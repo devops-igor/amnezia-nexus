@@ -233,6 +233,25 @@ func (f *Forwarder) beginUnregisterSession(peerKey, sessionID string) (retiremen
 	return retirement
 }
 
+// UpdateSessionBackend updates the assigned backend tunnel for a session (e.g. during failover).
+func (f *Forwarder) UpdateSessionBackend(peerKey string, newBackendTunnelID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	route, ok := f.routesByPeer[peerKey]
+	if !ok {
+		return ErrSessionNotRegistered
+	}
+
+	if _, ok := f.backendQueues[newBackendTunnelID]; !ok {
+		f.backendQueues[newBackendTunnelID] = make(chan []byte, f.backendBufSize)
+		f.ensureBackendTrafficLocked(newBackendTunnelID)
+	}
+
+	route.backendTunnelID = newBackendTunnelID
+	return nil
+}
+
 func (f *Forwarder) retireRoutesMatchingLocked(predicate func(*sessionRoute) bool) []Retirement {
 	var matches []*sessionRoute
 	for _, route := range f.routesByPeer {

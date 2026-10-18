@@ -403,6 +403,8 @@ func TestRouteLifecycleConcurrentLoad(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
+	f.StartPumps(ctx)
+
 	var wg sync.WaitGroup
 	const workers = 8
 
@@ -426,8 +428,12 @@ func TestRouteLifecycleConcurrentLoad(t *testing.T) {
 
 				// Register with return path
 				f.RegisterSessionWithReturnPath(sessionID, connID, peerKey, ip, 1, path)
-				_ = f.HasSessionRoute(peerKey, sessionID, connID, ip, 1)
-				_ = f.RouteSessionID(peerKey)
+				if !f.HasSessionRoute(peerKey, sessionID, connID, ip, 1) {
+					t.Errorf("worker %d: HasSessionRoute(%s) = false, want true", workerID, peerKey)
+				}
+				if got := f.RouteSessionID(peerKey); got != sessionID {
+					t.Errorf("worker %d: RouteSessionID(%s) = %q, want %q", workerID, peerKey, got, sessionID)
+				}
 				_ = f.PeerRegistration(peerKey)
 				_ = f.ActiveRoutesCount()
 
@@ -437,6 +443,12 @@ func TestRouteLifecycleConcurrentLoad(t *testing.T) {
 				} else {
 					ret := f.BeginUnregisterSession(peerKey, sessionID)
 					ret.Wait()
+				}
+				if f.HasSessionRoute(peerKey, sessionID, connID, ip, 1) {
+					t.Errorf("worker %d: HasSessionRoute(%s) = true after unregister, want false", workerID, peerKey)
+				}
+				if got := f.RouteSessionID(peerKey); got != "" {
+					t.Errorf("worker %d: RouteSessionID(%s) = %q after unregister, want empty", workerID, peerKey, got)
 				}
 			}
 		}()
@@ -452,7 +464,13 @@ func TestRouteLifecycleConcurrentLoad(t *testing.T) {
 				return
 			default:
 			}
-			_ = f.InspectRoutes()
+			routes := f.InspectRoutes()
+			for _, r := range routes {
+				if r.PeerKey != "" {
+					_ = f.HasSessionRoute(r.PeerKey, r.SessionID, r.ConnectionID, r.AssignedIP, r.BackendTunnelID)
+					_ = f.RouteSessionID(r.PeerKey)
+				}
+			}
 			_ = f.ProblemRoutes(5)
 			time.Sleep(5 * time.Millisecond)
 		}
@@ -460,11 +478,158 @@ func TestRouteLifecycleConcurrentLoad(t *testing.T) {
 
 	wg.Wait()
 
+	if count := f.ActiveRoutesCount(); count != 0 {
+		t.Fatalf("expected 0 active routes immediately after workers finished, got %d", count)
+	}
+
+	f.StopPumps()
+
 	wait := f.RetireAllRoutes()
 	if err := wait(context.Background()); err != nil {
 		t.Fatalf("RetireAllRoutes: %v", err)
 	}
 	if count := f.ActiveRoutesCount(); count != 0 {
 		t.Fatalf("expected 0 active routes after final retirement, got %d", count)
+	}
+}
+
+func TestStaleRouteIPMappingGuards(t *testing.T) {
+	t.Run("reregistration with new IP does not purge reassigned old IP (routes.go:129)", func(t *testing.T) {
+		f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+		if err != nil {
+			t.Fatalf("NewForwarderWithLimits: %v", err)
+		}
+
+		ipX := "10.100.0.10"
+		ipY := "10.100.0.11"
+
+		// Peer 1 registers with IP X (session s1)
+		f.RegisterSession("s1", "c1", "p1", ipX, 1)
+		if !f.HasSessionRoute("p1", "s1", "c1", ipX, 1) {
+			t.Fatal("expected s1 to be registered with ipX")
+		}
+
+		// Replacement session S2 (on peer 2) takes over IP X
+		f.RegisterSession("s2", "c2", "p2", ipX, 1)
+		if !f.HasSessionRoute("p2", "s2", "c2", ipX, 1) {
+			t.Fatal("expected s2 to be registered with ipX")
+		}
+
+		// Now peer 1 re-registers with IP Y (session s3), displacing s1 on peer 1.
+		// old.assignedIP is ipX, but routesByIP[ipX] belongs to s2 (p2).
+		f.RegisterSession("s3", "c3", "p1", ipY, 1)
+
+		// Guard at routes.go:129 must preserve S2's route for ipX
+		if !f.HasSessionRoute("p2", "s2", "c2", ipX, 1) {
+			t.Fatal("re-registration of p1 purged p2's IP route for ipX (routes.go:129 guard failed)")
+		}
+		if !f.HasSessionRoute("p1", "s3", "c3", ipY, 1) {
+			t.Fatal("expected p1 to have active route s3 for ipY")
+		}
+	})
+
+	t.Run("stale session unregister does not purge replacement session on same peer (routes.go:220)", func(t *testing.T) {
+		f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+		if err != nil {
+			t.Fatalf("NewForwarderWithLimits: %v", err)
+		}
+
+		ipX := "10.100.0.20"
+
+		// Peer 1 registers session s1
+		f.RegisterSession("s1", "c1", "p1", ipX, 1)
+		// Replacement session s2 for same peer and IP X
+		f.RegisterSession("s2", "c2", "p1", ipX, 1)
+
+		// Attempt to unregister stale session s1
+		ret := f.BeginUnregisterSession("p1", "s1")
+		ret.Wait()
+
+		// Replacement session S2's route and IP mapping must NOT be purged
+		if !f.HasSessionRoute("p1", "s2", "c2", ipX, 1) {
+			t.Fatal("unregistering stale session s1 purged replacement session s2 route for ipX")
+		}
+		if f.ActiveRoutesCount() != 1 {
+			t.Fatalf("expected 1 active route, got %d", f.ActiveRoutesCount())
+		}
+	})
+
+	t.Run("stale peer unregister does not purge reassigned IP on replacement peer (routes.go:220)", func(t *testing.T) {
+		f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+		if err != nil {
+			t.Fatalf("NewForwarderWithLimits: %v", err)
+		}
+
+		ipX := "10.100.0.30"
+
+		// Peer 1 registers with IP X (session s1)
+		f.RegisterSession("s1", "c1", "p1", ipX, 1)
+		// Peer 2 registers with IP X (session s2, replacement)
+		f.RegisterSession("s2", "c2", "p2", ipX, 1)
+
+		// Unregister stale peer 1
+		f.UnregisterSession("p1")
+
+		// Replacement session S2's IP route must NOT be purged
+		if !f.HasSessionRoute("p2", "s2", "c2", ipX, 1) {
+			t.Fatal("unregistering p1 purged p2's IP route for ipX (routes.go:220 guard failed)")
+		}
+		if f.ActiveRoutesCount() != 1 {
+			t.Fatalf("expected 1 active route remaining (p2), got %d", f.ActiveRoutesCount())
+		}
+	})
+
+	t.Run("retiring return path does not purge reassigned IP on another path (routes.go:246)", func(t *testing.T) {
+		f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+		if err != nil {
+			t.Fatalf("NewForwarderWithLimits: %v", err)
+		}
+
+		pathA := NewReturnPath(func(_, _ string, p []byte) (int, error) { return len(p), nil })
+		pathB := NewReturnPath(func(_, _ string, p []byte) (int, error) { return len(p), nil })
+
+		ipX := "10.100.0.40"
+
+		// Session s1 on pathA
+		f.RegisterSessionWithReturnPath("s1", "c1", "p1", ipX, 1, pathA)
+		// Replacement session s2 on pathB for same IP X
+		f.RegisterSessionWithReturnPath("s2", "c2", "p2", ipX, 1, pathB)
+
+		// Retire routes for pathA
+		waitA := f.RetireRoutesByReturnPath(pathA)
+		if err := waitA(context.Background()); err != nil {
+			t.Fatalf("RetireRoutesByReturnPath: %v", err)
+		}
+
+		// Replacement session S2 on pathB must NOT have its IP route purged
+		if !f.HasSessionRoute("p2", "s2", "c2", ipX, 1) {
+			t.Fatal("retiring pathA purged p2's IP route for ipX (routes.go:246 guard failed)")
+		}
+		if f.ActiveRoutesCount() != 1 {
+			t.Fatalf("expected 1 active route remaining (p2), got %d", f.ActiveRoutesCount())
+		}
+	})
+}
+
+func TestUpdateSessionBackendInRoutes(t *testing.T) {
+	f, err := NewForwarderWithLimits(nil, "10.100.0.0/16", 10, 100)
+	if err != nil {
+		t.Fatalf("NewForwarderWithLimits: %v", err)
+	}
+
+	f.RegisterSession("s1", "c1", "p1", "10.100.0.2", 1)
+	if !f.HasSessionRoute("p1", "s1", "c1", "10.100.0.2", 1) {
+		t.Fatal("expected route with backend 1")
+	}
+
+	if err := f.UpdateSessionBackend("p1", 2); err != nil {
+		t.Fatalf("UpdateSessionBackend failed: %v", err)
+	}
+	if !f.HasSessionRoute("p1", "s1", "c1", "10.100.0.2", 2) {
+		t.Fatal("expected route to be updated to backend 2")
+	}
+
+	if err := f.UpdateSessionBackend("ghost", 2); !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered, got %v", err)
 	}
 }

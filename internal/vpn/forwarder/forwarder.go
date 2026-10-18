@@ -485,25 +485,6 @@ func (f *Forwarder) GetPeerRateLimit(peerKey string) (limitDownBps, limitUpBps i
 	return route.limitDownBps, route.limitUpBps, nil
 }
 
-// UpdateSessionBackend updates the assigned backend tunnel for a session (e.g. during failover).
-func (f *Forwarder) UpdateSessionBackend(peerKey string, newBackendTunnelID int64) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	route, ok := f.routesByPeer[peerKey]
-	if !ok {
-		return ErrSessionNotRegistered
-	}
-
-	if _, ok := f.backendQueues[newBackendTunnelID]; !ok {
-		f.backendQueues[newBackendTunnelID] = make(chan []byte, f.backendBufSize)
-		f.ensureBackendTrafficLocked(newBackendTunnelID)
-	}
-
-	route.backendTunnelID = newBackendTunnelID
-	return nil
-}
-
 // RouteClientToBackend routes a packet from a client peer toward their assigned backend tunnel.
 func (f *Forwarder) RouteClientToBackend(peerKey string, packet []byte) error {
 	return f.routeClientToBackend(peerKey, packet, nil)
