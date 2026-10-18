@@ -11,10 +11,25 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
+func closeBackendDevices(svc *Service) {
+	if svc == nil {
+		return
+	}
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+	for id, dev := range svc.backendDevices {
+		if dev != nil && !dev.IsClosed() {
+			_ = dev.Close()
+		}
+		delete(svc.backendDevices, id)
+	}
+}
+
 func TestDisableBackend_Lifecycle(t *testing.T) {
 	t.Run("disables tunnel detaches device migrates sessions bumps version", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, s1ID, s2ID, uID, peerKeyAlice := setupTestVPNService(t, db)
+		defer closeBackendDevices(svc)
 		ctx := context.Background()
 
 		if err := svc.pool.SyncFromDB(ctx); err != nil {
@@ -30,16 +45,31 @@ func TestDisableBackend_Lifecycle(t *testing.T) {
 		tun1 := tunMust(t, svc, s1ID)
 		tun2 := tunMust(t, svc, s2ID)
 
-		if dev := svc.GetBackendDeviceForTest(tun1.ID); dev == nil {
+		dev1 := svc.GetBackendDeviceForTest(tun1.ID)
+		if dev1 == nil {
 			t.Fatal("expected device for s1 before disable")
 		}
+		dev2 := svc.GetBackendDeviceForTest(tun2.ID)
+		if dev2 == nil {
+			t.Fatal("expected device for s2 before disable")
+		}
+		t.Cleanup(func() {
+			if !dev2.IsClosed() {
+				_ = dev2.Close()
+			}
+		})
+		defer func() {
+			if !dev2.IsClosed() {
+				_ = dev2.Close()
+			}
+		}()
 
 		// Seed session on s1
 		seed := &models.VPNSession{
 			UserID:          uID,
 			BackendTunnelID: tun1.ID,
 			PeerPublicKey:   peerKeyAlice,
-			AssignedIP:      "10.201.0.10",
+			AssignedIP:      "10.100.0.10",
 			Status:          "connected",
 		}
 		if err := db.CreateVPNSession(ctx, seed); err != nil {
@@ -47,7 +77,7 @@ func TestDisableBackend_Lifecycle(t *testing.T) {
 		}
 
 		svc.pool.IncrementConnections(tun1.ID)
-		svc.forwarder.RegisterSession("sess-1", "conn-1", peerKeyAlice, "10.201.0.10", tun1.ID)
+		svc.forwarder.RegisterSession("sess-1", "conn-1", peerKeyAlice, "10.100.0.10", tun1.ID)
 		svc.forwarder.StartPumps(ctx)
 		defer svc.forwarder.StopPumps()
 		svc.stickyMgr.AssignPeerAffinity(peerKeyAlice, tun1.ID)
@@ -72,6 +102,9 @@ func TestDisableBackend_Lifecycle(t *testing.T) {
 		if dev := svc.GetBackendDeviceForTest(tun1.ID); dev != nil {
 			t.Errorf("expected backend device for tun1 to be detached/removed, got %v", dev)
 		}
+		if !dev1.IsClosed() {
+			t.Errorf("expected disabled backend device for tun1 to be closed")
+		}
 
 		// 3. Active session migrated to s2
 		gotTun, _, err := svc.stickyMgr.GetOrAssignBackend(ctx, &loadbalancer.RoutingRequest{
@@ -86,12 +119,18 @@ func TestDisableBackend_Lifecycle(t *testing.T) {
 		}
 
 		// 4. Pool counters moved
-		curTun1, _ := svc.pool.GetTunnelByID(tun1.ID)
-		if curTun1 != nil && curTun1.ActiveConnections != 0 {
+		curTun1, err := svc.pool.GetTunnelByID(tun1.ID)
+		if err != nil || curTun1 == nil {
+			t.Fatalf("failed to retrieve survivor tun1 %d: %v", tun1.ID, err)
+		}
+		if curTun1.ActiveConnections != 0 {
 			t.Errorf("tun1 ActiveConnections = %d, want 0", curTun1.ActiveConnections)
 		}
-		curTun2, _ := svc.pool.GetTunnelByID(tun2.ID)
-		if curTun2 != nil && curTun2.ActiveConnections != 1 {
+		curTun2, err := svc.pool.GetTunnelByID(tun2.ID)
+		if err != nil || curTun2 == nil {
+			t.Fatalf("failed to retrieve survivor tun2 %d: %v", tun2.ID, err)
+		}
+		if curTun2.ActiveConnections != 1 {
 			t.Errorf("tun2 ActiveConnections = %d, want 1", curTun2.ActiveConnections)
 		}
 
@@ -110,6 +149,7 @@ func TestDisableBackend_Lifecycle(t *testing.T) {
 
 		db := setupTestDB(t)
 		svc, _, _, _, _ := setupTestVPNService(t, db)
+		defer closeBackendDevices(svc)
 		if err := svc.DisableBackend(context.Background(), 99999); !errors.Is(err, tunnel.ErrTunnelNotFound) {
 			t.Errorf("expected ErrTunnelNotFound for unknown server, got %v", err)
 		}
@@ -120,6 +160,7 @@ func TestUpdateBackendServerHost_Lifecycle(t *testing.T) {
 	t.Run("idempotent no-op on matching host", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, s1ID, _, _, _ := setupTestVPNService(t, db)
+		defer closeBackendDevices(svc)
 		ctx := context.Background()
 
 		if err := svc.pool.SyncFromDB(ctx); err != nil {
@@ -130,6 +171,20 @@ func TestUpdateBackendServerHost_Lifecycle(t *testing.T) {
 		}
 
 		tunBefore := tunMust(t, svc, s1ID)
+		dev1 := svc.GetBackendDeviceForTest(tunBefore.ID)
+		if dev1 == nil {
+			t.Fatal("expected device for s1 before update")
+		}
+		t.Cleanup(func() {
+			if !dev1.IsClosed() {
+				_ = dev1.Close()
+			}
+		})
+		defer func() {
+			if !dev1.IsClosed() {
+				_ = dev1.Close()
+			}
+		}()
 
 		// Same host
 		if err := svc.UpdateBackendServerHost(ctx, s1ID, "198.51.100.1"); err != nil {
@@ -150,6 +205,7 @@ func TestUpdateBackendServerHost_Lifecycle(t *testing.T) {
 	t.Run("endpoint update success", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, s1ID, _, _, _ := setupTestVPNService(t, db)
+		defer closeBackendDevices(svc)
 		ctx := context.Background()
 
 		if err := svc.pool.SyncFromDB(ctx); err != nil {
@@ -166,11 +222,25 @@ func TestUpdateBackendServerHost_Lifecycle(t *testing.T) {
 		if tun.Endpoint != wantEndpoint {
 			t.Errorf("tun.Endpoint = %q, want %q", tun.Endpoint, wantEndpoint)
 		}
+		dev := svc.GetBackendDeviceForTest(tun.ID)
+		if dev != nil {
+			t.Cleanup(func() {
+				if !dev.IsClosed() {
+					_ = dev.Close()
+				}
+			})
+			defer func() {
+				if !dev.IsClosed() {
+					_ = dev.Close()
+				}
+			}()
+		}
 	})
 
 	t.Run("rollback on forwarder sync failure", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, s1ID, _, _, _ := setupTestVPNService(t, db)
+		defer closeBackendDevices(svc)
 		ctx := context.Background()
 
 		if err := svc.pool.SyncFromDB(ctx); err != nil {
@@ -199,9 +269,42 @@ func TestUpdateBackendServerHost_Lifecycle(t *testing.T) {
 		}
 	})
 
+	t.Run("rollback on real device attachment failure", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, s1ID, _, _, _ := setupTestVPNService(t, db)
+		defer closeBackendDevices(svc)
+		ctx := context.Background()
+
+		if err := svc.pool.SyncFromDB(ctx); err != nil {
+			t.Fatalf("SyncFromDB: %v", err)
+		}
+		origEndpoint := tunMust(t, svc, s1ID).Endpoint
+
+		err := svc.UpdateBackendServerHost(ctx, s1ID, "bad\x00host")
+		if err == nil {
+			t.Fatal("expected real device attachment error, got nil")
+		}
+
+		// In-memory endpoint rolled back
+		tunAfter := tunMust(t, svc, s1ID)
+		if tunAfter.Endpoint != origEndpoint {
+			t.Errorf("expected rolled back in-memory endpoint %q, got %q", origEndpoint, tunAfter.Endpoint)
+		}
+
+		// Database pool endpoint rolled back
+		row, err := db.GetBackendTunnelByServerID(ctx, s1ID)
+		if err != nil || row == nil {
+			t.Fatalf("failed to retrieve backend tunnel from DB: %v", err)
+		}
+		if row.Endpoint != origEndpoint {
+			t.Errorf("expected rolled back DB endpoint %q, got %q", origEndpoint, row.Endpoint)
+		}
+	})
+
 	t.Run("rollback failure wraps ErrVPNRollbackFailed", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, s1ID, _, _, _ := setupTestVPNService(t, db)
+		defer closeBackendDevices(svc)
 		ctx := context.Background()
 
 		if err := svc.pool.SyncFromDB(ctx); err != nil {
@@ -237,6 +340,7 @@ func TestDeleteServer_Lifecycle(t *testing.T) {
 	t.Run("tombstones server deletes backend clears tombstone on rollback", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, serverID, _, _, _ := setupTestVPNService(t, db)
+		defer closeBackendDevices(svc)
 		ctx := context.Background()
 
 		if err := svc.pool.SyncFromDB(ctx); err != nil {
@@ -246,6 +350,20 @@ func TestDeleteServer_Lifecycle(t *testing.T) {
 			t.Fatalf("EnableBackend: %v", err)
 		}
 		tun := tunMust(t, svc, serverID)
+		dev := svc.GetBackendDeviceForTest(tun.ID)
+		if dev == nil {
+			t.Fatal("expected backend device before DeleteServer")
+		}
+		t.Cleanup(func() {
+			if !dev.IsClosed() {
+				_ = dev.Close()
+			}
+		})
+		defer func() {
+			if !dev.IsClosed() {
+				_ = dev.Close()
+			}
+		}()
 
 		// 1. DeleteServer succeeds
 		if err := svc.DeleteServer(ctx, serverID); err != nil {
@@ -266,8 +384,11 @@ func TestDeleteServer_Lifecycle(t *testing.T) {
 		}
 
 		// Backend device cleaned up
-		if dev := svc.GetBackendDeviceForTest(tun.ID); dev != nil {
-			t.Errorf("expected backend device to be cleaned up, got %v", dev)
+		if d := svc.GetBackendDeviceForTest(tun.ID); d != nil {
+			t.Errorf("expected backend device to be cleaned up, got %v", d)
+		}
+		if !dev.IsClosed() {
+			t.Errorf("expected backend device to be closed after DeleteServer")
 		}
 
 		// Subsequent EnableBackend rejected by tombstone
@@ -293,6 +414,7 @@ func TestDeleteServer_Lifecycle(t *testing.T) {
 	t.Run("clears tombstone on teardown error", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, serverID, _, _, _ := setupTestVPNService(t, db)
+		defer closeBackendDevices(svc)
 		ctx := context.Background()
 
 		if err := svc.pool.SyncFromDB(ctx); err != nil {
@@ -317,9 +439,35 @@ func TestDeleteServer_Lifecycle(t *testing.T) {
 		}
 	})
 
+	t.Run("clears tombstone on real teardown failure", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, serverID, _, _, _ := setupTestVPNService(t, db)
+		defer closeBackendDevices(svc)
+
+		if err := svc.pool.SyncFromDB(context.Background()); err != nil {
+			t.Fatalf("SyncFromDB: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := svc.DeleteServer(ctx, serverID)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected canceled persistence failure, got: %v", err)
+		}
+
+		svc.mu.RLock()
+		isDel := svc.isServerDeletedLocked(serverID)
+		svc.mu.RUnlock()
+		if isDel {
+			t.Fatal("expected server deletion tombstone to be cleared on real teardown failure")
+		}
+	})
+
 	t.Run("non-VPN server tombstones cleanly", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, _, _, _, _ := setupTestVPNService(t, db)
+		defer closeBackendDevices(svc)
 		ctx := context.Background()
 
 		if err := svc.DeleteServer(ctx, 9999); err != nil {
@@ -339,16 +487,17 @@ func TestDeleteBackend_Lifecycle(t *testing.T) {
 	t.Run("drains sessions and removes from pool", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, _, _, uID, _ := setupTestVPNService(t, db)
+		defer closeBackendDevices(svc)
 		ctx := t.Context()
 
-		oldTun := lbTunnel(t, svc, db, 951, "awg951", "pub951", "priv951", "10.9.9.151:51820")
-		newTun := lbTunnel(t, svc, db, 952, "awg952", "pub952", "priv952", "10.9.9.152:51820")
+		oldTun := lbTunnel(t, svc, db, 951, "awg951", "pub951", "priv951", "198.51.100.151:51820")
+		newTun := lbTunnel(t, svc, db, 952, "awg952", "pub952", "priv952", "198.51.100.152:51820")
 
 		seed := &models.VPNSession{
 			UserID:          uID,
 			BackendTunnelID: oldTun.ID,
 			PeerPublicKey:   "peer-del-lifecycle-1",
-			AssignedIP:      "10.201.0.51",
+			AssignedIP:      "10.100.0.51",
 			Status:          "connected",
 		}
 		if err := db.CreateVPNSession(ctx, seed); err != nil {
@@ -356,7 +505,7 @@ func TestDeleteBackend_Lifecycle(t *testing.T) {
 		}
 
 		svc.pool.IncrementConnections(oldTun.ID)
-		svc.forwarder.RegisterSession("sess-del-lc", "conn-del-lc", "peer-del-lifecycle-1", "10.201.0.51", oldTun.ID)
+		svc.forwarder.RegisterSession("sess-del-lc", "conn-del-lc", "peer-del-lifecycle-1", "10.100.0.51", oldTun.ID)
 		svc.forwarder.StartPumps(ctx)
 		defer svc.forwarder.StopPumps()
 		svc.stickyMgr.AssignPeerAffinity("peer-del-lifecycle-1", oldTun.ID)
@@ -407,8 +556,11 @@ func TestDeleteBackend_Lifecycle(t *testing.T) {
 		if curOld != nil && curOld.ActiveConnections != 0 {
 			t.Errorf("oldTun ActiveConnections = %d, want 0", curOld.ActiveConnections)
 		}
-		curNew, _ := svc.pool.GetTunnelByID(newTun.ID)
-		if curNew != nil && curNew.ActiveConnections != 1 {
+		curNew, err := svc.pool.GetTunnelByID(newTun.ID)
+		if err != nil || curNew == nil {
+			t.Fatalf("failed to retrieve survivor newTun %d: %v", newTun.ID, err)
+		}
+		if curNew.ActiveConnections != 1 {
 			t.Errorf("newTun ActiveConnections = %d, want 1", curNew.ActiveConnections)
 		}
 	})
@@ -416,10 +568,11 @@ func TestDeleteBackend_Lifecycle(t *testing.T) {
 	t.Run("sweeps orphan sessions from DB on drift", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, _, _, uID, _ := setupTestVPNService(t, db)
+		defer closeBackendDevices(svc)
 		ctx := t.Context()
 
-		oldTun := lbTunnel(t, svc, db, 961, "awg961", "pub961", "priv961", "10.9.9.161:51820")
-		newTun := lbTunnel(t, svc, db, 962, "awg962", "pub962", "priv962", "10.9.9.162:51820")
+		oldTun := lbTunnel(t, svc, db, 961, "awg961", "pub961", "priv961", "198.51.100.161:51820")
+		newTun := lbTunnel(t, svc, db, 962, "awg962", "pub962", "priv962", "198.51.100.162:51820")
 
 		// Create a drift backend_tunnels row for oldTun.ServerID
 		leftoverID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
@@ -427,7 +580,7 @@ func TestDeleteBackend_Lifecycle(t *testing.T) {
 			InterfaceName: "awg961-drift",
 			PublicKey:     "pub961-drift",
 			PrivateKey:    "priv961-drift",
-			Endpoint:      "10.9.9.161:51820",
+			Endpoint:      "198.51.100.161:51820",
 			Status:        "active",
 		})
 		if err != nil {
@@ -439,7 +592,7 @@ func TestDeleteBackend_Lifecycle(t *testing.T) {
 			UserID:          uID,
 			BackendTunnelID: leftoverID,
 			PeerPublicKey:   "peer-drift-lifecycle-1",
-			AssignedIP:      "10.201.0.61",
+			AssignedIP:      "10.100.0.61",
 			Status:          "connected",
 		}
 		if err := db.CreateVPNSession(ctx, seed); err != nil {
