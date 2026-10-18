@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"io/fs"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -749,16 +750,7 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 		t.Errorf("vpn.html missing #vpnTableContainer")
 	}
 
-	// 3. Assert stylesheet cache-busting (?v=1.1.0) across all shell and auth templates
-	requiredStylesheets := []string{
-		"tokens.css",
-		"base.css",
-		"layout.css",
-		"components.css",
-		"tables.css",
-		"server.css",
-		"vpn.css",
-	}
+	// 3. Assert stylesheet cache-busting (?v=1.1.0) and cascade order across all shell and auth templates
 	templatesToCheck := []string{"base.html", "login.html", "change_password.html", "setup.html"}
 	for _, tmpl := range templatesToCheck {
 		tmplData, err := fs.ReadFile(templatesFS, tmpl)
@@ -766,11 +758,22 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 			t.Fatalf("failed to read %s: %v", tmpl, err)
 		}
 		tmplStr := string(tmplData)
-		for _, sheet := range requiredStylesheets {
-			expectedLink := `href="/static/css/` + sheet + `?v=1.1.0"`
+		for _, name := range canonicalStylesheetOrder {
+			expectedLink := `href="/static/css/` + name + `.css?v=1.1.0"`
 			if !strings.Contains(tmplStr, expectedLink) {
 				t.Errorf("%s missing stylesheet link %s", tmpl, expectedLink)
 			}
+		}
+
+		matches := cssLinkRegex.FindAllStringSubmatch(tmplStr, -1)
+		extracted := make([]string, 0, len(matches))
+		for _, m := range matches {
+			if len(m) > 1 {
+				extracted = append(extracted, m[1])
+			}
+		}
+		if !slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Errorf("%s stylesheet link order mismatch: got %v, want %v", tmpl, extracted, canonicalStylesheetOrder)
 		}
 	}
 }

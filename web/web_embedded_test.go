@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io/fs"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -611,24 +612,27 @@ func TestServerStaticAssetsProductionServing(t *testing.T) {
 	})
 }
 
+var canonicalStylesheetOrder = []string{
+	"tokens",
+	"base",
+	"layout",
+	"components",
+	"tables",
+	"server",
+	"vpn",
+}
+
+var cssLinkRegex = regexp.MustCompile(`href="/static/css/(\w+)\.css`)
+
 func TestStyleCSSConcatenationParity(t *testing.T) {
 	staticFS, err := GetStaticSubFS()
 	if err != nil {
 		t.Fatalf("GetStaticSubFS failed: %v", err)
 	}
 
-	modules := []string{
-		"css/tokens.css",
-		"css/base.css",
-		"css/layout.css",
-		"css/components.css",
-		"css/tables.css",
-		"css/server.css",
-		"css/vpn.css",
-	}
-
 	var concatenated strings.Builder
-	for _, mod := range modules {
+	for _, name := range canonicalStylesheetOrder {
+		mod := "css/" + name + ".css"
 		data, err := fs.ReadFile(staticFS, mod)
 		if err != nil {
 			t.Fatalf("failed to read %s: %v", mod, err)
@@ -643,5 +647,34 @@ func TestStyleCSSConcatenationParity(t *testing.T) {
 
 	if concatenated.String() != string(styleData) {
 		t.Fatal("style.css does not match concatenation of the 7 modular stylesheets")
+	}
+}
+
+func TestStylesheetTemplateLoadOrder(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	templatesToCheck := []string{"base.html", "login.html", "setup.html", "change_password.html"}
+	for _, tmpl := range templatesToCheck {
+		t.Run(tmpl, func(t *testing.T) {
+			data, err := fs.ReadFile(templatesFS, tmpl)
+			if err != nil {
+				t.Fatalf("failed to read %s: %v", tmpl, err)
+			}
+
+			matches := cssLinkRegex.FindAllStringSubmatch(string(data), -1)
+			extractedOrder := make([]string, 0, len(matches))
+			for _, m := range matches {
+				if len(m) > 1 {
+					extractedOrder = append(extractedOrder, m[1])
+				}
+			}
+
+			if !slices.Equal(canonicalStylesheetOrder, extractedOrder) {
+				t.Fatalf("%s stylesheet link order mismatch:\n got:  %v\n want: %v", tmpl, extractedOrder, canonicalStylesheetOrder)
+			}
+		})
 	}
 }
