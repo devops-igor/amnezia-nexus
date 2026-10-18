@@ -758,14 +758,15 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 			t.Fatalf("failed to read %s: %v", tmpl, err)
 		}
 		tmplStr := string(tmplData)
+		cleanTmplStr := stripHTMLComments(tmplStr)
 		for _, name := range canonicalStylesheetOrder {
 			expectedLink := `href="/static/css/` + name + `.css?v=1.1.0"`
-			if !strings.Contains(tmplStr, expectedLink) {
+			if !strings.Contains(cleanTmplStr, expectedLink) {
 				t.Errorf("%s missing stylesheet link %s", tmpl, expectedLink)
 			}
 		}
 
-		matches := cssLinkRegex.FindAllStringSubmatch(tmplStr, -1)
+		matches := cssLinkRegex.FindAllStringSubmatch(cleanTmplStr, -1)
 		extracted := make([]string, 0, len(matches))
 		for _, m := range matches {
 			if len(m) > 1 {

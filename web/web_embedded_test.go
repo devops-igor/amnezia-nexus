@@ -423,7 +423,7 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 	appLayoutRegex := regexp.MustCompile(`(?s)\.app-layout\s*\{([^}]+)\}`)
 	matchLayout := appLayoutRegex.FindStringSubmatch(css)
 	if len(matchLayout) < 2 {
-		t.Fatal("style.css missing .app-layout definition")
+		t.Fatal("layout.css missing .app-layout definition")
 	}
 	layoutBlock := matchLayout[1]
 	integerZIndexRegex := regexp.MustCompile(`z-index\s*:\s*[0-9]+`)
@@ -438,7 +438,7 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 	bottomBarRegex := regexp.MustCompile(`(?s)\.mobile-bottom-bar\s*\{([^}]+)\}`)
 	matchBottomBar := bottomBarRegex.FindStringSubmatch(css)
 	if len(matchBottomBar) < 2 {
-		t.Fatal("style.css missing .mobile-bottom-bar definition")
+		t.Fatal("layout.css missing .mobile-bottom-bar definition")
 	}
 	bottomBarBlock := matchBottomBar[1]
 	zIndexExtract := regexp.MustCompile(`z-index\s*:\s*([0-9]+)`)
@@ -451,7 +451,7 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 	backdropRegex := regexp.MustCompile(`(?s)\.drawer-backdrop\s*\{([^}]+)\}`)
 	matchBackdrop := backdropRegex.FindStringSubmatch(css)
 	if len(matchBackdrop) < 2 {
-		t.Fatal("style.css missing .drawer-backdrop definition")
+		t.Fatal("layout.css missing .drawer-backdrop definition")
 	}
 	backdropBlock := matchBackdrop[1]
 	backdropZMatch := zIndexExtract.FindStringSubmatch(backdropBlock)
@@ -461,7 +461,7 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 
 	mobileQueryIdx := strings.Index(css, "@media (max-width: 1023px)")
 	if mobileQueryIdx == -1 {
-		t.Fatal("style.css missing @media (max-width: 1023px) query")
+		t.Fatal("layout.css missing @media (max-width: 1023px) query")
 	}
 	mobileQueryBlock := css[mobileQueryIdx:]
 	nextMediaOffset := len("@media (max-width: 1023px)")
@@ -532,7 +532,7 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 	sidebarFooterRegex := regexp.MustCompile(`(?s)\.sidebar-footer\s*\{([^}]+)\}`)
 	matchSidebarFooter := sidebarFooterRegex.FindStringSubmatch(css)
 	if len(matchSidebarFooter) < 2 {
-		t.Fatal("style.css missing .sidebar-footer definition")
+		t.Fatal("layout.css missing .sidebar-footer definition")
 	}
 	footerBlock := matchSidebarFooter[1]
 	if !strings.Contains(footerBlock, "env(safe-area-inset-bottom)") {
@@ -569,7 +569,7 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 
 	// Verify mobile bottom bar interaction protection when drawer is open
 	if !strings.Contains(css, ".app-layout:has(.drawer-open) ~ .mobile-bottom-bar") {
-		t.Error("style.css missing rule disabling pointer events on .mobile-bottom-bar when drawer is open")
+		t.Error("layout.css missing rule disabling pointer events on .mobile-bottom-bar when drawer is open")
 	}
 }
 
@@ -622,7 +622,14 @@ var canonicalStylesheetOrder = []string{
 	"vpn",
 }
 
-var cssLinkRegex = regexp.MustCompile(`href="/static/css/(\w+)\.css`)
+var (
+	cssLinkRegex     = regexp.MustCompile(`href=["']/static/css/(\w+)\.css`)
+	htmlCommentRegex = regexp.MustCompile(`<!--[\s\S]*?-->`)
+)
+
+func stripHTMLComments(s string) string {
+	return htmlCommentRegex.ReplaceAllString(s, "")
+}
 
 func TestStyleCSSConcatenationParity(t *testing.T) {
 	staticFS, err := GetStaticSubFS()
@@ -664,7 +671,8 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 				t.Fatalf("failed to read %s: %v", tmpl, err)
 			}
 
-			matches := cssLinkRegex.FindAllStringSubmatch(string(data), -1)
+			cleanHTML := stripHTMLComments(string(data))
+			matches := cssLinkRegex.FindAllStringSubmatch(cleanHTML, -1)
 			extractedOrder := make([]string, 0, len(matches))
 			for _, m := range matches {
 				if len(m) > 1 {
@@ -677,4 +685,74 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("CommentedOutLinkFailsClosed", func(t *testing.T) {
+		sample := `
+			<!-- <link rel="stylesheet" href="/static/css/tokens.css"> -->
+			<link rel="stylesheet" href="/static/css/base.css">
+			<link rel="stylesheet" href="/static/css/layout.css">
+			<link rel="stylesheet" href="/static/css/components.css">
+			<link rel="stylesheet" href="/static/css/tables.css">
+			<link rel="stylesheet" href="/static/css/server.css">
+			<link rel="stylesheet" href="/static/css/vpn.css">
+		`
+		cleanHTML := stripHTMLComments(sample)
+		matches := cssLinkRegex.FindAllStringSubmatch(cleanHTML, -1)
+		extracted := make([]string, 0, len(matches))
+		for _, m := range matches {
+			if len(m) > 1 {
+				extracted = append(extracted, m[1])
+			}
+		}
+		if slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Fatal("expected commented-out link to fail matching canonicalStylesheetOrder, but it matched")
+		}
+	})
+
+	t.Run("CommentedExtraLinkDoesNotCorruptExtractedOrder", func(t *testing.T) {
+		sample := `
+			<!-- <link rel="stylesheet" href="/static/css/vpn.css"> -->
+			<link rel="stylesheet" href="/static/css/tokens.css">
+			<link rel="stylesheet" href='/static/css/base.css'>
+			<link rel="stylesheet" href="/static/css/layout.css">
+			<link rel="stylesheet" href="/static/css/components.css">
+			<link rel="stylesheet" href="/static/css/tables.css">
+			<link rel="stylesheet" href="/static/css/server.css">
+			<link rel="stylesheet" href="/static/css/vpn.css">
+		`
+		cleanHTML := stripHTMLComments(sample)
+		matches := cssLinkRegex.FindAllStringSubmatch(cleanHTML, -1)
+		extracted := make([]string, 0, len(matches))
+		for _, m := range matches {
+			if len(m) > 1 {
+				extracted = append(extracted, m[1])
+			}
+		}
+		if !slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Fatalf("expected canonical order when extra link is commented out, got: %v", extracted)
+		}
+	})
+
+	t.Run("SingleAndDoubleQuotesBothSupported", func(t *testing.T) {
+		sample := `
+			<link rel='stylesheet' href='/static/css/tokens.css'>
+			<link rel="stylesheet" href="/static/css/base.css">
+			<link rel='stylesheet' href='/static/css/layout.css'>
+			<link rel="stylesheet" href="/static/css/components.css">
+			<link rel='stylesheet' href='/static/css/tables.css'>
+			<link rel="stylesheet" href="/static/css/server.css">
+			<link rel='stylesheet' href='/static/css/vpn.css'>
+		`
+		cleanHTML := stripHTMLComments(sample)
+		matches := cssLinkRegex.FindAllStringSubmatch(cleanHTML, -1)
+		extracted := make([]string, 0, len(matches))
+		for _, m := range matches {
+			if len(m) > 1 {
+				extracted = append(extracted, m[1])
+			}
+		}
+		if !slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Fatalf("expected canonical order with mixed quotes, got: %v", extracted)
+		}
+	})
 }

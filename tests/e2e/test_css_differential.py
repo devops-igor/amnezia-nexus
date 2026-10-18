@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import sync_playwright
 
+pytestmark = pytest.mark.e2e
+
 VIEWPORTS = [
     (1280, 800),  # Desktop standard
     (1024, 768),  # Landscape tablet
@@ -81,12 +83,12 @@ def extract_base_template_stylesheets(repo_root: Path) -> list[str]:
 
 def strip_template_syntax(html: str) -> str:
     """Strip Go template actions and scripts to isolate static DOM hierarchy."""
-    html = re.sub(r"\{\{.*?\}\}", "", html, flags=re.S)
-    html = re.sub(r"<script\b.*?</script>", "", html, flags=re.S | re.I)
-    html = re.sub(r"<link[^>]*stylesheet[^>]*>", "", html, flags=re.I)
-    html = re.sub(r"</?(html|head|body)\b[^>]*>", "", html, flags=re.I)
-    html = re.sub(r"<!DOCTYPE[^>]*>", "", html, flags=re.I)
-    html = re.sub(r"\bautofocus\b", "", html, flags=re.I)
+    html = re.sub(r"\{\{.*?\}\}", "", html, flags=re.DOTALL)
+    html = re.sub(r"<script\b.*?</script>", "", html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r"<link[^>]*stylesheet[^>]*>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"</?(html|head|body)\b[^>]*>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"<!DOCTYPE[^>]*>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"\bautofocus\b", "", html, flags=re.IGNORECASE)
     return html
 
 
@@ -157,6 +159,7 @@ def wrap_html(stylesheets: list[str], body: str, theme: str) -> str:
     )
 
 
+@pytest.mark.e2e
 def test_css_computed_style_differential(repo_root: Path):
     """Assert zero computed style differences between monolith and modular bundle."""
     fixture_path = repo_root / "tests" / "e2e" / "fixtures" / "style.pre-505.css"
