@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"io/fs"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+
+	"golang.org/x/net/html"
 )
 
 func TestEmbeddedTranslations(t *testing.T) {
@@ -61,6 +64,13 @@ func TestEmbeddedStaticAndTemplates(t *testing.T) {
 
 	staticFiles := []string{
 		"css/style.css",
+		"css/tokens.css",
+		"css/base.css",
+		"css/layout.css",
+		"css/components.css",
+		"css/tables.css",
+		"css/server.css",
+		"css/vpn.css",
 		"js/qrcode.min.js",
 		"js/api.js",
 		"js/captcha.js",
@@ -157,11 +167,21 @@ func TestModernDesignSystemAndShell(t *testing.T) {
 		t.Fatalf("GetStaticSubFS failed: %v", err)
 	}
 
-	cssData, err := fs.ReadFile(staticFS, "css/style.css")
+	tokensData, err := fs.ReadFile(staticFS, "css/tokens.css")
 	if err != nil {
-		t.Fatalf("failed to read css/style.css: %v", err)
+		t.Fatalf("failed to read css/tokens.css: %v", err)
 	}
-	css := string(cssData)
+	tokensCSS := string(tokensData)
+
+	layoutData, err := fs.ReadFile(staticFS, "css/layout.css")
+	if err != nil {
+		t.Fatalf("failed to read css/layout.css: %v", err)
+	}
+	baseCSSData, err := fs.ReadFile(staticFS, "css/base.css")
+	if err != nil {
+		t.Fatalf("failed to read css/base.css: %v", err)
+	}
+	layoutAndBaseCSS := string(layoutData) + "\n" + string(baseCSSData)
 
 	requiredCSSTokens := []string{
 		"--bg-primary: #090a0f",
@@ -176,8 +196,8 @@ func TestModernDesignSystemAndShell(t *testing.T) {
 		"--font-mono: 'JetBrains Mono'",
 	}
 	for _, token := range requiredCSSTokens {
-		if !strings.Contains(css, token) {
-			t.Errorf("style.css missing required design token %q", token)
+		if !strings.Contains(tokensCSS, token) {
+			t.Errorf("tokens.css missing required design token %q", token)
 		}
 	}
 
@@ -193,8 +213,8 @@ func TestModernDesignSystemAndShell(t *testing.T) {
 		".sidebar-nav-link",
 	}
 	for _, cls := range requiredCSSClasses {
-		if !strings.Contains(css, cls) {
-			t.Errorf("style.css missing required layout class %q", cls)
+		if !strings.Contains(layoutAndBaseCSS, cls) {
+			t.Errorf("layout.css / base.css missing required layout class %q", cls)
 		}
 	}
 
@@ -380,11 +400,15 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 		t.Fatalf("GetStaticSubFS failed: %v", err)
 	}
 
-	cssBytes, err := fs.ReadFile(staticFS, "css/style.css")
+	layoutBytes, err := fs.ReadFile(staticFS, "css/layout.css")
 	if err != nil {
-		t.Fatalf("failed to read css/style.css: %v", err)
+		t.Fatalf("failed to read css/layout.css: %v", err)
 	}
-	css := string(cssBytes)
+	baseCSSBytes, err := fs.ReadFile(staticFS, "css/base.css")
+	if err != nil {
+		t.Fatalf("failed to read css/base.css: %v", err)
+	}
+	css := string(layoutBytes) + "\n" + string(baseCSSBytes)
 
 	templatesFS, err := GetTemplatesSubFS()
 	if err != nil {
@@ -401,7 +425,7 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 	appLayoutRegex := regexp.MustCompile(`(?s)\.app-layout\s*\{([^}]+)\}`)
 	matchLayout := appLayoutRegex.FindStringSubmatch(css)
 	if len(matchLayout) < 2 {
-		t.Fatal("style.css missing .app-layout definition")
+		t.Fatal("layout.css missing .app-layout definition")
 	}
 	layoutBlock := matchLayout[1]
 	integerZIndexRegex := regexp.MustCompile(`z-index\s*:\s*[0-9]+`)
@@ -416,7 +440,7 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 	bottomBarRegex := regexp.MustCompile(`(?s)\.mobile-bottom-bar\s*\{([^}]+)\}`)
 	matchBottomBar := bottomBarRegex.FindStringSubmatch(css)
 	if len(matchBottomBar) < 2 {
-		t.Fatal("style.css missing .mobile-bottom-bar definition")
+		t.Fatal("layout.css missing .mobile-bottom-bar definition")
 	}
 	bottomBarBlock := matchBottomBar[1]
 	zIndexExtract := regexp.MustCompile(`z-index\s*:\s*([0-9]+)`)
@@ -429,7 +453,7 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 	backdropRegex := regexp.MustCompile(`(?s)\.drawer-backdrop\s*\{([^}]+)\}`)
 	matchBackdrop := backdropRegex.FindStringSubmatch(css)
 	if len(matchBackdrop) < 2 {
-		t.Fatal("style.css missing .drawer-backdrop definition")
+		t.Fatal("layout.css missing .drawer-backdrop definition")
 	}
 	backdropBlock := matchBackdrop[1]
 	backdropZMatch := zIndexExtract.FindStringSubmatch(backdropBlock)
@@ -439,7 +463,7 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 
 	mobileQueryIdx := strings.Index(css, "@media (max-width: 1023px)")
 	if mobileQueryIdx == -1 {
-		t.Fatal("style.css missing @media (max-width: 1023px) query")
+		t.Fatal("layout.css missing @media (max-width: 1023px) query")
 	}
 	mobileQueryBlock := css[mobileQueryIdx:]
 	nextMediaOffset := len("@media (max-width: 1023px)")
@@ -510,7 +534,7 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 	sidebarFooterRegex := regexp.MustCompile(`(?s)\.sidebar-footer\s*\{([^}]+)\}`)
 	matchSidebarFooter := sidebarFooterRegex.FindStringSubmatch(css)
 	if len(matchSidebarFooter) < 2 {
-		t.Fatal("style.css missing .sidebar-footer definition")
+		t.Fatal("layout.css missing .sidebar-footer definition")
 	}
 	footerBlock := matchSidebarFooter[1]
 	if !strings.Contains(footerBlock, "env(safe-area-inset-bottom)") {
@@ -547,7 +571,7 @@ func TestIssue351MobileLogoutOcclusionAndStackingContext(t *testing.T) {
 
 	// Verify mobile bottom bar interaction protection when drawer is open
 	if !strings.Contains(css, ".app-layout:has(.drawer-open) ~ .mobile-bottom-bar") {
-		t.Error("style.css missing rule disabling pointer events on .mobile-bottom-bar when drawer is open")
+		t.Error("layout.css missing rule disabling pointer events on .mobile-bottom-bar when drawer is open")
 	}
 }
 
@@ -586,6 +610,273 @@ func TestServerStaticAssetsProductionServing(t *testing.T) {
 		_, err := fs.ReadFile(staticSubFS, "js/nonexistent_server_script.js")
 		if err == nil {
 			t.Fatalf("expected error reading non-existent server asset from staticSubFS, got nil")
+		}
+	})
+}
+
+var canonicalStylesheetOrder = []string{
+	"tokens",
+	"base",
+	"layout",
+	"components",
+	"tables",
+	"server",
+	"vpn",
+}
+
+var (
+	htmlCommentRegex = regexp.MustCompile(`<!--[\s\S]*?-->`)
+	hrefCSSRegex     = regexp.MustCompile(`^/static/css/(\w+)\.css(?:\?.*)?$`)
+)
+
+func stripHTMLComments(s string) string {
+	return htmlCommentRegex.ReplaceAllString(s, "")
+}
+
+func extractActiveStylesheetOrder(htmlContent string) []string {
+	cleanHTML := stripHTMLComments(htmlContent)
+	z := html.NewTokenizer(strings.NewReader(cleanHTML))
+	var order []string
+
+	for {
+		tt := z.Next()
+		if tt == html.ErrorToken {
+			break
+		}
+		if tt == html.StartTagToken || tt == html.SelfClosingTagToken {
+			tok := z.Token()
+			if strings.EqualFold(tok.Data, "link") {
+				var rel, href, media string
+				hasDisabled := false
+				for _, attr := range tok.Attr {
+					key := strings.ToLower(attr.Key)
+					switch key {
+					case "rel":
+						rel = strings.ToLower(strings.TrimSpace(attr.Val))
+					case "href":
+						href = strings.TrimSpace(attr.Val)
+					case "disabled":
+						hasDisabled = true
+					case "media":
+						media = strings.ToLower(strings.TrimSpace(attr.Val))
+					}
+				}
+				if rel != "stylesheet" || hasDisabled || media == "print" {
+					continue
+				}
+				if m := hrefCSSRegex.FindStringSubmatch(href); len(m) > 1 {
+					order = append(order, m[1])
+				}
+			}
+		}
+	}
+	return order
+}
+
+func TestStyleCSSConcatenationParity(t *testing.T) {
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+
+	var concatenated strings.Builder
+	for _, name := range canonicalStylesheetOrder {
+		mod := "css/" + name + ".css"
+		data, err := fs.ReadFile(staticFS, mod)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", mod, err)
+		}
+		concatenated.Write(data)
+	}
+
+	styleData, err := fs.ReadFile(staticFS, "css/style.css")
+	if err != nil {
+		t.Fatalf("failed to read css/style.css: %v", err)
+	}
+
+	if concatenated.String() != string(styleData) {
+		t.Fatal("style.css does not match concatenation of the 7 modular stylesheets")
+	}
+}
+
+func TestStylesheetTemplateLoadOrder(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	templatesToCheck := []string{"base.html", "login.html", "setup.html", "change_password.html"}
+	for _, tmpl := range templatesToCheck {
+		t.Run(tmpl, func(t *testing.T) {
+			data, err := fs.ReadFile(templatesFS, tmpl)
+			if err != nil {
+				t.Fatalf("failed to read %s: %v", tmpl, err)
+			}
+
+			cleanHTML := stripHTMLComments(string(data))
+			firstIdx := strings.Index(cleanHTML, "/static/css/")
+			lastIdx := strings.LastIndex(cleanHTML, "/static/css/")
+			if firstIdx != -1 && lastIdx != -1 && firstIdx < lastIdx {
+				linkSpan := cleanHTML[firstIdx:lastIdx]
+				if strings.Contains(linkSpan, "{{") {
+					t.Fatalf("%s contains Go template actions between stylesheet links", tmpl)
+				}
+			}
+
+			extractedOrder := extractActiveStylesheetOrder(string(data))
+			if !slices.Equal(canonicalStylesheetOrder, extractedOrder) {
+				t.Fatalf("%s stylesheet link order mismatch:\n got:  %v\n want: %v", tmpl, extractedOrder, canonicalStylesheetOrder)
+			}
+		})
+	}
+
+	t.Run("PreloadLinkFailsClosed", func(t *testing.T) {
+		sample := `
+			<link rel="preload" href="/static/css/tokens.css">
+			<link rel="stylesheet" href="/static/css/base.css">
+			<link rel="stylesheet" href="/static/css/layout.css">
+			<link rel="stylesheet" href="/static/css/components.css">
+			<link rel="stylesheet" href="/static/css/tables.css">
+			<link rel="stylesheet" href="/static/css/server.css">
+			<link rel="stylesheet" href="/static/css/vpn.css">
+		`
+		extracted := extractActiveStylesheetOrder(sample)
+		if slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Fatal("expected preload link to fail matching canonicalStylesheetOrder, but it matched")
+		}
+		if slices.Contains(extracted, "tokens") {
+			t.Fatalf("expected preload link for tokens.css to be ignored, got %v", extracted)
+		}
+	})
+
+	t.Run("DisabledStylesheetLinkFailsClosed", func(t *testing.T) {
+		sample := `
+			<link rel="stylesheet" disabled href="/static/css/tokens.css">
+			<link rel="stylesheet" href="/static/css/base.css">
+			<link rel="stylesheet" href="/static/css/layout.css">
+			<link rel="stylesheet" href="/static/css/components.css">
+			<link rel="stylesheet" href="/static/css/tables.css">
+			<link rel="stylesheet" href="/static/css/server.css">
+			<link rel="stylesheet" href="/static/css/vpn.css">
+		`
+		extracted := extractActiveStylesheetOrder(sample)
+		if slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Fatal("expected disabled stylesheet link to fail matching canonicalStylesheetOrder, but it matched")
+		}
+		if slices.Contains(extracted, "tokens") {
+			t.Fatalf("expected disabled link for tokens.css to be ignored, got %v", extracted)
+		}
+	})
+
+	t.Run("PrintMediaStylesheetLinkFailsClosed", func(t *testing.T) {
+		sample := `
+			<link rel="stylesheet" media="print" href="/static/css/tokens.css">
+			<link rel="stylesheet" href="/static/css/base.css">
+			<link rel="stylesheet" href="/static/css/layout.css">
+			<link rel="stylesheet" href="/static/css/components.css">
+			<link rel="stylesheet" href="/static/css/tables.css">
+			<link rel="stylesheet" href="/static/css/server.css">
+			<link rel="stylesheet" href="/static/css/vpn.css">
+		`
+		extracted := extractActiveStylesheetOrder(sample)
+		if slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Fatal("expected print media stylesheet link to fail matching canonicalStylesheetOrder, but it matched")
+		}
+		if slices.Contains(extracted, "tokens") {
+			t.Fatalf("expected print media link for tokens.css to be ignored, got %v", extracted)
+		}
+	})
+
+	t.Run("AlternateStylesheetLinkFailsClosed", func(t *testing.T) {
+		sample := `
+			<link rel="alternate stylesheet" href="/static/css/tokens.css">
+			<link rel="stylesheet" href="/static/css/base.css">
+			<link rel="stylesheet" href="/static/css/layout.css">
+			<link rel="stylesheet" href="/static/css/components.css">
+			<link rel="stylesheet" href="/static/css/tables.css">
+			<link rel="stylesheet" href="/static/css/server.css">
+			<link rel="stylesheet" href="/static/css/vpn.css">
+		`
+		extracted := extractActiveStylesheetOrder(sample)
+		if slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Fatal("expected alternate stylesheet link to fail matching canonicalStylesheetOrder, but it matched")
+		}
+		if slices.Contains(extracted, "tokens") {
+			t.Fatalf("expected alternate stylesheet link for tokens.css to be ignored, got %v", extracted)
+		}
+	})
+
+	t.Run("CommentedOutLinkFailsClosed", func(t *testing.T) {
+		sample := `
+			<!-- <link rel="stylesheet" href="/static/css/tokens.css"> -->
+			<link rel="stylesheet" href="/static/css/base.css">
+			<link rel="stylesheet" href="/static/css/layout.css">
+			<link rel="stylesheet" href="/static/css/components.css">
+			<link rel="stylesheet" href="/static/css/tables.css">
+			<link rel="stylesheet" href="/static/css/server.css">
+			<link rel="stylesheet" href="/static/css/vpn.css">
+		`
+		extracted := extractActiveStylesheetOrder(sample)
+		if slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Fatal("expected commented-out link to fail matching canonicalStylesheetOrder, but it matched")
+		}
+	})
+
+	t.Run("CommentedExtraLinkDoesNotCorruptExtractedOrder", func(t *testing.T) {
+		sample := `
+			<!-- <link rel="stylesheet" href="/static/css/vpn.css"> -->
+			<link rel="stylesheet" href="/static/css/tokens.css">
+			<link rel="stylesheet" href='/static/css/base.css'>
+			<link rel="stylesheet" href="/static/css/layout.css">
+			<link rel="stylesheet" href="/static/css/components.css">
+			<link rel="stylesheet" href="/static/css/tables.css">
+			<link rel="stylesheet" href="/static/css/server.css">
+			<link rel="stylesheet" href="/static/css/vpn.css">
+		`
+		extracted := extractActiveStylesheetOrder(sample)
+		if !slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Fatalf("expected canonical order when extra link is commented out, got: %v", extracted)
+		}
+	})
+
+	t.Run("SingleAndDoubleQuotesBothSupported", func(t *testing.T) {
+		sample := `
+			<link rel='stylesheet' href='/static/css/tokens.css'>
+			<link rel="stylesheet" href="/static/css/base.css">
+			<link rel='stylesheet' href='/static/css/layout.css'>
+			<link rel="stylesheet" href="/static/css/components.css">
+			<link rel='stylesheet' href='/static/css/tables.css'>
+			<link rel="stylesheet" href="/static/css/server.css">
+			<link rel='stylesheet' href='/static/css/vpn.css'>
+		`
+		extracted := extractActiveStylesheetOrder(sample)
+		if !slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Fatalf("expected canonical order with mixed quotes, got: %v", extracted)
+		}
+	})
+
+	t.Run("NoStylesheetLinksInChildTemplates", func(t *testing.T) {
+		entries, err := fs.Glob(templatesFS, "*.html")
+		if err != nil {
+			t.Fatalf("failed to glob templates: %v", err)
+		}
+		shells := map[string]bool{
+			"base.html":            true,
+			"login.html":           true,
+			"setup.html":           true,
+			"change_password.html": true,
+		}
+		for _, entry := range entries {
+			if shells[entry] {
+				continue
+			}
+			content, err := fs.ReadFile(templatesFS, entry)
+			if err != nil {
+				t.Fatalf("failed to read %s: %v", entry, err)
+			}
+			if strings.Contains(string(content), "/static/css/") {
+				t.Errorf("child template %s defines unexpected stylesheet link", entry)
+			}
 		}
 	})
 }

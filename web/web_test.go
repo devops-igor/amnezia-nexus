@@ -67,12 +67,16 @@ func TestModernJavaScriptAndInteractiveComponents(t *testing.T) {
 		}
 	}
 
-	// 3. Assert style.css skeleton shimmer and micro-interactions
-	cssData, err := fs.ReadFile(staticFS, "css/style.css")
+	// 3. Assert base.css and components.css skeleton shimmer and micro-interactions
+	baseCSSData, err := fs.ReadFile(staticFS, "css/base.css")
 	if err != nil {
-		t.Fatalf("failed to read css/style.css: %v", err)
+		t.Fatalf("failed to read css/base.css: %v", err)
 	}
-	cssStr := string(cssData)
+	compData, err := fs.ReadFile(staticFS, "css/components.css")
+	if err != nil {
+		t.Fatalf("failed to read css/components.css: %v", err)
+	}
+	cssStr := string(baseCSSData) + "\n" + string(compData)
 	requiredCSS := []string{
 		"@keyframes shimmer",
 		".skeleton",
@@ -85,7 +89,7 @@ func TestModernJavaScriptAndInteractiveComponents(t *testing.T) {
 	}
 	for _, item := range requiredCSS {
 		if !strings.Contains(cssStr, item) {
-			t.Errorf("style.css missing required skeleton or micro-interaction token %q", item)
+			t.Errorf("base.css / components.css missing required skeleton or micro-interaction token %q", item)
 		}
 	}
 
@@ -221,12 +225,16 @@ func TestPhase3TablesAndTelemetryEngine(t *testing.T) {
 		}
 	}
 
-	// 3. Assert style.css Phase 3 styles
-	cssData, err := fs.ReadFile(staticFS, "css/style.css")
+	// 3. Assert tables.css and vpn.css Phase 3 styles
+	cssTablesData, err := fs.ReadFile(staticFS, "css/tables.css")
 	if err != nil {
-		t.Fatalf("failed to read css/style.css: %v", err)
+		t.Fatalf("failed to read css/tables.css: %v", err)
 	}
-	cssStr := string(cssData)
+	vpnData, err := fs.ReadFile(staticFS, "css/vpn.css")
+	if err != nil {
+		t.Fatalf("failed to read css/vpn.css: %v", err)
+	}
+	cssStr := string(cssTablesData) + "\n" + string(vpnData)
 	requiredCSSPhase3 := []string{
 		".table-toolbar",
 		".table-search-box",
@@ -243,7 +251,7 @@ func TestPhase3TablesAndTelemetryEngine(t *testing.T) {
 	}
 	for _, item := range requiredCSSPhase3 {
 		if !strings.Contains(cssStr, item) {
-			t.Errorf("style.css missing required Phase 3 CSS token %q", item)
+			t.Errorf("tables.css / vpn.css missing required Phase 3 CSS token %q", item)
 		}
 	}
 
@@ -500,12 +508,16 @@ func TestPhase6ClientExperienceAndPolish(t *testing.T) {
 		}
 	}
 
-	// 5. CSS Tokens and RTL Rules in style.css
-	cssData, err := fs.ReadFile(staticFS, "css/style.css")
+	// 5. CSS Tokens and RTL Rules in components.css and vpn.css
+	compData, err := fs.ReadFile(staticFS, "css/components.css")
 	if err != nil {
-		t.Fatalf("failed to read css/style.css: %v", err)
+		t.Fatalf("failed to read css/components.css: %v", err)
 	}
-	cssStr := string(cssData)
+	vpnData, err := fs.ReadFile(staticFS, "css/vpn.css")
+	if err != nil {
+		t.Fatalf("failed to read css/vpn.css: %v", err)
+	}
+	cssStr := string(compData) + "\n" + string(vpnData)
 
 	requiredCSSRules := []string{
 		".switch-container",
@@ -526,7 +538,7 @@ func TestPhase6ClientExperienceAndPolish(t *testing.T) {
 	}
 	for _, rule := range requiredCSSRules {
 		if !strings.Contains(cssStr, rule) {
-			t.Errorf("style.css missing required Phase 6 CSS rule %q", rule)
+			t.Errorf("components.css / vpn.css missing required Phase 6 CSS rule %q", rule)
 		}
 	}
 }

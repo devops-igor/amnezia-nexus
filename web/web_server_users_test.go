@@ -212,20 +212,20 @@ func TestIssue113UsersUIModernization(t *testing.T) {
 		}
 	}
 
-	// 7. Assert style.css contains .clients-list, #usersContainer, #usersGrid, and #userConnsTable width rules
-	cssData, err := fs.ReadFile(staticFS, "css/style.css")
+	// 7. Assert vpn.css contains #usersContainer, #usersGrid, and #userConnsTable width rules
+	cssData, err := fs.ReadFile(staticFS, "css/vpn.css")
 	if err != nil {
-		t.Fatalf("failed to read css/style.css: %v", err)
+		t.Fatalf("failed to read css/vpn.css: %v", err)
 	}
 	cssStr := string(cssData)
 	if !strings.Contains(cssStr, "#usersContainer {\n    width: 100%;\n    min-width: 100%;\n}") {
-		t.Errorf("style.css missing #usersContainer width rules")
+		t.Errorf("vpn.css missing #usersContainer width rules")
 	}
 	if !strings.Contains(cssStr, "#usersGrid {\n    width: 100%;\n    min-width: 100%;\n}") {
-		t.Errorf("style.css missing #usersGrid width rules")
+		t.Errorf("vpn.css missing #usersGrid width rules")
 	}
 	if !strings.Contains(cssStr, "#userConnsTable {\n    width: 100%;\n    min-width: 100%;\n}") {
-		t.Errorf("style.css missing #userConnsTable width rules")
+		t.Errorf("vpn.css missing #userConnsTable width rules")
 	}
 }
 

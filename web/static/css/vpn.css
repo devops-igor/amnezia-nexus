@@ -1,0 +1,449 @@
+/* ===== Utility ===== */
+.flex {
+    display: flex;
+}
+
+.items-center {
+    align-items: center;
+}
+
+.justify-between {
+    justify-content: space-between;
+}
+
+.gap-xs {
+    gap: var(--space-xs);
+}
+
+.gap-sm {
+    gap: var(--space-sm);
+}
+
+.gap-md {
+    gap: var(--space-md);
+}
+
+.mt-md {
+    margin-top: var(--space-md);
+}
+
+.text-muted {
+    color: var(--text-muted);
+}
+
+.text-sm {
+    font-size: 0.82rem;
+}
+
+.font-mono {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.hidden {
+    display: none !important;
+}
+
+/* ===== VPN Link ===== */
+.vpn-link-box {
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    padding: var(--space-md);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 0.72rem;
+    line-height: 1.6;
+    color: var(--accent-light);
+    word-break: break-all;
+    max-height: 200px;
+    overflow-y: auto;
+    user-select: all;
+}
+
+/* ===== Telemetry & Sparkline Widgets ===== */
+.sparkline-container {
+    display: inline-flex;
+    align-items: center;
+    position: relative;
+    border-radius: var(--radius-sm);
+    transition: var(--transition-fast);
+}
+
+.sparkline-container:hover {
+    filter: drop-shadow(0 0 6px var(--accent-glow));
+}
+
+.sparkline-svg {
+    display: block;
+    overflow: visible;
+    vertical-align: middle;
+}
+
+.sparkline-path {
+    transition: stroke var(--transition-fast);
+}
+
+.sparkline-area {
+    pointer-events: none;
+}
+
+.sparkline-dot {
+    transition: transform var(--transition-fast), r var(--transition-fast);
+    cursor: pointer;
+}
+
+.sparkline-dot:hover {
+    r: 4.5;
+    filter: drop-shadow(0 0 4px currentColor);
+}
+
+/* ===== Client Dashboard & Settings Modern Polish ===== */
+.settings-section-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    padding: var(--space-lg);
+    box-shadow: var(--shadow-sm);
+    transition: var(--transition-fast);
+}
+
+.settings-section-card:hover {
+    border-color: var(--border-hover);
+}
+
+.settings-card-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    margin-bottom: var(--space-md);
+    padding-bottom: var(--space-sm);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.settings-card-header .card-title {
+    margin-bottom: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+}
+
+.settings-card-header .icon {
+    width: 1.2rem;
+    height: 1.2rem;
+    color: var(--accent);
+}
+
+/* Modern Connections List & Cards */
+.connections-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-md);
+    margin-bottom: var(--space-lg);
+}
+
+.connections-toolbar-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    flex-wrap: wrap;
+}
+
+.network-health-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 0.75rem;
+    margin-top: 0.75rem;
+}
+
+.network-health-node {
+    background: var(--bg-surface);
+    padding: 0.75rem 1rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-color);
+    transition: var(--transition-fast);
+}
+
+.network-health-node:hover {
+    border-color: var(--border-hover);
+    background: var(--bg-card-hover);
+}
+
+[dir="rtl"] .client-meta > * {
+    margin-left: var(--space-sm);
+    margin-right: 0;
+}
+
+/* Load Balancer Selection Callout */
+.lb-selection-callout {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-sm);
+    margin-top: var(--space-sm);
+    padding: 0.625rem 0.875rem;
+    background: var(--success-bg);
+    border: 1px solid var(--success-border);
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+    line-height: 1.4;
+}
+
+.lb-selection-callout .icon {
+    width: 16px;
+    height: 16px;
+    color: var(--success);
+    flex-shrink: 0;
+    margin-top: 2px;
+}
+
+.lb-selection-callout strong {
+    color: var(--success);
+}
+
+[dir="rtl"] .lb-selection-callout {
+    text-align: right;
+}
+
+/* ========================================
+   Issue #101: Modernized VPN Section & Tables
+   ======================================== */
+
+/* Stat Cards */
+.stat-card {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    min-height: 124px;
+    padding: var(--space-md) var(--space-lg);
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    transition: all var(--transition-base);
+}
+
+.stat-card:hover {
+    border-color: var(--border-hover);
+    box-shadow: var(--shadow-card);
+}
+
+.stat-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm);
+    margin-bottom: var(--space-xs);
+}
+
+.stat-card-title {
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    margin: 0;
+}
+
+.stat-card-value {
+    font-size: 1.5rem;
+    font-weight: 700;
+    line-height: 1.25;
+    color: var(--text-primary);
+    margin: var(--space-xs) 0;
+    word-break: break-all;
+}
+
+.stat-card-sub {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-top: auto;
+    padding-top: var(--space-xs);
+}
+
+/* Latency Indicators */
+.latency-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 8px;
+    border-radius: var(--radius-full);
+    font-family: var(--font-mono, 'SF Mono', monospace);
+    font-size: 0.775rem;
+    font-weight: 600;
+    line-height: 1.4;
+    white-space: nowrap;
+}
+
+.latency-good {
+    color: var(--success);
+    background: rgba(34, 197, 94, 0.1);
+    border: 1px solid rgba(34, 197, 94, 0.25);
+}
+
+.latency-fair {
+    color: var(--warning);
+    background: rgba(245, 158, 11, 0.1);
+    border: 1px solid rgba(245, 158, 11, 0.25);
+}
+
+.latency-poor {
+    color: var(--danger);
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.25);
+}
+
+.latency-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+}
+
+/* Modal Info Card */
+.info-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    padding: var(--space-md);
+    font-size: 0.85rem;
+}
+
+.info-card-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: var(--space-sm);
+}
+
+.info-card-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.info-card-label {
+    font-size: 0.725rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-weight: 600;
+}
+
+.info-card-value {
+    font-weight: 600;
+    color: var(--text-primary);
+    font-size: 0.875rem;
+}
+
+.modal-notice-error {
+    padding: var(--space-sm) var(--space-md);
+    border-radius: var(--radius-sm);
+    margin-bottom: var(--space-md);
+    font-size: 0.85rem;
+    color: var(--danger);
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.25);
+}
+
+/* Modernized Interactive Table Polish */
+.interactive-table {
+    width: 100%;
+    min-width: 100%;
+    border-collapse: collapse;
+}
+
+.interactive-table th {
+    padding: var(--space-md) var(--space-lg);
+    background: var(--bg-surface);
+    font-size: 0.775rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.interactive-table td {
+    padding: var(--space-md) var(--space-lg);
+    border-bottom: 1px solid var(--border-color);
+    vertical-align: middle;
+    font-size: 0.875rem;
+}
+
+.interactive-table tbody tr {
+    transition: background var(--transition-fast);
+}
+
+.interactive-table tbody tr:hover {
+    background: var(--bg-card-hover);
+}
+
+.interactive-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
+.btn-sm.btn-icon {
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.btn-danger-hover:hover {
+    color: var(--danger) !important;
+    background: rgba(239, 68, 68, 0.1) !important;
+}
+
+.btn-success-hover:hover {
+    color: var(--success) !important;
+    background: rgba(34, 197, 94, 0.1) !important;
+}
+
+/* ===== Modernized Users Section (Issue #113) ===== */
+#usersContainer {
+    width: 100%;
+    min-width: 100%;
+}
+
+#usersGrid {
+    width: 100%;
+    min-width: 100%;
+}
+
+#userConnsTable {
+    width: 100%;
+    min-width: 100%;
+}
+
+.user-card {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    padding: var(--space-md);
+    transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.user-card:hover {
+    border-color: var(--border-hover);
+}
+
+.user-avatar-circle {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    font-weight: 700;
+    font-size: 1.1rem;
+    color: var(--accent);
+    flex-shrink: 0;
+}
