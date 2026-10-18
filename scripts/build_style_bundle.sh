@@ -35,6 +35,7 @@ for mod in "${MODULES[@]}"; do
     cat "$mod_path" >> "$TEMP_FILE"
 done
 
+chmod 644 "$TEMP_FILE"
 mv "$TEMP_FILE" "$OUTPUT_FILE"
 echo "Successfully generated $OUTPUT_FILE from ${#MODULES[@]} modules."
 exit 0

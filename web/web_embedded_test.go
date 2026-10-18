@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"golang.org/x/net/html"
 )
 
 func TestEmbeddedTranslations(t *testing.T) {
@@ -623,12 +625,52 @@ var canonicalStylesheetOrder = []string{
 }
 
 var (
-	cssLinkRegex     = regexp.MustCompile(`href=["']/static/css/(\w+)\.css`)
 	htmlCommentRegex = regexp.MustCompile(`<!--[\s\S]*?-->`)
+	hrefCSSRegex     = regexp.MustCompile(`^/static/css/(\w+)\.css(?:\?.*)?$`)
 )
 
 func stripHTMLComments(s string) string {
 	return htmlCommentRegex.ReplaceAllString(s, "")
+}
+
+func extractActiveStylesheetOrder(htmlContent string) []string {
+	cleanHTML := stripHTMLComments(htmlContent)
+	z := html.NewTokenizer(strings.NewReader(cleanHTML))
+	var order []string
+
+	for {
+		tt := z.Next()
+		if tt == html.ErrorToken {
+			break
+		}
+		if tt == html.StartTagToken || tt == html.SelfClosingTagToken {
+			tok := z.Token()
+			if strings.EqualFold(tok.Data, "link") {
+				var rel, href, media string
+				hasDisabled := false
+				for _, attr := range tok.Attr {
+					key := strings.ToLower(attr.Key)
+					switch key {
+					case "rel":
+						rel = strings.ToLower(strings.TrimSpace(attr.Val))
+					case "href":
+						href = strings.TrimSpace(attr.Val)
+					case "disabled":
+						hasDisabled = true
+					case "media":
+						media = strings.ToLower(strings.TrimSpace(attr.Val))
+					}
+				}
+				if rel != "stylesheet" || hasDisabled || media == "print" {
+					continue
+				}
+				if m := hrefCSSRegex.FindStringSubmatch(href); len(m) > 1 {
+					order = append(order, m[1])
+				}
+			}
+		}
+	}
+	return order
 }
 
 func TestStyleCSSConcatenationParity(t *testing.T) {
@@ -672,19 +714,97 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			}
 
 			cleanHTML := stripHTMLComments(string(data))
-			matches := cssLinkRegex.FindAllStringSubmatch(cleanHTML, -1)
-			extractedOrder := make([]string, 0, len(matches))
-			for _, m := range matches {
-				if len(m) > 1 {
-					extractedOrder = append(extractedOrder, m[1])
+			firstIdx := strings.Index(cleanHTML, "/static/css/")
+			lastIdx := strings.LastIndex(cleanHTML, "/static/css/")
+			if firstIdx != -1 && lastIdx != -1 && firstIdx < lastIdx {
+				linkSpan := cleanHTML[firstIdx:lastIdx]
+				if strings.Contains(linkSpan, "{{") {
+					t.Fatalf("%s contains Go template actions between stylesheet links", tmpl)
 				}
 			}
 
+			extractedOrder := extractActiveStylesheetOrder(string(data))
 			if !slices.Equal(canonicalStylesheetOrder, extractedOrder) {
 				t.Fatalf("%s stylesheet link order mismatch:\n got:  %v\n want: %v", tmpl, extractedOrder, canonicalStylesheetOrder)
 			}
 		})
 	}
+
+	t.Run("PreloadLinkFailsClosed", func(t *testing.T) {
+		sample := `
+			<link rel="preload" href="/static/css/tokens.css">
+			<link rel="stylesheet" href="/static/css/base.css">
+			<link rel="stylesheet" href="/static/css/layout.css">
+			<link rel="stylesheet" href="/static/css/components.css">
+			<link rel="stylesheet" href="/static/css/tables.css">
+			<link rel="stylesheet" href="/static/css/server.css">
+			<link rel="stylesheet" href="/static/css/vpn.css">
+		`
+		extracted := extractActiveStylesheetOrder(sample)
+		if slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Fatal("expected preload link to fail matching canonicalStylesheetOrder, but it matched")
+		}
+		if slices.Contains(extracted, "tokens") {
+			t.Fatalf("expected preload link for tokens.css to be ignored, got %v", extracted)
+		}
+	})
+
+	t.Run("DisabledStylesheetLinkFailsClosed", func(t *testing.T) {
+		sample := `
+			<link rel="stylesheet" disabled href="/static/css/tokens.css">
+			<link rel="stylesheet" href="/static/css/base.css">
+			<link rel="stylesheet" href="/static/css/layout.css">
+			<link rel="stylesheet" href="/static/css/components.css">
+			<link rel="stylesheet" href="/static/css/tables.css">
+			<link rel="stylesheet" href="/static/css/server.css">
+			<link rel="stylesheet" href="/static/css/vpn.css">
+		`
+		extracted := extractActiveStylesheetOrder(sample)
+		if slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Fatal("expected disabled stylesheet link to fail matching canonicalStylesheetOrder, but it matched")
+		}
+		if slices.Contains(extracted, "tokens") {
+			t.Fatalf("expected disabled link for tokens.css to be ignored, got %v", extracted)
+		}
+	})
+
+	t.Run("PrintMediaStylesheetLinkFailsClosed", func(t *testing.T) {
+		sample := `
+			<link rel="stylesheet" media="print" href="/static/css/tokens.css">
+			<link rel="stylesheet" href="/static/css/base.css">
+			<link rel="stylesheet" href="/static/css/layout.css">
+			<link rel="stylesheet" href="/static/css/components.css">
+			<link rel="stylesheet" href="/static/css/tables.css">
+			<link rel="stylesheet" href="/static/css/server.css">
+			<link rel="stylesheet" href="/static/css/vpn.css">
+		`
+		extracted := extractActiveStylesheetOrder(sample)
+		if slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Fatal("expected print media stylesheet link to fail matching canonicalStylesheetOrder, but it matched")
+		}
+		if slices.Contains(extracted, "tokens") {
+			t.Fatalf("expected print media link for tokens.css to be ignored, got %v", extracted)
+		}
+	})
+
+	t.Run("AlternateStylesheetLinkFailsClosed", func(t *testing.T) {
+		sample := `
+			<link rel="alternate stylesheet" href="/static/css/tokens.css">
+			<link rel="stylesheet" href="/static/css/base.css">
+			<link rel="stylesheet" href="/static/css/layout.css">
+			<link rel="stylesheet" href="/static/css/components.css">
+			<link rel="stylesheet" href="/static/css/tables.css">
+			<link rel="stylesheet" href="/static/css/server.css">
+			<link rel="stylesheet" href="/static/css/vpn.css">
+		`
+		extracted := extractActiveStylesheetOrder(sample)
+		if slices.Equal(canonicalStylesheetOrder, extracted) {
+			t.Fatal("expected alternate stylesheet link to fail matching canonicalStylesheetOrder, but it matched")
+		}
+		if slices.Contains(extracted, "tokens") {
+			t.Fatalf("expected alternate stylesheet link for tokens.css to be ignored, got %v", extracted)
+		}
+	})
 
 	t.Run("CommentedOutLinkFailsClosed", func(t *testing.T) {
 		sample := `
@@ -696,14 +816,7 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			<link rel="stylesheet" href="/static/css/server.css">
 			<link rel="stylesheet" href="/static/css/vpn.css">
 		`
-		cleanHTML := stripHTMLComments(sample)
-		matches := cssLinkRegex.FindAllStringSubmatch(cleanHTML, -1)
-		extracted := make([]string, 0, len(matches))
-		for _, m := range matches {
-			if len(m) > 1 {
-				extracted = append(extracted, m[1])
-			}
-		}
+		extracted := extractActiveStylesheetOrder(sample)
 		if slices.Equal(canonicalStylesheetOrder, extracted) {
 			t.Fatal("expected commented-out link to fail matching canonicalStylesheetOrder, but it matched")
 		}
@@ -720,14 +833,7 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			<link rel="stylesheet" href="/static/css/server.css">
 			<link rel="stylesheet" href="/static/css/vpn.css">
 		`
-		cleanHTML := stripHTMLComments(sample)
-		matches := cssLinkRegex.FindAllStringSubmatch(cleanHTML, -1)
-		extracted := make([]string, 0, len(matches))
-		for _, m := range matches {
-			if len(m) > 1 {
-				extracted = append(extracted, m[1])
-			}
-		}
+		extracted := extractActiveStylesheetOrder(sample)
 		if !slices.Equal(canonicalStylesheetOrder, extracted) {
 			t.Fatalf("expected canonical order when extra link is commented out, got: %v", extracted)
 		}
@@ -743,16 +849,34 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			<link rel="stylesheet" href="/static/css/server.css">
 			<link rel='stylesheet' href='/static/css/vpn.css'>
 		`
-		cleanHTML := stripHTMLComments(sample)
-		matches := cssLinkRegex.FindAllStringSubmatch(cleanHTML, -1)
-		extracted := make([]string, 0, len(matches))
-		for _, m := range matches {
-			if len(m) > 1 {
-				extracted = append(extracted, m[1])
-			}
-		}
+		extracted := extractActiveStylesheetOrder(sample)
 		if !slices.Equal(canonicalStylesheetOrder, extracted) {
 			t.Fatalf("expected canonical order with mixed quotes, got: %v", extracted)
+		}
+	})
+
+	t.Run("NoStylesheetLinksInChildTemplates", func(t *testing.T) {
+		entries, err := fs.Glob(templatesFS, "*.html")
+		if err != nil {
+			t.Fatalf("failed to glob templates: %v", err)
+		}
+		shells := map[string]bool{
+			"base.html":            true,
+			"login.html":           true,
+			"setup.html":           true,
+			"change_password.html": true,
+		}
+		for _, entry := range entries {
+			if shells[entry] {
+				continue
+			}
+			content, err := fs.ReadFile(templatesFS, entry)
+			if err != nil {
+				t.Fatalf("failed to read %s: %v", entry, err)
+			}
+			if strings.Contains(string(content), "/static/css/") {
+				t.Errorf("child template %s defines unexpected stylesheet link", entry)
+			}
 		}
 	})
 }

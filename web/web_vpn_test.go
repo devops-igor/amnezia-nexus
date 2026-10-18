@@ -766,13 +766,7 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 			}
 		}
 
-		matches := cssLinkRegex.FindAllStringSubmatch(cleanTmplStr, -1)
-		extracted := make([]string, 0, len(matches))
-		for _, m := range matches {
-			if len(m) > 1 {
-				extracted = append(extracted, m[1])
-			}
-		}
+		extracted := extractActiveStylesheetOrder(cleanTmplStr)
 		if !slices.Equal(canonicalStylesheetOrder, extracted) {
 			t.Errorf("%s stylesheet link order mismatch: got %v, want %v", tmpl, extracted, canonicalStylesheetOrder)
 		}

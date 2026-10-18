@@ -7,6 +7,7 @@ combinations, viewports, and themes in headless Chromium.
 import glob
 import os
 import re
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -72,13 +73,38 @@ PROBE_SCRIPT = """
 """
 
 
+class StylesheetLinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.stylesheets: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "link":
+            return
+        attr_dict = {
+            k.lower(): (v.strip() if isinstance(v, str) else "") for k, v in attrs
+        }
+        if attr_dict.get("rel", "").lower() != "stylesheet":
+            return
+        if "disabled" in attr_dict:
+            return
+        if attr_dict.get("media", "").lower() == "print":
+            return
+        href = attr_dict.get("href", "")
+        m = re.search(r"/static/css/(\w+\.css)", href)
+        if m:
+            self.stylesheets.append(m.group(1))
+
+
 def extract_base_template_stylesheets(repo_root: Path) -> list[str]:
-    """Parse stylesheet filenames from web/templates/base.html in document order."""
+    """Parse active stylesheet filenames from web/templates/base.html in document order."""
     base_file = repo_root / "web" / "templates" / "base.html"
     base_html = base_file.read_text(encoding="utf-8")
-    matches = re.findall(r'href="/static/css/(\w+\.css)', base_html)
-    assert matches, "Failed to extract stylesheet links from base.html"
-    return matches
+    clean_html = re.sub(r"<!--[\s\S]*?-->", "", base_html)
+    parser = StylesheetLinkParser()
+    parser.feed(clean_html)
+    assert parser.stylesheets, "Failed to extract stylesheet links from base.html"
+    return parser.stylesheets
 
 
 def strip_template_syntax(html: str) -> str:
@@ -219,4 +245,12 @@ def test_css_computed_style_differential(repo_root: Path):
                                 })
         browser.close()
 
-    assert len(diffs) == 0, f"Detected {len(diffs)} computed style differences"
+    if diffs:
+        sample = "\n".join(
+            f"  [{d['page']}] {d['viewport']} ({d['theme']}): {d['element']}"
+            for d in diffs[:20]
+        )
+        assert len(diffs) == 0, (
+            f"Detected {len(diffs)} computed style differences:\n{sample}"
+        )
+    assert len(diffs) == 0
