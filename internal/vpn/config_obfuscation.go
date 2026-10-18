@@ -118,7 +118,7 @@ func generateMissingObfuscation(cfg *models.VPNConfig) (bool, error) {
 // divergent ephemeral values. The ListenPort is propagated through every save branch (R3):
 // the migration must never persist a zeroed listen_port, which GetVPNConfig's
 // fill-down would re-default to the default port and desync the running listener
-// from rendered client configs. Ports <= 0 fall back to DefaultListenPort.
+// from rendered client configs. Ports <= 0 fall back to 51820.
 func ensureObfuscationParams(ctx context.Context, db *database.DB, cfg *models.VPNConfig) error {
 	if cfg == nil {
 		return nil

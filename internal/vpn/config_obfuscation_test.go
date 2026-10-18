@@ -1,6 +1,7 @@
 package vpn
 
 import (
+	"context"
 	"encoding/base64"
 	"reflect"
 	"testing"
@@ -56,7 +57,7 @@ func TestEnforceMinSValues(t *testing.T) {
 		{
 			name: "only S1 below 12",
 			input: &models.VPNConfig{
-				S1: 10, S2: 15, S3: 20, S4: 25,
+				S1: 11, S2: 15, S3: 20, S4: 25,
 			},
 			wantChanged: true,
 			wantS1:      12,
@@ -67,7 +68,7 @@ func TestEnforceMinSValues(t *testing.T) {
 		{
 			name: "only S2 below 12",
 			input: &models.VPNConfig{
-				S1: 15, S2: 8, S3: 20, S4: 25,
+				S1: 15, S2: 11, S3: 20, S4: 25,
 			},
 			wantChanged: true,
 			wantS1:      15,
@@ -78,7 +79,7 @@ func TestEnforceMinSValues(t *testing.T) {
 		{
 			name: "only S3 below 12",
 			input: &models.VPNConfig{
-				S1: 15, S2: 20, S3: 5, S4: 25,
+				S1: 15, S2: 20, S3: 11, S4: 25,
 			},
 			wantChanged: true,
 			wantS1:      15,
@@ -155,9 +156,9 @@ func TestIsObfuscationConfigComplete(t *testing.T) {
 		mod  func(*models.VPNConfig)
 	}{
 		{"S1 < 12", func(c *models.VPNConfig) { c.S1 = 11 }},
-		{"S2 < 12", func(c *models.VPNConfig) { c.S2 = 0 }},
-		{"S3 < 12", func(c *models.VPNConfig) { c.S3 = -1 }},
-		{"S4 < 12", func(c *models.VPNConfig) { c.S4 = 5 }},
+		{"S2 < 12", func(c *models.VPNConfig) { c.S2 = 11 }},
+		{"S3 < 12", func(c *models.VPNConfig) { c.S3 = 11 }},
+		{"S4 < 12", func(c *models.VPNConfig) { c.S4 = 11 }},
 	}
 	for _, st := range sTests {
 		t.Run(st.name, func(t *testing.T) {
@@ -378,7 +379,7 @@ func TestObfuscationDiffers(t *testing.T) {
 			name: "non-obfuscation fields differ does not trigger obfuscation diff",
 			modify: func(c *models.VPNConfig) {
 				c.ListenPort = 55555
-				c.SubnetCIDR = "192.168.0.0/24"
+				c.SubnetCIDR = "10.200.0.0/24"
 				c.Algorithm = models.LBWeighted
 				c.HealthThresholdMS = 999
 				c.MaxTotalPeers = 2000
@@ -542,7 +543,7 @@ func TestDefaultVPNConfig_And_ApplyVPNConfigDefaults(t *testing.T) {
 		cfg := &models.VPNConfig{
 			Algorithm:          models.LBWeighted,
 			ListenPort:         55555,
-			SubnetCIDR:         "192.168.1.0/24",
+			SubnetCIDR:         "10.201.0.0/24",
 			HealthThresholdMS:  1000,
 			MaxTotalPeers:      500,
 			MaxPeersPerBackend: 100,
@@ -551,7 +552,7 @@ func TestDefaultVPNConfig_And_ApplyVPNConfigDefaults(t *testing.T) {
 		applyVPNConfigDefaults(cfg)
 
 		if cfg.Algorithm != models.LBWeighted || cfg.ListenPort != 55555 ||
-			cfg.SubnetCIDR != "192.168.1.0/24" || cfg.HealthThresholdMS != 1000 ||
+			cfg.SubnetCIDR != "10.201.0.0/24" || cfg.HealthThresholdMS != 1000 ||
 			cfg.MaxTotalPeers != 500 || cfg.MaxPeersPerBackend != 100 ||
 			cfg.Weights[1] != 10 {
 			t.Errorf("valid values were overwritten: %+v", cfg)
@@ -579,4 +580,141 @@ func TestGeneratePortalHeaderProtectionKey(t *testing.T) {
 	if key1 == key2 {
 		t.Fatalf("expected distinct random keys, got identical: %q", key1)
 	}
+}
+
+func TestEnsureObfuscationParams_MigrationScenarios(t *testing.T) {
+	t.Run("Case A: persisted complete wins over in-memory guess and DB is not rewritten", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+
+		persisted := makeCompleteTestConfig()
+		persisted.ListenPort = 51820
+		if err := db.SaveVPNConfig(ctx, persisted); err != nil {
+			t.Fatalf("failed to save initial persisted config: %v", err)
+		}
+
+		inMem := &models.VPNConfig{
+			H1:         models.NewHeaderRange(1000000, 1000000), // degenerate
+			ListenPort: 51820,
+		}
+
+		if err := ensureObfuscationParams(ctx, db, inMem); err != nil {
+			t.Fatalf("ensureObfuscationParams failed: %v", err)
+		}
+
+		if inMem.H1 != persisted.H1 || inMem.H2 != persisted.H2 || inMem.H3 != persisted.H3 || inMem.H4 != persisted.H4 {
+			t.Errorf("inMem header ranges do not match persisted: got (%v, %v, %v, %v), want (%v, %v, %v, %v)",
+				inMem.H1, inMem.H2, inMem.H3, inMem.H4,
+				persisted.H1, persisted.H2, persisted.H3, persisted.H4)
+		}
+		if inMem.S1 != persisted.S1 || inMem.S2 != persisted.S2 || inMem.S3 != persisted.S3 || inMem.S4 != persisted.S4 {
+			t.Errorf("inMem S values do not match persisted: got (%d, %d, %d, %d), want (%d, %d, %d, %d)",
+				inMem.S1, inMem.S2, inMem.S3, inMem.S4,
+				persisted.S1, persisted.S2, persisted.S3, persisted.S4)
+		}
+		if inMem.HeaderProtectionKey != persisted.HeaderProtectionKey {
+			t.Errorf("inMem HPK does not match persisted: got %q, want %q",
+				inMem.HeaderProtectionKey, persisted.HeaderProtectionKey)
+		}
+
+		afterDB, err := db.GetVPNConfig(ctx)
+		if err != nil {
+			t.Fatalf("failed to read persisted config: %v", err)
+		}
+		if afterDB.H1 != persisted.H1 || afterDB.H2 != persisted.H2 || afterDB.H3 != persisted.H3 || afterDB.H4 != persisted.H4 ||
+			afterDB.S1 != persisted.S1 || afterDB.S2 != persisted.S2 || afterDB.S3 != persisted.S3 || afterDB.S4 != persisted.S4 ||
+			afterDB.HeaderProtectionKey != persisted.HeaderProtectionKey {
+			t.Errorf("persisted DB config was modified: got %+v, want %+v", afterDB, persisted)
+		}
+	})
+
+	t.Run("Case B: R3 ListenPort propagation updates persisted config port", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+
+		persisted := &models.VPNConfig{
+			ListenPort: 51820,
+		}
+		if err := db.SaveVPNConfig(ctx, persisted); err != nil {
+			t.Fatalf("failed to save initial persisted config: %v", err)
+		}
+
+		inMem := &models.VPNConfig{
+			ListenPort: 52000,
+		}
+
+		if err := ensureObfuscationParams(ctx, db, inMem); err != nil {
+			t.Fatalf("ensureObfuscationParams failed: %v", err)
+		}
+
+		afterDB, err := db.GetVPNConfig(ctx)
+		if err != nil {
+			t.Fatalf("failed to read persisted config: %v", err)
+		}
+		if afterDB.ListenPort != 52000 {
+			t.Errorf("persisted ListenPort = %d, want 52000", afterDB.ListenPort)
+		}
+		if inMem.ListenPort != 52000 {
+			t.Errorf("inMem ListenPort = %d, want 52000", inMem.ListenPort)
+		}
+	})
+
+	t.Run("Case C: partial HPK adoption preserves persisted key without regeneration", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+
+		expectedHPK := "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+		persisted := &models.VPNConfig{
+			ListenPort:          51820,
+			HeaderProtectionKey: expectedHPK,
+			H1:                  models.NewHeaderRange(1000, 1000), // degenerate
+		}
+		if err := db.SaveVPNConfig(ctx, persisted); err != nil {
+			t.Fatalf("failed to save initial persisted config: %v", err)
+		}
+
+		inMem := &models.VPNConfig{
+			ListenPort: 51820,
+		}
+
+		if err := ensureObfuscationParams(ctx, db, inMem); err != nil {
+			t.Fatalf("ensureObfuscationParams failed: %v", err)
+		}
+
+		if inMem.HeaderProtectionKey != expectedHPK {
+			t.Errorf("inMem HeaderProtectionKey = %q, want %q", inMem.HeaderProtectionKey, expectedHPK)
+		}
+
+		afterDB, err := db.GetVPNConfig(ctx)
+		if err != nil {
+			t.Fatalf("failed to read persisted config: %v", err)
+		}
+		if afterDB.HeaderProtectionKey != expectedHPK {
+			t.Errorf("persisted HeaderProtectionKey = %q, want %q", afterDB.HeaderProtectionKey, expectedHPK)
+		}
+	})
+
+	t.Run("ListenPort <= 0 falls back to 51820", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+
+		inMem := &models.VPNConfig{
+			ListenPort: 0,
+		}
+
+		if err := ensureObfuscationParams(ctx, db, inMem); err != nil {
+			t.Fatalf("ensureObfuscationParams failed: %v", err)
+		}
+
+		if inMem.ListenPort != 51820 {
+			t.Errorf("inMem ListenPort = %d, want 51820", inMem.ListenPort)
+		}
+		afterDB, err := db.GetVPNConfig(ctx)
+		if err != nil {
+			t.Fatalf("failed to read persisted config: %v", err)
+		}
+		if afterDB.ListenPort != 51820 {
+			t.Errorf("persisted ListenPort = %d, want 51820", afterDB.ListenPort)
+		}
+	})
 }
