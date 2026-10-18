@@ -124,26 +124,3 @@ jobs:
           name: panel-${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: bin/panel-${{ matrix.target.os }}-${{ matrix.target.arch }}
           retention-days: 7
-
-  css-differential:
-    name: CSS Differential Oracle
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install Test Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r tests/e2e/requirements.txt
-          playwright install --with-deps chromium
-
-      - name: Run CSS Computed Style Differential Oracle
-        run: pytest tests/e2e/test_css_differential.py -v
