@@ -721,13 +721,13 @@ def test_css_computed_style_differential(repo_root: Path):
 ```bash
 pytest tests/e2e/test_css_differential.py -v
 ```
-The computed-style differential oracle (`tests/e2e/test_css_differential.py`) is fully integrated into GitHub Actions CI via the dedicated `css-differential` job (`.github/workflows/ci.yml`) and Stage 3 of `scripts/run_e2e_lifecycle.sh`. It executes on PR runs in GitHub-hosted runners, evaluating all 13 application templates and dynamic synthetic class permutations across 7 viewports and 2 themes (196 total renders), asserting strictly zero computed-style differences.
+The computed-style differential oracle (`tests/e2e/test_css_differential.py`) serves as the Issue #505 migration qualification oracle, accessible on-demand via `.github/workflows/css-differential.yml` (`workflow_dispatch`). It evaluates all 13 application templates and dynamic synthetic class permutations across 7 viewports and 2 themes (196 total renders), asserting strictly zero computed-style differences.
 
 #### 2. Secondary Verification: Pixel Snapshot Procedure (`tests/e2e/test_css_snapshots.py`)
-As a secondary visual smoke check against a running server instance, a pixel snapshot comparison suite may be executed in Issue #505.
+As a secondary visual smoke check against a running server instance, a live visual screenshot comparison suite is deferred to follow-up Issue #592.
 
 ##### Qualification Boundary & Follow-Up Tracking (#592)
-The computed-style differential oracle (`tests/e2e/test_css_differential.py`) serves as the authoritative automated qualification gate for CSS modularization in CI (#505). Full-stack, real-page authenticated visual screenshot comparisons against a running application server (requiring database seeding, auth sessions, and live daemon lifecycles) are decoupled from the static modularization PR and tracked in follow-up Issue #592:
+The computed-style differential oracle (`tests/e2e/test_css_differential.py`) serves as the authoritative qualification gate for CSS modularization (#505). Full-stack, real-page authenticated visual screenshot comparisons against a running application server (requiring database seeding, auth sessions, and live daemon lifecycles) are decoupled from the static modularization PR and tracked in follow-up Issue #592:
 - **Issue #592**: `[P3][CSS] Add real-page authenticated visual screenshot comparison test suite (#505 follow-up)`
 This establishes an explicit qualification boundary: PR #589 / Issue #505 qualifies cascade invariance deterministically via computed styles in headless Chromium across 196 renders; real-page screenshot baselines and automated pixel diffing against running daemons are delivered under Issue #592. Architectural requirements:
 1. **Target Route Scope**: Includes full regression surface:
@@ -886,5 +886,5 @@ Any PR implementing Issue #505 MUST satisfy the following checklist before merge
 - [ ] **Badge Integrity**: Winning `.badge` definition (L1900, `border-radius: var(--radius-sm)`) and `.badge-secondary` (line 1935) are preserved during badge consolidation.
 - [ ] **Dedup Boundaries**: Only byte-identical utilities (lines 1941–1956: `.hidden`, `.gap-*`) and dead companion `.skeleton-icon` (line 1428) are pruned mechanically; visual design changes are separated.
 - [ ] **Stacking Context Hierarchy**: Stacking order is strictly maintained: desktop base sidebar (`z-index: 90`), mobile bottom bar (`z-index: 70`), drawer backdrop (`z-index: 95`), drawer active sidebar (`z-index: 100`).
-- [ ] **Visual & Computed Parity**: Computed-style differential across all 13 templates and synthetic dynamic class lists over 7 viewports and 2 themes proves 0 computed style differences in CI (`css-differential` job); full real-page authenticated visual screenshot comparison suite tracked in follow-up Issue #592.
+- [ ] **Visual & Computed Parity**: Computed-style differential across all 13 templates and synthetic dynamic class lists over 7 viewports and 2 themes proves 0 computed style differences (verified qualification via on-demand `.github/workflows/css-differential.yml`); full real-page authenticated visual screenshot comparison suite tracked in follow-up Issue #592.
 - [ ] **Automated Test Parity**: `CI=true go test -race -count=1 ./web/...` passes with zero failures (220 PASS, 0 FAIL, 0 SKIP).
