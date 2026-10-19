@@ -38,6 +38,11 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 		return err
 	}
 
+	if s.adminDisableEpoch == nil {
+		s.adminDisableEpoch = make(map[int64]uint64)
+	}
+	s.adminDisableEpoch[serverID]++
+
 	if err := s.pool.SetTunnelEnabled(ctx, serverID, false, models.DisableReasonAdmin); err != nil {
 		return fmt.Errorf("failed to persist administrative backend disable: %w", err)
 	}

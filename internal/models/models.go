@@ -290,6 +290,21 @@ type BackendTunnel struct {
 	CreatedAt         time.Time  `json:"created_at" db:"created_at"`
 }
 
+// SameTunnelIdentity reports whether two backend tunnels have identical immutable
+// configuration and cryptographic identity (ID, endpoint, and key material).
+// Runtime health (Status, StateVersion, LatencyMS, etc.) and administrative state
+// (Enabled, DisableReason) are not part of identity.
+func SameTunnelIdentity(a, b *BackendTunnel) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.ID == b.ID &&
+		a.Endpoint == b.Endpoint &&
+		a.PublicKey == b.PublicKey &&
+		a.PrivateKey == b.PrivateKey &&
+		a.ProbePrivateKey == b.ProbePrivateKey
+}
+
 // VPNSession tracks an active user connection through the portal AWG endpoint.
 //
 // vpn_sessions is a table of ACTIVE NEXUS BACKEND-ROUTING SESSIONS, not a

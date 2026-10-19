@@ -203,26 +203,39 @@ func TestEnableBackend_PreflightValidation(t *testing.T) {
 }
 
 func TestFinishEnableBackend_Guards(t *testing.T) {
-	t.Run("identity change aborts enable", func(t *testing.T) {
-		db := setupTestDB(t)
-		svc, s1ID, _, _, _ := setupTestVPNService(t, db)
-		if err := svc.pool.SyncFromDB(context.Background()); err != nil {
-			t.Fatalf("failed to sync pool from DB: %v", err)
-		}
+	identityTests := []struct {
+		name   string
+		mutate func(t *models.BackendTunnel)
+	}{
+		{"ID mismatch aborts enable", func(t *models.BackendTunnel) { t.ID += 100 }},
+		{"PublicKey mismatch aborts enable", func(t *models.BackendTunnel) { t.PublicKey = "rotated-" + t.PublicKey }},
+		{"PrivateKey mismatch aborts enable", func(t *models.BackendTunnel) { t.PrivateKey = "rotated-" + t.PrivateKey }},
+		{"ProbePrivateKey mismatch aborts enable", func(t *models.BackendTunnel) { t.ProbePrivateKey = "rotated-" + t.ProbePrivateKey }},
+		{"Endpoint mismatch aborts enable", func(t *models.BackendTunnel) { t.Endpoint = "203.0.113.99:51820" }},
+	}
+	for _, tc := range identityTests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupTestDB(t)
+			svc, s1ID, _, _, _ := setupTestVPNService(t, db)
+			if err := svc.pool.SyncFromDB(context.Background()); err != nil {
+				t.Fatalf("failed to sync pool from DB: %v", err)
+			}
 
-		tun, err := svc.pool.GetTunnel(s1ID)
-		if err != nil {
-			t.Fatalf("failed to get tunnel: %v", err)
-		}
+			tun, err := svc.pool.GetTunnel(s1ID)
+			if err != nil {
+				t.Fatalf("failed to get tunnel: %v", err)
+			}
 
-		ctx := context.Background()
-		stale := *tun
-		stale.PrivateKey = "rotated-" + tun.PrivateKey
-		err = svc.finishEnableBackend(ctx, svc.pool, &stale, nil, s1ID, true, true)
-		if err == nil || !strings.Contains(err.Error(), "backend state modified concurrently; aborting enable") {
-			t.Fatalf("expected concurrent modification error, got: %v", err)
-		}
-	})
+			ctx := context.Background()
+			stale := *tun
+			tc.mutate(&stale)
+			startEpoch := svc.adminDisableEpoch[s1ID]
+			err = svc.finishEnableBackend(ctx, svc.pool, &stale, nil, s1ID, startEpoch)
+			if err == nil || !strings.Contains(err.Error(), "backend identity modified concurrently; aborting enable") {
+				t.Fatalf("expected concurrent modification error, got: %v", err)
+			}
+		})
+	}
 
 	t.Run("runtime status bump does not abort enable", func(t *testing.T) {
 		db := setupTestDB(t)
@@ -241,7 +254,7 @@ func TestFinishEnableBackend_Guards(t *testing.T) {
 			t.Fatalf("SetTunnelStatus failed: %v", err)
 		}
 		t.Cleanup(func() { closeBackendDevices(svc) })
-		if err := svc.finishEnableBackend(ctx, svc.pool, tun, nil, s1ID, true, true); err != nil {
+		if err := svc.finishEnableBackend(ctx, svc.pool, tun, nil, s1ID, svc.adminDisableEpoch[s1ID]); err != nil {
 			t.Fatalf("expected enable to tolerate a prober status write, got: %v", err)
 		}
 	})
@@ -262,7 +275,7 @@ func TestFinishEnableBackend_Guards(t *testing.T) {
 		}
 
 		ctx := tunnel.ContextWithSelfHealing(context.Background())
-		err = svc.finishEnableBackend(ctx, svc.pool, tun, nil, s1ID, false, false)
+		err = svc.finishEnableBackend(ctx, svc.pool, tun, nil, s1ID, svc.adminDisableEpoch[s1ID])
 		if err == nil || !strings.Contains(err.Error(), "backend was administratively disabled; aborting enable") {
 			t.Fatalf("expected administratively disabled abort, got: %v", err)
 		}
@@ -281,30 +294,31 @@ func TestFinishEnableBackend_Guards(t *testing.T) {
 		}
 
 		ctx := tunnel.ContextWithSelfHealing(context.Background())
-		err = svc.finishEnableBackend(ctx, svc.pool, tun, nil, s1ID, true, true)
+		err = svc.finishEnableBackend(ctx, svc.pool, tun, nil, s1ID, svc.adminDisableEpoch[s1ID])
 		if err != nil {
 			t.Fatalf("expected nil from self-healing finish on enabled tunnel, got: %v", err)
 		}
 	})
 
-	t.Run("manual enable aborts if transition to disabled occurred during enable", func(t *testing.T) {
+	t.Run("administrative disable mid-enable aborts enable", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, s1ID, _, _, _ := setupTestVPNService(t, db)
 		if err := svc.pool.SyncFromDB(context.Background()); err != nil {
 			t.Fatalf("failed to sync pool from DB: %v", err)
 		}
 
-		if err := svc.pool.SetTunnelEnabled(context.Background(), s1ID, false, models.DisableReasonAdmin); err != nil {
-			t.Fatalf("failed to disable tunnel: %v", err)
-		}
 		tun, err := svc.pool.GetTunnel(s1ID)
 		if err != nil {
 			t.Fatalf("failed to get tunnel: %v", err)
 		}
 
 		ctx := context.Background()
-		// initialEnabled = true, but currTun.Enabled = false
-		err = svc.finishEnableBackend(ctx, svc.pool, tun, nil, s1ID, true, true)
+		startEpoch := svc.adminDisableEpoch[s1ID]
+		if err := svc.DisableBackend(ctx, s1ID); err != nil {
+			t.Fatalf("failed to disable tunnel: %v", err)
+		}
+
+		err = svc.finishEnableBackend(ctx, svc.pool, tun, nil, s1ID, startEpoch)
 		if err == nil || !strings.Contains(err.Error(), "backend was administratively disabled; aborting enable") {
 			t.Fatalf("expected administratively disabled error, got: %v", err)
 		}
@@ -317,7 +331,7 @@ func TestFinishEnableBackend_Guards(t *testing.T) {
 			t.Fatalf("failed to sync pool from DB: %v", err)
 		}
 
-		if err := svc.pool.SetTunnelEnabled(context.Background(), s1ID, false, models.DisableReasonAdmin); err != nil {
+		if err := svc.DisableBackend(context.Background(), s1ID); err != nil {
 			t.Fatalf("failed to disable tunnel: %v", err)
 		}
 		tun, err := svc.pool.GetTunnel(s1ID)
@@ -326,8 +340,8 @@ func TestFinishEnableBackend_Guards(t *testing.T) {
 		}
 
 		ctx := context.Background()
-		// initialEnabled = false, currTun.Enabled = false -> valid manual enable
-		err = svc.finishEnableBackend(ctx, svc.pool, tun, nil, s1ID, true, false)
+		startEpoch := svc.adminDisableEpoch[s1ID]
+		err = svc.finishEnableBackend(ctx, svc.pool, tun, nil, s1ID, startEpoch)
 		if err != nil {
 			t.Fatalf("expected success on manual enable from disabled state, got: %v", err)
 		}
@@ -337,6 +351,140 @@ func TestFinishEnableBackend_Guards(t *testing.T) {
 			t.Fatalf("expected tunnel to be enabled, err=%v, enabled=%v", err, updated.Enabled)
 		}
 	})
+}
+
+func TestEnableBackend_ConcurrentDisable_HealthProvenance(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+
+	srvID, err := db.CreateServer(ctx, &models.Server{
+		Name: "test-health-prov", Host: "198.51.100.91",
+		Protocols: map[string]any{"awg": map[string]any{"installed": true, "port": 51820, "public_key": "health-prov-pub"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("initial EnableBackend: %v", err)
+	}
+
+	// Prober health-disables it (runtime: status=disabled, reason=health)
+	if err := svc.pool.SetTunnelStatus(ctx, srvID, models.TunnelStatusDisabled, 0); err != nil {
+		t.Fatalf("SetTunnelStatus: %v", err)
+	}
+	// Admin then disables it; SetTunnelEnabled preserves health provenance
+	if err := svc.DisableBackend(ctx, srvID); err != nil {
+		t.Fatalf("DisableBackend: %v", err)
+	}
+
+	tunBefore, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel: %v", err)
+	}
+	if tunBefore.Enabled || tunBefore.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("expected Enabled=false with health provenance, got Enabled=%v Reason=%s", tunBefore.Enabled, tunBefore.DisableReason)
+	}
+
+	var disableErr error
+	svc.SetEnableBackendPostAddTunnelHookForTest(func() {
+		disableErr = svc.DisableBackend(ctx, srvID)
+	})
+	defer svc.SetEnableBackendPostAddTunnelHookForTest(nil)
+
+	err = svc.EnableBackend(ctx, srvID)
+	if disableErr != nil {
+		t.Fatalf("concurrent DisableBackend failed: %v", disableErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "backend was administratively disabled; aborting enable") {
+		t.Fatalf("expected administratively disabled error, got: %v", err)
+	}
+
+	finalTun, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel: %v", err)
+	}
+	if finalTun.Enabled {
+		t.Errorf("expected Enabled=false in pool, got true")
+	}
+
+	svc.mu.RLock()
+	_, devBySrvID := svc.backendDevices[srvID]
+	_, devByTunID := svc.backendDevices[finalTun.ID]
+	svc.mu.RUnlock()
+	if devBySrvID || devByTunID {
+		t.Errorf("expected svc.backendDevices to not exist, got devBySrvID=%v devByTunID=%v", devBySrvID, devByTunID)
+	}
+}
+
+func TestEnableBackend_ConcurrentDisable_AdminProvenance(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+
+	srvID, err := db.CreateServer(ctx, &models.Server{
+		Name: "test-admin-prov", Host: "198.51.100.92",
+		Protocols: map[string]any{"awg": map[string]any{"installed": true, "port": 51820, "public_key": "admin-prov-pub"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("initial EnableBackend: %v", err)
+	}
+	if err := svc.DisableBackend(ctx, srvID); err != nil {
+		t.Fatalf("DisableBackend: %v", err)
+	}
+
+	tunBefore, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel: %v", err)
+	}
+	if tunBefore.Enabled || tunBefore.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("expected Enabled=false with admin provenance, got Enabled=%v Reason=%s", tunBefore.Enabled, tunBefore.DisableReason)
+	}
+
+	var disableErr error
+	svc.SetEnableBackendPostAddTunnelHookForTest(func() {
+		disableErr = svc.DisableBackend(ctx, srvID)
+	})
+	defer svc.SetEnableBackendPostAddTunnelHookForTest(nil)
+
+	err = svc.EnableBackend(ctx, srvID)
+	if disableErr != nil {
+		t.Fatalf("concurrent DisableBackend failed: %v", disableErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "backend was administratively disabled; aborting enable") {
+		t.Fatalf("expected administratively disabled error, got: %v", err)
+	}
+
+	finalTun, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel: %v", err)
+	}
+	if finalTun.Enabled {
+		t.Errorf("expected Enabled=false in pool, got true")
+	}
+
+	svc.mu.RLock()
+	_, devBySrvID := svc.backendDevices[srvID]
+	_, devByTunID := svc.backendDevices[finalTun.ID]
+	svc.mu.RUnlock()
+	if devBySrvID || devByTunID {
+		t.Errorf("expected svc.backendDevices to not exist, got devBySrvID=%v devByTunID=%v", devBySrvID, devByTunID)
+	}
 }
 
 func TestRegisterBackendPortalPeers_KeysAndCollisions(t *testing.T) {
