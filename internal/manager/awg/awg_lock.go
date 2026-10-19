@@ -40,15 +40,8 @@ func (r *ServerLockRegistry) getLock(serverID int64) *sync.Mutex {
 	return l
 }
 
-// SetServerLockRegistry overrides the server lock registry used by the manager instance.
-func (m *AWGManager) SetServerLockRegistry(r *ServerLockRegistry) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.serverLocks = r
-}
-
 func (m *AWGManager) getServerLock(serverID int64) *sync.Mutex {
-	if m.serverLocks != nil {
+	if m != nil && m.serverLocks != nil {
 		return m.serverLocks.getLock(serverID)
 	}
 	return globalServerLocks.getLock(serverID)
