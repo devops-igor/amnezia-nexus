@@ -497,6 +497,15 @@ func TestMigrateSession(t *testing.T) {
 		svc.forwarder.RegisterSession(sess.ID, "conn-fail", peerKeyFail, assignedIP, tun1.ID)
 		svc.pool.IncrementConnections(tun1.ID)
 
+		tun1Before, err := svc.pool.GetTunnelByID(tun1.ID)
+		if err != nil {
+			t.Fatalf("failed to get tun1 from pool before migration: %v", err)
+		}
+		tun2Before, err := svc.pool.GetTunnelByID(tun2.ID)
+		if err != nil {
+			t.Fatalf("failed to get tun2 from pool before migration: %v", err)
+		}
+
 		// Set pre-commit hook to invalidate target tunnel status in pool before counter commit
 		svc.SetPreCommitMigrationHookForTest(func() {
 			_ = svc.pool.SetTunnelStatus(ctx, s2ID, models.TunnelStatusDegraded, 200)
@@ -551,13 +560,27 @@ func TestMigrateSession(t *testing.T) {
 			t.Fatalf("DB BackendTunnelID after rollback = %d, want %d", dbSess.BackendTunnelID, tun1.ID)
 		}
 
-		// Counters should remain at tun1 = 1, tun2 = 0 (or previous count)
-		tun1Live, err := svc.pool.GetTunnelByID(tun1.ID)
+		// Counters should be unchanged after rollback
+		tun1After, err := svc.pool.GetTunnelByID(tun1.ID)
 		if err != nil {
-			t.Fatalf("failed to get tun1 from pool: %v", err)
+			t.Fatalf("failed to get tun1 from pool after rollback: %v", err)
 		}
-		if tun1Live.ActiveConnections < 1 {
-			t.Fatalf("tun1 ActiveConnections = %d, want at least 1", tun1Live.ActiveConnections)
+		if tun1After.ActiveConnections != tun1Before.ActiveConnections {
+			t.Fatalf("tun1 ActiveConnections after rollback = %d, want %d (unchanged)", tun1After.ActiveConnections, tun1Before.ActiveConnections)
+		}
+
+		tun2After, err := svc.pool.GetTunnelByID(tun2.ID)
+		if err != nil {
+			t.Fatalf("failed to get tun2 from pool after rollback: %v", err)
+		}
+		if tun2After.ActiveConnections != tun2Before.ActiveConnections {
+			t.Fatalf("tun2 ActiveConnections after rollback = %d, want %d (unchanged)", tun2After.ActiveConnections, tun2Before.ActiveConnections)
+		}
+
+		// Verify that peerKeyFail has no affinity to tun2
+		affTunnelID, hasAffinity := svc.stickyMgr.GetPeerAffinity(peerKeyFail)
+		if hasAffinity && affTunnelID == tun2.ID {
+			t.Fatalf("expected peerKeyFail to have no affinity to tun2, but found affinity to tunnel %d", affTunnelID)
 		}
 	})
 }

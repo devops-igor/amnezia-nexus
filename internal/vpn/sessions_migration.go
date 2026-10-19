@@ -78,9 +78,9 @@ func (s *Service) rollbackMigration(ctx context.Context, sessionID, peerKey stri
 // the live forwarder route, in-memory session, database state, and pool counters atomically
 // with full rollback across all subsystems if any step fails (issue #289, rework).
 //
-// Invariant (issue #86, #289): caller executes under s.mu.Lock(), maintaining the
-// lock ordering s.mu -> SessionManager.mu (never reversed), and preserving serialization
-// for pool connection counters and route transitions.
+// Invariant (issue #86, #289): caller must not hold s.mu (it is acquired internally
+// by MigrateSession), maintaining the lock ordering s.mu -> SessionManager.mu (never reversed),
+// and preserving serialization for pool connection counters and route transitions.
 func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTunnelID int64) error {
 	if s == nil {
 		return errors.New("vpn service is nil")
