@@ -1125,11 +1125,11 @@ func TestAWGManager_RemoteLockSerialization_CrossProcess(t *testing.T) {
 	// simulating separate operating system processes where in-process mutexes are not shared.
 	mgr1 := awg.NewAWGManager(provider)
 	mgr1.SetIPAllocator(db)
-	mgr1.SetServerLockRegistry(awg.NewServerLockRegistry())
+	mgr1.SetServerLockRegistryForTest(awg.NewServerLockRegistry())
 
 	mgr2 := awg.NewAWGManager(provider)
 	mgr2.SetIPAllocator(db)
-	mgr2.SetServerLockRegistry(awg.NewServerLockRegistry())
+	mgr2.SetServerLockRegistryForTest(awg.NewServerLockRegistry())
 
 	server := &models.Server{
 		ID:   99,
