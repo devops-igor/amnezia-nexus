@@ -299,6 +299,9 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	} else {
 		applyVPNConfigDefaults(cfg)
 	}
+	if err := cfg.ValidateDataPlaneI1Protocol(); err != nil {
+		return nil, err
+	}
 
 	if err := forwarder.ValidateClientRouteLimit(cfg.MaxTotalPeers); err != nil {
 		return nil, err
@@ -1394,6 +1397,9 @@ func (s *Service) GetConfig(ctx context.Context) (*models.VPNConfig, error) {
 func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error {
 	if cfg == nil {
 		return errors.New("vpn config cannot be nil")
+	}
+	if err := cfg.ValidateDataPlaneI1Protocol(); err != nil {
+		return err
 	}
 	if err := forwarder.ValidateClientRouteLimit(cfg.MaxTotalPeers); err != nil {
 		return err

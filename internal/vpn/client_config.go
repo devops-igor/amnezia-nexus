@@ -9,6 +9,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
@@ -264,6 +265,26 @@ func (s *Service) renderClientConfigForConnection(
 		return "", "", fmt.Errorf("restore client IP assignments: %w", err)
 	}
 	clientParams := buildClientParams(awgConn, p)
+	if err := cfg.ValidateDataPlaneI1Protocol(); err != nil {
+		return "", "", err
+	}
+	i1, exists := clientParams["portal_i1"]
+	if !exists {
+		if err := ctx.Err(); err != nil {
+			return "", "", fmt.Errorf("generate portal I1: %w", err)
+		}
+		packets, err := cps.GenerateMimicryPackets(ctx, cfg.DataPlaneI1Protocol(), "", nil)
+		if err != nil {
+			return "", "", fmt.Errorf("generate portal I1: %w", err)
+		}
+		i1 = packets["i1"]
+		clientParams["portal_i1"] = i1
+	}
+	value, ok := i1.(string)
+	if !ok || value == "" {
+		return "", "", errors.New("invalid persisted portal I1")
+	}
+	awgParams.I1 = value
 	_, hadLease := s.ipam.GetAssignedIP(p.clientPub)
 	assignedIP, err := s.resolveAssignedIP(clientParams, cfg, p.clientPub)
 	if err != nil {

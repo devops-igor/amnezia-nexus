@@ -40,6 +40,9 @@ func (d *DB) GetVPNConfig(ctx context.Context) (*models.VPNConfig, error) {
 	if err := json.Unmarshal([]byte(val.String), &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse vpn_config JSON: %w", err)
 	}
+	if err := cfg.ValidateDataPlaneI1Protocol(); err != nil {
+		return nil, err
+	}
 
 	fillVPNConfigDefaults(&cfg)
 	// Obfuscation-parameter migration (generating H/S when unset and
@@ -84,6 +87,9 @@ func fillVPNConfigDefaults(cfg *models.VPNConfig) {
 func (d *DB) saveVPNConfig(ctx context.Context, cfg *models.VPNConfig) error {
 	if cfg == nil {
 		return errors.New("vpn config is nil")
+	}
+	if err := cfg.ValidateDataPlaneI1Protocol(); err != nil {
+		return err
 	}
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()

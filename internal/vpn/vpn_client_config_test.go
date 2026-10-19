@@ -185,7 +185,7 @@ func TestGenerateClientConfig_AutoDetectFallbackAndCaching(t *testing.T) {
 	}
 }
 
-func TestGenerateClientConfig_NoCPSPackets(t *testing.T) {
+func TestGenerateClientConfig_PortalSIPI1(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
@@ -211,10 +211,12 @@ func TestGenerateClientConfig_NoCPSPackets(t *testing.T) {
 		t.Errorf("unexpected filename: %s", filename)
 	}
 
-	// Issue #15: Load balancer client configs must be pure AWG 3+ and must NEVER contain I1..I5
+	if got := parseDirectiveString(t, cfgStr, "I1"); !strings.HasPrefix(got, "<b 0x5245474953544552") {
+		t.Fatalf("expected SIP REGISTER I1, got %q", got)
+	}
 	for _, line := range strings.Split(cfgStr, "\n") {
 		trimmed := strings.TrimSpace(line)
-		for _, key := range []string{"I1", "I2", "I3", "I4", "I5"} {
+		for _, key := range []string{"I2", "I3", "I4", "I5"} {
 			if strings.HasPrefix(trimmed, key+" =") || strings.HasPrefix(trimmed, key+"=") {
 				t.Errorf("GenerateClientConfig must not output CPS param %s, config:\n%s", key, cfgStr)
 			}
@@ -301,10 +303,12 @@ func TestGenerateUserClientConfig_AWG3_Compliance(t *testing.T) {
 		}
 	}
 
-	// Verify NO CPS packets (Issue #15)
+	if got := parseDirectiveString(t, cfgStr, "I1"); !strings.HasPrefix(got, "<b 0x5245474953544552") {
+		t.Fatalf("expected SIP REGISTER I1, got %q", got)
+	}
 	for _, line := range strings.Split(cfgStr, "\n") {
 		trimmed := strings.TrimSpace(line)
-		for _, key := range []string{"I1", "I2", "I3", "I4", "I5"} {
+		for _, key := range []string{"I2", "I3", "I4", "I5"} {
 			if strings.HasPrefix(trimmed, key+" =") || strings.HasPrefix(trimmed, key+"=") {
 				t.Errorf("Load Balancer client config must not contain %s, got:\n%s", key, cfgStr)
 			}
@@ -346,6 +350,7 @@ func TestGenerateUserClientConfig_StabilityAcrossRefetches(t *testing.T) {
 
 	// Verify stability across all 3 fetches
 	directives := []string{
+		"I1",
 		"RekeyAfterTime",
 		"RekeyTimeout",
 		"RejectAfterTime",
@@ -683,6 +688,9 @@ func TestGenerateClientConfigForConnection(t *testing.T) {
 	if !strings.Contains(cfgStr, "[Interface]") {
 		t.Errorf("expected config to contain [Interface], got:\n%s", cfgStr)
 	}
+	if got := parseDirectiveString(t, cfgStr, "I1"); !strings.HasPrefix(got, "<b 0x5245474953544552") {
+		t.Fatalf("expected SIP REGISTER I1, got %q", got)
+	}
 
 	// Verify DB was updated with client_id and client_params
 	updated, err := db.GetConnection(ctx, conn.ID)
@@ -694,6 +702,9 @@ func TestGenerateClientConfigForConnection(t *testing.T) {
 	}
 	if updated.ClientParams == nil || updated.ClientParams["client_private_key"] == nil {
 		t.Errorf("expected ClientParams with client_private_key")
+	}
+	if got := updated.ClientParams["portal_i1"]; got != parseDirectiveString(t, cfgStr, "I1") {
+		t.Fatalf("persisted I1 %v differs from rendered I1", got)
 	}
 
 	// Subsequent call returns identical config and preserves ClientID

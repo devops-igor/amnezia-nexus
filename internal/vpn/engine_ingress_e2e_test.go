@@ -377,6 +377,11 @@ func TestIngressEngineEndToEndThroughService(t *testing.T) {
 	svc := newIngressEngineService(t, db)
 
 	peer, saved := newEnginePeer(t, svc, db, "engine-alice")
+	// The upstream device transmits configured I1 as its own UDP datagram
+	// before handshake initiation; ingress must discard it and handshake.
+	if i1 := configField(t, saved, "I1"); !strings.HasPrefix(i1, "<b 0x5245474953544552") {
+		t.Fatalf("expected SIP REGISTER preamble, got %q", i1)
+	}
 	ip := netip.MustParseAddr(peer.assignedIP)
 	engine := startEngine(t, svc, "engine-e2e-portal", []clientawg.Peer{
 		{PublicKey: peer.publicKey, AllowedIP: netip.PrefixFrom(ip, 32)},
