@@ -1140,3 +1140,33 @@ func TestVirtualTUN_DirectionalStatsAndPeaks(t *testing.T) {
 		t.Errorf("expected OutboundDrops=1, got %d", s.OutboundDrops)
 	}
 }
+
+// TestVirtualTUN_SymmetricBufferCapacity verifies issue #561: outbound buffer
+// capacity is symmetrically aligned to 2,048 packets alongside inbound capacity.
+func TestVirtualTUN_SymmetricBufferCapacity(t *testing.T) {
+	if DefaultInboundCapacity != 2048 {
+		t.Fatalf("DefaultInboundCapacity = %d, want 2048", DefaultInboundCapacity)
+	}
+	if DefaultOutboundCapacity != 2048 {
+		t.Fatalf("DefaultOutboundCapacity = %d, want 2048", DefaultOutboundCapacity)
+	}
+	if DefaultInboundCapacity != DefaultOutboundCapacity {
+		t.Fatalf("asymmetric defaults: inbound=%d outbound=%d", DefaultInboundCapacity, DefaultOutboundCapacity)
+	}
+
+	vt, err := NewVirtualTUN(Config{})
+	if err != nil {
+		t.Fatalf("NewVirtualTUN(Config{}): %v", err)
+	}
+	defer vt.Close()
+
+	if got := cap(vt.inPackets); got != 2048 {
+		t.Errorf("cap(vt.inPackets) = %d, want 2048", got)
+	}
+	if got := cap(vt.outPackets); got != 2048 {
+		t.Errorf("cap(vt.outPackets) = %d, want 2048", got)
+	}
+	if cap(vt.inPackets) != cap(vt.outPackets) {
+		t.Errorf("asymmetric channel capacities: in=%d out=%d", cap(vt.inPackets), cap(vt.outPackets))
+	}
+}
