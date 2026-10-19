@@ -45,9 +45,9 @@ H4 = 4
 
 func TestSaveServerConfigStillValidatesNewParams(t *testing.T) {
 	cases := []struct {
-		name string
+		name   string
 		params string
-		want string
+		want   string
 	}{
 		{name: "forward collision", params: "S1 = 12\nS2 = 68\n", want: "collision"},
 		{name: "reverse collision", params: "S1 = 68\nS2 = 12\n", want: "collision"},
