@@ -2,6 +2,7 @@ package awg
 
 import (
 	"context"
+	"sync"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 )
@@ -19,18 +20,17 @@ func (m *AWGManager) AcquireRemoteServerLock(ctx context.Context, client ssh.SSH
 	return m.acquireRemoteServerLock(ctx, client, serverID)
 }
 
-// SetServerLockRegistryForTest overrides the server lock registry for testing purposes.
-func (m *AWGManager) SetServerLockRegistryForTest(r *ServerLockRegistry) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.serverLocks = r
+// ServerLockForTest returns the in-process server mutex for testing preconditions.
+func (m *AWGManager) ServerLockForTest(serverID int64) *sync.Mutex {
+	return m.getServerLock(serverID)
 }
 
 // NewAWGManagerWithServerLocks creates a new AWGManager instance with a custom ServerLockRegistry for test isolation.
 func NewAWGManagerWithServerLocks(pool SSHProvider, r *ServerLockRegistry) *AWGManager {
-	mgr := NewAWGManager(pool)
-	if r != nil {
-		mgr.serverLocks = r
+	if r == nil {
+		panic("NewAWGManagerWithServerLocks: nil registry")
 	}
+	mgr := NewAWGManager(pool)
+	mgr.serverLocks = r
 	return mgr
 }

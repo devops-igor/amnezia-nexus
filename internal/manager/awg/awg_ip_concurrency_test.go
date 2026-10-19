@@ -1123,18 +1123,20 @@ func TestAWGManager_RemoteLockSerialization_CrossProcess(t *testing.T) {
 
 	// Create TWO separate manager instances with INDEPENDENT in-process lock registries,
 	// simulating separate operating system processes where in-process mutexes are not shared.
-	mgr1 := awg.NewAWGManager(provider)
+	mgr1 := awg.NewAWGManagerWithServerLocks(provider, awg.NewServerLockRegistry())
 	mgr1.SetIPAllocator(db)
-	mgr1.SetServerLockRegistryForTest(awg.NewServerLockRegistry())
 
-	mgr2 := awg.NewAWGManager(provider)
+	mgr2 := awg.NewAWGManagerWithServerLocks(provider, awg.NewServerLockRegistry())
 	mgr2.SetIPAllocator(db)
-	mgr2.SetServerLockRegistryForTest(awg.NewServerLockRegistry())
 
 	server := &models.Server{
 		ID:   99,
 		Name: "cross-process-server",
 		Host: "192.0.2.99",
+	}
+
+	if mgr1.ServerLockForTest(server.ID) == mgr2.ServerLockForTest(server.ID) {
+		t.Fatalf("expected distinct in-process server locks between mgr1 and mgr2 for server %d", server.ID)
 	}
 
 	ctx := context.Background()

@@ -10,16 +10,15 @@ func TestAWGManager_ServerLock_Isolation(t *testing.T) {
 	regCustom := NewServerLockRegistry()
 
 	mgrWithLocks := NewAWGManagerWithServerLocks(nil, regCustom)
-	mgrSetter := NewAWGManager(nil)
-	mgrSetter.SetServerLockRegistryForTest(regCustom)
+	mgrShared := NewAWGManagerWithServerLocks(nil, regCustom)
 
 	const serverID = int64(101)
 
 	lockDefault := mgrDefault.getServerLock(serverID)
 	lockCustom := mgrWithLocks.getServerLock(serverID)
-	lockSetter := mgrSetter.getServerLock(serverID)
+	lockShared := mgrShared.getServerLock(serverID)
 
-	if lockDefault == nil || lockCustom == nil || lockSetter == nil {
+	if lockDefault == nil || lockCustom == nil || lockShared == nil {
 		t.Fatal("expected non-nil locks from getServerLock")
 	}
 
@@ -27,8 +26,8 @@ func TestAWGManager_ServerLock_Isolation(t *testing.T) {
 		t.Fatalf("expected isolated locks between default global registry and custom registry, got same pointer: %p", lockDefault)
 	}
 
-	if lockCustom != lockSetter {
-		t.Fatalf("expected same lock pointer for managers sharing the same registry, got %p vs %p", lockCustom, lockSetter)
+	if lockCustom != lockShared {
+		t.Fatalf("expected same lock pointer for managers sharing the same registry, got %p vs %p", lockCustom, lockShared)
 	}
 }
 
@@ -100,4 +99,20 @@ func TestAWGManager_ServerLock_ConcurrentAccess(t *testing.T) {
 	}
 
 	wg.Wait()
+
+	expectedCount := (workers / 4) * iterations
+	for id := int64(0); id < 4; id++ {
+		if counters1[id] != expectedCount {
+			t.Errorf("server %d: counters1 = %d, want %d", id, counters1[id], expectedCount)
+		}
+		if counters2[id] != expectedCount {
+			t.Errorf("server %d: counters2 = %d, want %d", id, counters2[id], expectedCount)
+		}
+		if countersDefault[id] != expectedCount {
+			t.Errorf("server %d: countersDefault = %d, want %d", id, countersDefault[id], expectedCount)
+		}
+		if lock1, lock2 := mgr1.getServerLock(id), mgr2.getServerLock(id); lock1 == lock2 {
+			t.Errorf("server %d: expected distinct locks for mgr1 and mgr2, got %p", id, lock1)
+		}
+	}
 }
