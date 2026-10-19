@@ -61,6 +61,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	pool := s.pool
 	db := s.db
 	awgProv := s.awgProvider
+	startEpoch := s.adminDisableEpoch[serverID]
 	s.mu.RUnlock()
 
 	if pool == nil {
@@ -115,7 +116,6 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		}
 	}
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
-	startEpoch := s.adminDisableEpoch[serverID]
 	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to register backend tunnel for server %d: %w", serverID, err)
