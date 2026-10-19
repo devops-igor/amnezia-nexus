@@ -75,8 +75,9 @@ const (
 	DefaultInboundCapacity = 2048
 
 	// DefaultOutboundCapacity is the default buffer capacity for outbound
-	// packets (1024).
-	DefaultOutboundCapacity = 1024
+	// packets (2048), symmetrically aligned with DefaultInboundCapacity to
+	// eliminate buffer asymmetry in the return dataplane (issue #561).
+	DefaultOutboundCapacity = 2048
 
 	// DefaultBatchSize is the default number of packets handled per Read
 	// call (1), matching the legacy single-packet behavior of the pinned
@@ -243,6 +244,11 @@ func New(cfg Config) (*VirtualTUN, error) {
 		name:       cfg.Name,
 		batchSize:  batchSize,
 	}, nil
+}
+
+// NewVirtualTUN creates a VirtualTUN from cfg. It is an alias for New.
+func NewVirtualTUN(cfg Config) (*VirtualTUN, error) {
+	return New(cfg)
 }
 
 // NewSuspendedForTest creates a device whose reads are ALREADY suspended,
