@@ -1192,7 +1192,7 @@ func TestValidateAWGParams_S1S2CollisionValidation(t *testing.T) {
 		})
 	}
 
-	// 2. Diff < 10 configurations
+	// 2. Non-colliding sizes can be equal or close.
 	diffTooSmallCases := []struct {
 		name   string
 		params map[string]string
@@ -1222,17 +1222,13 @@ func TestValidateAWGParams_S1S2CollisionValidation(t *testing.T) {
 
 	for _, tc := range diffTooSmallCases {
 		t.Run("diff_small_"+tc.name, func(t *testing.T) {
-			err := ValidateAWGParams(tc.params)
-			if err == nil {
-				t.Fatalf("expected |s1 - s2| < 10 error for params %+v, got nil", tc.params)
-			}
-			if !strings.Contains(err.Error(), "|s1 - s2| must be >= 10") {
-				t.Errorf("expected error to mention |s1 - s2| >= 10, got: %v", err)
+			if err := ValidateAWGParams(tc.params); err != nil {
+				t.Fatalf("expected close sizes to be valid for params %+v, got: %v", tc.params, err)
 			}
 		})
 	}
 
-	// 3. Valid configurations (diff >= 10 and diff != 56)
+	// 3. Valid configurations (diff != 56)
 	validCases := []struct {
 		name   string
 		params map[string]string
