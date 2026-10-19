@@ -65,8 +65,11 @@ func TestDisconnectUser_Lifecycle(t *testing.T) {
 		t.Errorf("expected peer affinity for %s to be cleared", peerKeyAlice)
 	}
 	tunAfter, err := vpnSvc.pool.GetTunnelByID(tunID)
-	if err != nil || tunAfter.ActiveConnections != 0 {
-		t.Errorf("expected pool connections=0, got %d (err: %v)", tunAfter.ActiveConnections, err)
+	if err != nil || tunAfter == nil {
+		t.Fatalf("GetTunnelByID(%d): %v", tunID, err)
+	}
+	if tunAfter.ActiveConnections != 0 {
+		t.Errorf("ActiveConnections = %d, want 0", tunAfter.ActiveConnections)
 	}
 
 	if err := vpnSvc.DisconnectUser(ctx, "non-existent-user"); err != nil {
@@ -126,8 +129,11 @@ func TestDisconnectSession_Lifecycle(t *testing.T) {
 		t.Errorf("expected peer affinity to be cleared")
 	}
 	tunAfter, err := vpnSvc.pool.GetTunnelByID(tunID)
-	if err != nil || tunAfter.ActiveConnections != 0 {
-		t.Errorf("expected pool connections=0, got %d", tunAfter.ActiveConnections)
+	if err != nil || tunAfter == nil {
+		t.Fatalf("GetTunnelByID(%d): %v", tunID, err)
+	}
+	if tunAfter.ActiveConnections != 0 {
+		t.Errorf("ActiveConnections = %d, want 0", tunAfter.ActiveConnections)
 	}
 }
 
@@ -188,8 +194,11 @@ func TestRevokeUpstreamPeerSession_Lifecycle(t *testing.T) {
 		t.Errorf("expected peer affinity to be cleared")
 	}
 	tunAfter, err := vpnSvc.pool.GetTunnelByID(tunID)
-	if err != nil || tunAfter.ActiveConnections != 0 {
-		t.Errorf("expected pool connections=0, got %d", tunAfter.ActiveConnections)
+	if err != nil || tunAfter == nil {
+		t.Fatalf("GetTunnelByID(%d): %v", tunID, err)
+	}
+	if tunAfter.ActiveConnections != 0 {
+		t.Errorf("ActiveConnections = %d, want 0", tunAfter.ActiveConnections)
 	}
 
 	// 3. Race condition: session evicted between GetSession and CloseSession
@@ -256,8 +265,11 @@ func TestReleaseClient_Lifecycle(t *testing.T) {
 		t.Errorf("expected peer affinity to be cleared")
 	}
 	tunAfter, err := vpnSvc.pool.GetTunnelByID(tunID)
-	if err != nil || tunAfter.ActiveConnections != 0 {
-		t.Errorf("expected pool connections=0, got %d", tunAfter.ActiveConnections)
+	if err != nil || tunAfter == nil {
+		t.Fatalf("GetTunnelByID(%d): %v", tunID, err)
+	}
+	if tunAfter.ActiveConnections != 0 {
+		t.Errorf("ActiveConnections = %d, want 0", tunAfter.ActiveConnections)
 	}
 	if _, ok := vpnSvc.ipam.GetAssignedIP(peerKeyAlice); ok {
 		t.Errorf("expected IPAM allocation to be released")
@@ -291,7 +303,7 @@ func TestSweepTimedOutSessions_Lifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
-	sess1.LastSeen = time.Now().UTC().Add(-10 * time.Minute)
+	vpnSvc.sessionMgr.SetSessionLastSeen(peerKeyAlice, time.Now().UTC().Add(-10*time.Minute))
 
 	var hookCalled bool
 	var reapedID string
@@ -323,7 +335,7 @@ func TestSweepTimedOutSessions_Lifecycle(t *testing.T) {
 	}
 	vpnSvc.forwarder.RegisterSession(sess2.ID, "conn-sweep-2", peerKeyBob, assignedIP2, tunID)
 	vpnSvc.pool.IncrementConnections(tunID)
-	sess2.LastSeen = time.Now().UTC().Add(-10 * time.Minute)
+	vpnSvc.sessionMgr.SetSessionLastSeen(peerKeyBob, time.Now().UTC().Add(-10*time.Minute))
 
 	timedOut2, err := vpnSvc.SweepTimedOutSessions(ctx)
 	if err != nil {
@@ -336,8 +348,11 @@ func TestSweepTimedOutSessions_Lifecycle(t *testing.T) {
 		t.Errorf("expected route to be unregistered by default reap")
 	}
 	tunAfter, err := vpnSvc.pool.GetTunnelByID(tunID)
-	if err != nil || tunAfter.ActiveConnections != 0 {
-		t.Errorf("expected pool connections=0 after default reap, got %d", tunAfter.ActiveConnections)
+	if err != nil || tunAfter == nil {
+		t.Fatalf("GetTunnelByID(%d): %v", tunID, err)
+	}
+	if tunAfter.ActiveConnections != 0 {
+		t.Errorf("ActiveConnections = %d, want 0", tunAfter.ActiveConnections)
 	}
 }
 
