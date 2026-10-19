@@ -42,6 +42,14 @@ func TestPortalI1ProtocolSwitchAndGenerationFailure(t *testing.T) {
 	if err != nil || config2 != config {
 		t.Fatalf("DNS refetch not stable: %v", err)
 	}
+	cfg.VPNDataPlaneI1Protocol = "sip"
+	if err := svc.UpdateConfig(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	config3, _, err := svc.GenerateClientConfig(ctx, userID)
+	if err != nil || config3 != config {
+		t.Fatalf("existing connection changed after protocol switch: %v", err)
+	}
 	cfg.VPNDataPlaneI1Protocol = "quic"
 	if err := svc.UpdateConfig(ctx, cfg); err == nil {
 		t.Fatal("unsupported protocol accepted")
@@ -57,5 +65,12 @@ func TestPortalI1ProtocolSwitchAndGenerationFailure(t *testing.T) {
 	cancel()
 	if _, _, err := svc.GenerateClientConfig(cancelled, otherID); err == nil {
 		t.Fatal("cancelled generation succeeded")
+	}
+	if _, err := resolvePortalI1(cancelled, cfg, map[string]any{}); err == nil {
+		t.Fatal("cancelled I1 generation succeeded")
+	}
+	cfg.VPNDataPlaneI1Protocol = "sip"
+	if _, err := resolvePortalI1(ctx, cfg, map[string]any{"portal_i1": 42}); err == nil {
+		t.Fatal("invalid persisted I1 accepted")
 	}
 }

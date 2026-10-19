@@ -265,26 +265,11 @@ func (s *Service) renderClientConfigForConnection(
 		return "", "", fmt.Errorf("restore client IP assignments: %w", err)
 	}
 	clientParams := buildClientParams(awgConn, p)
-	if err := cfg.ValidateDataPlaneI1Protocol(); err != nil {
+	i1, err := resolvePortalI1(ctx, cfg, clientParams)
+	if err != nil {
 		return "", "", err
 	}
-	i1, exists := clientParams["portal_i1"]
-	if !exists {
-		if err := ctx.Err(); err != nil {
-			return "", "", fmt.Errorf("generate portal I1: %w", err)
-		}
-		packets, err := cps.GenerateMimicryPackets(ctx, cfg.DataPlaneI1Protocol(), "", nil)
-		if err != nil {
-			return "", "", fmt.Errorf("generate portal I1: %w", err)
-		}
-		i1 = packets["i1"]
-		clientParams["portal_i1"] = i1
-	}
-	value, ok := i1.(string)
-	if !ok || value == "" {
-		return "", "", errors.New("invalid persisted portal I1")
-	}
-	awgParams.I1 = value
+	awgParams.I1 = i1
 	_, hadLease := s.ipam.GetAssignedIP(p.clientPub)
 	assignedIP, err := s.resolveAssignedIP(clientParams, cfg, p.clientPub)
 	if err != nil {
@@ -366,6 +351,29 @@ func (s *Service) renderClientConfigForConnection(
 		filename = fmt.Sprintf("%s.conf", awgConn.Name)
 	}
 	return configStr, filename, nil
+}
+
+func resolvePortalI1(ctx context.Context, cfg *models.VPNConfig, clientParams map[string]any) (string, error) {
+	if err := cfg.ValidateDataPlaneI1Protocol(); err != nil {
+		return "", err
+	}
+	i1, exists := clientParams["portal_i1"]
+	if !exists {
+		if err := ctx.Err(); err != nil {
+			return "", fmt.Errorf("generate portal I1: %w", err)
+		}
+		packets, err := cps.GenerateMimicryPackets(ctx, cfg.DataPlaneI1Protocol(), "", nil)
+		if err != nil {
+			return "", fmt.Errorf("generate portal I1: %w", err)
+		}
+		i1 = packets["i1"]
+		clientParams["portal_i1"] = i1
+	}
+	value, ok := i1.(string)
+	if !ok || value == "" {
+		return "", errors.New("invalid persisted portal I1")
+	}
+	return value, nil
 }
 
 func buildClientParams(awgConn *models.UserConnection, p *clientConfigParameters) map[string]any {

@@ -219,6 +219,7 @@ func BuildAWGInitiationPacket(serverPubKey, clientPrivKey, psk []byte, h1 any, s
 		return nil, nil, fmt.Errorf("failed to create aead1: %w", err)
 	}
 	nonce0 := make([]byte, 12)
+	// #nosec G407 -- Noise IK specifies nonce zero for the first AEAD under a fresh ephemeral-derived key.
 	encryptedStatic := aead1.Seal(nil, nonce0, clientPubKey, h)
 	hSum = blake2s.Sum256(append(h, encryptedStatic...))
 	h = hSum[:]
