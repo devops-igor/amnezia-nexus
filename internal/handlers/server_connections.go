@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -142,6 +143,7 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 
 	result, err := protoMgr.AddClient(ctx, server, clientParams)
 	if err != nil {
+		slog.Error("failed to add client", "server_id", serverID, "protocol", req.Protocol, "error", err)
 		h.JSONError(w, http.StatusInternalServerError, "add_client_failed", "Failed to add client")
 		return
 	}
@@ -164,6 +166,7 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	if err := h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, clientID, req.Name, assignedUserID, "active"); err != nil {
+		slog.Error("failed to record peer lifecycle", "server_id", serverID, "protocol", req.Protocol, "error", err)
 		if rbErr := h.rollbackClient(ctx, protoMgr, server, result, clientID); rbErr != nil {
 			_ = h.db.SetPeerLifecycleStatus(ctx, serverID, req.Protocol, clientID, "failed")
 		}
@@ -187,6 +190,7 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 			conn.AWGMimicry = models.AWGMimicryProfile(*req.AWGMimicry)
 		}
 		if _, err := h.db.CreateConnection(ctx, conn); err != nil {
+			slog.Error("failed to save connection record", "server_id", serverID, "protocol", req.Protocol, "error", err)
 			if rbErr := h.rollbackClient(ctx, protoMgr, server, result, clientID); rbErr != nil {
 				_ = h.db.SetPeerLifecycleStatus(ctx, serverID, req.Protocol, clientID, "failed")
 			} else {
