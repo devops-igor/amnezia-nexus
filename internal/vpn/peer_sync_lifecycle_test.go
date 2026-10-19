@@ -345,7 +345,8 @@ func TestPeerSyncNotificationStopLifecycleRace(t *testing.T) {
 	// Whatever the interleaving was, the outcome is coherent: notifications
 	// were either enqueued and drained, or recorded as visible failures.
 	// Nothing is silently dropped.
-	ps.quiesceNotifyWorker()
+	// Stop has already joined the worker. Queued notifications rejected by
+	// shutdown remain counted as pending, so quiesce would wait forever.
 	if !ps.armedFlag.Load() {
 		if failures, reason := ps.EnqueueFailures(); failures > 0 && reason == "" {
 			t.Fatal("enqueue failure counted without a recorded reason")
