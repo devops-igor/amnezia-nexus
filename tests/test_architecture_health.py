@@ -15,6 +15,7 @@ from scripts.architecture_health import (
     classify_component,
     compute_git_churn,
     count_file_lines_and_bytes,
+    detect_renames,
     find_repo_root,
     generate_baseline,
     generate_json_report,
@@ -22,6 +23,7 @@ from scripts.architecture_health import (
     get_commit_metadata,
     get_tracked_files,
     is_excluded,
+    is_generated_or_vendor,
     load_baseline,
     save_baseline,
     scan_repository,
@@ -140,7 +142,10 @@ def test_classify_component() -> None:
     assert classify_component("internal/vpn/vpn_test.go") == "Test Suites"
     assert classify_component("tests/e2e/test_traffic.py") == "Test Suites"
     assert classify_component("web/templates/vpn.html") == "Web Templates"
-    assert classify_component("web/static/css/style.css") == "CSS Styles"
+    assert classify_component("web/static/css/base.css") == "CSS Styles"
+    assert classify_component("web/static/css/style.css") == "Generated & Vendor"
+    assert classify_component("web/static/js/qrcode.min.js") == "Generated & Vendor"
+    assert classify_component("tests/e2e/fixtures/style.pre-505.css") == "Generated & Vendor"
     assert classify_component("web/static/js/vpn/backends.js") == "Frontend JavaScript"
     assert classify_component("web/translations/en.json") == "Translations"
     assert classify_component("cmd/server/main.go") == "Go Production (CLI & Entrypoints)"
@@ -713,3 +718,247 @@ def test_cli_generate_baseline_and_check(tmp_path: Path) -> None:
         ],
     ):
         assert main() == 0
+
+
+def test_generate_baseline_upward_ratchet_refusal(tmp_path: Path) -> None:
+    """Verify generate_baseline refuses ceiling increases when existing baseline is present."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "file.go").write_text("\n" * 1200, encoding="utf-8")
+
+    mock_tracked = ["file.go"]
+    mock_meta = ("abcdef1234567890abcdef1234567890abcdef12", "2026-10-19T12:00:00Z", 1792411200)
+
+    # Existing baseline had ceiling 1000 for file.go
+    existing = {
+        "ceilings": {"file.go": 1000},
+        "files": {"file.go": {"lines": 1000, "ceiling": 1000}},
+    }
+
+    with (
+        patch("scripts.architecture_health.get_tracked_files", return_value=mock_tracked),
+        patch("scripts.architecture_health.get_commit_metadata", return_value=mock_meta),
+        patch("scripts.architecture_health.compute_git_churn", return_value=({}, {})),
+    ):
+        # Refusal without --allow-ceiling-increase
+        with pytest.raises(ValueError, match="Cannot increase ceilings"):
+            generate_baseline(
+                repo_root=repo_root,
+                existing_baseline=existing,
+                allow_ceiling_increase=False,
+            )
+
+        # Allowed with allow_ceiling_increase=True
+        baseline = generate_baseline(
+            repo_root=repo_root,
+            existing_baseline=existing,
+            allow_ceiling_increase=True,
+        )
+        assert baseline["ceilings"]["file.go"] == 1200
+
+
+def test_cli_generate_baseline_refuses_upward_ratchet(tmp_path: Path) -> None:
+    """Verify CLI main() with --generate-baseline fails closed when ceilings rise."""
+    from scripts.architecture_health import main
+
+    test_baseline = tmp_path / "baseline.json"
+    existing = {
+        "metadata": {
+            "baseline_commit": "abc",
+            "reference_timestamp": "now",
+            "reference_timestamp_epoch": 123,
+        },
+        "ceilings": {"internal/vpn/vpn.go": 1000},
+        "files": {"internal/vpn/vpn.go": {"lines": 1000, "ceiling": 1000}},
+    }
+    save_baseline(test_baseline, existing)
+
+    mock_meta = ("abcdef1234567890abcdef1234567890abcdef12", "2026-10-19T12:00:00Z", 1792411200)
+    with (
+        patch(
+            "scripts.architecture_health.get_tracked_files", return_value=["internal/vpn/vpn.go"]
+        ),
+        patch("scripts.architecture_health.count_file_lines_and_bytes", return_value=(2000, 50000)),
+        patch("scripts.architecture_health.get_commit_metadata", return_value=mock_meta),
+        patch("scripts.architecture_health.compute_git_churn", return_value=({}, {})),
+    ):
+        # Fails closed without flag
+        with patch(
+            "sys.argv",
+            ["arch.py", "--baseline-file", str(test_baseline), "--generate-baseline"],
+        ):
+            assert main() == 1
+
+        # Succeeds with --allow-ceiling-increase
+        with patch(
+            "sys.argv",
+            [
+                "arch.py",
+                "--baseline-file",
+                str(test_baseline),
+                "--generate-baseline",
+                "--allow-ceiling-increase",
+            ],
+        ):
+            assert main() == 0
+
+
+def test_rename_detection_and_ceiling_transfer(tmp_path: Path) -> None:
+    """Verify file moves via git diff -M transfer baseline ceilings without false violations."""
+    # 1. Test detect_renames with git diff -M output
+    mock_diff = "R100\told_path.go\tnew_path.go\nM\tother.go\n"
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(stdout=mock_diff, returncode=0)
+        renames = detect_renames(Path("/fake/repo"), "commit_sha")
+        assert renames == {"new_path.go": "old_path.go"}
+
+    # 2. Test scan_repository carries ceiling and churn across rename
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    moved_file = repo_root / "new_path.go"
+    moved_file.write_text("\n" * 1500, encoding="utf-8")
+
+    baseline_ceilings = {"old_path.go": 1500}
+    with (
+        patch("scripts.architecture_health.get_tracked_files", return_value=["new_path.go"]),
+        patch(
+            "scripts.architecture_health.detect_renames",
+            return_value={"new_path.go": "old_path.go"},
+        ),
+        patch(
+            "scripts.architecture_health.compute_git_churn",
+            return_value=({"old_path.go": 7}, {"old_path.go": 14}),
+        ),
+    ):
+        files_data, summary, violations, ratchets = scan_repository(
+            repo_root=repo_root,
+            baseline_ceilings=baseline_ceilings,
+            baseline_commit="commit_sha",
+            reference_epoch=1792411200,
+        )
+        assert summary["ceiling_violations_count"] == 0
+        assert len(violations) == 0
+        assert files_data[0]["ceiling"] == 1500
+        assert files_data[0]["churn_30d"] == 7
+        assert files_data[0]["churn_90d"] == 14
+
+    # 3. Test update_downward_ratchet purges old_path ceiling when renamed
+    baseline_data = {
+        "ceilings": {"old_path.go": 1500},
+        "files": {"old_path.go": {"lines": 1500, "ceiling": 1500}},
+    }
+    current_files = [{"path": "new_path.go", "lines": 1200}]
+    updated, applied, unauth = update_downward_ratchet(
+        current_files_data=current_files,
+        baseline_data=baseline_data,
+        renames={"new_path.go": "old_path.go"},
+    )
+    assert "old_path.go" not in updated["ceilings"]
+    assert updated["ceilings"]["new_path.go"] == 1200
+
+
+def test_downward_ratchet_warning_annotations_and_summary(caplog: pytest.LogCaptureFixture) -> None:
+    """Verify downward ratchet opportunities emit ::warning annotations and summary callouts."""
+    import logging
+    from scripts.architecture_health import main
+
+    summary = {
+        "total_files": 1,
+        "total_lines": 800,
+        "total_bytes": 20000,
+        "ceiling_lines": 1000,
+        "warning_lines": 500,
+        "ceiling_violations_count": 0,
+        "warning_count": 1,
+        "ratchet_opportunities_count": 1,
+        "tier_counts": {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 1, "LOW": 0},
+        "component_stats": {},
+    }
+    ratchets = [
+        {
+            "path": "shrunk.go",
+            "component": "Go Core VPN",
+            "previous_ceiling": 1400,
+            "current_lines": 1100,
+            "new_ceiling": 1100,
+            "reduction": 300,
+        }
+    ]
+
+    md = generate_markdown_summary(
+        files_data=[], summary=summary, ceiling_violations=[], ratchet_opportunities=ratchets
+    )
+    assert "Downward Ratchet Pending" in md
+    assert "📉 Ratchet Pending" in md
+    assert "shrunk.go" in md
+
+    # Verify annotation emission via logger during CLI check
+    with (
+        patch(
+            "scripts.architecture_health.load_baseline",
+            return_value={"ceilings": {}, "metadata": {}},
+        ),
+        patch("scripts.architecture_health.Path.exists", return_value=True),
+        patch(
+            "scripts.architecture_health.scan_repository",
+            return_value=([], summary, [], ratchets),
+        ),
+        patch("scripts.architecture_health.generate_json_report", return_value="{}"),
+        patch("scripts.architecture_health.save_baseline"),
+        patch("builtins.open", MagicMock()),
+        patch("sys.argv", ["arch.py", "--check"]),
+    ):
+        with caplog.at_level(logging.WARNING):
+            ret = main()
+            assert ret == 0
+            assert any(
+                "::warning file=shrunk.go::Downward ratchet pending" in record.message
+                for record in caplog.records
+            )
+
+
+def test_generated_and_vendor_asset_handling() -> None:
+    """Verify generated/vendor assets are identified and separated from developer hotspots."""
+    assert is_generated_or_vendor("web/static/js/qrcode.min.js") is True
+    assert is_generated_or_vendor("web/static/css/style.css") is True
+    assert is_generated_or_vendor("tests/e2e/fixtures/style.pre-505.css") is True
+    assert is_generated_or_vendor("web/static/css/base.css") is False
+    assert is_generated_or_vendor("internal/vpn/vpn.go") is False
+
+    files_data = [
+        {
+            "path": "web/static/css/style.css",
+            "lines": 2991,
+            "is_generated": True,
+            "component": "Generated & Vendor",
+        },
+        {
+            "path": "internal/vpn/vpn.go",
+            "lines": 2000,
+            "is_generated": False,
+            "component": "Go Core VPN",
+        },
+    ]
+    summary = {
+        "total_files": 2,
+        "total_lines": 4991,
+        "total_bytes": 100000,
+        "ceiling_lines": 1000,
+        "warning_lines": 500,
+        "ceiling_violations_count": 0,
+        "warning_count": 0,
+        "ratchet_opportunities_count": 0,
+        "tier_counts": {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 0, "LOW": 0},
+        "component_stats": {},
+    }
+
+    report_str = generate_json_report(files_data, summary, [], [])
+    report = json.loads(report_str)
+    assert len(report["top_hotspots"]) == 1
+    assert report["top_hotspots"][0]["path"] == "internal/vpn/vpn.go"
+    assert len(report["generated_vendor_files"]) == 1
+    assert report["generated_vendor_files"][0]["path"] == "web/static/css/style.css"
+
+    md = generate_markdown_summary(files_data, summary, [], [])
+    assert "### 🤖 Generated & Vendor Assets" in md
+    assert "web/static/css/style.css" in md

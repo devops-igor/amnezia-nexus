@@ -79,6 +79,22 @@ LANGUAGE_MAP: Dict[str, str] = {
     ".xml": "XML",
 }
 
+GENERATED_OR_VENDOR_PATHS: Set[str] = {
+    "web/static/js/qrcode.min.js",
+    "web/static/css/style.css",
+    "tests/e2e/fixtures/style.pre-505.css",
+}
+
+
+def is_generated_or_vendor(rel_path: str) -> bool:
+    """Determine whether a path is a generated bundle, minified vendor asset, or fixture."""
+    norm = rel_path.replace("\\", "/")
+    if norm in GENERATED_OR_VENDOR_PATHS:
+        return True
+    if norm.endswith(".min.js") or norm.endswith(".min.css"):
+        return True
+    return "/fixtures/" in norm or norm.startswith("fixtures/")
+
 
 def find_repo_root(custom_root: Optional[Union[str, Path]] = None) -> Path:
     """Find repository root using git rev-parse or fallback to current directory."""
@@ -86,27 +102,50 @@ def find_repo_root(custom_root: Optional[Union[str, Path]] = None) -> Path:
         return Path(custom_root).resolve()
     try:
         out = subprocess.check_output(
-            ["git", "rev-parse", "--show-toplevel"],
-            stderr=subprocess.DEVNULL,
-            text=True,
+            ["git", "rev-parse", "--show-toplevel"], stderr=subprocess.DEVNULL, text=True
         ).strip()
-        if out:
-            return Path(out).resolve()
+        return Path(out).resolve() if out else Path.cwd().resolve()
     except Exception:
-        pass
-    return Path.cwd().resolve()
+        return Path.cwd().resolve()
 
 
 def get_tracked_files(repo_root: Path) -> List[str]:
     """Enumerate repository tracked files strictly using git ls-files."""
     res = subprocess.run(
-        ["git", "ls-files"],
+        ["git", "-c", "core.quotePath=false", "ls-files"],
         cwd=repo_root,
         capture_output=True,
         text=True,
         check=True,
     )
     return sorted(Path(line.strip()).as_posix() for line in res.stdout.splitlines() if line.strip())
+
+
+def detect_renames(repo_root: Path, baseline_commit: Optional[str] = None) -> Dict[str, str]:
+    """Detect file renames via git diff -M between baseline commit (or HEAD) and working tree."""
+    refs_to_try = [baseline_commit, "HEAD"] if baseline_commit else ["HEAD"]
+    for ref in refs_to_try:
+        if not ref:
+            continue
+        try:
+            res = subprocess.run(
+                ["git", "-c", "core.quotePath=false", "diff", "-M", "--name-status", ref],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            renames: Dict[str, str] = {}
+            for line in res.stdout.splitlines():
+                parts = line.strip().split("\t")
+                if len(parts) >= 3 and parts[0].startswith("R"):
+                    old_path = Path(parts[1].strip()).as_posix()
+                    new_path = Path(parts[2].strip()).as_posix()
+                    renames[new_path] = old_path
+            return renames
+        except Exception as exc:
+            logger.debug("Failed git diff -M for ref %s: %s", ref, exc)
+    return {}
 
 
 def is_excluded(rel_path: str) -> bool:
@@ -128,56 +167,51 @@ def count_file_lines_and_bytes(file_path: Path) -> Optional[Tuple[int, int]]:
             content = f.read()
     except Exception:
         return None
-
     if b"\x00" in content:
         return None
-
-    byte_size = len(content)
     line_count = content.count(b"\n") + (1 if content and not content.endswith(b"\n") else 0)
-    return line_count, byte_size
+    return line_count, len(content)
 
 
 def classify_component(rel_path: str) -> str:
     """Classify a relative path into an architectural component."""
     norm = rel_path.replace("\\", "/")
-    filename = os.path.basename(norm)
-
+    if is_generated_or_vendor(norm):
+        return "Generated & Vendor"
+    fn = os.path.basename(norm)
     if (
-        norm.endswith("_test.go")
-        or norm.startswith("tests/")
-        or norm.endswith("_test.py")
-        or filename.startswith("test_")
+        norm.startswith("tests/")
+        or fn.startswith("test_")
+        or norm.endswith(("_test.go", "_test.py"))
     ):
         return "Test Suites"
-    if norm.startswith("internal/vpn/forwarder/"):
-        return "Packet Forwarder"
-    if norm.startswith("internal/vpn/"):
-        return "Go Core VPN"
-    if norm.startswith("web/templates/") or norm.endswith(".html"):
-        return "Web Templates"
-    if norm.startswith("web/static/css/") or norm.endswith(".css"):
-        return "CSS Styles"
-    if norm.startswith("cmd/"):
-        return "Go Production (CLI & Entrypoints)"
-    if norm.startswith("internal/service/"):
-        return "Go Production (Services)"
-    if norm.startswith("internal/manager/"):
-        return "Go Production (WireGuard Manager)"
-    if norm.startswith("internal/handlers/") or norm.startswith("internal/router/"):
-        return "Go Production (Handlers & Router)"
-    if any(
-        norm.startswith(f"internal/{pkg}/")
-        for pkg in ("database", "config", "models", "security", "middleware", "captcha")
-    ):
-        return "Go Production (Database & Infra)"
-    if norm.startswith("web/static/js/"):
-        return "Frontend JavaScript"
-    if norm.startswith("web/translations/"):
-        return "Translations"
-    if norm.startswith("scripts/"):
-        return "Scripts & Tooling"
-    if norm.startswith("docs/") or norm.endswith(".md"):
-        return "Documentation"
+    rules: Tuple[Tuple[Union[str, Tuple[str, ...]], str], ...] = (
+        ("internal/vpn/forwarder/", "Packet Forwarder"),
+        ("internal/vpn/", "Go Core VPN"),
+        (("web/templates/", ".html"), "Web Templates"),
+        (("web/static/css/", ".css"), "CSS Styles"),
+        ("cmd/", "Go Production (CLI & Entrypoints)"),
+        ("internal/service/", "Go Production (Services)"),
+        ("internal/manager/", "Go Production (WireGuard Manager)"),
+        (("internal/handlers/", "internal/router/"), "Go Production (Handlers & Router)"),
+        (
+            tuple(
+                f"internal/{p}/"
+                for p in ("database", "config", "models", "security", "middleware", "captcha")
+            ),
+            "Go Production (Database & Infra)",
+        ),
+        ("web/static/js/", "Frontend JavaScript"),
+        ("web/translations/", "Translations"),
+        ("scripts/", "Scripts & Tooling"),
+        (("docs/", ".md"), "Documentation"),
+    )
+    for pattern, comp in rules:
+        if isinstance(pattern, tuple):
+            if any(norm.startswith(p) if p.endswith("/") else norm.endswith(p) for p in pattern):
+                return comp
+        elif norm.startswith(pattern):
+            return comp
     return "Other"
 
 
@@ -285,6 +319,38 @@ def calculate_risk_metrics(
     return risk_score, tier
 
 
+def _violation(path: str, comp: str, lines: int, ceil: int) -> Dict[str, Any]:
+    return {
+        "path": path,
+        "component": comp,
+        "lines": lines,
+        "ceiling": ceil,
+        "excess_lines": lines - ceil,
+    }
+
+
+def _ratchet_opp(path: str, comp: str, old: int, curr: int, new: int) -> Dict[str, Any]:
+    return {
+        "path": path,
+        "component": comp,
+        "previous_ceiling": old,
+        "current_lines": curr,
+        "new_ceiling": new,
+        "reduction": old - new,
+    }
+
+
+def _ratchet_applied(path: str, old: int, new: int, act: str, red: int = 0) -> Dict[str, Any]:
+    d = {"path": path, "old_ceiling": old, "new_ceiling": new, "action": act}
+    if red:
+        d["reduction"] = red
+    return d
+
+
+def _unauthorized_ratchet(path: str, old: int, curr: int) -> Dict[str, Any]:
+    return {"path": path, "old_ceiling": old, "current_lines": curr, "excess": curr - old}
+
+
 def scan_repository(
     repo_root: Path,
     baseline_ceilings: Optional[Dict[str, int]] = None,
@@ -294,6 +360,7 @@ def scan_repository(
     warning_lines: int = DEFAULT_WARNING_LINES,
     days_short: int = CHURN_SHORT_DAYS,
     days_long: int = CHURN_LONG_DAYS,
+    renames: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Scan tracked repository files, compute metrics, and detect ceiling/ratchet delta."""
     tracked_files = get_tracked_files(repo_root)
@@ -305,7 +372,20 @@ def scan_repository(
             repo_root, baseline_commit, reference_epoch, days_short, days_long
         )
 
-    ceilings = baseline_ceilings or {}
+    if renames is None and baseline_commit:
+        renames = detect_renames(repo_root, baseline_commit)
+    else:
+        renames = renames or {}
+
+    ceilings = dict(baseline_ceilings or {})
+    for new_p, old_p in renames.items():
+        if new_p not in ceilings and old_p in ceilings:
+            ceilings[new_p] = ceilings[old_p]
+        if new_p not in churn_30 and old_p in churn_30:
+            churn_30[new_p] = churn_30[old_p]
+        if new_p not in churn_90 and old_p in churn_90:
+            churn_90[new_p] = churn_90[old_p]
+
     files_data: List[Dict[str, Any]] = []
     ceiling_violations: List[Dict[str, Any]] = []
     ratchet_opportunities: List[Dict[str, Any]] = []
@@ -327,10 +407,12 @@ def scan_repository(
         c30 = churn_30.get(rel_path, 0)
         c90 = churn_90.get(rel_path, 0)
         risk_score, risk_tier = calculate_risk_metrics(line_count, c30, c90, ceiling_lines)
+        gen = is_generated_or_vendor(rel_path)
 
         file_ceiling = ceilings.get(rel_path, ceiling_lines)
         is_ceiling_violation = line_count > file_ceiling
-        is_warning = warning_lines <= line_count <= file_ceiling
+        is_warning = (warning_lines <= line_count < ceiling_lines) and (line_count <= file_ceiling)
+        is_grandfathered = (line_count > ceiling_lines) and (line_count <= file_ceiling)
 
         files_data.append(
             {
@@ -342,35 +424,22 @@ def scan_repository(
                 "ceiling": file_ceiling,
                 "churn_30d": c30,
                 "churn_90d": c90,
-                "risk_score": risk_score,
-                "risk_tier": risk_tier,
+                "risk_score": 0.0 if gen else risk_score,
+                "risk_tier": "GENERATED" if gen else risk_tier,
                 "ceiling_violation": is_ceiling_violation,
                 "warning_threshold": is_warning,
+                "grandfathered": is_grandfathered,
+                "is_generated": gen,
             }
         )
 
         if is_ceiling_violation:
-            ceiling_violations.append(
-                {
-                    "path": rel_path,
-                    "component": component,
-                    "lines": line_count,
-                    "ceiling": file_ceiling,
-                    "excess_lines": line_count - file_ceiling,
-                }
-            )
+            ceiling_violations.append(_violation(rel_path, component, line_count, file_ceiling))
 
         ratcheted_ceiling = max(ceiling_lines, line_count)
         if ratcheted_ceiling < file_ceiling:
             ratchet_opportunities.append(
-                {
-                    "path": rel_path,
-                    "component": component,
-                    "previous_ceiling": file_ceiling,
-                    "current_lines": line_count,
-                    "new_ceiling": ratcheted_ceiling,
-                    "reduction": file_ceiling - ratcheted_ceiling,
-                }
+                _ratchet_opp(rel_path, component, file_ceiling, line_count, ratcheted_ceiling)
             )
 
     files_data.sort(key=lambda x: (x["risk_score"], x["lines"]), reverse=True)
@@ -420,6 +489,7 @@ def scan_repository(
         "warning_lines": warning_lines,
         "ceiling_violations_count": len(ceiling_violations),
         "warning_count": sum(1 for f in files_data if f["warning_threshold"]),
+        "grandfathered_count": sum(1 for f in files_data if f.get("grandfathered", False)),
         "ratchet_opportunities_count": len(ratchet_opportunities),
         "tier_counts": tier_counts,
         "component_stats": component_stats,
@@ -434,6 +504,9 @@ def generate_baseline(
     warning_lines: int = DEFAULT_WARNING_LINES,
     days_short: int = CHURN_SHORT_DAYS,
     days_long: int = CHURN_LONG_DAYS,
+    existing_baseline: Optional[Dict[str, Any]] = None,
+    allow_ceiling_increase: bool = False,
+    renames: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Generate baseline JSON metadata against specified commit reference."""
     sha, iso_ts, epoch = get_commit_metadata(repo_root, commit_ref)
@@ -465,6 +538,24 @@ def generate_baseline(
             "churn_90d": churn_90.get(rel_path, 0),
         }
 
+    if existing_baseline:
+        existing_ceilings = dict(existing_baseline.get("ceilings", {}))
+        if renames:
+            for new_p, old_p in renames.items():
+                if old_p in existing_ceilings and new_p not in existing_ceilings:
+                    existing_ceilings[new_p] = existing_ceilings[old_p]
+        increases: List[Tuple[str, int, int]] = []
+        for path, new_ceil in ceilings.items():
+            old_ceil = existing_ceilings.get(path, ceiling_lines)
+            if new_ceil > old_ceil:
+                increases.append((path, old_ceil, new_ceil))
+        if increases and not allow_ceiling_increase:
+            inc_summary = ", ".join(f"{p} ({o}->{n})" for p, o, n in increases[:3])
+            raise ValueError(
+                f"Cannot increase ceilings for {len(increases)} file(s) [{inc_summary}] "
+                f"without --allow-ceiling-increase."
+            )
+
     return {
         "metadata": {
             "repository": "amnezia-nexus",
@@ -485,12 +576,20 @@ def update_downward_ratchet(
     baseline_data: Dict[str, Any],
     ceiling_lines: int = DEFAULT_CEILING_LINES,
     allow_ceiling_increase: bool = False,
+    renames: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Apply downward ratchet updates to baseline ceilings, rejecting unapproved increases."""
     ceilings = dict(baseline_data.get("ceilings", {}))
     files_map = dict(baseline_data.get("files", {}))
     applied: List[Dict[str, Any]] = []
     unauthorized: List[Dict[str, Any]] = []
+
+    if renames:
+        for new_p, old_p in renames.items():
+            if old_p in ceilings and new_p not in ceilings:
+                ceilings[new_p] = ceilings.pop(old_p)
+            if old_p in files_map and new_p not in files_map:
+                files_map[new_p] = files_map.pop(old_p)
 
     for item in current_files_data:
         path, curr_lines = item["path"], item["lines"]
@@ -500,36 +599,18 @@ def update_downward_ratchet(
             if allow_ceiling_increase:
                 ceilings[path] = curr_lines
                 files_map.setdefault(path, {}).update({"ceiling": curr_lines, "lines": curr_lines})
-                applied.append(
-                    {
-                        "path": path,
-                        "old_ceiling": old_ceiling,
-                        "new_ceiling": curr_lines,
-                        "action": "increased",
-                    }
-                )
+                applied.append(_ratchet_applied(path, old_ceiling, curr_lines, "increased"))
             else:
-                unauthorized.append(
-                    {
-                        "path": path,
-                        "old_ceiling": old_ceiling,
-                        "current_lines": curr_lines,
-                        "excess": curr_lines - old_ceiling,
-                    }
-                )
+                unauthorized.append(_unauthorized_ratchet(path, old_ceiling, curr_lines))
         elif curr_lines < old_ceiling:
             new_ceiling = max(ceiling_lines, curr_lines)
             if new_ceiling < old_ceiling:
                 ceilings[path] = new_ceiling
                 files_map.setdefault(path, {}).update({"ceiling": new_ceiling, "lines": curr_lines})
                 applied.append(
-                    {
-                        "path": path,
-                        "old_ceiling": old_ceiling,
-                        "new_ceiling": new_ceiling,
-                        "reduction": old_ceiling - new_ceiling,
-                        "action": "ratcheted_down",
-                    }
+                    _ratchet_applied(
+                        path, old_ceiling, new_ceiling, "ratcheted_down", old_ceiling - new_ceiling
+                    )
                 )
 
     if unauthorized and not allow_ceiling_increase:
@@ -554,6 +635,8 @@ def generate_json_report(
 ) -> str:
     """Generate structured JSON architecture health report."""
     meta = baseline_metadata or {}
+    developer_hotspots = [f for f in files_data if not f.get("is_generated")][:top_limit]
+    generated_files = [f for f in files_data if f.get("is_generated")]
     report = {
         "scan_metadata": {
             "repository": meta.get("repository", "amnezia-nexus"),
@@ -572,13 +655,15 @@ def generate_json_report(
         "summary": {
             "ceiling_violations_count": summary["ceiling_violations_count"],
             "warning_count": summary["warning_count"],
+            "grandfathered_count": summary.get("grandfathered_count", 0),
             "ratchet_opportunities_count": summary["ratchet_opportunities_count"],
             "tier_counts": summary["tier_counts"],
             "component_stats": summary["component_stats"],
         },
         "ceiling_violations": ceiling_violations,
         "ratchet_opportunities": ratchet_opportunities,
-        "top_hotspots": files_data[:top_limit],
+        "top_hotspots": developer_hotspots,
+        "generated_vendor_files": generated_files,
     }
     return json.dumps(report, indent=2)
 
@@ -595,32 +680,42 @@ def generate_markdown_summary(
     lines: List[str] = ["## Architecture Health & Churn Report", ""]
     meta = baseline_metadata or {}
     viol_count = summary["ceiling_violations_count"]
+    ratchet_count = summary["ratchet_opportunities_count"]
 
-    callout = (
-        f"> [!WARNING]\n> **{viol_count} Ceiling Violation(s) Detected.** Files exceed their pinned architecture ceiling."
-        if viol_count
-        else "> [!NOTE]\n> **Architecture Health Clean.** All tracked files respect baseline ceilings."
-    )
-    lines.extend([callout, ""])
-    lines.append(
-        f"- **Baseline Commit**: `{meta.get('baseline_commit', 'N/A')[:10]}` (Date: `{meta.get('reference_timestamp', 'N/A')}`)"
-    )
-    lines.append(
-        f"- **Default Thresholds**: Strict Ceiling = {summary['ceiling_lines']:,} lines | Warning = {summary['warning_lines']:,} lines"
-    )
-    lines.append(
-        f"- **Evaluated Files**: {summary['total_files']:,} tracked files | **Total Lines**: {summary['total_lines']:,}\n"
-    )
+    if viol_count:
+        callout = (
+            f"> [!WARNING]\n"
+            f"> **{viol_count} Ceiling Violation(s) Detected.** Files exceed their pinned architecture ceiling."
+        )
+    elif ratchet_count:
+        callout = (
+            f"> [!WARNING]\n"
+            f"> **Downward Ratchet Pending.** {ratchet_count} file(s) dropped below baseline ceiling. "
+            f"Run `scripts/architecture_health.py --ratchet` to lock in reductions."
+        )
+    else:
+        callout = "> [!NOTE]\n> **Architecture Health Clean.** All tracked files respect baseline ceilings."
 
-    lines.append("| Metric Category | Count | Status |\n|---|---:|:---:|")
-    lines.append(
-        f"| **Ceiling Violations (> Baseline Ceiling)** | **{viol_count}** | {'❌ VIOLATION' if viol_count else '✅ PASS'} |"
+    lines.extend(
+        [
+            callout,
+            "",
+            f"- **Baseline Commit**: `{meta.get('baseline_commit', 'N/A')[:10]}` (Date: `{meta.get('reference_timestamp', 'N/A')}`)",
+            f"- **Default Thresholds**: Strict Ceiling = {summary['ceiling_lines']:,} lines | Warning = {summary['warning_lines']:,} lines",
+            f"- **Evaluated Files**: {summary['total_files']:,} tracked files | **Total Lines**: {summary['total_lines']:,}\n",
+            "| Metric Category | Count | Status |\n|---|---:|:---:|",
+            f"| **Ceiling Violations (> Baseline Ceiling)** | **{viol_count}** | {'❌ VIOLATION' if viol_count else '✅ PASS'} |",
+        ]
     )
-    lines.append(
-        f"| **Warning Threshold ({summary['warning_lines']:,}-{summary['ceiling_lines']-1:,} lines)** | **{summary['warning_count']}** | ⚠️ Advisory |"
-    )
-    lines.append(
-        f"| **Downward Ratchet Opportunities** | **{summary['ratchet_opportunities_count']}** | 📉 Shrinkage |"
+    if summary.get("grandfathered_count"):
+        lines.append(
+            f"| **Grandfathered Exceptions (> {summary['ceiling_lines']:,} lines)** | **{summary['grandfathered_count']}** | 📋 Pinned Ceiling |"
+        )
+    lines.extend(
+        [
+            f"| **Warning Threshold ({summary['warning_lines']:,}-{summary['ceiling_lines']-1:,} lines)** | **{summary['warning_count']}** | ⚠️ Advisory |",
+            f"| **Downward Ratchet Opportunities** | **{ratchet_count}** | {'📉 Ratchet Pending' if ratchet_count else '✅ Synchronized'} |",
+        ]
     )
     lines.append(
         f"| **CRITICAL Risk Hotspots** | **{summary['tier_counts']['CRITICAL']}** | 🔥 Urgent |"
@@ -636,10 +731,10 @@ def generate_markdown_summary(
                 "|---|---|---:|---:|---:|",
             ]
         )
-        for v in ceiling_violations[:15]:
-            lines.append(
-                f"| `{v['path']}` | {v['component']} | {v['lines']:,} | {v['ceiling']:,} | +{v['excess_lines']:,} |"
-            )
+        lines.extend(
+            f"| `{v['path']}` | {v['component']} | {v['lines']:,} | {v['ceiling']:,} | +{v['excess_lines']:,} |"
+            for v in ceiling_violations[:15]
+        )
         lines.append("")
 
     if ratchet_opportunities:
@@ -647,16 +742,19 @@ def generate_markdown_summary(
             [
                 "### 📉 Downward Ratchet Opportunities",
                 "",
-                "These files decreased in size; their ceilings can ratchet downward to lock in gains:\n",
+                "> **Notice:** Downward ratchet is pending. These files decreased in size; their ceilings can ratchet downward to lock in gains:\n",
                 "| File Path | Component | Previous Ceiling | Current Lines | Proposed Ratchet | Reduction |",
                 "|---|---|---:|---:|---:|---:|",
             ]
         )
-        for r in ratchet_opportunities[:15]:
-            lines.append(
-                f"| `{r['path']}` | {r['component']} | {r['previous_ceiling']:,} | {r['current_lines']:,} | {r['new_ceiling']:,} | -{r['reduction']:,} |"
-            )
+        lines.extend(
+            f"| `{r['path']}` | {r['component']} | {r['previous_ceiling']:,} | {r['current_lines']:,} | {r['new_ceiling']:,} | -{r['reduction']:,} |"
+            for r in ratchet_opportunities[:15]
+        )
         lines.append("")
+
+    developer_hotspots = [f for f in files_data if not f.get("is_generated")]
+    generated_files = [f for f in files_data if f.get("is_generated")]
 
     lines.extend(
         [
@@ -666,11 +764,28 @@ def generate_markdown_summary(
             "|---:|---|---|---:|---:|---:|---:|:---:|",
         ]
     )
-    for idx, f in enumerate(files_data[:top_limit], 1):
+    for idx, f in enumerate(developer_hotspots[:top_limit], 1):
         lines.append(
-            f"| {idx} | `{f['path']}` | {f['component']} | {f['lines']:,} | {f['churn_30d']} | {f['churn_90d']} | {f['risk_score']:.2f} | **{f['risk_tier']}** |"
+            f"| {idx} | `{f['path']}` | {f['component']} | {f['lines']:,} | {f.get('churn_30d', 0)} | {f.get('churn_90d', 0)} | {f.get('risk_score', 0.0):.2f} | **{f.get('risk_tier', 'LOW')}** |"
         )
     lines.append("")
+
+    if generated_files:
+        lines.extend(
+            [
+                "### 🤖 Generated & Vendor Assets",
+                "",
+                "These files are generated bundles, fixtures, or vendor assets (excluded from developer hotspots):",
+                "",
+                "| File Path | Component | Lines | Baseline Ceiling |",
+                "|---|---|---:|---:|",
+            ]
+        )
+        lines.extend(
+            f"| `{gf['path']}` | {gf['component']} | {gf['lines']:,} | {gf.get('ceiling', 1000):,} |"
+            for gf in generated_files
+        )
+        lines.append("")
 
     lines.extend(
         [
@@ -719,53 +834,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Architecture Health Size and Churn Report with Ratchet."
     )
-    parser.add_argument("--repo-root", type=str, default=None, help="Path to repository root.")
+    parser.add_argument("--repo-root", default=None, help="Repository root path.")
     parser.add_argument(
-        "--baseline-file",
-        type=str,
-        default="scripts/architecture_baseline.json",
-        help="Path to baseline JSON.",
+        "--baseline-file", default="scripts/architecture_baseline.json", help="Path."
     )
+    parser.add_argument("--generate-baseline", action="store_true", help="Generate baseline JSON.")
+    parser.add_argument("--check", action="store_true", help="Check baseline ceilings.")
+    parser.add_argument("--ratchet", action="store_true", help="Apply downward ratchet.")
+    parser.add_argument("--allow-ceiling-increase", action="store_true", help="Allow increase.")
+    parser.add_argument("--nonblocking", action="store_true", help="Exit 0 even with violations.")
     parser.add_argument(
-        "--generate-baseline",
-        action="store_true",
-        help="Generate baseline JSON against current commit.",
+        "--report-json", default="architecture_health_report.json", help="JSON report."
     )
-    parser.add_argument(
-        "--check", action="store_true", help="Check repository state against baseline ceilings."
-    )
-    parser.add_argument(
-        "--ratchet", action="store_true", help="Apply downward ratchet updates to baseline JSON."
-    )
-    parser.add_argument(
-        "--allow-ceiling-increase",
-        action="store_true",
-        help="Allow ceiling increase when updating ratchet.",
-    )
-    parser.add_argument(
-        "--nonblocking", action="store_true", help="Exit 0 even if ceiling violations exist."
-    )
-    parser.add_argument(
-        "--report-json",
-        type=str,
-        default="architecture_health_report.json",
-        help="Output JSON report path.",
-    )
-    parser.add_argument(
-        "--summary-md", type=str, default=None, help="Output Markdown summary path."
-    )
-    parser.add_argument(
-        "--ceiling",
-        type=int,
-        default=DEFAULT_CEILING_LINES,
-        help=f"Default ceiling (default: {DEFAULT_CEILING_LINES}).",
-    )
-    parser.add_argument(
-        "--warning",
-        type=int,
-        default=DEFAULT_WARNING_LINES,
-        help=f"Default warning (default: {DEFAULT_WARNING_LINES}).",
-    )
+    parser.add_argument("--summary-md", default=None, help="Summary path.")
+    parser.add_argument("--ceiling", type=int, default=DEFAULT_CEILING_LINES, help="Ceiling lines.")
+    parser.add_argument("--warning", type=int, default=DEFAULT_WARNING_LINES, help="Warning lines.")
 
     args = parser.parse_args()
     repo_root = find_repo_root(args.repo_root)
@@ -775,12 +858,29 @@ def main() -> int:
 
     if args.generate_baseline:
         logger.info("Generating architecture baseline at %s...", baseline_path)
-        baseline_data = generate_baseline(
-            repo_root=repo_root,
-            commit_ref="HEAD",
-            ceiling_lines=args.ceiling,
-            warning_lines=args.warning,
+        existing_data = None
+        if baseline_path.exists():
+            try:
+                existing_data = load_baseline(baseline_path)
+            except Exception as exc:
+                logger.warning("Could not load existing baseline: %s", exc)
+        b_commit = (
+            existing_data.get("metadata", {}).get("baseline_commit") if existing_data else None
         )
+        renames = detect_renames(repo_root, b_commit)
+        try:
+            baseline_data = generate_baseline(
+                repo_root=repo_root,
+                commit_ref="HEAD",
+                ceiling_lines=args.ceiling,
+                warning_lines=args.warning,
+                existing_baseline=existing_data,
+                allow_ceiling_increase=args.allow_ceiling_increase,
+                renames=renames,
+            )
+        except ValueError as exc:
+            logger.error("Baseline generation rejected: %s", exc)
+            return 1
         save_baseline(baseline_path, baseline_data)
         meta = baseline_data["metadata"]
         logger.info(
@@ -798,6 +898,8 @@ def main() -> int:
 
     baseline_data = load_baseline(baseline_path)
     base_meta = baseline_data.get("metadata", {})
+    b_commit = base_meta.get("baseline_commit")
+    renames = detect_renames(repo_root, b_commit)
 
     try:
         scan_commit = subprocess.check_output(
@@ -809,10 +911,11 @@ def main() -> int:
     files_data, summary, violations, ratchets = scan_repository(
         repo_root=repo_root,
         baseline_ceilings=baseline_data.get("ceilings", {}),
-        baseline_commit=base_meta.get("baseline_commit"),
+        baseline_commit=b_commit,
         reference_epoch=base_meta.get("reference_timestamp_epoch"),
         ceiling_lines=args.ceiling,
         warning_lines=args.warning,
+        renames=renames,
     )
 
     if args.ratchet:
@@ -822,6 +925,7 @@ def main() -> int:
                 baseline_data=baseline_data,
                 ceiling_lines=args.ceiling,
                 allow_ceiling_increase=args.allow_ceiling_increase,
+                renames=renames,
             )
             save_baseline(baseline_path, updated_baseline)
             logger.info("Ratchet applied: %d ceiling updates saved.", len(applied))
@@ -859,6 +963,18 @@ def main() -> int:
         summary["warning_count"],
         summary["ratchet_opportunities_count"],
     )
+
+    if ratchets:
+        for r in ratchets:
+            logger.warning(
+                "::warning file=%s::Downward ratchet pending: %s dropped from %d to %d lines "
+                "(reduction: %d). Run --ratchet to update baseline.",
+                r["path"],
+                r["path"],
+                r["previous_ceiling"],
+                r["current_lines"],
+                r["reduction"],
+            )
 
     if violations and not args.nonblocking:
         logger.error(
