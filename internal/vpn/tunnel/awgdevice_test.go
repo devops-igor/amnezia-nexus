@@ -110,8 +110,8 @@ func TestVirtualTUN_DropCounter(t *testing.T) {
 
 	pkt := []byte{0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2}
 
-	// Fill the outPackets channel buffer (capacity 1024)
-	for i := 0; i < 1024; i++ {
+	// Fill the outPackets channel buffer (capacity 2048)
+	for i := 0; i < virtualtun.DefaultOutboundCapacity; i++ {
 		n, err := dev.vtun.Write([][]byte{pkt}, 0)
 		if err != nil {
 			t.Fatalf("unexpected error on write %d: %v", i, err)
