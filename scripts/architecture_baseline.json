@@ -1,0 +1,5668 @@
+{
+  "metadata": {
+    "repository": "amnezia-nexus",
+    "baseline_commit": "1810775edb75a1b0b3239087bd5e8b30b72de610",
+    "reference_timestamp": "2026-10-19T12:33:29Z",
+    "reference_timestamp_epoch": 1792413209,
+    "warning_threshold": 500,
+    "ceiling_threshold": 1000,
+    "churn_windows_days": [
+      30,
+      90
+    ]
+  },
+  "ceilings": {
+    ".flake8": 1000,
+    ".github/workflows/ci.yml": 1000,
+    ".github/workflows/css-differential.yml": 1000,
+    ".github/workflows/differential-soak.yml": 1000,
+    ".github/workflows/docker.yml": 1000,
+    ".github/workflows/e2e-dev.yml": 1000,
+    ".github/workflows/upstream-monitor.yml": 1000,
+    ".gitignore": 1000,
+    ".golangci.yml": 1000,
+    "CHANGELOG.md": 1000,
+    "Dockerfile": 1000,
+    "Makefile": 1000,
+    "README.md": 1000,
+    "cmd/panel/main.go": 1000,
+    "cmd/panel/main_test.go": 1000,
+    "cmd/qualification-subject/main.go": 1000,
+    "cmd/server/main.go": 1000,
+    "cmd/server/main_test.go": 1000,
+    "docs/architecture/css-contracts.md": 1000,
+    "docs/architecture/forwarder-dataplane-ownership.md": 1000,
+    "docs/architecture/frontend-javascript-contracts.md": 1000,
+    "docs/architecture/vpn-service-state-ownership.md": 1000,
+    "go.mod": 1000,
+    "go.sum": 1000,
+    "internal/captcha/captcha.go": 1000,
+    "internal/captcha/captcha_test.go": 1000,
+    "internal/captcha/slide.go": 1000,
+    "internal/config/config.go": 1000,
+    "internal/config/config_test.go": 1000,
+    "internal/config/cookie_insecure_test.go": 1000,
+    "internal/config/rename_darwin.go": 1000,
+    "internal/config/rename_linux.go": 1000,
+    "internal/config/rename_other.go": 1000,
+    "internal/config/secret_key_test.go": 1358,
+    "internal/database/awg_ip_allocations.go": 1000,
+    "internal/database/awg_ip_allocations_test.go": 1196,
+    "internal/database/backend_enabled_migration_test.go": 1000,
+    "internal/database/backend_tunnels.go": 1000,
+    "internal/database/connections.go": 1000,
+    "internal/database/connections_test.go": 1000,
+    "internal/database/database.go": 1000,
+    "internal/database/database_helpers_test.go": 1000,
+    "internal/database/database_test.go": 1000,
+    "internal/database/issue338_ipam_collision_test.go": 1000,
+    "internal/database/known_hosts.go": 1000,
+    "internal/database/known_hosts_test.go": 1000,
+    "internal/database/leaderboard.go": 1000,
+    "internal/database/leaderboard_test.go": 1000,
+    "internal/database/migrate.go": 1000,
+    "internal/database/migrate_test.go": 1000,
+    "internal/database/migration_compat_test.go": 1000,
+    "internal/database/migrations.go": 1000,
+    "internal/database/migrations_legacy_alloc.go": 1000,
+    "internal/database/peer_changes.go": 1000,
+    "internal/database/peer_changes_null_client_id_test.go": 1000,
+    "internal/database/peer_changes_test.go": 1000,
+    "internal/database/peer_lifecycle.go": 1000,
+    "internal/database/peer_lifecycle_test.go": 1000,
+    "internal/database/preflight.go": 1000,
+    "internal/database/preflight_test.go": 1000,
+    "internal/database/schema.sql": 1000,
+    "internal/database/servers.go": 1000,
+    "internal/database/servers_test.go": 1000,
+    "internal/database/settings.go": 1000,
+    "internal/database/settings_test.go": 1000,
+    "internal/database/test_helpers_test.go": 1000,
+    "internal/database/users.go": 1000,
+    "internal/database/users_test.go": 1000,
+    "internal/database/vpn.go": 1000,
+    "internal/database/vpn_config.go": 1000,
+    "internal/database/vpn_endpoint_test.go": 1000,
+    "internal/database/vpn_enriched_sessions_test.go": 1000,
+    "internal/database/vpn_restart_test.go": 1000,
+    "internal/database/vpn_sessions_connection_name_test.go": 1000,
+    "internal/database/vpn_test.go": 1023,
+    "internal/handlers/auth.go": 1000,
+    "internal/handlers/auth_test.go": 1000,
+    "internal/handlers/captcha_slide_test.go": 1000,
+    "internal/handlers/connections.go": 1000,
+    "internal/handlers/connections_test.go": 1204,
+    "internal/handlers/edge_cases_test.go": 1000,
+    "internal/handlers/handlers.go": 1000,
+    "internal/handlers/handlers_test.go": 1000,
+    "internal/handlers/leaderboard.go": 1000,
+    "internal/handlers/leaderboard_test.go": 1000,
+    "internal/handlers/pages.go": 1000,
+    "internal/handlers/pages_test.go": 1000,
+    "internal/handlers/peer_sync.go": 1000,
+    "internal/handlers/peer_sync_convergence_test.go": 1000,
+    "internal/handlers/server_connections.go": 1000,
+    "internal/handlers/server_connections_test.go": 1065,
+    "internal/handlers/server_delete_backend_test.go": 1000,
+    "internal/handlers/server_stats_parse.go": 1000,
+    "internal/handlers/server_stats_parse_test.go": 1000,
+    "internal/handlers/servers.go": 1035,
+    "internal/handlers/servers_install_logging_test.go": 1000,
+    "internal/handlers/servers_test.go": 2385,
+    "internal/handlers/settings.go": 1000,
+    "internal/handlers/settings_test.go": 1000,
+    "internal/handlers/share.go": 1000,
+    "internal/handlers/share_test.go": 1000,
+    "internal/handlers/system.go": 1000,
+    "internal/handlers/system_test.go": 1000,
+    "internal/handlers/template.go": 1000,
+    "internal/handlers/template_test.go": 1000,
+    "internal/handlers/upstream.go": 1000,
+    "internal/handlers/upstream_test.go": 1000,
+    "internal/handlers/users.go": 1000,
+    "internal/handlers/users_test.go": 1130,
+    "internal/handlers/vpn.go": 1000,
+    "internal/handlers/vpn_config_presence_test.go": 1000,
+    "internal/handlers/vpn_key_boundary_test.go": 1000,
+    "internal/handlers/vpn_metrics.go": 1000,
+    "internal/handlers/vpn_test.go": 1228,
+    "internal/handlers/vpn_unavailable_test.go": 1000,
+    "internal/handlers/zombie_peer_rollback_test.go": 1000,
+    "internal/manager/awg/awg.go": 2754,
+    "internal/manager/awg/awg_ip_concurrency_test.go": 2522,
+    "internal/manager/awg/awg_lock.go": 1000,
+    "internal/manager/awg/awg_lock_test.go": 1000,
+    "internal/manager/awg/awg_nat_test.go": 1000,
+    "internal/manager/awg/awg_preflight_port_test.go": 1000,
+    "internal/manager/awg/awg_probe_rework_test.go": 1000,
+    "internal/manager/awg/awg_tc_cleanup_test.go": 1000,
+    "internal/manager/awg/awg_test.go": 2544,
+    "internal/manager/awg/config.go": 1000,
+    "internal/manager/awg/config_test.go": 1078,
+    "internal/manager/awg/container_cache_hardening_test.go": 1000,
+    "internal/manager/awg/cps/cps.go": 1000,
+    "internal/manager/awg/cps/cps_test.go": 1000,
+    "internal/manager/awg/cps/dns.go": 1000,
+    "internal/manager/awg/cps/quic.go": 1000,
+    "internal/manager/awg/cps/sip.go": 1000,
+    "internal/manager/awg/cps/tls.go": 1000,
+    "internal/manager/awg/export_test.go": 1000,
+    "internal/manager/awg/health/awg_container_integration_test.go": 1000,
+    "internal/manager/awg/health/noise.go": 1000,
+    "internal/manager/awg/health/noise_test.go": 1000,
+    "internal/manager/awg/health/probe.go": 1000,
+    "internal/manager/awg/health/probe_test.go": 1000,
+    "internal/manager/awg/params.go": 1274,
+    "internal/manager/awg/params_test.go": 1518,
+    "internal/manager/awg/peer_config.go": 1000,
+    "internal/manager/awg/remote_lock_hardening_test.go": 1624,
+    "internal/manager/awg/shell_escape_test.go": 1000,
+    "internal/manager/awg/timing_ranges_review_34_test.go": 1000,
+    "internal/manager/dns/dns.go": 1000,
+    "internal/manager/dns/dns_test.go": 1000,
+    "internal/manager/dns/unbound.go": 1000,
+    "internal/manager/manager.go": 1000,
+    "internal/manager/manager_test.go": 1000,
+    "internal/manager/mtproxyl/mtproxyl.go": 1000,
+    "internal/manager/mtproxyl/mtproxyl_test.go": 1000,
+    "internal/manager/mtproxyl/secrets.go": 1000,
+    "internal/manager/mtproxyl/stats.go": 1000,
+    "internal/manager/ssh/auth.go": 1000,
+    "internal/manager/ssh/auth_test.go": 1000,
+    "internal/manager/ssh/client.go": 1000,
+    "internal/manager/ssh/client_test.go": 1000,
+    "internal/manager/ssh/exec.go": 1000,
+    "internal/manager/ssh/exec_test.go": 1000,
+    "internal/manager/ssh/hostkey.go": 1000,
+    "internal/manager/ssh/hostkey_test.go": 1000,
+    "internal/manager/ssh/mock_server_test.go": 1000,
+    "internal/manager/ssh/pool.go": 1000,
+    "internal/manager/ssh/pool_test.go": 1000,
+    "internal/manager/ssh/sftp.go": 1000,
+    "internal/manager/ssh/sftp_test.go": 1000,
+    "internal/manager/ssh/utils.go": 1000,
+    "internal/manager/ssh/utils_test.go": 1000,
+    "internal/middleware/cookie_policy.go": 1000,
+    "internal/middleware/cookie_policy_test.go": 1000,
+    "internal/middleware/csrf.go": 1000,
+    "internal/middleware/csrf_test.go": 1000,
+    "internal/middleware/errors.go": 1000,
+    "internal/middleware/errors_test.go": 1000,
+    "internal/middleware/middleware.go": 1000,
+    "internal/middleware/middleware_test.go": 1000,
+    "internal/middleware/password_change.go": 1000,
+    "internal/middleware/password_change_test.go": 1000,
+    "internal/middleware/ratelimit.go": 1000,
+    "internal/middleware/ratelimit_test.go": 1000,
+    "internal/middleware/realip.go": 1000,
+    "internal/middleware/realip_test.go": 1000,
+    "internal/middleware/secure_conn.go": 1000,
+    "internal/middleware/secure_conn_test.go": 1000,
+    "internal/middleware/secure_cookie_xfp_test.go": 1000,
+    "internal/middleware/session.go": 1000,
+    "internal/middleware/session_test.go": 1000,
+    "internal/middleware/setup.go": 1000,
+    "internal/middleware/setup_test.go": 1000,
+    "internal/models/identifier_validation_test.go": 1000,
+    "internal/models/models.go": 1000,
+    "internal/models/models_test.go": 1000,
+    "internal/models/range.go": 1000,
+    "internal/models/range_test.go": 1000,
+    "internal/models/requests.go": 1000,
+    "internal/models/responses.go": 1000,
+    "internal/router/ratelimit_endpoints_test.go": 1000,
+    "internal/router/router.go": 1000,
+    "internal/router/router_static_vpn_test.go": 1000,
+    "internal/router/router_test.go": 1039,
+    "internal/router/server.go": 1000,
+    "internal/router/server_test.go": 1000,
+    "internal/router/vpn_metrics_test.go": 1000,
+    "internal/security/security.go": 1000,
+    "internal/security/security_test.go": 1000,
+    "internal/service/orchestrator/autotrial.go": 1000,
+    "internal/service/orchestrator/orchestrator.go": 1000,
+    "internal/service/orchestrator/orchestrator_test.go": 2170,
+    "internal/service/orchestrator/probe_failover_retry_test.go": 1000,
+    "internal/service/orchestrator/reachability.go": 1000,
+    "internal/service/orchestrator/rebalance_live_migration_test.go": 1000,
+    "internal/service/orchestrator/rebalance_threshold_test.go": 1000,
+    "internal/service/orchestrator/traffic.go": 1000,
+    "internal/service/orchestrator/vpn_tasks.go": 1000,
+    "internal/service/orchestrator/vpn_tasks_params_regression_test.go": 1000,
+    "internal/service/orchestrator/vpn_tasks_range_test.go": 1000,
+    "internal/service/reconciliation/reconciliation.go": 1000,
+    "internal/service/reconciliation/reconciliation_test.go": 1301,
+    "internal/service/service.go": 1000,
+    "internal/service/service_test.go": 1000,
+    "internal/service/supervisor/supervisor.go": 1000,
+    "internal/service/supervisor/supervisor_test.go": 1000,
+    "internal/service/upstream/service.go": 1000,
+    "internal/service/upstream/service_test.go": 1000,
+    "internal/service/userops/userops.go": 1000,
+    "internal/service/userops/userops_test.go": 1000,
+    "internal/vpn/auth/auth.go": 1000,
+    "internal/vpn/auth/auth_test.go": 1000,
+    "internal/vpn/backend_enable.go": 1000,
+    "internal/vpn/backend_enable_test.go": 1000,
+    "internal/vpn/backend_lifecycle.go": 1000,
+    "internal/vpn/backend_lifecycle_test.go": 1000,
+    "internal/vpn/backend_routing_test.go": 1000,
+    "internal/vpn/capacity_stress_test.go": 1000,
+    "internal/vpn/clientawg/config.go": 1000,
+    "internal/vpn/clientawg/config_test.go": 1000,
+    "internal/vpn/clientawg/device.go": 1000,
+    "internal/vpn/clientawg/device_test.go": 1000,
+    "internal/vpn/clientawg/interoperability_test.go": 1000,
+    "internal/vpn/clientawg/status.go": 1000,
+    "internal/vpn/config_obfuscation.go": 1000,
+    "internal/vpn/config_obfuscation_test.go": 1000,
+    "internal/vpn/delete_backend_test.go": 1000,
+    "internal/vpn/diagnostics.go": 1000,
+    "internal/vpn/diagnostics_backend_decomposition_test.go": 1000,
+    "internal/vpn/diagnostics_backend_drops.go": 1000,
+    "internal/vpn/diagnostics_backend_drops_test.go": 1000,
+    "internal/vpn/diagnostics_backends.go": 1000,
+    "internal/vpn/diagnostics_expanded_test.go": 1000,
+    "internal/vpn/diagnostics_generation_race_test.go": 1000,
+    "internal/vpn/diagnostics_generation_test.go": 1000,
+    "internal/vpn/diagnostics_handshake.go": 1000,
+    "internal/vpn/diagnostics_health.go": 1000,
+    "internal/vpn/diagnostics_health_test.go": 1000,
+    "internal/vpn/diagnostics_history.go": 1000,
+    "internal/vpn/diagnostics_history_bench_test.go": 1000,
+    "internal/vpn/diagnostics_history_sampling_test.go": 1000,
+    "internal/vpn/diagnostics_history_test.go": 1000,
+    "internal/vpn/diagnostics_inputs.go": 1000,
+    "internal/vpn/diagnostics_lifetime.go": 1000,
+    "internal/vpn/diagnostics_loss_accounting_test.go": 1000,
+    "internal/vpn/diagnostics_loss_health_test.go": 1000,
+    "internal/vpn/diagnostics_problems.go": 1000,
+    "internal/vpn/diagnostics_problems_handshake_test.go": 1000,
+    "internal/vpn/diagnostics_problems_onset_test.go": 1000,
+    "internal/vpn/diagnostics_problems_test.go": 1000,
+    "internal/vpn/diagnostics_resources.go": 1000,
+    "internal/vpn/diagnostics_retirement_direction_test.go": 1000,
+    "internal/vpn/diagnostics_return_mismatch_test.go": 1000,
+    "internal/vpn/diagnostics_round10_test.go": 1000,
+    "internal/vpn/diagnostics_round11_test.go": 1000,
+    "internal/vpn/diagnostics_round2_test.go": 1000,
+    "internal/vpn/diagnostics_round3_test.go": 1000,
+    "internal/vpn/diagnostics_round4_test.go": 1000,
+    "internal/vpn/diagnostics_round5_test.go": 1000,
+    "internal/vpn/diagnostics_round6_test.go": 1000,
+    "internal/vpn/diagnostics_round7_test.go": 1000,
+    "internal/vpn/diagnostics_round8_latency_test.go": 1000,
+    "internal/vpn/diagnostics_round8_test.go": 1000,
+    "internal/vpn/diagnostics_round9_test.go": 1000,
+    "internal/vpn/diagnostics_routing.go": 1000,
+    "internal/vpn/diagnostics_routing_test.go": 1000,
+    "internal/vpn/diagnostics_runtime_test.go": 1000,
+    "internal/vpn/diagnostics_samplers.go": 1000,
+    "internal/vpn/diagnostics_severity_test.go": 1000,
+    "internal/vpn/diagnostics_snapshot_test.go": 1000,
+    "internal/vpn/diagnostics_test.go": 1000,
+    "internal/vpn/diagnostics_thresholds.go": 1000,
+    "internal/vpn/diagnostics_thresholds_source_test.go": 1000,
+    "internal/vpn/diagnostics_thresholds_test.go": 1000,
+    "internal/vpn/diagnostics_unattributed_health_test.go": 1000,
+    "internal/vpn/differential_baseline_test.go": 1000,
+    "internal/vpn/differential_harness_test.go": 1045,
+    "internal/vpn/differential_lifecycle_test.go": 1000,
+    "internal/vpn/differential_matrix_test.go": 1071,
+    "internal/vpn/differential_shim_test.go": 1000,
+    "internal/vpn/differential_soak_test.go": 1038,
+    "internal/vpn/disabled_backend_regression_test.go": 1000,
+    "internal/vpn/enable_backend_failcount_test.go": 1000,
+    "internal/vpn/endpoint_detection_test.go": 1000,
+    "internal/vpn/engine_ingress_e2e_test.go": 1000,
+    "internal/vpn/engine_return.go": 1000,
+    "internal/vpn/engine_return_e2e_test.go": 1000,
+    "internal/vpn/engine_return_production_test.go": 1000,
+    "internal/vpn/engine_return_test.go": 1000,
+    "internal/vpn/faultinjection_test.go": 1000,
+    "internal/vpn/forwarder/accounting.go": 1000,
+    "internal/vpn/forwarder/accounting_test.go": 1000,
+    "internal/vpn/forwarder/backend_admission_accounting_test.go": 1000,
+    "internal/vpn/forwarder/client_write.go": 1000,
+    "internal/vpn/forwarder/client_write_round8_test.go": 1000,
+    "internal/vpn/forwarder/forwarder.go": 1000,
+    "internal/vpn/forwarder/forwarder_test.go": 1000,
+    "internal/vpn/forwarder/generation.go": 1000,
+    "internal/vpn/forwarder/generation_test.go": 1000,
+    "internal/vpn/forwarder/issue151_regression_test.go": 1000,
+    "internal/vpn/forwarder/issue309_teardown_test.go": 1000,
+    "internal/vpn/forwarder/issue39_regression_test.go": 1000,
+    "internal/vpn/forwarder/pumps.go": 1000,
+    "internal/vpn/forwarder/pumps_test.go": 1000,
+    "internal/vpn/forwarder/queue_benchmark_test.go": 1000,
+    "internal/vpn/forwarder/queue_dwell.go": 1000,
+    "internal/vpn/forwarder/queue_dwell_test.go": 1000,
+    "internal/vpn/forwarder/queue_observability_test.go": 1000,
+    "internal/vpn/forwarder/queue_thresholds_source_test.go": 1000,
+    "internal/vpn/forwarder/queues.go": 1000,
+    "internal/vpn/forwarder/queues_test.go": 1000,
+    "internal/vpn/forwarder/rates.go": 1000,
+    "internal/vpn/forwarder/rates_restart_test.go": 1000,
+    "internal/vpn/forwarder/rates_test.go": 1000,
+    "internal/vpn/forwarder/rebind_guard_test.go": 1000,
+    "internal/vpn/forwarder/return_path.go": 1000,
+    "internal/vpn/forwarder/return_path_test.go": 1000,
+    "internal/vpn/forwarder/reverse_map_invariant_test.go": 1000,
+    "internal/vpn/forwarder/route_pressure.go": 1000,
+    "internal/vpn/forwarder/route_pressure_test.go": 1000,
+    "internal/vpn/forwarder/routes.go": 1000,
+    "internal/vpn/forwarder/routes_pressure_round6_test.go": 1000,
+    "internal/vpn/forwarder/routes_test.go": 1000,
+    "internal/vpn/forwarder/routing_bench_test.go": 1000,
+    "internal/vpn/forwarder/teardown_integration_test.go": 1000,
+    "internal/vpn/forwarder/telemetry.go": 1000,
+    "internal/vpn/forwarder/telemetry_expanded_test.go": 1000,
+    "internal/vpn/forwarder/telemetry_test.go": 1000,
+    "internal/vpn/forwarder/thresholds/thresholds.go": 1000,
+    "internal/vpn/forwarder/tokenbucket_issue94_test.go": 1000,
+    "internal/vpn/forwarder/traffic_telemetry.go": 1000,
+    "internal/vpn/forwarder/traffic_telemetry_test.go": 1000,
+    "internal/vpn/forwarder/write_error_logging_test.go": 1000,
+    "internal/vpn/forwarder/write_histogram.go": 1000,
+    "internal/vpn/generation.go": 1000,
+    "internal/vpn/http2_pmtu_regression_test.go": 1000,
+    "internal/vpn/identity/serverkeys.go": 1000,
+    "internal/vpn/identity/serverkeys_migration_test.go": 1000,
+    "internal/vpn/ingress/doc.go": 1000,
+    "internal/vpn/ingress/liveness.go": 1000,
+    "internal/vpn/ingress/liveness_test.go": 1000,
+    "internal/vpn/ingress/packet.go": 1000,
+    "internal/vpn/ingress/packet_test.go": 1000,
+    "internal/vpn/ingress/resolver.go": 1000,
+    "internal/vpn/ingress/resolver_test.go": 1000,
+    "internal/vpn/ingress/return_path.go": 1000,
+    "internal/vpn/ingress/router.go": 1000,
+    "internal/vpn/ingress/router_interop_test.go": 1000,
+    "internal/vpn/ingress/router_owner_memo_test.go": 1000,
+    "internal/vpn/ingress/router_test.go": 1000,
+    "internal/vpn/ingress_concurrent_legacy_mix_test.go": 1000,
+    "internal/vpn/ingress_engine.go": 1000,
+    "internal/vpn/ingress_replacement_accounting_test.go": 1000,
+    "internal/vpn/ipam/ipam.go": 1000,
+    "internal/vpn/ipam/ipam_test.go": 1000,
+    "internal/vpn/issue297_remote_ipam_test.go": 1000,
+    "internal/vpn/issue297_restart_test.go": 1000,
+    "internal/vpn/issue309_test.go": 1000,
+    "internal/vpn/issue338_ipam_collision_test.go": 1673,
+    "internal/vpn/issue90_admin_health_split_test.go": 1000,
+    "internal/vpn/lb_integration_test.go": 1000,
+    "internal/vpn/lifecycle_test.go": 1000,
+    "internal/vpn/loadbalancer/balancer.go": 1000,
+    "internal/vpn/loadbalancer/balancer_test.go": 1000,
+    "internal/vpn/loadbalancer/faultinjection_test.go": 1000,
+    "internal/vpn/loadbalancer/least_conn.go": 1000,
+    "internal/vpn/loadbalancer/least_conn_test.go": 1000,
+    "internal/vpn/loadbalancer/round_robin.go": 1000,
+    "internal/vpn/loadbalancer/round_robin_test.go": 1000,
+    "internal/vpn/loadbalancer/sticky.go": 1000,
+    "internal/vpn/loadbalancer/sticky85_test.go": 1000,
+    "internal/vpn/loadbalancer/sticky_test.go": 1000,
+    "internal/vpn/loadbalancer/weighted_rr.go": 1000,
+    "internal/vpn/loadbalancer/weighted_rr_issue92_test.go": 1000,
+    "internal/vpn/loadbalancer/weighted_rr_test.go": 1000,
+    "internal/vpn/metrics.go": 1000,
+    "internal/vpn/orchestrator_concurrency_test.go": 1000,
+    "internal/vpn/peer_ip_recovery.go": 1000,
+    "internal/vpn/peer_ip_recovery_test.go": 1000,
+    "internal/vpn/peer_lifecycle_e2e_test.go": 1000,
+    "internal/vpn/peer_revoke.go": 1000,
+    "internal/vpn/peer_sync.go": 1303,
+    "internal/vpn/peer_sync_lifecycle_test.go": 1000,
+    "internal/vpn/peer_sync_ownership_status_test.go": 1000,
+    "internal/vpn/peer_sync_test.go": 1000,
+    "internal/vpn/portal_key_restart_test.go": 1000,
+    "internal/vpn/probe_identity_red_test.go": 1000,
+    "internal/vpn/qualification_subject.go": 1000,
+    "internal/vpn/qualification_subject_test.go": 1000,
+    "internal/vpn/queue_observability_test.go": 1000,
+    "internal/vpn/race_off_test.go": 1000,
+    "internal/vpn/race_on_test.go": 1000,
+    "internal/vpn/rebalance_migration_test.go": 1000,
+    "internal/vpn/reconcile_connections_test.go": 1000,
+    "internal/vpn/regression_deletion_test.go": 1000,
+    "internal/vpn/regression_transition_test.go": 1000,
+    "internal/vpn/rekey_replacement_regression_test.go": 1000,
+    "internal/vpn/self_healing_test.go": 1000,
+    "internal/vpn/service_admission_test_helper.go": 1000,
+    "internal/vpn/service_lifecycle.go": 1000,
+    "internal/vpn/service_lifecycle_test.go": 1000,
+    "internal/vpn/session/session.go": 1000,
+    "internal/vpn/session/session_migration_test.go": 1000,
+    "internal/vpn/session/session_test.go": 1000,
+    "internal/vpn/sessions_enriched_test.go": 1000,
+    "internal/vpn/sessions_lifecycle.go": 1000,
+    "internal/vpn/sessions_lifecycle_test.go": 1000,
+    "internal/vpn/sessions_live_test.go": 1000,
+    "internal/vpn/sessions_migration.go": 1000,
+    "internal/vpn/sessions_migration_test.go": 1000,
+    "internal/vpn/timing_ranges_review_34_test.go": 1000,
+    "internal/vpn/tunnel/admin_health_state_test.go": 1000,
+    "internal/vpn/tunnel/awgdevice.go": 1000,
+    "internal/vpn/tunnel/awgdevice_params_regression_test.go": 1000,
+    "internal/vpn/tunnel/awgdevice_test.go": 1000,
+    "internal/vpn/tunnel/device_bench_test.go": 1000,
+    "internal/vpn/tunnel/disabled_tunnel_regression_test.go": 1000,
+    "internal/vpn/tunnel/endpoint_fencing_test.go": 1000,
+    "internal/vpn/tunnel/export_test.go": 1000,
+    "internal/vpn/tunnel/failcount_reset_test.go": 1000,
+    "internal/vpn/tunnel/health.go": 1322,
+    "internal/vpn/tunnel/health_range_test.go": 1000,
+    "internal/vpn/tunnel/health_test.go": 1000,
+    "internal/vpn/tunnel/pool.go": 1000,
+    "internal/vpn/tunnel/pool_persist_issue96_test.go": 1000,
+    "internal/vpn/tunnel/pool_test.go": 1336,
+    "internal/vpn/tunnel/reconnect.go": 1000,
+    "internal/vpn/tunnel/reconnect_test.go": 1000,
+    "internal/vpn/tunnel/self_healing_test.go": 1567,
+    "internal/vpn/tunnel/udpdevice.go": 1000,
+    "internal/vpn/tunnel/udpdevice_test.go": 1000,
+    "internal/vpn/upstream_durability_test.go": 1000,
+    "internal/vpn/upstream_engine_test.go": 1000,
+    "internal/vpn/upstream_reap_test.go": 1000,
+    "internal/vpn/virtualtun/stats_coherence_test.go": 1000,
+    "internal/vpn/virtualtun/suspend_reads_test.go": 1000,
+    "internal/vpn/virtualtun/virtualtun.go": 1000,
+    "internal/vpn/virtualtun/virtualtun_bench_test.go": 1000,
+    "internal/vpn/virtualtun/virtualtun_test.go": 1172,
+    "internal/vpn/vpn.go": 2371,
+    "internal/vpn/vpn_backend_attachment_test.go": 1000,
+    "internal/vpn/vpn_backend_enable_test.go": 1000,
+    "internal/vpn/vpn_backend_probe_test.go": 1000,
+    "internal/vpn/vpn_client_config_test.go": 1000,
+    "internal/vpn/vpn_config_obfuscation_test.go": 1000,
+    "internal/vpn/vpn_config_test.go": 1000,
+    "internal/vpn/vpn_ingress.go": 1000,
+    "internal/vpn/vpn_ingress_test.go": 1000,
+    "internal/vpn/vpn_ipam_test.go": 1000,
+    "internal/vpn/vpn_lifecycle_test.go": 1000,
+    "internal/vpn/vpn_session_reaper_test.go": 1000,
+    "internal/vpn/vpn_session_reconcile_test.go": 1000,
+    "internal/vpn/vpn_test.go": 1000,
+    "pyproject.toml": 1000,
+    "scripts/DIFFERENTIAL_SUITE_RUNBOOK.md": 1000,
+    "scripts/build_style_bundle.sh": 1000,
+    "scripts/generate_captcha_assets.py": 1000,
+    "scripts/run_differential_qualification.sh": 1000,
+    "scripts/run_e2e.sh": 1000,
+    "scripts/run_e2e_lifecycle.sh": 1000,
+    "scripts/run_non_netstack_client_qualification.sh": 1025,
+    "scripts/run_upstream_restart_durability.sh": 1000,
+    "scripts/verify_issue392_qualification.sh": 1000,
+    "tests/__init__.py": 1000,
+    "tests/e2e/README.md": 1000,
+    "tests/e2e/__init__.py": 1000,
+    "tests/e2e/conftest.py": 1000,
+    "tests/e2e/fixtures/style.pre-505.css": 3008,
+    "tests/e2e/requirements.txt": 1000,
+    "tests/e2e/test_auth.py": 1000,
+    "tests/e2e/test_connections.py": 1000,
+    "tests/e2e/test_css_differential.py": 1000,
+    "tests/e2e/test_my_connections.py": 1000,
+    "tests/e2e/test_onboard.py": 1000,
+    "tests/e2e/test_onboard_credentials.py": 1000,
+    "tests/e2e/test_servers.py": 1000,
+    "tests/e2e/test_settings.py": 1000,
+    "tests/e2e/test_setup.py": 1000,
+    "tests/e2e/test_share.py": 1000,
+    "tests/e2e/test_traffic.py": 1000,
+    "tests/e2e/test_users.py": 1000,
+    "tests/e2e/test_vpn_diagnostics.py": 1000,
+    "tests/test_vpn_diagnostics_oracle.py": 1000,
+    "useful_notes/HOW_IT_WORKS.md": 1000,
+    "web/static/css/base.css": 1000,
+    "web/static/css/components.css": 1000,
+    "web/static/css/layout.css": 1000,
+    "web/static/css/server.css": 1000,
+    "web/static/css/style.css": 2991,
+    "web/static/css/tables.css": 1000,
+    "web/static/css/tokens.css": 1000,
+    "web/static/css/vpn.css": 1000,
+    "web/static/favicon.svg": 1000,
+    "web/static/js/api.js": 1000,
+    "web/static/js/captcha.js": 1000,
+    "web/static/js/qrcode.min.js": 1000,
+    "web/static/js/server_actions.js": 1000,
+    "web/static/js/server_telemetry.js": 1000,
+    "web/static/js/tables.js": 1000,
+    "web/static/js/telemetry.js": 1000,
+    "web/static/js/ui.js": 1000,
+    "web/static/js/users.js": 1000,
+    "web/static/js/vpn/backends.js": 1000,
+    "web/static/js/vpn/charts.js": 1000,
+    "web/static/js/vpn/health_problems.js": 1000,
+    "web/static/js/vpn/health_summary.js": 1000,
+    "web/static/js/vpn/page.js": 1000,
+    "web/static/js/vpn/sessions.js": 1000,
+    "web/templates/base.html": 1000,
+    "web/templates/change_password.html": 1000,
+    "web/templates/icons.html": 1000,
+    "web/templates/index.html": 1000,
+    "web/templates/leaderboard.html": 1000,
+    "web/templates/login.html": 1000,
+    "web/templates/my_connections.html": 1000,
+    "web/templates/server.html": 1000,
+    "web/templates/settings.html": 1000,
+    "web/templates/setup.html": 1000,
+    "web/templates/user_share.html": 1000,
+    "web/templates/users.html": 1000,
+    "web/templates/vpn.html": 1000,
+    "web/translations/en.json": 1000,
+    "web/translations/fa.json": 1000,
+    "web/translations/fr.json": 1000,
+    "web/translations/ru.json": 1000,
+    "web/translations/zh.json": 1000,
+    "web/vpn_backends_test.go": 1000,
+    "web/vpn_diagnostics_accordion_test.go": 1000,
+    "web/vpn_diagnostics_health_test.go": 1000,
+    "web/vpn_diagnostics_history_test.go": 1000,
+    "web/vpn_diagnostics_i18n_test.go": 1000,
+    "web/vpn_diagnostics_problems_test.go": 1000,
+    "web/vpn_diagnostics_routes_test.go": 1000,
+    "web/vpn_diagnostics_sessions_test.go": 1000,
+    "web/vpn_diagnostics_test.go": 1000,
+    "web/vpn_fixture_dom_test.go": 1000,
+    "web/vpn_fixture_selftest_test.go": 1000,
+    "web/vpn_fixture_test.go": 1000,
+    "web/vpn_i18n_test.go": 1000,
+    "web/vpn_page_test.go": 1000,
+    "web/vpn_template_test.go": 1000,
+    "web/web.go": 1000,
+    "web/web_embedded_test.go": 1000,
+    "web/web_server_test.go": 1000,
+    "web/web_server_users_test.go": 1000,
+    "web/web_test.go": 1000,
+    "web/web_vpn_test.go": 1000
+  },
+  "files": {
+    ".flake8": {
+      "lines": 4,
+      "ceiling": 1000,
+      "bytes": 123,
+      "component": "Other",
+      "language": "Other",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    ".github/workflows/ci.yml": {
+      "lines": 126,
+      "ceiling": 1000,
+      "bytes": 3604,
+      "component": "Other",
+      "language": "YAML",
+      "churn_30d": 7,
+      "churn_90d": 11
+    },
+    ".github/workflows/css-differential.yml": {
+      "lines": 32,
+      "ceiling": 1000,
+      "bytes": 783,
+      "component": "Other",
+      "language": "YAML",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    ".github/workflows/differential-soak.yml": {
+      "lines": 87,
+      "ceiling": 1000,
+      "bytes": 3125,
+      "component": "Other",
+      "language": "YAML",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    ".github/workflows/docker.yml": {
+      "lines": 59,
+      "ceiling": 1000,
+      "bytes": 1510,
+      "component": "Other",
+      "language": "YAML",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    ".github/workflows/e2e-dev.yml": {
+      "lines": 286,
+      "ceiling": 1000,
+      "bytes": 12471,
+      "component": "Other",
+      "language": "YAML",
+      "churn_30d": 16,
+      "churn_90d": 16
+    },
+    ".github/workflows/upstream-monitor.yml": {
+      "lines": 370,
+      "ceiling": 1000,
+      "bytes": 16634,
+      "component": "Other",
+      "language": "YAML",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    ".gitignore": {
+      "lines": 34,
+      "ceiling": 1000,
+      "bytes": 473,
+      "component": "Other",
+      "language": "Other",
+      "churn_30d": 2,
+      "churn_90d": 7
+    },
+    ".golangci.yml": {
+      "lines": 46,
+      "ceiling": 1000,
+      "bytes": 831,
+      "component": "Other",
+      "language": "YAML",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "CHANGELOG.md": {
+      "lines": 437,
+      "ceiling": 1000,
+      "bytes": 35077,
+      "component": "Documentation",
+      "language": "Markdown",
+      "churn_30d": 18,
+      "churn_90d": 26
+    },
+    "Dockerfile": {
+      "lines": 71,
+      "ceiling": 1000,
+      "bytes": 2493,
+      "component": "Other",
+      "language": "Other",
+      "churn_30d": 3,
+      "churn_90d": 5
+    },
+    "Makefile": {
+      "lines": 48,
+      "ceiling": 1000,
+      "bytes": 906,
+      "component": "Other",
+      "language": "Other",
+      "churn_30d": 1,
+      "churn_90d": 2
+    },
+    "README.md": {
+      "lines": 270,
+      "ceiling": 1000,
+      "bytes": 13205,
+      "component": "Documentation",
+      "language": "Markdown",
+      "churn_30d": 21,
+      "churn_90d": 32
+    },
+    "cmd/panel/main.go": {
+      "lines": 262,
+      "ceiling": 1000,
+      "bytes": 8238,
+      "component": "Go Production (CLI & Entrypoints)",
+      "language": "Go",
+      "churn_30d": 7,
+      "churn_90d": 14
+    },
+    "cmd/panel/main_test.go": {
+      "lines": 289,
+      "ceiling": 1000,
+      "bytes": 8228,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 4
+    },
+    "cmd/qualification-subject/main.go": {
+      "lines": 64,
+      "ceiling": 1000,
+      "bytes": 2424,
+      "component": "Go Production (CLI & Entrypoints)",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "cmd/server/main.go": {
+      "lines": 262,
+      "ceiling": 1000,
+      "bytes": 8254,
+      "component": "Go Production (CLI & Entrypoints)",
+      "language": "Go",
+      "churn_30d": 6,
+      "churn_90d": 13
+    },
+    "cmd/server/main_test.go": {
+      "lines": 121,
+      "ceiling": 1000,
+      "bytes": 2989,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 3
+    },
+    "docs/architecture/css-contracts.md": {
+      "lines": 890,
+      "ceiling": 1000,
+      "bytes": 77351,
+      "component": "Documentation",
+      "language": "Markdown",
+      "churn_30d": 8,
+      "churn_90d": 8
+    },
+    "docs/architecture/forwarder-dataplane-ownership.md": {
+      "lines": 654,
+      "ceiling": 1000,
+      "bytes": 63429,
+      "component": "Documentation",
+      "language": "Markdown",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "docs/architecture/frontend-javascript-contracts.md": {
+      "lines": 826,
+      "ceiling": 1000,
+      "bytes": 104580,
+      "component": "Documentation",
+      "language": "Markdown",
+      "churn_30d": 9,
+      "churn_90d": 9
+    },
+    "docs/architecture/vpn-service-state-ownership.md": {
+      "lines": 334,
+      "ceiling": 1000,
+      "bytes": 57032,
+      "component": "Documentation",
+      "language": "Markdown",
+      "churn_30d": 7,
+      "churn_90d": 7
+    },
+    "go.mod": {
+      "lines": 39,
+      "ceiling": 1000,
+      "bytes": 1246,
+      "component": "Other",
+      "language": "Other",
+      "churn_30d": 6,
+      "churn_90d": 10
+    },
+    "go.sum": {
+      "lines": 130,
+      "ceiling": 1000,
+      "bytes": 11441,
+      "component": "Other",
+      "language": "Other",
+      "churn_30d": 2,
+      "churn_90d": 5
+    },
+    "internal/captcha/captcha.go": {
+      "lines": 136,
+      "ceiling": 1000,
+      "bytes": 3463,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 2
+    },
+    "internal/captcha/captcha_test.go": {
+      "lines": 201,
+      "ceiling": 1000,
+      "bytes": 5283,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 2
+    },
+    "internal/captcha/slide.go": {
+      "lines": 118,
+      "ceiling": 1000,
+      "bytes": 2927,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/config/config.go": {
+      "lines": 476,
+      "ceiling": 1000,
+      "bytes": 14100,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 20,
+      "churn_90d": 30
+    },
+    "internal/config/config_test.go": {
+      "lines": 166,
+      "ceiling": 1000,
+      "bytes": 4598,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 4
+    },
+    "internal/config/cookie_insecure_test.go": {
+      "lines": 53,
+      "ceiling": 1000,
+      "bytes": 1129,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/config/rename_darwin.go": {
+      "lines": 19,
+      "ceiling": 1000,
+      "bytes": 306,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/config/rename_linux.go": {
+      "lines": 20,
+      "ceiling": 1000,
+      "bytes": 499,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/config/rename_other.go": {
+      "lines": 20,
+      "ceiling": 1000,
+      "bytes": 469,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/config/secret_key_test.go": {
+      "lines": 1358,
+      "ceiling": 1358,
+      "bytes": 43791,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 7,
+      "churn_90d": 7
+    },
+    "internal/database/awg_ip_allocations.go": {
+      "lines": 395,
+      "ceiling": 1000,
+      "bytes": 12880,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/database/awg_ip_allocations_test.go": {
+      "lines": 1196,
+      "ceiling": 1196,
+      "bytes": 38775,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 2
+    },
+    "internal/database/backend_enabled_migration_test.go": {
+      "lines": 141,
+      "ceiling": 1000,
+      "bytes": 4121,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/database/backend_tunnels.go": {
+      "lines": 413,
+      "ceiling": 1000,
+      "bytes": 13642,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/database/connections.go": {
+      "lines": 665,
+      "ceiling": 1000,
+      "bytes": 21137,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 8
+    },
+    "internal/database/connections_test.go": {
+      "lines": 399,
+      "ceiling": 1000,
+      "bytes": 14203,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 4
+    },
+    "internal/database/database.go": {
+      "lines": 329,
+      "ceiling": 1000,
+      "bytes": 9333,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 8,
+      "churn_90d": 16
+    },
+    "internal/database/database_helpers_test.go": {
+      "lines": 219,
+      "ceiling": 1000,
+      "bytes": 7494,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/database/database_test.go": {
+      "lines": 829,
+      "ceiling": 1000,
+      "bytes": 24317,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 3
+    },
+    "internal/database/issue338_ipam_collision_test.go": {
+      "lines": 138,
+      "ceiling": 1000,
+      "bytes": 4540,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/database/known_hosts.go": {
+      "lines": 123,
+      "ceiling": 1000,
+      "bytes": 3689,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/database/known_hosts_test.go": {
+      "lines": 130,
+      "ceiling": 1000,
+      "bytes": 4282,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/database/leaderboard.go": {
+      "lines": 144,
+      "ceiling": 1000,
+      "bytes": 3898,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/database/leaderboard_test.go": {
+      "lines": 176,
+      "ceiling": 1000,
+      "bytes": 7239,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 3
+    },
+    "internal/database/migrate.go": {
+      "lines": 838,
+      "ceiling": 1000,
+      "bytes": 25669,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 7
+    },
+    "internal/database/migrate_test.go": {
+      "lines": 408,
+      "ceiling": 1000,
+      "bytes": 13422,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 4
+    },
+    "internal/database/migration_compat_test.go": {
+      "lines": 795,
+      "ceiling": 1000,
+      "bytes": 29985,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/database/migrations.go": {
+      "lines": 508,
+      "ceiling": 1000,
+      "bytes": 16288,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/database/migrations_legacy_alloc.go": {
+      "lines": 221,
+      "ceiling": 1000,
+      "bytes": 5746,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/database/peer_changes.go": {
+      "lines": 504,
+      "ceiling": 1000,
+      "bytes": 20528,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/database/peer_changes_null_client_id_test.go": {
+      "lines": 175,
+      "ceiling": 1000,
+      "bytes": 6355,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/database/peer_changes_test.go": {
+      "lines": 102,
+      "ceiling": 1000,
+      "bytes": 4063,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/database/peer_lifecycle.go": {
+      "lines": 151,
+      "ceiling": 1000,
+      "bytes": 5100,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/database/peer_lifecycle_test.go": {
+      "lines": 174,
+      "ceiling": 1000,
+      "bytes": 5585,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/database/preflight.go": {
+      "lines": 89,
+      "ceiling": 1000,
+      "bytes": 3131,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/database/preflight_test.go": {
+      "lines": 161,
+      "ceiling": 1000,
+      "bytes": 4888,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/database/schema.sql": {
+      "lines": 194,
+      "ceiling": 1000,
+      "bytes": 6607,
+      "component": "Go Production (Database & Infra)",
+      "language": "SQL",
+      "churn_30d": 4,
+      "churn_90d": 10
+    },
+    "internal/database/servers.go": {
+      "lines": 392,
+      "ceiling": 1000,
+      "bytes": 11464,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 4
+    },
+    "internal/database/servers_test.go": {
+      "lines": 264,
+      "ceiling": 1000,
+      "bytes": 8454,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/database/settings.go": {
+      "lines": 353,
+      "ceiling": 1000,
+      "bytes": 9675,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 5
+    },
+    "internal/database/settings_test.go": {
+      "lines": 291,
+      "ceiling": 1000,
+      "bytes": 9473,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 4
+    },
+    "internal/database/test_helpers_test.go": {
+      "lines": 130,
+      "ceiling": 1000,
+      "bytes": 3951,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/database/users.go": {
+      "lines": 875,
+      "ceiling": 1000,
+      "bytes": 26420,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 10
+    },
+    "internal/database/users_test.go": {
+      "lines": 522,
+      "ceiling": 1000,
+      "bytes": 17364,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 6
+    },
+    "internal/database/vpn.go": {
+      "lines": 499,
+      "ceiling": 1000,
+      "bytes": 17961,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 17,
+      "churn_90d": 26
+    },
+    "internal/database/vpn_config.go": {
+      "lines": 152,
+      "ceiling": 1000,
+      "bytes": 4860,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/database/vpn_endpoint_test.go": {
+      "lines": 56,
+      "ceiling": 1000,
+      "bytes": 1621,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/database/vpn_enriched_sessions_test.go": {
+      "lines": 187,
+      "ceiling": 1000,
+      "bytes": 7208,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 2
+    },
+    "internal/database/vpn_restart_test.go": {
+      "lines": 87,
+      "ceiling": 1000,
+      "bytes": 3507,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/database/vpn_sessions_connection_name_test.go": {
+      "lines": 200,
+      "ceiling": 1000,
+      "bytes": 6480,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/database/vpn_test.go": {
+      "lines": 1023,
+      "ceiling": 1023,
+      "bytes": 36729,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 8,
+      "churn_90d": 15
+    },
+    "internal/handlers/auth.go": {
+      "lines": 441,
+      "ceiling": 1000,
+      "bytes": 14556,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 8
+    },
+    "internal/handlers/auth_test.go": {
+      "lines": 891,
+      "ceiling": 1000,
+      "bytes": 29135,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 8
+    },
+    "internal/handlers/captcha_slide_test.go": {
+      "lines": 170,
+      "ceiling": 1000,
+      "bytes": 6043,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/handlers/connections.go": {
+      "lines": 662,
+      "ceiling": 1000,
+      "bytes": 20832,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 11
+    },
+    "internal/handlers/connections_test.go": {
+      "lines": 1204,
+      "ceiling": 1204,
+      "bytes": 39501,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 10
+    },
+    "internal/handlers/edge_cases_test.go": {
+      "lines": 388,
+      "ceiling": 1000,
+      "bytes": 15229,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 6
+    },
+    "internal/handlers/handlers.go": {
+      "lines": 332,
+      "ceiling": 1000,
+      "bytes": 9849,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 10
+    },
+    "internal/handlers/handlers_test.go": {
+      "lines": 605,
+      "ceiling": 1000,
+      "bytes": 21239,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 16
+    },
+    "internal/handlers/leaderboard.go": {
+      "lines": 53,
+      "ceiling": 1000,
+      "bytes": 1446,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 4
+    },
+    "internal/handlers/leaderboard_test.go": {
+      "lines": 245,
+      "ceiling": 1000,
+      "bytes": 8032,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 3
+    },
+    "internal/handlers/pages.go": {
+      "lines": 214,
+      "ceiling": 1000,
+      "bytes": 6209,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 5
+    },
+    "internal/handlers/pages_test.go": {
+      "lines": 444,
+      "ceiling": 1000,
+      "bytes": 14937,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 10
+    },
+    "internal/handlers/peer_sync.go": {
+      "lines": 51,
+      "ceiling": 1000,
+      "bytes": 2261,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/handlers/peer_sync_convergence_test.go": {
+      "lines": 282,
+      "ceiling": 1000,
+      "bytes": 10885,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/handlers/server_connections.go": {
+      "lines": 809,
+      "ceiling": 1000,
+      "bytes": 24645,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 11
+    },
+    "internal/handlers/server_connections_test.go": {
+      "lines": 1065,
+      "ceiling": 1065,
+      "bytes": 39700,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 7
+    },
+    "internal/handlers/server_delete_backend_test.go": {
+      "lines": 921,
+      "ceiling": 1000,
+      "bytes": 29104,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/handlers/server_stats_parse.go": {
+      "lines": 144,
+      "ceiling": 1000,
+      "bytes": 3884,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/handlers/server_stats_parse_test.go": {
+      "lines": 208,
+      "ceiling": 1000,
+      "bytes": 7121,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/handlers/servers.go": {
+      "lines": 1035,
+      "ceiling": 1035,
+      "bytes": 31491,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 14,
+      "churn_90d": 21
+    },
+    "internal/handlers/servers_install_logging_test.go": {
+      "lines": 72,
+      "ceiling": 1000,
+      "bytes": 2211,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/handlers/servers_test.go": {
+      "lines": 2385,
+      "ceiling": 2385,
+      "bytes": 84939,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 7,
+      "churn_90d": 12
+    },
+    "internal/handlers/settings.go": {
+      "lines": 527,
+      "ceiling": 1000,
+      "bytes": 15598,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 4
+    },
+    "internal/handlers/settings_test.go": {
+      "lines": 347,
+      "ceiling": 1000,
+      "bytes": 11777,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 3
+    },
+    "internal/handlers/share.go": {
+      "lines": 204,
+      "ceiling": 1000,
+      "bytes": 6013,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 5
+    },
+    "internal/handlers/share_test.go": {
+      "lines": 329,
+      "ceiling": 1000,
+      "bytes": 10745,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/handlers/system.go": {
+      "lines": 72,
+      "ceiling": 1000,
+      "bytes": 2025,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 6
+    },
+    "internal/handlers/system_test.go": {
+      "lines": 98,
+      "ceiling": 1000,
+      "bytes": 2950,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 6
+    },
+    "internal/handlers/template.go": {
+      "lines": 871,
+      "ceiling": 1000,
+      "bytes": 20521,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 4
+    },
+    "internal/handlers/template_test.go": {
+      "lines": 956,
+      "ceiling": 1000,
+      "bytes": 29188,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 4
+    },
+    "internal/handlers/upstream.go": {
+      "lines": 24,
+      "ceiling": 1000,
+      "bytes": 766,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/handlers/upstream_test.go": {
+      "lines": 207,
+      "ceiling": 1000,
+      "bytes": 5792,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/handlers/users.go": {
+      "lines": 798,
+      "ceiling": 1000,
+      "bytes": 23759,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 10
+    },
+    "internal/handlers/users_test.go": {
+      "lines": 1130,
+      "ceiling": 1130,
+      "bytes": 38712,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 6
+    },
+    "internal/handlers/vpn.go": {
+      "lines": 447,
+      "ceiling": 1000,
+      "bytes": 14571,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 13,
+      "churn_90d": 23
+    },
+    "internal/handlers/vpn_config_presence_test.go": {
+      "lines": 307,
+      "ceiling": 1000,
+      "bytes": 10735,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/handlers/vpn_key_boundary_test.go": {
+      "lines": 62,
+      "ceiling": 1000,
+      "bytes": 2191,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/handlers/vpn_metrics.go": {
+      "lines": 14,
+      "ceiling": 1000,
+      "bytes": 648,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/handlers/vpn_test.go": {
+      "lines": 1228,
+      "ceiling": 1228,
+      "bytes": 43140,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 12,
+      "churn_90d": 22
+    },
+    "internal/handlers/vpn_unavailable_test.go": {
+      "lines": 26,
+      "ceiling": 1000,
+      "bytes": 719,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/handlers/zombie_peer_rollback_test.go": {
+      "lines": 571,
+      "ceiling": 1000,
+      "bytes": 18506,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/manager/awg/awg.go": {
+      "lines": 2754,
+      "ceiling": 2754,
+      "bytes": 99924,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 13,
+      "churn_90d": 37
+    },
+    "internal/manager/awg/awg_ip_concurrency_test.go": {
+      "lines": 2522,
+      "ceiling": 2522,
+      "bytes": 83184,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 5
+    },
+    "internal/manager/awg/awg_lock.go": {
+      "lines": 241,
+      "ceiling": 1000,
+      "bytes": 12163,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/manager/awg/awg_lock_test.go": {
+      "lines": 118,
+      "ceiling": 1000,
+      "bytes": 3272,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/manager/awg/awg_nat_test.go": {
+      "lines": 509,
+      "ceiling": 1000,
+      "bytes": 20905,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 8
+    },
+    "internal/manager/awg/awg_preflight_port_test.go": {
+      "lines": 264,
+      "ceiling": 1000,
+      "bytes": 8854,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/manager/awg/awg_probe_rework_test.go": {
+      "lines": 379,
+      "ceiling": 1000,
+      "bytes": 14698,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 3
+    },
+    "internal/manager/awg/awg_tc_cleanup_test.go": {
+      "lines": 293,
+      "ceiling": 1000,
+      "bytes": 11038,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/manager/awg/awg_test.go": {
+      "lines": 2544,
+      "ceiling": 2544,
+      "bytes": 84226,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 7,
+      "churn_90d": 20
+    },
+    "internal/manager/awg/config.go": {
+      "lines": 554,
+      "ceiling": 1000,
+      "bytes": 16924,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 11
+    },
+    "internal/manager/awg/config_test.go": {
+      "lines": 1078,
+      "ceiling": 1078,
+      "bytes": 31076,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 9
+    },
+    "internal/manager/awg/container_cache_hardening_test.go": {
+      "lines": 292,
+      "ceiling": 1000,
+      "bytes": 9264,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/manager/awg/cps/cps.go": {
+      "lines": 293,
+      "ceiling": 1000,
+      "bytes": 6404,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 5
+    },
+    "internal/manager/awg/cps/cps_test.go": {
+      "lines": 326,
+      "ceiling": 1000,
+      "bytes": 8941,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/manager/awg/cps/dns.go": {
+      "lines": 85,
+      "ceiling": 1000,
+      "bytes": 2112,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/awg/cps/quic.go": {
+      "lines": 135,
+      "ceiling": 1000,
+      "bytes": 3644,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/awg/cps/sip.go": {
+      "lines": 163,
+      "ceiling": 1000,
+      "bytes": 4912,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/awg/cps/tls.go": {
+      "lines": 199,
+      "ceiling": 1000,
+      "bytes": 6924,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/awg/export_test.go": {
+      "lines": 36,
+      "ceiling": 1000,
+      "bytes": 1107,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/manager/awg/health/awg_container_integration_test.go": {
+      "lines": 463,
+      "ceiling": 1000,
+      "bytes": 18076,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 5
+    },
+    "internal/manager/awg/health/noise.go": {
+      "lines": 494,
+      "ceiling": 1000,
+      "bytes": 14938,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 8
+    },
+    "internal/manager/awg/health/noise_test.go": {
+      "lines": 813,
+      "ceiling": 1000,
+      "bytes": 27732,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 5
+    },
+    "internal/manager/awg/health/probe.go": {
+      "lines": 571,
+      "ceiling": 1000,
+      "bytes": 16319,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 8
+    },
+    "internal/manager/awg/health/probe_test.go": {
+      "lines": 615,
+      "ceiling": 1000,
+      "bytes": 21497,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 7
+    },
+    "internal/manager/awg/params.go": {
+      "lines": 1274,
+      "ceiling": 1274,
+      "bytes": 40676,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 17
+    },
+    "internal/manager/awg/params_test.go": {
+      "lines": 1518,
+      "ceiling": 1518,
+      "bytes": 45564,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 15
+    },
+    "internal/manager/awg/peer_config.go": {
+      "lines": 308,
+      "ceiling": 1000,
+      "bytes": 8158,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/manager/awg/remote_lock_hardening_test.go": {
+      "lines": 1624,
+      "ceiling": 1624,
+      "bytes": 60865,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/manager/awg/shell_escape_test.go": {
+      "lines": 242,
+      "ceiling": 1000,
+      "bytes": 8158,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/awg/timing_ranges_review_34_test.go": {
+      "lines": 45,
+      "ceiling": 1000,
+      "bytes": 1465,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/dns/dns.go": {
+      "lines": 198,
+      "ceiling": 1000,
+      "bytes": 7238,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/manager/dns/dns_test.go": {
+      "lines": 528,
+      "ceiling": 1000,
+      "bytes": 15462,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/manager/dns/unbound.go": {
+      "lines": 134,
+      "ceiling": 1000,
+      "bytes": 3124,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/manager.go": {
+      "lines": 137,
+      "ceiling": 1000,
+      "bytes": 4322,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/manager/manager_test.go": {
+      "lines": 74,
+      "ceiling": 1000,
+      "bytes": 1796,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/manager/mtproxyl/mtproxyl.go": {
+      "lines": 455,
+      "ceiling": 1000,
+      "bytes": 14007,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 5
+    },
+    "internal/manager/mtproxyl/mtproxyl_test.go": {
+      "lines": 850,
+      "ceiling": 1000,
+      "bytes": 26844,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 4
+    },
+    "internal/manager/mtproxyl/secrets.go": {
+      "lines": 106,
+      "ceiling": 1000,
+      "bytes": 2301,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/mtproxyl/stats.go": {
+      "lines": 130,
+      "ceiling": 1000,
+      "bytes": 3386,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/manager/ssh/auth.go": {
+      "lines": 151,
+      "ceiling": 1000,
+      "bytes": 4265,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/ssh/auth_test.go": {
+      "lines": 140,
+      "ceiling": 1000,
+      "bytes": 3707,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/ssh/client.go": {
+      "lines": 464,
+      "ceiling": 1000,
+      "bytes": 13182,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/manager/ssh/client_test.go": {
+      "lines": 634,
+      "ceiling": 1000,
+      "bytes": 17808,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/manager/ssh/exec.go": {
+      "lines": 150,
+      "ceiling": 1000,
+      "bytes": 3941,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 2
+    },
+    "internal/manager/ssh/exec_test.go": {
+      "lines": 224,
+      "ceiling": 1000,
+      "bytes": 6578,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/manager/ssh/hostkey.go": {
+      "lines": 184,
+      "ceiling": 1000,
+      "bytes": 5460,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/ssh/hostkey_test.go": {
+      "lines": 336,
+      "ceiling": 1000,
+      "bytes": 9925,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/ssh/mock_server_test.go": {
+      "lines": 461,
+      "ceiling": 1000,
+      "bytes": 11183,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/ssh/pool.go": {
+      "lines": 317,
+      "ceiling": 1000,
+      "bytes": 6970,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/manager/ssh/pool_test.go": {
+      "lines": 302,
+      "ceiling": 1000,
+      "bytes": 7079,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/manager/ssh/sftp.go": {
+      "lines": 164,
+      "ceiling": 1000,
+      "bytes": 4289,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/ssh/sftp_test.go": {
+      "lines": 65,
+      "ceiling": 1000,
+      "bytes": 1868,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/ssh/utils.go": {
+      "lines": 157,
+      "ceiling": 1000,
+      "bytes": 4455,
+      "component": "Go Production (WireGuard Manager)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/manager/ssh/utils_test.go": {
+      "lines": 274,
+      "ceiling": 1000,
+      "bytes": 7217,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/middleware/cookie_policy.go": {
+      "lines": 105,
+      "ceiling": 1000,
+      "bytes": 3856,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/middleware/cookie_policy_test.go": {
+      "lines": 139,
+      "ceiling": 1000,
+      "bytes": 4217,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/middleware/csrf.go": {
+      "lines": 161,
+      "ceiling": 1000,
+      "bytes": 5067,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/middleware/csrf_test.go": {
+      "lines": 203,
+      "ceiling": 1000,
+      "bytes": 6882,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/middleware/errors.go": {
+      "lines": 122,
+      "ceiling": 1000,
+      "bytes": 3976,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/middleware/errors_test.go": {
+      "lines": 156,
+      "ceiling": 1000,
+      "bytes": 4242,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/middleware/middleware.go": {
+      "lines": 92,
+      "ceiling": 1000,
+      "bytes": 2305,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/middleware/middleware_test.go": {
+      "lines": 53,
+      "ceiling": 1000,
+      "bytes": 1499,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/middleware/password_change.go": {
+      "lines": 63,
+      "ceiling": 1000,
+      "bytes": 1567,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/middleware/password_change_test.go": {
+      "lines": 85,
+      "ceiling": 1000,
+      "bytes": 3133,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/middleware/ratelimit.go": {
+      "lines": 175,
+      "ceiling": 1000,
+      "bytes": 4238,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/middleware/ratelimit_test.go": {
+      "lines": 114,
+      "ceiling": 1000,
+      "bytes": 2839,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/middleware/realip.go": {
+      "lines": 133,
+      "ceiling": 1000,
+      "bytes": 3646,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/middleware/realip_test.go": {
+      "lines": 113,
+      "ceiling": 1000,
+      "bytes": 3370,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/middleware/secure_conn.go": {
+      "lines": 61,
+      "ceiling": 1000,
+      "bytes": 2108,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/middleware/secure_conn_test.go": {
+      "lines": 92,
+      "ceiling": 1000,
+      "bytes": 3077,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/middleware/secure_cookie_xfp_test.go": {
+      "lines": 166,
+      "ceiling": 1000,
+      "bytes": 5926,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/middleware/session.go": {
+      "lines": 241,
+      "ceiling": 1000,
+      "bytes": 7726,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 6
+    },
+    "internal/middleware/session_test.go": {
+      "lines": 396,
+      "ceiling": 1000,
+      "bytes": 14400,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 7
+    },
+    "internal/middleware/setup.go": {
+      "lines": 125,
+      "ceiling": 1000,
+      "bytes": 2964,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 4
+    },
+    "internal/middleware/setup_test.go": {
+      "lines": 125,
+      "ceiling": 1000,
+      "bytes": 3793,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/models/identifier_validation_test.go": {
+      "lines": 208,
+      "ceiling": 1000,
+      "bytes": 5948,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/models/models.go": {
+      "lines": 565,
+      "ceiling": 1000,
+      "bytes": 23607,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 14,
+      "churn_90d": 31
+    },
+    "internal/models/models_test.go": {
+      "lines": 736,
+      "ceiling": 1000,
+      "bytes": 24650,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 6
+    },
+    "internal/models/range.go": {
+      "lines": 253,
+      "ceiling": 1000,
+      "bytes": 7424,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/models/range_test.go": {
+      "lines": 216,
+      "ceiling": 1000,
+      "bytes": 5524,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/models/requests.go": {
+      "lines": 523,
+      "ceiling": 1000,
+      "bytes": 17425,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/models/responses.go": {
+      "lines": 93,
+      "ceiling": 1000,
+      "bytes": 3699,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/router/ratelimit_endpoints_test.go": {
+      "lines": 88,
+      "ceiling": 1000,
+      "bytes": 2715,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/router/router.go": {
+      "lines": 356,
+      "ceiling": 1000,
+      "bytes": 13634,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 6,
+      "churn_90d": 21
+    },
+    "internal/router/router_static_vpn_test.go": {
+      "lines": 78,
+      "ceiling": 1000,
+      "bytes": 2323,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/router/router_test.go": {
+      "lines": 1039,
+      "ceiling": 1039,
+      "bytes": 36283,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 14
+    },
+    "internal/router/server.go": {
+      "lines": 216,
+      "ceiling": 1000,
+      "bytes": 6171,
+      "component": "Go Production (Handlers & Router)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 3
+    },
+    "internal/router/server_test.go": {
+      "lines": 261,
+      "ceiling": 1000,
+      "bytes": 6645,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 3
+    },
+    "internal/router/vpn_metrics_test.go": {
+      "lines": 53,
+      "ceiling": 1000,
+      "bytes": 1760,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/security/security.go": {
+      "lines": 454,
+      "ceiling": 1000,
+      "bytes": 12836,
+      "component": "Go Production (Database & Infra)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 2
+    },
+    "internal/security/security_test.go": {
+      "lines": 448,
+      "ceiling": 1000,
+      "bytes": 13937,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/service/orchestrator/autotrial.go": {
+      "lines": 258,
+      "ceiling": 1000,
+      "bytes": 6808,
+      "component": "Go Production (Services)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/service/orchestrator/orchestrator.go": {
+      "lines": 442,
+      "ceiling": 1000,
+      "bytes": 12340,
+      "component": "Go Production (Services)",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 9
+    },
+    "internal/service/orchestrator/orchestrator_test.go": {
+      "lines": 2170,
+      "ceiling": 2170,
+      "bytes": 68654,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 7,
+      "churn_90d": 15
+    },
+    "internal/service/orchestrator/probe_failover_retry_test.go": {
+      "lines": 562,
+      "ceiling": 1000,
+      "bytes": 20036,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 4
+    },
+    "internal/service/orchestrator/reachability.go": {
+      "lines": 388,
+      "ceiling": 1000,
+      "bytes": 11907,
+      "component": "Go Production (Services)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 4
+    },
+    "internal/service/orchestrator/rebalance_live_migration_test.go": {
+      "lines": 265,
+      "ceiling": 1000,
+      "bytes": 8537,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/service/orchestrator/rebalance_threshold_test.go": {
+      "lines": 327,
+      "ceiling": 1000,
+      "bytes": 11138,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/service/orchestrator/traffic.go": {
+      "lines": 470,
+      "ceiling": 1000,
+      "bytes": 13178,
+      "component": "Go Production (Services)",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 5
+    },
+    "internal/service/orchestrator/vpn_tasks.go": {
+      "lines": 552,
+      "ceiling": 1000,
+      "bytes": 17258,
+      "component": "Go Production (Services)",
+      "language": "Go",
+      "churn_30d": 6,
+      "churn_90d": 14
+    },
+    "internal/service/orchestrator/vpn_tasks_params_regression_test.go": {
+      "lines": 170,
+      "ceiling": 1000,
+      "bytes": 5539,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 3
+    },
+    "internal/service/orchestrator/vpn_tasks_range_test.go": {
+      "lines": 67,
+      "ceiling": 1000,
+      "bytes": 1991,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/service/reconciliation/reconciliation.go": {
+      "lines": 750,
+      "ceiling": 1000,
+      "bytes": 20132,
+      "component": "Go Production (Services)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/service/reconciliation/reconciliation_test.go": {
+      "lines": 1301,
+      "ceiling": 1301,
+      "bytes": 38425,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/service/service.go": {
+      "lines": 103,
+      "ceiling": 1000,
+      "bytes": 3129,
+      "component": "Go Production (Services)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 4
+    },
+    "internal/service/service_test.go": {
+      "lines": 70,
+      "ceiling": 1000,
+      "bytes": 1487,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/service/supervisor/supervisor.go": {
+      "lines": 374,
+      "ceiling": 1000,
+      "bytes": 8597,
+      "component": "Go Production (Services)",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/service/supervisor/supervisor_test.go": {
+      "lines": 316,
+      "ceiling": 1000,
+      "bytes": 7453,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/service/upstream/service.go": {
+      "lines": 810,
+      "ceiling": 1000,
+      "bytes": 19190,
+      "component": "Go Production (Services)",
+      "language": "Go",
+      "churn_30d": 11,
+      "churn_90d": 11
+    },
+    "internal/service/upstream/service_test.go": {
+      "lines": 646,
+      "ceiling": 1000,
+      "bytes": 19900,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/service/userops/userops.go": {
+      "lines": 355,
+      "ceiling": 1000,
+      "bytes": 9867,
+      "component": "Go Production (Services)",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/service/userops/userops_test.go": {
+      "lines": 549,
+      "ceiling": 1000,
+      "bytes": 14043,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/vpn/auth/auth.go": {
+      "lines": 91,
+      "ceiling": 1000,
+      "bytes": 2782,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/auth/auth_test.go": {
+      "lines": 239,
+      "ceiling": 1000,
+      "bytes": 7086,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/backend_enable.go": {
+      "lines": 620,
+      "ceiling": 1000,
+      "bytes": 21361,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/backend_enable_test.go": {
+      "lines": 695,
+      "ceiling": 1000,
+      "bytes": 21578,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/backend_lifecycle.go": {
+      "lines": 452,
+      "ceiling": 1000,
+      "bytes": 15287,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/backend_lifecycle_test.go": {
+      "lines": 627,
+      "ceiling": 1000,
+      "bytes": 18848,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "internal/vpn/backend_routing_test.go": {
+      "lines": 328,
+      "ceiling": 1000,
+      "bytes": 8856,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/vpn/capacity_stress_test.go": {
+      "lines": 171,
+      "ceiling": 1000,
+      "bytes": 5510,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 4
+    },
+    "internal/vpn/clientawg/config.go": {
+      "lines": 311,
+      "ceiling": 1000,
+      "bytes": 12282,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "internal/vpn/clientawg/config_test.go": {
+      "lines": 179,
+      "ceiling": 1000,
+      "bytes": 7012,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/clientawg/device.go": {
+      "lines": 193,
+      "ceiling": 1000,
+      "bytes": 6987,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 6,
+      "churn_90d": 6
+    },
+    "internal/vpn/clientawg/device_test.go": {
+      "lines": 220,
+      "ceiling": 1000,
+      "bytes": 7841,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/clientawg/interoperability_test.go": {
+      "lines": 365,
+      "ceiling": 1000,
+      "bytes": 11950,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/clientawg/status.go": {
+      "lines": 129,
+      "ceiling": 1000,
+      "bytes": 3312,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/config_obfuscation.go": {
+      "lines": 282,
+      "ceiling": 1000,
+      "bytes": 8628,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/config_obfuscation_test.go": {
+      "lines": 720,
+      "ceiling": 1000,
+      "bytes": 21600,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/delete_backend_test.go": {
+      "lines": 396,
+      "ceiling": 1000,
+      "bytes": 14897,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 5
+    },
+    "internal/vpn/diagnostics.go": {
+      "lines": 688,
+      "ceiling": 1000,
+      "bytes": 34194,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 49,
+      "churn_90d": 49
+    },
+    "internal/vpn/diagnostics_backend_decomposition_test.go": {
+      "lines": 278,
+      "ceiling": 1000,
+      "bytes": 10668,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/diagnostics_backend_drops.go": {
+      "lines": 156,
+      "ceiling": 1000,
+      "bytes": 7211,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "internal/vpn/diagnostics_backend_drops_test.go": {
+      "lines": 445,
+      "ceiling": 1000,
+      "bytes": 19826,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "internal/vpn/diagnostics_backends.go": {
+      "lines": 187,
+      "ceiling": 1000,
+      "bytes": 6678,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_expanded_test.go": {
+      "lines": 581,
+      "ceiling": 1000,
+      "bytes": 24519,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 7,
+      "churn_90d": 7
+    },
+    "internal/vpn/diagnostics_generation_race_test.go": {
+      "lines": 130,
+      "ceiling": 1000,
+      "bytes": 4429,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/diagnostics_generation_test.go": {
+      "lines": 696,
+      "ceiling": 1000,
+      "bytes": 28962,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 9,
+      "churn_90d": 9
+    },
+    "internal/vpn/diagnostics_handshake.go": {
+      "lines": 69,
+      "ceiling": 1000,
+      "bytes": 2277,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_health.go": {
+      "lines": 633,
+      "ceiling": 1000,
+      "bytes": 28293,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_health_test.go": {
+      "lines": 293,
+      "ceiling": 1000,
+      "bytes": 9905,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_history.go": {
+      "lines": 668,
+      "ceiling": 1000,
+      "bytes": 23924,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 18,
+      "churn_90d": 18
+    },
+    "internal/vpn/diagnostics_history_bench_test.go": {
+      "lines": 35,
+      "ceiling": 1000,
+      "bytes": 736,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_history_sampling_test.go": {
+      "lines": 273,
+      "ceiling": 1000,
+      "bytes": 9045,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_history_test.go": {
+      "lines": 162,
+      "ceiling": 1000,
+      "bytes": 5075,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_inputs.go": {
+      "lines": 219,
+      "ceiling": 1000,
+      "bytes": 9366,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/diagnostics_lifetime.go": {
+      "lines": 57,
+      "ceiling": 1000,
+      "bytes": 2618,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_loss_accounting_test.go": {
+      "lines": 787,
+      "ceiling": 1000,
+      "bytes": 36187,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/diagnostics_loss_health_test.go": {
+      "lines": 63,
+      "ceiling": 1000,
+      "bytes": 2012,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/diagnostics_problems.go": {
+      "lines": 600,
+      "ceiling": 1000,
+      "bytes": 20170,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/diagnostics_problems_handshake_test.go": {
+      "lines": 292,
+      "ceiling": 1000,
+      "bytes": 9700,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_problems_onset_test.go": {
+      "lines": 438,
+      "ceiling": 1000,
+      "bytes": 14151,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_problems_test.go": {
+      "lines": 745,
+      "ceiling": 1000,
+      "bytes": 23721,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/diagnostics_resources.go": {
+      "lines": 158,
+      "ceiling": 1000,
+      "bytes": 3616,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_retirement_direction_test.go": {
+      "lines": 260,
+      "ceiling": 1000,
+      "bytes": 11654,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_return_mismatch_test.go": {
+      "lines": 678,
+      "ceiling": 1000,
+      "bytes": 29402,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/vpn/diagnostics_round10_test.go": {
+      "lines": 171,
+      "ceiling": 1000,
+      "bytes": 7404,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_round11_test.go": {
+      "lines": 245,
+      "ceiling": 1000,
+      "bytes": 10560,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_round2_test.go": {
+      "lines": 500,
+      "ceiling": 1000,
+      "bytes": 20600,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "internal/vpn/diagnostics_round3_test.go": {
+      "lines": 300,
+      "ceiling": 1000,
+      "bytes": 12389,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/diagnostics_round4_test.go": {
+      "lines": 421,
+      "ceiling": 1000,
+      "bytes": 17178,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/diagnostics_round5_test.go": {
+      "lines": 802,
+      "ceiling": 1000,
+      "bytes": 32549,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/diagnostics_round6_test.go": {
+      "lines": 496,
+      "ceiling": 1000,
+      "bytes": 20496,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_round7_test.go": {
+      "lines": 167,
+      "ceiling": 1000,
+      "bytes": 4998,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_round8_latency_test.go": {
+      "lines": 127,
+      "ceiling": 1000,
+      "bytes": 5071,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/diagnostics_round8_test.go": {
+      "lines": 95,
+      "ceiling": 1000,
+      "bytes": 3971,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/diagnostics_round9_test.go": {
+      "lines": 165,
+      "ceiling": 1000,
+      "bytes": 4859,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/diagnostics_routing.go": {
+      "lines": 222,
+      "ceiling": 1000,
+      "bytes": 9081,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_routing_test.go": {
+      "lines": 68,
+      "ceiling": 1000,
+      "bytes": 2215,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_runtime_test.go": {
+      "lines": 37,
+      "ceiling": 1000,
+      "bytes": 859,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_samplers.go": {
+      "lines": 441,
+      "ceiling": 1000,
+      "bytes": 17085,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/diagnostics_severity_test.go": {
+      "lines": 837,
+      "ceiling": 1000,
+      "bytes": 35511,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 10,
+      "churn_90d": 10
+    },
+    "internal/vpn/diagnostics_snapshot_test.go": {
+      "lines": 309,
+      "ceiling": 1000,
+      "bytes": 8939,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/diagnostics_test.go": {
+      "lines": 538,
+      "ceiling": 1000,
+      "bytes": 19772,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 19,
+      "churn_90d": 19
+    },
+    "internal/vpn/diagnostics_thresholds.go": {
+      "lines": 302,
+      "ceiling": 1000,
+      "bytes": 14306,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 9,
+      "churn_90d": 9
+    },
+    "internal/vpn/diagnostics_thresholds_source_test.go": {
+      "lines": 114,
+      "ceiling": 1000,
+      "bytes": 4919,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/diagnostics_thresholds_test.go": {
+      "lines": 663,
+      "ceiling": 1000,
+      "bytes": 27349,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 6,
+      "churn_90d": 6
+    },
+    "internal/vpn/diagnostics_unattributed_health_test.go": {
+      "lines": 238,
+      "ceiling": 1000,
+      "bytes": 11241,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/differential_baseline_test.go": {
+      "lines": 624,
+      "ceiling": 1000,
+      "bytes": 21060,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/differential_harness_test.go": {
+      "lines": 1045,
+      "ceiling": 1045,
+      "bytes": 30598,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 7,
+      "churn_90d": 7
+    },
+    "internal/vpn/differential_lifecycle_test.go": {
+      "lines": 636,
+      "ceiling": 1000,
+      "bytes": 20016,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 6,
+      "churn_90d": 6
+    },
+    "internal/vpn/differential_matrix_test.go": {
+      "lines": 1071,
+      "ceiling": 1071,
+      "bytes": 33046,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/differential_shim_test.go": {
+      "lines": 591,
+      "ceiling": 1000,
+      "bytes": 15362,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/differential_soak_test.go": {
+      "lines": 1038,
+      "ceiling": 1038,
+      "bytes": 35764,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 7,
+      "churn_90d": 7
+    },
+    "internal/vpn/disabled_backend_regression_test.go": {
+      "lines": 171,
+      "ceiling": 1000,
+      "bytes": 5839,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/vpn/enable_backend_failcount_test.go": {
+      "lines": 167,
+      "ceiling": 1000,
+      "bytes": 6524,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 4
+    },
+    "internal/vpn/endpoint_detection_test.go": {
+      "lines": 314,
+      "ceiling": 1000,
+      "bytes": 9853,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/vpn/engine_ingress_e2e_test.go": {
+      "lines": 657,
+      "ceiling": 1000,
+      "bytes": 24556,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/vpn/engine_return.go": {
+      "lines": 126,
+      "ceiling": 1000,
+      "bytes": 5254,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/vpn/engine_return_e2e_test.go": {
+      "lines": 314,
+      "ceiling": 1000,
+      "bytes": 9941,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/vpn/engine_return_production_test.go": {
+      "lines": 111,
+      "ceiling": 1000,
+      "bytes": 4913,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/engine_return_test.go": {
+      "lines": 362,
+      "ceiling": 1000,
+      "bytes": 13816,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/vpn/faultinjection_test.go": {
+      "lines": 566,
+      "ceiling": 1000,
+      "bytes": 23448,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 7
+    },
+    "internal/vpn/forwarder/accounting.go": {
+      "lines": 228,
+      "ceiling": 1000,
+      "bytes": 5399,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/vpn/forwarder/accounting_test.go": {
+      "lines": 132,
+      "ceiling": 1000,
+      "bytes": 3783,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/vpn/forwarder/backend_admission_accounting_test.go": {
+      "lines": 154,
+      "ceiling": 1000,
+      "bytes": 6678,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/forwarder/client_write.go": {
+      "lines": 312,
+      "ceiling": 1000,
+      "bytes": 10402,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 9,
+      "churn_90d": 9
+    },
+    "internal/vpn/forwarder/client_write_round8_test.go": {
+      "lines": 105,
+      "ceiling": 1000,
+      "bytes": 3447,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/forwarder/forwarder.go": {
+      "lines": 475,
+      "ceiling": 1000,
+      "bytes": 19803,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 32,
+      "churn_90d": 40
+    },
+    "internal/vpn/forwarder/forwarder_test.go": {
+      "lines": 676,
+      "ceiling": 1000,
+      "bytes": 20561,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 9
+    },
+    "internal/vpn/forwarder/generation.go": {
+      "lines": 210,
+      "ceiling": 1000,
+      "bytes": 7918,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/vpn/forwarder/generation_test.go": {
+      "lines": 590,
+      "ceiling": 1000,
+      "bytes": 28684,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 6,
+      "churn_90d": 6
+    },
+    "internal/vpn/forwarder/issue151_regression_test.go": {
+      "lines": 153,
+      "ceiling": 1000,
+      "bytes": 5242,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 2
+    },
+    "internal/vpn/forwarder/issue309_teardown_test.go": {
+      "lines": 64,
+      "ceiling": 1000,
+      "bytes": 2309,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/forwarder/issue39_regression_test.go": {
+      "lines": 250,
+      "ceiling": 1000,
+      "bytes": 10138,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 7
+    },
+    "internal/vpn/forwarder/pumps.go": {
+      "lines": 415,
+      "ceiling": 1000,
+      "bytes": 12588,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/forwarder/pumps_test.go": {
+      "lines": 617,
+      "ceiling": 1000,
+      "bytes": 18680,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/forwarder/queue_benchmark_test.go": {
+      "lines": 84,
+      "ceiling": 1000,
+      "bytes": 2737,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/forwarder/queue_dwell.go": {
+      "lines": 102,
+      "ceiling": 1000,
+      "bytes": 3176,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/forwarder/queue_dwell_test.go": {
+      "lines": 194,
+      "ceiling": 1000,
+      "bytes": 6586,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/forwarder/queue_observability_test.go": {
+      "lines": 826,
+      "ceiling": 1000,
+      "bytes": 28573,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/forwarder/queue_thresholds_source_test.go": {
+      "lines": 144,
+      "ceiling": 1000,
+      "bytes": 5871,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/forwarder/queues.go": {
+      "lines": 197,
+      "ceiling": 1000,
+      "bytes": 6547,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/forwarder/queues_test.go": {
+      "lines": 408,
+      "ceiling": 1000,
+      "bytes": 12622,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/forwarder/rates.go": {
+      "lines": 213,
+      "ceiling": 1000,
+      "bytes": 7750,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 10,
+      "churn_90d": 10
+    },
+    "internal/vpn/forwarder/rates_restart_test.go": {
+      "lines": 210,
+      "ceiling": 1000,
+      "bytes": 10555,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/forwarder/rates_test.go": {
+      "lines": 319,
+      "ceiling": 1000,
+      "bytes": 12311,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 7,
+      "churn_90d": 7
+    },
+    "internal/vpn/forwarder/rebind_guard_test.go": {
+      "lines": 204,
+      "ceiling": 1000,
+      "bytes": 7642,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 2
+    },
+    "internal/vpn/forwarder/return_path.go": {
+      "lines": 167,
+      "ceiling": 1000,
+      "bytes": 6742,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "internal/vpn/forwarder/return_path_test.go": {
+      "lines": 247,
+      "ceiling": 1000,
+      "bytes": 7852,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "internal/vpn/forwarder/reverse_map_invariant_test.go": {
+      "lines": 116,
+      "ceiling": 1000,
+      "bytes": 4635,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/forwarder/route_pressure.go": {
+      "lines": 125,
+      "ceiling": 1000,
+      "bytes": 4416,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/forwarder/route_pressure_test.go": {
+      "lines": 106,
+      "ceiling": 1000,
+      "bytes": 3811,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/forwarder/routes.go": {
+      "lines": 610,
+      "ceiling": 1000,
+      "bytes": 22791,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 12,
+      "churn_90d": 12
+    },
+    "internal/vpn/forwarder/routes_pressure_round6_test.go": {
+      "lines": 295,
+      "ceiling": 1000,
+      "bytes": 11964,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/forwarder/routes_test.go": {
+      "lines": 635,
+      "ceiling": 1000,
+      "bytes": 21110,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/vpn/forwarder/routing_bench_test.go": {
+      "lines": 174,
+      "ceiling": 1000,
+      "bytes": 5195,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 3
+    },
+    "internal/vpn/forwarder/teardown_integration_test.go": {
+      "lines": 449,
+      "ceiling": 1000,
+      "bytes": 14931,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 5
+    },
+    "internal/vpn/forwarder/telemetry.go": {
+      "lines": 434,
+      "ceiling": 1000,
+      "bytes": 16746,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/forwarder/telemetry_expanded_test.go": {
+      "lines": 144,
+      "ceiling": 1000,
+      "bytes": 4870,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/forwarder/telemetry_test.go": {
+      "lines": 573,
+      "ceiling": 1000,
+      "bytes": 21567,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/forwarder/thresholds/thresholds.go": {
+      "lines": 83,
+      "ceiling": 1000,
+      "bytes": 3727,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/forwarder/tokenbucket_issue94_test.go": {
+      "lines": 232,
+      "ceiling": 1000,
+      "bytes": 8586,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/vpn/forwarder/traffic_telemetry.go": {
+      "lines": 268,
+      "ceiling": 1000,
+      "bytes": 9013,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 6,
+      "churn_90d": 6
+    },
+    "internal/vpn/forwarder/traffic_telemetry_test.go": {
+      "lines": 194,
+      "ceiling": 1000,
+      "bytes": 6679,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/forwarder/write_error_logging_test.go": {
+      "lines": 107,
+      "ceiling": 1000,
+      "bytes": 3755,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/vpn/forwarder/write_histogram.go": {
+      "lines": 51,
+      "ceiling": 1000,
+      "bytes": 1759,
+      "component": "Packet Forwarder",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/generation.go": {
+      "lines": 260,
+      "ceiling": 1000,
+      "bytes": 8488,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 6,
+      "churn_90d": 6
+    },
+    "internal/vpn/http2_pmtu_regression_test.go": {
+      "lines": 460,
+      "ceiling": 1000,
+      "bytes": 13603,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/vpn/identity/serverkeys.go": {
+      "lines": 160,
+      "ceiling": 1000,
+      "bytes": 5357,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/identity/serverkeys_migration_test.go": {
+      "lines": 87,
+      "ceiling": 1000,
+      "bytes": 2634,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/ingress/doc.go": {
+      "lines": 116,
+      "ceiling": 1000,
+      "bytes": 6254,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "internal/vpn/ingress/liveness.go": {
+      "lines": 78,
+      "ceiling": 1000,
+      "bytes": 2897,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/ingress/liveness_test.go": {
+      "lines": 263,
+      "ceiling": 1000,
+      "bytes": 9766,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/ingress/packet.go": {
+      "lines": 92,
+      "ceiling": 1000,
+      "bytes": 3679,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/ingress/packet_test.go": {
+      "lines": 156,
+      "ceiling": 1000,
+      "bytes": 5740,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/ingress/resolver.go": {
+      "lines": 358,
+      "ceiling": 1000,
+      "bytes": 14853,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 7,
+      "churn_90d": 7
+    },
+    "internal/vpn/ingress/resolver_test.go": {
+      "lines": 578,
+      "ceiling": 1000,
+      "bytes": 19637,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/ingress/return_path.go": {
+      "lines": 34,
+      "ceiling": 1000,
+      "bytes": 1543,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/ingress/router.go": {
+      "lines": 352,
+      "ceiling": 1000,
+      "bytes": 15177,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/vpn/ingress/router_interop_test.go": {
+      "lines": 938,
+      "ceiling": 1000,
+      "bytes": 35927,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/ingress/router_owner_memo_test.go": {
+      "lines": 117,
+      "ceiling": 1000,
+      "bytes": 4740,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/ingress/router_test.go": {
+      "lines": 455,
+      "ceiling": 1000,
+      "bytes": 15218,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/ingress_concurrent_legacy_mix_test.go": {
+      "lines": 187,
+      "ceiling": 1000,
+      "bytes": 7580,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/ingress_engine.go": {
+      "lines": 517,
+      "ceiling": 1000,
+      "bytes": 20296,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 12,
+      "churn_90d": 12
+    },
+    "internal/vpn/ingress_replacement_accounting_test.go": {
+      "lines": 283,
+      "ceiling": 1000,
+      "bytes": 11645,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/ipam/ipam.go": {
+      "lines": 236,
+      "ceiling": 1000,
+      "bytes": 5583,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/ipam/ipam_test.go": {
+      "lines": 218,
+      "ceiling": 1000,
+      "bytes": 6433,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/issue297_remote_ipam_test.go": {
+      "lines": 105,
+      "ceiling": 1000,
+      "bytes": 4043,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/issue297_restart_test.go": {
+      "lines": 307,
+      "ceiling": 1000,
+      "bytes": 12394,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "internal/vpn/issue309_test.go": {
+      "lines": 55,
+      "ceiling": 1000,
+      "bytes": 1692,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/issue338_ipam_collision_test.go": {
+      "lines": 1673,
+      "ceiling": 1673,
+      "bytes": 58511,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/issue90_admin_health_split_test.go": {
+      "lines": 254,
+      "ceiling": 1000,
+      "bytes": 10108,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/lb_integration_test.go": {
+      "lines": 164,
+      "ceiling": 1000,
+      "bytes": 6697,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 4
+    },
+    "internal/vpn/lifecycle_test.go": {
+      "lines": 38,
+      "ceiling": 1000,
+      "bytes": 953,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/vpn/loadbalancer/balancer.go": {
+      "lines": 84,
+      "ceiling": 1000,
+      "bytes": 2974,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 5
+    },
+    "internal/vpn/loadbalancer/balancer_test.go": {
+      "lines": 62,
+      "ceiling": 1000,
+      "bytes": 2151,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/vpn/loadbalancer/faultinjection_test.go": {
+      "lines": 326,
+      "ceiling": 1000,
+      "bytes": 12719,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 4
+    },
+    "internal/vpn/loadbalancer/least_conn.go": {
+      "lines": 81,
+      "ceiling": 1000,
+      "bytes": 2125,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/vpn/loadbalancer/least_conn_test.go": {
+      "lines": 82,
+      "ceiling": 1000,
+      "bytes": 3126,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/vpn/loadbalancer/round_robin.go": {
+      "lines": 68,
+      "ceiling": 1000,
+      "bytes": 1768,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/vpn/loadbalancer/round_robin_test.go": {
+      "lines": 57,
+      "ceiling": 1000,
+      "bytes": 1843,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/vpn/loadbalancer/sticky.go": {
+      "lines": 601,
+      "ceiling": 1000,
+      "bytes": 20497,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 7
+    },
+    "internal/vpn/loadbalancer/sticky85_test.go": {
+      "lines": 332,
+      "ceiling": 1000,
+      "bytes": 11434,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 4
+    },
+    "internal/vpn/loadbalancer/sticky_test.go": {
+      "lines": 535,
+      "ceiling": 1000,
+      "bytes": 18358,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 7
+    },
+    "internal/vpn/loadbalancer/weighted_rr.go": {
+      "lines": 141,
+      "ceiling": 1000,
+      "bytes": 4562,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 3
+    },
+    "internal/vpn/loadbalancer/weighted_rr_issue92_test.go": {
+      "lines": 137,
+      "ceiling": 1000,
+      "bytes": 5554,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/vpn/loadbalancer/weighted_rr_test.go": {
+      "lines": 93,
+      "ceiling": 1000,
+      "bytes": 2850,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/vpn/metrics.go": {
+      "lines": 19,
+      "ceiling": 1000,
+      "bytes": 430,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/orchestrator_concurrency_test.go": {
+      "lines": 823,
+      "ceiling": 1000,
+      "bytes": 29116,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 6,
+      "churn_90d": 6
+    },
+    "internal/vpn/peer_ip_recovery.go": {
+      "lines": 294,
+      "ceiling": 1000,
+      "bytes": 10582,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/peer_ip_recovery_test.go": {
+      "lines": 747,
+      "ceiling": 1000,
+      "bytes": 24469,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/peer_lifecycle_e2e_test.go": {
+      "lines": 659,
+      "ceiling": 1000,
+      "bytes": 29683,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 6,
+      "churn_90d": 6
+    },
+    "internal/vpn/peer_revoke.go": {
+      "lines": 200,
+      "ceiling": 1000,
+      "bytes": 8123,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/peer_sync.go": {
+      "lines": 1303,
+      "ceiling": 1303,
+      "bytes": 56059,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 10,
+      "churn_90d": 10
+    },
+    "internal/vpn/peer_sync_lifecycle_test.go": {
+      "lines": 618,
+      "ceiling": 1000,
+      "bytes": 24515,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/peer_sync_ownership_status_test.go": {
+      "lines": 915,
+      "ceiling": 1000,
+      "bytes": 39217,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/peer_sync_test.go": {
+      "lines": 812,
+      "ceiling": 1000,
+      "bytes": 28982,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "internal/vpn/portal_key_restart_test.go": {
+      "lines": 86,
+      "ceiling": 1000,
+      "bytes": 2453,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/probe_identity_red_test.go": {
+      "lines": 193,
+      "ceiling": 1000,
+      "bytes": 6971,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 3
+    },
+    "internal/vpn/qualification_subject.go": {
+      "lines": 529,
+      "ceiling": 1000,
+      "bytes": 16015,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/vpn/qualification_subject_test.go": {
+      "lines": 278,
+      "ceiling": 1000,
+      "bytes": 8062,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/queue_observability_test.go": {
+      "lines": 358,
+      "ceiling": 1000,
+      "bytes": 11871,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 6,
+      "churn_90d": 6
+    },
+    "internal/vpn/race_off_test.go": {
+      "lines": 5,
+      "ceiling": 1000,
+      "bytes": 65,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/race_on_test.go": {
+      "lines": 5,
+      "ceiling": 1000,
+      "bytes": 63,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/rebalance_migration_test.go": {
+      "lines": 896,
+      "ceiling": 1000,
+      "bytes": 32300,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/vpn/reconcile_connections_test.go": {
+      "lines": 320,
+      "ceiling": 1000,
+      "bytes": 11925,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 4
+    },
+    "internal/vpn/regression_deletion_test.go": {
+      "lines": 369,
+      "ceiling": 1000,
+      "bytes": 14902,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/regression_transition_test.go": {
+      "lines": 388,
+      "ceiling": 1000,
+      "bytes": 14840,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/rekey_replacement_regression_test.go": {
+      "lines": 223,
+      "ceiling": 1000,
+      "bytes": 7605,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 5
+    },
+    "internal/vpn/self_healing_test.go": {
+      "lines": 884,
+      "ceiling": 1000,
+      "bytes": 29786,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/service_admission_test_helper.go": {
+      "lines": 113,
+      "ceiling": 1000,
+      "bytes": 3928,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "internal/vpn/service_lifecycle.go": {
+      "lines": 458,
+      "ceiling": 1000,
+      "bytes": 14568,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/service_lifecycle_test.go": {
+      "lines": 523,
+      "ceiling": 1000,
+      "bytes": 15070,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/session/session.go": {
+      "lines": 622,
+      "ceiling": 1000,
+      "bytes": 23400,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/session/session_migration_test.go": {
+      "lines": 115,
+      "ceiling": 1000,
+      "bytes": 3753,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/session/session_test.go": {
+      "lines": 764,
+      "ceiling": 1000,
+      "bytes": 24951,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/sessions_enriched_test.go": {
+      "lines": 178,
+      "ceiling": 1000,
+      "bytes": 6905,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/vpn/sessions_lifecycle.go": {
+      "lines": 341,
+      "ceiling": 1000,
+      "bytes": 11553,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/sessions_lifecycle_test.go": {
+      "lines": 437,
+      "ceiling": 1000,
+      "bytes": 14243,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/sessions_live_test.go": {
+      "lines": 413,
+      "ceiling": 1000,
+      "bytes": 16804,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 4
+    },
+    "internal/vpn/sessions_migration.go": {
+      "lines": 216,
+      "ceiling": 1000,
+      "bytes": 7831,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/sessions_migration_test.go": {
+      "lines": 777,
+      "ceiling": 1000,
+      "bytes": 24171,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/timing_ranges_review_34_test.go": {
+      "lines": 210,
+      "ceiling": 1000,
+      "bytes": 6425,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/vpn/tunnel/admin_health_state_test.go": {
+      "lines": 272,
+      "ceiling": 1000,
+      "bytes": 8766,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/vpn/tunnel/awgdevice.go": {
+      "lines": 464,
+      "ceiling": 1000,
+      "bytes": 14940,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 13
+    },
+    "internal/vpn/tunnel/awgdevice_params_regression_test.go": {
+      "lines": 264,
+      "ceiling": 1000,
+      "bytes": 9204,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/vpn/tunnel/awgdevice_test.go": {
+      "lines": 413,
+      "ceiling": 1000,
+      "bytes": 11919,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 9
+    },
+    "internal/vpn/tunnel/device_bench_test.go": {
+      "lines": 246,
+      "ceiling": 1000,
+      "bytes": 7042,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 2
+    },
+    "internal/vpn/tunnel/disabled_tunnel_regression_test.go": {
+      "lines": 316,
+      "ceiling": 1000,
+      "bytes": 11094,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 4
+    },
+    "internal/vpn/tunnel/endpoint_fencing_test.go": {
+      "lines": 498,
+      "ceiling": 1000,
+      "bytes": 15873,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/tunnel/export_test.go": {
+      "lines": 34,
+      "ceiling": 1000,
+      "bytes": 1088,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 2
+    },
+    "internal/vpn/tunnel/failcount_reset_test.go": {
+      "lines": 95,
+      "ceiling": 1000,
+      "bytes": 3107,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 3
+    },
+    "internal/vpn/tunnel/health.go": {
+      "lines": 1322,
+      "ceiling": 1322,
+      "bytes": 36746,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 15
+    },
+    "internal/vpn/tunnel/health_range_test.go": {
+      "lines": 124,
+      "ceiling": 1000,
+      "bytes": 3894,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/vpn/tunnel/health_test.go": {
+      "lines": 496,
+      "ceiling": 1000,
+      "bytes": 16282,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 10
+    },
+    "internal/vpn/tunnel/pool.go": {
+      "lines": 891,
+      "ceiling": 1000,
+      "bytes": 29461,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 14,
+      "churn_90d": 21
+    },
+    "internal/vpn/tunnel/pool_persist_issue96_test.go": {
+      "lines": 300,
+      "ceiling": 1000,
+      "bytes": 9538,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/vpn/tunnel/pool_test.go": {
+      "lines": 1336,
+      "ceiling": 1336,
+      "bytes": 47112,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 8,
+      "churn_90d": 12
+    },
+    "internal/vpn/tunnel/reconnect.go": {
+      "lines": 240,
+      "ceiling": 1000,
+      "bytes": 5825,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "internal/vpn/tunnel/reconnect_test.go": {
+      "lines": 158,
+      "ceiling": 1000,
+      "bytes": 5229,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 5
+    },
+    "internal/vpn/tunnel/self_healing_test.go": {
+      "lines": 1567,
+      "ceiling": 1567,
+      "bytes": 52831,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/vpn/tunnel/udpdevice.go": {
+      "lines": 144,
+      "ceiling": 1000,
+      "bytes": 3762,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "internal/vpn/tunnel/udpdevice_test.go": {
+      "lines": 100,
+      "ceiling": 1000,
+      "bytes": 3097,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "internal/vpn/upstream_durability_test.go": {
+      "lines": 640,
+      "ceiling": 1000,
+      "bytes": 25605,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/upstream_engine_test.go": {
+      "lines": 659,
+      "ceiling": 1000,
+      "bytes": 21574,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/upstream_reap_test.go": {
+      "lines": 787,
+      "ceiling": 1000,
+      "bytes": 31030,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 10,
+      "churn_90d": 10
+    },
+    "internal/vpn/virtualtun/stats_coherence_test.go": {
+      "lines": 282,
+      "ceiling": 1000,
+      "bytes": 10048,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/virtualtun/suspend_reads_test.go": {
+      "lines": 261,
+      "ceiling": 1000,
+      "bytes": 8948,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/virtualtun/virtualtun.go": {
+      "lines": 876,
+      "ceiling": 1000,
+      "bytes": 34456,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 8,
+      "churn_90d": 8
+    },
+    "internal/vpn/virtualtun/virtualtun_bench_test.go": {
+      "lines": 138,
+      "ceiling": 1000,
+      "bytes": 4355,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/virtualtun/virtualtun_test.go": {
+      "lines": 1172,
+      "ceiling": 1172,
+      "bytes": 36540,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "internal/vpn/vpn.go": {
+      "lines": 2371,
+      "ceiling": 2371,
+      "bytes": 85675,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 73,
+      "churn_90d": 103
+    },
+    "internal/vpn/vpn_backend_attachment_test.go": {
+      "lines": 798,
+      "ceiling": 1000,
+      "bytes": 26261,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/vpn_backend_enable_test.go": {
+      "lines": 843,
+      "ceiling": 1000,
+      "bytes": 28045,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/vpn_backend_probe_test.go": {
+      "lines": 269,
+      "ceiling": 1000,
+      "bytes": 8552,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/vpn_client_config_test.go": {
+      "lines": 931,
+      "ceiling": 1000,
+      "bytes": 28492,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/vpn_config_obfuscation_test.go": {
+      "lines": 551,
+      "ceiling": 1000,
+      "bytes": 20233,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/vpn_config_test.go": {
+      "lines": 954,
+      "ceiling": 1000,
+      "bytes": 31874,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/vpn_ingress.go": {
+      "lines": 345,
+      "ceiling": 1000,
+      "bytes": 17004,
+      "component": "Go Core VPN",
+      "language": "Go",
+      "churn_30d": 9,
+      "churn_90d": 9
+    },
+    "internal/vpn/vpn_ingress_test.go": {
+      "lines": 438,
+      "ceiling": 1000,
+      "bytes": 16079,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "internal/vpn/vpn_ipam_test.go": {
+      "lines": 220,
+      "ceiling": 1000,
+      "bytes": 7388,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/vpn_lifecycle_test.go": {
+      "lines": 674,
+      "ceiling": 1000,
+      "bytes": 20308,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/vpn_session_reaper_test.go": {
+      "lines": 412,
+      "ceiling": 1000,
+      "bytes": 13429,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/vpn_session_reconcile_test.go": {
+      "lines": 521,
+      "ceiling": 1000,
+      "bytes": 18863,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "internal/vpn/vpn_test.go": {
+      "lines": 675,
+      "ceiling": 1000,
+      "bytes": 22409,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 30,
+      "churn_90d": 52
+    },
+    "pyproject.toml": {
+      "lines": 17,
+      "ceiling": 1000,
+      "bytes": 342,
+      "component": "Other",
+      "language": "TOML",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "scripts/DIFFERENTIAL_SUITE_RUNBOOK.md": {
+      "lines": 559,
+      "ceiling": 1000,
+      "bytes": 28659,
+      "component": "Scripts & Tooling",
+      "language": "Markdown",
+      "churn_30d": 13,
+      "churn_90d": 13
+    },
+    "scripts/build_style_bundle.sh": {
+      "lines": 41,
+      "ceiling": 1000,
+      "bytes": 1197,
+      "component": "Scripts & Tooling",
+      "language": "Shell",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "scripts/generate_captcha_assets.py": {
+      "lines": 83,
+      "ceiling": 1000,
+      "bytes": 3244,
+      "component": "Scripts & Tooling",
+      "language": "Python",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "scripts/run_differential_qualification.sh": {
+      "lines": 365,
+      "ceiling": 1000,
+      "bytes": 13348,
+      "component": "Scripts & Tooling",
+      "language": "Shell",
+      "churn_30d": 6,
+      "churn_90d": 6
+    },
+    "scripts/run_e2e.sh": {
+      "lines": 144,
+      "ceiling": 1000,
+      "bytes": 4289,
+      "component": "Scripts & Tooling",
+      "language": "Shell",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "scripts/run_e2e_lifecycle.sh": {
+      "lines": 190,
+      "ceiling": 1000,
+      "bytes": 8018,
+      "component": "Scripts & Tooling",
+      "language": "Shell",
+      "churn_30d": 8,
+      "churn_90d": 8
+    },
+    "scripts/run_non_netstack_client_qualification.sh": {
+      "lines": 1025,
+      "ceiling": 1025,
+      "bytes": 40311,
+      "component": "Scripts & Tooling",
+      "language": "Shell",
+      "churn_30d": 8,
+      "churn_90d": 8
+    },
+    "scripts/run_upstream_restart_durability.sh": {
+      "lines": 429,
+      "ceiling": 1000,
+      "bytes": 14898,
+      "component": "Scripts & Tooling",
+      "language": "Shell",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "scripts/verify_issue392_qualification.sh": {
+      "lines": 377,
+      "ceiling": 1000,
+      "bytes": 15202,
+      "component": "Scripts & Tooling",
+      "language": "Shell",
+      "churn_30d": 8,
+      "churn_90d": 8
+    },
+    "tests/__init__.py": {
+      "lines": 0,
+      "ceiling": 1000,
+      "bytes": 0,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "tests/e2e/README.md": {
+      "lines": 386,
+      "ceiling": 1000,
+      "bytes": 24007,
+      "component": "Test Suites",
+      "language": "Markdown",
+      "churn_30d": 9,
+      "churn_90d": 9
+    },
+    "tests/e2e/__init__.py": {
+      "lines": 0,
+      "ceiling": 1000,
+      "bytes": 0,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "tests/e2e/conftest.py": {
+      "lines": 317,
+      "ceiling": 1000,
+      "bytes": 12016,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "tests/e2e/fixtures/style.pre-505.css": {
+      "lines": 3008,
+      "ceiling": 3008,
+      "bytes": 63291,
+      "component": "Test Suites",
+      "language": "CSS",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "tests/e2e/requirements.txt": {
+      "lines": 4,
+      "ceiling": 1000,
+      "bytes": 81,
+      "component": "Test Suites",
+      "language": "Other",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "tests/e2e/test_auth.py": {
+      "lines": 228,
+      "ceiling": 1000,
+      "bytes": 9132,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "tests/e2e/test_connections.py": {
+      "lines": 328,
+      "ceiling": 1000,
+      "bytes": 11506,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "tests/e2e/test_css_differential.py": {
+      "lines": 256,
+      "ceiling": 1000,
+      "bytes": 9515,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "tests/e2e/test_my_connections.py": {
+      "lines": 219,
+      "ceiling": 1000,
+      "bytes": 7761,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "tests/e2e/test_onboard.py": {
+      "lines": 209,
+      "ceiling": 1000,
+      "bytes": 7607,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "tests/e2e/test_onboard_credentials.py": {
+      "lines": 240,
+      "ceiling": 1000,
+      "bytes": 8621,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "tests/e2e/test_servers.py": {
+      "lines": 317,
+      "ceiling": 1000,
+      "bytes": 11648,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 8,
+      "churn_90d": 8
+    },
+    "tests/e2e/test_settings.py": {
+      "lines": 332,
+      "ceiling": 1000,
+      "bytes": 11501,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "tests/e2e/test_setup.py": {
+      "lines": 77,
+      "ceiling": 1000,
+      "bytes": 2570,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "tests/e2e/test_share.py": {
+      "lines": 177,
+      "ceiling": 1000,
+      "bytes": 5323,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "tests/e2e/test_traffic.py": {
+      "lines": 578,
+      "ceiling": 1000,
+      "bytes": 23776,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "tests/e2e/test_users.py": {
+      "lines": 310,
+      "ceiling": 1000,
+      "bytes": 8900,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "tests/e2e/test_vpn_diagnostics.py": {
+      "lines": 936,
+      "ceiling": 1000,
+      "bytes": 37795,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 19,
+      "churn_90d": 19
+    },
+    "tests/test_vpn_diagnostics_oracle.py": {
+      "lines": 532,
+      "ceiling": 1000,
+      "bytes": 19082,
+      "component": "Test Suites",
+      "language": "Python",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "useful_notes/HOW_IT_WORKS.md": {
+      "lines": 74,
+      "ceiling": 1000,
+      "bytes": 4645,
+      "component": "Documentation",
+      "language": "Markdown",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "web/static/css/base.css": {
+      "lines": 217,
+      "ceiling": 1000,
+      "bytes": 4243,
+      "component": "CSS Styles",
+      "language": "CSS",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "web/static/css/components.css": {
+      "lines": 958,
+      "ceiling": 1000,
+      "bytes": 19818,
+      "component": "CSS Styles",
+      "language": "CSS",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "web/static/css/layout.css": {
+      "lines": 446,
+      "ceiling": 1000,
+      "bytes": 9507,
+      "component": "CSS Styles",
+      "language": "CSS",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "web/static/css/server.css": {
+      "lines": 449,
+      "ceiling": 1000,
+      "bytes": 8923,
+      "component": "CSS Styles",
+      "language": "CSS",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "web/static/css/style.css": {
+      "lines": 2991,
+      "ceiling": 2991,
+      "bytes": 63084,
+      "component": "CSS Styles",
+      "language": "CSS",
+      "churn_30d": 3,
+      "churn_90d": 13
+    },
+    "web/static/css/tables.css": {
+      "lines": 311,
+      "ceiling": 1000,
+      "bytes": 6441,
+      "component": "CSS Styles",
+      "language": "CSS",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "web/static/css/tokens.css": {
+      "lines": 161,
+      "ceiling": 1000,
+      "bytes": 4908,
+      "component": "CSS Styles",
+      "language": "CSS",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "web/static/css/vpn.css": {
+      "lines": 449,
+      "ceiling": 1000,
+      "bytes": 9244,
+      "component": "CSS Styles",
+      "language": "CSS",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "web/static/favicon.svg": {
+      "lines": 11,
+      "ceiling": 1000,
+      "bytes": 619,
+      "component": "Other",
+      "language": "Other",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "web/static/js/api.js": {
+      "lines": 204,
+      "ceiling": 1000,
+      "bytes": 7026,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 1,
+      "churn_90d": 4
+    },
+    "web/static/js/captcha.js": {
+      "lines": 139,
+      "ceiling": 1000,
+      "bytes": 5446,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "web/static/js/qrcode.min.js": {
+      "lines": 1,
+      "ceiling": 1000,
+      "bytes": 19927,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "web/static/js/server_actions.js": {
+      "lines": 731,
+      "ceiling": 1000,
+      "bytes": 29981,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 6,
+      "churn_90d": 6
+    },
+    "web/static/js/server_telemetry.js": {
+      "lines": 574,
+      "ceiling": 1000,
+      "bytes": 31750,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 7,
+      "churn_90d": 7
+    },
+    "web/static/js/tables.js": {
+      "lines": 783,
+      "ceiling": 1000,
+      "bytes": 30810,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "web/static/js/telemetry.js": {
+      "lines": 525,
+      "ceiling": 1000,
+      "bytes": 18319,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "web/static/js/ui.js": {
+      "lines": 444,
+      "ceiling": 1000,
+      "bytes": 16863,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 1,
+      "churn_90d": 2
+    },
+    "web/static/js/users.js": {
+      "lines": 955,
+      "ceiling": 1000,
+      "bytes": 46069,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "web/static/js/vpn/backends.js": {
+      "lines": 522,
+      "ceiling": 1000,
+      "bytes": 21380,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "web/static/js/vpn/charts.js": {
+      "lines": 644,
+      "ceiling": 1000,
+      "bytes": 32166,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "web/static/js/vpn/health_problems.js": {
+      "lines": 913,
+      "ceiling": 1000,
+      "bytes": 46884,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "web/static/js/vpn/health_summary.js": {
+      "lines": 527,
+      "ceiling": 1000,
+      "bytes": 26028,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "web/static/js/vpn/page.js": {
+      "lines": 265,
+      "ceiling": 1000,
+      "bytes": 12159,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "web/static/js/vpn/sessions.js": {
+      "lines": 667,
+      "ceiling": 1000,
+      "bytes": 31516,
+      "component": "Frontend JavaScript",
+      "language": "JavaScript",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "web/templates/base.html": {
+      "lines": 570,
+      "ceiling": 1000,
+      "bytes": 35673,
+      "component": "Web Templates",
+      "language": "HTML",
+      "churn_30d": 1,
+      "churn_90d": 12
+    },
+    "web/templates/change_password.html": {
+      "lines": 371,
+      "ceiling": 1000,
+      "bytes": 15304,
+      "component": "Web Templates",
+      "language": "HTML",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "web/templates/icons.html": {
+      "lines": 282,
+      "ceiling": 1000,
+      "bytes": 15085,
+      "component": "Web Templates",
+      "language": "HTML",
+      "churn_30d": 0,
+      "churn_90d": 6
+    },
+    "web/templates/index.html": {
+      "lines": 469,
+      "ceiling": 1000,
+      "bytes": 21015,
+      "component": "Web Templates",
+      "language": "HTML",
+      "churn_30d": 1,
+      "churn_90d": 4
+    },
+    "web/templates/leaderboard.html": {
+      "lines": 208,
+      "ceiling": 1000,
+      "bytes": 9738,
+      "component": "Web Templates",
+      "language": "HTML",
+      "churn_30d": 0,
+      "churn_90d": 2
+    },
+    "web/templates/login.html": {
+      "lines": 355,
+      "ceiling": 1000,
+      "bytes": 18771,
+      "component": "Web Templates",
+      "language": "HTML",
+      "churn_30d": 2,
+      "churn_90d": 7
+    },
+    "web/templates/my_connections.html": {
+      "lines": 726,
+      "ceiling": 1000,
+      "bytes": 36008,
+      "component": "Web Templates",
+      "language": "HTML",
+      "churn_30d": 0,
+      "churn_90d": 7
+    },
+    "web/templates/server.html": {
+      "lines": 452,
+      "ceiling": 1000,
+      "bytes": 28302,
+      "component": "Web Templates",
+      "language": "HTML",
+      "churn_30d": 7,
+      "churn_90d": 14
+    },
+    "web/templates/settings.html": {
+      "lines": 531,
+      "ceiling": 1000,
+      "bytes": 31111,
+      "component": "Web Templates",
+      "language": "HTML",
+      "churn_30d": 2,
+      "churn_90d": 6
+    },
+    "web/templates/setup.html": {
+      "lines": 340,
+      "ceiling": 1000,
+      "bytes": 14366,
+      "component": "Web Templates",
+      "language": "HTML",
+      "churn_30d": 1,
+      "churn_90d": 3
+    },
+    "web/templates/user_share.html": {
+      "lines": 265,
+      "ceiling": 1000,
+      "bytes": 11043,
+      "component": "Web Templates",
+      "language": "HTML",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "web/templates/users.html": {
+      "lines": 489,
+      "ceiling": 1000,
+      "bytes": 27168,
+      "component": "Web Templates",
+      "language": "HTML",
+      "churn_30d": 1,
+      "churn_90d": 7
+    },
+    "web/templates/vpn.html": {
+      "lines": 509,
+      "ceiling": 1000,
+      "bytes": 35282,
+      "component": "Web Templates",
+      "language": "HTML",
+      "churn_30d": 59,
+      "churn_90d": 69
+    },
+    "web/translations/en.json": {
+      "lines": 713,
+      "ceiling": 1000,
+      "bytes": 34032,
+      "component": "Translations",
+      "language": "JSON",
+      "churn_30d": 30,
+      "churn_90d": 47
+    },
+    "web/translations/fa.json": {
+      "lines": 713,
+      "ceiling": 1000,
+      "bytes": 44287,
+      "component": "Translations",
+      "language": "JSON",
+      "churn_30d": 30,
+      "churn_90d": 47
+    },
+    "web/translations/fr.json": {
+      "lines": 713,
+      "ceiling": 1000,
+      "bytes": 36921,
+      "component": "Translations",
+      "language": "JSON",
+      "churn_30d": 30,
+      "churn_90d": 47
+    },
+    "web/translations/ru.json": {
+      "lines": 713,
+      "ceiling": 1000,
+      "bytes": 49297,
+      "component": "Translations",
+      "language": "JSON",
+      "churn_30d": 30,
+      "churn_90d": 47
+    },
+    "web/translations/zh.json": {
+      "lines": 713,
+      "ceiling": 1000,
+      "bytes": 33476,
+      "component": "Translations",
+      "language": "JSON",
+      "churn_30d": 30,
+      "churn_90d": 47
+    },
+    "web/vpn_backends_test.go": {
+      "lines": 583,
+      "ceiling": 1000,
+      "bytes": 27539,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 3,
+      "churn_90d": 3
+    },
+    "web/vpn_diagnostics_accordion_test.go": {
+      "lines": 893,
+      "ceiling": 1000,
+      "bytes": 41196,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "web/vpn_diagnostics_health_test.go": {
+      "lines": 726,
+      "ceiling": 1000,
+      "bytes": 30878,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "web/vpn_diagnostics_history_test.go": {
+      "lines": 760,
+      "ceiling": 1000,
+      "bytes": 43349,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 9,
+      "churn_90d": 9
+    },
+    "web/vpn_diagnostics_i18n_test.go": {
+      "lines": 591,
+      "ceiling": 1000,
+      "bytes": 29617,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 9,
+      "churn_90d": 9
+    },
+    "web/vpn_diagnostics_problems_test.go": {
+      "lines": 693,
+      "ceiling": 1000,
+      "bytes": 27625,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 4,
+      "churn_90d": 4
+    },
+    "web/vpn_diagnostics_routes_test.go": {
+      "lines": 747,
+      "ceiling": 1000,
+      "bytes": 34175,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 11,
+      "churn_90d": 11
+    },
+    "web/vpn_diagnostics_sessions_test.go": {
+      "lines": 597,
+      "ceiling": 1000,
+      "bytes": 24540,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 10,
+      "churn_90d": 10
+    },
+    "web/vpn_diagnostics_test.go": {
+      "lines": 595,
+      "ceiling": 1000,
+      "bytes": 30641,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 50,
+      "churn_90d": 50
+    },
+    "web/vpn_fixture_dom_test.go": {
+      "lines": 261,
+      "ceiling": 1000,
+      "bytes": 6779,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 1,
+      "churn_90d": 1
+    },
+    "web/vpn_fixture_selftest_test.go": {
+      "lines": 815,
+      "ceiling": 1000,
+      "bytes": 33493,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 14,
+      "churn_90d": 14
+    },
+    "web/vpn_fixture_test.go": {
+      "lines": 825,
+      "ceiling": 1000,
+      "bytes": 28425,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 17,
+      "churn_90d": 17
+    },
+    "web/vpn_i18n_test.go": {
+      "lines": 310,
+      "ceiling": 1000,
+      "bytes": 9027,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 2,
+      "churn_90d": 2
+    },
+    "web/vpn_page_test.go": {
+      "lines": 769,
+      "ceiling": 1000,
+      "bytes": 34046,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "web/vpn_template_test.go": {
+      "lines": 726,
+      "ceiling": 1000,
+      "bytes": 25458,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 5,
+      "churn_90d": 5
+    },
+    "web/web.go": {
+      "lines": 30,
+      "ceiling": 1000,
+      "bytes": 684,
+      "component": "Other",
+      "language": "Go",
+      "churn_30d": 0,
+      "churn_90d": 1
+    },
+    "web/web_embedded_test.go": {
+      "lines": 882,
+      "ceiling": 1000,
+      "bytes": 28075,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 11,
+      "churn_90d": 11
+    },
+    "web/web_server_test.go": {
+      "lines": 982,
+      "ceiling": 1000,
+      "bytes": 45076,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 9,
+      "churn_90d": 9
+    },
+    "web/web_server_users_test.go": {
+      "lines": 882,
+      "ceiling": 1000,
+      "bytes": 30877,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 8,
+      "churn_90d": 8
+    },
+    "web/web_test.go": {
+      "lines": 592,
+      "ceiling": 1000,
+      "bytes": 16705,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 21,
+      "churn_90d": 40
+    },
+    "web/web_vpn_test.go": {
+      "lines": 774,
+      "ceiling": 1000,
+      "bytes": 26080,
+      "component": "Test Suites",
+      "language": "Go",
+      "churn_30d": 9,
+      "churn_90d": 9
+    }
+  }
+}
