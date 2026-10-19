@@ -61,6 +61,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	pool := s.pool
 	db := s.db
 	awgProv := s.awgProvider
+	startEpoch := s.adminDisableEpoch[serverID]
 	s.mu.RUnlock()
 
 	if pool == nil {
@@ -68,15 +69,6 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	}
 	if db == nil {
 		return errors.New("database not available")
-	}
-
-	var (
-		hasInitial     bool
-		initialEnabled bool
-	)
-	if initTun, err := pool.GetTunnel(serverID); err == nil && initTun != nil {
-		hasInitial = true
-		initialEnabled = initTun.Enabled
 	}
 
 	server, err := db.GetServerByID(ctx, serverID)
@@ -124,10 +116,6 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		}
 	}
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
-	var postRefreshVersion int64
-	if err == nil && tun != nil {
-		postRefreshVersion = tun.StateVersion
-	}
 	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to register backend tunnel for server %d: %w", serverID, err)
@@ -164,7 +152,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 	}
 
-	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, postRefreshVersion)
+	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, startEpoch)
 }
 
 func (s *Service) finishEnableBackend(
@@ -173,9 +161,7 @@ func (s *Service) finishEnableBackend(
 	tun *models.BackendTunnel,
 	awgParams map[string]any,
 	serverID int64,
-	hasInitial bool,
-	initialEnabled bool,
-	initialVersion int64,
+	startEpoch uint64,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -187,19 +173,15 @@ func (s *Service) finishEnableBackend(
 	if tunnel.IsSelfHealingContext(ctx) && !currTun.Enabled {
 		return errors.New("backend was administratively disabled; aborting enable")
 	}
-	if hasInitial {
-		// Reject only a transition from administratively enabled to disabled
-		// while this operation was in flight. A backend that was already
-		// administratively disabled when EnableBackend started is the normal
-		// manual-enable case, regardless of preserved runtime-health provenance.
-		if initialEnabled && !currTun.Enabled {
-			return errors.New("backend was administratively disabled; aborting enable")
-		}
-	} else if !currTun.Enabled {
+	if s.adminDisableEpoch[serverID] != startEpoch {
 		return errors.New("backend was administratively disabled; aborting enable")
 	}
-	if currTun.StateVersion != initialVersion {
-		return errors.New("backend state modified concurrently; aborting enable")
+	// Guard on the tunnel's identity, not StateVersion: the health prober bumps
+	// StateVersion on every status write, and registering portal peers over SSH
+	// routinely outlasts the probe interval, so a version check aborts valid
+	// enables (issue #607). Runtime status/latency changes do not invalidate it.
+	if !models.SameTunnelIdentity(currTun, tun) {
+		return errors.New("backend identity modified concurrently; aborting enable")
 	}
 
 	if err := s.attachBackendForwarder(tun, awgParams); err != nil {

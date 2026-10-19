@@ -196,6 +196,7 @@ type Service struct {
 	backendDevices         map[int64]BackendDevice
 	backendDeviceEndpoints map[int64]string
 	deletedServers         map[int64]struct{} // guarded by mu
+	adminDisableEpoch      map[int64]uint64   // guarded by mu
 	lastLoggedDrops        atomic.Uint64
 	// retiredBackendDeviceDrops is the LIFETIME accumulator for backend
 	// devices that have left backendDevices (issue #424 round 5, finding 1).
@@ -424,6 +425,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		portalPrivKey:          priv,
 		backendDeviceEndpoints: make(map[int64]string),
 		deletedServers:         make(map[int64]struct{}),
+		adminDisableEpoch:      make(map[int64]uint64),
 		lastReconcileByTunnel:  make(map[int64]time.Time),
 		rollingHistory:         NewRollingHistory(),
 		diagRates:              newDiagRatesTracker(),
