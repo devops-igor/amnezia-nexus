@@ -124,10 +124,6 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		}
 	}
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
-	var postRefreshVersion int64
-	if err == nil && tun != nil {
-		postRefreshVersion = tun.StateVersion
-	}
 	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to register backend tunnel for server %d: %w", serverID, err)
@@ -164,7 +160,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 	}
 
-	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, postRefreshVersion)
+	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled)
 }
 
 func (s *Service) finishEnableBackend(
@@ -175,7 +171,6 @@ func (s *Service) finishEnableBackend(
 	serverID int64,
 	hasInitial bool,
 	initialEnabled bool,
-	initialVersion int64,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -198,7 +193,15 @@ func (s *Service) finishEnableBackend(
 	} else if !currTun.Enabled {
 		return errors.New("backend was administratively disabled; aborting enable")
 	}
-	if currTun.StateVersion != initialVersion {
+	// Guard on the tunnel's identity, not StateVersion: the health prober bumps
+	// StateVersion on every status write, and registering portal peers over SSH
+	// routinely outlasts the probe interval, so a version check aborts valid
+	// enables (issue #607). Runtime status/latency changes do not invalidate it.
+	if currTun.ID != tun.ID ||
+		currTun.Endpoint != tun.Endpoint ||
+		currTun.PublicKey != tun.PublicKey ||
+		currTun.PrivateKey != tun.PrivateKey ||
+		currTun.ProbePrivateKey != tun.ProbePrivateKey {
 		return errors.New("backend state modified concurrently; aborting enable")
 	}
 
