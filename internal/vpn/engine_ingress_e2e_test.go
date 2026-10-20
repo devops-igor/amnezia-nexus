@@ -227,6 +227,12 @@ func startEngineUpstreamClient(t *testing.T, saved, name string) *engineUpstream
 	if err := dev.IpcSet(configToUAPI(t, saved)); err != nil {
 		t.Fatal("upstream rejected saved generated configuration")
 	}
+	if want := configField(t, saved, "I1"); want != "" {
+		got, err := dev.IpcGet()
+		if err != nil || !strings.Contains(got, "i1="+want) {
+			t.Fatalf("upstream device did not load the rendered I1 (err=%v)", err)
+		}
+	}
 	_ = dev.IpcSet("rekey_timeout=1\n")
 	if err := dev.Up(); err != nil {
 		t.Fatal(err)

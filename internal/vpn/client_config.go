@@ -265,6 +265,9 @@ func (s *Service) renderClientConfigForConnection(
 		return "", "", fmt.Errorf("restore client IP assignments: %w", err)
 	}
 	clientParams := buildClientParams(awgConn, p)
+	if target := refreshPersistedPortalI1(ctx, db, user, awgConn, isExplicit, clientParams); target != nil {
+		awgConn = target
+	}
 	i1, err := resolvePortalI1(ctx, cfg, clientParams)
 	if err != nil {
 		return "", "", err
@@ -323,15 +326,7 @@ func (s *Service) renderClientConfigForConnection(
 		ContentPaddingAddition: p.cpAdd,
 	}
 
-	clientMTU := "1280"
-	if awgConn != nil && len(awgConn.ClientParams) > 0 {
-		if m := getStringParam(awgConn.ClientParams, "mtu"); m != "" {
-			clientMTU = m
-		}
-	}
-	if clientMTU == "1280" && awgParams != nil && awgParams.MTU != "" {
-		clientMTU = awgParams.MTU
-	}
+	clientMTU := resolveClientMTU(awgConn, awgParams)
 
 	configStr := awg.RenderClientConfig(
 		p.clientPriv,
@@ -351,6 +346,38 @@ func (s *Service) renderClientConfigForConnection(
 		filename = fmt.Sprintf("%s.conf", awgConn.Name)
 	}
 	return configStr, filename, nil
+}
+
+func refreshPersistedPortalI1(ctx context.Context, db *database.DB, user *models.User, awgConn *models.UserConnection, isExplicit bool, clientParams map[string]any) *models.UserConnection {
+	targetConn := awgConn
+	if targetConn == nil && !isExplicit {
+		if found := findAWGConnection(ctx, db, user); found != nil {
+			targetConn = found
+		}
+	}
+	if targetConn == nil || targetConn.ID == "" {
+		return targetConn
+	}
+	freshConn, err := db.GetConnection(ctx, targetConn.ID)
+	if err != nil || freshConn == nil || freshConn.ClientParams == nil {
+		return targetConn
+	}
+	if freshI1, ok := freshConn.ClientParams["portal_i1"]; ok && freshI1 != nil {
+		clientParams["portal_i1"] = freshI1
+	}
+	return targetConn
+}
+
+func resolveClientMTU(awgConn *models.UserConnection, awgParams *awg.AWGParams) string {
+	if awgConn != nil && len(awgConn.ClientParams) > 0 {
+		if m := getStringParam(awgConn.ClientParams, "mtu"); m != "" {
+			return m
+		}
+	}
+	if awgParams != nil && awgParams.MTU != "" {
+		return awgParams.MTU
+	}
+	return "1280"
 }
 
 func resolvePortalI1(ctx context.Context, cfg *models.VPNConfig, clientParams map[string]any) (string, error) {

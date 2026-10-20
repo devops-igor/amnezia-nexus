@@ -356,6 +356,10 @@ func (h *Handlers) VPNUpdateConfigHandler(w http.ResponseWriter, r *http.Request
 
 	ctx := r.Context()
 	if present.dataPlaneI1 {
+		if cfg.VPNDataPlaneI1Protocol == "" {
+			h.JSONError(w, http.StatusBadRequest, "validation_failed", "invalid vpn_data_plane_i1_protocol: expected sip or dns")
+			return
+		}
 		if err := cfg.ValidateDataPlaneI1Protocol(); err != nil {
 			h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
 			return

@@ -39,6 +39,28 @@ func TestVPNUpdateConfigHandlerI1Protocol(t *testing.T) {
 			if got := get(); got != "dns" {
 				t.Fatalf("invalid update changed protocol to %q", got)
 			}
+			if w := f.put(t, `{"vpn_data_plane_i1_protocol":null}`); w.Code != http.StatusBadRequest {
+				t.Fatalf("null protocol returned %d, want 400", w.Code)
+			}
+			if got := get(); got != "dns" {
+				t.Fatalf("null update changed protocol to %q", got)
+			}
+			if w := f.put(t, `{"vpn_data_plane_i1_protocol":""}`); w.Code != http.StatusBadRequest {
+				t.Fatalf("empty string protocol returned %d, want 400", w.Code)
+			}
+			if got := get(); got != "dns" {
+				t.Fatalf("empty string update changed protocol to %q", got)
+			}
+			if w := f.put(t, `{"vpn_data_plane_i1_protocol":"SIP"}`); w.Code != http.StatusBadRequest {
+				t.Fatalf("uppercase SIP returned %d, want 400", w.Code)
+			}
+			if got := get(); got != "dns" {
+				t.Fatalf("uppercase SIP update changed protocol to %q", got)
+			}
+			f.putOK(t, `{"listen_port":51820}`)
+			if got := get(); got != "dns" {
+				t.Fatalf("absent protocol key changed protocol to %q", got)
+			}
 		})
 	}
 }

@@ -1774,10 +1774,10 @@ var (
 // debug line (VPN_DEBUG-gated) otherwise, so cache hits and steady-state
 // fallback resolves don't spam the log.
 func logEndpointSource(source, value string) {
+	value = sanitizeLogValue(value)
 	prevSrc := lastEndpointSource.Swap(&source)
 	prevVal := lastEndpointValue.Swap(&value)
 	unchanged := prevSrc != nil && *prevSrc == source && prevVal != nil && *prevVal == value
-	value = sanitizeLogValue(value)
 	if unchanged {
 		vpnDebugf("[vpn] client endpoint source: %s (%s) (unchanged)", source, value)
 		return
