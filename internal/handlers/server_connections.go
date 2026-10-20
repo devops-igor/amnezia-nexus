@@ -809,5 +809,17 @@ func (h *Handlers) handleClientConfigError(w http.ResponseWriter, err error) {
 		h.JSONError(w, http.StatusBadRequest, code, err.Error())
 		return
 	}
+	if isClientConfigConflictError(err) {
+		h.JSONError(w, http.StatusConflict, "conflict", err.Error())
+		return
+	}
 	h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config: "+err.Error())
+}
+
+func isClientConfigConflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "concurrently") || strings.Contains(msg, "conflict")
 }

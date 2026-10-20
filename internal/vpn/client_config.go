@@ -15,6 +15,10 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
+// ErrConnectionCreatedConcurrently is returned when client config generation raced
+// with a concurrent creation of the user's connection while awgConn was nil.
+var ErrConnectionCreatedConcurrently = errors.New("connection was created concurrently; retry")
+
 // GenerateUserClientConfig is an alias for GenerateClientConfig for API clarity.
 func (s *Service) GenerateUserClientConfig(ctx context.Context, userID string) (string, string, error) {
 	return s.GenerateClientConfig(ctx, userID)
@@ -265,8 +269,10 @@ func (s *Service) renderClientConfigForConnection(
 		return "", "", fmt.Errorf("restore client IP assignments: %w", err)
 	}
 	clientParams := buildClientParams(awgConn, p)
-	if target := refreshPersistedPortalI1(ctx, db, user, awgConn, isExplicit, clientParams); target != nil {
-		awgConn = target
+	if target := refreshPersistedPortalI1(ctx, db, user, awgConn, isExplicit, clientParams); target != nil && awgConn == nil {
+		// A concurrent first fetch created the connection after this request
+		// built its keypair. Do not overwrite that connection's keys.
+		return "", "", ErrConnectionCreatedConcurrently
 	}
 	i1, err := resolvePortalI1(ctx, cfg, clientParams)
 	if err != nil {

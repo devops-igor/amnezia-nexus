@@ -303,3 +303,194 @@ func TestGenerateClientConfig_ConcurrentFirstFetch_LegacyRow(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerateClientConfig_ConcurrentFirstFetch_WinnerKeyIntegrity(t *testing.T) {
+	t.Run("awgConn nil with concurrent winner returns error and preserves winner keys", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := svc.GetConfig(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		portalPub := svc.portalPubKey
+
+		uID, err := db.CreateUser(ctx, &models.User{Username: "race-nil-user", Enabled: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		user, err := db.GetUser(ctx, uID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		winnerConn := &models.UserConnection{
+			UserID:   uID,
+			ServerID: 0,
+			Protocol: "awg",
+			Name:     "race-nil-user-awg",
+			ClientID: "winner-client-pubkey",
+			ClientParams: map[string]any{
+				"portal_i1":          "<r 2><b 0x01020304>",
+				"client_private_key": "winner-client-privkey",
+			},
+		}
+		winnerConnID, err := db.CreateConnection(ctx, winnerConn)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Simulate request where awgConn was nil before the concurrent winner committed
+		_, _, err = svc.renderClientConfigForConnection(ctx, db, cfg, portalPub, user, nil, false)
+		if err == nil {
+			t.Fatal("expected error when awgConn is nil and connection was created concurrently, got nil")
+		}
+		if !errors.Is(err, ErrConnectionCreatedConcurrently) && !strings.Contains(err.Error(), "concurrently") {
+			t.Fatalf("expected concurrent creation error, got %v", err)
+		}
+
+		persisted, err := db.GetConnection(ctx, winnerConnID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.ClientID != "winner-client-pubkey" {
+			t.Fatalf("winner clientID overwritten: got %q, want %q", persisted.ClientID, "winner-client-pubkey")
+		}
+		if persisted.ClientParams["client_private_key"] != "winner-client-privkey" {
+			t.Fatalf("winner client_private_key overwritten: got %v", persisted.ClientParams["client_private_key"])
+		}
+		if persisted.ClientParams["portal_i1"] != "<r 2><b 0x01020304>" {
+			t.Fatalf("winner portal_i1 overwritten: got %v", persisted.ClientParams["portal_i1"])
+		}
+	})
+
+	t.Run("existing awgConn with refreshed I1 reuses I1 and retains awgConn", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := svc.GetConfig(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		portalPub := svc.portalPubKey
+
+		uID, err := db.CreateUser(ctx, &models.User{Username: "existing-conn-user", Enabled: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		user, err := db.GetUser(ctx, uID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		conn := &models.UserConnection{
+			UserID:   uID,
+			ServerID: 0,
+			Protocol: "awg",
+			Name:     "existing-conn-user-awg",
+			ClientID: "existing-client-pubkey",
+			ClientParams: map[string]any{
+				"portal_i1":          "<r 2><b 0xfeedbeef>",
+				"client_private_key": "existing-client-privkey",
+			},
+		}
+		connID, err := db.CreateConnection(ctx, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		callerConn := &models.UserConnection{
+			ID:       connID,
+			UserID:   uID,
+			ServerID: 0,
+			Protocol: "awg",
+			Name:     "existing-conn-user-awg",
+			ClientID: "existing-client-pubkey",
+			ClientParams: map[string]any{
+				"client_private_key": "existing-client-privkey",
+			},
+		}
+
+		renderedCfg, _, err := svc.renderClientConfigForConnection(ctx, db, cfg, portalPub, user, callerConn, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		i1 := parseDirectiveString(t, renderedCfg, "I1")
+		if i1 != "<r 2><b 0xfeedbeef>" {
+			t.Fatalf("expected refreshed I1 %q, got %q", "<r 2><b 0xfeedbeef>", i1)
+		}
+
+		persisted, err := db.GetConnection(ctx, connID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.ClientID != "existing-client-pubkey" {
+			t.Fatalf("clientID changed: got %q, want %q", persisted.ClientID, "existing-client-pubkey")
+		}
+		if persisted.ClientParams["client_private_key"] != "existing-client-privkey" {
+			t.Fatalf("client_private_key changed: got %v", persisted.ClientParams["client_private_key"])
+		}
+	})
+
+	t.Run("concurrent GenerateClientConfig from scratch preserves winner keys", func(t *testing.T) {
+		db := setupTestDB(t)
+		ctx := context.Background()
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		uID, err := db.CreateUser(ctx, &models.User{Username: "scratch-user", Enabled: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		const concurrency = 4
+		var wg sync.WaitGroup
+		errs := make([]error, concurrency)
+		cfgs := make([]string, concurrency)
+		start := make(chan struct{})
+		for i := 0; i < concurrency; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				cfgStr, _, err := svc.GenerateClientConfig(ctx, uID)
+				errs[i] = err
+				cfgs[i] = cfgStr
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		var successCount int
+		for _, err := range errs {
+			if err == nil {
+				successCount++
+			} else if !errors.Is(err, ErrConnectionCreatedConcurrently) && !strings.Contains(err.Error(), "concurrently") {
+				t.Fatalf("unexpected error from concurrent fetch: %v", err)
+			}
+		}
+		if successCount < 1 {
+			t.Fatalf("expected at least 1 success, got %d", successCount)
+		}
+
+		conns, err := db.GetConnectionsByUserID(ctx, uID)
+		if err != nil || len(conns) == 0 {
+			t.Fatalf("expected connection created, got conns=%+v err=%v", conns, err)
+		}
+		for i, err := range errs {
+			if err == nil {
+				clientPub := ExtractClientPublicKeyFromConfig(cfgs[i])
+				if clientPub != "" && clientPub != conns[0].ClientID {
+					t.Fatalf("winner client config pubkey %q does not match persisted %q", clientPub, conns[0].ClientID)
+				}
+			}
+		}
+	})
+}

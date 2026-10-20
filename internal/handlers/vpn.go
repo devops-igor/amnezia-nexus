@@ -424,7 +424,7 @@ func (h *Handlers) VPNMyConfigHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to generate VPN configuration")
+		h.handleClientConfigError(w, err)
 		return
 	}
 

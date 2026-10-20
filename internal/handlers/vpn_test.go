@@ -403,6 +403,14 @@ func TestVPNHandlers(t *testing.T) {
 		}
 	})
 
+	t.Run("VPNMyConfigHandler Concurrent Conflict Returns 409", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		h.handleClientConfigError(w, vpn.ErrConnectionCreatedConcurrently)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("expected 409 Conflict, got %d", w.Code)
+		}
+	})
+
 	t.Run("VPNEnableBackendHandler Without AWG", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sID), nil)
 		w := httptest.NewRecorder()
