@@ -827,16 +827,23 @@ func (m *AWGManager) resolveContainerConfigPath(ctx context.Context, client ssh.
 }
 
 func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient, content string) error {
-	_, err := m.saveServerConfigTracked(ctx, client, content)
+	_, err := m.saveServerConfigTracked(ctx, client, content, true)
 	return err
 }
 
-func (m *AWGManager) saveServerConfigTracked(ctx context.Context, client ssh.SSHClient, content string) (bool, error) {
+// saveServerConfigPreservingParams writes a peer-only edit without revalidating
+// existing interface parameters against today's rules.
+func (m *AWGManager) saveServerConfigPreservingParams(ctx context.Context, client ssh.SSHClient, content string) error {
+	_, err := m.saveServerConfigTracked(ctx, client, content, false)
+	return err
+}
+
+func (m *AWGManager) saveServerConfigTracked(ctx context.Context, client ssh.SSHClient, content string, validateParams bool) (bool, error) {
 	params, _, err := ParseServerConfig(content)
 	if err != nil {
 		return false, fmt.Errorf("invalid server config: %w", err)
 	}
-	if len(params) > 0 {
+	if validateParams && len(params) > 0 {
 		if err := ValidateAWGParams(params); err != nil {
 			return false, fmt.Errorf("invalid AWG parameters: %w", err)
 		}
@@ -1403,7 +1410,7 @@ func (m *AWGManager) commitPeerConfigWithCAS(
 		if err != nil {
 			return false, fmt.Errorf("failed to upsert peer in config: %w", err)
 		}
-		return m.saveServerConfigTracked(ctx, client, newConfig)
+		return m.saveServerConfigTracked(ctx, client, newConfig, false)
 	}
 
 	return false, errors.New("failed to commit remote config: CAS retry limit exceeded due to concurrent modifications")
@@ -1416,7 +1423,7 @@ func (m *AWGManager) removePeerFromRemote(ctx context.Context, client ssh.SSHCli
 	}
 
 	newConfig := removePeerFromConfig(confText, pubKey, ip)
-	if err := m.saveServerConfig(ctx, client, newConfig); err != nil {
+	if err := m.saveServerConfigPreservingParams(ctx, client, newConfig); err != nil {
 		return fmt.Errorf("failed to save config during peer removal: %w", err)
 	}
 
@@ -1441,7 +1448,7 @@ func (m *AWGManager) removePeerFromRemote(ctx context.Context, client ssh.SSHCli
 }
 
 func (m *AWGManager) restorePreviousPeer(ctx context.Context, client ssh.SSHClient, initialConfText string, initialClients []AWGClient) (bool, error) {
-	if err := m.saveServerConfig(ctx, client, initialConfText); err != nil {
+	if err := m.saveServerConfigPreservingParams(ctx, client, initialConfText); err != nil {
 		return false, fmt.Errorf("failed to restore initial server config: %w", err)
 	}
 	if err := m.saveClientsTable(ctx, client, initialClients); err != nil {
@@ -2057,7 +2064,7 @@ func (m *AWGManager) rollbackServerConfigSurgically(ctx context.Context, client 
 	}
 
 	if newConf != "" && newConf != freshConf {
-		if _, saveErr := m.saveServerConfigTracked(ctx, client, newConf); saveErr != nil {
+		if _, saveErr := m.saveServerConfigTracked(ctx, client, newConf, false); saveErr != nil {
 			return fmt.Errorf("failed to save server config during rollback: %w", saveErr)
 		}
 	}
@@ -2161,7 +2168,7 @@ func (m *AWGManager) RemoveClient(ctx context.Context, server *models.Server, cl
 	}
 
 	newConfig := "[" + strings.Join(newSections, "[")
-	if err := m.saveServerConfig(ctx, client, newConfig); err != nil {
+	if err := m.saveServerConfigPreservingParams(ctx, client, newConfig); err != nil {
 		return err
 	}
 
@@ -2316,7 +2323,7 @@ func (m *AWGManager) ToggleClient(ctx context.Context, server *models.Server, cl
 		newConfig = "[" + strings.Join(newSections, "[")
 	}
 
-	if err := m.saveServerConfig(ctx, client, newConfig); err != nil {
+	if err := m.saveServerConfigPreservingParams(ctx, client, newConfig); err != nil {
 		return err
 	}
 	return m.saveClientsTable(ctx, client, clients)
@@ -2669,7 +2676,7 @@ func (m *AWGManager) updateServerConfigPeer(ctx context.Context, client ssh.SSHC
 		}
 		newConfig = "[" + strings.Join(newSections, "[")
 	}
-	return m.saveServerConfig(ctx, client, newConfig)
+	return m.saveServerConfigPreservingParams(ctx, client, newConfig)
 }
 
 // RotateMimicry rotates a client's mimicry profile through the sequence:
