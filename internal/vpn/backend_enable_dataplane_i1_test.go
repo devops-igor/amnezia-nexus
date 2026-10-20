@@ -712,8 +712,7 @@ func TestUpdateConfig_DataPlaneI1ProtocolSwitch_NoDataRaceWithLiveTimers(t *test
 		"port":       pc.LocalAddr().(*net.UDPAddr).Port,
 		"public_key": pub,
 		"awg_params": map[string]any{
-			"rekey_timeout":                 "1",
-			"persistent_keepalive_interval": "1",
+			"rekey_timeout": "1",
 		},
 	}
 	srvID, err := svc.db.CreateServer(ctx, &models.Server{
@@ -750,6 +749,8 @@ func TestUpdateConfig_DataPlaneI1ProtocolSwitch_NoDataRaceWithLiveTimers(t *test
 				seen++
 			}
 		}
+		// Allow in-flight timer callback from the observed retransmission to complete.
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	// Verify initial SIP preambles on wire (handshake + timer retransmission)
@@ -780,6 +781,10 @@ func TestUpdateConfig_DataPlaneI1ProtocolSwitch_NoDataRaceWithLiveTimers(t *test
 		assertDeviceIPCI1Payload(t, ipc, proto)
 		readPreambles(proto)
 	}
+
+	// Allow in-flight timer callbacks to complete before closing devices.
+	time.Sleep(100 * time.Millisecond)
+	closeBackendDevices(svc)
 }
 
 func TestEnableBackend_InterleavedProtocolSwitch(t *testing.T) {
@@ -927,5 +932,137 @@ func TestUpdateConfig_DataPlaneI1ProtocolSameProtocol_NoReattach(t *testing.T) {
 	svc.mu.RUnlock()
 	if calls != 0 || old != currentDev {
 		t.Fatalf("same effective protocol unexpectedly regenerated %d times (device replaced: %v)", calls, old != currentDev)
+	}
+}
+
+func TestEnableBackend_InterleavedProtocolSwitch_GeneratorFailureMarksTunnelDegraded(t *testing.T) {
+	for _, stage := range []string{"before-add", "after-add"} {
+		t.Run(stage, func(t *testing.T) {
+			ctx := context.Background()
+			db := setupTestDB(t)
+			svc, err := NewVPNService(db, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { closeBackendDevices(svc) })
+			id := testNewServerWithAWGParams(t, svc, "198.51.100.83", nil)
+			svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+			sentinel := errors.New("audit DNS regeneration failure")
+			restore := setGenerateMimicryPacketsForTest(func(ctx context.Context, p, d string, c ssh.SSHClient) (map[string]string, error) {
+				if p == "dns" {
+					return nil, sentinel
+				}
+				return cps.GenerateMimicryPackets(ctx, p, d, c)
+			})
+			defer restore()
+			hook := func() {
+				if err := svc.UpdateConfig(ctx, &models.VPNConfig{VPNDataPlaneI1Protocol: "dns"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if stage == "before-add" {
+				svc.enableBackendPreAddTunnelHook = hook
+			} else {
+				svc.enableBackendPostAddTunnelHook = hook
+			}
+			err = svc.EnableBackend(ctx, id)
+			if !errors.Is(err, sentinel) {
+				t.Fatalf("expected injected error, got %v", err)
+			}
+			tun, err := svc.pool.GetTunnel(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			svc.mu.RLock()
+			hasDev := svc.backendDevices[tun.ID] != nil
+			svc.mu.RUnlock()
+			if tun.Enabled && tun.Status == models.TunnelStatusActive && !hasDev {
+				t.Fatal("failed enable left an active selectable tunnel without a device")
+			}
+			if tun.Status != models.TunnelStatusDegraded {
+				t.Fatalf("tunnel status = %s, want %s", tun.Status, models.TunnelStatusDegraded)
+			}
+		})
+	}
+}
+
+func TestUpdateConfig_DataPlaneI1ProtocolSwitch_PreservesLegacyParams(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+	id, err := db.CreateServer(ctx, &models.Server{Name: "legacy-params", Host: "198.51.100.84", Protocols: map[string]any{"awg": map[string]any{
+		"installed": true, "port": 51820, "public_key": "legacy-backend-public-fixture",
+		"params": map[string]any{"s1": 15, "s2": 40, "h1": "101", "h2": "102", "h3": "103", "h4": "104"},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.EnableBackend(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	tun, err := svc.pool.GetTunnel(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, before := testDeviceIPC(t, svc, tun.ID)
+	for _, line := range []string{"s1=15\n", "s2=40\n", "h1=101\n", "h2=102\n"} {
+		if !strings.Contains(before, line) {
+			t.Fatalf("fixture missing %q before switch", line)
+		}
+	}
+	if err := svc.UpdateConfig(ctx, &models.VPNConfig{VPNDataPlaneI1Protocol: "dns"}); err != nil {
+		t.Fatal(err)
+	}
+	_, after := testDeviceIPC(t, svc, tun.ID)
+	assertDeviceIPCI1Payload(t, after, "dns")
+	for _, line := range []string{"s1=15\n", "s2=40\n", "h1=101\n", "h2=102\n"} {
+		if !strings.Contains(after, line) {
+			t.Errorf("after protocol switch missing parameter %q", line)
+		}
+	}
+}
+
+func TestUpdateConfig_DataPlaneI1ProtocolSwitch_CancellationMidReattach(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+	ids := []int64{testNewServerWithAWGParams(t, svc, "198.51.100.85", nil), testNewServerWithAWGParams(t, svc, "198.51.100.86", nil)}
+	for _, id := range ids {
+		if err := svc.EnableBackend(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	updateCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	restore := setGenerateMimicryPacketsForTest(func(ctx context.Context, p, d string, c ssh.SSHClient) (map[string]string, error) {
+		packets, err := cps.GenerateMimicryPackets(ctx, p, d, c)
+		cancel()
+		return packets, err
+	})
+	defer restore()
+	if err := svc.UpdateConfig(updateCtx, &models.VPNConfig{VPNDataPlaneI1Protocol: "dns"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		tun, err := svc.pool.GetTunnel(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		svc.mu.RLock()
+		hasDev := svc.backendDevices[tun.ID] != nil
+		svc.mu.RUnlock()
+		if tun.Enabled && tun.Status == models.TunnelStatusActive && !hasDev {
+			t.Errorf("server %d: request cancellation left detached tunnel selectable as active", id)
+		}
 	}
 }

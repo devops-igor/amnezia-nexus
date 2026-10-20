@@ -57,6 +57,9 @@ func (s *Service) reattachBackendDevicesLocked(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	detachCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+
 	for _, tun := range s.pool.ListTunnels() {
 		if tun == nil || !tun.Enabled {
 			continue
@@ -64,18 +67,7 @@ func (s *Service) reattachBackendDevicesLocked(ctx context.Context) {
 		if s.backendDevices[tun.ID] == nil {
 			continue
 		}
-		var awgParams map[string]any
-		var attachErr error
-		if s.db != nil {
-			srv, err := s.db.GetServer(ctx, tun.ServerID)
-			if err != nil || srv == nil {
-				attachErr = fmt.Errorf("failed to load server %d: %w", tun.ServerID, err)
-			} else if awgInfo, ok := srv.Protocols["awg"].(map[string]any); ok {
-				awgParams, _ = awgInfo["awg_params"].(map[string]any)
-			}
-		} else {
-			attachErr = errors.New("database not available")
-		}
+		awgParams, attachErr := s.resolveServerAWGParams(detachCtx, tun.ServerID)
 		if attachErr == nil {
 			attachErr = s.attachBackendForwarder(tun, awgParams)
 		}
@@ -92,7 +84,7 @@ func (s *Service) reattachBackendDevicesLocked(ctx context.Context) {
 				_ = oldDev.Close()
 				s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(oldDev))
 			}
-			if err := s.pool.SetTunnelStatus(ctx, tun.ServerID, models.TunnelStatusDegraded, 0); err != nil {
+			if err := s.pool.SetTunnelStatus(detachCtx, tun.ServerID, models.TunnelStatusDegraded, 0); err != nil {
 				log.Printf("[vpn] warning: failed to mark tunnel %d (server %d) degraded: %v", tun.ID, tun.ServerID, err)
 			}
 		}
@@ -290,6 +282,7 @@ func (s *Service) finishEnableBackend(
 	}
 
 	if err := s.attachBackendForwarder(tun, awgParams, prepared...); err != nil {
+		_ = pool.SetTunnelStatusWithReason(ctx, serverID, models.TunnelStatusDegraded, models.DisableReasonNone, 0)
 		return err
 	}
 
