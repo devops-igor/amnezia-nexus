@@ -446,30 +446,20 @@ func (h *Handlers) handleVPNMyConfigError(w http.ResponseWriter, err error) {
 	}
 	slog.Error("failed to generate VPN configuration", "error", err)
 
-	if isClientConfigNotFoundError(err) {
-		h.JSONError(w, http.StatusNotFound, "not_found", "Client configuration not found")
-		return
-	}
-	msgLower := strings.ToLower(err.Error())
-	if strings.Contains(msgLower, "unauthorized") || strings.Contains(msgLower, "forbidden") {
-		h.JSONError(w, http.StatusForbidden, "forbidden", "Access denied")
-		return
-	}
-	if isClientConfigBadRequestError(err) {
-		code := "bad_request"
-		detail := "Invalid configuration request"
-		if strings.Contains(msgLower, "parameter") {
-			code = "invalid_parameter"
-			detail = "Invalid configuration parameter"
-		}
-		h.JSONError(w, http.StatusBadRequest, code, detail)
-		return
-	}
-	if isClientConfigConflictError(err) {
+	switch {
+	case errors.Is(err, vpn.ErrConnectionCreatedConcurrently):
 		h.JSONError(w, http.StatusConflict, "conflict", "Connection was created concurrently; please retry")
-		return
+	case errors.Is(err, vpn.ErrUserNotFound):
+		h.JSONError(w, http.StatusNotFound, "not_found", "Client configuration not found")
+	case errors.Is(err, vpn.ErrAccessDenied):
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Access denied")
+	case errors.Is(err, vpn.ErrInvalidParameter):
+		h.JSONError(w, http.StatusBadRequest, "invalid_parameter", "Invalid configuration parameter")
+	case errors.Is(err, vpn.ErrBadRequest):
+		h.JSONError(w, http.StatusBadRequest, "bad_request", "Invalid configuration request")
+	default:
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to generate VPN configuration")
 	}
-	h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to generate VPN configuration")
 }
 
 // VPNDisconnectHandler terminates active user or session VPN connections.

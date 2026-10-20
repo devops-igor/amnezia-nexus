@@ -99,6 +99,17 @@ func TestPortalI1ProtocolSwitchAndGenerationFailure(t *testing.T) {
 		t.Fatal("invalid persisted I1 accepted")
 	}
 
+	// Empty generator result test: empty i1 from generator returns server error
+	func() {
+		restoreGen := setGenerateMimicryPacketsForTest(func(ctx context.Context, mimicry string, domain string, sshClient ssh.SSHClient) (map[string]string, error) {
+			return map[string]string{"i1": ""}, nil
+		})
+		defer restoreGen()
+		if _, err := resolvePortalI1(ctx, cfg, map[string]any{}); err == nil || !strings.Contains(err.Error(), "empty generator result") {
+			t.Fatalf("expected empty generator result error, got %v", err)
+		}
+	}()
+
 	// Injected generator failure test: verify generator error cause is preserved,
 	// and GenerateClientConfig leaves no partial row or IP allocation (M14 kill oracle).
 	func() {
@@ -522,4 +533,31 @@ func TestGenerateClientConfig_ConcurrentFirstFetch_WinnerKeyIntegrity(t *testing
 			}
 		}
 	})
+}
+
+func TestGenerateClientConfig_UserErrorClassification(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Missing user returns ErrUserNotFound
+	_, _, err = svc.GenerateClientConfig(ctx, "non-existent-user-id")
+	if !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("expected ErrUserNotFound for missing user, got %v", err)
+	}
+
+	// 2. Database error does NOT return ErrUserNotFound
+	if _, err := db.ExecContext(ctx, "DROP TABLE users"); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = svc.GenerateClientConfig(ctx, "any-user-id")
+	if err == nil {
+		t.Fatal("expected error with dropped users table")
+	}
+	if errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("database error must not be classified as ErrUserNotFound: %v", err)
+	}
 }

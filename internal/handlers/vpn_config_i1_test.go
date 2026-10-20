@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
@@ -85,7 +86,7 @@ func testVPNMyConfigHandlerConcurrentConflict(t *testing.T) {
 	}
 	h.vpnSvc = svc
 	counts := map[int]int{}
-	for round := 0; round < 20; round++ {
+	for round := 0; round < 1; round++ {
 		uid, err := db.CreateUser(ctx, &models.User{Username: fmt.Sprintf("myconfig-race-%d", round), Enabled: true})
 		if err != nil {
 			t.Fatal(err)
@@ -97,24 +98,56 @@ func testVPNMyConfigHandlerConcurrentConflict(t *testing.T) {
 			h.VPNMyConfigHandler(w, req)
 			return w
 		}
-		ws := make([]*httptest.ResponseRecorder, 4)
-		start := make(chan struct{})
-		var wg sync.WaitGroup
-		for i := range ws {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				<-start
-				ws[i] = issue()
-			}(i)
-		}
-		close(start)
-		wg.Wait()
+
+		firstEntered := make(chan struct{})
+		firstRelease := make(chan struct{})
+		secondEntered := make(chan struct{})
+		secondRelease := make(chan struct{})
+		var hookCallCount atomic.Int32
+
+		restoreHook := svc.SetPreAssignmentLockHookForTest(func() {
+			count := hookCallCount.Add(1)
+			if count == 1 {
+				close(firstEntered)
+				<-firstRelease
+			} else if count == 2 {
+				close(secondEntered)
+				<-secondRelease
+			}
+		})
+
+		var w1, w2 *httptest.ResponseRecorder
+		var wg1, wg2 sync.WaitGroup
+
+		wg1.Add(1)
+		go func() {
+			defer wg1.Done()
+			w1 = issue()
+		}()
+		<-firstEntered
+
+		wg2.Add(1)
+		go func() {
+			defer wg2.Done()
+			w2 = issue()
+		}()
+		<-secondEntered
+
+		// Release Goroutine 1 to acquire assignmentMu and commit first
+		close(firstRelease)
+		wg1.Wait()
+
+		// Release Goroutine 2 to acquire assignmentMu and detect concurrent creation
+		close(secondRelease)
+		wg2.Wait()
+
+		restoreHook()
+
 		cs, e := db.GetConnectionsByUserID(ctx, uid)
 		if e != nil || len(cs) != 1 {
 			t.Fatalf("rows=%d error=%v", len(cs), e)
 		}
-		for _, w := range ws {
+		for _, w := range []*httptest.ResponseRecorder{w1, w2} {
 			counts[w.Code]++
 			if w.Code != http.StatusOK && w.Code != http.StatusConflict {
 				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
@@ -166,9 +199,9 @@ func TestVPNMyConfigHandler_DBErrorSanitization(t *testing.T) {
 	}{
 		{
 			table:        "users",
-			expectedCode: http.StatusNotFound,
-			expectedErr:  "not_found",
-			expectedMsg:  "Client configuration not found",
+			expectedCode: http.StatusInternalServerError,
+			expectedErr:  "internal_error",
+			expectedMsg:  "Failed to generate VPN configuration",
 		},
 		{
 			table:        "user_connections",
@@ -223,6 +256,44 @@ func TestVPNMyConfigHandler_DBErrorSanitization(t *testing.T) {
 	}
 }
 
+// Proves that when user does not exist in the database (user == nil), handler returns HTTP 404 not_found
+// with the sanitized public message and no internal leakage.
+func TestVPNMyConfigHandler_UserNotFound(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	svc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.vpnSvc = svc
+
+	req := httptest.NewRequest(http.MethodGet, "/api/vpn/my-config", nil)
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+		UserID: "non-existent-user-uuid",
+		Role:   models.RoleUser,
+	}))
+	w := httptest.NewRecorder()
+	h.VPNMyConfigHandler(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d: %s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if body["error"] != "not_found" {
+		t.Errorf("expected error 'not_found', got %v", body["error"])
+	}
+	if body["detail"] != "Client configuration not found" {
+		t.Errorf("expected detail 'Client configuration not found', got %v", body["detail"])
+	}
+	for _, leak := range []string{"sql", "sqlite", "uuid", "non-existent"} {
+		if strings.Contains(strings.ToLower(w.Body.String()), leak) {
+			t.Errorf("response body leaks %q: %s", leak, w.Body.String())
+		}
+	}
+}
+
 // Boundary test verifying fixed public messages and zero diagnostic leakage for all 5 mapped statuses.
 func TestVPNMyConfigHandler_ErrorMappingBoundary(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)
@@ -237,28 +308,28 @@ func TestVPNMyConfigHandler_ErrorMappingBoundary(t *testing.T) {
 	}{
 		{
 			name:         "400 invalid parameter",
-			err:          errors.New("invalid parameter: " + secret),
+			err:          fmt.Errorf("%w: %s", vpn.ErrInvalidParameter, secret),
 			expectedCode: http.StatusBadRequest,
 			expectedErr:  "invalid_parameter",
 			expectedMsg:  "Invalid configuration parameter",
 		},
 		{
 			name:         "400 bad request",
-			err:          errors.New("malformed request: " + secret),
+			err:          fmt.Errorf("%w: %s", vpn.ErrBadRequest, secret),
 			expectedCode: http.StatusBadRequest,
 			expectedErr:  "bad_request",
 			expectedMsg:  "Invalid configuration request",
 		},
 		{
 			name:         "403 forbidden",
-			err:          errors.New("forbidden: " + secret),
+			err:          fmt.Errorf("%w: %s", vpn.ErrAccessDenied, secret),
 			expectedCode: http.StatusForbidden,
 			expectedErr:  "forbidden",
 			expectedMsg:  "Access denied",
 		},
 		{
 			name:         "404 not found",
-			err:          errors.New("user not found: " + secret),
+			err:          fmt.Errorf("%w: %s", vpn.ErrUserNotFound, secret),
 			expectedCode: http.StatusNotFound,
 			expectedErr:  "not_found",
 			expectedMsg:  "Client configuration not found",
@@ -271,11 +342,18 @@ func TestVPNMyConfigHandler_ErrorMappingBoundary(t *testing.T) {
 			expectedMsg:  "Connection was created concurrently; please retry",
 		},
 		{
-			name:         "409 conflict string",
-			err:          errors.New("connection was created concurrently; retry: " + secret),
-			expectedCode: http.StatusConflict,
-			expectedErr:  "conflict",
-			expectedMsg:  "Connection was created concurrently; please retry",
+			name:         "500 malformed persisted I1",
+			err:          errors.New("malformed persisted portal I1: " + secret),
+			expectedCode: http.StatusInternalServerError,
+			expectedErr:  "internal_error",
+			expectedMsg:  "Failed to generate VPN configuration",
+		},
+		{
+			name:         "500 empty generator result",
+			err:          errors.New("empty generator result for portal I1: " + secret),
+			expectedCode: http.StatusInternalServerError,
+			expectedErr:  "internal_error",
+			expectedMsg:  "Failed to generate VPN configuration",
 		},
 		{
 			name:         "500 internal error fallback",
