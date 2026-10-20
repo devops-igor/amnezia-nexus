@@ -3,6 +3,7 @@ package vpn
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -693,14 +694,36 @@ func TestUpdateConfig_DataPlaneI1ProtocolSwitch_NoDataRaceWithLiveTimers(t *test
 		t.Fatalf("NewVPNService: %v", err)
 	}
 	t.Cleanup(func() { closeBackendDevices(svc) })
-
-	srvID := testNewServerWithAWGParams(t, svc, "198.51.100.103", map[string]any{
-		"s1":                            15,
-		"s2":                            40,
-		"rekey_timeout":                 "1",
-		"persistent_keepalive_interval": "1",
-	})
 	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket failed: %v", err)
+	}
+	defer pc.Close()
+
+	pub, _, err := tunnel.GenerateCurve25519KeyPair()
+	if err != nil {
+		t.Fatalf("GenerateCurve25519KeyPair failed: %v", err)
+	}
+
+	awg := map[string]any{
+		"installed":  true,
+		"port":       pc.LocalAddr().(*net.UDPAddr).Port,
+		"public_key": pub,
+		"awg_params": map[string]any{
+			"rekey_timeout":                 "1",
+			"persistent_keepalive_interval": "1",
+		},
+	}
+	srvID, err := svc.db.CreateServer(ctx, &models.Server{
+		Name:      "server-live-wire",
+		Host:      "127.0.0.1",
+		Protocols: map[string]any{"awg": awg},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
 
 	if err := svc.EnableBackend(ctx, srvID); err != nil {
 		t.Fatalf("EnableBackend: %v", err)
@@ -711,21 +734,198 @@ func TestUpdateConfig_DataPlaneI1ProtocolSwitch_NoDataRaceWithLiveTimers(t *test
 		t.Fatalf("GetTunnel: %v", err)
 	}
 
-	// Switch protocol repeatedly between DNS and SIP while timers are active
-	for i := 0; i < 6; i++ {
-		proto := "dns"
-		if i%2 == 1 {
-			proto = "sip"
+	readPreambles := func(proto string) {
+		t.Helper()
+		_ = pc.SetReadDeadline(time.Now().Add(5 * time.Second))
+		seen := 0
+		buf := make([]byte, 4096)
+		for seen < 2 {
+			n, _, err := pc.ReadFrom(buf)
+			if err != nil {
+				t.Fatalf("%s received %d preambles: %v", proto, seen, err)
+			}
+			sip := strings.HasPrefix(string(buf[:n]), "REGISTER ") && strings.Contains(string(buf[:n]), "SIP/2.0")
+			dns := n >= 12 && buf[2] == 1 && buf[3] == 0 && buf[4] == 0 && buf[5] == 1
+			if (proto == "sip" && sip) || (proto == "dns" && dns) {
+				seen++
+			}
 		}
+	}
+
+	// Verify initial SIP preambles on wire (handshake + timer retransmission)
+	readPreambles("sip")
+
+	// Switch protocol repeatedly between DNS and SIP while timers are active
+	for _, proto := range []string{"dns", "sip", "dns"} {
+		svc.mu.RLock()
+		oldDev := svc.backendDevices[tun.ID]
+		svc.mu.RUnlock()
+
 		if err := svc.UpdateConfig(ctx, &models.VPNConfig{VPNDataPlaneI1Protocol: proto}); err != nil {
 			t.Fatalf("UpdateConfig(%s) failed: %v", proto, err)
 		}
-		time.Sleep(10 * time.Millisecond)
+
+		svc.mu.RLock()
+		newDev := svc.backendDevices[tun.ID]
+		svc.mu.RUnlock()
+
+		if oldDev == newDev {
+			t.Fatal("device not replaced after protocol switch")
+		}
+		if _, err := oldDev.Write(make([]byte, 20)); err == nil {
+			t.Fatal("old device not closed after protocol switch")
+		}
+
+		_, ipc := testDeviceIPC(t, svc, tun.ID)
+		assertDeviceIPCI1Payload(t, ipc, proto)
+		readPreambles(proto)
+	}
+}
+
+func TestEnableBackend_InterleavedProtocolSwitch(t *testing.T) {
+	for _, stage := range []string{"before-add", "after-add"} {
+		t.Run(stage, func(t *testing.T) {
+			ctx := context.Background()
+			db := setupTestDB(t)
+			svc, err := NewVPNService(db, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { closeBackendDevices(svc) })
+			id := testNewServerWithAWGParams(t, svc, "198.51.100.80", nil)
+			svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+			hook := func() {
+				if err := svc.UpdateConfig(ctx, &models.VPNConfig{VPNDataPlaneI1Protocol: "dns"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if stage == "before-add" {
+				svc.enableBackendPreAddTunnelHook = hook
+			} else {
+				svc.enableBackendPostAddTunnelHook = hook
+			}
+			if err := svc.EnableBackend(ctx, id); err != nil {
+				t.Fatal(err)
+			}
+			tun, err := svc.pool.GetTunnel(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored, err := db.GetVPNConfig(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, ipc := testDeviceIPC(t, svc, tun.ID)
+			t.Logf("saved=%s runtime=%s status=%s enable_error=nil", stored.DataPlaneI1Protocol(), svc.cfg.DataPlaneI1Protocol(), tun.Status)
+			assertDeviceIPCI1Payload(t, ipc, "dns")
+		})
+	}
+}
+
+func TestUpdateConfig_DataPlaneI1ProtocolSwitch_GeneratorFailureDetachesObsoleteDevice(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+	id := testNewServerWithAWGParams(t, svc, "198.51.100.81", nil)
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+	if err := svc.EnableBackend(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	tun, err := svc.pool.GetTunnel(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.RLock()
+	oldDev := svc.backendDevices[tun.ID]
+	svc.mu.RUnlock()
+
+	restore := setGenerateMimicryPacketsForTest(func(context.Context, string, string, ssh.SSHClient) (map[string]string, error) {
+		return nil, errors.New("transient generator failure")
+	})
+	err = svc.UpdateConfig(ctx, &models.VPNConfig{VPNDataPlaneI1Protocol: "dns"})
+	restore()
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	i1Final, ipcFinal := testDeviceIPC(t, svc, tun.ID)
-	assertDeviceIPCI1Payload(t, ipcFinal, "sip")
-	if !strings.HasPrefix(i1Final, "<b 0x") {
-		t.Fatalf("expected SIP I1 after final switch, got %q", i1Final)
+	degraded, err := svc.pool.GetTunnel(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if degraded.Status != models.TunnelStatusDegraded {
+		t.Fatalf("status=%s, want degraded", degraded.Status)
+	}
+
+	// Verify old device is detached and closed
+	svc.mu.RLock()
+	retainedDev := svc.backendDevices[tun.ID]
+	svc.mu.RUnlock()
+	if retainedDev != nil {
+		t.Fatalf("expected obsolete device to be removed from backendDevices, got %v", retainedDev)
+	}
+	if _, err := oldDev.Write(make([]byte, 20)); err == nil {
+		t.Fatal("expected old device to be closed after detach")
+	}
+
+	// Same configured protocol retry and the real health activation hook must not silently retain stale I1.
+	if err := svc.UpdateConfig(ctx, &models.VPNConfig{VPNDataPlaneI1Protocol: "dns"}); err != nil {
+		t.Fatal(err)
+	}
+	svc.prober.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+		return time.Millisecond, nil
+	})
+	if _, err := svc.prober.ProbeTunnel(ctx, degraded); err != nil {
+		t.Fatal(err)
+	}
+	after, err := svc.pool.GetTunnel(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != models.TunnelStatusActive {
+		t.Fatalf("status=%s, want active", after.Status)
+	}
+	_, ipc := testDeviceIPC(t, svc, tun.ID)
+	t.Logf("retained_old_device=%v config=%s after_health_activation=%s", oldDev == svc.backendDevices[tun.ID], svc.cfg.DataPlaneI1Protocol(), after.Status)
+	assertDeviceIPCI1Payload(t, ipc, "dns")
+}
+
+func TestUpdateConfig_DataPlaneI1ProtocolSameProtocol_NoReattach(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+	id := testNewServerWithAWGParams(t, svc, "198.51.100.82", nil)
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+	if err := svc.EnableBackend(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	tun, err := svc.pool.GetTunnel(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.RLock()
+	old := svc.backendDevices[tun.ID]
+	svc.mu.RUnlock()
+	calls := 0
+	restore := setGenerateMimicryPacketsForTest(func(ctx context.Context, p, d string, c ssh.SSHClient) (map[string]string, error) {
+		calls++
+		return cps.GenerateMimicryPackets(ctx, p, d, c)
+	})
+	defer restore()
+	if err := svc.UpdateConfig(ctx, &models.VPNConfig{VPNDataPlaneI1Protocol: "sip"}); err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.RLock()
+	currentDev := svc.backendDevices[tun.ID]
+	svc.mu.RUnlock()
+	if calls != 0 || old != currentDev {
+		t.Fatalf("same effective protocol unexpectedly regenerated %d times (device replaced: %v)", calls, old != currentDev)
 	}
 }

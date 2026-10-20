@@ -1505,7 +1505,7 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 	}
 
 	if previousCfg != nil && previousCfg.DataPlaneI1Protocol() != cfg.DataPlaneI1Protocol() {
-		s.reattachBackendDevicesLocked()
+		s.reattachBackendDevicesLocked(ctx)
 	}
 
 	return nil
