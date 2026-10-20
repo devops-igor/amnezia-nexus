@@ -321,7 +321,10 @@ func extractPrivateKeyFromConfig(confStr string) string {
 
 func (o *Orchestrator) dataPlaneI1Protocol(ctx context.Context) string {
 	if o != nil && o.db != nil {
-		if vpnCfg, err := o.db.GetVPNConfig(ctx); err == nil && vpnCfg != nil {
+		vpnCfg, err := o.db.GetVPNConfig(ctx)
+		if err != nil {
+			slog.WarnContext(ctx, "failed to load VPN config for data-plane I1 protocol", "err", err)
+		} else if vpnCfg != nil {
 			return vpnCfg.DataPlaneI1Protocol()
 		}
 	}

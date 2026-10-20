@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"bytes"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -436,5 +437,41 @@ func TestNewAWGClientDevice_WithI1(t *testing.T) {
 	}
 	if dev.I1() != params["i1"] {
 		t.Errorf("expected device I1 %q, got %q", params["i1"], dev.I1())
+	}
+
+	ipc, err := dev.DeviceIPC()
+	if err != nil {
+		t.Fatalf("DeviceIPC failed: %v", err)
+	}
+	if !strings.Contains(ipc, "i1=<b 0x0102030405060708>\n") {
+		t.Errorf("expected live device IPC to contain rendered i1, got:\n%s", ipc)
+	}
+}
+
+func TestNewAWGClientDevice_I1NewlineInjection(t *testing.T) {
+	pub, priv, err := GenerateCurve25519KeyPair()
+	if err != nil {
+		t.Fatalf("failed to generate keypair: %v", err)
+	}
+
+	params := map[string]any{
+		"i1": "<b 0x01>\nlisten_port=4242\nreplace_peers=true",
+	}
+
+	dev, err := NewAWGClientDevice("test-inj", "127.0.0.1:51820", priv, pub, 1340, params)
+	if err != nil {
+		t.Fatalf("NewAWGClientDevice failed: %v", err)
+	}
+	defer dev.Close()
+
+	ipc, err := dev.DeviceIPC()
+	if err != nil {
+		t.Fatalf("DeviceIPC failed: %v", err)
+	}
+	if strings.Contains(ipc, "listen_port=4242") {
+		t.Errorf("injected UAPI lines must not be present in device IPC:\n%s", ipc)
+	}
+	if dev.I1() != "" {
+		t.Errorf("expected empty I1 on newline injection, got %q", dev.I1())
 	}
 }

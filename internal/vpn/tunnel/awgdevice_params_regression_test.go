@@ -308,4 +308,30 @@ func TestBuildAWGIPCConfig_I1Parameter(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("rejects newline injection in i1", func(t *testing.T) {
+		params := map[string]any{
+			"i1": "<b 0x01>\nlisten_port=4242\nreplace_peers=true",
+		}
+		cfg := BuildAWGIPCConfigForTest("privkeyhex", "pubkeyhex", "198.51.100.1:51820", params)
+		if strings.Contains(cfg, "listen_port=4242") {
+			t.Errorf("expected newline injection to be rejected, got config:\n%s", cfg)
+		}
+		if strings.Contains(cfg, "i1=") {
+			t.Errorf("expected i1= to be omitted when containing newlines, got config:\n%s", cfg)
+		}
+	})
+
+	t.Run("deterministically handles I1 vs i1 casing", func(t *testing.T) {
+		for i := 0; i < 40; i++ {
+			params := map[string]any{
+				"I1": "<b 0xuppercase>",
+				"i1": "<b 0xlowercase>",
+			}
+			cfg := BuildAWGIPCConfigForTest("privkeyhex", "pubkeyhex", "198.51.100.1:51820", params)
+			if !strings.Contains(cfg, "i1=<b 0xlowercase>\n") {
+				t.Fatalf("run %d: expected i1=<b 0xlowercase>, got:\n%s", i, cfg)
+			}
+		}
+	})
 }

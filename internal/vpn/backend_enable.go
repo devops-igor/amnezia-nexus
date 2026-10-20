@@ -37,14 +37,9 @@ func (s *Service) restoreBackendDevices(ctx context.Context) {
 			attachErr = errors.New("database not available")
 		}
 		if attachErr == nil {
-			deviceParams, prepErr := s.prepareBackendDeviceParams(ctx, awgParams)
-			if prepErr != nil {
-				attachErr = prepErr
-			} else {
-				s.mu.Lock()
-				attachErr = s.attachBackendForwarder(tun, deviceParams)
-				s.mu.Unlock()
-			}
+			s.mu.Lock()
+			attachErr = s.attachBackendForwarder(tun, awgParams)
+			s.mu.Unlock()
 		}
 		if attachErr != nil {
 			log.Printf("[vpn] warning: failed to restore data plane for tunnel %d (server %d): %v", tun.ID, tun.ServerID, attachErr)
@@ -86,6 +81,12 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 
 	pub, port, awgParams, err := s.resolveBackendCredentials(ctx, serverID, server)
 	if err != nil {
+		return err
+	}
+
+	// Validate I1 parameter preparation early (before pool.AddTunnel) so that
+	// a generator failure aborts immediately without mutating pool or remote peers (CodeRabbit #1).
+	if _, err := s.prepareBackendDeviceParams(ctx, awgParams); err != nil {
 		return err
 	}
 
@@ -157,30 +158,38 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 	}
 
-	deviceParams, err := s.prepareBackendDeviceParams(ctx, awgParams)
-	if err != nil {
-		return err
-	}
-
-	return s.finishEnableBackend(ctx, pool, tun, deviceParams, serverID, startEpoch)
+	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, startEpoch)
 }
 
 func (s *Service) dataPlaneI1Protocol() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.cfg != nil {
-		return s.cfg.DataPlaneI1Protocol()
-	}
-	return (*models.VPNConfig)(nil).DataPlaneI1Protocol()
+	return s.cfg.DataPlaneI1Protocol()
 }
 
 func (s *Service) prepareBackendDeviceParams(ctx context.Context, awgParams map[string]any) (map[string]any, error) {
+	proto := s.dataPlaneI1Protocol()
+	return s.buildBackendDeviceParams(ctx, proto, awgParams)
+}
+
+func (s *Service) prepareBackendDeviceParamsLocked(awgParams map[string]any) (map[string]any, error) {
+	proto := s.cfg.DataPlaneI1Protocol()
+	return s.buildBackendDeviceParams(context.Background(), proto, awgParams)
+}
+
+// buildBackendDeviceParams constructs the device parameters used by AWGClientDevice.
+// The configured data plane I1 protocol (SIP by default, or DNS) always overrides
+// any existing backend I1 setting stored in the database.
+func (s *Service) buildBackendDeviceParams(ctx context.Context, proto string, awgParams map[string]any) (map[string]any, error) {
 	deviceParams := make(map[string]any, len(awgParams)+1)
 	for k, v := range awgParams {
+		// Data plane I1 setting always overrides stored backend I1 (any casing/variant)
+		if tunnel.NormalizeAWGKey(k) == "i1" {
+			continue
+		}
 		deviceParams[k] = v
 	}
 
-	proto := s.dataPlaneI1Protocol()
 	mimicryPacketsMu.RLock()
 	genFn := generateMimicryPackets
 	mimicryPacketsMu.RUnlock()
@@ -486,6 +495,11 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 		return nil
 	}
 
+	deviceParams, prepErr := s.prepareBackendDeviceParamsLocked(awgParams)
+	if prepErr != nil {
+		return fmt.Errorf("failed to prepare backend device parameters for server %d: %w", tun.ServerID, prepErr)
+	}
+
 	// Detach and close previous device for this tunnel to prevent leaks
 	if s.backendDevices != nil {
 		if oldDev, ok := s.backendDevices[tun.ID]; ok {
@@ -502,17 +516,17 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 	}
 
 	beMTU := 1280
-	if awgParams != nil {
-		if mVal, ok := awgParams["mtu"].(string); ok && mVal != "" {
+	if deviceParams != nil {
+		if mVal, ok := deviceParams["mtu"].(string); ok && mVal != "" {
 			if parsed, err := strconv.Atoi(mVal); err == nil && parsed > 0 {
 				beMTU = parsed
 			}
-		} else if mInt, ok := awgParams["mtu"].(int); ok && mInt > 0 {
+		} else if mInt, ok := deviceParams["mtu"].(int); ok && mInt > 0 {
 			beMTU = mInt
 		}
 	}
 
-	dev, devErr := tunnel.NewAWGClientDevice(fmt.Sprintf("awg-be-%d", tun.ServerID), tun.Endpoint, tun.PrivateKey, tun.PublicKey, beMTU, awgParams)
+	dev, devErr := tunnel.NewAWGClientDevice(fmt.Sprintf("awg-be-%d", tun.ServerID), tun.Endpoint, tun.PrivateKey, tun.PublicKey, beMTU, deviceParams)
 	if devErr != nil {
 		return fmt.Errorf("failed to create backend AWG device for server %d: %w", tun.ServerID, devErr)
 	}
