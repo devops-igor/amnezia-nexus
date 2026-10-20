@@ -26,6 +26,7 @@ import (
 type AWGClientDevice struct {
 	name            string
 	mtu             int
+	i1Mu            sync.RWMutex
 	i1              string
 	vtun            *VirtualTUN
 	dev             *device.Device
@@ -160,7 +161,27 @@ func (d *AWGClientDevice) I1() string {
 	if d == nil {
 		return ""
 	}
+	d.i1Mu.RLock()
+	defer d.i1Mu.RUnlock()
 	return d.i1
+}
+
+// SetI1 updates the device's I1 preamble via UAPI on the live running device.
+func (d *AWGClientDevice) SetI1(newI1 string) error {
+	if d == nil || d.dev == nil {
+		return errors.New("device is nil")
+	}
+	newI1 = strings.TrimSpace(newI1)
+	if strings.ContainsAny(newI1, "\r\n") {
+		return errors.New("i1 cannot contain carriage returns or newlines")
+	}
+	if err := d.dev.IpcSet("i1=" + newI1 + "\n"); err != nil {
+		return fmt.Errorf("failed to update device i1: %w", err)
+	}
+	d.i1Mu.Lock()
+	d.i1 = newI1
+	d.i1Mu.Unlock()
+	return nil
 }
 
 // DeviceIPC returns the device's current UAPI configuration string.

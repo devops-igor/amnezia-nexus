@@ -1504,6 +1504,20 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 		s.stickyMgr = loadbalancer.NewStickySessionManager(s.db, newLB, caps)
 	}
 
+	if previousCfg != nil && previousCfg.DataPlaneI1Protocol() != cfg.DataPlaneI1Protocol() {
+		newProto := cfg.DataPlaneI1Protocol()
+		mimicryPacketsMu.RLock()
+		genFn := generateMimicryPackets
+		mimicryPacketsMu.RUnlock()
+		if packets, err := genFn(ctx, newProto, "", nil); err == nil && packets != nil && packets["i1"] != "" {
+			for _, dev := range s.backendDevices {
+				if awgDev, ok := dev.(*tunnel.AWGClientDevice); ok {
+					_ = awgDev.SetI1(packets["i1"])
+				}
+			}
+		}
+	}
+
 	return nil
 }
 

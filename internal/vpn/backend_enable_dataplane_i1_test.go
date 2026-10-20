@@ -462,3 +462,121 @@ func TestAuditSecondGenerationMustNotOrphan(t *testing.T) {
 		t.Fatalf("expected enabled tunnel with attached device, tun=%v hasDevice=%v", tun, hasDevice)
 	}
 }
+
+func TestBuildBackendDeviceParams_RejectMissingOrEmptyI1(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	testCases := []struct {
+		name    string
+		packets map[string]string
+	}{
+		{
+			name:    "nil map",
+			packets: nil,
+		},
+		{
+			name:    "empty map",
+			packets: map[string]string{},
+		},
+		{
+			name:    "empty string i1",
+			packets: map[string]string{"i1": ""},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			restore := setGenerateMimicryPacketsForTest(func(ctx context.Context, mimicry, domain string, sshClient ssh.SSHClient) (map[string]string, error) {
+				return tc.packets, nil
+			})
+			defer restore()
+
+			awgParams := map[string]any{"s1": 15, "s2": 40}
+			params, err := svc.buildBackendDeviceParams(ctx, "sip", awgParams)
+			if err == nil {
+				t.Fatalf("expected error on %s, got nil and params: %v", tc.name, params)
+			}
+			if params != nil {
+				t.Fatalf("expected nil params on error, got: %v", params)
+			}
+			if !strings.Contains(err.Error(), "generator returned empty data plane I1 packet for protocol \"sip\"") {
+				t.Fatalf("expected specific fail-closed error message, got: %v", err)
+			}
+
+			// Also verify via prepareBackendDeviceParams
+			prepParams, prepErr := svc.prepareBackendDeviceParams(ctx, awgParams)
+			if prepErr == nil || prepParams != nil {
+				t.Fatalf("prepareBackendDeviceParams expected error and nil, got params=%v err=%v", prepParams, prepErr)
+			}
+		})
+	}
+}
+
+func TestUpdateConfig_DataPlaneI1ProtocolSwitch_UpdatesRunningBackendDevices(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+
+	srvID := testNewServerWithAWGParams(t, svc, "198.51.100.99", map[string]any{"s1": 15, "s2": 40})
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("EnableBackend: %v", err)
+	}
+
+	tun, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel: %v", err)
+	}
+
+	// 1. Initially attached device has default SIP I1
+	i1Initial, ipcInitial := testDeviceIPC(t, svc, tun.ID)
+	assertDeviceIPCI1Payload(t, ipcInitial, "sip")
+	if !strings.HasPrefix(i1Initial, "<b 0x") {
+		t.Fatalf("expected initial SIP prefix, got %q", i1Initial)
+	}
+
+	// 2. Switch protocol to DNS via UpdateConfig
+	cfgWithDNS := &models.VPNConfig{
+		VPNDataPlaneI1Protocol: "dns",
+	}
+	if err := svc.UpdateConfig(ctx, cfgWithDNS); err != nil {
+		t.Fatalf("UpdateConfig(dns) failed: %v", err)
+	}
+
+	// Read dev.DeviceIPC() and assert that live device IPC now contains the DNS I1 packet!
+	i1DNS, ipcDNS := testDeviceIPC(t, svc, tun.ID)
+	assertDeviceIPCI1Payload(t, ipcDNS, "dns")
+	if !strings.HasPrefix(i1DNS, "<r 2><b 0x") {
+		t.Fatalf("expected updated DNS I1 on device, got %q", i1DNS)
+	}
+	if !strings.Contains(ipcDNS, "i1="+i1DNS+"\n") {
+		t.Fatalf("expected live device IPC to contain updated DNS i1 line, got:\n%s", ipcDNS)
+	}
+
+	// 3. Switch back to SIP
+	cfgWithSIP := &models.VPNConfig{
+		VPNDataPlaneI1Protocol: "sip",
+	}
+	if err := svc.UpdateConfig(ctx, cfgWithSIP); err != nil {
+		t.Fatalf("UpdateConfig(sip) failed: %v", err)
+	}
+
+	i1SIP, ipcSIP := testDeviceIPC(t, svc, tun.ID)
+	assertDeviceIPCI1Payload(t, ipcSIP, "sip")
+	if !strings.HasPrefix(i1SIP, "<b 0x") {
+		t.Fatalf("expected switched back SIP I1 on device, got %q", i1SIP)
+	}
+	if !strings.Contains(ipcSIP, "i1="+i1SIP+"\n") {
+		t.Fatalf("expected live device IPC to contain switched back SIP i1 line, got:\n%s", ipcSIP)
+	}
+}

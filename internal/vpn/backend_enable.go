@@ -199,9 +199,11 @@ func (s *Service) buildBackendDeviceParams(ctx context.Context, proto string, aw
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate data plane I1 packet: %w", err)
 	}
-	if i1Val, ok := packets["i1"]; ok && i1Val != "" {
-		deviceParams["i1"] = i1Val
+	i1Val, ok := packets["i1"]
+	if !ok || i1Val == "" {
+		return nil, fmt.Errorf("generator returned empty data plane I1 packet for protocol %q", proto)
 	}
+	deviceParams["i1"] = i1Val
 	return deviceParams, nil
 }
 
