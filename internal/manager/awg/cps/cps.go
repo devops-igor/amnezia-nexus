@@ -44,13 +44,19 @@ func ParseCPSBlob(tagStr string) ([]byte, error) {
 	rCount := 0
 	if strings.HasPrefix(s, "<r ") {
 		rEnd := strings.Index(s, ">")
-		if rEnd != -1 {
-			nStr := strings.TrimSpace(s[3:rEnd])
-			if n, err := strconv.Atoi(nStr); err == nil && n >= 0 {
-				rCount = n
-			}
-			s = strings.TrimSpace(s[rEnd+1:])
+		if rEnd == -1 {
+			return nil, fmt.Errorf("unclosed <r tag: %s", tagStr)
 		}
+		nStr := strings.TrimSpace(s[3:rEnd])
+		n, err := strconv.Atoi(nStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid random prefix count %q: %w", nStr, err)
+		}
+		rCount = n
+		if rCount <= 0 || rCount > 65535 {
+			return nil, fmt.Errorf("invalid random prefix count %d (must be 1..65535)", rCount)
+		}
+		s = strings.TrimSpace(s[rEnd+1:])
 	}
 
 	if strings.HasPrefix(s, "<b 0x") && strings.HasSuffix(s, ">") {

@@ -188,6 +188,70 @@ func TestCPSBlobConversion(t *testing.T) {
 	}
 }
 
+func TestParseCPSBlob_RandomPrefixBounds(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+		wantLen int
+	}{
+		{
+			name:    "max int64 overflow does not panic",
+			input:   "<r 9223372036854775807><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "exceeds 65535",
+			input:   "<r 65536><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "zero count",
+			input:   "<r 0><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "negative count",
+			input:   "<r -1><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "valid count 2",
+			input:   "<r 2><b 0x11223344>",
+			wantErr: false,
+			wantLen: 6,
+		},
+		{
+			name:    "non-numeric count",
+			input:   "<r abc><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "unclosed r tag",
+			input:   "<r 2<b 0x1122>",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseCPSBlob(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ParseCPSBlob(%q) expected error, got nil (len=%d)", tt.input, len(got))
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("ParseCPSBlob(%q) unexpected error: %v", tt.input, err)
+				}
+				if len(got) != tt.wantLen {
+					t.Errorf("ParseCPSBlob(%q) len = %d, want %d", tt.input, len(got), tt.wantLen)
+				}
+			}
+		})
+	}
+}
+
 func TestGenerateCPSPackets(t *testing.T) {
 	// Lite
 	litePackets, err := GenerateCPSPackets("lite", "example.com")

@@ -55,7 +55,7 @@ func simulateWire(tagStr string) ([]byte, error) {
 				return nil, errors.New("missing count in r tag")
 			}
 			n, err := strconv.Atoi(parts[1])
-			if err != nil || n < 0 {
+			if err != nil || n <= 0 || n > 65535 {
 				return nil, fmt.Errorf("invalid count in r tag: %s", parts[1])
 			}
 			rnd := make([]byte, n)
@@ -69,6 +69,54 @@ func simulateWire(tagStr string) ([]byte, error) {
 		remaining = remaining[end+1:]
 	}
 	return wire, nil
+}
+
+// verifyDNSStrictFraming checks that pkt is a valid DNS query with strict framing and no trailing bytes.
+func verifyDNSStrictFraming(pkt []byte, expectedDomain string) error {
+	var msg dnsmessage.Message
+	if err := msg.Unpack(pkt); err != nil {
+		return fmt.Errorf("strict dnsmessage.Unpack failed: %w", err)
+	}
+
+	// Unpack alone ignores trailing bytes. Repack to verify full consumption.
+	packed, err := msg.Pack()
+	if err != nil {
+		return fmt.Errorf("dnsmessage.Pack failed: %w", err)
+	}
+	if len(packed) != len(pkt) {
+		return fmt.Errorf("dns framing violation: wire length (%d) != packed message length (%d) (trailing bytes detected)", len(pkt), len(packed))
+	}
+
+	// Assert !Header.Response (Query, QR=0)
+	if msg.Header.Response {
+		return errors.New("expected DNS query (!Header.Response), got response")
+	}
+
+	// Assert QDCOUNT == 1
+	if len(msg.Questions) != 1 {
+		return fmt.Errorf("expected QDCOUNT == 1, got %d questions", len(msg.Questions))
+	}
+
+	// Assert ANCOUNT == 0
+	if len(msg.Answers) != 0 {
+		return fmt.Errorf("expected ANCOUNT == 0, got %d answers", len(msg.Answers))
+	}
+
+	// Assert valid question name matching target domain
+	if expectedDomain != "" {
+		qName := strings.TrimSuffix(msg.Questions[0].Name.String(), ".")
+		if qName != expectedDomain {
+			return fmt.Errorf("expected QNAME %q, got %q", expectedDomain, qName)
+		}
+		if msg.Questions[0].Type != dnsmessage.TypeA {
+			return fmt.Errorf("expected TypeA (1), got %v", msg.Questions[0].Type)
+		}
+		if msg.Questions[0].Class != dnsmessage.ClassINET {
+			return fmt.Errorf("expected ClassINET (1), got %v", msg.Questions[0].Class)
+		}
+	}
+
+	return nil
 }
 
 func TestWireLayout_DNS_StrictFraming(t *testing.T) {
@@ -151,57 +199,51 @@ func TestWireLayout_DNS_StrictFraming(t *testing.T) {
 				t.Fatalf("wire length (%d) != ParseCPSBlob length (%d)", len(wire), len(parsed))
 			}
 
-			// 2. Strictly parse wire bytes using dnsmessage.Message.Unpack
-			var msg dnsmessage.Message
-			if err := msg.Unpack(wire); err != nil {
-				t.Fatalf("strict dnsmessage.Unpack failed on wire bytes: %v", err)
+			// 2. Strictly verify wire bytes framing and no trailing bytes
+			if err := verifyDNSStrictFraming(wire, tt.expectedDomain); err != nil {
+				t.Fatalf("strict framing verification failed on wire bytes: %v", err)
 			}
 
-			// Assert !Header.Response (Query, QR=0)
-			if msg.Header.Response {
-				t.Errorf("expected DNS query (!Header.Response), got response")
-			}
-
-			// Assert QDCOUNT == 1
-			if len(msg.Questions) != 1 {
-				t.Errorf("expected QDCOUNT == 1, got %d questions", len(msg.Questions))
-			}
-
-			// Assert ANCOUNT == 0
-			if len(msg.Answers) != 0 {
-				t.Errorf("expected ANCOUNT == 0, got %d answers", len(msg.Answers))
-			}
-
-			// Assert valid question name matching target domain
-			if len(msg.Questions) == 1 {
-				qName := strings.TrimSuffix(msg.Questions[0].Name.String(), ".")
-				if qName != tt.expectedDomain {
-					t.Errorf("expected QNAME %q, got %q", tt.expectedDomain, qName)
-				}
-				if msg.Questions[0].Type != dnsmessage.TypeA {
-					t.Errorf("expected TypeA (1), got %v", msg.Questions[0].Type)
-				}
-				if msg.Questions[0].Class != dnsmessage.ClassINET {
-					t.Errorf("expected ClassINET (1), got %v", msg.Questions[0].Class)
-				}
-			}
-
-			// 3. Also verify that ParseCPSBlob result unpacks cleanly as identical DNS query
-			var parsedMsg dnsmessage.Message
-			if err := parsedMsg.Unpack(parsed); err != nil {
-				t.Fatalf("strict dnsmessage.Unpack failed on ParseCPSBlob bytes: %v", err)
-			}
-			if parsedMsg.Header.Response {
-				t.Errorf("expected parsed DNS query (!Header.Response), got response")
-			}
-			if len(parsedMsg.Questions) != 1 {
-				t.Errorf("expected parsed QDCOUNT == 1, got %d questions", len(parsedMsg.Questions))
-			}
-			if len(parsedMsg.Answers) != 0 {
-				t.Errorf("expected parsed ANCOUNT == 0, got %d answers", len(parsedMsg.Answers))
+			// 3. Also verify that ParseCPSBlob result passes strict framing verification
+			if err := verifyDNSStrictFraming(parsed, tt.expectedDomain); err != nil {
+				t.Fatalf("strict framing verification failed on ParseCPSBlob bytes: %v", err)
 			}
 		})
 	}
+
+	t.Run("trailing junk bytes rejected", func(t *testing.T) {
+		pkts, err := GenerateCPSPackets("lite", "example.com")
+		if err != nil {
+			t.Fatalf("packet generation failed: %v", err)
+		}
+		wire, err := simulateWire(pkts["i1"])
+		if err != nil {
+			t.Fatalf("simulateWire failed: %v", err)
+		}
+
+		// Clean wire must pass strict framing verification
+		if err := verifyDNSStrictFraming(wire, "example.com"); err != nil {
+			t.Fatalf("expected clean wire to pass verification: %v", err)
+		}
+
+		// Append trailing junk bytes (e.g. 2 extra bytes)
+		wireWithJunk := append(wire, 0xde, 0xad)
+
+		// dnsmessage.Message.Unpack alone does NOT reject trailing junk bytes
+		var msg dnsmessage.Message
+		if err := msg.Unpack(wireWithJunk); err != nil {
+			t.Fatalf("dnsmessage.Unpack unexpectedly returned error on trailing bytes: %v", err)
+		}
+
+		// Strict framing verification MUST detect and reject trailing junk bytes
+		err = verifyDNSStrictFraming(wireWithJunk, "example.com")
+		if err == nil {
+			t.Fatalf("expected verifyDNSStrictFraming to reject wire with trailing junk bytes, got nil")
+		}
+		if !strings.Contains(err.Error(), "trailing bytes detected") {
+			t.Errorf("expected error to mention trailing bytes, got: %v", err)
+		}
+	})
 }
 
 func TestWireLayout_AllProfiles_LengthEquivalence(t *testing.T) {
@@ -264,6 +306,9 @@ func TestSimulateWire_Errors(t *testing.T) {
 		{"unclosed tag", "<r 2", true},
 		{"invalid r count non-numeric", "<r abc><b 0x01>", true},
 		{"negative r count", "<r -1><b 0x01>", true},
+		{"zero r count", "<r 0><b 0x01>", true},
+		{"overflow r count", "<r 65536><b 0x01>", true},
+		{"huge r count", "<r 9223372036854775807><b 0x01>", true},
 		{"missing r count", "<r ><b 0x01>", true},
 		{"unknown tag", "<unknown 123>", true},
 	}
