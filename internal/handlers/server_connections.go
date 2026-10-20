@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
@@ -809,5 +810,21 @@ func (h *Handlers) handleClientConfigError(w http.ResponseWriter, err error) {
 		h.JSONError(w, http.StatusBadRequest, code, err.Error())
 		return
 	}
+	if isClientConfigConflictError(err) {
+		h.JSONError(w, http.StatusConflict, "conflict", err.Error())
+		return
+	}
 	h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to get config: "+err.Error())
+}
+
+func isClientConfigConflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, vpn.ErrConnectionCreatedConcurrently) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection was created concurrently") ||
+		strings.Contains(msg, "conflict detected in connection registration")
 }

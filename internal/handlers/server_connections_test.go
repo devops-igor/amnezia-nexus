@@ -16,6 +16,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 )
 
 func TestServerConnectionsHandlers(t *testing.T) {
@@ -899,6 +900,42 @@ func TestServerConnectionsConfig_ErrorDifferentiation(t *testing.T) {
 			if got != tc.want {
 				t.Errorf("isClientConfigBadRequestError(%v) = %v; want %v", tc.err, got, tc.want)
 			}
+		}
+	})
+
+	t.Run("Unit: isClientConfigConflictError", func(t *testing.T) {
+		tests := []struct {
+			err  error
+			want bool
+		}{
+			{nil, false},
+			{vpn.ErrConnectionCreatedConcurrently, true},
+			{errors.New("connection was created concurrently; retry"), true},
+			{errors.New("conflict detected in connection registration"), true},
+			{errors.New("client not found"), false},
+			{errors.New("bad parameter"), false},
+			{errors.New("database locked"), false},
+		}
+
+		for _, tc := range tests {
+			got := isClientConfigConflictError(tc.err)
+			if got != tc.want {
+				t.Errorf("isClientConfigConflictError(%v) = %v; want %v", tc.err, got, tc.want)
+			}
+		}
+	})
+
+	t.Run("Unit: handleClientConfigError Conflict", func(t *testing.T) {
+		h, _, _ := setupTestHandlers(t)
+		w := httptest.NewRecorder()
+		h.handleClientConfigError(w, errors.New("connection was created concurrently; retry"))
+		if w.Code != http.StatusConflict {
+			t.Fatalf("expected 409 Conflict, got %d", w.Code)
+		}
+		var resp map[string]any
+		_ = json.NewDecoder(w.Body).Decode(&resp)
+		if resp["error"] != "conflict" {
+			t.Fatalf("expected error='conflict', got %v", resp["error"])
 		}
 	})
 

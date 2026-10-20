@@ -388,6 +388,7 @@ type EnrichedVPNSession struct {
 
 // VPNConfig holds runtime configuration for the built-in VPN service.
 type VPNConfig struct {
+	VPNDataPlaneI1Protocol string                 `json:"vpn_data_plane_i1_protocol,omitempty"`
 	Algorithm              LoadBalancingAlgorithm `json:"algorithm"`
 	Weights                map[int64]int          `json:"weights"` // server_id -> weight (1-100)
 	HealthThresholdMS      int                    `json:"health_threshold_ms"`

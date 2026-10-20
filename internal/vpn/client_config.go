@@ -6,12 +6,72 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
+)
+
+var (
+	mimicryPacketsMu       sync.RWMutex
+	generateMimicryPackets = cps.GenerateMimicryPackets
+
+	preAssignmentHookMu          sync.RWMutex
+	preAssignmentLockHookForTest func()
+)
+
+func setGenerateMimicryPacketsForTest(fn func(ctx context.Context, mimicry string, domain string, sshClient ssh.SSHClient) (map[string]string, error)) func() {
+	mimicryPacketsMu.Lock()
+	orig := generateMimicryPackets
+	generateMimicryPackets = fn
+	mimicryPacketsMu.Unlock()
+	return func() {
+		mimicryPacketsMu.Lock()
+		generateMimicryPackets = orig
+		mimicryPacketsMu.Unlock()
+	}
+}
+
+// SetPreAssignmentLockHookForTest installs a test hook called after client keypair
+// generation and immediately before acquiring assignmentMu in renderClientConfigForConnection.
+func SetPreAssignmentLockHookForTest(fn func()) func() {
+	preAssignmentHookMu.Lock()
+	orig := preAssignmentLockHookForTest
+	preAssignmentLockHookForTest = fn
+	preAssignmentHookMu.Unlock()
+	return func() {
+		preAssignmentHookMu.Lock()
+		preAssignmentLockHookForTest = orig
+		preAssignmentHookMu.Unlock()
+	}
+}
+
+// SetPreAssignmentLockHookForTest installs a test hook on Service.
+func (s *Service) SetPreAssignmentLockHookForTest(fn func()) func() {
+	return SetPreAssignmentLockHookForTest(fn)
+}
+
+var (
+	// ErrConnectionCreatedConcurrently is returned when client config generation raced
+	// with a concurrent creation of the user's connection while awgConn was nil.
+	ErrConnectionCreatedConcurrently = errors.New("connection was created concurrently; retry")
+
+	// ErrUserNotFound is returned when the target user does not exist in the database.
+	ErrUserNotFound = errors.New("user not found")
+
+	// ErrBadRequest indicates an invalid or unsupported client configuration request.
+	ErrBadRequest = errors.New("invalid client configuration request")
+
+	// ErrInvalidParameter indicates an invalid client configuration parameter.
+	ErrInvalidParameter = errors.New("invalid client configuration parameter")
+
+	// ErrAccessDenied indicates forbidden access to the client configuration.
+	ErrAccessDenied = errors.New("access denied")
 )
 
 // GenerateUserClientConfig is an alias for GenerateClientConfig for API clarity.
@@ -189,8 +249,11 @@ func (s *Service) GenerateClientConfigForConnection(ctx context.Context, userID 
 	}
 
 	user, err := db.GetUser(ctx, userID)
-	if err != nil || user == nil {
-		return "", "", fmt.Errorf("user not found: %w", err)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get user: %w", err)
+	}
+	if user == nil {
+		return "", "", ErrUserNotFound
 	}
 
 	conn, err := db.GetConnection(ctx, connectionID)
@@ -226,8 +289,11 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 	}
 
 	user, err := db.GetUser(ctx, userID)
-	if err != nil || user == nil {
-		return "", "", fmt.Errorf("user not found: %w", err)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get user: %w", err)
+	}
+	if user == nil {
+		return "", "", ErrUserNotFound
 	}
 
 	awgConn := findAWGConnection(ctx, db, user)
@@ -258,12 +324,29 @@ func (s *Service) renderClientConfigForConnection(
 		return "", "", err
 	}
 
+	preAssignmentHookMu.RLock()
+	hook := preAssignmentLockHookForTest
+	preAssignmentHookMu.RUnlock()
+	if hook != nil {
+		hook()
+	}
+
 	s.assignmentMu.Lock()
 	defer s.assignmentMu.Unlock()
 	if err := reservePersistedClientIPs(ctx, db, s.ipam); err != nil {
 		return "", "", fmt.Errorf("restore client IP assignments: %w", err)
 	}
 	clientParams := buildClientParams(awgConn, p)
+	if target := refreshPersistedPortalI1(ctx, db, user, awgConn, isExplicit, clientParams); target != nil && awgConn == nil {
+		// A concurrent first fetch created the connection after this request
+		// built its keypair. Do not overwrite that connection's keys.
+		return "", "", ErrConnectionCreatedConcurrently
+	}
+	i1, err := resolvePortalI1(ctx, cfg, clientParams)
+	if err != nil {
+		return "", "", err
+	}
+	awgParams.I1 = i1
 	_, hadLease := s.ipam.GetAssignedIP(p.clientPub)
 	assignedIP, err := s.resolveAssignedIP(clientParams, cfg, p.clientPub)
 	if err != nil {
@@ -317,15 +400,7 @@ func (s *Service) renderClientConfigForConnection(
 		ContentPaddingAddition: p.cpAdd,
 	}
 
-	clientMTU := "1280"
-	if awgConn != nil && len(awgConn.ClientParams) > 0 {
-		if m := getStringParam(awgConn.ClientParams, "mtu"); m != "" {
-			clientMTU = m
-		}
-	}
-	if clientMTU == "1280" && awgParams != nil && awgParams.MTU != "" {
-		clientMTU = awgParams.MTU
-	}
+	clientMTU := resolveClientMTU(awgConn, awgParams)
 
 	configStr := awg.RenderClientConfig(
 		p.clientPriv,
@@ -345,6 +420,68 @@ func (s *Service) renderClientConfigForConnection(
 		filename = fmt.Sprintf("%s.conf", awgConn.Name)
 	}
 	return configStr, filename, nil
+}
+
+func refreshPersistedPortalI1(ctx context.Context, db *database.DB, user *models.User, awgConn *models.UserConnection, isExplicit bool, clientParams map[string]any) *models.UserConnection {
+	targetConn := awgConn
+	if targetConn == nil && !isExplicit {
+		if found := findAWGConnection(ctx, db, user); found != nil {
+			targetConn = found
+		}
+	}
+	if targetConn == nil || targetConn.ID == "" {
+		return targetConn
+	}
+	freshConn, err := db.GetConnection(ctx, targetConn.ID)
+	if err != nil || freshConn == nil || freshConn.ClientParams == nil {
+		return targetConn
+	}
+	if freshI1, ok := freshConn.ClientParams["portal_i1"]; ok && freshI1 != nil {
+		clientParams["portal_i1"] = freshI1
+	}
+	return targetConn
+}
+
+func resolveClientMTU(awgConn *models.UserConnection, awgParams *awg.AWGParams) string {
+	if awgConn != nil && len(awgConn.ClientParams) > 0 {
+		if m := getStringParam(awgConn.ClientParams, "mtu"); m != "" {
+			return m
+		}
+	}
+	if awgParams != nil && awgParams.MTU != "" {
+		return awgParams.MTU
+	}
+	return "1280"
+}
+
+func resolvePortalI1(ctx context.Context, cfg *models.VPNConfig, clientParams map[string]any) (string, error) {
+	if err := cfg.ValidateDataPlaneI1Protocol(); err != nil {
+		return "", err
+	}
+	i1, exists := clientParams["portal_i1"]
+	if !exists {
+		if err := ctx.Err(); err != nil {
+			return "", fmt.Errorf("generate portal I1: %w", err)
+		}
+		mimicryPacketsMu.RLock()
+		genFn := generateMimicryPackets
+		mimicryPacketsMu.RUnlock()
+		packets, err := genFn(ctx, cfg.DataPlaneI1Protocol(), "", nil)
+		if err != nil {
+			return "", fmt.Errorf("generate portal I1: %w", err)
+		}
+		genI1, ok := packets["i1"]
+		if !ok || genI1 == "" {
+			return "", errors.New("empty generator result for portal I1")
+		}
+		clientParams["portal_i1"] = genI1
+		return genI1, nil
+	}
+	value, ok := i1.(string)
+	if !ok || value == "" {
+		return "", errors.New("malformed persisted portal I1")
+	}
+	return value, nil
 }
 
 func buildClientParams(awgConn *models.UserConnection, p *clientConfigParameters) map[string]any {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -227,6 +228,7 @@ type vpnConfigPresence struct {
 	publicEndpoint bool
 	randomTrailers bool
 	disableCookies bool
+	dataPlaneI1    bool
 }
 
 // hasRawKey reports whether the caller sent the named JSON key, matching the
@@ -249,6 +251,9 @@ func hasRawKey(raw map[string]json.RawMessage, name string) bool {
 func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, present vpnConfigPresence) {
 	if current == nil || cfg == nil {
 		return
+	}
+	if !present.dataPlaneI1 {
+		cfg.VPNDataPlaneI1Protocol = current.VPNDataPlaneI1Protocol
 	}
 	if cfg.H1.IsZero() && cfg.S1 == 0 {
 		cfg.H1, cfg.H2, cfg.H3, cfg.H4 = current.H1, current.H2, current.H3, current.H4
@@ -347,9 +352,20 @@ func (h *Handlers) VPNUpdateConfigHandler(w http.ResponseWriter, r *http.Request
 		publicEndpoint: hasRawKey(raw, "public_endpoint"),
 		randomTrailers: hasRawKey(raw, "random_trailers"),
 		disableCookies: hasRawKey(raw, "disable_cookies"),
+		dataPlaneI1:    hasRawKey(raw, "vpn_data_plane_i1_protocol"),
 	}
 
 	ctx := r.Context()
+	if present.dataPlaneI1 {
+		if cfg.VPNDataPlaneI1Protocol == "" {
+			h.JSONError(w, http.StatusBadRequest, "validation_failed", "invalid vpn_data_plane_i1_protocol: expected sip or dns")
+			return
+		}
+		if err := cfg.ValidateDataPlaneI1Protocol(); err != nil {
+			h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
+			return
+		}
+	}
 	if h.vpnSvc != nil {
 		if current, err := h.vpnSvc.GetConfig(ctx); err == nil && current != nil {
 			mergeVPNConfig(current, &cfg, present)
@@ -409,7 +425,7 @@ func (h *Handlers) VPNMyConfigHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to generate VPN configuration")
+		h.handleVPNMyConfigError(w, err)
 		return
 	}
 
@@ -420,6 +436,30 @@ func (h *Handlers) VPNMyConfigHandler(w http.ResponseWriter, r *http.Request) {
 		"filename": filename,
 		"vpn_link": vpnLink,
 	})
+}
+
+// handleVPNMyConfigError writes a sanitized error response for VPNMyConfigHandler (/api/vpn/my-config),
+// preserving 400/403/404/409/500 status and code mappings without leaking internal error details (CWE-209).
+func (h *Handlers) handleVPNMyConfigError(w http.ResponseWriter, err error) {
+	if err == nil {
+		return
+	}
+	slog.Error("failed to generate VPN configuration", "error", err)
+
+	switch {
+	case errors.Is(err, vpn.ErrConnectionCreatedConcurrently):
+		h.JSONError(w, http.StatusConflict, "conflict", "Connection was created concurrently; please retry")
+	case errors.Is(err, vpn.ErrUserNotFound):
+		h.JSONError(w, http.StatusNotFound, "not_found", "Client configuration not found")
+	case errors.Is(err, vpn.ErrAccessDenied):
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Access denied")
+	case errors.Is(err, vpn.ErrInvalidParameter):
+		h.JSONError(w, http.StatusBadRequest, "invalid_parameter", "Invalid configuration parameter")
+	case errors.Is(err, vpn.ErrBadRequest):
+		h.JSONError(w, http.StatusBadRequest, "bad_request", "Invalid configuration request")
+	default:
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to generate VPN configuration")
+	}
 }
 
 // VPNDisconnectHandler terminates active user or session VPN connections.
