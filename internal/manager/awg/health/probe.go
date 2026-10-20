@@ -109,10 +109,20 @@ func extractHeaderProtectionKey(awgParams any) string {
 	return v
 }
 
+// DefaultMimicryProfile defines the default mimicry profile used for reachability and health probes.
+const DefaultMimicryProfile = "sip"
+
 // ExtractHeaderProtectionKey is the exported form of extractHeaderProtectionKey,
 // used by callers that resolve probe parameters from backend server configs.
 func ExtractHeaderProtectionKey(awgParams any) string {
 	return extractHeaderProtectionKey(awgParams)
+}
+
+// ExtractPreambles extracts CPS mimicry and junk preambles for a probe.
+// If mimicryProfile is non-empty, it generates preambles for that profile.
+// Otherwise, it parses stored i1-i5 parameters from awgParams.
+func ExtractPreambles(ctx context.Context, mimicryProfile string, awgParams map[string]any) [][]byte {
+	return extractPreambles(ctx, mimicryProfile, awgParams)
 }
 
 func extractPreambles(ctx context.Context, mimicryProfile string, awgParams map[string]any) [][]byte {

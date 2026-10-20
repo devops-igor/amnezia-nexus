@@ -411,3 +411,30 @@ func TestTunedBind_DelegationAndFallbacks(t *testing.T) {
 	_ = tuned.BindSocketToInterface4(0, false)
 	_ = tuned.BindSocketToInterface6(0, false)
 }
+
+func TestNewAWGClientDevice_WithI1(t *testing.T) {
+	pub, priv, err := GenerateCurve25519KeyPair()
+	if err != nil {
+		t.Fatalf("failed to generate keypair: %v", err)
+	}
+
+	params := map[string]any{
+		"i1": "<b 0x0102030405060708>",
+	}
+
+	dev, err := NewAWGClientDevice("test-awg-i1", "127.0.0.1:51820", priv, pub, 1340, params)
+	if err != nil {
+		t.Fatalf("NewAWGClientDevice with i1 failed: %v", err)
+	}
+	defer dev.Close()
+
+	if dev.Name() != "test-awg-i1" {
+		t.Errorf("expected device name 'test-awg-i1', got %q", dev.Name())
+	}
+	if dev.MTU() != 1340 {
+		t.Errorf("expected device MTU 1340, got %d", dev.MTU())
+	}
+	if dev.I1() != params["i1"] {
+		t.Errorf("expected device I1 %q, got %q", params["i1"], dev.I1())
+	}
+}

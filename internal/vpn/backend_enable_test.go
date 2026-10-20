@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
@@ -981,6 +982,150 @@ func TestGetPortalSubnet_Fallback(t *testing.T) {
 		}
 		if got := svc.getPortalSubnet(); got != "10.100.0.0/16" {
 			t.Fatalf("expected default 10.100.0.0/16, got: %s", got)
+		}
+	})
+}
+
+func TestEnableBackend_DataPlaneI1_DeviceInitialization(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("injects SIP I1 into backend device by default", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatalf("NewVPNService: %v", err)
+		}
+		t.Cleanup(func() { closeBackendDevices(svc) })
+
+		srvID, err := db.CreateServer(ctx, &models.Server{
+			Name: "test-sip-i1", Host: "198.51.100.95",
+			Protocols: map[string]any{
+				"awg": map[string]any{
+					"installed":  true,
+					"port":       51820,
+					"public_key": "sip-backend-pubkey",
+					"awg_params": map[string]any{"s1": 15, "s2": 40},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateServer: %v", err)
+		}
+		svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+		if err := svc.EnableBackend(ctx, srvID); err != nil {
+			t.Fatalf("EnableBackend: %v", err)
+		}
+
+		tun, err := svc.pool.GetTunnel(srvID)
+		if err != nil {
+			t.Fatalf("GetTunnel: %v", err)
+		}
+
+		svc.mu.RLock()
+		dev, ok := svc.backendDevices[tun.ID].(*tunnel.AWGClientDevice)
+		svc.mu.RUnlock()
+		if !ok || dev == nil {
+			t.Fatalf("expected attached *tunnel.AWGClientDevice for tunnel %d", tun.ID)
+		}
+
+		i1 := dev.I1()
+		if !strings.HasPrefix(i1, "<b 0x") {
+			t.Fatalf("expected device I1 to be hex CPS blob (<b 0x...>), got %q", i1)
+		}
+
+		// Verify stored database parameters were NOT mutated
+		loadedSrv, err := db.GetServerByID(ctx, srvID)
+		if err != nil {
+			t.Fatalf("GetServerByID: %v", err)
+		}
+		awgInfo := loadedSrv.Protocols["awg"].(map[string]any)
+		storedParams := awgInfo["awg_params"].(map[string]any)
+		if _, exists := storedParams["i1"]; exists {
+			t.Errorf("stored awg_params in DB must not be mutated with i1, found: %v", storedParams["i1"])
+		}
+	})
+
+	t.Run("injects DNS I1 into backend device when configured", func(t *testing.T) {
+		db := setupTestDB(t)
+		cfg := &models.VPNConfig{
+			VPNDataPlaneI1Protocol: "dns",
+		}
+		svc, err := NewVPNService(db, cfg)
+		if err != nil {
+			t.Fatalf("NewVPNService: %v", err)
+		}
+		t.Cleanup(func() { closeBackendDevices(svc) })
+
+		srvID, err := db.CreateServer(ctx, &models.Server{
+			Name: "test-dns-i1", Host: "198.51.100.96",
+			Protocols: map[string]any{
+				"awg": map[string]any{
+					"installed":  true,
+					"port":       51820,
+					"public_key": "dns-backend-pubkey",
+					"awg_params": map[string]any{"s1": 15, "s2": 40},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateServer: %v", err)
+		}
+		svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+		if err := svc.EnableBackend(ctx, srvID); err != nil {
+			t.Fatalf("EnableBackend: %v", err)
+		}
+
+		tun, err := svc.pool.GetTunnel(srvID)
+		if err != nil {
+			t.Fatalf("GetTunnel: %v", err)
+		}
+
+		svc.mu.RLock()
+		dev, ok := svc.backendDevices[tun.ID].(*tunnel.AWGClientDevice)
+		svc.mu.RUnlock()
+		if !ok || dev == nil {
+			t.Fatalf("expected attached *tunnel.AWGClientDevice for tunnel %d", tun.ID)
+		}
+
+		i1 := dev.I1()
+		if !strings.HasPrefix(i1, "<r 2><b 0x") {
+			t.Fatalf("expected device I1 to be DNS format (<r 2><b 0x...>), got %q", i1)
+		}
+	})
+
+	t.Run("propagates mimicry packet generator error", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatalf("NewVPNService: %v", err)
+		}
+		t.Cleanup(func() { closeBackendDevices(svc) })
+
+		srvID, err := db.CreateServer(ctx, &models.Server{
+			Name: "test-err-i1", Host: "198.51.100.97",
+			Protocols: map[string]any{
+				"awg": map[string]any{
+					"installed":  true,
+					"port":       51820,
+					"public_key": "err-backend-pubkey",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateServer: %v", err)
+		}
+		svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+		restoreGen := setGenerateMimicryPacketsForTest(func(ctx context.Context, mimicry string, domain string, sshClient ssh.SSHClient) (map[string]string, error) {
+			return nil, errors.New("simulated mimicry generator failure")
+		})
+		defer restoreGen()
+
+		err = svc.EnableBackend(ctx, srvID)
+		if err == nil || !strings.Contains(err.Error(), "simulated mimicry generator failure") {
+			t.Fatalf("expected simulated mimicry generator failure, got: %v", err)
 		}
 	})
 }

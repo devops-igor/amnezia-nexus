@@ -262,3 +262,50 @@ func TestBuildAWGIPCConfig_TimingRangesDegenerateSingle(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildAWGIPCConfig_I1Parameter(t *testing.T) {
+	t.Run("emits i1 when present and non-empty", func(t *testing.T) {
+		const i1Val = "<b 0x1234567890abcdef>"
+		params := map[string]any{
+			"i1": i1Val,
+		}
+		cfg := BuildAWGIPCConfigForTest("privkeyhex", "pubkeyhex", "198.51.100.1:51820", params)
+		expected := "i1=" + i1Val + "\n"
+		if !strings.Contains(cfg, expected) {
+			t.Fatalf("expected config to contain %q, got:\n%s", expected, cfg)
+		}
+
+		// Verify i1 is placed in the device options block before peer public_key
+		i1Idx := strings.Index(cfg, expected)
+		pubIdx := strings.Index(cfg, "public_key=")
+		if i1Idx < 0 || pubIdx < 0 || i1Idx > pubIdx {
+			t.Errorf("i1 must appear before public_key (i1Idx=%d, pubIdx=%d)", i1Idx, pubIdx)
+		}
+	})
+
+	t.Run("supports uppercase I1 key", func(t *testing.T) {
+		const i1Val = "<b 0xdeadbeef>"
+		params := map[string]any{
+			"I1": i1Val,
+		}
+		cfg := BuildAWGIPCConfigForTest("privkeyhex", "pubkeyhex", "198.51.100.1:51820", params)
+		expected := "i1=" + i1Val + "\n"
+		if !strings.Contains(cfg, expected) {
+			t.Fatalf("expected config to contain %q, got:\n%s", expected, cfg)
+		}
+	})
+
+	t.Run("omits i1 when empty or absent", func(t *testing.T) {
+		for _, p := range []map[string]any{
+			nil,
+			{},
+			{"i1": ""},
+			{"i1": "   "},
+		} {
+			cfg := BuildAWGIPCConfigForTest("privkeyhex", "pubkeyhex", "198.51.100.1:51820", p)
+			if strings.Contains(cfg, "i1=") {
+				t.Errorf("expected config without i1=, got:\n%s", cfg)
+			}
+		}
+	})
+}

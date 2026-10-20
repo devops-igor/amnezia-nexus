@@ -1,6 +1,7 @@
 package health
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -8,10 +9,12 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -611,5 +614,120 @@ func TestExtractHeaderProtectionKey_CasingAndStyles(t *testing.T) {
 	_, _, _, _, found := ExtractAWGExplicitParams(m1)
 	if !found {
 		t.Errorf("expected ExtractAWGExplicitParams to return found=true for HeaderProtectionKey")
+	}
+}
+
+func TestExtractPreambles_SIPAndPrecedence(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("generates SIP preamble from profile", func(t *testing.T) {
+		preambles := ExtractPreambles(ctx, "sip", nil)
+		if len(preambles) == 0 {
+			t.Fatalf("expected at least 1 preamble for SIP profile")
+		}
+		sipPreamble := string(preambles[0])
+		if !strings.HasPrefix(sipPreamble, "REGISTER ") {
+			t.Errorf("expected SIP preamble to start with 'REGISTER ', got: %q", sipPreamble)
+		}
+		if !strings.Contains(sipPreamble, "SIP/2.0") {
+			t.Errorf("expected SIP preamble to contain 'SIP/2.0', got: %q", sipPreamble)
+		}
+	})
+
+	t.Run("extracts SIP preamble from awgParams when profile is empty", func(t *testing.T) {
+		rawSIP, err := cps.GenSIP("")
+		if err != nil {
+			t.Fatalf("GenSIP failed: %v", err)
+		}
+		cpsBlob := cps.ToCPS(rawSIP)
+
+		params := map[string]any{
+			"i1": cpsBlob,
+		}
+		preambles := ExtractPreambles(ctx, "", params)
+		if len(preambles) == 0 {
+			t.Fatalf("expected at least 1 preamble from awgParams")
+		}
+		if !bytes.Equal(preambles[0], rawSIP) {
+			t.Fatalf("extracted preamble mismatch with stored SIP packet")
+		}
+	})
+
+	t.Run("explicit mimicry profile takes precedence over stored awgParams", func(t *testing.T) {
+		rawSIP, err := cps.GenSIP("")
+		if err != nil {
+			t.Fatalf("GenSIP failed: %v", err)
+		}
+		paramsWithSIP := map[string]any{
+			"i1": cps.ToCPS(rawSIP),
+		}
+
+		// When DNS profile is passed, it must generate DNS preamble, ignoring stored SIP
+		dnsPreambles := ExtractPreambles(ctx, "dns", paramsWithSIP)
+		if len(dnsPreambles) == 0 {
+			t.Fatalf("expected DNS preamble")
+		}
+		if strings.Contains(string(dnsPreambles[0]), "SIP/2.0") {
+			t.Errorf("expected DNS preamble to override stored SIP param, but got SIP preamble")
+		}
+
+		// When SIP profile is passed, it must generate SIP preamble
+		rawDNS, _ := cps.GenDNS("example.com")
+		paramsWithDNS := map[string]any{
+			"i1": fmt.Sprintf("<r 2><b 0x%x>", rawDNS),
+		}
+		sipPreambles := ExtractPreambles(ctx, "sip", paramsWithDNS)
+		if len(sipPreambles) == 0 {
+			t.Fatalf("expected SIP preamble")
+		}
+		if !strings.Contains(string(sipPreambles[0]), "SIP/2.0") {
+			t.Errorf("expected SIP preamble to override stored DNS param, but got non-SIP preamble")
+		}
+	})
+
+	t.Run("appends junk preambles when configured", func(t *testing.T) {
+		params := map[string]any{
+			"junk_packet_count":    "2",
+			"junk_packet_min_size": "10",
+			"junk_packet_max_size": "20",
+		}
+		preambles := ExtractPreambles(ctx, "sip", params)
+		// 1 SIP preamble + 2 junk packets = 3 preambles
+		if len(preambles) != 3 {
+			t.Fatalf("expected 3 preambles (1 SIP + 2 junk), got %d", len(preambles))
+		}
+	})
+}
+
+func TestPerformAWGHandshake_SIPProfile(t *testing.T) {
+	ctx := context.Background()
+	h1 := DefaultH1
+	h2 := DefaultH2
+	s1 := DefaultS1
+	s2 := DefaultS2
+
+	pc, serverPub, host, port := startMockAWGServer(t, h1, h2, s1, s2)
+	defer func() {
+		_ = pc.Close()
+	}()
+
+	serverPubB64 := base64.StdEncoding.EncodeToString(serverPub)
+	params := map[string]any{
+		"init_packet_magic_header":     strconv.FormatUint(uint64(h1), 10),
+		"response_packet_magic_header": strconv.FormatUint(uint64(h2), 10),
+		"init_packet_junk_size":        strconv.Itoa(s1),
+		"response_packet_junk_size":    strconv.Itoa(s2),
+	}
+
+	res, err := PerformAWGHandshake(ctx, host, port, serverPubB64, "", "", "", params, DefaultMimicryProfile, 2*time.Second)
+	if err != nil {
+		t.Fatalf("PerformAWGHandshake returned error: %v", err)
+	}
+
+	if reachable, ok := res["reachable"].(bool); !ok || !reachable {
+		t.Errorf("expected reachable to be true, got %v (err=%v)", reachable, res["error"])
+	}
+	if profile, ok := res["profile"].(string); !ok || profile != "sip" {
+		t.Errorf("expected profile to be 'sip', got %v", profile)
 	}
 }

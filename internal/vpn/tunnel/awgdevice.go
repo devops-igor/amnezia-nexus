@@ -25,6 +25,7 @@ import (
 type AWGClientDevice struct {
 	name            string
 	mtu             int
+	i1              string
 	vtun            *VirtualTUN
 	dev             *device.Device
 	doneCh          chan struct{}
@@ -135,9 +136,12 @@ func NewAWGClientDevice(name, endpoint, privateKey, publicKey string, mtu int, a
 		return nil, fmt.Errorf("failed to bring up awg device: %w", err)
 	}
 
+	i1, _ := lookupAWGParamStr(awgParams, "i1")
+
 	d := &AWGClientDevice{
 		name:      name,
 		mtu:       mtu,
+		i1:        i1,
 		vtun:      vtun,
 		dev:       dev,
 		doneCh:    make(chan struct{}),
@@ -145,6 +149,14 @@ func NewAWGClientDevice(name, endpoint, privateKey, publicKey string, mtu int, a
 	}
 
 	return d, nil
+}
+
+// I1 returns the configured I1 preamble tag for the device, if any.
+func (d *AWGClientDevice) I1() string {
+	if d == nil {
+		return ""
+	}
+	return d.i1
 }
 
 func normalizeAWGKey(s string) string {
@@ -229,6 +241,9 @@ func renderAWGDeviceOptions(b *strings.Builder, awgParams map[string]any) {
 	}
 	if cpa, ok := lookupAWGParamStr(awgParams, "content_padding_addition", "contentpaddingaddition"); ok {
 		fmt.Fprintf(b, "content_padding_addition=%s\n", cpa)
+	}
+	if i1, ok := lookupAWGParamStr(awgParams, "i1"); ok && i1 != "" {
+		fmt.Fprintf(b, "i1=%s\n", i1)
 	}
 	for _, timingKey := range []string{"rekey_after_time", "rekey_timeout", "reject_after_time", "keepalive_timeout", "max_handshake_attempts"} {
 		if val, ok := lookupAWGParamStr(awgParams, timingKey); ok {

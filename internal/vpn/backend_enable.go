@@ -37,9 +37,14 @@ func (s *Service) restoreBackendDevices(ctx context.Context) {
 			attachErr = errors.New("database not available")
 		}
 		if attachErr == nil {
-			s.mu.Lock()
-			attachErr = s.attachBackendForwarder(tun, awgParams)
-			s.mu.Unlock()
+			deviceParams, prepErr := s.prepareBackendDeviceParams(ctx, awgParams)
+			if prepErr != nil {
+				attachErr = prepErr
+			} else {
+				s.mu.Lock()
+				attachErr = s.attachBackendForwarder(tun, deviceParams)
+				s.mu.Unlock()
+			}
 		}
 		if attachErr != nil {
 			log.Printf("[vpn] warning: failed to restore data plane for tunnel %d (server %d): %v", tun.ID, tun.ServerID, attachErr)
@@ -152,7 +157,42 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 	}
 
-	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, startEpoch)
+	deviceParams, err := s.prepareBackendDeviceParams(ctx, awgParams)
+	if err != nil {
+		return err
+	}
+
+	return s.finishEnableBackend(ctx, pool, tun, deviceParams, serverID, startEpoch)
+}
+
+func (s *Service) dataPlaneI1Protocol() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.cfg != nil {
+		return s.cfg.DataPlaneI1Protocol()
+	}
+	return (*models.VPNConfig)(nil).DataPlaneI1Protocol()
+}
+
+func (s *Service) prepareBackendDeviceParams(ctx context.Context, awgParams map[string]any) (map[string]any, error) {
+	deviceParams := make(map[string]any, len(awgParams)+1)
+	for k, v := range awgParams {
+		deviceParams[k] = v
+	}
+
+	proto := s.dataPlaneI1Protocol()
+	mimicryPacketsMu.RLock()
+	genFn := generateMimicryPackets
+	mimicryPacketsMu.RUnlock()
+
+	packets, err := genFn(ctx, proto, "", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate data plane I1 packet: %w", err)
+	}
+	if i1Val, ok := packets["i1"]; ok && i1Val != "" {
+		deviceParams["i1"] = i1Val
+	}
+	return deviceParams, nil
 }
 
 func (s *Service) finishEnableBackend(
