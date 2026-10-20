@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
@@ -48,6 +49,43 @@ func testDeviceIPC(t *testing.T, svc *Service, tunID int64) (string, string) {
 	return dev.I1(), ipc
 }
 
+func assertDeviceIPCI1Payload(t *testing.T, ipc string, proto string) {
+	t.Helper()
+	var foundI1 string
+	for _, line := range strings.Split(ipc, "\n") {
+		if strings.HasPrefix(line, "i1=") {
+			foundI1 = strings.TrimPrefix(line, "i1=")
+			break
+		}
+	}
+	if foundI1 == "" {
+		t.Fatalf("no i1= entry found in device IPC:\n%s", ipc)
+	}
+
+	raw, err := cps.ParseCPSBlob(foundI1)
+	if err != nil {
+		t.Fatalf("failed to parse CPS blob from i1=%q: %v", foundI1, err)
+	}
+
+	switch proto {
+	case "dns":
+		if !strings.HasPrefix(foundI1, "<r 2><b 0x") {
+			t.Fatalf("expected DNS I1 format (<r 2><b 0x...>), got %q", foundI1)
+		}
+		if len(raw) < 12 || raw[2] != 1 || raw[3] != 0 || raw[4] != 0 || raw[5] != 1 {
+			t.Fatalf("live I1 payload is not a valid framed DNS query (len=%d)", len(raw))
+		}
+	default: // "sip"
+		if !strings.HasPrefix(foundI1, "<b 0x") {
+			t.Fatalf("expected SIP I1 format (<b 0x...>), got %q", foundI1)
+		}
+		rawStr := string(raw)
+		if !strings.Contains(rawStr, "REGISTER sip:") || !strings.Contains(rawStr, "SIP/2.0") {
+			t.Fatalf("live I1 payload does not contain ASCII 'REGISTER sip:' and 'SIP/2.0', got %q", rawStr)
+		}
+	}
+}
+
 func TestEnableBackend_DataPlaneI1_DeviceInitialization(t *testing.T) {
 	ctx := context.Background()
 
@@ -78,6 +116,7 @@ func TestEnableBackend_DataPlaneI1_DeviceInitialization(t *testing.T) {
 		if !strings.Contains(ipc, "\ni1=<b 0x") {
 			t.Fatalf("expected live device IPC to contain rendered i1, got:\n%s", ipc)
 		}
+		assertDeviceIPCI1Payload(t, ipc, "sip")
 
 		// Verify stored database parameters were NOT mutated
 		loadedSrv, err := db.GetServerByID(ctx, srvID)
@@ -121,6 +160,7 @@ func TestEnableBackend_DataPlaneI1_DeviceInitialization(t *testing.T) {
 		if !strings.Contains(ipc, "\ni1=<r 2><b 0x") {
 			t.Fatalf("expected live device IPC to contain DNS i1, got:\n%s", ipc)
 		}
+		assertDeviceIPCI1Payload(t, ipc, "dns")
 	})
 
 	t.Run("propagates mimicry packet generator error", func(t *testing.T) {
@@ -172,6 +212,7 @@ func TestEnsureBackendDeviceAttached_DataPlaneI1(t *testing.T) {
 	if !strings.Contains(ipc, "\ni1=<b 0x") {
 		t.Errorf("device IPC must contain SIP i1 line, got:\n%s", ipc)
 	}
+	assertDeviceIPCI1Payload(t, ipc, "sip")
 }
 
 func TestSyncBackendForwarderOnHostUpdate_DataPlaneI1(t *testing.T) {
@@ -206,6 +247,7 @@ func TestSyncBackendForwarderOnHostUpdate_DataPlaneI1(t *testing.T) {
 	if !strings.Contains(ipc, "\ni1=<b 0x") {
 		t.Errorf("device IPC must contain SIP i1 line after host update, got:\n%s", ipc)
 	}
+	assertDeviceIPCI1Payload(t, ipc, "sip")
 }
 
 func TestCodeRabbit1_GeneratorFailureDoesNotOrphanTunnel(t *testing.T) {
@@ -218,16 +260,32 @@ func TestCodeRabbit1_GeneratorFailureDoesNotOrphanTunnel(t *testing.T) {
 	t.Cleanup(func() { closeBackendDevices(svc) })
 
 	srvID := testNewServerWithAWGParams(t, svc, "198.51.100.14", nil)
-	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+	adder := &mockAWGManagerWithClientAdder{}
+	svc.SetAWGStatusProvider(adder)
 
+	sentinelErr := errors.New("simulated generator failure for orphan check")
 	restore := setGenerateMimicryPacketsForTest(func(ctx context.Context, mimicry, domain string, sshClient ssh.SSHClient) (map[string]string, error) {
-		return nil, errors.New("simulated generator failure for orphan check")
+		return nil, sentinelErr
 	})
 	defer restore()
+
+	preAddHookCalled := false
+	svc.enableBackendPreAddTunnelHook = func() {
+		preAddHookCalled = true
+	}
 
 	err = svc.EnableBackend(ctx, srvID)
 	if err == nil {
 		t.Fatal("expected EnableBackend to fail when generator fails")
+	}
+	if !errors.Is(err, sentinelErr) {
+		t.Fatalf("expected error to wrap sentinel %v, got %v", sentinelErr, err)
+	}
+	if preAddHookCalled {
+		t.Fatal("pre-add hook was called: generator error did not abort before pool.AddTunnel")
+	}
+	if adder.addClientCalls > 0 {
+		t.Fatalf("peer registration occurred (%d calls) despite preflight generator failure", adder.addClientCalls)
 	}
 
 	tun, gerr := svc.pool.GetTunnel(srvID)
@@ -284,5 +342,123 @@ func TestEnableBackend_StoredUppercaseI1_OverriddenDeterministically(t *testing.
 		if strings.Contains(ipc, stored) {
 			t.Fatalf("run %d: device IPC contains stored I1 value %s instead of generated I1:\n%s", i, stored, ipc)
 		}
+		assertDeviceIPCI1Payload(t, ipc, "sip")
+	}
+}
+
+func TestEnableBackend_GeneratesMimicryOnce(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+
+	srvID := testNewServerWithAWGParams(t, svc, "198.51.100.15", nil)
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+	genCalls := 0
+	restore := setGenerateMimicryPacketsForTest(func(ctx context.Context, mimicry, domain string, sshClient ssh.SSHClient) (map[string]string, error) {
+		genCalls++
+		return cps.GenerateMimicryPackets(ctx, mimicry, domain, sshClient)
+	})
+	defer restore()
+
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("EnableBackend failed: %v", err)
+	}
+
+	if genCalls != 1 {
+		t.Fatalf("expected exactly 1 generator call (preflight reused on attach), got %d", genCalls)
+	}
+
+	tun, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel failed: %v", err)
+	}
+	_, ipc := testDeviceIPC(t, svc, tun.ID)
+	assertDeviceIPCI1Payload(t, ipc, "sip")
+}
+
+func TestRestoreBackendDevices_EnabledTunnel_DataPlaneI1(t *testing.T) {
+	for _, proto := range []string{"sip", "dns"} {
+		t.Run(proto, func(t *testing.T) {
+			ctx := context.Background()
+			db := setupTestDB(t)
+			var cfg *models.VPNConfig
+			if proto != "sip" {
+				cfg = &models.VPNConfig{VPNDataPlaneI1Protocol: proto}
+			}
+			svc, err := NewVPNService(db, cfg)
+			if err != nil {
+				t.Fatalf("NewVPNService: %v", err)
+			}
+			t.Cleanup(func() { closeBackendDevices(svc) })
+			svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+			const storedDummy = "<b 0xdeadbeef>"
+			srvID := testNewServerWithAWGParams(t, svc, "198.51.100.30", map[string]any{
+				"I1": storedDummy,
+				"s1": 15,
+				"s2": 40,
+			})
+
+			tun, err := svc.pool.AddTunnel(ctx, srvID, "198.51.100.30:51820", "")
+			if err != nil {
+				t.Fatalf("AddTunnel: %v", err)
+			}
+
+			svc.restoreBackendDevices(ctx)
+
+			i1, ipc := testDeviceIPC(t, svc, tun.ID)
+			if strings.Contains(ipc, storedDummy) || i1 == storedDummy {
+				t.Fatalf("restored live device retained stored dummy I1 instead of generating configured %s I1", proto)
+			}
+
+			assertDeviceIPCI1Payload(t, ipc, proto)
+		})
+	}
+}
+
+func TestAuditSecondGenerationMustNotOrphan(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+	id := testNewServerWithAWGParams(t, svc, "198.51.100.88", nil)
+	adder := &mockAWGManagerWithClientAdder{}
+	svc.SetAWGStatusProvider(adder)
+	sentinel := errors.New("audit second generation failure")
+	calls := 0
+	restore := setGenerateMimicryPacketsForTest(func(ctx context.Context, profile, domain string, sshClient ssh.SSHClient) (map[string]string, error) {
+		calls++
+		if calls == 2 {
+			return nil, sentinel
+		}
+		return cps.GenerateMimicryPackets(ctx, profile, domain, sshClient)
+	})
+	defer restore()
+	err = svc.EnableBackend(ctx, id)
+	tun, getErr := svc.pool.GetTunnel(id)
+	hasDevice := false
+	if tun != nil {
+		svc.mu.RLock()
+		hasDevice = svc.backendDevices[tun.ID] != nil
+		svc.mu.RUnlock()
+	}
+	t.Logf("generation_calls=%d peer_registration_calls=%d error_matches=%v pool_found=%v device_attached=%v selectable_active=%d",
+		calls, adder.addClientCalls, errors.Is(err, sentinel), getErr == nil, hasDevice, len(svc.pool.GetActiveTunnels()))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 generation call, got %d", calls)
+	}
+	if tun == nil || !tun.Enabled || !hasDevice {
+		t.Fatalf("expected enabled tunnel with attached device, tun=%v hasDevice=%v", tun, hasDevice)
 	}
 }

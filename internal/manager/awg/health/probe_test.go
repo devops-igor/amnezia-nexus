@@ -25,7 +25,7 @@ func startMockAWGServer(t *testing.T, h1, h2 uint32, s1, s2 int) (net.PacketConn
 	return startMockAWGServerWithHP(t, nil, h1, h2, s1, s2)
 }
 
-func startMockAWGServerWithHP(t *testing.T, hpKey []byte, h1, h2 uint32, s1, s2 int) (net.PacketConn, []byte, string, int) {
+func startMockAWGServerWithHP(t *testing.T, hpKey []byte, h1, h2 uint32, s1, s2 int, onPacket ...func([]byte)) (net.PacketConn, []byte, string, int) {
 	serverPriv, serverPub := generateTestKeypair(t)
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -41,6 +41,11 @@ func startMockAWGServerWithHP(t *testing.T, hpKey []byte, h1, h2 uint32, s1, s2 
 			n, clientAddr, err := pc.ReadFrom(buf)
 			if err != nil {
 				return
+			}
+			if len(onPacket) > 0 && onPacket[0] != nil {
+				pktCopy := make([]byte, n)
+				copy(pktCopy, buf[:n])
+				onPacket[0](pktCopy)
 			}
 			if n < s1+116 {
 				continue
@@ -699,14 +704,22 @@ func TestExtractPreambles_SIPAndPrecedence(t *testing.T) {
 	})
 }
 
-func TestPerformAWGHandshake_SIPProfile(t *testing.T) {
+func TestPerformAWGHandshake_SIPMimicry(t *testing.T) {
 	ctx := context.Background()
 	h1 := DefaultH1
 	h2 := DefaultH2
 	s1 := DefaultS1
 	s2 := DefaultS2
 
-	pc, serverPub, host, port := startMockAWGServer(t, h1, h2, s1, s2)
+	var receivedPackets [][]byte
+	var recMu sync.Mutex
+	recordPkt := func(pkt []byte) {
+		recMu.Lock()
+		defer recMu.Unlock()
+		receivedPackets = append(receivedPackets, pkt)
+	}
+
+	pc, serverPub, host, port := startMockAWGServerWithHP(t, nil, h1, h2, s1, s2, recordPkt)
 	defer func() {
 		_ = pc.Close()
 	}()
@@ -730,4 +743,23 @@ func TestPerformAWGHandshake_SIPProfile(t *testing.T) {
 	if profile, ok := res["profile"].(string); !ok || profile != "sip" {
 		t.Errorf("expected profile to be 'sip', got %v", profile)
 	}
+
+	// Verify that the SIP preamble is transmitted before the handshake message
+	recMu.Lock()
+	defer recMu.Unlock()
+	foundSIPPreamble := false
+	for _, pkt := range receivedPackets {
+		s := string(pkt)
+		if strings.HasPrefix(s, "REGISTER ") && strings.Contains(s, "SIP/2.0") {
+			foundSIPPreamble = true
+			break
+		}
+	}
+	if !foundSIPPreamble {
+		t.Fatalf("expected SIP preamble datagram containing 'REGISTER ... SIP/2.0' to be transmitted, received %d packets", len(receivedPackets))
+	}
+}
+
+func TestPerformAWGHandshake_SIPProfile(t *testing.T) {
+	TestPerformAWGHandshake_SIPMimicry(t)
 }

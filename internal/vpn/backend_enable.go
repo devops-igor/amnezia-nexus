@@ -86,7 +86,8 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 
 	// Validate I1 parameter preparation early (before pool.AddTunnel) so that
 	// a generator failure aborts immediately without mutating pool or remote peers (CodeRabbit #1).
-	if _, err := s.prepareBackendDeviceParams(ctx, awgParams); err != nil {
+	deviceParams, err := s.prepareBackendDeviceParams(ctx, awgParams)
+	if err != nil {
 		return err
 	}
 
@@ -158,7 +159,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 	}
 
-	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, startEpoch)
+	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, startEpoch, deviceParams)
 }
 
 func (s *Service) dataPlaneI1Protocol() string {
@@ -211,6 +212,7 @@ func (s *Service) finishEnableBackend(
 	awgParams map[string]any,
 	serverID int64,
 	startEpoch uint64,
+	prepared ...map[string]any,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -233,7 +235,7 @@ func (s *Service) finishEnableBackend(
 		return errors.New("backend identity modified concurrently; aborting enable")
 	}
 
-	if err := s.attachBackendForwarder(tun, awgParams); err != nil {
+	if err := s.attachBackendForwarder(tun, awgParams, prepared...); err != nil {
 		return err
 	}
 
@@ -487,7 +489,7 @@ func (s *Service) discoverLiveAWG(ctx context.Context, serverID int64, server *m
 	return livePub, livePort, true
 }
 
-func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams map[string]any) error {
+func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams map[string]any, prepared ...map[string]any) error {
 	if tun == nil {
 		return errors.New("backend tunnel is nil")
 	}
@@ -495,9 +497,15 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 		return nil
 	}
 
-	deviceParams, prepErr := s.prepareBackendDeviceParamsLocked(awgParams)
-	if prepErr != nil {
-		return fmt.Errorf("failed to prepare backend device parameters for server %d: %w", tun.ServerID, prepErr)
+	var deviceParams map[string]any
+	if len(prepared) > 0 && prepared[0] != nil {
+		deviceParams = prepared[0]
+	} else {
+		var prepErr error
+		deviceParams, prepErr = s.prepareBackendDeviceParamsLocked(awgParams)
+		if prepErr != nil {
+			return fmt.Errorf("failed to prepare backend device parameters for server %d: %w", tun.ServerID, prepErr)
+		}
 	}
 
 	// Detach and close previous device for this tunnel to prevent leaks
