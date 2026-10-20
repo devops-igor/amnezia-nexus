@@ -25,18 +25,25 @@ H4 = 4
 `
 
 const (
+	legacyConfigPath     = "/opt/amnezia/awg/awg0.conf"
+	clientsTablePath     = "/opt/amnezia/awg/clientsTable"
 	testLegacyPeerPubKey = "pubkey12345678901234567890123456789012="
 	testLegacyPeerPSK    = "pskKey123456789012345678901234567890123="
 	testLegacyPeerIP     = "10.100.0.2"
-	testLegacyPeerSec    = "\n[Peer]\nPublicKey = " + testLegacyPeerPubKey + "\nPresharedKey = " + testLegacyPeerPSK + "\nAllowedIPs = 10.100.0.2/32\n"
 )
+
+func peerSection(pubKey, ip string) string {
+	return "\n[Peer]\nPublicKey = " + pubKey + "\nPresharedKey = " + testLegacyPeerPSK + "\nAllowedIPs = " + ip + "/32\n"
+}
+
+var testLegacyPeerSec = peerSection(testLegacyPeerPubKey, testLegacyPeerIP)
 
 func newLegacyServerMock(initialPeersConfig string, initialClients []AWGClient) (*mockAWGSSHClient, *AWGManager, *models.Server) {
 	client := newMockAWGSSHClient()
-	client.files["/opt/amnezia/awg/awg0.conf"] = []byte(legacyInterfaceConfig + initialPeersConfig)
+	client.files[legacyConfigPath] = []byte(legacyInterfaceConfig + initialPeersConfig)
 	if initialClients != nil {
 		raw, _ := json.Marshal(initialClients)
-		client.files["/opt/amnezia/awg/clientsTable"] = raw
+		client.files[clientsTablePath] = raw
 	}
 	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
 	server := &models.Server{ID: 611, Host: "198.51.100.11", SSHPort: 22, SSHUser: "root"}
@@ -69,16 +76,13 @@ func assertLegacyInterfacePreserved(t *testing.T, config string) {
 }
 
 func TestAddClientPreservesLegacyInterfaceParams(t *testing.T) {
-	client := newMockAWGSSHClient()
-	client.files["/opt/amnezia/awg/awg0.conf"] = []byte(legacyInterfaceConfig)
-	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
-	server := &models.Server{ID: 611, Host: "198.51.100.11", SSHPort: 22, SSHUser: "root"}
+	client, mgr, server := newLegacyServerMock("", nil)
 
 	res, err := mgr.AddClient(context.Background(), server, map[string]any{"clientName": "Legacy peer"})
 	if err != nil {
 		t.Fatalf("AddClient rejected existing interface values: %v", err)
 	}
-	config := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	config := string(client.files[legacyConfigPath])
 	assertLegacyInterfacePreserved(t, config)
 	if !strings.Contains(config, "[Peer]") || res["client_id"] == nil {
 		t.Fatalf("peer save did not add the peer: %q", config)
@@ -93,10 +97,14 @@ func TestRemoveClientPreservesLegacyInterfaceParams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RemoveClient failed on legacy server config: %v", err)
 	}
-	config := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	config := string(client.files[legacyConfigPath])
 	assertLegacyInterfacePreserved(t, config)
 	if strings.Contains(config, testLegacyPeerPubKey) {
 		t.Fatalf("RemoveClient did not remove peer from config: %q", config)
+	}
+	clientsPost, err := ParseClientsTable(string(client.files[clientsTablePath]))
+	if err != nil || len(clientsPost) != 0 {
+		t.Fatalf("expected clientsTable to be empty after RemoveClient, got: %+v (err: %v)", clientsPost, err)
 	}
 }
 
@@ -108,20 +116,28 @@ func TestToggleClientPreservesLegacyInterfaceParams(t *testing.T) {
 	if err := mgr.ToggleClient(ctx, server, testLegacyPeerPubKey, false); err != nil {
 		t.Fatalf("ToggleClient(disable) failed on legacy server config: %v", err)
 	}
-	configDisabled := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	configDisabled := string(client.files[legacyConfigPath])
 	assertLegacyInterfacePreserved(t, configDisabled)
 	if strings.Contains(configDisabled, testLegacyPeerPubKey) {
 		t.Fatalf("ToggleClient(disable) did not remove peer from config: %q", configDisabled)
+	}
+	clientsDisabled, err := ParseClientsTable(string(client.files[clientsTablePath]))
+	if err != nil || len(clientsDisabled) != 1 || clientsDisabled[0].UserData.Enabled {
+		t.Fatalf("expected clientsTable to have 1 disabled client, got: %+v (err: %v)", clientsDisabled, err)
 	}
 
 	// Enable client back
 	if err := mgr.ToggleClient(ctx, server, testLegacyPeerPubKey, true); err != nil {
 		t.Fatalf("ToggleClient(enable) failed on legacy server config: %v", err)
 	}
-	configEnabled := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	configEnabled := string(client.files[legacyConfigPath])
 	assertLegacyInterfacePreserved(t, configEnabled)
 	if !strings.Contains(configEnabled, testLegacyPeerPubKey) {
 		t.Fatalf("ToggleClient(enable) did not add peer back to config: %q", configEnabled)
+	}
+	clientsEnabled, err := ParseClientsTable(string(client.files[clientsTablePath]))
+	if err != nil || len(clientsEnabled) != 1 || !clientsEnabled[0].UserData.Enabled {
+		t.Fatalf("expected clientsTable to have 1 enabled client, got: %+v (err: %v)", clientsEnabled, err)
 	}
 }
 
@@ -133,20 +149,28 @@ func TestEditClientPreservesLegacyInterfaceParams(t *testing.T) {
 	if err := mgr.EditClient(ctx, server, testLegacyPeerPubKey, map[string]any{"enabled": false}); err != nil {
 		t.Fatalf("EditClient(enabled=false) failed on legacy server config: %v", err)
 	}
-	configDisabled := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	configDisabled := string(client.files[legacyConfigPath])
 	assertLegacyInterfacePreserved(t, configDisabled)
 	if strings.Contains(configDisabled, testLegacyPeerPubKey) {
 		t.Fatalf("EditClient(enabled=false) did not remove peer from config: %q", configDisabled)
+	}
+	clientsDisabled, err := ParseClientsTable(string(client.files[clientsTablePath]))
+	if err != nil || len(clientsDisabled) != 1 || clientsDisabled[0].UserData.Enabled {
+		t.Fatalf("expected clientsTable to have 1 disabled client, got: %+v (err: %v)", clientsDisabled, err)
 	}
 
 	// Re-enable client (triggers updateServerConfigPeer with enable=true)
 	if err := mgr.EditClient(ctx, server, testLegacyPeerPubKey, map[string]any{"enabled": true}); err != nil {
 		t.Fatalf("EditClient(enabled=true) failed on legacy server config: %v", err)
 	}
-	configEnabled := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	configEnabled := string(client.files[legacyConfigPath])
 	assertLegacyInterfacePreserved(t, configEnabled)
 	if !strings.Contains(configEnabled, testLegacyPeerPubKey) {
 		t.Fatalf("EditClient(enabled=true) did not add peer back to config: %q", configEnabled)
+	}
+	clientsEnabled, err := ParseClientsTable(string(client.files[clientsTablePath]))
+	if err != nil || len(clientsEnabled) != 1 || !clientsEnabled[0].UserData.Enabled {
+		t.Fatalf("expected clientsTable to have 1 enabled client, got: %+v (err: %v)", clientsEnabled, err)
 	}
 }
 
@@ -163,16 +187,20 @@ func TestRollbackServerConfigSurgicallyPreservesLegacyInterfaceParams(t *testing
 		if err := mgr.RollbackAddClient(ctx, server, rollbackResult); err != nil {
 			t.Fatalf("RollbackAddClient(non-upsert) failed on legacy server config: %v", err)
 		}
-		config := string(client.files["/opt/amnezia/awg/awg0.conf"])
+		config := string(client.files[legacyConfigPath])
 		assertLegacyInterfacePreserved(t, config)
 		if strings.Contains(config, testLegacyPeerPubKey) {
 			t.Fatalf("RollbackAddClient did not remove peer from config: %q", config)
+		}
+		clientsPost, err := ParseClientsTable(string(client.files[clientsTablePath]))
+		if err != nil || len(clientsPost) != 0 {
+			t.Fatalf("expected clientsTable to be empty after non-upsert rollback, got: %+v (err: %v)", clientsPost, err)
 		}
 	})
 
 	t.Run("upsert rollback via RollbackAddClient", func(t *testing.T) {
 		const newPubKey = "newPubKey123456789012345678901234567890="
-		newPeerSec := "\n[Peer]\nPublicKey = " + newPubKey + "\nPresharedKey = " + testLegacyPeerPSK + "\nAllowedIPs = 10.100.0.2/32\n"
+		newPeerSec := peerSection(newPubKey, testLegacyPeerIP)
 		client, mgr, server := newLegacyServerMock(newPeerSec, []AWGClient{
 			{
 				ClientID: newPubKey,
@@ -204,10 +232,14 @@ func TestRollbackServerConfigSurgicallyPreservesLegacyInterfaceParams(t *testing
 		if err := mgr.RollbackAddClient(ctx, server, rollbackResult); err != nil {
 			t.Fatalf("RollbackAddClient(upsert) failed on legacy server config: %v", err)
 		}
-		config := string(client.files["/opt/amnezia/awg/awg0.conf"])
+		config := string(client.files[legacyConfigPath])
 		assertLegacyInterfacePreserved(t, config)
 		if strings.Contains(config, newPubKey) || !strings.Contains(config, testLegacyPeerPubKey) {
 			t.Fatalf("RollbackAddClient(upsert) did not restore previous peer: %q", config)
+		}
+		clientsRestored, err := ParseClientsTable(string(client.files[clientsTablePath]))
+		if err != nil || len(clientsRestored) != 1 || clientsRestored[0].ClientID != testLegacyPeerPubKey {
+			t.Fatalf("expected clientsTable to restore previous client %q, got: %+v (err: %v)", testLegacyPeerPubKey, clientsRestored, err)
 		}
 	})
 
@@ -217,7 +249,7 @@ func TestRollbackServerConfigSurgicallyPreservesLegacyInterfaceParams(t *testing
 		if err != nil {
 			t.Fatalf("rollbackServerConfigSurgically failed on legacy config: %v", err)
 		}
-		config := string(client.files["/opt/amnezia/awg/awg0.conf"])
+		config := string(client.files[legacyConfigPath])
 		assertLegacyInterfacePreserved(t, config)
 		if strings.Contains(config, testLegacyPeerPubKey) {
 			t.Fatalf("rollbackServerConfigSurgically did not remove peer: %q", config)
@@ -233,7 +265,7 @@ func TestRestorePreviousPeerPreservesLegacyInterfaceParams(t *testing.T) {
 	if err != nil || !restored {
 		t.Fatalf("restorePreviousPeer failed on legacy server config: %v", err)
 	}
-	config := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	config := string(client.files[legacyConfigPath])
 	assertLegacyInterfacePreserved(t, config)
 	if !strings.Contains(config, testLegacyPeerPubKey) {
 		t.Fatalf("restorePreviousPeer did not write config: %q", config)
@@ -248,7 +280,7 @@ func TestRemovePeerFromRemotePreservesLegacyInterfaceParams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("removePeerFromRemote failed on legacy server config: %v", err)
 	}
-	config := string(client.files["/opt/amnezia/awg/awg0.conf"])
+	config := string(client.files[legacyConfigPath])
 	assertLegacyInterfacePreserved(t, config)
 	if strings.Contains(config, testLegacyPeerPubKey) {
 		t.Fatalf("removePeerFromRemote did not remove peer from config: %q", config)
