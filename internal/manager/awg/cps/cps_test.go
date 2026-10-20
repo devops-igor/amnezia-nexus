@@ -171,12 +171,12 @@ func TestCPSBlobConversion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseCPSBlob with <r 2> failed: %v", err)
 	}
-	if len(rParsed) != 4 {
-		t.Fatalf("expected 4 bytes, got %d", len(rParsed))
+	if len(rParsed) != 6 {
+		t.Fatalf("expected 6 bytes, got %d", len(rParsed))
 	}
-	// Bytes 2 and 3 should match 0x33, 0x44
-	if rParsed[2] != 0x33 || rParsed[3] != 0x44 {
-		t.Errorf("non-random suffix changed: %x", rParsed)
+	// Suffix should match original data bytes [0x11, 0x22, 0x33, 0x44]
+	if !bytes.Equal(rParsed[2:], []byte{0x11, 0x22, 0x33, 0x44}) {
+		t.Errorf("data suffix changed: expected [11 22 33 44], got %x", rParsed[2:])
 	}
 
 	// Invalid tags
@@ -185,6 +185,70 @@ func TestCPSBlobConversion(t *testing.T) {
 	}
 	if _, err := ParseCPSBlob("<b 0xzzzz>"); err == nil {
 		t.Errorf("expected error for invalid hex in tag")
+	}
+}
+
+func TestParseCPSBlob_RandomPrefixBounds(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+		wantLen int
+	}{
+		{
+			name:    "max int64 overflow does not panic",
+			input:   "<r 9223372036854775807><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "exceeds 65535",
+			input:   "<r 65536><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "zero count",
+			input:   "<r 0><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "negative count",
+			input:   "<r -1><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "valid count 2",
+			input:   "<r 2><b 0x11223344>",
+			wantErr: false,
+			wantLen: 6,
+		},
+		{
+			name:    "non-numeric count",
+			input:   "<r abc><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "unclosed r tag",
+			input:   "<r 2<b 0x1122>",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseCPSBlob(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ParseCPSBlob(%q) expected error, got nil (len=%d)", tt.input, len(got))
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("ParseCPSBlob(%q) unexpected error: %v", tt.input, err)
+				}
+				if len(got) != tt.wantLen {
+					t.Errorf("ParseCPSBlob(%q) len = %d, want %d", tt.input, len(got), tt.wantLen)
+				}
+			}
+		})
 	}
 }
 
