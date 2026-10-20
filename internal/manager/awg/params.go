@@ -1182,13 +1182,6 @@ func validateS1S2Collision(params map[string]string) error {
 		return nil
 	}
 
-	diff := s1 - s2
-	if diff < 0 {
-		diff = -diff
-	}
-	if diff < 10 {
-		return fmt.Errorf("param init_packet_junk_size (s1=%d) and response_packet_junk_size (s2=%d): |s1 - s2| must be >= 10, difference is %d", s1, s2, diff)
-	}
 	if s2 == s1+56 || s1 == s2+56 {
 		return fmt.Errorf("AmneziaWG packet length collision: s1=%d and s2=%d cause handshake initiation and response packets to collide in length (s2 == s1 + 56 or s1 == s2 + 56)", s1, s2)
 	}
@@ -1256,7 +1249,7 @@ func validateMTU(params map[string]string) error {
 }
 
 // ValidateAWGParams ensures all AWG parameters are numeric strings within safe ranges to prevent command injection
-// and validates AmneziaWG packet length constraints (|s1 - s2| >= 10 and s2 != s1+56 && s1 != s2+56).
+// and validates AmneziaWG packet length collisions (s2 != s1+56 && s1 != s2+56).
 func ValidateAWGParams(params map[string]string) error {
 	if err := validateNumericBounds(params); err != nil {
 		return err
