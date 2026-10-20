@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
@@ -97,6 +98,34 @@ func TestPortalI1ProtocolSwitchAndGenerationFailure(t *testing.T) {
 	if _, err := resolvePortalI1(ctx, cfg, map[string]any{"portal_i1": 42}); err == nil {
 		t.Fatal("invalid persisted I1 accepted")
 	}
+
+	// Injected generator failure test: verify generator error cause is preserved,
+	// and GenerateClientConfig leaves no partial row or IP allocation (M14 kill oracle).
+	func() {
+		restoreGen := setGenerateMimicryPacketsForTest(func(ctx context.Context, mimicry string, domain string, sshClient ssh.SSHClient) (map[string]string, error) {
+			return nil, fmt.Errorf("injected generator failure: %w", context.DeadlineExceeded)
+		})
+		defer restoreGen()
+
+		if _, err := resolvePortalI1(ctx, cfg, map[string]any{}); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("generator cause lost in resolvePortalI1: %v", err)
+		}
+		genFailUID, err := db.CreateUser(ctx, &models.User{Username: "generator-fail-user", Enabled: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		allocBefore := svc.ipam.AllocatedCount()
+		if cfgStr, _, err := svc.GenerateClientConfig(ctx, genFailUID); !errors.Is(err, context.DeadlineExceeded) || cfgStr != "" {
+			t.Fatalf("render did not propagate generator cause: cfg=%q, err=%v", cfgStr, err)
+		}
+		conns, err := db.GetConnectionsByUserID(ctx, genFailUID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(conns) != 0 || svc.ipam.AllocatedCount() != allocBefore {
+			t.Fatalf("failed generation persisted partial row or lease: rows=%d, ipam=%d (was %d)", len(conns), svc.ipam.AllocatedCount(), allocBefore)
+		}
+	}()
 }
 
 func TestVPNService_DBLessI1ProtocolValidation(t *testing.T) {

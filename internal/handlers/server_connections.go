@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
@@ -820,6 +821,10 @@ func isClientConfigConflictError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, vpn.ErrConnectionCreatedConcurrently) {
+		return true
+	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "concurrently") || strings.Contains(msg, "conflict")
+	return strings.Contains(msg, "connection was created concurrently") ||
+		strings.Contains(msg, "conflict detected in connection registration")
 }

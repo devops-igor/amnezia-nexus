@@ -6,14 +6,33 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
+
+var (
+	mimicryPacketsMu       sync.RWMutex
+	generateMimicryPackets = cps.GenerateMimicryPackets
+)
+
+func setGenerateMimicryPacketsForTest(fn func(ctx context.Context, mimicry string, domain string, sshClient ssh.SSHClient) (map[string]string, error)) func() {
+	mimicryPacketsMu.Lock()
+	orig := generateMimicryPackets
+	generateMimicryPackets = fn
+	mimicryPacketsMu.Unlock()
+	return func() {
+		mimicryPacketsMu.Lock()
+		generateMimicryPackets = orig
+		mimicryPacketsMu.Unlock()
+	}
+}
 
 // ErrConnectionCreatedConcurrently is returned when client config generation raced
 // with a concurrent creation of the user's connection while awgConn was nil.
@@ -395,7 +414,10 @@ func resolvePortalI1(ctx context.Context, cfg *models.VPNConfig, clientParams ma
 		if err := ctx.Err(); err != nil {
 			return "", fmt.Errorf("generate portal I1: %w", err)
 		}
-		packets, err := cps.GenerateMimicryPackets(ctx, cfg.DataPlaneI1Protocol(), "", nil)
+		mimicryPacketsMu.RLock()
+		genFn := generateMimicryPackets
+		mimicryPacketsMu.RUnlock()
+		packets, err := genFn(ctx, cfg.DataPlaneI1Protocol(), "", nil)
 		if err != nil {
 			return "", fmt.Errorf("generate portal I1: %w", err)
 		}

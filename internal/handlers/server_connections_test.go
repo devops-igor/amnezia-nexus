@@ -16,6 +16,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 )
 
 func TestServerConnectionsHandlers(t *testing.T) {
@@ -908,6 +909,7 @@ func TestServerConnectionsConfig_ErrorDifferentiation(t *testing.T) {
 			want bool
 		}{
 			{nil, false},
+			{vpn.ErrConnectionCreatedConcurrently, true},
 			{errors.New("connection was created concurrently; retry"), true},
 			{errors.New("conflict detected in connection registration"), true},
 			{errors.New("client not found"), false},

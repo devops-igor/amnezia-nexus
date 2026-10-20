@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -424,7 +425,7 @@ func (h *Handlers) VPNMyConfigHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		h.handleClientConfigError(w, err)
+		h.handleVPNMyConfigError(w, err)
 		return
 	}
 
@@ -435,6 +436,40 @@ func (h *Handlers) VPNMyConfigHandler(w http.ResponseWriter, r *http.Request) {
 		"filename": filename,
 		"vpn_link": vpnLink,
 	})
+}
+
+// handleVPNMyConfigError writes a sanitized error response for VPNMyConfigHandler (/api/vpn/my-config),
+// preserving 400/403/404/409/500 status and code mappings without leaking internal error details (CWE-209).
+func (h *Handlers) handleVPNMyConfigError(w http.ResponseWriter, err error) {
+	if err == nil {
+		return
+	}
+	slog.Error("failed to generate VPN configuration", "error", err)
+
+	if isClientConfigNotFoundError(err) {
+		h.JSONError(w, http.StatusNotFound, "not_found", "Client configuration not found")
+		return
+	}
+	msgLower := strings.ToLower(err.Error())
+	if strings.Contains(msgLower, "unauthorized") || strings.Contains(msgLower, "forbidden") {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Access denied")
+		return
+	}
+	if isClientConfigBadRequestError(err) {
+		code := "bad_request"
+		detail := "Invalid configuration request"
+		if strings.Contains(msgLower, "parameter") {
+			code = "invalid_parameter"
+			detail = "Invalid configuration parameter"
+		}
+		h.JSONError(w, http.StatusBadRequest, code, detail)
+		return
+	}
+	if isClientConfigConflictError(err) {
+		h.JSONError(w, http.StatusConflict, "conflict", "Connection was created concurrently; please retry")
+		return
+	}
+	h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to generate VPN configuration")
 }
 
 // VPNDisconnectHandler terminates active user or session VPN connections.
