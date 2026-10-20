@@ -404,6 +404,11 @@ func (p *Pool) ListTunnels() []*models.BackendTunnel {
 	return result
 }
 
+// GetTunnels returns a copy of all tunnels in the pool. Alias for ListTunnels.
+func (p *Pool) GetTunnels() []*models.BackendTunnel {
+	return p.ListTunnels()
+}
+
 // GetActiveTunnels returns all tunnels currently in "active" status.
 func (p *Pool) GetActiveTunnels() []*models.BackendTunnel {
 	p.mu.RLock()

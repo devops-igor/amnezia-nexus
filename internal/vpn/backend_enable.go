@@ -48,6 +48,42 @@ func (s *Service) restoreBackendDevices(ctx context.Context) {
 	}
 }
 
+// reattachBackendDevicesLocked re-attaches active backend devices with fresh parameters.
+// Must be called with s.mu held.
+func (s *Service) reattachBackendDevicesLocked() {
+	if s.pool == nil || s.backendDevices == nil {
+		return
+	}
+	ctx := context.Background()
+	for _, tun := range s.pool.GetTunnels() {
+		if tun == nil || !tun.Enabled {
+			continue
+		}
+		if s.backendDevices[tun.ID] == nil {
+			continue
+		}
+		var awgParams map[string]any
+		var attachErr error
+		if s.db != nil {
+			srv, err := s.db.GetServer(ctx, tun.ServerID)
+			if err != nil || srv == nil {
+				attachErr = fmt.Errorf("failed to load server %d: %w", tun.ServerID, err)
+			} else if awgInfo, ok := srv.Protocols["awg"].(map[string]any); ok {
+				awgParams, _ = awgInfo["awg_params"].(map[string]any)
+			}
+		} else {
+			attachErr = errors.New("database not available")
+		}
+		if attachErr == nil {
+			attachErr = s.attachBackendForwarder(tun, awgParams)
+		}
+		if attachErr != nil {
+			log.Printf("[vpn] warning: failed to reattach backend device for tunnel %d (server %d): %v", tun.ID, tun.ServerID, attachErr)
+			_ = s.pool.SetTunnelStatus(ctx, tun.ServerID, models.TunnelStatusDegraded, 0)
+		}
+	}
+}
+
 // EnableBackend restores administrative eligibility by loading the backend's
 // AWG credentials, registering (or refreshing) the tunnel, and attaching its
 // data-plane device. It does not declare the backend healthy: runtime health

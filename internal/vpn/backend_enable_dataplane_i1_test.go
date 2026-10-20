@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
@@ -539,6 +540,10 @@ func TestUpdateConfig_DataPlaneI1ProtocolSwitch_UpdatesRunningBackendDevices(t *
 	}
 
 	// 1. Initially attached device has default SIP I1
+	svc.mu.RLock()
+	devInitial := svc.backendDevices[tun.ID]
+	svc.mu.RUnlock()
+
 	i1Initial, ipcInitial := testDeviceIPC(t, svc, tun.ID)
 	assertDeviceIPCI1Payload(t, ipcInitial, "sip")
 	if !strings.HasPrefix(i1Initial, "<b 0x") {
@@ -551,6 +556,14 @@ func TestUpdateConfig_DataPlaneI1ProtocolSwitch_UpdatesRunningBackendDevices(t *
 	}
 	if err := svc.UpdateConfig(ctx, cfgWithDNS); err != nil {
 		t.Fatalf("UpdateConfig(dns) failed: %v", err)
+	}
+
+	// Verify device instance was re-attached with new instance
+	svc.mu.RLock()
+	devDNS := svc.backendDevices[tun.ID]
+	svc.mu.RUnlock()
+	if devInitial == devDNS {
+		t.Fatalf("expected backend device to be re-attached with new instance, got same pointer")
 	}
 
 	// Read dev.DeviceIPC() and assert that live device IPC now contains the DNS I1 packet!
@@ -571,6 +584,13 @@ func TestUpdateConfig_DataPlaneI1ProtocolSwitch_UpdatesRunningBackendDevices(t *
 		t.Fatalf("UpdateConfig(sip) failed: %v", err)
 	}
 
+	svc.mu.RLock()
+	devSIP := svc.backendDevices[tun.ID]
+	svc.mu.RUnlock()
+	if devDNS == devSIP {
+		t.Fatalf("expected backend device to be re-attached with new instance, got same pointer")
+	}
+
 	i1SIP, ipcSIP := testDeviceIPC(t, svc, tun.ID)
 	assertDeviceIPCI1Payload(t, ipcSIP, "sip")
 	if !strings.HasPrefix(i1SIP, "<b 0x") {
@@ -578,5 +598,134 @@ func TestUpdateConfig_DataPlaneI1ProtocolSwitch_UpdatesRunningBackendDevices(t *
 	}
 	if !strings.Contains(ipcSIP, "i1="+i1SIP+"\n") {
 		t.Fatalf("expected live device IPC to contain switched back SIP i1 line, got:\n%s", ipcSIP)
+	}
+}
+
+func TestUpdateConfig_DataPlaneI1ProtocolSwitch_GeneratorFailureMarksTunnelDegraded(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+
+	srvID := testNewServerWithAWGParams(t, svc, "198.51.100.100", map[string]any{"s1": 15, "s2": 40})
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("EnableBackend: %v", err)
+	}
+
+	tun, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel: %v", err)
+	}
+	if tun.Status != models.TunnelStatusActive && tun.Status != TunnelStatusActive {
+		t.Fatalf("expected active tunnel before switch, got %q", tun.Status)
+	}
+
+	restoreGen := setGenerateMimicryPacketsForTest(func(ctx context.Context, mimicry, domain string, sshClient ssh.SSHClient) (map[string]string, error) {
+		return nil, errors.New("simulated generator failure")
+	})
+	defer restoreGen()
+
+	cfgWithDNS := &models.VPNConfig{
+		VPNDataPlaneI1Protocol: "dns",
+	}
+	if err := svc.UpdateConfig(ctx, cfgWithDNS); err != nil {
+		t.Fatalf("UpdateConfig unexpected error: %v", err)
+	}
+
+	tunAfter, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel after switch: %v", err)
+	}
+	if tunAfter.Status != models.TunnelStatusDegraded {
+		t.Fatalf("expected tunnel status to become %q on generator failure, got %q", models.TunnelStatusDegraded, tunAfter.Status)
+	}
+}
+
+func TestUpdateConfig_DataPlaneI1ProtocolSwitch_MultipleRunningBackendDevices(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+
+	srv1 := testNewServerWithAWGParams(t, svc, "198.51.100.101", map[string]any{"s1": 15, "s2": 40})
+	srv2 := testNewServerWithAWGParams(t, svc, "198.51.100.102", map[string]any{"s1": 15, "s2": 40})
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+	if err := svc.EnableBackend(ctx, srv1); err != nil {
+		t.Fatalf("EnableBackend(1): %v", err)
+	}
+	if err := svc.EnableBackend(ctx, srv2); err != nil {
+		t.Fatalf("EnableBackend(2): %v", err)
+	}
+
+	tun1, _ := svc.pool.GetTunnel(srv1)
+	tun2, _ := svc.pool.GetTunnel(srv2)
+
+	cfgWithDNS := &models.VPNConfig{
+		VPNDataPlaneI1Protocol: "dns",
+	}
+	if err := svc.UpdateConfig(ctx, cfgWithDNS); err != nil {
+		t.Fatalf("UpdateConfig: %v", err)
+	}
+
+	i1DNS1, ipc1 := testDeviceIPC(t, svc, tun1.ID)
+	i1DNS2, ipc2 := testDeviceIPC(t, svc, tun2.ID)
+	assertDeviceIPCI1Payload(t, ipc1, "dns")
+	assertDeviceIPCI1Payload(t, ipc2, "dns")
+	if !strings.HasPrefix(i1DNS1, "<r 2><b 0x") || !strings.HasPrefix(i1DNS2, "<r 2><b 0x") {
+		t.Fatalf("expected DNS I1 prefix on both devices, got dev1=%q dev2=%q", i1DNS1, i1DNS2)
+	}
+}
+
+func TestUpdateConfig_DataPlaneI1ProtocolSwitch_NoDataRaceWithLiveTimers(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+
+	srvID := testNewServerWithAWGParams(t, svc, "198.51.100.103", map[string]any{
+		"s1":                            15,
+		"s2":                            40,
+		"rekey_timeout":                 "1",
+		"persistent_keepalive_interval": "1",
+	})
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("EnableBackend: %v", err)
+	}
+
+	tun, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel: %v", err)
+	}
+
+	// Switch protocol repeatedly between DNS and SIP while timers are active
+	for i := 0; i < 6; i++ {
+		proto := "dns"
+		if i%2 == 1 {
+			proto = "sip"
+		}
+		if err := svc.UpdateConfig(ctx, &models.VPNConfig{VPNDataPlaneI1Protocol: proto}); err != nil {
+			t.Fatalf("UpdateConfig(%s) failed: %v", proto, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	i1Final, ipcFinal := testDeviceIPC(t, svc, tun.ID)
+	assertDeviceIPCI1Payload(t, ipcFinal, "sip")
+	if !strings.HasPrefix(i1Final, "<b 0x") {
+		t.Fatalf("expected SIP I1 after final switch, got %q", i1Final)
 	}
 }
