@@ -63,12 +63,12 @@ func ParseCPSBlob(tagStr string) ([]byte, error) {
 			return nil, fmt.Errorf("invalid hex in CPS blob: %w", err)
 		}
 
-		if rCount > 0 && len(raw) >= rCount {
+		if rCount > 0 {
 			rnd := make([]byte, rCount)
 			if _, err := rand.Read(rnd); err != nil {
 				return nil, fmt.Errorf("failed to generate random prefix: %w", err)
 			}
-			copy(raw[:rCount], rnd)
+			raw = append(rnd, raw...)
 		}
 		return raw, nil
 	}
@@ -88,13 +88,8 @@ func GenerateCPSPackets(profile string, domain string) (map[string]string, error
 		if err != nil {
 			return nil, err
 		}
-		txid := make([]byte, 2)
-		if _, err := rand.Read(txid); err != nil {
-			return nil, err
-		}
-		i1Raw := append(txid, dnsPayload...)
 		return map[string]string{
-			"i1": fmt.Sprintf("<r 2><b 0x%x>", i1Raw),
+			"i1": fmt.Sprintf("<r 2><b 0x%x>", dnsPayload),
 			"i2": "",
 			"i3": "",
 			"i4": "",
@@ -181,13 +176,8 @@ func GenerateMimicryPackets(ctx context.Context, mimicry string, domain string, 
 		if err != nil {
 			return nil, err
 		}
-		txid := make([]byte, 2)
-		if _, err := rand.Read(txid); err != nil {
-			return nil, err
-		}
-		i1Raw := append(txid, dnsPayload...)
 		return map[string]string{
-			"i1": fmt.Sprintf("<r 2><b 0x%x>", i1Raw),
+			"i1": fmt.Sprintf("<r 2><b 0x%x>", dnsPayload),
 			"i2": "",
 			"i3": "",
 			"i4": "",

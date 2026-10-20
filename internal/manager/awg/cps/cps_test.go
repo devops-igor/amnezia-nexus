@@ -171,12 +171,12 @@ func TestCPSBlobConversion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseCPSBlob with <r 2> failed: %v", err)
 	}
-	if len(rParsed) != 4 {
-		t.Fatalf("expected 4 bytes, got %d", len(rParsed))
+	if len(rParsed) != 6 {
+		t.Fatalf("expected 6 bytes, got %d", len(rParsed))
 	}
-	// Bytes 2 and 3 should match 0x33, 0x44
-	if rParsed[2] != 0x33 || rParsed[3] != 0x44 {
-		t.Errorf("non-random suffix changed: %x", rParsed)
+	// Suffix should match original data bytes [0x11, 0x22, 0x33, 0x44]
+	if !bytes.Equal(rParsed[2:], []byte{0x11, 0x22, 0x33, 0x44}) {
+		t.Errorf("data suffix changed: expected [11 22 33 44], got %x", rParsed[2:])
 	}
 
 	// Invalid tags
