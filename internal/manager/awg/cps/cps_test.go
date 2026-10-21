@@ -357,6 +357,9 @@ func (m *mockCPSSSHClient) GetServerID() *int64 {
 func (m *mockCPSSSHClient) GetLastActive() time.Time {
 	return time.Now()
 }
+func (m *mockCPSSSHClient) InUse() bool {
+	return false
+}
 
 func TestSelectMimicryDomain(t *testing.T) {
 	ctx := context.Background()

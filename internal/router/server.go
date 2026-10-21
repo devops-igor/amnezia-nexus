@@ -62,7 +62,7 @@ func NewServer(cfg *config.Config, handler http.Handler, db ...*database.DB) *Se
 			Handler:           handler,
 			ReadHeaderTimeout: 10 * time.Second,
 			ReadTimeout:       30 * time.Second,
-			WriteTimeout:      60 * time.Second,
+			WriteTimeout:      300 * time.Second,
 			IdleTimeout:       120 * time.Second,
 		},
 	}

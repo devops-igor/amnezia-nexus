@@ -165,6 +165,10 @@ func (m *mockDNSSSHClient) GetLastActive() time.Time {
 	return time.Now()
 }
 
+func (m *mockDNSSSHClient) InUse() bool {
+	return false
+}
+
 type mockDNSSSHProvider struct {
 	client *mockDNSSSHClient
 }

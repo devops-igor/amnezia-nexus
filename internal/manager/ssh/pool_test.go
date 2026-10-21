@@ -300,3 +300,107 @@ func TestPoolKeyHelpers(t *testing.T) {
 		t.Fatalf("expected empty key for nil server")
 	}
 }
+
+func TestSSHClientPool_SweepActiveNotEvicted(t *testing.T) {
+	server := NewMockSSHServer(t, "root", "pass")
+	defer server.Close()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	server.SetCommandHandler("long-op", func(cmd string, stdin []byte) (stdout, stderr string, exitCode int) {
+		close(started)
+		<-release
+		return "completed", "", 0
+	})
+
+	ctx := context.Background()
+	store := newMemoryHostKeyStore()
+
+	pool := NewSSHClientPool(PoolConfig{
+		IdleTimeout:     100 * time.Millisecond,
+		SweepInterval:   30 * time.Millisecond,
+		KeepAlivePeriod: 1 * time.Second,
+	}, store)
+	defer pool.Close()
+
+	sModel := &models.Server{
+		ID:      305,
+		Host:    server.Host(),
+		SSHPort: server.Port(),
+		SSHUser: "root",
+		SSHPass: "pass",
+	}
+
+	client, err := pool.Get(ctx, sModel)
+	if err != nil {
+		t.Fatalf("pool.Get failed: %v", err)
+	}
+
+	if client.InUse() {
+		t.Fatal("expected client to not be InUse initially")
+	}
+
+	cmdErrCh := make(chan error, 1)
+	cmdOutCh := make(chan string, 1)
+
+	go func() {
+		out, _, code, err := client.RunCommand(ctx, "long-op")
+		if err != nil || code != 0 {
+			cmdErrCh <- fmt.Errorf("code=%d, err=%w", code, err)
+			return
+		}
+		cmdOutCh <- out
+		cmdErrCh <- nil
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for command to start")
+	}
+
+	if !client.InUse() {
+		t.Fatal("expected client to be InUse while command is running")
+	}
+
+	// Sleep past IdleTimeout (100ms) while sweeper runs every 30ms
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify connection was NOT swept / closed because it is InUse
+	if pool.Len() != 1 {
+		t.Fatalf("expected pool length 1 during active execution, got %d", pool.Len())
+	}
+	if !client.IsAlive() {
+		t.Fatal("expected active client to remain alive")
+	}
+
+	// Release command and verify completion
+	close(release)
+
+	select {
+	case err := <-cmdErrCh:
+		if err != nil {
+			t.Fatalf("command failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for command to finish")
+	}
+
+	out := <-cmdOutCh
+	if out != "completed" {
+		t.Fatalf("expected stdout 'completed', got %q", out)
+	}
+
+	if client.InUse() {
+		t.Fatal("expected client to not be InUse after command completion")
+	}
+
+	// Wait past IdleTimeout again now that it is idle
+	time.Sleep(250 * time.Millisecond)
+
+	// Now genuine idle eviction should have evicted the connection
+	if pool.Len() != 0 {
+		t.Fatalf("expected pool length 0 after idle timeout, got %d", pool.Len())
+	}
+}

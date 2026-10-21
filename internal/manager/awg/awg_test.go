@@ -250,6 +250,10 @@ func (m *mockAWGSSHClient) GetLastActive() time.Time {
 	return time.Now()
 }
 
+func (m *mockAWGSSHClient) InUse() bool {
+	return false
+}
+
 type mockAWGSSHProvider struct {
 	client *mockAWGSSHClient
 }
