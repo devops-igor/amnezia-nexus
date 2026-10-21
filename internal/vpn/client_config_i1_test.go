@@ -165,7 +165,7 @@ func TestGenerateClientConfig_ConcurrentFirstFetch_Explicit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const rounds = 5
+	const rounds = 20
 	const concurrency = 4
 	for r := 0; r < rounds; r++ {
 		uID, err := db.CreateUser(ctx, &models.User{Username: fmt.Sprintf("race-exp-user-%d", r), Enabled: true})
@@ -178,7 +178,9 @@ func TestGenerateClientConfig_ConcurrentFirstFetch_Explicit(t *testing.T) {
 			t.Fatal(err)
 		}
 		var wg sync.WaitGroup
-		out := make([]string, concurrency)
+		outI1 := make([]string, concurrency)
+		outPriv := make([]string, concurrency)
+		outAddr := make([]string, concurrency)
 		errs := make([]error, concurrency)
 		start := make(chan struct{})
 		for i := 0; i < concurrency; i++ {
@@ -189,7 +191,9 @@ func TestGenerateClientConfig_ConcurrentFirstFetch_Explicit(t *testing.T) {
 				cfg, _, err := svc.GenerateClientConfigForConnection(ctx, uID, connID)
 				errs[i] = err
 				if err == nil {
-					out[i] = parseDirectiveString(t, cfg, "I1")
+					outI1[i] = parseDirectiveString(t, cfg, "I1")
+					outPriv[i] = parseDirectiveString(t, cfg, "PrivateKey")
+					outAddr[i] = parseDirectiveString(t, cfg, "Address")
 				}
 			}(i)
 		}
@@ -208,11 +212,138 @@ func TestGenerateClientConfig_ConcurrentFirstFetch_Explicit(t *testing.T) {
 		if persistedI1 == "" {
 			t.Fatalf("round %d: persisted portal_i1 is empty", r)
 		}
-		for i, v := range out {
-			if v != persistedI1 {
-				t.Fatalf("round %d: goroutine %d got I1 %q, want persisted %q", r, i, v, persistedI1)
+		persistedPriv, _ := persisted.ClientParams["client_private_key"].(string)
+		if persistedPriv == "" {
+			t.Fatalf("round %d: persisted client_private_key is empty", r)
+		}
+		persistedIP, _ := persisted.ClientParams["assigned_ip"].(string)
+		if persistedIP == "" {
+			t.Fatalf("round %d: persisted assigned_ip is empty", r)
+		}
+		expectedAddr := fmt.Sprintf("%s/32", persistedIP)
+
+		for i := 0; i < concurrency; i++ {
+			if outI1[i] != persistedI1 {
+				t.Fatalf("round %d: goroutine %d got I1 %q, want persisted %q", r, i, outI1[i], persistedI1)
+			}
+			if outPriv[i] != persistedPriv {
+				t.Fatalf("round %d: goroutine %d got PrivateKey %q, want persisted %q", r, i, outPriv[i], persistedPriv)
+			}
+			if outAddr[i] != expectedAddr {
+				t.Fatalf("round %d: goroutine %d got Address %q, want persisted %q", r, i, outAddr[i], expectedAddr)
+			}
+			if outPriv[i] != outPriv[0] {
+				t.Fatalf("round %d: goroutine %d divergent key %q != %q", r, i, outPriv[i], outPriv[0])
+			}
+			if outAddr[i] != outAddr[0] {
+				t.Fatalf("round %d: goroutine %d divergent address %q != %q", r, i, outAddr[i], outAddr[0])
 			}
 		}
+	}
+}
+
+func TestGenerateClientConfig_InitializedConnection_NeverMutatesKeys(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	uID, err := db.CreateUser(ctx, &models.User{Username: "init-stable-user", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &models.UserConnection{UserID: uID, ServerID: 0, Protocol: "awg", Name: "init-stable-conn"}
+	connID, err := db.CreateConnection(ctx, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	initialCfg, _, err := svc.GenerateClientConfigForConnection(ctx, uID, connID)
+	if err != nil {
+		t.Fatalf("initial GenerateClientConfigForConnection failed: %v", err)
+	}
+
+	initialConn, err := db.GetConnection(ctx, connID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialPriv := parseDirectiveString(t, initialCfg, "PrivateKey")
+	initialAddr := parseDirectiveString(t, initialCfg, "Address")
+	initialI1 := parseDirectiveString(t, initialCfg, "I1")
+	initialClientID := initialConn.ClientID
+
+	if initialPriv == "" || initialClientID == "" {
+		t.Fatal("expected non-empty initial keys")
+	}
+
+	// Sequential fetches must return identical configs without mutating database row
+	for seq := 0; seq < 5; seq++ {
+		cfg, _, err := svc.GenerateClientConfigForConnection(ctx, uID, connID)
+		if err != nil {
+			t.Fatalf("sequential fetch %d failed: %v", seq, err)
+		}
+		if priv := parseDirectiveString(t, cfg, "PrivateKey"); priv != initialPriv {
+			t.Fatalf("sequential fetch %d mutated PrivateKey: got %q, want %q", seq, priv, initialPriv)
+		}
+		if addr := parseDirectiveString(t, cfg, "Address"); addr != initialAddr {
+			t.Fatalf("sequential fetch %d mutated Address: got %q, want %q", seq, addr, initialAddr)
+		}
+		if i1 := parseDirectiveString(t, cfg, "I1"); i1 != initialI1 {
+			t.Fatalf("sequential fetch %d mutated I1: got %q, want %q", seq, i1, initialI1)
+		}
+	}
+
+	// Concurrent subsequent fetches must also never mutate keys
+	const concurrency = 8
+	var wg sync.WaitGroup
+	errs := make([]error, concurrency)
+	cfgs := make([]string, concurrency)
+	start := make(chan struct{})
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			c, _, err := svc.GenerateClientConfigForConnection(ctx, uID, connID)
+			errs[i] = err
+			cfgs[i] = c
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent subsequent fetch goroutine %d failed: %v", i, err)
+		}
+		if priv := parseDirectiveString(t, cfgs[i], "PrivateKey"); priv != initialPriv {
+			t.Fatalf("concurrent subsequent fetch goroutine %d mutated PrivateKey: got %q, want %q", i, priv, initialPriv)
+		}
+		if addr := parseDirectiveString(t, cfgs[i], "Address"); addr != initialAddr {
+			t.Fatalf("concurrent subsequent fetch goroutine %d mutated Address: got %q, want %q", i, addr, initialAddr)
+		}
+		if i1 := parseDirectiveString(t, cfgs[i], "I1"); i1 != initialI1 {
+			t.Fatalf("concurrent subsequent fetch goroutine %d mutated I1: got %q, want %q", i, i1, initialI1)
+		}
+	}
+
+	finalConn, err := db.GetConnection(ctx, connID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalConn.ClientID != initialClientID {
+		t.Fatalf("persisted ClientID mutated: got %q, want %q", finalConn.ClientID, initialClientID)
+	}
+	if priv, _ := finalConn.ClientParams["client_private_key"].(string); priv != initialPriv {
+		t.Fatalf("persisted client_private_key mutated: got %q, want %q", priv, initialPriv)
+	}
+	if ip, _ := finalConn.ClientParams["assigned_ip"].(string); fmt.Sprintf("%s/32", ip) != initialAddr {
+		t.Fatalf("persisted assigned_ip mutated: got %q, want %q", fmt.Sprintf("%s/32", ip), initialAddr)
+	}
+	if i1, _ := finalConn.ClientParams["portal_i1"].(string); i1 != initialI1 {
+		t.Fatalf("persisted portal_i1 mutated: got %q, want %q", i1, initialI1)
 	}
 }
 
@@ -235,7 +366,9 @@ func TestGenerateClientConfig_ConcurrentFirstFetch_Implicit(t *testing.T) {
 			t.Fatal(err)
 		}
 		var wg sync.WaitGroup
-		out := make([]string, concurrency)
+		outI1 := make([]string, concurrency)
+		outPriv := make([]string, concurrency)
+		outAddr := make([]string, concurrency)
 		errs := make([]error, concurrency)
 		start := make(chan struct{})
 		for i := 0; i < concurrency; i++ {
@@ -246,7 +379,9 @@ func TestGenerateClientConfig_ConcurrentFirstFetch_Implicit(t *testing.T) {
 				cfg, _, err := svc.GenerateClientConfig(ctx, uID)
 				errs[i] = err
 				if err == nil {
-					out[i] = parseDirectiveString(t, cfg, "I1")
+					outI1[i] = parseDirectiveString(t, cfg, "I1")
+					outPriv[i] = parseDirectiveString(t, cfg, "PrivateKey")
+					outAddr[i] = parseDirectiveString(t, cfg, "Address")
 				}
 			}(i)
 		}
@@ -265,9 +400,30 @@ func TestGenerateClientConfig_ConcurrentFirstFetch_Implicit(t *testing.T) {
 		if persistedI1 == "" {
 			t.Fatalf("round %d: persisted portal_i1 is empty", r)
 		}
-		for i, v := range out {
-			if v != persistedI1 {
-				t.Fatalf("round %d: goroutine %d got I1 %q, want persisted %q", r, i, v, persistedI1)
+		persistedPriv, _ := persisted.ClientParams["client_private_key"].(string)
+		if persistedPriv == "" {
+			t.Fatalf("round %d: persisted client_private_key is empty", r)
+		}
+		persistedIP, _ := persisted.ClientParams["assigned_ip"].(string)
+		if persistedIP == "" {
+			t.Fatalf("round %d: persisted assigned_ip is empty", r)
+		}
+		expectedAddr := fmt.Sprintf("%s/32", persistedIP)
+		for i := 0; i < concurrency; i++ {
+			if outI1[i] != persistedI1 {
+				t.Fatalf("round %d: goroutine %d got I1 %q, want persisted %q", r, i, outI1[i], persistedI1)
+			}
+			if outPriv[i] != persistedPriv {
+				t.Fatalf("round %d: goroutine %d got PrivateKey %q, want persisted %q", r, i, outPriv[i], persistedPriv)
+			}
+			if outAddr[i] != expectedAddr {
+				t.Fatalf("round %d: goroutine %d got Address %q, want persisted %q", r, i, outAddr[i], expectedAddr)
+			}
+			if outPriv[i] != outPriv[0] {
+				t.Fatalf("round %d: goroutine %d divergent key %q != %q", r, i, outPriv[i], outPriv[0])
+			}
+			if outAddr[i] != outAddr[0] {
+				t.Fatalf("round %d: goroutine %d divergent address %q != %q", r, i, outAddr[i], outAddr[0])
 			}
 		}
 	}
