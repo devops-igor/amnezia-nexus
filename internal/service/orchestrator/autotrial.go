@@ -21,21 +21,22 @@ type MimicryRotator interface {
 	RotateMimicry(ctx context.Context, server *models.Server, clientID string) (string, error)
 }
 
-// NextMimicryProfile calculates the next mimicry profile in rotation order.
+// NextMimicryProfile calculates the next mimicry profile in rotation order:
+// auto -> sip -> dns -> quic -> tls -> sip.
 func NextMimicryProfile(current models.AWGMimicryProfile) models.AWGMimicryProfile {
 	switch current {
 	case models.AWGMimicryAuto, "":
-		return models.AWGMimicryTLS
-	case models.AWGMimicryTLS:
-		return models.AWGMimicryQUIC
-	case models.AWGMimicryQUIC:
-		return models.AWGMimicryDNS
-	case models.AWGMimicryDNS:
 		return models.AWGMimicrySIP
 	case models.AWGMimicrySIP:
+		return models.AWGMimicryDNS
+	case models.AWGMimicryDNS:
+		return models.AWGMimicryQUIC
+	case models.AWGMimicryQUIC:
 		return models.AWGMimicryTLS
+	case models.AWGMimicryTLS:
+		return models.AWGMimicrySIP
 	default:
-		return models.AWGMimicryTLS
+		return models.AWGMimicrySIP
 	}
 }
 

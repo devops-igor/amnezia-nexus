@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"golang.org/x/crypto/curve25519"
@@ -488,10 +489,10 @@ func TestAWGManager_RotateMimicry(t *testing.T) {
 	server := &models.Server{ID: 1, Host: "1.2.3.4"}
 
 	// Initial client has awg_mimicry: "tls"
-	// Sequence: tls -> quic -> dns -> sip -> tls
+	// Sequence: auto -> sip -> dns -> quic -> tls -> sip
 	proto1, err := mgr.RotateMimicry(ctx, server, "pubkey1")
-	if err != nil || proto1 != "quic" {
-		t.Fatalf("RotateMimicry 1 expected quic, got %s, err: %v", proto1, err)
+	if err != nil || proto1 != "sip" {
+		t.Fatalf("RotateMimicry 1 expected sip, got %s, err: %v", proto1, err)
 	}
 
 	proto2, err := mgr.RotateMimicry(ctx, server, "pubkey1")
@@ -500,8 +501,8 @@ func TestAWGManager_RotateMimicry(t *testing.T) {
 	}
 
 	proto3, err := mgr.RotateMimicry(ctx, server, "pubkey1")
-	if err != nil || proto3 != "sip" {
-		t.Fatalf("RotateMimicry 3 expected sip, got %s, err: %v", proto3, err)
+	if err != nil || proto3 != "quic" {
+		t.Fatalf("RotateMimicry 3 expected quic, got %s, err: %v", proto3, err)
 	}
 
 	proto4, err := mgr.RotateMimicry(ctx, server, "pubkey1")
@@ -509,20 +510,25 @@ func TestAWGManager_RotateMimicry(t *testing.T) {
 		t.Fatalf("RotateMimicry 4 expected tls, got %s, err: %v", proto4, err)
 	}
 
+	proto5, err := mgr.RotateMimicry(ctx, server, "pubkey1")
+	if err != nil || proto5 != "sip" {
+		t.Fatalf("RotateMimicry 5 expected sip, got %s, err: %v", proto5, err)
+	}
+
 	clients, _ := mgr.getClientsTable(ctx, client)
-	if clients[0].UserData.AWGMimicry != "tls" {
-		t.Errorf("expected clientsTable mimicry tls, got %s", clients[0].UserData.AWGMimicry)
+	if clients[0].UserData.AWGMimicry != "sip" {
+		t.Errorf("expected clientsTable mimicry sip, got %s", clients[0].UserData.AWGMimicry)
 	}
 	if clients[0].UserData.RotatedAt == "" {
 		t.Errorf("expected rotated_at timestamp to be set")
 	}
 
-	// Test auto -> tls
+	// Test auto -> sip
 	clients[0].UserData.AWGMimicry = "auto"
 	_ = mgr.saveClientsTable(ctx, client, clients)
 	protoAuto, err := mgr.RotateMimicry(ctx, server, "pubkey1")
-	if err != nil || protoAuto != "tls" {
-		t.Fatalf("RotateMimicry from auto expected tls, got %s, err: %v", protoAuto, err)
+	if err != nil || protoAuto != "sip" {
+		t.Fatalf("RotateMimicry from auto expected sip, got %s, err: %v", protoAuto, err)
 	}
 
 	// Error cases
@@ -1371,8 +1377,8 @@ func TestInstall_HeaderProtectionDefaultOn(t *testing.T) {
 	}
 }
 
-// generateAWGParamsForInstall mirrors Install()'s header-protection defaulting
-// logic so the default-on contract is testable without touching live hosts.
+// generateAWGParamsForInstall mirrors Install()'s parameter and CPS defaulting
+// logic so the install defaults contract is testable without touching live hosts.
 func generateAWGParamsForInstall(params map[string]any) (*AWGParams, error) {
 	profile := "standard"
 	if p, ok := params["awg_profile"]; ok && fmt.Sprint(p) != "" {
@@ -1382,7 +1388,156 @@ func generateAWGParamsForInstall(params map[string]any) (*AWGParams, error) {
 	if v, ok := parseBoolParam(params["awg_header_protection"]); ok {
 		hpOn = v
 	}
-	return GenerateAWGParams(profile, hpOn)
+	awgParams, err := GenerateAWGParams(profile, hpOn)
+	if err != nil {
+		return nil, err
+	}
+	cpsProto := "sip"
+	if params != nil {
+		if cp, ok := params["awg_cps_protocol"]; ok && fmt.Sprint(cp) != "" {
+			cpsProto = strings.ToLower(strings.TrimSpace(fmt.Sprint(cp)))
+		}
+	}
+	d := cps.FallbackDomains[cpsProto]
+	if cpsPackets, err := cps.GenerateCPSPackets(profile, d, cpsProto); err == nil {
+		awgParams.I1 = cpsPackets["i1"]
+		awgParams.I2 = cpsPackets["i2"]
+		awgParams.I3 = cpsPackets["i3"]
+		awgParams.I4 = cpsPackets["i4"]
+		awgParams.I5 = cpsPackets["i5"]
+	}
+	return awgParams, nil
+}
+
+func TestInstall_ProducesSIPI1ByDefault_StandardAndLite(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name    string
+		params  map[string]any
+		checkI1 func(t *testing.T, p *AWGParams)
+	}{
+		{
+			name:   "standard_defaults_to_sip",
+			params: map[string]any{"port": "55424", "awg_profile": "standard"},
+			checkI1: func(t *testing.T, p *AWGParams) {
+				t.Helper()
+				if !strings.HasPrefix(p.I1, "<b 0x") {
+					t.Fatalf("expected I1 to have '<b 0x' tag, got: %s", p.I1)
+				}
+				raw, err := cps.ParseCPSBlob(p.I1)
+				if err != nil {
+					t.Fatalf("ParseCPSBlob failed: %v", err)
+				}
+				rawStr := string(raw)
+				if !strings.Contains(rawStr, "REGISTER sip:") {
+					t.Errorf("expected I1 to contain 'REGISTER sip:', got: %s", rawStr)
+				}
+				if !strings.Contains(rawStr, "Content-Length: 0") {
+					t.Errorf("expected I1 to contain 'Content-Length: 0', got: %s", rawStr)
+				}
+			},
+		},
+		{
+			name:   "lite_defaults_to_sip",
+			params: map[string]any{"port": "55424", "awg_profile": "lite"},
+			checkI1: func(t *testing.T, p *AWGParams) {
+				t.Helper()
+				if !strings.HasPrefix(p.I1, "<b 0x") {
+					t.Fatalf("expected I1 to have '<b 0x' tag, got: %s", p.I1)
+				}
+				raw, err := cps.ParseCPSBlob(p.I1)
+				if err != nil {
+					t.Fatalf("ParseCPSBlob failed: %v", err)
+				}
+				rawStr := string(raw)
+				if !strings.Contains(rawStr, "REGISTER sip:") {
+					t.Errorf("expected I1 to contain 'REGISTER sip:', got: %s", rawStr)
+				}
+				if !strings.Contains(rawStr, "Content-Length: 0") {
+					t.Errorf("expected I1 to contain 'Content-Length: 0', got: %s", rawStr)
+				}
+			},
+		},
+		{
+			name: "standard_respects_explicit_dns",
+			params: map[string]any{
+				"port":             "55424",
+				"awg_profile":      "standard",
+				"awg_cps_protocol": "dns",
+			},
+			checkI1: func(t *testing.T, p *AWGParams) {
+				t.Helper()
+				if !strings.HasPrefix(p.I1, "<r 2><b 0x") {
+					t.Fatalf("expected dns I1 to have '<r 2><b 0x' tag, got: %s", p.I1)
+				}
+				raw, err := cps.ParseCPSBlob(p.I1)
+				if err != nil {
+					t.Fatalf("ParseCPSBlob failed: %v", err)
+				}
+				if len(raw) < 12 {
+					t.Errorf("dns packet too short: %d bytes", len(raw))
+				}
+			},
+		},
+		{
+			name: "standard_respects_explicit_quic",
+			params: map[string]any{
+				"port":             "55424",
+				"awg_profile":      "standard",
+				"awg_cps_protocol": "quic",
+			},
+			checkI1: func(t *testing.T, p *AWGParams) {
+				t.Helper()
+				if !strings.HasPrefix(p.I1, "<b 0x") {
+					t.Fatalf("expected quic I1 to start with '<b 0x', got: %s", p.I1)
+				}
+				raw, err := cps.ParseCPSBlob(p.I1)
+				if err != nil {
+					t.Fatalf("ParseCPSBlob failed: %v", err)
+				}
+				if strings.Contains(string(raw), "SIP/2.0") {
+					t.Errorf("expected QUIC packet, got SIP: %s", string(raw))
+				}
+			},
+		},
+		{
+			name: "lite_respects_explicit_dns",
+			params: map[string]any{
+				"port":             "55424",
+				"awg_profile":      "lite",
+				"awg_cps_protocol": "dns",
+			},
+			checkI1: func(t *testing.T, p *AWGParams) {
+				t.Helper()
+				if !strings.HasPrefix(p.I1, "<r 2><b 0x") {
+					t.Fatalf("expected dns I1 to have '<r 2><b 0x' tag, got: %s", p.I1)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newMockAWGSSHClient()
+			provider := &mockAWGSSHProvider{client: client}
+			mgr := NewAWGManager(provider)
+			server := &models.Server{ID: 1, Host: "198.51.100.10"}
+
+			var captured *AWGParams
+			mgr.SetInstallHookForTest(func(p *AWGParams) {
+				captured = p
+			})
+
+			if err := mgr.Install(ctx, server, tt.params); err != nil {
+				t.Fatalf("Install failed: %v", err)
+			}
+			if captured == nil {
+				t.Fatalf("installHook was not called")
+			}
+			tt.checkI1(t, captured)
+		})
+	}
 }
 
 func TestGetServerStatus_ProtocolGenerationEnrichment(t *testing.T) {

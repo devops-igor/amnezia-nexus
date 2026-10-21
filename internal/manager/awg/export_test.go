@@ -34,3 +34,8 @@ func NewAWGManagerWithServerLocks(pool SSHProvider, r *ServerLockRegistry) *AWGM
 	mgr.serverLocks = r
 	return mgr
 }
+
+// SetInstallHookForTest registers an interception hook called with the generated AWGParams during Install.
+func (m *AWGManager) SetInstallHookForTest(h func(*AWGParams)) {
+	m.installHook = h
+}

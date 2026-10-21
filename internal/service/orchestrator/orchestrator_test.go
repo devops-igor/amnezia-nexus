@@ -1905,13 +1905,13 @@ func TestNextMimicryProfile(t *testing.T) {
 		in   models.AWGMimicryProfile
 		want models.AWGMimicryProfile
 	}{
-		{models.AWGMimicryAuto, models.AWGMimicryTLS},
-		{models.AWGMimicryTLS, models.AWGMimicryQUIC},
-		{models.AWGMimicryQUIC, models.AWGMimicryDNS},
-		{models.AWGMimicryDNS, models.AWGMimicrySIP},
-		{models.AWGMimicrySIP, models.AWGMimicryTLS},
-		{"", models.AWGMimicryTLS},
-		{"unknown", models.AWGMimicryTLS},
+		{models.AWGMimicryAuto, models.AWGMimicrySIP},
+		{models.AWGMimicrySIP, models.AWGMimicryDNS},
+		{models.AWGMimicryDNS, models.AWGMimicryQUIC},
+		{models.AWGMimicryQUIC, models.AWGMimicryTLS},
+		{models.AWGMimicryTLS, models.AWGMimicrySIP},
+		{"", models.AWGMimicrySIP},
+		{"unknown", models.AWGMimicrySIP},
 	}
 
 	for _, tc := range cases {

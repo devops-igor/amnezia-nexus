@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -386,5 +387,207 @@ func TestSelectMimicryDomain(t *testing.T) {
 	mp, err := GenerateMimicryPackets(ctx, "auto", "", mockSuccess)
 	if err != nil || mp["i1"] == "" {
 		t.Errorf("GenerateMimicryPackets(auto) failed: %v", err)
+	}
+}
+
+func TestGenerateMimicryPackets_AutoResolvesToSIP(t *testing.T) {
+	ctx := context.Background()
+	mockSuccess := &mockCPSSSHClient{fail: false}
+
+	tests := []struct {
+		name      string
+		mimicry   string
+		sshClient *mockCPSSSHClient
+	}{
+		{name: "empty_mimicry_nil_client", mimicry: "", sshClient: nil},
+		{name: "auto_mimicry_nil_client", mimicry: "auto", sshClient: nil},
+		{name: "empty_mimicry_with_client", mimicry: "", sshClient: mockSuccess},
+		{name: "auto_mimicry_with_client", mimicry: "auto", sshClient: mockSuccess},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var client ssh.SSHClient
+			if tt.sshClient != nil {
+				client = tt.sshClient
+			}
+			pkts, err := GenerateMimicryPackets(ctx, tt.mimicry, "", client)
+			if err != nil {
+				t.Fatalf("GenerateMimicryPackets(%q) failed: %v", tt.mimicry, err)
+			}
+			i1 := pkts["i1"]
+			if i1 == "" {
+				t.Fatalf("expected non-empty i1")
+			}
+			raw, err := ParseCPSBlob(i1)
+			if err != nil {
+				t.Fatalf("ParseCPSBlob failed: %v", err)
+			}
+			rawStr := string(raw)
+			if !strings.Contains(rawStr, "REGISTER sip:") {
+				t.Errorf("expected I1 to contain 'REGISTER sip:', got: %s", rawStr)
+			}
+			if !strings.Contains(rawStr, "Content-Length: 0") {
+				t.Errorf("expected I1 to contain 'Content-Length: 0', got: %s", rawStr)
+			}
+			for _, k := range []string{"i2", "i3", "i4", "i5"} {
+				if pkts[k] != "" {
+					t.Errorf("expected empty %s for SIP, got %q", k, pkts[k])
+				}
+			}
+		})
+	}
+}
+
+func TestGenerateCPSPackets_Protocols(t *testing.T) {
+	tests := []struct {
+		name      string
+		profile   string
+		domain    string
+		protocol  []string
+		wantProto string
+		checkPkt  func(t *testing.T, pkts map[string]string)
+	}{
+		{
+			name:      "sip_via_variadic",
+			profile:   "standard",
+			domain:    "sip.example.com",
+			protocol:  []string{"sip"},
+			wantProto: "sip",
+			checkPkt: func(t *testing.T, pkts map[string]string) {
+				t.Helper()
+				raw, err := ParseCPSBlob(pkts["i1"])
+				if err != nil {
+					t.Fatalf("ParseCPSBlob(i1) failed: %v", err)
+				}
+				rawStr := string(raw)
+				if !strings.Contains(rawStr, "REGISTER sip:") {
+					t.Errorf("expected I1 to contain 'REGISTER sip:', got: %s", rawStr)
+				}
+				if !strings.Contains(rawStr, "Content-Length: 0") {
+					t.Errorf("expected I1 to contain 'Content-Length: 0', got: %s", rawStr)
+				}
+				for _, k := range []string{"i2", "i3", "i4", "i5"} {
+					if pkts[k] != "" {
+						t.Errorf("expected empty %s for sip, got %q", k, pkts[k])
+					}
+				}
+			},
+		},
+		{
+			name:      "sip_via_profile_name",
+			profile:   "sip",
+			domain:    "sip.example.com",
+			protocol:  nil,
+			wantProto: "sip",
+			checkPkt: func(t *testing.T, pkts map[string]string) {
+				t.Helper()
+				raw, err := ParseCPSBlob(pkts["i1"])
+				if err != nil {
+					t.Fatalf("ParseCPSBlob(i1) failed: %v", err)
+				}
+				rawStr := string(raw)
+				if !strings.Contains(rawStr, "REGISTER sip:") {
+					t.Errorf("expected I1 to contain 'REGISTER sip:', got: %s", rawStr)
+				}
+				if !strings.Contains(rawStr, "Content-Length: 0") {
+					t.Errorf("expected I1 to contain 'Content-Length: 0', got: %s", rawStr)
+				}
+			},
+		},
+		{
+			name:      "dns_via_variadic",
+			profile:   "standard",
+			domain:    "example.com",
+			protocol:  []string{"dns"},
+			wantProto: "dns",
+			checkPkt: func(t *testing.T, pkts map[string]string) {
+				t.Helper()
+				if !strings.HasPrefix(pkts["i1"], "<r 2><b 0x") {
+					t.Errorf("expected dns I1 to have '<r 2><b 0x' tag, got: %s", pkts["i1"])
+				}
+				raw, err := ParseCPSBlob(pkts["i1"])
+				if err != nil {
+					t.Fatalf("ParseCPSBlob(i1) failed: %v", err)
+				}
+				if len(raw) < 12 {
+					t.Errorf("dns packet too short: %d bytes", len(raw))
+				}
+				for _, k := range []string{"i2", "i3", "i4", "i5"} {
+					if pkts[k] != "" {
+						t.Errorf("expected empty %s for dns, got %q", k, pkts[k])
+					}
+				}
+			},
+		},
+		{
+			name:      "dns_via_profile_name",
+			profile:   "dns",
+			domain:    "example.com",
+			protocol:  nil,
+			wantProto: "dns",
+			checkPkt: func(t *testing.T, pkts map[string]string) {
+				t.Helper()
+				if !strings.HasPrefix(pkts["i1"], "<r 2><b 0x") {
+					t.Errorf("expected dns I1 to have '<r 2><b 0x' tag, got: %s", pkts["i1"])
+				}
+			},
+		},
+		{
+			name:      "quic_standard_via_variadic",
+			profile:   "standard",
+			domain:    "example.com",
+			protocol:  []string{"quic"},
+			wantProto: "quic",
+			checkPkt: func(t *testing.T, pkts map[string]string) {
+				t.Helper()
+				if !strings.HasPrefix(pkts["i1"], "<b 0x") {
+					t.Errorf("expected quic I1 to start with '<b 0x', got: %s", pkts["i1"])
+				}
+				for _, k := range []string{"i2", "i3", "i4", "i5"} {
+					if pkts[k] != "" {
+						t.Errorf("expected empty %s for standard quic, got %q", k, pkts[k])
+					}
+				}
+			},
+		},
+		{
+			name:      "quic_pro_via_variadic",
+			profile:   "pro",
+			domain:    "example.com",
+			protocol:  []string{"quic"},
+			wantProto: "quic",
+			checkPkt: func(t *testing.T, pkts map[string]string) {
+				t.Helper()
+				for _, k := range []string{"i1", "i2", "i3", "i4", "i5"} {
+					if !strings.HasPrefix(pkts[k], "<b 0x") {
+						t.Errorf("expected pro quic %s to start with '<b 0x', got: %s", k, pkts[k])
+					}
+				}
+			},
+		},
+		{
+			name:      "quic_via_profile_name",
+			profile:   "quic",
+			domain:    "example.com",
+			protocol:  nil,
+			wantProto: "quic",
+			checkPkt: func(t *testing.T, pkts map[string]string) {
+				t.Helper()
+				if !strings.HasPrefix(pkts["i1"], "<b 0x") {
+					t.Errorf("expected quic I1 to start with '<b 0x', got: %s", pkts["i1"])
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pkts, err := GenerateCPSPackets(tt.profile, tt.domain, tt.protocol...)
+			if err != nil {
+				t.Fatalf("GenerateCPSPackets failed: %v", err)
+			}
+			tt.checkPkt(t, pkts)
+		})
 	}
 }
