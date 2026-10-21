@@ -16,6 +16,9 @@ import (
 
 var handshakeUnitRegex = regexp.MustCompile(`(?i)(\d+)\s*([a-zA-Z]+)`)
 
+// DefaultAutoTrialCooldown defines the dwell window before rotating a stalled auto-trial connection again.
+const DefaultAutoTrialCooldown = 24 * time.Hour
+
 // MimicryRotator defines protocol managers that support rotating AWG DPI mimicry signatures.
 type MimicryRotator interface {
 	RotateMimicry(ctx context.Context, server *models.Server, clientID string) (string, error)
@@ -97,8 +100,9 @@ func (o *Orchestrator) processServerAutoTrial(ctx context.Context, serverID int6
 
 	var handshakeAges map[string]time.Duration
 	var hasHandshake map[string]bool
+	var rotatedTimes map[string]time.Time
 	if remoteClients, err := mgr.GetClients(ctx, server); err == nil {
-		handshakeAges, hasHandshake = extractHandshakes(remoteClients)
+		handshakeAges, hasHandshake, rotatedTimes = extractClientStatus(remoteClients)
 	}
 
 	for _, c := range sConns {
@@ -106,6 +110,12 @@ func (o *Orchestrator) processServerAutoTrial(ctx context.Context, serverID int6
 			if handshakeAges[c.ClientID] <= 180*time.Second {
 				// Fresh active handshake (<= 180s); no rotation needed
 				continue
+			}
+		}
+
+		if rotatedAt, ok := rotatedTimes[c.ClientID]; ok && !rotatedAt.IsZero() {
+			if time.Since(rotatedAt) < DefaultAutoTrialCooldown {
+				continue // Already rotated recently within cooldown; give user time to connect
 			}
 		}
 
@@ -121,16 +131,6 @@ func (o *Orchestrator) processServerAutoTrial(ctx context.Context, serverID int6
 
 		// Preserve auto mimicry in DB for auto-trial connections so filterAutoTrialConns continues to process them.
 		// The remote server's clientsTable tracks the active rotated profile.
-		if c.AWGMimicry != models.AWGMimicryAuto && c.AWGMimicry != "" {
-			if _, err := o.db.UpdateConnection(ctx, c.ID, map[string]any{
-				"awg_mimicry": nextProf,
-			}); err != nil {
-				slog.Warn("Failed to update connection mimicry in database",
-					"connection_id", c.ID,
-					"err", err,
-				)
-			}
-		}
 
 		slog.Info("Auto-trial rotated mimicry for client",
 			"connection_id", c.ID,
@@ -140,9 +140,11 @@ func (o *Orchestrator) processServerAutoTrial(ctx context.Context, serverID int6
 	}
 }
 
-func extractHandshakes(clients []map[string]any) (map[string]time.Duration, map[string]bool) {
+// extractClientStatus extracts client handshake ages, active handshake flags, and rotation timestamps from remote clients.
+func extractClientStatus(clients []map[string]any) (map[string]time.Duration, map[string]bool, map[string]time.Time) {
 	handshakeAges := make(map[string]time.Duration, len(clients))
 	hasHandshake := make(map[string]bool, len(clients))
+	rotatedTimes := make(map[string]time.Time, len(clients))
 	for _, cl := range clients {
 		cID, _ := cl["clientId"].(string)
 		if uData, ok := cl["userData"].(map[string]any); ok && uData != nil {
@@ -150,9 +152,18 @@ func extractHandshakes(clients []map[string]any) (map[string]time.Duration, map[
 				handshakeAges[cID] = age
 				hasHandshake[cID] = true
 			}
+			if rotVal, ok := uData["rotated_at"]; ok && rotVal != nil {
+				if rotStr, ok := rotVal.(string); ok && rotStr != "" {
+					if t, err := time.Parse(time.RFC3339, rotStr); err == nil {
+						rotatedTimes[cID] = t
+					}
+				} else if t, ok := rotVal.(time.Time); ok {
+					rotatedTimes[cID] = t
+				}
+			}
 		}
 	}
-	return handshakeAges, hasHandshake
+	return handshakeAges, hasHandshake, rotatedTimes
 }
 
 // parseHandshakeAge calculates the elapsed age of a handshake value.
