@@ -306,6 +306,10 @@ func (m *threadSafeMockSSHClient) GetLastActive() time.Time {
 	return time.Now()
 }
 
+func (m *threadSafeMockSSHClient) InUse() bool {
+	return false
+}
+
 type threadSafeMockSSHProvider struct {
 	client *threadSafeMockSSHClient
 }

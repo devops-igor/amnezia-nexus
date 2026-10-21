@@ -12,6 +12,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -40,6 +41,7 @@ type SSHClient interface {
 	GetUser() string
 	GetServerID() *int64
 	GetLastActive() time.Time
+	InUse() bool
 }
 
 // Config specifies the connection parameters for an SSH client.
@@ -66,6 +68,7 @@ type Client struct {
 	isRoot              bool
 	capturedFingerprint string
 	lastActive          time.Time
+	activeOps           atomic.Int64
 	closed              bool
 	mu                  sync.Mutex
 }
@@ -212,7 +215,7 @@ func (c *Client) getSFTP() (*sftp.Client, error) {
 
 // RunCommand executes a command remotely and returns stdout, stderr, and exit code.
 func (c *Client) RunCommand(ctx context.Context, cmd string) (string, string, int, error) {
-	c.touch()
+	defer c.startOp()()
 	c.mu.Lock()
 	client := c.sshClient
 	c.mu.Unlock()
@@ -226,7 +229,7 @@ func (c *Client) RunCommand(ctx context.Context, cmd string) (string, string, in
 
 // RunSudoCommand executes a command with sudo privileges, delivering passwords via stdin safely.
 func (c *Client) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
-	c.touch()
+	defer c.startOp()()
 	cleanCmd := CleanSudoCommand(cmd)
 	if c.isRoot {
 		return c.RunCommand(ctx, cleanCmd)
@@ -252,7 +255,7 @@ func (c *Client) RunSudoCommand(ctx context.Context, cmd string) (string, string
 
 // RunScript executes a multi-line shell script via bash stdin.
 func (c *Client) RunScript(ctx context.Context, script string) (string, string, int, error) {
-	c.touch()
+	defer c.startOp()()
 	c.mu.Lock()
 	client := c.sshClient
 	c.mu.Unlock()
@@ -267,7 +270,7 @@ func (c *Client) RunScript(ctx context.Context, script string) (string, string, 
 
 // RunSudoScript executes a multi-line script with root privileges.
 func (c *Client) RunSudoScript(ctx context.Context, script string) (string, string, int, error) {
-	c.touch()
+	defer c.startOp()()
 	if c.isRoot {
 		return c.RunScript(ctx, script)
 	}
@@ -290,7 +293,7 @@ func (c *Client) RunSudoScript(ctx context.Context, script string) (string, stri
 
 // UploadFile uploads content to a remote path via SFTP.
 func (c *Client) UploadFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error {
-	c.touch()
+	defer c.startOp()()
 	sftpClient, err := c.getSFTP()
 	if err != nil {
 		return err
@@ -300,7 +303,7 @@ func (c *Client) UploadFile(ctx context.Context, remotePath string, content []by
 
 // UploadSudoFile uploads content to a root-owned remote path via atomic temp write and sudo move.
 func (c *Client) UploadSudoFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error {
-	c.touch()
+	defer c.startOp()()
 	if c.isRoot {
 		return c.UploadFile(ctx, remotePath, content, mode)
 	}
@@ -339,7 +342,7 @@ func (c *Client) UploadSudoFile(ctx context.Context, remotePath string, content 
 
 // DownloadFile downloads the complete content of a remote file via SFTP.
 func (c *Client) DownloadFile(ctx context.Context, remotePath string) ([]byte, error) {
-	c.touch()
+	defer c.startOp()()
 	sftpClient, err := c.getSFTP()
 	if err != nil {
 		return nil, err
@@ -349,7 +352,7 @@ func (c *Client) DownloadFile(ctx context.Context, remotePath string) ([]byte, e
 
 // FileExists checks if a remote file or directory exists via SFTP.
 func (c *Client) FileExists(ctx context.Context, remotePath string) (bool, error) {
-	c.touch()
+	defer c.startOp()()
 	sftpClient, err := c.getSFTP()
 	if err != nil {
 		return false, err
@@ -449,6 +452,20 @@ func (c *Client) touch() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.lastActive = time.Now()
+}
+
+// InUse reports whether the client is currently executing commands or file operations.
+func (c *Client) InUse() bool {
+	return c.activeOps.Load() > 0
+}
+
+func (c *Client) startOp() func() {
+	c.touch()
+	c.activeOps.Add(1)
+	return func() {
+		c.activeOps.Add(-1)
+		c.touch()
+	}
 }
 
 // CapturedFingerprint returns the host key fingerprint captured during handshake.

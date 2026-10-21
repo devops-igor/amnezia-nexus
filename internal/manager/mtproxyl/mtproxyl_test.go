@@ -313,6 +313,10 @@ func (m *mockMTProxyLSSHClient) GetLastActive() time.Time {
 	return time.Now()
 }
 
+func (m *mockMTProxyLSSHClient) InUse() bool {
+	return false
+}
+
 type mockMTProxyLSSHProvider struct {
 	client *mockMTProxyLSSHClient
 }

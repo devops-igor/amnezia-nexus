@@ -259,3 +259,14 @@ func TestServerCookiePolicyTracksTLS(t *testing.T) {
 		t.Errorf("expected Secure=false after ReloadTLS(nil)")
 	}
 }
+
+func TestServer_WriteTimeout(t *testing.T) {
+	cfg := &config.Config{
+		Host: "127.0.0.1",
+		Port: 5000,
+	}
+	srv := NewServer(cfg, nil)
+	if srv.httpServer.WriteTimeout != 300*time.Second {
+		t.Fatalf("expected httpServer.WriteTimeout to be 300s, got %v", srv.httpServer.WriteTimeout)
+	}
+}
