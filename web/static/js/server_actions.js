@@ -186,11 +186,9 @@ async function installProtocol() {
             if (profileSelect && profileSelect.value) {
                 params.awg_profile = profileSelect.value;
             }
-            if (profileSelect && profileSelect.value === 'pro') {
-                const cpsSelect = document.getElementById('installAwgCpsProtocol');
-                if (cpsSelect && cpsSelect.value) {
-                    params.awg_cps_protocol = cpsSelect.value;
-                }
+            const cpsSelect = document.getElementById('installAwgCpsProtocol');
+            if (cpsSelect && cpsSelect.value) {
+                params.awg_cps_protocol = cpsSelect.value;
             }
         }
         const result = await API.post(`/api/servers/${SERVER_ID}/install`, params);

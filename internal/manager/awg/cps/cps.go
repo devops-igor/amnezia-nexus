@@ -83,12 +83,47 @@ func ParseCPSBlob(tagStr string) ([]byte, error) {
 }
 
 // GenerateCPSPackets generates I1-I5 CPS packet signatures for the specified profile.
-func GenerateCPSPackets(profile string, domain string) (map[string]string, error) {
-	switch strings.ToLower(profile) {
-	case "lite":
+// If a protocol is explicitly provided, packets are generated for that protocol ("sip", "dns", "quic").
+func GenerateCPSPackets(profile string, domain string, protocol ...string) (map[string]string, error) {
+	proto := ""
+	if len(protocol) > 0 {
+		proto = strings.ToLower(strings.TrimSpace(protocol[0]))
+	}
+
+	prof := strings.ToLower(strings.TrimSpace(profile))
+	if proto == "" {
+		switch prof {
+		case "sip", "dns", "quic", "tls":
+			proto = prof
+		case "lite":
+			proto = "dns"
+		default: // "standard", "pro"
+			proto = "quic"
+		}
+	}
+
+	switch proto {
+	case "sip":
+		sipPkt, err := GenSIP(domain)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]string{
+			"i1": ToCPS(sipPkt),
+			"i2": "",
+			"i3": "",
+			"i4": "",
+			"i5": "",
+		}, nil
+
+	case "dns":
 		dnsDomain := domain
 		if dnsDomain == "" {
-			dnsDomain = "icloud.com"
+			if prof == "lite" {
+				dnsDomain = "icloud.com"
+			} else {
+				dnsDomain = "one.one.one.one"
+			}
 		}
 		dnsPayload, err := GenDNS(dnsDomain)
 		if err != nil {
@@ -102,36 +137,62 @@ func GenerateCPSPackets(profile string, domain string) (map[string]string, error
 			"i5": "",
 		}, nil
 
-	case "pro":
+	case "quic":
+		if prof == "pro" {
+			i1, err := GenQUICInitial(domain)
+			if err != nil {
+				return nil, err
+			}
+			i2, err := GenQUICShort()
+			if err != nil {
+				return nil, err
+			}
+			i3, err := GenQUICShort()
+			if err != nil {
+				return nil, err
+			}
+			i4, err := GenQUICShort()
+			if err != nil {
+				return nil, err
+			}
+			i5, err := GenQUICShort()
+			if err != nil {
+				return nil, err
+			}
+			return map[string]string{
+				"i1": ToCPS(i1),
+				"i2": ToCPS(i2),
+				"i3": ToCPS(i3),
+				"i4": ToCPS(i4),
+				"i5": ToCPS(i5),
+			}, nil
+		}
 		i1, err := GenQUICInitial(domain)
-		if err != nil {
-			return nil, err
-		}
-		i2, err := GenQUICShort()
-		if err != nil {
-			return nil, err
-		}
-		i3, err := GenQUICShort()
-		if err != nil {
-			return nil, err
-		}
-		i4, err := GenQUICShort()
-		if err != nil {
-			return nil, err
-		}
-		i5, err := GenQUICShort()
 		if err != nil {
 			return nil, err
 		}
 		return map[string]string{
 			"i1": ToCPS(i1),
-			"i2": ToCPS(i2),
-			"i3": ToCPS(i3),
-			"i4": ToCPS(i4),
-			"i5": ToCPS(i5),
+			"i2": "",
+			"i3": "",
+			"i4": "",
+			"i5": "",
 		}, nil
 
-	default: // "standard"
+	case "tls":
+		tlsPkt, err := GenTLS(domain)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]string{
+			"i1": ToCPS(tlsPkt),
+			"i2": "",
+			"i3": "",
+			"i4": "",
+			"i5": "",
+		}, nil
+
+	default:
 		i1, err := GenQUICInitial(domain)
 		if err != nil {
 			return nil, err
@@ -151,12 +212,12 @@ func GenerateMimicryPackets(ctx context.Context, mimicry string, domain string, 
 	m := strings.ToLower(strings.TrimSpace(mimicry))
 	if m == "" || m == "auto" {
 		if sshClient != nil {
-			d, err := SelectMimicryDomain(ctx, sshClient, "tls")
+			d, err := SelectMimicryDomain(ctx, sshClient, "sip")
 			if err == nil && d != "" {
 				domain = d
 			}
 		}
-		m = "tls"
+		m = "sip"
 	}
 
 	switch m {

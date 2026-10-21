@@ -82,7 +82,8 @@ type AWGManager struct {
 	lockHeartbeatTimeoutNs  atomic.Int64
 	// tcCleaned guards the one-shot legacy tc-state sweep: server IDs that
 	// have already been swept by this manager instance. Guarded by mu.
-	tcCleaned map[int64]bool
+	tcCleaned   map[int64]bool
+	installHook func(*AWGParams)
 }
 
 // NewAWGManager creates a new AWGManager instance.
@@ -557,20 +558,25 @@ func (m *AWGManager) Install(ctx context.Context, server *models.Server, params 
 	}
 	awgParams.Port = port
 
-	if (profile == "standard" || profile == "pro") && params != nil {
-		cpsProto := "quic"
+	cpsProto := "sip"
+	if params != nil {
 		if cp, ok := params["awg_cps_protocol"]; ok && fmt.Sprint(cp) != "" {
-			cpsProto = fmt.Sprint(cp)
+			cpsProto = strings.ToLower(strings.TrimSpace(fmt.Sprint(cp)))
 		}
-		if d, err := cps.SelectMimicryDomain(ctx, client, cpsProto); err == nil && d != "" {
-			if cpsPackets, err := cps.GenerateCPSPackets(profile, d); err == nil {
-				awgParams.I1 = cpsPackets["i1"]
-				awgParams.I2 = cpsPackets["i2"]
-				awgParams.I3 = cpsPackets["i3"]
-				awgParams.I4 = cpsPackets["i4"]
-				awgParams.I5 = cpsPackets["i5"]
-			}
-		}
+	}
+	d, err := cps.SelectMimicryDomain(ctx, client, cpsProto)
+	if err != nil || d == "" {
+		d = cps.FallbackDomains[cpsProto]
+	}
+	if cpsPackets, err := cps.GenerateCPSPackets(profile, d, cpsProto); err == nil {
+		awgParams.I1 = cpsPackets["i1"]
+		awgParams.I2 = cpsPackets["i2"]
+		awgParams.I3 = cpsPackets["i3"]
+		awgParams.I4 = cpsPackets["i4"]
+		awgParams.I5 = cpsPackets["i5"]
+	}
+	if m.installHook != nil {
+		m.installHook(awgParams)
 	}
 
 	if err := ensureDockerInstalled(ctx, client); err != nil {
@@ -2679,8 +2685,8 @@ func (m *AWGManager) updateServerConfigPeer(ctx context.Context, client ssh.SSHC
 	return m.saveServerConfigPreservingParams(ctx, client, newConfig)
 }
 
-// RotateMimicry rotates a client's mimicry profile through the sequence:
-// auto -> tls -> quic -> dns -> sip -> tls, regenerates I1-I5 packet headers, and updates clientsTable.
+// RotateMimicry rotates a client's mimicry profile strictly between verified DPI-passing UDP protocols (SIP <-> DNS),
+// regenerates I1-I5 packet headers, and updates clientsTable.
 func (m *AWGManager) RotateMimicry(ctx context.Context, server *models.Server, clientID string) (string, error) {
 	client, err := m.getSSHClient(ctx, server)
 	if err != nil {
@@ -2728,17 +2734,15 @@ func (m *AWGManager) RotateMimicry(ctx context.Context, server *models.Server, c
 	var nextProfile string
 	switch curr {
 	case "auto":
-		nextProfile = "tls"
-	case "tls":
-		nextProfile = "quic"
-	case "quic":
+		nextProfile = "dns"
+	case "sip":
 		nextProfile = "dns"
 	case "dns":
 		nextProfile = "sip"
-	case "sip":
-		nextProfile = "tls"
+	case "quic", "tls":
+		nextProfile = "sip"
 	default:
-		nextProfile = "tls"
+		nextProfile = "dns"
 	}
 
 	// Regenerate I1-I5 signature packets
