@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
@@ -70,6 +71,7 @@ func TestInstallProtocolHandler_WriteDeadlineAndContextTimeout(t *testing.T) {
 		t.Fatalf("failed to create test server: %v", err)
 	}
 	r := setupFullServerRouter(h)
+	handler := middleware.OperationTimeout(60 * time.Second)(r)
 
 	body, _ := json.Marshal(models.InstallProtocolRequest{
 		Protocol: "awg",
@@ -77,7 +79,7 @@ func TestInstallProtocolHandler_WriteDeadlineAndContextTimeout(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/install", serverID), bytes.NewReader(body))
 	rec := newDeadlineRecorder()
-	r.ServeHTTP(rec, req)
+	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 on install success, got %d (body: %s)", rec.Code, rec.Body.String())
@@ -139,13 +141,14 @@ func TestUninstallProtocolHandler_WriteDeadlineAndContextTimeout(t *testing.T) {
 		t.Fatalf("failed to create test server: %v", err)
 	}
 	r := setupFullServerRouter(h)
+	handler := middleware.OperationTimeout(60 * time.Second)(r)
 
 	body, _ := json.Marshal(models.ProtocolRequest{
 		Protocol: "awg",
 	})
 	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/uninstall", serverID), bytes.NewReader(body))
 	rec := newDeadlineRecorder()
-	r.ServeHTTP(rec, req)
+	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 on uninstall success, got %d (body: %s)", rec.Code, rec.Body.String())
@@ -200,6 +203,7 @@ func TestInstallProtocolHandler_ParentContextCanceled(t *testing.T) {
 		t.Fatalf("failed to create test server: %v", err)
 	}
 	r := setupFullServerRouter(h)
+	handler := middleware.OperationTimeout(60 * time.Second)(r)
 
 	body, _ := json.Marshal(models.InstallProtocolRequest{
 		Protocol: "awg",
@@ -214,7 +218,7 @@ func TestInstallProtocolHandler_ParentContextCanceled(t *testing.T) {
 		reqCancel()
 	}()
 
-	r.ServeHTTP(rec, req)
+	handler.ServeHTTP(rec, req)
 
 	select {
 	case <-canceled:
