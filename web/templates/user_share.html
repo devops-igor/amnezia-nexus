@@ -94,6 +94,11 @@
         <div class="config-panel" id="panel-qr">
             <div class="qr-container">
                 <div id="qrcode"></div>
+                <div class="config-actions" style="margin-top:var(--space-md); width:100%; max-width:280px;">
+                    <button class="btn btn-primary btn-sm" id="downloadQrBtn" onclick="UI.downloadQRCode('qrcode', (currentConfigName || 'vpn_config') + '_qr.png')" style="flex:1">
+                        <svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download" }} QR
+                    </button>
+                </div>
             </div>
         </div>
     </div>
@@ -187,6 +192,7 @@
 
     let currentConfig = '';
     let currentVpnLink = '';
+    let currentConfigName = 'vpn_config';
 
     async function showConfig(connId, name) {
         try {
@@ -201,6 +207,7 @@
 
             currentConfig = data.config;
             currentVpnLink = data.vpn_link || '';
+            currentConfigName = (name || 'vpn_config').replace(/\s+/g, '_');
 
             document.getElementById('configText').value = data.config;
             document.getElementById('vpnLinkText').textContent = currentVpnLink;
@@ -208,6 +215,9 @@
 
             const dl = document.getElementById('downloadBtn');
             dl.onclick = () => downloadFile(data.config, `${name}.conf`);
+
+            const dlQr = document.getElementById('downloadQrBtn');
+            if (dlQr) dlQr.onclick = () => downloadQRCode();
 
             const qrContainer = document.getElementById('qrcode');
             qrContainer.innerHTML = '';
@@ -233,6 +243,10 @@
 
     function copyVpnLink() {
         copyToClipboard(currentVpnLink);
+    }
+
+    function downloadQRCode() {
+        UI.downloadQRCode('qrcode', (currentConfigName || 'vpn_config') + '_qr.png');
     }
 
     document.addEventListener('DOMContentLoaded', loadConnections);

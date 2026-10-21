@@ -347,28 +347,7 @@
     }
 
     function downloadQRCode() {
-        const qrContainer = document.getElementById('qrCode');
-        if (!qrContainer) return;
-        const img = qrContainer.querySelector('img');
-        const canvas = qrContainer.querySelector('canvas');
-        if (canvas) {
-            const url = canvas.toDataURL('image/png');
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = (currentConfigName || 'vpn_config') + '_qr.png';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-        } else if (img && img.src) {
-            const a = document.createElement('a');
-            a.href = img.src;
-            a.download = (currentConfigName || 'vpn_config') + '_qr.png';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-        } else {
-            UI.toast('Unable to export QR image', 'error');
-        }
+        UI.downloadQRCode('qrCode', (currentConfigName || 'vpn_config') + '_qr.png');
     }
 
     function renderConnectionItem(conn, isTopConsumer) {

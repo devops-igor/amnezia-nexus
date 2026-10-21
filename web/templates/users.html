@@ -411,6 +411,13 @@
             <div class="qr-container">
                 <div id="qrCode"></div>
                 <div id="configQrCode" style="display:none;"></div>
+                <div class="config-actions" style="margin-top:var(--space-md); width:100%; max-width:280px;">
+                    <button type="button" class="btn btn-primary btn-sm"
+                        onclick="UI.downloadQRCode('qrCode', (currentConfigName || 'vpn_config') + '_qr.png')" style="flex:1">
+                        <svg class="icon"><use href="#icon-download"></use></svg>
+                        <span>{{ _ "download" }} QR</span>
+                    </button>
+                </div>
             </div>
         </div>
     </div>
