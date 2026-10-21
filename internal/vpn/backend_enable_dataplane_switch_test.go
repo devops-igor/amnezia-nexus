@@ -561,3 +561,110 @@ func TestUpdateConfig_DataPlaneI1ProtocolSwitch_CancellationMidReattach(t *testi
 		}
 	}
 }
+
+func TestUpdateConfig_DataPlaneI1ProtocolSwitch_ReattachTimeoutEnsuresFailClosed(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+
+	srvID := testNewServerWithAWGParams(t, svc, "198.51.100.103", map[string]any{"s1": 15, "s2": 40})
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+	if err := svc.EnableBackend(ctx, srvID); err != nil {
+		t.Fatalf("EnableBackend: %v", err)
+	}
+
+	tun, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel: %v", err)
+	}
+	if tun.Status != models.TunnelStatusActive {
+		t.Fatalf("expected active tunnel before switch, got %q", tun.Status)
+	}
+
+	svc.mu.RLock()
+	oldDev := svc.backendDevices[tun.ID]
+	svc.mu.RUnlock()
+	if oldDev == nil {
+		t.Fatal("expected backend device attached before switch")
+	}
+	awgOldDev, ok := oldDev.(*tunnel.AWGClientDevice)
+	if !ok {
+		t.Fatalf("expected *tunnel.AWGClientDevice, got %T", oldDev)
+	}
+	if awgOldDev.IsClosed() {
+		t.Fatal("expected initial device not to be closed")
+	}
+
+	// Verify initially returned in active tunnels
+	activeBefore := svc.pool.GetActiveTunnels()
+	foundActive := false
+	for _, at := range activeBefore {
+		if at.ID == tun.ID {
+			foundActive = true
+			break
+		}
+	}
+	if !foundActive {
+		t.Fatal("expected tunnel to be in GetActiveTunnels before switch")
+	}
+
+	// Simulate timeout during reattachment parameter resolution (context.DeadlineExceeded)
+	svc.SetResolveServerAWGParamsHookForTest(func(ctx context.Context, serverID int64) (map[string]any, error) {
+		return nil, context.DeadlineExceeded
+	})
+	defer svc.SetResolveServerAWGParamsHookForTest(nil)
+
+	// Simulate database persistence failure during status write
+	svc.pool.SetUpdateTunnelStatusHookForTest(func(ctx context.Context, serverID int64, status string) error {
+		return errors.New("simulated db persistence failure")
+	})
+	defer svc.pool.SetUpdateTunnelStatusHookForTest(nil)
+
+	// Trigger protocol switch
+	cfgWithDNS := &models.VPNConfig{
+		VPNDataPlaneI1Protocol: "dns",
+	}
+	if err := svc.UpdateConfig(ctx, cfgWithDNS); err != nil {
+		t.Fatalf("UpdateConfig: %v", err)
+	}
+
+	// (a) Obsolete device is detached/closed.
+	svc.mu.RLock()
+	devAfter := svc.backendDevices[tun.ID]
+	svc.mu.RUnlock()
+	if devAfter != nil {
+		t.Fatalf("expected obsolete device to be detached from backendDevices, but found %v", devAfter)
+	}
+	if !awgOldDev.IsClosed() {
+		t.Fatal("expected obsolete device to be closed")
+	}
+
+	// (b) Tunnel is marked Degraded in pool (both in memory and pool queries: pool.GetActiveTunnels() does NOT return it).
+	activeAfter := svc.pool.GetActiveTunnels()
+	for _, at := range activeAfter {
+		if at.ID == tun.ID {
+			t.Fatalf("expected tunnel %d NOT to be returned by GetActiveTunnels, but found in active list", tun.ID)
+		}
+	}
+
+	// (c) Even if database persistence fails during status write, in-memory status is Degraded.
+	tunAfter, err := svc.pool.GetTunnel(srvID)
+	if err != nil {
+		t.Fatalf("GetTunnel: %v", err)
+	}
+	if tunAfter.Status != models.TunnelStatusDegraded {
+		t.Fatalf("expected in-memory tunnel status %q, got %q", models.TunnelStatusDegraded, tunAfter.Status)
+	}
+	tunByID, err := svc.pool.GetTunnelByID(tun.ID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID: %v", err)
+	}
+	if tunByID.Status != models.TunnelStatusDegraded {
+		t.Fatalf("expected in-memory tunnelByID status %q, got %q", models.TunnelStatusDegraded, tunByID.Status)
+	}
+}

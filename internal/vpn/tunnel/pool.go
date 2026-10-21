@@ -25,14 +25,15 @@ var (
 
 // Pool manages the in-process AWG tunnels connected to backend VPN servers.
 type Pool struct {
-	mu                    sync.RWMutex
-	db                    *database.DB
-	tunnelsByServerID     map[int64]*models.BackendTunnel
-	tunnelsByID           map[int64]*models.BackendTunnel
-	tunnelsByIfName       map[string]*models.BackendTunnel
-	closed                bool
-	setTunnelEndpointHook func(ctx context.Context, tunnelID int64, endpoint string) error
-	generateKeypairFn     func() (string, string, error)
+	mu                     sync.RWMutex
+	db                     *database.DB
+	tunnelsByServerID      map[int64]*models.BackendTunnel
+	tunnelsByID            map[int64]*models.BackendTunnel
+	tunnelsByIfName        map[string]*models.BackendTunnel
+	closed                 bool
+	setTunnelEndpointHook  func(ctx context.Context, tunnelID int64, endpoint string) error
+	updateTunnelStatusHook func(ctx context.Context, serverID int64, status string) error
+	generateKeypairFn      func() (string, string, error)
 }
 
 // DeriveClientPublicKey derives the Base64-encoded Curve25519 public key from a Base64-encoded private key.
@@ -426,6 +427,22 @@ func (p *Pool) SetTunnelStatus(ctx context.Context, serverID int64, status strin
 	return p.setTunnelStatus(ctx, serverID, 0, 0, status, latencyMS)
 }
 
+// SetTunnelStatusInMemory explicitly updates the tunnel status in memory without
+// writing to the database. This ensures fail-closed invariants (e.g.,
+// degrading a tunnel whose device failed to attach or reattach) even if database
+// persistence fails.
+func (p *Pool) SetTunnelStatusInMemory(serverID int64, status string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if tunnel, ok := p.tunnelsByServerID[serverID]; ok {
+		tunnel.Status = status
+	}
+}
+
 // SetTunnelStatusIfCurrent applies a probe result only to the tunnel generation
 // that produced it. The identity check and DB/memory update share p.mu.
 func (p *Pool) SetTunnelStatusIfCurrent(ctx context.Context, serverID, expectedTunnelID int64, status string, latencyMS int64) error {
@@ -472,7 +489,11 @@ func (p *Pool) setTunnelStatus(ctx context.Context, serverID, expectedTunnelID, 
 		newReason = models.DisableReasonHealth
 	}
 
-	if p.db != nil {
+	if p.updateTunnelStatusHook != nil {
+		if err := p.updateTunnelStatusHook(ctx, serverID, status); err != nil {
+			return fmt.Errorf("failed to persist backend tunnel status: %w", err)
+		}
+	} else if p.db != nil {
 		if expectedVersion > 0 {
 			swapped, err := p.db.CompareAndSwapTunnelStatus(ctx, tunnel.ID, tunnel.Status, tunnel.DisableReason, expectedVersion, status, newReason, latencyMS)
 			if err != nil {
@@ -523,7 +544,11 @@ func (p *Pool) SetTunnelStatusWithReason(ctx context.Context, serverID int64, st
 		return nil
 	}
 
-	if p.db != nil {
+	if p.updateTunnelStatusHook != nil {
+		if err := p.updateTunnelStatusHook(ctx, serverID, status); err != nil {
+			return fmt.Errorf("failed to persist backend tunnel status with reason: %w", err)
+		}
+	} else if p.db != nil {
 		if err := p.db.UpdateBackendTunnelStatusWithReason(ctx, tunnel.ID, status, disableReason, latencyMS); err != nil {
 			return fmt.Errorf("failed to persist backend tunnel status with reason: %w", err)
 		}
@@ -884,6 +909,17 @@ func (p *Pool) SetSetTunnelEndpointHookForTest(fn func(ctx context.Context, tunn
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.setTunnelEndpointHook = fn
+}
+
+// SetUpdateTunnelStatusHookForTest overrides the DB persistence step in SetTunnelStatus
+// and SetTunnelStatusWithReason for deterministic fault injection during tests.
+func (p *Pool) SetUpdateTunnelStatusHookForTest(fn func(ctx context.Context, serverID int64, status string) error) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.updateTunnelStatusHook = fn
 }
 
 // Close tears down all tunnels and cleans up resources.

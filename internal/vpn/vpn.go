@@ -235,6 +235,7 @@ type Service struct {
 	updateBackendServerHostErr             error
 	deleteBackendErr                       error
 	syncBackendForwarderHook               func() error
+	resolveServerAWGParamsHook             func(ctx context.Context, serverID int64) (map[string]any, error)
 	enableBackendPreAddTunnelHook          func()
 	enableBackendPostAddTunnelHook         func()
 	reaperHook                             func(context.Context, *models.VPNSession)
@@ -664,7 +665,17 @@ func (s *Service) SetTunnelEndpointHookForTest(fn func(ctx context.Context, tunn
 	s.pool.SetSetTunnelEndpointHookForTest(fn)
 }
 
+// SetResolveServerAWGParamsHookForTest sets a test hook for resolveServerAWGParams.
+func (s *Service) SetResolveServerAWGParamsHookForTest(fn func(ctx context.Context, serverID int64) (map[string]any, error)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resolveServerAWGParamsHook = fn
+}
+
 func (s *Service) resolveServerAWGParams(ctx context.Context, serverID int64) (map[string]any, error) {
+	if s.resolveServerAWGParamsHook != nil {
+		return s.resolveServerAWGParamsHook(ctx, serverID)
+	}
 	if s.db == nil {
 		return nil, errors.New("database not available")
 	}

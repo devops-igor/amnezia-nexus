@@ -54,11 +54,10 @@ func (s *Service) reattachBackendDevicesLocked(ctx context.Context) {
 	if s.pool == nil || s.backendDevices == nil {
 		return
 	}
-	if ctx == nil {
-		ctx = context.Background()
+	baseCtx := ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
 	}
-	detachCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
 
 	for _, tun := range s.pool.ListTunnels() {
 		if tun == nil || !tun.Enabled {
@@ -67,7 +66,9 @@ func (s *Service) reattachBackendDevicesLocked(ctx context.Context) {
 		if s.backendDevices[tun.ID] == nil {
 			continue
 		}
-		awgParams, attachErr := s.resolveServerAWGParams(detachCtx, tun.ServerID)
+		opCtx, opCancel := context.WithTimeout(context.WithoutCancel(baseCtx), 5*time.Second)
+		awgParams, attachErr := s.resolveServerAWGParams(opCtx, tun.ServerID)
+		opCancel()
 		if attachErr == nil {
 			attachErr = s.attachBackendForwarder(tun, awgParams)
 		}
@@ -84,9 +85,15 @@ func (s *Service) reattachBackendDevicesLocked(ctx context.Context) {
 				_ = oldDev.Close()
 				s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(oldDev))
 			}
-			if err := s.pool.SetTunnelStatus(detachCtx, tun.ServerID, models.TunnelStatusDegraded, 0); err != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(baseCtx), 5*time.Second)
+			if err := s.pool.SetTunnelStatus(cleanupCtx, tun.ServerID, models.TunnelStatusDegraded, 0); err != nil {
 				log.Printf("[vpn] warning: failed to mark tunnel %d (server %d) degraded: %v", tun.ID, tun.ServerID, err)
+				tun.Status = models.TunnelStatusDegraded
+				s.pool.SetTunnelStatusInMemory(tun.ServerID, models.TunnelStatusDegraded)
+			} else {
+				tun.Status = models.TunnelStatusDegraded
 			}
+			cleanupCancel()
 		}
 	}
 }
@@ -282,7 +289,20 @@ func (s *Service) finishEnableBackend(
 	}
 
 	if err := s.attachBackendForwarder(tun, awgParams, prepared...); err != nil {
-		_ = pool.SetTunnelStatusWithReason(ctx, serverID, models.TunnelStatusDegraded, models.DisableReasonNone, 0)
+		baseCtx := ctx
+		if baseCtx == nil {
+			baseCtx = context.Background()
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(baseCtx), 5*time.Second)
+		defer cleanupCancel()
+		if setErr := pool.SetTunnelStatusWithReason(cleanupCtx, serverID, models.TunnelStatusDegraded, models.DisableReasonNone, 0); setErr != nil {
+			if tun != nil {
+				tun.Status = models.TunnelStatusDegraded
+			}
+			pool.SetTunnelStatusInMemory(serverID, models.TunnelStatusDegraded)
+		} else if tun != nil {
+			tun.Status = models.TunnelStatusDegraded
+		}
 		return err
 	}
 
