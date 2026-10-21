@@ -465,53 +465,47 @@ func TestAuditSecondGenerationMustNotOrphan(t *testing.T) {
 
 func TestBuildBackendDeviceParams_RejectMissingOrEmptyI1(t *testing.T) {
 	ctx := context.Background()
-	db := setupTestDB(t)
-	svc, err := NewVPNService(db, nil)
-	if err != nil {
-		t.Fatalf("NewVPNService failed: %v", err)
-	}
+	svc := &Service{}
 
-	testCases := []struct {
-		name    string
-		packets map[string]string
+	tests := []struct {
+		name        string
+		generatorFn func(ctx context.Context, mimicry, domain string, sshClient ssh.SSHClient) (map[string]string, error)
+		wantErrSub  string
 	}{
 		{
-			name:    "nil map",
-			packets: nil,
+			name: "nil map returned by generator",
+			generatorFn: func(ctx context.Context, mimicry, domain string, sshClient ssh.SSHClient) (map[string]string, error) {
+				return nil, nil
+			},
+			wantErrSub: "generator returned empty data plane I1 packet for protocol \"sip\"",
 		},
 		{
-			name:    "empty map",
-			packets: map[string]string{},
+			name: "empty map returned by generator",
+			generatorFn: func(ctx context.Context, mimicry, domain string, sshClient ssh.SSHClient) (map[string]string, error) {
+				return map[string]string{}, nil
+			},
+			wantErrSub: "generator returned empty data plane I1 packet for protocol \"sip\"",
 		},
 		{
-			name:    "empty string i1",
-			packets: map[string]string{"i1": ""},
+			name: "empty string i1 returned by generator",
+			generatorFn: func(ctx context.Context, mimicry, domain string, sshClient ssh.SSHClient) (map[string]string, error) {
+				return map[string]string{"i1": ""}, nil
+			},
+			wantErrSub: "generator returned empty data plane I1 packet for protocol \"sip\"",
 		},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			restore := setGenerateMimicryPacketsForTest(func(ctx context.Context, mimicry, domain string, sshClient ssh.SSHClient) (map[string]string, error) {
-				return tc.packets, nil
-			})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			restore := setGenerateMimicryPacketsForTest(tt.generatorFn)
 			defer restore()
 
-			awgParams := map[string]any{"s1": 15, "s2": 40}
-			params, err := svc.buildBackendDeviceParams(ctx, "sip", awgParams)
+			params, err := svc.buildBackendDeviceParams(ctx, "sip", map[string]any{"h1": "123"})
 			if err == nil {
-				t.Fatalf("expected error on %s, got nil and params: %v", tc.name, params)
+				t.Fatalf("expected error containing %q, got nil (params: %v)", tt.wantErrSub, params)
 			}
-			if params != nil {
-				t.Fatalf("expected nil params on error, got: %v", params)
-			}
-			if !strings.Contains(err.Error(), "generator returned empty data plane I1 packet for protocol \"sip\"") {
-				t.Fatalf("expected specific fail-closed error message, got: %v", err)
-			}
-
-			// Also verify via prepareBackendDeviceParams
-			prepParams, prepErr := svc.prepareBackendDeviceParams(ctx, awgParams)
-			if prepErr == nil || prepParams != nil {
-				t.Fatalf("prepareBackendDeviceParams expected error and nil, got params=%v err=%v", prepParams, prepErr)
+			if !strings.Contains(err.Error(), tt.wantErrSub) {
+				t.Fatalf("expected error containing %q, got %v", tt.wantErrSub, err)
 			}
 		})
 	}

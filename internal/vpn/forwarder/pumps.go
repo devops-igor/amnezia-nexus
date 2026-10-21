@@ -413,13 +413,3 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 		}
 	}
 }
-
-// HasBackendDevice returns whether an active packet device is attached for the backend tunnel.
-func (f *Forwarder) HasBackendDevice(backendTunnelID int64) bool {
-	if f == nil {
-		return false
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.backendDevices[backendTunnelID] != nil
-}

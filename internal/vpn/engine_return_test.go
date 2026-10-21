@@ -37,7 +37,6 @@ func TestEngineReturnOwnershipFreshReuseReplacementAndLegacyMemo(t *testing.T) {
 	if err := svc.pool.SyncFromDB(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	svc.SeedIngressDevicesForTest()
 	peer := seedIngressPeer(t, db, "return-owner", "return-peer-key-11111", "10.100.8.2")
 	owner := ownershipFor(peer)
 	path := forwarder.NewReturnPath(func(_, _ string, p []byte) (int, error) { return len(p), nil })
@@ -132,7 +131,6 @@ func TestEngineReturnWriteClassifiesDropsAndStats(t *testing.T) {
 	if err := svc.pool.SyncFromDB(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	svc.SeedIngressDevicesForTest()
 	// NewIngressEngine fail-closed validates real upstream keys, so this test
 	// mints an actual X25519 identity and seeds the matching durable lease.
 	peerKey, _ := engineKeys(t)
@@ -230,7 +228,6 @@ func TestEngineFreshAdmissionCarriesReturnOwner(t *testing.T) {
 	if err := svc.pool.SyncFromDB(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	svc.SeedIngressDevicesForTest()
 	peer := seedIngressPeer(t, db, "return-fresh", "return-peer-key-22222", "10.100.8.3")
 	path := forwarder.NewReturnPath(func(_, _ string, p []byte) (int, error) { return len(p), nil })
 	sess, be, _, err := svc.ensureBackendSessionForIngress(t.Context(), ownershipFor(peer), path)
@@ -250,7 +247,6 @@ func TestEngineReturnWriteConcurrent_Race(t *testing.T) {
 	if err := svc.pool.SyncFromDB(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	svc.SeedIngressDevicesForTest()
 	peerKey, _ := engineKeys(t)
 	peer := seedIngressPeer(t, db, "race-return", peerKey, "10.100.8.98")
 	engine, err := svc.NewIngressEngine(t.Context(), "race-return-portal", []clientawg.Peer{

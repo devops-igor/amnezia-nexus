@@ -235,7 +235,6 @@ type Service struct {
 	updateBackendServerHostErr             error
 	deleteBackendErr                       error
 	syncBackendForwarderHook               func() error
-	resolveServerAWGParamsHook             func(ctx context.Context, serverID int64) (map[string]any, error)
 	enableBackendPreAddTunnelHook          func()
 	enableBackendPostAddTunnelHook         func()
 	reaperHook                             func(context.Context, *models.VPNSession)
@@ -568,26 +567,6 @@ func (s *Service) GetBackendDeviceEndpointForTest(tunID int64) string {
 	return s.backendDeviceEndpoints[tunID]
 }
 
-// filterActiveTunnelsWithDevices returns only active tunnels that have an attached, non-nil packet device.
-// Must be called with s.mu held.
-func (s *Service) filterActiveTunnelsWithDevices(tunnels []*models.BackendTunnel) []*models.BackendTunnel {
-	if len(tunnels) == 0 {
-		return nil
-	}
-	ready := make([]*models.BackendTunnel, 0, len(tunnels))
-	for _, t := range tunnels {
-		if t == nil {
-			continue
-		}
-		hasDev := (s.backendDevices != nil && s.backendDevices[t.ID] != nil) ||
-			(s.forwarder != nil && s.forwarder.HasBackendDevice(t.ID))
-		if hasDev {
-			ready = append(ready, t)
-		}
-	}
-	return ready
-}
-
 // ProbeTunnel probes a tunnel using the service's health prober.
 func (s *Service) ProbeTunnel(ctx context.Context, t *models.BackendTunnel) (int64, error) {
 	if s.prober == nil {
@@ -685,17 +664,7 @@ func (s *Service) SetTunnelEndpointHookForTest(fn func(ctx context.Context, tunn
 	s.pool.SetSetTunnelEndpointHookForTest(fn)
 }
 
-// SetResolveServerAWGParamsHookForTest sets a test hook for resolveServerAWGParams.
-func (s *Service) SetResolveServerAWGParamsHookForTest(fn func(ctx context.Context, serverID int64) (map[string]any, error)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.resolveServerAWGParamsHook = fn
-}
-
 func (s *Service) resolveServerAWGParams(ctx context.Context, serverID int64) (map[string]any, error) {
-	if s.resolveServerAWGParamsHook != nil {
-		return s.resolveServerAWGParamsHook(ctx, serverID)
-	}
 	if s.db == nil {
 		return nil, errors.New("database not available")
 	}
@@ -1533,12 +1502,6 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 	s.balancer = newLB
 	if s.stickyMgr != nil {
 		s.stickyMgr = loadbalancer.NewStickySessionManager(s.db, newLB, caps)
-	}
-
-	if previousCfg != nil && previousCfg.DataPlaneI1Protocol() != cfg.DataPlaneI1Protocol() {
-		if err := s.reattachBackendDevicesLocked(ctx); err != nil {
-			return fmt.Errorf("configuration saved, but failed to reattach some backend devices: %w", err)
-		}
 	}
 
 	return nil

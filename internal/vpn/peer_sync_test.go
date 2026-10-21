@@ -378,7 +378,6 @@ func TestPeerSyncConcurrentRevokeTrafficRekey(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
-	svc.SeedIngressDevicesForTest()
 	for _, tun := range svc.pool.ListTunnels() {
 		svc.forwarder.AttachBackendDevice(tun.ID, nil)
 	}

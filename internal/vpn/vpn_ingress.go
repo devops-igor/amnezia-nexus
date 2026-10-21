@@ -202,7 +202,7 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 
 	// New admission: select through the existing sticky/LB/capacity
 	// primitives (all under s.mu — issue #86).
-	activeTunnels := s.filterActiveTunnelsWithDevices(s.pool.GetActiveTunnels())
+	activeTunnels := s.pool.GetActiveTunnels()
 	if len(activeTunnels) == 0 {
 		return nil, nil, retirement, loadbalancer.ErrNoActiveBackends
 	}

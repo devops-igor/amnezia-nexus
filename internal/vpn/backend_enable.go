@@ -48,53 +48,6 @@ func (s *Service) restoreBackendDevices(ctx context.Context) {
 	}
 }
 
-// reattachBackendDevicesLocked re-attaches active backend devices with fresh parameters.
-// Must be called with s.mu held.
-func (s *Service) reattachBackendDevicesLocked(ctx context.Context) error {
-	if s.pool == nil || s.backendDevices == nil {
-		return nil
-	}
-	baseCtx := ctx
-	if baseCtx == nil {
-		baseCtx = context.Background()
-	}
-
-	var reattachErrs []error
-	for _, tun := range s.pool.ListTunnels() {
-		if tun == nil || !tun.Enabled {
-			continue
-		}
-		if s.backendDevices[tun.ID] == nil {
-			continue
-		}
-		opCtx, opCancel := context.WithTimeout(context.WithoutCancel(baseCtx), 5*time.Second)
-		awgParams, attachErr := s.resolveServerAWGParams(opCtx, tun.ServerID)
-		opCancel()
-		if attachErr == nil {
-			attachErr = s.attachBackendForwarder(tun, awgParams)
-		}
-		if attachErr != nil {
-			reattachErrs = append(reattachErrs, fmt.Errorf("backend tunnel %d (server %d): %w", tun.ID, tun.ServerID, attachErr))
-			log.Printf("[vpn] warning: failed to reattach backend device for tunnel %d (server %d): %v", tun.ID, tun.ServerID, attachErr)
-			if oldDev, ok := s.backendDevices[tun.ID]; ok && oldDev != nil {
-				delete(s.backendDevices, tun.ID)
-				if s.backendDeviceEndpoints != nil {
-					delete(s.backendDeviceEndpoints, tun.ID)
-				}
-				if s.forwarder != nil {
-					s.forwarder.DetachBackendDevice(tun.ID)
-				}
-				_ = oldDev.Close()
-				s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(oldDev))
-			}
-			detachCtx, detachCancel := context.WithTimeout(context.WithoutCancel(baseCtx), 5*time.Second)
-			_ = s.pool.SetTunnelStatus(detachCtx, tun.ServerID, models.TunnelStatusDegraded, 0)
-			detachCancel()
-		}
-	}
-	return errors.Join(reattachErrs...)
-}
-
 // EnableBackend restores administrative eligibility by loading the backend's
 // AWG credentials, registering (or refreshing) the tunnel, and attaching its
 // data-plane device. It does not declare the backend healthy: runtime health
@@ -229,7 +182,7 @@ func (s *Service) prepareBackendDeviceParamsLocked(awgParams map[string]any) (ma
 // The configured data plane I1 protocol (SIP by default, or DNS) always overrides
 // any existing backend I1 setting stored in the database.
 func (s *Service) buildBackendDeviceParams(ctx context.Context, proto string, awgParams map[string]any) (map[string]any, error) {
-	deviceParams := make(map[string]any, len(awgParams)+2)
+	deviceParams := make(map[string]any, len(awgParams)+1)
 	for k, v := range awgParams {
 		// Data plane I1 setting always overrides stored backend I1 (any casing/variant)
 		if tunnel.NormalizeAWGKey(k) == "i1" {
@@ -251,7 +204,6 @@ func (s *Service) buildBackendDeviceParams(ctx context.Context, proto string, aw
 		return nil, fmt.Errorf("generator returned empty data plane I1 packet for protocol %q", proto)
 	}
 	deviceParams["i1"] = i1Val
-	deviceParams["_data_plane_proto"] = proto
 	return deviceParams, nil
 }
 
@@ -286,13 +238,6 @@ func (s *Service) finishEnableBackend(
 	}
 
 	if err := s.attachBackendForwarder(tun, awgParams, prepared...); err != nil {
-		baseCtx := ctx
-		if baseCtx == nil {
-			baseCtx = context.Background()
-		}
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(baseCtx), 5*time.Second)
-		defer cleanupCancel()
-		_ = pool.SetTunnelStatusWithReason(cleanupCtx, serverID, models.TunnelStatusDegraded, models.DisableReasonNone, 0)
 		return err
 	}
 
@@ -554,19 +499,9 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 		return nil
 	}
 
-	currentProto := s.cfg.DataPlaneI1Protocol()
 	var deviceParams map[string]any
 	if len(prepared) > 0 && prepared[0] != nil {
-		preparedProto, _ := prepared[0]["_data_plane_proto"].(string)
-		if preparedProto != "" && preparedProto != currentProto {
-			var prepErr error
-			deviceParams, prepErr = s.prepareBackendDeviceParamsLocked(awgParams)
-			if prepErr != nil {
-				return fmt.Errorf("failed to prepare backend device parameters for server %d: %w", tun.ServerID, prepErr)
-			}
-		} else {
-			deviceParams = prepared[0]
-		}
+		deviceParams = prepared[0]
 	} else {
 		var prepErr error
 		deviceParams, prepErr = s.prepareBackendDeviceParamsLocked(awgParams)
@@ -574,7 +509,6 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 			return fmt.Errorf("failed to prepare backend device parameters for server %d: %w", tun.ServerID, prepErr)
 		}
 	}
-	delete(deviceParams, "_data_plane_proto")
 
 	// Detach and close previous device for this tunnel to prevent leaks
 	if s.backendDevices != nil {

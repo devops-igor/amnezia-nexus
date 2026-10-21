@@ -85,7 +85,6 @@ func TestEnsureBackendSessionForIngressCreatesSessionWithDurableIP(t *testing.T)
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
-	svc.SeedIngressDevicesForTest()
 
 	peer := seedIngressPeer(t, db, "ingress-alice", "ingress-peer-aaaaaaaaaa1", "10.100.3.2")
 	o := ownershipFor(peer)
@@ -138,7 +137,6 @@ func TestEnsureBackendSessionForIngressReusesLiveSession(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
-	svc.SeedIngressDevicesForTest()
 
 	peer := seedIngressPeer(t, db, "ingress-bob", "ingress-peer-bbbbbbbbbb2", "10.100.3.3")
 	o := ownershipFor(peer)
@@ -187,7 +185,6 @@ func TestEnsureBackendSessionForIngressValidatesOwnership(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
-	svc.SeedIngressDevicesForTest()
 
 	peer := seedIngressPeer(t, db, "ingress-carol", "ingress-peer-cccccccccc3", "10.100.3.4")
 
@@ -259,7 +256,6 @@ func TestEnsureBackendSessionForIngressRollsBackOnRouteCapacity(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
-	svc.SeedIngressDevicesForTest()
 
 	occupant := seedIngressPeer(t, db, "ingress-dave", "ingress-peer-dddddddddd4", "10.100.3.5")
 	_, _, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(occupant))
@@ -341,7 +337,6 @@ func TestIngressAdmissionExactlyOnceConcurrentBurst(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
-	svc.SeedIngressDevicesForTest()
 
 	peer := seedIngressPeer(t, db, "ingress-frank", "ingress-peer-ffffffffff6", "10.100.3.7")
 	o := ownershipFor(peer)
@@ -414,7 +409,6 @@ func TestIngressEngineLivenessRefreshesSessionManager(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
-	svc.SeedIngressDevicesForTest()
 
 	peer := seedIngressPeer(t, db, "ingress-iris", "ingress-peer-iiiiiiiiii9", "10.100.3.10")
 	o := ownershipFor(peer)
