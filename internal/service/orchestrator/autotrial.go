@@ -25,7 +25,8 @@ type MimicryRotator interface {
 }
 
 // NextMimicryProfile calculates the next mimicry profile in rotation order:
-// auto -> dns -> quic -> tls -> sip -> dns.
+// auto -> dns, sip -> dns, dns -> sip, quic/tls -> sip.
+// Rotation cycles strictly between verified DPI-passing UDP protocols (SIP <-> DNS).
 func NextMimicryProfile(current models.AWGMimicryProfile) models.AWGMimicryProfile {
 	switch current {
 	case models.AWGMimicryAuto, "":
@@ -33,10 +34,8 @@ func NextMimicryProfile(current models.AWGMimicryProfile) models.AWGMimicryProfi
 	case models.AWGMimicrySIP:
 		return models.AWGMimicryDNS
 	case models.AWGMimicryDNS:
-		return models.AWGMimicryQUIC
-	case models.AWGMimicryQUIC:
-		return models.AWGMimicryTLS
-	case models.AWGMimicryTLS:
+		return models.AWGMimicrySIP
+	case models.AWGMimicryQUIC, models.AWGMimicryTLS:
 		return models.AWGMimicrySIP
 	default:
 		return models.AWGMimicryDNS
@@ -106,11 +105,13 @@ func (o *Orchestrator) processServerAutoTrial(ctx context.Context, serverID int6
 	}
 
 	for _, c := range sConns {
-		if hasHandshake != nil && hasHandshake[c.ClientID] {
-			if handshakeAges[c.ClientID] <= 180*time.Second {
-				// Fresh active handshake (<= 180s); no rotation needed
-				continue
-			}
+		// Do not rotate dormant clients that have never established a handshake; keep the working default SIP configuration.
+		if hasHandshake == nil || !hasHandshake[c.ClientID] {
+			continue
+		}
+		if handshakeAges[c.ClientID] <= 180*time.Second {
+			// Fresh active handshake (<= 180s); no rotation needed
+			continue
 		}
 
 		if rotatedAt, ok := rotatedTimes[c.ClientID]; ok && !rotatedAt.IsZero() {

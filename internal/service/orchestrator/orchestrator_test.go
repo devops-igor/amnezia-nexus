@@ -932,6 +932,14 @@ func TestOrchestrator_CheckAutoTrialHandshakes(t *testing.T) {
 
 	reg := newMockOrchRegistry()
 	awgMgr := newMockOrchProtocolManager("awg")
+	awgMgr.clients = []map[string]any{
+		{
+			"clientId": "cid-autotrial",
+			"userData": map[string]any{
+				"latestHandshake": "5 minutes ago",
+			},
+		},
+	}
 	reg.Register(awgMgr)
 
 	orch := New(db, reg)
@@ -1000,7 +1008,7 @@ func TestOrchestrator_CheckAutoTrialHandshakes(t *testing.T) {
 		_, _ = db.DeleteConnection(ctx, connIDFresh)
 	}
 
-	// 2b. Test stale handshakes (> 180s or never/empty) - MUST rotate
+	// 2b. Test stale handshakes (> 180s) - MUST rotate
 	staleTestCases := []struct {
 		name      string
 		cid       string
@@ -1010,10 +1018,6 @@ func TestOrchestrator_CheckAutoTrialHandshakes(t *testing.T) {
 		{"wg show 5 minutes ago", "cid-stale-5m", "5 minutes ago"},
 		{"wg show 2 hours, 10 minutes ago", "cid-stale-2h", "2 hours, 10 minutes ago"},
 		{"wg show 3 days, 4 hours ago", "cid-stale-3d", "3 days, 4 hours ago"},
-		{"wg show never", "cid-stale-never", "never"},
-		{"wg show none", "cid-stale-none", "(none)"},
-		{"empty handshake", "cid-stale-empty", ""},
-		{"zero numeric timestamp", "cid-stale-zero", int64(0)},
 	}
 
 	for _, tc := range staleTestCases {
@@ -1051,6 +1055,53 @@ func TestOrchestrator_CheckAutoTrialHandshakes(t *testing.T) {
 		_, _ = db.DeleteConnection(ctx, connIDStale)
 	}
 
+	// 2c. Test dormant handshakes (never/none/empty/zero) - MUST NOT rotate
+	dormantTestCases := []struct {
+		name      string
+		cid       string
+		handshake any
+	}{
+		{"wg show never", "cid-dormant-never", "never"},
+		{"wg show none", "cid-dormant-none", "(none)"},
+		{"empty handshake", "cid-dormant-empty", ""},
+		{"zero numeric timestamp", "cid-dormant-zero", int64(0)},
+	}
+
+	for _, tc := range dormantTestCases {
+		connIDDormant, _ := db.CreateConnection(ctx, &models.UserConnection{
+			UserID:     uID,
+			ServerID:   sID,
+			Protocol:   "awg",
+			ClientID:   tc.cid,
+			Name:       tc.name,
+			AWGMimicry: models.AWGMimicryAuto,
+			CreatedAt:  time.Now().UTC(),
+		})
+		awgMgr.mu.Lock()
+		awgMgr.rotated = nil
+		awgMgr.clients = []map[string]any{
+			{
+				"clientId": tc.cid,
+				"userData": map[string]any{
+					"latestHandshake": tc.handshake,
+				},
+			},
+		}
+		awgMgr.mu.Unlock()
+
+		if err := orch.CheckAutoTrialHandshakes(ctx); err != nil {
+			t.Fatalf("CheckAutoTrialHandshakes failed for dormant client %s: %v", tc.name, err)
+		}
+		if len(awgMgr.rotated) != 0 {
+			t.Errorf("[%s] expected dormant client NOT to be rotated, but rotated: %v", tc.name, awgMgr.rotated)
+		}
+		ucDormant, _ := db.GetConnection(ctx, connIDDormant)
+		if ucDormant.AWGMimicry != models.AWGMimicryAuto {
+			t.Errorf("[%s] expected connection in DB to remain auto, got %s", tc.name, ucDormant.AWGMimicry)
+		}
+		_, _ = db.DeleteConnection(ctx, connIDDormant)
+	}
+
 	// 3. Test failed remote rotation - DB must NOT mutate
 	connIDFail, _ := db.CreateConnection(ctx, &models.UserConnection{
 		UserID:     uID,
@@ -1063,7 +1114,14 @@ func TestOrchestrator_CheckAutoTrialHandshakes(t *testing.T) {
 	})
 	awgMgr.mu.Lock()
 	awgMgr.rotated = nil
-	awgMgr.clients = nil
+	awgMgr.clients = []map[string]any{
+		{
+			"clientId": "cid-fail",
+			"userData": map[string]any{
+				"latestHandshake": "5 minutes ago",
+			},
+		},
+	}
 	awgMgr.returnError = true
 	awgMgr.mu.Unlock()
 
@@ -1917,8 +1975,8 @@ func TestNextMimicryProfile(t *testing.T) {
 	}{
 		{models.AWGMimicryAuto, models.AWGMimicryDNS},
 		{models.AWGMimicrySIP, models.AWGMimicryDNS},
-		{models.AWGMimicryDNS, models.AWGMimicryQUIC},
-		{models.AWGMimicryQUIC, models.AWGMimicryTLS},
+		{models.AWGMimicryDNS, models.AWGMimicrySIP},
+		{models.AWGMimicryQUIC, models.AWGMimicrySIP},
 		{models.AWGMimicryTLS, models.AWGMimicrySIP},
 		{"", models.AWGMimicryDNS},
 		{"unknown", models.AWGMimicryDNS},

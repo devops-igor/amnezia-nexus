@@ -489,7 +489,7 @@ func TestAWGManager_RotateMimicry(t *testing.T) {
 	server := &models.Server{ID: 1, Host: "1.2.3.4"}
 
 	// Initial client has awg_mimicry: "tls"
-	// Sequence: auto -> sip -> dns -> quic -> tls -> sip
+	// Sequence: tls -> sip -> dns -> sip -> dns (cycling strictly between DPI-passing UDP profiles, with tls/quic falling back to sip)
 	proto1, err := mgr.RotateMimicry(ctx, server, "pubkey1")
 	if err != nil || proto1 != "sip" {
 		t.Fatalf("RotateMimicry 1 expected sip, got %s, err: %v", proto1, err)
@@ -501,23 +501,18 @@ func TestAWGManager_RotateMimicry(t *testing.T) {
 	}
 
 	proto3, err := mgr.RotateMimicry(ctx, server, "pubkey1")
-	if err != nil || proto3 != "quic" {
-		t.Fatalf("RotateMimicry 3 expected quic, got %s, err: %v", proto3, err)
+	if err != nil || proto3 != "sip" {
+		t.Fatalf("RotateMimicry 3 expected sip, got %s, err: %v", proto3, err)
 	}
 
 	proto4, err := mgr.RotateMimicry(ctx, server, "pubkey1")
-	if err != nil || proto4 != "tls" {
-		t.Fatalf("RotateMimicry 4 expected tls, got %s, err: %v", proto4, err)
-	}
-
-	proto5, err := mgr.RotateMimicry(ctx, server, "pubkey1")
-	if err != nil || proto5 != "sip" {
-		t.Fatalf("RotateMimicry 5 expected sip, got %s, err: %v", proto5, err)
+	if err != nil || proto4 != "dns" {
+		t.Fatalf("RotateMimicry 4 expected dns, got %s, err: %v", proto4, err)
 	}
 
 	clients, _ := mgr.getClientsTable(ctx, client)
-	if clients[0].UserData.AWGMimicry != "sip" {
-		t.Errorf("expected clientsTable mimicry sip, got %s", clients[0].UserData.AWGMimicry)
+	if clients[0].UserData.AWGMimicry != "dns" {
+		t.Errorf("expected clientsTable mimicry dns, got %s", clients[0].UserData.AWGMimicry)
 	}
 	if clients[0].UserData.RotatedAt == "" {
 		t.Errorf("expected rotated_at timestamp to be set")
@@ -529,6 +524,14 @@ func TestAWGManager_RotateMimicry(t *testing.T) {
 	protoAuto, err := mgr.RotateMimicry(ctx, server, "pubkey1")
 	if err != nil || protoAuto != "dns" {
 		t.Fatalf("RotateMimicry from auto expected dns, got %s, err: %v", protoAuto, err)
+	}
+
+	// Test quic -> sip
+	clients[0].UserData.AWGMimicry = "quic"
+	_ = mgr.saveClientsTable(ctx, client, clients)
+	protoQuic, err := mgr.RotateMimicry(ctx, server, "pubkey1")
+	if err != nil || protoQuic != "sip" {
+		t.Fatalf("RotateMimicry from quic expected sip, got %s, err: %v", protoQuic, err)
 	}
 
 	// Error cases

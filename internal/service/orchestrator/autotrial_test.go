@@ -17,8 +17,8 @@ func TestNextMimicryProfile_RotationOrder(t *testing.T) {
 		{name: "auto_rotates_to_dns", current: models.AWGMimicryAuto, want: models.AWGMimicryDNS},
 		{name: "empty_rotates_to_dns", current: "", want: models.AWGMimicryDNS},
 		{name: "sip_rotates_to_dns", current: models.AWGMimicrySIP, want: models.AWGMimicryDNS},
-		{name: "dns_rotates_to_quic", current: models.AWGMimicryDNS, want: models.AWGMimicryQUIC},
-		{name: "quic_rotates_to_tls", current: models.AWGMimicryQUIC, want: models.AWGMimicryTLS},
+		{name: "dns_rotates_to_sip", current: models.AWGMimicryDNS, want: models.AWGMimicrySIP},
+		{name: "quic_rotates_to_sip", current: models.AWGMimicryQUIC, want: models.AWGMimicrySIP},
 		{name: "tls_rotates_to_sip", current: models.AWGMimicryTLS, want: models.AWGMimicrySIP},
 		{name: "unknown_rotates_to_dns", current: "unknown", want: models.AWGMimicryDNS},
 	}
@@ -34,13 +34,13 @@ func TestNextMimicryProfile_RotationOrder(t *testing.T) {
 }
 
 func TestNextMimicryProfile_FullCycle(t *testing.T) {
-	// Verify continuous cycle starting from Auto advances to DNS and cycles indefinitely:
-	// auto -> dns -> quic -> tls -> sip -> dns ...
+	// Verify continuous cycle starting from Auto advances to DNS and cycles strictly between SIP and DNS:
+	// auto -> dns -> sip -> dns -> sip ...
 	cycle := []models.AWGMimicryProfile{
 		models.AWGMimicryAuto,
 		models.AWGMimicryDNS,
-		models.AWGMimicryQUIC,
-		models.AWGMimicryTLS,
+		models.AWGMimicrySIP,
+		models.AWGMimicryDNS,
 		models.AWGMimicrySIP,
 		models.AWGMimicryDNS,
 	}
@@ -99,15 +99,16 @@ func TestCheckAutoTrialHandshakes_ConsecutiveRotations_DoNotFilterOut(t *testing
 	awgMgr := newMockOrchProtocolManager("awg")
 
 	// The remote server's clientsTable tracks the active mimicry profile.
-	// An auto connection initially runs with SIP, so initial mimicry on remote is "auto" (or "sip").
-	// RotateMimicry simulates the lockstep rotation:
-	// auto/sip -> dns -> quic -> tls -> sip
-	remoteMimicry := "auto"
+	// An active auto client that had established a handshake but subsequently stalled (> 180s).
+	// Initial mimicry on remote is "sip" (or "auto").
+	// RotateMimicry simulates the lockstep rotation cycling strictly between SIP and DNS:
+	// auto/sip -> dns -> sip -> dns
+	remoteMimicry := "sip"
 	awgMgr.clients = []map[string]any{
 		{
 			"clientId": "cid-consecutive",
 			"userData": map[string]any{
-				"latestHandshake": "never",
+				"latestHandshake": "5 minutes ago",
 			},
 		},
 	}
@@ -116,10 +117,6 @@ func TestCheckAutoTrialHandshakes_ConsecutiveRotations_DoNotFilterOut(t *testing
 		case "auto", "sip":
 			remoteMimicry = "dns"
 		case "dns":
-			remoteMimicry = "quic"
-		case "quic":
-			remoteMimicry = "tls"
-		case "tls":
 			remoteMimicry = "sip"
 		default:
 			remoteMimicry = "dns"
@@ -170,7 +167,7 @@ func TestCheckAutoTrialHandshakes_ConsecutiveRotations_DoNotFilterOut(t *testing
 		t.Fatalf("expected awg_mimicry in DB to remain %q after second run, got %q", models.AWGMimicryAuto, uc2.AWGMimicry)
 	}
 
-	// Step (c): Background run after cooldown expiry advances to quic
+	// Step (c): Background run after cooldown expiry advances to sip (never QUIC/TLS)
 	// Simulate cooldown expiry by advancing rotated_at past DefaultAutoTrialCooldown
 	expiredTime := time.Now().Add(-(DefaultAutoTrialCooldown + time.Hour)).UTC().Format(time.RFC3339)
 	awgMgr.clients[0]["userData"].(map[string]any)["rotated_at"] = expiredTime
@@ -179,11 +176,11 @@ func TestCheckAutoTrialHandshakes_ConsecutiveRotations_DoNotFilterOut(t *testing
 		t.Fatalf("third CheckAutoTrialHandshakes failed: %v", err)
 	}
 
-	if len(awgMgr.rotatedProfiles) != 2 || awgMgr.rotatedProfiles[1] != "quic" {
-		t.Fatalf("expected rotation to advance to quic after cooldown expiry, got %v", awgMgr.rotatedProfiles)
+	if len(awgMgr.rotatedProfiles) != 2 || awgMgr.rotatedProfiles[1] != "sip" {
+		t.Fatalf("expected rotation to advance to sip after cooldown expiry, got %v", awgMgr.rotatedProfiles)
 	}
-	if remoteMimicry != "quic" {
-		t.Fatalf("expected remote mimicry to advance to quic, got %q", remoteMimicry)
+	if remoteMimicry != "sip" {
+		t.Fatalf("expected remote mimicry to advance to sip, got %q", remoteMimicry)
 	}
 
 	uc3, err := db.GetConnection(ctx, connID)
@@ -192,6 +189,109 @@ func TestCheckAutoTrialHandshakes_ConsecutiveRotations_DoNotFilterOut(t *testing
 	}
 	if uc3.AWGMimicry != models.AWGMimicryAuto {
 		t.Fatalf("expected awg_mimicry in DB to remain %q after third run, got %q", models.AWGMimicryAuto, uc3.AWGMimicry)
+	}
+}
+
+func TestCheckAutoTrialHandshakes_DormantClient_DoesNotRotateFromSIP(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	sID, err := db.CreateServer(ctx, &models.Server{
+		Name:    "AWG Server Dormant",
+		Host:    "10.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"awg": map[string]any{"port": 55424},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	uID, err := db.CreateUser(ctx, &models.User{
+		Username: "dormant_user",
+		Role:     models.RoleUser,
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	dormantCases := []struct {
+		name      string
+		cid       string
+		handshake any
+	}{
+		{name: "handshake_never", cid: "cid-dormant-never", handshake: "never"},
+		{name: "handshake_none", cid: "cid-dormant-none", handshake: "(none)"},
+		{name: "handshake_empty", cid: "cid-dormant-empty", handshake: ""},
+		{name: "handshake_zero", cid: "cid-dormant-zero", handshake: int64(0)},
+		{name: "handshake_nil", cid: "cid-dormant-nil", handshake: nil},
+		{name: "handshake_unreported", cid: "cid-dormant-unreported", handshake: "omit"},
+	}
+
+	var connIDs []string
+	var remoteClients []map[string]any
+
+	for _, dc := range dormantCases {
+		connID, err := db.CreateConnection(ctx, &models.UserConnection{
+			UserID:     uID,
+			ServerID:   sID,
+			Protocol:   "awg",
+			ClientID:   dc.cid,
+			Name:       "auto_vpn_" + dc.cid,
+			AWGMimicry: models.AWGMimicryAuto,
+			CreatedAt:  time.Now().UTC(),
+		})
+		if err != nil {
+			t.Fatalf("failed to create connection for %s: %v", dc.cid, err)
+		}
+		connIDs = append(connIDs, connID)
+
+		if dc.handshake != "omit" {
+			userData := map[string]any{
+				"awg_mimicry": "sip",
+			}
+			if dc.handshake != nil {
+				userData["latestHandshake"] = dc.handshake
+			}
+			remoteClients = append(remoteClients, map[string]any{
+				"clientId": dc.cid,
+				"userData": userData,
+			})
+		}
+	}
+
+	reg := newMockOrchRegistry()
+	awgMgr := newMockOrchProtocolManager("awg")
+	awgMgr.clients = remoteClients
+	reg.Register(awgMgr)
+
+	orch := New(db, reg)
+
+	// Execute CheckAutoTrialHandshakes across multiple background runs (simulating cron ticks over several days)
+	for run := 1; run <= 5; run++ {
+		if err := orch.CheckAutoTrialHandshakes(ctx); err != nil {
+			t.Fatalf("run %d failed: %v", run, err)
+		}
+	}
+
+	// Verify that NO dormant client was ever rotated
+	if len(awgMgr.rotated) != 0 || len(awgMgr.rotatedProfiles) != 0 {
+		t.Fatalf("expected 0 rotations for dormant clients, but got rotated=%v, profiles=%v", awgMgr.rotated, awgMgr.rotatedProfiles)
+	}
+
+	// Verify all DB connections maintain auto mimicry, preserving default SIP configuration
+	for _, cid := range connIDs {
+		uc, err := db.GetConnection(ctx, cid)
+		if err != nil {
+			t.Fatalf("failed to get connection %s: %v", cid, err)
+		}
+		if uc.AWGMimicry != models.AWGMimicryAuto {
+			t.Fatalf("expected connection %s AWGMimicry to remain auto, got %q", cid, uc.AWGMimicry)
+		}
 	}
 }
 
