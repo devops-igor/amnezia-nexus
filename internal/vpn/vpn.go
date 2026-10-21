@@ -1516,7 +1516,9 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 	}
 
 	if previousCfg != nil && previousCfg.DataPlaneI1Protocol() != cfg.DataPlaneI1Protocol() {
-		s.reattachBackendDevicesLocked(ctx)
+		if err := s.reattachBackendDevicesLocked(ctx); err != nil {
+			return fmt.Errorf("configuration saved, but failed to reattach some backend devices: %w", err)
+		}
 	}
 
 	return nil

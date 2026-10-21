@@ -443,6 +443,12 @@ func (p *Pool) SetTunnelStatusInMemory(serverID int64, status string) {
 	}
 }
 
+// SetTunnelStatusFailClosed degrades the tunnel status in memory without writing to the DB.
+// It is an alias for SetTunnelStatusInMemory.
+func (p *Pool) SetTunnelStatusFailClosed(serverID int64, status string) {
+	p.SetTunnelStatusInMemory(serverID, status)
+}
+
 // SetTunnelStatusIfCurrent applies a probe result only to the tunnel generation
 // that produced it. The identity check and DB/memory update share p.mu.
 func (p *Pool) SetTunnelStatusIfCurrent(ctx context.Context, serverID, expectedTunnelID int64, status string, latencyMS int64) error {
@@ -500,7 +506,16 @@ func (p *Pool) setTunnelStatus(ctx context.Context, serverID, expectedTunnelID, 
 				return fmt.Errorf("failed to execute CAS update on backend tunnel: %w", err)
 			}
 			if !swapped {
-				return ErrStaleStateVersion
+				dbTun, dbErr := p.db.GetBackendTunnel(ctx, tunnel.ID)
+				if dbErr == nil && dbTun != nil && dbTun.StateVersion == expectedVersion {
+					swapped, err = p.db.CompareAndSwapTunnelStatus(ctx, tunnel.ID, dbTun.Status, dbTun.DisableReason, expectedVersion, status, newReason, latencyMS)
+					if err != nil {
+						return fmt.Errorf("failed to execute CAS update on backend tunnel: %w", err)
+					}
+				}
+				if !swapped {
+					return ErrStaleStateVersion
+				}
 			}
 		} else {
 			var err error

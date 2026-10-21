@@ -50,15 +50,16 @@ func (s *Service) restoreBackendDevices(ctx context.Context) {
 
 // reattachBackendDevicesLocked re-attaches active backend devices with fresh parameters.
 // Must be called with s.mu held.
-func (s *Service) reattachBackendDevicesLocked(ctx context.Context) {
+func (s *Service) reattachBackendDevicesLocked(ctx context.Context) error {
 	if s.pool == nil || s.backendDevices == nil {
-		return
+		return nil
 	}
 	baseCtx := ctx
 	if baseCtx == nil {
 		baseCtx = context.Background()
 	}
 
+	var reattachErrs []error
 	for _, tun := range s.pool.ListTunnels() {
 		if tun == nil || !tun.Enabled {
 			continue
@@ -73,6 +74,7 @@ func (s *Service) reattachBackendDevicesLocked(ctx context.Context) {
 			attachErr = s.attachBackendForwarder(tun, awgParams)
 		}
 		if attachErr != nil {
+			reattachErrs = append(reattachErrs, fmt.Errorf("backend tunnel %d (server %d): %w", tun.ID, tun.ServerID, attachErr))
 			log.Printf("[vpn] warning: failed to reattach backend device for tunnel %d (server %d): %v", tun.ID, tun.ServerID, attachErr)
 			if oldDev, ok := s.backendDevices[tun.ID]; ok && oldDev != nil {
 				delete(s.backendDevices, tun.ID)
@@ -96,6 +98,7 @@ func (s *Service) reattachBackendDevicesLocked(ctx context.Context) {
 			cleanupCancel()
 		}
 	}
+	return errors.Join(reattachErrs...)
 }
 
 // EnableBackend restores administrative eligibility by loading the backend's

@@ -129,8 +129,8 @@ func TestUpdateConfig_DataPlaneI1ProtocolSwitch_GeneratorFailureMarksTunnelDegra
 	cfgWithDNS := &models.VPNConfig{
 		VPNDataPlaneI1Protocol: "dns",
 	}
-	if err := svc.UpdateConfig(ctx, cfgWithDNS); err != nil {
-		t.Fatalf("UpdateConfig unexpected error: %v", err)
+	if err := svc.UpdateConfig(ctx, cfgWithDNS); err == nil || !strings.Contains(err.Error(), "failed to reattach some backend devices") {
+		t.Fatalf("expected error indicating reattach failure, got: %v", err)
 	}
 
 	tunAfter, err := svc.pool.GetTunnel(srvID)
@@ -348,8 +348,8 @@ func TestUpdateConfig_DataPlaneI1ProtocolSwitch_GeneratorFailureDetachesObsolete
 	})
 	err = svc.UpdateConfig(ctx, &models.VPNConfig{VPNDataPlaneI1Protocol: "dns"})
 	restore()
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "failed to reattach some backend devices") {
+		t.Fatalf("expected error indicating reattach failure, got: %v", err)
 	}
 
 	degraded, err := svc.pool.GetTunnel(id)
@@ -629,8 +629,8 @@ func TestUpdateConfig_DataPlaneI1ProtocolSwitch_ReattachTimeoutEnsuresFailClosed
 	cfgWithDNS := &models.VPNConfig{
 		VPNDataPlaneI1Protocol: "dns",
 	}
-	if err := svc.UpdateConfig(ctx, cfgWithDNS); err != nil {
-		t.Fatalf("UpdateConfig: %v", err)
+	if err := svc.UpdateConfig(ctx, cfgWithDNS); err == nil || !strings.Contains(err.Error(), "failed to reattach some backend devices") {
+		t.Fatalf("expected reattach failure error, got: %v", err)
 	}
 
 	// (a) Obsolete device is detached/closed.
@@ -666,5 +666,174 @@ func TestUpdateConfig_DataPlaneI1ProtocolSwitch_ReattachTimeoutEnsuresFailClosed
 	}
 	if tunByID.Status != models.TunnelStatusDegraded {
 		t.Fatalf("expected in-memory tunnelByID status %q, got %q", models.TunnelStatusDegraded, tunByID.Status)
+	}
+}
+
+func TestUpdateConfig_DataPlaneI1ProtocolSwitch_PartialFailureReturnsErrorAndPreservesConfig(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+
+	s1 := testNewServerWithAWGParams(t, svc, "198.51.100.111", map[string]any{"s1": 15, "s2": 40})
+	s2 := testNewServerWithAWGParams(t, svc, "198.51.100.112", map[string]any{"s1": 15, "s2": 40})
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+	if err := svc.EnableBackend(ctx, s1); err != nil {
+		t.Fatalf("EnableBackend(s1): %v", err)
+	}
+	if err := svc.EnableBackend(ctx, s2); err != nil {
+		t.Fatalf("EnableBackend(s2): %v", err)
+	}
+
+	tun1, _ := svc.pool.GetTunnel(s1)
+	tun2, _ := svc.pool.GetTunnel(s2)
+
+	// Make s2 fail during reattachment parameter resolution, while s1 succeeds
+	svc.SetResolveServerAWGParamsHookForTest(func(ctx context.Context, serverID int64) (map[string]any, error) {
+		if serverID == s2 {
+			return nil, errors.New("simulated reattach error for s2")
+		}
+		return map[string]any{"s1": 15, "s2": 40}, nil
+	})
+	defer svc.SetResolveServerAWGParamsHookForTest(nil)
+
+	cfgWithDNS := &models.VPNConfig{
+		VPNDataPlaneI1Protocol: "dns",
+	}
+	err = svc.UpdateConfig(ctx, cfgWithDNS)
+	if err == nil {
+		t.Fatal("expected UpdateConfig to return error on partial failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to reattach some backend devices") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+	if !strings.Contains(err.Error(), "simulated reattach error for s2") {
+		t.Fatalf("expected error to include backend cause, got: %v", err)
+	}
+
+	// Verify config is preserved in DB and service
+	savedCfg, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetVPNConfig: %v", err)
+	}
+	if savedCfg.DataPlaneI1Protocol() != "dns" {
+		t.Fatalf("expected DB config preserved with dns, got %q", savedCfg.DataPlaneI1Protocol())
+	}
+	if svc.cfg.DataPlaneI1Protocol() != "dns" {
+		t.Fatalf("expected svc config preserved with dns, got %q", svc.cfg.DataPlaneI1Protocol())
+	}
+
+	// s1 succeeded: device attached and active
+	svc.mu.RLock()
+	dev1 := svc.backendDevices[tun1.ID]
+	dev2 := svc.backendDevices[tun2.ID]
+	svc.mu.RUnlock()
+	if dev1 == nil {
+		t.Fatal("expected s1 device to remain attached")
+	}
+	if dev2 != nil {
+		t.Fatal("expected failing s2 device to be detached")
+	}
+
+	tun1After, _ := svc.pool.GetTunnel(s1)
+	tun2After, _ := svc.pool.GetTunnel(s2)
+	if tun1After.Status != models.TunnelStatusActive {
+		t.Fatalf("expected s1 status %q, got %q", models.TunnelStatusActive, tun1After.Status)
+	}
+	if tun2After.Status != models.TunnelStatusDegraded {
+		t.Fatalf("expected s2 status %q, got %q", models.TunnelStatusDegraded, tun2After.Status)
+	}
+}
+
+func TestTunnelPool_SetTunnelStatusFailClosed_RecoversOnSubsequentCASProbe(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { closeBackendDevices(svc) })
+
+	sID := testNewServerWithAWGParams(t, svc, "198.51.100.120", map[string]any{"s1": 15, "s2": 40})
+	svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+	if err := svc.EnableBackend(ctx, sID); err != nil {
+		t.Fatalf("EnableBackend: %v", err)
+	}
+
+	tun, err := svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel: %v", err)
+	}
+	if tun.Status != models.TunnelStatusActive {
+		t.Fatalf("expected initial status active, got %q", tun.Status)
+	}
+
+	initialVersion := tun.StateVersion
+	dbTun, err := db.GetBackendTunnel(ctx, tun.ID)
+	if err != nil || dbTun == nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if dbTun.Status != models.TunnelStatusActive || dbTun.StateVersion != initialVersion {
+		t.Fatalf("expected DB tunnel active at version %d, got status %q version %d", initialVersion, dbTun.Status, dbTun.StateVersion)
+	}
+
+	// Simulate status persistence failure during degradation:
+	// in-memory degraded, DB active.
+	svc.pool.SetTunnelStatusFailClosed(sID, models.TunnelStatusDegraded)
+
+	inMemTun, err := svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel after fail-closed: %v", err)
+	}
+	if inMemTun.Status != models.TunnelStatusDegraded {
+		t.Fatalf("expected in-memory status degraded, got %q", inMemTun.Status)
+	}
+
+	dbTunBeforeProbe, err := db.GetBackendTunnel(ctx, tun.ID)
+	if err != nil || dbTunBeforeProbe == nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if dbTunBeforeProbe.Status != models.TunnelStatusActive {
+		t.Fatalf("expected DB status to remain active after simulated persistence failure, got %q", dbTunBeforeProbe.Status)
+	}
+
+	// Simulate a subsequent successful probe using SetTunnelStatusIfCurrentWithVersion
+	err = svc.pool.SetTunnelStatusIfCurrentWithVersion(ctx, sID, tun.ID, initialVersion, models.TunnelStatusActive, 20)
+	if err != nil {
+		t.Fatalf("expected CAS to recover and resynchronize tunnel, got: %v", err)
+	}
+
+	// Verify CAS recovered and transitioned the tunnel back to active both in memory and DB
+	recoveredTun, err := svc.pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("GetTunnel after probe: %v", err)
+	}
+	if recoveredTun.Status != models.TunnelStatusActive {
+		t.Fatalf("expected recovered in-memory status active, got %q", recoveredTun.Status)
+	}
+	if recoveredTun.StateVersion != initialVersion+1 {
+		t.Fatalf("expected recovered version %d, got %d", initialVersion+1, recoveredTun.StateVersion)
+	}
+	if recoveredTun.LatencyMS != 20 {
+		t.Fatalf("expected latency 20, got %d", recoveredTun.LatencyMS)
+	}
+
+	dbTunAfter, err := db.GetBackendTunnel(ctx, tun.ID)
+	if err != nil || dbTunAfter == nil {
+		t.Fatalf("GetBackendTunnel after probe: %v", err)
+	}
+	if dbTunAfter.Status != models.TunnelStatusActive {
+		t.Fatalf("expected recovered DB status active, got %q", dbTunAfter.Status)
+	}
+	if dbTunAfter.StateVersion != initialVersion+1 {
+		t.Fatalf("expected recovered DB version %d, got %d", initialVersion+1, dbTunAfter.StateVersion)
+	}
+	if dbTunAfter.LatencyMS != 20 {
+		t.Fatalf("expected DB latency 20, got %d", dbTunAfter.LatencyMS)
 	}
 }
