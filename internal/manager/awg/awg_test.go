@@ -523,12 +523,12 @@ func TestAWGManager_RotateMimicry(t *testing.T) {
 		t.Errorf("expected rotated_at timestamp to be set")
 	}
 
-	// Test auto -> sip
+	// Test auto -> dns
 	clients[0].UserData.AWGMimicry = "auto"
 	_ = mgr.saveClientsTable(ctx, client, clients)
 	protoAuto, err := mgr.RotateMimicry(ctx, server, "pubkey1")
-	if err != nil || protoAuto != "sip" {
-		t.Fatalf("RotateMimicry from auto expected sip, got %s, err: %v", protoAuto, err)
+	if err != nil || protoAuto != "dns" {
+		t.Fatalf("RotateMimicry from auto expected dns, got %s, err: %v", protoAuto, err)
 	}
 
 	// Error cases

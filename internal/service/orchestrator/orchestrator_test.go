@@ -21,14 +21,16 @@ import (
 )
 
 type mockOrchProtocolManager struct {
-	proto          string
-	mu             sync.Mutex
-	clients        []map[string]any
-	deleted        []string
-	toggled        map[string]bool
-	rotated        []string
-	returnError    bool
-	addClientCalls int
+	proto           string
+	mu              sync.Mutex
+	clients         []map[string]any
+	deleted         []string
+	toggled         map[string]bool
+	rotated         []string
+	rotatedProfiles []string
+	rotateFunc      func(ctx context.Context, server *models.Server, clientID string) (string, error)
+	returnError     bool
+	addClientCalls  int
 }
 
 func newMockOrchProtocolManager(proto string) *mockOrchProtocolManager {
@@ -108,6 +110,14 @@ func (m *mockOrchProtocolManager) RotateMimicry(ctx context.Context, server *mod
 		return "", errors.New("remote rotation failed")
 	}
 	m.rotated = append(m.rotated, clientID)
+	if m.rotateFunc != nil {
+		prof, err := m.rotateFunc(ctx, server, clientID)
+		if err == nil {
+			m.rotatedProfiles = append(m.rotatedProfiles, prof)
+		}
+		return prof, err
+	}
+	m.rotatedProfiles = append(m.rotatedProfiles, "quic")
 	return "quic", nil
 }
 
@@ -935,8 +945,8 @@ func TestOrchestrator_CheckAutoTrialHandshakes(t *testing.T) {
 	}
 
 	uc, _ := db.GetConnection(ctx, connID)
-	if uc.AWGMimicry != "quic" {
-		t.Errorf("expected connection mimicry to be updated to quic, got %s", uc.AWGMimicry)
+	if uc.AWGMimicry != models.AWGMimicryAuto {
+		t.Errorf("expected connection mimicry in DB to remain auto, got %s", uc.AWGMimicry)
 	}
 	_, _ = db.DeleteConnection(ctx, connID)
 
@@ -1035,8 +1045,8 @@ func TestOrchestrator_CheckAutoTrialHandshakes(t *testing.T) {
 			t.Errorf("[%s] expected stale client to be rotated, got: %v", tc.name, awgMgr.rotated)
 		}
 		ucStale, _ := db.GetConnection(ctx, connIDStale)
-		if ucStale.AWGMimicry != "quic" {
-			t.Errorf("[%s] expected connection in DB to be updated to quic, got %s", tc.name, ucStale.AWGMimicry)
+		if ucStale.AWGMimicry != models.AWGMimicryAuto {
+			t.Errorf("[%s] expected connection in DB to remain auto, got %s", tc.name, ucStale.AWGMimicry)
 		}
 		_, _ = db.DeleteConnection(ctx, connIDStale)
 	}
@@ -1905,13 +1915,13 @@ func TestNextMimicryProfile(t *testing.T) {
 		in   models.AWGMimicryProfile
 		want models.AWGMimicryProfile
 	}{
-		{models.AWGMimicryAuto, models.AWGMimicrySIP},
+		{models.AWGMimicryAuto, models.AWGMimicryDNS},
 		{models.AWGMimicrySIP, models.AWGMimicryDNS},
 		{models.AWGMimicryDNS, models.AWGMimicryQUIC},
 		{models.AWGMimicryQUIC, models.AWGMimicryTLS},
 		{models.AWGMimicryTLS, models.AWGMimicrySIP},
-		{"", models.AWGMimicrySIP},
-		{"unknown", models.AWGMimicrySIP},
+		{"", models.AWGMimicryDNS},
+		{"unknown", models.AWGMimicryDNS},
 	}
 
 	for _, tc := range cases {

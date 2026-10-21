@@ -22,11 +22,11 @@ type MimicryRotator interface {
 }
 
 // NextMimicryProfile calculates the next mimicry profile in rotation order:
-// auto -> sip -> dns -> quic -> tls -> sip.
+// auto -> dns -> quic -> tls -> sip -> dns.
 func NextMimicryProfile(current models.AWGMimicryProfile) models.AWGMimicryProfile {
 	switch current {
 	case models.AWGMimicryAuto, "":
-		return models.AWGMimicrySIP
+		return models.AWGMimicryDNS
 	case models.AWGMimicrySIP:
 		return models.AWGMimicryDNS
 	case models.AWGMimicryDNS:
@@ -36,7 +36,7 @@ func NextMimicryProfile(current models.AWGMimicryProfile) models.AWGMimicryProfi
 	case models.AWGMimicryTLS:
 		return models.AWGMimicrySIP
 	default:
-		return models.AWGMimicrySIP
+		return models.AWGMimicryDNS
 	}
 }
 
@@ -119,9 +119,18 @@ func (o *Orchestrator) processServerAutoTrial(ctx context.Context, serverID int6
 			continue
 		}
 
-		_, _ = o.db.UpdateConnection(ctx, c.ID, map[string]any{
-			"awg_mimicry": nextProf,
-		})
+		// Preserve auto mimicry in DB for auto-trial connections so filterAutoTrialConns continues to process them.
+		// The remote server's clientsTable tracks the active rotated profile.
+		if c.AWGMimicry != models.AWGMimicryAuto && c.AWGMimicry != "" {
+			if _, err := o.db.UpdateConnection(ctx, c.ID, map[string]any{
+				"awg_mimicry": nextProf,
+			}); err != nil {
+				slog.Warn("Failed to update connection mimicry in database",
+					"connection_id", c.ID,
+					"err", err,
+				)
+			}
+		}
 
 		slog.Info("Auto-trial rotated mimicry for client",
 			"connection_id", c.ID,

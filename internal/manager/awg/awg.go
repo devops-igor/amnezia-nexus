@@ -2686,7 +2686,7 @@ func (m *AWGManager) updateServerConfigPeer(ctx context.Context, client ssh.SSHC
 }
 
 // RotateMimicry rotates a client's mimicry profile through the sequence:
-// auto -> sip -> dns -> quic -> tls -> sip, regenerates I1-I5 packet headers, and updates clientsTable.
+// auto -> dns -> quic -> tls -> sip -> dns, regenerates I1-I5 packet headers, and updates clientsTable.
 func (m *AWGManager) RotateMimicry(ctx context.Context, server *models.Server, clientID string) (string, error) {
 	client, err := m.getSSHClient(ctx, server)
 	if err != nil {
@@ -2734,7 +2734,7 @@ func (m *AWGManager) RotateMimicry(ctx context.Context, server *models.Server, c
 	var nextProfile string
 	switch curr {
 	case "auto":
-		nextProfile = "sip"
+		nextProfile = "dns"
 	case "sip":
 		nextProfile = "dns"
 	case "dns":
@@ -2744,7 +2744,7 @@ func (m *AWGManager) RotateMimicry(ctx context.Context, server *models.Server, c
 	case "tls":
 		nextProfile = "sip"
 	default:
-		nextProfile = "sip"
+		nextProfile = "dns"
 	}
 
 	// Regenerate I1-I5 signature packets
