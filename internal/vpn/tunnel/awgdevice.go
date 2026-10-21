@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 type AWGClientDevice struct {
 	name            string
 	mtu             int
+	i1              string
 	vtun            *VirtualTUN
 	dev             *device.Device
 	doneCh          chan struct{}
@@ -135,9 +137,15 @@ func NewAWGClientDevice(name, endpoint, privateKey, publicKey string, mtu int, a
 		return nil, fmt.Errorf("failed to bring up awg device: %w", err)
 	}
 
+	i1, _ := lookupAWGParamStr(awgParams, "i1")
+	if strings.ContainsAny(i1, "\r\n") {
+		i1 = ""
+	}
+
 	d := &AWGClientDevice{
 		name:      name,
 		mtu:       mtu,
+		i1:        i1,
 		vtun:      vtun,
 		dev:       dev,
 		doneCh:    make(chan struct{}),
@@ -147,7 +155,24 @@ func NewAWGClientDevice(name, endpoint, privateKey, publicKey string, mtu int, a
 	return d, nil
 }
 
-func normalizeAWGKey(s string) string {
+// I1 returns the configured I1 preamble tag for the device, if any.
+func (d *AWGClientDevice) I1() string {
+	if d == nil {
+		return ""
+	}
+	return d.i1
+}
+
+// DeviceIPC returns the device's current UAPI configuration string.
+func (d *AWGClientDevice) DeviceIPC() (string, error) {
+	if d == nil || d.dev == nil {
+		return "", errors.New("device is nil")
+	}
+	return d.dev.IpcGet()
+}
+
+// NormalizeAWGKey normalizes an AWG parameter key by stripping dashes and underscores and converting to lowercase.
+func NormalizeAWGKey(s string) string {
 	return strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(s, "_", ""), "-", ""))
 }
 
@@ -156,13 +181,33 @@ func lookupAWGParamStr(awgParams map[string]any, keys ...string) (string, bool) 
 		return "", false
 	}
 	for _, k := range keys {
-		nk := normalizeAWGKey(k)
-		for mk, v := range awgParams {
-			if (strings.EqualFold(mk, k) || normalizeAWGKey(mk) == nk) && v != nil {
-				s := strings.TrimSpace(fmt.Sprint(v))
-				if s != "" {
-					return s, true
-				}
+		if v, ok := awgParams[k]; ok && v != nil {
+			s := strings.TrimSpace(fmt.Sprint(v))
+			if s != "" {
+				return s, true
+			}
+		}
+	}
+	var matchedKeys []string
+	for mk := range awgParams {
+		nmk := NormalizeAWGKey(mk)
+		for _, k := range keys {
+			if strings.EqualFold(mk, k) || nmk == NormalizeAWGKey(k) {
+				matchedKeys = append(matchedKeys, mk)
+				break
+			}
+		}
+	}
+	if len(matchedKeys) == 0 {
+		return "", false
+	}
+	sort.Strings(matchedKeys)
+	for _, mk := range matchedKeys {
+		v := awgParams[mk]
+		if v != nil {
+			s := strings.TrimSpace(fmt.Sprint(v))
+			if s != "" {
+				return s, true
 			}
 		}
 	}
@@ -229,6 +274,11 @@ func renderAWGDeviceOptions(b *strings.Builder, awgParams map[string]any) {
 	}
 	if cpa, ok := lookupAWGParamStr(awgParams, "content_padding_addition", "contentpaddingaddition"); ok {
 		fmt.Fprintf(b, "content_padding_addition=%s\n", cpa)
+	}
+	if i1, ok := lookupAWGParamStr(awgParams, "i1"); ok && i1 != "" {
+		if !strings.ContainsAny(i1, "\r\n") {
+			fmt.Fprintf(b, "i1=%s\n", i1)
+		}
 	}
 	for _, timingKey := range []string{"rekey_after_time", "rekey_timeout", "reject_after_time", "keepalive_timeout", "max_handshake_attempts"} {
 		if val, ok := lookupAWGParamStr(awgParams, timingKey); ok {
