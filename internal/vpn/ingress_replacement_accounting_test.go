@@ -58,6 +58,7 @@ func serverTunnelID(t *testing.T, svc *Service, serverID int64) int64 {
 	t.Helper()
 	for _, tun := range svc.pool.ListTunnels() {
 		if tun.ServerID == serverID {
+			svc.SetBackendDeviceForTest(tun.ID, testAdmissionDevice{})
 			return tun.ID
 		}
 	}
@@ -80,6 +81,7 @@ func TestIngressDifferentBackendReplacementExactlyOnce(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 	backendA := serverTunnelID(t, svc, serverA)
 	backendB := serverTunnelID(t, svc, serverB)
 
@@ -158,6 +160,7 @@ func TestIngressDifferentBackendReplacementRollbackNoPhantom(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 	backendA := serverTunnelID(t, svc, serverA)
 	backendB := serverTunnelID(t, svc, serverB)
 
@@ -251,6 +254,7 @@ func TestIngressSameBackendReplacementNetOne(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 	peer := seedIngressPeer(t, db, "ingress-repl-carol", "ingress-peer-bbbbbbbbbb3", "10.100.4.4")
 
 	sess1, _, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))

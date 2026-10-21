@@ -568,6 +568,21 @@ func (s *Service) GetBackendDeviceEndpointForTest(tunID int64) string {
 	return s.backendDeviceEndpoints[tunID]
 }
 
+// filterActiveTunnelsWithDevices returns only active tunnels that have an attached, non-nil packet device.
+// Must be called with s.mu held.
+func (s *Service) filterActiveTunnelsWithDevices(tunnels []*models.BackendTunnel) []*models.BackendTunnel {
+	if len(tunnels) == 0 || s.backendDevices == nil {
+		return nil
+	}
+	ready := make([]*models.BackendTunnel, 0, len(tunnels))
+	for _, t := range tunnels {
+		if t != nil && s.backendDevices[t.ID] != nil {
+			ready = append(ready, t)
+		}
+	}
+	return ready
+}
+
 // ProbeTunnel probes a tunnel using the service's health prober.
 func (s *Service) ProbeTunnel(ctx context.Context, t *models.BackendTunnel) (int64, error) {
 	if s.prober == nil {

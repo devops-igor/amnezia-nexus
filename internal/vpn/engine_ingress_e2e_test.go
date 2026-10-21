@@ -281,6 +281,7 @@ func startEngine(t *testing.T, svc *Service, name string, peers []clientawg.Peer
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 	for _, tun := range svc.pool.ListTunnels() {
 		svc.forwarder.AttachBackendDevice(tun.ID, nil)
 	}

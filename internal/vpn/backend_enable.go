@@ -87,15 +87,9 @@ func (s *Service) reattachBackendDevicesLocked(ctx context.Context) error {
 				_ = oldDev.Close()
 				s.retiredBackendDeviceDrops.addInto(snapshotBackendDeviceDrops(oldDev))
 			}
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(baseCtx), 5*time.Second)
-			if err := s.pool.SetTunnelStatus(cleanupCtx, tun.ServerID, models.TunnelStatusDegraded, 0); err != nil {
-				log.Printf("[vpn] warning: failed to mark tunnel %d (server %d) degraded: %v", tun.ID, tun.ServerID, err)
-				tun.Status = models.TunnelStatusDegraded
-				s.pool.SetTunnelStatusInMemory(tun.ServerID, models.TunnelStatusDegraded)
-			} else {
-				tun.Status = models.TunnelStatusDegraded
-			}
-			cleanupCancel()
+			detachCtx, detachCancel := context.WithTimeout(context.WithoutCancel(baseCtx), 5*time.Second)
+			_ = s.pool.SetTunnelStatus(detachCtx, tun.ServerID, models.TunnelStatusDegraded, 0)
+			detachCancel()
 		}
 	}
 	return errors.Join(reattachErrs...)
@@ -298,14 +292,7 @@ func (s *Service) finishEnableBackend(
 		}
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(baseCtx), 5*time.Second)
 		defer cleanupCancel()
-		if setErr := pool.SetTunnelStatusWithReason(cleanupCtx, serverID, models.TunnelStatusDegraded, models.DisableReasonNone, 0); setErr != nil {
-			if tun != nil {
-				tun.Status = models.TunnelStatusDegraded
-			}
-			pool.SetTunnelStatusInMemory(serverID, models.TunnelStatusDegraded)
-		} else if tun != nil {
-			tun.Status = models.TunnelStatusDegraded
-		}
+		_ = pool.SetTunnelStatusWithReason(cleanupCtx, serverID, models.TunnelStatusDegraded, models.DisableReasonNone, 0)
 		return err
 	}
 

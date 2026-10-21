@@ -31,6 +31,7 @@ func TestRegressionReplacementOwnershipHandoffIsFailClosed(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 	peer, _ := newEnginePeer(t, svc, db, "regr-replace")
 	e, err := svc.NewIngressEngine(ctx, "regr-replace-portal", nil)
 	if err != nil {
@@ -134,6 +135,7 @@ func TestRegressionLegacyAdmissionWithListenerCompletes(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 	userID, err := db.CreateUser(ctx, &models.User{Username: "regr-admission", Role: "user", Enabled: true})
 	if err != nil {
 		t.Fatal(err)
@@ -183,6 +185,7 @@ func TestRegressionLegacyDisableStopsForwarding(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 	backend := svc.pool.GetActiveTunnels()[0]
 
 	// A real enabled user with a real issued connection: the durable toggle
@@ -269,6 +272,7 @@ func TestRegressionMissingUpstreamCleanupExactlyOnce(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 	backend := svc.pool.GetActiveTunnels()[0]
 
 	peerKey, connID := issueDurablePeer(t, svc, db, "regr-missing-upstream")

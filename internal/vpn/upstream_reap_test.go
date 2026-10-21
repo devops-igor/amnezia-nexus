@@ -43,6 +43,7 @@ func newReapIngressFixture(t *testing.T) *reapIngressSessionFixture {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 	tunnels := svc.pool.GetActiveTunnels()
 	if len(tunnels) == 0 {
 		t.Fatal("no active tunnels")
@@ -110,6 +111,7 @@ func TestIngressAdmissionStampsProvenance(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 
 	peer := seedIngressPeer(t, db, "ingress-stamp-alice", "ingress-stamp-peer-1", "10.100.6.10")
 	sess, _, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))
@@ -139,6 +141,7 @@ func TestIngressReadoptStampsDirectSession(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 
 	peer := seedIngressPeer(t, db, "ingress-adopt-bob", "ingress-adopt-peer-1", "10.100.6.11")
 	backend, err := selectBackendForIngressTest(t, svc, peer.userID)
@@ -198,6 +201,7 @@ func TestEngineSweepReapsIdleIngressSessionRoutingOnly(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 	for _, tun := range svc.pool.ListTunnels() {
 		svc.forwarder.AttachBackendDevice(tun.ID, nil)
 	}
@@ -270,6 +274,7 @@ func TestUpstreamReapRacesFirstPlaintextAdmission(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 
 	peer := seedIngressPeer(t, db, "race-admit-eva", "race-admit-peer-1", "10.100.6.30")
 	o := ownershipFor(peer)
@@ -336,6 +341,7 @@ func TestUpstreamReapDoesNotRetireRecreatedSessionRoute(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 	for _, tun := range svc.pool.ListTunnels() {
 		svc.forwarder.AttachBackendDevice(tun.ID, nil)
 	}
@@ -420,6 +426,7 @@ func TestUpstreamRekeyDoesNotCreateBackendSessionWithoutTraffic(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 	for _, tun := range svc.pool.ListTunnels() {
 		svc.forwarder.AttachBackendDevice(tun.ID, nil)
 	}
@@ -512,6 +519,7 @@ func TestUpstreamPeerSurvivesReapWithIdentityIntact(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 	for _, tun := range svc.pool.ListTunnels() {
 		svc.forwarder.AttachBackendDevice(tun.ID, nil)
 	}
@@ -591,6 +599,7 @@ func TestIngressAdoptionFailureFallsThroughToFreshAdmission(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 
 	peer := seedIngressPeer(t, db, "adopt-fail-user", "adopt-fail-peer", "10.100.6.50")
 	backend, err := selectBackendForIngressTest(t, svc, peer.userID)
@@ -644,6 +653,7 @@ func TestIngressAdoptionRefreshesLivenessAgainstImmediateReap(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 
 	peer := seedIngressPeer(t, db, "adopt-refresh-user", "adopt-refresh-peer", "10.100.6.51")
 	backend, err := selectBackendForIngressTest(t, svc, peer.userID)
@@ -700,6 +710,7 @@ func TestDisconnectSessionUpstreamIsRoutingOnly(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 
 	peer := seedIngressPeer(t, db, "dc-sess-user", "dc-sess-peer", "10.100.6.60")
 	sess, backend, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))
@@ -748,6 +759,7 @@ func TestDisconnectUserUpstreamIsRoutingOnly(t *testing.T) {
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatal(err)
 	}
+	svc.SeedIngressDevicesForTest()
 
 	peer := seedIngressPeer(t, db, "dc-user-user", "dc-user-peer", "10.100.6.61")
 	sess, backend, _, err := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))

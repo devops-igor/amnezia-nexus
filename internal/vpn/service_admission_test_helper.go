@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
@@ -21,6 +23,20 @@ func (s *Service) HandleIncomingPeerForTest(ctx context.Context, peerPublicKey s
 	if s == nil || s.auth == nil || s.sessionMgr == nil || s.pool == nil {
 		return nil, nil, errors.New("subsystems not initialized")
 	}
+
+	// For test environments where tunnels were added to the pool without real WireGuard devices,
+	// ensure an attached test device placeholder so ingress admission under s.mu succeeds.
+	s.mu.Lock()
+	if s.backendDevices == nil {
+		s.backendDevices = make(map[int64]BackendDevice)
+	}
+	for _, tun := range s.pool.GetActiveTunnels() {
+		if s.backendDevices[tun.ID] == nil {
+			s.backendDevices[tun.ID] = testAdmissionDevice{}
+		}
+	}
+	s.mu.Unlock()
+
 	user, conn, err := s.auth.AuthenticatePeer(ctx, peerPublicKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("peer authentication failed: %w", err)
@@ -111,3 +127,28 @@ func (s *Service) SyncBackendTunnelsForTest(ctx context.Context) error {
 	}
 	return s.pool.SyncFromDB(ctx)
 }
+
+// SeedIngressDevicesForTest attaches test device placeholders for all pool tunnels
+// so that ingress admission under s.mu sees non-nil packet devices in unit tests.
+func (s *Service) SeedIngressDevicesForTest() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.backendDevices == nil {
+		s.backendDevices = make(map[int64]BackendDevice)
+	}
+	for _, tun := range s.pool.ListTunnels() {
+		if s.backendDevices[tun.ID] == nil {
+			s.backendDevices[tun.ID] = testAdmissionDevice{}
+		}
+	}
+}
+
+type testAdmissionDevice struct{}
+
+func (testAdmissionDevice) Read(p []byte) (int, error)   { return 0, io.EOF }
+func (testAdmissionDevice) Write(p []byte) (int, error)  { return len(p), nil }
+func (testAdmissionDevice) Close() error                 { return nil }
+func (testAdmissionDevice) LastHandshakeTime() time.Time { return time.Time{} }
+func (testAdmissionDevice) CreatedAt() time.Time         { return time.Time{} }
+func (testAdmissionDevice) DroppedPackets() uint64       { return 0 }
+func (testAdmissionDevice) IsClosed() bool               { return false }
