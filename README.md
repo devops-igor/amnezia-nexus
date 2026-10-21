@@ -93,7 +93,7 @@ Create `docker-compose.yaml` with the following contents:
 ```yaml
 services:
   amnezia-panel:
-    image: ghcr.io/devops-igor/amnezia-nexus:v2.3.0
+    image: ghcr.io/devops-igor/amnezia-nexus:v2.4.0
     container_name: amnezia-panel
     restart: unless-stopped
     ports:
@@ -121,7 +121,7 @@ volumes:
 
 ### 2. Start Nexus
 
-The example uses version `v2.3.0` (Horizon). Check [Releases](https://github.com/devops-igor/amnezia-nexus/releases/latest) for the latest stable version. The `:latest` image follows `main`, so it may contain changes that have not been released yet. You can find the available tags on [GHCR](https://github.com/devops-igor/amnezia-nexus/pkgs/container/amnezia-nexus).
+The example uses version `v2.4.0` (Quasar). Check [Releases](https://github.com/devops-igor/amnezia-nexus/releases/latest) for the latest stable version. The `:latest` image follows `main`, so it may contain changes that have not been released yet. You can find the available tags on [GHCR](https://github.com/devops-igor/amnezia-nexus/pkgs/container/amnezia-nexus).
 
 ```bash
 docker compose up -d

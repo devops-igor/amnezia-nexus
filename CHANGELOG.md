@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - Quasar - 2026-10-22
+
+Feature and stability release introducing full-stack SIP obfuscation and CPS auto-mimicry defaults, operation-aware router context timeouts, concurrent keypair persistence synchronization, and complete architectural modularization across backend services and frontend interfaces.
+
+### Added
+- Full-stack SIP obfuscation: added SIP-compatible I1 packet header obfuscation to client configuration generation and VPN backend tunnel interfaces (#611, #613, #616).
+- CPS default parameters: defaulted server installation to SIP, resolved automatic mimicry to SIP, prioritized DPI-passing rotation, and added autotrial rotation safeguards for dormant clients (#611, #617).
+- Operation-aware context timeouts: added `OperationTimeout` middleware providing bounded 15-minute context windows for protocol installation and 5-minute windows for uninstallation, while preserving client cancellation propagation and 60-second defaults for standard routes (#619, #620).
+- Modular frontend architecture: extracted server actions, server telemetry, user management, and VPN diagnostic charts into dedicated modules with strict CSP-compliant delegated event listeners (#501, #502, #542, #574).
+
+### Changed
+- Increased baseline HTTP server `WriteTimeout` from 60 seconds to 300 seconds to provide headroom for remote server operations (#619, #620).
+- Simplified obfuscation engine to immutable obfuscation parameters, eliminating runtime race hazards during dynamic hot-switching (#611, #616).
+- Updated Go toolchain to `go1.26.10` addressing stdlib security advisories (#616).
+- Aligned default outbound TUN capacity to 2048 packets to eliminate buffer pressure (#561, #603).
+
+### Fixed
+- Protocol installation timeouts: eliminated premature 60-second HTTP terminations and prevented background SSH pool idle sweeps from severing active installation sessions (#619, #620).
+- Keypair convergence on initial fetch: synchronized connection key assignment under lock to prevent divergent client private key generation during concurrent first fetches (#614, #618).
+- CPS packet framing: corrected wire layout and framing for DNS and Lite packet generators, and bounded random prefix parsing (#611, #615).
+- Backend enable version guard: protected `EnableBackend` against concurrent administrative disables during state version increments (#607, #608).
+- Client error visibility: added explicit error logging for swallowed failures in server connection handlers (#609).
+- Lock registry cleanup: eliminated test-only lock setter and construction-time lock races in AWG manager (#581, #599).
+
+### Refactored
+- Core service boundaries: decomposed VPN service into dedicated modules for lifecycle, session migration, reaper orchestration, backend enable/disable, and route management (#508, #509, #510, #511, #512, #513, #517, #518, #519, #520).
+- Database and model separation: split VPN database queries by entity and separated HTTP DTOs from persisted database models (#543, #545).
+- Modular stylesheet architecture: split global CSS into shared base and feature-scoped stylesheets with strict cascade ordering (#505).
+- Test suite partitioning: reorganized and partitioned monolithic test suites across database, router, web, and VPN subsystems to ensure isolated execution under 1,000-line file caps (#480, #481, #482, #483, #485, #553).
+
 ## [2.3.0] - Horizon - 2026-10-13
 
 Feature and stability release introducing streamlined VPN operational diagnostics, consolidated historical telemetry charts with tooltips and KPI badges, actionable upstream handshake problem detection, and resilience against WAF method blocking.
