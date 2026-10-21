@@ -336,12 +336,14 @@ func (s *Service) renderClientConfigForConnection(
 	if err := reservePersistedClientIPs(ctx, db, s.ipam); err != nil {
 		return "", "", fmt.Errorf("restore client IP assignments: %w", err)
 	}
-	clientParams := buildClientParams(awgConn, p)
-	if target := refreshPersistedPortalI1(ctx, db, user, awgConn, isExplicit, clientParams); target != nil && awgConn == nil {
-		// A concurrent first fetch created the connection after this request
-		// built its keypair. Do not overwrite that connection's keys.
-		return "", "", ErrConnectionCreatedConcurrently
+
+	refreshedConn, keysAlreadyPersisted, err := refreshAndAdoptPersistedConnection(ctx, db, user, awgConn, isExplicit, p)
+	if err != nil {
+		return "", "", err
 	}
+	awgConn = refreshedConn
+
+	clientParams := buildClientParams(awgConn, p)
 	i1, err := resolvePortalI1(ctx, cfg, clientParams)
 	if err != nil {
 		return "", "", err
@@ -356,34 +358,13 @@ func (s *Service) renderClientConfigForConnection(
 	delete(clientParams, "quarantined_ip_collision")
 	clientParams["assigned_ip"] = assignedIP
 
-	if isExplicit && awgConn != nil {
-		updates := map[string]any{
-			"client_id":     p.clientPub,
-			"client_params": clientParams,
+	if connectionNeedsUpdate(awgConn, keysAlreadyPersisted, assignedIP, i1) {
+		if err := s.persistRenderedConnection(ctx, db, user, awgConn, isExplicit, p.clientPub, clientParams, hadLease); err != nil {
+			return "", "", err
 		}
-		updated, err := db.UpdateConnection(ctx, awgConn.ID, updates)
-		if err != nil || !updated {
-			if !hadLease {
-				_ = s.ipam.Release(p.clientPub)
-			}
-			if err == nil {
-				err = errors.New("connection was removed")
-			}
-			return "", "", fmt.Errorf("failed to update connection: %w", err)
-		}
+	} else if awgConn != nil {
 		awgConn.ClientID = p.clientPub
 		awgConn.ClientParams = clientParams
-	} else {
-		if err := saveOrUpdateAWGConnection(ctx, db, user, awgConn, p.clientPub, clientParams); err != nil {
-			if !hadLease {
-				_ = s.ipam.Release(p.clientPub)
-			}
-			return "", "", fmt.Errorf("failed to persist client configuration: %w", err)
-		}
-		if awgConn != nil {
-			awgConn.ClientID = p.clientPub
-			awgConn.ClientParams = clientParams
-		}
 	}
 
 	ud := &awg.AWGClientUserData{
@@ -422,24 +403,128 @@ func (s *Service) renderClientConfigForConnection(
 	return configStr, filename, nil
 }
 
-func refreshPersistedPortalI1(ctx context.Context, db *database.DB, user *models.User, awgConn *models.UserConnection, isExplicit bool, clientParams map[string]any) *models.UserConnection {
-	targetConn := awgConn
-	if targetConn == nil && !isExplicit {
+func refreshAndAdoptPersistedConnection(
+	ctx context.Context,
+	db *database.DB,
+	user *models.User,
+	awgConn *models.UserConnection,
+	isExplicit bool,
+	p *clientConfigParameters,
+) (*models.UserConnection, bool, error) {
+	if awgConn != nil && awgConn.ID != "" {
+		freshConn, err := db.GetConnection(ctx, awgConn.ID)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to get connection: %w", err)
+		}
+		if freshConn == nil {
+			return nil, false, errors.New("connection was removed")
+		}
+		keysAlreadyPersisted := false
+		if freshConn.ClientID != "" {
+			if priv := getStringParam(freshConn.ClientParams, "client_private_key"); priv != "" {
+				keysAlreadyPersisted = true
+				if awgConn.ClientID == "" || getStringParam(awgConn.ClientParams, "client_private_key") == "" {
+					p.clientPub = freshConn.ClientID
+					p.clientPriv = priv
+					adoptTimingParams(p, freshConn.ClientParams)
+				}
+			}
+		}
+		return freshConn, keysAlreadyPersisted, nil
+	}
+	if awgConn == nil && !isExplicit {
 		if found := findAWGConnection(ctx, db, user); found != nil {
-			targetConn = found
+			return nil, false, ErrConnectionCreatedConcurrently
 		}
 	}
-	if targetConn == nil || targetConn.ID == "" {
-		return targetConn
+	return awgConn, false, nil
+}
+
+func adoptTimingParams(p *clientConfigParameters, params map[string]any) {
+	if tr := getTimingParam(params, "rekey_after_time"); tr != nil {
+		p.rat = tr
 	}
-	freshConn, err := db.GetConnection(ctx, targetConn.ID)
-	if err != nil || freshConn == nil || freshConn.ClientParams == nil {
-		return targetConn
+	if tr := getTimingParam(params, "rekey_timeout"); tr != nil {
+		p.rt = tr
 	}
-	if freshI1, ok := freshConn.ClientParams["portal_i1"]; ok && freshI1 != nil {
-		clientParams["portal_i1"] = freshI1
+	if tr := getTimingParam(params, "reject_after_time"); tr != nil {
+		p.rej = tr
 	}
-	return targetConn
+	if tr := getTimingParam(params, "keepalive_timeout"); tr != nil {
+		p.kt = tr
+	}
+	if tr := getTimingParam(params, "max_handshake_attempts"); tr != nil {
+		p.mha = tr
+	}
+	if tr := getTimingParam(params, "persistent_keepalive"); tr != nil {
+		p.pk = tr
+	}
+	if s := getStringParam(params, "content_padding_addition"); s != "" {
+		p.cpAdd = &s
+	}
+}
+
+func connectionNeedsUpdate(awgConn *models.UserConnection, keysAlreadyPersisted bool, assignedIP, i1 string) bool {
+	if !keysAlreadyPersisted {
+		return true
+	}
+	if awgConn == nil || awgConn.ClientParams == nil {
+		return true
+	}
+	if getStringParam(awgConn.ClientParams, "assigned_ip") != assignedIP ||
+		getStringParam(awgConn.ClientParams, "portal_i1") != i1 {
+		return true
+	}
+	if req, ok := awgConn.ClientParams["config_regeneration_required"].(bool); ok && req {
+		return true
+	}
+	if q, ok := awgConn.ClientParams["quarantined_ip_collision"]; ok && q != nil && q != "" {
+		return true
+	}
+	return false
+}
+
+func (s *Service) persistRenderedConnection(
+	ctx context.Context,
+	db *database.DB,
+	user *models.User,
+	awgConn *models.UserConnection,
+	isExplicit bool,
+	clientPub string,
+	clientParams map[string]any,
+	hadLease bool,
+) error {
+	if isExplicit && awgConn != nil {
+		updates := map[string]any{
+			"client_id":     clientPub,
+			"client_params": clientParams,
+		}
+		updated, err := db.UpdateConnection(ctx, awgConn.ID, updates)
+		if err != nil || !updated {
+			if !hadLease {
+				_ = s.ipam.Release(clientPub)
+			}
+			if err == nil {
+				err = errors.New("connection was removed")
+			}
+			return fmt.Errorf("failed to update connection: %w", err)
+		}
+		awgConn.ClientID = clientPub
+		awgConn.ClientParams = clientParams
+		return nil
+	}
+
+	if err := saveOrUpdateAWGConnection(ctx, db, user, awgConn, clientPub, clientParams); err != nil {
+		if !hadLease {
+			_ = s.ipam.Release(clientPub)
+		}
+		return fmt.Errorf("failed to persist client configuration: %w", err)
+	}
+	if awgConn != nil {
+		awgConn.ClientID = clientPub
+		awgConn.ClientParams = clientParams
+	}
+	return nil
 }
 
 func resolveClientMTU(awgConn *models.UserConnection, awgParams *awg.AWGParams) string {
