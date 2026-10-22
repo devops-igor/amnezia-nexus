@@ -225,10 +225,14 @@ func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPu
 			candProbePrivKey = sk
 		}
 
-		changed := existing.Endpoint != candEndpoint ||
-			existing.PublicKey != candPubKey ||
-			existing.PrivateKey != candPrivKey ||
-			existing.ProbePrivateKey != candProbePrivKey
+		cand := models.BackendTunnel{
+			ID:              existing.ID,
+			Endpoint:        candEndpoint,
+			PublicKey:       candPubKey,
+			PrivateKey:      candPrivKey,
+			ProbePrivateKey: candProbePrivKey,
+		}
+		changed := !models.SameTunnelIdentity(existing, &cand)
 
 		candStateVersion := existing.StateVersion
 		if changed {

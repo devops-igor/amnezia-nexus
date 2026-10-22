@@ -313,11 +313,14 @@ func TestVPNServiceConfigAndBackends(t *testing.T) {
 	if !strings.Contains(cfgStr, "Endpoint = ") {
 		t.Errorf("expected Endpoint directive in config: %s", cfgStr)
 	}
+	if got := parseDirectiveString(t, cfgStr, "I1"); !strings.HasPrefix(got, "<b 0x5245474953544552") {
+		t.Fatalf("expected SIP REGISTER I1, got %q", got)
+	}
 	for _, line := range strings.Split(cfgStr, "\n") {
 		trimmed := strings.TrimSpace(line)
-		for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
+		for _, k := range []string{"I2", "I3", "I4", "I5"} {
 			if strings.HasPrefix(trimmed, k+" =") || strings.HasPrefix(trimmed, k+"=") {
-				t.Errorf("client config must NEVER contain %s (Issue #15), got:\n%s", k, cfgStr)
+				t.Errorf("client config must not contain %s, got:\n%s", k, cfgStr)
 			}
 		}
 	}

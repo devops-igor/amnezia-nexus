@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -171,12 +172,12 @@ func TestCPSBlobConversion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseCPSBlob with <r 2> failed: %v", err)
 	}
-	if len(rParsed) != 4 {
-		t.Fatalf("expected 4 bytes, got %d", len(rParsed))
+	if len(rParsed) != 6 {
+		t.Fatalf("expected 6 bytes, got %d", len(rParsed))
 	}
-	// Bytes 2 and 3 should match 0x33, 0x44
-	if rParsed[2] != 0x33 || rParsed[3] != 0x44 {
-		t.Errorf("non-random suffix changed: %x", rParsed)
+	// Suffix should match original data bytes [0x11, 0x22, 0x33, 0x44]
+	if !bytes.Equal(rParsed[2:], []byte{0x11, 0x22, 0x33, 0x44}) {
+		t.Errorf("data suffix changed: expected [11 22 33 44], got %x", rParsed[2:])
 	}
 
 	// Invalid tags
@@ -185,6 +186,70 @@ func TestCPSBlobConversion(t *testing.T) {
 	}
 	if _, err := ParseCPSBlob("<b 0xzzzz>"); err == nil {
 		t.Errorf("expected error for invalid hex in tag")
+	}
+}
+
+func TestParseCPSBlob_RandomPrefixBounds(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+		wantLen int
+	}{
+		{
+			name:    "max int64 overflow does not panic",
+			input:   "<r 9223372036854775807><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "exceeds 65535",
+			input:   "<r 65536><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "zero count",
+			input:   "<r 0><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "negative count",
+			input:   "<r -1><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "valid count 2",
+			input:   "<r 2><b 0x11223344>",
+			wantErr: false,
+			wantLen: 6,
+		},
+		{
+			name:    "non-numeric count",
+			input:   "<r abc><b 0x1122>",
+			wantErr: true,
+		},
+		{
+			name:    "unclosed r tag",
+			input:   "<r 2<b 0x1122>",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseCPSBlob(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ParseCPSBlob(%q) expected error, got nil (len=%d)", tt.input, len(got))
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("ParseCPSBlob(%q) unexpected error: %v", tt.input, err)
+				}
+				if len(got) != tt.wantLen {
+					t.Errorf("ParseCPSBlob(%q) len = %d, want %d", tt.input, len(got), tt.wantLen)
+				}
+			}
+		})
 	}
 }
 
@@ -292,6 +357,9 @@ func (m *mockCPSSSHClient) GetServerID() *int64 {
 func (m *mockCPSSSHClient) GetLastActive() time.Time {
 	return time.Now()
 }
+func (m *mockCPSSSHClient) InUse() bool {
+	return false
+}
 
 func TestSelectMimicryDomain(t *testing.T) {
 	ctx := context.Background()
@@ -322,5 +390,207 @@ func TestSelectMimicryDomain(t *testing.T) {
 	mp, err := GenerateMimicryPackets(ctx, "auto", "", mockSuccess)
 	if err != nil || mp["i1"] == "" {
 		t.Errorf("GenerateMimicryPackets(auto) failed: %v", err)
+	}
+}
+
+func TestGenerateMimicryPackets_AutoResolvesToSIP(t *testing.T) {
+	ctx := context.Background()
+	mockSuccess := &mockCPSSSHClient{fail: false}
+
+	tests := []struct {
+		name      string
+		mimicry   string
+		sshClient *mockCPSSSHClient
+	}{
+		{name: "empty_mimicry_nil_client", mimicry: "", sshClient: nil},
+		{name: "auto_mimicry_nil_client", mimicry: "auto", sshClient: nil},
+		{name: "empty_mimicry_with_client", mimicry: "", sshClient: mockSuccess},
+		{name: "auto_mimicry_with_client", mimicry: "auto", sshClient: mockSuccess},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var client ssh.SSHClient
+			if tt.sshClient != nil {
+				client = tt.sshClient
+			}
+			pkts, err := GenerateMimicryPackets(ctx, tt.mimicry, "", client)
+			if err != nil {
+				t.Fatalf("GenerateMimicryPackets(%q) failed: %v", tt.mimicry, err)
+			}
+			i1 := pkts["i1"]
+			if i1 == "" {
+				t.Fatalf("expected non-empty i1")
+			}
+			raw, err := ParseCPSBlob(i1)
+			if err != nil {
+				t.Fatalf("ParseCPSBlob failed: %v", err)
+			}
+			rawStr := string(raw)
+			if !strings.Contains(rawStr, "REGISTER sip:") {
+				t.Errorf("expected I1 to contain 'REGISTER sip:', got: %s", rawStr)
+			}
+			if !strings.Contains(rawStr, "Content-Length: 0") {
+				t.Errorf("expected I1 to contain 'Content-Length: 0', got: %s", rawStr)
+			}
+			for _, k := range []string{"i2", "i3", "i4", "i5"} {
+				if pkts[k] != "" {
+					t.Errorf("expected empty %s for SIP, got %q", k, pkts[k])
+				}
+			}
+		})
+	}
+}
+
+func TestGenerateCPSPackets_Protocols(t *testing.T) {
+	tests := []struct {
+		name      string
+		profile   string
+		domain    string
+		protocol  []string
+		wantProto string
+		checkPkt  func(t *testing.T, pkts map[string]string)
+	}{
+		{
+			name:      "sip_via_variadic",
+			profile:   "standard",
+			domain:    "sip.example.com",
+			protocol:  []string{"sip"},
+			wantProto: "sip",
+			checkPkt: func(t *testing.T, pkts map[string]string) {
+				t.Helper()
+				raw, err := ParseCPSBlob(pkts["i1"])
+				if err != nil {
+					t.Fatalf("ParseCPSBlob(i1) failed: %v", err)
+				}
+				rawStr := string(raw)
+				if !strings.Contains(rawStr, "REGISTER sip:") {
+					t.Errorf("expected I1 to contain 'REGISTER sip:', got: %s", rawStr)
+				}
+				if !strings.Contains(rawStr, "Content-Length: 0") {
+					t.Errorf("expected I1 to contain 'Content-Length: 0', got: %s", rawStr)
+				}
+				for _, k := range []string{"i2", "i3", "i4", "i5"} {
+					if pkts[k] != "" {
+						t.Errorf("expected empty %s for sip, got %q", k, pkts[k])
+					}
+				}
+			},
+		},
+		{
+			name:      "sip_via_profile_name",
+			profile:   "sip",
+			domain:    "sip.example.com",
+			protocol:  nil,
+			wantProto: "sip",
+			checkPkt: func(t *testing.T, pkts map[string]string) {
+				t.Helper()
+				raw, err := ParseCPSBlob(pkts["i1"])
+				if err != nil {
+					t.Fatalf("ParseCPSBlob(i1) failed: %v", err)
+				}
+				rawStr := string(raw)
+				if !strings.Contains(rawStr, "REGISTER sip:") {
+					t.Errorf("expected I1 to contain 'REGISTER sip:', got: %s", rawStr)
+				}
+				if !strings.Contains(rawStr, "Content-Length: 0") {
+					t.Errorf("expected I1 to contain 'Content-Length: 0', got: %s", rawStr)
+				}
+			},
+		},
+		{
+			name:      "dns_via_variadic",
+			profile:   "standard",
+			domain:    "example.com",
+			protocol:  []string{"dns"},
+			wantProto: "dns",
+			checkPkt: func(t *testing.T, pkts map[string]string) {
+				t.Helper()
+				if !strings.HasPrefix(pkts["i1"], "<r 2><b 0x") {
+					t.Errorf("expected dns I1 to have '<r 2><b 0x' tag, got: %s", pkts["i1"])
+				}
+				raw, err := ParseCPSBlob(pkts["i1"])
+				if err != nil {
+					t.Fatalf("ParseCPSBlob(i1) failed: %v", err)
+				}
+				if len(raw) < 12 {
+					t.Errorf("dns packet too short: %d bytes", len(raw))
+				}
+				for _, k := range []string{"i2", "i3", "i4", "i5"} {
+					if pkts[k] != "" {
+						t.Errorf("expected empty %s for dns, got %q", k, pkts[k])
+					}
+				}
+			},
+		},
+		{
+			name:      "dns_via_profile_name",
+			profile:   "dns",
+			domain:    "example.com",
+			protocol:  nil,
+			wantProto: "dns",
+			checkPkt: func(t *testing.T, pkts map[string]string) {
+				t.Helper()
+				if !strings.HasPrefix(pkts["i1"], "<r 2><b 0x") {
+					t.Errorf("expected dns I1 to have '<r 2><b 0x' tag, got: %s", pkts["i1"])
+				}
+			},
+		},
+		{
+			name:      "quic_standard_via_variadic",
+			profile:   "standard",
+			domain:    "example.com",
+			protocol:  []string{"quic"},
+			wantProto: "quic",
+			checkPkt: func(t *testing.T, pkts map[string]string) {
+				t.Helper()
+				if !strings.HasPrefix(pkts["i1"], "<b 0x") {
+					t.Errorf("expected quic I1 to start with '<b 0x', got: %s", pkts["i1"])
+				}
+				for _, k := range []string{"i2", "i3", "i4", "i5"} {
+					if pkts[k] != "" {
+						t.Errorf("expected empty %s for standard quic, got %q", k, pkts[k])
+					}
+				}
+			},
+		},
+		{
+			name:      "quic_pro_via_variadic",
+			profile:   "pro",
+			domain:    "example.com",
+			protocol:  []string{"quic"},
+			wantProto: "quic",
+			checkPkt: func(t *testing.T, pkts map[string]string) {
+				t.Helper()
+				for _, k := range []string{"i1", "i2", "i3", "i4", "i5"} {
+					if !strings.HasPrefix(pkts[k], "<b 0x") {
+						t.Errorf("expected pro quic %s to start with '<b 0x', got: %s", k, pkts[k])
+					}
+				}
+			},
+		},
+		{
+			name:      "quic_via_profile_name",
+			profile:   "quic",
+			domain:    "example.com",
+			protocol:  nil,
+			wantProto: "quic",
+			checkPkt: func(t *testing.T, pkts map[string]string) {
+				t.Helper()
+				if !strings.HasPrefix(pkts["i1"], "<b 0x") {
+					t.Errorf("expected quic I1 to start with '<b 0x', got: %s", pkts["i1"])
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pkts, err := GenerateCPSPackets(tt.profile, tt.domain, tt.protocol...)
+			if err != nil {
+				t.Fatalf("GenerateCPSPackets failed: %v", err)
+			}
+			tt.checkPkt(t, pkts)
+		})
 	}
 }

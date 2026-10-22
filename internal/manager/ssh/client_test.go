@@ -632,3 +632,70 @@ func TestClient_StaleSFTPRefresh(t *testing.T) {
 		t.Fatalf("expected 'refreshed', got %q", string(content))
 	}
 }
+
+func TestClient_InUseAndLastActive(t *testing.T) {
+	server := NewMockSSHServer(t, "root", "secretPass")
+	defer server.Close()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	server.SetCommandHandler("slow-cmd", func(cmd string, stdin []byte) (stdout, stderr string, exitCode int) {
+		close(started)
+		<-release
+		return "done", "", 0
+	})
+
+	ctx := context.Background()
+	cfg := Config{
+		Host:            server.Host(),
+		Port:            server.Port(),
+		User:            "root",
+		Password:        "secretPass",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+		Timeout:         3 * time.Second,
+	}
+
+	client, err := Dial(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer client.Close()
+
+	if client.InUse() {
+		t.Fatal("expected InUse == false initially")
+	}
+
+	initialLastActive := client.GetLastActive()
+
+	go func() {
+		_, _, _, _ = client.RunCommand(ctx, "slow-cmd")
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for slow-cmd to start")
+	}
+
+	if !client.InUse() {
+		t.Fatal("expected InUse == true while command is running")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	for range 50 {
+		if !client.InUse() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if client.InUse() {
+		t.Fatal("expected InUse == false after command completion")
+	}
+
+	if !client.GetLastActive().After(initialLastActive) {
+		t.Fatalf("expected lastActive to be updated after command, got %v <= %v", client.GetLastActive(), initialLastActive)
+	}
+}

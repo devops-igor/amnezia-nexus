@@ -734,3 +734,75 @@ func TestValidateHost(t *testing.T) {
 		})
 	}
 }
+
+func TestSameTunnelIdentity(t *testing.T) {
+	base := &BackendTunnel{
+		ID:              1,
+		ServerID:        10,
+		InterfaceName:   "awg1",
+		PublicKey:       "pubkey1",
+		PrivateKey:      "privkey1",
+		ProbePrivateKey: "probekey1",
+		Endpoint:        "192.0.2.1:51820",
+		Enabled:         true,
+		Status:          "active",
+		DisableReason:   "",
+		StateVersion:    1,
+		LatencyMS:       10,
+	}
+
+	if !SameTunnelIdentity(nil, nil) {
+		t.Error("expected SameTunnelIdentity(nil, nil) to be true")
+	}
+	if SameTunnelIdentity(base, nil) || SameTunnelIdentity(nil, base) {
+		t.Error("expected SameTunnelIdentity with one nil to be false")
+	}
+
+	clone := *base
+	if !SameTunnelIdentity(base, &clone) {
+		t.Error("expected identical tunnel copies to match")
+	}
+
+	// Runtime health and admin flags do not affect identity
+	runtimeDiff := *base
+	runtimeDiff.Enabled = false
+	runtimeDiff.Status = "disabled"
+	runtimeDiff.DisableReason = "health"
+	runtimeDiff.StateVersion = 42
+	runtimeDiff.LatencyMS = 999
+	runtimeDiff.ActiveConnections = 50
+	if !SameTunnelIdentity(base, &runtimeDiff) {
+		t.Error("expected runtime/admin differences to not affect identity")
+	}
+
+	// Any identity field difference must fail
+	diffID := *base
+	diffID.ID = 2
+	if SameTunnelIdentity(base, &diffID) {
+		t.Error("expected ID difference to break identity")
+	}
+
+	diffEndpoint := *base
+	diffEndpoint.Endpoint = "192.0.2.2:51820"
+	if SameTunnelIdentity(base, &diffEndpoint) {
+		t.Error("expected Endpoint difference to break identity")
+	}
+
+	diffPub := *base
+	diffPub.PublicKey = "diff-pub"
+	if SameTunnelIdentity(base, &diffPub) {
+		t.Error("expected PublicKey difference to break identity")
+	}
+
+	diffPriv := *base
+	diffPriv.PrivateKey = "diff-priv"
+	if SameTunnelIdentity(base, &diffPriv) {
+		t.Error("expected PrivateKey difference to break identity")
+	}
+
+	diffProbePriv := *base
+	diffProbePriv.ProbePrivateKey = "diff-probe-priv"
+	if SameTunnelIdentity(base, &diffProbePriv) {
+		t.Error("expected ProbePrivateKey difference to break identity")
+	}
+}

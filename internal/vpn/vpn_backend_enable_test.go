@@ -670,15 +670,16 @@ func TestEnableBackend_NetworkCallDoesNotHoldServiceLock(t *testing.T) {
 	}
 }
 
-func TestEnableBackend_ConcurrentStateModificationAbortsEnable(t *testing.T) {
+func TestEnableBackend_ConcurrentStateModification(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("ExistingTunnel_ConcurrentMutationAbortsEnable", func(t *testing.T) {
+	t.Run("ExistingTunnel_ConcurrentHealthWriteDoesNotAbortEnable", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, err := NewVPNService(db, nil)
 		if err != nil {
 			t.Fatalf("NewVPNService failed: %v", err)
 		}
+		t.Cleanup(func() { closeBackendDevices(svc) })
 
 		srvID, err := db.CreateServer(ctx, &models.Server{
 			Name: "concurrent-enable-server",
@@ -721,13 +722,10 @@ func TestEnableBackend_ConcurrentStateModificationAbortsEnable(t *testing.T) {
 		})
 		defer svc.SetEnableBackendPostAddTunnelHookForTest(nil)
 
-		// 3. Call EnableBackend again: must abort because StateVersion was concurrently bumped
-		err = svc.EnableBackend(ctx, srvID)
-		if err == nil {
-			t.Fatal("expected EnableBackend to fail when tunnel is modified concurrently, got nil")
-		}
-		if !strings.Contains(err.Error(), "backend state modified concurrently; aborting enable") {
-			t.Fatalf("unexpected error message: %v", err)
+		// 3. Call EnableBackend again: a health-status write bumps StateVersion but
+		// must not abort the enable (issue #607).
+		if err := svc.EnableBackend(ctx, srvID); err != nil {
+			t.Fatalf("expected EnableBackend to tolerate concurrent health write, got: %v", err)
 		}
 		if !hookFired {
 			t.Fatal("expected postAddTunnelHook to fire")
@@ -746,12 +744,13 @@ func TestEnableBackend_ConcurrentStateModificationAbortsEnable(t *testing.T) {
 		}
 	})
 
-	t.Run("NewTunnel_ConcurrentMutationAbortsEnable", func(t *testing.T) {
+	t.Run("NewTunnel_ConcurrentHealthWriteDoesNotAbortEnable", func(t *testing.T) {
 		db := setupTestDB(t)
 		svc, err := NewVPNService(db, nil)
 		if err != nil {
 			t.Fatalf("NewVPNService failed: %v", err)
 		}
+		t.Cleanup(func() { closeBackendDevices(svc) })
 
 		srvID, err := db.CreateServer(ctx, &models.Server{
 			Name: "concurrent-enable-new-server",
@@ -780,13 +779,10 @@ func TestEnableBackend_ConcurrentStateModificationAbortsEnable(t *testing.T) {
 		})
 		defer svc.SetEnableBackendPostAddTunnelHookForTest(nil)
 
-		// Call EnableBackend on brand new backend: must abort because StateVersion was concurrently bumped after AddTunnel
-		err = svc.EnableBackend(ctx, srvID)
-		if err == nil {
-			t.Fatal("expected EnableBackend to fail when new tunnel is modified concurrently, got nil")
-		}
-		if !strings.Contains(err.Error(), "backend state modified concurrently; aborting enable") {
-			t.Fatalf("unexpected error message: %v", err)
+		// Brand new backend: the prober writes status after AddTunnel (issue #607).
+		// StateVersion is bumped but the enable must still succeed.
+		if err := svc.EnableBackend(ctx, srvID); err != nil {
+			t.Fatalf("expected EnableBackend to tolerate concurrent health write, got: %v", err)
 		}
 		if !hookFired {
 			t.Fatal("expected postAddTunnelHook to fire")
@@ -799,8 +795,121 @@ func TestEnableBackend_ConcurrentStateModificationAbortsEnable(t *testing.T) {
 		if finalTun.Status != models.TunnelStatusDegraded {
 			t.Errorf("expected tunnel status %q to remain intact, got %q", models.TunnelStatusDegraded, finalTun.Status)
 		}
-		if finalTun.StateVersion != 2 {
-			t.Errorf("expected StateVersion = 2 after concurrent mutation, got %d", finalTun.StateVersion)
+		if finalTun.StateVersion <= 1 {
+			t.Errorf("expected StateVersion > 1 after concurrent mutation, got %d", finalTun.StateVersion)
+		}
+	})
+
+	t.Run("NewTunnel_ConcurrentEndpointChangeAbortsEnable", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+		t.Cleanup(func() { closeBackendDevices(svc) })
+
+		srvID, err := db.CreateServer(ctx, &models.Server{
+			Name: "concurrent-enable-endpoint-server",
+			Host: "198.51.100.79",
+			Protocols: map[string]any{
+				"awg": map[string]any{
+					"installed":  true,
+					"port":       51820,
+					"public_key": "server-concurrent-enable-endpoint-pubkey",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateServer failed: %v", err)
+		}
+		svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+		svc.SetEnableBackendPostAddTunnelHookForTest(func() {
+			if _, hookErr := svc.pool.AddTunnel(ctx, srvID, "203.0.113.9:51820", "server-concurrent-enable-endpoint-pubkey"); hookErr != nil {
+				t.Errorf("concurrent AddTunnel failed: %v", hookErr)
+			}
+		})
+		defer svc.SetEnableBackendPostAddTunnelHookForTest(nil)
+
+		err = svc.EnableBackend(ctx, srvID)
+		if err == nil || !strings.Contains(err.Error(), "backend identity modified concurrently; aborting enable") {
+			t.Fatalf("expected concurrent modification error, got: %v", err)
+		}
+	})
+
+	t.Run("NewTunnel_ConcurrentPublicKeyChangeAbortsEnable", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+		t.Cleanup(func() { closeBackendDevices(svc) })
+
+		srvID, err := db.CreateServer(ctx, &models.Server{
+			Name: "concurrent-enable-pubkey-server",
+			Host: "198.51.100.80",
+			Protocols: map[string]any{
+				"awg": map[string]any{
+					"installed":  true,
+					"port":       51820,
+					"public_key": "server-concurrent-enable-orig-pubkey",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateServer failed: %v", err)
+		}
+		svc.SetAWGStatusProvider(&mockAWGManagerWithClientAdder{})
+
+		svc.SetEnableBackendPostAddTunnelHookForTest(func() {
+			if _, hookErr := svc.pool.AddTunnel(ctx, srvID, "198.51.100.80:51820", "server-concurrent-enable-diff-pubkey"); hookErr != nil {
+				t.Errorf("concurrent AddTunnel failed: %v", hookErr)
+			}
+		})
+		defer svc.SetEnableBackendPostAddTunnelHookForTest(nil)
+
+		err = svc.EnableBackend(ctx, srvID)
+		if err == nil || !strings.Contains(err.Error(), "backend identity modified concurrently; aborting enable") {
+			t.Fatalf("expected concurrent modification error, got: %v", err)
+		}
+	})
+
+	t.Run("NewTunnel_ConcurrentRecreateAbortsEnable", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, err := NewVPNService(db, nil)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+		t.Cleanup(func() { closeBackendDevices(svc) })
+
+		srvID, err := db.CreateServer(ctx, &models.Server{
+			Name: "concurrent-enable-recreate-server",
+			Host: "198.51.100.81",
+			Protocols: map[string]any{
+				"awg": map[string]any{
+					"installed":  true,
+					"port":       51820,
+					"public_key": "server-concurrent-enable-recreate-pubkey",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateServer failed: %v", err)
+		}
+
+		svc.SetEnableBackendPostAddTunnelHookForTest(func() {
+			if hookErr := svc.pool.RemoveTunnel(ctx, srvID); hookErr != nil {
+				t.Errorf("concurrent RemoveTunnel failed: %v", hookErr)
+			}
+			if _, hookErr := svc.pool.AddTunnel(ctx, srvID, "198.51.100.81:51820", "server-concurrent-enable-recreate-pubkey"); hookErr != nil {
+				t.Errorf("concurrent AddTunnel failed: %v", hookErr)
+			}
+		})
+		defer svc.SetEnableBackendPostAddTunnelHookForTest(nil)
+
+		err = svc.EnableBackend(ctx, srvID)
+		if err == nil || !strings.Contains(err.Error(), "backend identity modified concurrently; aborting enable") {
+			t.Fatalf("expected concurrent modification error, got: %v", err)
 		}
 	})
 }

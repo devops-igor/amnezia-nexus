@@ -600,7 +600,12 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	ctx := r.Context()
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Minute))
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
+	defer cancel()
+
 	server, err := h.db.GetServer(ctx, serverID)
 	if err != nil || server == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
@@ -676,7 +681,12 @@ func (h *Handlers) UninstallProtocolHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	ctx := r.Context()
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(5 * time.Minute))
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+
 	server, err := h.db.GetServer(ctx, serverID)
 	if err != nil || server == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")

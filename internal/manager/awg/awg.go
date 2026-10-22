@@ -82,7 +82,8 @@ type AWGManager struct {
 	lockHeartbeatTimeoutNs  atomic.Int64
 	// tcCleaned guards the one-shot legacy tc-state sweep: server IDs that
 	// have already been swept by this manager instance. Guarded by mu.
-	tcCleaned map[int64]bool
+	tcCleaned   map[int64]bool
+	installHook func(*AWGParams)
 }
 
 // NewAWGManager creates a new AWGManager instance.
@@ -557,20 +558,25 @@ func (m *AWGManager) Install(ctx context.Context, server *models.Server, params 
 	}
 	awgParams.Port = port
 
-	if (profile == "standard" || profile == "pro") && params != nil {
-		cpsProto := "quic"
+	cpsProto := "sip"
+	if params != nil {
 		if cp, ok := params["awg_cps_protocol"]; ok && fmt.Sprint(cp) != "" {
-			cpsProto = fmt.Sprint(cp)
+			cpsProto = strings.ToLower(strings.TrimSpace(fmt.Sprint(cp)))
 		}
-		if d, err := cps.SelectMimicryDomain(ctx, client, cpsProto); err == nil && d != "" {
-			if cpsPackets, err := cps.GenerateCPSPackets(profile, d); err == nil {
-				awgParams.I1 = cpsPackets["i1"]
-				awgParams.I2 = cpsPackets["i2"]
-				awgParams.I3 = cpsPackets["i3"]
-				awgParams.I4 = cpsPackets["i4"]
-				awgParams.I5 = cpsPackets["i5"]
-			}
-		}
+	}
+	d, err := cps.SelectMimicryDomain(ctx, client, cpsProto)
+	if err != nil || d == "" {
+		d = cps.FallbackDomains[cpsProto]
+	}
+	if cpsPackets, err := cps.GenerateCPSPackets(profile, d, cpsProto); err == nil {
+		awgParams.I1 = cpsPackets["i1"]
+		awgParams.I2 = cpsPackets["i2"]
+		awgParams.I3 = cpsPackets["i3"]
+		awgParams.I4 = cpsPackets["i4"]
+		awgParams.I5 = cpsPackets["i5"]
+	}
+	if m.installHook != nil {
+		m.installHook(awgParams)
 	}
 
 	if err := ensureDockerInstalled(ctx, client); err != nil {
@@ -827,16 +833,23 @@ func (m *AWGManager) resolveContainerConfigPath(ctx context.Context, client ssh.
 }
 
 func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient, content string) error {
-	_, err := m.saveServerConfigTracked(ctx, client, content)
+	_, err := m.saveServerConfigTracked(ctx, client, content, true)
 	return err
 }
 
-func (m *AWGManager) saveServerConfigTracked(ctx context.Context, client ssh.SSHClient, content string) (bool, error) {
+// saveServerConfigPreservingParams writes a peer-only edit without revalidating
+// existing interface parameters against today's rules.
+func (m *AWGManager) saveServerConfigPreservingParams(ctx context.Context, client ssh.SSHClient, content string) error {
+	_, err := m.saveServerConfigTracked(ctx, client, content, false)
+	return err
+}
+
+func (m *AWGManager) saveServerConfigTracked(ctx context.Context, client ssh.SSHClient, content string, validateParams bool) (bool, error) {
 	params, _, err := ParseServerConfig(content)
 	if err != nil {
 		return false, fmt.Errorf("invalid server config: %w", err)
 	}
-	if len(params) > 0 {
+	if validateParams && len(params) > 0 {
 		if err := ValidateAWGParams(params); err != nil {
 			return false, fmt.Errorf("invalid AWG parameters: %w", err)
 		}
@@ -1403,7 +1416,7 @@ func (m *AWGManager) commitPeerConfigWithCAS(
 		if err != nil {
 			return false, fmt.Errorf("failed to upsert peer in config: %w", err)
 		}
-		return m.saveServerConfigTracked(ctx, client, newConfig)
+		return m.saveServerConfigTracked(ctx, client, newConfig, false)
 	}
 
 	return false, errors.New("failed to commit remote config: CAS retry limit exceeded due to concurrent modifications")
@@ -1416,7 +1429,7 @@ func (m *AWGManager) removePeerFromRemote(ctx context.Context, client ssh.SSHCli
 	}
 
 	newConfig := removePeerFromConfig(confText, pubKey, ip)
-	if err := m.saveServerConfig(ctx, client, newConfig); err != nil {
+	if err := m.saveServerConfigPreservingParams(ctx, client, newConfig); err != nil {
 		return fmt.Errorf("failed to save config during peer removal: %w", err)
 	}
 
@@ -1441,7 +1454,7 @@ func (m *AWGManager) removePeerFromRemote(ctx context.Context, client ssh.SSHCli
 }
 
 func (m *AWGManager) restorePreviousPeer(ctx context.Context, client ssh.SSHClient, initialConfText string, initialClients []AWGClient) (bool, error) {
-	if err := m.saveServerConfig(ctx, client, initialConfText); err != nil {
+	if err := m.saveServerConfigPreservingParams(ctx, client, initialConfText); err != nil {
 		return false, fmt.Errorf("failed to restore initial server config: %w", err)
 	}
 	if err := m.saveClientsTable(ctx, client, initialClients); err != nil {
@@ -2057,7 +2070,7 @@ func (m *AWGManager) rollbackServerConfigSurgically(ctx context.Context, client 
 	}
 
 	if newConf != "" && newConf != freshConf {
-		if _, saveErr := m.saveServerConfigTracked(ctx, client, newConf); saveErr != nil {
+		if _, saveErr := m.saveServerConfigTracked(ctx, client, newConf, false); saveErr != nil {
 			return fmt.Errorf("failed to save server config during rollback: %w", saveErr)
 		}
 	}
@@ -2161,7 +2174,7 @@ func (m *AWGManager) RemoveClient(ctx context.Context, server *models.Server, cl
 	}
 
 	newConfig := "[" + strings.Join(newSections, "[")
-	if err := m.saveServerConfig(ctx, client, newConfig); err != nil {
+	if err := m.saveServerConfigPreservingParams(ctx, client, newConfig); err != nil {
 		return err
 	}
 
@@ -2316,7 +2329,7 @@ func (m *AWGManager) ToggleClient(ctx context.Context, server *models.Server, cl
 		newConfig = "[" + strings.Join(newSections, "[")
 	}
 
-	if err := m.saveServerConfig(ctx, client, newConfig); err != nil {
+	if err := m.saveServerConfigPreservingParams(ctx, client, newConfig); err != nil {
 		return err
 	}
 	return m.saveClientsTable(ctx, client, clients)
@@ -2669,11 +2682,11 @@ func (m *AWGManager) updateServerConfigPeer(ctx context.Context, client ssh.SSHC
 		}
 		newConfig = "[" + strings.Join(newSections, "[")
 	}
-	return m.saveServerConfig(ctx, client, newConfig)
+	return m.saveServerConfigPreservingParams(ctx, client, newConfig)
 }
 
-// RotateMimicry rotates a client's mimicry profile through the sequence:
-// auto -> tls -> quic -> dns -> sip -> tls, regenerates I1-I5 packet headers, and updates clientsTable.
+// RotateMimicry rotates a client's mimicry profile strictly between verified DPI-passing UDP protocols (SIP <-> DNS),
+// regenerates I1-I5 packet headers, and updates clientsTable.
 func (m *AWGManager) RotateMimicry(ctx context.Context, server *models.Server, clientID string) (string, error) {
 	client, err := m.getSSHClient(ctx, server)
 	if err != nil {
@@ -2721,17 +2734,15 @@ func (m *AWGManager) RotateMimicry(ctx context.Context, server *models.Server, c
 	var nextProfile string
 	switch curr {
 	case "auto":
-		nextProfile = "tls"
-	case "tls":
-		nextProfile = "quic"
-	case "quic":
+		nextProfile = "dns"
+	case "sip":
 		nextProfile = "dns"
 	case "dns":
 		nextProfile = "sip"
-	case "sip":
-		nextProfile = "tls"
+	case "quic", "tls":
+		nextProfile = "sip"
 	default:
-		nextProfile = "tls"
+		nextProfile = "dns"
 	}
 
 	// Regenerate I1-I5 signature packets

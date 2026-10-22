@@ -108,7 +108,7 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 	}
 	r.Use(chimiddleware.Logger)
 	r.Use(middleware.Recoverer)
-	r.Use(chimiddleware.Timeout(60 * time.Second))
+	r.Use(middleware.OperationTimeout(60 * time.Second))
 
 	if cfg != nil && cfg.SecretKey != "" {
 		r.Use(middleware.Session(cfg.SecretKey))

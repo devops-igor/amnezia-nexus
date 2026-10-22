@@ -61,6 +61,7 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	pool := s.pool
 	db := s.db
 	awgProv := s.awgProvider
+	startEpoch := s.adminDisableEpoch[serverID]
 	s.mu.RUnlock()
 
 	if pool == nil {
@@ -68,15 +69,6 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	}
 	if db == nil {
 		return errors.New("database not available")
-	}
-
-	var (
-		hasInitial     bool
-		initialEnabled bool
-	)
-	if initTun, err := pool.GetTunnel(serverID); err == nil && initTun != nil {
-		hasInitial = true
-		initialEnabled = initTun.Enabled
 	}
 
 	server, err := db.GetServerByID(ctx, serverID)
@@ -88,6 +80,13 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	}
 
 	pub, port, awgParams, err := s.resolveBackendCredentials(ctx, serverID, server)
+	if err != nil {
+		return err
+	}
+
+	// Validate I1 parameter preparation early (before pool.AddTunnel) so that
+	// a generator failure aborts immediately without mutating pool or remote peers (CodeRabbit #1).
+	deviceParams, err := s.prepareBackendDeviceParams(ctx, awgParams)
 	if err != nil {
 		return err
 	}
@@ -124,10 +123,6 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		}
 	}
 	tun, err := pool.AddTunnel(ctx, serverID, endpoint, pub)
-	var postRefreshVersion int64
-	if err == nil && tun != nil {
-		postRefreshVersion = tun.StateVersion
-	}
 	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to register backend tunnel for server %d: %w", serverID, err)
@@ -164,7 +159,52 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 	}
 
-	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, hasInitial, initialEnabled, postRefreshVersion)
+	return s.finishEnableBackend(ctx, pool, tun, awgParams, serverID, startEpoch, deviceParams)
+}
+
+func (s *Service) dataPlaneI1Protocol() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg.DataPlaneI1Protocol()
+}
+
+func (s *Service) prepareBackendDeviceParams(ctx context.Context, awgParams map[string]any) (map[string]any, error) {
+	proto := s.dataPlaneI1Protocol()
+	return s.buildBackendDeviceParams(ctx, proto, awgParams)
+}
+
+func (s *Service) prepareBackendDeviceParamsLocked(awgParams map[string]any) (map[string]any, error) {
+	proto := s.cfg.DataPlaneI1Protocol()
+	return s.buildBackendDeviceParams(context.Background(), proto, awgParams)
+}
+
+// buildBackendDeviceParams constructs the device parameters used by AWGClientDevice.
+// The configured data plane I1 protocol (SIP by default, or DNS) always overrides
+// any existing backend I1 setting stored in the database.
+func (s *Service) buildBackendDeviceParams(ctx context.Context, proto string, awgParams map[string]any) (map[string]any, error) {
+	deviceParams := make(map[string]any, len(awgParams)+1)
+	for k, v := range awgParams {
+		// Data plane I1 setting always overrides stored backend I1 (any casing/variant)
+		if tunnel.NormalizeAWGKey(k) == "i1" {
+			continue
+		}
+		deviceParams[k] = v
+	}
+
+	mimicryPacketsMu.RLock()
+	genFn := generateMimicryPackets
+	mimicryPacketsMu.RUnlock()
+
+	packets, err := genFn(ctx, proto, "", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate data plane I1 packet: %w", err)
+	}
+	i1Val, ok := packets["i1"]
+	if !ok || i1Val == "" {
+		return nil, fmt.Errorf("generator returned empty data plane I1 packet for protocol %q", proto)
+	}
+	deviceParams["i1"] = i1Val
+	return deviceParams, nil
 }
 
 func (s *Service) finishEnableBackend(
@@ -173,9 +213,8 @@ func (s *Service) finishEnableBackend(
 	tun *models.BackendTunnel,
 	awgParams map[string]any,
 	serverID int64,
-	hasInitial bool,
-	initialEnabled bool,
-	initialVersion int64,
+	startEpoch uint64,
+	prepared ...map[string]any,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -187,22 +226,18 @@ func (s *Service) finishEnableBackend(
 	if tunnel.IsSelfHealingContext(ctx) && !currTun.Enabled {
 		return errors.New("backend was administratively disabled; aborting enable")
 	}
-	if hasInitial {
-		// Reject only a transition from administratively enabled to disabled
-		// while this operation was in flight. A backend that was already
-		// administratively disabled when EnableBackend started is the normal
-		// manual-enable case, regardless of preserved runtime-health provenance.
-		if initialEnabled && !currTun.Enabled {
-			return errors.New("backend was administratively disabled; aborting enable")
-		}
-	} else if !currTun.Enabled {
+	if s.adminDisableEpoch[serverID] != startEpoch {
 		return errors.New("backend was administratively disabled; aborting enable")
 	}
-	if currTun.StateVersion != initialVersion {
-		return errors.New("backend state modified concurrently; aborting enable")
+	// Guard on the tunnel's identity, not StateVersion: the health prober bumps
+	// StateVersion on every status write, and registering portal peers over SSH
+	// routinely outlasts the probe interval, so a version check aborts valid
+	// enables (issue #607). Runtime status/latency changes do not invalidate it.
+	if !models.SameTunnelIdentity(currTun, tun) {
+		return errors.New("backend identity modified concurrently; aborting enable")
 	}
 
-	if err := s.attachBackendForwarder(tun, awgParams); err != nil {
+	if err := s.attachBackendForwarder(tun, awgParams, prepared...); err != nil {
 		return err
 	}
 
@@ -456,12 +491,23 @@ func (s *Service) discoverLiveAWG(ctx context.Context, serverID int64, server *m
 	return livePub, livePort, true
 }
 
-func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams map[string]any) error {
+func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams map[string]any, prepared ...map[string]any) error {
 	if tun == nil {
 		return errors.New("backend tunnel is nil")
 	}
 	if s.forwarder == nil {
 		return nil
+	}
+
+	var deviceParams map[string]any
+	if len(prepared) > 0 && prepared[0] != nil {
+		deviceParams = prepared[0]
+	} else {
+		var prepErr error
+		deviceParams, prepErr = s.prepareBackendDeviceParamsLocked(awgParams)
+		if prepErr != nil {
+			return fmt.Errorf("failed to prepare backend device parameters for server %d: %w", tun.ServerID, prepErr)
+		}
 	}
 
 	// Detach and close previous device for this tunnel to prevent leaks
@@ -480,17 +526,17 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 	}
 
 	beMTU := 1280
-	if awgParams != nil {
-		if mVal, ok := awgParams["mtu"].(string); ok && mVal != "" {
+	if deviceParams != nil {
+		if mVal, ok := deviceParams["mtu"].(string); ok && mVal != "" {
 			if parsed, err := strconv.Atoi(mVal); err == nil && parsed > 0 {
 				beMTU = parsed
 			}
-		} else if mInt, ok := awgParams["mtu"].(int); ok && mInt > 0 {
+		} else if mInt, ok := deviceParams["mtu"].(int); ok && mInt > 0 {
 			beMTU = mInt
 		}
 	}
 
-	dev, devErr := tunnel.NewAWGClientDevice(fmt.Sprintf("awg-be-%d", tun.ServerID), tun.Endpoint, tun.PrivateKey, tun.PublicKey, beMTU, awgParams)
+	dev, devErr := tunnel.NewAWGClientDevice(fmt.Sprintf("awg-be-%d", tun.ServerID), tun.Endpoint, tun.PrivateKey, tun.PublicKey, beMTU, deviceParams)
 	if devErr != nil {
 		return fmt.Errorf("failed to create backend AWG device for server %d: %w", tun.ServerID, devErr)
 	}

@@ -307,6 +307,15 @@ func (p *SSHClientPool) sweepIdle() {
 	defer p.mu.Unlock()
 
 	for key, entry := range p.conns {
+		if entry.client != nil {
+			if clientLastActive := entry.client.GetLastActive(); clientLastActive.After(entry.lastActive) {
+				entry.lastActive = clientLastActive
+			}
+			if entry.client.InUse() {
+				continue
+			}
+		}
+
 		if now.Sub(entry.lastActive) > p.cfg.IdleTimeout {
 			if entry.client != nil {
 				_ = entry.client.Close()

@@ -227,6 +227,12 @@ func startEngineUpstreamClient(t *testing.T, saved, name string) *engineUpstream
 	if err := dev.IpcSet(configToUAPI(t, saved)); err != nil {
 		t.Fatal("upstream rejected saved generated configuration")
 	}
+	if want := configField(t, saved, "I1"); want != "" {
+		got, err := dev.IpcGet()
+		if err != nil || !strings.Contains(got, "i1="+want) {
+			t.Fatalf("upstream device did not load the rendered I1 (err=%v)", err)
+		}
+	}
 	_ = dev.IpcSet("rekey_timeout=1\n")
 	if err := dev.Up(); err != nil {
 		t.Fatal(err)
@@ -377,6 +383,11 @@ func TestIngressEngineEndToEndThroughService(t *testing.T) {
 	svc := newIngressEngineService(t, db)
 
 	peer, saved := newEnginePeer(t, svc, db, "engine-alice")
+	// The upstream device transmits configured I1 as its own UDP datagram
+	// before handshake initiation; ingress must discard it and handshake.
+	if i1 := configField(t, saved, "I1"); !strings.HasPrefix(i1, "<b 0x5245474953544552") {
+		t.Fatalf("expected SIP REGISTER preamble, got %q", i1)
+	}
 	ip := netip.MustParseAddr(peer.assignedIP)
 	engine := startEngine(t, svc, "engine-e2e-portal", []clientawg.Peer{
 		{PublicKey: peer.publicKey, AllowedIP: netip.PrefixFrom(ip, 32)},

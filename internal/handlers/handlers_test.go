@@ -279,6 +279,10 @@ func (m *testMockSSHClient) GetLastActive() time.Time {
 	return time.Now()
 }
 
+func (m *testMockSSHClient) InUse() bool {
+	return false
+}
+
 type testMockSSHPool struct {
 	client     *testMockSSHClient
 	err        error

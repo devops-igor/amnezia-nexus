@@ -44,13 +44,19 @@ func ParseCPSBlob(tagStr string) ([]byte, error) {
 	rCount := 0
 	if strings.HasPrefix(s, "<r ") {
 		rEnd := strings.Index(s, ">")
-		if rEnd != -1 {
-			nStr := strings.TrimSpace(s[3:rEnd])
-			if n, err := strconv.Atoi(nStr); err == nil && n >= 0 {
-				rCount = n
-			}
-			s = strings.TrimSpace(s[rEnd+1:])
+		if rEnd == -1 {
+			return nil, fmt.Errorf("unclosed <r tag: %s", tagStr)
 		}
+		nStr := strings.TrimSpace(s[3:rEnd])
+		n, err := strconv.Atoi(nStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid random prefix count %q: %w", nStr, err)
+		}
+		rCount = n
+		if rCount <= 0 || rCount > 65535 {
+			return nil, fmt.Errorf("invalid random prefix count %d (must be 1..65535)", rCount)
+		}
+		s = strings.TrimSpace(s[rEnd+1:])
 	}
 
 	if strings.HasPrefix(s, "<b 0x") && strings.HasSuffix(s, ">") {
@@ -63,12 +69,12 @@ func ParseCPSBlob(tagStr string) ([]byte, error) {
 			return nil, fmt.Errorf("invalid hex in CPS blob: %w", err)
 		}
 
-		if rCount > 0 && len(raw) >= rCount {
+		if rCount > 0 {
 			rnd := make([]byte, rCount)
 			if _, err := rand.Read(rnd); err != nil {
 				return nil, fmt.Errorf("failed to generate random prefix: %w", err)
 			}
-			copy(raw[:rCount], rnd)
+			raw = append(rnd, raw...)
 		}
 		return raw, nil
 	}
@@ -77,60 +83,116 @@ func ParseCPSBlob(tagStr string) ([]byte, error) {
 }
 
 // GenerateCPSPackets generates I1-I5 CPS packet signatures for the specified profile.
-func GenerateCPSPackets(profile string, domain string) (map[string]string, error) {
-	switch strings.ToLower(profile) {
-	case "lite":
-		dnsDomain := domain
-		if dnsDomain == "" {
-			dnsDomain = "icloud.com"
+// If a protocol is explicitly provided, packets are generated for that protocol ("sip", "dns", "quic").
+func GenerateCPSPackets(profile string, domain string, protocol ...string) (map[string]string, error) {
+	proto := ""
+	if len(protocol) > 0 {
+		proto = strings.ToLower(strings.TrimSpace(protocol[0]))
+	}
+
+	prof := strings.ToLower(strings.TrimSpace(profile))
+	if proto == "" {
+		switch prof {
+		case "sip", "dns", "quic", "tls":
+			proto = prof
+		case "lite":
+			proto = "dns"
+		default: // "standard", "pro"
+			proto = "quic"
 		}
-		dnsPayload, err := GenDNS(dnsDomain)
+	}
+
+	switch proto {
+	case "sip":
+		sipPkt, err := GenSIP(domain)
 		if err != nil {
 			return nil, err
 		}
-		txid := make([]byte, 2)
-		if _, err := rand.Read(txid); err != nil {
-			return nil, err
-		}
-		i1Raw := append(txid, dnsPayload...)
 		return map[string]string{
-			"i1": fmt.Sprintf("<r 2><b 0x%x>", i1Raw),
+			"i1": ToCPS(sipPkt),
 			"i2": "",
 			"i3": "",
 			"i4": "",
 			"i5": "",
 		}, nil
 
-	case "pro":
+	case "dns":
+		dnsDomain := domain
+		if dnsDomain == "" {
+			if prof == "lite" {
+				dnsDomain = "icloud.com"
+			} else {
+				dnsDomain = "one.one.one.one"
+			}
+		}
+		dnsPayload, err := GenDNS(dnsDomain)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]string{
+			"i1": fmt.Sprintf("<r 2><b 0x%x>", dnsPayload),
+			"i2": "",
+			"i3": "",
+			"i4": "",
+			"i5": "",
+		}, nil
+
+	case "quic":
+		if prof == "pro" {
+			i1, err := GenQUICInitial(domain)
+			if err != nil {
+				return nil, err
+			}
+			i2, err := GenQUICShort()
+			if err != nil {
+				return nil, err
+			}
+			i3, err := GenQUICShort()
+			if err != nil {
+				return nil, err
+			}
+			i4, err := GenQUICShort()
+			if err != nil {
+				return nil, err
+			}
+			i5, err := GenQUICShort()
+			if err != nil {
+				return nil, err
+			}
+			return map[string]string{
+				"i1": ToCPS(i1),
+				"i2": ToCPS(i2),
+				"i3": ToCPS(i3),
+				"i4": ToCPS(i4),
+				"i5": ToCPS(i5),
+			}, nil
+		}
 		i1, err := GenQUICInitial(domain)
-		if err != nil {
-			return nil, err
-		}
-		i2, err := GenQUICShort()
-		if err != nil {
-			return nil, err
-		}
-		i3, err := GenQUICShort()
-		if err != nil {
-			return nil, err
-		}
-		i4, err := GenQUICShort()
-		if err != nil {
-			return nil, err
-		}
-		i5, err := GenQUICShort()
 		if err != nil {
 			return nil, err
 		}
 		return map[string]string{
 			"i1": ToCPS(i1),
-			"i2": ToCPS(i2),
-			"i3": ToCPS(i3),
-			"i4": ToCPS(i4),
-			"i5": ToCPS(i5),
+			"i2": "",
+			"i3": "",
+			"i4": "",
+			"i5": "",
 		}, nil
 
-	default: // "standard"
+	case "tls":
+		tlsPkt, err := GenTLS(domain)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]string{
+			"i1": ToCPS(tlsPkt),
+			"i2": "",
+			"i3": "",
+			"i4": "",
+			"i5": "",
+		}, nil
+
+	default:
 		i1, err := GenQUICInitial(domain)
 		if err != nil {
 			return nil, err
@@ -150,12 +212,12 @@ func GenerateMimicryPackets(ctx context.Context, mimicry string, domain string, 
 	m := strings.ToLower(strings.TrimSpace(mimicry))
 	if m == "" || m == "auto" {
 		if sshClient != nil {
-			d, err := SelectMimicryDomain(ctx, sshClient, "tls")
+			d, err := SelectMimicryDomain(ctx, sshClient, "sip")
 			if err == nil && d != "" {
 				domain = d
 			}
 		}
-		m = "tls"
+		m = "sip"
 	}
 
 	switch m {
@@ -181,13 +243,8 @@ func GenerateMimicryPackets(ctx context.Context, mimicry string, domain string, 
 		if err != nil {
 			return nil, err
 		}
-		txid := make([]byte, 2)
-		if _, err := rand.Read(txid); err != nil {
-			return nil, err
-		}
-		i1Raw := append(txid, dnsPayload...)
 		return map[string]string{
-			"i1": fmt.Sprintf("<r 2><b 0x%x>", i1Raw),
+			"i1": fmt.Sprintf("<r 2><b 0x%x>", dnsPayload),
 			"i2": "",
 			"i3": "",
 			"i4": "",

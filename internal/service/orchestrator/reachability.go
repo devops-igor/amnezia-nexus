@@ -319,8 +319,21 @@ func extractPrivateKeyFromConfig(confStr string) string {
 	return ""
 }
 
+func (o *Orchestrator) dataPlaneI1Protocol(ctx context.Context) string {
+	if o != nil && o.db != nil {
+		vpnCfg, err := o.db.GetVPNConfig(ctx)
+		if err != nil {
+			slog.WarnContext(ctx, "failed to load VPN config for data-plane I1 protocol", "err", err)
+		} else if vpnCfg != nil {
+			return vpnCfg.DataPlaneI1Protocol()
+		}
+	}
+	return (*models.VPNConfig)(nil).DataPlaneI1Protocol()
+}
+
 func (o *Orchestrator) probeAWGHealth(ctx context.Context, server *models.Server, host string, port int, serverPub, clientPriv, psk, hpKey string, awgParams map[string]any) (map[string]any, map[string]map[string]any, bool) {
-	reachRes, err := health.PerformAWGHandshake(ctx, host, port, serverPub, clientPriv, psk, hpKey, awgParams, "tls", 3*time.Second)
+	proto := o.dataPlaneI1Protocol(ctx)
+	reachRes, err := health.PerformAWGHandshake(ctx, host, port, serverPub, clientPriv, psk, hpKey, awgParams, proto, 3*time.Second)
 	if err != nil {
 		return nil, nil, false
 	}
