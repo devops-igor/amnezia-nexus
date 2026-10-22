@@ -1,0 +1,52 @@
+name: Architecture Health & Churn Report
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: architecture-health-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  architecture-health:
+    name: Architecture Health Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Code with Full History
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Architecture Health Tests
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest==8.3.4 pytest-cov==6.0.0
+          python -m pytest -v tests/test_architecture_health*.py
+
+      - name: Run Architecture Health Scan
+        run: |
+          python3 scripts/architecture_health.py --check --nonblocking
+
+      - name: Upload Architecture Health Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: architecture-health-report
+          path: architecture_health_report.json
+          retention-days: 14
