@@ -95,6 +95,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if baseline_path.exists():
             try:
                 existing_data = ah.load_baseline(baseline_path)
+                ah.validate_baseline(existing_data)
             except Exception as exc:
                 if not args.allow_ceiling_increase:
                     logger.error(

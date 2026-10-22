@@ -9,8 +9,12 @@ def validate_baseline(data: Any) -> None:
     """Validate that baseline data is non-empty and structurally complete.
 
     Requires a non-empty dictionary containing:
-      - non-empty 'metadata' dictionary with a non-empty 'baseline_commit' string.
+      - non-empty 'metadata' dictionary containing:
+        - non-empty 'baseline_commit' string.
+        - 'reference_timestamp_epoch' (int or float > 0).
+        - non-empty 'reference_timestamp' string.
       - non-empty 'ceilings' dictionary.
+      - non-empty 'files' dictionary.
 
     Raises:
         ValueError: If the baseline data is empty or structurally incomplete.
@@ -23,9 +27,25 @@ def validate_baseline(data: Any) -> None:
     baseline_commit = metadata.get("baseline_commit")
     if not baseline_commit or not isinstance(baseline_commit, str) or not baseline_commit.strip():
         raise ValueError("Baseline metadata is missing a valid 'baseline_commit'.")
+    ref_epoch = metadata.get("reference_timestamp_epoch")
+    if (
+        ref_epoch is None
+        or isinstance(ref_epoch, bool)
+        or not isinstance(ref_epoch, (int, float))
+        or ref_epoch <= 0
+    ):
+        raise ValueError(
+            "Baseline metadata is missing a valid 'reference_timestamp_epoch' (must be a number > 0)."
+        )
+    ref_timestamp = metadata.get("reference_timestamp")
+    if not ref_timestamp or not isinstance(ref_timestamp, str) or not ref_timestamp.strip():
+        raise ValueError("Baseline metadata is missing a valid 'reference_timestamp'.")
     ceilings = data.get("ceilings")
     if not isinstance(ceilings, dict) or not ceilings:
         raise ValueError("Baseline data is missing or has empty 'ceilings'.")
+    files = data.get("files")
+    if not isinstance(files, dict) or not files:
+        raise ValueError("Baseline data is missing or has empty 'files'.")
 
 
 def load_baseline(baseline_path: Path) -> Dict[str, Any]:

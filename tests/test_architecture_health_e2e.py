@@ -362,7 +362,11 @@ def test_e2e_nonblocking_operational_vs_advisory_exit_codes(tmp_path: Path) -> N
     save_baseline(
         base_file,
         {
-            "metadata": {"baseline_commit": "HEAD"},
+            "metadata": {
+                "baseline_commit": "HEAD",
+                "reference_timestamp": "2026-10-22T00:00:00Z",
+                "reference_timestamp_epoch": 1792627200,
+            },
             "ceilings": {"oversized.go": 1000},
             "files": {"oversized.go": {"lines": 1000, "ceiling": 1000}},
         },
@@ -435,6 +439,7 @@ def test_e2e_nonblocking_operational_vs_advisory_exit_codes(tmp_path: Path) -> N
         {
             "metadata": {
                 "baseline_commit": "0000000000000000000000000000000000000000",
+                "reference_timestamp": "2026-10-22T00:00:00Z",
                 "reference_timestamp_epoch": 100000,
             },
             "ceilings": {"oversized.go": 1000},
@@ -463,8 +468,11 @@ def test_baseline_save_and_load(tmp_path: Path) -> None:
         "metadata": {
             "repository": "amnezia-nexus",
             "baseline_commit": "3eea2b6fe0381d8dfe1ec693a9b12bacb1738e6f",
+            "reference_timestamp": "2026-10-22T09:42:52Z",
+            "reference_timestamp_epoch": 1792662172,
         },
         "ceilings": {"a.go": 1000},
+        "files": {"a.go": {"lines": 10, "ceiling": 1000}},
     }
     save_baseline(p, data)
     assert p.exists()
@@ -487,34 +495,167 @@ def test_validate_baseline_structural_completeness(tmp_path: Path) -> None:
 
     # Missing metadata
     with pytest.raises(ValueError, match="missing or has empty 'metadata'"):
-        validate_baseline({"ceilings": {"a.go": 1000}})
+        validate_baseline({"ceilings": {"a.go": 1000}, "files": {"a.go": {}}})
 
     # Empty metadata dict
     with pytest.raises(ValueError, match="missing or has empty 'metadata'"):
-        validate_baseline({"metadata": {}, "ceilings": {"a.go": 1000}})
+        validate_baseline({"metadata": {}, "ceilings": {"a.go": 1000}, "files": {"a.go": {}}})
 
     # Missing baseline_commit
     with pytest.raises(ValueError, match="missing a valid 'baseline_commit'"):
-        validate_baseline({"metadata": {"repository": "amnezia-nexus"}, "ceilings": {"a.go": 1000}})
+        validate_baseline(
+            {
+                "metadata": {
+                    "repository": "amnezia-nexus",
+                    "reference_timestamp": "2026-10-22T09:42:52Z",
+                    "reference_timestamp_epoch": 1792662172,
+                },
+                "ceilings": {"a.go": 1000},
+                "files": {"a.go": {}},
+            }
+        )
 
     # Whitespace baseline_commit
     with pytest.raises(ValueError, match="missing a valid 'baseline_commit'"):
-        validate_baseline({"metadata": {"baseline_commit": "   "}, "ceilings": {"a.go": 1000}})
+        validate_baseline(
+            {
+                "metadata": {
+                    "baseline_commit": "   ",
+                    "reference_timestamp": "2026-10-22T09:42:52Z",
+                    "reference_timestamp_epoch": 1792662172,
+                },
+                "ceilings": {"a.go": 1000},
+                "files": {"a.go": {}},
+            }
+        )
+
+    # Missing reference_timestamp_epoch
+    with pytest.raises(ValueError, match="missing a valid 'reference_timestamp_epoch'"):
+        validate_baseline(
+            {
+                "metadata": {
+                    "baseline_commit": "3eea2b6fe0",
+                    "reference_timestamp": "2026-10-22T09:42:52Z",
+                },
+                "ceilings": {"a.go": 1000},
+                "files": {"a.go": {}},
+            }
+        )
+
+    # Invalid reference_timestamp_epoch (non-positive / boolean / non-numeric)
+    for invalid_epoch in [0, -100, True, False, "1792662172", None]:
+        with pytest.raises(ValueError, match="missing a valid 'reference_timestamp_epoch'"):
+            validate_baseline(
+                {
+                    "metadata": {
+                        "baseline_commit": "3eea2b6fe0",
+                        "reference_timestamp": "2026-10-22T09:42:52Z",
+                        "reference_timestamp_epoch": invalid_epoch,
+                    },
+                    "ceilings": {"a.go": 1000},
+                    "files": {"a.go": {}},
+                }
+            )
+
+    # Missing reference_timestamp
+    with pytest.raises(ValueError, match="missing a valid 'reference_timestamp'"):
+        validate_baseline(
+            {
+                "metadata": {
+                    "baseline_commit": "3eea2b6fe0",
+                    "reference_timestamp_epoch": 1792662172,
+                },
+                "ceilings": {"a.go": 1000},
+                "files": {"a.go": {}},
+            }
+        )
+
+    # Whitespace or invalid reference_timestamp
+    for invalid_ts in ["", "   ", 12345, None]:
+        with pytest.raises(ValueError, match="missing a valid 'reference_timestamp'"):
+            validate_baseline(
+                {
+                    "metadata": {
+                        "baseline_commit": "3eea2b6fe0",
+                        "reference_timestamp_epoch": 1792662172,
+                        "reference_timestamp": invalid_ts,
+                    },
+                    "ceilings": {"a.go": 1000},
+                    "files": {"a.go": {}},
+                }
+            )
 
     # Missing ceilings
     with pytest.raises(ValueError, match="missing or has empty 'ceilings'"):
-        validate_baseline({"metadata": {"baseline_commit": "3eea2b6fe0"}})
+        validate_baseline(
+            {
+                "metadata": {
+                    "baseline_commit": "3eea2b6fe0",
+                    "reference_timestamp": "2026-10-22T09:42:52Z",
+                    "reference_timestamp_epoch": 1792662172,
+                },
+                "files": {"a.go": {"lines": 100, "ceiling": 1000}},
+            }
+        )
 
     # Empty ceilings dict
     with pytest.raises(ValueError, match="missing or has empty 'ceilings'"):
-        validate_baseline({"metadata": {"baseline_commit": "3eea2b6fe0"}, "ceilings": {}})
+        validate_baseline(
+            {
+                "metadata": {
+                    "baseline_commit": "3eea2b6fe0",
+                    "reference_timestamp": "2026-10-22T09:42:52Z",
+                    "reference_timestamp_epoch": 1792662172,
+                },
+                "ceilings": {},
+                "files": {"a.go": {"lines": 100, "ceiling": 1000}},
+            }
+        )
+
+    # Missing files
+    with pytest.raises(ValueError, match="missing or has empty 'files'"):
+        validate_baseline(
+            {
+                "metadata": {
+                    "baseline_commit": "3eea2b6fe0",
+                    "reference_timestamp": "2026-10-22T09:42:52Z",
+                    "reference_timestamp_epoch": 1792662172,
+                },
+                "ceilings": {"a.go": 1000},
+            }
+        )
+
+    # Empty files dict
+    with pytest.raises(ValueError, match="missing or has empty 'files'"):
+        validate_baseline(
+            {
+                "metadata": {
+                    "baseline_commit": "3eea2b6fe0",
+                    "reference_timestamp": "2026-10-22T09:42:52Z",
+                    "reference_timestamp_epoch": 1792662172,
+                },
+                "ceilings": {"a.go": 1000},
+                "files": {},
+            }
+        )
 
     # Valid baseline structure
     valid = {
-        "metadata": {"baseline_commit": "3eea2b6fe0381d8dfe1ec693a9b12bacb1738e6f"},
+        "metadata": {
+            "baseline_commit": "3eea2b6fe0381d8dfe1ec693a9b12bacb1738e6f",
+            "reference_timestamp": "2026-10-22T09:42:52Z",
+            "reference_timestamp_epoch": 1792662172,
+        },
         "ceilings": {"a.go": 1000},
+        "files": {"a.go": {"lines": 100, "ceiling": 1000}},
     }
     validate_baseline(valid)
+
+    # Valid baseline structure with float epoch
+    valid_float = dict(valid)
+    valid_float["metadata"] = dict(valid["metadata"])
+    valid_float["metadata"]["reference_timestamp_epoch"] = 1792662172.5
+    validate_baseline(valid_float)
 
     # File-level load_baseline failure on empty object
     empty_file = tmp_path / "empty_baseline.json"
@@ -577,7 +718,22 @@ def test_e2e_cli_fail_closed_on_empty_or_incomplete_baseline(tmp_path: Path) -> 
     loaded = load_baseline(base_file)
     assert "metadata" in loaded
     assert "baseline_commit" in loaded["metadata"]
+    assert "reference_timestamp" in loaded["metadata"]
+    assert "reference_timestamp_epoch" in loaded["metadata"]
     assert "ceilings" in loaded
+    assert "files" in loaded
+
+    # Re-generating over an existing valid baseline exercises load_baseline validation path
+    rc_gen_existing = main(
+        [
+            "--repo-root",
+            str(repo),
+            "--baseline-file",
+            str(base_file),
+            "--generate-baseline",
+        ]
+    )
+    assert rc_gen_existing == 0
 
     # 2. Baseline is incomplete: {"metadata": {"baseline_commit": ""}, "ceilings": {}}
     base_file.write_text(
@@ -595,6 +751,81 @@ def test_e2e_cli_fail_closed_on_empty_or_incomplete_baseline(tmp_path: Path) -> 
         ]
     )
     assert rc_incomplete == 1
+
+
+def test_e2e_cli_fail_closed_on_missing_timestamp_or_files_map(tmp_path: Path) -> None:
+    """Verify CLI --check --nonblocking fails closed (exit code 1) on missing timestamp or files map."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    (repo / "main.go").write_text("\n" * 100, encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    base_file = repo / "baseline.json"
+    cmd_check = [
+        "--repo-root",
+        str(repo),
+        "--baseline-file",
+        str(base_file),
+        "--check",
+        "--nonblocking",
+    ]
+
+    incomplete_baselines = [
+        # Missing reference_timestamp_epoch
+        {
+            "metadata": {"baseline_commit": "HEAD", "reference_timestamp": "2026-10-22T09:42:52Z"},
+            "ceilings": {"main.go": 1000},
+            "files": {"main.go": {"lines": 100, "ceiling": 1000}},
+        },
+        # Invalid reference_timestamp_epoch (<= 0)
+        {
+            "metadata": {
+                "baseline_commit": "HEAD",
+                "reference_timestamp": "2026-10-22T09:42:52Z",
+                "reference_timestamp_epoch": 0,
+            },
+            "ceilings": {"main.go": 1000},
+            "files": {"main.go": {"lines": 100, "ceiling": 1000}},
+        },
+        # Missing reference_timestamp string
+        {
+            "metadata": {"baseline_commit": "HEAD", "reference_timestamp_epoch": 1792662172},
+            "ceilings": {"main.go": 1000},
+            "files": {"main.go": {"lines": 100, "ceiling": 1000}},
+        },
+        # Missing files map
+        {
+            "metadata": {
+                "baseline_commit": "HEAD",
+                "reference_timestamp": "2026-10-22T09:42:52Z",
+                "reference_timestamp_epoch": 1792662172,
+            },
+            "ceilings": {"main.go": 1000},
+        },
+        # Empty files map
+        {
+            "metadata": {
+                "baseline_commit": "HEAD",
+                "reference_timestamp": "2026-10-22T09:42:52Z",
+                "reference_timestamp_epoch": 1792662172,
+            },
+            "ceilings": {"main.go": 1000},
+            "files": {},
+        },
+        # Sample incomplete baseline from finding
+        {"metadata": {"baseline_commit": "HEAD"}, "ceilings": {"main.go": 1000}},
+    ]
+
+    for payload in incomplete_baselines:
+        base_file.write_text(json.dumps(payload), encoding="utf-8")
+        assert main(cmd_check) == 1
+
+    # Also verify --generate-baseline fails closed over incomplete baseline without --allow-ceiling-increase
+    cmd_gen = ["--repo-root", str(repo), "--baseline-file", str(base_file), "--generate-baseline"]
+    assert main(cmd_gen) == 1
 
 
 def test_e2e_renamed_grandfathered_file_satisfies_invariant_after_ratchet(tmp_path: Path) -> None:
