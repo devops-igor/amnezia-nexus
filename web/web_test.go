@@ -58,6 +58,7 @@ func TestModernJavaScriptAndInteractiveComponents(t *testing.T) {
 		"nexusConfirmModal",
 		"formatBytes",
 		"downloadFile",
+		"downloadQRCode",
 		"escapeHtml",
 		"escapeJs",
 	}

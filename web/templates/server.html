@@ -364,7 +364,7 @@
                 <div class="qr-hint" id="qrHint">{{ _ "qr_hint" }}</div>
                 <div class="config-actions" style="margin-top: var(--space-md); width: 100%; max-width: 280px;">
                     <button class="btn btn-secondary btn-sm" onclick="UI.copy(currentConfig, this)" style="flex:1"><svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy" }}</button>
-                    <button class="btn btn-primary btn-sm" onclick="UI.downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1"><svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download_conf" }}</button>
+                    <button class="btn btn-primary btn-sm" onclick="UI.downloadQRCode('qrCode', (currentConfigName || 'vpn_config') + '_qr.png')" style="flex:1"><svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download" }} QR</button>
                 </div>
             </div>
         </div>

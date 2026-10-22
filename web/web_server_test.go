@@ -180,6 +180,7 @@ const dom = new JSDOM(docHtml, {
             confirm: async (opts) => { confirmOptions = opts; return true; },
             copy: async () => true,
             downloadFile: () => {},
+            downloadQRCode: () => {},
             escapeHtml: (s) => (s == null ? '' : String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')),
             formatBytes: (n) => String(n) + 'B',
         };

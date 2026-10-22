@@ -28,6 +28,9 @@
         root.downloadFile = function (content, filename) {
             return root.UI.downloadFile(content, filename);
         };
+        root.downloadQRCode = function (containerOrId, filename) {
+            return root.UI.downloadQRCode(containerOrId, filename);
+        };
         root.escapeHtml = function (str) {
             return root.UI.escapeHtml(str);
         };
@@ -408,6 +411,74 @@
         }, 100);
     }
 
+    function downloadQRCode(containerOrId, filename) {
+        if (typeof document === 'undefined') return;
+        const target = containerOrId || 'qrCode';
+        let container = null;
+        if (typeof target === 'string') {
+            container = document.getElementById(target);
+            if (!container) {
+                try {
+                    container = document.querySelector(target);
+                } catch (e) {
+                    container = null;
+                }
+            }
+        } else {
+            container = target;
+        }
+
+        if (!container) {
+            toast('Unable to export QR image', 'error');
+            return;
+        }
+
+        const canvas = (container.tagName && container.tagName.toLowerCase() === 'canvas')
+            ? container
+            : container.querySelector('canvas');
+        const img = (container.tagName && container.tagName.toLowerCase() === 'img')
+            ? container
+            : container.querySelector('img');
+        let url = '';
+
+        if (canvas && typeof canvas.toDataURL === 'function') {
+            try {
+                url = canvas.toDataURL('image/png');
+            } catch (e) {
+                // Ignore tainted canvas errors and fall through
+            }
+        }
+        if (!url && img && img.src) {
+            url = img.src;
+        }
+
+        if (!url) {
+            toast('Unable to export QR image', 'error');
+            return;
+        }
+
+        let dlFilename = filename;
+        if (!dlFilename) {
+            const fallbackName = (typeof window !== 'undefined' && window.currentConfigName)
+                ? window.currentConfigName
+                : (typeof currentConfigName !== 'undefined' && currentConfigName ? currentConfigName : 'vpn_config');
+            dlFilename = fallbackName + '_qr.png';
+        } else if (!dlFilename.toLowerCase().endsWith('.png')) {
+            dlFilename += '.png';
+        }
+
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = dlFilename;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(function () {
+            if (a.parentNode) {
+                document.body.removeChild(a);
+            }
+        }, 100);
+    }
+
     function escapeHtml(str) {
         if (str === null || str === undefined) return '';
         return String(str)
@@ -438,6 +509,7 @@
         confirm: confirm,
         formatBytes: formatBytes,
         downloadFile: downloadFile,
+        downloadQRCode: downloadQRCode,
         escapeHtml: escapeHtml,
         escapeJs: escapeJs,
     };
