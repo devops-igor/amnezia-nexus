@@ -1,9 +1,9 @@
 {
   "metadata": {
     "repository": "amnezia-nexus",
-    "baseline_commit": "4aaa74c42d67305c7c8c108006755c12eb9b8ae7",
-    "reference_timestamp": "2026-10-22T11:28:56Z",
-    "reference_timestamp_epoch": 1792668536,
+    "baseline_commit": "3eea2b6fe0381d8dfe1ec693a9b12bacb1738e6f",
+    "reference_timestamp": "2026-10-22T09:42:52Z",
+    "reference_timestamp_epoch": 1792662172,
     "warning_threshold": 500,
     "ceiling_threshold": 1000,
     "churn_windows_days": [

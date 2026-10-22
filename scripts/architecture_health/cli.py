@@ -150,7 +150,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.warning(
             "Baseline file not found at %s. Run with --generate-baseline.", baseline_path
         )
-        return 0 if args.nonblocking else 1
+        return 1
 
     try:
         baseline_data = ah.load_baseline(baseline_path)

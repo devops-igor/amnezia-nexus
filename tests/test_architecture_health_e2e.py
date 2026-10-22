@@ -13,6 +13,12 @@ from scripts.architecture_health import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolate_github_step_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate GITHUB_STEP_SUMMARY environment variable in E2E tests."""
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+
 def _init_git_repo(path: Path) -> None:
     subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=path, check=True)
@@ -381,6 +387,48 @@ def test_e2e_nonblocking_operational_vs_advisory_exit_codes(tmp_path: Path) -> N
 
     # Operational error (corrupt baseline) returns 1 even with --nonblocking
     base_file.write_text("corrupted json", encoding="utf-8")
+    assert (
+        main(
+            [
+                "--repo-root",
+                str(repo),
+                "--baseline-file",
+                str(base_file),
+                "--check",
+                "--nonblocking",
+            ]
+        )
+        == 1
+    )
+
+    # Operational error (missing baseline) returns 1 even with --nonblocking
+    missing_file = repo / "nonexistent.json"
+    assert (
+        main(
+            [
+                "--repo-root",
+                str(repo),
+                "--baseline-file",
+                str(missing_file),
+                "--check",
+                "--nonblocking",
+            ]
+        )
+        == 1
+    )
+
+    # Operational error during scan (unknown commit) returns 1 even with --nonblocking
+    save_baseline(
+        base_file,
+        {
+            "metadata": {
+                "baseline_commit": "0000000000000000000000000000000000000000",
+                "reference_timestamp_epoch": 100000,
+            },
+            "ceilings": {"oversized.go": 1000},
+            "files": {"oversized.go": {"lines": 1000, "ceiling": 1000}},
+        },
+    )
     assert (
         main(
             [
