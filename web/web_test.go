@@ -591,3 +591,39 @@ func TestAPIClientCsrfTokenRecursionPrevention(t *testing.T) {
 		t.Errorf("js/api.js must safely export window.getCsrfToken")
 	}
 }
+
+func TestMyConnections_OfflineServerGuardrails(t *testing.T) {
+	templatesFS, err := GetTemplatesSubFS()
+	if err != nil {
+		t.Fatalf("GetTemplatesSubFS failed: %v", err)
+	}
+
+	myConnData, err := fs.ReadFile(templatesFS, "my_connections.html")
+	if err != nil {
+		t.Fatalf("failed to read my_connections.html: %v", err)
+	}
+	myConnStr := string(myConnData)
+
+	// 1. Assert template contains reachability disabled and status_offline tags in select
+	requiredSnippets := []string{
+		`{{ if not $srv.Reachable }}disabled{{ end }}`,
+		`{{ if not $srv.Reachable }} ({{ _ "status_offline" }}){{ end }}`,
+		`server.reachable === false`,
+		`submitBtn.disabled = true`,
+	}
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(myConnStr, snippet) {
+			t.Errorf("my_connections.html missing required offline guardrail %q", snippet)
+		}
+	}
+
+	// 2. Assert users.html contains (Offline) annotation in #ucServer
+	usersData, err := fs.ReadFile(templatesFS, "users.html")
+	if err != nil {
+		t.Fatalf("failed to read users.html: %v", err)
+	}
+	usersStr := string(usersData)
+	if !strings.Contains(usersStr, `(Offline)`) {
+		t.Errorf("users.html missing (Offline) annotation for offline servers")
+	}
+}

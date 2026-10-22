@@ -221,7 +221,9 @@
                     <option value="0" data-protocols='{"awg":{"installed":true}}' data-is-lb="true" selected>⚡ {{ _ "load_balancer_auto" }} ({{ _ "recommended" }})</option>
                     {{ end }}
                     {{ range $srv := .servers }}
-                    <option value="{{ $srv.ID }}" data-protocols="{{ $srv.Protocols | json }}">{{ $srv.Name }}</option>
+                    <option value="{{ $srv.ID }}" data-protocols="{{ $srv.Protocols | json }}" {{ if not $srv.Reachable }}disabled{{ end }}>
+                        {{ $srv.Name }}{{ if not $srv.Reachable }} ({{ _ "status_offline" }}){{ end }}
+                    </option>
                     {{ end }}
                 </select>
                 <div id="lbHighlightCallout" class="lb-selection-callout" style="display: {{ if .vpn_enabled }}flex{{ else }}none{{ end }};">
@@ -419,7 +421,12 @@
         if (lbOption) {
             serverSelect.value = '0';
         } else if (serverSelect.options.length > 1) {
-            serverSelect.selectedIndex = 1;
+            const firstEnabled = Array.from(serverSelect.options).find(opt => opt.value !== '' && !opt.disabled);
+            if (firstEnabled) {
+                serverSelect.value = firstEnabled.value;
+            } else {
+                serverSelect.selectedIndex = 1;
+            }
         }
         onServerSelected();
         UI.modal.close('configModal');
@@ -431,6 +438,7 @@
         const serverId = parseInt(serverSelect.value);
         const protoSelect = document.getElementById('createProtoSelect');
         const lbCallout = document.getElementById('lbHighlightCallout');
+        const submitBtn = document.getElementById('createConnSubmit');
 
         if (lbCallout) {
             lbCallout.style.display = serverSelect.value === '0' ? 'flex' : 'none';
@@ -440,10 +448,22 @@
 
         if (isNaN(serverId)) {
             document.getElementById('myAwgMimicryGroup').style.display = 'none';
+            if (submitBtn) submitBtn.disabled = false;
             return;
         }
 
         const selectedOpt = serverSelect.options[serverSelect.selectedIndex];
+        const server = availableServers.find(s => s.id === serverId);
+        const isOffline = (selectedOpt && selectedOpt.disabled) || (server && server.reachable === false);
+        if (isOffline) {
+            if (submitBtn) submitBtn.disabled = true;
+            document.getElementById('myAwgMimicryGroup').style.display = 'none';
+            UI.toast(_('server_offline_desc') || 'Server is currently unavailable or offline', 'warning');
+            return;
+        } else {
+            if (submitBtn) submitBtn.disabled = false;
+        }
+
         let protocols = null;
         if (selectedOpt && selectedOpt.dataset.protocols) {
             try {
@@ -451,7 +471,6 @@
             } catch (e) {}
         }
         if (!protocols) {
-            const server = availableServers.find(s => s.id === serverId);
             if (server && server.protocols) protocols = server.protocols;
         }
         if (!protocols) {
@@ -580,6 +599,13 @@
 
         if (isNaN(serverId) || !protocol) {
             UI.toast('Please select server and protocol', 'error');
+            return;
+        }
+
+        const selectedOpt = serverSelect.options[serverSelect.selectedIndex];
+        const server = availableServers.find(s => s.id === serverId);
+        if ((selectedOpt && selectedOpt.disabled) || (server && server.reachable === false)) {
+            UI.toast(_('server_offline_desc') || 'Server is currently unavailable or offline', 'error');
             return;
         }
 

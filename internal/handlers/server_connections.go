@@ -114,6 +114,10 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	if !h.checkServerReachable(w, ctx, server) {
+		return
+	}
+
 	protoMgr, err := h.GetProtocolManager(req.Protocol)
 	if err != nil {
 		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", err.Error())
@@ -126,21 +130,7 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	clientParams := map[string]any{
-		"name": req.Name,
-	}
-	if req.TelemtQuota != nil {
-		clientParams["telemt_quota"] = *req.TelemtQuota
-	}
-	if req.TelemtMaxIPs != nil {
-		clientParams["telemt_max_ips"] = *req.TelemtMaxIPs
-	}
-	if req.TelemtExpiry != nil {
-		clientParams["telemt_expiry"] = *req.TelemtExpiry
-	}
-	if req.AWGMimicry != nil {
-		clientParams["awg_mimicry"] = *req.AWGMimicry
-	}
+	clientParams := buildConnectionParams(req.Name, req.TelemtQuota, req.TelemtMaxIPs, req.TelemtExpiry, req.AWGMimicry)
 
 	result, err := protoMgr.AddClient(ctx, server, clientParams)
 	if err != nil {
@@ -149,10 +139,7 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	clientID, _ := result["client_id"].(string)
-	if clientID == "" {
-		clientID, _ = result["clientId"].(string)
-	}
+	clientID := resolveClientID(result)
 
 	configStr, _ := result["config"].(string)
 	if configStr == "" && clientID != "" {

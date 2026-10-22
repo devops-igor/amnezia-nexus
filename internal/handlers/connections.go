@@ -190,6 +190,10 @@ func (h *Handlers) UserAddConnectionHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	if !h.checkServerReachable(w, ctx, server) {
+		return
+	}
+
 	if h.hasDuplicateConnectionName(userConns, req.Name) {
 		h.JSON(w, http.StatusConflict, map[string]any{
 			"error":   "duplicate_name",
@@ -222,10 +226,7 @@ func (h *Handlers) UserAddConnectionHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	clientID, _ := result["client_id"].(string)
-	if clientID == "" {
-		clientID, _ = result["clientId"].(string)
-	}
+	clientID := resolveClientID(result)
 
 	configStr, _ := result["config"].(string)
 	if configStr == "" && clientID != "" {
