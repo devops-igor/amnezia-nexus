@@ -3,12 +3,14 @@
 import json
 from pathlib import Path
 import subprocess
+from typing import Any, Dict, Optional, Set, Tuple
 from unittest.mock import patch
 
 import pytest
 
 from scripts.architecture_health import (
     calculate_risk_metrics,
+    detect_renames,
     find_repo_root,
     generate_baseline,
     rebase_ceilings,
@@ -437,8 +439,46 @@ def test_scan_repository_newly_added_files_sorting_and_normal_ceiling(tmp_path: 
         assert violations[0]["excess_lines"] == 200
 
 
+def check_baseline_invariants(
+    data: Dict[str, Any],
+    repo_root: Path,
+    tracked_at_commit: Optional[Set[str]] = None,
+) -> Tuple[Set[str], Set[str]]:
+    """Check baseline invariant rules against baseline_commit, renames, and reviewed increases.
+
+    Returns (stray_ceilings, stray_files).
+    """
+    metadata = data.get("metadata", {})
+    baseline_commit = str(metadata.get("baseline_commit", ""))
+    if tracked_at_commit is None:
+        proc = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", baseline_commit],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        tracked_at_commit = set(proc.stdout.splitlines())
+
+    ceilings: Dict[str, int] = data.get("ceilings", {})  # type: ignore[assignment]
+    files: Dict[str, Any] = data.get("files", {})  # type: ignore[assignment]
+
+    renamed_targets = set(detect_renames(repo_root, baseline_commit).keys())
+    default_ceiling: int = data.get("metadata", {}).get("ceiling_threshold", 1000)
+    allowed = tracked_at_commit | renamed_targets
+
+    stray_ceilings = {
+        k for k in ceilings if k not in allowed and ceilings.get(k, 0) <= default_ceiling
+    }
+    stray_files = {k for k in files if k not in allowed and ceilings.get(k, 0) <= default_ceiling}
+    return stray_ceilings, stray_files
+
+
 def test_architecture_baseline_files_exist_at_baseline_commit() -> None:
-    """Verify every file in scripts/architecture_baseline.json exists in git at baseline_commit."""
+    """Verify every file in scripts/architecture_baseline.json exists in git at baseline_commit,
+
+    is a rename target, or has a reviewed ceiling increase.
+    """
     repo_root = find_repo_root()
     baseline_path = repo_root / "scripts" / "architecture_baseline.json"
     assert baseline_path.exists(), f"Baseline file missing at {baseline_path}"
@@ -447,22 +487,92 @@ def test_architecture_baseline_files_exist_at_baseline_commit() -> None:
         data = json.load(f)
 
     baseline_commit = data["metadata"]["baseline_commit"]
-    proc = subprocess.run(
-        ["git", "ls-tree", "-r", "--name-only", baseline_commit],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    tracked_at_commit = set(proc.stdout.splitlines())
-
-    ceilings = data.get("ceilings", {})
-    files = data.get("files", {})
-
-    missing_ceilings = set(ceilings.keys()) - tracked_at_commit
-    missing_files = set(files.keys()) - tracked_at_commit
+    stray_ceilings, stray_files = check_baseline_invariants(data, repo_root)
 
     assert (
-        not missing_ceilings
-    ), f"Ceiling files not tracked at {baseline_commit}: {missing_ceilings}"
-    assert not missing_files, f"Files map entries not tracked at {baseline_commit}: {missing_files}"
+        not stray_ceilings
+    ), f"Unreviewed baseline ceilings not tracked at {baseline_commit}: {stray_ceilings}"
+    assert (
+        not stray_files
+    ), f"Unreviewed baseline files map entries not tracked at {baseline_commit}: {stray_files}"
+
+
+def test_check_baseline_invariants_tolerates_renames_and_reviewed_increases() -> None:
+    """Verify check_baseline_invariants permits tracked files, rename targets, and reviewed increases."""
+    repo_root = Path("/fake/repo")
+    data: Dict[str, Any] = {
+        "metadata": {
+            "baseline_commit": "baseline_sha",
+            "ceiling_threshold": 1000,
+        },
+        "ceilings": {
+            "tracked.go": 1000,
+            "renamed_target.go": 1500,
+            "reviewed_increase.go": 1200,
+        },
+        "files": {
+            "tracked.go": {"lines": 800, "ceiling": 1000},
+            "renamed_target.go": {"lines": 1400, "ceiling": 1500},
+            "reviewed_increase.go": {"lines": 1150, "ceiling": 1200},
+        },
+    }
+    tracked_at_commit = {"tracked.go", "old_source.go"}
+
+    with patch(
+        "tests.test_architecture_health_policy.detect_renames",
+        return_value={"renamed_target.go": "old_source.go"},
+    ):
+        stray_ceilings, stray_files = check_baseline_invariants(
+            data, repo_root, tracked_at_commit=tracked_at_commit
+        )
+
+    assert not stray_ceilings
+    assert not stray_files
+
+
+def test_check_baseline_invariants_flags_unreviewed_new_files() -> None:
+    """Verify check_baseline_invariants flags unreviewed files with ceiling <= 1000 not tracked at baseline."""
+    repo_root = Path("/fake/repo")
+    data: Dict[str, Any] = {
+        "metadata": {
+            "baseline_commit": "baseline_sha",
+            "ceiling_threshold": 1000,
+        },
+        "ceilings": {
+            "tracked.go": 1000,
+            "unreviewed_branch_tool.py": 1000,
+            "another_small.py": 500,
+        },
+        "files": {
+            "tracked.go": {"lines": 500, "ceiling": 1000},
+            "unreviewed_branch_tool.py": {"lines": 80, "ceiling": 1000},
+            "another_small.py": {"lines": 200, "ceiling": 500},
+        },
+    }
+    tracked_at_commit = {"tracked.go"}
+
+    with patch(
+        "tests.test_architecture_health_policy.detect_renames",
+        return_value={},
+    ):
+        stray_ceilings, stray_files = check_baseline_invariants(
+            data, repo_root, tracked_at_commit=tracked_at_commit
+        )
+
+    assert stray_ceilings == {"unreviewed_branch_tool.py", "another_small.py"}
+    assert stray_files == {"unreviewed_branch_tool.py", "another_small.py"}
+
+
+def test_architecture_baseline_fails_on_branch_local_tool() -> None:
+    """Verify that injecting an unreviewed branch-local tool into real baseline fails invariant test."""
+    repo_root = find_repo_root()
+    baseline_path = repo_root / "scripts" / "architecture_baseline.json"
+    with open(baseline_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    data["ceilings"]["scripts/architecture_health.py"] = 1000
+    data["files"]["scripts/architecture_health.py"] = {"lines": 89, "ceiling": 1000}
+
+    stray_ceilings, stray_files = check_baseline_invariants(data, repo_root)
+    assert "scripts/architecture_health.py" in stray_ceilings
+    assert "scripts/architecture_health.py" in stray_files

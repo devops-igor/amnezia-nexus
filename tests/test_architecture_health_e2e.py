@@ -595,3 +595,93 @@ def test_e2e_cli_fail_closed_on_empty_or_incomplete_baseline(tmp_path: Path) -> 
         ]
     )
     assert rc_incomplete == 1
+
+
+def test_e2e_renamed_grandfathered_file_satisfies_invariant_after_ratchet(tmp_path: Path) -> None:
+    """Verify that a renamed grandfathered file after --ratchet satisfies baseline invariants."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    # 1. Create grandfathered file with 1500 lines (> 1000 ceiling threshold)
+    content = "\n".join(f"func BigFunc{i}() {{}}" for i in range(1500)) + "\n"
+    (repo / "grandfathered.go").write_text(content, encoding="utf-8")
+    subprocess.run(["git", "add", "grandfathered.go"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init baseline commit"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    base_file = repo / "scripts" / "architecture_baseline.json"
+    base_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # 2. Generate initial baseline at commit B
+    assert (
+        main(
+            [
+                "--repo-root",
+                str(repo),
+                "--baseline-file",
+                str(base_file),
+                "--generate-baseline",
+            ]
+        )
+        == 0
+    )
+
+    data_initial = json.loads(base_file.read_text(encoding="utf-8"))
+    initial_commit = data_initial["metadata"]["baseline_commit"]
+    assert "grandfathered.go" in data_initial["ceilings"]
+    assert data_initial["ceilings"]["grandfathered.go"] == 1500
+
+    # 3. Rename grandfathered file and commit the rename
+    subprocess.run(["git", "mv", "grandfathered.go", "renamed_service.go"], cwd=repo, check=True)
+    content_reduced = "\n".join(f"func BigFunc{i}() {{}}" for i in range(1450)) + "\n"
+    (repo / "renamed_service.go").write_text(content_reduced, encoding="utf-8")
+    subprocess.run(["git", "add", "renamed_service.go"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "rename grandfathered file and reduce lines"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # 4. Run --ratchet to update ceiling for renamed path
+    assert (
+        main(
+            [
+                "--repo-root",
+                str(repo),
+                "--baseline-file",
+                str(base_file),
+                "--ratchet",
+            ]
+        )
+        == 0
+    )
+
+    data_ratcheted = json.loads(base_file.read_text(encoding="utf-8"))
+
+    # Confirm baseline_commit remained at initial_commit B
+    assert data_ratcheted["metadata"]["baseline_commit"] == initial_commit
+    assert "renamed_service.go" in data_ratcheted["ceilings"]
+    assert data_ratcheted["ceilings"]["renamed_service.go"] == 1450
+    assert "grandfathered.go" not in data_ratcheted["ceilings"]
+
+    # 5. Invariant check MUST pass on the ratcheted baseline
+    from tests.test_architecture_health_policy import check_baseline_invariants
+
+    stray_ceilings, stray_files = check_baseline_invariants(data_ratcheted, repo)
+    assert not stray_ceilings
+    assert not stray_files
+
+    # 6. Verify an unreviewed new file (ceiling <= 1000) added to baseline is caught
+    corrupt_data = json.loads(json.dumps(data_ratcheted))
+    corrupt_data["ceilings"]["unreviewed_branch_tool.py"] = 1000
+    corrupt_data["files"]["unreviewed_branch_tool.py"] = {"lines": 50, "ceiling": 1000}
+
+    stray_c, stray_f = check_baseline_invariants(corrupt_data, repo)
+    assert "unreviewed_branch_tool.py" in stray_c
+    assert "unreviewed_branch_tool.py" in stray_f
