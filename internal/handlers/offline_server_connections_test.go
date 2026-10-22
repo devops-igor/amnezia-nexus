@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -368,4 +369,123 @@ func TestRenderTemplate_OfflineServerVisualGuardrails(t *testing.T) {
 			t.Errorf("expected users.html to render 'Beta Offline (198.51.100.2) (Offline)', got body: %s", body)
 		}
 	})
+}
+
+func TestMyConnectionsPageHandler_ReachabilityStates(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+
+	srv := &models.Server{
+		Name:      "Reachability-Node",
+		Host:      "198.51.100.20",
+		SSHPort:   22,
+		SSHUser:   "root",
+		SSHPass:   "secret",
+		Protocols: map[string]any{"awg": map[string]any{"port": 55424, "installed": true}},
+		CreatedAt: time.Now(),
+	}
+	sID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	u := &models.User{
+		ID:           "u-reachability-1",
+		Username:     "reachabilityuser",
+		PasswordHash: "hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	}
+	if _, err := db.CreateUser(ctx, u); err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	sess := &models.SessionData{
+		UserID:   u.ID,
+		Username: u.Username,
+		Role:     models.RoleUser,
+	}
+
+	tests := []struct {
+		name           string
+		status         models.ReachabilityStatus
+		updateStatus   bool
+		wantDisabled   bool
+		wantOfflineTag bool
+	}{
+		{
+			name:           "ReachabilityUnknown (no probe history)",
+			status:         models.ReachabilityUnknown,
+			updateStatus:   false,
+			wantDisabled:   false,
+			wantOfflineTag: false,
+		},
+		{
+			name:           "ReachabilityOffline",
+			status:         models.ReachabilityOffline,
+			updateStatus:   true,
+			wantDisabled:   true,
+			wantOfflineTag: true,
+		},
+		{
+			name:           "ReachabilityOnline",
+			status:         models.ReachabilityOnline,
+			updateStatus:   true,
+			wantDisabled:   false,
+			wantOfflineTag: false,
+		},
+		{
+			name:           "ReachabilityUnknown (explicit)",
+			status:         models.ReachabilityUnknown,
+			updateStatus:   true,
+			wantDisabled:   false,
+			wantOfflineTag: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.updateStatus {
+				if err := db.UpdateServerReachability(ctx, sID, tc.status); err != nil {
+					t.Fatalf("UpdateServerReachability failed: %v", err)
+				}
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "/my", nil)
+			reqCtx := middleware.WithSession(req.Context(), sess)
+			w := httptest.NewRecorder()
+
+			h.MyConnectionsPageHandler(w, req.WithContext(reqCtx))
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected HTTP 200 OK, got %d", w.Code)
+			}
+
+			body := w.Body.String()
+			selectRegex := regexp.MustCompile(`(?s)<select[^>]*id="createServerSelect"[^>]*>(.*?)</select>`)
+			selectMatches := selectRegex.FindStringSubmatch(body)
+			if len(selectMatches) < 2 {
+				t.Fatalf("could not find #createServerSelect in rendered HTML")
+			}
+			selectHTML := selectMatches[1]
+
+			optionRegex := regexp.MustCompile(fmt.Sprintf(`(?s)<option value="%d"[^>]*>.*?</option>`, sID))
+			option := optionRegex.FindString(selectHTML)
+			if option == "" {
+				t.Fatalf("missing option for server %d in #createServerSelect: %s", sID, selectHTML)
+			}
+
+			openTag := strings.SplitN(option, ">", 2)[0]
+			hasDisabled := strings.Contains(openTag, "disabled")
+			if hasDisabled != tc.wantDisabled {
+				t.Errorf("state %s: option disabled=%v, want %v (option: %s)", tc.status, hasDisabled, tc.wantDisabled, option)
+			}
+
+			hasOfflineTag := strings.Contains(option, "(Offline)")
+			if hasOfflineTag != tc.wantOfflineTag {
+				t.Errorf("state %s: option contains '(Offline)'=%v, want %v (option: %s)", tc.status, hasOfflineTag, tc.wantOfflineTag, option)
+			}
+		})
+	}
 }
