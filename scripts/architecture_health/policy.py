@@ -142,6 +142,7 @@ def scan_repository(
     ceiling_violations: List[Dict[str, Any]] = []
     ratchet_opportunities: List[Dict[str, Any]] = []
     growing_files: List[Dict[str, Any]] = []
+    newly_added_files: List[Dict[str, Any]] = []
 
     for rel_path in tracked_files:
         if ah.is_excluded(rel_path):
@@ -184,7 +185,16 @@ def scan_repository(
         b_lines = b_entry.get("lines") if isinstance(b_entry, dict) else None
         line_delta = (line_count - b_lines) if b_lines is not None else None
 
-        if line_delta is not None and line_delta > 0 and not gen:
+        if b_lines is None:
+            newly_added_files.append(
+                {
+                    "path": rel_path,
+                    "lines": line_count,
+                    "bytes": byte_size,
+                    "component": component,
+                }
+            )
+        elif line_delta is not None and line_delta > 0 and not gen:
             growing_files.append(
                 {
                     "path": rel_path,
@@ -230,6 +240,7 @@ def scan_repository(
     ceiling_violations.sort(key=lambda x: x["excess_lines"], reverse=True)
     ratchet_opportunities.sort(key=lambda x: x["reduction"], reverse=True)
     growing_files.sort(key=lambda x: x["line_delta"], reverse=True)
+    newly_added_files.sort(key=lambda x: (-x["lines"], x["path"]))
 
     tier_counts = {
         t: sum(1 for f in files_data if f["risk_tier"] == t)
@@ -280,6 +291,8 @@ def scan_repository(
         "ratchet_opportunities_count": len(ratchet_opportunities),
         "tier_counts": tier_counts,
         "component_stats": component_stats,
+        "newly_added_files": newly_added_files,
+        "newly_added_files_count": len(newly_added_files),
         "top_growing_files": growing_files[:20],
         "top_go_functions": top_go_functions,
     }

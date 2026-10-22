@@ -39,7 +39,11 @@ from scripts.architecture_health.render import (
     generate_json_report,
     generate_markdown_summary,
 )
-from scripts.architecture_health.storage import load_baseline, save_baseline
+from scripts.architecture_health.storage import (
+    load_baseline,
+    save_baseline,
+    validate_baseline,
+)
 
 __all__ = [
     "BINARY_EXTENSIONS",
@@ -72,6 +76,7 @@ __all__ = [
     "generate_markdown_summary",
     "load_baseline",
     "save_baseline",
+    "validate_baseline",
     "main",
     "Path",
 ]

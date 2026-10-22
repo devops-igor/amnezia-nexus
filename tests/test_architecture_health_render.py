@@ -43,6 +43,14 @@ def test_generate_json_report_schema_and_zero_leak() -> None:
                 "line_delta": 200,
             }
         ],
+        "newly_added_files": [
+            {
+                "path": "scripts/new_tool.py",
+                "lines": 50,
+                "bytes": 1200,
+                "component": "Scripts & Tooling",
+            }
+        ],
         "top_go_functions": [
             {
                 "file": "internal/vpn/vpn.go",
@@ -133,6 +141,9 @@ def test_generate_json_report_schema_and_zero_leak() -> None:
     assert len(data["top_hotspots"]) == 1
     assert len(data["generated_vendor_files"]) == 1
     assert len(data["top_growing_files"]) == 1
+    assert len(data["newly_added_files"]) == 1
+    assert data["newly_added_files"][0]["path"] == "scripts/new_tool.py"
+    assert data["summary"]["newly_added_files_count"] == 1
     assert len(data["top_go_functions"]) == 1
 
     # Security: Verify zero leaks of absolute home paths, Windows mounts, or RFC 1918 IPs
@@ -177,6 +188,14 @@ def test_generate_markdown_summary() -> None:
                 "current_lines": 1200,
                 "baseline_lines": 1000,
                 "line_delta": 200,
+            }
+        ],
+        "newly_added_files": [
+            {
+                "path": "scripts/new_tool.py",
+                "lines": 50,
+                "bytes": 1200,
+                "component": "Scripts & Tooling",
             }
         ],
         "top_go_functions": [
@@ -245,6 +264,8 @@ def test_generate_markdown_summary() -> None:
     assert "### ❌ Ceiling Violations" in md
     assert "### 📉 Downward Ratchet Opportunities" in md
     assert "### 📈 Top Growing Files" in md
+    assert "Newly Added Files" in md
+    assert "scripts/new_tool.py" in md
     assert "### 🔍 Top Go Functions by Line Count" in md
     assert "### 🔥 Top 20 Hotspots (Risk & Churn)" in md
     assert "### 🤖 Generated & Vendor Assets" in md

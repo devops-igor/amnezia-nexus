@@ -10,6 +10,7 @@ from scripts.architecture_health import (
     load_baseline,
     main,
     save_baseline,
+    validate_baseline,
 )
 
 
@@ -106,6 +107,7 @@ def test_e2e_git_mv_and_new_file_at_old_path(tmp_path: Path) -> None:
     )
 
     report_path = repo / "report.json"
+    summary_path = repo / "summary.md"
     # Check should FAIL because new big.go exceeds the 1000 default ceiling
     rc = main(
         [
@@ -115,6 +117,8 @@ def test_e2e_git_mv_and_new_file_at_old_path(tmp_path: Path) -> None:
             str(base_file),
             "--report-json",
             str(report_path),
+            "--summary-md",
+            str(summary_path),
             "--check",
         ]
     )
@@ -127,6 +131,14 @@ def test_e2e_git_mv_and_new_file_at_old_path(tmp_path: Path) -> None:
     assert viols[0]["path"] == "big.go"
     assert viols[0]["ceiling"] == 1000
     assert viols[0]["excess_lines"] == 400
+
+    # Newly added file reporting in JSON and Markdown
+    assert "newly_added_files" in report
+    assert any(f["path"] == "big.go" for f in report["newly_added_files"])
+    assert report["summary"]["newly_added_files_count"] >= 1
+    md_summary = summary_path.read_text(encoding="utf-8")
+    assert "Newly Added Files" in md_summary
+    assert "big.go" in md_summary
 
 
 def test_e2e_decomposition_mv_and_rewrite(tmp_path: Path) -> None:
@@ -447,7 +459,13 @@ def test_e2e_nonblocking_operational_vs_advisory_exit_codes(tmp_path: Path) -> N
 def test_baseline_save_and_load(tmp_path: Path) -> None:
     """Verify save_baseline and load_baseline persistence fidelity."""
     p = tmp_path / "nested" / "dir" / "baseline.json"
-    data = {"metadata": {"repository": "amnezia-nexus"}, "ceilings": {"a.go": 1000}}
+    data = {
+        "metadata": {
+            "repository": "amnezia-nexus",
+            "baseline_commit": "3eea2b6fe0381d8dfe1ec693a9b12bacb1738e6f",
+        },
+        "ceilings": {"a.go": 1000},
+    }
     save_baseline(p, data)
     assert p.exists()
     loaded = load_baseline(p)
@@ -455,3 +473,125 @@ def test_baseline_save_and_load(tmp_path: Path) -> None:
 
     with pytest.raises(FileNotFoundError):
         load_baseline(tmp_path / "nonexistent.json")
+
+
+def test_validate_baseline_structural_completeness(tmp_path: Path) -> None:
+    """Verify structural completeness validation on baseline load."""
+    # Empty baseline object
+    with pytest.raises(ValueError, match="Baseline data is empty"):
+        validate_baseline({})
+
+    # None or non-dict
+    with pytest.raises(ValueError, match="Baseline data is empty"):
+        validate_baseline(None)
+
+    # Missing metadata
+    with pytest.raises(ValueError, match="missing or has empty 'metadata'"):
+        validate_baseline({"ceilings": {"a.go": 1000}})
+
+    # Empty metadata dict
+    with pytest.raises(ValueError, match="missing or has empty 'metadata'"):
+        validate_baseline({"metadata": {}, "ceilings": {"a.go": 1000}})
+
+    # Missing baseline_commit
+    with pytest.raises(ValueError, match="missing a valid 'baseline_commit'"):
+        validate_baseline({"metadata": {"repository": "amnezia-nexus"}, "ceilings": {"a.go": 1000}})
+
+    # Whitespace baseline_commit
+    with pytest.raises(ValueError, match="missing a valid 'baseline_commit'"):
+        validate_baseline({"metadata": {"baseline_commit": "   "}, "ceilings": {"a.go": 1000}})
+
+    # Missing ceilings
+    with pytest.raises(ValueError, match="missing or has empty 'ceilings'"):
+        validate_baseline({"metadata": {"baseline_commit": "3eea2b6fe0"}})
+
+    # Empty ceilings dict
+    with pytest.raises(ValueError, match="missing or has empty 'ceilings'"):
+        validate_baseline({"metadata": {"baseline_commit": "3eea2b6fe0"}, "ceilings": {}})
+
+    # Valid baseline structure
+    valid = {
+        "metadata": {"baseline_commit": "3eea2b6fe0381d8dfe1ec693a9b12bacb1738e6f"},
+        "ceilings": {"a.go": 1000},
+    }
+    validate_baseline(valid)
+
+    # File-level load_baseline failure on empty object
+    empty_file = tmp_path / "empty_baseline.json"
+    empty_file.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="Baseline data is empty"):
+        load_baseline(empty_file)
+
+
+def test_e2e_cli_fail_closed_on_empty_or_incomplete_baseline(tmp_path: Path) -> None:
+    """Verify CLI fails closed with exit code 1 on empty or incomplete baseline."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    (repo / "main.go").write_text("\n" * 100, encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    base_file = repo / "baseline.json"
+
+    # 1. Baseline is literally {}
+    base_file.write_text("{}", encoding="utf-8")
+
+    # --check blocking must exit 1
+    rc_check = main(["--repo-root", str(repo), "--baseline-file", str(base_file), "--check"])
+    assert rc_check == 1
+
+    # --check nonblocking must exit 1 (fails closed)
+    rc_check_nb = main(
+        [
+            "--repo-root",
+            str(repo),
+            "--baseline-file",
+            str(base_file),
+            "--check",
+            "--nonblocking",
+        ]
+    )
+    assert rc_check_nb == 1
+
+    # --generate-baseline without --allow-ceiling-increase must exit 1
+    rc_gen = main(
+        ["--repo-root", str(repo), "--baseline-file", str(base_file), "--generate-baseline"]
+    )
+    assert rc_gen == 1
+
+    # --generate-baseline with --allow-ceiling-increase succeeds and creates valid baseline
+    rc_gen_allowed = main(
+        [
+            "--repo-root",
+            str(repo),
+            "--baseline-file",
+            str(base_file),
+            "--generate-baseline",
+            "--allow-ceiling-increase",
+        ]
+    )
+    assert rc_gen_allowed == 0
+    assert base_file.exists()
+    loaded = load_baseline(base_file)
+    assert "metadata" in loaded
+    assert "baseline_commit" in loaded["metadata"]
+    assert "ceilings" in loaded
+
+    # 2. Baseline is incomplete: {"metadata": {"baseline_commit": ""}, "ceilings": {}}
+    base_file.write_text(
+        json.dumps({"metadata": {"baseline_commit": ""}, "ceilings": {}}),
+        encoding="utf-8",
+    )
+    rc_incomplete = main(
+        [
+            "--repo-root",
+            str(repo),
+            "--baseline-file",
+            str(base_file),
+            "--check",
+            "--nonblocking",
+        ]
+    )
+    assert rc_incomplete == 1

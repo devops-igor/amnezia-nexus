@@ -13,7 +13,6 @@
   },
   "ceilings": {
     ".flake8": 1000,
-    ".github/workflows/architecture-health.yml": 1000,
     ".github/workflows/ci.yml": 1000,
     ".github/workflows/css-differential.yml": 1000,
     ".github/workflows/differential-soak.yml": 1000,
@@ -504,7 +503,6 @@
     "internal/vpn/vpn_test.go": 1000,
     "pyproject.toml": 1000,
     "scripts/DIFFERENTIAL_SUITE_RUNBOOK.md": 1000,
-    "scripts/architecture_health.py": 1000,
     "scripts/build_style_bundle.sh": 1000,
     "scripts/generate_captcha_assets.py": 1000,
     "scripts/run_differential_qualification.sh": 1000,
@@ -532,7 +530,6 @@
     "tests/e2e/test_traffic.py": 1000,
     "tests/e2e/test_users.py": 1000,
     "tests/e2e/test_vpn_diagnostics.py": 1000,
-    "tests/test_architecture_health.py": 1000,
     "tests/test_vpn_diagnostics_oracle.py": 1000,
     "useful_notes/HOW_IT_WORKS.md": 1000,
     "web/qr_download_test.go": 1000,
@@ -609,15 +606,6 @@
       "language": "Other",
       "churn_30d": 0,
       "churn_90d": 1
-    },
-    ".github/workflows/architecture-health.yml": {
-      "lines": 49,
-      "ceiling": 1000,
-      "bytes": 1245,
-      "component": "Other",
-      "language": "YAML",
-      "churn_30d": 2,
-      "churn_90d": 2
     },
     ".github/workflows/ci.yml": {
       "lines": 126,
@@ -5029,15 +5017,6 @@
       "churn_30d": 13,
       "churn_90d": 13
     },
-    "scripts/architecture_health.py": {
-      "lines": 89,
-      "ceiling": 1000,
-      "bytes": 2278,
-      "component": "Scripts & Tooling",
-      "language": "Python",
-      "churn_30d": 2,
-      "churn_90d": 2
-    },
     "scripts/build_style_bundle.sh": {
       "lines": 41,
       "ceiling": 1000,
@@ -5280,15 +5259,6 @@
       "language": "Python",
       "churn_30d": 19,
       "churn_90d": 19
-    },
-    "tests/test_architecture_health.py": {
-      "lines": 964,
-      "ceiling": 1000,
-      "bytes": 34314,
-      "component": "Test Suites",
-      "language": "Python",
-      "churn_30d": 2,
-      "churn_90d": 2
     },
     "tests/test_vpn_diagnostics_oracle.py": {
       "lines": 532,

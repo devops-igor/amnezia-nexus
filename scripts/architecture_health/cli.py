@@ -154,6 +154,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         baseline_data = ah.load_baseline(baseline_path)
+        ah.validate_baseline(baseline_data)
     except Exception as exc:
         logger.error("Failed to load baseline file %s: %s", baseline_path, exc)
         return 1

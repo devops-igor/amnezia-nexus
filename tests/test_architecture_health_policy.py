@@ -1,12 +1,15 @@
 """Unit tests for architecture health policies, ceiling evaluations, and ratchets."""
 
+import json
 from pathlib import Path
+import subprocess
 from unittest.mock import patch
 
 import pytest
 
 from scripts.architecture_health import (
     calculate_risk_metrics,
+    find_repo_root,
     generate_baseline,
     rebase_ceilings,
     rebase_churn,
@@ -324,6 +327,16 @@ def test_scan_repository_line_delta_and_growing_files(tmp_path: Path) -> None:
         assert top_growing[0]["path"] == "growing.go"
         assert top_growing[0]["line_delta"] == 100
 
+        # Newly added files verification
+        assert "newly_added_files" in summary
+        newly_added = summary["newly_added_files"]
+        assert len(newly_added) == 1
+        assert newly_added[0]["path"] == "new.go"
+        assert newly_added[0]["lines"] == 80
+        assert newly_added[0]["bytes"] == 80
+        assert newly_added[0]["component"] == "Other"
+        assert summary["newly_added_files_count"] == 1
+
 
 def test_generate_baseline_upward_ratchet_refusal(tmp_path: Path) -> None:
     """Verify generate_baseline rejects increases on existing baseline without review flag."""
@@ -383,3 +396,73 @@ def test_generate_baseline_carries_renames(tmp_path: Path) -> None:
         )
         assert baseline["ceilings"]["moved.go"] == 1500
         assert "old.go" not in baseline["ceilings"]
+
+
+def test_scan_repository_newly_added_files_sorting_and_normal_ceiling(tmp_path: Path) -> None:
+    """Verify newly added files are sorted by lines descending and receive normal ceiling check."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    # Small new file (under ceiling)
+    (repo_root / "small.go").write_text("\n" * 50, encoding="utf-8")
+    # Medium new file (under ceiling)
+    (repo_root / "medium.go").write_text("\n" * 300, encoding="utf-8")
+    # Huge new file (exceeds default 1000 ceiling -> violation)
+    (repo_root / "huge.go").write_text("\n" * 1200, encoding="utf-8")
+
+    mock_tracked = ["small.go", "medium.go", "huge.go"]
+    # Empty baseline files/ceilings -> all 3 are newly added
+    with patch("scripts.architecture_health.get_tracked_files", return_value=mock_tracked):
+        files_data, summary, violations, _ = scan_repository(
+            repo_root=repo_root,
+            baseline_ceilings={},
+            baseline_files={},
+            ceiling_lines=1000,
+            warning_lines=500,
+        )
+
+        # Newly added files should be sorted by lines descending
+        newly_added = summary["newly_added_files"]
+        assert len(newly_added) == 3
+        assert [f["path"] for f in newly_added] == ["huge.go", "medium.go", "small.go"]
+        assert newly_added[0]["lines"] == 1200
+        assert newly_added[1]["lines"] == 300
+        assert newly_added[2]["lines"] == 50
+
+        # Newly added huge.go must still receive normal ceiling check (1200 > 1000)
+        assert len(violations) == 1
+        assert violations[0]["path"] == "huge.go"
+        assert violations[0]["lines"] == 1200
+        assert violations[0]["ceiling"] == 1000
+        assert violations[0]["excess_lines"] == 200
+
+
+def test_architecture_baseline_files_exist_at_baseline_commit() -> None:
+    """Verify every file in scripts/architecture_baseline.json exists in git at baseline_commit."""
+    repo_root = find_repo_root()
+    baseline_path = repo_root / "scripts" / "architecture_baseline.json"
+    assert baseline_path.exists(), f"Baseline file missing at {baseline_path}"
+
+    with open(baseline_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    baseline_commit = data["metadata"]["baseline_commit"]
+    proc = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", baseline_commit],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tracked_at_commit = set(proc.stdout.splitlines())
+
+    ceilings = data.get("ceilings", {})
+    files = data.get("files", {})
+
+    missing_ceilings = set(ceilings.keys()) - tracked_at_commit
+    missing_files = set(files.keys()) - tracked_at_commit
+
+    assert (
+        not missing_ceilings
+    ), f"Ceiling files not tracked at {baseline_commit}: {missing_ceilings}"
+    assert not missing_files, f"Files map entries not tracked at {baseline_commit}: {missing_files}"

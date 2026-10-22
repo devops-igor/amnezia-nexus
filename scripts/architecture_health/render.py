@@ -20,6 +20,7 @@ def generate_json_report(
     developer_hotspots = [f for f in files_data if not f.get("is_generated")][:top_limit]
     generated_files = [f for f in files_data if f.get("is_generated")]
     top_growing = summary.get("top_growing_files", [])
+    newly_added = summary.get("newly_added_files", [])
     top_go_funcs = summary.get("top_go_functions", [])
 
     report = {
@@ -42,6 +43,7 @@ def generate_json_report(
             "warning_count": summary["warning_count"],
             "grandfathered_count": summary.get("grandfathered_count", 0),
             "ratchet_opportunities_count": summary["ratchet_opportunities_count"],
+            "newly_added_files_count": summary.get("newly_added_files_count", len(newly_added)),
             "tier_counts": summary["tier_counts"],
             "component_stats": summary["component_stats"],
         },
@@ -49,6 +51,7 @@ def generate_json_report(
         "ratchet_opportunities": ratchet_opportunities,
         "top_hotspots": developer_hotspots,
         "generated_vendor_files": generated_files,
+        "newly_added_files": newly_added,
         "top_growing_files": top_growing,
         "top_go_functions": top_go_funcs,
     }
@@ -68,6 +71,8 @@ def generate_markdown_summary(
     meta = baseline_metadata or {}
     viol_count = summary["ceiling_violations_count"]
     ratchet_count = summary["ratchet_opportunities_count"]
+    newly_added = summary.get("newly_added_files", [])
+    newly_added_count = summary.get("newly_added_files_count", len(newly_added))
 
     if viol_count:
         callout = (
@@ -104,6 +109,7 @@ def generate_markdown_summary(
         [
             f"| **Warning Threshold ({summary['warning_lines']:,}-{summary['ceiling_lines']-1:,} lines)** | **{summary['warning_count']}** | ⚠️ Advisory |",
             f"| **Downward Ratchet Opportunities** | **{ratchet_count}** | {'📉 Ratchet Pending' if ratchet_count else '✅ Synchronized'} |",
+            f"| **Newly Added Files** | **{newly_added_count}** | ℹ️ Tracked |",
         ]
     )
     lines.append(
@@ -155,6 +161,23 @@ def generate_markdown_summary(
         lines.extend(
             f"| `{g['path']}` | {g['component']} | {g['current_lines']:,} | {g['baseline_lines']:,} | +{g['line_delta']:,} |"
             for g in top_growing[:15]
+        )
+        lines.append("")
+
+    if newly_added:
+        lines.extend(
+            [
+                f"### 🆕 Newly Added Files ({len(newly_added)})",
+                "",
+                f"Total newly added files since baseline: **{len(newly_added)}**",
+                "",
+                "| File Path | Component | Lines | Bytes |",
+                "|---|---|---:|---:|",
+            ]
+        )
+        lines.extend(
+            f"| `{nf['path']}` | {nf['component']} | {nf['lines']:,} | {nf['bytes']:,} |"
+            for nf in newly_added[:top_limit]
         )
         lines.append("")
 
