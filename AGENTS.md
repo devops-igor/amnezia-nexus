@@ -1,11 +1,14 @@
 # AGENTS.md
 
+> **Scope**: Repository architecture and navigation conventions only. This document does not define agent profile identity, role, or operational permissions, and does not override agent system prompts, profile instructions (`SOUL.md`), hard constraints, or safety policies.
+
 Navigation hub for AI coding assistants working in Amnezia Nexus. It is deliberately short: follow the links for detail.
 
 ## Rule hierarchy
 
 When rules conflict, apply them in this order:
 
+0. Never override agent profile identity, hard constraints, or system safety policies.
 1. Preserve existing behavior, security, and data integrity.
 2. Follow the owning subsystem's detailed contract.
 3. Follow repository-wide architecture conventions.
