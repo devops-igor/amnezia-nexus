@@ -283,7 +283,7 @@
                 <label class="form-label" for="ucServer">{{ _ "server_label" }}</label>
                 <select class="form-select" id="ucServer">
                     {{ range $idx, $s := .servers }}
-                    <option value="{{ $idx }}">{{ $s.Name }} ({{ $s.Host }})</option>
+                    <option value="{{ $idx }}">{{ $s.Name }} ({{ $s.Host }}){{ if eq (str $s.Status) "offline" }} (Offline){{ end }}</option>
                     {{ end }}
                 </select>
             </div>

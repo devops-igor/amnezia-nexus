@@ -161,6 +161,11 @@ type Server struct {
 	ServerInfo map[string]any     `json:"server_info,omitempty"`
 }
 
+// Reachable returns true if the server status is not offline.
+func (s Server) Reachable() bool {
+	return s.Status != ReachabilityOffline
+}
+
 // User represents an authenticated dashboard user or VPN client subscriber.
 type User struct {
 	ID                     string               `json:"id" db:"id"`

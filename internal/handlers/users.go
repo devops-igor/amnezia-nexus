@@ -251,6 +251,12 @@ func (h *Handlers) provisionInitialConnection(ctx context.Context, user *models.
 		}
 		return
 	}
+	status, err := h.db.GetServerStatus(ctx, server.ID)
+	if (err == nil && status == models.ReachabilityOffline) || server.Status == models.ReachabilityOffline {
+		resp["connection_created"] = false
+		resp["connection_error"] = "server is currently unavailable or offline"
+		return
+	}
 	protoMgr, err := h.GetProtocolManager(*req.Protocol)
 	if err != nil || protoMgr == nil {
 		resp["connection_created"] = false
@@ -590,6 +596,10 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	if !h.checkServerReachable(w, ctx, server) {
+		return
+	}
+
 	var clientID, configStr string
 	var addResult map[string]any
 	clientCreated := false
@@ -597,21 +607,7 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 		clientID = *req.ClientID
 		configStr, _ = protoMgr.GetClientConfig(ctx, server, clientID)
 	} else {
-		params := map[string]any{
-			"name": req.Name,
-		}
-		if req.TelemtQuota != nil {
-			params["telemt_quota"] = *req.TelemtQuota
-		}
-		if req.TelemtMaxIPs != nil {
-			params["telemt_max_ips"] = *req.TelemtMaxIPs
-		}
-		if req.TelemtExpiry != nil {
-			params["telemt_expiry"] = *req.TelemtExpiry
-		}
-		if req.AWGMimicry != nil {
-			params["awg_mimicry"] = *req.AWGMimicry
-		}
+		params := buildConnectionParams(req.Name, req.TelemtQuota, req.TelemtMaxIPs, req.TelemtExpiry, req.AWGMimicry)
 
 		res, err := protoMgr.AddClient(ctx, server, params)
 		if err != nil {
@@ -619,10 +615,7 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		addResult = res
-		clientID, _ = res["client_id"].(string)
-		if clientID == "" {
-			clientID, _ = res["clientId"].(string)
-		}
+		clientID = resolveClientID(res)
 		configStr, _ = res["config"].(string)
 		if configStr == "" && clientID != "" {
 			configStr, _ = protoMgr.GetClientConfig(ctx, server, clientID)

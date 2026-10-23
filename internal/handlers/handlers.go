@@ -220,6 +220,47 @@ func (h *Handlers) Translate(r *http.Request, key string) string {
 	return config.T(lang, key)
 }
 
+// checkServerReachable verifies that the server is not offline.
+// If offline, it responds with HTTP 409 Conflict and returns false.
+func (h *Handlers) checkServerReachable(w http.ResponseWriter, ctx context.Context, server *models.Server) bool {
+	if server == nil {
+		return false
+	}
+	status, err := h.db.GetServerStatus(ctx, server.ID)
+	if (err == nil && status == models.ReachabilityOffline) || server.Status == models.ReachabilityOffline {
+		h.JSONError(w, http.StatusConflict, "server_unavailable", "Server is currently unavailable or offline")
+		return false
+	}
+	return true
+}
+
+// resolveClientID extracts the client ID from protocol manager result.
+func resolveClientID(result map[string]any) string {
+	if cid, ok := result["client_id"].(string); ok && cid != "" {
+		return cid
+	}
+	cid, _ := result["clientId"].(string)
+	return cid
+}
+
+// buildConnectionParams aggregates protocol and optional telemt params.
+func buildConnectionParams(name string, quota *string, maxIPs *int, expiry *string, mimicry *string) map[string]any {
+	params := map[string]any{"name": name}
+	if quota != nil {
+		params["telemt_quota"] = *quota
+	}
+	if maxIPs != nil {
+		params["telemt_max_ips"] = *maxIPs
+	}
+	if expiry != nil {
+		params["telemt_expiry"] = *expiry
+	}
+	if mimicry != nil {
+		params["awg_mimicry"] = *mimicry
+	}
+	return params
+}
+
 // GenerateVPNLink converts a client configuration into a base64 encoded vpn:// link.
 func GenerateVPNLink(configText string) string {
 	b64 := base64.StdEncoding.EncodeToString([]byte(strings.TrimSpace(configText)))

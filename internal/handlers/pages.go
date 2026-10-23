@@ -123,7 +123,7 @@ func (h *Handlers) MyConnectionsPageHandler(w http.ResponseWriter, r *http.Reque
 		if status == "" {
 			status = "online"
 		}
-		reachable := srv.Status == models.ReachabilityOnline || srv.Status == ""
+		reachable := srv.Reachable()
 		sClean := SanitizedServerForUser{
 			ID:        srv.ID,
 			Name:      name,
