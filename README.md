@@ -270,4 +270,6 @@ If you find a bug or have an idea for a feature, [open an issue](https://github.
 
 Before posting logs or configurations, remove private keys, passwords, tokens, and other personal or sensitive information.
 
-The repository does not currently include a license. Check the licensing status before copying or redistributing the code.
+## License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.

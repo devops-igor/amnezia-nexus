@@ -62,6 +62,8 @@ Also available: `make fmt`, `make vet`, `make build`, `make test-e2e`.
 6. **Open a PR against `main`.** Link the issue, explain the why, list what you ran, and for refactors paste the checklist from this file.
 7. **Review.** Address comments with new commits; do not rewrite history after review starts. Maintainers merge; do not push to `main`.
 
+By contributing to Amnezia Nexus, you agree that your contributions will be licensed under the project's [MIT License](LICENSE).
+
 Commit messages follow Conventional Commits with the issue number, for example:
 
 ```
