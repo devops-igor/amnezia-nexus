@@ -11,11 +11,35 @@ It indexes, and does not replace, the detailed contracts:
 - [Frontend JavaScript Architecture Contracts](frontend-javascript-contracts.md)
 - [CSS Architecture Contracts](css-contracts.md)
 
-Where this document and a detailed contract disagree, the detailed contract wins for its subsystem; fix this document in the same PR.
+### Rule hierarchy
+
+When rules pull in different directions, apply them in this order:
+
+1. Preserve existing behavior, security, and data integrity.
+2. Follow the owning subsystem's detailed contract.
+3. Follow repository-wide architecture conventions (this document).
+4. Prefer the smallest complete change (the Ponytail principle).
+5. If code and documentation conflict, report the conflict. Do not silently rewrite working behavior to match a target rule.
+6. Report which tests ran and which were not run.
+
+Where this document and a detailed contract disagree, the detailed contract wins for its subsystem (rule 2); fix this document in the same PR.
 
 Rules are marked **MUST** (enforced by review or CI) or **SHOULD** (default unless the PR states a reason). Where the code does not yet meet a rule, the gap is listed under "Known exceptions" and is not a precedent.
 
 ## 2. Component Topology and Ownership Map
+
+### Where do I start?
+
+Find your task, open the package, read the contract, and run the validation before review.
+
+| Task | Package | Governing contract | Validate with |
+|------|---------|--------------------|---------------|
+| HTTP/API behavior | `internal/handlers/` | [Frontend JavaScript contracts](frontend-javascript-contracts.md) | Handler tests (`internal/handlers/*_test.go`); JSON schema compatibility |
+| Server protocol operations | `internal/manager/` | Manager interfaces (`internal/manager/manager.go`) | Manager unit/mock tests; timeout and rollback behavior |
+| VPN sessions or backends | `internal/vpn/` | [VPN service state ownership](vpn-service-state-ownership.md) | State ownership contract; `go test -race ./internal/vpn/...`; multi-backend tests |
+| Dataplane and packet forwarding | `internal/vpn/forwarder/` | [Forwarder dataplane ownership](forwarder-dataplane-ownership.md) | Forwarder tests; queue/dwell tests |
+| Database records or migrations | `internal/database/` | Migration conventions (section 6) | Migration tests (`database_test.go`); upgrade compatibility |
+| Page behavior and UI | `web/templates/`, `web/static/js/` | [Frontend JavaScript contracts](frontend-javascript-contracts.md), [CSS contracts](css-contracts.md) | Node/jsdom tests (`web/*_test.go`); 5-locale i18n parity |
 
 ### 2.1 Entrypoints
 
@@ -171,23 +195,40 @@ Never create a package merely to shorten a file. If extraction forces you to exp
 
 ### 4.3 Size signals
 
-- Warning at 500 physical lines, ceiling at 1,000 (`scripts/architecture_health/constants.py`).
+- One rule for every file type (Go, tests, scripts, Markdown, JavaScript, CSS). Warning at 500 physical lines, review ceiling at 1,000 (`scripts/architecture_health/constants.py`). A PR must not push a file from below 1,000 lines to 1,000 or more, or grow a file that is already at or above 1,000 lines, without a stated per-PR responsibility justification. There are no blanket exemptions. An upward change to `scripts/architecture_baseline.json` needs the same per-PR rationale.
 - Line count is a discovery signal, not a goal. Do not fragment cohesive code into many tiny files to hit a number; split along concerns the contracts name.
 - Mechanical moves and behavior changes **MUST** land in separate PRs.
 
+### 4.4 Examples from this repository
+
+- **Good same-package split:** `internal/vpn/sessions_live.go` and `internal/vpn/service_test_hooks.go` were extracted from `internal/vpn/vpn.go`. They stay in package `vpn`, so unexported state is still reachable and no caller changes.
+- **Good new package:** `internal/vpn/tunnel/` is an independent tunnel pool abstraction with a narrow interface. `internal/manager/awg/cps/` is standalone obfuscation packet framing.
+- **Anti-pattern:** creating a package only to reduce the line count of one file when it requires exporting private fields or creates cyclic dependency pressure. Split into files instead.
+
 ## 5. Go Concurrency and State Authority
 
-The detailed matrices live in the two ownership contracts. The rules every change must respect:
+The detailed matrices live in the two ownership contracts. This section separates three things: the target architecture (normative rules for new and modified code), the established synchronization contracts (how the code works today), and known technical debt.
+
+### 5.1 Target architecture (normative)
+
+1. **No I/O under locks.** Do not run database queries, SSH or HTTP calls, STUN lookups, subprocesses, device writes, or blocking channel operations while holding `Service.mu`, `Forwarder.mu`, `aggregateQueueMu`, or any other internal mutex. Pattern: snapshot under the lock, release, do the I/O, re-acquire and re-validate (compare a generation or ID), then commit.
+2. **Bounded external calls.** Every operation against a remote host, database, or network peer takes a `context.Context` with an explicit timeout derived from the caller's context. Existing values to follow: 5s for per-backend health and reachability checks, 30s for registration-class operations. Do not use a bare `context.Background()` inside a request path.
+3. **Fail closed with rollback.** A multi-step operation that fails midway must undo its earlier steps (best-effort compensation, logged) or leave the backend in `TunnelStatusDegraded` rather than appearing healthy. Do not report success for partial state. See the rollback semantics in `vpn-service-state-ownership.md` section 4.4.
+4. **Goroutine lifecycle.** Every goroutine has a documented stop condition (context cancel or close channel) and is joined on shutdown. No fire-and-forget goroutines that capture mutable state.
+5. **Race tests.** Changes under `internal/vpn/...`, `internal/handlers/...`, `internal/service/...`, or `internal/manager/...` **MUST** pass `go test -race` for the touched packages. New concurrent code needs a test that would fail under `-race` or deadlock detection if the lock discipline were broken.
+
+### 5.2 Established synchronization contracts
+
+These describe the code as it is. Follow them exactly; change them only through the owning contract.
 
 1. **One owner per piece of state.** Every mutable field has exactly one guarding lock or is atomic. Check the field's row in `vpn-service-state-ownership.md` before touching it; add a row when you add a field.
-2. **`Service.mu`** guards tunnel pool membership, backend enable/disable, backend device maps, `cfg`, lifecycle flags (`running`, `startedAt`), and the in-memory admission state. Lock order is `Service.mu` -> `SessionManager.mu`, never the reverse.
-3. **No I/O under locks (normative).** Do not run database queries, SSH or HTTP calls, STUN lookups, subprocesses, device writes, or blocking channel operations while holding `Service.mu`, `Forwarder.mu`, `aggregateQueueMu`, or any other internal mutex. Pattern: snapshot under the lock, release, do the I/O, re-acquire and re-validate (compare a generation or ID), then commit.
-4. **Existing violations are debt, not license.** `vpn-service-state-ownership.md` section 3.1 inventories the database calls still made under `Service.mu`. Never add to that list; shrink it when you touch those paths.
-5. **Forwarder lock graph.** `Forwarder.mu` and `sessionRoute.writeMu` are disjoint. Never call `Retirement.Wait()` while holding `Forwarder.mu` or `Service.mu`. Run callbacks and classifiers after releasing the lock.
-6. **Bounded external calls.** Every operation against a remote host, database, or network peer takes a `context.Context` with an explicit timeout derived from the caller's context. Existing values to follow: 5s for per-backend health and reachability checks, 30s for registration-class operations. Do not use a bare `context.Background()` inside a request path.
-7. **Fail closed with rollback.** A multi-step operation that fails midway must undo its earlier steps (best-effort compensation, logged) or leave the backend in `TunnelStatusDegraded` rather than appearing healthy. Do not report success for partial state. See the rollback semantics in `vpn-service-state-ownership.md` section 4.4.
-8. **Goroutine lifecycle.** Every goroutine has a documented stop condition (context cancel or close channel) and is joined on shutdown. No fire-and-forget goroutines that capture mutable state.
-9. **Race tests.** Changes under `internal/vpn/...`, `internal/handlers/...`, `internal/service/...`, or `internal/manager/...` **MUST** pass `go test -race` for the touched packages. New concurrent code needs a test that would fail under `-race` or deadlock detection if the lock discipline were broken.
+2. **`Service.mu`** guards tunnel pool membership, backend enable/disable, backend device maps, `cfg`, lifecycle flags (`running`, `startedAt`), and the in-memory admission state.
+3. **`SessionManager.mu`** guards the live session maps. Lock order is `Service.mu` -> `SessionManager.mu`, never the reverse.
+4. **`Forwarder.mu`** guards routes, queues, and backend device maps. `Forwarder.mu` and `sessionRoute.writeMu` are disjoint. Never call `Retirement.Wait()` while holding `Forwarder.mu` or `Service.mu`. Run callbacks and classifiers after releasing the lock. The full lock graph is in `forwarder-dataplane-ownership.md` section 5.
+
+### 5.3 Known technical debt
+
+Existing code still makes database calls under `Service.mu`; `vpn-service-state-ownership.md` section 3.1 inventories them. This debt is not license. **MUST NOT** add to the inventory. **SHOULD** eliminate the affected calls when a PR modifies those paths. Do not rewrite working behavior outside the PR's scope to clear debt (rule 5 of the hierarchy); report it instead.
 
 ## 6. Data and Persistence Rules
 
@@ -204,7 +245,7 @@ Details are in `frontend-javascript-contracts.md` and `css-contracts.md`. Requir
 2. **Event delegation.** Do not add inline `onclick`/`onchange` handlers. Mark elements with `data-action` (or a similar `data-*` hook) and bind delegated listeners in the companion module.
 3. **i18n parity.** Every user-visible string is a translation key: `{{ _ "key" }}` in templates, `window._("key")` in JavaScript. A key added to `web/translations/en.json` **MUST** be added to `fa`, `fr`, `ru`, and `zh` in the same PR, with identical `{placeholder}` sets. The dictionary parity tests in `web/` enforce this.
 4. **Strict CSP readiness.** Write every new line as if the page ran under a policy without `'unsafe-inline'` for scripts. The panel does not enforce such a policy yet.
-5. **Ceilings.** Each static JS or CSS file stays under 1,000 lines; one concern per file; load order is declared in the template and documented in the contracts.
+5. **Sizing.** JS and CSS files follow SG1 (section 4.3) like every other file type; one concern per file; load order is declared in the template and documented in the contracts.
 6. **Atomic staging.** A moved function, its `<script src>` tag, and the test fixture that extracts it land in one PR.
 
 Known exceptions: some templates still contain inline `<script>` blocks and inline event handlers. They are tracked in the JavaScript contracts' CSP roadmap. Do not copy the pattern, and remove handlers you touch when the change is small.
@@ -222,51 +263,17 @@ Known exceptions: some templates still contain inline `<script>` blocks and inli
 
 ## 9. Refactor PR Review Checklist
 
-Copy this into the PR description for any refactor, file split, or package extraction. `CONTRIBUTING.md` carries the same checklist.
+The single authoritative checklist is in [`CONTRIBUTING.md`](../../CONTRIBUTING.md#refactor-pr-review-checklist). Copy it from there into the PR description for any refactor, file split, or package extraction. It is not duplicated here, so it cannot drift.
 
-### 9.1 Safeguard SG1: line-count sizing rule
+The safeguards it enforces:
 
-> A PR must not push a file from below 1,000 lines to 1,000 or more, or grow a file that is already at or above 1,000 lines, without a stated justification.
-
-- [ ] No file crossed the 1,000-line ceiling, and no file at or above 1,000 lines grew; **or** each exception has a written per-PR rationale in the PR description (for example a single table-driven data matrix, or a comprehensive benchmark harness that cannot be split without losing coverage).
-- [ ] No blanket exemption is claimed for model, test, or script files; each is judged by the same rule.
-- [ ] The split follows a documented concern boundary, not an arbitrary line count. Line count is a discovery signal, not an excuse for fragmentation.
-- [ ] `scripts/architecture_baseline.json` is changed only by the downward ratchet, or the PR explains an intentional increase.
-
-### 9.2 Structure and fidelity
-
-- [ ] Same-package split by default; a new package meets all four conditions in section 4.2.
-- [ ] Dependency direction follows section 3; `go list` shows no new upward or cyclic edge.
-- [ ] Moved code is identical (error handling, validation, locking) apart from the file it lives in.
-- [ ] Mechanical moves and behavior changes are in separate PRs.
-- [ ] No regression test deleted, skipped, or weakened; tests moved with the code they cover.
-
-### 9.3 Verification layers
-
-- [ ] Compile, vet, format: `go build ./...`, `go vet ./...`, `gofmt -l .` print nothing.
-- [ ] Lint and security: `golangci-lint run ./...`, `gosec -quiet ./...`, `govulncheck ./...` clean.
-- [ ] Concurrency: touched packages pass `go test -race`, especially `./internal/vpn/...` and `./internal/handlers/...`.
-- [ ] Locks: no new I/O under `Service.mu` or other internal mutexes; lock order unchanged; state-ownership docs updated for new fields.
-- [ ] Architecture health: `python3 scripts/architecture_health.py --check --nonblocking` reports no unratcheted violation; the CI architecture-health workflow is green.
-- [ ] Frontend and templates: Node/jsdom tests in `web/` run and pass with `CI=true` (a missing jsdom must fail, not skip); i18n key parity holds across all 5 locales.
-- [ ] E2E and multi-backend: failover, reconnect, and lifecycle tests run when routing, session, or backend state is touched.
-- [ ] Docs: affected architecture contracts and cross-references updated; Markdown files stay under 1,000 lines.
-
-### 9.4 Leak and secret scan
-
-- [ ] The diff contains no local filesystem paths, real hostnames, real private IPs, bot or tool identities, tokens, keys, or credentials.
-- [ ] Logs and fixtures added by the PR are scrubbed.
-
-Suggested scan:
-
-```bash
-git diff origin/main...HEAD | grep -n -E '/home/|/Users/|/mnt/[a-z]/|(^|[^0-9])(10|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]+\.[0-9]+|BEGIN [A-Z ]*PRIVATE KEY|ghp_[A-Za-z0-9]'
-```
-
-Every hit needs a justification (for example a documentation-range address) before merge.
+- **SG1 sizing.** One rule for all file types (section 4.3). Exceptions and upward baseline changes need a per-PR rationale; no blanket exemptions.
+- **Structure and fidelity.** Same-package split by default; layering holds; moved code is identical; mechanical moves and behavior changes ship separately; no test deleted or weakened.
+- **Verification layers.** Compile, vet, format, lint, security, race tests, architecture health, frontend/i18n tests, and E2E where routing or backend state changed. Report what ran and what did not (rule 6 of the hierarchy).
+- **Leak and secret scan.** A human or automated review for local paths, hostnames, private IPs, tokens, and credentials. The checklist's regex is a supplemental heuristic (not exhaustive) and does not replace that review.
 
 ## 10. Maintaining This Document
 
 - Update it in the same PR that changes a package boundary, adds a package, or changes a rule here.
 - Re-verify section 3.3 whenever an import edge is added or removed.
-- Keep it under 1,000 lines; move detail into a subsystem contract and link to it.
+- Keep it within SG1 (section 4.3); move detail into a subsystem contract and link to it.

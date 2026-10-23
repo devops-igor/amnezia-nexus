@@ -4,16 +4,53 @@ Thanks for helping improve Nexus. This guide covers the workflow, the rules that
 
 ## Getting started
 
-Requirements: Go (the version in `go.mod`), Python 3 for the tooling tests, and Node.js with `jsdom` for the frontend tests in `web/`. Docker is only needed for end-to-end runs.
-
 ```bash
 git clone https://github.com/devops-igor/amnezia-nexus.git
 cd amnezia-nexus
 make build        # builds bin/panel
-make test         # go test ./...
 ```
 
-Useful targets: `make fmt`, `make vet`, `make lint`, `make security`, `make test-race`, `make test-e2e`. `make check` runs format, vet, lint, security, and race tests together.
+### Local setup
+
+- **Go.** Install the Go version declared in `go.mod` (the `go` directive). Also install `golangci-lint`, `gosec`, and `govulncheck` and put `$HOME/go/bin` on `PATH`; the Make targets add it for you.
+- **Node.js and jsdom.** The frontend tests in `web/` run under Node.js with `jsdom` pinned to the same version CI uses (`29.1.1`). Either install it globally:
+
+  ```bash
+  npm install -g jsdom@29.1.1
+  export NODE_PATH="$(npm root -g)"
+  ```
+
+  or locally in a directory outside the repository:
+
+  ```bash
+  npm install --save-dev jsdom@29.1.1
+  export NODE_PATH="$PWD/node_modules"
+  ```
+
+  Without jsdom the frontend tests skip locally; with `CI=true` they fail.
+- **Python tooling.** Python 3 is needed for architecture health and its tests. Use a virtual environment outside version control or in an ignored directory (`.venv` is skipped by the scanner):
+
+  ```bash
+  python3 -m venv .venv
+  . .venv/bin/activate
+  python -m pip install pytest==8.3.4 pytest-cov==6.0.0   # versions CI uses
+  python3 scripts/architecture_health.py --check --nonblocking
+  python -m pytest tests/test_architecture_health*.py
+  ```
+
+  The health script itself needs only the standard library. Browser end-to-end tests (`tests/e2e/`) have their own requirements; see [tests/e2e/README.md](tests/e2e/README.md). Docker is needed only for end-to-end runs.
+
+### Make targets
+
+| Target | Runs |
+|--------|------|
+| `make check` | `fmt`, `vet`, `lint`, `security`, `test-race` together |
+| `make test` | `go test -v ./...` |
+| `make test-race` | `go test -race -v ./...` (several minutes) |
+| `make lint` | `golangci-lint run ./...` |
+| `make security` | `gosec` and `govulncheck` |
+
+Also available: `make fmt`, `make vet`, `make build`, `make test-e2e`.
 
 ## Workflow
 
@@ -44,7 +81,7 @@ These are summarized from the [module ownership conventions](docs/architecture/m
 - **Bound every external call** with a context timeout, and **fail closed**: on a partial failure, roll back or mark the backend degraded.
 - **Never delete or weaken tests** to make a gate pass.
 - **Frontend.** No new inline `<script>` bodies or inline `onclick`/`onchange` handlers. Use companion modules in `web/static/js/`, delegated listeners on `data-*` hooks, and translation keys that exist in all five locales (`en`, `fa`, `fr`, `ru`, `zh`). Write code that works under a CSP without `'unsafe-inline'`.
-- **Size.** Files above 500 lines are a warning, 1,000 is the ceiling. See SG1 below.
+- **Size.** SG1 applies to every file type: warning at 500 lines, review ceiling at 1,000, no blanket exemptions. See SG1 below.
 - **Secrets and privacy.** Never commit keys, tokens, passwords, real hostnames, real private IPs, or local filesystem paths. Use documentation-range addresses (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) in examples.
 
 Related contracts: [VPN service state ownership](docs/architecture/vpn-service-state-ownership.md), [forwarder dataplane ownership](docs/architecture/forwarder-dataplane-ownership.md), [frontend JavaScript contracts](docs/architecture/frontend-javascript-contracts.md), [CSS contracts](docs/architecture/css-contracts.md).
@@ -77,12 +114,12 @@ Copy this block into the description of any refactor, file split, or package ext
 
 ### SG1: line-count sizing rule
 
-> A PR must not push a file from below 1,000 lines to 1,000 or more, or grow a file that is already at or above 1,000 lines, without a stated justification.
+> One rule for Go, tests, scripts, Markdown, JavaScript, and CSS. Warning at 500 physical lines, review ceiling at 1,000. A PR must not push a file from below 1,000 lines to 1,000 or more, or grow a file that is already at or above 1,000 lines, without a stated per-PR responsibility justification.
 
 - [ ] No file crossed the 1,000-line ceiling and no file at or above 1,000 lines grew; **or** each exception has a written per-PR rationale (for example a single table-driven data matrix, or a benchmark harness that cannot be split without losing coverage).
-- [ ] No blanket exemption is claimed for model, test, or script files.
+- [ ] No blanket exemption is claimed for any file type (model, test, script, Markdown, JavaScript, CSS).
 - [ ] Splits follow a documented concern boundary; line count is a discovery signal, not an excuse for fragmentation.
-- [ ] `scripts/architecture_baseline.json` changes only by the downward ratchet, or the PR explains an intentional increase.
+- [ ] `scripts/architecture_baseline.json` changes only by the downward ratchet, or the PR gives the same per-PR rationale for an intentional increase.
 
 ### Structure and fidelity
 
@@ -99,17 +136,25 @@ Copy this block into the description of any refactor, file split, or package ext
 - [ ] Architecture health: `python3 scripts/architecture_health.py --check --nonblocking` shows no unratcheted violation, and the CI architecture-health workflow is green.
 - [ ] Frontend and templates: Node/jsdom tests in `web/` pass under `CI=true` without fail-open skips; i18n keys are in all 5 locales.
 - [ ] E2E and multi-backend: failover, reconnect, and lifecycle tests ran when routing, session, or backend state changed.
-- [ ] Docs: affected architecture contracts updated; Markdown files stay under 1,000 lines.
+- [ ] Docs: affected architecture contracts updated; Markdown files follow SG1 like any other file.
 
 ### Leak and secret scan
 
 - [ ] The diff contains no local paths, real hostnames, real private IPs, bot or tool identities, tokens, keys, or credentials.
 - [ ] Added logs and fixtures are scrubbed.
 
+Suggested supplemental scan (not exhaustive):
+
+```bash
+git diff origin/main...HEAD | grep -n -E '/home/|/Users/|/mnt/[a-z]/|(^|[^0-9])(10|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]+\.[0-9]+|BEGIN [A-Z ]*PRIVATE KEY|ghp_[A-Za-z0-9]'
+```
+
+This regex is a heuristic helper. It does not replace human or automated review for tokens, hostnames, and arbitrary credentials. Every hit needs a justification (for example a documentation-range address) before merge.
+
 ## AI-assisted contributions
 
-Contributions written with an AI coding agent follow the same rules and the same checklist. The author is responsible for understanding every line. Agents must make the smallest complete change, keep structural moves byte-for-byte identical, preserve all tests, report real gate output (including anything not run), and stay within the authorized branch. See section 8 of the [module ownership conventions](docs/architecture/module-ownership-conventions.md).
+Contributions written with an AI coding agent follow the same rules and the same checklist. The author is responsible for understanding every line. Agents must make the smallest complete change, keep structural moves byte-for-byte identical, preserve all tests, report real gate output (including anything not run), and stay within the authorized branch. See section 8 of the [module ownership conventions](docs/architecture/module-ownership-conventions.md) and the root [AGENTS.md](AGENTS.md).
 
 ## Documentation
 
-Architecture contracts live in `docs/architecture/`. Update them in the same PR that changes a package boundary, lock rule, or JavaScript module contract. Keep each Markdown file under 1,000 lines.
+Architecture contracts live in `docs/architecture/`. Update them in the same PR that changes a package boundary, lock rule, or JavaScript module contract. Markdown files follow SG1 like every other file type.
