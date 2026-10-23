@@ -254,6 +254,8 @@ Nexus then accepts `X-Forwarded-Proto: https` only from trusted proxies and mark
 ## Documentation & specifications
 
 - [Architecture & How It Works](useful_notes/HOW_IT_WORKS.md): How the userspace data plane, VirtualTUN, and packet routing work.
+- [Contributing](CONTRIBUTING.md): Development workflow, quality gates, and the refactor PR review checklist.
+- [Module ownership conventions](docs/architecture/module-ownership-conventions.md): Package ownership, dependency rules, locking and frontend standards.
 - [Changelog](CHANGELOG.md): Changes and fixes from previous versions.
 - [Releases](https://github.com/devops-igor/amnezia-nexus/releases): Stable versions and release notes.
 - [End-to-end testing](tests/e2e/README.md): How to run the browser and VPN lifecycle tests.
