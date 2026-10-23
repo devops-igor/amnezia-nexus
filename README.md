@@ -254,6 +254,9 @@ Nexus then accepts `X-Forwarded-Proto: https` only from trusted proxies and mark
 ## Documentation & specifications
 
 - [Architecture & How It Works](useful_notes/HOW_IT_WORKS.md): How the userspace data plane, VirtualTUN, and packet routing work.
+- [Contributing](CONTRIBUTING.md): Development workflow, quality gates, and the refactor PR review checklist.
+- [Module ownership conventions](docs/architecture/module-ownership-conventions.md): Package ownership, dependency rules, locking and frontend standards.
+- [AGENTS.md](AGENTS.md): Short navigation hub for AI coding assistants.
 - [Changelog](CHANGELOG.md): Changes and fixes from previous versions.
 - [Releases](https://github.com/devops-igor/amnezia-nexus/releases): Stable versions and release notes.
 - [End-to-end testing](tests/e2e/README.md): How to run the browser and VPN lifecycle tests.
@@ -267,4 +270,6 @@ If you find a bug or have an idea for a feature, [open an issue](https://github.
 
 Before posting logs or configurations, remove private keys, passwords, tokens, and other personal or sensitive information.
 
-The repository does not currently include a license. Check the licensing status before copying or redistributing the code.
+## License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
