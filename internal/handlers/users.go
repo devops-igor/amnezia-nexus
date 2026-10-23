@@ -596,6 +596,10 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	if !h.checkServerReachable(w, ctx, server) {
+		return
+	}
+
 	var clientID, configStr string
 	var addResult map[string]any
 	clientCreated := false
@@ -603,10 +607,6 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 		clientID = *req.ClientID
 		configStr, _ = protoMgr.GetClientConfig(ctx, server, clientID)
 	} else {
-		if !h.checkServerReachable(w, ctx, server) {
-			return
-		}
-
 		params := buildConnectionParams(req.Name, req.TelemtQuota, req.TelemtMaxIPs, req.TelemtExpiry, req.AWGMimicry)
 
 		res, err := protoMgr.AddClient(ctx, server, params)

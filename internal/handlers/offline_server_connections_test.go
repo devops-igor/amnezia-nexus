@@ -283,6 +283,121 @@ func TestAddUserConnectionHandler_OfflineServer(t *testing.T) {
 			t.Fatalf("expected HTTP 200 OK, got %d (body: %s)", w.Code, w.Body.String())
 		}
 	})
+
+	t.Run("Rejects existing client connection attachment when server is ReachabilityOffline", func(t *testing.T) {
+		if err := db.UpdateServerReachability(ctx, serverID, models.ReachabilityOffline); err != nil {
+			t.Fatalf("UpdateServerReachability failed: %v", err)
+		}
+
+		var getClientConfigCalls int
+		var addClientCalls int
+		spyMgr := &mockProtocolManager{
+			protocol: "awg",
+			getClientConfigFn: func(ctx context.Context, server *models.Server, clientID string) (string, error) {
+				getClientConfigCalls++
+				return "[Interface]\nPrivateKey=testkey\nAddress=198.51.100.5/32\n", nil
+			},
+			addClientFn: func(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
+				addClientCalls++
+				return map[string]any{
+					"clientId":  "new-client-1",
+					"client_id": "new-client-1",
+					"config":    "[Interface]\nPrivateKey=testkey\nAddress=198.51.100.5/32\n",
+				}, nil
+			},
+		}
+		h.registry.Register(spyMgr)
+
+		initialConns, err := db.GetConnectionsByUserID(ctx, u.ID)
+		if err != nil {
+			t.Fatalf("GetConnectionsByUserID failed: %v", err)
+		}
+		initialCount := len(initialConns)
+
+		existingCID := "existing-client-xyz"
+		body, _ := json.Marshal(models.AddUserConnectionRequest{
+			ServerID: serverID,
+			Protocol: "awg",
+			Name:     "Existing Client Offline Conn",
+			ClientID: &existingCID,
+		})
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/connections/add", u.ID), bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusConflict {
+			t.Fatalf("expected HTTP 409 Conflict, got %d (body: %s)", w.Code, w.Body.String())
+		}
+
+		var resp map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to parse JSON response: %v", err)
+		}
+		if resp["error"] != "server_unavailable" {
+			t.Errorf("expected error 'server_unavailable', got %v", resp["error"])
+		}
+		detail, _ := resp["detail"].(string)
+		if detail == "" {
+			detail, _ = resp["message"].(string)
+		}
+		if detail != "Server is currently unavailable or offline" {
+			t.Errorf("expected detail 'Server is currently unavailable or offline', got %v", detail)
+		}
+
+		if getClientConfigCalls != 0 {
+			t.Errorf("expected 0 calls to GetClientConfig, got %d", getClientConfigCalls)
+		}
+		if addClientCalls != 0 {
+			t.Errorf("expected 0 calls to AddClient, got %d", addClientCalls)
+		}
+
+		connsAfterOffline, err := db.GetConnectionsByUserID(ctx, u.ID)
+		if err != nil {
+			t.Fatalf("GetConnectionsByUserID failed: %v", err)
+		}
+		if len(connsAfterOffline) != initialCount {
+			t.Errorf("expected %d connections persisted after rejected offline attach, got %d", initialCount, len(connsAfterOffline))
+		}
+		persistedConn, _ := db.GetConnectionByClientID(ctx, existingCID, serverID)
+		if persistedConn != nil {
+			t.Errorf("expected no connection persisted for client ID %s, but found one", existingCID)
+		}
+
+		// When the server transitions back to models.ReachabilityOnline, verify linking succeeds normally
+		if err := db.UpdateServerReachability(ctx, serverID, models.ReachabilityOnline); err != nil {
+			t.Fatalf("UpdateServerReachability failed: %v", err)
+		}
+
+		reqOnline := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/connections/add", u.ID), bytes.NewReader(body))
+		wOnline := httptest.NewRecorder()
+		r.ServeHTTP(wOnline, reqOnline)
+
+		if wOnline.Code != http.StatusOK {
+			t.Fatalf("expected HTTP 200 OK after recovery, got %d (body: %s)", wOnline.Code, wOnline.Body.String())
+		}
+		if getClientConfigCalls != 1 {
+			t.Errorf("expected 1 call to GetClientConfig after recovery, got %d", getClientConfigCalls)
+		}
+		if addClientCalls != 0 {
+			t.Errorf("expected 0 calls to AddClient when linking existing client, got %d", addClientCalls)
+		}
+
+		connsAfterOnline, err := db.GetConnectionsByUserID(ctx, u.ID)
+		if err != nil {
+			t.Fatalf("GetConnectionsByUserID failed: %v", err)
+		}
+		if len(connsAfterOnline) != initialCount+1 {
+			t.Errorf("expected %d connections persisted after online attach, got %d", initialCount+1, len(connsAfterOnline))
+		}
+
+		linkedConn, err := db.GetConnectionByClientID(ctx, existingCID, serverID)
+		if err != nil || linkedConn == nil {
+			t.Fatalf("expected connection to be persisted for client %s, got err: %v", existingCID, err)
+		}
+		if linkedConn.ClientID != existingCID {
+			t.Errorf("expected persisted connection client ID %s, got %s", existingCID, linkedConn.ClientID)
+		}
+	})
 }
 
 func TestRenderTemplate_OfflineServerVisualGuardrails(t *testing.T) {
