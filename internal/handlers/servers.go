@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
@@ -777,117 +776,6 @@ func (h *Handlers) ToggleContainerHandler(w http.ResponseWriter, r *http.Request
 		"status": "ok",
 		"state":  req.Action,
 	})
-}
-
-// GetServerConfigHandler retrieves configuration text for a server protocol.
-func (h *Handlers) GetServerConfigHandler(w http.ResponseWriter, r *http.Request) {
-	serverID, err := parseServerID(r)
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "invalid_parameter", "Invalid server_id")
-		return
-	}
-
-	var req models.ProtocolRequest
-	if err := h.DecodeJSON(r, &req); err != nil {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
-		return
-	}
-
-	req.Protocol = models.NormalizeProtocol(req.Protocol)
-	if !models.IsValidProtocol(req.Protocol) {
-		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", "Unknown protocol")
-		return
-	}
-
-	configPath, ok := models.ConfigPathForProtocol(req.Protocol)
-	if !ok {
-		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", "Unknown protocol")
-		return
-	}
-
-	ctx := r.Context()
-	server, err := h.db.GetServer(ctx, serverID)
-	if err != nil || server == nil {
-		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
-		return
-	}
-
-	client, err := h.GetSSHClient(ctx, server)
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "connection_failed", "SSH connection failed")
-		return
-	}
-
-	out, _, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("cat %s 2>/dev/null", ssh.EscapeShellArg(configPath)))
-	if err != nil || code != 0 {
-		out = "# Configuration not found or empty"
-	}
-
-	h.JSON(w, http.StatusOK, map[string]any{
-		"status": "ok",
-		"config": out,
-	})
-}
-
-// SaveServerConfigHandler overwrites configuration text for a server protocol.
-func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Request) {
-	serverID, err := parseServerID(r)
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "invalid_parameter", "Invalid server_id")
-		return
-	}
-
-	var req models.ServerConfigSaveRequest
-	if err := h.DecodeJSON(r, &req); err != nil {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
-		return
-	}
-
-	if err := req.Validate(); err != nil {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
-		return
-	}
-
-	if req.Protocol == "awg" {
-		params, _, err := awg.ParseServerConfig(req.Config)
-		if err != nil {
-			h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
-			return
-		}
-		if len(params) > 0 {
-			if err := awg.ValidateAWGParams(params); err != nil {
-				h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
-				return
-			}
-		}
-	}
-
-	configPath, ok := models.ConfigPathForProtocol(req.Protocol)
-	if !ok {
-		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", "Unknown protocol")
-		return
-	}
-
-	ctx := r.Context()
-	server, err := h.db.GetServer(ctx, serverID)
-	if err != nil || server == nil {
-		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
-		return
-	}
-
-	client, err := h.GetSSHClient(ctx, server)
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "connection_failed", "SSH connection failed")
-		return
-	}
-
-	if err := client.UploadSudoFile(ctx, configPath, []byte(req.Config), 0600); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "save_failed", "Failed to save config")
-		return
-	}
-
-	h.audit(r, "server.config_save", map[string]any{"server_id": serverID, "protocol": req.Protocol})
-	h.JSONOK(w)
 }
 
 // GetServerReachabilityHandler returns server connectivity and latency status.

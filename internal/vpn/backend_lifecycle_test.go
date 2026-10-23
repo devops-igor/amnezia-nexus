@@ -336,6 +336,95 @@ func TestUpdateBackendServerHost_Lifecycle(t *testing.T) {
 	})
 }
 
+func TestUpdateBackendServerPublicKey_Lifecycle(t *testing.T) {
+	setup := func(t *testing.T) (*Service, int64, string) {
+		t.Helper()
+		db := setupTestDB(t)
+		svc, s1ID, _, _, _ := setupTestVPNService(t, db)
+		t.Cleanup(func() { closeBackendDevices(svc) })
+		if err := svc.pool.SyncFromDB(context.Background()); err != nil {
+			t.Fatalf("SyncFromDB: %v", err)
+		}
+		return svc, s1ID, tunMust(t, svc, s1ID).PublicKey
+	}
+
+	t.Run("success persists new key to pool and database", func(t *testing.T) {
+		svc, id, _ := setup(t)
+		ctx := context.Background()
+		if err := svc.UpdateBackendServerPublicKey(ctx, id, "new-public-key"); err != nil {
+			t.Fatalf("UpdateBackendServerPublicKey: %v", err)
+		}
+		tun := tunMust(t, svc, id)
+		if tun.PublicKey != "new-public-key" {
+			t.Fatalf("pool public key = %q", tun.PublicKey)
+		}
+		row, err := svc.db.GetBackendTunnelByServerID(ctx, id)
+		if err != nil || row == nil || row.PublicKey != "new-public-key" {
+			t.Fatalf("durable public key = %+v, err=%v", row, err)
+		}
+	})
+
+	t.Run("unknown backend is a no-op", func(t *testing.T) {
+		svc, _, _ := setup(t)
+		if err := svc.UpdateBackendServerPublicKey(context.Background(), 987654, "k"); err != nil {
+			t.Fatalf("expected nil for unknown backend, got %v", err)
+		}
+	})
+
+	t.Run("forwarder sync failure restores old key", func(t *testing.T) {
+		svc, id, oldKey := setup(t)
+		ctx := context.Background()
+		svc.SetSyncBackendForwarderHookForTest(func() error { return errors.New("simulated forwarder sync failure") })
+		defer svc.SetSyncBackendForwarderHookForTest(nil)
+
+		err := svc.UpdateBackendServerPublicKey(ctx, id, "candidate-key")
+		if err == nil || errors.Is(err, ErrVPNRollbackFailed) {
+			t.Fatalf("expected plain sync error, got %v", err)
+		}
+		if got := tunMust(t, svc, id).PublicKey; got != oldKey {
+			t.Fatalf("pool public key = %q, want restored %q", got, oldKey)
+		}
+		row, rowErr := svc.db.GetBackendTunnelByServerID(ctx, id)
+		if rowErr != nil || row == nil || row.PublicKey != oldKey {
+			t.Fatalf("durable public key = %+v, err=%v, want %q", row, rowErr, oldKey)
+		}
+	})
+
+	t.Run("rollback failure wraps ErrVPNRollbackFailed and keeps new key", func(t *testing.T) {
+		svc, id, oldKey := setup(t)
+		svc.SetSyncBackendForwarderHookForTest(func() error { return errors.New("sync failure") })
+		defer svc.SetSyncBackendForwarderHookForTest(nil)
+		svc.SetTunnelPublicKeyHookForTest(func(_ context.Context, _ int64, key string) error {
+			if key == oldKey {
+				return errors.New("rollback disk failure")
+			}
+			return nil
+		})
+		defer svc.SetTunnelPublicKeyHookForTest(nil)
+
+		err := svc.UpdateBackendServerPublicKey(context.Background(), id, "candidate-key")
+		if !errors.Is(err, ErrVPNRollbackFailed) {
+			t.Fatalf("expected ErrVPNRollbackFailed, got %v", err)
+		}
+		if got := tunMust(t, svc, id).PublicKey; got != "candidate-key" {
+			t.Fatalf("pool public key = %q, want unrestored candidate-key", got)
+		}
+	})
+
+	t.Run("pool hook failure leaves old key and reports error", func(t *testing.T) {
+		svc, id, oldKey := setup(t)
+		svc.SetTunnelPublicKeyHookForTest(func(context.Context, int64, string) error { return errors.New("pool refused") })
+		defer svc.SetTunnelPublicKeyHookForTest(nil)
+
+		if err := svc.UpdateBackendServerPublicKey(context.Background(), id, "candidate-key"); err == nil {
+			t.Fatal("expected error")
+		}
+		if got := tunMust(t, svc, id).PublicKey; got != oldKey {
+			t.Fatalf("pool public key = %q, want %q", got, oldKey)
+		}
+	})
+}
+
 func TestDeleteServer_Lifecycle(t *testing.T) {
 	t.Run("tombstones server deletes backend clears tombstone on rollback", func(t *testing.T) {
 		db := setupTestDB(t)
