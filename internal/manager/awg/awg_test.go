@@ -1220,8 +1220,8 @@ func TestAWGManager_SaveServerConfig_DynamicConfigPath(t *testing.T) {
 			copiedTarget = cmd
 			return "", "", 0, nil
 		}
-		if strings.Contains(cmd, "syncconf") {
-			syncCmdExecuted = cmd
+		if strings.Contains(cmd, "syncconf") || strings.Contains(cmd, "awg-quick") {
+			syncCmdExecuted += cmd
 			return "OK", "", 0, nil
 		}
 		if strings.Contains(cmd, "cat ") && strings.Contains(cmd, "etc/amnezia/amneziawg/awg0.conf") {
@@ -1253,8 +1253,8 @@ func TestAWGManager_SaveServerConfig_DynamicConfigPath(t *testing.T) {
 	if !strings.Contains(copiedTarget, "/etc/amnezia/amneziawg/awg0.conf") {
 		t.Errorf("expected config to be copied to /etc/amnezia/amneziawg/awg0.conf, got: %s", copiedTarget)
 	}
-	if !strings.Contains(syncCmdExecuted, "/etc/amnezia/amneziawg/awg0.conf") {
-		t.Errorf("expected syncconf to target /etc/amnezia/amneziawg/awg0.conf, got: %s", syncCmdExecuted)
+	if !strings.Contains(syncCmdExecuted, "/etc/amnezia/amneziawg/awg0.conf") || !strings.Contains(syncCmdExecuted, "/etc/amnezia/amneziawg/.awg-strip-") {
+		t.Errorf("expected strip of awg0.conf and syncconf of the stripped file, got: %s", syncCmdExecuted)
 	}
 }
 

@@ -445,7 +445,7 @@ func TestServerHandlers(t *testing.T) {
 				t.Fatalf("expected 200 get config %s, got %d", p, wGet.Code)
 			}
 
-			bodySave, _ := json.Marshal(models.ServerConfigSaveRequest{Protocol: p, Config: "dummy-config"})
+			bodySave, _ := json.Marshal(models.ServerConfigSaveRequest{Protocol: p, Config: saveTestConfig(t, p)})
 			reqSave := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/server_config/save", sCfgID), bytes.NewReader(bodySave))
 			wSave := httptest.NewRecorder()
 			r.ServeHTTP(wSave, reqSave)

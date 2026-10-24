@@ -19,7 +19,6 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"golang.org/x/crypto/curve25519"
 )
 
 var (
@@ -466,11 +465,18 @@ func (m *AWGManager) initializeServerKeysAndConfig(ctx context.Context, client s
 
 	keygenScript := fmt.Sprintf(`
 mkdir -p /opt/amnezia/awg
-echo "%s" > /opt/amnezia/awg/wireguard_server_private_key.key
-echo "%s" > /opt/amnezia/awg/wireguard_server_public_key.key
-echo "%s" > /opt/amnezia/awg/wireguard_psk.key
-`, serverPrivKey, serverPubKey, serverPSK)
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s bash -c %s", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(keygenScript)))
+echo "%s" > %s
+echo "%s" > %s
+echo "%s" > %s
+`, serverPrivKey, serverPrivateKeyArtifactPath, serverPubKey, serverPublicKeyArtifactPath, serverPSK, serverPSKArtifactPath)
+	if _, errOut, code, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker exec -i %s bash -c %s", ssh.EscapeShellArg(cName), ssh.EscapeShellArg(keygenScript))); err != nil || code != 0 {
+		// Provisioning keeps its historical best-effort behavior here: the
+		// identity artifacts are recoverable (the config still carries the
+		// private key, and GetServerPublicKey derives from it), so a failed
+		// artifact write must not abort an otherwise valid install.
+		slog.Warn("failed to write AmneziaWG server identity artifacts during provisioning",
+			"container", cName, "exit_code", code, "stderr", strings.TrimSpace(errOut), "error", err)
+	}
 
 	serverConfig := RenderServerConfig(serverPrivKey, AWGDefaults["subnet_ip"], AWGDefaults["subnet_cidr"], port, awgParams.MTU, awgParams, nil)
 	if err := client.UploadSudoFile(ctx, "/tmp/_amnz_awg0.conf", []byte(serverConfig), 0600); err != nil {
@@ -789,19 +795,10 @@ func (m *AWGManager) ensureBackendNATRule(ctx context.Context, client ssh.SSHCli
 	return m.ensureBackendRoutingAndNAT(ctx, client, "")
 }
 
-func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient, containerNames ...string) (string, error) {
+func (m *AWGManager) getServerConfigWithContainer(ctx context.Context, client ssh.SSHClient, containerNames ...string) (string, string, error) {
 	names := containerNames
 	if len(names) == 0 || (len(names) == 1 && names[0] == "") {
-		resolved := m.resolveContainerName(ctx, client)
-		if !IsValidContainerName(resolved) {
-			resolved = m.containerName()
-		}
-		names = []string{resolved}
-		for _, name := range AWGContainerNames {
-			if name != resolved && IsValidContainerName(name) {
-				names = append(names, name)
-			}
-		}
+		names = m.candidateContainerNames(ctx, client)
 	}
 	for _, name := range names {
 		if !IsValidContainerName(name) {
@@ -810,10 +807,15 @@ func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient, 
 		cmd := fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null || docker exec -i %s cat '/etc/amnezia/amneziawg/awg0.conf' 2>/dev/null", ssh.EscapeShellArg(name), ssh.EscapeShellArg(m.configPath()), ssh.EscapeShellArg(name))
 		out, _, code, err := client.RunSudoCommand(ctx, cmd)
 		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
-			return out, nil
+			return out, name, nil
 		}
 	}
-	return "", fmt.Errorf("failed to get server config from containers: %v", names)
+	return "", "", fmt.Errorf("failed to get server config from containers: %v", names)
+}
+
+func (m *AWGManager) getServerConfig(ctx context.Context, client ssh.SSHClient, containerNames ...string) (string, error) {
+	cfg, _, err := m.getServerConfigWithContainer(ctx, client, containerNames...)
+	return cfg, err
 }
 
 func (m *AWGManager) resolveContainerConfigPath(ctx context.Context, client ssh.SSHClient, containerName string) string {
@@ -832,65 +834,24 @@ func (m *AWGManager) resolveContainerConfigPath(ctx context.Context, client ssh.
 	return m.configPath()
 }
 
-func (m *AWGManager) saveServerConfig(ctx context.Context, client ssh.SSHClient, content string) error {
-	_, err := m.saveServerConfigTracked(ctx, client, content, true)
-	return err
-}
-
-// saveServerConfigPreservingParams writes a peer-only edit without revalidating
-// existing interface parameters against today's rules.
-func (m *AWGManager) saveServerConfigPreservingParams(ctx context.Context, client ssh.SSHClient, content string) error {
-	_, err := m.saveServerConfigTracked(ctx, client, content, false)
-	return err
-}
-
-func (m *AWGManager) saveServerConfigTracked(ctx context.Context, client ssh.SSHClient, content string, validateParams bool) (bool, error) {
-	params, _, err := ParseServerConfig(content)
-	if err != nil {
-		return false, fmt.Errorf("invalid server config: %w", err)
-	}
-	if validateParams && len(params) > 0 {
-		if err := ValidateAWGParams(params); err != nil {
-			return false, fmt.Errorf("invalid AWG parameters: %w", err)
-		}
-	}
-
-	content = EnsureInterfaceTableOff(content)
-	cName := m.resolveContainerName(ctx, client)
-	if !IsValidContainerName(cName) {
-		cName = m.containerName()
-	}
-	if !IsValidContainerName(cName) {
-		return false, errors.New("invalid container name")
-	}
-	randBytes := make([]byte, 8)
-	_, _ = rand.Read(randBytes)
-	tmpPath := fmt.Sprintf("/tmp/_amnz_edit_config_%d_%x.conf", time.Now().UnixNano(), randBytes)
-	if err := client.UploadSudoFile(ctx, tmpPath, []byte(content), 0600); err != nil {
-		return false, err
-	}
-	defer func() {
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("rm -f %s", ssh.EscapeShellArg(tmpPath)))
-	}()
-
-	cfgPath := m.resolveContainerConfigPath(ctx, client, cName)
-	cpCmd := fmt.Sprintf("docker cp %s %s:%s", ssh.EscapeShellArg(tmpPath), ssh.EscapeShellArg(cName), ssh.EscapeShellArg(cfgPath))
-	if _, errOut, code, err := client.RunSudoCommand(ctx, cpCmd); err != nil || code != 0 {
-		return false, fmt.Errorf("failed to copy config into container (code %d): %s, %w", code, errOut, err)
-	}
-
-	// Disk write succeeded
-	diskWritten := true
-
-	if err := m.syncInterfaceConfig(ctx, client, cName, cfgPath); err != nil {
-		return diskWritten, err
-	}
-	return diskWritten, nil
-}
-
 func (m *AWGManager) syncInterfaceConfig(ctx context.Context, client ssh.SSHClient, cName, cfgPath string) error {
+	// Strip first, separately checked. A failing strip returns here, so syncconf
+	// is never invoked and the caller restores the previous configuration.
+	stripPath, err := m.stripInterfaceConfig(ctx, client, cName, cfgPath)
+	if err != nil {
+		return err
+	}
+	defer m.removeContainerFile(ctx, client, cName, stripPath)
+
+	// syncconf takes TWO operands: the interface AND the name of a configuration
+	// file. The stripped configuration therefore has to arrive as a FILENAME
+	// argument, not on stdin. A shell redirect (`< path`) feeds the file on the
+	// standard input stream and supplies NO second operand, so syncconf aborts
+	// with "Usage: awg syncconf <interface> <configuration filename>". The strip
+	// file already lives inside the container, so passing its path directly
+	// needs no second copy.
 	syncCmd := fmt.Sprintf("docker exec -i %s bash -c %s",
-		ssh.EscapeShellArg(cName), ssh.EscapeShellArg(fmt.Sprintf("%s syncconf %s <(%s-quick strip %s)", m.wgBinary(), m.interfaceName(), m.wgBinary(), cfgPath)))
+		ssh.EscapeShellArg(cName), ssh.EscapeShellArg(fmt.Sprintf("%s syncconf %s %s", m.wgBinary(), m.interfaceName(), ssh.EscapeShellArg(stripPath))))
 	out, errOut, code, err := client.RunSudoCommand(ctx, syncCmd)
 	if err != nil || code != 0 {
 		if restErr := m.restoreInterfaceIfDown(ctx, client, cName, cfgPath); restErr != nil {
@@ -1293,6 +1254,7 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 
 	diskWritten := false
 	remoteCommitted := false
+	var classification configMutationClassification
 	defer func() {
 		if err != nil {
 			m.rollbackAddClient(ctx, client, serverID, effectiveClientID, clientPubKey, clientIP, previousOwner, rekeyedIP, initialConfText, initialClients, rekeyed, newlyAllocated, diskWritten, remoteCommitted)
@@ -1310,9 +1272,18 @@ func (m *AWGManager) AddClient(ctx context.Context, server *models.Server, clien
 	allowedIPs := resolveAllowedIPs(clientParams)
 	peerSection := peerSectionFor(isProbePeer, clientPubKey, psk, clientIP, allowedIPs)
 
-	if diskWritten, err = m.commitPeerConfigWithCAS(ctx, client, confText, peerSection, clientPubKey, clientName, existingPubKey); err != nil {
+	if classification, err = m.commitPeerConfigWithCAS(ctx, client, confText, peerSection, clientPubKey, clientName, existingPubKey); err != nil {
+		// The historical multi-assign populated diskWritten even when the
+		// commit returned an error (disk-written failure classes), and the
+		// deferred rollback below depends on that bookkeeping. Mirror it on
+		// the error path too.
+		diskWritten = classification.asLegacyWriteSucceeded()
 		return nil, err
 	}
+	// AddClient's rollback bookkeeping keeps its historical meaning (rollback
+	// only when the disk write is KNOWN to have persisted); the ambiguous-class
+	// routing decision is R3-2's scope.
+	diskWritten = classification.asLegacyWriteSucceeded()
 	remoteCommitted = true
 
 	mimicry := resolveMimicry(clientParams)
@@ -1392,20 +1363,20 @@ func (m *AWGManager) commitPeerConfigWithCAS(
 	ctx context.Context,
 	client ssh.SSHClient,
 	initialConf, peerSection, clientPubKey, clientName, existingPubKey string,
-) (bool, error) {
+) (configMutationClassification, error) {
 	confText := initialConf
 	currExistingPubKey := existingPubKey
 
 	for attempt := 0; attempt < 5; attempt++ {
 		freshConf, err := m.getServerConfig(ctx, client)
 		if err != nil {
-			return false, fmt.Errorf("failed to fetch remote config for CAS check: %w", err)
+			return configMutationNotAttempted, fmt.Errorf("failed to fetch remote config for CAS check: %w", err)
 		}
 		if freshConf != confText {
 			confText = freshConf
 			clients, err := m.getClientsTable(ctx, client)
 			if err != nil {
-				return false, fmt.Errorf("failed to fetch clientsTable for CAS retry: %w", err)
+				return configMutationNotAttempted, fmt.Errorf("failed to fetch clientsTable for CAS retry: %w", err)
 			}
 			_, currExistingPubKey = findExistingClient(clients, clientPubKey, clientName)
 			continue
@@ -1414,12 +1385,12 @@ func (m *AWGManager) commitPeerConfigWithCAS(
 		removePubKeys := peerRemovalKeys(currExistingPubKey, clientPubKey)
 		newConfig, err := upsertPeerInConfig(confText, peerSection, removePubKeys...)
 		if err != nil {
-			return false, fmt.Errorf("failed to upsert peer in config: %w", err)
+			return configMutationNotAttempted, fmt.Errorf("failed to upsert peer in config: %w", err)
 		}
 		return m.saveServerConfigTracked(ctx, client, newConfig, false)
 	}
 
-	return false, errors.New("failed to commit remote config: CAS retry limit exceeded due to concurrent modifications")
+	return configMutationNotAttempted, errors.New("failed to commit remote config: CAS retry limit exceeded due to concurrent modifications")
 }
 
 func (m *AWGManager) removePeerFromRemote(ctx context.Context, client ssh.SSHClient, pubKey, ip string) error {
@@ -2227,13 +2198,13 @@ func (m *AWGManager) GetClientConfig(ctx context.Context, server *models.Server,
 		return "", errors.New("client private key not stored; config cannot be reconstructed")
 	}
 
-	confText, err := m.getServerConfig(ctx, client)
+	confText, containerName, err := m.getServerConfigWithContainer(ctx, client)
 	if err != nil {
 		return "", err
 	}
 
 	serverParams, _, _ := ParseServerConfig(confText)
-	serverPubKey, err := m.GetServerPublicKey(ctx, server)
+	serverPubKey, err := m.getServerPublicKeyInContainer(ctx, client, server, containerName, confText)
 	if err != nil || serverPubKey == "" {
 		if err != nil {
 			return "", fmt.Errorf("failed to get AmneziaWG server public key: %w", err)
@@ -2495,56 +2466,6 @@ func (m *AWGManager) extractContainerPort(ctx context.Context, client ssh.SSHCli
 	return 0
 }
 
-// GetServerPublicKey returns the public key for AmneziaWG server.
-func (m *AWGManager) GetServerPublicKey(ctx context.Context, server *models.Server) (string, error) {
-	client, err := m.getSSHClient(ctx, server)
-	if err != nil {
-		return "", err
-	}
-
-	resolved := m.resolveContainerName(ctx, client)
-	if !IsValidContainerName(resolved) {
-		resolved = m.containerName()
-	}
-	names := []string{resolved}
-	for _, name := range AWGContainerNames {
-		if name != resolved && IsValidContainerName(name) {
-			names = append(names, name)
-		}
-	}
-
-	for _, name := range names {
-		if !IsValidContainerName(name) {
-			continue
-		}
-		cmd := fmt.Sprintf("docker exec -i %s cat '/opt/amnezia/awg/wireguard_server_public_key.key' 2>/dev/null || docker exec -i %s %s show awg0 public-key 2>/dev/null || docker exec -i %s wg show awg0 public-key 2>/dev/null", ssh.EscapeShellArg(name), ssh.EscapeShellArg(name), ssh.EscapeShellArg(m.wgBinary()), ssh.EscapeShellArg(name))
-		out, _, code, err := client.RunSudoCommand(ctx, cmd)
-		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
-			return strings.TrimSpace(out), nil
-		}
-	}
-
-	// Also check if public key can be derived from PrivateKey in awg0.conf
-	if conf, err := m.getServerConfig(ctx, client, names...); err == nil && conf != "" {
-		for _, line := range strings.Split(conf, "\n") {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(strings.ToLower(trimmed), "privatekey") {
-				parts := strings.SplitN(trimmed, "=", 2)
-				if len(parts) == 2 {
-					privKeyBase64 := strings.TrimSpace(parts[1])
-					if privBytes, err := base64.StdEncoding.DecodeString(privKeyBase64); err == nil && len(privBytes) == 32 {
-						if pubBytes, err := curve25519.X25519(privBytes, curve25519.Basepoint); err == nil {
-							return base64.StdEncoding.EncodeToString(pubBytes), nil
-						}
-					}
-				}
-			}
-		}
-	}
-
-	return "", errors.New("failed to get AmneziaWG server public key")
-}
-
 // GetServerPSK returns the preshared key for AmneziaWG server.
 func (m *AWGManager) GetServerPSK(ctx context.Context, server *models.Server) (string, error) {
 	client, err := m.getSSHClient(ctx, server)
@@ -2552,22 +2473,13 @@ func (m *AWGManager) GetServerPSK(ctx context.Context, server *models.Server) (s
 		return "", err
 	}
 
-	resolved := m.resolveContainerName(ctx, client)
-	if !IsValidContainerName(resolved) {
-		resolved = m.containerName()
-	}
-	names := []string{resolved}
-	for _, name := range AWGContainerNames {
-		if name != resolved && IsValidContainerName(name) {
-			names = append(names, name)
-		}
-	}
+	names := m.candidateContainerNames(ctx, client)
 
 	for _, name := range names {
 		if !IsValidContainerName(name) {
 			continue
 		}
-		cmd := fmt.Sprintf("docker exec -i %s cat '/opt/amnezia/awg/wireguard_psk.key' 2>/dev/null || docker exec -i %s cat '/etc/amnezia/amneziawg/wireguard_psk.key' 2>/dev/null", ssh.EscapeShellArg(name), ssh.EscapeShellArg(name))
+		cmd := fmt.Sprintf("docker exec -i %s cat %s 2>/dev/null || docker exec -i %s cat '/etc/amnezia/amneziawg/wireguard_psk.key' 2>/dev/null", ssh.EscapeShellArg(name), ssh.EscapeShellArg(serverPSKArtifactPath), ssh.EscapeShellArg(name))
 		out, _, code, err := client.RunSudoCommand(ctx, cmd)
 		if err == nil && code == 0 && strings.TrimSpace(out) != "" {
 			return strings.TrimSpace(out), nil

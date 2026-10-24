@@ -118,6 +118,36 @@ func (s *Service) SetUpdateBackendServerHostErrorForTest(err error) {
 	s.updateBackendServerHostErr = err
 }
 
+// SetUpdateBackendServerPublicKeyPreLockHook sets a hook called immediately before acquiring s.mu in UpdateBackendServerPublicKey.
+func (s *Service) SetUpdateBackendServerPublicKeyPreLockHook(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.publicKeyUpdateSeams.preLockHook = fn
+}
+
+// SetUpdateBackendServerPublicKeyErrorForTest sets an error to be returned by UpdateBackendServerPublicKey for testing.
+func (s *Service) SetUpdateBackendServerPublicKeyErrorForTest(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.publicKeyUpdateSeams.err = err
+}
+
+// SetTunnelEnabledHookForTest sets a test hook for SetTunnelEnabled on the pool.
+func (s *Service) SetTunnelEnabledHookForTest(fn func(ctx context.Context, serverID int64, enabled bool, disableReason string) error) {
+	if s == nil || s.pool == nil {
+		return
+	}
+	s.pool.SetSetTunnelEnabledHookForTest(fn)
+}
+
+// SetTunnelPublicKeyHookForTest sets a test hook for SetTunnelPublicKey on the pool.
+func (s *Service) SetTunnelPublicKeyHookForTest(fn func(ctx context.Context, tunnelID int64, publicKey string) error) {
+	if s == nil || s.pool == nil {
+		return
+	}
+	s.pool.SetSetTunnelPublicKeyHookForTest(fn)
+}
+
 // SetDeleteBackendErrorForTest sets an error to be returned by DeleteBackend for testing.
 func (s *Service) SetDeleteBackendErrorForTest(err error) {
 	s.mu.Lock()

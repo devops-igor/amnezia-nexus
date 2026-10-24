@@ -25,14 +25,16 @@ var (
 
 // Pool manages the in-process AWG tunnels connected to backend VPN servers.
 type Pool struct {
-	mu                    sync.RWMutex
-	db                    *database.DB
-	tunnelsByServerID     map[int64]*models.BackendTunnel
-	tunnelsByID           map[int64]*models.BackendTunnel
-	tunnelsByIfName       map[string]*models.BackendTunnel
-	closed                bool
-	setTunnelEndpointHook func(ctx context.Context, tunnelID int64, endpoint string) error
-	generateKeypairFn     func() (string, string, error)
+	mu                     sync.RWMutex
+	db                     *database.DB
+	tunnelsByServerID      map[int64]*models.BackendTunnel
+	tunnelsByID            map[int64]*models.BackendTunnel
+	tunnelsByIfName        map[string]*models.BackendTunnel
+	closed                 bool
+	setTunnelEndpointHook  func(ctx context.Context, tunnelID int64, endpoint string) error
+	setTunnelEnabledHook   func(ctx context.Context, serverID int64, enabled bool, disableReason string) error
+	setTunnelPublicKeyHook func(ctx context.Context, tunnelID int64, publicKey string) error
+	generateKeypairFn      func() (string, string, error)
 }
 
 // DeriveClientPublicKey derives the Base64-encoded Curve25519 public key from a Base64-encoded private key.
@@ -552,6 +554,11 @@ func (p *Pool) SetTunnelEnabled(ctx context.Context, serverID int64, enabled boo
 	if tunnel.Enabled == enabled && tunnel.DisableReason == disableReason {
 		return nil
 	}
+	if p.setTunnelEnabledHook != nil {
+		if err := p.setTunnelEnabledHook(ctx, serverID, enabled, disableReason); err != nil {
+			return err
+		}
+	}
 
 	effectiveReason := disableReason
 	if tunnel.DisableReason == models.DisableReasonHealth {
@@ -884,6 +891,66 @@ func (p *Pool) SetSetTunnelEndpointHookForTest(fn func(ctx context.Context, tunn
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.setTunnelEndpointHook = fn
+}
+
+// SetSetTunnelEnabledHookForTest sets a hook invoked before SetTunnelEnabled
+// persists a real state transition.
+func (p *Pool) SetSetTunnelEnabledHookForTest(fn func(ctx context.Context, serverID int64, enabled bool, disableReason string) error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.setTunnelEnabledHook = fn
+}
+
+// SetTunnelPublicKey updates the public key of a backend tunnel in memory and in the database,
+// advancing StateVersion so in-flight health probes targeting the previous identity are fenced.
+func (p *Pool) SetTunnelPublicKey(ctx context.Context, tunnelID int64, publicKey string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.setTunnelPublicKeyHook != nil {
+		if err := p.setTunnelPublicKeyHook(ctx, tunnelID, publicKey); err != nil {
+			return err
+		}
+	}
+
+	if p.closed {
+		return ErrPoolClosed
+	}
+
+	tunnel, ok := p.tunnelsByID[tunnelID]
+	if !ok {
+		return ErrTunnelNotFound
+	}
+
+	if tunnel.PublicKey == publicKey {
+		return nil
+	}
+
+	nextVersion := tunnel.StateVersion + 1
+	if tunnel.StateVersion <= 0 {
+		nextVersion = 2
+	}
+
+	if p.db != nil {
+		updates := map[string]any{
+			"public_key":    publicKey,
+			"state_version": nextVersion,
+		}
+		if err := p.db.UpdateBackendTunnel(ctx, tunnel.ID, updates); err != nil {
+			return fmt.Errorf("failed to persist backend tunnel public key: %w", err)
+		}
+	}
+
+	tunnel.StateVersion = nextVersion
+	tunnel.PublicKey = publicKey
+	return nil
+}
+
+// SetSetTunnelPublicKeyHookForTest sets a hook invoked at the start of SetTunnelPublicKey for testing.
+func (p *Pool) SetSetTunnelPublicKeyHookForTest(fn func(ctx context.Context, tunnelID int64, publicKey string) error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.setTunnelPublicKeyHook = fn
 }
 
 // Close tears down all tunnels and cleans up resources.

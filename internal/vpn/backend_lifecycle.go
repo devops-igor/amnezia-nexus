@@ -278,6 +278,108 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 	return nil
 }
 
+// publicKeyUpdateSeams holds the test seams of UpdateBackendServerPublicKey.
+type publicKeyUpdateSeams struct {
+	preLockHook func()
+	err         error
+}
+
+// UpdateBackendServerPublicKey updates the public key of a server in the VPN backend pool.
+func (s *Service) UpdateBackendServerPublicKey(ctx context.Context, serverID int64, newPublicKey string) error {
+	if s == nil || s.pool == nil {
+		return nil
+	}
+
+	s.mu.RLock()
+	injectedErr := s.publicKeyUpdateSeams.err
+	s.mu.RUnlock()
+	if injectedErr != nil {
+		return injectedErr
+	}
+
+	tun, err := s.pool.GetTunnel(serverID)
+	if err != nil {
+		if errors.Is(err, tunnel.ErrTunnelNotFound) {
+			return nil
+		}
+		return err
+	}
+	if tun == nil {
+		return nil
+	}
+
+	if tun.PublicKey == newPublicKey {
+		s.mu.RLock()
+		dev := s.backendDevices[tun.ID]
+		s.mu.RUnlock()
+
+		// Genuinely synchronized idempotent no-op: device exists and is open.
+		if dev != nil && !dev.IsClosed() {
+			return nil
+		}
+
+		if !tun.Enabled {
+			return nil
+		}
+
+		awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
+
+		s.mu.RLock()
+		hook := s.publicKeyUpdateSeams.preLockHook
+		s.mu.RUnlock()
+		if hook != nil {
+			hook()
+		}
+
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
+	}
+
+	oldPublicKey := tun.PublicKey
+	if err := s.pool.SetTunnelPublicKey(ctx, tun.ID, newPublicKey); err != nil {
+		return fmt.Errorf("failed to update backend tunnel public key in pool: %w", err)
+	}
+	tun.PublicKey = newPublicKey
+
+	rollbackPublicKey := func(originalErr error) error {
+		rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if rbErr := s.pool.SetTunnelPublicKey(rbCtx, tun.ID, oldPublicKey); rbErr != nil {
+			log.Printf("[vpn] warning: failed to rollback backend tunnel public key for server %d: %v", serverID, rbErr)
+			return errors.Join(originalErr, fmt.Errorf("%w: failed to restore backend public key: %w", ErrVPNRollbackFailed, rbErr))
+		}
+		return originalErr
+	}
+
+	awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
+
+	s.mu.RLock()
+	hook := s.publicKeyUpdateSeams.preLockHook
+	s.mu.RUnlock()
+	if hook != nil {
+		hook()
+	}
+
+	if err := ctx.Err(); err != nil {
+		return rollbackPublicKey(err)
+	}
+
+	s.mu.Lock()
+	syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
+	s.mu.Unlock()
+
+	if syncErr != nil {
+		return rollbackPublicKey(syncErr)
+	}
+
+	return nil
+}
+
 type deleteServerContextKey struct{}
 
 func withDeleteServer(ctx context.Context) context.Context {

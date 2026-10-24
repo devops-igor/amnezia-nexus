@@ -202,9 +202,7 @@ type Service struct {
 	// buckets, so a return-direction loss stays a return-direction loss after
 	// the device is gone. The accumulator carries the SAME fields as a live
 	// device's contribution, which is what lets a retired loss be published
-	// under the same key a live one uses.
-	//
-	// guarded by mu
+	// under the same key a live one uses. Guarded by mu.
 	retiredBackendDeviceDrops  backendDeviceDropStats
 	restartInvalidatedSessions atomic.Int64
 	freshSessionRegistrations  atomic.Int64
@@ -229,6 +227,7 @@ type Service struct {
 	postCommitRevokeHookForTest            func(kind database.PeerRevokeKind, userID string, clientID string)
 	updateBackendServerHostPreLockHook     func()
 	updateBackendServerHostErr             error
+	publicKeyUpdateSeams                   publicKeyUpdateSeams
 	deleteBackendErr                       error
 	syncBackendForwarderHook               func() error
 	enableBackendPreAddTunnelHook          func()
