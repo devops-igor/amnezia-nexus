@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - Eclipse - 2026-10-24
+
+Feature and maintenance release adding direct QR code PNG image download in connection modals, offline server connection guards, automated architectural health tracking, and completed modularization across VPN services and WireGuard managers.
+
+### Added
+- Direct QR code image download: added PNG download button to connection share modals and user connection cards (#622, #623).
+- Architecture health report and ratcheting baseline: added automated CI verification tool measuring file line counts and commit churn against baseline ceilings (#521, #606).
+- Module ownership conventions and agent navigation hub: added repository standards guide, PR review checklist, navigation hub, and official MIT license (#522, #628).
+
+### Changed
+- Offline server protection: added reachability guard preventing client connection creation on unreachable or offline servers, returning HTTP 409 Conflict with `server_unavailable` and displaying `(Offline)` in UI server selection (#626, #627).
+- Configuration format labeling: corrected modal title and filename attributes for AmneziaWG configuration downloads (.conf vs .vpn) (#622, #623).
+
+### Fixed
+- WireGuard identity synchronization: reconciled tunnel public key updates, CAS versioning, and compensation rollback handlers to prevent key divergence and state split-brains during configuration failures (#438, #442).
+
+### Refactored
+- VPN service modularization: extracted portal endpoint discovery to endpoint.go (#514, #624), and decoupled live session queries and test hooks to sessions_live.go and service_test_hooks.go (#515, #625).
+- WireGuard manager decomposition: extracted host install, Docker setup, container lifecycle, and NAT/routing helpers into awg_install.go, and container caching into awg_container_cache.go (#540, #629).
+- WireGuard test suite decomposition: split monolithic awg_test.go into five focused companion test files (awg_install_test.go, awg_container_cache_test.go, awg_server_config_test.go, awg_client_test.go, awg_status_test.go), reducing awg_test.go from 2,706 to 382 lines while strictly preserving all 264 tests and 85.6% coverage (#541, #630).
+
 ## [2.4.0] - Quasar - 2026-10-22
 
 Feature and stability release introducing full-stack SIP obfuscation and CPS auto-mimicry defaults, operation-aware router context timeouts, concurrent keypair persistence synchronization, and complete architectural modularization across backend services and frontend interfaces.
