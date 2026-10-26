@@ -13,6 +13,9 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GOFLAGS: -tags=with_utls
+
 jobs:
   lint-and-security:
     name: Lint & Security Audit
@@ -50,7 +53,7 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
 
       - name: Run gosec Security Scanner
-        run: gosec -quiet ./...
+        run: gosec -tags with_utls -quiet ./...
 
       - name: Run govulncheck Vulnerability Scanner
         run: govulncheck ./...
@@ -81,6 +84,9 @@ jobs:
 
       - name: Run Tests with Race Detector
         run: go test -race -cover -count=1 -coverprofile=coverage.out ./...
+
+      - name: Run Vision Tests (non-race)
+        run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
 
       - name: Upload Test Coverage
         uses: actions/upload-artifact@v4
@@ -116,7 +122,7 @@ jobs:
           GOARCH: ${{ matrix.target.arch }}
         run: |
           mkdir -p bin
-          go build -trimpath -ldflags="-s -w" -o bin/panel-${{ matrix.target.os }}-${{ matrix.target.arch }} ./cmd/panel
+          go build -tags with_utls -trimpath -ldflags="-s -w" -o bin/panel-${{ matrix.target.os }}-${{ matrix.target.arch }} ./cmd/panel
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4

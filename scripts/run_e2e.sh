@@ -59,7 +59,7 @@ wait_for_server() {
 
 # 1. Build binary
 echo "==> Building Go panel binary..."
-(cd "$GO_DIR" && go build -trimpath -ldflags="-s -w" -o bin/panel ./cmd/panel)
+(cd "$GO_DIR" && go build -tags with_utls -trimpath -ldflags="-s -w" -o bin/panel ./cmd/panel)
 
 # 2. Seed database
 echo "==> Seeding E2E test database..."

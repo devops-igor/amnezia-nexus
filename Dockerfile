@@ -17,7 +17,7 @@ RUN go mod download
 COPY . .
 
 # Build stripped statically linked production binary with CGO disabled
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /build/bin/panel ./cmd/panel
+RUN CGO_ENABLED=0 go build -tags with_utls -trimpath -ldflags="-s -w" -o /build/bin/panel ./cmd/panel
 
 # =============================================================================
 # Stage 2: Production Stage (Lean Alpine runtime ~41MB)
