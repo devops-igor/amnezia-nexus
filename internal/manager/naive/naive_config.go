@@ -55,15 +55,19 @@ func RenderCaddyfile(port int, domain string, clients []NaiveClient) string {
 	sb.WriteString("    route {\n")
 	sb.WriteString("        forward_proxy {\n")
 
+	hasAuth := false
 	for _, c := range clients {
 		if c.Username != "" && c.Password != "" {
+			hasAuth = true
 			fmt.Fprintf(&sb, "            basic_auth %s %s\n", c.Username, c.Password)
 		}
 	}
 
 	sb.WriteString("            hide_ip\n")
 	sb.WriteString("            hide_via\n")
-	sb.WriteString("            probe_resistance\n")
+	if hasAuth {
+		sb.WriteString("            probe_resistance\n")
+	}
 	sb.WriteString("        }\n")
 	sb.WriteString("        root * /srv\n")
 	sb.WriteString("        file_server\n")
@@ -165,9 +169,18 @@ func DefaultDecoyHTML() string {
         <p>We blend art and technology to build memorable visual identities and immersive digital architecture.</p>
     </main>
     <footer>
-        &copy; 2026 Aura Creative Studio. All rights reserved.
+    &copy; 2026 Aura Creative Studio. All rights reserved.
     </footer>
-</body>
-</html>
-`
+    </body>
+    </html>
+    `
+}
+
+// RenderCaddyDockerfile returns the multi-stage Dockerfile for Caddy with forwardproxy.
+func RenderCaddyDockerfile() string {
+	return `FROM caddy:builder AS builder
+    RUN xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024
+    FROM caddy:alpine
+    COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+    `
 }

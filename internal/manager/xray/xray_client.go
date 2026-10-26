@@ -12,6 +12,35 @@ import (
 	"github.com/google/uuid"
 )
 
+func resolveClientName(clientID string, clientParams map[string]any) string {
+	name := fmt.Sprintf("client-%s", clientID[:8])
+	if n, ok := clientParams["name"].(string); ok && strings.TrimSpace(n) != "" {
+		return strings.TrimSpace(n)
+	}
+	if email, ok := clientParams["email"].(string); ok && strings.TrimSpace(email) != "" {
+		return strings.TrimSpace(email)
+	}
+	return name
+}
+
+func resolveClientFlow(server *models.Server, clientParams map[string]any) string {
+	flow := "xtls-rprx-vision"
+	if server != nil && server.Protocols != nil {
+		if pMap, ok := server.Protocols[models.ProtocolVLESS].(map[string]any); ok {
+			if f, ok := pMap["flow"].(string); ok && strings.TrimSpace(f) != "" {
+				flow = strings.TrimSpace(f)
+			}
+		}
+	}
+	if f, ok := clientParams["flow"].(string); ok && strings.TrimSpace(f) != "" {
+		flow = strings.TrimSpace(f)
+	}
+	if flow == "none" {
+		return ""
+	}
+	return flow
+}
+
 // AddClient adds a new VLESS+REALITY client credential, uploads updated config, and restarts the container.
 func (m *XrayManager) AddClient(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
 	client, err := m.getSSHClient(ctx, server)
@@ -42,22 +71,13 @@ func (m *XrayManager) AddClient(ctx context.Context, server *models.Server, clie
 
 	// 2. Generate client identity
 	clientID := uuid.NewString()
-	name := fmt.Sprintf("client-%s", clientID[:8])
-	if n, ok := clientParams["name"].(string); ok && strings.TrimSpace(n) != "" {
-		name = strings.TrimSpace(n)
-	} else if email, ok := clientParams["email"].(string); ok && strings.TrimSpace(email) != "" {
-		name = strings.TrimSpace(email)
-	}
+	name := resolveClientName(clientID, clientParams)
+	flow := resolveClientFlow(server, clientParams)
 
-	flow := "xtls-rprx-vision"
-	if f, ok := clientParams["flow"].(string); ok {
-		flow = f
-	}
-
-	// 3. Append client to inbounds
+	// 3. Append client to inbounds (Email must be unique clientID to prevent Xray crash on duplicate display names)
 	newClient := XrayClient{
 		ID:    clientID,
-		Email: name,
+		Email: clientID,
 		Flow:  flow,
 	}
 	cfg.Inbounds[0].Settings.Clients = append(cfg.Inbounds[0].Settings.Clients, newClient)
@@ -65,7 +85,7 @@ func (m *XrayManager) AddClient(ctx context.Context, server *models.Server, clie
 	if len(cfg.Inbounds) > 1 {
 		cfg.Inbounds[1].Settings.Clients = append(cfg.Inbounds[1].Settings.Clients, XrayClient{
 			ID:    clientID,
-			Email: name,
+			Email: clientID,
 			Flow:  "xtls-rprx-vision",
 		})
 	}

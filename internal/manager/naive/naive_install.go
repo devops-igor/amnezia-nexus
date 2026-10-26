@@ -88,14 +88,21 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 		return fmt.Errorf("upload decoy index.html: %w", err)
 	}
 
-	// 5. Write local DNS resolver configuration
-	resolvConf := "nameserver 127.0.0.1\noptions no-aaaa\n"
-	_ = client.UploadSudoFile(ctx, NaiveResolvConf, []byte(resolvConf), 0644)
-
-	// 6. Render and upload initial Caddyfile
+	// 5. Render and upload initial Caddyfile
 	caddyfileContent := RenderCaddyfile(port, domain, []NaiveClient{})
 	if err := client.UploadSudoFile(ctx, NaiveCaddyfilePath, []byte(caddyfileContent), 0644); err != nil {
 		return fmt.Errorf("upload Caddyfile: %w", err)
+	}
+
+	// 6. Upload Dockerfile and build local Caddy image with forwardproxy
+	dockerfile := RenderCaddyDockerfile()
+	if err := client.UploadSudoFile(ctx, fmt.Sprintf("%s/Dockerfile", NaiveConfigDir), []byte(dockerfile), 0644); err != nil {
+		return fmt.Errorf("failed to upload Caddy Dockerfile: %w", err)
+	}
+
+	buildCmd := fmt.Sprintf("docker build -t %s %s", ssh.EscapeShellArg(NaiveBaseImage), ssh.EscapeShellArg(NaiveConfigDir))
+	if _, errOut, code, err := client.RunSudoCommand(ctx, buildCmd); err != nil || code != 0 {
+		return fmt.Errorf("failed to build caddy image (code %d): %s: %w", code, errOut, err)
 	}
 
 	// 7. Ensure persistent data volume for Let's Encrypt certificates
@@ -106,24 +113,22 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 		ssh.EscapeShellArg(NaiveContainerName), ssh.EscapeShellArg(NaiveContainerName))
 	_, _, _, _ = client.RunSudoCommand(ctx, stopCmd)
 
-	// Best-effort image pull
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker pull %s 2>/dev/null || true", ssh.EscapeShellArg(NaiveBaseImage)))
-
 	// 9. Launch amnezia-caddy container
 	runCmd := fmt.Sprintf(`docker run -d \
 --name %s \
 --restart unless-stopped \
 --network host \
--v %s:/etc/caddy/Caddyfile:ro \
+--log-driver none \
+--tmpfs /tmp:rw,noexec,nosuid,size=16m \
+--tmpfs /run:rw,noexec,nosuid,size=16m \
+-v %s:/etc/caddy:ro \
 -v %s:/srv:ro \
 -v %s:/data \
--v %s:/etc/resolv.conf:ro \
 %s`,
 		ssh.EscapeShellArg(NaiveContainerName),
-		ssh.EscapeShellArg(NaiveCaddyfilePath),
+		ssh.EscapeShellArg(NaiveConfigDir),
 		ssh.EscapeShellArg(NaiveHTMLDir),
 		ssh.EscapeShellArg(NaiveDataVolume),
-		ssh.EscapeShellArg(NaiveResolvConf),
 		ssh.EscapeShellArg(NaiveBaseImage),
 	)
 
@@ -131,11 +136,15 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 		return fmt.Errorf("failed to run naive caddy container (code %d): %s: %w", code, errOut, err)
 	}
 
-	// 10. Verify container is alive
-	checkCmd := fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Names}}'", ssh.EscapeShellArg(NaiveContainerName))
-	out, _, code, err = client.RunCommand(ctx, checkCmd)
-	if err != nil || code != 0 || !strings.Contains(out, NaiveContainerName) {
-		return fmt.Errorf("caddy container failed to start: %s", out)
+	// 10. Verify container is alive and not restarting
+	checkCmd := fmt.Sprintf("docker inspect -f '{{.State.Running}} {{.State.Restarting}}' %s", ssh.EscapeShellArg(NaiveContainerName))
+	out, errOut, code, err := client.RunSudoCommand(ctx, checkCmd)
+	if err != nil || code != 0 {
+		return fmt.Errorf("caddy container failed to inspect (code %d): %s: %w", code, errOut, err)
+	}
+	fields := strings.Fields(strings.TrimSpace(out))
+	if len(fields) < 2 || fields[0] != "true" || fields[1] != "false" {
+		return fmt.Errorf("caddy container is not running (state: %s)", strings.TrimSpace(out))
 	}
 
 	// Update server.Protocols in-memory

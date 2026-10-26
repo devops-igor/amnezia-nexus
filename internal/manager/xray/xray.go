@@ -16,7 +16,6 @@ const (
 	XrayContainerName = "amnezia-xray"
 	XrayConfigDir     = "/opt/amnezia/xray"
 	XrayConfigPath    = "/opt/amnezia/xray/config.json"
-	XrayResolvConf    = "/opt/amnezia/xray/resolv.conf"
 	XrayBaseImage     = "ghcr.io/xtls/xray-core:26.10.21"
 )
 
@@ -104,7 +103,7 @@ func (m *XrayManager) GetServerStatus(ctx context.Context, server *models.Server
 	}
 
 	cmd := fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Names}}'", ssh.EscapeShellArg(XrayContainerName))
-	out, _, code, err := client.RunCommand(ctx, cmd)
+	out, _, code, err := client.RunSudoCommand(ctx, cmd)
 	if err != nil || code != 0 {
 		m.containerCache.set(cacheKey, false)
 		return map[string]any{"container_running": false}, nil

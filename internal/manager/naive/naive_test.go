@@ -52,6 +52,21 @@ func (m *mockNaiveSSHClient) RunSudoCommand(ctx context.Context, cmd string) (st
 	defer m.mu.Unlock()
 	m.commands = append(m.commands, "sudo: "+cmd)
 
+	if strings.Contains(cmd, "docker inspect") {
+		if m.dockerAlive {
+			return "true false\n", "", 0, nil
+		}
+		return "false false\n", "", 0, nil
+	}
+	if strings.Contains(cmd, "docker ps") && strings.Contains(cmd, "amnezia-caddy") {
+		if m.dockerAlive {
+			return "amnezia-caddy\n", "", 0, nil
+		}
+		return "", "", 0, nil
+	}
+	if strings.Contains(cmd, "docker build") {
+		return "Successfully built", "", 0, nil
+	}
 	if strings.Contains(cmd, "docker run") {
 		m.dockerAlive = true
 		return "container_id_caddy", "", 0, nil
@@ -345,5 +360,141 @@ func TestNaiveManager_Lifecycle(t *testing.T) {
 	}
 	if running, _ := statusAfterUninstall["container_running"].(bool); running {
 		t.Errorf("expected container_running=false after uninstall")
+	}
+}
+
+func TestNaiveConfig_ZeroClientsNoProbeResistance(t *testing.T) {
+	// B5 assertion: zero-client Caddyfile must NOT emit probe_resistance
+	caddyfileNil := RenderCaddyfile(443, "vpn.example.com", nil)
+	if strings.Contains(caddyfileNil, "probe_resistance") {
+		t.Errorf("RenderCaddyfile with nil clients must not contain probe_resistance:\n%s", caddyfileNil)
+	}
+
+	caddyfileEmpty := RenderCaddyfile(443, "vpn.example.com", []NaiveClient{})
+	if strings.Contains(caddyfileEmpty, "probe_resistance") {
+		t.Errorf("RenderCaddyfile with empty clients must not contain probe_resistance:\n%s", caddyfileEmpty)
+	}
+
+	// When clients with credentials exist, probe_resistance MUST be present
+	caddyfileWithClients := RenderCaddyfile(443, "vpn.example.com", []NaiveClient{
+		{Username: "user1", Password: "test_secret_pass_123"},
+	})
+	if !strings.Contains(caddyfileWithClients, "probe_resistance") {
+		t.Errorf("RenderCaddyfile with authenticated clients must contain probe_resistance:\n%s", caddyfileWithClients)
+	}
+	if !strings.Contains(caddyfileWithClients, "basic_auth user1 test_secret_pass_123") {
+		t.Errorf("RenderCaddyfile missing basic_auth directive:\n%s", caddyfileWithClients)
+	}
+}
+
+func TestNaiveManager_DockerBuildAndDirectoryMount(t *testing.T) {
+	mockSSH := newMockNaiveSSHClient()
+	pool := &mockNaivePool{client: mockSSH}
+	locks := awg.NewServerLockRegistry()
+	mgr := NewNaiveManagerWithServerLocks(pool, locks)
+
+	server := &models.Server{
+		ID:      89,
+		Host:    "198.51.100.2",
+		SSHPort: 22,
+	}
+	ctx := context.Background()
+
+	installParams := map[string]any{
+		"port": 443,
+		"naive_options": models.NaiveInstallOptions{
+			Port:   "443",
+			Domain: "naive.example.com",
+		},
+	}
+
+	if err := mgr.Install(ctx, server, installParams); err != nil {
+		t.Fatalf("Install failed: %v", err)
+	}
+
+	// B4 assertion: Dockerfile must be uploaded with xcaddy builder for klzgrad/forwardproxy
+	dockerfilePath := NaiveConfigDir + "/Dockerfile"
+	dfBytes, ok := mockSSH.files[dockerfilePath]
+	if !ok || len(dfBytes) == 0 {
+		t.Fatalf("Dockerfile was not uploaded to %s", dockerfilePath)
+	}
+	dfContent := string(dfBytes)
+	if !strings.Contains(dfContent, "FROM caddy:builder AS builder") {
+		t.Errorf("Dockerfile missing builder stage:\n%s", dfContent)
+	}
+	if !strings.Contains(dfContent, "c096d6a00cb28e019cc1995b04bdc6a9311d8024") {
+		t.Errorf("Dockerfile missing pinned forwardproxy commit digest:\n%s", dfContent)
+	}
+	if !strings.Contains(dfContent, "FROM caddy:alpine") {
+		t.Errorf("Dockerfile missing alpine runtime stage:\n%s", dfContent)
+	}
+
+	// B4 assertion: docker build command was executed with sudo
+	var buildCmd string
+	var runCmd string
+	var inspectCmd string
+	for _, cmd := range mockSSH.commands {
+		if strings.Contains(cmd, "docker build") {
+			buildCmd = cmd
+		}
+		if strings.Contains(cmd, "docker run") {
+			runCmd = cmd
+		}
+		if strings.Contains(cmd, "docker inspect") {
+			inspectCmd = cmd
+		}
+	}
+
+	if buildCmd == "" || !strings.HasPrefix(buildCmd, "sudo: ") {
+		t.Errorf("expected docker build via RunSudoCommand, got %q", buildCmd)
+	}
+	if !strings.Contains(buildCmd, "-t 'amnezia-caddy:local'") {
+		t.Errorf("expected docker build tag amnezia-caddy:local, got: %s", buildCmd)
+	}
+
+	// H1 & Hardening assertions: directory mount instead of single file, no resolv.conf, hardening flags
+	if runCmd == "" {
+		t.Fatalf("docker run command was not recorded")
+	}
+	if !strings.Contains(runCmd, "-v '/opt/amnezia/caddy':/etc/caddy:ro") {
+		t.Errorf("docker run must mount config directory /opt/amnezia/caddy, got:\n%s", runCmd)
+	}
+	if strings.Contains(runCmd, "/etc/caddy/Caddyfile:ro") {
+		t.Errorf("docker run must NOT mount single file Caddyfile directly:\n%s", runCmd)
+	}
+	if strings.Contains(runCmd, "resolv.conf") {
+		t.Errorf("docker run must NOT mount resolv.conf:\n%s", runCmd)
+	}
+	if !strings.Contains(runCmd, "'amnezia-caddy:local'") {
+		t.Errorf("docker run must use local built image amnezia-caddy:local, got:\n%s", runCmd)
+	}
+	if !strings.Contains(runCmd, "--log-driver none") {
+		t.Errorf("docker run missing --log-driver none flag:\n%s", runCmd)
+	}
+	if !strings.Contains(runCmd, "--tmpfs /tmp:rw,noexec,nosuid,size=16m") {
+		t.Errorf("docker run missing tmpfs /tmp flag:\n%s", runCmd)
+	}
+
+	// H2 assertion: inspectCmd was executed with sudo
+	if inspectCmd == "" || !strings.HasPrefix(inspectCmd, "sudo: ") {
+		t.Errorf("expected docker inspect via RunSudoCommand, got %q", inspectCmd)
+	}
+
+	// H2 assertion: GetServerStatus uses RunSudoCommand for docker ps
+	mockSSH.commands = nil
+	if _, err := mgr.GetServerStatus(ctx, server); err != nil {
+		t.Fatalf("GetServerStatus failed: %v", err)
+	}
+	var psFound bool
+	for _, cmd := range mockSSH.commands {
+		if strings.Contains(cmd, "docker ps") {
+			psFound = true
+			if !strings.HasPrefix(cmd, "sudo: ") {
+				t.Errorf("docker ps must be run with sudo in GetServerStatus, got: %s", cmd)
+			}
+		}
+	}
+	if !psFound {
+		t.Errorf("docker ps was not executed in GetServerStatus")
 	}
 }

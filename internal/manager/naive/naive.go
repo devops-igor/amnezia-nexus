@@ -17,9 +17,8 @@ const (
 	NaiveConfigDir     = "/opt/amnezia/caddy"
 	NaiveHTMLDir       = "/opt/amnezia/caddy/html"
 	NaiveCaddyfilePath = "/opt/amnezia/caddy/Caddyfile"
-	NaiveResolvConf    = "/opt/amnezia/caddy/resolv.conf"
 	NaiveDataVolume    = "amnezia-caddy-data"
-	NaiveBaseImage     = "devopsigor/caddy-naive:latest"
+	NaiveBaseImage     = "amnezia-caddy:local"
 )
 
 // SSHProvider abstracts obtaining an SSHClient for a server.
@@ -98,7 +97,7 @@ func (m *NaiveManager) GetServerStatus(ctx context.Context, server *models.Serve
 	}
 
 	cmd := fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Names}}'", ssh.EscapeShellArg(NaiveContainerName))
-	out, _, code, err := client.RunCommand(ctx, cmd)
+	out, _, code, err := client.RunSudoCommand(ctx, cmd)
 	if err != nil || code != 0 {
 		return map[string]any{"container_running": false}, nil
 	}

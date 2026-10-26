@@ -75,7 +75,7 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	}
 
 	// 2. Parse installation options
-	portPrimary, serverName, _ := parseXrayInstallOptions(params)
+	portPrimary, serverName, flow := parseXrayInstallOptions(params)
 
 	// 3. Generate REALITY cryptographic credentials
 	privB64, pubB64, err := GenerateRealityKeypair()
@@ -94,11 +94,7 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 		return fmt.Errorf("failed to create xray config directory (code %d): %s: %w", code, errOut, err)
 	}
 
-	// 5. Write local DNS resolver configuration (loopback Unbound with no-aaaa)
-	resolvConf := "nameserver 127.0.0.1\noptions no-aaaa\n"
-	_ = client.UploadSudoFile(ctx, XrayResolvConf, []byte(resolvConf), 0644)
-
-	// 6. Render and upload initial config.json
+	// 5. Render and upload initial config.json
 	portHigh := 54321
 	dest := netJoinHostPort(serverName, "443")
 	cfgBytes, err := RenderXrayConfig(portPrimary, portHigh, serverName, dest, privB64, []string{shortID}, []XrayClient{})
@@ -110,7 +106,7 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 		return fmt.Errorf("upload xray config: %w", err)
 	}
 
-	// 7. Cleanup any stale xray container
+	// 6. Cleanup any stale xray container
 	stopCmd := fmt.Sprintf("docker stop %s 2>/dev/null || true; docker rm -fv %s 2>/dev/null || true",
 		ssh.EscapeShellArg(XrayContainerName), ssh.EscapeShellArg(XrayContainerName))
 	_, _, _, _ = client.RunSudoCommand(ctx, stopCmd)
@@ -118,19 +114,24 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	// Best effort image pull
 	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker pull %s 2>/dev/null || true", ssh.EscapeShellArg(XrayBaseImage)))
 
-	// 8. Launch amnezia-xray container
+	// 7. Launch amnezia-xray container
 	runCmd := fmt.Sprintf(`docker run -d \
 --name %s \
 --restart unless-stopped \
 --network host \
--v %s:/usr/local/etc/xray/config.json:ro \
--v %s:/etc/xray/config.json:ro \
--v %s:/etc/resolv.conf:ro \
+--user 0:0 \
+--cap-drop ALL \
+--cap-add NET_BIND_SERVICE \
+--security-opt no-new-privileges:true \
+--log-driver none \
+--tmpfs /tmp:rw,noexec,nosuid,size=16m \
+--tmpfs /run:rw,noexec,nosuid,size=16m \
+-v %s:/etc/xray:ro \
+-v %s:/usr/local/etc/xray:ro \
 %s`,
 		ssh.EscapeShellArg(XrayContainerName),
-		ssh.EscapeShellArg(XrayConfigPath),
-		ssh.EscapeShellArg(XrayConfigPath),
-		ssh.EscapeShellArg(XrayResolvConf),
+		ssh.EscapeShellArg(XrayConfigDir),
+		ssh.EscapeShellArg(XrayConfigDir),
 		ssh.EscapeShellArg(XrayBaseImage),
 	)
 
@@ -138,11 +139,15 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 		return fmt.Errorf("failed to run xray container (code %d): %s: %w", code, errOut, err)
 	}
 
-	// 9. Verify container is alive
-	checkCmd := fmt.Sprintf("docker ps --filter name=^%s$ --format '{{.Names}}'", ssh.EscapeShellArg(XrayContainerName))
-	out, _, code, err = client.RunCommand(ctx, checkCmd)
-	if err != nil || code != 0 || !strings.Contains(out, XrayContainerName) {
-		return fmt.Errorf("xray container failed to start: %s", out)
+	// 8. Verify container is alive and not restarting
+	checkCmd := fmt.Sprintf("docker inspect -f '{{.State.Running}} {{.State.Restarting}}' %s", ssh.EscapeShellArg(XrayContainerName))
+	out, errOut, code, err := client.RunSudoCommand(ctx, checkCmd)
+	if err != nil || code != 0 {
+		return fmt.Errorf("xray container failed to inspect (code %d): %s: %w", code, errOut, err)
+	}
+	fields := strings.Fields(strings.TrimSpace(out))
+	if len(fields) < 2 || fields[0] != "true" || fields[1] != "false" {
+		return fmt.Errorf("xray container is not running (state: %s)", strings.TrimSpace(out))
 	}
 
 	m.containerCache.set(m.containerCache.keyForServer(server), true)
@@ -157,6 +162,7 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 		"server_name": serverName,
 		"public_key":  pubB64,
 		"short_id":    shortID,
+		"flow":        flow,
 	}
 
 	return nil

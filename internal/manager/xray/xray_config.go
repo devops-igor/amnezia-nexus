@@ -18,7 +18,7 @@ import (
 //nolint:revive
 type XrayConfig struct {
 	Log       XrayLog        `json:"log"`
-	DNS       XrayDNS        `json:"dns"`
+	DNS       *XrayDNS       `json:"dns,omitempty"`
 	Inbounds  []XrayInbound  `json:"inbounds"`
 	Outbounds []XrayOutbound `json:"outbounds"`
 }
@@ -160,10 +160,6 @@ func RenderXrayConfig(
 		Log: XrayLog{
 			LogLevel: "none",
 		},
-		DNS: XrayDNS{
-			Servers:       []string{"127.0.0.1"},
-			QueryStrategy: "UseIPv4",
-		},
 		Inbounds: []XrayInbound{
 			{
 				Port:     portPrimary,
@@ -259,7 +255,7 @@ func BuildVLESSURI(
 	query.Set("sni", sni)
 	query.Set("sid", sid)
 	query.Set("type", "tcp")
-	if flow != "" {
+	if flow != "" && flow != "none" {
 		query.Set("flow", flow)
 	}
 
