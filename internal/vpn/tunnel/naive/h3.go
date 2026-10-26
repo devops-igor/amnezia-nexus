@@ -224,14 +224,23 @@ type h3Conn struct {
 }
 
 func (c *h3Conn) Read(b []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	return c.stream.Read(b)
 }
 
 func (c *h3Conn) Write(b []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	return c.stream.Write(b)
 }
 
 func (c *h3Conn) CloseWrite() error {
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
 	return c.stream.Close()
 }
 
@@ -240,7 +249,8 @@ func (c *h3Conn) Close() error {
 		return nil
 	}
 	c.stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
-	return c.stream.Close()
+	c.stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeNoError))
+	return nil
 }
 
 func (c *h3Conn) LocalAddr() net.Addr {

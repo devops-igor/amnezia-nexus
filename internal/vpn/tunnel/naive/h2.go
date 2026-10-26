@@ -23,38 +23,78 @@ var (
 type h2Pool struct {
 	mu sync.Mutex
 	//nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
-	cc         *http2.ClientConn
+	cc *http2.ClientConn
+	//nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
+	conns      map[*http2.ClientConn]struct{}
+	closed     bool
 	localAddr  net.Addr
 	remoteAddr net.Addr
 }
 
+//nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
 func newH2Pool() *h2Pool {
-	return &h2Pool{}
-}
-
-func (p *h2Pool) close() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.cc != nil {
-		_ = p.cc.Close()
-		p.cc = nil
+	return &h2Pool{
+		conns: make(map[*http2.ClientConn]struct{}),
 	}
 }
 
 //nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
+func (p *h2Pool) close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+	for cc := range p.conns {
+		_ = cc.Close()
+	}
+	p.conns = make(map[*http2.ClientConn]struct{})
+	p.cc = nil
+}
+
+//nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
 func (p *h2Pool) invalidate(cc *http2.ClientConn) {
+	if cc == nil {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.cc == cc {
 		p.cc = nil
-		go func() { _ = cc.Shutdown(context.Background()) }()
 	}
+	delete(p.conns, cc)
+	go func() { _ = cc.Shutdown(context.Background()) }()
+}
+
+// trackedConns returns a slice of all active and retired connections currently tracked by the pool.
+//
+//nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
+func (p *h2Pool) trackedConns() []*http2.ClientConn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	res := make([]*http2.ClientConn, 0, len(p.conns))
+	for cc := range p.conns {
+		res = append(res, cc)
+	}
+	return res
 }
 
 //nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
 func (d *Dialer) getH2Conn(ctx context.Context) (*http2.ClientConn, net.Addr, net.Addr, error) {
 	d.h2Pool.mu.Lock()
 	defer d.h2Pool.mu.Unlock()
+
+	if d.h2Pool.closed {
+		return nil, nil, nil, net.ErrClosed
+	}
+
+	if d.h2Pool.conns == nil {
+		d.h2Pool.conns = make(map[*http2.ClientConn]struct{})
+	}
+
+	for c := range d.h2Pool.conns {
+		if c.State().Closed {
+			delete(d.h2Pool.conns, c)
+		}
+	}
 
 	if d.h2Pool.cc != nil && d.h2Pool.cc.CanTakeNewRequest() {
 		return d.h2Pool.cc, d.h2Pool.localAddr, d.h2Pool.remoteAddr, nil
@@ -94,6 +134,7 @@ func (d *Dialer) getH2Conn(ctx context.Context) (*http2.ClientConn, net.Addr, ne
 	}
 
 	d.h2Pool.cc = cc
+	d.h2Pool.conns[cc] = struct{}{}
 	d.h2Pool.localAddr = tlsConn.LocalAddr()
 	d.h2Pool.remoteAddr = tlsConn.RemoteAddr()
 
