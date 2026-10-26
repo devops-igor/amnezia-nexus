@@ -173,13 +173,52 @@ func (m *NaiveManager) Uninstall(ctx context.Context, server *models.Server) err
 	}
 	defer unlock()
 
-	cleanupCmd := fmt.Sprintf(
-		"docker stop %s 2>/dev/null || true; docker rm -fv %s 2>/dev/null || true; rm -rf %s",
-		ssh.EscapeShellArg(NaiveContainerName),
-		ssh.EscapeShellArg(NaiveContainerName),
-		ssh.EscapeShellArg(NaiveConfigDir),
-	)
-	_, _, _, _ = client.RunSudoCommand(ctx, cleanupCmd)
+	// 1. Inspect whether container is absent
+	inspectCmd := fmt.Sprintf("docker inspect %s", ssh.EscapeShellArg(NaiveContainerName))
+	out, errOut, code, err := client.RunSudoCommand(ctx, inspectCmd)
+	if err != nil {
+		return fmt.Errorf("failed to inspect naive container: %w", err)
+	}
+
+	containerAbsent := false
+	if code != 0 {
+		combined := strings.ToLower(out + " " + errOut)
+		if strings.Contains(combined, "no such") {
+			containerAbsent = true
+		} else {
+			return fmt.Errorf("failed to inspect naive container (code %d): %s", code, strings.TrimSpace(errOut))
+		}
+	} else if strings.TrimSpace(out) == "false false" {
+		containerAbsent = true
+	}
+
+	// 2. If present, stop and remove container without || true
+	if !containerAbsent {
+		rmCmd := fmt.Sprintf("docker stop %s && docker rm -fv %s",
+			ssh.EscapeShellArg(NaiveContainerName),
+			ssh.EscapeShellArg(NaiveContainerName),
+		)
+		if _, errOut, code, err := client.RunSudoCommand(ctx, rmCmd); err != nil || code != 0 {
+			return fmt.Errorf("failed to stop and remove naive container (code %d): %s: %w", code, strings.TrimSpace(errOut), err)
+		}
+
+		verifyOut, verifyErrOut, verifyCode, verifyErr := client.RunSudoCommand(ctx, inspectCmd)
+		if verifyErr != nil {
+			return fmt.Errorf("failed to verify naive container removal: %w", verifyErr)
+		}
+		if verifyCode == 0 && strings.TrimSpace(verifyOut) != "false false" {
+			return fmt.Errorf("naive container %s still present after removal", NaiveContainerName)
+		}
+		if verifyCode != 0 && !strings.Contains(strings.ToLower(verifyOut+" "+verifyErrOut), "no such") {
+			return fmt.Errorf("unexpected inspect status for %s (code %d): %s", NaiveContainerName, verifyCode, strings.TrimSpace(verifyErrOut))
+		}
+	}
+
+	// 3. Remove configuration directory only after container removal is confirmed
+	rmDirCmd := fmt.Sprintf("rm -rf %s", ssh.EscapeShellArg(NaiveConfigDir))
+	if _, errOut, code, err := client.RunSudoCommand(ctx, rmDirCmd); err != nil || code != 0 {
+		return fmt.Errorf("failed to remove naive config directory (code %d): %s: %w", code, strings.TrimSpace(errOut), err)
+	}
 
 	if server.Protocols != nil {
 		delete(server.Protocols, models.ProtocolNaive)

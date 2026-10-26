@@ -578,8 +578,8 @@ func TestServerHandlers(t *testing.T) {
 		reqUninst := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/uninstall", sErrID), bytes.NewReader(bodyUninst))
 		wUninst := httptest.NewRecorder()
 		rError.ServeHTTP(wUninst, reqUninst)
-		if wUninst.Code != http.StatusOK {
-			t.Errorf("expected 200 for uninstall, got %d", wUninst.Code)
+		if wUninst.Code != http.StatusInternalServerError {
+			t.Errorf("expected 500 for uninstall error, got %d", wUninst.Code)
 		}
 	})
 

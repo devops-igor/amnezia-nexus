@@ -2,6 +2,7 @@ package naive
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"os"
 	"strings"
@@ -271,6 +272,9 @@ func TestNaiveManager_Lifecycle(t *testing.T) {
 	if !strings.Contains(string(caddyfileBytes), "naive.example.com") {
 		t.Errorf("uploaded Caddyfile missing domain")
 	}
+	if strings.Contains(string(caddyfileBytes), "forward_proxy") {
+		t.Errorf("initial install Caddyfile with 0 clients must NOT contain forward_proxy directive")
+	}
 
 	decoyBytes, ok := mockSSH.files[NaiveHTMLDir+"/index.html"]
 	if !ok || len(decoyBytes) == 0 {
@@ -340,6 +344,11 @@ func TestNaiveManager_Lifecycle(t *testing.T) {
 		t.Errorf("expected 2 caddy reload invocations after remove, got %d", mockSSH.reloaded)
 	}
 
+	caddyfileAfterRemove := string(mockSSH.files[NaiveCaddyfilePath])
+	if strings.Contains(caddyfileAfterRemove, "forward_proxy") {
+		t.Errorf("Caddyfile after removing last client must NOT contain forward_proxy directive:\n%s", caddyfileAfterRemove)
+	}
+
 	clientsAfterRemove, err := mgr.GetClients(ctx, server)
 	if err != nil {
 		t.Fatalf("GetClients after remove: %v", err)
@@ -364,26 +373,85 @@ func TestNaiveManager_Lifecycle(t *testing.T) {
 }
 
 func TestNaiveConfig_ZeroClientsNoProbeResistance(t *testing.T) {
-	// B5 assertion: zero-client Caddyfile must NOT emit probe_resistance
+	// B5 & R2-B1 assertion: zero-client Caddyfile must NOT emit probe_resistance or forward_proxy
 	caddyfileNil := RenderCaddyfile(443, "vpn.example.com", nil)
 	if strings.Contains(caddyfileNil, "probe_resistance") {
 		t.Errorf("RenderCaddyfile with nil clients must not contain probe_resistance:\n%s", caddyfileNil)
+	}
+	if strings.Contains(caddyfileNil, "forward_proxy") {
+		t.Errorf("RenderCaddyfile with nil clients must NOT contain forward_proxy directive:\n%s", caddyfileNil)
+	}
+	if !strings.Contains(caddyfileNil, "root * /srv") || !strings.Contains(caddyfileNil, "file_server") {
+		t.Errorf("RenderCaddyfile with nil clients must contain decoy site:\n%s", caddyfileNil)
 	}
 
 	caddyfileEmpty := RenderCaddyfile(443, "vpn.example.com", []NaiveClient{})
 	if strings.Contains(caddyfileEmpty, "probe_resistance") {
 		t.Errorf("RenderCaddyfile with empty clients must not contain probe_resistance:\n%s", caddyfileEmpty)
 	}
+	if strings.Contains(caddyfileEmpty, "forward_proxy") {
+		t.Errorf("RenderCaddyfile with empty clients must NOT contain forward_proxy directive:\n%s", caddyfileEmpty)
+	}
 
-	// When clients with credentials exist, probe_resistance MUST be present
+	// When clients with credentials exist, forward_proxy, basic_auth, and probe_resistance MUST be present
 	caddyfileWithClients := RenderCaddyfile(443, "vpn.example.com", []NaiveClient{
 		{Username: "user1", Password: "test_secret_pass_123"},
 	})
+	if !strings.Contains(caddyfileWithClients, "forward_proxy {") {
+		t.Errorf("RenderCaddyfile with authenticated clients must contain forward_proxy:\n%s", caddyfileWithClients)
+	}
 	if !strings.Contains(caddyfileWithClients, "probe_resistance") {
 		t.Errorf("RenderCaddyfile with authenticated clients must contain probe_resistance:\n%s", caddyfileWithClients)
 	}
 	if !strings.Contains(caddyfileWithClients, "basic_auth user1 test_secret_pass_123") {
 		t.Errorf("RenderCaddyfile missing basic_auth directive:\n%s", caddyfileWithClients)
+	}
+}
+
+func TestNaiveConfig_NonDefaultPortRoundTrip(t *testing.T) {
+	// R2-H2: port 8443 must render https://domain:port and parse back domain and port
+	domain := "vpn.custom.org"
+	port := 8443
+	clients := []NaiveClient{
+		{Username: "user8443", Password: "pass8443secret"},
+	}
+
+	rendered := RenderCaddyfile(port, domain, clients)
+	if !strings.Contains(rendered, "https://vpn.custom.org:8443 {") {
+		t.Errorf("expected rendered Caddyfile to contain https://vpn.custom.org:8443 {, got:\n%s", rendered)
+	}
+	if strings.Contains(rendered, ":8443,") {
+		t.Errorf("rendered Caddyfile must NOT emit plaintext HTTP :8443 address, got:\n%s", rendered)
+	}
+
+	parsedDomain, parsedPort, parsedClients, err := ParseCaddyfile(rendered)
+	if err != nil {
+		t.Fatalf("ParseCaddyfile failed: %v", err)
+	}
+	if parsedDomain != domain {
+		t.Errorf("domain mismatch: expected %q, got %q", domain, parsedDomain)
+	}
+	if parsedPort != port {
+		t.Errorf("port mismatch: expected %d, got %d", port, parsedPort)
+	}
+	if len(parsedClients) != 1 || parsedClients[0].Username != "user8443" || parsedClients[0].Password != "pass8443secret" {
+		t.Errorf("parsed clients mismatch: %+v", parsedClients)
+	}
+
+	// Also verify 0-client custom port
+	rendered0 := RenderCaddyfile(port, domain, nil)
+	if !strings.Contains(rendered0, "https://vpn.custom.org:8443 {") {
+		t.Errorf("expected rendered Caddyfile to contain https://vpn.custom.org:8443 {, got:\n%s", rendered0)
+	}
+	if strings.Contains(rendered0, "forward_proxy") {
+		t.Errorf("0-client custom port Caddyfile must not have forward_proxy:\n%s", rendered0)
+	}
+	parsedDomain0, parsedPort0, parsedClients0, err := ParseCaddyfile(rendered0)
+	if err != nil {
+		t.Fatalf("ParseCaddyfile 0-client failed: %v", err)
+	}
+	if parsedDomain0 != domain || parsedPort0 != port || len(parsedClients0) != 0 {
+		t.Errorf("parsed 0-client mismatch: domain=%s port=%d clients=%v", parsedDomain0, parsedPort0, parsedClients0)
 	}
 }
 
@@ -496,5 +564,73 @@ func TestNaiveManager_DockerBuildAndDirectoryMount(t *testing.T) {
 	}
 	if !psFound {
 		t.Errorf("docker ps was not executed in GetServerStatus")
+	}
+}
+
+type failNaiveSSHClient struct {
+	*mockNaiveSSHClient
+	stopFails bool
+}
+
+func (m *failNaiveSSHClient) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	if strings.Contains(cmd, "docker stop") && m.stopFails {
+		return "", "daemon error: cannot stop container", 1, fmt.Errorf("command exited 1")
+	}
+	return m.mockNaiveSSHClient.RunSudoCommand(ctx, cmd)
+}
+
+func TestNaiveManager_UninstallFailurePropagation(t *testing.T) {
+	mockSSH := &failNaiveSSHClient{
+		mockNaiveSSHClient: newMockNaiveSSHClient(),
+		stopFails:          true,
+	}
+	pool := &mockNaivePool{client: mockSSH}
+	locks := awg.NewServerLockRegistry()
+	mgr := NewNaiveManagerWithServerLocks(pool, locks)
+
+	server := &models.Server{
+		ID:        99,
+		Host:      "198.51.100.2",
+		Protocols: map[string]any{models.ProtocolNaive: map[string]any{"installed": true}},
+	}
+	ctx := context.Background()
+
+	// Initial install
+	if err := mgr.Install(ctx, server, map[string]any{"port": 443}); err != nil {
+		t.Fatalf("Install failed: %v", err)
+	}
+
+	// Attempt uninstall with failing stop/rm
+	err := mgr.Uninstall(ctx, server)
+	if err == nil {
+		t.Fatalf("expected error from Uninstall when stop/rm fails")
+	}
+
+	// Config directory must NOT be deleted
+	for _, cmd := range mockSSH.commands {
+		if strings.Contains(cmd, "rm -rf") && strings.Contains(cmd, NaiveConfigDir) {
+			t.Errorf("rm -rf config directory must not be run when container removal fails")
+		}
+	}
+
+	// Protocol must still be in in-memory map
+	if _, ok := server.Protocols[models.ProtocolNaive]; !ok {
+		t.Errorf("server.Protocols[naive] must not be deleted on uninstall failure")
+	}
+
+	// Also verify idempotent uninstall when container is absent
+	absentMockSSH := newMockNaiveSSHClient()
+	absentMockSSH.dockerAlive = false
+	absentMgr := NewNaiveManagerWithServerLocks(&mockNaivePool{client: absentMockSSH}, awg.NewServerLockRegistry())
+	server2 := &models.Server{
+		ID:        100,
+		Host:      "198.51.100.3",
+		Protocols: map[string]any{models.ProtocolNaive: map[string]any{"installed": true}},
+	}
+	if err := absentMgr.Uninstall(ctx, server2); err != nil {
+		t.Fatalf("expected idempotent success on absent container, got: %v", err)
+	}
+	if _, ok := server2.Protocols[models.ProtocolNaive]; ok {
+		t.Errorf("expected server.Protocols[naive] deleted on successful absent uninstall")
 	}
 }

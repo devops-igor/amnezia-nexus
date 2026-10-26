@@ -3,6 +3,7 @@ package xray
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"os"
 	"strings"
@@ -508,5 +509,73 @@ func TestXrayManager_ContainerFlagsAndSudo(t *testing.T) {
 	}
 	if !psFound {
 		t.Errorf("docker ps was not executed in GetServerStatus")
+	}
+}
+
+type failXraySSHClient struct {
+	*mockXraySSHClient
+	stopFails bool
+}
+
+func (m *failXraySSHClient) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	if strings.Contains(cmd, "docker stop") && m.stopFails {
+		return "", "daemon error: cannot stop container", 1, fmt.Errorf("command exited 1")
+	}
+	return m.mockXraySSHClient.RunSudoCommand(ctx, cmd)
+}
+
+func TestXrayManager_UninstallFailurePropagation(t *testing.T) {
+	mockSSH := &failXraySSHClient{
+		mockXraySSHClient: newMockXraySSHClient(),
+		stopFails:         true,
+	}
+	pool := &mockXrayPool{client: mockSSH}
+	locks := awg.NewServerLockRegistry()
+	mgr := NewXrayManagerWithServerLocks(pool, locks)
+
+	server := &models.Server{
+		ID:        99,
+		Host:      "198.51.100.2",
+		Protocols: map[string]any{models.ProtocolVLESS: map[string]any{"installed": true}},
+	}
+	ctx := context.Background()
+
+	// Initial install
+	if err := mgr.Install(ctx, server, map[string]any{"port": 443}); err != nil {
+		t.Fatalf("Install failed: %v", err)
+	}
+
+	// Attempt uninstall with failing stop/rm
+	err := mgr.Uninstall(ctx, server)
+	if err == nil {
+		t.Fatalf("expected error from Uninstall when stop/rm fails")
+	}
+
+	// Config directory must NOT be deleted
+	for _, cmd := range mockSSH.commands {
+		if strings.Contains(cmd, "rm -rf") && strings.Contains(cmd, XrayConfigDir) {
+			t.Errorf("rm -rf config directory must not be run when container removal fails")
+		}
+	}
+
+	// Protocol must still be in in-memory map
+	if _, ok := server.Protocols[models.ProtocolVLESS]; !ok {
+		t.Errorf("server.Protocols[vless] must not be deleted on uninstall failure")
+	}
+
+	// Also verify idempotent uninstall when container is absent
+	absentMockSSH := newMockXraySSHClient()
+	absentMockSSH.dockerAlive = false
+	absentMgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: absentMockSSH}, awg.NewServerLockRegistry())
+	server2 := &models.Server{
+		ID:        100,
+		Host:      "198.51.100.3",
+		Protocols: map[string]any{models.ProtocolVLESS: map[string]any{"installed": true}},
+	}
+	if err := absentMgr.Uninstall(ctx, server2); err != nil {
+		t.Fatalf("expected idempotent success on absent container, got: %v", err)
+	}
+	if _, ok := server2.Protocols[models.ProtocolVLESS]; ok {
+		t.Errorf("expected server.Protocols[vless] deleted on successful absent uninstall")
 	}
 }

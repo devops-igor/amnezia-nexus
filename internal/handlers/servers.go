@@ -609,6 +609,15 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	normProto := models.NormalizeProtocol(req.Protocol)
+	if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
+		session := h.GetSession(r)
+		if session == nil || !session.IsAdmin() {
+			h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required")
+			return
+		}
+	}
+
 	rc := http.NewResponseController(w)
 	_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Minute))
 
@@ -696,6 +705,15 @@ func (h *Handlers) UninstallProtocolHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	normProto := models.NormalizeProtocol(req.Protocol)
+	if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
+		session := h.GetSession(r)
+		if session == nil || !session.IsAdmin() {
+			h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required")
+			return
+		}
+	}
+
 	rc := http.NewResponseController(w)
 	_ = rc.SetWriteDeadline(time.Now().Add(5 * time.Minute))
 
@@ -710,7 +728,10 @@ func (h *Handlers) UninstallProtocolHandler(w http.ResponseWriter, r *http.Reque
 
 	protoMgr, err := h.GetProtocolManager(req.Protocol)
 	if err == nil && protoMgr != nil {
-		_ = protoMgr.Uninstall(ctx, server)
+		if err := protoMgr.Uninstall(ctx, server); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "uninstall_failed", fmt.Sprintf("Failed to remove protocol container: %v", err))
+			return
+		}
 	}
 
 	if server.Protocols != nil {

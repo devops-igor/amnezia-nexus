@@ -51,24 +51,30 @@ func RenderCaddyfile(port int, domain string, clients []NaiveClient) string {
 	sb.WriteString("}\n\n")
 
 	// Domain and port block
-	fmt.Fprintf(&sb, ":%d, %s {\n", port, domain)
+	if port > 0 && port != 443 {
+		fmt.Fprintf(&sb, "https://%s:%d {\n", domain, port)
+	} else {
+		fmt.Fprintf(&sb, ":%d, %s {\n", port, domain)
+	}
 	sb.WriteString("    route {\n")
-	sb.WriteString("        forward_proxy {\n")
 
-	hasAuth := false
+	validClients := make([]NaiveClient, 0, len(clients))
 	for _, c := range clients {
 		if c.Username != "" && c.Password != "" {
-			hasAuth = true
-			fmt.Fprintf(&sb, "            basic_auth %s %s\n", c.Username, c.Password)
+			validClients = append(validClients, c)
 		}
 	}
 
-	sb.WriteString("            hide_ip\n")
-	sb.WriteString("            hide_via\n")
-	if hasAuth {
+	if len(validClients) > 0 {
+		sb.WriteString("        forward_proxy {\n")
+		for _, c := range validClients {
+			fmt.Fprintf(&sb, "            basic_auth %s %s\n", c.Username, c.Password)
+		}
+		sb.WriteString("            hide_ip\n")
+		sb.WriteString("            hide_via\n")
 		sb.WriteString("            probe_resistance\n")
+		sb.WriteString("        }\n")
 	}
-	sb.WriteString("        }\n")
 	sb.WriteString("        root * /srv\n")
 	sb.WriteString("        file_server\n")
 	sb.WriteString("    }\n")
@@ -94,19 +100,35 @@ func ParseCaddyfile(content string) (domain string, port int, clients []NaiveCli
 					Password: parts[2],
 				})
 			}
-		} else if strings.Contains(trimmed, "{") && strings.Contains(trimmed, ":") {
+		} else if strings.Contains(trimmed, "{") && (strings.Contains(trimmed, ":") || strings.Contains(trimmed, ".")) {
 			header := strings.TrimSuffix(trimmed, "{")
 			header = strings.TrimSpace(header)
+			if header == "" {
+				continue
+			}
 			segments := strings.Split(header, ",")
 			for _, seg := range segments {
 				seg = strings.TrimSpace(seg)
-				if strings.HasPrefix(seg, ":") {
-					pStr := strings.TrimPrefix(seg, ":")
+				if seg == "" {
+					continue
+				}
+				cleaned := strings.TrimPrefix(seg, "https://")
+				cleaned = strings.TrimPrefix(cleaned, "http://")
+
+				if strings.HasPrefix(cleaned, ":") {
+					pStr := strings.TrimPrefix(cleaned, ":")
 					if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
 						port = p
 					}
-				} else if seg != "" {
-					domain = seg
+				} else if host, pStr, err := net.SplitHostPort(cleaned); err == nil {
+					if host != "" {
+						domain = host
+					}
+					if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
+						port = p
+					}
+				} else if cleaned != "" {
+					domain = cleaned
 				}
 			}
 		}
