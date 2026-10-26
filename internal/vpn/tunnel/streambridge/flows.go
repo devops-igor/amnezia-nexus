@@ -46,11 +46,15 @@ var (
 )
 
 func (d *Device) acquire() bool {
+	d.gateMu.RLock()
+	defer d.gateMu.RUnlock()
+
 	if d.closed.Load() || d.ctx.Err() != nil {
 		return false
 	}
 	select {
 	case d.slots <- struct{}{}:
+		d.wg.Add(1)
 		d.stats.flowsTotal.Add(1)
 		return true
 	default:
@@ -61,6 +65,7 @@ func (d *Device) acquire() bool {
 
 func (d *Device) release() {
 	<-d.slots
+	d.wg.Done()
 }
 
 func (d *Device) onTCP(r *tcp.ForwarderRequest) {
@@ -82,6 +87,13 @@ func (d *Device) onTCP(r *tcp.ForwarderRequest) {
 		return
 	}
 	d.stats.lastHandshakeNano.Store(time.Now().UnixNano())
+
+	if d.closed.Load() || d.ctx.Err() != nil {
+		_ = outConn.Close()
+		d.release()
+		r.Complete(true)
+		return
+	}
 
 	var wq waiter.Queue
 	ep, tcpipErr := r.CreateEndpoint(&wq)
@@ -107,7 +119,6 @@ func (d *Device) onTCP(r *tcp.ForwarderRequest) {
 
 	inConn := gonet.NewTCPConn(&wq, ep)
 
-	d.wg.Add(1)
 	go d.runTCPFlow(inConn, outConn)
 }
 
@@ -125,7 +136,6 @@ func (d *Device) runTCPFlow(inConn *gonet.TCPConn, outConn net.Conn) {
 		stopAfter()
 		closeBoth()
 		d.release()
-		d.wg.Done()
 	}()
 
 	var copyWg sync.WaitGroup
@@ -175,6 +185,11 @@ func (d *Device) onUDP(r *udp.ForwarderRequest) {
 		return // drop packet without creating endpoint
 	}
 
+	if d.closed.Load() || d.ctx.Err() != nil {
+		d.release()
+		return
+	}
+
 	var wq waiter.Queue
 	ep, tcpipErr := r.CreateEndpoint(&wq)
 	if tcpipErr != nil {
@@ -185,14 +200,18 @@ func (d *Device) onUDP(r *udp.ForwarderRequest) {
 	inConn := gonet.NewUDPConn(&wq, ep)
 	id := r.ID()
 
-	d.wg.Add(1)
+	if d.closed.Load() || d.ctx.Err() != nil {
+		_ = inConn.Close()
+		d.release()
+		return
+	}
+
 	go d.runUDPFlow(inConn, id)
 }
 
 func (d *Device) runUDPFlow(inConn *gonet.UDPConn, id stack.TransportEndpointID) {
 	defer func() {
 		d.release()
-		d.wg.Done()
 	}()
 
 	dst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))

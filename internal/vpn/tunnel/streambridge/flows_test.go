@@ -557,3 +557,274 @@ func TestFlows_CapAtMaxFlowsPerBackend(t *testing.T) {
 		t.Errorf("Active = %d, want 0 after release", dev.FlowStats().Active)
 	}
 }
+
+func TestFlows_CloseWaitsForInFlightTCPDial(t *testing.T) {
+	baseGoroutines := runtime.NumGoroutine()
+
+	dialStarted := make(chan struct{})
+	unblockDial := make(chan struct{})
+	var dialExited atomic.Bool
+
+	dialer := funcDialer(func(ctx context.Context, network, address string) (net.Conn, error) {
+		close(dialStarted)
+		<-unblockDial
+		time.Sleep(20 * time.Millisecond) // Ensure callback is actively executing
+		dialExited.Store(true)
+		return nil, errors.New("dial aborted")
+	})
+
+	cfg := Config{
+		DialTimeout: 5 * time.Second,
+	}
+	dev, err := New(cfg, dialer)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+
+	tc := newTestClient(t, dev)
+	defer tc.Close()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = tc.DialTCP(ctx, "198.51.100.1:8080")
+	}()
+
+	select {
+	case <-dialStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dialer did not start")
+	}
+
+	// Dial is actively held. Device.Close() must block on d.wg.Wait().
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- dev.Close()
+	}()
+
+	// Assert that Close() does not return while dial is in flight
+	select {
+	case err := <-closeDone:
+		t.Fatalf("dev.Close() returned prematurely while dial in flight: %v", err)
+	case <-time.After(60 * time.Millisecond):
+		// Expected: Close() is waiting
+	}
+
+	if dialExited.Load() {
+		t.Fatal("dialer exited unexpectedly early")
+	}
+
+	// Now unblock the dial callback
+	close(unblockDial)
+
+	// Close() must now return
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close() returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() timed out waiting for dial callback to finish")
+	}
+
+	if !dialExited.Load() {
+		t.Fatal("expected dial callback to have finished before Close() returned")
+	}
+
+	if !dev.IsClosed() {
+		t.Error("expected dev.IsClosed() to be true")
+	}
+
+	tc.Close()
+
+	if !waitFor(t, func() bool {
+		return runtime.NumGoroutine() <= baseGoroutines+2
+	}) {
+		t.Errorf("goroutine leak: base=%d, current=%d", baseGoroutines, runtime.NumGoroutine())
+	}
+}
+
+func TestFlows_CloseWaitsForInFlightUDPDial(t *testing.T) {
+	baseGoroutines := runtime.NumGoroutine()
+
+	udpDialStarted := make(chan struct{})
+	unblockUDPDial := make(chan struct{})
+	var udpDialExited atomic.Bool
+
+	dialer := funcDialer(func(ctx context.Context, network, address string) (net.Conn, error) {
+		if network == "udp" {
+			close(udpDialStarted)
+			<-unblockUDPDial
+			time.Sleep(20 * time.Millisecond)
+			udpDialExited.Store(true)
+			return nil, errors.New("udp dial aborted")
+		}
+		return nil, errors.New("unsupported network")
+	})
+
+	cfg := Config{
+		DialTimeout: 5 * time.Second,
+	}
+	dev, err := New(cfg, dialer)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+
+	tc := newTestClient(t, dev)
+	defer tc.Close()
+
+	uConn, err := tc.DialUDPWithBind(25000, "198.51.100.1:53")
+	if err != nil {
+		t.Fatalf("DialUDPWithBind error: %v", err)
+	}
+	defer uConn.Close()
+
+	_, _ = uConn.Write([]byte("probe-udp"))
+
+	select {
+	case <-udpDialStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("udp dialer did not start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- dev.Close()
+	}()
+
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close() returned prematurely while udp dial in flight: %v", err)
+	case <-time.After(60 * time.Millisecond):
+		// Expected: Close() is waiting
+	}
+
+	if udpDialExited.Load() {
+		t.Fatal("udp dialer exited unexpectedly early")
+	}
+
+	close(unblockUDPDial)
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close() returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() timed out waiting for udp dial callback to finish")
+	}
+
+	if !udpDialExited.Load() {
+		t.Fatal("expected udp dial callback to have finished before Close() returned")
+	}
+
+	tc.Close()
+
+	if !waitFor(t, func() bool {
+		return runtime.NumGoroutine() <= baseGoroutines+2
+	}) {
+		t.Errorf("goroutine leak: base=%d, current=%d", baseGoroutines, runtime.NumGoroutine())
+	}
+}
+
+func TestFlows_ConcurrentAdmissionAndCloseStress(t *testing.T) {
+	baseGoroutines := runtime.NumGoroutine()
+
+	echoTCP, stopTCP := startTCPEchoServer(t)
+	defer stopTCP()
+	echoUDP, stopUDP := startUDPEchoServer(t)
+	defer stopUDP()
+
+	dialer := funcDialer(func(ctx context.Context, network, address string) (net.Conn, error) {
+		var d net.Dialer
+		if network == "tcp" {
+			return d.DialContext(ctx, "tcp", echoTCP)
+		}
+		return d.DialContext(ctx, "udp", echoUDP)
+	})
+
+	cfg := Config{
+		DialTimeout:         100 * time.Millisecond,
+		TCPHalfCloseTimeout: 100 * time.Millisecond,
+		UDPIdleTimeout:      100 * time.Millisecond,
+	}
+	dev, err := New(cfg, dialer)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+
+	tc := newTestClient(t, dev)
+
+	var wg sync.WaitGroup
+	const workers = 15
+
+	// TCP traffic
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+				conn, err := tc.DialTCP(ctx, "198.51.100.1:8080")
+				cancel()
+				if err == nil {
+					_ = conn.SetDeadline(time.Now().Add(50 * time.Millisecond))
+					_, _ = conn.Write([]byte("ping"))
+					buf := make([]byte, 4)
+					_, _ = conn.Read(buf)
+					_ = conn.Close()
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}()
+	}
+
+	// UDP traffic
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			uConn, err := tc.DialUDPWithBind(uint16(30000+idx), "198.51.100.1:53")
+			if err != nil {
+				return
+			}
+			defer uConn.Close()
+
+			for j := 0; j < 10; j++ {
+				_, _ = uConn.Write([]byte("udp-ping"))
+				time.Sleep(time.Millisecond)
+			}
+		}(i)
+	}
+
+	// Multiple concurrent Close() calls
+	const closers = 6
+	var closeWg sync.WaitGroup
+	closeWg.Add(closers)
+	for i := 0; i < closers; i++ {
+		go func(idx int) {
+			defer closeWg.Done()
+			if idx > 0 {
+				time.Sleep(time.Duration(idx*2) * time.Millisecond)
+			}
+			if closeErr := dev.Close(); closeErr != nil {
+				t.Errorf("Close returned error: %v", closeErr)
+			}
+		}(i)
+	}
+
+	closeWg.Wait()
+	wg.Wait()
+
+	if !dev.IsClosed() {
+		t.Error("expected dev.IsClosed() to be true")
+	}
+
+	tc.Close()
+
+	if !waitFor(t, func() bool {
+		return runtime.NumGoroutine() <= baseGoroutines+3
+	}) {
+		t.Errorf("goroutine leak after concurrent stress: base=%d, current=%d", baseGoroutines, runtime.NumGoroutine())
+	}
+}

@@ -80,6 +80,7 @@ type Device struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
+	gateMu    sync.RWMutex
 	closed    atomic.Bool
 	createdAt time.Time
 	stats     deviceStats
@@ -247,14 +248,17 @@ func (d *Device) Read(p []byte) (int, error) {
 // Close gracefully terminates the device, canceling active flows, closing the netstack,
 // and waiting for all flow goroutines to exit.
 func (d *Device) Close() error {
+	d.gateMu.Lock()
 	if !d.closed.CompareAndSwap(false, true) {
+		d.gateMu.Unlock()
 		return nil
 	}
-
 	d.cancel()
+	d.gateMu.Unlock()
+
+	d.wg.Wait()
 	d.ep.Close()
 	d.stack.Close()
-	d.wg.Wait()
 	d.stack.Wait()
 	return nil
 }
