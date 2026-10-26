@@ -87,6 +87,10 @@ func (d *Dialer) getH3Conn(ctx context.Context) (*http3.ClientConn, error) {
 }
 
 func (d *Dialer) dialH3(ctx context.Context, address string) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	clientConn, err := d.getH3Conn(ctx)
 	if err != nil {
 		return nil, err
@@ -94,7 +98,9 @@ func (d *Dialer) dialH3(ctx context.Context, address string) (net.Conn, error) {
 
 	reqStream, err := clientConn.OpenRequestStream(ctx)
 	if err != nil {
-		d.h3Pool.invalidate(clientConn)
+		if clientConn.Context().Err() != nil {
+			d.h3Pool.invalidate(clientConn)
+		}
 		return nil, fmt.Errorf("naive: open h3 request stream: %w", err)
 	}
 
@@ -109,16 +115,33 @@ func (d *Dialer) dialH3(ctx context.Context, address string) (net.Conn, error) {
 	req.Header.Set("Proxy-Authorization", "Basic "+basicAuth(d.params.Username, d.params.Password))
 	req.Header["User-Agent"] = []string{""}
 
+	stop := context.AfterFunc(ctx, func() {
+		reqStream.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		reqStream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+	})
+
 	if err := reqStream.SendRequestHeader(req); err != nil {
-		d.h3Pool.invalidate(clientConn)
+		if !stop() {
+			_ = reqStream.Close()
+			return nil, ctx.Err()
+		}
 		_ = reqStream.Close()
+		if clientConn.Context().Err() != nil {
+			d.h3Pool.invalidate(clientConn)
+		}
 		return nil, fmt.Errorf("naive: send h3 request headers: %w", err)
 	}
 
 	resp, err := reqStream.ReadResponse()
-	if err != nil {
-		d.h3Pool.invalidate(clientConn)
+	if !stop() {
 		_ = reqStream.Close()
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		_ = reqStream.Close()
+		if clientConn.Context().Err() != nil {
+			d.h3Pool.invalidate(clientConn)
+		}
 		return nil, fmt.Errorf("naive: read h3 connect response: %w", err)
 	}
 
@@ -137,16 +160,18 @@ func (d *Dialer) dialH3(ctx context.Context, address string) (net.Conn, error) {
 	}, nil
 }
 
-func (d *Dialer) probeH3(ctx context.Context, camTarget string) (int64, int, error) {
+func (d *Dialer) probeH3(ctx context.Context, camTarget string) (int, error) {
 	clientConn, err := d.getH3Conn(ctx)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 
 	reqStream, err := clientConn.OpenRequestStream(ctx)
 	if err != nil {
-		d.h3Pool.invalidate(clientConn)
-		return 0, 0, err
+		if clientConn.Context().Err() != nil {
+			d.h3Pool.invalidate(clientConn)
+		}
+		return 0, err
 	}
 	defer func() {
 		_ = reqStream.Close()
@@ -154,7 +179,7 @@ func (d *Dialer) probeH3(ctx context.Context, camTarget string) (int64, int, err
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "", nil)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 	req.URL = &url.URL{Host: camTarget}
 	req.Host = camTarget
@@ -162,20 +187,33 @@ func (d *Dialer) probeH3(ctx context.Context, camTarget string) (int64, int, err
 	req.Header.Set("Proxy-Authorization", "Basic "+basicAuth(d.params.Username, d.params.Password))
 	req.Header["User-Agent"] = []string{""}
 
-	start := time.Now()
+	stop := context.AfterFunc(ctx, func() {
+		reqStream.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		reqStream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+	})
+
 	if err := reqStream.SendRequestHeader(req); err != nil {
-		d.h3Pool.invalidate(clientConn)
-		return 0, 0, err
+		if !stop() {
+			return 0, ctx.Err()
+		}
+		if clientConn.Context().Err() != nil {
+			d.h3Pool.invalidate(clientConn)
+		}
+		return 0, err
 	}
 
 	resp, err := reqStream.ReadResponse()
-	if err != nil {
-		d.h3Pool.invalidate(clientConn)
-		return 0, 0, err
+	if !stop() {
+		return 0, ctx.Err()
 	}
-	elapsed := time.Since(start).Milliseconds()
+	if err != nil {
+		if clientConn.Context().Err() != nil {
+			d.h3Pool.invalidate(clientConn)
+		}
+		return 0, err
+	}
 
-	return elapsed, resp.StatusCode, nil
+	return resp.StatusCode, nil
 }
 
 type h3Conn struct {
@@ -191,6 +229,10 @@ func (c *h3Conn) Read(b []byte) (int, error) {
 
 func (c *h3Conn) Write(b []byte) (int, error) {
 	return c.stream.Write(b)
+}
+
+func (c *h3Conn) CloseWrite() error {
+	return c.stream.Close()
 }
 
 func (c *h3Conn) Close() error {

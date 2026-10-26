@@ -72,8 +72,10 @@ func probeNaiveProxy(ctx context.Context, target string, p models.NaiveProxyPara
 			defer cancel()
 		}
 
-		elapsed, status, errH3 := d.probeH3(h3Ctx, camTarget)
+		start := time.Now()
+		status, errH3 := d.probeH3(h3Ctx, camTarget)
 		if errH3 == nil {
+			elapsed := time.Since(start).Milliseconds()
 			return handleProbeStatus(status, elapsed)
 		}
 		// If the context timed out or was canceled during H3 probe, abort immediately.
@@ -84,13 +86,15 @@ func probeNaiveProxy(ctx context.Context, target string, p models.NaiveProxyPara
 		// gracefully fall back to H2 probe.
 	}
 
-	elapsed, status, err := d.probeH2(timeoutCtx, camTarget)
+	start := time.Now()
+	status, err := d.probeH2(timeoutCtx, camTarget)
 	if err != nil {
 		if timeoutCtx.Err() != nil {
 			return 0, timeoutCtx.Err()
 		}
 		return 0, fmt.Errorf("naive: probe failed: %w", err)
 	}
+	elapsed := time.Since(start).Milliseconds()
 
 	return handleProbeStatus(status, elapsed)
 }

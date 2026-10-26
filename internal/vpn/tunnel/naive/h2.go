@@ -93,14 +93,23 @@ func (d *Dialer) getH2Conn(ctx context.Context) (*http2.ClientConn, net.Addr, ne
 }
 
 func (d *Dialer) dialH2(ctx context.Context, address string) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	cc, localAddr, remoteAddr, err := d.getH2Conn(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	pr, pw := io.Pipe()
-	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "", pr)
+	reqCtx, reqCancel := context.WithCancel(context.WithoutCancel(ctx))
+	stop := context.AfterFunc(ctx, reqCancel)
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodConnect, "", pr)
 	if err != nil {
+		_ = stop()
+		reqCancel()
 		_ = pr.Close()
 		_ = pw.Close()
 		return nil, fmt.Errorf("naive: new h2 connect request: %w", err)
@@ -112,14 +121,27 @@ func (d *Dialer) dialH2(ctx context.Context, address string) (net.Conn, error) {
 	req.Header["User-Agent"] = []string{""}
 
 	resp, err := cc.RoundTrip(req)
-	if err != nil {
-		d.h2Pool.invalidate(cc)
+	if !stop() {
+		reqCancel()
 		_ = pr.Close()
 		_ = pw.Close()
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		reqCancel()
+		_ = pr.Close()
+		_ = pw.Close()
+		if !cc.CanTakeNewRequest() {
+			d.h2Pool.invalidate(cc)
+		}
 		return nil, fmt.Errorf("naive: h2 roundtrip: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		reqCancel()
 		_ = pr.Close()
 		_ = pw.Close()
 		_ = resp.Body.Close()
@@ -131,20 +153,21 @@ func (d *Dialer) dialH2(ctx context.Context, address string) (net.Conn, error) {
 		dr:         dr,
 		pw:         pw,
 		resp:       resp,
+		cancel:     reqCancel,
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
 	}, nil
 }
 
-func (d *Dialer) probeH2(ctx context.Context, camTarget string) (int64, int, error) {
+func (d *Dialer) probeH2(ctx context.Context, camTarget string) (int, error) {
 	cc, _, _, err := d.getH2Conn(ctx)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "", http.NoBody)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 	req.URL = &url.URL{Host: camTarget}
 	req.Host = camTarget
@@ -152,16 +175,16 @@ func (d *Dialer) probeH2(ctx context.Context, camTarget string) (int64, int, err
 	req.Header.Set("Proxy-Authorization", "Basic "+basicAuth(d.params.Username, d.params.Password))
 	req.Header["User-Agent"] = []string{""}
 
-	start := time.Now()
 	resp, err := cc.RoundTrip(req)
 	if err != nil {
-		d.h2Pool.invalidate(cc)
-		return 0, 0, err
+		if !cc.CanTakeNewRequest() {
+			d.h2Pool.invalidate(cc)
+		}
+		return 0, err
 	}
 	_ = resp.Body.Close()
-	elapsed := time.Since(start).Milliseconds()
 
-	return elapsed, resp.StatusCode, nil
+	return resp.StatusCode, nil
 }
 
 type deadlineReader struct {
@@ -267,6 +290,7 @@ type h2Conn struct {
 	dr         *deadlineReader
 	pw         *io.PipeWriter
 	resp       *http.Response
+	cancel     context.CancelFunc
 	localAddr  net.Addr
 	remoteAddr net.Addr
 
@@ -294,6 +318,10 @@ func (c *h2Conn) Write(p []byte) (int, error) {
 	return c.pw.Write(p)
 }
 
+func (c *h2Conn) CloseWrite() error {
+	return c.pw.Close()
+}
+
 func (c *h2Conn) Close() error {
 	c.mu.Lock()
 	if c.closed {
@@ -303,6 +331,9 @@ func (c *h2Conn) Close() error {
 	c.closed = true
 	c.mu.Unlock()
 
+	if c.cancel != nil {
+		c.cancel()
+	}
 	err1 := c.pw.Close()
 	err2 := c.dr.Close()
 	if err1 != nil {

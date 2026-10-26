@@ -2,12 +2,16 @@ package naive
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/quic-go/quic-go/http3"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
@@ -275,5 +279,59 @@ func TestProbeNaiveProxy_ClosedPort(t *testing.T) {
 	_, err = ProbeNaiveProxy(ctx, closedAddr, p, 1*time.Second)
 	if err == nil {
 		t.Fatal("expected error for closed port, got nil")
+	}
+}
+
+func TestProbeNaiveProxy_H3_TimeoutDuringResponse(t *testing.T) {
+	cert, err := generateLeafCert(testCACert, testCAKey, testCamouflageDomain)
+	if err != nil {
+		t.Fatalf("generate leaf cert: %v", err)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{http3.NextProtoH3},
+	}
+
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+
+	server := &http3.Server{
+		TLSConfig: tlsConfig,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Intentionally delay responding to verify client timeout cancels ReadResponse
+			time.Sleep(2 * time.Second)
+			w.WriteHeader(http.StatusOK)
+		}),
+	}
+
+	go func() {
+		_ = server.Serve(udpConn)
+	}()
+	defer func() {
+		_ = server.Close()
+		_ = udpConn.Close()
+	}()
+
+	p := models.NaiveProxyParams{
+		Username: "userA",
+		Password: "passA",
+		Domain:   testCamouflageDomain,
+		EnableH3: true,
+	}
+
+	ctx := context.Background()
+	start := time.Now()
+	_, err = ProbeNaiveProxy(ctx, udpConn.LocalAddr().String(), p, 300*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("probe did not respect 300ms timeout on slow H3 response: took %v", elapsed)
 	}
 }

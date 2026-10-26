@@ -680,3 +680,279 @@ func TestDialer_ConnClose_WriteError(t *testing.T) {
 		t.Fatal("expected error writing to closed conn, got nil")
 	}
 }
+
+func TestDialer_H2_DialCtxCancelledAfterReturn(t *testing.T) {
+	echoAddr, cleanupEcho := setupTCPEchoServer(t)
+	defer cleanupEcho()
+
+	proxyAddr, cleanupH2 := setupTestH2Server(t, "testuser", "testpass", true)
+	defer cleanupH2()
+
+	p := models.NaiveProxyParams{Username: "testuser", Password: "testpass", Domain: testCamouflageDomain, EnableH3: false}
+	d, err := New(proxyAddr, p)
+	if err != nil {
+		t.Fatalf("New dialer: %v", err)
+	}
+	defer d.Close()
+
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	conn, err := d.DialContext(dialCtx, "tcp", echoAddr)
+	dialCancel() // Cancel dial context immediately after return (mirrors streambridge flows.go)
+
+	if err != nil {
+		t.Fatalf("DialContext failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Verify that cancelling dialCtx did not abort the H2 stream
+	time.Sleep(50 * time.Millisecond)
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	msg := []byte("payload after dial ctx cancel")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("write after dialCtx cancel: %v", err)
+	}
+
+	recv := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, recv); err != nil {
+		t.Fatalf("read after dialCtx cancel: %v", err)
+	}
+
+	if !bytes.Equal(recv, msg) {
+		t.Fatalf("payload mismatch: got %q, want %q", recv, msg)
+	}
+}
+
+func TestDialer_H2_StreamTimeoutDoesNotKillSiblings(t *testing.T) {
+	echoAddr, cleanupEcho := setupTCPEchoServer(t)
+	defer cleanupEcho()
+
+	proxyAddr, cleanupH2 := setupTestH2Server(t, "testuser", "testpass", true)
+	defer cleanupH2()
+
+	p := models.NaiveProxyParams{Username: "testuser", Password: "testpass", Domain: testCamouflageDomain, EnableH3: false}
+	d, err := New(proxyAddr, p)
+	if err != nil {
+		t.Fatalf("New dialer: %v", err)
+	}
+	defer d.Close()
+
+	// Establish sibling connection on the pooled H2 conn
+	c1, err := d.DialContext(context.Background(), "tcp", echoAddr)
+	if err != nil {
+		t.Fatalf("first dial: %v", err)
+	}
+	defer c1.Close()
+
+	// Dial an unroutable target with a tight timeout to trigger a stream-level timeout
+	// In the test fixture, net.DialTimeout to an unroutable IP hangs for 3s before 502
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	_, err = d.DialContext(ctx2, "tcp", "10.255.255.1:80")
+	cancel2()
+	if err == nil {
+		t.Fatal("expected timed out dial to fail, got nil")
+	}
+
+	// Verify that c1 is still functional on the pooled H2 conn
+	_ = c1.SetDeadline(time.Now().Add(3 * time.Second))
+	msg := []byte("sibling flow still alive after other stream timeout")
+	if _, err := c1.Write(msg); err != nil {
+		t.Fatalf("sibling write after other stream timeout: %v", err)
+	}
+
+	recv := make([]byte, len(msg))
+	if _, err := io.ReadFull(c1, recv); err != nil {
+		t.Fatalf("sibling read after other stream timeout: %v", err)
+	}
+
+	if !bytes.Equal(recv, msg) {
+		t.Fatalf("sibling payload mismatch: got %q, want %q", recv, msg)
+	}
+}
+
+func TestDialer_H3_HonorsContextDeadlineOnSlowResponse(t *testing.T) {
+	proxyAddr, cleanupH3 := setupTestH3Server(t, "testuser", "testpass", true)
+	defer cleanupH3()
+
+	p := models.NaiveProxyParams{Username: "testuser", Password: "testpass", Domain: testCamouflageDomain, EnableH3: true}
+	d, err := New(proxyAddr, p)
+	if err != nil {
+		t.Fatalf("New dialer: %v", err)
+	}
+	defer d.Close()
+
+	// Dial an unroutable target where upstream takes 3s, but caller ctx deadline is 300ms
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err = d.DialContext(ctx, "tcp", "10.255.255.1:80")
+	elapsed := time.Since(start)
+	t.Logf("H3 slow upstream dial returned in: %v (err=%v)", elapsed, err)
+
+	if err == nil {
+		t.Fatal("expected dial to fail, got nil")
+	}
+
+	if elapsed > 1*time.Second {
+		t.Fatalf("H3 dial did not honor 300ms context deadline: took %v", elapsed)
+	}
+}
+
+func TestDialer_H3_PooledConnUDPDropFallback(t *testing.T) {
+	echoAddr, cleanupEcho := setupTCPEchoServer(t)
+	defer cleanupEcho()
+
+	proxyAddr, drop, cleanupServer := setupDualStackH2H3Server(t, "testuser", "testpass")
+	defer cleanupServer()
+
+	p := models.NaiveProxyParams{Username: "testuser", Password: "testpass", Domain: testCamouflageDomain, EnableH3: true}
+	d, err := New(proxyAddr, p)
+	if err != nil {
+		t.Fatalf("New dialer: %v", err)
+	}
+	defer d.Close()
+
+	// 1. First dial over H3 through relay: succeeds and pools QUIC conn
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
+	c1, err := d.DialContext(ctx1, "tcp", echoAddr)
+	cancel1()
+	if err != nil {
+		t.Fatalf("first dial (H3) failed: %v", err)
+	}
+	testMsg1 := []byte("first flow over H3")
+	if _, err := c1.Write(testMsg1); err != nil {
+		t.Fatalf("c1 write: %v", err)
+	}
+	recv1 := make([]byte, len(testMsg1))
+	if _, err := io.ReadFull(c1, recv1); err != nil {
+		t.Fatalf("c1 read: %v", err)
+	}
+	if !bytes.Equal(recv1, testMsg1) {
+		t.Fatalf("c1 payload mismatch: got %q, want %q", recv1, testMsg1)
+	}
+	_ = c1.Close()
+
+	// 2. Drop all UDP traffic through relay
+	drop.Store(true)
+
+	// 3. Second dial: tries H3 on pooled QUIC conn, aborts in 2s, falls back to H2 on same port
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+
+	start := time.Now()
+	c2, err := d.DialContext(ctx2, "tcp", echoAddr)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("second dial after UDP drop failed to fall back to H2: %v", err)
+	}
+	defer c2.Close()
+
+	if elapsed > 4*time.Second {
+		t.Fatalf("H3 fallback to H2 took too long (%v), exceeded H3 budget", elapsed)
+	}
+
+	testMsg2 := []byte("second flow over H2 fallback")
+	if _, err := c2.Write(testMsg2); err != nil {
+		t.Fatalf("c2 write over H2 fallback: %v", err)
+	}
+	recv2 := make([]byte, len(testMsg2))
+	if _, err := io.ReadFull(c2, recv2); err != nil {
+		t.Fatalf("c2 read over H2 fallback: %v", err)
+	}
+	if !bytes.Equal(recv2, testMsg2) {
+		t.Fatalf("c2 payload mismatch: got %q, want %q", recv2, testMsg2)
+	}
+}
+
+func TestDialer_H2_CloseWrite(t *testing.T) {
+	echoAddr, cleanupEcho := setupTCPEchoServer(t)
+	defer cleanupEcho()
+
+	proxyAddr, cleanupH2 := setupTestH2Server(t, "testuser", "testpass", true)
+	defer cleanupH2()
+
+	p := models.NaiveProxyParams{Username: "testuser", Password: "testpass", Domain: testCamouflageDomain, EnableH3: false}
+	d, err := New(proxyAddr, p)
+	if err != nil {
+		t.Fatalf("New dialer: %v", err)
+	}
+	defer d.Close()
+
+	conn, err := d.DialContext(context.Background(), "tcp", echoAddr)
+	if err != nil {
+		t.Fatalf("DialContext failed: %v", err)
+	}
+	defer conn.Close()
+
+	cw, ok := conn.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("h2Conn does not implement CloseWrite()")
+	}
+
+	msg := []byte("half-close test message H2")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	recv := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, recv); err != nil {
+		t.Fatalf("read after CloseWrite: %v", err)
+	}
+	if !bytes.Equal(recv, msg) {
+		t.Fatalf("payload mismatch: got %q, want %q", recv, msg)
+	}
+
+	if err := cw.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite failed: %v", err)
+	}
+
+	// Further writes must fail
+	if _, err := conn.Write([]byte("extra data after CloseWrite")); err == nil {
+		t.Fatal("expected write after CloseWrite to fail, got nil")
+	}
+}
+
+func TestDialer_H3_CloseWrite(t *testing.T) {
+	echoAddr, cleanupEcho := setupTCPEchoServer(t)
+	defer cleanupEcho()
+
+	proxyAddr, cleanupH3 := setupTestH3Server(t, "testuser", "testpass", true)
+	defer cleanupH3()
+
+	p := models.NaiveProxyParams{Username: "testuser", Password: "testpass", Domain: testCamouflageDomain, EnableH3: true}
+	d, err := New(proxyAddr, p)
+	if err != nil {
+		t.Fatalf("New dialer: %v", err)
+	}
+	defer d.Close()
+
+	conn, err := d.DialContext(context.Background(), "tcp", echoAddr)
+	if err != nil {
+		t.Fatalf("DialContext failed: %v", err)
+	}
+	defer conn.Close()
+
+	cw, ok := conn.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("h3Conn does not implement CloseWrite()")
+	}
+
+	msg := []byte("half-close test message H3")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	recv := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, recv); err != nil {
+		t.Fatalf("read after CloseWrite: %v", err)
+	}
+	if !bytes.Equal(recv, msg) {
+		t.Fatalf("payload mismatch: got %q, want %q", recv, msg)
+	}
+
+	if err := cw.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite failed: %v", err)
+	}
+}

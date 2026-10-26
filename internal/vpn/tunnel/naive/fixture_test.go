@@ -14,7 +14,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -369,4 +371,77 @@ func setupTestH3Server(t *testing.T, authUser, authPass string, probeResistance 
 	}
 
 	return udpConn.LocalAddr().String(), cleanup
+}
+
+func setupDualStackH2H3Server(t *testing.T, authUser, authPass string) (string, *atomic.Bool, func()) {
+	t.Helper()
+	h2Addr, cleanupH2 := setupTestH2Server(t, authUser, authPass, true)
+	_, portStr, err := net.SplitHostPort(h2Addr)
+	if err != nil {
+		cleanupH2()
+		t.Fatalf("split host port: %v", err)
+	}
+	sharedPort, _ := strconv.Atoi(portStr)
+
+	h3Addr, cleanupH3 := setupTestH3Server(t, authUser, authPass, true)
+	up, err := net.ResolveUDPAddr("udp", h3Addr)
+	if err != nil {
+		cleanupH2()
+		cleanupH3()
+		t.Fatalf("resolve udp: %v", err)
+	}
+
+	relay, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sharedPort})
+	if err != nil {
+		cleanupH2()
+		cleanupH3()
+		t.Fatalf("listen udp relay: %v", err)
+	}
+
+	upConn, err := net.DialUDP("udp", nil, up)
+	if err != nil {
+		cleanupH2()
+		cleanupH3()
+		_ = relay.Close()
+		t.Fatalf("dial udp relay: %v", err)
+	}
+
+	var drop atomic.Bool
+	var client atomic.Pointer[net.UDPAddr]
+
+	go func() {
+		b := make([]byte, 65535)
+		for {
+			n, a, err := relay.ReadFromUDP(b)
+			if err != nil {
+				return
+			}
+			client.Store(a)
+			if !drop.Load() {
+				_, _ = upConn.Write(b[:n])
+			}
+		}
+	}()
+
+	go func() {
+		b := make([]byte, 65535)
+		for {
+			n, err := upConn.Read(b)
+			if err != nil {
+				return
+			}
+			if a := client.Load(); a != nil && !drop.Load() {
+				_, _ = relay.WriteToUDP(b[:n], a)
+			}
+		}
+	}()
+
+	cleanup := func() {
+		_ = relay.Close()
+		_ = upConn.Close()
+		cleanupH3()
+		cleanupH2()
+	}
+
+	return h2Addr, &drop, cleanup
 }

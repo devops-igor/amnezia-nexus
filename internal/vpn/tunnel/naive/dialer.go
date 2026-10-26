@@ -83,6 +83,9 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	if network != "tcp" {
 		return nil, fmt.Errorf("naive: unsupported network %q (NaiveProxy only tunnels TCP streams)", network)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	if d.params.EnableH3 {
 		h3Ctx := ctx
@@ -111,6 +114,10 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 		var statusErr *statusError
 		if errors.As(err, &statusErr) {
 			return nil, statusErr
+		}
+		// If the caller's outer context has expired, abort immediately.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 		// On any transport-level H3 failure (UDP blocked, handshake timeout, network drop),
 		// gracefully fall through to H2 without failing the connection.
