@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -826,5 +827,83 @@ func TestFlows_ConcurrentAdmissionAndCloseStress(t *testing.T) {
 		return runtime.NumGoroutine() <= baseGoroutines+3
 	}) {
 		t.Errorf("goroutine leak after concurrent stress: base=%d, current=%d", baseGoroutines, runtime.NumGoroutine())
+	}
+}
+
+func tcpChecksum(b []byte) uint16 {
+	var sum uint32
+	for len(b) >= 2 {
+		sum += uint32(binary.BigEndian.Uint16(b[:2]))
+		b = b[2:]
+	}
+	if len(b) != 0 {
+		sum += uint32(b[0]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func TestFlows_CloseDuringUnacknowledgedTCPHandshake(t *testing.T) {
+	out, peer := net.Pipe()
+	defer peer.Close()
+	dev, err := New(Config{}, funcDialer(func(context.Context, string, string) (net.Conn, error) {
+		return out, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pkt := make([]byte, 40)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(len(pkt)))
+	pkt[8], pkt[9] = 64, 6
+	copy(pkt[12:16], net.ParseIP("192.0.2.10").To4())
+	copy(pkt[16:20], net.ParseIP("198.51.100.1").To4())
+	binary.BigEndian.PutUint16(pkt[10:12], tcpChecksum(pkt[:20]))
+	tcpHeader := pkt[20:]
+	binary.BigEndian.PutUint16(tcpHeader[:2], 25000)
+	binary.BigEndian.PutUint16(tcpHeader[2:4], 8080)
+	binary.BigEndian.PutUint32(tcpHeader[4:8], 12345)
+	tcpHeader[12], tcpHeader[13] = 0x50, 0x02
+	binary.BigEndian.PutUint16(tcpHeader[14:16], 65535)
+	pseudo := append([]byte{}, pkt[12:20]...)
+	pseudo = append(pseudo, 0, 6, 0, 20)
+	pseudo = append(pseudo, tcpHeader...)
+	binary.BigEndian.PutUint16(tcpHeader[16:18], tcpChecksum(pseudo))
+
+	if _, err := dev.Write(pkt); err != nil {
+		t.Fatal(err)
+	}
+
+	readDone := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 2048)
+		n, _ := dev.Read(buf)
+		readDone <- buf[:n]
+	}()
+
+	select {
+	case synAck := <-readDone:
+		if len(synAck) < 40 || synAck[33]&0x12 != 0x12 {
+			t.Fatalf("expected SYN-ACK; received %x", synAck)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("did not receive SYN-ACK")
+	}
+
+	// Allow endpoint setup to settle; deliberately do not send the final ACK.
+	time.Sleep(20 * time.Millisecond)
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- dev.Close() }()
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close error: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Close did not return promptly within 500ms during unacknowledged TCP handshake")
 	}
 }

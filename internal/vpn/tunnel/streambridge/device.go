@@ -256,6 +256,12 @@ func (d *Device) Close() error {
 	d.cancel()
 	d.gateMu.Unlock()
 
+	if d.stack != nil {
+		for _, ep := range d.stack.RegisteredEndpoints() {
+			ep.Abort()
+		}
+	}
+
 	d.wg.Wait()
 	d.ep.Close()
 	d.stack.Close()
