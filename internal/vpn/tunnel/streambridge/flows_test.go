@@ -167,8 +167,8 @@ func TestFlows_TCPEchoAndHalfClose(t *testing.T) {
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	extraBuf := make([]byte, 16)
 	n, readErr := conn.Read(extraBuf)
-	if n != 0 || (!errors.Is(readErr, io.EOF) && readErr != nil) {
-		t.Logf("Read after CloseWrite returned n=%d, err=%v", n, readErr)
+	if n != 0 || !errors.Is(readErr, io.EOF) {
+		t.Fatalf("expected EOF after CloseWrite, got n=%d, err=%v", n, readErr)
 	}
 
 	_ = conn.Close()
@@ -179,6 +179,87 @@ func TestFlows_TCPEchoAndHalfClose(t *testing.T) {
 
 	if dev.LastHandshakeTime().IsZero() {
 		t.Fatal("expected non-zero LastHandshakeTime after successful dial")
+	}
+}
+
+func TestFlows_TCPHalfCloseReapingTimeout(t *testing.T) {
+	// Start an upstream server that reads client data to EOF but never closes the connection.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	defer l.Close()
+
+	var wg sync.WaitGroup
+	serverDone := make(chan struct{})
+	defer func() {
+		close(serverDone)
+		wg.Wait()
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		conn, acceptErr := l.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Read until client closes write (EOF), but do NOT close or send FIN.
+		_, _ = io.Copy(io.Discard, conn)
+
+		// Wait until test teardown or peer disconnect.
+		select {
+		case <-serverDone:
+		case <-time.After(5 * time.Second):
+		}
+	}()
+
+	dialer := funcDialer(func(ctx context.Context, network, address string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", l.Addr().String())
+	})
+
+	const halfCloseTimeout = 200 * time.Millisecond
+	cfg := Config{
+		DialTimeout:         1 * time.Second,
+		TCPHalfCloseTimeout: halfCloseTimeout,
+	}
+	dev, err := New(cfg, dialer)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+	defer dev.Close()
+
+	tc := newTestClient(t, dev)
+	defer tc.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	conn, err := tc.DialTCP(ctx, "198.51.100.1:8080")
+	if err != nil {
+		t.Fatalf("DialTCP error: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+
+	if active := dev.FlowStats().Active; active != 1 {
+		t.Fatalf("Active = %d, want 1", active)
+	}
+
+	// Client sends FIN via CloseWrite. Upstream reads EOF and stays open.
+	if err := conn.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite error: %v", err)
+	}
+
+	// Verify that the flow is terminated and Active returns to 0 within timeout window.
+	if !waitFor(t, func() bool { return dev.FlowStats().Active == 0 }) {
+		t.Fatalf("slot not reaped after TCPHalfCloseTimeout: Active = %d", dev.FlowStats().Active)
 	}
 }
 

@@ -147,7 +147,7 @@ func (d *Device) runTCPFlow(inConn *gonet.TCPConn, outConn net.Conn) {
 		if cw, ok := outConn.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}
-		_ = inConn.SetReadDeadline(time.Now().Add(d.cfg.TCPHalfCloseTimeout))
+		_ = outConn.SetReadDeadline(time.Now().Add(d.cfg.TCPHalfCloseTimeout))
 	}()
 
 	// outbound -> client
@@ -164,7 +164,7 @@ func (d *Device) runTCPFlow(inConn *gonet.TCPConn, outConn net.Conn) {
 		}
 
 		_ = inConn.CloseWrite()
-		_ = outConn.SetReadDeadline(time.Now().Add(d.cfg.TCPHalfCloseTimeout))
+		_ = inConn.SetReadDeadline(time.Now().Add(d.cfg.TCPHalfCloseTimeout))
 	}()
 
 	copyWg.Wait()
