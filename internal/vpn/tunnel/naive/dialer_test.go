@@ -3,11 +3,11 @@ package naive
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"errors"
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,29 +45,7 @@ func TestDialer_H2_Echo256KiB(t *testing.T) {
 
 	// 256 KiB payload
 	const payloadSize = 256 * 1024
-	payload := make([]byte, payloadSize)
-	if _, err := rand.Read(payload); err != nil {
-		t.Fatalf("generate payload: %v", err)
-	}
-
-	errc := make(chan error, 1)
-	go func() {
-		_, err := conn.Write(payload)
-		errc <- err
-	}()
-
-	recv := make([]byte, payloadSize)
-	if _, err := io.ReadFull(conn, recv); err != nil {
-		t.Fatalf("ReadFull H2: %v", err)
-	}
-
-	if err := <-errc; err != nil {
-		t.Fatalf("Write H2: %v", err)
-	}
-
-	if !bytes.Equal(payload, recv) {
-		t.Fatal("received payload does not match sent payload over H2")
-	}
+	verifyEchoPayload(t, conn, payloadSize, "H2")
 }
 
 func TestDialer_H3_Echo256KiB(t *testing.T) {
@@ -100,29 +78,7 @@ func TestDialer_H3_Echo256KiB(t *testing.T) {
 	defer conn.Close()
 
 	const payloadSize = 256 * 1024
-	payload := make([]byte, payloadSize)
-	if _, err := rand.Read(payload); err != nil {
-		t.Fatalf("generate payload: %v", err)
-	}
-
-	errc := make(chan error, 1)
-	go func() {
-		_, err := conn.Write(payload)
-		errc <- err
-	}()
-
-	recv := make([]byte, payloadSize)
-	if _, err := io.ReadFull(conn, recv); err != nil {
-		t.Fatalf("ReadFull H3: %v", err)
-	}
-
-	if err := <-errc; err != nil {
-		t.Fatalf("Write H3: %v", err)
-	}
-
-	if !bytes.Equal(payload, recv) {
-		t.Fatal("received payload does not match sent payload over H3")
-	}
+	verifyEchoPayload(t, conn, payloadSize, "H3")
 }
 
 func TestDialer_H3_FallbackToH2(t *testing.T) {
@@ -184,108 +140,19 @@ func TestDialer_Validation(t *testing.T) {
 		params   models.NaiveProxyParams
 		wantErr  string
 	}{
-		{
-			name:     "empty endpoint",
-			endpoint: "",
-			params:   validParams,
-			wantErr:  "invalid endpoint",
-		},
-		{
-			name:     "missing port",
-			endpoint: "127.0.0.1",
-			params:   validParams,
-			wantErr:  "invalid endpoint",
-		},
-		{
-			name:     "invalid port non-numeric",
-			endpoint: "127.0.0.1:abc",
-			params:   validParams,
-			wantErr:  "invalid endpoint port",
-		},
-		{
-			name:     "invalid port 0",
-			endpoint: "127.0.0.1:0",
-			params:   validParams,
-			wantErr:  "invalid endpoint port",
-		},
-		{
-			name:     "invalid port 65536",
-			endpoint: "127.0.0.1:65536",
-			params:   validParams,
-			wantErr:  "invalid endpoint port",
-		},
-		{
-			name:     "empty host",
-			endpoint: ":443",
-			params:   validParams,
-			wantErr:  "endpoint host cannot be empty",
-		},
-		{
-			name:     "empty domain",
-			endpoint: "127.0.0.1:443",
-			params: models.NaiveProxyParams{
-				Username: "u",
-				Password: "p",
-				Domain:   "",
-			},
-			wantErr: "domain cannot be empty",
-		},
-		{
-			name:     "domain with space",
-			endpoint: "127.0.0.1:443",
-			params: models.NaiveProxyParams{
-				Username: "u",
-				Password: "p",
-				Domain:   "foo bar.com",
-			},
-			wantErr: "invalid domain name",
-		},
-		{
-			name:     "domain with slash",
-			endpoint: "127.0.0.1:443",
-			params: models.NaiveProxyParams{
-				Username: "u",
-				Password: "p",
-				Domain:   "foo/bar.com",
-			},
-			wantErr: "invalid domain name",
-		},
-		{
-			name:     "domain with colon",
-			endpoint: "127.0.0.1:443",
-			params: models.NaiveProxyParams{
-				Username: "u",
-				Password: "p",
-				Domain:   "foo:443",
-			},
-			wantErr: "invalid domain name",
-		},
-		{
-			name:     "empty username",
-			endpoint: "127.0.0.1:443",
-			params: models.NaiveProxyParams{
-				Username: "",
-				Password: "p",
-				Domain:   "example.com",
-			},
-			wantErr: "username cannot be empty",
-		},
-		{
-			name:     "empty password",
-			endpoint: "127.0.0.1:443",
-			params: models.NaiveProxyParams{
-				Username: "u",
-				Password: "",
-				Domain:   "example.com",
-			},
-			wantErr: "password cannot be empty",
-		},
-		{
-			name:     "valid parameters",
-			endpoint: "127.0.0.1:443",
-			params:   validParams,
-			wantErr:  "",
-		},
+		{name: "empty endpoint", endpoint: "", params: validParams, wantErr: "invalid endpoint"},
+		{name: "missing port", endpoint: "127.0.0.1", params: validParams, wantErr: "invalid endpoint"},
+		{name: "invalid port non-numeric", endpoint: "127.0.0.1:abc", params: validParams, wantErr: "invalid endpoint port"},
+		{name: "invalid port 0", endpoint: "127.0.0.1:0", params: validParams, wantErr: "invalid endpoint port"},
+		{name: "invalid port 65536", endpoint: "127.0.0.1:65536", params: validParams, wantErr: "invalid endpoint port"},
+		{name: "empty host", endpoint: ":443", params: validParams, wantErr: "endpoint host cannot be empty"},
+		{name: "empty domain", endpoint: "127.0.0.1:443", params: models.NaiveProxyParams{Username: "u", Password: "p", Domain: ""}, wantErr: "domain cannot be empty"},
+		{name: "domain with space", endpoint: "127.0.0.1:443", params: models.NaiveProxyParams{Username: "u", Password: "p", Domain: "foo bar.com"}, wantErr: "invalid domain name"},
+		{name: "domain with slash", endpoint: "127.0.0.1:443", params: models.NaiveProxyParams{Username: "u", Password: "p", Domain: "foo/bar.com"}, wantErr: "invalid domain name"},
+		{name: "domain with colon", endpoint: "127.0.0.1:443", params: models.NaiveProxyParams{Username: "u", Password: "p", Domain: "foo:443"}, wantErr: "invalid domain name"},
+		{name: "empty username", endpoint: "127.0.0.1:443", params: models.NaiveProxyParams{Username: "", Password: "p", Domain: "example.com"}, wantErr: "username cannot be empty"},
+		{name: "empty password", endpoint: "127.0.0.1:443", params: models.NaiveProxyParams{Username: "u", Password: "", Domain: "example.com"}, wantErr: "password cannot be empty"},
+		{name: "valid parameters", endpoint: "127.0.0.1:443", params: validParams, wantErr: ""},
 	}
 
 	for _, tt := range tests {
@@ -954,5 +821,101 @@ func TestDialer_H3_CloseWrite(t *testing.T) {
 
 	if err := cw.CloseWrite(); err != nil {
 		t.Fatalf("CloseWrite failed: %v", err)
+	}
+}
+
+func TestDialer_H2_StreamLimitSaturationDoesNotKillLiveFlows(t *testing.T) {
+	echoAddr, ce := setupTCPEchoServer(t)
+	defer ce()
+	const maxStreams = 250
+	addr, scl := setupTestH2Server(t, "u", "p", true)
+	defer scl()
+	for iter := 0; iter < 2; iter++ {
+		d, err := New(addr, models.NaiveProxyParams{Username: "u", Password: "p", Domain: testCamouflageDomain})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		var live []net.Conn
+		for i := 0; i < maxStreams-2; i++ {
+			c, err := d.DialContext(context.Background(), "tcp", echoAddr)
+			if err != nil {
+				t.Fatalf("setup dial %d: %v", i, err)
+			}
+			live = append(live, c)
+		}
+		var wg sync.WaitGroup
+		for i := 0; i < 6; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				c, err := d.DialContext(ctx, "tcp", echoAddr)
+				if err == nil {
+					_ = c.Close()
+				}
+			}()
+		}
+		wg.Wait()
+		for i, c := range live {
+			if err := r2Echo(c); err != nil {
+				t.Fatalf("iter %d: live flow %d killed under saturation burst: %v", iter, i, err)
+			}
+		}
+		for _, c := range live {
+			_ = c.Close()
+		}
+		_ = d.Close()
+	}
+}
+
+func TestDialer_H2_BlackholedPooledConnEvicted(t *testing.T) {
+	origIdle := h2ReadIdleTimeout
+	origPing := h2PingTimeout
+	h2ReadIdleTimeout = 100 * time.Millisecond
+	h2PingTimeout = 100 * time.Millisecond
+	t.Cleanup(func() {
+		h2ReadIdleTimeout = origIdle
+		h2PingTimeout = origPing
+	})
+
+	echoAddr, ce := setupTCPEchoServer(t)
+	defer ce()
+	h2Addr, cl := setupTestH2Server(t, "u", "p", true)
+	defer cl()
+	relay := newR2Relay(t, h2Addr)
+	d, err := New(relay.ln.Addr().String(), models.NaiveProxyParams{Username: "u", Password: "p", Domain: testCamouflageDomain})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer d.Close()
+
+	c, err := d.DialContext(context.Background(), "tcp", echoAddr)
+	if err != nil {
+		t.Fatalf("first dial: %v", err)
+	}
+	_ = c.Close()
+
+	relay.blackholeExisting() // pooled TCP conn now silently drops traffic both ways
+
+	fails := 0
+	for i := 0; i < 4; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		start := time.Now()
+		c, err := d.DialContext(ctx, "tcp", echoAddr)
+		cancel()
+		if err != nil {
+			fails++
+			t.Logf("dial %d after blackhole: elapsed=%v err=%v", i, time.Since(start).Round(time.Millisecond), err)
+			continue
+		}
+		_ = c.SetDeadline(time.Now().Add(time.Second))
+		_, _ = c.Write([]byte("x"))
+		_, rerr := io.ReadFull(c, make([]byte, 1))
+		t.Logf("dial %d after blackhole: ok, echo err=%v", i, rerr)
+		_ = c.Close()
+	}
+	if fails > 1 {
+		t.Fatalf("dead pooled H2 conn kept being reused: %d/4 dials failed although fresh TCP to the proxy works", fails)
 	}
 }

@@ -1,6 +1,7 @@
 package naive
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -444,4 +445,99 @@ func setupDualStackH2H3Server(t *testing.T, authUser, authPass string) (string, 
 	}
 
 	return h2Addr, &drop, cleanup
+}
+
+type r2Relay struct {
+	ln   net.Listener
+	mu   sync.Mutex
+	gens []*atomic.Bool
+}
+
+func newR2Relay(t *testing.T, upstream string) *r2Relay {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &r2Relay{ln: ln}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			u, err := net.Dial("tcp", upstream)
+			if err != nil {
+				_ = c.Close()
+				continue
+			}
+			bh := &atomic.Bool{}
+			r.mu.Lock()
+			r.gens = append(r.gens, bh)
+			r.mu.Unlock()
+			pump := func(dst, src net.Conn) {
+				b := make([]byte, 32*1024)
+				for {
+					n, err := src.Read(b)
+					if err != nil {
+						return
+					}
+					if !bh.Load() {
+						if _, err := dst.Write(b[:n]); err != nil {
+							return
+						}
+					}
+				}
+			}
+			go pump(u, c)
+			go pump(c, u)
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close() })
+	return r
+}
+
+func (r *r2Relay) blackholeExisting() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, g := range r.gens {
+		g.Store(true)
+	}
+}
+
+func r2Echo(c net.Conn) error {
+	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+	msg := []byte("alive")
+	if _, err := c.Write(msg); err != nil {
+		return err
+	}
+	_, err := io.ReadFull(c, make([]byte, len(msg)))
+	return err
+}
+
+func verifyEchoPayload(t *testing.T, conn net.Conn, size int, proto string) {
+	t.Helper()
+	payload := make([]byte, size)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatalf("generate payload: %v", err)
+	}
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(payload)
+		errc <- err
+	}()
+
+	recv := make([]byte, size)
+	if _, err := io.ReadFull(conn, recv); err != nil {
+		t.Fatalf("ReadFull %s: %v", proto, err)
+	}
+
+	if err := <-errc; err != nil {
+		t.Fatalf("Write %s: %v", proto, err)
+	}
+
+	if !bytes.Equal(payload, recv) {
+		t.Fatalf("received payload does not match sent payload over %s", proto)
+	}
 }

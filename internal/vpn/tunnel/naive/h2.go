@@ -15,6 +15,11 @@ import (
 	"golang.org/x/net/http2"
 )
 
+var (
+	h2ReadIdleTimeout = 15 * time.Second
+	h2PingTimeout     = 15 * time.Second
+)
+
 type h2Pool struct {
 	mu sync.Mutex
 	//nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
@@ -41,8 +46,8 @@ func (p *h2Pool) invalidate(cc *http2.ClientConn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.cc == cc {
-		_ = p.cc.Close()
 		p.cc = nil
+		go func() { _ = cc.Shutdown(context.Background()) }()
 	}
 }
 
@@ -77,7 +82,10 @@ func (d *Dialer) getH2Conn(ctx context.Context) (*http2.ClientConn, net.Addr, ne
 	}
 
 	//nolint:staticcheck // SA1019: x/net/http2.Transport.NewClientConn required for raw TLS connection wrapping
-	t := &http2.Transport{}
+	t := &http2.Transport{
+		ReadIdleTimeout: h2ReadIdleTimeout,
+		PingTimeout:     h2PingTimeout,
+	}
 	//nolint:staticcheck // SA1019: x/net/http2.Transport.NewClientConn required for raw TLS connection wrapping
 	cc, err := t.NewClientConn(tlsConn)
 	if err != nil {
@@ -134,9 +142,6 @@ func (d *Dialer) dialH2(ctx context.Context, address string) (net.Conn, error) {
 		reqCancel()
 		_ = pr.Close()
 		_ = pw.Close()
-		if !cc.CanTakeNewRequest() {
-			d.h2Pool.invalidate(cc)
-		}
 		return nil, fmt.Errorf("naive: h2 roundtrip: %w", err)
 	}
 
