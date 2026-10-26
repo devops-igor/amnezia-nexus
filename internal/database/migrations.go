@@ -43,6 +43,9 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 	if err := d.migrateBackendTunnelsEnabled(ctx); err != nil {
 		return err
 	}
+	if err := d.migrateBackendTunnelsProtocol(ctx); err != nil {
+		return err
+	}
 	if err := d.migrateAWGIPAllocations(ctx); err != nil {
 		return err
 	}
@@ -505,4 +508,48 @@ func (d *DB) migratePlaintextSSLKeys(ctx context.Context) error {
 
 	_, err := d.sqlDB.ExecContext(ctx, "INSERT INTO migration_flags (key, value) VALUES ('ssl_keys_encrypted', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
 	return err
+}
+
+// migrateBackendTunnelsProtocol adds protocol and protocol_params columns to
+// backend_tunnels for multi-protocol egress backend support (issue #632).
+// Existing rows default to protocol='awg' and empty encrypted protocol_params.
+func (d *DB) migrateBackendTunnelsProtocol(ctx context.Context) error {
+	rows, err := d.sqlDB.QueryContext(ctx, "PRAGMA table_info(backend_tunnels)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect backend_tunnels schema: %w", err)
+	}
+	defer rows.Close()
+
+	hasProtocol := false
+	hasProtocolParams := false
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltVal sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltVal, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(name, "protocol") {
+			hasProtocol = true
+		}
+		if strings.EqualFold(name, "protocol_params") {
+			hasProtocolParams = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if !hasProtocol {
+		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN protocol TEXT NOT NULL DEFAULT 'awg'"); err != nil {
+			return fmt.Errorf("failed to add protocol column: %w", err)
+		}
+	}
+	if !hasProtocolParams {
+		if _, err := d.sqlDB.ExecContext(ctx, "ALTER TABLE backend_tunnels ADD COLUMN protocol_params TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("failed to add protocol_params column: %w", err)
+		}
+	}
+	return nil
 }

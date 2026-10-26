@@ -1,19 +1,33 @@
 package models
 
 import (
+	"bytes"
+	"encoding/json"
+	"reflect"
 	"time"
 )
 
+const (
+	ProtocolAWG   = "awg"
+	ProtocolVLESS = "vless"
+	ProtocolNaive = "naive"
+)
+
 var ValidProtocols = map[string]bool{
-	"awg":    true,
-	"telemt": true,
-	"dns":    true,
+	ProtocolAWG:   true,
+	"telemt":      true,
+	"dns":         true,
+	ProtocolVLESS: true,
+	ProtocolNaive: true,
 }
 
 // ProtocolAliases maps legacy protocol names to standardized names.
 var ProtocolAliases = map[string]string{
-	"awg2":       "awg",
-	"awg_legacy": "awg",
+	"awg2":          ProtocolAWG,
+	"awg_legacy":    ProtocolAWG,
+	"vless-reality": ProtocolVLESS,
+	"vless_reality": ProtocolVLESS,
+	"naiveproxy":    ProtocolNaive,
 }
 
 // NormalizeProtocol normalizes legacy protocol names (e.g., awg2, awg_legacy -> awg).
@@ -34,12 +48,16 @@ func IsValidProtocol(proto string) bool {
 // unvalidated user input instead of interpolating it into shell commands.
 func ContainerNameForProtocol(proto string) (string, bool) {
 	switch NormalizeProtocol(proto) {
-	case "awg":
+	case ProtocolAWG:
 		return "amnezia-awg", true
 	case "telemt":
 		return "telemt", true
 	case "dns":
 		return "amnezia-dns", true
+	case ProtocolVLESS:
+		return "amnezia-xray", true
+	case ProtocolNaive:
+		return "amnezia-caddy", true
 	default:
 		return "", false
 	}
@@ -49,12 +67,16 @@ func ContainerNameForProtocol(proto string) (string, bool) {
 // Rejecting unknown protocols here prevents path injection via user-supplied input.
 func ConfigPathForProtocol(proto string) (string, bool) {
 	switch NormalizeProtocol(proto) {
-	case "awg":
+	case ProtocolAWG:
 		return "/opt/amnezia/awg/awg0.conf", true
 	case "dns":
 		return "/opt/amnezia/dns/unbound.conf", true
 	case "telemt":
 		return "/opt/mtproxyl/settings.conf", true
+	case ProtocolVLESS:
+		return "/opt/amnezia/xray/config.json", true
+	case ProtocolNaive:
+		return "/opt/amnezia/caddy/Caddyfile", true
 	default:
 		return "", false
 	}
@@ -273,7 +295,26 @@ const (
 	DisableReasonAdmin  = "admin"
 )
 
-// BackendTunnel represents an in-process AWG tunnel to a backend VPN server.
+// VLESSRealityParams holds connection and cryptographic parameters for VLESS+REALITY backends.
+type VLESSRealityParams struct {
+	UUID        string `json:"uuid"`
+	Flow        string `json:"flow"`
+	PublicKey   string `json:"public_key"`
+	ShortID     string `json:"short_id"`
+	ServerName  string `json:"server_name"`
+	Fingerprint string `json:"fingerprint"`
+	Transport   string `json:"transport"`
+}
+
+// NaiveProxyParams holds connection and authentication parameters for NaiveProxy backends.
+type NaiveProxyParams struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Domain   string `json:"domain"`
+	EnableH3 bool   `json:"enable_h3"`
+}
+
+// BackendTunnel represents an in-process tunnel to a backend VPN server.
 type BackendTunnel struct {
 	ID            int64  `json:"id" db:"id"`
 	ServerID      int64  `json:"server_id" db:"server_id"`
@@ -283,31 +324,66 @@ type BackendTunnel struct {
 	// ProbePrivateKey is the dedicated health-probe client key, distinct from
 	// PrivateKey (the data device identity). Sharing one key made the backend
 	// roam the peer's return endpoint to whichever socket sent last (issue #43).
-	ProbePrivateKey   string     `json:"-" db:"probe_private_key"` // Encrypted at rest
-	Endpoint          string     `json:"endpoint" db:"endpoint"`
-	Enabled           bool       `json:"enabled" db:"enabled"` // administrative intent; independent from runtime health
-	Status            string     `json:"status" db:"status"`   // runtime health: connecting, active, degraded, disabled
-	DisableReason     string     `json:"disable_reason,omitempty" db:"disable_reason"`
-	StateVersion      int64      `json:"state_version" db:"state_version"`
-	LastHealthCheck   *time.Time `json:"last_health_check,omitempty" db:"last_health_check"`
-	LatencyMS         int64      `json:"latency_ms" db:"latency_ms"`
-	ActiveConnections int        `json:"active_connections" db:"active_connections"`
-	CreatedAt         time.Time  `json:"created_at" db:"created_at"`
+	ProbePrivateKey   string          `json:"-" db:"probe_private_key"` // Encrypted at rest
+	Endpoint          string          `json:"endpoint" db:"endpoint"`
+	Enabled           bool            `json:"enabled" db:"enabled"` // administrative intent; independent from runtime health
+	Status            string          `json:"status" db:"status"`   // runtime health: connecting, active, degraded, disabled
+	DisableReason     string          `json:"disable_reason,omitempty" db:"disable_reason"`
+	StateVersion      int64           `json:"state_version" db:"state_version"`
+	LastHealthCheck   *time.Time      `json:"last_health_check,omitempty" db:"last_health_check"`
+	LatencyMS         int64           `json:"latency_ms" db:"latency_ms"`
+	ActiveConnections int             `json:"active_connections" db:"active_connections"`
+	CreatedAt         time.Time       `json:"created_at" db:"created_at"`
+	Protocol          string          `json:"protocol" db:"protocol"`
+	ProtocolParams    json.RawMessage `json:"-" db:"protocol_params"`
+}
+
+func normalizeTunnelProtocol(proto string) string {
+	if proto == "" {
+		return ProtocolAWG
+	}
+	return NormalizeProtocol(proto)
+}
+
+func equalJSON(a, b json.RawMessage) bool {
+	if bytes.Equal(a, b) {
+		return true
+	}
+	if len(a) == 0 || len(b) == 0 {
+		return len(a) == 0 && len(b) == 0
+	}
+	var valA, valB any
+	if err := json.Unmarshal(a, &valA); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(b, &valB); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(valA, valB)
 }
 
 // SameTunnelIdentity reports whether two backend tunnels have identical immutable
-// configuration and cryptographic identity (ID, endpoint, and key material).
+// configuration and cryptographic identity (ID, endpoint, protocol, and key material / protocol params).
 // Runtime health (Status, StateVersion, LatencyMS, etc.) and administrative state
 // (Enabled, DisableReason) are not part of identity.
 func SameTunnelIdentity(a, b *BackendTunnel) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	return a.ID == b.ID &&
-		a.Endpoint == b.Endpoint &&
-		a.PublicKey == b.PublicKey &&
-		a.PrivateKey == b.PrivateKey &&
-		a.ProbePrivateKey == b.ProbePrivateKey
+	if a.ID != b.ID || a.Endpoint != b.Endpoint {
+		return false
+	}
+	protoA := normalizeTunnelProtocol(a.Protocol)
+	protoB := normalizeTunnelProtocol(b.Protocol)
+	if protoA != protoB {
+		return false
+	}
+	if protoA == ProtocolAWG {
+		return a.PublicKey == b.PublicKey &&
+			a.PrivateKey == b.PrivateKey &&
+			a.ProbePrivateKey == b.ProbePrivateKey
+	}
+	return equalJSON(a.ProtocolParams, b.ProtocolParams)
 }
 
 // VPNSession tracks an active user connection through the portal AWG endpoint.

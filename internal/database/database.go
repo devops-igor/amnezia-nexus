@@ -104,6 +104,8 @@ var (
 		// subsystem ownership cannot be bypassed.
 		"active_connections": true,
 		"created_at":         true,
+		"protocol":           true,
+		"protocol_params":    true,
 	}
 )
 

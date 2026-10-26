@@ -212,6 +212,20 @@ func (r *UpdateServerHostRequest) Validate() error {
 	return ValidateHost(r.Host)
 }
 
+// VLESSInstallOptions defines installation parameters specific to VLESS+REALITY.
+type VLESSInstallOptions struct {
+	Port       string `json:"port,omitempty"`
+	ServerName string `json:"server_name,omitempty"`
+	Flow       string `json:"flow,omitempty"`
+}
+
+// NaiveInstallOptions defines installation parameters specific to NaiveProxy.
+type NaiveInstallOptions struct {
+	Port          string `json:"port,omitempty"`
+	Domain        string `json:"domain,omitempty"`
+	DecoyTemplate string `json:"decoy_template,omitempty"`
+}
+
 // InstallProtocolRequest defines protocol deployment options on a server.
 type InstallProtocolRequest struct {
 	Protocol            string                 `json:"protocol"`
@@ -222,6 +236,8 @@ type InstallProtocolRequest struct {
 	AWGProfile          *AWGObfuscationProfile `json:"awg_profile,omitempty"`
 	AWGCPSProtocol      *string                `json:"awg_cps_protocol,omitempty"`
 	AWGHeaderProtection *bool                  `json:"awg_header_protection,omitempty"`
+	VLESSOptions        *VLESSInstallOptions   `json:"vless_options,omitempty"`
+	NaiveOptions        *NaiveInstallOptions   `json:"naive_options,omitempty"`
 }
 
 func (r *InstallProtocolRequest) Validate() error {
@@ -236,6 +252,32 @@ func (r *InstallProtocolRequest) Validate() error {
 	if r.TLSDomain != nil && *r.TLSDomain != "" {
 		if err := ValidateTLSDomain(*r.TLSDomain); err != nil {
 			return err
+		}
+	}
+	if r.VLESSOptions != nil {
+		if r.VLESSOptions.Port != "" {
+			p, err := strconv.Atoi(r.VLESSOptions.Port)
+			if err != nil || p < 1 || p > 65535 {
+				return errors.New("vless port must be an integer between 1 and 65535")
+			}
+		}
+		if r.VLESSOptions.ServerName != "" {
+			if err := ValidateTLSDomain(r.VLESSOptions.ServerName); err != nil {
+				return fmt.Errorf("invalid vless server_name: %w", err)
+			}
+		}
+	}
+	if r.NaiveOptions != nil {
+		if r.NaiveOptions.Port != "" {
+			p, err := strconv.Atoi(r.NaiveOptions.Port)
+			if err != nil || p < 1 || p > 65535 {
+				return errors.New("naive port must be an integer between 1 and 65535")
+			}
+		}
+		if r.NaiveOptions.Domain != "" {
+			if err := ValidateTLSDomain(r.NaiveOptions.Domain); err != nil {
+				return fmt.Errorf("invalid naive domain: %w", err)
+			}
 		}
 	}
 	return nil
