@@ -6,14 +6,17 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 )
 
 // ProbeOptions configures the TLS probe behavior.
 type ProbeOptions struct {
-	Timeout time.Duration
-	RootCAs *x509.CertPool
-	Dialer  *net.Dialer
+	Timeout  time.Duration
+	RootCAs  *x509.CertPool
+	Dialer   *net.Dialer
+	TargetIP net.IP
+	Port     int
 }
 
 // ProbeResult contains TLS handshake and ALPN verification details.
@@ -28,7 +31,10 @@ type ProbeResult struct {
 	Error     string        `json:"error,omitempty"`
 }
 
-// ProbeTLSH2 performs a TLS 1.3 handshake with ALPN "h2" negotiation against domain:443.
+// ProbeTLSH2 performs a TLS 1.3 handshake with ALPN "h2" negotiation.
+// When opts.TargetIP is specified, the probe connects directly to net.JoinHostPort(candIP.String(), "443")
+// while setting tls.Config.ServerName to domain. This ensures that the TLS handshake probes the exact IP
+// that passed geo proximity checks rather than re-resolving the domain.
 func ProbeTLSH2(ctx context.Context, domain string, opts ProbeOptions) ProbeResult {
 	timeout := opts.Timeout
 	if timeout <= 0 {
@@ -40,8 +46,25 @@ func ProbeTLSH2(ctx context.Context, domain string, opts ProbeOptions) ProbeResu
 		dialer = &net.Dialer{Timeout: timeout}
 	}
 
+	portStr := "443"
+	if opts.Port > 0 {
+		portStr = strconv.Itoa(opts.Port)
+	}
+
+	targetAddr := net.JoinHostPort(domain, portStr)
+	serverName := domain
+	if len(opts.TargetIP) > 0 {
+		targetAddr = net.JoinHostPort(opts.TargetIP.String(), portStr)
+		if h, _, err := net.SplitHostPort(domain); err == nil {
+			serverName = h
+		}
+	} else if h, p, err := net.SplitHostPort(domain); err == nil {
+		targetAddr = net.JoinHostPort(h, p)
+		serverName = h
+	}
+
 	start := time.Now()
-	rawConn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(domain, "443"))
+	rawConn, err := dialer.DialContext(ctx, "tcp", targetAddr)
 	if err != nil {
 		return ProbeResult{
 			Domain: domain,
@@ -53,7 +76,7 @@ func ProbeTLSH2(ctx context.Context, domain string, opts ProbeOptions) ProbeResu
 	}()
 
 	tlsCfg := &tls.Config{
-		ServerName: domain,
+		ServerName: serverName,
 		MinVersion: tls.VersionTLS13,
 		NextProtos: []string{"h2", "http/1.1"},
 		RootCAs:    opts.RootCAs,

@@ -11,21 +11,21 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
-func extractVLESSOptions(vo any) (portStr, serverName, flow string) {
+func extractVLESSOptions(vo any) (portStr, serverName, flow string, flowSpecified bool) {
 	switch opt := vo.(type) {
 	case *models.VLESSInstallOptions:
 		if opt != nil {
-			return opt.Port, opt.ServerName, opt.Flow
+			return opt.Port, opt.ServerName, opt.Flow, opt.FlowSet || opt.Flow != ""
 		}
 	case models.VLESSInstallOptions:
-		return opt.Port, opt.ServerName, opt.Flow
+		return opt.Port, opt.ServerName, opt.Flow, opt.FlowSet || opt.Flow != ""
 	case map[string]any:
 		p, _ := opt["port"].(string)
 		sn, _ := opt["server_name"].(string)
-		fl, _ := opt["flow"].(string)
-		return p, sn, fl
+		fl, ok := opt["flow"].(string)
+		return p, sn, fl, ok
 	}
-	return "", "", ""
+	return "", "", "", false
 }
 
 func parseXrayInstallOptions(params map[string]any) (int, string, string) {
@@ -38,8 +38,11 @@ func parseXrayInstallOptions(params map[string]any) (int, string, string) {
 
 	serverName := "gateway.icloud.com"
 	flow := "xtls-rprx-vision"
+	if f, ok := params["flow"]; ok {
+		flow = fmt.Sprint(f)
+	}
 	if vo, ok := params["vless_options"]; ok && vo != nil {
-		pStr, sn, fl := extractVLESSOptions(vo)
+		pStr, sn, fl, flSet := extractVLESSOptions(vo)
 		if pStr != "" {
 			if pInt, err := strconv.Atoi(pStr); err == nil && pInt > 0 {
 				portPrimary = pInt
@@ -48,73 +51,91 @@ func parseXrayInstallOptions(params map[string]any) (int, string, string) {
 		if sn != "" {
 			serverName = sn
 		}
-		if fl != "" {
+		if flSet {
 			flow = fl
 		}
+	}
+	if flow == "none" {
+		flow = ""
 	}
 	return portPrimary, serverName, flow
 }
 
-// Install prepares the host, renders VLESS+REALITY configuration, and launches amnezia-xray.
-func (m *XrayManager) Install(ctx context.Context, server *models.Server, params map[string]any) error {
-	client, err := m.getSSHClient(ctx, server)
-	if err != nil {
-		return err
+func (m *XrayManager) resolveRealityCredentials(
+	ctx context.Context,
+	client ssh.SSHClient,
+) (string, string, string, []string, []XrayClient, error) {
+	var (
+		privB64  string
+		pubB64   string
+		shortID  string
+		shortIDs []string
+		clients  []XrayClient
+	)
+
+	// Check if existing config.json is present on the server
+	var existingCfgBytes []byte
+	catOut, _, catCode, _ := client.RunSudoCommand(ctx, fmt.Sprintf("cat %s 2>/dev/null", ssh.EscapeShellArg(XrayConfigPath)))
+	if catCode == 0 && strings.TrimSpace(catOut) != "" && strings.TrimSpace(catOut) != "OK" {
+		existingCfgBytes = []byte(catOut)
+	} else if data, dlErr := client.DownloadFile(ctx, XrayConfigPath); dlErr == nil && len(data) > 0 {
+		existingCfgBytes = data
 	}
 
-	unlock, err := m.lockServer(ctx, client, server.ID)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
-	// 1. Check Docker is installed
-	out, _, code, _ := client.RunCommand(ctx, "docker --version")
-	if code != 0 || !strings.Contains(strings.ToLower(out), "docker") {
-		return errors.New("docker is not installed on the remote server")
-	}
-
-	// 2. Parse installation options
-	portPrimary, serverName, flow := parseXrayInstallOptions(params)
-
-	// 3. Generate REALITY cryptographic credentials
-	privB64, pubB64, err := GenerateRealityKeypair()
-	if err != nil {
-		return fmt.Errorf("generate reality keypair: %w", err)
+	if len(existingCfgBytes) > 0 {
+		if parsed, err := ParseXrayConfig(existingCfgBytes); err == nil && len(parsed.Inbounds) > 0 {
+			inbound := parsed.Inbounds[0]
+			reality := inbound.StreamSettings.RealitySettings
+			if reality.PrivateKey != "" {
+				if derivedPub, pubErr := DerivePublicKey(reality.PrivateKey); pubErr == nil {
+					privB64 = reality.PrivateKey
+					pubB64 = derivedPub
+					shortIDs = reality.ShortIDs
+					if len(shortIDs) > 0 && shortIDs[0] != "" {
+						shortID = shortIDs[0]
+					}
+					clients = inbound.Settings.Clients
+				}
+			}
+		}
 	}
 
-	shortID, err := GenerateShortID()
-	if err != nil {
-		return fmt.Errorf("generate short ID: %w", err)
+	if privB64 == "" {
+		var genErr error
+		privB64, pubB64, genErr = GenerateRealityKeypair()
+		if genErr != nil {
+			return "", "", "", nil, nil, fmt.Errorf("generate reality keypair: %w", genErr)
+		}
+		shortID, genErr = GenerateShortID()
+		if genErr != nil {
+			return "", "", "", nil, nil, fmt.Errorf("generate short ID: %w", genErr)
+		}
+		shortIDs = []string{shortID}
+		clients = []XrayClient{}
+	} else {
+		if shortID == "" {
+			var genErr error
+			shortID, genErr = GenerateShortID()
+			if genErr != nil {
+				return "", "", "", nil, nil, fmt.Errorf("generate short ID: %w", genErr)
+			}
+			shortIDs = []string{shortID}
+		}
+		if clients == nil {
+			clients = []XrayClient{}
+		}
 	}
 
-	// 4. Create directory structure
-	mkdirCmd := fmt.Sprintf("mkdir -p %s", ssh.EscapeShellArg(XrayConfigDir))
-	if _, errOut, code, err := client.RunSudoCommand(ctx, mkdirCmd); err != nil || code != 0 {
-		return fmt.Errorf("failed to create xray config directory (code %d): %s: %w", code, errOut, err)
-	}
+	return privB64, pubB64, shortID, shortIDs, clients, nil
+}
 
-	// 5. Render and upload initial config.json
-	portHigh := 54321
-	dest := netJoinHostPort(serverName, "443")
-	cfgBytes, err := RenderXrayConfig(portPrimary, portHigh, serverName, dest, privB64, []string{shortID}, []XrayClient{})
-	if err != nil {
-		return fmt.Errorf("render xray config: %w", err)
-	}
-
-	if err := client.UploadSudoFile(ctx, XrayConfigPath, cfgBytes, 0644); err != nil {
-		return fmt.Errorf("upload xray config: %w", err)
-	}
-
-	// 6. Cleanup any stale xray container
+func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient) error {
 	stopCmd := fmt.Sprintf("docker stop %s 2>/dev/null || true; docker rm -fv %s 2>/dev/null || true",
 		ssh.EscapeShellArg(XrayContainerName), ssh.EscapeShellArg(XrayContainerName))
 	_, _, _, _ = client.RunSudoCommand(ctx, stopCmd)
 
-	// Best effort image pull
 	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker pull %s 2>/dev/null || true", ssh.EscapeShellArg(XrayBaseImage)))
 
-	// 7. Launch amnezia-xray container
 	runCmd := fmt.Sprintf(`docker run -d \
 --name %s \
 --restart unless-stopped \
@@ -139,7 +160,6 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 		return fmt.Errorf("failed to run xray container (code %d): %s: %w", code, errOut, err)
 	}
 
-	// 8. Verify container is alive and not restarting
 	checkCmd := fmt.Sprintf("docker inspect -f '{{.State.Running}} {{.State.Restarting}}' %s", ssh.EscapeShellArg(XrayContainerName))
 	out, errOut, code, err := client.RunSudoCommand(ctx, checkCmd)
 	if err != nil || code != 0 {
@@ -148,6 +168,59 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	fields := strings.Fields(strings.TrimSpace(out))
 	if len(fields) < 2 || fields[0] != "true" || fields[1] != "false" {
 		return fmt.Errorf("xray container is not running (state: %s)", strings.TrimSpace(out))
+	}
+	return nil
+}
+
+// Install prepares the host, renders VLESS+REALITY configuration, and launches amnezia-xray.
+func (m *XrayManager) Install(ctx context.Context, server *models.Server, params map[string]any) error {
+	client, err := m.getSSHClient(ctx, server)
+	if err != nil {
+		return err
+	}
+
+	unlock, err := m.lockServer(ctx, client, server.ID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	// 1. Check Docker is installed
+	out, _, code, _ := client.RunCommand(ctx, "docker --version")
+	if code != 0 || !strings.Contains(strings.ToLower(out), "docker") {
+		return errors.New("docker is not installed on the remote server")
+	}
+
+	// 2. Parse installation options
+	portPrimary, serverName, flow := parseXrayInstallOptions(params)
+
+	// 3. Generate or preserve REALITY cryptographic credentials and existing clients
+	privB64, pubB64, shortID, shortIDs, clients, err := m.resolveRealityCredentials(ctx, client)
+	if err != nil {
+		return err
+	}
+
+	// 4. Create directory structure
+	mkdirCmd := fmt.Sprintf("mkdir -p %s", ssh.EscapeShellArg(XrayConfigDir))
+	if _, errOut, code, err := client.RunSudoCommand(ctx, mkdirCmd); err != nil || code != 0 {
+		return fmt.Errorf("failed to create xray config directory (code %d): %s: %w", code, errOut, err)
+	}
+
+	// 5. Render and upload config.json
+	portHigh := 54321
+	dest := netJoinHostPort(serverName, "443")
+	cfgBytes, err := RenderXrayConfig(portPrimary, portHigh, serverName, dest, privB64, shortIDs, clients)
+	if err != nil {
+		return fmt.Errorf("render xray config: %w", err)
+	}
+
+	if err := client.UploadSudoFile(ctx, XrayConfigPath, cfgBytes, 0644); err != nil {
+		return fmt.Errorf("upload xray config: %w", err)
+	}
+
+	// 6. Launch amnezia-xray container
+	if err := m.launchContainer(ctx, client); err != nil {
+		return err
 	}
 
 	m.containerCache.set(m.containerCache.keyForServer(server), true)

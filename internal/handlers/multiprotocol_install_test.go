@@ -26,6 +26,16 @@ func (m *captureMockProtocolManager) Protocol() string {
 
 func (m *captureMockProtocolManager) Install(ctx context.Context, server *models.Server, params map[string]any) error {
 	m.capturedParams = params
+	if server.Protocols == nil {
+		server.Protocols = make(map[string]any)
+	}
+	server.Protocols[m.proto] = map[string]any{
+		"installed":   true,
+		"public_key":  "pubkey123",
+		"short_id":    "shortid123",
+		"server_name": "gateway.icloud.com",
+		"flow":        "xtls-rprx-vision",
+	}
 	return nil
 }
 
@@ -316,5 +326,76 @@ func TestUninstallProtocolHandler_FailurePreservesRecords(t *testing.T) {
 	savedConn, err := db.GetConnection(ctx, connID)
 	if err != nil || savedConn == nil {
 		t.Errorf("expected connection %s to be preserved in database, got: %v, err: %v", connID, savedConn, err)
+	}
+}
+
+func TestInstallProtocolHandler_PreservesProtocolMetadata(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+
+	vlessMock := &captureMockProtocolManager{proto: "vless"}
+	h.registry = manager.NewRegistry()
+	h.registry.Register(vlessMock)
+
+	server := &models.Server{
+		Name:      "meta-test-server",
+		Host:      "198.51.100.12",
+		SSHPort:   22,
+		Protocols: make(map[string]any),
+	}
+	serverID, err := db.CreateServer(context.Background(), server)
+	if err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+
+	adminSession := &models.SessionData{
+		UserID:   "admin-user",
+		Username: "admin",
+		Role:     models.RoleAdmin,
+	}
+
+	reqBody := models.InstallProtocolRequest{
+		Protocol: "vless",
+		Port:     "443",
+		VLESSOptions: &models.VLESSInstallOptions{
+			Port:       "443",
+			ServerName: "gateway.icloud.com",
+			Flow:       "xtls-rprx-vision",
+		},
+	}
+	body, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/install", serverID), bytes.NewReader(body))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("server_id", fmt.Sprintf("%d", serverID))
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	req = req.WithContext(middleware.WithSession(req.Context(), adminSession))
+	w := httptest.NewRecorder()
+	h.InstallProtocolHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK installing vless, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	savedServer, err := db.GetServer(context.Background(), serverID)
+	if err != nil {
+		t.Fatalf("GetServer: %v", err)
+	}
+	pMap, ok := savedServer.Protocols["vless"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected savedServer.Protocols[vless] to be map[string]any")
+	}
+	if pMap["installed"] != true {
+		t.Errorf("expected installed: true, got %v", pMap["installed"])
+	}
+	if pMap["port"] != "443" {
+		t.Errorf("expected port: 443, got %v", pMap["port"])
+	}
+	if pMap["public_key"] != "pubkey123" {
+		t.Errorf("expected public_key: pubkey123, got %v", pMap["public_key"])
+	}
+	if pMap["short_id"] != "shortid123" {
+		t.Errorf("expected short_id: shortid123, got %v", pMap["short_id"])
+	}
+	if pMap["server_name"] != "gateway.icloud.com" {
+		t.Errorf("expected server_name: gateway.icloud.com, got %v", pMap["server_name"])
 	}
 }

@@ -40,7 +40,11 @@ type ScanResult struct {
 }
 
 // ScanReport encapsulates scan results against a target server.
+//
+// Note: This scan is a panel-side network proximity check conducted from the
+// management panel host to measure TLS compatibility and network latency.
 type ScanReport struct {
+	Scope         string       `json:"scope,omitempty"`
 	ServerIP      string       `json:"server_ip"`
 	ServerCountry string       `json:"server_country,omitempty"`
 	ServerASN     uint32       `json:"server_asn,omitempty"`
@@ -156,6 +160,7 @@ func ScanSNI(ctx context.Context, serverHost string, opts ScannerOptions) (*Scan
 	})
 
 	return &ScanReport{
+		Scope:         "panel_side_proximity",
 		ServerIP:      serverIP.String(),
 		ServerCountry: serverCountry,
 		ServerASN:     serverASN,
@@ -200,8 +205,9 @@ func scanCandidateDomain(
 
 	// 3. TLS 1.3 / H2 Probe
 	probeOpts := ProbeOptions{
-		Timeout: timeout,
-		RootCAs: rootCAs,
+		Timeout:  timeout,
+		RootCAs:  rootCAs,
+		TargetIP: candIP,
 	}
 	probeRes := ProbeTLSH2(ctx, domain, probeOpts)
 	if probeRes.Error != "" {

@@ -76,6 +76,14 @@ func (m *mockXraySSHClient) RunSudoCommand(ctx context.Context, cmd string) (str
 	if strings.Contains(cmd, "docker restart") {
 		return "amnezia-xray", "", 0, nil
 	}
+	if strings.HasPrefix(cmd, "cat /opt/amnezia/") {
+		for p, data := range m.files {
+			if strings.Contains(cmd, p) {
+				return string(data), "", 0, nil
+			}
+		}
+		return "", "", 1, nil
+	}
 	return "OK", "", 0, nil
 }
 
@@ -577,5 +585,158 @@ func TestXrayManager_UninstallFailurePropagation(t *testing.T) {
 	}
 	if _, ok := server2.Protocols[models.ProtocolVLESS]; ok {
 		t.Errorf("expected server.Protocols[vless] deleted on successful absent uninstall")
+	}
+}
+
+func TestXrayManager_ReinstallPreservesClientsAndKeys(t *testing.T) {
+	mockSSH := newMockXraySSHClient()
+	pool := &mockXrayPool{client: mockSSH}
+	mgr := NewXrayManagerWithServerLocks(pool, awg.NewServerLockRegistry())
+
+	server := &models.Server{
+		ID:        77,
+		Host:      "198.51.100.77",
+		Protocols: make(map[string]any),
+	}
+	ctx := context.Background()
+
+	// 1. Initial install
+	installParams := map[string]any{
+		"port": 443,
+		"vless_options": models.VLESSInstallOptions{
+			Port:       "443",
+			ServerName: "gateway.icloud.com",
+			Flow:       "xtls-rprx-vision",
+		},
+	}
+	if err := mgr.Install(ctx, server, installParams); err != nil {
+		t.Fatalf("Initial install failed: %v", err)
+	}
+
+	protoMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any)
+	if !ok {
+		t.Fatalf("expected server.Protocols[vless] to be populated")
+	}
+	origPubKey, _ := protoMeta["public_key"].(string)
+	origShortID, _ := protoMeta["short_id"].(string)
+	if origPubKey == "" || origShortID == "" {
+		t.Fatalf("expected non-empty origPubKey and origShortID, got pub=%q sid=%q", origPubKey, origShortID)
+	}
+
+	// 2. Add two clients
+	c1, err := mgr.AddClient(ctx, server, map[string]any{"name": "alice"})
+	if err != nil {
+		t.Fatalf("AddClient alice failed: %v", err)
+	}
+	c2, err := mgr.AddClient(ctx, server, map[string]any{"name": "bob"})
+	if err != nil {
+		t.Fatalf("AddClient bob failed: %v", err)
+	}
+
+	clientsBefore, err := mgr.GetClients(ctx, server)
+	if err != nil {
+		t.Fatalf("GetClients failed: %v", err)
+	}
+	if len(clientsBefore) != 2 {
+		t.Fatalf("expected 2 clients before reinstall, got %d", len(clientsBefore))
+	}
+
+	// 3. Reinstall
+	if err := mgr.Install(ctx, server, installParams); err != nil {
+		t.Fatalf("Reinstall failed: %v", err)
+	}
+
+	// 4. Verify keys and short IDs are preserved
+	protoMetaAfter, ok := server.Protocols[models.ProtocolVLESS].(map[string]any)
+	if !ok {
+		t.Fatalf("expected server.Protocols[vless] populated after reinstall")
+	}
+	afterPubKey, _ := protoMetaAfter["public_key"].(string)
+	afterShortID, _ := protoMetaAfter["short_id"].(string)
+
+	if afterPubKey != origPubKey {
+		t.Errorf("public_key changed on reinstall: want %q, got %q", origPubKey, afterPubKey)
+	}
+	if afterShortID != origShortID {
+		t.Errorf("short_id changed on reinstall: want %q, got %q", origShortID, afterShortID)
+	}
+
+	// 5. Verify clients are preserved in config.json and GetClients
+	clientsAfter, err := mgr.GetClients(ctx, server)
+	if err != nil {
+		t.Fatalf("GetClients after reinstall failed: %v", err)
+	}
+	if len(clientsAfter) != 2 {
+		t.Fatalf("expected 2 clients after reinstall, got %d", len(clientsAfter))
+	}
+	if clientsAfter[0]["client_id"] != c1["client_id"] || clientsAfter[1]["client_id"] != c2["client_id"] {
+		t.Errorf("client IDs mismatched after reinstall: got %+v", clientsAfter)
+	}
+}
+
+func TestXrayManager_StandardVLESS_EmptyFlow(t *testing.T) {
+	mockSSH := newMockXraySSHClient()
+	pool := &mockXrayPool{client: mockSSH}
+	mgr := NewXrayManagerWithServerLocks(pool, awg.NewServerLockRegistry())
+
+	server := &models.Server{
+		ID:        80,
+		Host:      "198.51.100.80",
+		Protocols: make(map[string]any),
+	}
+	ctx := context.Background()
+
+	// 1. Install with explicit empty flow (Standard VLESS)
+	installParams := map[string]any{
+		"port": 443,
+		"vless_options": map[string]any{
+			"port":        "443",
+			"server_name": "gateway.icloud.com",
+			"flow":        "",
+		},
+	}
+	if err := mgr.Install(ctx, server, installParams); err != nil {
+		t.Fatalf("Standard VLESS install failed: %v", err)
+	}
+
+	protoMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any)
+	if !ok {
+		t.Fatalf("expected server.Protocols[vless] to be populated")
+	}
+	if protoMeta["flow"] != "" {
+		t.Errorf("expected empty flow in server.Protocols[vless], got %v", protoMeta["flow"])
+	}
+	if protoMeta["public_key"] == "" || protoMeta["short_id"] == "" || protoMeta["server_name"] == "" {
+		t.Errorf("expected complete metadata retained, got %+v", protoMeta)
+	}
+
+	// 2. Add client to Standard VLESS server
+	clientRes, err := mgr.AddClient(ctx, server, map[string]any{"name": "standard-user"})
+	if err != nil {
+		t.Fatalf("AddClient failed: %v", err)
+	}
+	clientID, _ := clientRes["client_id"].(string)
+
+	// 3. Verify client config has no vision flow
+	uri, err := mgr.GetClientConfig(ctx, server, clientID)
+	if err != nil {
+		t.Fatalf("GetClientConfig failed: %v", err)
+	}
+	if strings.Contains(uri, "flow=") {
+		t.Errorf("expected client URI to have NO flow parameter for Standard VLESS, got: %s", uri)
+	}
+
+	// 4. Verify config.json inbounds[0].settings.clients[0].flow is empty
+	cfgBytes := mockSSH.files[XrayConfigPath]
+	cfg, err := ParseXrayConfig(cfgBytes)
+	if err != nil {
+		t.Fatalf("ParseXrayConfig failed: %v", err)
+	}
+	if len(cfg.Inbounds[0].Settings.Clients) == 0 {
+		t.Fatalf("expected at least 1 client in config.json")
+	}
+	clientInConfig := cfg.Inbounds[0].Settings.Clients[0]
+	if clientInConfig.Flow != "" {
+		t.Errorf("expected empty flow in config.json client, got %q", clientInConfig.Flow)
 	}
 }

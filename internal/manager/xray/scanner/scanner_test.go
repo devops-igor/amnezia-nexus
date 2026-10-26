@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -144,6 +145,55 @@ func TestProbeTLSH2_Success(t *testing.T) {
 	}
 	if len(cs.VerifiedChains) == 0 {
 		t.Errorf("expected verified certificate chain")
+	}
+}
+
+func TestProbeTLSH2_TargetIPExactDial(t *testing.T) {
+	domain := "reality.test.local"
+	tlsCert, _ := generateTestCertificate(t, domain)
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		NextProtos:   []string{"h2", "http/1.1"},
+		MinVersion:   tls.VersionTLS13,
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	host, portStr, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("SplitHostPort: %v", err)
+	}
+	port, _ := strconv.Atoi(portStr)
+	targetIP := net.ParseIP(host)
+
+	// Probe connects directly to TargetIP:Port without resolving unresolvable domain
+	unresolvableDomain := "candidate.reality-unresolvable.invalid"
+	certForUnresolvable, unresRootCAs := generateTestCertificate(t, unresolvableDomain)
+	server.TLS.Certificates = []tls.Certificate{certForUnresolvable}
+
+	opts := ProbeOptions{
+		Timeout:  2 * time.Second,
+		RootCAs:  unresRootCAs,
+		TargetIP: targetIP,
+		Port:     port,
+	}
+
+	res := ProbeTLSH2(context.Background(), unresolvableDomain, opts)
+	if res.Error != "" {
+		t.Fatalf("ProbeTLSH2 direct dial to TargetIP failed: %s", res.Error)
+	}
+	if !res.TLS13 {
+		t.Errorf("expected TLS13 = true")
+	}
+	if res.ALPN != "h2" {
+		t.Errorf("expected ALPN = h2, got %q", res.ALPN)
+	}
+	if !res.CertValid {
+		t.Errorf("expected CertValid = true")
 	}
 }
 

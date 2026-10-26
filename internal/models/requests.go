@@ -1,6 +1,7 @@
 package models
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -216,7 +217,26 @@ func (r *UpdateServerHostRequest) Validate() error {
 type VLESSInstallOptions struct {
 	Port       string `json:"port,omitempty"`
 	ServerName string `json:"server_name,omitempty"`
-	Flow       string `json:"flow,omitempty"`
+	Flow       string `json:"flow"`
+	FlowSet    bool   `json:"-"`
+}
+
+// UnmarshalJSON preserves awareness of whether the "flow" field was explicitly present in the JSON payload.
+func (v *VLESSInstallOptions) UnmarshalJSON(data []byte) error {
+	type Alias VLESSInstallOptions
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	var a Alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*v = VLESSInstallOptions(a)
+	if _, ok := raw["flow"]; ok {
+		v.FlowSet = true
+	}
+	return nil
 }
 
 // NaiveInstallOptions defines installation parameters specific to NaiveProxy.

@@ -659,6 +659,9 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 	}
 	if req.VLESSOptions != nil {
 		params["vless_options"] = req.VLESSOptions
+		if req.VLESSOptions.FlowSet {
+			params["flow"] = req.VLESSOptions.Flow
+		}
 	}
 	if req.NaiveOptions != nil {
 		params["naive_options"] = req.NaiveOptions
@@ -673,10 +676,15 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 	if server.Protocols == nil {
 		server.Protocols = make(map[string]any)
 	}
-	server.Protocols[req.Protocol] = map[string]any{
-		"installed": true,
-		"port":      req.Port,
+	protoMeta, _ := server.Protocols[req.Protocol].(map[string]any)
+	if protoMeta == nil {
+		protoMeta = make(map[string]any)
 	}
+	protoMeta["installed"] = true
+	if req.Port != "" {
+		protoMeta["port"] = req.Port
+	}
+	server.Protocols[req.Protocol] = protoMeta
 	_ = h.db.UpdateServerProtocols(ctx, serverID, server.Protocols)
 
 	h.audit(r, "server.protocol_install", map[string]any{"server_id": serverID, "protocol": req.Protocol, "port": req.Port})

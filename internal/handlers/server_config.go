@@ -34,6 +34,14 @@ func (h *Handlers) GetServerConfigHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if req.Protocol == models.ProtocolVLESS || req.Protocol == models.ProtocolNaive {
+		session := h.GetSession(r)
+		if session == nil || !session.IsAdmin() {
+			h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required")
+			return
+		}
+	}
+
 	configPath, ok := models.ConfigPathForProtocol(req.Protocol)
 	if !ok {
 		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", "Unknown protocol")
@@ -90,6 +98,14 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 	if err := req.Validate(); err != nil {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
 		return
+	}
+
+	if req.Protocol == models.ProtocolVLESS || req.Protocol == models.ProtocolNaive {
+		session := h.GetSession(r)
+		if session == nil || !session.IsAdmin() {
+			h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required")
+			return
+		}
 	}
 
 	if req.Protocol == "awg" {

@@ -80,6 +80,14 @@ func (m *mockNaiveSSHClient) RunSudoCommand(ctx context.Context, cmd string) (st
 		m.reloaded++
 		return "reload successful", "", 0, nil
 	}
+	if strings.HasPrefix(cmd, "cat /opt/amnezia/") {
+		for p, data := range m.files {
+			if strings.Contains(cmd, p) {
+				return string(data), "", 0, nil
+			}
+		}
+		return "", "", 1, nil
+	}
 	return "OK", "", 0, nil
 }
 
@@ -634,5 +642,65 @@ func TestNaiveManager_UninstallFailurePropagation(t *testing.T) {
 	}
 	if _, ok := server2.Protocols[models.ProtocolNaive]; ok {
 		t.Errorf("expected server.Protocols[naive] deleted on successful absent uninstall")
+	}
+}
+
+func TestNaiveManager_ReinstallPreservesClients(t *testing.T) {
+	mockSSH := newMockNaiveSSHClient()
+	pool := &mockNaivePool{client: mockSSH}
+	mgr := NewNaiveManagerWithServerLocks(pool, awg.NewServerLockRegistry())
+
+	server := &models.Server{
+		ID:        78,
+		Host:      "198.51.100.78",
+		Protocols: make(map[string]any),
+	}
+	ctx := context.Background()
+
+	// 1. Initial install
+	installParams := map[string]any{
+		"port": 443,
+		"naive_options": models.NaiveInstallOptions{
+			Port:   "443",
+			Domain: "naive.example.com",
+		},
+	}
+	if err := mgr.Install(ctx, server, installParams); err != nil {
+		t.Fatalf("Initial install failed: %v", err)
+	}
+
+	// 2. Add two clients
+	c1, err := mgr.AddClient(ctx, server, map[string]any{"username": "user1", "password": "pass1_secure"})
+	if err != nil {
+		t.Fatalf("AddClient user1 failed: %v", err)
+	}
+	c2, err := mgr.AddClient(ctx, server, map[string]any{"username": "user2", "password": "pass2_secure"})
+	if err != nil {
+		t.Fatalf("AddClient user2 failed: %v", err)
+	}
+
+	clientsBefore, err := mgr.GetClients(ctx, server)
+	if err != nil {
+		t.Fatalf("GetClients failed: %v", err)
+	}
+	if len(clientsBefore) != 2 {
+		t.Fatalf("expected 2 clients before reinstall, got %d", len(clientsBefore))
+	}
+
+	// 3. Reinstall
+	if err := mgr.Install(ctx, server, installParams); err != nil {
+		t.Fatalf("Reinstall failed: %v", err)
+	}
+
+	// 4. Verify clients preserved
+	clientsAfter, err := mgr.GetClients(ctx, server)
+	if err != nil {
+		t.Fatalf("GetClients after reinstall failed: %v", err)
+	}
+	if len(clientsAfter) != 2 {
+		t.Fatalf("expected 2 clients after reinstall, got %d", len(clientsAfter))
+	}
+	if clientsAfter[0]["username"] != c1["username"] || clientsAfter[1]["username"] != c2["username"] {
+		t.Errorf("client usernames mismatched after reinstall: got %+v", clientsAfter)
 	}
 }

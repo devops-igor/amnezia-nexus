@@ -27,12 +27,12 @@ func resolveClientFlow(server *models.Server, clientParams map[string]any) strin
 	flow := "xtls-rprx-vision"
 	if server != nil && server.Protocols != nil {
 		if pMap, ok := server.Protocols[models.ProtocolVLESS].(map[string]any); ok {
-			if f, ok := pMap["flow"].(string); ok && strings.TrimSpace(f) != "" {
+			if f, ok := pMap["flow"].(string); ok {
 				flow = strings.TrimSpace(f)
 			}
 		}
 	}
-	if f, ok := clientParams["flow"].(string); ok && strings.TrimSpace(f) != "" {
+	if f, ok := clientParams["flow"].(string); ok {
 		flow = strings.TrimSpace(f)
 	}
 	if flow == "none" {

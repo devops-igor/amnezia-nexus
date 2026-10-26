@@ -54,6 +54,78 @@ func parseNaiveInstallOptions(params map[string]any, defaultHost string) (int, s
 	return port, domain
 }
 
+func (m *NaiveManager) resolveExistingClients(ctx context.Context, client ssh.SSHClient) []NaiveClient {
+	var existingClients []NaiveClient
+	var existingCaddyBytes []byte
+	catOut, _, catCode, _ := client.RunSudoCommand(ctx, fmt.Sprintf("cat %s 2>/dev/null", ssh.EscapeShellArg(NaiveCaddyfilePath)))
+	if catCode == 0 && strings.TrimSpace(catOut) != "" && strings.TrimSpace(catOut) != "OK" {
+		existingCaddyBytes = []byte(catOut)
+	} else if data, dlErr := client.DownloadFile(ctx, NaiveCaddyfilePath); dlErr == nil && len(data) > 0 {
+		existingCaddyBytes = data
+	}
+
+	if len(existingCaddyBytes) > 0 {
+		if _, _, clients, parseErr := ParseCaddyfile(string(existingCaddyBytes)); parseErr == nil && len(clients) > 0 {
+			existingClients = clients
+		}
+	}
+	if existingClients == nil {
+		existingClients = []NaiveClient{}
+	}
+	return existingClients
+}
+
+func (m *NaiveManager) buildAndLaunchContainer(ctx context.Context, client ssh.SSHClient) error {
+	dockerfile := RenderCaddyDockerfile()
+	if err := client.UploadSudoFile(ctx, fmt.Sprintf("%s/Dockerfile", NaiveConfigDir), []byte(dockerfile), 0644); err != nil {
+		return fmt.Errorf("failed to upload Caddy Dockerfile: %w", err)
+	}
+
+	buildCmd := fmt.Sprintf("docker build -t %s %s", ssh.EscapeShellArg(NaiveBaseImage), ssh.EscapeShellArg(NaiveConfigDir))
+	if _, errOut, code, err := client.RunSudoCommand(ctx, buildCmd); err != nil || code != 0 {
+		return fmt.Errorf("failed to build caddy image (code %d): %s: %w", code, errOut, err)
+	}
+
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker volume create %s 2>/dev/null || true", ssh.EscapeShellArg(NaiveDataVolume)))
+
+	stopCmd := fmt.Sprintf("docker stop %s 2>/dev/null || true; docker rm -fv %s 2>/dev/null || true",
+		ssh.EscapeShellArg(NaiveContainerName), ssh.EscapeShellArg(NaiveContainerName))
+	_, _, _, _ = client.RunSudoCommand(ctx, stopCmd)
+
+	runCmd := fmt.Sprintf(`docker run -d \
+--name %s \
+--restart unless-stopped \
+--network host \
+--log-driver none \
+--tmpfs /tmp:rw,noexec,nosuid,size=16m \
+--tmpfs /run:rw,noexec,nosuid,size=16m \
+-v %s:/etc/caddy:ro \
+-v %s:/srv:ro \
+-v %s:/data \
+%s`,
+		ssh.EscapeShellArg(NaiveContainerName),
+		ssh.EscapeShellArg(NaiveConfigDir),
+		ssh.EscapeShellArg(NaiveHTMLDir),
+		ssh.EscapeShellArg(NaiveDataVolume),
+		ssh.EscapeShellArg(NaiveBaseImage),
+	)
+
+	if _, errOut, code, err := client.RunSudoCommand(ctx, runCmd); err != nil || code != 0 {
+		return fmt.Errorf("failed to run naive caddy container (code %d): %s: %w", code, errOut, err)
+	}
+
+	checkCmd := fmt.Sprintf("docker inspect -f '{{.State.Running}} {{.State.Restarting}}' %s", ssh.EscapeShellArg(NaiveContainerName))
+	out, errOut, code, err := client.RunSudoCommand(ctx, checkCmd)
+	if err != nil || code != 0 {
+		return fmt.Errorf("caddy container failed to inspect (code %d): %s: %w", code, errOut, err)
+	}
+	fields := strings.Fields(strings.TrimSpace(out))
+	if len(fields) < 2 || fields[0] != "true" || fields[1] != "false" {
+		return fmt.Errorf("caddy container is not running (state: %s)", strings.TrimSpace(out))
+	}
+	return nil
+}
+
 // Install configures Caddy forward_proxy, deploys the decoy website, and launches amnezia-caddy.
 func (m *NaiveManager) Install(ctx context.Context, server *models.Server, params map[string]any) error {
 	client, err := m.getSSHClient(ctx, server)
@@ -88,63 +160,16 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 		return fmt.Errorf("upload decoy index.html: %w", err)
 	}
 
-	// 5. Render and upload initial Caddyfile
-	caddyfileContent := RenderCaddyfile(port, domain, []NaiveClient{})
+	// 5. Render and upload initial or preserved Caddyfile
+	existingClients := m.resolveExistingClients(ctx, client)
+	caddyfileContent := RenderCaddyfile(port, domain, existingClients)
 	if err := client.UploadSudoFile(ctx, NaiveCaddyfilePath, []byte(caddyfileContent), 0644); err != nil {
 		return fmt.Errorf("upload Caddyfile: %w", err)
 	}
 
-	// 6. Upload Dockerfile and build local Caddy image with forwardproxy
-	dockerfile := RenderCaddyDockerfile()
-	if err := client.UploadSudoFile(ctx, fmt.Sprintf("%s/Dockerfile", NaiveConfigDir), []byte(dockerfile), 0644); err != nil {
-		return fmt.Errorf("failed to upload Caddy Dockerfile: %w", err)
-	}
-
-	buildCmd := fmt.Sprintf("docker build -t %s %s", ssh.EscapeShellArg(NaiveBaseImage), ssh.EscapeShellArg(NaiveConfigDir))
-	if _, errOut, code, err := client.RunSudoCommand(ctx, buildCmd); err != nil || code != 0 {
-		return fmt.Errorf("failed to build caddy image (code %d): %s: %w", code, errOut, err)
-	}
-
-	// 7. Ensure persistent data volume for Let's Encrypt certificates
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker volume create %s 2>/dev/null || true", ssh.EscapeShellArg(NaiveDataVolume)))
-
-	// 8. Cleanup any stale caddy container
-	stopCmd := fmt.Sprintf("docker stop %s 2>/dev/null || true; docker rm -fv %s 2>/dev/null || true",
-		ssh.EscapeShellArg(NaiveContainerName), ssh.EscapeShellArg(NaiveContainerName))
-	_, _, _, _ = client.RunSudoCommand(ctx, stopCmd)
-
-	// 9. Launch amnezia-caddy container
-	runCmd := fmt.Sprintf(`docker run -d \
---name %s \
---restart unless-stopped \
---network host \
---log-driver none \
---tmpfs /tmp:rw,noexec,nosuid,size=16m \
---tmpfs /run:rw,noexec,nosuid,size=16m \
--v %s:/etc/caddy:ro \
--v %s:/srv:ro \
--v %s:/data \
-%s`,
-		ssh.EscapeShellArg(NaiveContainerName),
-		ssh.EscapeShellArg(NaiveConfigDir),
-		ssh.EscapeShellArg(NaiveHTMLDir),
-		ssh.EscapeShellArg(NaiveDataVolume),
-		ssh.EscapeShellArg(NaiveBaseImage),
-	)
-
-	if _, errOut, code, err := client.RunSudoCommand(ctx, runCmd); err != nil || code != 0 {
-		return fmt.Errorf("failed to run naive caddy container (code %d): %s: %w", code, errOut, err)
-	}
-
-	// 10. Verify container is alive and not restarting
-	checkCmd := fmt.Sprintf("docker inspect -f '{{.State.Running}} {{.State.Restarting}}' %s", ssh.EscapeShellArg(NaiveContainerName))
-	out, errOut, code, err := client.RunSudoCommand(ctx, checkCmd)
-	if err != nil || code != 0 {
-		return fmt.Errorf("caddy container failed to inspect (code %d): %s: %w", code, errOut, err)
-	}
-	fields := strings.Fields(strings.TrimSpace(out))
-	if len(fields) < 2 || fields[0] != "true" || fields[1] != "false" {
-		return fmt.Errorf("caddy container is not running (state: %s)", strings.TrimSpace(out))
+	// 6. Build and launch amnezia-caddy container
+	if err := m.buildAndLaunchContainer(ctx, client); err != nil {
+		return err
 	}
 
 	// Update server.Protocols in-memory
