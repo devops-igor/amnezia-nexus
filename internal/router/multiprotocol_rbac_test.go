@@ -385,4 +385,92 @@ func TestMultiProtocol_RouterRBAC(t *testing.T) {
 			})
 		}
 	}
+
+	// 6. Support role MUST be forbidden from container toggle on VLESS and Naive (canonical and aliases) across both route families
+	for _, proto := range []string{"vless", "naive", "vless-reality", "naiveproxy"} {
+		for _, prefix := range []string{"/api/servers", ""} {
+			for _, action := range []string{"stop", "start", "restart"} {
+				testName := fmt.Sprintf("Support toggle %s %s/%s", proto, prefix, action)
+				t.Run(testName, func(t *testing.T) {
+					body := fmt.Sprintf(`{"protocol":%q,"action":%q}`, proto, action)
+					urlPath := fmt.Sprintf("%s/%d/container/toggle", prefix, serverID)
+					req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
+					req.Header.Set("Content-Type", "application/json")
+					req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+					req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+					req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+					req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+						UserID:   "support-user-id",
+						Username: "supportuser",
+						Role:     models.RoleSupport,
+					}))
+
+					w := httptest.NewRecorder()
+					r.ServeHTTP(w, req)
+
+					if w.Code != http.StatusForbidden {
+						t.Errorf("expected 403 Forbidden for Support role on %s toggle %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
+					}
+				})
+			}
+		}
+	}
+
+	// 7. Admin role MUST succeed on container toggle for VLESS and Naive across both route families
+	for _, proto := range []string{"vless", "naive"} {
+		for _, prefix := range []string{"/api/servers", ""} {
+			for _, action := range []string{"stop", "start", "restart"} {
+				testName := fmt.Sprintf("Admin toggle %s %s/%s", proto, prefix, action)
+				t.Run(testName, func(t *testing.T) {
+					body := fmt.Sprintf(`{"protocol":%q,"action":%q}`, proto, action)
+					urlPath := fmt.Sprintf("%s/%d/container/toggle", prefix, serverID)
+					req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
+					req.Header.Set("Content-Type", "application/json")
+					req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+					req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+					req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+					req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+						UserID:   "admin-user-id",
+						Username: "adminuser",
+						Role:     models.RoleAdmin,
+					}))
+
+					w := httptest.NewRecorder()
+					r.ServeHTTP(w, req)
+
+					if w.Code != http.StatusOK {
+						t.Errorf("expected 200 OK for Admin role on %s toggle %s, got %d (body: %s)", proto, urlPath, w.Code, w.Body.String())
+					}
+				})
+			}
+		}
+	}
+
+	// 8. Support role CAN still toggle legacy protocols like AWG
+	for _, prefix := range []string{"/api/servers", ""} {
+		for _, action := range []string{"stop", "start", "restart"} {
+			testName := fmt.Sprintf("Support toggle awg %s/%s", prefix, action)
+			t.Run(testName, func(t *testing.T) {
+				body := fmt.Sprintf(`{"protocol":"awg","action":%q}`, action)
+				urlPath := fmt.Sprintf("%s/%d/container/toggle", prefix, serverID)
+				req := httptest.NewRequest(http.MethodPost, urlPath, strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+				req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+				req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+				req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+					UserID:   "support-user-id",
+					Username: "supportuser",
+					Role:     models.RoleSupport,
+				}))
+
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, req)
+
+				if w.Code != http.StatusOK {
+					t.Errorf("expected 200 OK for Support role on awg toggle %s, got %d (body: %s)", urlPath, w.Code, w.Body.String())
+				}
+			})
+		}
+	}
 }

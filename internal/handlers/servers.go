@@ -378,19 +378,10 @@ func (h *Handlers) ClearServerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	containers := []string{
-		"amnezia-awg",
-		"amnezia-awg2",
-		"amnezia-awg-legacy",
-		"telemt",
-		"amnezia-dns",
+	if err := h.teardownServerContainers(ctx, client); err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "operation_failed", fmt.Sprintf("Failed to teardown server containers: %v", err))
+		return
 	}
-
-	for _, c := range containers {
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s || true", ssh.EscapeShellArg(c)))
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm %s || true", ssh.EscapeShellArg(c)))
-	}
-	_, _, _, _ = client.RunSudoCommand(ctx, "docker network rm amnezia-dns-net || true")
 	if _, _, _, err := client.RunSudoCommand(ctx, "rm -rf /opt/amnezia"); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "operation_failed", "Failed to clear server directory: "+err.Error())
 		return
@@ -505,89 +496,6 @@ func (h *Handlers) ServerCheckHandler(w http.ResponseWriter, r *http.Request) {
 		DockerInstalled: dockerInstalled,
 		Protocols:       protocolsStatus,
 	})
-}
-
-// queryProtocolsStatus queries remote managers for protocol container status.
-func (h *Handlers) queryProtocolsStatus(ctx context.Context, server *models.Server) map[string]any {
-	protocolsStatus := make(map[string]any)
-	if h.awgMgr != nil {
-		if status, err := h.awgMgr.GetServerStatus(ctx, server); err == nil {
-			protocolsStatus["awg"] = status
-		}
-	}
-	if h.mtproxylMgr != nil {
-		if status, err := h.mtproxylMgr.GetServerStatus(ctx, server); err == nil {
-			protocolsStatus["telemt"] = status
-		}
-	}
-	if h.dnsMgr != nil {
-		if status, err := h.dnsMgr.GetServerStatus(ctx, server); err == nil {
-			protocolsStatus["dns"] = status
-		}
-	}
-	if h.xrayMgr != nil {
-		if status, err := h.xrayMgr.GetServerStatus(ctx, server); err == nil {
-			protocolsStatus["vless"] = status
-		}
-	}
-	if h.naiveMgr != nil {
-		if status, err := h.naiveMgr.GetServerStatus(ctx, server); err == nil {
-			protocolsStatus["naive"] = status
-		}
-	}
-	return protocolsStatus
-}
-
-// syncDiscoveredProtocols updates server.Protocols with running protocol configurations.
-func syncDiscoveredProtocols(server *models.Server, protocolsStatus map[string]any) bool {
-	if server.Protocols == nil {
-		server.Protocols = make(map[string]any)
-	}
-	updated := false
-
-	for proto, stAny := range protocolsStatus {
-		st, ok := stAny.(map[string]any)
-		if !ok {
-			continue
-		}
-		if running, _ := st["container_running"].(bool); !running {
-			continue
-		}
-
-		protoMap, _ := server.Protocols[proto].(map[string]any)
-		if protoMap == nil {
-			protoMap = make(map[string]any)
-		}
-		protoMap["installed"] = true
-
-		if pVal, ok := st["port"]; ok && pVal != nil && fmt.Sprint(pVal) != "" {
-			if pInt, err := strconv.Atoi(fmt.Sprint(pVal)); err == nil && pInt > 0 {
-				protoMap["port"] = pInt
-			} else {
-				protoMap["port"] = pVal
-			}
-		}
-		if pubKey, ok := st["public_key"].(string); ok && pubKey != "" {
-			protoMap["public_key"] = pubKey
-		}
-		if psk, ok := st["psk"].(string); ok && psk != "" {
-			protoMap["psk"] = psk
-		}
-		if awgParams, ok := st["awg_params"]; ok && awgParams != nil {
-			protoMap["awg_params"] = awgParams
-		}
-		if clientsCount, ok := st["clients_count"]; ok && clientsCount != nil {
-			protoMap["clients_count"] = clientsCount
-		}
-		if dnsIP, ok := st["dns_ip"].(string); ok && dnsIP != "" {
-			protoMap["dns_ip"] = dnsIP
-		}
-
-		server.Protocols[proto] = protoMap
-		updated = true
-	}
-
-	return updated
 }
 
 // InstallProtocolHandler deploys a VPN protocol backend to the remote server.
@@ -750,77 +658,6 @@ func (h *Handlers) UninstallProtocolHandler(w http.ResponseWriter, r *http.Reque
 
 	h.audit(r, "server.protocol_uninstall", map[string]any{"server_id": serverID, "protocol": req.Protocol})
 	h.JSONOK(w)
-}
-
-// ToggleContainerHandler starts, stops, or restarts a protocol container.
-func (h *Handlers) ToggleContainerHandler(w http.ResponseWriter, r *http.Request) {
-	serverID, err := parseServerID(r)
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "invalid_parameter", "Invalid server_id")
-		return
-	}
-
-	var req struct {
-		Protocol string `json:"protocol"`
-		Action   string `json:"action"`
-	}
-	if err := h.DecodeJSON(r, &req); err != nil {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
-		return
-	}
-
-	req.Protocol = models.NormalizeProtocol(req.Protocol)
-	if !models.IsValidProtocol(req.Protocol) {
-		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", "Unknown protocol")
-		return
-	}
-
-	containerName, ok := models.ContainerNameForProtocol(req.Protocol)
-	if !ok {
-		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", "Unknown protocol")
-		return
-	}
-
-	if req.Action == "" {
-		req.Action = "restart"
-	}
-	if req.Action != "start" && req.Action != "stop" && req.Action != "restart" {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid action: must be start, stop, or restart")
-		return
-	}
-
-	ctx := r.Context()
-	server, err := h.db.GetServer(ctx, serverID)
-	if err != nil || server == nil {
-		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
-		return
-	}
-
-	client, err := h.GetSSHClient(ctx, server)
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "connection_failed", "SSH connection failed")
-		return
-	}
-
-	var runErr error
-	switch req.Action {
-	case "start":
-		_, _, _, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker start %s", ssh.EscapeShellArg(containerName)))
-	case "stop":
-		_, _, _, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s", ssh.EscapeShellArg(containerName)))
-	default:
-		_, _, _, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker restart %s", ssh.EscapeShellArg(containerName)))
-	}
-	if runErr != nil {
-		h.JSONError(w, http.StatusInternalServerError, "operation_failed", fmt.Sprintf("Failed to %s container %s: %v", req.Action, containerName, runErr))
-		return
-	}
-
-	h.audit(r, "server.container_toggle", map[string]any{"server_id": serverID, "protocol": req.Protocol, "action": req.Action})
-	h.JSON(w, http.StatusOK, map[string]any{
-		"status": "ok",
-		"state":  req.Action,
-	})
 }
 
 // GetServerReachabilityHandler returns server connectivity and latency status.
