@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -18,7 +19,8 @@ func (d *DB) GetBackendTunnels(ctx context.Context) ([]models.BackendTunnel, err
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
+		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at,
+		protocol, protocol_params
 		FROM backend_tunnels ORDER BY id`
 
 	rows, err := d.sqlDB.QueryContext(ctx, query)
@@ -50,7 +52,8 @@ func (d *DB) GetBackendTunnel(ctx context.Context, id int64) (*models.BackendTun
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
+		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at,
+		protocol, protocol_params
 		FROM backend_tunnels WHERE id = ?`
 
 	row := d.sqlDB.QueryRowContext(ctx, query, id)
@@ -92,6 +95,19 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 		encProbeKey = ep
 	}
 
+	if t.Protocol == "" {
+		t.Protocol = models.ProtocolAWG
+	}
+
+	encProtoParams := string(t.ProtocolParams)
+	if encProtoParams != "" && !security.LooksLikeFernetToken(encProtoParams) {
+		ep, err := security.EncryptCredential(encProtoParams, d.secretKey)
+		if err != nil {
+			return 0, fmt.Errorf("failed to encrypt backend tunnel protocol params: %w", err)
+		}
+		encProtoParams = ep
+	}
+
 	if !t.Enabled && t.DisableReason != models.DisableReasonAdmin {
 		// Callers written before issue #90 did not populate Enabled. Preserve
 		// the historical default: a newly created backend is administratively enabled.
@@ -112,8 +128,9 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 
 	query := `INSERT INTO backend_tunnels (
 		server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at,
+		protocol, protocol_params
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	res, err := d.sqlDB.ExecContext(ctx, query,
 		t.ServerID,
@@ -130,6 +147,8 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 		t.LatencyMS,
 		t.ActiveConnections,
 		createdAtStr,
+		t.Protocol,
+		encProtoParams,
 	)
 
 	if err != nil {
@@ -142,6 +161,52 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 	}
 	t.ID = id
 	return id, nil
+}
+
+// prepareBackendTunnelUpdateValue transforms and encrypts column update values.
+func (d *DB) prepareBackendTunnelUpdateValue(col string, val any) (any, error) {
+	switch col {
+	case "private_key", "probe_private_key":
+		if s, ok := val.(string); ok && s != "" && !security.LooksLikeFernetToken(s) {
+			enc, err := security.EncryptCredential(s, d.secretKey)
+			if err != nil {
+				return nil, fmt.Errorf("failed to encrypt %s: %w", col, err)
+			}
+			return enc, nil
+		}
+		return val, nil
+	case "protocol_params":
+		var rawStr string
+		switch v := val.(type) {
+		case string:
+			rawStr = v
+		case []byte:
+			rawStr = string(v)
+		case json.RawMessage:
+			rawStr = string(v)
+		default:
+			if b, err := json.Marshal(v); err == nil {
+				rawStr = string(b)
+			}
+		}
+		if rawStr != "" && !security.LooksLikeFernetToken(rawStr) {
+			enc, err := security.EncryptCredential(rawStr, d.secretKey)
+			if err != nil {
+				return nil, fmt.Errorf("failed to encrypt protocol params: %w", err)
+			}
+			return enc, nil
+		}
+		return rawStr, nil
+	case "last_health_check":
+		if t, ok := val.(*time.Time); ok && t != nil {
+			return formatTime(*t), nil
+		} else if t, ok := val.(time.Time); ok {
+			return formatTime(t), nil
+		}
+		return val, nil
+	default:
+		return val, nil
+	}
 }
 
 // UpdateBackendTunnel dynamically updates fields on a backend tunnel record.
@@ -162,33 +227,11 @@ func (d *DB) UpdateBackendTunnel(ctx context.Context, id int64, updates map[stri
 	var setClauses []string
 	var values []any
 
-	for col, val := range updates {
-		if col == "private_key" {
-			if s, ok := val.(string); ok && s != "" && !security.LooksLikeFernetToken(s) {
-				enc, err := security.EncryptCredential(s, d.secretKey)
-				if err != nil {
-					return fmt.Errorf("failed to encrypt private key: %w", err)
-				}
-				val = enc
-			}
+	for col, rawVal := range updates {
+		val, err := d.prepareBackendTunnelUpdateValue(col, rawVal)
+		if err != nil {
+			return err
 		}
-		if col == "probe_private_key" {
-			if s, ok := val.(string); ok && s != "" && !security.LooksLikeFernetToken(s) {
-				enc, err := security.EncryptCredential(s, d.secretKey)
-				if err != nil {
-					return fmt.Errorf("failed to encrypt probe private key: %w", err)
-				}
-				val = enc
-			}
-		}
-		if col == "last_health_check" {
-			if t, ok := val.(*time.Time); ok && t != nil {
-				val = formatTime(*t)
-			} else if t, ok := val.(time.Time); ok {
-				val = formatTime(t)
-			}
-		}
-
 		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
 		values = append(values, val)
 	}
@@ -337,7 +380,8 @@ func (d *DB) GetBackendTunnelByServerID(ctx context.Context, serverID int64) (*m
 	defer d.mu.RUnlock()
 
 	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at
+		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at,
+		protocol, protocol_params
 		FROM backend_tunnels WHERE server_id = ?`
 
 	row := d.sqlDB.QueryRowContext(ctx, query, serverID)
@@ -358,6 +402,7 @@ func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
 	var privKey, probeKey, healthCheck, createdAt sql.NullString
 	var disableReason sql.NullString
 	var stateVersion sql.NullInt64
+	var protocol, protocolParams sql.NullString
 
 	err := s.Scan(
 		&t.ID,
@@ -375,6 +420,8 @@ func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
 		&t.LatencyMS,
 		&t.ActiveConnections,
 		&createdAt,
+		&protocol,
+		&protocolParams,
 	)
 	if err != nil {
 		return t, err
@@ -403,6 +450,22 @@ func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {
 	}
 	if createdAt.Valid && createdAt.String != "" {
 		t.CreatedAt = parseTime(createdAt.String)
+	}
+
+	if protocol.Valid && protocol.String != "" {
+		t.Protocol = protocol.String
+	} else {
+		t.Protocol = models.ProtocolAWG
+	}
+	if protocolParams.Valid && protocolParams.String != "" {
+		if security.LooksLikeFernetToken(protocolParams.String) {
+			dec := security.DecryptCredentialSafe(protocolParams.String, d.secretKey)
+			if dec != "" {
+				t.ProtocolParams = json.RawMessage(dec)
+			}
+		} else {
+			t.ProtocolParams = json.RawMessage(protocolParams.String)
+		}
 	}
 
 	return t, nil

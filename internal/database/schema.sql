@@ -112,7 +112,7 @@ CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
     UNIQUE(year, month, username)
 );
 
--- 9. Backend AWG Tunnels
+-- 9. Backend Tunnels (AWG, VLESS, NaiveProxy)
 CREATE TABLE IF NOT EXISTS backend_tunnels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     server_id INTEGER NOT NULL,
@@ -129,6 +129,8 @@ CREATE TABLE IF NOT EXISTS backend_tunnels (
     latency_ms INTEGER DEFAULT 0,
     active_connections INTEGER DEFAULT 0,
     created_at TEXT NOT NULL,
+    protocol TEXT NOT NULL DEFAULT 'awg',
+    protocol_params TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE
 );
 

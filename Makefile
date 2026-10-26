@@ -1,3 +1,5 @@
+export GOFLAGS ?= -tags=with_utls
+
 .PHONY: all build test test-race test-e2e lint gosec govulncheck security clean fmt vet check docker-build
 
 APP_NAME := panel
@@ -8,13 +10,13 @@ all: check build
 
 build:
 	@mkdir -p $(BIN_DIR)
-	go build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/$(APP_NAME) ./$(CMD_DIR)
+	go build -tags with_utls -trimpath -ldflags="-s -w" -o $(BIN_DIR)/$(APP_NAME) ./$(CMD_DIR)
 
 test:
-	go test -v ./...
+	go test -tags with_utls -v ./...
 
 test-race:
-	go test -race -v ./...
+	go test -tags with_utls -race -v ./...
 
 test-e2e:
 	./scripts/run_e2e.sh
@@ -23,7 +25,7 @@ lint:
 	PATH=$$PATH:$$HOME/go/bin:/usr/local/go/bin golangci-lint run ./...
 
 gosec:
-	PATH=$$PATH:$$HOME/go/bin:/usr/local/go/bin gosec -quiet ./...
+	PATH=$$PATH:$$HOME/go/bin:/usr/local/go/bin gosec -tags with_utls -quiet ./...
 
 govulncheck:
 	-PATH=$$PATH:$$HOME/go/bin:/usr/local/go/bin govulncheck ./...
@@ -34,7 +36,7 @@ fmt:
 	go fmt ./...
 
 vet:
-	go vet ./...
+	go vet -tags with_utls ./...
 
 clean:
 	rm -rf $(BIN_DIR)
