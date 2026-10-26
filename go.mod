@@ -22,7 +22,7 @@ require (
 	github.com/google/btree v1.1.3 // indirect
 	golang.org/x/image v0.16.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
-	gvisor.dev/gvisor v0.0.0-20250610212827-59e91d9b9902 // indirect
+	gvisor.dev/gvisor v0.0.0-20250610212827-59e91d9b9902
 )
 
 require (
