@@ -525,6 +525,16 @@ func (h *Handlers) queryProtocolsStatus(ctx context.Context, server *models.Serv
 			protocolsStatus["dns"] = status
 		}
 	}
+	if h.xrayMgr != nil {
+		if status, err := h.xrayMgr.GetServerStatus(ctx, server); err == nil {
+			protocolsStatus["vless"] = status
+		}
+	}
+	if h.naiveMgr != nil {
+		if status, err := h.naiveMgr.GetServerStatus(ctx, server); err == nil {
+			protocolsStatus["naive"] = status
+		}
+	}
 	return protocolsStatus
 }
 
@@ -637,6 +647,12 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 	}
 	if req.AWGHeaderProtection != nil {
 		params["awg_header_protection"] = *req.AWGHeaderProtection
+	}
+	if req.VLESSOptions != nil {
+		params["vless_options"] = req.VLESSOptions
+	}
+	if req.NaiveOptions != nil {
+		params["naive_options"] = req.NaiveOptions
 	}
 
 	if err := protoMgr.Install(ctx, server, params); err != nil {

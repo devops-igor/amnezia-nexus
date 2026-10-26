@@ -21,7 +21,9 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/dns"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/mtproxyl"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/naive"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/xray"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/upstream"
@@ -48,6 +50,8 @@ type Dependencies struct {
 	AWGManager      *awg.AWGManager
 	MTProxyLManager *mtproxyl.MTProxyLManager
 	DNSManager      *dns.DNSManager
+	XrayManager     *xray.XrayManager
+	NaiveManager    *naive.NaiveManager
 	VPNService      *vpn.Service
 	UpstreamService UpstreamChecker
 }
@@ -61,6 +65,8 @@ type Handlers struct {
 	awgMgr                    *awg.AWGManager
 	mtproxylMgr               *mtproxyl.MTProxyLManager
 	dnsMgr                    *dns.DNSManager
+	xrayMgr                   *xray.XrayManager
+	naiveMgr                  *naive.NaiveManager
 	vpnSvc                    *vpn.Service
 	upstreamSvc               UpstreamChecker
 	dialTimeout               func(network, address string, timeout time.Duration) (net.Conn, error)
@@ -127,6 +133,8 @@ func NewHandlers(deps Dependencies) *Handlers {
 		awgMgr:      deps.AWGManager,
 		mtproxylMgr: deps.MTProxyLManager,
 		dnsMgr:      deps.DNSManager,
+		xrayMgr:     deps.XrayManager,
+		naiveMgr:    deps.NaiveManager,
 		vpnSvc:      deps.VPNService,
 		upstreamSvc: deps.UpstreamService,
 	}
@@ -146,6 +154,12 @@ func NewHandlers(deps Dependencies) *Handlers {
 	}
 	if h.dnsMgr != nil {
 		h.registry.Register(h.dnsMgr)
+	}
+	if h.xrayMgr != nil {
+		h.registry.Register(h.xrayMgr)
+	}
+	if h.naiveMgr != nil {
+		h.registry.Register(h.naiveMgr)
 	}
 	if h.vpnSvc != nil && h.awgMgr != nil {
 		h.vpnSvc.SetAWGStatusProvider(h.awgMgr)
@@ -307,6 +321,14 @@ func (h *Handlers) GetProtocolManager(proto string) (manager.ProtocolManager, er
 	case "dns":
 		if h.dnsMgr != nil {
 			return h.dnsMgr, nil
+		}
+	case "vless":
+		if h.xrayMgr != nil {
+			return h.xrayMgr, nil
+		}
+	case "naive":
+		if h.naiveMgr != nil {
+			return h.naiveMgr, nil
 		}
 	}
 
