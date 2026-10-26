@@ -52,7 +52,7 @@ func RenderCaddyfile(port int, domain string, clients []NaiveClient) string {
 
 	// Domain and port block
 	if port > 0 && port != 443 {
-		fmt.Fprintf(&sb, "https://%s:%d {\n", domain, port)
+		fmt.Fprintf(&sb, ":%d, %s:%d {\n", port, domain, port)
 	} else {
 		fmt.Fprintf(&sb, ":%d, %s {\n", port, domain)
 	}

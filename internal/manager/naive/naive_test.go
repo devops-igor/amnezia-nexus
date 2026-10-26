@@ -409,19 +409,21 @@ func TestNaiveConfig_ZeroClientsNoProbeResistance(t *testing.T) {
 }
 
 func TestNaiveConfig_NonDefaultPortRoundTrip(t *testing.T) {
-	// R2-H2: port 8443 must render https://domain:port and parse back domain and port
+	// R3-H1: port 8443 must render :port, domain:port to enable CONNECT routing while automating domain TLS
 	domain := "vpn.custom.org"
 	port := 8443
 	clients := []NaiveClient{
 		{Username: "user8443", Password: "pass8443secret"},
 	}
 
+	expectedHeader := fmt.Sprintf(":%d, %s:%d {", port, domain, port)
+
 	rendered := RenderCaddyfile(port, domain, clients)
-	if !strings.Contains(rendered, "https://vpn.custom.org:8443 {") {
-		t.Errorf("expected rendered Caddyfile to contain https://vpn.custom.org:8443 {, got:\n%s", rendered)
+	if !strings.Contains(rendered, expectedHeader) {
+		t.Errorf("expected rendered Caddyfile to contain %q, got:\n%s", expectedHeader, rendered)
 	}
-	if strings.Contains(rendered, ":8443,") {
-		t.Errorf("rendered Caddyfile must NOT emit plaintext HTTP :8443 address, got:\n%s", rendered)
+	if strings.Contains(rendered, "https://") {
+		t.Errorf("rendered Caddyfile must NOT emit https:// site address (creates host matcher blocking CONNECT), got:\n%s", rendered)
 	}
 
 	parsedDomain, parsedPort, parsedClients, err := ParseCaddyfile(rendered)
@@ -440,8 +442,8 @@ func TestNaiveConfig_NonDefaultPortRoundTrip(t *testing.T) {
 
 	// Also verify 0-client custom port
 	rendered0 := RenderCaddyfile(port, domain, nil)
-	if !strings.Contains(rendered0, "https://vpn.custom.org:8443 {") {
-		t.Errorf("expected rendered Caddyfile to contain https://vpn.custom.org:8443 {, got:\n%s", rendered0)
+	if !strings.Contains(rendered0, expectedHeader) {
+		t.Errorf("expected 0-client custom port Caddyfile to contain %q, got:\n%s", expectedHeader, rendered0)
 	}
 	if strings.Contains(rendered0, "forward_proxy") {
 		t.Errorf("0-client custom port Caddyfile must not have forward_proxy:\n%s", rendered0)
