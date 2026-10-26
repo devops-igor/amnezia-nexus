@@ -154,7 +154,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	dst := metadata.ParseSocksaddr(address)
 	switch network {
 	case "tcp":
-		conn, err := d.client.DialEarlyConn(tc, dst)
+		conn, err := d.client.DialConn(tc, dst)
 		if err != nil {
 			_ = tc.Close()
 			return nil, fmt.Errorf("vless: dial tcp: %w", err)
