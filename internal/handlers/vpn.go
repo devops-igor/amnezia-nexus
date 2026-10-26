@@ -225,10 +225,11 @@ func (h *Handlers) VPNGetConfigHandler(w http.ResponseWriter, r *http.Request) {
 // false and silently erase the stored protocol flag
 // (issue #391 round 4b, finding 3).
 type vpnConfigPresence struct {
-	publicEndpoint bool
-	randomTrailers bool
-	disableCookies bool
-	dataPlaneI1    bool
+	publicEndpoint              bool
+	randomTrailers              bool
+	disableCookies              bool
+	dataPlaneI1                 bool
+	enableMultiProtocolBackends bool
 }
 
 // hasRawKey reports whether the caller sent the named JSON key, matching the
@@ -314,6 +315,9 @@ func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, present vp
 	if !present.disableCookies {
 		cfg.DisableCookies = current.DisableCookies
 	}
+	if !present.enableMultiProtocolBackends {
+		cfg.EnableMultiProtocolBackends = current.EnableMultiProtocolBackends
+	}
 }
 
 // VPNUpdateConfigHandler applies new routing policy and rebalances existing pools.
@@ -349,10 +353,11 @@ func (h *Handlers) VPNUpdateConfigHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	present := vpnConfigPresence{
-		publicEndpoint: hasRawKey(raw, "public_endpoint"),
-		randomTrailers: hasRawKey(raw, "random_trailers"),
-		disableCookies: hasRawKey(raw, "disable_cookies"),
-		dataPlaneI1:    hasRawKey(raw, "vpn_data_plane_i1_protocol"),
+		publicEndpoint:              hasRawKey(raw, "public_endpoint"),
+		randomTrailers:              hasRawKey(raw, "random_trailers"),
+		disableCookies:              hasRawKey(raw, "disable_cookies"),
+		dataPlaneI1:                 hasRawKey(raw, "vpn_data_plane_i1_protocol"),
+		enableMultiProtocolBackends: hasRawKey(raw, "enable_multi_protocol_backends"),
 	}
 
 	ctx := r.Context()

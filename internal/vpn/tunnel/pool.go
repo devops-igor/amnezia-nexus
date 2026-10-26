@@ -31,10 +31,25 @@ type Pool struct {
 	tunnelsByID            map[int64]*models.BackendTunnel
 	tunnelsByIfName        map[string]*models.BackendTunnel
 	closed                 bool
+	multiProtocolEnabled   bool
 	setTunnelEndpointHook  func(ctx context.Context, tunnelID int64, endpoint string) error
 	setTunnelEnabledHook   func(ctx context.Context, serverID int64, enabled bool, disableReason string) error
 	setTunnelPublicKeyHook func(ctx context.Context, tunnelID int64, publicKey string) error
 	generateKeypairFn      func() (string, string, error)
+}
+
+// SetMultiProtocolEnabled configures whether multi-protocol backends are enabled.
+func (p *Pool) SetMultiProtocolEnabled(enabled bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.multiProtocolEnabled = enabled
+}
+
+// MultiProtocolEnabled reports whether multi-protocol backends are enabled.
+func (p *Pool) MultiProtocolEnabled() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.multiProtocolEnabled
 }
 
 // DeriveClientPublicKey derives the Base64-encoded Curve25519 public key from a Base64-encoded private key.
@@ -134,7 +149,8 @@ func (p *Pool) SyncFromDB(ctx context.Context) error {
 		if t.StateVersion <= 0 {
 			t.StateVersion = 1
 		}
-		if t.ProbePrivateKey == "" {
+		proto := models.NormalizeTunnelProtocol(t.Protocol)
+		if proto == models.ProtocolAWG && t.ProbePrivateKey == "" {
 			// Legacy row from before the dedicated probe key existed
 			// (issue #43): backfill in memory; EnableBackend's peer
 			// registration persists it and provisions the probe peer.
@@ -181,154 +197,6 @@ func (p *Pool) ResetEnabledHealthForStartup(ctx context.Context) error {
 	}
 
 	return nil
-}
-
-// AddTunnel establishes or registers an in-process AWG backend tunnel for a server.
-func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPubKey string) (*models.BackendTunnel, error) {
-	if serverID <= 0 {
-		return nil, errors.New("server_id must be greater than 0")
-	}
-	if endpoint == "" {
-		return nil, errors.New("endpoint cannot be empty")
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.closed {
-		return nil, ErrPoolClosed
-	}
-
-	if existing, ok := p.tunnelsByServerID[serverID]; ok {
-		candEndpoint := endpoint
-		candPubKey := serverPubKey
-		if candPubKey == "" {
-			candPubKey = existing.PublicKey
-		}
-		candPrivKey := existing.PrivateKey
-		candProbePrivKey := existing.ProbePrivateKey
-
-		if candPrivKey == "" {
-			_, sk, err := p.genKeyPair()
-			if err != nil {
-				return nil, fmt.Errorf("failed to generate backend private key: %w", err)
-			}
-			candPrivKey = sk
-		}
-
-		if candProbePrivKey == "" {
-			// Dedicated health-probe identity (issue #43): must differ from
-			// PrivateKey so the prober's socket cannot steal the data peer's
-			// return endpoint on the backend.
-			_, sk, err := p.genKeyPair()
-			if err != nil {
-				return nil, fmt.Errorf("failed to generate probe private key: %w", err)
-			}
-			candProbePrivKey = sk
-		}
-
-		cand := models.BackendTunnel{
-			ID:              existing.ID,
-			Endpoint:        candEndpoint,
-			PublicKey:       candPubKey,
-			PrivateKey:      candPrivKey,
-			ProbePrivateKey: candProbePrivKey,
-		}
-		changed := !models.SameTunnelIdentity(existing, &cand)
-
-		candStateVersion := existing.StateVersion
-		if changed {
-			candStateVersion = existing.StateVersion + 1
-			if existing.StateVersion <= 0 {
-				candStateVersion = 2
-			}
-		}
-
-		if p.db != nil {
-			updates := map[string]any{
-				"endpoint":          candEndpoint,
-				"public_key":        candPubKey,
-				"private_key":       candPrivKey,
-				"probe_private_key": candProbePrivKey,
-			}
-			if changed {
-				updates["state_version"] = candStateVersion
-			}
-			if err := p.db.UpdateBackendTunnel(ctx, existing.ID, updates); err != nil {
-				return nil, fmt.Errorf("failed to persist backend tunnel updates: %w", err)
-			}
-		}
-
-		existing.Endpoint = candEndpoint
-		existing.PublicKey = candPubKey
-		existing.PrivateKey = candPrivKey
-		existing.ProbePrivateKey = candProbePrivKey
-		if changed {
-			existing.StateVersion = candStateVersion
-		}
-		copyTunnel := *existing
-		return &copyTunnel, nil
-	}
-
-	pubKey := serverPubKey
-	var privKey string
-	if pubKey == "" {
-		pk, sk, err := p.genKeyPair()
-		if err != nil {
-			return nil, err
-		}
-		pubKey = pk
-		privKey = sk
-	} else {
-		_, sk, err := p.genKeyPair()
-		if err != nil {
-			return nil, err
-		}
-		privKey = sk
-	}
-
-	probePrivPub, probePrivKey, err := p.genKeyPair()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate probe keypair: %w", err)
-	}
-	_ = probePrivPub // pub recomputed from priv via ClientPublicKey; kept for symmetry
-
-	ifName := fmt.Sprintf("awg-be-%d", serverID)
-	now := time.Now().UTC()
-
-	tunnel := &models.BackendTunnel{
-		ServerID:          serverID,
-		InterfaceName:     ifName,
-		PublicKey:         pubKey,
-		PrivateKey:        privKey,
-		ProbePrivateKey:   probePrivKey,
-		Endpoint:          endpoint,
-		Enabled:           true,
-		Status:            models.TunnelStatusActive,
-		DisableReason:     models.DisableReasonNone,
-		StateVersion:      1,
-		LastHealthCheck:   &now,
-		LatencyMS:         10,
-		ActiveConnections: 0,
-		CreatedAt:         now,
-	}
-
-	if p.db != nil {
-		id, err := p.db.CreateBackendTunnel(ctx, tunnel)
-		if err != nil {
-			return nil, fmt.Errorf("failed to persist backend tunnel: %w", err)
-		}
-		tunnel.ID = id
-	} else {
-		tunnel.ID = serverID
-	}
-
-	p.tunnelsByServerID[serverID] = tunnel
-	p.tunnelsByID[tunnel.ID] = tunnel
-	p.tunnelsByIfName[ifName] = tunnel
-
-	copyTunnel := *tunnel
-	return &copyTunnel, nil
 }
 
 // RemoveTunnel removes a backend tunnel by server ID.
@@ -407,6 +275,7 @@ func (p *Pool) ListTunnels() []*models.BackendTunnel {
 }
 
 // GetActiveTunnels returns all tunnels currently in "active" status.
+// When multi-protocol is disabled, non-AWG tunnels are excluded.
 func (p *Pool) GetActiveTunnels() []*models.BackendTunnel {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -414,6 +283,9 @@ func (p *Pool) GetActiveTunnels() []*models.BackendTunnel {
 	var result []*models.BackendTunnel
 	for _, t := range p.tunnelsByServerID {
 		if t.Enabled && t.Status == "active" {
+			if !p.multiProtocolEnabled && models.NormalizeTunnelProtocol(t.Protocol) != models.ProtocolAWG {
+				continue
+			}
 			copyTunnel := *t
 			result = append(result, &copyTunnel)
 		}

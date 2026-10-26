@@ -191,6 +191,7 @@ type Service struct {
 	// backendDevices holds the per-backend UDP devices created by EnableBackend.
 	backendDevices         map[int64]BackendDevice
 	backendDeviceEndpoints map[int64]string
+	backendDeviceSnapshots map[int64]*models.BackendTunnel
 	deletedServers         map[int64]struct{} // guarded by mu
 	adminDisableEpoch      map[int64]uint64   // guarded by mu
 	lastLoggedDrops        atomic.Uint64
@@ -345,10 +346,20 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	}
 
 	pool := tunnel.NewPool(db)
-
 	healthCfg := tunnel.DefaultHealthConfig()
-	healthCfg.LatencyThresholdMS = int64(cfg.HealthThresholdMS)
+	if cfg != nil {
+		if cfg.HealthThresholdMS > 0 {
+			healthCfg.LatencyThresholdMS = int64(cfg.HealthThresholdMS)
+		}
+		if cfg.EnableMultiProtocolBackends {
+			pool.SetMultiProtocolEnabled(true)
+		}
+	}
+
 	prober := tunnel.NewHealthProber(pool, db, healthCfg)
+	if cfg != nil && cfg.EnableMultiProtocolBackends {
+		prober.SetMultiProtocolEnabled(true)
+	}
 
 	reconnectCfg := tunnel.DefaultReconnectConfig()
 	reconnectMgr := tunnel.NewReconnectManager(pool, prober, reconnectCfg)
@@ -511,98 +522,6 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	})
 
 	return svc, nil
-}
-
-func (s *Service) resolveServerAWGParams(ctx context.Context, serverID int64) (map[string]any, error) {
-	if s.db == nil {
-		return nil, errors.New("database not available")
-	}
-	srv, err := s.db.GetServerByID(ctx, serverID)
-	if err != nil || srv == nil {
-		return nil, fmt.Errorf("failed to load server %d: %w", serverID, err)
-	}
-	if awgInfo, ok := srv.Protocols["awg"].(map[string]any); ok {
-		if p, ok := awgInfo["awg_params"].(map[string]any); ok && p != nil {
-			return p, nil
-		} else if p, ok := awgInfo["params"].(map[string]any); ok && p != nil {
-			return p, nil
-		}
-	}
-	return nil, nil
-}
-
-// backendTunnelReady rejects a deleted, replaced, or disabled pool entry.
-func (s *Service) backendTunnelReady(t *models.BackendTunnel) error {
-	if s.pool == nil {
-		return errors.New("tunnel pool not initialized")
-	}
-	current, err := s.pool.GetTunnel(t.ServerID)
-	if err != nil {
-		return err
-	}
-	if current == nil || current.ID != t.ID {
-		return tunnel.ErrTunnelNotFound
-	}
-	if !current.Enabled {
-		return ErrTunnelDisabled
-	}
-	if t.StateVersion > 0 && current.StateVersion != t.StateVersion {
-		return tunnel.ErrStaleStateVersion
-	}
-	if t.Endpoint != "" && current.Endpoint != t.Endpoint {
-		return tunnel.ErrStaleStateVersion
-	}
-	return nil
-}
-
-// ensureBackendDeviceAttached verifies that a data-plane device is attached for the tunnel.
-// If missing, it attempts to attach the device using persisted server AWG credentials.
-func (s *Service) ensureBackendDeviceAttached(ctx context.Context, t *models.BackendTunnel) error {
-	if t == nil {
-		return nil
-	}
-	if err := s.backendTunnelReady(t); err != nil {
-		return err
-	}
-	s.mu.RLock()
-	hasDev := s.backendDevices != nil && s.backendDevices[t.ID] != nil
-	s.mu.RUnlock()
-	if hasDev {
-		return nil
-	}
-
-	awgParams, loadErr := s.resolveServerAWGParams(ctx, t.ServerID)
-	if loadErr != nil {
-		log.Printf("[vpn] warning: tunnel %d (server %d) probe succeeded but failed to load server credentials: %v", t.ID, t.ServerID, loadErr)
-		return loadErr
-	}
-
-	s.mu.RLock()
-	hook := s.ensureDevicePreLockHook
-	s.mu.RUnlock()
-	if hook != nil {
-		hook()
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.isServerDeletedLocked(t.ServerID) {
-		return fmt.Errorf("server %d is deleted", t.ServerID)
-	}
-
-	if err := s.backendTunnelReady(t); err != nil {
-		return err
-	}
-	if s.backendDevices != nil && s.backendDevices[t.ID] != nil {
-		return nil
-	}
-
-	if attachErr := s.attachBackendForwarder(t, awgParams); attachErr != nil {
-		log.Printf("[vpn] warning: tunnel %d (server %d) probe succeeded but failed to attach data plane: %v", t.ID, t.ServerID, attachErr)
-		return attachErr
-	}
-	return nil
 }
 
 // SetAWGStatusProvider sets the provider used to query live AWG status on backend servers.
@@ -952,6 +871,12 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 		return errors.New("listen_port cannot be changed while the VPN listener is running; restart the panel")
 	}
 
+	multiProtocolChanged := s.cfg != nil && cfg.EnableMultiProtocolBackends != s.cfg.EnableMultiProtocolBackends
+	if multiProtocolChanged && listenerRunning {
+		log.Printf("[vpn] rejecting config update: enable_multi_protocol_backends is immutable while listener is running")
+		return errors.New("enable_multi_protocol_backends cannot be changed while the VPN listener is running; restart the panel")
+	}
+
 	if cfg.ClientQueueSize <= 0 {
 		cfg.ClientQueueSize = forwarder.DefaultClientQueueSize
 	}
@@ -1004,6 +929,12 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 		}
 	}
 	s.cfg = cfg
+	if s.pool != nil {
+		s.pool.SetMultiProtocolEnabled(cfg.EnableMultiProtocolBackends)
+	}
+	if s.prober != nil {
+		s.prober.SetMultiProtocolEnabled(cfg.EnableMultiProtocolBackends)
+	}
 
 	s.balancer = newLB
 	if s.stickyMgr != nil {

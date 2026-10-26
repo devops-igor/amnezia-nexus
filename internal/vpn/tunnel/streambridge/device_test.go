@@ -12,14 +12,12 @@ import (
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 
-	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
-// Static assertion that Device satisfies both PacketDevice and BackendDevice.
+// Static assertion that Device satisfies PacketDevice.
 var (
 	_ tunnel.PacketDevice = (*Device)(nil)
-	_ vpn.BackendDevice   = (*Device)(nil)
 )
 
 type dummyDialer struct{}
