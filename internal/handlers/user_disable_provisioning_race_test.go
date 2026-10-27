@@ -119,6 +119,10 @@ func (r *provisioningRig) addInitialUser(t *testing.T) *httptest.ResponseRecorde
 		ServerID: &r.sID, Protocol: &r.proto,
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/users/add", bytes.NewReader(body))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+		UserID: "race-admin",
+		Role:   models.RoleAdmin,
+	}))
 	w := httptest.NewRecorder()
 	setupFullUsersRouter(r.h).ServeHTTP(w, req)
 	return w
