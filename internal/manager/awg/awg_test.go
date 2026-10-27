@@ -197,6 +197,10 @@ func (m *mockAWGSSHClient) DownloadFile(ctx context.Context, remotePath string) 
 	return m.files[remotePath], nil
 }
 
+func (m *mockAWGSSHClient) DownloadSudoFile(ctx context.Context, remotePath string) ([]byte, error) {
+	return m.DownloadFile(ctx, remotePath)
+}
+
 func (m *mockAWGSSHClient) FileExists(ctx context.Context, remotePath string) (bool, error) {
 	_, exists := m.files[remotePath]
 	return exists, nil

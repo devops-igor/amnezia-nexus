@@ -51,6 +51,9 @@ func (m *rbacMockSSH) DownloadFile(ctx context.Context, remotePath string) ([]by
 	}
 	return []byte("sample config content"), nil
 }
+func (m *rbacMockSSH) DownloadSudoFile(ctx context.Context, remotePath string) ([]byte, error) {
+	return m.DownloadFile(ctx, remotePath)
+}
 func (m *rbacMockSSH) FileExists(ctx context.Context, remotePath string) (bool, error) {
 	return true, nil
 }

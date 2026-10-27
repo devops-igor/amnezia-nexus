@@ -31,6 +31,7 @@ type SSHClient interface {
 	UploadFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error
 	UploadSudoFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error
 	DownloadFile(ctx context.Context, remotePath string) ([]byte, error)
+	DownloadSudoFile(ctx context.Context, remotePath string) ([]byte, error)
 	FileExists(ctx context.Context, remotePath string) (bool, error)
 	TestConnection(ctx context.Context) (string, error)
 	Close() error
@@ -345,6 +346,22 @@ func (c *Client) DownloadFile(ctx context.Context, remotePath string) ([]byte, e
 		return nil, err
 	}
 	return SFTPDownload(ctx, sftpClient, remotePath)
+}
+
+// DownloadSudoFile downloads a root-owned remote file, elevating reads for non-root SSH users.
+func (c *Client) DownloadSudoFile(ctx context.Context, remotePath string) ([]byte, error) {
+	if c.isRoot {
+		return c.DownloadFile(ctx, remotePath)
+	}
+
+	stdout, stderr, code, err := c.RunSudoCommand(ctx, fmt.Sprintf("cat %s", EscapeShellArg(remotePath)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to download sudo file %s: %w", remotePath, err)
+	}
+	if code != 0 {
+		return nil, fmt.Errorf("failed to download sudo file %s (code %d): %s", remotePath, code, stderr)
+	}
+	return []byte(stdout), nil
 }
 
 // FileExists checks if a remote file or directory exists via SFTP.

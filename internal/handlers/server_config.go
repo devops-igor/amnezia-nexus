@@ -171,7 +171,7 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 		h.JSONOK(w)
 		return
 	}
-	if err := client.UploadSudoFile(ctx, configPath, []byte(req.Config), 0600); err != nil {
+	if err := client.UploadSudoFile(ctx, configPath, []byte(req.Config), 0644); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "save_failed", "Failed to save config")
 		return
 	}

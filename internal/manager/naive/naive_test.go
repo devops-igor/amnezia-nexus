@@ -17,17 +17,20 @@ import (
 )
 
 type mockNaiveSSHClient struct {
-	mu          sync.Mutex
-	commands    []string
-	files       map[string][]byte
-	dockerAlive bool
-	reloaded    int
+	mu                 sync.Mutex
+	commands           []string
+	files              map[string][]byte
+	dockerAlive        bool
+	reloaded           int
+	sshUser            string
+	denyConfigDownload bool
 }
 
 func newMockNaiveSSHClient() *mockNaiveSSHClient {
 	return &mockNaiveSSHClient{
 		files:       make(map[string][]byte),
 		dockerAlive: true,
+		sshUser:     "root",
 	}
 }
 
@@ -116,6 +119,19 @@ func (m *mockNaiveSSHClient) UploadSudoFile(ctx context.Context, remotePath stri
 func (m *mockNaiveSSHClient) DownloadFile(ctx context.Context, remotePath string) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.denyConfigDownload && remotePath == NaiveCaddyfilePath {
+		return nil, os.ErrPermission
+	}
+	data, ok := m.files[remotePath]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return append([]byte(nil), data...), nil
+}
+
+func (m *mockNaiveSSHClient) DownloadSudoFile(ctx context.Context, remotePath string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	data, ok := m.files[remotePath]
 	if !ok {
 		return nil, os.ErrNotExist
@@ -155,7 +171,7 @@ func (m *mockNaiveSSHClient) GetPort() int {
 }
 
 func (m *mockNaiveSSHClient) GetUser() string {
-	return "root"
+	return m.sshUser
 }
 
 func (m *mockNaiveSSHClient) GetServerID() *int64 {
@@ -377,6 +393,38 @@ func TestNaiveManager_Lifecycle(t *testing.T) {
 	}
 	if running, _ := statusAfterUninstall["container_running"].(bool); running {
 		t.Errorf("expected container_running=false after uninstall")
+	}
+}
+
+func TestNaiveManager_SudoNodeClientOperationsAfterRawConfigSave(t *testing.T) {
+	mockSSH := newMockNaiveSSHClient()
+	mgr := NewNaiveManagerWithServerLocks(&mockNaivePool{client: mockSSH}, awg.NewServerLockRegistry())
+	server := &models.Server{ID: 90, Host: "198.51.100.90", SSHUser: "ubuntu"}
+	ctx := context.Background()
+
+	if err := mgr.Install(ctx, server, map[string]any{"port": 443}); err != nil {
+		t.Fatalf("Install failed: %v", err)
+	}
+	if err := mockSSH.UploadSudoFile(ctx, NaiveCaddyfilePath, mockSSH.files[NaiveCaddyfilePath], 0600); err != nil {
+		t.Fatalf("raw config save failed: %v", err)
+	}
+	mockSSH.sshUser = "ubuntu"
+	mockSSH.denyConfigDownload = true
+
+	added, err := mgr.AddClient(ctx, server, map[string]any{"username": "sudo-user", "password": "secret-password"})
+	if err != nil {
+		t.Fatalf("AddClient after root-owned 0600 save failed: %v", err)
+	}
+	clientID, _ := added["client_id"].(string)
+	if _, err := mgr.GetClientConfig(ctx, server, clientID); err != nil {
+		t.Fatalf("GetClientConfig after root-owned 0600 save failed: %v", err)
+	}
+	clients, err := mgr.GetClients(ctx, server)
+	if err != nil || len(clients) != 1 {
+		t.Fatalf("GetClients after root-owned 0600 save failed: clients=%v err=%v", clients, err)
+	}
+	if err := mgr.RemoveClient(ctx, server, clientID); err != nil {
+		t.Fatalf("RemoveClient after root-owned 0600 save failed: %v", err)
 	}
 }
 

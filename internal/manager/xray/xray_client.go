@@ -55,7 +55,7 @@ func (m *XrayManager) AddClient(ctx context.Context, server *models.Server, clie
 	defer unlock()
 
 	// 1. Download existing config.json
-	cfgBytes, err := client.DownloadFile(ctx, XrayConfigPath)
+	cfgBytes, err := client.DownloadSudoFile(ctx, XrayConfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to download xray config: %w", err)
 	}
@@ -161,7 +161,7 @@ func (m *XrayManager) RemoveClient(ctx context.Context, server *models.Server, c
 	}
 	defer unlock()
 
-	cfgBytes, err := client.DownloadFile(ctx, XrayConfigPath)
+	cfgBytes, err := client.DownloadSudoFile(ctx, XrayConfigPath)
 	if err != nil {
 		return fmt.Errorf("failed to download xray config: %w", err)
 	}
@@ -205,7 +205,7 @@ func (m *XrayManager) GetClients(ctx context.Context, server *models.Server) ([]
 		return nil, err
 	}
 
-	cfgBytes, err := client.DownloadFile(ctx, XrayConfigPath)
+	cfgBytes, err := client.DownloadSudoFile(ctx, XrayConfigPath)
 	if err != nil {
 		return []map[string]any{}, nil
 	}
@@ -240,7 +240,7 @@ func (m *XrayManager) GetClientConfig(ctx context.Context, server *models.Server
 		return "", err
 	}
 
-	cfgBytes, err := client.DownloadFile(ctx, XrayConfigPath)
+	cfgBytes, err := client.DownloadSudoFile(ctx, XrayConfigPath)
 	if err != nil {
 		return "", fmt.Errorf("download xray config: %w", err)
 	}

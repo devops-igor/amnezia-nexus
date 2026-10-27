@@ -24,7 +24,7 @@ func (m *NaiveManager) AddClient(ctx context.Context, server *models.Server, cli
 	defer unlock()
 
 	// 1. Download existing Caddyfile
-	caddyfileBytes, err := client.DownloadFile(ctx, NaiveCaddyfilePath)
+	caddyfileBytes, err := client.DownloadSudoFile(ctx, NaiveCaddyfilePath)
 	if err != nil {
 		return nil, fmt.Errorf("download Caddyfile: %w", err)
 	}
@@ -116,7 +116,7 @@ func (m *NaiveManager) RemoveClient(ctx context.Context, server *models.Server, 
 	}
 	defer unlock()
 
-	caddyfileBytes, err := client.DownloadFile(ctx, NaiveCaddyfilePath)
+	caddyfileBytes, err := client.DownloadSudoFile(ctx, NaiveCaddyfilePath)
 	if err != nil {
 		return fmt.Errorf("download Caddyfile: %w", err)
 	}
@@ -153,7 +153,7 @@ func (m *NaiveManager) GetClients(ctx context.Context, server *models.Server) ([
 		return nil, err
 	}
 
-	caddyfileBytes, err := client.DownloadFile(ctx, NaiveCaddyfilePath)
+	caddyfileBytes, err := client.DownloadSudoFile(ctx, NaiveCaddyfilePath)
 	if err != nil {
 		return []map[string]any{}, nil
 	}
@@ -186,7 +186,7 @@ func (m *NaiveManager) GetClientConfig(ctx context.Context, server *models.Serve
 		return "", err
 	}
 
-	caddyfileBytes, err := client.DownloadFile(ctx, NaiveCaddyfilePath)
+	caddyfileBytes, err := client.DownloadSudoFile(ctx, NaiveCaddyfilePath)
 	if err != nil {
 		return "", fmt.Errorf("download Caddyfile: %w", err)
 	}

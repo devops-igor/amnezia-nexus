@@ -257,6 +257,10 @@ func (m *threadSafeMockSSHClient) DownloadFile(ctx context.Context, remotePath s
 	return m.files[remotePath], nil
 }
 
+func (m *threadSafeMockSSHClient) DownloadSudoFile(ctx context.Context, remotePath string) ([]byte, error) {
+	return m.DownloadFile(ctx, remotePath)
+}
+
 func (m *threadSafeMockSSHClient) FileExists(ctx context.Context, remotePath string) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

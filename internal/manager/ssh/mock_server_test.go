@@ -612,6 +612,16 @@ func (s *MockSSHServer) handleFileCommand(cmd string) (stdout, stderr string, ex
 		}
 		return "", "", 0, true
 
+	case "cat":
+		if len(args) != 2 {
+			return "", "cat: missing operand", 1, true
+		}
+		data, err := os.ReadFile(s.resolvePath(args[1]))
+		if err != nil {
+			return "", err.Error(), 1, true
+		}
+		return string(data), "", 0, true
+
 	case "chown":
 		return "", "", 0, true
 

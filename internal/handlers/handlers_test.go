@@ -170,10 +170,11 @@ func (m *mockProtocolManager) GetClientConfig(ctx context.Context, server *model
 }
 
 type testMockSSHClient struct {
-	serverID   *int64
-	cmdFunc    func(ctx context.Context, cmd string) (string, string, int, error)
-	downloadFn func(ctx context.Context, path string) ([]byte, error)
-	uploadFn   func(ctx context.Context, path string, content []byte) error
+	serverID       *int64
+	cmdFunc        func(ctx context.Context, cmd string) (string, string, int, error)
+	downloadFn     func(ctx context.Context, path string) ([]byte, error)
+	uploadFn       func(ctx context.Context, path string, content []byte) error
+	uploadSudoMode os.FileMode
 }
 
 func (m *testMockSSHClient) RunCommand(ctx context.Context, cmd string) (string, string, int, error) {
@@ -223,6 +224,7 @@ func (m *testMockSSHClient) UploadFile(ctx context.Context, remotePath string, c
 }
 
 func (m *testMockSSHClient) UploadSudoFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error {
+	m.uploadSudoMode = mode
 	if m.uploadFn != nil {
 		return m.uploadFn(ctx, remotePath, content)
 	}
@@ -237,6 +239,10 @@ func (m *testMockSSHClient) DownloadFile(ctx context.Context, remotePath string)
 		return []byte(`[{"clientId":"client-1","client_id":"client-1","userData":{"clientName":"Test Client"},"config":"[Interface]\nAddress = 10.8.0.2/24\n"}]`), nil
 	}
 	return []byte("[Interface]\nAddress = 10.8.0.1/24\nPrivateKey = privkey\n"), nil
+}
+
+func (m *testMockSSHClient) DownloadSudoFile(ctx context.Context, remotePath string) ([]byte, error) {
+	return m.DownloadFile(ctx, remotePath)
 }
 
 func (m *testMockSSHClient) FileExists(ctx context.Context, remotePath string) (bool, error) {

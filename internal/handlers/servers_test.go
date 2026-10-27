@@ -354,6 +354,22 @@ func TestServerHandlers(t *testing.T) {
 		}
 	})
 
+	t.Run("SaveServerConfigHandler Uses Manager-Readable Modes", func(t *testing.T) {
+		for _, protocol := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
+			body, _ := json.Marshal(models.ServerConfigSaveRequest{Protocol: protocol, Config: "valid raw config"})
+			req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/server_config/save", serverID), bytes.NewReader(body))
+			req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200 saving %s config, got %d", protocol, w.Code)
+			}
+			if mockSSH.uploadSudoMode != 0644 {
+				t.Errorf("expected %s config mode 0644, got %04o", protocol, mockSSH.uploadSudoMode)
+			}
+		}
+	})
+
 	t.Run("SaveServerConfigHandler Rejects Overlapping AWG Headers", func(t *testing.T) {
 		overlappingConf := "[Interface]\nPrivateKey = aaaa\nListenPort = 55424\nH1 = 10000000-20000000\nH2 = 15000000-25000000\n"
 		body, _ := json.Marshal(map[string]any{"protocol": "awg", "config": overlappingConf})

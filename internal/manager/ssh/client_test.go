@@ -275,6 +275,12 @@ func TestClient_SFTPAndUploadDownload(t *testing.T) {
 		t.Fatalf("downloaded sudo file mismatch: %v, content=%s", err, string(sudoDownloaded))
 	}
 
+	// 5. DownloadSudoFile as root
+	sudoDownloaded, err = client.DownloadSudoFile(ctx, sudoFile)
+	if err != nil || string(sudoDownloaded) != string(sudoContent) {
+		t.Fatalf("privileged downloaded sudo file mismatch: %v, content=%s", err, string(sudoDownloaded))
+	}
+
 	// 6. UploadSudoFile as non-root user
 	nonRootServer := NewMockSSHServer(t, "ubuntu", "ubuntuPass")
 	defer nonRootServer.Close()
@@ -294,13 +300,18 @@ func TestClient_SFTPAndUploadDownload(t *testing.T) {
 	defer nonRootClient.Close()
 
 	nonRootTargetFile := filepath.Join(nonRootServer.BaseDir(), "etc", "amnezia", "config.json")
-	if err := nonRootClient.UploadSudoFile(ctx, nonRootTargetFile, []byte(`{"inbounds":[]}`), 0644); err != nil {
+	if err := nonRootClient.UploadSudoFile(ctx, nonRootTargetFile, []byte(`{"inbounds":[]}`), 0600); err != nil {
 		t.Fatalf("UploadSudoFile non-root failed: %v", err)
 	}
 
 	nonRootDownloaded, err := nonRootClient.DownloadFile(ctx, nonRootTargetFile)
 	if err != nil || string(nonRootDownloaded) != `{"inbounds":[]}` {
 		t.Fatalf("downloaded non-root sudo file mismatch: %v, content=%s", err, string(nonRootDownloaded))
+	}
+
+	privilegedDownload, err := nonRootClient.DownloadSudoFile(ctx, nonRootTargetFile)
+	if err != nil || string(privilegedDownload) != `{"inbounds":[]}` {
+		t.Fatalf("privileged non-root download mismatch: %v, content=%s", err, string(privilegedDownload))
 	}
 }
 

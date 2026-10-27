@@ -327,6 +327,9 @@ func (m *mockCPSSSHClient) UploadSudoFile(ctx context.Context, remotePath string
 func (m *mockCPSSSHClient) DownloadFile(ctx context.Context, remotePath string) ([]byte, error) {
 	return []byte("test"), nil
 }
+func (m *mockCPSSSHClient) DownloadSudoFile(ctx context.Context, remotePath string) ([]byte, error) {
+	return m.DownloadFile(ctx, remotePath)
+}
 func (m *mockCPSSSHClient) FileExists(ctx context.Context, remotePath string) (bool, error) {
 	return true, nil
 }
