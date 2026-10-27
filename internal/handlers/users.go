@@ -473,21 +473,26 @@ func (h *Handlers) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Delete client connections on servers
-	conns, _ := h.db.GetConnectionsByUserID(ctx, userID)
+	// Delete client connections on servers only after their remote credentials
+	// are removed, preserving failed records so account deletion can be retried.
+	conns, err := h.db.GetConnectionsByUserID(ctx, userID)
+	if err != nil {
+		h.peerChangeError(w, err)
+		return
+	}
 	for _, c := range conns {
-		if server, err := h.db.GetServer(ctx, c.ServerID); err == nil && server != nil {
-			if protoMgr, err := h.GetProtocolManager(c.Protocol); err == nil && protoMgr != nil {
-				_ = protoMgr.RemoveClient(ctx, server, c.ClientID)
-			}
+		if err := h.removeRemoteClient(ctx, &c); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "remote_removal_failed",
+				"Failed to remove remote client credentials: "+err.Error())
+			return
+		}
+		if _, err := h.db.DeleteConnection(ctx, c.ID); err != nil {
+			h.peerChangeError(w, err)
+			return
 		}
 		_ = h.db.DeletePeerLifecycle(ctx, c.ServerID, c.Protocol, c.ClientID)
 	}
 
-	if _, err := h.db.DeleteConnectionsByUser(ctx, userID); err != nil {
-		h.peerChangeError(w, err)
-		return
-	}
 	if _, err := h.db.DeleteUser(ctx, userID); err != nil {
 		h.peerChangeError(w, err)
 		return
@@ -504,6 +509,32 @@ func (h *Handlers) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 
 	h.audit(r, "user.delete", map[string]any{"user_id": userID, "username": user.Username})
 	h.JSONOK(w)
+}
+
+// removeRemoteClient revokes a connection's credential on its server. Server-less
+// (ServerID 0, load-balanced) connections have no remote credential to remove.
+func (h *Handlers) removeRemoteClient(ctx context.Context, c *models.UserConnection) error {
+	if c.ServerID == 0 {
+		return nil
+	}
+	server, err := h.db.GetServer(ctx, c.ServerID)
+	if err != nil {
+		return fmt.Errorf("load server %d: %w", c.ServerID, err)
+	}
+	if server == nil {
+		return fmt.Errorf("server %d not found", c.ServerID)
+	}
+	protoMgr, err := h.GetProtocolManager(c.Protocol)
+	if err != nil {
+		return fmt.Errorf("protocol manager %q: %w", c.Protocol, err)
+	}
+	if protoMgr == nil {
+		return fmt.Errorf("protocol manager %q not found", c.Protocol)
+	}
+	if err := protoMgr.RemoveClient(ctx, server, c.ClientID); err != nil {
+		return fmt.Errorf("remove client %q: %w", c.ClientID, err)
+	}
+	return nil
 }
 
 // ToggleUserHandler enables or disables a user and toggles their server client connections.
