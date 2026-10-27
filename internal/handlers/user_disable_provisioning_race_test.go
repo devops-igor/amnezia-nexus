@@ -91,6 +91,24 @@ func (r *provisioningRig) addConnection(t *testing.T) int {
 	return w.Code
 }
 
+func (r *provisioningRig) addServerAssignment(t *testing.T) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(models.AddConnectionRequest{Protocol: r.proto, Name: "staff", UserID: &r.userID})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/add", r.sID), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	setupFullServerConnectionsRouter(r.h).ServeHTTP(w, req)
+	return w
+}
+
+func (r *provisioningRig) adminAddConnection(t *testing.T) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(models.AddUserConnectionRequest{ServerID: r.sID, Protocol: r.proto, Name: "staff"})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/connections/add", r.userID), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	setupFullUsersRouter(r.h).ServeHTTP(w, req)
+	return w
+}
+
 func (r *provisioningRig) assertRevoked(t *testing.T) {
 	t.Helper()
 	ctx := t.Context()
@@ -173,5 +191,75 @@ func TestInFlightProvisioningCompensatesWhenUserDisabled(t *testing.T) {
 			}
 			rig.assertRevoked(t)
 		})
+	}
+}
+
+func TestStaffServerAssignment_DisabledWhileProvisioning(t *testing.T) {
+	for _, proto := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
+		t.Run(proto, func(t *testing.T) {
+			entered, release := make(chan struct{}), make(chan struct{})
+			rig := newProvisioningRig(t, proto, func() {
+				close(entered)
+				<-release
+			})
+
+			addCode := make(chan int, 1)
+			go func() { addCode <- rig.addServerAssignment(t).Code }()
+			<-entered
+
+			disabled := make(chan error, 1)
+			go func() {
+				_, err := rig.h.db.UpdateUser(context.Background(), rig.userID, map[string]any{"enabled": false})
+				disabled <- err
+			}()
+			if err := <-disabled; err != nil {
+				t.Fatalf("disable user: %v", err)
+			}
+			close(release)
+
+			if code := <-addCode; code != http.StatusForbidden {
+				t.Fatalf("expected 403, got %d", code)
+			}
+			rig.assertRevoked(t)
+		})
+	}
+}
+
+func TestStaffAssignment_AlreadyDisabledUserRejected(t *testing.T) {
+	addCalls := 0
+	rig := newProvisioningRig(t, models.ProtocolVLESS, func() { addCalls++ })
+	if _, err := rig.h.db.UpdateUser(t.Context(), rig.userID, map[string]any{"enabled": false}); err != nil {
+		t.Fatalf("disable user: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		add  func() *httptest.ResponseRecorder
+	}{
+		{name: "server assignment", add: func() *httptest.ResponseRecorder { return rig.addServerAssignment(t) }},
+		{name: "admin user assignment", add: func() *httptest.ResponseRecorder { return rig.adminAddConnection(t) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := tt.add()
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("expected 403, got %d (body: %s)", w.Code, w.Body.String())
+			}
+			var resp struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if resp.Error != "forbidden" {
+				t.Fatalf("expected forbidden error, got %q", resp.Error)
+			}
+		})
+	}
+	if addCalls != 0 {
+		t.Fatalf("expected zero remote AddClient calls, got %d", addCalls)
+	}
+	if n := rig.node.active(); n != 0 {
+		t.Fatalf("expected zero remote credentials, got %d", n)
 	}
 }

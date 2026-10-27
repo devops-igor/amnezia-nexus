@@ -108,6 +108,21 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	ctx := r.Context()
+	var assignedUserID string
+	if req.UserID != nil && *req.UserID != "" {
+		assignedUserID = *req.UserID
+		defer h.lockUser(assignedUserID)()
+		u, err := h.db.GetUser(ctx, assignedUserID)
+		if err != nil || u == nil {
+			h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
+			return
+		}
+		if !u.Enabled {
+			h.JSONError(w, http.StatusForbidden, "forbidden", "Account is disabled")
+			return
+		}
+	}
+
 	server, err := h.db.GetServer(ctx, serverID)
 	if err != nil || server == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
@@ -147,22 +162,6 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 	}
 	vpnLink := GenerateVPNLink(configStr)
 
-	// Persist in peer_lifecycle (both assigned and unassigned)
-	var assignedUserID string
-	if req.UserID != nil && *req.UserID != "" {
-		assignedUserID = *req.UserID
-	}
-
-	if err := h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, clientID, req.Name, assignedUserID, "active"); err != nil {
-		slog.Error("failed to record peer lifecycle", "server_id", serverID, "protocol", req.Protocol, "error", err)
-		if rbErr := h.rollbackClient(ctx, protoMgr, server, result, clientID); rbErr != nil {
-			_ = h.db.SetPeerLifecycleStatus(ctx, serverID, req.Protocol, clientID, "failed")
-		}
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to record peer lifecycle")
-		return
-	}
-
-	// Persist link to user if requested
 	if assignedUserID != "" {
 		conn := &models.UserConnection{
 			ID:         uuid.NewString(),
@@ -177,16 +176,17 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 		if req.AWGMimicry != nil {
 			conn.AWGMimicry = models.AWGMimicryProfile(*req.AWGMimicry)
 		}
-		if _, err := h.db.CreateConnection(ctx, conn); err != nil {
-			slog.Error("failed to save connection record", "server_id", serverID, "protocol", req.Protocol, "error", err)
-			if rbErr := h.rollbackClient(ctx, protoMgr, server, result, clientID); rbErr != nil {
-				_ = h.db.SetPeerLifecycleStatus(ctx, serverID, req.Protocol, clientID, "failed")
-			} else {
-				_ = h.db.DeletePeerLifecycle(ctx, serverID, req.Protocol, clientID)
-			}
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
+		if status, code, msg := h.persistProvisioned(ctx, protoMgr, server, result, conn); status != 0 {
+			h.JSONError(w, status, code, msg)
 			return
 		}
+	} else if err := h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, clientID, req.Name, "", "active"); err != nil {
+		slog.Error("failed to record peer lifecycle", "server_id", serverID, "protocol", req.Protocol, "error", err)
+		if rbErr := h.rollbackClient(ctx, protoMgr, server, result, clientID); rbErr != nil {
+			_ = h.db.SetPeerLifecycleStatus(ctx, serverID, req.Protocol, clientID, "failed")
+		}
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to record peer lifecycle")
+		return
 	}
 
 	h.audit(r, "server_connection.add", map[string]any{"server_id": serverID, "protocol": req.Protocol, "client_id": clientID, "user_id": req.UserID})

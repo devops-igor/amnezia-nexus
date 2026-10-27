@@ -642,6 +642,10 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 		h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
 		return
 	}
+	if !user.Enabled {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Account is disabled")
+		return
+	}
 
 	server, err := h.db.GetServer(ctx, req.ServerID)
 	if err != nil || server == nil {
@@ -698,17 +702,11 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	if clientCreated {
-		_ = h.db.RecordPeerLifecycle(ctx, req.ServerID, req.Protocol, clientID, req.Name, userID, "active")
-	}
-
-	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
-		if clientCreated && clientID != "" {
-			if rbErr := h.rollbackClient(ctx, protoMgr, server, addResult, clientID); rbErr != nil {
-				_ = h.db.SetPeerLifecycleStatus(ctx, req.ServerID, req.Protocol, clientID, "failed")
-			} else {
-				_ = h.db.DeletePeerLifecycle(ctx, req.ServerID, req.Protocol, clientID)
-			}
+		if status, code, msg := h.persistProvisioned(ctx, protoMgr, server, addResult, newConn); status != 0 {
+			h.JSONError(w, status, code, msg)
+			return
 		}
+	} else if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
 		return
 	}
