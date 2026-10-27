@@ -135,20 +135,26 @@ func (h *Handlers) MyConnectionsPageHandler(w http.ResponseWriter, r *http.Reque
 		serversMap[srv.ID] = sClean
 	}
 
+	displayConns := make([]models.UserConnection, len(conns))
 	for i := range conns {
+		displayConns[i] = conns[i]
 		if sClean, ok := serversMap[conns[i].ServerID]; ok {
-			conns[i].ServerName = sClean.Name
+			displayConns[i].ServerName = sClean.Name
 		} else if conns[i].ServerID == 0 {
-			conns[i].ServerName = "Load Balancer (Auto)"
+			displayConns[i].ServerName = "Load Balancer (Auto)"
 		} else if conns[i].ServerID > 0 {
-			conns[i].ServerName = fmt.Sprintf("Server #%d", conns[i].ServerID)
+			displayConns[i].ServerName = fmt.Sprintf("Server #%d", conns[i].ServerID)
+		}
+		if models.NormalizeProtocol(conns[i].Protocol) == models.ProtocolVLESS && sess.Role != models.RoleAdmin {
+			displayConns[i].Name = safeVLESSDisplayName(conns[i].Name, conns[i].ClientID)
+			displayConns[i].ClientID = ""
 		}
 	}
 
 	vpnEnabled := h.vpnSvc != nil
 
 	_ = RenderTemplate(w, r, h.db, "my_connections.html", map[string]any{
-		"connections": conns,
+		"connections": displayConns,
 		"servers":     sanitizedServers,
 		"vpn_enabled": vpnEnabled,
 	})

@@ -550,3 +550,122 @@ func TestResourceRBACClosureAssignedVLESSNameRedaction(t *testing.T) {
 		t.Errorf("friendly name was not preserved: status=%d body=%s", w.Code, w.Body.String())
 	}
 }
+
+func TestResourceRBACClosureMyConnectionsPageCredentialBoundary(t *testing.T) {
+	h, db, serverID := setupResourceRBACClosure(t)
+	ctx := context.Background()
+	const (
+		userID             = "closure-page-user"
+		defaultCredential  = "7f2d1290-7953-4f69-a85e-363087c0f331"
+		legacyCredential   = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+		friendlyCredential = "123e4567-e89b-42d3-a456-426614174000"
+		awgCredential      = "awg-page-secret"
+	)
+	if _, err := db.CreateUser(ctx, &models.User{
+		ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	fixtures := []models.UserConnection{
+		{ID: "page-vless-default", Protocol: models.ProtocolVLESS, ClientID: defaultCredential, Name: "Unnamed"},
+		{ID: "page-vless-legacy", Protocol: models.ProtocolVLESS, ClientID: legacyCredential, Name: legacyCredential},
+		{ID: "page-vless-friendly", Protocol: models.ProtocolVLESS, ClientID: friendlyCredential, Name: "My Phone"},
+		{ID: "page-awg", Protocol: models.ProtocolAWG, ClientID: awgCredential, Name: "Office Laptop"},
+	}
+	for i := range fixtures {
+		fixtures[i].UserID = userID
+		fixtures[i].ServerID = serverID
+		fixtures[i].CreatedAt = time.Now()
+		if _, err := db.CreateConnection(ctx, &fixtures[i]); err != nil {
+			t.Fatalf("CreateConnection(%s): %v", fixtures[i].ID, err)
+		}
+	}
+
+	readPage := func(t *testing.T, sess *models.SessionData) (string, map[string]models.UserConnection) {
+		t.Helper()
+		w := resourceRBACRequest(t, http.HandlerFunc(h.MyConnectionsPageHandler), http.MethodGet, "/my", sess, nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		const marker = "const initialConnections = "
+		start := strings.Index(body, marker)
+		if start < 0 {
+			t.Fatal("initialConnections bootstrap not found")
+		}
+		start += len(marker)
+		end := strings.Index(body[start:], ";")
+		if end < 0 {
+			t.Fatal("initialConnections bootstrap is unterminated")
+		}
+		var connections []models.UserConnection
+		if err := json.Unmarshal([]byte(body[start:start+end]), &connections); err != nil {
+			t.Fatalf("decode initialConnections: %v", err)
+		}
+		byID := make(map[string]models.UserConnection, len(connections))
+		for _, conn := range connections {
+			byID[conn.ID] = conn
+		}
+		if len(byID) != len(fixtures) {
+			t.Fatalf("initialConnections contains %d connections, want %d", len(byID), len(fixtures))
+		}
+		return body, byID
+	}
+
+	userSess := resourceRBACSession(models.RoleUser)
+	userSess.UserID = userID
+	body, connections := readPage(t, userSess)
+	for _, credential := range []string{defaultCredential, legacyCredential, friendlyCredential} {
+		if strings.Contains(body, credential) {
+			t.Errorf("user response contains VLESS credential %q", credential)
+		}
+	}
+	for _, fixture := range fixtures[:3] {
+		conn := connections[fixture.ID]
+		if conn.ClientID != "" {
+			t.Errorf("%s client_id = %q, want redacted", fixture.ID, conn.ClientID)
+		}
+		wantName := fixture.Name
+		if fixture.ID != "page-vless-friendly" {
+			wantName = "Unnamed"
+		}
+		if conn.Name != wantName {
+			t.Errorf("%s name = %q, want %q", fixture.ID, conn.Name, wantName)
+		}
+	}
+	if got := connections["page-awg"].ClientID; got != awgCredential {
+		t.Errorf("AWG client_id = %q, want %q", got, awgCredential)
+	}
+	if got := connections["page-awg"].Name; got != "Office Laptop" {
+		t.Errorf("AWG name = %q, want Office Laptop", got)
+	}
+
+	adminSess := resourceRBACSession(models.RoleAdmin)
+	adminSess.UserID = userID
+	body, connections = readPage(t, adminSess)
+	for _, fixture := range fixtures {
+		if !strings.Contains(body, fixture.ClientID) {
+			t.Errorf("admin response does not contain %s credential", fixture.ID)
+		}
+		conn := connections[fixture.ID]
+		if conn.ClientID != fixture.ClientID || conn.Name != fixture.Name {
+			t.Errorf("admin %s = {client_id:%q name:%q}, want {%q %q}",
+				fixture.ID, conn.ClientID, conn.Name, fixture.ClientID, fixture.Name)
+		}
+	}
+
+	persisted, err := db.GetConnectionsByUserID(ctx, userID)
+	if err != nil {
+		t.Fatalf("GetConnectionsByUserID: %v", err)
+	}
+	if len(persisted) != len(fixtures) {
+		t.Fatalf("persisted connections = %d, want %d", len(persisted), len(fixtures))
+	}
+	for i, conn := range persisted {
+		if conn.ClientID != fixtures[i].ClientID || conn.Name != fixtures[i].Name {
+			t.Errorf("handler modified database row %s: got {%q %q}, want {%q %q}",
+				conn.ID, conn.ClientID, conn.Name, fixtures[i].ClientID, fixtures[i].Name)
+		}
+	}
+}
