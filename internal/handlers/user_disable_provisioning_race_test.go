@@ -95,6 +95,7 @@ func (r *provisioningRig) addServerAssignment(t *testing.T) *httptest.ResponseRe
 	t.Helper()
 	body, _ := json.Marshal(models.AddConnectionRequest{Protocol: r.proto, Name: "staff", UserID: &r.userID})
 	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/add", r.sID), bytes.NewReader(body))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "race-admin", Role: models.RoleAdmin}))
 	w := httptest.NewRecorder()
 	setupFullServerConnectionsRouter(r.h).ServeHTTP(w, req)
 	return w
@@ -104,6 +105,7 @@ func (r *provisioningRig) adminAddConnection(t *testing.T) *httptest.ResponseRec
 	t.Helper()
 	body, _ := json.Marshal(models.AddUserConnectionRequest{ServerID: r.sID, Protocol: r.proto, Name: "staff"})
 	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/connections/add", r.userID), bytes.NewReader(body))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "race-admin", Role: models.RoleAdmin}))
 	w := httptest.NewRecorder()
 	setupFullUsersRouter(r.h).ServeHTTP(w, req)
 	return w
