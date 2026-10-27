@@ -398,3 +398,66 @@ func TestDialer_GoroutineLeak(t *testing.T) {
 		t.Fatalf("goroutine leak detected: baseline=%d, final=%d (+%d)", baseline, finalCount, finalCount-baseline)
 	}
 }
+
+func startServerFirstTCPServer(t *testing.T, banner string) (string, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen server-first tcp: %v", err)
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = c.Write([]byte(banner))
+				buf := make([]byte, 1024)
+				for {
+					if _, err := c.Read(buf); err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+	return ln.Addr().String(), func() {
+		_ = ln.Close()
+	}
+}
+
+func TestDialer_ServerFirstTCP(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	const banner = "SSH-2.0-OpenSSH_9.0\r\n"
+	serverAddr, cleanup := startServerFirstTCPServer(t, banner)
+	defer cleanup()
+
+	d, err := New(fixture.Endpoint, fixture.Params)
+	if err != nil {
+		t.Fatalf("New dialer: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := d.DialContext(ctx, "tcp", serverAddr)
+	if err != nil {
+		t.Fatalf("DialContext tcp: %v", err)
+	}
+	defer conn.Close()
+
+	// Assert server-first protocol: read banner immediately without writing first
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, len(banner))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("failed to read server-first banner without writing: %v", err)
+	}
+
+	if string(buf) != banner {
+		t.Fatalf("unexpected banner: got %q, want %q", string(buf), banner)
+	}
+}
