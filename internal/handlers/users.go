@@ -241,6 +241,13 @@ func (h *Handlers) provisionInitialConnection(ctx context.Context, user *models.
 	if req.ServerID == nil || req.Protocol == nil || *req.Protocol == "" {
 		return
 	}
+	defer h.lockUser(user.ID)()
+	curUser, err := h.db.GetUser(ctx, user.ID)
+	if err != nil || curUser == nil || !curUser.Enabled {
+		resp["connection_created"] = false
+		resp["connection_error"] = "user is disabled"
+		return
+	}
 	server, err := h.db.GetServer(ctx, *req.ServerID)
 	if err != nil || server == nil {
 		resp["connection_created"] = false
@@ -304,14 +311,9 @@ func (h *Handlers) provisionInitialConnection(ctx context.Context, user *models.
 		AWGMimicry: user.AWGMimicry,
 		CreatedAt:  time.Now(),
 	}
-	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
-		if rbErr := h.rollbackClient(ctx, protoMgr, server, connRes, clientID); rbErr != nil {
-			_ = h.db.SetPeerLifecycleStatus(ctx, server.ID, *req.Protocol, clientID, "failed")
-		} else {
-			_ = h.db.DeletePeerLifecycle(ctx, server.ID, *req.Protocol, clientID)
-		}
+	if status, _, msg := h.persistProvisioned(ctx, protoMgr, server, connRes, newConn); status != 0 {
 		resp["connection_created"] = false
-		resp["connection_error"] = err.Error()
+		resp["connection_error"] = msg
 		return
 	}
 

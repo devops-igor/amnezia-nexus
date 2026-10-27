@@ -109,6 +109,18 @@ func (r *provisioningRig) adminAddConnection(t *testing.T) *httptest.ResponseRec
 	return w
 }
 
+func (r *provisioningRig) addInitialUser(t *testing.T) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(models.AddUserRequest{
+		Username: "initialuser", Password: "InitialPass123!",
+		ServerID: &r.sID, Protocol: &r.proto,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/users/add", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	setupFullUsersRouter(r.h).ServeHTTP(w, req)
+	return w
+}
+
 func (r *provisioningRig) assertRevoked(t *testing.T) {
 	t.Helper()
 	ctx := t.Context()
@@ -191,6 +203,72 @@ func TestInFlightProvisioningCompensatesWhenUserDisabled(t *testing.T) {
 			}
 			rig.assertRevoked(t)
 		})
+	}
+}
+
+func TestInitialUserProvisioning_DisabledWhileProvisioning(t *testing.T) {
+	for _, proto := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
+		for _, mode := range []string{"compensation", "serialized"} {
+			t.Run(proto+"/"+mode, func(t *testing.T) {
+				entered, release := make(chan struct{}), make(chan struct{})
+				rig := newProvisioningRig(t, proto, func() {
+					close(entered)
+					<-release
+				})
+
+				created := make(chan *httptest.ResponseRecorder, 1)
+				go func() { created <- rig.addInitialUser(t) }()
+				<-entered
+				user, err := rig.h.db.GetUserByUsername(t.Context(), "initialuser")
+				if err != nil || user == nil {
+					t.Fatalf("fetch initial user: user=%v err=%v", user, err)
+				}
+				rig.userID = user.ID
+
+				disabled := make(chan error, 1)
+				go func() {
+					if mode == "serialized" {
+						_, err := userops.New(rig.h.db, rig.h.registry).ToggleUser(context.Background(), user.ID, false)
+						disabled <- err
+						return
+					}
+					_, err := rig.h.db.UpdateUser(context.Background(), user.ID, map[string]any{"enabled": false})
+					disabled <- err
+				}()
+
+				var disableErr error
+				if mode == "compensation" {
+					disableErr = <-disabled
+				} else {
+					select {
+					case <-disabled:
+						t.Fatal("disable completed while initial provisioning was still in flight")
+					case <-time.After(150 * time.Millisecond):
+					}
+				}
+				close(release)
+				w := <-created
+				if mode == "serialized" {
+					disableErr = <-disabled
+				}
+				if disableErr != nil {
+					t.Fatalf("disable failed: %v", disableErr)
+				}
+				if w.Code != http.StatusOK {
+					t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+				}
+				var resp struct {
+					ConnectionCreated bool `json:"connection_created"`
+				}
+				if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+					t.Fatalf("decode response: %v", err)
+				}
+				if wantCreated := mode == "serialized"; resp.ConnectionCreated != wantCreated {
+					t.Fatalf("connection_created=%v, want %v (body: %s)", resp.ConnectionCreated, wantCreated, w.Body.String())
+				}
+				rig.assertRevoked(t)
+			})
+		}
 	}
 }
 
