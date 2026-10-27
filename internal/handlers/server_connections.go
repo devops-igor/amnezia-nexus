@@ -595,6 +595,17 @@ func (h *Handlers) ToggleServerConnectionHandler(w http.ResponseWriter, r *http.
 			proto = conn.Protocol
 		}
 	}
+	if proto == "" && serverID != 0 {
+		// Unassigned clients have no user_connections row; fall back to the lifecycle ledger.
+		for _, p := range []string{models.ProtocolAWG, models.ProtocolVLESS, models.ProtocolNaive} {
+			if recs, err := h.db.GetPeerLifecycles(ctx, serverID, p); err == nil {
+				if _, ok := recs[req.ClientID]; ok {
+					proto = p
+					break
+				}
+			}
+		}
+	}
 	normProto := models.NormalizeProtocol(proto)
 	if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
 		h.JSONError(w, http.StatusBadRequest, "unsupported_action", "Client disable is not supported for this protocol; use remove instead")
@@ -638,11 +649,22 @@ func (h *Handlers) ToggleServerConnectionHandler(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if req.Protocol == "awg" && h.awgMgr != nil {
-		_ = h.awgMgr.ToggleClient(ctx, server, req.ClientID, enableState)
+	// Only AWG supports in-place toggling; never report success for a no-op.
+	if normProto != models.ProtocolAWG {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Cannot resolve a toggle-capable protocol for this client; specify protocol")
+		return
+	}
+	if h.awgMgr == nil {
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "AWG manager is not configured")
+		return
+	}
+	if err := h.awgMgr.ToggleClient(ctx, server, req.ClientID, enableState); err != nil {
+		slog.Error("failed to toggle client", "server_id", serverID, "client_id", req.ClientID, "error", err)
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to toggle client")
+		return
 	}
 
-	h.audit(r, "server_connection.toggle", map[string]any{"server_id": serverID, "protocol": req.Protocol, "client_id": req.ClientID, "enabled": enableState})
+	h.audit(r, "server_connection.toggle", map[string]any{"server_id": serverID, "protocol": normProto, "client_id": req.ClientID, "enabled": enableState})
 	h.JSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
 		"enabled": enableState,

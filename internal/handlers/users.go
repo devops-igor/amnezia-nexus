@@ -560,12 +560,23 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 
 	conns, _ := h.db.GetConnectionsByUserID(ctx, userID)
 	if !req.Enabled {
-		for _, c := range conns {
-			proto := models.NormalizeProtocol(c.Protocol)
-			if proto == models.ProtocolVLESS || proto == models.ProtocolNaive {
-				h.JSONError(w, http.StatusBadRequest, "unsupported_action", "Client disable is not supported for this protocol; use remove instead")
+		// VLESS/Naive cannot be toggled in place: revoke the remote credential
+		// first (fail closed, user stays enabled), then drop the row like userops does.
+		for i := range conns {
+			c := &conns[i]
+			if proto := models.NormalizeProtocol(c.Protocol); proto != models.ProtocolVLESS && proto != models.ProtocolNaive {
+				continue
+			}
+			if err := h.removeRemoteClient(ctx, c); err != nil {
+				slog.Error("failed to revoke remote client on user disable", "user_id", userID, "client_id", c.ClientID, "error", err)
+				h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to revoke remote client credential")
 				return
 			}
+			if _, err := h.db.DeleteConnection(ctx, c.ID); err != nil {
+				h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete revoked connection")
+				return
+			}
+			_ = h.db.DeletePeerLifecycle(ctx, c.ServerID, c.Protocol, c.ClientID)
 		}
 	}
 

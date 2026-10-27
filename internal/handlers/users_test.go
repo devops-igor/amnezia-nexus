@@ -592,42 +592,6 @@ func TestUsersHandlers(t *testing.T) {
 		}
 	})
 
-	t.Run("ToggleUserHandler Rejects Disable For User With VLESS Connection", func(t *testing.T) {
-		vlessUser := &models.User{
-			ID:           "user-vless-toggle",
-			Username:     "uservlesstoggle",
-			PasswordHash: "hash",
-			Role:         models.RoleUser,
-			Enabled:      true,
-			CreatedAt:    time.Now(),
-		}
-		_, _ = db.CreateUser(ctx, vlessUser)
-
-		cVless := &models.UserConnection{
-			ID:        "c-vless-toggle",
-			UserID:    vlessUser.ID,
-			ServerID:  sID,
-			Protocol:  "vless",
-			ClientID:  "client-vless-toggle",
-			Name:      "VLESS Device",
-			CreatedAt: time.Now(),
-		}
-		_, _ = db.CreateConnection(ctx, cVless)
-
-		body, _ := json.Marshal(models.ToggleUserRequest{
-			Enabled: false,
-		})
-		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/toggle", vlessUser.ID), bytes.NewReader(body))
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusBadRequest {
-			t.Errorf("expected 400 Bad Request when disabling user with VLESS connection, got %d", w.Code)
-		}
-		if !strings.Contains(w.Body.String(), "Client disable is not supported for this protocol; use remove instead") {
-			t.Errorf("expected honest error message, got %s", w.Body.String())
-		}
-	})
-
 	t.Run("GetUserConnectionsHandler Enriched Output", func(t *testing.T) {
 		// Fresh user (earlier subtests may have deleted seeded users)
 		fu := &models.User{

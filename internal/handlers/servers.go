@@ -150,6 +150,10 @@ func (h *Handlers) DeleteServerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.teardownAdminProtocols(w, r, server) {
+		return
+	}
+
 	if h.vpnSvc != nil {
 		if err := h.vpnSvc.DeleteServer(ctx, serverID); err != nil {
 			slog.Error("failed to teardown VPN backend for server", "server_id", serverID, "error", err)

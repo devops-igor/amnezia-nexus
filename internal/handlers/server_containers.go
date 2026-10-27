@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -237,4 +238,31 @@ func syncDiscoveredProtocols(server *models.Server, protocolsStatus map[string]a
 	}
 
 	return updated
+}
+
+// teardownAdminProtocols uninstalls the Admin-managed (VLESS/Naive) protocols
+// installed on a server ahead of its deletion, so no remote container or client
+// credential outlives the records. It writes the error response and returns
+// false when the caller is not an Admin or teardown fails (records stay intact).
+func (h *Handlers) teardownAdminProtocols(w http.ResponseWriter, r *http.Request, server *models.Server) bool {
+	for proto := range server.Protocols {
+		if norm := models.NormalizeProtocol(proto); (norm != models.ProtocolVLESS && norm != models.ProtocolNaive) || !isProtocolInstalled(server, proto) {
+			continue
+		}
+		if session := h.GetSession(r); session == nil || !session.IsAdmin() {
+			h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required")
+			return false
+		}
+		mgr, err := h.GetProtocolManager(proto)
+		if err != nil || mgr == nil {
+			h.JSONError(w, http.StatusInternalServerError, "uninstall_failed", fmt.Sprintf("No protocol manager available to remove %s", proto))
+			return false
+		}
+		if err := mgr.Uninstall(r.Context(), server); err != nil {
+			slog.Error("failed to uninstall protocol before server delete", "server_id", server.ID, "protocol", proto, "error", err)
+			h.JSONError(w, http.StatusInternalServerError, "uninstall_failed", fmt.Sprintf("Failed to remove protocol container: %v", err))
+			return false
+		}
+	}
+	return true
 }
