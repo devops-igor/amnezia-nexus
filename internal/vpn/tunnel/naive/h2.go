@@ -3,6 +3,7 @@ package naive
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,86 +19,255 @@ import (
 var (
 	h2ReadIdleTimeout = 15 * time.Second
 	h2PingTimeout     = 15 * time.Second
+	h2SetupTimeout    = 15 * time.Second
+	// h2IdleConnTimeout bounds how long a connection with no active streams
+	// (notably a retired, saturated-then-drained one) stays open.
+	h2IdleConnTimeout = 15 * time.Second
 )
 
 type h2Pool struct {
 	mu sync.Mutex
 	//nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
-	cc         *http2.ClientConn
+	cc *http2.ClientConn
+	//nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
+	conns      map[*http2.ClientConn]struct{}
+	closed     bool
 	localAddr  net.Addr
 	remoteAddr net.Addr
+	inflight   *h2Inflight
 }
 
+type h2Inflight struct {
+	done    chan struct{}
+	cancel  context.CancelFunc
+	rawConn net.Conn
+	err     error
+}
+
+//nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
 func newH2Pool() *h2Pool {
-	return &h2Pool{}
+	return &h2Pool{
+		conns: make(map[*http2.ClientConn]struct{}),
+	}
 }
 
+//nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
 func (p *h2Pool) close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.cc != nil {
-		_ = p.cc.Close()
-		p.cc = nil
+	p.closed = true
+	if p.inflight != nil {
+		if p.inflight.cancel != nil {
+			p.inflight.cancel()
+		}
+		if p.inflight.rawConn != nil {
+			_ = p.inflight.rawConn.Close()
+		}
 	}
+	for cc := range p.conns {
+		_ = cc.Close()
+	}
+	p.conns = make(map[*http2.ClientConn]struct{})
+	p.cc = nil
 }
 
 //nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
 func (p *h2Pool) invalidate(cc *http2.ClientConn) {
+	if cc == nil {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.cc == cc {
 		p.cc = nil
-		go func() { _ = cc.Shutdown(context.Background()) }()
 	}
+	delete(p.conns, cc)
+	go func() { _ = cc.Shutdown(context.Background()) }()
+}
+
+// trackedConns returns a slice of all active and retired connections currently tracked by the pool.
+//
+//nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
+func (p *h2Pool) trackedConns() []*http2.ClientConn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	res := make([]*http2.ClientConn, 0, len(p.conns))
+	for cc := range p.conns {
+		res = append(res, cc)
+	}
+	return res
 }
 
 //nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
 func (d *Dialer) getH2Conn(ctx context.Context) (*http2.ClientConn, net.Addr, net.Addr, error) {
-	d.h2Pool.mu.Lock()
-	defer d.h2Pool.mu.Unlock()
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
 
-	if d.h2Pool.cc != nil && d.h2Pool.cc.CanTakeNewRequest() {
-		return d.h2Pool.cc, d.h2Pool.localAddr, d.h2Pool.remoteAddr, nil
+		d.h2Pool.mu.Lock()
+		if d.h2Pool.closed {
+			d.h2Pool.mu.Unlock()
+			return nil, nil, nil, net.ErrClosed
+		}
+
+		if d.h2Pool.conns == nil {
+			d.h2Pool.conns = make(map[*http2.ClientConn]struct{})
+		}
+
+		for c := range d.h2Pool.conns {
+			if c.State().Closed {
+				delete(d.h2Pool.conns, c)
+			}
+		}
+
+		if d.h2Pool.cc != nil && d.h2Pool.cc.CanTakeNewRequest() {
+			cc := d.h2Pool.cc
+			local := d.h2Pool.localAddr
+			remote := d.h2Pool.remoteAddr
+			d.h2Pool.mu.Unlock()
+			return cc, local, remote, nil
+		}
+
+		if d.h2Pool.inflight != nil {
+			inf := d.h2Pool.inflight
+			d.h2Pool.mu.Unlock()
+
+			select {
+			case <-ctx.Done():
+				return nil, nil, nil, ctx.Err()
+			case <-inf.done:
+				if inf.err != nil {
+					if errors.Is(inf.err, context.Canceled) || errors.Is(inf.err, context.DeadlineExceeded) {
+						if ctx.Err() != nil {
+							return nil, nil, nil, ctx.Err()
+						}
+						continue
+					}
+					return nil, nil, nil, inf.err
+				}
+				continue
+			}
+		}
+
+		// No in-flight dial; become the dialer outside pool lock.
+		dialCtx, dialCancel := context.WithTimeout(ctx, h2SetupTimeout)
+		inf := &h2Inflight{
+			done:   make(chan struct{}),
+			cancel: dialCancel,
+		}
+		d.h2Pool.inflight = inf
+		d.h2Pool.mu.Unlock()
+
+		return d.dialAndPublishH2(dialCtx, dialCancel, inf)
 	}
+}
+
+//nolint:staticcheck // SA1019: x/net/http2.ClientConn required for low-level H2 CONNECT pooling
+func (d *Dialer) dialAndPublishH2(dialCtx context.Context, dialCancel context.CancelFunc, inf *h2Inflight) (*http2.ClientConn, net.Addr, net.Addr, error) {
+	defer dialCancel()
+	defer func() {
+		d.h2Pool.mu.Lock()
+		if d.h2Pool.inflight == inf {
+			d.h2Pool.inflight = nil
+		}
+		select {
+		case <-inf.done:
+		default:
+			close(inf.done)
+		}
+		d.h2Pool.mu.Unlock()
+	}()
+
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	rawConn, err := dialer.DialContext(dialCtx, "tcp", d.endpoint)
+	if err != nil {
+		d.h2Pool.mu.Lock()
+		if d.h2Pool.closed {
+			inf.err = net.ErrClosed
+		} else {
+			inf.err = fmt.Errorf("naive: dial tcp %s: %w", d.endpoint, err)
+		}
+		d.h2Pool.mu.Unlock()
+		return nil, nil, nil, inf.err
+	}
+
+	d.h2Pool.mu.Lock()
+	if d.h2Pool.closed {
+		d.h2Pool.mu.Unlock()
+		_ = rawConn.Close()
+		inf.err = net.ErrClosed
+		return nil, nil, nil, net.ErrClosed
+	}
+	inf.rawConn = rawConn
+	d.h2Pool.mu.Unlock()
 
 	tlsCfg := d.tlsCfg.Clone()
 	tlsCfg.NextProtos = []string{"h2"}
 
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	rawConn, err := dialer.DialContext(ctx, "tcp", d.endpoint)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("naive: dial tcp %s: %w", d.endpoint, err)
-	}
-
 	tlsConn := tls.Client(rawConn, tlsCfg)
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
+	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
 		_ = rawConn.Close()
-		return nil, nil, nil, fmt.Errorf("naive: tls handshake %s: %w", d.endpoint, err)
+		d.h2Pool.mu.Lock()
+		if d.h2Pool.closed {
+			inf.err = net.ErrClosed
+		} else {
+			inf.err = fmt.Errorf("naive: tls handshake %s: %w", d.endpoint, err)
+		}
+		d.h2Pool.mu.Unlock()
+		return nil, nil, nil, inf.err
 	}
 
 	cs := tlsConn.ConnectionState()
 	if cs.NegotiatedProtocol != "h2" {
 		_ = tlsConn.Close()
-		return nil, nil, nil, fmt.Errorf("naive: negotiated unexpected protocol %q, want h2", cs.NegotiatedProtocol)
+		d.h2Pool.mu.Lock()
+		if d.h2Pool.closed {
+			inf.err = net.ErrClosed
+		} else {
+			inf.err = fmt.Errorf("naive: negotiated unexpected protocol %q, want h2", cs.NegotiatedProtocol)
+		}
+		d.h2Pool.mu.Unlock()
+		return nil, nil, nil, inf.err
 	}
 
 	//nolint:staticcheck // SA1019: x/net/http2.Transport.NewClientConn required for raw TLS connection wrapping
 	t := &http2.Transport{
 		ReadIdleTimeout: h2ReadIdleTimeout,
 		PingTimeout:     h2PingTimeout,
+		IdleConnTimeout: h2IdleConnTimeout,
 	}
 	//nolint:staticcheck // SA1019: x/net/http2.Transport.NewClientConn required for raw TLS connection wrapping
 	cc, err := t.NewClientConn(tlsConn)
 	if err != nil {
 		_ = tlsConn.Close()
-		return nil, nil, nil, fmt.Errorf("naive: create http2 client conn: %w", err)
+		d.h2Pool.mu.Lock()
+		if d.h2Pool.closed {
+			inf.err = net.ErrClosed
+		} else {
+			inf.err = fmt.Errorf("naive: create http2 client conn: %w", err)
+		}
+		d.h2Pool.mu.Unlock()
+		return nil, nil, nil, inf.err
+	}
+
+	d.h2Pool.mu.Lock()
+	if d.h2Pool.closed {
+		d.h2Pool.mu.Unlock()
+		_ = cc.Close()
+		inf.err = net.ErrClosed
+		return nil, nil, nil, net.ErrClosed
 	}
 
 	d.h2Pool.cc = cc
+	d.h2Pool.conns[cc] = struct{}{}
 	d.h2Pool.localAddr = tlsConn.LocalAddr()
 	d.h2Pool.remoteAddr = tlsConn.RemoteAddr()
+	localAddr := d.h2Pool.localAddr
+	remoteAddr := d.h2Pool.remoteAddr
+	d.h2Pool.mu.Unlock()
 
-	return cc, d.h2Pool.localAddr, d.h2Pool.remoteAddr, nil
+	return cc, localAddr, remoteAddr, nil
 }
 
 func (d *Dialer) dialH2(ctx context.Context, address string) (net.Conn, error) {
@@ -301,6 +471,9 @@ type h2Conn struct {
 
 	mu            sync.Mutex
 	writeDeadline time.Time
+	writeTimer    *time.Timer
+	writing       int
+	wdExpired     bool
 	closed        bool
 }
 
@@ -314,13 +487,42 @@ func (c *h2Conn) Write(p []byte) (int, error) {
 		c.mu.Unlock()
 		return 0, net.ErrClosed
 	}
-	if !c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline) {
+	if c.wdExpired || (!c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline)) {
 		c.mu.Unlock()
 		return 0, os.ErrDeadlineExceeded
 	}
+	c.writing++
 	c.mu.Unlock()
 
-	return c.pw.Write(p)
+	n, err := c.pw.Write(p)
+
+	c.mu.Lock()
+	c.writing--
+	expired := c.wdExpired
+	c.mu.Unlock()
+	if err != nil && expired {
+		err = os.ErrDeadlineExceeded
+	}
+	return n, err
+}
+
+// expireWrite aborts a Write blocked past the write deadline. io.Pipe offers no
+// deadline, so the request body is failed instead; that resets only this stream
+// (a partially written stream cannot be resumed anyway), siblings are unaffected.
+func (c *h2Conn) expireWrite() {
+	c.mu.Lock()
+	if c.closed || c.writing == 0 || c.writeDeadline.IsZero() || time.Now().Before(c.writeDeadline) {
+		c.mu.Unlock()
+		return
+	}
+	c.wdExpired = true
+	c.mu.Unlock()
+	_ = c.pw.CloseWithError(os.ErrDeadlineExceeded)
+	// The transport may be parked in flow control, not reading the pipe: reset the stream.
+	if c.cancel != nil {
+		c.cancel()
+	}
+	_ = c.dr.Close()
 }
 
 func (c *h2Conn) CloseWrite() error {
@@ -334,6 +536,9 @@ func (c *h2Conn) Close() error {
 		return nil
 	}
 	c.closed = true
+	if c.writeTimer != nil {
+		c.writeTimer.Stop()
+	}
 	c.mu.Unlock()
 
 	if c.cancel != nil {
@@ -366,7 +571,14 @@ func (c *h2Conn) SetReadDeadline(t time.Time) error {
 
 func (c *h2Conn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.writeDeadline = t
-	c.mu.Unlock()
+	if c.writeTimer != nil {
+		c.writeTimer.Stop()
+		c.writeTimer = nil
+	}
+	if !t.IsZero() && !c.closed {
+		c.writeTimer = time.AfterFunc(time.Until(t), c.expireWrite)
+	}
 	return nil
 }

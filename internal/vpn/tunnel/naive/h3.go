@@ -2,6 +2,7 @@ package naive
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -31,6 +32,16 @@ type h3Pool struct {
 	mu         sync.Mutex
 	quicConn   *quic.Conn
 	clientConn *http3.ClientConn
+	closed     bool
+	inflight   *h3Inflight
+}
+
+// h3Inflight coordinates a single QUIC handshake shared by concurrent callers.
+// err is written before done is closed.
+type h3Inflight struct {
+	done   chan struct{}
+	cancel context.CancelFunc
+	err    error
 }
 
 func newH3Pool() *h3Pool {
@@ -40,6 +51,10 @@ func newH3Pool() *h3Pool {
 func (p *h3Pool) close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.closed = true
+	if p.inflight != nil {
+		p.inflight.cancel()
+	}
 	if p.quicConn != nil {
 		_ = p.quicConn.CloseWithError(0, "closed")
 		p.quicConn = nil
@@ -59,31 +74,87 @@ func (p *h3Pool) invalidate(clientConn *http3.ClientConn) {
 	}
 }
 
+// getH3Conn returns the pooled HTTP/3 connection, dialing at most one new QUIC
+// connection at a time. The handshake runs outside h3Pool.mu so that other
+// callers stay cancelable and Close can abort it.
 func (d *Dialer) getH3Conn(ctx context.Context) (*http3.ClientConn, error) {
-	d.h3Pool.mu.Lock()
-	defer d.h3Pool.mu.Unlock()
+	p := d.h3Pool
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 
-	if d.h3Pool.clientConn != nil && d.h3Pool.clientConn.Context().Err() == nil {
-		return d.h3Pool.clientConn, nil
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, net.ErrClosed
+		}
+		if p.clientConn != nil && p.clientConn.Context().Err() == nil {
+			cc := p.clientConn
+			p.mu.Unlock()
+			return cc, nil
+		}
+
+		if inf := p.inflight; inf != nil {
+			p.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-inf.done:
+			}
+			// A leader aborted by its own context must not fail healthy waiters: retry.
+			if inf.err != nil && !errors.Is(inf.err, context.Canceled) && !errors.Is(inf.err, context.DeadlineExceeded) {
+				return nil, inf.err
+			}
+			continue
+		}
+
+		dialCtx, cancel := context.WithCancel(ctx)
+		inf := &h3Inflight{done: make(chan struct{}), cancel: cancel}
+		p.inflight = inf
+		p.mu.Unlock()
+
+		return d.dialAndPublishH3(dialCtx, inf)
 	}
+}
+
+func (d *Dialer) dialAndPublishH3(dialCtx context.Context, inf *h3Inflight) (*http3.ClientConn, error) {
+	defer inf.cancel()
 
 	tlsCfg := d.tlsCfg.Clone()
 	tlsCfg.NextProtos = []string{http3.NextProtoH3}
 
-	quicConn, err := quic.DialAddr(ctx, d.endpoint, tlsCfg, &quic.Config{
+	quicConn, err := quic.DialAddr(dialCtx, d.endpoint, tlsCfg, &quic.Config{
 		KeepAlivePeriod: 15 * time.Second,
 	})
+	var clientConn *http3.ClientConn
 	if err != nil {
-		return nil, fmt.Errorf("naive: quic dial %s: %w", d.endpoint, err)
+		err = fmt.Errorf("naive: quic dial %s: %w", d.endpoint, err)
+	} else {
+		clientConn = (&http3.Transport{}).NewClientConn(quicConn)
 	}
 
-	tr := &http3.Transport{}
-	clientConn := tr.NewClientConn(quicConn)
+	p := d.h3Pool
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	defer close(inf.done)
+	p.inflight = nil
 
-	d.h3Pool.quicConn = quicConn
-	d.h3Pool.clientConn = clientConn
-
-	return clientConn, nil
+	switch {
+	case p.closed:
+		// Close raced the handshake: discard any late connection.
+		if quicConn != nil {
+			_ = quicConn.CloseWithError(0, "closed")
+		}
+		inf.err = net.ErrClosed
+	case err != nil:
+		inf.err = err
+	default:
+		p.quicConn = quicConn
+		p.clientConn = clientConn
+		return clientConn, nil
+	}
+	return nil, inf.err
 }
 
 func (d *Dialer) dialH3(ctx context.Context, address string) (net.Conn, error) {
@@ -224,14 +295,23 @@ type h3Conn struct {
 }
 
 func (c *h3Conn) Read(b []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	return c.stream.Read(b)
 }
 
 func (c *h3Conn) Write(b []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	return c.stream.Write(b)
 }
 
 func (c *h3Conn) CloseWrite() error {
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
 	return c.stream.Close()
 }
 
@@ -240,7 +320,8 @@ func (c *h3Conn) Close() error {
 		return nil
 	}
 	c.stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
-	return c.stream.Close()
+	c.stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeNoError))
+	return nil
 }
 
 func (c *h3Conn) LocalAddr() net.Addr {

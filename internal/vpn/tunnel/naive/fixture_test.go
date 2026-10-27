@@ -244,6 +244,10 @@ func setupTestH2Server(t *testing.T, authUser, authPass string, probeResistance 
 				return
 			}
 			defer targetConn.Close()
+			go func() {
+				<-r.Context().Done()
+				_ = targetConn.Close()
+			}()
 
 			flusher, _ := w.(http.Flusher)
 			w.WriteHeader(http.StatusOK)
@@ -338,6 +342,10 @@ func setupTestH3Server(t *testing.T, authUser, authPass string, probeResistance 
 				return
 			}
 			defer targetConn.Close()
+			go func() {
+				<-r.Context().Done()
+				_ = targetConn.Close()
+			}()
 
 			flusher, _ := w.(http.Flusher)
 			w.WriteHeader(http.StatusOK)

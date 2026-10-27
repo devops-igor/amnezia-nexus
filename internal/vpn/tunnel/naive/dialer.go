@@ -10,6 +10,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -20,6 +21,10 @@ import (
 // remains nil, prompting standard crypto/tls system root verification.
 var testRootCAs *x509.CertPool
 
+// h3FailureCooldown is how long DialContext skips H3 and dials H2 directly
+// after a transport-level H3 failure, so UDP loss costs one timeout, not one per dial.
+var h3FailureCooldown = 30 * time.Second
+
 // Dialer establishes authenticated HTTP/2 or HTTP/3 CONNECT tunnels to a NaiveProxy
 // endpoint, satisfying the streambridge.StreamDialer interface.
 type Dialer struct {
@@ -28,6 +33,9 @@ type Dialer struct {
 	tlsCfg   *tls.Config
 	h2Pool   *h2Pool
 	h3Pool   *h3Pool
+	// h3CooldownUntil is a UnixNano deadline; H3 is skipped until then.
+	// The shared QUIC conn is deliberately left open so healthy sibling tunnels survive.
+	h3CooldownUntil atomic.Int64
 }
 
 // New constructs a new NaiveProxy Dialer with defensive input validation.
@@ -87,7 +95,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 		return nil, err
 	}
 
-	if d.params.EnableH3 {
+	if d.params.EnableH3 && time.Now().UnixNano() >= d.h3CooldownUntil.Load() {
 		h3Ctx := ctx
 		if deadline, ok := ctx.Deadline(); ok {
 			timeout := time.Until(deadline) / 2
@@ -107,6 +115,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 
 		conn, err := d.dialH3(h3Ctx, address)
 		if err == nil {
+			d.h3CooldownUntil.Store(0)
 			return conn, nil
 		}
 		// If the proxy actively rejected with an HTTP status (e.g. 407 auth failure),
@@ -120,7 +129,10 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 			return nil, ctx.Err()
 		}
 		// On any transport-level H3 failure (UDP blocked, handshake timeout, network drop),
-		// gracefully fall through to H2 without failing the connection.
+		// start the cooldown and gracefully fall through to H2.
+		if !errors.Is(err, net.ErrClosed) {
+			d.h3CooldownUntil.Store(time.Now().Add(h3FailureCooldown).UnixNano())
+		}
 	}
 
 	return d.dialH2(ctx, address)
