@@ -559,6 +559,30 @@ func (h *Handlers) GetServerConnectionConfigHandler(w http.ResponseWriter, r *ht
 	})
 }
 
+// resolveToggleProtocol returns the requested protocol, or when omitted the one recorded
+// for the client in user_connections or (for unassigned clients) peer_lifecycle; "" if unknown.
+func (h *Handlers) resolveToggleProtocol(ctx context.Context, serverID int64, clientID, requested string) string {
+	if requested != "" {
+		return requested
+	}
+	if conn, err := h.db.GetConnection(ctx, clientID); err == nil && conn != nil {
+		return conn.Protocol
+	}
+	if conn, err := h.db.GetConnectionByClientID(ctx, clientID, serverID); err == nil && conn != nil {
+		return conn.Protocol
+	}
+	if serverID != 0 {
+		for _, p := range []string{models.ProtocolAWG, models.ProtocolVLESS, models.ProtocolNaive} {
+			if recs, err := h.db.GetPeerLifecycles(ctx, serverID, p); err == nil {
+				if _, ok := recs[clientID]; ok {
+					return p
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // ToggleServerConnectionHandler enables or disables a client connection on the server.
 func (h *Handlers) ToggleServerConnectionHandler(w http.ResponseWriter, r *http.Request) {
 	serverID, err := parseServerID(r)
@@ -587,26 +611,7 @@ func (h *Handlers) ToggleServerConnectionHandler(w http.ResponseWriter, r *http.
 
 	ctx := r.Context()
 
-	proto := req.Protocol
-	if proto == "" {
-		if conn, err := h.db.GetConnection(ctx, req.ClientID); err == nil && conn != nil {
-			proto = conn.Protocol
-		} else if conn, err := h.db.GetConnectionByClientID(ctx, req.ClientID, serverID); err == nil && conn != nil {
-			proto = conn.Protocol
-		}
-	}
-	if proto == "" && serverID != 0 {
-		// Unassigned clients have no user_connections row; fall back to the lifecycle ledger.
-		for _, p := range []string{models.ProtocolAWG, models.ProtocolVLESS, models.ProtocolNaive} {
-			if recs, err := h.db.GetPeerLifecycles(ctx, serverID, p); err == nil {
-				if _, ok := recs[req.ClientID]; ok {
-					proto = p
-					break
-				}
-			}
-		}
-	}
-	normProto := models.NormalizeProtocol(proto)
+	normProto := models.NormalizeProtocol(h.resolveToggleProtocol(ctx, serverID, req.ClientID, req.Protocol))
 	if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
 		h.JSONError(w, http.StatusBadRequest, "unsupported_action", "Client disable is not supported for this protocol; use remove instead")
 		return
