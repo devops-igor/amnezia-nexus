@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -66,6 +67,18 @@ func (m *XrayManager) resolveRealityCredentials(
 	client ssh.SSHClient,
 ) (string, string, string, []string, []XrayClient, error) {
 	exists, err := client.FileExists(ctx, XrayConfigPath)
+	if errors.Is(err, os.ErrPermission) {
+		testCmd := fmt.Sprintf("test -f %s", ssh.EscapeShellArg(XrayConfigPath))
+		_, errOut, code, sudoErr := client.RunSudoCommand(ctx, testCmd)
+		switch {
+		case sudoErr != nil:
+			err = sudoErr
+		case code > 1:
+			err = fmt.Errorf("privileged existence check exited %d: %s", code, strings.TrimSpace(errOut))
+		default:
+			exists, err = code == 0, nil
+		}
+	}
 	if err != nil {
 		return "", "", "", nil, nil, fmt.Errorf("failed to check existence of xray config %s: %w", XrayConfigPath, err)
 	}

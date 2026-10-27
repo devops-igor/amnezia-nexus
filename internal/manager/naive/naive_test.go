@@ -24,6 +24,7 @@ type mockNaiveSSHClient struct {
 	reloaded           int
 	sshUser            string
 	denyConfigDownload bool
+	denyConfigStat     bool
 }
 
 func newMockNaiveSSHClient() *mockNaiveSSHClient {
@@ -83,7 +84,14 @@ func (m *mockNaiveSSHClient) RunSudoCommand(ctx context.Context, cmd string) (st
 		m.reloaded++
 		return "reload successful", "", 0, nil
 	}
-	if strings.HasPrefix(cmd, "cat /opt/amnezia/") {
+	if strings.HasPrefix(cmd, "test -f ") {
+		path := strings.Trim(strings.TrimPrefix(cmd, "test -f "), "'")
+		if _, ok := m.files[path]; ok {
+			return "", "", 0, nil
+		}
+		return "", "", 1, nil
+	}
+	if strings.HasPrefix(cmd, "cat ") && strings.Contains(cmd, "/opt/amnezia/") {
 		for p, data := range m.files {
 			if strings.Contains(cmd, p) {
 				return string(data), "", 0, nil
@@ -142,6 +150,9 @@ func (m *mockNaiveSSHClient) DownloadSudoFile(ctx context.Context, remotePath st
 func (m *mockNaiveSSHClient) FileExists(ctx context.Context, remotePath string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.denyConfigStat && remotePath == NaiveCaddyfilePath {
+		return false, os.ErrPermission
+	}
 	_, ok := m.files[remotePath]
 	return ok, nil
 }

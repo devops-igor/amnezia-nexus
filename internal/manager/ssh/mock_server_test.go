@@ -533,6 +533,16 @@ func (s *MockSSHServer) handleFileCommand(cmd string) (stdout, stderr string, ex
 	}
 
 	switch args[0] {
+	case "test":
+		if len(args) == 3 && args[1] == "-f" {
+			info, err := os.Stat(s.resolvePath(args[2]))
+			if err != nil || !info.Mode().IsRegular() {
+				return "", "", 1, true
+			}
+			return "", "", 0, true
+		}
+		return "", "test: expected -f path", 2, true
+
 	case "mkdir":
 		var paths []string
 		for _, a := range args[1:] {

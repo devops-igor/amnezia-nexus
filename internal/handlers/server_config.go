@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
@@ -171,13 +172,23 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 		h.JSONOK(w)
 		return
 	}
-	if err := client.UploadSudoFile(ctx, configPath, []byte(req.Config), 0644); err != nil {
+	if err := client.UploadSudoFile(ctx, configPath, []byte(req.Config), rawConfigMode(req.Protocol)); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "save_failed", "Failed to save config")
 		return
 	}
 
 	h.audit(r, "server.config_save", map[string]any{"server_id": serverID, "protocol": req.Protocol})
 	h.JSONOK(w)
+}
+
+// rawConfigMode returns 0600 for secret-bearing configs (Xray config.json, Caddyfile credentials)
+// so a raw save never loosens the restrictive mode applied at install time.
+func rawConfigMode(protocol string) os.FileMode {
+	switch models.NormalizeProtocol(protocol) {
+	case models.ProtocolVLESS, models.ProtocolNaive:
+		return 0600
+	}
+	return 0644
 }
 
 func (h *Handlers) reconcileAWGServerIdentity(ctx context.Context, server *models.Server, config string) error {

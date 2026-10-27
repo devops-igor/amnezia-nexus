@@ -85,7 +85,8 @@ func (r *provisioningRig) addConnection(t *testing.T) int {
 	t.Helper()
 	body, _ := json.Marshal(models.MyAddConnectionRequest{ServerID: r.sID, Protocol: r.proto, Name: "inflight"})
 	req := httptest.NewRequest(http.MethodPost, "/api/connections/add", bytes.NewReader(body))
-	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: r.userID, Role: models.RoleUser}))
+	// VLESS/Naive self-service provisioning is admin-only; the session keeps the target user's ID.
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: r.userID, Role: models.RoleAdmin}))
 	w := httptest.NewRecorder()
 	setupFullConnectionsRouter(r.h).ServeHTTP(w, req)
 	return w.Code

@@ -160,6 +160,12 @@ func (h *Handlers) UserAddConnectionHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	proto := models.NormalizeProtocol(req.Protocol)
+	if (proto == models.ProtocolVLESS || proto == models.ProtocolNaive) && sess.Role != models.RoleAdmin {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required for VLESS and Naive protocols")
+		return
+	}
+
 	ctx := r.Context()
 	user, err := h.db.GetUser(ctx, sess.UserID)
 	if err != nil || user == nil {
@@ -408,6 +414,11 @@ func (h *Handlers) UserGetConnectionConfigHandler(w http.ResponseWriter, r *http
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
 		return
 	}
+	proto := models.NormalizeProtocol(conn.Protocol)
+	if (proto == models.ProtocolVLESS || proto == models.ProtocolNaive) && sess.Role != models.RoleAdmin {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required for VLESS and Naive protocols")
+		return
+	}
 
 	if conn.ServerID == 0 {
 		if h.vpnSvc == nil {
@@ -548,6 +559,11 @@ func (h *Handlers) UserDeleteConnectionHandler(w http.ResponseWriter, r *http.Re
 	}
 	if sess.Role != models.RoleAdmin && sess.Role != models.RoleSupport && conn.UserID != sess.UserID {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
+		return
+	}
+	proto := models.NormalizeProtocol(conn.Protocol)
+	if (proto == models.ProtocolVLESS || proto == models.ProtocolNaive) && sess.Role != models.RoleAdmin {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required for VLESS and Naive protocols")
 		return
 	}
 

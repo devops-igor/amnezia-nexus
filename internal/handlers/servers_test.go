@@ -354,7 +354,7 @@ func TestServerHandlers(t *testing.T) {
 		}
 	})
 
-	t.Run("SaveServerConfigHandler Uses Manager-Readable Modes", func(t *testing.T) {
+	t.Run("SaveServerConfigHandler Uses Secret-File Modes", func(t *testing.T) {
 		for _, protocol := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
 			body, _ := json.Marshal(models.ServerConfigSaveRequest{Protocol: protocol, Config: "valid raw config"})
 			req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/server_config/save", serverID), bytes.NewReader(body))
@@ -364,8 +364,8 @@ func TestServerHandlers(t *testing.T) {
 			if w.Code != http.StatusOK {
 				t.Fatalf("expected 200 saving %s config, got %d", protocol, w.Code)
 			}
-			if mockSSH.uploadSudoMode != 0644 {
-				t.Errorf("expected %s config mode 0644, got %04o", protocol, mockSSH.uploadSudoMode)
+			if mockSSH.uploadSudoMode != 0600 {
+				t.Errorf("expected %s config mode 0600, got %04o", protocol, mockSSH.uploadSudoMode)
 			}
 		}
 	})

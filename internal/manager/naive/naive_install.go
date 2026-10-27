@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -56,6 +57,18 @@ func parseNaiveInstallOptions(params map[string]any, defaultHost string) (int, s
 
 func (m *NaiveManager) resolveExistingClients(ctx context.Context, client ssh.SSHClient) ([]NaiveClient, error) {
 	exists, err := client.FileExists(ctx, NaiveCaddyfilePath)
+	if errors.Is(err, os.ErrPermission) {
+		testCmd := fmt.Sprintf("test -f %s", ssh.EscapeShellArg(NaiveCaddyfilePath))
+		_, errOut, code, sudoErr := client.RunSudoCommand(ctx, testCmd)
+		switch {
+		case sudoErr != nil:
+			err = sudoErr
+		case code > 1:
+			err = fmt.Errorf("privileged existence check exited %d: %s", code, strings.TrimSpace(errOut))
+		default:
+			exists, err = code == 0, nil
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to check existence of Caddyfile %s: %w", NaiveCaddyfilePath, err)
 	}
