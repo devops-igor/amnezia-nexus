@@ -516,6 +516,15 @@ func (h *Handlers) ServerCheckHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func setProtocolPortFallback(protoMeta map[string]any, requestPort string) {
+	if protoMeta["port"] != nil && protoMeta["port"] != "" {
+		return
+	}
+	if requestPort != "" {
+		protoMeta["port"] = requestPort
+	}
+}
+
 // InstallProtocolHandler deploys a VPN protocol backend to the remote server.
 func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request) {
 	serverID, err := parseServerID(r)
@@ -607,11 +616,7 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 		protoMeta = make(map[string]any)
 	}
 	protoMeta["installed"] = true
-	if protoMeta["port"] == nil || protoMeta["port"] == "" {
-		if req.Port != "" {
-			protoMeta["port"] = req.Port
-		}
-	}
+	setProtocolPortFallback(protoMeta, req.Port)
 	server.Protocols[req.Protocol] = protoMeta
 	if err := h.db.UpdateServerProtocols(ctx, serverID, server.Protocols); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to update server protocols")
