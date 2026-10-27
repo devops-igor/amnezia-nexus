@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -410,13 +411,18 @@ func (s *MockSSHServer) dispatchCommand(cmd string, stdin []byte) (stdout, stder
 		if strings.Contains(cmd, "echo") {
 			return "success", "", 0
 		}
-		if strings.Contains(cmd, "mv ") || strings.Contains(cmd, "mkdir ") || strings.Contains(cmd, "chmod ") || strings.Contains(cmd, "chown ") || strings.Contains(cmd, "rm ") {
-			return "", "", 0
+		if out, errStr, code, handled := s.handleFileCommand(cmd); handled {
+			return out, errStr, code
 		}
 		return "sudo executed", "", 0
 	}
 
-	// 4. Explicit test exit codes
+	// 4. File commands without sudo (e.g. root)
+	if out, errStr, code, handled := s.handleFileCommand(cmd); handled {
+		return out, errStr, code
+	}
+
+	// 5. Explicit test exit codes
 	if strings.Contains(trimmed, "exit 42") {
 		return "", "custom error", 42
 	}
@@ -425,13 +431,193 @@ func (s *MockSSHServer) dispatchCommand(cmd string, stdin []byte) (stdout, stder
 		return "", "failure", 1
 	}
 
-	// 5. Command existence checks (command -v ...)
+	// 6. Command existence checks (command -v ...)
 	if strings.HasPrefix(trimmed, "command -v") {
 		return "", "not found", 1
 	}
 
-	// 6. Default fallback
+	// 7. Default fallback
 	return "", "", 0
+}
+
+func unwrapCommand(cmd string) string {
+	trimmed := strings.TrimSpace(cmd)
+	const bashPrefix = "/bin/bash -c "
+	if idx := strings.Index(trimmed, bashPrefix); idx != -1 {
+		sub := strings.TrimSpace(trimmed[idx+len(bashPrefix):])
+		if strings.HasPrefix(sub, "'") && strings.HasSuffix(sub, "'") && len(sub) >= 2 {
+			sub = sub[1 : len(sub)-1]
+			sub = strings.ReplaceAll(sub, `'\''`, `'`)
+		}
+		return strings.TrimSpace(sub)
+	}
+	if strings.HasPrefix(trimmed, "sudo ") {
+		trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "sudo "))
+	}
+	return trimmed
+}
+
+func splitShellArgs(cmd string) []string {
+	var args []string
+	var current strings.Builder
+	inSingleQuote := false
+	inDoubleQuote := false
+	escaped := false
+
+	for i := 0; i < len(cmd); i++ {
+		ch := cmd[i]
+		if escaped {
+			current.WriteByte(ch)
+			escaped = false
+			continue
+		}
+		if ch == '\\' && !inSingleQuote {
+			escaped = true
+			continue
+		}
+		if ch == '\'' && !inDoubleQuote {
+			inSingleQuote = !inSingleQuote
+			continue
+		}
+		if ch == '"' && !inSingleQuote {
+			inDoubleQuote = !inDoubleQuote
+			continue
+		}
+		if (ch == ' ' || ch == '	') && !inSingleQuote && !inDoubleQuote {
+			if current.Len() > 0 {
+				args = append(args, current.String())
+				current.Reset()
+			}
+			continue
+		}
+		current.WriteByte(ch)
+	}
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+	return args
+}
+
+func moveFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(src)
+	mode := os.FileMode(0644)
+	if err == nil {
+		mode = info.Mode()
+	}
+	if err := os.WriteFile(dst, data, mode); err != nil {
+		return err
+	}
+	_ = os.Remove(src)
+	return nil
+}
+
+func (s *MockSSHServer) resolvePath(p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(s.baseDir, p)
+}
+
+func (s *MockSSHServer) handleFileCommand(cmd string) (stdout, stderr string, exitCode int, handled bool) {
+	unwrapped := unwrapCommand(cmd)
+	args := splitShellArgs(unwrapped)
+	if len(args) == 0 {
+		return "", "", 0, false
+	}
+
+	switch args[0] {
+	case "mkdir":
+		var paths []string
+		for _, a := range args[1:] {
+			if strings.HasPrefix(a, "-") {
+				continue
+			}
+			if a == ">" || a == ">>" || a == "<" || a == "|" || a == "&&" || a == "||" || a == ";" || strings.HasPrefix(a, "2>") || strings.HasPrefix(a, "1>") {
+				break
+			}
+			paths = append(paths, a)
+		}
+		for _, p := range paths {
+			_ = os.MkdirAll(s.resolvePath(p), 0755)
+		}
+		return "", "", 0, true
+
+	case "mv":
+		var paths []string
+		for _, a := range args[1:] {
+			if strings.HasPrefix(a, "-") {
+				continue
+			}
+			if a == ">" || a == ">>" || a == "<" || a == "|" || a == "&&" || a == "||" || a == ";" || strings.HasPrefix(a, "2>") || strings.HasPrefix(a, "1>") {
+				break
+			}
+			paths = append(paths, a)
+		}
+		if len(paths) >= 2 {
+			src := s.resolvePath(paths[0])
+			dst := s.resolvePath(paths[1])
+			if st, err := os.Stat(dst); err == nil && st.IsDir() {
+				dst = filepath.Join(dst, filepath.Base(src))
+			}
+			_ = os.MkdirAll(filepath.Dir(dst), 0755)
+			if _, err := os.Stat(src); err == nil {
+				if err := moveFile(src, dst); err != nil {
+					return "", err.Error(), 1, true
+				}
+			}
+			return "", "", 0, true
+		}
+		return "", "mv: missing operand", 1, true
+
+	case "rm":
+		var paths []string
+		for _, a := range args[1:] {
+			if strings.HasPrefix(a, "-") {
+				continue
+			}
+			if a == ">" || a == ">>" || a == "<" || a == "|" || a == "&&" || a == "||" || a == ";" || strings.HasPrefix(a, "2>") || strings.HasPrefix(a, "1>") {
+				break
+			}
+			paths = append(paths, a)
+		}
+		for _, p := range paths {
+			_ = os.RemoveAll(s.resolvePath(p))
+		}
+		return "", "", 0, true
+
+	case "chmod":
+		var nonFlags []string
+		for _, a := range args[1:] {
+			if strings.HasPrefix(a, "-") {
+				continue
+			}
+			if a == ">" || a == ">>" || a == "<" || a == "|" || a == "&&" || a == "||" || a == ";" || strings.HasPrefix(a, "2>") || strings.HasPrefix(a, "1>") {
+				break
+			}
+			nonFlags = append(nonFlags, a)
+		}
+		if len(nonFlags) >= 2 {
+			if perm, err := strconv.ParseUint(nonFlags[0], 8, 32); err == nil {
+				for _, p := range nonFlags[1:] {
+					_ = os.Chmod(s.resolvePath(p), os.FileMode(perm))
+				}
+			}
+		}
+		return "", "", 0, true
+
+	case "chown":
+		return "", "", 0, true
+
+	default:
+		return "", "", 0, false
+	}
 }
 
 func (s *MockSSHServer) handleSFTP(ch gossh.Channel) {
