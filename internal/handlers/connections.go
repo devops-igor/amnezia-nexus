@@ -543,7 +543,10 @@ func (h *Handlers) UserDeleteConnectionHandler(w http.ResponseWriter, r *http.Re
 		server, err := h.db.GetServer(ctx, conn.ServerID)
 		if err == nil && server != nil {
 			if protoMgr, err := h.GetProtocolManager(conn.Protocol); err == nil && protoMgr != nil {
-				_ = protoMgr.RemoveClient(ctx, server, conn.ClientID)
+				if err := protoMgr.RemoveClient(ctx, server, conn.ClientID); err != nil {
+					h.JSONError(w, http.StatusInternalServerError, "remote_removal_failed", "Failed to remove remote client credentials: "+err.Error())
+					return
+				}
 			}
 		}
 	}
