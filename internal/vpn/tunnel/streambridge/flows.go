@@ -152,9 +152,29 @@ func (d *Device) runTCPFlow(inConn *gonet.TCPConn, outConn net.Conn) {
 		})
 	}
 
+	var (
+		halfCloseMu    sync.Mutex
+		halfCloseTimer *time.Timer
+	)
+	startHalfCloseTimer := func() {
+		halfCloseMu.Lock()
+		defer halfCloseMu.Unlock()
+		if halfCloseTimer == nil {
+			halfCloseTimer = time.AfterFunc(d.cfg.TCPHalfCloseTimeout, closeBoth)
+		}
+	}
+	stopHalfCloseTimer := func() {
+		halfCloseMu.Lock()
+		defer halfCloseMu.Unlock()
+		if halfCloseTimer != nil {
+			halfCloseTimer.Stop()
+		}
+	}
+
 	stopAfter := context.AfterFunc(d.ctx, closeBoth)
 	defer func() {
 		stopAfter()
+		stopHalfCloseTimer()
 		closeBoth()
 		d.release()
 	}()
@@ -179,6 +199,7 @@ func (d *Device) runTCPFlow(inConn *gonet.TCPConn, outConn net.Conn) {
 			_ = cw.CloseWrite()
 		}
 		_ = outConn.SetReadDeadline(time.Now().Add(d.cfg.TCPHalfCloseTimeout))
+		startHalfCloseTimer()
 	}()
 
 	// outbound -> client
@@ -196,6 +217,7 @@ func (d *Device) runTCPFlow(inConn *gonet.TCPConn, outConn net.Conn) {
 
 		_ = inConn.CloseWrite()
 		_ = inConn.SetReadDeadline(time.Now().Add(d.cfg.TCPHalfCloseTimeout))
+		startHalfCloseTimer()
 	}()
 
 	copyWg.Wait()

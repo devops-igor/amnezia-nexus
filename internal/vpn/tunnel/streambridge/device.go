@@ -82,6 +82,7 @@ type Device struct {
 	wg                       sync.WaitGroup
 	gateMu                   sync.RWMutex
 	closed                   atomic.Bool
+	closeDone                chan struct{}
 	pendingHandshakes        atomic.Int32
 	beforeCreateEndpointHook func()
 	createdAt                time.Time
@@ -99,6 +100,9 @@ func New(cfg Config, d StreamDialer) (*Device, error) {
 	}
 	if cfg.MaxFlows <= 0 {
 		cfg.MaxFlows = DefaultMaxFlows
+	}
+	if cfg.MaxFlows > MaxFlowsPerBackend {
+		cfg.MaxFlows = MaxFlowsPerBackend
 	}
 	if cfg.QueueLen <= 0 {
 		cfg.QueueLen = DefaultQueueLen
@@ -119,6 +123,7 @@ func New(cfg Config, d StreamDialer) (*Device, error) {
 		cfg:       cfg,
 		dialer:    d,
 		slots:     make(chan struct{}, cfg.MaxFlows),
+		closeDone: make(chan struct{}),
 		ctx:       ctx,
 		cancel:    cancel,
 		createdAt: time.Now(),
@@ -253,6 +258,9 @@ func (d *Device) Close() error {
 	d.gateMu.Lock()
 	if !d.closed.CompareAndSwap(false, true) {
 		d.gateMu.Unlock()
+		if d.closeDone != nil {
+			<-d.closeDone
+		}
 		return nil
 	}
 	d.cancel()
@@ -274,6 +282,9 @@ func (d *Device) Close() error {
 	d.ep.Close()
 	d.stack.Close()
 	d.stack.Wait()
+	if d.closeDone != nil {
+		close(d.closeDone)
+	}
 	return nil
 }
 
