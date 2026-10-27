@@ -88,8 +88,9 @@ func (h *Handlers) GetServerConnectionsHandler(w http.ResponseWriter, r *http.Re
 			client["clientId"] = ""
 			client["client_id"] = ""
 			client["uuid"] = ""
-			// Xray uses the authentication UUID as the display name for unassigned clients.
-			if client["assigned_user_id"] == nil || client["assigned_user_id"] == "" {
+			name, _ := client["name"].(string)
+			unassigned := client["assigned_user_id"] == nil || client["assigned_user_id"] == ""
+			if unassigned || safeVLESSDisplayName(name, cid) == "Unnamed" {
 				client["name"] = "Unnamed"
 				if ud, ok := client["userData"].(map[string]any); ok {
 					ud["clientName"] = "Unnamed"
@@ -426,6 +427,9 @@ func (h *Handlers) editAWGParams(ctx context.Context, server *models.Server, req
 
 func (h *Handlers) editConnectionBinding(ctx context.Context, serverID int64, req *models.EditConnectionRequest, matchingConn *models.UserConnection) error {
 	connName := req.ClientID
+	if models.NormalizeProtocol(req.Protocol) == models.ProtocolVLESS {
+		connName = "Unnamed"
+	}
 	if req.Name != nil && *req.Name != "" {
 		connName = *req.Name
 	} else if matchingConn != nil && matchingConn.Name != "" {

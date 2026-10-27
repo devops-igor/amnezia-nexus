@@ -774,8 +774,10 @@ func (h *Handlers) GetUserConnectionsHandler(w http.ResponseWriter, r *http.Requ
 			}
 		}
 		clientID := c.ClientID
+		connName := c.Name
 		if models.NormalizeProtocol(c.Protocol) == models.ProtocolVLESS && sess.Role != models.RoleAdmin {
 			clientID = ""
+			connName = safeVLESSDisplayName(connName, c.ClientID)
 		}
 		enriched[i] = map[string]any{
 			"id":               c.ID,
@@ -784,7 +786,7 @@ func (h *Handlers) GetUserConnectionsHandler(w http.ResponseWriter, r *http.Requ
 			"server_name":      srvName,
 			"protocol":         c.Protocol,
 			"client_id":        clientID,
-			"name":             c.Name,
+			"name":             connName,
 			"awg_mimicry":      c.AWGMimicry,
 			"traffic_total_rx": c.TrafficTotalRx,
 			"traffic_total_tx": c.TrafficTotalTx,

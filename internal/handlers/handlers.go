@@ -252,6 +252,14 @@ func resolveClientID(result map[string]any) string {
 	return cid
 }
 
+// safeVLESSDisplayName hides empty and credential-derived VLESS display names.
+func safeVLESSDisplayName(name, clientID string) string {
+	if name == "" || strings.EqualFold(name, clientID) || (clientID != "" && strings.Contains(name, clientID)) {
+		return "Unnamed"
+	}
+	return name
+}
+
 // buildConnectionParams aggregates protocol and optional telemt params.
 func buildConnectionParams(name string, quota *string, maxIPs *int, expiry *string, mimicry *string) map[string]any {
 	params := map[string]any{"name": name}

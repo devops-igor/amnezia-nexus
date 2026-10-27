@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -415,5 +416,137 @@ func TestResourceRBACClosureBackup(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestResourceRBACClosureAssignedVLESSNameRedaction(t *testing.T) {
+	h, db, serverID := setupResourceRBACClosure(t)
+	ctx := context.Background()
+	const credential = "7f2d1290-7953-4f69-a85e-363087c0f331"
+	shareToken := "assigned-vless-share-token"
+	user := &models.User{
+		ID:           "assigned-vless-user",
+		Username:     "assigned-vless-user",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		ShareEnabled: true,
+		ShareToken:   &shareToken,
+		CreatedAt:    time.Now(),
+	}
+	if _, err := db.CreateUser(ctx, user); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if err := db.RecordPeerLifecycle(ctx, serverID, models.ProtocolVLESS, credential, credential, "", "active"); err != nil {
+		t.Fatalf("RecordPeerLifecycle: %v", err)
+	}
+	h.registry.Register(&mockProtocolManager{
+		protocol: models.ProtocolVLESS,
+		getClientsFn: func(context.Context, *models.Server) ([]map[string]any, error) {
+			return []map[string]any{{
+				"clientId":  credential,
+				"client_id": credential,
+				"uuid":      credential,
+				"name":      credential,
+				"userData":  map[string]any{"clientName": credential},
+			}}, nil
+		},
+	})
+
+	serverRouter := setupFullServerConnectionsRouter(h)
+	serverRouter.Get("/{server_id}/connections", h.GetServerConnectionsHandler)
+	editPath := fmt.Sprintf("/api/servers/%d/connections/edit", serverID)
+	w := resourceRBACRequest(t, serverRouter, http.MethodPost, editPath, resourceRBACSession(models.RoleAdmin), models.EditConnectionRequest{
+		Protocol: models.ProtocolVLESS,
+		ClientID: credential,
+		UserID:   &user.ID,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("edit status = %d; body: %s", w.Code, w.Body.String())
+	}
+	conn, err := db.GetConnectionByClientID(ctx, credential, serverID)
+	if err != nil || conn == nil {
+		t.Fatalf("GetConnectionByClientID: conn=%v err=%v", conn, err)
+	}
+	if conn.Name != "Unnamed" {
+		t.Fatalf("persisted name = %q, want Unnamed", conn.Name)
+	}
+
+	// Exercise rows persisted before the writer fix, including embedded credentials.
+	if _, err := db.UpdateConnection(ctx, conn.ID, map[string]any{"name": "device-" + credential}); err != nil {
+		t.Fatalf("UpdateConnection: %v", err)
+	}
+	connectionsRouter := setupFullConnectionsRouter(h)
+	connectionsRouter.Get("/api/connections/", h.UserGetMyConnectionsHandler)
+	userSession := resourceRBACSession(models.RoleUser)
+	userSession.UserID = user.ID
+	adminSession := resourceRBACSession(models.RoleAdmin)
+	adminSession.UserID = user.ID
+	tests := []struct {
+		name      string
+		router    http.Handler
+		path      string
+		sess      *models.SessionData
+		adminSess *models.SessionData
+	}{
+		{
+			name: "server connections", router: serverRouter,
+			path: fmt.Sprintf("/api/servers/%d/connections?protocol=vless", serverID),
+			sess: resourceRBACSession(models.RoleSupport), adminSess: resourceRBACSession(models.RoleAdmin),
+		},
+		{
+			name: "server connections alias", router: serverRouter,
+			path: fmt.Sprintf("/%d/connections?protocol=vless", serverID),
+			sess: resourceRBACSession(models.RoleSupport), adminSess: resourceRBACSession(models.RoleAdmin),
+		},
+		{
+			name: "staff user connections", router: setupFullUsersRouter(h),
+			path: "/api/users/" + user.ID + "/connections",
+			sess: resourceRBACSession(models.RoleSupport), adminSess: resourceRBACSession(models.RoleAdmin),
+		},
+		{
+			name: "self connections", router: connectionsRouter, path: "/api/connections/",
+			sess: userSession, adminSess: adminSession,
+		},
+		{
+			name: "public share", router: setupFullShareRouter(h),
+			path: "/api/share/" + shareToken + "/connections",
+		},
+		{
+			name: "backup", router: setupFullSettingsRouter(h), path: "/api/settings/backup/download",
+			sess: resourceRBACSession(models.RoleSupport), adminSess: resourceRBACSession(models.RoleAdmin),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			checks := []struct {
+				name           string
+				sess           *models.SessionData
+				wantCredential bool
+			}{{name: "redacted", sess: tc.sess}}
+			if tc.adminSess != nil {
+				checks = append(checks, struct {
+					name           string
+					sess           *models.SessionData
+					wantCredential bool
+				}{name: "admin", sess: tc.adminSess, wantCredential: true})
+			}
+			for _, check := range checks {
+				w := resourceRBACRequest(t, tc.router, http.MethodGet, tc.path, check.sess, nil)
+				if w.Code != http.StatusOK {
+					t.Fatalf("%s status = %d; body: %s", check.name, w.Code, w.Body.String())
+				}
+				if got := strings.Contains(w.Body.String(), credential); got != check.wantCredential {
+					t.Errorf("%s credential presence = %v, want %v; body: %s", check.name, got, check.wantCredential, w.Body.String())
+				}
+			}
+		})
+	}
+
+	if _, err := db.UpdateConnection(ctx, conn.ID, map[string]any{"name": "My Phone"}); err != nil {
+		t.Fatalf("UpdateConnection friendly name: %v", err)
+	}
+	w = resourceRBACRequest(t, setupFullUsersRouter(h), http.MethodGet, "/api/users/"+user.ID+"/connections", resourceRBACSession(models.RoleSupport), nil)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"name":"My Phone"`) {
+		t.Errorf("friendly name was not preserved: status=%d body=%s", w.Code, w.Body.String())
 	}
 }

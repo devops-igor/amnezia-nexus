@@ -130,12 +130,14 @@ func (h *Handlers) GetShareConnectionsHandler(w http.ResponseWriter, r *http.Req
 			srvName = fmt.Sprintf("Server #%d", c.ServerID)
 		}
 		clientID := c.ClientID
+		connName := c.Name
 		if models.NormalizeProtocol(c.Protocol) == models.ProtocolVLESS {
 			clientID = ""
+			connName = safeVLESSDisplayName(connName, c.ClientID)
 		}
 		enriched[i] = map[string]any{
 			"id":          c.ID,
-			"name":        c.Name,
+			"name":        connName,
 			"protocol":    c.Protocol,
 			"server_name": srvName,
 			"server_id":   c.ServerID,
