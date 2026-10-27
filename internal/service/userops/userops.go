@@ -136,6 +136,7 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 
 	serverOps := make(map[int64]*serverOperations)
 	var opsMu sync.Mutex
+	var toggleFailures sync.Map
 
 	getOps := func(serverID int64) *serverOperations {
 		opsMu.Lock()
@@ -170,6 +171,7 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 		conns, err := s.db.GetConnectionsByUserID(ctx, t.UserID)
 		if err != nil {
 			slog.Warn("Failed to fetch connections for user toggle", "user_id", t.UserID, "err", err)
+			toggleFailures.Store(t.UserID, fmt.Errorf("fetch connections for user %s: %w", t.UserID, err))
 			continue
 		}
 		for _, c := range conns {
@@ -195,9 +197,12 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 			defer func() {
 				if r := recover(); r != nil {
 					slog.Error("Panic recovered in userops server worker", "server_id", sID, "panic", r)
+					for _, t := range sOps.toggles {
+						toggleFailures.Store(t.conn.UserID, fmt.Errorf("toggle client on server %d: panic: %v", sID, r))
+					}
 				}
 			}()
-			s.runServerOperations(gCtx, sID, sOps)
+			s.runServerOperations(gCtx, sID, sOps, &toggleFailures)
 			return nil
 		})
 	}
@@ -219,20 +224,31 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 		}
 	}
 
+	toggleErrs := make([]error, 0)
 	for _, t := range req.ToggleUIDs {
+		if failure, failed := toggleFailures.Load(t.UserID); failed {
+			toggleErrs = append(toggleErrs, failure.(error))
+			continue
+		}
 		_, err := s.db.UpdateUser(ctx, t.UserID, map[string]any{"enabled": t.Enabled})
 		if err != nil {
 			slog.Warn("Failed to update user enabled status", "user_id", t.UserID, "err", err)
 		}
 	}
 
-	return nil
+	return errors.Join(toggleErrs...)
 }
 
-func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *serverOperations) {
+func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *serverOperations, toggleFailures *sync.Map) {
 	server, err := s.db.GetServer(ctx, serverID)
 	if err != nil || server == nil {
 		slog.Warn("Server not found for mass operations", "server_id", serverID, "err", err)
+		if err == nil {
+			err = errors.New("server not found")
+		}
+		for _, t := range ops.toggles {
+			toggleFailures.Store(t.conn.UserID, fmt.Errorf("get server %d: %w", serverID, err))
+		}
 		return
 	}
 
@@ -260,24 +276,7 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 	}
 
 	// 2. Toggles
-	for _, t := range ops.toggles {
-		proto := models.NormalizeProtocol(t.conn.Protocol)
-		if s.registry != nil {
-			if mgr, ok := s.registry.Get(proto); ok {
-				if toggler, ok := mgr.(ClientToggler); ok {
-					if err := toggler.ToggleClient(ctx, server, t.conn.ClientID, t.enabled); err != nil {
-						slog.Warn("Failed to toggle remote client",
-							"server_id", serverID,
-							"protocol", proto,
-							"client_id", t.conn.ClientID,
-							"enabled", t.enabled,
-							"err", err,
-						)
-					}
-				}
-			}
-		}
-	}
+	s.runToggleOperations(ctx, server, ops.toggles, toggleFailures)
 
 	// 3. Creates
 	for _, cReq := range ops.creates {
@@ -342,6 +341,54 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 				}
 			}
 		}
+	}
+}
+
+func (s *Service) runToggleOperations(
+	ctx context.Context,
+	server *models.Server,
+	toggles []connToggle,
+	toggleFailures *sync.Map,
+) {
+	recordFailure := func(t connToggle, proto string, err error) {
+		slog.Warn("Failed to update remote client",
+			"server_id", server.ID,
+			"protocol", proto,
+			"client_id", t.conn.ClientID,
+			"enabled", t.enabled,
+			"err", err,
+		)
+		toggleFailures.Store(t.conn.UserID, fmt.Errorf("update %s client on server %d: %w", proto, server.ID, err))
+	}
+	for _, t := range toggles {
+		proto := models.NormalizeProtocol(t.conn.Protocol)
+		var mgr manager.ProtocolManager
+		var ok bool
+		if s.registry != nil {
+			mgr, ok = s.registry.Get(proto)
+		}
+		if !ok {
+			recordFailure(t, proto, errors.New("protocol manager is not configured"))
+			continue
+		}
+		if toggler, ok := mgr.(ClientToggler); ok {
+			if err := toggler.ToggleClient(ctx, server, t.conn.ClientID, t.enabled); err != nil {
+				recordFailure(t, proto, err)
+			}
+			continue
+		}
+		if t.enabled {
+			continue
+		}
+		if err := mgr.RemoveClient(ctx, server, t.conn.ClientID); err != nil {
+			recordFailure(t, proto, err)
+			continue
+		}
+		if _, err := s.db.DeleteConnection(ctx, t.conn.ID); err != nil {
+			recordFailure(t, proto, fmt.Errorf("delete withdrawn connection: %w", err))
+			continue
+		}
+		_ = s.db.DeletePeerLifecycle(ctx, t.conn.ServerID, t.conn.Protocol, t.conn.ClientID)
 	}
 }
 
