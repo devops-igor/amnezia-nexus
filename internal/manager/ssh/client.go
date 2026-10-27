@@ -306,14 +306,27 @@ func (c *Client) UploadFile(ctx context.Context, remotePath string, content []by
 func (c *Client) UploadSudoFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error {
 	defer c.startOp()()
 
-	tmpPath := GenerateRandomTempPath("upload")
-	// Registered before the upload and bound to an independent context so a failed or
+	stagingDir := GenerateRandomTempPath("stage")
+	// Registered before staging and bound to an independent context so a failed or
 	// canceled upload still removes any partially staged secret from /tmp.
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, _, _, _ = c.RunSudoCommand(cleanupCtx, fmt.Sprintf("rm -f %s", EscapeShellArg(tmpPath)))
+		_, _, _, _ = c.RunSudoCommand(cleanupCtx, fmt.Sprintf("rm -rf %s", EscapeShellArg(stagingDir)))
 	}()
+
+	// Pre-create a private directory and inode so SFTP truncation never exposes the payload
+	// through the server's default umask between open and chmod.
+	mkdirCmd := fmt.Sprintf("umask 077 && mkdir -p %s && chmod 0700 %s", EscapeShellArg(stagingDir), EscapeShellArg(stagingDir))
+	if _, _, code, err := c.RunCommand(ctx, mkdirCmd); err != nil || code != 0 {
+		return fmt.Errorf("failed to create secure staging directory %s (code %d): %w", stagingDir, code, err)
+	}
+
+	tmpPath := path.Join(stagingDir, "payload")
+	precreateCmd := fmt.Sprintf("umask 077 && install -m 0600 /dev/null %s", EscapeShellArg(tmpPath))
+	if _, _, code, err := c.RunCommand(ctx, precreateCmd); err != nil || code != 0 {
+		return fmt.Errorf("failed to pre-create secure staging file %s (code %d): %w", tmpPath, code, err)
+	}
 
 	if err := c.UploadFile(ctx, tmpPath, content, 0600); err != nil {
 		return fmt.Errorf("failed to upload temporary file: %w", err)

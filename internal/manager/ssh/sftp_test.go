@@ -180,7 +180,7 @@ func TestUploadSudoFile_CleansStagingOnFailedUpload(t *testing.T) {
 	defer server.Close()
 
 	removed := make(chan string, 1)
-	server.SetCommandHandler("rm -f '/tmp/_upload_", func(cmd string, _ []byte) (string, string, int) {
+	server.SetCommandHandler("rm -rf '/tmp/_stage_", func(cmd string, _ []byte) (string, string, int) {
 		removed <- cmd
 		return "", "", 0
 	})
@@ -203,10 +203,10 @@ func TestUploadSudoFile_CleansStagingOnFailedUpload(t *testing.T) {
 
 	select {
 	case cmd := <-removed:
-		if !strings.HasPrefix(cmd, "rm -f '/tmp/_upload_") {
+		if !strings.HasPrefix(cmd, "rm -rf '/tmp/_stage_") {
 			t.Fatalf("unexpected cleanup command %q", cmd)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("staging file cleanup (rm -f) was not issued after failed upload")
+		t.Fatal("staging directory cleanup (rm -rf) was not issued after failed upload")
 	}
 }

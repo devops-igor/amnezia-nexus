@@ -3,6 +3,7 @@ package ssh
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -553,6 +554,70 @@ func TestClient_ConcurrentRunCommands(t *testing.T) {
 	}
 }
 
+func TestClient_UploadSudoFile_PrivateStagingBeforeUpload(t *testing.T) {
+	server := NewMockSSHServer(t, "root", "pass")
+	defer server.Close()
+
+	var mu sync.Mutex
+	var events []string
+	record := func(event string) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, event)
+	}
+	server.SetCommandHandler("umask 077 && mkdir -p '/tmp/_stage_", func(cmd string, _ []byte) (string, string, int) {
+		if !strings.Contains(cmd, "&& chmod 0700 '/tmp/_stage_") {
+			t.Errorf("staging directory is not private: %q", cmd)
+		}
+		record("mkdir")
+		return "", "", 0
+	})
+	server.SetCommandHandler("umask 077 && install -m 0600 /dev/null '/tmp/_stage_", func(cmd string, _ []byte) (string, string, int) {
+		record("precreate")
+		return "", "", 0
+	})
+	server.SetCommandHandler("mv '/tmp/_stage_", func(cmd string, _ []byte) (string, string, int) {
+		mu.Lock()
+		beforeMove := append([]string(nil), events...)
+		mu.Unlock()
+		if len(beforeMove) != 2 || beforeMove[0] != "mkdir" || beforeMove[1] != "precreate" {
+			t.Errorf("secure staging commands did not precede upload: %v", beforeMove)
+		}
+		args := splitShellArgs(unwrapCommand(cmd))
+		if len(args) != 3 {
+			t.Errorf("unexpected mv command: %q", cmd)
+		} else if payload, err := os.ReadFile(args[1]); err != nil || string(payload) != "secret" {
+			t.Errorf("payload was not uploaded after secure staging: %v, %q", err, payload)
+		}
+		record("move")
+		return "", "", 0
+	})
+	server.SetCommandHandler("rm -rf '/tmp/_stage_", func(_ string, _ []byte) (string, string, int) {
+		record("cleanup")
+		return "", "", 0
+	})
+
+	client, err := Dial(context.Background(), Config{
+		Host: server.Host(), Port: server.Port(), User: "root", Password: "pass",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.UploadSudoFile(context.Background(), "/etc/amnezia/x.conf", []byte("secret"), 0600); err != nil {
+		t.Fatalf("UploadSudoFile: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"mkdir", "precreate", "move", "cleanup"}
+	if fmt.Sprint(events) != fmt.Sprint(want) {
+		t.Fatalf("unexpected staging lifecycle: got %v, want %v", events, want)
+	}
+}
+
 func TestClient_UploadSudoFile_CleanupOnMoveFailure(t *testing.T) {
 	server := NewMockSSHServer(t, "ubuntu", "ubuntuPass")
 	defer server.Close()
@@ -579,7 +644,7 @@ func TestClient_UploadSudoFile_CleanupOnMoveFailure(t *testing.T) {
 
 	var rmCalled bool
 	var rmMu sync.Mutex
-	server.SetCommandHandler("sudo -S -p '' -- /bin/bash -c 'rm -f", func(cmd string, stdin []byte) (string, string, int) {
+	server.SetCommandHandler("sudo -S -p '' -- /bin/bash -c 'rm -rf", func(cmd string, stdin []byte) (string, string, int) {
 		rmMu.Lock()
 		rmCalled = true
 		rmMu.Unlock()
@@ -597,7 +662,7 @@ func TestClient_UploadSudoFile_CleanupOnMoveFailure(t *testing.T) {
 	rmMu.Unlock()
 
 	if !wasRmCalled {
-		t.Fatal("expected temporary file cleanup via rm -f after mv failure")
+		t.Fatal("expected staging directory cleanup via rm -rf after mv failure")
 	}
 }
 
