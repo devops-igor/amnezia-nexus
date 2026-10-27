@@ -163,12 +163,16 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 
 	connMaps := make([]map[string]any, len(conns))
 	for i, c := range conns {
+		clientID := c.ClientID
+		if models.NormalizeProtocol(c.Protocol) == models.ProtocolVLESS && !h.GetSession(r).IsAdmin() {
+			clientID = ""
+		}
 		connMaps[i] = map[string]any{
 			"id":               c.ID,
 			"user_id":          c.UserID,
 			"server_id":        c.ServerID,
 			"protocol":         c.Protocol,
-			"client_id":        c.ClientID,
+			"client_id":        clientID,
 			"name":             c.Name,
 			"awg_mimicry":      c.AWGMimicry,
 			"traffic_total_rx": c.TrafficTotalRx,

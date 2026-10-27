@@ -58,6 +58,11 @@ func (h *Handlers) GetServerConnectionsHandler(w http.ResponseWriter, r *http.Re
 		usersMap[users[i].ID] = &users[i]
 	}
 
+	redactVLESSCredentials := false
+	if proto == models.ProtocolVLESS {
+		sess := h.GetSession(r)
+		redactVLESSCredentials = sess == nil || sess.Role != models.RoleAdmin
+	}
 	for _, client := range clients {
 		cid, _ := client["clientId"].(string)
 		if cid == "" {
@@ -78,6 +83,11 @@ func (h *Handlers) GetServerConnectionsHandler(w http.ResponseWriter, r *http.Re
 				}
 				break
 			}
+		}
+		if redactVLESSCredentials {
+			client["clientId"] = ""
+			client["client_id"] = ""
+			client["uuid"] = ""
 		}
 	}
 
@@ -712,6 +722,9 @@ func (h *Handlers) GetProtocolClientsHandler(w http.ResponseWriter, r *http.Requ
 		protocol = "awg"
 	}
 	protocol = models.NormalizeProtocol(protocol)
+	if protocol == models.ProtocolVLESS && !h.authorizeAdminProtocol(w, r, protocol) {
+		return
+	}
 
 	ctx := r.Context()
 	server, err := h.db.GetServer(ctx, serverID)

@@ -149,6 +149,9 @@ func (h *Handlers) AddUserHandler(w http.ResponseWriter, r *http.Request) {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
 		return
 	}
+	if req.Protocol != nil && *req.Protocol != "" && !h.authorizeAdminProtocol(w, r, *req.Protocol) {
+		return
+	}
 
 	ctx := r.Context()
 	existing, err := h.db.GetUserByUsername(ctx, req.Username)

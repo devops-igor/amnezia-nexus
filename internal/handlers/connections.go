@@ -101,13 +101,17 @@ func (h *Handlers) UserGetMyConnectionsHandler(w http.ResponseWriter, r *http.Re
 			srvStatus, srvReachable = h.serverReachabilityInfo(ctx, c.ServerID)
 		}
 
+		clientID := c.ClientID
+		if models.NormalizeProtocol(c.Protocol) == models.ProtocolVLESS && sess.Role != models.RoleAdmin {
+			clientID = ""
+		}
 		enriched[i] = map[string]any{
 			"id":               c.ID,
 			"user_id":          c.UserID,
 			"server_id":        c.ServerID,
 			"server_name":      srvName,
 			"protocol":         c.Protocol,
-			"client_id":        c.ClientID,
+			"client_id":        clientID,
 			"name":             c.Name,
 			"awg_mimicry":      c.AWGMimicry,
 			"traffic_total_rx": c.TrafficTotalRx,
