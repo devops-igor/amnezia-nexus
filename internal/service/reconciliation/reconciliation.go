@@ -500,6 +500,8 @@ func (r *Reconciler) reconcileServerProtocolZombiePeers(ctx context.Context, ser
 		return
 	}
 
+	r.withdrawDisabledOwnerConns(ctx, server, proto, mgr, conns)
+
 	lifecycles, err := r.db.GetPeerLifecycles(ctx, serverID, proto)
 	if err != nil {
 		slog.Warn("Reconciliation Phase 3: failed to fetch peer lifecycles",
@@ -542,6 +544,47 @@ func (r *Reconciler) reconcileServerProtocolZombiePeers(ctx context.Context, ser
 		if rec.Status == "failed" || (rec.Status == "pending" && time.Since(rec.CreatedAt) > stalePendingThreshold) {
 			_ = r.db.DeletePeerLifecycle(ctx, serverID, proto, cid)
 		}
+	}
+}
+
+// withdrawDisabledOwnerConns revokes credentials owned by disabled users on managers that
+// cannot toggle clients in place (VLESS/Naive only, matching the toggle handler), so a row that raced past a user disable
+// does not keep a usable remote credential. Failures are retried on the next cycle.
+func (r *Reconciler) withdrawDisabledOwnerConns(ctx context.Context, server *models.Server, proto string, mgr manager.ProtocolManager, conns []models.UserConnection) {
+	if proto != models.ProtocolVLESS && proto != models.ProtocolNaive {
+		return
+	}
+	if _, toggles := mgr.(interface {
+		ToggleClient(context.Context, *models.Server, string, bool) error
+	}); toggles {
+		return
+	}
+	disabled := make(map[string]bool)
+	for _, conn := range conns {
+		if conn.ClientID == "" {
+			continue
+		}
+		off, seen := disabled[conn.UserID]
+		if !seen {
+			u, err := r.db.GetUser(ctx, conn.UserID)
+			off = err == nil && u != nil && !u.Enabled
+			disabled[conn.UserID] = off
+		}
+		if !off {
+			continue
+		}
+		if err := mgr.RemoveClient(ctx, server, conn.ClientID); err != nil {
+			slog.Warn("Reconciliation Phase 3: failed to revoke credential of disabled user",
+				"server_id", server.ID, "protocol", proto, "client_id", conn.ClientID, "err", err)
+			continue
+		}
+		if _, err := r.db.DeleteConnection(ctx, conn.ID); err != nil {
+			slog.Warn("Reconciliation Phase 3: failed to delete revoked connection", "conn_id", conn.ID, "err", err)
+			continue
+		}
+		_ = r.db.DeletePeerLifecycle(ctx, server.ID, proto, conn.ClientID)
+		slog.Info("Reconciliation: revoked credential of disabled user",
+			"server_id", server.ID, "protocol", proto, "client_id", conn.ClientID)
 	}
 }
 

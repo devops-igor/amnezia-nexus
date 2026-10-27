@@ -27,6 +27,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/upstream"
+	"github.com/devops-igor/amnezia-nexus/internal/service/userops"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 )
 
@@ -73,29 +74,15 @@ type Handlers struct {
 	setupMu                   sync.Mutex
 	captchaOnce               sync.Once
 	captchaSt                 *captcha.Store
-	userConnMu                sync.Mutex
-	userConnLocks             map[string]*sync.Mutex
 	serverHostMu              sync.Mutex
 	serverHostLocks           map[int64]*sync.Mutex
 	updateServerProtocolsHook func(context.Context, int64, map[string]any) error
 }
 
+// lockUser serializes credential admission and user disabling; the lock is shared
+// with userops so background quota/expiry disables are covered too.
 func (h *Handlers) lockUser(userID string) func() {
-	h.userConnMu.Lock()
-	if h.userConnLocks == nil {
-		h.userConnLocks = make(map[string]*sync.Mutex)
-	}
-	mu, ok := h.userConnLocks[userID]
-	if !ok {
-		mu = &sync.Mutex{}
-		h.userConnLocks[userID] = mu
-	}
-	h.userConnMu.Unlock()
-
-	mu.Lock()
-	return func() {
-		mu.Unlock()
-	}
+	return userops.LockUser(userID)
 }
 
 func (h *Handlers) updateServerProtocols(ctx context.Context, serverID int64, protocols map[string]any) error {

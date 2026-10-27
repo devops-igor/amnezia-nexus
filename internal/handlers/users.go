@@ -551,6 +551,10 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Hold the per-user lock across snapshot, revocation and commit so an in-flight
+	// credential creation either lands in the snapshot or sees the user disabled.
+	defer h.lockUser(userID)()
+
 	ctx := r.Context()
 	user, err := h.db.GetUser(ctx, userID)
 	if err != nil || user == nil {
@@ -629,6 +633,8 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
 		return
 	}
+
+	defer h.lockUser(userID)()
 
 	ctx := r.Context()
 	user, err := h.db.GetUser(ctx, userID)

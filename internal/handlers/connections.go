@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"github.com/go-chi/chi/v5"
@@ -248,15 +249,8 @@ func (h *Handlers) UserAddConnectionHandler(w http.ResponseWriter, r *http.Reque
 		newConn.AWGMimicry = models.AWGMimicryProfile(*req.AWGMimicry)
 	}
 
-	_ = h.db.RecordPeerLifecycle(ctx, req.ServerID, req.Protocol, clientID, req.Name, user.ID, "active")
-
-	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
-		if rbErr := h.rollbackClient(ctx, protoMgr, server, result, clientID); rbErr != nil {
-			_ = h.db.SetPeerLifecycleStatus(ctx, req.ServerID, req.Protocol, clientID, "failed")
-		} else {
-			_ = h.db.DeletePeerLifecycle(ctx, req.ServerID, req.Protocol, clientID)
-		}
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
+	if status, code, msg := h.persistProvisioned(ctx, protoMgr, server, result, newConn); status != 0 {
+		h.JSONError(w, status, code, msg)
 		return
 	}
 
@@ -270,6 +264,28 @@ func (h *Handlers) UserAddConnectionHandler(w http.ResponseWriter, r *http.Reque
 		"vpn_link":   vpnLink,
 		"connection": newConn,
 	})
+}
+
+// persistProvisioned records a just-provisioned remote client and inserts its connection row.
+// If the owner was disabled or deleted while provisioning was in flight, or the insert fails,
+// the remote credential is revoked and a non-zero HTTP status is returned.
+func (h *Handlers) persistProvisioned(ctx context.Context, protoMgr manager.ProtocolManager, server *models.Server, result map[string]any, conn *models.UserConnection) (status int, code, msg string) {
+	_ = h.db.RecordPeerLifecycle(ctx, conn.ServerID, conn.Protocol, conn.ClientID, conn.Name, conn.UserID, "active")
+
+	if cur, err := h.db.GetUser(ctx, conn.UserID); err != nil || cur == nil || !cur.Enabled {
+		status, code, msg = http.StatusForbidden, "forbidden", "Account is disabled"
+	} else if _, err := h.db.CreateConnection(ctx, conn); err != nil {
+		status, code, msg = http.StatusInternalServerError, "internal_error", "Failed to save connection record"
+	} else {
+		return 0, "", ""
+	}
+
+	if rbErr := h.rollbackClient(ctx, protoMgr, server, result, conn.ClientID); rbErr != nil {
+		_ = h.db.SetPeerLifecycleStatus(ctx, conn.ServerID, conn.Protocol, conn.ClientID, "failed")
+	} else {
+		_ = h.db.DeletePeerLifecycle(ctx, conn.ServerID, conn.Protocol, conn.ClientID)
+	}
+	return status, code, msg
 }
 
 // addLoadBalancedConnection provisions a load-balanced client connection targeting the portal VPN subsystem.

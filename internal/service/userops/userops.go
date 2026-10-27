@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -128,11 +129,55 @@ func (s *Service) ToggleUser(ctx context.Context, userID string, enabled bool) (
 	return true, nil
 }
 
+var (
+	userLocksMu sync.Mutex
+	userLocks   = make(map[string]*sync.Mutex)
+)
+
+// LockUser serializes credential admission against disabling for one user. The
+// handlers and userops share it so a credential provisioned while a user is being
+// disabled is either snapshotted for revocation or rejected. It is not reentrant.
+func LockUser(userID string) func() {
+	userLocksMu.Lock()
+	mu, ok := userLocks[userID]
+	if !ok {
+		mu = &sync.Mutex{}
+		userLocks[userID] = mu
+	}
+	userLocksMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
+// lockUsers locks the distinct users in sorted order (deadlock-free) and returns the unlock func.
+func lockUsers(req MassOperationRequest) func() {
+	ids := make([]string, 0, len(req.ToggleUIDs)+len(req.CreateConns))
+	for _, t := range req.ToggleUIDs {
+		ids = append(ids, t.UserID)
+	}
+	for _, c := range req.CreateConns {
+		ids = append(ids, c.UserID)
+	}
+	slices.Sort(ids)
+	ids = slices.Compact(ids)
+	unlocks := make([]func(), 0, len(ids))
+	for _, id := range ids {
+		unlocks = append(unlocks, LockUser(id))
+	}
+	return func() {
+		for _, u := range slices.Backward(unlocks) {
+			u()
+		}
+	}
+}
+
 // PerformMassOperations executes multiple SSH operations grouped by server with bounded concurrency.
 func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRequest) error {
 	if s.db == nil {
 		return errors.New("database is not configured")
 	}
+
+	defer lockUsers(req)()
 
 	serverOps := make(map[int64]*serverOperations)
 	var opsMu sync.Mutex
@@ -312,36 +357,47 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 						Name:      cReq.Name,
 						CreatedAt: time.Now().UTC(),
 					}
+					// The owner may have been disabled/deleted while AddClient was in flight.
+					if u, err := s.db.GetUser(ctx, cReq.UserID); err != nil || u == nil || !u.Enabled {
+						slog.Warn("Revoking credential created for disabled user", "user_id", cReq.UserID, "client_id", clientID)
+						s.rollbackCreate(ctx, mgr, server, proto, clientID, res)
+						continue
+					}
 					if _, err := s.db.CreateConnection(ctx, newConn); err != nil {
 						slog.Error("Failed to insert user connection into DB", "conn_id", newConn.ID, "err", err)
-						cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-						var rbErr error
-						if rm, ok := mgr.(manager.RollbackableManager); ok && res != nil {
-							rbErr = rm.RollbackAddClient(cleanupCtx, server, res)
-						} else {
-							rbErr = mgr.RemoveClient(cleanupCtx, server, clientID)
-						}
-						cancel()
-						if rbErr != nil {
-							slog.Error("Failed to rollback client on remote server after DB failure",
-								"server_id", server.ID,
-								"client_id", clientID,
-								"err", rbErr,
-							)
-							_ = s.db.SetPeerLifecycleStatus(ctx, serverID, proto, clientID, "failed")
-						} else {
-							slog.Info("Rolled back remote client after DB failure",
-								"server_id", server.ID,
-								"protocol", proto,
-								"client_id", clientID,
-							)
-							_ = s.db.DeletePeerLifecycle(ctx, serverID, proto, clientID)
-						}
+						s.rollbackCreate(ctx, mgr, server, proto, clientID, res)
 					}
 				}
 			}
 		}
 	}
+}
+
+// rollbackCreate removes a just-provisioned remote client and its lifecycle record.
+func (s *Service) rollbackCreate(ctx context.Context, mgr manager.ProtocolManager, server *models.Server, proto, clientID string, res map[string]any) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	var rbErr error
+	if rm, ok := mgr.(manager.RollbackableManager); ok && res != nil {
+		rbErr = rm.RollbackAddClient(cleanupCtx, server, res)
+	} else {
+		rbErr = mgr.RemoveClient(cleanupCtx, server, clientID)
+	}
+	if rbErr != nil {
+		slog.Error("Failed to rollback client on remote server",
+			"server_id", server.ID,
+			"client_id", clientID,
+			"err", rbErr,
+		)
+		_ = s.db.SetPeerLifecycleStatus(ctx, server.ID, proto, clientID, "failed")
+		return
+	}
+	slog.Info("Rolled back remote client",
+		"server_id", server.ID,
+		"protocol", proto,
+		"client_id", clientID,
+	)
+	_ = s.db.DeletePeerLifecycle(ctx, server.ID, proto, clientID)
 }
 
 func (s *Service) runToggleOperations(
