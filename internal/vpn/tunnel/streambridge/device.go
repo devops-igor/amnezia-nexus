@@ -72,18 +72,20 @@ type deviceStats struct {
 // Device terminates client L3 packets in a private userspace netstack, demultiplexes
 // them into L4/L7 flows, and splices them onto an outbound StreamDialer.
 type Device struct {
-	cfg       Config
-	dialer    StreamDialer
-	ep        *channel.Endpoint
-	stack     *stack.Stack
-	slots     chan struct{}
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	gateMu    sync.RWMutex
-	closed    atomic.Bool
-	createdAt time.Time
-	stats     deviceStats
+	cfg                      Config
+	dialer                   StreamDialer
+	ep                       *channel.Endpoint
+	stack                    *stack.Stack
+	slots                    chan struct{}
+	ctx                      context.Context
+	cancel                   context.CancelFunc
+	wg                       sync.WaitGroup
+	gateMu                   sync.RWMutex
+	closed                   atomic.Bool
+	pendingHandshakes        atomic.Int32
+	beforeCreateEndpointHook func()
+	createdAt                time.Time
+	stats                    deviceStats
 }
 
 // New creates and initializes a stream bridge Device with gVisor netstack.
@@ -256,10 +258,16 @@ func (d *Device) Close() error {
 	d.cancel()
 	d.gateMu.Unlock()
 
-	if d.stack != nil {
-		for _, ep := range d.stack.RegisteredEndpoints() {
-			ep.Abort()
+	for {
+		if d.stack != nil {
+			for _, ep := range d.stack.RegisteredEndpoints() {
+				ep.Abort()
+			}
 		}
+		if d.pendingHandshakes.Load() == 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 
 	d.wg.Wait()
@@ -277,6 +285,12 @@ func (d *Device) CreatedAt() time.Time {
 // IsClosed returns true if the device has been closed.
 func (d *Device) IsClosed() bool {
 	return d.closed.Load()
+}
+
+// setBeforeCreateEndpointHookForTest registers a test hook called immediately
+// before r.CreateEndpoint at the registration boundary.
+func (d *Device) setBeforeCreateEndpointHookForTest(hook func()) {
+	d.beforeCreateEndpointHook = hook
 }
 
 // DroppedPackets returns the cumulative number of dropped packets, including non-IPv4,

@@ -88,7 +88,14 @@ func (d *Device) onTCP(r *tcp.ForwarderRequest) {
 	}
 	d.stats.lastHandshakeNano.Store(time.Now().UnixNano())
 
-	if d.closed.Load() || d.ctx.Err() != nil {
+	d.gateMu.RLock()
+	closed := d.closed.Load() || d.ctx.Err() != nil
+	if !closed {
+		d.pendingHandshakes.Add(1)
+	}
+	d.gateMu.RUnlock()
+
+	if closed {
 		_ = outConn.Close()
 		d.release()
 		r.Complete(true)
@@ -96,7 +103,13 @@ func (d *Device) onTCP(r *tcp.ForwarderRequest) {
 	}
 
 	var wq waiter.Queue
-	ep, tcpipErr := r.CreateEndpoint(&wq)
+	ep, tcpipErr := func() (tcpip.Endpoint, tcpip.Error) {
+		defer d.pendingHandshakes.Add(-1)
+		if d.beforeCreateEndpointHook != nil {
+			d.beforeCreateEndpointHook()
+		}
+		return r.CreateEndpoint(&wq)
+	}()
 	if tcpipErr != nil {
 		_ = outConn.Close()
 		d.release()
@@ -104,6 +117,14 @@ func (d *Device) onTCP(r *tcp.ForwarderRequest) {
 		return
 	}
 	r.Complete(false)
+
+	if d.closed.Load() || d.ctx.Err() != nil {
+		ep.Abort()
+		ep.Close()
+		_ = outConn.Close()
+		d.release()
+		return
+	}
 
 	ep.SocketOptions().SetKeepAlive(true)
 	idle := tcpip.KeepaliveIdleOption(60 * time.Second)
