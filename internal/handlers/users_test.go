@@ -171,6 +171,10 @@ func TestUsersHandlers(t *testing.T) {
 		if w404.Code != http.StatusNotFound {
 			t.Fatalf("expected 404, got %d", w404.Code)
 		}
+
+		if _, err := db.UpdateUser(ctx, u.ID, map[string]any{"enabled": true}); err != nil {
+			t.Fatalf("restore test user: %v", err)
+		}
 	})
 
 	t.Run("AddUserConnectionHandler Server Not Found", func(t *testing.T) {
