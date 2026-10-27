@@ -396,6 +396,35 @@ func TestNaiveManager_Lifecycle(t *testing.T) {
 	}
 }
 
+func TestNaiveManager_GetClientsReturnsEnumerationErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		content []byte
+		wantErr string
+	}{
+		{name: "download failure", wantErr: "download caddyfile"},
+		{name: "parse failure", content: []byte("not a caddyfile"), wantErr: "parse caddyfile"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockSSH := newMockNaiveSSHClient()
+			if tt.content != nil {
+				mockSSH.files[NaiveCaddyfilePath] = tt.content
+			}
+			mgr := NewNaiveManagerWithServerLocks(&mockNaivePool{client: mockSSH}, awg.NewServerLockRegistry())
+
+			clients, err := mgr.GetClients(context.Background(), &models.Server{ID: 88})
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("GetClients error = %v, want error containing %q", err, tt.wantErr)
+			}
+			if clients != nil {
+				t.Fatalf("GetClients clients = %v, want nil", clients)
+			}
+		})
+	}
+}
+
 func TestNaiveManager_SudoNodeClientOperationsAfterRawConfigSave(t *testing.T) {
 	mockSSH := newMockNaiveSSHClient()
 	mgr := NewNaiveManagerWithServerLocks(&mockNaivePool{client: mockSSH}, awg.NewServerLockRegistry())

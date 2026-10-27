@@ -394,6 +394,35 @@ func TestXrayManager_Lifecycle(t *testing.T) {
 	}
 }
 
+func TestXrayManager_GetClientsReturnsEnumerationErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		content []byte
+		wantErr string
+	}{
+		{name: "download failure", wantErr: "download xray config"},
+		{name: "parse failure", content: []byte("not json"), wantErr: "parse xray config"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockSSH := newMockXraySSHClient()
+			if tt.content != nil {
+				mockSSH.files[XrayConfigPath] = tt.content
+			}
+			mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+
+			clients, err := mgr.GetClients(context.Background(), &models.Server{ID: 42})
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("GetClients error = %v, want error containing %q", err, tt.wantErr)
+			}
+			if clients != nil {
+				t.Fatalf("GetClients clients = %v, want nil", clients)
+			}
+		})
+	}
+}
+
 func TestXrayManager_SudoNodeClientOperationsAfterRawConfigSave(t *testing.T) {
 	mockSSH := newMockXraySSHClient()
 	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())

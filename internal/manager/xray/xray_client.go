@@ -207,11 +207,14 @@ func (m *XrayManager) GetClients(ctx context.Context, server *models.Server) ([]
 
 	cfgBytes, err := client.DownloadSudoFile(ctx, XrayConfigPath)
 	if err != nil {
-		return []map[string]any{}, nil
+		return nil, fmt.Errorf("download xray config: %w", err)
 	}
 
 	cfg, err := ParseXrayConfig(cfgBytes)
-	if err != nil || len(cfg.Inbounds) == 0 {
+	if err != nil {
+		return nil, fmt.Errorf("parse xray config: %w", err)
+	}
+	if len(cfg.Inbounds) == 0 {
 		return []map[string]any{}, nil
 	}
 

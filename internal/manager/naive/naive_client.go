@@ -155,12 +155,12 @@ func (m *NaiveManager) GetClients(ctx context.Context, server *models.Server) ([
 
 	caddyfileBytes, err := client.DownloadSudoFile(ctx, NaiveCaddyfilePath)
 	if err != nil {
-		return []map[string]any{}, nil
+		return nil, fmt.Errorf("download caddyfile: %w", err)
 	}
 
 	_, _, clients, err := ParseCaddyfile(string(caddyfileBytes))
 	if err != nil {
-		return []map[string]any{}, nil
+		return nil, fmt.Errorf("parse caddyfile: %w", err)
 	}
 
 	results := make([]map[string]any, 0, len(clients))
