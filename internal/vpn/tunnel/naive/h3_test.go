@@ -18,11 +18,11 @@ func TestDialer_H3_CloseUnblocksBlockedWriterAndPreservesSibling(t *testing.T) {
 
 	// 2. Setup TCP blackhole listener (accepts but never reads data) to trigger backpressure
 	blackholeAddr, cleanupBlackhole := startBlackholeListener(t)
-	defer cleanupBlackhole()
 
 	// 3. Setup H3 test server
 	proxyAddr, cleanupH3 := setupTestH3Server(t, "testuser", "testpass", true)
 	defer cleanupH3()
+	defer cleanupBlackhole() // Release target before waiting for server shutdown.
 
 	p := models.NaiveProxyParams{
 		Username: "testuser",
@@ -92,18 +92,23 @@ func TestDialer_H3_CloseUnblocksBlockedWriterAndPreservesSibling(t *testing.T) {
 	<-writeStarted
 
 	// Wait until conn1 writer has written data and is blocked waiting for flow control
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	blocked := false
+	last := int64(-1)
+	stable := 0
 	for time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-		if bytesWritten.Load() > 0 && writeBlocked.Load() {
-			// Verify it remains blocked
-			time.Sleep(50 * time.Millisecond)
-			if writeBlocked.Load() {
+		time.Sleep(100 * time.Millisecond)
+		cur := bytesWritten.Load()
+		if cur > 0 && cur == last && writeBlocked.Load() {
+			stable++
+			if stable >= 5 {
 				blocked = true
 				break
 			}
+		} else {
+			stable = 0
 		}
+		last = cur
 	}
 	if !blocked {
 		t.Fatalf("conn1 writer did not block under backpressure (bytesWritten=%d)", bytesWritten.Load())

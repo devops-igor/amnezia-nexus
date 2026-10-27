@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -271,5 +272,148 @@ func TestDialer_H2_InvalidateRetiredConnection(t *testing.T) {
 	}
 	if afterInvalidate[0] != currentCC {
 		t.Errorf("expected currentCC to remain tracked, got %p (current %p)", afterInvalidate[0], currentCC)
+	}
+}
+
+// TestDialer_H2_HandshakeBlocksNeitherCancelledWaiterNorClose verifies finding R5-H1:
+// when an H2 handshake is stalled, a second caller with a short context timeout returns
+// promptly with context.DeadlineExceeded without blocking on the pool mutex, and
+// Dialer.Close() returns promptly and terminates in-flight setup.
+func TestDialer_H2_HandshakeBlocksNeitherCancelledWaiterNorClose(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		b := make([]byte, 1)
+		if _, err := io.ReadFull(c, b); err != nil {
+			return
+		}
+		close(entered) // ClientHello proves first dial is actively inside TLS handshake
+		<-release
+	}()
+
+	d, err := New(ln.Addr().String(), models.NaiveProxyParams{
+		Username: "testuser",
+		Password: "testpassword",
+		Domain:   testCamouflageDomain,
+		EnableH3: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	defer cancelFirst()
+	firstDone := make(chan error, 1)
+	go func() {
+		c, err := d.DialContext(firstCtx, "tcp", "example.com:443")
+		if c != nil {
+			_ = c.Close()
+		}
+		firstDone <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no ClientHello received by test server")
+	}
+
+	waiterCtx, cancelWaiter := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancelWaiter()
+
+	waiterDone := make(chan error, 1)
+	go func() {
+		c, err := d.DialContext(waiterCtx, "tcp", "example.com:443")
+		if c != nil {
+			_ = c.Close()
+		}
+		waiterDone <- err
+	}()
+
+	start := time.Now()
+	select {
+	case err := <-waiterDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("waiter dial expected DeadlineExceeded, got: %v", err)
+		}
+	case <-time.After(350 * time.Millisecond):
+		t.Errorf("queued dial still blocked after %v with 75ms context; ctx.Err()=%v", time.Since(start), waiterCtx.Err())
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		_ = d.Close()
+		close(closeDone)
+	}()
+
+	select {
+	case <-closeDone:
+	case <-time.After(350 * time.Millisecond):
+		t.Error("Dialer.Close blocked by in-flight TLS handshake")
+	}
+
+	// In-flight dial must unblock promptly following Close()
+	select {
+	case err := <-firstDone:
+		if err == nil {
+			t.Error("expected first dial to fail following Close(), got nil")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Error("first dial did not unblock after Dialer.Close()")
+	}
+
+	close(release)
+	<-serverDone
+}
+
+func TestDialer_H2_HandshakeLateCompletionAfterCloseNotRetained(t *testing.T) {
+	echoAddr, cleanupEcho := setupTCPEchoServer(t)
+	defer cleanupEcho()
+
+	proxyAddr, cleanupH2 := setupTestH2Server(t, "testuser", "testpass", true)
+	defer cleanupH2()
+
+	d, err := New(proxyAddr, models.NaiveProxyParams{
+		Username: "testuser",
+		Password: "testpass",
+		Domain:   testCamouflageDomain,
+		EnableH3: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Close before dial
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	conn, err := d.DialContext(ctx, "tcp", echoAddr)
+	if conn != nil {
+		_ = conn.Close()
+		t.Fatal("expected nil conn after Close()")
+	}
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("expected net.ErrClosed after Close(), got %v", err)
+	}
+
+	if tracked := d.h2Pool.trackedConns(); len(tracked) != 0 {
+		t.Fatalf("expected 0 tracked conns after Close(), got %d", len(tracked))
 	}
 }
