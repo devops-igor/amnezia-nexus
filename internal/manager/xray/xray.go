@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
@@ -32,6 +33,8 @@ type XrayManager struct {
 	containerCache *xrayContainerCache
 	serverLocks    *awg.ServerLockRegistry
 	mu             sync.Mutex
+	recentMu       sync.Mutex
+	recentClients  map[string]time.Time
 }
 
 // NewXrayManager creates a new XrayManager instance.
@@ -40,6 +43,7 @@ func NewXrayManager(pool SSHProvider) *XrayManager {
 		sshPool:        pool,
 		containerCache: newXrayContainerCache(),
 		serverLocks:    awg.GlobalServerLocks(),
+		recentClients:  make(map[string]time.Time),
 	}
 }
 
@@ -49,7 +53,28 @@ func NewXrayManagerWithServerLocks(pool SSHProvider, locks *awg.ServerLockRegist
 		sshPool:        pool,
 		containerCache: newXrayContainerCache(),
 		serverLocks:    locks,
+		recentClients:  make(map[string]time.Time),
 	}
+}
+
+func (m *XrayManager) recordClientCreation(clientID string, createdAt time.Time) {
+	m.recentMu.Lock()
+	defer m.recentMu.Unlock()
+	m.recentClients[clientID] = createdAt
+}
+
+func (m *XrayManager) recentClientCreation(clientID string) (time.Time, bool) {
+	m.recentMu.Lock()
+	defer m.recentMu.Unlock()
+
+	now := time.Now().UTC()
+	for id, createdAt := range m.recentClients {
+		if now.Sub(createdAt) >= 10*time.Minute {
+			delete(m.recentClients, id)
+		}
+	}
+	createdAt, ok := m.recentClients[clientID]
+	return createdAt, ok && now.Sub(createdAt) < 5*time.Minute
 }
 
 // Protocol returns the canonical protocol identifier for VLESS.

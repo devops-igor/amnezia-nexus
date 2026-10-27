@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
@@ -30,25 +31,49 @@ type SSHProvider interface {
 //
 //nolint:revive
 type NaiveManager struct {
-	sshPool     SSHProvider
-	serverLocks *awg.ServerLockRegistry
-	mu          sync.Mutex
+	sshPool       SSHProvider
+	serverLocks   *awg.ServerLockRegistry
+	mu            sync.Mutex
+	recentMu      sync.Mutex
+	recentClients map[string]time.Time
 }
 
 // NewNaiveManager creates a new NaiveManager instance.
 func NewNaiveManager(pool SSHProvider) *NaiveManager {
 	return &NaiveManager{
-		sshPool:     pool,
-		serverLocks: awg.GlobalServerLocks(),
+		sshPool:       pool,
+		serverLocks:   awg.GlobalServerLocks(),
+		recentClients: make(map[string]time.Time),
 	}
 }
 
 // NewNaiveManagerWithServerLocks creates a new NaiveManager with custom server locks for testing.
 func NewNaiveManagerWithServerLocks(pool SSHProvider, locks *awg.ServerLockRegistry) *NaiveManager {
 	return &NaiveManager{
-		sshPool:     pool,
-		serverLocks: locks,
+		sshPool:       pool,
+		serverLocks:   locks,
+		recentClients: make(map[string]time.Time),
 	}
+}
+
+func (m *NaiveManager) recordClientCreation(clientID string, createdAt time.Time) {
+	m.recentMu.Lock()
+	defer m.recentMu.Unlock()
+	m.recentClients[clientID] = createdAt
+}
+
+func (m *NaiveManager) recentClientCreation(clientID string) (time.Time, bool) {
+	m.recentMu.Lock()
+	defer m.recentMu.Unlock()
+
+	now := time.Now().UTC()
+	for id, createdAt := range m.recentClients {
+		if now.Sub(createdAt) >= 10*time.Minute {
+			delete(m.recentClients, id)
+		}
+	}
+	createdAt, ok := m.recentClients[clientID]
+	return createdAt, ok && now.Sub(createdAt) < 5*time.Minute
 }
 
 // Protocol returns the canonical protocol identifier for NaiveProxy.

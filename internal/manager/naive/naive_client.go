@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -63,6 +64,9 @@ func (m *NaiveManager) AddClient(ctx context.Context, server *models.Server, cli
 		name = strings.TrimSpace(n)
 	}
 
+	now := time.Now().UTC()
+	m.recordClientCreation(username, now)
+
 	// 3. Append new client credentials
 	clients = append(clients, NaiveClient{
 		Username: username,
@@ -88,14 +92,16 @@ func (m *NaiveManager) AddClient(ctx context.Context, server *models.Server, cli
 	}
 
 	return map[string]any{
-		"client_id": username,
-		"clientId":  username,
-		"username":  username,
-		"password":  password,
-		"name":      name,
-		"config":    uri,
-		"domain":    domain,
-		"port":      port,
+		"client_id":    username,
+		"clientId":     username,
+		"username":     username,
+		"password":     password,
+		"name":         name,
+		"config":       uri,
+		"domain":       domain,
+		"port":         port,
+		"creationDate": now.Format(time.RFC3339),
+		"created_at":   now.Format(time.RFC3339),
 	}, nil
 }
 
@@ -165,11 +171,15 @@ func (m *NaiveManager) GetClients(ctx context.Context, server *models.Server) ([
 
 	results := make([]map[string]any, 0, len(clients))
 	for _, c := range clients {
-		results = append(results, map[string]any{
+		client := map[string]any{
 			"client_id": c.Username,
 			"clientId":  c.Username,
 			"username":  c.Username,
-		})
+		}
+		if createdAt, ok := m.recentClientCreation(c.Username); ok {
+			client["creationDate"] = createdAt.Format(time.RFC3339)
+		}
+		results = append(results, client)
 	}
 
 	return results, nil

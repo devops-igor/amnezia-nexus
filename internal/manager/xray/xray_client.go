@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -71,6 +72,8 @@ func (m *XrayManager) AddClient(ctx context.Context, server *models.Server, clie
 
 	// 2. Generate client identity
 	clientID := uuid.NewString()
+	now := time.Now().UTC()
+	m.recordClientCreation(clientID, now)
 	name := resolveClientName(clientID, clientParams)
 	flow := resolveClientFlow(server, clientParams)
 
@@ -131,16 +134,18 @@ func (m *XrayManager) AddClient(ctx context.Context, server *models.Server, clie
 	}
 
 	return map[string]any{
-		"client_id":   clientID,
-		"clientId":    clientID,
-		"uuid":        clientID,
-		"name":        name,
-		"config":      vlessURI,
-		"public_key":  pubKey,
-		"short_id":    shortID,
-		"flow":        flow,
-		"server_name": serverName,
-		"port":        port,
+		"client_id":    clientID,
+		"clientId":     clientID,
+		"uuid":         clientID,
+		"name":         name,
+		"config":       vlessURI,
+		"public_key":   pubKey,
+		"short_id":     shortID,
+		"flow":         flow,
+		"server_name":  serverName,
+		"port":         port,
+		"creationDate": now.Format(time.RFC3339),
+		"created_at":   now.Format(time.RFC3339),
 	}, nil
 }
 
@@ -220,13 +225,17 @@ func (m *XrayManager) GetClients(ctx context.Context, server *models.Server) ([]
 
 	clients := make([]map[string]any, 0, len(cfg.Inbounds[0].Settings.Clients))
 	for _, c := range cfg.Inbounds[0].Settings.Clients {
-		clients = append(clients, map[string]any{
+		client := map[string]any{
 			"client_id": c.ID,
 			"clientId":  c.ID,
 			"uuid":      c.ID,
 			"name":      c.Email,
 			"flow":      c.Flow,
-		})
+		}
+		if createdAt, ok := m.recentClientCreation(c.ID); ok {
+			client["creationDate"] = createdAt.Format(time.RFC3339)
+		}
+		clients = append(clients, client)
 	}
 
 	return clients, nil
