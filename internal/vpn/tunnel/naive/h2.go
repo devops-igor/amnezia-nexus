@@ -467,6 +467,9 @@ type h2Conn struct {
 
 	mu            sync.Mutex
 	writeDeadline time.Time
+	writeTimer    *time.Timer
+	writing       int
+	wdExpired     bool
 	closed        bool
 }
 
@@ -480,13 +483,42 @@ func (c *h2Conn) Write(p []byte) (int, error) {
 		c.mu.Unlock()
 		return 0, net.ErrClosed
 	}
-	if !c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline) {
+	if c.wdExpired || (!c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline)) {
 		c.mu.Unlock()
 		return 0, os.ErrDeadlineExceeded
 	}
+	c.writing++
 	c.mu.Unlock()
 
-	return c.pw.Write(p)
+	n, err := c.pw.Write(p)
+
+	c.mu.Lock()
+	c.writing--
+	expired := c.wdExpired
+	c.mu.Unlock()
+	if err != nil && expired {
+		err = os.ErrDeadlineExceeded
+	}
+	return n, err
+}
+
+// expireWrite aborts a Write blocked past the write deadline. io.Pipe offers no
+// deadline, so the request body is failed instead; that resets only this stream
+// (a partially written stream cannot be resumed anyway), siblings are unaffected.
+func (c *h2Conn) expireWrite() {
+	c.mu.Lock()
+	if c.closed || c.writing == 0 || c.writeDeadline.IsZero() || time.Now().Before(c.writeDeadline) {
+		c.mu.Unlock()
+		return
+	}
+	c.wdExpired = true
+	c.mu.Unlock()
+	_ = c.pw.CloseWithError(os.ErrDeadlineExceeded)
+	// The transport may be parked in flow control, not reading the pipe: reset the stream.
+	if c.cancel != nil {
+		c.cancel()
+	}
+	_ = c.dr.Close()
 }
 
 func (c *h2Conn) CloseWrite() error {
@@ -500,6 +532,9 @@ func (c *h2Conn) Close() error {
 		return nil
 	}
 	c.closed = true
+	if c.writeTimer != nil {
+		c.writeTimer.Stop()
+	}
 	c.mu.Unlock()
 
 	if c.cancel != nil {
@@ -532,7 +567,14 @@ func (c *h2Conn) SetReadDeadline(t time.Time) error {
 
 func (c *h2Conn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.writeDeadline = t
-	c.mu.Unlock()
+	if c.writeTimer != nil {
+		c.writeTimer.Stop()
+		c.writeTimer = nil
+	}
+	if !t.IsZero() && !c.closed {
+		c.writeTimer = time.AfterFunc(time.Until(t), c.expireWrite)
+	}
 	return nil
 }
