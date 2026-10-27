@@ -90,12 +90,14 @@ func SFTPUpload(ctx context.Context, client *sftp.Client, remotePath string, con
 	}
 	defer f.Close()
 
-	if _, err := f.Write(content); err != nil {
-		return fmt.Errorf("failed to write content to %s: %w", remotePath, err)
-	}
-
+	// Chmod the still-empty file BEFORE writing the payload: the server creates it with its
+	// default umask (typically 0644), so a failed chmod must abort before secret bytes reach disk.
 	if err := client.Chmod(remotePath, mode); err != nil {
 		return fmt.Errorf("failed to chmod %s: %w", remotePath, err)
+	}
+
+	if _, err := f.Write(content); err != nil {
+		return fmt.Errorf("failed to write content to %s: %w", remotePath, err)
 	}
 
 	return nil

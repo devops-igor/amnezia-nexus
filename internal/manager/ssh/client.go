@@ -307,13 +307,17 @@ func (c *Client) UploadSudoFile(ctx context.Context, remotePath string, content 
 	defer c.startOp()()
 
 	tmpPath := GenerateRandomTempPath("upload")
+	// Registered before the upload and bound to an independent context so a failed or
+	// canceled upload still removes any partially staged secret from /tmp.
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _, _, _ = c.RunSudoCommand(cleanupCtx, fmt.Sprintf("rm -f %s", EscapeShellArg(tmpPath)))
+	}()
+
 	if err := c.UploadFile(ctx, tmpPath, content, 0600); err != nil {
 		return fmt.Errorf("failed to upload temporary file: %w", err)
 	}
-
-	defer func() {
-		_, _, _, _ = c.RunSudoCommand(ctx, fmt.Sprintf("rm -f %s", EscapeShellArg(tmpPath)))
-	}()
 
 	targetDir := path.Dir(remotePath)
 	if _, _, code, err := c.RunSudoCommand(ctx, fmt.Sprintf("mkdir -p %s", EscapeShellArg(targetDir))); err != nil || code != 0 {
