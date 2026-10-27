@@ -66,6 +66,7 @@ func TestHandlers_EdgeCasesAndErrorBranches(t *testing.T) {
 		}
 
 		req404 := httptest.NewRequest(http.MethodPost, "/api/servers/9999/reboot", nil)
+		req404 = req404.WithContext(middleware.WithSession(req404.Context(), &models.SessionData{Role: models.RoleAdmin}))
 		rctx := chi.NewRouteContext()
 		rctx.URLParams.Add("server_id", "9999")
 		req404 = req404.WithContext(context.WithValue(req404.Context(), chi.RouteCtxKey, rctx))

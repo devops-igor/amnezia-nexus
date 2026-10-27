@@ -399,3 +399,124 @@ func TestInstallProtocolHandler_PreservesProtocolMetadata(t *testing.T) {
 		t.Errorf("expected server_name: gateway.icloud.com, got %v", pMap["server_name"])
 	}
 }
+
+type dbClosingMockProtocolManager struct {
+	proto     string
+	closeFunc func()
+}
+
+func (m *dbClosingMockProtocolManager) Protocol() string { return m.proto }
+func (m *dbClosingMockProtocolManager) Install(ctx context.Context, server *models.Server, params map[string]any) error {
+	if m.closeFunc != nil {
+		m.closeFunc()
+	}
+	return nil
+}
+func (m *dbClosingMockProtocolManager) Uninstall(ctx context.Context, server *models.Server) error {
+	if m.closeFunc != nil {
+		m.closeFunc()
+	}
+	return nil
+}
+func (m *dbClosingMockProtocolManager) GetClients(ctx context.Context, server *models.Server) ([]map[string]any, error) {
+	return []map[string]any{}, nil
+}
+func (m *dbClosingMockProtocolManager) AddClient(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
+	return map[string]any{"client_id": "c1"}, nil
+}
+func (m *dbClosingMockProtocolManager) RemoveClient(ctx context.Context, server *models.Server, clientID string) error {
+	return nil
+}
+func (m *dbClosingMockProtocolManager) GetClientConfig(ctx context.Context, server *models.Server, clientID string) (string, error) {
+	return "mock-config", nil
+}
+func (m *dbClosingMockProtocolManager) GetServerStatus(ctx context.Context, server *models.Server) (map[string]any, error) {
+	return map[string]any{"container_running": true, "port": 443}, nil
+}
+
+func TestInstallProtocolHandler_DatabaseFailureReturns500(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+
+	server := &models.Server{
+		Name:      "db-fail-install-server",
+		Host:      "198.51.100.11",
+		SSHPort:   22,
+		Protocols: make(map[string]any),
+	}
+	serverID, err := db.CreateServer(context.Background(), server)
+	if err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+
+	mockProto := &dbClosingMockProtocolManager{
+		proto: "vless",
+		closeFunc: func() {
+			_ = db.Close()
+		},
+	}
+	h.registry = manager.NewRegistry()
+	h.registry.Register(mockProto)
+
+	adminSession := &models.SessionData{UserID: "admin-1", Username: "admin", Role: models.RoleAdmin}
+
+	body, _ := json.Marshal(models.InstallProtocolRequest{
+		Protocol: "vless",
+		Port:     "443",
+	})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/install", serverID), bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(middleware.WithSession(req.Context(), adminSession))
+	rc := chi.NewRouteContext()
+	rc.URLParams.Add("server_id", fmt.Sprint(serverID))
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rc))
+
+	w := httptest.NewRecorder()
+	h.InstallProtocolHandler(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 when database update fails, got %d (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestUninstallProtocolHandler_DatabaseFailureReturns500(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+
+	server := &models.Server{
+		Name:      "db-fail-uninstall-server",
+		Host:      "198.51.100.12",
+		SSHPort:   22,
+		Protocols: map[string]any{"vless": map[string]any{"installed": true}},
+	}
+	serverID, err := db.CreateServer(context.Background(), server)
+	if err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+
+	mockProto := &dbClosingMockProtocolManager{
+		proto: "vless",
+		closeFunc: func() {
+			_ = db.Close()
+		},
+	}
+	h.registry = manager.NewRegistry()
+	h.registry.Register(mockProto)
+
+	adminSession := &models.SessionData{UserID: "admin-1", Username: "admin", Role: models.RoleAdmin}
+
+	body, _ := json.Marshal(models.ProtocolRequest{
+		Protocol: "vless",
+	})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/uninstall", serverID), bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(middleware.WithSession(req.Context(), adminSession))
+	rc := chi.NewRouteContext()
+	rc.URLParams.Add("server_id", fmt.Sprint(serverID))
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rc))
+
+	w := httptest.NewRecorder()
+	h.UninstallProtocolHandler(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 when database uninstall update fails, got %d (body: %s)", w.Code, w.Body.String())
+	}
+}

@@ -54,25 +54,42 @@ func parseNaiveInstallOptions(params map[string]any, defaultHost string) (int, s
 	return port, domain
 }
 
-func (m *NaiveManager) resolveExistingClients(ctx context.Context, client ssh.SSHClient) []NaiveClient {
-	var existingClients []NaiveClient
+func (m *NaiveManager) resolveExistingClients(ctx context.Context, client ssh.SSHClient) ([]NaiveClient, error) {
+	exists, err := client.FileExists(ctx, NaiveCaddyfilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check existence of Caddyfile %s: %w", NaiveCaddyfilePath, err)
+	}
+	if !exists {
+		return []NaiveClient{}, nil
+	}
+
+	catCmd := fmt.Sprintf("cat %s 2>/dev/null", ssh.EscapeShellArg(NaiveCaddyfilePath))
+	catOut, catErrOut, catCode, catErr := client.RunSudoCommand(ctx, catCmd)
 	var existingCaddyBytes []byte
-	catOut, _, catCode, _ := client.RunSudoCommand(ctx, fmt.Sprintf("cat %s 2>/dev/null", ssh.EscapeShellArg(NaiveCaddyfilePath)))
-	if catCode == 0 && strings.TrimSpace(catOut) != "" && strings.TrimSpace(catOut) != "OK" {
+	if catErr == nil && catCode == 0 && strings.TrimSpace(catOut) != "" && strings.TrimSpace(catOut) != "OK" {
 		existingCaddyBytes = []byte(catOut)
-	} else if data, dlErr := client.DownloadFile(ctx, NaiveCaddyfilePath); dlErr == nil && len(data) > 0 {
+	} else {
+		data, dlErr := client.DownloadFile(ctx, NaiveCaddyfilePath)
+		if dlErr != nil {
+			return nil, fmt.Errorf("failed to read existing Caddyfile %s (cat code %d: %s, download err: %w)", NaiveCaddyfilePath, catCode, strings.TrimSpace(catErrOut), dlErr)
+		}
 		existingCaddyBytes = data
 	}
 
-	if len(existingCaddyBytes) > 0 {
-		if _, _, clients, parseErr := ParseCaddyfile(string(existingCaddyBytes)); parseErr == nil && len(clients) > 0 {
-			existingClients = clients
-		}
+	trimmed := strings.TrimSpace(string(existingCaddyBytes))
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("existing Caddyfile %s is empty or truncated", NaiveCaddyfilePath)
 	}
-	if existingClients == nil {
-		existingClients = []NaiveClient{}
+
+	_, _, clients, parseErr := ParseCaddyfile(trimmed)
+	if parseErr != nil {
+		return nil, fmt.Errorf("failed to parse existing Caddyfile %s: %w", NaiveCaddyfilePath, parseErr)
 	}
-	return existingClients
+
+	if clients == nil {
+		clients = []NaiveClient{}
+	}
+	return clients, nil
 }
 
 func (m *NaiveManager) buildAndLaunchContainer(ctx context.Context, client ssh.SSHClient) error {
@@ -161,7 +178,10 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 	}
 
 	// 5. Render and upload initial or preserved Caddyfile
-	existingClients := m.resolveExistingClients(ctx, client)
+	existingClients, err := m.resolveExistingClients(ctx, client)
+	if err != nil {
+		return fmt.Errorf("resolve existing clients: %w", err)
+	}
 	caddyfileContent := RenderCaddyfile(port, domain, existingClients)
 	if err := client.UploadSudoFile(ctx, NaiveCaddyfilePath, []byte(caddyfileContent), 0644); err != nil {
 		return fmt.Errorf("upload Caddyfile: %w", err)

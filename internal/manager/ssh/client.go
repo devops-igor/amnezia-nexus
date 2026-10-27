@@ -304,9 +304,6 @@ func (c *Client) UploadFile(ctx context.Context, remotePath string, content []by
 // UploadSudoFile uploads content to a root-owned remote path via atomic temp write and sudo move.
 func (c *Client) UploadSudoFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error {
 	defer c.startOp()()
-	if c.isRoot {
-		return c.UploadFile(ctx, remotePath, content, mode)
-	}
 
 	tmpPath := GenerateRandomTempPath("upload")
 	if err := c.UploadFile(ctx, tmpPath, content, 0600); err != nil {

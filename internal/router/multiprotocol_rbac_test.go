@@ -473,4 +473,54 @@ func TestMultiProtocol_RouterRBAC(t *testing.T) {
 			})
 		}
 	}
+
+	// 9. Clear Server: Support role MUST receive 403 Forbidden across both route families
+	for _, prefix := range []string{"/api/servers", ""} {
+		testName := fmt.Sprintf("Support clear %s/{id}/clear", prefix)
+		t.Run(testName, func(t *testing.T) {
+			urlPath := fmt.Sprintf("%s/%d/clear", prefix, serverID)
+			req := httptest.NewRequest(http.MethodPost, urlPath, nil)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+			req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+			req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+			req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+				UserID:   "support-user-id",
+				Username: "supportuser",
+				Role:     models.RoleSupport,
+			}))
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusForbidden {
+				t.Errorf("expected 403 Forbidden for Support role on clear %s, got %d (body: %s)", urlPath, w.Code, w.Body.String())
+			}
+		})
+	}
+
+	// 10. Clear Server: Admin role MUST receive 200 OK across both route families
+	for _, prefix := range []string{"/api/servers", ""} {
+		testName := fmt.Sprintf("Admin clear %s/{id}/clear", prefix)
+		t.Run(testName, func(t *testing.T) {
+			urlPath := fmt.Sprintf("%s/%d/clear", prefix, serverID)
+			req := httptest.NewRequest(http.MethodPost, urlPath, nil)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(middleware.CSRFHeaderName, csrfTok)
+			req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: csrfTok})
+			req = req.WithContext(middleware.WithCSRFToken(req.Context(), csrfTok))
+			req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+				UserID:   "admin-user-id",
+				Username: "adminuser",
+				Role:     models.RoleAdmin,
+			}))
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Errorf("expected 200 OK for Admin role on clear %s, got %d (body: %s)", urlPath, w.Code, w.Body.String())
+			}
+		})
+	}
 }

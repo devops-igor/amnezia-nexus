@@ -65,65 +65,78 @@ func (m *XrayManager) resolveRealityCredentials(
 	ctx context.Context,
 	client ssh.SSHClient,
 ) (string, string, string, []string, []XrayClient, error) {
-	var (
-		privB64  string
-		pubB64   string
-		shortID  string
-		shortIDs []string
-		clients  []XrayClient
-	)
-
-	// Check if existing config.json is present on the server
-	var existingCfgBytes []byte
-	catOut, _, catCode, _ := client.RunSudoCommand(ctx, fmt.Sprintf("cat %s 2>/dev/null", ssh.EscapeShellArg(XrayConfigPath)))
-	if catCode == 0 && strings.TrimSpace(catOut) != "" && strings.TrimSpace(catOut) != "OK" {
-		existingCfgBytes = []byte(catOut)
-	} else if data, dlErr := client.DownloadFile(ctx, XrayConfigPath); dlErr == nil && len(data) > 0 {
-		existingCfgBytes = data
+	exists, err := client.FileExists(ctx, XrayConfigPath)
+	if err != nil {
+		return "", "", "", nil, nil, fmt.Errorf("failed to check existence of xray config %s: %w", XrayConfigPath, err)
 	}
-
-	if len(existingCfgBytes) > 0 {
-		if parsed, err := ParseXrayConfig(existingCfgBytes); err == nil && len(parsed.Inbounds) > 0 {
-			inbound := parsed.Inbounds[0]
-			reality := inbound.StreamSettings.RealitySettings
-			if reality.PrivateKey != "" {
-				if derivedPub, pubErr := DerivePublicKey(reality.PrivateKey); pubErr == nil {
-					privB64 = reality.PrivateKey
-					pubB64 = derivedPub
-					shortIDs = reality.ShortIDs
-					if len(shortIDs) > 0 && shortIDs[0] != "" {
-						shortID = shortIDs[0]
-					}
-					clients = inbound.Settings.Clients
-				}
-			}
-		}
-	}
-
-	if privB64 == "" {
-		var genErr error
-		privB64, pubB64, genErr = GenerateRealityKeypair()
+	if !exists {
+		privB64, pubB64, genErr := GenerateRealityKeypair()
 		if genErr != nil {
 			return "", "", "", nil, nil, fmt.Errorf("generate reality keypair: %w", genErr)
 		}
+		shortID, genErr := GenerateShortID()
+		if genErr != nil {
+			return "", "", "", nil, nil, fmt.Errorf("generate short ID: %w", genErr)
+		}
+		return privB64, pubB64, shortID, []string{shortID}, []XrayClient{}, nil
+	}
+
+	catCmd := fmt.Sprintf("cat %s 2>/dev/null", ssh.EscapeShellArg(XrayConfigPath))
+	catOut, catErrOut, catCode, catErr := client.RunSudoCommand(ctx, catCmd)
+	var existingCfgBytes []byte
+	if catErr == nil && catCode == 0 && strings.TrimSpace(catOut) != "" && strings.TrimSpace(catOut) != "OK" {
+		existingCfgBytes = []byte(catOut)
+	} else {
+		data, dlErr := client.DownloadFile(ctx, XrayConfigPath)
+		if dlErr != nil {
+			return "", "", "", nil, nil, fmt.Errorf("failed to read existing xray config %s (cat code %d: %s, download err: %w)", XrayConfigPath, catCode, strings.TrimSpace(catErrOut), dlErr)
+		}
+		existingCfgBytes = data
+	}
+
+	trimmed := strings.TrimSpace(string(existingCfgBytes))
+	if len(trimmed) == 0 {
+		return "", "", "", nil, nil, fmt.Errorf("existing xray config %s is empty or truncated", XrayConfigPath)
+	}
+
+	parsed, parseErr := ParseXrayConfig(existingCfgBytes)
+	if parseErr != nil {
+		return "", "", "", nil, nil, fmt.Errorf("failed to parse existing xray config %s: %w", XrayConfigPath, parseErr)
+	}
+
+	if len(parsed.Inbounds) == 0 {
+		return "", "", "", nil, nil, fmt.Errorf("existing xray config %s contains no inbounds", XrayConfigPath)
+	}
+
+	inbound := parsed.Inbounds[0]
+	reality := inbound.StreamSettings.RealitySettings
+	if reality.PrivateKey == "" {
+		return "", "", "", nil, nil, fmt.Errorf("existing xray config %s missing reality private key", XrayConfigPath)
+	}
+
+	derivedPub, pubErr := DerivePublicKey(reality.PrivateKey)
+	if pubErr != nil {
+		return "", "", "", nil, nil, fmt.Errorf("failed to derive public key from existing reality private key: %w", pubErr)
+	}
+
+	privB64 := reality.PrivateKey
+	pubB64 := derivedPub
+	shortIDs := reality.ShortIDs
+	var shortID string
+	if len(shortIDs) > 0 && shortIDs[0] != "" {
+		shortID = shortIDs[0]
+	} else {
+		var genErr error
 		shortID, genErr = GenerateShortID()
 		if genErr != nil {
 			return "", "", "", nil, nil, fmt.Errorf("generate short ID: %w", genErr)
 		}
 		shortIDs = []string{shortID}
+	}
+
+	clients := inbound.Settings.Clients
+	if clients == nil {
 		clients = []XrayClient{}
-	} else {
-		if shortID == "" {
-			var genErr error
-			shortID, genErr = GenerateShortID()
-			if genErr != nil {
-				return "", "", "", nil, nil, fmt.Errorf("generate short ID: %w", genErr)
-			}
-			shortIDs = []string{shortID}
-		}
-		if clients == nil {
-			clients = []XrayClient{}
-		}
 	}
 
 	return privB64, pubB64, shortID, shortIDs, clients, nil

@@ -243,7 +243,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 				r.Patch("/{server_id}/host", h.UpdateServerHostHandler)
 				r.Post("/{server_id}/delete", h.DeleteServerHandler)
 				r.Post("/{server_id}/reboot", h.RebootServerHandler)
-				r.Post("/{server_id}/clear", h.ClearServerHandler)
 				r.Post("/{server_id}/stats", h.ServerStatsHandler)
 				r.Post("/{server_id}/check", h.ServerCheckHandler)
 				r.Post("/{server_id}/install", h.InstallProtocolHandler)
@@ -265,12 +264,18 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 
 			r.Group(func(r chi.Router) {
 				r.Use(middleware.RequireAdmin)
+				r.Post("/{server_id}/clear", h.ClearServerHandler)
 				r.Post("/{server_id}/reality/scan-sni", h.ScanRealitySNIHandler)
 			})
 		})
 	})
 
 	// 7. Admin Protected Pages & APIs
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.RequireAdmin)
+		r.Post("/{server_id}/clear", h.ClearServerHandler)
+	})
+
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.RequireAdminOrSupport)
 
@@ -284,7 +289,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 		r.Post("/confirm-fingerprint", h.ConfirmFingerprintHandler)
 		r.Post("/{server_id}/delete", h.DeleteServerHandler)
 		r.Post("/{server_id}/reboot", h.RebootServerHandler)
-		r.Post("/{server_id}/clear", h.ClearServerHandler)
 		r.Post("/{server_id}/stats", h.ServerStatsHandler)
 		r.Post("/{server_id}/check", h.ServerCheckHandler)
 		r.Post("/{server_id}/install", h.InstallProtocolHandler)

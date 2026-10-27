@@ -85,21 +85,36 @@ func RenderCaddyfile(port int, domain string, clients []NaiveClient) string {
 
 // ParseCaddyfile extracts the configured domain, port, and client basic-auth pairs from a Caddyfile.
 func ParseCaddyfile(content string) (domain string, port int, clients []NaiveClient, err error) {
-	lines := strings.Split(content, "\n")
+	trimmedContent := strings.TrimSpace(content)
+	if trimmedContent == "" {
+		return "", 0, nil, errors.New("empty caddyfile content")
+	}
+
+	openBraces := strings.Count(trimmedContent, "{")
+	closeBraces := strings.Count(trimmedContent, "}")
+	if openBraces == 0 || closeBraces == 0 {
+		return "", 0, nil, errors.New("caddyfile contains no configuration blocks")
+	}
+	if openBraces != closeBraces {
+		return "", 0, nil, fmt.Errorf("caddyfile contains unmatched braces: %d '{' vs %d '}'", openBraces, closeBraces)
+	}
+
+	lines := strings.Split(trimmedContent, "\n")
 	port = 443
 	domain = ""
 	clients = []NaiveClient{}
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "basic_auth ") {
+		if strings.HasPrefix(trimmed, "basic_auth") {
 			parts := strings.Fields(trimmed)
-			if len(parts) >= 3 {
-				clients = append(clients, NaiveClient{
-					Username: parts[1],
-					Password: parts[2],
-				})
+			if len(parts) < 3 {
+				return "", 0, nil, fmt.Errorf("malformed basic_auth directive: %q", trimmed)
 			}
+			clients = append(clients, NaiveClient{
+				Username: parts[1],
+				Password: parts[2],
+			})
 		} else if strings.Contains(trimmed, "{") && (strings.Contains(trimmed, ":") || strings.Contains(trimmed, ".")) {
 			header := strings.TrimSuffix(trimmed, "{")
 			header = strings.TrimSpace(header)

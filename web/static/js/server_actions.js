@@ -528,6 +528,10 @@ async function showConnectionConfig(clientId, connName, hasKey) {
 
 async function toggleConnection(clientId, enable) {
     const proto = document.getElementById('connProtoSelect').value;
+    if (proto === 'vless' || proto === 'naive') {
+        UI.toast('Client disable is not supported for this protocol; use remove instead', 'error');
+        return;
+    }
     try {
         UI.toast(_('connection_enabled_disabled').replace('{status}', enable ? _('enabling') : _('disabling')) + '...', 'info');
         await API.post(`/api/servers/${SERVER_ID}/connections/toggle`, {

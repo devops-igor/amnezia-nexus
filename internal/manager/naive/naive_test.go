@@ -704,3 +704,47 @@ func TestNaiveManager_ReinstallPreservesClients(t *testing.T) {
 		t.Errorf("client usernames mismatched after reinstall: got %+v", clientsAfter)
 	}
 }
+
+func TestNaiveManager_InstallFailsClosedOnMalformedOrUncertainConfig(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Truncated Caddyfile with unmatched braces fails closed", func(t *testing.T) {
+		mockSSH := newMockNaiveSSHClient()
+		truncated := []byte("{\n    admin 127.0.0.1:2019\n\n:443, localhost {\n    route {\n") // unmatched braces
+		mockSSH.files[NaiveCaddyfilePath] = truncated
+
+		pool := &mockNaivePool{client: mockSSH}
+		mgr := NewNaiveManagerWithServerLocks(pool, awg.NewServerLockRegistry())
+		server := &models.Server{ID: 1, Host: "192.0.2.1"}
+
+		err := mgr.Install(ctx, server, map[string]any{"port": 443})
+		if err == nil {
+			t.Fatalf("expected Install to fail closed on truncated Caddyfile, got nil error")
+		}
+		if !strings.Contains(err.Error(), "unmatched") && !strings.Contains(err.Error(), "parse") {
+			t.Errorf("expected error to mention parsing or unmatched braces, got: %v", err)
+		}
+		// Verify file was NOT overwritten
+		if string(mockSSH.files[NaiveCaddyfilePath]) != string(truncated) {
+			t.Errorf("truncated Caddyfile was overwritten despite failure!")
+		}
+	})
+
+	t.Run("Malformed basic_auth directive fails closed", func(t *testing.T) {
+		mockSSH := newMockNaiveSSHClient()
+		malformed := []byte("{\n    admin 127.0.0.1:2019\n}\n:443, localhost {\n    route {\n        forward_proxy {\n            basic_auth truncated_no_pass\n        }\n    }\n}\n")
+		mockSSH.files[NaiveCaddyfilePath] = malformed
+
+		pool := &mockNaivePool{client: mockSSH}
+		mgr := NewNaiveManagerWithServerLocks(pool, awg.NewServerLockRegistry())
+		server := &models.Server{ID: 1, Host: "192.0.2.1"}
+
+		err := mgr.Install(ctx, server, map[string]any{"port": 443})
+		if err == nil {
+			t.Fatalf("expected Install to fail closed on malformed basic_auth, got nil error")
+		}
+		if !strings.Contains(err.Error(), "basic_auth") {
+			t.Errorf("expected error to mention basic_auth, got: %v", err)
+		}
+	})
+}

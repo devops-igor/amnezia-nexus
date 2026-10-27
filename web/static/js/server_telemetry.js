@@ -520,9 +520,9 @@ async function loadConnections() {
                         </button>
                         ${awgRotateBtn}
                         ${proto === 'telemt' ? `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" onclick="editConnection(this.dataset.cid)" title="${_('edit')}"><svg class="icon"><use href="#icon-pencil"></use></svg></button>` : ''}
-                        <button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-enabled="${!enabled}" onclick="toggleConnection(this.dataset.cid, this.dataset.enabled === 'true')" title="${toggleTitle}">
+                        ${proto === 'vless' || proto === 'naive' ? '' : `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-enabled="${!enabled}" onclick="toggleConnection(this.dataset.cid, this.dataset.enabled === 'true')" title="${toggleTitle}">
                             <span class="badge-dot" style="background:${enabled ? 'var(--success)' : 'var(--text-muted)'}; width:10px; height:10px; display:inline-block;"></span>
-                        </button>
+                        </button>`}
                         <button class="btn btn-ghost btn-sm btn-icon" style="color:var(--danger);" data-cid="${UI.escapeHtml(client.clientId)}" onclick="removeConnection(this.dataset.cid)" title="${_('delete')}">
                             <svg class="icon"><use href="#icon-trash"></use></svg>
                         </button>

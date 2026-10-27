@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -25,15 +26,40 @@ var clearServerContainers = []string{
 // can abort before wiping configuration directories or database records.
 func (h *Handlers) teardownServerContainers(ctx context.Context, client ssh.SSHClient) error {
 	for _, c := range clearServerContainers {
-		if _, _, _, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s || true", ssh.EscapeShellArg(c))); err != nil {
-			return fmt.Errorf("failed to stop container %s: %w", c, err)
+		inspectCmd := fmt.Sprintf("docker inspect %s", ssh.EscapeShellArg(c))
+		out, errOut, code, err := client.RunSudoCommand(ctx, inspectCmd)
+		if err != nil {
+			return fmt.Errorf("failed to inspect container %s: %w", c, err)
 		}
-		if _, _, _, err := client.RunSudoCommand(ctx, fmt.Sprintf("docker rm %s || true", ssh.EscapeShellArg(c))); err != nil {
-			return fmt.Errorf("failed to remove container %s: %w", c, err)
+		if code != 0 {
+			combined := strings.ToLower(out + " " + errOut)
+			if strings.Contains(combined, "no such") {
+				continue
+			}
+			return fmt.Errorf("failed to inspect container %s (code %d): %s", c, code, strings.TrimSpace(errOut))
+		}
+
+		stopCmd := fmt.Sprintf("docker stop %s", ssh.EscapeShellArg(c))
+		if out, errOut, code, err := client.RunSudoCommand(ctx, stopCmd); err != nil || code != 0 {
+			combined := strings.ToLower(out + " " + errOut)
+			if !strings.Contains(combined, "no such") {
+				return fmt.Errorf("failed to stop container %s (code %d): %s", c, code, strings.TrimSpace(errOut))
+			}
+		}
+		rmCmd := fmt.Sprintf("docker rm -f %s", ssh.EscapeShellArg(c))
+		if out, errOut, code, err := client.RunSudoCommand(ctx, rmCmd); err != nil || code != 0 {
+			combined := strings.ToLower(out + " " + errOut)
+			if !strings.Contains(combined, "no such") {
+				return fmt.Errorf("failed to remove container %s (code %d): %s", c, code, strings.TrimSpace(errOut))
+			}
 		}
 	}
-	if _, _, _, err := client.RunSudoCommand(ctx, "docker network rm amnezia-dns-net || true"); err != nil {
-		return fmt.Errorf("failed to remove DNS network: %w", err)
+	netCmd := "docker network rm amnezia-dns-net"
+	if out, errOut, code, err := client.RunSudoCommand(ctx, netCmd); err != nil || code != 0 {
+		combined := strings.ToLower(out + " " + errOut)
+		if !strings.Contains(combined, "not found") && !strings.Contains(combined, "no such") {
+			return fmt.Errorf("failed to remove DNS network (code %d): %s", code, strings.TrimSpace(errOut))
+		}
 	}
 	return nil
 }
@@ -96,17 +122,30 @@ func (h *Handlers) ToggleContainerHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	var runOut, runStderr string
+	var runCode int
 	var runErr error
 	switch req.Action {
 	case "start":
-		_, _, _, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker start %s", ssh.EscapeShellArg(containerName)))
+		runOut, runStderr, runCode, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker start %s", ssh.EscapeShellArg(containerName)))
 	case "stop":
-		_, _, _, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s", ssh.EscapeShellArg(containerName)))
+		runOut, runStderr, runCode, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s", ssh.EscapeShellArg(containerName)))
 	default:
-		_, _, _, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker restart %s", ssh.EscapeShellArg(containerName)))
+		runOut, runStderr, runCode, runErr = client.RunSudoCommand(ctx, fmt.Sprintf("docker restart %s", ssh.EscapeShellArg(containerName)))
 	}
-	if runErr != nil {
-		h.JSONError(w, http.StatusInternalServerError, "operation_failed", fmt.Sprintf("Failed to %s container %s: %v", req.Action, containerName, runErr))
+	if runErr != nil || runCode != 0 {
+		errMsg := strings.TrimSpace(runStderr)
+		if errMsg == "" && runOut != "" {
+			errMsg = strings.TrimSpace(runOut)
+		}
+		if runErr != nil {
+			if errMsg != "" {
+				errMsg += ": " + runErr.Error()
+			} else {
+				errMsg = runErr.Error()
+			}
+		}
+		h.JSONError(w, http.StatusInternalServerError, "operation_failed", fmt.Sprintf("Failed to %s container %s (code %d): %s", req.Action, containerName, runCode, errMsg))
 		return
 	}
 

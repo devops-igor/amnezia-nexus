@@ -740,3 +740,45 @@ func TestXrayManager_StandardVLESS_EmptyFlow(t *testing.T) {
 		t.Errorf("expected empty flow in config.json client, got %q", clientInConfig.Flow)
 	}
 }
+
+func TestXrayManager_InstallFailsClosedOnMalformedOrUncertainConfig(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Malformed JSON config fails closed", func(t *testing.T) {
+		mockSSH := newMockXraySSHClient()
+		malformed := []byte(`{"inbounds": [{"settings": {"clients": [{"id": "abc"}]`) // truncated JSON
+		mockSSH.files[XrayConfigPath] = malformed
+
+		mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+		server := &models.Server{ID: 1, Host: "192.0.2.1"}
+
+		err := mgr.Install(ctx, server, map[string]any{"port": 443})
+		if err == nil {
+			t.Fatalf("expected Install to fail closed on malformed config, got nil error")
+		}
+		if !strings.Contains(err.Error(), "parse") {
+			t.Errorf("expected error to mention parsing failure, got: %v", err)
+		}
+		// Verify file was NOT overwritten with fresh credentials
+		if string(mockSSH.files[XrayConfigPath]) != string(malformed) {
+			t.Errorf("malformed config was overwritten despite failure!")
+		}
+	})
+
+	t.Run("Missing reality private key fails closed", func(t *testing.T) {
+		mockSSH := newMockXraySSHClient()
+		noKey := []byte(`{"inbounds": [{"protocol": "vless", "streamSettings": {"realitySettings": {}}}]}`)
+		mockSSH.files[XrayConfigPath] = noKey
+
+		mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+		server := &models.Server{ID: 1, Host: "192.0.2.1"}
+
+		err := mgr.Install(ctx, server, map[string]any{"port": 443})
+		if err == nil {
+			t.Fatalf("expected Install to fail closed on missing private key, got nil error")
+		}
+		if !strings.Contains(err.Error(), "private key") {
+			t.Errorf("expected error to mention missing private key, got: %v", err)
+		}
+	})
+}

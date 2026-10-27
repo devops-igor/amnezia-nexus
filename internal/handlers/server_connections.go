@@ -586,6 +586,21 @@ func (h *Handlers) ToggleServerConnectionHandler(w http.ResponseWriter, r *http.
 	enableState := req.Enable || req.Enabled
 
 	ctx := r.Context()
+
+	proto := req.Protocol
+	if proto == "" {
+		if conn, err := h.db.GetConnection(ctx, req.ClientID); err == nil && conn != nil {
+			proto = conn.Protocol
+		} else if conn, err := h.db.GetConnectionByClientID(ctx, req.ClientID, serverID); err == nil && conn != nil {
+			proto = conn.Protocol
+		}
+	}
+	normProto := models.NormalizeProtocol(proto)
+	if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
+		h.JSONError(w, http.StatusBadRequest, "unsupported_action", "Client disable is not supported for this protocol; use remove instead")
+		return
+	}
+
 	if serverID == 0 {
 		conn, err := h.db.GetConnection(ctx, req.ClientID)
 		if err != nil || conn == nil || conn.ServerID != 0 {

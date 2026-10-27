@@ -359,6 +359,12 @@ func (h *Handlers) RebootServerHandler(w http.ResponseWriter, r *http.Request) {
 
 // ClearServerHandler stops all protocol containers and wipes server configuration.
 func (h *Handlers) ClearServerHandler(w http.ResponseWriter, r *http.Request) {
+	session := h.GetSession(r)
+	if session == nil || !session.IsAdmin() {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required")
+		return
+	}
+
 	serverID, err := parseServerID(r)
 	if err != nil {
 		h.JSONError(w, http.StatusBadRequest, "invalid_parameter", "Invalid server_id")
@@ -382,8 +388,16 @@ func (h *Handlers) ClearServerHandler(w http.ResponseWriter, r *http.Request) {
 		h.JSONError(w, http.StatusInternalServerError, "operation_failed", fmt.Sprintf("Failed to teardown server containers: %v", err))
 		return
 	}
-	if _, _, _, err := client.RunSudoCommand(ctx, "rm -rf /opt/amnezia"); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "operation_failed", "Failed to clear server directory: "+err.Error())
+	if _, stderr, code, err := client.RunSudoCommand(ctx, "rm -rf /opt/amnezia"); err != nil || code != 0 {
+		errMsg := strings.TrimSpace(stderr)
+		if err != nil {
+			if errMsg != "" {
+				errMsg += ": " + err.Error()
+			} else {
+				errMsg = err.Error()
+			}
+		}
+		h.JSONError(w, http.StatusInternalServerError, "operation_failed", fmt.Sprintf("Failed to clear server directory (code %d): %s", code, errMsg))
 		return
 	}
 
@@ -593,7 +607,10 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 		protoMeta["port"] = req.Port
 	}
 	server.Protocols[req.Protocol] = protoMeta
-	_ = h.db.UpdateServerProtocols(ctx, serverID, server.Protocols)
+	if err := h.db.UpdateServerProtocols(ctx, serverID, server.Protocols); err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to update server protocols")
+		return
+	}
 
 	h.audit(r, "server.protocol_install", map[string]any{"server_id": serverID, "protocol": req.Protocol, "port": req.Port})
 	h.JSON(w, http.StatusOK, map[string]any{
@@ -652,9 +669,15 @@ func (h *Handlers) UninstallProtocolHandler(w http.ResponseWriter, r *http.Reque
 
 	if server.Protocols != nil {
 		delete(server.Protocols, req.Protocol)
-		_ = h.db.UpdateServerProtocols(ctx, serverID, server.Protocols)
+		if err := h.db.UpdateServerProtocols(ctx, serverID, server.Protocols); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to update server protocols")
+			return
+		}
 	}
-	_, _ = h.db.DeleteConnectionsByServerAndProtocol(ctx, serverID, req.Protocol)
+	if _, err := h.db.DeleteConnectionsByServerAndProtocol(ctx, serverID, req.Protocol); err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server connections")
+		return
+	}
 
 	h.audit(r, "server.protocol_uninstall", map[string]any{"server_id": serverID, "protocol": req.Protocol})
 	h.JSONOK(w)

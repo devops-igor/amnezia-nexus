@@ -466,6 +466,7 @@ func TestServerHandlers(t *testing.T) {
 
 	t.Run("ClearServerHandler", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/clear", serverID), nil)
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {
@@ -602,6 +603,7 @@ func TestServerHandlers(t *testing.T) {
 
 		// Clear 404
 		reqClear := httptest.NewRequest(http.MethodPost, "/api/servers/99999/clear", nil)
+		reqClear = reqClear.WithContext(middleware.WithSession(reqClear.Context(), &models.SessionData{Role: models.RoleAdmin}))
 		wClear := httptest.NewRecorder()
 		r.ServeHTTP(wClear, reqClear)
 		if wClear.Code != http.StatusNotFound {

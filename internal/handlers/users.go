@@ -527,6 +527,17 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	conns, _ := h.db.GetConnectionsByUserID(ctx, userID)
+	if !req.Enabled {
+		for _, c := range conns {
+			proto := models.NormalizeProtocol(c.Protocol)
+			if proto == models.ProtocolVLESS || proto == models.ProtocolNaive {
+				h.JSONError(w, http.StatusBadRequest, "unsupported_action", "Client disable is not supported for this protocol; use remove instead")
+				return
+			}
+		}
+	}
+
 	if _, err := h.db.UpdateUser(ctx, userID, map[string]any{
 		"enabled": req.Enabled,
 	}); err != nil {
@@ -542,7 +553,7 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Toggle clients on servers
-	conns, _ := h.db.GetConnectionsByUserID(ctx, userID)
+	conns, _ = h.db.GetConnectionsByUserID(ctx, userID)
 	for _, c := range conns {
 		if c.Protocol == "awg" && h.awgMgr != nil {
 			if server, err := h.db.GetServer(ctx, c.ServerID); err == nil && server != nil {

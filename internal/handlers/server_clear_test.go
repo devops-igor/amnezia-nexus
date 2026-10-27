@@ -185,3 +185,102 @@ func TestClearServer_TeardownFailurePreservesRecords(t *testing.T) {
 		t.Errorf("expected connections to be preserved after teardown failure, got 0")
 	}
 }
+
+func TestClearServer_NonzeroDockerExitHaltsClearAndPreservesRecords(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+
+	sid, err := db.CreateServer(ctx, &models.Server{
+		Name:    "clear-nonzero-server",
+		Host:    "192.0.2.52",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"vless": map[string]any{"installed": true},
+			"naive": map[string]any{"installed": true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create test server: %v", err)
+	}
+
+	_, err = db.CreateUser(ctx, &models.User{
+		ID:       "clear-nonzero-user",
+		Username: "nonzero-user",
+		Role:     models.RoleUser,
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create test user: %v", err)
+	}
+
+	conn := &models.UserConnection{
+		ServerID: sid,
+		UserID:   "clear-nonzero-user",
+		Protocol: "vless",
+		ClientID: "client-nonzero-1",
+	}
+	if _, err := db.CreateConnection(ctx, conn); err != nil {
+		t.Fatalf("failed to create test connection: %v", err)
+	}
+
+	var mu sync.Mutex
+	commands := []string{}
+	// Mock returns code 1 with nil Go error when docker stop is attempted
+	h.sshPool = &testMockSSHPool{
+		client: &testMockSSHClient{
+			cmdFunc: func(_ context.Context, cmd string) (string, string, int, error) {
+				mu.Lock()
+				commands = append(commands, cmd)
+				mu.Unlock()
+				if strings.Contains(cmd, "docker inspect") {
+					// Container exists
+					return "{}", "", 0, nil
+				}
+				if strings.Contains(cmd, "docker stop") {
+					// Docker daemon error, nonzero exit code with nil Go error
+					return "", "Error response from daemon: docker daemon failure", 1, nil
+				}
+				return "OK", "", 0, nil
+			},
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	rc := chi.NewRouteContext()
+	rc.URLParams.Add("server_id", fmt.Sprint(sid))
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rc))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+
+	w := httptest.NewRecorder()
+	h.ClearServerHandler(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 on nonzero docker exit, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify rm -rf /opt/amnezia was never executed
+	mu.Lock()
+	cmds := append([]string{}, commands...)
+	mu.Unlock()
+	for _, cmd := range cmds {
+		if strings.Contains(cmd, "rm -rf /opt/amnezia") {
+			t.Errorf("rm -rf /opt/amnezia was executed despite nonzero docker exit: %s", cmd)
+		}
+	}
+
+	// Verify protocols and connections are preserved in database
+	saved, err := db.GetServer(ctx, sid)
+	if err != nil {
+		t.Fatalf("failed to fetch server: %v", err)
+	}
+	if len(saved.Protocols) == 0 {
+		t.Errorf("expected protocols to be preserved after nonzero docker exit, got empty map")
+	}
+	conns, err := db.GetConnectionsByServerID(ctx, sid)
+	if err != nil {
+		t.Fatalf("failed to get connections: %v", err)
+	}
+	if len(conns) == 0 {
+		t.Errorf("expected connections to be preserved after nonzero docker exit, got 0")
+	}
+}
