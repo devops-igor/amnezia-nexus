@@ -191,6 +191,8 @@ func TestResourceRBACClosureServerConnectionListings(t *testing.T) {
 				"clientId":  "vless-secret",
 				"client_id": "vless-secret",
 				"uuid":      "vless-secret",
+				"name":      "vless-secret",
+				"userData":  map[string]any{"clientName": "vless-secret"},
 			}}, nil
 		},
 	})
@@ -212,14 +214,28 @@ func TestResourceRBACClosureServerConnectionListings(t *testing.T) {
 			if len(response.Clients) != 1 {
 				t.Fatalf("clients = %d, want 1", len(response.Clients))
 			}
+			client := response.Clients[0]
 			for _, key := range []string{"clientId", "client_id", "uuid"} {
 				want := ""
 				if role == models.RoleAdmin {
 					want = "vless-secret"
 				}
-				if response.Clients[0][key] != want {
-					t.Errorf("%s = %v, want %q", key, response.Clients[0][key], want)
+				if client[key] != want {
+					t.Errorf("%s = %v, want %q", key, client[key], want)
 				}
+			}
+			wantName := "Unnamed"
+			if role == models.RoleAdmin {
+				wantName = "vless-secret"
+			} else if bytes.Contains(w.Body.Bytes(), []byte("vless-secret")) {
+				t.Fatal("Support response contains VLESS authentication UUID")
+			}
+			if client["name"] != wantName {
+				t.Errorf("name = %v, want %q", client["name"], wantName)
+			}
+			userData, ok := client["userData"].(map[string]any)
+			if !ok || userData["clientName"] != wantName {
+				t.Errorf("userData.clientName = %v, want %q", client["userData"], wantName)
 			}
 		})
 	}
@@ -240,6 +256,51 @@ func TestResourceRBACClosureServerConnectionListings(t *testing.T) {
 			t.Fatalf("AWG clients = %#v, want unredacted client-1", response.Clients)
 		}
 	})
+}
+
+func TestResourceRBACClosureUserConnections(t *testing.T) {
+	h, db, serverID := setupResourceRBACClosure(t)
+	if _, err := db.CreateUser(context.Background(), &models.User{
+		ID: "closure-user", Username: "closure-user", Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	createResourceRBACConnection(t, db, "user-vless", "closure-user", serverID, models.ProtocolVLESS, "vless-secret")
+	createResourceRBACConnection(t, db, "user-awg", "closure-user", serverID, models.ProtocolAWG, "awg-secret")
+
+	for _, role := range []models.UserRole{models.RoleSupport, models.RoleAdmin} {
+		t.Run(string(role), func(t *testing.T) {
+			w := resourceRBACRequest(t, setupFullUsersRouter(h), http.MethodGet, "/api/users/closure-user/connections", resourceRBACSession(role), nil)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d; body: %s", w.Code, w.Body.String())
+			}
+			var response struct {
+				Connections []map[string]any `json:"connections"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode connections: %v", err)
+			}
+			if len(response.Connections) != 2 {
+				t.Fatalf("connections = %d, want 2", len(response.Connections))
+			}
+			for _, conn := range response.Connections {
+				switch conn["protocol"] {
+				case models.ProtocolVLESS:
+					want := ""
+					if role == models.RoleAdmin {
+						want = "vless-secret"
+					}
+					if conn["client_id"] != want {
+						t.Errorf("VLESS client_id = %v, want %q", conn["client_id"], want)
+					}
+				case models.ProtocolAWG:
+					if conn["client_id"] != "awg-secret" {
+						t.Errorf("AWG client_id = %v, want unredacted", conn["client_id"])
+					}
+				}
+			}
+		})
+	}
 }
 
 func TestResourceRBACClosureProtocolClients(t *testing.T) {

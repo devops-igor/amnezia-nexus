@@ -88,6 +88,13 @@ func (h *Handlers) GetServerConnectionsHandler(w http.ResponseWriter, r *http.Re
 			client["clientId"] = ""
 			client["client_id"] = ""
 			client["uuid"] = ""
+			// Xray uses the authentication UUID as the display name for unassigned clients.
+			if client["assigned_user_id"] == nil || client["assigned_user_id"] == "" {
+				client["name"] = "Unnamed"
+				if ud, ok := client["userData"].(map[string]any); ok {
+					ud["clientName"] = "Unnamed"
+				}
+			}
 		}
 	}
 
