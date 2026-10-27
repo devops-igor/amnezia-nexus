@@ -75,7 +75,7 @@ func (m *NaiveManager) AddClient(ctx context.Context, server *models.Server, cli
 
 	// 4. Render and upload updated Caddyfile
 	updatedContent := RenderCaddyfile(port, domain, clients)
-	if err := client.UploadSudoFile(ctx, NaiveCaddyfilePath, []byte(updatedContent), 0644); err != nil {
+	if err := client.UploadSudoFile(ctx, NaiveCaddyfilePath, []byte(updatedContent), 0600); err != nil {
 		return nil, fmt.Errorf("upload updated Caddyfile: %w", err)
 	}
 
@@ -140,7 +140,7 @@ func (m *NaiveManager) RemoveClient(ctx context.Context, server *models.Server, 
 	}
 
 	updatedContent := RenderCaddyfile(port, domain, filtered)
-	if err := client.UploadSudoFile(ctx, NaiveCaddyfilePath, []byte(updatedContent), 0644); err != nil {
+	if err := client.UploadSudoFile(ctx, NaiveCaddyfilePath, []byte(updatedContent), 0600); err != nil {
 		return fmt.Errorf("upload updated Caddyfile: %w", err)
 	}
 

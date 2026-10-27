@@ -99,7 +99,7 @@ func (m *XrayManager) AddClient(ctx context.Context, server *models.Server, clie
 		return nil, fmt.Errorf("marshal updated xray config: %w", err)
 	}
 
-	if err := client.UploadSudoFile(ctx, XrayConfigPath, updatedBytes, 0644); err != nil {
+	if err := client.UploadSudoFile(ctx, XrayConfigPath, updatedBytes, 0600); err != nil {
 		return nil, fmt.Errorf("upload updated xray config: %w", err)
 	}
 
@@ -191,7 +191,7 @@ func (m *XrayManager) RemoveClient(ctx context.Context, server *models.Server, c
 		return fmt.Errorf("marshal updated xray config: %w", err)
 	}
 
-	if err := client.UploadSudoFile(ctx, XrayConfigPath, updatedBytes, 0644); err != nil {
+	if err := client.UploadSudoFile(ctx, XrayConfigPath, updatedBytes, 0600); err != nil {
 		return fmt.Errorf("upload updated xray config: %w", err)
 	}
 

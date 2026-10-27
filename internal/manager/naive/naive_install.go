@@ -166,7 +166,7 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 	port, domain := parseNaiveInstallOptions(params, server.Host)
 
 	// 3. Create directory structure
-	mkdirCmd := fmt.Sprintf("mkdir -p %s", ssh.EscapeShellArg(NaiveHTMLDir))
+	mkdirCmd := fmt.Sprintf("mkdir -p %s && chmod 0700 %s", ssh.EscapeShellArg(NaiveHTMLDir), ssh.EscapeShellArg(NaiveConfigDir))
 	if _, errOut, code, err := client.RunSudoCommand(ctx, mkdirCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to create naive directories (code %d): %s: %w", code, errOut, err)
 	}
@@ -183,7 +183,7 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 		return fmt.Errorf("resolve existing clients: %w", err)
 	}
 	caddyfileContent := RenderCaddyfile(port, domain, existingClients)
-	if err := client.UploadSudoFile(ctx, NaiveCaddyfilePath, []byte(caddyfileContent), 0644); err != nil {
+	if err := client.UploadSudoFile(ctx, NaiveCaddyfilePath, []byte(caddyfileContent), 0600); err != nil {
 		return fmt.Errorf("upload Caddyfile: %w", err)
 	}
 

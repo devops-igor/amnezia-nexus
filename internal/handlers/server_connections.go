@@ -88,6 +88,18 @@ func (h *Handlers) GetServerConnectionsHandler(w http.ResponseWriter, r *http.Re
 	})
 }
 
+func (h *Handlers) authorizeAdminProtocol(w http.ResponseWriter, r *http.Request, protocol string) bool {
+	proto := models.NormalizeProtocol(protocol)
+	if proto != models.ProtocolVLESS && proto != models.ProtocolNaive {
+		return true
+	}
+	if session := h.GetSession(r); session == nil || session.Role != models.RoleAdmin {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required for VLESS and Naive protocols")
+		return false
+	}
+	return true
+}
+
 // AddServerConnectionHandler provisions a new client connection on a server.
 func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Request) {
 	serverID, err := parseServerID(r)
@@ -104,6 +116,9 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 
 	if err := req.Validate(); err != nil {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
+		return
+	}
+	if !h.authorizeAdminProtocol(w, r, req.Protocol) {
 		return
 	}
 
@@ -309,6 +324,10 @@ func (h *Handlers) RemoveServerConnectionHandler(w http.ResponseWriter, r *http.
 	}
 
 	ctx := r.Context()
+	protocol := h.resolveToggleProtocol(ctx, serverID, req.ClientID, req.Protocol)
+	if !h.authorizeAdminProtocol(w, r, protocol) {
+		return
+	}
 	if serverID == 0 {
 		clientPub := req.ClientID
 		if conn, err := h.db.GetConnection(ctx, req.ClientID); err == nil && conn != nil && conn.ServerID == 0 {
@@ -511,6 +530,10 @@ func (h *Handlers) GetServerConnectionConfigHandler(w http.ResponseWriter, r *ht
 	}
 
 	ctx := r.Context()
+	protocol := h.resolveToggleProtocol(ctx, serverID, req.ClientID, req.Protocol)
+	if !h.authorizeAdminProtocol(w, r, protocol) {
+		return
+	}
 	sess := h.GetSession(r)
 	if sess != nil && sess.Role == models.RoleUser {
 		userConns, _ := h.db.GetConnectionsByUserID(ctx, sess.UserID)

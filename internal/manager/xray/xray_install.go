@@ -214,7 +214,7 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	}
 
 	// 4. Create directory structure
-	mkdirCmd := fmt.Sprintf("mkdir -p %s", ssh.EscapeShellArg(XrayConfigDir))
+	mkdirCmd := fmt.Sprintf("mkdir -p %s && chmod 0700 %s", ssh.EscapeShellArg(XrayConfigDir), ssh.EscapeShellArg(XrayConfigDir))
 	if _, errOut, code, err := client.RunSudoCommand(ctx, mkdirCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to create xray config directory (code %d): %s: %w", code, errOut, err)
 	}
@@ -227,7 +227,7 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 		return fmt.Errorf("render xray config: %w", err)
 	}
 
-	if err := client.UploadSudoFile(ctx, XrayConfigPath, cfgBytes, 0644); err != nil {
+	if err := client.UploadSudoFile(ctx, XrayConfigPath, cfgBytes, 0600); err != nil {
 		return fmt.Errorf("upload xray config: %w", err)
 	}
 

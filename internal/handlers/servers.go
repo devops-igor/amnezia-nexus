@@ -607,8 +607,10 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 		protoMeta = make(map[string]any)
 	}
 	protoMeta["installed"] = true
-	if req.Port != "" {
-		protoMeta["port"] = req.Port
+	if protoMeta["port"] == nil || protoMeta["port"] == "" {
+		if req.Port != "" {
+			protoMeta["port"] = req.Port
+		}
 	}
 	server.Protocols[req.Protocol] = protoMeta
 	if err := h.db.UpdateServerProtocols(ctx, serverID, server.Protocols); err != nil {

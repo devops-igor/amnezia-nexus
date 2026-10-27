@@ -63,8 +63,11 @@ func ProbeTLSH2(ctx context.Context, domain string, opts ProbeOptions) ProbeResu
 		serverName = h
 	}
 
+	candCtx, candCancel := context.WithTimeout(ctx, timeout)
+	defer candCancel()
+
 	start := time.Now()
-	rawConn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+	rawConn, err := dialer.DialContext(candCtx, "tcp", targetAddr)
 	if err != nil {
 		return ProbeResult{
 			Domain: domain,
@@ -83,7 +86,7 @@ func ProbeTLSH2(ctx context.Context, domain string, opts ProbeOptions) ProbeResu
 	}
 
 	tlsConn := tls.Client(rawConn, tlsCfg)
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
+	if err := tlsConn.HandshakeContext(candCtx); err != nil {
 		return ProbeResult{
 			Domain: domain,
 			Error:  fmt.Sprintf("tls handshake failed: %v", err),

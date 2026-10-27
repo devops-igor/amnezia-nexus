@@ -564,7 +564,11 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conns, _ := h.db.GetConnectionsByUserID(ctx, userID)
+	conns, err := h.db.GetConnectionsByUserID(ctx, userID)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve user connections")
+		return
+	}
 	if !req.Enabled {
 		// VLESS/Naive cannot be toggled in place: revoke the remote credential
 		// first (fail closed, user stays enabled), then drop the row like userops does.
@@ -633,6 +637,9 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 
 	if err := req.Validate(); err != nil {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
+		return
+	}
+	if !h.authorizeAdminProtocol(w, r, req.Protocol) {
 		return
 	}
 
