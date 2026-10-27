@@ -66,11 +66,7 @@ func NewRouter(cfg *config.Config, db *database.DB, vpnSvc *vpn.Service) *chi.Mu
 	reg.Register(xrayMgr)
 	reg.Register(naiveMgr)
 
-	if vpnSvc != nil && !vpnSvc.HasAWGStatusProvider() {
-		vpnSvc.SetAWGStatusProvider(awgMgr)
-	}
-
-	h := handlers.NewHandlers(handlers.Dependencies{
+	return NewRouterWithDeps(handlers.Dependencies{
 		Config:          cfg,
 		DB:              db,
 		Registry:        reg,
@@ -82,11 +78,18 @@ func NewRouter(cfg *config.Config, db *database.DB, vpnSvc *vpn.Service) *chi.Mu
 		NaiveManager:    naiveMgr,
 		VPNService:      vpnSvc,
 	})
+}
 
+// NewRouterWithDeps builds the router around caller-owned managers and registry, so HTTP
+// handlers and background services (orchestrator, reconciler, userops) share the same instances.
+func NewRouterWithDeps(deps handlers.Dependencies) *chi.Mux {
+	if vpnSvc := deps.VPNService; vpnSvc != nil && deps.AWGManager != nil && !vpnSvc.HasAWGStatusProvider() {
+		vpnSvc.SetAWGStatusProvider(deps.AWGManager)
+	}
 	return NewRouterWithOptions(Options{
-		Config:   cfg,
-		DB:       db,
-		Handlers: h,
+		Config:   deps.Config,
+		DB:       deps.DB,
+		Handlers: handlers.NewHandlers(deps),
 	})
 }
 

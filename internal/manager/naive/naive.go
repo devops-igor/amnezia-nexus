@@ -31,48 +31,51 @@ type SSHProvider interface {
 //
 //nolint:revive
 type NaiveManager struct {
-	sshPool       SSHProvider
-	serverLocks   *awg.ServerLockRegistry
-	mu            sync.Mutex
-	recentMu      sync.Mutex
-	recentClients map[string]time.Time
+	sshPool     SSHProvider
+	serverLocks *awg.ServerLockRegistry
+	mu          sync.Mutex
 }
 
 // NewNaiveManager creates a new NaiveManager instance.
 func NewNaiveManager(pool SSHProvider) *NaiveManager {
 	return &NaiveManager{
-		sshPool:       pool,
-		serverLocks:   awg.GlobalServerLocks(),
-		recentClients: make(map[string]time.Time),
+		sshPool:     pool,
+		serverLocks: awg.GlobalServerLocks(),
 	}
 }
 
 // NewNaiveManagerWithServerLocks creates a new NaiveManager with custom server locks for testing.
 func NewNaiveManagerWithServerLocks(pool SSHProvider, locks *awg.ServerLockRegistry) *NaiveManager {
 	return &NaiveManager{
-		sshPool:       pool,
-		serverLocks:   locks,
-		recentClients: make(map[string]time.Time),
+		sshPool:     pool,
+		serverLocks: locks,
 	}
 }
 
+// recentClients is package-level so every manager instance (HTTP handlers, reconciler,
+// orchestrator) sees clients created by any other instance during the creation grace window.
+var (
+	recentMu      sync.Mutex
+	recentClients = make(map[string]time.Time)
+)
+
 func (m *NaiveManager) recordClientCreation(clientID string, createdAt time.Time) {
-	m.recentMu.Lock()
-	defer m.recentMu.Unlock()
-	m.recentClients[clientID] = createdAt
+	recentMu.Lock()
+	defer recentMu.Unlock()
+	recentClients[clientID] = createdAt
 }
 
 func (m *NaiveManager) recentClientCreation(clientID string) (time.Time, bool) {
-	m.recentMu.Lock()
-	defer m.recentMu.Unlock()
+	recentMu.Lock()
+	defer recentMu.Unlock()
 
 	now := time.Now().UTC()
-	for id, createdAt := range m.recentClients {
+	for id, createdAt := range recentClients {
 		if now.Sub(createdAt) >= 10*time.Minute {
-			delete(m.recentClients, id)
+			delete(recentClients, id)
 		}
 	}
-	createdAt, ok := m.recentClients[clientID]
+	createdAt, ok := recentClients[clientID]
 	return createdAt, ok && now.Sub(createdAt) < 5*time.Minute
 }
 

@@ -86,7 +86,7 @@ func TestNaiveManager_AddClientEmitsCreationDate(t *testing.T) {
 	}
 	mgr.recordClientCreation(id, time.Now().Add(-11*time.Minute))
 	_, _ = mgr.GetClients(ctx, server)
-	if _, ok := mgr.recentClients[id]; ok {
+	if _, ok := recentClients[id]; ok {
 		t.Errorf("expected entry older than 10 minutes to be pruned")
 	}
 }
@@ -109,22 +109,25 @@ func TestNaiveManager_ReconcilerSparesClientDuringReload(t *testing.T) {
 	mock := newMockNaiveSSHClient()
 	seedCaddyfile(mock)
 	gate := &reloadGateSSH{mockNaiveSSHClient: mock, entered: make(chan struct{}), release: make(chan struct{})}
-	mgr := NewNaiveManagerWithServerLocks(&mockNaivePool{client: gate}, awg.NewServerLockRegistry())
+	// Production topology: HTTP handlers and the reconciler hold separately constructed managers.
+	sshPool := &mockNaivePool{client: gate}
+	handlerMgr := NewNaiveManager(sshPool)
+	reconcilerMgr := NewNaiveManager(sshPool)
 
 	sID, err := db.CreateServer(ctx, &models.Server{
-		Name: "S", Host: "198.51.100.72", SSHPort: 22, Protocols: map[string]any{mgr.Protocol(): map[string]any{"port": 443}},
+		Name: "S", Host: "198.51.100.72", SSHPort: 22, Protocols: map[string]any{handlerMgr.Protocol(): map[string]any{"port": 443}},
 	})
 	if err != nil {
 		t.Fatalf("CreateServer: %v", err)
 	}
 	// Legacy adoption already completed, so untracked remote peers are treated as zombies.
-	if err := db.SetSetting(ctx, "legacy_peers_adopted:"+strconv.FormatInt(sID, 10)+":"+models.NormalizeProtocol(mgr.Protocol()), true); err != nil {
+	if err := db.SetSetting(ctx, "legacy_peers_adopted:"+strconv.FormatInt(sID, 10)+":"+models.NormalizeProtocol(handlerMgr.Protocol()), true); err != nil {
 		t.Fatalf("SetSetting: %v", err)
 	}
 
 	addDone := make(chan map[string]any, 1)
 	go func() {
-		res, err := mgr.AddClient(ctx, &models.Server{ID: sID, Host: "198.51.100.72", SSHPort: 22}, map[string]any{"name": "inflight"})
+		res, err := handlerMgr.AddClient(ctx, &models.Server{ID: sID, Host: "198.51.100.72", SSHPort: 22}, map[string]any{"name": "inflight"})
 		if err != nil {
 			t.Errorf("AddClient: %v", err)
 		}
@@ -133,7 +136,16 @@ func TestNaiveManager_ReconcilerSparesClientDuringReload(t *testing.T) {
 
 	<-gate.entered // Caddyfile uploaded, reload in flight, no DB rows yet
 
-	rec := &removeRecorder{NaiveManager: mgr}
+	srv := &models.Server{ID: sID, Host: "198.51.100.72", SSHPort: 22}
+	seen, err := reconcilerMgr.GetClients(ctx, srv)
+	if err != nil || len(seen) != 1 {
+		t.Fatalf("reconciler GetClients = %v, %v; want 1 client", seen, err)
+	}
+	if seen[0]["creationDate"] == nil {
+		t.Errorf("reconciler instance did not emit creationDate for client created by handler instance")
+	}
+
+	rec := &removeRecorder{NaiveManager: reconcilerMgr}
 	if err := reconciliation.New(db, singleResolver{rec}).CleanupZombiePeers(ctx); err != nil {
 		t.Fatalf("CleanupZombiePeers: %v", err)
 	}
