@@ -669,3 +669,129 @@ func TestResourceRBACClosureMyConnectionsPageCredentialBoundary(t *testing.T) {
 		}
 	}
 }
+
+func TestResourceRBACClosureRemoveUsesRecordedProtocol(t *testing.T) {
+	for _, tc := range []struct {
+		role models.UserRole
+		want int
+	}{
+		{role: models.RoleSupport, want: http.StatusForbidden},
+		{role: models.RoleAdmin, want: http.StatusBadRequest},
+	} {
+		t.Run(string(tc.role), func(t *testing.T) {
+			h, db, serverID := setupResourceRBACClosure(t)
+			if _, err := db.CreateUser(context.Background(), &models.User{
+				ID: "closure-user", Username: "closure-user", Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatalf("CreateUser: %v", err)
+			}
+			createResourceRBACConnection(t, db, "forged-remove", "closure-user", serverID, models.ProtocolVLESS, "vless-secret")
+			var removals []string
+			for _, protocol := range []string{models.ProtocolVLESS, "dns"} {
+				h.registry.Register(&mockProtocolManager{
+					protocol: protocol,
+					removeClientFn: func(context.Context, *models.Server, string) error {
+						removals = append(removals, protocol)
+						return nil
+					},
+				})
+			}
+
+			path := fmt.Sprintf("/api/servers/%d/connections/remove", serverID)
+			w := resourceRBACRequest(t, setupFullServerConnectionsRouter(h), http.MethodPost, path, resourceRBACSession(tc.role), models.ConnectionActionRequest{
+				Protocol: "dns",
+				ClientID: "vless-secret",
+			})
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tc.want, w.Body.String())
+			}
+			conn, err := db.GetConnection(context.Background(), "forged-remove")
+			if err != nil || conn == nil {
+				t.Fatalf("forged request deleted database row: conn=%v err=%v", conn, err)
+			}
+			if len(removals) != 0 {
+				t.Fatalf("forged request removed remote credentials: %v", removals)
+			}
+		})
+	}
+}
+
+func TestResourceRBACClosureEditUsesRecordedProtocol(t *testing.T) {
+	h, db, serverID := setupResourceRBACClosure(t)
+	ctx := context.Background()
+	userID := "edit-destination"
+	if _, err := db.CreateUser(ctx, &models.User{
+		ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	createResourceRBACConnection(t, db, "protected-edit", userID, serverID, models.ProtocolVLESS, "vless-secret")
+
+	path := fmt.Sprintf("/api/servers/%d/connections/edit", serverID)
+	w := resourceRBACRequest(t, setupFullServerConnectionsRouter(h), http.MethodPost, path, resourceRBACSession(models.RoleSupport), models.EditConnectionRequest{
+		Protocol: models.ProtocolVLESS,
+		ClientID: "vless-secret",
+		UserID:   &userID,
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body: %s", w.Code, w.Body.String())
+	}
+	conn, err := db.GetConnection(ctx, "protected-edit")
+	if err != nil || conn == nil || conn.UserID != userID {
+		t.Fatalf("forbidden edit changed ownership: conn=%v err=%v", conn, err)
+	}
+}
+
+func TestDeleteUserHandlerHoldsUserLock(t *testing.T) {
+	h, db, serverID := setupResourceRBACClosure(t)
+	ctx := context.Background()
+	userID := "delete-lock-user"
+	if _, err := db.CreateUser(ctx, &models.User{
+		ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	createResourceRBACConnection(t, db, "delete-lock-connection", userID, serverID, models.ProtocolAWG, "delete-lock-client")
+	removeStarted := make(chan struct{}, 1)
+	h.registry.Register(&mockProtocolManager{
+		protocol: models.ProtocolAWG,
+		removeClientFn: func(context.Context, *models.Server, string) error {
+			removeStarted <- struct{}{}
+			return nil
+		},
+	})
+
+	unlock := h.lockUser(userID)
+	req := httptest.NewRequest(http.MethodPost, "/api/users/"+userID+"/delete", nil)
+	req = req.WithContext(middleware.WithSession(req.Context(), resourceRBACSession(models.RoleAdmin)))
+	router := setupFullUsersRouter(h)
+	done := make(chan int, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		done <- w.Code
+	}()
+
+	select {
+	case <-removeStarted:
+		unlock()
+		<-done
+		t.Fatal("remote revocation started without the user lock")
+	case <-time.After(100 * time.Millisecond):
+	}
+	unlock()
+
+	select {
+	case <-removeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("remote revocation did not start after releasing the user lock")
+	}
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("user deletion did not complete")
+	}
+}

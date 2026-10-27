@@ -346,6 +346,11 @@ func (h *Handlers) RemoveServerConnectionHandler(w http.ResponseWriter, r *http.
 	if !h.authorizeAdminProtocol(w, r, protocol) {
 		return
 	}
+	if protocol != req.Protocol {
+		h.JSONError(w, http.StatusBadRequest, "protocol_mismatch", "Protocol does not match the recorded connection")
+		return
+	}
+	req.Protocol = protocol
 	if serverID == 0 {
 		clientPub := req.ClientID
 		if conn, err := h.db.GetConnection(ctx, req.ClientID); err == nil && conn != nil && conn.ServerID == 0 {
@@ -360,13 +365,13 @@ func (h *Handlers) RemoveServerConnectionHandler(w http.ResponseWriter, r *http.
 		if h.vpnSvc != nil && clientPub != "" {
 			_ = h.vpnSvc.ReleaseClient(ctx, clientPub)
 		}
-		if _, err := h.db.DeleteConnectionByClientID(ctx, req.ClientID, 0); err != nil {
+		if err := h.deleteConnectionByClientIDAndProtocol(ctx, 0, req.ClientID, req.Protocol); err != nil {
 			h.peerChangeError(w, err)
 			return
 		}
 		_ = h.db.DeletePeerLifecycle(ctx, 0, req.Protocol, req.ClientID)
 		if clientPub != req.ClientID {
-			if _, err := h.db.DeleteConnectionByClientID(ctx, clientPub, 0); err != nil {
+			if err := h.deleteConnectionByClientIDAndProtocol(ctx, 0, clientPub, req.Protocol); err != nil {
 				h.peerChangeError(w, err)
 				return
 			}
@@ -401,7 +406,7 @@ func (h *Handlers) RemoveServerConnectionHandler(w http.ResponseWriter, r *http.
 		h.JSONError(w, http.StatusInternalServerError, "operation_failed", "Failed to remove client on server: "+err.Error())
 		return
 	}
-	if _, err := h.db.DeleteConnectionByClientID(ctx, req.ClientID, serverID); err != nil {
+	if err := h.deleteConnectionByClientIDAndProtocol(ctx, serverID, req.ClientID, req.Protocol); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete connection record: "+err.Error())
 		return
 	}
@@ -496,6 +501,27 @@ func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	ctx := r.Context()
+	protocol := h.resolveToggleProtocol(ctx, serverID, req.ClientID, req.Protocol)
+	if !h.authorizeAdminProtocol(w, r, protocol) {
+		return
+	}
+	if req.Protocol != "" && protocol != req.Protocol {
+		h.JSONError(w, http.StatusBadRequest, "protocol_mismatch", "Protocol does not match the recorded connection")
+		return
+	}
+	req.Protocol = protocol
+	if req.UserID != nil && *req.UserID != "" {
+		defer h.lockUser(*req.UserID)()
+		user, err := h.db.GetUser(ctx, *req.UserID)
+		if err != nil || user == nil {
+			h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
+			return
+		}
+		if !user.Enabled {
+			h.JSONError(w, http.StatusForbidden, "forbidden", "Account is disabled")
+			return
+		}
+	}
 	server, err := h.db.GetServer(ctx, serverID)
 	if err != nil || server == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
@@ -603,13 +629,27 @@ func (h *Handlers) GetServerConnectionConfigHandler(w http.ResponseWriter, r *ht
 	})
 }
 
-// resolveToggleProtocol returns the requested protocol, or when omitted the one recorded
-// for the client in user_connections or (for unassigned clients) peer_lifecycle; "" if unknown.
-func (h *Handlers) resolveToggleProtocol(ctx context.Context, serverID int64, clientID, requested string) string {
-	if requested != "" {
-		return requested
+// deleteConnectionByClientIDAndProtocol deletes only rows for the trusted protocol.
+func (h *Handlers) deleteConnectionByClientIDAndProtocol(ctx context.Context, serverID int64, clientID, protocol string) error {
+	conns, err := h.db.GetConnectionsByServerAndProtocol(ctx, serverID, protocol)
+	if err != nil {
+		return err
 	}
-	if conn, err := h.db.GetConnection(ctx, clientID); err == nil && conn != nil {
+	for i := range conns {
+		if conns[i].ID != clientID && conns[i].ClientID != clientID {
+			continue
+		}
+		if _, err := h.db.DeleteConnection(ctx, conns[i].ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolveToggleProtocol returns the protocol recorded for the client in
+// user_connections or peer_lifecycle, falling back to requested if unknown.
+func (h *Handlers) resolveToggleProtocol(ctx context.Context, serverID int64, clientID, requested string) string {
+	if conn, err := h.db.GetConnection(ctx, clientID); err == nil && conn != nil && conn.ServerID == serverID {
 		return conn.Protocol
 	}
 	if conn, err := h.db.GetConnectionByClientID(ctx, clientID, serverID); err == nil && conn != nil {
@@ -624,7 +664,7 @@ func (h *Handlers) resolveToggleProtocol(ctx context.Context, serverID int64, cl
 			}
 		}
 	}
-	return ""
+	return requested
 }
 
 // ToggleServerConnectionHandler enables or disables a client connection on the server.
@@ -655,7 +695,10 @@ func (h *Handlers) ToggleServerConnectionHandler(w http.ResponseWriter, r *http.
 
 	ctx := r.Context()
 
-	normProto := models.NormalizeProtocol(h.resolveToggleProtocol(ctx, serverID, req.ClientID, req.Protocol))
+	normProto := models.NormalizeProtocol(req.Protocol)
+	if normProto == "" {
+		normProto = models.NormalizeProtocol(h.resolveToggleProtocol(ctx, serverID, req.ClientID, ""))
+	}
 	if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
 		h.JSONError(w, http.StatusBadRequest, "unsupported_action", "Client disable is not supported for this protocol; use remove instead")
 		return

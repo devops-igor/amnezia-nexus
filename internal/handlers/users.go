@@ -471,6 +471,10 @@ func (h *Handlers) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Serialize the connection snapshot, remote revocation and user deletion
+	// with provisioning so no new credential can escape the deletion snapshot.
+	defer h.lockUser(userID)()
+
 	ctx := r.Context()
 	user, err := h.db.GetUser(ctx, userID)
 	if err != nil || user == nil {
