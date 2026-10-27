@@ -20,6 +20,9 @@ var (
 	h2ReadIdleTimeout = 15 * time.Second
 	h2PingTimeout     = 15 * time.Second
 	h2SetupTimeout    = 15 * time.Second
+	// h2IdleConnTimeout bounds how long a connection with no active streams
+	// (notably a retired, saturated-then-drained one) stays open.
+	h2IdleConnTimeout = 15 * time.Second
 )
 
 type h2Pool struct {
@@ -232,6 +235,7 @@ func (d *Dialer) dialAndPublishH2(dialCtx context.Context, dialCancel context.Ca
 	t := &http2.Transport{
 		ReadIdleTimeout: h2ReadIdleTimeout,
 		PingTimeout:     h2PingTimeout,
+		IdleConnTimeout: h2IdleConnTimeout,
 	}
 	//nolint:staticcheck // SA1019: x/net/http2.Transport.NewClientConn required for raw TLS connection wrapping
 	cc, err := t.NewClientConn(tlsConn)
