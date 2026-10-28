@@ -198,6 +198,11 @@ func (h *Handlers) lockAssignment(w http.ResponseWriter, ctx context.Context, se
 	// Remote existence must be probed under the client lock: two concurrent edits on
 	// an unassigned client otherwise both pass the probe and both create a binding.
 	exists, probeErr := verifyRemoteClientExists(ctx, protoMgr, server, req.ClientID)
+	if probeErr != nil && !exists {
+		unlock()
+		h.JSONError(w, http.StatusNotFound, "client_not_found", "Client configuration not found on remote server")
+		return nil, nil, false
+	}
 	if probeErr != nil {
 		unlock()
 		h.JSONError(w, http.StatusInternalServerError, "operation_failed", "Failed to verify client on remote server: "+probeErr.Error())
