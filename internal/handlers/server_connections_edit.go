@@ -2,12 +2,46 @@ package handlers
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/google/uuid"
 )
+
+// errClientAlreadyAssigned reports that a user_connections row already exists for the client.
+var errClientAlreadyAssigned = errors.New("client is already assigned")
+
+// clientLocks holds one mutex per (server, protocol, client) credential. Entries are
+// never evicted (shortcut: one small mutex per edited client; add eviction if that grows).
+var clientLocks sync.Map
+
+// lockClient serializes ownership changes of a single credential and returns the unlock func.
+// Lock order is client first, then users (lockConnectionUsers); no path takes them reversed.
+func lockClient(serverID int64, protocol, clientID string) func() {
+	key := fmt.Sprintf("%d|%s|%s", serverID, models.NormalizeProtocol(protocol), clientID)
+	mu, _ := clientLocks.LoadOrStore(key, &sync.Mutex{})
+	m := mu.(*sync.Mutex)
+	m.Lock()
+	return m.Unlock
+}
+
+// findClientConnection returns the connection row bound to the client, or nil if unassigned.
+func (h *Handlers) findClientConnection(ctx context.Context, serverID int64, protocol, clientID string) (*models.UserConnection, error) {
+	conns, err := h.db.GetConnectionsByServerAndProtocol(ctx, serverID, protocol)
+	if err != nil {
+		return nil, err
+	}
+	for i := range conns {
+		if conns[i].ClientID == clientID {
+			return &conns[i], nil
+		}
+	}
+	return nil, nil
+}
 
 func (h *Handlers) editAWGParams(ctx context.Context, server *models.Server, req *models.EditConnectionRequest) error {
 	if req.Protocol != "awg" || h.awgMgr == nil {
@@ -44,6 +78,11 @@ func (h *Handlers) editConnectionBinding(ctx context.Context, serverID int64, re
 				}
 				_, err := h.db.UpdateConnection(ctx, matchingConn.ID, updates)
 				return err
+			}
+			if existing, err := h.findClientConnection(ctx, serverID, req.Protocol, req.ClientID); err != nil {
+				return err
+			} else if existing != nil {
+				return errClientAlreadyAssigned
 			}
 			newConn := &models.UserConnection{
 				ID:         uuid.NewString(),
@@ -155,20 +194,31 @@ func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	// Update DB user connection binding
-	userConns, err := h.db.GetConnectionsByServerAndProtocol(ctx, serverID, req.Protocol)
+	matchingConn, err := h.findClientConnection(ctx, serverID, req.Protocol, req.ClientID)
 	if err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve connections")
 		return
 	}
-	var matchingConn *models.UserConnection
-	for i := range userConns {
-		if userConns[i].ClientID == req.ClientID {
-			matchingConn = &userConns[i]
-			break
-		}
-	}
 
 	if req.UserID != nil {
+		// Serialize on the credential itself: user locks alone let two admins bind one
+		// unassigned client to different users concurrently.
+		defer lockClient(serverID, req.Protocol, req.ClientID)()
+		current, err := h.findClientConnection(ctx, serverID, req.Protocol, req.ClientID)
+		if err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve connections")
+			return
+		}
+		switch {
+		case matchingConn == nil && current != nil:
+			h.JSONError(w, http.StatusConflict, "connection_already_assigned", "Client is already assigned to another user")
+			return
+		case matchingConn != nil && (current == nil || current.ID != matchingConn.ID):
+			h.JSONError(w, http.StatusConflict, "connection_changed", "Connection ownership changed; retry the request")
+			return
+		}
+		matchingConn = current
+
 		sourceUserID := ""
 		if matchingConn != nil {
 			sourceUserID = matchingConn.UserID
@@ -195,6 +245,10 @@ func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	if err := h.editConnectionBinding(ctx, serverID, &req, matchingConn); err != nil {
+		if errors.Is(err, errClientAlreadyAssigned) {
+			h.JSONError(w, http.StatusConflict, "connection_already_assigned", "Client is already assigned to another user")
+			return
+		}
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to update connection binding: "+err.Error())
 		return
 	}

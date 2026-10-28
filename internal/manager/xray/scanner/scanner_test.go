@@ -255,6 +255,9 @@ func TestScanSNI_WorkerPool(t *testing.T) {
 	if report.Scope != "panel_side_proximity" {
 		t.Errorf("scope = %q, want panel_side_proximity", report.Scope)
 	}
+	if report.FallbackToPanel || report.Warning != "" {
+		t.Errorf("scanner alone must not set fallback markers: %+v", report)
+	}
 	if len(report.Results) != 2 {
 		t.Errorf("expected 2 results, got %d", len(report.Results))
 	}

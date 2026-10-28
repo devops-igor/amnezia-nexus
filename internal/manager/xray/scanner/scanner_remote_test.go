@@ -87,8 +87,11 @@ func TestScanSNIRemoteDialContextScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScanSNI: %v", err)
 	}
-	if report.Scope != "remote_server_rtt" {
-		t.Fatalf("scope = %q, want remote_server_rtt", report.Scope)
+	if report.Scope != "ssh_tunneled_proximity" {
+		t.Fatalf("scope = %q, want ssh_tunneled_proximity", report.Scope)
+	}
+	if report.FallbackToPanel || report.Warning != "" {
+		t.Fatalf("tunneled report must not carry fallback markers: %+v", report)
 	}
 	if len(report.Results) != 1 || report.Results[0].Status != "ok" {
 		t.Fatalf("results = %+v, want one successful probe", report.Results)

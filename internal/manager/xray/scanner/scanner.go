@@ -41,14 +41,19 @@ type ScanResult struct {
 
 // ScanReport encapsulates scan results against a target server.
 //
-// Note: This scan is a panel-side network proximity check conducted from the
-// management panel host to measure TLS compatibility and network latency.
+// Scope is "panel_side_proximity" when probes dial directly from the panel host, or
+// "ssh_tunneled_proximity" when TCP is tunneled over SSH direct-tcpip while the TLS
+// handshake still runs on the panel: RTTMS then includes panel<->SSH transport overhead
+// and is not an isolated remote-server RTT. FallbackToPanel/Warning are set by callers
+// that wanted the SSH tunnel but had to probe from the panel.
 type ScanReport struct {
-	Scope         string       `json:"scope,omitempty"`
-	ServerIP      string       `json:"server_ip"`
-	ServerCountry string       `json:"server_country,omitempty"`
-	ServerASN     uint32       `json:"server_asn,omitempty"`
-	Results       []ScanResult `json:"results"`
+	Scope           string       `json:"scope,omitempty"`
+	FallbackToPanel bool         `json:"fallback_to_panel,omitempty"`
+	Warning         string       `json:"warning,omitempty"`
+	ServerIP        string       `json:"server_ip"`
+	ServerCountry   string       `json:"server_country,omitempty"`
+	ServerASN       uint32       `json:"server_asn,omitempty"`
+	Results         []ScanResult `json:"results"`
 }
 
 // ScannerOptions configures the worker pool and candidate selection.
@@ -162,7 +167,7 @@ func ScanSNI(ctx context.Context, serverHost string, opts ScannerOptions) (*Scan
 
 	scope := "panel_side_proximity"
 	if opts.DialContext != nil {
-		scope = "remote_server_rtt"
+		scope = "ssh_tunneled_proximity"
 	}
 	return &ScanReport{
 		Scope:         scope,

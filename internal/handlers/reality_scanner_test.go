@@ -69,5 +69,11 @@ func TestScanRealitySNIHandler_Unit(t *testing.T) {
 		if !strings.Contains(w.Body.String(), "server_ip") {
 			t.Errorf("expected response to contain server_ip, got %s", w.Body.String())
 		}
+		// The test pool cannot reach 127.0.0.1:22, so the fallback must be reported.
+		for _, want := range []string{`"scope":"panel_side_proximity"`, `"fallback_to_panel":true`, "SSH tunnel unavailable"} {
+			if !strings.Contains(w.Body.String(), want) {
+				t.Errorf("expected response to contain %q, got %s", want, w.Body.String())
+			}
+		}
 	})
 }

@@ -17,7 +17,8 @@ type ScanRealitySNIRequest struct {
 
 // ScanRealitySNIHandler executes offline ASN/geo proximity filtering and TLS 1.3 / H2 probing
 // for candidate REALITY camouflage domains against the target server host.
-// Probes use the server's network stack over SSH when available and otherwise run panel-side.
+// Probes are tunneled over SSH direct-tcpip when available (scope ssh_tunneled_proximity);
+// otherwise they run panel-side and the report carries fallback_to_panel and a warning.
 func (h *Handlers) ScanRealitySNIHandler(w http.ResponseWriter, r *http.Request) {
 	serverID, err := parseServerID(r)
 	if err != nil {
@@ -59,11 +60,16 @@ func (h *Handlers) ScanRealitySNIHandler(w http.ResponseWriter, r *http.Request)
 			opts.DialContext = underlying.DialContext
 		}
 	}
+	fellBack := opts.DialContext == nil
 
 	report, err := scanner.ScanSNI(ctx, server.Host, opts)
 	if err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "scan_failed", err.Error())
 		return
+	}
+	if fellBack {
+		report.FallbackToPanel = true
+		report.Warning = "SSH tunnel unavailable; probe conducted from panel host"
 	}
 
 	h.audit(r, "server.reality_scan_sni", map[string]any{

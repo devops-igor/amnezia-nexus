@@ -148,6 +148,78 @@ func TestConnectionTransferAndUserDeletionPreserveTransferredConnection(t *testi
 	}
 }
 
+func TestConcurrentAssignmentOfUnassignedClientIsSerialized(t *testing.T) {
+	h, db, serverID := setupResourceRBACClosure(t)
+	ctx := context.Background()
+	userIDs := []string{"race-user-a", "race-user-b"}
+	for _, userID := range userIDs {
+		if _, err := db.CreateUser(ctx, &models.User{
+			ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("CreateUser(%s): %v", userID, err)
+		}
+	}
+	const clientID = "race-client"
+
+	// Hold the client lock so both requests pass their unassigned pre-check and queue on it.
+	unlock := lockClient(serverID, models.ProtocolVLESS, clientID)
+	codes := make(chan int, len(userIDs))
+	bodies := make(chan string, len(userIDs))
+	for _, userID := range userIDs {
+		go func() {
+			path := fmt.Sprintf("/api/servers/%d/connections/edit", serverID)
+			w := resourceRBACRequest(t, setupFullServerConnectionsRouter(h), http.MethodPost, path,
+				resourceRBACSession(models.RoleAdmin), models.EditConnectionRequest{
+					Protocol: models.ProtocolVLESS,
+					ClientID: clientID,
+					UserID:   &userID,
+				})
+			codes <- w.Code
+			bodies <- w.Body.String()
+		}()
+	}
+	time.Sleep(200 * time.Millisecond)
+	unlock()
+
+	var ok, conflict int
+	for range userIDs {
+		select {
+		case code := <-codes:
+			body := <-bodies
+			switch code {
+			case http.StatusOK:
+				ok++
+			case http.StatusConflict:
+				conflict++
+				if !strings.Contains(body, "connection_already_assigned") {
+					t.Errorf("409 body = %s, want connection_already_assigned", body)
+				}
+			default:
+				t.Errorf("unexpected status %d: %s", code, body)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("assignment request did not complete")
+		}
+	}
+	if ok != 1 || conflict != 1 {
+		t.Fatalf("ok=%d conflict=%d, want exactly one of each", ok, conflict)
+	}
+
+	conns, err := db.GetConnectionsByServerAndProtocol(ctx, serverID, models.ProtocolVLESS)
+	if err != nil {
+		t.Fatalf("GetConnectionsByServerAndProtocol: %v", err)
+	}
+	var rows int
+	for _, c := range conns {
+		if c.ClientID == clientID {
+			rows++
+		}
+	}
+	if rows != 1 {
+		t.Fatalf("user_connections rows for client = %d, want 1", rows)
+	}
+}
+
 func TestDeleteUserHandlerProtectedProtocolAuthorization(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
