@@ -776,7 +776,11 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		clientID = *req.ClientID
-		configStr, _ = protoMgr.GetClientConfig(ctx, server, clientID)
+		configStr, err = protoMgr.GetClientConfig(ctx, server, clientID)
+		if err != nil || configStr == "" {
+			h.JSONError(w, http.StatusNotFound, "client_not_found", "Client configuration not found on remote server")
+			return
+		}
 	} else {
 		params := buildConnectionParams(req.Name, req.TelemtQuota, req.TelemtMaxIPs, req.TelemtExpiry, req.AWGMimicry)
 

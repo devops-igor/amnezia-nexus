@@ -341,6 +341,9 @@ func (h *Handlers) RemoveServerConnectionHandler(w http.ResponseWriter, r *http.
 		return
 	}
 
+	unlockClient := lockClient(serverID, req.Protocol, req.ClientID)
+	defer unlockClient()
+
 	ctx := r.Context()
 	protocol := h.resolveToggleProtocol(ctx, serverID, req.ClientID, req.Protocol)
 	if !h.authorizeAdminProtocol(w, r, protocol) {
@@ -406,6 +409,10 @@ func (h *Handlers) RemoveServerConnectionHandler(w http.ResponseWriter, r *http.
 	if err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to resolve connection record")
 		return
+	}
+	if conn != nil {
+		unlockUser := h.lockUser(conn.UserID)
+		defer unlockUser()
 	}
 
 	if err := protoMgr.RemoveClient(ctx, server, canonicalClientID); err != nil {

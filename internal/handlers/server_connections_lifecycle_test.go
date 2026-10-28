@@ -2,9 +2,11 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -759,5 +761,169 @@ func TestSupportOrdinaryUserLifecycle(t *testing.T) {
 	user, err = db.GetUser(ctx, user.ID)
 	if err != nil || user != nil {
 		t.Fatalf("deleted user = %+v, err=%v", user, err)
+	}
+}
+
+func TestAddUserConnectionVerifiesRemoteClient(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		config     string
+		lookupErr  error
+		wantStatus int
+	}{
+		{name: "missing remote client", lookupErr: errors.New("not found"), wantStatus: http.StatusNotFound},
+		{name: "existing remote client", config: "remote-config", wantStatus: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, db, serverID := setupResourceRBACClosure(t)
+			ctx := context.Background()
+			const userID = "remote-check-user"
+			if _, err := db.CreateUser(ctx, &models.User{
+				ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatalf("CreateUser: %v", err)
+			}
+			clientID := "remote-check-client"
+			h.registry.Register(&mockProtocolManager{
+				protocol: models.ProtocolVLESS,
+				getClientConfigFn: func(_ context.Context, _ *models.Server, id string) (string, error) {
+					if id != clientID {
+						t.Fatalf("GetClientConfig client ID = %q, want %q", id, clientID)
+					}
+					return tc.config, tc.lookupErr
+				},
+			})
+
+			w := resourceRBACRequest(t, setupFullUsersRouter(h), http.MethodPost,
+				"/api/users/"+userID+"/connections/add", resourceRBACSession(models.RoleAdmin),
+				models.AddUserConnectionRequest{
+					ServerID: serverID, Protocol: models.ProtocolVLESS, ClientID: &clientID, Name: "remote-check",
+				})
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tc.wantStatus, w.Body.String())
+			}
+			connections, err := db.GetAllConnections(ctx)
+			if err != nil {
+				t.Fatalf("GetAllConnections: %v", err)
+			}
+			peers, err := db.GetPeerLifecycles(ctx, serverID, models.ProtocolVLESS)
+			if err != nil {
+				t.Fatalf("GetPeerLifecycles: %v", err)
+			}
+			if tc.wantStatus == http.StatusNotFound {
+				if !strings.Contains(w.Body.String(), "client_not_found") || len(connections) != 0 || len(peers) != 0 {
+					t.Fatalf("missing client left state: body=%s connections=%+v peers=%+v", w.Body.String(), connections, peers)
+				}
+				return
+			}
+			if len(connections) != 1 || len(peers) != 1 {
+				t.Fatalf("successful assignment state: connections=%+v peers=%+v", connections, peers)
+			}
+		})
+	}
+}
+
+func TestConcurrentAddAndRemoveServerConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		assignmentFirst bool
+		wantAssign      int
+	}{
+		{name: "assignment after removal", wantAssign: http.StatusNotFound},
+		{name: "removal after assignment", assignmentFirst: true, wantAssign: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, db, serverID := setupResourceRBACClosure(t)
+			ctx := context.Background()
+			const userID = "add-remove-user"
+			if _, err := db.CreateUser(ctx, &models.User{
+				ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatalf("CreateUser: %v", err)
+			}
+			clientID := "add-remove-client"
+			lookupStarted := make(chan struct{})
+			allowLookup := make(chan struct{})
+			removeStarted := make(chan struct{})
+			allowRemove := make(chan struct{})
+			var remoteMu sync.Mutex
+			remoteExists := true
+			h.registry.Register(&mockProtocolManager{
+				protocol: models.ProtocolVLESS,
+				getClientConfigFn: func(_ context.Context, _ *models.Server, _ string) (string, error) {
+					if tc.assignmentFirst {
+						close(lookupStarted)
+						<-allowLookup
+					}
+					remoteMu.Lock()
+					defer remoteMu.Unlock()
+					if !remoteExists {
+						return "", errors.New("remote client not found")
+					}
+					return "remote-config", nil
+				},
+				removeClientFn: func(_ context.Context, _ *models.Server, _ string) error {
+					if !tc.assignmentFirst {
+						close(removeStarted)
+						<-allowRemove
+					}
+					remoteMu.Lock()
+					remoteExists = false
+					remoteMu.Unlock()
+					return nil
+				},
+			})
+
+			type result struct {
+				code int
+				body string
+			}
+			assign := func() result {
+				w := resourceRBACRequest(t, setupFullUsersRouter(h), http.MethodPost,
+					"/api/users/"+userID+"/connections/add", resourceRBACSession(models.RoleAdmin),
+					models.AddUserConnectionRequest{
+						ServerID: serverID, Protocol: models.ProtocolVLESS, ClientID: &clientID, Name: "add-remove",
+					})
+				return result{code: w.Code, body: w.Body.String()}
+			}
+			remove := func() result {
+				w := resourceRBACRequest(t, setupFullServerConnectionsRouter(h), http.MethodPost,
+					fmt.Sprintf("/api/servers/%d/connections/remove", serverID), resourceRBACSession(models.RoleAdmin),
+					models.ConnectionActionRequest{Protocol: models.ProtocolVLESS, ClientID: clientID})
+				return result{code: w.Code, body: w.Body.String()}
+			}
+			assignDone := make(chan result, 1)
+			removeDone := make(chan result, 1)
+			if tc.assignmentFirst {
+				go func() { assignDone <- assign() }()
+				<-lookupStarted
+				go func() { removeDone <- remove() }()
+				close(allowLookup)
+			} else {
+				go func() { removeDone <- remove() }()
+				<-removeStarted
+				go func() { assignDone <- assign() }()
+				close(allowRemove)
+			}
+			gotAssign := <-assignDone
+			gotRemove := <-removeDone
+			if gotAssign.code != tc.wantAssign || gotRemove.code != http.StatusOK {
+				t.Fatalf("assignment = %d (%s), removal = %d (%s)", gotAssign.code, gotAssign.body, gotRemove.code, gotRemove.body)
+			}
+			connections, err := db.GetAllConnections(ctx)
+			if err != nil {
+				t.Fatalf("GetAllConnections: %v", err)
+			}
+			peers, err := db.GetPeerLifecycles(ctx, serverID, models.ProtocolVLESS)
+			if err != nil {
+				t.Fatalf("GetPeerLifecycles: %v", err)
+			}
+			remoteMu.Lock()
+			exists := remoteExists
+			remoteMu.Unlock()
+			if len(connections) != 0 || len(peers) != 0 || exists {
+				t.Fatalf("zombie state: connections=%+v peers=%+v remoteExists=%v", connections, peers, exists)
+			}
+		})
 	}
 }
