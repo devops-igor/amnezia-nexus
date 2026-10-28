@@ -728,7 +728,8 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if req.ClientID != nil && *req.ClientID != "" {
+	hasExistingClient := req.ClientID != nil && *req.ClientID != ""
+	if hasExistingClient {
 		unlockClient := lockClient(req.ServerID, req.Protocol, *req.ClientID)
 		defer unlockClient()
 	}
@@ -764,7 +765,7 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 	var clientID, configStr string
 	var addResult map[string]any
 	clientCreated := false
-	if req.ClientID != nil && *req.ClientID != "" {
+	if hasExistingClient {
 		current, err := h.findClientConnection(ctx, req.ServerID, req.Protocol, *req.ClientID)
 		if err != nil {
 			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve connections")
@@ -817,7 +818,7 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
 		return
 	}
-	if !clientCreated {
+	if hasExistingClient {
 		_ = h.db.RecordPeerLifecycle(ctx, req.ServerID, req.Protocol, *req.ClientID, req.Name, userID, "active")
 	}
 
