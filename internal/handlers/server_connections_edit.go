@@ -106,9 +106,15 @@ func (h *Handlers) editConnectionBinding(ctx context.Context, serverID int64, re
 		return nil
 	}
 	if req.Name != nil && *req.Name != "" && matchingConn != nil {
+		ok, err := h.db.UpdateConnection(ctx, matchingConn.ID, map[string]any{"name": *req.Name})
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("connection record not found")
+		}
 		_ = h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, req.ClientID, *req.Name, matchingConn.UserID, "active")
-		_, err := h.db.UpdateConnection(ctx, matchingConn.ID, map[string]any{"name": *req.Name})
-		return err
+		return nil
 	}
 	return nil
 }
@@ -264,6 +270,35 @@ func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Re
 			return
 		}
 		defer unlock()
+	} else {
+		unlockClient := lockClient(serverID, req.Protocol, req.ClientID)
+		defer unlockClient()
+		matchingConn, err = h.findClientConnection(ctx, serverID, req.Protocol, req.ClientID)
+		if err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve connections")
+			return
+		}
+		if matchingConn == nil {
+			h.JSONError(w, http.StatusNotFound, "connection_not_found", "Connection record not found")
+			return
+		}
+
+		unlockUser := h.lockUser(matchingConn.UserID)
+		defer unlockUser()
+		current, err := h.db.GetConnection(ctx, matchingConn.ID)
+		if err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to verify connection ownership")
+			return
+		}
+		if current == nil {
+			h.JSONError(w, http.StatusNotFound, "connection_not_found", "Connection record not found")
+			return
+		}
+		if current.UserID != matchingConn.UserID {
+			h.JSONError(w, http.StatusConflict, "connection_changed", "Connection ownership changed; retry the request")
+			return
+		}
+		matchingConn = current
 	}
 
 	protoMgr, err := h.GetProtocolManager(req.Protocol)

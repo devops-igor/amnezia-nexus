@@ -71,3 +71,49 @@ func TestEditServerConnectionRejectsRemovedRemoteClient(t *testing.T) {
 		t.Fatalf("removed client was resurrected: connections=%+v peers=%+v", connections, peers)
 	}
 }
+
+func TestNameOnlyConnectionEditAfterUserDeletionDoesNotRecreateLifecycle(t *testing.T) {
+	h, db, serverID := setupResourceRBACClosure(t)
+	ctx := context.Background()
+	const userID = "name-only-delete-user"
+	const clientID = "name-only-delete-client"
+	if _, err := db.CreateUser(ctx, &models.User{
+		ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	createResourceRBACConnection(t, db, "name-only-delete-connection", userID, serverID, models.ProtocolVLESS, clientID)
+	if err := db.RecordPeerLifecycle(ctx, serverID, models.ProtocolVLESS, clientID, "Old Name", userID, "active"); err != nil {
+		t.Fatalf("RecordPeerLifecycle: %v", err)
+	}
+	h.registry.Register(&mockProtocolManager{
+		protocol: models.ProtocolVLESS,
+		getClientConfigFn: func(_ context.Context, _ *models.Server, _ string) (string, error) {
+			return "remote-config", nil
+		},
+		removeClientFn: func(_ context.Context, _ *models.Server, _ string) error {
+			return nil
+		},
+	})
+
+	w := resourceRBACRequest(t, setupFullUsersRouter(h), http.MethodPost,
+		"/api/users/"+userID+"/delete", resourceRBACSession(models.RoleAdmin), nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+
+	name := "New Name"
+	w = resourceRBACRequest(t, setupFullServerConnectionsRouter(h), http.MethodPost,
+		fmt.Sprintf("/api/servers/%d/connections/edit", serverID), resourceRBACSession(models.RoleAdmin),
+		models.EditConnectionRequest{Protocol: models.ProtocolVLESS, ClientID: clientID, Name: &name})
+	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "connection_not_found") {
+		t.Fatalf("edit status = %d, body = %s; want 404 connection_not_found", w.Code, w.Body.String())
+	}
+	peers, err := db.GetPeerLifecycles(ctx, serverID, models.ProtocolVLESS)
+	if err != nil {
+		t.Fatalf("GetPeerLifecycles: %v", err)
+	}
+	if len(peers) != 0 {
+		t.Fatalf("active lifecycle records after deleted-user edit = %+v, want none", peers)
+	}
+}
