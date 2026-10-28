@@ -60,17 +60,18 @@ func verifyRemoteClientExists(
 		return true, nil
 	}
 	clients, getErr := protoMgr.GetClients(ctx, server)
-	if getErr == nil {
-		for _, c := range clients {
-			if id, ok := c["clientId"].(string); ok && id == clientID {
-				return true, nil
-			}
-			if id, ok := c["client_id"].(string); ok && id == clientID {
-				return true, nil
-			}
+	if getErr != nil {
+		return false, getErr
+	}
+	for _, c := range clients {
+		if id, ok := c["clientId"].(string); ok && id == clientID {
+			return true, nil
+		}
+		if id, ok := c["client_id"].(string); ok && id == clientID {
+			return true, nil
 		}
 	}
-	return false, err
+	return false, nil
 }
 
 func (h *Handlers) editAWGParams(ctx context.Context, server *models.Server, req *models.EditConnectionRequest) error {
@@ -198,11 +199,6 @@ func (h *Handlers) lockAssignment(w http.ResponseWriter, ctx context.Context, se
 	// Remote existence must be probed under the client lock: two concurrent edits on
 	// an unassigned client otherwise both pass the probe and both create a binding.
 	exists, probeErr := verifyRemoteClientExists(ctx, protoMgr, server, req.ClientID)
-	if probeErr != nil && !exists {
-		unlock()
-		h.JSONError(w, http.StatusNotFound, "client_not_found", "Client configuration not found on remote server")
-		return nil, nil, false
-	}
 	if probeErr != nil {
 		unlock()
 		h.JSONError(w, http.StatusInternalServerError, "operation_failed", "Failed to verify client on remote server: "+probeErr.Error())
@@ -304,12 +300,6 @@ func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Update AWG speed limits / parameters if applicable
-	if err := h.editAWGParams(ctx, server, &req); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "operation_failed", "Failed to edit client on server: "+err.Error())
-		return
-	}
-
 	// Update DB user connection binding
 	matchingConn, err := h.findClientConnection(ctx, serverID, req.Protocol, req.ClientID)
 	if err != nil {
@@ -353,6 +343,12 @@ func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Re
 			return
 		}
 		matchingConn = current
+	}
+
+	// Update AWG speed limits / parameters if applicable.
+	if err := h.editAWGParams(ctx, server, &req); err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "operation_failed", "Failed to edit client on server: "+err.Error())
+		return
 	}
 
 	if err := h.editConnectionBinding(ctx, serverID, &req, matchingConn); err != nil {

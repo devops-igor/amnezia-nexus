@@ -220,3 +220,76 @@ func TestAddUserConnectionAllowsAWGClientWithoutStoredPrivateKey(t *testing.T) {
 		t.Fatalf("connections = %+v, want client %q", connections, clientID)
 	}
 }
+
+func TestEditServerConnectionDoesNotMutateAWGWhenDestinationInvalid(t *testing.T) {
+	const clientID = "awg-disabled-destination-client"
+	const clientsTable = `[{"clientId":"awg-disabled-destination-client","userData":{"clientName":"Client","clientPrivateKey":"","enabled":true,"awg_mimicry":"auto"}}]`
+	editCalls := 0
+	mockSSH := &testMockSSHClient{
+		cmdFunc: func(_ context.Context, cmd string) (string, string, int, error) {
+			if strings.Contains(cmd, "cat") && strings.Contains(cmd, "clientsTable") {
+				return clientsTable, "", 0, nil
+			}
+			return "ok", "", 0, nil
+		},
+		uploadFn: func(_ context.Context, _ string, _ []byte) error {
+			editCalls++
+			return nil
+		},
+	}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+	serverID, err := db.CreateServer(ctx, &models.Server{
+		Name: "awg-disabled-destination", Host: "192.0.2.92", SSHPort: 22, SSHUser: "root",
+		Protocols: map[string]any{models.ProtocolAWG: map[string]any{"installed": true}}, CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+	userID := "awg-disabled-destination-user"
+	if _, err := db.CreateUser(ctx, &models.User{
+		ID: userID, Username: userID, Role: models.RoleUser, Enabled: false, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	mimicry := string(models.AWGMimicryDNS)
+	w := resourceRBACRequest(t, setupFullServerConnectionsRouter(h), http.MethodPost,
+		fmt.Sprintf("/api/servers/%d/connections/edit", serverID), resourceRBACSession(models.RoleAdmin),
+		models.EditConnectionRequest{
+			Protocol: models.ProtocolAWG, ClientID: clientID, UserID: &userID, AWGMimicry: &mimicry,
+		})
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "forbidden") {
+		t.Fatalf("edit status = %d, body = %s; want 403 forbidden", w.Code, w.Body.String())
+	}
+	if editCalls != 0 {
+		t.Fatalf("remote EditClient calls = %d, want 0", editCalls)
+	}
+}
+
+func TestEditServerConnectionReturns500OnSSHLookupFailure(t *testing.T) {
+	h, db, serverID := setupResourceRBACClosure(t)
+	ctx := context.Background()
+	userID := "remote-lookup-failure-user"
+	if _, err := db.CreateUser(ctx, &models.User{
+		ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	h.registry.Register(&mockProtocolManager{
+		protocol: models.ProtocolVLESS,
+		getClientConfigFn: func(_ context.Context, _ *models.Server, _ string) (string, error) {
+			return "", errors.New("SSH dial failed")
+		},
+		getClientsFn: func(_ context.Context, _ *models.Server) ([]map[string]any, error) {
+			return nil, errors.New("SSH dial failed")
+		},
+	})
+
+	w := resourceRBACRequest(t, setupFullServerConnectionsRouter(h), http.MethodPost,
+		fmt.Sprintf("/api/servers/%d/connections/edit", serverID), resourceRBACSession(models.RoleAdmin),
+		models.EditConnectionRequest{Protocol: models.ProtocolVLESS, ClientID: "remote-client", UserID: &userID})
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "operation_failed") {
+		t.Fatalf("edit status = %d, body = %s; want 500 operation_failed", w.Code, w.Body.String())
+	}
+}
