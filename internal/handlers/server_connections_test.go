@@ -341,6 +341,10 @@ func TestServerConnectionsHandlers(t *testing.T) {
 	})
 
 	t.Run("EditServerConnectionHandler All Branches", func(t *testing.T) {
+		awgMgr, _ := h.GetProtocolManager("awg")
+		h.registry.Register(&mockProtocolManager{protocol: "awg"})
+		defer h.registry.Register(awgMgr)
+
 		// Branch: no matching conn, userID set -> creates new conn
 		bodyNewConn, _ := json.Marshal(models.EditConnectionRequest{
 			Protocol: "awg",
