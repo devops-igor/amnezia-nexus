@@ -388,13 +388,17 @@ func (h *Handlers) refreshSelfSessionCookie(w http.ResponseWriter, r *http.Reque
 }
 
 // authorizeAccessPolicyUpdate fails closed (writing the response) unless the
-// caller is Admin whenever req changes expiry or quota for a user owning VLESS
-// or Naive connections: background enforcement of those limits revokes the
-// protected credentials, so it must not be reachable by Support.
+// caller is Admin whenever req changes expiry, quota, or reset policy for a
+// user owning VLESS or Naive connections: background enforcement of those
+// limits revokes the protected credentials, so it must not be reachable by
+// Support.
 func (h *Handlers) authorizeAccessPolicyUpdate(
 	w http.ResponseWriter, r *http.Request, userID string, req *models.UpdateUserRequest,
 ) bool {
-	if req.ExpiresAt == nil && req.ExpirationDate == nil && req.TrafficLimit == nil {
+	if req.ExpiresAt == nil &&
+		req.ExpirationDate == nil &&
+		req.TrafficLimit == nil &&
+		req.TrafficResetStrategy == nil {
 		return true
 	}
 	conns, err := h.db.GetConnectionsByUserID(r.Context(), userID)

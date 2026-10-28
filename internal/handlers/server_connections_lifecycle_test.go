@@ -309,6 +309,11 @@ func TestUpdateUserHandlerProtectedProtocolAccessPolicy(t *testing.T) {
 		{"support PATCH expires_at VLESS", http.MethodPatch, models.ProtocolVLESS, models.RoleSupport, map[string]any{"expires_at": expiryStr}, http.StatusForbidden},
 		{"support PATCH expiration_date VLESS", http.MethodPatch, models.ProtocolVLESS, models.RoleSupport, map[string]any{"expiration_date": expiryStr}, http.StatusForbidden},
 		{"support traffic_limit VLESS", http.MethodPost, models.ProtocolVLESS, models.RoleSupport, map[string]any{"traffic_limit": 5}, http.StatusForbidden},
+		{"support POST traffic_reset_strategy VLESS", http.MethodPost, models.ProtocolVLESS, models.RoleSupport, map[string]any{"traffic_reset_strategy": "monthly"}, http.StatusForbidden},
+		{"support PATCH traffic_reset_strategy VLESS", http.MethodPatch, models.ProtocolVLESS, models.RoleSupport, map[string]any{"traffic_reset_strategy": "monthly"}, http.StatusForbidden},
+		{"support traffic_reset_strategy Naive", http.MethodPost, models.ProtocolNaive, models.RoleSupport, map[string]any{"traffic_reset_strategy": "monthly"}, http.StatusForbidden},
+		{"admin traffic_reset_strategy VLESS", http.MethodPost, models.ProtocolVLESS, models.RoleAdmin, map[string]any{"traffic_reset_strategy": "monthly"}, http.StatusOK},
+		{"support traffic_reset_strategy AWG", http.MethodPost, models.ProtocolAWG, models.RoleSupport, map[string]any{"traffic_reset_strategy": "monthly"}, http.StatusOK},
 		{"support expires_at Naive", http.MethodPost, models.ProtocolNaive, models.RoleSupport, map[string]any{"expires_at": expiryStr}, http.StatusForbidden},
 		{"support mixed fields VLESS rejected entirely", http.MethodPost, models.ProtocolVLESS, models.RoleSupport, map[string]any{"expires_at": expiryStr, "description": "mixed"}, http.StatusForbidden},
 		{"admin expires_at VLESS", http.MethodPost, models.ProtocolVLESS, models.RoleAdmin, map[string]any{"expires_at": expiryStr}, http.StatusOK},
@@ -320,8 +325,10 @@ func TestUpdateUserHandlerProtectedProtocolAccessPolicy(t *testing.T) {
 			ctx := context.Background()
 			const userID = "protected-update-user"
 			const connectionID = "protected-update-connection"
+			lastResetAt := "2000-01-01T00:00:00Z"
 			if _, err := db.CreateUser(ctx, &models.User{
 				ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+				TrafficResetStrategy: models.ResetStrategyNever, LastResetAt: &lastResetAt,
 			}); err != nil {
 				t.Fatalf("CreateUser: %v", err)
 			}
@@ -351,7 +358,15 @@ func TestUpdateUserHandlerProtectedProtocolAccessPolicy(t *testing.T) {
 				if user.ExpiresAt != nil || user.ExpirationDate != nil || user.TrafficLimit != 0 || user.Description != nil {
 					t.Fatalf("forbidden update changed user: %+v", user)
 				}
+				if user.TrafficResetStrategy != models.ResetStrategyNever || user.LastResetAt == nil || *user.LastResetAt != lastResetAt {
+					t.Fatalf("forbidden update changed reset policy: strategy=%q last_reset_at=%v", user.TrafficResetStrategy, user.LastResetAt)
+				}
 				return
+			}
+			if _, ok := tc.body["traffic_reset_strategy"]; ok {
+				if user.TrafficResetStrategy != models.ResetStrategyMonthly {
+					t.Fatalf("traffic_reset_strategy = %q, want monthly", user.TrafficResetStrategy)
+				}
 			}
 			if _, ok := tc.body["expires_at"]; ok {
 				if user.ExpiresAt == nil || !user.ExpiresAt.Equal(expiry) {
