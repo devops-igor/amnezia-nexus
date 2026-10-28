@@ -490,6 +490,15 @@ func (h *Handlers) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, c := range conns {
+		proto := models.NormalizeProtocol(c.Protocol)
+		if proto == models.ProtocolVLESS || proto == models.ProtocolNaive {
+			if !h.authorizeAdminProtocol(w, r, proto) {
+				return
+			}
+			break
+		}
+	}
+	for _, c := range conns {
 		current, err := h.db.GetConnection(ctx, c.ID)
 		if err != nil {
 			h.peerChangeError(w, err)
@@ -585,6 +594,16 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !req.Enabled {
+		for i := range conns {
+			c := &conns[i]
+			proto := models.NormalizeProtocol(c.Protocol)
+			if proto == models.ProtocolVLESS || proto == models.ProtocolNaive {
+				if !h.authorizeAdminProtocol(w, r, proto) {
+					return
+				}
+				break
+			}
+		}
 		// VLESS/Naive cannot be toggled in place: revoke the remote credential
 		// first (fail closed, user stays enabled), then drop the row like userops does.
 		for i := range conns {

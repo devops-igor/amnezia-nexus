@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,5 +144,150 @@ func TestConnectionTransferAndUserDeletionPreserveTransferredConnection(t *testi
 	case id := <-remoteRemovals:
 		t.Fatalf("transferred client %q was remotely revoked", id)
 	default:
+	}
+}
+
+func TestDeleteUserHandlerProtectedProtocolAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		protocol string
+		role     models.UserRole
+		want     int
+	}{
+		{name: "support VLESS forbidden", protocol: models.ProtocolVLESS, role: models.RoleSupport, want: http.StatusForbidden},
+		{name: "support Naive forbidden", protocol: models.ProtocolNaive, role: models.RoleSupport, want: http.StatusForbidden},
+		{name: "admin VLESS allowed", protocol: models.ProtocolVLESS, role: models.RoleAdmin, want: http.StatusOK},
+		{name: "support AWG allowed", protocol: models.ProtocolAWG, role: models.RoleSupport, want: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, db, serverID := setupResourceRBACClosure(t)
+			ctx := context.Background()
+			const userID = "protected-delete-user"
+			const connectionID = "protected-delete-connection"
+			if _, err := db.CreateUser(ctx, &models.User{
+				ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatalf("CreateUser: %v", err)
+			}
+			createResourceRBACConnection(t, db, connectionID, userID, serverID, tc.protocol, "delete-client")
+
+			var removals []string
+			h.registry.Register(&mockProtocolManager{
+				protocol: tc.protocol,
+				removeClientFn: func(_ context.Context, _ *models.Server, clientID string) error {
+					removals = append(removals, clientID)
+					return nil
+				},
+			})
+
+			w := resourceRBACRequest(t, setupFullUsersRouter(h), http.MethodPost,
+				"/api/users/"+userID+"/delete", resourceRBACSession(tc.role), nil)
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tc.want, w.Body.String())
+			}
+			user, userErr := db.GetUser(ctx, userID)
+			conn, connErr := db.GetConnection(ctx, connectionID)
+			if userErr != nil || connErr != nil {
+				t.Fatalf("read state: user err=%v connection err=%v", userErr, connErr)
+			}
+			if tc.want == http.StatusForbidden {
+				if !strings.Contains(w.Body.String(), "forbidden") {
+					t.Errorf("response does not contain forbidden error: %s", w.Body.String())
+				}
+				if user == nil || conn == nil {
+					t.Fatalf("forbidden deletion changed state: user=%v connection=%v", user, conn)
+				}
+				if len(removals) != 0 {
+					t.Fatalf("forbidden deletion made RemoveClient calls: %v", removals)
+				}
+				return
+			}
+			if user != nil || conn != nil {
+				t.Fatalf("allowed deletion left state behind: user=%v connection=%v", user, conn)
+			}
+			if len(removals) != 1 || removals[0] != "delete-client" {
+				t.Fatalf("RemoveClient calls = %v, want [delete-client]", removals)
+			}
+		})
+	}
+}
+
+func TestToggleUserHandlerProtectedProtocolAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		protocol string
+		role     models.UserRole
+		want     int
+	}{
+		{name: "support VLESS forbidden", protocol: models.ProtocolVLESS, role: models.RoleSupport, want: http.StatusForbidden},
+		{name: "support Naive forbidden", protocol: models.ProtocolNaive, role: models.RoleSupport, want: http.StatusForbidden},
+		{name: "admin VLESS allowed", protocol: models.ProtocolVLESS, role: models.RoleAdmin, want: http.StatusOK},
+		{name: "support AWG allowed", protocol: models.ProtocolAWG, role: models.RoleSupport, want: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, db, serverID := setupResourceRBACClosure(t)
+			ctx := context.Background()
+			const userID = "protected-toggle-user"
+			const connectionID = "protected-toggle-connection"
+			if _, err := db.CreateUser(ctx, &models.User{
+				ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatalf("CreateUser: %v", err)
+			}
+			createResourceRBACConnection(t, db, connectionID, userID, serverID, tc.protocol, "toggle-client")
+
+			var removals []string
+			h.registry.Register(&mockProtocolManager{
+				protocol: tc.protocol,
+				removeClientFn: func(_ context.Context, _ *models.Server, clientID string) error {
+					removals = append(removals, clientID)
+					return nil
+				},
+			})
+
+			w := resourceRBACRequest(t, setupFullUsersRouter(h), http.MethodPost,
+				"/api/users/"+userID+"/toggle", resourceRBACSession(tc.role), models.ToggleUserRequest{Enabled: false})
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tc.want, w.Body.String())
+			}
+			user, userErr := db.GetUser(ctx, userID)
+			conn, connErr := db.GetConnection(ctx, connectionID)
+			if userErr != nil || connErr != nil {
+				t.Fatalf("read state: user err=%v connection err=%v", userErr, connErr)
+			}
+			if user == nil {
+				t.Fatal("toggle deleted the user")
+			}
+			if tc.want == http.StatusForbidden {
+				if !strings.Contains(w.Body.String(), "forbidden") {
+					t.Errorf("response does not contain forbidden error: %s", w.Body.String())
+				}
+				if !user.Enabled || conn == nil {
+					t.Fatalf("forbidden disable changed state: enabled=%v connection=%v", user.Enabled, conn)
+				}
+				if len(removals) != 0 {
+					t.Fatalf("forbidden disable made RemoveClient calls: %v", removals)
+				}
+				return
+			}
+			if user.Enabled {
+				t.Fatal("allowed disable left user enabled")
+			}
+			if tc.protocol == models.ProtocolAWG {
+				if conn == nil {
+					t.Fatal("AWG disable deleted the connection")
+				}
+				if len(removals) != 0 {
+					t.Fatalf("AWG disable made RemoveClient calls: %v", removals)
+				}
+				return
+			}
+			if conn != nil {
+				t.Fatal("admin disable left protected connection behind")
+			}
+			if len(removals) != 1 || removals[0] != "toggle-client" {
+				t.Fatalf("RemoveClient calls = %v, want [toggle-client]", removals)
+			}
+		})
 	}
 }
