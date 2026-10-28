@@ -1,6 +1,6 @@
 export GOFLAGS ?= -tags=with_utls
 
-.PHONY: all build test test-race test-e2e lint gosec govulncheck security clean fmt vet check docker-build
+.PHONY: all build test test-race test-e2e lint gosec govulncheck security clean fmt vet check docker-build docker-scan
 
 APP_NAME := panel
 BIN_DIR := bin
@@ -45,6 +45,10 @@ check: fmt vet lint security test-race
 
 docker-build:
 	docker build -t amnezia-web-panel:latest -f ../Dockerfile ..
+
+docker-scan:
+	docker build -t amnezia-nexus:local .
+	trivy image --severity HIGH,CRITICAL amnezia-nexus:local
 
 docker-run:
 	docker run --rm -p 5000:5000 -p 51820:51820/udp amnezia-web-panel:latest
