@@ -245,6 +245,12 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 
 // RestoreBackupHandler imports and merges database records from a JSON backup.
 func (h *Handlers) RestoreBackupHandler(w http.ResponseWriter, r *http.Request) {
+	sess := h.GetSession(r)
+	if sess == nil || !sess.IsAdmin() {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin role required")
+		return
+	}
+
 	var bodyBytes []byte
 
 	// Handle multipart upload or raw JSON

@@ -277,6 +277,7 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.RequireAdmin)
 		r.Post("/{server_id}/clear", h.ClearServerHandler)
+		r.Post("/api/settings/backup/restore", h.RestoreBackupHandler)
 	})
 
 	r.Group(func(r chi.Router) {
@@ -329,7 +330,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			r.Get("/", h.GetSettingsHandler)
 			r.Post("/save", h.SaveSettingsHandler)
 			r.Get("/backup/download", h.DownloadBackupHandler)
-			r.Post("/backup/restore", h.RestoreBackupHandler)
 		})
 
 		// System API

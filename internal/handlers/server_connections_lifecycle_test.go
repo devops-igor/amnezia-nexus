@@ -381,3 +381,53 @@ func TestUpdateUserHandlerProtectedProtocolAccessPolicy(t *testing.T) {
 		})
 	}
 }
+
+func TestRestoreBackupHandlerRequiresAdmin(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		role       models.UserRole
+		wantStatus int
+		wantUsers  int
+		wantConns  int
+	}{
+		{name: "support forbidden without restoring", role: models.RoleSupport, wantStatus: http.StatusForbidden},
+		{name: "admin allowed", role: models.RoleAdmin, wantStatus: http.StatusOK, wantUsers: 1, wantConns: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, db, serverID := setupResourceRBACClosure(t)
+			backup := models.BackupData{
+				Users: []map[string]any{{
+					"id": "restore-admin-user", "username": "restore-admin-user",
+					"role": models.RoleAdmin, "enabled": true,
+				}},
+				UserConnections: []map[string]any{{
+					"id": "restore-admin-connection", "user_id": "restore-admin-user",
+					"server_id": serverID, "protocol": models.ProtocolVLESS,
+					"client_id": "restore-admin-client", "name": "restore-admin-connection",
+				}},
+			}
+
+			w := resourceRBACRequest(t, setupFullSettingsRouter(h), http.MethodPost,
+				"/api/settings/backup/restore", resourceRBACSession(tc.role), backup)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tc.wantStatus, w.Body.String())
+			}
+			if tc.wantStatus == http.StatusForbidden && !strings.Contains(w.Body.String(), "forbidden") {
+				t.Errorf("response does not contain forbidden error: %s", w.Body.String())
+			}
+
+			users, err := db.GetAllUsers(context.Background())
+			if err != nil {
+				t.Fatalf("GetAllUsers: %v", err)
+			}
+			connections, err := db.GetAllConnections(context.Background())
+			if err != nil {
+				t.Fatalf("GetAllConnections: %v", err)
+			}
+			if len(users) != tc.wantUsers || len(connections) != tc.wantConns {
+				t.Fatalf("restored state: users=%d want %d, connections=%d want %d",
+					len(users), tc.wantUsers, len(connections), tc.wantConns)
+			}
+		})
+	}
+}
