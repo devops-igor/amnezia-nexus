@@ -490,16 +490,24 @@ func (h *Handlers) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, c := range conns {
-		if err := h.removeRemoteClient(ctx, &c); err != nil {
+		current, err := h.db.GetConnection(ctx, c.ID)
+		if err != nil {
+			h.peerChangeError(w, err)
+			return
+		}
+		if current == nil || current.UserID != userID {
+			continue
+		}
+		if err := h.removeRemoteClient(ctx, current); err != nil {
 			h.JSONError(w, http.StatusInternalServerError, "remote_removal_failed",
 				"Failed to remove remote client credentials: "+err.Error())
 			return
 		}
-		if _, err := h.db.DeleteConnection(ctx, c.ID); err != nil {
+		if _, err := h.db.DeleteConnection(ctx, current.ID); err != nil {
 			h.peerChangeError(w, err)
 			return
 		}
-		_ = h.db.DeletePeerLifecycle(ctx, c.ServerID, c.Protocol, c.ClientID)
+		_ = h.db.DeletePeerLifecycle(ctx, current.ServerID, current.Protocol, current.ClientID)
 	}
 
 	if _, err := h.db.DeleteUser(ctx, userID); err != nil {

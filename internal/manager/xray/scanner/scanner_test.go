@@ -252,6 +252,9 @@ func TestScanSNI_WorkerPool(t *testing.T) {
 	if report.ServerIP != "127.0.0.1" {
 		t.Errorf("expected server IP 127.0.0.1, got %q", report.ServerIP)
 	}
+	if report.Scope != "panel_side_proximity" {
+		t.Errorf("scope = %q, want panel_side_proximity", report.Scope)
+	}
 	if len(report.Results) != 2 {
 		t.Errorf("expected 2 results, got %d", len(report.Results))
 	}

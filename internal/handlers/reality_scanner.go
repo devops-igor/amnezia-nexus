@@ -17,7 +17,7 @@ type ScanRealitySNIRequest struct {
 
 // ScanRealitySNIHandler executes offline ASN/geo proximity filtering and TLS 1.3 / H2 probing
 // for candidate REALITY camouflage domains against the target server host.
-// Note: This scan is a panel-side network proximity check conducted from the management panel host.
+// Probes use the server's network stack over SSH when available and otherwise run panel-side.
 func (h *Handlers) ScanRealitySNIHandler(w http.ResponseWriter, r *http.Request) {
 	serverID, err := parseServerID(r)
 	if err != nil {
@@ -53,6 +53,11 @@ func (h *Handlers) ScanRealitySNIHandler(w http.ResponseWriter, r *http.Request)
 		Concurrency: concurrency,
 		Timeout:     timeout,
 		Domains:     req.Domains,
+	}
+	if sshClient, err := h.GetSSHClient(ctx, server); err == nil && sshClient != nil {
+		if underlying := sshClient.GetUnderlyingClient(); underlying != nil {
+			opts.DialContext = underlying.DialContext
+		}
 	}
 
 	report, err := scanner.ScanSNI(ctx, server.Host, opts)

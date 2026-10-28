@@ -60,6 +60,7 @@ type ScannerOptions struct {
 	Domains     []string
 	GeoDB       *GeoDB
 	RootCAs     *x509.CertPool
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // ScanSNI executes concurrent probing and ASN/geo proximity filtering for candidate domains.
@@ -129,7 +130,7 @@ func ScanSNI(ctx context.Context, serverHost string, opts ScannerOptions) (*Scan
 				default:
 				}
 
-				res := scanCandidateDomain(ctx, domain, serverIP, geoDB, timeout, opts.RootCAs)
+				res := scanCandidateDomain(ctx, domain, serverIP, geoDB, timeout, opts.RootCAs, opts.DialContext)
 				resultsChan <- res
 			}
 		}()
@@ -159,8 +160,12 @@ func ScanSNI(ctx context.Context, serverHost string, opts ScannerOptions) (*Scan
 		return results[i].Domain < results[j].Domain
 	})
 
+	scope := "panel_side_proximity"
+	if opts.DialContext != nil {
+		scope = "remote_server_rtt"
+	}
 	return &ScanReport{
-		Scope:         "panel_side_proximity",
+		Scope:         scope,
 		ServerIP:      serverIP.String(),
 		ServerCountry: serverCountry,
 		ServerASN:     serverASN,
@@ -175,6 +180,7 @@ func scanCandidateDomain(
 	geoDB *GeoDB,
 	timeout time.Duration,
 	rootCAs *x509.CertPool,
+	dialContext func(ctx context.Context, network, addr string) (net.Conn, error),
 ) ScanResult {
 	// 1. Resolve domain A record
 	resolveCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -205,9 +211,10 @@ func scanCandidateDomain(
 
 	// 3. TLS 1.3 / H2 Probe
 	probeOpts := ProbeOptions{
-		Timeout:  timeout,
-		RootCAs:  rootCAs,
-		TargetIP: candIP,
+		Timeout:     timeout,
+		RootCAs:     rootCAs,
+		TargetIP:    candIP,
+		DialContext: dialContext,
 	}
 	probeRes := ProbeTLSH2(ctx, domain, probeOpts)
 	if probeRes.Error != "" {

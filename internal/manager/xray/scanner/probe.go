@@ -12,11 +12,12 @@ import (
 
 // ProbeOptions configures the TLS probe behavior.
 type ProbeOptions struct {
-	Timeout  time.Duration
-	RootCAs  *x509.CertPool
-	Dialer   *net.Dialer
-	TargetIP net.IP
-	Port     int
+	Timeout     time.Duration
+	RootCAs     *x509.CertPool
+	Dialer      *net.Dialer
+	TargetIP    net.IP
+	Port        int
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // ProbeResult contains TLS handshake and ALPN verification details.
@@ -67,7 +68,11 @@ func ProbeTLSH2(ctx context.Context, domain string, opts ProbeOptions) ProbeResu
 	defer candCancel()
 
 	start := time.Now()
-	rawConn, err := dialer.DialContext(candCtx, "tcp", targetAddr)
+	dialContext := dialer.DialContext
+	if opts.DialContext != nil {
+		dialContext = opts.DialContext
+	}
+	rawConn, err := dialContext(candCtx, "tcp", targetAddr)
 	if err != nil {
 		return ProbeResult{
 			Domain: domain,
