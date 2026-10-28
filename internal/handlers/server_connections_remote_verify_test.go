@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -115,5 +116,107 @@ func TestNameOnlyConnectionEditAfterUserDeletionDoesNotRecreateLifecycle(t *test
 	}
 	if len(peers) != 0 {
 		t.Fatalf("active lifecycle records after deleted-user edit = %+v, want none", peers)
+	}
+}
+
+func TestEditServerConnectionAllowsAWGClientWithoutStoredPrivateKey(t *testing.T) {
+	const clientID = "awg-client-without-private-key"
+	const clientsTable = `[{"clientId":"awg-client-without-private-key","userData":{"clientName":"Old Name","clientPrivateKey":"","enabled":true,"awg_mimicry":"auto"}}]`
+	var savedClientsTable []byte
+	mockSSH := &testMockSSHClient{
+		cmdFunc: func(_ context.Context, cmd string) (string, string, int, error) {
+			if strings.Contains(cmd, "cat") && strings.Contains(cmd, "clientsTable") {
+				return clientsTable, "", 0, nil
+			}
+			return "ok", "", 0, nil
+		},
+		uploadFn: func(_ context.Context, _ string, content []byte) error {
+			savedClientsTable = append([]byte(nil), content...)
+			return nil
+		},
+	}
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	ctx := context.Background()
+	serverID, err := db.CreateServer(ctx, &models.Server{
+		Name: "awg-remote-verify", Host: "192.0.2.91", SSHPort: 22, SSHUser: "root",
+		Protocols: map[string]any{models.ProtocolAWG: map[string]any{"installed": true}}, CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+	const userID = "awg-remote-verify-user"
+	if _, err := db.CreateUser(ctx, &models.User{
+		ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	createResourceRBACConnection(t, db, "awg-remote-verify-connection", userID, serverID, models.ProtocolAWG, clientID)
+
+	name := "renamed-awg-client"
+	mimicry := string(models.AWGMimicryDNS)
+	w := resourceRBACRequest(t, setupFullServerConnectionsRouter(h), http.MethodPost,
+		fmt.Sprintf("/api/servers/%d/connections/edit", serverID), resourceRBACSession(models.RoleAdmin),
+		models.EditConnectionRequest{
+			Protocol: models.ProtocolAWG, ClientID: clientID, Name: &name, AWGMimicry: &mimicry,
+		})
+	if w.Code != http.StatusOK {
+		t.Fatalf("edit status = %d, body = %s; want 200", w.Code, w.Body.String())
+	}
+
+	var remoteClients []struct {
+		UserData struct {
+			ClientPrivateKey string `json:"clientPrivateKey"`
+			AWGMimicry       string `json:"awg_mimicry"`
+		} `json:"userData"`
+	}
+	if err := json.Unmarshal(savedClientsTable, &remoteClients); err != nil {
+		t.Fatalf("Unmarshal saved clients table: %v", err)
+	}
+	if len(remoteClients) != 1 || remoteClients[0].UserData.AWGMimicry != mimicry {
+		t.Fatalf("saved remote clients = %+v, want mimicry %q", remoteClients, mimicry)
+	}
+	if remoteClients[0].UserData.ClientPrivateKey != "" {
+		t.Fatal("test unexpectedly stored a remote private key")
+	}
+	connection, err := db.GetConnection(ctx, "awg-remote-verify-connection")
+	if err != nil {
+		t.Fatalf("GetConnection: %v", err)
+	}
+	if connection == nil || connection.Name != name {
+		t.Fatalf("connection = %+v, want name %q", connection, name)
+	}
+}
+
+func TestAddUserConnectionAllowsAWGClientWithoutStoredPrivateKey(t *testing.T) {
+	h, db, serverID := setupResourceRBACClosure(t)
+	ctx := context.Background()
+	const userID = "awg-add-remote-verify-user"
+	clientID := "awg-add-client-without-private-key"
+	if _, err := db.CreateUser(ctx, &models.User{
+		ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	h.registry.Register(&mockProtocolManager{
+		protocol: models.ProtocolAWG,
+		getClientConfigFn: func(_ context.Context, _ *models.Server, _ string) (string, error) {
+			return "", errors.New("client private key not stored; config cannot be reconstructed")
+		},
+	})
+
+	w := resourceRBACRequest(t, setupFullUsersRouter(h), http.MethodPost,
+		"/api/users/"+userID+"/connections/add", resourceRBACSession(models.RoleAdmin),
+		models.AddUserConnectionRequest{
+			ServerID: serverID, Protocol: models.ProtocolAWG, ClientID: &clientID, Name: "imported-awg-client",
+		})
+	if w.Code != http.StatusOK {
+		t.Fatalf("add status = %d, body = %s; want 200", w.Code, w.Body.String())
+	}
+	connections, err := db.GetConnectionsByUserID(ctx, userID)
+	if err != nil {
+		t.Fatalf("GetConnectionsByUserID: %v", err)
+	}
+	if len(connections) != 1 || connections[0].ClientID != clientID {
+		t.Fatalf("connections = %+v, want client %q", connections, clientID)
 	}
 }

@@ -714,23 +714,29 @@ func (h *Handlers) loadExistingClientConfig(
 	protoMgr manager.ProtocolManager,
 	server *models.Server,
 	req *models.AddUserConnectionRequest,
-) string {
+) (string, bool) {
 	clientID := *req.ClientID
 	current, err := h.findClientConnection(ctx, req.ServerID, req.Protocol, clientID)
 	if err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve connections")
-		return ""
+		return "", false
 	}
 	if current != nil {
 		h.JSONError(w, http.StatusConflict, "connection_already_assigned", "Client is already assigned to another user")
-		return ""
+		return "", false
 	}
 	configStr, err := protoMgr.GetClientConfig(ctx, server, clientID)
-	if err != nil || configStr == "" {
-		h.JSONError(w, http.StatusNotFound, "client_not_found", "Client configuration not found on remote server")
-		return ""
+	if err == nil && configStr != "" {
+		return configStr, true
 	}
-	return configStr
+	if err != nil && req.Protocol == models.ProtocolAWG {
+		exists, _ := verifyRemoteClientExists(ctx, protoMgr, server, clientID)
+		if exists {
+			return "", true
+		}
+	}
+	h.JSONError(w, http.StatusNotFound, "client_not_found", "Client configuration not found on remote server")
+	return "", false
 }
 
 // AddUserConnectionHandler assigns a new or existing connection to a specific user.
@@ -794,8 +800,9 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 	clientCreated := false
 	if hasExistingClient {
 		clientID = *req.ClientID
-		configStr = h.loadExistingClientConfig(w, ctx, protoMgr, server, &req)
-		if configStr == "" {
+		var ok bool
+		configStr, ok = h.loadExistingClientConfig(w, ctx, protoMgr, server, &req)
+		if !ok {
 			return
 		}
 	} else {

@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/google/uuid"
 )
@@ -41,6 +43,34 @@ func (h *Handlers) findClientConnection(ctx context.Context, serverID int64, pro
 		}
 	}
 	return nil, nil
+}
+
+func verifyRemoteClientExists(
+	ctx context.Context,
+	protoMgr manager.ProtocolManager,
+	server *models.Server,
+	clientID string,
+) (bool, error) {
+	_, err := protoMgr.GetClientConfig(ctx, server, clientID)
+	if err == nil {
+		return true, nil
+	}
+	// AWG clients without a stored private key exist, but their config cannot be reconstructed.
+	if strings.Contains(err.Error(), "client private key not stored") {
+		return true, nil
+	}
+	clients, getErr := protoMgr.GetClients(ctx, server)
+	if getErr == nil {
+		for _, c := range clients {
+			if id, ok := c["clientId"].(string); ok && id == clientID {
+				return true, nil
+			}
+			if id, ok := c["client_id"].(string); ok && id == clientID {
+				return true, nil
+			}
+		}
+	}
+	return false, err
 }
 
 func (h *Handlers) editAWGParams(ctx context.Context, server *models.Server, req *models.EditConnectionRequest) error {
@@ -250,6 +280,17 @@ func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	protoMgr, err := h.GetProtocolManager(req.Protocol)
+	if err != nil {
+		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", err.Error())
+		return
+	}
+	exists, _ := verifyRemoteClientExists(ctx, protoMgr, server, req.ClientID)
+	if !exists {
+		h.JSONError(w, http.StatusNotFound, "client_not_found", "Client configuration not found on remote server")
+		return
+	}
+
 	// Update AWG speed limits / parameters if applicable
 	if err := h.editAWGParams(ctx, server, &req); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "operation_failed", "Failed to edit client on server: "+err.Error())
@@ -299,16 +340,6 @@ func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Re
 			return
 		}
 		matchingConn = current
-	}
-
-	protoMgr, err := h.GetProtocolManager(req.Protocol)
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", err.Error())
-		return
-	}
-	if _, err := protoMgr.GetClientConfig(ctx, server, req.ClientID); err != nil {
-		h.JSONError(w, http.StatusNotFound, "client_not_found", "Client configuration not found on remote server")
-		return
 	}
 
 	if err := h.editConnectionBinding(ctx, serverID, &req, matchingConn); err != nil {
