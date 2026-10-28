@@ -167,6 +167,9 @@ func TestDisableWaitsForInFlightProvisioning(t *testing.T) {
 						return
 					}
 					req := httptest.NewRequest(http.MethodPost, "/api/users/"+rig.userID+"/toggle", bytes.NewReader([]byte(`{"enabled":false}`)))
+					req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+						UserID: "race-admin", Role: models.RoleAdmin,
+					}))
 					w := httptest.NewRecorder()
 					setupFullUsersRouter(rig.h).ServeHTTP(w, req)
 					if w.Code != http.StatusOK {

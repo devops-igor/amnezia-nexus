@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
@@ -63,6 +64,9 @@ func TestToggleUserHandlerDisableRevokesNonToggleProtocols(t *testing.T) {
 
 	disable := func() int {
 		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/toggle", user.ID), bytes.NewReader([]byte(`{"enabled":false}`)))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+			UserID: "toggle-admin", Role: models.RoleAdmin,
+		}))
 		w := httptest.NewRecorder()
 		setupFullUsersRouter(h).ServeHTTP(w, req)
 		return w.Code
