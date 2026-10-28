@@ -220,6 +220,79 @@ func TestConcurrentAssignmentOfUnassignedClient(t *testing.T) {
 	}
 }
 
+func TestAddUserConnectionRejectsAlreadyAssignedClient(t *testing.T) {
+	h, db, serverID := setupResourceRBACClosure(t)
+	ctx := context.Background()
+	userA, userB := "cross-route-user-a", "cross-route-user-b"
+	for _, userID := range []string{userA, userB} {
+		if _, err := db.CreateUser(ctx, &models.User{
+			ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("CreateUser(%s): %v", userID, err)
+		}
+	}
+	clientID := "cross-route-client"
+	var revoked []string
+	h.registry.Register(&mockProtocolManager{
+		protocol: models.ProtocolVLESS,
+		removeClientFn: func(_ context.Context, _ *models.Server, id string) error {
+			revoked = append(revoked, id)
+			return nil
+		},
+	})
+
+	path := fmt.Sprintf("/api/servers/%d/connections/edit", serverID)
+	w := resourceRBACRequest(t, setupFullServerConnectionsRouter(h), http.MethodPost, path,
+		resourceRBACSession(models.RoleAdmin), models.EditConnectionRequest{
+			Protocol: models.ProtocolVLESS,
+			ClientID: clientID,
+			UserID:   &userA,
+		})
+	if w.Code != http.StatusOK {
+		t.Fatalf("assign to user A status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+
+	w = resourceRBACRequest(t, setupFullUsersRouter(h), http.MethodPost,
+		"/api/users/"+userB+"/connections/add", resourceRBACSession(models.RoleAdmin),
+		models.AddUserConnectionRequest{
+			ServerID: serverID, Protocol: models.ProtocolVLESS, ClientID: &clientID, Name: "shared-client",
+		})
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "connection_already_assigned") {
+		t.Fatalf("assign to user B status = %d, want 409 connection_already_assigned; body: %s", w.Code, w.Body.String())
+	}
+
+	connections, err := db.GetAllConnections(ctx)
+	if err != nil {
+		t.Fatalf("GetAllConnections: %v", err)
+	}
+	if len(connections) != 1 || connections[0].ClientID != clientID || connections[0].UserID != userA {
+		t.Fatalf("connections after conflict = %+v, want only user A's client", connections)
+	}
+	userBConnections, err := db.GetConnectionsByUserID(ctx, userB)
+	if err != nil {
+		t.Fatalf("GetConnectionsByUserID(user B): %v", err)
+	}
+	if len(userBConnections) != 0 {
+		t.Fatalf("user B connections = %+v, want none", userBConnections)
+	}
+
+	w = resourceRBACRequest(t, setupFullUsersRouter(h), http.MethodPost,
+		"/api/users/"+userA+"/delete", resourceRBACSession(models.RoleAdmin), nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete user A status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if len(revoked) != 1 || revoked[0] != clientID {
+		t.Fatalf("revoked clients = %v, want [%s]", revoked, clientID)
+	}
+	connections, err = db.GetAllConnections(ctx)
+	if err != nil {
+		t.Fatalf("GetAllConnections after delete: %v", err)
+	}
+	if len(connections) != 0 {
+		t.Fatalf("connections after user A deletion = %+v, want none", connections)
+	}
+}
+
 func TestDeleteUserHandlerProtectedProtocolAuthorization(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

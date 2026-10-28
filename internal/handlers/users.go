@@ -728,6 +728,10 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	if req.ClientID != nil && *req.ClientID != "" {
+		unlockClient := lockClient(req.ServerID, req.Protocol, *req.ClientID)
+		defer unlockClient()
+	}
 	defer h.lockUser(userID)()
 
 	ctx := r.Context()
@@ -761,6 +765,15 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 	var addResult map[string]any
 	clientCreated := false
 	if req.ClientID != nil && *req.ClientID != "" {
+		current, err := h.findClientConnection(ctx, req.ServerID, req.Protocol, *req.ClientID)
+		if err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve connections")
+			return
+		}
+		if current != nil {
+			h.JSONError(w, http.StatusConflict, "connection_already_assigned", "Client is already assigned to another user")
+			return
+		}
 		clientID = *req.ClientID
 		configStr, _ = protoMgr.GetClientConfig(ctx, server, clientID)
 	} else {
@@ -803,6 +816,9 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 	} else if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
 		return
+	}
+	if !clientCreated {
+		_ = h.db.RecordPeerLifecycle(ctx, req.ServerID, req.Protocol, *req.ClientID, req.Name, userID, "active")
 	}
 
 	h.audit(r, "user.connection_add", map[string]any{"user_id": userID, "server_id": req.ServerID, "protocol": req.Protocol, "client_id": clientID})
