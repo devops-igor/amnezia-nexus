@@ -249,7 +249,16 @@ func AcquireRemoteServerLockWithHeartbeat(ctx context.Context, client ssh.SSHCli
 	unlock := func() {
 		once.Do(func() {
 			cancelHeartbeat()
-			heartbeatWg.Wait()
+			done := make(chan struct{})
+			go func() {
+				heartbeatWg.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				slog.Warn("remote server lock heartbeat worker did not exit promptly on cancel")
+			}
 
 			relCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()

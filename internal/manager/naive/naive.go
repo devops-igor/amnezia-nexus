@@ -112,8 +112,8 @@ func (m *NaiveManager) lockServer(ctx context.Context, client ssh.SSHClient, ser
 	}
 
 	return func() {
+		defer localUnlock()
 		remoteUnlock()
-		localUnlock()
 	}, nil
 }
 

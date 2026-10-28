@@ -113,8 +113,8 @@ func (m *XrayManager) lockServer(ctx context.Context, client ssh.SSHClient, serv
 	}
 
 	return func() {
+		defer localUnlock()
 		remoteUnlock()
-		localUnlock()
 	}, nil
 }
 

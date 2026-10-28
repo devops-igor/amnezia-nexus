@@ -1,8 +1,19 @@
 package awg
 
 import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/binary"
+	"net"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 func TestAWGManager_ServerLock_Isolation(t *testing.T) {
@@ -115,4 +126,162 @@ func TestAWGManager_ServerLock_ConcurrentAccess(t *testing.T) {
 			t.Errorf("server %d: expected distinct locks for mgr1 and mgr2, got %p", id, lock1)
 		}
 	}
+}
+
+type stalledSessionServer struct {
+	listener         net.Listener
+	config           *gossh.ServerConfig
+	heartbeatOpening chan struct{}
+	heartbeatOnce    sync.Once
+	channelCount     atomic.Int32
+	locked           atomic.Bool
+}
+
+func newStalledSessionServer(t *testing.T) *stalledSessionServer {
+	t.Helper()
+
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate SSH host key: %v", err)
+	}
+	signer, err := gossh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatalf("create SSH host signer: %v", err)
+	}
+
+	config := &gossh.ServerConfig{
+		PasswordCallback: func(conn gossh.ConnMetadata, password []byte) (*gossh.Permissions, error) {
+			return nil, nil
+		},
+	}
+	config.AddHostKey(signer)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for SSH connections: %v", err)
+	}
+
+	server := &stalledSessionServer{
+		listener:         listener,
+		config:           config,
+		heartbeatOpening: make(chan struct{}),
+	}
+	go server.serve(t)
+	t.Cleanup(func() { _ = listener.Close() })
+	return server
+}
+
+func (s *stalledSessionServer) serve(t *testing.T) {
+	conn, err := s.listener.Accept()
+	if err != nil {
+		return
+	}
+	serverConn, channels, requests, err := gossh.NewServerConn(conn, s.config)
+	if err != nil {
+		_ = conn.Close()
+		t.Errorf("SSH handshake failed: %v", err)
+		return
+	}
+	defer serverConn.Close()
+	go gossh.DiscardRequests(requests)
+
+	for newChannel := range channels {
+		if newChannel.ChannelType() != "session" {
+			_ = newChannel.Reject(gossh.UnknownChannelType, "unsupported channel type")
+			continue
+		}
+		if s.channelCount.Add(1) == 2 {
+			s.heartbeatOnce.Do(func() { close(s.heartbeatOpening) })
+			continue
+		}
+		channel, channelRequests, err := newChannel.Accept()
+		if err != nil {
+			continue
+		}
+		go s.handleSession(channel, channelRequests)
+	}
+}
+
+func (s *stalledSessionServer) handleSession(channel gossh.Channel, requests <-chan *gossh.Request) {
+	defer channel.Close()
+	for request := range requests {
+		if request.Type != "exec" || len(request.Payload) < 4 {
+			_ = request.Reply(false, nil)
+			continue
+		}
+		commandLength := binary.BigEndian.Uint32(request.Payload[:4])
+		if int(commandLength) > len(request.Payload)-4 {
+			_ = request.Reply(false, nil)
+			continue
+		}
+		command := string(request.Payload[4 : 4+commandLength])
+		_ = request.Reply(true, nil)
+
+		exitCode := uint32(0)
+		switch {
+		case strings.Contains(command, "cur_owner=") && strings.Contains(command, "rm -rf"):
+			s.locked.Store(false)
+		case strings.Contains(command, "flock_path="):
+			if !s.locked.CompareAndSwap(false, true) {
+				exitCode = 1
+			}
+		}
+		status := make([]byte, 4)
+		binary.BigEndian.PutUint32(status, exitCode)
+		_, _ = channel.SendRequest("exit-status", false, status)
+		return
+	}
+}
+
+func TestRemoteLock_UnlockCancelsStalledHeartbeatSessionOpen(t *testing.T) {
+	server := newStalledSessionServer(t)
+	address := server.listener.Addr().(*net.TCPAddr)
+	client, err := ssh.Dial(context.Background(), ssh.Config{
+		Host:            address.IP.String(),
+		Port:            address.Port,
+		User:            "root",
+		Password:        "test",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		t.Fatalf("dial stalled-session SSH server: %v", err)
+	}
+	defer client.Close()
+
+	unlock, err := AcquireRemoteServerLockWithHeartbeat(
+		context.Background(), client, "server_636", 10*time.Millisecond, time.Second,
+	)
+	if err != nil {
+		t.Fatalf("acquire remote lock: %v", err)
+	}
+
+	select {
+	case <-server.heartbeatOpening:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat did not attempt to open an SSH session")
+	}
+
+	unlockDone := make(chan struct{})
+	started := time.Now()
+	go func() {
+		unlock()
+		close(unlockDone)
+	}()
+	select {
+	case <-unlockDone:
+		if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+			t.Fatalf("unlock took %s with a stalled heartbeat session open", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("unlock did not cancel stalled heartbeat session opening")
+	}
+
+	reacquireCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	secondUnlock, err := AcquireRemoteServerLockWithHeartbeat(
+		reacquireCtx, client, "server_636", time.Hour, time.Second,
+	)
+	if err != nil {
+		t.Fatalf("reacquire remote lock after stalled heartbeat: %v", err)
+	}
+	secondUnlock()
 }
