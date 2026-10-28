@@ -149,6 +149,11 @@ func (h *Handlers) AddUserHandler(w http.ResponseWriter, r *http.Request) {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
 		return
 	}
+	role := req.Role
+	if role == models.RoleAdmin && !h.GetSession(r).IsAdmin() {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin role required to create admin users")
+		return
+	}
 	if req.Protocol != nil && *req.Protocol != "" && !h.authorizeAdminProtocol(w, r, *req.Protocol) {
 		return
 	}
@@ -166,7 +171,6 @@ func (h *Handlers) AddUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	role := req.Role
 	if role == "" {
 		role = models.RoleUser
 	}
@@ -447,6 +451,10 @@ func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 		h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
 		return
 	}
+	if user.Role == models.RoleAdmin && !h.GetSession(r).IsAdmin() {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin role required to update admin accounts")
+		return
+	}
 
 	updates, passwordUpdated, err := buildUserUpdates(&req)
 	if err != nil {
@@ -514,6 +522,10 @@ func (h *Handlers) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 	user, err := h.db.GetUser(ctx, userID)
 	if err != nil || user == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
+		return
+	}
+	if user.Role == models.RoleAdmin && !h.GetSession(r).IsAdmin() {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin role required to delete admin accounts")
 		return
 	}
 
@@ -620,6 +632,10 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 	user, err := h.db.GetUser(ctx, userID)
 	if err != nil || user == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
+		return
+	}
+	if user.Role == models.RoleAdmin && !h.GetSession(r).IsAdmin() {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin role required to toggle admin accounts")
 		return
 	}
 

@@ -431,3 +431,188 @@ func TestRestoreBackupHandlerRequiresAdmin(t *testing.T) {
 		})
 	}
 }
+
+func TestAddUserHandlerAdminAccountAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		callerRole models.UserRole
+		wantStatus int
+		wantUsers  int
+	}{
+		{name: "support cannot create admin", callerRole: models.RoleSupport, wantStatus: http.StatusForbidden},
+		{name: "admin can create admin", callerRole: models.RoleAdmin, wantStatus: http.StatusOK, wantUsers: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, db, _ := setupResourceRBACClosure(t)
+			w := resourceRBACRequest(t, setupFullUsersRouter(h), http.MethodPost, "/api/users/add",
+				resourceRBACSession(tc.callerRole), models.AddUserRequest{
+					Username: "created-admin",
+					Password: "ValidPass123!",
+					Role:     models.RoleAdmin,
+				})
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tc.wantStatus, w.Body.String())
+			}
+			if tc.wantStatus == http.StatusForbidden && !strings.Contains(w.Body.String(), "forbidden") {
+				t.Errorf("response does not contain forbidden error: %s", w.Body.String())
+			}
+			users, err := db.GetAllUsers(context.Background())
+			if err != nil {
+				t.Fatalf("GetAllUsers: %v", err)
+			}
+			if len(users) != tc.wantUsers {
+				t.Fatalf("users = %d, want %d", len(users), tc.wantUsers)
+			}
+			if tc.wantUsers == 1 && users[0].Role != models.RoleAdmin {
+				t.Fatalf("created role = %q, want admin", users[0].Role)
+			}
+		})
+	}
+}
+
+func TestUpdateUserHandlerAdminAccountAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		method     string
+		callerRole models.UserRole
+		wantStatus int
+	}{
+		{name: "support POST forbidden", method: http.MethodPost, callerRole: models.RoleSupport, wantStatus: http.StatusForbidden},
+		{name: "support PATCH forbidden", method: http.MethodPatch, callerRole: models.RoleSupport, wantStatus: http.StatusForbidden},
+		{name: "admin POST allowed", method: http.MethodPost, callerRole: models.RoleAdmin, wantStatus: http.StatusOK},
+		{name: "admin PATCH allowed", method: http.MethodPatch, callerRole: models.RoleAdmin, wantStatus: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, db, _ := setupResourceRBACClosure(t)
+			ctx := context.Background()
+			const userID = "admin-update-target"
+			if _, err := db.CreateUser(ctx, &models.User{
+				ID: userID, Username: userID, PasswordHash: "original-hash",
+				Role: models.RoleAdmin, Enabled: true, CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatalf("CreateUser: %v", err)
+			}
+			router := chi.NewRouter()
+			router.Post("/api/users/{user_id}/update", h.UpdateUserHandler)
+			router.Patch("/api/users/{user_id}", h.UpdateUserHandler)
+			path := "/api/users/" + userID
+			if tc.method == http.MethodPost {
+				path += "/update"
+			}
+			w := resourceRBACRequest(t, router, tc.method, path, resourceRBACSession(tc.callerRole),
+				map[string]any{"password": "NewValidPass123!"})
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tc.wantStatus, w.Body.String())
+			}
+			user, err := db.GetUser(ctx, userID)
+			if err != nil || user == nil {
+				t.Fatalf("GetUser: user=%v err=%v", user, err)
+			}
+			if tc.wantStatus == http.StatusForbidden {
+				if !strings.Contains(w.Body.String(), "forbidden") {
+					t.Errorf("response does not contain forbidden error: %s", w.Body.String())
+				}
+				if user.PasswordHash != "original-hash" {
+					t.Fatalf("forbidden update changed password hash to %q", user.PasswordHash)
+				}
+				return
+			}
+			if user.PasswordHash == "" || user.PasswordHash == "original-hash" {
+				t.Fatalf("allowed update did not change password hash: %q", user.PasswordHash)
+			}
+		})
+	}
+}
+
+func TestDeleteAndToggleUserHandlerAdminAccountAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		action     string
+		callerRole models.UserRole
+		wantStatus int
+	}{
+		{name: "support delete forbidden", action: "delete", callerRole: models.RoleSupport, wantStatus: http.StatusForbidden},
+		{name: "admin delete allowed", action: "delete", callerRole: models.RoleAdmin, wantStatus: http.StatusOK},
+		{name: "support toggle forbidden", action: "toggle", callerRole: models.RoleSupport, wantStatus: http.StatusForbidden},
+		{name: "admin toggle allowed", action: "toggle", callerRole: models.RoleAdmin, wantStatus: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, db, _ := setupResourceRBACClosure(t)
+			ctx := context.Background()
+			const userID = "admin-mutation-target"
+			if _, err := db.CreateUser(ctx, &models.User{
+				ID: userID, Username: userID, Role: models.RoleAdmin, Enabled: true, CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatalf("CreateUser: %v", err)
+			}
+			var body any
+			if tc.action == "toggle" {
+				body = models.ToggleUserRequest{Enabled: false}
+			}
+			w := resourceRBACRequest(t, setupFullUsersRouter(h), http.MethodPost,
+				"/api/users/"+userID+"/"+tc.action, resourceRBACSession(tc.callerRole), body)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tc.wantStatus, w.Body.String())
+			}
+			user, err := db.GetUser(ctx, userID)
+			if err != nil {
+				t.Fatalf("GetUser: %v", err)
+			}
+			if tc.wantStatus == http.StatusForbidden {
+				if !strings.Contains(w.Body.String(), "forbidden") {
+					t.Errorf("response does not contain forbidden error: %s", w.Body.String())
+				}
+				if user == nil || !user.Enabled {
+					t.Fatalf("forbidden %s changed admin account: %+v", tc.action, user)
+				}
+				return
+			}
+			if tc.action == "delete" {
+				if user != nil {
+					t.Fatal("allowed delete left admin account behind")
+				}
+				return
+			}
+			if user == nil || user.Enabled {
+				t.Fatalf("allowed toggle did not disable admin account: %+v", user)
+			}
+		})
+	}
+}
+
+func TestSupportOrdinaryUserLifecycle(t *testing.T) {
+	h, db, _ := setupResourceRBACClosure(t)
+	ctx := context.Background()
+	router := setupFullUsersRouter(h)
+	sess := resourceRBACSession(models.RoleSupport)
+
+	w := resourceRBACRequest(t, router, http.MethodPost, "/api/users/add", sess, models.AddUserRequest{
+		Username: "ordinary-user", Password: "ValidPass123!", Role: models.RoleUser,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	user, err := db.GetUserByUsername(ctx, "ordinary-user")
+	if err != nil || user == nil {
+		t.Fatalf("GetUserByUsername: user=%v err=%v", user, err)
+	}
+
+	w = resourceRBACRequest(t, router, http.MethodPost, "/api/users/"+user.ID+"/update", sess,
+		map[string]any{"description": "support managed"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("update status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	user, err = db.GetUser(ctx, user.ID)
+	if err != nil || user == nil || user.Description == nil || *user.Description != "support managed" {
+		t.Fatalf("updated user = %+v, err=%v", user, err)
+	}
+
+	w = resourceRBACRequest(t, router, http.MethodPost, "/api/users/"+user.ID+"/delete", sess, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	user, err = db.GetUser(ctx, user.ID)
+	if err != nil || user != nil {
+		t.Fatalf("deleted user = %+v, err=%v", user, err)
+	}
+}

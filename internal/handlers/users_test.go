@@ -524,6 +524,9 @@ func TestUsersHandlers(t *testing.T) {
 			ExpirationDate: &expDate,
 		})
 		req := httptest.NewRequest(http.MethodPost, "/api/users/add", bytes.NewReader(body))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+			UserID: "admin-creator", Role: models.RoleAdmin,
+		}))
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 
@@ -589,6 +592,9 @@ func TestUsersHandlers(t *testing.T) {
 			Enabled: false,
 		})
 		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/toggle", selfUser.ID), bytes.NewReader(body))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+			UserID: "other-admin", Role: models.RoleAdmin,
+		}))
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {
