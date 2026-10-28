@@ -266,6 +266,16 @@ func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Re
 		defer unlock()
 	}
 
+	protoMgr, err := h.GetProtocolManager(req.Protocol)
+	if err != nil {
+		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", err.Error())
+		return
+	}
+	if _, err := protoMgr.GetClientConfig(ctx, server, req.ClientID); err != nil {
+		h.JSONError(w, http.StatusNotFound, "client_not_found", "Client configuration not found on remote server")
+		return
+	}
+
 	if err := h.editConnectionBinding(ctx, serverID, &req, matchingConn); err != nil {
 		if errors.Is(err, errClientAlreadyAssigned) {
 			h.JSONError(w, http.StatusConflict, "connection_already_assigned", "Client is already assigned to another user")
