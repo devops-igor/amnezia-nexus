@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/security"
@@ -706,6 +707,32 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// loadExistingClientConfig validates an unassigned client and returns its remote configuration.
+func (h *Handlers) loadExistingClientConfig(
+	w http.ResponseWriter,
+	ctx context.Context,
+	protoMgr manager.ProtocolManager,
+	server *models.Server,
+	req *models.AddUserConnectionRequest,
+) string {
+	clientID := *req.ClientID
+	current, err := h.findClientConnection(ctx, req.ServerID, req.Protocol, clientID)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve connections")
+		return ""
+	}
+	if current != nil {
+		h.JSONError(w, http.StatusConflict, "connection_already_assigned", "Client is already assigned to another user")
+		return ""
+	}
+	configStr, err := protoMgr.GetClientConfig(ctx, server, clientID)
+	if err != nil || configStr == "" {
+		h.JSONError(w, http.StatusNotFound, "client_not_found", "Client configuration not found on remote server")
+		return ""
+	}
+	return configStr
+}
+
 // AddUserConnectionHandler assigns a new or existing connection to a specific user.
 func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Request) {
 	userID := chi.URLParam(r, "user_id")
@@ -766,19 +793,9 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 	var addResult map[string]any
 	clientCreated := false
 	if hasExistingClient {
-		current, err := h.findClientConnection(ctx, req.ServerID, req.Protocol, *req.ClientID)
-		if err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve connections")
-			return
-		}
-		if current != nil {
-			h.JSONError(w, http.StatusConflict, "connection_already_assigned", "Client is already assigned to another user")
-			return
-		}
 		clientID = *req.ClientID
-		configStr, err = protoMgr.GetClientConfig(ctx, server, clientID)
-		if err != nil || configStr == "" {
-			h.JSONError(w, http.StatusNotFound, "client_not_found", "Client configuration not found on remote server")
+		configStr = h.loadExistingClientConfig(w, ctx, protoMgr, server, &req)
+		if configStr == "" {
 			return
 		}
 	} else {
