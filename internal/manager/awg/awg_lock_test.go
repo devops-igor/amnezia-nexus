@@ -285,3 +285,145 @@ func TestRemoteLock_UnlockCancelsStalledHeartbeatSessionOpen(t *testing.T) {
 	}
 	secondUnlock()
 }
+
+type blackholePacketGate struct {
+	net.Conn
+	paused atomic.Bool
+	resume <-chan struct{}
+}
+
+func (c *blackholePacketGate) Write(p []byte) (int, error) {
+	if c.paused.Load() {
+		<-c.resume
+	}
+	return c.Conn.Write(p)
+}
+
+func TestRemoteLock_UnlockReturnsPromptlyWhenReleaseExecBlackholes(t *testing.T) {
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate SSH host key: %v", err)
+	}
+	signer, err := gossh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatalf("create SSH host signer: %v", err)
+	}
+	config := &gossh.ServerConfig{NoClientAuth: true}
+	config.AddHostKey(signer)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for SSH connections: %v", err)
+	}
+	defer listener.Close()
+
+	resume := make(chan struct{})
+	releaseStarted := make(chan struct{})
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		raw, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		wire := &blackholePacketGate{Conn: raw, resume: resume}
+		serverConn, channels, requests, handshakeErr := gossh.NewServerConn(wire, config)
+		if handshakeErr != nil {
+			_ = raw.Close()
+			return
+		}
+		defer serverConn.Close()
+		go gossh.DiscardRequests(requests)
+
+		for newChannel := range channels {
+			channel, channelRequests, openErr := newChannel.Accept()
+			if openErr != nil {
+				return
+			}
+			go func() {
+				for request := range channelRequests {
+					if request.Type != "exec" || len(request.Payload) < 4 {
+						_ = request.Reply(false, nil)
+						continue
+					}
+					commandLength := binary.BigEndian.Uint32(request.Payload[:4])
+					if int(commandLength) > len(request.Payload)-4 {
+						_ = request.Reply(false, nil)
+						continue
+					}
+					command := string(request.Payload[4 : 4+commandLength])
+					if strings.Contains(command, "cur_owner=") && strings.Contains(command, "rm -rf") {
+						wire.paused.Store(true)
+						close(releaseStarted)
+						<-resume
+						return
+					}
+					_ = request.Reply(true, nil)
+					status := make([]byte, 4)
+					_, _ = channel.SendRequest("exit-status", false, status)
+					_ = channel.Close()
+					return
+				}
+			}()
+		}
+	}()
+
+	address := listener.Addr().(*net.TCPAddr)
+	client, err := ssh.Dial(context.Background(), ssh.Config{
+		Host:            address.IP.String(),
+		Port:            address.Port,
+		User:            "root",
+		Password:        "test",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		close(resume)
+		t.Fatalf("dial blackhole SSH server: %v", err)
+	}
+	defer func() {
+		close(resume)
+		_ = client.Close()
+		<-serverDone
+	}()
+
+	const serverID = int64(636)
+	registry := NewServerLockRegistry()
+	localLock := registry.GetLock(serverID)
+	localLock.Lock()
+	unlock, err := AcquireRemoteServerLockWithHeartbeat(
+		context.Background(), client, "server_636", time.Hour, time.Second,
+	)
+	if err != nil {
+		localLock.Unlock()
+		t.Fatalf("acquire remote lock: %v", err)
+	}
+
+	started := time.Now()
+	unlockDone := make(chan struct{})
+	go func() {
+		defer close(unlockDone)
+		defer localLock.Unlock()
+		unlock()
+	}()
+
+	select {
+	case <-releaseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("release did not reach exec phase after channel confirmation")
+	}
+
+	timer := time.NewTimer(5500 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-unlockDone:
+		if elapsed := time.Since(started); elapsed >= 5500*time.Millisecond {
+			t.Fatalf("unlock took %s with a blackholed release exec", elapsed)
+		}
+	case <-timer.C:
+		t.Fatal("unlock did not return after its release context expired")
+	}
+
+	if !localLock.TryLock() {
+		t.Fatal("local server mutex remains locked after unlock returned")
+	}
+	localLock.Unlock()
+}

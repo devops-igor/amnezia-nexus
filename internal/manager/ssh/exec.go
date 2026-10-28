@@ -130,20 +130,18 @@ func RunSession(ctx context.Context, client *gossh.Client, cmd string, stdin io.
 		}
 	}
 
-	// Goroutine to handle context cancellation / timeout
-	done := make(chan struct{})
-	defer close(done)
-
+	runCh := make(chan error, 1)
 	go func() {
-		select {
-		case <-ctx.Done():
-			_ = session.Signal(gossh.SIGKILL)
-			_ = session.Close()
-		case <-done:
-		}
+		runCh <- session.Run(cmd)
 	}()
 
-	runErr := session.Run(cmd)
+	var runErr error
+	select {
+	case <-ctx.Done():
+		_ = session.Signal(gossh.SIGKILL)
+		_ = session.Close()
+	case runErr = <-runCh:
+	}
 
 	outStr := strings.TrimSpace(stdoutBuf.String())
 	errStr := strings.TrimSpace(stderrBuf.String())
