@@ -190,11 +190,24 @@ func (h *Handlers) validateConnectionDestination(w http.ResponseWriter, ctx cont
 
 // lockAssignment takes the client lock, then the user locks, and re-validates the binding
 // under them. On failure it writes the error response; otherwise the caller must call unlock.
-func (h *Handlers) lockAssignment(w http.ResponseWriter, ctx context.Context, serverID int64, req *models.EditConnectionRequest, matchingConn *models.UserConnection) (*models.UserConnection, func(), bool) {
+func (h *Handlers) lockAssignment(w http.ResponseWriter, ctx context.Context, serverID int64, req *models.EditConnectionRequest, matchingConn *models.UserConnection, protoMgr manager.ProtocolManager, server *models.Server) (*models.UserConnection, func(), bool) {
 	// Serialize on the credential itself: user locks alone let two admins bind one
 	// unassigned client to different users concurrently.
 	unlockClient := lockClient(serverID, req.Protocol, req.ClientID)
 	unlock := unlockClient
+	// Remote existence must be probed under the client lock: two concurrent edits on
+	// an unassigned client otherwise both pass the probe and both create a binding.
+	exists, probeErr := verifyRemoteClientExists(ctx, protoMgr, server, req.ClientID)
+	if probeErr != nil {
+		unlock()
+		h.JSONError(w, http.StatusInternalServerError, "operation_failed", "Failed to verify client on remote server: "+probeErr.Error())
+		return nil, nil, false
+	}
+	if !exists {
+		unlock()
+		h.JSONError(w, http.StatusNotFound, "client_not_found", "Client configuration not found on remote server")
+		return nil, nil, false
+	}
 	current, err := h.findClientConnection(ctx, serverID, req.Protocol, req.ClientID)
 	if err != nil {
 		unlock()
@@ -285,11 +298,6 @@ func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Re
 		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", err.Error())
 		return
 	}
-	exists, _ := verifyRemoteClientExists(ctx, protoMgr, server, req.ClientID)
-	if !exists {
-		h.JSONError(w, http.StatusNotFound, "client_not_found", "Client configuration not found on remote server")
-		return
-	}
 
 	// Update AWG speed limits / parameters if applicable
 	if err := h.editAWGParams(ctx, server, &req); err != nil {
@@ -307,7 +315,7 @@ func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Re
 	if req.UserID != nil {
 		var unlock func()
 		var ok bool
-		if matchingConn, unlock, ok = h.lockAssignment(w, ctx, serverID, &req, matchingConn); !ok {
+		if matchingConn, unlock, ok = h.lockAssignment(w, ctx, serverID, &req, matchingConn, protoMgr, server); !ok {
 			return
 		}
 		defer unlock()
