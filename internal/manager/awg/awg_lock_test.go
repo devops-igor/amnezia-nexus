@@ -427,3 +427,123 @@ func TestRemoteLock_UnlockReturnsPromptlyWhenReleaseExecBlackholes(t *testing.T)
 	}
 	localLock.Unlock()
 }
+
+func TestRemoteLock_UnlockReturnsPromptlyWhenKeepaliveBlockedOnBlackhole(t *testing.T) {
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate SSH host key: %v", err)
+	}
+	signer, err := gossh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatalf("create SSH host signer: %v", err)
+	}
+	config := &gossh.ServerConfig{NoClientAuth: true}
+	config.AddHostKey(signer)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for SSH connections: %v", err)
+	}
+	defer listener.Close()
+
+	resume := make(chan struct{})
+	wireCh := make(chan *blackholePacketGate, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		raw, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		wire := &blackholePacketGate{Conn: raw, resume: resume}
+		wireCh <- wire
+		serverConn, channels, requests, handshakeErr := gossh.NewServerConn(wire, config)
+		if handshakeErr != nil {
+			_ = raw.Close()
+			return
+		}
+		defer serverConn.Close()
+		go func() {
+			for request := range requests {
+				_ = request.Reply(true, nil)
+			}
+		}()
+
+		for newChannel := range channels {
+			channel, channelRequests, openErr := newChannel.Accept()
+			if openErr != nil {
+				return
+			}
+			go func() {
+				for request := range channelRequests {
+					if request.Type != "exec" {
+						_ = request.Reply(false, nil)
+						continue
+					}
+					_ = request.Reply(true, nil)
+					_, _ = channel.SendRequest("exit-status", false, make([]byte, 4))
+					_ = channel.Close()
+					return
+				}
+			}()
+		}
+	}()
+
+	address := listener.Addr().(*net.TCPAddr)
+	client, err := ssh.Dial(context.Background(), ssh.Config{
+		Host:            address.IP.String(),
+		Port:            address.Port,
+		User:            "root",
+		Password:        "test",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		close(resume)
+		t.Fatalf("dial blackhole SSH server: %v", err)
+	}
+	defer func() {
+		close(resume)
+		_ = client.Close()
+		<-serverDone
+	}()
+
+	const serverID = int64(636)
+	registry := NewServerLockRegistry()
+	localLock := registry.GetLock(serverID)
+	localLock.Lock()
+	unlock, err := AcquireRemoteServerLockWithHeartbeat(
+		context.Background(), client, "server_636", time.Hour, time.Second,
+	)
+	if err != nil {
+		localLock.Unlock()
+		t.Fatalf("acquire remote lock: %v", err)
+	}
+
+	wire := <-wireCh
+	wire.paused.Store(true)
+	go func() { _ = client.IsAlive() }()
+	time.Sleep(200 * time.Millisecond)
+
+	started := time.Now()
+	unlockDone := make(chan struct{})
+	go func() {
+		defer close(unlockDone)
+		defer localLock.Unlock()
+		unlock()
+	}()
+
+	timer := time.NewTimer(5500 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-unlockDone:
+		if elapsed := time.Since(started); elapsed >= 5500*time.Millisecond {
+			t.Fatalf("unlock took %s with keepalive blocked on a blackhole", elapsed)
+		}
+	case <-timer.C:
+		t.Fatal("unlock did not return while keepalive was blocked on a blackhole")
+	}
+
+	if !localLock.TryLock() {
+		t.Fatal("local server mutex remains locked after unlock returned")
+	}
+	localLock.Unlock()
+}

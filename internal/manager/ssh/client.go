@@ -68,7 +68,7 @@ type Client struct {
 	sftpClient          *sftp.Client
 	isRoot              bool
 	capturedFingerprint string
-	lastActive          time.Time
+	lastActive          atomic.Int64
 	activeOps           atomic.Int64
 	closed              bool
 	mu                  sync.Mutex
@@ -89,11 +89,12 @@ func NewClient(cfg Config) *Client {
 		cfg.KeepAlivePeriod = 30 * time.Second
 	}
 
-	return &Client{
-		cfg:        cfg,
-		isRoot:     cfg.User == "root",
-		lastActive: time.Now(),
+	client := &Client{
+		cfg:    cfg,
+		isRoot: cfg.User == "root",
 	}
+	client.lastActive.Store(time.Now().UnixNano())
+	return client
 }
 
 // Dial creates a new Client and immediately establishes an SSH connection.
@@ -182,7 +183,7 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	c.sshClient = gossh.NewClient(sshConn, chans, reqs)
 	c.closed = false
-	c.lastActive = time.Now()
+	c.lastActive.Store(time.Now().UnixNano())
 
 	return nil
 }
@@ -406,14 +407,25 @@ func (c *Client) TestConnection(ctx context.Context) (string, error) {
 // IsAlive checks if the SSH transport connection is alive by sending a keepalive global request.
 func (c *Client) IsAlive() bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.closed || c.sshClient == nil {
+		c.mu.Unlock()
 		return false
 	}
+	client := c.sshClient
+	c.mu.Unlock()
 
-	_, _, err := c.sshClient.SendRequest("keepalive@openssh.com", true, nil)
-	return err == nil
+	doneCh := make(chan error, 1)
+	go func() {
+		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+		doneCh <- err
+	}()
+
+	select {
+	case err := <-doneCh:
+		return err == nil
+	case <-time.After(5 * time.Second):
+		return false
+	}
 }
 
 // Close terminates the SFTP and SSH connections.
@@ -473,16 +485,12 @@ func (c *Client) GetServerID() *int64 {
 
 // GetLastActive returns the timestamp of the last executed operation.
 func (c *Client) GetLastActive() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.lastActive
+	return time.Unix(0, c.lastActive.Load())
 }
 
 // touch updates the last active timestamp.
 func (c *Client) touch() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.lastActive = time.Now()
+	c.lastActive.Store(time.Now().UnixNano())
 }
 
 // InUse reports whether the client is currently executing commands or file operations.
