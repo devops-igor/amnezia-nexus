@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/go-chi/chi/v5"
 )
 
 func TestRemoveServerConnectionHandlerUsesCanonicalClientID(t *testing.T) {
@@ -287,6 +288,80 @@ func TestToggleUserHandlerProtectedProtocolAuthorization(t *testing.T) {
 			}
 			if len(removals) != 1 || removals[0] != "toggle-client" {
 				t.Fatalf("RemoveClient calls = %v, want [toggle-client]", removals)
+			}
+		})
+	}
+}
+
+func TestUpdateUserHandlerProtectedProtocolAccessPolicy(t *testing.T) {
+	expiry := time.Now().Add(72 * time.Hour).UTC().Truncate(time.Second)
+	expiryStr := expiry.Format(time.RFC3339)
+	for _, tc := range []struct {
+		name     string
+		method   string
+		protocol string
+		role     models.UserRole
+		body     map[string]any
+		want     int
+	}{
+		{"support POST expires_at VLESS", http.MethodPost, models.ProtocolVLESS, models.RoleSupport, map[string]any{"expires_at": expiryStr}, http.StatusForbidden},
+		{"support POST expiration_date VLESS", http.MethodPost, models.ProtocolVLESS, models.RoleSupport, map[string]any{"expiration_date": expiryStr}, http.StatusForbidden},
+		{"support PATCH expires_at VLESS", http.MethodPatch, models.ProtocolVLESS, models.RoleSupport, map[string]any{"expires_at": expiryStr}, http.StatusForbidden},
+		{"support PATCH expiration_date VLESS", http.MethodPatch, models.ProtocolVLESS, models.RoleSupport, map[string]any{"expiration_date": expiryStr}, http.StatusForbidden},
+		{"support traffic_limit VLESS", http.MethodPost, models.ProtocolVLESS, models.RoleSupport, map[string]any{"traffic_limit": 5}, http.StatusForbidden},
+		{"support expires_at Naive", http.MethodPost, models.ProtocolNaive, models.RoleSupport, map[string]any{"expires_at": expiryStr}, http.StatusForbidden},
+		{"support mixed fields VLESS rejected entirely", http.MethodPost, models.ProtocolVLESS, models.RoleSupport, map[string]any{"expires_at": expiryStr, "description": "mixed"}, http.StatusForbidden},
+		{"admin expires_at VLESS", http.MethodPost, models.ProtocolVLESS, models.RoleAdmin, map[string]any{"expires_at": expiryStr}, http.StatusOK},
+		{"support description VLESS", http.MethodPost, models.ProtocolVLESS, models.RoleSupport, map[string]any{"description": "note"}, http.StatusOK},
+		{"support expires_at AWG", http.MethodPost, models.ProtocolAWG, models.RoleSupport, map[string]any{"expires_at": expiryStr}, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, db, serverID := setupResourceRBACClosure(t)
+			ctx := context.Background()
+			const userID = "protected-update-user"
+			const connectionID = "protected-update-connection"
+			if _, err := db.CreateUser(ctx, &models.User{
+				ID: userID, Username: userID, Role: models.RoleUser, Enabled: true, CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatalf("CreateUser: %v", err)
+			}
+			createResourceRBACConnection(t, db, connectionID, userID, serverID, tc.protocol, "update-client")
+
+			router := chi.NewRouter()
+			router.Post("/api/users/{user_id}/update", h.UpdateUserHandler)
+			router.Patch("/api/users/{user_id}", h.UpdateUserHandler)
+			path := "/api/users/" + userID
+			if tc.method == http.MethodPost {
+				path += "/update"
+			}
+			w := resourceRBACRequest(t, router, tc.method, path, resourceRBACSession(tc.role), tc.body)
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tc.want, w.Body.String())
+			}
+
+			user, userErr := db.GetUser(ctx, userID)
+			conn, connErr := db.GetConnection(ctx, connectionID)
+			if userErr != nil || connErr != nil || user == nil || conn == nil {
+				t.Fatalf("read state: user=%v (%v) connection=%v (%v)", user, userErr, conn, connErr)
+			}
+			if tc.want == http.StatusForbidden {
+				if !strings.Contains(w.Body.String(), "forbidden") {
+					t.Errorf("response does not contain forbidden error: %s", w.Body.String())
+				}
+				if user.ExpiresAt != nil || user.ExpirationDate != nil || user.TrafficLimit != 0 || user.Description != nil {
+					t.Fatalf("forbidden update changed user: %+v", user)
+				}
+				return
+			}
+			if _, ok := tc.body["expires_at"]; ok {
+				if user.ExpiresAt == nil || !user.ExpiresAt.Equal(expiry) {
+					t.Fatalf("expires_at = %v, want %v", user.ExpiresAt, expiry)
+				}
+			}
+			if _, ok := tc.body["description"]; ok {
+				if user.Description == nil || *user.Description != "note" {
+					t.Fatalf("description = %v, want note", user.Description)
+				}
 			}
 		})
 	}

@@ -387,6 +387,30 @@ func (h *Handlers) refreshSelfSessionCookie(w http.ResponseWriter, r *http.Reque
 	return nil
 }
 
+// authorizeAccessPolicyUpdate fails closed (writing the response) unless the
+// caller is Admin whenever req changes expiry or quota for a user owning VLESS
+// or Naive connections: background enforcement of those limits revokes the
+// protected credentials, so it must not be reachable by Support.
+func (h *Handlers) authorizeAccessPolicyUpdate(
+	w http.ResponseWriter, r *http.Request, userID string, req *models.UpdateUserRequest,
+) bool {
+	if req.ExpiresAt == nil && req.ExpirationDate == nil && req.TrafficLimit == nil {
+		return true
+	}
+	conns, err := h.db.GetConnectionsByUserID(r.Context(), userID)
+	if err != nil {
+		h.peerChangeError(w, err)
+		return false
+	}
+	for _, c := range conns {
+		proto := models.NormalizeProtocol(c.Protocol)
+		if proto == models.ProtocolVLESS || proto == models.ProtocolNaive {
+			return h.authorizeAdminProtocol(w, r, proto)
+		}
+	}
+	return true
+}
+
 // UpdateUserHandler updates user attributes and resets limits if modified.
 func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 	userID := chi.URLParam(r, "user_id")
@@ -406,7 +430,14 @@ func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Serialize with provisioning so the protected-connection snapshot below
+	// cannot go stale before the access-policy change is committed.
+	defer h.lockUser(userID)()
+
 	ctx := r.Context()
+	if !h.authorizeAccessPolicyUpdate(w, r, userID, &req) {
+		return
+	}
 	user, err := h.db.GetUser(ctx, userID)
 	if err != nil || user == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
