@@ -148,7 +148,7 @@ func TestConnectionTransferAndUserDeletionPreserveTransferredConnection(t *testi
 	}
 }
 
-func TestConcurrentAssignmentOfUnassignedClientIsSerialized(t *testing.T) {
+func TestConcurrentAssignmentOfUnassignedClient(t *testing.T) {
 	h, db, serverID := setupResourceRBACClosure(t)
 	ctx := context.Background()
 	userIDs := []string{"race-user-a", "race-user-b"}

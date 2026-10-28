@@ -152,6 +152,63 @@ func (h *Handlers) validateConnectionDestination(w http.ResponseWriter, ctx cont
 	return true
 }
 
+// lockAssignment takes the client lock, then the user locks, and re-validates the binding
+// under them. On failure it writes the error response; otherwise the caller must call unlock.
+func (h *Handlers) lockAssignment(w http.ResponseWriter, ctx context.Context, serverID int64, req *models.EditConnectionRequest, matchingConn *models.UserConnection) (*models.UserConnection, func(), bool) {
+	// Serialize on the credential itself: user locks alone let two admins bind one
+	// unassigned client to different users concurrently.
+	unlockClient := lockClient(serverID, req.Protocol, req.ClientID)
+	unlock := unlockClient
+	current, err := h.findClientConnection(ctx, serverID, req.Protocol, req.ClientID)
+	if err != nil {
+		unlock()
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve connections")
+		return nil, nil, false
+	}
+	switch {
+	case matchingConn == nil && current != nil:
+		unlock()
+		h.JSONError(w, http.StatusConflict, "connection_already_assigned", "Client is already assigned to another user")
+		return nil, nil, false
+	case matchingConn != nil && (current == nil || current.ID != matchingConn.ID):
+		unlock()
+		h.JSONError(w, http.StatusConflict, "connection_changed", "Connection ownership changed; retry the request")
+		return nil, nil, false
+	}
+
+	sourceUserID := ""
+	if current != nil {
+		sourceUserID = current.UserID
+	}
+	destUserID := *req.UserID
+	unlockUsers := h.lockConnectionUsers(sourceUserID, destUserID)
+	unlock = func() {
+		unlockUsers()
+		unlockClient()
+	}
+
+	if sourceUserID != "" && destUserID != "" && sourceUserID != destUserID {
+		fresh, err := h.db.GetConnection(ctx, current.ID)
+		if err != nil {
+			unlock()
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to verify connection ownership")
+			return nil, nil, false
+		}
+		if fresh == nil || fresh.UserID != sourceUserID {
+			unlock()
+			h.JSONError(w, http.StatusConflict, "connection_changed", "Connection ownership changed; retry the request")
+			return nil, nil, false
+		}
+		current = fresh
+	}
+
+	if !h.validateConnectionDestination(w, ctx, destUserID) {
+		unlock()
+		return nil, nil, false
+	}
+	return current, unlock, true
+}
+
 // EditServerConnectionHandler updates connection parameters and user assignment.
 func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Request) {
 	serverID, err := parseServerID(r)
@@ -201,47 +258,12 @@ func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	if req.UserID != nil {
-		// Serialize on the credential itself: user locks alone let two admins bind one
-		// unassigned client to different users concurrently.
-		defer lockClient(serverID, req.Protocol, req.ClientID)()
-		current, err := h.findClientConnection(ctx, serverID, req.Protocol, req.ClientID)
-		if err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve connections")
+		var unlock func()
+		var ok bool
+		if matchingConn, unlock, ok = h.lockAssignment(w, ctx, serverID, &req, matchingConn); !ok {
 			return
 		}
-		switch {
-		case matchingConn == nil && current != nil:
-			h.JSONError(w, http.StatusConflict, "connection_already_assigned", "Client is already assigned to another user")
-			return
-		case matchingConn != nil && (current == nil || current.ID != matchingConn.ID):
-			h.JSONError(w, http.StatusConflict, "connection_changed", "Connection ownership changed; retry the request")
-			return
-		}
-		matchingConn = current
-
-		sourceUserID := ""
-		if matchingConn != nil {
-			sourceUserID = matchingConn.UserID
-		}
-		destUserID := *req.UserID
-		defer h.lockConnectionUsers(sourceUserID, destUserID)()
-
-		if sourceUserID != "" && destUserID != "" && sourceUserID != destUserID {
-			current, err := h.db.GetConnection(ctx, matchingConn.ID)
-			if err != nil {
-				h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to verify connection ownership")
-				return
-			}
-			if current == nil || current.UserID != sourceUserID {
-				h.JSONError(w, http.StatusConflict, "connection_changed", "Connection ownership changed; retry the request")
-				return
-			}
-			matchingConn = current
-		}
-
-		if !h.validateConnectionDestination(w, ctx, destUserID) {
-			return
-		}
+		defer unlock()
 	}
 
 	if err := h.editConnectionBinding(ctx, serverID, &req, matchingConn); err != nil {
