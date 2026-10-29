@@ -441,8 +441,16 @@ func (sm *StickySessionManager) persistFailoverMoves(ctx context.Context, dbMove
 	}
 }
 
-func (sm *StickySessionManager) HandleFailover(ctx context.Context, degradedTunnelID int64, availableTunnels []*models.BackendTunnel) (*FailoverResult, error) {
-	healthy, snap, err := sm.snapshotFailoverTargets(degradedTunnelID, availableTunnels)
+func (sm *StickySessionManager) HandleFailover(ctx context.Context, degradedTunnelID int64, availableTunnels []*models.BackendTunnel, sourceProto ...string) (*FailoverResult, error) {
+	family := models.ProtocolAWG
+	if len(sourceProto) > 0 && sourceProto[0] != "" {
+		family = models.NormalizeTunnelProtocol(sourceProto[0])
+	}
+	filtered := models.FilterTunnelsByProtocol(availableTunnels, family)
+	if len(filtered) == 0 {
+		return nil, ErrNoActiveBackends
+	}
+	healthy, snap, err := sm.snapshotFailoverTargets(degradedTunnelID, filtered)
 	if err != nil {
 		return nil, err
 	}

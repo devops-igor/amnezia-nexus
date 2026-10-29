@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,8 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
 // VPNStatusHandler returns operational metrics for the VPN subsystem.
@@ -86,7 +89,142 @@ func (h *Handlers) VPNBackendsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func extractProxyParamsFromManagerResult(proto string, res map[string]any) json.RawMessage {
+	switch proto {
+	case models.ProtocolVLESS:
+		uid, _ := res["uuid"].(string)
+		if uid == "" {
+			uid, _ = res["client_id"].(string)
+		}
+		if uid == "" {
+			return nil
+		}
+		flow, _ := res["flow"].(string)
+		pubKey, _ := res["public_key"].(string)
+		shortID, _ := res["short_id"].(string)
+		serverName, _ := res["server_name"].(string)
+		if serverName == "" {
+			serverName = "gateway.icloud.com"
+		}
+		p := models.VLESSRealityParams{
+			UUID:        uid,
+			Flow:        flow,
+			PublicKey:   pubKey,
+			ShortID:     shortID,
+			ServerName:  serverName,
+			Fingerprint: "chrome",
+			Transport:   "tcp",
+		}
+		b, _ := json.Marshal(p)
+		return b
+
+	case models.ProtocolNaive:
+		username, _ := res["username"].(string)
+		if username == "" {
+			username, _ = res["client_id"].(string)
+		}
+		password, _ := res["password"].(string)
+		if username == "" || password == "" {
+			return nil
+		}
+		domain, _ := res["domain"].(string)
+		p := models.NaiveProxyParams{
+			Username: username,
+			Password: password,
+			Domain:   domain,
+			EnableH3: false,
+		}
+		// #nosec G117 -- Typed internal backend proxy credentials marshaled for encrypted persistence
+		b, _ := json.Marshal(p)
+		return b
+	}
+	return nil
+}
+
+func detectServerProxyProtocol(srv *models.Server) string {
+	if srv == nil || srv.Protocols == nil {
+		return ""
+	}
+	if awgInfo, ok := srv.Protocols["awg"].(map[string]any); ok {
+		if inst, _ := awgInfo["installed"].(bool); inst {
+			return ""
+		}
+		if pub, _ := awgInfo["public_key"].(string); pub != "" {
+			return ""
+		}
+	}
+	for _, p := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
+		if pInfo, ok := srv.Protocols[p].(map[string]any); ok {
+			if inst, _ := pInfo["installed"].(bool); inst {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+func (h *Handlers) resolveInstalledProxyParamsForProto(ctx context.Context, srv *models.Server, proto string) (json.RawMessage, error) {
+	if srv == nil || srv.Protocols == nil {
+		return nil, errors.New("server protocols not available")
+	}
+	normProto := models.NormalizeTunnelProtocol(proto)
+	pInfo, ok := srv.Protocols[normProto].(map[string]any)
+	if !ok || pInfo == nil {
+		return nil, fmt.Errorf("protocol %s not configured on server", normProto)
+	}
+
+	// 1. If explicit credentials already exist in server metadata, reuse them.
+	if pVal, ok := pInfo["params"]; ok && pVal != nil {
+		if b, err := json.Marshal(pVal); err == nil && len(bytes.TrimSpace(b)) > 2 && string(bytes.TrimSpace(b)) != "null" {
+			return b, nil
+		}
+	}
+	if pVal, ok := pInfo["protocol_params"]; ok && pVal != nil {
+		if b, err := json.Marshal(pVal); err == nil && len(bytes.TrimSpace(b)) > 2 && string(bytes.TrimSpace(b)) != "null" {
+			return b, nil
+		}
+	}
+
+	// 2. Try protocol manager if available and configured
+	protoMgr, err := h.GetProtocolManager(normProto)
+	if err != nil || protoMgr == nil {
+		return nil, fmt.Errorf("protocol manager for %s not available: %w", normProto, err)
+	}
+	clientParams := map[string]any{"name": fmt.Sprintf("vpn-backend-%d", srv.ID)}
+	res, err := protoMgr.AddClient(ctx, srv, clientParams)
+	if err != nil {
+		return nil, fmt.Errorf("failed to provision proxy client on server %d: %w", srv.ID, err)
+	}
+	if res == nil {
+		return nil, errors.New("protocol manager returned empty client provisioning result")
+	}
+	params := extractProxyParamsFromManagerResult(normProto, res)
+	if len(params) == 0 {
+		return nil, errors.New("failed to extract proxy parameters from manager result")
+	}
+	return params, nil
+}
+
+func (h *Handlers) isMultiProtocolEnabled(ctx context.Context) bool {
+	if h.vpnSvc != nil {
+		if h.vpnSvc.MultiProtocolEnabled() {
+			return true
+		}
+		if _, err := h.vpnSvc.GetConfig(ctx); err == nil {
+			return false
+		}
+	}
+	if h.db != nil {
+		if cfg, err := h.db.GetVPNConfig(ctx); err == nil && cfg != nil {
+			return cfg.EnableMultiProtocolBackends
+		}
+	}
+	return false
+}
+
 // VPNEnableBackendHandler activates a backend server for load balancing.
+//
+//nolint:gocyclo // transactional enable, protocol dispatch, and error handling are centralized.
 func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Request) {
 	serverID, err := parseServerID(r)
 	if err != nil {
@@ -94,17 +232,129 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	var req struct {
+		Protocol       string          `json:"protocol"`
+		ProtocolParams json.RawMessage `json:"protocol_params"`
+	}
+	if r.Body != nil && r.Body != http.NoBody {
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1048576))
+		if err == nil && len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &req); err != nil {
+				h.JSONError(w, http.StatusBadRequest, "invalid_parameter", "Invalid JSON payload")
+				return
+			}
+		}
+	}
+	if req.Protocol == "" {
+		req.Protocol = r.URL.Query().Get("protocol")
+	}
+
 	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 45*time.Second)
 	defer cancel()
 
+	var existingTunnel *models.BackendTunnel
+	if h.db != nil {
+		existingTunnel, _ = h.db.GetBackendTunnelByServerID(bgCtx, serverID)
+	}
+
+	if existingTunnel != nil {
+		// R2-B1: Protected proxy credentials (VLESS, NaiveProxy) require Admin authorization.
+		hasCustomParams := len(req.ProtocolParams) > 0
+		hasProtoChange := req.Protocol != "" && models.NormalizeTunnelProtocol(req.Protocol) != models.NormalizeTunnelProtocol(existingTunnel.Protocol)
+		if hasCustomParams || (hasProtoChange && models.NormalizeTunnelProtocol(req.Protocol) != models.ProtocolAWG) {
+			sess := h.GetSession(r)
+			if sess == nil || sess.Role != models.RoleAdmin {
+				h.JSONError(w, http.StatusForbidden, "forbidden", "forbidden: admin role required to configure protected proxy credentials")
+				return
+			}
+		}
+
+		// R2-H1: Existing backend re-enables preserving stored configuration
+		if req.Protocol == "" {
+			req.Protocol = existingTunnel.Protocol
+		}
+		if len(req.ProtocolParams) == 0 {
+			req.ProtocolParams = existingTunnel.ProtocolParams
+		}
+
+		normProto := models.NormalizeTunnelProtocol(req.Protocol)
+		if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
+			if !h.isMultiProtocolEnabled(bgCtx) {
+				middleware.WriteJSONError(w, http.StatusBadRequest, "multi_protocol_disabled", "multi-protocol backends are disabled")
+				return
+			}
+		}
+	} else {
+		// R4-B1: First-time enrollment: determine effective protocol BEFORE calling any manager or mutating state
+		effectiveProto := ""
+		if req.Protocol != "" {
+			effectiveProto = models.NormalizeTunnelProtocol(req.Protocol)
+		}
+		var srv *models.Server
+		if effectiveProto == "" && h.db != nil {
+			srv, _ = h.db.GetServer(bgCtx, serverID)
+			effectiveProto = detectServerProxyProtocol(srv)
+		}
+
+		isProxy := effectiveProto == models.ProtocolVLESS || effectiveProto == models.ProtocolNaive
+		if isProxy || len(req.ProtocolParams) > 0 {
+			sess := h.GetSession(r)
+			if sess == nil || sess.Role != models.RoleAdmin {
+				middleware.WriteJSONError(w, http.StatusForbidden, "forbidden", "forbidden: admin role required to enroll proxy backends")
+				return
+			}
+		}
+
+		if req.Protocol == "" && effectiveProto != "" {
+			req.Protocol = effectiveProto
+		}
+
+		normProto := models.NormalizeTunnelProtocol(req.Protocol)
+		if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
+			if !h.isMultiProtocolEnabled(bgCtx) {
+				middleware.WriteJSONError(w, http.StatusBadRequest, "multi_protocol_disabled", "multi-protocol backends are disabled")
+				return
+			}
+		}
+
+		if (normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive) && len(req.ProtocolParams) == 0 {
+			if srv == nil && h.db != nil {
+				srv, _ = h.db.GetServer(bgCtx, serverID)
+			}
+			if srv == nil {
+				h.JSONError(w, http.StatusNotFound, "server_not_found", fmt.Sprintf("Server %d not found", serverID))
+				return
+			}
+			params, provErr := h.resolveInstalledProxyParamsForProto(bgCtx, srv, normProto)
+			if provErr != nil {
+				// #nosec G706 -- Internal server audit log for failed backend proxy client provisioning
+				log.Printf("[vpn/handlers] failed to provision proxy client for server %d: %v", serverID, provErr)
+				h.JSONError(w, http.StatusBadGateway, "provisioning_failed", fmt.Sprintf("Failed to provision proxy client: %v", provErr))
+				return
+			}
+			req.ProtocolParams = params
+		}
+	}
+
 	if h.vpnSvc != nil {
-		if err := h.vpnSvc.EnableBackend(bgCtx, serverID); err != nil {
+		var opts []tunnel.BackendTunnelOptions
+		if req.Protocol != "" || len(req.ProtocolParams) > 0 {
+			opts = append(opts, tunnel.BackendTunnelOptions{
+				Protocol:       models.NormalizeTunnelProtocol(req.Protocol),
+				ProtocolParams: req.ProtocolParams,
+			})
+		}
+		if err := h.vpnSvc.EnableBackendWithConfig(bgCtx, serverID, opts...); err != nil {
 			if errors.Is(err, vpn.ErrAWGNotInstalled) {
 				h.JSONError(w, http.StatusBadRequest, "awg_not_installed", "Server does not have AmneziaWG installed or configured")
 				return
 			}
 			if errors.Is(err, vpn.ErrServerNotFound) {
 				h.JSONError(w, http.StatusNotFound, "server_not_found", fmt.Sprintf("Server %d not found", serverID))
+				return
+			}
+			if errors.Is(err, vpn.ErrMultiProtocolBackendsDisabled) || strings.Contains(err.Error(), "multi-protocol backends are disabled") {
+				h.JSONError(w, http.StatusBadRequest, "multi_protocol_disabled", "multi-protocol backends are disabled")
 				return
 			}
 			// #nosec G706 -- Internal server audit log for failed backend enable
@@ -225,10 +475,11 @@ func (h *Handlers) VPNGetConfigHandler(w http.ResponseWriter, r *http.Request) {
 // false and silently erase the stored protocol flag
 // (issue #391 round 4b, finding 3).
 type vpnConfigPresence struct {
-	publicEndpoint bool
-	randomTrailers bool
-	disableCookies bool
-	dataPlaneI1    bool
+	publicEndpoint              bool
+	randomTrailers              bool
+	disableCookies              bool
+	dataPlaneI1                 bool
+	enableMultiProtocolBackends bool
 }
 
 // hasRawKey reports whether the caller sent the named JSON key, matching the
@@ -314,6 +565,9 @@ func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, present vp
 	if !present.disableCookies {
 		cfg.DisableCookies = current.DisableCookies
 	}
+	if !present.enableMultiProtocolBackends {
+		cfg.EnableMultiProtocolBackends = current.EnableMultiProtocolBackends
+	}
 }
 
 // VPNUpdateConfigHandler applies new routing policy and rebalances existing pools.
@@ -349,10 +603,11 @@ func (h *Handlers) VPNUpdateConfigHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	present := vpnConfigPresence{
-		publicEndpoint: hasRawKey(raw, "public_endpoint"),
-		randomTrailers: hasRawKey(raw, "random_trailers"),
-		disableCookies: hasRawKey(raw, "disable_cookies"),
-		dataPlaneI1:    hasRawKey(raw, "vpn_data_plane_i1_protocol"),
+		publicEndpoint:              hasRawKey(raw, "public_endpoint"),
+		randomTrailers:              hasRawKey(raw, "random_trailers"),
+		disableCookies:              hasRawKey(raw, "disable_cookies"),
+		dataPlaneI1:                 hasRawKey(raw, "vpn_data_plane_i1_protocol"),
+		enableMultiProtocolBackends: hasRawKey(raw, "enable_multi_protocol_backends"),
 	}
 
 	ctx := r.Context()

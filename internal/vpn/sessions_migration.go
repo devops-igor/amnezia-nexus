@@ -81,6 +81,8 @@ func (s *Service) rollbackMigration(ctx context.Context, sessionID, peerKey stri
 // Invariant (issue #86, #289): caller must not hold s.mu (it is acquired internally
 // by MigrateSession), maintaining the lock ordering s.mu -> SessionManager.mu (never reversed),
 // and preserving serialization for pool connection counters and route transitions.
+//
+//nolint:gocyclo // transactional validation, protocol check, and multi-phase rollback are centralized.
 func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTunnelID int64) error {
 	if s == nil {
 		return errors.New("vpn service is nil")
@@ -118,6 +120,27 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 
 	if oldTunnelID == targetTunnelID {
 		return nil
+	}
+
+	// Cross-protocol migration rejection (Epic #631, Issue #637):
+	// Both source and target tunnels must belong to the same effective protocol family.
+	if s.pool != nil {
+		sourceTun, err := s.pool.GetTunnelByID(oldTunnelID)
+		if err != nil {
+			return fmt.Errorf("source backend tunnel %d not found: %w", oldTunnelID, err)
+		}
+		targetTun, err := s.pool.GetTunnelByID(targetTunnelID)
+		if err != nil {
+			return fmt.Errorf("target backend tunnel %d not found: %w", targetTunnelID, err)
+		}
+		sourceProto := models.NormalizeTunnelProtocol(sourceTun.Protocol)
+		targetProto := models.NormalizeTunnelProtocol(targetTun.Protocol)
+		if sourceProto != targetProto {
+			return fmt.Errorf("cross-protocol migration rejected: source=%s target=%s", sourceProto, targetProto)
+		}
+		if targetProto != models.ProtocolAWG && (s.cfg == nil || !s.cfg.EnableMultiProtocolBackends) {
+			return errors.New("multi-protocol backends are disabled")
+		}
 	}
 
 	// Step 1: Live Forwarder Route Migration
@@ -183,6 +206,9 @@ func (s *Service) MigrateVPNSession(ctx context.Context, sessionID string, targe
 }
 
 func (s *Service) selectTunnelForPeer(ctx context.Context, req *loadbalancer.RoutingRequest) (*models.BackendTunnel, error) {
+	if req == nil || len(req.AvailableTunnels) == 0 {
+		return nil, loadbalancer.ErrNoActiveBackends
+	}
 	if s.stickyMgr != nil {
 		b, _, err := s.stickyMgr.GetOrAssignBackend(ctx, req)
 		if err != nil {
@@ -201,7 +227,8 @@ func (s *Service) selectTunnelForPeer(ctx context.Context, req *loadbalancer.Rou
 }
 
 // SelectTunnel selects a backend tunnel using the configured load balancing algorithm.
-func (s *Service) SelectTunnel(ctx context.Context, tunnels []*models.BackendTunnel) (*models.BackendTunnel, error) {
+// Optional protoFamily filters candidates by protocol (defaults to AWG for backward compatibility).
+func (s *Service) SelectTunnel(ctx context.Context, tunnels []*models.BackendTunnel, protoFamily ...string) (*models.BackendTunnel, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -209,8 +236,18 @@ func (s *Service) SelectTunnel(ctx context.Context, tunnels []*models.BackendTun
 		return nil, fmt.Errorf("load balancer not initialized")
 	}
 
+	family := models.ProtocolAWG
+	if len(protoFamily) > 0 && protoFamily[0] != "" {
+		family = models.NormalizeTunnelProtocol(protoFamily[0])
+	}
+
+	filtered := models.FilterTunnelsByProtocol(tunnels, family)
+	if len(filtered) == 0 {
+		return nil, loadbalancer.ErrNoActiveBackends
+	}
+
 	req := &loadbalancer.RoutingRequest{
-		AvailableTunnels: tunnels,
+		AvailableTunnels: filtered,
 	}
 	return s.balancer.SelectBackend(ctx, req)
 }

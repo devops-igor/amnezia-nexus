@@ -1,7 +1,9 @@
 package vpn
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,10 +15,15 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel/naive"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel/streambridge"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel/vless"
 )
 
 // restoreBackendDevices restores data-plane devices for active and degraded tunnels loaded from DB.
 func (s *Service) restoreBackendDevices(ctx context.Context) {
+	multiProto := s.MultiProtocolEnabled()
+
 	for _, tun := range s.pool.ListTunnels() {
 		if !tun.Enabled {
 			continue
@@ -24,17 +31,23 @@ func (s *Service) restoreBackendDevices(ctx context.Context) {
 		if tun.Status != TunnelStatusActive && tun.Status != TunnelStatusDegraded {
 			continue
 		}
+		proto := models.NormalizeTunnelProtocol(tun.Protocol)
+		if proto != models.ProtocolAWG && !multiProto {
+			continue
+		}
 		var awgParams map[string]any
 		var attachErr error
-		if s.db != nil {
-			srv, err := s.db.GetServerByID(ctx, tun.ServerID)
-			if err != nil || srv == nil {
-				attachErr = fmt.Errorf("failed to load server %d: %w", tun.ServerID, err)
-			} else if awgInfo, ok := srv.Protocols["awg"].(map[string]any); ok {
-				awgParams, _ = awgInfo["awg_params"].(map[string]any)
+		if proto == models.ProtocolAWG {
+			if s.db != nil {
+				srv, err := s.db.GetServerByID(ctx, tun.ServerID)
+				if err != nil || srv == nil {
+					attachErr = fmt.Errorf("failed to load server %d: %w", tun.ServerID, err)
+				} else if awgInfo, ok := srv.Protocols["awg"].(map[string]any); ok {
+					awgParams, _ = awgInfo["awg_params"].(map[string]any)
+				}
+			} else {
+				attachErr = errors.New("database not available")
 			}
-		} else {
-			attachErr = errors.New("database not available")
 		}
 		if attachErr == nil {
 			s.mu.Lock()
@@ -53,6 +66,13 @@ func (s *Service) restoreBackendDevices(ctx context.Context) {
 // data-plane device. It does not declare the backend healthy: runtime health
 // remains owned by the prober/self-healing subsystem.
 func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
+	return s.EnableBackendWithConfig(ctx, serverID)
+}
+
+// EnableBackendWithConfig enables a backend tunnel with optional explicit protocol configuration.
+//
+//nolint:gocyclo // transactional enable, protocol dispatch, and identity validation are centralized.
+func (s *Service) EnableBackendWithConfig(ctx context.Context, serverID int64, opts ...tunnel.BackendTunnelOptions) error {
 	s.mu.RLock()
 	if s.isServerDeletedLocked(serverID) {
 		s.mu.RUnlock()
@@ -77,6 +97,130 @@ func (s *Service) EnableBackend(ctx context.Context, serverID int64) error {
 	}
 	if server == nil {
 		return fmt.Errorf("%w: server %d", ErrServerNotFound, serverID)
+	}
+
+	var opt tunnel.BackendTunnelOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
+	if p := models.NormalizeTunnelProtocol(opt.Protocol); p != "" && p != models.ProtocolAWG {
+		if !s.MultiProtocolEnabled() {
+			return ErrMultiProtocolBackendsDisabled
+		}
+	}
+
+	// R2-H1: Before inferring protocol from installed server metadata, check if a backend row
+	// already exists in the database (or in-memory pool) for serverID.
+	var existingTunnel *models.BackendTunnel
+	if existingDB, err := db.GetBackendTunnelByServerID(ctx, serverID); err == nil && existingDB != nil {
+		existingTunnel = existingDB
+	} else if existing, err := pool.GetTunnel(serverID); err == nil && existing != nil {
+		existingTunnel = existing
+	}
+
+	if existingTunnel != nil {
+		if opt.Protocol == "" {
+			if p := models.NormalizeTunnelProtocol(existingTunnel.Protocol); p != models.ProtocolAWG {
+				opt.Protocol = existingTunnel.Protocol
+				opt.ProtocolParams = existingTunnel.ProtocolParams
+			}
+		} else if len(opt.ProtocolParams) == 0 {
+			if models.NormalizeTunnelProtocol(opt.Protocol) == models.NormalizeTunnelProtocol(existingTunnel.Protocol) && len(existingTunnel.ProtocolParams) > 0 {
+				opt.ProtocolParams = existingTunnel.ProtocolParams
+			}
+		}
+	} else if server != nil && server.Protocols != nil {
+		// Only when no backend row exists in the database (initial first-time enrollment)
+		// should it consult installed server metadata.
+		if opt.Protocol == "" {
+			p, params, _ := ResolveServerProxyProtocol(server)
+			if p != "" {
+				opt.Protocol = p
+				if len(opt.ProtocolParams) == 0 && len(params) > 0 {
+					opt.ProtocolParams = params
+				}
+			}
+		} else if len(opt.ProtocolParams) == 0 {
+			proto := models.NormalizeTunnelProtocol(opt.Protocol)
+			if proto != models.ProtocolAWG {
+				if params, err := DeriveProxyProtocolParams(server, proto); err == nil && len(params) > 0 {
+					opt.ProtocolParams = params
+				}
+			}
+		}
+	}
+
+	proto := models.NormalizeTunnelProtocol(opt.Protocol)
+	if proto != models.ProtocolAWG {
+		if !s.MultiProtocolEnabled() {
+			return ErrMultiProtocolBackendsDisabled
+		}
+
+		if len(opt.ProtocolParams) == 0 {
+			return fmt.Errorf("protocol parameters required for proxy backend: %w", ErrEmptyParams)
+		}
+
+		port := 0
+		if info, ok := server.Protocols[proto].(map[string]any); ok {
+			if pVal, ok := info["port"].(float64); ok && pVal > 0 {
+				port = int(pVal)
+			} else if pVal, ok := info["port"].(int); ok && pVal > 0 {
+				port = pVal
+			} else if pStr, ok := info["port"].(string); ok && pStr != "" {
+				if pInt, err := strconv.Atoi(pStr); err == nil && pInt > 0 {
+					port = pInt
+				}
+			}
+		}
+		if port <= 0 {
+			port = 443
+		}
+		endpoint := net.JoinHostPort(server.Host, strconv.Itoa(port))
+
+		s.mu.RLock()
+		preAddHook := s.enableBackendPreAddTunnelHook
+		s.mu.RUnlock()
+		if preAddHook != nil {
+			preAddHook()
+		}
+
+		s.mu.Lock()
+		if s.isServerDeletedLocked(serverID) {
+			s.mu.Unlock()
+			return fmt.Errorf("%w: server %d is deleted", ErrServerNotFound, serverID)
+		}
+		if s.db != nil {
+			checkCtx, checkCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			srv, err := s.db.GetServer(checkCtx, serverID)
+			checkCancel()
+			if err != nil {
+				s.mu.Unlock()
+				return fmt.Errorf("failed to verify server %d in database: %w", serverID, err)
+			}
+			if srv == nil {
+				s.mu.Unlock()
+				return fmt.Errorf("%w: server %d not found in database", ErrServerNotFound, serverID)
+			}
+			if !srv.CreatedAt.Equal(server.CreatedAt) || srv.Host != server.Host {
+				s.mu.Unlock()
+				return fmt.Errorf("%w: server %d generation changed during enable", ErrServerNotFound, serverID)
+			}
+		}
+		tun, err := pool.AddTunnelWithConfig(ctx, serverID, endpoint, "", opt)
+		s.mu.Unlock()
+		if err != nil {
+			return fmt.Errorf("failed to register backend tunnel for server %d: %w", serverID, err)
+		}
+
+		s.mu.RLock()
+		postAddHook := s.enableBackendPostAddTunnelHook
+		s.mu.RUnlock()
+		if postAddHook != nil {
+			postAddHook()
+		}
+
+		return s.finishEnableBackend(ctx, pool, tun, nil, serverID, startEpoch)
 	}
 
 	pub, port, awgParams, err := s.resolveBackendCredentials(ctx, serverID, server)
@@ -373,6 +517,9 @@ func (s *Service) EnsureBackendProbeKeys(ctx context.Context) {
 		if !tun.Enabled {
 			continue
 		}
+		if models.NormalizeTunnelProtocol(tun.Protocol) != models.ProtocolAWG {
+			continue
+		}
 
 		// SyncFromDB already backfills missing keys; this defensive second
 		// pass keeps the migration correct if it ever runs against a pool
@@ -491,6 +638,7 @@ func (s *Service) discoverLiveAWG(ctx context.Context, serverID int64, server *m
 	return livePub, livePort, true
 }
 
+//nolint:gocyclo // protocol attachment dispatch, MTU derivation, and device initialization are centralized.
 func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams map[string]any, prepared ...map[string]any) error {
 	if tun == nil {
 		return errors.New("backend tunnel is nil")
@@ -499,15 +647,80 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 		return nil
 	}
 
-	var deviceParams map[string]any
-	if len(prepared) > 0 && prepared[0] != nil {
-		deviceParams = prepared[0]
-	} else {
-		var prepErr error
-		deviceParams, prepErr = s.prepareBackendDeviceParamsLocked(awgParams)
-		if prepErr != nil {
-			return fmt.Errorf("failed to prepare backend device parameters for server %d: %w", tun.ServerID, prepErr)
+	proto := models.NormalizeTunnelProtocol(tun.Protocol)
+	var dev BackendDevice
+
+	switch proto {
+	case models.ProtocolAWG:
+		var deviceParams map[string]any
+		if len(prepared) > 0 && prepared[0] != nil {
+			deviceParams = prepared[0]
+		} else {
+			var prepErr error
+			deviceParams, prepErr = s.prepareBackendDeviceParamsLocked(awgParams)
+			if prepErr != nil {
+				return fmt.Errorf("failed to prepare backend device parameters for server %d: %w", tun.ServerID, prepErr)
+			}
 		}
+
+		beMTU := 1280
+		if deviceParams != nil {
+			if mVal, ok := deviceParams["mtu"].(string); ok && mVal != "" {
+				if parsed, err := strconv.Atoi(mVal); err == nil && parsed > 0 {
+					beMTU = parsed
+				}
+			} else if mInt, ok := deviceParams["mtu"].(int); ok && mInt > 0 {
+				beMTU = mInt
+			}
+		}
+
+		awgDev, devErr := tunnel.NewAWGClientDevice(fmt.Sprintf("awg-be-%d", tun.ServerID), tun.Endpoint, tun.PrivateKey, tun.PublicKey, beMTU, deviceParams)
+		if devErr != nil {
+			return fmt.Errorf("failed to create backend AWG device for server %d: %w", tun.ServerID, devErr)
+		}
+		dev = awgDev
+
+	case models.ProtocolVLESS:
+		if len(tun.ProtocolParams) == 0 {
+			return fmt.Errorf("vless protocol params cannot be empty for server %d", tun.ServerID)
+		}
+		var vlessParams models.VLESSRealityParams
+		if err := json.Unmarshal(tun.ProtocolParams, &vlessParams); err != nil {
+			return fmt.Errorf("failed to decode vless params for server %d: %w", tun.ServerID, err)
+		}
+		dialer, err := vless.New(tun.Endpoint, vlessParams)
+		if err != nil {
+			return fmt.Errorf("failed to create vless dialer for server %d: %w", tun.ServerID, err)
+		}
+		bridgeCfg := streambridge.Config{MTU: 1280}
+		bridgeDev, err := streambridge.New(bridgeCfg, dialer)
+		if err != nil {
+			return fmt.Errorf("failed to create stream bridge device for server %d: %w", tun.ServerID, err)
+		}
+		dev = NewProxyBackendDevice(bridgeDev, nil)
+
+	case models.ProtocolNaive:
+		if len(tun.ProtocolParams) == 0 {
+			return fmt.Errorf("naive protocol params cannot be empty for server %d", tun.ServerID)
+		}
+		var naiveParams models.NaiveProxyParams
+		if err := json.Unmarshal(tun.ProtocolParams, &naiveParams); err != nil {
+			return fmt.Errorf("failed to decode naive params for server %d: %w", tun.ServerID, err)
+		}
+		dialer, err := naive.New(tun.Endpoint, naiveParams)
+		if err != nil {
+			return fmt.Errorf("failed to create naive dialer for server %d: %w", tun.ServerID, err)
+		}
+		bridgeCfg := streambridge.Config{MTU: 1280}
+		bridgeDev, err := streambridge.New(bridgeCfg, dialer)
+		if err != nil {
+			_ = dialer.Close()
+			return fmt.Errorf("failed to create stream bridge device for server %d: %w", tun.ServerID, err)
+		}
+		dev = NewProxyBackendDevice(bridgeDev, dialer)
+
+	default:
+		return fmt.Errorf("unsupported protocol for backend attachment: %s", tun.Protocol)
 	}
 
 	// Detach and close previous device for this tunnel to prevent leaks
@@ -522,24 +735,12 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 			if s.backendDeviceEndpoints != nil {
 				delete(s.backendDeviceEndpoints, tun.ID)
 			}
-		}
-	}
-
-	beMTU := 1280
-	if deviceParams != nil {
-		if mVal, ok := deviceParams["mtu"].(string); ok && mVal != "" {
-			if parsed, err := strconv.Atoi(mVal); err == nil && parsed > 0 {
-				beMTU = parsed
+			if s.backendDeviceSnapshots != nil {
+				delete(s.backendDeviceSnapshots, tun.ID)
 			}
-		} else if mInt, ok := deviceParams["mtu"].(int); ok && mInt > 0 {
-			beMTU = mInt
 		}
 	}
 
-	dev, devErr := tunnel.NewAWGClientDevice(fmt.Sprintf("awg-be-%d", tun.ServerID), tun.Endpoint, tun.PrivateKey, tun.PublicKey, beMTU, deviceParams)
-	if devErr != nil {
-		return fmt.Errorf("failed to create backend AWG device for server %d: %w", tun.ServerID, devErr)
-	}
 	s.forwarder.AttachBackendDevice(tun.ID, dev)
 	if s.backendDevices == nil {
 		s.backendDevices = make(map[int64]BackendDevice)
@@ -549,13 +750,20 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 		s.backendDeviceEndpoints = make(map[int64]string)
 	}
 	s.backendDeviceEndpoints[tun.ID] = tun.Endpoint
+	if s.backendDeviceSnapshots == nil {
+		s.backendDeviceSnapshots = make(map[int64]*models.BackendTunnel)
+	}
+	tunCopy := *tun
+	tunCopy.ProtocolParams = bytes.Clone(tun.ProtocolParams)
+	s.backendDeviceSnapshots[tun.ID] = &tunCopy
 
 	// Spawn backend read loop to route packets back to clients
 	go s.pumpBackendReturns(tun.ID, tun.ServerID, dev)
 
-	// Trigger backend routing and NAT remediation asynchronously in the background
-	// so tunnel attachment and data-plane startup are never blocked by SSH latency.
-	go s.triggerBackendRoutingRemediation(tun.ServerID)
+	// Trigger backend routing and NAT remediation asynchronously only for AWG
+	if proto == models.ProtocolAWG {
+		go s.triggerBackendRoutingRemediation(tun.ServerID)
+	}
 
 	return nil
 }

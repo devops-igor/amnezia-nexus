@@ -338,11 +338,40 @@ type BackendTunnel struct {
 	ProtocolParams    json.RawMessage `json:"-" db:"protocol_params"`
 }
 
-func normalizeTunnelProtocol(proto string) string {
+func NormalizeTunnelProtocol(proto string) string {
 	if proto == "" {
 		return ProtocolAWG
 	}
 	return NormalizeProtocol(proto)
+}
+
+func normalizeTunnelProtocol(proto string) string {
+	return NormalizeTunnelProtocol(proto)
+}
+
+// IsSupportedBackendProtocol reports whether a backend tunnel protocol is supported
+// by the multi-protocol orchestrator (AWG, VLESS, or Naive).
+func IsSupportedBackendProtocol(proto string) bool {
+	switch NormalizeTunnelProtocol(proto) {
+	case ProtocolAWG, ProtocolVLESS, ProtocolNaive:
+		return true
+	default:
+		return false
+	}
+}
+
+// FilterTunnelsByProtocol returns a new slice containing only non-nil tunnels
+// whose effective normalized protocol matches the target protocol family.
+// It never mutates the input slice or tunnel objects.
+func FilterTunnelsByProtocol(tunnels []*BackendTunnel, proto string) []*BackendTunnel {
+	target := NormalizeTunnelProtocol(proto)
+	result := make([]*BackendTunnel, 0, len(tunnels))
+	for _, t := range tunnels {
+		if t != nil && NormalizeTunnelProtocol(t.Protocol) == target {
+			result = append(result, t)
+		}
+	}
+	return result
 }
 
 func equalJSON(a, b json.RawMessage) bool {
@@ -469,32 +498,33 @@ type EnrichedVPNSession struct {
 
 // VPNConfig holds runtime configuration for the built-in VPN service.
 type VPNConfig struct {
-	VPNDataPlaneI1Protocol string                 `json:"vpn_data_plane_i1_protocol,omitempty"`
-	Algorithm              LoadBalancingAlgorithm `json:"algorithm"`
-	Weights                map[int64]int          `json:"weights"` // server_id -> weight (1-100)
-	HealthThresholdMS      int                    `json:"health_threshold_ms"`
-	ListenPort             int                    `json:"listen_port"`
-	SubnetCIDR             string                 `json:"subnet_cidr"`
-	MaxTotalPeers          int                    `json:"max_total_peers"`
-	MaxPeersPerBackend     int                    `json:"max_peers_per_backend"`
-	AffinityTTLMinutes     int                    `json:"affinity_ttl_minutes,omitempty"`
-	MinRebalanceSessions   int                    `json:"min_rebalance_sessions"`       // rebalancer minimum-load gate; default 8 when zero/absent
-	ClientQueueSize        int                    `json:"client_queue_size,omitempty"`  // per-peer downstream queue capacity, bounded by the forwarder
-	ServerPrivateKey       string                 `json:"server_private_key,omitempty"` // portal endpoint Curve25519 private key (base64), encrypted at rest
-	ServerPublicKey        string                 `json:"server_public_key,omitempty"`  // derived public key, safe to expose
-	PublicEndpoint         string                 `json:"public_endpoint,omitempty"`    // host or host:port of the panel's public LB entry point
-	H1                     HeaderRange            `json:"h1"`
-	H2                     HeaderRange            `json:"h2"`
-	H3                     HeaderRange            `json:"h3"`
-	H4                     HeaderRange            `json:"h4"`
-	S1                     int                    `json:"s1"`
-	S2                     int                    `json:"s2"`
-	S3                     int                    `json:"s3"`
-	S4                     int                    `json:"s4"`
-	HeaderProtectionKey    string                 `json:"header_protection_key,omitempty"`
-	ContentPaddingAddition string                 `json:"content_padding_addition,omitempty"`
-	RandomTrailers         bool                   `json:"random_trailers,omitempty"`
-	DisableCookies         bool                   `json:"disable_cookies,omitempty"`
+	VPNDataPlaneI1Protocol      string                 `json:"vpn_data_plane_i1_protocol,omitempty"`
+	Algorithm                   LoadBalancingAlgorithm `json:"algorithm"`
+	Weights                     map[int64]int          `json:"weights"` // server_id -> weight (1-100)
+	HealthThresholdMS           int                    `json:"health_threshold_ms"`
+	ListenPort                  int                    `json:"listen_port"`
+	SubnetCIDR                  string                 `json:"subnet_cidr"`
+	MaxTotalPeers               int                    `json:"max_total_peers"`
+	MaxPeersPerBackend          int                    `json:"max_peers_per_backend"`
+	AffinityTTLMinutes          int                    `json:"affinity_ttl_minutes,omitempty"`
+	MinRebalanceSessions        int                    `json:"min_rebalance_sessions"`       // rebalancer minimum-load gate; default 8 when zero/absent
+	ClientQueueSize             int                    `json:"client_queue_size,omitempty"`  // per-peer downstream queue capacity, bounded by the forwarder
+	ServerPrivateKey            string                 `json:"server_private_key,omitempty"` // portal endpoint Curve25519 private key (base64), encrypted at rest
+	ServerPublicKey             string                 `json:"server_public_key,omitempty"`  // derived public key, safe to expose
+	PublicEndpoint              string                 `json:"public_endpoint,omitempty"`    // host or host:port of the panel's public LB entry point
+	H1                          HeaderRange            `json:"h1"`
+	H2                          HeaderRange            `json:"h2"`
+	H3                          HeaderRange            `json:"h3"`
+	H4                          HeaderRange            `json:"h4"`
+	S1                          int                    `json:"s1"`
+	S2                          int                    `json:"s2"`
+	S3                          int                    `json:"s3"`
+	S4                          int                    `json:"s4"`
+	HeaderProtectionKey         string                 `json:"header_protection_key,omitempty"`
+	ContentPaddingAddition      string                 `json:"content_padding_addition,omitempty"`
+	RandomTrailers              bool                   `json:"random_trailers,omitempty"`
+	DisableCookies              bool                   `json:"disable_cookies,omitempty"`
+	EnableMultiProtocolBackends bool                   `json:"enable_multi_protocol_backends"`
 }
 
 // AppearanceSettings holds UI display configuration.

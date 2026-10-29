@@ -79,7 +79,7 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 		// Issue #85: HandleFailover returns a result with successful
 		// migrations AND explicitly reported skipped peers — every peer left
 		// on the disabled backend is logged here so stranding is visible.
-		failover, err := s.stickyMgr.HandleFailover(ctx, tunnel.ID, activeTunnels)
+		failover, err := s.stickyMgr.HandleFailover(ctx, tunnel.ID, activeTunnels, tunnel.Protocol)
 		if err != nil {
 			log.Printf("[vpn] failover for backend %d found no healthy target: %v", serverID, err)
 		}

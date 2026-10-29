@@ -13,7 +13,22 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
+func classifyProxyTunnel(t models.BackendTunnel) (isProxy bool, isDegraded bool, isActive bool) {
+	if models.NormalizeTunnelProtocol(t.Protocol) == models.ProtocolAWG {
+		return false, false, false
+	}
+	if strings.EqualFold(t.Status, models.TunnelStatusDegraded) || strings.EqualFold(t.Status, models.TunnelStatusDisabled) {
+		return true, true, false
+	}
+	if strings.EqualFold(t.Status, models.TunnelStatusActive) {
+		return true, false, true
+	}
+	return true, false, false
+}
+
 // CheckBackendTunnelHealth probes active backend AWG tunnels via pure-Go Noise IK handshakes.
+//
+//nolint:gocyclo // Multi-protocol health classification, AWG probing, and session failover are centralized.
 func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 	if o.db == nil {
 		return errors.New("database is not configured")
@@ -47,8 +62,24 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 	threshold := o.ProbeFailureThreshold()
 
 	for _, t := range tunnels {
-		if !t.Enabled || strings.EqualFold(t.Status, models.TunnelStatusDisabled) {
+		if !t.Enabled {
 			// Administratively disabled backends are ineligible altogether.
+			continue
+		}
+		if isProxy, isDegraded, isActive := classifyProxyTunnel(t); isProxy {
+			// Proxy health is owned by the VPN service HealthProber (native probes).
+			// We do not probe them with AWG UDP probes, but detect when an enabled proxy
+			// tunnel is marked degraded or disabled by HealthProber, or active/healthy,
+			// to trigger session failover to an active same-family replacement tunnel.
+			if isDegraded {
+				degradedTunnels = append(degradedTunnels, t.ID)
+			} else if isActive {
+				tCopy := t
+				healthyTunnels = append(healthyTunnels, &tCopy)
+			}
+			continue
+		}
+		if strings.EqualFold(t.Status, models.TunnelStatusDisabled) {
 			// Runtime-disabled backends belong to the VPN health prober's
 			// dedicated self-healing path, which applies flap damping and
 			// restores the data plane before making the backend routable.
@@ -189,13 +220,19 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 	hIdx := 0
 	for _, s := range sessions {
 		if degradedMap[s.BackendTunnelID] {
+			sourceTun, err := o.db.GetBackendTunnel(ctx, s.BackendTunnelID)
+			if err != nil || sourceTun == nil {
+				continue
+			}
+			sourceProto := models.NormalizeTunnelProtocol(sourceTun.Protocol)
+
 			// The probe result is only a snapshot. An administrator can disable a
 			// target after it was classified as healthy, even before this loop.
 			var target *models.BackendTunnel
 			for checked := 0; checked < len(healthyTunnels); checked++ {
 				idx := (hIdx + checked) % len(healthyTunnels)
 				candidate := healthyTunnels[idx]
-				if candidate == nil {
+				if candidate == nil || models.NormalizeTunnelProtocol(candidate.Protocol) != sourceProto {
 					continue
 				}
 				current, err := o.db.GetBackendTunnel(ctx, candidate.ID)
@@ -203,14 +240,14 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 					slog.Warn("Failed to recheck migration target", "tunnel_id", candidate.ID, "err", err)
 					continue
 				}
-				if current != nil && current.Enabled && strings.EqualFold(current.Status, "active") {
+				if current != nil && current.Enabled && strings.EqualFold(current.Status, "active") && models.NormalizeTunnelProtocol(current.Protocol) == sourceProto {
 					target = current
 					hIdx = (idx + 1) % len(healthyTunnels)
 					break
 				}
 			}
 			if target == nil {
-				break
+				continue
 			}
 			if migrator != nil {
 				if err := migrator.MigrateSession(ctx, s.ID, target.ID); err != nil {
@@ -437,6 +474,15 @@ func (o *Orchestrator) RebalanceVPNSessions(ctx context.Context) error {
 		return nil
 	}
 
+	// Group active tunnels by protocol family
+	tunnelsByFamily := make(map[string][]models.BackendTunnel)
+	tunnelFamily := make(map[int64]string)
+	for _, t := range activeTunnels {
+		fam := models.NormalizeTunnelProtocol(t.Protocol)
+		tunnelsByFamily[fam] = append(tunnelsByFamily[fam], t)
+		tunnelFamily[t.ID] = fam
+	}
+
 	sessions, err := o.db.GetActiveVPNSessions(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to query active sessions for rebalance: %w", err)
@@ -446,59 +492,60 @@ func (o *Orchestrator) RebalanceVPNSessions(ctx context.Context) error {
 		return nil
 	}
 
-	// R3: only connected sessions are eligible. GetActiveVPNSessions already
-	// filters status='connected'; skip defensively on iteration anyway.
-	eligible := make([]models.VPNSession, 0, len(sessions))
+	// R3: only connected sessions are eligible.
+	// Group connected sessions by protocol family.
+	sessionsByFamily := make(map[string][]models.VPNSession)
 	for _, s := range sessions {
-		if s.Status == "connected" {
-			eligible = append(eligible, s)
+		if s.Status == "connected" && s.BackendTunnelID > 0 {
+			if fam, ok := tunnelFamily[s.BackendTunnelID]; ok {
+				sessionsByFamily[fam] = append(sessionsByFamily[fam], s)
+			}
 		}
 	}
 
-	// R1 minimum-load gate: below it, rebalancing is pure churn and misleading
-	// "overloaded" logs (with 1 session / 2 tunnels the legacy code drained the
-	// only session). No log here on purpose — this is the normal quiet path.
 	vpnCfg, err := o.db.GetVPNConfig(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to load VPN config for rebalance gate: %w", err)
 	}
-	avg := float64(len(eligible)) / float64(len(activeTunnels))
-	if len(eligible) < vpnCfg.MinRebalanceSessions || avg < 1.0 {
-		return nil
-	}
 
-	counts := make(map[int64]int)
-	sessionsByTunnel := make(map[int64][]models.VPNSession)
-	for _, s := range eligible {
-		if s.BackendTunnelID > 0 {
+	for fam, famTunnels := range tunnelsByFamily {
+		if len(famTunnels) < 2 {
+			continue
+		}
+		famSessions := sessionsByFamily[fam]
+		avg := float64(len(famSessions)) / float64(len(famTunnels))
+		if len(famSessions) < vpnCfg.MinRebalanceSessions || avg < 1.0 {
+			continue
+		}
+
+		counts := make(map[int64]int)
+		sessionsByTunnel := make(map[int64][]models.VPNSession)
+		for _, s := range famSessions {
 			counts[s.BackendTunnelID]++
 			sessionsByTunnel[s.BackendTunnelID] = append(sessionsByTunnel[s.BackendTunnelID], s)
 		}
-	}
 
-	// R2 corrected threshold: max(1, int(avg*1.4)) instead of the legacy
-	// int(avg*1.4), which collapsed to 0 whenever avg < 1 and made any tunnel
-	// with a single session look "overloaded". A tunnel drains only when its
-	// count exceeds BOTH the 40%-above-average threshold and avg+1.
-	threshold := int(avg * 1.4)
-	if threshold < 1 {
-		threshold = 1
-	}
-
-	for _, t := range activeTunnels {
-		count := counts[t.ID]
-		if count <= threshold || count <= int(avg)+1 {
-			continue
+		threshold := int(avg * 1.4)
+		if threshold < 1 {
+			threshold = 1
 		}
-		excess := count - threshold
-		drained := o.drainTunnelExcess(ctx, sessionsByTunnel[t.ID], activeTunnels, t.ID, counts, excess)
 
-		slog.Info("Rebalanced overloaded backend tunnel",
-			"tunnel_id", t.ID,
-			"session_count", count,
-			"average", avg,
-			"drained_sessions", drained,
-		)
+		for _, t := range famTunnels {
+			count := counts[t.ID]
+			if count <= threshold || count <= int(avg)+1 {
+				continue
+			}
+			excess := count - threshold
+			drained := o.drainTunnelExcess(ctx, sessionsByTunnel[t.ID], famTunnels, t.ID, counts, excess)
+
+			slog.Info("Rebalanced overloaded backend tunnel",
+				"tunnel_id", t.ID,
+				"protocol", fam,
+				"session_count", count,
+				"average", avg,
+				"drained_sessions", drained,
+			)
+		}
 	}
 
 	return nil

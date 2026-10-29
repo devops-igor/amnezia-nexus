@@ -158,6 +158,7 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 	// Live-session reuse: LastSeen-based validity, no generations. A
 	// healthy live session keeps its backend and route through upstream
 	// rekeys (issue #388: a rekey must not recreate the Nexus session).
+	multiProto := s.cfg != nil && s.cfg.EnableMultiProtocolBackends
 	if live, ok := s.sessionMgr.GetSessionSnapshotByPeer(o.PeerPublicKey); ok && live.UserID == user.ID && live.Status == "connected" {
 		backend, backendErr := s.pool.GetTunnelByID(live.BackendTunnelID)
 		// Same reuse conditions as HandleIncomingPeer minus generation
@@ -165,6 +166,7 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 		// health, plus identity agreement with the durable ownership.
 		if backendErr == nil &&
 			backend.Enabled &&
+			(models.NormalizeTunnelProtocol(backend.Protocol) == models.ProtocolAWG || multiProto) &&
 			strings.EqualFold(backend.Status, models.TunnelStatusActive) &&
 			live.AssignedIP == assignedIP &&
 			live.PeerPublicKey == o.PeerPublicKey &&
@@ -207,6 +209,89 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 		return nil, nil, retirement, loadbalancer.ErrNoActiveBackends
 	}
 
+	// Resolve protocol family for this peer/session.
+	targetFamily := ""
+	if live, ok := s.sessionMgr.GetSessionSnapshotByPeer(o.PeerPublicKey); ok {
+		if oldTun, err := s.pool.GetTunnelByID(live.BackendTunnelID); err == nil && oldTun != nil {
+			targetFamily = models.NormalizeTunnelProtocol(oldTun.Protocol)
+		} else if s.db != nil {
+			if oldTun, err := s.db.GetBackendTunnel(ctx, live.BackendTunnelID); err == nil && oldTun != nil {
+				targetFamily = models.NormalizeTunnelProtocol(oldTun.Protocol)
+			}
+		}
+		if targetFamily == "" {
+			// Finding R4: an existing session was found for the peer, but its source backend
+			// was deleted and its protocol family cannot be verified. Fail closed to prevent
+			// silent cross-family readmission to AWG.
+			return nil, nil, retirement, loadbalancer.ErrNoActiveBackends
+		}
+	}
+	if targetFamily == "" && s.stickyMgr != nil {
+		if affID, ok := s.stickyMgr.GetPeerAffinity(o.PeerPublicKey); ok {
+			if affTun, err := s.pool.GetTunnelByID(affID); err == nil && affTun != nil {
+				targetFamily = models.NormalizeTunnelProtocol(affTun.Protocol)
+			} else if s.db != nil {
+				if affTun, err := s.db.GetBackendTunnel(ctx, affID); err == nil && affTun != nil {
+					targetFamily = models.NormalizeTunnelProtocol(affTun.Protocol)
+				}
+			}
+		}
+	}
+	if targetFamily == "" && s.stickyMgr != nil {
+		if affID, ok := s.stickyMgr.GetAffinity(user.ID); ok {
+			if affTun, err := s.pool.GetTunnelByID(affID); err == nil && affTun != nil {
+				targetFamily = models.NormalizeTunnelProtocol(affTun.Protocol)
+			} else if s.db != nil {
+				if affTun, err := s.db.GetBackendTunnel(ctx, affID); err == nil && affTun != nil {
+					targetFamily = models.NormalizeTunnelProtocol(affTun.Protocol)
+				}
+			}
+		}
+	}
+	if targetFamily != "" && targetFamily != models.ProtocolAWG && !multiProto {
+		return nil, nil, retirement, loadbalancer.ErrNoActiveBackends
+	}
+	if targetFamily == "" {
+		eligibleFamilies := []string{models.ProtocolAWG}
+		if multiProto {
+			// Finding R2: exclude Naive backends from generic full-tunnel client admission
+			// unless the client/session specifies an explicit stream/TCP routing policy
+			// or explicit Naive protocol affinity.
+			isStreamOrTCP := false
+			if conn != nil {
+				if models.NormalizeProtocol(conn.Protocol) == models.ProtocolNaive {
+					isStreamOrTCP = true
+				}
+				if pol, ok := conn.ClientParams["routing_policy"].(string); ok && (pol == "tcp" || pol == "stream") {
+					isStreamOrTCP = true
+				}
+				if streamOnly, ok := conn.ClientParams["stream_only"].(bool); ok && streamOnly {
+					isStreamOrTCP = true
+				}
+			}
+			if isStreamOrTCP {
+				eligibleFamilies = append(eligibleFamilies, models.ProtocolVLESS, models.ProtocolNaive)
+			} else {
+				eligibleFamilies = append(eligibleFamilies, models.ProtocolVLESS)
+			}
+		}
+		for _, fam := range eligibleFamilies {
+			candidates := models.FilterTunnelsByProtocol(activeTunnels, fam)
+			if len(candidates) > 0 {
+				targetFamily = fam
+				break
+			}
+		}
+		if targetFamily == "" {
+			return nil, nil, retirement, loadbalancer.ErrNoActiveBackends
+		}
+	}
+
+	candidates := models.FilterTunnelsByProtocol(activeTunnels, targetFamily)
+	if len(candidates) == 0 {
+		return nil, nil, retirement, loadbalancer.ErrNoActiveBackends
+	}
+
 	// Sticky provenance, captured BEFORE selection: if the peer had no
 	// affinity yet, the assignment selection is about to install was
 	// created solely for this admission and must be rolled back on
@@ -220,7 +305,7 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 	req := &loadbalancer.RoutingRequest{
 		UserID:           user.ID,
 		PeerPublicKey:    o.PeerPublicKey,
-		AvailableTunnels: activeTunnels,
+		AvailableTunnels: candidates,
 	}
 	backend, err := s.selectTunnelForPeer(ctx, req)
 	if err != nil {
