@@ -125,8 +125,7 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	configPath, ok := models.ConfigPathForProtocol(req.Protocol)
-	if !ok {
+	if _, ok := models.ConfigPathForProtocol(req.Protocol); !ok {
 		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", "Unknown protocol")
 		return
 	}
@@ -174,35 +173,59 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 		h.JSONOK(w)
 		return
 	}
-	if (req.Protocol == models.ProtocolVLESS && h.xrayMgr != nil) ||
-		(req.Protocol == models.ProtocolNaive && h.naiveMgr != nil) {
-		var saveErr error
-		switch req.Protocol {
-		case models.ProtocolVLESS:
-			saveErr = h.xrayMgr.WriteConfiguration(ctx, server, req.Config)
-		case models.ProtocolNaive:
-			saveErr = h.naiveMgr.WriteConfiguration(ctx, server, req.Config)
-		}
-		if saveErr != nil {
-			if errors.Is(saveErr, xray.ErrInvalidConfiguration) || errors.Is(saveErr, naive.ErrInvalidConfiguration) {
-				h.JSONError(w, http.StatusBadRequest, "validation_failed", saveErr.Error())
-			} else {
-				h.JSONError(w, http.StatusInternalServerError, "apply_failed", "Failed to apply config")
-			}
-			return
-		}
-
-		h.audit(r, "server.config_save", map[string]any{"server_id": serverID, "protocol": req.Protocol})
-		h.JSONOK(w)
+	if h.saveXrayOrNaiveConfig(w, r, server, req) {
 		return
 	}
-	if err := client.UploadSudoFile(ctx, configPath, []byte(req.Config), rawConfigMode(req.Protocol)); err != nil {
+	h.saveRawServerConfig(w, r, client, req)
+}
+
+func (h *Handlers) saveRawServerConfig(
+	w http.ResponseWriter,
+	r *http.Request,
+	client ssh.SSHClient,
+	req models.ServerConfigSaveRequest,
+) {
+	configPath, _ := models.ConfigPathForProtocol(req.Protocol)
+	if err := client.UploadSudoFile(r.Context(), configPath, []byte(req.Config), rawConfigMode(req.Protocol)); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "save_failed", "Failed to save config")
 		return
 	}
 
+	serverID, _ := parseServerID(r)
 	h.audit(r, "server.config_save", map[string]any{"server_id": serverID, "protocol": req.Protocol})
 	h.JSONOK(w)
+}
+
+func (h *Handlers) saveXrayOrNaiveConfig(
+	w http.ResponseWriter,
+	r *http.Request,
+	server *models.Server,
+	req models.ServerConfigSaveRequest,
+) bool {
+	if (req.Protocol != models.ProtocolVLESS || h.xrayMgr == nil) &&
+		(req.Protocol != models.ProtocolNaive || h.naiveMgr == nil) {
+		return false
+	}
+
+	var saveErr error
+	switch req.Protocol {
+	case models.ProtocolVLESS:
+		saveErr = h.xrayMgr.WriteConfiguration(r.Context(), server, req.Config)
+	case models.ProtocolNaive:
+		saveErr = h.naiveMgr.WriteConfiguration(r.Context(), server, req.Config)
+	}
+	if saveErr != nil {
+		if errors.Is(saveErr, xray.ErrInvalidConfiguration) || errors.Is(saveErr, naive.ErrInvalidConfiguration) {
+			h.JSONError(w, http.StatusBadRequest, "validation_failed", saveErr.Error())
+		} else {
+			h.JSONError(w, http.StatusInternalServerError, "apply_failed", "Failed to apply config")
+		}
+		return true
+	}
+
+	h.audit(r, "server.config_save", map[string]any{"server_id": server.ID, "protocol": req.Protocol})
+	h.JSONOK(w)
+	return true
 }
 
 // rawConfigMode returns 0600 for secret-bearing configs (Xray config.json, Caddyfile credentials)
