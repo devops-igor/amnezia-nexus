@@ -202,7 +202,65 @@ func (h *Handlers) resolveInstalledProxyParamsForProto(ctx context.Context, srv 
 	if len(params) == 0 {
 		return nil, errors.New("failed to extract proxy parameters from manager result")
 	}
+
+	clientID := extractClientIDFromManagerResult(normProto, res)
+	if h.db != nil && clientID != "" {
+		if err := vpn.RecordBackendProxyPeerLifecycle(ctx, h.db, srv.ID, normProto, clientID, clientParams["name"].(string)); err != nil {
+			slog.Warn("failed to record backend proxy peer lifecycle", "server_id", srv.ID, "protocol", normProto, "client_id", clientID, "err", err)
+		}
+	}
+
 	return params, nil
+}
+
+func extractClientIDFromManagerResult(proto string, res map[string]any) string {
+	if res == nil {
+		return ""
+	}
+	switch proto {
+	case models.ProtocolVLESS:
+		if uid, ok := res["uuid"].(string); ok && uid != "" {
+			return uid
+		}
+	case models.ProtocolNaive:
+		if username, ok := res["username"].(string); ok && username != "" {
+			return username
+		}
+	}
+	if cid, ok := res["client_id"].(string); ok && cid != "" {
+		return cid
+	}
+	if cid, ok := res["clientId"].(string); ok && cid != "" {
+		return cid
+	}
+	return ""
+}
+
+func extractClientIDFromProtocolParams(proto string, params json.RawMessage) string {
+	if len(params) == 0 {
+		return ""
+	}
+	switch proto {
+	case models.ProtocolVLESS:
+		var vless models.VLESSRealityParams
+		if err := json.Unmarshal(params, &vless); err == nil && vless.UUID != "" {
+			return vless.UUID
+		}
+	case models.ProtocolNaive:
+		var naive models.NaiveProxyParams
+		if err := json.Unmarshal(params, &naive); err == nil && naive.Username != "" {
+			return naive.Username
+		}
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(params, &raw); err == nil {
+		for _, k := range []string{"username", "client_id", "clientId", "uuid"} {
+			if v, ok := raw[k].(string); ok && v != "" {
+				return v
+			}
+		}
+	}
+	return ""
 }
 
 func (h *Handlers) isMultiProtocolEnabled(ctx context.Context) bool {
@@ -361,6 +419,14 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 			log.Printf("[vpn/handlers] failed to enable backend %d: %v", serverID, err)
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to enable backend")
 			return
+		}
+	}
+
+	normProto := models.NormalizeTunnelProtocol(req.Protocol)
+	if (normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive) && h.db != nil {
+		cid := extractClientIDFromProtocolParams(normProto, req.ProtocolParams)
+		if cid != "" {
+			_ = vpn.RecordBackendProxyPeerLifecycle(bgCtx, h.db, serverID, normProto, cid, fmt.Sprintf("vpn-backend-%d", serverID))
 		}
 	}
 

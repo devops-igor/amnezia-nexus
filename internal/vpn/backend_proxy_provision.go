@@ -2,10 +2,12 @@ package vpn
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
@@ -82,4 +84,15 @@ func DeriveProxyProtocolParams(server *models.Server, proto string) (json.RawMes
 	}
 
 	return nil, fmt.Errorf("protocol parameters required for proxy backend: %w", ErrEmptyParams)
+}
+
+// RecordBackendProxyPeerLifecycle records a backend proxy peer in peer_lifecycle with status "backend_active".
+func RecordBackendProxyPeerLifecycle(ctx context.Context, db *database.DB, serverID int64, proto, clientID, name string) error {
+	if db == nil || clientID == "" {
+		return nil
+	}
+	if name == "" {
+		name = fmt.Sprintf("vpn-backend-%d", serverID)
+	}
+	return db.RecordPeerLifecycle(ctx, serverID, proto, clientID, name, "", "backend_active")
 }

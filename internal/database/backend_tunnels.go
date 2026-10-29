@@ -395,6 +395,34 @@ func (d *DB) GetBackendTunnelByServerID(ctx context.Context, serverID int64) (*m
 	return &t, nil
 }
 
+// GetBackendTunnelsByServerID retrieves all backend tunnels for a specific server_id.
+func (d *DB) GetBackendTunnelsByServerID(ctx context.Context, serverID int64) ([]models.BackendTunnel, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
+		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at,
+		protocol, protocol_params
+		FROM backend_tunnels WHERE server_id = ? ORDER BY id`
+
+	rows, err := d.sqlDB.QueryContext(ctx, query, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query backend tunnels for server %d: %w", serverID, err)
+	}
+	defer rows.Close()
+
+	var tunnels []models.BackendTunnel
+	for rows.Next() {
+		t, err := d.scanBackendTunnel(rows)
+		if err != nil {
+			return nil, err
+		}
+		tunnels = append(tunnels, t)
+	}
+
+	return tunnels, rows.Err()
+}
+
 // Helper scanners
 
 func (d *DB) scanBackendTunnel(s scannable) (models.BackendTunnel, error) {

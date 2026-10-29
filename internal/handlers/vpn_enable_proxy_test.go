@@ -166,6 +166,15 @@ func TestVPNEnableBackendHandler_ProxyBootstrap(t *testing.T) {
 	if err != nil || dbTun == nil || len(dbTun.ProtocolParams) == 0 {
 		t.Fatalf("expected encrypted protocol params persisted in db for server %d, got %+v err=%v", sid, dbTun, err)
 	}
+
+	lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
+	if err != nil {
+		t.Fatalf("GetPeerLifecycles failed: %v", err)
+	}
+	rec, ok := lifecycles[provisionedNaive.Username]
+	if !ok || rec.Status != "backend_active" {
+		t.Fatalf("expected peer_lifecycle record for %s with status backend_active, got %+v", provisionedNaive.Username, lifecycles)
+	}
 }
 
 func TestVPNEnableBackendHandler_ProxyBootstrap_VLESS(t *testing.T) {
@@ -260,6 +269,15 @@ func TestVPNEnableBackendHandler_ProxyBootstrap_VLESS(t *testing.T) {
 	dbTun, err := db.GetBackendTunnelByServerID(ctx, sid)
 	if err != nil || dbTun == nil || len(dbTun.ProtocolParams) == 0 {
 		t.Fatalf("expected encrypted protocol params persisted in db for server %d, got %+v err=%v", sid, dbTun, err)
+	}
+
+	lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolVLESS)
+	if err != nil {
+		t.Fatalf("GetPeerLifecycles failed: %v", err)
+	}
+	rec, ok := lifecycles[provisionedVLESS.UUID]
+	if !ok || rec.Status != "backend_active" {
+		t.Fatalf("expected peer_lifecycle record for %s with status backend_active, got %+v", provisionedVLESS.UUID, lifecycles)
 	}
 }
 

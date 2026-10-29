@@ -2,6 +2,7 @@ package reconciliation
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -590,6 +591,22 @@ func (r *Reconciler) withdrawDisabledOwnerConns(ctx context.Context, server *mod
 
 func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *models.Server, proto string, mgr manager.ProtocolManager, client map[string]any, clientID string, lifecycles map[string]database.PeerLifecycleRecord, staleThreshold time.Duration) {
 	serverID := server.ID
+
+	if r.isBackendTunnelClient(ctx, serverID, clientID) {
+		slog.Info("Reconciliation: preserving active backend tunnel client",
+			"server_id", serverID,
+			"client_id", clientID,
+		)
+		if _, has := lifecycles[clientID]; !has && r.db != nil {
+			clientName := resolveClientNameFromMap(client)
+			if clientName == "" {
+				clientName = fmt.Sprintf("vpn-backend-%d", serverID)
+			}
+			_ = r.db.RecordPeerLifecycle(ctx, serverID, proto, clientID, clientName, "", "backend_active")
+		}
+		return
+	}
+
 	rec, hasLifecycle := lifecycles[clientID]
 	if !hasLifecycle {
 		settingKey := legacyPeersAdoptedSettingKey(serverID, proto)
@@ -790,4 +807,57 @@ func parseClientTimestamp(val any) *time.Time {
 		}
 	}
 	return nil
+}
+
+func (r *Reconciler) isBackendTunnelClient(ctx context.Context, serverID int64, clientID string) bool {
+	if r.db == nil || clientID == "" {
+		return false
+	}
+	tunnels, err := r.db.GetBackendTunnelsByServerID(ctx, serverID)
+	if err != nil || len(tunnels) == 0 {
+		return false
+	}
+	for _, t := range tunnels {
+		if !t.Enabled {
+			continue
+		}
+		if isMatchingBackendTunnelClient(&t, clientID) {
+			return true
+		}
+	}
+	return false
+}
+
+func isMatchingBackendTunnelClient(t *models.BackendTunnel, clientID string) bool {
+	if t == nil || clientID == "" {
+		return false
+	}
+	if len(t.ProtocolParams) > 0 {
+		var naive models.NaiveProxyParams
+		if err := json.Unmarshal(t.ProtocolParams, &naive); err == nil && naive.Username != "" {
+			if naive.Username == clientID {
+				return true
+			}
+		}
+		var vless models.VLESSRealityParams
+		if err := json.Unmarshal(t.ProtocolParams, &vless); err == nil && vless.UUID != "" {
+			if strings.EqualFold(vless.UUID, clientID) {
+				return true
+			}
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(t.ProtocolParams, &raw); err == nil {
+			for _, k := range []string{"username", "user", "client_id", "clientId", "uuid", "id"} {
+				if v, ok := raw[k].(string); ok && v != "" {
+					if strings.EqualFold(v, clientID) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	if t.PublicKey != "" && t.PublicKey == clientID {
+		return true
+	}
+	return false
 }
