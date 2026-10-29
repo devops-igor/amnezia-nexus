@@ -136,7 +136,8 @@ func (m *XrayManager) resolveRealityCredentials(
 	pubB64 := derivedPub
 	shortIDs := reality.ShortIDs
 	var shortID string
-	if len(shortIDs) > 0 && shortIDs[0] != "" {
+	// A non-empty list is an existing identity, even when its first entry is "" (valid REALITY "no short ID").
+	if len(shortIDs) > 0 {
 		shortID = shortIDs[0]
 	} else {
 		var genErr error
