@@ -607,7 +607,7 @@ def test_protocol_uninstall_modal_ui_flow(
         if uninstall_btn.is_visible():
             uninstall_btn.click()
         else:
-            page.evaluate("uninstallProtocol('vless')")
+            page.evaluate("() => { void uninstallProtocol('vless'); }")
 
         confirm_modal = page.locator("#nexusConfirmModal")
         expect(confirm_modal).to_be_visible()
@@ -626,7 +626,7 @@ def test_protocol_uninstall_modal_ui_flow(
         if uninstall_btn.is_visible():
             uninstall_btn.click()
         else:
-            page.evaluate("uninstallProtocol('vless')")
+            page.evaluate("() => { void uninstallProtocol('vless'); }")
 
         expect(confirm_modal).to_be_visible()
 
