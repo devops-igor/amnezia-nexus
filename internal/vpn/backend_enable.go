@@ -133,7 +133,7 @@ func (s *Service) EnableBackendWithConfig(ctx context.Context, serverID int64, o
 			p, params, _ := ResolveServerProxyProtocol(server)
 			if p != "" {
 				opt.Protocol = p
-				if len(opt.ProtocolParams) == 0 {
+				if len(opt.ProtocolParams) == 0 && len(params) > 0 {
 					opt.ProtocolParams = params
 				}
 			}
@@ -154,6 +154,10 @@ func (s *Service) EnableBackendWithConfig(ctx context.Context, serverID int64, o
 		s.mu.RUnlock()
 		if !multiEnabled {
 			return errors.New("multi-protocol backends are disabled")
+		}
+
+		if len(opt.ProtocolParams) == 0 {
+			return fmt.Errorf("protocol parameters required for proxy backend: %w", ErrEmptyParams)
 		}
 
 		port := 0

@@ -115,9 +115,31 @@ func TestVPNEnableBackendHandler_ProxyBootstrap(t *testing.T) {
 	// Clean up for omitted options check
 	_ = vpnSvc.DeleteBackend(ctx, sid)
 
-	// 2. Enable without body resolves installed proxy from server.Protocols (Finding R1)
-	// and auto-provisions client credentials from standard installer metadata (no pre-existing params).
+	// Register protocol manager to provision dedicated client credentials
+	h.registry.Register(&mockProtocolManager{
+		protocol: models.ProtocolNaive,
+		addClientFn: func(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
+			return map[string]any{
+				"username": "auto-naive-user",
+				"password": "auto-naive-password",
+				"domain":   "example.com",
+			}, nil
+		},
+	})
+
+	// R4-B1: Support cannot enroll proxy backend without body on first-time enrollment
+	reqSupportNoBody := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sid), nil)
+	reqSupportNoBody = reqSupportNoBody.WithContext(middleware.WithSession(reqSupportNoBody.Context(), &models.SessionData{UserID: "support", Role: models.RoleSupport}))
+	wSupportNoBody := httptest.NewRecorder()
+	r.ServeHTTP(wSupportNoBody, reqSupportNoBody)
+	if wSupportNoBody.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for Support role on initial proxy enrollment without body, got %d: %s", wSupportNoBody.Code, wSupportNoBody.Body.String())
+	}
+
+	// 2. Admin enable without body resolves installed proxy from server.Protocols
+	// and provisions client credentials via protocol manager.
 	reqEmpty := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sid), nil)
+	reqEmpty = reqEmpty.WithContext(middleware.WithSession(reqEmpty.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
 	wEmpty := httptest.NewRecorder()
 	r.ServeHTTP(wEmpty, reqEmpty)
 
@@ -187,8 +209,32 @@ func TestVPNEnableBackendHandler_ProxyBootstrap_VLESS(t *testing.T) {
 		t.Fatalf("CreateServer failed: %v", err)
 	}
 
-	// Enable without body on server with standard VLESS installer metadata (no pre-existing client params).
+	// Register protocol manager to provision dedicated client credentials
+	h.registry.Register(&mockProtocolManager{
+		protocol: models.ProtocolVLESS,
+		addClientFn: func(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
+			return map[string]any{
+				"uuid":        "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+				"flow":        "xtls-rprx-vision",
+				"public_key":  "e-JgU2X7X8aH1pQ1pZqUuWbWw5K2s6J8f8gH9jK1lM4",
+				"short_id":    "0123456789abcdef",
+				"server_name": "gateway.icloud.com",
+			}, nil
+		},
+	})
+
+	// R4-B1: Support cannot enroll VLESS proxy backend without body on first-time enrollment
+	reqSupport := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sid), nil)
+	reqSupport = reqSupport.WithContext(middleware.WithSession(reqSupport.Context(), &models.SessionData{UserID: "support", Role: models.RoleSupport}))
+	wSupport := httptest.NewRecorder()
+	r.ServeHTTP(wSupport, reqSupport)
+	if wSupport.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for Support role on initial VLESS enrollment without body, got %d: %s", wSupport.Code, wSupport.Body.String())
+	}
+
+	// Admin enable without body on server with standard VLESS installer metadata.
 	reqEmpty := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sid), nil)
+	reqEmpty = reqEmpty.WithContext(middleware.WithSession(reqEmpty.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
 	wEmpty := httptest.NewRecorder()
 	r.ServeHTTP(wEmpty, reqEmpty)
 

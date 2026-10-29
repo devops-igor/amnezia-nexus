@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
@@ -140,56 +141,68 @@ func extractProxyParamsFromManagerResult(proto string, res map[string]any) json.
 	return nil
 }
 
-func (h *Handlers) resolveInstalledProxyParamsForProto(ctx context.Context, srv *models.Server, proto string) json.RawMessage {
+func detectServerProxyProtocol(srv *models.Server) string {
 	if srv == nil || srv.Protocols == nil {
-		return nil
-	}
-	normProto := models.NormalizeTunnelProtocol(proto)
-	pInfo, ok := srv.Protocols[normProto].(map[string]any)
-	if !ok || pInfo == nil {
-		return nil
-	}
-	// 1. Try protocol manager if available and configured
-	if h.registry != nil || h.xrayMgr != nil || h.naiveMgr != nil {
-		if protoMgr, err := h.GetProtocolManager(normProto); err == nil && protoMgr != nil {
-			clientParams := map[string]any{"name": fmt.Sprintf("vpn-backend-%d", srv.ID)}
-			if res, err := protoMgr.AddClient(ctx, srv, clientParams); err == nil && res != nil {
-				if params := extractProxyParamsFromManagerResult(normProto, res); len(params) > 0 {
-					return params
-				}
-			}
-		}
-	}
-	// 2. Auto-provision or derive from server and protocol metadata
-	params, _ := vpn.DeriveProxyProtocolParams(srv, normProto)
-	return params
-}
-
-func (h *Handlers) resolveInstalledProxyOptions(ctx context.Context, serverID int64) (string, json.RawMessage) {
-	if h.db == nil {
-		return "", nil
-	}
-	srv, err := h.db.GetServer(ctx, serverID)
-	if err != nil || srv == nil || srv.Protocols == nil {
-		return "", nil
+		return ""
 	}
 	if awgInfo, ok := srv.Protocols["awg"].(map[string]any); ok {
 		if inst, _ := awgInfo["installed"].(bool); inst {
-			return "", nil
+			return ""
 		}
 		if pub, _ := awgInfo["public_key"].(string); pub != "" {
-			return "", nil
+			return ""
 		}
 	}
 	for _, p := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
 		if pInfo, ok := srv.Protocols[p].(map[string]any); ok {
 			if inst, _ := pInfo["installed"].(bool); inst {
-				params := h.resolveInstalledProxyParamsForProto(ctx, srv, p)
-				return p, params
+				return p
 			}
 		}
 	}
-	return "", nil
+	return ""
+}
+
+func (h *Handlers) resolveInstalledProxyParamsForProto(ctx context.Context, srv *models.Server, proto string) (json.RawMessage, error) {
+	if srv == nil || srv.Protocols == nil {
+		return nil, errors.New("server protocols not available")
+	}
+	normProto := models.NormalizeTunnelProtocol(proto)
+	pInfo, ok := srv.Protocols[normProto].(map[string]any)
+	if !ok || pInfo == nil {
+		return nil, fmt.Errorf("protocol %s not configured on server", normProto)
+	}
+
+	// 1. If explicit credentials already exist in server metadata, reuse them.
+	if pVal, ok := pInfo["params"]; ok && pVal != nil {
+		if b, err := json.Marshal(pVal); err == nil && len(bytes.TrimSpace(b)) > 2 && string(bytes.TrimSpace(b)) != "null" {
+			return b, nil
+		}
+	}
+	if pVal, ok := pInfo["protocol_params"]; ok && pVal != nil {
+		if b, err := json.Marshal(pVal); err == nil && len(bytes.TrimSpace(b)) > 2 && string(bytes.TrimSpace(b)) != "null" {
+			return b, nil
+		}
+	}
+
+	// 2. Try protocol manager if available and configured
+	protoMgr, err := h.GetProtocolManager(normProto)
+	if err != nil || protoMgr == nil {
+		return nil, fmt.Errorf("protocol manager for %s not available: %w", normProto, err)
+	}
+	clientParams := map[string]any{"name": fmt.Sprintf("vpn-backend-%d", srv.ID)}
+	res, err := protoMgr.AddClient(ctx, srv, clientParams)
+	if err != nil {
+		return nil, fmt.Errorf("failed to provision proxy client on server %d: %w", srv.ID, err)
+	}
+	if res == nil {
+		return nil, errors.New("protocol manager returned empty client provisioning result")
+	}
+	params := extractProxyParamsFromManagerResult(normProto, res)
+	if len(params) == 0 {
+		return nil, errors.New("failed to extract proxy parameters from manager result")
+	}
+	return params, nil
 }
 
 // VPNEnableBackendHandler activates a backend server for load balancing.
@@ -219,51 +232,71 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 		req.Protocol = r.URL.Query().Get("protocol")
 	}
 
-	// R2-B1: Protected proxy credentials (VLESS, NaiveProxy) require Admin authorization.
-	hasCustomParams := len(req.ProtocolParams) > 0
-	hasProtectedProto := req.Protocol != "" && models.NormalizeTunnelProtocol(req.Protocol) != models.ProtocolAWG
-	if hasCustomParams || hasProtectedProto {
-		sess := h.GetSession(r)
-		if sess == nil || sess.Role != models.RoleAdmin {
-			h.JSONError(w, http.StatusForbidden, "forbidden", "forbidden: admin role required to configure protected proxy credentials")
-			return
-		}
-	}
-
 	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 45*time.Second)
 	defer cancel()
 
-	// R2-H1: Before inferring protocol from installed server metadata, check if a backend row
-	// already exists in the database for serverID. If it exists, re-enable using its existing
-	// persisted configuration and credentials.
 	var existingTunnel *models.BackendTunnel
 	if h.db != nil {
 		existingTunnel, _ = h.db.GetBackendTunnelByServerID(bgCtx, serverID)
 	}
 
 	if existingTunnel != nil {
+		// R2-B1: Protected proxy credentials (VLESS, NaiveProxy) require Admin authorization.
+		hasCustomParams := len(req.ProtocolParams) > 0
+		hasProtoChange := req.Protocol != "" && models.NormalizeTunnelProtocol(req.Protocol) != models.NormalizeTunnelProtocol(existingTunnel.Protocol)
+		if hasCustomParams || (hasProtoChange && models.NormalizeTunnelProtocol(req.Protocol) != models.ProtocolAWG) {
+			sess := h.GetSession(r)
+			if sess == nil || sess.Role != models.RoleAdmin {
+				h.JSONError(w, http.StatusForbidden, "forbidden", "forbidden: admin role required to configure protected proxy credentials")
+				return
+			}
+		}
+
+		// R2-H1: Existing backend re-enables preserving stored configuration
 		if req.Protocol == "" {
 			req.Protocol = existingTunnel.Protocol
 		}
 		if len(req.ProtocolParams) == 0 {
 			req.ProtocolParams = existingTunnel.ProtocolParams
 		}
-	} else if req.Protocol == "" {
-		// Only when no backend row exists in the database (initial first-time enrollment)
-		// should it consult installed server metadata.
-		proto, pParams := h.resolveInstalledProxyOptions(bgCtx, serverID)
-		if proto != "" {
-			req.Protocol = proto
-			if len(req.ProtocolParams) == 0 {
-				req.ProtocolParams = pParams
+	} else {
+		// R4-B1: First-time enrollment: determine effective protocol BEFORE calling any manager or mutating state
+		effectiveProto := ""
+		if req.Protocol != "" {
+			effectiveProto = models.NormalizeTunnelProtocol(req.Protocol)
+		}
+		var srv *models.Server
+		if effectiveProto == "" && h.db != nil {
+			srv, _ = h.db.GetServer(bgCtx, serverID)
+			effectiveProto = detectServerProxyProtocol(srv)
+		}
+
+		isProxy := effectiveProto == models.ProtocolVLESS || effectiveProto == models.ProtocolNaive
+		if isProxy || len(req.ProtocolParams) > 0 {
+			sess := h.GetSession(r)
+			if sess == nil || sess.Role != models.RoleAdmin {
+				middleware.WriteJSONError(w, http.StatusForbidden, "forbidden", "forbidden: admin role required to enroll proxy backends")
+				return
 			}
 		}
-	} else if len(req.ProtocolParams) == 0 {
+
+		if req.Protocol == "" && effectiveProto != "" {
+			req.Protocol = effectiveProto
+		}
+
 		normProto := models.NormalizeTunnelProtocol(req.Protocol)
-		if normProto != models.ProtocolAWG && h.db != nil {
-			if srv, err := h.db.GetServer(bgCtx, serverID); err == nil && srv != nil {
-				req.ProtocolParams = h.resolveInstalledProxyParamsForProto(bgCtx, srv, normProto)
+		if (normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive) && len(req.ProtocolParams) == 0 {
+			if srv == nil && h.db != nil {
+				srv, _ = h.db.GetServer(bgCtx, serverID)
 			}
+			params, provErr := h.resolveInstalledProxyParamsForProto(bgCtx, srv, normProto)
+			if provErr != nil {
+				// #nosec G706 -- Internal server audit log for failed backend proxy client provisioning
+				log.Printf("[vpn/handlers] failed to provision proxy client for server %d: %v", serverID, provErr)
+				h.JSONError(w, http.StatusBadGateway, "provisioning_failed", fmt.Sprintf("Failed to provision proxy client: %v", provErr))
+				return
+			}
+			req.ProtocolParams = params
 		}
 	}
 
