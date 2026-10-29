@@ -23,13 +23,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout Code with Full History
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -44,7 +44,7 @@ jobs:
           python3 scripts/architecture_health.py --check --nonblocking
 
       - name: Upload Architecture Health Report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: architecture-health-report
