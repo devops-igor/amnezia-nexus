@@ -396,3 +396,55 @@ func TestService_EnableBackendWithConfig_ProxyBootstrapResolvesProtocol_VLESS(t 
 		t.Fatalf("expected ErrEmptyParams when enabling VLESS backend without options, got: %v", err)
 	}
 }
+
+func TestService_EnableBackendWithConfig_MultiProtocolDisabled_Rejected(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	cfg := &models.VPNConfig{
+		EnableMultiProtocolBackends: false,
+		ListenPort:                  51820,
+	}
+	svc, err := NewVPNService(db, cfg)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+
+	naiveParams := models.NaiveProxyParams{
+		Domain:   "example.com",
+		Username: "fixture-user",
+		Password: "fixture-password",
+		EnableH3: false,
+	}
+	paramsRaw, _ := json.Marshal(naiveParams)
+
+	sid, err := db.CreateServer(ctx, &models.Server{
+		Name:    "proxy-node-disabled",
+		Host:    "127.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"naive": map[string]any{
+				"installed": true,
+				"port":      443,
+				"domain":    "example.com",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	// 1. Explicit proxy options rejected when flag disabled
+	err = svc.EnableBackendWithConfig(ctx, sid, tunnel.BackendTunnelOptions{
+		Protocol:       models.ProtocolNaive,
+		ProtocolParams: paramsRaw,
+	})
+	if !errors.Is(err, ErrMultiProtocolBackendsDisabled) {
+		t.Fatalf("expected ErrMultiProtocolBackendsDisabled with explicit options, got: %v", err)
+	}
+
+	// 2. Inferred proxy protocol rejected when flag disabled
+	err = svc.EnableBackendWithConfig(ctx, sid)
+	if !errors.Is(err, ErrMultiProtocolBackendsDisabled) {
+		t.Fatalf("expected ErrMultiProtocolBackendsDisabled with inferred options, got: %v", err)
+	}
+}

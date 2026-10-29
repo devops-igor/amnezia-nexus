@@ -22,9 +22,7 @@ import (
 
 // restoreBackendDevices restores data-plane devices for active and degraded tunnels loaded from DB.
 func (s *Service) restoreBackendDevices(ctx context.Context) {
-	s.mu.RLock()
-	multiProto := s.cfg != nil && s.cfg.EnableMultiProtocolBackends
-	s.mu.RUnlock()
+	multiProto := s.MultiProtocolEnabled()
 
 	for _, tun := range s.pool.ListTunnels() {
 		if !tun.Enabled {
@@ -106,6 +104,12 @@ func (s *Service) EnableBackendWithConfig(ctx context.Context, serverID int64, o
 		opt = opts[0]
 	}
 
+	if p := models.NormalizeTunnelProtocol(opt.Protocol); p != "" && p != models.ProtocolAWG {
+		if !s.MultiProtocolEnabled() {
+			return ErrMultiProtocolBackendsDisabled
+		}
+	}
+
 	// R2-H1: Before inferring protocol from installed server metadata, check if a backend row
 	// already exists in the database (or in-memory pool) for serverID.
 	var existingTunnel *models.BackendTunnel
@@ -149,11 +153,8 @@ func (s *Service) EnableBackendWithConfig(ctx context.Context, serverID int64, o
 
 	proto := models.NormalizeTunnelProtocol(opt.Protocol)
 	if proto != models.ProtocolAWG {
-		s.mu.RLock()
-		multiEnabled := s.cfg != nil && s.cfg.EnableMultiProtocolBackends
-		s.mu.RUnlock()
-		if !multiEnabled {
-			return errors.New("multi-protocol backends are disabled")
+		if !s.MultiProtocolEnabled() {
+			return ErrMultiProtocolBackendsDisabled
 		}
 
 		if len(opt.ProtocolParams) == 0 {

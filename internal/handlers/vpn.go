@@ -205,6 +205,23 @@ func (h *Handlers) resolveInstalledProxyParamsForProto(ctx context.Context, srv 
 	return params, nil
 }
 
+func (h *Handlers) isMultiProtocolEnabled(ctx context.Context) bool {
+	if h.vpnSvc != nil {
+		if h.vpnSvc.MultiProtocolEnabled() {
+			return true
+		}
+		if _, err := h.vpnSvc.GetConfig(ctx); err == nil {
+			return false
+		}
+	}
+	if h.db != nil {
+		if cfg, err := h.db.GetVPNConfig(ctx); err == nil && cfg != nil {
+			return cfg.EnableMultiProtocolBackends
+		}
+	}
+	return false
+}
+
 // VPNEnableBackendHandler activates a backend server for load balancing.
 //
 //nolint:gocyclo // transactional enable, protocol dispatch, and error handling are centralized.
@@ -259,6 +276,14 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 		if len(req.ProtocolParams) == 0 {
 			req.ProtocolParams = existingTunnel.ProtocolParams
 		}
+
+		normProto := models.NormalizeTunnelProtocol(req.Protocol)
+		if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
+			if !h.isMultiProtocolEnabled(bgCtx) {
+				middleware.WriteJSONError(w, http.StatusBadRequest, "multi_protocol_disabled", "multi-protocol backends are disabled")
+				return
+			}
+		}
 	} else {
 		// R4-B1: First-time enrollment: determine effective protocol BEFORE calling any manager or mutating state
 		effectiveProto := ""
@@ -285,9 +310,20 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 		}
 
 		normProto := models.NormalizeTunnelProtocol(req.Protocol)
+		if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
+			if !h.isMultiProtocolEnabled(bgCtx) {
+				middleware.WriteJSONError(w, http.StatusBadRequest, "multi_protocol_disabled", "multi-protocol backends are disabled")
+				return
+			}
+		}
+
 		if (normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive) && len(req.ProtocolParams) == 0 {
 			if srv == nil && h.db != nil {
 				srv, _ = h.db.GetServer(bgCtx, serverID)
+			}
+			if srv == nil {
+				h.JSONError(w, http.StatusNotFound, "server_not_found", fmt.Sprintf("Server %d not found", serverID))
+				return
 			}
 			params, provErr := h.resolveInstalledProxyParamsForProto(bgCtx, srv, normProto)
 			if provErr != nil {
@@ -315,6 +351,10 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 			}
 			if errors.Is(err, vpn.ErrServerNotFound) {
 				h.JSONError(w, http.StatusNotFound, "server_not_found", fmt.Sprintf("Server %d not found", serverID))
+				return
+			}
+			if errors.Is(err, vpn.ErrMultiProtocolBackendsDisabled) || strings.Contains(err.Error(), "multi-protocol backends are disabled") {
+				h.JSONError(w, http.StatusBadRequest, "multi_protocol_disabled", "multi-protocol backends are disabled")
 				return
 			}
 			// #nosec G706 -- Internal server audit log for failed backend enable

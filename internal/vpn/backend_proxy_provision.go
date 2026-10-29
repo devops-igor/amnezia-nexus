@@ -12,6 +12,19 @@ import (
 // ErrEmptyParams indicates that proxy protocol parameters are missing.
 var ErrEmptyParams = errors.New("protocol parameters cannot be empty")
 
+// ErrMultiProtocolBackendsDisabled indicates that multi-protocol backends are disabled in configuration.
+var ErrMultiProtocolBackendsDisabled = errors.New("multi-protocol backends are disabled")
+
+// MultiProtocolEnabled reports whether multi-protocol backends are enabled.
+func (s *Service) MultiProtocolEnabled() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg != nil && s.cfg.EnableMultiProtocolBackends
+}
+
 // ResolveServerProxyProtocol inspects server.Protocols. If AWG is not installed,
 // it checks whether VLESS or Naive is installed and returns the protocol name and its
 // preserved protocol parameters if present in metadata.
