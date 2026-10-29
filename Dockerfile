@@ -22,7 +22,7 @@ RUN CGO_ENABLED=0 go build -tags with_utls -trimpath -ldflags="-s -w" -o /build/
 # =============================================================================
 # Stage 2: Production Stage (Lean Alpine runtime ~41MB)
 # =============================================================================
-FROM alpine:3.22
+FROM alpine:3.24
 
 WORKDIR /app
 
