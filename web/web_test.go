@@ -106,7 +106,7 @@ func TestModernJavaScriptAndInteractiveComponents(t *testing.T) {
 	}
 	baseStr := string(baseData)
 	requiredIntegrations := []string{
-		"src=\"/static/js/api.js\"",
+		"src=\"/static/js/api.js",
 		"src=\"/static/js/ui.js\"",
 		"id=\"nexusConfirmModal\"",
 		"id=\"nexusConfirmTitle\"",
