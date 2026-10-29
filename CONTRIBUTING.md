@@ -28,6 +28,7 @@ make build        # builds bin/panel
   ```
 
   Without jsdom the frontend tests skip locally; with `CI=true` they fail.
+- **Docker and Trivy.** Install Docker and [Trivy](https://trivy.dev/) to build and scan the production container image locally with `make docker-scan`.
 - **Python tooling.** Python 3 is needed for architecture health and its tests. Use a virtual environment outside version control or in an ignored directory (`.venv` is skipped by the scanner):
 
   ```bash
@@ -49,8 +50,17 @@ make build        # builds bin/panel
 | `make test-race` | `go test -race -v ./...` (several minutes) |
 | `make lint` | `golangci-lint run ./...` |
 | `make security` | `gosec` and `govulncheck` |
+| `make docker-scan` | Build `amnezia-nexus:local` and scan it for HIGH and CRITICAL vulnerabilities |
 
 Also available: `make fmt`, `make vet`, `make build`, `make test-e2e`.
+
+### Container security scanning
+
+Pull requests that change `Dockerfile` or `.github/workflows/docker.yml` build the local image and scan it with Trivy before any registry push. Fixed CRITICAL vulnerabilities fail the workflow; HIGH vulnerabilities are reported in the workflow summary without blocking it. Run the same local image inspection with:
+
+```bash
+make docker-scan
+```
 
 ## Workflow
 
