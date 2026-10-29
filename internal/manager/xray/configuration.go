@@ -35,10 +35,6 @@ func (m *XrayManager) WriteConfiguration(ctx context.Context, server *models.Ser
 	if err != nil {
 		return fmt.Errorf("download previous xray config: %w", err)
 	}
-	if err := client.UploadSudoFile(ctx, XrayConfigPath, []byte(content), 0600); err != nil {
-		return fmt.Errorf("upload xray config: %w", err)
-	}
-
 	restart := func(ctx context.Context) error {
 		cmd := fmt.Sprintf("docker restart %s", ssh.EscapeShellArg(XrayContainerName))
 		_, errOut, code, err := client.RunSudoCommand(ctx, cmd)
@@ -48,19 +44,38 @@ func (m *XrayManager) WriteConfiguration(ctx context.Context, server *models.Ser
 		if code != 0 {
 			return fmt.Errorf("restart xray container exited with code %d: %s", code, strings.TrimSpace(errOut))
 		}
+
+		inspectCmd := fmt.Sprintf("docker inspect -f '{{.State.Running}}' %s", ssh.EscapeShellArg(XrayContainerName))
+		out, errOut, code, err := client.RunSudoCommand(ctx, inspectCmd)
+		if err != nil {
+			return fmt.Errorf("inspect xray container after restart: %w", err)
+		}
+		if code != 0 {
+			return fmt.Errorf("inspect xray container exited with code %d: %s", code, strings.TrimSpace(errOut))
+		}
+		if state := strings.TrimSpace(out); state != "true" {
+			return fmt.Errorf("xray container is not running after restart (state %q)", state)
+		}
 		return nil
 	}
-
-	if err := restart(ctx); err != nil {
+	rollback := func(applyErr error) error {
 		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		if restoreErr := client.UploadSudoFile(rollbackCtx, XrayConfigPath, previous, 0600); restoreErr != nil {
-			return errors.Join(err, fmt.Errorf("restore previous xray config: %w", restoreErr))
+			return errors.Join(applyErr, fmt.Errorf("restore previous xray config: %w", restoreErr))
 		}
 		if recoveryErr := restart(rollbackCtx); recoveryErr != nil {
-			return errors.Join(err, fmt.Errorf("restart xray container with previous config: %w", recoveryErr))
+			return errors.Join(applyErr, fmt.Errorf("restart xray container with previous config: %w", recoveryErr))
 		}
-		return err
+		return applyErr
+	}
+
+	// An upload error can occur after the remote move committed, so always compensate.
+	if err := client.UploadSudoFile(ctx, XrayConfigPath, []byte(content), 0600); err != nil {
+		return rollback(fmt.Errorf("upload xray config: %w", err))
+	}
+	if err := restart(ctx); err != nil {
+		return rollback(err)
 	}
 	return nil
 }

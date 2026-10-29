@@ -83,11 +83,50 @@ func RenderCaddyfile(port int, domain string, clients []NaiveClient) string {
 	return sb.String()
 }
 
+// validateCaddyfileTokens rejects unterminated quoted tokens while ignoring comments.
+func validateCaddyfileTokens(content string) error {
+	var quote byte
+	escaped := false
+	for i := 0; i < len(content); i++ {
+		c := content[i]
+		if quote != 0 {
+			if quote != '`' && escaped {
+				escaped = false
+				continue
+			}
+			if quote != '`' && c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		if c == '#' {
+			for i+1 < len(content) && content[i+1] != '\n' {
+				i++
+			}
+			continue
+		}
+		if c == '"' || c == '\'' || c == '`' {
+			quote = c
+		}
+	}
+	if quote != 0 {
+		return fmt.Errorf("caddyfile contains unterminated %c quote", quote)
+	}
+	return nil
+}
+
 // ParseCaddyfile extracts the configured domain, port, and client basic-auth pairs from a Caddyfile.
 func ParseCaddyfile(content string) (domain string, port int, clients []NaiveClient, err error) {
 	trimmedContent := strings.TrimSpace(content)
 	if trimmedContent == "" {
 		return "", 0, nil, errors.New("empty caddyfile content")
+	}
+	if err := validateCaddyfileTokens(trimmedContent); err != nil {
+		return "", 0, nil, err
 	}
 
 	openBraces := strings.Count(trimmedContent, "{")

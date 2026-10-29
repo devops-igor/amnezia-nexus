@@ -197,6 +197,9 @@ func (m *testMockSSHClient) RunCommand(ctx context.Context, cmd string) (string,
 		// Preflight: no UDP listener on the requested port.
 		return "", "", 0, nil
 	}
+	if strings.Contains(cmd, "docker inspect") && strings.Contains(cmd, ".State.Running") {
+		return "true\n", "", 0, nil
+	}
 	if strings.Contains(cmd, "docker ps") {
 		// Preflight: publish filter finds no existing binding.
 		return "", "", 0, nil

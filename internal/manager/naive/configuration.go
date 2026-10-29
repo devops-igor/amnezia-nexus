@@ -35,10 +35,6 @@ func (m *NaiveManager) WriteConfiguration(ctx context.Context, server *models.Se
 	if err != nil {
 		return fmt.Errorf("download previous Caddyfile: %w", err)
 	}
-	if err := client.UploadSudoFile(ctx, NaiveCaddyfilePath, []byte(content), 0600); err != nil {
-		return fmt.Errorf("upload Caddyfile: %w", err)
-	}
-
 	reload := func(ctx context.Context) error {
 		cmd := fmt.Sprintf("docker exec %s caddy reload --config /etc/caddy/Caddyfile", ssh.EscapeShellArg(NaiveContainerName))
 		_, errOut, code, err := client.RunSudoCommand(ctx, cmd)
@@ -50,17 +46,24 @@ func (m *NaiveManager) WriteConfiguration(ctx context.Context, server *models.Se
 		}
 		return nil
 	}
-
-	if err := reload(ctx); err != nil {
+	rollback := func(applyErr error) error {
 		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		if restoreErr := client.UploadSudoFile(rollbackCtx, NaiveCaddyfilePath, previous, 0600); restoreErr != nil {
-			return errors.Join(err, fmt.Errorf("restore previous Caddyfile: %w", restoreErr))
+			return errors.Join(applyErr, fmt.Errorf("restore previous Caddyfile: %w", restoreErr))
 		}
 		if recoveryErr := reload(rollbackCtx); recoveryErr != nil {
-			return errors.Join(err, fmt.Errorf("reload caddy with previous Caddyfile: %w", recoveryErr))
+			return errors.Join(applyErr, fmt.Errorf("reload caddy with previous Caddyfile: %w", recoveryErr))
 		}
-		return err
+		return applyErr
+	}
+
+	// An upload error can occur after the remote move committed, so always compensate.
+	if err := client.UploadSudoFile(ctx, NaiveCaddyfilePath, []byte(content), 0600); err != nil {
+		return rollback(fmt.Errorf("upload Caddyfile: %w", err))
+	}
+	if err := reload(ctx); err != nil {
+		return rollback(err)
 	}
 	return nil
 }

@@ -81,6 +81,9 @@ func newConfigApplyMock(path, initialContent, applyMarker string, failFirstApply
 				return "", "forced apply failure", 1, errors.New("forced apply failure")
 			}
 		}
+		if strings.Contains(cmd, "docker inspect") {
+			return "true\n", "", 0, nil
+		}
 		return "", "", 0, nil
 	}
 	return state
@@ -180,6 +183,25 @@ func TestSaveServerConfigHandlerRejectsInvalidXrayWithoutRemoteChanges(t *testin
 	}
 }
 
+func TestSaveServerConfigHandlerRejectsInvalidRealityKeyWithoutRemoteChanges(t *testing.T) {
+	const original = `{"inbounds":[],"outbounds":[]}`
+	remote := newConfigApplyMock(xray.XrayConfigPath, original, "docker restart", false)
+	router, serverID := setupServerConfigHandlerTest(t, remote.client)
+	invalid := `{"inbounds":[{"port":443,"protocol":"vless","streamSettings":{` +
+		`"security":"reality","realitySettings":{"privateKey":"not-a-valid-key"}}}],"outbounds":[]}`
+
+	w := performServerConfigSave(t, router, serverID, models.ProtocolVLESS, invalid)
+
+	assertServerConfigResponse(t, w, http.StatusBadRequest, "validation_failed")
+	if remote.uploads != 0 || remote.downloads != 0 || remote.applies != 0 {
+		t.Errorf("invalid REALITY key caused remote operations: uploads=%d downloads=%d restarts=%d",
+			remote.uploads, remote.downloads, remote.applies)
+	}
+	if got := string(remote.files[xray.XrayConfigPath]); got != original {
+		t.Errorf("config changed to %q, want original %q", got, original)
+	}
+}
+
 func TestSaveServerConfigHandlerXrayRestartFailureRollsBack(t *testing.T) {
 	const original = `{"inbounds":[{"port":443}],"outbounds":[]}`
 	remote := newConfigApplyMock(xray.XrayConfigPath, original, "docker restart", true)
@@ -196,6 +218,44 @@ func TestSaveServerConfigHandlerXrayRestartFailureRollsBack(t *testing.T) {
 	}
 	if got := string(remote.files[xray.XrayConfigPath]); got != original {
 		t.Errorf("rolled-back config = %q, want original %q", got, original)
+	}
+}
+
+func TestSaveServerConfigHandlerXrayStoppedContainerRollsBack(t *testing.T) {
+	const original = `{"inbounds":[{"port":443}],"outbounds":[]}`
+	remote := newConfigApplyMock(xray.XrayConfigPath, original, "docker restart", false)
+	router, serverID := setupServerConfigHandlerTest(t, remote.client)
+	running := true
+	baseCmd := remote.client.cmdFunc
+	remote.client.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "docker restart") {
+			remote.applies++
+			running = remote.applies > 1
+			return "amnezia-xray", "", 0, nil
+		}
+		if strings.Contains(cmd, "docker inspect") {
+			if running {
+				return "true\n", "", 0, nil
+			}
+			return "false\n", "", 0, nil
+		}
+		return baseCmd(ctx, cmd)
+	}
+
+	w := performServerConfigSave(t, router, serverID, models.ProtocolVLESS, testXrayConfig)
+
+	assertServerConfigResponse(t, w, http.StatusInternalServerError, "apply_failed")
+	if remote.applies != 2 {
+		t.Errorf("xray restarts = %d, want crashed apply plus recovery", remote.applies)
+	}
+	if remote.uploads != 2 {
+		t.Errorf("uploads = %d, want new config plus rollback", remote.uploads)
+	}
+	if got := string(remote.files[xray.XrayConfigPath]); got != original {
+		t.Errorf("rolled-back config = %q, want original %q", got, original)
+	}
+	if !running {
+		t.Error("xray container was not running after recovery restart")
 	}
 }
 
@@ -234,6 +294,23 @@ func TestSaveServerConfigHandlerRejectsInvalidCaddyfileWithoutRemoteChanges(t *t
 	}
 }
 
+func TestSaveServerConfigHandlerRejectsUnterminatedCaddyfileQuote(t *testing.T) {
+	remote := newConfigApplyMock(naive.NaiveCaddyfilePath, testNaiveConfig, "caddy reload", false)
+	router, serverID := setupServerConfigHandlerTest(t, remote.client)
+	invalid := strings.Replace(testNaiveConfig, "root * /srv", `root * "/srv`, 1)
+
+	w := performServerConfigSave(t, router, serverID, models.ProtocolNaive, invalid)
+
+	assertServerConfigResponse(t, w, http.StatusBadRequest, "validation_failed")
+	if remote.uploads != 0 || remote.downloads != 0 || remote.applies != 0 {
+		t.Errorf("unterminated quote caused remote operations: uploads=%d downloads=%d reloads=%d",
+			remote.uploads, remote.downloads, remote.applies)
+	}
+	if got := string(remote.files[naive.NaiveCaddyfilePath]); got != testNaiveConfig {
+		t.Errorf("Caddyfile changed to %q, want original %q", got, testNaiveConfig)
+	}
+}
+
 func TestSaveServerConfigHandlerCaddyReloadFailureRollsBack(t *testing.T) {
 	remote := newConfigApplyMock(naive.NaiveCaddyfilePath, testNaiveConfig, "caddy reload", true)
 	router, serverID := setupServerConfigHandlerTest(t, remote.client)
@@ -250,5 +327,63 @@ func TestSaveServerConfigHandlerCaddyReloadFailureRollsBack(t *testing.T) {
 	}
 	if got := string(remote.files[naive.NaiveCaddyfilePath]); got != testNaiveConfig {
 		t.Errorf("rolled-back Caddyfile = %q, want original %q", got, testNaiveConfig)
+	}
+}
+
+func TestSaveServerConfigHandlerUploadErrorRollsBack(t *testing.T) {
+	tests := []struct {
+		name        string
+		protocol    string
+		path        string
+		original    string
+		updated     string
+		applyMarker string
+	}{
+		{
+			name:        "xray",
+			protocol:    models.ProtocolVLESS,
+			path:        xray.XrayConfigPath,
+			original:    `{"inbounds":[{"port":443}],"outbounds":[]}`,
+			updated:     testXrayConfig,
+			applyMarker: "docker restart",
+		},
+		{
+			name:        "naive",
+			protocol:    models.ProtocolNaive,
+			path:        naive.NaiveCaddyfilePath,
+			original:    testNaiveConfig,
+			updated:     strings.Replace(testNaiveConfig, "naive.example.com", "new.example.com", 1),
+			applyMarker: "caddy reload",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			remote := newConfigApplyMock(tt.path, tt.original, tt.applyMarker, false)
+			router, serverID := setupServerConfigHandlerTest(t, remote.client)
+			baseUpload := remote.client.uploadFn
+			remote.client.uploadFn = func(ctx context.Context, remotePath string, content []byte) error {
+				if err := baseUpload(ctx, remotePath, content); err != nil {
+					return err
+				}
+				if remote.uploads == 1 {
+					return errors.New("forced post-commit upload failure")
+				}
+				return nil
+			}
+
+			w := performServerConfigSave(t, router, serverID, tt.protocol, tt.updated)
+
+			assertServerConfigResponse(t, w, http.StatusInternalServerError, "apply_failed")
+			if remote.uploads != 2 {
+				t.Errorf("uploads = %d, want failed upload plus rollback", remote.uploads)
+			}
+			if remote.applies != 1 {
+				t.Errorf("service recovery operations = %d, want 1", remote.applies)
+			}
+			if got := string(remote.files[tt.path]); got != tt.original {
+				t.Errorf("rolled-back config = %q, want original %q", got, tt.original)
+			}
+		})
 	}
 }

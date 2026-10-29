@@ -213,11 +213,20 @@ func RenderXrayConfig(
 	return json.MarshalIndent(cfg, "", "  ")
 }
 
-// ParseXrayConfig decodes an existing config.json.
+// ParseXrayConfig decodes an existing config.json and validates REALITY private keys.
 func ParseXrayConfig(data []byte) (*XrayConfig, error) {
 	var cfg XrayConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal xray config: %w", err)
+	}
+	for i, inbound := range cfg.Inbounds {
+		stream := inbound.StreamSettings
+		if stream.Security != "reality" && stream.RealitySettings.PrivateKey == "" {
+			continue
+		}
+		if _, err := DerivePublicKey(stream.RealitySettings.PrivateKey); err != nil {
+			return nil, fmt.Errorf("validate reality private key for inbound %d: %w", i, err)
+		}
 	}
 	return &cfg, nil
 }
