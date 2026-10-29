@@ -187,7 +187,7 @@ def _ensure_protocol_installed(page: Page, server_id: int, proto: str, csrf_toke
     Checks if proto is present in server protocol inventory. If absent, provisions
     the protocol via POST /api/servers/{server_id}/install with standard parameters:
     - VLESS: port 443, server_name gateway.icloud.com, flow xtls-rprx-vision
-    - NaiveProxy: port 8443, domain proxy.example.com, decoy default
+    - NaiveProxy: port 9443, domain proxy.example.com, decoy default
     """
     server = _get_server_by_id(page, server_id)
     if server and _is_protocol_installed(server, proto):
@@ -207,10 +207,10 @@ def _ensure_protocol_installed(page: Page, server_id: int, proto: str, csrf_toke
     elif proto == "naive":
         payload = {
             "protocol": "naive",
-            "port": "8443",
+            "port": "9443",
             "naive_options": {
                 "domain": "proxy.example.com",
-                "port": "8443",
+                "port": "9443",
                 "decoy": "default",
             },
         }
@@ -896,6 +896,11 @@ def test_naive_uri_validation_oracle() -> None:
     valid_default_port = "https://bob:hunter2@proxy.example.com#DefaultPort"
     res2 = validate_naive_uri(valid_default_port, expected_name="DefaultPort")
     assert res2["port"] == 443
+
+    # Valid NaiveProxy URI with fixture port 9443
+    valid_fixture_port = "https://alice:secret-pass_123@proxy.example.com:9443#NaiveWorker"
+    res_9443 = validate_naive_uri(valid_fixture_port, expected_name="NaiveWorker")
+    assert res_9443["port"] == 9443
 
     # Valid NaiveProxy URI where fragment is the reconstructed username (H2 contract)
     reconstructed_naive = "https://alice:secret-pass_123@proxy.example.com:8443#alice"
