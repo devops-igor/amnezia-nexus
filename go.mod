@@ -6,7 +6,7 @@ toolchain go1.26.10
 
 require (
 	github.com/amnezia-vpn/amneziawg-go/v3 v3.1.20260828
-	github.com/go-chi/chi/v5 v5.2.5
+	github.com/go-chi/chi/v5 v5.4.0
 	github.com/google/uuid v1.6.0
 	github.com/pkg/sftp v1.13.10
 	github.com/quic-go/quic-go v0.64.1
@@ -24,7 +24,7 @@ require (
 require (
 	github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0 // indirect
 	github.com/google/btree v1.1.3 // indirect
-	golang.org/x/image v0.16.0 // indirect
+	golang.org/x/image v0.41.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	gvisor.dev/gvisor v0.0.0-20250610212827-59e91d9b9902
 )
