@@ -12,13 +12,13 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Union
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e.conftest import api_get, api_post
+from tests.e2e.conftest import _do_login, api_get, api_post
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,10 @@ logger = logging.getLogger(__name__)
 # ── URI Validation Helpers ──────────────────────────────────────────
 
 
-def validate_vless_uri(uri: str, expected_name: Optional[str] = None) -> Dict[str, Any]:
+def validate_vless_uri(
+    uri: str,
+    expected_name: Optional[Union[str, Iterable[str]]] = None,
+) -> Dict[str, Any]:
     """Validate a VLESS+REALITY client URI format and parameters.
 
     Expected format:
@@ -63,11 +66,14 @@ def validate_vless_uri(uri: str, expected_name: Optional[str] = None) -> Dict[st
     assert "pbk" in qs and qs["pbk"][0], f"pbk (public key) required, got: {qs.get('pbk')}"
     assert "sid" in qs and qs["sid"][0], f"sid (short ID) required, got: {qs.get('sid')}"
 
-    # Name fragment validation
+    # Name fragment validation: accept display name or reconstructed client UUID/email
     if expected_name:
+        expected_set = {expected_name} if isinstance(expected_name, str) else set(expected_name)
+        if parsed.username:
+            expected_set.add(parsed.username)
         assert (
-            parsed.fragment == expected_name
-        ), f"Expected fragment '{expected_name}', got '{parsed.fragment}'"
+            parsed.fragment in expected_set
+        ), f"Expected fragment in {expected_set}, got '{parsed.fragment}'"
 
     return {
         "uuid": parsed.username,
@@ -81,7 +87,10 @@ def validate_vless_uri(uri: str, expected_name: Optional[str] = None) -> Dict[st
     }
 
 
-def validate_naive_uri(uri: str, expected_name: Optional[str] = None) -> Dict[str, Any]:
+def validate_naive_uri(
+    uri: str,
+    expected_name: Optional[Union[str, Iterable[str]]] = None,
+) -> Dict[str, Any]:
     """Validate a NaiveProxy client URI format and basic-auth credentials.
 
     Expected format:
@@ -100,11 +109,14 @@ def validate_naive_uri(uri: str, expected_name: Optional[str] = None) -> Dict[st
     port = parsed.port or 443
     assert port > 0, f"NaiveProxy port must be positive, got: {port}"
 
-    # Name fragment validation
+    # Name fragment validation: accept display name or reconstructed basic-auth username
     if expected_name:
+        expected_set = {expected_name} if isinstance(expected_name, str) else set(expected_name)
+        if parsed.username:
+            expected_set.add(parsed.username)
         assert (
-            parsed.fragment == expected_name
-        ), f"Expected fragment '{expected_name}', got '{parsed.fragment}'"
+            parsed.fragment in expected_set
+        ), f"Expected fragment in {expected_set}, got '{parsed.fragment}'"
 
     return {
         "username": parsed.username,
@@ -113,6 +125,11 @@ def validate_naive_uri(uri: str, expected_name: Optional[str] = None) -> Dict[st
         "port": port,
         "name": parsed.fragment,
     }
+
+
+# Backwards-compatible aliases for URI assertion helpers
+assert_valid_vless_uri = validate_vless_uri
+assert_valid_naive_uri = validate_naive_uri
 
 
 # ── Portal Navigation & Inventory Helpers ───────────────────────────
@@ -187,6 +204,36 @@ def _cleanup_connection(
         )
     except Exception as exc:
         logger.warning("Failed to clean up connection %s (%s): %s", client_id, protocol, exc)
+
+
+def _verify_user_my_page(
+    page: Page,
+    base_url: str,
+    username: str,
+    expected_client_names: Optional[List[str]] = None,
+    expect_empty: bool = False,
+) -> None:
+    """Validate /my under the connection owner's session using an isolated context."""
+    browser = page.context.browser
+    if not browser:
+        return
+    user_context = browser.new_context()
+    try:
+        user_page = user_context.new_page()
+        _do_login(user_page, base_url, username, "TestPassword123!")
+        user_page.goto(f"{base_url}/my")
+        user_page.wait_for_load_state("networkidle")
+        if expect_empty:
+            empty_state = user_page.locator("#emptyState")
+            expect(empty_state).to_be_visible()
+            expect(empty_state.locator(".empty-title")).to_be_visible()
+        if expected_client_names:
+            list_container = user_page.locator("#myConnectionsList")
+            expect(list_container).to_be_visible()
+            for name in expected_client_names:
+                expect(list_container).to_contain_text(name)
+    finally:
+        user_context.close()
 
 
 # ── Test Suite 1: Client Credential Creation Flow ────────────────────
@@ -289,14 +336,13 @@ def test_multiprotocol_client_creation_flow(
             if info_grid.is_visible():
                 expect(info_grid).to_contain_text("Connections")
 
-        # 7. Verify user self-service interface (/my)
-        page.goto(f"{base_url}/my")
-        page.wait_for_load_state("networkidle")
-        list_container = page.locator("#myConnectionsList")
-        expect(list_container).to_be_visible()
-
-        for c in created_clients:
-            expect(list_container).to_contain_text(c["name"])
+        # 7. Verify user self-service interface (/my) under the connection owner's session
+        _verify_user_my_page(
+            page,
+            base_url,
+            username=test_user["username"],
+            expected_client_names=[c["name"] for c in created_clients],
+        )
 
     finally:
         for c in created_clients:
@@ -392,10 +438,12 @@ def test_multiprotocol_config_display_and_uri_export(
                 details = validate_vless_uri(config_text, expected_name=client_name)
                 assert details["flow"] == "xtls-rprx-vision"
                 assert details["uuid"]
+                assert details["uuid"].lower() == client_id.lower()
                 assert details["sni"]
             elif proto == "naive":
                 details = validate_naive_uri(config_text, expected_name=client_name)
                 assert details["username"]
+                assert details["username"] == client_id
                 assert details["password"]
                 assert details["domain"]
 
@@ -491,9 +539,12 @@ def test_multiprotocol_qr_code_modal_interaction(
             page.locator("[onclick=\"switchConfigTab('qr')\"], .config-tab:has-text('QR')").click()
             page.wait_for_selector("#panel-qr.active", state="visible")
 
-            # Verify QR code container has rendered content (canvas or img)
-            qr_canvas_or_img = page.locator("#qrCode canvas, #qrCode img")
-            expect(qr_canvas_or_img.first).to_be_visible(timeout=5000)
+            # Verify QR code container has rendered visible content (visible img or canvas)
+            qr_visible = page.locator(
+                "#qrCode img:visible, #qrCode canvas:visible, "
+                "#qrCodeContainer img:visible, #qrCodeContainer canvas:visible"
+            )
+            expect(qr_visible.first).to_be_visible(timeout=5000)
 
             # Verify QR hint element is present
             qr_hint = page.locator("#qrHint")
@@ -601,7 +652,7 @@ def test_multiprotocol_revocation_and_zero_client_state(
                 expect(empty_state).to_be_visible()
                 expect(empty_state.locator(".empty-title")).to_be_visible()
 
-        # Verify zero-client state on /my when user has no connections
+        # Verify zero-client state on /my under the connection owner's session
         user_conns_resp = api_get(page, f"/api/users/{user_id}/connections")
         user_conns = (
             user_conns_resp.get("connections", [])
@@ -609,11 +660,12 @@ def test_multiprotocol_revocation_and_zero_client_state(
             else user_conns_resp
         )
         if isinstance(user_conns, list) and len(user_conns) == 0:
-            page.goto(f"{base_url}/my")
-            page.wait_for_load_state("networkidle")
-            empty_user_state = page.locator("#emptyState")
-            expect(empty_user_state).to_be_visible()
-            expect(empty_user_state.locator(".empty-title")).to_be_visible()
+            _verify_user_my_page(
+                page,
+                base_url,
+                username=test_user["username"],
+                expect_empty=True,
+            )
 
     finally:
         for c in leftover_clients:
@@ -639,6 +691,20 @@ def test_vless_uri_validation_oracle() -> None:
     assert res["port"] == 443
     assert res["flow"] == "xtls-rprx-vision"
     assert res["sni"] == "gateway.icloud.com"
+
+    # Valid VLESS URI where fragment is the reconstructed client UUID (H2 contract)
+    reconstructed_uri = (
+        "vless://9f5b2446-2ab9-42b4-8260-2ff0d061c0de@vpn.example.com:443?"
+        "security=reality&encryption=none&pbk=1w_PubkeySecret123&headerType=none"
+        "&fp=chrome&sni=gateway.icloud.com&sid=abcdef12&type=tcp"
+        "&flow=xtls-rprx-vision#9f5b2446-2ab9-42b4-8260-2ff0d061c0de"
+    )
+    res_recon = validate_vless_uri(reconstructed_uri, expected_name="MyVlessClient")
+    assert res_recon["uuid"] == "9f5b2446-2ab9-42b4-8260-2ff0d061c0de"
+
+    # Reject mismatched fragment when neither expected_name nor UUID matches
+    with pytest.raises(AssertionError, match="Expected fragment in"):
+        validate_vless_uri(valid_uri, expected_name="DifferentClient")
 
     # Reject non-vless scheme
     with pytest.raises(AssertionError, match="URI must start with vless://"):
@@ -680,6 +746,18 @@ def test_naive_uri_validation_oracle() -> None:
     valid_default_port = "https://bob:hunter2@proxy.example.com#DefaultPort"
     res2 = validate_naive_uri(valid_default_port, expected_name="DefaultPort")
     assert res2["port"] == 443
+
+    # Valid NaiveProxy URI where fragment is the reconstructed username (H2 contract)
+    reconstructed_naive = "https://alice:secret-pass_123@proxy.example.com:8443#alice"
+    res_recon = validate_naive_uri(reconstructed_naive, expected_name="NaiveWorker")
+    assert res_recon["username"] == "alice"
+
+    # Reject mismatched fragment when neither expected_name nor username matches
+    with pytest.raises(AssertionError, match="Expected fragment in"):
+        validate_naive_uri(
+            "https://alice:secret-pass_123@proxy.example.com:8443#charlie",
+            expected_name="NaiveWorker",
+        )
 
     # Reject non-https scheme
     with pytest.raises(AssertionError, match="URI must start with https://"):
