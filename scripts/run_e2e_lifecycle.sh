@@ -174,6 +174,7 @@ if pytest "$REPO_ROOT/tests/e2e/test_auth.py" \
           "$REPO_ROOT/tests/e2e/test_users.py" \
           "$REPO_ROOT/tests/e2e/test_connections.py" \
           "$REPO_ROOT/tests/e2e/test_my_connections.py" \
+          "$REPO_ROOT/tests/e2e/test_multiprotocol_clients.py" \
           "$REPO_ROOT/tests/e2e/test_share.py" \
           "$REPO_ROOT/tests/e2e/test_servers.py" \
           "$REPO_ROOT/tests/e2e/test_vpn_diagnostics.py" \
