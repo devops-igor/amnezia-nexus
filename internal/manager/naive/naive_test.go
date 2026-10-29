@@ -380,9 +380,7 @@ func TestNaiveManager_Lifecycle(t *testing.T) {
 	}
 
 	caddyfileAfterRemove := string(mockSSH.files[NaiveCaddyfilePath])
-	if strings.Contains(caddyfileAfterRemove, "forward_proxy") {
-		t.Errorf("Caddyfile after removing last client must NOT contain forward_proxy directive:\n%s", caddyfileAfterRemove)
-	}
+	requireNoActiveProxy(t, caddyfileAfterRemove)
 
 	clientsAfterRemove, err := mgr.GetClients(ctx, server)
 	if err != nil {

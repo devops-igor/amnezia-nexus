@@ -119,6 +119,30 @@ func validateCaddyfileTokens(content string) error {
 	return nil
 }
 
+// parseSiteAddress extracts the host and port from a site header such as ":443, vpn.example.com".
+// The port defaults to 443 and the host to empty when the header does not state them.
+func parseSiteAddress(header string) (domain string, port int) {
+	port = 443
+	for _, seg := range strings.Split(header, ",") {
+		cleaned := strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(seg), "https://"), "http://")
+		if strings.HasPrefix(cleaned, ":") {
+			if p, err := strconv.Atoi(strings.TrimPrefix(cleaned, ":")); err == nil && p > 0 {
+				port = p
+			}
+		} else if host, pStr, err := net.SplitHostPort(cleaned); err == nil {
+			if host != "" {
+				domain = host
+			}
+			if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
+				port = p
+			}
+		} else if cleaned != "" {
+			domain = cleaned
+		}
+	}
+	return domain, port
+}
+
 // ParseCaddyfile extracts the configured domain, port, and client basic-auth pairs from a Caddyfile.
 func ParseCaddyfile(content string) (domain string, port int, clients []NaiveClient, err error) {
 	trimmedContent := strings.TrimSpace(content)
@@ -139,55 +163,46 @@ func ParseCaddyfile(content string) (domain string, port int, clients []NaiveCli
 	}
 
 	lines := strings.Split(trimmedContent, "\n")
-	port = 443
-	domain = ""
 	clients = []NaiveClient{}
 
+	// The managed listener is the top-level site block enclosing forward_proxy (or the first site
+	// block when forward_proxy is absent, e.g. zero clients); nested directives and other sites are ignored.
+	// shortcut: brace depth is counted per line, so braces inside quoted strings are not understood.
+	depth, forwardSite, firstSite, curSite := 0, "", "", ""
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
 		if strings.HasPrefix(trimmed, "basic_auth") {
 			parts := strings.Fields(trimmed)
 			if len(parts) < 3 {
 				return "", 0, nil, fmt.Errorf("malformed basic_auth directive: %q", trimmed)
 			}
-			clients = append(clients, NaiveClient{
-				Username: parts[1],
-				Password: parts[2],
-			})
-		} else if strings.Contains(trimmed, "{") && (strings.Contains(trimmed, ":") || strings.Contains(trimmed, ".")) {
-			header := strings.TrimSuffix(trimmed, "{")
-			header = strings.TrimSpace(header)
-			if header == "" {
-				continue
+			clients = append(clients, NaiveClient{Username: parts[1], Password: parts[2]})
+		}
+		if depth == 0 && strings.HasSuffix(trimmed, "{") {
+			curSite = strings.TrimSpace(strings.TrimSuffix(trimmed, "{"))
+			if strings.HasPrefix(curSite, "(") || strings.HasPrefix(curSite, "&(") {
+				curSite = "" // snippet or named-route definition, not a site
 			}
-			segments := strings.Split(header, ",")
-			for _, seg := range segments {
-				seg = strings.TrimSpace(seg)
-				if seg == "" {
-					continue
-				}
-				cleaned := strings.TrimPrefix(seg, "https://")
-				cleaned = strings.TrimPrefix(cleaned, "http://")
-
-				if strings.HasPrefix(cleaned, ":") {
-					pStr := strings.TrimPrefix(cleaned, ":")
-					if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
-						port = p
-					}
-				} else if host, pStr, err := net.SplitHostPort(cleaned); err == nil {
-					if host != "" {
-						domain = host
-					}
-					if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
-						port = p
-					}
-				} else if cleaned != "" {
-					domain = cleaned
-				}
+			if firstSite == "" {
+				firstSite = curSite
 			}
 		}
+		if f := strings.Fields(trimmed); depth > 0 && forwardSite == "" && len(f) > 0 && f[0] == "forward_proxy" {
+			forwardSite = curSite
+		}
+		depth += strings.Count(trimmed, "{") - strings.Count(trimmed, "}")
+		if depth <= 0 {
+			depth, curSite = 0, ""
+		}
+	}
+	if forwardSite == "" {
+		forwardSite = firstSite
 	}
 
+	domain, port = parseSiteAddress(forwardSite)
 	return domain, port, clients, nil
 }
 

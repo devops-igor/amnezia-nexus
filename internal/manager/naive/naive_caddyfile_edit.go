@@ -31,7 +31,7 @@ func insertLines(lines []string, at int, block ...string) []string {
 // addCaddyBasicAuth inserts a basic_auth line for user/pass, creating the forward_proxy block
 // (right after the route opener, so it precedes file_server) when the Caddyfile has none.
 func addCaddyBasicAuth(content, user, pass string) (string, error) {
-	lines := strings.Split(content, "\n")
+	lines := enableDisabledProxy(strings.Split(content, "\n"))
 	cred := func(indent string) string { return fmt.Sprintf("%sbasic_auth %s %s", indent, user, pass) }
 
 	lastAuth, proxyOpen, routeOpen := -1, -1, -1
@@ -64,8 +64,57 @@ func addCaddyBasicAuth(content, user, pass string) (string, error) {
 	return strings.Join(lines, "\n"), nil
 }
 
+// disabledMarker prefixes every line of a forward_proxy block that was switched off because its
+// last client was removed. Caddy treats the lines as comments, so the block (and any operator
+// options such as upstream) is kept but cannot serve as an open proxy.
+const disabledMarker = "#nexus-disabled# "
+
+func isProxyOpen(line string) bool {
+	f := strings.Fields(line)
+	return len(f) == 2 && f[0] == "forward_proxy" && f[1] == "{"
+}
+
+// proxyBlockEnd returns the index of the line closing the block opened at lines[i].
+func proxyBlockEnd(lines []string, i int) int {
+	for depth := 0; i < len(lines); i++ {
+		depth += strings.Count(lines[i], "{") - strings.Count(lines[i], "}")
+		if depth <= 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+// enableDisabledProxy restores the first disabled forward_proxy block, unless an active one exists.
+func enableDisabledProxy(lines []string) []string {
+	start := -1
+	for i, l := range lines {
+		switch t := strings.TrimSpace(l); {
+		case isProxyOpen(l):
+			return lines
+		case start < 0 && strings.HasPrefix(t, disabledMarker) && isProxyOpen(strings.TrimPrefix(t, disabledMarker)):
+			start = i
+		}
+	}
+	if start < 0 {
+		return lines
+	}
+	var plain []string
+	for _, l := range lines[start:] {
+		plain = append(plain, strings.Replace(l, disabledMarker, "", 1))
+	}
+	end := proxyBlockEnd(plain, 0)
+	if end < 0 {
+		return lines
+	}
+	out := append([]string{}, lines...)
+	copy(out[start:], plain[:end+1])
+	return out
+}
+
 // removeCaddyBasicAuth deletes basic_auth lines for user. A forward_proxy block left without any
-// credentials is removed entirely, because an auth-less forward_proxy is an open proxy.
+// credentials is disabled (commented out), because an auth-less forward_proxy is an open proxy;
+// adding a client later re-enables it with its original options.
 func removeCaddyBasicAuth(content, user string) string {
 	var lines []string
 	removed := false
@@ -81,21 +130,24 @@ func removeCaddyBasicAuth(content, user string) string {
 	}
 
 	for i := 0; i < len(lines); i++ {
-		if f := strings.Fields(lines[i]); len(f) != 2 || f[0] != "forward_proxy" || f[1] != "{" {
+		if !isProxyOpen(lines[i]) {
 			continue
 		}
-		end, hasAuth := i, false
-		for depth := 0; end < len(lines); end++ {
-			hasAuth = hasAuth || isBasicAuthLine(lines[end])
-			depth += strings.Count(lines[end], "{") - strings.Count(lines[end], "}")
-			if depth <= 0 {
-				break
-			}
+		end := proxyBlockEnd(lines, i)
+		if end < 0 {
+			continue
 		}
-		if !hasAuth && end < len(lines) {
-			lines = append(lines[:i], lines[end+1:]...)
-			i--
+		hasAuth := false
+		for _, l := range lines[i : end+1] {
+			hasAuth = hasAuth || isBasicAuthLine(l)
 		}
+		if hasAuth {
+			continue
+		}
+		for j := i; j <= end; j++ {
+			lines[j] = caddyIndent(lines[j]) + disabledMarker + strings.TrimSpace(lines[j])
+		}
+		i = end
 	}
 	return strings.Join(lines, "\n")
 }
