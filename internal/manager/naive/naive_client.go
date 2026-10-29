@@ -30,12 +30,8 @@ func (m *NaiveManager) AddClient(ctx context.Context, server *models.Server, cli
 		return nil, fmt.Errorf("download Caddyfile: %w", err)
 	}
 
-	domain, port, _, err := ParseCaddyfile(string(caddyfileBytes))
-	if err != nil {
+	if _, _, _, err := ParseCaddyfile(string(caddyfileBytes)); err != nil {
 		return nil, fmt.Errorf("parse Caddyfile: %w", err)
-	}
-	if domain == "" {
-		domain = server.Host
 	}
 
 	// 2. Generate or extract credentials
@@ -72,8 +68,13 @@ func (m *NaiveManager) AddClient(ctx context.Context, server *models.Server, cli
 	if err != nil {
 		return nil, fmt.Errorf("add client to Caddyfile: %w", err)
 	}
-	if _, _, _, err := ParseCaddyfile(updatedContent); err != nil {
+	// The endpoint comes from the updated file: a disabled proxy is re-enabled in its own site block.
+	domain, port, _, err := ParseCaddyfile(updatedContent)
+	if err != nil {
 		return nil, fmt.Errorf("validate updated Caddyfile: %w", err)
+	}
+	if domain == "" {
+		domain = server.Host
 	}
 
 	// 4. Upload updated Caddyfile

@@ -198,3 +198,61 @@ late.example.com:8080 {
 		t.Errorf("GetClientConfig = %q err=%v", cfg, err)
 	}
 }
+
+func TestNaiveManager_ZeroClientsMultiSiteEndpointSync(t *testing.T) {
+	tests := []struct {
+		name, site, wantHost string
+		wantPort             int
+		wantURI              string
+	}{
+		{"default port", ":443, vpn.example.com", "vpn.example.com", 443, "https://bob:secret-b@vpn.example.com#"},
+		{"custom port", ":8443, vpn.example.com:8443", "vpn.example.com", 8443, "https://bob:secret-b@vpn.example.com:8443#"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			caddyfile := "other.example.com:9443 {\n    respond \"ok\"\n}\n\n" + tc.site + ` {
+    route {
+        forward_proxy {
+            basic_auth alice secret-a
+            upstream https://egress.example.com:443
+            hide_ip
+        }
+        file_server
+    }
+}
+`
+			mock := newMockNaiveSSHClient()
+			mgr := NewNaiveManager(&mockNaivePool{client: mock})
+			server := &models.Server{ID: 636, Host: "198.51.100.36", SSHPort: 22}
+			ctx := context.Background()
+			mock.files[NaiveCaddyfilePath] = []byte(caddyfile)
+
+			if err := mgr.RemoveClient(ctx, server, "alice"); err != nil {
+				t.Fatalf("RemoveClient: %v", err)
+			}
+			got := string(mock.files[NaiveCaddyfilePath])
+			requireNoActiveProxy(t, got)
+			if domain, port, _, err := ParseCaddyfile(got); err != nil || domain != tc.wantHost || port != tc.wantPort {
+				t.Fatalf("disabled parse = %s:%d err=%v, want %s:%d", domain, port, err, tc.wantHost, tc.wantPort)
+			}
+
+			res, err := mgr.AddClient(ctx, server, map[string]any{"username": "bob", "password": "secret-b"})
+			if err != nil {
+				t.Fatalf("AddClient: %v", err)
+			}
+			uri, _ := res["config"].(string)
+			if !strings.HasPrefix(uri, tc.wantURI) || strings.Contains(uri, "other.example.com") {
+				t.Errorf("AddClient config = %q, want prefix %q", uri, tc.wantURI)
+			}
+			if res["domain"] != tc.wantHost || res["port"] != tc.wantPort {
+				t.Errorf("AddClient endpoint = %v:%v, want %s:%d", res["domain"], res["port"], tc.wantHost, tc.wantPort)
+			}
+			cfg, err := mgr.GetClientConfig(ctx, server, "bob")
+			if err != nil || cfg != uri {
+				t.Errorf("GetClientConfig = %q err=%v, want %q", cfg, err, uri)
+			}
+			requireContains(t, "after re-add", string(mock.files[NaiveCaddyfilePath]),
+				[]string{"upstream https://egress.example.com:443", "hide_ip", "basic_auth bob secret-b"})
+		})
+	}
+}

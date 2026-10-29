@@ -171,6 +171,9 @@ func ParseCaddyfile(content string) (domain string, port int, clients []NaiveCli
 	depth, forwardSite, firstSite, curSite := 0, "", "", ""
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(trimmed, disabledMarker); ok && depth > 0 && forwardSite == "" && isProxyOpen(rest) {
+			forwardSite = curSite // disabled forward_proxy still identifies the managed site
+		}
 		if strings.HasPrefix(trimmed, "#") {
 			continue
 		}
