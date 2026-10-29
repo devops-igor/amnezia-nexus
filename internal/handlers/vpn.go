@@ -147,10 +147,38 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 		req.Protocol = r.URL.Query().Get("protocol")
 	}
 
+	// R2-B1: Protected proxy credentials (VLESS, NaiveProxy) require Admin authorization.
+	hasCustomParams := len(req.ProtocolParams) > 0
+	hasProtectedProto := req.Protocol != "" && models.NormalizeTunnelProtocol(req.Protocol) != models.ProtocolAWG
+	if hasCustomParams || hasProtectedProto {
+		sess := h.GetSession(r)
+		if sess == nil || sess.Role != models.RoleAdmin {
+			h.JSONError(w, http.StatusForbidden, "forbidden", "forbidden: admin role required to configure protected proxy credentials")
+			return
+		}
+	}
+
 	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 45*time.Second)
 	defer cancel()
 
-	if req.Protocol == "" {
+	// R2-H1: Before inferring protocol from installed server metadata, check if a backend row
+	// already exists in the database for serverID. If it exists, re-enable using its existing
+	// persisted configuration and credentials.
+	var existingTunnel *models.BackendTunnel
+	if h.db != nil {
+		existingTunnel, _ = h.db.GetBackendTunnelByServerID(bgCtx, serverID)
+	}
+
+	if existingTunnel != nil {
+		if req.Protocol == "" {
+			req.Protocol = existingTunnel.Protocol
+		}
+		if len(req.ProtocolParams) == 0 {
+			req.ProtocolParams = existingTunnel.ProtocolParams
+		}
+	} else if req.Protocol == "" {
+		// Only when no backend row exists in the database (initial first-time enrollment)
+		// should it consult installed server metadata.
 		proto, pParams := h.resolveInstalledProxyOptions(bgCtx, serverID)
 		if proto != "" {
 			req.Protocol = proto

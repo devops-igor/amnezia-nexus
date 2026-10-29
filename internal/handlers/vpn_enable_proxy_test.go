@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"github.com/go-chi/chi/v5"
@@ -63,12 +64,23 @@ func TestVPNEnableBackendHandler_ProxyBootstrap(t *testing.T) {
 		t.Fatalf("CreateServer failed: %v", err)
 	}
 
-	// 1. Enable with JSON body specifying protocol and protocol_params (Finding R1)
 	body, _ := json.Marshal(map[string]any{
 		"protocol":        "naive",
 		"protocol_params": json.RawMessage(paramsRaw),
 	})
+
+	// R2-B1: Verify Support role cannot supply or replace protected proxy credentials
+	reqSupport := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sid), bytes.NewReader(body))
+	reqSupport = reqSupport.WithContext(middleware.WithSession(reqSupport.Context(), &models.SessionData{UserID: "support", Role: models.RoleSupport}))
+	wSupport := httptest.NewRecorder()
+	r.ServeHTTP(wSupport, reqSupport)
+	if wSupport.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for Support role with proxy body, got %d: %s", wSupport.Code, wSupport.Body.String())
+	}
+
+	// 1. Enable with JSON body specifying protocol and protocol_params (Admin authorization)
 	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sid), bytes.NewReader(body))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -82,6 +94,22 @@ func TestVPNEnableBackendHandler_ProxyBootstrap(t *testing.T) {
 	}
 	if tun.Protocol != models.ProtocolNaive {
 		t.Fatalf("expected protocol %q, got %q", models.ProtocolNaive, tun.Protocol)
+	}
+
+	// 1b. Normal no-body re-enable preserves stored backend credentials (R2-H1)
+	if err := vpnSvc.DisableBackend(ctx, sid); err != nil {
+		t.Fatalf("DisableBackend failed: %v", err)
+	}
+	reqReenable := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sid), nil)
+	reqReenable = reqReenable.WithContext(middleware.WithSession(reqReenable.Context(), &models.SessionData{UserID: "support", Role: models.RoleSupport}))
+	wReenable := httptest.NewRecorder()
+	r.ServeHTTP(wReenable, reqReenable)
+	if wReenable.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on no-body re-enable, got %d: %s", wReenable.Code, wReenable.Body.String())
+	}
+	tunReenabled, err := vpnSvc.GetTunnel(sid)
+	if err != nil || tunReenabled == nil || !tunReenabled.Enabled {
+		t.Fatalf("expected backend %d re-enabled with preserved credentials, got %+v err=%v", sid, tunReenabled, err)
 	}
 
 	// Clean up for omitted options check

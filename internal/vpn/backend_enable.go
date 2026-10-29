@@ -105,40 +105,49 @@ func (s *Service) EnableBackendWithConfig(ctx context.Context, serverID int64, o
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
-	if opt.Protocol == "" {
-		if existing, err := pool.GetTunnel(serverID); err == nil && existing != nil {
-			if p := models.NormalizeTunnelProtocol(existing.Protocol); p != models.ProtocolAWG {
-				opt.Protocol = existing.Protocol
-				opt.ProtocolParams = existing.ProtocolParams
+
+	// R2-H1: Before inferring protocol from installed server metadata, check if a backend row
+	// already exists in the database (or in-memory pool) for serverID.
+	var existingTunnel *models.BackendTunnel
+	if existingDB, err := db.GetBackendTunnelByServerID(ctx, serverID); err == nil && existingDB != nil {
+		existingTunnel = existingDB
+	} else if existing, err := pool.GetTunnel(serverID); err == nil && existing != nil {
+		existingTunnel = existing
+	}
+
+	if existingTunnel != nil {
+		if opt.Protocol == "" {
+			if p := models.NormalizeTunnelProtocol(existingTunnel.Protocol); p != models.ProtocolAWG {
+				opt.Protocol = existingTunnel.Protocol
+				opt.ProtocolParams = existingTunnel.ProtocolParams
 			}
-		} else if existingDB, err := db.GetBackendTunnelByServerID(ctx, serverID); err == nil && existingDB != nil {
-			if p := models.NormalizeTunnelProtocol(existingDB.Protocol); p != models.ProtocolAWG {
-				opt.Protocol = existingDB.Protocol
-				opt.ProtocolParams = existingDB.ProtocolParams
+		} else if len(opt.ProtocolParams) == 0 {
+			if models.NormalizeTunnelProtocol(opt.Protocol) == models.NormalizeTunnelProtocol(existingTunnel.Protocol) && len(existingTunnel.ProtocolParams) > 0 {
+				opt.ProtocolParams = existingTunnel.ProtocolParams
 			}
-		} else if server != nil && server.Protocols != nil {
-			// Finding R1: If AWG is not installed but a proxy protocol is installed,
-			// resolve and pass the installed proxy protocol options instead of hardcoded AWG fallback.
-			hasAWG := false
-			if awgInfo, ok := server.Protocols["awg"].(map[string]any); ok {
-				if inst, _ := awgInfo["installed"].(bool); inst {
-					hasAWG = true
-				} else if pub, _ := awgInfo["public_key"].(string); pub != "" {
-					hasAWG = true
-				}
+		}
+	} else if opt.Protocol == "" && server != nil && server.Protocols != nil {
+		// Only when no backend row exists in the database (initial first-time enrollment)
+		// should it consult installed server metadata.
+		hasAWG := false
+		if awgInfo, ok := server.Protocols["awg"].(map[string]any); ok {
+			if inst, _ := awgInfo["installed"].(bool); inst {
+				hasAWG = true
+			} else if pub, _ := awgInfo["public_key"].(string); pub != "" {
+				hasAWG = true
 			}
-			if !hasAWG {
-				for _, p := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
-					if pInfo, ok := server.Protocols[p].(map[string]any); ok {
-						if inst, _ := pInfo["installed"].(bool); inst {
-							opt.Protocol = p
-							if pBytes, ok := pInfo["params"].(map[string]any); ok {
-								opt.ProtocolParams, _ = json.Marshal(pBytes)
-							} else if pRaw, ok := pInfo["protocol_params"].(map[string]any); ok {
-								opt.ProtocolParams, _ = json.Marshal(pRaw)
-							}
-							break
+		}
+		if !hasAWG {
+			for _, p := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
+				if pInfo, ok := server.Protocols[p].(map[string]any); ok {
+					if inst, _ := pInfo["installed"].(bool); inst {
+						opt.Protocol = p
+						if pBytes, ok := pInfo["params"].(map[string]any); ok {
+							opt.ProtocolParams, _ = json.Marshal(pBytes)
+						} else if pRaw, ok := pInfo["protocol_params"].(map[string]any); ok {
+							opt.ProtocolParams, _ = json.Marshal(pRaw)
 						}
+						break
 					}
 				}
 			}
