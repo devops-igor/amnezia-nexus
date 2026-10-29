@@ -119,12 +119,17 @@
                 }
             }
 
-            if (typeof window !== 'undefined' && !url.includes('/api/auth/login') && window.location.pathname !== '/login') {
-                window.location.href = '/login';
-                const err = new Error('Session expired');
-                err.status = res.status;
-                throw err;
+            // 401: Unauthenticated -> session expired, redirect to /login
+            if (res.status === 401) {
+                if (typeof window !== 'undefined' && !url.includes('/api/auth/login') && window.location.pathname !== '/login') {
+                    window.location.href = '/login';
+                    const err = new Error('Session expired');
+                    err.status = 401;
+                    throw err;
+                }
             }
+            // 403: Forbidden / Permission Denied / WAF Rejection -> do NOT redirect to /login.
+            // Handled below via standard response parsing so real rejection details are surfaced.
         }
 
         let data;
@@ -143,7 +148,7 @@
                     } catch (_) {
                         const match = text.match(/<title>([^<]+)<\/title>/i);
                         const errorMsg = match ? match[1].trim() : text.substring(0, 200).trim();
-                        data = { error: errorMsg || `HTTP ${res.status}: ${res.statusText}` };
+                        data = { error: errorMsg || (res.statusText ? `HTTP ${res.status}: ${res.statusText}` : (res.status === 403 ? 'Forbidden' : `HTTP ${res.status}`)) };
                     }
                 }
             } catch (e) {
@@ -152,7 +157,8 @@
         }
 
         if (!res.ok) {
-            const errorMsg = (data && (data.error || data.message)) || `HTTP ${res.status}: ${res.statusText}`;
+            const errorMsg = (data && (data.detail || data.error || data.message)) ||
+                (res.statusText ? `HTTP ${res.status}: ${res.statusText}` : (res.status === 403 ? 'Forbidden' : `HTTP ${res.status}`));
             if (!options.silent) {
                 notifyError(errorMsg);
             }

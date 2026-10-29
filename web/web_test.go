@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"strings"
 	"testing"
@@ -625,5 +626,145 @@ func TestMyConnections_OfflineServerGuardrails(t *testing.T) {
 	usersStr := string(usersData)
 	if !strings.Contains(usersStr, `(Offline)`) {
 		t.Errorf("users.html missing (Offline) annotation for offline servers")
+	}
+}
+
+func TestAPIClient401Vs403Handling(t *testing.T) {
+	staticFS, err := GetStaticSubFS()
+	if err != nil {
+		t.Fatalf("GetStaticSubFS failed: %v", err)
+	}
+
+	apiData, err := fs.ReadFile(staticFS, "js/api.js")
+	if err != nil {
+		t.Fatalf("failed to read js/api.js: %v", err)
+	}
+	apiStr := string(apiData)
+
+	// 1. Static assertions
+	if !strings.Contains(apiStr, "if (res.status === 401)") {
+		t.Errorf("api.js must explicitly check for 401 before session expiry redirect")
+	}
+
+	nodePath := requireJSDOM(t)
+
+	var sb strings.Builder
+	sb.WriteString(jsdomBootstrapSnippet)
+	sb.WriteString(fmt.Sprintf(`
+(async () => {
+    const assert = require('assert');
+    const dom = new JSDOM('<!DOCTYPE html><html><head><meta name="csrf-token" content="test-token"></head><body></body></html>', {
+        url: 'https://vpn.example.com/servers',
+        runScripts: 'outside-only',
+    });
+    const w = dom.window;
+
+    const sym = Object.getOwnPropertySymbols(w.location)[0];
+    const locationImpl = w.location[sym];
+    let navTarget = null;
+    locationImpl._locationObjectSetterNavigate = (url) => {
+        navTarget = url;
+    };
+
+    // Load api.js into JSDOM window
+    const apiCode = %q;
+    w.eval(apiCode);
+    const API = w.API;
+    assert(API, 'API module must be exported on window');
+
+    // Test 1: 401 Unauthorized -> redirects to /login with 'Session expired'
+    navTarget = null;
+    w.fetch = async () => ({
+        status: 401,
+        ok: false,
+        headers: { get: () => 'application/json' },
+        clone: () => ({ json: async () => ({}) }),
+        json: async () => ({ error: 'unauthorized' }),
+    });
+
+    let caught401 = null;
+    try {
+        await API.post('/api/servers/add', {});
+    } catch (err) {
+        caught401 = err;
+    }
+    assert(caught401, '401 request must reject');
+    assert.strictEqual(caught401.message, 'Session expired', '401 error message must be "Session expired"');
+    assert(navTarget && navTarget.path && navTarget.path[0] === 'login', '401 must redirect to /login');
+
+    // Test 2: 403 Forbidden with detail -> do NOT redirect to /login, throw real detail
+    navTarget = null;
+    w.fetch = async () => ({
+        status: 403,
+        ok: false,
+        headers: { get: () => 'application/json' },
+        clone: () => ({ json: async () => ({}) }),
+        json: async () => ({ error: 'forbidden', detail: 'CSRF token mismatch or missing' }),
+    });
+
+    let caught403 = null;
+    try {
+        await API.post('/api/servers/add', {});
+    } catch (err) {
+        caught403 = err;
+    }
+    assert(caught403, '403 request must reject');
+    assert.strictEqual(navTarget, null, '403 must NOT redirect to /login');
+    assert.strictEqual(caught403.message, 'CSRF token mismatch or missing', '403 error message must be detail');
+    assert.strictEqual(caught403.status, 403, '403 error status must be 403');
+
+    // Test 3: 403 Forbidden from WAF (empty body) -> do NOT redirect to /login, throw Forbidden
+    navTarget = null;
+    w.fetch = async () => ({
+        status: 403,
+        ok: false,
+        headers: { get: () => '' },
+        clone: () => ({ json: async () => { throw new Error('empty'); } }),
+        text: async () => '',
+    });
+
+    let caughtWAF = null;
+    try {
+        await API.post('/api/servers/add', {});
+    } catch (err) {
+        caughtWAF = err;
+    }
+    assert(caughtWAF, 'WAF 403 request must reject');
+    assert.strictEqual(navTarget, null, 'WAF 403 must NOT redirect to /login');
+    assert.strictEqual(caughtWAF.message, 'Forbidden', 'WAF 403 empty body must report Forbidden');
+    assert.strictEqual(caughtWAF.status, 403, 'WAF 403 error status must be 403');
+
+    // Test 4: 403 with password_change_required -> redirects to /change-password?forced=1
+    navTarget = null;
+    w.fetch = async () => ({
+        status: 403,
+        ok: false,
+        headers: { get: () => 'application/json' },
+        clone: () => ({ json: async () => ({ password_change_required: true }) }),
+        json: async () => ({ password_change_required: true }),
+    });
+
+    let caughtPwChange = null;
+    try {
+        await API.post('/api/servers/add', {});
+    } catch (err) {
+        caughtPwChange = err;
+    }
+    assert(caughtPwChange, 'password change required must reject');
+    assert(navTarget && navTarget.path && navTarget.path[0] === 'change-password', 'password change required must redirect to /change-password');
+    assert.strictEqual(caughtPwChange.message, 'Password change required');
+
+    console.log('JSDOM_401_403_TEST_SUCCESS');
+    process.exit(0);
+})();
+`, apiStr))
+
+	testScript := sb.String()
+	out, err := execNodeScript(nodePath, testScript)
+	if err != nil {
+		t.Fatalf("JSDOM execution failed: %v\nOutput:\n%s", err, string(out))
+	}
+	if !strings.Contains(string(out), "JSDOM_401_403_TEST_SUCCESS") {
+		t.Fatalf("JSDOM test did not report success. Output:\n%s", string(out))
 	}
 }
