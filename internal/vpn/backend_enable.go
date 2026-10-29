@@ -126,29 +126,22 @@ func (s *Service) EnableBackendWithConfig(ctx context.Context, serverID int64, o
 				opt.ProtocolParams = existingTunnel.ProtocolParams
 			}
 		}
-	} else if opt.Protocol == "" && server != nil && server.Protocols != nil {
+	} else if server != nil && server.Protocols != nil {
 		// Only when no backend row exists in the database (initial first-time enrollment)
 		// should it consult installed server metadata.
-		hasAWG := false
-		if awgInfo, ok := server.Protocols["awg"].(map[string]any); ok {
-			if inst, _ := awgInfo["installed"].(bool); inst {
-				hasAWG = true
-			} else if pub, _ := awgInfo["public_key"].(string); pub != "" {
-				hasAWG = true
+		if opt.Protocol == "" {
+			p, params, _ := ResolveServerProxyProtocol(server)
+			if p != "" {
+				opt.Protocol = p
+				if len(opt.ProtocolParams) == 0 {
+					opt.ProtocolParams = params
+				}
 			}
-		}
-		if !hasAWG {
-			for _, p := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
-				if pInfo, ok := server.Protocols[p].(map[string]any); ok {
-					if inst, _ := pInfo["installed"].(bool); inst {
-						opt.Protocol = p
-						if pBytes, ok := pInfo["params"].(map[string]any); ok {
-							opt.ProtocolParams, _ = json.Marshal(pBytes)
-						} else if pRaw, ok := pInfo["protocol_params"].(map[string]any); ok {
-							opt.ProtocolParams, _ = json.Marshal(pRaw)
-						}
-						break
-					}
+		} else if len(opt.ProtocolParams) == 0 {
+			proto := models.NormalizeTunnelProtocol(opt.Protocol)
+			if proto != models.ProtocolAWG {
+				if params, err := DeriveProxyProtocolParams(server, proto); err == nil && len(params) > 0 {
+					opt.ProtocolParams = params
 				}
 			}
 		}
@@ -169,6 +162,10 @@ func (s *Service) EnableBackendWithConfig(ctx context.Context, serverID int64, o
 				port = int(pVal)
 			} else if pVal, ok := info["port"].(int); ok && pVal > 0 {
 				port = pVal
+			} else if pStr, ok := info["port"].(string); ok && pStr != "" {
+				if pInt, err := strconv.Atoi(pStr); err == nil && pInt > 0 {
+					port = pInt
+				}
 			}
 		}
 		if port <= 0 {

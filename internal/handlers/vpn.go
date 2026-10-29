@@ -88,6 +88,83 @@ func (h *Handlers) VPNBackendsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func extractProxyParamsFromManagerResult(proto string, res map[string]any) json.RawMessage {
+	switch proto {
+	case models.ProtocolVLESS:
+		uid, _ := res["uuid"].(string)
+		if uid == "" {
+			uid, _ = res["client_id"].(string)
+		}
+		if uid == "" {
+			return nil
+		}
+		flow, _ := res["flow"].(string)
+		pubKey, _ := res["public_key"].(string)
+		shortID, _ := res["short_id"].(string)
+		serverName, _ := res["server_name"].(string)
+		if serverName == "" {
+			serverName = "gateway.icloud.com"
+		}
+		p := models.VLESSRealityParams{
+			UUID:        uid,
+			Flow:        flow,
+			PublicKey:   pubKey,
+			ShortID:     shortID,
+			ServerName:  serverName,
+			Fingerprint: "chrome",
+			Transport:   "tcp",
+		}
+		b, _ := json.Marshal(p)
+		return b
+
+	case models.ProtocolNaive:
+		username, _ := res["username"].(string)
+		if username == "" {
+			username, _ = res["client_id"].(string)
+		}
+		password, _ := res["password"].(string)
+		if username == "" || password == "" {
+			return nil
+		}
+		domain, _ := res["domain"].(string)
+		p := models.NaiveProxyParams{
+			Username: username,
+			Password: password,
+			Domain:   domain,
+			EnableH3: false,
+		}
+		// #nosec G117 -- Typed internal backend proxy credentials marshaled for encrypted persistence
+		b, _ := json.Marshal(p)
+		return b
+	}
+	return nil
+}
+
+func (h *Handlers) resolveInstalledProxyParamsForProto(ctx context.Context, srv *models.Server, proto string) json.RawMessage {
+	if srv == nil || srv.Protocols == nil {
+		return nil
+	}
+	normProto := models.NormalizeTunnelProtocol(proto)
+	pInfo, ok := srv.Protocols[normProto].(map[string]any)
+	if !ok || pInfo == nil {
+		return nil
+	}
+	// 1. Try protocol manager if available and configured
+	if h.registry != nil || h.xrayMgr != nil || h.naiveMgr != nil {
+		if protoMgr, err := h.GetProtocolManager(normProto); err == nil && protoMgr != nil {
+			clientParams := map[string]any{"name": fmt.Sprintf("vpn-backend-%d", srv.ID)}
+			if res, err := protoMgr.AddClient(ctx, srv, clientParams); err == nil && res != nil {
+				if params := extractProxyParamsFromManagerResult(normProto, res); len(params) > 0 {
+					return params
+				}
+			}
+		}
+	}
+	// 2. Auto-provision or derive from server and protocol metadata
+	params, _ := vpn.DeriveProxyProtocolParams(srv, normProto)
+	return params
+}
+
 func (h *Handlers) resolveInstalledProxyOptions(ctx context.Context, serverID int64) (string, json.RawMessage) {
 	if h.db == nil {
 		return "", nil
@@ -107,12 +184,7 @@ func (h *Handlers) resolveInstalledProxyOptions(ctx context.Context, serverID in
 	for _, p := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
 		if pInfo, ok := srv.Protocols[p].(map[string]any); ok {
 			if inst, _ := pInfo["installed"].(bool); inst {
-				var params json.RawMessage
-				if pBytes, ok := pInfo["params"].(map[string]any); ok {
-					params, _ = json.Marshal(pBytes)
-				} else if pRaw, ok := pInfo["protocol_params"].(map[string]any); ok {
-					params, _ = json.Marshal(pRaw)
-				}
+				params := h.resolveInstalledProxyParamsForProto(ctx, srv, p)
 				return p, params
 			}
 		}
@@ -184,6 +256,13 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 			req.Protocol = proto
 			if len(req.ProtocolParams) == 0 {
 				req.ProtocolParams = pParams
+			}
+		}
+	} else if len(req.ProtocolParams) == 0 {
+		normProto := models.NormalizeTunnelProtocol(req.Protocol)
+		if normProto != models.ProtocolAWG && h.db != nil {
+			if srv, err := h.db.GetServer(bgCtx, serverID); err == nil && srv != nil {
+				req.ProtocolParams = h.resolveInstalledProxyParamsForProto(bgCtx, srv, normProto)
 			}
 		}
 	}

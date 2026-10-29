@@ -316,7 +316,7 @@ func TestService_EnableBackendWithConfig_ProxyBootstrapResolvesProtocol(t *testi
 			"naive": map[string]any{
 				"installed": true,
 				"port":      443,
-				"params":    naiveParams,
+				"domain":    "example.com",
 			},
 		},
 	})
@@ -345,6 +345,7 @@ func TestService_EnableBackendWithConfig_ProxyBootstrapResolvesProtocol(t *testi
 	_ = svc.DeleteBackend(ctx, sid)
 
 	// 2. Enabling without options resolves protocol from server.Protocols (Finding R1)
+	// and auto-provisions client credentials from standard installer metadata (no pre-existing params).
 	err = svc.EnableBackendWithConfig(ctx, sid)
 	if err != nil {
 		t.Fatalf("EnableBackendWithConfig without options failed to resolve proxy protocol: %v", err)
@@ -356,5 +357,79 @@ func TestService_EnableBackendWithConfig_ProxyBootstrapResolvesProtocol(t *testi
 	}
 	if tunAfter.Protocol != models.ProtocolNaive {
 		t.Fatalf("expected resolved protocol %q, got %q", models.ProtocolNaive, tunAfter.Protocol)
+	}
+	var provisionedNaive models.NaiveProxyParams
+	if err := json.Unmarshal(tunAfter.ProtocolParams, &provisionedNaive); err != nil {
+		t.Fatalf("failed to decode provisioned naive params: %v", err)
+	}
+	if provisionedNaive.Username == "" || provisionedNaive.Password == "" || provisionedNaive.Domain == "" {
+		t.Fatalf("expected complete provisioned naive params, got %+v", provisionedNaive)
+	}
+	dbTun, err := db.GetBackendTunnelByServerID(ctx, sid)
+	if err != nil || dbTun == nil || len(dbTun.ProtocolParams) == 0 {
+		t.Fatalf("expected encrypted protocol params persisted in db for server %d, got %+v err=%v", sid, dbTun, err)
+	}
+}
+
+func TestService_EnableBackendWithConfig_ProxyBootstrapResolvesProtocol_VLESS(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	cfg := &models.VPNConfig{
+		EnableMultiProtocolBackends: true,
+		ListenPort:                  51820,
+	}
+	svc, err := NewVPNService(db, cfg)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	t.Cleanup(func() {
+		ts, _ := svc.GetTunnels(ctx)
+		for _, tun := range ts {
+			if d := svc.GetBackendDeviceForTest(tun.ID); d != nil {
+				_ = d.Close()
+			}
+		}
+	})
+
+	sid, err := db.CreateServer(ctx, &models.Server{
+		Name:    "vless-only-server",
+		Host:    "127.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"vless": map[string]any{
+				"installed":   true,
+				"port":        443,
+				"server_name": "gateway.icloud.com",
+				"flow":        "xtls-rprx-vision",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	// Enabling without options resolves VLESS and auto-provisions client credentials from standard installer metadata.
+	err = svc.EnableBackendWithConfig(ctx, sid)
+	if err != nil {
+		t.Fatalf("EnableBackendWithConfig without options failed to resolve VLESS protocol: %v", err)
+	}
+
+	tunAfter, err := svc.GetTunnel(sid)
+	if err != nil || tunAfter == nil {
+		t.Fatalf("expected tunnel for server %d, got tun=%+v err=%v", sid, tunAfter, err)
+	}
+	if tunAfter.Protocol != models.ProtocolVLESS {
+		t.Fatalf("expected resolved protocol %q, got %q", models.ProtocolVLESS, tunAfter.Protocol)
+	}
+	var provisionedVLESS models.VLESSRealityParams
+	if err := json.Unmarshal(tunAfter.ProtocolParams, &provisionedVLESS); err != nil {
+		t.Fatalf("failed to decode provisioned vless params: %v", err)
+	}
+	if provisionedVLESS.UUID == "" || provisionedVLESS.PublicKey == "" || provisionedVLESS.ShortID == "" || provisionedVLESS.ServerName == "" {
+		t.Fatalf("expected complete provisioned vless params, got %+v", provisionedVLESS)
+	}
+	dbTun, err := db.GetBackendTunnelByServerID(ctx, sid)
+	if err != nil || dbTun == nil || len(dbTun.ProtocolParams) == 0 {
+		t.Fatalf("expected encrypted protocol params persisted in db for server %d, got %+v err=%v", sid, dbTun, err)
 	}
 }
