@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/naive"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/xray"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 )
@@ -164,6 +166,28 @@ func (h *Handlers) SaveServerConfigHandler(w http.ResponseWriter, r *http.Reques
 				h.JSONError(w, http.StatusInternalServerError, "reconcile_failed", "Failed to reconcile AWG server identity")
 			} else {
 				h.JSONError(w, http.StatusInternalServerError, "save_failed", "Failed to apply AWG configuration")
+			}
+			return
+		}
+
+		h.audit(r, "server.config_save", map[string]any{"server_id": serverID, "protocol": req.Protocol})
+		h.JSONOK(w)
+		return
+	}
+	if (req.Protocol == models.ProtocolVLESS && h.xrayMgr != nil) ||
+		(req.Protocol == models.ProtocolNaive && h.naiveMgr != nil) {
+		var saveErr error
+		switch req.Protocol {
+		case models.ProtocolVLESS:
+			saveErr = h.xrayMgr.WriteConfiguration(ctx, server, req.Config)
+		case models.ProtocolNaive:
+			saveErr = h.naiveMgr.WriteConfiguration(ctx, server, req.Config)
+		}
+		if saveErr != nil {
+			if errors.Is(saveErr, xray.ErrInvalidConfiguration) || errors.Is(saveErr, naive.ErrInvalidConfiguration) {
+				h.JSONError(w, http.StatusBadRequest, "validation_failed", saveErr.Error())
+			} else {
+				h.JSONError(w, http.StatusInternalServerError, "apply_failed", "Failed to apply config")
 			}
 			return
 		}

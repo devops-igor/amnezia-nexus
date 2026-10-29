@@ -16,6 +16,7 @@ import (
 func TestSaveServerConfigHandlerSecretPermissions(t *testing.T) {
 	mockSSH := &testMockSSHClient{}
 	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	enableRawConfigManagers(h)
 	serverID, err := db.CreateServer(context.Background(), &models.Server{
 		Name:      "secret-config-server",
 		Host:      "192.0.2.60",
@@ -37,7 +38,7 @@ func TestSaveServerConfigHandlerSecretPermissions(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.protocol, func(t *testing.T) {
-			body, err := json.Marshal(models.ServerConfigSaveRequest{Protocol: tt.protocol, Config: "raw config"})
+			body, err := json.Marshal(models.ServerConfigSaveRequest{Protocol: tt.protocol, Config: testRawConfigForProtocol(tt.protocol)})
 			if err != nil {
 				t.Fatalf("Marshal: %v", err)
 			}
