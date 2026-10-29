@@ -10,6 +10,7 @@ Validates VLESS+REALITY and NaiveProxy client connection management:
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Union
@@ -148,7 +149,104 @@ def _is_protocol_installed(server: Dict[str, Any], protocol: str) -> bool:
     """Check whether a specific protocol is installed on the given server."""
     protocols = server.get("protocols", {})
     proto_info = protocols.get(protocol, {})
-    return bool(proto_info.get("installed", False) or proto_info.get("container_running", False))
+    if isinstance(proto_info, bool):
+        return proto_info
+    if isinstance(proto_info, dict):
+        return bool(
+            proto_info.get("installed", False) or proto_info.get("container_running", False)
+        )
+    return False
+
+
+def _is_qualification_mode() -> bool:
+    """Return whether running in strict qualification / E2E test mode."""
+    return os.environ.get("E2E_TESTING", "").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+    ) or os.environ.get("E2E_REQUIRE_DATAPLANE", "").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
+def _get_server_by_id(page: Page, server_id: int) -> Optional[Dict[str, Any]]:
+    """Retrieve server data by ID from the /api/servers endpoint."""
+    result = api_get(page, "/api/servers")
+    servers = result if isinstance(result, list) else result.get("servers", [])
+    for s in servers:
+        if s.get("id") == server_id:
+            return s
+    return None
+
+
+def _ensure_protocol_installed(page: Page, server_id: int, proto: str, csrf_token: str) -> bool:
+    """Ensure that the requested protocol is installed on the target server.
+
+    Checks if proto is present in server protocol inventory. If absent, provisions
+    the protocol via POST /api/servers/{server_id}/install with standard parameters:
+    - VLESS: port 443, server_name gateway.icloud.com, flow xtls-rprx-vision
+    - NaiveProxy: port 8443, domain proxy.example.com, decoy default
+    """
+    server = _get_server_by_id(page, server_id)
+    if server and _is_protocol_installed(server, proto):
+        return True
+
+    payload: Dict[str, Any]
+    if proto == "vless":
+        payload = {
+            "protocol": "vless",
+            "port": "443",
+            "vless_options": {
+                "server_name": "gateway.icloud.com",
+                "port": "443",
+                "flow": "xtls-rprx-vision",
+            },
+        }
+    elif proto == "naive":
+        payload = {
+            "protocol": "naive",
+            "port": "8443",
+            "naive_options": {
+                "domain": "proxy.example.com",
+                "port": "8443",
+                "decoy": "default",
+            },
+        }
+    else:
+        raise ValueError(f"Unsupported protocol for auto-provisioning: {proto}")
+
+    install_res = api_post(
+        page,
+        f"/api/servers/{server_id}/install",
+        payload,
+        csrf_token,
+        timeout=120_000,
+    )
+    status = install_res.get("status")
+    assert status in (200, 201), (
+        f"Failed to auto-provision {proto} on server {server_id}: "
+        f"status={status}, response={install_res}"
+    )
+
+    # Validate installed status in server inventory
+    updated = _get_server_by_id(page, server_id)
+    if updated and _is_protocol_installed(updated, proto):
+        return True
+
+    # Allow a short poll window if remote state sync is in-flight
+    for _ in range(5):
+        time.sleep(1)
+        updated = _get_server_by_id(page, server_id)
+        if updated and _is_protocol_installed(updated, proto):
+            return True
+
+    if _is_qualification_mode():
+        assert updated and _is_protocol_installed(
+            updated, proto
+        ), f"Protocol {proto} not reported as installed on server {server_id} after install"
+    return True
 
 
 def _find_or_create_user(
@@ -254,14 +352,27 @@ def test_multiprotocol_client_creation_flow(
     page = authenticated_page
     server = _get_target_server(page)
     if not server:
+        if _is_qualification_mode():
+            pytest.fail("No servers available for multi-protocol client test in qualification mode")
         pytest.skip("No servers available for multi-protocol client test")
     assert server is not None
 
     server_id = server["id"]
+    for proto in ("vless", "naive"):
+        _ensure_protocol_installed(page, server_id, proto, csrf_token)
+
+    server = _get_server_by_id(page, server_id) or server
     installed_protos: List[str] = [
         p for p in ("vless", "naive") if _is_protocol_installed(server, p)
     ]
-    if not installed_protos:
+    if _is_qualification_mode():
+        assert (
+            "vless" in installed_protos
+        ), f"VLESS protocol must be installed on server {server_id} in qualification mode"
+        assert (
+            "naive" in installed_protos
+        ), f"NaiveProxy protocol must be installed on server {server_id} in qualification mode"
+    elif not installed_protos:
         pytest.skip(
             f"Neither VLESS nor NaiveProxy installed on server {server_id} "
             "(server installation owned by #643)"
@@ -367,14 +478,27 @@ def test_multiprotocol_config_display_and_uri_export(
     page = authenticated_page
     server = _get_target_server(page)
     if not server:
+        if _is_qualification_mode():
+            pytest.fail("No servers available for URI export test in qualification mode")
         pytest.skip("No servers available for URI export test")
     assert server is not None
 
     server_id = server["id"]
+    for proto in ("vless", "naive"):
+        _ensure_protocol_installed(page, server_id, proto, csrf_token)
+
+    server = _get_server_by_id(page, server_id) or server
     installed_protos: List[str] = [
         p for p in ("vless", "naive") if _is_protocol_installed(server, p)
     ]
-    if not installed_protos:
+    if _is_qualification_mode():
+        assert (
+            "vless" in installed_protos
+        ), f"VLESS protocol must be installed on server {server_id} in qualification mode"
+        assert (
+            "naive" in installed_protos
+        ), f"NaiveProxy protocol must be installed on server {server_id} in qualification mode"
+    elif not installed_protos:
         pytest.skip(
             f"Neither VLESS nor NaiveProxy installed on server {server_id} "
             "(server installation owned by #643)"
@@ -483,14 +607,27 @@ def test_multiprotocol_qr_code_modal_interaction(
     page = authenticated_page
     server = _get_target_server(page)
     if not server:
+        if _is_qualification_mode():
+            pytest.fail("No servers available for QR code modal test in qualification mode")
         pytest.skip("No servers available for QR code modal test")
     assert server is not None
 
     server_id = server["id"]
+    for proto in ("vless", "naive"):
+        _ensure_protocol_installed(page, server_id, proto, csrf_token)
+
+    server = _get_server_by_id(page, server_id) or server
     installed_protos: List[str] = [
         p for p in ("vless", "naive") if _is_protocol_installed(server, p)
     ]
-    if not installed_protos:
+    if _is_qualification_mode():
+        assert (
+            "vless" in installed_protos
+        ), f"VLESS protocol must be installed on server {server_id} in qualification mode"
+        assert (
+            "naive" in installed_protos
+        ), f"NaiveProxy protocol must be installed on server {server_id} in qualification mode"
+    elif not installed_protos:
         pytest.skip(
             f"Neither VLESS nor NaiveProxy installed on server {server_id} "
             "(server installation owned by #643)"
@@ -583,14 +720,27 @@ def test_multiprotocol_revocation_and_zero_client_state(
     page = authenticated_page
     server = _get_target_server(page)
     if not server:
+        if _is_qualification_mode():
+            pytest.fail("No servers available for revocation test in qualification mode")
         pytest.skip("No servers available for revocation test")
     assert server is not None
 
     server_id = server["id"]
+    for proto in ("vless", "naive"):
+        _ensure_protocol_installed(page, server_id, proto, csrf_token)
+
+    server = _get_server_by_id(page, server_id) or server
     installed_protos: List[str] = [
         p for p in ("vless", "naive") if _is_protocol_installed(server, p)
     ]
-    if not installed_protos:
+    if _is_qualification_mode():
+        assert (
+            "vless" in installed_protos
+        ), f"VLESS protocol must be installed on server {server_id} in qualification mode"
+        assert (
+            "naive" in installed_protos
+        ), f"NaiveProxy protocol must be installed on server {server_id} in qualification mode"
+    elif not installed_protos:
         pytest.skip(
             f"Neither VLESS nor NaiveProxy installed on server {server_id} "
             "(server installation owned by #643)"
@@ -766,3 +916,50 @@ def test_naive_uri_validation_oracle() -> None:
     # Reject missing password / basic auth
     with pytest.raises(AssertionError, match="basic-auth password"):
         validate_naive_uri("https://bob@proxy.example.com#MissingPass")
+
+
+def test_ensure_protocol_provisioning_and_qualification_oracle() -> None:
+    """Oracle test: verify protocol provisioning check logic and qualification mode."""
+    # 1. Qualification mode detection
+    orig_testing = os.environ.get("E2E_TESTING")
+    orig_dataplane = os.environ.get("E2E_REQUIRE_DATAPLANE")
+    try:
+        os.environ["E2E_TESTING"] = "true"
+        os.environ.pop("E2E_REQUIRE_DATAPLANE", None)
+        assert _is_qualification_mode() is True
+
+        os.environ["E2E_TESTING"] = "false"
+        os.environ["E2E_REQUIRE_DATAPLANE"] = "true"
+        assert _is_qualification_mode() is True
+
+        os.environ["E2E_TESTING"] = "false"
+        os.environ["E2E_REQUIRE_DATAPLANE"] = "false"
+        assert _is_qualification_mode() is False
+    finally:
+        if orig_testing is not None:
+            os.environ["E2E_TESTING"] = orig_testing
+        else:
+            os.environ.pop("E2E_TESTING", None)
+        if orig_dataplane is not None:
+            os.environ["E2E_REQUIRE_DATAPLANE"] = orig_dataplane
+        else:
+            os.environ.pop("E2E_REQUIRE_DATAPLANE", None)
+
+    # 2. Installed protocol check logic (AWG-only vs dual-protocol)
+    awg_server: Dict[str, Any] = {
+        "id": 1,
+        "protocols": {"awg": {"installed": True, "container_running": True}},
+    }
+    assert _is_protocol_installed(awg_server, "awg") is True
+    assert _is_protocol_installed(awg_server, "vless") is False
+    assert _is_protocol_installed(awg_server, "naive") is False
+
+    dual_server: Dict[str, Any] = {
+        "id": 1,
+        "protocols": {
+            "vless": {"installed": True},
+            "naive": {"container_running": True},
+        },
+    }
+    assert _is_protocol_installed(dual_server, "vless") is True
+    assert _is_protocol_installed(dual_server, "naive") is True
