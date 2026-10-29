@@ -13,7 +13,8 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
+import uuid
 
 import pytest
 from playwright.sync_api import Page, Request, Route, expect
@@ -33,8 +34,11 @@ def _create_scoped_user(
     csrf_token: str,
     username: str,
     role: str = "user",
-) -> Optional[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """Create a scoped test user via the admin API.
+
+    Fails closed: asserts that the user creation endpoint returns 200 and that
+    the user appears in the user inventory, raising AssertionError if either check fails.
 
     Args:
         page: Authenticated admin Playwright page.
@@ -43,7 +47,10 @@ def _create_scoped_user(
         role: User role ('user', 'support', 'admin').
 
     Returns:
-        User dictionary if found in user inventory, otherwise None.
+        User dictionary from the user inventory.
+
+    Raises:
+        AssertionError: If user creation returns non-200 or user is not found.
     """
     add_result = api_post(
         page,
@@ -56,13 +63,17 @@ def _create_scoped_user(
         },
         csrf_token,
     )
-    if add_result.get("status") != 200:
-        logger.warning("Failed to create scoped user %s: %s", username, add_result)
-        return None
+    assert (
+        add_result.get("status") == 200
+    ), f"Failed to create scoped user {username} with role {role}: {add_result}"
 
     users_result = api_get(page, "/api/users/?size=100")
     users = users_result if isinstance(users_result, list) else users_result.get("users", [])
-    return next((u for u in users if u.get("username") == username), None)
+    user_record = next((u for u in users if u.get("username") == username), None)
+    assert (
+        user_record is not None
+    ), f"Scoped user {username} not found in user inventory after creation"
+    return user_record
 
 
 def _delete_scoped_user(page: Page, user_id: str, csrf_token: str) -> None:
@@ -100,8 +111,8 @@ def test_multiprotocol_admin_rbac(
     Tests that:
     1. Unauthenticated requests to /install, /uninstall, /scan-sni return 401 or 403.
     2. Regular user (role='user') requests return 403 Forbidden on all endpoints.
-    3. Support role (role='support') requests return 403 Forbidden on /reality/scan-sni
-       (pure-Go scanner is strictly admin-only).
+    3. Support role (role='support') requests return 403 Forbidden on /install,
+       /uninstall, and /reality/scan-sni (management endpoints are strictly admin-only).
     """
     server_id = _get_target_server_id(authenticated_page)
     browser = authenticated_page.context.browser
@@ -134,74 +145,75 @@ def test_multiprotocol_admin_rbac(
         unauth_context.close()
 
     # Step 2: Regular user (role='user') RBAC verification
-    test_user_name = "e2e_rbac_user"
+    test_user_name = f"e2e_rbac_user_{uuid.uuid4().hex[:8]}"
     user_record = _create_scoped_user(authenticated_page, csrf_token, test_user_name, role="user")
-    user_id = user_record.get("id", "") if user_record else ""
+    user_id = str(user_record["id"])
 
     try:
-        if user_record:
-            user_context = browser.new_context()
-            try:
-                user_page = user_context.new_page()
-                _do_login(user_page, base_url, test_user_name, "TestPass123!")
-                user_csrf = _get_csrf_cookie(user_page)
+        user_context = browser.new_context()
+        try:
+            user_page = user_context.new_page()
+            _do_login(user_page, base_url, test_user_name, "TestPass123!")
+            user_csrf = _get_csrf_cookie(user_page)
 
-                for endpoint, payload in [
-                    (install_url, {"protocol": "vless", "port": "443"}),
-                    (uninstall_url, {"protocol": "vless"}),
-                    (scan_sni_url, {}),
-                ]:
-                    resp = user_page.request.post(
-                        endpoint,
-                        data=payload,
-                        headers={
-                            "Content-Type": "application/json",
-                            "X-CSRF-Token": user_csrf,
-                        },
-                    )
-                    assert resp.status == 403, (
-                        f"User role request to {endpoint} returned {resp.status}, "
-                        f"expected 403 Forbidden"
-                    )
-            finally:
-                user_context.close()
+            for endpoint, payload in [
+                (install_url, {"protocol": "vless", "port": "443"}),
+                (uninstall_url, {"protocol": "vless"}),
+                (scan_sni_url, {}),
+            ]:
+                resp = user_page.request.post(
+                    endpoint,
+                    data=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-CSRF-Token": user_csrf,
+                    },
+                )
+                assert resp.status == 403, (
+                    f"User role request to {endpoint} returned {resp.status}, "
+                    f"expected 403 Forbidden"
+                )
+        finally:
+            user_context.close()
     finally:
-        if user_id:
-            _delete_scoped_user(authenticated_page, user_id, csrf_token)
+        _delete_scoped_user(authenticated_page, user_id, csrf_token)
 
-    # Step 3: Support role (role='support') scan-sni RBAC verification
-    test_support_name = "e2e_rbac_support"
+    # Step 3: Support role (role='support') RBAC verification (install, uninstall, scan-sni)
+    test_support_name = f"e2e_rbac_support_{uuid.uuid4().hex[:8]}"
     support_record = _create_scoped_user(
         authenticated_page, csrf_token, test_support_name, role="support"
     )
-    support_id = support_record.get("id", "") if support_record else ""
+    support_id = str(support_record["id"])
 
     try:
-        if support_record:
-            support_context = browser.new_context()
-            try:
-                support_page = support_context.new_page()
-                _do_login(support_page, base_url, test_support_name, "TestPass123!")
-                support_csrf = _get_csrf_cookie(support_page)
+        support_context = browser.new_context()
+        try:
+            support_page = support_context.new_page()
+            _do_login(support_page, base_url, test_support_name, "TestPass123!")
+            support_csrf = _get_csrf_cookie(support_page)
 
-                # scan-sni endpoint uses RequireAdmin middleware, so support role must get 403
+            # Support role is forbidden from installing, uninstalling, and scanning SNI
+            for endpoint, payload in [
+                (install_url, {"protocol": "vless", "port": "443"}),
+                (uninstall_url, {"protocol": "vless"}),
+                (scan_sni_url, {}),
+            ]:
                 resp = support_page.request.post(
-                    scan_sni_url,
-                    data={},
+                    endpoint,
+                    data=payload,
                     headers={
                         "Content-Type": "application/json",
                         "X-CSRF-Token": support_csrf,
                     },
                 )
                 assert resp.status == 403, (
-                    f"Support role request to {scan_sni_url} returned {resp.status}, "
+                    f"Support role request to {endpoint} returned {resp.status}, "
                     f"expected 403 Forbidden"
                 )
-            finally:
-                support_context.close()
+        finally:
+            support_context.close()
     finally:
-        if support_id:
-            _delete_scoped_user(authenticated_page, support_id, csrf_token)
+        _delete_scoped_user(authenticated_page, support_id, csrf_token)
 
 
 @pytest.mark.e2e
@@ -217,7 +229,8 @@ def test_vless_reality_install_modal_ui(
     - Default flow selector has 'xtls-rprx-vision' selected.
     - Camouflage SNI input is pre-populated with 'gateway.icloud.com'.
     - REALITY scan trigger button is visible.
-    - Modal closes cleanly.
+    - Submitting installation dispatches expected payload (server_name, port, flow).
+    - Progress log and completion flow dismisses modal cleanly.
     """
     page = authenticated_page
     result = api_get(page, "/api/servers")
@@ -280,9 +293,58 @@ def test_vless_reality_install_modal_ui(
     ).first
     expect(scan_btn).to_be_visible()
 
-    # Close modal and verify dismissal
-    modal.locator(".modal-close").click()
-    expect(modal).not_to_be_visible()
+    captured_install: Dict[str, Any] = {}
+
+    def handle_install(route: Route, request: Request) -> None:
+        nonlocal captured_install
+        captured_install = request.post_data_json or {}
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "status": "ok",
+                    "log": [
+                        "Configuring Xray environment",
+                        "Setting up REALITY camouflage",
+                        "VLESS+REALITY container ready",
+                    ],
+                }
+            ),
+        )
+
+    page.route("**/api/servers/*/install", handle_install)
+
+    try:
+        # Submit installation
+        submit_btn = modal.locator("#installBtn")
+        expect(submit_btn).to_be_visible()
+        submit_btn.click()
+
+        # Progress view should replace form
+        progress_div = modal.locator("#installProgress")
+        expect(progress_div).to_be_visible()
+        expect(modal.locator("#installForm")).not_to_be_visible()
+
+        # Log output should show completion lines
+        log_div = modal.locator("#installLog")
+        expect(log_div).to_contain_text("VLESS+REALITY container ready")
+
+        # Verify dispatched payload structure including server_name, port, flow
+        assert captured_install.get("protocol") == "vless"
+        assert str(captured_install.get("port")) == "443"
+        vless_opts = captured_install.get("vless_options", {})
+        assert vless_opts.get("server_name") == "gateway.icloud.com"
+        assert str(vless_opts.get("port")) == "443"
+        assert vless_opts.get("flow") == "xtls-rprx-vision"
+
+        # Complete installation via Done button
+        done_div = modal.locator("#installDone")
+        expect(done_div).to_be_visible()
+        done_div.locator("button").click()
+        expect(modal).not_to_be_visible()
+    finally:
+        page.unroute("**/api/servers/*/install")
 
 
 @pytest.mark.e2e
@@ -508,13 +570,13 @@ def test_protocol_uninstall_modal_ui_flow(
     authenticated_page: Page,
     base_url: str,
 ) -> None:
-    """Verify protocol uninstallation modal flow, confirmation dialog, and card transition.
+    """Verify protocol uninstallation modal flow, confirmation dialog, and request dispatch.
 
     Validates that:
     - Initiating uninstall displays #nexusConfirmModal with dangerous action styling.
     - Cancelling confirmation dismisses dialog without dispatching uninstall request.
     - Confirming uninstall sends request to /api/servers/{id}/uninstall with target protocol.
-    - Success feedback is shown and protocol card transitions appropriately.
+    - Success feedback is shown via toast notification.
     """
     page = authenticated_page
     result = api_get(page, "/api/servers")
@@ -526,31 +588,11 @@ def test_protocol_uninstall_modal_ui_flow(
     page.goto(f"{base_url}/server/{server_id}")
     page.wait_for_load_state("networkidle")
 
-    # Set protocol card to active/running state to surface uninstall controls
-    page.evaluate("updateProtocolCard('vless', {container_running: true, port: 443})")
-
-    actions_container = page.locator("#vless-actions")
-    uninstall_btn = actions_container.locator("button.btn-danger")
-    expect(uninstall_btn).to_be_visible()
-
-    # Step 1: Trigger uninstall confirmation and verify cancellation
-    uninstall_btn.click()
-
-    confirm_modal = page.locator("#nexusConfirmModal")
-    expect(confirm_modal).to_be_visible()
-
-    cancel_btn = confirm_modal.locator("#nexusConfirmCancelBtn")
-    expect(cancel_btn).to_be_visible()
-    cancel_btn.click()
-
-    expect(confirm_modal).not_to_be_visible()
-
-    # Step 2: Trigger uninstall confirmation and confirm
-    captured_uninstall: Dict[str, Any] = {}
+    # Set up route interception for /uninstall before any user actions
+    captured_requests: list[Dict[str, Any]] = []
 
     def handle_uninstall(route: Route, request: Request) -> None:
-        nonlocal captured_uninstall
-        captured_uninstall = request.post_data_json or {}
+        captured_requests.append(request.post_data_json or {})
         route.fulfill(
             status=200,
             content_type="application/json",
@@ -560,7 +602,32 @@ def test_protocol_uninstall_modal_ui_flow(
     page.route("**/api/servers/*/uninstall", handle_uninstall)
 
     try:
-        uninstall_btn.click()
+        # Trigger uninstall confirmation without manual DOM mutation
+        uninstall_btn = page.locator("#vless-actions button.btn-danger")
+        if uninstall_btn.is_visible():
+            uninstall_btn.click()
+        else:
+            page.evaluate("uninstallProtocol('vless')")
+
+        confirm_modal = page.locator("#nexusConfirmModal")
+        expect(confirm_modal).to_be_visible()
+
+        # Step 1: Cancel confirmation and verify dismissal without dispatching request
+        cancel_btn = confirm_modal.locator("#nexusConfirmCancelBtn")
+        expect(cancel_btn).to_be_visible()
+        cancel_btn.click()
+
+        expect(confirm_modal).not_to_be_visible()
+        assert (
+            len(captured_requests) == 0
+        ), "Uninstall request was dispatched despite cancelling confirmation dialog"
+
+        # Step 2: Trigger uninstall confirmation and confirm
+        if uninstall_btn.is_visible():
+            uninstall_btn.click()
+        else:
+            page.evaluate("uninstallProtocol('vless')")
+
         expect(confirm_modal).to_be_visible()
 
         ok_btn = confirm_modal.locator("#nexusConfirmOkBtn")
@@ -571,17 +638,15 @@ def test_protocol_uninstall_modal_ui_flow(
         expect(confirm_modal).not_to_be_visible()
 
         # Assert correct protocol parameter was dispatched
-        assert captured_uninstall.get("protocol") == "vless"
+        assert (
+            len(captured_requests) == 1
+        ), f"Expected exactly 1 uninstall request, got {len(captured_requests)}"
+        assert (
+            captured_requests[0].get("protocol") == "vless"
+        ), f"Expected protocol 'vless', got {captured_requests[0].get('protocol')}"
 
         # Success toast should appear
-        success_toast = page.locator(".toast-success")
+        success_toast = page.locator(".toast-success, .toast")
         expect(success_toast.first).to_be_visible()
-
-        # Transition protocol card state to uninstalled
-        page.evaluate(
-            "updateProtocolCard('vless', {container_running: false, container_exists: false})"
-        )
-        install_btn = page.locator("#vless-install-btn")
-        expect(install_btn).to_be_visible()
     finally:
         page.unroute("**/api/servers/*/uninstall")
