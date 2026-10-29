@@ -26,10 +26,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -241,7 +241,7 @@ jobs:
             --expected-commit "${{ github.sha }}"
 
       - name: Upload Qualification Evidence Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always() && steps.qual-mode.outputs.mode != 'standard'
         with:
           name: issue392-qualification-evidence-${{ github.run_id }}

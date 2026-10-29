@@ -35,10 +35,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -79,7 +79,7 @@ jobs:
           ./scripts/run_non_netstack_client_qualification.sh --dry-run --output-dir test-artifacts
 
       - name: Upload Qualification Evidence Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: differential-qualification-evidence-${{ github.run_id }}

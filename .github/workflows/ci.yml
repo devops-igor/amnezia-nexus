@@ -22,10 +22,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -64,16 +64,16 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
           cache: true
 
       - name: Set up Node.js for JSDOM Integration Tests
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
 
@@ -89,7 +89,7 @@ jobs:
         run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
 
       - name: Upload Test Coverage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: coverage-report
@@ -107,10 +107,10 @@ jobs:
           - { os: linux, arch: arm64 }
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -125,7 +125,7 @@ jobs:
           go build -tags with_utls -trimpath -ldflags="-s -w" -o bin/panel-${{ matrix.target.os }}-${{ matrix.target.arch }} ./cmd/panel
 
       - name: Upload Binary Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: panel-${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: bin/panel-${{ matrix.target.os }}-${{ matrix.target.arch }}
