@@ -116,6 +116,32 @@ func (s *Service) EnableBackendWithConfig(ctx context.Context, serverID int64, o
 				opt.Protocol = existingDB.Protocol
 				opt.ProtocolParams = existingDB.ProtocolParams
 			}
+		} else if server != nil && server.Protocols != nil {
+			// Finding R1: If AWG is not installed but a proxy protocol is installed,
+			// resolve and pass the installed proxy protocol options instead of hardcoded AWG fallback.
+			hasAWG := false
+			if awgInfo, ok := server.Protocols["awg"].(map[string]any); ok {
+				if inst, _ := awgInfo["installed"].(bool); inst {
+					hasAWG = true
+				} else if pub, _ := awgInfo["public_key"].(string); pub != "" {
+					hasAWG = true
+				}
+			}
+			if !hasAWG {
+				for _, p := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
+					if pInfo, ok := server.Protocols[p].(map[string]any); ok {
+						if inst, _ := pInfo["installed"].(bool); inst {
+							opt.Protocol = p
+							if pBytes, ok := pInfo["params"].(map[string]any); ok {
+								opt.ProtocolParams, _ = json.Marshal(pBytes)
+							} else if pRaw, ok := pInfo["protocol_params"].(map[string]any); ok {
+								opt.ProtocolParams, _ = json.Marshal(pRaw)
+							}
+							break
+						}
+					}
+				}
+			}
 		}
 	}
 

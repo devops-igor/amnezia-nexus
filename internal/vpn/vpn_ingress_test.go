@@ -7,6 +7,7 @@ package vpn
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -17,6 +18,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 )
 
 // ingressTestPeer is one portal client seeded end-to-end for admission
@@ -435,4 +437,158 @@ func TestIngressEngineLivenessRefreshesSessionManager(t *testing.T) {
 	if !sess.LastSeen.After(stale) {
 		t.Fatalf("liveness refresh did not advance LastSeen: %s -> %s", stale, sess.LastSeen)
 	}
+}
+
+func TestEnsureBackendSessionForIngress_NaiveAdmissionExcludedForGenericClient(t *testing.T) {
+	db := setupTestDB(t)
+	svc, s1, s2, _, _ := setupTestVPNService(t, db, func(cfg *models.VPNConfig) {
+		cfg.EnableMultiProtocolBackends = true
+	})
+	ctx := t.Context()
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remove AWG backends so only Naive will be present
+	_ = svc.DeleteBackend(ctx, s1)
+	_ = svc.DeleteBackend(ctx, s2)
+
+	// Add a Naive server and tunnel
+	naiveSrv, _ := db.CreateServer(ctx, &models.Server{Name: "Naive-Node", Host: "10.0.0.9", Protocols: map[string]any{
+		"naive": map[string]any{"installed": true, "port": 443},
+	}})
+	naiveParams, _ := json.Marshal(models.NaiveProxyParams{Domain: "example.com", Username: "u", Password: "p"})
+	naiveTunID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:       naiveSrv,
+		InterfaceName:  "naive-be-1",
+		Endpoint:       "10.0.0.9:443",
+		Protocol:       models.ProtocolNaive,
+		ProtocolParams: naiveParams,
+		Enabled:        true,
+		Status:         models.TunnelStatusActive,
+		StateVersion:   1,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Generic AWG client without routing policy must be rejected (Finding R2)
+	peer := seedIngressPeer(t, db, "naive-alice", "naive-peer-aaaaaaaaaa1", "10.100.3.21")
+	o := ownershipFor(peer)
+	_, _, _, err = svc.EnsureBackendSessionForIngress(ctx, o)
+	if !errors.Is(err, loadbalancer.ErrNoActiveBackends) {
+		t.Fatalf("expected ErrNoActiveBackends for generic full-tunnel client on Naive, got: %v", err)
+	}
+
+	// 2. Client with explicit stream routing policy should be admitted to Naive
+	peerStream := seedIngressPeer(t, db, "naive-bob", "naive-peer-bbbbbbbbbb2", "10.100.3.22")
+	conn, err := db.GetConnection(ctx, peerStream.connID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.ClientParams["routing_policy"] = "stream"
+	if _, err := db.UpdateConnection(ctx, conn.ID, map[string]any{"client_params": conn.ClientParams}); err != nil {
+		t.Fatal(err)
+	}
+	oStream := ownershipFor(peerStream)
+	sess, backend, _, err := svc.EnsureBackendSessionForIngress(ctx, oStream)
+	if err != nil {
+		t.Fatalf("expected stream client admission to succeed, got: %v", err)
+	}
+	if backend.ID != naiveTunID || sess.BackendTunnelID != naiveTunID {
+		t.Fatalf("expected admission to Naive tunnel %d, got %d", naiveTunID, backend.ID)
+	}
+}
+
+func TestEnsureBackendSessionForIngress_DeletedSourceDoesNotFallbackToAWG(t *testing.T) {
+	db := setupTestDB(t)
+	svc, s1, s2, _, _ := setupTestVPNService(t, db, func(cfg *models.VPNConfig) {
+		cfg.EnableMultiProtocolBackends = true
+	})
+	ctx := t.Context()
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Delete both existing AWG backends so initial setup has only Naive
+	_ = svc.DeleteBackend(ctx, s1)
+	_ = svc.DeleteBackend(ctx, s2)
+
+	// Add a Naive server and tunnel
+	naiveSrv, _ := db.CreateServer(ctx, &models.Server{Name: "Naive-Delete-Node", Host: "10.0.0.10", Protocols: map[string]any{
+		"naive": map[string]any{"installed": true, "port": 443},
+	}})
+	naiveParams, _ := json.Marshal(models.NaiveProxyParams{Domain: "example.com", Username: "u", Password: "p"})
+	naiveTunID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:       naiveSrv,
+		InterfaceName:  "naive-be-2",
+		Endpoint:       "10.0.0.10:443",
+		Protocol:       models.ProtocolNaive,
+		ProtocolParams: naiveParams,
+		Enabled:        true,
+		Status:         models.TunnelStatusActive,
+		StateVersion:   1,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	peer := seedIngressPeer(t, db, "naive-del-peer", "naive-peer-dddddddddd4", "10.100.3.24")
+	conn, err := db.GetConnection(ctx, peer.connID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.ClientParams["routing_policy"] = "stream"
+	if _, err := db.UpdateConnection(ctx, conn.ID, map[string]any{"client_params": conn.ClientParams}); err != nil {
+		t.Fatal(err)
+	}
+	o := ownershipFor(peer)
+	sess, backend, _, err := svc.EnsureBackendSessionForIngress(ctx, o)
+	if err != nil {
+		t.Fatalf("initial admission failed: %v", err)
+	}
+	if backend.ID != naiveTunID {
+		t.Fatalf("expected initial admission to Naive tunnel %d, got %d", naiveTunID, backend.ID)
+	}
+
+	// Now add an active, healthy AWG server and tunnel
+	awgSrv, _ := db.CreateServer(ctx, &models.Server{Name: "AWG-Surviving", Host: "10.0.0.1", Protocols: map[string]any{
+		"awg": map[string]any{"public_key": "surviving-pubkey", "port": 51820},
+	}})
+	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:      awgSrv,
+		InterfaceName: "awg-surviving",
+		PublicKey:     "surviving-pubkey",
+		PrivateKey:    "surviving-privkey",
+		Endpoint:      "10.0.0.1:51820",
+		Protocol:      models.ProtocolAWG,
+		Status:        models.TunnelStatusActive,
+		Enabled:       true,
+		StateVersion:  1,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel(AWG) failed: %v", err)
+	}
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Delete the Naive backend server
+	if err := svc.DeleteBackend(ctx, naiveSrv); err != nil {
+		t.Fatalf("DeleteBackend failed: %v", err)
+	}
+
+	// Readmission of same peer with live session on deleted source must fail closed (Finding R4),
+	// never silently falling back to the healthy surviving AWG backend.
+	next, _, _, err := svc.EnsureBackendSessionForIngress(ctx, o)
+	if !errors.Is(err, loadbalancer.ErrNoActiveBackends) {
+		t.Fatalf("expected ErrNoActiveBackends after source deletion, got session=%+v err=%v", next, err)
+	}
+	_ = sess
 }

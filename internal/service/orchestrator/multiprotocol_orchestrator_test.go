@@ -161,3 +161,50 @@ func TestOrchestrator_RebalanceVPNSessions_SameFamilyIsolation(t *testing.T) {
 		}
 	}
 }
+
+func TestOrchestrator_CheckBackendTunnelHealth_ProxyDegradedMigratesSessions(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	t.Cleanup(cleanup)
+	ctx := context.Background()
+
+	userID, err := db.CreateUser(ctx, &models.User{Username: "failover_user", Role: models.RoleUser})
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	s1, _ := db.CreateServer(ctx, &models.Server{Name: "ProxyFailed", Host: "10.0.0.1", SSHPort: 22})
+	s2, _ := db.CreateServer(ctx, &models.Server{Name: "ProxyHealthy", Host: "10.0.0.2", SSHPort: 22})
+
+	// Source proxy tunnel is disabled/degraded by health prober
+	src, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID: s1, InterfaceName: "naive0", Endpoint: "10.0.0.1:443", Protocol: "naive", Status: models.TunnelStatusDisabled, Enabled: true,
+	})
+	// Target proxy tunnel is active
+	target, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID: s2, InterfaceName: "naive1", Endpoint: "10.0.0.2:443", Protocol: "naive", Status: models.TunnelStatusActive, Enabled: true,
+	})
+
+	_ = db.CreateVPNSession(ctx, &models.VPNSession{
+		ID:              "sess-proxy-1",
+		UserID:          userID,
+		PeerPublicKey:   "peer-proxy-1",
+		AssignedIP:      "10.100.5.1",
+		BackendTunnelID: src,
+		Status:          "connected",
+	})
+
+	migrator := &mockSessionMigrator{}
+	orch := New(db, nil, WithSessionMigrator(migrator))
+
+	if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
+		t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+	}
+
+	migrations := migrator.getMigrations()
+	if len(migrations) != 1 {
+		t.Fatalf("expected 1 migration, got %d", len(migrations))
+	}
+	if migrations[0].sessionID != "sess-proxy-1" || migrations[0].targetTunnelID != target {
+		t.Fatalf("unexpected migration: %+v (want target=%d)", migrations[0], target)
+	}
+}

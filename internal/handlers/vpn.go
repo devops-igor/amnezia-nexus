@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
 // VPNStatusHandler returns operational metrics for the VPN subsystem.
@@ -86,7 +88,41 @@ func (h *Handlers) VPNBackendsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handlers) resolveInstalledProxyOptions(ctx context.Context, serverID int64) (string, json.RawMessage) {
+	if h.db == nil {
+		return "", nil
+	}
+	srv, err := h.db.GetServer(ctx, serverID)
+	if err != nil || srv == nil || srv.Protocols == nil {
+		return "", nil
+	}
+	if awgInfo, ok := srv.Protocols["awg"].(map[string]any); ok {
+		if inst, _ := awgInfo["installed"].(bool); inst {
+			return "", nil
+		}
+		if pub, _ := awgInfo["public_key"].(string); pub != "" {
+			return "", nil
+		}
+	}
+	for _, p := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
+		if pInfo, ok := srv.Protocols[p].(map[string]any); ok {
+			if inst, _ := pInfo["installed"].(bool); inst {
+				var params json.RawMessage
+				if pBytes, ok := pInfo["params"].(map[string]any); ok {
+					params, _ = json.Marshal(pBytes)
+				} else if pRaw, ok := pInfo["protocol_params"].(map[string]any); ok {
+					params, _ = json.Marshal(pRaw)
+				}
+				return p, params
+			}
+		}
+	}
+	return "", nil
+}
+
 // VPNEnableBackendHandler activates a backend server for load balancing.
+//
+//nolint:gocyclo // transactional enable, protocol dispatch, and error handling are centralized.
 func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Request) {
 	serverID, err := parseServerID(r)
 	if err != nil {
@@ -94,11 +130,45 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	var req struct {
+		Protocol       string          `json:"protocol"`
+		ProtocolParams json.RawMessage `json:"protocol_params"`
+	}
+	if r.Body != nil && r.Body != http.NoBody {
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1048576))
+		if err == nil && len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &req); err != nil {
+				h.JSONError(w, http.StatusBadRequest, "invalid_parameter", "Invalid JSON payload")
+				return
+			}
+		}
+	}
+	if req.Protocol == "" {
+		req.Protocol = r.URL.Query().Get("protocol")
+	}
+
 	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 45*time.Second)
 	defer cancel()
 
+	if req.Protocol == "" {
+		proto, pParams := h.resolveInstalledProxyOptions(bgCtx, serverID)
+		if proto != "" {
+			req.Protocol = proto
+			if len(req.ProtocolParams) == 0 {
+				req.ProtocolParams = pParams
+			}
+		}
+	}
+
 	if h.vpnSvc != nil {
-		if err := h.vpnSvc.EnableBackend(bgCtx, serverID); err != nil {
+		var opts []tunnel.BackendTunnelOptions
+		if req.Protocol != "" || len(req.ProtocolParams) > 0 {
+			opts = append(opts, tunnel.BackendTunnelOptions{
+				Protocol:       models.NormalizeTunnelProtocol(req.Protocol),
+				ProtocolParams: req.ProtocolParams,
+			})
+		}
+		if err := h.vpnSvc.EnableBackendWithConfig(bgCtx, serverID, opts...); err != nil {
 			if errors.Is(err, vpn.ErrAWGNotInstalled) {
 				h.JSONError(w, http.StatusBadRequest, "awg_not_installed", "Server does not have AmneziaWG installed or configured")
 				return

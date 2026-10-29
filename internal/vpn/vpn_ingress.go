@@ -219,6 +219,12 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 				targetFamily = models.NormalizeTunnelProtocol(oldTun.Protocol)
 			}
 		}
+		if targetFamily == "" {
+			// Finding R4: an existing session was found for the peer, but its source backend
+			// was deleted and its protocol family cannot be verified. Fail closed to prevent
+			// silent cross-family readmission to AWG.
+			return nil, nil, retirement, loadbalancer.ErrNoActiveBackends
+		}
 	}
 	if targetFamily == "" && s.stickyMgr != nil {
 		if affID, ok := s.stickyMgr.GetPeerAffinity(o.PeerPublicKey); ok {
@@ -248,7 +254,26 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 	if targetFamily == "" {
 		eligibleFamilies := []string{models.ProtocolAWG}
 		if multiProto {
-			eligibleFamilies = append(eligibleFamilies, models.ProtocolVLESS, models.ProtocolNaive)
+			// Finding R2: exclude Naive backends from generic full-tunnel client admission
+			// unless the client/session specifies an explicit stream/TCP routing policy
+			// or explicit Naive protocol affinity.
+			isStreamOrTCP := false
+			if conn != nil {
+				if models.NormalizeProtocol(conn.Protocol) == models.ProtocolNaive {
+					isStreamOrTCP = true
+				}
+				if pol, ok := conn.ClientParams["routing_policy"].(string); ok && (pol == "tcp" || pol == "stream") {
+					isStreamOrTCP = true
+				}
+				if streamOnly, ok := conn.ClientParams["stream_only"].(bool); ok && streamOnly {
+					isStreamOrTCP = true
+				}
+			}
+			if isStreamOrTCP {
+				eligibleFamilies = append(eligibleFamilies, models.ProtocolVLESS, models.ProtocolNaive)
+			} else {
+				eligibleFamilies = append(eligibleFamilies, models.ProtocolVLESS)
+			}
 		}
 		for _, fam := range eligibleFamilies {
 			candidates := models.FilterTunnelsByProtocol(activeTunnels, fam)

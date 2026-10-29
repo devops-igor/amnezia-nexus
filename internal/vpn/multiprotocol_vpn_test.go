@@ -279,3 +279,82 @@ func TestService_AttachBackendForwarder_Proxy(t *testing.T) {
 	_ = dev.Close()
 	_ = devNaive.Close()
 }
+
+func TestService_EnableBackendWithConfig_ProxyBootstrapResolvesProtocol(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	cfg := &models.VPNConfig{
+		EnableMultiProtocolBackends: true,
+		ListenPort:                  51820,
+	}
+	svc, err := NewVPNService(db, cfg)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	t.Cleanup(func() {
+		ts, _ := svc.GetTunnels(ctx)
+		for _, tun := range ts {
+			if d := svc.GetBackendDeviceForTest(tun.ID); d != nil {
+				_ = d.Close()
+			}
+		}
+	})
+
+	naiveParams := models.NaiveProxyParams{
+		Domain:   "example.com",
+		Username: "fixture-user",
+		Password: "fixture-password",
+		EnableH3: false,
+	}
+	paramsRaw, _ := json.Marshal(naiveParams)
+
+	sid, err := db.CreateServer(ctx, &models.Server{
+		Name:    "proxy-only-server",
+		Host:    "127.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"naive": map[string]any{
+				"installed": true,
+				"port":      443,
+				"params":    naiveParams,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	// 1. Enabling with explicit options succeeds
+	err = svc.EnableBackendWithConfig(ctx, sid, tunnel.BackendTunnelOptions{
+		Protocol:       models.ProtocolNaive,
+		ProtocolParams: paramsRaw,
+	})
+	if err != nil {
+		t.Fatalf("EnableBackendWithConfig with explicit options failed: %v", err)
+	}
+
+	tun, err := svc.GetTunnel(sid)
+	if err != nil || tun == nil {
+		t.Fatalf("expected tunnel for server %d, got tun=%+v err=%v", sid, tun, err)
+	}
+	if tun.Protocol != models.ProtocolNaive {
+		t.Fatalf("expected protocol %q, got %q", models.ProtocolNaive, tun.Protocol)
+	}
+
+	// Clean up for next check
+	_ = svc.DeleteBackend(ctx, sid)
+
+	// 2. Enabling without options resolves protocol from server.Protocols (Finding R1)
+	err = svc.EnableBackendWithConfig(ctx, sid)
+	if err != nil {
+		t.Fatalf("EnableBackendWithConfig without options failed to resolve proxy protocol: %v", err)
+	}
+
+	tunAfter, err := svc.GetTunnel(sid)
+	if err != nil || tunAfter == nil {
+		t.Fatalf("expected tunnel for server %d, got tun=%+v err=%v", sid, tunAfter, err)
+	}
+	if tunAfter.Protocol != models.ProtocolNaive {
+		t.Fatalf("expected resolved protocol %q, got %q", models.ProtocolNaive, tunAfter.Protocol)
+	}
+}

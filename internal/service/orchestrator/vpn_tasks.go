@@ -13,7 +13,22 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
+func classifyProxyTunnel(t models.BackendTunnel) (isProxy bool, isDegraded bool, isActive bool) {
+	if models.NormalizeTunnelProtocol(t.Protocol) == models.ProtocolAWG {
+		return false, false, false
+	}
+	if strings.EqualFold(t.Status, models.TunnelStatusDegraded) || strings.EqualFold(t.Status, models.TunnelStatusDisabled) {
+		return true, true, false
+	}
+	if strings.EqualFold(t.Status, models.TunnelStatusActive) {
+		return true, false, true
+	}
+	return true, false, false
+}
+
 // CheckBackendTunnelHealth probes active backend AWG tunnels via pure-Go Noise IK handshakes.
+//
+//nolint:gocyclo // Multi-protocol health classification, AWG probing, and session failover are centralized.
 func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 	if o.db == nil {
 		return errors.New("database is not configured")
@@ -47,16 +62,27 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 	threshold := o.ProbeFailureThreshold()
 
 	for _, t := range tunnels {
-		if !t.Enabled || strings.EqualFold(t.Status, models.TunnelStatusDisabled) {
+		if !t.Enabled {
 			// Administratively disabled backends are ineligible altogether.
+			continue
+		}
+		if isProxy, isDegraded, isActive := classifyProxyTunnel(t); isProxy {
+			// Proxy health is owned by the VPN service HealthProber (native probes).
+			// We do not probe them with AWG UDP probes, but detect when an enabled proxy
+			// tunnel is marked degraded or disabled by HealthProber, or active/healthy,
+			// to trigger session failover to an active same-family replacement tunnel.
+			if isDegraded {
+				degradedTunnels = append(degradedTunnels, t.ID)
+			} else if isActive {
+				tCopy := t
+				healthyTunnels = append(healthyTunnels, &tCopy)
+			}
+			continue
+		}
+		if strings.EqualFold(t.Status, models.TunnelStatusDisabled) {
 			// Runtime-disabled backends belong to the VPN health prober's
 			// dedicated self-healing path, which applies flap damping and
 			// restores the data plane before making the backend routable.
-			continue
-		}
-		if models.NormalizeTunnelProtocol(t.Protocol) != models.ProtocolAWG {
-			// Legacy orchestrator AWG probe only probes AWG tunnels; proxy health
-			// is owned by the VPN service HealthProber.
 			continue
 		}
 
@@ -221,7 +247,7 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 				}
 			}
 			if target == nil {
-				break
+				continue
 			}
 			if migrator != nil {
 				if err := migrator.MigrateSession(ctx, s.ID, target.ID); err != nil {
