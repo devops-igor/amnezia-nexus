@@ -198,7 +198,7 @@ func (m *testMockSSHClient) RunCommand(ctx context.Context, cmd string) (string,
 		return "", "", 0, nil
 	}
 	if strings.Contains(cmd, "docker inspect") && strings.Contains(cmd, ".State.Running") {
-		return "true\n", "", 0, nil
+		return "true false 123\n", "", 0, nil
 	}
 	if strings.Contains(cmd, "docker ps") {
 		// Preflight: publish filter finds no existing binding.

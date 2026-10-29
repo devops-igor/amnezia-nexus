@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,7 +46,10 @@ func (m *XrayManager) WriteConfiguration(ctx context.Context, server *models.Ser
 			return fmt.Errorf("restart xray container exited with code %d: %s", code, strings.TrimSpace(errOut))
 		}
 
-		inspectCmd := fmt.Sprintf("docker inspect -f '{{.State.Running}}' %s", ssh.EscapeShellArg(XrayContainerName))
+		inspectCmd := fmt.Sprintf(
+			"docker inspect -f '{{.State.Running}} {{.State.Restarting}} {{.State.Pid}}' %s",
+			ssh.EscapeShellArg(XrayContainerName),
+		)
 		out, errOut, code, err := client.RunSudoCommand(ctx, inspectCmd)
 		if err != nil {
 			return fmt.Errorf("inspect xray container after restart: %w", err)
@@ -53,8 +57,18 @@ func (m *XrayManager) WriteConfiguration(ctx context.Context, server *models.Ser
 		if code != 0 {
 			return fmt.Errorf("inspect xray container exited with code %d: %s", code, strings.TrimSpace(errOut))
 		}
-		if state := strings.TrimSpace(out); state != "true" {
-			return fmt.Errorf("xray container is not running after restart (state %q)", state)
+		state := strings.TrimSpace(out)
+		fields := strings.Fields(state)
+		if len(fields) != 3 {
+			return fmt.Errorf("unexpected xray container state after restart %q", state)
+		}
+		pid, err := strconv.Atoi(fields[2])
+		if err != nil {
+			return fmt.Errorf("parse xray container pid after restart: %w", err)
+		}
+		healthy := fields[0] == "true" && fields[1] == "false" && pid > 0
+		if !healthy {
+			return fmt.Errorf("xray container is not healthy after restart (state %q)", state)
 		}
 		return nil
 	}

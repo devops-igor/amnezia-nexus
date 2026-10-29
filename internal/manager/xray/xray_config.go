@@ -213,7 +213,7 @@ func RenderXrayConfig(
 	return json.MarshalIndent(cfg, "", "  ")
 }
 
-// ParseXrayConfig decodes an existing config.json and validates REALITY private keys.
+// ParseXrayConfig decodes an existing config.json and validates REALITY private keys and short IDs.
 func ParseXrayConfig(data []byte) (*XrayConfig, error) {
 	var cfg XrayConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
@@ -221,6 +221,18 @@ func ParseXrayConfig(data []byte) (*XrayConfig, error) {
 	}
 	for i, inbound := range cfg.Inbounds {
 		stream := inbound.StreamSettings
+		for j, shortID := range stream.RealitySettings.ShortIDs {
+			if len(shortID) > 16 || len(shortID)%2 != 0 {
+				return nil, fmt.Errorf(
+					"validate reality short ID %d for inbound %d: must be even-length hex with at most 16 characters",
+					j,
+					i,
+				)
+			}
+			if _, err := hex.DecodeString(shortID); err != nil {
+				return nil, fmt.Errorf("validate reality short ID %d for inbound %d: %w", j, i, err)
+			}
+		}
 		if stream.Security != "reality" && stream.RealitySettings.PrivateKey == "" {
 			continue
 		}

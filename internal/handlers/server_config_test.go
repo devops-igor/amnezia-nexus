@@ -82,6 +82,9 @@ func newConfigApplyMock(path, initialContent, applyMarker string, failFirstApply
 			}
 		}
 		if strings.Contains(cmd, "docker inspect") {
+			if strings.Contains(cmd, "{{.State.Pid}}") {
+				return "true false 123\n", "", 0, nil
+			}
 			return "true\n", "", 0, nil
 		}
 		return "", "", 0, nil
@@ -202,6 +205,70 @@ func TestSaveServerConfigHandlerRejectsInvalidRealityKeyWithoutRemoteChanges(t *
 	}
 }
 
+func TestSaveServerConfigHandlerRejectsInvalidRealityShortIDWithoutRemoteChanges(t *testing.T) {
+	const original = `{"inbounds":[],"outbounds":[]}`
+	remote := newConfigApplyMock(xray.XrayConfigPath, original, "docker restart", false)
+	router, serverID := setupServerConfigHandlerTest(t, remote.client)
+	invalid := `{"inbounds":[{"port":443,"protocol":"vless","streamSettings":{` +
+		`"security":"reality","realitySettings":{"privateKey":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",` +
+		`"shortIds":["gg"]}}}],"outbounds":[]}`
+
+	w := performServerConfigSave(t, router, serverID, models.ProtocolVLESS, invalid)
+
+	assertServerConfigResponse(t, w, http.StatusBadRequest, "validation_failed")
+	if remote.uploads != 0 || remote.downloads != 0 || remote.applies != 0 {
+		t.Errorf("invalid REALITY short ID caused remote operations: uploads=%d downloads=%d restarts=%d",
+			remote.uploads, remote.downloads, remote.applies)
+	}
+	if got := string(remote.files[xray.XrayConfigPath]); got != original {
+		t.Errorf("config changed to %q, want original %q", got, original)
+	}
+}
+
+func TestSaveServerConfigHandlerXrayRestartBackoffRollsBack(t *testing.T) {
+	const original = `{"inbounds":[{"port":443}],"outbounds":[]}`
+	remote := newConfigApplyMock(xray.XrayConfigPath, original, "docker restart", false)
+	router, serverID := setupServerConfigHandlerTest(t, remote.client)
+	crashLooping := true
+	baseCmd := remote.client.cmdFunc
+	remote.client.cmdFunc = func(ctx context.Context, cmd string) (string, string, int, error) {
+		if strings.Contains(cmd, "docker restart") {
+			remote.applies++
+			crashLooping = remote.applies == 1
+			return "amnezia-xray", "", 0, nil
+		}
+		if strings.Contains(cmd, "docker inspect") {
+			if crashLooping {
+				if strings.Contains(cmd, "{{.State.Pid}}") {
+					return "true true 0\n", "", 0, nil
+				}
+				return "true\n", "", 0, nil
+			}
+			if strings.Contains(cmd, "{{.State.Pid}}") {
+				return "true false 123\n", "", 0, nil
+			}
+			return "true\n", "", 0, nil
+		}
+		return baseCmd(ctx, cmd)
+	}
+
+	w := performServerConfigSave(t, router, serverID, models.ProtocolVLESS, testXrayConfig)
+
+	assertServerConfigResponse(t, w, http.StatusInternalServerError, "apply_failed")
+	if remote.applies != 2 {
+		t.Errorf("xray restarts = %d, want crash-looping apply plus recovery", remote.applies)
+	}
+	if remote.uploads != 2 {
+		t.Errorf("uploads = %d, want new config plus rollback", remote.uploads)
+	}
+	if got := string(remote.files[xray.XrayConfigPath]); got != original {
+		t.Errorf("rolled-back config = %q, want original %q", got, original)
+	}
+	if crashLooping {
+		t.Error("xray container was not healthy after recovery restart")
+	}
+}
+
 func TestSaveServerConfigHandlerXrayRestartFailureRollsBack(t *testing.T) {
 	const original = `{"inbounds":[{"port":443}],"outbounds":[]}`
 	remote := newConfigApplyMock(xray.XrayConfigPath, original, "docker restart", true)
@@ -235,9 +302,9 @@ func TestSaveServerConfigHandlerXrayStoppedContainerRollsBack(t *testing.T) {
 		}
 		if strings.Contains(cmd, "docker inspect") {
 			if running {
-				return "true\n", "", 0, nil
+				return "true false 123\n", "", 0, nil
 			}
-			return "false\n", "", 0, nil
+			return "false false 0\n", "", 0, nil
 		}
 		return baseCmd(ctx, cmd)
 	}
