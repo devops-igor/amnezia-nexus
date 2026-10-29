@@ -2,7 +2,6 @@ package xray
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -77,28 +76,19 @@ func (m *XrayManager) AddClient(ctx context.Context, server *models.Server, clie
 	name := resolveClientName(clientID, clientParams)
 	flow := resolveClientFlow(server, clientParams)
 
-	// 3. Append client to inbounds (Email must be unique clientID to prevent Xray crash on duplicate display names)
-	newClient := XrayClient{
-		ID:    clientID,
-		Email: clientID,
-		Flow:  flow,
-	}
-	cfg.Inbounds[0].Settings.Clients = append(cfg.Inbounds[0].Settings.Clients, newClient)
-
-	if len(cfg.Inbounds) > 1 {
-		cfg.Inbounds[1].Settings.Clients = append(cfg.Inbounds[1].Settings.Clients, XrayClient{
-			ID:    clientID,
-			Email: clientID,
-			Flow:  "xtls-rprx-vision",
-		})
+	// 3. Append client to inbounds (Email must be unique clientID to prevent Xray crash on duplicate display names).
+	// The raw JSON is edited so operator-added blocks (routing, dns, sniffing, ...) survive.
+	updatedBytes, err := appendInboundClient(cfgBytes, func(i int) XrayClient {
+		if i == 0 {
+			return XrayClient{ID: clientID, Email: clientID, Flow: flow}
+		}
+		return XrayClient{ID: clientID, Email: clientID, Flow: "xtls-rprx-vision"}
+	})
+	if err != nil {
+		return nil, fmt.Errorf("add client to xray config: %w", err)
 	}
 
 	// 4. Upload updated config
-	updatedBytes, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("marshal updated xray config: %w", err)
-	}
-
 	if err := client.UploadSudoFile(ctx, XrayConfigPath, updatedBytes, 0600); err != nil {
 		return nil, fmt.Errorf("upload updated xray config: %w", err)
 	}
@@ -171,24 +161,13 @@ func (m *XrayManager) RemoveClient(ctx context.Context, server *models.Server, c
 		return fmt.Errorf("failed to download xray config: %w", err)
 	}
 
-	cfg, err := ParseXrayConfig(cfgBytes)
-	if err != nil {
+	if _, err := ParseXrayConfig(cfgBytes); err != nil {
 		return fmt.Errorf("failed to parse xray config: %w", err)
 	}
 
-	for i := range cfg.Inbounds {
-		filtered := make([]XrayClient, 0, len(cfg.Inbounds[i].Settings.Clients))
-		for _, c := range cfg.Inbounds[i].Settings.Clients {
-			if c.ID != clientID {
-				filtered = append(filtered, c)
-			}
-		}
-		cfg.Inbounds[i].Settings.Clients = filtered
-	}
-
-	updatedBytes, err := json.MarshalIndent(cfg, "", "  ")
+	updatedBytes, err := removeInboundClient(cfgBytes, clientID)
 	if err != nil {
-		return fmt.Errorf("marshal updated xray config: %w", err)
+		return fmt.Errorf("remove client from xray config: %w", err)
 	}
 
 	if err := client.UploadSudoFile(ctx, XrayConfigPath, updatedBytes, 0600); err != nil {

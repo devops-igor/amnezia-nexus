@@ -30,7 +30,7 @@ func (m *NaiveManager) AddClient(ctx context.Context, server *models.Server, cli
 		return nil, fmt.Errorf("download Caddyfile: %w", err)
 	}
 
-	domain, port, clients, err := ParseCaddyfile(string(caddyfileBytes))
+	domain, port, _, err := ParseCaddyfile(string(caddyfileBytes))
 	if err != nil {
 		return nil, fmt.Errorf("parse Caddyfile: %w", err)
 	}
@@ -67,14 +67,16 @@ func (m *NaiveManager) AddClient(ctx context.Context, server *models.Server, cli
 	now := time.Now().UTC()
 	m.recordClientCreation(username, now)
 
-	// 3. Append new client credentials
-	clients = append(clients, NaiveClient{
-		Username: username,
-		Password: password,
-	})
+	// 3. Insert credentials in place so custom directives in the Caddyfile survive
+	updatedContent, err := addCaddyBasicAuth(string(caddyfileBytes), username, password)
+	if err != nil {
+		return nil, fmt.Errorf("add client to Caddyfile: %w", err)
+	}
+	if _, _, _, err := ParseCaddyfile(updatedContent); err != nil {
+		return nil, fmt.Errorf("validate updated Caddyfile: %w", err)
+	}
 
-	// 4. Render and upload updated Caddyfile
-	updatedContent := RenderCaddyfile(port, domain, clients)
+	// 4. Upload updated Caddyfile
 	if err := client.UploadSudoFile(ctx, NaiveCaddyfilePath, []byte(updatedContent), 0600); err != nil {
 		return nil, fmt.Errorf("upload updated Caddyfile: %w", err)
 	}
@@ -127,19 +129,11 @@ func (m *NaiveManager) RemoveClient(ctx context.Context, server *models.Server, 
 		return fmt.Errorf("download Caddyfile: %w", err)
 	}
 
-	domain, port, clients, err := ParseCaddyfile(string(caddyfileBytes))
-	if err != nil {
+	if _, _, _, err := ParseCaddyfile(string(caddyfileBytes)); err != nil {
 		return fmt.Errorf("parse Caddyfile: %w", err)
 	}
 
-	filtered := make([]NaiveClient, 0, len(clients))
-	for _, c := range clients {
-		if c.Username != clientID {
-			filtered = append(filtered, c)
-		}
-	}
-
-	updatedContent := RenderCaddyfile(port, domain, filtered)
+	updatedContent := removeCaddyBasicAuth(string(caddyfileBytes), clientID)
 	if err := client.UploadSudoFile(ctx, NaiveCaddyfilePath, []byte(updatedContent), 0600); err != nil {
 		return fmt.Errorf("upload updated Caddyfile: %w", err)
 	}
