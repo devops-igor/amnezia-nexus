@@ -31,6 +31,7 @@ type SSHClient interface {
 	UploadFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error
 	UploadSudoFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error
 	DownloadFile(ctx context.Context, remotePath string) ([]byte, error)
+	DownloadSudoFile(ctx context.Context, remotePath string) ([]byte, error)
 	FileExists(ctx context.Context, remotePath string) (bool, error)
 	TestConnection(ctx context.Context) (string, error)
 	Close() error
@@ -67,7 +68,7 @@ type Client struct {
 	sftpClient          *sftp.Client
 	isRoot              bool
 	capturedFingerprint string
-	lastActive          time.Time
+	lastActive          atomic.Int64
 	activeOps           atomic.Int64
 	closed              bool
 	mu                  sync.Mutex
@@ -88,11 +89,12 @@ func NewClient(cfg Config) *Client {
 		cfg.KeepAlivePeriod = 30 * time.Second
 	}
 
-	return &Client{
-		cfg:        cfg,
-		isRoot:     cfg.User == "root",
-		lastActive: time.Now(),
+	client := &Client{
+		cfg:    cfg,
+		isRoot: cfg.User == "root",
 	}
+	client.lastActive.Store(time.Now().UnixNano())
+	return client
 }
 
 // Dial creates a new Client and immediately establishes an SSH connection.
@@ -181,7 +183,7 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	c.sshClient = gossh.NewClient(sshConn, chans, reqs)
 	c.closed = false
-	c.lastActive = time.Now()
+	c.lastActive.Store(time.Now().UnixNano())
 
 	return nil
 }
@@ -304,18 +306,32 @@ func (c *Client) UploadFile(ctx context.Context, remotePath string, content []by
 // UploadSudoFile uploads content to a root-owned remote path via atomic temp write and sudo move.
 func (c *Client) UploadSudoFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error {
 	defer c.startOp()()
-	if c.isRoot {
-		return c.UploadFile(ctx, remotePath, content, mode)
+
+	stagingDir := GenerateRandomTempPath("stage")
+	// Registered before staging and bound to an independent context so a failed or
+	// canceled upload still removes any partially staged secret from /tmp.
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _, _, _ = c.RunSudoCommand(cleanupCtx, fmt.Sprintf("rm -rf %s", EscapeShellArg(stagingDir)))
+	}()
+
+	// Pre-create a private directory and inode so SFTP truncation never exposes the payload
+	// through the server's default umask between open and chmod.
+	mkdirCmd := fmt.Sprintf("umask 077 && mkdir -p %s && chmod 0700 %s", EscapeShellArg(stagingDir), EscapeShellArg(stagingDir))
+	if _, _, code, err := c.RunCommand(ctx, mkdirCmd); err != nil || code != 0 {
+		return fmt.Errorf("failed to create secure staging directory %s (code %d): %w", stagingDir, code, err)
 	}
 
-	tmpPath := GenerateRandomTempPath("upload")
+	tmpPath := path.Join(stagingDir, "payload")
+	precreateCmd := fmt.Sprintf("umask 077 && install -m 0600 /dev/null %s", EscapeShellArg(tmpPath))
+	if _, _, code, err := c.RunCommand(ctx, precreateCmd); err != nil || code != 0 {
+		return fmt.Errorf("failed to pre-create secure staging file %s (code %d): %w", tmpPath, code, err)
+	}
+
 	if err := c.UploadFile(ctx, tmpPath, content, 0600); err != nil {
 		return fmt.Errorf("failed to upload temporary file: %w", err)
 	}
-
-	defer func() {
-		_, _, _, _ = c.RunSudoCommand(ctx, fmt.Sprintf("rm -f %s", EscapeShellArg(tmpPath)))
-	}()
 
 	targetDir := path.Dir(remotePath)
 	if _, _, code, err := c.RunSudoCommand(ctx, fmt.Sprintf("mkdir -p %s", EscapeShellArg(targetDir))); err != nil || code != 0 {
@@ -350,6 +366,22 @@ func (c *Client) DownloadFile(ctx context.Context, remotePath string) ([]byte, e
 	return SFTPDownload(ctx, sftpClient, remotePath)
 }
 
+// DownloadSudoFile downloads a root-owned remote file, elevating reads for non-root SSH users.
+func (c *Client) DownloadSudoFile(ctx context.Context, remotePath string) ([]byte, error) {
+	if c.isRoot {
+		return c.DownloadFile(ctx, remotePath)
+	}
+
+	stdout, stderr, code, err := c.RunSudoCommand(ctx, fmt.Sprintf("cat %s", EscapeShellArg(remotePath)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to download sudo file %s: %w", remotePath, err)
+	}
+	if code != 0 {
+		return nil, fmt.Errorf("failed to download sudo file %s (code %d): %s", remotePath, code, stderr)
+	}
+	return []byte(stdout), nil
+}
+
 // FileExists checks if a remote file or directory exists via SFTP.
 func (c *Client) FileExists(ctx context.Context, remotePath string) (bool, error) {
 	defer c.startOp()()
@@ -375,36 +407,47 @@ func (c *Client) TestConnection(ctx context.Context) (string, error) {
 // IsAlive checks if the SSH transport connection is alive by sending a keepalive global request.
 func (c *Client) IsAlive() bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.closed || c.sshClient == nil {
+		c.mu.Unlock()
 		return false
 	}
+	client := c.sshClient
+	c.mu.Unlock()
 
-	_, _, err := c.sshClient.SendRequest("keepalive@openssh.com", true, nil)
-	return err == nil
+	doneCh := make(chan error, 1)
+	go func() {
+		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+		doneCh <- err
+	}()
+
+	select {
+	case err := <-doneCh:
+		return err == nil
+	case <-time.After(5 * time.Second):
+		return false
+	}
 }
 
 // Close terminates the SFTP and SSH connections.
 func (c *Client) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	c.closed = true
+	sftp := c.sftpClient
+	ssh := c.sshClient
+	c.sftpClient = nil
+	c.sshClient = nil
+	c.mu.Unlock()
+
 	var errs []error
-
-	if c.sftpClient != nil {
-		if err := c.sftpClient.Close(); err != nil {
+	if ssh != nil {
+		if err := ssh.Close(); err != nil {
 			errs = append(errs, err)
 		}
-		c.sftpClient = nil
 	}
-
-	if c.sshClient != nil {
-		if err := c.sshClient.Close(); err != nil {
+	if sftp != nil {
+		if err := sftp.Close(); err != nil {
 			errs = append(errs, err)
 		}
-		c.sshClient = nil
 	}
 
 	if len(errs) > 0 {
@@ -442,16 +485,12 @@ func (c *Client) GetServerID() *int64 {
 
 // GetLastActive returns the timestamp of the last executed operation.
 func (c *Client) GetLastActive() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.lastActive
+	return time.Unix(0, c.lastActive.Load())
 }
 
 // touch updates the last active timestamp.
 func (c *Client) touch() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.lastActive = time.Now()
+	c.lastActive.Store(time.Now().UnixNano())
 }
 
 // InUse reports whether the client is currently executing commands or file operations.

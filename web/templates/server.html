@@ -118,6 +118,36 @@
             <button class="btn btn-primary btn-sm" onclick="openInstallModal('telemt')" id="telemt-install-btn" style="flex:1">{{ _ "install" }}</button>
         </div>
     </div>
+
+    <!-- Xray (VLESS + REALITY) Card -->
+    <div class="card card-hover protocol-card protocol-vless" id="proto-vless">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
+            <div class="protocol-icon"><svg class="icon" style="width:24px;height:24px;color:var(--accent);"><use href="#icon-shield"></use></svg></div>
+            <div class="flex gap-sm" id="vless-ctrl" style="display:none!important;"></div>
+        </div>
+        <div class="protocol-name">Xray (VLESS + REALITY)</div>
+        <div class="protocol-desc">Active-probing resistant VLESS protocol with REALITY TLS camouflage.</div>
+        <div class="protocol-status" id="vless-status"><span class="badge badge-warn"><span class="badge-dot"></span> {{ _ "not_checked" }}</span></div>
+        <div id="vless-info" class="hidden"><div class="protocol-info" id="vless-info-grid"></div></div>
+        <div class="flex gap-sm" id="vless-actions">
+            <button class="btn btn-primary btn-sm" onclick="openInstallModal('vless')" id="vless-install-btn" style="flex:1">{{ _ "install" }}</button>
+        </div>
+    </div>
+
+    <!-- NaiveProxy Card -->
+    <div class="card card-hover protocol-card protocol-naive" id="proto-naive">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
+            <div class="protocol-icon"><svg class="icon" style="width:24px;height:24px;color:var(--info);"><use href="#icon-network"></use></svg></div>
+            <div class="flex gap-sm" id="naive-ctrl" style="display:none!important;"></div>
+        </div>
+        <div class="protocol-name">NaiveProxy (Caddy)</div>
+        <div class="protocol-desc">Commercial browser camouflage proxy with Let's Encrypt TLS and HTTP/3.</div>
+        <div class="protocol-status" id="naive-status"><span class="badge badge-warn"><span class="badge-dot"></span> {{ _ "not_checked" }}</span></div>
+        <div id="naive-info" class="hidden"><div class="protocol-info" id="naive-info-grid"></div></div>
+        <div class="flex gap-sm" id="naive-actions">
+            <button class="btn btn-primary btn-sm" onclick="openInstallModal('naive')" id="naive-install-btn" style="flex:1">{{ _ "install" }}</button>
+        </div>
+    </div>
 </div>
 
 <div class="protocol-cards hidden" id="services-grid">
@@ -163,6 +193,8 @@
             <select class="form-select" id="connProtoSelect" onchange="loadConnections()" style="width:auto; min-width:160px;">
                 <option value="awg">AmneziaWG</option>
                 <option value="telemt">MTProxyL</option>
+                <option value="vless">Xray (VLESS)</option>
+                <option value="naive">NaiveProxy</option>
             </select>
             <button class="btn btn-primary btn-sm" onclick="openAddConnectionModal()">
                 <svg class="icon"><use href="#icon-plus"></use></svg> {{ _ "add" }}
@@ -250,6 +282,43 @@
                     <label class="form-label">{{ _ "awg_cps_protocol" }}</label>
                     <select class="form-input" id="installAwgCpsProtocol"><option value="sip" selected>SIP</option><option value="dns">DNS</option><option value="quic">QUIC</option></select>
                     <div class="form-hint">{{ _ "awg_cps_protocol_hint" }}</div>
+                </div>
+            </div>
+
+            <div id="vlessOptions" style="display:none; margin-bottom: var(--space-md);">
+                <div class="form-group">
+                    <label class="form-label" style="display:flex; justify-content:space-between; align-items:center;">
+                        Camouflage SNI / Target
+                        <button type="button" class="btn btn-secondary btn-sm" id="vlessScanBtn" onclick="scanRealitySNI()" style="padding: 2px 8px; font-size: 11px;">
+                            <svg class="icon" style="width:12px;height:12px;margin-right:4px;"><use href="#icon-search"></use></svg> Find Best SNIs
+                        </button>
+                    </label>
+                    <input class="form-input" type="text" id="installVlessSni" value="gateway.icloud.com" placeholder="e.g. gateway.icloud.com">
+                    <select class="form-select" id="installVlessSniSelect" style="display:none; margin-top:var(--space-xs); font-size:12px;"></select>
+                    <div class="form-hint">Server SNI used for REALITY TLS camouflage and active-probing defense.</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Flow / Obfuscation</label>
+                    <select class="form-input" id="installVlessFlow">
+                        <option value="xtls-rprx-vision" selected>xtls-rprx-vision (Vision Direct/Padding)</option>
+                        <option value="">None (Standard VLESS)</option>
+                    </select>
+                    <div class="form-hint">Vision eliminates TLS-in-TLS signature patterns to bypass DPI classifiers.</div>
+                </div>
+            </div>
+
+            <div id="naiveOptions" style="display:none; margin-bottom: var(--space-md);">
+                <div class="form-group">
+                    <label class="form-label">Proxy Domain (Let's Encrypt)</label>
+                    <input class="form-input" type="text" id="installNaiveDomain" placeholder="e.g. vpn.example.com">
+                    <div class="form-hint">A DNS A record for this domain must resolve to this server's public IP.</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Decoy Site Template</label>
+                    <select class="form-input" id="installNaiveDecoy">
+                        <option value="default" selected>Creative Studio (HTML5/CSS3 Portfolio)</option>
+                    </select>
+                    <div class="form-hint">Static camouflage website served to unauthenticated probe requests.</div>
                 </div>
             </div>
 

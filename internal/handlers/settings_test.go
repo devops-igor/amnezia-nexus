@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
@@ -24,6 +25,7 @@ func TestSettingsHandlers(t *testing.T) {
 	})
 
 	r := setupFullSettingsRouter(h)
+	adminSession := &models.SessionData{UserID: "settings-admin", Role: models.RoleAdmin}
 
 	t.Run("GetSettingsHandler Masks Secrets", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
@@ -159,6 +161,7 @@ func TestSettingsHandlers(t *testing.T) {
 		}
 		body, _ := json.Marshal(backup)
 		req := httptest.NewRequest(http.MethodPost, "/api/settings/backup/restore", bytes.NewReader(body))
+		req = req.WithContext(middleware.WithSession(req.Context(), adminSession))
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 
@@ -193,6 +196,7 @@ func TestSettingsHandlers(t *testing.T) {
 		_ = mw.Close()
 
 		req := httptest.NewRequest(http.MethodPost, "/api/settings/backup/restore", buf)
+		req = req.WithContext(middleware.WithSession(req.Context(), adminSession))
 		req.Header.Set("Content-Type", mw.FormDataContentType())
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
@@ -213,6 +217,7 @@ func TestSettingsHandlers(t *testing.T) {
 
 	t.Run("RestoreBackupHandler Invalid & Empty JSON", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/api/settings/backup/restore", bytes.NewReader([]byte("not-json")))
+		req = req.WithContext(middleware.WithSession(req.Context(), adminSession))
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusBadRequest {
@@ -220,6 +225,7 @@ func TestSettingsHandlers(t *testing.T) {
 		}
 
 		reqEmpty := httptest.NewRequest(http.MethodPost, "/api/settings/backup/restore", bytes.NewReader([]byte("")))
+		reqEmpty = reqEmpty.WithContext(middleware.WithSession(reqEmpty.Context(), adminSession))
 		wEmpty := httptest.NewRecorder()
 		r.ServeHTTP(wEmpty, reqEmpty)
 		if wEmpty.Code != http.StatusBadRequest {

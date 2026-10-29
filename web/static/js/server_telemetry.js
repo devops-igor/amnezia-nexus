@@ -137,7 +137,7 @@ async function checkServer() {
 
                 for (const [proto, info] of Object.entries(data.protocols)) {
                     updateProtocolCard(proto, info);
-                    const isVPN = ['awg', 'telemt'].includes(proto);
+                    const isVPN = ['awg', 'telemt', 'vless', 'naive'].includes(proto);
                     if (info.container_running && isVPN) {
                         const opt = document.createElement('option');
                         opt.value = proto;
@@ -186,7 +186,7 @@ async function checkServer() {
 }
 
 function updateStatusCounts(protocols) {
-    const protos = ['awg', 'telemt'];
+    const protos = ['awg', 'telemt', 'vless', 'naive'];
     const servs = ['dns'];
     let pRunning = 0, pTotal = protos.length;
     let sRunning = 0, sTotal = servs.length;
@@ -220,7 +220,10 @@ function updateProtocolCard(proto, info) {
                 if (proto === 'dns') {
                     grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('port')}</span><span class="protocol-info-value">172.29.172.254:53 (Internal)</span></div>`;
                 } else {
-                    grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('port')}</span><span class="protocol-info-value">${info.port}/${(proto === 'telemt') ? 'TCP' : 'UDP'}</span></div>`;
+                    let transport = 'UDP';
+                    if (proto === 'telemt' || proto === 'vless') transport = 'TCP';
+                    else if (proto === 'naive') transport = 'TCP/UDP';
+                    grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('port')}</span><span class="protocol-info-value">${info.port}/${transport}</span></div>`;
                 }
             }
             if (info.clients_count !== undefined) grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('connections')}</span><span class="protocol-info-value">${info.clients_count}</span></div>`;
@@ -512,14 +515,14 @@ async function loadConnections() {
                         <button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-cname="${UI.escapeHtml(name)}" onclick="copyConnectionConfig(this.dataset.cid, this.dataset.cname, this)" title="${_('copy')}">
                             <svg class="icon"><use href="#icon-copy"></use></svg>
                         </button>
-                        <button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-cname="${UI.escapeHtml(name)}" data-haskey="${!!userData.clientPrivateKey || proto === 'telemt'}" onclick="showConnectionConfig(this.dataset.cid, this.dataset.cname, this.dataset.haskey === 'true')" title="${_('config')}">
+                        <button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-cname="${UI.escapeHtml(name)}" data-haskey="${!!userData.clientPrivateKey || proto === 'telemt' || proto === 'vless' || proto === 'naive'}" onclick="showConnectionConfig(this.dataset.cid, this.dataset.cname, this.dataset.haskey === 'true')" title="${_('config')}">
                             <svg class="icon"><use href="#icon-file-text"></use></svg>
                         </button>
                         ${awgRotateBtn}
                         ${proto === 'telemt' ? `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" onclick="editConnection(this.dataset.cid)" title="${_('edit')}"><svg class="icon"><use href="#icon-pencil"></use></svg></button>` : ''}
-                        <button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-enabled="${!enabled}" onclick="toggleConnection(this.dataset.cid, this.dataset.enabled === 'true')" title="${toggleTitle}">
+                        ${proto === 'vless' || proto === 'naive' ? '' : `<button class="btn btn-ghost btn-sm btn-icon" data-cid="${UI.escapeHtml(client.clientId)}" data-enabled="${!enabled}" onclick="toggleConnection(this.dataset.cid, this.dataset.enabled === 'true')" title="${toggleTitle}">
                             <span class="badge-dot" style="background:${enabled ? 'var(--success)' : 'var(--text-muted)'}; width:10px; height:10px; display:inline-block;"></span>
-                        </button>
+                        </button>`}
                         <button class="btn btn-ghost btn-sm btn-icon" style="color:var(--danger);" data-cid="${UI.escapeHtml(client.clientId)}" onclick="removeConnection(this.dataset.cid)" title="${_('delete')}">
                             <svg class="icon"><use href="#icon-trash"></use></svg>
                         </button>

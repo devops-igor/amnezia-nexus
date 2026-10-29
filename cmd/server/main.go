@@ -14,11 +14,14 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/config"
 	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/handlers"
 	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/dns"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/mtproxyl"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/naive"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/xray"
 	"github.com/devops-igor/amnezia-nexus/internal/router"
 	"github.com/devops-igor/amnezia-nexus/internal/service"
 	"github.com/devops-igor/amnezia-nexus/internal/service/orchestrator"
@@ -167,11 +170,15 @@ func run(ctx context.Context) error {
 	}
 	mtproxylMgr := mtproxyl.NewMTProxyLManager(sshPool)
 	dnsMgr := dns.NewDNSManager(sshPool)
+	xrayMgr := xray.NewXrayManager(sshPool)
+	naiveMgr := naive.NewNaiveManager(sshPool)
 
 	reg := manager.NewRegistry()
 	reg.Register(awgMgr)
 	reg.Register(mtproxylMgr)
 	reg.Register(dnsMgr)
+	reg.Register(xrayMgr)
+	reg.Register(naiveMgr)
 
 	// 5. Startup Protocol Reconciliation
 	reconciler := service.NewReconciler(db, reg)
@@ -216,7 +223,18 @@ func run(ctx context.Context) error {
 	}()
 
 	// 10. Initialize HTTP Router and Server
-	r := router.NewRouter(cfg, db, vpnSvc)
+	r := router.NewRouterWithDeps(handlers.Dependencies{
+		Config:          cfg,
+		DB:              db,
+		Registry:        reg,
+		SSHPool:         sshPool,
+		AWGManager:      awgMgr,
+		MTProxyLManager: mtproxylMgr,
+		DNSManager:      dnsMgr,
+		XrayManager:     xrayMgr,
+		NaiveManager:    naiveMgr,
+		VPNService:      vpnSvc,
+	})
 	srv := router.NewServer(cfg, r, db)
 
 	serverErrCh := make(chan error, 1)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/security"
@@ -149,6 +150,14 @@ func (h *Handlers) AddUserHandler(w http.ResponseWriter, r *http.Request) {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
 		return
 	}
+	role := req.Role
+	if role == models.RoleAdmin && !h.GetSession(r).IsAdmin() {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin role required to create admin users")
+		return
+	}
+	if req.Protocol != nil && *req.Protocol != "" && !h.authorizeAdminProtocol(w, r, *req.Protocol) {
+		return
+	}
 
 	ctx := r.Context()
 	existing, err := h.db.GetUserByUsername(ctx, req.Username)
@@ -163,7 +172,6 @@ func (h *Handlers) AddUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	role := req.Role
 	if role == "" {
 		role = models.RoleUser
 	}
@@ -241,6 +249,13 @@ func (h *Handlers) provisionInitialConnection(ctx context.Context, user *models.
 	if req.ServerID == nil || req.Protocol == nil || *req.Protocol == "" {
 		return
 	}
+	defer h.lockUser(user.ID)()
+	curUser, err := h.db.GetUser(ctx, user.ID)
+	if err != nil || curUser == nil || !curUser.Enabled {
+		resp["connection_created"] = false
+		resp["connection_error"] = "user is disabled"
+		return
+	}
 	server, err := h.db.GetServer(ctx, *req.ServerID)
 	if err != nil || server == nil {
 		resp["connection_created"] = false
@@ -304,14 +319,9 @@ func (h *Handlers) provisionInitialConnection(ctx context.Context, user *models.
 		AWGMimicry: user.AWGMimicry,
 		CreatedAt:  time.Now(),
 	}
-	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
-		if rbErr := h.rollbackClient(ctx, protoMgr, server, connRes, clientID); rbErr != nil {
-			_ = h.db.SetPeerLifecycleStatus(ctx, server.ID, *req.Protocol, clientID, "failed")
-		} else {
-			_ = h.db.DeletePeerLifecycle(ctx, server.ID, *req.Protocol, clientID)
-		}
+	if status, _, msg := h.persistProvisioned(ctx, protoMgr, server, connRes, newConn); status != 0 {
 		resp["connection_created"] = false
-		resp["connection_error"] = err.Error()
+		resp["connection_error"] = msg
 		return
 	}
 
@@ -382,6 +392,34 @@ func (h *Handlers) refreshSelfSessionCookie(w http.ResponseWriter, r *http.Reque
 	return nil
 }
 
+// authorizeAccessPolicyUpdate fails closed (writing the response) unless the
+// caller is Admin whenever req changes expiry, quota, or reset policy for a
+// user owning VLESS or Naive connections: background enforcement of those
+// limits revokes the protected credentials, so it must not be reachable by
+// Support.
+func (h *Handlers) authorizeAccessPolicyUpdate(
+	w http.ResponseWriter, r *http.Request, userID string, req *models.UpdateUserRequest,
+) bool {
+	if req.ExpiresAt == nil &&
+		req.ExpirationDate == nil &&
+		req.TrafficLimit == nil &&
+		req.TrafficResetStrategy == nil {
+		return true
+	}
+	conns, err := h.db.GetConnectionsByUserID(r.Context(), userID)
+	if err != nil {
+		h.peerChangeError(w, err)
+		return false
+	}
+	for _, c := range conns {
+		proto := models.NormalizeProtocol(c.Protocol)
+		if proto == models.ProtocolVLESS || proto == models.ProtocolNaive {
+			return h.authorizeAdminProtocol(w, r, proto)
+		}
+	}
+	return true
+}
+
 // UpdateUserHandler updates user attributes and resets limits if modified.
 func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 	userID := chi.URLParam(r, "user_id")
@@ -401,10 +439,21 @@ func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Serialize with provisioning so the protected-connection snapshot below
+	// cannot go stale before the access-policy change is committed.
+	defer h.lockUser(userID)()
+
 	ctx := r.Context()
+	if !h.authorizeAccessPolicyUpdate(w, r, userID, &req) {
+		return
+	}
 	user, err := h.db.GetUser(ctx, userID)
 	if err != nil || user == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
+		return
+	}
+	if user.Role == models.RoleAdmin && !h.GetSession(r).IsAdmin() {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin role required to update admin accounts")
 		return
 	}
 
@@ -466,28 +515,58 @@ func (h *Handlers) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Serialize the connection snapshot, remote revocation and user deletion
+	// with provisioning so no new credential can escape the deletion snapshot.
+	defer h.lockUser(userID)()
+
 	ctx := r.Context()
 	user, err := h.db.GetUser(ctx, userID)
 	if err != nil || user == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
 		return
 	}
-
-	// Delete client connections on servers
-	conns, _ := h.db.GetConnectionsByUserID(ctx, userID)
-	for _, c := range conns {
-		if server, err := h.db.GetServer(ctx, c.ServerID); err == nil && server != nil {
-			if protoMgr, err := h.GetProtocolManager(c.Protocol); err == nil && protoMgr != nil {
-				_ = protoMgr.RemoveClient(ctx, server, c.ClientID)
-			}
-		}
-		_ = h.db.DeletePeerLifecycle(ctx, c.ServerID, c.Protocol, c.ClientID)
+	if user.Role == models.RoleAdmin && !h.GetSession(r).IsAdmin() {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin role required to delete admin accounts")
+		return
 	}
 
-	if _, err := h.db.DeleteConnectionsByUser(ctx, userID); err != nil {
+	// Delete client connections on servers only after their remote credentials
+	// are removed, preserving failed records so account deletion can be retried.
+	conns, err := h.db.GetConnectionsByUserID(ctx, userID)
+	if err != nil {
 		h.peerChangeError(w, err)
 		return
 	}
+	for _, c := range conns {
+		proto := models.NormalizeProtocol(c.Protocol)
+		if proto == models.ProtocolVLESS || proto == models.ProtocolNaive {
+			if !h.authorizeAdminProtocol(w, r, proto) {
+				return
+			}
+			break
+		}
+	}
+	for _, c := range conns {
+		current, err := h.db.GetConnection(ctx, c.ID)
+		if err != nil {
+			h.peerChangeError(w, err)
+			return
+		}
+		if current == nil || current.UserID != userID {
+			continue
+		}
+		if err := h.removeRemoteClient(ctx, current); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "remote_removal_failed",
+				"Failed to remove remote client credentials: "+err.Error())
+			return
+		}
+		if _, err := h.db.DeleteConnection(ctx, current.ID); err != nil {
+			h.peerChangeError(w, err)
+			return
+		}
+		_ = h.db.DeletePeerLifecycle(ctx, current.ServerID, current.Protocol, current.ClientID)
+	}
+
 	if _, err := h.db.DeleteUser(ctx, userID); err != nil {
 		h.peerChangeError(w, err)
 		return
@@ -506,6 +585,32 @@ func (h *Handlers) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 	h.JSONOK(w)
 }
 
+// removeRemoteClient revokes a connection's credential on its server. Server-less
+// (ServerID 0, load-balanced) connections have no remote credential to remove.
+func (h *Handlers) removeRemoteClient(ctx context.Context, c *models.UserConnection) error {
+	if c.ServerID == 0 {
+		return nil
+	}
+	server, err := h.db.GetServer(ctx, c.ServerID)
+	if err != nil {
+		return fmt.Errorf("load server %d: %w", c.ServerID, err)
+	}
+	if server == nil {
+		return fmt.Errorf("server %d not found", c.ServerID)
+	}
+	protoMgr, err := h.GetProtocolManager(c.Protocol)
+	if err != nil {
+		return fmt.Errorf("protocol manager %q: %w", c.Protocol, err)
+	}
+	if protoMgr == nil {
+		return fmt.Errorf("protocol manager %q not found", c.Protocol)
+	}
+	if err := protoMgr.RemoveClient(ctx, server, c.ClientID); err != nil {
+		return fmt.Errorf("remove client %q: %w", c.ClientID, err)
+	}
+	return nil
+}
+
 // ToggleUserHandler enables or disables a user and toggles their server client connections.
 func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 	userID := chi.URLParam(r, "user_id")
@@ -520,11 +625,55 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Hold the per-user lock across snapshot, revocation and commit so an in-flight
+	// credential creation either lands in the snapshot or sees the user disabled.
+	defer h.lockUser(userID)()
+
 	ctx := r.Context()
 	user, err := h.db.GetUser(ctx, userID)
 	if err != nil || user == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
 		return
+	}
+	if user.Role == models.RoleAdmin && !h.GetSession(r).IsAdmin() {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin role required to toggle admin accounts")
+		return
+	}
+
+	conns, err := h.db.GetConnectionsByUserID(ctx, userID)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve user connections")
+		return
+	}
+	if !req.Enabled {
+		for i := range conns {
+			c := &conns[i]
+			proto := models.NormalizeProtocol(c.Protocol)
+			if proto == models.ProtocolVLESS || proto == models.ProtocolNaive {
+				if !h.authorizeAdminProtocol(w, r, proto) {
+					return
+				}
+				break
+			}
+		}
+		// VLESS/Naive cannot be toggled in place: revoke the remote credential
+		// first (fail closed, user stays enabled), then drop the row like userops does.
+		for i := range conns {
+			c := &conns[i]
+			if proto := models.NormalizeProtocol(c.Protocol); proto != models.ProtocolVLESS && proto != models.ProtocolNaive {
+				continue
+			}
+			if err := h.removeRemoteClient(ctx, c); err != nil {
+				slog.Error("failed to revoke remote client on user disable", "user_id", userID, "client_id", c.ClientID, "error", err)
+				h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to revoke remote client credential")
+				return
+			}
+			if _, err := h.db.DeleteConnection(ctx, c.ID); err != nil {
+				h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete revoked connection")
+				return
+			}
+			_ = h.db.DeletePeerLifecycle(ctx, c.ServerID, c.Protocol, c.ClientID)
+		}
 	}
 
 	if _, err := h.db.UpdateUser(ctx, userID, map[string]any{
@@ -542,7 +691,7 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Toggle clients on servers
-	conns, _ := h.db.GetConnectionsByUserID(ctx, userID)
+	conns, _ = h.db.GetConnectionsByUserID(ctx, userID)
 	for _, c := range conns {
 		if c.Protocol == "awg" && h.awgMgr != nil {
 			if server, err := h.db.GetServer(ctx, c.ServerID); err == nil && server != nil {
@@ -556,6 +705,38 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 		"status":  "ok",
 		"enabled": req.Enabled,
 	})
+}
+
+// loadExistingClientConfig validates an unassigned client and returns its remote configuration.
+func (h *Handlers) loadExistingClientConfig(
+	w http.ResponseWriter,
+	ctx context.Context,
+	protoMgr manager.ProtocolManager,
+	server *models.Server,
+	req *models.AddUserConnectionRequest,
+) (string, bool) {
+	clientID := *req.ClientID
+	current, err := h.findClientConnection(ctx, req.ServerID, req.Protocol, clientID)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve connections")
+		return "", false
+	}
+	if current != nil {
+		h.JSONError(w, http.StatusConflict, "connection_already_assigned", "Client is already assigned to another user")
+		return "", false
+	}
+	configStr, err := protoMgr.GetClientConfig(ctx, server, clientID)
+	if err == nil && configStr != "" {
+		return configStr, true
+	}
+	if err != nil && req.Protocol == models.ProtocolAWG {
+		exists, _ := verifyRemoteClientExists(ctx, protoMgr, server, clientID)
+		if exists {
+			return "", true
+		}
+	}
+	h.JSONError(w, http.StatusNotFound, "client_not_found", "Client configuration not found on remote server")
+	return "", false
 }
 
 // AddUserConnectionHandler assigns a new or existing connection to a specific user.
@@ -576,11 +757,25 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
 		return
 	}
+	if !h.authorizeAdminProtocol(w, r, req.Protocol) {
+		return
+	}
+
+	hasExistingClient := req.ClientID != nil && *req.ClientID != ""
+	if hasExistingClient {
+		unlockClient := lockClient(req.ServerID, req.Protocol, *req.ClientID)
+		defer unlockClient()
+	}
+	defer h.lockUser(userID)()
 
 	ctx := r.Context()
 	user, err := h.db.GetUser(ctx, userID)
 	if err != nil || user == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
+		return
+	}
+	if !user.Enabled {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Account is disabled")
 		return
 	}
 
@@ -603,9 +798,13 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 	var clientID, configStr string
 	var addResult map[string]any
 	clientCreated := false
-	if req.ClientID != nil && *req.ClientID != "" {
+	if hasExistingClient {
 		clientID = *req.ClientID
-		configStr, _ = protoMgr.GetClientConfig(ctx, server, clientID)
+		var ok bool
+		configStr, ok = h.loadExistingClientConfig(w, ctx, protoMgr, server, &req)
+		if !ok {
+			return
+		}
 	} else {
 		params := buildConnectionParams(req.Name, req.TelemtQuota, req.TelemtMaxIPs, req.TelemtExpiry, req.AWGMimicry)
 
@@ -639,19 +838,16 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	if clientCreated {
-		_ = h.db.RecordPeerLifecycle(ctx, req.ServerID, req.Protocol, clientID, req.Name, userID, "active")
-	}
-
-	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
-		if clientCreated && clientID != "" {
-			if rbErr := h.rollbackClient(ctx, protoMgr, server, addResult, clientID); rbErr != nil {
-				_ = h.db.SetPeerLifecycleStatus(ctx, req.ServerID, req.Protocol, clientID, "failed")
-			} else {
-				_ = h.db.DeletePeerLifecycle(ctx, req.ServerID, req.Protocol, clientID)
-			}
+		if status, code, msg := h.persistProvisioned(ctx, protoMgr, server, addResult, newConn); status != 0 {
+			h.JSONError(w, status, code, msg)
+			return
 		}
+	} else if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
 		return
+	}
+	if hasExistingClient {
+		_ = h.db.RecordPeerLifecycle(ctx, req.ServerID, req.Protocol, *req.ClientID, req.Name, userID, "active")
 	}
 
 	h.audit(r, "user.connection_add", map[string]any{"user_id": userID, "server_id": req.ServerID, "protocol": req.Protocol, "client_id": clientID})
@@ -704,14 +900,20 @@ func (h *Handlers) GetUserConnectionsHandler(w http.ResponseWriter, r *http.Requ
 				srvName = fmt.Sprintf("Server #%d", c.ServerID)
 			}
 		}
+		clientID := c.ClientID
+		connName := c.Name
+		if models.NormalizeProtocol(c.Protocol) == models.ProtocolVLESS && sess.Role != models.RoleAdmin {
+			clientID = ""
+			connName = safeVLESSDisplayName(connName, c.ClientID)
+		}
 		enriched[i] = map[string]any{
 			"id":               c.ID,
 			"user_id":          c.UserID,
 			"server_id":        c.ServerID,
 			"server_name":      srvName,
 			"protocol":         c.Protocol,
-			"client_id":        c.ClientID,
-			"name":             c.Name,
+			"client_id":        clientID,
+			"name":             connName,
 			"awg_mimicry":      c.AWGMimicry,
 			"traffic_total_rx": c.TrafficTotalRx,
 			"traffic_total_tx": c.TrafficTotalTx,

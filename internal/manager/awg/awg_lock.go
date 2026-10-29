@@ -40,6 +40,19 @@ func (r *ServerLockRegistry) getLock(serverID int64) *sync.Mutex {
 	return l
 }
 
+// GetLock retrieves or creates a per-server mutex.
+func (r *ServerLockRegistry) GetLock(serverID int64) *sync.Mutex {
+	if r == nil {
+		return globalServerLocks.getLock(serverID)
+	}
+	return r.getLock(serverID)
+}
+
+// GlobalServerLocks returns the global per-server lock registry.
+func GlobalServerLocks() *ServerLockRegistry {
+	return globalServerLocks
+}
+
 func (m *AWGManager) getServerLock(serverID int64) *sync.Mutex {
 	if m != nil && m.serverLocks != nil {
 		return m.serverLocks.getLock(serverID)
@@ -182,19 +195,29 @@ func (m *AWGManager) ResolveLockResource(ctx context.Context, client ssh.SSHClie
 	return m.resolveLockResource(ctx, client, serverID)
 }
 
-func (m *AWGManager) acquireRemoteServerLock(ctx context.Context, client ssh.SSHClient, serverID int64) (func(), error) {
-	if client == nil || serverID <= 0 {
+// AcquireRemoteServerLock acquires a remote shell lock for the given resource on the target host.
+func AcquireRemoteServerLock(ctx context.Context, client ssh.SSHClient, resource any) (func(), error) {
+	return AcquireRemoteServerLockWithHeartbeat(ctx, client, resource, defaultRemoteLockHeartbeatInterval, defaultRemoteLockHeartbeatTimeout)
+}
+
+// AcquireRemoteServerLockWithHeartbeat acquires a remote shell lock with custom heartbeat settings.
+func AcquireRemoteServerLockWithHeartbeat(ctx context.Context, client ssh.SSHClient, resource any, interval, timeout time.Duration) (func(), error) {
+	if client == nil {
 		return func() {}, nil
 	}
-	resource := m.resolveLockResource(ctx, client, serverID)
 	token := generateLockToken()
 	cmd := remoteLockAcquireCmd(resource, token)
 	_, errOut, code, err := client.RunSudoCommand(ctx, cmd)
 	if err != nil || code != 0 {
-		return nil, fmt.Errorf("failed to acquire remote server lock on server %d (exit code %d): %s: %w", serverID, code, strings.TrimSpace(errOut), err)
+		return nil, fmt.Errorf("failed to acquire remote server lock on resource %v (exit code %d): %s: %w", resource, code, strings.TrimSpace(errOut), err)
 	}
 
-	interval, timeout := m.getLockHeartbeatConfig()
+	if interval <= 0 {
+		interval = defaultRemoteLockHeartbeatInterval
+	}
+	if timeout <= 0 {
+		timeout = defaultRemoteLockHeartbeatTimeout
+	}
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(context.Background())
 	touchCmd := remoteLockHeartbeatCmd(resource, token)
 
@@ -215,7 +238,7 @@ func (m *AWGManager) acquireRemoteServerLock(ctx context.Context, client ssh.SSH
 				touchCancel()
 				if err != nil || code != 0 {
 					if !errors.Is(touchCtx.Err(), context.Canceled) {
-						slog.Debug("failed to refresh remote server lock heartbeat", "server_id", serverID, "resource", resource, "code", code, "error", err, "stderr", strings.TrimSpace(errOut))
+						slog.Debug("failed to refresh remote server lock heartbeat", "resource", resource, "code", code, "error", err, "stderr", strings.TrimSpace(errOut))
 					}
 				}
 			}
@@ -226,16 +249,34 @@ func (m *AWGManager) acquireRemoteServerLock(ctx context.Context, client ssh.SSH
 	unlock := func() {
 		once.Do(func() {
 			cancelHeartbeat()
-			heartbeatWg.Wait()
+			done := make(chan struct{})
+			go func() {
+				heartbeatWg.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				slog.Warn("remote server lock heartbeat worker did not exit promptly on cancel")
+			}
 
 			relCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			relCmd := remoteLockReleaseCmd(resource, token)
 			_, errOut, code, err := client.RunSudoCommand(relCtx, relCmd)
 			if err != nil || code != 0 {
-				slog.Warn("failed to release remote server lock", "server_id", serverID, "resource", resource, "code", code, "error", err, "stderr", strings.TrimSpace(errOut))
+				slog.Warn("failed to release remote server lock", "resource", resource, "code", code, "error", err, "stderr", strings.TrimSpace(errOut))
 			}
 		})
 	}
 	return unlock, nil
+}
+
+func (m *AWGManager) acquireRemoteServerLock(ctx context.Context, client ssh.SSHClient, serverID int64) (func(), error) {
+	if client == nil || serverID <= 0 {
+		return func() {}, nil
+	}
+	resource := m.resolveLockResource(ctx, client, serverID)
+	interval, timeout := m.getLockHeartbeatConfig()
+	return AcquireRemoteServerLockWithHeartbeat(ctx, client, resource, interval, timeout)
 }

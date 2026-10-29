@@ -198,6 +198,7 @@
                         <svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download_backup" }}
                     </a>
                 </div>
+                {{ if is_admin .current_user }}
                 <div style="border-top: 1px solid var(--border-color); padding-top: var(--space-md);">
                     <div style="display: flex; flex-direction: column; gap: var(--space-sm);">
                         <input type="file" id="backupFile" accept=".json" style="display: none;"
@@ -210,10 +211,13 @@
                         </button>
                     </div>
                 </div>
+                {{ end }}
             </div>
+            {{ if is_admin .current_user }}
             <p class="form-hint" style="margin-top: var(--space-sm);">
                 {{ _ "restore_confirm" }}
             </p>
+            {{ end }}
         </div>
 
         <!-- BLOCK 7: Upstream AmneziaWG Components -->

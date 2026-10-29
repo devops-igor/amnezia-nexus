@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"github.com/go-chi/chi/v5"
@@ -100,14 +101,20 @@ func (h *Handlers) UserGetMyConnectionsHandler(w http.ResponseWriter, r *http.Re
 			srvStatus, srvReachable = h.serverReachabilityInfo(ctx, c.ServerID)
 		}
 
+		clientID := c.ClientID
+		connName := c.Name
+		if models.NormalizeProtocol(c.Protocol) == models.ProtocolVLESS && sess.Role != models.RoleAdmin {
+			clientID = ""
+			connName = safeVLESSDisplayName(connName, c.ClientID)
+		}
 		enriched[i] = map[string]any{
 			"id":               c.ID,
 			"user_id":          c.UserID,
 			"server_id":        c.ServerID,
 			"server_name":      srvName,
 			"protocol":         c.Protocol,
-			"client_id":        c.ClientID,
-			"name":             c.Name,
+			"client_id":        clientID,
+			"name":             connName,
 			"awg_mimicry":      c.AWGMimicry,
 			"traffic_total_rx": c.TrafficTotalRx,
 			"traffic_total_tx": c.TrafficTotalTx,
@@ -156,6 +163,12 @@ func (h *Handlers) UserAddConnectionHandler(w http.ResponseWriter, r *http.Reque
 
 	if err := req.Validate(); err != nil {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
+		return
+	}
+
+	proto := models.NormalizeProtocol(req.Protocol)
+	if (proto == models.ProtocolVLESS || proto == models.ProtocolNaive) && sess.Role != models.RoleAdmin {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required for VLESS and Naive protocols")
 		return
 	}
 
@@ -248,15 +261,8 @@ func (h *Handlers) UserAddConnectionHandler(w http.ResponseWriter, r *http.Reque
 		newConn.AWGMimicry = models.AWGMimicryProfile(*req.AWGMimicry)
 	}
 
-	_ = h.db.RecordPeerLifecycle(ctx, req.ServerID, req.Protocol, clientID, req.Name, user.ID, "active")
-
-	if _, err := h.db.CreateConnection(ctx, newConn); err != nil {
-		if rbErr := h.rollbackClient(ctx, protoMgr, server, result, clientID); rbErr != nil {
-			_ = h.db.SetPeerLifecycleStatus(ctx, req.ServerID, req.Protocol, clientID, "failed")
-		} else {
-			_ = h.db.DeletePeerLifecycle(ctx, req.ServerID, req.Protocol, clientID)
-		}
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
+	if status, code, msg := h.persistProvisioned(ctx, protoMgr, server, result, newConn); status != 0 {
+		h.JSONError(w, status, code, msg)
 		return
 	}
 
@@ -270,6 +276,28 @@ func (h *Handlers) UserAddConnectionHandler(w http.ResponseWriter, r *http.Reque
 		"vpn_link":   vpnLink,
 		"connection": newConn,
 	})
+}
+
+// persistProvisioned records a just-provisioned remote client and inserts its connection row.
+// If the owner was disabled or deleted while provisioning was in flight, or the insert fails,
+// the remote credential is revoked and a non-zero HTTP status is returned.
+func (h *Handlers) persistProvisioned(ctx context.Context, protoMgr manager.ProtocolManager, server *models.Server, result map[string]any, conn *models.UserConnection) (status int, code, msg string) {
+	_ = h.db.RecordPeerLifecycle(ctx, conn.ServerID, conn.Protocol, conn.ClientID, conn.Name, conn.UserID, "active")
+
+	if cur, err := h.db.GetUser(ctx, conn.UserID); err != nil || cur == nil || !cur.Enabled {
+		status, code, msg = http.StatusForbidden, "forbidden", "Account is disabled"
+	} else if _, err := h.db.CreateConnection(ctx, conn); err != nil {
+		status, code, msg = http.StatusInternalServerError, "internal_error", "Failed to save connection record"
+	} else {
+		return 0, "", ""
+	}
+
+	if rbErr := h.rollbackClient(ctx, protoMgr, server, result, conn.ClientID); rbErr != nil {
+		_ = h.db.SetPeerLifecycleStatus(ctx, conn.ServerID, conn.Protocol, conn.ClientID, "failed")
+	} else {
+		_ = h.db.DeletePeerLifecycle(ctx, conn.ServerID, conn.Protocol, conn.ClientID)
+	}
+	return status, code, msg
 }
 
 // addLoadBalancedConnection provisions a load-balanced client connection targeting the portal VPN subsystem.
@@ -390,6 +418,11 @@ func (h *Handlers) UserGetConnectionConfigHandler(w http.ResponseWriter, r *http
 	}
 	if sess.Role != models.RoleAdmin && sess.Role != models.RoleSupport && conn.UserID != sess.UserID {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
+		return
+	}
+	proto := models.NormalizeProtocol(conn.Protocol)
+	if (proto == models.ProtocolVLESS || proto == models.ProtocolNaive) && sess.Role != models.RoleAdmin {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required for VLESS and Naive protocols")
 		return
 	}
 
@@ -534,6 +567,11 @@ func (h *Handlers) UserDeleteConnectionHandler(w http.ResponseWriter, r *http.Re
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
 		return
 	}
+	proto := models.NormalizeProtocol(conn.Protocol)
+	if (proto == models.ProtocolVLESS || proto == models.ProtocolNaive) && sess.Role != models.RoleAdmin {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required for VLESS and Naive protocols")
+		return
+	}
 
 	if conn.ServerID == 0 {
 		if h.vpnSvc != nil {
@@ -543,7 +581,10 @@ func (h *Handlers) UserDeleteConnectionHandler(w http.ResponseWriter, r *http.Re
 		server, err := h.db.GetServer(ctx, conn.ServerID)
 		if err == nil && server != nil {
 			if protoMgr, err := h.GetProtocolManager(conn.Protocol); err == nil && protoMgr != nil {
-				_ = protoMgr.RemoveClient(ctx, server, conn.ClientID)
+				if err := protoMgr.RemoveClient(ctx, server, conn.ClientID); err != nil {
+					h.JSONError(w, http.StatusInternalServerError, "remote_removal_failed", "Failed to remove remote client credentials: "+err.Error())
+					return
+				}
 			}
 		}
 	}

@@ -163,13 +163,19 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 
 	connMaps := make([]map[string]any, len(conns))
 	for i, c := range conns {
+		clientID := c.ClientID
+		connName := c.Name
+		if models.NormalizeProtocol(c.Protocol) == models.ProtocolVLESS && !h.GetSession(r).IsAdmin() {
+			clientID = ""
+			connName = safeVLESSDisplayName(connName, c.ClientID)
+		}
 		connMaps[i] = map[string]any{
 			"id":               c.ID,
 			"user_id":          c.UserID,
 			"server_id":        c.ServerID,
 			"protocol":         c.Protocol,
-			"client_id":        c.ClientID,
-			"name":             c.Name,
+			"client_id":        clientID,
+			"name":             connName,
 			"awg_mimicry":      c.AWGMimicry,
 			"traffic_total_rx": c.TrafficTotalRx,
 			"traffic_total_tx": c.TrafficTotalTx,
@@ -239,6 +245,12 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 
 // RestoreBackupHandler imports and merges database records from a JSON backup.
 func (h *Handlers) RestoreBackupHandler(w http.ResponseWriter, r *http.Request) {
+	sess := h.GetSession(r)
+	if sess == nil || !sess.IsAdmin() {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin role required")
+		return
+	}
+
 	var bodyBytes []byte
 
 	// Handle multipart upload or raw JSON

@@ -341,6 +341,10 @@ func TestServerConnectionsHandlers(t *testing.T) {
 	})
 
 	t.Run("EditServerConnectionHandler All Branches", func(t *testing.T) {
+		awgMgr, _ := h.GetProtocolManager("awg")
+		h.registry.Register(&mockProtocolManager{protocol: "awg"})
+		defer h.registry.Register(awgMgr)
+
 		// Branch: no matching conn, userID set -> creates new conn
 		bodyNewConn, _ := json.Marshal(models.EditConnectionRequest{
 			Protocol: "awg",
@@ -424,6 +428,24 @@ func TestServerConnectionsHandlers(t *testing.T) {
 		r.ServeHTTP(w404, req404)
 		if w404.Code != http.StatusNotFound {
 			t.Fatalf("expected 404, got %d", w404.Code)
+		}
+
+		// Rejects VLESS and Naive
+		for _, proto := range []string{"vless", "naive"} {
+			toggleBody, _ := json.Marshal(map[string]any{
+				"protocol":  proto,
+				"client_id": "client-1",
+				"enabled":   false,
+			})
+			reqProto := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/connections/toggle", serverID), bytes.NewReader(toggleBody))
+			wProto := httptest.NewRecorder()
+			r.ServeHTTP(wProto, reqProto)
+			if wProto.Code != http.StatusBadRequest {
+				t.Errorf("expected 400 Bad Request for %s connection toggle, got %d (body: %s)", proto, wProto.Code, wProto.Body.String())
+			}
+			if !strings.Contains(wProto.Body.String(), "Client disable is not supported for this protocol; use remove instead") {
+				t.Errorf("expected honest error message for %s, got: %s", proto, wProto.Body.String())
+			}
 		}
 	})
 

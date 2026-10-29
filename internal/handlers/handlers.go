@@ -21,10 +21,13 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/dns"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/mtproxyl"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/naive"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/xray"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/upstream"
+	"github.com/devops-igor/amnezia-nexus/internal/service/userops"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 )
 
@@ -48,6 +51,8 @@ type Dependencies struct {
 	AWGManager      *awg.AWGManager
 	MTProxyLManager *mtproxyl.MTProxyLManager
 	DNSManager      *dns.DNSManager
+	XrayManager     *xray.XrayManager
+	NaiveManager    *naive.NaiveManager
 	VPNService      *vpn.Service
 	UpstreamService UpstreamChecker
 }
@@ -61,35 +66,23 @@ type Handlers struct {
 	awgMgr                    *awg.AWGManager
 	mtproxylMgr               *mtproxyl.MTProxyLManager
 	dnsMgr                    *dns.DNSManager
+	xrayMgr                   *xray.XrayManager
+	naiveMgr                  *naive.NaiveManager
 	vpnSvc                    *vpn.Service
 	upstreamSvc               UpstreamChecker
 	dialTimeout               func(network, address string, timeout time.Duration) (net.Conn, error)
 	setupMu                   sync.Mutex
 	captchaOnce               sync.Once
 	captchaSt                 *captcha.Store
-	userConnMu                sync.Mutex
-	userConnLocks             map[string]*sync.Mutex
 	serverHostMu              sync.Mutex
 	serverHostLocks           map[int64]*sync.Mutex
 	updateServerProtocolsHook func(context.Context, int64, map[string]any) error
 }
 
+// lockUser serializes credential admission and user disabling; the lock is shared
+// with userops so background quota/expiry disables are covered too.
 func (h *Handlers) lockUser(userID string) func() {
-	h.userConnMu.Lock()
-	if h.userConnLocks == nil {
-		h.userConnLocks = make(map[string]*sync.Mutex)
-	}
-	mu, ok := h.userConnLocks[userID]
-	if !ok {
-		mu = &sync.Mutex{}
-		h.userConnLocks[userID] = mu
-	}
-	h.userConnMu.Unlock()
-
-	mu.Lock()
-	return func() {
-		mu.Unlock()
-	}
+	return userops.LockUser(userID)
 }
 
 func (h *Handlers) updateServerProtocols(ctx context.Context, serverID int64, protocols map[string]any) error {
@@ -127,6 +120,8 @@ func NewHandlers(deps Dependencies) *Handlers {
 		awgMgr:      deps.AWGManager,
 		mtproxylMgr: deps.MTProxyLManager,
 		dnsMgr:      deps.DNSManager,
+		xrayMgr:     deps.XrayManager,
+		naiveMgr:    deps.NaiveManager,
 		vpnSvc:      deps.VPNService,
 		upstreamSvc: deps.UpstreamService,
 	}
@@ -146,6 +141,12 @@ func NewHandlers(deps Dependencies) *Handlers {
 	}
 	if h.dnsMgr != nil {
 		h.registry.Register(h.dnsMgr)
+	}
+	if h.xrayMgr != nil {
+		h.registry.Register(h.xrayMgr)
+	}
+	if h.naiveMgr != nil {
+		h.registry.Register(h.naiveMgr)
 	}
 	if h.vpnSvc != nil && h.awgMgr != nil {
 		h.vpnSvc.SetAWGStatusProvider(h.awgMgr)
@@ -251,6 +252,14 @@ func resolveClientID(result map[string]any) string {
 	return cid
 }
 
+// safeVLESSDisplayName hides empty and credential-derived VLESS display names.
+func safeVLESSDisplayName(name, clientID string) string {
+	if name == "" || strings.EqualFold(name, clientID) || (clientID != "" && strings.Contains(name, clientID)) {
+		return "Unnamed"
+	}
+	return name
+}
+
 // buildConnectionParams aggregates protocol and optional telemt params.
 func buildConnectionParams(name string, quota *string, maxIPs *int, expiry *string, mimicry *string) map[string]any {
 	params := map[string]any{"name": name}
@@ -307,6 +316,14 @@ func (h *Handlers) GetProtocolManager(proto string) (manager.ProtocolManager, er
 	case "dns":
 		if h.dnsMgr != nil {
 			return h.dnsMgr, nil
+		}
+	case "vless":
+		if h.xrayMgr != nil {
+			return h.xrayMgr, nil
+		}
+	case "naive":
+		if h.naiveMgr != nil {
+			return h.naiveMgr, nil
 		}
 	}
 

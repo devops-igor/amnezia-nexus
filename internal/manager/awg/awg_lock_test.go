@@ -1,8 +1,21 @@
 package awg
 
 import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/binary"
+	"net"
+	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	"github.com/pkg/sftp"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 func TestAWGManager_ServerLock_Isolation(t *testing.T) {
@@ -115,4 +128,599 @@ func TestAWGManager_ServerLock_ConcurrentAccess(t *testing.T) {
 			t.Errorf("server %d: expected distinct locks for mgr1 and mgr2, got %p", id, lock1)
 		}
 	}
+}
+
+type stalledSessionServer struct {
+	listener         net.Listener
+	config           *gossh.ServerConfig
+	heartbeatOpening chan struct{}
+	heartbeatOnce    sync.Once
+	channelCount     atomic.Int32
+	locked           atomic.Bool
+}
+
+func newStalledSessionServer(t *testing.T) *stalledSessionServer {
+	t.Helper()
+
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate SSH host key: %v", err)
+	}
+	signer, err := gossh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatalf("create SSH host signer: %v", err)
+	}
+
+	config := &gossh.ServerConfig{
+		PasswordCallback: func(conn gossh.ConnMetadata, password []byte) (*gossh.Permissions, error) {
+			return nil, nil
+		},
+	}
+	config.AddHostKey(signer)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for SSH connections: %v", err)
+	}
+
+	server := &stalledSessionServer{
+		listener:         listener,
+		config:           config,
+		heartbeatOpening: make(chan struct{}),
+	}
+	go server.serve(t)
+	t.Cleanup(func() { _ = listener.Close() })
+	return server
+}
+
+func (s *stalledSessionServer) serve(t *testing.T) {
+	conn, err := s.listener.Accept()
+	if err != nil {
+		return
+	}
+	serverConn, channels, requests, err := gossh.NewServerConn(conn, s.config)
+	if err != nil {
+		_ = conn.Close()
+		t.Errorf("SSH handshake failed: %v", err)
+		return
+	}
+	defer serverConn.Close()
+	go gossh.DiscardRequests(requests)
+
+	for newChannel := range channels {
+		if newChannel.ChannelType() != "session" {
+			_ = newChannel.Reject(gossh.UnknownChannelType, "unsupported channel type")
+			continue
+		}
+		if s.channelCount.Add(1) == 2 {
+			s.heartbeatOnce.Do(func() { close(s.heartbeatOpening) })
+			continue
+		}
+		channel, channelRequests, err := newChannel.Accept()
+		if err != nil {
+			continue
+		}
+		go s.handleSession(channel, channelRequests)
+	}
+}
+
+func (s *stalledSessionServer) handleSession(channel gossh.Channel, requests <-chan *gossh.Request) {
+	defer channel.Close()
+	for request := range requests {
+		if request.Type != "exec" || len(request.Payload) < 4 {
+			_ = request.Reply(false, nil)
+			continue
+		}
+		commandLength := binary.BigEndian.Uint32(request.Payload[:4])
+		if int(commandLength) > len(request.Payload)-4 {
+			_ = request.Reply(false, nil)
+			continue
+		}
+		command := string(request.Payload[4 : 4+commandLength])
+		_ = request.Reply(true, nil)
+
+		exitCode := uint32(0)
+		switch {
+		case strings.Contains(command, "cur_owner=") && strings.Contains(command, "rm -rf"):
+			s.locked.Store(false)
+		case strings.Contains(command, "flock_path="):
+			if !s.locked.CompareAndSwap(false, true) {
+				exitCode = 1
+			}
+		}
+		status := make([]byte, 4)
+		binary.BigEndian.PutUint32(status, exitCode)
+		_, _ = channel.SendRequest("exit-status", false, status)
+		return
+	}
+}
+
+func TestRemoteLock_UnlockCancelsStalledHeartbeatSessionOpen(t *testing.T) {
+	server := newStalledSessionServer(t)
+	address := server.listener.Addr().(*net.TCPAddr)
+	client, err := ssh.Dial(context.Background(), ssh.Config{
+		Host:            address.IP.String(),
+		Port:            address.Port,
+		User:            "root",
+		Password:        "test",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		t.Fatalf("dial stalled-session SSH server: %v", err)
+	}
+	defer client.Close()
+
+	unlock, err := AcquireRemoteServerLockWithHeartbeat(
+		context.Background(), client, "server_636", 10*time.Millisecond, time.Second,
+	)
+	if err != nil {
+		t.Fatalf("acquire remote lock: %v", err)
+	}
+
+	select {
+	case <-server.heartbeatOpening:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat did not attempt to open an SSH session")
+	}
+
+	unlockDone := make(chan struct{})
+	started := time.Now()
+	go func() {
+		unlock()
+		close(unlockDone)
+	}()
+	select {
+	case <-unlockDone:
+		if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+			t.Fatalf("unlock took %s with a stalled heartbeat session open", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("unlock did not cancel stalled heartbeat session opening")
+	}
+
+	reacquireCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	secondUnlock, err := AcquireRemoteServerLockWithHeartbeat(
+		reacquireCtx, client, "server_636", time.Hour, time.Second,
+	)
+	if err != nil {
+		t.Fatalf("reacquire remote lock after stalled heartbeat: %v", err)
+	}
+	secondUnlock()
+}
+
+type blackholePacketGate struct {
+	net.Conn
+	paused atomic.Bool
+	resume <-chan struct{}
+}
+
+func (c *blackholePacketGate) Write(p []byte) (int, error) {
+	if c.paused.Load() {
+		<-c.resume
+	}
+	return c.Conn.Write(p)
+}
+
+func TestRemoteLock_UnlockReturnsPromptlyWhenReleaseExecBlackholes(t *testing.T) {
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate SSH host key: %v", err)
+	}
+	signer, err := gossh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatalf("create SSH host signer: %v", err)
+	}
+	config := &gossh.ServerConfig{NoClientAuth: true}
+	config.AddHostKey(signer)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for SSH connections: %v", err)
+	}
+	defer listener.Close()
+
+	resume := make(chan struct{})
+	releaseStarted := make(chan struct{})
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		raw, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		wire := &blackholePacketGate{Conn: raw, resume: resume}
+		serverConn, channels, requests, handshakeErr := gossh.NewServerConn(wire, config)
+		if handshakeErr != nil {
+			_ = raw.Close()
+			return
+		}
+		defer serverConn.Close()
+		go gossh.DiscardRequests(requests)
+
+		for newChannel := range channels {
+			channel, channelRequests, openErr := newChannel.Accept()
+			if openErr != nil {
+				return
+			}
+			go func() {
+				for request := range channelRequests {
+					if request.Type != "exec" || len(request.Payload) < 4 {
+						_ = request.Reply(false, nil)
+						continue
+					}
+					commandLength := binary.BigEndian.Uint32(request.Payload[:4])
+					if int(commandLength) > len(request.Payload)-4 {
+						_ = request.Reply(false, nil)
+						continue
+					}
+					command := string(request.Payload[4 : 4+commandLength])
+					if strings.Contains(command, "cur_owner=") && strings.Contains(command, "rm -rf") {
+						wire.paused.Store(true)
+						close(releaseStarted)
+						<-resume
+						return
+					}
+					_ = request.Reply(true, nil)
+					status := make([]byte, 4)
+					_, _ = channel.SendRequest("exit-status", false, status)
+					_ = channel.Close()
+					return
+				}
+			}()
+		}
+	}()
+
+	address := listener.Addr().(*net.TCPAddr)
+	client, err := ssh.Dial(context.Background(), ssh.Config{
+		Host:            address.IP.String(),
+		Port:            address.Port,
+		User:            "root",
+		Password:        "test",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		close(resume)
+		t.Fatalf("dial blackhole SSH server: %v", err)
+	}
+	defer func() {
+		close(resume)
+		_ = client.Close()
+		<-serverDone
+	}()
+
+	const serverID = int64(636)
+	registry := NewServerLockRegistry()
+	localLock := registry.GetLock(serverID)
+	localLock.Lock()
+	unlock, err := AcquireRemoteServerLockWithHeartbeat(
+		context.Background(), client, "server_636", time.Hour, time.Second,
+	)
+	if err != nil {
+		localLock.Unlock()
+		t.Fatalf("acquire remote lock: %v", err)
+	}
+
+	started := time.Now()
+	unlockDone := make(chan struct{})
+	go func() {
+		defer close(unlockDone)
+		defer localLock.Unlock()
+		unlock()
+	}()
+
+	select {
+	case <-releaseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("release did not reach exec phase after channel confirmation")
+	}
+
+	timer := time.NewTimer(5500 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-unlockDone:
+		if elapsed := time.Since(started); elapsed >= 5500*time.Millisecond {
+			t.Fatalf("unlock took %s with a blackholed release exec", elapsed)
+		}
+	case <-timer.C:
+		t.Fatal("unlock did not return after its release context expired")
+	}
+
+	if !localLock.TryLock() {
+		t.Fatal("local server mutex remains locked after unlock returned")
+	}
+	localLock.Unlock()
+}
+
+func TestRemoteLock_UnlockReturnsPromptlyWhenKeepaliveBlockedOnBlackhole(t *testing.T) {
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate SSH host key: %v", err)
+	}
+	signer, err := gossh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatalf("create SSH host signer: %v", err)
+	}
+	config := &gossh.ServerConfig{NoClientAuth: true}
+	config.AddHostKey(signer)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for SSH connections: %v", err)
+	}
+	defer listener.Close()
+
+	resume := make(chan struct{})
+	wireCh := make(chan *blackholePacketGate, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		raw, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		wire := &blackholePacketGate{Conn: raw, resume: resume}
+		wireCh <- wire
+		serverConn, channels, requests, handshakeErr := gossh.NewServerConn(wire, config)
+		if handshakeErr != nil {
+			_ = raw.Close()
+			return
+		}
+		defer serverConn.Close()
+		go func() {
+			for request := range requests {
+				_ = request.Reply(true, nil)
+			}
+		}()
+
+		for newChannel := range channels {
+			channel, channelRequests, openErr := newChannel.Accept()
+			if openErr != nil {
+				return
+			}
+			go func() {
+				for request := range channelRequests {
+					if request.Type != "exec" {
+						_ = request.Reply(false, nil)
+						continue
+					}
+					_ = request.Reply(true, nil)
+					_, _ = channel.SendRequest("exit-status", false, make([]byte, 4))
+					_ = channel.Close()
+					return
+				}
+			}()
+		}
+	}()
+
+	address := listener.Addr().(*net.TCPAddr)
+	client, err := ssh.Dial(context.Background(), ssh.Config{
+		Host:            address.IP.String(),
+		Port:            address.Port,
+		User:            "root",
+		Password:        "test",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		close(resume)
+		t.Fatalf("dial blackhole SSH server: %v", err)
+	}
+	defer func() {
+		close(resume)
+		_ = client.Close()
+		<-serverDone
+	}()
+
+	const serverID = int64(636)
+	registry := NewServerLockRegistry()
+	localLock := registry.GetLock(serverID)
+	localLock.Lock()
+	unlock, err := AcquireRemoteServerLockWithHeartbeat(
+		context.Background(), client, "server_636", time.Hour, time.Second,
+	)
+	if err != nil {
+		localLock.Unlock()
+		t.Fatalf("acquire remote lock: %v", err)
+	}
+
+	wire := <-wireCh
+	wire.paused.Store(true)
+	go func() { _ = client.IsAlive() }()
+	time.Sleep(200 * time.Millisecond)
+
+	started := time.Now()
+	unlockDone := make(chan struct{})
+	go func() {
+		defer close(unlockDone)
+		defer localLock.Unlock()
+		unlock()
+	}()
+
+	timer := time.NewTimer(5500 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-unlockDone:
+		if elapsed := time.Since(started); elapsed >= 5500*time.Millisecond {
+			t.Fatalf("unlock took %s with keepalive blocked on a blackhole", elapsed)
+		}
+	case <-timer.C:
+		t.Fatal("unlock did not return while keepalive was blocked on a blackhole")
+	}
+
+	if !localLock.TryLock() {
+		t.Fatal("local server mutex remains locked after unlock returned")
+	}
+	localLock.Unlock()
+}
+
+func TestRemoteLock_UnlockReturnsPromptlyWhenPoolEvictsDeadClientWithCachedSFTP(t *testing.T) {
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate SSH host key: %v", err)
+	}
+	signer, err := gossh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatalf("create SSH host signer: %v", err)
+	}
+	config := &gossh.ServerConfig{NoClientAuth: true}
+	config.AddHostKey(signer)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for SSH connections: %v", err)
+	}
+	defer listener.Close()
+
+	resume := make(chan struct{})
+	wireCh := make(chan *blackholePacketGate, 1)
+	sftpEOF := make(chan struct{})
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		raw, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		wire := &blackholePacketGate{Conn: raw, resume: resume}
+		wireCh <- wire
+		serverConn, channels, requests, handshakeErr := gossh.NewServerConn(wire, config)
+		if handshakeErr != nil {
+			_ = raw.Close()
+			return
+		}
+		defer serverConn.Close()
+		go func() {
+			for request := range requests {
+				_ = request.Reply(true, nil)
+			}
+		}()
+
+		for newChannel := range channels {
+			channel, channelRequests, openErr := newChannel.Accept()
+			if openErr != nil {
+				return
+			}
+			go func() {
+				for request := range channelRequests {
+					switch request.Type {
+					case "subsystem":
+						_ = request.Reply(true, nil)
+						server, serveErr := sftp.NewServer(channel)
+						if serveErr != nil {
+							return
+						}
+						_ = server.Serve()
+						close(sftpEOF)
+						_ = server.Close()
+						_ = channel.Close()
+						return
+					case "exec":
+						_ = request.Reply(true, nil)
+						_, _ = channel.SendRequest("exit-status", false, make([]byte, 4))
+						_ = channel.Close()
+						return
+					default:
+						_ = request.Reply(false, nil)
+					}
+				}
+			}()
+		}
+	}()
+
+	address := listener.Addr().(*net.TCPAddr)
+	cfg := ssh.Config{
+		Host:            address.IP.String(),
+		Port:            address.Port,
+		User:            "root",
+		Password:        "test",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	}
+	pool := ssh.NewSSHClientPool(ssh.PoolConfig{
+		KeepAlivePeriod: time.Hour,
+		SweepInterval:   time.Hour,
+	}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	client, err := pool.GetWithConfig(ctx, cfg)
+	cancel()
+	if err != nil {
+		close(resume)
+		t.Fatalf("get pooled SSH client: %v", err)
+	}
+	raw := client.GetUnderlyingClient()
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			close(resume)
+			_ = raw.Close()
+			_ = pool.Close()
+			<-serverDone
+		})
+	}
+	defer cleanup()
+
+	target := filepath.Join(t.TempDir(), "payload")
+	if err := client.UploadFile(context.Background(), target, []byte("fixture"), 0600); err != nil {
+		t.Fatalf("initialize cached SFTP session: %v", err)
+	}
+
+	const serverID = int64(636)
+	registry := NewServerLockRegistry()
+	localLock := registry.GetLock(serverID)
+	localLock.Lock()
+	unlock, err := AcquireRemoteServerLockWithHeartbeat(
+		context.Background(), client, "server_636", time.Hour, time.Second,
+	)
+	if err != nil {
+		localLock.Unlock()
+		t.Fatalf("acquire remote lock: %v", err)
+	}
+
+	wire := <-wireCh
+	wire.paused.Store(true)
+	evictDone := make(chan struct{})
+	go func() {
+		defer close(evictDone)
+		evictCtx, evictCancel := context.WithTimeout(context.Background(), time.Second)
+		defer evictCancel()
+		_, _ = pool.GetWithConfig(evictCtx, cfg)
+	}()
+
+	// The old order reaches SFTP Close and hangs; the fixed order finishes eviction.
+	select {
+	case <-sftpEOF:
+	case <-evictDone:
+	case <-time.After(8 * time.Second):
+		t.Fatal("pool eviction did not reach client teardown")
+	}
+
+	started := time.Now()
+	unlockDone := make(chan struct{})
+	go func() {
+		defer close(unlockDone)
+		defer localLock.Unlock()
+		unlock()
+	}()
+
+	timer := time.NewTimer(5500 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-unlockDone:
+		if elapsed := time.Since(started); elapsed >= 5500*time.Millisecond {
+			t.Errorf("unlock took %s after dead client eviction", elapsed)
+		}
+	case <-timer.C:
+		t.Error("unlock did not return after pool eviction closed a dead client")
+	}
+
+	cleanup()
+	select {
+	case <-unlockDone:
+	case <-time.After(time.Second):
+		t.Fatal("unlock did not unwind after transport abort")
+	}
+	select {
+	case <-evictDone:
+	case <-time.After(time.Second):
+		t.Fatal("pool eviction did not unwind")
+	}
+	if !localLock.TryLock() {
+		t.Fatal("local server mutex remains locked after unlock returned")
+	}
+	localLock.Unlock()
 }

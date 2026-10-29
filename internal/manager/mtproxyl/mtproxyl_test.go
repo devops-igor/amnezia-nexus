@@ -273,6 +273,10 @@ func (m *mockMTProxyLSSHClient) DownloadFile(ctx context.Context, remotePath str
 	return []byte("test"), nil
 }
 
+func (m *mockMTProxyLSSHClient) DownloadSudoFile(ctx context.Context, remotePath string) ([]byte, error) {
+	return m.DownloadFile(ctx, remotePath)
+}
+
 func (m *mockMTProxyLSSHClient) FileExists(ctx context.Context, remotePath string) (bool, error) {
 	return true, nil
 }

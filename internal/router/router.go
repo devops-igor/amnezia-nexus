@@ -18,7 +18,9 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/dns"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/mtproxyl"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/naive"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/xray"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
@@ -54,17 +56,17 @@ func NewRouter(cfg *config.Config, db *database.DB, vpnSvc *vpn.Service) *chi.Mu
 	}
 	mtproxylMgr := mtproxyl.NewMTProxyLManager(sshPool)
 	dnsMgr := dns.NewDNSManager(sshPool)
+	xrayMgr := xray.NewXrayManager(sshPool)
+	naiveMgr := naive.NewNaiveManager(sshPool)
 
 	reg := manager.NewRegistry()
 	reg.Register(awgMgr)
 	reg.Register(mtproxylMgr)
 	reg.Register(dnsMgr)
+	reg.Register(xrayMgr)
+	reg.Register(naiveMgr)
 
-	if vpnSvc != nil && !vpnSvc.HasAWGStatusProvider() {
-		vpnSvc.SetAWGStatusProvider(awgMgr)
-	}
-
-	h := handlers.NewHandlers(handlers.Dependencies{
+	return NewRouterWithDeps(handlers.Dependencies{
 		Config:          cfg,
 		DB:              db,
 		Registry:        reg,
@@ -72,13 +74,22 @@ func NewRouter(cfg *config.Config, db *database.DB, vpnSvc *vpn.Service) *chi.Mu
 		AWGManager:      awgMgr,
 		MTProxyLManager: mtproxylMgr,
 		DNSManager:      dnsMgr,
+		XrayManager:     xrayMgr,
+		NaiveManager:    naiveMgr,
 		VPNService:      vpnSvc,
 	})
+}
 
+// NewRouterWithDeps builds the router around caller-owned managers and registry, so HTTP
+// handlers and background services (orchestrator, reconciler, userops) share the same instances.
+func NewRouterWithDeps(deps handlers.Dependencies) *chi.Mux {
+	if vpnSvc := deps.VPNService; vpnSvc != nil && deps.AWGManager != nil && !vpnSvc.HasAWGStatusProvider() {
+		vpnSvc.SetAWGStatusProvider(deps.AWGManager)
+	}
 	return NewRouterWithOptions(Options{
-		Config:   cfg,
-		DB:       db,
-		Handlers: h,
+		Config:   deps.Config,
+		DB:       deps.DB,
+		Handlers: handlers.NewHandlers(deps),
 	})
 }
 
@@ -235,7 +246,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 				r.Patch("/{server_id}/host", h.UpdateServerHostHandler)
 				r.Post("/{server_id}/delete", h.DeleteServerHandler)
 				r.Post("/{server_id}/reboot", h.RebootServerHandler)
-				r.Post("/{server_id}/clear", h.ClearServerHandler)
 				r.Post("/{server_id}/stats", h.ServerStatsHandler)
 				r.Post("/{server_id}/check", h.ServerCheckHandler)
 				r.Post("/{server_id}/install", h.InstallProtocolHandler)
@@ -254,10 +264,22 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 				r.Post("/{server_id}/connections/toggle", h.ToggleServerConnectionHandler)
 				r.Get("/{server_id}/{protocol}/clients", h.GetProtocolClientsHandler)
 			})
+
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.RequireAdmin)
+				r.Post("/{server_id}/clear", h.ClearServerHandler)
+				r.Post("/{server_id}/reality/scan-sni", h.ScanRealitySNIHandler)
+			})
 		})
 	})
 
 	// 7. Admin Protected Pages & APIs
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.RequireAdmin)
+		r.Post("/{server_id}/clear", h.ClearServerHandler)
+		r.Post("/api/settings/backup/restore", h.RestoreBackupHandler)
+	})
+
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.RequireAdminOrSupport)
 
@@ -271,7 +293,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 		r.Post("/confirm-fingerprint", h.ConfirmFingerprintHandler)
 		r.Post("/{server_id}/delete", h.DeleteServerHandler)
 		r.Post("/{server_id}/reboot", h.RebootServerHandler)
-		r.Post("/{server_id}/clear", h.ClearServerHandler)
 		r.Post("/{server_id}/stats", h.ServerStatsHandler)
 		r.Post("/{server_id}/check", h.ServerCheckHandler)
 		r.Post("/{server_id}/install", h.InstallProtocolHandler)
@@ -309,7 +330,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			r.Get("/", h.GetSettingsHandler)
 			r.Post("/save", h.SaveSettingsHandler)
 			r.Get("/backup/download", h.DownloadBackupHandler)
-			r.Post("/backup/restore", h.RestoreBackupHandler)
 		})
 
 		// System API

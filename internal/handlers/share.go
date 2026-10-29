@@ -129,13 +129,19 @@ func (h *Handlers) GetShareConnectionsHandler(w http.ResponseWriter, r *http.Req
 		if srvName == "" {
 			srvName = fmt.Sprintf("Server #%d", c.ServerID)
 		}
+		clientID := c.ClientID
+		connName := c.Name
+		if models.NormalizeProtocol(c.Protocol) == models.ProtocolVLESS {
+			clientID = ""
+			connName = safeVLESSDisplayName(connName, c.ClientID)
+		}
 		enriched[i] = map[string]any{
 			"id":          c.ID,
-			"name":        c.Name,
+			"name":        connName,
 			"protocol":    c.Protocol,
 			"server_name": srvName,
 			"server_id":   c.ServerID,
-			"client_id":   c.ClientID,
+			"client_id":   clientID,
 		}
 	}
 
@@ -173,6 +179,12 @@ func (h *Handlers) GetShareConnectionConfigHandler(w http.ResponseWriter, r *htt
 	conn, err := h.db.GetConnection(ctx, connectionID)
 	if err != nil || conn == nil || conn.UserID != user.ID {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
+		return
+	}
+
+	proto := models.NormalizeProtocol(conn.Protocol)
+	if proto == models.ProtocolVLESS || proto == models.ProtocolNaive {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required for VLESS and Naive protocols")
 		return
 	}
 

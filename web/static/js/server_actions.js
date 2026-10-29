@@ -36,6 +36,8 @@ function getProtoTitle(proto) {
         case 'awg': return 'AmneziaWG';
         case 'telemt': return 'MTProxyL';
         case 'dns': return 'AmneziaDNS';
+        case 'vless': return 'Xray (VLESS+REALITY)';
+        case 'naive': return 'NaiveProxy';
         default: return proto;
     }
 }
@@ -112,9 +114,13 @@ function openInstallModal(proto) {
     const portHint = document.getElementById('installPortHint');
     const telemtOpts = document.getElementById('telemtOptions');
     const awgOpts = document.getElementById('awgOptions');
+    const vlessOpts = document.getElementById('vlessOptions');
+    const naiveOpts = document.getElementById('naiveOptions');
 
-    telemtOpts.style.display = 'none';
-    awgOpts.style.display = 'none';
+    if (telemtOpts) telemtOpts.style.display = 'none';
+    if (awgOpts) awgOpts.style.display = 'none';
+    if (vlessOpts) vlessOpts.style.display = 'none';
+    if (naiveOpts) naiveOpts.style.display = 'none';
 
     if (proto === 'dns') {
         portLabel.textContent = _('port') + ' (Internal)';
@@ -126,13 +132,25 @@ function openInstallModal(proto) {
         portInput.value = '443';
         portInput.disabled = false;
         portHint.textContent = _('port_telemt_hint');
-        telemtOpts.style.display = 'block';
+        if (telemtOpts) telemtOpts.style.display = 'block';
+    } else if (proto === 'vless') {
+        portLabel.textContent = _('port') + ' (TCP)';
+        portInput.value = '443';
+        portInput.disabled = false;
+        portHint.textContent = 'Port 443 TCP (REALITY) + 54321 (Vision)';
+        if (vlessOpts) vlessOpts.style.display = 'block';
+    } else if (proto === 'naive') {
+        portLabel.textContent = _('port') + ' (TCP)';
+        portInput.value = '443';
+        portInput.disabled = false;
+        portHint.textContent = 'Port 443 TCP/UDP (HTTP/3)';
+        if (naiveOpts) naiveOpts.style.display = 'block';
     } else {
         portLabel.textContent = _('port') + ' (UDP)';
         portInput.value = '55424';
         portInput.disabled = false;
         portHint.textContent = _('port_default_hint');
-        awgOpts.style.display = 'block';
+        if (awgOpts) awgOpts.style.display = 'block';
     }
 
     document.getElementById('installForm').classList.remove('hidden');
@@ -181,6 +199,24 @@ async function installProtocol() {
             params.tls_domain = document.getElementById('installTelemtDomain').value;
             params.max_connections = parseInt(document.getElementById('installTelemtMaxConns').value) || 0;
         }
+        if (currentInstallProto === 'vless') {
+            const vlessSniEl = document.getElementById('installVlessSni');
+            const vlessFlowEl = document.getElementById('installVlessFlow');
+            params.vless_options = {
+                port: port,
+                server_name: vlessSniEl ? vlessSniEl.value.trim() : 'gateway.icloud.com',
+                flow: vlessFlowEl ? vlessFlowEl.value : 'xtls-rprx-vision'
+            };
+        }
+        if (currentInstallProto === 'naive') {
+            const naiveDomainEl = document.getElementById('installNaiveDomain');
+            const naiveDecoyEl = document.getElementById('installNaiveDecoy');
+            params.naive_options = {
+                port: port,
+                domain: naiveDomainEl ? naiveDomainEl.value.trim() : '',
+                decoy_template: naiveDecoyEl ? naiveDecoyEl.value : 'default'
+            };
+        }
         if (['awg'].includes(currentInstallProto)) {
             const profileSelect = document.getElementById('installAwgProfile');
             if (profileSelect && profileSelect.value) {
@@ -213,6 +249,48 @@ async function installProtocol() {
             clearInterval(progressInterval);
             progressInterval = null;
         }
+    }
+}
+
+async function scanRealitySNI() {
+    const scanBtn = document.getElementById('vlessScanBtn');
+    const sniInput = document.getElementById('installVlessSni');
+    const sniSelect = document.getElementById('installVlessSniSelect');
+    if (scanBtn) scanBtn.disabled = true;
+
+    try {
+        UI.toast('Scanning optimal REALITY camouflage domains...', 'info');
+        const res = await API.post(`/api/servers/${SERVER_ID}/reality/scan-sni`, {});
+        if (res && res.results && res.results.length > 0) {
+            if (sniSelect) {
+                sniSelect.innerHTML = '<option value="">-- Select optimal SNI candidate --</option>';
+                res.results.forEach(r => {
+                    if (r.status === 'ok') {
+                        const opt = document.createElement('option');
+                        opt.value = r.domain;
+                        opt.textContent = `${r.domain} (${r.rtt_ms}ms, ${r.country || ''} AS${r.asn || ''})`;
+                        sniSelect.appendChild(opt);
+                    }
+                });
+                sniSelect.style.display = 'block';
+                sniSelect.onchange = () => {
+                    if (sniSelect.value && sniInput) {
+                        sniInput.value = sniSelect.value;
+                    }
+                };
+            }
+            const best = res.results.find(r => r.status === 'ok');
+            if (best && sniInput) {
+                sniInput.value = best.domain;
+            }
+            UI.toast('Camouflage SNI candidates ranked successfully', 'success');
+        } else {
+            UI.toast('No candidate domains passed active probing', 'warning');
+        }
+    } catch (err) {
+        UI.toast('SNI scan failed: ' + (err.message || String(err)), 'error');
+    } finally {
+        if (scanBtn) scanBtn.disabled = false;
     }
 }
 
@@ -450,6 +528,10 @@ async function showConnectionConfig(clientId, connName, hasKey) {
 
 async function toggleConnection(clientId, enable) {
     const proto = document.getElementById('connProtoSelect').value;
+    if (proto === 'vless' || proto === 'naive') {
+        UI.toast('Client disable is not supported for this protocol; use remove instead', 'error');
+        return;
+    }
     try {
         UI.toast(_('connection_enabled_disabled').replace('{status}', enable ? _('enabling') : _('disabling')) + '...', 'info');
         await API.post(`/api/servers/${SERVER_ID}/connections/toggle`, {

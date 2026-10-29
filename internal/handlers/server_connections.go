@@ -58,6 +58,11 @@ func (h *Handlers) GetServerConnectionsHandler(w http.ResponseWriter, r *http.Re
 		usersMap[users[i].ID] = &users[i]
 	}
 
+	redactVLESSCredentials := false
+	if proto == models.ProtocolVLESS {
+		sess := h.GetSession(r)
+		redactVLESSCredentials = sess == nil || sess.Role != models.RoleAdmin
+	}
 	for _, client := range clients {
 		cid, _ := client["clientId"].(string)
 		if cid == "" {
@@ -79,6 +84,19 @@ func (h *Handlers) GetServerConnectionsHandler(w http.ResponseWriter, r *http.Re
 				break
 			}
 		}
+		if redactVLESSCredentials {
+			client["clientId"] = ""
+			client["client_id"] = ""
+			client["uuid"] = ""
+			name, _ := client["name"].(string)
+			unassigned := client["assigned_user_id"] == nil || client["assigned_user_id"] == ""
+			if unassigned || safeVLESSDisplayName(name, cid) == "Unnamed" {
+				client["name"] = "Unnamed"
+				if ud, ok := client["userData"].(map[string]any); ok {
+					ud["clientName"] = "Unnamed"
+				}
+			}
+		}
 	}
 
 	h.JSON(w, http.StatusOK, map[string]any{
@@ -86,6 +104,18 @@ func (h *Handlers) GetServerConnectionsHandler(w http.ResponseWriter, r *http.Re
 		"clients":     clients,
 		"connections": clients,
 	})
+}
+
+func (h *Handlers) authorizeAdminProtocol(w http.ResponseWriter, r *http.Request, protocol string) bool {
+	proto := models.NormalizeProtocol(protocol)
+	if proto != models.ProtocolVLESS && proto != models.ProtocolNaive {
+		return true
+	}
+	if session := h.GetSession(r); session == nil || session.Role != models.RoleAdmin {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required for VLESS and Naive protocols")
+		return false
+	}
+	return true
 }
 
 // AddServerConnectionHandler provisions a new client connection on a server.
@@ -106,8 +136,26 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
 		return
 	}
+	if !h.authorizeAdminProtocol(w, r, req.Protocol) {
+		return
+	}
 
 	ctx := r.Context()
+	var assignedUserID string
+	if req.UserID != nil && *req.UserID != "" {
+		assignedUserID = *req.UserID
+		defer h.lockUser(assignedUserID)()
+		u, err := h.db.GetUser(ctx, assignedUserID)
+		if err != nil || u == nil {
+			h.JSONError(w, http.StatusNotFound, "not_found", "User not found")
+			return
+		}
+		if !u.Enabled {
+			h.JSONError(w, http.StatusForbidden, "forbidden", "Account is disabled")
+			return
+		}
+	}
+
 	server, err := h.db.GetServer(ctx, serverID)
 	if err != nil || server == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
@@ -147,22 +195,6 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 	}
 	vpnLink := GenerateVPNLink(configStr)
 
-	// Persist in peer_lifecycle (both assigned and unassigned)
-	var assignedUserID string
-	if req.UserID != nil && *req.UserID != "" {
-		assignedUserID = *req.UserID
-	}
-
-	if err := h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, clientID, req.Name, assignedUserID, "active"); err != nil {
-		slog.Error("failed to record peer lifecycle", "server_id", serverID, "protocol", req.Protocol, "error", err)
-		if rbErr := h.rollbackClient(ctx, protoMgr, server, result, clientID); rbErr != nil {
-			_ = h.db.SetPeerLifecycleStatus(ctx, serverID, req.Protocol, clientID, "failed")
-		}
-		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to record peer lifecycle")
-		return
-	}
-
-	// Persist link to user if requested
 	if assignedUserID != "" {
 		conn := &models.UserConnection{
 			ID:         uuid.NewString(),
@@ -177,16 +209,17 @@ func (h *Handlers) AddServerConnectionHandler(w http.ResponseWriter, r *http.Req
 		if req.AWGMimicry != nil {
 			conn.AWGMimicry = models.AWGMimicryProfile(*req.AWGMimicry)
 		}
-		if _, err := h.db.CreateConnection(ctx, conn); err != nil {
-			slog.Error("failed to save connection record", "server_id", serverID, "protocol", req.Protocol, "error", err)
-			if rbErr := h.rollbackClient(ctx, protoMgr, server, result, clientID); rbErr != nil {
-				_ = h.db.SetPeerLifecycleStatus(ctx, serverID, req.Protocol, clientID, "failed")
-			} else {
-				_ = h.db.DeletePeerLifecycle(ctx, serverID, req.Protocol, clientID)
-			}
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save connection record")
+		if status, code, msg := h.persistProvisioned(ctx, protoMgr, server, result, conn); status != 0 {
+			h.JSONError(w, status, code, msg)
 			return
 		}
+	} else if err := h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, clientID, req.Name, "", "active"); err != nil {
+		slog.Error("failed to record peer lifecycle", "server_id", serverID, "protocol", req.Protocol, "error", err)
+		if rbErr := h.rollbackClient(ctx, protoMgr, server, result, clientID); rbErr != nil {
+			_ = h.db.SetPeerLifecycleStatus(ctx, serverID, req.Protocol, clientID, "failed")
+		}
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to record peer lifecycle")
+		return
 	}
 
 	h.audit(r, "server_connection.add", map[string]any{"server_id": serverID, "protocol": req.Protocol, "client_id": clientID, "user_id": req.UserID})
@@ -308,7 +341,19 @@ func (h *Handlers) RemoveServerConnectionHandler(w http.ResponseWriter, r *http.
 		return
 	}
 
+	unlockClient := lockClient(serverID, req.Protocol, req.ClientID)
+	defer unlockClient()
+
 	ctx := r.Context()
+	protocol := h.resolveToggleProtocol(ctx, serverID, req.ClientID, req.Protocol)
+	if !h.authorizeAdminProtocol(w, r, protocol) {
+		return
+	}
+	if protocol != req.Protocol {
+		h.JSONError(w, http.StatusBadRequest, "protocol_mismatch", "Protocol does not match the recorded connection")
+		return
+	}
+	req.Protocol = protocol
 	if serverID == 0 {
 		clientPub := req.ClientID
 		if conn, err := h.db.GetConnection(ctx, req.ClientID); err == nil && conn != nil && conn.ServerID == 0 {
@@ -323,13 +368,13 @@ func (h *Handlers) RemoveServerConnectionHandler(w http.ResponseWriter, r *http.
 		if h.vpnSvc != nil && clientPub != "" {
 			_ = h.vpnSvc.ReleaseClient(ctx, clientPub)
 		}
-		if _, err := h.db.DeleteConnectionByClientID(ctx, req.ClientID, 0); err != nil {
+		if err := h.deleteConnectionByClientIDAndProtocol(ctx, 0, req.ClientID, req.Protocol); err != nil {
 			h.peerChangeError(w, err)
 			return
 		}
 		_ = h.db.DeletePeerLifecycle(ctx, 0, req.Protocol, req.ClientID)
 		if clientPub != req.ClientID {
-			if _, err := h.db.DeleteConnectionByClientID(ctx, clientPub, 0); err != nil {
+			if err := h.deleteConnectionByClientIDAndProtocol(ctx, 0, clientPub, req.Protocol); err != nil {
 				h.peerChangeError(w, err)
 				return
 			}
@@ -360,134 +405,26 @@ func (h *Handlers) RemoveServerConnectionHandler(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if err := protoMgr.RemoveClient(ctx, server, req.ClientID); err != nil {
+	canonicalClientID, conn, err := h.resolveCanonicalClientID(ctx, serverID, req.Protocol, req.ClientID)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to resolve connection record")
+		return
+	}
+	if conn != nil {
+		unlockUser := h.lockUser(conn.UserID)
+		defer unlockUser()
+	}
+
+	if err := protoMgr.RemoveClient(ctx, server, canonicalClientID); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "operation_failed", "Failed to remove client on server: "+err.Error())
 		return
 	}
-	if _, err := h.db.DeleteConnectionByClientID(ctx, req.ClientID, serverID); err != nil {
+	if err := h.deleteServerConnectionRecords(ctx, serverID, req.Protocol, req.ClientID, canonicalClientID, conn); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete connection record: "+err.Error())
 		return
 	}
-	_ = h.db.DeletePeerLifecycle(ctx, serverID, req.Protocol, req.ClientID)
 
 	h.audit(r, "server_connection.remove", map[string]any{"server_id": serverID, "protocol": req.Protocol, "client_id": req.ClientID})
-	h.JSONOK(w)
-}
-
-func (h *Handlers) editAWGParams(ctx context.Context, server *models.Server, req *models.EditConnectionRequest) error {
-	if req.Protocol != "awg" || h.awgMgr == nil {
-		return nil
-	}
-	params := make(map[string]any)
-	if req.AWGMimicry != nil {
-		params["awg_mimicry"] = *req.AWGMimicry
-	}
-	if len(params) > 0 {
-		return h.awgMgr.EditClient(ctx, server, req.ClientID, params)
-	}
-	return nil
-}
-
-func (h *Handlers) editConnectionBinding(ctx context.Context, serverID int64, req *models.EditConnectionRequest, matchingConn *models.UserConnection) error {
-	connName := req.ClientID
-	if req.Name != nil && *req.Name != "" {
-		connName = *req.Name
-	} else if matchingConn != nil && matchingConn.Name != "" {
-		connName = matchingConn.Name
-	}
-
-	if req.UserID != nil {
-		if *req.UserID != "" {
-			_ = h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, req.ClientID, connName, *req.UserID, "active")
-			if matchingConn != nil {
-				updates := map[string]any{"user_id": *req.UserID}
-				if req.Name != nil && *req.Name != "" {
-					updates["name"] = *req.Name
-				}
-				_, err := h.db.UpdateConnection(ctx, matchingConn.ID, updates)
-				return err
-			}
-			newConn := &models.UserConnection{
-				ID:         uuid.NewString(),
-				UserID:     *req.UserID,
-				ServerID:   serverID,
-				Protocol:   req.Protocol,
-				ClientID:   req.ClientID,
-				Name:       connName,
-				AWGMimicry: models.AWGMimicryAuto,
-				CreatedAt:  time.Now(),
-			}
-			_, err := h.db.CreateConnection(ctx, newConn)
-			return err
-		}
-		// Unbinding connection from user: remains active unassigned connection in peer_lifecycle
-		_ = h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, req.ClientID, connName, "", "active")
-		if matchingConn != nil {
-			_, err := h.db.DeleteConnection(ctx, matchingConn.ID)
-			return err
-		}
-		return nil
-	}
-	if req.Name != nil && *req.Name != "" && matchingConn != nil {
-		_ = h.db.RecordPeerLifecycle(ctx, serverID, req.Protocol, req.ClientID, *req.Name, matchingConn.UserID, "active")
-		_, err := h.db.UpdateConnection(ctx, matchingConn.ID, map[string]any{"name": *req.Name})
-		return err
-	}
-	return nil
-}
-
-// EditServerConnectionHandler updates connection parameters and user assignment.
-func (h *Handlers) EditServerConnectionHandler(w http.ResponseWriter, r *http.Request) {
-	serverID, err := parseServerID(r)
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "invalid_parameter", "Invalid server_id")
-		return
-	}
-
-	var req models.EditConnectionRequest
-	if err := h.DecodeJSON(r, &req); err != nil {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
-		return
-	}
-
-	if err := req.Validate(); err != nil {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
-		return
-	}
-
-	ctx := r.Context()
-	server, err := h.db.GetServer(ctx, serverID)
-	if err != nil || server == nil {
-		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")
-		return
-	}
-
-	// Update AWG speed limits / parameters if applicable
-	if err := h.editAWGParams(ctx, server, &req); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "operation_failed", "Failed to edit client on server: "+err.Error())
-		return
-	}
-
-	// Update DB user connection binding
-	userConns, err := h.db.GetConnectionsByServerAndProtocol(ctx, serverID, req.Protocol)
-	if err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve connections")
-		return
-	}
-	var matchingConn *models.UserConnection
-	for i := range userConns {
-		if userConns[i].ClientID == req.ClientID {
-			matchingConn = &userConns[i]
-			break
-		}
-	}
-
-	if err := h.editConnectionBinding(ctx, serverID, &req, matchingConn); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to update connection binding: "+err.Error())
-		return
-	}
-
-	h.audit(r, "server_connection.edit", map[string]any{"server_id": serverID, "protocol": req.Protocol, "client_id": req.ClientID, "user_id": req.UserID, "name": req.Name})
 	h.JSONOK(w)
 }
 
@@ -511,6 +448,10 @@ func (h *Handlers) GetServerConnectionConfigHandler(w http.ResponseWriter, r *ht
 	}
 
 	ctx := r.Context()
+	protocol := h.resolveToggleProtocol(ctx, serverID, req.ClientID, req.Protocol)
+	if !h.authorizeAdminProtocol(w, r, protocol) {
+		return
+	}
 	sess := h.GetSession(r)
 	if sess != nil && sess.Role == models.RoleUser {
 		userConns, _ := h.db.GetConnectionsByUserID(ctx, sess.UserID)
@@ -559,6 +500,44 @@ func (h *Handlers) GetServerConnectionConfigHandler(w http.ResponseWriter, r *ht
 	})
 }
 
+// deleteConnectionByClientIDAndProtocol deletes only rows for the trusted protocol.
+func (h *Handlers) deleteConnectionByClientIDAndProtocol(ctx context.Context, serverID int64, clientID, protocol string) error {
+	conns, err := h.db.GetConnectionsByServerAndProtocol(ctx, serverID, protocol)
+	if err != nil {
+		return err
+	}
+	for i := range conns {
+		if conns[i].ID != clientID && conns[i].ClientID != clientID {
+			continue
+		}
+		if _, err := h.db.DeleteConnection(ctx, conns[i].ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolveToggleProtocol returns the protocol recorded for the client in
+// user_connections or peer_lifecycle, falling back to requested if unknown.
+func (h *Handlers) resolveToggleProtocol(ctx context.Context, serverID int64, clientID, requested string) string {
+	if conn, err := h.db.GetConnection(ctx, clientID); err == nil && conn != nil && conn.ServerID == serverID {
+		return conn.Protocol
+	}
+	if conn, err := h.db.GetConnectionByClientID(ctx, clientID, serverID); err == nil && conn != nil {
+		return conn.Protocol
+	}
+	if serverID != 0 {
+		for _, p := range []string{models.ProtocolAWG, models.ProtocolVLESS, models.ProtocolNaive} {
+			if recs, err := h.db.GetPeerLifecycles(ctx, serverID, p); err == nil {
+				if _, ok := recs[clientID]; ok {
+					return p
+				}
+			}
+		}
+	}
+	return requested
+}
+
 // ToggleServerConnectionHandler enables or disables a client connection on the server.
 func (h *Handlers) ToggleServerConnectionHandler(w http.ResponseWriter, r *http.Request) {
 	serverID, err := parseServerID(r)
@@ -586,6 +565,16 @@ func (h *Handlers) ToggleServerConnectionHandler(w http.ResponseWriter, r *http.
 	enableState := req.Enable || req.Enabled
 
 	ctx := r.Context()
+
+	normProto := models.NormalizeProtocol(req.Protocol)
+	if normProto == "" {
+		normProto = models.NormalizeProtocol(h.resolveToggleProtocol(ctx, serverID, req.ClientID, ""))
+	}
+	if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
+		h.JSONError(w, http.StatusBadRequest, "unsupported_action", "Client disable is not supported for this protocol; use remove instead")
+		return
+	}
+
 	if serverID == 0 {
 		conn, err := h.db.GetConnection(ctx, req.ClientID)
 		if err != nil || conn == nil || conn.ServerID != 0 {
@@ -623,11 +612,22 @@ func (h *Handlers) ToggleServerConnectionHandler(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if req.Protocol == "awg" && h.awgMgr != nil {
-		_ = h.awgMgr.ToggleClient(ctx, server, req.ClientID, enableState)
+	// Only AWG supports in-place toggling; never report success for a no-op.
+	if normProto != models.ProtocolAWG {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Cannot resolve a toggle-capable protocol for this client; specify protocol")
+		return
+	}
+	if h.awgMgr == nil {
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "AWG manager is not configured")
+		return
+	}
+	if err := h.awgMgr.ToggleClient(ctx, server, req.ClientID, enableState); err != nil {
+		slog.Error("failed to toggle client", "server_id", serverID, "client_id", req.ClientID, "error", err)
+		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to toggle client")
+		return
 	}
 
-	h.audit(r, "server_connection.toggle", map[string]any{"server_id": serverID, "protocol": req.Protocol, "client_id": req.ClientID, "enabled": enableState})
+	h.audit(r, "server_connection.toggle", map[string]any{"server_id": serverID, "protocol": normProto, "client_id": req.ClientID, "enabled": enableState})
 	h.JSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
 		"enabled": enableState,
@@ -647,6 +647,9 @@ func (h *Handlers) GetProtocolClientsHandler(w http.ResponseWriter, r *http.Requ
 		protocol = "awg"
 	}
 	protocol = models.NormalizeProtocol(protocol)
+	if protocol == models.ProtocolVLESS && !h.authorizeAdminProtocol(w, r, protocol) {
+		return
+	}
 
 	ctx := r.Context()
 	server, err := h.db.GetServer(ctx, serverID)

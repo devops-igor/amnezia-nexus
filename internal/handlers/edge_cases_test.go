@@ -66,6 +66,7 @@ func TestHandlers_EdgeCasesAndErrorBranches(t *testing.T) {
 		}
 
 		req404 := httptest.NewRequest(http.MethodPost, "/api/servers/9999/reboot", nil)
+		req404 = req404.WithContext(middleware.WithSession(req404.Context(), &models.SessionData{Role: models.RoleAdmin}))
 		rctx := chi.NewRouteContext()
 		rctx.URLParams.Add("server_id", "9999")
 		req404 = req404.WithContext(context.WithValue(req404.Context(), chi.RouteCtxKey, rctx))
@@ -258,8 +259,9 @@ func TestHandlers_EdgeCasesAndErrorBranches(t *testing.T) {
 		reqToggle = reqToggle.WithContext(context.WithValue(reqToggle.Context(), chi.RouteCtxKey, rctxRot))
 		wToggle := httptest.NewRecorder()
 		h.ToggleServerConnectionHandler(wToggle, reqToggle)
-		if wToggle.Code != http.StatusOK {
-			t.Errorf("expected 200 for toggle connection, got %d", wToggle.Code)
+		// No reachable AWG backend in this harness: the toggle must fail closed, not report success.
+		if wToggle.Code != http.StatusInternalServerError {
+			t.Errorf("expected 500 for toggle connection without a reachable AWG backend, got %d", wToggle.Code)
 		}
 
 		// Leaderboard handler

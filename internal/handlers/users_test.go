@@ -171,6 +171,10 @@ func TestUsersHandlers(t *testing.T) {
 		if w404.Code != http.StatusNotFound {
 			t.Fatalf("expected 404, got %d", w404.Code)
 		}
+
+		if _, err := db.UpdateUser(ctx, u.ID, map[string]any{"enabled": true}); err != nil {
+			t.Fatalf("restore test user: %v", err)
+		}
 	})
 
 	t.Run("AddUserConnectionHandler Server Not Found", func(t *testing.T) {
@@ -520,6 +524,9 @@ func TestUsersHandlers(t *testing.T) {
 			ExpirationDate: &expDate,
 		})
 		req := httptest.NewRequest(http.MethodPost, "/api/users/add", bytes.NewReader(body))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+			UserID: "admin-creator", Role: models.RoleAdmin,
+		}))
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 
@@ -585,6 +592,9 @@ func TestUsersHandlers(t *testing.T) {
 			Enabled: false,
 		})
 		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/toggle", selfUser.ID), bytes.NewReader(body))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+			UserID: "other-admin", Role: models.RoleAdmin,
+		}))
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {

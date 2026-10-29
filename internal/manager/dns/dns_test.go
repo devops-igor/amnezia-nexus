@@ -125,6 +125,10 @@ func (m *mockDNSSSHClient) DownloadFile(ctx context.Context, remotePath string) 
 	return []byte("test"), nil
 }
 
+func (m *mockDNSSSHClient) DownloadSudoFile(ctx context.Context, remotePath string) ([]byte, error) {
+	return m.DownloadFile(ctx, remotePath)
+}
+
 func (m *mockDNSSSHClient) FileExists(ctx context.Context, remotePath string) (bool, error) {
 	return true, nil
 }
