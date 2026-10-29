@@ -431,23 +431,23 @@ func (c *Client) IsAlive() bool {
 // Close terminates the SFTP and SSH connections.
 func (c *Client) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	c.closed = true
+	sftp := c.sftpClient
+	ssh := c.sshClient
+	c.sftpClient = nil
+	c.sshClient = nil
+	c.mu.Unlock()
+
 	var errs []error
-
-	if c.sftpClient != nil {
-		if err := c.sftpClient.Close(); err != nil {
+	if ssh != nil {
+		if err := ssh.Close(); err != nil {
 			errs = append(errs, err)
 		}
-		c.sftpClient = nil
 	}
-
-	if c.sshClient != nil {
-		if err := c.sshClient.Close(); err != nil {
+	if sftp != nil {
+		if err := sftp.Close(); err != nil {
 			errs = append(errs, err)
 		}
-		c.sshClient = nil
 	}
 
 	if len(errs) > 0 {

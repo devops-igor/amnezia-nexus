@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"net"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	"github.com/pkg/sftp"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -542,6 +544,181 @@ func TestRemoteLock_UnlockReturnsPromptlyWhenKeepaliveBlockedOnBlackhole(t *test
 		t.Fatal("unlock did not return while keepalive was blocked on a blackhole")
 	}
 
+	if !localLock.TryLock() {
+		t.Fatal("local server mutex remains locked after unlock returned")
+	}
+	localLock.Unlock()
+}
+
+func TestRemoteLock_UnlockReturnsPromptlyWhenPoolEvictsDeadClientWithCachedSFTP(t *testing.T) {
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate SSH host key: %v", err)
+	}
+	signer, err := gossh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatalf("create SSH host signer: %v", err)
+	}
+	config := &gossh.ServerConfig{NoClientAuth: true}
+	config.AddHostKey(signer)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for SSH connections: %v", err)
+	}
+	defer listener.Close()
+
+	resume := make(chan struct{})
+	wireCh := make(chan *blackholePacketGate, 1)
+	sftpEOF := make(chan struct{})
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		raw, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		wire := &blackholePacketGate{Conn: raw, resume: resume}
+		wireCh <- wire
+		serverConn, channels, requests, handshakeErr := gossh.NewServerConn(wire, config)
+		if handshakeErr != nil {
+			_ = raw.Close()
+			return
+		}
+		defer serverConn.Close()
+		go func() {
+			for request := range requests {
+				_ = request.Reply(true, nil)
+			}
+		}()
+
+		for newChannel := range channels {
+			channel, channelRequests, openErr := newChannel.Accept()
+			if openErr != nil {
+				return
+			}
+			go func() {
+				for request := range channelRequests {
+					switch request.Type {
+					case "subsystem":
+						_ = request.Reply(true, nil)
+						server, serveErr := sftp.NewServer(channel)
+						if serveErr != nil {
+							return
+						}
+						_ = server.Serve()
+						close(sftpEOF)
+						_ = server.Close()
+						_ = channel.Close()
+						return
+					case "exec":
+						_ = request.Reply(true, nil)
+						_, _ = channel.SendRequest("exit-status", false, make([]byte, 4))
+						_ = channel.Close()
+						return
+					default:
+						_ = request.Reply(false, nil)
+					}
+				}
+			}()
+		}
+	}()
+
+	address := listener.Addr().(*net.TCPAddr)
+	cfg := ssh.Config{
+		Host:            address.IP.String(),
+		Port:            address.Port,
+		User:            "root",
+		Password:        "test",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	}
+	pool := ssh.NewSSHClientPool(ssh.PoolConfig{
+		KeepAlivePeriod: time.Hour,
+		SweepInterval:   time.Hour,
+	}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	client, err := pool.GetWithConfig(ctx, cfg)
+	cancel()
+	if err != nil {
+		close(resume)
+		t.Fatalf("get pooled SSH client: %v", err)
+	}
+	raw := client.GetUnderlyingClient()
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			close(resume)
+			_ = raw.Close()
+			_ = pool.Close()
+			<-serverDone
+		})
+	}
+	defer cleanup()
+
+	target := filepath.Join(t.TempDir(), "payload")
+	if err := client.UploadFile(context.Background(), target, []byte("fixture"), 0600); err != nil {
+		t.Fatalf("initialize cached SFTP session: %v", err)
+	}
+
+	const serverID = int64(636)
+	registry := NewServerLockRegistry()
+	localLock := registry.GetLock(serverID)
+	localLock.Lock()
+	unlock, err := AcquireRemoteServerLockWithHeartbeat(
+		context.Background(), client, "server_636", time.Hour, time.Second,
+	)
+	if err != nil {
+		localLock.Unlock()
+		t.Fatalf("acquire remote lock: %v", err)
+	}
+
+	wire := <-wireCh
+	wire.paused.Store(true)
+	evictDone := make(chan struct{})
+	go func() {
+		defer close(evictDone)
+		evictCtx, evictCancel := context.WithTimeout(context.Background(), time.Second)
+		defer evictCancel()
+		_, _ = pool.GetWithConfig(evictCtx, cfg)
+	}()
+
+	// The old order reaches SFTP Close and hangs; the fixed order finishes eviction.
+	select {
+	case <-sftpEOF:
+	case <-evictDone:
+	case <-time.After(8 * time.Second):
+		t.Fatal("pool eviction did not reach client teardown")
+	}
+
+	started := time.Now()
+	unlockDone := make(chan struct{})
+	go func() {
+		defer close(unlockDone)
+		defer localLock.Unlock()
+		unlock()
+	}()
+
+	timer := time.NewTimer(5500 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-unlockDone:
+		if elapsed := time.Since(started); elapsed >= 5500*time.Millisecond {
+			t.Errorf("unlock took %s after dead client eviction", elapsed)
+		}
+	case <-timer.C:
+		t.Error("unlock did not return after pool eviction closed a dead client")
+	}
+
+	cleanup()
+	select {
+	case <-unlockDone:
+	case <-time.After(time.Second):
+		t.Fatal("unlock did not unwind after transport abort")
+	}
+	select {
+	case <-evictDone:
+	case <-time.After(time.Second):
+		t.Fatal("pool eviction did not unwind")
+	}
 	if !localLock.TryLock() {
 		t.Fatal("local server mutex remains locked after unlock returned")
 	}
