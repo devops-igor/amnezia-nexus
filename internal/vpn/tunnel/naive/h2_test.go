@@ -83,6 +83,9 @@ func setupTestH2ServerWithMaxStreams(t *testing.T, authUser, authPass string, ma
 				errc <- err
 			}()
 			<-errc
+			// Stop the copier before returning: the server reuses w's buffer after the handler exits.
+			_ = targetConn.Close()
+			_ = fw.Close()
 		}),
 	}
 	//nolint:staticcheck // SA1019: http2.ConfigureServer test fixture helper

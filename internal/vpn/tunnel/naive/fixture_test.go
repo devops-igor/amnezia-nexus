@@ -178,16 +178,30 @@ func startBlackholeListener(t *testing.T) (string, func()) {
 }
 
 type flushWriter struct {
-	w io.Writer
-	f http.Flusher
+	mu     sync.Mutex
+	w      io.Writer
+	f      http.Flusher
+	closed bool
 }
 
 func (fw *flushWriter) Write(p []byte) (int, error) {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if fw.closed {
+		return 0, net.ErrClosed
+	}
 	n, err := fw.w.Write(p)
 	if fw.f != nil {
 		fw.f.Flush()
 	}
 	return n, err
+}
+
+func (fw *flushWriter) Close() error {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	fw.closed = true
+	return nil
 }
 
 func setupTestH2Server(t *testing.T, authUser, authPass string, probeResistance bool) (string, func()) {
@@ -269,6 +283,9 @@ func setupTestH2Server(t *testing.T, authUser, authPass string, probeResistance 
 				errc <- err
 			}()
 			<-errc
+			// Stop the copier before returning: the server reuses w's buffer after the handler exits.
+			_ = targetConn.Close()
+			_ = fw.Close()
 		}),
 	}
 	//nolint:staticcheck // SA1019: http2.ConfigureServer test fixture helper
@@ -367,6 +384,9 @@ func setupTestH3Server(t *testing.T, authUser, authPass string, probeResistance 
 				errc <- err
 			}()
 			<-errc
+			// Stop the copier before returning: the server reuses w's buffer after the handler exits.
+			_ = targetConn.Close()
+			_ = fw.Close()
 		}),
 	}
 
