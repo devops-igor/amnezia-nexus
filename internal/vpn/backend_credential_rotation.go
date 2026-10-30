@@ -168,6 +168,11 @@ func (s *Service) commitBackendRotation(
 	if err != nil {
 		return fmt.Errorf("switch backend credentials: %w", err), true
 	}
+	// AddTunnelWithConfig preserves the live administrative state. DisableBackend
+	// already detached its device; never reattach it after a concurrent disable.
+	if !live.Enabled {
+		return nil, false
+	}
 	if err := s.attachBackendForwarder(updated, nil); err != nil {
 		// Old remote identity is still valid; roll back before revoking anything.
 		_, rollbackErr := s.pool.AddTunnelWithConfig(ctx, serverID, current.Endpoint, current.PublicKey,

@@ -692,6 +692,93 @@ func TestRotationRemoteDelayDoesNotBlockUnrelatedIngressAdmission(t *testing.T) 
 	}
 }
 
+func TestRotationPendingAdministrativeDisableKeepsBackendDetached(t *testing.T) {
+	_, db, _ := setupTestHandlers(t)
+	ctx := t.Context()
+	sid, err := db.CreateServer(ctx, &models.Server{Name: "rotation-disable", Host: "127.0.0.1", SSHPort: 22})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := db.GetServer(ctx, sid)
+	if err != nil || server == nil {
+		t.Fatalf("load server: %+v %v", server, err)
+	}
+	params, err := json.Marshal(models.NaiveProxyParams{Username: "old-user", Password: "old-secret", Domain: "example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID: sid, InterfaceName: "naive-be", Endpoint: "127.0.0.1:443",
+		Protocol: models.ProtocolNaive, ProtocolParams: params, Enabled: true, Status: models.TunnelStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := vpn.NewVPNService(db, &models.VPNConfig{EnableMultiProtocolBackends: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	mgr := &mockProtocolManager{
+		protocol: models.ProtocolNaive,
+		addClientFn: func(_ context.Context, _ *models.Server, _ map[string]any) (map[string]any, error) {
+			close(entered)
+			<-release
+			return map[string]any{"username": "replacement", "password": "replacement-secret"}, nil
+		},
+	}
+	rotationDone := make(chan error, 1)
+	go func() {
+		rotationDone <- svc.RotateSharedBackendCredential(ctx, server, mgr, models.ProtocolNaive, "old-user")
+	}()
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+			<-rotationDone
+		}
+	}()
+	select {
+	case <-entered:
+	case err := <-rotationDone:
+		close(release)
+		released = true
+		t.Fatalf("rotation failed before provisioning: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote provisioning never started")
+	}
+	if err := svc.DisableBackend(ctx, sid); err != nil {
+		t.Fatalf("disable during remote provisioning: %v", err)
+	}
+	close(release)
+	released = true
+	if err := <-rotationDone; err != nil {
+		t.Fatalf("rotation after disable: %v", err)
+	}
+	row, err := db.GetBackendTunnelByServerID(ctx, sid)
+	if err != nil || row == nil {
+		t.Fatalf("persisted backend: %+v %v", row, err)
+	}
+	live, err := svc.GetTunnel(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, backend := range []*models.BackendTunnel{row, live} {
+		var got models.NaiveProxyParams
+		if err := json.Unmarshal(backend.ProtocolParams, &got); err != nil {
+			t.Fatal(err)
+		}
+		if backend.Enabled || backend.DisableReason != models.DisableReasonAdmin ||
+			got.Username != "replacement" || got.Password != "replacement-secret" {
+			t.Fatalf("disabled backend lost state or rotated credentials: %+v params=%+v", backend, got)
+		}
+	}
+	if dev := svc.GetBackendDeviceForTest(live.ID); dev != nil {
+		_ = dev.Close()
+		t.Fatal("rotation reattached an administratively disabled backend")
+	}
+}
+
 func TestRotateVLESSBackendPreservesExplicitEmptyReplacementFlow(t *testing.T) {
 	_, db, _ := setupTestHandlers(t)
 	ctx := t.Context()
