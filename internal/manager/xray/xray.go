@@ -95,20 +95,22 @@ type VLESSProbeFunc func(ctx context.Context, endpoint string, params models.VLE
 //
 //nolint:revive
 type XrayManager struct {
-	sshPool        SSHProvider
-	containerCache *xrayContainerCache
-	serverLocks    *awg.ServerLockRegistry
-	vlessProbeFn   VLESSProbeFunc
-	mu             sync.Mutex
+	sshPool             SSHProvider
+	containerCache      *xrayContainerCache
+	serverLocks         *awg.ServerLockRegistry
+	vlessProbeFn        VLESSProbeFunc
+	vlessTrafficProbeFn VLESSProbeFunc
+	mu                  sync.Mutex
 }
 
 // NewXrayManager creates a new XrayManager instance.
 func NewXrayManager(pool SSHProvider) *XrayManager {
 	return &XrayManager{
-		sshPool:        pool,
-		containerCache: newXrayContainerCache(),
-		serverLocks:    awg.GlobalServerLocks(),
-		vlessProbeFn:   vless.ProbeVLESSReality,
+		sshPool:             pool,
+		containerCache:      newXrayContainerCache(),
+		serverLocks:         awg.GlobalServerLocks(),
+		vlessProbeFn:        vless.ProbeVLESSReality,
+		vlessTrafficProbeFn: vless.ProbeVLESSTraffic,
 	}
 }
 
@@ -122,10 +124,19 @@ func NewXrayManagerWithServerLocks(pool SSHProvider, locks *awg.ServerLockRegist
 }
 
 // SetVLESSProbeFunc configures an optional authenticated handshake probe function for container readiness checks.
+// When set, it also clears any configured traffic probe function so test mocks apply cleanly across both probe modes.
 func (m *XrayManager) SetVLESSProbeFunc(fn VLESSProbeFunc) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.vlessProbeFn = fn
+	m.vlessTrafficProbeFn = nil
+}
+
+// SetVLESSTrafficProbeFunc configures an optional application-level VLESS traffic probe function for upgrade readiness checks.
+func (m *XrayManager) SetVLESSTrafficProbeFunc(fn VLESSProbeFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.vlessTrafficProbeFn = fn
 }
 
 // recentClients is package-level so every manager instance (HTTP handlers, reconciler,

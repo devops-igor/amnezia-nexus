@@ -3,8 +3,10 @@ package xray
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -588,8 +590,8 @@ func TestXrayManager_DefaultConstructor_AuthenticatesReadinessAndRollsBackOnFail
 	if err == nil {
 		t.Fatalf("expected Install with default constructor to fail due to failed handshake probe on closed port")
 	}
-	if !strings.Contains(err.Error(), "failed REALITY handshake readiness probe") {
-		t.Errorf("expected error mentioning failed REALITY handshake readiness probe, got: %v", err)
+	if !strings.Contains(err.Error(), "failed VLESS traffic readiness probe") {
+		t.Errorf("expected error mentioning failed VLESS traffic readiness probe, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "rolled back to previous container") {
 		t.Errorf("expected error mentioning rolled back to previous container, got: %v", err)
@@ -756,5 +758,171 @@ func TestXrayManager_FreshInstallWithoutClients_Succeeds(t *testing.T) {
 	}
 	if ep, _ := protoMeta["engine_profile"].(string); ep != "modern_pq" {
 		t.Errorf("server metadata engine_profile = %q, want modern_pq", ep)
+	}
+}
+
+func setupInitialXrayConfig(t *testing.T, clientID string) []byte {
+	t.Helper()
+	key, _, err := GenerateRealityKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cls := []XrayClient{}
+	if clientID != "" {
+		cls = []XrayClient{{ID: clientID, Flow: "xtls-rprx-vision", Email: "retained"}}
+	}
+	cfg, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, cls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func hasCmd(cmds []string, s1, s2 string) bool {
+	for _, c := range cmds {
+		if strings.Contains(c, s1) && strings.Contains(c, s2) {
+			return true
+		}
+	}
+	return false
+}
+
+type renameFailMockSSH struct {
+	*mockXraySSHClient
+}
+
+func (m *renameFailMockSSH) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	if strings.Contains(cmd, "docker rename") && strings.Contains(cmd, "amnezia-xray-backup") {
+		return "", "docker daemon: rename failed", 1, errors.New("command exited 1")
+	}
+	return m.mockXraySSHClient.RunSudoCommand(ctx, cmd)
+}
+
+func TestXrayManager_StageExistingContainer_RenameFailureRestartsContainer(t *testing.T) {
+	mockSSH := &renameFailMockSSH{mockXraySSHClient: newMockXraySSHClient()}
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+	cfg := setupInitialXrayConfig(t, "c1b2c3d4-e5f6-4a1b-8c2d-3e4f5a6b7c8d")
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
+
+	err := mgr.Install(context.Background(), &models.Server{ID: 910, Host: "192.0.2.110"}, map[string]any{"port": 8443})
+	if err == nil || !strings.Contains(err.Error(), "failed to stage existing xray container for replacement") {
+		t.Fatalf("expected staging failure error, got: %v", err)
+	}
+	if !hasCmd(mockSSH.commands, "docker start", "amnezia-xray") {
+		t.Error("expected docker start amnezia-xray after rename failure")
+	}
+	if !bytes.Equal(mockSSH.files[XrayConfigPath], cfg) {
+		t.Error("expected previous config restored after rename failure")
+	}
+}
+
+type cancelAwareMockSSH struct {
+	*mockXraySSHClient
+	onCommand func(cmd string)
+}
+
+func (m *cancelAwareMockSSH) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	if m.onCommand != nil {
+		m.onCommand(cmd)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", "context canceled", 1, err
+	}
+	return m.mockXraySSHClient.RunSudoCommand(ctx, cmd)
+}
+
+func (m *cancelAwareMockSSH) UploadSudoFile(ctx context.Context, path string, content []byte, mode os.FileMode) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return m.mockXraySSHClient.UploadSudoFile(ctx, path, content, mode)
+}
+
+func TestXrayManager_LaunchContainer_ContextCanceledAfterStaging_RollsBackSuccessfully(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mockSSH := &cancelAwareMockSSH{
+		mockXraySSHClient: newMockXraySSHClient(),
+		onCommand: func(cmd string) {
+			if strings.Contains(cmd, "docker run") {
+				cancel()
+			}
+		},
+	}
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+	cfg := setupInitialXrayConfig(t, "d1b2c3d4-e5f6-4a1b-8c2d-3e4f5a6b7c8d")
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
+
+	err := mgr.Install(ctx, &models.Server{ID: 911, Host: "192.0.2.111"}, map[string]any{"port": 8443})
+	if err == nil || !strings.Contains(err.Error(), "rolled back to previous container") {
+		t.Fatalf("expected rollback error, got: %v", err)
+	}
+	if !hasCmd(mockSSH.commands, "docker rename", "amnezia-xray") || !hasCmd(mockSSH.commands, "docker start", "amnezia-xray") {
+		t.Error("expected backup restored and restarted after context cancellation")
+	}
+}
+
+func TestXrayManager_LaunchContainer_ContextCanceledDuringReadiness_RollsBackSuccessfully(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mockSSH := &cancelAwareMockSSH{mockXraySSHClient: newMockXraySSHClient()}
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+	mgr.SetVLESSProbeFunc(func(probeCtx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		cancel()
+		return 0, context.Canceled
+	})
+	cfg := setupInitialXrayConfig(t, "e1b2c3d4-e5f6-4a1b-8c2d-3e4f5a6b7c8d")
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
+
+	err := mgr.Install(ctx, &models.Server{ID: 912, Host: "192.0.2.112"}, map[string]any{"port": 8443})
+	if err == nil || !strings.Contains(err.Error(), "rolled back to previous container") {
+		t.Fatalf("expected rollback error, got: %v", err)
+	}
+	if !hasCmd(mockSSH.commands, "docker rename", "amnezia-xray") || !hasCmd(mockSSH.commands, "docker start", "amnezia-xray") {
+		t.Error("expected container restored and restarted after readiness cancellation")
+	}
+}
+
+func TestXrayManager_UpgradeWithClients_VerifiesVLESSTrafficProbe(t *testing.T) {
+	mockSSH := newMockXraySSHClient()
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+
+	var capturedTrafficParams models.VLESSRealityParams
+	called := false
+	mgr.SetVLESSTrafficProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		called = true
+		capturedTrafficParams = params
+		return 25, nil
+	})
+
+	const clientUUID = "f1b2c3d4-e5f6-4a1b-8c2d-3e4f5a6b7c8d"
+	cfg := setupInitialXrayConfig(t, clientUUID)
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
+
+	if err := mgr.Install(context.Background(), &models.Server{ID: 913, Host: "192.0.2.113"}, map[string]any{"port": 8443}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if !called || capturedTrafficParams.UUID != clientUUID || capturedTrafficParams.Flow != "xtls-rprx-vision" {
+		t.Fatalf("traffic probe verification failed: called=%v, params=%+v", called, capturedTrafficParams)
+	}
+}
+
+func TestXrayManager_UpgradeWithClients_TrafficProbeFailureRollsBack(t *testing.T) {
+	mockSSH := newMockXraySSHClient()
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+	mgr.SetVLESSTrafficProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		return 0, errors.New("vless: client unauthorized")
+	})
+	cfg := setupInitialXrayConfig(t, "a9b2c3d4-e5f6-4a1b-8c2d-3e4f5a6b7c8d")
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
+
+	err := mgr.Install(context.Background(), &models.Server{ID: 914, Host: "192.0.2.114"}, map[string]any{"port": 8443})
+	if err == nil || !strings.Contains(err.Error(), "failed VLESS traffic readiness probe") || !strings.Contains(err.Error(), "rolled back to previous container") {
+		t.Fatalf("expected traffic probe rollback error, got: %v", err)
+	}
+	if !hasCmd(mockSSH.commands, "docker rename", "amnezia-xray") || !hasCmd(mockSSH.commands, "docker start", "amnezia-xray") {
+		t.Error("expected container restored and restarted on traffic probe failure")
 	}
 }
