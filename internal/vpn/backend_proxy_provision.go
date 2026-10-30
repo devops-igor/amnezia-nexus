@@ -17,6 +17,15 @@ var ErrEmptyParams = errors.New("protocol parameters cannot be empty")
 // ErrMultiProtocolBackendsDisabled indicates that multi-protocol backends are disabled in configuration.
 var ErrMultiProtocolBackendsDisabled = errors.New("multi-protocol backends are disabled")
 
+const (
+	// PeerOwnershipAutoProvisioned marks credentials auto-provisioned by Nexus.
+	// These credentials may be cleaned up by reconciliation if orphaned.
+	PeerOwnershipAutoProvisioned = "auto_provisioned"
+	// PeerOwnershipOperatorSupplied marks credentials supplied by an operator or external source.
+	// These credentials must never be automatically revoked by reconciliation.
+	PeerOwnershipOperatorSupplied = "operator_supplied"
+)
+
 // MultiProtocolEnabled reports whether multi-protocol backends are enabled.
 func (s *Service) MultiProtocolEnabled() bool {
 	if s == nil {
@@ -88,11 +97,19 @@ func DeriveProxyProtocolParams(server *models.Server, proto string) (json.RawMes
 
 // RecordBackendProxyPeerLifecycle records a backend proxy peer in peer_lifecycle with status "backend_active".
 func RecordBackendProxyPeerLifecycle(ctx context.Context, db *database.DB, serverID int64, proto, clientID, name string) error {
+	return RecordBackendProxyPeerLifecycleWithOwnership(ctx, db, serverID, proto, clientID, name, PeerOwnershipAutoProvisioned)
+}
+
+// RecordBackendProxyPeerLifecycleWithOwnership records a backend proxy peer in peer_lifecycle with status "backend_active" and explicit ownership metadata.
+func RecordBackendProxyPeerLifecycleWithOwnership(ctx context.Context, db *database.DB, serverID int64, proto, clientID, name, ownership string) error {
 	if db == nil || clientID == "" {
 		return nil
 	}
 	if name == "" {
 		name = fmt.Sprintf("vpn-backend-%d", serverID)
 	}
-	return db.RecordPeerLifecycle(ctx, serverID, proto, clientID, name, "", "backend_active")
+	if ownership == "" {
+		ownership = PeerOwnershipOperatorSupplied
+	}
+	return db.RecordPeerLifecycle(ctx, serverID, proto, clientID, name, ownership, "backend_active")
 }

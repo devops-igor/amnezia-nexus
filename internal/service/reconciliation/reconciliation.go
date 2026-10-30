@@ -26,6 +26,11 @@ type ProtocolResolver interface {
 	Get(proto string) (manager.ProtocolManager, bool)
 }
 
+const (
+	peerOwnershipAutoProvisioned  = "auto_provisioned"
+	peerOwnershipOperatorSupplied = "operator_supplied"
+)
+
 // Option configures Reconciler periodic background service.
 type Option func(*Reconciler)
 
@@ -611,7 +616,7 @@ func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *mode
 			if clientName == "" {
 				clientName = fmt.Sprintf("vpn-backend-%d", serverID)
 			}
-			_ = r.db.RecordPeerLifecycle(ctx, serverID, proto, clientID, clientName, "", "backend_active")
+			_ = r.db.RecordPeerLifecycle(ctx, serverID, proto, clientID, clientName, peerOwnershipOperatorSupplied, "backend_active")
 		}
 		return
 	}
@@ -707,6 +712,19 @@ func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *mode
 		// An orphan backend_active record with no corresponding backend_tunnels row
 		// (e.g. from an aborted enrollment or deleted backend tunnel).
 		if time.Since(rec.CreatedAt) > staleThreshold {
+			// Issue #656 / #662: Only credentials whose auto-provisioned ownership is established
+			// may be revoked by reconciliation. Operator-supplied / external credentials must NEVER
+			// be deleted from remote nodes.
+			if rec.UserID != peerOwnershipAutoProvisioned {
+				slog.Info("Reconciliation: preserving orphan operator-supplied backend peer from remote removal",
+					"server_id", serverID,
+					"protocol", proto,
+					"client_id", clientID,
+					"age", time.Since(rec.CreatedAt),
+				)
+				_ = r.db.SetPeerLifecycleStatus(ctx, serverID, proto, clientID, "active")
+				return
+			}
 			if err := mgr.RemoveClient(ctx, server, clientID); err != nil {
 				slog.Warn("Reconciliation Phase 3: failed to remove orphan backend peer from remote container",
 					"server_id", serverID,

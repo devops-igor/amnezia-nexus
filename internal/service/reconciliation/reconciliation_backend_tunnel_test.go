@@ -390,9 +390,9 @@ func TestReconciler_RemovesOrphanBackendActiveWithoutBackendTunnel(t *testing.T)
 	}
 
 	orphanClient := "orphan_backend_user_123"
-	// Record lifecycle as backend_active, but DO NOT create a backend_tunnels row
+	// Record lifecycle as backend_active with auto_provisioned ownership, but DO NOT create a backend_tunnels row
 	past := time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
-	if err := db.RecordPeerLifecycle(ctx, sID, "naive", orphanClient, "orphan_backend", "", "backend_active"); err != nil {
+	if err := db.RecordPeerLifecycle(ctx, sID, "naive", orphanClient, "orphan_backend", peerOwnershipAutoProvisioned, "backend_active"); err != nil {
 		t.Fatalf("record lifecycle: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, "UPDATE peer_lifecycle SET created_at = ? WHERE server_id = ? AND client_id = ?", past, sID, orphanClient); err != nil {
@@ -430,5 +430,105 @@ func TestReconciler_RemovesOrphanBackendActiveWithoutBackendTunnel(t *testing.T)
 	}
 	if rec, exists := lifecycles[orphanClient]; exists {
 		t.Fatalf("expected orphan lifecycle record deleted, got %+v", rec)
+	}
+}
+
+// TestReconciler_PreservesOperatorSuppliedBackendCredentialsAfterBackendDeletion verifies
+// that when a backend using operator-supplied credentials is deleted (backend_tunnels row removed),
+// background reconciliation past the stale threshold NEVER revokes the remote credential.
+func TestReconciler_PreservesOperatorSuppliedBackendCredentialsAfterBackendDeletion(t *testing.T) {
+	for _, proto := range []string{models.ProtocolNaive, models.ProtocolVLESS} {
+		t.Run(proto, func(t *testing.T) {
+			db, cleanup := setupTestDB(t)
+			defer cleanup()
+			ctx := context.Background()
+
+			sID, err := db.CreateServer(ctx, &models.Server{
+				Name:      "Operator-Node-" + proto,
+				Host:      "10.0.0.50",
+				SSHPort:   22,
+				Protocols: map[string]any{proto: map[string]any{"installed": true}},
+			})
+			if err != nil {
+				t.Fatalf("create server: %v", err)
+			}
+
+			// Mark legacy peers adopted so that unmanaged zombie peers would normally be deleted
+			if err := db.SetSetting(ctx, legacyPeersAdoptedSettingKey(sID, proto), true); err != nil {
+				t.Fatalf("set legacy adopted: %v", err)
+			}
+
+			operatorClientID := "operator_shared_user_99"
+			if proto == models.ProtocolVLESS {
+				operatorClientID = "e4f5a6b7-c8d9-4012-a345-6789abcdef01"
+			}
+
+			// Record lifecycle as backend_active with operator_supplied ownership
+			// (simulating backend enable with operator-supplied credentials).
+			past := time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+			if err := db.RecordPeerLifecycle(ctx, sID, proto, operatorClientID, "vpn-backend-1", peerOwnershipOperatorSupplied, "backend_active"); err != nil {
+				t.Fatalf("record lifecycle: %v", err)
+			}
+			if _, err := db.ExecContext(ctx, "UPDATE peer_lifecycle SET created_at = ? WHERE server_id = ? AND client_id = ?", past, sID, operatorClientID); err != nil {
+				t.Fatalf("update created_at: %v", err)
+			}
+
+			// Backend tunnel is permanently deleted: NO row exists in backend_tunnels table.
+			old := time.Now().Add(-15 * time.Minute).Format(time.RFC3339)
+			mgr := &mockZombiePeerProtocolManager{
+				proto: proto,
+				clients: []map[string]any{
+					{"clientId": operatorClientID, "username": operatorClientID, "creationDate": old},
+				},
+			}
+			reg := newMockRegistry()
+			reg.Register(mgr)
+
+			r := New(db, reg)
+
+			// First reconciliation cycle past stale threshold
+			if err := r.CleanupZombiePeers(ctx); err != nil {
+				t.Fatalf("CleanupZombiePeers (cycle 1) failed: %v", err)
+			}
+
+			mgr.mu.Lock()
+			deleted := append([]string(nil), mgr.deleted...)
+			mgr.mu.Unlock()
+
+			// Invariant: operator-supplied credential must NEVER be deleted from remote node
+			if len(deleted) != 0 {
+				t.Fatalf("expected 0 remote deletions for operator-supplied credential, got %v", deleted)
+			}
+
+			// Verify lifecycle record was preserved and reclassified to active
+			lifecycles, err := db.GetPeerLifecycles(ctx, sID, proto)
+			if err != nil {
+				t.Fatalf("GetPeerLifecycles failed: %v", err)
+			}
+			rec, exists := lifecycles[operatorClientID]
+			if !exists {
+				t.Fatalf("expected lifecycle record preserved for operator client %s", operatorClientID)
+			}
+			if rec.Status != "active" {
+				t.Fatalf("expected lifecycle status reclassified to 'active', got %q", rec.Status)
+			}
+			if rec.UserID != peerOwnershipOperatorSupplied {
+				t.Fatalf("expected ownership preserved as %q, got %q", peerOwnershipOperatorSupplied, rec.UserID)
+			}
+
+			// Second reconciliation cycle: verify ongoing reconciliation with legacyAdopted=true
+			// still does NOT delete the preserved operator-supplied credential
+			if err := r.CleanupZombiePeers(ctx); err != nil {
+				t.Fatalf("CleanupZombiePeers (cycle 2) failed: %v", err)
+			}
+
+			mgr.mu.Lock()
+			deletedCycle2 := append([]string(nil), mgr.deleted...)
+			mgr.mu.Unlock()
+
+			if len(deletedCycle2) != 0 {
+				t.Fatalf("expected 0 remote deletions on subsequent cycle, got %v", deletedCycle2)
+			}
+		})
 	}
 }

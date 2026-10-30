@@ -212,7 +212,7 @@ func (h *Handlers) resolveInstalledProxyParamsForProto(ctx context.Context, srv 
 	// Tie backend_active strictly to successful registration: record "pending" during enrollment.
 	// Status becomes "backend_active" ONLY after EnableBackendWithConfig succeeds.
 	if h.db != nil && clientID != "" {
-		if err := h.db.RecordPeerLifecycle(ctx, srv.ID, normProto, clientID, clientParams["name"].(string), "", "pending"); err != nil {
+		if err := h.db.RecordPeerLifecycle(ctx, srv.ID, normProto, clientID, clientParams["name"].(string), vpn.PeerOwnershipAutoProvisioned, "pending"); err != nil {
 			slog.Warn("failed to record pending backend proxy peer lifecycle", "server_id", srv.ID, "protocol", normProto, "client_id", clientID, "err", err)
 		}
 	}
@@ -481,7 +481,15 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 	if (normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive) && h.db != nil {
 		cid := extractClientIDFromProtocolParams(normProto, req.ProtocolParams)
 		if cid != "" {
-			_ = vpn.RecordBackendProxyPeerLifecycle(bgCtx, h.db, serverID, normProto, cid, fmt.Sprintf("vpn-backend-%d", serverID))
+			ownership := vpn.PeerOwnershipOperatorSupplied
+			if newlyProvisionedClientID != "" && (cid == newlyProvisionedClientID || strings.EqualFold(cid, newlyProvisionedClientID)) {
+				ownership = vpn.PeerOwnershipAutoProvisioned
+			} else if lifecycles, err := h.db.GetPeerLifecycles(bgCtx, serverID, normProto); err == nil {
+				if existing, ok := lifecycles[cid]; ok && existing.UserID == vpn.PeerOwnershipAutoProvisioned {
+					ownership = vpn.PeerOwnershipAutoProvisioned
+				}
+			}
+			_ = vpn.RecordBackendProxyPeerLifecycleWithOwnership(bgCtx, h.db, serverID, normProto, cid, fmt.Sprintf("vpn-backend-%d", serverID), ownership)
 		}
 	}
 

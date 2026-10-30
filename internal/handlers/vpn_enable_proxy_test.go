@@ -176,6 +176,14 @@ func TestVPNEnableBackendHandler_ProxyBootstrap(t *testing.T) {
 	if !ok || rec.Status != "backend_active" {
 		t.Fatalf("expected peer_lifecycle record for %s with status backend_active, got %+v", provisionedNaive.Username, lifecycles)
 	}
+	if rec.UserID != vpn.PeerOwnershipAutoProvisioned {
+		t.Fatalf("expected auto_provisioned ownership for %s, got %q", provisionedNaive.Username, rec.UserID)
+	}
+	if opRec, exists := lifecycles["user1"]; exists {
+		if opRec.UserID != vpn.PeerOwnershipOperatorSupplied {
+			t.Fatalf("expected operator_supplied ownership for user1, got %q", opRec.UserID)
+		}
+	}
 }
 
 func TestVPNEnableBackendHandler_ProxyBootstrap_VLESS(t *testing.T) {
@@ -279,6 +287,9 @@ func TestVPNEnableBackendHandler_ProxyBootstrap_VLESS(t *testing.T) {
 	rec, ok := lifecycles[provisionedVLESS.UUID]
 	if !ok || rec.Status != "backend_active" {
 		t.Fatalf("expected peer_lifecycle record for %s with status backend_active, got %+v", provisionedVLESS.UUID, lifecycles)
+	}
+	if rec.UserID != vpn.PeerOwnershipAutoProvisioned {
+		t.Fatalf("expected auto_provisioned ownership for %s, got %q", provisionedVLESS.UUID, rec.UserID)
 	}
 }
 
@@ -755,5 +766,84 @@ func TestVPNEnableBackendHandler_PostRegistrationAbort_PreservesCommittedCredent
 	}
 	if rec.Status != "backend_active" {
 		t.Fatalf("expected lifecycle status 'backend_active', got %q", rec.Status)
+	}
+}
+
+func TestVPNEnableBackendHandler_OperatorSuppliedCredentials_RecordedWithOperatorOwnership(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+
+	vpnCfg := &models.VPNConfig{
+		EnableMultiProtocolBackends: true,
+		ListenPort:                  51820,
+	}
+	vpnSvc, err := vpn.NewVPNService(db, vpnCfg)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	t.Cleanup(func() {
+		ts, _ := vpnSvc.GetTunnels(ctx)
+		for _, tun := range ts {
+			if d := vpnSvc.GetBackendDeviceForTest(tun.ID); d != nil {
+				_ = d.Close()
+			}
+		}
+	})
+	h.vpnSvc = vpnSvc
+
+	r := chi.NewRouter()
+	r.Post("/api/vpn/backends/{server_id}/enable", h.VPNEnableBackendHandler)
+
+	sid, err := db.CreateServer(ctx, &models.Server{
+		Name:    "operator-proxy-node",
+		Host:    "127.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"naive": map[string]any{
+				"installed": true,
+				"port":      443,
+				"domain":    "op.example.com",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	operatorUser := "operator_custom_user_123"
+	paramsRaw, _ := json.Marshal(models.NaiveProxyParams{
+		Domain:   "op.example.com",
+		Username: operatorUser,
+		Password: "supersecretpassword",
+		EnableH3: false,
+	})
+
+	body, _ := json.Marshal(map[string]any{
+		"protocol":        "naive",
+		"protocol_params": json.RawMessage(paramsRaw),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sid), bytes.NewReader(body))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
+	if err != nil {
+		t.Fatalf("GetPeerLifecycles failed: %v", err)
+	}
+	rec, exists := lifecycles[operatorUser]
+	if !exists {
+		t.Fatalf("expected peer lifecycle record for %s", operatorUser)
+	}
+	if rec.Status != "backend_active" {
+		t.Fatalf("expected status 'backend_active', got %q", rec.Status)
+	}
+	if rec.UserID != vpn.PeerOwnershipOperatorSupplied {
+		t.Fatalf("expected UserID %q, got %q", vpn.PeerOwnershipOperatorSupplied, rec.UserID)
 	}
 }
