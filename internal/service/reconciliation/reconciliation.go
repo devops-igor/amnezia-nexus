@@ -703,6 +703,28 @@ func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *mode
 				_ = r.db.DeletePeerLifecycle(ctx, serverID, proto, clientID)
 			}
 		}
+	case "backend_active":
+		// An orphan backend_active record with no corresponding backend_tunnels row
+		// (e.g. from an aborted enrollment or deleted backend tunnel).
+		if time.Since(rec.CreatedAt) > staleThreshold {
+			if err := mgr.RemoveClient(ctx, server, clientID); err != nil {
+				slog.Warn("Reconciliation Phase 3: failed to remove orphan backend peer from remote container",
+					"server_id", serverID,
+					"protocol", proto,
+					"client_id", clientID,
+					"age", time.Since(rec.CreatedAt),
+					"err", err,
+				)
+			} else {
+				slog.Info("Reconciliation: removed orphan backend peer from remote container",
+					"server_id", serverID,
+					"protocol", proto,
+					"client_id", clientID,
+					"age", time.Since(rec.CreatedAt),
+				)
+				_ = r.db.DeletePeerLifecycle(ctx, serverID, proto, clientID)
+			}
+		}
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel/naive"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel/vless"
 	"golang.org/x/net/http2"
 )
 
@@ -200,6 +202,10 @@ func (a auditObservedDialer) DialContext(ctx context.Context, network, address s
 		err     error
 	}{network: network, address: address, err: err}
 	return c, err
+}
+
+func (a auditObservedDialer) Unwrap() StreamDialer {
+	return a.dialer
 }
 
 func TestFlows_NaiveDefaultDNSBridgeRegression(t *testing.T) {
@@ -454,4 +460,141 @@ func TestFlows_NaiveBackedStreambridgeDNS(t *testing.T) {
 		t.Fatalf("expected QR bit set in response")
 	}
 	t.Logf("successfully received valid %d-byte DNS reply through Naive-backed streambridge", n)
+}
+
+// startUDPDNSServer starts an in-process UDP DNS server.
+// It accepts standard DNS queries over UDP and responds with an answer record.
+func startUDPDNSServer(t *testing.T) (string, func()) {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp dns: %v", err)
+	}
+	closed := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			resp := make([]byte, n+16)
+			copy(resp, buf[:n])
+			if len(resp) >= 4 {
+				resp[2] |= 0x80 // QR bit = 1 (response)
+				resp[3] |= 0x80 // RA bit = 1
+				resp[7] = 1     // ANCOUNT = 1
+			}
+			ans := []byte{0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 93, 184, 216, 34}
+			copy(resp[n:], ans)
+			respLen := n + len(ans)
+			_, _ = pc.WriteTo(resp[:respLen], addr)
+		}
+	}()
+	cleanup := func() {
+		close(closed)
+		_ = pc.Close()
+		wg.Wait()
+	}
+	return pc.LocalAddr().String(), cleanup
+}
+
+type udpCapableTestDialer struct {
+	udpAddr       string
+	dialedNetwork atomic.Value
+	dialedAddr    atomic.Value
+}
+
+func (d *udpCapableTestDialer) SupportsUDP() bool {
+	return true
+}
+
+func (d *udpCapableTestDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	d.dialedNetwork.Store(network)
+	d.dialedAddr.Store(address)
+	if network == "tcp" {
+		return nil, errors.New("connection refused: upstream resolver is UDP only")
+	}
+	var dialer net.Dialer
+	return dialer.DialContext(ctx, network, d.udpAddr)
+}
+
+func TestFlows_UDPCapableDialer_PreservesNativeUDPDNS(t *testing.T) {
+	// Static capability checks for both concrete proxy dialers
+	var vlessDialer vless.Dialer
+	if !vlessDialer.SupportsUDP() {
+		t.Fatal("expected vless.Dialer.SupportsUDP() to be true")
+	}
+	var naiveDialer naive.Dialer
+	if naiveDialer.SupportsUDP() {
+		t.Fatal("expected naive.Dialer.SupportsUDP() to be false")
+	}
+
+	udpDNSAddr, stopUDP := startUDPDNSServer(t)
+	defer stopUDP()
+
+	testDialer := &udpCapableTestDialer{
+		udpAddr: udpDNSAddr,
+	}
+
+	cfg := Config{
+		UDPIdleTimeout: 500 * time.Millisecond,
+		DialTimeout:    2 * time.Second,
+	}
+	dev, err := New(cfg, testDialer)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+	defer dev.Close()
+
+	tc := newTestClient(t, dev)
+	defer tc.Close()
+
+	conn, err := tc.DialUDP("198.51.100.1:53")
+	if err != nil {
+		t.Fatalf("DialUDP to port 53 error: %v", err)
+	}
+	defer conn.Close()
+
+	query := []byte{
+		0xaa, 0xbb, // ID
+		0x01, 0x00, // standard query
+		0x00, 0x01, // QDCOUNT = 1
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0x00,
+		0x00, 0x01, 0x00, 0x01,
+	}
+
+	if _, err := conn.Write(query); err != nil {
+		t.Fatalf("conn.Write error: %v", err)
+	}
+
+	resp := make([]byte, 1024)
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, err := conn.Read(resp)
+	if err != nil {
+		t.Fatalf("conn.Read DNS response error (TCP refusal bypassed, native UDP expected): %v", err)
+	}
+
+	if n < len(query) {
+		t.Fatalf("expected response length >= %d, got %d", len(query), n)
+	}
+	if binary.BigEndian.Uint16(resp[:2]) != 0xaabb {
+		t.Fatalf("expected transaction ID 0xaabb, got 0x%04x", binary.BigEndian.Uint16(resp[:2]))
+	}
+	if resp[2]&0x80 == 0 {
+		t.Fatalf("expected QR bit set in response")
+	}
+
+	netVal, _ := testDialer.dialedNetwork.Load().(string)
+	addrVal, _ := testDialer.dialedAddr.Load().(string)
+	if netVal != "udp" {
+		t.Fatalf("expected dialer network 'udp' for UDP-capable dialer, got %q", netVal)
+	}
+	if addrVal != "198.51.100.1:53" {
+		t.Fatalf("expected dialer target '198.51.100.1:53', got %q", addrVal)
+	}
 }

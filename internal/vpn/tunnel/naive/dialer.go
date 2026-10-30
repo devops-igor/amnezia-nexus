@@ -150,6 +150,11 @@ func (d *Dialer) Close() error {
 	return nil
 }
 
+// SupportsUDP returns false because NaiveProxy only tunnels TCP streams.
+func (d *Dialer) SupportsUDP() bool {
+	return false
+}
+
 // basicAuth returns the HTTP Basic authentication credentials formatted for Proxy-Authorization.
 func basicAuth(username, password string) string {
 	auth := username + ":" + password

@@ -369,3 +369,66 @@ func TestReconciler_PreservesBackendTunnelClients_QueryError(t *testing.T) {
 		})
 	}
 }
+
+func TestReconciler_RemovesOrphanBackendActiveWithoutBackendTunnel(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	sID, err := db.CreateServer(ctx, &models.Server{
+		Name:      "Naive-Orphan-Node",
+		Host:      "10.0.0.1",
+		SSHPort:   22,
+		Protocols: map[string]any{"naive": map[string]any{"installed": true}},
+	})
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+
+	if err := db.SetSetting(ctx, legacyPeersAdoptedSettingKey(sID, "naive"), true); err != nil {
+		t.Fatalf("set legacy adopted: %v", err)
+	}
+
+	orphanClient := "orphan_backend_user_123"
+	// Record lifecycle as backend_active, but DO NOT create a backend_tunnels row
+	past := time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+	if err := db.RecordPeerLifecycle(ctx, sID, "naive", orphanClient, "orphan_backend", "", "backend_active"); err != nil {
+		t.Fatalf("record lifecycle: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "UPDATE peer_lifecycle SET created_at = ? WHERE server_id = ? AND client_id = ?", past, sID, orphanClient); err != nil {
+		t.Fatalf("update created_at: %v", err)
+	}
+
+	old := time.Now().Add(-15 * time.Minute).Format(time.RFC3339)
+	mgr := &mockZombiePeerProtocolManager{
+		proto: "naive",
+		clients: []map[string]any{
+			{"clientId": orphanClient, "username": orphanClient, "creationDate": old},
+		},
+	}
+	reg := newMockRegistry()
+	reg.Register(mgr)
+
+	r := New(db, reg)
+	if err := r.CleanupZombiePeers(ctx); err != nil {
+		t.Fatalf("CleanupZombiePeers failed: %v", err)
+	}
+
+	mgr.mu.Lock()
+	deleted := append([]string(nil), mgr.deleted...)
+	mgr.mu.Unlock()
+
+	// Assert: orphan backend_active client without backend_tunnels row was deleted
+	if len(deleted) != 1 || deleted[0] != orphanClient {
+		t.Fatalf("expected orphan client %q deleted, got %v", orphanClient, deleted)
+	}
+
+	// Verify lifecycle record was also deleted
+	lifecycles, err := db.GetPeerLifecycles(ctx, sID, "naive")
+	if err != nil {
+		t.Fatalf("GetPeerLifecycles failed: %v", err)
+	}
+	if rec, exists := lifecycles[orphanClient]; exists {
+		t.Fatalf("expected orphan lifecycle record deleted, got %+v", rec)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -436,4 +437,151 @@ func TestVPNEnableBackendHandler_ProxyDisabled_RejectsWithoutProvisioning(t *tes
 	if calls := naiveAddCalls.Load(); calls != 0 {
 		t.Fatalf("expected 0 AddClient calls for Naive on omitted-body enable, got %d", calls)
 	}
+}
+
+func TestVPNEnableBackendHandler_EnrollmentFailure_RollsBackOrphanClient(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("successful rollback deletes pending lifecycle and revokes remote client", func(t *testing.T) {
+		h, db, _ := setupTestHandlers(t)
+		vpnCfg := &models.VPNConfig{
+			EnableMultiProtocolBackends: true,
+			ListenPort:                  51820,
+		}
+		vpnSvc, err := vpn.NewVPNService(db, vpnCfg)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+		h.vpnSvc = vpnSvc
+
+		r := chi.NewRouter()
+		r.Post("/api/vpn/backends/{server_id}/enable", h.VPNEnableBackendHandler)
+
+		// Server with invalid port 99999 so EnableBackendWithConfig fails at dialer creation after AddClient
+		sid, err := db.CreateServer(ctx, &models.Server{
+			Name:    "naive-node-fail-port",
+			Host:    "127.0.0.1",
+			SSHPort: 22,
+			Protocols: map[string]any{
+				"naive": map[string]any{
+					"installed": true,
+					"port":      99999,
+					"domain":    "example.com",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateServer failed: %v", err)
+		}
+
+		var addedClients []string
+		var removedClients []string
+		h.registry.Register(&mockProtocolManager{
+			protocol: models.ProtocolNaive,
+			addClientFn: func(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
+				username := "orphan-rollback-user"
+				addedClients = append(addedClients, username)
+				return map[string]any{
+					"username": username,
+					"password": "temp-password",
+					"domain":   "example.com",
+				}, nil
+			},
+			removeClientFn: func(ctx context.Context, server *models.Server, clientID string) error {
+				removedClients = append(removedClients, clientID)
+				return nil
+			},
+		})
+
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sid), nil)
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 InternalServerError on failed backend enable, got %d: %s", w.Code, w.Body.String())
+		}
+
+		if len(addedClients) != 1 || addedClients[0] != "orphan-rollback-user" {
+			t.Fatalf("expected AddClient called for orphan-rollback-user, got %v", addedClients)
+		}
+		if len(removedClients) != 1 || removedClients[0] != "orphan-rollback-user" {
+			t.Fatalf("expected RemoveClient rollback called for orphan-rollback-user, got %v", removedClients)
+		}
+
+		lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
+		if err != nil {
+			t.Fatalf("GetPeerLifecycles failed: %v", err)
+		}
+		if rec, exists := lifecycles["orphan-rollback-user"]; exists {
+			t.Fatalf("expected lifecycle record deleted after successful rollback, got %+v", rec)
+		}
+	})
+
+	t.Run("failed rollback marks lifecycle as failed for reconciler cleanup", func(t *testing.T) {
+		h, db, _ := setupTestHandlers(t)
+		vpnCfg := &models.VPNConfig{
+			EnableMultiProtocolBackends: true,
+			ListenPort:                  51820,
+		}
+		vpnSvc, err := vpn.NewVPNService(db, vpnCfg)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+		h.vpnSvc = vpnSvc
+
+		r := chi.NewRouter()
+		r.Post("/api/vpn/backends/{server_id}/enable", h.VPNEnableBackendHandler)
+
+		sid, err := db.CreateServer(ctx, &models.Server{
+			Name:    "naive-node-fail-remove",
+			Host:    "127.0.0.1",
+			SSHPort: 22,
+			Protocols: map[string]any{
+				"naive": map[string]any{
+					"installed": true,
+					"port":      99999,
+					"domain":    "example.com",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateServer failed: %v", err)
+		}
+
+		h.registry.Register(&mockProtocolManager{
+			protocol: models.ProtocolNaive,
+			addClientFn: func(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
+				return map[string]any{
+					"username": "orphan-failed-user",
+					"password": "temp-password",
+					"domain":   "example.com",
+				}, nil
+			},
+			removeClientFn: func(ctx context.Context, server *models.Server, clientID string) error {
+				return errors.New("remote SSH connection down")
+			},
+		})
+
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sid), nil)
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 InternalServerError, got %d: %s", w.Code, w.Body.String())
+		}
+
+		lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
+		if err != nil {
+			t.Fatalf("GetPeerLifecycles failed: %v", err)
+		}
+		rec, exists := lifecycles["orphan-failed-user"]
+		if !exists {
+			t.Fatal("expected lifecycle record to exist with status 'failed' after failed rollback")
+		}
+		if rec.Status != "failed" {
+			t.Fatalf("expected lifecycle status 'failed', got %q (never backend_active)", rec.Status)
+		}
+	})
 }

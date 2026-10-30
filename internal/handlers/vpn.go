@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
@@ -163,54 +164,60 @@ func detectServerProxyProtocol(srv *models.Server) string {
 	return ""
 }
 
-func (h *Handlers) resolveInstalledProxyParamsForProto(ctx context.Context, srv *models.Server, proto string) (json.RawMessage, error) {
+func (h *Handlers) resolveInstalledProxyParamsForProto(ctx context.Context, srv *models.Server, proto string) (json.RawMessage, string, manager.ProtocolManager, error) {
 	if srv == nil || srv.Protocols == nil {
-		return nil, errors.New("server protocols not available")
+		return nil, "", nil, errors.New("server protocols not available")
 	}
 	normProto := models.NormalizeTunnelProtocol(proto)
 	pInfo, ok := srv.Protocols[normProto].(map[string]any)
 	if !ok || pInfo == nil {
-		return nil, fmt.Errorf("protocol %s not configured on server", normProto)
+		return nil, "", nil, fmt.Errorf("protocol %s not configured on server", normProto)
 	}
 
 	// 1. If explicit credentials already exist in server metadata, reuse them.
 	if pVal, ok := pInfo["params"]; ok && pVal != nil {
 		if b, err := json.Marshal(pVal); err == nil && len(bytes.TrimSpace(b)) > 2 && string(bytes.TrimSpace(b)) != "null" {
-			return b, nil
+			return b, "", nil, nil
 		}
 	}
 	if pVal, ok := pInfo["protocol_params"]; ok && pVal != nil {
 		if b, err := json.Marshal(pVal); err == nil && len(bytes.TrimSpace(b)) > 2 && string(bytes.TrimSpace(b)) != "null" {
-			return b, nil
+			return b, "", nil, nil
 		}
 	}
 
 	// 2. Try protocol manager if available and configured
 	protoMgr, err := h.GetProtocolManager(normProto)
 	if err != nil || protoMgr == nil {
-		return nil, fmt.Errorf("protocol manager for %s not available: %w", normProto, err)
+		return nil, "", nil, fmt.Errorf("protocol manager for %s not available: %w", normProto, err)
 	}
 	clientParams := map[string]any{"name": fmt.Sprintf("vpn-backend-%d", srv.ID)}
 	res, err := protoMgr.AddClient(ctx, srv, clientParams)
 	if err != nil {
-		return nil, fmt.Errorf("failed to provision proxy client on server %d: %w", srv.ID, err)
+		return nil, "", nil, fmt.Errorf("failed to provision proxy client on server %d: %w", srv.ID, err)
 	}
 	if res == nil {
-		return nil, errors.New("protocol manager returned empty client provisioning result")
+		return nil, "", nil, errors.New("protocol manager returned empty client provisioning result")
 	}
+	clientID := extractClientIDFromManagerResult(normProto, res)
 	params := extractProxyParamsFromManagerResult(normProto, res)
 	if len(params) == 0 {
-		return nil, errors.New("failed to extract proxy parameters from manager result")
+		_ = h.rollbackClient(ctx, protoMgr, srv, res, clientID)
+		if h.db != nil && clientID != "" {
+			_ = h.db.SetPeerLifecycleStatus(ctx, srv.ID, normProto, clientID, "failed")
+		}
+		return nil, "", nil, errors.New("failed to extract proxy parameters from manager result")
 	}
 
-	clientID := extractClientIDFromManagerResult(normProto, res)
+	// Tie backend_active strictly to successful registration: record "pending" during enrollment.
+	// Status becomes "backend_active" ONLY after EnableBackendWithConfig succeeds.
 	if h.db != nil && clientID != "" {
-		if err := vpn.RecordBackendProxyPeerLifecycle(ctx, h.db, srv.ID, normProto, clientID, clientParams["name"].(string)); err != nil {
-			slog.Warn("failed to record backend proxy peer lifecycle", "server_id", srv.ID, "protocol", normProto, "client_id", clientID, "err", err)
+		if err := h.db.RecordPeerLifecycle(ctx, srv.ID, normProto, clientID, clientParams["name"].(string), "", "pending"); err != nil {
+			slog.Warn("failed to record pending backend proxy peer lifecycle", "server_id", srv.ID, "protocol", normProto, "client_id", clientID, "err", err)
 		}
 	}
 
-	return params, nil
+	return params, clientID, protoMgr, nil
 }
 
 func extractClientIDFromManagerResult(proto string, res map[string]any) string {
@@ -311,6 +318,10 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 	defer cancel()
 
 	var existingTunnel *models.BackendTunnel
+	var srv *models.Server
+	var newlyProvisionedClientID string
+	var newlyProvisionedMgr manager.ProtocolManager
+
 	if h.db != nil {
 		existingTunnel, _ = h.db.GetBackendTunnelByServerID(bgCtx, serverID)
 	}
@@ -348,7 +359,6 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 		if req.Protocol != "" {
 			effectiveProto = models.NormalizeTunnelProtocol(req.Protocol)
 		}
-		var srv *models.Server
 		if effectiveProto == "" && h.db != nil {
 			srv, _ = h.db.GetServer(bgCtx, serverID)
 			effectiveProto = detectServerProxyProtocol(srv)
@@ -383,26 +393,42 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 				h.JSONError(w, http.StatusNotFound, "server_not_found", fmt.Sprintf("Server %d not found", serverID))
 				return
 			}
-			params, provErr := h.resolveInstalledProxyParamsForProto(bgCtx, srv, normProto)
+			params, provCID, provMgr, provErr := h.resolveInstalledProxyParamsForProto(bgCtx, srv, normProto)
 			if provErr != nil {
 				// #nosec G706 -- Internal server audit log for failed backend proxy client provisioning
 				log.Printf("[vpn/handlers] failed to provision proxy client for server %d: %v", serverID, provErr)
 				h.JSONError(w, http.StatusBadGateway, "provisioning_failed", fmt.Sprintf("Failed to provision proxy client: %v", provErr))
 				return
 			}
+			newlyProvisionedClientID = provCID
+			newlyProvisionedMgr = provMgr
 			req.ProtocolParams = params
 		}
 	}
 
+	normProto := models.NormalizeTunnelProtocol(req.Protocol)
 	if h.vpnSvc != nil {
 		var opts []tunnel.BackendTunnelOptions
 		if req.Protocol != "" || len(req.ProtocolParams) > 0 {
 			opts = append(opts, tunnel.BackendTunnelOptions{
-				Protocol:       models.NormalizeTunnelProtocol(req.Protocol),
+				Protocol:       normProto,
 				ProtocolParams: req.ProtocolParams,
 			})
 		}
 		if err := h.vpnSvc.EnableBackendWithConfig(bgCtx, serverID, opts...); err != nil {
+			if newlyProvisionedClientID != "" && newlyProvisionedMgr != nil {
+				if srv == nil && h.db != nil {
+					srv, _ = h.db.GetServer(bgCtx, serverID)
+				}
+				if rbErr := h.rollbackClient(bgCtx, newlyProvisionedMgr, srv, nil, newlyProvisionedClientID); rbErr != nil {
+					slog.Warn("failed to rollback remote client after enable backend failure", "server_id", serverID, "client_id", newlyProvisionedClientID, "err", rbErr)
+					if h.db != nil {
+						_ = h.db.SetPeerLifecycleStatus(bgCtx, serverID, normProto, newlyProvisionedClientID, "failed")
+					}
+				} else if h.db != nil {
+					_ = h.db.DeletePeerLifecycle(bgCtx, serverID, normProto, newlyProvisionedClientID)
+				}
+			}
 			if errors.Is(err, vpn.ErrAWGNotInstalled) {
 				h.JSONError(w, http.StatusBadRequest, "awg_not_installed", "Server does not have AmneziaWG installed or configured")
 				return
@@ -422,7 +448,6 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	normProto := models.NormalizeTunnelProtocol(req.Protocol)
 	if (normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive) && h.db != nil {
 		cid := extractClientIDFromProtocolParams(normProto, req.ProtocolParams)
 		if cid != "" {

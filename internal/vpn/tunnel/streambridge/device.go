@@ -74,6 +74,7 @@ type deviceStats struct {
 type Device struct {
 	cfg                      Config
 	dialer                   StreamDialer
+	supportsUDP              bool
 	ep                       *channel.Endpoint
 	stack                    *stack.Stack
 	slots                    chan struct{}
@@ -120,13 +121,14 @@ func New(cfg Config, d StreamDialer) (*Device, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	dev := &Device{
-		cfg:       cfg,
-		dialer:    d,
-		slots:     make(chan struct{}, cfg.MaxFlows),
-		closeDone: make(chan struct{}),
-		ctx:       ctx,
-		cancel:    cancel,
-		createdAt: time.Now(),
+		cfg:         cfg,
+		dialer:      d,
+		supportsUDP: dialerSupportsUDP(d),
+		slots:       make(chan struct{}, cfg.MaxFlows),
+		closeDone:   make(chan struct{}),
+		ctx:         ctx,
+		cancel:      cancel,
+		createdAt:   time.Now(),
 	}
 
 	// #nosec G115 -- cfg.MTU is validated in [1, 65535] range above.

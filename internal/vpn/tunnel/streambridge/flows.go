@@ -26,6 +26,29 @@ type StreamDialer interface {
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 }
 
+// UDPCapable is an optional interface that a StreamDialer can implement to declare
+// whether it supports native UDP packet forwarding.
+type UDPCapable interface {
+	SupportsUDP() bool
+}
+
+// dialerSupportsUDP reports whether the dialer supports native UDP packet forwarding.
+// If the dialer implements UDPCapable, its SupportsUDP() return value is authoritative.
+// If the dialer wraps an underlying StreamDialer, it unwraps recursively.
+// A dialer that does not declare UDP capability defaults to false (TCP only).
+func dialerSupportsUDP(d StreamDialer) bool {
+	if d == nil {
+		return false
+	}
+	if u, ok := d.(UDPCapable); ok {
+		return u.SupportsUDP()
+	}
+	if u, ok := d.(interface{ Unwrap() StreamDialer }); ok {
+		return dialerSupportsUDP(u.Unwrap())
+	}
+	return false
+}
+
 const (
 	tcpBufferSize = 32 * 1024
 	udpBufferSize = 64 * 1024
@@ -250,7 +273,7 @@ func (d *Device) onUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
-	if id.LocalPort == 53 {
+	if id.LocalPort == 53 && !d.supportsUDP {
 		go d.runDNSOverTCPFlow(inConn, id)
 		return
 	}
