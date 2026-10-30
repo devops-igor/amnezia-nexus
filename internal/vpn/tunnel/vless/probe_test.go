@@ -175,3 +175,63 @@ func TestProbeVLESSReality_Failures(t *testing.T) {
 		}
 	})
 }
+
+func TestProbeVLESSTraffic_Success(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	echoAddr, cleanupEcho := startTCPEchoServer(t)
+	defer cleanupEcho()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	latencyMS, err := ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, echoAddr, 3*time.Second)
+	if err != nil {
+		t.Fatalf("ProbeVLESSTrafficWithTarget failed: %v", err)
+	}
+
+	if latencyMS < 1 {
+		t.Fatalf("expected latencyMS >= 1, got %d", latencyMS)
+	}
+}
+
+func TestProbeVLESSTraffic_UnauthorizedClient(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	echoAddr, cleanupEcho := startTCPEchoServer(t)
+	defer cleanupEcho()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	wrongParams := fixture.Params
+	wrongParams.UUID = "00000000-0000-0000-0000-000000000000"
+
+	_, err := ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, wrongParams, echoAddr, 2*time.Second)
+	if err == nil {
+		t.Fatal("expected error for unauthorized client UUID, got nil")
+	}
+}
+
+func TestProbeVLESSTraffic_UnreachableDestination(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	// Allocate and close local port
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedDest := ln.Addr().String()
+	_ = ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, closedDest, 2*time.Second)
+	if err == nil {
+		t.Fatal("expected error for unreachable destination through tunnel, got nil")
+	}
+}

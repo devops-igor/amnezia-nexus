@@ -287,7 +287,7 @@ func (m *XrayManager) stageExistingContainer(
 	existingOut, _, existingCode, _ := client.RunSudoCommand(ctx, inspectExistingCmd)
 	hasExistingContainer := existingCode == 0 && strings.TrimSpace(existingOut) != ""
 	wasRunning := false
-	if hasExistingContainer {
+	if hasExistingContainer && len(existingCfgBytes) > 0 {
 		fields := strings.Fields(strings.TrimSpace(existingOut))
 		if len(fields) > 0 && fields[0] == "true" {
 			wasRunning = true
@@ -295,22 +295,35 @@ func (m *XrayManager) stageExistingContainer(
 		rmBackupCmd := fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(backupContainerName))
 		_, _, _, _ = client.RunSudoCommand(ctx, rmBackupCmd)
 
-		stopCmd := fmt.Sprintf("docker stop %s 2>/dev/null || true", ssh.EscapeShellArg(XrayContainerName))
-		_, _, _, _ = client.RunSudoCommand(ctx, stopCmd)
+		if wasRunning {
+			stopCmd := fmt.Sprintf("docker stop %s", ssh.EscapeShellArg(XrayContainerName))
+			if _, stopErrOut, stopCode, stopErr := client.RunSudoCommand(ctx, stopCmd); stopErr != nil || stopCode != 0 {
+				recCtx, recCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+				_ = client.UploadSudoFile(recCtx, XrayConfigPath, existingCfgBytes, 0600)
+				recCancel()
+				return false, false, fmt.Errorf("failed to stop existing xray container for staging (code %d): %s: %w", stopCode, strings.TrimSpace(stopErrOut), stopErr)
+			}
+		}
 
 		renameCmd := fmt.Sprintf("docker rename %s %s",
 			ssh.EscapeShellArg(XrayContainerName),
 			ssh.EscapeShellArg(backupContainerName),
 		)
 		if _, renameErrOut, renameCode, renameErr := client.RunSudoCommand(ctx, renameCmd); renameErr != nil || renameCode != 0 {
-			if len(existingCfgBytes) > 0 {
-				_ = client.UploadSudoFile(ctx, XrayConfigPath, existingCfgBytes, 0600)
+			recCtx, recCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer recCancel()
+			_ = client.UploadSudoFile(recCtx, XrayConfigPath, existingCfgBytes, 0600)
+			if wasRunning {
+				startCmd := fmt.Sprintf("docker start %s", ssh.EscapeShellArg(XrayContainerName))
+				_, _, _, _ = client.RunSudoCommand(recCtx, startCmd)
 			}
 			return false, false, fmt.Errorf("failed to stage existing xray container for replacement (code %d): %s: %w", renameCode, strings.TrimSpace(renameErrOut), renameErr)
 		}
 	} else {
 		rmCmd := fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(XrayContainerName))
 		_, _, _, _ = client.RunSudoCommand(ctx, rmCmd)
+		hasExistingContainer = false
+		wasRunning = false
 	}
 	return hasExistingContainer, wasRunning, nil
 }
@@ -349,12 +362,35 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 
 	m.mu.Lock()
 	probeFn := m.vlessProbeFn
+	trafficProbeFn := m.vlessTrafficProbeFn
 	m.mu.Unlock()
 
-	if probeFn != nil && opts.server != nil && opts.portPrimary > 0 {
+	hasClients := len(opts.clients) > 0
+	var activeProbeFn VLESSProbeFunc
+	probeMode := "REALITY handshake"
+
+	if hasClients {
+		if trafficProbeFn != nil {
+			activeProbeFn = trafficProbeFn
+			probeMode = "VLESS traffic"
+		} else if probeFn != nil {
+			// Fallback to handshake probe if traffic probe is not explicitly configured
+			activeProbeFn = probeFn
+			probeMode = "REALITY handshake"
+		}
+	} else {
+		// Fresh install without clients: keep TLS handshake probe and document it explicitly.
+		// Fresh installs have an empty clients list, so VLESS client traffic authorization
+		// cannot be tested until user credentials are added. The REALITY TLS probe verifies
+		// container startup, TLS certificate/key configuration, and shortID handling.
+		activeProbeFn = probeFn
+		probeMode = "REALITY handshake"
+	}
+
+	if activeProbeFn != nil && opts.server != nil && opts.portPrimary > 0 {
 		probeUUID := ""
 		probeFlow := opts.flow
-		if len(opts.clients) > 0 {
+		if hasClients {
 			probeUUID = opts.clients[0].ID
 			if opts.clients[0].Flow != "" {
 				probeFlow = opts.clients[0].Flow
@@ -376,10 +412,10 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 		probeCtx, probeCancel := context.WithTimeout(ctx, 3*time.Second)
 		defer probeCancel()
 
-		if _, probeErr := probeFn(probeCtx, endpoint, probeParams, 3*time.Second); probeErr != nil {
+		if _, probeErr := activeProbeFn(probeCtx, endpoint, probeParams, 3*time.Second); probeErr != nil {
 			logCmd := fmt.Sprintf("docker logs --tail 50 %s 2>&1", ssh.EscapeShellArg(XrayContainerName))
 			logsOut, _, _, _ := client.RunSudoCommand(ctx, logCmd)
-			return fmt.Errorf("xray container failed REALITY handshake readiness probe: %w (logs: %s)", probeErr, strings.TrimSpace(logsOut))
+			return fmt.Errorf("xray container failed %s readiness probe: %w (logs: %s)", probeMode, probeErr, strings.TrimSpace(logsOut))
 		}
 	}
 
@@ -395,13 +431,16 @@ func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient,
 	}
 
 	rollback := func(triggerErr error) error {
+		recoveryCtx, recoveryCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer recoveryCancel()
+
 		rmFailedCmd := fmt.Sprintf("docker stop %s 2>/dev/null || true; docker rm -fv %s 2>/dev/null || true",
 			ssh.EscapeShellArg(XrayContainerName), ssh.EscapeShellArg(XrayContainerName))
-		_, _, _, _ = client.RunSudoCommand(ctx, rmFailedCmd)
+		_, _, _, _ = client.RunSudoCommand(recoveryCtx, rmFailedCmd)
 
 		if hasExistingContainer {
 			if len(opts.existingCfgBytes) > 0 {
-				if rUpErr := client.UploadSudoFile(ctx, XrayConfigPath, opts.existingCfgBytes, 0600); rUpErr != nil {
+				if rUpErr := client.UploadSudoFile(recoveryCtx, XrayConfigPath, opts.existingCfgBytes, 0600); rUpErr != nil {
 					return fmt.Errorf("%w (rollback failed to restore previous config: %v)", triggerErr, rUpErr)
 				}
 			}
@@ -410,14 +449,14 @@ func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient,
 			if wasRunning {
 				restoreCmd += fmt.Sprintf(" && docker start %s", ssh.EscapeShellArg(XrayContainerName))
 			}
-			if _, rErrOut, rCode, rErr := client.RunSudoCommand(ctx, restoreCmd); rErr != nil || rCode != 0 {
+			if _, rErrOut, rCode, rErr := client.RunSudoCommand(recoveryCtx, restoreCmd); rErr != nil || rCode != 0 {
 				return fmt.Errorf("%w (rollback failed to restore previous container, code %d: %s: %v)",
 					triggerErr, rCode, strings.TrimSpace(rErrOut), rErr)
 			}
 			return fmt.Errorf("%w (rolled back to previous container)", triggerErr)
 		}
 		if len(opts.existingCfgBytes) > 0 {
-			_ = client.UploadSudoFile(ctx, XrayConfigPath, opts.existingCfgBytes, 0600)
+			_ = client.UploadSudoFile(recoveryCtx, XrayConfigPath, opts.existingCfgBytes, 0600)
 		}
 		return triggerErr
 	}
@@ -655,7 +694,9 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 
 	if err := client.UploadSudoFile(ctx, XrayConfigPath, cfgBytes, 0600); err != nil {
 		if len(existingCfgBytes) > 0 {
-			_ = client.UploadSudoFile(ctx, XrayConfigPath, existingCfgBytes, 0600)
+			recCtx, recCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			_ = client.UploadSudoFile(recCtx, XrayConfigPath, existingCfgBytes, 0600)
+			recCancel()
 		}
 		return fmt.Errorf("upload xray config: %w", err)
 	}
