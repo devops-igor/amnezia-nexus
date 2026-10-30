@@ -45,6 +45,7 @@ type Dialer struct {
 	fingerprint   string
 	realityPubKey []byte
 	shortID       [8]byte
+	engineProfile string
 }
 
 type realityVerifier struct {
@@ -198,11 +199,139 @@ func New(endpoint string, p models.VLESSRealityParams) (*Dialer, error) {
 		fingerprint:   fp,
 		realityPubKey: pubKeyBytes,
 		shortID:       shortIDBytes,
+		engineProfile: strings.ToLower(strings.TrimSpace(p.EngineProfile)),
 	}, nil
 }
 
+func (d *Dialer) isModernPQ() bool {
+	switch d.engineProfile {
+	case "modern_pq", "modern", "pq", "26.10.29", "v26.10.29", "modern pq", "post_quantum", "post-quantum":
+		return true
+	default:
+		return false
+	}
+}
+
+func (d *Dialer) configureKeyShares(uConn *utls.UConn, uConfig *utls.Config, raw net.Conn) (*utls.UConn, error) {
+	if d.isModernPQ() {
+		hasPQShare := false
+		for _, ext := range uConn.Extensions {
+			if ks, ok := ext.(*utls.KeyShareExtension); ok {
+				for _, share := range ks.KeyShares {
+					if share.Group == utls.X25519MLKEM768 {
+						hasPQShare = true
+						break
+					}
+				}
+			}
+		}
+		if !hasPQShare {
+			uConn = utls.UClient(raw, uConfig, utls.HelloChrome_Auto)
+			if err := uConn.BuildHandshakeState(); err != nil {
+				return nil, fmt.Errorf("vless: build hybrid handshake state: %w", err)
+			}
+		}
+		return uConn, nil
+	}
+
+	hasPQ := false
+	for _, ext := range uConn.Extensions {
+		if ks, ok := ext.(*utls.KeyShareExtension); ok {
+			var filtered []utls.KeyShare
+			for _, s := range ks.KeyShares {
+				if s.Group == utls.X25519MLKEM768 || s.Group == utls.X25519Kyber768Draft00 {
+					hasPQ = true
+				} else {
+					filtered = append(filtered, s)
+				}
+			}
+			ks.KeyShares = filtered
+		}
+		if sc, ok := ext.(*utls.SupportedCurvesExtension); ok {
+			var filtered []utls.CurveID
+			for _, crv := range sc.Curves {
+				if crv == utls.X25519MLKEM768 || crv == utls.X25519Kyber768Draft00 {
+					hasPQ = true
+				} else {
+					filtered = append(filtered, crv)
+				}
+			}
+			sc.Curves = filtered
+		}
+	}
+	if hasPQ {
+		if err := uConn.MarshalClientHello(); err != nil {
+			return nil, fmt.Errorf("vless: marshal classical client hello: %w", err)
+		}
+	}
+	return uConn, nil
+}
+
+func (d *Dialer) deriveAuthKey(keys *utls.KeySharePrivateKeys) ([]byte, error) {
+	if keys == nil {
+		return nil, errors.New("vless: nil KeyShareKeys")
+	}
+	var ecdheKey *ecdh.PrivateKey
+	if keys.Ecdhe != nil {
+		ecdheKey = keys.Ecdhe
+	} else if keys.MlkemEcdhe != nil {
+		ecdheKey = keys.MlkemEcdhe
+	}
+	if ecdheKey == nil {
+		return nil, errors.New("vless: nil ecdheKey")
+	}
+
+	serverPubKey, err := ecdh.X25519().NewPublicKey(d.realityPubKey)
+	if err != nil {
+		return nil, fmt.Errorf("vless: invalid server reality public key: %w", err)
+	}
+
+	authKey, err := ecdheKey.ECDH(serverPubKey)
+	if err != nil || authKey == nil {
+		return nil, fmt.Errorf("vless: ecdh key exchange: %w", err)
+	}
+	return authKey, nil
+}
+
+func (d *Dialer) sealRealityHello(hello *utls.PubClientHelloMsg, authKey []byte) ([]byte, error) {
+	hello.SessionId = make([]byte, 32)
+	copy(hello.Raw[39:], hello.SessionId)
+
+	nowTime := time.Now()
+	nowSec := nowTime.Unix()
+	if nowSec < 0 {
+		nowSec = 0
+	}
+	// #nosec G115 -- unix timestamp is validated non-negative
+	binary.BigEndian.PutUint64(hello.SessionId, uint64(nowSec))
+	hello.SessionId[0] = 1
+	hello.SessionId[1] = 8
+	hello.SessionId[2] = 1
+	// #nosec G115 -- REALITY protocol mandates 32-bit big-endian timestamp field
+	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(uint64(nowSec)&0xFFFFFFFF))
+	copy(hello.SessionId[8:], d.shortID[:])
+
+	hkdfReader := hkdf.New(sha256.New, authKey, hello.Random[:20], []byte("REALITY"))
+	derivedAuthKey := make([]byte, len(authKey))
+	if _, err := io.ReadFull(hkdfReader, derivedAuthKey); err != nil {
+		return nil, fmt.Errorf("vless: hkdf derive auth key: %w", err)
+	}
+
+	aesBlock, err := aes.NewCipher(derivedAuthKey)
+	if err != nil {
+		return nil, fmt.Errorf("vless: aes cipher: %w", err)
+	}
+	aesGcmCipher, err := cipher.NewGCM(aesBlock)
+	if err != nil {
+		return nil, fmt.Errorf("vless: aes-gcm cipher: %w", err)
+	}
+	aesGcmCipher.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
+	copy(hello.Raw[39:], hello.SessionId)
+	return derivedAuthKey, nil
+}
+
 // handshake connects to the endpoint and executes the REALITY TLS handshake using metacubex/utls,
-// sending both X25519MLKEM768 and X25519 key shares.
+// sending both X25519MLKEM768 and X25519 key shares for modern_pq, or classical X25519 for legacy backends.
 // Shared by DialContext and probeVLESSReality.
 func (d *Dialer) handshake(ctx context.Context) (net.Conn, time.Duration, error) {
 	start := time.Now()
@@ -230,35 +359,17 @@ func (d *Dialer) handshake(ctx context.Context) (net.Conn, time.Duration, error)
 	}
 
 	uConn := utls.UClient(raw, uConfig, helloID)
-	verifier.uConn = uConn
-
 	if err := uConn.BuildHandshakeState(); err != nil {
 		_ = raw.Close()
 		return nil, 0, fmt.Errorf("vless: build handshake state: %w", err)
 	}
 
-	// Verify hybrid post-quantum key shares are intact (never stripped).
-	// If the chosen fingerprint does not carry an X25519MLKEM768 share,
-	// fall back to HelloChrome_Auto to guarantee hybrid X25519MLKEM768 + X25519 key shares.
-	hasPQShare := false
-	for _, ext := range uConn.Extensions {
-		if ks, ok := ext.(*utls.KeyShareExtension); ok {
-			for _, share := range ks.KeyShares {
-				if share.Group == utls.X25519MLKEM768 {
-					hasPQShare = true
-					break
-				}
-			}
-		}
+	uConn, err = d.configureKeyShares(uConn, uConfig, raw)
+	if err != nil {
+		_ = raw.Close()
+		return nil, 0, err
 	}
-	if !hasPQShare {
-		uConn = utls.UClient(raw, uConfig, utls.HelloChrome_Auto)
-		verifier.uConn = uConn
-		if err := uConn.BuildHandshakeState(); err != nil {
-			_ = raw.Close()
-			return nil, 0, fmt.Errorf("vless: build hybrid handshake state: %w", err)
-		}
-	}
+	verifier.uConn = uConn
 
 	for _, extension := range uConn.Extensions {
 		if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
@@ -267,73 +378,18 @@ func (d *Dialer) handshake(ctx context.Context) (net.Conn, time.Duration, error)
 		}
 	}
 
-	keys := uConn.HandshakeState.State13.KeyShareKeys
-	if keys == nil {
-		_ = raw.Close()
-		return nil, 0, errors.New("vless: nil KeyShareKeys")
-	}
-
-	var ecdheKey *ecdh.PrivateKey
-	if keys.Ecdhe != nil {
-		ecdheKey = keys.Ecdhe
-	} else if keys.MlkemEcdhe != nil {
-		ecdheKey = keys.MlkemEcdhe
-	}
-	if ecdheKey == nil {
-		_ = raw.Close()
-		return nil, 0, errors.New("vless: nil ecdheKey")
-	}
-
-	serverPubKey, err := ecdh.X25519().NewPublicKey(d.realityPubKey)
+	authKey, err := d.deriveAuthKey(uConn.HandshakeState.State13.KeyShareKeys)
 	if err != nil {
 		_ = raw.Close()
-		return nil, 0, fmt.Errorf("vless: invalid server reality public key: %w", err)
+		return nil, 0, err
 	}
 
-	authKey, err := ecdheKey.ECDH(serverPubKey)
-	if err != nil || authKey == nil {
+	derivedAuthKey, err := d.sealRealityHello(uConn.HandshakeState.Hello, authKey)
+	if err != nil {
 		_ = raw.Close()
-		return nil, 0, fmt.Errorf("vless: ecdh key exchange: %w", err)
-	}
-
-	hello := uConn.HandshakeState.Hello
-	hello.SessionId = make([]byte, 32)
-	copy(hello.Raw[39:], hello.SessionId)
-
-	nowTime := time.Now()
-	nowSec := nowTime.Unix()
-	if nowSec < 0 {
-		nowSec = 0
-	}
-	// #nosec G115 -- unix timestamp is validated non-negative
-	binary.BigEndian.PutUint64(hello.SessionId, uint64(nowSec))
-	hello.SessionId[0] = 1
-	hello.SessionId[1] = 8
-	hello.SessionId[2] = 1
-	// #nosec G115 -- REALITY protocol mandates 32-bit big-endian timestamp field
-	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(uint64(nowSec)&0xFFFFFFFF))
-	copy(hello.SessionId[8:], d.shortID[:])
-
-	hkdfReader := hkdf.New(sha256.New, authKey, hello.Random[:20], []byte("REALITY"))
-	derivedAuthKey := make([]byte, len(authKey))
-	if _, err := io.ReadFull(hkdfReader, derivedAuthKey); err != nil {
-		_ = raw.Close()
-		return nil, 0, fmt.Errorf("vless: hkdf derive auth key: %w", err)
+		return nil, 0, err
 	}
 	verifier.authKey = derivedAuthKey
-
-	aesBlock, err := aes.NewCipher(derivedAuthKey)
-	if err != nil {
-		_ = raw.Close()
-		return nil, 0, fmt.Errorf("vless: aes cipher: %w", err)
-	}
-	aesGcmCipher, err := cipher.NewGCM(aesBlock)
-	if err != nil {
-		_ = raw.Close()
-		return nil, 0, fmt.Errorf("vless: aes-gcm cipher: %w", err)
-	}
-	aesGcmCipher.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
-	copy(hello.Raw[39:], hello.SessionId)
 
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		_ = raw.Close()

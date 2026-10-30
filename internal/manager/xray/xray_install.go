@@ -2,6 +2,7 @@ package xray
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -29,7 +30,7 @@ func extractVLESSOptions(vo any) (portStr, serverName, flow string, flowSpecifie
 	return "", "", "", false
 }
 
-func resolveInstallNetworkOptions(params map[string]any) (int, string, string) {
+func resolveInstallNetworkOptions(params map[string]any) (int, string, string, bool, bool) {
 	portPrimary := 443
 	if p, ok := params["port"]; ok && fmt.Sprint(p) != "" {
 		if pInt, err := strconv.Atoi(fmt.Sprint(p)); err == nil && pInt > 0 {
@@ -38,9 +39,17 @@ func resolveInstallNetworkOptions(params map[string]any) (int, string, string) {
 	}
 
 	serverName := "gateway.icloud.com"
+	hasServerName := false
 	flow := "xtls-rprx-vision"
+	hasFlow := false
+
+	if sn, ok := params["server_name"]; ok && fmt.Sprint(sn) != "" {
+		serverName = fmt.Sprint(sn)
+		hasServerName = true
+	}
 	if f, ok := params["flow"]; ok {
 		flow = fmt.Sprint(f)
+		hasFlow = true
 	}
 	if vo, ok := params["vless_options"]; ok && vo != nil {
 		pStr, sn, fl, flSet := extractVLESSOptions(vo)
@@ -51,15 +60,17 @@ func resolveInstallNetworkOptions(params map[string]any) (int, string, string) {
 		}
 		if sn != "" {
 			serverName = sn
+			hasServerName = true
 		}
 		if flSet {
 			flow = fl
+			hasFlow = true
 		}
 	}
 	if flow == "none" {
 		flow = ""
 	}
-	return portPrimary, serverName, flow
+	return portPrimary, serverName, flow, hasServerName, hasFlow
 }
 
 func resolveInstallProfileParam(params map[string]any, server *models.Server) string {
@@ -70,11 +81,20 @@ func resolveInstallProfileParam(params map[string]any, server *models.Server) st
 		}
 	}
 	if vo, ok := params["vless_options"]; ok && vo != nil {
-		if vm, ok := vo.(map[string]any); ok {
+		switch v := vo.(type) {
+		case map[string]any:
 			for _, k := range []string{"engine_profile", "profile"} {
-				if p, ok := vm[k]; ok && fmt.Sprint(p) != "" {
+				if p, ok := v[k]; ok && fmt.Sprint(p) != "" {
 					return fmt.Sprint(p)
 				}
+			}
+		case *models.VLESSInstallOptions:
+			if v != nil && v.EngineProfile != "" {
+				return v.EngineProfile
+			}
+		case models.VLESSInstallOptions:
+			if v.EngineProfile != "" {
+				return v.EngineProfile
 			}
 		}
 	}
@@ -90,20 +110,20 @@ func resolveInstallProfileParam(params map[string]any, server *models.Server) st
 	return ""
 }
 
-func parseXrayInstallOptions(params map[string]any, server *models.Server) (int, string, string, EngineProfileInfo, error) {
-	portPrimary, serverName, flow := resolveInstallNetworkOptions(params)
+func parseXrayInstallOptions(params map[string]any, server *models.Server) (int, string, string, bool, bool, EngineProfileInfo, error) {
+	portPrimary, serverName, flow, hasServerName, hasFlow := resolveInstallNetworkOptions(params)
 	profileParam := resolveInstallProfileParam(params, server)
 	profile, err := ResolveEngineProfile(profileParam)
 	if err != nil {
-		return 0, "", "", EngineProfileInfo{}, err
+		return 0, "", "", false, false, EngineProfileInfo{}, err
 	}
-	return portPrimary, serverName, flow, profile, nil
+	return portPrimary, serverName, flow, hasServerName, hasFlow, profile, nil
 }
 
 func (m *XrayManager) resolveRealityCredentials(
 	ctx context.Context,
 	client ssh.SSHClient,
-) (string, string, string, []string, []XrayClient, error) {
+) (string, string, string, []string, []XrayClient, []byte, *XrayConfig, error) {
 	exists, err := client.FileExists(ctx, XrayConfigPath)
 	if errors.Is(err, os.ErrPermission) {
 		testCmd := fmt.Sprintf("test -f %s", ssh.EscapeShellArg(XrayConfigPath))
@@ -118,18 +138,18 @@ func (m *XrayManager) resolveRealityCredentials(
 		}
 	}
 	if err != nil {
-		return "", "", "", nil, nil, fmt.Errorf("failed to check existence of xray config %s: %w", XrayConfigPath, err)
+		return "", "", "", nil, nil, nil, nil, fmt.Errorf("failed to check existence of xray config %s: %w", XrayConfigPath, err)
 	}
 	if !exists {
 		privB64, pubB64, genErr := GenerateRealityKeypair()
 		if genErr != nil {
-			return "", "", "", nil, nil, fmt.Errorf("generate reality keypair: %w", genErr)
+			return "", "", "", nil, nil, nil, nil, fmt.Errorf("generate reality keypair: %w", genErr)
 		}
 		shortID, genErr := GenerateShortID()
 		if genErr != nil {
-			return "", "", "", nil, nil, fmt.Errorf("generate short ID: %w", genErr)
+			return "", "", "", nil, nil, nil, nil, fmt.Errorf("generate short ID: %w", genErr)
 		}
-		return privB64, pubB64, shortID, []string{shortID}, []XrayClient{}, nil
+		return privB64, pubB64, shortID, []string{shortID}, []XrayClient{}, nil, nil, nil
 	}
 
 	catCmd := fmt.Sprintf("cat %s 2>/dev/null", ssh.EscapeShellArg(XrayConfigPath))
@@ -140,34 +160,34 @@ func (m *XrayManager) resolveRealityCredentials(
 	} else {
 		data, dlErr := client.DownloadFile(ctx, XrayConfigPath)
 		if dlErr != nil {
-			return "", "", "", nil, nil, fmt.Errorf("failed to read existing xray config %s (cat code %d: %s, download err: %w)", XrayConfigPath, catCode, strings.TrimSpace(catErrOut), dlErr)
+			return "", "", "", nil, nil, nil, nil, fmt.Errorf("failed to read existing xray config %s (cat code %d: %s, download err: %w)", XrayConfigPath, catCode, strings.TrimSpace(catErrOut), dlErr)
 		}
 		existingCfgBytes = data
 	}
 
 	trimmed := strings.TrimSpace(string(existingCfgBytes))
 	if len(trimmed) == 0 {
-		return "", "", "", nil, nil, fmt.Errorf("existing xray config %s is empty or truncated", XrayConfigPath)
+		return "", "", "", nil, nil, nil, nil, fmt.Errorf("existing xray config %s is empty or truncated", XrayConfigPath)
 	}
 
 	parsed, parseErr := ParseXrayConfig(existingCfgBytes)
 	if parseErr != nil {
-		return "", "", "", nil, nil, fmt.Errorf("failed to parse existing xray config %s: %w", XrayConfigPath, parseErr)
+		return "", "", "", nil, nil, nil, nil, fmt.Errorf("failed to parse existing xray config %s: %w", XrayConfigPath, parseErr)
 	}
 
 	if len(parsed.Inbounds) == 0 {
-		return "", "", "", nil, nil, fmt.Errorf("existing xray config %s contains no inbounds", XrayConfigPath)
+		return "", "", "", nil, nil, nil, nil, fmt.Errorf("existing xray config %s contains no inbounds", XrayConfigPath)
 	}
 
 	inbound := parsed.Inbounds[0]
 	reality := inbound.StreamSettings.RealitySettings
 	if reality.PrivateKey == "" {
-		return "", "", "", nil, nil, fmt.Errorf("existing xray config %s missing reality private key", XrayConfigPath)
+		return "", "", "", nil, nil, nil, nil, fmt.Errorf("existing xray config %s missing reality private key", XrayConfigPath)
 	}
 
 	derivedPub, pubErr := DerivePublicKey(reality.PrivateKey)
 	if pubErr != nil {
-		return "", "", "", nil, nil, fmt.Errorf("failed to derive public key from existing reality private key: %w", pubErr)
+		return "", "", "", nil, nil, nil, nil, fmt.Errorf("failed to derive public key from existing reality private key: %w", pubErr)
 	}
 
 	privB64 := reality.PrivateKey
@@ -181,7 +201,7 @@ func (m *XrayManager) resolveRealityCredentials(
 		var genErr error
 		shortID, genErr = GenerateShortID()
 		if genErr != nil {
-			return "", "", "", nil, nil, fmt.Errorf("generate short ID: %w", genErr)
+			return "", "", "", nil, nil, nil, nil, fmt.Errorf("generate short ID: %w", genErr)
 		}
 		shortIDs = []string{shortID}
 	}
@@ -191,15 +211,18 @@ func (m *XrayManager) resolveRealityCredentials(
 		clients = []XrayClient{}
 	}
 
-	return privB64, pubB64, shortID, shortIDs, clients, nil
+	return privB64, pubB64, shortID, shortIDs, clients, existingCfgBytes, parsed, nil
 }
 
 func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient, image string) error {
+	pullCmd := fmt.Sprintf("docker pull %s", ssh.EscapeShellArg(image))
+	if _, pullErrOut, pullCode, pullErr := client.RunSudoCommand(ctx, pullCmd); pullErr != nil || pullCode != 0 {
+		return fmt.Errorf("failed to pull xray image %s (code %d): %s: %w", image, pullCode, strings.TrimSpace(pullErrOut), pullErr)
+	}
+
 	stopCmd := fmt.Sprintf("docker stop %s 2>/dev/null || true; docker rm -fv %s 2>/dev/null || true",
 		ssh.EscapeShellArg(XrayContainerName), ssh.EscapeShellArg(XrayContainerName))
 	_, _, _, _ = client.RunSudoCommand(ctx, stopCmd)
-
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker pull %s 2>/dev/null || true", ssh.EscapeShellArg(image)))
 
 	runCmd := fmt.Sprintf(`docker run -d \
 --name %s \
@@ -237,6 +260,115 @@ func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient,
 	return nil
 }
 
+func (m *XrayManager) prepareConfigBytes(
+	existingCfgBytes []byte,
+	existingParsed *XrayConfig,
+	portPrimary int,
+	serverName, flow string,
+	hasServerName, hasFlow bool,
+	privB64 string,
+	shortIDs []string,
+	clients []XrayClient,
+	server *models.Server,
+) ([]byte, string, string, error) {
+	if existingCfgBytes == nil || existingParsed == nil || len(existingParsed.Inbounds) == 0 {
+		portHigh := 54321
+		dest := netJoinHostPort(serverName, "443")
+		rendered, err := RenderXrayConfig(portPrimary, portHigh, serverName, dest, privB64, shortIDs, clients)
+		if err != nil {
+			return nil, "", "", fmt.Errorf("render xray config: %w", err)
+		}
+		return rendered, serverName, flow, nil
+	}
+
+	existingInbound := existingParsed.Inbounds[0]
+	existingReality := existingInbound.StreamSettings.RealitySettings
+	if !hasServerName {
+		if len(existingReality.ServerNames) > 0 && existingReality.ServerNames[0] != "" {
+			serverName = existingReality.ServerNames[0]
+		} else if server != nil && server.Protocols != nil {
+			if vMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any); ok {
+				if sn, ok := vMeta["server_name"].(string); ok && sn != "" {
+					serverName = sn
+				}
+			}
+		}
+	}
+	if !hasFlow {
+		if server != nil && server.Protocols != nil {
+			if vMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any); ok {
+				if fl, ok := vMeta["flow"].(string); ok {
+					flow = fl
+				}
+			}
+		} else if len(existingInbound.Settings.Clients) > 0 {
+			flow = existingInbound.Settings.Clients[0].Flow
+		}
+	}
+
+	portChanged := portPrimary != existingInbound.Port
+	sniChanged := hasServerName && (len(existingReality.ServerNames) == 0 || existingReality.ServerNames[0] != serverName)
+	flowChanged := hasFlow
+
+	if !portChanged && !sniChanged && !flowChanged {
+		return existingCfgBytes, serverName, flow, nil
+	}
+
+	updated, err := updateExistingConfig(existingCfgBytes, portPrimary, serverName, flow, portChanged, sniChanged, flowChanged)
+	if err != nil {
+		return nil, "", "", err
+	}
+	return updated, serverName, flow, nil
+}
+
+func updateExistingConfig(existingCfgBytes []byte, portPrimary int, serverName, flow string, portChanged, sniChanged, flowChanged bool) ([]byte, error) {
+	var doc map[string]any
+	if err := json.Unmarshal(existingCfgBytes, &doc); err != nil {
+		return nil, fmt.Errorf("unmarshal existing xray config: %w", err)
+	}
+	if inbounds, ok := doc["inbounds"].([]any); ok && len(inbounds) > 0 {
+		if in0, ok := inbounds[0].(map[string]any); ok {
+			if portChanged {
+				in0["port"] = portPrimary
+			}
+			if sniChanged {
+				if ss, ok := in0["streamSettings"].(map[string]any); ok {
+					if rs, ok := ss["realitySettings"].(map[string]any); ok {
+						rs["serverNames"] = []any{serverName}
+						rs["dest"] = netJoinHostPort(serverName, "443")
+					}
+				}
+			}
+			if flowChanged {
+				if settings, ok := in0["settings"].(map[string]any); ok {
+					if cls, ok := settings["clients"].([]any); ok {
+						for _, c := range cls {
+							if cm, ok := c.(map[string]any); ok {
+								cm["flow"] = flow
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	updated, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal updated xray config: %w", err)
+	}
+	return updated, nil
+}
+
+func determineRunningEngineVersion(ctx context.Context, client ssh.SSHClient, defaultVersion string) string {
+	verCmd := fmt.Sprintf("docker exec %s xray version 2>/dev/null", ssh.EscapeShellArg(XrayContainerName))
+	if verOut, _, code, err := client.RunSudoCommand(ctx, verCmd); err == nil && code == 0 && strings.TrimSpace(verOut) != "" {
+		if fields := strings.Fields(strings.TrimSpace(verOut)); len(fields) >= 2 && strings.EqualFold(fields[0], "Xray") {
+			return fields[1]
+		}
+	}
+	return defaultVersion
+}
+
 // Install prepares the host, renders VLESS+REALITY configuration, and launches amnezia-xray.
 func (m *XrayManager) Install(ctx context.Context, server *models.Server, params map[string]any) error {
 	client, err := m.getSSHClient(ctx, server)
@@ -257,13 +389,13 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	}
 
 	// 2. Parse installation options and resolve engine profile
-	portPrimary, serverName, flow, profile, err := parseXrayInstallOptions(params, server)
+	portPrimary, serverName, flow, hasServerName, hasFlow, profile, err := parseXrayInstallOptions(params, server)
 	if err != nil {
 		return err
 	}
 
 	// 3. Generate or preserve REALITY cryptographic credentials and existing clients
-	privB64, pubB64, shortID, shortIDs, clients, err := m.resolveRealityCredentials(ctx, client)
+	privB64, pubB64, shortID, shortIDs, clients, existingCfgBytes, existingParsed, err := m.resolveRealityCredentials(ctx, client)
 	if err != nil {
 		return err
 	}
@@ -274,12 +406,13 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 		return fmt.Errorf("failed to create xray config directory (code %d): %s: %w", code, errOut, err)
 	}
 
-	// 5. Render and upload config.json
-	portHigh := 54321
-	dest := netJoinHostPort(serverName, "443")
-	cfgBytes, err := RenderXrayConfig(portPrimary, portHigh, serverName, dest, privB64, shortIDs, clients)
+	// 5. Render or preserve and upload config.json
+	cfgBytes, serverName, flow, err := m.prepareConfigBytes(
+		existingCfgBytes, existingParsed, portPrimary, serverName, flow,
+		hasServerName, hasFlow, privB64, shortIDs, clients, server,
+	)
 	if err != nil {
-		return fmt.Errorf("render xray config: %w", err)
+		return err
 	}
 
 	if err := client.UploadSudoFile(ctx, XrayConfigPath, cfgBytes, 0600); err != nil {
@@ -294,30 +427,27 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	m.containerCache.set(m.containerCache.keyForServer(server), true)
 
 	// Determine running engine version from container inspect/exec
-	runningVersion := profile.Version
-	verCmd := fmt.Sprintf("docker exec %s xray version 2>/dev/null", ssh.EscapeShellArg(XrayContainerName))
-	if verOut, _, code, err := client.RunSudoCommand(ctx, verCmd); err == nil && code == 0 && strings.TrimSpace(verOut) != "" {
-		if fields := strings.Fields(strings.TrimSpace(verOut)); len(fields) >= 2 && strings.EqualFold(fields[0], "Xray") {
-			runningVersion = fields[1]
-		}
-	}
+	runningVersion := determineRunningEngineVersion(ctx, client, profile.Version)
 
 	// Update server.Protocols in-memory for caller awareness
 	if server.Protocols == nil {
 		server.Protocols = make(map[string]any)
 	}
-	server.Protocols[models.ProtocolVLESS] = map[string]any{
-		"installed":              true,
-		"port":                   portPrimary,
-		"server_name":            serverName,
-		"public_key":             pubB64,
-		"short_id":               shortID,
-		"flow":                   flow,
-		"engine_profile":         string(profile.Name),
-		"engine_version":         profile.Version,
-		"engine_image":           profile.Image,
-		"running_engine_version": runningVersion,
+	protoMeta, _ := server.Protocols[models.ProtocolVLESS].(map[string]any)
+	if protoMeta == nil {
+		protoMeta = make(map[string]any)
 	}
+	protoMeta["installed"] = true
+	protoMeta["port"] = portPrimary
+	protoMeta["server_name"] = serverName
+	protoMeta["public_key"] = pubB64
+	protoMeta["short_id"] = shortID
+	protoMeta["flow"] = flow
+	protoMeta["engine_profile"] = string(profile.Name)
+	protoMeta["engine_version"] = profile.Version
+	protoMeta["engine_image"] = profile.Image
+	protoMeta["running_engine_version"] = runningVersion
+	server.Protocols[models.ProtocolVLESS] = protoMeta
 
 	return nil
 }

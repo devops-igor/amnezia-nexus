@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager"
@@ -518,5 +519,57 @@ func TestUninstallProtocolHandler_DatabaseFailureReturns500(t *testing.T) {
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected HTTP 500 when database uninstall update fails, got %d (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestInstallProtocolHandler_EngineProfileForwarding(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+	}{
+		{name: "top_level", payload: `{"protocol":"vless","port":"443","engine_profile":"modern_pq"}`},
+		{name: "nested", payload: `{"protocol":"vless","port":"443","vless_options":{"engine_profile":"modern_pq","server_name":"example.com"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, db, _ := setupTestHandlers(t)
+			capture := &captureMockProtocolManager{proto: models.ProtocolVLESS}
+			h.registry = manager.NewRegistry()
+			h.registry.Register(capture)
+			id, err := db.CreateServer(context.Background(), &models.Server{
+				Name: "test-profile-srv", Host: "192.0.2.1", SSHPort: 22,
+				Protocols: map[string]any{},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/install", id), strings.NewReader(tc.payload))
+			rc := chi.NewRouteContext()
+			rc.URLParams.Add("server_id", fmt.Sprint(id))
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rc))
+			req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+				UserID: "admin-1", Username: "admin", Role: models.RoleAdmin,
+			}))
+			rec := httptest.NewRecorder()
+			h.InstallProtocolHandler(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("HTTP %d: %s", rec.Code, rec.Body.String())
+			}
+			if capture.capturedParams["engine_profile"] == "modern_pq" {
+				return
+			}
+			encoded, err := json.Marshal(capture.capturedParams["vless_options"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			nested := map[string]any{}
+			if err := json.Unmarshal(encoded, &nested); err != nil {
+				t.Fatal(err)
+			}
+			if nested["engine_profile"] == "modern_pq" {
+				return
+			}
+			t.Fatalf("engine_profile not forwarded to manager: %#v", capture.capturedParams)
+		})
 	}
 }

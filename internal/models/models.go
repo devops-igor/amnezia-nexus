@@ -297,13 +297,14 @@ const (
 
 // VLESSRealityParams holds connection and cryptographic parameters for VLESS+REALITY backends.
 type VLESSRealityParams struct {
-	UUID        string `json:"uuid"`
-	Flow        string `json:"flow"`
-	PublicKey   string `json:"public_key"`
-	ShortID     string `json:"short_id"`
-	ServerName  string `json:"server_name"`
-	Fingerprint string `json:"fingerprint"`
-	Transport   string `json:"transport"`
+	UUID          string `json:"uuid"`
+	Flow          string `json:"flow"`
+	PublicKey     string `json:"public_key"`
+	ShortID       string `json:"short_id"`
+	ServerName    string `json:"server_name"`
+	Fingerprint   string `json:"fingerprint"`
+	Transport     string `json:"transport"`
+	EngineProfile string `json:"engine_profile,omitempty"`
 }
 
 // NaiveProxyParams holds connection and authentication parameters for NaiveProxy backends.
