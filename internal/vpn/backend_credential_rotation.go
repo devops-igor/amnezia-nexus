@@ -17,6 +17,8 @@ import (
 // RotateSharedBackendCredential provisions a separate remote proxy identity and switches
 // the persisted and live backend before callers revoke the former user's identity.
 // A failed switch leaves the former identity untouched for a later retry.
+//
+//nolint:gocyclo // provisioning, ownership, persistence and rollback are one fail-closed operation.
 func (s *Service) RotateSharedBackendCredential(
 	ctx context.Context, server *models.Server, mgr manager.ProtocolManager, proto, oldID string,
 ) error {
@@ -142,6 +144,7 @@ func rotatedProxyParams(proto string, previous json.RawMessage, res map[string]a
 		if domain := get("domain"); domain != "" {
 			p.Domain = domain
 		}
+		// #nosec G117 -- Backend credentials are encrypted by Pool.AddTunnelWithConfig before persistence.
 		params, err := json.Marshal(p)
 		return params, id, err
 	case models.ProtocolVLESS:

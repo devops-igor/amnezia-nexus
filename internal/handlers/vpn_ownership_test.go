@@ -446,13 +446,16 @@ func TestToggleUserHandler_PreservesSharedBackendCredential(t *testing.T) {
 	}
 }
 
-func TestWithdrawUserConnection_RotatesSharedBackendCredential(t *testing.T) {
+func TestUserHandlers_RotateSharedBackendCredential(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
+		delete  bool
 		failAdd bool
 	}{
-		{name: "rotates and revokes"},
-		{name: "provisioning failure preserves user and backend", failAdd: true},
+		{name: "delete rotates and revokes", delete: true},
+		{name: "disable rotates and revokes"},
+		{name: "delete provisioning failure preserves user and backend", delete: true, failAdd: true},
+		{name: "disable provisioning failure preserves user and backend", failAdd: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, db, _ := setupTestHandlers(t)
@@ -517,9 +520,26 @@ func TestWithdrawUserConnection_RotatesSharedBackendCredential(t *testing.T) {
 					return nil
 				},
 			})
-			err = h.withdrawUserConnection(ctx, conn)
-			if tc.failAdd != (err != nil) {
-				t.Fatalf("withdraw returned %v", err)
+			path := fmt.Sprintf("/api/users/%s/toggle", uid)
+			var body []byte
+			if tc.delete {
+				path = fmt.Sprintf("/api/users/%s/delete", uid)
+			} else {
+				body, err = json.Marshal(models.ToggleUserRequest{Enabled: false})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+			req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+			w := httptest.NewRecorder()
+			setupFullUsersRouter(h).ServeHTTP(w, req)
+			wantStatus := http.StatusOK
+			if tc.failAdd {
+				wantStatus = http.StatusInternalServerError
+			}
+			if w.Code != wantStatus {
+				t.Fatalf("user withdrawal got %d: %s", w.Code, w.Body.String())
 			}
 			if provisioned != 1 {
 				t.Fatalf("AddClient calls: %d", provisioned)
@@ -551,6 +571,17 @@ func TestWithdrawUserConnection_RotatesSharedBackendCredential(t *testing.T) {
 			got, err := db.GetConnection(ctx, conn.ID)
 			if err != nil || (got != nil) != tc.failAdd {
 				t.Fatalf("user connection: %+v %v", got, err)
+			}
+			user, err := db.GetUser(ctx, uid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.delete {
+				if (user != nil) != tc.failAdd {
+					t.Fatalf("deleted user state: %+v", user)
+				}
+			} else if user == nil || user.Enabled != tc.failAdd {
+				t.Fatalf("disabled user state: %+v", user)
 			}
 		})
 	}
