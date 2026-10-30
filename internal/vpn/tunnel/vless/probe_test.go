@@ -235,3 +235,20 @@ func TestProbeVLESSTraffic_UnreachableDestination(t *testing.T) {
 		t.Fatal("expected error for unreachable destination through tunnel, got nil")
 	}
 }
+
+func TestProbeVLESSTraffic_HTTPSDestination_Success(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	latencyMS, err := ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, fixture.DecoyAddr, 3*time.Second)
+	if err != nil {
+		t.Fatalf("ProbeVLESSTrafficWithTarget on HTTPS destination failed: %v", err)
+	}
+
+	if latencyMS < 1 {
+		t.Fatalf("expected latencyMS >= 1, got %d", latencyMS)
+	}
+}

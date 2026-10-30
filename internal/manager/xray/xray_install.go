@@ -299,8 +299,10 @@ func (m *XrayManager) stageExistingContainer(
 			stopCmd := fmt.Sprintf("docker stop %s", ssh.EscapeShellArg(XrayContainerName))
 			if _, stopErrOut, stopCode, stopErr := client.RunSudoCommand(ctx, stopCmd); stopErr != nil || stopCode != 0 {
 				recCtx, recCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+				defer recCancel()
 				_ = client.UploadSudoFile(recCtx, XrayConfigPath, existingCfgBytes, 0600)
-				recCancel()
+				startCmd := fmt.Sprintf("docker start %s", ssh.EscapeShellArg(XrayContainerName))
+				_, _, _, _ = client.RunSudoCommand(recCtx, startCmd)
 				return false, false, fmt.Errorf("failed to stop existing xray container for staging (code %d): %s: %w", stopCode, strings.TrimSpace(stopErrOut), stopErr)
 			}
 		}
