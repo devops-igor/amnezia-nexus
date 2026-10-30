@@ -1,6 +1,7 @@
 package xray
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"reflect"
@@ -232,5 +233,61 @@ func TestXrayManagerLaunchContainer_RollbackOnFailure(t *testing.T) {
 	}
 	if !foundRestoreStart {
 		t.Errorf("expected docker start amnezia-xray in commands, got: %v", mockSSH.commands)
+	}
+	if !bytes.Equal(mockSSH.files[XrayConfigPath], config) {
+		t.Errorf("rollback failed to restore previous config bytes")
+	}
+}
+
+func TestXrayManagerLaunchContainer_RollbackRestoresPreviousConfig(t *testing.T) {
+	mockSSH := &rollbackFaultMockSSHClient{
+		mockXraySSHClient: newMockXraySSHClient(),
+		failDockerRun:     true,
+	}
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+	server := &models.Server{
+		ID:   4401,
+		Host: "192.0.2.41",
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{
+				"installed":      true,
+				"port":           8443,
+				"engine_profile": "legacy",
+			},
+		},
+	}
+	ctx := context.Background()
+
+	key, _, err := GenerateRealityKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialConfig, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
+		{ID: "e8512bce-e575-4805-a678-1d64c033e83e", Flow: "xtls-rprx-vision", Email: "retained"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), initialConfig...)
+
+	err = mgr.Install(ctx, server, map[string]any{
+		"engine_profile": "modern_pq",
+		"port":           9443,
+	})
+	if err == nil {
+		t.Fatalf("expected Install to fail due to injected docker run fault")
+	}
+	if !strings.Contains(err.Error(), "rolled back to previous container") {
+		t.Fatalf("expected rollback error, got: %v", err)
+	}
+	if !bytes.Equal(mockSSH.files[XrayConfigPath], initialConfig) {
+		t.Errorf("rollback left replacement configuration in place; want restored initial config")
+	}
+	parsed, err := ParseXrayConfig(mockSSH.files[XrayConfigPath])
+	if err != nil {
+		t.Fatalf("ParseXrayConfig: %v", err)
+	}
+	if len(parsed.Inbounds) == 0 || parsed.Inbounds[0].Port != 8443 {
+		t.Errorf("expected restored config to listen on port 8443, got %+v", parsed.Inbounds)
 	}
 }

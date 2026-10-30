@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"runtime"
@@ -522,5 +524,82 @@ func TestDialer_ModernPQFingerprintFallback(t *testing.T) {
 	}
 	if !hasPQShare {
 		t.Errorf("expected modern_pq fallback to include group 4588 (X25519MLKEM768), got groups: %v", groups)
+	}
+}
+
+// TestAuditR4SustainedTransferIntegrityUnderGC performs sustained bulk transfer through
+// the production handshake wrapper under garbage-collection pressure, verifying byte-for-byte SHA-256 integrity.
+func TestAuditR4SustainedTransferIntegrityUnderGC(t *testing.T) {
+	f := setupTestServer(t, "", 0)
+	defer f.ServerClose()
+	echo, cleanup := startTCPEchoServer(t)
+	defer cleanup()
+	d, err := New(f.Endpoint, f.Params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	conn, err := d.DialContext(ctx, "tcp", echo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
+	var churn [][]byte
+	for round := 0; round < 200; round++ {
+		payload := bytes.Repeat([]byte(fmt.Sprintf("round-%03d-", round)), 4096)
+		errc := make(chan error, 1)
+		go func() { _, e := conn.Write(payload); errc <- e }()
+		got := make([]byte, len(payload))
+		if _, err := io.ReadFull(conn, got); err != nil {
+			t.Fatalf("round %d read: %v", round, err)
+		}
+		if e := <-errc; e != nil {
+			t.Fatalf("round %d write: %v", round, e)
+		}
+		if sha256.Sum256(got) != sha256.Sum256(payload) {
+			t.Fatalf("round %d: echoed bytes corrupted", round)
+		}
+		// ordinary allocation churn reuses freed spans of the same size classes
+		churn = append(churn, bytes.Repeat([]byte{0xA5}, 16384))
+		if len(churn) > 64 {
+			churn = churn[1:]
+		}
+		if round%5 == 0 {
+			runtime.GC()
+		}
+	}
+	t.Logf("200 verified rounds of %d bytes", 4096*10)
+}
+
+// TestAuditR4CloseDuringBlockedReadRepeated tests streambridge-style teardown:
+// one goroutine blocked in Read, another calls Close.
+func TestAuditR4CloseDuringBlockedReadRepeated(t *testing.T) {
+	f := setupTestServer(t, "", 0)
+	defer f.ServerClose()
+	echo, cleanup := startTCPEchoServer(t)
+	defer cleanup()
+	d, err := New(f.Endpoint, f.Params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 40; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		conn, err := d.DialContext(ctx, "tcp", echo)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		errc := make(chan error, 1)
+		go func() { _, e := conn.Read(make([]byte, 1)); errc <- e }()
+		time.Sleep(5 * time.Millisecond)
+		_ = conn.Close()
+		select {
+		case <-errc:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: Read not unblocked", i)
+		}
+		cancel()
 	}
 }
