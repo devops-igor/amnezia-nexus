@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/reconciliation"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/ingress"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -584,6 +586,172 @@ func TestUserHandlers_RotateSharedBackendCredential(t *testing.T) {
 				t.Fatalf("disabled user state: %+v", user)
 			}
 		})
+	}
+}
+
+func TestRotationRemoteDelayDoesNotBlockUnrelatedIngressAdmission(t *testing.T) {
+	_, db, _ := setupTestHandlers(t)
+	ctx := t.Context()
+	sid, err := db.CreateServer(ctx, &models.Server{Name: "slow-naive", Host: "127.0.0.1", SSHPort: 22})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := db.GetServer(ctx, sid)
+	if err != nil || server == nil {
+		t.Fatalf("load slow server: %+v %v", server, err)
+	}
+	params, err := json.Marshal(models.NaiveProxyParams{Username: "old-user", Password: "old-secret", Domain: "example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID: sid, InterfaceName: "slow-naive", Endpoint: "127.0.0.1:443",
+		Protocol: models.ProtocolNaive, ProtocolParams: params, Enabled: true, Status: models.TunnelStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	awgID, err := db.CreateServer(ctx, &models.Server{Name: "healthy-awg", Host: "127.0.0.2", SSHPort: 22})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID: awgID, InterfaceName: "healthy-awg", Endpoint: "127.0.0.2:51820",
+		Protocol: models.ProtocolAWG, Enabled: true, Status: models.TunnelStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	uid, err := db.CreateUser(ctx, &models.User{Username: "admitted", Role: models.RoleUser, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const peerKey = "healthy-awg-peer-key"
+	const assignedIP = "10.100.3.20"
+	if _, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID: "healthy-awg-conn", UserID: uid, Protocol: models.ProtocolAWG, ClientID: peerKey,
+		ClientParams: map[string]any{"assigned_ip": assignedIP},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := vpn.NewVPNService(db, &models.VPNConfig{EnableMultiProtocolBackends: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	mgr := &mockProtocolManager{
+		protocol: models.ProtocolNaive,
+		addClientFn: func(_ context.Context, _ *models.Server, _ map[string]any) (map[string]any, error) {
+			close(entered)
+			<-release
+			return map[string]any{"username": "replacement", "password": "replacement-secret"}, nil
+		},
+	}
+	rotationDone := make(chan error, 1)
+	go func() {
+		rotationDone <- svc.RotateSharedBackendCredential(ctx, server, mgr, models.ProtocolNaive, "old-user")
+	}()
+	rotationFinished := false
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		if !rotationFinished {
+			<-rotationDone
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote provisioning never started")
+	}
+	admissionDone := make(chan error, 1)
+	go func() {
+		session, backend, _, err := svc.EnsureBackendSessionForIngress(ctx, ingress.PeerOwnership{
+			PeerPublicKey: peerKey, ConnectionID: "healthy-awg-conn", UserID: uid, IP: netip.MustParseAddr(assignedIP),
+		})
+		if err == nil && (session == nil || backend == nil || backend.ServerID != awgID) {
+			err = fmt.Errorf("wrong admission: session=%+v backend=%+v", session, backend)
+		}
+		admissionDone <- err
+	}()
+	select {
+	case err := <-admissionDone:
+		if err != nil {
+			t.Fatalf("unrelated ingress admission: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("healthy AWG admission blocked by remote rotation")
+	}
+	close(release)
+	rotationErr := <-rotationDone
+	rotationFinished = true
+	if rotationErr != nil {
+		t.Fatalf("rotation after release: %v", rotationErr)
+	}
+}
+
+func TestRotateVLESSBackendPreservesExplicitEmptyReplacementFlow(t *testing.T) {
+	_, db, _ := setupTestHandlers(t)
+	ctx := t.Context()
+	sid, err := db.CreateServer(ctx, &models.Server{Name: "vless-node", Host: "127.0.0.1", SSHPort: 22})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := db.GetServer(ctx, sid)
+	if err != nil || server == nil {
+		t.Fatalf("server: %+v %v", server, err)
+	}
+	const oldID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+	const newID = "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+	params, err := json.Marshal(models.VLESSRealityParams{
+		UUID: oldID, Flow: "xtls-rprx-vision", PublicKey: "e-JgU2X7X8aH1pQ1pZqUuWbWw5K2s6J8f8gH9jK1lM4",
+		ShortID: "0123456789abcdef", ServerName: "example.com", Fingerprint: "chrome",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID: sid, InterfaceName: "vless-be", Endpoint: "127.0.0.1:443",
+		Protocol: models.ProtocolVLESS, ProtocolParams: params, Enabled: true, Status: models.TunnelStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := vpn.NewVPNService(db, &models.VPNConfig{EnableMultiProtocolBackends: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr := &mockProtocolManager{
+		protocol: models.ProtocolVLESS,
+		addClientFn: func(_ context.Context, _ *models.Server, _ map[string]any) (map[string]any, error) {
+			return map[string]any{"uuid": newID, "flow": ""}, nil
+		},
+	}
+	if err := svc.RotateSharedBackendCredential(ctx, server, mgr, models.ProtocolVLESS, oldID); err != nil {
+		t.Fatalf("rotate VLESS: %v", err)
+	}
+	row, err := db.GetBackendTunnelByServerID(ctx, sid)
+	if err != nil || row == nil {
+		t.Fatalf("persisted backend: %+v %v", row, err)
+	}
+	live, err := svc.GetTunnel(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, backend := range []*models.BackendTunnel{row, live} {
+		var got models.VLESSRealityParams
+		if err := json.Unmarshal(backend.ProtocolParams, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.UUID != newID || got.Flow != "" {
+			t.Fatalf("rotated VLESS params: %+v", got)
+		}
+	}
+	if dev := svc.GetBackendDeviceForTest(live.ID); dev == nil {
+		t.Fatal("replacement VLESS device not attached")
+	} else {
+		t.Cleanup(func() { _ = dev.Close() })
 	}
 }
 
