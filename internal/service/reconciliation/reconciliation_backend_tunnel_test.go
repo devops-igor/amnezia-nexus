@@ -532,3 +532,215 @@ func TestReconciler_PreservesOperatorSuppliedBackendCredentialsAfterBackendDelet
 		})
 	}
 }
+
+func TestReconciler_PreservesUserAssociatedBackendCredentialsAfterBackendDeletion(t *testing.T) {
+	for _, proto := range []string{models.ProtocolNaive, models.ProtocolVLESS} {
+		t.Run(proto, func(t *testing.T) {
+			db, cleanup := setupTestDB(t)
+			defer cleanup()
+			ctx := context.Background()
+
+			sID, err := db.CreateServer(ctx, &models.Server{
+				Name:      "User-Backend-Node-" + proto,
+				Host:      "10.0.0.51",
+				SSHPort:   22,
+				Protocols: map[string]any{proto: map[string]any{"installed": true}},
+			})
+			if err != nil {
+				t.Fatalf("create server: %v", err)
+			}
+
+			if err := db.SetSetting(ctx, legacyPeersAdoptedSettingKey(sID, proto), true); err != nil {
+				t.Fatalf("set legacy adopted: %v", err)
+			}
+
+			sharedClientID := "user_shared_client_99"
+			if proto == models.ProtocolVLESS {
+				sharedClientID = "a1b2c3d4-e5f6-4789-abcd-0123456789ab"
+			}
+			userID := "user-uuid-persistent-777"
+
+			// 1. Initial user lifecycle entry
+			if err := db.RecordPeerLifecycle(ctx, sID, proto, sharedClientID, "User Device", userID, "active"); err != nil {
+				t.Fatalf("record initial user peer lifecycle: %v", err)
+			}
+
+			// 2. Backend enrollment uses the same credential
+			if err := db.RecordPeerLifecycle(ctx, sID, proto, sharedClientID, "vpn-backend-1", peerOwnershipOperatorSupplied, "backend_active"); err != nil {
+				t.Fatalf("record backend proxy lifecycle: %v", err)
+			}
+
+			// Assert user_id was preserved and not overwritten by operator_supplied
+			lifecycles, err := db.GetPeerLifecycles(ctx, sID, proto)
+			if err != nil {
+				t.Fatalf("get peer lifecycles: %v", err)
+			}
+			rec, exists := lifecycles[sharedClientID]
+			if !exists {
+				t.Fatalf("expected lifecycle record for %s", sharedClientID)
+			}
+			if rec.UserID != userID {
+				t.Fatalf("expected user_id to be preserved as %q, got %q", userID, rec.UserID)
+			}
+			if rec.Status != "backend_active" {
+				t.Fatalf("expected status 'backend_active', got %q", rec.Status)
+			}
+
+			// 3. Backend tunnel is deleted (no row in backend_tunnels) and record ages
+			past := time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+			if _, err := db.ExecContext(ctx, "UPDATE peer_lifecycle SET created_at = ? WHERE server_id = ? AND client_id = ?", past, sID, sharedClientID); err != nil {
+				t.Fatalf("update created_at: %v", err)
+			}
+
+			mgr := &mockZombiePeerProtocolManager{
+				proto: proto,
+				clients: []map[string]any{
+					{"clientId": sharedClientID, "username": sharedClientID, "creationDate": past},
+				},
+			}
+			reg := newMockRegistry()
+			reg.Register(mgr)
+
+			r := New(db, reg)
+
+			// First reconciliation cycle
+			if err := r.CleanupZombiePeers(ctx); err != nil {
+				t.Fatalf("CleanupZombiePeers (cycle 1) failed: %v", err)
+			}
+
+			mgr.mu.Lock()
+			deleted := append([]string(nil), mgr.deleted...)
+			mgr.mu.Unlock()
+
+			if len(deleted) != 0 {
+				t.Fatalf("expected 0 remote deletions for user-associated credential, got %v", deleted)
+			}
+
+			// Verify lifecycle record was preserved with original user_id
+			lifecycles, err = db.GetPeerLifecycles(ctx, sID, proto)
+			if err != nil {
+				t.Fatalf("GetPeerLifecycles failed: %v", err)
+			}
+			rec, exists = lifecycles[sharedClientID]
+			if !exists {
+				t.Fatalf("expected lifecycle record preserved for %s", sharedClientID)
+			}
+			if rec.Status != "active" {
+				t.Fatalf("expected status reclassified to 'active', got %q", rec.Status)
+			}
+			if rec.UserID != userID {
+				t.Fatalf("expected user_id preserved as %q, got %q", userID, rec.UserID)
+			}
+
+			// Second reconciliation cycle
+			if err := r.CleanupZombiePeers(ctx); err != nil {
+				t.Fatalf("CleanupZombiePeers (cycle 2) failed: %v", err)
+			}
+
+			mgr.mu.Lock()
+			deletedCycle2 := append([]string(nil), mgr.deleted...)
+			mgr.mu.Unlock()
+
+			if len(deletedCycle2) != 0 {
+				t.Fatalf("expected 0 remote deletions on subsequent cycle, got %v", deletedCycle2)
+			}
+		})
+	}
+}
+
+func TestReconciler_OwnershipPersistenceFailure_PreservesExternallyManagedCredentials(t *testing.T) {
+	for _, proto := range []string{models.ProtocolNaive, models.ProtocolVLESS} {
+		t.Run(proto, func(t *testing.T) {
+			db, cleanup := setupTestDB(t)
+			defer cleanup()
+			ctx := context.Background()
+
+			sID, err := db.CreateServer(ctx, &models.Server{
+				Name:      "Failed-Persistence-Node-" + proto,
+				Host:      "10.0.0.52",
+				SSHPort:   22,
+				Protocols: map[string]any{proto: map[string]any{"installed": true}},
+			})
+			if err != nil {
+				t.Fatalf("create server: %v", err)
+			}
+
+			if err := db.SetSetting(ctx, legacyPeersAdoptedSettingKey(sID, proto), true); err != nil {
+				t.Fatalf("set legacy adopted: %v", err)
+			}
+
+			operatorClientID := "operator_persisted_fail_client"
+			var paramsRaw []byte
+			if proto == models.ProtocolVLESS {
+				operatorClientID = "b2c3d4e5-f6a7-4890-bcde-123456789abc"
+				paramsRaw, _ = json.Marshal(models.VLESSRealityParams{UUID: operatorClientID})
+			} else {
+				paramsRaw, _ = json.Marshal(models.NaiveProxyParams{Username: operatorClientID})
+			}
+
+			// Simulate failed ownership persistence:
+			// The backend tunnel was created and disabled (fail-closed in handler),
+			// but NO peer_lifecycle record exists.
+			if _, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+				ServerID:       sID,
+				Protocol:       proto,
+				ProtocolParams: paramsRaw,
+				Enabled:        false,
+				CreatedAt:      time.Now().Add(-10 * time.Minute),
+			}); err != nil {
+				t.Fatalf("create backend tunnel: %v", err)
+			}
+
+			past := time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+			mgr := &mockZombiePeerProtocolManager{
+				proto: proto,
+				clients: []map[string]any{
+					{"clientId": operatorClientID, "username": operatorClientID, "creationDate": past},
+				},
+			}
+			reg := newMockRegistry()
+			reg.Register(mgr)
+
+			r := New(db, reg)
+
+			// First cycle: reconciler must preserve the externally managed client and adopt it
+			if err := r.CleanupZombiePeers(ctx); err != nil {
+				t.Fatalf("CleanupZombiePeers (cycle 1) failed: %v", err)
+			}
+
+			mgr.mu.Lock()
+			deleted := append([]string(nil), mgr.deleted...)
+			mgr.mu.Unlock()
+
+			if len(deleted) != 0 {
+				t.Fatalf("expected 0 remote deletions when ownership persistence failed, got %v", deleted)
+			}
+
+			// Verify adopted into peer_lifecycle with operator ownership
+			lifecycles, err := db.GetPeerLifecycles(ctx, sID, proto)
+			if err != nil {
+				t.Fatalf("GetPeerLifecycles failed: %v", err)
+			}
+			rec, exists := lifecycles[operatorClientID]
+			if !exists {
+				t.Fatalf("expected client %s to be adopted into peer_lifecycle", operatorClientID)
+			}
+			if rec.UserID != peerOwnershipOperatorSupplied {
+				t.Fatalf("expected adopted ownership %q, got %q", peerOwnershipOperatorSupplied, rec.UserID)
+			}
+
+			// Second cycle: still preserved
+			if err := r.CleanupZombiePeers(ctx); err != nil {
+				t.Fatalf("CleanupZombiePeers (cycle 2) failed: %v", err)
+			}
+
+			mgr.mu.Lock()
+			deletedCycle2 := append([]string(nil), mgr.deleted...)
+			mgr.mu.Unlock()
+
+			if len(deletedCycle2) != 0 {
+				t.Fatalf("expected 0 remote deletions on subsequent cycle, got %v", deletedCycle2)
+			}
+		})
+	}
+}

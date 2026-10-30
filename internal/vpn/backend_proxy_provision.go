@@ -101,6 +101,7 @@ func RecordBackendProxyPeerLifecycle(ctx context.Context, db *database.DB, serve
 }
 
 // RecordBackendProxyPeerLifecycleWithOwnership records a backend proxy peer in peer_lifecycle with status "backend_active" and explicit ownership metadata.
+// It preserves any existing non-empty user_id associated with the peer so user associations are not overwritten on conflict.
 func RecordBackendProxyPeerLifecycleWithOwnership(ctx context.Context, db *database.DB, serverID int64, proto, clientID, name, ownership string) error {
 	if db == nil || clientID == "" {
 		return nil
@@ -111,5 +112,13 @@ func RecordBackendProxyPeerLifecycleWithOwnership(ctx context.Context, db *datab
 	if ownership == "" {
 		ownership = PeerOwnershipOperatorSupplied
 	}
-	return db.RecordPeerLifecycle(ctx, serverID, proto, clientID, name, ownership, "backend_active")
+	targetUserID := ownership
+	if lifecycles, err := db.GetPeerLifecycles(ctx, serverID, proto); err == nil {
+		if existing, ok := lifecycles[clientID]; ok {
+			if existing.UserID != "" && existing.UserID != PeerOwnershipAutoProvisioned && existing.UserID != PeerOwnershipOperatorSupplied {
+				targetUserID = existing.UserID
+			}
+		}
+	}
+	return db.RecordPeerLifecycle(ctx, serverID, proto, clientID, name, targetUserID, "backend_active")
 }

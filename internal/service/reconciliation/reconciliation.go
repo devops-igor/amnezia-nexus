@@ -713,13 +713,14 @@ func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *mode
 		// (e.g. from an aborted enrollment or deleted backend tunnel).
 		if time.Since(rec.CreatedAt) > staleThreshold {
 			// Issue #656 / #662: Only credentials whose auto-provisioned ownership is established
-			// may be revoked by reconciliation. Operator-supplied / external credentials must NEVER
+			// may be revoked by reconciliation. Operator-supplied, user-associated, or external credentials must NEVER
 			// be deleted from remote nodes.
 			if rec.UserID != peerOwnershipAutoProvisioned {
-				slog.Info("Reconciliation: preserving orphan operator-supplied backend peer from remote removal",
+				slog.Info("Reconciliation: preserving orphan operator-supplied or user-associated backend peer from remote removal",
 					"server_id", serverID,
 					"protocol", proto,
 					"client_id", clientID,
+					"user_id", rec.UserID,
 					"age", time.Since(rec.CreatedAt),
 				)
 				_ = r.db.SetPeerLifecycleStatus(ctx, serverID, proto, clientID, "active")

@@ -489,7 +489,15 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 					ownership = vpn.PeerOwnershipAutoProvisioned
 				}
 			}
-			_ = vpn.RecordBackendProxyPeerLifecycleWithOwnership(bgCtx, h.db, serverID, normProto, cid, fmt.Sprintf("vpn-backend-%d", serverID), ownership)
+			if err := vpn.RecordBackendProxyPeerLifecycleWithOwnership(bgCtx, h.db, serverID, normProto, cid, fmt.Sprintf("vpn-backend-%d", serverID), ownership); err != nil {
+				// #nosec G706 -- Internal server audit log for failed backend peer ownership persistence
+				log.Printf("[vpn/handlers] failed to record peer lifecycle for backend %d: %v", serverID, err)
+				if h.vpnSvc != nil {
+					_ = h.vpnSvc.DisableBackend(bgCtx, serverID)
+				}
+				h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to record backend peer ownership")
+				return
+			}
 		}
 	}
 
