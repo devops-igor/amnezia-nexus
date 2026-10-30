@@ -138,6 +138,9 @@ func TestXrayManager_ProfileSwitchingPreservesConfigAndCredentials(t *testing.T)
 		t.Fatalf("AddClient failed: %v", err)
 	}
 	addedUUID, _ := addedClient["client_id"].(string)
+	if addedClient["engine_profile"] != string(EngineProfileLegacy) {
+		t.Errorf("initial client engine_profile = %v, want %s", addedClient["engine_profile"], EngineProfileLegacy)
+	}
 
 	// 2. Switch engine profile to Modern PQ (26.10.29)
 	switchParams := map[string]any{
@@ -232,5 +235,46 @@ func TestXrayManager_ProfileSwitchingPreservesConfigAndCredentials(t *testing.T)
 	}
 	if !reflect.DeepEqual(revertedCfg.Inbounds[0].StreamSettings.RealitySettings.ShortIDs, switchedCfg.Inbounds[0].StreamSettings.RealitySettings.ShortIDs) {
 		t.Errorf("shortIDs mismatch after revert")
+	}
+}
+
+func TestXrayManager_AddClientPropagatesEngineProfile(t *testing.T) {
+	ctx := context.Background()
+	mockSSH := newMockXraySSHClient()
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+
+	server := &models.Server{
+		ID:      2,
+		Host:    "192.0.2.10",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{
+				"installed":      true,
+				"engine_profile": string(EngineProfileModernPQ),
+			},
+		},
+	}
+
+	// 1. Initial install with modern profile
+	if err := mgr.Install(ctx, server, map[string]any{"engine_profile": "modern_pq"}); err != nil {
+		t.Fatalf("Install modern: %v", err)
+	}
+
+	// 2. Add client inherits modern profile
+	client1, err := mgr.AddClient(ctx, server, map[string]any{"name": "modern-user"})
+	if err != nil {
+		t.Fatalf("AddClient modern: %v", err)
+	}
+	if client1["engine_profile"] != string(EngineProfileModernPQ) {
+		t.Fatalf("got engine_profile = %v, want %s", client1["engine_profile"], EngineProfileModernPQ)
+	}
+
+	// 3. Explicit override in clientParams
+	client2, err := mgr.AddClient(ctx, server, map[string]any{"name": "legacy-override", "engine_profile": "legacy"})
+	if err != nil {
+		t.Fatalf("AddClient override: %v", err)
+	}
+	if client2["engine_profile"] != string(EngineProfileLegacy) {
+		t.Fatalf("got engine_profile = %v, want %s", client2["engine_profile"], EngineProfileLegacy)
 	}
 }
