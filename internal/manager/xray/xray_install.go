@@ -253,7 +253,7 @@ func (m *XrayManager) resolveRealityCredentials(
 	return privB64, pubB64, shortID, shortIDs, clients, existingCfgBytes, parsed, nil
 }
 
-func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient, image string) error {
+func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient, image string, existingCfgBytes []byte) error {
 	pullCmd := fmt.Sprintf("docker pull %s", ssh.EscapeShellArg(image))
 	if _, pullErrOut, pullCode, pullErr := client.RunSudoCommand(ctx, pullCmd); pullErr != nil || pullCode != 0 {
 		return fmt.Errorf("failed to pull xray image %s (code %d): %s: %w", image, pullCode, strings.TrimSpace(pullErrOut), pullErr)
@@ -297,6 +297,11 @@ func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient,
 		_, _, _, _ = client.RunSudoCommand(ctx, rmFailedCmd)
 
 		if hasExistingContainer {
+			if len(existingCfgBytes) > 0 {
+				if rUpErr := client.UploadSudoFile(ctx, XrayConfigPath, existingCfgBytes, 0600); rUpErr != nil {
+					return fmt.Errorf("%w (rollback failed to restore previous config: %v)", triggerErr, rUpErr)
+				}
+			}
 			restoreCmd := fmt.Sprintf("docker rename %s %s",
 				ssh.EscapeShellArg(backupContainerName), ssh.EscapeShellArg(XrayContainerName))
 			if wasRunning {
@@ -548,7 +553,7 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	}
 
 	// 6. Launch amnezia-xray container with resolved profile image
-	if err := m.launchContainer(ctx, client, profile.Image); err != nil {
+	if err := m.launchContainer(ctx, client, profile.Image, existingCfgBytes); err != nil {
 		return err
 	}
 
