@@ -2,7 +2,6 @@ package reconciliation
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -579,27 +578,15 @@ func (r *Reconciler) withdrawDisabledOwnerConns(ctx context.Context, server *mod
 		if !off {
 			continue
 		}
-		isBackend, err := r.isBackendTunnelClient(ctx, server.ID, conn.ClientID)
+		isBackend, err := r.db.IsBackendTunnelClient(ctx, server.ID, proto, conn.ClientID)
 		if err != nil {
 			slog.Warn("Reconciliation Phase 3: failed to verify backend tunnel client for disabled user, skipping removal to fail closed",
 				"server_id", server.ID, "protocol", proto, "client_id", conn.ClientID, "err", err)
 			continue
 		}
 		if isBackend {
-			slog.Info("Reconciliation: preserving active backend tunnel credential while withdrawing disabled user connection",
+			slog.Warn("Reconciliation: disabled user shares backend credential; rotate backend credential before revocation",
 				"server_id", server.ID, "protocol", proto, "client_id", conn.ClientID, "user_id", conn.UserID)
-			if _, err := r.db.DeleteConnection(ctx, conn.ID); err != nil {
-				slog.Warn("Reconciliation Phase 3: failed to delete withdrawn connection", "conn_id", conn.ID, "err", err)
-				continue
-			}
-			if r.db != nil {
-				clientName := conn.Name
-				if clientName == "" {
-					clientName = fmt.Sprintf("vpn-backend-%d", server.ID)
-				}
-				_ = r.db.RecordPeerLifecycle(ctx, server.ID, proto, conn.ClientID, clientName, "", "active")
-				_ = r.db.RecordPeerLifecycle(ctx, server.ID, proto, conn.ClientID, clientName, peerOwnershipOperatorSupplied, "active")
-			}
 			continue
 		}
 		if err := mgr.RemoveClient(ctx, server, conn.ClientID); err != nil {
@@ -620,7 +607,7 @@ func (r *Reconciler) withdrawDisabledOwnerConns(ctx context.Context, server *mod
 func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *models.Server, proto string, mgr manager.ProtocolManager, client map[string]any, clientID string, lifecycles map[string]database.PeerLifecycleRecord, staleThreshold time.Duration) {
 	serverID := server.ID
 
-	isBackend, err := r.isBackendTunnelClient(ctx, serverID, clientID)
+	isBackend, err := r.db.IsBackendTunnelClient(ctx, serverID, proto, clientID)
 	if err != nil {
 		slog.Warn("Reconciliation: failed to verify backend tunnel client due to query error, skipping removal to fail closed",
 			"server_id", serverID,
@@ -919,54 +906,4 @@ func parseClientTimestamp(val any) *time.Time {
 		}
 	}
 	return nil
-}
-
-func (r *Reconciler) isBackendTunnelClient(ctx context.Context, serverID int64, clientID string) (bool, error) {
-	if r.db == nil || clientID == "" {
-		return false, nil
-	}
-	tunnels, err := r.db.GetBackendTunnelsByServerID(ctx, serverID)
-	if err != nil {
-		return false, fmt.Errorf("get backend tunnels for server %d: %w", serverID, err)
-	}
-	for _, t := range tunnels {
-		if isMatchingBackendTunnelClient(&t, clientID) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func isMatchingBackendTunnelClient(t *models.BackendTunnel, clientID string) bool {
-	if t == nil || clientID == "" {
-		return false
-	}
-	if len(t.ProtocolParams) > 0 {
-		var naive models.NaiveProxyParams
-		if err := json.Unmarshal(t.ProtocolParams, &naive); err == nil && naive.Username != "" {
-			if naive.Username == clientID {
-				return true
-			}
-		}
-		var vless models.VLESSRealityParams
-		if err := json.Unmarshal(t.ProtocolParams, &vless); err == nil && vless.UUID != "" {
-			if strings.EqualFold(vless.UUID, clientID) {
-				return true
-			}
-		}
-		var raw map[string]any
-		if err := json.Unmarshal(t.ProtocolParams, &raw); err == nil {
-			for _, k := range []string{"username", "user", "client_id", "clientId", "uuid", "id"} {
-				if v, ok := raw[k].(string); ok && v != "" {
-					if strings.EqualFold(v, clientID) {
-						return true
-					}
-				}
-			}
-		}
-	}
-	if t.PublicKey != "" && t.PublicKey == clientID {
-		return true
-	}
-	return false
 }

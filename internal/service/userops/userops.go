@@ -3,12 +3,10 @@ package userops
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -102,6 +100,13 @@ func (s *Service) DeleteUser(ctx context.Context, userID string) (bool, error) {
 	})
 	if err != nil {
 		return false, err
+	}
+	remaining, err := s.db.GetUser(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("verify deleted user %s: %w", userID, err)
+	}
+	if remaining != nil {
+		return false, errors.New("user still has connections that could not be revoked")
 	}
 
 	return true, nil
@@ -303,7 +308,7 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 	for _, c := range ops.deletes {
 		proto := models.NormalizeProtocol(c.Protocol)
 		removeFailed := false
-		isBackend, err := s.isBackendTunnelClient(ctx, serverID, c.ClientID)
+		isBackend, err := s.db.IsBackendTunnelClient(ctx, serverID, c.Protocol, c.ClientID)
 		if err != nil {
 			slog.Warn("Failed to check backend tunnel client during mass delete, skipping remote removal to fail closed",
 				"server_id", serverID,
@@ -314,34 +319,25 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 			continue
 		}
 		if isBackend {
-			slog.Info("Preserving backend tunnel client during mass delete",
-				"server_id", serverID,
-				"protocol", proto,
-				"client_id", c.ClientID,
-			)
-			if _, err := s.db.DeleteConnection(ctx, c.ID); err != nil {
-				slog.Warn("Failed to delete user connection for preserved backend client", "conn_id", c.ID, "err", err)
-			}
-			name := c.Name
-			if name == "" {
-				name = fmt.Sprintf("vpn-backend-%d", serverID)
-			}
-			_ = s.db.RecordPeerLifecycle(ctx, serverID, proto, c.ClientID, name, "", "active")
-			_ = s.db.RecordPeerLifecycle(ctx, serverID, proto, c.ClientID, name, "operator_supplied", "active")
+			// A legacy shared credential cannot be withdrawn without also disconnecting the backend.
+			// Keep the user and connection intact until an operator rotates the backend credential.
+			slog.Warn("Cannot delete user with a shared backend credential; rotate backend first",
+				"server_id", serverID, "protocol", proto, "client_id", c.ClientID)
 			continue
 		}
-		if s.registry != nil {
-			if mgr, ok := s.registry.Get(proto); ok {
-				if err := mgr.RemoveClient(ctx, server, c.ClientID); err != nil {
-					slog.Warn("Failed to remove remote client during mass delete",
-						"server_id", serverID,
-						"protocol", proto,
-						"client_id", c.ClientID,
-						"err", err,
-					)
-					removeFailed = true
-				}
-			}
+		if s.registry == nil {
+			slog.Warn("Protocol registry unavailable during mass delete; retaining connection", "server_id", serverID, "protocol", proto)
+			continue
+		}
+		mgr, ok := s.registry.Get(proto)
+		if !ok {
+			slog.Warn("Protocol manager unavailable during mass delete; retaining connection", "server_id", serverID, "protocol", proto)
+			continue
+		}
+		if err := mgr.RemoveClient(ctx, server, c.ClientID); err != nil {
+			slog.Warn("Failed to remove remote client during mass delete",
+				"server_id", serverID, "protocol", proto, "client_id", c.ClientID, "err", err)
+			removeFailed = true
 		}
 		if !removeFailed {
 			_, _ = s.db.DeleteConnection(ctx, c.ID)
@@ -456,6 +452,17 @@ func (s *Service) runToggleOperations(
 			recordFailure(t, proto, errors.New("protocol manager is not configured"))
 			continue
 		}
+		if !t.enabled {
+			isBackend, err := s.db.IsBackendTunnelClient(ctx, server.ID, proto, t.conn.ClientID)
+			if err != nil {
+				recordFailure(t, proto, fmt.Errorf("check backend tunnel: %w", err))
+				continue
+			}
+			if isBackend {
+				recordFailure(t, proto, errors.New("user credential is shared with a backend; rotate backend credentials before disabling user"))
+				continue
+			}
+		}
 		if toggler, ok := mgr.(ClientToggler); ok {
 			if err := toggler.ToggleClient(ctx, server, t.conn.ClientID, t.enabled); err != nil {
 				recordFailure(t, proto, err)
@@ -463,29 +470,6 @@ func (s *Service) runToggleOperations(
 			continue
 		}
 		if t.enabled {
-			continue
-		}
-		isBackend, err := s.isBackendTunnelClient(ctx, server.ID, t.conn.ClientID)
-		if err != nil {
-			recordFailure(t, proto, fmt.Errorf("check backend tunnel: %w", err))
-			continue
-		}
-		if isBackend {
-			slog.Info("Preserving backend tunnel client during user toggle disable",
-				"server_id", server.ID,
-				"protocol", proto,
-				"client_id", t.conn.ClientID,
-			)
-			if _, err := s.db.DeleteConnection(ctx, t.conn.ID); err != nil {
-				recordFailure(t, proto, fmt.Errorf("delete connection for preserved backend client: %w", err))
-				continue
-			}
-			name := t.conn.Name
-			if name == "" {
-				name = fmt.Sprintf("vpn-backend-%d", server.ID)
-			}
-			_ = s.db.RecordPeerLifecycle(ctx, server.ID, proto, t.conn.ClientID, name, "", "active")
-			_ = s.db.RecordPeerLifecycle(ctx, server.ID, proto, t.conn.ClientID, name, "operator_supplied", "active")
 			continue
 		}
 		if err := mgr.RemoveClient(ctx, server, t.conn.ClientID); err != nil {
@@ -498,56 +482,6 @@ func (s *Service) runToggleOperations(
 		}
 		_ = s.db.DeletePeerLifecycle(ctx, t.conn.ServerID, t.conn.Protocol, t.conn.ClientID)
 	}
-}
-
-func (s *Service) isBackendTunnelClient(ctx context.Context, serverID int64, clientID string) (bool, error) {
-	if s.db == nil || clientID == "" || serverID == 0 {
-		return false, nil
-	}
-	tunnels, err := s.db.GetBackendTunnelsByServerID(ctx, serverID)
-	if err != nil {
-		return false, fmt.Errorf("get backend tunnels for server %d: %w", serverID, err)
-	}
-	for _, t := range tunnels {
-		if isMatchingBackendTunnelClient(&t, clientID) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func isMatchingBackendTunnelClient(t *models.BackendTunnel, clientID string) bool {
-	if t == nil || clientID == "" {
-		return false
-	}
-	if len(t.ProtocolParams) > 0 {
-		var naive models.NaiveProxyParams
-		if err := json.Unmarshal(t.ProtocolParams, &naive); err == nil && naive.Username != "" {
-			if naive.Username == clientID {
-				return true
-			}
-		}
-		var vless models.VLESSRealityParams
-		if err := json.Unmarshal(t.ProtocolParams, &vless); err == nil && vless.UUID != "" {
-			if strings.EqualFold(vless.UUID, clientID) {
-				return true
-			}
-		}
-		var raw map[string]any
-		if err := json.Unmarshal(t.ProtocolParams, &raw); err == nil {
-			for _, k := range []string{"username", "user", "client_id", "clientId", "uuid", "id"} {
-				if v, ok := raw[k].(string); ok && v != "" {
-					if strings.EqualFold(v, clientID) {
-						return true
-					}
-				}
-			}
-		}
-	}
-	if t.PublicKey != "" && t.PublicKey == clientID {
-		return true
-	}
-	return false
 }
 
 func generateUUID() string {

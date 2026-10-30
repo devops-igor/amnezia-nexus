@@ -400,10 +400,10 @@ func TestUserOpsService_ErrorIsolationAndNilDB(t *testing.T) {
 
 	svc := NewUserOpsService(db, reg)
 
-	// When remote removal returns error, PerformMassOperations isolates the error and preserves local records
+	// A failed remote removal must be surfaced, not reported as a successful deletion.
 	ok, err := svc.DeleteUser(ctx, uID)
-	if err != nil || !ok {
-		t.Fatalf("DeleteUser returned unexpected error: ok=%v, err=%v", ok, err)
+	if err == nil || ok {
+		t.Fatalf("DeleteUser should report incomplete revocation: ok=%v, err=%v", ok, err)
 	}
 
 	// Verify connection is NOT deleted to prevent state mismatch with remote server
@@ -638,32 +638,17 @@ func TestUserOps_ToggleUser_PreservesSharedBackendCredential(t *testing.T) {
 	svc := New(db, reg)
 
 	ok, err := svc.ToggleUser(ctx, uID, false)
-	if err != nil || !ok {
-		t.Fatalf("ToggleUser failed: ok=%v, err=%v", ok, err)
+	if err == nil || ok {
+		t.Fatalf("shared credential operation must fail: ok=%v err=%v", ok, err)
 	}
-
-	mgr.mu.Lock()
-	delCount := len(mgr.deleted)
-	mgr.mu.Unlock()
-	if delCount > 0 {
-		t.Fatalf("expected 0 remote removals, got %d", delCount)
+	if c, err := db.GetConnection(ctx, connID); err != nil || c == nil {
+		t.Fatalf("connection must remain: %+v %v", c, err)
 	}
-
-	conn, _ := db.GetConnection(ctx, connID)
-	if conn != nil {
-		t.Fatalf("expected user connection to be deleted from DB")
+	if u, err := db.GetUser(ctx, uID); err != nil || u == nil || !u.Enabled {
+		t.Fatalf("user must remain enabled: %+v %v", u, err)
 	}
-
-	lifecycles, err := db.GetPeerLifecycles(ctx, sID, models.ProtocolNaive)
-	if err != nil {
-		t.Fatalf("GetPeerLifecycles failed: %v", err)
-	}
-	rec, exists := lifecycles[sharedCred]
-	if !exists {
-		t.Fatalf("expected lifecycle record for %s to exist", sharedCred)
-	}
-	if rec.Status != "active" || rec.UserID != "operator_supplied" {
-		t.Fatalf("expected active/operator_supplied lifecycle, got status=%q user_id=%q", rec.Status, rec.UserID)
+	if tunnels, err := db.GetBackendTunnelsByServerID(ctx, sID); err != nil || len(tunnels) != 1 || !tunnels[0].Enabled {
+		t.Fatalf("backend must remain: %+v %v", tunnels, err)
 	}
 }
 
@@ -729,36 +714,16 @@ func TestUserOps_DeleteUser_PreservesSharedBackendCredential(t *testing.T) {
 	svc := New(db, reg)
 
 	ok, err := svc.DeleteUser(ctx, uID)
-	if err != nil || !ok {
-		t.Fatalf("DeleteUser failed: ok=%v, err=%v", ok, err)
+	if err == nil || ok {
+		t.Fatalf("shared credential operation must fail: ok=%v err=%v", ok, err)
 	}
-
-	mgr.mu.Lock()
-	delCount := len(mgr.deleted)
-	mgr.mu.Unlock()
-	if delCount > 0 {
-		t.Fatalf("expected 0 remote removals, got %d", delCount)
+	if c, err := db.GetConnection(ctx, connID); err != nil || c == nil {
+		t.Fatalf("connection must remain: %+v %v", c, err)
 	}
-
-	user, _ := db.GetUser(ctx, uID)
-	if user != nil {
-		t.Fatalf("expected user to be deleted from DB")
+	if u, err := db.GetUser(ctx, uID); err != nil || u == nil || !u.Enabled {
+		t.Fatalf("user must remain enabled: %+v %v", u, err)
 	}
-
-	conn, _ := db.GetConnection(ctx, connID)
-	if conn != nil {
-		t.Fatalf("expected user connection to be deleted from DB")
-	}
-
-	lifecycles, err := db.GetPeerLifecycles(ctx, sID, models.ProtocolNaive)
-	if err != nil {
-		t.Fatalf("GetPeerLifecycles failed: %v", err)
-	}
-	rec, exists := lifecycles[sharedCred]
-	if !exists {
-		t.Fatalf("expected lifecycle record for %s to exist", sharedCred)
-	}
-	if rec.Status != "active" || rec.UserID != "operator_supplied" {
-		t.Fatalf("expected active/operator_supplied lifecycle, got status=%q user_id=%q", rec.Status, rec.UserID)
+	if tunnels, err := db.GetBackendTunnelsByServerID(ctx, sID); err != nil || len(tunnels) != 1 || !tunnels[0].Enabled {
+		t.Fatalf("backend must remain: %+v %v", tunnels, err)
 	}
 }

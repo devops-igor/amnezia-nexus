@@ -322,7 +322,17 @@ func TestVPNEnableBackendHandler_PreservesExistingUserAssociation(t *testing.T) 
 		t.Fatalf("RecordPeerLifecycle failed: %v", err)
 	}
 
-	// 2. Admin enables backend using the same credential
+	// A lifecycle-only record does not establish ownership. Create a real user connection.
+	if _, err := db.CreateUser(ctx, &models.User{ID: realUserID, Username: "shared-owner", Role: models.RoleUser, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID: "shared-connection", UserID: realUserID, ServerID: sid,
+		Protocol: models.ProtocolNaive, ClientID: sharedUser,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 2. Admin attempts to enroll a backend using the same credential
 	paramsRaw, _ := json.Marshal(models.NaiveProxyParams{
 		Domain:   "user.example.com",
 		Username: sharedUser,
@@ -338,44 +348,18 @@ func TestVPNEnableBackendHandler_PreservesExistingUserAssociation(t *testing.T) 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 conflict, got %d: %s", w.Code, w.Body.String())
 	}
-
-	// Invariant: user_id must NOT be overwritten by operator_supplied
+	if tun, err := db.GetBackendTunnelByServerID(ctx, sid); err != nil || tun != nil {
+		t.Fatalf("rejected credential enrolled as backend: %+v, %v", tun, err)
+	}
+	if conn, err := db.GetConnection(ctx, "shared-connection"); err != nil || conn == nil {
+		t.Fatalf("existing user connection changed: %+v, %v", conn, err)
+	}
 	lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
-	if err != nil {
-		t.Fatalf("GetPeerLifecycles failed: %v", err)
-	}
-	rec, exists := lifecycles[sharedUser]
-	if !exists {
-		t.Fatalf("expected peer lifecycle record for %s", sharedUser)
-	}
-	if rec.UserID != realUserID {
-		t.Fatalf("expected user_id to remain %q, got %q", realUserID, rec.UserID)
-	}
-	if rec.Status != "backend_active" {
-		t.Fatalf("expected status 'backend_active', got %q", rec.Status)
-	}
-
-	// 3. Delete backend
-	delReq := httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/api/vpn/backends/%d", sid), nil)
-	delReq = delReq.WithContext(middleware.WithSession(delReq.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
-	delW := httptest.NewRecorder()
-	r.ServeHTTP(delW, delReq)
-
-	if delW.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK on delete, got %d: %s", delW.Code, delW.Body.String())
-	}
-
-	// Verify user_id is still preserved after backend deletion
-	lifecycles, err = db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
-	if err != nil {
-		t.Fatalf("GetPeerLifecycles failed: %v", err)
-	}
-	rec = lifecycles[sharedUser]
-	if rec.UserID != realUserID {
-		t.Fatalf("expected user_id to be preserved as %q after backend delete, got %q", realUserID, rec.UserID)
+	if err != nil || lifecycles[sharedUser].UserID != realUserID {
+		t.Fatalf("user lifecycle changed: %v, %v", lifecycles, err)
 	}
 }
 
@@ -445,34 +429,20 @@ func TestToggleUserHandler_PreservesSharedBackendCredential(t *testing.T) {
 	w := httptest.NewRecorder()
 	setupFullUsersRouter(h).ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected shared credential operation to fail, got %d: %s", w.Code, w.Body.String())
 	}
-
-	if len(removedClients) > 0 {
-		t.Fatalf("expected 0 remote removals, got %v", removedClients)
+	if len(removedClients) != 0 {
+		t.Fatalf("backend credential was removed: %v", removedClients)
 	}
-
-	dbConn, _ := db.GetConnection(ctx, conn.ID)
-	if dbConn != nil {
-		t.Fatalf("expected user connection to be deleted from DB")
+	if c, err := db.GetConnection(ctx, conn.ID); err != nil || c == nil {
+		t.Fatalf("shared connection must remain retryable: %+v, %v", c, err)
 	}
-
-	lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
-	if err != nil {
-		t.Fatalf("GetPeerLifecycles failed: %v", err)
+	if u, err := db.GetUser(ctx, user.ID); err != nil || u == nil || !u.Enabled {
+		t.Fatalf("user must remain enabled: %+v, %v", u, err)
 	}
-	rec, ok := lifecycles[sharedCred]
-	if !ok {
-		t.Fatalf("expected lifecycle record for %s to exist", sharedCred)
-	}
-	if rec.Status != "active" || rec.UserID != "operator_supplied" {
-		t.Fatalf("expected active/operator_supplied lifecycle, got status=%q user_id=%q", rec.Status, rec.UserID)
-	}
-
-	tunnels, err := db.GetBackendTunnelsByServerID(ctx, sid)
-	if err != nil || len(tunnels) != 1 || !tunnels[0].Enabled {
-		t.Fatalf("expected backend tunnel to remain active, got %v (err: %v)", tunnels, err)
+	if tunnels, err := db.GetBackendTunnelsByServerID(ctx, sid); err != nil || len(tunnels) != 1 || !tunnels[0].Enabled {
+		t.Fatalf("backend must remain enabled: %+v, %v", tunnels, err)
 	}
 }
 
@@ -541,38 +511,19 @@ func TestDeleteUserHandler_PreservesSharedBackendCredential(t *testing.T) {
 	w := httptest.NewRecorder()
 	setupFullUsersRouter(h).ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected shared credential operation to fail, got %d: %s", w.Code, w.Body.String())
 	}
-
-	if len(removedClients) > 0 {
-		t.Fatalf("expected 0 remote removals, got %v", removedClients)
+	if len(removedClients) != 0 {
+		t.Fatalf("backend credential was removed: %v", removedClients)
 	}
-
-	u, _ := db.GetUser(ctx, user.ID)
-	if u != nil {
-		t.Fatalf("expected user to be deleted from DB")
+	if c, err := db.GetConnection(ctx, conn.ID); err != nil || c == nil {
+		t.Fatalf("shared connection must remain retryable: %+v, %v", c, err)
 	}
-
-	dbConn, _ := db.GetConnection(ctx, conn.ID)
-	if dbConn != nil {
-		t.Fatalf("expected user connection to be deleted from DB")
+	if u, err := db.GetUser(ctx, user.ID); err != nil || u == nil || !u.Enabled {
+		t.Fatalf("user must remain enabled: %+v, %v", u, err)
 	}
-
-	lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
-	if err != nil {
-		t.Fatalf("GetPeerLifecycles failed: %v", err)
-	}
-	rec, ok := lifecycles[sharedCred]
-	if !ok {
-		t.Fatalf("expected lifecycle record for %s to exist", sharedCred)
-	}
-	if rec.Status != "active" || rec.UserID != "operator_supplied" {
-		t.Fatalf("expected active/operator_supplied lifecycle, got status=%q user_id=%q", rec.Status, rec.UserID)
-	}
-
-	tunnels, err := db.GetBackendTunnelsByServerID(ctx, sid)
-	if err != nil || len(tunnels) != 1 || !tunnels[0].Enabled {
-		t.Fatalf("expected backend tunnel to remain active, got %v (err: %v)", tunnels, err)
+	if tunnels, err := db.GetBackendTunnelsByServerID(ctx, sid); err != nil || len(tunnels) != 1 || !tunnels[0].Enabled {
+		t.Fatalf("backend must remain enabled: %+v, %v", tunnels, err)
 	}
 }

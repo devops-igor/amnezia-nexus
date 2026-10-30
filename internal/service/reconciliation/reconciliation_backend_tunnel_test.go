@@ -944,11 +944,11 @@ func TestReconciler_WithdrawDisabledOwnerConns_PreservesSharedBackendCredential(
 	if del > 0 {
 		t.Fatalf("expected 0 remote removals, got %d", del)
 	}
-	if conn, _ := db.GetConnection(ctx, "c-dis"); conn != nil {
-		t.Fatalf("expected user connection to be deleted")
+	if conn, _ := db.GetConnection(ctx, "c-dis"); conn == nil {
+		t.Fatal("shared connection must remain for credential rotation")
 	}
 	lifecycles, _ := db.GetPeerLifecycles(ctx, sID, models.ProtocolNaive)
-	if rec := lifecycles[sharedUser]; rec.Status != "active" || rec.UserID != peerOwnershipOperatorSupplied {
-		t.Fatalf("expected active/operator_supplied lifecycle, got %+v", rec)
+	if rec := lifecycles[sharedUser]; rec.UserID != "u-dis" {
+		t.Fatalf("shared credential must retain ownership, got %+v", rec)
 	}
 }

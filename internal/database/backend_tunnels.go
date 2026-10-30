@@ -13,6 +13,57 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/security"
 )
 
+// IsBackendTunnelClient reports whether the credential belongs to a backend on this server and protocol.
+func (d *DB) IsBackendTunnelClient(ctx context.Context, serverID int64, protocol, clientID string) (bool, error) {
+	if d == nil || serverID == 0 || clientID == "" {
+		return false, nil
+	}
+	tunnels, err := d.GetBackendTunnelsByServerID(ctx, serverID)
+	if err != nil {
+		return false, fmt.Errorf("get backend tunnels for server %d: %w", serverID, err)
+	}
+	for _, t := range tunnels {
+		if models.NormalizeTunnelProtocol(t.Protocol) != models.NormalizeProtocol(protocol) {
+			continue
+		}
+		switch models.NormalizeTunnelProtocol(t.Protocol) {
+		case models.ProtocolNaive:
+			var p models.NaiveProxyParams
+			if json.Unmarshal(t.ProtocolParams, &p) == nil && p.Username != "" && p.Username == clientID {
+				return true, nil
+			}
+		case models.ProtocolVLESS:
+			var p models.VLESSRealityParams
+			if json.Unmarshal(t.ProtocolParams, &p) == nil && p.UUID != "" && strings.EqualFold(p.UUID, clientID) {
+				return true, nil
+			}
+		case models.ProtocolAWG:
+			if t.PublicKey != "" && t.PublicKey == clientID {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// HasUserConnectionCredential reports whether a regular user owns this credential on the server.
+func (d *DB) HasUserConnectionCredential(ctx context.Context, serverID int64, protocol, clientID string) (bool, error) {
+	if d == nil || clientID == "" {
+		return false, nil
+	}
+	conns, err := d.GetConnectionsByServerAndProtocol(ctx, serverID, models.NormalizeProtocol(protocol))
+	if err != nil {
+		return false, fmt.Errorf("get user connections for server %d: %w", serverID, err)
+	}
+	for _, conn := range conns {
+		if conn.ClientID == clientID ||
+			(models.NormalizeProtocol(protocol) == models.ProtocolVLESS && strings.EqualFold(conn.ClientID, clientID)) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // GetBackendTunnels retrieves all backend AWG tunnel definitions.
 func (d *DB) GetBackendTunnels(ctx context.Context) ([]models.BackendTunnel, error) {
 	d.mu.RLock()

@@ -384,6 +384,27 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	normProto := models.NormalizeTunnelProtocol(req.Protocol)
+	if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
+		cid := extractClientIDFromProtocolParams(normProto, req.ProtocolParams)
+		if cid == "" {
+			h.JSONError(w, http.StatusBadRequest, "invalid_parameter", "Proxy backend credential requires a client identifier")
+			return
+		}
+		defer lockClient(serverID, normProto, cid)()
+		if h.db == nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Database not configured")
+			return
+		}
+		assigned, err := h.db.HasUserConnectionCredential(bgCtx, serverID, normProto, cid)
+		if err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to check credential ownership")
+			return
+		}
+		if assigned {
+			h.JSONError(w, http.StatusConflict, "shared_backend_credential", "Credential is assigned to a user; use a separate backend credential")
+			return
+		}
+	}
 	if h.vpnSvc != nil {
 		var opts []tunnel.BackendTunnelOptions
 		if req.Protocol != "" || len(req.ProtocolParams) > 0 {

@@ -706,6 +706,15 @@ func (h *Handlers) loadExistingClientConfig(
 	req *models.AddUserConnectionRequest,
 ) (string, bool) {
 	clientID := *req.ClientID
+	backend, err := h.db.IsBackendTunnelClient(ctx, req.ServerID, req.Protocol, clientID)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to verify backend credential ownership")
+		return "", false
+	}
+	if backend {
+		h.JSONError(w, http.StatusConflict, "backend_credential", "Backend credential cannot be assigned to a user")
+		return "", false
+	}
 	current, err := h.findClientConnection(ctx, req.ServerID, req.Protocol, clientID)
 	if err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve connections")
