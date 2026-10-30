@@ -378,3 +378,201 @@ func TestVPNEnableBackendHandler_PreservesExistingUserAssociation(t *testing.T) 
 		t.Fatalf("expected user_id to be preserved as %q after backend delete, got %q", realUserID, rec.UserID)
 	}
 }
+
+func TestToggleUserHandler_PreservesSharedBackendCredential(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := t.Context()
+
+	sid, err := db.CreateServer(ctx, &models.Server{
+		Name:    "naive-srv-toggle",
+		Host:    "127.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"naive": map[string]any{"installed": true, "port": 443, "domain": "toggle.example.com"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	var removedClients []string
+	sharedCred := "shared-toggle-user"
+	h.registry.Register(&mockProtocolManager{
+		protocol: models.ProtocolNaive,
+		removeClientFn: func(_ context.Context, _ *models.Server, clientID string) error {
+			removedClients = append(removedClients, clientID)
+			return nil
+		},
+	})
+
+	naiveParams, _ := json.Marshal(models.NaiveProxyParams{
+		Domain:   "toggle.example.com",
+		Username: sharedCred,
+		Password: "password",
+	})
+	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:       sid,
+		InterfaceName:  "naive-be-toggle",
+		Endpoint:       "127.0.0.1:443",
+		Protocol:       models.ProtocolNaive,
+		ProtocolParams: naiveParams,
+		Enabled:        true,
+		Status:         models.TunnelStatusActive,
+		StateVersion:   1,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	user := &models.User{
+		ID: "u-toggle", Username: "utoggle", Role: models.RoleUser, Enabled: true,
+	}
+	if _, err := db.CreateUser(ctx, user); err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	conn := &models.UserConnection{
+		ID: "c-toggle", UserID: user.ID, ServerID: sid, Protocol: models.ProtocolNaive,
+		ClientID: sharedCred, Name: "Shared Toggle Conn", CreatedAt: time.Now(),
+	}
+	if _, err := db.CreateConnection(ctx, conn); err != nil {
+		t.Fatalf("CreateConnection failed: %v", err)
+	}
+	_ = db.RecordPeerLifecycle(ctx, sid, models.ProtocolNaive, sharedCred, "Shared Toggle Conn", user.ID, "active")
+
+	body, _ := json.Marshal(models.ToggleUserRequest{Enabled: false})
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/toggle", user.ID), bytes.NewReader(body))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	setupFullUsersRouter(h).ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if len(removedClients) > 0 {
+		t.Fatalf("expected 0 remote removals, got %v", removedClients)
+	}
+
+	dbConn, _ := db.GetConnection(ctx, conn.ID)
+	if dbConn != nil {
+		t.Fatalf("expected user connection to be deleted from DB")
+	}
+
+	lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
+	if err != nil {
+		t.Fatalf("GetPeerLifecycles failed: %v", err)
+	}
+	rec, ok := lifecycles[sharedCred]
+	if !ok {
+		t.Fatalf("expected lifecycle record for %s to exist", sharedCred)
+	}
+	if rec.Status != "active" || rec.UserID != "operator_supplied" {
+		t.Fatalf("expected active/operator_supplied lifecycle, got status=%q user_id=%q", rec.Status, rec.UserID)
+	}
+
+	tunnels, err := db.GetBackendTunnelsByServerID(ctx, sid)
+	if err != nil || len(tunnels) != 1 || !tunnels[0].Enabled {
+		t.Fatalf("expected backend tunnel to remain active, got %v (err: %v)", tunnels, err)
+	}
+}
+
+func TestDeleteUserHandler_PreservesSharedBackendCredential(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := t.Context()
+
+	sid, err := db.CreateServer(ctx, &models.Server{
+		Name:    "naive-srv-del",
+		Host:    "127.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"naive": map[string]any{"installed": true, "port": 443, "domain": "del.example.com"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	var removedClients []string
+	sharedCred := "shared-del-user"
+	h.registry.Register(&mockProtocolManager{
+		protocol: models.ProtocolNaive,
+		removeClientFn: func(_ context.Context, _ *models.Server, clientID string) error {
+			removedClients = append(removedClients, clientID)
+			return nil
+		},
+	})
+
+	naiveParams, _ := json.Marshal(models.NaiveProxyParams{
+		Domain:   "del.example.com",
+		Username: sharedCred,
+		Password: "password",
+	})
+	_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:       sid,
+		InterfaceName:  "naive-be-del",
+		Endpoint:       "127.0.0.1:443",
+		Protocol:       models.ProtocolNaive,
+		ProtocolParams: naiveParams,
+		Enabled:        true,
+		Status:         models.TunnelStatusActive,
+		StateVersion:   1,
+	})
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel failed: %v", err)
+	}
+
+	user := &models.User{
+		ID: "u-del", Username: "udel", Role: models.RoleUser, Enabled: true,
+	}
+	if _, err := db.CreateUser(ctx, user); err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	conn := &models.UserConnection{
+		ID: "c-del", UserID: user.ID, ServerID: sid, Protocol: models.ProtocolNaive,
+		ClientID: sharedCred, Name: "Shared Del Conn", CreatedAt: time.Now(),
+	}
+	if _, err := db.CreateConnection(ctx, conn); err != nil {
+		t.Fatalf("CreateConnection failed: %v", err)
+	}
+	_ = db.RecordPeerLifecycle(ctx, sid, models.ProtocolNaive, sharedCred, "Shared Del Conn", user.ID, "active")
+
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/delete", user.ID), nil)
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	setupFullUsersRouter(h).ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if len(removedClients) > 0 {
+		t.Fatalf("expected 0 remote removals, got %v", removedClients)
+	}
+
+	u, _ := db.GetUser(ctx, user.ID)
+	if u != nil {
+		t.Fatalf("expected user to be deleted from DB")
+	}
+
+	dbConn, _ := db.GetConnection(ctx, conn.ID)
+	if dbConn != nil {
+		t.Fatalf("expected user connection to be deleted from DB")
+	}
+
+	lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
+	if err != nil {
+		t.Fatalf("GetPeerLifecycles failed: %v", err)
+	}
+	rec, ok := lifecycles[sharedCred]
+	if !ok {
+		t.Fatalf("expected lifecycle record for %s to exist", sharedCred)
+	}
+	if rec.Status != "active" || rec.UserID != "operator_supplied" {
+		t.Fatalf("expected active/operator_supplied lifecycle, got status=%q user_id=%q", rec.Status, rec.UserID)
+	}
+
+	tunnels, err := db.GetBackendTunnelsByServerID(ctx, sid)
+	if err != nil || len(tunnels) != 1 || !tunnels[0].Enabled {
+		t.Fatalf("expected backend tunnel to remain active, got %v (err: %v)", tunnels, err)
+	}
+}

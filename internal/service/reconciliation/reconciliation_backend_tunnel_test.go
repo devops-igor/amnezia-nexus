@@ -916,3 +916,39 @@ func TestReconciler_InterleavedDeletionPreservation_RefreshesLifecycle(t *testin
 		})
 	}
 }
+
+func TestReconciler_WithdrawDisabledOwnerConns_PreservesSharedBackendCredential(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "Naive-Shared", Host: "10.0.0.1", Protocols: map[string]any{"naive": map[string]any{"installed": true}}})
+	sharedUser := "shared_naive_client"
+	naiveParams, _ := json.Marshal(models.NaiveProxyParams{Username: sharedUser, Password: "p", Domain: "d.example"})
+	_, _ = db.CreateBackendTunnel(ctx, &models.BackendTunnel{ServerID: sID, Protocol: models.ProtocolNaive, ProtocolParams: naiveParams, Enabled: true, Status: models.TunnelStatusActive})
+	_, _ = db.CreateUser(ctx, &models.User{ID: "u-dis", Username: "dis", Enabled: false})
+	_, _ = db.CreateConnection(ctx, &models.UserConnection{ID: "c-dis", UserID: "u-dis", ServerID: sID, Protocol: models.ProtocolNaive, ClientID: sharedUser})
+	_ = db.RecordPeerLifecycle(ctx, sID, models.ProtocolNaive, sharedUser, "Shared", "u-dis", "active")
+
+	mgr := &mockZombiePeerProtocolManager{proto: "naive", clients: []map[string]any{{"clientId": sharedUser}}}
+	reg := newMockRegistry()
+	reg.Register(mgr)
+
+	if err := New(db, reg).CleanupZombiePeers(ctx); err != nil {
+		t.Fatalf("CleanupZombiePeers: %v", err)
+	}
+
+	mgr.mu.Lock()
+	del := len(mgr.deleted)
+	mgr.mu.Unlock()
+	if del > 0 {
+		t.Fatalf("expected 0 remote removals, got %d", del)
+	}
+	if conn, _ := db.GetConnection(ctx, "c-dis"); conn != nil {
+		t.Fatalf("expected user connection to be deleted")
+	}
+	lifecycles, _ := db.GetPeerLifecycles(ctx, sID, models.ProtocolNaive)
+	if rec := lifecycles[sharedUser]; rec.Status != "active" || rec.UserID != peerOwnershipOperatorSupplied {
+		t.Fatalf("expected active/operator_supplied lifecycle, got %+v", rec)
+	}
+}

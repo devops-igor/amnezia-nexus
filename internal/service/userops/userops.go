@@ -3,10 +3,12 @@ package userops
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -301,6 +303,33 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 	for _, c := range ops.deletes {
 		proto := models.NormalizeProtocol(c.Protocol)
 		removeFailed := false
+		isBackend, err := s.isBackendTunnelClient(ctx, serverID, c.ClientID)
+		if err != nil {
+			slog.Warn("Failed to check backend tunnel client during mass delete, skipping remote removal to fail closed",
+				"server_id", serverID,
+				"protocol", proto,
+				"client_id", c.ClientID,
+				"err", err,
+			)
+			continue
+		}
+		if isBackend {
+			slog.Info("Preserving backend tunnel client during mass delete",
+				"server_id", serverID,
+				"protocol", proto,
+				"client_id", c.ClientID,
+			)
+			if _, err := s.db.DeleteConnection(ctx, c.ID); err != nil {
+				slog.Warn("Failed to delete user connection for preserved backend client", "conn_id", c.ID, "err", err)
+			}
+			name := c.Name
+			if name == "" {
+				name = fmt.Sprintf("vpn-backend-%d", serverID)
+			}
+			_ = s.db.RecordPeerLifecycle(ctx, serverID, proto, c.ClientID, name, "", "active")
+			_ = s.db.RecordPeerLifecycle(ctx, serverID, proto, c.ClientID, name, "operator_supplied", "active")
+			continue
+		}
 		if s.registry != nil {
 			if mgr, ok := s.registry.Get(proto); ok {
 				if err := mgr.RemoveClient(ctx, server, c.ClientID); err != nil {
@@ -436,6 +465,29 @@ func (s *Service) runToggleOperations(
 		if t.enabled {
 			continue
 		}
+		isBackend, err := s.isBackendTunnelClient(ctx, server.ID, t.conn.ClientID)
+		if err != nil {
+			recordFailure(t, proto, fmt.Errorf("check backend tunnel: %w", err))
+			continue
+		}
+		if isBackend {
+			slog.Info("Preserving backend tunnel client during user toggle disable",
+				"server_id", server.ID,
+				"protocol", proto,
+				"client_id", t.conn.ClientID,
+			)
+			if _, err := s.db.DeleteConnection(ctx, t.conn.ID); err != nil {
+				recordFailure(t, proto, fmt.Errorf("delete connection for preserved backend client: %w", err))
+				continue
+			}
+			name := t.conn.Name
+			if name == "" {
+				name = fmt.Sprintf("vpn-backend-%d", server.ID)
+			}
+			_ = s.db.RecordPeerLifecycle(ctx, server.ID, proto, t.conn.ClientID, name, "", "active")
+			_ = s.db.RecordPeerLifecycle(ctx, server.ID, proto, t.conn.ClientID, name, "operator_supplied", "active")
+			continue
+		}
 		if err := mgr.RemoveClient(ctx, server, t.conn.ClientID); err != nil {
 			recordFailure(t, proto, err)
 			continue
@@ -446,6 +498,56 @@ func (s *Service) runToggleOperations(
 		}
 		_ = s.db.DeletePeerLifecycle(ctx, t.conn.ServerID, t.conn.Protocol, t.conn.ClientID)
 	}
+}
+
+func (s *Service) isBackendTunnelClient(ctx context.Context, serverID int64, clientID string) (bool, error) {
+	if s.db == nil || clientID == "" || serverID == 0 {
+		return false, nil
+	}
+	tunnels, err := s.db.GetBackendTunnelsByServerID(ctx, serverID)
+	if err != nil {
+		return false, fmt.Errorf("get backend tunnels for server %d: %w", serverID, err)
+	}
+	for _, t := range tunnels {
+		if isMatchingBackendTunnelClient(&t, clientID) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func isMatchingBackendTunnelClient(t *models.BackendTunnel, clientID string) bool {
+	if t == nil || clientID == "" {
+		return false
+	}
+	if len(t.ProtocolParams) > 0 {
+		var naive models.NaiveProxyParams
+		if err := json.Unmarshal(t.ProtocolParams, &naive); err == nil && naive.Username != "" {
+			if naive.Username == clientID {
+				return true
+			}
+		}
+		var vless models.VLESSRealityParams
+		if err := json.Unmarshal(t.ProtocolParams, &vless); err == nil && vless.UUID != "" {
+			if strings.EqualFold(vless.UUID, clientID) {
+				return true
+			}
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(t.ProtocolParams, &raw); err == nil {
+			for _, k := range []string{"username", "user", "client_id", "clientId", "uuid", "id"} {
+				if v, ok := raw[k].(string); ok && v != "" {
+					if strings.EqualFold(v, clientID) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	if t.PublicKey != "" && t.PublicKey == clientID {
+		return true
+	}
+	return false
 }
 
 func generateUUID() string {

@@ -579,6 +579,29 @@ func (r *Reconciler) withdrawDisabledOwnerConns(ctx context.Context, server *mod
 		if !off {
 			continue
 		}
+		isBackend, err := r.isBackendTunnelClient(ctx, server.ID, conn.ClientID)
+		if err != nil {
+			slog.Warn("Reconciliation Phase 3: failed to verify backend tunnel client for disabled user, skipping removal to fail closed",
+				"server_id", server.ID, "protocol", proto, "client_id", conn.ClientID, "err", err)
+			continue
+		}
+		if isBackend {
+			slog.Info("Reconciliation: preserving active backend tunnel credential while withdrawing disabled user connection",
+				"server_id", server.ID, "protocol", proto, "client_id", conn.ClientID, "user_id", conn.UserID)
+			if _, err := r.db.DeleteConnection(ctx, conn.ID); err != nil {
+				slog.Warn("Reconciliation Phase 3: failed to delete withdrawn connection", "conn_id", conn.ID, "err", err)
+				continue
+			}
+			if r.db != nil {
+				clientName := conn.Name
+				if clientName == "" {
+					clientName = fmt.Sprintf("vpn-backend-%d", server.ID)
+				}
+				_ = r.db.RecordPeerLifecycle(ctx, server.ID, proto, conn.ClientID, clientName, "", "active")
+				_ = r.db.RecordPeerLifecycle(ctx, server.ID, proto, conn.ClientID, clientName, peerOwnershipOperatorSupplied, "active")
+			}
+			continue
+		}
 		if err := mgr.RemoveClient(ctx, server, conn.ClientID); err != nil {
 			slog.Warn("Reconciliation Phase 3: failed to revoke credential of disabled user",
 				"server_id", server.ID, "protocol", proto, "client_id", conn.ClientID, "err", err)
