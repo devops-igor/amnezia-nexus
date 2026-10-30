@@ -61,10 +61,26 @@ type connToggle struct {
 	enabled bool
 }
 
+// BackendCredentialRotator replaces a shared backend identity before user revocation.
+type BackendCredentialRotator interface {
+	RotateSharedBackendCredential(context.Context, *models.Server, manager.ProtocolManager, string, string) error
+}
+
 // Service coordinates SSH-based user operations and mass batching.
 type Service struct {
 	db       *database.DB
 	registry ProtocolResolver
+	vpnSvc   BackendCredentialRotator
+}
+
+// SetVPNService wires the live backend pool for credential rotation.
+func (s *Service) SetVPNService(svc BackendCredentialRotator) { s.vpnSvc = svc }
+
+func (s *Service) rotateBackendCredential(ctx context.Context, server *models.Server, mgr manager.ProtocolManager, proto, clientID string) error {
+	if s.vpnSvc == nil {
+		return errors.New("VPN service unavailable for backend rotation")
+	}
+	return s.vpnSvc.RotateSharedBackendCredential(ctx, server, mgr, proto, clientID)
 }
 
 // New creates a new user operations Service.
@@ -254,12 +270,11 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 					}
 				}
 			}()
-			s.runServerOperations(gCtx, sID, sOps, &toggleFailures)
-			return nil
+			return s.runServerOperations(gCtx, sID, sOps, &toggleFailures)
 		})
 	}
 
-	_ = g.Wait()
+	workerErr := g.Wait()
 
 	// 5. Final DB cleanup at user level
 	for _, uid := range req.DeleteUIDs {
@@ -288,10 +303,10 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 		}
 	}
 
-	return errors.Join(toggleErrs...)
+	return errors.Join(append(toggleErrs, workerErr)...)
 }
 
-func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *serverOperations, toggleFailures *sync.Map) {
+func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *serverOperations, toggleFailures *sync.Map) error {
 	server, err := s.db.GetServer(ctx, serverID)
 	if err != nil || server == nil {
 		slog.Warn("Server not found for mass operations", "server_id", serverID, "err", err)
@@ -301,9 +316,10 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 		for _, t := range ops.toggles {
 			toggleFailures.Store(t.conn.UserID, fmt.Errorf("get server %d: %w", serverID, err))
 		}
-		return
+		return nil
 	}
 
+	var deleteErrors []error
 	// 1. Deletes
 	for _, c := range ops.deletes {
 		proto := models.NormalizeProtocol(c.Protocol)
@@ -318,13 +334,6 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 			)
 			continue
 		}
-		if isBackend {
-			// A legacy shared credential cannot be withdrawn without also disconnecting the backend.
-			// Keep the user and connection intact until an operator rotates the backend credential.
-			slog.Warn("Cannot delete user with a shared backend credential; rotate backend first",
-				"server_id", serverID, "protocol", proto, "client_id", c.ClientID)
-			continue
-		}
 		if s.registry == nil {
 			slog.Warn("Protocol registry unavailable during mass delete; retaining connection", "server_id", serverID, "protocol", proto)
 			continue
@@ -333,6 +342,13 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 		if !ok {
 			slog.Warn("Protocol manager unavailable during mass delete; retaining connection", "server_id", serverID, "protocol", proto)
 			continue
+		}
+		if isBackend {
+			if err := s.rotateBackendCredential(ctx, server, mgr, proto, c.ClientID); err != nil {
+				slog.Warn("Failed to rotate backend credentials during mass delete", "server_id", serverID, "err", err)
+				deleteErrors = append(deleteErrors, fmt.Errorf("rotate backend for server %d: %w", serverID, err))
+				continue
+			}
 		}
 		if err := mgr.RemoveClient(ctx, server, c.ClientID); err != nil {
 			slog.Warn("Failed to remove remote client during mass delete",
@@ -396,6 +412,7 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 			}
 		}
 	}
+	return errors.Join(deleteErrors...)
 }
 
 // rollbackCreate removes a just-provisioned remote client and its lifecycle record.
@@ -459,7 +476,21 @@ func (s *Service) runToggleOperations(
 				continue
 			}
 			if isBackend {
-				recordFailure(t, proto, errors.New("user credential is shared with a backend; rotate backend credentials before disabling user"))
+				if err := s.rotateBackendCredential(ctx, server, mgr, proto, t.conn.ClientID); err != nil {
+					recordFailure(t, proto, fmt.Errorf("rotate shared backend credential: %w", err))
+					continue
+				}
+				// The former identity must be revoked, not merely toggled: the
+				// replacement now owns the backend's live data plane.
+				if err := mgr.RemoveClient(ctx, server, t.conn.ClientID); err != nil {
+					recordFailure(t, proto, err)
+					continue
+				}
+				if _, err := s.db.DeleteConnection(ctx, t.conn.ID); err != nil {
+					recordFailure(t, proto, fmt.Errorf("delete withdrawn connection: %w", err))
+					continue
+				}
+				_ = s.db.DeletePeerLifecycle(ctx, server.ID, proto, t.conn.ClientID)
 				continue
 			}
 		}

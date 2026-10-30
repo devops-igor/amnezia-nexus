@@ -13,6 +13,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 )
 
 type mockProtocolManager struct {
@@ -552,6 +553,8 @@ func TestUserOpsService_CreateConnection_RollbackOnDBFailure(t *testing.T) {
 type mockNonToggleNaiveManager struct {
 	proto   string
 	deleted []string
+	added   []string
+	failAdd bool
 	mu      sync.Mutex
 }
 
@@ -563,8 +566,15 @@ func (m *mockNonToggleNaiveManager) Uninstall(context.Context, *models.Server) e
 func (m *mockNonToggleNaiveManager) GetClients(context.Context, *models.Server) ([]map[string]any, error) {
 	return nil, nil
 }
-func (m *mockNonToggleNaiveManager) AddClient(context.Context, *models.Server, map[string]any) (map[string]any, error) {
-	return nil, nil
+func (m *mockNonToggleNaiveManager) AddClient(_ context.Context, _ *models.Server, params map[string]any) (map[string]any, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failAdd {
+		return nil, errors.New("injected provisioning failure")
+	}
+	name, _ := params["name"].(string)
+	m.added = append(m.added, name)
+	return map[string]any{"username": name, "password": "replacement-secret"}, nil
 }
 func (m *mockNonToggleNaiveManager) RemoveClient(_ context.Context, _ *models.Server, clientID string) error {
 	m.mu.Lock()
@@ -649,6 +659,122 @@ func TestUserOps_ToggleUser_PreservesSharedBackendCredential(t *testing.T) {
 	}
 	if tunnels, err := db.GetBackendTunnelsByServerID(ctx, sID); err != nil || len(tunnels) != 1 || !tunnels[0].Enabled {
 		t.Fatalf("backend must remain: %+v %v", tunnels, err)
+	}
+}
+
+func TestUserOps_RotatesSharedBackendCredential(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		delete  bool
+		failAdd bool
+	}{
+		{name: "delete", delete: true},
+		{name: "disable"},
+		{name: "provisioning failure on delete", delete: true, failAdd: true},
+		{name: "provisioning failure on disable", failAdd: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, cleanup := setupTestDB(t)
+			defer cleanup()
+			ctx := t.Context()
+			sid, err := db.CreateServer(ctx, &models.Server{Name: "backend", Host: "127.0.0.1", SSHPort: 22})
+			if err != nil {
+				t.Fatal(err)
+			}
+			uid, err := db.CreateUser(ctx, &models.User{Username: "shared", Role: models.RoleUser, Enabled: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			old := "shared-credential"
+			params, err := json.Marshal(models.NaiveProxyParams{Username: old, Password: "old-password", Domain: "example.com"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+				ServerID: sid, InterfaceName: "naive-backend", Endpoint: "127.0.0.1:443",
+				Protocol: models.ProtocolNaive, ProtocolParams: params, Enabled: true, Status: models.TunnelStatusActive,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = db.CreateConnection(ctx, &models.UserConnection{
+				ID: "shared-conn", UserID: uid, ServerID: sid, Protocol: models.ProtocolNaive, ClientID: old,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			vpnSvc, err := vpn.NewVPNService(db, &models.VPNConfig{EnableMultiProtocolBackends: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if tun, err := vpnSvc.GetTunnel(sid); err == nil {
+					if dev := vpnSvc.GetBackendDeviceForTest(tun.ID); dev != nil {
+						_ = dev.Close()
+					}
+				}
+			})
+			mgr := &mockNonToggleNaiveManager{proto: models.ProtocolNaive, failAdd: tc.failAdd}
+			reg := newMockRegistry()
+			reg.Register(mgr)
+			svc := New(db, reg)
+			svc.SetVPNService(vpnSvc)
+			var ok bool
+			if tc.delete {
+				ok, err = svc.DeleteUser(ctx, uid)
+			} else {
+				ok, err = svc.ToggleUser(ctx, uid, false)
+			}
+			if tc.failAdd {
+				if err == nil || ok {
+					t.Fatalf("expected provisioning failure: ok=%v err=%v", ok, err)
+				}
+			} else if err != nil || !ok {
+				t.Fatalf("withdraw user: ok=%v err=%v", ok, err)
+			}
+			mgr.mu.Lock()
+			added, removed := append([]string{}, mgr.added...), append([]string{}, mgr.deleted...)
+			mgr.mu.Unlock()
+			if tc.failAdd {
+				if len(added) != 0 || len(removed) != 0 {
+					t.Fatalf("mutated remote on failed provision: %v %v", added, removed)
+				}
+			} else if len(added) != 1 || len(removed) != 1 || removed[0] != old {
+				t.Fatalf("rotation/revocation missing: added=%v removed=%v", added, removed)
+			}
+			row, err := db.GetBackendTunnelByServerID(ctx, sid)
+			if err != nil || row == nil {
+				t.Fatalf("backend row: %+v %v", row, err)
+			}
+			live, liveErr := vpnSvc.GetTunnel(sid)
+			if liveErr != nil {
+				t.Fatal(liveErr)
+			}
+			want := old
+			if !tc.failAdd {
+				want = added[0]
+			}
+			if !row.Enabled || row.Status != models.TunnelStatusActive ||
+				vpn.ExtractClientIDFromProtocolParams(row.Protocol, row.ProtocolParams) != want ||
+				vpn.ExtractClientIDFromProtocolParams(live.Protocol, live.ProtocolParams) != want {
+				t.Fatalf("backend did not retain expected credential %q: row=%+v live=%+v", want, row, live)
+			}
+			conn, err := db.GetConnection(ctx, "shared-conn")
+			if err != nil || (conn != nil) != tc.failAdd {
+				t.Fatalf("connection state: %+v %v", conn, err)
+			}
+			user, err := db.GetUser(ctx, uid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.delete {
+				if (user != nil) != tc.failAdd {
+					t.Fatalf("user deletion state: %+v", user)
+				}
+			} else if user == nil || user.Enabled != tc.failAdd {
+				t.Fatalf("user disable state: %+v", user)
+			}
+		})
 	}
 }
 

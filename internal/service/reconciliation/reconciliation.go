@@ -51,11 +51,17 @@ func WithBootDelay(delay time.Duration) Option {
 	}
 }
 
+// BackendCredentialRotator switches a live backend identity before old peer revocation.
+type BackendCredentialRotator interface {
+	RotateSharedBackendCredential(context.Context, *models.Server, manager.ProtocolManager, string, string) error
+}
+
 // Reconciler executes startup synchronization and periodic background audits
 // to clean up orphaned connections, stale protocols, and zombie container peers.
 type Reconciler struct {
 	db        *database.DB
 	registry  ProtocolResolver
+	vpnSvc    BackendCredentialRotator
 	mu        sync.Mutex
 	running   bool
 	cancel    context.CancelFunc
@@ -77,6 +83,9 @@ func New(db *database.DB, registry ProtocolResolver, opts ...Option) *Reconciler
 	}
 	return r
 }
+
+// SetVPNService wires the live backend pool for credential rotation.
+func (r *Reconciler) SetVPNService(svc BackendCredentialRotator) { r.vpnSvc = svc }
 
 // Name returns the background service worker name.
 func (r *Reconciler) Name() string {
@@ -585,9 +594,15 @@ func (r *Reconciler) withdrawDisabledOwnerConns(ctx context.Context, server *mod
 			continue
 		}
 		if isBackend {
-			slog.Warn("Reconciliation: disabled user shares backend credential; rotate backend credential before revocation",
-				"server_id", server.ID, "protocol", proto, "client_id", conn.ClientID, "user_id", conn.UserID)
-			continue
+			if r.vpnSvc == nil {
+				slog.Warn("Reconciliation: VPN service unavailable for backend rotation", "server_id", server.ID)
+				continue
+			}
+			if err := r.vpnSvc.RotateSharedBackendCredential(ctx, server, mgr, proto, conn.ClientID); err != nil {
+				slog.Warn("Reconciliation: failed to rotate disabled user's shared backend credential",
+					"server_id", server.ID, "protocol", proto, "client_id", conn.ClientID, "err", err)
+				continue
+			}
 		}
 		if err := mgr.RemoveClient(ctx, server, conn.ClientID); err != nil {
 			slog.Warn("Reconciliation Phase 3: failed to revoke credential of disabled user",

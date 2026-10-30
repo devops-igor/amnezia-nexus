@@ -2,14 +2,10 @@ package handlers
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
-
-// ErrSharedBackendCredential prevents an existing shared credential from being silently orphaned.
-var ErrSharedBackendCredential = errors.New("user credential is shared with a backend; rotate backend credentials before revoking user")
 
 // withdrawUserConnection revokes a user connection row only after remote revocation.
 func (h *Handlers) withdrawUserConnection(ctx context.Context, c *models.UserConnection) error {
@@ -18,7 +14,17 @@ func (h *Handlers) withdrawUserConnection(ctx context.Context, c *models.UserCon
 		return fmt.Errorf("check backend tunnel: %w", err)
 	}
 	if isBackend {
-		return ErrSharedBackendCredential
+		server, err := h.db.GetServer(ctx, c.ServerID)
+		if err != nil || server == nil {
+			return fmt.Errorf("load backend server %d: %v", c.ServerID, err)
+		}
+		mgr, err := h.GetProtocolManager(c.Protocol)
+		if err != nil || mgr == nil {
+			return fmt.Errorf("load backend protocol manager %q: %v", c.Protocol, err)
+		}
+		if err := h.vpnSvc.RotateSharedBackendCredential(ctx, server, mgr, c.Protocol, c.ClientID); err != nil {
+			return fmt.Errorf("rotate shared backend credential: %w", err)
+		}
 	}
 	if err := h.removeRemoteClient(ctx, c); err != nil {
 		return err

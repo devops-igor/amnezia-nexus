@@ -446,6 +446,116 @@ func TestToggleUserHandler_PreservesSharedBackendCredential(t *testing.T) {
 	}
 }
 
+func TestWithdrawUserConnection_RotatesSharedBackendCredential(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		failAdd bool
+	}{
+		{name: "rotates and revokes"},
+		{name: "provisioning failure preserves user and backend", failAdd: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, db, _ := setupTestHandlers(t)
+			ctx := t.Context()
+			sid, err := db.CreateServer(ctx, &models.Server{Name: "shared-node", Host: "127.0.0.1", SSHPort: 22})
+			if err != nil {
+				t.Fatal(err)
+			}
+			uid, err := db.CreateUser(ctx, &models.User{Username: "shared-owner", Role: models.RoleUser, Enabled: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			old := "shared-username"
+			params, err := json.Marshal(models.NaiveProxyParams{Username: old, Password: "old-secret", Domain: "example.com"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+				ServerID: sid, InterfaceName: "naive-be", Endpoint: "127.0.0.1:443",
+				Protocol: models.ProtocolNaive, ProtocolParams: params, Enabled: true, Status: models.TunnelStatusActive,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn := &models.UserConnection{
+				ID: "shared-conn", UserID: uid, ServerID: sid, Protocol: models.ProtocolNaive, ClientID: old,
+			}
+			if _, err := db.CreateConnection(ctx, conn); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.RecordPeerLifecycle(ctx, sid, models.ProtocolNaive, old, "User", uid, "active"); err != nil {
+				t.Fatal(err)
+			}
+			svc, err := vpn.NewVPNService(db, &models.VPNConfig{EnableMultiProtocolBackends: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.vpnSvc = svc
+			t.Cleanup(func() {
+				if tun, err := svc.GetTunnel(sid); err == nil {
+					if dev := svc.GetBackendDeviceForTest(tun.ID); dev != nil {
+						_ = dev.Close()
+					}
+				}
+			})
+			var removed []string
+			var provisioned int
+			h.registry.Register(&mockProtocolManager{
+				protocol: models.ProtocolNaive,
+				addClientFn: func(_ context.Context, _ *models.Server, p map[string]any) (map[string]any, error) {
+					provisioned++
+					if tc.failAdd {
+						return nil, fmt.Errorf("injected add failure")
+					}
+					if p["name"] != fmt.Sprintf("vpn-backend-%d", sid) {
+						t.Fatalf("unexpected replacement name: %v", p)
+					}
+					return map[string]any{"username": "new-backend-username", "password": "new-secret"}, nil
+				},
+				removeClientFn: func(_ context.Context, _ *models.Server, id string) error {
+					removed = append(removed, id)
+					return nil
+				},
+			})
+			err = h.withdrawUserConnection(ctx, conn)
+			if tc.failAdd != (err != nil) {
+				t.Fatalf("withdraw returned %v", err)
+			}
+			if provisioned != 1 {
+				t.Fatalf("AddClient calls: %d", provisioned)
+			}
+			if tc.failAdd {
+				if len(removed) != 0 {
+					t.Fatalf("old credential revoked after failed provision: %v", removed)
+				}
+			} else if len(removed) != 1 || removed[0] != old {
+				t.Fatalf("old remote credential not revoked: %v", removed)
+			}
+			want := "new-backend-username"
+			if tc.failAdd {
+				want = old
+			}
+			row, err := db.GetBackendTunnelByServerID(ctx, sid)
+			if err != nil || row == nil {
+				t.Fatalf("backend row: %+v %v", row, err)
+			}
+			live, err := svc.GetTunnel(sid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !row.Enabled || row.Status != models.TunnelStatusActive ||
+				vpn.ExtractClientIDFromProtocolParams(row.Protocol, row.ProtocolParams) != want ||
+				vpn.ExtractClientIDFromProtocolParams(live.Protocol, live.ProtocolParams) != want {
+				t.Fatalf("backend did not retain active identity %q: row=%+v live=%+v", want, row, live)
+			}
+			got, err := db.GetConnection(ctx, conn.ID)
+			if err != nil || (got != nil) != tc.failAdd {
+				t.Fatalf("user connection: %+v %v", got, err)
+			}
+		})
+	}
+}
+
 func TestDeleteUserHandler_PreservesSharedBackendCredential(t *testing.T) {
 	h, db, _ := setupTestHandlers(t)
 	ctx := t.Context()
