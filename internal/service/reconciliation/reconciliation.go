@@ -623,6 +623,39 @@ func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *mode
 
 	rec, hasLifecycle := lifecycles[clientID]
 	if !hasLifecycle {
+		if r.db == nil {
+			return
+		}
+		freshLifecycles, err := r.db.GetPeerLifecycles(ctx, serverID, proto)
+		if err != nil {
+			slog.Warn("Reconciliation: failed to refresh peer lifecycles due to query error, skipping removal to fail closed",
+				"server_id", serverID,
+				"protocol", proto,
+				"client_id", clientID,
+				"err", err,
+			)
+			return
+		}
+		for k, v := range freshLifecycles {
+			lifecycles[k] = v
+		}
+		if freshRec, exists := freshLifecycles[clientID]; exists {
+			rec = freshRec
+			hasLifecycle = true
+			if rec.Status == "active" || rec.UserID == peerOwnershipOperatorSupplied || (rec.UserID != "" && rec.UserID != peerOwnershipAutoProvisioned) {
+				slog.Info("Reconciliation: preserving peer with fresh active or operator lifecycle record",
+					"server_id", serverID,
+					"protocol", proto,
+					"client_id", clientID,
+					"user_id", rec.UserID,
+					"status", rec.Status,
+				)
+				return
+			}
+		}
+	}
+
+	if !hasLifecycle {
 		settingKey := legacyPeersAdoptedSettingKey(serverID, proto)
 		var legacyAdopted bool
 		if r.db != nil {
@@ -670,6 +703,12 @@ func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *mode
 		}
 		return
 	}
+
+	r.reconcileManagedPeer(ctx, server, proto, mgr, clientID, rec, staleThreshold)
+}
+
+func (r *Reconciler) reconcileManagedPeer(ctx context.Context, server *models.Server, proto string, mgr manager.ProtocolManager, clientID string, rec database.PeerLifecycleRecord, staleThreshold time.Duration) {
+	serverID := server.ID
 
 	switch rec.Status {
 	case "failed":

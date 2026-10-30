@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -740,6 +741,177 @@ func TestReconciler_OwnershipPersistenceFailure_PreservesExternallyManagedCreden
 
 			if len(deletedCycle2) != 0 {
 				t.Fatalf("expected 0 remote deletions on subsequent cycle, got %v", deletedCycle2)
+			}
+		})
+	}
+}
+
+type mockInterleavedZombieManager struct {
+	proto      string
+	clients    []map[string]any
+	removeHook func(clientID string)
+	deleted    []string
+	mu         sync.Mutex
+}
+
+func (m *mockInterleavedZombieManager) Protocol() string { return m.proto }
+func (m *mockInterleavedZombieManager) Install(ctx context.Context, server *models.Server, params map[string]any) error {
+	return nil
+}
+func (m *mockInterleavedZombieManager) Uninstall(ctx context.Context, server *models.Server) error {
+	return nil
+}
+func (m *mockInterleavedZombieManager) GetClients(ctx context.Context, server *models.Server) ([]map[string]any, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.clients, nil
+}
+func (m *mockInterleavedZombieManager) AddClient(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
+	return nil, nil
+}
+func (m *mockInterleavedZombieManager) RemoveClient(ctx context.Context, server *models.Server, clientID string) error {
+	if m.removeHook != nil {
+		m.removeHook(clientID)
+	}
+	m.mu.Lock()
+	m.deleted = append(m.deleted, clientID)
+	m.mu.Unlock()
+	return nil
+}
+func (m *mockInterleavedZombieManager) GetClientConfig(ctx context.Context, server *models.Server, clientID string) (string, error) {
+	return "", nil
+}
+func (m *mockInterleavedZombieManager) GetServerStatus(ctx context.Context, server *models.Server) (map[string]any, error) {
+	return map[string]any{"container_exists": true}, nil
+}
+
+func TestReconciler_InterleavedDeletionPreservation_RefreshesLifecycle(t *testing.T) {
+	for _, proto := range []string{models.ProtocolNaive, models.ProtocolVLESS} {
+		t.Run(proto, func(t *testing.T) {
+			db, cleanup := setupTestDB(t)
+			defer cleanup()
+			ctx := context.Background()
+
+			sID, err := db.CreateServer(ctx, &models.Server{
+				Name:      "Interleaved-Node-" + proto,
+				Host:      "10.0.0.53",
+				SSHPort:   22,
+				Protocols: map[string]any{proto: map[string]any{"installed": true}},
+			})
+			if err != nil {
+				t.Fatalf("create server: %v", err)
+			}
+
+			if err := db.SetSetting(ctx, legacyPeersAdoptedSettingKey(sID, proto), true); err != nil {
+				t.Fatalf("set legacy adopted: %v", err)
+			}
+
+			operatorClientID := "operator_interleaved_client"
+			var paramsRaw []byte
+			if proto == models.ProtocolVLESS {
+				operatorClientID = "c3d4e5f6-a7b8-4901-cdef-23456789abcd"
+				paramsRaw, _ = json.Marshal(models.VLESSRealityParams{UUID: operatorClientID})
+			} else {
+				paramsRaw, _ = json.Marshal(models.NaiveProxyParams{Username: operatorClientID})
+			}
+
+			// Create a disabled backend tunnel (simulating failed/disabled backend without lifecycle record)
+			tunID, err := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+				ServerID:       sID,
+				Protocol:       proto,
+				ProtocolParams: paramsRaw,
+				Enabled:        false,
+				CreatedAt:      time.Now().Add(-10 * time.Minute),
+			})
+			if err != nil {
+				t.Fatalf("create backend tunnel: %v", err)
+			}
+
+			past := time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+			unrelatedZombie := "unrelated_zombie_" + proto
+
+			started := make(chan struct{})
+			resume := make(chan struct{})
+			var once sync.Once
+
+			mgr := &mockInterleavedZombieManager{
+				proto: proto,
+				clients: []map[string]any{
+					{"clientId": unrelatedZombie, "username": unrelatedZombie, "creationDate": past},
+					{"clientId": operatorClientID, "username": operatorClientID, "creationDate": past},
+				},
+				removeHook: func(clientID string) {
+					if clientID == unrelatedZombie {
+						once.Do(func() { close(started) })
+						select {
+						case <-resume:
+						case <-time.After(5 * time.Second):
+						}
+					}
+				},
+			}
+			reg := newMockRegistry()
+			reg.Register(mgr)
+
+			r := New(db, reg)
+
+			cleanupErrCh := make(chan error, 1)
+			go func() {
+				cleanupErrCh <- r.CleanupZombiePeers(ctx)
+			}()
+
+			// Wait until reconciler has taken the lifecycle snapshot and is removing the unrelated zombie
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for reconciler to start removing unrelated zombie")
+			}
+
+			// Interleaved deletion: commit preservation record and delete backend tunnel
+			if err := db.RecordPeerLifecycle(ctx, sID, proto, operatorClientID, "vpn-backend-1", peerOwnershipOperatorSupplied, "active"); err != nil {
+				t.Fatalf("failed to record peer lifecycle: %v", err)
+			}
+			if err := db.DeleteBackendTunnel(ctx, tunID); err != nil {
+				t.Fatalf("failed to delete backend tunnel: %v", err)
+			}
+
+			// Resume reconciler so it reaches the operator client
+			close(resume)
+
+			select {
+			case err := <-cleanupErrCh:
+				if err != nil {
+					t.Fatalf("CleanupZombiePeers failed: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for CleanupZombiePeers to finish")
+			}
+
+			mgr.mu.Lock()
+			deleted := append([]string(nil), mgr.deleted...)
+			mgr.mu.Unlock()
+
+			// Verify: unrelated zombie was removed, but operator client was NOT removed
+			for _, id := range deleted {
+				if id == operatorClientID {
+					t.Fatalf("operator credential %s was revoked despite interleaved active/operator preservation commit", operatorClientID)
+				}
+			}
+			if len(deleted) != 1 || deleted[0] != unrelatedZombie {
+				t.Fatalf("expected exactly [unrelatedZombie] deleted, got %v", deleted)
+			}
+
+			// Verify lifecycle record remains intact in SQLite
+			lifecycles, err := db.GetPeerLifecycles(ctx, sID, proto)
+			if err != nil {
+				t.Fatalf("GetPeerLifecycles failed: %v", err)
+			}
+			rec, exists := lifecycles[operatorClientID]
+			if !exists {
+				t.Fatalf("expected lifecycle record for %s to exist", operatorClientID)
+			}
+			if rec.Status != "active" || rec.UserID != peerOwnershipOperatorSupplied {
+				t.Fatalf("expected active/operator_supplied, got status=%q user_id=%q", rec.Status, rec.UserID)
 			}
 		})
 	}
