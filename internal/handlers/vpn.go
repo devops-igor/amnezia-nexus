@@ -89,7 +89,7 @@ func (h *Handlers) VPNBackendsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func extractProxyParamsFromManagerResult(proto string, res map[string]any) json.RawMessage {
+func extractProxyParamsFromManagerResult(proto string, res map[string]any, srv ...*models.Server) json.RawMessage {
 	switch proto {
 	case models.ProtocolVLESS:
 		uid, _ := res["uuid"].(string)
@@ -107,6 +107,9 @@ func extractProxyParamsFromManagerResult(proto string, res map[string]any) json.
 			serverName = "gateway.icloud.com"
 		}
 		engineProfile, _ := res["engine_profile"].(string)
+		if engineProfile == "" && len(srv) > 0 && srv[0] != nil {
+			engineProfile = vpn.ResolveServerEngineProfile(srv[0], proto)
+		}
 		p := models.VLESSRealityParams{
 			UUID:          uid,
 			Flow:          flow,
@@ -178,11 +181,17 @@ func (h *Handlers) resolveInstalledProxyParamsForProto(ctx context.Context, srv 
 	// 1. If explicit credentials already exist in server metadata, reuse them.
 	if pVal, ok := pInfo["params"]; ok && pVal != nil {
 		if b, err := json.Marshal(pVal); err == nil && len(bytes.TrimSpace(b)) > 2 && string(bytes.TrimSpace(b)) != "null" {
+			if normProto == models.ProtocolVLESS {
+				b = vpn.SyncVLESSParamsEngineProfile(b, srv)
+			}
 			return b, nil
 		}
 	}
 	if pVal, ok := pInfo["protocol_params"]; ok && pVal != nil {
 		if b, err := json.Marshal(pVal); err == nil && len(bytes.TrimSpace(b)) > 2 && string(bytes.TrimSpace(b)) != "null" {
+			if normProto == models.ProtocolVLESS {
+				b = vpn.SyncVLESSParamsEngineProfile(b, srv)
+			}
 			return b, nil
 		}
 	}
@@ -193,6 +202,11 @@ func (h *Handlers) resolveInstalledProxyParamsForProto(ctx context.Context, srv 
 		return nil, fmt.Errorf("protocol manager for %s not available: %w", normProto, err)
 	}
 	clientParams := map[string]any{"name": fmt.Sprintf("vpn-backend-%d", srv.ID)}
+	if normProto == models.ProtocolVLESS {
+		if ep := vpn.ResolveServerEngineProfile(srv, normProto); ep != "" {
+			clientParams["engine_profile"] = ep
+		}
+	}
 	res, err := protoMgr.AddClient(ctx, srv, clientParams)
 	if err != nil {
 		return nil, fmt.Errorf("failed to provision proxy client on server %d: %w", srv.ID, err)
@@ -200,7 +214,7 @@ func (h *Handlers) resolveInstalledProxyParamsForProto(ctx context.Context, srv 
 	if res == nil {
 		return nil, errors.New("protocol manager returned empty client provisioning result")
 	}
-	params := extractProxyParamsFromManagerResult(normProto, res)
+	params := extractProxyParamsFromManagerResult(normProto, res, srv)
 	if len(params) == 0 {
 		return nil, errors.New("failed to extract proxy parameters from manager result")
 	}
@@ -278,6 +292,13 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 		if len(req.ProtocolParams) == 0 {
 			req.ProtocolParams = existingTunnel.ProtocolParams
 		}
+		if models.NormalizeTunnelProtocol(req.Protocol) == models.ProtocolVLESS && len(req.ProtocolParams) > 0 && !hasCustomParams {
+			var srv *models.Server
+			if h.db != nil {
+				srv, _ = h.db.GetServer(bgCtx, serverID)
+			}
+			req.ProtocolParams = vpn.SyncVLESSParamsEngineProfile(req.ProtocolParams, srv)
+		}
 
 		normProto := models.NormalizeTunnelProtocol(req.Protocol)
 		if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
@@ -335,6 +356,19 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 				return
 			}
 			req.ProtocolParams = params
+		} else if normProto == models.ProtocolVLESS && len(req.ProtocolParams) > 0 {
+			var vp models.VLESSRealityParams
+			if err := json.Unmarshal(req.ProtocolParams, &vp); err == nil && vp.EngineProfile == "" {
+				if srv == nil && h.db != nil {
+					srv, _ = h.db.GetServer(bgCtx, serverID)
+				}
+				if ep := vpn.ResolveServerEngineProfile(srv, normProto); ep != "" {
+					vp.EngineProfile = ep
+					if b, err := json.Marshal(vp); err == nil {
+						req.ProtocolParams = b
+					}
+				}
+			}
 		}
 	}
 

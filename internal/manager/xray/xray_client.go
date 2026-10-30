@@ -41,6 +41,26 @@ func resolveClientFlow(server *models.Server, clientParams map[string]any) strin
 	return flow
 }
 
+func resolveClientEngineProfile(server *models.Server, clientParams map[string]any) string {
+	if clientParams != nil {
+		for _, k := range []string{"engine_profile", "profile"} {
+			if p, ok := clientParams[k].(string); ok && strings.TrimSpace(p) != "" {
+				return strings.TrimSpace(p)
+			}
+		}
+	}
+	if server != nil && server.Protocols != nil {
+		if pMap, ok := server.Protocols[models.ProtocolVLESS].(map[string]any); ok {
+			for _, k := range []string{"engine_profile", "profile", "engine_version"} {
+				if p, ok := pMap[k].(string); ok && strings.TrimSpace(p) != "" {
+					return strings.TrimSpace(p)
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // AddClient adds a new VLESS+REALITY client credential, uploads updated config, and restarts the container.
 func (m *XrayManager) AddClient(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
 	client, err := m.getSSHClient(ctx, server)
@@ -123,19 +143,22 @@ func (m *XrayManager) AddClient(ctx context.Context, server *models.Server, clie
 		return nil, fmt.Errorf("build vless URI: %w", err)
 	}
 
+	engineProfile := resolveClientEngineProfile(server, clientParams)
+
 	return map[string]any{
-		"client_id":    clientID,
-		"clientId":     clientID,
-		"uuid":         clientID,
-		"name":         name,
-		"config":       vlessURI,
-		"public_key":   pubKey,
-		"short_id":     shortID,
-		"flow":         flow,
-		"server_name":  serverName,
-		"port":         port,
-		"creationDate": now.Format(time.RFC3339),
-		"created_at":   now.Format(time.RFC3339),
+		"client_id":      clientID,
+		"clientId":       clientID,
+		"uuid":           clientID,
+		"name":           name,
+		"config":         vlessURI,
+		"public_key":     pubKey,
+		"short_id":       shortID,
+		"flow":           flow,
+		"server_name":    serverName,
+		"port":           port,
+		"engine_profile": engineProfile,
+		"creationDate":   now.Format(time.RFC3339),
+		"created_at":     now.Format(time.RFC3339),
 	}, nil
 }
 
