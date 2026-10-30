@@ -275,3 +275,33 @@ func TestScanSNI_WorkerPool(t *testing.T) {
 		}
 	}
 }
+
+func TestRankScanResults_DirectProductionSort(t *testing.T) {
+	input := []ScanResult{
+		{Domain: "z-failed.com", Status: "dns_failed"},
+		{Domain: "b-failed.com", Status: "tls_failed"},
+		{Domain: "low-score.com", Status: "ok", ProximityScore: 40, RTTMS: 10},
+		{Domain: "high-score-slow.com", Status: "ok", ProximityScore: 100, RTTMS: 80},
+		{Domain: "high-score-fast.com", Status: "ok", ProximityScore: 100, RTTMS: 20},
+		{Domain: "mid-score.com", Status: "ok", ProximityScore: 80, RTTMS: 30},
+		{Domain: "a-failed.com", Status: "rejected_geo_mismatch"},
+	}
+
+	RankScanResults(input)
+
+	wantDomains := []string{
+		"high-score-fast.com", // ok, score 100, RTT 20
+		"high-score-slow.com", // ok, score 100, RTT 80
+		"mid-score.com",       // ok, score 80
+		"low-score.com",       // ok, score 40
+		"a-failed.com",        // non-ok, alphabetical 'a'
+		"b-failed.com",        // non-ok, alphabetical 'b'
+		"z-failed.com",        // non-ok, alphabetical 'z'
+	}
+
+	for i, want := range wantDomains {
+		if input[i].Domain != want {
+			t.Errorf("result[%d] = %q, want %q", i, input[i].Domain, want)
+		}
+	}
+}

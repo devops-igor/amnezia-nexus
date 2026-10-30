@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -212,6 +213,10 @@ func (d *Dialer) isModernPQ() bool {
 	}
 }
 
+// configureKeyShares validates and adapts the ClientHello key shares to match the engine profile.
+// When modern_pq is active and the requested fingerprint does not advertise X25519MLKEM768 hybrid shares,
+// the dialer explicitly falls back to HelloChrome_Auto (which generates valid X25519MLKEM768 key shares),
+// logging the substitution clearly to make the fallback explicit to operators.
 func (d *Dialer) configureKeyShares(uConn *utls.UConn, uConfig *utls.Config, raw net.Conn) (*utls.UConn, error) {
 	if d.isModernPQ() {
 		hasPQShare := false
@@ -226,6 +231,10 @@ func (d *Dialer) configureKeyShares(uConn *utls.UConn, uConfig *utls.Config, raw
 			}
 		}
 		if !hasPQShare {
+			slog.Info("vless: modern_pq requested but fingerprint lacks hybrid post-quantum key share, falling back to HelloChrome_Auto",
+				"requested_fingerprint", d.fingerprint,
+				"fallback_fingerprint", "HelloChrome_Auto",
+			)
 			uConn = utls.UClient(raw, uConfig, utls.HelloChrome_Auto)
 			if err := uConn.BuildHandshakeState(); err != nil {
 				return nil, fmt.Errorf("vless: build hybrid handshake state: %w", err)

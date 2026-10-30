@@ -30,11 +30,13 @@ func extractVLESSOptions(vo any) (portStr, serverName, flow string, flowSpecifie
 	return "", "", "", false
 }
 
-func resolveInstallNetworkOptions(params map[string]any) (int, string, string, bool, bool) {
+func resolveInstallNetworkOptions(params map[string]any) (int, string, string, bool, bool, bool) {
 	portPrimary := 443
+	hasPort := false
 	if p, ok := params["port"]; ok && fmt.Sprint(p) != "" {
 		if pInt, err := strconv.Atoi(fmt.Sprint(p)); err == nil && pInt > 0 {
 			portPrimary = pInt
+			hasPort = true
 		}
 	}
 
@@ -56,6 +58,7 @@ func resolveInstallNetworkOptions(params map[string]any) (int, string, string, b
 		if pStr != "" {
 			if pInt, err := strconv.Atoi(pStr); err == nil && pInt > 0 {
 				portPrimary = pInt
+				hasPort = true
 			}
 		}
 		if sn != "" {
@@ -70,10 +73,41 @@ func resolveInstallNetworkOptions(params map[string]any) (int, string, string, b
 	if flow == "none" {
 		flow = ""
 	}
-	return portPrimary, serverName, flow, hasServerName, hasFlow
+	return portPrimary, serverName, flow, hasPort, hasServerName, hasFlow
 }
 
-func resolveInstallProfileParam(params map[string]any, server *models.Server) string {
+func detectRunningEngineProfile(ctx context.Context, client ssh.SSHClient) string {
+	if client == nil {
+		return ""
+	}
+	verCmd := fmt.Sprintf("docker exec %s xray version 2>/dev/null", ssh.EscapeShellArg(XrayContainerName))
+	if verOut, _, code, err := client.RunSudoCommand(ctx, verCmd); err == nil && code == 0 && strings.TrimSpace(verOut) != "" {
+		fields := strings.Fields(strings.TrimSpace(verOut))
+		if len(fields) >= 2 && strings.EqualFold(fields[0], "Xray") {
+			ver := fields[1]
+			if strings.HasPrefix(ver, "26.10.") || strings.HasPrefix(ver, "v26.10.") {
+				return string(EngineProfileModernPQ)
+			}
+			if strings.HasPrefix(ver, "1.8.") || strings.HasPrefix(ver, "v1.8.") {
+				return string(EngineProfileLegacy)
+			}
+		}
+	}
+
+	imgCmd := fmt.Sprintf("docker inspect -f '{{.Config.Image}}' %s 2>/dev/null", ssh.EscapeShellArg(XrayContainerName))
+	if imgOut, _, code, err := client.RunSudoCommand(ctx, imgCmd); err == nil && code == 0 && strings.TrimSpace(imgOut) != "" {
+		img := strings.TrimSpace(imgOut)
+		if strings.Contains(img, "26.10.") {
+			return string(EngineProfileModernPQ)
+		}
+		if strings.Contains(img, "1.8.") {
+			return string(EngineProfileLegacy)
+		}
+	}
+	return ""
+}
+
+func resolveInstallProfileParam(ctx context.Context, client ssh.SSHClient, params map[string]any, server *models.Server) string {
 	keys := []string{"engine_profile", "profile", "engine_version"}
 	for _, k := range keys {
 		if p, ok := params[k]; ok && fmt.Sprint(p) != "" {
@@ -107,17 +141,22 @@ func resolveInstallProfileParam(params map[string]any, server *models.Server) st
 			}
 		}
 	}
+	if client != nil {
+		if detected := detectRunningEngineProfile(ctx, client); detected != "" {
+			return detected
+		}
+	}
 	return ""
 }
 
-func parseXrayInstallOptions(params map[string]any, server *models.Server) (int, string, string, bool, bool, EngineProfileInfo, error) {
-	portPrimary, serverName, flow, hasServerName, hasFlow := resolveInstallNetworkOptions(params)
-	profileParam := resolveInstallProfileParam(params, server)
+func parseXrayInstallOptions(ctx context.Context, client ssh.SSHClient, params map[string]any, server *models.Server) (int, string, string, bool, bool, bool, EngineProfileInfo, error) {
+	portPrimary, serverName, flow, hasPort, hasServerName, hasFlow := resolveInstallNetworkOptions(params)
+	profileParam := resolveInstallProfileParam(ctx, client, params, server)
 	profile, err := ResolveEngineProfile(profileParam)
 	if err != nil {
-		return 0, "", "", false, false, EngineProfileInfo{}, err
+		return 0, "", "", false, false, false, EngineProfileInfo{}, err
 	}
-	return portPrimary, serverName, flow, hasServerName, hasFlow, profile, nil
+	return portPrimary, serverName, flow, hasPort, hasServerName, hasFlow, profile, nil
 }
 
 func (m *XrayManager) resolveRealityCredentials(
@@ -220,9 +259,57 @@ func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient,
 		return fmt.Errorf("failed to pull xray image %s (code %d): %s: %w", image, pullCode, strings.TrimSpace(pullErrOut), pullErr)
 	}
 
-	stopCmd := fmt.Sprintf("docker stop %s 2>/dev/null || true; docker rm -fv %s 2>/dev/null || true",
-		ssh.EscapeShellArg(XrayContainerName), ssh.EscapeShellArg(XrayContainerName))
-	_, _, _, _ = client.RunSudoCommand(ctx, stopCmd)
+	backupContainerName := fmt.Sprintf("%s-backup", XrayContainerName)
+
+	inspectExistingCmd := fmt.Sprintf("docker inspect -f '{{.State.Running}}' %s 2>/dev/null", ssh.EscapeShellArg(XrayContainerName))
+	existingOut, _, existingCode, _ := client.RunSudoCommand(ctx, inspectExistingCmd)
+	hasExistingContainer := existingCode == 0 && strings.TrimSpace(existingOut) != ""
+	wasRunning := false
+	if hasExistingContainer {
+		fields := strings.Fields(strings.TrimSpace(existingOut))
+		if len(fields) > 0 && fields[0] == "true" {
+			wasRunning = true
+		}
+	}
+
+	if hasExistingContainer {
+		rmBackupCmd := fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(backupContainerName))
+		_, _, _, _ = client.RunSudoCommand(ctx, rmBackupCmd)
+
+		stopCmd := fmt.Sprintf("docker stop %s 2>/dev/null || true", ssh.EscapeShellArg(XrayContainerName))
+		_, _, _, _ = client.RunSudoCommand(ctx, stopCmd)
+
+		renameCmd := fmt.Sprintf("docker rename %s %s",
+			ssh.EscapeShellArg(XrayContainerName),
+			ssh.EscapeShellArg(backupContainerName),
+		)
+		if _, renameErrOut, renameCode, renameErr := client.RunSudoCommand(ctx, renameCmd); renameErr != nil || renameCode != 0 {
+			return fmt.Errorf("failed to stage existing xray container for replacement (code %d): %s: %w", renameCode, strings.TrimSpace(renameErrOut), renameErr)
+		}
+	} else {
+		rmCmd := fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(XrayContainerName))
+		_, _, _, _ = client.RunSudoCommand(ctx, rmCmd)
+	}
+
+	rollback := func(triggerErr error) error {
+		rmFailedCmd := fmt.Sprintf("docker stop %s 2>/dev/null || true; docker rm -fv %s 2>/dev/null || true",
+			ssh.EscapeShellArg(XrayContainerName), ssh.EscapeShellArg(XrayContainerName))
+		_, _, _, _ = client.RunSudoCommand(ctx, rmFailedCmd)
+
+		if hasExistingContainer {
+			restoreCmd := fmt.Sprintf("docker rename %s %s",
+				ssh.EscapeShellArg(backupContainerName), ssh.EscapeShellArg(XrayContainerName))
+			if wasRunning {
+				restoreCmd += fmt.Sprintf(" && docker start %s", ssh.EscapeShellArg(XrayContainerName))
+			}
+			if _, rErrOut, rCode, rErr := client.RunSudoCommand(ctx, restoreCmd); rErr != nil || rCode != 0 {
+				return fmt.Errorf("%w (rollback failed to restore previous container, code %d: %s: %v)",
+					triggerErr, rCode, strings.TrimSpace(rErrOut), rErr)
+			}
+			return fmt.Errorf("%w (rolled back to previous container)", triggerErr)
+		}
+		return triggerErr
+	}
 
 	runCmd := fmt.Sprintf(`docker run -d \
 --name %s \
@@ -245,19 +332,72 @@ func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient,
 	)
 
 	if _, errOut, code, err := client.RunSudoCommand(ctx, runCmd); err != nil || code != 0 {
-		return fmt.Errorf("failed to run xray container (code %d): %s: %w", code, errOut, err)
+		return rollback(fmt.Errorf("failed to run xray container (code %d): %s: %w", code, strings.TrimSpace(errOut), err))
 	}
 
 	checkCmd := fmt.Sprintf("docker inspect -f '{{.State.Running}} {{.State.Restarting}}' %s", ssh.EscapeShellArg(XrayContainerName))
 	out, errOut, code, err := client.RunSudoCommand(ctx, checkCmd)
 	if err != nil || code != 0 {
-		return fmt.Errorf("xray container failed to inspect (code %d): %s: %w", code, errOut, err)
+		return rollback(fmt.Errorf("xray container failed to inspect (code %d): %s: %w", code, strings.TrimSpace(errOut), err))
 	}
 	fields := strings.Fields(strings.TrimSpace(out))
 	if len(fields) < 2 || fields[0] != "true" || fields[1] != "false" {
-		return fmt.Errorf("xray container is not running (state: %s)", strings.TrimSpace(out))
+		return rollback(fmt.Errorf("xray container is not running (state: %s)", strings.TrimSpace(out)))
 	}
+
+	if hasExistingContainer {
+		rmBackupCmd := fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(backupContainerName))
+		_, _, _, _ = client.RunSudoCommand(ctx, rmBackupCmd)
+	}
+
 	return nil
+}
+
+func resolveExistingPort(inbound XrayInbound, server *models.Server, fallbackPort int) int {
+	if inbound.Port > 0 {
+		return inbound.Port
+	}
+	if server != nil && server.Protocols != nil {
+		if vMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any); ok {
+			if p, ok := vMeta["port"].(int); ok && p > 0 {
+				return p
+			}
+			if pStr, ok := vMeta["port"].(string); ok {
+				if pInt, err := strconv.Atoi(pStr); err == nil && pInt > 0 {
+					return pInt
+				}
+			}
+		}
+	}
+	return fallbackPort
+}
+
+func resolveExistingServerName(reality XrayRealitySettings, server *models.Server, fallback string) string {
+	if len(reality.ServerNames) > 0 && reality.ServerNames[0] != "" {
+		return reality.ServerNames[0]
+	}
+	if server != nil && server.Protocols != nil {
+		if vMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any); ok {
+			if sn, ok := vMeta["server_name"].(string); ok && sn != "" {
+				return sn
+			}
+		}
+	}
+	return fallback
+}
+
+func resolveExistingFlow(inbound XrayInbound, server *models.Server, fallback string) string {
+	if server != nil && server.Protocols != nil {
+		if vMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any); ok {
+			if fl, ok := vMeta["flow"].(string); ok {
+				return fl
+			}
+		}
+	}
+	if len(inbound.Settings.Clients) > 0 && inbound.Settings.Clients[0].Flow != "" {
+		return inbound.Settings.Clients[0].Flow
+	}
+	return fallback
 }
 
 func (m *XrayManager) prepareConfigBytes(
@@ -265,60 +405,48 @@ func (m *XrayManager) prepareConfigBytes(
 	existingParsed *XrayConfig,
 	portPrimary int,
 	serverName, flow string,
-	hasServerName, hasFlow bool,
+	hasPort, hasServerName, hasFlow bool,
 	privB64 string,
 	shortIDs []string,
 	clients []XrayClient,
 	server *models.Server,
-) ([]byte, string, string, error) {
+) ([]byte, int, string, string, error) {
 	if existingCfgBytes == nil || existingParsed == nil || len(existingParsed.Inbounds) == 0 {
 		portHigh := 54321
 		dest := netJoinHostPort(serverName, "443")
 		rendered, err := RenderXrayConfig(portPrimary, portHigh, serverName, dest, privB64, shortIDs, clients)
 		if err != nil {
-			return nil, "", "", fmt.Errorf("render xray config: %w", err)
+			return nil, 0, "", "", fmt.Errorf("render xray config: %w", err)
 		}
-		return rendered, serverName, flow, nil
+		return rendered, portPrimary, serverName, flow, nil
 	}
 
 	existingInbound := existingParsed.Inbounds[0]
 	existingReality := existingInbound.StreamSettings.RealitySettings
+
+	if !hasPort {
+		portPrimary = resolveExistingPort(existingInbound, server, portPrimary)
+	}
 	if !hasServerName {
-		if len(existingReality.ServerNames) > 0 && existingReality.ServerNames[0] != "" {
-			serverName = existingReality.ServerNames[0]
-		} else if server != nil && server.Protocols != nil {
-			if vMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any); ok {
-				if sn, ok := vMeta["server_name"].(string); ok && sn != "" {
-					serverName = sn
-				}
-			}
-		}
+		serverName = resolveExistingServerName(existingReality, server, serverName)
 	}
 	if !hasFlow {
-		if server != nil && server.Protocols != nil {
-			if vMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any); ok {
-				if fl, ok := vMeta["flow"].(string); ok {
-					flow = fl
-				}
-			}
-		} else if len(existingInbound.Settings.Clients) > 0 {
-			flow = existingInbound.Settings.Clients[0].Flow
-		}
+		flow = resolveExistingFlow(existingInbound, server, flow)
 	}
 
-	portChanged := portPrimary != existingInbound.Port
+	portChanged := hasPort && (portPrimary != existingInbound.Port)
 	sniChanged := hasServerName && (len(existingReality.ServerNames) == 0 || existingReality.ServerNames[0] != serverName)
 	flowChanged := hasFlow
 
 	if !portChanged && !sniChanged && !flowChanged {
-		return existingCfgBytes, serverName, flow, nil
+		return existingCfgBytes, portPrimary, serverName, flow, nil
 	}
 
 	updated, err := updateExistingConfig(existingCfgBytes, portPrimary, serverName, flow, portChanged, sniChanged, flowChanged)
 	if err != nil {
-		return nil, "", "", err
+		return nil, 0, "", "", err
 	}
-	return updated, serverName, flow, nil
+	return updated, portPrimary, serverName, flow, nil
 }
 
 func updateExistingConfig(existingCfgBytes []byte, portPrimary int, serverName, flow string, portChanged, sniChanged, flowChanged bool) ([]byte, error) {
@@ -389,7 +517,7 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	}
 
 	// 2. Parse installation options and resolve engine profile
-	portPrimary, serverName, flow, hasServerName, hasFlow, profile, err := parseXrayInstallOptions(params, server)
+	portPrimary, serverName, flow, hasPort, hasServerName, hasFlow, profile, err := parseXrayInstallOptions(ctx, client, params, server)
 	if err != nil {
 		return err
 	}
@@ -407,9 +535,9 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	}
 
 	// 5. Render or preserve and upload config.json
-	cfgBytes, serverName, flow, err := m.prepareConfigBytes(
+	cfgBytes, portPrimary, serverName, flow, err := m.prepareConfigBytes(
 		existingCfgBytes, existingParsed, portPrimary, serverName, flow,
-		hasServerName, hasFlow, privB64, shortIDs, clients, server,
+		hasPort, hasServerName, hasFlow, privB64, shortIDs, clients, server,
 	)
 	if err != nil {
 		return err

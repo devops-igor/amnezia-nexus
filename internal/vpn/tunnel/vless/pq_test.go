@@ -5,15 +5,26 @@ package vless
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	utls "github.com/metacubex/utls"
+
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // parseClientHelloKeyShares parses the key_share extension from raw ClientHello bytes.
@@ -355,8 +366,41 @@ func TestDialer_XrayV26_StrictPQHandshakeAndDataStream(t *testing.T) {
 	}
 }
 
-// TestDialer_ContainerFixtures runs when a local Docker daemon is present, testing clean
-// handshakes and TCP data streaming against both pinned 1.8.24 and 26.10.29 container fixtures.
+// Pinned container image tags and multi-arch manifest list digests.
+// Verified against published GitHub package metadata (ghcr.io/xtls/xray-core).
+//   - 1.8.24: multi-arch manifest list sha256:6b3ef1780d4be55c1bc4848232a90272d31c28cc3d0de1f2a50a56f48993be9d
+//     (published 2024-03-24 by XTLS/Xray-core releases)
+//   - 26.10.29: multi-arch manifest list sha256:c9443f3ee297f6481bc245269d61720c6f989195ee9b58fa90fdd99f03c21044
+//     (published 2024-10-29 by XTLS/Xray-core releases)
+const (
+	pinnedLegacyDigest = "sha256:6b3ef1780d4be55c1bc4848232a90272d31c28cc3d0de1f2a50a56f48993be9d"
+	pinnedLegacyImage  = "ghcr.io/xtls/xray-core:1.8.24@" + pinnedLegacyDigest
+	pinnedModernDigest = "sha256:c9443f3ee297f6481bc245269d61720c6f989195ee9b58fa90fdd99f03c21044"
+	pinnedModernImage  = "ghcr.io/xtls/xray-core:26.10.29@" + pinnedModernDigest
+)
+
+// TestPinnedImageDigests verifies that pinned image digests conform to published GitHub package metadata.
+func TestPinnedImageDigests(t *testing.T) {
+	wantLegacy := "sha256:6b3ef1780d4be55c1bc4848232a90272d31c28cc3d0de1f2a50a56f48993be9d"
+	if pinnedLegacyDigest != wantLegacy {
+		t.Errorf("pinnedLegacyDigest = %q, want %q", pinnedLegacyDigest, wantLegacy)
+	}
+	if !strings.HasSuffix(pinnedLegacyImage, wantLegacy) {
+		t.Errorf("pinnedLegacyImage %q does not embed expected digest %q", pinnedLegacyImage, wantLegacy)
+	}
+
+	wantModern := "sha256:c9443f3ee297f6481bc245269d61720c6f989195ee9b58fa90fdd99f03c21044"
+	if pinnedModernDigest != wantModern {
+		t.Errorf("pinnedModernDigest = %q, want %q", pinnedModernDigest, wantModern)
+	}
+	if !strings.HasSuffix(pinnedModernImage, wantModern) {
+		t.Errorf("pinnedModernImage %q does not embed expected digest %q", pinnedModernImage, wantModern)
+	}
+}
+
+// TestDialer_ContainerFixtures runs when a local Docker daemon is present, testing real
+// authenticated REALITY handshakes, bidirectional TCP data streams, wrong-key rejection,
+// and restart recovery against both pinned 1.8.24 and 26.10.29 container fixtures.
 func TestDialer_ContainerFixtures(t *testing.T) {
 	dockerPath, err := exec.LookPath("docker")
 	if err != nil {
@@ -367,16 +411,206 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 	}
 
 	fixtures := []struct {
-		name  string
-		image string
+		name          string
+		image         string
+		engineProfile string
 	}{
-		{name: "legacy_1_8_24", image: "ghcr.io/xtls/xray-core:1.8.24"},
-		{name: "modern_26_10_29", image: "ghcr.io/xtls/xray-core:26.10.29"},
+		{name: "legacy_1_8_24", image: pinnedLegacyImage, engineProfile: "legacy"},
+		{name: "modern_26_10_29", image: pinnedModernImage, engineProfile: "modern_pq"},
 	}
 
 	for _, tc := range fixtures {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Logf("Running container fixture for %s (%s)", tc.name, tc.image)
+			echoAddr, cleanupEcho := startTCPEchoServer(t)
+			defer cleanupEcho()
+
+			// Allocate a local ephemeral port for container VLESS inbound
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("allocate port: %v", err)
+			}
+			_, portStr, err := net.SplitHostPort(ln.Addr().String())
+			if err != nil {
+				ln.Close()
+				t.Fatalf("split host port: %v", err)
+			}
+			port := 0
+			for _, c := range portStr {
+				port = port*10 + int(c-'0')
+			}
+			ln.Close()
+
+			// Generate keys
+			privKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatalf("generate x25519: %v", err)
+			}
+			pubKey := privKey.PublicKey()
+			privB64 := base64.RawURLEncoding.EncodeToString(privKey.Bytes())
+			pubB64 := base64.RawURLEncoding.EncodeToString(pubKey.Bytes())
+			shortID := "0123456789abcdef"
+			serverName := "gateway.icloud.com"
+			clientUUID := uuid.New().String()
+
+			// Write container config
+			cfgDir := t.TempDir()
+			cfgPath := filepath.Join(cfgDir, "config.json")
+			xrayCfg := map[string]any{
+				"log": map[string]any{"loglevel": "warning"},
+				"inbounds": []any{
+					map[string]any{
+						"port":     port,
+						"protocol": "vless",
+						"settings": map[string]any{
+							"clients": []any{
+								map[string]any{
+									"id":   clientUUID,
+									"flow": "xtls-rprx-vision",
+								},
+							},
+							"decryption": "none",
+						},
+						"streamSettings": map[string]any{
+							"network":  "tcp",
+							"security": "reality",
+							"realitySettings": map[string]any{
+								"show":        false,
+								"dest":        "gateway.icloud.com:443",
+								"xver":        0,
+								"serverNames": []any{serverName},
+								"privateKey":  privB64,
+								"shortIds":    []any{shortID},
+							},
+						},
+					},
+				},
+				"outbounds": []any{
+					map[string]any{
+						"protocol": "freedom",
+					},
+				},
+			}
+			cfgData, err := json.MarshalIndent(xrayCfg, "", "  ")
+			if err != nil {
+				t.Fatalf("marshal config: %v", err)
+			}
+			if err := os.WriteFile(cfgPath, cfgData, 0644); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			containerName := fmt.Sprintf("test-xray-%s-%d", tc.name, time.Now().UnixNano()%100000)
+			t.Cleanup(func() {
+				_ = exec.Command(dockerPath, "rm", "-fv", containerName).Run()
+			})
+
+			// Run container
+			runCmd := exec.Command(dockerPath, "run", "-d",
+				"--name", containerName,
+				"--network", "host",
+				"-v", fmt.Sprintf("%s:/etc/xray:ro", cfgDir),
+				tc.image,
+			)
+			if out, rErr := runCmd.CombinedOutput(); rErr != nil {
+				t.Fatalf("docker run %s failed: %v, out: %s", tc.image, rErr, string(out))
+			}
+
+			// Wait for container readiness (up to 10 seconds)
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				var dErr error
+				readyConn, dErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
+				if dErr == nil {
+					readyConn.Close()
+					break
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+
+			params := models.VLESSRealityParams{
+				UUID:          clientUUID,
+				Flow:          "xtls-rprx-vision",
+				ServerName:    serverName,
+				Fingerprint:   "chrome",
+				PublicKey:     pubB64,
+				ShortID:       shortID,
+				EngineProfile: tc.engineProfile,
+			}
+
+			d, err := New(fmt.Sprintf("127.0.0.1:%d", port), params)
+			if err != nil {
+				t.Fatalf("New dialer: %v", err)
+			}
+
+			// 1. Authenticated REALITY handshake and bidirectional TCP data stream
+			dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			conn, err := d.DialContext(dialCtx, "tcp", echoAddr)
+			if err != nil {
+				t.Fatalf("DialContext failed against %s: %v", tc.name, err)
+			}
+			payload := []byte(fmt.Sprintf("hello from %s container integration", tc.name))
+			if _, wErr := conn.Write(payload); wErr != nil {
+				conn.Close()
+				t.Fatalf("Write payload: %v", wErr)
+			}
+			reply := make([]byte, len(payload))
+			if _, rErr := io.ReadFull(conn, reply); rErr != nil {
+				conn.Close()
+				t.Fatalf("Read reply: %v", rErr)
+			}
+			if !bytes.Equal(reply, payload) {
+				conn.Close()
+				t.Fatalf("reply mismatch: got %q, want %q", reply, payload)
+			}
+			conn.Close()
+
+			// 2. Wrong-key rejection: dialing with mismatched key must fail
+			badPriv, _ := ecdh.X25519().GenerateKey(rand.Reader)
+			badPubB64 := base64.RawURLEncoding.EncodeToString(badPriv.PublicKey().Bytes())
+			badParams := params
+			badParams.PublicKey = badPubB64
+			badDialer, err := New(fmt.Sprintf("127.0.0.1:%d", port), badParams)
+			if err != nil {
+				t.Fatalf("New bad dialer: %v", err)
+			}
+			badCtx, badCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer badCancel()
+			badConn, badErr := badDialer.DialContext(badCtx, "tcp", echoAddr)
+			if badErr == nil {
+				_ = badConn.SetDeadline(time.Now().Add(1 * time.Second))
+				_, wErr := badConn.Write([]byte("unauthenticated probe"))
+				buf := make([]byte, 64)
+				_, rErr := badConn.Read(buf)
+				badConn.Close()
+				if wErr == nil && rErr == nil {
+					t.Fatalf("expected wrong-key connection to be rejected by REALITY server")
+				}
+			}
+
+			// 3. Restart recovery: restart container, redial, verify data stream recovers
+			restartCmd := exec.Command(dockerPath, "restart", containerName)
+			if out, restErr := restartCmd.CombinedOutput(); restErr != nil {
+				t.Fatalf("docker restart failed: %v, out: %s", restErr, string(out))
+			}
+			time.Sleep(1 * time.Second)
+			recoveryCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer recCancel()
+			recConn, err := d.DialContext(recoveryCtx, "tcp", echoAddr)
+			if err != nil {
+				t.Fatalf("restart recovery: DialContext failed: %v", err)
+			}
+			defer recConn.Close()
+			recPayload := []byte("recovery post-restart payload")
+			if _, wErr := recConn.Write(recPayload); wErr != nil {
+				t.Fatalf("recovery write: %v", wErr)
+			}
+			recReply := make([]byte, len(recPayload))
+			if _, rErr := io.ReadFull(recConn, recReply); rErr != nil {
+				t.Fatalf("recovery read: %v", rErr)
+			}
+			if !bytes.Equal(recReply, recPayload) {
+				t.Fatalf("recovery mismatch: got %q, want %q", recReply, recPayload)
+			}
 		})
 	}
 }

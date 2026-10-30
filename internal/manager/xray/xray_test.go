@@ -69,15 +69,16 @@ func (m *mockXraySSHClient) RunSudoCommand(ctx context.Context, cmd string) (str
 		}
 		return "", "", 0, nil
 	}
-	if strings.Contains(cmd, "docker run") {
+	if strings.Contains(cmd, "docker run") || strings.Contains(cmd, "docker start") {
 		m.dockerAlive = true
 		return "container_id_xray", "", 0, nil
 	}
-	if strings.Contains(cmd, "docker stop") || strings.Contains(cmd, "docker rm") {
+	if (strings.Contains(cmd, "docker stop") || strings.Contains(cmd, "docker rm")) && !strings.Contains(cmd, "amnezia-xray-backup") {
 		m.dockerAlive = false
 		return "", "", 0, nil
 	}
 	if strings.Contains(cmd, "docker restart") {
+		m.dockerAlive = true
 		return "amnezia-xray", "", 0, nil
 	}
 	if strings.HasPrefix(cmd, "test -f ") {

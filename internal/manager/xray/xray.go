@@ -72,10 +72,10 @@ var SupportedEngineProfiles = map[EngineProfile]EngineProfileInfo{
 // ResolveEngineProfile normalizes user input into a known EngineProfileInfo.
 func ResolveEngineProfile(profileName string) (EngineProfileInfo, error) {
 	norm := strings.ToLower(strings.TrimSpace(profileName))
-	switch norm {
-	case "", "legacy", "legacy_baseline", "legacy compatibility baseline", "baseline", "1.8.24", "v1.8.24":
+	switch {
+	case norm == "" || norm == "legacy" || norm == "legacy_baseline" || norm == "legacy compatibility baseline" || norm == "baseline" || norm == "1.8.24" || norm == "v1.8.24":
 		return SupportedEngineProfiles[EngineProfileLegacy], nil
-	case "modern_pq", "modern", "pq", "26.10.29", "v26.10.29", "modern pq", "post_quantum", "post-quantum":
+	case norm == "modern_pq" || norm == "modern" || norm == "pq" || norm == "26.10.29" || norm == "v26.10.29" || norm == "modern pq" || norm == "post_quantum" || norm == "post-quantum" || strings.HasPrefix(norm, "26.10.") || strings.HasPrefix(norm, "v26.10."):
 		return SupportedEngineProfiles[EngineProfileModernPQ], nil
 	default:
 		return EngineProfileInfo{}, fmt.Errorf("unknown xray engine profile %q (supported: legacy, modern_pq)", profileName)
