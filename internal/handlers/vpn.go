@@ -417,16 +417,46 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 		}
 		if err := h.vpnSvc.EnableBackendWithConfig(bgCtx, serverID, opts...); err != nil {
 			if newlyProvisionedClientID != "" && newlyProvisionedMgr != nil {
-				if srv == nil && h.db != nil {
-					srv, _ = h.db.GetServer(bgCtx, serverID)
-				}
-				if rbErr := h.rollbackClient(bgCtx, newlyProvisionedMgr, srv, nil, newlyProvisionedClientID); rbErr != nil {
-					slog.Warn("failed to rollback remote client after enable backend failure", "server_id", serverID, "client_id", newlyProvisionedClientID, "err", rbErr)
-					if h.db != nil {
-						_ = h.db.SetPeerLifecycleStatus(bgCtx, serverID, normProto, newlyProvisionedClientID, "failed")
+				// R3-H1: Distinguish pre-registration failure from post-registration abort.
+				// If a backend row has already been committed in backend_tunnels (or exists in the pool),
+				// do NOT revoke remote credentials; preserve them for subsequent re-enable/retry.
+				hasCommittedBackend := false
+				if h.db != nil {
+					tunnels, dbErr := h.db.GetBackendTunnelsByServerID(bgCtx, serverID)
+					if dbErr != nil {
+						hasCommittedBackend = true
+					} else {
+						for i := range tunnels {
+							cid := extractClientIDFromProtocolParams(tunnels[i].Protocol, tunnels[i].ProtocolParams)
+							if cid != "" && (cid == newlyProvisionedClientID || strings.EqualFold(cid, newlyProvisionedClientID)) {
+								hasCommittedBackend = true
+								break
+							}
+						}
 					}
-				} else if h.db != nil {
-					_ = h.db.DeletePeerLifecycle(bgCtx, serverID, normProto, newlyProvisionedClientID)
+				}
+				if !hasCommittedBackend && h.vpnSvc != nil {
+					if tun, err := h.vpnSvc.GetTunnel(serverID); err == nil && tun != nil {
+						cid := extractClientIDFromProtocolParams(tun.Protocol, tun.ProtocolParams)
+						if cid != "" && (cid == newlyProvisionedClientID || strings.EqualFold(cid, newlyProvisionedClientID)) {
+							hasCommittedBackend = true
+						}
+					}
+				}
+				if !hasCommittedBackend {
+					if srv == nil && h.db != nil {
+						srv, _ = h.db.GetServer(bgCtx, serverID)
+					}
+					if rbErr := h.rollbackClient(bgCtx, newlyProvisionedMgr, srv, nil, newlyProvisionedClientID); rbErr != nil {
+						slog.Warn("failed to rollback remote client after enable backend failure", "server_id", serverID, "client_id", newlyProvisionedClientID, "err", rbErr)
+						if h.db != nil {
+							_ = h.db.SetPeerLifecycleStatus(bgCtx, serverID, normProto, newlyProvisionedClientID, "failed")
+						}
+					} else if h.db != nil {
+						_ = h.db.DeletePeerLifecycle(bgCtx, serverID, normProto, newlyProvisionedClientID)
+					}
+				} else {
+					slog.Info("preserving remote client credential owned by committed backend after enable abort", "server_id", serverID, "client_id", newlyProvisionedClientID)
 				}
 			}
 			if errors.Is(err, vpn.ErrAWGNotInstalled) {
