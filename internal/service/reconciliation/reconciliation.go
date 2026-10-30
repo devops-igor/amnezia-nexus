@@ -592,7 +592,16 @@ func (r *Reconciler) withdrawDisabledOwnerConns(ctx context.Context, server *mod
 func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *models.Server, proto string, mgr manager.ProtocolManager, client map[string]any, clientID string, lifecycles map[string]database.PeerLifecycleRecord, staleThreshold time.Duration) {
 	serverID := server.ID
 
-	if r.isBackendTunnelClient(ctx, serverID, clientID) {
+	isBackend, err := r.isBackendTunnelClient(ctx, serverID, clientID)
+	if err != nil {
+		slog.Warn("Reconciliation: failed to verify backend tunnel client due to query error, skipping removal to fail closed",
+			"server_id", serverID,
+			"client_id", clientID,
+			"err", err,
+		)
+		return
+	}
+	if isBackend {
 		slog.Info("Reconciliation: preserving active backend tunnel client",
 			"server_id", serverID,
 			"client_id", clientID,
@@ -809,23 +818,20 @@ func parseClientTimestamp(val any) *time.Time {
 	return nil
 }
 
-func (r *Reconciler) isBackendTunnelClient(ctx context.Context, serverID int64, clientID string) bool {
+func (r *Reconciler) isBackendTunnelClient(ctx context.Context, serverID int64, clientID string) (bool, error) {
 	if r.db == nil || clientID == "" {
-		return false
+		return false, nil
 	}
 	tunnels, err := r.db.GetBackendTunnelsByServerID(ctx, serverID)
-	if err != nil || len(tunnels) == 0 {
-		return false
+	if err != nil {
+		return false, fmt.Errorf("get backend tunnels for server %d: %w", serverID, err)
 	}
 	for _, t := range tunnels {
-		if !t.Enabled {
-			continue
-		}
 		if isMatchingBackendTunnelClient(&t, clientID) {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func isMatchingBackendTunnelClient(t *models.BackendTunnel, clientID string) bool {

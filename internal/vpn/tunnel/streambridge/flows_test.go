@@ -286,7 +286,7 @@ func TestFlows_UDPEchoAndMultiFlow(t *testing.T) {
 	defer tc.Close()
 
 	// Flow 1 from local port 20001
-	conn1, err := tc.DialUDPWithBind(20001, "198.51.100.1:53")
+	conn1, err := tc.DialUDPWithBind(20001, "198.51.100.1:12345")
 	if err != nil {
 		t.Fatalf("DialUDP 1 error: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestFlows_UDPEchoAndMultiFlow(t *testing.T) {
 	}
 
 	// Flow 2 from local port 20002
-	conn2, err := tc.DialUDPWithBind(20002, "198.51.100.1:53")
+	conn2, err := tc.DialUDPWithBind(20002, "198.51.100.1:12345")
 	if err != nil {
 		t.Fatalf("DialUDP 2 error: %v", err)
 	}
@@ -674,7 +674,7 @@ func TestFlows_CloseWaitsForInFlightUDPDial(t *testing.T) {
 	tc := newTestClient(t, dev)
 	defer tc.Close()
 
-	uConn, err := tc.DialUDPWithBind(25000, "198.51.100.1:53")
+	uConn, err := tc.DialUDPWithBind(25000, "198.51.100.1:12345")
 	if err != nil {
 		t.Fatalf("DialUDPWithBind error: %v", err)
 	}
@@ -785,7 +785,7 @@ func TestFlows_ConcurrentAdmissionAndCloseStress(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			uConn, err := tc.DialUDPWithBind(uint16(30000+idx), "198.51.100.1:53")
+			uConn, err := tc.DialUDPWithBind(uint16(30000+idx), "198.51.100.1:12345")
 			if err != nil {
 				return
 			}
