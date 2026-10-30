@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -289,5 +290,253 @@ func TestXrayManagerLaunchContainer_RollbackRestoresPreviousConfig(t *testing.T)
 	}
 	if len(parsed.Inbounds) == 0 || parsed.Inbounds[0].Port != 8443 {
 		t.Errorf("expected restored config to listen on port 8443, got %+v", parsed.Inbounds)
+	}
+}
+
+type pullFaultMockSSHClient struct {
+	*mockXraySSHClient
+	failDockerPull bool
+}
+
+func (m *pullFaultMockSSHClient) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	if strings.Contains(cmd, "docker pull") && m.failDockerPull {
+		return "", "Error response from daemon: repository ghcr.io/xtls/xray-core not found", 1, fmt.Errorf("exit status 1")
+	}
+	return m.mockXraySSHClient.RunSudoCommand(ctx, cmd)
+}
+
+func TestXrayManagerInstall_ImagePullFailurePreservesConfig(t *testing.T) {
+	mockSSH := &pullFaultMockSSHClient{
+		mockXraySSHClient: newMockXraySSHClient(),
+		failDockerPull:    true,
+	}
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+	server := &models.Server{
+		ID:   501,
+		Host: "192.0.2.51",
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{
+				"installed":      true,
+				"port":           8443,
+				"engine_profile": "legacy",
+			},
+		},
+	}
+	ctx := context.Background()
+
+	key, _, err := GenerateRealityKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialConfig, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
+		{ID: "e8512bce-e575-4805-a678-1d64c033e83e", Flow: "xtls-rprx-vision", Email: "retained"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), initialConfig...)
+
+	err = mgr.Install(ctx, server, map[string]any{
+		"engine_profile": "modern_pq",
+		"port":           9443,
+	})
+	if err == nil {
+		t.Fatalf("expected Install to fail due to injected docker pull fault")
+	}
+	if !strings.Contains(err.Error(), "failed to pull xray image") {
+		t.Errorf("error = %q, want mention of 'failed to pull xray image'", err.Error())
+	}
+	if !bytes.Equal(mockSSH.files[XrayConfigPath], initialConfig) {
+		t.Fatalf("live config.json was mutated despite pull failure; initial config must be preserved")
+	}
+	parsed, err := ParseXrayConfig(mockSSH.files[XrayConfigPath])
+	if err != nil {
+		t.Fatalf("ParseXrayConfig: %v", err)
+	}
+	if len(parsed.Inbounds) == 0 || parsed.Inbounds[0].Port != 8443 {
+		t.Errorf("expected preserved config port 8443, got %+v", parsed.Inbounds)
+	}
+	// Verify no container rename command was executed
+	for _, cmd := range mockSSH.commands {
+		if strings.Contains(cmd, "docker rename") {
+			t.Errorf("docker rename ran despite pull failure: %v", cmd)
+		}
+	}
+}
+
+type delayedCrashMockSSHClient struct {
+	*mockXraySSHClient
+	inspectCount int
+}
+
+func (m *delayedCrashMockSSHClient) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
+	if strings.Contains(cmd, "docker inspect") && strings.Contains(cmd, XrayContainerName) && !strings.Contains(cmd, "amnezia-xray-backup") {
+		m.inspectCount++
+		// Initial check before launch: existing container was running (inspectCount 1)
+		// Check 1 during readiness: new container is running (inspectCount 2)
+		// Check 2 during readiness: new container crashes (inspectCount 3)
+		if m.inspectCount >= 3 {
+			return "false false\n", "", 0, nil
+		}
+		return "true false\n", "", 0, nil
+	}
+	return m.mockXraySSHClient.RunSudoCommand(ctx, cmd)
+}
+
+func TestXrayManagerLaunchContainer_DelayedStartupFailureRollback(t *testing.T) {
+	mockSSH := &delayedCrashMockSSHClient{
+		mockXraySSHClient: newMockXraySSHClient(),
+	}
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+	server := &models.Server{
+		ID:   601,
+		Host: "192.0.2.61",
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{
+				"installed":      true,
+				"port":           8443,
+				"engine_profile": "legacy",
+			},
+		},
+	}
+	ctx := context.Background()
+
+	key, _, err := GenerateRealityKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialConfig, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
+		{ID: "e8512bce-e575-4805-a678-1d64c033e83e", Flow: "xtls-rprx-vision", Email: "retained"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), initialConfig...)
+
+	err = mgr.Install(ctx, server, map[string]any{
+		"engine_profile": "modern_pq",
+		"port":           9443,
+	})
+	if err == nil {
+		t.Fatalf("expected Install to fail due to delayed container crash")
+	}
+	if !strings.Contains(err.Error(), "rolled back to previous container") {
+		t.Fatalf("expected error mentioning 'rolled back to previous container', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "readiness check failed") {
+		t.Errorf("expected error mentioning readiness check failure, got: %v", err)
+	}
+
+	// Verify rollback restored previous container and config
+	foundRestoreRename := false
+	foundRestoreStart := false
+	for _, cmd := range mockSSH.commands {
+		if strings.Contains(cmd, "docker rename") && strings.Contains(cmd, "amnezia-xray-backup") && strings.Contains(cmd, "amnezia-xray") {
+			foundRestoreRename = true
+		}
+		if strings.Contains(cmd, "docker start") && strings.Contains(cmd, "amnezia-xray") {
+			foundRestoreStart = true
+		}
+	}
+	if !foundRestoreRename {
+		t.Errorf("expected docker rename amnezia-xray-backup amnezia-xray in rollback, commands: %v", mockSSH.commands)
+	}
+	if !foundRestoreStart {
+		t.Errorf("expected docker start amnezia-xray in rollback, commands: %v", mockSSH.commands)
+	}
+	if !bytes.Equal(mockSSH.files[XrayConfigPath], initialConfig) {
+		t.Errorf("rollback failed to restore initial configuration bytes on delayed crash")
+	}
+	parsed, err := ParseXrayConfig(mockSSH.files[XrayConfigPath])
+	if err != nil {
+		t.Fatalf("ParseXrayConfig: %v", err)
+	}
+	if len(parsed.Inbounds) == 0 || parsed.Inbounds[0].Port != 8443 {
+		t.Errorf("expected restored port 8443, got %+v", parsed.Inbounds)
+	}
+}
+
+func TestXrayManagerLaunchContainer_FailedHandshakeRollback(t *testing.T) {
+	mockSSH := newMockXraySSHClient()
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+
+	// Configure failing handshake probe
+	handshakeAttempted := false
+	mgr.SetVLESSProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		handshakeAttempted = true
+		if params.ServerName != "example.com" {
+			t.Errorf("probe params ServerName = %q, want example.com", params.ServerName)
+		}
+		return 0, fmt.Errorf("connection refused: REALITY handshake failed")
+	})
+
+	server := &models.Server{
+		ID:   701,
+		Host: "192.0.2.71",
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{
+				"installed":      true,
+				"port":           8443,
+				"engine_profile": "legacy",
+			},
+		},
+	}
+	ctx := context.Background()
+
+	key, _, err := GenerateRealityKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialConfig, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
+		{ID: "e8512bce-e575-4805-a678-1d64c033e83e", Flow: "xtls-rprx-vision", Email: "retained"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), initialConfig...)
+
+	err = mgr.Install(ctx, server, map[string]any{
+		"engine_profile": "modern_pq",
+		"port":           9443,
+	})
+	if err == nil {
+		t.Fatalf("expected Install to fail due to failed handshake probe")
+	}
+	if !handshakeAttempted {
+		t.Errorf("handshake probe was not called during readiness verification")
+	}
+	if !strings.Contains(err.Error(), "failed REALITY handshake readiness probe") {
+		t.Errorf("expected error mentioning failed REALITY handshake readiness probe, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "rolled back to previous container") {
+		t.Errorf("expected error mentioning rolled back to previous container, got: %v", err)
+	}
+
+	// Verify rollback restored previous container and config
+	foundRestoreRename := false
+	foundRestoreStart := false
+	for _, cmd := range mockSSH.commands {
+		if strings.Contains(cmd, "docker rename") && strings.Contains(cmd, "amnezia-xray-backup") && strings.Contains(cmd, "amnezia-xray") {
+			foundRestoreRename = true
+		}
+		if strings.Contains(cmd, "docker start") && strings.Contains(cmd, "amnezia-xray") {
+			foundRestoreStart = true
+		}
+	}
+	if !foundRestoreRename {
+		t.Errorf("expected docker rename amnezia-xray-backup amnezia-xray in rollback, commands: %v", mockSSH.commands)
+	}
+	if !foundRestoreStart {
+		t.Errorf("expected docker start amnezia-xray in rollback, commands: %v", mockSSH.commands)
+	}
+	if !bytes.Equal(mockSSH.files[XrayConfigPath], initialConfig) {
+		t.Errorf("rollback failed to restore initial configuration bytes on failed handshake")
+	}
+	parsed, err := ParseXrayConfig(mockSSH.files[XrayConfigPath])
+	if err != nil {
+		t.Fatalf("ParseXrayConfig: %v", err)
+	}
+	if len(parsed.Inbounds) == 0 || parsed.Inbounds[0].Port != 8443 {
+		t.Errorf("expected restored port 8443, got %+v", parsed.Inbounds)
 	}
 }

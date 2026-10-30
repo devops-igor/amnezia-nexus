@@ -573,3 +573,66 @@ func TestInstallProtocolHandler_EngineProfileForwarding(t *testing.T) {
 		})
 	}
 }
+
+func TestInstallProtocolHandler_ProfileSwitchPreservesExistingNonstandardPort(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+	}{
+		{name: "top_level_profile_omitted_port", payload: `{"protocol":"vless","engine_profile":"modern_pq"}`},
+		{name: "nested_profile_omitted_port", payload: `{"protocol":"vless","vless_options":{"engine_profile":"modern_pq"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, db, _ := setupTestHandlers(t)
+			capture := &captureMockProtocolManager{proto: models.ProtocolVLESS}
+			h.registry = manager.NewRegistry()
+			h.registry.Register(capture)
+			id, err := db.CreateServer(context.Background(), &models.Server{
+				Name:    "test-vless-srv",
+				Host:    "192.0.2.1",
+				SSHPort: 22,
+				Protocols: map[string]any{
+					models.ProtocolVLESS: map[string]any{
+						"installed":      true,
+						"port":           8443,
+						"engine_profile": "legacy",
+					},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/install", id), strings.NewReader(tc.payload))
+			rc := chi.NewRouteContext()
+			rc.URLParams.Add("server_id", fmt.Sprint(id))
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rc))
+			req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+				UserID: "admin-1", Username: "admin", Role: models.RoleAdmin,
+			}))
+			rec := httptest.NewRecorder()
+			h.InstallProtocolHandler(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("HTTP %d: %s", rec.Code, rec.Body.String())
+			}
+
+			// Verify manager received the preserved nonstandard port 8443
+			if portVal := capture.capturedParams["port"]; portVal != "8443" && portVal != 8443 {
+				t.Errorf("expected manager captured port to preserve 8443, got %#v", portVal)
+			}
+
+			// Verify server protocols in database preserved port 8443
+			server, err := db.GetServer(context.Background(), id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			vMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any)
+			if !ok {
+				t.Fatalf("expected VLESS protocol in server.Protocols")
+			}
+			if p := fmt.Sprint(vMeta["port"]); p != "8443" {
+				t.Errorf("expected DB server.Protocols[vless] port = 8443, got %v", vMeta["port"])
+			}
+		})
+	}
+}

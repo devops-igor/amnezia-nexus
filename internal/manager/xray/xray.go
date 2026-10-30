@@ -87,6 +87,9 @@ type SSHProvider interface {
 	Get(ctx context.Context, server *models.Server) (ssh.SSHClient, error)
 }
 
+// VLESSProbeFunc is the function signature for probing a VLESS+REALITY endpoint.
+type VLESSProbeFunc func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error)
+
 // XrayManager implements manager.ProtocolManager for VLESS+REALITY via Xray-core.
 //
 //nolint:revive
@@ -94,6 +97,7 @@ type XrayManager struct {
 	sshPool        SSHProvider
 	containerCache *xrayContainerCache
 	serverLocks    *awg.ServerLockRegistry
+	vlessProbeFn   VLESSProbeFunc
 	mu             sync.Mutex
 }
 
@@ -113,6 +117,13 @@ func NewXrayManagerWithServerLocks(pool SSHProvider, locks *awg.ServerLockRegist
 		containerCache: newXrayContainerCache(),
 		serverLocks:    locks,
 	}
+}
+
+// SetVLESSProbeFunc configures an optional authenticated handshake probe function for container readiness checks.
+func (m *XrayManager) SetVLESSProbeFunc(fn VLESSProbeFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.vlessProbeFn = fn
 }
 
 // recentClients is package-level so every manager instance (HTTP handlers, reconciler,

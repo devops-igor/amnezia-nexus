@@ -273,6 +273,37 @@ func TestMultiProtocol_InstallProtocolRequestValidation(t *testing.T) {
 			t.Errorf("expected normalized protocol %q, got %q", ProtocolVLESS, req.Protocol)
 		}
 	})
+
+	t.Run("omitted port with engine profile is valid", func(t *testing.T) {
+		req := InstallProtocolRequest{
+			Protocol:      ProtocolVLESS,
+			EngineProfile: "modern_pq",
+		}
+		if err := req.Validate(); err != nil {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("omitted port with vless options is valid", func(t *testing.T) {
+		req := InstallProtocolRequest{
+			Protocol: ProtocolVLESS,
+			VLESSOptions: &VLESSInstallOptions{
+				ServerName: "example.com",
+			},
+		}
+		if err := req.Validate(); err != nil {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("omitted port without options is invalid", func(t *testing.T) {
+		req := InstallProtocolRequest{
+			Protocol: ProtocolVLESS,
+		}
+		if err := req.Validate(); err == nil {
+			t.Error("expected error for omitted port with no options")
+		}
+	})
 }
 
 func TestMultiProtocol_ParamStructsSerialization(t *testing.T) {
