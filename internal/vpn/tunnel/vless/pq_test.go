@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -428,6 +429,8 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			echoAddr, cleanupEcho := startTCPEchoServer(t)
 			defer cleanupEcho()
+			udpEchoAddr, cleanupUDPEcho := startUDPEchoServer(t)
+			defer cleanupUDPEcho()
 
 			// Allocate a local ephemeral port for container VLESS inbound
 			ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -439,9 +442,10 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 				ln.Close()
 				t.Fatalf("split host port: %v", err)
 			}
-			port := 0
-			for _, c := range portStr {
-				port = port*10 + int(c-'0')
+			port, err := strconv.Atoi(portStr)
+			if err != nil {
+				ln.Close()
+				t.Fatalf("parse host port: %v", err)
 			}
 			ln.Close()
 
@@ -463,8 +467,22 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 				t.Fatalf("chmod cfgDir: %v", err)
 			}
 			cfgPath := filepath.Join(cfgDir, "config.json")
+
+			freedomSettings := map[string]any{
+				"domainStrategy": "AsIs",
+			}
+			if tc.engineProfile == "modern_pq" {
+				// Xray v26.4+ default security policy blocks loopback (127.0.0.1) and private IP ranges
+				// from VLESS inbounds unless explicitly permitted via finalRules.
+				freedomSettings["finalRules"] = []any{
+					map[string]any{
+						"action": "allow",
+					},
+				}
+			}
+
 			xrayCfg := map[string]any{
-				"log": map[string]any{"loglevel": "warning"},
+				"log": map[string]any{"loglevel": "info"},
 				"inbounds": []any{
 					map[string]any{
 						"port":     port,
@@ -495,6 +513,7 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 				"outbounds": []any{
 					map[string]any{
 						"protocol": "freedom",
+						"settings": freedomSettings,
 					},
 				},
 			}
@@ -600,18 +619,43 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 			payload := []byte(fmt.Sprintf("hello from %s container integration", tc.name))
 			if _, wErr := conn.Write(payload); wErr != nil {
 				conn.Close()
-				t.Fatalf("Write payload: %v", wErr)
+				t.Fatalf("Write payload against %s failed: %v\n%s", tc.name, wErr, dumpDiagnostics())
 			}
 			reply := make([]byte, len(payload))
 			if _, rErr := io.ReadFull(conn, reply); rErr != nil {
 				conn.Close()
-				t.Fatalf("Read reply: %v", rErr)
+				t.Fatalf("Read reply against %s failed: %v\n%s", tc.name, rErr, dumpDiagnostics())
 			}
 			if !bytes.Equal(reply, payload) {
 				conn.Close()
-				t.Fatalf("reply mismatch: got %q, want %q", reply, payload)
+				t.Fatalf("reply mismatch against %s: got %q, want %q\n%s", tc.name, reply, payload, dumpDiagnostics())
 			}
 			conn.Close()
+
+			// Bidirectional UDP data stream through container
+			udpCtx, udpCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer udpCancel()
+			udpConn, err := d.DialContext(udpCtx, "udp", udpEchoAddr)
+			if err != nil {
+				t.Fatalf("DialContext udp failed against %s: %v\n%s", tc.name, err, dumpDiagnostics())
+			}
+			udpPayload := []byte(fmt.Sprintf("hello udp from %s container integration", tc.name))
+			_ = udpConn.SetDeadline(time.Now().Add(5 * time.Second))
+			if _, wErr := udpConn.Write(udpPayload); wErr != nil {
+				udpConn.Close()
+				t.Fatalf("Write udp payload against %s failed: %v\n%s", tc.name, wErr, dumpDiagnostics())
+			}
+			udpReply := make([]byte, len(udpPayload)+64)
+			n, rErr := udpConn.Read(udpReply)
+			if rErr != nil {
+				udpConn.Close()
+				t.Fatalf("Read udp reply against %s failed: %v\n%s", tc.name, rErr, dumpDiagnostics())
+			}
+			if !bytes.Equal(udpReply[:n], udpPayload) {
+				udpConn.Close()
+				t.Fatalf("udp reply mismatch against %s: got %q, want %q\n%s", tc.name, udpReply[:n], udpPayload, dumpDiagnostics())
+			}
+			udpConn.Close()
 
 			// 2. Wrong-key rejection: dialing with mismatched key must fail
 			badPriv, _ := ecdh.X25519().GenerateKey(rand.Reader)
@@ -632,33 +676,33 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 				_, rErr := badConn.Read(buf)
 				badConn.Close()
 				if wErr == nil && rErr == nil {
-					t.Fatalf("expected wrong-key connection to be rejected by REALITY server")
+					t.Fatalf("expected wrong-key connection to be rejected by REALITY server\n%s", dumpDiagnostics())
 				}
 			}
 
 			// 3. Restart recovery: restart container, redial, verify data stream recovers
 			restartCmd := exec.Command(dockerPath, "restart", containerName)
 			if out, restErr := restartCmd.CombinedOutput(); restErr != nil {
-				t.Fatalf("docker restart failed: %v, out: %s", restErr, string(out))
+				t.Fatalf("docker restart failed: %v, out: %s\n%s", restErr, string(out), dumpDiagnostics())
 			}
 			waitForReadiness("restart recovery", 30*time.Second)
 			recoveryCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer recCancel()
 			recConn, err := d.DialContext(recoveryCtx, "tcp", echoAddr)
 			if err != nil {
-				t.Fatalf("restart recovery: DialContext failed: %v\n%s", err, dumpDiagnostics())
+				t.Fatalf("restart recovery: DialContext failed against %s: %v\n%s", tc.name, err, dumpDiagnostics())
 			}
 			defer recConn.Close()
 			recPayload := []byte("recovery post-restart payload")
 			if _, wErr := recConn.Write(recPayload); wErr != nil {
-				t.Fatalf("recovery write: %v", wErr)
+				t.Fatalf("recovery write against %s failed: %v\n%s", tc.name, wErr, dumpDiagnostics())
 			}
 			recReply := make([]byte, len(recPayload))
 			if _, rErr := io.ReadFull(recConn, recReply); rErr != nil {
-				t.Fatalf("recovery read: %v", rErr)
+				t.Fatalf("recovery read against %s failed: %v\n%s", tc.name, rErr, dumpDiagnostics())
 			}
 			if !bytes.Equal(recReply, recPayload) {
-				t.Fatalf("recovery mismatch: got %q, want %q", recReply, recPayload)
+				t.Fatalf("recovery mismatch against %s: got %q, want %q\n%s", tc.name, recReply, recPayload, dumpDiagnostics())
 			}
 		})
 	}
