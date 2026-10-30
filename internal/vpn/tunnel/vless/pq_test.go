@@ -459,6 +459,9 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 
 			// Write container config
 			cfgDir := t.TempDir()
+			if err := os.Chmod(cfgDir, 0755); err != nil {
+				t.Fatalf("chmod cfgDir: %v", err)
+			}
 			cfgPath := filepath.Join(cfgDir, "config.json")
 			xrayCfg := map[string]any{
 				"log": map[string]any{"loglevel": "warning"},
@@ -508,28 +511,69 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 				_ = exec.Command(dockerPath, "rm", "-fv", containerName).Run()
 			})
 
-			// Run container
+			// Pre-pull image to isolate image download time from container readiness
+			pullCmd := exec.Command(dockerPath, "pull", tc.image)
+			if pullOut, pullErr := pullCmd.CombinedOutput(); pullErr != nil {
+				t.Fatalf("docker pull %s failed: %v, out: %s", tc.image, pullErr, string(pullOut))
+			}
+
+			// Run container with host network and dual configuration directory mounts
+			// (/etc/xray for 1.8.24 baseline, /usr/local/etc/xray for 26.10.x distroless default).
 			runCmd := exec.Command(dockerPath, "run", "-d",
 				"--name", containerName,
 				"--network", "host",
+				"--user", "0:0",
 				"-v", fmt.Sprintf("%s:/etc/xray:ro", cfgDir),
+				"-v", fmt.Sprintf("%s:/usr/local/etc/xray:ro", cfgDir),
 				tc.image,
 			)
 			if out, rErr := runCmd.CombinedOutput(); rErr != nil {
 				t.Fatalf("docker run %s failed: %v, out: %s", tc.image, rErr, string(out))
 			}
 
-			// Wait for container readiness (up to 10 seconds)
-			deadline := time.Now().Add(10 * time.Second)
-			for time.Now().Before(deadline) {
-				var dErr error
-				readyConn, dErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
-				if dErr == nil {
-					readyConn.Close()
-					break
-				}
-				time.Sleep(200 * time.Millisecond)
+			dumpDiagnostics := func() string {
+				inspectCmd := exec.Command(dockerPath, "inspect", "-f", "status={{.State.Status}} running={{.State.Running}} exit={{.State.ExitCode}} error={{.State.Error}}", containerName)
+				insOut, _ := inspectCmd.CombinedOutput()
+				logsCmd := exec.Command(dockerPath, "logs", "--tail", "100", containerName)
+				logsOut, _ := logsCmd.CombinedOutput()
+				return fmt.Sprintf("container state: %s\ndocker logs:\n%s", strings.TrimSpace(string(insOut)), string(logsOut))
 			}
+
+			waitForReadiness := func(phase string, timeout time.Duration) {
+				deadline := time.Now().Add(timeout)
+				var lastDialErr error
+				for time.Now().Before(deadline) {
+					readyConn, dErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 250*time.Millisecond)
+					if dErr == nil {
+						_ = readyConn.Close()
+						return
+					}
+					lastDialErr = dErr
+
+					// Check if container already exited prematurely
+					inspectCmd := exec.Command(dockerPath, "inspect", "-f", "{{.State.Status}} {{.State.Running}} {{.State.ExitCode}}", containerName)
+					if insOut, insErr := inspectCmd.CombinedOutput(); insErr == nil {
+						fields := strings.Fields(strings.TrimSpace(string(insOut)))
+						if len(fields) >= 2 && fields[1] == "false" {
+							logsCmd := exec.Command(dockerPath, "logs", "--tail", "100", containerName)
+							logsOut, _ := logsCmd.CombinedOutput()
+							t.Fatalf("%s: container %s exited prematurely before readiness (state: %s, dial err: %v)\ndocker logs:\n%s",
+								phase, containerName, strings.TrimSpace(string(insOut)), lastDialErr, string(logsOut))
+						}
+					}
+					time.Sleep(250 * time.Millisecond)
+				}
+
+				inspectCmd := exec.Command(dockerPath, "inspect", containerName)
+				insOut, _ := inspectCmd.CombinedOutput()
+				logsCmd := exec.Command(dockerPath, "logs", "--tail", "100", containerName)
+				logsOut, _ := logsCmd.CombinedOutput()
+				t.Fatalf("%s: container %s timed out waiting for readiness on 127.0.0.1:%d after %v (last dial err: %v)\ndocker inspect:\n%s\ndocker logs:\n%s",
+					phase, containerName, port, timeout, lastDialErr, string(insOut), string(logsOut))
+			}
+
+			// Wait for container readiness (up to 30 seconds)
+			waitForReadiness("initial startup", 30*time.Second)
 
 			params := models.VLESSRealityParams{
 				UUID:          clientUUID,
@@ -551,7 +595,7 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 			defer cancel()
 			conn, err := d.DialContext(dialCtx, "tcp", echoAddr)
 			if err != nil {
-				t.Fatalf("DialContext failed against %s: %v", tc.name, err)
+				t.Fatalf("DialContext failed against %s: %v\n%s", tc.name, err, dumpDiagnostics())
 			}
 			payload := []byte(fmt.Sprintf("hello from %s container integration", tc.name))
 			if _, wErr := conn.Write(payload); wErr != nil {
@@ -597,12 +641,12 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 			if out, restErr := restartCmd.CombinedOutput(); restErr != nil {
 				t.Fatalf("docker restart failed: %v, out: %s", restErr, string(out))
 			}
-			time.Sleep(1 * time.Second)
+			waitForReadiness("restart recovery", 30*time.Second)
 			recoveryCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer recCancel()
 			recConn, err := d.DialContext(recoveryCtx, "tcp", echoAddr)
 			if err != nil {
-				t.Fatalf("restart recovery: DialContext failed: %v", err)
+				t.Fatalf("restart recovery: DialContext failed: %v\n%s", err, dumpDiagnostics())
 			}
 			defer recConn.Close()
 			recPayload := []byte("recovery post-restart payload")
