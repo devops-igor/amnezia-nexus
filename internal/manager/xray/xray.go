@@ -11,6 +11,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel/vless"
 )
 
 const (
@@ -107,6 +108,7 @@ func NewXrayManager(pool SSHProvider) *XrayManager {
 		sshPool:        pool,
 		containerCache: newXrayContainerCache(),
 		serverLocks:    awg.GlobalServerLocks(),
+		vlessProbeFn:   vless.ProbeVLESSReality,
 	}
 }
 

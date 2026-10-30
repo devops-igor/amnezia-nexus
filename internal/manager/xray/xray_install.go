@@ -13,6 +13,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/google/uuid"
 )
 
 func extractVLESSOptions(vo any) (portStr, serverName, flow string, flowSpecified bool) {
@@ -257,12 +258,14 @@ func (m *XrayManager) resolveRealityCredentials(
 
 type containerLaunchOptions struct {
 	image            string
+	engineProfile    string
 	existingCfgBytes []byte
 	server           *models.Server
 	portPrimary      int
 	serverName       string
 	pubB64           string
 	shortID          string
+	flow             string
 	clients          []XrayClient
 }
 
@@ -349,14 +352,25 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 	m.mu.Unlock()
 
 	if probeFn != nil && opts.server != nil && opts.portPrimary > 0 {
-		probeParams := models.VLESSRealityParams{
-			PublicKey:  opts.pubB64,
-			ShortID:    opts.shortID,
-			ServerName: opts.serverName,
-		}
+		probeUUID := ""
+		probeFlow := opts.flow
 		if len(opts.clients) > 0 {
-			probeParams.UUID = opts.clients[0].ID
-			probeParams.Flow = opts.clients[0].Flow
+			probeUUID = opts.clients[0].ID
+			if opts.clients[0].Flow != "" {
+				probeFlow = opts.clients[0].Flow
+			}
+		}
+		if probeUUID == "" {
+			probeUUID = uuid.NewString()
+		}
+
+		probeParams := models.VLESSRealityParams{
+			UUID:          probeUUID,
+			Flow:          probeFlow,
+			PublicKey:     opts.pubB64,
+			ShortID:       opts.shortID,
+			ServerName:    opts.serverName,
+			EngineProfile: opts.engineProfile,
 		}
 		endpoint := net.JoinHostPort(opts.server.Host, strconv.Itoa(opts.portPrimary))
 		probeCtx, probeCancel := context.WithTimeout(ctx, 3*time.Second)
@@ -649,12 +663,14 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	// 7. Launch amnezia-xray container with resolved profile image and verify readiness before deleting backup
 	launchOpts := containerLaunchOptions{
 		image:            profile.Image,
+		engineProfile:    string(profile.Name),
 		existingCfgBytes: existingCfgBytes,
 		server:           server,
 		portPrimary:      portPrimary,
 		serverName:       serverName,
 		pubB64:           pubB64,
 		shortID:          shortID,
+		flow:             flow,
 		clients:          clients,
 	}
 	if err := m.launchContainer(ctx, client, launchOpts); err != nil {
