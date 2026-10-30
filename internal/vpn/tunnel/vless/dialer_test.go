@@ -461,3 +461,66 @@ func TestDialer_ServerFirstTCP(t *testing.T) {
 		t.Fatalf("unexpected banner: got %q, want %q", string(buf), banner)
 	}
 }
+
+func TestDialer_ModernPQFingerprintFallback(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	chReceived := make(chan []byte, 1)
+	go func() {
+		c, aErr := ln.Accept()
+		if aErr != nil {
+			return
+		}
+		defer c.Close()
+		buf := make([]byte, 4096)
+		n, _ := c.Read(buf)
+		chReceived <- buf[:n]
+	}()
+
+	params := fixture.Params
+	params.EngineProfile = "modern_pq"
+	params.Fingerprint = "ios" // iOS fingerprint does not have X25519MLKEM768 shares
+
+	d, err := New(ln.Addr().String(), params)
+	if err != nil {
+		t.Fatalf("New dialer: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		_, _ = d.DialContext(ctx, "tcp", "127.0.0.1:80")
+	}()
+
+	var rawHello []byte
+	select {
+	case rawHello = <-chReceived:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for ClientHello")
+	}
+
+	groups, _, _, err := parseClientHelloKeyShares(rawHello)
+	if err != nil {
+		t.Fatalf("parse ClientHello: %v", err)
+	}
+
+	// Verify that X25519MLKEM768 (4588) key share is present despite requesting "ios" fingerprint
+	hasPQShare := false
+	for _, g := range groups {
+		if g == 4588 {
+			hasPQShare = true
+			break
+		}
+	}
+	if !hasPQShare {
+		t.Errorf("expected modern_pq fallback to include group 4588 (X25519MLKEM768), got groups: %v", groups)
+	}
+}

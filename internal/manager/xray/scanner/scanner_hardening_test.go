@@ -222,8 +222,8 @@ func TestScanSNI_PrioritizedRankingGeoAlignedOverAnycastCDN(t *testing.T) {
 	}
 
 	results := []ScanResult{resCDN, resLocal}
-	// Sort per scanner rules
-	sortScanResults(results)
+	// Sort per production scanner ranking rules directly
+	RankScanResults(results)
 
 	if results[0].Domain != localDomain {
 		t.Fatalf("ranking order failed: expected local domain %q to rank first over CDN %q, but got %q",
@@ -236,27 +236,4 @@ func TestScanSNI_PrioritizedRankingGeoAlignedOverAnycastCDN(t *testing.T) {
 
 	_ = geoDB
 	_ = dialContext
-}
-
-// helper sorting function mirroring scanner.go sorting logic
-func sortScanResults(results []ScanResult) {
-	for i := 0; i < len(results); i++ {
-		for j := i + 1; j < len(results); j++ {
-			iOk := results[i].Status == "ok"
-			jOk := results[j].Status == "ok"
-			swap := false
-			if iOk && jOk {
-				if results[i].ProximityScore != results[j].ProximityScore {
-					swap = results[i].ProximityScore < results[j].ProximityScore
-				} else {
-					swap = results[i].RTTMS > results[j].RTTMS
-				}
-			} else if !iOk && jOk {
-				swap = true
-			}
-			if swap {
-				results[i], results[j] = results[j], results[i]
-			}
-		}
-	}
 }

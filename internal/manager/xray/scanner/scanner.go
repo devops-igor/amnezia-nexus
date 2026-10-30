@@ -176,6 +176,25 @@ func ScanSNI(ctx context.Context, serverHost string, opts ScannerOptions) (*Scan
 	}
 
 	// Rank results: "ok" first by proximity score descending, then latency ascending
+	RankScanResults(results)
+
+	scope := "panel_side_proximity"
+	if opts.DialContext != nil {
+		scope = "ssh_tunneled_proximity"
+	}
+	return &ScanReport{
+		Scope:         scope,
+		ServerIP:      serverIP.String(),
+		ServerCountry: serverCountry,
+		ServerASN:     serverASN,
+		Results:       results,
+	}, nil
+}
+
+// RankScanResults sorts scan results in-place per production ranking rules:
+// "ok" status candidates appear first, ordered by ProximityScore descending,
+// then RTTMS ascending. Non-"ok" results follow, ordered alphabetically by domain.
+func RankScanResults(results []ScanResult) {
 	sort.Slice(results, func(i, j int) bool {
 		iOk := results[i].Status == "ok"
 		jOk := results[j].Status == "ok"
@@ -193,18 +212,6 @@ func ScanSNI(ctx context.Context, serverHost string, opts ScannerOptions) (*Scan
 		}
 		return results[i].Domain < results[j].Domain
 	})
-
-	scope := "panel_side_proximity"
-	if opts.DialContext != nil {
-		scope = "ssh_tunneled_proximity"
-	}
-	return &ScanReport{
-		Scope:         scope,
-		ServerIP:      serverIP.String(),
-		ServerCountry: serverCountry,
-		ServerASN:     serverASN,
-		Results:       results,
-	}, nil
 }
 
 func scanCandidateDomain(
