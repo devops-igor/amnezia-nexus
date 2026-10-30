@@ -128,7 +128,8 @@ func isRetryableTLSError(err error) bool {
 	msg := err.Error()
 	return errors.Is(err, io.EOF) ||
 		strings.Contains(msg, "empty response") ||
-		strings.Contains(msg, "connection reset")
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "invalid http response")
 }
 
 func probeTrafficTarget(
@@ -179,6 +180,11 @@ func probeTrafficTarget(
 	}
 	if n == 0 {
 		return 0, errors.New("vless: empty response from target through tunnel")
+	}
+
+	resp := string(buf[:n])
+	if !strings.HasPrefix(resp, "HTTP/1.0 ") && !strings.HasPrefix(resp, "HTTP/1.1 ") && !strings.HasPrefix(resp, "HTTP/2") {
+		return 0, fmt.Errorf("vless: invalid http response status line: %q", strings.SplitN(resp, "\r\n", 2)[0])
 	}
 
 	latencyMS := time.Since(start).Milliseconds()

@@ -22,6 +22,9 @@ type mockXraySSHClient struct {
 	commands           []string
 	files              map[string][]byte
 	dockerAlive        bool
+	existingContainer  *bool
+	hadInitialConfig   bool
+	checkedInitialCfg  bool
 	sshUser            string
 	denyConfigDownload bool
 	denyConfigStat     bool
@@ -58,6 +61,17 @@ func (m *mockXraySSHClient) RunSudoCommand(ctx context.Context, cmd string) (str
 	m.commands = append(m.commands, "sudo: "+cmd)
 
 	if strings.Contains(cmd, "docker inspect") {
+		if strings.Contains(cmd, "{{.State.Running}}") && !strings.Contains(cmd, "{{.State.Restarting}}") {
+			if m.existingContainer != nil {
+				if *m.existingContainer {
+					return "true\n", "", 0, nil
+				}
+				return "", "Error: No such container: amnezia-xray", 1, nil
+			}
+			if m.checkedInitialCfg && !m.hadInitialConfig {
+				return "", "Error: No such container: amnezia-xray", 1, nil
+			}
+		}
 		if m.dockerAlive {
 			return "true false\n", "", 0, nil
 		}
@@ -83,6 +97,10 @@ func (m *mockXraySSHClient) RunSudoCommand(ctx context.Context, cmd string) (str
 	}
 	if strings.HasPrefix(cmd, "test -f ") {
 		path := strings.Trim(strings.TrimPrefix(cmd, "test -f "), "'")
+		if path == XrayConfigPath && !m.checkedInitialCfg {
+			_, m.hadInitialConfig = m.files[path]
+			m.checkedInitialCfg = true
+		}
 		if _, ok := m.files[path]; ok {
 			return "", "", 0, nil
 		}
@@ -147,6 +165,10 @@ func (m *mockXraySSHClient) DownloadSudoFile(ctx context.Context, remotePath str
 func (m *mockXraySSHClient) FileExists(ctx context.Context, remotePath string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if remotePath == XrayConfigPath && !m.checkedInitialCfg {
+		_, m.hadInitialConfig = m.files[remotePath]
+		m.checkedInitialCfg = true
+	}
 	if m.denyConfigStat && remotePath == XrayConfigPath {
 		return false, os.ErrPermission
 	}

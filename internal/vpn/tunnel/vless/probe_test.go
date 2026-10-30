@@ -176,23 +176,120 @@ func TestProbeVLESSReality_Failures(t *testing.T) {
 	})
 }
 
+func startHTTPMockServer(t *testing.T, responseBytes []byte) (string, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen tcp http mock: %v", err)
+	}
+	closeChan := make(chan struct{})
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				_, _ = c.Read(buf)
+				_, _ = c.Write(responseBytes)
+			}(conn)
+		}
+	}()
+	return ln.Addr().String(), func() {
+		close(closeChan)
+		_ = ln.Close()
+	}
+}
+
 func TestProbeVLESSTraffic_Success(t *testing.T) {
 	fixture := setupTestServer(t, "", 0)
 	defer fixture.ServerClose()
 
-	echoAddr, cleanupEcho := startTCPEchoServer(t)
-	defer cleanupEcho()
+	httpAddr, cleanupHTTP := startHTTPMockServer(t, []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+	defer cleanupHTTP()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	latencyMS, err := ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, echoAddr, 3*time.Second)
+	latencyMS, err := ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, httpAddr, 3*time.Second)
 	if err != nil {
 		t.Fatalf("ProbeVLESSTrafficWithTarget failed: %v", err)
 	}
 
 	if latencyMS < 1 {
 		t.Fatalf("expected latencyMS >= 1, got %d", latencyMS)
+	}
+}
+
+func TestProbeVLESSTraffic_HTTPResponseValidation(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	tests := []struct {
+		name       string
+		response   []byte
+		expectErr  bool
+		errContain string
+	}{
+		{
+			name:      "HTTP/1.0 200 OK",
+			response:  []byte("HTTP/1.0 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+			expectErr: false,
+		},
+		{
+			name:      "HTTP/1.1 204 No Content",
+			response:  []byte("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"),
+			expectErr: false,
+		},
+		{
+			name:      "HTTP/2 200",
+			response:  []byte("HTTP/2 200\r\n\r\n"),
+			expectErr: false,
+		},
+		{
+			name:       "TLS alert record bytes",
+			response:   []byte("\x15\x03\x03\x00\x02\x02\x32"),
+			expectErr:  true,
+			errContain: "invalid http response status line",
+		},
+		{
+			name:       "arbitrary garbled stream",
+			response:   []byte("SOMERANDOMSTRING 12345\r\n"),
+			expectErr:  true,
+			errContain: "invalid http response status line",
+		},
+		{
+			name:       "request echoed back",
+			response:   []byte("HEAD / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+			expectErr:  true,
+			errContain: "invalid http response status line",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr, cleanup := startHTTPMockServer(t, tt.response)
+			defer cleanup()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			_, err := ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, addr, 2*time.Second)
+			if tt.expectErr {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.errContain)
+				}
+				if !strings.Contains(err.Error(), tt.errContain) {
+					t.Fatalf("expected error containing %q, got: %v", tt.errContain, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+		})
 	}
 }
 
