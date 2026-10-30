@@ -244,30 +244,7 @@ func extractClientIDFromManagerResult(proto string, res map[string]any) string {
 }
 
 func extractClientIDFromProtocolParams(proto string, params json.RawMessage) string {
-	if len(params) == 0 {
-		return ""
-	}
-	switch proto {
-	case models.ProtocolVLESS:
-		var vless models.VLESSRealityParams
-		if err := json.Unmarshal(params, &vless); err == nil && vless.UUID != "" {
-			return vless.UUID
-		}
-	case models.ProtocolNaive:
-		var naive models.NaiveProxyParams
-		if err := json.Unmarshal(params, &naive); err == nil && naive.Username != "" {
-			return naive.Username
-		}
-	}
-	var raw map[string]any
-	if err := json.Unmarshal(params, &raw); err == nil {
-		for _, k := range []string{"username", "client_id", "clientId", "uuid"} {
-			if v, ok := raw[k].(string); ok && v != "" {
-				return v
-			}
-		}
-	}
-	return ""
+	return vpn.ExtractClientIDFromProtocolParams(proto, params)
 }
 
 func (h *Handlers) isMultiProtocolEnabled(ctx context.Context) bool {
@@ -540,6 +517,18 @@ func (h *Handlers) VPNDeleteBackendHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	ctx := r.Context()
+	if h.db != nil {
+		if tunnels, err := h.db.GetBackendTunnelsByServerID(ctx, serverID); err == nil && len(tunnels) > 0 {
+			for i := range tunnels {
+				if pErr := vpn.EnsureBackendProxyPeerPreservation(ctx, h.db, serverID, tunnels[i].Protocol, tunnels[i].ProtocolParams); pErr != nil {
+					// #nosec G706 -- Internal server audit log for failed backend peer preservation
+					log.Printf("[vpn/handlers] failed to preserve peer lifecycle before backend delete %d: %v", serverID, pErr)
+					h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to preserve backend peer ownership")
+					return
+				}
+			}
+		}
+	}
 	if h.vpnSvc != nil {
 		if err := h.vpnSvc.DeleteBackend(ctx, serverID); err != nil {
 			if errors.Is(err, vpn.ErrBackendTunnelNotFound) {
