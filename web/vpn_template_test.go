@@ -198,7 +198,8 @@ func validateScriptElement(s *html.Node, expectedSrc string) error {
 		return fmt.Errorf("script missing src attribute, expected %q", expectedSrc)
 	}
 	src, _ := getAttr(s, "src")
-	if src != expectedSrc {
+	srcBase := strings.Split(src, "?")[0]
+	if srcBase != expectedSrc {
 		return fmt.Errorf("expected src %q, got %q", expectedSrc, src)
 	}
 	body := strings.TrimSpace(getNodeText(s))
@@ -529,7 +530,7 @@ func TestRenderedVPNTemplateRejectPreBootstrapMutants(t *testing.T) {
 
 	t.Run("CoreScriptOrderSwapped", func(t *testing.T) {
 		s1 := `<script src="/static/js/qrcode.min.js"></script>`
-		s2 := `<script src="/static/js/api.js"></script>`
+		s2 := `<script src="/static/js/api.js?v=2.5.0"></script>`
 		mutated := strings.Replace(rendered, s1, "__PLACEHOLDER__", 1)
 		mutated = strings.Replace(mutated, s2, s1, 1)
 		mutated = strings.Replace(mutated, "__PLACEHOLDER__", s2, 1)
