@@ -525,6 +525,48 @@ func setProtocolPortFallback(protoMeta map[string]any, requestPort string) {
 	}
 }
 
+func buildInstallParams(req *models.InstallProtocolRequest) map[string]any {
+	params := map[string]any{
+		"port": req.Port,
+	}
+	if req.EngineProfile != "" {
+		params["engine_profile"] = req.EngineProfile
+	}
+	if req.TLSEmulation != nil {
+		params["tls_emulation"] = *req.TLSEmulation
+	}
+	if req.TLSDomain != nil {
+		params["tls_domain"] = *req.TLSDomain
+	}
+	if req.MaxConnections != nil {
+		params["max_connections"] = *req.MaxConnections
+	}
+	if req.AWGProfile != nil {
+		params["awg_profile"] = string(*req.AWGProfile)
+	}
+	if req.AWGCPSProtocol != nil {
+		params["awg_cps_protocol"] = *req.AWGCPSProtocol
+	}
+	if req.AWGHeaderProtection != nil {
+		params["awg_header_protection"] = *req.AWGHeaderProtection
+	}
+	if req.VLESSOptions != nil {
+		params["vless_options"] = req.VLESSOptions
+		if req.VLESSOptions.FlowSet {
+			params["flow"] = req.VLESSOptions.Flow
+		}
+		if req.VLESSOptions.EngineProfile != "" {
+			if _, ok := params["engine_profile"]; !ok {
+				params["engine_profile"] = req.VLESSOptions.EngineProfile
+			}
+		}
+	}
+	if req.NaiveOptions != nil {
+		params["naive_options"] = req.NaiveOptions
+	}
+	return params
+}
+
 // InstallProtocolHandler deploys a VPN protocol backend to the remote server.
 func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request) {
 	serverID, err := parseServerID(r)
@@ -571,36 +613,7 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	params := map[string]any{
-		"port": req.Port,
-	}
-	if req.TLSEmulation != nil {
-		params["tls_emulation"] = *req.TLSEmulation
-	}
-	if req.TLSDomain != nil {
-		params["tls_domain"] = *req.TLSDomain
-	}
-	if req.MaxConnections != nil {
-		params["max_connections"] = *req.MaxConnections
-	}
-	if req.AWGProfile != nil {
-		params["awg_profile"] = string(*req.AWGProfile)
-	}
-	if req.AWGCPSProtocol != nil {
-		params["awg_cps_protocol"] = *req.AWGCPSProtocol
-	}
-	if req.AWGHeaderProtection != nil {
-		params["awg_header_protection"] = *req.AWGHeaderProtection
-	}
-	if req.VLESSOptions != nil {
-		params["vless_options"] = req.VLESSOptions
-		if req.VLESSOptions.FlowSet {
-			params["flow"] = req.VLESSOptions.Flow
-		}
-	}
-	if req.NaiveOptions != nil {
-		params["naive_options"] = req.NaiveOptions
-	}
+	params := buildInstallParams(&req)
 
 	if err := protoMgr.Install(ctx, server, params); err != nil {
 		slog.Error("protocol install failed", "server_id", serverID, "protocol", req.Protocol, "port", req.Port, "err", err)

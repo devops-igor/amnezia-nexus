@@ -143,6 +143,7 @@ func TestDialer_ClientHelloHybridPostQuantumKeyShares(t *testing.T) {
 	}()
 
 	params := fixture.Params
+	params.EngineProfile = "modern_pq"
 	d, err := New(ln.Addr().String(), params)
 	if err != nil {
 		t.Fatalf("New dialer: %v", err)
@@ -318,6 +319,7 @@ func TestDialer_XrayV26_StrictPQHandshakeAndDataStream(t *testing.T) {
 	}()
 
 	params := fixture.Params
+	params.EngineProfile = "modern_pq"
 	d, err := New(proxyLn.Addr().String(), params)
 	if err != nil {
 		t.Fatalf("New dialer: %v", err)

@@ -215,10 +215,11 @@ func (r *UpdateServerHostRequest) Validate() error {
 
 // VLESSInstallOptions defines installation parameters specific to VLESS+REALITY.
 type VLESSInstallOptions struct {
-	Port       string `json:"port,omitempty"`
-	ServerName string `json:"server_name,omitempty"`
-	Flow       string `json:"flow"`
-	FlowSet    bool   `json:"-"`
+	Port          string `json:"port,omitempty"`
+	ServerName    string `json:"server_name,omitempty"`
+	Flow          string `json:"flow"`
+	FlowSet       bool   `json:"-"`
+	EngineProfile string `json:"engine_profile,omitempty"`
 }
 
 // UnmarshalJSON preserves awareness of whether the "flow" field was explicitly present in the JSON payload.
@@ -258,6 +259,7 @@ type InstallProtocolRequest struct {
 	AWGHeaderProtection *bool                  `json:"awg_header_protection,omitempty"`
 	VLESSOptions        *VLESSInstallOptions   `json:"vless_options,omitempty"`
 	NaiveOptions        *NaiveInstallOptions   `json:"naive_options,omitempty"`
+	EngineProfile       string                 `json:"engine_profile,omitempty"`
 }
 
 func (r *InstallProtocolRequest) Validate() error {

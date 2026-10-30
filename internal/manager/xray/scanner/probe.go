@@ -126,6 +126,17 @@ func ProbeTLSH2(ctx context.Context, domain string, opts ProbeOptions) ProbeResu
 	// Curve inspection: REALITY strictly requires X25519 key exchange support.
 	// Reject candidates that negotiate NIST CurveP256 or any other non-X25519 curve.
 	if !isX25519 {
+		// If the server selected a non-X25519 curve (e.g. CurveP256 due to server curve preference),
+		// verify whether it actually supports X25519 when offered exclusively.
+		if len(opts.CurvePreferences) == 0 {
+			retryOpts := opts
+			retryOpts.CurvePreferences = []tls.CurveID{tls.X25519}
+			retryRes := ProbeTLSH2(ctx, domain, retryOpts)
+			if retryRes.Error == "" && retryRes.X25519 {
+				return retryRes
+			}
+		}
+
 		errMsg := fmt.Sprintf("negotiated unsupported curve %v (requires X25519)", cs.CurveID)
 		if cs.CurveID == tls.CurveP256 {
 			errMsg = "negotiated NIST CurveP256 without X25519 support"

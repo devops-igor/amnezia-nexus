@@ -106,14 +106,16 @@ func extractProxyParamsFromManagerResult(proto string, res map[string]any) json.
 		if serverName == "" {
 			serverName = "gateway.icloud.com"
 		}
+		engineProfile, _ := res["engine_profile"].(string)
 		p := models.VLESSRealityParams{
-			UUID:        uid,
-			Flow:        flow,
-			PublicKey:   pubKey,
-			ShortID:     shortID,
-			ServerName:  serverName,
-			Fingerprint: "chrome",
-			Transport:   "tcp",
+			UUID:          uid,
+			Flow:          flow,
+			PublicKey:     pubKey,
+			ShortID:       shortID,
+			ServerName:    serverName,
+			Fingerprint:   "chrome",
+			Transport:     "tcp",
+			EngineProfile: engineProfile,
 		}
 		b, _ := json.Marshal(p)
 		return b
