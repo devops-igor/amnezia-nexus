@@ -3,18 +3,31 @@
 package vless
 
 import (
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/ecdh"
+	"crypto/ed25519"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/sha512"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/sagernet/sing-box/common/tls"
-	"github.com/sagernet/sing-box/option"
+	utls "github.com/metacubex/utls"
+	"golang.org/x/crypto/hkdf"
+
 	"github.com/sagernet/sing-vmess/vless"
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/metadata"
@@ -25,10 +38,94 @@ import (
 // Dialer connects to a VLESS+REALITY endpoint and establishes encrypted streams
 // satisfying streambridge.StreamDialer.
 type Dialer struct {
-	endpoint string
-	tlsCfg   tls.Config
-	client   *vless.Client
-	nd       net.Dialer
+	endpoint      string
+	client        *vless.Client
+	nd            net.Dialer
+	serverName    string
+	fingerprint   string
+	realityPubKey []byte
+	shortID       [8]byte
+}
+
+type realityVerifier struct {
+	uConn      *utls.UConn
+	serverName string
+	authKey    []byte
+	verified   bool
+}
+
+func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+	if len(rawCerts) == 0 {
+		return errors.New("vless: no peer certificate")
+	}
+	cert, err := x509.ParseCertificate(rawCerts[0])
+	if err != nil {
+		return err
+	}
+	if pub, ok := cert.PublicKey.(ed25519.PublicKey); ok && len(c.authKey) > 0 {
+		h := hmac.New(sha512.New, c.authKey)
+		h.Write(pub)
+		if bytes.Equal(h.Sum(nil), cert.Signature) {
+			c.verified = true
+			return nil
+		}
+	}
+	opts := x509.VerifyOptions{
+		DNSName:       c.serverName,
+		Intermediates: x509.NewCertPool(),
+	}
+	for _, certBytes := range rawCerts[1:] {
+		if intermediate, err := x509.ParseCertificate(certBytes); err == nil {
+			opts.Intermediates.AddCert(intermediate)
+		}
+	}
+	if _, err := cert.Verify(opts); err != nil {
+		return err
+	}
+	return nil
+}
+
+type realityClientConnWrapper struct {
+	*utls.UConn
+}
+
+func (c *realityClientConnWrapper) Upstream() any {
+	return c.UConn
+}
+
+func (c *realityClientConnWrapper) CloseWrite() error {
+	return c.Close()
+}
+
+func (c *realityClientConnWrapper) ReaderReplaceable() bool {
+	return true
+}
+
+func (c *realityClientConnWrapper) WriterReplaceable() bool {
+	return false
+}
+
+func parseClientHelloID(fp string) utls.ClientHelloID {
+	switch strings.ToLower(strings.TrimSpace(fp)) {
+	case "firefox", "firefox_auto", "firefox_120":
+		return utls.HelloFirefox_Auto
+	case "safari", "safari_auto", "safari_16_0":
+		return utls.HelloSafari_Auto
+	case "ios", "ios_auto", "ios_14":
+		return utls.HelloIOS_Auto
+	case "edge", "edge_auto", "edge_85":
+		return utls.HelloEdge_Auto
+	case "random", "randomized":
+		return utls.HelloRandomized
+	case "360", "hello_360":
+		return utls.Hello360_Auto
+	case "qq", "hello_qq":
+		return utls.HelloQQ_Auto
+	case "android", "android_auto":
+		return utls.HelloAndroid_11_OkHttp
+	default:
+		return utls.HelloChrome_Auto
+	}
 }
 
 // New constructs a new VLESS+REALITY Dialer with defensive input validation.
@@ -53,9 +150,10 @@ func New(endpoint string, p models.VLESSRealityParams) (*Dialer, error) {
 	if len(p.ShortID) > 16 {
 		return nil, errors.New("vless: short_id exceeds 16 hex characters")
 	}
+	var shortIDBytes [8]byte
 	if len(p.ShortID) > 0 {
-		var sid [8]byte
-		if _, err := hex.Decode(sid[:], []byte(p.ShortID)); err != nil {
+		decodedLen, err := hex.Decode(shortIDBytes[:], []byte(p.ShortID))
+		if err != nil || decodedLen > 8 {
 			return nil, fmt.Errorf("vless: invalid short_id: %w", err)
 		}
 	}
@@ -75,7 +173,6 @@ func New(endpoint string, p models.VLESSRealityParams) (*Dialer, error) {
 	if len(pubKeyBytes) != 32 {
 		return nil, errors.New("vless: public_key must be 32 bytes")
 	}
-	normPubKey := base64.RawURLEncoding.EncodeToString(pubKeyBytes)
 
 	switch p.Flow {
 	case "", "xtls-rprx-vision":
@@ -88,39 +185,24 @@ func New(endpoint string, p models.VLESSRealityParams) (*Dialer, error) {
 		fp = "chrome"
 	}
 
-	tlsOpts := option.OutboundTLSOptions{
-		Enabled:    true,
-		ServerName: p.ServerName,
-		UTLS: &option.OutboundUTLSOptions{
-			Enabled:     true,
-			Fingerprint: fp,
-		},
-		Reality: &option.OutboundRealityOptions{
-			Enabled:   true,
-			PublicKey: normPubKey,
-			ShortID:   p.ShortID,
-		},
-	}
-
-	tlsCfg, err := tls.NewClient(context.Background(), nil, host, tlsOpts)
-	if err != nil {
-		return nil, fmt.Errorf("vless: tls client config: %w", err)
-	}
-
 	vlessClient, err := vless.NewClient(parsedUUID.String(), p.Flow, logger.NOP())
 	if err != nil {
 		return nil, fmt.Errorf("vless: vless client: %w", err)
 	}
 
 	return &Dialer{
-		endpoint: endpoint,
-		tlsCfg:   tlsCfg,
-		client:   vlessClient,
-		nd:       net.Dialer{},
+		endpoint:      endpoint,
+		client:        vlessClient,
+		nd:            net.Dialer{},
+		serverName:    p.ServerName,
+		fingerprint:   fp,
+		realityPubKey: pubKeyBytes,
+		shortID:       shortIDBytes,
 	}, nil
 }
 
-// handshake connects to the endpoint and executes the REALITY TLS handshake.
+// handshake connects to the endpoint and executes the REALITY TLS handshake using metacubex/utls,
+// sending both X25519MLKEM768 and X25519 key shares.
 // Shared by DialContext and probeVLESSReality.
 func (d *Dialer) handshake(ctx context.Context) (net.Conn, time.Duration, error) {
 	start := time.Now()
@@ -134,13 +216,136 @@ func (d *Dialer) handshake(ctx context.Context) (net.Conn, time.Duration, error)
 	})
 	defer stop()
 
-	tc, err := tls.ClientHandshake(ctx, raw, d.tlsCfg)
+	helloID := parseClientHelloID(d.fingerprint)
+	verifier := &realityVerifier{
+		serverName: d.serverName,
+	}
+
+	uConfig := &utls.Config{
+		ServerName:             d.serverName,
+		InsecureSkipVerify:     true,
+		SessionTicketsDisabled: true,
+		VerifyPeerCertificate:  verifier.VerifyPeerCertificate,
+		NextProtos:             []string{"h2", "http/1.1"},
+	}
+
+	uConn := utls.UClient(raw, uConfig, helloID)
+	verifier.uConn = uConn
+
+	if err := uConn.BuildHandshakeState(); err != nil {
+		_ = raw.Close()
+		return nil, 0, fmt.Errorf("vless: build handshake state: %w", err)
+	}
+
+	// Verify hybrid post-quantum key shares are intact (never stripped).
+	// If the chosen fingerprint does not carry an X25519MLKEM768 share,
+	// fall back to HelloChrome_Auto to guarantee hybrid X25519MLKEM768 + X25519 key shares.
+	hasPQShare := false
+	for _, ext := range uConn.Extensions {
+		if ks, ok := ext.(*utls.KeyShareExtension); ok {
+			for _, share := range ks.KeyShares {
+				if share.Group == utls.X25519MLKEM768 {
+					hasPQShare = true
+					break
+				}
+			}
+		}
+	}
+	if !hasPQShare {
+		uConn = utls.UClient(raw, uConfig, utls.HelloChrome_Auto)
+		verifier.uConn = uConn
+		if err := uConn.BuildHandshakeState(); err != nil {
+			_ = raw.Close()
+			return nil, 0, fmt.Errorf("vless: build hybrid handshake state: %w", err)
+		}
+	}
+
+	for _, extension := range uConn.Extensions {
+		if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
+			alpnExtension.AlpnProtocols = []string{"h2", "http/1.1"}
+			break
+		}
+	}
+
+	keys := uConn.HandshakeState.State13.KeyShareKeys
+	if keys == nil {
+		_ = raw.Close()
+		return nil, 0, errors.New("vless: nil KeyShareKeys")
+	}
+
+	var ecdheKey *ecdh.PrivateKey
+	if keys.Ecdhe != nil {
+		ecdheKey = keys.Ecdhe
+	} else if keys.MlkemEcdhe != nil {
+		ecdheKey = keys.MlkemEcdhe
+	}
+	if ecdheKey == nil {
+		_ = raw.Close()
+		return nil, 0, errors.New("vless: nil ecdheKey")
+	}
+
+	serverPubKey, err := ecdh.X25519().NewPublicKey(d.realityPubKey)
 	if err != nil {
+		_ = raw.Close()
+		return nil, 0, fmt.Errorf("vless: invalid server reality public key: %w", err)
+	}
+
+	authKey, err := ecdheKey.ECDH(serverPubKey)
+	if err != nil || authKey == nil {
+		_ = raw.Close()
+		return nil, 0, fmt.Errorf("vless: ecdh key exchange: %w", err)
+	}
+
+	hello := uConn.HandshakeState.Hello
+	hello.SessionId = make([]byte, 32)
+	copy(hello.Raw[39:], hello.SessionId)
+
+	nowTime := time.Now()
+	nowSec := nowTime.Unix()
+	if nowSec < 0 {
+		nowSec = 0
+	}
+	// #nosec G115 -- unix timestamp is validated non-negative
+	binary.BigEndian.PutUint64(hello.SessionId, uint64(nowSec))
+	hello.SessionId[0] = 1
+	hello.SessionId[1] = 8
+	hello.SessionId[2] = 1
+	// #nosec G115 -- REALITY protocol mandates 32-bit big-endian timestamp field
+	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(uint64(nowSec)&0xFFFFFFFF))
+	copy(hello.SessionId[8:], d.shortID[:])
+
+	hkdfReader := hkdf.New(sha256.New, authKey, hello.Random[:20], []byte("REALITY"))
+	derivedAuthKey := make([]byte, len(authKey))
+	if _, err := io.ReadFull(hkdfReader, derivedAuthKey); err != nil {
+		_ = raw.Close()
+		return nil, 0, fmt.Errorf("vless: hkdf derive auth key: %w", err)
+	}
+	verifier.authKey = derivedAuthKey
+
+	aesBlock, err := aes.NewCipher(derivedAuthKey)
+	if err != nil {
+		_ = raw.Close()
+		return nil, 0, fmt.Errorf("vless: aes cipher: %w", err)
+	}
+	aesGcmCipher, err := cipher.NewGCM(aesBlock)
+	if err != nil {
+		_ = raw.Close()
+		return nil, 0, fmt.Errorf("vless: aes-gcm cipher: %w", err)
+	}
+	aesGcmCipher.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
+	copy(hello.Raw[39:], hello.SessionId)
+
+	if err := uConn.HandshakeContext(ctx); err != nil {
 		_ = raw.Close()
 		return nil, 0, fmt.Errorf("vless: reality handshake: %w", err)
 	}
 
-	return tc, time.Since(start), nil
+	if !verifier.verified {
+		_ = uConn.Close()
+		return nil, 0, errors.New("vless: reality verification failed")
+	}
+
+	return &realityClientConnWrapper{UConn: uConn}, time.Since(start), nil
 }
 
 // DialContext establishes an encrypted VLESS connection over REALITY TLS to the target address.

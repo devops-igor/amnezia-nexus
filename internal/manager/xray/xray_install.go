@@ -29,7 +29,7 @@ func extractVLESSOptions(vo any) (portStr, serverName, flow string, flowSpecifie
 	return "", "", "", false
 }
 
-func parseXrayInstallOptions(params map[string]any) (int, string, string) {
+func resolveInstallNetworkOptions(params map[string]any) (int, string, string) {
 	portPrimary := 443
 	if p, ok := params["port"]; ok && fmt.Sprint(p) != "" {
 		if pInt, err := strconv.Atoi(fmt.Sprint(p)); err == nil && pInt > 0 {
@@ -60,6 +60,44 @@ func parseXrayInstallOptions(params map[string]any) (int, string, string) {
 		flow = ""
 	}
 	return portPrimary, serverName, flow
+}
+
+func resolveInstallProfileParam(params map[string]any, server *models.Server) string {
+	keys := []string{"engine_profile", "profile", "engine_version"}
+	for _, k := range keys {
+		if p, ok := params[k]; ok && fmt.Sprint(p) != "" {
+			return fmt.Sprint(p)
+		}
+	}
+	if vo, ok := params["vless_options"]; ok && vo != nil {
+		if vm, ok := vo.(map[string]any); ok {
+			for _, k := range []string{"engine_profile", "profile"} {
+				if p, ok := vm[k]; ok && fmt.Sprint(p) != "" {
+					return fmt.Sprint(p)
+				}
+			}
+		}
+	}
+	if server != nil && server.Protocols != nil {
+		if vMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any); ok {
+			for _, k := range []string{"engine_profile", "engine_version"} {
+				if val, ok := vMeta[k].(string); ok && val != "" {
+					return val
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func parseXrayInstallOptions(params map[string]any, server *models.Server) (int, string, string, EngineProfileInfo, error) {
+	portPrimary, serverName, flow := resolveInstallNetworkOptions(params)
+	profileParam := resolveInstallProfileParam(params, server)
+	profile, err := ResolveEngineProfile(profileParam)
+	if err != nil {
+		return 0, "", "", EngineProfileInfo{}, err
+	}
+	return portPrimary, serverName, flow, profile, nil
 }
 
 func (m *XrayManager) resolveRealityCredentials(
@@ -156,12 +194,12 @@ func (m *XrayManager) resolveRealityCredentials(
 	return privB64, pubB64, shortID, shortIDs, clients, nil
 }
 
-func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient) error {
+func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient, image string) error {
 	stopCmd := fmt.Sprintf("docker stop %s 2>/dev/null || true; docker rm -fv %s 2>/dev/null || true",
 		ssh.EscapeShellArg(XrayContainerName), ssh.EscapeShellArg(XrayContainerName))
 	_, _, _, _ = client.RunSudoCommand(ctx, stopCmd)
 
-	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker pull %s 2>/dev/null || true", ssh.EscapeShellArg(XrayBaseImage)))
+	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker pull %s 2>/dev/null || true", ssh.EscapeShellArg(image)))
 
 	runCmd := fmt.Sprintf(`docker run -d \
 --name %s \
@@ -180,7 +218,7 @@ func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient)
 		ssh.EscapeShellArg(XrayContainerName),
 		ssh.EscapeShellArg(XrayConfigDir),
 		ssh.EscapeShellArg(XrayConfigDir),
-		ssh.EscapeShellArg(XrayBaseImage),
+		ssh.EscapeShellArg(image),
 	)
 
 	if _, errOut, code, err := client.RunSudoCommand(ctx, runCmd); err != nil || code != 0 {
@@ -218,8 +256,11 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 		return errors.New("docker is not installed on the remote server")
 	}
 
-	// 2. Parse installation options
-	portPrimary, serverName, flow := parseXrayInstallOptions(params)
+	// 2. Parse installation options and resolve engine profile
+	portPrimary, serverName, flow, profile, err := parseXrayInstallOptions(params, server)
+	if err != nil {
+		return err
+	}
 
 	// 3. Generate or preserve REALITY cryptographic credentials and existing clients
 	privB64, pubB64, shortID, shortIDs, clients, err := m.resolveRealityCredentials(ctx, client)
@@ -245,24 +286,37 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 		return fmt.Errorf("upload xray config: %w", err)
 	}
 
-	// 6. Launch amnezia-xray container
-	if err := m.launchContainer(ctx, client); err != nil {
+	// 6. Launch amnezia-xray container with resolved profile image
+	if err := m.launchContainer(ctx, client, profile.Image); err != nil {
 		return err
 	}
 
 	m.containerCache.set(m.containerCache.keyForServer(server), true)
+
+	// Determine running engine version from container inspect/exec
+	runningVersion := profile.Version
+	verCmd := fmt.Sprintf("docker exec %s xray version 2>/dev/null", ssh.EscapeShellArg(XrayContainerName))
+	if verOut, _, code, err := client.RunSudoCommand(ctx, verCmd); err == nil && code == 0 && strings.TrimSpace(verOut) != "" {
+		if fields := strings.Fields(strings.TrimSpace(verOut)); len(fields) >= 2 && strings.EqualFold(fields[0], "Xray") {
+			runningVersion = fields[1]
+		}
+	}
 
 	// Update server.Protocols in-memory for caller awareness
 	if server.Protocols == nil {
 		server.Protocols = make(map[string]any)
 	}
 	server.Protocols[models.ProtocolVLESS] = map[string]any{
-		"installed":   true,
-		"port":        portPrimary,
-		"server_name": serverName,
-		"public_key":  pubB64,
-		"short_id":    shortID,
-		"flow":        flow,
+		"installed":              true,
+		"port":                   portPrimary,
+		"server_name":            serverName,
+		"public_key":             pubB64,
+		"short_id":               shortID,
+		"flow":                   flow,
+		"engine_profile":         string(profile.Name),
+		"engine_version":         profile.Version,
+		"engine_image":           profile.Image,
+		"running_engine_version": runningVersion,
 	}
 
 	return nil
