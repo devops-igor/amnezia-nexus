@@ -486,7 +486,7 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 							"clients": []any{
 								map[string]any{
 									"id":   clientUUID,
-									"flow": "xtls-rprx-vision",
+									"flow": "",
 								},
 							},
 							"decryption": "none",
@@ -591,7 +591,7 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 
 			params := models.VLESSRealityParams{
 				UUID:          clientUUID,
-				Flow:          "xtls-rprx-vision",
+				Flow:          "",
 				ServerName:    serverName,
 				Fingerprint:   "chrome",
 				PublicKey:     pubB64,
