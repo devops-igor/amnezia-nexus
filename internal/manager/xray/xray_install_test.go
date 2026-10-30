@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"reflect"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/google/uuid"
 )
 
 func TestXrayManagerReinstallPreservesEmptyFirstShortIDs(t *testing.T) {
@@ -538,5 +540,221 @@ func TestXrayManagerLaunchContainer_FailedHandshakeRollback(t *testing.T) {
 	}
 	if len(parsed.Inbounds) == 0 || parsed.Inbounds[0].Port != 8443 {
 		t.Errorf("expected restored port 8443, got %+v", parsed.Inbounds)
+	}
+}
+
+func TestXrayManager_DefaultConstructor_AuthenticatesReadinessAndRollsBackOnFailure(t *testing.T) {
+	mockSSH := newMockXraySSHClient()
+	// Default construction without test-only setters wires production REALITY probe (vless.ProbeVLESSReality).
+	mgr := NewXrayManager(&mockXrayPool{client: mockSSH})
+
+	// Allocate a local port and immediately close the listener to ensure a closed TCP port.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedPort := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+
+	server := &models.Server{
+		ID:   801,
+		Host: "127.0.0.1",
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{
+				"installed":      true,
+				"port":           closedPort,
+				"engine_profile": "legacy",
+			},
+		},
+	}
+	ctx := context.Background()
+
+	key, _, err := GenerateRealityKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialConfig, err := RenderXrayConfig(closedPort, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
+		{ID: "e8512bce-e575-4805-a678-1d64c033e83e", Flow: "xtls-rprx-vision", Email: "retained"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), initialConfig...)
+
+	err = mgr.Install(ctx, server, map[string]any{
+		"engine_profile": "modern_pq",
+		"port":           closedPort,
+	})
+	if err == nil {
+		t.Fatalf("expected Install with default constructor to fail due to failed handshake probe on closed port")
+	}
+	if !strings.Contains(err.Error(), "failed REALITY handshake readiness probe") {
+		t.Errorf("expected error mentioning failed REALITY handshake readiness probe, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "rolled back to previous container") {
+		t.Errorf("expected error mentioning rolled back to previous container, got: %v", err)
+	}
+
+	// Verify rollback restored previous container and initial config
+	foundRestoreRename := false
+	foundRestoreStart := false
+	for _, cmd := range mockSSH.commands {
+		if strings.Contains(cmd, "docker rename") && strings.Contains(cmd, "amnezia-xray-backup") && strings.Contains(cmd, "amnezia-xray") {
+			foundRestoreRename = true
+		}
+		if strings.Contains(cmd, "docker start") && strings.Contains(cmd, "amnezia-xray") {
+			foundRestoreStart = true
+		}
+	}
+	if !foundRestoreRename {
+		t.Errorf("expected docker rename amnezia-xray-backup amnezia-xray in rollback, commands: %v", mockSSH.commands)
+	}
+	if !foundRestoreStart {
+		t.Errorf("expected docker start amnezia-xray in rollback, commands: %v", mockSSH.commands)
+	}
+	if !bytes.Equal(mockSSH.files[XrayConfigPath], initialConfig) {
+		t.Errorf("rollback failed to restore initial configuration bytes on failed handshake")
+	}
+}
+
+func TestXrayManager_ProbeParams_ForwardsEngineProfile(t *testing.T) {
+	tests := []struct {
+		name          string
+		installParams map[string]any
+		wantProfile   string
+	}{
+		{
+			name:          "modern_pq explicitly requested",
+			installParams: map[string]any{"engine_profile": "modern_pq", "port": 8443},
+			wantProfile:   "modern_pq",
+		},
+		{
+			name:          "legacy explicitly requested",
+			installParams: map[string]any{"engine_profile": "legacy", "port": 8443},
+			wantProfile:   "legacy",
+		},
+		{
+			name:          "unprofiled defaults to legacy baseline",
+			installParams: map[string]any{"port": 8443},
+			wantProfile:   "legacy",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockSSH := newMockXraySSHClient()
+			mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+
+			var captured models.VLESSRealityParams
+			probeCalled := false
+			mgr.SetVLESSProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+				probeCalled = true
+				captured = params
+				return 10, nil
+			})
+
+			server := &models.Server{ID: 901, Host: "192.0.2.91"}
+			ctx := context.Background()
+
+			key, _, err := GenerateRealityKeypair()
+			if err != nil {
+				t.Fatal(err)
+			}
+			initialConfig, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
+				{ID: "a1b2c3d4-e5f6-4a1b-8c2d-3e4f5a6b7c8d", Flow: "xtls-rprx-vision", Email: "user1"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mockSSH.files[XrayConfigPath] = append([]byte(nil), initialConfig...)
+
+			if err := mgr.Install(ctx, server, tt.installParams); err != nil {
+				t.Fatalf("Install: %v", err)
+			}
+
+			if !probeCalled {
+				t.Fatal("expected readiness probe to be called")
+			}
+			if captured.EngineProfile != tt.wantProfile {
+				t.Errorf("probeParams.EngineProfile = %q, want %q", captured.EngineProfile, tt.wantProfile)
+			}
+			if captured.UUID != "a1b2c3d4-e5f6-4a1b-8c2d-3e4f5a6b7c8d" {
+				t.Errorf("probeParams.UUID = %q, want user1 UUID", captured.UUID)
+			}
+			if captured.ServerName != "example.com" {
+				t.Errorf("probeParams.ServerName = %q, want example.com", captured.ServerName)
+			}
+		})
+	}
+}
+
+func TestXrayManager_FreshInstallWithoutClients_Succeeds(t *testing.T) {
+	mockSSH := newMockXraySSHClient()
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+
+	var captured models.VLESSRealityParams
+	probeCalled := false
+	mgr.SetVLESSProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		probeCalled = true
+		captured = params
+		return 15, nil
+	})
+
+	server := &models.Server{ID: 902, Host: "192.0.2.92"}
+	ctx := context.Background()
+
+	// Fresh install: no pre-existing config file, no clients
+	if err := mgr.Install(ctx, server, map[string]any{
+		"engine_profile": "modern_pq",
+		"port":           443,
+	}); err != nil {
+		t.Fatalf("fresh install without existing clients failed: %v", err)
+	}
+
+	if !probeCalled {
+		t.Fatal("expected readiness probe to be called during fresh install")
+	}
+	if captured.UUID == "" {
+		t.Fatal("expected valid probe UUID for fresh install without clients, got empty string")
+	}
+	if _, err := uuid.Parse(captured.UUID); err != nil {
+		t.Errorf("expected valid RFC 4122 UUID in probeParams, got %q: %v", captured.UUID, err)
+	}
+	if captured.EngineProfile != "modern_pq" {
+		t.Errorf("expected EngineProfile modern_pq, got %q", captured.EngineProfile)
+	}
+	if captured.ServerName == "" {
+		t.Error("expected non-empty ServerName in probeParams")
+	}
+	if captured.PublicKey == "" {
+		t.Error("expected non-empty PublicKey in probeParams")
+	}
+
+	// Verify generated config has valid structure and 0 clients
+	cfgBytes, exists := mockSSH.files[XrayConfigPath]
+	if !exists {
+		t.Fatalf("expected config file %s to be written", XrayConfigPath)
+	}
+	parsed, err := ParseXrayConfig(cfgBytes)
+	if err != nil {
+		t.Fatalf("ParseXrayConfig: %v", err)
+	}
+	if len(parsed.Inbounds) == 0 {
+		t.Fatal("expected at least one inbound")
+	}
+	if len(parsed.Inbounds[0].Settings.Clients) != 0 {
+		t.Errorf("expected 0 clients in fresh install, got %d", len(parsed.Inbounds[0].Settings.Clients))
+	}
+
+	// Verify server.Protocols metadata updated
+	protoMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any)
+	if !ok {
+		t.Fatal("expected VLESS protocol metadata")
+	}
+	if installed, _ := protoMeta["installed"].(bool); !installed {
+		t.Error("expected installed == true")
+	}
+	if ep, _ := protoMeta["engine_profile"].(string); ep != "modern_pq" {
+		t.Errorf("server metadata engine_profile = %q, want modern_pq", ep)
 	}
 }
