@@ -1,1 +1,100 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc"><title id="title">vpnCAT astronaut-cat mascot</title><desc id="desc">A curious golden kitten in a teal-tinted space helmet, wearing a purple-and-white spacesuit, floating in an orbital blue circle with stars.</desc><defs><linearGradient id="space" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#3669D6"/><stop offset="1" stop-color="#7AC8FF"/></linearGradient><linearGradient id="glass" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#B5F5FF" stop-opacity=".56"/><stop offset=".7" stop-color="#80CEFF" stop-opacity=".16"/><stop offset="1" stop-color="#695CE9" stop-opacity=".4"/></linearGradient><linearGradient id="suit" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#FFFDF5"/><stop offset="1" stop-color="#DCE9FF"/></linearGradient></defs><circle cx="256" cy="256" r="230" fill="url(#space)"/><path d="M66 356c82 86 199 121 351 37" stroke="#DBF6FF" stroke-width="9" fill="none" stroke-linecap="round" opacity=".5"/><g fill="#FFD84D"><path d="m98 117 10-31 10 31 31 10-31 10-10 31-10-31-31-10z"/><path d="m408 94 8-23 8 23 23 8-23 8-8 23-8-23-23-8z"/><path d="m389 372 7-23 7 23 23 7-23 7-7 23-7-23-23-7z"/></g><g stroke="#2D2B6F" stroke-width="10" stroke-linejoin="round" stroke-linecap="round"><path d="M196 370q-24 33-54 18-25-14-9-35 11-13 27-1" fill="none"/><path d="M301 373q55 32 74-11 10-27-14-42" fill="none"/><path d="m210 358-11 66q-3 24 22 23l25-2 21-58" fill="#EAF1FF"/><path d="m286 370 37 63q12 18 30 8l16-10q17-12 5-30l-45-62" fill="#EAF1FF"/><path d="M203 320q-21 18-37 5l-14-13q-12-17 6-32l38-30 36 25" fill="url(#suit)"/><path d="M322 316q22 16 40-1l19-18q11-14-7-29l-37-32-38 39" fill="url(#suit)"/><path d="M212 305q-20 29-22 65 14 35 60 41 74 9 102-31-3-41-29-75" fill="url(#suit)"/><rect x="249" y="340" width="62" height="52" rx="13" fill="#BEDCFB"/><path d="M267 356h26m-26 11h17" stroke="#2D2B6F" stroke-width="7"/><path d="M166 168c-10-61 35-107 99-107 68 0 111 49 104 111" fill="#597DD7"/><path d="m187 177-18-67 72 38 19-6 65-48 12 74" fill="#FFDB67"/><path d="m192 179-11-45 54 27 54-12 33-29 4 58" fill="#FFEEAE"/><path d="M164 215c2-70 44-110 103-110 69 0 113 51 108 122-5 78-53 124-111 122-63-2-103-46-100-134Z" fill="#FFF5D5"/><path d="m181 170-6-69 67 37m78-10 24-57 22 81" fill="#FFE381"/><path d="M133 213c0-98 59-162 132-162 97 0 155 74 146 167-4 39-24 81-43 99" fill="url(#glass)" stroke-width="14"/><path d="M149 285c-24-39-22-66-16-88" fill="none"/><path d="M166 330c23 24 56 38 96 38 51 0 92-20 114-50" fill="none" stroke-width="16"/><path d="M211 223l-8-5m101-7 10-7" fill="none" stroke-width="8"/></g><g fill="#2D2B6F"><ellipse cx="218" cy="249" rx="11" ry="15"/><ellipse cx="301" cy="244" rx="11" ry="15"/><path d="m254 265 13-6 12 6-12 10z"/><path d="M245 288q20 27 44-3" fill="none" stroke="#2D2B6F" stroke-width="9" stroke-linecap="round"/></g><g fill="#FF8DA1" opacity=".8"><ellipse cx="194" cy="277" rx="21" ry="13"/><ellipse cx="331" cy="272" rx="21" ry="13"/></g><g fill="#FFF"><ellipse cx="223" cy="244" rx="4" ry="6"/><ellipse cx="305" cy="238" rx="4" ry="6"/><path d="M176 157q42-83 125-77" fill="none" stroke="#fff" stroke-width="12" stroke-linecap="round" opacity=".75"/></g><path d="M95 301q-8-18 7-31 13-12 30 5 16-17 30-3 13 16-3 33l-28 29z" fill="#FF8DA1" stroke="#2D2B6F" stroke-width="8" stroke-linejoin="round"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" role="img" aria-labelledby="title desc">
+<title id="title">Captain CAT — vpnCAT astronaut mascot</title><desc id="desc">Original cheerful cream-and-gold astronaut kitten with a cyan helmet, a waving paw, star-map tablet and white spacesuit, floating among satellites, a ringed planet and golden stars.</desc>
+<defs>
+<linearGradient id="m-space" x1="0" y1="0" x2=".9" y2="1"><stop stop-color="#18376F"/><stop offset=".52" stop-color="#3479EA"/><stop offset="1" stop-color="#78D0FF"/></linearGradient>
+<linearGradient id="m-helmet" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#C6F5FF"/><stop offset=".42" stop-color="#5B9DF6"/><stop offset=".82" stop-color="#3861CB"/><stop offset="1" stop-color="#8A5CF6"/></linearGradient>
+<linearGradient id="m-glass" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#F4FEFF"/><stop offset=".46" stop-color="#BEEBFF"/><stop offset="1" stop-color="#83BEFF"/></linearGradient>
+<linearGradient id="m-fur" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#FFFFFF"/><stop offset=".7" stop-color="#FFF6DF"/><stop offset="1" stop-color="#FFE7C0"/></linearGradient>
+<linearGradient id="m-suit" x1="0" y1="0" x2=".8" y2="1"><stop stop-color="#FFFFFF"/><stop offset=".58" stop-color="#F4F7FF"/><stop offset="1" stop-color="#BBD8FF"/></linearGradient>
+<linearGradient id="m-flare" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#FFF1AB"/><stop offset="1" stop-color="#FFD84D"/></linearGradient>
+</defs>
+<circle cx="322" cy="316" r="287" fill="url(#m-space)"/>
+<circle cx="322" cy="316" r="278" fill="none" stroke="#A9E9FF" stroke-opacity=".28" stroke-width="5"/>
+<path d="M55 379Q211 478 396 478T587 389" stroke="#B2E7FF" stroke-opacity=".33" stroke-width="10" fill="none"/>
+<path d="M108 523Q198 547 256 562" stroke="#FFF" stroke-opacity=".5" stroke-width="6" stroke-dasharray="12 19" fill="none"/>
+<g opacity=".96"><path d="M486 59Q490.14 77.86 509 82Q490.14 86.14 486 105Q481.86 86.14 463 82Q481.86 77.86 486 59Z" fill="#FFD84D"/><path d="M112 230Q115.24 244.76 130 248Q115.24 251.24 112 266Q108.76 251.24 94 248Q108.76 244.76 112 230Z" fill="#E2F5FF"/><path d="M533 434Q537.5 454.5 558 459Q537.5 463.5 533 484Q528.5 463.5 508 459Q528.5 454.5 533 434Z" fill="#FFD84D"/><path d="M90 420Q92.7 432.3 105 435Q92.7 437.7 90 450Q87.3 437.7 75 435Q87.3 432.3 90 420Z" fill="#8BD8FF"/><path d="M390 551Q392.88 564.12 406 567Q392.88 569.88 390 583Q387.12 569.88 374 567Q387.12 564.12 390 551Z" fill="#E2F5FF"/><path d="M413 29Q414.62 36.38 422 38Q414.62 39.62 413 47Q411.38 39.62 404 38Q411.38 36.38 413 29Z" fill="#FFD84D"/></g>
+<g fill="#E0F7FF" opacity=".82"><circle cx="165" cy="58" r="5"/><circle cx="552" cy="305" r="5"/><circle cx="528" cy="225" r="7"/><circle cx="77" cy="324" r="3"/><circle cx="451" cy="524" r="3"/></g>
+<g transform="translate(96 112) rotate(-29)" stroke="#2D2B6F" stroke-width="6" stroke-linejoin="round">
+<rect x="-75" y="-25" width="68" height="50" rx="5" fill="#75C6FF"/><rect x="20" y="-25" width="68" height="50" rx="5" fill="#75C6FF"/>
+<path d="M-53-25v50M-29-25v50M-75 0h68M42-25v50M66-25v50M20 0h68" stroke="#D4FAFF" stroke-width="4"/>
+<rect x="-8" y="-18" width="30" height="36" rx="7" fill="#FFD84D"/><path d="M7-18V-36" fill="none"/>
+<path d="M-14-36Q7-66 28-36Z" fill="#FFD84D"/><circle cx="7" cy="-36" r="6" fill="#FF8DA1"/>
+</g>
+<!-- small ringed planet on the upper right -->
+<g transform="translate(530 179) rotate(-22)"><ellipse cy="0" rx="68" ry="17" fill="#B8ADFF" stroke="#2D2B6F" stroke-width="5"/><circle r="41" fill="#8A5CF6" stroke="#2D2B6F" stroke-width="6"/><path d="M-29-21Q-3-4 29-13M-27 17Q7 10 30 24" fill="none" stroke="#C2A2FF" stroke-width="10"/><path d="M-65 0Q0 33 65 0" fill="none" stroke="#FFD84D" stroke-width="5"/></g>
+<!-- tail behind the suit, terminating in a distinct bright tip -->
+<path d="M382 444Q472 460 477 404Q483 362 510 378Q538 401 512 427" stroke="#2D2B6F" stroke-width="33" fill="none" stroke-linecap="round"/>
+<path d="M382 444Q472 460 477 404Q483 362 510 378Q538 401 512 427" stroke="#FEE9AA" stroke-width="22" fill="none" stroke-linecap="round"/>
+<path d="M508 381Q538 400 512 427" stroke="#FFD84D" stroke-width="19" fill="none" stroke-linecap="round"/>
+<!-- backpack glows from behind -->
+<rect x="403" y="336" width="43" height="103" rx="20" fill="#5B9DF6" stroke="#2D2B6F" stroke-width="8" transform="rotate(-12 423 387)"/>
+<rect x="409" y="365" width="17" height="46" rx="8" fill="#B9E8FF" transform="rotate(-12 423 387)"/>
+<!-- boots -->
+<g stroke="#2D2B6F" stroke-width="10"><path d="M280 460L263 516Q252 537 272 549L302 555Q320 548 318 529L329 474" fill="url(#m-suit)"/><path d="M367 473L389 530Q395 550 416 542L438 529Q446 512 426 495L405 454" fill="url(#m-suit)"/></g>
+<path d="M266 526Q293 531 318 531M391 517Q418 516 430 505" fill="none" stroke="#5B9DF6" stroke-width="9" stroke-linecap="round"/>
+<!-- body suit -->
+<path d="M271 321Q311 298 366 315Q427 335 429 408Q436 476 372 495Q287 512 253 462Q231 427 244 377Q246 349 271 321Z" fill="url(#m-suit)" stroke="#2D2B6F" stroke-width="11" stroke-linejoin="round"/>
+<path d="M267 455Q336 477 415 448" stroke="#5B9DF6" stroke-opacity=".55" stroke-width="10" fill="none"/>
+<path d="M277 353Q316 365 356 353" fill="none" stroke="#9FD4FF" stroke-width="9"/>
+<!-- left arm waving, with hand clearly separated -->
+<path d="M270 361Q239 350 215 308L196 280Q177 262 161 276Q148 296 166 315L200 370Q228 396 260 395" fill="url(#m-suit)" stroke="#2D2B6F" stroke-width="10" stroke-linejoin="round"/>
+<path d="M147 288Q135 274 145 258Q157 247 170 261L174 254Q184 239 197 254L200 277Q216 294 198 313Q172 323 154 307Z" fill="#F6FCFF" stroke="#2D2B6F" stroke-width="9"/>
+<path d="M157 275L164 285M176 266L181 278" stroke="#74B7EE" stroke-width="5" stroke-linecap="round"/>
+<!-- right arm extended to nav tablet -->
+<path d="M404 351Q447 323 468 305L482 320Q471 363 425 400" fill="url(#m-suit)" stroke="#2D2B6F" stroke-width="10" stroke-linejoin="round"/>
+<path d="M454 306Q458 284 480 284Q494 291 495 306L505 317Q508 338 486 341Q466 340 454 329Z" fill="#FFFFFF" stroke="#2D2B6F" stroke-width="9"/>
+<!-- navigational tablet has a real route and destinations -->
+<g transform="translate(469 267) rotate(15)"><rect width="90" height="71" x="-6" y="-14" rx="14" fill="#292364" stroke="#292364" stroke-width="6"/><rect width="78" height="57" x="0" y="-8" rx="9" fill="#BCEEFF"/><path d="M15 35L31 12L47 22L65 3" fill="none" stroke="#3A5CD8" stroke-width="5" stroke-linecap="round"/><circle cx="15" cy="35" r="6" fill="#FFD84D"/><circle cx="65" cy="3" r="6" fill="#FF8DA1"/><path d="M58 42h9" stroke="#00BFC9" stroke-width="5"/></g>
+<!-- chest badge: three connected nodes, unique vpnCAT mission mark -->
+<rect x="305" y="390" width="92" height="72" rx="19" fill="#D4F0FF" stroke="#2D2B6F" stroke-width="8"/>
+<path d="M327 440L347 412L377 437" fill="none" stroke="#436BE5" stroke-width="6"/>
+<circle cx="327" cy="440" r="8" fill="#FF8DA1" stroke="#2D2B6F" stroke-width="3"/>
+<circle cx="347" cy="412" r="8" fill="#FFD84D" stroke="#2D2B6F" stroke-width="3"/>
+<circle cx="377" cy="437" r="8" fill="#00D2D0" stroke="#2D2B6F" stroke-width="3"/>
+<path d="M293 372Q356 382 411 371" stroke="#2D2B6F" stroke-width="9" fill="none"/>
+<!-- helmet + facial master; same reusable character drawing in logo and favicon -->
+<g transform="translate(183 62) scale(0.91)" stroke-linejoin="round" stroke-linecap="round">
+<!-- visor housing: wide cyan glass helmet with a navy structural rim -->
+<circle cx="150" cy="148" r="139" fill="url(#m-helmet)" stroke="#2D2B6F" stroke-width="11"/>
+<circle cx="150" cy="148" r="126" fill="#BDEBFF" opacity=".32"/>
+<path d="M40 159Q23 92 83 48Q113 25 151 26" stroke="#E7FBFF" stroke-width="10" opacity=".87" fill="none"/>
+<path d="M232 52Q261 69 274 104" stroke="#E7FBFF" stroke-width="8" opacity=".8" fill="none"/>
+<path d="M266 166Q256 215 228 238" stroke="#294EA6" stroke-width="9" opacity=".42" fill="none"/>
+<!-- ear silhouettes are deliberately asymmetric and are part of this character's identity -->
+<path d="M77 149L77 62Q78 48 89 54L134 100Z" fill="#FFDB55" stroke="#2D2B6F" stroke-width="8"/>
+<path d="M204 102L250 54Q264 44 269 65L263 154Z" fill="#FFDB55" stroke="#2D2B6F" stroke-width="8"/>
+<path d="M94 82L96 119L119 108Z" fill="#FF8DA1" opacity=".83"/>
+<path d="M241 86L223 106L248 114Z" fill="#FF8DA1" opacity=".83"/>
+<!-- warm white kitten face with a golden asymmetric fringe -->
+<path d="M67 149Q63 99 109 88Q144 77 164 90Q221 80 242 132Q260 202 203 232Q159 256 109 234Q64 211 67 149Z" fill="url(#m-fur)" stroke="#2D2B6F" stroke-width="8"/>
+<path d="M98 103Q126 83 160 92L179 105Q162 109 153 123Q131 111 108 122Z" fill="#FFDE64"/>
+<path d="M158 94Q187 83 213 102L204 119Q183 112 166 123Z" fill="#FFCC40"/>
+<!-- cheek markings: soft coral + individually drawn freckles -->
+<ellipse cx="94" cy="184" rx="21" ry="18" fill="#FF8DA1" opacity=".69"/>
+<ellipse cx="217" cy="181" rx="20" ry="17" fill="#FF8DA1" opacity=".69"/>
+<g fill="#FFF6FC" opacity=".9"><circle cx="87" cy="178" r="3"/><circle cx="101" cy="176" r="2.5"/><circle cx="91" cy="188" r="2.7"/><circle cx="104" cy="188" r="2"/><circle cx="209" cy="175" r="3"/><circle cx="221" cy="179" r="2.8"/><circle cx="215" cy="188" r="2.3"/></g>
+<!-- personality: bright eyes, inquisitive eyebrows, wide mouth + tiny tongue -->
+<path d="M105 137Q113 127 122 133M185 130Q193 121 202 130" fill="none" stroke="#2D2B6F" stroke-width="5"/>
+<ellipse cx="118" cy="157" rx="10.5" ry="13" fill="#2D2B6F"/><ellipse cx="191" cy="153" rx="10.5" ry="13" fill="#2D2B6F"/>
+<ellipse cx="114" cy="151" rx="3.2" ry="4.5" fill="#FFFFFF"/><ellipse cx="187" cy="148" rx="3.2" ry="4.5" fill="#FFFFFF"/>
+<path d="M146 170Q154 166 162 169Q158 177 154 176Z" fill="#2D2B6F"/>
+<path d="M139 184Q153 196 170 181Q174 211 155 215Q138 210 139 184Z" fill="#2D2B6F"/>
+<path d="M148 206Q153 194 164 202" fill="none" stroke="#FF8DA1" stroke-width="9"/>
+<!-- whiskers sit away from facial expression -->
+<path d="M77 166L59 161M78 179L56 183M233 163L253 159M234 178L255 185" stroke="#2D2B6F" stroke-width="4.5" fill="none"/>
+<!-- lower helmet rim, padded ear fixtures, and glass reflection -->
+<path d="M64 222Q143 292 235 222" fill="none" stroke="#2D2B6F" stroke-width="10"/>
+<path d="M70 232Q151 289 228 232" fill="none" stroke="#76D7FF" stroke-width="8"/>
+<rect x="25" y="163" width="24" height="43" rx="11" fill="#E6F9FF" stroke="#2D2B6F" stroke-width="5" transform="rotate(-10 37 184)"/>
+<rect x="251" y="162" width="24" height="43" rx="11" fill="#E6F9FF" stroke="#2D2B6F" stroke-width="5" transform="rotate(10 263 184)"/>
+<path d="M65 87Q88 47 132 41" fill="none" stroke="#FFFFFF" stroke-width="12" opacity=".86"/>
+<ellipse cx="245" cy="85" rx="9" ry="17" transform="rotate(-35 245 85)" fill="#FFFFFF" opacity=".89"/>
+<ellipse cx="259" cy="113" rx="5" ry="8" transform="rotate(-35 259 113)" fill="#FFFFFF" opacity=".72"/>
+<!-- unique identifying cyan comet seal on helmet -->
+<circle cx="73" cy="66" r="17" fill="#00D2D0" stroke="#2D2B6F" stroke-width="5"/>
+<path d="M73 55L76 63L85 65L77 70L76 79L70 71L62 68L70 64Z" fill="#FFFFFF"/>
+</g>
+<!-- foreground heart and sparkle anchors -->
+<path d="M110 422Q84 395 67 414Q49 441 81 462L111 486L142 459Q165 437 148 418Q133 399 110 422Z" fill="#FF8DA1" stroke="#2D2B6F" stroke-width="9" stroke-linejoin="round"/>
+<path d="M171 506Q174.6 522.4 191 526Q174.6 529.6 171 546Q167.4 529.6 151 526Q167.4 522.4 171 506Z" fill="#FFD84D"/><path d="M565 348Q567.16 357.84 577 360Q567.16 362.16 565 372Q562.84 362.16 553 360Q562.84 357.84 565 348Z" fill="#D9FAFF"/>
+</svg>
