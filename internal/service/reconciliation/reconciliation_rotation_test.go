@@ -26,6 +26,10 @@ func (m *rotationNaiveManager) AddClient(_ context.Context, _ *models.Server, pa
 	return map[string]any{"username": name, "password": "new-secret"}, nil
 }
 
+func (m *rotationNaiveManager) ProbeBackendCredential(context.Context, *models.Server, *models.BackendTunnel) error {
+	return nil
+}
+
 func TestReconciler_WithdrawDisabledOwnerConns_RotatesBackend(t *testing.T) {
 	for _, failAdd := range []bool{false, true} {
 		t.Run(fmt.Sprintf("fail_add_%v", failAdd), func(t *testing.T) {

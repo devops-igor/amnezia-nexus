@@ -587,6 +587,12 @@ func (r *Reconciler) withdrawDisabledOwnerConns(ctx context.Context, server *mod
 		if !off {
 			continue
 		}
+		shared, err := r.db.HasOtherUserConnectionCredential(ctx, &conn)
+		if err != nil || shared {
+			slog.Warn("Reconciliation: shared credential cannot be revoked for disabled user",
+				"server_id", server.ID, "protocol", proto, "client_id", conn.ClientID, "shared", shared, "err", err)
+			continue
+		}
 		isBackend, err := r.db.IsBackendTunnelClient(ctx, server.ID, proto, conn.ClientID)
 		if err != nil {
 			slog.Warn("Reconciliation Phase 3: failed to verify backend tunnel client for disabled user, skipping removal to fail closed",

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -586,6 +587,17 @@ func (m *mockNonToggleNaiveManager) GetClientConfig(context.Context, *models.Ser
 	return "", nil
 }
 
+func (m *mockNonToggleNaiveManager) ProbeBackendCredential(_ context.Context, _ *models.Server, candidate *models.BackendTunnel) error {
+	var p models.NaiveProxyParams
+	if err := json.Unmarshal(candidate.ProtocolParams, &p); err != nil {
+		return err
+	}
+	if p.Username == "" || p.Password != "replacement-secret" {
+		return errors.New("replacement credentials not authenticated")
+	}
+	return nil
+}
+
 func TestUserOps_ToggleUser_PreservesSharedBackendCredential(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -773,6 +785,85 @@ func TestUserOps_RotatesSharedBackendCredential(t *testing.T) {
 				}
 			} else if user == nil || user.Enabled != tc.failAdd {
 				t.Fatalf("user disable state: %+v", user)
+			}
+		})
+	}
+}
+
+func TestPerformMassOperations_ReportsRemoteRevocationFailure(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := t.Context()
+	sid, err := db.CreateServer(ctx, &models.Server{Name: "failed-removal", Host: "127.0.0.1", SSHPort: 22})
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, err := db.CreateUser(ctx, &models.User{Username: "failed-removal", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID: "failed-conn", UserID: uid, ServerID: sid, Protocol: models.ProtocolAWG, ClientID: "failed-client",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mgr := newMockProtocolManager(models.ProtocolAWG)
+	mgr.returnError = true
+	reg := newMockRegistry()
+	reg.Register(mgr)
+	err = New(db, reg).PerformMassOperations(ctx, MassOperationRequest{DeleteUIDs: []string{uid}})
+	if err == nil || !strings.Contains(err.Error(), "remove remote client failed-client: remove client error") {
+		t.Fatalf("expected remote removal error in batch result, got %v", err)
+	}
+	if c, err := db.GetConnection(ctx, "failed-conn"); err != nil || c == nil {
+		t.Fatalf("failed remote removal lost retryable row: %v %v", c, err)
+	}
+}
+
+func TestUserOps_SharedCredentialDoesNotDisconnectOtherUser(t *testing.T) {
+	for _, toggle := range []bool{false, true} {
+		t.Run(fmt.Sprintf("toggle_%t", toggle), func(t *testing.T) {
+			db, cleanup := setupTestDB(t)
+			defer cleanup()
+			ctx := t.Context()
+			sid, err := db.CreateServer(ctx, &models.Server{Name: "two-users", Host: "127.0.0.1", SSHPort: 22})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var aliceID string
+			for _, name := range []string{"alice", "bob"} {
+				uid, err := db.CreateUser(ctx, &models.User{Username: name, Enabled: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if name == "alice" {
+					aliceID = uid
+				}
+				if _, err := db.CreateConnection(ctx, &models.UserConnection{
+					ID: name, UserID: uid, ServerID: sid, Protocol: models.ProtocolNaive, ClientID: "same-login",
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			mgr := &mockNonToggleNaiveManager{proto: models.ProtocolNaive}
+			reg := newMockRegistry()
+			reg.Register(mgr)
+			svc := New(db, reg)
+			if toggle {
+				_, err = svc.ToggleUser(ctx, aliceID, false)
+			} else {
+				_, err = svc.DeleteUser(ctx, aliceID)
+			}
+			if !errors.Is(err, database.ErrSharedUserCredential) {
+				t.Fatalf("expected shared credential refusal: %v", err)
+			}
+			if len(mgr.deleted) != 0 {
+				t.Fatalf("removed Bob's credential: %v", mgr.deleted)
+			}
+			for _, id := range []string{"alice", "bob"} {
+				if c, err := db.GetConnection(ctx, id); err != nil || c == nil {
+					t.Fatalf("%s connection lost: %v %v", id, c, err)
+				}
 			}
 		})
 	}

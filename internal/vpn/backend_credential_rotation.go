@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +16,8 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel/naive"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel/vless"
 )
 
 // rotations serializes remote provisioning for a given backend without holding Service.mu.
@@ -122,6 +127,15 @@ func (s *Service) RotateSharedBackendCredential(
 		return err
 	}
 
+	// Probe before persisting or attaching: the old identity and its live device
+	// remain intact if the replacement cannot authenticate remotely.
+	candidate := *current
+	candidate.ProtocolParams = params
+	if err := probeReplacementCredential(ctx, mgr, server, &candidate); err != nil {
+		return errors.Join(fmt.Errorf("verify replacement backend credential: %w", err),
+			cleanupRotatedCredential(ctx, s.db, mgr, server, proto, newID))
+	}
+
 	// Only the local commit is serialized with admissions and enable/disable.
 	// Remote compensation is deliberately done after releasing Service.mu.
 	s.mu.Lock()
@@ -184,6 +198,64 @@ func (s *Service) commitBackendRotation(
 		return fmt.Errorf("attach replacement backend: %w", err), true
 	}
 	return nil, false
+}
+
+// replacementCredentialProber lets protocol managers provide their own authenticated
+// readiness check (also used by test managers). The default uses the live proxy.
+type replacementCredentialProber interface {
+	ProbeBackendCredential(context.Context, *models.Server, *models.BackendTunnel) error
+}
+
+func probeReplacementCredential(ctx context.Context, mgr manager.ProtocolManager, server *models.Server, candidate *models.BackendTunnel) error {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if prober, ok := mgr.(replacementCredentialProber); ok {
+		return prober.ProbeBackendCredential(probeCtx, server, candidate)
+	}
+	switch models.NormalizeTunnelProtocol(candidate.Protocol) {
+	case models.ProtocolNaive:
+		var p models.NaiveProxyParams
+		if err := json.Unmarshal(candidate.ProtocolParams, &p); err != nil {
+			return fmt.Errorf("decode naive replacement: %w", err)
+		}
+		_, err := naive.ProbeNaiveProxy(probeCtx, candidate.Endpoint, p, 5*time.Second)
+		return err
+	case models.ProtocolVLESS:
+		var p models.VLESSRealityParams
+		if err := json.Unmarshal(candidate.ProtocolParams, &p); err != nil {
+			return fmt.Errorf("decode vless replacement: %w", err)
+		}
+		dialer, err := vless.New(candidate.Endpoint, p)
+		if err != nil {
+			return fmt.Errorf("construct vless replacement: %w", err)
+		}
+		port := server.SSHPort
+		if port == 0 {
+			port = 22
+		}
+		// A REALITY handshake alone does not validate the VLESS UUID. Require
+		// an SSH greeting through the authenticated VLESS stream to this node.
+		conn, err := dialer.DialContext(probeCtx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			return fmt.Errorf("dial replacement vless stream: %w", err)
+		}
+		defer conn.Close()
+		if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			return fmt.Errorf("set vless probe deadline: %w", err)
+		}
+		stop := context.AfterFunc(probeCtx, func() { _ = conn.Close() })
+		defer stop()
+		var banner [4]byte
+		if _, err := io.ReadFull(conn, banner[:]); err != nil {
+			return fmt.Errorf("read authenticated vless SSH greeting: %w", err)
+		}
+		if string(banner[:]) != "SSH-" {
+			return errors.New("replacement vless stream did not reach server SSH")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported replacement protocol %q", candidate.Protocol)
+	}
 }
 
 func cleanupRotatedCredential(ctx context.Context, db *database.DB, mgr manager.ProtocolManager, server *models.Server, proto, clientID string) error {

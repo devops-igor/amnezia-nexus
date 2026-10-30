@@ -3,12 +3,14 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -137,12 +139,16 @@ func (m *mockProtocolManager) AddClient(ctx context.Context, server *models.Serv
 	if m.addClientFn != nil {
 		return m.addClientFn(ctx, server, clientParams)
 	}
+	id := fmt.Sprintf("new-client-%d", defaultClientSeq.Add(1))
 	return map[string]any{
-		"clientId":  "new-client-1",
-		"client_id": "new-client-1",
+		"clientId":  id,
+		"client_id": id,
 		"config":    "[Interface]\nPrivateKey=testkey\nAddress=10.0.0.5/32\n",
 	}, nil
 }
+
+// defaultClientSeq keeps default mock credentials unique, as real managers issue them.
+var defaultClientSeq atomic.Int64
 
 func (m *mockProtocolManager) RemoveClient(ctx context.Context, server *models.Server, clientID string) error {
 	if m.removeClientFn != nil {

@@ -64,6 +64,35 @@ func (d *DB) HasUserConnectionCredential(ctx context.Context, serverID int64, pr
 	return false, nil
 }
 
+// ErrSharedUserCredential requires operator remediation before remote revocation.
+var ErrSharedUserCredential = errors.New("remote credential is shared by another user connection")
+
+// HasOtherUserConnectionCredential refuses revocation while another connection row
+// references the same remote identity. Disabled owners count too: their row may
+// become active again, and revoking the remote credential would break that user.
+func (d *DB) HasOtherUserConnectionCredential(ctx context.Context, c *models.UserConnection) (bool, error) {
+	if d == nil || c == nil || c.ClientID == "" {
+		return false, errors.New("missing connection credential for revocation check")
+	}
+	conns, err := d.GetConnectionsByServerAndProtocol(ctx, c.ServerID, c.Protocol)
+	if err != nil {
+		return false, fmt.Errorf("check shared user credential: %w", err)
+	}
+	for _, other := range conns {
+		if other.ID != c.ID && sameUserCredential(c.Protocol, other.ClientID, c.ClientID) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func sameUserCredential(proto, a, b string) bool {
+	if models.NormalizeProtocol(proto) == models.ProtocolVLESS {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
 // GetBackendTunnels retrieves all backend AWG tunnel definitions.
 func (d *DB) GetBackendTunnels(ctx context.Context) ([]models.BackendTunnel, error) {
 	d.mu.RLock()

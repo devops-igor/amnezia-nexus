@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/reconciliation"
@@ -448,16 +450,30 @@ func TestToggleUserHandler_PreservesSharedBackendCredential(t *testing.T) {
 	}
 }
 
+type verifiedRotationManager struct {
+	*mockProtocolManager
+	probe func(*models.BackendTunnel) error
+}
+
+func (m *verifiedRotationManager) ProbeBackendCredential(_ context.Context, _ *models.Server, candidate *models.BackendTunnel) error {
+	if m.probe != nil {
+		return m.probe(candidate)
+	}
+	return nil
+}
+
 func TestUserHandlers_RotateSharedBackendCredential(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		delete  bool
-		failAdd bool
+		name      string
+		delete    bool
+		failAdd   bool
+		failProbe bool
 	}{
 		{name: "delete rotates and revokes", delete: true},
 		{name: "disable rotates and revokes"},
 		{name: "delete provisioning failure preserves user and backend", delete: true, failAdd: true},
 		{name: "disable provisioning failure preserves user and backend", failAdd: true},
+		{name: "failed authenticated probe rolls back replacement", delete: true, failProbe: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, db, _ := setupTestHandlers(t)
@@ -505,7 +521,7 @@ func TestUserHandlers_RotateSharedBackendCredential(t *testing.T) {
 			})
 			var removed []string
 			var provisioned int
-			h.registry.Register(&mockProtocolManager{
+			h.registry.Register(&verifiedRotationManager{mockProtocolManager: &mockProtocolManager{
 				protocol: models.ProtocolNaive,
 				addClientFn: func(_ context.Context, _ *models.Server, p map[string]any) (map[string]any, error) {
 					provisioned++
@@ -521,7 +537,15 @@ func TestUserHandlers_RotateSharedBackendCredential(t *testing.T) {
 					removed = append(removed, id)
 					return nil
 				},
-			})
+			}, probe: func(candidate *models.BackendTunnel) error {
+				if vpn.ExtractClientIDFromProtocolParams(candidate.Protocol, candidate.ProtocolParams) != "new-backend-username" {
+					return fmt.Errorf("probed wrong identity")
+				}
+				if tc.failProbe {
+					return fmt.Errorf("replacement authentication rejected")
+				}
+				return nil
+			}})
 			path := fmt.Sprintf("/api/users/%s/toggle", uid)
 			var body []byte
 			if tc.delete {
@@ -537,7 +561,7 @@ func TestUserHandlers_RotateSharedBackendCredential(t *testing.T) {
 			w := httptest.NewRecorder()
 			setupFullUsersRouter(h).ServeHTTP(w, req)
 			wantStatus := http.StatusOK
-			if tc.failAdd {
+			if tc.failAdd || tc.failProbe {
 				wantStatus = http.StatusInternalServerError
 			}
 			if w.Code != wantStatus {
@@ -550,11 +574,15 @@ func TestUserHandlers_RotateSharedBackendCredential(t *testing.T) {
 				if len(removed) != 0 {
 					t.Fatalf("old credential revoked after failed provision: %v", removed)
 				}
+			} else if tc.failProbe {
+				if len(removed) != 1 || removed[0] != "new-backend-username" {
+					t.Fatalf("probe failure did not clean only replacement: %v", removed)
+				}
 			} else if len(removed) != 1 || removed[0] != old {
 				t.Fatalf("old remote credential not revoked: %v", removed)
 			}
 			want := "new-backend-username"
-			if tc.failAdd {
+			if tc.failAdd || tc.failProbe {
 				want = old
 			}
 			row, err := db.GetBackendTunnelByServerID(ctx, sid)
@@ -571,7 +599,7 @@ func TestUserHandlers_RotateSharedBackendCredential(t *testing.T) {
 				t.Fatalf("backend did not retain active identity %q: row=%+v live=%+v", want, row, live)
 			}
 			got, err := db.GetConnection(ctx, conn.ID)
-			if err != nil || (got != nil) != tc.failAdd {
+			if err != nil || (got != nil) != (tc.failAdd || tc.failProbe) {
 				t.Fatalf("user connection: %+v %v", got, err)
 			}
 			user, err := db.GetUser(ctx, uid)
@@ -579,10 +607,10 @@ func TestUserHandlers_RotateSharedBackendCredential(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.delete {
-				if (user != nil) != tc.failAdd {
+				if (user != nil) != (tc.failAdd || tc.failProbe) {
 					t.Fatalf("deleted user state: %+v", user)
 				}
-			} else if user == nil || user.Enabled != tc.failAdd {
+			} else if user == nil || user.Enabled != (tc.failAdd || tc.failProbe) {
 				t.Fatalf("disabled user state: %+v", user)
 			}
 		})
@@ -638,14 +666,14 @@ func TestRotationRemoteDelayDoesNotBlockUnrelatedIngressAdmission(t *testing.T) 
 	}
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	mgr := &mockProtocolManager{
+	mgr := &verifiedRotationManager{mockProtocolManager: &mockProtocolManager{
 		protocol: models.ProtocolNaive,
 		addClientFn: func(_ context.Context, _ *models.Server, _ map[string]any) (map[string]any, error) {
 			close(entered)
 			<-release
 			return map[string]any{"username": "replacement", "password": "replacement-secret"}, nil
 		},
-	}
+	}}
 	rotationDone := make(chan error, 1)
 	go func() {
 		rotationDone <- svc.RotateSharedBackendCredential(ctx, server, mgr, models.ProtocolNaive, "old-user")
@@ -719,14 +747,14 @@ func TestRotationPendingAdministrativeDisableKeepsBackendDetached(t *testing.T) 
 	}
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	mgr := &mockProtocolManager{
+	mgr := &verifiedRotationManager{mockProtocolManager: &mockProtocolManager{
 		protocol: models.ProtocolNaive,
 		addClientFn: func(_ context.Context, _ *models.Server, _ map[string]any) (map[string]any, error) {
 			close(entered)
 			<-release
 			return map[string]any{"username": "replacement", "password": "replacement-secret"}, nil
 		},
-	}
+	}}
 	rotationDone := make(chan error, 1)
 	go func() {
 		rotationDone <- svc.RotateSharedBackendCredential(ctx, server, mgr, models.ProtocolNaive, "old-user")
@@ -809,12 +837,12 @@ func TestRotateVLESSBackendPreservesExplicitEmptyReplacementFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mgr := &mockProtocolManager{
+	mgr := &verifiedRotationManager{mockProtocolManager: &mockProtocolManager{
 		protocol: models.ProtocolVLESS,
 		addClientFn: func(_ context.Context, _ *models.Server, _ map[string]any) (map[string]any, error) {
 			return map[string]any{"uuid": newID, "flow": ""}, nil
 		},
-	}
+	}}
 	if err := svc.RotateSharedBackendCredential(ctx, server, mgr, models.ProtocolVLESS, oldID); err != nil {
 		t.Fatalf("rotate VLESS: %v", err)
 	}
@@ -839,6 +867,48 @@ func TestRotateVLESSBackendPreservesExplicitEmptyReplacementFlow(t *testing.T) {
 		t.Fatal("replacement VLESS device not attached")
 	} else {
 		t.Cleanup(func() { _ = dev.Close() })
+	}
+}
+
+func TestWithdrawUserConnection_SharedWithAnotherEnabledUser(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := t.Context()
+	sid, err := db.CreateServer(ctx, &models.Server{Name: "shared-user-node", Host: "127.0.0.1", SSHPort: 22})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var removed []string
+	h.registry.Register(&mockProtocolManager{protocol: models.ProtocolNaive,
+		removeClientFn: func(_ context.Context, _ *models.Server, id string) error {
+			removed = append(removed, id)
+			return nil
+		},
+	})
+	for _, name := range []string{"alice", "bob"} {
+		uid, err := db.CreateUser(ctx, &models.User{Username: name, Enabled: true, Role: models.RoleUser})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.CreateConnection(ctx, &models.UserConnection{
+			ID: name, UserID: uid, ServerID: sid, Protocol: models.ProtocolNaive, ClientID: "shared-login",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alice, err := db.GetConnection(ctx, "alice")
+	if err != nil || alice == nil {
+		t.Fatalf("alice connection: %v %v", alice, err)
+	}
+	if err := h.withdrawUserConnection(ctx, alice); !errors.Is(err, database.ErrSharedUserCredential) {
+		t.Fatalf("expected shared credential refusal, got %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("revoked Bob's credential: %v", removed)
+	}
+	for _, id := range []string{"alice", "bob"} {
+		if c, err := db.GetConnection(ctx, id); err != nil || c == nil {
+			t.Fatalf("%s connection lost: %v %v", id, c, err)
+		}
 	}
 }
 

@@ -324,6 +324,15 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 	for _, c := range ops.deletes {
 		proto := models.NormalizeProtocol(c.Protocol)
 		removeFailed := false
+		shared, err := s.db.HasOtherUserConnectionCredential(ctx, &c)
+		if err != nil {
+			deleteErrors = append(deleteErrors, fmt.Errorf("check shared credential %s: %w", c.ClientID, err))
+			continue
+		}
+		if shared {
+			deleteErrors = append(deleteErrors, fmt.Errorf("client %s: %w", c.ClientID, database.ErrSharedUserCredential))
+			continue
+		}
 		isBackend, err := s.db.IsBackendTunnelClient(ctx, serverID, c.Protocol, c.ClientID)
 		if err != nil {
 			slog.Warn("Failed to check backend tunnel client during mass delete, skipping remote removal to fail closed",
@@ -354,6 +363,7 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 			slog.Warn("Failed to remove remote client during mass delete",
 				"server_id", serverID, "protocol", proto, "client_id", c.ClientID, "err", err)
 			removeFailed = true
+			deleteErrors = append(deleteErrors, fmt.Errorf("remove remote client %s: %w", c.ClientID, err))
 		}
 		if !removeFailed {
 			_, _ = s.db.DeleteConnection(ctx, c.ID)
@@ -460,6 +470,17 @@ func (s *Service) runToggleOperations(
 	}
 	for _, t := range toggles {
 		proto := models.NormalizeProtocol(t.conn.Protocol)
+		if !t.enabled {
+			shared, err := s.db.HasOtherUserConnectionCredential(ctx, &t.conn)
+			if err != nil {
+				recordFailure(t, proto, fmt.Errorf("check shared credential: %w", err))
+				continue
+			}
+			if shared {
+				recordFailure(t, proto, database.ErrSharedUserCredential)
+				continue
+			}
+		}
 		var mgr manager.ProtocolManager
 		var ok bool
 		if s.registry != nil {

@@ -4,11 +4,19 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // withdrawUserConnection revokes a user connection row only after remote revocation.
 func (h *Handlers) withdrawUserConnection(ctx context.Context, c *models.UserConnection) error {
+	shared, err := h.db.HasOtherUserConnectionCredential(ctx, c)
+	if err != nil {
+		return fmt.Errorf("check shared user credential: %w", err)
+	}
+	if shared {
+		return fmt.Errorf("connection %s: %w", c.ID, database.ErrSharedUserCredential)
+	}
 	isBackend, err := h.db.IsBackendTunnelClient(ctx, c.ServerID, c.Protocol, c.ClientID)
 	if err != nil {
 		return fmt.Errorf("check backend tunnel: %w", err)
