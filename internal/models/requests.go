@@ -262,13 +262,59 @@ type InstallProtocolRequest struct {
 	EngineProfile       string                 `json:"engine_profile,omitempty"`
 }
 
+func (r *InstallProtocolRequest) hasConfigOptions() bool {
+	return r.EngineProfile != "" || r.VLESSOptions != nil || r.NaiveOptions != nil ||
+		r.TLSEmulation != nil || r.TLSDomain != nil || r.MaxConnections != nil ||
+		r.AWGProfile != nil || r.AWGCPSProtocol != nil || r.AWGHeaderProtection != nil
+}
+
+func (r *InstallProtocolRequest) validateVLESS() error {
+	if r.VLESSOptions == nil {
+		return nil
+	}
+	if r.VLESSOptions.Port != "" {
+		p, err := strconv.Atoi(r.VLESSOptions.Port)
+		if err != nil || p < 1 || p > 65535 {
+			return errors.New("vless port must be an integer between 1 and 65535")
+		}
+	}
+	if r.VLESSOptions.ServerName != "" {
+		if err := ValidateTLSDomain(r.VLESSOptions.ServerName); err != nil {
+			return fmt.Errorf("invalid vless server_name: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *InstallProtocolRequest) validateNaive() error {
+	if r.NaiveOptions == nil {
+		return nil
+	}
+	if r.NaiveOptions.Port != "" {
+		p, err := strconv.Atoi(r.NaiveOptions.Port)
+		if err != nil || p < 1 || p > 65535 {
+			return errors.New("naive port must be an integer between 1 and 65535")
+		}
+	}
+	if r.NaiveOptions.Domain != "" {
+		if err := ValidateTLSDomain(r.NaiveOptions.Domain); err != nil {
+			return fmt.Errorf("invalid naive domain: %w", err)
+		}
+	}
+	return nil
+}
+
 func (r *InstallProtocolRequest) Validate() error {
 	r.Protocol = NormalizeProtocol(r.Protocol)
 	if !IsValidProtocol(r.Protocol) {
 		return fmt.Errorf("invalid protocol: %s", r.Protocol)
 	}
-	portNum, err := strconv.Atoi(r.Port)
-	if err != nil || portNum < 1 || portNum > 65535 {
+	if r.Port != "" {
+		portNum, err := strconv.Atoi(r.Port)
+		if err != nil || portNum < 1 || portNum > 65535 {
+			return errors.New("port must be an integer between 1 and 65535")
+		}
+	} else if !r.hasConfigOptions() {
 		return errors.New("port must be an integer between 1 and 65535")
 	}
 	if r.TLSDomain != nil && *r.TLSDomain != "" {
@@ -276,33 +322,10 @@ func (r *InstallProtocolRequest) Validate() error {
 			return err
 		}
 	}
-	if r.VLESSOptions != nil {
-		if r.VLESSOptions.Port != "" {
-			p, err := strconv.Atoi(r.VLESSOptions.Port)
-			if err != nil || p < 1 || p > 65535 {
-				return errors.New("vless port must be an integer between 1 and 65535")
-			}
-		}
-		if r.VLESSOptions.ServerName != "" {
-			if err := ValidateTLSDomain(r.VLESSOptions.ServerName); err != nil {
-				return fmt.Errorf("invalid vless server_name: %w", err)
-			}
-		}
+	if err := r.validateVLESS(); err != nil {
+		return err
 	}
-	if r.NaiveOptions != nil {
-		if r.NaiveOptions.Port != "" {
-			p, err := strconv.Atoi(r.NaiveOptions.Port)
-			if err != nil || p < 1 || p > 65535 {
-				return errors.New("naive port must be an integer between 1 and 65535")
-			}
-		}
-		if r.NaiveOptions.Domain != "" {
-			if err := ValidateTLSDomain(r.NaiveOptions.Domain); err != nil {
-				return fmt.Errorf("invalid naive domain: %w", err)
-			}
-		}
-	}
-	return nil
+	return r.validateNaive()
 }
 
 // AddUserRequest defines user creation parameters.

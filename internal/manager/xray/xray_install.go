@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -253,14 +255,31 @@ func (m *XrayManager) resolveRealityCredentials(
 	return privB64, pubB64, shortID, shortIDs, clients, existingCfgBytes, parsed, nil
 }
 
-func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient, image string, existingCfgBytes []byte) error {
+type containerLaunchOptions struct {
+	image            string
+	existingCfgBytes []byte
+	server           *models.Server
+	portPrimary      int
+	serverName       string
+	pubB64           string
+	shortID          string
+	clients          []XrayClient
+}
+
+func (m *XrayManager) pullImage(ctx context.Context, client ssh.SSHClient, image string) error {
 	pullCmd := fmt.Sprintf("docker pull %s", ssh.EscapeShellArg(image))
 	if _, pullErrOut, pullCode, pullErr := client.RunSudoCommand(ctx, pullCmd); pullErr != nil || pullCode != 0 {
 		return fmt.Errorf("failed to pull xray image %s (code %d): %s: %w", image, pullCode, strings.TrimSpace(pullErrOut), pullErr)
 	}
+	return nil
+}
 
-	backupContainerName := fmt.Sprintf("%s-backup", XrayContainerName)
-
+func (m *XrayManager) stageExistingContainer(
+	ctx context.Context,
+	client ssh.SSHClient,
+	backupContainerName string,
+	existingCfgBytes []byte,
+) (bool, bool, error) {
 	inspectExistingCmd := fmt.Sprintf("docker inspect -f '{{.State.Running}}' %s 2>/dev/null", ssh.EscapeShellArg(XrayContainerName))
 	existingOut, _, existingCode, _ := client.RunSudoCommand(ctx, inspectExistingCmd)
 	hasExistingContainer := existingCode == 0 && strings.TrimSpace(existingOut) != ""
@@ -270,9 +289,6 @@ func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient,
 		if len(fields) > 0 && fields[0] == "true" {
 			wasRunning = true
 		}
-	}
-
-	if hasExistingContainer {
 		rmBackupCmd := fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(backupContainerName))
 		_, _, _, _ = client.RunSudoCommand(ctx, rmBackupCmd)
 
@@ -284,11 +300,84 @@ func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient,
 			ssh.EscapeShellArg(backupContainerName),
 		)
 		if _, renameErrOut, renameCode, renameErr := client.RunSudoCommand(ctx, renameCmd); renameErr != nil || renameCode != 0 {
-			return fmt.Errorf("failed to stage existing xray container for replacement (code %d): %s: %w", renameCode, strings.TrimSpace(renameErrOut), renameErr)
+			if len(existingCfgBytes) > 0 {
+				_ = client.UploadSudoFile(ctx, XrayConfigPath, existingCfgBytes, 0600)
+			}
+			return false, false, fmt.Errorf("failed to stage existing xray container for replacement (code %d): %s: %w", renameCode, strings.TrimSpace(renameErrOut), renameErr)
 		}
 	} else {
 		rmCmd := fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(XrayContainerName))
 		_, _, _, _ = client.RunSudoCommand(ctx, rmCmd)
+	}
+	return hasExistingContainer, wasRunning, nil
+}
+
+func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.SSHClient, opts containerLaunchOptions) error {
+	const (
+		readinessAttempts = 3
+		readinessInterval = 50 * time.Millisecond
+	)
+
+	for attempt := 1; attempt <= readinessAttempts; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(readinessInterval):
+			}
+		}
+
+		checkCmd := fmt.Sprintf("docker inspect -f '{{.State.Running}} {{.State.Restarting}}' %s", ssh.EscapeShellArg(XrayContainerName))
+		out, errOut, code, err := client.RunSudoCommand(ctx, checkCmd)
+		if err != nil || code != 0 {
+			logCmd := fmt.Sprintf("docker logs --tail 50 %s 2>&1", ssh.EscapeShellArg(XrayContainerName))
+			logsOut, _, _, _ := client.RunSudoCommand(ctx, logCmd)
+			return fmt.Errorf("xray container failed to inspect on readiness check (attempt %d, code %d): %s: %w (logs: %s)",
+				attempt, code, strings.TrimSpace(errOut), err, strings.TrimSpace(logsOut))
+		}
+		fields := strings.Fields(strings.TrimSpace(out))
+		if len(fields) < 2 || fields[0] != "true" || fields[1] != "false" {
+			logCmd := fmt.Sprintf("docker logs --tail 50 %s 2>&1", ssh.EscapeShellArg(XrayContainerName))
+			logsOut, _, _, _ := client.RunSudoCommand(ctx, logCmd)
+			return fmt.Errorf("xray container readiness check failed (attempt %d, state: %s, logs: %s)",
+				attempt, strings.TrimSpace(out), strings.TrimSpace(logsOut))
+		}
+	}
+
+	m.mu.Lock()
+	probeFn := m.vlessProbeFn
+	m.mu.Unlock()
+
+	if probeFn != nil && opts.server != nil && opts.portPrimary > 0 {
+		probeParams := models.VLESSRealityParams{
+			PublicKey:  opts.pubB64,
+			ShortID:    opts.shortID,
+			ServerName: opts.serverName,
+		}
+		if len(opts.clients) > 0 {
+			probeParams.UUID = opts.clients[0].ID
+			probeParams.Flow = opts.clients[0].Flow
+		}
+		endpoint := net.JoinHostPort(opts.server.Host, strconv.Itoa(opts.portPrimary))
+		probeCtx, probeCancel := context.WithTimeout(ctx, 3*time.Second)
+		defer probeCancel()
+
+		if _, probeErr := probeFn(probeCtx, endpoint, probeParams, 3*time.Second); probeErr != nil {
+			logCmd := fmt.Sprintf("docker logs --tail 50 %s 2>&1", ssh.EscapeShellArg(XrayContainerName))
+			logsOut, _, _, _ := client.RunSudoCommand(ctx, logCmd)
+			return fmt.Errorf("xray container failed REALITY handshake readiness probe: %w (logs: %s)", probeErr, strings.TrimSpace(logsOut))
+		}
+	}
+
+	return nil
+}
+
+func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient, opts containerLaunchOptions) error {
+	backupContainerName := fmt.Sprintf("%s-backup", XrayContainerName)
+
+	hasExistingContainer, wasRunning, err := m.stageExistingContainer(ctx, client, backupContainerName, opts.existingCfgBytes)
+	if err != nil {
+		return err
 	}
 
 	rollback := func(triggerErr error) error {
@@ -297,8 +386,8 @@ func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient,
 		_, _, _, _ = client.RunSudoCommand(ctx, rmFailedCmd)
 
 		if hasExistingContainer {
-			if len(existingCfgBytes) > 0 {
-				if rUpErr := client.UploadSudoFile(ctx, XrayConfigPath, existingCfgBytes, 0600); rUpErr != nil {
+			if len(opts.existingCfgBytes) > 0 {
+				if rUpErr := client.UploadSudoFile(ctx, XrayConfigPath, opts.existingCfgBytes, 0600); rUpErr != nil {
 					return fmt.Errorf("%w (rollback failed to restore previous config: %v)", triggerErr, rUpErr)
 				}
 			}
@@ -312,6 +401,9 @@ func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient,
 					triggerErr, rCode, strings.TrimSpace(rErrOut), rErr)
 			}
 			return fmt.Errorf("%w (rolled back to previous container)", triggerErr)
+		}
+		if len(opts.existingCfgBytes) > 0 {
+			_ = client.UploadSudoFile(ctx, XrayConfigPath, opts.existingCfgBytes, 0600)
 		}
 		return triggerErr
 	}
@@ -333,21 +425,15 @@ func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient,
 		ssh.EscapeShellArg(XrayContainerName),
 		ssh.EscapeShellArg(XrayConfigDir),
 		ssh.EscapeShellArg(XrayConfigDir),
-		ssh.EscapeShellArg(image),
+		ssh.EscapeShellArg(opts.image),
 	)
 
 	if _, errOut, code, err := client.RunSudoCommand(ctx, runCmd); err != nil || code != 0 {
 		return rollback(fmt.Errorf("failed to run xray container (code %d): %s: %w", code, strings.TrimSpace(errOut), err))
 	}
 
-	checkCmd := fmt.Sprintf("docker inspect -f '{{.State.Running}} {{.State.Restarting}}' %s", ssh.EscapeShellArg(XrayContainerName))
-	out, errOut, code, err := client.RunSudoCommand(ctx, checkCmd)
-	if err != nil || code != 0 {
-		return rollback(fmt.Errorf("xray container failed to inspect (code %d): %s: %w", code, strings.TrimSpace(errOut), err))
-	}
-	fields := strings.Fields(strings.TrimSpace(out))
-	if len(fields) < 2 || fields[0] != "true" || fields[1] != "false" {
-		return rollback(fmt.Errorf("xray container is not running (state: %s)", strings.TrimSpace(out)))
+	if err := m.verifyContainerReadiness(ctx, client, opts); err != nil {
+		return rollback(err)
 	}
 
 	if hasExistingContainer {
@@ -539,7 +625,12 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 		return fmt.Errorf("failed to create xray config directory (code %d): %s: %w", code, errOut, err)
 	}
 
-	// 5. Render or preserve and upload config.json
+	// 5. Pre-pull / validate container image BEFORE mutating live configuration on disk.
+	if err := m.pullImage(ctx, client, profile.Image); err != nil {
+		return err
+	}
+
+	// 6. Render or preserve and upload config.json
 	cfgBytes, portPrimary, serverName, flow, err := m.prepareConfigBytes(
 		existingCfgBytes, existingParsed, portPrimary, serverName, flow,
 		hasPort, hasServerName, hasFlow, privB64, shortIDs, clients, server,
@@ -549,11 +640,24 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	}
 
 	if err := client.UploadSudoFile(ctx, XrayConfigPath, cfgBytes, 0600); err != nil {
+		if len(existingCfgBytes) > 0 {
+			_ = client.UploadSudoFile(ctx, XrayConfigPath, existingCfgBytes, 0600)
+		}
 		return fmt.Errorf("upload xray config: %w", err)
 	}
 
-	// 6. Launch amnezia-xray container with resolved profile image
-	if err := m.launchContainer(ctx, client, profile.Image, existingCfgBytes); err != nil {
+	// 7. Launch amnezia-xray container with resolved profile image and verify readiness before deleting backup
+	launchOpts := containerLaunchOptions{
+		image:            profile.Image,
+		existingCfgBytes: existingCfgBytes,
+		server:           server,
+		portPrimary:      portPrimary,
+		serverName:       serverName,
+		pubB64:           pubB64,
+		shortID:          shortID,
+		clients:          clients,
+	}
+	if err := m.launchContainer(ctx, client, launchOpts); err != nil {
 		return err
 	}
 
