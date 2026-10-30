@@ -24,6 +24,11 @@ import (
 	"github.com/google/uuid"
 	utls "github.com/metacubex/utls"
 
+	sTLS "github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-vmess/vless"
+	"github.com/sagernet/sing/common/json/badoption"
+
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
@@ -612,5 +617,121 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 				t.Fatalf("recovery mismatch: got %q, want %q", recReply, recPayload)
 			}
 		})
+	}
+}
+
+// TestDialer_VisionFlow_CheckptrUnderRace verifies that dialing VLESS with flow "xtls-rprx-vision"
+// over a REALITY TLS connection completes without triggering checkptr invalid allocation panics
+// under the Go race detector (-race).
+func TestDialer_VisionFlow_CheckptrUnderRace(t *testing.T) {
+	decoyAddr, cleanupDecoy := startDecoyServer(t, 0)
+	defer cleanupDecoy()
+	decoyHost, decoyPortStr, _ := net.SplitHostPort(decoyAddr)
+	var decoyPort uint16
+	_, _ = fmt.Sscanf(decoyPortStr, "%d", &decoyPort)
+
+	privKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate x25519: %v", err)
+	}
+	pubKey := privKey.PublicKey()
+	privB64 := base64.RawURLEncoding.EncodeToString(privKey.Bytes())
+	pubB64 := base64.RawURLEncoding.EncodeToString(pubKey.Bytes())
+	shortID := "0123456789abcdef"
+	serverName := "example.com"
+	clientUUID := uuid.New().String()
+
+	inboundTLSOpts := option.InboundTLSOptions{
+		Enabled:    true,
+		ServerName: serverName,
+		Reality: &option.InboundRealityOptions{
+			Enabled:    true,
+			PrivateKey: privB64,
+			ShortID:    badoption.Listable[string]{shortID},
+			Handshake: option.InboundRealityHandshakeOptions{
+				ServerOptions: option.ServerOptions{
+					Server:     decoyHost,
+					ServerPort: decoyPort,
+				},
+			},
+		},
+	}
+
+	serverCfg, err := sTLS.NewRealityServer(context.Background(), nil, inboundTLSOpts)
+	if err != nil {
+		t.Fatalf("NewRealityServer: %v", err)
+	}
+
+	serverLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen reality server: %v", err)
+	}
+	defer serverLn.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		for {
+			conn, aErr := serverLn.Accept()
+			if aErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				tlsConn, sErr := sTLS.ServerHandshake(ctx, c, serverCfg)
+				if sErr != nil {
+					return
+				}
+				defer tlsConn.Close()
+				req, rErr := vless.ReadRequest(tlsConn)
+				if rErr != nil {
+					return
+				}
+				if req.Flow != "xtls-rprx-vision" {
+					return
+				}
+				if _, wErr := tlsConn.Write([]byte{0, 0}); wErr != nil {
+					return
+				}
+				_, _ = io.Copy(tlsConn, tlsConn)
+			}(conn)
+		}
+	}()
+
+	params := models.VLESSRealityParams{
+		UUID:          clientUUID,
+		Flow:          "xtls-rprx-vision",
+		PublicKey:     pubB64,
+		ShortID:       shortID,
+		ServerName:    serverName,
+		Fingerprint:   "chrome",
+		EngineProfile: "modern_pq",
+	}
+
+	d, err := New(serverLn.Addr().String(), params)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+
+	conn, err := d.DialContext(dialCtx, "tcp", "127.0.0.1:80")
+	if err != nil {
+		t.Fatalf("DialContext failed under race detector: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte("hello from xtls-rprx-vision under race detector")
+	if _, wErr := conn.Write(payload); wErr != nil {
+		t.Fatalf("Write: %v", wErr)
+	}
+	reply := make([]byte, len(payload))
+	if _, rErr := io.ReadFull(conn, reply); rErr != nil {
+		t.Fatalf("ReadFull: %v", rErr)
+	}
+	if !bytes.Equal(reply, payload) {
+		t.Fatalf("reply mismatch: got %q, want %q", reply, payload)
 	}
 }

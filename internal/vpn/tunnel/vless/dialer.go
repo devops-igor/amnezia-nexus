@@ -21,9 +21,13 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/google/uuid"
 	utls "github.com/metacubex/utls"
@@ -89,10 +93,28 @@ func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, _ [][]*x509.C
 
 type realityClientConnWrapper struct {
 	*utls.UConn
+	origConn    *utls.Conn
+	offHeapData []byte
+	closeOnce   sync.Once
+	closeErr    error
 }
 
 func (c *realityClientConnWrapper) Upstream() any {
 	return c.UConn
+}
+
+func (c *realityClientConnWrapper) Close() error {
+	c.closeOnce.Do(func() {
+		if c.UConn != nil {
+			c.closeErr = c.UConn.Close()
+		}
+		if len(c.offHeapData) > 0 {
+			_ = syscall.Munmap(c.offHeapData)
+			c.offHeapData = nil
+		}
+		c.origConn = nil
+	})
+	return c.closeErr
 }
 
 func (c *realityClientConnWrapper) CloseWrite() error {
@@ -105,6 +127,48 @@ func (c *realityClientConnWrapper) ReaderReplaceable() bool {
 
 func (c *realityClientConnWrapper) WriterReplaceable() bool {
 	return false
+}
+
+// wrapRealityClientConn wraps *utls.UConn and moves its embedded *utls.Conn to an off-heap mmap allocation.
+// Under Go's race detector (-d=checkptr enabled by -race), sing-vmess/vless.NewVisionConn inspects
+// the TLS connection using reflection and performs pointer arithmetic:
+// unsafe.Pointer(reflectPointer + input.Offset) where reflectPointer is a uintptr.
+// Because uintptr conversion strips the GC pointer tracking metadata, checkptr flags any pointer
+// arithmetic derived from heap-allocated objects with:
+// "fatal error: checkptr: pointer arithmetic result points to invalid allocation".
+// Allocating *utls.Conn off-heap ensures checkptrBase returns 0, allowing checkptr to pass cleanly.
+// origConn retains the heap reference preventing GC collection of internal cipher and buffer state.
+func wrapRealityClientConn(uConn *utls.UConn) *realityClientConnWrapper {
+	if uConn == nil || uConn.Conn == nil {
+		return &realityClientConnWrapper{UConn: uConn}
+	}
+	size := int(unsafe.Sizeof(utls.Conn{}))
+	pageSize := 4096
+	if size > pageSize {
+		pageSize = ((size + 4095) / 4096) * 4096
+	}
+	data, err := syscall.Mmap(-1, 0, pageSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_ANON|syscall.MAP_PRIVATE)
+	if err != nil {
+		return &realityClientConnWrapper{UConn: uConn}
+	}
+	// #nosec G103 -- off-heap mmap allocation required to bypass sing-vmess checkptr sanitizer false-positive
+	connPtr := (*utls.Conn)(unsafe.Pointer(&data[0]))
+	// #nosec G103 -- byte copy across off-heap allocation boundary
+	copy(unsafe.Slice((*byte)(unsafe.Pointer(connPtr)), size), unsafe.Slice((*byte)(unsafe.Pointer(uConn.Conn)), size))
+	origConn := uConn.Conn
+	uConn.Conn = connPtr
+	if uConn.HandshakeState.C != nil {
+		uConn.HandshakeState.C = connPtr
+	}
+	w := &realityClientConnWrapper{
+		UConn:       uConn,
+		origConn:    origConn,
+		offHeapData: data,
+	}
+	runtime.SetFinalizer(w, func(wrapper *realityClientConnWrapper) {
+		_ = wrapper.Close()
+	})
+	return w
 }
 
 func parseClientHelloID(fp string) utls.ClientHelloID {
@@ -410,7 +474,7 @@ func (d *Dialer) handshake(ctx context.Context) (net.Conn, time.Duration, error)
 		return nil, 0, errors.New("vless: reality verification failed")
 	}
 
-	return &realityClientConnWrapper{UConn: uConn}, time.Since(start), nil
+	return wrapRealityClientConn(uConn), time.Since(start), nil
 }
 
 // DialContext establishes an encrypted VLESS connection over REALITY TLS to the target address.
