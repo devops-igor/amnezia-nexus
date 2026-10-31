@@ -525,6 +525,121 @@ func setProtocolPortFallback(protoMeta map[string]any, requestPort string) {
 	}
 }
 
+func buildInstallParams(req *models.InstallProtocolRequest, portExplicit bool) map[string]any {
+	params := map[string]any{
+		"port":          req.Port,
+		"port_explicit": portExplicit,
+	}
+	if req.EngineProfile != "" {
+		params["engine_profile"] = req.EngineProfile
+	}
+	if req.TLSEmulation != nil {
+		params["tls_emulation"] = *req.TLSEmulation
+	}
+	if req.TLSDomain != nil {
+		params["tls_domain"] = *req.TLSDomain
+	}
+	if req.MaxConnections != nil {
+		params["max_connections"] = *req.MaxConnections
+	}
+	if req.AWGProfile != nil {
+		params["awg_profile"] = string(*req.AWGProfile)
+	}
+	if req.AWGCPSProtocol != nil {
+		params["awg_cps_protocol"] = *req.AWGCPSProtocol
+	}
+	if req.AWGHeaderProtection != nil {
+		params["awg_header_protection"] = *req.AWGHeaderProtection
+	}
+	if req.VLESSOptions != nil {
+		params["vless_options"] = req.VLESSOptions
+		if req.VLESSOptions.FlowSet {
+			params["flow"] = req.VLESSOptions.Flow
+		}
+		if req.VLESSOptions.EngineProfile != "" {
+			if _, ok := params["engine_profile"]; !ok {
+				params["engine_profile"] = req.VLESSOptions.EngineProfile
+			}
+		}
+	}
+	if req.NaiveOptions != nil {
+		params["naive_options"] = req.NaiveOptions
+	}
+	return params
+}
+
+func resolveOmittedProtocolPort(req *models.InstallProtocolRequest, server *models.Server) error {
+	if req.Port != "" {
+		return nil
+	}
+	if req.VLESSOptions != nil && req.VLESSOptions.Port != "" {
+		req.Port = req.VLESSOptions.Port
+		return nil
+	}
+	if req.NaiveOptions != nil && req.NaiveOptions.Port != "" {
+		req.Port = req.NaiveOptions.Port
+		return nil
+	}
+	if server.Protocols != nil {
+		if protoMeta, ok := server.Protocols[req.Protocol].(map[string]any); ok {
+			switch p := protoMeta["port"].(type) {
+			case string:
+				if p != "" {
+					req.Port = p
+					return nil
+				}
+			case int:
+				if p > 0 {
+					req.Port = strconv.Itoa(p)
+					return nil
+				}
+			case float64:
+				if p > 0 {
+					req.Port = strconv.Itoa(int(p))
+					return nil
+				}
+			}
+		}
+	}
+	if req.Protocol != models.ProtocolVLESS {
+		return errors.New("Port is required for new protocol installation")
+	}
+	return nil
+}
+
+func (h *Handlers) persistInstalledProtocol(
+	ctx context.Context,
+	serverID int64,
+	server *models.Server,
+	protocol, reqPort string,
+) (string, error) {
+	if server.Protocols == nil {
+		server.Protocols = make(map[string]any)
+	}
+	protoMeta, _ := server.Protocols[protocol].(map[string]any)
+	if protoMeta == nil {
+		protoMeta = make(map[string]any)
+	}
+	protoMeta["installed"] = true
+	setProtocolPortFallback(protoMeta, reqPort)
+	server.Protocols[protocol] = protoMeta
+	if err := h.db.UpdateServerProtocols(ctx, serverID, server.Protocols); err != nil {
+		return "", err
+	}
+	auditPort := reqPort
+	switch p := protoMeta["port"].(type) {
+	case string:
+		if p != "" {
+			auditPort = p
+		}
+	case int:
+		if p > 0 {
+			auditPort = strconv.Itoa(p)
+		}
+	}
+	return auditPort, nil
+}
+
 // InstallProtocolHandler deploys a VPN protocol backend to the remote server.
 func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request) {
 	serverID, err := parseServerID(r)
@@ -571,36 +686,16 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	params := map[string]any{
-		"port": req.Port,
+	portExplicit := req.Port != "" ||
+		(req.VLESSOptions != nil && req.VLESSOptions.Port != "") ||
+		(req.NaiveOptions != nil && req.NaiveOptions.Port != "")
+
+	if err := resolveOmittedProtocolPort(&req, server); err != nil {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
+		return
 	}
-	if req.TLSEmulation != nil {
-		params["tls_emulation"] = *req.TLSEmulation
-	}
-	if req.TLSDomain != nil {
-		params["tls_domain"] = *req.TLSDomain
-	}
-	if req.MaxConnections != nil {
-		params["max_connections"] = *req.MaxConnections
-	}
-	if req.AWGProfile != nil {
-		params["awg_profile"] = string(*req.AWGProfile)
-	}
-	if req.AWGCPSProtocol != nil {
-		params["awg_cps_protocol"] = *req.AWGCPSProtocol
-	}
-	if req.AWGHeaderProtection != nil {
-		params["awg_header_protection"] = *req.AWGHeaderProtection
-	}
-	if req.VLESSOptions != nil {
-		params["vless_options"] = req.VLESSOptions
-		if req.VLESSOptions.FlowSet {
-			params["flow"] = req.VLESSOptions.Flow
-		}
-	}
-	if req.NaiveOptions != nil {
-		params["naive_options"] = req.NaiveOptions
-	}
+
+	params := buildInstallParams(&req, portExplicit)
 
 	if err := protoMgr.Install(ctx, server, params); err != nil {
 		slog.Error("protocol install failed", "server_id", serverID, "protocol", req.Protocol, "port", req.Port, "err", err)
@@ -608,22 +703,13 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if server.Protocols == nil {
-		server.Protocols = make(map[string]any)
-	}
-	protoMeta, _ := server.Protocols[req.Protocol].(map[string]any)
-	if protoMeta == nil {
-		protoMeta = make(map[string]any)
-	}
-	protoMeta["installed"] = true
-	setProtocolPortFallback(protoMeta, req.Port)
-	server.Protocols[req.Protocol] = protoMeta
-	if err := h.db.UpdateServerProtocols(ctx, serverID, server.Protocols); err != nil {
+	auditPort, err := h.persistInstalledProtocol(ctx, serverID, server, req.Protocol, req.Port)
+	if err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to update server protocols")
 		return
 	}
 
-	h.audit(r, "server.protocol_install", map[string]any{"server_id": serverID, "protocol": req.Protocol, "port": req.Port})
+	h.audit(r, "server.protocol_install", map[string]any{"server_id": serverID, "protocol": req.Protocol, "port": auditPort})
 	h.JSON(w, http.StatusOK, map[string]any{
 		"status":   "ok",
 		"protocol": req.Protocol,

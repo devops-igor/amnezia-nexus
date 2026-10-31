@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"runtime"
@@ -459,5 +461,145 @@ func TestDialer_ServerFirstTCP(t *testing.T) {
 
 	if string(buf) != banner {
 		t.Fatalf("unexpected banner: got %q, want %q", string(buf), banner)
+	}
+}
+
+func TestDialer_ModernPQFingerprintFallback(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	chReceived := make(chan []byte, 1)
+	go func() {
+		c, aErr := ln.Accept()
+		if aErr != nil {
+			return
+		}
+		defer c.Close()
+		buf := make([]byte, 4096)
+		n, _ := c.Read(buf)
+		chReceived <- buf[:n]
+	}()
+
+	params := fixture.Params
+	params.EngineProfile = "modern_pq"
+	params.Fingerprint = "ios" // iOS fingerprint does not have X25519MLKEM768 shares
+
+	d, err := New(ln.Addr().String(), params)
+	if err != nil {
+		t.Fatalf("New dialer: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		_, _ = d.DialContext(ctx, "tcp", "127.0.0.1:80")
+	}()
+
+	var rawHello []byte
+	select {
+	case rawHello = <-chReceived:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for ClientHello")
+	}
+
+	groups, _, _, err := parseClientHelloKeyShares(rawHello)
+	if err != nil {
+		t.Fatalf("parse ClientHello: %v", err)
+	}
+
+	// Verify that X25519MLKEM768 (4588) key share is present despite requesting "ios" fingerprint
+	hasPQShare := false
+	for _, g := range groups {
+		if g == 4588 {
+			hasPQShare = true
+			break
+		}
+	}
+	if !hasPQShare {
+		t.Errorf("expected modern_pq fallback to include group 4588 (X25519MLKEM768), got groups: %v", groups)
+	}
+}
+
+// TestAuditR4SustainedTransferIntegrityUnderGC performs sustained bulk transfer through
+// the production handshake wrapper under garbage-collection pressure, verifying byte-for-byte SHA-256 integrity.
+func TestAuditR4SustainedTransferIntegrityUnderGC(t *testing.T) {
+	f := setupTestServer(t, "", 0)
+	defer f.ServerClose()
+	echo, cleanup := startTCPEchoServer(t)
+	defer cleanup()
+	d, err := New(f.Endpoint, f.Params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	conn, err := d.DialContext(ctx, "tcp", echo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
+	var churn [][]byte
+	for round := 0; round < 200; round++ {
+		payload := bytes.Repeat([]byte(fmt.Sprintf("round-%03d-", round)), 4096)
+		errc := make(chan error, 1)
+		go func() { _, e := conn.Write(payload); errc <- e }()
+		got := make([]byte, len(payload))
+		if _, err := io.ReadFull(conn, got); err != nil {
+			t.Fatalf("round %d read: %v", round, err)
+		}
+		if e := <-errc; e != nil {
+			t.Fatalf("round %d write: %v", round, e)
+		}
+		if sha256.Sum256(got) != sha256.Sum256(payload) {
+			t.Fatalf("round %d: echoed bytes corrupted", round)
+		}
+		// ordinary allocation churn reuses freed spans of the same size classes
+		churn = append(churn, bytes.Repeat([]byte{0xA5}, 16384))
+		if len(churn) > 64 {
+			churn = churn[1:]
+		}
+		if round%5 == 0 {
+			runtime.GC()
+		}
+	}
+	t.Logf("200 verified rounds of %d bytes", 4096*10)
+}
+
+// TestAuditR4CloseDuringBlockedReadRepeated tests streambridge-style teardown:
+// one goroutine blocked in Read, another calls Close.
+func TestAuditR4CloseDuringBlockedReadRepeated(t *testing.T) {
+	f := setupTestServer(t, "", 0)
+	defer f.ServerClose()
+	echo, cleanup := startTCPEchoServer(t)
+	defer cleanup()
+	d, err := New(f.Endpoint, f.Params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 40; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		conn, err := d.DialContext(ctx, "tcp", echo)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		errc := make(chan error, 1)
+		go func() { _, e := conn.Read(make([]byte, 1)); errc <- e }()
+		time.Sleep(5 * time.Millisecond)
+		_ = conn.Close()
+		select {
+		case <-errc:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: Read not unblocked", i)
+		}
+		cancel()
 	}
 }

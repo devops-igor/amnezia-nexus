@@ -18,13 +18,18 @@ import (
 )
 
 type mockXraySSHClient struct {
-	mu                 sync.Mutex
-	commands           []string
-	files              map[string][]byte
-	dockerAlive        bool
-	sshUser            string
-	denyConfigDownload bool
-	denyConfigStat     bool
+	mu                   sync.Mutex
+	commands             []string
+	files                map[string][]byte
+	dockerAlive          bool
+	backupContainerAlive bool
+	existingContainer    *bool
+	existingRunning      *bool
+	hadInitialConfig     bool
+	checkedInitialCfg    bool
+	sshUser              string
+	denyConfigDownload   bool
+	denyConfigStat       bool
 }
 
 func newMockXraySSHClient() *mockXraySSHClient {
@@ -58,6 +63,33 @@ func (m *mockXraySSHClient) RunSudoCommand(ctx context.Context, cmd string) (str
 	m.commands = append(m.commands, "sudo: "+cmd)
 
 	if strings.Contains(cmd, "docker inspect") {
+		if strings.Contains(cmd, "amnezia-xray-backup") {
+			if m.backupContainerAlive {
+				if strings.Contains(cmd, "{{.State.Running}}") && !strings.Contains(cmd, "{{.State.Restarting}}") {
+					return "false\n", "", 0, nil
+				}
+				return "false false\n", "", 0, nil
+			}
+			return "", "Error: No such container: amnezia-xray-backup", 1, nil
+		}
+		if m.backupContainerAlive {
+			// amnezia-xray was renamed to backup, so amnezia-xray does not exist
+			return "", "Error: No such container: amnezia-xray", 1, nil
+		}
+		if strings.Contains(cmd, "{{.State.Running}}") && !strings.Contains(cmd, "{{.State.Restarting}}") {
+			if m.existingContainer != nil {
+				if *m.existingContainer {
+					if m.existingRunning != nil && !*m.existingRunning {
+						return "false\n", "", 0, nil
+					}
+					return "true\n", "", 0, nil
+				}
+				return "", "Error: No such container: amnezia-xray", 1, nil
+			}
+			if m.checkedInitialCfg && !m.hadInitialConfig {
+				return "", "Error: No such container: amnezia-xray", 1, nil
+			}
+		}
 		if m.dockerAlive {
 			return "true false\n", "", 0, nil
 		}
@@ -69,19 +101,41 @@ func (m *mockXraySSHClient) RunSudoCommand(ctx context.Context, cmd string) (str
 		}
 		return "", "", 0, nil
 	}
-	if strings.Contains(cmd, "docker run") {
+	if strings.Contains(cmd, "docker run") || strings.Contains(cmd, "docker start") {
 		m.dockerAlive = true
 		return "container_id_xray", "", 0, nil
 	}
-	if strings.Contains(cmd, "docker stop") || strings.Contains(cmd, "docker rm") {
+	if strings.Contains(cmd, "docker rename") {
+		idxBackup := strings.Index(cmd, "amnezia-xray-backup")
+		if idxBackup != -1 && idxBackup < strings.LastIndex(cmd, "amnezia-xray") {
+			// Revert rename: amnezia-xray-backup -> amnezia-xray
+			m.dockerAlive = m.backupContainerAlive
+			m.backupContainerAlive = false
+		} else if strings.Contains(cmd, "amnezia-xray") && idxBackup != -1 {
+			// Initial rename: amnezia-xray -> amnezia-xray-backup
+			m.backupContainerAlive = m.dockerAlive
+			m.dockerAlive = false
+		}
+		return "OK", "", 0, nil
+	}
+	if strings.Contains(cmd, "docker rm") && strings.Contains(cmd, "amnezia-xray-backup") {
+		m.backupContainerAlive = false
+		return "", "", 0, nil
+	}
+	if (strings.Contains(cmd, "docker stop") || strings.Contains(cmd, "docker rm")) && !strings.Contains(cmd, "amnezia-xray-backup") {
 		m.dockerAlive = false
 		return "", "", 0, nil
 	}
 	if strings.Contains(cmd, "docker restart") {
+		m.dockerAlive = true
 		return "amnezia-xray", "", 0, nil
 	}
 	if strings.HasPrefix(cmd, "test -f ") {
 		path := strings.Trim(strings.TrimPrefix(cmd, "test -f "), "'")
+		if path == XrayConfigPath && !m.checkedInitialCfg {
+			_, m.hadInitialConfig = m.files[path]
+			m.checkedInitialCfg = true
+		}
 		if _, ok := m.files[path]; ok {
 			return "", "", 0, nil
 		}
@@ -146,6 +200,10 @@ func (m *mockXraySSHClient) DownloadSudoFile(ctx context.Context, remotePath str
 func (m *mockXraySSHClient) FileExists(ctx context.Context, remotePath string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if remotePath == XrayConfigPath && !m.checkedInitialCfg {
+		_, m.hadInitialConfig = m.files[remotePath]
+		m.checkedInitialCfg = true
+	}
 	if m.denyConfigStat && remotePath == XrayConfigPath {
 		return false, os.ErrPermission
 	}

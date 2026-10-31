@@ -474,7 +474,7 @@ func TestOrchestrator_ApplyConnectionUpdates_PortalFlushBeforeMonthlyRollover(t 
 	defer cleanup()
 	ctx := context.Background()
 	now := time.Now().UTC()
-	lastMonth := now.AddDate(0, -1, 0).Format(time.RFC3339)
+	lastMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, -1, 0).Format(time.RFC3339)
 
 	serverID, err := db.CreateServer(ctx, &models.Server{Name: "Rollover Server", Host: "10.0.0.2"})
 	if err != nil {
@@ -567,7 +567,7 @@ func TestOrchestrator_ApplyConnectionUpdates_PortalFlushBeforePeriodReset(t *tes
 			thisMonth := now.Format(time.RFC3339)
 			monthlyResetAt := thisMonth
 			if tc.rollover {
-				monthlyResetAt = now.AddDate(0, -1, 0).Format(time.RFC3339)
+				monthlyResetAt = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, -1, 0).Format(time.RFC3339)
 			}
 			serverID, err := db.CreateServer(ctx, &models.Server{Name: "Period Server", Host: "10.0.0.3"})
 			if err != nil {
@@ -680,7 +680,8 @@ func TestOrchestrator_MonthlyRolloverAndStrategyReset(t *testing.T) {
 	ctx := context.Background()
 
 	// Setup user with naive Python timestamp from previous month
-	prevMonthTime := time.Now().UTC().AddDate(0, -1, 0)
+	now := time.Now().UTC()
+	prevMonthTime := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, -1, 0)
 	prevMonthNaiveStr := prevMonthTime.Format("2006-01-02T15:04:05.000000")
 
 	uID, _ := db.CreateUser(ctx, &models.User{
@@ -1911,7 +1912,7 @@ func TestOrchestrator_ExtractBytes_And_ResetStrategies(t *testing.T) {
 	now := time.Now().UTC()
 	yesterday := now.AddDate(0, 0, -1).Format(time.RFC3339)
 	lastWeek := now.AddDate(0, 0, -8).Format(time.RFC3339)
-	lastMonth := now.AddDate(0, -1, 0).Format(time.RFC3339)
+	lastMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, -1, 0).Format(time.RFC3339)
 	today := now.Format(time.RFC3339)
 
 	uDaily := &models.User{TrafficResetStrategy: models.ResetStrategyDaily, LastResetAt: &yesterday}
