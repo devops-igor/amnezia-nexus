@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,12 +84,16 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 	}
 	seed := func(protocol, suffix string) *models.UserConnection {
 		t.Helper()
+		clientID := "client-1" // present in the mocked AWG clients table
+		if strings.HasSuffix(suffix, "delete") {
+			clientID = fmt.Sprintf("client-%s-%s", protocol, suffix)
+		}
 		conn := &models.UserConnection{
 			ID:        fmt.Sprintf("rbac-%s-%s", protocol, suffix),
 			UserID:    users[models.RoleUser].ID,
 			ServerID:  serverID,
 			Protocol:  protocol,
-			ClientID:  "client-1", // present in the mocked AWG clients table
+			ClientID:  clientID,
 			Name:      fmt.Sprintf("rbac-%s-%s", protocol, suffix),
 			CreatedAt: time.Now(),
 		}
