@@ -545,6 +545,8 @@ func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 	if leftover != nil {
 		if err := EnsureBackendProxyPeerPreservation(ctx, s.db, serverID, leftover.Protocol, leftover.ProtocolParams); err != nil {
 			log.Printf("[vpn] warning: delete backend %d: failed to ensure peer preservation for leftover row %d: %v", serverID, leftover.ID, err)
+			s.mu.Lock()
+			return fmt.Errorf("failed to ensure peer preservation for leftover row %d: %w", leftover.ID, err)
 		}
 		// Reassign connected sessions that lost the failover race onto the
 		// leftover row, marking them draining (issue #29: no orphaned

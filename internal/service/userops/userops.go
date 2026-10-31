@@ -196,6 +196,9 @@ func lockUsers(req MassOperationRequest) func() {
 
 // PerformMassOperations executes multiple SSH operations grouped by server with bounded concurrency.
 func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.db == nil {
 		return errors.New("database is not configured")
 	}
@@ -255,13 +258,17 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 	}
 
 	// 4. Run server operations concurrently
-	g, gCtx := errgroup.WithContext(ctx)
+	var (
+		g          errgroup.Group
+		workerMu   sync.Mutex
+		workerErrs []error
+	)
 	g.SetLimit(10)
 
 	for serverID, ops := range serverOps {
 		sID := serverID
 		sOps := ops
-		g.Go(func() (err error) {
+		g.Go(func() error {
 			defer func() {
 				if r := recover(); r != nil {
 					slog.Error("Panic recovered in userops server worker", "server_id", sID, "panic", r)
@@ -270,11 +277,22 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 					}
 				}
 			}()
-			return s.runServerOperations(gCtx, sID, sOps, &toggleFailures)
+			if err := ctx.Err(); err != nil {
+				workerMu.Lock()
+				workerErrs = append(workerErrs, err)
+				workerMu.Unlock()
+				return nil
+			}
+			if err := s.runServerOperations(ctx, sID, sOps, &toggleFailures); err != nil {
+				workerMu.Lock()
+				workerErrs = append(workerErrs, err)
+				workerMu.Unlock()
+			}
+			return nil
 		})
 	}
 
-	workerErr := g.Wait()
+	_ = g.Wait()
 
 	// 5. Final DB cleanup at user level
 	for _, uid := range req.DeleteUIDs {
@@ -303,7 +321,7 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 		}
 	}
 
-	return errors.Join(append(toggleErrs, workerErr)...)
+	return errors.Join(append(toggleErrs, workerErrs...)...)
 }
 
 func (s *Service) loadServerForOperations(ctx context.Context, serverID int64, ops *serverOperations, toggleFailures *sync.Map) (*models.Server, error) {

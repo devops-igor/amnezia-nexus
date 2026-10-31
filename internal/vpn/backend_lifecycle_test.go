@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -711,6 +712,89 @@ func TestDeleteBackend_Lifecycle(t *testing.T) {
 		}
 		if sess.BackendTunnelID != newTun.ID {
 			t.Errorf("sess.BackendTunnelID = %d, want %d", sess.BackendTunnelID, newTun.ID)
+		}
+	})
+
+	t.Run("fails closed and retains leftover row on peer preservation failure", func(t *testing.T) {
+		db := setupTestDB(t)
+		svc, _, _, uID, _ := setupTestVPNService(t, db)
+		defer closeBackendDevices(svc)
+		ctx := t.Context()
+
+		oldTun := lbTunnel(t, svc, db, 971, "awg971", "pub971", "priv971", "198.51.100.171:51820")
+		newTun := lbTunnel(t, svc, db, 972, "awg972", "pub972", "priv972", "198.51.100.172:51820")
+
+		naiveParams, err := json.Marshal(models.NaiveProxyParams{
+			Domain:   "failclosed.example.com",
+			Username: "drift-failclosed-user",
+			Password: "drift-password",
+		})
+		if err != nil {
+			t.Fatalf("Marshal NaiveProxyParams: %v", err)
+		}
+
+		var leftoverID int64
+		var seed *models.VPNSession
+
+		// Inject the drift leftover row and SQLite trigger during Phase 1 disable,
+		// after the Phase 0 pre-check has already passed.
+		svc.SetTunnelEnabledHookForTest(func(hookCtx context.Context, sID int64, enabled bool, disableReason string) error {
+			var createErr error
+			leftoverID, createErr = db.CreateBackendTunnel(hookCtx, &models.BackendTunnel{
+				ServerID:       oldTun.ServerID,
+				InterfaceName:  "naive971-drift",
+				Endpoint:       "198.51.100.171:443",
+				Protocol:       models.ProtocolNaive,
+				ProtocolParams: naiveParams,
+				Status:         "active",
+			})
+			if createErr != nil {
+				return createErr
+			}
+
+			seed = &models.VPNSession{
+				UserID:          uID,
+				BackendTunnelID: leftoverID,
+				PeerPublicKey:   "peer-drift-failclosed-1",
+				AssignedIP:      "10.100.0.71",
+				Status:          "connected",
+			}
+			if sessErr := db.CreateVPNSession(hookCtx, seed); sessErr != nil {
+				return sessErr
+			}
+
+			triggerSQL := "CREATE TRIGGER fail_peer_lifecycle_insert BEFORE INSERT ON peer_lifecycle BEGIN SELECT RAISE(ABORT, 'injected peer_lifecycle persistence failure'); END"
+			_, trigErr := db.ExecContext(hookCtx, triggerSQL)
+			return trigErr
+		})
+
+		err = svc.DeleteBackend(ctx, oldTun.ServerID)
+		if err == nil {
+			t.Fatal("expected DeleteBackend to fail closed on peer preservation failure, got nil")
+		}
+		if !strings.Contains(err.Error(), "failed to ensure peer preservation for leftover row") {
+			t.Fatalf("expected error to mention peer preservation failure for leftover row, got: %v", err)
+		}
+
+		// Leftover row MUST remain intact in database
+		leftover, err := db.GetBackendTunnelByID(ctx, leftoverID)
+		if err != nil {
+			t.Fatalf("GetBackendTunnelByID: %v", err)
+		}
+		if leftover == nil {
+			t.Fatal("leftover backend_tunnels row was deleted, expected retained for retry")
+		}
+
+		// Session MUST NOT have been reassigned to newTun
+		sess, err := db.GetVPNSessionByID(ctx, seed.ID)
+		if err != nil {
+			t.Fatalf("GetVPNSessionByID: %v", err)
+		}
+		if sess == nil {
+			t.Fatal("session not found")
+		}
+		if sess.BackendTunnelID != leftoverID {
+			t.Errorf("sess.BackendTunnelID = %d, want retained on leftover %d (survivor was %d)", sess.BackendTunnelID, leftoverID, newTun.ID)
 		}
 	})
 }
