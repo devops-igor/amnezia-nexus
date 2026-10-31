@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -474,4 +475,119 @@ func TestXrayManager_StageExistingContainer_AmbiguousRenameFailureRecovery(t *te
 			t.Error("expected original config restored after ambiguous rename recovery")
 		}
 	})
+}
+
+func TestXrayManager_UpgradeWithExistingClient_EmptyFlowProbedWithEmptyFlow(t *testing.T) {
+	mockSSH := newMockXraySSHClient()
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+
+	clientUUID := "f1b2c3d4-e5f6-4a1b-8c2d-3e4f5a6b7c8d"
+	key, _, err := GenerateRealityKeypair()
+	if err != nil {
+		t.Fatalf("GenerateRealityKeypair: %v", err)
+	}
+	// Existing client configured with empty Flow ("")
+	cls := []XrayClient{{ID: clientUUID, Flow: "", Email: "plain-vless-client"}}
+	cfg, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, cls)
+	if err != nil {
+		t.Fatalf("RenderXrayConfig: %v", err)
+	}
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
+
+	var capturedTrafficParams models.VLESSRealityParams
+	trafficProbeCalled := false
+	mgr.SetVLESSTrafficProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		trafficProbeCalled = true
+		capturedTrafficParams = params
+		return 15, nil
+	})
+
+	server := &models.Server{
+		ID:   941,
+		Host: "192.0.2.141",
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{
+				"installed":      true,
+				"port":           8443,
+				"engine_profile": "legacy",
+			},
+		},
+	}
+
+	// Install with fallback flow configured ("xtls-rprx-vision")
+	err = mgr.Install(context.Background(), server, map[string]any{
+		"port": 8443,
+		"flow": "xtls-rprx-vision",
+	})
+	if err != nil {
+		t.Fatalf("mgr.Install failed: %v", err)
+	}
+
+	if !trafficProbeCalled {
+		t.Fatal("expected traffic probe to be invoked during readiness check")
+	}
+	if capturedTrafficParams.UUID != clientUUID {
+		t.Errorf("probeParams.UUID = %q, want %q", capturedTrafficParams.UUID, clientUUID)
+	}
+	// Finding F1 assertion: client with empty flow must be probed with empty flow (""),
+	// not falling back to opts.flow ("xtls-rprx-vision").
+	if capturedTrafficParams.Flow != "" {
+		t.Errorf("probeParams.Flow = %q, want empty string for client with empty flow", capturedTrafficParams.Flow)
+	}
+}
+
+func TestXrayManager_ProfileSwitch_OmittedPortPreservesExistingInboundPort(t *testing.T) {
+	mockSSH := newMockXraySSHClient()
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+
+	key, _, err := GenerateRealityKeypair()
+	if err != nil {
+		t.Fatalf("GenerateRealityKeypair: %v", err)
+	}
+	// Remote Xray inbound configuration is on port 8443
+	cfg, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{})
+	if err != nil {
+		t.Fatalf("RenderXrayConfig: %v", err)
+	}
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
+
+	// Server metadata is STALE with port 443
+	server := &models.Server{
+		ID:   942,
+		Host: "192.0.2.142",
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{
+				"installed":      true,
+				"port":           443, // STALE! Mismatched with remote 8443!
+				"engine_profile": "legacy",
+			},
+		},
+	}
+
+	// Routine profile switch where port was omitted (port_explicit: false)
+	err = mgr.Install(context.Background(), server, map[string]any{
+		"engine_profile": "modern_pq",
+		"port_explicit":  false,
+	})
+	if err != nil {
+		t.Fatalf("mgr.Install failed: %v", err)
+	}
+
+	// 1. Verify remote Xray inbound config was NOT overwritten with stale port 443
+	parsed, err := ParseXrayConfig(mockSSH.files[XrayConfigPath])
+	if err != nil {
+		t.Fatalf("ParseXrayConfig: %v", err)
+	}
+	if len(parsed.Inbounds) == 0 || parsed.Inbounds[0].Port != 8443 {
+		t.Fatalf("remote config inbound port = %v, want 8443 (stale metadata 443 must not overwrite)", parsed.Inbounds[0].Port)
+	}
+
+	// 2. Verify server metadata was repaired to 8443
+	vMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any)
+	if !ok {
+		t.Fatalf("expected VLESS metadata on server")
+	}
+	if port, _ := vMeta["port"].(int); port != 8443 {
+		t.Errorf("server.Protocols[vless] port = %v, want 8443", port)
+	}
 }

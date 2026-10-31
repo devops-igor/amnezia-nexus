@@ -76,6 +76,9 @@ func resolveInstallNetworkOptions(params map[string]any) (int, string, string, b
 	if flow == "none" {
 		flow = ""
 	}
+	if exp, ok := params["port_explicit"].(bool); ok {
+		hasPort = exp
+	}
 	return portPrimary, serverName, flow, hasPort, hasServerName, hasFlow
 }
 
@@ -483,9 +486,7 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 		probeFlow := opts.flow
 		if hasClients {
 			probeUUID = opts.clients[0].ID
-			if opts.clients[0].Flow != "" {
-				probeFlow = opts.clients[0].Flow
-			}
+			probeFlow = opts.clients[0].Flow
 		}
 		if probeUUID == "" {
 			probeUUID = uuid.NewString()
