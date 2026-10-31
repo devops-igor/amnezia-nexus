@@ -61,10 +61,26 @@ type connToggle struct {
 	enabled bool
 }
 
+// BackendCredentialRotator replaces a shared backend identity before user revocation.
+type BackendCredentialRotator interface {
+	RotateSharedBackendCredential(context.Context, *models.Server, manager.ProtocolManager, string, string) error
+}
+
 // Service coordinates SSH-based user operations and mass batching.
 type Service struct {
 	db       *database.DB
 	registry ProtocolResolver
+	vpnSvc   BackendCredentialRotator
+}
+
+// SetVPNService wires the live backend pool for credential rotation.
+func (s *Service) SetVPNService(svc BackendCredentialRotator) { s.vpnSvc = svc }
+
+func (s *Service) rotateBackendCredential(ctx context.Context, server *models.Server, mgr manager.ProtocolManager, proto, clientID string) error {
+	if s.vpnSvc == nil {
+		return errors.New("VPN service unavailable for backend rotation")
+	}
+	return s.vpnSvc.RotateSharedBackendCredential(ctx, server, mgr, proto, clientID)
 }
 
 // New creates a new user operations Service.
@@ -100,6 +116,13 @@ func (s *Service) DeleteUser(ctx context.Context, userID string) (bool, error) {
 	})
 	if err != nil {
 		return false, err
+	}
+	remaining, err := s.db.GetUser(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("verify deleted user %s: %w", userID, err)
+	}
+	if remaining != nil {
+		return false, errors.New("user still has connections that could not be revoked")
 	}
 
 	return true, nil
@@ -173,6 +196,9 @@ func lockUsers(req MassOperationRequest) func() {
 
 // PerformMassOperations executes multiple SSH operations grouped by server with bounded concurrency.
 func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.db == nil {
 		return errors.New("database is not configured")
 	}
@@ -198,11 +224,16 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 		return ops
 	}
 
+	deleteBlocked := make(map[string]bool)
+	var deleteErrs []error
+
 	// 1. Group deletes by server
 	for _, uid := range req.DeleteUIDs {
 		conns, err := s.db.GetConnectionsByUserID(ctx, uid)
 		if err != nil {
 			slog.Warn("Failed to fetch connections for user deletion", "user_id", uid, "err", err)
+			deleteBlocked[uid] = true
+			deleteErrs = append(deleteErrs, fmt.Errorf("fetch connections for user %s: %w", uid, err))
 			continue
 		}
 		for _, c := range conns {
@@ -232,13 +263,17 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 	}
 
 	// 4. Run server operations concurrently
-	g, gCtx := errgroup.WithContext(ctx)
+	var (
+		g          errgroup.Group
+		workerMu   sync.Mutex
+		workerErrs []error
+	)
 	g.SetLimit(10)
 
 	for serverID, ops := range serverOps {
 		sID := serverID
 		sOps := ops
-		g.Go(func() (err error) {
+		g.Go(func() error {
 			defer func() {
 				if r := recover(); r != nil {
 					slog.Error("Panic recovered in userops server worker", "server_id", sID, "panic", r)
@@ -247,7 +282,17 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 					}
 				}
 			}()
-			s.runServerOperations(gCtx, sID, sOps, &toggleFailures)
+			if err := ctx.Err(); err != nil {
+				workerMu.Lock()
+				workerErrs = append(workerErrs, err)
+				workerMu.Unlock()
+				return nil
+			}
+			if err := s.runServerOperations(ctx, sID, sOps, &toggleFailures); err != nil {
+				workerMu.Lock()
+				workerErrs = append(workerErrs, err)
+				workerMu.Unlock()
+			}
 			return nil
 		})
 	}
@@ -256,14 +301,24 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 
 	// 5. Final DB cleanup at user level
 	for _, uid := range req.DeleteUIDs {
-		conns, _ := s.db.GetConnectionsByUserID(ctx, uid)
+		if deleteBlocked[uid] {
+			slog.Warn("Skipping user record deletion due to prior connection enumeration failure", "user_id", uid)
+			continue
+		}
+		conns, err := s.db.GetConnectionsByUserID(ctx, uid)
+		if err != nil {
+			slog.Warn("Failed to verify remaining connections for user deletion", "user_id", uid, "err", err)
+			deleteErrs = append(deleteErrs, fmt.Errorf("verify connections for user %s: %w", uid, err))
+			continue
+		}
 		if len(conns) > 0 {
 			slog.Warn("Skipping user record deletion due to remaining connections from failed remote removals", "user_id", uid, "remaining_connections", len(conns))
 			continue
 		}
-		_, err := s.db.DeleteUser(ctx, uid)
+		_, err = s.db.DeleteUser(ctx, uid)
 		if err != nil {
 			slog.Warn("Failed to delete user record", "user_id", uid, "err", err)
+			deleteErrs = append(deleteErrs, fmt.Errorf("delete user record %s: %w", uid, err))
 		} else {
 			_ = s.db.DeletePeerLifecycleByUserID(ctx, uid)
 		}
@@ -281,43 +336,82 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 		}
 	}
 
-	return errors.Join(toggleErrs...)
+	allErrs := make([]error, 0, len(toggleErrs)+len(deleteErrs)+len(workerErrs))
+	allErrs = append(allErrs, toggleErrs...)
+	allErrs = append(allErrs, deleteErrs...)
+	allErrs = append(allErrs, workerErrs...)
+	return errors.Join(allErrs...)
 }
 
-func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *serverOperations, toggleFailures *sync.Map) {
+func (s *Service) loadServerForOperations(ctx context.Context, serverID int64, ops *serverOperations, toggleFailures *sync.Map) (*models.Server, error) {
 	server, err := s.db.GetServer(ctx, serverID)
-	if err != nil || server == nil {
-		slog.Warn("Server not found for mass operations", "server_id", serverID, "err", err)
-		if err == nil {
-			err = errors.New("server not found")
-		}
-		for _, t := range ops.toggles {
-			toggleFailures.Store(t.conn.UserID, fmt.Errorf("get server %d: %w", serverID, err))
-		}
-		return
+	if err == nil && server != nil {
+		return server, nil
+	}
+	slog.Warn("Server not found for mass operations", "server_id", serverID, "err", err)
+	if err == nil {
+		err = errors.New("server not found")
+	}
+	for _, t := range ops.toggles {
+		toggleFailures.Store(t.conn.UserID, fmt.Errorf("get server %d: %w", serverID, err))
+	}
+	if len(ops.deletes) > 0 {
+		return nil, fmt.Errorf("get server %d for %d deletes: %w", serverID, len(ops.deletes), err)
+	}
+	return nil, nil
+}
+
+func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *serverOperations, toggleFailures *sync.Map) error {
+	server, err := s.loadServerForOperations(ctx, serverID, ops, toggleFailures)
+	if server == nil {
+		return err
 	}
 
+	var deleteErrors []error
 	// 1. Deletes
 	for _, c := range ops.deletes {
 		proto := models.NormalizeProtocol(c.Protocol)
-		removeFailed := false
+		shared, err := s.db.HasOtherUserConnectionCredential(ctx, &c)
+		if err != nil {
+			deleteErrors = append(deleteErrors, fmt.Errorf("check shared credential %s: %w", c.ClientID, err))
+			continue
+		}
+		if shared {
+			deleteErrors = append(deleteErrors, fmt.Errorf("client %s: %w", c.ClientID, database.ErrSharedUserCredential))
+			continue
+		}
+		isBackend, err := s.db.IsBackendTunnelClient(ctx, serverID, c.Protocol, c.ClientID)
+		if err != nil {
+			deleteErrors = append(deleteErrors, fmt.Errorf("check backend tunnel for server %d client %s: %w", serverID, c.ClientID, err))
+			continue
+		}
+		var mgr manager.ProtocolManager
+		var ok bool
 		if s.registry != nil {
-			if mgr, ok := s.registry.Get(proto); ok {
-				if err := mgr.RemoveClient(ctx, server, c.ClientID); err != nil {
-					slog.Warn("Failed to remove remote client during mass delete",
-						"server_id", serverID,
-						"protocol", proto,
-						"client_id", c.ClientID,
-						"err", err,
-					)
-					removeFailed = true
-				}
+			mgr, ok = s.registry.Get(proto)
+		}
+		if !ok {
+			deleteErrors = append(deleteErrors, fmt.Errorf("protocol manager %q unavailable for server %d client %s", proto, serverID, c.ClientID))
+			continue
+		}
+		if isBackend {
+			if err := s.rotateBackendCredential(ctx, server, mgr, proto, c.ClientID); err != nil {
+				slog.Warn("Failed to rotate backend credentials during mass delete", "server_id", serverID, "err", err)
+				deleteErrors = append(deleteErrors, fmt.Errorf("rotate backend for server %d: %w", serverID, err))
+				continue
 			}
 		}
-		if !removeFailed {
-			_, _ = s.db.DeleteConnection(ctx, c.ID)
-			_ = s.db.DeletePeerLifecycle(ctx, c.ServerID, c.Protocol, c.ClientID)
+		if err := mgr.RemoveClient(ctx, server, c.ClientID); err != nil {
+			slog.Warn("Failed to remove remote client during mass delete",
+				"server_id", serverID, "protocol", proto, "client_id", c.ClientID, "err", err)
+			deleteErrors = append(deleteErrors, fmt.Errorf("remove remote client %s: %w", c.ClientID, err))
+			continue
 		}
+		if _, err := s.db.DeleteConnection(ctx, c.ID); err != nil {
+			deleteErrors = append(deleteErrors, fmt.Errorf("delete connection %s: %w", c.ID, err))
+			continue
+		}
+		_ = s.db.DeletePeerLifecycle(ctx, c.ServerID, c.Protocol, c.ClientID)
 	}
 
 	// 2. Toggles
@@ -371,6 +465,7 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 			}
 		}
 	}
+	return errors.Join(deleteErrors...)
 }
 
 // rollbackCreate removes a just-provisioned remote client and its lifecycle record.
@@ -418,6 +513,17 @@ func (s *Service) runToggleOperations(
 	}
 	for _, t := range toggles {
 		proto := models.NormalizeProtocol(t.conn.Protocol)
+		if !t.enabled {
+			shared, err := s.db.HasOtherUserConnectionCredential(ctx, &t.conn)
+			if err != nil {
+				recordFailure(t, proto, fmt.Errorf("check shared credential: %w", err))
+				continue
+			}
+			if shared {
+				recordFailure(t, proto, database.ErrSharedUserCredential)
+				continue
+			}
+		}
 		var mgr manager.ProtocolManager
 		var ok bool
 		if s.registry != nil {
@@ -426,6 +532,31 @@ func (s *Service) runToggleOperations(
 		if !ok {
 			recordFailure(t, proto, errors.New("protocol manager is not configured"))
 			continue
+		}
+		if !t.enabled {
+			isBackend, err := s.db.IsBackendTunnelClient(ctx, server.ID, proto, t.conn.ClientID)
+			if err != nil {
+				recordFailure(t, proto, fmt.Errorf("check backend tunnel: %w", err))
+				continue
+			}
+			if isBackend {
+				if err := s.rotateBackendCredential(ctx, server, mgr, proto, t.conn.ClientID); err != nil {
+					recordFailure(t, proto, fmt.Errorf("rotate shared backend credential: %w", err))
+					continue
+				}
+				// The former identity must be revoked, not merely toggled: the
+				// replacement now owns the backend's live data plane.
+				if err := mgr.RemoveClient(ctx, server, t.conn.ClientID); err != nil {
+					recordFailure(t, proto, err)
+					continue
+				}
+				if _, err := s.db.DeleteConnection(ctx, t.conn.ID); err != nil {
+					recordFailure(t, proto, fmt.Errorf("delete withdrawn connection: %w", err))
+					continue
+				}
+				_ = s.db.DeletePeerLifecycle(ctx, server.ID, proto, t.conn.ClientID)
+				continue
+			}
 		}
 		if toggler, ok := mgr.(ClientToggler); ok {
 			if err := toggler.ToggleClient(ctx, server, t.conn.ClientID, t.enabled); err != nil {

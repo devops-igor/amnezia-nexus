@@ -254,25 +254,12 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 	if targetFamily == "" {
 		eligibleFamilies := []string{models.ProtocolAWG}
 		if multiProto {
-			// Finding R2: exclude Naive backends from generic full-tunnel client admission
-			// unless the client/session specifies an explicit stream/TCP routing policy
-			// or explicit Naive protocol affinity.
-			isStreamOrTCP := false
-			if conn != nil {
-				if models.NormalizeProtocol(conn.Protocol) == models.ProtocolNaive {
-					isStreamOrTCP = true
-				}
-				if pol, ok := conn.ClientParams["routing_policy"].(string); ok && (pol == "tcp" || pol == "stream") {
-					isStreamOrTCP = true
-				}
-				if streamOnly, ok := conn.ClientParams["stream_only"].(bool); ok && streamOnly {
-					isStreamOrTCP = true
-				}
-			}
-			if isStreamOrTCP {
-				eligibleFamilies = append(eligibleFamilies, models.ProtocolVLESS, models.ProtocolNaive)
+			// Multi-protocol ingress: allow VLESS and Naive backends for generic clients (#662).
+			// Streambridge and userspace netstack handle TCP/DNS traffic through Naive forwarder.
+			if conn != nil && models.NormalizeProtocol(conn.Protocol) == models.ProtocolNaive {
+				eligibleFamilies = append(eligibleFamilies, models.ProtocolNaive, models.ProtocolVLESS)
 			} else {
-				eligibleFamilies = append(eligibleFamilies, models.ProtocolVLESS)
+				eligibleFamilies = append(eligibleFamilies, models.ProtocolVLESS, models.ProtocolNaive)
 			}
 		}
 		for _, fam := range eligibleFamilies {

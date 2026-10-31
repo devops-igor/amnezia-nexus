@@ -13,6 +13,86 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/security"
 )
 
+// IsBackendTunnelClient reports whether the credential belongs to a backend on this server and protocol.
+func (d *DB) IsBackendTunnelClient(ctx context.Context, serverID int64, protocol, clientID string) (bool, error) {
+	if d == nil || serverID == 0 || clientID == "" {
+		return false, nil
+	}
+	tunnels, err := d.GetBackendTunnelsByServerID(ctx, serverID)
+	if err != nil {
+		return false, fmt.Errorf("get backend tunnels for server %d: %w", serverID, err)
+	}
+	for _, t := range tunnels {
+		if models.NormalizeTunnelProtocol(t.Protocol) != models.NormalizeProtocol(protocol) {
+			continue
+		}
+		switch models.NormalizeTunnelProtocol(t.Protocol) {
+		case models.ProtocolNaive:
+			var p models.NaiveProxyParams
+			if json.Unmarshal(t.ProtocolParams, &p) == nil && p.Username != "" && p.Username == clientID {
+				return true, nil
+			}
+		case models.ProtocolVLESS:
+			var p models.VLESSRealityParams
+			if json.Unmarshal(t.ProtocolParams, &p) == nil && p.UUID != "" && strings.EqualFold(p.UUID, clientID) {
+				return true, nil
+			}
+		case models.ProtocolAWG:
+			if t.PublicKey != "" && t.PublicKey == clientID {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// HasUserConnectionCredential reports whether a regular user owns this credential on the server.
+func (d *DB) HasUserConnectionCredential(ctx context.Context, serverID int64, protocol, clientID string) (bool, error) {
+	if d == nil || clientID == "" {
+		return false, nil
+	}
+	conns, err := d.GetConnectionsByServerAndProtocol(ctx, serverID, models.NormalizeProtocol(protocol))
+	if err != nil {
+		return false, fmt.Errorf("get user connections for server %d: %w", serverID, err)
+	}
+	for _, conn := range conns {
+		if conn.ClientID == clientID ||
+			(models.NormalizeProtocol(protocol) == models.ProtocolVLESS && strings.EqualFold(conn.ClientID, clientID)) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ErrSharedUserCredential requires operator remediation before remote revocation.
+var ErrSharedUserCredential = errors.New("remote credential is shared by another user connection")
+
+// HasOtherUserConnectionCredential refuses revocation while another connection row
+// references the same remote identity. Disabled owners count too: their row may
+// become active again, and revoking the remote credential would break that user.
+func (d *DB) HasOtherUserConnectionCredential(ctx context.Context, c *models.UserConnection) (bool, error) {
+	if d == nil || c == nil || c.ClientID == "" {
+		return false, errors.New("missing connection credential for revocation check")
+	}
+	conns, err := d.GetConnectionsByServerAndProtocol(ctx, c.ServerID, c.Protocol)
+	if err != nil {
+		return false, fmt.Errorf("check shared user credential: %w", err)
+	}
+	for _, other := range conns {
+		if other.ID != c.ID && sameUserCredential(c.Protocol, other.ClientID, c.ClientID) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func sameUserCredential(proto, a, b string) bool {
+	if models.NormalizeProtocol(proto) == models.ProtocolVLESS {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
 // GetBackendTunnels retrieves all backend AWG tunnel definitions.
 func (d *DB) GetBackendTunnels(ctx context.Context) ([]models.BackendTunnel, error) {
 	d.mu.RLock()
@@ -393,6 +473,34 @@ func (d *DB) GetBackendTunnelByServerID(ctx context.Context, serverID int64) (*m
 		return nil, fmt.Errorf("failed to get backend tunnel for server %d: %w", serverID, err)
 	}
 	return &t, nil
+}
+
+// GetBackendTunnelsByServerID retrieves all backend tunnels for a specific server_id.
+func (d *DB) GetBackendTunnelsByServerID(ctx context.Context, serverID int64) ([]models.BackendTunnel, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	query := `SELECT id, server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
+		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at,
+		protocol, protocol_params
+		FROM backend_tunnels WHERE server_id = ? ORDER BY id`
+
+	rows, err := d.sqlDB.QueryContext(ctx, query, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query backend tunnels for server %d: %w", serverID, err)
+	}
+	defer rows.Close()
+
+	var tunnels []models.BackendTunnel
+	for rows.Next() {
+		t, err := d.scanBackendTunnel(rows)
+		if err != nil {
+			return nil, err
+		}
+		tunnels = append(tunnels, t)
+	}
+
+	return tunnels, rows.Err()
 }
 
 // Helper scanners

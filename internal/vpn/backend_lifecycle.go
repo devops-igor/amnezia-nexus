@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -473,9 +474,42 @@ func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 	}
 
 	// Guard: unknown backend -> not-found, before any state mutation.
+	// If the tunnel is absent from the pool (e.g. removed by a prior attempt that
+	// failed during defensive sweep peer preservation), check if leftover rows exist
+	// in backend_tunnels and allow retrying the defensive cleanup sweep.
 	tunnel, err := s.pool.GetTunnel(serverID)
 	if err != nil {
+		if errors.Is(err, ErrBackendTunnelNotFound) && s.db != nil {
+			tunnels, dbErr := s.db.GetBackendTunnelsByServerID(ctx, serverID)
+			if dbErr != nil {
+				return fmt.Errorf("failed to query backend tunnels for server %d: %w", serverID, dbErr)
+			}
+			if len(tunnels) > 0 {
+				return s.sweepLeftoverBackendLocked(ctx, serverID, 0)
+			}
+		}
 		return err
+	}
+
+	// Ensure operator-supplied proxy credentials retain durable peer_lifecycle
+	// preservation before deleting the backend tunnel row. If preservation fails,
+	// fail closed so the credential is never exposed to zombie cleanup.
+	if s.db != nil {
+		tunnels, dbErr := s.db.GetBackendTunnelsByServerID(ctx, serverID)
+		if dbErr != nil {
+			return fmt.Errorf("failed to query backend tunnels for server %d: %w", serverID, dbErr)
+		}
+		if len(tunnels) > 0 {
+			for i := range tunnels {
+				if err := EnsureBackendProxyPeerPreservation(ctx, s.db, serverID, tunnels[i].Protocol, tunnels[i].ProtocolParams); err != nil {
+					return fmt.Errorf("failed to ensure peer lifecycle preservation for backend %d: %w", serverID, err)
+				}
+			}
+		} else {
+			if err := EnsureBackendProxyPeerPreservation(ctx, s.db, serverID, tunnel.Protocol, tunnel.ProtocolParams); err != nil {
+				return fmt.Errorf("failed to ensure peer lifecycle preservation for backend %d: %w", serverID, err)
+			}
+		}
 	}
 
 	// Phase 1 — drain: disable + failover while the tunnel is still in the
@@ -498,30 +532,85 @@ func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 	// reassigns any connected sessions still on it to a surviving active
 	// backend, deletes the leftover row, and never fails the delete: a
 	// missing row is the expected path.
-	//
-	// DB calls run without s.mu held (db methods take their own locks) — the
-	// disabled tunnel cannot re-enter the pool in between: pool mutations
-	// all happen under s.mu, which we re-acquire immediately after.
-	//
+	return s.sweepLeftoverBackendLocked(ctx, serverID, tunnel.ID)
+}
+
+var (
+	sweepPreLookupHookMu sync.RWMutex
+	sweepPreLookupHook   func()
+)
+
+// SetSweepPreLookupHookForTest sets a test hook invoked during sweepLeftoverBackendLocked
+// after s.mu is released and before querying leftover rows.
+func (s *Service) SetSweepPreLookupHookForTest(fn func()) {
+	sweepPreLookupHookMu.Lock()
+	defer sweepPreLookupHookMu.Unlock()
+	sweepPreLookupHook = fn
+}
+
+func getSweepPreLookupHook() func() {
+	sweepPreLookupHookMu.RLock()
+	defer sweepPreLookupHookMu.RUnlock()
+	return sweepPreLookupHook
+}
+
+func (s *Service) isLivePoolTunnel(serverID int64, tunnelID int64) bool {
+	if s == nil || s.pool == nil {
+		return false
+	}
+	if liveTun, err := s.pool.GetTunnel(serverID); err == nil && liveTun != nil && liveTun.ID == tunnelID {
+		return true
+	}
+	if tunByID, err := s.pool.GetTunnelByID(tunnelID); err == nil && tunByID != nil && tunByID.ServerID == serverID {
+		return true
+	}
+	return false
+}
+
+func (s *Service) sweepLeftoverBackendLocked(ctx context.Context, serverID int64, excludedTunnelID int64) error {
+	if s.db == nil {
+		return nil
+	}
+
 	// failoverTarget is a surviving ACTIVE pool tunnel (never the deleted
 	// one): reassigning sessions onto the just-deleted row would only move
 	// the orphan. Zero means no healthy target exists — HandleFailover
 	// already hit the same terminal state and logged it.
 	failoverTarget := int64(0)
 	for _, tun := range s.pool.GetActiveTunnels() {
-		if tun.ID != tunnel.ID {
+		if tun.ID != excludedTunnelID {
 			failoverTarget = tun.ID
 			break
 		}
 	}
 
+	// DB calls run without s.mu held (db methods take their own locks) — the
+	// disabled tunnel cannot re-enter the pool in between: pool mutations
+	// all happen under s.mu, which we re-acquire immediately on return.
 	s.mu.Unlock()
-	leftover, dbErr := s.db.GetBackendTunnelByServerID(ctx, serverID)
-	if dbErr != nil {
-		leftover = nil
-		log.Printf("[vpn] warning: delete backend %d: DB sweep lookup failed: %v", serverID, dbErr)
+	defer s.mu.Lock()
+
+	hook := getSweepPreLookupHook()
+	if hook != nil {
+		hook()
 	}
-	if leftover != nil {
+
+	leftovers, dbErr := s.db.GetBackendTunnelsByServerID(ctx, serverID)
+	if dbErr != nil {
+		log.Printf("[vpn] warning: delete backend %d: DB sweep lookup failed: %v", serverID, dbErr)
+		return fmt.Errorf("failed to query leftover backend tunnels for server %d: %w", serverID, dbErr)
+	}
+	for i := range leftovers {
+		leftover := &leftovers[i]
+		if s.isLivePoolTunnel(serverID, leftover.ID) {
+			log.Printf("[vpn] defensive sweep: skipping leftover row %d matching live pool tunnel for server %d", leftover.ID, serverID)
+			continue
+		}
+
+		if err := EnsureBackendProxyPeerPreservation(ctx, s.db, serverID, leftover.Protocol, leftover.ProtocolParams); err != nil {
+			log.Printf("[vpn] warning: delete backend %d: failed to ensure peer preservation for leftover row %d: %v", serverID, leftover.ID, err)
+			return fmt.Errorf("failed to ensure peer preservation for leftover row %d: %w", leftover.ID, err)
+		}
 		// Reassign connected sessions that lost the failover race onto the
 		// leftover row, marking them draining (issue #29: no orphaned
 		// vpn_sessions row may reference a deleted backend_tunnels row).
@@ -531,29 +620,39 @@ func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 		// intentionally NOT swept: draining is a terminal state per issue
 		// #44 — such sessions are winding down and must never be migrated
 		// again, even if their stale backend_tunnels row is deleted here.
-		if sessions, sessErr := s.db.GetActiveVPNSessions(ctx); sessErr != nil {
+		sessions, sessErr := s.db.GetActiveVPNSessions(ctx)
+		if sessErr != nil {
 			log.Printf("[vpn] warning: delete backend %d: orphan-session sweep lookup failed: %v", serverID, sessErr)
-		} else {
-			for i := range sessions {
-				if sessions[i].BackendTunnelID != leftover.ID {
-					continue
-				}
-				if failoverTarget == 0 {
-					log.Printf("[vpn] warning: delete backend %d: no healthy backend left to reassign session %s (leftover row %d deleted, session left draining)", serverID, sessions[i].ID, leftover.ID)
-					continue
-				}
-				if err := s.db.UpdateVPNSessionBackendTunnel(ctx, sessions[i].ID, failoverTarget); err != nil {
-					log.Printf("[vpn] warning: delete backend %d: could not reassign session %s off leftover row %d: %v", serverID, sessions[i].ID, leftover.ID, err)
-				} else {
-					log.Printf("[vpn] delete backend %d: reassigned session %s off leftover backend_tunnels row %d onto backend %d (draining)", serverID, sessions[i].ID, leftover.ID, failoverTarget)
-				}
-			}
+			return fmt.Errorf("failed to query active vpn sessions during sweep for server %d: %w", serverID, sessErr)
 		}
+		for j := range sessions {
+			if sessions[j].BackendTunnelID != leftover.ID {
+				continue
+			}
+			target := failoverTarget
+			if target == 0 {
+				log.Printf("[vpn] warning: delete backend %d: no healthy backend left to reassign session %s (leftover row %d deleted, session left draining)", serverID, sessions[j].ID, leftover.ID)
+				continue
+			}
+			if err := s.db.UpdateVPNSessionBackendTunnel(ctx, sessions[j].ID, target); err != nil {
+				log.Printf("[vpn] warning: delete backend %d: could not reassign session %s off leftover row %d: %v", serverID, sessions[j].ID, leftover.ID, err)
+				return fmt.Errorf("failed to reassign session %s off leftover row %d: %w", sessions[j].ID, leftover.ID, err)
+			}
+			log.Printf("[vpn] delete backend %d: reassigned session %s off leftover backend_tunnels row %d onto backend %d (draining)", serverID, sessions[j].ID, leftover.ID, target)
+		}
+
+		// Re-verify that leftover.ID has not been adopted or re-enabled by a concurrent
+		// operation before physically deleting the row.
+		if s.isLivePoolTunnel(serverID, leftover.ID) {
+			log.Printf("[vpn] defensive sweep: skipping deletion of row %d matching live pool tunnel for server %d", leftover.ID, serverID)
+			continue
+		}
+
 		if err := s.db.DeleteBackendTunnel(ctx, leftover.ID); err != nil {
 			log.Printf("[vpn] warning: delete backend %d: failed to delete leftover backend_tunnels row %d: %v", serverID, leftover.ID, err)
+			return fmt.Errorf("failed to delete leftover backend tunnel row %d: %w", leftover.ID, err)
 		}
 	}
-	s.mu.Lock()
 
 	return nil
 }

@@ -21,6 +21,11 @@ import (
 // remains nil, prompting standard crypto/tls system root verification.
 var testRootCAs *x509.CertPool
 
+// SetTestRootCAs allows test harnesses outside package naive to configure an ephemeral root CA pool.
+func SetTestRootCAs(pool *x509.CertPool) {
+	testRootCAs = pool
+}
+
 // h3FailureCooldown is how long DialContext skips H3 and dials H2 directly
 // after a transport-level H3 failure, so UDP loss costs one timeout, not one per dial.
 var h3FailureCooldown = 30 * time.Second
@@ -143,6 +148,11 @@ func (d *Dialer) Close() error {
 	d.h2Pool.close()
 	d.h3Pool.close()
 	return nil
+}
+
+// SupportsUDP returns false because NaiveProxy only tunnels TCP streams.
+func (d *Dialer) SupportsUDP() bool {
+	return false
 }
 
 // basicAuth returns the HTTP Basic authentication credentials formatted for Proxy-Authorization.
