@@ -525,9 +525,10 @@ func setProtocolPortFallback(protoMeta map[string]any, requestPort string) {
 	}
 }
 
-func buildInstallParams(req *models.InstallProtocolRequest) map[string]any {
+func buildInstallParams(req *models.InstallProtocolRequest, portExplicit bool) map[string]any {
 	params := map[string]any{
-		"port": req.Port,
+		"port":          req.Port,
+		"port_explicit": portExplicit,
 	}
 	if req.EngineProfile != "" {
 		params["engine_profile"] = req.EngineProfile
@@ -685,12 +686,16 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	portExplicit := req.Port != "" ||
+		(req.VLESSOptions != nil && req.VLESSOptions.Port != "") ||
+		(req.NaiveOptions != nil && req.NaiveOptions.Port != "")
+
 	if err := resolveOmittedProtocolPort(&req, server); err != nil {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
 		return
 	}
 
-	params := buildInstallParams(&req)
+	params := buildInstallParams(&req, portExplicit)
 
 	if err := protoMgr.Install(ctx, server, params); err != nil {
 		slog.Error("protocol install failed", "server_id", serverID, "protocol", req.Protocol, "port", req.Port, "err", err)
