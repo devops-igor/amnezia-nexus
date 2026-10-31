@@ -181,30 +181,17 @@ func (h *Handlers) DeleteServerHandler(w http.ResponseWriter, r *http.Request) {
 		h.sshPool.Remove(serverID)
 	}
 
-	if force {
-		if _, err := h.db.DeleteConnectionsByServer(ctx, serverID); err != nil {
-			slog.Warn("force delete: failed to delete server connections", "server_id", serverID, "error", err)
-		}
-		if _, err := h.db.DeleteKnownHost(ctx, serverID); err != nil {
-			slog.Warn("force delete: failed to delete server known host", "server_id", serverID, "error", err)
-		}
-		if _, err := h.db.DeleteServer(ctx, serverID); err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server")
-			return
-		}
-	} else {
-		if _, err := h.db.DeleteConnectionsByServer(ctx, serverID); err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server connections")
-			return
-		}
-		if _, err := h.db.DeleteKnownHost(ctx, serverID); err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server known host")
-			return
-		}
-		if _, err := h.db.DeleteServer(ctx, serverID); err != nil {
-			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server")
-			return
-		}
+	if _, err := h.db.DeleteConnectionsByServer(ctx, serverID); err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server connections")
+		return
+	}
+	if _, err := h.db.DeleteKnownHost(ctx, serverID); err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server known host")
+		return
+	}
+	if _, err := h.db.DeleteServer(ctx, serverID); err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server")
+		return
 	}
 
 	h.audit(r, "server.delete", map[string]any{"server_id": serverID, "name": server.Name})

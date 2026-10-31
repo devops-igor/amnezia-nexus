@@ -540,3 +540,84 @@ func TestDeleteServerHandler_SSHAuthFailure_StandardReturns409_ForceReturns200(t
 		t.Errorf("server must be deleted from DB after force delete, found: %+v", srvAfterForce)
 	}
 }
+
+func TestDeleteServerHandler_ForceDelete_WithFailingConnectionDeletion_FailsClosed(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := t.Context()
+
+	sID, err := db.CreateServer(ctx, &models.Server{
+		Name:      "Failing-Conn-Delete-Server",
+		Host:      "192.0.2.1",
+		SSHPort:   22,
+		SSHUser:   "root",
+		Protocols: map[string]any{},
+		CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+
+	_, err = db.CreateUser(ctx, &models.User{
+		ID:           "test-user-failing-conn",
+		Username:     "testuserfc",
+		PasswordHash: "hash",
+		Role:         models.RoleUser,
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	connID, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID:        "test-conn-failing-delete",
+		UserID:    "test-user-failing-conn",
+		ServerID:  sID,
+		Protocol:  models.ProtocolVLESS,
+		ClientID:  "test-client-fc",
+		CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("create connection: %v", err)
+	}
+
+	// Inject an SQLite trigger:
+	// CREATE TRIGGER fail_conn_delete BEFORE DELETE ON user_connections BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END;
+	_, err = db.ExecContext(ctx, "CREATE TRIGGER fail_conn_delete BEFORE DELETE ON user_connections BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END;")
+	if err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	defer func() {
+		_, _ = db.ExecContext(ctx, "DROP TRIGGER IF EXISTS fail_conn_delete")
+	}()
+
+	router := setupFullServerRouter(h)
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/delete?force=true", sID), nil)
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	// Assert response status is HTTP 500 (database_error)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 on failing connection deletion, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	var errResp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if errResp["error"] != "database_error" {
+		t.Errorf("expected error 'database_error', got %v", errResp["error"])
+	}
+
+	// Query DB and assert server row STILL EXISTS
+	serverAfter, err := db.GetServer(ctx, sID)
+	if err != nil || serverAfter == nil {
+		t.Fatalf("server row must still exist in DB after failed connection deletion: %v", err)
+	}
+
+	// Query DB and assert connection row STILL EXISTS
+	connAfter, err := db.GetConnection(ctx, connID)
+	if err != nil || connAfter == nil {
+		t.Fatalf("connection row must still exist in DB after failed connection deletion: %v", err)
+	}
+}
