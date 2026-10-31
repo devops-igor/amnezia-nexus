@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -514,10 +515,9 @@ func TestXrayManager_UpgradeWithExistingClient_EmptyFlowProbedWithEmptyFlow(t *t
 		},
 	}
 
-	// Install with fallback flow configured ("xtls-rprx-vision")
+	// Install with fallback flow configured (no explicit flow override; manager defaults to "xtls-rprx-vision")
 	err = mgr.Install(context.Background(), server, map[string]any{
 		"port": 8443,
-		"flow": "xtls-rprx-vision",
 	})
 	if err != nil {
 		t.Fatalf("mgr.Install failed: %v", err)
@@ -533,6 +533,172 @@ func TestXrayManager_UpgradeWithExistingClient_EmptyFlowProbedWithEmptyFlow(t *t
 	// not falling back to opts.flow ("xtls-rprx-vision").
 	if capturedTrafficParams.Flow != "" {
 		t.Errorf("probeParams.Flow = %q, want empty string for client with empty flow", capturedTrafficParams.Flow)
+	}
+	parsed, err := ParseXrayConfig(mockSSH.files[XrayConfigPath])
+	if err != nil {
+		t.Fatalf("ParseXrayConfig: %v", err)
+	}
+	if len(parsed.Inbounds) == 0 || len(parsed.Inbounds[0].Settings.Clients) == 0 {
+		t.Fatal("expected clients in config")
+	}
+	if got := parsed.Inbounds[0].Settings.Clients[0].Flow; got != "" {
+		t.Errorf("expected empty flow preserved in config, got %q", got)
+	}
+}
+
+func TestXrayManager_FlowConversion_PlainToVision(t *testing.T) {
+	mockSSH := newMockXraySSHClient()
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+
+	clientUUID := "f1b2c3d4-e5f6-4a1b-8c2d-3e4f5a6b7c8d"
+	key, _, err := GenerateRealityKeypair()
+	if err != nil {
+		t.Fatalf("GenerateRealityKeypair: %v", err)
+	}
+	// 1. Existing client configured with empty Flow ("")
+	cls := []XrayClient{{ID: clientUUID, Flow: "", Email: "plain-vless-client"}}
+	cfg, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, cls)
+	if err != nil {
+		t.Fatalf("RenderXrayConfig: %v", err)
+	}
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
+
+	var capturedTrafficParams models.VLESSRealityParams
+	trafficProbeCalled := false
+	mgr.SetVLESSTrafficProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		trafficProbeCalled = true
+		capturedTrafficParams = params
+		uploaded, parseErr := ParseXrayConfig(mockSSH.files[XrayConfigPath])
+		if parseErr != nil {
+			return 0, parseErr
+		}
+		if len(uploaded.Inbounds) == 0 || len(uploaded.Inbounds[0].Settings.Clients) == 0 {
+			return 0, errors.New("uploaded config has no clients")
+		}
+		uploadedFlow := uploaded.Inbounds[0].Settings.Clients[0].Flow
+		if params.Flow != uploadedFlow {
+			return 0, fmt.Errorf("probe flow %q differs from uploaded client flow %q", params.Flow, uploadedFlow)
+		}
+		return 15, nil
+	})
+
+	server := &models.Server{
+		ID:   943,
+		Host: "192.0.2.143",
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{
+				"installed":      true,
+				"port":           8443,
+				"engine_profile": "legacy",
+			},
+		},
+	}
+
+	// Plain-to-Vision conversion: explicit flow "xtls-rprx-vision"
+	err = mgr.Install(context.Background(), server, map[string]any{
+		"port": 8443,
+		"flow": "xtls-rprx-vision",
+	})
+	if err != nil {
+		t.Fatalf("mgr.Install failed: %v", err)
+	}
+
+	if !trafficProbeCalled {
+		t.Fatal("expected traffic probe to be invoked during readiness check")
+	}
+	if capturedTrafficParams.UUID != clientUUID {
+		t.Errorf("probeParams.UUID = %q, want %q", capturedTrafficParams.UUID, clientUUID)
+	}
+	if capturedTrafficParams.Flow != "xtls-rprx-vision" {
+		t.Errorf("probeParams.Flow = %q, want xtls-rprx-vision", capturedTrafficParams.Flow)
+	}
+
+	parsed, err := ParseXrayConfig(mockSSH.files[XrayConfigPath])
+	if err != nil {
+		t.Fatalf("ParseXrayConfig: %v", err)
+	}
+	if got := parsed.Inbounds[0].Settings.Clients[0].Flow; got != "xtls-rprx-vision" {
+		t.Errorf("uploaded client flow = %q, want xtls-rprx-vision", got)
+	}
+}
+
+func TestXrayManager_FlowConversion_VisionToPlain(t *testing.T) {
+	mockSSH := newMockXraySSHClient()
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+
+	clientUUID := "f1b2c3d4-e5f6-4a1b-8c2d-3e4f5a6b7c8d"
+	key, _, err := GenerateRealityKeypair()
+	if err != nil {
+		t.Fatalf("GenerateRealityKeypair: %v", err)
+	}
+	// 1. Existing client configured with Vision Flow ("xtls-rprx-vision")
+	cls := []XrayClient{{ID: clientUUID, Flow: "xtls-rprx-vision", Email: "vision-vless-client"}}
+	cfg, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, cls)
+	if err != nil {
+		t.Fatalf("RenderXrayConfig: %v", err)
+	}
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
+
+	var capturedTrafficParams models.VLESSRealityParams
+	trafficProbeCalled := false
+	mgr.SetVLESSTrafficProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		trafficProbeCalled = true
+		capturedTrafficParams = params
+		uploaded, parseErr := ParseXrayConfig(mockSSH.files[XrayConfigPath])
+		if parseErr != nil {
+			return 0, parseErr
+		}
+		if len(uploaded.Inbounds) == 0 || len(uploaded.Inbounds[0].Settings.Clients) == 0 {
+			return 0, errors.New("uploaded config has no clients")
+		}
+		uploadedFlow := uploaded.Inbounds[0].Settings.Clients[0].Flow
+		if params.Flow != uploadedFlow {
+			return 0, fmt.Errorf("probe flow %q differs from uploaded client flow %q", params.Flow, uploadedFlow)
+		}
+		return 15, nil
+	})
+
+	server := &models.Server{
+		ID:   944,
+		Host: "192.0.2.144",
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{
+				"installed":      true,
+				"port":           8443,
+				"engine_profile": "legacy",
+				"flow":           "xtls-rprx-vision",
+			},
+		},
+	}
+
+	// Vision-to-plain conversion: explicit flow "" via vless_options
+	err = mgr.Install(context.Background(), server, map[string]any{
+		"port": 8443,
+		"vless_options": &models.VLESSInstallOptions{
+			Flow:    "",
+			FlowSet: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("mgr.Install failed: %v", err)
+	}
+
+	if !trafficProbeCalled {
+		t.Fatal("expected traffic probe to be invoked during readiness check")
+	}
+	if capturedTrafficParams.UUID != clientUUID {
+		t.Errorf("probeParams.UUID = %q, want %q", capturedTrafficParams.UUID, clientUUID)
+	}
+	if capturedTrafficParams.Flow != "" {
+		t.Errorf("probeParams.Flow = %q, want empty string", capturedTrafficParams.Flow)
+	}
+
+	parsed, err := ParseXrayConfig(mockSSH.files[XrayConfigPath])
+	if err != nil {
+		t.Fatalf("ParseXrayConfig: %v", err)
+	}
+	if got := parsed.Inbounds[0].Settings.Clients[0].Flow; got != "" {
+		t.Errorf("uploaded client flow = %q, want empty string", got)
 	}
 }
 

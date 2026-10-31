@@ -632,7 +632,7 @@ func resolveExistingFlow(inbound XrayInbound, server *models.Server, fallback st
 			}
 		}
 	}
-	if len(inbound.Settings.Clients) > 0 && inbound.Settings.Clients[0].Flow != "" {
+	if len(inbound.Settings.Clients) > 0 {
 		return inbound.Settings.Clients[0].Flow
 	}
 	return fallback
@@ -648,15 +648,15 @@ func (m *XrayManager) prepareConfigBytes(
 	shortIDs []string,
 	clients []XrayClient,
 	server *models.Server,
-) ([]byte, int, string, string, error) {
+) ([]byte, int, string, string, []XrayClient, error) {
 	if existingCfgBytes == nil || existingParsed == nil || len(existingParsed.Inbounds) == 0 {
 		portHigh := 54321
 		dest := netJoinHostPort(serverName, "443")
 		rendered, err := RenderXrayConfig(portPrimary, portHigh, serverName, dest, privB64, shortIDs, clients)
 		if err != nil {
-			return nil, 0, "", "", fmt.Errorf("render xray config: %w", err)
+			return nil, 0, "", "", nil, fmt.Errorf("render xray config: %w", err)
 		}
-		return rendered, portPrimary, serverName, flow, nil
+		return rendered, portPrimary, serverName, flow, clients, nil
 	}
 
 	existingInbound := existingParsed.Inbounds[0]
@@ -676,15 +676,24 @@ func (m *XrayManager) prepareConfigBytes(
 	sniChanged := hasServerName && (len(existingReality.ServerNames) == 0 || existingReality.ServerNames[0] != serverName)
 	flowChanged := hasFlow
 
+	if flowChanged && len(clients) > 0 {
+		updatedClients := make([]XrayClient, len(clients))
+		copy(updatedClients, clients)
+		for i := range updatedClients {
+			updatedClients[i].Flow = flow
+		}
+		clients = updatedClients
+	}
+
 	if !portChanged && !sniChanged && !flowChanged {
-		return existingCfgBytes, portPrimary, serverName, flow, nil
+		return existingCfgBytes, portPrimary, serverName, flow, clients, nil
 	}
 
 	updated, err := updateExistingConfig(existingCfgBytes, portPrimary, serverName, flow, portChanged, sniChanged, flowChanged)
 	if err != nil {
-		return nil, 0, "", "", err
+		return nil, 0, "", "", nil, err
 	}
-	return updated, portPrimary, serverName, flow, nil
+	return updated, portPrimary, serverName, flow, clients, nil
 }
 
 func updateExistingConfig(existingCfgBytes []byte, portPrimary int, serverName, flow string, portChanged, sniChanged, flowChanged bool) ([]byte, error) {
@@ -791,7 +800,7 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	}
 
 	// 6. Render or preserve and upload config.json
-	cfgBytes, portPrimary, serverName, flow, err := m.prepareConfigBytes(
+	cfgBytes, portPrimary, serverName, flow, clients, err := m.prepareConfigBytes(
 		existingCfgBytes, existingParsed, portPrimary, serverName, flow,
 		hasPort, hasServerName, hasFlow, privB64, shortIDs, clients, server,
 	)
