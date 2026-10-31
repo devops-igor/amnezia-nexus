@@ -11,36 +11,106 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel/vless"
 )
 
 const (
 	XrayContainerName = "amnezia-xray"
 	XrayConfigDir     = "/opt/amnezia/xray"
 	XrayConfigPath    = "/opt/amnezia/xray/config.json"
-	XrayBaseImage     = "ghcr.io/xtls/xray-core:26.10.21"
+
+	// Pinned engine image tags and digests for reproducible deployments.
+	XrayLegacyVersion = "1.8.24"
+	XrayLegacyDigest  = "sha256:6b3ef1780d4be55c1bc4848232a90272d31c28cc3d0de1f2a50a56f48993be9d"
+	XrayLegacyImage   = "ghcr.io/xtls/xray-core:1.8.24@sha256:6b3ef1780d4be55c1bc4848232a90272d31c28cc3d0de1f2a50a56f48993be9d"
+
+	XrayModernPQVersion = "26.10.29"
+	XrayModernPQDigest  = "sha256:c9443f3ee297f6481bc245269d61720c6f989195ee9b58fa90fdd99f03c21044"
+	XrayModernPQImage   = "ghcr.io/xtls/xray-core:26.10.29@sha256:c9443f3ee297f6481bc245269d61720c6f989195ee9b58fa90fdd99f03c21044"
+
+	// DefaultEngineProfile is the Legacy Compatibility Baseline (default for broad third-party client compatibility).
+	DefaultEngineProfile = EngineProfileLegacy
+
+	// XrayBaseImage remains for backward compatibility, pointing to the default legacy baseline image.
+	XrayBaseImage = XrayLegacyImage
 )
+
+// EngineProfile represents the Xray-core deployment profile.
+type EngineProfile string
+
+const (
+	EngineProfileLegacy   EngineProfile = "legacy"
+	EngineProfileModernPQ EngineProfile = "modern_pq"
+)
+
+// EngineProfileInfo encapsulates pinned metadata for an Xray engine profile.
+type EngineProfileInfo struct {
+	Name        EngineProfile `json:"name"`
+	Version     string        `json:"version"`
+	ImageDigest string        `json:"image_digest"`
+	Image       string        `json:"image"`
+	Description string        `json:"description"`
+}
+
+// SupportedEngineProfiles holds verified, pinned profiles.
+var SupportedEngineProfiles = map[EngineProfile]EngineProfileInfo{
+	EngineProfileLegacy: {
+		Name:        EngineProfileLegacy,
+		Version:     XrayLegacyVersion,
+		ImageDigest: XrayLegacyDigest,
+		Image:       XrayLegacyImage,
+		Description: "Legacy Compatibility Baseline (v1.8.24) — broad third-party client compatibility",
+	},
+	EngineProfileModernPQ: {
+		Name:        EngineProfileModernPQ,
+		Version:     XrayModernPQVersion,
+		ImageDigest: XrayModernPQDigest,
+		Image:       XrayModernPQImage,
+		Description: "Modern PQ (v26.10.29) — Post-Quantum REALITY (X25519MLKEM768)",
+	},
+}
+
+// ResolveEngineProfile normalizes user input into a known EngineProfileInfo.
+func ResolveEngineProfile(profileName string) (EngineProfileInfo, error) {
+	norm := strings.ToLower(strings.TrimSpace(profileName))
+	switch {
+	case norm == "" || norm == "legacy" || norm == "legacy_baseline" || norm == "legacy compatibility baseline" || norm == "baseline" || norm == "1.8.24" || norm == "v1.8.24":
+		return SupportedEngineProfiles[EngineProfileLegacy], nil
+	case norm == "modern_pq" || norm == "modern" || norm == "pq" || norm == "26.10.29" || norm == "v26.10.29" || norm == "modern pq" || norm == "post_quantum" || norm == "post-quantum" || strings.HasPrefix(norm, "26.10.") || strings.HasPrefix(norm, "v26.10."):
+		return SupportedEngineProfiles[EngineProfileModernPQ], nil
+	default:
+		return EngineProfileInfo{}, fmt.Errorf("unknown xray engine profile %q (supported: legacy, modern_pq)", profileName)
+	}
+}
 
 // SSHProvider abstracts obtaining an SSHClient for a server.
 type SSHProvider interface {
 	Get(ctx context.Context, server *models.Server) (ssh.SSHClient, error)
 }
 
+// VLESSProbeFunc is the function signature for probing a VLESS+REALITY endpoint.
+type VLESSProbeFunc func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error)
+
 // XrayManager implements manager.ProtocolManager for VLESS+REALITY via Xray-core.
 //
 //nolint:revive
 type XrayManager struct {
-	sshPool        SSHProvider
-	containerCache *xrayContainerCache
-	serverLocks    *awg.ServerLockRegistry
-	mu             sync.Mutex
+	sshPool             SSHProvider
+	containerCache      *xrayContainerCache
+	serverLocks         *awg.ServerLockRegistry
+	vlessProbeFn        VLESSProbeFunc
+	vlessTrafficProbeFn VLESSProbeFunc
+	mu                  sync.Mutex
 }
 
 // NewXrayManager creates a new XrayManager instance.
 func NewXrayManager(pool SSHProvider) *XrayManager {
 	return &XrayManager{
-		sshPool:        pool,
-		containerCache: newXrayContainerCache(),
-		serverLocks:    awg.GlobalServerLocks(),
+		sshPool:             pool,
+		containerCache:      newXrayContainerCache(),
+		serverLocks:         awg.GlobalServerLocks(),
+		vlessProbeFn:        vless.ProbeVLESSReality,
+		vlessTrafficProbeFn: vless.ProbeVLESSTraffic,
 	}
 }
 
@@ -51,6 +121,22 @@ func NewXrayManagerWithServerLocks(pool SSHProvider, locks *awg.ServerLockRegist
 		containerCache: newXrayContainerCache(),
 		serverLocks:    locks,
 	}
+}
+
+// SetVLESSProbeFunc configures an optional authenticated handshake probe function for container readiness checks.
+// When set, it also clears any configured traffic probe function so test mocks apply cleanly across both probe modes.
+func (m *XrayManager) SetVLESSProbeFunc(fn VLESSProbeFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.vlessProbeFn = fn
+	m.vlessTrafficProbeFn = nil
+}
+
+// SetVLESSTrafficProbeFunc configures an optional application-level VLESS traffic probe function for upgrade readiness checks.
+func (m *XrayManager) SetVLESSTrafficProbeFunc(fn VLESSProbeFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.vlessTrafficProbeFn = fn
 }
 
 // recentClients is package-level so every manager instance (HTTP handlers, reconciler,
@@ -160,6 +246,18 @@ func (m *XrayManager) GetServerStatus(ctx context.Context, server *models.Server
 			if pubKey, err := DerivePublicKey(cfg.Inbounds[0].StreamSettings.RealitySettings.PrivateKey); err == nil {
 				status["public_key"] = pubKey
 			}
+		}
+	}
+
+	// Inspect engine image and running version
+	imgCmd := fmt.Sprintf("docker inspect -f '{{.Config.Image}}' %s 2>/dev/null", ssh.EscapeShellArg(XrayContainerName))
+	if imgOut, _, iCode, iErr := client.RunSudoCommand(ctx, imgCmd); iErr == nil && iCode == 0 && strings.TrimSpace(imgOut) != "" {
+		status["engine_image"] = strings.TrimSpace(imgOut)
+	}
+	verCmd := fmt.Sprintf("docker exec %s xray version 2>/dev/null", ssh.EscapeShellArg(XrayContainerName))
+	if verOut, _, vCode, vErr := client.RunSudoCommand(ctx, verCmd); vErr == nil && vCode == 0 && strings.TrimSpace(verOut) != "" {
+		if fields := strings.Fields(strings.TrimSpace(verOut)); len(fields) >= 2 && strings.EqualFold(fields[0], "Xray") {
+			status["running_engine_version"] = fields[1]
 		}
 	}
 

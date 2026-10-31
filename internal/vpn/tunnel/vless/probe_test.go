@@ -6,9 +6,13 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
+	"io"
+	"log"
 	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -174,4 +178,300 @@ func TestProbeVLESSReality_Failures(t *testing.T) {
 			t.Fatalf("probe did not respect cancellation: elapsed %v", elapsed)
 		}
 	})
+}
+
+func startHTTPMockServer(t *testing.T, responseBytes []byte) (string, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen tcp http mock: %v", err)
+	}
+	closeChan := make(chan struct{})
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				_, _ = c.Read(buf)
+				_, _ = c.Write(responseBytes)
+			}(conn)
+		}
+	}()
+	return ln.Addr().String(), func() {
+		close(closeChan)
+		_ = ln.Close()
+	}
+}
+
+func TestProbeVLESSTraffic_Success(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	httpAddr, cleanupHTTP := startHTTPMockServer(t, []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+	defer cleanupHTTP()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	latencyMS, err := ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, httpAddr, 3*time.Second)
+	if err != nil {
+		t.Fatalf("ProbeVLESSTrafficWithTarget failed: %v", err)
+	}
+
+	if latencyMS < 1 {
+		t.Fatalf("expected latencyMS >= 1, got %d", latencyMS)
+	}
+}
+
+func TestProbeVLESSTraffic_HTTPResponseValidation(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	tests := []struct {
+		name       string
+		response   []byte
+		expectErr  bool
+		errContain string
+	}{
+		{
+			name:      "HTTP/1.0 200 OK",
+			response:  []byte("HTTP/1.0 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+			expectErr: false,
+		},
+		{
+			name:      "HTTP/1.1 204 No Content",
+			response:  []byte("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"),
+			expectErr: false,
+		},
+		{
+			name:      "HTTP/2 200",
+			response:  []byte("HTTP/2 200\r\n\r\n"),
+			expectErr: false,
+		},
+		{
+			name:       "TLS alert record bytes",
+			response:   []byte("\x15\x03\x03\x00\x02\x02\x32"),
+			expectErr:  true,
+			errContain: "invalid http response status line",
+		},
+		{
+			name:       "arbitrary garbled stream",
+			response:   []byte("SOMERANDOMSTRING 12345\r\n"),
+			expectErr:  true,
+			errContain: "invalid http response status line",
+		},
+		{
+			name:       "request echoed back",
+			response:   []byte("HEAD / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+			expectErr:  true,
+			errContain: "invalid http response status line",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr, cleanup := startHTTPMockServer(t, tt.response)
+			defer cleanup()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			_, err := ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, addr, 2*time.Second)
+			if tt.expectErr {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.errContain)
+				}
+				if !strings.Contains(err.Error(), tt.errContain) {
+					t.Fatalf("expected error containing %q, got: %v", tt.errContain, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestProbeVLESSTraffic_UnauthorizedClient(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	echoAddr, cleanupEcho := startTCPEchoServer(t)
+	defer cleanupEcho()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	wrongParams := fixture.Params
+	wrongParams.UUID = "00000000-0000-0000-0000-000000000000"
+
+	_, err := ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, wrongParams, echoAddr, 2*time.Second)
+	if err == nil {
+		t.Fatal("expected error for unauthorized client UUID, got nil")
+	}
+}
+
+func TestProbeVLESSTraffic_UnreachableDestination(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	// Allocate and close local port
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedDest := ln.Addr().String()
+	_ = ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, closedDest, 2*time.Second)
+	if err == nil {
+		t.Fatal("expected error for unreachable destination through tunnel, got nil")
+	}
+}
+
+func TestProbeVLESSTraffic_HTTPSDestination_Success(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	latencyMS, err := ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, fixture.DecoyAddr, 3*time.Second)
+	if err != nil {
+		t.Fatalf("ProbeVLESSTrafficWithTarget on HTTPS destination failed: %v", err)
+	}
+
+	if latencyMS < 1 {
+		t.Fatalf("expected latencyMS >= 1, got %d", latencyMS)
+	}
+}
+
+func TestProbeVLESSTraffic_H2OnlyDestination_Success(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen h2 decoy: %v", err)
+	}
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{testLeafCert},
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"h2"},
+	}
+	tlsLn := tls.NewListener(ln, tlsConfig)
+
+	h2Server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+		ErrorLog: log.New(io.Discard, "", 0),
+	}
+	defer h2Server.Close()
+	go func() {
+		_ = h2Server.Serve(tlsLn)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	h2Addr := ln.Addr().String()
+	latencyMS, err := ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, h2Addr, 3*time.Second)
+	if err != nil {
+		t.Fatalf("ProbeVLESSTrafficWithTarget on h2-only destination failed: %v", err)
+	}
+
+	if latencyMS < 1 {
+		t.Fatalf("expected latencyMS >= 1, got %d", latencyMS)
+	}
+}
+
+func TestProbeVLESSTraffic_ApplicationTrafficFailure_ReturnsError(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	tests := []struct {
+		name      string
+		alpnProto string
+		behavior  string // "stall" or "close_early"
+	}{
+		{
+			name:      "h2 handshake succeeds but application stream stalls",
+			alpnProto: "h2",
+			behavior:  "stall",
+		},
+		{
+			name:      "h2 handshake succeeds but server closes without HTTP response",
+			alpnProto: "h2",
+			behavior:  "close_early",
+		},
+		{
+			name:      "http1.1 handshake succeeds but application stream stalls",
+			alpnProto: "http/1.1",
+			behavior:  "stall",
+		},
+		{
+			name:      "http1.1 handshake succeeds but server closes without HTTP response",
+			alpnProto: "http/1.1",
+			behavior:  "close_early",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer ln.Close()
+
+			tlsConfig := &tls.Config{
+				Certificates: []tls.Certificate{testLeafCert},
+				MinVersion:   tls.VersionTLS13,
+				NextProtos:   []string{tt.alpnProto},
+			}
+			tlsLn := tls.NewListener(ln, tlsConfig)
+			defer tlsLn.Close()
+
+			go func() {
+				for {
+					conn, err := tlsLn.Accept()
+					if err != nil {
+						return
+					}
+					go func(c net.Conn) {
+						defer c.Close()
+						if tc, ok := c.(*tls.Conn); ok {
+							_ = tc.Handshake()
+						}
+						if tt.behavior == "stall" {
+							// Intentionally stall without transmitting any HTTP response
+							time.Sleep(5 * time.Second)
+						}
+					}(conn)
+				}
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			destAddr := ln.Addr().String()
+			probeTimeout := 300 * time.Millisecond
+			if tt.behavior == "close_early" {
+				probeTimeout = 2 * time.Second
+			}
+			_, err = ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, destAddr, probeTimeout)
+			if err == nil {
+				t.Fatalf("%s: expected probe error, got nil", tt.name)
+			}
+		})
+	}
 }

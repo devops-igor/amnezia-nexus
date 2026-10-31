@@ -32,9 +32,12 @@ type ScanResult struct {
 	ASN             uint32 `json:"asn,omitempty"`
 	RTTMS           int64  `json:"rtt_ms,omitempty"`
 	TLS13           bool   `json:"tls13"`
+	Curve           string `json:"curve,omitempty"`
+	X25519          bool   `json:"x25519,omitempty"`
 	ALPN            string `json:"alpn,omitempty"`
 	ALPNH2          bool   `json:"alpn_h2,omitempty"`
 	PassedGeoFilter bool   `json:"passed_geo_filter"`
+	ProximityScore  int    `json:"proximity_score,omitempty"`
 	Status          string `json:"status"` // "ok", "rejected_geo_mismatch", "tls_failed", "dns_failed"
 	Reason          string `json:"reason,omitempty"`
 }
@@ -68,7 +71,30 @@ type ScannerOptions struct {
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
-// ScanSNI executes concurrent probing and ASN/geo proximity filtering for candidate domains.
+// calculateProximityScore ranks candidate domains by locality, treating Anycast CDNs as graceful fallback.
+func calculateProximityScore(serverCountry string, serverASN uint32, candCountry string, candASN uint32) int {
+	isCDN := IsMultiRegionCDNASN(candASN)
+	sameASN := serverASN > 0 && candASN > 0 && serverASN == candASN
+	sameCountry := serverCountry != "" && candCountry != "" && serverCountry == candCountry
+
+	switch {
+	case sameASN && sameCountry:
+		return 100 // Same-ASN and same-country: optimal proximity
+	case sameASN:
+		return 90 // Same-ASN
+	case sameCountry && !isCDN:
+		return 80 // Same country local domain (non-CDN)
+	case sameCountry && isCDN:
+		return 60 // Same country CDN edge
+	case isCDN:
+		return 40 // Multi-region Anycast CDN fallback
+	default:
+		return 20 // Other allowed fallback
+	}
+}
+
+// ScanSNI executes concurrent probing, compatibility filtering (TLS 1.3, X25519, H2),
+// and geo/ASN-aligned ranking for candidate domains.
 func ScanSNI(ctx context.Context, serverHost string, opts ScannerOptions) (*ScanReport, error) {
 	concurrency := opts.Concurrency
 	if concurrency <= 0 {
@@ -135,7 +161,7 @@ func ScanSNI(ctx context.Context, serverHost string, opts ScannerOptions) (*Scan
 				default:
 				}
 
-				res := scanCandidateDomain(ctx, domain, serverIP, geoDB, timeout, opts.RootCAs, opts.DialContext)
+				res := scanCandidateDomain(ctx, domain, serverIP, serverCountry, serverASN, geoDB, timeout, opts.RootCAs, opts.DialContext)
 				resultsChan <- res
 			}
 		}()
@@ -149,21 +175,8 @@ func ScanSNI(ctx context.Context, serverHost string, opts ScannerOptions) (*Scan
 		results = append(results, res)
 	}
 
-	// Rank results: "ok" first by latency ascending, then non-ok
-	sort.Slice(results, func(i, j int) bool {
-		iOk := results[i].Status == "ok"
-		jOk := results[j].Status == "ok"
-		if iOk && jOk {
-			return results[i].RTTMS < results[j].RTTMS
-		}
-		if iOk && !jOk {
-			return true
-		}
-		if !iOk && jOk {
-			return false
-		}
-		return results[i].Domain < results[j].Domain
-	})
+	// Rank results: "ok" first by proximity score descending, then latency ascending
+	RankScanResults(results)
 
 	scope := "panel_side_proximity"
 	if opts.DialContext != nil {
@@ -178,10 +191,35 @@ func ScanSNI(ctx context.Context, serverHost string, opts ScannerOptions) (*Scan
 	}, nil
 }
 
+// RankScanResults sorts scan results in-place per production ranking rules:
+// "ok" status candidates appear first, ordered by ProximityScore descending,
+// then RTTMS ascending. Non-"ok" results follow, ordered alphabetically by domain.
+func RankScanResults(results []ScanResult) {
+	sort.Slice(results, func(i, j int) bool {
+		iOk := results[i].Status == "ok"
+		jOk := results[j].Status == "ok"
+		if iOk && jOk {
+			if results[i].ProximityScore != results[j].ProximityScore {
+				return results[i].ProximityScore > results[j].ProximityScore
+			}
+			return results[i].RTTMS < results[j].RTTMS
+		}
+		if iOk && !jOk {
+			return true
+		}
+		if !iOk && jOk {
+			return false
+		}
+		return results[i].Domain < results[j].Domain
+	})
+}
+
 func scanCandidateDomain(
 	ctx context.Context,
 	domain string,
 	serverIP net.IP,
+	serverCountry string,
+	serverASN uint32,
 	geoDB *GeoDB,
 	timeout time.Duration,
 	rootCAs *x509.CertPool,
@@ -214,7 +252,7 @@ func scanCandidateDomain(
 		}
 	}
 
-	// 3. TLS 1.3 / H2 Probe
+	// 3. TLS 1.3 / X25519 / H2 Probe
 	probeOpts := ProbeOptions{
 		Timeout:     timeout,
 		RootCAs:     rootCAs,
@@ -222,17 +260,37 @@ func scanCandidateDomain(
 		DialContext: dialContext,
 	}
 	probeRes := ProbeTLSH2(ctx, domain, probeOpts)
-	if probeRes.Error != "" {
+	if probeRes.Error != "" || !probeRes.TLS13 || !probeRes.X25519 || probeRes.ALPN != "h2" {
+		failReason := probeRes.Error
+		if failReason == "" {
+			switch {
+			case !probeRes.TLS13:
+				failReason = "requires TLS 1.3"
+			case !probeRes.X25519:
+				failReason = "requires X25519 key exchange"
+			case probeRes.ALPN != "h2":
+				failReason = "requires ALPN h2 negotiation"
+			default:
+				failReason = "incompatible TLS configuration"
+			}
+		}
 		return ScanResult{
 			Domain:          domain,
 			Country:         candCountry,
 			ASN:             candASN,
 			RTTMS:           probeRes.RTTMS,
+			TLS13:           probeRes.TLS13,
+			Curve:           probeRes.Curve,
+			X25519:          probeRes.X25519,
+			ALPN:            probeRes.ALPN,
+			ALPNH2:          probeRes.ALPN == "h2",
 			PassedGeoFilter: true,
 			Status:          "tls_failed",
-			Reason:          probeRes.Error,
+			Reason:          failReason,
 		}
 	}
+
+	score := calculateProximityScore(serverCountry, serverASN, candCountry, candASN)
 
 	return ScanResult{
 		Domain:          domain,
@@ -240,9 +298,12 @@ func scanCandidateDomain(
 		ASN:             candASN,
 		RTTMS:           probeRes.RTTMS,
 		TLS13:           true,
+		Curve:           probeRes.Curve,
+		X25519:          true,
 		ALPN:            probeRes.ALPN,
-		ALPNH2:          probeRes.ALPN == "h2",
+		ALPNH2:          true,
 		PassedGeoFilter: true,
+		ProximityScore:  score,
 		Status:          "ok",
 		Reason:          geoReason,
 	}

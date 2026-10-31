@@ -17,11 +17,14 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
 
 	"github.com/google/uuid"
 	sTLS "github.com/sagernet/sing-box/common/tls"
@@ -258,6 +261,23 @@ func startDecoyServer(t *testing.T, delay time.Duration) (string, func()) {
 				defer c.Close()
 				if delay > 0 {
 					time.Sleep(delay)
+				}
+				if tc, ok := c.(*tls.Conn); ok {
+					if err := tc.Handshake(); err != nil {
+						return
+					}
+					if tc.ConnectionState().NegotiatedProtocol == "h2" {
+						//nolint:staticcheck // SA1019: http2.Server test fixture helper
+						h2s := &http2.Server{}
+						//nolint:staticcheck // SA1019: http2.Server test fixture helper
+						h2s.ServeConn(tc, &http2.ServeConnOpts{
+							Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+								w.WriteHeader(http.StatusOK)
+								_, _ = w.Write([]byte("Hello Decoy!"))
+							}),
+						})
+						return
+					}
 				}
 				buf := make([]byte, 1024)
 				_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
