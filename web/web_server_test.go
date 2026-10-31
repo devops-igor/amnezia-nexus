@@ -39,23 +39,23 @@ func TestServerTemplateAndActionsJSDOM(t *testing.T) {
 	}
 	telemetryJS := string(telemetryBytes)
 
-	// 1. Assert server.html contains <script src="/static/js/server_actions.js"></script> and <script src="/static/js/server_telemetry.js"></script> before the inline <script> block.
-	const scriptTag = `<script src="/static/js/server_actions.js"></script>`
-	const telemetryScriptTag = `<script src="/static/js/server_telemetry.js"></script>`
-	scriptIdx := strings.Index(serverHTML, scriptTag)
+	// 1. Assert server.html contains <script src="/static/js/server_actions.js..."> and <script src="/static/js/server_telemetry.js..."> before the inline <script> block.
+	const scriptTagPrefix = `<script src="/static/js/server_actions.js`
+	const telemetryScriptTagPrefix = `<script src="/static/js/server_telemetry.js`
+	scriptIdx := strings.Index(serverHTML, scriptTagPrefix)
 	if scriptIdx == -1 {
-		t.Fatalf("server.html missing required script tag: %q", scriptTag)
+		t.Fatalf("server.html missing required script tag: %q", scriptTagPrefix)
 	}
-	telemetryScriptIdx := strings.Index(serverHTML, telemetryScriptTag)
+	telemetryScriptIdx := strings.Index(serverHTML, telemetryScriptTagPrefix)
 	if telemetryScriptIdx == -1 {
-		t.Fatalf("server.html missing required script tag: %q", telemetryScriptTag)
+		t.Fatalf("server.html missing required script tag: %q", telemetryScriptTagPrefix)
 	}
 	if telemetryScriptIdx < scriptIdx {
 		t.Fatalf("server_telemetry.js must be loaded after server_actions.js")
 	}
 	inlineScriptRelIdx := strings.Index(serverHTML[telemetryScriptIdx:], "<script>")
 	if inlineScriptRelIdx == -1 {
-		t.Fatalf("server.html must include inline <script> block after %q", telemetryScriptTag)
+		t.Fatalf("server.html must include inline <script> block after %q", telemetryScriptTagPrefix)
 	}
 
 	// Extract all onclick function calls to assert they resolve on window.
@@ -104,10 +104,10 @@ func TestServerTemplateAndActionsJSDOM(t *testing.T) {
 	sb.WriteString("const serverTelemetryJs = " + string(telemetryJSJSON) + ";\n")
 	sb.WriteString("const expectedFunctions = " + string(expectedFunctionsJSON) + ";\n")
 	sb.WriteString(`
-const scriptTag = '<script src="/static/js/server_actions.js"></script>';
-const telemetryScriptTag = '<script src="/static/js/server_telemetry.js"></script>';
-assert(serverHtmlRaw.includes(scriptTag), 'serverHtmlRaw must contain server_actions.js script tag');
-assert(serverHtmlRaw.includes(telemetryScriptTag), 'serverHtmlRaw must contain server_telemetry.js script tag');
+const scriptTagPrefix = '<script src="/static/js/server_actions.js';
+const telemetryScriptTagPrefix = '<script src="/static/js/server_telemetry.js';
+assert(serverHtmlRaw.includes(scriptTagPrefix), 'serverHtmlRaw must contain server_actions.js script tag');
+assert(serverHtmlRaw.includes(telemetryScriptTagPrefix), 'serverHtmlRaw must contain server_telemetry.js script tag');
 
 // Render template with realistic substitutions
 let rendered = serverHtmlRaw;
@@ -132,12 +132,12 @@ rendered = rendered.replace(/\{\{slice_str[^}]*\}\}/g, '12:00:00');
 rendered = rendered.replace(/\{\{[^}]*\}\}/g, '');
 
 assert(!rendered.includes('{{'), 'all template directives must be resolved');
-assert(rendered.includes(scriptTag), 'scriptTag must remain intact before script replacement');
-assert(rendered.includes(telemetryScriptTag), 'telemetryScriptTag must remain intact before script replacement');
+assert(rendered.includes(scriptTagPrefix), 'scriptTagPrefix must remain intact before script replacement');
+assert(rendered.includes(telemetryScriptTagPrefix), 'telemetryScriptTagPrefix must remain intact before script replacement');
 
 // Replace script tags with inlined server_actions.js and server_telemetry.js
-rendered = rendered.replace(scriptTag, '<script>\n' + serverActionsJs + '\n</script>');
-rendered = rendered.replace(telemetryScriptTag, '<script>\n' + serverTelemetryJs + '\n</script>');
+rendered = rendered.replace(/<script src="\/static\/js\/server_actions\.js[^"]*"><\/script>/, '<script>\n' + serverActionsJs + '\n</script>');
+rendered = rendered.replace(/<script src="\/static\/js\/server_telemetry\.js[^"]*"><\/script>/, '<script>\n' + serverTelemetryJs + '\n</script>');
 
 const docHtml = '<!DOCTYPE html><html><head></head><body>' + rendered + '</body></html>';
 
@@ -944,8 +944,8 @@ func TestServerTemplateGoRenderingFailClosed(t *testing.T) {
 	rendered := buf.String()
 
 	// 1. Assert script loading sequence and bootstrap
-	const expectedActionsScript = `<script src="/static/js/server_actions.js"></script>`
-	const expectedTelemetryScript = `<script src="/static/js/server_telemetry.js"></script>`
+	const expectedActionsScript = `<script src="/static/js/server_actions.js`
+	const expectedTelemetryScript = `<script src="/static/js/server_telemetry.js`
 	actionsIdx := strings.Index(rendered, expectedActionsScript)
 	if actionsIdx == -1 {
 		t.Errorf("rendered server.html missing script tag %q", expectedActionsScript)

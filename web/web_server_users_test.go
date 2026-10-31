@@ -487,7 +487,7 @@ func TestServerTemplate_TelemetryPolling(t *testing.T) {
 	serverTelemetryStr := string(serverTelemetryData)
 
 	// 0. Verify server.html includes server_telemetry.js script tag and minimal bootstrap
-	const expectedTelemetryScript = `<script src="/static/js/server_telemetry.js"></script>`
+	const expectedTelemetryScript = `<script src="/static/js/server_telemetry.js`
 	if !strings.Contains(serverStr, expectedTelemetryScript) {
 		t.Errorf("server.html missing script tag %q", expectedTelemetryScript)
 	}
