@@ -834,16 +834,16 @@ func TestXrayManager_ExternalDestinationError_NoRollback(t *testing.T) {
 	}
 	mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
 
-	// Traffic probe fails with external destination TLS alert failure
-	mgr.SetVLESSTrafficProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
-		return 0, fmt.Errorf("vless: tls handshake to target external-target.com:443: tls: handshake failure")
-	})
-
 	// Fallback REALITY handshake probe succeeds directly against Xray
 	handshakeProbeCalled := false
 	mgr.SetVLESSProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
 		handshakeProbeCalled = true
 		return 10, nil
+	})
+
+	// Traffic probe fails with external destination TLS alert failure
+	mgr.SetVLESSTrafficProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		return 0, fmt.Errorf("vless: tls handshake to target external-target.com:443: tls: handshake failure")
 	})
 
 	server := &models.Server{
@@ -888,11 +888,11 @@ func TestXrayManager_InternalVLESSFailure_TriggersRollback(t *testing.T) {
 	mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
 
 	// Internal failure: REALITY verification failed
-	mgr.SetVLESSTrafficProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
-		return 0, fmt.Errorf("vless: dial traffic target fail-target.com:443: reality verification failed")
-	})
 	mgr.SetVLESSProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
 		return 0, fmt.Errorf("reality verification failed")
+	})
+	mgr.SetVLESSTrafficProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		return 0, fmt.Errorf("vless: dial traffic target fail-target.com:443: reality verification failed")
 	})
 
 	server := &models.Server{

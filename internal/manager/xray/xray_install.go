@@ -538,7 +538,10 @@ func isExternalDestinationError(err error) bool {
 		strings.Contains(msg, "vless: dial:") ||
 		strings.Contains(msg, "build handshake state") ||
 		strings.Contains(msg, "derive auth key") ||
-		strings.Contains(msg, "unauthorized client") {
+		strings.Contains(msg, "unauthorized client") ||
+		strings.Contains(msg, "eof") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") {
 		return false
 	}
 	return strings.Contains(msg, "tls handshake to target") ||
