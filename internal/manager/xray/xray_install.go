@@ -277,23 +277,112 @@ func (m *XrayManager) pullImage(ctx context.Context, client ssh.SSHClient, image
 	return nil
 }
 
+func (m *XrayManager) inspectContainer(ctx context.Context, client ssh.SSHClient, containerName string) (bool, bool, error) {
+	inspectCmd := fmt.Sprintf("docker inspect -f '{{.State.Running}}' %s", ssh.EscapeShellArg(containerName))
+	out, errOut, code, err := client.RunSudoCommand(ctx, inspectCmd)
+	if err != nil {
+		return false, false, fmt.Errorf("failed to inspect container %s: %w", containerName, err)
+	}
+	if code == 0 {
+		fields := strings.Fields(strings.TrimSpace(out))
+		running := len(fields) > 0 && fields[0] == "true"
+		return true, running, nil
+	}
+
+	combinedErr := strings.ToLower(strings.TrimSpace(errOut + " " + out))
+	if code == 1 && (strings.Contains(combinedErr, "no such") || strings.Contains(combinedErr, "not found")) {
+		return false, false, nil
+	}
+
+	return false, false, fmt.Errorf("failed to inspect container %s (code %d): %s", containerName, code, strings.TrimSpace(errOut))
+}
+
+func (m *XrayManager) recoverStopFailure(
+	ctx context.Context,
+	client ssh.SSHClient,
+	existingCfgBytes []byte,
+	stopCode int,
+	stopErrOut string,
+	stopErr error,
+) error {
+	recCtx, recCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer recCancel()
+	var recErrs []string
+	if len(existingCfgBytes) > 0 {
+		if rUpErr := client.UploadSudoFile(recCtx, XrayConfigPath, existingCfgBytes, 0600); rUpErr != nil {
+			recErrs = append(recErrs, fmt.Sprintf("failed to restore config: %v", rUpErr))
+		}
+	}
+	startCmd := fmt.Sprintf("docker start %s", ssh.EscapeShellArg(XrayContainerName))
+	if _, sErrOut, sCode, sErr := client.RunSudoCommand(recCtx, startCmd); sErr != nil || sCode != 0 {
+		recErrs = append(recErrs, fmt.Sprintf("failed to restart container (code %d): %s: %v", sCode, strings.TrimSpace(sErrOut), sErr))
+	}
+	errBase := fmt.Errorf("failed to stop existing xray container for staging (code %d): %s: %w", stopCode, strings.TrimSpace(stopErrOut), stopErr)
+	if len(recErrs) > 0 {
+		return fmt.Errorf("%w (recovery failures: %s)", errBase, strings.Join(recErrs, "; "))
+	}
+	return errBase
+}
+
+func (m *XrayManager) recoverRenameFailure(
+	ctx context.Context,
+	client ssh.SSHClient,
+	backupContainerName string,
+	existingCfgBytes []byte,
+	wasRunning bool,
+	renameCode int,
+	renameErrOut string,
+	renameErr error,
+) error {
+	recCtx, recCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer recCancel()
+	var recErrs []string
+	if len(existingCfgBytes) > 0 {
+		if rUpErr := client.UploadSudoFile(recCtx, XrayConfigPath, existingCfgBytes, 0600); rUpErr != nil {
+			recErrs = append(recErrs, fmt.Sprintf("failed to restore config: %v", rUpErr))
+		}
+	}
+
+	origExists, _, oErr := m.inspectContainer(recCtx, client, XrayContainerName)
+	backupExists, _, bErr := m.inspectContainer(recCtx, client, backupContainerName)
+	if oErr != nil || bErr != nil {
+		recErrs = append(recErrs, fmt.Sprintf("failed to inspect container state during rename rollback (orig err: %v, backup err: %v)", oErr, bErr))
+	} else if backupExists && !origExists {
+		undoRenameCmd := fmt.Sprintf("docker rename %s %s",
+			ssh.EscapeShellArg(backupContainerName),
+			ssh.EscapeShellArg(XrayContainerName),
+		)
+		if _, uOut, uCode, uErr := client.RunSudoCommand(recCtx, undoRenameCmd); uErr != nil || uCode != 0 {
+			recErrs = append(recErrs, fmt.Sprintf("failed to revert container rename (code %d): %s: %v", uCode, strings.TrimSpace(uOut), uErr))
+		}
+	}
+
+	if wasRunning {
+		startCmd := fmt.Sprintf("docker start %s", ssh.EscapeShellArg(XrayContainerName))
+		if _, sErrOut, sCode, sErr := client.RunSudoCommand(recCtx, startCmd); sErr != nil || sCode != 0 {
+			recErrs = append(recErrs, fmt.Sprintf("failed to restart container (code %d): %s: %v", sCode, strings.TrimSpace(sErrOut), sErr))
+		}
+	}
+	errBase := fmt.Errorf("failed to stage existing xray container for replacement (code %d): %s: %w", renameCode, strings.TrimSpace(renameErrOut), renameErr)
+	if len(recErrs) > 0 {
+		return fmt.Errorf("%w (recovery failures: %s)", errBase, strings.Join(recErrs, "; "))
+	}
+	return errBase
+}
+
 func (m *XrayManager) stageExistingContainer(
 	ctx context.Context,
 	client ssh.SSHClient,
 	backupContainerName string,
 	existingCfgBytes []byte,
 ) (bool, bool, error) {
-	inspectExistingCmd := fmt.Sprintf("docker inspect -f '{{.State.Running}}' %s 2>/dev/null", ssh.EscapeShellArg(XrayContainerName))
-	existingOut, _, existingCode, _ := client.RunSudoCommand(ctx, inspectExistingCmd)
-	hasExistingContainer := existingCode == 0 && strings.TrimSpace(existingOut) != "" && strings.TrimSpace(existingOut) != "false false"
-	wasRunning := false
+	hasExistingContainer, wasRunning, err := m.inspectContainer(ctx, client, XrayContainerName)
+	if err != nil {
+		return false, false, err
+	}
 	if hasExistingContainer {
 		if len(existingCfgBytes) == 0 {
 			return false, false, fmt.Errorf("existing xray container detected but original configuration could not be recovered; aborting to preserve container state")
-		}
-		fields := strings.Fields(strings.TrimSpace(existingOut))
-		if len(fields) > 0 && fields[0] == "true" {
-			wasRunning = true
 		}
 		rmBackupCmd := fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(backupContainerName))
 		_, _, _, _ = client.RunSudoCommand(ctx, rmBackupCmd)
@@ -301,23 +390,8 @@ func (m *XrayManager) stageExistingContainer(
 		if wasRunning {
 			stopCmd := fmt.Sprintf("docker stop %s", ssh.EscapeShellArg(XrayContainerName))
 			if _, stopErrOut, stopCode, stopErr := client.RunSudoCommand(ctx, stopCmd); stopErr != nil || stopCode != 0 {
-				recCtx, recCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-				defer recCancel()
-				var recErrs []string
-				if len(existingCfgBytes) > 0 {
-					if rUpErr := client.UploadSudoFile(recCtx, XrayConfigPath, existingCfgBytes, 0600); rUpErr != nil {
-						recErrs = append(recErrs, fmt.Sprintf("failed to restore config: %v", rUpErr))
-					}
-				}
-				startCmd := fmt.Sprintf("docker start %s", ssh.EscapeShellArg(XrayContainerName))
-				if _, sErrOut, sCode, sErr := client.RunSudoCommand(recCtx, startCmd); sErr != nil || sCode != 0 {
-					recErrs = append(recErrs, fmt.Sprintf("failed to restart container (code %d): %s: %v", sCode, strings.TrimSpace(sErrOut), sErr))
-				}
-				errBase := fmt.Errorf("failed to stop existing xray container for staging (code %d): %s: %w", stopCode, strings.TrimSpace(stopErrOut), stopErr)
-				if len(recErrs) > 0 {
-					return false, false, fmt.Errorf("%w (recovery failures: %s)", errBase, strings.Join(recErrs, "; "))
-				}
-				return false, false, errBase
+				recErr := m.recoverStopFailure(ctx, client, existingCfgBytes, stopCode, stopErrOut, stopErr)
+				return false, false, recErr
 			}
 		}
 
@@ -326,25 +400,8 @@ func (m *XrayManager) stageExistingContainer(
 			ssh.EscapeShellArg(backupContainerName),
 		)
 		if _, renameErrOut, renameCode, renameErr := client.RunSudoCommand(ctx, renameCmd); renameErr != nil || renameCode != 0 {
-			recCtx, recCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-			defer recCancel()
-			var recErrs []string
-			if len(existingCfgBytes) > 0 {
-				if rUpErr := client.UploadSudoFile(recCtx, XrayConfigPath, existingCfgBytes, 0600); rUpErr != nil {
-					recErrs = append(recErrs, fmt.Sprintf("failed to restore config: %v", rUpErr))
-				}
-			}
-			if wasRunning {
-				startCmd := fmt.Sprintf("docker start %s", ssh.EscapeShellArg(XrayContainerName))
-				if _, sErrOut, sCode, sErr := client.RunSudoCommand(recCtx, startCmd); sErr != nil || sCode != 0 {
-					recErrs = append(recErrs, fmt.Sprintf("failed to restart container (code %d): %s: %v", sCode, strings.TrimSpace(sErrOut), sErr))
-				}
-			}
-			errBase := fmt.Errorf("failed to stage existing xray container for replacement (code %d): %s: %w", renameCode, strings.TrimSpace(renameErrOut), renameErr)
-			if len(recErrs) > 0 {
-				return false, false, fmt.Errorf("%w (recovery failures: %s)", errBase, strings.Join(recErrs, "; "))
-			}
-			return false, false, errBase
+			recErr := m.recoverRenameFailure(ctx, client, backupContainerName, existingCfgBytes, wasRunning, renameCode, renameErrOut, renameErr)
+			return false, false, recErr
 		}
 	} else {
 		rmCmd := fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(XrayContainerName))
@@ -697,6 +754,19 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	privB64, pubB64, shortID, shortIDs, clients, existingCfgBytes, existingParsed, err := m.resolveRealityCredentials(ctx, client)
 	if err != nil {
 		return err
+	}
+
+	// Safety check before mutating configuration on disk:
+	// If an existing container is detected but its original configuration could not be recovered,
+	// abort immediately before writing XrayConfigPath to prevent corrupting credentials.
+	if len(existingCfgBytes) == 0 {
+		hasExistingContainer, _, inspectErr := m.inspectContainer(ctx, client, XrayContainerName)
+		if inspectErr != nil {
+			return fmt.Errorf("failed to check existing xray container before config upload: %w", inspectErr)
+		}
+		if hasExistingContainer {
+			return fmt.Errorf("existing xray container detected but original configuration could not be recovered; aborting to preserve container state")
+		}
 	}
 
 	// 4. Create directory structure
