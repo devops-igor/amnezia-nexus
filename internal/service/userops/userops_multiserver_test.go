@@ -419,3 +419,142 @@ func TestPerformMassOperations_MultiServerAllErrorsCollected(t *testing.T) {
 		t.Fatalf("expected errors for both cid-err-a and cid-err-b, got: %v", err)
 	}
 }
+
+func TestPerformMassOperations_FailClosedOnConnectionEnumerationError(t *testing.T) {
+	t.Run("fails closed when initial connection enumeration fails in step 1", func(t *testing.T) {
+		db, cleanup := setupTestDB(t)
+		defer cleanup()
+		ctx := t.Context()
+
+		serverID, err := db.CreateServer(ctx, &models.Server{Name: "step1-fault-srv", Host: "10.0.3.1", SSHPort: 22})
+		if err != nil {
+			t.Fatalf("CreateServer: %v", err)
+		}
+
+		uid, err := db.CreateUser(ctx, &models.User{Username: "step1-fault-user", Enabled: true})
+		if err != nil {
+			t.Fatalf("CreateUser: %v", err)
+		}
+
+		connID := "step1-fault-conn"
+		if _, err := db.CreateConnection(ctx, &models.UserConnection{
+			ID:        connID,
+			UserID:    uid,
+			ServerID:  serverID,
+			Protocol:  models.ProtocolAWG,
+			ClientID:  "cid-step1-fault",
+			CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("CreateConnection: %v", err)
+		}
+
+		// Prevent s.db.DeleteUser from ever running successfully; if called, the test must fail.
+		triggerSQL := "CREATE TRIGGER fail_delete_user_step1 BEFORE DELETE ON users BEGIN SELECT RAISE(ABORT, 'DeleteUser must not be called when step 1 enumeration fails'); END"
+		if _, err := db.ExecContext(ctx, triggerSQL); err != nil {
+			t.Fatalf("Create trigger: %v", err)
+		}
+
+		// Inject schema fault that breaks GetConnectionsByUserID (which selects traffic_total)
+		// while simpler queries (like DELETE FROM users) would have succeeded.
+		if _, err := db.ExecContext(ctx, "ALTER TABLE user_connections RENAME COLUMN traffic_total TO traffic_total_step1_fault"); err != nil {
+			t.Fatalf("Alter table: %v", err)
+		}
+
+		reg := newMockRegistry()
+		reg.Register(newMockProtocolManager(models.ProtocolAWG))
+		svc := New(db, reg)
+
+		err = svc.PerformMassOperations(ctx, MassOperationRequest{
+			DeleteUIDs: []string{uid},
+		})
+		if err == nil {
+			t.Fatal("expected PerformMassOperations to return error on connection enumeration failure, got nil")
+		}
+		if !strings.Contains(err.Error(), "fetch connections for user") {
+			t.Fatalf("expected error to mention connection enumeration failure, got: %v", err)
+		}
+
+		// Verify user record remains intact
+		user, err := db.GetUser(ctx, uid)
+		if err != nil {
+			t.Fatalf("GetUser: %v", err)
+		}
+		if user == nil {
+			t.Fatal("user record was deleted, expected preserved")
+		}
+
+		// Verify connection row remains intact
+		var connCount int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM user_connections WHERE id = ?", connID).Scan(&connCount); err != nil {
+			t.Fatalf("Count connection: %v", err)
+		}
+		if connCount != 1 {
+			t.Fatalf("user connection %s was deleted, expected preserved", connID)
+		}
+	})
+
+	t.Run("fails closed when final verification enumeration fails in step 5", func(t *testing.T) {
+		db, cleanup := setupTestDB(t)
+		defer cleanup()
+		ctx := t.Context()
+
+		serverID, err := db.CreateServer(ctx, &models.Server{Name: "step5-fault-srv", Host: "10.0.3.2", SSHPort: 22})
+		if err != nil {
+			t.Fatalf("CreateServer: %v", err)
+		}
+
+		uid, err := db.CreateUser(ctx, &models.User{Username: "step5-fault-user", Enabled: true})
+		if err != nil {
+			t.Fatalf("CreateUser: %v", err)
+		}
+
+		connID := "step5-fault-conn"
+		if _, err := db.CreateConnection(ctx, &models.UserConnection{
+			ID:        connID,
+			UserID:    uid,
+			ServerID:  serverID,
+			Protocol:  models.ProtocolAWG,
+			ClientID:  "cid-step5-fault",
+			CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("CreateConnection: %v", err)
+		}
+
+		// Prevent s.db.DeleteUser from ever running; if called, abort immediately.
+		triggerSQL := "CREATE TRIGGER fail_delete_user_step5 BEFORE DELETE ON users BEGIN SELECT RAISE(ABORT, 'DeleteUser must not be called when step 5 verification fails'); END"
+		if _, err := db.ExecContext(ctx, triggerSQL); err != nil {
+			t.Fatalf("Create trigger: %v", err)
+		}
+
+		// Fault injected during step 4 remove client: after step 1 succeeds, alter table so step 5 fails.
+		mgr := &blockingMockManager{
+			proto: models.ProtocolAWG,
+			onRemove: func(rmCtx context.Context) error {
+				_, alterErr := db.ExecContext(rmCtx, "ALTER TABLE user_connections RENAME COLUMN traffic_total TO traffic_total_step5_fault")
+				return alterErr
+			},
+		}
+		reg := newMockRegistry()
+		reg.Register(mgr)
+		svc := New(db, reg)
+
+		err = svc.PerformMassOperations(ctx, MassOperationRequest{
+			DeleteUIDs: []string{uid},
+		})
+		if err == nil {
+			t.Fatal("expected PerformMassOperations to return error when step 5 enumeration fails, got nil")
+		}
+		if !strings.Contains(err.Error(), "verify connections for user") {
+			t.Fatalf("expected error to mention verify connections failure, got: %v", err)
+		}
+
+		// Verify user record remains intact
+		user, err := db.GetUser(ctx, uid)
+		if err != nil {
+			t.Fatalf("GetUser: %v", err)
+		}
+		if user == nil {
+			t.Fatal("user record was deleted, expected preserved")
+		}
+	})
+}

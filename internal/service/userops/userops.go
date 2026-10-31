@@ -224,11 +224,16 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 		return ops
 	}
 
+	deleteBlocked := make(map[string]bool)
+	var deleteErrs []error
+
 	// 1. Group deletes by server
 	for _, uid := range req.DeleteUIDs {
 		conns, err := s.db.GetConnectionsByUserID(ctx, uid)
 		if err != nil {
 			slog.Warn("Failed to fetch connections for user deletion", "user_id", uid, "err", err)
+			deleteBlocked[uid] = true
+			deleteErrs = append(deleteErrs, fmt.Errorf("fetch connections for user %s: %w", uid, err))
 			continue
 		}
 		for _, c := range conns {
@@ -296,14 +301,24 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 
 	// 5. Final DB cleanup at user level
 	for _, uid := range req.DeleteUIDs {
-		conns, _ := s.db.GetConnectionsByUserID(ctx, uid)
+		if deleteBlocked[uid] {
+			slog.Warn("Skipping user record deletion due to prior connection enumeration failure", "user_id", uid)
+			continue
+		}
+		conns, err := s.db.GetConnectionsByUserID(ctx, uid)
+		if err != nil {
+			slog.Warn("Failed to verify remaining connections for user deletion", "user_id", uid, "err", err)
+			deleteErrs = append(deleteErrs, fmt.Errorf("verify connections for user %s: %w", uid, err))
+			continue
+		}
 		if len(conns) > 0 {
 			slog.Warn("Skipping user record deletion due to remaining connections from failed remote removals", "user_id", uid, "remaining_connections", len(conns))
 			continue
 		}
-		_, err := s.db.DeleteUser(ctx, uid)
+		_, err = s.db.DeleteUser(ctx, uid)
 		if err != nil {
 			slog.Warn("Failed to delete user record", "user_id", uid, "err", err)
+			deleteErrs = append(deleteErrs, fmt.Errorf("delete user record %s: %w", uid, err))
 		} else {
 			_ = s.db.DeletePeerLifecycleByUserID(ctx, uid)
 		}
@@ -321,7 +336,11 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 		}
 	}
 
-	return errors.Join(append(toggleErrs, workerErrs...)...)
+	allErrs := make([]error, 0, len(toggleErrs)+len(deleteErrs)+len(workerErrs))
+	allErrs = append(allErrs, toggleErrs...)
+	allErrs = append(allErrs, deleteErrs...)
+	allErrs = append(allErrs, workerErrs...)
+	return errors.Join(allErrs...)
 }
 
 func (s *Service) loadServerForOperations(ctx context.Context, serverID int64, ops *serverOperations, toggleFailures *sync.Map) (*models.Server, error) {

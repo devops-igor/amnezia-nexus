@@ -473,8 +473,20 @@ func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 	}
 
 	// Guard: unknown backend -> not-found, before any state mutation.
+	// If the tunnel is absent from the pool (e.g. removed by a prior attempt that
+	// failed during defensive sweep peer preservation), check if leftover rows exist
+	// in backend_tunnels and allow retrying the defensive cleanup sweep.
 	tunnel, err := s.pool.GetTunnel(serverID)
 	if err != nil {
+		if errors.Is(err, ErrBackendTunnelNotFound) && s.db != nil {
+			tunnels, dbErr := s.db.GetBackendTunnelsByServerID(ctx, serverID)
+			if dbErr != nil {
+				return fmt.Errorf("failed to query backend tunnels for server %d: %w", serverID, dbErr)
+			}
+			if len(tunnels) > 0 {
+				return s.sweepLeftoverBackendLocked(ctx, serverID, 0)
+			}
+		}
 		return err
 	}
 
@@ -519,30 +531,36 @@ func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 	// reassigns any connected sessions still on it to a surviving active
 	// backend, deletes the leftover row, and never fails the delete: a
 	// missing row is the expected path.
-	//
-	// DB calls run without s.mu held (db methods take their own locks) — the
-	// disabled tunnel cannot re-enter the pool in between: pool mutations
-	// all happen under s.mu, which we re-acquire immediately after.
-	//
+	return s.sweepLeftoverBackendLocked(ctx, serverID, tunnel.ID)
+}
+
+func (s *Service) sweepLeftoverBackendLocked(ctx context.Context, serverID int64, excludedTunnelID int64) error {
+	if s.db == nil {
+		return nil
+	}
+
 	// failoverTarget is a surviving ACTIVE pool tunnel (never the deleted
 	// one): reassigning sessions onto the just-deleted row would only move
 	// the orphan. Zero means no healthy target exists — HandleFailover
 	// already hit the same terminal state and logged it.
 	failoverTarget := int64(0)
 	for _, tun := range s.pool.GetActiveTunnels() {
-		if tun.ID != tunnel.ID {
+		if tun.ID != excludedTunnelID {
 			failoverTarget = tun.ID
 			break
 		}
 	}
 
+	// DB calls run without s.mu held (db methods take their own locks) — the
+	// disabled tunnel cannot re-enter the pool in between: pool mutations
+	// all happen under s.mu, which we re-acquire immediately after.
 	s.mu.Unlock()
-	leftover, dbErr := s.db.GetBackendTunnelByServerID(ctx, serverID)
+	leftovers, dbErr := s.db.GetBackendTunnelsByServerID(ctx, serverID)
 	if dbErr != nil {
-		leftover = nil
 		log.Printf("[vpn] warning: delete backend %d: DB sweep lookup failed: %v", serverID, dbErr)
 	}
-	if leftover != nil {
+	for i := range leftovers {
+		leftover := &leftovers[i]
 		if err := EnsureBackendProxyPeerPreservation(ctx, s.db, serverID, leftover.Protocol, leftover.ProtocolParams); err != nil {
 			log.Printf("[vpn] warning: delete backend %d: failed to ensure peer preservation for leftover row %d: %v", serverID, leftover.ID, err)
 			s.mu.Lock()
@@ -560,18 +578,18 @@ func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 		if sessions, sessErr := s.db.GetActiveVPNSessions(ctx); sessErr != nil {
 			log.Printf("[vpn] warning: delete backend %d: orphan-session sweep lookup failed: %v", serverID, sessErr)
 		} else {
-			for i := range sessions {
-				if sessions[i].BackendTunnelID != leftover.ID {
+			for j := range sessions {
+				if sessions[j].BackendTunnelID != leftover.ID {
 					continue
 				}
 				if failoverTarget == 0 {
-					log.Printf("[vpn] warning: delete backend %d: no healthy backend left to reassign session %s (leftover row %d deleted, session left draining)", serverID, sessions[i].ID, leftover.ID)
+					log.Printf("[vpn] warning: delete backend %d: no healthy backend left to reassign session %s (leftover row %d deleted, session left draining)", serverID, sessions[j].ID, leftover.ID)
 					continue
 				}
-				if err := s.db.UpdateVPNSessionBackendTunnel(ctx, sessions[i].ID, failoverTarget); err != nil {
-					log.Printf("[vpn] warning: delete backend %d: could not reassign session %s off leftover row %d: %v", serverID, sessions[i].ID, leftover.ID, err)
+				if err := s.db.UpdateVPNSessionBackendTunnel(ctx, sessions[j].ID, failoverTarget); err != nil {
+					log.Printf("[vpn] warning: delete backend %d: could not reassign session %s off leftover row %d: %v", serverID, sessions[j].ID, leftover.ID, err)
 				} else {
-					log.Printf("[vpn] delete backend %d: reassigned session %s off leftover backend_tunnels row %d onto backend %d (draining)", serverID, sessions[i].ID, leftover.ID, failoverTarget)
+					log.Printf("[vpn] delete backend %d: reassigned session %s off leftover backend_tunnels row %d onto backend %d (draining)", serverID, sessions[j].ID, leftover.ID, failoverTarget)
 				}
 			}
 		}
