@@ -298,6 +298,7 @@
   "server_config": "Конфигурация сервера",
   "server_degraded_desc": "Некоторые протоколы подключения могут работать нестабильно",
   "server_deleted": "Сервер удалён",
+  "server_unreachable": "Сервер недоступен",
   "server_host_updated": "IP сервера обновлен",
   "server_label": "Сервер",
   "server_management": "Управление сервером",

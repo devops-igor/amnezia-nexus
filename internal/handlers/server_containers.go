@@ -2,11 +2,15 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -242,9 +246,11 @@ func syncDiscoveredProtocols(server *models.Server, protocolsStatus map[string]a
 
 // teardownAdminProtocols uninstalls the Admin-managed (VLESS/Naive) protocols
 // installed on a server ahead of its deletion, so no remote container or client
-// credential outlives the records. It writes the error response and returns
-// false when the caller is not an Admin or teardown fails (records stay intact).
-func (h *Handlers) teardownAdminProtocols(w http.ResponseWriter, r *http.Request, server *models.Server) bool {
+// credential outlives the records. When force is false, it returns false (keeping records
+// intact) and writes HTTP 409 if remote host is unreachable, or HTTP 500 on other errors.
+// When force is true, it attempts uninstallation with a bounded timeout, logging any failures
+// and continuing deletion.
+func (h *Handlers) teardownAdminProtocols(w http.ResponseWriter, r *http.Request, server *models.Server, force bool) bool {
 	for proto := range server.Protocols {
 		if norm := models.NormalizeProtocol(proto); (norm != models.ProtocolVLESS && norm != models.ProtocolNaive) || !isProtocolInstalled(server, proto) {
 			continue
@@ -255,14 +261,75 @@ func (h *Handlers) teardownAdminProtocols(w http.ResponseWriter, r *http.Request
 		}
 		mgr, err := h.GetProtocolManager(proto)
 		if err != nil || mgr == nil {
+			if force {
+				slog.Warn("force delete: no protocol manager available to remove, ignoring", "server_id", server.ID, "protocol", proto, "error", err)
+				continue
+			}
 			h.JSONError(w, http.StatusInternalServerError, "uninstall_failed", fmt.Sprintf("No protocol manager available to remove %s", proto))
 			return false
 		}
+		if force {
+			timeoutCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			err := mgr.Uninstall(timeoutCtx, server)
+			cancel()
+			if err != nil {
+				slog.Warn("force delete: failed to uninstall protocol container, ignoring", "server_id", server.ID, "protocol", proto, "error", err)
+			}
+			continue
+		}
 		if err := mgr.Uninstall(r.Context(), server); err != nil {
 			slog.Error("failed to uninstall protocol before server delete", "server_id", server.ID, "protocol", proto, "error", err)
+			if isNetworkOrDialError(err) {
+				h.JSONError(w, http.StatusConflict, "server_unreachable", "Remote server is unreachable: container cleanup failed. Use force delete to remove from panel.")
+				return false
+			}
 			h.JSONError(w, http.StatusInternalServerError, "uninstall_failed", fmt.Sprintf("Failed to remove protocol container: %v", err))
 			return false
 		}
 	}
 	return true
+}
+
+// isNetworkOrDialError returns true if err represents a network unreachability,
+// dial timeout, connection refusal, or related network failure.
+func isNetworkOrDialError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ETIMEDOUT) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	var sysErr syscall.Errno
+	if errors.As(err, &sysErr) {
+		if sysErr == syscall.ECONNREFUSED ||
+			sysErr == syscall.ETIMEDOUT ||
+			sysErr == syscall.EHOSTUNREACH ||
+			sysErr == syscall.ENETUNREACH {
+			return true
+		}
+	}
+	lower := strings.ToLower(err.Error())
+	patterns := []string{
+		"i/o timeout",
+		"connection refused",
+		"no route to host",
+		"network is unreachable",
+		"failed to dial",
+	}
+	for _, p := range patterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
 }

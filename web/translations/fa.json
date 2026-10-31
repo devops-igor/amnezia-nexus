@@ -298,6 +298,7 @@
   "server_config": "پیکربندی سرور",
   "server_degraded_desc": "برخی از پروتکل‌های اتصال ممکن است با اختلال مواجه شوند",
   "server_deleted": "سرور حذف شد",
+  "server_unreachable": "سرور در دسترس نیست",
   "server_host_updated": "آی‌پی سرور به‌روزرسانی شد",
   "server_label": "سرور",
   "server_management": "مدیریت سرور",

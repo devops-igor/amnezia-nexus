@@ -647,6 +647,23 @@ async function removeServer() {
         await API.post(`/api/servers/${SERVER_ID}/delete`);
         window.location.href = '/';
     } catch (err) {
+        if (err.status === 409 || (err.data && err.data.error === 'server_unreachable')) {
+            const forceConfirmed = await UI.confirm({
+                title: _('server_unreachable') || 'Server Unreachable',
+                message: 'Remote server is unreachable. Would you like to force remove this server from the panel database?',
+                confirmText: 'Force Remove',
+                confirmVariant: 'danger'
+            });
+            if (forceConfirmed) {
+                try {
+                    await API.post(`/api/servers/${SERVER_ID}/delete?force=true`);
+                    window.location.href = '/';
+                } catch (forceErr) {
+                    UI.toast('Error: ' + forceErr.message, 'error');
+                }
+            }
+            return;
+        }
         UI.toast('Error: ' + err.message, 'error');
     }
 }

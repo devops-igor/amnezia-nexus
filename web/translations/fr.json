@@ -298,6 +298,7 @@
   "server_config": "Configuration du serveur",
   "server_degraded_desc": "Certains protocoles de connexion peuvent rencontrer des problèmes",
   "server_deleted": "Serveur supprimé",
+  "server_unreachable": "Serveur inaccessible",
   "server_host_updated": "IP du serveur mis à jour",
   "server_label": "Serveur",
   "server_management": "Gestion du serveur",

@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -143,6 +145,18 @@ func (h *Handlers) DeleteServerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	force := false
+	if q := r.URL.Query().Get("force"); q == "true" || q == "1" {
+		force = true
+	} else if r.Body != nil {
+		var req struct {
+			Force bool `json:"force"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 65536)).Decode(&req); err == nil {
+			force = req.Force
+		}
+	}
+
 	ctx := r.Context()
 	server, err := h.db.GetServer(ctx, serverID)
 	if err != nil || server == nil {
@@ -150,34 +164,52 @@ func (h *Handlers) DeleteServerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.teardownAdminProtocols(w, r, server) {
+	if !h.teardownAdminProtocols(w, r, server, force) {
 		return
 	}
 
 	if h.vpnSvc != nil {
 		if err := h.vpnSvc.DeleteServer(ctx, serverID); err != nil {
-			slog.Error("failed to teardown VPN backend for server", "server_id", serverID, "error", err)
-			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to teardown VPN backend")
-			return
+			if force {
+				slog.Warn("force delete: failed to teardown VPN backend for server, ignoring", "server_id", serverID, "error", err)
+			} else {
+				slog.Error("failed to teardown VPN backend for server", "server_id", serverID, "error", err)
+				h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to teardown VPN backend")
+				return
+			}
+		} else {
+			defer h.vpnSvc.ClearServerDeletedTombstone(serverID)
 		}
-		defer h.vpnSvc.ClearServerDeletedTombstone(serverID)
 	}
 
 	if h.sshPool != nil {
 		h.sshPool.Remove(serverID)
 	}
 
-	if _, err := h.db.DeleteConnectionsByServer(ctx, serverID); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server connections")
-		return
-	}
-	if _, err := h.db.DeleteKnownHost(ctx, serverID); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server known host")
-		return
-	}
-	if _, err := h.db.DeleteServer(ctx, serverID); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server")
-		return
+	if force {
+		if _, err := h.db.DeleteConnectionsByServer(ctx, serverID); err != nil {
+			slog.Warn("force delete: failed to delete server connections", "server_id", serverID, "error", err)
+		}
+		if _, err := h.db.DeleteKnownHost(ctx, serverID); err != nil {
+			slog.Warn("force delete: failed to delete server known host", "server_id", serverID, "error", err)
+		}
+		if _, err := h.db.DeleteServer(ctx, serverID); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server")
+			return
+		}
+	} else {
+		if _, err := h.db.DeleteConnectionsByServer(ctx, serverID); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server connections")
+			return
+		}
+		if _, err := h.db.DeleteKnownHost(ctx, serverID); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server known host")
+			return
+		}
+		if _, err := h.db.DeleteServer(ctx, serverID); err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete server")
+			return
+		}
 	}
 
 	h.audit(r, "server.delete", map[string]any{"server_id": serverID, "name": server.Name})
