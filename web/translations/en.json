@@ -299,6 +299,8 @@
   "server_degraded_desc": "Some connection protocols may experience issues",
   "server_deleted": "Server deleted",
   "server_unreachable": "Server Unreachable",
+  "server_unreachable_confirm": "Remote server is unreachable. Would you like to force remove this server from the panel database?",
+  "force_remove": "Force Remove",
   "server_host_updated": "Server IP updated",
   "server_label": "Server",
   "server_management": "Server Management",

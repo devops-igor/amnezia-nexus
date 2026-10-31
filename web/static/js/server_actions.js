@@ -637,7 +637,7 @@ async function clearServer() {
 async function removeServer() {
     const confirmed = await UI.confirm({
         title: _('remove_server') || 'Remove Server',
-        message: 'Are you sure you want to remove this server from the panel? (The server itself will not be erased).',
+        message: _('remove_server_confirm') || 'Are you sure you want to remove this server from the panel?',
         confirmText: 'Remove',
         confirmVariant: 'danger'
     });
@@ -650,8 +650,8 @@ async function removeServer() {
         if (err.status === 409 || (err.data && err.data.error === 'server_unreachable')) {
             const forceConfirmed = await UI.confirm({
                 title: _('server_unreachable') || 'Server Unreachable',
-                message: 'Remote server is unreachable. Would you like to force remove this server from the panel database?',
-                confirmText: 'Force Remove',
+                message: _('server_unreachable_confirm') || 'Remote server is unreachable. Would you like to force remove this server from the panel database?',
+                confirmText: _('force_remove') || 'Force Remove',
                 confirmVariant: 'danger'
             });
             if (forceConfirmed) {

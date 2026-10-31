@@ -299,6 +299,8 @@
   "server_degraded_desc": "部分连接协议可能存在异常",
   "server_deleted": "服务器已删除",
   "server_unreachable": "服务器无法连接",
+  "server_unreachable_confirm": "远程服务器无法访问。是否要强制从面板数据库中删除此服务器？",
+  "force_remove": "强制删除",
   "server_host_updated": "服务器IP已更新",
   "server_label": "服务器",
   "server_management": "服务器管理",

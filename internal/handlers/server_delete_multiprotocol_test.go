@@ -86,7 +86,7 @@ func TestDeleteServerHandlerAdminManagedProtocols(t *testing.T) {
 			}
 			assertPreserved("non-admin")
 
-			uninstallErr = errors.New("container removal failed: permission denied")
+			uninstallErr = errors.New("container removal failed: docker daemon error")
 			if code := doDelete(models.RoleAdmin); code != http.StatusInternalServerError {
 				t.Fatalf("teardown failure: expected 500, got %d", code)
 			}

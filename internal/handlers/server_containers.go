@@ -279,7 +279,7 @@ func (h *Handlers) teardownAdminProtocols(w http.ResponseWriter, r *http.Request
 		}
 		if err := mgr.Uninstall(r.Context(), server); err != nil {
 			slog.Error("failed to uninstall protocol before server delete", "server_id", server.ID, "protocol", proto, "error", err)
-			if isNetworkOrDialError(err) {
+			if isRemoteTeardownError(err) {
 				h.JSONError(w, http.StatusConflict, "server_unreachable", "Remote server is unreachable: container cleanup failed. Use force delete to remove from panel.")
 				return false
 			}
@@ -290,9 +290,10 @@ func (h *Handlers) teardownAdminProtocols(w http.ResponseWriter, r *http.Request
 	return true
 }
 
-// isNetworkOrDialError returns true if err represents a network unreachability,
-// dial timeout, connection refusal, or related network failure.
-func isNetworkOrDialError(err error) bool {
+// isRemoteTeardownError returns true if err represents a network unreachability,
+// dial timeout, connection refusal, SSH handshake failure, or authentication failure
+// indicating that the remote host cannot be reached or logged into for container teardown.
+func isRemoteTeardownError(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -325,6 +326,10 @@ func isNetworkOrDialError(err error) bool {
 		"no route to host",
 		"network is unreachable",
 		"failed to dial",
+		"unable to authenticate",
+		"handshake failed",
+		"permission denied",
+		"auth failed",
 	}
 	for _, p := range patterns {
 		if strings.Contains(lower, p) {
@@ -332,4 +337,9 @@ func isNetworkOrDialError(err error) bool {
 		}
 	}
 	return false
+}
+
+// isNetworkOrDialError is an alias for isRemoteTeardownError for backwards compatibility.
+func isNetworkOrDialError(err error) bool {
+	return isRemoteTeardownError(err)
 }

@@ -344,8 +344,8 @@
             if (err.status === 409 || (err.data && err.data.error === 'server_unreachable')) {
                 const forceConfirmed = await UI.confirm({
                     title: _('server_unreachable') || 'Server Unreachable',
-                    message: 'Remote server is unreachable. Would you like to force remove this server from the panel database?',
-                    confirmText: 'Force Remove',
+                    message: _('server_unreachable_confirm') || 'Remote server is unreachable. Would you like to force remove this server from the panel database?',
+                    confirmText: _('force_remove') || 'Force Remove',
                     confirmVariant: 'danger'
                 });
                 if (forceConfirmed) {
