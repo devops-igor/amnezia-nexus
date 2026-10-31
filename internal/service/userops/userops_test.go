@@ -820,6 +820,59 @@ func TestPerformMassOperations_ReportsRemoteRevocationFailure(t *testing.T) {
 	}
 }
 
+func TestPerformMassOperations_ReportsDeleteFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, sql, want string
+		registry        bool
+	}{
+		{"server lookup error", "ALTER TABLE servers RENAME TO unavailable_servers", "get server", true},
+		{"server missing", "UPDATE user_connections SET server_id = -1", "server not found", true},
+		{"backend check error", "ALTER TABLE backend_tunnels RENAME TO unavailable_tunnels", "check backend tunnel", true},
+		{"nil registry", "", "protocol manager \"awg\" unavailable", false},
+		{"missing manager", "", "protocol manager \"awg\" unavailable", true},
+		{"database deletion error", "CREATE TRIGGER fail_conn_delete BEFORE DELETE ON user_connections BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END", "delete connection failed-conn: failed to delete connection failed-conn: constraint failed: injected delete failure", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, cleanup := setupTestDB(t)
+			defer cleanup()
+			ctx := t.Context()
+			sid, err := db.CreateServer(ctx, &models.Server{Name: "delete-errors", Host: "127.0.0.1", SSHPort: 22})
+			if err != nil {
+				t.Fatal(err)
+			}
+			uid, err := db.CreateUser(ctx, &models.User{Username: "delete-errors", Enabled: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.CreateConnection(ctx, &models.UserConnection{
+				ID: "failed-conn", UserID: uid, ServerID: sid, Protocol: models.ProtocolAWG, ClientID: "failed-client",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var reg ProtocolResolver
+			if tc.registry {
+				r := newMockRegistry()
+				if tc.name != "missing manager" {
+					r.Register(newMockProtocolManager(models.ProtocolAWG))
+				}
+				reg = r
+			}
+			if tc.sql != "" {
+				if _, err := db.ExecContext(ctx, tc.sql); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err = New(db, reg).PerformMassOperations(ctx, MassOperationRequest{DeleteUIDs: []string{uid}})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %q in mass delete error, got %v", tc.want, err)
+			}
+			if c, err := db.GetConnection(ctx, "failed-conn"); err != nil || c == nil {
+				t.Fatalf("failed delete lost retryable connection: %v %v", c, err)
+			}
+		})
+	}
+}
+
 func TestUserOps_SharedCredentialDoesNotDisconnectOtherUser(t *testing.T) {
 	for _, toggle := range []bool{false, true} {
 		t.Run(fmt.Sprintf("toggle_%t", toggle), func(t *testing.T) {

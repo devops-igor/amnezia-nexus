@@ -316,6 +316,9 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 		for _, t := range ops.toggles {
 			toggleFailures.Store(t.conn.UserID, fmt.Errorf("get server %d: %w", serverID, err))
 		}
+		if len(ops.deletes) > 0 {
+			return fmt.Errorf("get server %d for %d deletes: %w", serverID, len(ops.deletes), err)
+		}
 		return nil
 	}
 
@@ -335,21 +338,16 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 		}
 		isBackend, err := s.db.IsBackendTunnelClient(ctx, serverID, c.Protocol, c.ClientID)
 		if err != nil {
-			slog.Warn("Failed to check backend tunnel client during mass delete, skipping remote removal to fail closed",
-				"server_id", serverID,
-				"protocol", proto,
-				"client_id", c.ClientID,
-				"err", err,
-			)
+			deleteErrors = append(deleteErrors, fmt.Errorf("check backend tunnel for server %d client %s: %w", serverID, c.ClientID, err))
 			continue
 		}
 		if s.registry == nil {
-			slog.Warn("Protocol registry unavailable during mass delete; retaining connection", "server_id", serverID, "protocol", proto)
+			deleteErrors = append(deleteErrors, fmt.Errorf("protocol manager %q unavailable for server %d client %s", proto, serverID, c.ClientID))
 			continue
 		}
 		mgr, ok := s.registry.Get(proto)
 		if !ok {
-			slog.Warn("Protocol manager unavailable during mass delete; retaining connection", "server_id", serverID, "protocol", proto)
+			deleteErrors = append(deleteErrors, fmt.Errorf("protocol manager %q unavailable for server %d client %s", proto, serverID, c.ClientID))
 			continue
 		}
 		if isBackend {
@@ -366,7 +364,10 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 			deleteErrors = append(deleteErrors, fmt.Errorf("remove remote client %s: %w", c.ClientID, err))
 		}
 		if !removeFailed {
-			_, _ = s.db.DeleteConnection(ctx, c.ID)
+			if _, err := s.db.DeleteConnection(ctx, c.ID); err != nil {
+				deleteErrors = append(deleteErrors, fmt.Errorf("delete connection %s: %w", c.ID, err))
+				continue
+			}
 			_ = s.db.DeletePeerLifecycle(ctx, c.ServerID, c.Protocol, c.ClientID)
 		}
 	}
