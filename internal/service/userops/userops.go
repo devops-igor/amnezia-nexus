@@ -306,27 +306,34 @@ func (s *Service) PerformMassOperations(ctx context.Context, req MassOperationRe
 	return errors.Join(append(toggleErrs, workerErr)...)
 }
 
-func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *serverOperations, toggleFailures *sync.Map) error {
+func (s *Service) loadServerForOperations(ctx context.Context, serverID int64, ops *serverOperations, toggleFailures *sync.Map) (*models.Server, error) {
 	server, err := s.db.GetServer(ctx, serverID)
-	if err != nil || server == nil {
-		slog.Warn("Server not found for mass operations", "server_id", serverID, "err", err)
-		if err == nil {
-			err = errors.New("server not found")
-		}
-		for _, t := range ops.toggles {
-			toggleFailures.Store(t.conn.UserID, fmt.Errorf("get server %d: %w", serverID, err))
-		}
-		if len(ops.deletes) > 0 {
-			return fmt.Errorf("get server %d for %d deletes: %w", serverID, len(ops.deletes), err)
-		}
-		return nil
+	if err == nil && server != nil {
+		return server, nil
+	}
+	slog.Warn("Server not found for mass operations", "server_id", serverID, "err", err)
+	if err == nil {
+		err = errors.New("server not found")
+	}
+	for _, t := range ops.toggles {
+		toggleFailures.Store(t.conn.UserID, fmt.Errorf("get server %d: %w", serverID, err))
+	}
+	if len(ops.deletes) > 0 {
+		return nil, fmt.Errorf("get server %d for %d deletes: %w", serverID, len(ops.deletes), err)
+	}
+	return nil, nil
+}
+
+func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *serverOperations, toggleFailures *sync.Map) error {
+	server, err := s.loadServerForOperations(ctx, serverID, ops, toggleFailures)
+	if server == nil {
+		return err
 	}
 
 	var deleteErrors []error
 	// 1. Deletes
 	for _, c := range ops.deletes {
 		proto := models.NormalizeProtocol(c.Protocol)
-		removeFailed := false
 		shared, err := s.db.HasOtherUserConnectionCredential(ctx, &c)
 		if err != nil {
 			deleteErrors = append(deleteErrors, fmt.Errorf("check shared credential %s: %w", c.ClientID, err))
@@ -341,11 +348,11 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 			deleteErrors = append(deleteErrors, fmt.Errorf("check backend tunnel for server %d client %s: %w", serverID, c.ClientID, err))
 			continue
 		}
-		if s.registry == nil {
-			deleteErrors = append(deleteErrors, fmt.Errorf("protocol manager %q unavailable for server %d client %s", proto, serverID, c.ClientID))
-			continue
+		var mgr manager.ProtocolManager
+		var ok bool
+		if s.registry != nil {
+			mgr, ok = s.registry.Get(proto)
 		}
-		mgr, ok := s.registry.Get(proto)
 		if !ok {
 			deleteErrors = append(deleteErrors, fmt.Errorf("protocol manager %q unavailable for server %d client %s", proto, serverID, c.ClientID))
 			continue
@@ -360,16 +367,14 @@ func (s *Service) runServerOperations(ctx context.Context, serverID int64, ops *
 		if err := mgr.RemoveClient(ctx, server, c.ClientID); err != nil {
 			slog.Warn("Failed to remove remote client during mass delete",
 				"server_id", serverID, "protocol", proto, "client_id", c.ClientID, "err", err)
-			removeFailed = true
 			deleteErrors = append(deleteErrors, fmt.Errorf("remove remote client %s: %w", c.ClientID, err))
+			continue
 		}
-		if !removeFailed {
-			if _, err := s.db.DeleteConnection(ctx, c.ID); err != nil {
-				deleteErrors = append(deleteErrors, fmt.Errorf("delete connection %s: %w", c.ID, err))
-				continue
-			}
-			_ = s.db.DeletePeerLifecycle(ctx, c.ServerID, c.Protocol, c.ClientID)
+		if _, err := s.db.DeleteConnection(ctx, c.ID); err != nil {
+			deleteErrors = append(deleteErrors, fmt.Errorf("delete connection %s: %w", c.ID, err))
+			continue
 		}
+		_ = s.db.DeletePeerLifecycle(ctx, c.ServerID, c.Protocol, c.ClientID)
 	}
 
 	// 2. Toggles
