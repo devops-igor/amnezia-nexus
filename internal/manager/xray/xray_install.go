@@ -378,6 +378,13 @@ func (m *XrayManager) stageExistingContainer(
 ) (bool, bool, error) {
 	hasExistingContainer, wasRunning, err := m.inspectContainer(ctx, client, XrayContainerName)
 	if err != nil {
+		if len(existingCfgBytes) > 0 {
+			recCtx, recCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer recCancel()
+			if rUpErr := client.UploadSudoFile(recCtx, XrayConfigPath, existingCfgBytes, 0600); rUpErr != nil {
+				return false, false, fmt.Errorf("%w (recovery failures: failed to restore config: %v)", err, rUpErr)
+			}
+		}
 		return false, false, err
 	}
 	if hasExistingContainer {
@@ -540,7 +547,9 @@ func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient,
 			return fmt.Errorf("%w (rolled back to previous container)", triggerErr)
 		}
 		if len(opts.existingCfgBytes) > 0 {
-			_ = client.UploadSudoFile(recoveryCtx, XrayConfigPath, opts.existingCfgBytes, 0600)
+			if rUpErr := client.UploadSudoFile(recoveryCtx, XrayConfigPath, opts.existingCfgBytes, 0600); rUpErr != nil {
+				return fmt.Errorf("%w (rollback failed to restore previous config: %v)", triggerErr, rUpErr)
+			}
 		}
 		return triggerErr
 	}
@@ -792,8 +801,10 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	if err := client.UploadSudoFile(ctx, XrayConfigPath, cfgBytes, 0600); err != nil {
 		if len(existingCfgBytes) > 0 {
 			recCtx, recCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-			_ = client.UploadSudoFile(recCtx, XrayConfigPath, existingCfgBytes, 0600)
-			recCancel()
+			defer recCancel()
+			if rUpErr := client.UploadSudoFile(recCtx, XrayConfigPath, existingCfgBytes, 0600); rUpErr != nil {
+				return fmt.Errorf("upload xray config: %w (recovery failures: failed to restore config: %v)", err, rUpErr)
+			}
 		}
 		return fmt.Errorf("upload xray config: %w", err)
 	}

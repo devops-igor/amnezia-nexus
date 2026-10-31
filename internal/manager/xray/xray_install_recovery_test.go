@@ -266,15 +266,28 @@ func TestXrayManager_StageExistingContainer_StopFailureSurfacesContainerStartErr
 
 type inspectFaultMockSSH struct {
 	*mockXraySSHClient
-	transportErr error
-	daemonErr    string
-	daemonCode   int
+	transportErr      error
+	daemonErr         string
+	daemonCode        int
+	inspectAttempted  bool
+	failConfigRestore bool
+}
+
+func (m *inspectFaultMockSSH) UploadSudoFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error {
+	m.mu.Lock()
+	inspected := m.inspectAttempted
+	m.mu.Unlock()
+	if m.failConfigRestore && inspected && remotePath == XrayConfigPath {
+		return errors.New("simulated upload failure during config restore")
+	}
+	return m.mockXraySSHClient.UploadSudoFile(ctx, remotePath, content, mode)
 }
 
 func (m *inspectFaultMockSSH) RunSudoCommand(ctx context.Context, cmd string) (string, string, int, error) {
 	if strings.Contains(cmd, "docker inspect") && strings.Contains(cmd, "{{.State.Running}}") {
 		m.mu.Lock()
 		m.commands = append(m.commands, "sudo: "+cmd)
+		m.inspectAttempted = true
 		m.mu.Unlock()
 		if m.transportErr != nil {
 			return "", "", -1, m.transportErr
@@ -310,6 +323,9 @@ func TestXrayManager_StageExistingContainer_InspectFailureFailsClosedWithoutRemo
 		if hasCmd(mockSSH.commands, "docker stop", "amnezia-xray") {
 			t.Error("expected amnezia-xray to NOT be stopped when inspect fails")
 		}
+		if !bytes.Equal(mockSSH.files[XrayConfigPath], cfg) {
+			t.Error("expected original config restored on disk after inspect transport failure")
+		}
 	})
 
 	t.Run("daemon error on inspect", func(t *testing.T) {
@@ -335,6 +351,31 @@ func TestXrayManager_StageExistingContainer_InspectFailureFailsClosedWithoutRemo
 		}
 		if hasCmd(mockSSH.commands, "docker stop", "amnezia-xray") {
 			t.Error("expected amnezia-xray to NOT be stopped when inspect fails")
+		}
+		if !bytes.Equal(mockSSH.files[XrayConfigPath], cfg) {
+			t.Error("expected original config restored on disk after inspect daemon failure")
+		}
+	})
+
+	t.Run("inspect failure surfaces config restore error", func(t *testing.T) {
+		mockSSH := &inspectFaultMockSSH{
+			mockXraySSHClient: newMockXraySSHClient(),
+			transportErr:      errors.New("ssh connection reset by peer"),
+			failConfigRestore: true,
+		}
+		cfg := setupInitialXrayConfig(t, "b3b2c3d4-e5f6-4a1b-8c2d-3e4f5a6b7c8d")
+		mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
+
+		mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+		err := mgr.Install(context.Background(), &models.Server{ID: 939, Host: "192.0.2.139"}, map[string]any{"port": 8443})
+		if err == nil {
+			t.Fatal("expected Install to fail closed when inspect fails, got nil error")
+		}
+		if !strings.Contains(err.Error(), "failed to inspect container amnezia-xray") {
+			t.Fatalf("expected error mentioning inspect container failure, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "recovery failures: failed to restore config") {
+			t.Fatalf("expected error mentioning recovery config restore failure, got: %v", err)
 		}
 	})
 }
