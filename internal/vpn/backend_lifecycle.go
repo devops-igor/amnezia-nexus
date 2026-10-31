@@ -478,6 +478,27 @@ func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 		return err
 	}
 
+	// Ensure operator-supplied proxy credentials retain durable peer_lifecycle
+	// preservation before deleting the backend tunnel row. If preservation fails,
+	// fail closed so the credential is never exposed to zombie cleanup.
+	if s.db != nil {
+		tunnels, dbErr := s.db.GetBackendTunnelsByServerID(ctx, serverID)
+		if dbErr != nil {
+			return fmt.Errorf("failed to query backend tunnels for server %d: %w", serverID, dbErr)
+		}
+		if len(tunnels) > 0 {
+			for i := range tunnels {
+				if err := EnsureBackendProxyPeerPreservation(ctx, s.db, serverID, tunnels[i].Protocol, tunnels[i].ProtocolParams); err != nil {
+					return fmt.Errorf("failed to ensure peer lifecycle preservation for backend %d: %w", serverID, err)
+				}
+			}
+		} else {
+			if err := EnsureBackendProxyPeerPreservation(ctx, s.db, serverID, tunnel.Protocol, tunnel.ProtocolParams); err != nil {
+				return fmt.Errorf("failed to ensure peer lifecycle preservation for backend %d: %w", serverID, err)
+			}
+		}
+	}
+
 	// Phase 1 — drain: disable + failover while the tunnel is still in the
 	// pool, so HandleFailover's session migration has healthy targets and
 	// the caller's sessions never orphan onto a removed tunnel ID.
@@ -522,6 +543,11 @@ func (s *Service) DeleteBackend(ctx context.Context, serverID int64) error {
 		log.Printf("[vpn] warning: delete backend %d: DB sweep lookup failed: %v", serverID, dbErr)
 	}
 	if leftover != nil {
+		if err := EnsureBackendProxyPeerPreservation(ctx, s.db, serverID, leftover.Protocol, leftover.ProtocolParams); err != nil {
+			log.Printf("[vpn] warning: delete backend %d: failed to ensure peer preservation for leftover row %d: %v", serverID, leftover.ID, err)
+			s.mu.Lock()
+			return fmt.Errorf("failed to ensure peer preservation for leftover row %d: %w", leftover.ID, err)
+		}
 		// Reassign connected sessions that lost the failover race onto the
 		// leftover row, marking them draining (issue #29: no orphaned
 		// vpn_sessions row may reference a deleted backend_tunnels row).

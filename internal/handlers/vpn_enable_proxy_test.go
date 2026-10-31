@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -166,6 +167,23 @@ func TestVPNEnableBackendHandler_ProxyBootstrap(t *testing.T) {
 	if err != nil || dbTun == nil || len(dbTun.ProtocolParams) == 0 {
 		t.Fatalf("expected encrypted protocol params persisted in db for server %d, got %+v err=%v", sid, dbTun, err)
 	}
+
+	lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
+	if err != nil {
+		t.Fatalf("GetPeerLifecycles failed: %v", err)
+	}
+	rec, ok := lifecycles[provisionedNaive.Username]
+	if !ok || rec.Status != "backend_active" {
+		t.Fatalf("expected peer_lifecycle record for %s with status backend_active, got %+v", provisionedNaive.Username, lifecycles)
+	}
+	if rec.UserID != vpn.PeerOwnershipAutoProvisioned {
+		t.Fatalf("expected auto_provisioned ownership for %s, got %q", provisionedNaive.Username, rec.UserID)
+	}
+	if opRec, exists := lifecycles["user1"]; exists {
+		if opRec.UserID != vpn.PeerOwnershipOperatorSupplied {
+			t.Fatalf("expected operator_supplied ownership for user1, got %q", opRec.UserID)
+		}
+	}
 }
 
 func TestVPNEnableBackendHandler_ProxyBootstrap_VLESS(t *testing.T) {
@@ -260,6 +278,18 @@ func TestVPNEnableBackendHandler_ProxyBootstrap_VLESS(t *testing.T) {
 	dbTun, err := db.GetBackendTunnelByServerID(ctx, sid)
 	if err != nil || dbTun == nil || len(dbTun.ProtocolParams) == 0 {
 		t.Fatalf("expected encrypted protocol params persisted in db for server %d, got %+v err=%v", sid, dbTun, err)
+	}
+
+	lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolVLESS)
+	if err != nil {
+		t.Fatalf("GetPeerLifecycles failed: %v", err)
+	}
+	rec, ok := lifecycles[provisionedVLESS.UUID]
+	if !ok || rec.Status != "backend_active" {
+		t.Fatalf("expected peer_lifecycle record for %s with status backend_active, got %+v", provisionedVLESS.UUID, lifecycles)
+	}
+	if rec.UserID != vpn.PeerOwnershipAutoProvisioned {
+		t.Fatalf("expected auto_provisioned ownership for %s, got %q", provisionedVLESS.UUID, rec.UserID)
 	}
 }
 
@@ -417,5 +447,403 @@ func TestVPNEnableBackendHandler_ProxyDisabled_RejectsWithoutProvisioning(t *tes
 	}
 	if calls := naiveAddCalls.Load(); calls != 0 {
 		t.Fatalf("expected 0 AddClient calls for Naive on omitted-body enable, got %d", calls)
+	}
+}
+
+func TestVPNEnableBackendHandler_EnrollmentFailure_RollsBackOrphanClient(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("successful rollback deletes pending lifecycle and revokes remote client", func(t *testing.T) {
+		h, db, _ := setupTestHandlers(t)
+		vpnCfg := &models.VPNConfig{
+			EnableMultiProtocolBackends: true,
+			ListenPort:                  51820,
+		}
+		vpnSvc, err := vpn.NewVPNService(db, vpnCfg)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+		h.vpnSvc = vpnSvc
+
+		r := chi.NewRouter()
+		r.Post("/api/vpn/backends/{server_id}/enable", h.VPNEnableBackendHandler)
+
+		// Server configured for naive; pre-registration failure hook ensures no backend_tunnels row is created.
+		sid, err := db.CreateServer(ctx, &models.Server{
+			Name:    "naive-node-fail-port",
+			Host:    "127.0.0.1",
+			SSHPort: 22,
+			Protocols: map[string]any{
+				"naive": map[string]any{
+					"installed": true,
+					"port":      443,
+					"domain":    "example.com",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateServer failed: %v", err)
+		}
+
+		// Pre-registration failure: server generation changes before AddTunnel commits,
+		// ensuring no backend_tunnels row is created and the client is a true orphan.
+		vpnSvc.SetEnableBackendPreAddTunnelHookForTest(func() {
+			_ = db.UpdateServer(ctx, sid, map[string]any{"host": "127.0.0.2"})
+		})
+
+		var addedClients []string
+		var removedClients []string
+		h.registry.Register(&mockProtocolManager{
+			protocol: models.ProtocolNaive,
+			addClientFn: func(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
+				username := "orphan-rollback-user"
+				addedClients = append(addedClients, username)
+				return map[string]any{
+					"username": username,
+					"password": "temp-password",
+					"domain":   "example.com",
+				}, nil
+			},
+			removeClientFn: func(ctx context.Context, server *models.Server, clientID string) error {
+				removedClients = append(removedClients, clientID)
+				return nil
+			},
+		})
+
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sid), nil)
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 NotFound on failed backend enable, got %d: %s", w.Code, w.Body.String())
+		}
+
+		if len(addedClients) != 1 || addedClients[0] != "orphan-rollback-user" {
+			t.Fatalf("expected AddClient called for orphan-rollback-user, got %v", addedClients)
+		}
+		if len(removedClients) != 1 || removedClients[0] != "orphan-rollback-user" {
+			t.Fatalf("expected RemoveClient rollback called for orphan-rollback-user, got %v", removedClients)
+		}
+
+		lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
+		if err != nil {
+			t.Fatalf("GetPeerLifecycles failed: %v", err)
+		}
+		if rec, exists := lifecycles["orphan-rollback-user"]; exists {
+			t.Fatalf("expected lifecycle record deleted after successful rollback, got %+v", rec)
+		}
+
+		row, err := db.GetBackendTunnelByServerID(ctx, sid)
+		if err != nil {
+			t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
+		}
+		if row != nil {
+			t.Fatalf("expected no backend tunnel row committed on pre-registration failure, got %+v", row)
+		}
+	})
+
+	t.Run("failed rollback marks lifecycle as failed for reconciler cleanup", func(t *testing.T) {
+		h, db, _ := setupTestHandlers(t)
+		vpnCfg := &models.VPNConfig{
+			EnableMultiProtocolBackends: true,
+			ListenPort:                  51820,
+		}
+		vpnSvc, err := vpn.NewVPNService(db, vpnCfg)
+		if err != nil {
+			t.Fatalf("NewVPNService failed: %v", err)
+		}
+		h.vpnSvc = vpnSvc
+
+		r := chi.NewRouter()
+		r.Post("/api/vpn/backends/{server_id}/enable", h.VPNEnableBackendHandler)
+
+		// Server configured for naive; pre-registration failure hook ensures no backend_tunnels row is created.
+		sid, err := db.CreateServer(ctx, &models.Server{
+			Name:    "naive-node-fail-remove",
+			Host:    "127.0.0.1",
+			SSHPort: 22,
+			Protocols: map[string]any{
+				"naive": map[string]any{
+					"installed": true,
+					"port":      443,
+					"domain":    "example.com",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateServer failed: %v", err)
+		}
+
+		// Pre-registration failure: server generation changes before AddTunnel commits,
+		// ensuring no backend_tunnels row is created and the client is a true orphan.
+		vpnSvc.SetEnableBackendPreAddTunnelHookForTest(func() {
+			_ = db.UpdateServer(ctx, sid, map[string]any{"host": "127.0.0.2"})
+		})
+
+		h.registry.Register(&mockProtocolManager{
+			protocol: models.ProtocolNaive,
+			addClientFn: func(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
+				return map[string]any{
+					"username": "orphan-failed-user",
+					"password": "temp-password",
+					"domain":   "example.com",
+				}, nil
+			},
+			removeClientFn: func(ctx context.Context, server *models.Server, clientID string) error {
+				return errors.New("remote SSH connection down")
+			},
+		})
+
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sid), nil)
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 NotFound on failed backend enable, got %d: %s", w.Code, w.Body.String())
+		}
+
+		lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
+		if err != nil {
+			t.Fatalf("GetPeerLifecycles failed: %v", err)
+		}
+		rec, exists := lifecycles["orphan-failed-user"]
+		if !exists {
+			t.Fatal("expected lifecycle record to exist with status 'failed' after failed rollback")
+		}
+		if rec.Status != "failed" {
+			t.Fatalf("expected lifecycle status 'failed', got %q (never backend_active)", rec.Status)
+		}
+
+		row, err := db.GetBackendTunnelByServerID(ctx, sid)
+		if err != nil {
+			t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
+		}
+		if row != nil {
+			t.Fatalf("expected no backend tunnel row committed on pre-registration failure, got %+v", row)
+		}
+	})
+}
+
+// TestVPNEnableBackendHandler_PostRegistrationAbort_PreservesCommittedCredential exercises
+// the post-registration abort seam (e.g. administrative disable winning the race after AddTunnel
+// commits the backend row). It verifies that remote credentials are NOT deleted, and a subsequent
+// no-body re-enable preserves the remote credential and returns HTTP 200.
+func TestVPNEnableBackendHandler_PostRegistrationAbort_PreservesCommittedCredential(t *testing.T) {
+	ctx := context.Background()
+	h, db, _ := setupTestHandlers(t)
+
+	vpnCfg := &models.VPNConfig{
+		EnableMultiProtocolBackends: true,
+		ListenPort:                  51820,
+	}
+	vpnSvc, err := vpn.NewVPNService(db, vpnCfg)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	t.Cleanup(func() {
+		ts, _ := vpnSvc.GetTunnels(ctx)
+		for _, tun := range ts {
+			if d := vpnSvc.GetBackendDeviceForTest(tun.ID); d != nil {
+				_ = d.Close()
+			}
+		}
+	})
+	h.vpnSvc = vpnSvc
+
+	sid, err := db.CreateServer(ctx, &models.Server{
+		Name:    "naive-node-abort-seam",
+		Host:    "127.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"naive": map[string]any{
+				"installed": true,
+				"port":      443,
+				"domain":    "example.com",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	added, removed := 0, 0
+	remoteExists := false
+	cid := "test-committed-backend-user"
+	mgr := &mockProtocolManager{
+		protocol: models.ProtocolNaive,
+		addClientFn: func(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error) {
+			added++
+			remoteExists = true
+			return map[string]any{
+				"username": cid,
+				"password": "secret-password",
+				"domain":   "example.com",
+			}, nil
+		},
+		removeClientFn: func(ctx context.Context, server *models.Server, clientID string) error {
+			removed++
+			remoteExists = false
+			return nil
+		},
+		getClientsFn: func(ctx context.Context, server *models.Server) ([]map[string]any, error) {
+			if !remoteExists {
+				return nil, nil
+			}
+			return []map[string]any{{"clientId": cid, "username": cid}}, nil
+		},
+	}
+	h.registry.Register(mgr)
+
+	// Simulate administrative disable winning the race after AddTunnel commits the backend row
+	vpnSvc.SetEnableBackendPostAddTunnelHookForTest(func() {
+		if err := vpnSvc.DisableBackend(ctx, sid); err != nil {
+			t.Fatalf("DisableBackend in hook failed: %v", err)
+		}
+	})
+
+	r := chi.NewRouter()
+	r.Post("/api/vpn/backends/{server_id}/enable", h.VPNEnableBackendHandler)
+
+	enable := func() int {
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sid), nil)
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	// 1. First enable attempt: should fail (HTTP 500) because post-add hook administratively disabled the backend
+	code := enable()
+	if code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on post-registration abort, got %d", code)
+	}
+
+	// Verify the backend row was successfully committed in backend_tunnels
+	row, err := db.GetBackendTunnelByServerID(ctx, sid)
+	if err != nil {
+		t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
+	}
+	if row == nil {
+		t.Fatal("expected backend tunnel row to be committed in database")
+	}
+
+	// R3-H1: Remote credentials MUST NOT be deleted because a backend row owns them
+	if !remoteExists {
+		t.Fatal("expected remote credential to remain intact on post-registration abort")
+	}
+	if removed != 0 {
+		t.Fatalf("expected 0 RemoveClient calls on post-registration abort, got %d", removed)
+	}
+
+	// 2. Subsequent no-body re-enable: clear hook and re-enable
+	vpnSvc.SetEnableBackendPostAddTunnelHookForTest(nil)
+	code2 := enable()
+	if code2 != http.StatusOK {
+		t.Fatalf("expected 200 OK on re-enable, got %d", code2)
+	}
+
+	// Verify remote credential still exists and was not re-provisioned or deleted
+	if !remoteExists {
+		t.Fatal("expected remote credential to remain intact after re-enable")
+	}
+	if added != 1 {
+		t.Fatalf("expected exactly 1 AddClient call throughout (no re-provisioning on re-enable), got %d", added)
+	}
+	if removed != 0 {
+		t.Fatalf("expected 0 RemoveClient calls throughout, got %d", removed)
+	}
+
+	// Verify lifecycle status is now backend_active
+	lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
+	if err != nil {
+		t.Fatalf("GetPeerLifecycles failed: %v", err)
+	}
+	rec, exists := lifecycles[cid]
+	if !exists {
+		t.Fatalf("expected peer lifecycle record for %s", cid)
+	}
+	if rec.Status != "backend_active" {
+		t.Fatalf("expected lifecycle status 'backend_active', got %q", rec.Status)
+	}
+}
+
+func TestVPNEnableBackendHandler_OperatorSuppliedCredentials_RecordedWithOperatorOwnership(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+
+	vpnCfg := &models.VPNConfig{
+		EnableMultiProtocolBackends: true,
+		ListenPort:                  51820,
+	}
+	vpnSvc, err := vpn.NewVPNService(db, vpnCfg)
+	if err != nil {
+		t.Fatalf("NewVPNService failed: %v", err)
+	}
+	t.Cleanup(func() {
+		ts, _ := vpnSvc.GetTunnels(ctx)
+		for _, tun := range ts {
+			if d := vpnSvc.GetBackendDeviceForTest(tun.ID); d != nil {
+				_ = d.Close()
+			}
+		}
+	})
+	h.vpnSvc = vpnSvc
+
+	r := chi.NewRouter()
+	r.Post("/api/vpn/backends/{server_id}/enable", h.VPNEnableBackendHandler)
+
+	sid, err := db.CreateServer(ctx, &models.Server{
+		Name:    "operator-proxy-node",
+		Host:    "127.0.0.1",
+		SSHPort: 22,
+		Protocols: map[string]any{
+			"naive": map[string]any{
+				"installed": true,
+				"port":      443,
+				"domain":    "op.example.com",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	operatorUser := "operator_custom_user_123"
+	paramsRaw, _ := json.Marshal(models.NaiveProxyParams{
+		Domain:   "op.example.com",
+		Username: operatorUser,
+		Password: "supersecretpassword",
+		EnableH3: false,
+	})
+
+	body, _ := json.Marshal(map[string]any{
+		"protocol":        "naive",
+		"protocol_params": json.RawMessage(paramsRaw),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sid), bytes.NewReader(body))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	lifecycles, err := db.GetPeerLifecycles(ctx, sid, models.ProtocolNaive)
+	if err != nil {
+		t.Fatalf("GetPeerLifecycles failed: %v", err)
+	}
+	rec, exists := lifecycles[operatorUser]
+	if !exists {
+		t.Fatalf("expected peer lifecycle record for %s", operatorUser)
+	}
+	if rec.Status != "backend_active" {
+		t.Fatalf("expected status 'backend_active', got %q", rec.Status)
+	}
+	if rec.UserID != vpn.PeerOwnershipOperatorSupplied {
+		t.Fatalf("expected UserID %q, got %q", vpn.PeerOwnershipOperatorSupplied, rec.UserID)
 	}
 }

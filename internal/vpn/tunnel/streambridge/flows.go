@@ -2,6 +2,7 @@ package streambridge
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"net"
 	"strconv"
@@ -23,6 +24,29 @@ import (
 // and one Read returns one datagram.
 type StreamDialer interface {
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+// UDPCapable is an optional interface that a StreamDialer can implement to declare
+// whether it supports native UDP packet forwarding.
+type UDPCapable interface {
+	SupportsUDP() bool
+}
+
+// dialerSupportsUDP reports whether the dialer supports native UDP packet forwarding.
+// If the dialer implements UDPCapable, its SupportsUDP() return value is authoritative.
+// If the dialer wraps an underlying StreamDialer, it unwraps recursively.
+// A dialer that does not declare UDP capability defaults to false (TCP only).
+func dialerSupportsUDP(d StreamDialer) bool {
+	if d == nil {
+		return false
+	}
+	if u, ok := d.(UDPCapable); ok {
+		return u.SupportsUDP()
+	}
+	if u, ok := d.(interface{ Unwrap() StreamDialer }); ok {
+		return dialerSupportsUDP(u.Unwrap())
+	}
+	return false
 }
 
 const (
@@ -249,6 +273,11 @@ func (d *Device) onUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
+	if id.LocalPort == 53 && !d.supportsUDP {
+		go d.runDNSOverTCPFlow(inConn, id)
+		return
+	}
+
 	go d.runUDPFlow(inConn, id)
 }
 
@@ -345,6 +374,132 @@ func (d *Device) runUDPFlow(inConn *gonet.UDPConn, id stack.TransportEndpointID)
 
 			lastActivity.Store(time.Now().UnixNano())
 			if _, err := inConn.Write(buf[:n]); err != nil {
+				closeBoth()
+				return
+			}
+		}
+	}()
+
+	pumpWg.Wait()
+}
+
+func (d *Device) runDNSOverTCPFlow(inConn *gonet.UDPConn, id stack.TransportEndpointID) {
+	defer func() {
+		d.release()
+	}()
+
+	dst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
+
+	dialCtx, cancel := context.WithTimeout(d.ctx, d.cfg.DialTimeout)
+	outConn, err := d.dialer.DialContext(dialCtx, "tcp", dst)
+	cancel()
+	if err != nil {
+		d.stats.dialFailures.Add(1)
+		_ = inConn.Close()
+		return
+	}
+	d.stats.lastHandshakeNano.Store(time.Now().UnixNano())
+
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			_ = inConn.Close()
+			_ = outConn.Close()
+		})
+	}
+
+	stopAfter := context.AfterFunc(d.ctx, closeBoth)
+	defer func() {
+		stopAfter()
+		closeBoth()
+	}()
+
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+
+	var pumpWg sync.WaitGroup
+	pumpWg.Add(2)
+
+	// client UDP -> outbound TCP: translate UDP DNS datagram into RFC 1035 / RFC 7766 2-byte length-prefixed stream
+	go func() {
+		defer pumpWg.Done()
+		bufPtr := udpBufPool.Get().(*[]byte)
+		defer udpBufPool.Put(bufPtr)
+		buf := *bufPtr
+
+		for {
+			_ = inConn.SetReadDeadline(time.Now().Add(d.cfg.UDPIdleTimeout))
+			n, err := inConn.Read(buf)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					last := time.Unix(0, lastActivity.Load())
+					if time.Since(last) >= d.cfg.UDPIdleTimeout {
+						closeBoth()
+						return
+					}
+					continue
+				}
+				closeBoth()
+				return
+			}
+
+			if n <= 0 || n > 65535 {
+				continue
+			}
+
+			lastActivity.Store(time.Now().UnixNano())
+			var lenBuf [2]byte
+			//nolint:gosec // G115: n is bounded by n <= 65535 check above
+			binary.BigEndian.PutUint16(lenBuf[:], uint16(n))
+
+			_ = outConn.SetWriteDeadline(time.Now().Add(d.cfg.DialTimeout))
+			if _, err := outConn.Write(lenBuf[:]); err != nil {
+				closeBoth()
+				return
+			}
+			if _, err := outConn.Write(buf[:n]); err != nil {
+				closeBoth()
+				return
+			}
+		}
+	}()
+
+	// outbound TCP -> client UDP: read RFC 1035 / RFC 7766 2-byte length-prefixed stream and return DNS response datagram
+	go func() {
+		defer pumpWg.Done()
+		bufPtr := udpBufPool.Get().(*[]byte)
+		defer udpBufPool.Put(bufPtr)
+		buf := *bufPtr
+
+		var lenBuf [2]byte
+		for {
+			_ = outConn.SetReadDeadline(time.Now().Add(d.cfg.UDPIdleTimeout))
+			if _, err := io.ReadFull(outConn, lenBuf[:]); err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					last := time.Unix(0, lastActivity.Load())
+					if time.Since(last) >= d.cfg.UDPIdleTimeout {
+						closeBoth()
+						return
+					}
+					continue
+				}
+				closeBoth()
+				return
+			}
+
+			respLen := int(binary.BigEndian.Uint16(lenBuf[:]))
+			if respLen == 0 || respLen > len(buf) {
+				closeBoth()
+				return
+			}
+
+			if _, err := io.ReadFull(outConn, buf[:respLen]); err != nil {
+				closeBoth()
+				return
+			}
+
+			lastActivity.Store(time.Now().UnixNano())
+			if _, err := inConn.Write(buf[:respLen]); err != nil {
 				closeBoth()
 				return
 			}

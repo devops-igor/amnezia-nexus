@@ -555,16 +555,11 @@ func (h *Handlers) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
 		if current == nil || current.UserID != userID {
 			continue
 		}
-		if err := h.removeRemoteClient(ctx, current); err != nil {
+		if err := h.withdrawUserConnection(ctx, current); err != nil {
 			h.JSONError(w, http.StatusInternalServerError, "remote_removal_failed",
 				"Failed to remove remote client credentials: "+err.Error())
 			return
 		}
-		if _, err := h.db.DeleteConnection(ctx, current.ID); err != nil {
-			h.peerChangeError(w, err)
-			return
-		}
-		_ = h.db.DeletePeerLifecycle(ctx, current.ServerID, current.Protocol, current.ClientID)
 	}
 
 	if _, err := h.db.DeleteUser(ctx, userID); err != nil {
@@ -663,16 +658,11 @@ func (h *Handlers) ToggleUserHandler(w http.ResponseWriter, r *http.Request) {
 			if proto := models.NormalizeProtocol(c.Protocol); proto != models.ProtocolVLESS && proto != models.ProtocolNaive {
 				continue
 			}
-			if err := h.removeRemoteClient(ctx, c); err != nil {
+			if err := h.withdrawUserConnection(ctx, c); err != nil {
 				slog.Error("failed to revoke remote client on user disable", "user_id", userID, "client_id", c.ClientID, "error", err)
 				h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to revoke remote client credential")
 				return
 			}
-			if _, err := h.db.DeleteConnection(ctx, c.ID); err != nil {
-				h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to delete revoked connection")
-				return
-			}
-			_ = h.db.DeletePeerLifecycle(ctx, c.ServerID, c.Protocol, c.ClientID)
 		}
 	}
 
@@ -716,6 +706,15 @@ func (h *Handlers) loadExistingClientConfig(
 	req *models.AddUserConnectionRequest,
 ) (string, bool) {
 	clientID := *req.ClientID
+	backend, err := h.db.IsBackendTunnelClient(ctx, req.ServerID, req.Protocol, clientID)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to verify backend credential ownership")
+		return "", false
+	}
+	if backend {
+		h.JSONError(w, http.StatusConflict, "backend_credential", "Backend credential cannot be assigned to a user")
+		return "", false
+	}
 	current, err := h.findClientConnection(ctx, req.ServerID, req.Protocol, clientID)
 	if err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to retrieve connections")

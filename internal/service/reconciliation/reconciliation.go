@@ -25,6 +25,11 @@ type ProtocolResolver interface {
 	Get(proto string) (manager.ProtocolManager, bool)
 }
 
+const (
+	peerOwnershipAutoProvisioned  = "auto_provisioned"
+	peerOwnershipOperatorSupplied = "operator_supplied"
+)
+
 // Option configures Reconciler periodic background service.
 type Option func(*Reconciler)
 
@@ -46,11 +51,17 @@ func WithBootDelay(delay time.Duration) Option {
 	}
 }
 
+// BackendCredentialRotator switches a live backend identity before old peer revocation.
+type BackendCredentialRotator interface {
+	RotateSharedBackendCredential(context.Context, *models.Server, manager.ProtocolManager, string, string) error
+}
+
 // Reconciler executes startup synchronization and periodic background audits
 // to clean up orphaned connections, stale protocols, and zombie container peers.
 type Reconciler struct {
 	db        *database.DB
 	registry  ProtocolResolver
+	vpnSvc    BackendCredentialRotator
 	mu        sync.Mutex
 	running   bool
 	cancel    context.CancelFunc
@@ -72,6 +83,9 @@ func New(db *database.DB, registry ProtocolResolver, opts ...Option) *Reconciler
 	}
 	return r
 }
+
+// SetVPNService wires the live backend pool for credential rotation.
+func (r *Reconciler) SetVPNService(svc BackendCredentialRotator) { r.vpnSvc = svc }
 
 // Name returns the background service worker name.
 func (r *Reconciler) Name() string {
@@ -573,6 +587,29 @@ func (r *Reconciler) withdrawDisabledOwnerConns(ctx context.Context, server *mod
 		if !off {
 			continue
 		}
+		shared, err := r.db.HasOtherUserConnectionCredential(ctx, &conn)
+		if err != nil || shared {
+			slog.Warn("Reconciliation: shared credential cannot be revoked for disabled user",
+				"server_id", server.ID, "protocol", proto, "client_id", conn.ClientID, "shared", shared, "err", err)
+			continue
+		}
+		isBackend, err := r.db.IsBackendTunnelClient(ctx, server.ID, proto, conn.ClientID)
+		if err != nil {
+			slog.Warn("Reconciliation Phase 3: failed to verify backend tunnel client for disabled user, skipping removal to fail closed",
+				"server_id", server.ID, "protocol", proto, "client_id", conn.ClientID, "err", err)
+			continue
+		}
+		if isBackend {
+			if r.vpnSvc == nil {
+				slog.Warn("Reconciliation: VPN service unavailable for backend rotation", "server_id", server.ID)
+				continue
+			}
+			if err := r.vpnSvc.RotateSharedBackendCredential(ctx, server, mgr, proto, conn.ClientID); err != nil {
+				slog.Warn("Reconciliation: failed to rotate disabled user's shared backend credential",
+					"server_id", server.ID, "protocol", proto, "client_id", conn.ClientID, "err", err)
+				continue
+			}
+		}
 		if err := mgr.RemoveClient(ctx, server, conn.ClientID); err != nil {
 			slog.Warn("Reconciliation Phase 3: failed to revoke credential of disabled user",
 				"server_id", server.ID, "protocol", proto, "client_id", conn.ClientID, "err", err)
@@ -590,7 +627,65 @@ func (r *Reconciler) withdrawDisabledOwnerConns(ctx context.Context, server *mod
 
 func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *models.Server, proto string, mgr manager.ProtocolManager, client map[string]any, clientID string, lifecycles map[string]database.PeerLifecycleRecord, staleThreshold time.Duration) {
 	serverID := server.ID
+
+	isBackend, err := r.db.IsBackendTunnelClient(ctx, serverID, proto, clientID)
+	if err != nil {
+		slog.Warn("Reconciliation: failed to verify backend tunnel client due to query error, skipping removal to fail closed",
+			"server_id", serverID,
+			"client_id", clientID,
+			"err", err,
+		)
+		return
+	}
+	if isBackend {
+		slog.Info("Reconciliation: preserving active backend tunnel client",
+			"server_id", serverID,
+			"client_id", clientID,
+		)
+		if _, has := lifecycles[clientID]; !has && r.db != nil {
+			clientName := resolveClientNameFromMap(client)
+			if clientName == "" {
+				clientName = fmt.Sprintf("vpn-backend-%d", serverID)
+			}
+			_ = r.db.RecordPeerLifecycle(ctx, serverID, proto, clientID, clientName, peerOwnershipOperatorSupplied, "backend_active")
+		}
+		return
+	}
+
 	rec, hasLifecycle := lifecycles[clientID]
+	if !hasLifecycle {
+		if r.db == nil {
+			return
+		}
+		freshLifecycles, err := r.db.GetPeerLifecycles(ctx, serverID, proto)
+		if err != nil {
+			slog.Warn("Reconciliation: failed to refresh peer lifecycles due to query error, skipping removal to fail closed",
+				"server_id", serverID,
+				"protocol", proto,
+				"client_id", clientID,
+				"err", err,
+			)
+			return
+		}
+		for k, v := range freshLifecycles {
+			lifecycles[k] = v
+		}
+		if freshRec, exists := freshLifecycles[clientID]; exists {
+			rec = freshRec
+			hasLifecycle = true
+			if rec.Status == "active" || rec.UserID == peerOwnershipOperatorSupplied || (rec.UserID != "" && rec.UserID != peerOwnershipAutoProvisioned) {
+				slog.Info("Reconciliation: preserving peer with fresh active or operator lifecycle record",
+					"server_id", serverID,
+					"protocol", proto,
+					"client_id", clientID,
+					"user_id", rec.UserID,
+					"status", rec.Status,
+				)
+				return
+			}
+		}
+	}
+
 	if !hasLifecycle {
 		settingKey := legacyPeersAdoptedSettingKey(serverID, proto)
 		var legacyAdopted bool
@@ -640,6 +735,12 @@ func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *mode
 		return
 	}
 
+	r.reconcileManagedPeer(ctx, server, proto, mgr, clientID, rec, staleThreshold)
+}
+
+func (r *Reconciler) reconcileManagedPeer(ctx context.Context, server *models.Server, proto string, mgr manager.ProtocolManager, clientID string, rec database.PeerLifecycleRecord, staleThreshold time.Duration) {
+	serverID := server.ID
+
 	switch rec.Status {
 	case "failed":
 		if err := mgr.RemoveClient(ctx, server, clientID); err != nil {
@@ -669,6 +770,42 @@ func (r *Reconciler) reconcileSingleZombiePeer(ctx context.Context, server *mode
 				)
 			} else {
 				slog.Info("Reconciliation: removed stale pending peer from remote container",
+					"server_id", serverID,
+					"protocol", proto,
+					"client_id", clientID,
+					"age", time.Since(rec.CreatedAt),
+				)
+				_ = r.db.DeletePeerLifecycle(ctx, serverID, proto, clientID)
+			}
+		}
+	case "backend_active":
+		// An orphan backend_active record with no corresponding backend_tunnels row
+		// (e.g. from an aborted enrollment or deleted backend tunnel).
+		if time.Since(rec.CreatedAt) > staleThreshold {
+			// Issue #656 / #662: Only credentials whose auto-provisioned ownership is established
+			// may be revoked by reconciliation. Operator-supplied, user-associated, or external credentials must NEVER
+			// be deleted from remote nodes.
+			if rec.UserID != peerOwnershipAutoProvisioned {
+				slog.Info("Reconciliation: preserving orphan operator-supplied or user-associated backend peer from remote removal",
+					"server_id", serverID,
+					"protocol", proto,
+					"client_id", clientID,
+					"user_id", rec.UserID,
+					"age", time.Since(rec.CreatedAt),
+				)
+				_ = r.db.SetPeerLifecycleStatus(ctx, serverID, proto, clientID, "active")
+				return
+			}
+			if err := mgr.RemoveClient(ctx, server, clientID); err != nil {
+				slog.Warn("Reconciliation Phase 3: failed to remove orphan backend peer from remote container",
+					"server_id", serverID,
+					"protocol", proto,
+					"client_id", clientID,
+					"age", time.Since(rec.CreatedAt),
+					"err", err,
+				)
+			} else {
+				slog.Info("Reconciliation: removed orphan backend peer from remote container",
 					"server_id", serverID,
 					"protocol", proto,
 					"client_id", clientID,

@@ -22,8 +22,15 @@ func (d *DB) RecordPeerLifecycle(ctx context.Context, serverID int64, protocol, 
 	query := `INSERT INTO peer_lifecycle (server_id, protocol, client_id, name, user_id, status, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(server_id, protocol, client_id) DO UPDATE SET
-			name = excluded.name,
-			user_id = excluded.user_id,
+			name = CASE WHEN excluded.name != '' THEN excluded.name ELSE peer_lifecycle.name END,
+			user_id = CASE
+				WHEN (excluded.user_id IN ('auto_provisioned', 'operator_supplied') OR excluded.status = 'backend_active')
+				     AND peer_lifecycle.user_id IS NOT NULL
+				     AND peer_lifecycle.user_id != ''
+				     AND peer_lifecycle.user_id NOT IN ('auto_provisioned', 'operator_supplied')
+				THEN peer_lifecycle.user_id
+				ELSE excluded.user_id
+			END,
 			status = excluded.status,
 			updated_at = excluded.updated_at`
 

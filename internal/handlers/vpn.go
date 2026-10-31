@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
@@ -163,46 +164,87 @@ func detectServerProxyProtocol(srv *models.Server) string {
 	return ""
 }
 
-func (h *Handlers) resolveInstalledProxyParamsForProto(ctx context.Context, srv *models.Server, proto string) (json.RawMessage, error) {
+func (h *Handlers) resolveInstalledProxyParamsForProto(ctx context.Context, srv *models.Server, proto string) (json.RawMessage, string, manager.ProtocolManager, error) {
 	if srv == nil || srv.Protocols == nil {
-		return nil, errors.New("server protocols not available")
+		return nil, "", nil, errors.New("server protocols not available")
 	}
 	normProto := models.NormalizeTunnelProtocol(proto)
 	pInfo, ok := srv.Protocols[normProto].(map[string]any)
 	if !ok || pInfo == nil {
-		return nil, fmt.Errorf("protocol %s not configured on server", normProto)
+		return nil, "", nil, fmt.Errorf("protocol %s not configured on server", normProto)
 	}
 
 	// 1. If explicit credentials already exist in server metadata, reuse them.
 	if pVal, ok := pInfo["params"]; ok && pVal != nil {
 		if b, err := json.Marshal(pVal); err == nil && len(bytes.TrimSpace(b)) > 2 && string(bytes.TrimSpace(b)) != "null" {
-			return b, nil
+			return b, "", nil, nil
 		}
 	}
 	if pVal, ok := pInfo["protocol_params"]; ok && pVal != nil {
 		if b, err := json.Marshal(pVal); err == nil && len(bytes.TrimSpace(b)) > 2 && string(bytes.TrimSpace(b)) != "null" {
-			return b, nil
+			return b, "", nil, nil
 		}
 	}
 
 	// 2. Try protocol manager if available and configured
 	protoMgr, err := h.GetProtocolManager(normProto)
 	if err != nil || protoMgr == nil {
-		return nil, fmt.Errorf("protocol manager for %s not available: %w", normProto, err)
+		return nil, "", nil, fmt.Errorf("protocol manager for %s not available: %w", normProto, err)
 	}
 	clientParams := map[string]any{"name": fmt.Sprintf("vpn-backend-%d", srv.ID)}
 	res, err := protoMgr.AddClient(ctx, srv, clientParams)
 	if err != nil {
-		return nil, fmt.Errorf("failed to provision proxy client on server %d: %w", srv.ID, err)
+		return nil, "", nil, fmt.Errorf("failed to provision proxy client on server %d: %w", srv.ID, err)
 	}
 	if res == nil {
-		return nil, errors.New("protocol manager returned empty client provisioning result")
+		return nil, "", nil, errors.New("protocol manager returned empty client provisioning result")
 	}
+	clientID := extractClientIDFromManagerResult(normProto, res)
 	params := extractProxyParamsFromManagerResult(normProto, res)
 	if len(params) == 0 {
-		return nil, errors.New("failed to extract proxy parameters from manager result")
+		_ = h.rollbackClient(ctx, protoMgr, srv, res, clientID)
+		if h.db != nil && clientID != "" {
+			_ = h.db.SetPeerLifecycleStatus(ctx, srv.ID, normProto, clientID, "failed")
+		}
+		return nil, "", nil, errors.New("failed to extract proxy parameters from manager result")
 	}
-	return params, nil
+
+	// Tie backend_active strictly to successful registration: record "pending" during enrollment.
+	// Status becomes "backend_active" ONLY after EnableBackendWithConfig succeeds.
+	if h.db != nil && clientID != "" {
+		if err := h.db.RecordPeerLifecycle(ctx, srv.ID, normProto, clientID, clientParams["name"].(string), vpn.PeerOwnershipAutoProvisioned, "pending"); err != nil {
+			slog.Warn("failed to record pending backend proxy peer lifecycle", "server_id", srv.ID, "protocol", normProto, "client_id", clientID, "err", err)
+		}
+	}
+
+	return params, clientID, protoMgr, nil
+}
+
+func extractClientIDFromManagerResult(proto string, res map[string]any) string {
+	if res == nil {
+		return ""
+	}
+	switch proto {
+	case models.ProtocolVLESS:
+		if uid, ok := res["uuid"].(string); ok && uid != "" {
+			return uid
+		}
+	case models.ProtocolNaive:
+		if username, ok := res["username"].(string); ok && username != "" {
+			return username
+		}
+	}
+	if cid, ok := res["client_id"].(string); ok && cid != "" {
+		return cid
+	}
+	if cid, ok := res["clientId"].(string); ok && cid != "" {
+		return cid
+	}
+	return ""
+}
+
+func extractClientIDFromProtocolParams(proto string, params json.RawMessage) string {
+	return vpn.ExtractClientIDFromProtocolParams(proto, params)
 }
 
 func (h *Handlers) isMultiProtocolEnabled(ctx context.Context) bool {
@@ -253,6 +295,10 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 	defer cancel()
 
 	var existingTunnel *models.BackendTunnel
+	var srv *models.Server
+	var newlyProvisionedClientID string
+	var newlyProvisionedMgr manager.ProtocolManager
+
 	if h.db != nil {
 		existingTunnel, _ = h.db.GetBackendTunnelByServerID(bgCtx, serverID)
 	}
@@ -290,7 +336,6 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 		if req.Protocol != "" {
 			effectiveProto = models.NormalizeTunnelProtocol(req.Protocol)
 		}
-		var srv *models.Server
 		if effectiveProto == "" && h.db != nil {
 			srv, _ = h.db.GetServer(bgCtx, serverID)
 			effectiveProto = detectServerProxyProtocol(srv)
@@ -325,26 +370,93 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 				h.JSONError(w, http.StatusNotFound, "server_not_found", fmt.Sprintf("Server %d not found", serverID))
 				return
 			}
-			params, provErr := h.resolveInstalledProxyParamsForProto(bgCtx, srv, normProto)
+			params, provCID, provMgr, provErr := h.resolveInstalledProxyParamsForProto(bgCtx, srv, normProto)
 			if provErr != nil {
 				// #nosec G706 -- Internal server audit log for failed backend proxy client provisioning
 				log.Printf("[vpn/handlers] failed to provision proxy client for server %d: %v", serverID, provErr)
 				h.JSONError(w, http.StatusBadGateway, "provisioning_failed", fmt.Sprintf("Failed to provision proxy client: %v", provErr))
 				return
 			}
+			newlyProvisionedClientID = provCID
+			newlyProvisionedMgr = provMgr
 			req.ProtocolParams = params
 		}
 	}
 
+	normProto := models.NormalizeTunnelProtocol(req.Protocol)
+	if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
+		cid := extractClientIDFromProtocolParams(normProto, req.ProtocolParams)
+		if cid == "" {
+			h.JSONError(w, http.StatusBadRequest, "invalid_parameter", "Proxy backend credential requires a client identifier")
+			return
+		}
+		defer lockClient(serverID, normProto, cid)()
+		if h.db == nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Database not configured")
+			return
+		}
+		assigned, err := h.db.HasUserConnectionCredential(bgCtx, serverID, normProto, cid)
+		if err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to check credential ownership")
+			return
+		}
+		if assigned {
+			h.JSONError(w, http.StatusConflict, "shared_backend_credential", "Credential is assigned to a user; use a separate backend credential")
+			return
+		}
+	}
 	if h.vpnSvc != nil {
 		var opts []tunnel.BackendTunnelOptions
 		if req.Protocol != "" || len(req.ProtocolParams) > 0 {
 			opts = append(opts, tunnel.BackendTunnelOptions{
-				Protocol:       models.NormalizeTunnelProtocol(req.Protocol),
+				Protocol:       normProto,
 				ProtocolParams: req.ProtocolParams,
 			})
 		}
 		if err := h.vpnSvc.EnableBackendWithConfig(bgCtx, serverID, opts...); err != nil {
+			if newlyProvisionedClientID != "" && newlyProvisionedMgr != nil {
+				// R3-H1: Distinguish pre-registration failure from post-registration abort.
+				// If a backend row has already been committed in backend_tunnels (or exists in the pool),
+				// do NOT revoke remote credentials; preserve them for subsequent re-enable/retry.
+				hasCommittedBackend := false
+				if h.db != nil {
+					tunnels, dbErr := h.db.GetBackendTunnelsByServerID(bgCtx, serverID)
+					if dbErr != nil {
+						hasCommittedBackend = true
+					} else {
+						for i := range tunnels {
+							cid := extractClientIDFromProtocolParams(tunnels[i].Protocol, tunnels[i].ProtocolParams)
+							if cid != "" && (cid == newlyProvisionedClientID || strings.EqualFold(cid, newlyProvisionedClientID)) {
+								hasCommittedBackend = true
+								break
+							}
+						}
+					}
+				}
+				if !hasCommittedBackend && h.vpnSvc != nil {
+					if tun, err := h.vpnSvc.GetTunnel(serverID); err == nil && tun != nil {
+						cid := extractClientIDFromProtocolParams(tun.Protocol, tun.ProtocolParams)
+						if cid != "" && (cid == newlyProvisionedClientID || strings.EqualFold(cid, newlyProvisionedClientID)) {
+							hasCommittedBackend = true
+						}
+					}
+				}
+				if !hasCommittedBackend {
+					if srv == nil && h.db != nil {
+						srv, _ = h.db.GetServer(bgCtx, serverID)
+					}
+					if rbErr := h.rollbackClient(bgCtx, newlyProvisionedMgr, srv, nil, newlyProvisionedClientID); rbErr != nil {
+						slog.Warn("failed to rollback remote client after enable backend failure", "server_id", serverID, "client_id", newlyProvisionedClientID, "err", rbErr)
+						if h.db != nil {
+							_ = h.db.SetPeerLifecycleStatus(bgCtx, serverID, normProto, newlyProvisionedClientID, "failed")
+						}
+					} else if h.db != nil {
+						_ = h.db.DeletePeerLifecycle(bgCtx, serverID, normProto, newlyProvisionedClientID)
+					}
+				} else {
+					slog.Info("preserving remote client credential owned by committed backend after enable abort", "server_id", serverID, "client_id", newlyProvisionedClientID)
+				}
+			}
 			if errors.Is(err, vpn.ErrAWGNotInstalled) {
 				h.JSONError(w, http.StatusBadRequest, "awg_not_installed", "Server does not have AmneziaWG installed or configured")
 				return
@@ -361,6 +473,29 @@ func (h *Handlers) VPNEnableBackendHandler(w http.ResponseWriter, r *http.Reques
 			log.Printf("[vpn/handlers] failed to enable backend %d: %v", serverID, err)
 			h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to enable backend")
 			return
+		}
+	}
+
+	if (normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive) && h.db != nil {
+		cid := extractClientIDFromProtocolParams(normProto, req.ProtocolParams)
+		if cid != "" {
+			ownership := vpn.PeerOwnershipOperatorSupplied
+			if newlyProvisionedClientID != "" && (cid == newlyProvisionedClientID || strings.EqualFold(cid, newlyProvisionedClientID)) {
+				ownership = vpn.PeerOwnershipAutoProvisioned
+			} else if lifecycles, err := h.db.GetPeerLifecycles(bgCtx, serverID, normProto); err == nil {
+				if existing, ok := lifecycles[cid]; ok && existing.UserID == vpn.PeerOwnershipAutoProvisioned {
+					ownership = vpn.PeerOwnershipAutoProvisioned
+				}
+			}
+			if err := vpn.RecordBackendProxyPeerLifecycleWithOwnership(bgCtx, h.db, serverID, normProto, cid, fmt.Sprintf("vpn-backend-%d", serverID), ownership); err != nil {
+				// #nosec G706 -- Internal server audit log for failed backend peer ownership persistence
+				log.Printf("[vpn/handlers] failed to record peer lifecycle for backend %d: %v", serverID, err)
+				if h.vpnSvc != nil {
+					_ = h.vpnSvc.DisableBackend(bgCtx, serverID)
+				}
+				h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to record backend peer ownership")
+				return
+			}
 		}
 	}
 
@@ -403,6 +538,18 @@ func (h *Handlers) VPNDeleteBackendHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	ctx := r.Context()
+	if h.db != nil {
+		if tunnels, err := h.db.GetBackendTunnelsByServerID(ctx, serverID); err == nil && len(tunnels) > 0 {
+			for i := range tunnels {
+				if pErr := vpn.EnsureBackendProxyPeerPreservation(ctx, h.db, serverID, tunnels[i].Protocol, tunnels[i].ProtocolParams); pErr != nil {
+					// #nosec G706 -- Internal server audit log for failed backend peer preservation
+					log.Printf("[vpn/handlers] failed to preserve peer lifecycle before backend delete %d: %v", serverID, pErr)
+					h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to preserve backend peer ownership")
+					return
+				}
+			}
+		}
+	}
 	if h.vpnSvc != nil {
 		if err := h.vpnSvc.DeleteBackend(ctx, serverID); err != nil {
 			if errors.Is(err, vpn.ErrBackendTunnelNotFound) {

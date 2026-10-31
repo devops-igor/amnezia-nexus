@@ -429,13 +429,15 @@ func TestUsersTemplateServerZeroHandling(t *testing.T) {
 	if !strings.Contains(usersJsStr, `onclick="showUserConnectionConfig('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
 		t.Errorf("users.js showUserConnectionConfig must pass connection ID")
 	}
-	if !strings.Contains(usersJsStr, `onclick="unlinkUserConnection('${UI.escapeJs(c.id)}', ${Number(c.server_id)}`) {
-		t.Errorf("users.js unlinkUserConnection must pass connection ID")
+	if !strings.Contains(usersJsStr, `onclick="unlinkUserConnection('${UI.escapeJs(c.id)}', '${UI.escapeJs(c.name || 'VPN')}')"`) {
+		t.Errorf("users.js unlinkUserConnection must pass connection row ID and name")
 	}
 
-	// Check fallback/direct connection endpoint calls
-	if !strings.Contains(usersJsStr, `/api/connections/${connId}/delete`) {
-		t.Errorf("users.js unlinkUserConnection must support /api/connections/${connId}/delete")
+	// Deletion must always use the protected row-specific endpoint, never global server removal.
+	deleteFunction := strings.SplitN(strings.SplitN(usersJsStr, "async function unlinkUserConnection(", 2)[1], "function switchConfigTab(", 2)[0]
+	if !strings.Contains(deleteFunction, "await API.post(`/api/connections/${encodeURIComponent(connId)}/delete`)") ||
+		strings.Contains(deleteFunction, "/connections/remove") {
+		t.Errorf("users.js unlinkUserConnection must only use protected connection deletion")
 	}
 	if !strings.Contains(usersJsStr, `/api/connections/${connId}/config`) {
 		t.Errorf("users.js showUserConnectionConfig/copyUserConnectionDirect must support /api/connections/${connId}/config")

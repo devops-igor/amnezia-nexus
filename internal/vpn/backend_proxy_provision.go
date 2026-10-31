@@ -2,10 +2,12 @@ package vpn
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
@@ -14,6 +16,15 @@ var ErrEmptyParams = errors.New("protocol parameters cannot be empty")
 
 // ErrMultiProtocolBackendsDisabled indicates that multi-protocol backends are disabled in configuration.
 var ErrMultiProtocolBackendsDisabled = errors.New("multi-protocol backends are disabled")
+
+const (
+	// PeerOwnershipAutoProvisioned marks credentials auto-provisioned by Nexus.
+	// These credentials may be cleaned up by reconciliation if orphaned.
+	PeerOwnershipAutoProvisioned = "auto_provisioned"
+	// PeerOwnershipOperatorSupplied marks credentials supplied by an operator or external source.
+	// These credentials must never be automatically revoked by reconciliation.
+	PeerOwnershipOperatorSupplied = "operator_supplied"
+)
 
 // MultiProtocolEnabled reports whether multi-protocol backends are enabled.
 func (s *Service) MultiProtocolEnabled() bool {
@@ -82,4 +93,106 @@ func DeriveProxyProtocolParams(server *models.Server, proto string) (json.RawMes
 	}
 
 	return nil, fmt.Errorf("protocol parameters required for proxy backend: %w", ErrEmptyParams)
+}
+
+// RecordBackendProxyPeerLifecycle records a backend proxy peer in peer_lifecycle with status "backend_active".
+func RecordBackendProxyPeerLifecycle(ctx context.Context, db *database.DB, serverID int64, proto, clientID, name string) error {
+	return RecordBackendProxyPeerLifecycleWithOwnership(ctx, db, serverID, proto, clientID, name, PeerOwnershipAutoProvisioned)
+}
+
+// RecordBackendProxyPeerLifecycleWithOwnership records a backend proxy peer in peer_lifecycle with status "backend_active" and explicit ownership metadata.
+// It preserves any existing non-empty user_id associated with the peer so user associations are not overwritten on conflict.
+func RecordBackendProxyPeerLifecycleWithOwnership(ctx context.Context, db *database.DB, serverID int64, proto, clientID, name, ownership string) error {
+	if db == nil || clientID == "" {
+		return nil
+	}
+	if name == "" {
+		name = fmt.Sprintf("vpn-backend-%d", serverID)
+	}
+	if ownership == "" {
+		ownership = PeerOwnershipOperatorSupplied
+	}
+	targetUserID := ownership
+	if lifecycles, err := db.GetPeerLifecycles(ctx, serverID, proto); err == nil {
+		if existing, ok := lifecycles[clientID]; ok {
+			if existing.UserID != "" && existing.UserID != PeerOwnershipAutoProvisioned && existing.UserID != PeerOwnershipOperatorSupplied {
+				targetUserID = existing.UserID
+			}
+		}
+	}
+	return db.RecordPeerLifecycle(ctx, serverID, proto, clientID, name, targetUserID, "backend_active")
+}
+
+// ExtractClientIDFromProtocolParams extracts the client identifier (UUID or username)
+// from typed or untyped proxy protocol parameters.
+func ExtractClientIDFromProtocolParams(proto string, params json.RawMessage) string {
+	if len(params) == 0 {
+		return ""
+	}
+	normProto := models.NormalizeTunnelProtocol(proto)
+	switch normProto {
+	case models.ProtocolVLESS:
+		var vless models.VLESSRealityParams
+		if err := json.Unmarshal(params, &vless); err == nil && vless.UUID != "" {
+			return vless.UUID
+		}
+	case models.ProtocolNaive:
+		var naive models.NaiveProxyParams
+		if err := json.Unmarshal(params, &naive); err == nil && naive.Username != "" {
+			return naive.Username
+		}
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(params, &raw); err == nil {
+		for _, k := range []string{"username", "client_id", "clientId", "uuid", "user", "id"} {
+			if v, ok := raw[k].(string); ok && v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// EnsureBackendProxyPeerPreservation ensures that any proxy credential associated with a
+// backend tunnel retains or establishes durable peer_lifecycle preservation before the
+// backend registration is deleted. If no lifecycle record exists (e.g. following a failed
+// enrollment write), a durable non-auto "operator_supplied" record with status "active" is
+// persisted. If persistence fails, an error is returned so deletion can fail closed.
+func EnsureBackendProxyPeerPreservation(ctx context.Context, db *database.DB, serverID int64, proto string, params json.RawMessage) error {
+	if db == nil {
+		return nil
+	}
+	normProto := models.NormalizeTunnelProtocol(proto)
+	if normProto != models.ProtocolVLESS && normProto != models.ProtocolNaive {
+		return nil
+	}
+	cid := ExtractClientIDFromProtocolParams(normProto, params)
+	if cid == "" {
+		return nil
+	}
+	lifecycles, err := db.GetPeerLifecycles(ctx, serverID, normProto)
+	if err != nil {
+		return fmt.Errorf("failed to query peer lifecycles for backend %d: %w", serverID, err)
+	}
+	if existing, ok := lifecycles[cid]; ok {
+		// If already tracked as auto_provisioned, preserve known-auto cleanup semantics.
+		if existing.UserID == PeerOwnershipAutoProvisioned {
+			return nil
+		}
+		// If already tracked with non-auto ownership (operator_supplied or real user ID),
+		// ensure its status is active if it was backend_active.
+		if existing.Status == "backend_active" {
+			if err := db.SetPeerLifecycleStatus(ctx, serverID, normProto, cid, "active"); err != nil {
+				return fmt.Errorf("failed to update peer lifecycle status to active for backend %d: %w", serverID, err)
+			}
+		}
+		return nil
+	}
+	// No lifecycle record exists! Missing or failed enrollment.
+	// Establish a durable non-auto preservation record with status="active" and operator ownership.
+	name := fmt.Sprintf("vpn-backend-%d", serverID)
+	if err := db.RecordPeerLifecycle(ctx, serverID, normProto, cid, name, PeerOwnershipOperatorSupplied, "active"); err != nil {
+		return fmt.Errorf("failed to persist operator peer lifecycle preservation for backend %d: %w", serverID, err)
+	}
+	return nil
 }

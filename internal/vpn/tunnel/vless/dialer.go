@@ -172,3 +172,8 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 		return nil, net.UnknownNetworkError(network)
 	}
 }
+
+// SupportsUDP indicates that VLESS supports native UDP packet forwarding.
+func (d *Dialer) SupportsUDP() bool {
+	return true
+}

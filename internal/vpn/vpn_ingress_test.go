@@ -439,7 +439,7 @@ func TestIngressEngineLivenessRefreshesSessionManager(t *testing.T) {
 	}
 }
 
-func TestEnsureBackendSessionForIngress_NaiveAdmissionExcludedForGenericClient(t *testing.T) {
+func TestEnsureBackendSessionForIngress_NaiveAdmissionAllowedForGenericClient(t *testing.T) {
 	db := setupTestDB(t)
 	svc, s1, s2, _, _ := setupTestVPNService(t, db, func(cfg *models.VPNConfig) {
 		cfg.EnableMultiProtocolBackends = true
@@ -475,12 +475,15 @@ func TestEnsureBackendSessionForIngress_NaiveAdmissionExcludedForGenericClient(t
 		t.Fatal(err)
 	}
 
-	// 1. Generic AWG client without routing policy must be rejected (Finding R2)
+	// 1. Generic AWG client without routing policy is now admitted to Naive backend (#662)
 	peer := seedIngressPeer(t, db, "naive-alice", "naive-peer-aaaaaaaaaa1", "10.100.3.21")
 	o := ownershipFor(peer)
-	_, _, _, err = svc.EnsureBackendSessionForIngress(ctx, o)
-	if !errors.Is(err, loadbalancer.ErrNoActiveBackends) {
-		t.Fatalf("expected ErrNoActiveBackends for generic full-tunnel client on Naive, got: %v", err)
+	sessAlice, backendAlice, _, err := svc.EnsureBackendSessionForIngress(ctx, o)
+	if err != nil {
+		t.Fatalf("expected generic client admission to Naive backend to succeed, got: %v", err)
+	}
+	if backendAlice.ID != naiveTunID || sessAlice.BackendTunnelID != naiveTunID {
+		t.Fatalf("expected admission to Naive tunnel %d, got %d", naiveTunID, backendAlice.ID)
 	}
 
 	// 2. Client with explicit stream routing policy should be admitted to Naive

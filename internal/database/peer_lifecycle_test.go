@@ -172,3 +172,71 @@ func TestDB_SetPeerLifecycleStatus_UpsertsMissingRow(t *testing.T) {
 		t.Fatalf("expected status 'failed', got %s", rec.Status)
 	}
 }
+
+func TestRecordPeerLifecycle_PreservesValidUserIDOnBackendConflict(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(":memory:", "")
+	if err != nil {
+		t.Fatalf("failed to open in-memory db: %v", err)
+	}
+	defer db.Close()
+
+	serverID := int64(1)
+	proto := "vless"
+	cid := "shared-user-peer-123"
+	realUserID := "user-uuid-999"
+
+	// 1. Initial insert with valid user ID
+	if err := db.RecordPeerLifecycle(ctx, serverID, proto, cid, "User Conn", realUserID, "active"); err != nil {
+		t.Fatalf("RecordPeerLifecycle failed: %v", err)
+	}
+
+	// 2. Conflict update with operator_supplied marker
+	if err := db.RecordPeerLifecycle(ctx, serverID, proto, cid, "Backend", "operator_supplied", "backend_active"); err != nil {
+		t.Fatalf("RecordPeerLifecycle conflict with operator_supplied failed: %v", err)
+	}
+
+	lifecycles, err := db.GetPeerLifecycles(ctx, serverID, proto)
+	if err != nil {
+		t.Fatalf("GetPeerLifecycles failed: %v", err)
+	}
+	rec := lifecycles[cid]
+	if rec.UserID != realUserID {
+		t.Fatalf("expected user_id to remain %q, got %q", realUserID, rec.UserID)
+	}
+	if rec.Status != "backend_active" {
+		t.Fatalf("expected status 'backend_active', got %q", rec.Status)
+	}
+
+	// 3. Conflict update with auto_provisioned marker
+	if err := db.RecordPeerLifecycle(ctx, serverID, proto, cid, "Backend", "auto_provisioned", "backend_active"); err != nil {
+		t.Fatalf("RecordPeerLifecycle conflict with auto_provisioned failed: %v", err)
+	}
+
+	lifecycles, _ = db.GetPeerLifecycles(ctx, serverID, proto)
+	rec = lifecycles[cid]
+	if rec.UserID != realUserID {
+		t.Fatalf("expected user_id to remain %q after auto_provisioned conflict, got %q", realUserID, rec.UserID)
+	}
+
+	// 4. Legitimate user assignment update should overwrite
+	newUserID := "user-uuid-888"
+	if err := db.RecordPeerLifecycle(ctx, serverID, proto, cid, "Reassigned Conn", newUserID, "active"); err != nil {
+		t.Fatalf("RecordPeerLifecycle reassignment failed: %v", err)
+	}
+	lifecycles, _ = db.GetPeerLifecycles(ctx, serverID, proto)
+	rec = lifecycles[cid]
+	if rec.UserID != newUserID {
+		t.Fatalf("expected user_id to update to %q, got %q", newUserID, rec.UserID)
+	}
+
+	// 5. Unbinding user (user_id = "") should succeed
+	if err := db.RecordPeerLifecycle(ctx, serverID, proto, cid, "Unbound Conn", "", "active"); err != nil {
+		t.Fatalf("RecordPeerLifecycle unbinding failed: %v", err)
+	}
+	lifecycles, _ = db.GetPeerLifecycles(ctx, serverID, proto)
+	rec = lifecycles[cid]
+	if rec.UserID != "" {
+		t.Fatalf("expected user_id to update to empty, got %q", rec.UserID)
+	}
+}
