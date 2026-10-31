@@ -282,7 +282,7 @@ type testFixture struct {
 	ServerClose func()
 }
 
-func setupTestServer(t *testing.T, flow string, decoyDelay time.Duration) *testFixture {
+func setupTestServer(t *testing.T, flow string, decoyDelay time.Duration, rejectDelay time.Duration) *testFixture {
 	t.Helper()
 	initTestCAs(t)
 
@@ -349,7 +349,14 @@ func setupTestServer(t *testing.T, flow string, decoyDelay time.Duration) *testF
 					_ = c.Close()
 					return
 				}
-				_ = vlessService.NewConnection(ctx, tlsConn, metadata.SocksaddrFromNet(tlsConn.RemoteAddr()), nil)
+				serviceErr := vlessService.NewConnection(ctx, tlsConn, metadata.SocksaddrFromNet(tlsConn.RemoteAddr()), nil)
+				if serviceErr != nil && rejectDelay > 0 && (strings.Contains(serviceErr.Error(), "unknown UUID") || strings.Contains(serviceErr.Error(), "flow mismatch")) {
+					t.Logf("server confirmed VLESS rejection before any response; delaying close delivery: %v", serviceErr)
+					select {
+					case <-ctx.Done():
+					case <-time.After(rejectDelay):
+					}
+				}
 				_ = tlsConn.Close()
 			}(conn)
 		}
@@ -399,6 +406,44 @@ func auditR14Launch(t *testing.T, traffic VLESSProbeFunc, handshake VLESSProbeFu
 	return err, remote, server
 }
 
+func TestIsExternalDestinationError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{"nil error", nil, false},
+		{"reality verification failed", fmt.Errorf("vless: dial traffic target example.com:443: vless: reality verification failed"), false},
+		{"dial connect refused", fmt.Errorf("vless: dial: connect: connection refused"), false},
+		{"dial target timeout", fmt.Errorf("vless: dial traffic target example.com:443: i/o timeout"), false},
+		{"tls target deadline exceeded", fmt.Errorf("vless: tls handshake to target example.com:443: context deadline exceeded"), false},
+		{"tls target io timeout", fmt.Errorf("vless: tls handshake to target example.com:443: i/o timeout"), false},
+		{"tls target eof", fmt.Errorf("vless: tls handshake to target example.com:443: EOF"), false},
+		{"tls target reset", fmt.Errorf("vless: tls handshake to target example.com:443: connection reset by peer"), false},
+		{"tls target broken pipe", fmt.Errorf("vless: tls handshake to target example.com:443: broken pipe"), false},
+		{"unauthorized client", fmt.Errorf("vless: unauthorized client"), false},
+		{"read probe response timeout", fmt.Errorf("vless: read probe response: i/o timeout"), false},
+		{"empty response from target", fmt.Errorf("vless: empty response from target through tunnel"), false},
+		{"write probe request broken pipe", fmt.Errorf("vless: write probe request: broken pipe"), false},
+		{"remote tls alert handshake failure", fmt.Errorf("vless: tls handshake to target example.com:443: remote error: tls: handshake failure"), true},
+		{"tls handshake failure alert", fmt.Errorf("vless: tls handshake to target external-target.com:443: tls: handshake failure"), true},
+		{"remote tls alert unrecognized name", fmt.Errorf("vless: tls handshake to target example.com:443: remote error: tls: unrecognized name"), true},
+		{"tls failed to verify certificate", fmt.Errorf("vless: tls handshake to target example.com:443: tls: failed to verify certificate: x509: certificate signed by unknown authority"), true},
+		{"x509 cert expired", fmt.Errorf("vless: tls handshake to target example.com:443: x509: certificate has expired or is not yet valid"), true},
+		{"invalid http response empty", fmt.Errorf("vless: invalid http response status line: \"\""), true},
+		{"invalid http response ssh banner", fmt.Errorf("vless: invalid http response status line: \"SSH-2.0-OpenSSH_8.9p1\""), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isExternalDestinationError(tt.err)
+			if got != tt.expected {
+				t.Errorf("isExternalDestinationError(%v) = %v, want %v", tt.err, got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestAuditR14ActualFallbackBranches(t *testing.T) {
 	for _, tc := range []struct {
 		name, msg      string
@@ -406,10 +451,14 @@ func TestAuditR14ActualFallbackBranches(t *testing.T) {
 		wantFail       bool
 	}{
 		{"external TLS alert", "vless: tls handshake to target example.com:443: remote error: tls: handshake failure", false, false},
-		{"external timeout", "vless: tls handshake to target example.com:443: context deadline exceeded", false, false},
+		{"destination cert untrusted", "vless: tls handshake to target example.com:443: tls: failed to verify certificate: x509: certificate signed by unknown authority", false, false},
+		{"destination invalid http", "vless: invalid http response status line: \"502 Bad Gateway\"", false, false},
+		{"generic timeout deadline", "vless: tls handshake to target example.com:443: context deadline exceeded", false, true},
+		{"generic timeout io", "vless: tls handshake to target example.com:443: i/o timeout", false, true},
+		{"dial target timeout", "vless: dial traffic target example.com:443: i/o timeout", false, true},
 		{"internal REALITY rejection", "vless: dial traffic target example.com:443: vless: reality verification failed", false, true},
 		{"endpoint refused", "vless: dial traffic target example.com:443: vless: dial: connect: connection refused", false, true},
-		{"failed fallback", "vless: tls handshake to target example.com:443: EOF", true, true},
+		{"failed fallback", "vless: tls handshake to target example.com:443: remote error: tls: handshake failure", true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			trafficCalls, handshakeCalls := 0, 0
@@ -450,7 +499,7 @@ func TestAuditR14ActualFallbackBranches(t *testing.T) {
 }
 
 func TestAuditR14RejectedVLESSUUIDMustNotCommitUpgrade(t *testing.T) {
-	fixture := setupTestServer(t, "", 0)
+	fixture := setupTestServer(t, "", 0, 0)
 	defer fixture.ServerClose()
 	// The REALITY identity is valid but this VLESS account is not accepted.
 	bad := fixture.Params
@@ -476,10 +525,13 @@ func TestAuditR14RejectedVLESSUUIDMustNotCommitUpgrade(t *testing.T) {
 	if err == nil {
 		t.Fatal("upgrade committed despite real VLESS authentication failure; expected rollback, not REALITY-only acceptance")
 	}
+	if handshakeCalls != 0 {
+		t.Fatalf("expected 0 fallback handshake calls, got %d", handshakeCalls)
+	}
 }
 
 func TestAuditR14RejectedVLESSFlowMustNotCommitUpgrade(t *testing.T) {
-	fixture := setupTestServer(t, "xtls-rprx-vision", 0)
+	fixture := setupTestServer(t, "xtls-rprx-vision", 0, 0)
 	defer fixture.ServerClose()
 	// The REALITY identity is valid but this VLESS account is not accepted.
 	bad := fixture.Params
@@ -504,5 +556,86 @@ func TestAuditR14RejectedVLESSFlowMustNotCommitUpgrade(t *testing.T) {
 	t.Logf("Install error=%v; traffic calls=%d; fallback calls=%d; published profile=%v; backup retained=%v; replacement alive=%v", err, trafficCalls, handshakeCalls, meta["engine_profile"], remote.backupContainerAlive, remote.dockerAlive)
 	if err == nil {
 		t.Fatal("upgrade committed despite real VLESS authentication failure; expected rollback, not REALITY-only acceptance")
+	}
+	if handshakeCalls != 0 {
+		t.Fatalf("expected 0 fallback handshake calls, got %d", handshakeCalls)
+	}
+}
+
+func TestAuditR15DelayedRejectedVLESSUUIDMustNotCommitUpgrade(t *testing.T) {
+	fixture := setupTestServer(t, "", 0, 6*time.Second)
+	defer fixture.ServerClose()
+	bad := fixture.Params
+	bad.UUID = "00000000-0000-0000-0000-000000000000"
+	trafficCalls, handshakeCalls := 0, 0
+	traffic := func(ctx context.Context, _ string, _ models.VLESSRealityParams, d time.Duration) (int64, error) {
+		trafficCalls++
+		n, e := realvless.ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, bad, "example.com:443", d)
+		t.Logf("actual delayed rejected UUID traffic result: %v; external classification=%v", e, isExternalDestinationError(e))
+		if e == nil {
+			t.Fatal("invalid UUID unexpectedly authenticated")
+		}
+		if isExternalDestinationError(e) {
+			t.Fatalf("delayed rejected UUID must not be classified as external destination error: %v", e)
+		}
+		return n, e
+	}
+	handshake := func(ctx context.Context, _ string, _ models.VLESSRealityParams, d time.Duration) (int64, error) {
+		handshakeCalls++
+		return realvless.ProbeVLESSReality(ctx, fixture.Endpoint, bad, d)
+	}
+	err, remote, server := auditR14Launch(t, traffic, handshake)
+	meta := server.Protocols[models.ProtocolVLESS].(map[string]any)
+	t.Logf("Install error=%v; traffic calls=%d; fallback calls=%d; published profile=%v; backup retained=%v; replacement alive=%v", err, trafficCalls, handshakeCalls, meta["engine_profile"], remote.backupContainerAlive, remote.dockerAlive)
+	if err == nil {
+		t.Fatal("upgrade committed despite delayed VLESS rejection; expected rollback, not REALITY-only acceptance")
+	}
+	if handshakeCalls != 0 {
+		t.Fatalf("expected 0 fallback handshake calls for delayed rejected UUID, got %d", handshakeCalls)
+	}
+	if meta["engine_profile"] != "legacy" {
+		t.Fatalf("engine profile unexpectedly upgraded to %v", meta["engine_profile"])
+	}
+	if !strings.Contains(err.Error(), "rolled back to previous container") {
+		t.Fatalf("expected rollback error message, got: %v", err)
+	}
+}
+
+func TestAuditR15DelayedRejectedVLESSFlowMustNotCommitUpgrade(t *testing.T) {
+	fixture := setupTestServer(t, "xtls-rprx-vision", 0, 6*time.Second)
+	defer fixture.ServerClose()
+	bad := fixture.Params
+	bad.Flow = ""
+	trafficCalls, handshakeCalls := 0, 0
+	traffic := func(ctx context.Context, _ string, _ models.VLESSRealityParams, d time.Duration) (int64, error) {
+		trafficCalls++
+		n, e := realvless.ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, bad, "example.com:443", d)
+		t.Logf("actual delayed rejected flow traffic result: %v; external classification=%v", e, isExternalDestinationError(e))
+		if e == nil {
+			t.Fatal("mismatched flow unexpectedly authenticated")
+		}
+		if isExternalDestinationError(e) {
+			t.Fatalf("delayed rejected flow must not be classified as external destination error: %v", e)
+		}
+		return n, e
+	}
+	handshake := func(ctx context.Context, _ string, _ models.VLESSRealityParams, d time.Duration) (int64, error) {
+		handshakeCalls++
+		return realvless.ProbeVLESSReality(ctx, fixture.Endpoint, bad, d)
+	}
+	err, remote, server := auditR14Launch(t, traffic, handshake)
+	meta := server.Protocols[models.ProtocolVLESS].(map[string]any)
+	t.Logf("Install error=%v; traffic calls=%d; fallback calls=%d; published profile=%v; backup retained=%v; replacement alive=%v", err, trafficCalls, handshakeCalls, meta["engine_profile"], remote.backupContainerAlive, remote.dockerAlive)
+	if err == nil {
+		t.Fatal("upgrade committed despite delayed VLESS rejection; expected rollback, not REALITY-only acceptance")
+	}
+	if handshakeCalls != 0 {
+		t.Fatalf("expected 0 fallback handshake calls for delayed rejected flow, got %d", handshakeCalls)
+	}
+	if meta["engine_profile"] != "legacy" {
+		t.Fatalf("engine profile unexpectedly upgraded to %v", meta["engine_profile"])
+	}
+	if !strings.Contains(err.Error(), "rolled back to previous container") {
+		t.Fatalf("expected rollback error message, got: %v", err)
 	}
 }

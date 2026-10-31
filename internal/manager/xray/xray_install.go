@@ -541,17 +541,16 @@ func isExternalDestinationError(err error) bool {
 		strings.Contains(msg, "unauthorized client") ||
 		strings.Contains(msg, "eof") ||
 		strings.Contains(msg, "connection reset") ||
-		strings.Contains(msg, "broken pipe") {
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "i/o timeout") {
 		return false
 	}
-	return strings.Contains(msg, "tls handshake to target") ||
-		strings.Contains(msg, "invalid http response") ||
-		strings.Contains(msg, "empty response from target") ||
-		strings.Contains(msg, "read probe response") ||
-		strings.Contains(msg, "write probe request") ||
-		strings.Contains(msg, "dial traffic target") ||
-		strings.Contains(msg, "deadline exceeded") ||
-		strings.Contains(msg, "i/o timeout")
+	return strings.Contains(msg, "remote error: tls:") ||
+		strings.Contains(msg, "tls: handshake failure") ||
+		strings.Contains(msg, "tls: failed to verify certificate") ||
+		strings.Contains(msg, "x509:") ||
+		strings.Contains(msg, "invalid http response")
 }
 
 func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient, opts containerLaunchOptions) error {
