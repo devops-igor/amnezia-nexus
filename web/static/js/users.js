@@ -630,7 +630,7 @@ async function viewUserConnections(userId, username) {
                             <svg class="icon"><use href="#icon-file-text"></use></svg>
                         </button>
                         <button type="button" class="btn btn-ghost btn-sm btn-icon btn-danger-hover" style="color:var(--danger);" title="${_('delete')}" aria-label="${_('delete')}"
-                                onclick="unlinkUserConnection('${UI.escapeJs(c.id)}', ${Number(c.server_id)}, '${UI.escapeJs(c.client_id)}', '${UI.escapeJs(c.protocol)}', '${UI.escapeJs(c.name || 'VPN')}')">
+                                onclick="unlinkUserConnection('${UI.escapeJs(c.id)}', '${UI.escapeJs(c.name || 'VPN')}')">
                             <svg class="icon"><use href="#icon-trash"></use></svg>
                         </button>
                     </div>
@@ -692,22 +692,7 @@ async function copyUserConnectionDirect(connIdOrServerId, serverIdOrClientId, cl
     }
 }
 
-async function unlinkUserConnection(connIdOrServerId, serverIdOrClientId, clientIdOrProto, protocolOrName, maybeName) {
-    let connId, serverId, clientId, protocol, connName;
-    if (typeof connIdOrServerId === 'number') {
-        serverId = connIdOrServerId;
-        clientId = serverIdOrClientId;
-        protocol = clientIdOrProto;
-        connName = protocolOrName || 'VPN';
-        connId = '';
-    } else {
-        connId = connIdOrServerId;
-        serverId = serverIdOrClientId;
-        clientId = clientIdOrProto;
-        protocol = protocolOrName;
-        connName = maybeName || 'VPN';
-    }
-
+async function unlinkUserConnection(connId, connName) {
     const confirmed = await UI.confirm({
         title: _('delete_connection') || 'Delete Connection',
         message: _('delete_conn_confirm') || `Are you sure you want to delete connection "${connName}"?`,
@@ -717,14 +702,7 @@ async function unlinkUserConnection(connIdOrServerId, serverIdOrClientId, client
     if (!confirmed) return;
 
     try {
-        if (Number(serverId) === 0 && (!clientId || clientId === '')) {
-            await API.post(`/api/connections/${connId}/delete`);
-        } else {
-            await API.post(`/api/servers/${serverId}/connections/remove`, {
-                protocol: protocol,
-                client_id: clientId || connId,
-            });
-        }
+        await API.post(`/api/connections/${encodeURIComponent(connId)}/delete`);
         UI.toast(_('success'), 'success');
         await viewUserConnections(currentUserId, currentUsername);
         refreshUsersList();
