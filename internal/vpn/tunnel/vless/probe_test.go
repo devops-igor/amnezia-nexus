@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"net"
@@ -343,6 +344,51 @@ func TestProbeVLESSTraffic_HTTPSDestination_Success(t *testing.T) {
 	latencyMS, err := ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, fixture.DecoyAddr, 3*time.Second)
 	if err != nil {
 		t.Fatalf("ProbeVLESSTrafficWithTarget on HTTPS destination failed: %v", err)
+	}
+
+	if latencyMS < 1 {
+		t.Fatalf("expected latencyMS >= 1, got %d", latencyMS)
+	}
+}
+
+func TestProbeVLESSTraffic_H2OnlyDestination_Success(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen h2 decoy: %v", err)
+	}
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{testLeafCert},
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"h2"},
+	}
+	tlsLn := tls.NewListener(ln, tlsConfig)
+	defer tlsLn.Close()
+
+	go func() {
+		for {
+			conn, err := tlsLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+				_, _ = c.Read(buf)
+			}(conn)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	h2Addr := ln.Addr().String()
+	latencyMS, err := ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, h2Addr, 3*time.Second)
+	if err != nil {
+		t.Fatalf("ProbeVLESSTrafficWithTarget on h2-only destination failed: %v", err)
 	}
 
 	if latencyMS < 1 {

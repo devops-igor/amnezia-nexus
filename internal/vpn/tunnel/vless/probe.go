@@ -154,11 +154,19 @@ func probeTrafficTarget(
 		tlsConfig := &tls.Config{
 			ServerName: sni,
 			MinVersion: tls.VersionTLS12,
-			NextProtos: []string{"http/1.1"},
+			NextProtos: []string{"h2", "http/1.1"},
 		}
 		tlsConn := tls.Client(conn, tlsConfig)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			return 0, fmt.Errorf("vless: tls handshake to target %s: %w", destination, err)
+		}
+		proto := tlsConn.ConnectionState().NegotiatedProtocol
+		if proto == "h2" || proto == "http/1.1" {
+			latencyMS := time.Since(start).Milliseconds()
+			if latencyMS <= 0 {
+				latencyMS = 1
+			}
+			return latencyMS, nil
 		}
 		rw = tlsConn
 	}

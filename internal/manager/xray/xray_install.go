@@ -501,10 +501,25 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 			EngineProfile: opts.engineProfile,
 		}
 		endpoint := net.JoinHostPort(opts.server.Host, strconv.Itoa(opts.portPrimary))
-		probeCtx, probeCancel := context.WithTimeout(ctx, 3*time.Second)
+		const probeTimeout = 5 * time.Second
+		probeCtx, probeCancel := context.WithTimeout(ctx, probeTimeout)
 		defer probeCancel()
 
-		if _, probeErr := activeProbeFn(probeCtx, endpoint, probeParams, 3*time.Second); probeErr != nil {
+		if _, probeErr := activeProbeFn(probeCtx, endpoint, probeParams, probeTimeout); probeErr != nil {
+			if probeMode == "VLESS traffic" && isExternalDestinationError(probeErr) {
+				// Third-party TLS alert, protocol, or destination reachability error:
+				// verify container directly via REALITY handshake to avoid false rollback.
+				if probeFn != nil {
+					hCtx, hCancel := context.WithTimeout(ctx, probeTimeout)
+					defer hCancel()
+					if _, hErr := probeFn(hCtx, endpoint, probeParams, probeTimeout); hErr != nil {
+						logCmd := fmt.Sprintf("docker logs --tail 50 %s 2>&1", ssh.EscapeShellArg(XrayContainerName))
+						logsOut, _, _, _ := client.RunSudoCommand(ctx, logCmd)
+						return fmt.Errorf("xray container failed REALITY handshake fallback: %w (logs: %s)", hErr, strings.TrimSpace(logsOut))
+					}
+				}
+				return nil
+			}
 			logCmd := fmt.Sprintf("docker logs --tail 50 %s 2>&1", ssh.EscapeShellArg(XrayContainerName))
 			logsOut, _, _, _ := client.RunSudoCommand(ctx, logCmd)
 			return fmt.Errorf("xray container failed %s readiness probe: %w (logs: %s)", probeMode, probeErr, strings.TrimSpace(logsOut))
@@ -512,6 +527,28 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 	}
 
 	return nil
+}
+
+func isExternalDestinationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "reality verification failed") ||
+		strings.Contains(msg, "vless: dial:") ||
+		strings.Contains(msg, "build handshake state") ||
+		strings.Contains(msg, "derive auth key") ||
+		strings.Contains(msg, "unauthorized client") {
+		return false
+	}
+	return strings.Contains(msg, "tls handshake to target") ||
+		strings.Contains(msg, "invalid http response") ||
+		strings.Contains(msg, "empty response from target") ||
+		strings.Contains(msg, "read probe response") ||
+		strings.Contains(msg, "write probe request") ||
+		strings.Contains(msg, "dial traffic target") ||
+		strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "i/o timeout")
 }
 
 func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient, opts containerLaunchOptions) error {

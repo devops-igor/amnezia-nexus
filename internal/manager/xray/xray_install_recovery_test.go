@@ -749,11 +749,173 @@ func TestXrayManager_ProfileSwitch_OmittedPortPreservesExistingInboundPort(t *te
 	}
 
 	// 2. Verify server metadata was repaired to 8443
-	vMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any)
+	tvMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any)
 	if !ok {
 		t.Fatalf("expected VLESS metadata on server")
 	}
-	if port, _ := vMeta["port"].(int); port != 8443 {
+	if port, _ := tvMeta["port"].(int); port != 8443 {
 		t.Errorf("server.Protocols[vless] port = %v, want 8443", port)
+	}
+}
+
+func TestXrayManager_H2OnlyDestination_NoRollback(t *testing.T) {
+	mockSSH := newMockXraySSHClient()
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+
+	clientUUID := "a1b2c3d4-e5f6-4a1b-8c2d-3e4f5a6b7c8d"
+	key, _, err := GenerateRealityKeypair()
+	if err != nil {
+		t.Fatalf("GenerateRealityKeypair: %v", err)
+	}
+	cls := []XrayClient{{ID: clientUUID, Flow: "xtls-rprx-vision", Email: "h2user@example.com"}}
+	cfg, err := RenderXrayConfig(8443, 54321, "h2only-decoy.com", "h2only-decoy.com:443", key, []string{"0123456789abcdef"}, cls)
+	if err != nil {
+		t.Fatalf("RenderXrayConfig: %v", err)
+	}
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
+
+	trafficProbeCalled := false
+	mgr.SetVLESSTrafficProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		trafficProbeCalled = true
+		if params.ServerName != "h2only-decoy.com" {
+			return 0, fmt.Errorf("unexpected server name in probe: %s", params.ServerName)
+		}
+		// Simulated successful probe against h2-only destination (as handled by probe.go ALPN negotiation)
+		return 12, nil
+	})
+
+	server := &models.Server{
+		ID:   945,
+		Host: "192.0.2.145",
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{
+				"installed":      true,
+				"port":           8443,
+				"engine_profile": "legacy",
+			},
+		},
+	}
+
+	err = mgr.Install(context.Background(), server, map[string]any{
+		"engine_profile": "modern_pq",
+		"port":           8443,
+		"server_name":    "h2only-decoy.com",
+	})
+	if err != nil {
+		t.Fatalf("mgr.Install failed on h2-only destination: %v", err)
+	}
+
+	if !trafficProbeCalled {
+		t.Fatal("expected traffic probe to be invoked")
+	}
+
+	if mockSSH.commands != nil {
+		for _, cmd := range mockSSH.commands {
+			if strings.Contains(cmd, "docker rename xray-backup xray") {
+				t.Fatalf("rollback command executed unexpectedly: %s", cmd)
+			}
+		}
+	}
+}
+
+func TestXrayManager_ExternalDestinationError_NoRollback(t *testing.T) {
+	mockSSH := newMockXraySSHClient()
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+
+	clientUUID := "b2c3d4e5-f6a1-4b2c-9d3e-4f5a6b7c8d9e"
+	key, _, err := GenerateRealityKeypair()
+	if err != nil {
+		t.Fatalf("GenerateRealityKeypair: %v", err)
+	}
+	cls := []XrayClient{{ID: clientUUID, Flow: "xtls-rprx-vision", Email: "extuser@example.com"}}
+	cfg, err := RenderXrayConfig(8443, 54321, "external-target.com", "external-target.com:443", key, []string{"0123456789abcdef"}, cls)
+	if err != nil {
+		t.Fatalf("RenderXrayConfig: %v", err)
+	}
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
+
+	// Traffic probe fails with external destination TLS alert failure
+	mgr.SetVLESSTrafficProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		return 0, fmt.Errorf("vless: tls handshake to target external-target.com:443: tls: handshake failure")
+	})
+
+	// Fallback REALITY handshake probe succeeds directly against Xray
+	handshakeProbeCalled := false
+	mgr.SetVLESSProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		handshakeProbeCalled = true
+		return 10, nil
+	})
+
+	server := &models.Server{
+		ID:   946,
+		Host: "192.0.2.146",
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{
+				"installed":      true,
+				"port":           8443,
+				"engine_profile": "legacy",
+			},
+		},
+	}
+
+	err = mgr.Install(context.Background(), server, map[string]any{
+		"engine_profile": "modern_pq",
+		"port":           8443,
+		"server_name":    "external-target.com",
+	})
+	if err != nil {
+		t.Fatalf("expected install to succeed without rollback on external destination TLS error: %v", err)
+	}
+	if !handshakeProbeCalled {
+		t.Error("expected fallback REALITY handshake probe to be invoked")
+	}
+}
+
+func TestXrayManager_InternalVLESSFailure_TriggersRollback(t *testing.T) {
+	mockSSH := newMockXraySSHClient()
+	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
+
+	clientUUID := "c3d4e5f6-a1b2-4c3d-ae4f-5a6b7c8d9e0f"
+	key, _, err := GenerateRealityKeypair()
+	if err != nil {
+		t.Fatalf("GenerateRealityKeypair: %v", err)
+	}
+	cls := []XrayClient{{ID: clientUUID, Flow: "xtls-rprx-vision", Email: "failuser@example.com"}}
+	cfg, err := RenderXrayConfig(8443, 54321, "fail-target.com", "fail-target.com:443", key, []string{"0123456789abcdef"}, cls)
+	if err != nil {
+		t.Fatalf("RenderXrayConfig: %v", err)
+	}
+	mockSSH.files[XrayConfigPath] = append([]byte(nil), cfg...)
+
+	// Internal failure: REALITY verification failed
+	mgr.SetVLESSTrafficProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		return 0, fmt.Errorf("vless: dial traffic target fail-target.com:443: reality verification failed")
+	})
+	mgr.SetVLESSProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		return 0, fmt.Errorf("reality verification failed")
+	})
+
+	server := &models.Server{
+		ID:   947,
+		Host: "192.0.2.147",
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{
+				"installed":      true,
+				"port":           8443,
+				"engine_profile": "legacy",
+			},
+		},
+	}
+
+	err = mgr.Install(context.Background(), server, map[string]any{
+		"engine_profile": "modern_pq",
+		"port":           8443,
+		"server_name":    "fail-target.com",
+	})
+	if err == nil {
+		t.Fatal("expected install to fail and trigger rollback on internal reality failure")
+	}
+	if !strings.Contains(err.Error(), "rolled back to previous container") {
+		t.Errorf("expected error to mention rollback, got: %v", err)
 	}
 }
