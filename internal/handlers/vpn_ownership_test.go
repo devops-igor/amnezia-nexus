@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/reconciliation"
@@ -870,7 +868,7 @@ func TestRotateVLESSBackendPreservesExplicitEmptyReplacementFlow(t *testing.T) {
 	}
 }
 
-func TestWithdrawUserConnection_SharedWithAnotherEnabledUser(t *testing.T) {
+func TestUserDeleteConnectionHandler_SharedWithAnotherEnabledUser(t *testing.T) {
 	h, db, _ := setupTestHandlers(t)
 	ctx := t.Context()
 	sid, err := db.CreateServer(ctx, &models.Server{Name: "shared-user-node", Host: "127.0.0.1", SSHPort: 22})
@@ -895,12 +893,14 @@ func TestWithdrawUserConnection_SharedWithAnotherEnabledUser(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	alice, err := db.GetConnection(ctx, "alice")
-	if err != nil || alice == nil {
-		t.Fatalf("alice connection: %v %v", alice, err)
-	}
-	if err := h.withdrawUserConnection(ctx, alice); !errors.Is(err, database.ErrSharedUserCredential) {
-		t.Fatalf("expected shared credential refusal, got %v", err)
+	r := chi.NewRouter()
+	r.Post("/api/my/connections/{connection_id}/delete", h.UserDeleteConnectionHandler)
+	req := httptest.NewRequest(http.MethodPost, "/api/my/connections/alice/delete", nil)
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict || !bytes.Contains(w.Body.Bytes(), []byte(`"credential_shared"`)) {
+		t.Fatalf("expected credential_shared conflict, got %d: %s", w.Code, w.Body.String())
 	}
 	if len(removed) != 0 {
 		t.Fatalf("revoked Bob's credential: %v", removed)

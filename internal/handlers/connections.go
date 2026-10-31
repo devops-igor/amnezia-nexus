@@ -2,11 +2,13 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
@@ -573,25 +575,16 @@ func (h *Handlers) UserDeleteConnectionHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if conn.ServerID == 0 {
-		if h.vpnSvc != nil {
-			_ = h.vpnSvc.ReleaseClient(ctx, conn.ClientID)
+	if err := h.withdrawUserConnection(ctx, conn); err != nil {
+		if errors.Is(err, database.ErrSharedUserCredential) {
+			h.JSONError(w, http.StatusConflict, "credential_shared", "Cannot delete connection: credential is shared with another user")
+			return
 		}
-	} else {
-		server, err := h.db.GetServer(ctx, conn.ServerID)
-		if err == nil && server != nil {
-			if protoMgr, err := h.GetProtocolManager(conn.Protocol); err == nil && protoMgr != nil {
-				if err := protoMgr.RemoveClient(ctx, server, conn.ClientID); err != nil {
-					h.JSONError(w, http.StatusInternalServerError, "remote_removal_failed", "Failed to remove remote client credentials: "+err.Error())
-					return
-				}
-			}
-		}
-	}
-
-	if _, err := h.db.DeleteConnection(ctx, connectionID); err != nil {
-		h.peerChangeError(w, err)
+		h.JSONError(w, http.StatusInternalServerError, "remote_removal_failed", "Failed to remove remote client credentials: "+err.Error())
 		return
+	}
+	if conn.ServerID == 0 && h.vpnSvc != nil {
+		_ = h.vpnSvc.ReleaseClient(ctx, conn.ClientID)
 	}
 	// The commit only queued the runtime enforcement; confirm the peer's live
 	// access was actually withdrawn before reporting success (issue #391
