@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"time"
+
+	"golang.org/x/net/http2"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
@@ -161,7 +164,39 @@ func probeTrafficTarget(
 			return 0, fmt.Errorf("vless: tls handshake to target %s: %w", destination, err)
 		}
 		proto := tlsConn.ConnectionState().NegotiatedProtocol
-		if proto == "h2" || proto == "http/1.1" {
+		if proto == "h2" {
+			//nolint:staticcheck // SA1019: x/net/http2.Transport.NewClientConn required for raw TLS connection wrapping over VLESS tunnel
+			t := &http2.Transport{}
+			//nolint:staticcheck // SA1019: x/net/http2.Transport.NewClientConn required for raw TLS connection wrapping over VLESS tunnel
+			cc, err := t.NewClientConn(tlsConn)
+			if err != nil {
+				return 0, fmt.Errorf("vless: h2 client conn to target %s: %w", destination, err)
+			}
+			defer cc.Close()
+
+			reqHost := sni
+			if reqHost == "" {
+				reqHost = host
+			}
+			if strings.Contains(reqHost, ":") && !strings.HasPrefix(reqHost, "[") {
+				reqHost = "[" + reqHost + "]"
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodHead, "https://"+reqHost+"/", nil)
+			if err != nil {
+				return 0, fmt.Errorf("vless: create h2 probe request: %w", err)
+			}
+			req.Header.Set("User-Agent", "amnezia-nexus-readiness-probe")
+
+			resp, err := cc.RoundTrip(req)
+			if err != nil {
+				return 0, fmt.Errorf("vless: h2 probe roundtrip: %w", err)
+			}
+			_ = resp.Body.Close()
+
+			if resp.StatusCode <= 0 {
+				return 0, fmt.Errorf("vless: invalid http2 response status code: %d", resp.StatusCode)
+			}
+
 			latencyMS := time.Since(start).Milliseconds()
 			if latencyMS <= 0 {
 				latencyMS = 1

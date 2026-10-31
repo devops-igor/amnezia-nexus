@@ -9,7 +9,10 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
+	"io"
+	"log"
 	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -365,21 +368,16 @@ func TestProbeVLESSTraffic_H2OnlyDestination_Success(t *testing.T) {
 		NextProtos:   []string{"h2"},
 	}
 	tlsLn := tls.NewListener(ln, tlsConfig)
-	defer tlsLn.Close()
 
+	h2Server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+		ErrorLog: log.New(io.Discard, "", 0),
+	}
+	defer h2Server.Close()
 	go func() {
-		for {
-			conn, err := tlsLn.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				buf := make([]byte, 1024)
-				_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
-				_, _ = c.Read(buf)
-			}(conn)
-		}
+		_ = h2Server.Serve(tlsLn)
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -393,5 +391,87 @@ func TestProbeVLESSTraffic_H2OnlyDestination_Success(t *testing.T) {
 
 	if latencyMS < 1 {
 		t.Fatalf("expected latencyMS >= 1, got %d", latencyMS)
+	}
+}
+
+func TestProbeVLESSTraffic_ApplicationTrafficFailure_ReturnsError(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
+
+	tests := []struct {
+		name      string
+		alpnProto string
+		behavior  string // "stall" or "close_early"
+	}{
+		{
+			name:      "h2 handshake succeeds but application stream stalls",
+			alpnProto: "h2",
+			behavior:  "stall",
+		},
+		{
+			name:      "h2 handshake succeeds but server closes without HTTP response",
+			alpnProto: "h2",
+			behavior:  "close_early",
+		},
+		{
+			name:      "http1.1 handshake succeeds but application stream stalls",
+			alpnProto: "http/1.1",
+			behavior:  "stall",
+		},
+		{
+			name:      "http1.1 handshake succeeds but server closes without HTTP response",
+			alpnProto: "http/1.1",
+			behavior:  "close_early",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer ln.Close()
+
+			tlsConfig := &tls.Config{
+				Certificates: []tls.Certificate{testLeafCert},
+				MinVersion:   tls.VersionTLS13,
+				NextProtos:   []string{tt.alpnProto},
+			}
+			tlsLn := tls.NewListener(ln, tlsConfig)
+			defer tlsLn.Close()
+
+			go func() {
+				for {
+					conn, err := tlsLn.Accept()
+					if err != nil {
+						return
+					}
+					go func(c net.Conn) {
+						defer c.Close()
+						if tc, ok := c.(*tls.Conn); ok {
+							_ = tc.Handshake()
+						}
+						if tt.behavior == "stall" {
+							// Intentionally stall without transmitting any HTTP response
+							time.Sleep(5 * time.Second)
+						}
+					}(conn)
+				}
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			destAddr := ln.Addr().String()
+			probeTimeout := 300 * time.Millisecond
+			if tt.behavior == "close_early" {
+				probeTimeout = 2 * time.Second
+			}
+			_, err = ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, destAddr, probeTimeout)
+			if err == nil {
+				t.Fatalf("%s: expected probe error, got nil", tt.name)
+			}
+		})
 	}
 }

@@ -17,12 +17,15 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
 
 	"github.com/google/uuid"
 	sTLS "github.com/sagernet/sing-box/common/tls"
@@ -257,6 +260,23 @@ func startDecoyServer(t *testing.T, delay time.Duration) (string, func()) {
 				defer c.Close()
 				if delay > 0 {
 					time.Sleep(delay)
+				}
+				if tc, ok := c.(*tls.Conn); ok {
+					if err := tc.Handshake(); err != nil {
+						return
+					}
+					if tc.ConnectionState().NegotiatedProtocol == "h2" {
+						//nolint:staticcheck // SA1019: http2.Server test fixture helper
+						h2s := &http2.Server{}
+						//nolint:staticcheck // SA1019: http2.Server test fixture helper
+						h2s.ServeConn(tc, &http2.ServeConnOpts{
+							Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+								w.WriteHeader(http.StatusOK)
+								_, _ = w.Write([]byte("Hello Decoy!"))
+							}),
+						})
+						return
+					}
 				}
 				buf := make([]byte, 1024)
 				_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -637,5 +657,96 @@ func TestAuditR15DelayedRejectedVLESSFlowMustNotCommitUpgrade(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "rolled back to previous container") {
 		t.Fatalf("expected rollback error message, got: %v", err)
+	}
+}
+
+func TestAuditR16ApplicationTrafficFailureTriggersRollback(t *testing.T) {
+	fixture := setupTestServer(t, "", 0, 0)
+	defer fixture.ServerClose()
+
+	tests := []struct {
+		name      string
+		alpnProto string
+	}{
+		{
+			name:      "h2 TLS succeeds but application stream stalls",
+			alpnProto: "h2",
+		},
+		{
+			name:      "http1.1 TLS succeeds but application stream stalls",
+			alpnProto: "http/1.1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer ln.Close()
+
+			tlsConfig := &tls.Config{
+				Certificates: []tls.Certificate{testLeafCert},
+				MinVersion:   tls.VersionTLS13,
+				NextProtos:   []string{tt.alpnProto},
+			}
+			tlsLn := tls.NewListener(ln, tlsConfig)
+			defer tlsLn.Close()
+
+			go func() {
+				for {
+					conn, err := tlsLn.Accept()
+					if err != nil {
+						return
+					}
+					go func(c net.Conn) {
+						defer c.Close()
+						if tc, ok := c.(*tls.Conn); ok {
+							_ = tc.Handshake()
+						}
+						// Intentionally stall application data stream
+						time.Sleep(5 * time.Second)
+					}(conn)
+				}
+			}()
+
+			trafficCalls, handshakeCalls := 0, 0
+			targetAddr := ln.Addr().String()
+			traffic := func(ctx context.Context, _ string, _ models.VLESSRealityParams, d time.Duration) (int64, error) {
+				trafficCalls++
+				n, e := realvless.ProbeVLESSTrafficWithTarget(ctx, fixture.Endpoint, fixture.Params, targetAddr, 300*time.Millisecond)
+				t.Logf("actual stalled application traffic result: %v; external classification=%v", e, isExternalDestinationError(e))
+				if e == nil {
+					t.Fatal("stalled application traffic unexpectedly succeeded")
+				}
+				if isExternalDestinationError(e) {
+					t.Fatalf("stalled application traffic must not be classified as external destination error: %v", e)
+				}
+				return n, e
+			}
+			handshake := func(ctx context.Context, _ string, _ models.VLESSRealityParams, d time.Duration) (int64, error) {
+				handshakeCalls++
+				return realvless.ProbeVLESSReality(ctx, fixture.Endpoint, fixture.Params, d)
+			}
+
+			err, remote, server := auditR14Launch(t, traffic, handshake)
+			meta := server.Protocols[models.ProtocolVLESS].(map[string]any)
+			t.Logf("Install error=%v; traffic calls=%d; fallback calls=%d; published profile=%v; backup retained=%v; replacement alive=%v",
+				err, trafficCalls, handshakeCalls, meta["engine_profile"], remote.backupContainerAlive, remote.dockerAlive)
+
+			if err == nil {
+				t.Fatal("upgrade committed despite application traffic stall; expected rollback, not acceptance")
+			}
+			if handshakeCalls != 0 {
+				t.Fatalf("expected 0 fallback handshake calls for application stall, got %d", handshakeCalls)
+			}
+			if meta["engine_profile"] != "legacy" {
+				t.Fatalf("engine profile unexpectedly upgraded to %v", meta["engine_profile"])
+			}
+			if !strings.Contains(err.Error(), "rolled back to previous container") {
+				t.Fatalf("expected rollback error message, got: %v", err)
+			}
+		})
 	}
 }
