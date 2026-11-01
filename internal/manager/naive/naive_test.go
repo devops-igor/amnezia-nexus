@@ -475,7 +475,7 @@ func TestNaiveConfig_ZeroClientsNoProbeResistance(t *testing.T) {
 	if strings.Contains(caddyfileNil, "forward_proxy") {
 		t.Errorf("RenderCaddyfile with nil clients must NOT contain forward_proxy directive:\n%s", caddyfileNil)
 	}
-	if !strings.Contains(caddyfileNil, "root * /srv") || !strings.Contains(caddyfileNil, "file_server") {
+	if !strings.Contains(caddyfileNil, "root * /var/www/html") || !strings.Contains(caddyfileNil, "file_server") {
 		t.Errorf("RenderCaddyfile with nil clients must contain decoy site:\n%s", caddyfileNil)
 	}
 

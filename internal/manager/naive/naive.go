@@ -2,6 +2,7 @@ package naive
 
 import (
 	"context"
+	_ "embed"
 	"errors"
 	"fmt"
 	"net"
@@ -17,11 +18,15 @@ import (
 const (
 	NaiveContainerName = "amnezia-caddy"
 	NaiveConfigDir     = "/opt/amnezia/caddy"
-	NaiveHTMLDir       = "/opt/amnezia/caddy/html"
+	NaiveWWWDir        = "/opt/amnezia/caddy/www"
+	NaiveHTMLDir       = NaiveWWWDir
 	NaiveCaddyfilePath = "/opt/amnezia/caddy/Caddyfile"
 	NaiveDataVolume    = "amnezia-caddy-data"
 	NaiveBaseImage     = "amnezia-caddy:local"
 )
+
+//go:embed assets/decoy/minecraft/index.html
+var minecraftDecoyHTML []byte
 
 // SSHProvider abstracts obtaining an SSHClient for a server.
 type SSHProvider interface {
