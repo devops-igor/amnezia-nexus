@@ -453,7 +453,7 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 			privB64 := base64.RawURLEncoding.EncodeToString(privKey.Bytes())
 			pubB64 := base64.RawURLEncoding.EncodeToString(pubKey.Bytes())
 			shortID := "0123456789abcdef"
-			serverName := "www.microsoft.com"
+			serverName := "gateway.icloud.com"
 			clientUUID := uuid.New().String()
 
 			// Write container config
@@ -496,7 +496,7 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 							"security": "reality",
 							"realitySettings": map[string]any{
 								"show":        false,
-								"dest":        "www.microsoft.com:443",
+								"dest":        "gateway.icloud.com:443",
 								"xver":        0,
 								"serverNames": []any{serverName},
 								"privateKey":  privB64,
