@@ -336,8 +336,14 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 		}
 		defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusNotFound {
-			t.Errorf("expected status 404 Not Found under probe resistance, got %d", resp.StatusCode)
+		if resp.StatusCode == http.StatusProxyAuthRequired {
+			t.Fatalf("probe resistance failed: server returned 407 Proxy Authentication Required")
+		}
+		if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusPermanentRedirect {
+			t.Errorf("expected probe resistance to conceal proxy (404 Not Found or 308 Decoy Redirect), got %d", resp.StatusCode)
+		}
+		if resp.StatusCode == http.StatusPermanentRedirect && resp.Header.Get("Location") != "/" {
+			t.Errorf("expected 308 redirect location to be '/', got %q", resp.Header.Get("Location"))
 		}
 	})
 
