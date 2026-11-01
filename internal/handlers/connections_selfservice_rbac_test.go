@@ -390,8 +390,8 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 		}
 	})
 
-	// 7. Support share isolation and credential exposure prevention (F2 regression)
-	t.Run("support cannot acquire credentials via share links", func(t *testing.T) {
+	// 7. Support share isolation and public share link retrieval for authenticated visitors (F2)
+	t.Run("support share isolation and public share access for authenticated visitors", func(t *testing.T) {
 		supportUser := users[models.RoleSupport]
 		victimUser := users[models.RoleUser]
 		for _, protocol := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
@@ -431,10 +431,14 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 				t.Fatalf("UpdateUser share token: %v", err)
 			}
 
-			// Step 4: Authenticated Support session attempts to get config via share link -> 404 Not Found
+			// Step 4: Authenticated visitors (Support session and other User) possessing valid share link succeed -> 200 OK
 			w = request(http.MethodPost, fmt.Sprintf("/api/share/%s/config/%s", shareToken, victimConn.ID), supportUser, nil)
-			if w.Code != http.StatusNotFound {
-				t.Fatalf("support share config status = %d, want 404; body: %s", w.Code, w.Body.String())
+			if w.Code != http.StatusOK {
+				t.Fatalf("support share config status = %d, want 200; body: %s", w.Code, w.Body.String())
+			}
+			w = request(http.MethodPost, fmt.Sprintf("/api/share/%s/config/%s", shareToken, victimConn.ID), userB, nil)
+			if w.Code != http.StatusOK {
+				t.Fatalf("other user share config status = %d, want 200; body: %s", w.Code, w.Body.String())
 			}
 
 			// Step 5: Anonymous request via legitimate share link succeeds -> 200 OK
@@ -453,6 +457,13 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 			w = request(http.MethodPost, fmt.Sprintf("/api/share/%s/config/%s", shareToken, victimConn.ID), users[models.RoleAdmin], nil)
 			if w.Code != http.StatusOK {
 				t.Fatalf("admin share config status = %d, want 200; body: %s", w.Code, w.Body.String())
+			}
+
+			// Step 8: Authenticated visitor requesting mismatched connection ID via valid share link -> 404 Not Found
+			otherUserConn := seedForUser(userB.ID, protocol, "mismatched-conn-"+protocol)
+			w = request(http.MethodPost, fmt.Sprintf("/api/share/%s/config/%s", shareToken, otherUserConn.ID), supportUser, nil)
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("mismatched connection share config status = %d, want 404; body: %s", w.Code, w.Body.String())
 			}
 		}
 	})

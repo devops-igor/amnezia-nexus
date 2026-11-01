@@ -181,10 +181,6 @@ func (h *Handlers) GetShareConnectionConfigHandler(w http.ResponseWriter, r *htt
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
 		return
 	}
-	if sess != nil && sess.IsAuthenticated() && !canAccessConnection(sess, conn) {
-		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
-		return
-	}
 
 	server, err := h.db.GetServer(ctx, conn.ServerID)
 	if err != nil || server == nil {
