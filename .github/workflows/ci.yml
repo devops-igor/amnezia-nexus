@@ -82,6 +82,12 @@ jobs:
           npm install -g jsdom@29.1.1
           echo "NODE_PATH=$(npm root -g)" >> "$GITHUB_ENV"
 
+      - name: Build Caddy with forwardproxy for Naive Smoke Tests
+        run: |
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
+          xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$(go env GOPATH)/bin/caddy"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
       - name: Run Tests with Race Detector
         run: go test -race -cover -count=1 -coverprofile=coverage.out ./...
 

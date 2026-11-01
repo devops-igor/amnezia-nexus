@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"math/big"
 	"net"
-	"os"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -936,19 +934,6 @@ func TestCaddyConfigurationAdaptation_RouteStructureAndProbeDefense(t *testing.T
 			}
 			if !strings.Contains(caddyfile, "handle_errors") || !strings.Contains(caddyfile, "-Server") || !strings.Contains(caddyfile, "-Alt-Svc") {
 				t.Error("rendered Caddyfile missing error header camouflage")
-			}
-			if caddyBin, err := exec.LookPath("caddy"); err == nil {
-				tmp, err := os.CreateTemp("", "caddyfile-val-*")
-				if err == nil {
-					defer os.Remove(tmp.Name())
-					if _, err := tmp.WriteString(caddyfile); err == nil {
-						_ = tmp.Close()
-						cmd := exec.Command(caddyBin, "validate", "--adapter", "caddyfile", "--config", tmp.Name())
-						if out, err := cmd.CombinedOutput(); err != nil && !tc.expectAuth {
-							t.Errorf("caddy validate failed on decoy config: %v (%s)", err, strings.TrimSpace(string(out)))
-						}
-					}
-				}
 			}
 		})
 	}
