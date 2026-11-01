@@ -321,14 +321,15 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 		}
 		defer conn.Close()
 
-		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", echoAddr)
+		hostHeader := fmt.Sprintf("localhost:%d", proxyPort)
+		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", echoAddr, hostHeader)
 		if _, err := conn.Write([]byte(connectReq)); err != nil {
 			t.Fatalf("failed to send CONNECT request: %v", err)
 		}
 
 		reader := bufio.NewReader(conn)
 		req, _ := http.NewRequest("CONNECT", "http://"+echoAddr, nil)
-		req.Host = "localhost"
+		req.Host = hostHeader
 		resp, err := http.ReadResponse(reader, req)
 		if err != nil {
 			t.Fatalf("failed to read unauthenticated CONNECT response: %v", err)
