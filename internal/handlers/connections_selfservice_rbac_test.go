@@ -80,6 +80,7 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 	router.Post("/api/connections/{connection_id}/delete", h.UserDeleteConnectionHandler)
 	router.Post("/api/users/{user_id}/share/setup", h.SetupUserShareHandler)
 	router.Get("/api/users", h.ListUsersHandler)
+	router.Get("/api/settings/backup/download", h.DownloadBackupHandler)
 	router.Get("/api/share/{token}/connections", h.GetShareConnectionsHandler)
 	router.Post("/api/share/{token}/config/{connection_id}", h.GetShareConnectionConfigHandler)
 
@@ -456,7 +457,94 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 		}
 	})
 
-	// 8. Full production router verification (F4)
+	// 8. Support backup export redacts other users share tokens (Round 3 audit regression)
+	t.Run("support backup export redacts other users share tokens", func(t *testing.T) {
+		supportUser := users[models.RoleSupport]
+		victimUser := users[models.RoleUser]
+		adminUser := users[models.RoleAdmin]
+
+		for _, protocol := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
+			victimConn := seedForUser(victimUser.ID, protocol, "backup-victim-"+protocol)
+			victimToken := fmt.Sprintf("victim-share-token-%s-%d", protocol, time.Now().UnixNano())
+			if _, err := db.UpdateUser(ctx, victimUser.ID, map[string]any{
+				"share_enabled": true,
+				"share_token":   victimToken,
+			}); err != nil {
+				t.Fatalf("UpdateUser victim share token: %v", err)
+			}
+
+			supportToken := fmt.Sprintf("support-own-token-%s-%d", protocol, time.Now().UnixNano())
+			if _, err := db.UpdateUser(ctx, supportUser.ID, map[string]any{
+				"share_enabled": true,
+				"share_token":   supportToken,
+			}); err != nil {
+				t.Fatalf("UpdateUser support share token: %v", err)
+			}
+
+			type backupUserItem struct {
+				ID         string  `json:"id"`
+				ShareToken *string `json:"share_token"`
+			}
+			type backupResponse struct {
+				Users []backupUserItem `json:"users"`
+			}
+
+			// Step 1: Support downloads backup: victim's share_token is redacted (nil/omitted), Support's own share_token is preserved
+			w := request(http.MethodGet, "/api/settings/backup/download", supportUser, nil)
+			if w.Code != http.StatusOK {
+				t.Fatalf("support backup download status = %d, want 200; body: %s", w.Code, w.Body.String())
+			}
+			var supportBackup backupResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &supportBackup); err != nil {
+				t.Fatalf("Unmarshal support backup: %v", err)
+			}
+			var acquiredVictimToken string
+			for _, u := range supportBackup.Users {
+				if u.ID == victimUser.ID && u.ShareToken != nil {
+					t.Errorf("protocol %s: support backup export leaked victim share_token: %q", protocol, *u.ShareToken)
+					acquiredVictimToken = *u.ShareToken
+				}
+				if u.ID == supportUser.ID {
+					if u.ShareToken == nil || *u.ShareToken != supportToken {
+						t.Errorf("protocol %s: support user own share_token not preserved in backup: got %v, want %q", protocol, u.ShareToken, supportToken)
+					}
+				}
+			}
+
+			// Step 2: Support cannot discover victim's share token from backup to anonymously retrieve config
+			if acquiredVictimToken != "" {
+				wAnon := request(http.MethodPost, fmt.Sprintf("/api/share/%s/config/%s", acquiredVictimToken, victimConn.ID), nil, nil)
+				if wAnon.Code == http.StatusOK {
+					t.Errorf("protocol %s: Support exploited leaked backup token to anonymously retrieve victim config", protocol)
+				}
+			}
+
+			// Step 3: Admin downloads backup: victim's share_token remains present
+			wAdmin := request(http.MethodGet, "/api/settings/backup/download", adminUser, nil)
+			if wAdmin.Code != http.StatusOK {
+				t.Fatalf("admin backup download status = %d, want 200; body: %s", wAdmin.Code, wAdmin.Body.String())
+			}
+			var adminBackup backupResponse
+			if err := json.Unmarshal(wAdmin.Body.Bytes(), &adminBackup); err != nil {
+				t.Fatalf("Unmarshal admin backup: %v", err)
+			}
+			foundVictimTokenInAdmin := false
+			for _, u := range adminBackup.Users {
+				if u.ID == victimUser.ID {
+					if u.ShareToken == nil || *u.ShareToken != victimToken {
+						t.Errorf("protocol %s: admin backup export missing victim share_token: got %v, want %q", protocol, u.ShareToken, victimToken)
+					} else {
+						foundVictimTokenInAdmin = true
+					}
+				}
+			}
+			if !foundVictimTokenInAdmin {
+				t.Errorf("protocol %s: victim user not found in admin backup export", protocol)
+			}
+		}
+	})
+
+	// 9. Full production router verification (F4)
 	t.Run("full router connections endpoints match POST specification", func(t *testing.T) {
 		fullRouter := setupFullConnectionsRouter(h)
 		conn := seedForUser(users[models.RoleUser].ID, models.ProtocolNaive, "full-router-test")
