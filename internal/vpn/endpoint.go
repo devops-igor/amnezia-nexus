@@ -206,7 +206,8 @@ func formatEndpoint(val string, defaultPort int) string {
 	if _, _, err := net.SplitHostPort(val); err == nil {
 		return val
 	}
-	return net.JoinHostPort(val, strconv.Itoa(defaultPort))
+	cleanVal := strings.Trim(val, "[]")
+	return net.JoinHostPort(cleanVal, strconv.Itoa(defaultPort))
 }
 
 func resolveClientEndpointInternal(ctx context.Context, s *Service, cfg *models.VPNConfig, listenPort int) string {

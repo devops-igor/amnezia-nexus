@@ -26,6 +26,23 @@ func SetTestRootCAs(pool *x509.CertPool) {
 	testRootCAs = pool
 }
 
+// Option configures optional parameters for a Dialer.
+type Option func(*Dialer)
+
+// WithDialContext overrides the transport dialing function for the Dialer.
+func WithDialContext(fn func(ctx context.Context, network, addr string) (net.Conn, error)) Option {
+	return func(d *Dialer) {
+		d.dialContext = fn
+	}
+}
+
+// WithResolver overrides the DNS resolver used by the Dialer.
+func WithResolver(r *net.Resolver) Option {
+	return func(d *Dialer) {
+		d.resolver = r
+	}
+}
+
 // h3FailureCooldown is how long DialContext skips H3 and dials H2 directly
 // after a transport-level H3 failure, so UDP loss costs one timeout, not one per dial.
 var h3FailureCooldown = 30 * time.Second
@@ -41,10 +58,14 @@ type Dialer struct {
 	// h3CooldownUntil is a UnixNano deadline; H3 is skipped until then.
 	// The shared QUIC conn is deliberately left open so healthy sibling tunnels survive.
 	h3CooldownUntil atomic.Int64
+
+	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	resolver    *net.Resolver
 }
 
 // New constructs a new NaiveProxy Dialer with defensive input validation.
-func New(endpoint string, p models.NaiveProxyParams) (*Dialer, error) {
+func New(endpoint string, p models.NaiveProxyParams, opts ...Option) (*Dialer, error) {
+	endpoint = strings.TrimSpace(endpoint)
 	host, portStr, err := net.SplitHostPort(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("naive: invalid endpoint %q: %w", endpoint, err)
@@ -61,7 +82,7 @@ func New(endpoint string, p models.NaiveProxyParams) (*Dialer, error) {
 	if domain == "" {
 		return nil, errors.New("naive: domain cannot be empty")
 	}
-	if strings.ContainsAny(domain, " \t\r\n:/\\") {
+	if strings.ContainsAny(domain, " 	\r\n:/\\") {
 		return nil, fmt.Errorf("naive: invalid domain name %q", domain)
 	}
 
@@ -84,6 +105,21 @@ func New(endpoint string, p models.NaiveProxyParams) (*Dialer, error) {
 		tlsCfg:   tlsCfg,
 		h2Pool:   newH2Pool(),
 		h3Pool:   newH3Pool(),
+		resolver: net.DefaultResolver,
+	}
+
+	for _, opt := range opts {
+		if opt != nil {
+			opt(d)
+		}
+	}
+
+	if d.dialContext == nil {
+		netDialer := &net.Dialer{
+			Timeout:  10 * time.Second,
+			Resolver: d.resolver,
+		}
+		d.dialContext = netDialer.DialContext
 	}
 
 	return d, nil

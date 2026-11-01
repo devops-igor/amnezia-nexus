@@ -92,7 +92,7 @@ func generateLeafCert(ca *x509.Certificate, caKey *ecdsa.PrivateKey, dnsName str
 			CommonName: dnsName,
 		},
 		DNSNames:              []string{dnsName, "localhost"},
-		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1)},
+		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 		NotBefore:             now.Add(-time.Hour),
 		NotAfter:              now.Add(24 * time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
@@ -110,10 +110,14 @@ func generateLeafCert(ca *x509.Certificate, caKey *ecdsa.PrivateKey, dnsName str
 }
 
 func setupTCPEchoServer(t *testing.T) (string, func()) {
+	return setupTCPEchoServerOnAddr(t, "127.0.0.1:0")
+}
+
+func setupTCPEchoServerOnAddr(t *testing.T, listenAddr string) (string, func()) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		t.Fatalf("listen tcp echo: %v", err)
+		t.Fatalf("listen tcp echo on %s: %v", listenAddr, err)
 	}
 
 	var wg sync.WaitGroup
@@ -204,8 +208,20 @@ func (fw *flushWriter) Close() error {
 	return nil
 }
 
-func setupTestH2Server(t *testing.T, authUser, authPass string, probeResistance bool) (string, func()) {
+func setupTestH2Server(t *testing.T, authUser, authPass string, probeResistance bool, onConnect ...func(authority string)) (string, func()) {
+	return setupTestH2ServerOnAddr(t, "127.0.0.1:0", authUser, authPass, probeResistance, onConnect...)
+}
+
+func setupTestH2ServerIPv6(t *testing.T, authUser, authPass string, probeResistance bool, onConnect ...func(authority string)) (string, func()) {
+	return setupTestH2ServerOnAddr(t, "[::1]:0", authUser, authPass, probeResistance, onConnect...)
+}
+
+func setupTestH2ServerOnAddr(t *testing.T, listenAddr, authUser, authPass string, probeResistance bool, onConnect ...func(authority string)) (string, func()) {
 	t.Helper()
+	var connectCb func(string)
+	if len(onConnect) > 0 && onConnect[0] != nil {
+		connectCb = onConnect[0]
+	}
 	cert, err := generateLeafCert(testCACert, testCAKey, testCamouflageDomain)
 	if err != nil {
 		t.Fatalf("generate leaf cert: %v", err)
@@ -216,7 +232,7 @@ func setupTestH2Server(t *testing.T, authUser, authPass string, probeResistance 
 		NextProtos:   []string{"h2"},
 	}
 
-	ln, err := tls.Listen("tcp", "127.0.0.1:0", tlsConfig)
+	ln, err := tls.Listen("tcp", listenAddr, tlsConfig)
 	if err != nil {
 		t.Fatalf("listen h2 tls: %v", err)
 	}
@@ -249,6 +265,10 @@ func setupTestH2Server(t *testing.T, authUser, authPass string, probeResistance 
 					f.Flush()
 				}
 				return
+			}
+
+			if connectCb != nil {
+				connectCb(r.Host)
 			}
 
 			// Forward to backing target (e.g. echo server)
@@ -304,6 +324,14 @@ func setupTestH2Server(t *testing.T, authUser, authPass string, probeResistance 
 }
 
 func setupTestH3Server(t *testing.T, authUser, authPass string, probeResistance bool) (string, func()) {
+	return setupTestH3ServerOnAddr(t, "127.0.0.1:0", authUser, authPass, probeResistance)
+}
+
+func setupTestH3ServerIPv6(t *testing.T, authUser, authPass string, probeResistance bool) (string, func()) {
+	return setupTestH3ServerOnAddr(t, "[::1]:0", authUser, authPass, probeResistance)
+}
+
+func setupTestH3ServerOnAddr(t *testing.T, listenAddr, authUser, authPass string, probeResistance bool) (string, func()) {
 	t.Helper()
 	cert, err := generateLeafCert(testCACert, testCAKey, testCamouflageDomain)
 	if err != nil {
@@ -315,7 +343,7 @@ func setupTestH3Server(t *testing.T, authUser, authPass string, probeResistance 
 		NextProtos:   []string{http3.NextProtoH3},
 	}
 
-	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	udpAddr, err := net.ResolveUDPAddr("udp", listenAddr)
 	if err != nil {
 		t.Fatalf("resolve udp: %v", err)
 	}
