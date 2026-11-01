@@ -289,12 +289,12 @@ func (m *NaiveManager) buildAndLaunchContainer(ctx context.Context, client ssh.S
 --tmpfs /tmp:rw,noexec,nosuid,size=16m \
 --tmpfs /run:rw,noexec,nosuid,size=16m \
 -v %s:/etc/caddy:ro \
--v %s:/srv:ro \
+-v %s:/var/www/html:ro \
 -v %s:/data \
 %s`,
 		ssh.EscapeShellArg(NaiveContainerName),
 		ssh.EscapeShellArg(NaiveConfigDir),
-		ssh.EscapeShellArg(NaiveHTMLDir),
+		ssh.EscapeShellArg(NaiveWWWDir),
 		ssh.EscapeShellArg(NaiveDataVolume),
 		ssh.EscapeShellArg(NaiveBaseImage),
 	)
@@ -343,14 +343,17 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 	}
 
 	// 3. Create directory structure
-	mkdirCmd := fmt.Sprintf("mkdir -p %s && chmod 0700 %s", ssh.EscapeShellArg(NaiveHTMLDir), ssh.EscapeShellArg(NaiveConfigDir))
+	mkdirCmd := fmt.Sprintf("mkdir -p %s && chmod 0700 %s && chmod 0755 %s",
+		ssh.EscapeShellArg(NaiveWWWDir),
+		ssh.EscapeShellArg(NaiveConfigDir),
+		ssh.EscapeShellArg(NaiveWWWDir),
+	)
 	if _, errOut, code, err := client.RunSudoCommand(ctx, mkdirCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to create naive directories (code %d): %s: %w", code, errOut, err)
 	}
 
 	// 4. Deploy static decoy website
-	decoyHTML := DefaultDecoyHTML()
-	if err := client.UploadSudoFile(ctx, fmt.Sprintf("%s/index.html", NaiveHTMLDir), []byte(decoyHTML), 0644); err != nil {
+	if err := client.UploadSudoFile(ctx, fmt.Sprintf("%s/index.html", NaiveWWWDir), minecraftDecoyHTML, 0644); err != nil {
 		return fmt.Errorf("upload decoy index.html: %w", err)
 	}
 

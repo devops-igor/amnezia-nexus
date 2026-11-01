@@ -274,6 +274,36 @@ const d = w.document;
     assert.strictEqual(confirmOptions.confirmVariant, 'danger', 'removeServer confirmVariant must be "danger"');
     assert(apiCalls.some(c => c.method === 'POST' && c.url === '/api/servers/42/delete'), 'removeServer must post to /api/servers/42/delete');
 
+    // Flow 4.1b: removeServer with unreachable host 409 triggers force delete confirmation
+    const origPost = w.API.post;
+    const origConfirm = w.UI.confirm;
+    const confirmHistory = [];
+    w.UI.confirm = async (opts) => {
+        confirmHistory.push(opts);
+        confirmOptions = opts;
+        return true;
+    };
+    w.API.post = async (url, body, opts) => {
+        apiCalls.push({ method: 'POST', url, body, opts });
+        if (url === '/api/servers/42/delete') {
+            const err = new Error('Remote server is unreachable: container cleanup failed. Use force delete to remove from panel.');
+            err.status = 409;
+            err.data = { error: 'server_unreachable', detail: err.message };
+            throw err;
+        }
+        return {};
+    };
+    confirmHistory.length = 0;
+    apiCalls = [];
+    await w.removeServer();
+    assert.strictEqual(confirmHistory.length, 2, 'removeServer must invoke UI.confirm twice on 409 server_unreachable');
+    assert.strictEqual(confirmHistory[1].confirmText, 'T:force_remove', 'force remove confirmText must use _("force_remove")');
+    assert.strictEqual(confirmHistory[1].message, 'T:server_unreachable_confirm', 'force remove message must use _("server_unreachable_confirm")');
+    assert.strictEqual(confirmHistory[1].confirmVariant, 'danger', 'force remove confirmVariant must be "danger"');
+    assert(apiCalls.some(c => c.method === 'POST' && c.url === '/api/servers/42/delete?force=true'), 'removeServer must re-post with ?force=true');
+    w.API.post = origPost;
+    w.UI.confirm = origConfirm;
+
     // Flow 4.2: rebootServer and clearServer confirm texts
     confirmOptions = null;
     await w.rebootServer();
