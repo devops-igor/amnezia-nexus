@@ -79,6 +79,7 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 	router.Post("/api/connections/{connection_id}/rename", h.UserRenameConnectionHandler)
 	router.Post("/api/connections/{connection_id}/delete", h.UserDeleteConnectionHandler)
 	router.Post("/api/users/{user_id}/share/setup", h.SetupUserShareHandler)
+	router.Post("/api/users/{user_id}/update", h.UpdateUserHandler)
 	router.Get("/api/users", h.ListUsersHandler)
 	router.Get("/api/settings/backup/download", h.DownloadBackupHandler)
 	router.Get("/api/share/{token}/connections", h.GetShareConnectionsHandler)
@@ -568,6 +569,47 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 		fullRouter.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {
 			t.Fatalf("full router POST config status = %d, want 200; body: %s", w.Code, w.Body.String())
+		}
+	})
+
+	// 10. Support cannot reset passwords of users with protected connections (F1)
+	t.Run("support cannot reset password of user with protected connection", func(t *testing.T) {
+		newPass := "NewPass1234!"
+		for _, protocol := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
+			victimUser := &models.User{
+				ID:       fmt.Sprintf("pwd-victim-%s", strings.ToLower(protocol)),
+				Username: fmt.Sprintf("pwd-victim-%s", strings.ToLower(protocol)),
+				Role:     models.RoleUser,
+				Enabled:  true,
+			}
+			if _, err := db.CreateUser(ctx, victimUser); err != nil {
+				t.Fatalf("CreateUser: %v", err)
+			}
+			_ = seedForUser(victimUser.ID, protocol, fmt.Sprintf("protected-%s", protocol))
+
+			// Support attempts to reset victim's password -> must return 403 Forbidden
+			wSupport := request(http.MethodPost, fmt.Sprintf("/api/users/%s/update", victimUser.ID), users[models.RoleSupport], map[string]any{
+				"password": newPass,
+			})
+			if wSupport.Code != http.StatusForbidden {
+				t.Errorf("protocol %s: support password reset status = %d, want 403; body: %s", protocol, wSupport.Code, wSupport.Body.String())
+			}
+
+			// Admin can reset victim's password -> must return 200 OK
+			wAdmin := request(http.MethodPost, fmt.Sprintf("/api/users/%s/update", victimUser.ID), users[models.RoleAdmin], map[string]any{
+				"password": newPass,
+			})
+			if wAdmin.Code != http.StatusOK {
+				t.Errorf("protocol %s: admin password reset status = %d, want 200; body: %s", protocol, wAdmin.Code, wAdmin.Body.String())
+			}
+		}
+
+		// Support can update their own password
+		wOwn := request(http.MethodPost, fmt.Sprintf("/api/users/%s/update", users[models.RoleSupport].ID), users[models.RoleSupport], map[string]any{
+			"password": "SupportOwnPass123!",
+		})
+		if wOwn.Code != http.StatusOK {
+			t.Errorf("support self password update status = %d, want 200; body: %s", wOwn.Code, wOwn.Body.String())
 		}
 	})
 }

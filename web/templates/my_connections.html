@@ -125,11 +125,13 @@
                     onclick="showMyConfig(this.dataset.cid, this.dataset.cname, this.dataset.proto)">
                     <svg class="icon"><use href="#icon-file-text"></use></svg> {{ _ "show_config" }}
                 </button>
+                {{ if or (is_admin $.current_user) (ne (lower $c.Protocol) "vless") }}
                 <button class="btn btn-danger btn-sm"
                     data-cid="{{ $c.ID }}" data-cname="{{ if $c.Name }}{{ $c.Name }}{{ else }}Connection{{ end }}"
                     onclick="deleteConnection(this.dataset.cid, this.dataset.cname)">
                     <svg class="icon"><use href="#icon-trash"></use></svg> {{ _ "delete" }}
                 </button>
+                {{ end }}
             </div>
         </div>
         {{ end }}
@@ -290,6 +292,10 @@
     let currentVpnLink = '';
     let currentConfigName = 'connection';
 
+    const currentUser = {
+        role: '{{ if .current_user }}{{ .current_user.Role }}{{ end }}'
+    };
+
     const availableServers = {{ .servers | json }};
     const initialConnections = {{ .connections | json }};
 
@@ -352,7 +358,7 @@
         UI.downloadQRCode('qrCode', (currentConfigName || 'vpn_config') + '_qr.png');
     }
 
-    function renderConnectionItem(conn, isTopConsumer) {
+    function renderConnectionCard(conn, isTopConsumer) {
         const protoDisplay = {
             awg: 'AmneziaWG',
             telemt: 'MTProxyL',
@@ -376,6 +382,7 @@
             ? `<span class="badge badge-info" style="font-size:0.65rem;"><svg class="icon" style="width:11px;height:11px;"><use href="#icon-shield"></use></svg> ${UI.escapeHtml(conn.awg_mimicry.toUpperCase())}</span>`
             : '';
         const topClass = isTopConsumer ? ' top-consumer' : '';
+        const showDelete = currentUser.role === 'admin' || (conn.protocol || '').toLowerCase() !== 'vless';
         return `
         <div class="client-item${topClass}" data-conn-id="${connId}" data-id="${connId}">
             <div class="client-info">
@@ -407,13 +414,18 @@
                     onclick="showMyConfig(this.dataset.cid, this.dataset.cname, this.dataset.proto)">
                     <svg class="icon"><use href="#icon-file-text"></use></svg> ${_('show_config')}
                 </button>
+                ${showDelete ? `
                 <button class="btn btn-danger btn-sm"
                     data-cid="${UI.escapeHtml(conn.id)}" data-cname="${UI.escapeHtml(conn.name || 'Connection')}"
                     onclick="deleteConnection(this.dataset.cid, this.dataset.cname)">
                     <svg class="icon"><use href="#icon-trash"></use></svg> ${_('delete')}
-                </button>
+                </button>` : ''}
             </div>
         </div>`;
+    }
+
+    function renderConnectionItem(conn, isTopConsumer) {
+        return renderConnectionCard(conn, isTopConsumer);
     }
 
     function openCreateConnectionModal() {
@@ -490,6 +502,9 @@
 
         for (const [proto, info] of Object.entries(protocols)) {
             if (info && info.installed) {
+                if (proto === 'vless' && currentUser.role !== 'admin') {
+                    continue;
+                }
                 const opt = document.createElement('option');
                 opt.value = proto;
                 opt.textContent = protoNames[proto] || proto;

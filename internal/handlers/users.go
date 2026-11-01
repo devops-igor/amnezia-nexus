@@ -331,13 +331,12 @@ func (h *Handlers) provisionInitialConnection(ctx context.Context, user *models.
 }
 
 func applyExpirationUpdate(req *models.UpdateUserRequest, updates map[string]any) {
-	if req.ExpiresAt != nil {
-		if t, err := time.Parse(time.RFC3339, *req.ExpiresAt); err == nil {
-			updates["expires_at"] = t
-			updates["expiration_date"] = t
-		}
-	} else if req.ExpirationDate != nil {
-		if t, err := time.Parse(time.RFC3339, *req.ExpirationDate); err == nil {
+	exp := req.ExpiresAt
+	if exp == nil {
+		exp = req.ExpirationDate
+	}
+	if exp != nil {
+		if t, err := time.Parse(time.RFC3339, *exp); err == nil {
 			updates["expires_at"] = t
 			updates["expiration_date"] = t
 		}
@@ -400,10 +399,7 @@ func (h *Handlers) refreshSelfSessionCookie(w http.ResponseWriter, r *http.Reque
 func (h *Handlers) authorizeAccessPolicyUpdate(
 	w http.ResponseWriter, r *http.Request, userID string, req *models.UpdateUserRequest,
 ) bool {
-	if req.ExpiresAt == nil &&
-		req.ExpirationDate == nil &&
-		req.TrafficLimit == nil &&
-		req.TrafficResetStrategy == nil {
+	if req.ExpiresAt == nil && req.ExpirationDate == nil && req.TrafficLimit == nil && req.TrafficResetStrategy == nil {
 		return true
 	}
 	conns, err := h.db.GetConnectionsByUserID(r.Context(), userID)
@@ -455,6 +451,12 @@ func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 	if user.Role == models.RoleAdmin && !h.GetSession(r).IsAdmin() {
 		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin role required to update admin accounts")
 		return
+	}
+	if req.Password != nil && *req.Password != "" {
+		if sess := h.GetSession(r); sess == nil || (!sess.IsAdmin() && sess.UserID != userID) {
+			h.JSONError(w, http.StatusForbidden, "forbidden", "Admin role required to reset another user's password")
+			return
+		}
 	}
 
 	updates, passwordUpdated, err := buildUserUpdates(&req)
