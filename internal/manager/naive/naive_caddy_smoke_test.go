@@ -8,8 +8,10 @@ import (
 	"encoding/base64"
 	"fmt"
 	"go/build"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -169,11 +171,18 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 	clients := []NaiveClient{{Username: "testuser", Password: "testpassword"}}
 	caddyfile := RenderCaddyfile(proxyPort, "localhost", clients)
 
-	// Replace loopback admin port with allocated test port and specify http_port to avoid port 80 permission denial
+	// Replace loopback admin port with allocated test port and specify http_port to avoid port 80 permission denial.
+	// Allow loopback in forward_proxy ACL for hermetic in-process fixture tunneling.
 	caddyfile = strings.Replace(
 		caddyfile,
 		"admin 127.0.0.1:2019",
 		fmt.Sprintf("admin 127.0.0.1:%d\n    http_port %d", adminPort, httpPort),
+		1,
+	)
+	caddyfile = strings.Replace(
+		caddyfile,
+		"probe_resistance\n",
+		"probe_resistance\n            acl {\n                allow 127.0.0.1\n            }\n",
 		1,
 	)
 
@@ -287,6 +296,20 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 		}
 	})
 
+	// In-process HTTP fixture for hermetic proxy tunnel destination
+	const echoBody = "hermetic-connect-test-payload"
+	echoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/echo" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(echoBody))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer echoServer.Close()
+	echoAddr := echoServer.Listener.Addr().String()
+
 	// 4a. Probe resistance: unauthenticated CONNECT returns 404 (not 407)
 	t.Run("ProbeResistance_UnauthenticatedCONNECTReturns404", func(t *testing.T) {
 		conf := baseTLSConfig.Clone()
@@ -298,13 +321,13 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 		}
 		defer conn.Close()
 
-		connectReq := "CONNECT 1.1.1.1:80 HTTP/1.1\r\nHost: 1.1.1.1:80\r\nConnection: close\r\n\r\n"
+		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", echoAddr, echoAddr)
 		if _, err := conn.Write([]byte(connectReq)); err != nil {
 			t.Fatalf("failed to send CONNECT request: %v", err)
 		}
 
 		reader := bufio.NewReader(conn)
-		req, _ := http.NewRequest("CONNECT", "http://1.1.1.1:80", nil)
+		req, _ := http.NewRequest("CONNECT", "http://"+echoAddr, nil)
 		resp, err := http.ReadResponse(reader, req)
 		if err != nil {
 			t.Fatalf("failed to read unauthenticated CONNECT response: %v", err)
@@ -329,7 +352,9 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 
 		auth := base64.StdEncoding.EncodeToString([]byte("testuser:testpassword"))
 		connectReq := fmt.Sprintf(
-			"CONNECT 1.1.1.1:80 HTTP/1.1\r\nHost: 1.1.1.1:80\r\nProxy-Authorization: Basic %s\r\n\r\n",
+			"CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: Basic %s\r\n\r\n",
+			echoAddr,
+			echoAddr,
 			auth,
 		)
 		if _, err := conn.Write([]byte(connectReq)); err != nil {
@@ -337,7 +362,7 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 		}
 
 		reader := bufio.NewReader(conn)
-		req, _ := http.NewRequest("CONNECT", "http://1.1.1.1:80", nil)
+		req, _ := http.NewRequest("CONNECT", "http://"+echoAddr, nil)
 		resp, err := http.ReadResponse(reader, req)
 		if err != nil {
 			t.Fatalf("failed to read authenticated CONNECT response: %v", err)
@@ -350,23 +375,30 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 			t.Error("expected probe resistance Padding header in CONNECT response")
 		}
 
-		// Exercise bidirectional tunnel traffic
-		headReq := "HEAD / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n"
-		if _, err := conn.Write([]byte(headReq)); err != nil {
+		// Exercise bidirectional tunnel traffic to local in-process HTTP fixture
+		getReq := fmt.Sprintf("GET /echo HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", echoAddr)
+		if _, err := conn.Write([]byte(getReq)); err != nil {
 			t.Fatalf("failed to send payload through tunnel: %v", err)
 		}
 
 		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		targetReq, _ := http.NewRequest("HEAD", "http://1.1.1.1/", nil)
+		targetReq, _ := http.NewRequest("GET", "http://"+echoAddr+"/echo", nil)
 		targetResp, err := http.ReadResponse(reader, targetReq)
 		if err != nil {
-			// If external network connectivity is restricted, log rather than failing if CONNECT succeeded
-			t.Logf("target response read returned error (external network may be offline): %v", err)
-		} else {
-			defer targetResp.Body.Close()
-			if targetResp.StatusCode != http.StatusMovedPermanently && targetResp.StatusCode != http.StatusOK {
-				t.Logf("target response status: %d", targetResp.StatusCode)
-			}
+			t.Fatalf("failed to read response from local fixture through tunnel: %v", err)
+		}
+		defer targetResp.Body.Close()
+
+		if targetResp.StatusCode != http.StatusOK {
+			t.Fatalf("expected HTTP 200 OK from local fixture, got %d", targetResp.StatusCode)
+		}
+
+		body, err := io.ReadAll(targetResp.Body)
+		if err != nil {
+			t.Fatalf("failed to read payload from local fixture: %v", err)
+		}
+		if string(body) != echoBody {
+			t.Fatalf("expected payload %q from local fixture, got %q", echoBody, string(body))
 		}
 	})
 }
