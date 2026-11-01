@@ -3,7 +3,11 @@ package models
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"net"
 	"reflect"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -414,6 +418,38 @@ func SameTunnelIdentity(a, b *BackendTunnel) bool {
 			a.ProbePrivateKey == b.ProbePrivateKey
 	}
 	return equalJSON(a.ProtocolParams, b.ProtocolParams)
+}
+
+// ParseEndpoint parses an endpoint string (IPv4, bracketed IPv6, or hostname with port)
+// into host and port components without splitting on internal IPv6 colons.
+func ParseEndpoint(endpoint string) (host, port string, err error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return "", "", errors.New("empty endpoint")
+	}
+	return net.SplitHostPort(endpoint)
+}
+
+// FormatEndpoint constructs a host:port endpoint string, ensuring IPv6 literals are
+// properly bracketed exactly once without internal colon splitting or double brackets.
+func FormatEndpoint(host string, defaultPort int) string {
+	cleanHost := strings.Trim(strings.TrimSpace(host), "[]")
+	port := defaultPort
+	if h, pStr, err := net.SplitHostPort(host); err == nil && h != "" {
+		cleanHost = strings.Trim(strings.TrimSpace(h), "[]")
+		if pInt, err := strconv.Atoi(pStr); err == nil && pInt > 0 {
+			port = pInt
+		}
+	}
+	return net.JoinHostPort(cleanHost, strconv.Itoa(port))
+}
+
+// EndpointHostPort parses the BackendTunnel's endpoint into host and port.
+func (t *BackendTunnel) EndpointHostPort() (host, port string, err error) {
+	if t == nil {
+		return "", "", errors.New("nil backend tunnel")
+	}
+	return ParseEndpoint(t.Endpoint)
 }
 
 // VPNSession tracks an active user connection through the portal AWG endpoint.

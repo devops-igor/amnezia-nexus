@@ -299,3 +299,88 @@ func TestBackendTunnels_ProtocolMigrationIdempotent(t *testing.T) {
 		}
 	}
 }
+
+func TestBackendTunnel_IPv6_Persistence(t *testing.T) {
+	ctx := context.Background()
+	secretKey := "test-secret-key-1234567890123456"
+	dbPath := filepath.Join(t.TempDir(), "ipv6-backend.db")
+
+	db, err := Open(dbPath, secretKey)
+	if err != nil {
+		t.Fatalf("failed to open DB: %v", err)
+	}
+	defer db.Close()
+
+	srvID, err := db.CreateServer(ctx, &models.Server{
+		Name:      "ipv6-test-server",
+		Host:      "[2001:db8::10]",
+		CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+
+	naiveParams := models.NaiveProxyParams{
+		Username: "ipv6_user",
+		Password: "ipv6_password",
+		Domain:   "ipv6.camouflage.org",
+		EnableH3: true,
+	}
+	rawParams, _ := json.Marshal(naiveParams)
+
+	const originalEndpoint = "[2001:db8::10]:443"
+	tun := &models.BackendTunnel{
+		ServerID:       srvID,
+		InterfaceName:  "naive-be-ipv6",
+		Endpoint:       originalEndpoint,
+		Protocol:       models.ProtocolNaive,
+		ProtocolParams: rawParams,
+		Status:         "active",
+		Enabled:        true,
+	}
+
+	id, err := db.CreateBackendTunnel(ctx, tun)
+	if err != nil {
+		t.Fatalf("CreateBackendTunnel with bracketed IPv6 failed: %v", err)
+	}
+
+	// 1. Retrieve by ID
+	retrieved, err := db.GetBackendTunnel(ctx, id)
+	if err != nil {
+		t.Fatalf("GetBackendTunnel failed: %v", err)
+	}
+	if retrieved.Endpoint != originalEndpoint {
+		t.Errorf("GetBackendTunnel endpoint = %q, want %q", retrieved.Endpoint, originalEndpoint)
+	}
+
+	// 2. Parse endpoint cleanly
+	host, port, err := retrieved.EndpointHostPort()
+	if err != nil {
+		t.Fatalf("EndpointHostPort failed: %v", err)
+	}
+	if host != "2001:db8::10" || port != "443" {
+		t.Errorf("EndpointHostPort = (%q, %q), want (%q, %q)", host, port, "2001:db8::10", "443")
+	}
+
+	// 3. Update endpoint to another bracketed IPv6
+	const updatedEndpoint = "[2001:db8::20]:8443"
+	if err := db.UpdateBackendTunnelEndpoint(ctx, id, updatedEndpoint); err != nil {
+		t.Fatalf("UpdateBackendTunnelEndpoint failed: %v", err)
+	}
+
+	// 4. Retrieve by ServerID
+	byServer, err := db.GetBackendTunnelByServerID(ctx, srvID)
+	if err != nil {
+		t.Fatalf("GetBackendTunnelByServerID failed: %v", err)
+	}
+	if byServer.Endpoint != updatedEndpoint {
+		t.Errorf("updated endpoint = %q, want %q", byServer.Endpoint, updatedEndpoint)
+	}
+	uHost, uPort, err := byServer.EndpointHostPort()
+	if err != nil {
+		t.Fatalf("EndpointHostPort after update failed: %v", err)
+	}
+	if uHost != "2001:db8::20" || uPort != "8443" {
+		t.Errorf("EndpointHostPort after update = (%q, %q), want (%q, %q)", uHost, uPort, "2001:db8::20", "8443")
+	}
+}

@@ -356,7 +356,8 @@ func (o *Orchestrator) probeTCPFallback(ctx context.Context, server *models.Serv
 		sshPort = server.SSHPort
 	}
 
-	addr := net.JoinHostPort(host, strconv.Itoa(sshPort))
+	cleanHost := strings.Trim(strings.TrimSpace(host), "[]")
+	addr := net.JoinHostPort(cleanHost, strconv.Itoa(sshPort))
 	t0 := time.Now()
 
 	d := net.Dialer{Timeout: 3 * time.Second}

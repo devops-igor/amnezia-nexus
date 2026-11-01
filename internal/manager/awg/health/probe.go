@@ -425,7 +425,7 @@ func PerformAWGHandshake(ctx context.Context, host string, port int, serverPubKe
 	if timeout <= 0 {
 		timeout = 3 * time.Second
 	}
-	endpoint := net.JoinHostPort(host, strconv.Itoa(port))
+	endpoint := net.JoinHostPort(strings.Trim(strings.TrimSpace(host), "[]"), strconv.Itoa(port))
 
 	preambles := extractPreambles(ctx, mimicryProfile, awgParams)
 	h1, h2, s1, s2 := extractAWGHeaderLimits(awgParams)

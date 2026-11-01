@@ -176,7 +176,7 @@ func (s *Service) EnableBackendWithConfig(ctx context.Context, serverID int64, o
 		if port <= 0 {
 			port = 443
 		}
-		endpoint := net.JoinHostPort(server.Host, strconv.Itoa(port))
+		endpoint := models.FormatEndpoint(server.Host, port)
 
 		s.mu.RLock()
 		preAddHook := s.enableBackendPreAddTunnelHook
@@ -235,7 +235,7 @@ func (s *Service) EnableBackendWithConfig(ctx context.Context, serverID int64, o
 		return err
 	}
 
-	endpoint := net.JoinHostPort(server.Host, strconv.Itoa(port))
+	endpoint := models.FormatEndpoint(server.Host, port)
 
 	s.mu.RLock()
 	preAddHook := s.enableBackendPreAddTunnelHook

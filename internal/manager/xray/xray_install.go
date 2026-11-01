@@ -500,7 +500,7 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 			ServerName:    opts.serverName,
 			EngineProfile: opts.engineProfile,
 		}
-		endpoint := net.JoinHostPort(opts.server.Host, strconv.Itoa(opts.portPrimary))
+		endpoint := net.JoinHostPort(strings.Trim(strings.TrimSpace(opts.server.Host), "[]"), strconv.Itoa(opts.portPrimary))
 		const probeTimeout = 5 * time.Second
 		probeCtx, probeCancel := context.WithTimeout(ctx, probeTimeout)
 		defer probeCancel()

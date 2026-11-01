@@ -76,6 +76,7 @@ type Client struct {
 
 // NewClient initializes an unconnected Client with the given configuration.
 func NewClient(cfg Config) *Client {
+	cfg.Host = strings.Trim(strings.TrimSpace(cfg.Host), "[]")
 	if cfg.Port <= 0 {
 		cfg.Port = 22
 	}
@@ -113,7 +114,7 @@ func DialFromServer(ctx context.Context, server *models.Server, store HostKeySto
 	}
 
 	cfg := Config{
-		Host:            server.Host,
+		Host:            strings.Trim(strings.TrimSpace(server.Host), "[]"),
 		Port:            server.SSHPort,
 		User:            server.SSHUser,
 		Password:        server.SSHPass,
@@ -162,7 +163,8 @@ func (c *Client) Connect(ctx context.Context) error {
 		Timeout:         c.cfg.Timeout,
 	}
 
-	addr := net.JoinHostPort(c.cfg.Host, fmt.Sprintf("%d", c.cfg.Port))
+	host := strings.Trim(strings.TrimSpace(c.cfg.Host), "[]")
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", c.cfg.Port))
 
 	dialer := net.Dialer{Timeout: c.cfg.Timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)

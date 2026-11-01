@@ -134,6 +134,13 @@ func extractProxyParamsFromManagerResult(proto string, res map[string]any, srv .
 			return nil
 		}
 		domain, _ := res["domain"].(string)
+		if domain == "" && len(srv) > 0 && srv[0] != nil && srv[0].Protocols != nil {
+			if nInfo, ok := srv[0].Protocols[models.ProtocolNaive].(map[string]any); ok {
+				if d, ok := nInfo["domain"].(string); ok && d != "" {
+					domain = d
+				}
+			}
+		}
 		p := models.NaiveProxyParams{
 			Username: username,
 			Password: password,
