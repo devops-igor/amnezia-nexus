@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -82,11 +83,15 @@ func TestRenderCaddyfile_ActiveProbeDefense(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rendered := RenderCaddyfile(tc.port, tc.domain, tc.clients)
 
-			// 1. Must contain global options with fallback SNI for TLS probing defense
+			// 1. Must contain global options with fallback SNI for TLS probing defense and protocols h1 h2 to eliminate HTTP/3 QUIC on UDP 443
 			wantDefaultSNI := fmt.Sprintf("default_sni %s", tc.expectSNI)
 			wantFallbackSNI := fmt.Sprintf("fallback_sni %s", tc.expectSNI)
 			if !strings.Contains(rendered, wantDefaultSNI) || !strings.Contains(rendered, wantFallbackSNI) {
 				t.Fatalf("rendered Caddyfile missing global default/fallback SNI for %q:\n%s", tc.expectSNI, rendered)
+			}
+			const wantProtocols = "servers {\n        protocols h1 h2\n    }"
+			if !strings.Contains(rendered, wantProtocols) {
+				t.Fatalf("rendered Caddyfile missing global protocols restriction:\n%s\nExpected:\n%s", rendered, wantProtocols)
 			}
 
 			// 2. Must contain hostless listener address in site header to accept arbitrary CONNECT authorities
@@ -298,6 +303,9 @@ func TestPreFlightDNSValidation(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected Install to fail for unresolvable domain, got nil error")
 		}
+		if !errors.Is(err, ErrDNSValidation) {
+			t.Errorf("expected ErrDNSValidation sentinel error, got: %v", err)
+		}
 		errMsg := err.Error()
 		if !strings.Contains(errMsg, "pre-flight DNS validation failed") {
 			t.Errorf("error must mention pre-flight DNS validation failed, got: %s", errMsg)
@@ -333,6 +341,9 @@ func TestPreFlightDNSValidation(t *testing.T) {
 		err := mgr.Install(ctx, server, params)
 		if err == nil {
 			t.Fatalf("expected Install to fail for mismatched IP, got nil error")
+		}
+		if !errors.Is(err, ErrDNSValidation) {
+			t.Errorf("expected ErrDNSValidation sentinel error, got: %v", err)
 		}
 		errMsg := err.Error()
 		if !strings.Contains(errMsg, "pre-flight DNS validation failed") {
@@ -584,6 +595,28 @@ func TestPreFlightDNSValidation(t *testing.T) {
 			t.Errorf("error must mention pre-flight DNS validation failed, got: %v", err)
 		}
 	})
+
+	t.Run("private management IP behind NAT allows installation with public domain", func(t *testing.T) {
+		for _, privateHost := range []string{"10.0.0.1", "192.168.1.1", "172.16.0.1", "127.0.0.1", "::1"} {
+			t.Run(privateHost, func(t *testing.T) {
+				mockSSH := newMockNaiveSSHClient()
+				mgr := NewNaiveManagerWithServerLocks(&mockNaivePool{client: mockSSH}, awg.NewServerLockRegistry())
+				mgr.SetDNSLookup(func(ctx context.Context, host string) ([]net.IP, error) {
+					return []net.IP{net.ParseIP("198.51.100.99")}, nil
+				})
+				server := &models.Server{ID: 114, Host: privateHost, SSHPort: 22}
+				params := map[string]any{
+					"port": 443,
+					"naive_options": map[string]any{
+						"domain": "vpn.operator.net",
+					},
+				}
+				if err := mgr.Install(ctx, server, params); err != nil {
+					t.Fatalf("private host %s behind NAT must allow installation: %v", privateHost, err)
+				}
+			})
+		}
+	})
 }
 
 func TestParseCaddyfile_HardenedStructureRoundTrip(t *testing.T) {
@@ -666,6 +699,9 @@ func TestParseCaddyfile_HardenedStructureRoundTrip(t *testing.T) {
 	if !strings.Contains(afterAdd, "default_sni vpn.prod.org") || !strings.Contains(afterAdd, "fallback_sni vpn.prod.org") {
 		t.Errorf("AddClient corrupted global SNI settings:\n%s", afterAdd)
 	}
+	if !strings.Contains(afterAdd, "protocols h1 h2") {
+		t.Errorf("AddClient corrupted protocols h1 h2 restriction:\n%s", afterAdd)
+	}
 	if !strings.Contains(afterAdd, ":443, vpn.prod.org {") {
 		t.Errorf("AddClient corrupted site header:\n%s", afterAdd)
 	}
@@ -691,6 +727,9 @@ func TestParseCaddyfile_HardenedStructureRoundTrip(t *testing.T) {
 	afterRemove := string(mockSSH.files[NaiveCaddyfilePath])
 	if !strings.Contains(afterRemove, "default_sni vpn.prod.org") || !strings.Contains(afterRemove, "fallback_sni vpn.prod.org") {
 		t.Errorf("RemoveClient corrupted global SNI settings:\n%s", afterRemove)
+	}
+	if !strings.Contains(afterRemove, "protocols h1 h2") {
+		t.Errorf("RemoveClient corrupted protocols h1 h2 restriction:\n%s", afterRemove)
 	}
 	if !strings.Contains(afterRemove, ":443, vpn.prod.org {") {
 		t.Errorf("RemoveClient corrupted site header:\n%s", afterRemove)
@@ -827,5 +866,112 @@ func TestAuditEquivalent_TLSCertificateSelection(t *testing.T) {
 		if err != nil {
 			t.Fatalf("fallback control failed: %v", err)
 		}
+	}
+}
+
+func adaptCaddyfileToJSON(content string) ([]byte, error) {
+	if err := validateCaddyfileStructure(content); err != nil {
+		return nil, fmt.Errorf("caddyfile structure invalid: %w", err)
+	}
+	domain, port, clients, err := ParseCaddyfile(content)
+	if err != nil {
+		return nil, fmt.Errorf("caddyfile parse failed: %w", err)
+	}
+	routes := []map[string]any{
+		{"handle": []map[string]any{{"handler": "headers", "response": map[string]any{"delete": []string{"Server", "Alt-Svc"}}}}},
+		{
+			"match":  []map[string]any{{"not": []map[string]any{{"method": []string{"CONNECT"}}, {"host": []string{domain}}}}},
+			"handle": []map[string]any{{"handler": "static_response", "status_code": 404, "close": true}},
+		},
+	}
+	if len(clients) > 0 && strings.Contains(content, "forward_proxy") {
+		routes = append(routes, map[string]any{"handle": []map[string]any{{"handler": "forward_proxy", "probe_resistance": true}}})
+	}
+	routes = append(routes, map[string]any{"handle": []map[string]any{{"handler": "file_server", "root": "/srv"}}})
+
+	cfg := map[string]any{
+		"admin": map[string]any{"listen": "127.0.0.1:2019"},
+		"apps": map[string]any{
+			"http": map[string]any{
+				"servers": map[string]any{
+					"srv0": map[string]any{
+						"listen":    []string{fmt.Sprintf(":%d", port)},
+						"protocols": []string{"h1", "h2"},
+						"routes":    routes,
+						"errors": map[string]any{
+							"routes": []map[string]any{{
+								"handle": []map[string]any{
+									{"handler": "headers", "response": map[string]any{"delete": []string{"Server", "Alt-Svc"}}},
+									{"handler": "static_response", "status_code": "{err.status_code}"},
+								},
+							}},
+						},
+						"tls_connection_policies": []map[string]any{{"default_sni": domain, "fallback_sni": domain}},
+					},
+				},
+			},
+		},
+	}
+	return json.MarshalIndent(cfg, "", "  ")
+}
+
+func TestCaddyConfigurationAdaptation_RouteStructureAndProbeDefense(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		port       int
+		domain     string
+		clients    []NaiveClient
+		expectAuth bool
+	}{
+		{"public_clients", 443, "vpn.prod.org", []NaiveClient{{Username: "u1", Password: "p1"}}, true},
+		{"public_zero_clients", 443, "vpn.prod.org", nil, false},
+		{"custom_port_clients", 8443, "vpn.custom.org", []NaiveClient{{Username: "u2", Password: "p2"}}, true},
+		{"test_domain_ip", 443, "198.51.100.42", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			caddyfile := RenderCaddyfile(tc.port, tc.domain, tc.clients)
+			data, err := adaptCaddyfileToJSON(caddyfile)
+			if err != nil || !json.Valid(data) {
+				t.Fatalf("adaptation failed: %v", err)
+			}
+			var parsed struct {
+				Apps struct {
+					HTTP struct {
+						Servers map[string]struct {
+							Protocols []string                    `json:"protocols"`
+							Routes    []map[string]any            `json:"routes"`
+							Errors    map[string][]map[string]any `json:"errors"`
+						} `json:"servers"`
+					} `json:"http"`
+				} `json:"apps"`
+			}
+			if err := json.Unmarshal(data, &parsed); err != nil {
+				t.Fatalf("unmarshal adapted JSON failed: %v", err)
+			}
+			srv := parsed.Apps.HTTP.Servers["srv0"]
+			if len(srv.Protocols) != 2 || srv.Protocols[0] != "h1" || srv.Protocols[1] != "h2" {
+				t.Errorf("expected protocols [h1 h2], got: %v", srv.Protocols)
+			}
+			hasRawProbe, hasProxy := false, false
+			for _, r := range srv.Routes {
+				if r["match"] != nil {
+					hasRawProbe = true
+				}
+				for _, h := range r["handle"].([]any) {
+					if h.(map[string]any)["handler"] == "forward_proxy" {
+						hasProxy = true
+					}
+				}
+			}
+			if !hasRawProbe {
+				t.Error("adapted route structure missing @rawProbe")
+			}
+			if tc.expectAuth != hasProxy {
+				t.Errorf("expected forward_proxy=%t, got %t", tc.expectAuth, hasProxy)
+			}
+			if len(srv.Errors["routes"]) == 0 {
+				t.Error("adapted JSON missing error handlers")
+			}
+		})
 	}
 }

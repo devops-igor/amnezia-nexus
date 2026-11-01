@@ -81,11 +81,15 @@ func RenderCaddyfile(port int, domain string, clients []NaiveClient) string {
 	}
 
 	var sb strings.Builder
-	// Global options: enable loopback admin for caddy reload and fallback SNI for raw IP probes
+	// Global options: enable loopback admin for caddy reload, fallback SNI for raw IP probes,
+	// and restrict protocols to h1/h2 to eliminate HTTP/3 QUIC exposure on UDP 443.
 	sb.WriteString("{\n")
 	sb.WriteString("    admin 127.0.0.1:2019\n")
 	fmt.Fprintf(&sb, "    default_sni %s\n", domain)
 	fmt.Fprintf(&sb, "    fallback_sni %s\n", domain)
+	sb.WriteString("    servers {\n")
+	sb.WriteString("        protocols h1 h2\n")
+	sb.WriteString("    }\n")
 	sb.WriteString("}\n\n")
 
 	// Hostless listener combined with domain ensures arbitrary destination CONNECT requests are accepted

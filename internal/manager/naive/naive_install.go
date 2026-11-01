@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -12,6 +13,9 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
+
+// ErrDNSValidation is returned when pre-flight domain DNS validation fails.
+var ErrDNSValidation = errors.New("pre-flight DNS validation failed")
 
 func parseNaiveInstallOptions(params map[string]any, defaultHost string) (int, string) {
 	port := 443
@@ -151,22 +155,27 @@ func (m *NaiveManager) validateDomainDNS(ctx context.Context, domain string, ser
 		return nil
 	}
 
+	cleanHost := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(serverHost), "["), "]")
+	serverIP := net.ParseIP(cleanHost)
+	if serverIP != nil && (serverIP.IsPrivate() || serverIP.IsLoopback()) {
+		slog.Info("allowing naive installation with private/loopback server host behind NAT",
+			"server_host", serverHost, "domain", domain)
+		return nil
+	}
+
 	lookupFn := m.getDNSLookup()
 	ips, err := resolveHost(ctx, domain, lookupFn, params)
 	if err != nil {
-		return fmt.Errorf("pre-flight DNS validation failed: domain %q does not resolve to server IP %q: %w", domain, serverHost, err)
+		return fmt.Errorf("%w: domain %q does not resolve to server IP %q: %w", ErrDNSValidation, domain, serverHost, err)
 	}
 	if len(ips) == 0 {
-		return fmt.Errorf("pre-flight DNS validation failed: domain %q resolved to no IP addresses, expected server IP %q", domain, serverHost)
+		return fmt.Errorf("%w: domain %q resolved to no IP addresses, expected server IP %q", ErrDNSValidation, domain, serverHost)
 	}
 
 	var resolvedStrs []string
 	for _, ip := range ips {
 		resolvedStrs = append(resolvedStrs, ip.String())
 	}
-
-	cleanHost := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(serverHost), "["), "]")
-	serverIP := net.ParseIP(cleanHost)
 
 	matched := false
 	if serverIP != nil {
@@ -181,10 +190,10 @@ func (m *NaiveManager) validateDomainDNS(ctx context.Context, domain string, ser
 	} else {
 		hostIPs, hostErr := resolveHost(ctx, cleanHost, lookupFn, params)
 		if hostErr != nil {
-			return fmt.Errorf("pre-flight DNS validation failed: server host %q could not be resolved: %w", serverHost, hostErr)
+			return fmt.Errorf("%w: server host %q could not be resolved: %w", ErrDNSValidation, serverHost, hostErr)
 		}
 		if len(hostIPs) == 0 {
-			return fmt.Errorf("pre-flight DNS validation failed: server host %q resolved to no IP addresses", serverHost)
+			return fmt.Errorf("%w: server host %q resolved to no IP addresses", ErrDNSValidation, serverHost)
 		}
 		for _, dIP := range ips {
 			for _, hIP := range hostIPs {
@@ -200,7 +209,7 @@ func (m *NaiveManager) validateDomainDNS(ctx context.Context, domain string, ser
 	}
 
 	if !matched {
-		return fmt.Errorf("pre-flight DNS validation failed: domain %q resolves to [%s], expected server IP %q", domain, strings.Join(resolvedStrs, ", "), serverHost)
+		return fmt.Errorf("%w: domain %q resolves to [%s], expected server IP %q", ErrDNSValidation, domain, strings.Join(resolvedStrs, ", "), serverHost)
 	}
 	return nil
 }

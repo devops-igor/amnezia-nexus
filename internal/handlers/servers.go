@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/naive"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
@@ -699,6 +700,10 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 
 	if err := protoMgr.Install(ctx, server, params); err != nil {
 		slog.Error("protocol install failed", "server_id", serverID, "protocol", req.Protocol, "port", req.Port, "err", err)
+		if errors.Is(err, naive.ErrDNSValidation) || strings.Contains(err.Error(), "pre-flight DNS validation failed") {
+			h.JSONError(w, http.StatusBadRequest, "dns_validation_failed", err.Error())
+			return
+		}
 		h.JSONError(w, http.StatusInternalServerError, "install_failed", "Failed to install protocol")
 		return
 	}
