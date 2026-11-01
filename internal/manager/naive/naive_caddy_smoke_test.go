@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -154,6 +155,23 @@ func TestCaddyRuntimeSmoke_ConfigurationValidation(t *testing.T) {
 	}
 }
 
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (n int, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel exercises the four mandatory
 // runtime behaviors of the hardened Caddy deployment in Issue #684:
 // 1. Caddy configuration validation passes for authenticated configurations.
@@ -210,7 +228,8 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, caddyBin, "run", "--adapter", "caddyfile", "--config", tmpPath)
-	var stderrBuf bytes.Buffer
+	cmd.Env = append(os.Environ(), "TRUST_STORES=none")
+	var stderrBuf safeBuffer
 	cmd.Stderr = &stderrBuf
 
 	if err := cmd.Start(); err != nil {
@@ -227,7 +246,7 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 	// Wait for Caddy to start listening on proxyPort
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
 	ready := false
-	for start := time.Now(); time.Since(start) < 5*time.Second; {
+	for start := time.Now(); time.Since(start) < 15*time.Second; {
 		conn, dialErr := net.DialTimeout("tcp", proxyAddr, 100*time.Millisecond)
 		if dialErr == nil {
 			_ = conn.Close()
@@ -237,7 +256,7 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	if !ready {
-		t.Fatalf("caddy failed to listen on %s within 5s. Stderr: %s", proxyAddr, stderrBuf.String())
+		t.Fatalf("caddy failed to listen on %s within 15s. Stderr: %s", proxyAddr, stderrBuf.String())
 	}
 
 	baseTLSConfig := &tls.Config{
