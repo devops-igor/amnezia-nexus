@@ -145,10 +145,6 @@ func (h *Handlers) MyConnectionsPageHandler(w http.ResponseWriter, r *http.Reque
 		} else if conns[i].ServerID > 0 {
 			displayConns[i].ServerName = fmt.Sprintf("Server #%d", conns[i].ServerID)
 		}
-		if models.NormalizeProtocol(conns[i].Protocol) == models.ProtocolVLESS && sess.Role != models.RoleAdmin {
-			displayConns[i].Name = safeVLESSDisplayName(conns[i].Name, conns[i].ClientID)
-			displayConns[i].ClientID = ""
-		}
 	}
 
 	vpnEnabled := h.vpnSvc != nil
