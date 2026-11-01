@@ -19,25 +19,28 @@ import (
 // testRootCAs allows in-process test fixtures to supply an ephemeral root CA
 // without altering the public New() constructor signature. In production, this
 // remains nil, prompting standard crypto/tls system root verification.
-var (
-	testRootCAs     *x509.CertPool
-	testDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
-	testResolver    *net.Resolver
-)
+var testRootCAs *x509.CertPool
 
 // SetTestRootCAs allows test harnesses outside package naive to configure an ephemeral root CA pool.
 func SetTestRootCAs(pool *x509.CertPool) {
 	testRootCAs = pool
 }
 
-// SetTestDialContext allows test harnesses to intercept outbound transport dialing.
-func SetTestDialContext(fn func(ctx context.Context, network, addr string) (net.Conn, error)) {
-	testDialContext = fn
+// Option configures optional parameters for a Dialer.
+type Option func(*Dialer)
+
+// WithDialContext overrides the transport dialing function for the Dialer.
+func WithDialContext(fn func(ctx context.Context, network, addr string) (net.Conn, error)) Option {
+	return func(d *Dialer) {
+		d.dialContext = fn
+	}
 }
 
-// SetTestResolver allows test harnesses to configure a custom DNS resolver (e.g. for AAAA-only hostnames).
-func SetTestResolver(r *net.Resolver) {
-	testResolver = r
+// WithResolver overrides the DNS resolver used by the Dialer.
+func WithResolver(r *net.Resolver) Option {
+	return func(d *Dialer) {
+		d.resolver = r
+	}
 }
 
 // h3FailureCooldown is how long DialContext skips H3 and dials H2 directly
@@ -55,10 +58,13 @@ type Dialer struct {
 	// h3CooldownUntil is a UnixNano deadline; H3 is skipped until then.
 	// The shared QUIC conn is deliberately left open so healthy sibling tunnels survive.
 	h3CooldownUntil atomic.Int64
+
+	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	resolver    *net.Resolver
 }
 
 // New constructs a new NaiveProxy Dialer with defensive input validation.
-func New(endpoint string, p models.NaiveProxyParams) (*Dialer, error) {
+func New(endpoint string, p models.NaiveProxyParams, opts ...Option) (*Dialer, error) {
 	endpoint = strings.TrimSpace(endpoint)
 	host, portStr, err := net.SplitHostPort(endpoint)
 	if err != nil {
@@ -76,7 +82,7 @@ func New(endpoint string, p models.NaiveProxyParams) (*Dialer, error) {
 	if domain == "" {
 		return nil, errors.New("naive: domain cannot be empty")
 	}
-	if strings.ContainsAny(domain, " \t\r\n:/\\") {
+	if strings.ContainsAny(domain, " 	\r\n:/\\") {
 		return nil, fmt.Errorf("naive: invalid domain name %q", domain)
 	}
 
@@ -99,6 +105,21 @@ func New(endpoint string, p models.NaiveProxyParams) (*Dialer, error) {
 		tlsCfg:   tlsCfg,
 		h2Pool:   newH2Pool(),
 		h3Pool:   newH3Pool(),
+		resolver: net.DefaultResolver,
+	}
+
+	for _, opt := range opts {
+		if opt != nil {
+			opt(d)
+		}
+	}
+
+	if d.dialContext == nil {
+		netDialer := &net.Dialer{
+			Timeout:  10 * time.Second,
+			Resolver: d.resolver,
+		}
+		d.dialContext = netDialer.DialContext
 	}
 
 	return d, nil

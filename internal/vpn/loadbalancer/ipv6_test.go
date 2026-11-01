@@ -239,4 +239,33 @@ func TestLoadBalancer_IPv6_DegradationAndFailover(t *testing.T) {
 	if sel.ID != tunIPv6.ID {
 		t.Errorf("expected recovered IPv6 tunnel %d to be selected, got %d", tunIPv6.ID, sel.ID)
 	}
+
+	// 5. Bidirectional failover: IPv4 degradation migrates session to healthy IPv6 Naive backend
+	t.Run("Failover_IPv4Degradation_MigratesToIPv6", func(t *testing.T) {
+		tunIPv4Healthy.Status = "degraded"
+		tunIPv6.Status = "active"
+		tunIPv6.ActiveConnections = 2
+		sm.AssignPeerAffinity("peer-naive-ipv4", tunIPv4Healthy.ID)
+
+		res, err := sm.HandleFailover(ctx, tunIPv4Healthy.ID, activePool, models.ProtocolNaive)
+		if err != nil {
+			t.Fatalf("HandleFailover on IPv4 degradation failed: %v", err)
+		}
+		if len(res.Migrations) != 2 {
+			t.Fatalf("expected 2 migrations (both peer-naive-ipv6 and peer-naive-ipv4), got %d", len(res.Migrations))
+		}
+		for _, mig := range res.Migrations {
+			if mig.NewBackendTunnelID != tunIPv6.ID {
+				t.Fatalf("expected migration to IPv6 backend %d, got %d", tunIPv6.ID, mig.NewBackendTunnelID)
+			}
+		}
+		aff, ok := sm.GetPeerAffinity("peer-naive-ipv4")
+		if !ok || aff != tunIPv6.ID {
+			t.Fatalf("expected peer affinity updated to IPv6 backend %d, got %d (ok=%v)", tunIPv6.ID, aff, ok)
+		}
+		aff6, ok := sm.GetPeerAffinity("peer-naive-ipv6")
+		if !ok || aff6 != tunIPv6.ID {
+			t.Fatalf("expected peer affinity updated to IPv6 backend %d, got %d (ok=%v)", tunIPv6.ID, aff6, ok)
+		}
+	})
 }
