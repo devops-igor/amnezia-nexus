@@ -32,7 +32,7 @@ func (h *Handlers) AddServerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req.Host = strings.TrimSpace(req.Host)
+	req.Host = models.NormalizeHost(req.Host)
 	req.Username = strings.TrimSpace(req.Username)
 	if req.Host == "" || req.Username == "" {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Host and username are required")
@@ -87,7 +87,7 @@ func (h *Handlers) ConfirmFingerprintHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	req.Host = strings.TrimSpace(req.Host)
+	req.Host = models.NormalizeHost(req.Host)
 	req.Username = strings.TrimSpace(req.Username)
 	req.Fingerprint = strings.TrimSpace(req.Fingerprint)
 
@@ -827,7 +827,8 @@ func (h *Handlers) GetServerReachabilityHandler(w http.ResponseWriter, r *http.R
 
 	start := time.Now()
 	// #nosec G704 -- connecting to managed server host for latency probe
-	conn, err := dialFn("tcp", net.JoinHostPort(server.Host, strconv.Itoa(sshPort)), 3*time.Second)
+	serverHost := strings.Trim(strings.TrimSpace(server.Host), "[]")
+	conn, err := dialFn("tcp", net.JoinHostPort(serverHost, strconv.Itoa(sshPort)), 3*time.Second)
 	if err == nil {
 		_ = conn.Close()
 		latencyMS = int(time.Since(start).Milliseconds())

@@ -66,6 +66,17 @@ func ValidateHost(host string) error {
 	return errors.New("host must be a valid IPv4 address or hostname")
 }
 
+// NormalizeHost strips leading and trailing brackets from IP literals so the host
+// is always stored in clean, unbracketed format.
+func NormalizeHost(host string) string {
+	h := strings.TrimSpace(host)
+	trimmed := strings.Trim(h, "[]")
+	if ip := net.ParseIP(trimmed); ip != nil {
+		return trimmed
+	}
+	return h
+}
+
 // ValidateTLSDomain checks if a TLS domain string matches permitted patterns.
 func ValidateTLSDomain(domain string) error {
 	if !TLSDomainRegex.MatchString(domain) {
@@ -168,6 +179,7 @@ func (r *AddServerRequest) Validate() error {
 	if r.SSHPort < 1 || r.SSHPort > 65535 {
 		return errors.New("ssh_port must be between 1 and 65535")
 	}
+	r.Host = NormalizeHost(r.Host)
 	if r.Host != "" {
 		return ValidateHost(r.Host)
 	}
@@ -200,15 +212,9 @@ type UpdateServerHostRequest struct {
 }
 
 func (r *UpdateServerHostRequest) Validate() error {
-	r.Host = strings.TrimSpace(r.Host)
+	r.Host = NormalizeHost(r.Host)
 	if r.Host == "" {
 		return errors.New("host cannot be empty")
-	}
-	if strings.HasPrefix(r.Host, "[") && strings.HasSuffix(r.Host, "]") {
-		inner := r.Host[1 : len(r.Host)-1]
-		if ip := net.ParseIP(inner); ip != nil {
-			r.Host = inner
-		}
 	}
 	return ValidateHost(r.Host)
 }

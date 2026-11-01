@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -118,20 +120,55 @@ func (d *Dialer) getH3Conn(ctx context.Context) (*http3.ClientConn, error) {
 	}
 }
 
+func (d *Dialer) resolveEndpointUDP(ctx context.Context) (*net.UDPAddr, error) {
+	host, portStr, err := net.SplitHostPort(d.endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("naive: invalid endpoint %q: %w", d.endpoint, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("naive: invalid endpoint port %q: %w", portStr, err)
+	}
+
+	cleanHost := strings.Trim(host, "[]")
+	if ip := net.ParseIP(cleanHost); ip != nil {
+		return &net.UDPAddr{IP: ip, Port: port}, nil
+	}
+
+	resolver := d.resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	ips, err := resolver.LookupIP(ctx, "ip", host)
+	if err != nil {
+		return nil, fmt.Errorf("naive: resolve endpoint %s: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("naive: no IP addresses found for endpoint %s", host)
+	}
+	return &net.UDPAddr{IP: ips[0], Port: port}, nil
+}
+
 func (d *Dialer) dialAndPublishH3(dialCtx context.Context, inf *h3Inflight) (*http3.ClientConn, error) {
 	defer inf.cancel()
 
-	tlsCfg := d.tlsCfg.Clone()
-	tlsCfg.NextProtos = []string{http3.NextProtoH3}
-
-	quicConn, err := quic.DialAddr(dialCtx, d.endpoint, tlsCfg, &quic.Config{
-		KeepAlivePeriod: 15 * time.Second,
-	})
+	resolvedUDP, err := d.resolveEndpointUDP(dialCtx)
+	var quicConn *quic.Conn
 	var clientConn *http3.ClientConn
 	if err != nil {
 		err = fmt.Errorf("naive: quic dial %s: %w", d.endpoint, err)
 	} else {
-		clientConn = (&http3.Transport{}).NewClientConn(quicConn)
+		tlsCfg := d.tlsCfg.Clone()
+		tlsCfg.NextProtos = []string{http3.NextProtoH3}
+
+		quicConn, err = quic.DialAddr(dialCtx, resolvedUDP.String(), tlsCfg, &quic.Config{
+			KeepAlivePeriod: 15 * time.Second,
+		})
+		if err != nil {
+			err = fmt.Errorf("naive: quic dial %s: %w", d.endpoint, err)
+		} else {
+			clientConn = (&http3.Transport{}).NewClientConn(quicConn)
+		}
 	}
 
 	p := d.h3Pool

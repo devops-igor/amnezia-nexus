@@ -332,6 +332,53 @@ func TestDialer_IPv6_AAAA_HostnameResolution(t *testing.T) {
 	verifyEchoPayload(t, conn, payloadSize, "AAAA-H2")
 }
 
+func TestDialer_IPv6_AAAA_H3_HostnameResolution(t *testing.T) {
+	echoAddr, cleanupEcho := setupTCPEchoServer(t)
+	defer cleanupEcho()
+
+	proxyAddr, cleanupH3 := setupTestH3ServerIPv6(t, "testuser", "testpass", true)
+	defer cleanupH3()
+
+	_, portStr, err := net.SplitHostPort(proxyAddr)
+	if err != nil {
+		t.Fatalf("SplitHostPort: %v", err)
+	}
+
+	const aaaaDomain = "aaaa-h3-backend.example.com"
+	resolver, cleanupDNS := setupDeterministicAAAADNS(t, aaaaDomain, net.ParseIP("::1"))
+	defer cleanupDNS()
+
+	p := models.NaiveProxyParams{
+		Username: "testuser",
+		Password: "testpass",
+		Domain:   testCamouflageDomain,
+		EnableH3: true,
+	}
+
+	d, err := New(net.JoinHostPort(aaaaDomain, portStr), p, WithResolver(resolver))
+	if err != nil {
+		t.Fatalf("New dialer with AAAA hostname for H3: %v", err)
+	}
+	defer d.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := d.DialContext(ctx, "tcp", echoAddr)
+	if err != nil {
+		t.Fatalf("DialContext through AAAA hostname with H3: %v", err)
+	}
+	defer conn.Close()
+
+	remoteAddr := conn.RemoteAddr().String()
+	if !strings.HasPrefix(remoteAddr, "[::1]:") {
+		t.Errorf("expected remote address IPv6 loopback [::1]:..., got %q", remoteAddr)
+	}
+
+	const payloadSize = 32 * 1024
+	verifyEchoPayload(t, conn, payloadSize, "AAAA-H3")
+}
+
 func TestProbeNaiveProxy_IPv6_SuccessAndFailure(t *testing.T) {
 	proxyAddr, cleanupH2 := setupTestH2ServerIPv6(t, "testuser", "testpass", true)
 	defer cleanupH2()

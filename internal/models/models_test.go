@@ -195,6 +195,14 @@ func TestAddServerRequestValidation(t *testing.T) {
 	if err := reqInvalidHost.Validate(); err == nil {
 		t.Errorf("expected error for invalid host")
 	}
+
+	reqBracketedIPv6 := AddServerRequest{Host: "[2001:db8::10]", SSHPort: 22}
+	if err := reqBracketedIPv6.Validate(); err != nil {
+		t.Errorf("unexpected error for bracketed IPv6 host: %v", err)
+	}
+	if reqBracketedIPv6.Host != "2001:db8::10" {
+		t.Errorf("expected Host to be normalized to '2001:db8::10', got %q", reqBracketedIPv6.Host)
+	}
 }
 
 func TestInstallProtocolRequestValidation(t *testing.T) {
