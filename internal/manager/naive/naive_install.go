@@ -133,6 +133,16 @@ func getTestOverrideIPs(params map[string]any) ([]net.IP, bool) {
 	return nil, false
 }
 
+func resolveHost(ctx context.Context, host string, lookupFn DNSLookupFunc, params map[string]any) ([]net.IP, error) {
+	if lookupFn != nil {
+		return lookupFn(ctx, host)
+	}
+	if overrideIPs, ok := getTestOverrideIPs(params); ok {
+		return overrideIPs, nil
+	}
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
 func (m *NaiveManager) validateDomainDNS(ctx context.Context, domain string, serverHost string, params map[string]any) error {
 	if isTestDomainOrIP(domain) {
 		return nil
@@ -142,17 +152,7 @@ func (m *NaiveManager) validateDomainDNS(ctx context.Context, domain string, ser
 	}
 
 	lookupFn := m.getDNSLookup()
-	var ips []net.IP
-	var err error
-
-	if lookupFn != nil {
-		ips, err = lookupFn(ctx, domain)
-	} else if overrideIPs, ok := getTestOverrideIPs(params); ok {
-		ips = overrideIPs
-	} else {
-		ips, err = net.DefaultResolver.LookupIP(ctx, "ip", domain)
-	}
-
+	ips, err := resolveHost(ctx, domain, lookupFn, params)
 	if err != nil {
 		return fmt.Errorf("pre-flight DNS validation failed: domain %q does not resolve to server IP %q: %w", domain, serverHost, err)
 	}
@@ -160,19 +160,42 @@ func (m *NaiveManager) validateDomainDNS(ctx context.Context, domain string, ser
 		return fmt.Errorf("pre-flight DNS validation failed: domain %q resolved to no IP addresses, expected server IP %q", domain, serverHost)
 	}
 
-	serverIP := net.ParseIP(serverHost)
 	var resolvedStrs []string
-	matched := false
 	for _, ip := range ips {
 		resolvedStrs = append(resolvedStrs, ip.String())
-		if serverIP != nil {
+	}
+
+	cleanHost := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(serverHost), "["), "]")
+	serverIP := net.ParseIP(cleanHost)
+
+	matched := false
+	if serverIP != nil {
+		for _, ip := range ips {
 			if ip.Equal(serverIP) {
 				matched = true
 				break
 			}
-		} else if strings.EqualFold(ip.String(), serverHost) {
-			matched = true
-			break
+		}
+	} else if strings.EqualFold(cleanHost, domain) {
+		matched = true
+	} else {
+		hostIPs, hostErr := resolveHost(ctx, cleanHost, lookupFn, params)
+		if hostErr != nil {
+			return fmt.Errorf("pre-flight DNS validation failed: server host %q could not be resolved: %w", serverHost, hostErr)
+		}
+		if len(hostIPs) == 0 {
+			return fmt.Errorf("pre-flight DNS validation failed: server host %q resolved to no IP addresses", serverHost)
+		}
+		for _, dIP := range ips {
+			for _, hIP := range hostIPs {
+				if dIP.Equal(hIP) {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
 		}
 	}
 

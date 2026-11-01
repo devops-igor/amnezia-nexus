@@ -2,76 +2,113 @@ package naive
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
+	"math/big"
 	"net"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/caddyserver/certmagic"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
-func TestRenderCaddyfile_ActiveProbeFallbackBlock(t *testing.T) {
-	const expectedFallback = `:443 {
-    tls internal
-    respond "Not Found" 404 {
-        close
-    }
-}`
-
+func TestRenderCaddyfile_ActiveProbeDefense(t *testing.T) {
 	tests := []struct {
-		name    string
-		port    int
-		domain  string
-		clients []NaiveClient
+		name       string
+		port       int
+		domain     string
+		clients    []NaiveClient
+		wantHeader string
+		expectSNI  string
 	}{
 		{
-			name:    "default port 443 with domain and clients",
-			port:    443,
-			domain:  "vpn.example.com",
-			clients: []NaiveClient{{Username: "u1", Password: "p1"}},
+			name:       "default port 443 with domain and clients",
+			port:       443,
+			domain:     "vpn.example.com",
+			clients:    []NaiveClient{{Username: "u1", Password: "p1"}},
+			wantHeader: ":443, vpn.example.com {",
+			expectSNI:  "vpn.example.com",
 		},
 		{
-			name:    "default port 443 with domain and zero clients",
-			port:    443,
-			domain:  "vpn.example.com",
-			clients: nil,
+			name:       "default port 443 with domain and zero clients",
+			port:       443,
+			domain:     "vpn.example.com",
+			clients:    nil,
+			wantHeader: ":443, vpn.example.com {",
+			expectSNI:  "vpn.example.com",
 		},
 		{
-			name:    "non-default port 8443 with domain and clients",
-			port:    8443,
-			domain:  "vpn.custom.org",
-			clients: []NaiveClient{{Username: "u1", Password: "p1"}},
+			name:       "non-default port 8443 with domain and clients",
+			port:       8443,
+			domain:     "vpn.custom.org",
+			clients:    []NaiveClient{{Username: "u1", Password: "p1"}},
+			wantHeader: ":8443, vpn.custom.org:8443 {",
+			expectSNI:  "vpn.custom.org",
 		},
 		{
-			name:    "non-default port 8443 with zero clients",
-			port:    8443,
-			domain:  "vpn.custom.org",
-			clients: nil,
+			name:       "non-default port 8443 with zero clients",
+			port:       8443,
+			domain:     "vpn.custom.org",
+			clients:    nil,
+			wantHeader: ":8443, vpn.custom.org:8443 {",
+			expectSNI:  "vpn.custom.org",
 		},
 		{
-			name:    "localhost domain",
-			port:    443,
-			domain:  "localhost",
-			clients: nil,
+			name:       "localhost domain",
+			port:       443,
+			domain:     "localhost",
+			clients:    nil,
+			wantHeader: ":443, localhost {",
+			expectSNI:  "localhost",
 		},
 		{
-			name:    "raw IP domain",
-			port:    443,
-			domain:  "198.51.100.42",
-			clients: nil,
+			name:       "raw IP domain",
+			port:       443,
+			domain:     "198.51.100.42",
+			clients:    nil,
+			wantHeader: ":443, 198.51.100.42 {",
+			expectSNI:  "198.51.100.42",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			rendered := RenderCaddyfile(tc.port, tc.domain, tc.clients)
-			if !strings.Contains(rendered, expectedFallback) {
-				t.Fatalf("rendered Caddyfile missing expected active-probe fallback block:\n%s\nExpected to contain:\n%s",
-					rendered, expectedFallback)
+
+			// 1. Must contain global options with fallback SNI for TLS probing defense
+			wantDefaultSNI := fmt.Sprintf("default_sni %s", tc.expectSNI)
+			wantFallbackSNI := fmt.Sprintf("fallback_sni %s", tc.expectSNI)
+			if !strings.Contains(rendered, wantDefaultSNI) || !strings.Contains(rendered, wantFallbackSNI) {
+				t.Fatalf("rendered Caddyfile missing global default/fallback SNI for %q:\n%s", tc.expectSNI, rendered)
 			}
 
-			// Validate token quotes and brace balance
+			// 2. Must contain hostless listener address in site header to accept arbitrary CONNECT authorities
+			if !strings.Contains(rendered, tc.wantHeader) {
+				t.Fatalf("rendered Caddyfile missing expected site header %q:\n%s", tc.wantHeader, rendered)
+			}
+
+			// 3. Must contain in-route @rawProbe defense
+			wantRawProbe := fmt.Sprintf("@rawProbe {\n            not method CONNECT\n            not host %s\n        }", tc.expectSNI)
+			if !strings.Contains(rendered, wantRawProbe) {
+				t.Fatalf("rendered Caddyfile missing in-route @rawProbe matcher:\n%s\nExpected:\n%s", rendered, wantRawProbe)
+			}
+			const wantRawProbeHandle = `handle @rawProbe {
+            respond "Not Found" 404 {
+                close
+            }
+        }`
+			if !strings.Contains(rendered, wantRawProbeHandle) {
+				t.Fatalf("rendered Caddyfile missing in-route handle @rawProbe:\n%s", rendered)
+			}
+
+			// 4. Validate token quotes and brace balance
 			if err := validateCaddyfileTokens(rendered); err != nil {
 				t.Errorf("token validation failed: %v", err)
 			}
@@ -144,10 +181,10 @@ func TestRenderCaddyfile_TestDomainsEmitTLSInternal(t *testing.T) {
 	for _, d := range testDomains {
 		t.Run("test domain: "+d, func(t *testing.T) {
 			rendered := RenderCaddyfile(443, d, nil)
-			// In test domains, tls internal MUST be present in BOTH fallback block and site block
+			// In test domains, tls internal MUST be present in the site block
 			count := strings.Count(rendered, "tls internal")
-			if count < 2 {
-				t.Fatalf("expected at least 2 'tls internal' occurrences (fallback + site block) for %q, got %d:\n%s",
+			if count != 1 {
+				t.Fatalf("expected exactly 1 'tls internal' occurrence in site block for %q, got %d:\n%s",
 					d, count, rendered)
 			}
 		})
@@ -163,10 +200,10 @@ func TestRenderCaddyfile_TestDomainsEmitTLSInternal(t *testing.T) {
 	for _, d := range publicDomains {
 		t.Run("public domain: "+d, func(t *testing.T) {
 			rendered := RenderCaddyfile(443, d, nil)
-			// For public domains, tls internal MUST only appear ONCE (inside the :443 fallback block)
+			// For public domains, tls internal MUST NOT be emitted (Let's Encrypt / ZeroSSL automated)
 			count := strings.Count(rendered, "tls internal")
-			if count != 1 {
-				t.Fatalf("public domain %q must not emit tls internal in site block (expected count 1 for fallback only, got %d):\n%s",
+			if count != 0 {
+				t.Fatalf("public domain %q must not emit tls internal (expected 0, got %d):\n%s",
 					d, count, rendered)
 			}
 		})
@@ -443,6 +480,99 @@ func TestPreFlightDNSValidation(t *testing.T) {
 			t.Errorf("unexpected error format: %v", err)
 		}
 	})
+
+	t.Run("server host as same hostname as domain passes without DNS query", func(t *testing.T) {
+		mockSSH := newMockNaiveSSHClient()
+		mgr := NewNaiveManagerWithServerLocks(&mockNaivePool{client: mockSSH}, awg.NewServerLockRegistry())
+		mgr.SetDNSLookup(func(ctx context.Context, host string) ([]net.IP, error) {
+			if host == "vpn.operator.net" {
+				return []net.IP{net.ParseIP("198.51.100.50")}, nil
+			}
+			return nil, errors.New("unexpected lookup")
+		})
+
+		server := &models.Server{ID: 110, Host: "vpn.operator.net", SSHPort: 22}
+		params := map[string]any{
+			"port": 443,
+			"naive_options": map[string]any{
+				"domain": "vpn.operator.net",
+			},
+		}
+
+		err := mgr.Install(ctx, server, params)
+		if err != nil {
+			t.Fatalf("Install should succeed when server.Host matches domain: %v", err)
+		}
+	})
+
+	t.Run("server host as hostname alias resolving to same IP succeeds", func(t *testing.T) {
+		mockSSH := newMockNaiveSSHClient()
+		mgr := NewNaiveManagerWithServerLocks(&mockNaivePool{client: mockSSH}, awg.NewServerLockRegistry())
+		mgr.SetDNSLookup(func(ctx context.Context, host string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("198.51.100.50")}, nil
+		})
+
+		server := &models.Server{ID: 111, Host: "node.operator.net", SSHPort: 22}
+		params := map[string]any{
+			"port": 443,
+			"naive_options": map[string]any{
+				"domain": "vpn.operator.net",
+			},
+		}
+
+		err := mgr.Install(ctx, server, params)
+		if err != nil {
+			t.Fatalf("Install should succeed when hostname resolves to same IP: %v", err)
+		}
+	})
+
+	t.Run("server host as bracketed IPv6 resolving to same IP succeeds", func(t *testing.T) {
+		mockSSH := newMockNaiveSSHClient()
+		mgr := NewNaiveManagerWithServerLocks(&mockNaivePool{client: mockSSH}, awg.NewServerLockRegistry())
+		mgr.SetDNSLookup(func(ctx context.Context, host string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("2001:db8::50")}, nil
+		})
+
+		server := &models.Server{ID: 112, Host: "[2001:db8::50]", SSHPort: 22}
+		params := map[string]any{
+			"port": 443,
+			"naive_options": map[string]any{
+				"domain": "vpn.operator.net",
+			},
+		}
+
+		err := mgr.Install(ctx, server, params)
+		if err != nil {
+			t.Fatalf("Install should succeed for bracketed IPv6: %v", err)
+		}
+	})
+
+	t.Run("server host as hostname alias resolving to different IP fails", func(t *testing.T) {
+		mockSSH := newMockNaiveSSHClient()
+		mgr := NewNaiveManagerWithServerLocks(&mockNaivePool{client: mockSSH}, awg.NewServerLockRegistry())
+		mgr.SetDNSLookup(func(ctx context.Context, host string) ([]net.IP, error) {
+			if host == "vpn.operator.net" {
+				return []net.IP{net.ParseIP("198.51.100.50")}, nil
+			}
+			return []net.IP{net.ParseIP("198.51.100.99")}, nil
+		})
+
+		server := &models.Server{ID: 113, Host: "node.operator.net", SSHPort: 22}
+		params := map[string]any{
+			"port": 443,
+			"naive_options": map[string]any{
+				"domain": "vpn.operator.net",
+			},
+		}
+
+		err := mgr.Install(ctx, server, params)
+		if err == nil {
+			t.Fatalf("expected Install to fail for mismatched hostname IP")
+		}
+		if !strings.Contains(err.Error(), "pre-flight DNS validation failed") {
+			t.Errorf("error must mention pre-flight DNS validation failed, got: %v", err)
+		}
+	})
 }
 
 func TestParseCaddyfile_HardenedStructureRoundTrip(t *testing.T) {
@@ -488,7 +618,7 @@ func TestParseCaddyfile_HardenedStructureRoundTrip(t *testing.T) {
 		t.Errorf("8443 clients mismatch: %+v", clients8443)
 	}
 
-	// 4. Client additions and removals preserve fallback block and header camouflage
+	// 4. Client additions and removals preserve probe hardening and header camouflage
 	mockSSH := newMockNaiveSSHClient()
 	mgr := NewNaiveManagerWithServerLocks(&mockNaivePool{client: mockSSH}, awg.NewServerLockRegistry())
 	server := &models.Server{ID: 200, Host: "198.51.100.200", SSHPort: 22}
@@ -505,8 +635,14 @@ func TestParseCaddyfile_HardenedStructureRoundTrip(t *testing.T) {
 	}
 
 	afterAdd := string(mockSSH.files[NaiveCaddyfilePath])
-	if !strings.Contains(afterAdd, ":443 {\n    tls internal\n    respond \"Not Found\" 404") {
-		t.Errorf("AddClient corrupted fallback block:\n%s", afterAdd)
+	if !strings.Contains(afterAdd, "default_sni vpn.prod.org") || !strings.Contains(afterAdd, "fallback_sni vpn.prod.org") {
+		t.Errorf("AddClient corrupted global SNI settings:\n%s", afterAdd)
+	}
+	if !strings.Contains(afterAdd, ":443, vpn.prod.org {") {
+		t.Errorf("AddClient corrupted site header:\n%s", afterAdd)
+	}
+	if !strings.Contains(afterAdd, "@rawProbe {") || !strings.Contains(afterAdd, "handle @rawProbe {") {
+		t.Errorf("AddClient corrupted @rawProbe handler:\n%s", afterAdd)
 	}
 	if !strings.Contains(afterAdd, "-Server") || !strings.Contains(afterAdd, "-Alt-Svc") {
 		t.Errorf("AddClient stripped header camouflage:\n%s", afterAdd)
@@ -519,10 +655,137 @@ func TestParseCaddyfile_HardenedStructureRoundTrip(t *testing.T) {
 	}
 
 	afterRemove := string(mockSSH.files[NaiveCaddyfilePath])
-	if !strings.Contains(afterRemove, ":443 {\n    tls internal\n    respond \"Not Found\" 404") {
-		t.Errorf("RemoveClient corrupted fallback block:\n%s", afterRemove)
+	if !strings.Contains(afterRemove, "default_sni vpn.prod.org") || !strings.Contains(afterRemove, "fallback_sni vpn.prod.org") {
+		t.Errorf("RemoveClient corrupted global SNI settings:\n%s", afterRemove)
+	}
+	if !strings.Contains(afterRemove, ":443, vpn.prod.org {") {
+		t.Errorf("RemoveClient corrupted site header:\n%s", afterRemove)
+	}
+	if !strings.Contains(afterRemove, "@rawProbe {") || !strings.Contains(afterRemove, "handle @rawProbe {") {
+		t.Errorf("RemoveClient corrupted @rawProbe handler:\n%s", afterRemove)
 	}
 	if !strings.Contains(afterRemove, "-Server") || !strings.Contains(afterRemove, "-Alt-Svc") {
 		t.Errorf("RemoveClient stripped header camouflage:\n%s", afterRemove)
+	}
+}
+
+func TestAuditEquivalent_ValidHostnameServerInstall(t *testing.T) {
+	for _, tc := range []struct{ name, host, ip string }{
+		{"IPv4_control", "198.51.100.50", "198.51.100.50"},
+		{"hostname_same_as_domain", "vpn.operator.net", "198.51.100.50"},
+		{"hostname_alias", "node.operator.net", "198.51.100.50"},
+		{"IPv6_control", "2001:db8::50", "2001:db8::50"},
+		{"bracketed_IPv6", "[2001:db8::50]", "2001:db8::50"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := models.ValidateHost(tc.host); err != nil {
+				t.Fatal(err)
+			}
+			mock := newMockNaiveSSHClient()
+			mgr := NewNaiveManagerWithServerLocks(&mockNaivePool{client: mock}, awg.NewServerLockRegistry())
+			mgr.SetDNSLookup(func(ctx context.Context, host string) ([]net.IP, error) {
+				return []net.IP{net.ParseIP(tc.ip)}, nil
+			})
+			server := &models.Server{ID: 684, Host: tc.host, SSHPort: 22}
+			err := mgr.Install(context.Background(), server, map[string]any{
+				"port": 443,
+				"naive_options": &models.NaiveInstallOptions{
+					Domain: "vpn.operator.net",
+				},
+			})
+			if err != nil {
+				t.Fatalf("valid server host and matching DNS must install: %v", err)
+			}
+		})
+	}
+}
+
+func TestAuditEquivalent_ProxySiteMustAcceptCONNECTAuthority(t *testing.T) {
+	for _, port := range []int{443, 8443} {
+		t.Run(fmt.Sprintf("port_%d", port), func(t *testing.T) {
+			rendered := RenderCaddyfile(port, "vpn.operator.net", []NaiveClient{{Username: "audit", Password: "fixture-only"}})
+			depth := 0
+			site := ""
+			for _, line := range strings.Split(rendered, "\n") {
+				trim := strings.TrimSpace(line)
+				if depth == 0 && strings.HasSuffix(trim, "{") {
+					site = strings.TrimSpace(strings.TrimSuffix(trim, "{"))
+				}
+				if strings.HasPrefix(trim, "forward_proxy") {
+					catchall := false
+					for _, addr := range strings.Split(site, ",") {
+						if strings.HasPrefix(strings.TrimSpace(addr), ":") {
+							catchall = true
+						}
+					}
+					if !catchall {
+						t.Errorf("proxy site only matches its own domain; destination-authority CONNECT cannot enter this route")
+					}
+				}
+				depth += strings.Count(trim, "{") - strings.Count(trim, "}")
+			}
+		})
+	}
+}
+
+type auditEquivalentConn struct{ net.Conn }
+
+func (auditEquivalentConn) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("198.51.100.50"), Port: 443}
+}
+func (auditEquivalentConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("192.0.2.20"), Port: 50000}
+}
+
+func TestAuditEquivalent_TLSCertificateSelection(t *testing.T) {
+	var cfg *certmagic.Config
+	cache := certmagic.NewCache(certmagic.CacheOptions{GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) { return cfg, nil }})
+	defer cache.Stop()
+	cfg = certmagic.New(cache, certmagic.Config{})
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(684),
+		DNSNames:     []string{"vpn.operator.net"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cfg.CacheUnmanagedTLSCertificate(context.Background(), tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello := func(name string) *tls.ClientHelloInfo {
+		return &tls.ClientHelloInfo{
+			ServerName:        name,
+			Conn:              auditEquivalentConn{},
+			SupportedVersions: []uint16{tls.VersionTLS13},
+			SignatureSchemes:  []tls.SignatureScheme{tls.Ed25519},
+			CipherSuites:      []uint16{tls.TLS_AES_128_GCM_SHA256},
+		}
+	}
+	if _, err := cfg.GetCertificateWithContext(context.Background(), hello("vpn.operator.net")); err != nil {
+		t.Fatalf("configured-name control: %v", err)
+	}
+	for _, sni := range []string{"", "random.operator.net"} {
+		_, err := cfg.GetCertificateWithContext(context.Background(), hello(sni))
+		if err == nil {
+			t.Fatalf("expected absent certificate for unmatched SNI=%q", sni)
+		}
+	}
+	cfg.DefaultServerName = "vpn.operator.net"
+	cfg.FallbackServerName = "vpn.operator.net"
+	for _, sni := range []string{"", "random.operator.net"} {
+		_, err := cfg.GetCertificateWithContext(context.Background(), hello(sni))
+		if err != nil {
+			t.Fatalf("fallback control failed: %v", err)
+		}
 	}
 }

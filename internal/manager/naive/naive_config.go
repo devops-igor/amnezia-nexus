@@ -71,29 +71,28 @@ func RenderCaddyfile(port int, domain string, clients []NaiveClient) string {
 		port = 443
 	}
 	domain = strings.TrimSpace(domain)
+	domain = strings.TrimPrefix(strings.TrimPrefix(domain, "https://"), "http://")
+	if host, _, err := net.SplitHostPort(domain); err == nil && host != "" {
+		domain = host
+	}
+	domain = strings.Trim(domain, "[]")
 	if domain == "" || domain == ":443" || domain == "443" {
 		domain = "localhost"
 	}
 
 	var sb strings.Builder
-	// Global options: enable loopback admin for caddy reload
+	// Global options: enable loopback admin for caddy reload and fallback SNI for raw IP probes
 	sb.WriteString("{\n")
 	sb.WriteString("    admin 127.0.0.1:2019\n")
+	fmt.Fprintf(&sb, "    default_sni %s\n", domain)
+	fmt.Fprintf(&sb, "    fallback_sni %s\n", domain)
 	sb.WriteString("}\n\n")
 
-	// Default fallback catch-all block on port 443 for active-probing defense
-	sb.WriteString(":443 {\n")
-	sb.WriteString("    tls internal\n")
-	sb.WriteString("    respond \"Not Found\" 404 {\n")
-	sb.WriteString("        close\n")
-	sb.WriteString("    }\n")
-	sb.WriteString("}\n\n")
-
-	// Domain and port block
+	// Hostless listener combined with domain ensures arbitrary destination CONNECT requests are accepted
 	if port > 0 && port != 443 {
 		fmt.Fprintf(&sb, ":%d, %s:%d {\n", port, domain, port)
 	} else {
-		fmt.Fprintf(&sb, "%s {\n", domain)
+		fmt.Fprintf(&sb, ":443, %s {\n", domain)
 	}
 
 	if isTestDomainOrIP(domain) {
@@ -106,6 +105,15 @@ func RenderCaddyfile(port int, domain string, clients []NaiveClient) string {
 	sb.WriteString("    }\n")
 
 	sb.WriteString("    route {\n")
+	sb.WriteString("        @rawProbe {\n")
+	sb.WriteString("            not method CONNECT\n")
+	fmt.Fprintf(&sb, "            not host %s\n", domain)
+	sb.WriteString("        }\n")
+	sb.WriteString("        handle @rawProbe {\n")
+	sb.WriteString("            respond \"Not Found\" 404 {\n")
+	sb.WriteString("                close\n")
+	sb.WriteString("            }\n")
+	sb.WriteString("        }\n")
 
 	validClients := make([]NaiveClient, 0, len(clients))
 	for _, c := range clients {
