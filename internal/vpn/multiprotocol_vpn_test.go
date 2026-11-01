@@ -380,7 +380,7 @@ func TestService_EnableBackendWithConfig_ProxyBootstrapResolvesProtocol_VLESS(t 
 			"vless": map[string]any{
 				"installed":   true,
 				"port":        443,
-				"server_name": "gateway.icloud.com",
+				"server_name": "www.microsoft.com",
 				"flow":        "xtls-rprx-vision",
 			},
 		},

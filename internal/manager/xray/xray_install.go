@@ -43,7 +43,7 @@ func resolveInstallNetworkOptions(params map[string]any) (int, string, string, b
 		}
 	}
 
-	serverName := "gateway.icloud.com"
+	serverName := DefaultDecoyDomain
 	hasServerName := false
 	flow := "xtls-rprx-vision"
 	hasFlow := false
@@ -157,6 +157,15 @@ func resolveInstallProfileParam(ctx context.Context, client ssh.SSHClient, param
 
 func parseXrayInstallOptions(ctx context.Context, client ssh.SSHClient, params map[string]any, server *models.Server) (int, string, string, bool, bool, bool, EngineProfileInfo, error) {
 	portPrimary, serverName, flow, hasPort, hasServerName, hasFlow := resolveInstallNetworkOptions(params)
+	if hasServerName {
+		serverHost := ""
+		if server != nil {
+			serverHost = server.Host
+		}
+		if err := ValidateDecoyDomain(serverName, serverHost, nil); err != nil {
+			return 0, "", "", false, false, false, EngineProfileInfo{}, err
+		}
+	}
 	profileParam := resolveInstallProfileParam(ctx, client, params, server)
 	profile, err := ResolveEngineProfile(profileParam)
 	if err != nil {
@@ -190,11 +199,12 @@ func (m *XrayManager) resolveRealityCredentials(
 		if genErr != nil {
 			return "", "", "", nil, nil, nil, nil, fmt.Errorf("generate reality keypair: %w", genErr)
 		}
-		shortID, genErr := GenerateShortID()
+		shortIDs, genErr := GenerateShortIDPool(8)
 		if genErr != nil {
-			return "", "", "", nil, nil, nil, nil, fmt.Errorf("generate short ID: %w", genErr)
+			return "", "", "", nil, nil, nil, nil, fmt.Errorf("generate short ID pool: %w", genErr)
 		}
-		return privB64, pubB64, shortID, []string{shortID}, []XrayClient{}, nil, nil, nil
+		shortID := shortIDs[0]
+		return privB64, pubB64, shortID, shortIDs, []XrayClient{}, nil, nil, nil
 	}
 
 	catCmd := fmt.Sprintf("cat %s 2>/dev/null", ssh.EscapeShellArg(XrayConfigPath))
@@ -244,11 +254,11 @@ func (m *XrayManager) resolveRealityCredentials(
 		shortID = shortIDs[0]
 	} else {
 		var genErr error
-		shortID, genErr = GenerateShortID()
+		shortIDs, genErr = GenerateShortIDPool(8)
 		if genErr != nil {
-			return "", "", "", nil, nil, nil, nil, fmt.Errorf("generate short ID: %w", genErr)
+			return "", "", "", nil, nil, nil, nil, fmt.Errorf("generate short ID pool: %w", genErr)
 		}
-		shortIDs = []string{shortID}
+		shortID = shortIDs[0]
 	}
 
 	clients := inbound.Settings.Clients
@@ -741,6 +751,8 @@ func updateExistingConfig(existingCfgBytes []byte, portPrimary int, serverName, 
 		return nil, fmt.Errorf("unmarshal existing xray config: %w", err)
 	}
 	if inbounds, ok := doc["inbounds"].([]any); ok && len(inbounds) > 0 {
+		// Strictly enforce single inbound on portPrimary, removing auxiliary REALITY inbounds
+		doc["inbounds"] = inbounds[:1]
 		if in0, ok := inbounds[0].(map[string]any); ok {
 			if portChanged {
 				in0["port"] = portPrimary
@@ -893,6 +905,10 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	protoMeta["server_name"] = serverName
 	protoMeta["public_key"] = pubB64
 	protoMeta["short_id"] = shortID
+	protoMeta["short_ids"] = shortIDs
+	if mux, ok := parseMuxParam(params); ok {
+		protoMeta["mux"] = mux
+	}
 	protoMeta["flow"] = flow
 	protoMeta["engine_profile"] = string(profile.Name)
 	protoMeta["engine_version"] = profile.Version
@@ -976,4 +992,34 @@ func netJoinHostPort(host, port string) string {
 		return host
 	}
 	return fmt.Sprintf("%s:%s", host, port)
+}
+
+func parseMuxParam(params map[string]any) (bool, bool) {
+	if params == nil {
+		return false, false
+	}
+	if m, ok := params["mux"].(bool); ok {
+		return m, true
+	}
+	if m, ok := params["mux"].(string); ok {
+		return strings.EqualFold(m, "true"), true
+	}
+	switch vo := params["vless_options"].(type) {
+	case map[string]any:
+		if m, ok := vo["mux"].(bool); ok {
+			return m, true
+		}
+		if m, ok := vo["mux"].(string); ok {
+			return strings.EqualFold(m, "true"), true
+		}
+	case *models.VLESSInstallOptions:
+		if vo != nil && vo.Mux != nil {
+			return *vo.Mux, true
+		}
+	case models.VLESSInstallOptions:
+		if vo.Mux != nil {
+			return *vo.Mux, true
+		}
+	}
+	return false, false
 }

@@ -105,7 +105,7 @@ func extractProxyParamsFromManagerResult(proto string, res map[string]any, srv .
 		shortID, _ := res["short_id"].(string)
 		serverName, _ := res["server_name"].(string)
 		if serverName == "" {
-			serverName = "gateway.icloud.com"
+			serverName = "www.microsoft.com"
 		}
 		engineProfile, _ := res["engine_profile"].(string)
 		if engineProfile == "" && len(srv) > 0 && srv[0] != nil {

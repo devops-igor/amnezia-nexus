@@ -219,7 +219,7 @@ func TestVPNEnableBackendHandler_ProxyBootstrap_VLESS(t *testing.T) {
 			"vless": map[string]any{
 				"installed":   true,
 				"port":        443,
-				"server_name": "gateway.icloud.com",
+				"server_name": "www.microsoft.com",
 				"flow":        "xtls-rprx-vision",
 			},
 		},
@@ -237,7 +237,7 @@ func TestVPNEnableBackendHandler_ProxyBootstrap_VLESS(t *testing.T) {
 				"flow":        "xtls-rprx-vision",
 				"public_key":  "e-JgU2X7X8aH1pQ1pZqUuWbWw5K2s6J8f8gH9jK1lM4",
 				"short_id":    "0123456789abcdef",
-				"server_name": "gateway.icloud.com",
+				"server_name": "www.microsoft.com",
 			}, nil
 		},
 	})
@@ -319,7 +319,7 @@ func TestVPNEnableBackendHandler_ProxyDisabled_RejectsWithoutProvisioning(t *tes
 			"vless": map[string]any{
 				"installed":   true,
 				"port":        443,
-				"server_name": "gateway.icloud.com",
+				"server_name": "www.microsoft.com",
 				"flow":        "xtls-rprx-vision",
 			},
 		},
@@ -338,7 +338,7 @@ func TestVPNEnableBackendHandler_ProxyDisabled_RejectsWithoutProvisioning(t *tes
 				"flow":        "xtls-rprx-vision",
 				"public_key":  "e-JgU2X7X8aH1pQ1pZqUuWbWw5K2s6J8f8gH9jK1lM4",
 				"short_id":    "0123456789abcdef",
-				"server_name": "gateway.icloud.com",
+				"server_name": "www.microsoft.com",
 			}, nil
 		},
 	})
@@ -370,7 +370,7 @@ func TestVPNEnableBackendHandler_ProxyDisabled_RejectsWithoutProvisioning(t *tes
 		UUID:       "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
 		PublicKey:  "e-JgU2X7X8aH1pQ1pZqUuWbWw5K2s6J8f8gH9jK1lM4",
 		ShortID:    "0123456789abcdef",
-		ServerName: "gateway.icloud.com",
+		ServerName: "www.microsoft.com",
 		Flow:       "xtls-rprx-vision",
 	}
 	pRaw, _ := json.Marshal(vlessParams)

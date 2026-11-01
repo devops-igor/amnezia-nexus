@@ -28,7 +28,7 @@ func TestXrayManagerReinstallPreservesEmptyFirstShortIDs(t *testing.T) {
 		t.Fatalf("GenerateRealityKeypair: %v", err)
 	}
 	want := []string{"", "aabb"}
-	config, err := RenderXrayConfig(443, 54321, "gateway.icloud.com", "", privateKey, want, []XrayClient{})
+	config, err := RenderXrayConfig(443, 54321, "www.microsoft.com", "", privateKey, want, []XrayClient{})
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestXrayManagerProfileSwitchPreservesCustomPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateRealityKeypair: %v", err)
 	}
-	config, err := RenderXrayConfig(8443, 54321, "gateway.icloud.com", "", privateKey, []string{"0123456789abcdef"}, []XrayClient{})
+	config, err := RenderXrayConfig(8443, 54321, "www.microsoft.com", "", privateKey, []string{"0123456789abcdef"}, []XrayClient{})
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestXrayManagerUnprofiledExistingInstallation_ResolvesModernPQ(t *testing.T
 	if err != nil {
 		t.Fatalf("GenerateRealityKeypair: %v", err)
 	}
-	config, err := RenderXrayConfig(443, 54321, "gateway.icloud.com", "", privateKey, []string{"0123456789abcdef"}, []XrayClient{})
+	config, err := RenderXrayConfig(443, 54321, "www.microsoft.com", "", privateKey, []string{"0123456789abcdef"}, []XrayClient{})
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestXrayManagerLaunchContainer_RollbackOnFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateRealityKeypair: %v", err)
 	}
-	config, err := RenderXrayConfig(443, 54321, "gateway.icloud.com", "", privateKey, []string{"0123456789abcdef"}, []XrayClient{})
+	config, err := RenderXrayConfig(443, 54321, "www.microsoft.com", "", privateKey, []string{"0123456789abcdef"}, []XrayClient{})
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}

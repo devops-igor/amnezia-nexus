@@ -289,7 +289,7 @@ func TestXrayConfig_CryptoAndURI(t *testing.T) {
 	clients := []XrayClient{
 		{ID: "c1-uuid", Flow: "xtls-rprx-vision", Email: "alice"},
 	}
-	cfgBytes, err := RenderXrayConfig(443, 54321, "gateway.icloud.com", "gateway.icloud.com:443", privB64, []string{sid}, clients)
+	cfgBytes, err := RenderXrayConfig(443, 54321, "www.microsoft.com", "www.microsoft.com:443", privB64, []string{sid}, clients)
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -308,18 +308,23 @@ func TestXrayConfig_CryptoAndURI(t *testing.T) {
 	if _, ok := rawMap["dns"]; ok {
 		t.Errorf("expected rendered config to omit 'dns' block, but 'dns' key was present")
 	}
-	if len(parsed.Inbounds) != 2 {
-		t.Fatalf("expected 2 inbounds, got %d", len(parsed.Inbounds))
+	if len(parsed.Inbounds) != 1 {
+		t.Fatalf("expected 1 inbound (single-port 443), got %d", len(parsed.Inbounds))
 	}
-	if parsed.Inbounds[0].Port != 443 || parsed.Inbounds[1].Port != 54321 {
-		t.Errorf("inbound ports mismatch: %d, %d", parsed.Inbounds[0].Port, parsed.Inbounds[1].Port)
+	if parsed.Inbounds[0].Port != 443 {
+		t.Errorf("expected inbound port 443, got %d", parsed.Inbounds[0].Port)
+	}
+	for _, in := range parsed.Inbounds {
+		if in.Port == 54321 {
+			t.Errorf("auxiliary port 54321 must not be present in inbounds")
+		}
 	}
 	if len(parsed.Inbounds[0].Settings.Clients) != 1 {
 		t.Errorf("expected 1 client in inbound 0, got %d", len(parsed.Inbounds[0].Settings.Clients))
 	}
 
 	// Build URI
-	uri, err := BuildVLESSURI("203.0.113.1", 443, "test-uuid", "bob", "gateway.icloud.com", pubB64, sid, "xtls-rprx-vision")
+	uri, err := BuildVLESSURI("203.0.113.1", 443, "test-uuid", "bob", "www.microsoft.com", pubB64, sid, "xtls-rprx-vision")
 	if err != nil {
 		t.Fatalf("BuildVLESSURI: %v", err)
 	}
@@ -361,7 +366,7 @@ func TestXrayManager_Lifecycle(t *testing.T) {
 		"port": 443,
 		"vless_options": models.VLESSInstallOptions{
 			Port:       "443",
-			ServerName: "gateway.icloud.com",
+			ServerName: "www.microsoft.com",
 			Flow:       "xtls-rprx-vision",
 		},
 	}
@@ -751,7 +756,7 @@ func TestXrayManager_ReinstallPreservesClientsAndKeys(t *testing.T) {
 		"port": 443,
 		"vless_options": models.VLESSInstallOptions{
 			Port:       "443",
-			ServerName: "gateway.icloud.com",
+			ServerName: "www.microsoft.com",
 			Flow:       "xtls-rprx-vision",
 		},
 	}
@@ -837,7 +842,7 @@ func TestXrayManager_StandardVLESS_EmptyFlow(t *testing.T) {
 		"port": 443,
 		"vless_options": map[string]any{
 			"port":        "443",
-			"server_name": "gateway.icloud.com",
+			"server_name": "www.microsoft.com",
 			"flow":        "",
 		},
 	}
