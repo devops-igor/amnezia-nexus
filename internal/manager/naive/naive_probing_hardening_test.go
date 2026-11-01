@@ -6,11 +6,12 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
 	"net"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -887,52 +888,6 @@ func TestAuditEquivalent_TLSCertificateSelection(t *testing.T) {
 	}
 }
 
-func adaptCaddyfileToJSON(content string) ([]byte, error) {
-	if err := validateCaddyfileStructure(content); err != nil {
-		return nil, fmt.Errorf("caddyfile structure invalid: %w", err)
-	}
-	domain, port, clients, err := ParseCaddyfile(content)
-	if err != nil {
-		return nil, fmt.Errorf("caddyfile parse failed: %w", err)
-	}
-	routes := []map[string]any{
-		{"handle": []map[string]any{{"handler": "headers", "response": map[string]any{"delete": []string{"Server", "Alt-Svc"}}}}},
-		{
-			"match":  []map[string]any{{"not": []map[string]any{{"method": []string{"CONNECT"}}, {"host": []string{domain}}}}},
-			"handle": []map[string]any{{"handler": "static_response", "status_code": 404, "close": true}},
-		},
-	}
-	if len(clients) > 0 && strings.Contains(content, "forward_proxy") {
-		routes = append(routes, map[string]any{"handle": []map[string]any{{"handler": "forward_proxy", "probe_resistance": true}}})
-	}
-	routes = append(routes, map[string]any{"handle": []map[string]any{{"handler": "file_server", "root": "/srv"}}})
-
-	cfg := map[string]any{
-		"admin": map[string]any{"listen": "127.0.0.1:2019"},
-		"apps": map[string]any{
-			"http": map[string]any{
-				"servers": map[string]any{
-					"srv0": map[string]any{
-						"listen":    []string{fmt.Sprintf(":%d", port)},
-						"protocols": []string{"h1", "h2"},
-						"routes":    routes,
-						"errors": map[string]any{
-							"routes": []map[string]any{{
-								"handle": []map[string]any{
-									{"handler": "headers", "response": map[string]any{"delete": []string{"Server", "Alt-Svc"}}},
-									{"handler": "static_response", "status_code": "{err.status_code}"},
-								},
-							}},
-						},
-						"tls_connection_policies": []map[string]any{{"default_sni": domain, "fallback_sni": domain}},
-					},
-				},
-			},
-		},
-	}
-	return json.MarshalIndent(cfg, "", "  ")
-}
-
 func TestCaddyConfigurationAdaptation_RouteStructureAndProbeDefense(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -948,47 +903,52 @@ func TestCaddyConfigurationAdaptation_RouteStructureAndProbeDefense(t *testing.T
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			caddyfile := RenderCaddyfile(tc.port, tc.domain, tc.clients)
-			data, err := adaptCaddyfileToJSON(caddyfile)
-			if err != nil || !json.Valid(data) {
-				t.Fatalf("adaptation failed: %v", err)
+			if err := validateCaddyfileStructure(caddyfile); err != nil {
+				t.Fatalf("caddyfile structure invalid: %v", err)
 			}
-			var parsed struct {
-				Apps struct {
-					HTTP struct {
-						Servers map[string]struct {
-							Protocols []string                    `json:"protocols"`
-							Routes    []map[string]any            `json:"routes"`
-							Errors    map[string][]map[string]any `json:"errors"`
-						} `json:"servers"`
-					} `json:"http"`
-				} `json:"apps"`
+			parsedDomain, parsedPort, parsedClients, err := ParseCaddyfile(caddyfile)
+			if err != nil {
+				t.Fatalf("caddyfile parse failed: %v", err)
 			}
-			if err := json.Unmarshal(data, &parsed); err != nil {
-				t.Fatalf("unmarshal adapted JSON failed: %v", err)
+			if parsedDomain != tc.domain || parsedPort != tc.port || len(parsedClients) != len(tc.clients) {
+				t.Errorf("parsed config mismatch: domain=%s port=%d clients=%d", parsedDomain, parsedPort, len(parsedClients))
 			}
-			srv := parsed.Apps.HTTP.Servers["srv0"]
-			if len(srv.Protocols) != 2 || srv.Protocols[0] != "h1" || srv.Protocols[1] != "h2" {
-				t.Errorf("expected protocols [h1 h2], got: %v", srv.Protocols)
+			if !strings.Contains(caddyfile, "protocols h1 h2") {
+				t.Error("rendered Caddyfile missing protocols h1 h2 restriction")
 			}
-			hasRawProbe, hasProxy := false, false
-			for _, r := range srv.Routes {
-				if r["match"] != nil {
-					hasRawProbe = true
-				}
-				for _, h := range r["handle"].([]any) {
-					if h.(map[string]any)["handler"] == "forward_proxy" {
-						hasProxy = true
-					}
-				}
+			rawProbeIdx := strings.Index(caddyfile, "@rawProbe")
+			fileServerIdx := strings.Index(caddyfile, "file_server")
+			if rawProbeIdx == -1 || fileServerIdx == -1 || rawProbeIdx > fileServerIdx {
+				t.Errorf("route ordering invalid: @rawProbe=%d file_server=%d", rawProbeIdx, fileServerIdx)
 			}
-			if !hasRawProbe {
-				t.Error("adapted route structure missing @rawProbe")
-			}
+			hasProxy := strings.Contains(caddyfile, "forward_proxy")
 			if tc.expectAuth != hasProxy {
 				t.Errorf("expected forward_proxy=%t, got %t", tc.expectAuth, hasProxy)
 			}
-			if len(srv.Errors["routes"]) == 0 {
-				t.Error("adapted JSON missing error handlers")
+			if tc.expectAuth {
+				proxyIdx := strings.Index(caddyfile, "forward_proxy")
+				if rawProbeIdx > proxyIdx {
+					t.Error("@rawProbe must precede forward_proxy in route order")
+				}
+				if !strings.Contains(caddyfile, "probe_resistance") {
+					t.Error("forward_proxy missing probe_resistance")
+				}
+			}
+			if !strings.Contains(caddyfile, "handle_errors") || !strings.Contains(caddyfile, "-Server") || !strings.Contains(caddyfile, "-Alt-Svc") {
+				t.Error("rendered Caddyfile missing error header camouflage")
+			}
+			if caddyBin, err := exec.LookPath("caddy"); err == nil {
+				tmp, err := os.CreateTemp("", "caddyfile-val-*")
+				if err == nil {
+					defer os.Remove(tmp.Name())
+					if _, err := tmp.WriteString(caddyfile); err == nil {
+						_ = tmp.Close()
+						cmd := exec.Command(caddyBin, "validate", "--adapter", "caddyfile", "--config", tmp.Name())
+						if out, err := cmd.CombinedOutput(); err != nil && !tc.expectAuth {
+							t.Errorf("caddy validate failed on decoy config: %v (%s)", err, strings.TrimSpace(string(out)))
+						}
+					}
+				}
 			}
 		})
 	}
