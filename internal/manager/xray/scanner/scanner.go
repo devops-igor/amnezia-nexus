@@ -13,7 +13,6 @@ import (
 
 // DefaultCandidateDomains contains well-known high-reputation TLS 1.3 / H2 endpoints.
 var DefaultCandidateDomains = []string{
-	"gateway.icloud.com",
 	"www.microsoft.com",
 	"www.apple.com",
 	"aws.amazon.com",
@@ -225,6 +224,15 @@ func scanCandidateDomain(
 	rootCAs *x509.CertPool,
 	dialContext func(ctx context.Context, network, addr string) (net.Conn, error),
 ) ScanResult {
+	// 0. Censor-target blacklist check
+	if IsBlacklistedDecoyDomain(domain) {
+		return ScanResult{
+			Domain: domain,
+			Status: "rejected_blacklisted",
+			Reason: "censor-targeted circumvention domain",
+		}
+	}
+
 	// 1. Resolve domain A record
 	resolveCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -240,6 +248,18 @@ func scanCandidateDomain(
 	candIP := ips[0]
 
 	// 2. Validate Geo / ASN proximity
+	candASN, candCountry, _ := geoDB.Lookup(candIP)
+	if candASN == 714 {
+		return ScanResult{
+			Domain:          domain,
+			Country:         candCountry,
+			ASN:             candASN,
+			PassedGeoFilter: false,
+			Status:          "rejected_blacklisted",
+			Reason:          "resolves to Apple AS714 (censor-targeted Anycast)",
+		}
+	}
+
 	passed, _, candCountry, _, candASN, geoReason := geoDB.ValidateGeoProximity(serverIP, candIP)
 	if !passed {
 		return ScanResult{

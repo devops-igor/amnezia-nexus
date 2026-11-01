@@ -226,6 +226,7 @@ type VLESSInstallOptions struct {
 	Flow          string `json:"flow"`
 	FlowSet       bool   `json:"-"`
 	EngineProfile string `json:"engine_profile,omitempty"`
+	Mux           *bool  `json:"mux,omitempty"`
 }
 
 // UnmarshalJSON preserves awareness of whether the "flow" field was explicitly present in the JSON payload.

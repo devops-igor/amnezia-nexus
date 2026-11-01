@@ -227,7 +227,7 @@ def test_vless_reality_install_modal_ui(
     - Opening the VLESS install modal displays #vlessOptions and hides other protocols.
     - Default port is 443 TCP.
     - Default flow selector has 'xtls-rprx-vision' selected.
-    - Camouflage SNI input is pre-populated with 'gateway.icloud.com'.
+    - Camouflage SNI input is pre-populated with 'www.microsoft.com'.
     - REALITY scan trigger button is visible.
     - Submitting installation dispatches expected payload (server_name, port, flow).
     - Progress log and completion flow dismisses modal cleanly.
@@ -285,7 +285,7 @@ def test_vless_reality_install_modal_ui(
     # Verify camouflage SNI input and default domain
     sni_input = modal.locator("#installVlessSni, #vlessSni").first
     expect(sni_input).to_be_visible()
-    expect(sni_input).to_have_value("gateway.icloud.com")
+    expect(sni_input).to_have_value("www.microsoft.com")
 
     # Verify REALITY scanner button presence
     scan_btn = modal.locator(
@@ -334,7 +334,7 @@ def test_vless_reality_install_modal_ui(
         assert captured_install.get("protocol") == "vless"
         assert str(captured_install.get("port")) == "443"
         vless_opts = captured_install.get("vless_options", {})
-        assert vless_opts.get("server_name") == "gateway.icloud.com"
+        assert vless_opts.get("server_name") == "www.microsoft.com"
         assert str(vless_opts.get("port")) == "443"
         assert vless_opts.get("flow") == "xtls-rprx-vision"
 
@@ -381,7 +381,7 @@ def test_reality_sni_scanner_ui_flow(
         "server_ip": "198.51.100.1",
         "results": [
             {
-                "domain": "gateway.icloud.com",
+                "domain": "www.microsoft.com",
                 "status": "ok",
                 "rtt_ms": 14,
                 "country": "US",
@@ -435,7 +435,7 @@ def test_reality_sni_scanner_ui_flow(
         expect(sni_select).to_be_visible()
 
         # Verify best candidate auto-populated into input
-        expect(sni_input).to_have_value("gateway.icloud.com")
+        expect(sni_input).to_have_value("www.microsoft.com")
 
         # Select second candidate from dropdown
         sni_select.select_option("dl.google.com")

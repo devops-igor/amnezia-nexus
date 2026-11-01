@@ -186,7 +186,7 @@ def _ensure_protocol_installed(page: Page, server_id: int, proto: str, csrf_toke
 
     Checks if proto is present in server protocol inventory. If absent, provisions
     the protocol via POST /api/servers/{server_id}/install with standard parameters:
-    - VLESS: port 443, server_name gateway.icloud.com, flow xtls-rprx-vision
+    - VLESS: port 443, server_name www.microsoft.com, flow xtls-rprx-vision
     - NaiveProxy: port 9443, domain proxy.example.com, decoy default
     """
     server = _get_server_by_id(page, server_id)
@@ -199,7 +199,7 @@ def _ensure_protocol_installed(page: Page, server_id: int, proto: str, csrf_toke
             "protocol": "vless",
             "port": "443",
             "vless_options": {
-                "server_name": "gateway.icloud.com",
+                "server_name": "www.microsoft.com",
                 "port": "443",
                 "flow": "xtls-rprx-vision",
             },
@@ -832,7 +832,7 @@ def test_vless_uri_validation_oracle() -> None:
     valid_uri = (
         "vless://9f5b2446-2ab9-42b4-8260-2ff0d061c0de@vpn.example.com:443?"
         "security=reality&encryption=none&pbk=1w_PubkeySecret123&headerType=none"
-        "&fp=chrome&sni=gateway.icloud.com&sid=abcdef12&type=tcp"
+        "&fp=chrome&sni=www.microsoft.com&sid=abcdef12&type=tcp"
         "&flow=xtls-rprx-vision#MyVlessClient"
     )
     res = validate_vless_uri(valid_uri, expected_name="MyVlessClient")
@@ -840,13 +840,13 @@ def test_vless_uri_validation_oracle() -> None:
     assert res["host"] == "vpn.example.com"
     assert res["port"] == 443
     assert res["flow"] == "xtls-rprx-vision"
-    assert res["sni"] == "gateway.icloud.com"
+    assert res["sni"] == "www.microsoft.com"
 
     # Valid VLESS URI where fragment is the reconstructed client UUID (H2 contract)
     reconstructed_uri = (
         "vless://9f5b2446-2ab9-42b4-8260-2ff0d061c0de@vpn.example.com:443?"
         "security=reality&encryption=none&pbk=1w_PubkeySecret123&headerType=none"
-        "&fp=chrome&sni=gateway.icloud.com&sid=abcdef12&type=tcp"
+        "&fp=chrome&sni=www.microsoft.com&sid=abcdef12&type=tcp"
         "&flow=xtls-rprx-vision#9f5b2446-2ab9-42b4-8260-2ff0d061c0de"
     )
     res_recon = validate_vless_uri(reconstructed_uri, expected_name="MyVlessClient")
@@ -864,21 +864,21 @@ def test_vless_uri_validation_oracle() -> None:
     with pytest.raises(AssertionError, match="valid UUID"):
         validate_vless_uri(
             "vless://not-a-valid-uuid@vpn.example.com:443?security=reality&flow=xtls-rprx-vision"
-            "&fp=chrome&sni=gateway.icloud.com&pbk=key&sid=123"
+            "&fp=chrome&sni=www.microsoft.com&pbk=key&sid=123"
         )
 
     # Reject missing security=reality
     with pytest.raises(AssertionError, match="security must be 'reality'"):
         validate_vless_uri(
             "vless://9f5b2446-2ab9-42b4-8260-2ff0d061c0de@vpn.example.com:443?"
-            "security=tls&flow=xtls-rprx-vision&fp=chrome&sni=gateway.icloud.com&pbk=key&sid=123"
+            "security=tls&flow=xtls-rprx-vision&fp=chrome&sni=www.microsoft.com&pbk=key&sid=123"
         )
 
     # Reject missing flow=xtls-rprx-vision
     with pytest.raises(AssertionError, match="flow must be 'xtls-rprx-vision'"):
         validate_vless_uri(
             "vless://9f5b2446-2ab9-42b4-8260-2ff0d061c0de@vpn.example.com:443?"
-            "security=reality&flow=none&fp=chrome&sni=gateway.icloud.com&pbk=key&sid=123"
+            "security=reality&flow=none&fp=chrome&sni=www.microsoft.com&pbk=key&sid=123"
         )
 
 
