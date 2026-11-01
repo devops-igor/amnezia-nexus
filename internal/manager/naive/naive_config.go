@@ -34,13 +34,44 @@ func GenerateNaiveCredentials() (user, pass string, err error) {
 	return user, pass, nil
 }
 
+// isTestDomainOrIP returns true if domain is an IP address, localhost, or a test domain (e.g. *.example.com).
+func isTestDomainOrIP(domain string) bool {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	d = strings.TrimPrefix(strings.TrimPrefix(d, "https://"), "http://")
+	if host, _, err := net.SplitHostPort(d); err == nil && host != "" {
+		d = host
+	}
+	d = strings.Trim(d, "[]")
+	if d == "" {
+		return true
+	}
+	if net.ParseIP(d) != nil {
+		return true
+	}
+	if d == "localhost" || strings.HasSuffix(d, ".localhost") || strings.HasSuffix(d, ".local") {
+		return true
+	}
+	for _, reserved := range []string{"example.com", "example.net", "example.org"} {
+		if d == reserved || strings.HasSuffix(d, "."+reserved) {
+			return true
+		}
+	}
+	for _, tld := range []string{".test", ".example", ".invalid", ".internal"} {
+		if strings.HasSuffix(d, tld) {
+			return true
+		}
+	}
+	return false
+}
+
 // RenderCaddyfile generates a Caddyfile with forward_proxy, decoy website, and basic-auth credentials.
 // Per audit guidance, { admin off } is omitted so caddy reload communicates over loopback 127.0.0.1:2019.
 func RenderCaddyfile(port int, domain string, clients []NaiveClient) string {
 	if port <= 0 {
 		port = 443
 	}
-	if domain == "" {
+	domain = strings.TrimSpace(domain)
+	if domain == "" || domain == ":443" || domain == "443" {
 		domain = "localhost"
 	}
 
@@ -50,12 +81,30 @@ func RenderCaddyfile(port int, domain string, clients []NaiveClient) string {
 	sb.WriteString("    admin 127.0.0.1:2019\n")
 	sb.WriteString("}\n\n")
 
+	// Default fallback catch-all block on port 443 for active-probing defense
+	sb.WriteString(":443 {\n")
+	sb.WriteString("    tls internal\n")
+	sb.WriteString("    respond \"Not Found\" 404 {\n")
+	sb.WriteString("        close\n")
+	sb.WriteString("    }\n")
+	sb.WriteString("}\n\n")
+
 	// Domain and port block
 	if port > 0 && port != 443 {
 		fmt.Fprintf(&sb, ":%d, %s:%d {\n", port, domain, port)
 	} else {
-		fmt.Fprintf(&sb, ":%d, %s {\n", port, domain)
+		fmt.Fprintf(&sb, "%s {\n", domain)
 	}
+
+	if isTestDomainOrIP(domain) {
+		sb.WriteString("    tls internal\n")
+	}
+
+	sb.WriteString("    header {\n")
+	sb.WriteString("        -Server\n")
+	sb.WriteString("        -Alt-Svc\n")
+	sb.WriteString("    }\n")
+
 	sb.WriteString("    route {\n")
 
 	validClients := make([]NaiveClient, 0, len(clients))
@@ -143,23 +192,52 @@ func parseSiteAddress(header string) (domain string, port int) {
 	return domain, port
 }
 
+// validateCaddyfileStructure ensures tokens and braces are well-formed.
+func validateCaddyfileStructure(content string) error {
+	if err := validateCaddyfileTokens(content); err != nil {
+		return err
+	}
+	openBraces := strings.Count(content, "{")
+	closeBraces := strings.Count(content, "}")
+	if openBraces == 0 || closeBraces == 0 {
+		return errors.New("caddyfile contains no configuration blocks")
+	}
+	if openBraces != closeBraces {
+		return fmt.Errorf("caddyfile contains unmatched braces: %d '{' vs %d '}'", openBraces, closeBraces)
+	}
+	return nil
+}
+
+func parseTopLevelSite(trimmed string) string {
+	if !strings.HasSuffix(trimmed, "{") {
+		return ""
+	}
+	site := strings.TrimSpace(strings.TrimSuffix(trimmed, "{"))
+	if strings.HasPrefix(site, "(") || strings.HasPrefix(site, "&(") {
+		return "" // snippet or named-route definition, not a site
+	}
+	return site
+}
+
+func parseBasicAuthDirective(trimmed string) (*NaiveClient, error) {
+	if !strings.HasPrefix(trimmed, "basic_auth") {
+		return nil, nil
+	}
+	parts := strings.Fields(trimmed)
+	if len(parts) < 3 {
+		return nil, fmt.Errorf("malformed basic_auth directive: %q", trimmed)
+	}
+	return &NaiveClient{Username: parts[1], Password: parts[2]}, nil
+}
+
 // ParseCaddyfile extracts the configured domain, port, and client basic-auth pairs from a Caddyfile.
 func ParseCaddyfile(content string) (domain string, port int, clients []NaiveClient, err error) {
 	trimmedContent := strings.TrimSpace(content)
 	if trimmedContent == "" {
 		return "", 0, nil, errors.New("empty caddyfile content")
 	}
-	if err := validateCaddyfileTokens(trimmedContent); err != nil {
+	if err := validateCaddyfileStructure(trimmedContent); err != nil {
 		return "", 0, nil, err
-	}
-
-	openBraces := strings.Count(trimmedContent, "{")
-	closeBraces := strings.Count(trimmedContent, "}")
-	if openBraces == 0 || closeBraces == 0 {
-		return "", 0, nil, errors.New("caddyfile contains no configuration blocks")
-	}
-	if openBraces != closeBraces {
-		return "", 0, nil, fmt.Errorf("caddyfile contains unmatched braces: %d '{' vs %d '}'", openBraces, closeBraces)
 	}
 
 	lines := strings.Split(trimmedContent, "\n")
@@ -168,7 +246,7 @@ func ParseCaddyfile(content string) (domain string, port int, clients []NaiveCli
 	// The managed listener is the top-level site block enclosing forward_proxy (or the first site
 	// block when forward_proxy is absent, e.g. zero clients); nested directives and other sites are ignored.
 	// shortcut: brace depth is counted per line, so braces inside quoted strings are not understood.
-	depth, forwardSite, firstSite, curSite := 0, "", "", ""
+	depth, forwardSite, firstSite, fallbackSite, curSite := 0, "", "", "", ""
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if rest, ok := strings.CutPrefix(trimmed, disabledMarker); ok && depth > 0 && forwardSite == "" && isProxyOpen(rest) {
@@ -177,20 +255,20 @@ func ParseCaddyfile(content string) (domain string, port int, clients []NaiveCli
 		if strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		if strings.HasPrefix(trimmed, "basic_auth") {
-			parts := strings.Fields(trimmed)
-			if len(parts) < 3 {
-				return "", 0, nil, fmt.Errorf("malformed basic_auth directive: %q", trimmed)
-			}
-			clients = append(clients, NaiveClient{Username: parts[1], Password: parts[2]})
+		if client, err := parseBasicAuthDirective(trimmed); err != nil {
+			return "", 0, nil, err
+		} else if client != nil {
+			clients = append(clients, *client)
 		}
-		if depth == 0 && strings.HasSuffix(trimmed, "{") {
-			curSite = strings.TrimSpace(strings.TrimSuffix(trimmed, "{"))
-			if strings.HasPrefix(curSite, "(") || strings.HasPrefix(curSite, "&(") {
-				curSite = "" // snippet or named-route definition, not a site
-			}
-			if firstSite == "" {
-				firstSite = curSite
+		if depth == 0 {
+			if site := parseTopLevelSite(trimmed); site != "" {
+				curSite = site
+				if fallbackSite == "" {
+					fallbackSite = curSite
+				}
+				if d, _ := parseSiteAddress(curSite); d != "" && firstSite == "" {
+					firstSite = curSite
+				}
 			}
 		}
 		if f := strings.Fields(trimmed); depth > 0 && forwardSite == "" && len(f) > 0 && f[0] == "forward_proxy" {
@@ -202,7 +280,11 @@ func ParseCaddyfile(content string) (domain string, port int, clients []NaiveCli
 		}
 	}
 	if forwardSite == "" {
-		forwardSite = firstSite
+		if firstSite != "" {
+			forwardSite = firstSite
+		} else {
+			forwardSite = fallbackSite
+		}
 	}
 
 	domain, port = parseSiteAddress(forwardSite)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -53,6 +54,132 @@ func parseNaiveInstallOptions(params map[string]any, defaultHost string) (int, s
 		}
 	}
 	return port, domain
+}
+
+func shouldSkipDNSValidation(params map[string]any) bool {
+	if params == nil {
+		return false
+	}
+	checkMap := func(m map[string]any) bool {
+		for _, k := range []string{"skip_dns_validation", "skip_dns_check"} {
+			if val, ok := m[k]; ok {
+				switch v := val.(type) {
+				case bool:
+					if v {
+						return true
+					}
+				case string:
+					if strings.EqualFold(v, "true") || v == "1" {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+
+	if checkMap(params) {
+		return true
+	}
+	if no, ok := params["naive_options"]; ok && no != nil {
+		if optMap, ok := no.(map[string]any); ok {
+			if checkMap(optMap) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func getTestOverrideIPs(params map[string]any) ([]net.IP, bool) {
+	if params == nil {
+		return nil, false
+	}
+	extract := func(m map[string]any) ([]net.IP, bool) {
+		if raw, ok := m["test_override_ips"]; ok {
+			switch v := raw.(type) {
+			case []string:
+				var ips []net.IP
+				for _, s := range v {
+					if ip := net.ParseIP(s); ip != nil {
+						ips = append(ips, ip)
+					}
+				}
+				return ips, true
+			case []net.IP:
+				return v, true
+			}
+		}
+		if raw, ok := m["test_override_ip"]; ok {
+			if s, ok := raw.(string); ok {
+				if ip := net.ParseIP(s); ip != nil {
+					return []net.IP{ip}, true
+				}
+			}
+		}
+		return nil, false
+	}
+
+	if ips, ok := extract(params); ok {
+		return ips, true
+	}
+	if no, ok := params["naive_options"]; ok && no != nil {
+		if optMap, ok := no.(map[string]any); ok {
+			if ips, ok := extract(optMap); ok {
+				return ips, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func (m *NaiveManager) validateDomainDNS(ctx context.Context, domain string, serverHost string, params map[string]any) error {
+	if isTestDomainOrIP(domain) {
+		return nil
+	}
+	if shouldSkipDNSValidation(params) {
+		return nil
+	}
+
+	lookupFn := m.getDNSLookup()
+	var ips []net.IP
+	var err error
+
+	if lookupFn != nil {
+		ips, err = lookupFn(ctx, domain)
+	} else if overrideIPs, ok := getTestOverrideIPs(params); ok {
+		ips = overrideIPs
+	} else {
+		ips, err = net.DefaultResolver.LookupIP(ctx, "ip", domain)
+	}
+
+	if err != nil {
+		return fmt.Errorf("pre-flight DNS validation failed: domain %q does not resolve to server IP %q: %w", domain, serverHost, err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("pre-flight DNS validation failed: domain %q resolved to no IP addresses, expected server IP %q", domain, serverHost)
+	}
+
+	serverIP := net.ParseIP(serverHost)
+	var resolvedStrs []string
+	matched := false
+	for _, ip := range ips {
+		resolvedStrs = append(resolvedStrs, ip.String())
+		if serverIP != nil {
+			if ip.Equal(serverIP) {
+				matched = true
+				break
+			}
+		} else if strings.EqualFold(ip.String(), serverHost) {
+			matched = true
+			break
+		}
+	}
+
+	if !matched {
+		return fmt.Errorf("pre-flight DNS validation failed: domain %q resolves to [%s], expected server IP %q", domain, strings.Join(resolvedStrs, ", "), serverHost)
+	}
+	return nil
 }
 
 func (m *NaiveManager) resolveExistingClients(ctx context.Context, client ssh.SSHClient) ([]NaiveClient, error) {
@@ -177,6 +304,11 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 
 	// 2. Parse installation options
 	port, domain := parseNaiveInstallOptions(params, server.Host)
+
+	// Pre-flight DNS validation: ensure public domains resolve to server.Host before writing config or launching container
+	if err := m.validateDomainDNS(ctx, domain, server.Host, params); err != nil {
+		return err
+	}
 
 	// 3. Create directory structure
 	mkdirCmd := fmt.Sprintf("mkdir -p %s && chmod 0700 %s", ssh.EscapeShellArg(NaiveHTMLDir), ssh.EscapeShellArg(NaiveConfigDir))
