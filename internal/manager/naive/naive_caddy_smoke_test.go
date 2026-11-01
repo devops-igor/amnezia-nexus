@@ -171,12 +171,12 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 	clients := []NaiveClient{{Username: "testuser", Password: "testpassword"}}
 	caddyfile := RenderCaddyfile(proxyPort, "localhost", clients)
 
-	// Replace loopback admin port with allocated test port and specify http_port to avoid port 80 permission denial.
+	// Replace loopback admin port with allocated test port, specify http_port, and disable auto_https redirects to prevent 308 redirects.
 	// Allow loopback in forward_proxy ACL for hermetic in-process fixture tunneling.
 	caddyfile = strings.Replace(
 		caddyfile,
 		"admin 127.0.0.1:2019",
-		fmt.Sprintf("admin 127.0.0.1:%d\n    http_port %d", adminPort, httpPort),
+		fmt.Sprintf("admin 127.0.0.1:%d\n    http_port %d\n    auto_https disable_redirects", adminPort, httpPort),
 		1,
 	)
 	caddyfile = strings.Replace(
@@ -321,13 +321,14 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 		}
 		defer conn.Close()
 
-		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", echoAddr, echoAddr)
+		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", echoAddr)
 		if _, err := conn.Write([]byte(connectReq)); err != nil {
 			t.Fatalf("failed to send CONNECT request: %v", err)
 		}
 
 		reader := bufio.NewReader(conn)
 		req, _ := http.NewRequest("CONNECT", "http://"+echoAddr, nil)
+		req.Host = "localhost"
 		resp, err := http.ReadResponse(reader, req)
 		if err != nil {
 			t.Fatalf("failed to read unauthenticated CONNECT response: %v", err)
