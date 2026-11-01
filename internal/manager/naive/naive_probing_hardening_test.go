@@ -126,6 +126,13 @@ func TestRenderCaddyfile_HeaderCamouflage(t *testing.T) {
         -Server
         -Alt-Svc
     }`
+	const expectedHandleErrors = `    handle_errors {
+        header {
+            -Server
+            -Alt-Svc
+        }
+        respond "{err.status_code} {err.status_text}" {err.status_code}
+    }`
 
 	tests := []struct {
 		name   string
@@ -144,6 +151,10 @@ func TestRenderCaddyfile_HeaderCamouflage(t *testing.T) {
 			if !strings.Contains(rendered, expectedHeaders) {
 				t.Fatalf("rendered Caddyfile missing header camouflage directives:\n%s\nExpected:\n%s",
 					rendered, expectedHeaders)
+			}
+			if !strings.Contains(rendered, expectedHandleErrors) {
+				t.Fatalf("rendered Caddyfile missing handle_errors camouflage block:\n%s\nExpected:\n%s",
+					rendered, expectedHandleErrors)
 			}
 			if !strings.Contains(rendered, "-Server") {
 				t.Errorf("missing -Server directive in Caddyfile:\n%s", rendered)
@@ -579,9 +590,20 @@ func TestParseCaddyfile_HardenedStructureRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	// 1. Render and parse default port 443 with domain and clients
+	const expectedHandleErrors = `    handle_errors {
+        header {
+            -Server
+            -Alt-Svc
+        }
+        respond "{err.status_code} {err.status_text}" {err.status_code}
+    }`
+
 	rendered443 := RenderCaddyfile(443, "vpn.prod.org", []NaiveClient{
 		{Username: "client1", Password: "pass1secret123"},
 	})
+	if !strings.Contains(rendered443, expectedHandleErrors) {
+		t.Fatalf("rendered443 missing handle_errors block:\n%s", rendered443)
+	}
 	d443, p443, clients443, err := ParseCaddyfile(rendered443)
 	if err != nil {
 		t.Fatalf("ParseCaddyfile 443 failed: %v", err)
@@ -595,6 +617,9 @@ func TestParseCaddyfile_HardenedStructureRoundTrip(t *testing.T) {
 
 	// 2. Render and parse 0 clients
 	rendered0 := RenderCaddyfile(443, "vpn.prod.org", nil)
+	if !strings.Contains(rendered0, expectedHandleErrors) {
+		t.Fatalf("rendered0 missing handle_errors block:\n%s", rendered0)
+	}
 	d0, p0, clients0, err := ParseCaddyfile(rendered0)
 	if err != nil {
 		t.Fatalf("ParseCaddyfile 0-client failed: %v", err)
@@ -607,6 +632,9 @@ func TestParseCaddyfile_HardenedStructureRoundTrip(t *testing.T) {
 	rendered8443 := RenderCaddyfile(8443, "vpn.custom.org", []NaiveClient{
 		{Username: "u8443", Password: "p8443"},
 	})
+	if !strings.Contains(rendered8443, expectedHandleErrors) {
+		t.Fatalf("rendered8443 missing handle_errors block:\n%s", rendered8443)
+	}
 	d8443, p8443, clients8443, err := ParseCaddyfile(rendered8443)
 	if err != nil {
 		t.Fatalf("ParseCaddyfile 8443 failed: %v", err)
@@ -618,7 +646,7 @@ func TestParseCaddyfile_HardenedStructureRoundTrip(t *testing.T) {
 		t.Errorf("8443 clients mismatch: %+v", clients8443)
 	}
 
-	// 4. Client additions and removals preserve probe hardening and header camouflage
+	// 4. Client additions and removals preserve probe hardening, handle_errors, and header camouflage
 	mockSSH := newMockNaiveSSHClient()
 	mgr := NewNaiveManagerWithServerLocks(&mockNaivePool{client: mockSSH}, awg.NewServerLockRegistry())
 	server := &models.Server{ID: 200, Host: "198.51.100.200", SSHPort: 22}
@@ -647,6 +675,12 @@ func TestParseCaddyfile_HardenedStructureRoundTrip(t *testing.T) {
 	if !strings.Contains(afterAdd, "-Server") || !strings.Contains(afterAdd, "-Alt-Svc") {
 		t.Errorf("AddClient stripped header camouflage:\n%s", afterAdd)
 	}
+	if !strings.Contains(afterAdd, expectedHandleErrors) {
+		t.Errorf("AddClient corrupted handle_errors block:\n%s", afterAdd)
+	}
+	if dAdd, pAdd, clientsAdd, err := ParseCaddyfile(afterAdd); err != nil || dAdd != "vpn.prod.org" || pAdd != 443 || len(clientsAdd) != 1 || clientsAdd[0].Username != "added_user" {
+		t.Errorf("ParseCaddyfile failed on afterAdd: domain=%s port=%d clients=%v err=%v", dAdd, pAdd, clientsAdd, err)
+	}
 
 	// Remove client
 	err = mgr.RemoveClient(ctx, server, "added_user")
@@ -666,6 +700,12 @@ func TestParseCaddyfile_HardenedStructureRoundTrip(t *testing.T) {
 	}
 	if !strings.Contains(afterRemove, "-Server") || !strings.Contains(afterRemove, "-Alt-Svc") {
 		t.Errorf("RemoveClient stripped header camouflage:\n%s", afterRemove)
+	}
+	if !strings.Contains(afterRemove, expectedHandleErrors) {
+		t.Errorf("RemoveClient corrupted handle_errors block:\n%s", afterRemove)
+	}
+	if dRem, pRem, clientsRem, err := ParseCaddyfile(afterRemove); err != nil || dRem != "vpn.prod.org" || pRem != 443 || len(clientsRem) != 0 {
+		t.Errorf("ParseCaddyfile failed on afterRemove: domain=%s port=%d clients=%v err=%v", dRem, pRem, clientsRem, err)
 	}
 }
 

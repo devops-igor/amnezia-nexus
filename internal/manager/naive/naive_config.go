@@ -104,6 +104,14 @@ func RenderCaddyfile(port int, domain string, clients []NaiveClient) string {
 	sb.WriteString("        -Alt-Svc\n")
 	sb.WriteString("    }\n")
 
+	sb.WriteString("    handle_errors {\n")
+	sb.WriteString("        header {\n")
+	sb.WriteString("            -Server\n")
+	sb.WriteString("            -Alt-Svc\n")
+	sb.WriteString("        }\n")
+	sb.WriteString("        respond \"{err.status_code} {err.status_text}\" {err.status_code}\n")
+	sb.WriteString("    }\n")
+
 	sb.WriteString("    route {\n")
 	sb.WriteString("        @rawProbe {\n")
 	sb.WriteString("            not method CONNECT\n")
