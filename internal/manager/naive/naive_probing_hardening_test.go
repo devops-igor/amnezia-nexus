@@ -313,8 +313,8 @@ func TestPreFlightDNSValidation(t *testing.T) {
 		if !strings.Contains(errMsg, "unresolvable.mycustomvpn.org") {
 			t.Errorf("error must mention unresolvable domain name, got: %s", errMsg)
 		}
-		if !strings.Contains(errMsg, serverHost) {
-			t.Errorf("error must mention expected server IP %s, got: %s", serverHost, errMsg)
+		if !strings.Contains(errMsg, "does not resolve") {
+			t.Errorf("error must mention does not resolve, got: %s", errMsg)
 		}
 
 		// Verify remote system was untouched
@@ -596,23 +596,41 @@ func TestPreFlightDNSValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("private management IP behind NAT allows installation with public domain", func(t *testing.T) {
-		for _, privateHost := range []string{"10.0.0.1", "192.168.1.1", "172.16.0.1", "127.0.0.1", "::1"} {
-			t.Run(privateHost, func(t *testing.T) {
+	t.Run("private management IP behind NAT validates public domain DNS", func(t *testing.T) {
+		type testCase struct {
+			name       string
+			serverHost string
+			lookupIPs  []net.IP
+			lookupErr  error
+			wantErr    bool
+		}
+		var cases []testCase
+		for _, host := range []string{"10.0.0.1", "192.168.1.1", "172.16.0.1", "127.0.0.1", "::1", "fd00::1"} {
+			cases = append(cases,
+				testCase{host + "/valid domain succeeds", host, []net.IP{net.ParseIP("198.51.100.99")}, nil, false},
+				testCase{host + "/unresolvable domain fails", host, nil, &net.DNSError{Err: "no such host", Name: "vpn.operator.net", IsNotFound: true}, true},
+				testCase{host + "/zero ips fails", host, []net.IP{}, nil, true},
+			)
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
 				mockSSH := newMockNaiveSSHClient()
 				mgr := NewNaiveManagerWithServerLocks(&mockNaivePool{client: mockSSH}, awg.NewServerLockRegistry())
 				mgr.SetDNSLookup(func(ctx context.Context, host string) ([]net.IP, error) {
-					return []net.IP{net.ParseIP("198.51.100.99")}, nil
+					return tc.lookupIPs, tc.lookupErr
 				})
-				server := &models.Server{ID: 114, Host: privateHost, SSHPort: 22}
-				params := map[string]any{
-					"port": 443,
-					"naive_options": map[string]any{
-						"domain": "vpn.operator.net",
-					},
-				}
-				if err := mgr.Install(ctx, server, params); err != nil {
-					t.Fatalf("private host %s behind NAT must allow installation: %v", privateHost, err)
+				server := &models.Server{ID: 114, Host: tc.serverHost, SSHPort: 22}
+				params := map[string]any{"port": 443, "naive_options": map[string]any{"domain": "vpn.operator.net"}}
+				err := mgr.Install(ctx, server, params)
+				if tc.wantErr {
+					if err == nil || !errors.Is(err, ErrDNSValidation) {
+						t.Fatalf("expected ErrDNSValidation on %s, got: %v", tc.serverHost, err)
+					}
+					if len(mockSSH.files) > 0 {
+						t.Fatalf("files written despite DNS failure on %s: %v", tc.serverHost, mockSSH.files)
+					}
+				} else if err != nil {
+					t.Fatalf("expected success on %s, got: %v", tc.serverHost, err)
 				}
 			})
 		}

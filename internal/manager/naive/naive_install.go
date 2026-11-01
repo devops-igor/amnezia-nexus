@@ -155,21 +155,21 @@ func (m *NaiveManager) validateDomainDNS(ctx context.Context, domain string, ser
 		return nil
 	}
 
+	lookupFn := m.getDNSLookup()
+	ips, err := resolveHost(ctx, domain, lookupFn, params)
+	if err != nil {
+		return fmt.Errorf("%w: domain %q does not resolve: %w", ErrDNSValidation, domain, err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("%w: domain %q resolved to no IP addresses, expected server IP %q", ErrDNSValidation, domain, serverHost)
+	}
+
 	cleanHost := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(serverHost), "["), "]")
 	serverIP := net.ParseIP(cleanHost)
 	if serverIP != nil && (serverIP.IsPrivate() || serverIP.IsLoopback()) {
 		slog.Info("allowing naive installation with private/loopback server host behind NAT",
 			"server_host", serverHost, "domain", domain)
 		return nil
-	}
-
-	lookupFn := m.getDNSLookup()
-	ips, err := resolveHost(ctx, domain, lookupFn, params)
-	if err != nil {
-		return fmt.Errorf("%w: domain %q does not resolve to server IP %q: %w", ErrDNSValidation, domain, serverHost, err)
-	}
-	if len(ips) == 0 {
-		return fmt.Errorf("%w: domain %q resolved to no IP addresses, expected server IP %q", ErrDNSValidation, domain, serverHost)
 	}
 
 	var resolvedStrs []string
