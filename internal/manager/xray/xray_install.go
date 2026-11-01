@@ -906,22 +906,8 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	protoMeta["public_key"] = pubB64
 	protoMeta["short_id"] = shortID
 	protoMeta["short_ids"] = shortIDs
-	if m, ok := params["mux"].(bool); ok {
-		protoMeta["mux"] = m
-	} else if m, ok := params["mux"].(string); ok {
-		protoMeta["mux"] = strings.EqualFold(m, "true")
-	} else if vo, ok := params["vless_options"].(map[string]any); ok {
-		if m, ok := vo["mux"].(bool); ok {
-			protoMeta["mux"] = m
-		} else if m, ok := vo["mux"].(string); ok {
-			protoMeta["mux"] = strings.EqualFold(m, "true")
-		}
-	} else if vo, ok := params["vless_options"].(*models.VLESSInstallOptions); ok && vo != nil {
-		if vo.Mux != nil {
-			protoMeta["mux"] = *vo.Mux
-		}
-	} else if vo, ok := params["vless_options"].(models.VLESSInstallOptions); ok && vo.Mux != nil {
-		protoMeta["mux"] = *vo.Mux
+	if mux, ok := parseMuxParam(params); ok {
+		protoMeta["mux"] = mux
 	}
 	protoMeta["flow"] = flow
 	protoMeta["engine_profile"] = string(profile.Name)
@@ -1006,4 +992,34 @@ func netJoinHostPort(host, port string) string {
 		return host
 	}
 	return fmt.Sprintf("%s:%s", host, port)
+}
+
+func parseMuxParam(params map[string]any) (bool, bool) {
+	if params == nil {
+		return false, false
+	}
+	if m, ok := params["mux"].(bool); ok {
+		return m, true
+	}
+	if m, ok := params["mux"].(string); ok {
+		return strings.EqualFold(m, "true"), true
+	}
+	switch vo := params["vless_options"].(type) {
+	case map[string]any:
+		if m, ok := vo["mux"].(bool); ok {
+			return m, true
+		}
+		if m, ok := vo["mux"].(string); ok {
+			return strings.EqualFold(m, "true"), true
+		}
+	case *models.VLESSInstallOptions:
+		if vo != nil && vo.Mux != nil {
+			return *vo.Mux, true
+		}
+	case models.VLESSInstallOptions:
+		if vo.Mux != nil {
+			return *vo.Mux, true
+		}
+	}
+	return false, false
 }
