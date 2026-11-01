@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,8 +20,16 @@ import (
 func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 	mockSSH := &testMockSSHClient{}
 	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+	var removeCalls atomic.Int64
 	for _, protocol := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
-		h.registry.Register(&mockProtocolManager{protocol: protocol})
+		p := protocol
+		h.registry.Register(&mockProtocolManager{
+			protocol: p,
+			removeClientFn: func(ctx context.Context, server *models.Server, clientID string) error {
+				removeCalls.Add(1)
+				return nil
+			},
+		})
 	}
 	ctx := context.Background()
 	users := map[models.UserRole]*models.User{
@@ -183,24 +192,45 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 	t.Run("cross-user tenant isolation", func(t *testing.T) {
 		for _, protocol := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
 			userA := users[models.RoleUser]
-			connA := seedForUser(userA.ID, protocol, "isolation-owner")
+			nonOwners := []*models.User{userB, users[models.RoleSupport]}
+			for _, nonOwner := range nonOwners {
+				connA := seedForUser(userA.ID, protocol, "isolation-owner-"+string(nonOwner.Role))
+				removesBefore := removeCalls.Load()
 
-			// User B attempts to retrieve User A's config -> 404
-			w := request(http.MethodGet, fmt.Sprintf("/api/connections/%s/config", connA.ID), userB, nil)
-			if w.Code != http.StatusNotFound {
-				t.Errorf("cross-user config status = %d, want 404; body: %s", w.Code, w.Body.String())
-			}
+				// Non-owner attempts to retrieve User A's config -> 404
+				w := request(http.MethodGet, fmt.Sprintf("/api/connections/%s/config", connA.ID), nonOwner, nil)
+				if w.Code != http.StatusNotFound {
+					t.Errorf("%s cross-user config status = %d, want 404; body: %s", nonOwner.Role, w.Code, w.Body.String())
+				}
+				var cfgErr map[string]any
+				if err := json.Unmarshal(w.Body.Bytes(), &cfgErr); err != nil {
+					t.Errorf("Unmarshal %s cross-user config error: %v", nonOwner.Role, err)
+				} else if cfgErr["error"] != "not_found" {
+					t.Errorf("%s cross-user config error = %v, want not_found", nonOwner.Role, cfgErr["error"])
+				}
 
-			// User B attempts to delete User A's connection -> 404
-			w = request(http.MethodPost, fmt.Sprintf("/api/connections/%s/delete", connA.ID), userB, nil)
-			if w.Code != http.StatusNotFound {
-				t.Errorf("cross-user delete status = %d, want 404; body: %s", w.Code, w.Body.String())
-			}
+				// Non-owner attempts to delete User A's connection -> 404
+				w = request(http.MethodPost, fmt.Sprintf("/api/connections/%s/delete", connA.ID), nonOwner, nil)
+				if w.Code != http.StatusNotFound {
+					t.Errorf("%s cross-user delete status = %d, want 404; body: %s", nonOwner.Role, w.Code, w.Body.String())
+				}
+				var delErr map[string]any
+				if err := json.Unmarshal(w.Body.Bytes(), &delErr); err != nil {
+					t.Errorf("Unmarshal %s cross-user delete error: %v", nonOwner.Role, err)
+				} else if delErr["error"] != "not_found" {
+					t.Errorf("%s cross-user delete error = %v, want not_found", nonOwner.Role, delErr["error"])
+				}
 
-			// Verify connection row is untouched
-			remaining, err := db.GetConnection(ctx, connA.ID)
-			if err != nil || remaining == nil {
-				t.Errorf("cross-user delete removed connection: remaining=%v err=%v", remaining, err)
+				// Verify connection row is untouched
+				remaining, err := db.GetConnection(ctx, connA.ID)
+				if err != nil || remaining == nil {
+					t.Errorf("%s cross-user delete removed connection: remaining=%v err=%v", nonOwner.Role, remaining, err)
+				}
+
+				// Verify zero remote removals were invoked
+				if removesAfter := removeCalls.Load(); removesAfter != removesBefore {
+					t.Errorf("%s cross-user delete invoked remote removal: calls before=%d after=%d", nonOwner.Role, removesBefore, removesAfter)
+				}
 			}
 		}
 	})

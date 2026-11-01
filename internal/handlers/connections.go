@@ -41,6 +41,25 @@ func effectiveRateLimit(user *models.User, count, window int) (int, int) {
 	return count, window
 }
 
+// canAccessConnection reports whether sess is authorized to access or manage conn.
+// Admin and the connection owner have full access across all protocols.
+// For VLESS and Naive connections, non-admin non-owners (including RoleSupport)
+// are denied access to protect credentials and isolate tenants.
+// For other protocols, RoleSupport is permitted.
+func canAccessConnection(sess *models.SessionData, conn *models.UserConnection) bool {
+	if sess == nil || conn == nil {
+		return false
+	}
+	if sess.Role == models.RoleAdmin || conn.UserID == sess.UserID {
+		return true
+	}
+	if sess.Role != models.RoleSupport {
+		return false
+	}
+	proto := models.NormalizeProtocol(conn.Protocol)
+	return proto != models.ProtocolVLESS && proto != models.ProtocolNaive
+}
+
 // serverReachabilityInfo resolves cached reachability for a server: status string and boolean flag.
 func (h *Handlers) serverReachabilityInfo(ctx context.Context, serverID int64) (string, bool) {
 	status, err := h.db.GetServerStatus(ctx, serverID)
@@ -408,7 +427,7 @@ func (h *Handlers) UserGetConnectionConfigHandler(w http.ResponseWriter, r *http
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
 		return
 	}
-	if sess.Role != models.RoleAdmin && sess.Role != models.RoleSupport && conn.UserID != sess.UserID {
+	if !canAccessConnection(sess, conn) {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
 		return
 	}
@@ -550,7 +569,7 @@ func (h *Handlers) UserDeleteConnectionHandler(w http.ResponseWriter, r *http.Re
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
 		return
 	}
-	if sess.Role != models.RoleAdmin && sess.Role != models.RoleSupport && conn.UserID != sess.UserID {
+	if !canAccessConnection(sess, conn) {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
 		return
 	}
