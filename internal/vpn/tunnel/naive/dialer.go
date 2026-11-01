@@ -19,11 +19,25 @@ import (
 // testRootCAs allows in-process test fixtures to supply an ephemeral root CA
 // without altering the public New() constructor signature. In production, this
 // remains nil, prompting standard crypto/tls system root verification.
-var testRootCAs *x509.CertPool
+var (
+	testRootCAs     *x509.CertPool
+	testDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	testResolver    *net.Resolver
+)
 
 // SetTestRootCAs allows test harnesses outside package naive to configure an ephemeral root CA pool.
 func SetTestRootCAs(pool *x509.CertPool) {
 	testRootCAs = pool
+}
+
+// SetTestDialContext allows test harnesses to intercept outbound transport dialing.
+func SetTestDialContext(fn func(ctx context.Context, network, addr string) (net.Conn, error)) {
+	testDialContext = fn
+}
+
+// SetTestResolver allows test harnesses to configure a custom DNS resolver (e.g. for AAAA-only hostnames).
+func SetTestResolver(r *net.Resolver) {
+	testResolver = r
 }
 
 // h3FailureCooldown is how long DialContext skips H3 and dials H2 directly
@@ -45,6 +59,7 @@ type Dialer struct {
 
 // New constructs a new NaiveProxy Dialer with defensive input validation.
 func New(endpoint string, p models.NaiveProxyParams) (*Dialer, error) {
+	endpoint = strings.TrimSpace(endpoint)
 	host, portStr, err := net.SplitHostPort(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("naive: invalid endpoint %q: %w", endpoint, err)

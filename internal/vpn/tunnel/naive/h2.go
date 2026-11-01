@@ -179,8 +179,19 @@ func (d *Dialer) dialAndPublishH2(dialCtx context.Context, dialCancel context.Ca
 		d.h2Pool.mu.Unlock()
 	}()
 
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	rawConn, err := dialer.DialContext(dialCtx, "tcp", d.endpoint)
+	dialer := &net.Dialer{
+		Timeout:  10 * time.Second,
+		Resolver: testResolver,
+	}
+	var (
+		rawConn net.Conn
+		err     error
+	)
+	if testDialContext != nil {
+		rawConn, err = testDialContext(dialCtx, "tcp", d.endpoint)
+	} else {
+		rawConn, err = dialer.DialContext(dialCtx, "tcp", d.endpoint)
+	}
 	if err != nil {
 		d.h2Pool.mu.Lock()
 		if d.h2Pool.closed {
