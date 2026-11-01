@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -504,8 +505,8 @@ type lbDataplaneDispatcher struct {
 	dialers      map[int64]*Dialer
 	lastSelected int64
 	lastRemote   string
+	lastDest     string
 	dialCount    map[int64]int
-	targetAddr   string
 }
 
 func (l *lbDataplaneDispatcher) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
@@ -520,15 +521,12 @@ func (l *lbDataplaneDispatcher) DialContext(ctx context.Context, network, addres
 		return nil, err
 	}
 	l.lastSelected = tun.ID
+	l.lastDest = address
 	l.dialCount[tun.ID]++
 	dialer := l.dialers[tun.ID]
-	target := l.targetAddr
-	if target == "" {
-		target = address
-	}
 	l.mu.Unlock()
 
-	conn, err := dialer.DialContext(ctx, network, target)
+	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
 		return nil, err
 	}
@@ -540,17 +538,62 @@ func (l *lbDataplaneDispatcher) DialContext(ctx context.Context, network, addres
 	return conn, nil
 }
 
+func findLocalNonLoopbackIPv4() (string, error) {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err == nil {
+		_ = conn.Close()
+		if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && udpAddr.IP.To4() != nil && !udpAddr.IP.IsLoopback() {
+			return udpAddr.IP.String(), nil
+		}
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", err
+	}
+	for _, addr := range addrs {
+		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
+			if ip4 := ipNet.IP.To4(); ip4 != nil {
+				return ip4.String(), nil
+			}
+		}
+	}
+	return "", errors.New("no non-loopback IPv4 address found")
+}
+
+func setupTCPEchoServerOnLocalIP(t *testing.T) (string, func()) {
+	t.Helper()
+	localIP, err := findLocalNonLoopbackIPv4()
+	if err != nil {
+		t.Fatalf("findLocalNonLoopbackIPv4: %v", err)
+	}
+	return setupTCPEchoServerOnAddr(t, net.JoinHostPort(localIP, "0"))
+}
+
 func TestDataplane_IPv4Client_To_LB_IPv6NaiveBackend_RoundTripAndFailover(t *testing.T) {
 	// 1. Destination IPv4 TCP echo target (simulating destination server on the Internet)
-	echoAddr, cleanupEcho := setupTCPEchoServer(t)
+	echoAddr, cleanupEcho := setupTCPEchoServerOnLocalIP(t)
 	defer cleanupEcho()
 
+	var (
+		muConn            sync.Mutex
+		proxyDestIPv6List []string
+		proxyDestIPv4List []string
+	)
+
 	// 2. IPv6 Naive backend listening on [::1]:port
-	proxyAddrIPv6, cleanupH2IPv6 := setupTestH2ServerIPv6(t, "user-ipv6", "pass-ipv6", true)
+	proxyAddrIPv6, cleanupH2IPv6 := setupTestH2ServerIPv6(t, "user-ipv6", "pass-ipv6", true, func(authority string) {
+		muConn.Lock()
+		defer muConn.Unlock()
+		proxyDestIPv6List = append(proxyDestIPv6List, authority)
+	})
 	defer cleanupH2IPv6()
 
 	// 3. IPv4 Naive backend listening on 127.0.0.1:port
-	proxyAddrIPv4, cleanupH2IPv4 := setupTestH2Server(t, "user-ipv4", "pass-ipv4", true)
+	proxyAddrIPv4, cleanupH2IPv4 := setupTestH2Server(t, "user-ipv4", "pass-ipv4", true, func(authority string) {
+		muConn.Lock()
+		defer muConn.Unlock()
+		proxyDestIPv4List = append(proxyDestIPv4List, authority)
+	})
 	defer cleanupH2IPv4()
 
 	pIPv6 := models.NaiveProxyParams{
@@ -615,8 +658,7 @@ func TestDataplane_IPv4Client_To_LB_IPv6NaiveBackend_RoundTripAndFailover(t *tes
 			tunIPv6.ID: dIPv6,
 			tunIPv4.ID: dIPv4,
 		},
-		dialCount:  make(map[int64]int),
-		targetAddr: echoAddr,
+		dialCount: make(map[int64]int),
 	}
 
 	// 4. Create Nexus streambridge backed by the load-balancing dispatcher dialer
@@ -636,10 +678,8 @@ func TestDataplane_IPv4Client_To_LB_IPv6NaiveBackend_RoundTripAndFailover(t *tes
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	const virtualDest = "198.51.100.10:8080"
-
 	// Scenario Part A: Complete round trip through LB-selected IPv6 Naive backend
-	conn1, err := client.DialTCP(ctx, virtualDest)
+	conn1, err := client.DialTCP(ctx, echoAddr)
 	if err != nil {
 		t.Fatalf("client.DialTCP through streambridge (IPv6 backend): %v", err)
 	}
@@ -672,6 +712,9 @@ func TestDataplane_IPv4Client_To_LB_IPv6NaiveBackend_RoundTripAndFailover(t *tes
 	if disp.lastSelected != tunIPv6.ID {
 		t.Fatalf("expected LB to select IPv6 tunnel %d, got %d", tunIPv6.ID, disp.lastSelected)
 	}
+	if disp.lastDest != echoAddr {
+		t.Fatalf("expected dispatcher destination %q, got %q", echoAddr, disp.lastDest)
+	}
 	if !strings.HasPrefix(disp.lastRemote, "[::1]:") {
 		t.Fatalf("expected remote transport address to be IPv6 [::1]:..., got %q", disp.lastRemote)
 	}
@@ -679,6 +722,12 @@ func TestDataplane_IPv4Client_To_LB_IPv6NaiveBackend_RoundTripAndFailover(t *tes
 		t.Fatalf("expected 1 dial to IPv6 backend, got %d", disp.dialCount[tunIPv6.ID])
 	}
 	disp.mu.Unlock()
+
+	muConn.Lock()
+	if len(proxyDestIPv6List) != 1 || proxyDestIPv6List[0] != echoAddr {
+		t.Fatalf("expected IPv6 proxy to receive CONNECT destination %q, got %v", echoAddr, proxyDestIPv6List)
+	}
+	muConn.Unlock()
 
 	// Scenario Part B: Selected IPv6 backend is marked unhealthy -> failover to alternate healthy Naive backend
 	tunIPv6.Status = "degraded"
@@ -699,7 +748,7 @@ func TestDataplane_IPv4Client_To_LB_IPv6NaiveBackend_RoundTripAndFailover(t *tes
 	}
 
 	// Scenario Part C: Subsequent connection from client routes to alternate healthy Naive backend
-	conn2, err := client.DialTCP(ctx, virtualDest)
+	conn2, err := client.DialTCP(ctx, echoAddr)
 	if err != nil {
 		t.Fatalf("client.DialTCP through streambridge after failover (IPv4 backend): %v", err)
 	}
@@ -730,6 +779,9 @@ func TestDataplane_IPv4Client_To_LB_IPv6NaiveBackend_RoundTripAndFailover(t *tes
 	if disp.lastSelected != tunIPv4.ID {
 		t.Fatalf("expected LB to select failover IPv4 tunnel %d, got %d", tunIPv4.ID, disp.lastSelected)
 	}
+	if disp.lastDest != echoAddr {
+		t.Fatalf("expected dispatcher destination %q, got %q", echoAddr, disp.lastDest)
+	}
 	if !strings.HasPrefix(disp.lastRemote, "127.0.0.1:") {
 		t.Fatalf("expected remote transport address to be IPv4 127.0.0.1:..., got %q", disp.lastRemote)
 	}
@@ -737,6 +789,12 @@ func TestDataplane_IPv4Client_To_LB_IPv6NaiveBackend_RoundTripAndFailover(t *tes
 		t.Fatalf("expected 1 dial to IPv4 backend, got %d", disp.dialCount[tunIPv4.ID])
 	}
 	disp.mu.Unlock()
+
+	muConn.Lock()
+	if len(proxyDestIPv4List) != 1 || proxyDestIPv4List[0] != echoAddr {
+		t.Fatalf("expected IPv4 proxy to receive CONNECT destination %q, got %v", echoAddr, proxyDestIPv4List)
+	}
+	muConn.Unlock()
 
 	// Scenario Part D: Flow accounting verification
 	stats := bridgeDev.FlowStats()
