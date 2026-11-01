@@ -138,6 +138,10 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 
 	userMaps := make([]map[string]any, len(users))
 	for i, u := range users {
+		shareToken := u.ShareToken
+		if sess := h.GetSession(r); sess != nil && sess.Role == models.RoleSupport && u.ID != sess.UserID {
+			shareToken = nil
+		}
 		userMaps[i] = map[string]any{
 			"id":                     u.ID,
 			"username":               u.Username,
@@ -155,7 +159,7 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 			"monthly_tx":             u.MonthlyTx,
 			"traffic_reset_strategy": u.TrafficResetStrategy,
 			"share_enabled":          u.ShareEnabled,
-			"share_token":            u.ShareToken,
+			"share_token":            shareToken,
 			"created_at":             u.CreatedAt,
 			"awg_mimicry":            u.AWGMimicry,
 		}

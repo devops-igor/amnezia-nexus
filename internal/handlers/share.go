@@ -182,12 +182,6 @@ func (h *Handlers) GetShareConnectionConfigHandler(w http.ResponseWriter, r *htt
 		return
 	}
 
-	proto := models.NormalizeProtocol(conn.Protocol)
-	if proto == models.ProtocolVLESS || proto == models.ProtocolNaive {
-		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required for VLESS and Naive protocols")
-		return
-	}
-
 	server, err := h.db.GetServer(ctx, conn.ServerID)
 	if err != nil || server == nil {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Server not found")

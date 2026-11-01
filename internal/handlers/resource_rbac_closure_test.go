@@ -149,12 +149,8 @@ func TestResourceRBACClosureShare(t *testing.T) {
 		t.Run("config/"+protocol, func(t *testing.T) {
 			path := fmt.Sprintf("/api/share/%s/config/share-%s", *user.ShareToken, protocol)
 			w := resourceRBACRequest(t, router, http.MethodPost, path, nil, nil)
-			want := http.StatusForbidden
-			if protocol == models.ProtocolAWG {
-				want = http.StatusOK
-			}
-			if w.Code != want {
-				t.Fatalf("status = %d, want %d; body: %s", w.Code, want, w.Body.String())
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
 			}
 		})
 	}
@@ -366,12 +362,12 @@ func TestResourceRBACClosureMyConnections(t *testing.T) {
 			for _, conn := range response.Connections {
 				switch conn["protocol"] {
 				case models.ProtocolVLESS:
-					if conn["client_id"] != "" {
-						t.Errorf("VLESS client_id = %v, want redacted", conn["client_id"])
+					if conn["client_id"] != "vless-secret" {
+						t.Errorf("VLESS client_id = %v, want unredacted vless-secret", conn["client_id"])
 					}
 				case models.ProtocolAWG:
 					if conn["client_id"] != "awg-secret" {
-						t.Errorf("AWG client_id = %v, want unredacted", conn["client_id"])
+						t.Errorf("AWG client_id = %v, want unredacted awg-secret", conn["client_id"])
 					}
 				}
 			}
@@ -504,10 +500,6 @@ func TestResourceRBACClosureAssignedVLESSNameRedaction(t *testing.T) {
 			sess: resourceRBACSession(models.RoleSupport), adminSess: resourceRBACSession(models.RoleAdmin),
 		},
 		{
-			name: "self connections", router: connectionsRouter, path: "/api/connections/",
-			sess: userSession, adminSess: adminSession,
-		},
-		{
 			name: "public share", router: setupFullShareRouter(h),
 			path: "/api/share/" + shareToken + "/connections",
 		},
@@ -541,6 +533,16 @@ func TestResourceRBACClosureAssignedVLESSNameRedaction(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("self connections owner unredacted", func(t *testing.T) {
+		w := resourceRBACRequest(t, connectionsRouter, http.MethodGet, "/api/connections/", userSession, nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d; body: %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), credential) {
+			t.Errorf("owner self connections credential presence = false, want true; body: %s", w.Body.String())
+		}
+	})
 
 	if _, err := db.UpdateConnection(ctx, conn.ID, map[string]any{"name": "My Phone"}); err != nil {
 		t.Fatalf("UpdateConnection friendly name: %v", err)
@@ -616,29 +618,15 @@ func TestResourceRBACClosureMyConnectionsPageCredentialBoundary(t *testing.T) {
 	userSess := resourceRBACSession(models.RoleUser)
 	userSess.UserID = userID
 	body, connections := readPage(t, userSess)
-	for _, credential := range []string{defaultCredential, legacyCredential, friendlyCredential} {
-		if strings.Contains(body, credential) {
-			t.Errorf("user response contains VLESS credential %q", credential)
+	for _, fixture := range fixtures {
+		if !strings.Contains(body, fixture.ClientID) {
+			t.Errorf("user response does not contain %s credential %q", fixture.ID, fixture.ClientID)
 		}
-	}
-	for _, fixture := range fixtures[:3] {
 		conn := connections[fixture.ID]
-		if conn.ClientID != "" {
-			t.Errorf("%s client_id = %q, want redacted", fixture.ID, conn.ClientID)
+		if conn.ClientID != fixture.ClientID || conn.Name != fixture.Name {
+			t.Errorf("user %s = {client_id:%q name:%q}, want {%q %q}",
+				fixture.ID, conn.ClientID, conn.Name, fixture.ClientID, fixture.Name)
 		}
-		wantName := fixture.Name
-		if fixture.ID != "page-vless-friendly" {
-			wantName = "Unnamed"
-		}
-		if conn.Name != wantName {
-			t.Errorf("%s name = %q, want %q", fixture.ID, conn.Name, wantName)
-		}
-	}
-	if got := connections["page-awg"].ClientID; got != awgCredential {
-		t.Errorf("AWG client_id = %q, want %q", got, awgCredential)
-	}
-	if got := connections["page-awg"].Name; got != "Office Laptop" {
-		t.Errorf("AWG name = %q, want Office Laptop", got)
 	}
 
 	adminSess := resourceRBACSession(models.RoleAdmin)

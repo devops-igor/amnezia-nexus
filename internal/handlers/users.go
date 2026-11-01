@@ -74,15 +74,10 @@ func (h *Handlers) ListUsersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	total := len(filtered)
-	start := (page - 1) * size
-	if start > total {
-		start = total
-	}
-	end := start + size
-	if end > total {
-		end = total
-	}
+	start := min((page-1)*size, total)
+	end := min(start+size, total)
 
+	sess := h.GetSession(r)
 	items := filtered[start:end]
 	userItems := make([]models.UserItemResponse, len(items))
 	for i, u := range items {
@@ -96,6 +91,11 @@ func (h *Handlers) ListUsersHandler(w http.ResponseWriter, r *http.Request) {
 		if u.ExpiresAt != nil {
 			s := u.ExpiresAt.Format(time.RFC3339)
 			expiresStr = &s
+		}
+
+		shareToken := u.ShareToken
+		if sess != nil && sess.Role == models.RoleSupport && u.ID != sess.UserID {
+			shareToken = nil
 		}
 
 		mimicryStr := string(u.AWGMimicry)
@@ -118,7 +118,7 @@ func (h *Handlers) ListUsersHandler(w http.ResponseWriter, r *http.Request) {
 			ExpiresAt:            expiresStr,
 			AWGMimicry:           &mimicryStr,
 			ShareEnabled:         u.ShareEnabled,
-			ShareToken:           u.ShareToken,
+			ShareToken:           shareToken,
 			HasSharePassword:     u.SharePasswordHash != nil && *u.SharePasswordHash != "",
 			Source:               source,
 		}
@@ -331,13 +331,12 @@ func (h *Handlers) provisionInitialConnection(ctx context.Context, user *models.
 }
 
 func applyExpirationUpdate(req *models.UpdateUserRequest, updates map[string]any) {
-	if req.ExpiresAt != nil {
-		if t, err := time.Parse(time.RFC3339, *req.ExpiresAt); err == nil {
-			updates["expires_at"] = t
-			updates["expiration_date"] = t
-		}
-	} else if req.ExpirationDate != nil {
-		if t, err := time.Parse(time.RFC3339, *req.ExpirationDate); err == nil {
+	exp := req.ExpiresAt
+	if exp == nil {
+		exp = req.ExpirationDate
+	}
+	if exp != nil {
+		if t, err := time.Parse(time.RFC3339, *exp); err == nil {
 			updates["expires_at"] = t
 			updates["expiration_date"] = t
 		}
@@ -400,10 +399,7 @@ func (h *Handlers) refreshSelfSessionCookie(w http.ResponseWriter, r *http.Reque
 func (h *Handlers) authorizeAccessPolicyUpdate(
 	w http.ResponseWriter, r *http.Request, userID string, req *models.UpdateUserRequest,
 ) bool {
-	if req.ExpiresAt == nil &&
-		req.ExpirationDate == nil &&
-		req.TrafficLimit == nil &&
-		req.TrafficResetStrategy == nil {
+	if req.ExpiresAt == nil && req.ExpirationDate == nil && req.TrafficLimit == nil && req.TrafficResetStrategy == nil {
 		return true
 	}
 	conns, err := h.db.GetConnectionsByUserID(r.Context(), userID)
@@ -455,6 +451,12 @@ func (h *Handlers) UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
 	if user.Role == models.RoleAdmin && !h.GetSession(r).IsAdmin() {
 		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin role required to update admin accounts")
 		return
+	}
+	if req.Password != nil && *req.Password != "" {
+		if sess := h.GetSession(r); sess == nil || (!sess.IsAdmin() && sess.UserID != userID) {
+			h.JSONError(w, http.StatusForbidden, "forbidden", "Admin role required to reset another user's password")
+			return
+		}
 	}
 
 	updates, passwordUpdated, err := buildUserUpdates(&req)
@@ -893,10 +895,9 @@ func (h *Handlers) GetUserConnectionsHandler(w http.ResponseWriter, r *http.Requ
 	for i, c := range conns {
 		srvName := serversMap[c.ServerID]
 		if srvName == "" {
+			srvName = fmt.Sprintf("Server #%d", c.ServerID)
 			if c.ServerID == 0 {
 				srvName = "Cluster (Auto)"
-			} else {
-				srvName = fmt.Sprintf("Server #%d", c.ServerID)
 			}
 		}
 		clientID := c.ClientID
@@ -935,6 +936,12 @@ func (h *Handlers) SetupUserShareHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	sess := h.GetSession(r)
+	if sess != nil && sess.Role != models.RoleAdmin && sess.UserID != userID {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Forbidden")
+		return
+	}
+
 	var req struct {
 		Enabled  *bool   `json:"enabled"`
 		Password *string `json:"password"`
@@ -951,12 +958,11 @@ func (h *Handlers) SetupUserShareHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	updates := make(map[string]any)
+	shareEnabled := true
 	if req.Enabled != nil {
-		updates["share_enabled"] = *req.Enabled
-	} else {
-		updates["share_enabled"] = true
+		shareEnabled = *req.Enabled
 	}
+	updates := map[string]any{"share_enabled": shareEnabled}
 
 	token := ""
 	if user.ShareToken != nil && *user.ShareToken != "" {
@@ -967,13 +973,11 @@ func (h *Handlers) SetupUserShareHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	if req.Password != nil {
+		hash := ""
 		if *req.Password != "" {
-			if hash, err := security.HashPassword(*req.Password); err == nil {
-				updates["share_password_hash"] = hash
-			}
-		} else {
-			updates["share_password_hash"] = ""
+			hash, _ = security.HashPassword(*req.Password)
 		}
+		updates["share_password_hash"] = hash
 	}
 
 	_, _ = h.db.UpdateUser(ctx, userID, updates)

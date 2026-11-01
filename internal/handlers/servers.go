@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -144,6 +146,18 @@ func (h *Handlers) DeleteServerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	force := false
+	if q := r.URL.Query().Get("force"); q == "true" || q == "1" {
+		force = true
+	} else if r.Body != nil {
+		var req struct {
+			Force bool `json:"force"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 65536)).Decode(&req); err == nil {
+			force = req.Force
+		}
+	}
+
 	ctx := r.Context()
 	server, err := h.db.GetServer(ctx, serverID)
 	if err != nil || server == nil {
@@ -151,7 +165,7 @@ func (h *Handlers) DeleteServerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.teardownAdminProtocols(w, r, server) {
+	if !h.teardownAdminProtocols(w, r, server, force) {
 		return
 	}
 

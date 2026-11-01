@@ -136,21 +136,23 @@ func TestUsersHandlers(t *testing.T) {
 			AWGMimicry:           &mim,
 		})
 		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/update", u.ID), bytes.NewReader(body))
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+	req = req.WithContext(middleware.WithSession(req.Context(), adminSess))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
 
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", w.Code)
-		}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
 
-		// Bad JSON
-		reqBad := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/update", u.ID), bytes.NewReader([]byte("bad-json")))
-		wBad := httptest.NewRecorder()
-		r.ServeHTTP(wBad, reqBad)
-		if wBad.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400, got %d", wBad.Code)
-		}
-	})
+	// Bad JSON
+	reqBad := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/users/%s/update", u.ID), bytes.NewReader([]byte("bad-json")))
+	reqBad = reqBad.WithContext(middleware.WithSession(reqBad.Context(), adminSess))
+	wBad := httptest.NewRecorder()
+	r.ServeHTTP(wBad, reqBad)
+	if wBad.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", wBad.Code)
+	}
+})
 
 	t.Run("ToggleUserHandler", func(t *testing.T) {
 		body, _ := json.Marshal(models.ToggleUserRequest{

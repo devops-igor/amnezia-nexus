@@ -37,6 +37,9 @@ func TestPhase4DashboardAndServerModernization(t *testing.T) {
 		"UI.confirm",
 		"API.post",
 		"UI.toast",
+		"server_unreachable",
+		"delete?force=true",
+		"'Force Remove'",
 	}
 	for _, token := range requiredIndexTokens {
 		if !strings.Contains(indexStr, token) {
