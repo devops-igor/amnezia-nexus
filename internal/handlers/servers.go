@@ -561,6 +561,9 @@ func buildInstallParams(req *models.InstallProtocolRequest, portExplicit bool) m
 				params["engine_profile"] = req.VLESSOptions.EngineProfile
 			}
 		}
+		if req.VLESSOptions.Mux != nil {
+			params["mux"] = *req.VLESSOptions.Mux
+		}
 	}
 	if req.NaiveOptions != nil {
 		params["naive_options"] = req.NaiveOptions

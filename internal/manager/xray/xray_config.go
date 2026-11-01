@@ -114,6 +114,32 @@ func GenerateShortID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// GenerateShortIDPool provisions a pool of 4 to 8 distinct random 8-byte hexadecimal short IDs,
+// plus an optional empty short ID ("") for REALITY clients that do not specify a short ID.
+func GenerateShortIDPool(count int) ([]string, error) {
+	if count < 4 {
+		count = 4
+	}
+	if count > 8 {
+		count = 8
+	}
+
+	seen := make(map[string]bool)
+	pool := make([]string, 0, count+1)
+	for len(pool) < count {
+		sid, err := GenerateShortID()
+		if err != nil {
+			return nil, fmt.Errorf("generate short id: %w", err)
+		}
+		if !seen[sid] {
+			seen[sid] = true
+			pool = append(pool, sid)
+		}
+	}
+	pool = append(pool, "")
+	return pool, nil
+}
+
 // RenderXrayConfig generates a production-hardened xray.json configuration.
 func RenderXrayConfig(
 	portPrimary int,
@@ -127,11 +153,11 @@ func RenderXrayConfig(
 	if portPrimary <= 0 {
 		portPrimary = 443
 	}
-	if portHigh <= 0 {
-		portHigh = 54321
-	}
 	if sni == "" {
-		sni = "gateway.icloud.com"
+		sni = DefaultDecoyDomain
+	}
+	if IsBlacklistedDecoyDomain(sni) {
+		return nil, fmt.Errorf("decoy domain %q is blacklisted as a known censor target", sni)
 	}
 	if dest == "" {
 		dest = net.JoinHostPort(sni, "443")
@@ -139,21 +165,11 @@ func RenderXrayConfig(
 		dest = net.JoinHostPort(dest, "443")
 	}
 	if len(shortIDs) == 0 {
-		sid, err := GenerateShortID()
+		pool, err := GenerateShortIDPool(8)
 		if err != nil {
 			return nil, err
 		}
-		shortIDs = []string{sid}
-	}
-
-	// Prepare vision clients
-	visionClients := make([]XrayClient, len(clients))
-	for i, c := range clients {
-		visionClients[i] = XrayClient{
-			ID:    c.ID,
-			Email: c.Email,
-			Flow:  "xtls-rprx-vision",
-		}
+		shortIDs = pool
 	}
 
 	cfg := XrayConfig{
@@ -166,26 +182,6 @@ func RenderXrayConfig(
 				Protocol: "vless",
 				Settings: XrayInboundSettings{
 					Clients:    clients,
-					Decryption: "none",
-				},
-				StreamSettings: XrayStreamSettings{
-					Network:  "tcp",
-					Security: "reality",
-					RealitySettings: XrayRealitySettings{
-						Show:        false,
-						Dest:        dest,
-						Xver:        0,
-						ServerNames: []string{sni},
-						PrivateKey:  realityPrivKey,
-						ShortIDs:    shortIDs,
-					},
-				},
-			},
-			{
-				Port:     portHigh,
-				Protocol: "vless",
-				Settings: XrayInboundSettings{
-					Clients:    visionClients,
 					Decryption: "none",
 				},
 				StreamSettings: XrayStreamSettings{
@@ -253,6 +249,7 @@ func BuildVLESSURI(
 	pbk string,
 	sid string,
 	flow string,
+	opts ...bool,
 ) (string, error) {
 	if host == "" {
 		return "", errors.New("host cannot be empty")
@@ -264,7 +261,12 @@ func BuildVLESSURI(
 		return "", errors.New("clientID cannot be empty")
 	}
 	if sni == "" {
-		sni = "gateway.icloud.com"
+		sni = DefaultDecoyDomain
+	}
+
+	mux := false
+	if len(opts) > 0 && opts[0] {
+		mux = true
 	}
 
 	query := url.Values{}
@@ -278,6 +280,9 @@ func BuildVLESSURI(
 	query.Set("type", "tcp")
 	if flow != "" && flow != "none" {
 		query.Set("flow", flow)
+	}
+	if mux {
+		query.Set("mux", "true")
 	}
 
 	u := url.URL{

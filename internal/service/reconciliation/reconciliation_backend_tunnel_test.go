@@ -122,7 +122,7 @@ func TestReconciler_PreservesBackendTunnelClients_VLESS(t *testing.T) {
 	vlessParams, err := json.Marshal(models.VLESSRealityParams{
 		UUID:        vlessUUID,
 		PublicKey:   "test-pub-key",
-		ServerName:  "gateway.icloud.com",
+		ServerName:  "www.microsoft.com",
 		Fingerprint: "chrome",
 	})
 	if err != nil {

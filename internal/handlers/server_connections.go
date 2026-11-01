@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/xray"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"github.com/go-chi/chi/v5"
@@ -483,6 +484,10 @@ func (h *Handlers) GetServerConnectionConfigHandler(w http.ResponseWriter, r *ht
 	if err != nil {
 		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", err.Error())
 		return
+	}
+
+	if muxStr := r.URL.Query().Get("mux"); muxStr != "" {
+		ctx = xray.WithMuxContext(ctx, strings.EqualFold(muxStr, "true"))
 	}
 
 	configStr, err := protoMgr.GetClientConfig(ctx, server, req.ClientID)

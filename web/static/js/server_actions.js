@@ -204,7 +204,7 @@ async function installProtocol() {
             const vlessFlowEl = document.getElementById('installVlessFlow');
             params.vless_options = {
                 port: port,
-                server_name: vlessSniEl ? vlessSniEl.value.trim() : 'gateway.icloud.com',
+                server_name: vlessSniEl ? vlessSniEl.value.trim() : 'www.microsoft.com',
                 flow: vlessFlowEl ? vlessFlowEl.value : 'xtls-rprx-vision'
             };
         }

@@ -55,7 +55,7 @@ func seedXrayConfig(t *testing.T, mock *mockXraySSHClient) {
 	if err != nil {
 		t.Fatalf("GenerateRealityKeypair: %v", err)
 	}
-	cfg, err := RenderXrayConfig(443, 54321, "gateway.icloud.com", "gateway.icloud.com:443", priv, []string{"0123456789abcdef"}, nil)
+	cfg, err := RenderXrayConfig(443, 54321, "www.microsoft.com", "www.microsoft.com:443", priv, []string{"0123456789abcdef"}, nil)
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}

@@ -3,7 +3,9 @@ package handlers
 import (
 	"fmt"
 	"net/http"
+	"strings"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/xray"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/security"
@@ -198,6 +200,10 @@ func (h *Handlers) GetShareConnectionConfigHandler(w http.ResponseWriter, r *htt
 	if err != nil {
 		h.JSONError(w, http.StatusBadRequest, "invalid_protocol", err.Error())
 		return
+	}
+
+	if muxStr := r.URL.Query().Get("mux"); muxStr != "" {
+		ctx = xray.WithMuxContext(ctx, strings.EqualFold(muxStr, "true"))
 	}
 
 	configStr, err := protoMgr.GetClientConfig(ctx, server, conn.ClientID)
