@@ -33,6 +33,11 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 			t.Fatalf("CreateUser(%s): %v", user.Role, err)
 		}
 	}
+	userB := &models.User{ID: "self-user-b", Username: "self-user-b", Role: models.RoleUser, Enabled: true}
+	if _, err := db.CreateUser(ctx, userB); err != nil {
+		t.Fatalf("CreateUser(userB): %v", err)
+	}
+
 	if err := db.SetSetting(ctx, "limits", models.ConnectionLimits{
 		MaxConnectionsPerUser:     100,
 		ConnectionRateLimitCount:  100,
@@ -63,7 +68,7 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 	router.Get("/api/connections/{connection_id}/config", h.UserGetConnectionConfigHandler)
 	router.Post("/api/connections/{connection_id}/delete", h.UserDeleteConnectionHandler)
 
-	request := func(method, path string, role models.UserRole, body any) *httptest.ResponseRecorder {
+	request := func(method, path string, user *models.User, body any) *httptest.ResponseRecorder {
 		t.Helper()
 		var payload []byte
 		if body != nil {
@@ -75,22 +80,23 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 		}
 		req := httptest.NewRequest(method, path, bytes.NewReader(payload))
 		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
-			UserID: users[role].ID,
-			Role:   role,
+			UserID: user.ID,
+			Role:   user.Role,
 		}))
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 		return w
 	}
-	seed := func(protocol, suffix string) *models.UserConnection {
+
+	seedForUser := func(ownerID, protocol, suffix string) *models.UserConnection {
 		t.Helper()
-		clientID := "client-1" // present in the mocked AWG clients table
-		if strings.HasSuffix(suffix, "delete") {
-			clientID = fmt.Sprintf("client-%s-%s", protocol, suffix)
+		clientID := "client-1" // present in mocked AWG clients table
+		if strings.HasSuffix(suffix, "delete") || protocol != models.ProtocolAWG {
+			clientID = fmt.Sprintf("client-%s-%s-%d", protocol, suffix, time.Now().UnixNano())
 		}
 		conn := &models.UserConnection{
-			ID:        fmt.Sprintf("rbac-%s-%s", protocol, suffix),
-			UserID:    users[models.RoleUser].ID,
+			ID:        fmt.Sprintf("rbac-%s-%s-%d", protocol, suffix, time.Now().UnixNano()),
+			UserID:    ownerID,
 			ServerID:  serverID,
 			Protocol:  protocol,
 			ClientID:  clientID,
@@ -102,20 +108,8 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 		}
 		return conn
 	}
-	assertForbidden := func(w *httptest.ResponseRecorder) {
-		t.Helper()
-		if w.Code != http.StatusForbidden {
-			t.Fatalf("status = %d, want 403; body: %s", w.Code, w.Body.String())
-		}
-		var response map[string]any
-		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
-			t.Fatalf("decode forbidden response: %v", err)
-		}
-		if response["error"] != "forbidden" {
-			t.Errorf("error = %v, want forbidden", response["error"])
-		}
-	}
 
+	// 1. Self-service add connections for regular user, support, and admin
 	addCases := []struct {
 		name     string
 		protocol string
@@ -127,64 +121,133 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 		{name: "naive legacy alias", protocol: "naiveproxy", path: "/api/my/connections/add"},
 	}
 	for _, tc := range addCases {
-		for _, role := range []models.UserRole{models.RoleUser, models.RoleSupport} {
+		for _, role := range []models.UserRole{models.RoleUser, models.RoleSupport, models.RoleAdmin} {
 			t.Run(fmt.Sprintf("add %s %s", tc.name, role), func(t *testing.T) {
-				w := request(http.MethodPost, tc.path, role, models.MyAddConnectionRequest{
+				w := request(http.MethodPost, tc.path, users[role], models.MyAddConnectionRequest{
 					ServerID: serverID,
 					Protocol: tc.protocol,
-					Name:     fmt.Sprintf("denied-%s-%s", tc.protocol, role),
+					Name:     fmt.Sprintf("ok-%s-%s", tc.protocol, role),
 				})
-				assertForbidden(w)
-			})
-		}
-	}
-
-	for _, protocol := range []string{models.ProtocolVLESS, "vless-reality", models.ProtocolNaive, "naiveproxy"} {
-		for _, role := range []models.UserRole{models.RoleUser, models.RoleSupport} {
-			t.Run(fmt.Sprintf("config and delete %s %s", protocol, role), func(t *testing.T) {
-				conn := seed(protocol, string(role))
-				assertForbidden(request(http.MethodGet, fmt.Sprintf("/api/connections/%s/config", conn.ID), role, nil))
-				assertForbidden(request(http.MethodPost, fmt.Sprintf("/api/connections/%s/delete", conn.ID), role, nil))
-				remaining, err := db.GetConnection(ctx, conn.ID)
-				if err != nil || remaining == nil {
-					t.Errorf("forbidden delete removed connection: remaining=%v err=%v", remaining, err)
+				if w.Code != http.StatusOK {
+					t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+				}
+				var resp map[string]any
+				if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+					t.Fatalf("Unmarshal add response: %v", err)
+				}
+				if resp["status"] != "ok" {
+					t.Errorf("status = %v, want ok", resp["status"])
+				}
+				if cfg, _ := resp["config"].(string); cfg == "" {
+					t.Errorf("expected non-empty config in add response")
 				}
 			})
 		}
 	}
 
-	for _, protocol := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
-		t.Run("admin add "+protocol, func(t *testing.T) {
-			w := request(http.MethodPost, "/api/connections/add", models.RoleAdmin, models.MyAddConnectionRequest{
-				ServerID: serverID,
-				Protocol: protocol,
-				Name:     "admin-add-" + protocol,
+	// 2. Self-service config retrieval and deletion for owned connections
+	for _, protocol := range []string{models.ProtocolVLESS, "vless-reality", models.ProtocolNaive, "naiveproxy"} {
+		for _, role := range []models.UserRole{models.RoleUser, models.RoleSupport, models.RoleAdmin} {
+			t.Run(fmt.Sprintf("config and delete %s %s", protocol, role), func(t *testing.T) {
+				user := users[role]
+				conn := seedForUser(user.ID, protocol, string(role)+"-lifecycle")
+
+				// Get config succeeds
+				w := request(http.MethodGet, fmt.Sprintf("/api/connections/%s/config", conn.ID), user, nil)
+				if w.Code != http.StatusOK {
+					t.Fatalf("config status = %d, want 200; body: %s", w.Code, w.Body.String())
+				}
+				var cfgResp map[string]any
+				if err := json.Unmarshal(w.Body.Bytes(), &cfgResp); err != nil {
+					t.Fatalf("Unmarshal config response: %v", err)
+				}
+				if cfg, _ := cfgResp["config"].(string); cfg == "" {
+					t.Errorf("expected non-empty config in config response")
+				}
+
+				// Delete succeeds and cleans database
+				deleteConn := seedForUser(user.ID, protocol, string(role)+"-delete")
+				w = request(http.MethodPost, fmt.Sprintf("/api/connections/%s/delete", deleteConn.ID), user, nil)
+				if w.Code != http.StatusOK {
+					t.Fatalf("delete status = %d, want 200; body: %s", w.Code, w.Body.String())
+				}
+				remaining, err := db.GetConnection(ctx, deleteConn.ID)
+				if err != nil || remaining != nil {
+					t.Errorf("delete did not remove connection from db: remaining=%v err=%v", remaining, err)
+				}
 			})
-			if w.Code != http.StatusOK {
-				t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
-			}
-		})
-		t.Run("admin config and delete "+protocol, func(t *testing.T) {
-			configConn := seed(protocol, "admin-config")
-			w := request(http.MethodGet, fmt.Sprintf("/api/connections/%s/config", configConn.ID), models.RoleAdmin, nil)
-			if w.Code != http.StatusOK {
-				t.Fatalf("config status = %d, want 200; body: %s", w.Code, w.Body.String())
-			}
-			deleteConn := seed(protocol, "admin-delete")
-			w = request(http.MethodPost, fmt.Sprintf("/api/connections/%s/delete", deleteConn.ID), models.RoleAdmin, nil)
-			if w.Code != http.StatusOK {
-				t.Fatalf("delete status = %d, want 200; body: %s", w.Code, w.Body.String())
-			}
-			remaining, err := db.GetConnection(ctx, deleteConn.ID)
-			if err != nil || remaining != nil {
-				t.Errorf("admin delete did not remove connection: remaining=%v err=%v", remaining, err)
-			}
-		})
+		}
 	}
 
+	// 3. Cross-user tenant isolation
+	t.Run("cross-user tenant isolation", func(t *testing.T) {
+		for _, protocol := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
+			userA := users[models.RoleUser]
+			connA := seedForUser(userA.ID, protocol, "isolation-owner")
+
+			// User B attempts to retrieve User A's config -> 404
+			w := request(http.MethodGet, fmt.Sprintf("/api/connections/%s/config", connA.ID), userB, nil)
+			if w.Code != http.StatusNotFound {
+				t.Errorf("cross-user config status = %d, want 404; body: %s", w.Code, w.Body.String())
+			}
+
+			// User B attempts to delete User A's connection -> 404
+			w = request(http.MethodPost, fmt.Sprintf("/api/connections/%s/delete", connA.ID), userB, nil)
+			if w.Code != http.StatusNotFound {
+				t.Errorf("cross-user delete status = %d, want 404; body: %s", w.Code, w.Body.String())
+			}
+
+			// Verify connection row is untouched
+			remaining, err := db.GetConnection(ctx, connA.ID)
+			if err != nil || remaining == nil {
+				t.Errorf("cross-user delete removed connection: remaining=%v err=%v", remaining, err)
+			}
+		}
+	})
+
+	// 4. Connection limits and quota enforcement
+	t.Run("quota and connection limits enforcement", func(t *testing.T) {
+		limitUser := &models.User{
+			ID: "quota-user", Username: "quota-user", Role: models.RoleUser, Enabled: true,
+			Limits: map[string]any{"max_connections_per_user": float64(1)},
+		}
+		if _, err := db.CreateUser(ctx, limitUser); err != nil {
+			t.Fatalf("CreateUser(quota-user): %v", err)
+		}
+
+		// First connection succeeds
+		w := request(http.MethodPost, "/api/connections/add", limitUser, models.MyAddConnectionRequest{
+			ServerID: serverID,
+			Protocol: models.ProtocolVLESS,
+			Name:     "quota-conn-1",
+		})
+		if w.Code != http.StatusOK {
+			t.Fatalf("first connection status = %d, want 200; body: %s", w.Code, w.Body.String())
+		}
+
+		// Second connection fails due to limit reached (HTTP 428 Precondition Required)
+		w = request(http.MethodPost, "/api/connections/add", limitUser, models.MyAddConnectionRequest{
+			ServerID: serverID,
+			Protocol: models.ProtocolNaive,
+			Name:     "quota-conn-2",
+		})
+		if w.Code != http.StatusPreconditionRequired {
+			t.Fatalf("second connection status = %d, want 428; body: %s", w.Code, w.Body.String())
+		}
+		var errResp map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+			t.Fatalf("Unmarshal limit response: %v", err)
+		}
+		if errResp["error"] != "max_connections_reached" {
+			t.Errorf("error = %v, want max_connections_reached", errResp["error"])
+		}
+	})
+
+	// 5. AWG protocol regression verification
 	for _, role := range []models.UserRole{models.RoleUser, models.RoleSupport} {
 		t.Run("AWG remains available to "+string(role), func(t *testing.T) {
-			w := request(http.MethodPost, "/api/connections/add", role, models.MyAddConnectionRequest{
+			user := users[role]
+			w := request(http.MethodPost, "/api/connections/add", user, models.MyAddConnectionRequest{
 				ServerID: serverID,
 				Protocol: models.ProtocolAWG,
 				Name:     "awg-add-" + string(role),
@@ -192,13 +255,13 @@ func TestSelfServiceConnectionProtocolRBAC(t *testing.T) {
 			if w.Code != http.StatusOK {
 				t.Fatalf("add status = %d, want 200; body: %s", w.Code, w.Body.String())
 			}
-			configConn := seed(models.ProtocolAWG, string(role)+"-config")
-			w = request(http.MethodGet, fmt.Sprintf("/api/connections/%s/config", configConn.ID), role, nil)
+			configConn := seedForUser(user.ID, models.ProtocolAWG, string(role)+"-config")
+			w = request(http.MethodGet, fmt.Sprintf("/api/connections/%s/config", configConn.ID), user, nil)
 			if w.Code != http.StatusOK {
 				t.Fatalf("config status = %d, want 200; body: %s", w.Code, w.Body.String())
 			}
-			deleteConn := seed(models.ProtocolAWG, string(role)+"-delete")
-			w = request(http.MethodPost, fmt.Sprintf("/api/connections/%s/delete", deleteConn.ID), role, nil)
+			deleteConn := seedForUser(user.ID, models.ProtocolAWG, string(role)+"-delete")
+			w = request(http.MethodPost, fmt.Sprintf("/api/connections/%s/delete", deleteConn.ID), user, nil)
 			if w.Code != http.StatusOK {
 				t.Fatalf("delete status = %d, want 200; body: %s", w.Code, w.Body.String())
 			}

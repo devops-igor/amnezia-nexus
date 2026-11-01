@@ -105,10 +105,6 @@ func (h *Handlers) UserGetMyConnectionsHandler(w http.ResponseWriter, r *http.Re
 
 		clientID := c.ClientID
 		connName := c.Name
-		if models.NormalizeProtocol(c.Protocol) == models.ProtocolVLESS && sess.Role != models.RoleAdmin {
-			clientID = ""
-			connName = safeVLESSDisplayName(connName, c.ClientID)
-		}
 		enriched[i] = map[string]any{
 			"id":               c.ID,
 			"user_id":          c.UserID,
@@ -165,12 +161,6 @@ func (h *Handlers) UserAddConnectionHandler(w http.ResponseWriter, r *http.Reque
 
 	if err := req.Validate(); err != nil {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
-		return
-	}
-
-	proto := models.NormalizeProtocol(req.Protocol)
-	if (proto == models.ProtocolVLESS || proto == models.ProtocolNaive) && sess.Role != models.RoleAdmin {
-		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required for VLESS and Naive protocols")
 		return
 	}
 
@@ -422,11 +412,6 @@ func (h *Handlers) UserGetConnectionConfigHandler(w http.ResponseWriter, r *http
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
 		return
 	}
-	proto := models.NormalizeProtocol(conn.Protocol)
-	if (proto == models.ProtocolVLESS || proto == models.ProtocolNaive) && sess.Role != models.RoleAdmin {
-		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required for VLESS and Naive protocols")
-		return
-	}
 
 	if conn.ServerID == 0 {
 		if h.vpnSvc == nil {
@@ -567,11 +552,6 @@ func (h *Handlers) UserDeleteConnectionHandler(w http.ResponseWriter, r *http.Re
 	}
 	if sess.Role != models.RoleAdmin && sess.Role != models.RoleSupport && conn.UserID != sess.UserID {
 		h.JSONError(w, http.StatusNotFound, "not_found", "Connection not found")
-		return
-	}
-	proto := models.NormalizeProtocol(conn.Protocol)
-	if (proto == models.ProtocolVLESS || proto == models.ProtocolNaive) && sess.Role != models.RoleAdmin {
-		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required for VLESS and Naive protocols")
 		return
 	}
 

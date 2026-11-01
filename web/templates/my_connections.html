@@ -356,7 +356,9 @@
         const protoDisplay = {
             awg: 'AmneziaWG',
             telemt: 'MTProxyL',
-            dns: 'AmneziaDNS'
+            dns: 'AmneziaDNS',
+            vless: 'Xray (VLESS+REALITY)',
+            naive: 'NaiveProxy'
         };
         const isLB = conn.server_id === 0;
         const name = UI.escapeHtml(conn.name || 'VPN Connection');
@@ -481,7 +483,9 @@
         const protoNames = {
             awg: 'AmneziaWG',
             telemt: 'MTProxyL (Telegram Proxy)',
-            dns: 'AmneziaDNS'
+            dns: 'AmneziaDNS',
+            vless: 'Xray (VLESS+REALITY)',
+            naive: 'NaiveProxy'
         };
 
         for (const [proto, info] of Object.entries(protocols)) {
@@ -636,15 +640,17 @@
 
             if (result && result.config) {
                 const conn = result.connection;
+                const connName = (conn && conn.name) || result.name || 'Connection';
+                const proto = (conn && conn.protocol) || result.protocol || '';
                 currentConfig = result.config;
                 currentVpnLink = result.vpn_link || '';
-                currentConfigName = (conn && conn.name || 'Connection').replace(/\s+/g, '_');
-                document.getElementById('configModalTitle').textContent = `${_('config')} - ${conn && conn.name || 'Connection'}`;
+                currentConfigName = connName.replace(/\s+/g, '_');
+                document.getElementById('configModalTitle').textContent = `${_('config')} - ${connName}`;
                 document.getElementById('configText').textContent = result.config;
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
 
                 const vpnTab = document.querySelectorAll('.config-tab')[1];
-                if (conn && conn.protocol === 'telemt') {
+                if (proto === 'telemt') {
                     vpnTab.style.display = 'none';
                 } else {
                     vpnTab.style.display = '';
