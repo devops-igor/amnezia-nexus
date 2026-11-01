@@ -207,6 +207,15 @@ func TestQRTemplateExecution(t *testing.T) {
 		"proto_title":  func(p any) string { return fmt.Sprint(p) },
 		"is_installed": func(v any) bool { return true },
 		"format_time":  func(t any) string { return "" },
+		"lower":        func(s any) string { return strings.ToLower(fmt.Sprint(s)) },
+		"is_admin": func(u any) bool {
+			if m, ok := u.(map[string]any); ok {
+				if r, ok := m["Role"].(string); ok {
+					return strings.EqualFold(r, "admin")
+				}
+			}
+			return false
+		},
 		"get": func(target any, key any, defaultVal ...any) any {
 			if len(defaultVal) > 0 {
 				return defaultVal[0]
