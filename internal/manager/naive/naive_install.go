@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -11,6 +13,9 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
+
+// ErrDNSValidation is returned when pre-flight domain DNS validation fails.
+var ErrDNSValidation = errors.New("pre-flight DNS validation failed")
 
 func parseNaiveInstallOptions(params map[string]any, defaultHost string) (int, string) {
 	port := 443
@@ -53,6 +58,160 @@ func parseNaiveInstallOptions(params map[string]any, defaultHost string) (int, s
 		}
 	}
 	return port, domain
+}
+
+func shouldSkipDNSValidation(params map[string]any) bool {
+	if params == nil {
+		return false
+	}
+	checkMap := func(m map[string]any) bool {
+		for _, k := range []string{"skip_dns_validation", "skip_dns_check"} {
+			if val, ok := m[k]; ok {
+				switch v := val.(type) {
+				case bool:
+					if v {
+						return true
+					}
+				case string:
+					if strings.EqualFold(v, "true") || v == "1" {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+
+	if checkMap(params) {
+		return true
+	}
+	if no, ok := params["naive_options"]; ok && no != nil {
+		if optMap, ok := no.(map[string]any); ok {
+			if checkMap(optMap) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func getTestOverrideIPs(params map[string]any) ([]net.IP, bool) {
+	if params == nil {
+		return nil, false
+	}
+	extract := func(m map[string]any) ([]net.IP, bool) {
+		if raw, ok := m["test_override_ips"]; ok {
+			switch v := raw.(type) {
+			case []string:
+				var ips []net.IP
+				for _, s := range v {
+					if ip := net.ParseIP(s); ip != nil {
+						ips = append(ips, ip)
+					}
+				}
+				return ips, true
+			case []net.IP:
+				return v, true
+			}
+		}
+		if raw, ok := m["test_override_ip"]; ok {
+			if s, ok := raw.(string); ok {
+				if ip := net.ParseIP(s); ip != nil {
+					return []net.IP{ip}, true
+				}
+			}
+		}
+		return nil, false
+	}
+
+	if ips, ok := extract(params); ok {
+		return ips, true
+	}
+	if no, ok := params["naive_options"]; ok && no != nil {
+		if optMap, ok := no.(map[string]any); ok {
+			if ips, ok := extract(optMap); ok {
+				return ips, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func resolveHost(ctx context.Context, host string, lookupFn DNSLookupFunc, params map[string]any) ([]net.IP, error) {
+	if lookupFn != nil {
+		return lookupFn(ctx, host)
+	}
+	if overrideIPs, ok := getTestOverrideIPs(params); ok {
+		return overrideIPs, nil
+	}
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
+func (m *NaiveManager) validateDomainDNS(ctx context.Context, domain string, serverHost string, params map[string]any) error {
+	if isTestDomainOrIP(domain) {
+		return nil
+	}
+	if shouldSkipDNSValidation(params) {
+		return nil
+	}
+
+	lookupFn := m.getDNSLookup()
+	ips, err := resolveHost(ctx, domain, lookupFn, params)
+	if err != nil {
+		return fmt.Errorf("%w: domain %q does not resolve: %w", ErrDNSValidation, domain, err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("%w: domain %q resolved to no IP addresses, expected server IP %q", ErrDNSValidation, domain, serverHost)
+	}
+
+	cleanHost := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(serverHost), "["), "]")
+	serverIP := net.ParseIP(cleanHost)
+	if serverIP != nil && (serverIP.IsPrivate() || serverIP.IsLoopback()) {
+		slog.Info("allowing naive installation with private/loopback server host behind NAT",
+			"server_host", serverHost, "domain", domain)
+		return nil
+	}
+
+	var resolvedStrs []string
+	for _, ip := range ips {
+		resolvedStrs = append(resolvedStrs, ip.String())
+	}
+
+	matched := false
+	if serverIP != nil {
+		for _, ip := range ips {
+			if ip.Equal(serverIP) {
+				matched = true
+				break
+			}
+		}
+	} else if strings.EqualFold(cleanHost, domain) {
+		matched = true
+	} else {
+		hostIPs, hostErr := resolveHost(ctx, cleanHost, lookupFn, params)
+		if hostErr != nil {
+			return fmt.Errorf("%w: server host %q could not be resolved: %w", ErrDNSValidation, serverHost, hostErr)
+		}
+		if len(hostIPs) == 0 {
+			return fmt.Errorf("%w: server host %q resolved to no IP addresses", ErrDNSValidation, serverHost)
+		}
+		for _, dIP := range ips {
+			for _, hIP := range hostIPs {
+				if dIP.Equal(hIP) {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+	}
+
+	if !matched {
+		return fmt.Errorf("%w: domain %q resolves to [%s], expected server IP %q", ErrDNSValidation, domain, strings.Join(resolvedStrs, ", "), serverHost)
+	}
+	return nil
 }
 
 func (m *NaiveManager) resolveExistingClients(ctx context.Context, client ssh.SSHClient) ([]NaiveClient, error) {
@@ -130,12 +289,12 @@ func (m *NaiveManager) buildAndLaunchContainer(ctx context.Context, client ssh.S
 --tmpfs /tmp:rw,noexec,nosuid,size=16m \
 --tmpfs /run:rw,noexec,nosuid,size=16m \
 -v %s:/etc/caddy:ro \
--v %s:/srv:ro \
+-v %s:/var/www/html:ro \
 -v %s:/data \
 %s`,
 		ssh.EscapeShellArg(NaiveContainerName),
 		ssh.EscapeShellArg(NaiveConfigDir),
-		ssh.EscapeShellArg(NaiveHTMLDir),
+		ssh.EscapeShellArg(NaiveWWWDir),
 		ssh.EscapeShellArg(NaiveDataVolume),
 		ssh.EscapeShellArg(NaiveBaseImage),
 	)
@@ -178,15 +337,23 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 	// 2. Parse installation options
 	port, domain := parseNaiveInstallOptions(params, server.Host)
 
+	// Pre-flight DNS validation: ensure public domains resolve to server.Host before writing config or launching container
+	if err := m.validateDomainDNS(ctx, domain, server.Host, params); err != nil {
+		return err
+	}
+
 	// 3. Create directory structure
-	mkdirCmd := fmt.Sprintf("mkdir -p %s && chmod 0700 %s", ssh.EscapeShellArg(NaiveHTMLDir), ssh.EscapeShellArg(NaiveConfigDir))
+	mkdirCmd := fmt.Sprintf("mkdir -p %s && chmod 0700 %s && chmod 0755 %s",
+		ssh.EscapeShellArg(NaiveWWWDir),
+		ssh.EscapeShellArg(NaiveConfigDir),
+		ssh.EscapeShellArg(NaiveWWWDir),
+	)
 	if _, errOut, code, err := client.RunSudoCommand(ctx, mkdirCmd); err != nil || code != 0 {
 		return fmt.Errorf("failed to create naive directories (code %d): %s: %w", code, errOut, err)
 	}
 
 	// 4. Deploy static decoy website
-	decoyHTML := DefaultDecoyHTML()
-	if err := client.UploadSudoFile(ctx, fmt.Sprintf("%s/index.html", NaiveHTMLDir), []byte(decoyHTML), 0644); err != nil {
+	if err := client.UploadSudoFile(ctx, fmt.Sprintf("%s/index.html", NaiveWWWDir), minecraftDecoyHTML, 0644); err != nil {
 		return fmt.Errorf("upload decoy index.html: %w", err)
 	}
 

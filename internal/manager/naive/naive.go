@@ -2,8 +2,10 @@ package naive
 
 import (
 	"context"
+	_ "embed"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -16,16 +18,23 @@ import (
 const (
 	NaiveContainerName = "amnezia-caddy"
 	NaiveConfigDir     = "/opt/amnezia/caddy"
-	NaiveHTMLDir       = "/opt/amnezia/caddy/html"
+	NaiveWWWDir        = "/opt/amnezia/caddy/www"
+	NaiveHTMLDir       = NaiveWWWDir
 	NaiveCaddyfilePath = "/opt/amnezia/caddy/Caddyfile"
 	NaiveDataVolume    = "amnezia-caddy-data"
 	NaiveBaseImage     = "amnezia-caddy:local"
 )
 
+//go:embed assets/decoy/minecraft/index.html
+var minecraftDecoyHTML []byte
+
 // SSHProvider abstracts obtaining an SSHClient for a server.
 type SSHProvider interface {
 	Get(ctx context.Context, server *models.Server) (ssh.SSHClient, error)
 }
+
+// DNSLookupFunc abstracts DNS resolution for pre-flight domain validation.
+type DNSLookupFunc func(ctx context.Context, host string) ([]net.IP, error)
 
 // NaiveManager implements manager.ProtocolManager for NaiveProxy via Caddy forward_proxy.
 //
@@ -34,6 +43,20 @@ type NaiveManager struct {
 	sshPool     SSHProvider
 	serverLocks *awg.ServerLockRegistry
 	mu          sync.Mutex
+	dnsLookup   DNSLookupFunc
+}
+
+// SetDNSLookup sets a custom DNS lookup function for pre-flight domain validation (used in tests).
+func (m *NaiveManager) SetDNSLookup(fn DNSLookupFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dnsLookup = fn
+}
+
+func (m *NaiveManager) getDNSLookup() DNSLookupFunc {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.dnsLookup
 }
 
 // NewNaiveManager creates a new NaiveManager instance.
