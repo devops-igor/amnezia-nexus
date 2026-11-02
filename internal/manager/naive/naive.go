@@ -39,13 +39,14 @@ var minecraftDecoyHTML []byte
 var creativeStudioDecoyHTML []byte
 
 // GetDecoyHTML returns the static HTML content for the specified decoy theme.
-// It returns the Creative Studio asset for "creative-studio", and falls back to
-// the Minecraft Community asset for "minecraft", "default", or any empty/unknown theme.
+// It returns the Creative Studio asset for "creative-studio" (or "portfolio"),
+// and falls back to the Minecraft Community asset for "minecraft", "voxelnet",
+// "default", or any empty/unknown theme.
 func GetDecoyHTML(theme string) []byte {
 	switch strings.ToLower(strings.TrimSpace(theme)) {
-	case DecoyThemeCreativeStudio:
+	case DecoyThemeCreativeStudio, "portfolio":
 		return creativeStudioDecoyHTML
-	case DecoyThemeMinecraft, DecoyThemeDefault:
+	case DecoyThemeMinecraft, "voxelnet", DecoyThemeDefault:
 		return minecraftDecoyHTML
 	default:
 		return minecraftDecoyHTML

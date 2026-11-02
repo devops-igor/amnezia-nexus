@@ -340,6 +340,12 @@ func TestGetDecoyHTML(t *testing.T) {
 			wantTemplate: creativeStudioDecoyHTML,
 		},
 		{
+			name:         "portfolio alias returns Creative Studio template",
+			theme:        "portfolio",
+			wantSnippet:  "Aura Creative Studio",
+			wantTemplate: creativeStudioDecoyHTML,
+		},
+		{
 			name:         "minecraft returns Minecraft template",
 			theme:        DecoyThemeMinecraft,
 			wantSnippet:  "VOXELNET",
@@ -348,6 +354,12 @@ func TestGetDecoyHTML(t *testing.T) {
 		{
 			name:         "minecraft case-insensitive with whitespace",
 			theme:        "  MINECRAFT  ",
+			wantSnippet:  "VOXELNET",
+			wantTemplate: minecraftDecoyHTML,
+		},
+		{
+			name:         "voxelnet alias returns Minecraft template",
+			theme:        "voxelnet",
 			wantSnippet:  "VOXELNET",
 			wantTemplate: minecraftDecoyHTML,
 		},
