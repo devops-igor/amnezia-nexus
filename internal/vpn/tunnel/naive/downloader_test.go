@@ -209,6 +209,34 @@ func TestEnsureNaiveBinary_IdempotentCache(t *testing.T) {
 	}
 }
 
+func TestGetNaiveBinPath_Resolution(t *testing.T) {
+	// 1. NAIVE_BIN_PATH env var takes highest precedence
+	customPath := filepath.Join(t.TempDir(), "custom-naive")
+	t.Setenv(NaiveBinPathEnv, customPath)
+	if got := GetNaiveBinPath(); got != customPath {
+		t.Errorf("expected %q, got %q", customPath, got)
+	}
+
+	// 2. Unset env var
+	t.Setenv(NaiveBinPathEnv, "")
+
+	// In current test environment without /app/data or ./data, falls back to DefaultNaiveBinPath or ./data if created
+	gotDefault := GetNaiveBinPath()
+	if fi, err := os.Stat("/app/data"); err == nil && fi.IsDir() {
+		if gotDefault != "/app/data/bin/naive" {
+			t.Errorf("expected /app/data/bin/naive, got %q", gotDefault)
+		}
+	} else if fi, err := os.Stat("./data"); err == nil && fi.IsDir() {
+		if gotDefault != "./data/bin/naive" {
+			t.Errorf("expected ./data/bin/naive, got %q", gotDefault)
+		}
+	} else {
+		if gotDefault != DefaultNaiveBinPath {
+			t.Errorf("expected %q, got %q", DefaultNaiveBinPath, gotDefault)
+		}
+	}
+}
+
 // Ensure tar import is kept for tests
 var _ = tar.Header{}
 var _ = bytes.Buffer{}

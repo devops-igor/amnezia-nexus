@@ -56,6 +56,12 @@ func GetNaiveBinPath() string {
 	if p := os.Getenv(NaiveBinPathEnv); p != "" {
 		return filepath.Clean(p)
 	}
+	if fi, err := os.Stat("/app/data"); err == nil && fi.IsDir() {
+		return "/app/data/bin/naive"
+	}
+	if fi, err := os.Stat("./data"); err == nil && fi.IsDir() {
+		return "./data/bin/naive"
+	}
 	return DefaultNaiveBinPath
 }
 
@@ -94,6 +100,11 @@ func ResolveDownloadURL(baseURL, tag, arch string) (downloadURL, sha256Hex strin
 
 	downloadURL = fmt.Sprintf("%s/%s/%s", strings.TrimRight(baseURL, "/"), tag, assetName)
 	return downloadURL, expectedSHA, nil
+}
+
+// IsBinaryAvailable reports whether an executable naive binary exists on the configured path.
+func IsBinaryAvailable() bool {
+	return isExecutable(GetNaiveBinPath())
 }
 
 // isExecutable checks whether the file at path exists, is a regular file, and has executable bits set.
@@ -145,6 +156,12 @@ func DownloadNaiveBinary(ctx context.Context, destPath, baseURL, tag string) err
 func DownloadNaiveBinaryWithExpectedSHA(ctx context.Context, destPath, downloadURL, expectedSHA string) error {
 	if destPath == "" {
 		return errors.New("naive: empty destination binary path")
+	}
+
+	destDir := filepath.Dir(destPath)
+	// #nosec G301 -- destination directory requires 0755 permissions for unprivileged execution
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("naive: failed to create destination directory %s: %w", destDir, err)
 	}
 
 	tmpDir, err := os.MkdirTemp("", "naive-dl-*")
@@ -199,7 +216,8 @@ func DownloadNaiveBinaryWithExpectedSHA(ctx context.Context, destPath, downloadU
 	}
 
 	extractDir := filepath.Join(tmpDir, "extracted")
-	if err := os.MkdirAll(extractDir, 0750); err != nil {
+	// #nosec G301 -- extraction directory requires 0755 permissions for unprivileged execution
+	if err := os.MkdirAll(extractDir, 0755); err != nil {
 		return fmt.Errorf("naive: failed to create extraction directory: %w", err)
 	}
 
@@ -225,11 +243,6 @@ func DownloadNaiveBinaryWithExpectedSHA(ctx context.Context, destPath, downloadU
 	}
 	if foundBinary == "" {
 		return errors.New("naive: executable 'naive' not found in downloaded archive")
-	}
-
-	destDir := filepath.Dir(destPath)
-	if err := os.MkdirAll(destDir, 0750); err != nil {
-		return fmt.Errorf("naive: failed to create destination directory %s: %w", destDir, err)
 	}
 
 	tmpDest, err := os.CreateTemp(destDir, "naive-install-*")

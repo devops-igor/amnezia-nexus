@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -501,6 +502,69 @@ func TestDaemon_CrashRecovery(t *testing.T) {
 
 	if !restarted {
 		t.Fatal("expected daemon to recover and restart after crash")
+	}
+	if !d.IsHealthy() {
+		t.Errorf("expected daemon to be healthy after recovery, got last error: %v", d.LastError())
+	}
+}
+
+func TestDaemon_SupervisorBoundedRetries_Exhaustion(t *testing.T) {
+	mockBin := buildMockNaiveBinary(t)
+
+	p := models.NaiveProxyParams{
+		Username: "alice",
+		Password: "secret-password",
+		Domain:   "camouflage.example.com",
+		EnableH3: false,
+	}
+
+	d, err := NewDaemon(mockBin, "198.51.100.1:443", p)
+	if err != nil {
+		t.Fatalf("NewDaemon: %v", err)
+	}
+	d.SetReadinessTimeout(1 * time.Second)
+	d.SetRestartDelay(10 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := d.Start(ctx); err != nil {
+		t.Fatalf("Start daemon: %v", err)
+	}
+	defer func() {
+		_ = d.Stop()
+	}()
+
+	if !d.IsHealthy() {
+		t.Fatalf("expected daemon to be healthy initially")
+	}
+	if err := d.LastError(); err != nil {
+		t.Fatalf("expected no initial error, got: %v", err)
+	}
+
+	// Corrupt binary path so all restart attempts fail
+	d.mu.Lock()
+	d.binPath = "/nonexistent/binary/path"
+	proc := d.cmd.Process
+	d.mu.Unlock()
+
+	if proc != nil {
+		_ = proc.Kill()
+	}
+
+	// Wait for supervisor to exhaust 5 restart attempts with 10ms delays
+	deadline := time.Now().Add(2 * time.Second)
+	exhausted := false
+	for time.Now().Before(deadline) {
+		if !d.IsHealthy() && d.LastError() != nil && strings.Contains(d.LastError().Error(), "exhausted 5 restart attempts") {
+			exhausted = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !exhausted {
+		t.Fatalf("expected supervisor to exhaust attempts, IsHealthy=%v, LastError=%v", d.IsHealthy(), d.LastError())
 	}
 }
 

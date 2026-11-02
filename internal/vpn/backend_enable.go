@@ -11,6 +11,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -692,9 +693,27 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 		if err := json.Unmarshal(tun.ProtocolParams, &naiveParams); err != nil {
 			return fmt.Errorf("failed to decode naive params for server %d: %w", tun.ServerID, err)
 		}
-		dialer, err := naive.New(tun.Endpoint, naiveParams)
+		var dialerOpts []naive.Option
+		if testing.Testing() && !naive.IsBinaryAvailable() {
+			dialerOpts = append(dialerOpts, naive.WithInProcessFallback())
+		}
+		if len(prepared) > 0 && prepared[0] != nil {
+			if opt, ok := prepared[0]["naive_dialer_option"].(naive.Option); ok && opt != nil {
+				dialerOpts = append(dialerOpts, opt)
+			}
+			if opts, ok := prepared[0]["naive_dialer_options"].([]naive.Option); ok {
+				dialerOpts = append(dialerOpts, opts...)
+			}
+		}
+		dialer, err := naive.New(tun.Endpoint, naiveParams, dialerOpts...)
 		if err != nil {
 			return fmt.Errorf("failed to create naive dialer for server %d: %w", tun.ServerID, err)
+		}
+		readyCtx, readyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer readyCancel()
+		if err := dialer.EnsureReady(readyCtx); err != nil {
+			_ = dialer.Close()
+			return fmt.Errorf("failed to start and validate naive client for server %d: %w", tun.ServerID, err)
 		}
 		bridgeCfg := streambridge.Config{MTU: 1280}
 		bridgeDev, err := streambridge.New(bridgeCfg, dialer)

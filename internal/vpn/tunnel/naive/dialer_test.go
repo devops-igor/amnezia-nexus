@@ -919,3 +919,57 @@ func TestDialer_H2_BlackholedPooledConnEvicted(t *testing.T) {
 		t.Fatalf("dead pooled H2 conn kept being reused: %d/4 dials failed although fresh TCP to the proxy works", fails)
 	}
 }
+
+func TestDialer_ProductionFailClosedAndFallback(t *testing.T) {
+	p := models.NaiveProxyParams{
+		Username: "user",
+		Password: "pass",
+		Domain:   "example.com",
+	}
+
+	// 1. Production: testRootCAs is nil, no fallback option -> Fail Closed
+	oldCAs := testRootCAs
+	SetTestRootCAs(nil)
+	defer SetTestRootCAs(oldCAs)
+
+	t.Setenv(NaiveBinPathEnv, "/nonexistent/naive/path")
+	t.Setenv("NAIVE_DISABLE_DOWNLOAD", "1")
+
+	dProd, err := New("198.51.100.1:443", p)
+	if err != nil {
+		t.Fatalf("New dialer: %v", err)
+	}
+	defer dProd.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := dProd.EnsureReady(ctx); err == nil {
+		t.Fatal("expected EnsureReady to fail closed in production when daemon unavailable")
+	}
+	if dProd.IsHealthy() {
+		t.Error("expected dialer to be unhealthy after EnsureReady failure")
+	}
+	if dProd.LastError() == nil {
+		t.Error("expected non-nil LastError")
+	}
+
+	_, err = dProd.DialContext(ctx, "tcp", "target.example.com:80")
+	if err == nil || !strings.Contains(err.Error(), "native daemon required") {
+		t.Fatalf("expected 'native daemon required' error, got: %v", err)
+	}
+
+	// 2. Test opt-in: WithInProcessFallback() allows in-process transport
+	dFallback, err := New("198.51.100.1:443", p, WithInProcessFallback())
+	if err != nil {
+		t.Fatalf("New fallback dialer: %v", err)
+	}
+	defer dFallback.Close()
+
+	if err := dFallback.EnsureReady(ctx); err != nil {
+		t.Fatalf("expected EnsureReady to succeed with InProcessFallback, got: %v", err)
+	}
+	if !dFallback.IsHealthy() {
+		t.Error("expected fallback dialer to report healthy")
+	}
+}

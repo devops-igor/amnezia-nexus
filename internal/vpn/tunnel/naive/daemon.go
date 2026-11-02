@@ -132,6 +132,7 @@ type Daemon struct {
 	readinessWait  time.Duration
 	restartDelay   time.Duration
 	stopSupervisor chan struct{}
+	lastErr        error
 }
 
 // NewDaemon initializes a Daemon supervisor without starting the child process.
@@ -168,6 +169,13 @@ func (d *Daemon) SetReadinessTimeout(dur time.Duration) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.readinessWait = dur
+}
+
+// SetRestartDelay configures the initial recovery delay for the supervisor (useful for tests).
+func (d *Daemon) SetRestartDelay(dur time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.restartDelay = dur
 }
 
 // Start launches the naive child process and polls until the local SOCKS5 listener is accepting connections.
@@ -218,17 +226,24 @@ func (d *Daemon) Start(ctx context.Context) error {
 
 	if err := d.waitForReady(readyCtx, port); err != nil {
 		_ = d.Stop()
+		d.mu.Lock()
+		d.lastErr = err
+		d.mu.Unlock()
 		return fmt.Errorf("naive: readiness probe failed: %w", err)
 	}
 
 	dialer, err := NewSocks5Dialer(fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		_ = d.Stop()
+		d.mu.Lock()
+		d.lastErr = err
+		d.mu.Unlock()
 		return fmt.Errorf("naive: failed to create SOCKS5 dialer: %w", err)
 	}
 
 	d.mu.Lock()
 	d.socksDialer = dialer
+	d.lastErr = nil
 	d.mu.Unlock()
 
 	return nil
@@ -271,43 +286,109 @@ func (d *Daemon) handleProcessExit(c *exec.Cmd) {
 		d.cmdCancel()
 		d.cmdCancel = nil
 	}
-	delay := d.restartDelay
-	d.restartDelay *= 2
-	if d.restartDelay > 5*time.Second {
-		d.restartDelay = 5 * time.Second
-	}
-	d.mu.Unlock()
-
-	select {
-	case <-d.stopSupervisor:
-		return
-	case <-time.After(delay):
-	}
-
-	d.mu.Lock()
-	if d.stopped {
-		d.mu.Unlock()
-		return
-	}
-	if err := d.startProcessLocked(); err != nil {
-		d.mu.Unlock()
-		return
-	}
+	d.socksDialer = nil
+	d.lastErr = errors.New("naive: daemon process exited unexpectedly")
 	port := d.port
+	readinessWait := d.readinessWait
+	initialDelay := d.restartDelay
+	if initialDelay <= 0 {
+		initialDelay = 500 * time.Millisecond
+	}
 	d.mu.Unlock()
 
-	probeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	const maxAttempts = 5
+	delay := initialDelay
 
-	if err := d.waitForReady(probeCtx, port); err == nil {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		select {
+		case <-d.stopSupervisor:
+			return
+		case <-time.After(delay):
+		}
+
+		d.mu.Lock()
+		if d.stopped {
+			d.mu.Unlock()
+			return
+		}
+
+		if err := d.startProcessLocked(); err != nil {
+			d.lastErr = fmt.Errorf("naive: recovery restart attempt %d/%d failed: %w", attempt, maxAttempts, err)
+			d.mu.Unlock()
+			delay *= 2
+			if delay > 8*time.Second {
+				delay = 8 * time.Second
+			}
+			continue
+		}
+		d.mu.Unlock()
+
+		probeCtx, cancel := context.WithTimeout(context.Background(), readinessWait)
+		err := d.waitForReady(probeCtx, port)
+		cancel()
+
+		if err != nil {
+			d.mu.Lock()
+			d.lastErr = fmt.Errorf("naive: recovery readiness probe attempt %d/%d failed: %w", attempt, maxAttempts, err)
+			if d.cmd != nil {
+				cancelFn := d.cmdCancel
+				d.cmd = nil
+				d.cmdCancel = nil
+				if cancelFn != nil {
+					cancelFn()
+				}
+			}
+			d.mu.Unlock()
+			delay *= 2
+			if delay > 8*time.Second {
+				delay = 8 * time.Second
+			}
+			continue
+		}
+
+		dialer, err := NewSocks5Dialer(fmt.Sprintf("127.0.0.1:%d", port))
+		d.mu.Lock()
+		if d.stopped {
+			d.mu.Unlock()
+			return
+		}
+		if err != nil {
+			d.lastErr = fmt.Errorf("naive: recovery dialer setup attempt %d/%d failed: %w", attempt, maxAttempts, err)
+			if d.cmd != nil {
+				cancelFn := d.cmdCancel
+				d.cmd = nil
+				d.cmdCancel = nil
+				if cancelFn != nil {
+					cancelFn()
+				}
+			}
+			d.mu.Unlock()
+			delay *= 2
+			if delay > 8*time.Second {
+				delay = 8 * time.Second
+			}
+			continue
+		}
+
+		d.socksDialer = dialer
+		d.lastErr = nil
+		d.mu.Unlock()
+
 		// Successfully recovered, reset backoff after healthy uptime
 		time.AfterFunc(30*time.Second, func() {
 			d.mu.Lock()
 			defer d.mu.Unlock()
-			if !d.stopped && d.cmd != nil {
-				d.restartDelay = 200 * time.Millisecond
+			if !d.stopped && d.cmd != nil && d.lastErr == nil {
+				d.restartDelay = 500 * time.Millisecond
 			}
 		})
+		return
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.stopped {
+		d.lastErr = fmt.Errorf("naive: daemon supervisor exhausted %d restart attempts", maxAttempts)
 	}
 }
 
@@ -399,6 +480,21 @@ func (d *Daemon) IsActive() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return !d.stopped && d.cmd != nil && d.socksDialer != nil
+}
+
+// IsHealthy reports whether the daemon is running, has an active SOCKS5 dialer,
+// and has encountered no supervisor failure.
+func (d *Daemon) IsHealthy() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return !d.stopped && d.cmd != nil && d.socksDialer != nil && d.lastErr == nil
+}
+
+// LastError returns the most recent error encountered by the daemon supervisor, if any.
+func (d *Daemon) LastError() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.lastErr
 }
 
 // Socks5Dialer returns the SOCKS5 stream dialer connected to this daemon.
