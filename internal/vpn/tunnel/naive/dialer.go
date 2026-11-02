@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -43,12 +45,36 @@ func WithResolver(r *net.Resolver) Option {
 	}
 }
 
+// WithDaemon sets an existing Daemon instance for the Dialer.
+func WithDaemon(dm *Daemon) Option {
+	return func(d *Dialer) {
+		d.daemon = dm
+		if dm != nil && dm.Socks5Dialer() != nil {
+			d.socks5Dialer = dm.Socks5Dialer()
+		}
+	}
+}
+
+// WithSocks5Dialer sets a custom SOCKS5 StreamDialer for the Dialer.
+func WithSocks5Dialer(sd StreamDialer) Option {
+	return func(d *Dialer) {
+		d.socks5Dialer = sd
+	}
+}
+
+// WithDaemonDisabled explicitly disables the upstream naive daemon sidecar.
+func WithDaemonDisabled(disabled bool) Option {
+	return func(d *Dialer) {
+		d.disableDaemon = disabled
+	}
+}
+
 // h3FailureCooldown is how long DialContext skips H3 and dials H2 directly
 // after a transport-level H3 failure, so UDP loss costs one timeout, not one per dial.
 var h3FailureCooldown = 30 * time.Second
 
 // Dialer establishes authenticated HTTP/2 or HTTP/3 CONNECT tunnels to a NaiveProxy
-// endpoint, satisfying the streambridge.StreamDialer interface.
+// endpoint, satisfying the StreamDialer interface.
 type Dialer struct {
 	endpoint string
 	params   models.NaiveProxyParams
@@ -61,6 +87,11 @@ type Dialer struct {
 
 	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 	resolver    *net.Resolver
+
+	daemon        *Daemon
+	socks5Dialer  StreamDialer
+	daemonMu      sync.Mutex
+	disableDaemon bool
 }
 
 // New constructs a new NaiveProxy Dialer with defensive input validation.
@@ -136,6 +167,17 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 		return nil, err
 	}
 
+	if sd := d.ensureDaemon(ctx); sd != nil {
+		return sd.DialContext(ctx, network, address)
+	}
+
+	d.daemonMu.Lock()
+	sd := d.socks5Dialer
+	d.daemonMu.Unlock()
+	if sd != nil {
+		return sd.DialContext(ctx, network, address)
+	}
+
 	if d.params.EnableH3 && time.Now().UnixNano() >= d.h3CooldownUntil.Load() {
 		h3Ctx := ctx
 		if deadline, ok := ctx.Deadline(); ok {
@@ -179,8 +221,64 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	return d.dialH2(ctx, address)
 }
 
-// Close closes all pooled connections associated with this dialer.
+// Daemon returns the supervised Daemon instance, if active.
+func (d *Dialer) Daemon() *Daemon {
+	d.daemonMu.Lock()
+	defer d.daemonMu.Unlock()
+	return d.daemon
+}
+
+// ensureDaemon initializes and starts a supervised upstream naive daemon if available.
+func (d *Dialer) ensureDaemon(ctx context.Context) StreamDialer {
+	if d.disableDaemon || testRootCAs != nil {
+		return nil
+	}
+
+	d.daemonMu.Lock()
+	if d.socks5Dialer != nil {
+		sd := d.socks5Dialer
+		d.daemonMu.Unlock()
+		return sd
+	}
+	d.daemonMu.Unlock()
+
+	binPath := GetNaiveBinPath()
+	if !isExecutable(binPath) {
+		if os.Getenv("NAIVE_DISABLE_DOWNLOAD") == "1" {
+			return nil
+		}
+		var err error
+		binPath, err = EnsureNaiveBinary(ctx)
+		if err != nil {
+			return nil
+		}
+	}
+
+	d.daemonMu.Lock()
+	defer d.daemonMu.Unlock()
+	if d.socks5Dialer != nil {
+		return d.socks5Dialer
+	}
+
+	daemon, err := StartDaemon(ctx, binPath, d.endpoint, d.params)
+	if err != nil {
+		return nil
+	}
+	d.daemon = daemon
+	d.socks5Dialer = daemon.Socks5Dialer()
+	return d.socks5Dialer
+}
+
+// Close closes all pooled connections and terminates any supervised naive daemon.
 func (d *Dialer) Close() error {
+	d.daemonMu.Lock()
+	if d.daemon != nil {
+		_ = d.daemon.Stop()
+		d.daemon = nil
+		d.socks5Dialer = nil
+	}
+	d.daemonMu.Unlock()
+
 	d.h2Pool.close()
 	d.h3Pool.close()
 	return nil

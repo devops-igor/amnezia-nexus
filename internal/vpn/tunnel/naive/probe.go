@@ -54,6 +54,30 @@ func probeNaiveProxy(ctx context.Context, target string, p models.NaiveProxyPara
 
 	camTarget := net.JoinHostPort(p.Domain, "443")
 
+	// If a supervised daemon is active or can be started, route probe through the daemon
+	d.daemonMu.Lock()
+	sd := d.socks5Dialer
+	d.daemonMu.Unlock()
+	if sd == nil {
+		sd = d.ensureDaemon(timeoutCtx)
+	}
+	if sd != nil {
+		start := time.Now()
+		conn, err := sd.DialContext(timeoutCtx, "tcp", camTarget)
+		if err != nil {
+			if timeoutCtx.Err() != nil {
+				return 0, timeoutCtx.Err()
+			}
+			return 0, fmt.Errorf("naive: probe failed via daemon: %w", err)
+		}
+		_ = conn.Close()
+		elapsed := time.Since(start).Milliseconds()
+		if elapsed < 1 {
+			elapsed = 1
+		}
+		return elapsed, nil
+	}
+
 	if p.EnableH3 {
 		h3Ctx := timeoutCtx
 		if deadline, ok := timeoutCtx.Deadline(); ok {
