@@ -132,6 +132,7 @@ func resolveRunnableNaiveBinary(t *testing.T) string {
 			if err == nil && strings.Contains(strings.ToLower(string(out)), "naive") {
 				return cand
 			}
+			t.Logf("candidate binary %s failed version check: %v, out: %s", cand, err, strings.TrimSpace(string(out)))
 		}
 	}
 
@@ -145,6 +146,9 @@ func resolveRunnableNaiveBinary(t *testing.T) string {
 		if err == nil && strings.Contains(strings.ToLower(string(out)), "naive") {
 			return downloaded
 		}
+		t.Logf("downloaded binary %s failed version check: %v, out: %s", downloaded, err, strings.TrimSpace(string(out)))
+	} else {
+		t.Logf("EnsureNaiveBinary failed: %v", err)
 	}
 
 	return ""

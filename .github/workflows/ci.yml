@@ -88,11 +88,16 @@ jobs:
           xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$(go env GOPATH)/bin/caddy"
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: Install musl libc for Native NaiveProxy Tests
-        run: sudo apt-get update && sudo apt-get install -y musl
+      - name: Install musl libc and configure library paths for Native NaiveProxy Tests
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl
+          echo "/usr/lib/x86_64-linux-gnu" | sudo tee -a /etc/ld-musl-x86_64.path
 
       - name: Run Tests with Race Detector
         run: go test -race -cover -count=1 -coverprofile=coverage.out ./...
+
+      - name: Run Authentic Native Caddy Integration Tests
+        run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
 
       - name: Run Vision Tests (non-race)
         run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
