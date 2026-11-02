@@ -129,7 +129,7 @@ func resolveRunnableNaiveBinary(t *testing.T) string {
 		}
 		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() && fi.Mode().Perm()&0o111 != 0 {
 			out, err := exec.Command(cand, "--version").CombinedOutput()
-			if err == nil && strings.Contains(string(out), "naive") {
+			if err == nil && strings.Contains(strings.ToLower(string(out)), "naive") {
 				return cand
 			}
 		}
@@ -142,7 +142,7 @@ func resolveRunnableNaiveBinary(t *testing.T) string {
 	downloaded, err := EnsureNaiveBinary(context.Background())
 	if err == nil {
 		out, err := exec.Command(downloaded, "--version").CombinedOutput()
-		if err == nil && strings.Contains(string(out), "naive") {
+		if err == nil && strings.Contains(strings.ToLower(string(out)), "naive") {
 			return downloaded
 		}
 	}
