@@ -3,6 +3,7 @@ package vpn
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -70,5 +71,121 @@ func TestAuditNativeReadinessBlocksServiceReaders(t *testing.T) {
 	t.Logf("unrelated Service.mu reader blocked during native startup=%v activationError=%v", blocked, err)
 	if blocked {
 		t.Fatal("native readiness executes under service-wide state lock")
+	}
+}
+
+func TestAuditHostSyncRejectsStalePreparedCredential(t *testing.T) {
+	db := setupTestDB(t)
+	svc, err := NewVPNService(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	sid, _, _ := createTestServerAndKey(t, db, "audit-host-sync-race", "198.51.100.1")
+
+	cred1, err := json.Marshal(models.NaiveProxyParams{Username: "user1", Password: "pwd1", Domain: "naive1.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred2, err := json.Marshal(models.NaiveProxyParams{Username: "user2", Password: "pwd2", Domain: "naive2.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tun, err := svc.pool.AddTunnelWithConfig(ctx, sid, "198.51.100.1:443", "", tunnel.BackendTunnelOptions{
+		Protocol:       models.ProtocolNaive,
+		ProtocolParams: cred1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = svc.pool.SetTunnelStatus(ctx, sid, TunnelStatusActive, 0)
+
+	// 1. Direct test: candidate prepared with cred1, but pool rotated to cred2
+	prepMap, candCloser, err := svc.prepareNaiveCandidateForTunnel(ctx, tun)
+	if err != nil {
+		t.Fatalf("prepare candidate failed: %v", err)
+	}
+	defer func() {
+		if candCloser != nil {
+			_ = candCloser.Close()
+		}
+	}()
+
+	candDev := prepMap["candidate_device"].(BackendDevice)
+	if candDev.IsClosed() {
+		t.Fatal("expected candidate device to be open initially")
+	}
+
+	// Concurrent credential rotation commits cred2 to pool
+	_, err = svc.pool.AddTunnelWithConfig(ctx, sid, "198.51.100.1:443", "", tunnel.BackendTunnelOptions{
+		Protocol:       models.ProtocolNaive,
+		ProtocolParams: cred2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Host synchronization attempts to attach under Service.mu
+	svc.mu.Lock()
+	syncErr := svc.syncBackendForwarderOnHostUpdateLocked(ctx, sid, tun.ID, nil, prepMap)
+	svc.mu.Unlock()
+
+	if !errors.Is(syncErr, ErrStaleCandidate) {
+		t.Fatalf("expected ErrStaleCandidate, got: %v", syncErr)
+	}
+	if !candDev.IsClosed() {
+		t.Fatal("expected stale candidate device to be closed immediately on rejection")
+	}
+
+	svc.mu.RLock()
+	attachedDev := svc.backendDevices[tun.ID]
+	svc.mu.RUnlock()
+	if attachedDev != nil {
+		t.Fatal("expected no device to be attached after stale candidate rejection")
+	}
+
+	// 2. Lifecycle re-preparation during UpdateBackendServerHost
+	cred3, err := json.Marshal(models.NaiveProxyParams{Username: "user3", Password: "pwd3", Domain: "naive3.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rotationExecuted := false
+	svc.SetUpdateBackendServerHostPreLockHook(func() {
+		if !rotationExecuted {
+			rotationExecuted = true
+			_, rotErr := svc.pool.AddTunnelWithConfig(ctx, sid, "198.51.100.2:443", "", tunnel.BackendTunnelOptions{
+				Protocol:       models.ProtocolNaive,
+				ProtocolParams: cred3,
+			})
+			if rotErr != nil {
+				t.Errorf("rotation in hook failed: %v", rotErr)
+			}
+		}
+	})
+
+	updateErr := svc.UpdateBackendServerHost(ctx, sid, "198.51.100.2")
+	if updateErr != nil {
+		t.Fatalf("UpdateBackendServerHost failed: %v", updateErr)
+	}
+	if !rotationExecuted {
+		t.Fatal("expected rotation hook to execute")
+	}
+
+	svc.mu.RLock()
+	liveDev := svc.backendDevices[tun.ID]
+	svc.mu.RUnlock()
+	if liveDev == nil || liveDev.IsClosed() {
+		t.Fatal("expected new candidate device to be prepared and attached for rotated credentials")
+	}
+	defer liveDev.Close()
+
+	currTun, err := svc.pool.GetTunnel(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !models.EqualJSON(currTun.ProtocolParams, cred3) {
+		t.Errorf("expected pool tunnel to have cred3, got: %s", string(currTun.ProtocolParams))
 	}
 }

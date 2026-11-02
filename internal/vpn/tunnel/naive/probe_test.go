@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -425,5 +426,106 @@ func TestAuditDownloadFailureMustNotUseGoTransport(t *testing.T) {
 	t.Logf("download HTTP 503: Go transport calls=%d returned=%v", calls.Load(), err)
 	if calls.Load() != 0 {
 		t.Fatal("download failure silently downgraded to fingerprintable Go transport instead of failing closed")
+	}
+}
+
+type mockStreamDialer struct {
+	dialContext func(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+func (m *mockStreamDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return m.dialContext(ctx, network, address)
+}
+
+func TestProbeNaiveProxy_CustomPortBackend(t *testing.T) {
+	cert, err := generateLeafCert(testCACert, testCAKey, "camouflage.example.com")
+	if err != nil {
+		t.Fatalf("generate leaf cert: %v", err)
+	}
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	ts.TLS = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"http/1.1"},
+	}
+	ts.StartTLS()
+	defer ts.Close()
+
+	customPort := ts.Listener.Addr().(*net.TCPAddr).Port
+	if customPort == 443 {
+		t.Fatal("expected ephemeral test port != 443")
+	}
+
+	var dialedTarget string
+	sd := &mockStreamDialer{
+		dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialedTarget = address
+			var d net.Dialer
+			return d.DialContext(ctx, network, ts.Listener.Addr().String())
+		},
+	}
+
+	p := models.NaiveProxyParams{
+		Username: "alice",
+		Password: "secret-password",
+		Domain:   "camouflage.example.com",
+		Port:     customPort,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	latency, err := ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:"+strconv.Itoa(customPort), p, 3*time.Second, WithSocks5Dialer(sd))
+	if err != nil {
+		t.Fatalf("ProbeNaiveProxy custom port failed: %v", err)
+	}
+	if latency < 1 {
+		t.Errorf("expected latency >= 1ms, got %d", latency)
+	}
+
+	expectedTarget := net.JoinHostPort("camouflage.example.com", strconv.Itoa(customPort))
+	if dialedTarget != expectedTarget {
+		t.Fatalf("expected probe to dial %q, got %q", expectedTarget, dialedTarget)
+	}
+
+	// Verify that dialing with hardcoded 443 against a mock that rejects 443 fails
+	sdReject443 := &mockStreamDialer{
+		dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if strings.HasSuffix(address, ":443") {
+				return nil, errors.New("connection refused: not listening on port 443")
+			}
+			var d net.Dialer
+			return d.DialContext(ctx, network, ts.Listener.Addr().String())
+		},
+	}
+	// With custom port: should succeed
+	latency, err = ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:"+strconv.Itoa(customPort), p, 3*time.Second, WithSocks5Dialer(sdReject443))
+	if err != nil || latency < 1 {
+		t.Fatalf("expected custom port probe to succeed on non-443 server: %v (latency=%d)", err, latency)
+	}
+
+	// Without custom port (defaults to 443): should fail against sdReject443
+	pDefaultPort := p
+	pDefaultPort.Port = 0
+	_, err = ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:"+strconv.Itoa(customPort), pDefaultPort, 3*time.Second, WithSocks5Dialer(sdReject443))
+	if err == nil {
+		t.Fatal("expected probe without custom port to fail against server not listening on 443")
+	}
+
+	// Verify ProbeNaiveProxyTunnel with custom port
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun := &models.BackendTunnel{
+		ID:             42,
+		Endpoint:       "198.51.100.1:" + strconv.Itoa(customPort),
+		Protocol:       models.ProtocolNaive,
+		ProtocolParams: raw,
+	}
+	tunLatency, err := ProbeNaiveProxyWithOptions(ctx, tun.Endpoint, p, 3*time.Second, WithSocks5Dialer(sd))
+	if err != nil || tunLatency < 1 {
+		t.Fatalf("ProbeNaiveProxy with unmarshaled params failed: %v", err)
 	}
 }

@@ -259,7 +259,8 @@ func setupTestH2ServerOnAddr(t *testing.T, listenAddr, authUser, authPass string
 
 			// Check if target is camouflage domain (health probe)
 			camTarget := net.JoinHostPort(testCamouflageDomain, "443")
-			if r.Host == camTarget {
+			hostName, _, _ := net.SplitHostPort(r.Host)
+			if r.Host == camTarget || hostName == testCamouflageDomain {
 				w.WriteHeader(http.StatusOK)
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()

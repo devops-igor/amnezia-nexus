@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,7 +62,11 @@ func probeNaiveProxy(ctx context.Context, target string, p models.NaiveProxyPara
 		defer cancel()
 	}
 
-	camTarget := net.JoinHostPort(p.Domain, "443")
+	port := p.Port
+	if port <= 0 {
+		port = 443
+	}
+	camTarget := net.JoinHostPort(p.Domain, strconv.Itoa(port))
 
 	// 1. Production policy: If in-process Go transport is not allowed,
 	// native daemon is strictly mandatory. Fail closed on acquisition or startup failure (H2).
@@ -134,8 +139,21 @@ func (d *Dialer) probeViaDaemon(ctx context.Context, camTarget string, p models.
 		return 0, errors.New("naive: daemon dialer not available")
 	}
 
+	port := p.Port
+	if port <= 0 {
+		if _, portStr, err := net.SplitHostPort(camTarget); err == nil {
+			if parsed, err := strconv.Atoi(portStr); err == nil && parsed > 0 && parsed <= 65535 {
+				port = parsed
+			}
+		}
+	}
+	if port <= 0 {
+		port = 443
+	}
+	targetAddr := net.JoinHostPort(p.Domain, strconv.Itoa(port))
+
 	start := time.Now()
-	conn, err := sd.DialContext(ctx, "tcp", camTarget)
+	conn, err := sd.DialContext(ctx, "tcp", targetAddr)
 	if err != nil {
 		if ctx.Err() != nil {
 			return 0, ctx.Err()

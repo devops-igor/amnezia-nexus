@@ -17,6 +17,10 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
+// ErrStaleCandidate is returned when a prepared candidate device's credentials
+// no longer match the live tunnel parameters under Service.mu.
+var ErrStaleCandidate = errors.New("vpn: candidate credentials mismatch current tunnel")
+
 // DisableBackend disables a backend server and initiates connection draining.
 func (s *Service) DisableBackend(ctx context.Context, serverID int64) error {
 	s.mu.Lock()
@@ -144,11 +148,18 @@ func (s *Service) prepareNaiveCandidateForTunnel(ctx context.Context, tun *model
 		if err != nil {
 			return nil, nil, err
 		}
-		return map[string]any{"candidate_device": candDev}, closer, nil
+		tunClone := *tun
+		tunClone.ProtocolParams = append([]byte(nil), tun.ProtocolParams...)
+		return map[string]any{
+			"candidate_device": candDev,
+			"expected_tunnel":  &tunClone,
+			"protocol_params":  tunClone.ProtocolParams,
+		}, closer, nil
 	}
 	return nil, nil, nil
 }
 
+//nolint:gocyclo // forwarder synchronization and credential identity revalidation.
 func (s *Service) syncBackendForwarderOnHostUpdateLocked(
 	ctx context.Context, serverID, expectedTunnelID int64, awgParams map[string]any,
 	prepared ...map[string]any,
@@ -167,11 +178,39 @@ func (s *Service) syncBackendForwarderOnHostUpdateLocked(
 		return err
 	}
 	if currentTun == nil || currentTun.ID != expectedTunnelID {
+		if len(prepared) > 0 && prepared[0] != nil {
+			if candDev, ok := prepared[0]["candidate_device"].(BackendDevice); ok && candDev != nil {
+				_ = candDev.Close()
+			}
+		}
 		return nil
 	}
 
 	if !currentTun.Enabled {
+		if len(prepared) > 0 && prepared[0] != nil {
+			if candDev, ok := prepared[0]["candidate_device"].(BackendDevice); ok && candDev != nil {
+				_ = candDev.Close()
+			}
+		}
 		return nil
+	}
+
+	if len(prepared) > 0 && prepared[0] != nil {
+		if expParams, ok := prepared[0]["protocol_params"].([]byte); ok && len(expParams) > 0 {
+			if !models.EqualJSON(currentTun.ProtocolParams, expParams) {
+				if candDev, ok := prepared[0]["candidate_device"].(BackendDevice); ok && candDev != nil {
+					_ = candDev.Close()
+				}
+				return fmt.Errorf("%w: candidate credentials mismatch current tunnel", ErrStaleCandidate)
+			}
+		} else if expTun, ok := prepared[0]["expected_tunnel"].(*models.BackendTunnel); ok && expTun != nil {
+			if !models.SameTunnelIdentity(currentTun, expTun) {
+				if candDev, ok := prepared[0]["candidate_device"].(BackendDevice); ok && candDev != nil {
+					_ = candDev.Close()
+				}
+				return fmt.Errorf("%w: candidate credentials mismatch current tunnel", ErrStaleCandidate)
+			}
+		}
 	}
 
 	if currentTun.Status == TunnelStatusActive || currentTun.Status == TunnelStatusDegraded ||
@@ -181,6 +220,12 @@ func (s *Service) syncBackendForwarderOnHostUpdateLocked(
 			log.Printf("[vpn] warning: failed to attach backend forwarder for server %d after host update: %v", serverID, attachErr)
 			_ = s.pool.SetTunnelStatus(ctx, serverID, TunnelStatusDegraded, 0)
 			return fmt.Errorf("failed to attach backend forwarder: %w", attachErr)
+		}
+	} else {
+		if len(prepared) > 0 && prepared[0] != nil {
+			if candDev, ok := prepared[0]["candidate_device"].(BackendDevice); ok && candDev != nil {
+				_ = candDev.Close()
+			}
 		}
 	}
 
@@ -240,34 +285,50 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 		// Runtime device is missing, closed, or attached to a stale endpoint -> reconcile.
 		awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
 
-		s.mu.RLock()
-		hook := s.updateBackendServerHostPreLockHook
-		s.mu.RUnlock()
-		if hook != nil {
-			hook()
-		}
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 {
+				latestTun, err := s.pool.GetTunnel(serverID)
+				if err != nil || latestTun == nil || !latestTun.Enabled {
+					return err
+				}
+				tun = latestTun
+			}
 
-		if err := ctx.Err(); err != nil {
-			return err
-		}
+			prepMap, candCloser, err := s.prepareNaiveCandidateForTunnel(ctx, tun)
+			if err != nil {
+				return err
+			}
 
-		prepMap, candCloser, err := s.prepareNaiveCandidateForTunnel(ctx, tun)
-		if err != nil {
-			return err
-		}
-		defer func() {
+			s.mu.RLock()
+			hook := s.updateBackendServerHostPreLockHook
+			s.mu.RUnlock()
+			if hook != nil {
+				hook()
+			}
+
+			if err := ctx.Err(); err != nil {
+				if candCloser != nil {
+					_ = candCloser.Close()
+				}
+				return err
+			}
+
+			s.mu.Lock()
+			syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams, prepMap)
+			s.mu.Unlock()
+
+			if syncErr == nil {
+				return nil
+			}
 			if candCloser != nil {
 				_ = candCloser.Close()
 			}
-		}()
-
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams, prepMap)
-		if syncErr == nil {
-			candCloser = nil
+			if errors.Is(syncErr, ErrStaleCandidate) {
+				continue
+			}
+			return syncErr
 		}
-		return syncErr
+		return fmt.Errorf("host synchronization aborted: credentials changed concurrently: %w", ErrStaleCandidate)
 	}
 
 	oldEndpoint := tun.Endpoint
@@ -288,39 +349,51 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 
 	awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
 
-	s.mu.RLock()
-	hook := s.updateBackendServerHostPreLockHook
-	s.mu.RUnlock()
-	if hook != nil {
-		hook()
-	}
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			latestTun, err := s.pool.GetTunnel(serverID)
+			if err != nil || latestTun == nil || !latestTun.Enabled {
+				return rollbackEndpoint(err)
+			}
+			tun = latestTun
+		}
 
-	if err := ctx.Err(); err != nil {
-		return rollbackEndpoint(err)
-	}
+		prepMap, candCloser, err := s.prepareNaiveCandidateForTunnel(ctx, tun)
+		if err != nil {
+			return rollbackEndpoint(err)
+		}
 
-	prepMap, candCloser, err := s.prepareNaiveCandidateForTunnel(ctx, tun)
-	if err != nil {
-		return rollbackEndpoint(err)
-	}
-	defer func() {
+		s.mu.RLock()
+		hook := s.updateBackendServerHostPreLockHook
+		s.mu.RUnlock()
+		if hook != nil {
+			hook()
+		}
+
+		if err := ctx.Err(); err != nil {
+			if candCloser != nil {
+				_ = candCloser.Close()
+			}
+			return rollbackEndpoint(err)
+		}
+
+		s.mu.Lock()
+		syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams, prepMap)
+		s.mu.Unlock()
+
+		if syncErr == nil {
+			return nil
+		}
 		if candCloser != nil {
 			_ = candCloser.Close()
 		}
-	}()
-
-	s.mu.Lock()
-	syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams, prepMap)
-	s.mu.Unlock()
-	if syncErr == nil {
-		candCloser = nil
-	}
-
-	if syncErr != nil {
+		if errors.Is(syncErr, ErrStaleCandidate) {
+			continue
+		}
 		return rollbackEndpoint(syncErr)
 	}
 
-	return nil
+	return rollbackEndpoint(fmt.Errorf("host synchronization aborted: credentials changed concurrently: %w", ErrStaleCandidate))
 }
 
 // publicKeyUpdateSeams holds the test seams of UpdateBackendServerPublicKey.
@@ -330,6 +403,8 @@ type publicKeyUpdateSeams struct {
 }
 
 // UpdateBackendServerPublicKey updates the public key of a server in the VPN backend pool.
+//
+//nolint:gocyclo // transactional public key update with rollback and forwarder synchronization.
 func (s *Service) UpdateBackendServerPublicKey(ctx context.Context, serverID int64, newPublicKey string) error {
 	if s == nil || s.pool == nil {
 		return nil
@@ -369,34 +444,50 @@ func (s *Service) UpdateBackendServerPublicKey(ctx context.Context, serverID int
 
 		awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
 
-		s.mu.RLock()
-		hook := s.publicKeyUpdateSeams.preLockHook
-		s.mu.RUnlock()
-		if hook != nil {
-			hook()
-		}
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 {
+				latestTun, err := s.pool.GetTunnel(serverID)
+				if err != nil || latestTun == nil || !latestTun.Enabled {
+					return err
+				}
+				tun = latestTun
+			}
 
-		if err := ctx.Err(); err != nil {
-			return err
-		}
+			prepMap, candCloser, err := s.prepareNaiveCandidateForTunnel(ctx, tun)
+			if err != nil {
+				return err
+			}
 
-		prepMap, candCloser, err := s.prepareNaiveCandidateForTunnel(ctx, tun)
-		if err != nil {
-			return err
-		}
-		defer func() {
+			s.mu.RLock()
+			hook := s.publicKeyUpdateSeams.preLockHook
+			s.mu.RUnlock()
+			if hook != nil {
+				hook()
+			}
+
+			if err := ctx.Err(); err != nil {
+				if candCloser != nil {
+					_ = candCloser.Close()
+				}
+				return err
+			}
+
+			s.mu.Lock()
+			syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams, prepMap)
+			s.mu.Unlock()
+
+			if syncErr == nil {
+				return nil
+			}
 			if candCloser != nil {
 				_ = candCloser.Close()
 			}
-		}()
-
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams, prepMap)
-		if syncErr == nil {
-			candCloser = nil
+			if errors.Is(syncErr, ErrStaleCandidate) {
+				continue
+			}
+			return syncErr
 		}
-		return syncErr
+		return fmt.Errorf("public key synchronization aborted: credentials changed concurrently: %w", ErrStaleCandidate)
 	}
 
 	oldPublicKey := tun.PublicKey
@@ -417,39 +508,51 @@ func (s *Service) UpdateBackendServerPublicKey(ctx context.Context, serverID int
 
 	awgParams, _ := s.resolveServerAWGParams(ctx, serverID)
 
-	s.mu.RLock()
-	hook := s.publicKeyUpdateSeams.preLockHook
-	s.mu.RUnlock()
-	if hook != nil {
-		hook()
-	}
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			latestTun, err := s.pool.GetTunnel(serverID)
+			if err != nil || latestTun == nil || !latestTun.Enabled {
+				return rollbackPublicKey(err)
+			}
+			tun = latestTun
+		}
 
-	if err := ctx.Err(); err != nil {
-		return rollbackPublicKey(err)
-	}
+		prepMap, candCloser, err := s.prepareNaiveCandidateForTunnel(ctx, tun)
+		if err != nil {
+			return rollbackPublicKey(err)
+		}
 
-	prepMap, candCloser, err := s.prepareNaiveCandidateForTunnel(ctx, tun)
-	if err != nil {
-		return rollbackPublicKey(err)
-	}
-	defer func() {
+		s.mu.RLock()
+		hook := s.publicKeyUpdateSeams.preLockHook
+		s.mu.RUnlock()
+		if hook != nil {
+			hook()
+		}
+
+		if err := ctx.Err(); err != nil {
+			if candCloser != nil {
+				_ = candCloser.Close()
+			}
+			return rollbackPublicKey(err)
+		}
+
+		s.mu.Lock()
+		syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams, prepMap)
+		s.mu.Unlock()
+
+		if syncErr == nil {
+			return nil
+		}
 		if candCloser != nil {
 			_ = candCloser.Close()
 		}
-	}()
-
-	s.mu.Lock()
-	syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams, prepMap)
-	s.mu.Unlock()
-	if syncErr == nil {
-		candCloser = nil
-	}
-
-	if syncErr != nil {
+		if errors.Is(syncErr, ErrStaleCandidate) {
+			continue
+		}
 		return rollbackPublicKey(syncErr)
 	}
 
-	return nil
+	return rollbackPublicKey(fmt.Errorf("public key synchronization aborted: credentials changed concurrently: %w", ErrStaleCandidate))
 }
 
 type deleteServerContextKey struct{}

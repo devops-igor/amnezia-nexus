@@ -99,7 +99,11 @@ func (s *Service) ensureBackendDeviceAttached(ctx context.Context, t *models.Bac
 			return err
 		}
 		candCloser = closer
-		prepMap = map[string]any{"candidate_device": candDev}
+		prepMap = map[string]any{
+			"candidate_device": candDev,
+			"expected_tunnel":  t,
+			"protocol_params":  append([]byte(nil), t.ProtocolParams...),
+		}
 	}
 	defer func() {
 		if candCloser != nil {

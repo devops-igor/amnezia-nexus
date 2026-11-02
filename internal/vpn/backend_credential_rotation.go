@@ -153,7 +153,11 @@ func (s *Service) RotateSharedBackendCredential(
 				cleanupRotatedCredential(ctx, s.db, mgr, server, proto, newID))
 		}
 		candCloser = closer
-		prepMap = map[string]any{"candidate_device": candDev}
+		prepMap = map[string]any{
+			"candidate_device": candDev,
+			"expected_tunnel":  candTun,
+			"protocol_params":  append([]byte(nil), params...),
+		}
 	}
 	defer func() {
 		if candCloser != nil {
