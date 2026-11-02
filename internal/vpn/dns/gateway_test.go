@@ -3,6 +3,7 @@ package gatewaydns
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -19,11 +20,15 @@ type mockReplyWriter struct {
 	mu       sync.Mutex
 	packets  [][]byte
 	onPacket func(packet []byte)
+	writeErr error
 }
 
 func (w *mockReplyWriter) WritePacket(scope policy.Scope, packet []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.writeErr != nil {
+		return w.writeErr
+	}
 	cp := make([]byte, len(packet))
 	copy(cp, packet)
 	w.packets = append(w.packets, cp)
@@ -333,5 +338,114 @@ func TestGateway_TrySubmit_TCP(t *testing.T) {
 	publicIP := netip.MustParseAddr("93.184.216.34")
 	if got := sess.Lookup(publicIP, snap.Generation(), time.Now()); got != policy.Proxy {
 		t.Errorf("expected Proxy in route cache for TCP query, got %v", got)
+	}
+}
+
+func TestGateway_TrySubmit_TCP_WriteFailureMustNotCommit(t *testing.T) {
+	gwIP := netip.MustParseAddr("10.8.0.1")
+	gwAddrPort := netip.AddrPortFrom(gwIP, 53)
+	clientIP := netip.MustParseAddr("10.8.0.2")
+
+	res := &mockResolver{
+		exchange: func(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error) {
+			resp := new(mdns.Msg)
+			resp.SetReply(req)
+			resp.Answer = append(resp.Answer, &mdns.A{
+				Hdr: mdns.RR_Header{Name: req.Question[0].Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+				A:   net.ParseIP("93.184.216.34").To4(),
+			})
+			return resp, nil
+		},
+	}
+
+	snap := compileTestSnapshot(t, "", "") // Direct decision
+	srv, _ := NewServer(ServerConfig{Gateway: gwAddrPort}, res, &staticPolicySource{snapshot: snap})
+	gw, err := NewGateway(GatewayConfig{Gateway: gwAddrPort}, srv)
+	if err != nil {
+		t.Fatalf("failed to create gateway: %v", err)
+	}
+	defer gw.Close()
+
+	_, sess := setupTestSession(t, snap.Generation())
+	writer := &mockReplyWriter{}
+	scope := NewScopeHandle(context.Background(), policy.Scope{SessionID: "sess-gw-tcp-fail", OwnershipEpoch: 1}, sess, writer)
+	defer gw.BeginRetire(scope)
+
+	clientVT, clientTnet, err := netstack.CreateNetTUN([]netip.Addr{clientIP}, nil, 1500)
+	if err != nil {
+		t.Fatalf("failed to create client netstack: %v", err)
+	}
+	defer clientVT.Close()
+
+	writer.onPacket = func(packet []byte) {
+		_, _ = clientVT.Write([][]byte{packet}, 0)
+	}
+
+	stopClientReader := make(chan struct{})
+	go func() {
+		buf := make([][]byte, 1)
+		buf[0] = make([]byte, 1500)
+		sizes := make([]int, 1)
+		for {
+			select {
+			case <-stopClientReader:
+				return
+			default:
+			}
+			n, err := clientVT.Read(buf, sizes, 0)
+			if err != nil {
+				return
+			}
+			if n > 0 && sizes[0] > 0 {
+				pkt := make([]byte, sizes[0])
+				copy(pkt, buf[0][:sizes[0]])
+				_, _ = gw.TrySubmit(scope, pkt)
+			}
+		}
+	}()
+	defer close(stopClientReader)
+
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer dialCancel()
+	conn, err := clientTnet.DialContextTCPAddrPort(dialCtx, gwAddrPort)
+	if err != nil {
+		t.Fatalf("client failed to dial TCP to gateway: %v", err)
+	}
+	defer conn.Close()
+
+	// Inject write failure before query response is sent back
+	writer.mu.Lock()
+	writer.writeErr = errors.New("injected transport failure")
+	writer.mu.Unlock()
+
+	req := new(mdns.Msg)
+	req.SetQuestion("public.example.", mdns.TypeA)
+	req.Id = 4455
+	dnsBytes, err := req.Pack()
+	if err != nil {
+		t.Fatalf("failed to pack DNS query: %v", err)
+	}
+
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(dnsBytes)))
+	_, _ = conn.Write(lenBuf[:])
+	_, _ = conn.Write(dnsBytes)
+
+	// Wait for retirement to take effect
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if scope.IsRetired() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if !scope.IsRetired() {
+		t.Errorf("expected scope to be retired after reply writer failure")
+	}
+
+	publicIP := netip.MustParseAddr("93.184.216.34")
+	if got := sess.Lookup(publicIP, snap.Generation(), time.Now()); got != policy.Unknown {
+		t.Fatalf("expected Unknown in route cache after reply writer failure, got %v", got)
 	}
 }

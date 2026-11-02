@@ -358,7 +358,7 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 		if _, err := c.Write(out); err != nil {
 			return
 		}
-		if sc != nil {
+		if sc != nil && (scope == nil || !scope.IsRetired()) {
 			s.ObserveResponse(req, resp, sc, recvTime)
 		}
 	}

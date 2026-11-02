@@ -43,6 +43,20 @@ func NewScopeHandle(parent context.Context, scope policy.Scope, sc *policy.Sessi
 	}
 }
 
+// Retire permanently marks the scope handle as retired, cancels its context,
+// and invalidates its session cache. Synchronous, memory-only, and idempotent.
+func (h *ScopeHandle) Retire() {
+	if h == nil {
+		return
+	}
+	if h.retired.CompareAndSwap(false, true) {
+		h.cancel()
+		if h.SessionCache != nil {
+			h.SessionCache.Invalidate()
+		}
+	}
+}
+
 // IsRetired returns true if the scope handle has been retired.
 func (h *ScopeHandle) IsRetired() bool {
 	if h == nil {
@@ -155,7 +169,10 @@ func (g *Gateway) getOrCreateTransport(scope *ScopeHandle) (*gatewayTCPTransport
 				pkt := make([]byte, sizes[0])
 				copy(pkt, buf[0][:sizes[0]])
 				if !scope.IsRetired() && scope.ReplyWriter != nil {
-					_ = scope.ReplyWriter.WritePacket(scope.Scope, pkt)
+					if err := scope.ReplyWriter.WritePacket(scope.Scope, pkt); err != nil {
+						scope.Retire()
+						go g.BeginRetire(scope)
+					}
 				}
 			}
 		}
@@ -171,11 +188,15 @@ func (g *Gateway) getOrCreateTransport(scope *ScopeHandle) (*gatewayTCPTransport
 		<-scope.ctx.Done()
 		g.server.RetireScope(scope.Scope)
 		g.mu.Lock()
+		var toClose *gatewayTCPTransport
 		if g.transports[scope.Scope] == tr {
 			delete(g.transports, scope.Scope)
+			toClose = tr
 		}
 		g.mu.Unlock()
-		tr.Close()
+		if toClose != nil {
+			toClose.Close()
+		}
 	}()
 
 	return tr, nil
@@ -288,18 +309,18 @@ func (g *Gateway) TrySubmit(scope *ScopeHandle, ipv4Packet []byte) (handled bool
 // Synchronous, memory-only, and idempotent.
 func (g *Gateway) BeginRetire(scope *ScopeHandle) Retirement {
 	if scope != nil {
-		scope.retired.Store(true)
-		scope.cancel()
-		if scope.SessionCache != nil {
-			scope.SessionCache.Invalidate()
-		}
+		scope.Retire()
 		g.server.RetireScope(scope.Scope)
 		g.mu.Lock()
+		var toClose *gatewayTCPTransport
 		if tr, ok := g.transports[scope.Scope]; ok {
 			delete(g.transports, scope.Scope)
-			tr.Close()
+			toClose = tr
 		}
 		g.mu.Unlock()
+		if toClose != nil {
+			toClose.Close()
+		}
 		return Retirement{Scope: scope.Scope}
 	}
 	return Retirement{}
@@ -308,10 +329,14 @@ func (g *Gateway) BeginRetire(scope *ScopeHandle) Retirement {
 // Close permanently closes all active gateway TCP transports.
 func (g *Gateway) Close() error {
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	transports := make([]*gatewayTCPTransport, 0, len(g.transports))
 	for scope, tr := range g.transports {
 		delete(g.transports, scope)
 		g.server.RetireScope(scope)
+		transports = append(transports, tr)
+	}
+	g.mu.Unlock()
+	for _, tr := range transports {
 		tr.Close()
 	}
 	return nil
