@@ -2,6 +2,8 @@ package policy
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -172,5 +174,83 @@ func TestParse_EmptyFeedError(t *testing.T) {
 	_, _, err := Parse(context.Background(), strings.NewReader(input), src, DefaultParseLimits())
 	if err == nil || !strings.Contains(err.Error(), "contained no valid rules") {
 		t.Fatalf("expected error for empty feed, got %v", err)
+	}
+	if !errors.Is(err, ErrNoValidRules) {
+		t.Errorf("expected errors.Is(err, ErrNoValidRules), got %v", err)
+	}
+}
+
+func TestParse_ZeroByteFeedError(t *testing.T) {
+	formats := []Format{FormatDomains, FormatIPv4, FormatMixed}
+	for _, fmtType := range formats {
+		t.Run(fmtType.String(), func(t *testing.T) {
+			src := Source{
+				ID:       "zero-byte-feed",
+				URL:      "https://empty.example.com/zero.lst",
+				Format:   fmtType,
+				IsPreset: true,
+			}
+
+			rules, report, err := Parse(context.Background(), strings.NewReader(""), src, DefaultParseLimits())
+			if err == nil {
+				t.Fatalf("expected error for zero-byte feed, got nil")
+			}
+			if !errors.Is(err, ErrNoValidRules) {
+				t.Errorf("expected ErrNoValidRules, got %v", err)
+			}
+			if report.TotalLines != 0 || report.Accepted != 0 {
+				t.Errorf("expected 0 TotalLines and 0 Accepted, got %+v", report)
+			}
+			if len(rules.Domains) != 0 || len(rules.CIDRs) != 0 {
+				t.Errorf("expected 0 rules, got %d domains, %d cidrs", len(rules.Domains), len(rules.CIDRs))
+			}
+		})
+	}
+}
+
+func TestParse_LeadingMalformedRowsWithinBudget(t *testing.T) {
+	// Construct 1 malformed row followed by 999 valid domains
+	var sb strings.Builder
+	sb.WriteString("\"certr.ru\n") // Antifilter-style malformed leading line
+	for i := 0; i < 999; i++ {
+		fmt.Fprintf(&sb, "valid%d.example.com\n", i)
+	}
+	input := sb.String()
+
+	// 1. Preset feed should tolerate leading malformed row because overall rejection rate is 1/1000 = 0.1% <= 0.5%
+	presetSrc := Source{
+		ID:             "preset-feed",
+		URL:            "https://preset.example.com/domains.lst",
+		Format:         FormatDomains,
+		BareDomainMode: DomainModeInclusiveSuffix,
+		IsPreset:       true,
+	}
+
+	rules, report, err := Parse(context.Background(), strings.NewReader(input), presetSrc, DefaultParseLimits())
+	if err != nil {
+		t.Fatalf("expected preset feed to succeed despite leading malformed line, got: %v", err)
+	}
+	if report.Rejected != 1 {
+		t.Errorf("report.Rejected = %d, want 1", report.Rejected)
+	}
+	if report.Accepted != 999 {
+		t.Errorf("report.Accepted = %d, want 999", report.Accepted)
+	}
+	if len(rules.Domains) != 999 {
+		t.Errorf("len(rules.Domains) = %d, want 999", len(rules.Domains))
+	}
+
+	// 2. Custom feed should reject immediately on line 1 (strict parsing)
+	customSrc := Source{
+		ID:             "custom-feed",
+		URL:            "https://custom.example.com/domains.lst",
+		Format:         FormatDomains,
+		BareDomainMode: DomainModeExact,
+		IsPreset:       false,
+	}
+
+	_, _, err = Parse(context.Background(), strings.NewReader(input), customSrc, DefaultParseLimits())
+	if err == nil || !strings.Contains(err.Error(), "invalid domain rule") {
+		t.Fatalf("expected strict custom feed to reject on line 1, got %v", err)
 	}
 }

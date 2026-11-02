@@ -342,3 +342,230 @@ func TestSyncer_ShrinkGuard(t *testing.T) {
 		t.Errorf("expected 1 domain published with force shrink, got %d", matcher.Current().DomainCount())
 	}
 }
+
+func TestSyncer_ZeroByteFeedInitialSyncLeavesNotReady(t *testing.T) {
+	tempDir := t.TempDir()
+	store := NewFileStore(tempDir)
+	matcher := NewMatcher()
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// Return 0 bytes
+	}))
+	defer ts.Close()
+
+	serverAddr := ts.Listener.Addr().String()
+
+	fetcher := NewFetcher(DefaultFetchLimits())
+	fetcher.tlsConfig = &tls.Config{InsecureSkipVerify: true}
+	fetcher.lookupIP = func(ctx context.Context, host string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	}
+	fetcher.dialTCP = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", serverAddr)
+	}
+
+	cfg := SyncConfig{
+		Sources: []Source{
+			{
+				ID:       "zero-src",
+				URL:      "https://rules.example.com/rules.lst",
+				Format:   FormatDomains,
+				IsPreset: true,
+			},
+		},
+		RefreshInterval: 1 * time.Hour,
+	}
+
+	syncer, err := NewSyncer(matcher, fetcher, store, cfg)
+	if err != nil {
+		t.Fatalf("NewSyncer error: %v", err)
+	}
+
+	// 1. Direct executeUpdate must return error and leave Ready == false
+	_, err = syncer.executeUpdate(context.Background())
+	if err == nil {
+		t.Fatal("expected error on initial sync with zero-byte feed, got nil")
+	}
+	if !strings.Contains(err.Error(), "contained no valid rules") {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	status := syncer.Status()
+	if status.Ready {
+		t.Error("syncer status.Ready must be false after zero-byte initial sync")
+	}
+	if matcher.Current() != nil {
+		t.Error("matcher.Current() must be nil when syncer is not ready")
+	}
+
+	// 2. Also verify through Run(ctx) background loop with concurrent Sync()
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		runErrCh <- syncer.Run(runCtx)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	status = syncer.Status()
+	if status.Ready {
+		t.Error("syncer status.Ready must remain false after Run initial sync with zero-byte feed")
+	}
+	if matcher.Current() != nil {
+		t.Error("matcher.Current() must remain nil")
+	}
+
+	// Calling syncer.Sync() while Run is executing
+	syncCtx, syncCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer syncCancel()
+	_, syncErr := syncer.Sync(syncCtx)
+	if syncErr == nil {
+		t.Fatal("expected error from syncer.Sync with zero-byte feed, got nil")
+	}
+	if !strings.Contains(syncErr.Error(), "contained no valid rules") {
+		t.Errorf("unexpected error from Sync: %v", syncErr)
+	}
+
+	runCancel()
+	_ = <-runErrCh
+}
+
+func TestSyncer_MultiSourceZeroByteRefreshPreservesActiveAndLKG(t *testing.T) {
+	tempDir := t.TempDir()
+	store := NewFileStore(tempDir)
+	matcher := NewMatcher()
+
+	var sourceABody atomic.Pointer[string]
+	initA := "domain-a.com\n"
+	sourceABody.Store(&initA)
+
+	var sourceBBody atomic.Pointer[string]
+	initB := "domain-b.com\n"
+	sourceBBody.Store(&initB)
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		switch r.URL.Path {
+		case "/source-a.lst":
+			_, _ = w.Write([]byte(*sourceABody.Load()))
+		case "/source-b.lst":
+			_, _ = w.Write([]byte(*sourceBBody.Load()))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	serverAddr := ts.Listener.Addr().String()
+
+	fetcher := NewFetcher(DefaultFetchLimits())
+	fetcher.tlsConfig = &tls.Config{InsecureSkipVerify: true}
+	fetcher.lookupIP = func(ctx context.Context, host string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	}
+	fetcher.dialTCP = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", serverAddr)
+	}
+
+	cfg := SyncConfig{
+		Sources: []Source{
+			{
+				ID:             "source-a",
+				URL:            "https://rules.example.com/source-a.lst",
+				Format:         FormatDomains,
+				BareDomainMode: DomainModeExact,
+				IsPreset:       true,
+			},
+			{
+				ID:             "source-b",
+				URL:            "https://rules.example.com/source-b.lst",
+				Format:         FormatDomains,
+				BareDomainMode: DomainModeExact,
+				IsPreset:       true,
+			},
+		},
+		RefreshInterval: 1 * time.Hour,
+	}
+
+	syncer, err := NewSyncer(matcher, fetcher, store, cfg)
+	if err != nil {
+		t.Fatalf("NewSyncer error: %v", err)
+	}
+
+	// Initial sync: both sources provide rules
+	res, err := syncer.executeUpdate(context.Background())
+	if err != nil {
+		t.Fatalf("initial executeUpdate failed: %v", err)
+	}
+	if !res.Published {
+		t.Fatal("expected initial update to be published")
+	}
+
+	snap := matcher.Current()
+	if snap == nil {
+		t.Fatal("expected active snapshot after initial sync")
+	}
+	if snap.DomainCount() != 2 {
+		t.Fatalf("expected 2 domains, got %d", snap.DomainCount())
+	}
+	if !snap.MatchDomain("domain-a.com") || !snap.MatchDomain("domain-b.com") {
+		t.Fatal("expected both domain-a.com and domain-b.com to match")
+	}
+
+	// Verify LKG exists with both sources
+	lkgGen, err := store.Load(context.Background())
+	if err != nil || lkgGen == nil {
+		t.Fatalf("expected durable LKG generation on disk: %v", err)
+	}
+	if len(lkgGen.Domains) != 2 {
+		t.Fatalf("expected LKG to have 2 domains, got %d", len(lkgGen.Domains))
+	}
+
+	// Now simulate refresh where Source A returns zero bytes
+	emptyA := ""
+	sourceABody.Store(&emptyA)
+
+	// Refresh cycle
+	res2, err := syncer.executeUpdate(context.Background())
+	if err == nil {
+		t.Fatal("expected executeUpdate to fail when source-a returns zero bytes, got nil")
+	}
+	if res2.Published {
+		t.Error("update must not be published on failure")
+	}
+
+	// Verify active snapshot is still intact and retains source A rules!
+	snapAfter := matcher.Current()
+	if snapAfter == nil {
+		t.Fatal("active snapshot became nil after failed refresh")
+	}
+	if snapAfter.DomainCount() != 2 {
+		t.Errorf("active snapshot lost rules: got %d domains, want 2", snapAfter.DomainCount())
+	}
+	if !snapAfter.MatchDomain("domain-a.com") {
+		t.Error("domain-a.com was lost from active snapshot")
+	}
+	if !snapAfter.MatchDomain("domain-b.com") {
+		t.Error("domain-b.com was lost from active snapshot")
+	}
+
+	// Verify durable LKG still has both source A and source B rules
+	lkgGenAfter, err := store.Load(context.Background())
+	if err != nil || lkgGenAfter == nil {
+		t.Fatalf("failed loading LKG: %v", err)
+	}
+	if len(lkgGenAfter.Domains) != 2 {
+		t.Errorf("LKG lost domains: got %d, want 2", len(lkgGenAfter.Domains))
+	}
+	if _, ok := lkgGenAfter.Domains["domain-a.com"]; !ok {
+		t.Error("domain-a.com missing from durable LKG")
+	}
+	if _, ok := lkgGenAfter.Domains["domain-b.com"]; !ok {
+		t.Error("domain-b.com missing from durable LKG")
+	}
+}

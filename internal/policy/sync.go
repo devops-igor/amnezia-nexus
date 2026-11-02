@@ -141,7 +141,7 @@ func (s *Syncer) Run(ctx context.Context) error {
 	// Attempt initial recovery from last-known-good cache on startup
 	if s.store != nil {
 		if gen, err := s.store.Load(ctx); err == nil && gen != nil {
-			if snap, snapErr := GenerationToSnapshot(gen); snapErr == nil {
+			if snap, snapErr := GenerationToSnapshot(gen); snapErr == nil && (snap.DomainCount() > 0 || snap.CIDRCount() > 0) {
 				s.matcher.Publish(snap)
 				s.cachedGen = gen
 				s.statusMu.Lock()
@@ -357,6 +357,11 @@ func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
 	}
 
 	candidateDomains, candidateCIDRs, totalRules := aggregateCandidateRules(sourceParsedList)
+	if totalRules == 0 {
+		err := errors.New("cannot publish policy snapshot with zero rules")
+		s.recordFailure(err, statsMap, startTime)
+		return SyncResult{SourceStats: statsMap, Duration: time.Since(startTime)}, err
+	}
 	if err := s.checkShrink(totalRules); err != nil {
 		s.recordFailure(err, statsMap, startTime)
 		return SyncResult{SourceStats: statsMap, Duration: time.Since(startTime)}, err

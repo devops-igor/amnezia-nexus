@@ -11,6 +11,13 @@ import (
 	"strings"
 )
 
+var (
+	// ErrNoValidRules indicates that the parsed feed yielded zero valid rules.
+	ErrNoValidRules = errors.New("feed contained no valid rules")
+	// ErrEmptyFeed is an alias for ErrNoValidRules.
+	ErrEmptyFeed = ErrNoValidRules
+)
+
 // Format indicates whether a rule list source contains domains, IPv4 ranges, or mixed rules.
 type Format uint8
 
@@ -110,11 +117,12 @@ func checkRejectionBudget(lineNo int, line string, err error, src Source, limits
 		if src.Format == FormatDomains {
 			return fmt.Errorf("line %d: invalid domain rule %q: %w", lineNo, line, err)
 		}
+		if src.Format == FormatIPv4 {
+			return fmt.Errorf("line %d: invalid IPv4 rule %q: %w", lineNo, line, err)
+		}
 		return fmt.Errorf("line %d: invalid rule %q: %w", lineNo, line, err)
 	}
-	if report.Rejected > limits.MaxRejectedRows ||
-		(report.Accepted+report.Rejected > 0 &&
-			float64(report.Rejected)/float64(report.Accepted+report.Rejected) > limits.RejectionBudget) {
+	if limits.MaxRejectedRows > 0 && report.Rejected > limits.MaxRejectedRows {
 		return fmt.Errorf("rejection budget exceeded at line %d: %d rejected rows: %w", lineNo, report.Rejected, err)
 	}
 	return nil
@@ -134,11 +142,10 @@ func parseDomainsRow(line string, src Source, limits ParseLimits, domains map[st
 	return nil
 }
 
-func parseIPv4Row(line string, cidrs *[]netip.Prefix, report *ParseReport) error {
+func parseIPv4Row(line string, src Source, limits ParseLimits, cidrs *[]netip.Prefix, report *ParseReport) error {
 	prefix, ruleErr := ParseIPv4Rule(line)
 	if ruleErr != nil {
-		report.Rejected++
-		return fmt.Errorf("line %d: invalid IPv4 rule %q: %w", report.TotalLines, line, ruleErr)
+		return checkRejectionBudget(report.TotalLines, line, ruleErr, src, limits, report)
 	}
 	*cidrs = append(*cidrs, prefix)
 	report.Accepted++
@@ -167,8 +174,7 @@ func parseMixedRow(line string, src Source, limits ParseLimits, domains map[stri
 	return nil
 }
 
-// Parse reads list rules from r, validates and normalizes entries according to src configuration.
-func Parse(ctx context.Context, r io.Reader, src Source, limits ParseLimits) (ParsedRules, ParseReport, error) {
+func normalizeParseLimits(limits ParseLimits) ParseLimits {
 	if limits.MaxLines <= 0 {
 		limits.MaxLines = 3_000_000
 	}
@@ -178,6 +184,39 @@ func Parse(ctx context.Context, r io.Reader, src Source, limits ParseLimits) (Pa
 	if limits.MaxRules <= 0 {
 		limits.MaxRules = 3_000_000
 	}
+	if limits.MaxRejectedRows <= 0 {
+		limits.MaxRejectedRows = 10_000
+	}
+	if limits.RejectionBudget <= 0 {
+		limits.RejectionBudget = 0.005
+	}
+	return limits
+}
+
+func checkPostParseLimits(src Source, limits ParseLimits, domains map[string]domainFlags, cidrs []netip.Prefix, report ParseReport) error {
+	if report.Accepted == 0 || (len(domains) == 0 && len(cidrs) == 0) {
+		return ErrNoValidRules
+	}
+
+	if src.IsPreset && limits.RejectionBudget > 0 {
+		totalDataRows := report.Accepted + report.Duplicates + report.Rejected
+		if totalDataRows > 0 && float64(report.Rejected)/float64(totalDataRows) > limits.RejectionBudget {
+			return fmt.Errorf("rejection budget exceeded: %d of %d data rows rejected (%.2f%% > %.2f%%)",
+				report.Rejected, totalDataRows,
+				float64(report.Rejected)/float64(totalDataRows)*100,
+				limits.RejectionBudget*100)
+		}
+	}
+
+	if len(domains)+len(cidrs) > limits.MaxRules {
+		return fmt.Errorf("rule count %d exceeds maximum rule limit %d", len(domains)+len(cidrs), limits.MaxRules)
+	}
+	return nil
+}
+
+// Parse reads list rules from r, validates and normalizes entries according to src configuration.
+func Parse(ctx context.Context, r io.Reader, src Source, limits ParseLimits) (ParsedRules, ParseReport, error) {
+	limits = normalizeParseLimits(limits)
 
 	bufReader := bufio.NewReader(r)
 
@@ -214,7 +253,7 @@ func Parse(ctx context.Context, r io.Reader, src Source, limits ParseLimits) (Pa
 		case FormatDomains:
 			rowErr = parseDomainsRow(line, src, limits, domains, &cidrs, &report)
 		case FormatIPv4:
-			rowErr = parseIPv4Row(line, &cidrs, &report)
+			rowErr = parseIPv4Row(line, src, limits, &cidrs, &report)
 		case FormatMixed:
 			rowErr = parseMixedRow(line, src, limits, domains, &cidrs, &report)
 		default:
@@ -229,12 +268,8 @@ func Parse(ctx context.Context, r io.Reader, src Source, limits ParseLimits) (Pa
 		return ParsedRules{}, report, fmt.Errorf("scanner error during parse: %w", err)
 	}
 
-	if report.TotalLines > 0 && report.Accepted == 0 {
-		return ParsedRules{}, report, errors.New("feed contained no valid rules")
-	}
-
-	if len(domains)+len(cidrs) > limits.MaxRules {
-		return ParsedRules{}, report, fmt.Errorf("rule count %d exceeds maximum rule limit %d", len(domains)+len(cidrs), limits.MaxRules)
+	if err := checkPostParseLimits(src, limits, domains, cidrs, report); err != nil {
+		return ParsedRules{}, report, err
 	}
 
 	return ParsedRules{
