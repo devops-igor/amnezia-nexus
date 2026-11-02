@@ -25,8 +25,32 @@ const (
 	NaiveBaseImage     = "amnezia-caddy:local"
 )
 
+// Decoy website theme identifiers.
+const (
+	DecoyThemeMinecraft      = "minecraft"
+	DecoyThemeCreativeStudio = "creative-studio"
+	DecoyThemeDefault        = "default"
+)
+
 //go:embed assets/decoy/minecraft/index.html
 var minecraftDecoyHTML []byte
+
+//go:embed assets/decoy/creative-studio/index.html
+var creativeStudioDecoyHTML []byte
+
+// GetDecoyHTML returns the static HTML content for the specified decoy theme.
+// It returns the Creative Studio asset for "creative-studio", and falls back to
+// the Minecraft Community asset for "minecraft", "default", or any empty/unknown theme.
+func GetDecoyHTML(theme string) []byte {
+	switch strings.ToLower(strings.TrimSpace(theme)) {
+	case DecoyThemeCreativeStudio:
+		return creativeStudioDecoyHTML
+	case DecoyThemeMinecraft, DecoyThemeDefault:
+		return minecraftDecoyHTML
+	default:
+		return minecraftDecoyHTML
+	}
+}
 
 // SSHProvider abstracts obtaining an SSHClient for a server.
 type SSHProvider interface {

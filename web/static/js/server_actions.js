@@ -214,7 +214,7 @@ async function installProtocol() {
             params.naive_options = {
                 port: port,
                 domain: naiveDomainEl ? naiveDomainEl.value.trim() : '',
-                decoy_template: naiveDecoyEl ? naiveDecoyEl.value : 'default'
+                decoy_template: naiveDecoyEl ? naiveDecoyEl.value : 'minecraft'
             };
         }
         if (['awg'].includes(currentInstallProto)) {

@@ -338,9 +338,9 @@ func BuildNaiveURI(domain string, port int, user, pass, name string) (string, er
 	return u.String(), nil
 }
 
-// DefaultDecoyHTML returns the built-in Minecraft community decoy website.
+// DefaultDecoyHTML returns the built-in default decoy website (Minecraft community).
 func DefaultDecoyHTML() string {
-	return string(minecraftDecoyHTML)
+	return string(GetDecoyHTML(DecoyThemeDefault))
 }
 
 // RenderCaddyDockerfile returns the multi-stage Dockerfile for Caddy with forwardproxy.
