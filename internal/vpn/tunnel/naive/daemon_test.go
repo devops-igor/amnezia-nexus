@@ -2,10 +2,13 @@ package naive
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -115,10 +118,13 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 )
 
 type Config struct {
-	Listen string ` + "`json:\"listen\"`" + `
+	Listen            string ` + "`json:\"listen\"`" + `
+	Proxy             string ` + "`json:\"proxy\"`" + `
+	HostResolverRules string ` + "`json:\"host-resolver-rules\"`" + `
 }
 
 func main() {
@@ -194,12 +200,45 @@ func main() {
 				if _, err := io.ReadFull(c, dstBuf); err != nil {
 					return
 				}
+				// If upstream proxy is configured, verify it can be reached
+				targetAddr := ""
+				if cfg.Proxy != "" {
+					if u, err := url.Parse(cfg.Proxy); err == nil {
+						targetHost := u.Hostname()
+						targetPort := u.Port()
+						if cfg.HostResolverRules != "" {
+							parts := strings.Fields(cfg.HostResolverRules)
+							if len(parts) >= 3 && parts[0] == "MAP" {
+								targetHost = parts[2]
+							}
+						}
+						targetAddr = net.JoinHostPort(targetHost, targetPort)
+					}
+				}
+				var upstream net.Conn
+				if targetAddr != "" {
+					upstream, _ = net.DialTimeout("tcp", targetAddr, 1*time.Second)
+				}
+				if cfg.Proxy != "" && upstream == nil {
+					// Upstream unreachable / connection refused: close client
+					return
+				}
+				defer func() {
+					if upstream != nil {
+						_ = upstream.Close()
+					}
+				}()
 				// Reply: Success (0x00)
 				resp := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x10, 0x00}
 				if _, err := c.Write(resp); err != nil {
 					return
 				}
-				_, _ = io.Copy(c, c)
+				if upstream != nil {
+					go func() { _, _ = io.Copy(upstream, c) }()
+					_, _ = io.Copy(c, upstream)
+				} else {
+					_, _ = io.Copy(c, c)
+				}
 			}(conn)
 		}
 	}()
@@ -657,6 +696,22 @@ func TestProbeNaiveProxy_WithDaemonIntegration(t *testing.T) {
 func TestProbeNaiveProxy_ViaDaemonE2E(t *testing.T) {
 	mockBin := buildMockNaiveBinary(t)
 
+	cert, err := generateLeafCert(testCACert, testCAKey, "camouflage.example.com")
+	if err != nil {
+		t.Fatalf("generate leaf cert: %v", err)
+	}
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	ts.TLS = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h2", "http/1.1"},
+	}
+	ts.StartTLS()
+	defer ts.Close()
+
+	endpoint := ts.Listener.Addr().String()
+
 	p := models.NaiveProxyParams{
 		Username: "alice",
 		Password: "secret-password",
@@ -665,19 +720,75 @@ func TestProbeNaiveProxy_ViaDaemonE2E(t *testing.T) {
 
 	t.Setenv(NaiveBinPathEnv, mockBin)
 
-	// In-process test fixtures set testRootCAs; clear it temporarily to test daemon probe path
-	oldCAs := testRootCAs
-	SetTestRootCAs(nil)
-	defer SetTestRootCAs(oldCAs)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	latency, err := ProbeNaiveProxy(ctx, "198.51.100.1:443", p, 3*time.Second)
+	latency, err := ProbeNaiveProxy(ctx, endpoint, p, 3*time.Second)
 	if err != nil {
 		t.Fatalf("ProbeNaiveProxy via daemon failed: %v", err)
 	}
 	if latency < 1 {
 		t.Errorf("expected latency >= 1ms, got %d", latency)
+	}
+}
+
+func TestAuditSupervisorCrashLoopMustBeBounded(t *testing.T) {
+	mock := buildMockNaiveBinary(t)
+	p := models.NaiveProxyParams{Username: "audit-user", Password: "audit-password", Domain: "naive.example.com"}
+	d, err := NewDaemon(mock, "198.51.100.1:443", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.SetReadinessTimeout(50 * time.Millisecond)
+	d.SetRestartDelay(10 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := d.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Stop()
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "starts")
+	script := filepath.Join(dir, "crash")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf 'start\\n' >> '"+countPath+"'\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	d.binPath = script
+	proc := d.cmd.Process
+	d.mu.Unlock()
+	proc.Kill()
+	time.Sleep(500 * time.Millisecond)
+	d.Stop()
+	// Allow already-running canceled readiness polls to observe stop.
+	time.Sleep(100 * time.Millisecond)
+	data, _ := os.ReadFile(countPath)
+	count := strings.Count(string(data), "start\n")
+	t.Logf("failed child starts=%d health=%v lastErr=%v", count, d.IsHealthy(), d.LastError())
+	if count > 5 {
+		t.Fatalf("bounded five-attempt policy restarted an exiting child %d times", count)
+	}
+}
+
+func TestAuditClosedDialerMustNotStartDaemon(t *testing.T) {
+	oldCAs := testRootCAs
+	testRootCAs = nil
+	defer func() { testRootCAs = oldCAs }()
+	t.Setenv(NaiveBinPathEnv, buildMockNaiveBinary(t))
+	d, err := New("198.51.100.1:443", models.NaiveProxyParams{Username: "audit-user", Password: "audit-password", Domain: "naive.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = d.DialContext(ctx, "tcp", "target.example.com:443")
+	active := d.Daemon() != nil && d.Daemon().IsActive()
+	t.Logf("dial after Close: err=%v active=%v", err, active)
+	if active {
+		t.Fatal("DialContext started a fresh supervised child after Close")
 	}
 }

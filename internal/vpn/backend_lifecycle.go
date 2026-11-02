@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"strconv"
@@ -137,7 +138,21 @@ func (s *Service) resolveNewBackendEndpoint(ctx context.Context, serverID int64,
 	return net.JoinHostPort(cleanHost, strconv.Itoa(p)), nil
 }
 
-func (s *Service) syncBackendForwarderOnHostUpdateLocked(ctx context.Context, serverID, expectedTunnelID int64, awgParams map[string]any) error {
+func (s *Service) prepareNaiveCandidateForTunnel(ctx context.Context, tun *models.BackendTunnel) (map[string]any, io.Closer, error) {
+	if tun != nil && models.NormalizeTunnelProtocol(tun.Protocol) == models.ProtocolNaive {
+		candDev, closer, err := s.prepareNaiveCandidateDevice(ctx, tun)
+		if err != nil {
+			return nil, nil, err
+		}
+		return map[string]any{"candidate_device": candDev}, closer, nil
+	}
+	return nil, nil, nil
+}
+
+func (s *Service) syncBackendForwarderOnHostUpdateLocked(
+	ctx context.Context, serverID, expectedTunnelID int64, awgParams map[string]any,
+	prepared ...map[string]any,
+) error {
 	if s.syncBackendForwarderHook != nil {
 		if err := s.syncBackendForwarderHook(); err != nil {
 			return err
@@ -161,7 +176,7 @@ func (s *Service) syncBackendForwarderOnHostUpdateLocked(ctx context.Context, se
 
 	if currentTun.Status == TunnelStatusActive || currentTun.Status == TunnelStatusDegraded ||
 		currentTun.Status == models.TunnelStatusActive || currentTun.Status == models.TunnelStatusDegraded {
-		attachErr := s.attachBackendForwarder(currentTun, awgParams)
+		attachErr := s.attachBackendForwarder(currentTun, awgParams, prepared...)
 		if attachErr != nil {
 			log.Printf("[vpn] warning: failed to attach backend forwarder for server %d after host update: %v", serverID, attachErr)
 			_ = s.pool.SetTunnelStatus(ctx, serverID, TunnelStatusDegraded, 0)
@@ -177,6 +192,8 @@ func (s *Service) syncBackendForwarderOnHostUpdateLocked(ctx context.Context, se
 }
 
 // UpdateBackendServerHost updates the endpoint of a server in the VPN backend pool.
+//
+//nolint:gocyclo // transactional host update with rollback and forwarder synchronization.
 func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, newHost string) error {
 	if s == nil || s.pool == nil {
 		return nil
@@ -234,9 +251,23 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 			return err
 		}
 
+		prepMap, candCloser, err := s.prepareNaiveCandidateForTunnel(ctx, tun)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if candCloser != nil {
+				_ = candCloser.Close()
+			}
+		}()
+
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
+		syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams, prepMap)
+		if syncErr == nil {
+			candCloser = nil
+		}
+		return syncErr
 	}
 
 	oldEndpoint := tun.Endpoint
@@ -268,9 +299,22 @@ func (s *Service) UpdateBackendServerHost(ctx context.Context, serverID int64, n
 		return rollbackEndpoint(err)
 	}
 
+	prepMap, candCloser, err := s.prepareNaiveCandidateForTunnel(ctx, tun)
+	if err != nil {
+		return rollbackEndpoint(err)
+	}
+	defer func() {
+		if candCloser != nil {
+			_ = candCloser.Close()
+		}
+	}()
+
 	s.mu.Lock()
-	syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
+	syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams, prepMap)
 	s.mu.Unlock()
+	if syncErr == nil {
+		candCloser = nil
+	}
 
 	if syncErr != nil {
 		return rollbackEndpoint(syncErr)
@@ -336,9 +380,23 @@ func (s *Service) UpdateBackendServerPublicKey(ctx context.Context, serverID int
 			return err
 		}
 
+		prepMap, candCloser, err := s.prepareNaiveCandidateForTunnel(ctx, tun)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if candCloser != nil {
+				_ = candCloser.Close()
+			}
+		}()
+
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
+		syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams, prepMap)
+		if syncErr == nil {
+			candCloser = nil
+		}
+		return syncErr
 	}
 
 	oldPublicKey := tun.PublicKey
@@ -370,9 +428,22 @@ func (s *Service) UpdateBackendServerPublicKey(ctx context.Context, serverID int
 		return rollbackPublicKey(err)
 	}
 
+	prepMap, candCloser, err := s.prepareNaiveCandidateForTunnel(ctx, tun)
+	if err != nil {
+		return rollbackPublicKey(err)
+	}
+	defer func() {
+		if candCloser != nil {
+			_ = candCloser.Close()
+		}
+	}()
+
 	s.mu.Lock()
-	syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams)
+	syncErr := s.syncBackendForwarderOnHostUpdateLocked(ctx, serverID, tun.ID, awgParams, prepMap)
 	s.mu.Unlock()
+	if syncErr == nil {
+		candCloser = nil
+	}
 
 	if syncErr != nil {
 		return rollbackPublicKey(syncErr)

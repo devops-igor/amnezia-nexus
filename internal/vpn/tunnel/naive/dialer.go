@@ -101,6 +101,7 @@ type Dialer struct {
 	daemonMu          sync.Mutex
 	disableDaemon     bool
 	inProcessFallback bool
+	closed            bool
 	lastErr           error
 }
 
@@ -180,6 +181,13 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+
+	d.daemonMu.Lock()
+	if d.closed {
+		d.daemonMu.Unlock()
+		return nil, net.ErrClosed
+	}
+	d.daemonMu.Unlock()
 
 	// 1. If in-process Go transport is allowed and no daemon is configured, use in-process Go transport.
 	if d.allowsInProcess() {
@@ -335,6 +343,10 @@ func (d *Dialer) Daemon() *Daemon {
 // getOrStartDaemon initializes and starts a supervised upstream naive daemon if available.
 func (d *Dialer) getOrStartDaemon(ctx context.Context) (StreamDialer, error) {
 	d.daemonMu.Lock()
+	if d.closed {
+		d.daemonMu.Unlock()
+		return nil, errors.New("naive: dialer is closed")
+	}
 	if d.socks5Dialer != nil {
 		sd := d.socks5Dialer
 		d.daemonMu.Unlock()
@@ -360,6 +372,9 @@ func (d *Dialer) getOrStartDaemon(ctx context.Context) (StreamDialer, error) {
 
 	d.daemonMu.Lock()
 	defer d.daemonMu.Unlock()
+	if d.closed {
+		return nil, errors.New("naive: dialer is closed")
+	}
 	if d.socks5Dialer != nil {
 		return d.socks5Dialer, nil
 	}
@@ -373,15 +388,10 @@ func (d *Dialer) getOrStartDaemon(ctx context.Context) (StreamDialer, error) {
 	return d.socks5Dialer, nil
 }
 
-// ensureDaemon returns the active SOCKS5 dialer or attempts to start it, ignoring errors.
-func (d *Dialer) ensureDaemon(ctx context.Context) StreamDialer {
-	sd, _ := d.getOrStartDaemon(ctx)
-	return sd
-}
-
 // Close closes all pooled connections and terminates any supervised naive daemon.
 func (d *Dialer) Close() error {
 	d.daemonMu.Lock()
+	d.closed = true
 	if d.daemon != nil {
 		_ = d.daemon.Stop()
 		d.daemon = nil

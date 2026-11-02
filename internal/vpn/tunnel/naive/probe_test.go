@@ -7,7 +7,10 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -333,5 +336,94 @@ func TestProbeNaiveProxy_H3_TimeoutDuringResponse(t *testing.T) {
 
 	if elapsed > 1500*time.Millisecond {
 		t.Fatalf("probe did not respect 300ms timeout on slow H3 response: took %v", elapsed)
+	}
+}
+
+func auditProductionCAs(t *testing.T) {
+	t.Helper()
+	old := testRootCAs
+	testRootCAs = nil
+	t.Cleanup(func() { testRootCAs = old })
+}
+
+func TestAuditProbeDownloadFailureMustNotUseGoTransport(t *testing.T) {
+	auditProductionCAs(t)
+	t.Setenv(NaiveBinPathEnv, filepath.Join(t.TempDir(), "missing"))
+	t.Setenv("NAIVE_DISABLE_DOWNLOAD", "1")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var calls atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			c, e := ln.Accept()
+			if e != nil {
+				return
+			}
+			calls.Add(1)
+			_ = c.Close()
+		}
+	}()
+	p := models.NaiveProxyParams{Username: "audit-user", Password: "audit-password", Domain: "naive.example.com"}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = ProbeNaiveProxy(ctx, ln.Addr().String(), p, time.Second)
+	_ = ln.Close()
+	<-done
+	t.Logf("missing native binary: remote Go TCP attempts=%d err=%v", calls.Load(), err)
+	if calls.Load() != 0 {
+		t.Fatal("health probe leaked Go transport traffic after native failure")
+	}
+}
+
+func TestAuditProbeMustRejectUnreachableUpstream(t *testing.T) {
+	auditProductionCAs(t)
+	t.Setenv(NaiveBinPathEnv, buildMockNaiveBinary(t))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := ln.Addr().String()
+	_ = ln.Close() // deterministic refused remote endpoint
+	p := models.NaiveProxyParams{Username: "audit-user", Password: "invalid-audit-credential", Domain: "naive.example.com"}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ms, err := ProbeNaiveProxy(ctx, endpoint, p, time.Second)
+	t.Logf("refused remote endpoint: latency=%d err=%v", ms, err)
+	if err == nil {
+		t.Fatal("health probe accepted local SOCKS success without any authenticated remote roundtrip")
+	}
+}
+
+func TestAuditDownloadFailureMustNotUseGoTransport(t *testing.T) {
+	auditProductionCAs(t)
+	t.Setenv(NaiveBinPathEnv, filepath.Join(t.TempDir(), "missing-naive"))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
+	t.Setenv(NaiveDownloadBaseURLEnv, ts.URL)
+	t.Setenv("NAIVE_DISABLE_DOWNLOAD", "0")
+	var calls atomic.Int32
+	sentinel := errors.New("audit: in-process Go transport reached")
+	d, err := New("198.51.100.1:443", models.NaiveProxyParams{Username: "audit-user", Password: "audit-password", Domain: "naive.example.com"},
+		WithDialContext(func(context.Context, string, string) (net.Conn, error) {
+			calls.Add(1)
+			return nil, sentinel
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err = d.DialContext(ctx, "tcp", "target.example.com:443")
+	t.Logf("download HTTP 503: Go transport calls=%d returned=%v", calls.Load(), err)
+	if calls.Load() != 0 {
+		t.Fatal("download failure silently downgraded to fingerprintable Go transport instead of failing closed")
 	}
 }

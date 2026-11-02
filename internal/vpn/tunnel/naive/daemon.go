@@ -116,6 +116,11 @@ func allocateLoopbackPort() (int, error) {
 	return port, nil
 }
 
+type procExitEvent struct {
+	gen uint64
+	err error
+}
+
 // Daemon represents a supervised upstream naive process instance.
 type Daemon struct {
 	mu             sync.Mutex
@@ -126,7 +131,10 @@ type Daemon struct {
 	configPath     string
 	cmd            *exec.Cmd
 	cmdCancel      context.CancelFunc
+	cmdGen         uint64
 	exitCh         chan struct{}
+	procExitCh     chan procExitEvent
+	supervisorWg   sync.WaitGroup
 	stopped        bool
 	socksDialer    StreamDialer
 	readinessWait  time.Duration
@@ -154,6 +162,7 @@ func NewDaemon(binPath, endpoint string, params models.NaiveProxyParams) (*Daemo
 		readinessWait:  5 * time.Second,
 		restartDelay:   200 * time.Millisecond,
 		stopSupervisor: make(chan struct{}),
+		procExitCh:     make(chan procExitEvent, 16),
 	}, nil
 }
 
@@ -224,7 +233,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		defer readyCancel()
 	}
 
-	if err := d.waitForReady(readyCtx, port); err != nil {
+	if err := d.waitForReady(readyCtx, port, d.cmdGen); err != nil {
 		_ = d.Stop()
 		d.mu.Lock()
 		d.lastErr = err
@@ -246,10 +255,17 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.lastErr = nil
 	d.mu.Unlock()
 
+	// Launch single supervisor recovery owner for this daemon (H5)
+	d.supervisorWg.Add(1)
+	go d.supervisorLoop()
+
 	return nil
 }
 
 func (d *Daemon) startProcessLocked() error {
+	d.cmdGen++
+	gen := d.cmdGen
+
 	cmdCtx, cancel := context.WithCancel(context.Background())
 	// #nosec G204 -- supervised binary path and config path are validated internal paths
 	cmd := exec.CommandContext(cmdCtx, d.binPath, d.configPath)
@@ -266,36 +282,50 @@ func (d *Daemon) startProcessLocked() error {
 	d.cmdCancel = cancel
 	d.exitCh = exitCh
 
-	go func(c *exec.Cmd, ch chan struct{}) {
-		_ = c.Wait()
+	go func(c *exec.Cmd, g uint64, ch chan struct{}) {
+		err := c.Wait()
 		close(ch)
-		d.handleProcessExit(c)
-	}(cmd, exitCh)
+		select {
+		case d.procExitCh <- procExitEvent{gen: g, err: err}:
+		case <-d.stopSupervisor:
+		}
+	}(cmd, gen, exitCh)
 
 	return nil
 }
 
-func (d *Daemon) handleProcessExit(c *exec.Cmd) {
-	d.mu.Lock()
-	if d.stopped || d.cmd != c {
-		d.mu.Unlock()
-		return
-	}
-	d.cmd = nil
-	if d.cmdCancel != nil {
-		d.cmdCancel()
-		d.cmdCancel = nil
-	}
-	d.socksDialer = nil
-	d.lastErr = errors.New("naive: daemon process exited unexpectedly")
-	port := d.port
-	readinessWait := d.readinessWait
-	initialDelay := d.restartDelay
-	if initialDelay <= 0 {
-		initialDelay = 500 * time.Millisecond
-	}
-	d.mu.Unlock()
+func (d *Daemon) supervisorLoop() {
+	defer d.supervisorWg.Done()
 
+	for {
+		select {
+		case <-d.stopSupervisor:
+			return
+		case ev := <-d.procExitCh:
+			d.mu.Lock()
+			if d.stopped || d.cmd == nil || ev.gen != d.cmdGen {
+				d.mu.Unlock()
+				continue
+			}
+			d.cmd = nil
+			if d.cmdCancel != nil {
+				d.cmdCancel()
+				d.cmdCancel = nil
+			}
+			d.socksDialer = nil
+			d.lastErr = errors.New("naive: daemon process exited unexpectedly")
+			initialDelay := d.restartDelay
+			if initialDelay <= 0 {
+				initialDelay = 200 * time.Millisecond
+			}
+			d.mu.Unlock()
+
+			d.runRecovery(initialDelay)
+		}
+	}
+}
+
+func (d *Daemon) runRecovery(initialDelay time.Duration) {
 	const maxAttempts = 5
 	delay := initialDelay
 
@@ -315,22 +345,23 @@ func (d *Daemon) handleProcessExit(c *exec.Cmd) {
 		if err := d.startProcessLocked(); err != nil {
 			d.lastErr = fmt.Errorf("naive: recovery restart attempt %d/%d failed: %w", attempt, maxAttempts, err)
 			d.mu.Unlock()
-			delay *= 2
-			if delay > 8*time.Second {
-				delay = 8 * time.Second
-			}
+			delay = nextBackoff(delay)
 			continue
 		}
+
+		curGen := d.cmdGen
+		port := d.port
+		readinessWait := d.readinessWait
 		d.mu.Unlock()
 
 		probeCtx, cancel := context.WithTimeout(context.Background(), readinessWait)
-		err := d.waitForReady(probeCtx, port)
+		err := d.waitForReady(probeCtx, port, curGen)
 		cancel()
 
 		if err != nil {
 			d.mu.Lock()
 			d.lastErr = fmt.Errorf("naive: recovery readiness probe attempt %d/%d failed: %w", attempt, maxAttempts, err)
-			if d.cmd != nil {
+			if d.cmdGen == curGen && d.cmd != nil {
 				cancelFn := d.cmdCancel
 				d.cmd = nil
 				d.cmdCancel = nil
@@ -339,60 +370,48 @@ func (d *Daemon) handleProcessExit(c *exec.Cmd) {
 				}
 			}
 			d.mu.Unlock()
-			delay *= 2
-			if delay > 8*time.Second {
-				delay = 8 * time.Second
-			}
+
+			delay = nextBackoff(delay)
 			continue
 		}
 
 		dialer, err := NewSocks5Dialer(fmt.Sprintf("127.0.0.1:%d", port))
 		d.mu.Lock()
-		if d.stopped {
-			d.mu.Unlock()
-			return
-		}
-		if err != nil {
-			d.lastErr = fmt.Errorf("naive: recovery dialer setup attempt %d/%d failed: %w", attempt, maxAttempts, err)
-			if d.cmd != nil {
-				cancelFn := d.cmdCancel
-				d.cmd = nil
-				d.cmdCancel = nil
-				if cancelFn != nil {
-					cancelFn()
-				}
+		recovered := false
+		if !d.stopped && d.cmdGen == curGen {
+			if err == nil {
+				d.socksDialer = dialer
+				d.lastErr = nil
+				recovered = true
+			} else {
+				d.lastErr = fmt.Errorf("naive: recovery dialer setup attempt %d/%d failed: %w", attempt, maxAttempts, err)
 			}
-			d.mu.Unlock()
-			delay *= 2
-			if delay > 8*time.Second {
-				delay = 8 * time.Second
-			}
-			continue
 		}
-
-		d.socksDialer = dialer
-		d.lastErr = nil
 		d.mu.Unlock()
 
-		// Successfully recovered, reset backoff after healthy uptime
-		time.AfterFunc(30*time.Second, func() {
-			d.mu.Lock()
-			defer d.mu.Unlock()
-			if !d.stopped && d.cmd != nil && d.lastErr == nil {
-				d.restartDelay = 500 * time.Millisecond
-			}
-		})
-		return
+		if recovered {
+			return
+		}
+
+		delay = nextBackoff(delay)
 	}
 
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if !d.stopped {
-		d.lastErr = fmt.Errorf("naive: daemon supervisor exhausted %d restart attempts", maxAttempts)
+		d.lastErr = fmt.Errorf("naive: daemon supervisor exhausted %d restart attempts: %w", maxAttempts, d.lastErr)
 	}
+	d.mu.Unlock()
 }
 
-func (d *Daemon) waitForReady(ctx context.Context, port int) error {
+func nextBackoff(d time.Duration) time.Duration {
+	d *= 2
+	if d > 8*time.Second {
+		return 8 * time.Second
+	}
+	return d
+}
+
+func (d *Daemon) waitForReady(ctx context.Context, port int, expectedGen uint64) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
@@ -401,19 +420,29 @@ func (d *Daemon) waitForReady(ctx context.Context, port int) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-d.stopSupervisor:
+			return errors.New("naive: daemon stopped")
 		case <-ticker.C:
+			d.mu.Lock()
+			if d.cmdGen != expectedGen {
+				d.mu.Unlock()
+				return fmt.Errorf("process generation changed from %d to %d", expectedGen, d.cmdGen)
+			}
+			exitCh := d.exitCh
+			d.mu.Unlock()
+
+			if exitCh != nil {
+				select {
+				case <-exitCh:
+					return errors.New("process exited before readiness")
+				default:
+				}
+			}
+
 			conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
 			if err == nil {
 				_ = conn.Close()
 				return nil
-			}
-
-			// Check if process died prematurely
-			d.mu.Lock()
-			cmd := d.cmd
-			d.mu.Unlock()
-			if cmd != nil && cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-				return fmt.Errorf("process exited with status %d before readiness", cmd.ProcessState.ExitCode())
 			}
 		}
 	}
@@ -453,6 +482,8 @@ func (d *Daemon) Stop() error {
 	if cancel != nil {
 		cancel()
 	}
+
+	d.supervisorWg.Wait()
 
 	if configPath != "" {
 		_ = os.Remove(configPath)

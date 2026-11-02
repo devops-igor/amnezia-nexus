@@ -32,12 +32,14 @@ WORKDIR /app
 # - iproute2: IP & interface management for TUN devices (ip link, ip addr)
 # - iptables: NAT / packet forwarding rules for VPN endpoint
 # - curl: HTTP healthcheck probe
+# - libgcc: dynamic loader runtime dependency for upstream native binaries (libgcc_s.so.1)
 RUN apk add --no-cache \
         ca-certificates \
         tzdata \
         iproute2 \
         iptables \
-        curl && \
+        curl \
+        libgcc && \
     addgroup -S -g 1000 appgroup && \
     adduser -S -u 1000 -G appgroup appuser
 
