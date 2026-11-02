@@ -53,7 +53,7 @@ type Server struct {
 	policy      PolicySource
 	globalSem   chan struct{}
 	sessionMu   sync.Mutex
-	sessionSems map[string]chan struct{}
+	sessionSems map[policy.Scope]chan struct{}
 	closeOnce   sync.Once
 	closed      chan struct{}
 	wg          sync.WaitGroup
@@ -96,15 +96,128 @@ func NewServer(cfg ServerConfig, resolver Resolver, rules PolicySource) (*Server
 		resolver:    resolver,
 		policy:      rules,
 		globalSem:   make(chan struct{}, cfg.MaxInflight),
-		sessionSems: make(map[string]chan struct{}),
+		sessionSems: make(map[policy.Scope]chan struct{}),
 		closed:      make(chan struct{}),
 		activeConns: make(map[net.Conn]*ScopeHandle),
 	}, nil
 }
 
+func toScope(v any) policy.Scope {
+	switch s := v.(type) {
+	case policy.Scope:
+		return s
+	case *ScopeHandle:
+		if s != nil {
+			return s.Scope
+		}
+		return policy.Scope{}
+	case string:
+		if s != "" {
+			return policy.Scope{SessionID: s, OwnershipEpoch: 1}
+		}
+		return policy.Scope{}
+	default:
+		return policy.Scope{}
+	}
+}
+
+// ObserveResponse evaluates and records route observations into the session cache.
+func (s *Server) ObserveResponse(req, resp *mdns.Msg, session *policy.SessionCache, recvTime time.Time) {
+	if resp == nil || resp.Truncated || resp.Rcode != mdns.RcodeSuccess || session == nil || s.policy == nil {
+		return
+	}
+	snapshot := s.policy.Current()
+	if snapshot != nil {
+		_, _ = ObserveResponse(req, resp, snapshot, session, recvTime, s.cfg.MaxTTL)
+	}
+}
+
+func validateQuery(req *mdns.Msg) *mdns.Msg {
+	if req.Opcode != mdns.OpcodeQuery {
+		resp := new(mdns.Msg)
+		resp.SetRcode(req, mdns.RcodeNotImplemented)
+		return resp
+	}
+	q := req.Question[0]
+	if q.Qclass != mdns.ClassINET || q.Qtype == mdns.TypeAXFR || q.Qtype == mdns.TypeIXFR || q.Qtype == mdns.TypeANY {
+		resp := new(mdns.Msg)
+		resp.SetRcode(req, mdns.RcodeRefused)
+		return resp
+	}
+	return nil
+}
+
+func (s *Server) acquireInflight(ctx context.Context, scope policy.Scope) (func(), bool) {
+	if scope.SessionID == "" {
+		select {
+		case s.globalSem <- struct{}{}:
+			return func() { <-s.globalSem }, true
+		default:
+			return nil, false
+		}
+	}
+
+	s.sessionMu.Lock()
+	sem, ok := s.sessionSems[scope]
+	if !ok {
+		sem = make(chan struct{}, s.cfg.MaxInflightPerSession)
+		s.sessionSems[scope] = sem
+		if ctx != nil && ctx.Done() != nil {
+			go func(sc policy.Scope, ch chan struct{}, done <-chan struct{}) {
+				select {
+				case <-done:
+				case <-s.closed:
+				}
+				s.sessionMu.Lock()
+				if s.sessionSems[sc] == ch {
+					delete(s.sessionSems, sc)
+				}
+				s.sessionMu.Unlock()
+			}(scope, sem, ctx.Done())
+		}
+	}
+	s.sessionMu.Unlock()
+
+	select {
+	case sem <- struct{}{}:
+	default:
+		return nil, false
+	}
+
+	select {
+	case s.globalSem <- struct{}{}:
+		return func() {
+			<-s.globalSem
+			<-sem
+		}, true
+	default:
+		<-sem
+		return nil, false
+	}
+}
+
+func truncateUDP(req, resp *mdns.Msg) {
+	maxBuf := 512
+	if opt := req.IsEdns0(); opt != nil {
+		bufSize := int(opt.UDPSize())
+		if bufSize > safeEDNS0Size {
+			bufSize = safeEDNS0Size
+		}
+		if bufSize > maxBuf {
+			maxBuf = bufSize
+		}
+	}
+
+	if resp.Len() > maxBuf {
+		resp.Truncated = true
+		resp.Compress = true
+		resp.Truncate(maxBuf)
+	}
+}
+
 // ServeDNSMessage processes a single DNS request, applying inflight limits, upstream resolution,
 // response shaping, and route observation.
-func (s *Server) ServeDNSMessage(ctx context.Context, session *policy.SessionCache, sessionID string, req *mdns.Msg, isTCP bool) (*mdns.Msg, error) {
+func (s *Server) ServeDNSMessage(ctx context.Context, session *policy.SessionCache, scope any, req *mdns.Msg, isTCP bool) (*mdns.Msg, error) {
 	select {
 	case <-s.closed:
 		return nil, ErrServerClosed
@@ -117,52 +230,18 @@ func (s *Server) ServeDNSMessage(ctx context.Context, session *policy.SessionCac
 		return nil, ErrInvalidRequest
 	}
 
-	// Validate query opcode and class.
-	if req.Opcode != mdns.OpcodeQuery {
-		resp := new(mdns.Msg)
-		resp.SetRcode(req, mdns.RcodeNotImplemented)
-		return resp, nil
-	}
-	q := req.Question[0]
-	if q.Qclass != mdns.ClassINET {
-		resp := new(mdns.Msg)
-		resp.SetRcode(req, mdns.RcodeRefused)
-		return resp, nil
-	}
-	if q.Qtype == mdns.TypeAXFR || q.Qtype == mdns.TypeIXFR || q.Qtype == mdns.TypeANY {
-		resp := new(mdns.Msg)
-		resp.SetRcode(req, mdns.RcodeRefused)
-		return resp, nil
+	if errResp := validateQuery(req); errResp != nil {
+		return errResp, nil
 	}
 
-	// Bound per-session and global inflight queries.
-	if sessionID != "" {
-		s.sessionMu.Lock()
-		sem, ok := s.sessionSems[sessionID]
-		if !ok {
-			sem = make(chan struct{}, s.cfg.MaxInflightPerSession)
-			s.sessionSems[sessionID] = sem
-		}
-		s.sessionMu.Unlock()
-
-		select {
-		case sem <- struct{}{}:
-			defer func() { <-sem }()
-		default:
-			resp := new(mdns.Msg)
-			resp.SetRcode(req, mdns.RcodeServerFailure)
-			return resp, nil
-		}
-	}
-
-	select {
-	case s.globalSem <- struct{}{}:
-		defer func() { <-s.globalSem }()
-	default:
+	scopeVal := toScope(scope)
+	release, ok := s.acquireInflight(ctx, scopeVal)
+	if !ok {
 		resp := new(mdns.Msg)
 		resp.SetRcode(req, mdns.RcodeServerFailure)
 		return resp, nil
 	}
+	defer release()
 
 	recvTime := time.Now()
 	resp, err := s.resolver.Exchange(ctx, req)
@@ -172,35 +251,19 @@ func (s *Server) ServeDNSMessage(ctx context.Context, session *policy.SessionCac
 		return resp, nil
 	}
 
-	// Observe response and publish client-scoped route evidence if session is active.
-	if session != nil && s.policy != nil {
-		snapshot := s.policy.Current()
-		if snapshot != nil {
-			_, _ = ObserveResponse(req, resp, snapshot, session, recvTime, s.cfg.MaxTTL)
-		}
-	}
-
 	// Shape response: clear AD flag and preserve client ID.
 	resp.Id = req.Id
 	resp.AuthenticatedData = false
 
-	// Handle UDP truncation.
 	if !isTCP {
-		maxBuf := 512
-		if opt := req.IsEdns0(); opt != nil {
-			bufSize := int(opt.UDPSize())
-			if bufSize > safeEDNS0Size {
-				bufSize = safeEDNS0Size
-			}
-			if bufSize > maxBuf {
-				maxBuf = bufSize
-			}
-		}
+		truncateUDP(req, resp)
+	}
 
-		if resp.Len() > maxBuf {
-			resp.Truncated = true
-			resp.Compress = true
-			resp.Truncate(maxBuf)
+	// Observe response and publish client-scoped route evidence if session was provided by caller
+	// and response was complete, non-truncated, and serializable.
+	if session != nil && !resp.Truncated && resp.Rcode == mdns.RcodeSuccess {
+		if _, err := resp.Pack(); err == nil {
+			s.ObserveResponse(req, resp, session, recvTime)
 		}
 	}
 
@@ -227,16 +290,19 @@ func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.Packe
 		}
 
 		var sc *policy.SessionCache
-		var sessID string
+		var scopeVal policy.Scope
 		if scope != nil {
 			sc = scope.SessionCache
-			sessID = scope.Scope.SessionID
+			scopeVal = scope.Scope
 		}
 
-		resp, err := s.ServeDNSMessage(ctx, sc, sessID, req, false)
+		recvTime := time.Now()
+		resp, err := s.ServeDNSMessage(ctx, nil, scopeVal, req, false)
 		if err == nil && resp != nil {
 			if out, err := resp.Pack(); err == nil {
-				_, _ = udp.WriteTo(out, raddr)
+				if _, err := udp.WriteTo(out, raddr); err == nil && sc != nil {
+					s.ObserveResponse(req, resp, sc, recvTime)
+				}
 			}
 		}
 	}
@@ -268,13 +334,14 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 		}
 
 		var sc *policy.SessionCache
-		var sessID string
+		var scopeVal policy.Scope
 		if scope != nil {
 			sc = scope.SessionCache
-			sessID = scope.Scope.SessionID
+			scopeVal = scope.Scope
 		}
 
-		resp, err := s.ServeDNSMessage(ctx, sc, sessID, req, true)
+		recvTime := time.Now()
+		resp, err := s.ServeDNSMessage(ctx, nil, scopeVal, req, true)
 		if err != nil || resp == nil {
 			return
 		}
@@ -290,6 +357,9 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 		}
 		if _, err := c.Write(out); err != nil {
 			return
+		}
+		if sc != nil {
+			s.ObserveResponse(req, resp, sc, recvTime)
 		}
 	}
 }
@@ -359,6 +429,9 @@ func (s *Server) Serve(ctx context.Context, scope *ScopeHandle, udp net.PacketCo
 		case <-s.closed:
 		case <-ctx.Done():
 		}
+		if scope != nil {
+			s.RetireScope(scope.Scope)
+		}
 		if udp != nil {
 			_ = udp.Close()
 		}
@@ -415,6 +488,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 
+	s.sessionMu.Lock()
+	for sc := range s.sessionSems {
+		delete(s.sessionSems, sc)
+	}
+	s.sessionMu.Unlock()
+
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
@@ -427,4 +506,18 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// RetireScope removes any in-flight limiter state associated with the scope.
+func (s *Server) RetireScope(scope policy.Scope) {
+	s.sessionMu.Lock()
+	delete(s.sessionSems, scope)
+	s.sessionMu.Unlock()
+}
+
+// ActiveSessionLimiters returns the number of active session limiter entries.
+func (s *Server) ActiveSessionLimiters() int {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	return len(s.sessionSems)
 }

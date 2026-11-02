@@ -3,6 +3,7 @@ package gatewaydns
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -66,7 +67,7 @@ func TestServer_QueryValidation(t *testing.T) {
 	reqUpdate := new(mdns.Msg)
 	reqUpdate.Opcode = mdns.OpcodeUpdate
 	reqUpdate.SetQuestion("example.com.", mdns.TypeA)
-	resp, err := srv.ServeDNSMessage(context.Background(), nil, "sess-1", reqUpdate, false)
+	resp, err := srv.ServeDNSMessage(context.Background(), nil, policy.Scope{SessionID: "sess-1", OwnershipEpoch: 1}, reqUpdate, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -78,7 +79,7 @@ func TestServer_QueryValidation(t *testing.T) {
 	reqClass := new(mdns.Msg)
 	reqClass.SetQuestion("example.com.", mdns.TypeA)
 	reqClass.Question[0].Qclass = mdns.ClassCHAOS
-	resp, err = srv.ServeDNSMessage(context.Background(), nil, "sess-1", reqClass, false)
+	resp, err = srv.ServeDNSMessage(context.Background(), nil, policy.Scope{SessionID: "sess-1", OwnershipEpoch: 1}, reqClass, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -89,7 +90,7 @@ func TestServer_QueryValidation(t *testing.T) {
 	// 3. ANY query -> REFUSED
 	reqANY := new(mdns.Msg)
 	reqANY.SetQuestion("example.com.", mdns.TypeANY)
-	resp, err = srv.ServeDNSMessage(context.Background(), nil, "sess-1", reqANY, false)
+	resp, err = srv.ServeDNSMessage(context.Background(), nil, policy.Scope{SessionID: "sess-1", OwnershipEpoch: 1}, reqANY, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -127,14 +128,14 @@ func TestServer_InflightLimits(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_, _ = srv.ServeDNSMessage(context.Background(), nil, "sess-busy", req, false)
+		_, _ = srv.ServeDNSMessage(context.Background(), nil, policy.Scope{SessionID: "sess-busy", OwnershipEpoch: 1}, req, false)
 	}()
 
 	// Wait briefly for first query to acquire token
 	time.Sleep(10 * time.Millisecond)
 
 	// Second query for same session should immediately receive SERVFAIL
-	resp, err := srv.ServeDNSMessage(context.Background(), nil, "sess-busy", req, false)
+	resp, err := srv.ServeDNSMessage(context.Background(), nil, policy.Scope{SessionID: "sess-busy", OwnershipEpoch: 1}, req, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -172,7 +173,7 @@ func TestServer_ResponseShaping(t *testing.T) {
 	req.Id = 777
 
 	// UDP request without EDNS -> capped at 512 bytes, should be truncated (TC=1)
-	resp, err := srv.ServeDNSMessage(context.Background(), nil, "sess-shape", req, false)
+	resp, err := srv.ServeDNSMessage(context.Background(), nil, policy.Scope{SessionID: "sess-shape", OwnershipEpoch: 1}, req, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -187,7 +188,7 @@ func TestServer_ResponseShaping(t *testing.T) {
 	}
 
 	// TCP request -> not truncated
-	respTCP, err := srv.ServeDNSMessage(context.Background(), nil, "sess-shape", req, true)
+	respTCP, err := srv.ServeDNSMessage(context.Background(), nil, policy.Scope{SessionID: "sess-shape", OwnershipEpoch: 1}, req, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -476,5 +477,214 @@ func TestServer_ScopeRetirementDoesNotAbortSiblingTCPQueries(t *testing.T) {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		t.Fatalf("shutdown failed: %v", err)
+	}
+}
+
+func TestServer_OversizedUDPAnswerLeavesDestinationUnknownUntilTCP(t *testing.T) {
+	directIP := netip.MustParseAddr("93.184.216.34")
+	res := &mockResolver{
+		exchange: func(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error) {
+			resp := new(mdns.Msg)
+			resp.SetReply(req)
+			resp.Answer = append(resp.Answer, &mdns.A{
+				Hdr: mdns.RR_Header{Name: req.Question[0].Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+				A:   directIP.AsSlice(),
+			})
+			// Add extra TXT records so total response size exceeds 512 bytes
+			for j := 0; j < 25; j++ {
+				resp.Extra = append(resp.Extra, &mdns.TXT{
+					Hdr: mdns.RR_Header{Name: req.Question[0].Name, Rrtype: mdns.TypeTXT, Class: mdns.ClassINET, Ttl: 300},
+					Txt: []string{"filler-record-to-exceed-udp-512-byte-buffer-size-for-truncation-testing"},
+				})
+			}
+			return resp, nil
+		},
+	}
+
+	snap := compileTestSnapshot(t, "", "") // no domain or IP rules -> policy.Direct
+	rc, sess := setupTestSession(t, snap.Generation())
+	_ = rc
+	scope := policy.Scope{SessionID: "sess-trunc-test", OwnershipEpoch: 1}
+
+	srv, err := NewServer(ServerConfig{
+		Gateway: netip.MustParseAddrPort("10.0.0.1:53"),
+	}, res, &staticPolicySource{snapshot: snap})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	reqUDP := new(mdns.Msg)
+	reqUDP.SetQuestion("big.example.com.", mdns.TypeA)
+	reqUDP.Id = 1001
+
+	// 1. Oversized UDP query: must trigger truncation (TC=1)
+	respUDP, err := srv.ServeDNSMessage(context.Background(), sess, scope, reqUDP, false)
+	if err != nil {
+		t.Fatalf("UDP ServeDNSMessage failed: %v", err)
+	}
+	if !respUDP.Truncated {
+		t.Fatalf("expected UDP response to be truncated, len=%d", respUDP.Len())
+	}
+
+	// Session cache MUST remain Unknown because answer was truncated
+	now := time.Now()
+	if got := sess.Lookup(directIP, snap.Generation(), now); got != policy.Unknown {
+		t.Fatalf("expected destination to remain Unknown in session cache on truncated UDP, got %v", got)
+	}
+
+	// 2. Client retries over TCP: answer is complete without truncation
+	reqTCP := new(mdns.Msg)
+	reqTCP.SetQuestion("big.example.com.", mdns.TypeA)
+	reqTCP.Id = 1002
+
+	respTCP, err := srv.ServeDNSMessage(context.Background(), sess, scope, reqTCP, true)
+	if err != nil {
+		t.Fatalf("TCP ServeDNSMessage failed: %v", err)
+	}
+	if respTCP.Truncated {
+		t.Fatalf("expected TCP response not to be truncated")
+	}
+
+	// Destination in cache MUST now be Direct because TCP answer was complete and delivered
+	if got := sess.Lookup(directIP, snap.Generation(), now); got != policy.Direct {
+		t.Fatalf("expected destination to be Direct in session cache after complete TCP query, got %v", got)
+	}
+
+	// 3. Write failure on transport leaves cache Unknown: when serving, session cache is only populated on write success
+	failIP := netip.MustParseAddr("93.184.216.35")
+	resFail := &mockResolver{
+		exchange: func(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error) {
+			resp := new(mdns.Msg)
+			resp.SetReply(req)
+			resp.Answer = append(resp.Answer, &mdns.A{
+				Hdr: mdns.RR_Header{Name: req.Question[0].Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+				A:   failIP.AsSlice(),
+			})
+			return resp, nil
+		},
+	}
+	srvFail, _ := NewServer(ServerConfig{Gateway: netip.MustParseAddrPort("10.0.0.1:53")}, resFail, &staticPolicySource{snapshot: snap})
+	reqFail := new(mdns.Msg)
+	reqFail.SetQuestion("fail.example.com.", mdns.TypeA)
+
+	// Resolver executes with session=nil (as done by transport prior to delivery confirmation)
+	respFail, err := srvFail.ServeDNSMessage(context.Background(), nil, scope, reqFail, false)
+	if err != nil || respFail == nil {
+		t.Fatalf("ServeDNSMessage failed: %v", err)
+	}
+	// Simulate transmission failure: srvFail.ObserveResponse is not called
+	if got := sess.Lookup(failIP, snap.Generation(), now); got != policy.Unknown {
+		t.Fatalf("expected uncommitted query to leave destination Unknown, got %v", got)
+	}
+	// Simulate successful delivery: srvFail.ObserveResponse is called
+	srvFail.ObserveResponse(reqFail, respFail, sess, now)
+	if got := sess.Lookup(failIP, snap.Generation(), now); got != policy.Direct {
+		t.Fatalf("expected destination to be Direct after delivery confirmation, got %v", got)
+	}
+}
+
+func TestServer_SessionLimiterBoundedLifecycle(t *testing.T) {
+	res := &mockResolver{}
+	srv, err := NewServer(ServerConfig{
+		Gateway:               netip.MustParseAddrPort("10.0.0.1:53"),
+		MaxInflightPerSession: 2,
+	}, res, &staticPolicySource{})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	req := new(mdns.Msg)
+	req.SetQuestion("lifecycle.example.com.", mdns.TypeA)
+
+	// Verify repeatedly creating and retiring sessions cleans up limiter state and keeps memory bounded
+	const sessionCount = 50
+	for i := 0; i < sessionCount; i++ {
+		scopeCtx, cancel := context.WithCancel(context.Background())
+		scope := policy.Scope{
+			SessionID:      fmt.Sprintf("sess-%d", i),
+			OwnershipEpoch: uint64(i + 1),
+		}
+
+		resp, err := srv.ServeDNSMessage(scopeCtx, nil, scope, req, false)
+		if err != nil || resp == nil {
+			t.Fatalf("iteration %d: ServeDNSMessage failed: %v", i, err)
+		}
+
+		if active := srv.ActiveSessionLimiters(); active != 1 {
+			t.Fatalf("iteration %d: expected 1 active session limiter, got %d", i, active)
+		}
+
+		if i%2 == 0 {
+			// Test context cancellation cleanup
+			cancel()
+			deadline := time.Now().Add(1 * time.Second)
+			for srv.ActiveSessionLimiters() > 0 && time.Now().Before(deadline) {
+				time.Sleep(2 * time.Millisecond)
+			}
+		} else {
+			// Test explicit RetireScope cleanup
+			srv.RetireScope(scope)
+			cancel()
+		}
+
+		if active := srv.ActiveSessionLimiters(); active != 0 {
+			t.Fatalf("iteration %d: expected 0 active session limiters after retirement, got %d", i, active)
+		}
+	}
+
+	// Verify replacement session reusing the same SessionID does not inherit old in-flight limits
+	blockCh := make(chan struct{})
+	blockRes := &mockResolver{
+		exchange: func(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error) {
+			select {
+			case <-blockCh:
+				resp := new(mdns.Msg)
+				resp.SetReply(req)
+				return resp, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	srvReused, _ := NewServer(ServerConfig{
+		Gateway:               netip.MustParseAddrPort("10.0.0.1:53"),
+		MaxInflightPerSession: 1,
+	}, blockRes, &staticPolicySource{})
+
+	scopeV1 := policy.Scope{SessionID: "sess-shared", OwnershipEpoch: 1}
+	ctxV1, cancelV1 := context.WithCancel(context.Background())
+
+	// Start query holding the single in-flight slot for epoch 1
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = srvReused.ServeDNSMessage(ctxV1, nil, scopeV1, req, false)
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	// Retire old epoch scope
+	cancelV1()
+	srvReused.RetireScope(scopeV1)
+
+	// New session reusing same SessionID with new OwnershipEpoch should NOT be blocked
+	scopeV2 := policy.Scope{SessionID: "sess-shared", OwnershipEpoch: 2}
+	ctxV2, cancelV2 := context.WithCancel(context.Background())
+	defer cancelV2()
+
+	doneV2 := make(chan struct{})
+	go func() {
+		_, _ = srvReused.ServeDNSMessage(ctxV2, nil, scopeV2, req, false)
+		close(doneV2)
+	}()
+
+	// Release blocked query
+	close(blockCh)
+	wg.Wait()
+	<-doneV2
+
+	srvReused.RetireScope(scopeV2)
+	if active := srvReused.ActiveSessionLimiters(); active != 0 {
+		t.Fatalf("expected 0 active session limiters after scope cleanup, got %d", active)
 	}
 }

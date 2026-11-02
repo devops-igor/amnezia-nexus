@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
@@ -168,6 +169,7 @@ func (g *Gateway) getOrCreateTransport(scope *ScopeHandle) (*gatewayTCPTransport
 	// Clean up transport when scope context is done.
 	go func() {
 		<-scope.ctx.Done()
+		g.server.RetireScope(scope.Scope)
 		g.mu.Lock()
 		if g.transports[scope.Scope] == tr {
 			delete(g.transports, scope.Scope)
@@ -177,6 +179,57 @@ func (g *Gateway) getOrCreateTransport(scope *ScopeHandle) (*gatewayTCPTransport
 	}()
 
 	return tr, nil
+}
+
+func (g *Gateway) handleUDP(scope *ScopeHandle, ipv4Packet []byte, ihl int, dstIP netip.Addr) (bool, error) {
+	if len(ipv4Packet) < ihl+8 {
+		return false, nil
+	}
+	dstPort := binary.BigEndian.Uint16(ipv4Packet[ihl+2 : ihl+4])
+	if dstPort != 53 {
+		return false, nil
+	}
+
+	fragOffset := binary.BigEndian.Uint16(ipv4Packet[6:8]) & 0x1fff
+	moreFrags := (ipv4Packet[6] & 0x20) != 0
+	if fragOffset != 0 || moreFrags {
+		return true, nil // Drop fragmented UDP packets.
+	}
+
+	srcIP := netip.AddrFrom4([4]byte{ipv4Packet[12], ipv4Packet[13], ipv4Packet[14], ipv4Packet[15]})
+	srcPort := binary.BigEndian.Uint16(ipv4Packet[ihl : ihl+2])
+	udpLen := int(binary.BigEndian.Uint16(ipv4Packet[ihl+4 : ihl+6]))
+	if udpLen < 8 || ihl+udpLen > len(ipv4Packet) {
+		return true, nil
+	}
+
+	udpPayload := ipv4Packet[ihl+8 : ihl+udpLen]
+	reqMsg := new(mdns.Msg)
+	if err := reqMsg.Unpack(udpPayload); err != nil {
+		return true, nil // Malformed DNS query dropped.
+	}
+
+	recvTime := time.Now()
+	respMsg, err := g.server.ServeDNSMessage(scope.ctx, nil, scope.Scope, reqMsg, false)
+	if err != nil || respMsg == nil {
+		return true, nil
+	}
+
+	respBytes, err := respMsg.Pack()
+	if err != nil {
+		return true, nil
+	}
+
+	// Enqueue reply back to authenticated client if scope remains active.
+	if !scope.IsRetired() && scope.ReplyWriter != nil {
+		replyPkt := buildIPv4UDPPacket(dstIP, 53, srcIP, srcPort, respBytes)
+		if replyPkt != nil {
+			if err := scope.ReplyWriter.WritePacket(scope.Scope, replyPkt); err == nil {
+				g.server.ObserveResponse(reqMsg, respMsg, scope.SessionCache, recvTime)
+			}
+		}
+	}
+	return true, nil
 }
 
 // TrySubmit inspects incoming IPv4 packets from authenticated ingress.
@@ -207,53 +260,7 @@ func (g *Gateway) TrySubmit(scope *ScopeHandle, ipv4Packet []byte) (handled bool
 	proto := ipv4Packet[9]
 	switch proto {
 	case 17: // UDP
-		if len(ipv4Packet) < ihl+8 {
-			return false, nil
-		}
-		dstPort := binary.BigEndian.Uint16(ipv4Packet[ihl+2 : ihl+4])
-		if dstPort != 53 {
-			return false, nil
-		}
-
-		// Exact gateway:53 UDP destination - packet is handled by DNS gateway.
-		fragOffset := binary.BigEndian.Uint16(ipv4Packet[6:8]) & 0x1fff
-		moreFrags := (ipv4Packet[6] & 0x20) != 0
-		if fragOffset != 0 || moreFrags {
-			// Drop fragmented UDP packets.
-			return true, nil
-		}
-
-		srcIP := netip.AddrFrom4([4]byte{ipv4Packet[12], ipv4Packet[13], ipv4Packet[14], ipv4Packet[15]})
-		srcPort := binary.BigEndian.Uint16(ipv4Packet[ihl : ihl+2])
-		udpLen := int(binary.BigEndian.Uint16(ipv4Packet[ihl+4 : ihl+6]))
-		if udpLen < 8 || ihl+udpLen > len(ipv4Packet) {
-			return true, nil
-		}
-
-		udpPayload := ipv4Packet[ihl+8 : ihl+udpLen]
-		reqMsg := new(mdns.Msg)
-		if err := reqMsg.Unpack(udpPayload); err != nil {
-			return true, nil // Malformed DNS query dropped.
-		}
-
-		respMsg, err := g.server.ServeDNSMessage(scope.ctx, scope.SessionCache, scope.Scope.SessionID, reqMsg, false)
-		if err != nil || respMsg == nil {
-			return true, nil
-		}
-
-		respBytes, err := respMsg.Pack()
-		if err != nil {
-			return true, nil
-		}
-
-		// Enqueue reply back to authenticated client if scope remains active.
-		if !scope.IsRetired() && scope.ReplyWriter != nil {
-			replyPkt := buildIPv4UDPPacket(dstIP, 53, srcIP, srcPort, respBytes)
-			if replyPkt != nil {
-				_ = scope.ReplyWriter.WritePacket(scope.Scope, replyPkt)
-			}
-		}
-		return true, nil
+		return g.handleUDP(scope, ipv4Packet, ihl, dstIP)
 
 	case 6: // TCP
 		if len(ipv4Packet) < ihl+20 {
@@ -286,6 +293,7 @@ func (g *Gateway) BeginRetire(scope *ScopeHandle) Retirement {
 		if scope.SessionCache != nil {
 			scope.SessionCache.Invalidate()
 		}
+		g.server.RetireScope(scope.Scope)
 		g.mu.Lock()
 		if tr, ok := g.transports[scope.Scope]; ok {
 			delete(g.transports, scope.Scope)
@@ -303,6 +311,7 @@ func (g *Gateway) Close() error {
 	defer g.mu.Unlock()
 	for scope, tr := range g.transports {
 		delete(g.transports, scope)
+		g.server.RetireScope(scope)
 		tr.Close()
 	}
 	return nil
