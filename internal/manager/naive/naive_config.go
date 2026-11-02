@@ -311,7 +311,7 @@ func ParseCaddyfile(content string) (domain string, port int, clients []NaiveCli
 	return domain, port, clients, nil
 }
 
-// BuildNaiveURI constructs a standard client https:// URI for NaiveProxy.
+// BuildNaiveURI constructs a standard client naive+https:// URI for NaiveProxy.
 func BuildNaiveURI(domain string, port int, user, pass, name string) (string, error) {
 	if domain == "" {
 		return "", errors.New("domain cannot be empty")
@@ -329,7 +329,7 @@ func BuildNaiveURI(domain string, port int, user, pass, name string) (string, er
 	}
 
 	u := url.URL{
-		Scheme:   "https",
+		Scheme:   "naive+https",
 		User:     url.UserPassword(user, pass),
 		Host:     hostPort,
 		Fragment: name,

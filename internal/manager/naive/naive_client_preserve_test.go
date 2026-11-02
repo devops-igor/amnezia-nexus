@@ -189,12 +189,12 @@ late.example.com:8080 {
 	if err != nil {
 		t.Fatalf("AddClient: %v", err)
 	}
-	const want = "https://bob:secret-b@vpn.example.com"
+	const want = "naive+https://bob:secret-b@vpn.example.com"
 	if uri, _ := res["config"].(string); !strings.HasPrefix(uri, want) {
 		t.Errorf("AddClient config = %v, want prefix %q (result %v)", res["config"], want, res)
 	}
 	cfg, err := mgr.GetClientConfig(ctx, server, "alice")
-	if err != nil || !strings.HasPrefix(cfg, "https://alice:secret-a@vpn.example.com") || strings.Contains(cfg, "9000") {
+	if err != nil || !strings.HasPrefix(cfg, "naive+https://alice:secret-a@vpn.example.com") || strings.Contains(cfg, "9000") {
 		t.Errorf("GetClientConfig = %q err=%v", cfg, err)
 	}
 }
@@ -205,8 +205,8 @@ func TestNaiveManager_ZeroClientsMultiSiteEndpointSync(t *testing.T) {
 		wantPort             int
 		wantURI              string
 	}{
-		{"default port", ":443, vpn.example.com", "vpn.example.com", 443, "https://bob:secret-b@vpn.example.com#"},
-		{"custom port", ":8443, vpn.example.com:8443", "vpn.example.com", 8443, "https://bob:secret-b@vpn.example.com:8443#"},
+		{"default port", ":443, vpn.example.com", "vpn.example.com", 443, "naive+https://bob:secret-b@vpn.example.com#"},
+		{"custom port", ":8443, vpn.example.com:8443", "vpn.example.com", 8443, "naive+https://bob:secret-b@vpn.example.com:8443#"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

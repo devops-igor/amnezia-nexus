@@ -389,8 +389,11 @@ async function addConnection() {
                 document.getElementById('configModalTitle').textContent = `${_('config')} — ${connName || 'Connection'}`;
                 document.getElementById('configText').textContent = result.config;
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
-                document.getElementById('panel-vpn').style.display = (proto === 'telemt' ? 'none' : '');
-                document.querySelectorAll('.config-tab')[1].style.display = (proto === 'telemt' ? 'none' : '');
+                const isNoVpnKey = (proto === 'telemt' || proto === 'naive');
+                const vpnTab = document.getElementById('configTabVpn') || document.querySelectorAll('.config-tab')[1];
+                const panelVpn = document.getElementById('panel-vpn');
+                if (vpnTab) vpnTab.style.display = isNoVpnKey ? 'none' : '';
+                if (panelVpn) panelVpn.style.display = isNoVpnKey ? 'none' : '';
                 document.getElementById('qrHint').textContent = (proto === 'telemt') ? _('qr_hint_telemt') : _('qr_hint');
                 switchConfigTab('conf');
                 openModal('configModal');
@@ -482,9 +485,12 @@ async function removeConnection(clientId) {
 async function showConnectionConfig(clientId, connName, hasKey) {
     const proto = document.getElementById('connProtoSelect').value;
 
-    document.getElementById('panel-vpn').style.display = (proto === 'telemt' ? 'none' : '');
+    const isNoVpnKey = (proto === 'telemt' || proto === 'naive');
+    const vpnTab = document.getElementById('configTabVpn') || document.querySelectorAll('.config-tab')[1];
+    const panelVpn = document.getElementById('panel-vpn');
+    if (vpnTab) vpnTab.style.display = isNoVpnKey ? 'none' : '';
+    if (panelVpn) panelVpn.style.display = isNoVpnKey ? 'none' : '';
     document.getElementById('panel-qr').style.display = '';
-    document.querySelectorAll('.config-tab')[1].style.display = (proto === 'telemt' ? 'none' : '');
     document.querySelectorAll('.config-tab')[2].style.display = '';
 
     document.getElementById('qrHint').textContent = (proto === 'telemt') ? _('qr_hint_telemt') : _('qr_hint');
@@ -545,6 +551,11 @@ async function toggleConnection(clientId, enable) {
 }
 
 function switchConfigTab(tab) {
+    const protoSelect = document.getElementById('connProtoSelect');
+    const proto = protoSelect ? protoSelect.value : '';
+    if (tab === 'vpn' && (proto === 'naive' || proto === 'telemt')) {
+        tab = 'conf';
+    }
     document.querySelectorAll('.config-tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.config-panel').forEach(p => p.classList.remove('active'));
     const tabs = document.querySelectorAll('.config-tab');

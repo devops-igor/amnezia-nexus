@@ -535,33 +535,35 @@ type EnrichedVPNSession struct {
 
 // VPNConfig holds runtime configuration for the built-in VPN service.
 type VPNConfig struct {
-	VPNDataPlaneI1Protocol      string                 `json:"vpn_data_plane_i1_protocol,omitempty"`
-	Algorithm                   LoadBalancingAlgorithm `json:"algorithm"`
-	Weights                     map[int64]int          `json:"weights"` // server_id -> weight (1-100)
-	HealthThresholdMS           int                    `json:"health_threshold_ms"`
-	ListenPort                  int                    `json:"listen_port"`
-	SubnetCIDR                  string                 `json:"subnet_cidr"`
-	MaxTotalPeers               int                    `json:"max_total_peers"`
-	MaxPeersPerBackend          int                    `json:"max_peers_per_backend"`
-	AffinityTTLMinutes          int                    `json:"affinity_ttl_minutes,omitempty"`
-	MinRebalanceSessions        int                    `json:"min_rebalance_sessions"`       // rebalancer minimum-load gate; default 8 when zero/absent
-	ClientQueueSize             int                    `json:"client_queue_size,omitempty"`  // per-peer downstream queue capacity, bounded by the forwarder
-	ServerPrivateKey            string                 `json:"server_private_key,omitempty"` // portal endpoint Curve25519 private key (base64), encrypted at rest
-	ServerPublicKey             string                 `json:"server_public_key,omitempty"`  // derived public key, safe to expose
-	PublicEndpoint              string                 `json:"public_endpoint,omitempty"`    // host or host:port of the panel's public LB entry point
-	H1                          HeaderRange            `json:"h1"`
-	H2                          HeaderRange            `json:"h2"`
-	H3                          HeaderRange            `json:"h3"`
-	H4                          HeaderRange            `json:"h4"`
-	S1                          int                    `json:"s1"`
-	S2                          int                    `json:"s2"`
-	S3                          int                    `json:"s3"`
-	S4                          int                    `json:"s4"`
-	HeaderProtectionKey         string                 `json:"header_protection_key,omitempty"`
-	ContentPaddingAddition      string                 `json:"content_padding_addition,omitempty"`
-	RandomTrailers              bool                   `json:"random_trailers,omitempty"`
-	DisableCookies              bool                   `json:"disable_cookies,omitempty"`
-	EnableMultiProtocolBackends bool                   `json:"enable_multi_protocol_backends"`
+	VPNDataPlaneI1Protocol string                 `json:"vpn_data_plane_i1_protocol,omitempty"`
+	Algorithm              LoadBalancingAlgorithm `json:"algorithm"`
+	Weights                map[int64]int          `json:"weights"` // server_id -> weight (1-100)
+	HealthThresholdMS      int                    `json:"health_threshold_ms"`
+	ListenPort             int                    `json:"listen_port"`
+	SubnetCIDR             string                 `json:"subnet_cidr"`
+	MaxTotalPeers          int                    `json:"max_total_peers"`
+	MaxPeersPerBackend     int                    `json:"max_peers_per_backend"`
+	AffinityTTLMinutes     int                    `json:"affinity_ttl_minutes,omitempty"`
+	MinRebalanceSessions   int                    `json:"min_rebalance_sessions"`       // rebalancer minimum-load gate; default 8 when zero/absent
+	ClientQueueSize        int                    `json:"client_queue_size,omitempty"`  // per-peer downstream queue capacity, bounded by the forwarder
+	ServerPrivateKey       string                 `json:"server_private_key,omitempty"` // portal endpoint Curve25519 private key (base64), encrypted at rest
+	ServerPublicKey        string                 `json:"server_public_key,omitempty"`  // derived public key, safe to expose
+	PublicEndpoint         string                 `json:"public_endpoint,omitempty"`    // host or host:port of the panel's public LB entry point
+	H1                     HeaderRange            `json:"h1"`
+	H2                     HeaderRange            `json:"h2"`
+	H3                     HeaderRange            `json:"h3"`
+	H4                     HeaderRange            `json:"h4"`
+	S1                     int                    `json:"s1"`
+	S2                     int                    `json:"s2"`
+	S3                     int                    `json:"s3"`
+	S4                     int                    `json:"s4"`
+	HeaderProtectionKey    string                 `json:"header_protection_key,omitempty"`
+	ContentPaddingAddition string                 `json:"content_padding_addition,omitempty"`
+	RandomTrailers         bool                   `json:"random_trailers,omitempty"`
+	DisableCookies         bool                   `json:"disable_cookies,omitempty"`
+	// Multi-protocol backends are unconditionally active out-of-the-box (#661).
+	// Retained for backward-compatible JSON serialization.
+	EnableMultiProtocolBackends bool `json:"enable_multi_protocol_backends"`
 }
 
 // AppearanceSettings holds UI display configuration.
