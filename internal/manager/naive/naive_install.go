@@ -17,70 +17,70 @@ import (
 // ErrDNSValidation is returned when pre-flight domain DNS validation fails.
 var ErrDNSValidation = errors.New("pre-flight DNS validation failed")
 
+func parsePortOption(raw any) int {
+	if raw == nil {
+		return 0
+	}
+	s := strings.TrimSpace(fmt.Sprint(raw))
+	if s == "" {
+		return 0
+	}
+	if p, err := strconv.Atoi(s); err == nil && p > 0 {
+		return p
+	}
+	return 0
+}
+
+func extractNaiveOptions(opts any) (int, string, string) {
+	switch v := opts.(type) {
+	case *models.NaiveInstallOptions:
+		if v != nil {
+			return parsePortOption(v.Port), v.Domain, v.DecoyTemplate
+		}
+	case models.NaiveInstallOptions:
+		return parsePortOption(v.Port), v.Domain, v.DecoyTemplate
+	case map[string]any:
+		dt, _ := v["decoy_template"].(string)
+		if dt == "" {
+			dt, _ = v["decoyTemplate"].(string)
+		}
+		domain, _ := v["domain"].(string)
+		return parsePortOption(v["port"]), domain, dt
+	}
+	return 0, "", ""
+}
+
 func parseNaiveInstallOptions(params map[string]any, defaultHost string) (int, string, string) {
 	port := 443
-	if p, ok := params["port"]; ok && fmt.Sprint(p) != "" {
-		if pInt, err := strconv.Atoi(fmt.Sprint(p)); err == nil && pInt > 0 {
-			port = pInt
-		}
+	if p := parsePortOption(params["port"]); p > 0 {
+		port = p
 	}
 
 	domain := defaultHost
 	decoyTemplate := ""
-
-	if dt, ok := params["decoy_template"].(string); ok && dt != "" {
+	if dt, _ := params["decoy_template"].(string); dt != "" {
 		decoyTemplate = dt
-	} else if dt, ok := params["decoyTemplate"].(string); ok && dt != "" {
+	} else if dt, _ := params["decoyTemplate"].(string); dt != "" {
 		decoyTemplate = dt
 	}
 
-	naiveOptsVal, hasNaiveOpts := params["naive_options"]
-	if !hasNaiveOpts {
-		naiveOptsVal = params["NaiveOptions"]
+	opts := params["naive_options"]
+	if opts == nil {
+		opts = params["NaiveOptions"]
 	}
-
-	if naiveOptsVal != nil {
-		switch opt := naiveOptsVal.(type) {
-		case *models.NaiveInstallOptions:
-			if opt.Port != "" {
-				if pInt, err := strconv.Atoi(opt.Port); err == nil && pInt > 0 {
-					port = pInt
-				}
-			}
-			if opt.Domain != "" {
-				domain = opt.Domain
-			}
-			if opt.DecoyTemplate != "" {
-				decoyTemplate = opt.DecoyTemplate
-			}
-		case models.NaiveInstallOptions:
-			if opt.Port != "" {
-				if pInt, err := strconv.Atoi(opt.Port); err == nil && pInt > 0 {
-					port = pInt
-				}
-			}
-			if opt.Domain != "" {
-				domain = opt.Domain
-			}
-			if opt.DecoyTemplate != "" {
-				decoyTemplate = opt.DecoyTemplate
-			}
-		case map[string]any:
-			if p, ok := opt["port"].(string); ok && p != "" {
-				if pInt, err := strconv.Atoi(p); err == nil && pInt > 0 {
-					port = pInt
-				}
-			}
-			if d, ok := opt["domain"].(string); ok && d != "" {
-				domain = d
-			}
-			if dt, ok := opt["decoy_template"].(string); ok && dt != "" {
-				decoyTemplate = dt
-			} else if dt, ok := opt["decoyTemplate"].(string); ok && dt != "" {
-				decoyTemplate = dt
-			}
+	if opts != nil {
+		p, d, dt := extractNaiveOptions(opts)
+		if p > 0 {
+			port = p
+		}
+		if d != "" {
+			domain = d
+		}
+		if dt != "" {
+			decoyTemplate = dt
 		}
 	}
+
 	return port, domain, decoyTemplate
 }
 
