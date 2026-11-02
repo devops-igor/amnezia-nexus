@@ -505,12 +505,47 @@ func TestProbeNaiveProxy_CustomPortBackend(t *testing.T) {
 		t.Fatalf("expected custom port probe to succeed on non-443 server: %v (latency=%d)", err, latency)
 	}
 
-	// Without custom port (defaults to 443): should fail against sdReject443
-	pDefaultPort := p
-	pDefaultPort.Port = 0
-	_, err = ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:"+strconv.Itoa(customPort), pDefaultPort, 3*time.Second, WithSocks5Dialer(sdReject443))
+	// With Port == 0 and endpoint target port: falls back to target port and succeeds (H6 regression)
+	pFallback := p
+	pFallback.Port = 0
+	dialedTarget = ""
+	latency, err = ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:"+strconv.Itoa(customPort), pFallback, 3*time.Second, WithSocks5Dialer(sdReject443))
+	if err != nil || latency < 1 {
+		t.Fatalf("expected probe with Port=0 to fallback to endpoint target port and succeed: %v (latency=%d)", err, latency)
+	}
+
+	// Verify that dialed target through mock dialer matches custom port even when Port is 0
+	dialedTarget = ""
+	latency, err = ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:"+strconv.Itoa(customPort), pFallback, 3*time.Second, WithSocks5Dialer(sd))
+	if err != nil || latency < 1 {
+		t.Fatalf("expected fallback probe to succeed: %v", err)
+	}
+	if dialedTarget != expectedTarget {
+		t.Fatalf("expected fallback probe to dial %q, got %q", expectedTarget, dialedTarget)
+	}
+
+	// Without custom port anywhere (Port == 0 and target without port): defaults to 443 and fails against sdReject443
+	_, err = ProbeNaiveProxyWithOptions(ctx, "198.51.100.1", pFallback, 3*time.Second, WithSocks5Dialer(sdReject443))
 	if err == nil {
-		t.Fatal("expected probe without custom port to fail against server not listening on 443")
+		t.Fatal("expected probe without target port and Port=0 to fail against server not listening on 443")
+	}
+
+	// Without custom port anywhere (Port == 0 and target port 443): defaults to 443 and fails against sdReject443
+	_, err = ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:443", pFallback, 3*time.Second, WithSocks5Dialer(sdReject443))
+	if err == nil {
+		t.Fatal("expected probe with target port 443 and Port=0 to fail against server not listening on 443")
+	}
+
+	// Explicit p.Port takes precedence over target port
+	pExplicitDiffTarget := p
+	pExplicitDiffTarget.Port = customPort
+	dialedTarget = ""
+	latency, err = ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:9443", pExplicitDiffTarget, 3*time.Second, WithSocks5Dialer(sd))
+	if err != nil || latency < 1 {
+		t.Fatalf("expected explicit p.Port to succeed: %v", err)
+	}
+	if dialedTarget != expectedTarget {
+		t.Fatalf("expected explicit p.Port to take precedence, got %q, want %q", dialedTarget, expectedTarget)
 	}
 
 	// Verify ProbeNaiveProxyTunnel with custom port
@@ -527,5 +562,25 @@ func TestProbeNaiveProxy_CustomPortBackend(t *testing.T) {
 	tunLatency, err := ProbeNaiveProxyWithOptions(ctx, tun.Endpoint, p, 3*time.Second, WithSocks5Dialer(sd))
 	if err != nil || tunLatency < 1 {
 		t.Fatalf("ProbeNaiveProxy with unmarshaled params failed: %v", err)
+	}
+
+	// Verify ProbeNaiveProxyTunnel with Port == 0 (production normal persisted records)
+	rawFallback, err := json.Marshal(pFallback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tunFallback := &models.BackendTunnel{
+		ID:             43,
+		Endpoint:       "198.51.100.1:" + strconv.Itoa(customPort),
+		Protocol:       models.ProtocolNaive,
+		ProtocolParams: rawFallback,
+	}
+	dialedTarget = ""
+	tunFallbackLatency, err := ProbeNaiveProxyWithOptions(ctx, tunFallback.Endpoint, pFallback, 3*time.Second, WithSocks5Dialer(sd))
+	if err != nil || tunFallbackLatency < 1 {
+		t.Fatalf("ProbeNaiveProxy with Port=0 from tunnel endpoint failed: %v", err)
+	}
+	if dialedTarget != expectedTarget {
+		t.Fatalf("expected tunnel fallback probe to dial %q, got %q", expectedTarget, dialedTarget)
 	}
 }

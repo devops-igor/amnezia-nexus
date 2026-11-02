@@ -64,6 +64,13 @@ func probeNaiveProxy(ctx context.Context, target string, p models.NaiveProxyPara
 
 	port := p.Port
 	if port <= 0 {
+		if _, portStr, err := net.SplitHostPort(target); err == nil {
+			if parsed, err := strconv.Atoi(portStr); err == nil && parsed > 0 && parsed <= 65535 {
+				port = parsed
+			}
+		}
+	}
+	if port <= 0 {
 		port = 443
 	}
 	camTarget := net.JoinHostPort(p.Domain, strconv.Itoa(port))
@@ -139,21 +146,8 @@ func (d *Dialer) probeViaDaemon(ctx context.Context, camTarget string, p models.
 		return 0, errors.New("naive: daemon dialer not available")
 	}
 
-	port := p.Port
-	if port <= 0 {
-		if _, portStr, err := net.SplitHostPort(camTarget); err == nil {
-			if parsed, err := strconv.Atoi(portStr); err == nil && parsed > 0 && parsed <= 65535 {
-				port = parsed
-			}
-		}
-	}
-	if port <= 0 {
-		port = 443
-	}
-	targetAddr := net.JoinHostPort(p.Domain, strconv.Itoa(port))
-
 	start := time.Now()
-	conn, err := sd.DialContext(ctx, "tcp", targetAddr)
+	conn, err := sd.DialContext(ctx, "tcp", camTarget)
 	if err != nil {
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
