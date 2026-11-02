@@ -142,6 +142,7 @@ func (s *Service) RotateSharedBackendCredential(
 	var candCloser io.Closer
 	if models.NormalizeTunnelProtocol(proto) == models.ProtocolNaive {
 		candTun := &models.BackendTunnel{
+			ID:             current.ID,
 			ServerID:       server.ID,
 			Endpoint:       current.Endpoint,
 			Protocol:       proto,
