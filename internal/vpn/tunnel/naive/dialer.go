@@ -474,16 +474,37 @@ func (d *Dialer) fallbackToH2() {
 
 type h3ConnWrapper struct {
 	net.Conn
-	d         *Dialer
-	readBytes atomic.Int64
-	done      atomic.Bool
+	d             *Dialer
+	readBytes     atomic.Int64
+	done          atomic.Bool
+	locallyClosed atomic.Bool
 }
 
-func (c *h3ConnWrapper) isUnroutableOrBlackhole(err error) bool {
+func (c *h3ConnWrapper) Close() error {
+	c.locallyClosed.Store(true)
+	return c.Conn.Close()
+}
+
+func isLocalClose(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "use of closed network connection") ||
+		strings.Contains(errStr, "closed network connection") ||
+		strings.Contains(errStr, "closed pipe") ||
+		strings.Contains(errStr, "context canceled") ||
+		strings.Contains(errStr, "operation was canceled")
+}
+
+func (c *h3ConnWrapper) isUnroutableOrBlackhole(err error) bool {
+	if err == nil || c.locallyClosed.Load() || isLocalClose(err) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
 	var netErr net.Error
@@ -495,7 +516,9 @@ func (c *h3ConnWrapper) isUnroutableOrBlackhole(err error) bool {
 		strings.Contains(errStr, "broken pipe") ||
 		strings.Contains(errStr, "unreachable") ||
 		strings.Contains(errStr, "refused") ||
-		strings.Contains(errStr, "closed")
+		strings.Contains(errStr, "connection closed by remote") ||
+		strings.Contains(errStr, "closed by peer") ||
+		strings.Contains(errStr, "remote error")
 }
 
 func (c *h3ConnWrapper) triggerH2Fallback() {
@@ -509,7 +532,7 @@ func (c *h3ConnWrapper) Read(b []byte) (int, error) {
 	if n > 0 {
 		c.readBytes.Add(int64(n))
 	}
-	if err != nil && c.readBytes.Load() == 0 {
+	if err != nil && c.readBytes.Load() == 0 && !c.locallyClosed.Load() && !isLocalClose(err) {
 		if c.isUnroutableOrBlackhole(err) {
 			c.triggerH2Fallback()
 		}
@@ -519,7 +542,7 @@ func (c *h3ConnWrapper) Read(b []byte) (int, error) {
 
 func (c *h3ConnWrapper) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
-	if err != nil && c.readBytes.Load() == 0 {
+	if err != nil && c.readBytes.Load() == 0 && !c.locallyClosed.Load() && !isLocalClose(err) {
 		if c.isUnroutableOrBlackhole(err) {
 			c.triggerH2Fallback()
 		}
