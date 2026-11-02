@@ -122,9 +122,6 @@ func buildObservations(
 	maxTTL time.Duration,
 	recvTime time.Time,
 ) []policy.Observation {
-	if minTTL == 0 {
-		return nil
-	}
 	effectiveTTL := time.Duration(minTTL) * time.Second
 	if effectiveTTL > maxTTL {
 		effectiveTTL = maxTTL
@@ -144,6 +141,9 @@ func buildObservations(
 		decision := policy.Direct
 		if requiresProxy || snapshot.MatchIPv4(ip) {
 			decision = policy.Proxy
+		}
+		if minTTL == 0 && decision != policy.Proxy {
+			continue
 		}
 		observations = append(observations, policy.Observation{
 			IP:        ip,

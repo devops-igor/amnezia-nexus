@@ -57,6 +57,10 @@ type Server struct {
 	closeOnce   sync.Once
 	closed      chan struct{}
 	wg          sync.WaitGroup
+
+	mu          sync.Mutex
+	closing     bool
+	activeConns map[net.Conn]struct{}
 }
 
 // NewServer creates a new Server.
@@ -94,6 +98,7 @@ func NewServer(cfg ServerConfig, resolver Resolver, rules PolicySource) (*Server
 		globalSem:   make(chan struct{}, cfg.MaxInflight),
 		sessionSems: make(map[string]chan struct{}),
 		closed:      make(chan struct{}),
+		activeConns: make(map[net.Conn]struct{}),
 	}, nil
 }
 
@@ -239,12 +244,21 @@ func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.Packe
 
 func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Conn) {
 	var lenBuf [2]byte
+	readTimeout := s.cfg.QueryTimeout
+	if readTimeout <= 0 {
+		readTimeout = defaultQueryTimeout
+	}
 	for {
+		_ = c.SetReadDeadline(time.Now().Add(readTimeout))
 		if _, err := io.ReadFull(c, lenBuf[:]); err != nil {
 			return
 		}
 		msgLen := binary.BigEndian.Uint16(lenBuf[:])
+		if msgLen < 12 {
+			return
+		}
 		msgBuf := make([]byte, msgLen)
+		_ = c.SetReadDeadline(time.Now().Add(readTimeout))
 		if _, err := io.ReadFull(c, msgBuf); err != nil {
 			return
 		}
@@ -270,6 +284,7 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 		}
 		// #nosec G115 -- out length is validated <= 65535 above
 		binary.BigEndian.PutUint16(lenBuf[:], uint16(len(out)))
+		_ = c.SetWriteDeadline(time.Now().Add(readTimeout))
 		if _, err := c.Write(lenBuf[:]); err != nil {
 			return
 		}
@@ -279,7 +294,7 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 	}
 }
 
-func (s *Server) serveTCP(ctx context.Context, scope *ScopeHandle, tcp net.Listener, activeConnsMu *sync.Mutex, activeConns map[net.Conn]struct{}, errCh chan<- error) {
+func (s *Server) serveTCP(ctx context.Context, scope *ScopeHandle, tcp net.Listener, errCh chan<- error) {
 	defer s.wg.Done()
 	sem := make(chan struct{}, s.cfg.MaxTCPSessions)
 	for {
@@ -301,16 +316,22 @@ func (s *Server) serveTCP(ctx context.Context, scope *ScopeHandle, tcp net.Liste
 			continue
 		}
 
-		activeConnsMu.Lock()
-		activeConns[conn] = struct{}{}
-		activeConnsMu.Unlock()
-
+		s.mu.Lock()
+		if s.closing || ctx.Err() != nil {
+			s.mu.Unlock()
+			<-sem
+			_ = conn.Close()
+			return
+		}
+		s.activeConns[conn] = struct{}{}
 		s.wg.Add(1)
+		s.mu.Unlock()
+
 		go func(c net.Conn) {
 			defer func() {
-				activeConnsMu.Lock()
-				delete(activeConns, c)
-				activeConnsMu.Unlock()
+				s.mu.Lock()
+				delete(s.activeConns, c)
+				s.mu.Unlock()
 				<-sem
 				_ = c.Close()
 				s.wg.Done()
@@ -326,8 +347,6 @@ func (s *Server) Serve(ctx context.Context, scope *ScopeHandle, udp net.PacketCo
 	defer s.wg.Done()
 
 	errCh := make(chan error, 2)
-	var activeConnsMu sync.Mutex
-	activeConns := make(map[net.Conn]struct{})
 
 	// Unblock and close listeners on server shutdown or context cancellation.
 	go func() {
@@ -341,11 +360,11 @@ func (s *Server) Serve(ctx context.Context, scope *ScopeHandle, udp net.PacketCo
 		if tcp != nil {
 			_ = tcp.Close()
 		}
-		activeConnsMu.Lock()
-		for c := range activeConns {
+		s.mu.Lock()
+		for c := range s.activeConns {
 			_ = c.Close()
 		}
-		activeConnsMu.Unlock()
+		s.mu.Unlock()
 	}()
 
 	if udp != nil {
@@ -355,7 +374,7 @@ func (s *Server) Serve(ctx context.Context, scope *ScopeHandle, udp net.PacketCo
 
 	if tcp != nil {
 		s.wg.Add(1)
-		go s.serveTCP(ctx, scope, tcp, &activeConnsMu, activeConns, errCh)
+		go s.serveTCP(ctx, scope, tcp, errCh)
 	}
 
 	select {
@@ -373,6 +392,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.closeOnce.Do(func() {
 		close(s.closed)
 	})
+
+	s.mu.Lock()
+	s.closing = true
+	for c := range s.activeConns {
+		_ = c.Close()
+	}
+	s.mu.Unlock()
 
 	done := make(chan struct{})
 	go func() {

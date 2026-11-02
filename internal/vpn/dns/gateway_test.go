@@ -2,19 +2,23 @@ package gatewaydns
 
 import (
 	"context"
+	"encoding/binary"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	mdns "github.com/miekg/dns"
 )
 
 type mockReplyWriter struct {
-	mu      sync.Mutex
-	packets [][]byte
+	mu       sync.Mutex
+	packets  [][]byte
+	onPacket func(packet []byte)
 }
 
 func (w *mockReplyWriter) WritePacket(scope policy.Scope, packet []byte) error {
@@ -23,6 +27,9 @@ func (w *mockReplyWriter) WritePacket(scope policy.Scope, packet []byte) error {
 	cp := make([]byte, len(packet))
 	copy(cp, packet)
 	w.packets = append(w.packets, cp)
+	if w.onPacket != nil {
+		w.onPacket(cp)
+	}
 	return nil
 }
 
@@ -202,5 +209,129 @@ func TestGateway_BeginRetire(t *testing.T) {
 	}
 	if len(writer.getPackets()) != 0 {
 		t.Errorf("retired scope should not write replies")
+	}
+}
+
+func TestGateway_TrySubmit_TCP(t *testing.T) {
+	gwIP := netip.MustParseAddr("10.8.0.1")
+	gwAddrPort := netip.AddrPortFrom(gwIP, 53)
+	clientIP := netip.MustParseAddr("10.8.0.2")
+
+	res := &mockResolver{
+		exchange: func(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error) {
+			resp := new(mdns.Msg)
+			resp.SetReply(req)
+			resp.Answer = append(resp.Answer, &mdns.A{
+				Hdr: mdns.RR_Header{Name: req.Question[0].Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+				A:   net.ParseIP("93.184.216.34").To4(),
+			})
+			return resp, nil
+		},
+	}
+
+	snap := compileTestSnapshot(t, "example.com", "")
+	srv, _ := NewServer(ServerConfig{Gateway: gwAddrPort}, res, &staticPolicySource{snapshot: snap})
+	gw, err := NewGateway(GatewayConfig{Gateway: gwAddrPort}, srv)
+	if err != nil {
+		t.Fatalf("failed to create gateway: %v", err)
+	}
+	defer gw.Close()
+
+	rc, sess := setupTestSession(t, snap.Generation())
+	_ = rc
+	writer := &mockReplyWriter{}
+	scope := NewScopeHandle(context.Background(), policy.Scope{SessionID: "sess-gw-tcp", OwnershipEpoch: 1}, sess, writer)
+	defer scope.cancel()
+
+	// Simulated client network stack
+	clientVT, clientTnet, err := netstack.CreateNetTUN([]netip.Addr{clientIP}, nil, 1500)
+	if err != nil {
+		t.Fatalf("failed to create client netstack: %v", err)
+	}
+	defer clientVT.Close()
+
+	// When Gateway produces reply packets, route them into client netstack
+	writer.onPacket = func(packet []byte) {
+		_, _ = clientVT.Write([][]byte{packet}, 0)
+	}
+
+	// Read packets from client netstack and submit to Gateway
+	stopClientReader := make(chan struct{})
+	go func() {
+		buf := make([][]byte, 1)
+		buf[0] = make([]byte, 1500)
+		sizes := make([]int, 1)
+		for {
+			select {
+			case <-stopClientReader:
+				return
+			default:
+			}
+			n, err := clientVT.Read(buf, sizes, 0)
+			if err != nil {
+				return
+			}
+			if n > 0 && sizes[0] > 0 {
+				pkt := make([]byte, sizes[0])
+				copy(pkt, buf[0][:sizes[0]])
+				_, _ = gw.TrySubmit(scope, pkt)
+			}
+		}
+	}()
+	defer close(stopClientReader)
+
+	// Dial TCP to gateway on port 53
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer dialCancel()
+	conn, err := clientTnet.DialContextTCPAddrPort(dialCtx, gwAddrPort)
+	if err != nil {
+		t.Fatalf("client failed to dial TCP to gateway: %v", err)
+	}
+	defer conn.Close()
+
+	// Build and send framed DNS query
+	req := new(mdns.Msg)
+	req.SetQuestion("example.com.", mdns.TypeA)
+	req.Id = 3344
+	dnsBytes, err := req.Pack()
+	if err != nil {
+		t.Fatalf("failed to pack DNS query: %v", err)
+	}
+
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(dnsBytes)))
+	if _, err := conn.Write(lenBuf[:]); err != nil {
+		t.Fatalf("failed to write TCP length: %v", err)
+	}
+	if _, err := conn.Write(dnsBytes); err != nil {
+		t.Fatalf("failed to write TCP query: %v", err)
+	}
+
+	// Read framed DNS reply
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		t.Fatalf("failed to read TCP reply length: %v", err)
+	}
+	respLen := binary.BigEndian.Uint16(lenBuf[:])
+	respBuf := make([]byte, respLen)
+	if _, err := io.ReadFull(conn, respBuf); err != nil {
+		t.Fatalf("failed to read TCP reply payload: %v", err)
+	}
+
+	respMsg := new(mdns.Msg)
+	if err := respMsg.Unpack(respBuf); err != nil {
+		t.Fatalf("failed to unpack TCP reply DNS message: %v", err)
+	}
+	if respMsg.Id != 3344 {
+		t.Errorf("expected query ID 3344, got %d", respMsg.Id)
+	}
+	if len(respMsg.Answer) != 1 {
+		t.Fatalf("expected 1 answer, got %d", len(respMsg.Answer))
+	}
+
+	// Verify route cache was populated for example.com (proxy)
+	publicIP := netip.MustParseAddr("93.184.216.34")
+	if got := sess.Lookup(publicIP, snap.Generation(), time.Now()); got != policy.Proxy {
+		t.Errorf("expected Proxy in route cache for TCP query, got %v", got)
 	}
 }

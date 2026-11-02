@@ -292,3 +292,64 @@ func TestServer_ServeUDPAndTCP(t *testing.T) {
 		t.Fatalf("shutdown failed: %v", err)
 	}
 }
+
+func TestServer_ShutdownDrainWithLateConnections(t *testing.T) {
+	res := &mockResolver{}
+	srv, err := NewServer(ServerConfig{
+		Gateway:      netip.MustParseAddrPort("10.0.0.1:53"),
+		QueryTimeout: 500 * time.Millisecond,
+	}, res, &staticPolicySource{})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	tcpListener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen TCP: %v", err)
+	}
+	defer tcpListener.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = srv.Serve(ctx, nil, nil, tcpListener)
+	}()
+
+	// 1. Establish an idle TCP connection that never sends bytes.
+	idleConn, err := net.Dial("tcp4", tcpListener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to dial idle connection: %v", err)
+	}
+	defer idleConn.Close()
+
+	// Wait briefly for idleConn to be accepted by server.
+	time.Sleep(20 * time.Millisecond)
+
+	// 2. Concurrently dial multiple late connections while triggering Shutdown.
+	var dialWg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		dialWg.Add(1)
+		go func() {
+			defer dialWg.Done()
+			c, dErr := net.DialTimeout("tcp4", tcpListener.Addr().String(), 500*time.Millisecond)
+			if dErr == nil {
+				defer c.Close()
+				// Read until EOF or close
+				buf := make([]byte, 64)
+				_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+				_, _ = c.Read(buf)
+			}
+		}()
+	}
+
+	// 3. Trigger Shutdown with a strict timeout.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutdown failed or timed out with late connections: %v", err)
+	}
+
+	dialWg.Wait()
+}

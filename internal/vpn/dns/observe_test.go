@@ -340,3 +340,54 @@ func TestObserve_TTLZeroNotCached(t *testing.T) {
 		t.Errorf("TTL 0 must not be cached, got %+v", obs)
 	}
 }
+
+func TestObserve_ZeroTTLProxyRevokesActiveDirect(t *testing.T) {
+	snapshot := compileTestSnapshot(t, "blocked.com", "")
+	_, sess := setupTestSession(t, snapshot.Generation())
+	now := time.Now()
+	publicIP := netip.MustParseAddr("93.184.216.34")
+
+	// 1. Unlisted domain resolves to publicIP with TTL 300 -> DIRECT
+	req := new(mdns.Msg)
+	req.SetQuestion("unlisted.com.", mdns.TypeA)
+	resp := new(mdns.Msg)
+	resp.SetReply(req)
+	resp.Answer = append(resp.Answer, &mdns.A{
+		Hdr: mdns.RR_Header{Name: "unlisted.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+		A:   publicIP.AsSlice(),
+	})
+
+	obs, err := ObserveResponse(req, resp, snapshot, sess, now, 3600*time.Second)
+	if err != nil {
+		t.Fatalf("ObserveResponse 1 failed: %v", err)
+	}
+	if len(obs) != 1 || obs[0].Decision != policy.Direct {
+		t.Fatalf("expected DIRECT observation, got %+v", obs)
+	}
+	if got := sess.Lookup(publicIP, snapshot.Generation(), now); got != policy.Direct {
+		t.Fatalf("expected Direct in cache before suppression, got %v", got)
+	}
+
+	// 2. Blocked/proxy-required domain resolves to the same publicIP with TTL 0 -> PROXY
+	req2 := new(mdns.Msg)
+	req2.SetQuestion("blocked.com.", mdns.TypeA)
+	resp2 := new(mdns.Msg)
+	resp2.SetReply(req2)
+	resp2.Answer = append(resp2.Answer, &mdns.A{
+		Hdr: mdns.RR_Header{Name: "blocked.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 0},
+		A:   publicIP.AsSlice(),
+	})
+
+	obs2, err := ObserveResponse(req2, resp2, snapshot, sess, now, 3600*time.Second)
+	if err != nil {
+		t.Fatalf("ObserveResponse 2 failed: %v", err)
+	}
+	if len(obs2) != 1 || obs2[0].Decision != policy.Proxy {
+		t.Fatalf("expected PROXY observation with zero TTL, got %+v", obs2)
+	}
+
+	// 3. Confirm that the prior DIRECT grant was immediately revoked and lookup returns UNKNOWN (safe fallback).
+	if got := sess.Lookup(publicIP, snapshot.Generation(), now); got != policy.Unknown {
+		t.Errorf("expected Unknown (safe fallback) after zero-TTL proxy suppression, got %v", got)
+	}
+}

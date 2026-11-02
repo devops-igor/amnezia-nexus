@@ -528,3 +528,63 @@ func TestRouteCache_ConcurrencyRace(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestRouteCache_ZeroTTLProxyRevokesActiveDirect(t *testing.T) {
+	rc, _ := NewRouteCache(CacheConfig{})
+	rc.SetPolicyGeneration("gen-1")
+	now := time.Now()
+	ip := netip.MustParseAddr("93.184.216.34")
+
+	s, _ := rc.Open(Scope{SessionID: "sess-zero-ttl", OwnershipEpoch: 1})
+
+	// 1. Establish an active DIRECT entry with 300s TTL.
+	err := s.Observe("gen-1", []Observation{
+		{IP: ip, Decision: Direct, ExpiresAt: now.Add(300 * time.Second)},
+	}, now)
+	if err != nil {
+		t.Fatalf("initial direct observe failed: %v", err)
+	}
+	if got := s.Lookup(ip, "gen-1", now); got != Direct {
+		t.Fatalf("expected Direct initially, got %v", got)
+	}
+
+	// 2. Observe zero-TTL Proxy observation (ExpiresAt == now).
+	// Must immediately revoke the active DIRECT entry so subsequent lookups return UNKNOWN.
+	err = s.Observe("gen-1", []Observation{
+		{IP: ip, Decision: Proxy, ExpiresAt: now},
+	}, now)
+	if err != nil {
+		t.Fatalf("zero-ttl proxy observe failed: %v", err)
+	}
+	if got := s.Lookup(ip, "gen-1", now); got != Unknown {
+		t.Errorf("expected Unknown (safe fallback) after zero-TTL proxy suppression, got %v", got)
+	}
+
+	// 3. Confirm that zero-TTL DIRECT is still rejected as invalid.
+	err = s.Observe("gen-1", []Observation{
+		{IP: ip, Decision: Direct, ExpiresAt: now},
+	}, now)
+	if err == nil {
+		t.Errorf("expected error for zero-TTL Direct observation, got nil")
+	}
+
+	// 4. Confirm that zero-TTL Proxy does NOT revoke an already active PROXY entry.
+	err = s.Observe("gen-1", []Observation{
+		{IP: ip, Decision: Proxy, ExpiresAt: now.Add(60 * time.Second)},
+	}, now)
+	if err != nil {
+		t.Fatalf("proxy observe failed: %v", err)
+	}
+	if got := s.Lookup(ip, "gen-1", now); got != Proxy {
+		t.Fatalf("expected Proxy, got %v", got)
+	}
+	err = s.Observe("gen-1", []Observation{
+		{IP: ip, Decision: Proxy, ExpiresAt: now},
+	}, now)
+	if err != nil {
+		t.Fatalf("zero-ttl proxy observe over existing proxy failed: %v", err)
+	}
+	if got := s.Lookup(ip, "gen-1", now); got != Proxy {
+		t.Errorf("expected active Proxy to remain Proxy after zero-TTL proxy observation, got %v", got)
+	}
+}

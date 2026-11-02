@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	mdns "github.com/miekg/dns"
 )
@@ -64,10 +68,31 @@ type GatewayConfig struct {
 	Gateway netip.AddrPort
 }
 
+type gatewayTCPTransport struct {
+	scope    policy.Scope
+	vt       tun.Device
+	listener net.Listener
+	mu       sync.Mutex
+	closed   atomic.Bool
+}
+
+func (tr *gatewayTCPTransport) Close() {
+	if tr.closed.CompareAndSwap(false, true) {
+		if tr.listener != nil {
+			_ = tr.listener.Close()
+		}
+		if tr.vt != nil {
+			_ = tr.vt.Close()
+		}
+	}
+}
+
 // Gateway intercepts and processes DNS queries addressed to the gateway on port 53.
 type Gateway struct {
-	cfg    GatewayConfig
-	server *Server
+	cfg        GatewayConfig
+	server     *Server
+	mu         sync.Mutex
+	transports map[policy.Scope]*gatewayTCPTransport
 }
 
 // NewGateway constructs a new Gateway transport adapter.
@@ -79,9 +104,79 @@ func NewGateway(cfg GatewayConfig, server *Server) (*Gateway, error) {
 		return nil, errors.New("server cannot be nil")
 	}
 	return &Gateway{
-		cfg:    cfg,
-		server: server,
+		cfg:        cfg,
+		server:     server,
+		transports: make(map[policy.Scope]*gatewayTCPTransport),
 	}, nil
+}
+
+func (g *Gateway) getOrCreateTransport(scope *ScopeHandle) (*gatewayTCPTransport, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if scope == nil || scope.IsRetired() {
+		return nil, errors.New("scope is nil or retired")
+	}
+
+	if tr, ok := g.transports[scope.Scope]; ok {
+		return tr, nil
+	}
+
+	vt, tnet, err := netstack.CreateNetTUN([]netip.Addr{g.cfg.Gateway.Addr()}, nil, 1500)
+	if err != nil {
+		return nil, err
+	}
+
+	tcpL, err := tnet.ListenTCPAddrPort(g.cfg.Gateway)
+	if err != nil {
+		_ = vt.Close()
+		return nil, err
+	}
+
+	tr := &gatewayTCPTransport{
+		scope:    scope.Scope,
+		vt:       vt,
+		listener: tcpL,
+	}
+	g.transports[scope.Scope] = tr
+
+	// Background reader: forward outbound IP packets from netstack to client reply writer.
+	go func() {
+		buf := make([][]byte, 1)
+		buf[0] = make([]byte, 65535)
+		sizes := make([]int, 1)
+		for {
+			n, err := vt.Read(buf, sizes, 0)
+			if err != nil {
+				return
+			}
+			if n > 0 && sizes[0] > 0 {
+				pkt := make([]byte, sizes[0])
+				copy(pkt, buf[0][:sizes[0]])
+				if !scope.IsRetired() && scope.ReplyWriter != nil {
+					_ = scope.ReplyWriter.WritePacket(scope.Scope, pkt)
+				}
+			}
+		}
+	}()
+
+	// Serve TCP DNS queries over this listener bounded by scope context.
+	go func() {
+		_ = g.server.Serve(scope.ctx, scope, nil, tcpL)
+	}()
+
+	// Clean up transport when scope context is done.
+	go func() {
+		<-scope.ctx.Done()
+		g.mu.Lock()
+		if g.transports[scope.Scope] == tr {
+			delete(g.transports, scope.Scope)
+		}
+		g.mu.Unlock()
+		tr.Close()
+	}()
+
+	return tr, nil
 }
 
 // TrySubmit inspects incoming IPv4 packets from authenticated ingress.
@@ -168,7 +263,13 @@ func (g *Gateway) TrySubmit(scope *ScopeHandle, ipv4Packet []byte) (handled bool
 		if dstPort != 53 {
 			return false, nil
 		}
-		// Exact gateway:53 TCP destination - handled.
+		tr, err := g.getOrCreateTransport(scope)
+		if err != nil {
+			return true, nil
+		}
+		tr.mu.Lock()
+		_, _ = tr.vt.Write([][]byte{ipv4Packet}, 0)
+		tr.mu.Unlock()
 		return true, nil
 
 	default:
@@ -185,9 +286,26 @@ func (g *Gateway) BeginRetire(scope *ScopeHandle) Retirement {
 		if scope.SessionCache != nil {
 			scope.SessionCache.Invalidate()
 		}
+		g.mu.Lock()
+		if tr, ok := g.transports[scope.Scope]; ok {
+			delete(g.transports, scope.Scope)
+			tr.Close()
+		}
+		g.mu.Unlock()
 		return Retirement{Scope: scope.Scope}
 	}
 	return Retirement{}
+}
+
+// Close permanently closes all active gateway TCP transports.
+func (g *Gateway) Close() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for scope, tr := range g.transports {
+		delete(g.transports, scope)
+		tr.Close()
+	}
+	return nil
 }
 
 func buildIPv4UDPPacket(srcIP netip.Addr, srcPort uint16, dstIP netip.Addr, dstPort uint16, payload []byte) []byte {
@@ -204,8 +322,8 @@ func buildIPv4UDPPacket(srcIP netip.Addr, srcPort uint16, dstIP netip.Addr, dstP
 	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
 	binary.BigEndian.PutUint16(pkt[4:6], 0)
 	binary.BigEndian.PutUint16(pkt[6:8], 0x4000) // DF flag
-	pkt[8] = 64                                 // TTL
-	pkt[9] = 17                                 // Protocol UDP
+	pkt[8] = 64                                  // TTL
+	pkt[9] = 17                                  // Protocol UDP
 	srcBytes := srcIP.As4()
 	dstBytes := dstIP.As4()
 	copy(pkt[12:16], srcBytes[:])

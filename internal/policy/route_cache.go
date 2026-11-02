@@ -235,7 +235,9 @@ func validateBatch(batch []Observation, now time.Time, maxTTL time.Duration) err
 			return fmt.Errorf("%w: %v", ErrInvalidObservation, err)
 		}
 		if !obs.ExpiresAt.After(now) {
-			return fmt.Errorf("%w: expired deadline", ErrInvalidObservation)
+			if obs.Decision != Proxy {
+				return fmt.Errorf("%w: expired deadline", ErrInvalidObservation)
+			}
 		}
 		if obs.ExpiresAt.After(maxDeadline) {
 			return fmt.Errorf("%w: deadline exceeds MaxTTL", ErrInvalidObservation)
@@ -270,7 +272,7 @@ func foldBatch(batch []Observation) map[[4]byte]Observation {
 	return folded
 }
 
-func mergeConflictResolution(newEntries map[[4]byte]routeEntry, folded map[[4]byte]Observation) bool {
+func mergeConflictResolution(newEntries map[[4]byte]routeEntry, folded map[[4]byte]Observation, now time.Time) bool {
 	hasIncomingProxy := false
 	for k, obs := range folded {
 		if obs.Decision == Proxy {
@@ -278,6 +280,10 @@ func mergeConflictResolution(newEntries map[[4]byte]routeEntry, folded map[[4]by
 		}
 		existing, exists := newEntries[k]
 		if !exists {
+			if obs.Decision == Proxy && !obs.ExpiresAt.After(now) {
+				// Zero-TTL Proxy observation without prior entry: safe fallback (UNKNOWN).
+				continue
+			}
 			newEntries[k] = routeEntry{decision: obs.Decision, expiresAt: obs.ExpiresAt}
 			continue
 		}
@@ -288,9 +294,14 @@ func mergeConflictResolution(newEntries map[[4]byte]routeEntry, folded map[[4]by
 			}
 		} else if existing.decision == Direct && obs.Decision == Proxy {
 			// PROXY discards old DIRECT evidence.
-			newEntries[k] = routeEntry{
-				decision:  Proxy,
-				expiresAt: obs.ExpiresAt,
+			if !obs.ExpiresAt.After(now) {
+				// Zero-TTL Proxy: immediately revoke/suppress active DIRECT entry.
+				delete(newEntries, k)
+			} else {
+				newEntries[k] = routeEntry{
+					decision:  Proxy,
+					expiresAt: obs.ExpiresAt,
+				}
 			}
 		} else if existing.decision == Proxy && obs.Decision == Direct {
 			// Keep existing PROXY and its deadline; ignore DIRECT.
@@ -420,7 +431,7 @@ func (s *SessionCache) Observe(policyGeneration string, batch []Observation, now
 		}
 	}
 
-	hasIncomingProxy := mergeConflictResolution(newEntries, folded)
+	hasIncomingProxy := mergeConflictResolution(newEntries, folded, now)
 
 	if err := s.checkCapacityAndEvict(currentView, newEntries, folded, hasIncomingProxy); err != nil {
 		return err
