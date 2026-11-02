@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -141,17 +142,19 @@ func (s *Syncer) Run(ctx context.Context) error {
 	// Attempt initial recovery from last-known-good cache on startup
 	if s.store != nil {
 		if gen, err := s.store.Load(ctx); err == nil && gen != nil {
-			if snap, snapErr := GenerationToSnapshot(gen); snapErr == nil && (snap.DomainCount() > 0 || snap.CIDRCount() > 0) {
-				s.matcher.Publish(snap)
-				s.cachedGen = gen
-				s.statusMu.Lock()
-				s.status.Ready = true
-				s.status.Version = gen.Version
-				s.status.GenerationID = gen.GenerationID
-				s.status.LastSuccess = gen.CreatedAt
-				s.status.DomainCount = snap.DomainCount()
-				s.status.CIDRCount = snap.CIDRCount()
-				s.statusMu.Unlock()
+			if gen.ConfigHash == s.computeConfigHash() {
+				if snap, snapErr := GenerationToSnapshot(gen); snapErr == nil && (snap.DomainCount() > 0 || snap.CIDRCount() > 0) {
+					s.matcher.Publish(snap)
+					s.cachedGen = gen
+					s.statusMu.Lock()
+					s.status.Ready = true
+					s.status.Version = gen.Version
+					s.status.GenerationID = gen.GenerationID
+					s.status.LastSuccess = gen.CreatedAt
+					s.status.DomainCount = snap.DomainCount()
+					s.status.CIDRCount = snap.CIDRCount()
+					s.statusMu.Unlock()
+				}
 			}
 		}
 	}
@@ -284,11 +287,22 @@ func (s *Syncer) syncSingleSource(ctx context.Context, src Source, startTime tim
 	stat.Rejected = report.Rejected
 	stat.Duplicates = report.Duplicates
 
+	etag := fetchRes.ETag
+	lastMod := fetchRes.LastModified
+	if fetchRes.NotModified {
+		if etag == "" {
+			etag = ifNoneMatch
+		}
+		if lastMod == "" {
+			lastMod = ifModifiedSince
+		}
+	}
+
 	meta := SourceMeta{
 		ID:           src.ID,
 		URL:          src.URL,
-		ETag:         fetchRes.ETag,
-		LastModified: fetchRes.LastModified,
+		ETag:         etag,
+		LastModified: lastMod,
 		CheckedAt:    startTime,
 		RuleCount:    len(rules.Domains) + len(rules.CIDRs),
 	}
@@ -301,13 +315,18 @@ func (s *Syncer) syncSingleSource(ctx context.Context, src Source, startTime tim
 func aggregateCandidateRules(sourceParsedList []SourceParsedRules) (map[string]uint8, []string, int) {
 	candidateDomains := make(map[string]uint8)
 	var candidateCIDRs []string
+	seenCIDRs := make(map[netip.Prefix]struct{})
 
 	for _, item := range sourceParsedList {
 		for base, flags := range item.Rules.Domains {
 			candidateDomains[base] |= uint8(flags)
 		}
 		for _, prefix := range item.Rules.CIDRs {
-			candidateCIDRs = append(candidateCIDRs, prefix.String())
+			canon := prefix.Masked()
+			if _, exists := seenCIDRs[canon]; !exists {
+				seenCIDRs[canon] = struct{}{}
+				candidateCIDRs = append(candidateCIDRs, canon.String())
+			}
 		}
 	}
 	return candidateDomains, candidateCIDRs, len(candidateDomains) + len(candidateCIDRs)

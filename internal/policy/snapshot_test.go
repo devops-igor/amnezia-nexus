@@ -132,3 +132,50 @@ func TestSyncer_Status(t *testing.T) {
 		t.Error("expected error for refresh interval < 30m")
 	}
 }
+
+func TestCompileSnapshot_DeduplicateCIDRs(t *testing.T) {
+	sources := []SourceParsedRules{
+		{
+			SourceID: "s1",
+			Rules: ParsedRules{
+				Domains: map[string]domainFlags{"a.com": domainExact},
+				CIDRs: []netip.Prefix{
+					netip.MustParsePrefix("10.0.0.0/8"),
+					netip.MustParsePrefix("192.168.1.1/32"),
+				},
+			},
+		},
+		{
+			SourceID: "s2",
+			Rules: ParsedRules{
+				Domains: map[string]domainFlags{"b.com": domainExact},
+				CIDRs: []netip.Prefix{
+					netip.MustParsePrefix("10.0.0.0/8"),     // exact duplicate across sources
+					netip.MustParsePrefix("192.168.1.1/32"), // exact duplicate across sources
+					netip.MustParsePrefix("172.16.0.0/12"),
+				},
+			},
+		},
+	}
+
+	snap, err := CompileSnapshot(1, "gen-dedup", sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if snap.CIDRCount() != 3 {
+		t.Errorf("snap.CIDRCount() = %d, want 3", snap.CIDRCount())
+	}
+	if !snap.MatchIPv4(netip.MustParseAddr("10.5.0.1")) {
+		t.Error("expected 10.5.0.1 to match")
+	}
+	if !snap.MatchIPv4(netip.MustParseAddr("192.168.1.1")) {
+		t.Error("expected 192.168.1.1 to match")
+	}
+	if !snap.MatchIPv4(netip.MustParseAddr("172.16.1.1")) {
+		t.Error("expected 172.16.1.1 to match")
+	}
+	if snap.MatchIPv4(netip.MustParseAddr("192.168.2.1")) {
+		t.Error("expected 192.168.2.1 not to match")
+	}
+}

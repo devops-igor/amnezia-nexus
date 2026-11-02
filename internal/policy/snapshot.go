@@ -132,6 +132,7 @@ func CompileSnapshot(version uint64, generationID string, sources []SourceParsed
 
 	mergedDomains := make(map[string]domainFlags)
 	var allCIDRs []netip.Prefix
+	seenCIDRs := make(map[netip.Prefix]struct{})
 	sourceIDs := make([]string, 0, len(sources))
 
 	for _, src := range sources {
@@ -139,7 +140,13 @@ func CompileSnapshot(version uint64, generationID string, sources []SourceParsed
 		for base, flags := range src.Rules.Domains {
 			mergedDomains[base] |= flags
 		}
-		allCIDRs = append(allCIDRs, src.Rules.CIDRs...)
+		for _, prefix := range src.Rules.CIDRs {
+			canon := prefix.Masked()
+			if _, exists := seenCIDRs[canon]; !exists {
+				seenCIDRs[canon] = struct{}{}
+				allCIDRs = append(allCIDRs, canon)
+			}
+		}
 	}
 
 	idx := newIPv4Index(allCIDRs)

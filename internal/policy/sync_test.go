@@ -2,7 +2,9 @@ package policy
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/http"
@@ -567,5 +569,267 @@ func TestSyncer_MultiSourceZeroByteRefreshPreservesActiveAndLKG(t *testing.T) {
 	}
 	if _, ok := lkgGenAfter.Domains["domain-b.com"]; !ok {
 		t.Error("domain-b.com missing from durable LKG")
+	}
+}
+
+func TestSyncer_ConfigHashMismatchRejectsStaleCache(t *testing.T) {
+	tempDir := t.TempDir()
+	store := NewFileStore(tempDir)
+	matcherA := NewMatcher()
+
+	// Initial configuration A
+	cfgA := SyncConfig{
+		Sources: []Source{
+			{
+				ID:             "source-a",
+				URL:            "https://rules.example.com/rules-a.lst",
+				Format:         FormatDomains,
+				BareDomainMode: DomainModeExact,
+			},
+		},
+		RefreshInterval: 1 * time.Hour,
+	}
+
+	// Compute config hash for A
+	h := sha256.New()
+	for _, src := range cfgA.Sources {
+		_, _ = fmt.Fprintf(h, "%s:%s:%d:%d:%v\n", src.ID, src.URL, src.Format, src.BareDomainMode, src.IsPreset)
+	}
+	configHashA := hex.EncodeToString(h.Sum(nil))
+
+	genA := &Generation{
+		SchemaVersion: SchemaVersion,
+		GenerationID:  "gen-a-1",
+		Version:       1,
+		CreatedAt:     time.Now().UTC(),
+		ConfigHash:    configHashA,
+		Domains:       map[string]uint8{"old-domain.com": uint8(domainExact)},
+		DomainCount:   1,
+	}
+	if err := store.Commit(context.Background(), genA); err != nil {
+		t.Fatalf("failed committing genA: %v", err)
+	}
+
+	// Verify that with cfgA, an offline syncer recovers genA from cache
+	offlineFetcher := NewFetcher(DefaultFetchLimits())
+	syncerA, err := NewSyncer(matcherA, offlineFetcher, store, cfgA)
+	if err != nil {
+		t.Fatalf("NewSyncer error: %v", err)
+	}
+	stopCtxA, stopCancelA := context.WithCancel(context.Background())
+	stopCancelA()
+	_ = syncerA.Run(stopCtxA)
+
+	if matcherA.Current() == nil {
+		t.Fatal("expected matcherA to have recovered snapshot")
+	}
+	if !syncerA.Status().Ready {
+		t.Fatal("expected syncerA to be ready after matching config cache recovery")
+	}
+
+	// Now reconfigure to Source B (different ID and URL -> different config hash)
+	matcherB := NewMatcher()
+	cfgB := SyncConfig{
+		Sources: []Source{
+			{
+				ID:             "source-b",
+				URL:            "https://rules.example.com/rules-b.lst",
+				Format:         FormatDomains,
+				BareDomainMode: DomainModeExact,
+			},
+		},
+		RefreshInterval: 1 * time.Hour,
+	}
+
+	syncerB, err := NewSyncer(matcherB, offlineFetcher, store, cfgB)
+	if err != nil {
+		t.Fatalf("NewSyncer error: %v", err)
+	}
+
+	// Offline restart: context canceled or network unreachable
+	stopCtxB, stopCancelB := context.WithCancel(context.Background())
+	stopCancelB()
+	_ = syncerB.Run(stopCtxB)
+
+	// Since ConfigHash of genA does not match cfgB, cache MUST be rejected
+	if matcherB.Current() != nil {
+		t.Fatalf("expected nil active snapshot on config hash mismatch, got %v", matcherB.Current())
+	}
+	stB := syncerB.Status()
+	if stB.Ready {
+		t.Fatalf("expected syncerB.Status().Ready to be false, got true")
+	}
+	if stB.Version != 0 {
+		t.Fatalf("expected syncerB.Status().Version to be 0, got %d", stB.Version)
+	}
+
+	// Also verify with a live context where executeUpdate fails due to offline network
+	matcherC := NewMatcher()
+	syncerC, err := NewSyncer(matcherC, offlineFetcher, store, cfgB)
+	if err != nil {
+		t.Fatalf("NewSyncer error: %v", err)
+	}
+	runCtxC, runCancelC := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer runCancelC()
+	_ = syncerC.Run(runCtxC)
+
+	if matcherC.Current() != nil {
+		t.Fatalf("expected nil active snapshot after failed offline fetch, got %v", matcherC.Current())
+	}
+	stC := syncerC.Status()
+	if stC.Ready {
+		t.Fatalf("expected syncerC.Status().Ready to be false after failed offline fetch, got true")
+	}
+}
+
+func TestSyncer_RetainConditionalValidatorsOn304(t *testing.T) {
+	tempDir := t.TempDir()
+	store := NewFileStore(tempDir)
+	matcher := NewMatcher()
+
+	var reqStep atomic.Int32
+	var receivedIfNoneMatch atomic.Value
+	var receivedIfModifiedSince atomic.Value
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		step := reqStep.Add(1)
+		receivedIfNoneMatch.Store(r.Header.Get("If-None-Match"))
+		receivedIfModifiedSince.Store(r.Header.Get("If-Modified-Since"))
+
+		switch step {
+		case 1:
+			// Initial full download
+			w.Header().Set("ETag", `"etag-v1"`)
+			w.Header().Set("Last-Modified", "Mon, 02 Nov 2026 10:00:00 GMT")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("domain1.com\n10.0.0.1\n"))
+		case 2:
+			// 304 Not Modified WITHOUT ETag and WITHOUT Last-Modified in response headers
+			w.WriteHeader(http.StatusNotModified)
+		case 3:
+			// 304 Not Modified with UPDATED ETag, but NO Last-Modified
+			w.Header().Set("ETag", `"etag-v2"`)
+			w.WriteHeader(http.StatusNotModified)
+		default:
+			w.WriteHeader(http.StatusNotModified)
+		}
+	}))
+	defer ts.Close()
+
+	serverAddr := ts.Listener.Addr().String()
+	testFetcher := NewFetcher(DefaultFetchLimits())
+	testFetcher.tlsConfig = &tls.Config{InsecureSkipVerify: true}
+	testFetcher.lookupIP = func(ctx context.Context, host string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	}
+	testFetcher.dialTCP = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", serverAddr)
+	}
+
+	cfg := SyncConfig{
+		Sources: []Source{
+			{
+				ID:             "source-304",
+				URL:            "https://rules.example.com/rules.lst",
+				Format:         FormatMixed,
+				BareDomainMode: DomainModeExact,
+			},
+		},
+		RefreshInterval: 1 * time.Hour,
+	}
+
+	syncer, err := NewSyncer(matcher, testFetcher, store, cfg)
+	if err != nil {
+		t.Fatalf("NewSyncer error: %v", err)
+	}
+
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+
+	go func() {
+		_ = syncer.Run(runCtx)
+	}()
+
+	// Wait for initial sync from Run() to complete (Step 1: 200 OK)
+	deadline := time.Now().Add(2 * time.Second)
+	for !syncer.Status().Ready && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !syncer.Status().Ready {
+		t.Fatal("syncer not ready after initial sync in Run")
+	}
+
+	meta1 := syncer.cachedSources["source-304"].meta
+	if meta1.ETag != `"etag-v1"` {
+		t.Errorf("Sync 1: ETag = %q, want %q", meta1.ETag, `"etag-v1"`)
+	}
+	if meta1.LastModified != "Mon, 02 Nov 2026 10:00:00 GMT" {
+		t.Errorf("Sync 1: LastModified = %q, want %q", meta1.LastModified, "Mon, 02 Nov 2026 10:00:00 GMT")
+	}
+
+	ctx := context.Background()
+
+	// Step 2: 304 response omitting ETag and Last-Modified
+	res2, err := syncer.Sync(ctx)
+	if err != nil {
+		t.Fatalf("Sync 2 error: %v", err)
+	}
+	if !res2.SourceStats["source-304"].NotModified {
+		t.Fatalf("Sync 2: expected NotModified=true")
+	}
+	// Verify server received the conditional headers from Step 1
+	if receivedIfNoneMatch.Load() != `"etag-v1"` {
+		t.Errorf("Sync 2: server got If-None-Match = %v, want %q", receivedIfNoneMatch.Load(), `"etag-v1"`)
+	}
+	if receivedIfModifiedSince.Load() != "Mon, 02 Nov 2026 10:00:00 GMT" {
+		t.Errorf("Sync 2: server got If-Modified-Since = %v, want %q", receivedIfModifiedSince.Load(), "Mon, 02 Nov 2026 10:00:00 GMT")
+	}
+	// Verify Syncer RETAINED ETag and Last-Modified despite 304 omitting them
+	meta2 := syncer.cachedSources["source-304"].meta
+	if meta2.ETag != `"etag-v1"` {
+		t.Errorf("Sync 2: retained ETag = %q, want %q", meta2.ETag, `"etag-v1"`)
+	}
+	if meta2.LastModified != "Mon, 02 Nov 2026 10:00:00 GMT" {
+		t.Errorf("Sync 2: retained LastModified = %q, want %q", meta2.LastModified, "Mon, 02 Nov 2026 10:00:00 GMT")
+	}
+	// Also verify durable cached generation retained them
+	if syncer.cachedGen.SourcesMeta["source-304"].ETag != `"etag-v1"` {
+		t.Errorf("Sync 2: cachedGen ETag = %q, want %q", syncer.cachedGen.SourcesMeta["source-304"].ETag, `"etag-v1"`)
+	}
+
+	// Step 3: Next sync MUST send the retained validators
+	res3, err := syncer.Sync(ctx)
+	if err != nil {
+		t.Fatalf("Sync 3 error: %v", err)
+	}
+	if !res3.SourceStats["source-304"].NotModified {
+		t.Fatalf("Sync 3: expected NotModified=true")
+	}
+	if receivedIfNoneMatch.Load() != `"etag-v1"` {
+		t.Errorf("Sync 3: server got If-None-Match = %v, want %q", receivedIfNoneMatch.Load(), `"etag-v1"`)
+	}
+	if receivedIfModifiedSince.Load() != "Mon, 02 Nov 2026 10:00:00 GMT" {
+		t.Errorf("Sync 3: server got If-Modified-Since = %v, want %q", receivedIfModifiedSince.Load(), "Mon, 02 Nov 2026 10:00:00 GMT")
+	}
+	// Step 3 returned updated ETag: "etag-v2", but omitted Last-Modified
+	meta3 := syncer.cachedSources["source-304"].meta
+	if meta3.ETag != `"etag-v2"` {
+		t.Errorf("Sync 3: updated ETag = %q, want %q", meta3.ETag, `"etag-v2"`)
+	}
+	if meta3.LastModified != "Mon, 02 Nov 2026 10:00:00 GMT" {
+		t.Errorf("Sync 3: retained LastModified = %q, want %q", meta3.LastModified, "Mon, 02 Nov 2026 10:00:00 GMT")
+	}
+
+	// Step 4: Next sync sends the updated ETag and retained LastModified
+	_, err = syncer.Sync(ctx)
+	if err != nil {
+		t.Fatalf("Sync 4 error: %v", err)
+	}
+	if receivedIfNoneMatch.Load() != `"etag-v2"` {
+		t.Errorf("Sync 4: server got If-None-Match = %v, want %q", receivedIfNoneMatch.Load(), `"etag-v2"`)
+	}
+	if receivedIfModifiedSince.Load() != "Mon, 02 Nov 2026 10:00:00 GMT" {
+		t.Errorf("Sync 4: server got If-Modified-Since = %v, want %q", receivedIfModifiedSince.Load(), "Mon, 02 Nov 2026 10:00:00 GMT")
 	}
 }
