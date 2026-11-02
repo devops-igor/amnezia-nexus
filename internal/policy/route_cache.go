@@ -222,18 +222,8 @@ func (s *SessionCache) Lookup(ip netip.Addr, policyGeneration string, now time.T
 	return entry.decision
 }
 
-// Observe records a validated batch of route observations for this session.
-// Validates IP addresses (native public IPv4 only), deadlines, and policy generation.
-// Implements PROXY-wins conflict resolution and capacity overflow quarantine.
-func (s *SessionCache) Observe(policyGeneration string, batch []Observation, now time.Time) error {
-	if policyGeneration == "" {
-		return ErrInvalidGeneration
-	}
-	if len(batch) == 0 {
-		return nil
-	}
-
-	maxDeadline := now.Add(s.cache.cfg.MaxTTL)
+func validateBatch(batch []Observation, now time.Time, maxTTL time.Duration) error {
+	maxDeadline := now.Add(maxTTL)
 	for _, obs := range batch {
 		if obs.Decision != Direct && obs.Decision != Proxy {
 			return fmt.Errorf("%w: decision must be Direct or Proxy", ErrInvalidObservation)
@@ -251,8 +241,10 @@ func (s *SessionCache) Observe(policyGeneration string, batch []Observation, now
 			return fmt.Errorf("%w: deadline exceeds MaxTTL", ErrInvalidObservation)
 		}
 	}
+	return nil
+}
 
-	// Fold duplicate IPs within the batch with PROXY precedence.
+func foldBatch(batch []Observation) map[[4]byte]Observation {
 	folded := make(map[[4]byte]Observation, len(batch))
 	for _, obs := range batch {
 		k := obs.IP.As4()
@@ -275,6 +267,119 @@ func (s *SessionCache) Observe(policyGeneration string, batch []Observation, now
 			}
 		}
 	}
+	return folded
+}
+
+func mergeConflictResolution(newEntries map[[4]byte]routeEntry, folded map[[4]byte]Observation) bool {
+	hasIncomingProxy := false
+	for k, obs := range folded {
+		if obs.Decision == Proxy {
+			hasIncomingProxy = true
+		}
+		existing, exists := newEntries[k]
+		if !exists {
+			newEntries[k] = routeEntry{decision: obs.Decision, expiresAt: obs.ExpiresAt}
+			continue
+		}
+		if existing.decision == Direct && obs.Decision == Direct {
+			newEntries[k] = routeEntry{
+				decision:  Direct,
+				expiresAt: maxTime(existing.expiresAt, obs.ExpiresAt),
+			}
+		} else if existing.decision == Direct && obs.Decision == Proxy {
+			// PROXY discards old DIRECT evidence.
+			newEntries[k] = routeEntry{
+				decision:  Proxy,
+				expiresAt: obs.ExpiresAt,
+			}
+		} else if existing.decision == Proxy && obs.Decision == Direct {
+			// Keep existing PROXY and its deadline; ignore DIRECT.
+		} else if existing.decision == Proxy && obs.Decision == Proxy {
+			newEntries[k] = routeEntry{
+				decision:  Proxy,
+				expiresAt: maxTime(existing.expiresAt, obs.ExpiresAt),
+			}
+		}
+	}
+	return hasIncomingProxy
+}
+
+func (s *SessionCache) quarantineSession(currentView *routeView, folded map[[4]byte]Observation) error {
+	unknownUntil := currentView.unknownUntil
+	for _, entry := range currentView.entries {
+		if entry.expiresAt.After(unknownUntil) {
+			unknownUntil = entry.expiresAt
+		}
+	}
+	for _, obs := range folded {
+		if obs.ExpiresAt.After(unknownUntil) {
+			unknownUntil = obs.ExpiresAt
+		}
+	}
+	s.view.Store(&routeView{
+		entries:          make(map[[4]byte]routeEntry),
+		policyGeneration: s.cache.policyGeneration,
+		unknownUntil:     unknownUntil,
+		retired:          false,
+	})
+	s.cache.totalEntries -= len(currentView.entries)
+	return ErrCapacityExceeded
+}
+
+func (s *SessionCache) checkCapacityAndEvict(currentView *routeView, newEntries map[[4]byte]routeEntry, folded map[[4]byte]Observation, hasIncomingProxy bool) error {
+	c := s.cache
+	directEvictionNeeded := 0
+	sessionExcess := len(newEntries) - c.cfg.MaxEntriesPerSession
+	if sessionExcess > 0 {
+		directEvictionNeeded = sessionExcess
+	}
+	entriesDelta := len(newEntries) - len(currentView.entries)
+	totalExcess := (c.totalEntries + entriesDelta) - c.cfg.MaxEntriesTotal
+	if totalExcess > directEvictionNeeded {
+		directEvictionNeeded = totalExcess
+	}
+
+	if directEvictionNeeded <= 0 {
+		return nil
+	}
+
+	evictedDirect := 0
+	for k, entry := range newEntries {
+		if entry.decision == Direct {
+			delete(newEntries, k)
+			evictedDirect++
+			if evictedDirect >= directEvictionNeeded {
+				break
+			}
+		}
+	}
+
+	recheckEntriesDelta := len(newEntries) - len(currentView.entries)
+	if len(newEntries) > c.cfg.MaxEntriesPerSession ||
+		(c.totalEntries+recheckEntriesDelta) > c.cfg.MaxEntriesTotal ||
+		(hasIncomingProxy && evictedDirect < directEvictionNeeded) {
+		return s.quarantineSession(currentView, folded)
+	}
+
+	return nil
+}
+
+// Observe records a validated batch of route observations for this session.
+// Validates IP addresses (native public IPv4 only), deadlines, and policy generation.
+// Implements PROXY-wins conflict resolution and capacity overflow quarantine.
+func (s *SessionCache) Observe(policyGeneration string, batch []Observation, now time.Time) error {
+	if policyGeneration == "" {
+		return ErrInvalidGeneration
+	}
+	if len(batch) == 0 {
+		return nil
+	}
+
+	if err := validateBatch(batch, now, s.cache.cfg.MaxTTL); err != nil {
+		return err
+	}
+
+	folded := foldBatch(batch)
 
 	c := s.cache
 	c.mu.Lock()
@@ -315,89 +420,10 @@ func (s *SessionCache) Observe(policyGeneration string, batch []Observation, now
 		}
 	}
 
-	// Apply conflict resolution: PROXY wins.
-	hasIncomingProxy := false
-	for k, obs := range folded {
-		if obs.Decision == Proxy {
-			hasIncomingProxy = true
-		}
-		existing, exists := newEntries[k]
-		if !exists {
-			newEntries[k] = routeEntry{decision: obs.Decision, expiresAt: obs.ExpiresAt}
-			continue
-		}
-		if existing.decision == Direct && obs.Decision == Direct {
-			newEntries[k] = routeEntry{
-				decision:  Direct,
-				expiresAt: maxTime(existing.expiresAt, obs.ExpiresAt),
-			}
-		} else if existing.decision == Direct && obs.Decision == Proxy {
-			// PROXY discards old DIRECT evidence.
-			newEntries[k] = routeEntry{
-				decision:  Proxy,
-				expiresAt: obs.ExpiresAt,
-			}
-		} else if existing.decision == Proxy && obs.Decision == Direct {
-			// Keep existing PROXY and its deadline; ignore DIRECT.
-		} else if existing.decision == Proxy && obs.Decision == Proxy {
-			newEntries[k] = routeEntry{
-				decision:  Proxy,
-				expiresAt: maxTime(existing.expiresAt, obs.ExpiresAt),
-			}
-		}
-	}
+	hasIncomingProxy := mergeConflictResolution(newEntries, folded)
 
-	// Check capacity bounds.
-	directEvictionNeeded := 0
-	sessionExcess := len(newEntries) - c.cfg.MaxEntriesPerSession
-	if sessionExcess > 0 {
-		directEvictionNeeded = sessionExcess
-	}
-	entriesDelta := len(newEntries) - len(currentView.entries)
-	totalExcess := (c.totalEntries + entriesDelta) - c.cfg.MaxEntriesTotal
-	if totalExcess > directEvictionNeeded {
-		directEvictionNeeded = totalExcess
-	}
-
-	// If capacity exceeded, attempt to prune DIRECT entries to make room.
-	if directEvictionNeeded > 0 {
-		evictedDirect := 0
-		for k, entry := range newEntries {
-			if entry.decision == Direct {
-				delete(newEntries, k)
-				evictedDirect++
-				if evictedDirect >= directEvictionNeeded {
-					break
-				}
-			}
-		}
-
-		// Recheck if it now fits without evicting any PROXY.
-		recheckEntriesDelta := len(newEntries) - len(currentView.entries)
-		if len(newEntries) > c.cfg.MaxEntriesPerSession ||
-			(c.totalEntries+recheckEntriesDelta) > c.cfg.MaxEntriesTotal ||
-			(hasIncomingProxy && evictedDirect < directEvictionNeeded) {
-			// Cannot represent all PROXY observations safely -> Quarantine session!
-			unknownUntil := currentView.unknownUntil
-			for _, entry := range currentView.entries {
-				if entry.expiresAt.After(unknownUntil) {
-					unknownUntil = entry.expiresAt
-				}
-			}
-			for _, obs := range folded {
-				if obs.ExpiresAt.After(unknownUntil) {
-					unknownUntil = obs.ExpiresAt
-				}
-			}
-			s.view.Store(&routeView{
-				entries:          make(map[[4]byte]routeEntry),
-				policyGeneration: c.policyGeneration,
-				unknownUntil:     unknownUntil,
-				retired:          false,
-			})
-			c.totalEntries -= len(currentView.entries)
-			return ErrCapacityExceeded
-		}
+	if err := s.checkCapacityAndEvict(currentView, newEntries, folded, hasIncomingProxy); err != nil {
+		return err
 	}
 
 	// Publish new view atomically.

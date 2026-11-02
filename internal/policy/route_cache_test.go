@@ -287,15 +287,15 @@ func TestRouteCache_AddressValidation(t *testing.T) {
 	s, _ := rc.Open(Scope{SessionID: "sess-addr", OwnershipEpoch: 1})
 
 	invalidAddrs := []string{
-		"10.0.0.1",       // Private RFC 1918
-		"192.168.1.1",    // Private RFC 1918
-		"172.16.0.1",     // Private RFC 1918
-		"127.0.0.1",      // Loopback
-		"169.254.169.254", // Link-local / Cloud metadata
-		"100.64.0.1",     // CGNAT
-		"224.0.0.1",      // Multicast
-		"0.0.0.0",        // Unspecified
-		"::1",            // IPv6
+		"10.0.0.1",             // Private RFC 1918
+		"192.168.1.1",          // Private RFC 1918
+		"172.16.0.1",           // Private RFC 1918
+		"127.0.0.1",            // Loopback
+		"169.254.169.254",      // Link-local / Cloud metadata
+		"100.64.0.1",           // CGNAT
+		"224.0.0.1",            // Multicast
+		"0.0.0.0",              // Unspecified
+		"::1",                  // IPv6
 		"2001:4860:4860::8888", // IPv6
 	}
 
