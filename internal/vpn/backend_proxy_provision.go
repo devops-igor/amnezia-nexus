@@ -15,7 +15,7 @@ import (
 // ErrEmptyParams indicates that proxy protocol parameters are missing.
 var ErrEmptyParams = errors.New("protocol parameters cannot be empty")
 
-// ErrMultiProtocolBackendsDisabled indicates that multi-protocol backends are disabled in configuration.
+// Deprecated: Multi-protocol backends are unconditionally active. Retained for package compatibility.
 var ErrMultiProtocolBackendsDisabled = errors.New("multi-protocol backends are disabled")
 
 const (
@@ -28,13 +28,9 @@ const (
 )
 
 // MultiProtocolEnabled reports whether multi-protocol backends are enabled.
+// Multi-protocol backends are unconditionally active out-of-the-box (#661).
 func (s *Service) MultiProtocolEnabled() bool {
-	if s == nil {
-		return false
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.cfg != nil && s.cfg.EnableMultiProtocolBackends
+	return true
 }
 
 // ResolveServerEngineProfile returns the configured engine profile for proto from server metadata,

@@ -22,8 +22,6 @@ import (
 
 // restoreBackendDevices restores data-plane devices for active and degraded tunnels loaded from DB.
 func (s *Service) restoreBackendDevices(ctx context.Context) {
-	multiProto := s.MultiProtocolEnabled()
-
 	for _, tun := range s.pool.ListTunnels() {
 		if !tun.Enabled {
 			continue
@@ -32,9 +30,6 @@ func (s *Service) restoreBackendDevices(ctx context.Context) {
 			continue
 		}
 		proto := models.NormalizeTunnelProtocol(tun.Protocol)
-		if proto != models.ProtocolAWG && !multiProto {
-			continue
-		}
 		var awgParams map[string]any
 		var attachErr error
 		if proto == models.ProtocolAWG {
@@ -104,12 +99,6 @@ func (s *Service) EnableBackendWithConfig(ctx context.Context, serverID int64, o
 		opt = opts[0]
 	}
 
-	if p := models.NormalizeTunnelProtocol(opt.Protocol); p != "" && p != models.ProtocolAWG {
-		if !s.MultiProtocolEnabled() {
-			return ErrMultiProtocolBackendsDisabled
-		}
-	}
-
 	// R2-H1: Before inferring protocol from installed server metadata, check if a backend row
 	// already exists in the database (or in-memory pool) for serverID.
 	var existingTunnel *models.BackendTunnel
@@ -153,10 +142,6 @@ func (s *Service) EnableBackendWithConfig(ctx context.Context, serverID int64, o
 
 	proto := models.NormalizeTunnelProtocol(opt.Protocol)
 	if proto != models.ProtocolAWG {
-		if !s.MultiProtocolEnabled() {
-			return ErrMultiProtocolBackendsDisabled
-		}
-
 		if len(opt.ProtocolParams) == 0 {
 			return fmt.Errorf("protocol parameters required for proxy backend: %w", ErrEmptyParams)
 		}

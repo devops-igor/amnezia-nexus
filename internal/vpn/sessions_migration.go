@@ -138,9 +138,6 @@ func (s *Service) MigrateSession(ctx context.Context, sessionID string, targetTu
 		if sourceProto != targetProto {
 			return fmt.Errorf("cross-protocol migration rejected: source=%s target=%s", sourceProto, targetProto)
 		}
-		if targetProto != models.ProtocolAWG && (s.cfg == nil || !s.cfg.EnableMultiProtocolBackends) {
-			return errors.New("multi-protocol backends are disabled")
-		}
 	}
 
 	// Step 1: Live Forwarder Route Migration

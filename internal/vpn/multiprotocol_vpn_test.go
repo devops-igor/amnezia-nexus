@@ -174,7 +174,7 @@ func TestService_MigrateSession_RejectsCrossProtocol(t *testing.T) {
 	}
 }
 
-func TestService_UpdateConfig_MultiProtocolToggleRunningRejected(t *testing.T) {
+func TestService_UpdateConfig_MultiProtocolToggleRunningAllowed(t *testing.T) {
 	h := models.DegenerateHeaderRange(10)
 	svc := &Service{
 		running: true,
@@ -206,8 +206,8 @@ func TestService_UpdateConfig_MultiProtocolToggleRunningRejected(t *testing.T) {
 	}
 
 	err := svc.UpdateConfig(context.Background(), newCfg)
-	if err == nil || !strings.Contains(err.Error(), "enable_multi_protocol_backends") {
-		t.Fatalf("expected rejection of live multi-protocol toggle, got: %v", err)
+	if err != nil {
+		t.Fatalf("expected live multi-protocol config update to succeed, got: %v", err)
 	}
 }
 
@@ -397,7 +397,7 @@ func TestService_EnableBackendWithConfig_ProxyBootstrapResolvesProtocol_VLESS(t 
 	}
 }
 
-func TestService_EnableBackendWithConfig_MultiProtocolDisabled_Rejected(t *testing.T) {
+func TestService_EnableBackendWithConfig_MultiProtocolSucceedsByDefault(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 	cfg := &models.VPNConfig{
@@ -408,6 +408,14 @@ func TestService_EnableBackendWithConfig_MultiProtocolDisabled_Rejected(t *testi
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
+	t.Cleanup(func() {
+		ts := svc.pool.ListTunnels()
+		for _, tun := range ts {
+			if d := svc.GetBackendDeviceForTest(tun.ID); d != nil {
+				_ = d.Close()
+			}
+		}
+	})
 
 	naiveParams := models.NaiveProxyParams{
 		Domain:   "example.com",
@@ -418,7 +426,7 @@ func TestService_EnableBackendWithConfig_MultiProtocolDisabled_Rejected(t *testi
 	paramsRaw, _ := json.Marshal(naiveParams)
 
 	sid, err := db.CreateServer(ctx, &models.Server{
-		Name:    "proxy-node-disabled",
+		Name:    "proxy-node-default-enabled",
 		Host:    "127.0.0.1",
 		SSHPort: 22,
 		Protocols: map[string]any{
@@ -433,18 +441,18 @@ func TestService_EnableBackendWithConfig_MultiProtocolDisabled_Rejected(t *testi
 		t.Fatalf("CreateServer failed: %v", err)
 	}
 
-	// 1. Explicit proxy options rejected when flag disabled
+	// 1. Explicit proxy options succeed even when legacy flag is false
 	err = svc.EnableBackendWithConfig(ctx, sid, tunnel.BackendTunnelOptions{
 		Protocol:       models.ProtocolNaive,
 		ProtocolParams: paramsRaw,
 	})
-	if !errors.Is(err, ErrMultiProtocolBackendsDisabled) {
-		t.Fatalf("expected ErrMultiProtocolBackendsDisabled with explicit options, got: %v", err)
+	if err != nil {
+		t.Fatalf("expected explicit options to succeed by default, got: %v", err)
 	}
 
-	// 2. Inferred proxy protocol rejected when flag disabled
+	// 2. Inferred proxy protocol succeeds even when legacy flag is false
 	err = svc.EnableBackendWithConfig(ctx, sid)
-	if !errors.Is(err, ErrMultiProtocolBackendsDisabled) {
-		t.Fatalf("expected ErrMultiProtocolBackendsDisabled with inferred options, got: %v", err)
+	if err != nil {
+		t.Fatalf("expected inferred options to succeed by default, got: %v", err)
 	}
 }
