@@ -60,7 +60,7 @@ type Server struct {
 
 	mu          sync.Mutex
 	closing     bool
-	activeConns map[net.Conn]struct{}
+	activeConns map[net.Conn]*ScopeHandle
 }
 
 // NewServer creates a new Server.
@@ -98,7 +98,7 @@ func NewServer(cfg ServerConfig, resolver Resolver, rules PolicySource) (*Server
 		globalSem:   make(chan struct{}, cfg.MaxInflight),
 		sessionSems: make(map[string]chan struct{}),
 		closed:      make(chan struct{}),
-		activeConns: make(map[net.Conn]struct{}),
+		activeConns: make(map[net.Conn]*ScopeHandle),
 	}, nil
 }
 
@@ -323,7 +323,7 @@ func (s *Server) serveTCP(ctx context.Context, scope *ScopeHandle, tcp net.Liste
 			_ = conn.Close()
 			return
 		}
-		s.activeConns[conn] = struct{}{}
+		s.activeConns[conn] = scope
 		s.wg.Add(1)
 		s.mu.Unlock()
 
@@ -346,6 +346,11 @@ func (s *Server) Serve(ctx context.Context, scope *ScopeHandle, udp net.PacketCo
 	s.wg.Add(1)
 	defer s.wg.Done()
 
+	owner := scope
+	if owner == nil {
+		owner = &ScopeHandle{}
+	}
+
 	errCh := make(chan error, 2)
 
 	// Unblock and close listeners on server shutdown or context cancellation.
@@ -361,8 +366,18 @@ func (s *Server) Serve(ctx context.Context, scope *ScopeHandle, udp net.PacketCo
 			_ = tcp.Close()
 		}
 		s.mu.Lock()
-		for c := range s.activeConns {
-			_ = c.Close()
+		closing := s.closing
+		if !closing {
+			select {
+			case <-s.closed:
+				closing = true
+			default:
+			}
+		}
+		for c, sc := range s.activeConns {
+			if closing || sc == owner {
+				_ = c.Close()
+			}
 		}
 		s.mu.Unlock()
 	}()
@@ -374,7 +389,7 @@ func (s *Server) Serve(ctx context.Context, scope *ScopeHandle, udp net.PacketCo
 
 	if tcp != nil {
 		s.wg.Add(1)
-		go s.serveTCP(ctx, scope, tcp, errCh)
+		go s.serveTCP(ctx, owner, tcp, errCh)
 	}
 
 	select {

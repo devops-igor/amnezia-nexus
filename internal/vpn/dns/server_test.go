@@ -353,3 +353,128 @@ func TestServer_ShutdownDrainWithLateConnections(t *testing.T) {
 
 	dialWg.Wait()
 }
+
+func TestServer_ScopeRetirementDoesNotAbortSiblingTCPQueries(t *testing.T) {
+	clientBEntered := make(chan struct{})
+	clientBRelease := make(chan struct{})
+
+	res := &mockResolver{
+		exchange: func(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error) {
+			if len(req.Question) > 0 && req.Question[0].Name == "client-b.example.com." {
+				select {
+				case clientBEntered <- struct{}{}:
+				default:
+				}
+				select {
+				case <-clientBRelease:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			resp := new(mdns.Msg)
+			resp.SetReply(req)
+			resp.Answer = append(resp.Answer, &mdns.A{
+				Hdr: mdns.RR_Header{Name: req.Question[0].Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+				A:   net.ParseIP("93.184.216.34").To4(),
+			})
+			return resp, nil
+		},
+	}
+
+	srv, err := NewServer(ServerConfig{
+		Gateway:      netip.MustParseAddrPort("10.0.0.1:53"),
+		QueryTimeout: 5 * time.Second,
+	}, res, &staticPolicySource{})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	lnA, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen A: %v", err)
+	}
+	defer lnA.Close()
+
+	lnB, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen B: %v", err)
+	}
+	defer lnB.Close()
+
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	scopeA := NewScopeHandle(ctxA, policy.Scope{SessionID: "sess-a", OwnershipEpoch: 1}, nil, nil)
+
+	ctxB, cancelB := context.WithCancel(context.Background())
+	defer cancelB()
+	scopeB := NewScopeHandle(ctxB, policy.Scope{SessionID: "sess-b", OwnershipEpoch: 1}, nil, nil)
+
+	go func() { _ = srv.Serve(scopeA.Context(), scopeA, nil, lnA) }()
+	go func() { _ = srv.Serve(scopeB.Context(), scopeB, nil, lnB) }()
+
+	connA, err := net.Dial("tcp4", lnA.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to dial Client A: %v", err)
+	}
+	defer connA.Close()
+
+	connB, err := net.Dial("tcp4", lnB.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to dial Client B: %v", err)
+	}
+	defer connB.Close()
+
+	reqB := new(mdns.Msg)
+	reqB.SetQuestion("client-b.example.com.", mdns.TypeA)
+	reqB.Id = 4242
+	reqBBytes, _ := reqB.Pack()
+
+	var lenBufB [2]byte
+	binary.BigEndian.PutUint16(lenBufB[:], uint16(len(reqBBytes)))
+	_, _ = connB.Write(lenBufB[:])
+	_, _ = connB.Write(reqBBytes)
+
+	select {
+	case <-clientBEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Client B query to reach resolver entry")
+	}
+
+	// Cancel/retire Client A's scope
+	scopeA.retired.Store(true)
+	scopeA.cancel()
+
+	// Verify Client A's TCP connection is closed upon Scope A cancellation
+	_ = connA.SetReadDeadline(time.Now().Add(1 * time.Second))
+	bufA := make([]byte, 16)
+	if _, errA := connA.Read(bufA); errA == nil {
+		t.Fatalf("expected Client A connection to be closed after Scope A cancellation, got nil error")
+	}
+
+	// Release Client B's query
+	close(clientBRelease)
+
+	// Assert Client B receives framed response without EOF or disconnection
+	_ = connB.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var respLenBuf [2]byte
+	if _, err := io.ReadFull(connB, respLenBuf[:]); err != nil {
+		t.Fatalf("Client B failed to read response length (sibling connection aborted): %v", err)
+	}
+	respLen := binary.BigEndian.Uint16(respLenBuf[:])
+	respPayload := make([]byte, respLen)
+	if _, err := io.ReadFull(connB, respPayload); err != nil {
+		t.Fatalf("Client B failed to read response payload: %v", err)
+	}
+
+	respB := new(mdns.Msg)
+	if err := respB.Unpack(respPayload); err != nil || respB.Id != 4242 || len(respB.Answer) != 1 {
+		t.Fatalf("Client B unpack or validation failed: err=%v, id=%d, ans=%d", err, respB.Id, len(respB.Answer))
+	}
+
+	cancelB()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutdown failed: %v", err)
+	}
+}
