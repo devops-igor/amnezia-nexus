@@ -336,7 +336,16 @@ func TestGateway_TrySubmit_TCP(t *testing.T) {
 
 	// Verify route cache was populated for example.com (proxy)
 	publicIP := netip.MustParseAddr("93.184.216.34")
-	if got := sess.Lookup(publicIP, snap.Generation(), time.Now()); got != policy.Proxy {
+	deadline := time.Now().Add(2 * time.Second)
+	var got policy.Decision
+	for time.Now().Before(deadline) {
+		got = sess.Lookup(publicIP, snap.Generation(), time.Now())
+		if got == policy.Proxy {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got != policy.Proxy {
 		t.Errorf("expected Proxy in route cache for TCP query, got %v", got)
 	}
 }

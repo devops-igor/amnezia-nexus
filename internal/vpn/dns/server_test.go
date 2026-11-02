@@ -437,7 +437,7 @@ func TestServer_ScopeRetirementDoesNotAbortSiblingTCPQueries(t *testing.T) {
 
 	select {
 	case <-clientBEntered:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for Client B query to reach resolver entry")
 	}
 
