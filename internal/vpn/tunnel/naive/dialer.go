@@ -228,6 +228,21 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 
 	conn, err := sd.DialContext(ctx, network, address)
 	if err != nil {
+		if d.params.EnableH3 && d.params.H3Supported && ctx.Err() == nil {
+			d.daemonMu.Lock()
+			if d.daemon != nil {
+				_ = d.daemon.Stop()
+				d.daemon = nil
+				d.socks5Dialer = nil
+			}
+			d.params.H3Supported = false
+			d.daemonMu.Unlock()
+			if fallbackSd, fallbackErr := d.getOrStartDaemon(ctx); fallbackErr == nil {
+				if fbConn, fbErr := fallbackSd.DialContext(ctx, network, address); fbErr == nil {
+					return fbConn, nil
+				}
+			}
+		}
 		d.daemonMu.Lock()
 		d.lastErr = err
 		d.daemonMu.Unlock()

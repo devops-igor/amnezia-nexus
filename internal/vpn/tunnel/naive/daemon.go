@@ -42,7 +42,7 @@ func GenerateConfigJSON(listenPort int, endpoint string, p models.NaiveProxyPara
 	}
 
 	scheme := "https"
-	if p.EnableH3 {
+	if p.EnableH3 && p.H3Supported {
 		scheme = "quic"
 	}
 
@@ -497,6 +497,13 @@ func (d *Daemon) Port() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.port
+}
+
+// SocksAddr returns the local loopback SOCKS5 address the daemon is listening on.
+func (d *Daemon) SocksAddr() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return fmt.Sprintf("127.0.0.1:%d", d.port)
 }
 
 // ConfigPath returns the temporary configuration file path.

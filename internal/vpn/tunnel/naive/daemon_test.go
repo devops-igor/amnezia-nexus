@@ -51,20 +51,36 @@ func TestDaemonConfigGeneration(t *testing.T) {
 		t.Errorf("got host-resolver-rules %q, want %q", cfg.HostResolverRules, expectedRule)
 	}
 
-	// 2. H3 enabled: scheme should be quic
+	// 2a. H3 enabled without explicit H3 support (default / Nexus Caddy H2 backend): scheme must remain https (H2)
 	pH3 := p
 	pH3.EnableH3 = true
-	dataH3, err := GenerateConfigJSON(1081, endpointWithIP, pH3)
+	dataH3H2, err := GenerateConfigJSON(1081, endpointWithIP, pH3)
 	if err != nil {
-		t.Fatalf("GenerateConfigJSON H3: %v", err)
+		t.Fatalf("GenerateConfigJSON H3 on H2 backend: %v", err)
+	}
+	var cfgH3H2 naiveConfigFile
+	if err := json.Unmarshal(dataH3H2, &cfgH3H2); err != nil {
+		t.Fatalf("unmarshal config H3 on H2: %v", err)
+	}
+	expectedProxyH3H2 := "https://alice:secret-password@camouflage.example.com:443"
+	if cfgH3H2.Proxy != expectedProxyH3H2 {
+		t.Errorf("got proxy %q, want %q for H2 backend with EnableH3=true", cfgH3H2.Proxy, expectedProxyH3H2)
+	}
+
+	// 2b. H3 enabled with explicit H3 server capability: scheme should be quic
+	pH3Supported := pH3
+	pH3Supported.H3Supported = true
+	dataH3, err := GenerateConfigJSON(1081, endpointWithIP, pH3Supported)
+	if err != nil {
+		t.Fatalf("GenerateConfigJSON H3 supported: %v", err)
 	}
 	var cfgH3 naiveConfigFile
 	if err := json.Unmarshal(dataH3, &cfgH3); err != nil {
-		t.Fatalf("unmarshal config H3: %v", err)
+		t.Fatalf("unmarshal config H3 supported: %v", err)
 	}
 	expectedProxyH3 := "quic://alice:secret-password@camouflage.example.com:443"
 	if cfgH3.Proxy != expectedProxyH3 {
-		t.Errorf("got proxy %q, want %q", cfgH3.Proxy, expectedProxyH3)
+		t.Errorf("got proxy %q, want %q for H3-supported backend", cfgH3.Proxy, expectedProxyH3)
 	}
 
 	// 3. Endpoint host matches Domain: host-resolver-rules should be empty
@@ -790,5 +806,32 @@ func TestAuditClosedDialerMustNotStartDaemon(t *testing.T) {
 	t.Logf("dial after Close: err=%v active=%v", err, active)
 	if active {
 		t.Fatal("DialContext started a fresh supervised child after Close")
+	}
+}
+
+func TestDaemon_H3Enabled_H2Backend_GeneratesHTTPS(t *testing.T) {
+	// Verifies that for an H2 backend (Nexus Caddy server), EnableH3=true generates https:// proxy URL
+	// so that protocol mismatch (QUIC against an H2 server) does not occur.
+	p := models.NaiveProxyParams{
+		Username:    "nexus-user",
+		Password:    "nexus-pass",
+		Domain:      "caddy.example.com",
+		EnableH3:    true,
+		H3Supported: false, // H2-only listener (default for Nexus Caddy)
+	}
+
+	data, err := GenerateConfigJSON(1085, "198.51.100.10:443", p)
+	if err != nil {
+		t.Fatalf("GenerateConfigJSON failed: %v", err)
+	}
+
+	var cfg naiveConfigFile
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("failed to unmarshal config: %v", err)
+	}
+
+	expectedProxy := "https://nexus-user:nexus-pass@caddy.example.com:443"
+	if cfg.Proxy != expectedProxy {
+		t.Fatalf("expected proxy %q for H2 backend with EnableH3=true, got %q", expectedProxy, cfg.Proxy)
 	}
 }

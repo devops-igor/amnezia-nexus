@@ -758,13 +758,13 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 	case models.ProtocolNaive:
 		if len(prepared) > 0 && prepared[0] != nil {
 			if candDev, ok := prepared[0]["candidate_device"].(BackendDevice); ok && candDev != nil {
-				if expParams, ok := prepared[0]["protocol_params"].([]byte); ok && len(expParams) > 0 {
-					if !models.EqualJSON(tun.ProtocolParams, expParams) {
+				if expTun, ok := prepared[0]["expected_tunnel"].(*models.BackendTunnel); ok && expTun != nil {
+					if !models.SameTunnelIdentity(tun, expTun) {
 						_ = candDev.Close()
 						return fmt.Errorf("%w: naive candidate credentials mismatch current tunnel", ErrStaleCandidate)
 					}
-				} else if expTun, ok := prepared[0]["expected_tunnel"].(*models.BackendTunnel); ok && expTun != nil {
-					if !models.SameTunnelIdentity(tun, expTun) {
+				} else if expParams, ok := prepared[0]["protocol_params"].([]byte); ok && len(expParams) > 0 {
+					if !models.EqualJSON(tun.ProtocolParams, expParams) {
 						_ = candDev.Close()
 						return fmt.Errorf("%w: naive candidate credentials mismatch current tunnel", ErrStaleCandidate)
 					}

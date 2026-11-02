@@ -44,6 +44,38 @@ func ProbeNaiveProxyTunnel(ctx context.Context, tunnel *models.BackendTunnel, ti
 	return probeNaiveProxy(ctx, tunnel.Endpoint, params, timeout)
 }
 
+func resolveProbePort(p models.NaiveProxyParams, target string) int {
+	if p.Port > 0 {
+		return p.Port
+	}
+	if _, portStr, err := net.SplitHostPort(target); err == nil {
+		if parsed, err := strconv.Atoi(portStr); err == nil && parsed > 0 && parsed <= 65535 {
+			return parsed
+		}
+	}
+	return 443
+}
+
+func (d *Dialer) probeViaDaemonWithFallback(ctx context.Context, camTarget string, p models.NaiveProxyParams, sd StreamDialer) (int64, error) {
+	latency, probeErr := d.probeViaDaemon(ctx, camTarget, p, sd)
+	if probeErr != nil && d.params.EnableH3 && d.params.H3Supported && ctx.Err() == nil {
+		d.daemonMu.Lock()
+		if d.daemon != nil {
+			_ = d.daemon.Stop()
+			d.daemon = nil
+			d.socks5Dialer = nil
+		}
+		d.params.H3Supported = false
+		d.daemonMu.Unlock()
+		if fallbackSd, fallbackErr := d.getOrStartDaemon(ctx); fallbackErr == nil {
+			if fbLatency, fbErr := d.probeViaDaemon(ctx, camTarget, d.params, fallbackSd); fbErr == nil {
+				return fbLatency, nil
+			}
+		}
+	}
+	return latency, probeErr
+}
+
 func probeNaiveProxy(ctx context.Context, target string, p models.NaiveProxyParams, timeout time.Duration, opts ...Option) (int64, error) {
 	// Construct dialer outside the timed window so parameter validation
 	// and pool structure allocations do not skew latency metrics.
@@ -62,17 +94,7 @@ func probeNaiveProxy(ctx context.Context, target string, p models.NaiveProxyPara
 		defer cancel()
 	}
 
-	port := p.Port
-	if port <= 0 {
-		if _, portStr, err := net.SplitHostPort(target); err == nil {
-			if parsed, err := strconv.Atoi(portStr); err == nil && parsed > 0 && parsed <= 65535 {
-				port = parsed
-			}
-		}
-	}
-	if port <= 0 {
-		port = 443
-	}
+	port := resolveProbePort(p, target)
 	camTarget := net.JoinHostPort(p.Domain, strconv.Itoa(port))
 
 	// 1. Production policy: If in-process Go transport is not allowed,
@@ -82,7 +104,7 @@ func probeNaiveProxy(ctx context.Context, target string, p models.NaiveProxyPara
 		if err != nil {
 			return 0, fmt.Errorf("naive: probe native daemon required: %w", err)
 		}
-		return d.probeViaDaemon(timeoutCtx, camTarget, p, sd)
+		return d.probeViaDaemonWithFallback(timeoutCtx, camTarget, p, sd)
 	}
 
 	// 2. Test / fallback policy: allowsInProcess() is true (testRootCAs != nil or WithInProcessFallback())

@@ -154,6 +154,7 @@ func (s *Service) prepareNaiveCandidateForTunnel(ctx context.Context, tun *model
 			"candidate_device": candDev,
 			"expected_tunnel":  &tunClone,
 			"protocol_params":  tunClone.ProtocolParams,
+			"endpoint":         tunClone.Endpoint,
 		}, closer, nil
 	}
 	return nil, nil, nil
@@ -196,19 +197,29 @@ func (s *Service) syncBackendForwarderOnHostUpdateLocked(
 	}
 
 	if len(prepared) > 0 && prepared[0] != nil {
-		if expParams, ok := prepared[0]["protocol_params"].([]byte); ok && len(expParams) > 0 {
-			if !models.EqualJSON(currentTun.ProtocolParams, expParams) {
-				if candDev, ok := prepared[0]["candidate_device"].(BackendDevice); ok && candDev != nil {
-					_ = candDev.Close()
-				}
-				return fmt.Errorf("%w: candidate credentials mismatch current tunnel", ErrStaleCandidate)
-			}
-		} else if expTun, ok := prepared[0]["expected_tunnel"].(*models.BackendTunnel); ok && expTun != nil {
+		if expTun, ok := prepared[0]["expected_tunnel"].(*models.BackendTunnel); ok && expTun != nil {
 			if !models.SameTunnelIdentity(currentTun, expTun) {
 				if candDev, ok := prepared[0]["candidate_device"].(BackendDevice); ok && candDev != nil {
 					_ = candDev.Close()
 				}
 				return fmt.Errorf("%w: candidate credentials mismatch current tunnel", ErrStaleCandidate)
+			}
+		} else {
+			if expParams, ok := prepared[0]["protocol_params"].([]byte); ok && len(expParams) > 0 {
+				if !models.EqualJSON(currentTun.ProtocolParams, expParams) {
+					if candDev, ok := prepared[0]["candidate_device"].(BackendDevice); ok && candDev != nil {
+						_ = candDev.Close()
+					}
+					return fmt.Errorf("%w: candidate credentials mismatch current tunnel", ErrStaleCandidate)
+				}
+			}
+			if expEndpoint, ok := prepared[0]["endpoint"].(string); ok && expEndpoint != "" {
+				if currentTun.Endpoint != expEndpoint {
+					if candDev, ok := prepared[0]["candidate_device"].(BackendDevice); ok && candDev != nil {
+						_ = candDev.Close()
+					}
+					return fmt.Errorf("%w: candidate endpoint mismatch current tunnel", ErrStaleCandidate)
+				}
 			}
 		}
 	}

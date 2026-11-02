@@ -313,11 +313,12 @@ type VLESSRealityParams struct {
 
 // NaiveProxyParams holds connection and authentication parameters for NaiveProxy backends.
 type NaiveProxyParams struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Domain   string `json:"domain"`
-	Port     int    `json:"port,omitempty"`
-	EnableH3 bool   `json:"enable_h3"`
+	Username    string `json:"username"`
+	Password    string `json:"password"`
+	Domain      string `json:"domain"`
+	Port        int    `json:"port,omitempty"`
+	EnableH3    bool   `json:"enable_h3"`
+	H3Supported bool   `json:"h3_supported,omitempty"`
 }
 
 // BackendTunnel represents an in-process tunnel to a backend VPN server.
