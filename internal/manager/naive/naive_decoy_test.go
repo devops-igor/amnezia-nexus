@@ -346,6 +346,30 @@ func TestGetDecoyHTML(t *testing.T) {
 			wantTemplate: creativeStudioDecoyHTML,
 		},
 		{
+			name:         "jetpack-dash returns Jetpack Dash template",
+			theme:        DecoyThemeJetpackDash,
+			wantSnippet:  "Jetpack Dash Placeholder",
+			wantTemplate: jetpackDashDecoyHTML,
+		},
+		{
+			name:         "jetpack-dash case-insensitive with whitespace",
+			theme:        "  JETPACK-DASH  ",
+			wantSnippet:  "Jetpack Dash Placeholder",
+			wantTemplate: jetpackDashDecoyHTML,
+		},
+		{
+			name:         "jetpack alias returns Jetpack Dash template",
+			theme:        "jetpack",
+			wantSnippet:  "Jetpack Dash Placeholder",
+			wantTemplate: jetpackDashDecoyHTML,
+		},
+		{
+			name:         "dash alias returns Jetpack Dash template",
+			theme:        "dash",
+			wantSnippet:  "Jetpack Dash Placeholder",
+			wantTemplate: jetpackDashDecoyHTML,
+		},
+		{
 			name:         "minecraft returns Minecraft template",
 			theme:        DecoyThemeMinecraft,
 			wantSnippet:  "VOXELNET",
@@ -444,6 +468,58 @@ func TestInstall_UploadsSelectedDecoyTemplate(t *testing.T) {
 			},
 			wantSnippet:  "Aura Creative Studio",
 			wantTemplate: creativeStudioDecoyHTML,
+		},
+		{
+			name: "jetpack-dash theme via NaiveInstallOptions struct",
+			installParams: map[string]any{
+				"port": 443,
+				"naive_options": models.NaiveInstallOptions{
+					Port:          "443",
+					Domain:        "gaming.example.com",
+					DecoyTemplate: "jetpack-dash",
+				},
+			},
+			wantSnippet:  "Jetpack Dash Placeholder",
+			wantTemplate: jetpackDashDecoyHTML,
+		},
+		{
+			name: "jetpack-dash theme via pointer to NaiveInstallOptions",
+			installParams: map[string]any{
+				"port": 443,
+				"naive_options": &models.NaiveInstallOptions{
+					Port:          "443",
+					Domain:        "gaming-ptr.example.com",
+					DecoyTemplate: "jetpack-dash",
+				},
+			},
+			wantSnippet:  "Jetpack Dash Placeholder",
+			wantTemplate: jetpackDashDecoyHTML,
+		},
+		{
+			name: "jetpack alias via map[string]any options",
+			installParams: map[string]any{
+				"port": 443,
+				"naive_options": map[string]any{
+					"port":           "443",
+					"domain":         "gaming-map.example.com",
+					"decoy_template": "jetpack",
+				},
+			},
+			wantSnippet:  "Jetpack Dash Placeholder",
+			wantTemplate: jetpackDashDecoyHTML,
+		},
+		{
+			name: "dash alias via NaiveInstallOptions struct",
+			installParams: map[string]any{
+				"port": 443,
+				"naive_options": models.NaiveInstallOptions{
+					Port:          "443",
+					Domain:        "gaming-dash.example.com",
+					DecoyTemplate: "dash",
+				},
+			},
+			wantSnippet:  "Jetpack Dash Placeholder",
+			wantTemplate: jetpackDashDecoyHTML,
 		},
 		{
 			name: "minecraft theme explicit",

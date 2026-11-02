@@ -1,0 +1,1116 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Coming Soon — Jetpack Dash Placeholder</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+    <!-- Font Awesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace'],
+                    },
+                    colors: {
+                        brand: {
+                            400: '#38bdf8',
+                            500: '#0ea5e9',
+                            600: '#0284c7',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+
+    <style>
+        /* Custom styling for game canvas and smooth UI elements */
+        body {
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: manipulation;
+            overflow-x: hidden;
+        }
+        
+        .canvas-container {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            max-height: 60vh;
+            min-height: 300px;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            cursor: pointer;
+            touch-action: none;
+        }
+
+        /* Subtle glowing animation for status badge */
+        @keyframes pulse-glow {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(1.08); }
+        }
+        .animate-pulse-glow {
+            animation: pulse-glow 2s infinite ease-in-out;
+        }
+
+        /* Custom button styling */
+        .btn-game {
+            background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%);
+            box-shadow: 0 4px 15px -3px rgba(14, 165, 233, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+            transition: all 0.15s ease;
+        }
+        .btn-game:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px -3px rgba(14, 165, 233, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+        }
+        .btn-game:active {
+            transform: translateY(1px);
+        }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100 font-sans min-h-screen flex flex-col justify-between antialiased selection:bg-sky-500 selection:text-white">
+
+    <!-- Background decorative glow -->
+    <div class="fixed inset-0 overflow-hidden pointer-events-none z-0">
+        <div class="absolute -top-40 left-1/2 -translate-x-1/2 w-[600px] h-[300px] bg-sky-500/10 blur-[120px] rounded-full"></div>
+        <div class="absolute bottom-0 right-10 w-[400px] h-[250px] bg-indigo-500/10 blur-[100px] rounded-full"></div>
+    </div>
+
+    <!-- Header / Coming Soon Banner -->
+    <header class="relative z-10 w-full max-w-5xl mx-auto px-4 sm:px-6 pt-6 pb-2 flex flex-col sm:flex-row items-center justify-between gap-4">
+        <div class="flex items-center gap-3">
+            <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-sky-400 to-blue-600 flex items-center justify-center shadow-lg shadow-sky-500/20">
+                <i class="fa-solid fa-rocket text-white text-lg"></i>
+            </div>
+            <div>
+                <div class="flex items-center gap-2">
+                    <span class="font-bold tracking-tight text-lg text-white">JETPACK <span class="text-sky-400">BOY</span></span>
+                    <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                        <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse-glow"></span>
+                        Under Construction
+                    </span>
+                </div>
+                <p class="text-xs text-slate-400">we are playing games fyi</p>
+            </div>
+        </div>
+
+        <!-- Audio & Quick Stats Bar -->
+        <div class="flex items-center gap-3 bg-slate-900/80 border border-slate-800/80 px-3.5 py-2 rounded-xl backdrop-blur-md">
+            <div class="flex items-center gap-4 text-xs font-mono pr-2 border-r border-slate-800">
+                <div>
+                    <span class="text-slate-500 block text-[10px] uppercase">Score</span>
+                    <span id="ui-score" class="text-white font-bold text-sm">0000</span>
+                </div>
+                <div>
+                    <span class="text-slate-500 block text-[10px] uppercase">Coins</span>
+                    <span id="ui-coins" class="text-amber-400 font-bold text-sm">0</span>
+                </div>
+                <div>
+                    <span class="text-slate-500 block text-[10px] uppercase">Best</span>
+                    <span id="ui-best" class="text-sky-400 font-bold text-sm">0000</span>
+                </div>
+            </div>
+            <button id="btn-mute" class="w-8 h-8 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center transition-colors" title="Toggle Sound">
+                <i id="icon-mute" class="fa-solid fa-volume-high text-xs"></i>
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Content & Game Area -->
+    <main class="relative z-10 flex-1 flex flex-col items-center justify-center w-full max-w-5xl mx-auto px-4 sm:px-6 py-2">
+        
+        <!-- Game Wrapper Card -->
+        <div class="w-full bg-slate-900/90 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden backdrop-blur-sm">
+            
+            <!-- Canvas Container -->
+            <div class="canvas-container" id="game-container">
+                <canvas id="gameCanvas"></canvas>
+
+                <!-- Start Screen Overlay -->
+                <div id="overlay-start" class="absolute inset-0 bg-slate-950/80 backdrop-blur-sm flex flex-col items-center justify-center p-6 text-center transition-opacity duration-200">
+                    <div class="w-16 h-16 rounded-2xl bg-sky-500/10 border border-sky-500/30 flex items-center justify-center mb-4 text-sky-400 shadow-inner">
+                        <i class="fa-solid fa-jet-fighter-up text-3xl"></i>
+                    </div>
+                    <h1 class="text-2xl sm:text-4xl font-extrabold tracking-tight text-white mb-2">
+                        JETPACK <span class="text-transparent bg-clip-text bg-gradient-to-r from-sky-400 to-indigo-400">JOYDASH</span>
+                    </h1>
+                    <p class="text-slate-400 text-sm max-w-md mb-6">
+                        Hold <kbd class="px-2 py-0.5 text-xs font-mono bg-slate-800 text-slate-200 rounded border border-slate-700">SPACE</kbd>, <kbd class="px-2 py-0.5 text-xs font-mono bg-slate-800 text-slate-200 rounded border border-slate-700">↑</kbd>, or <span class="text-sky-400 font-medium">Touch & Hold</span> anywhere to fire your jetpack. Dodge laser barriers and collect coins!
+                    </p>
+                    <button id="btn-start" class="btn-game px-8 py-3.5 rounded-xl font-bold text-white tracking-wide flex items-center gap-2.5 text-base">
+                        <i class="fa-solid fa-play text-sm"></i>
+                        LAUNCH JETPACK
+                    </button>
+                </div>
+
+                <!-- Game Over Overlay -->
+                <div id="overlay-gameover" class="hidden absolute inset-0 bg-slate-950/85 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center transition-opacity duration-200">
+                    <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs font-bold uppercase tracking-wider mb-2">
+                        <i class="fa-solid fa-bolt"></i> System Zapped
+                    </div>
+                    <h2 class="text-2xl sm:text-3xl font-extrabold text-white mb-4">MISSION TERMINATED</h2>
+                    
+                    <!-- Score Card -->
+                    <div class="grid grid-cols-3 gap-3 w-full max-w-xs bg-slate-900/90 border border-slate-800 p-3.5 rounded-xl mb-6 font-mono">
+                        <div class="flex flex-col">
+                            <span class="text-[10px] text-slate-400 uppercase">Distance</span>
+                            <span id="final-score" class="text-lg font-bold text-white">0m</span>
+                        </div>
+                        <div class="flex flex-col border-x border-slate-800">
+                            <span class="text-[10px] text-slate-400 uppercase">Coins</span>
+                            <span id="final-coins" class="text-lg font-bold text-amber-400">+0</span>
+                        </div>
+                        <div class="flex flex-col">
+                            <span class="text-[10px] text-slate-400 uppercase">Best</span>
+                            <span id="final-best" class="text-lg font-bold text-sky-400">0m</span>
+                        </div>
+                    </div>
+
+                    <div class="flex items-center gap-3">
+                        <button id="btn-restart" class="btn-game px-7 py-3 rounded-xl font-bold text-white tracking-wide flex items-center gap-2 text-sm sm:text-base">
+                            <i class="fa-solid fa-rotate-right"></i>
+                            FLY AGAIN
+                        </button>
+                    </div>
+                    <span class="text-[11px] text-slate-500 mt-3">Press <kbd class="font-mono text-slate-400">SPACE</kbd> or tap button to quick restart</span>
+                </div>
+            </div>
+
+            <!-- Controls Bar Below Canvas -->
+            <div class="bg-slate-900 border-t border-slate-800/80 px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
+                <div class="flex items-center gap-4">
+                    <span class="flex items-center gap-1.5">
+                        <i class="fa-solid fa-fire-flame-curved text-orange-400"></i>
+                        <span><strong class="text-slate-200">Hold</strong> to Thrust Up</span>
+                    </span>
+                    <span class="hidden sm:flex items-center gap-1.5">
+                        <i class="fa-solid fa-arrow-down text-sky-400"></i>
+                        <span><strong class="text-slate-200">Release</strong> to Fall</span>
+                    </span>
+                </div>
+
+                <!-- External Thrust Button for Mobile / Mouse convenience -->
+                <div class="flex items-center gap-2 w-full sm:w-auto justify-end">
+                    <button id="btn-thrust-control" class="w-full sm:w-auto px-5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 active:bg-sky-600 text-slate-200 active:text-white font-semibold border border-slate-700 transition-colors flex items-center justify-center gap-2 select-none">
+                        <i class="fa-solid fa-angles-up text-sky-400"></i>
+                        <span>HOLD TO THRUST</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Minimal Footer / Notify Form -->
+    <footer class="relative z-10 w-full max-w-5xl mx-auto px-4 sm:px-6 py-4 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500">
+        <p>© 2026 Jetpack Boy. Our full platform launches soon.</p>
+        
+        <!-- Simple interactive email notify mock -->
+        <form id="notify-form" class="flex items-center gap-2 w-full sm:w-auto">
+            <input 
+                type="email" 
+                id="notify-email"
+                placeholder="Enter email for launch updates..." 
+                required
+                class="bg-slate-900 border border-slate-800 focus:border-sky-500 focus:outline-none text-slate-200 px-3 py-1.5 rounded-lg text-xs w-full sm:w-56 transition-colors"
+            >
+            <button type="submit" class="bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium px-3.5 py-1.5 rounded-lg border border-slate-700 transition-colors whitespace-nowrap">
+                Notify Me
+            </button>
+        </form>
+    </footer>
+
+    <!-- Toast Notification for Email Signup -->
+    <div id="toast" class="fixed bottom-5 right-5 z-50 pointer-events-none opacity-0 translate-y-2 transition-all duration-300 bg-slate-900 border border-emerald-500/40 text-emerald-400 px-4 py-2.5 rounded-xl shadow-xl flex items-center gap-2.5 text-xs font-medium">
+        <i class="fa-solid fa-circle-check text-sm"></i>
+        <span id="toast-msg">You're on the list! We'll let you know when we launch.</span>
+    </div>
+
+    <!-- Game Engine & Audio Logic -->
+    <script>
+        /**
+         * SIMPLE WEB AUDIO SYNTHESIZER
+         * Generates retro sound effects without external audio files
+         */
+        class SoundController {
+            constructor() {
+                this.ctx = null;
+                this.muted = false;
+                this.lastThrustTime = 0;
+            }
+
+            init() {
+                if (!this.ctx) {
+                    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                    if (AudioCtx) this.ctx = new AudioCtx();
+                }
+                if (this.ctx && this.ctx.state === 'suspended') {
+                    this.ctx.resume();
+                }
+            }
+
+            toggleMute() {
+                this.muted = !this.muted;
+                return this.muted;
+            }
+
+            playCoin() {
+                if (this.muted || !this.ctx) return;
+                try {
+                    const now = this.ctx.currentTime;
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(987.77, now); // B5
+                    osc.frequency.setValueAtTime(1318.51, now + 0.07); // E6
+                    gain.gain.setValueAtTime(0.12, now);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start(now);
+                    osc.stop(now + 0.25);
+                } catch (e) {}
+            }
+
+            playThrust() {
+                if (this.muted || !this.ctx) return;
+                const now = this.ctx.currentTime;
+                if (now - this.lastThrustTime < 0.06) return;
+                this.lastThrustTime = now;
+
+                try {
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'triangle';
+                    osc.frequency.setValueAtTime(110 + Math.random() * 40, now);
+                    osc.frequency.exponentialRampToValueAtTime(55, now + 0.06);
+                    gain.gain.setValueAtTime(0.05, now);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.06);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start(now);
+                    osc.stop(now + 0.06);
+                } catch (e) {}
+            }
+
+            playCrash() {
+                if (this.muted || !this.ctx) return;
+                try {
+                    const now = this.ctx.currentTime;
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'sawtooth';
+                    osc.frequency.setValueAtTime(220, now);
+                    osc.frequency.exponentialRampToValueAtTime(40, now + 0.35);
+                    gain.gain.setValueAtTime(0.18, now);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start(now);
+                    osc.stop(now + 0.35);
+                } catch (e) {}
+            }
+        }
+
+        /**
+         * MAIN JETPACK JOYDASH GAME
+         */
+        window.onload = function () {
+            const canvas = document.getElementById('gameCanvas');
+            const ctx = canvas.getContext('2d');
+            const sound = new SoundController();
+
+            // UI Elements
+            const uiScore = document.getElementById('ui-score');
+            const uiCoins = document.getElementById('ui-coins');
+            const uiBest = document.getElementById('ui-best');
+            const finalScore = document.getElementById('final-score');
+            const finalCoins = document.getElementById('final-coins');
+            const finalBest = document.getElementById('final-best');
+            const overlayStart = document.getElementById('overlay-start');
+            const overlayGameOver = document.getElementById('overlay-gameover');
+            const btnStart = document.getElementById('btn-start');
+            const btnRestart = document.getElementById('btn-restart');
+            const btnMute = document.getElementById('btn-mute');
+            const iconMute = document.getElementById('icon-mute');
+            const btnThrustControl = document.getElementById('btn-thrust-control');
+
+            // Virtual Coordinate System (16:9 internal logic scaled to canvas)
+            const V_WIDTH = 960;
+            const V_HEIGHT = 540;
+            const CEILING_Y = 55;
+            const FLOOR_Y = 475;
+
+            // Persistent High Score
+            let highScore = 0;
+            try {
+                highScore = parseInt(localStorage.getItem('jetpack_joydash_best') || '0', 10);
+            } catch (e) {
+                highScore = 0;
+            }
+            uiBest.textContent = String(highScore).padStart(4, '0');
+
+            // Game State Variables
+            let gameState = 'START'; // 'START', 'PLAYING', 'GAMEOVER'
+            let isThrusting = false;
+            let distance = 0;
+            let coinsCollected = 0;
+            let gameSpeed = 360; // pixels per second
+            let bgOffset = 0;
+            let screenShake = 0;
+            let lastTime = performance.now();
+
+            // Player Object
+            const player = {
+                x: 150,
+                y: FLOOR_Y - 46,
+                width: 38,
+                height: 46,
+                vy: 0,
+                gravity: 1450,
+                thrustAccel: -2950,
+                maxFallSpeed: 650,
+                maxRiseSpeed: -560,
+                rotation: 0,
+                legPhase: 0,
+                reset() {
+                    this.y = FLOOR_Y - this.height;
+                    this.vy = 0;
+                    this.rotation = 0;
+                    this.legPhase = 0;
+                }
+            };
+
+            // Entities Arrays
+            let obstacles = [];
+            let coins = [];
+            let particles = [];
+            let bgPillars = [];
+
+            // Initialize background pillars
+            for (let i = 0; i < 7; i++) {
+                bgPillars.push({
+                    x: i * 180,
+                    w: 45,
+                    lightColor: i % 2 === 0 ? '#0ea5e9' : '#6366f1'
+                });
+            }
+
+            // Spawn Timers
+            let obstacleTimer = 1.0;
+            let coinTimer = 1.5;
+
+            // Responsive Canvas Resizing
+            function resizeCanvas() {
+                const container = document.getElementById('game-container');
+                const rect = container.getBoundingClientRect();
+                const dpr = window.devicePixelRatio || 1;
+                canvas.width = rect.width * dpr;
+                canvas.height = rect.height * dpr;
+            }
+            window.addEventListener('resize', resizeCanvas);
+            resizeCanvas();
+
+            /**
+             * GAME RESET & START
+             */
+            function startGame() {
+                sound.init();
+                player.reset();
+                obstacles = [];
+                coins = [];
+                particles = [];
+                distance = 0;
+                coinsCollected = 0;
+                gameSpeed = 370;
+                obstacleTimer = 0.8;
+                coinTimer = 1.4;
+                screenShake = 0;
+                gameState = 'PLAYING';
+
+                overlayStart.classList.add('hidden');
+                overlayGameOver.classList.add('hidden');
+                updateScoreUI();
+            }
+
+            function triggerGameOver() {
+                gameState = 'GAMEOVER';
+                isThrusting = false;
+                screenShake = 14;
+                sound.playCrash();
+
+                // Explosion burst around player
+                for (let i = 0; i < 35; i++) {
+                    const angle = Math.random() * Math.PI * 2;
+                    const speed = 60 + Math.random() * 320;
+                    particles.push({
+                        x: player.x + player.width / 2,
+                        y: player.y + player.height / 2,
+                        vx: Math.cos(angle) * speed,
+                        vy: Math.sin(angle) * speed,
+                        size: 4 + Math.random() * 6,
+                        life: 1,
+                        decay: 1.2 + Math.random() * 1.2,
+                        color: Math.random() > 0.4 ? '#f43f5e' : '#fbbf24'
+                    });
+                }
+
+                const totalScore = Math.floor(distance) + coinsCollected * 10;
+                if (totalScore > highScore) {
+                    highScore = totalScore;
+                    try {
+                        localStorage.setItem('jetpack_joydash_best', String(highScore));
+                    } catch (e) {}
+                }
+
+                updateScoreUI();
+                finalScore.textContent = `${Math.floor(distance)}m`;
+                finalCoins.textContent = `+${coinsCollected}`;
+                finalBest.textContent = `${highScore}`;
+                overlayGameOver.classList.remove('hidden');
+            }
+
+            function updateScoreUI() {
+                const totalScore = Math.floor(distance) + coinsCollected * 10;
+                uiScore.textContent = String(totalScore).padStart(4, '0');
+                uiCoins.textContent = String(coinsCollected);
+                uiBest.textContent = String(highScore).padStart(4, '0');
+            }
+
+            /**
+             * SPAWNERS
+             */
+            function spawnObstacle() {
+                // Choose between vertical laser zappers, horizontal zappers, or moving drones
+                const rand = Math.random();
+                if (rand < 0.72) {
+                    // Laser Zapper
+                    const isHorizontal = Math.random() < 0.35;
+                    const w = isHorizontal ? 135 : 26;
+                    const h = isHorizontal ? 26 : 125 + Math.random() * 45;
+                    const minY = CEILING_Y + 20;
+                    const maxY = FLOOR_Y - h - 20;
+                    const y = minY + Math.random() * (maxY - minY);
+
+                    obstacles.push({
+                        type: 'zapper',
+                        x: V_WIDTH + 60,
+                        y: y,
+                        w: w,
+                        h: h,
+                        pulse: Math.random() * Math.PI * 2
+                    });
+                } else {
+                    // Hovering Warning Drone/Missile
+                    const size = 34;
+                    const y = CEILING_Y + 40 + Math.random() * (FLOOR_Y - CEILING_Y - 100);
+                    obstacles.push({
+                        type: 'drone',
+                        x: V_WIDTH + 80,
+                        y: y,
+                        baseY: y,
+                        w: size,
+                        h: size,
+                        speedMult: 1.28,
+                        phase: Math.random() * Math.PI * 2
+                    });
+                }
+            }
+
+            function spawnCoinPattern() {
+                const pattern = Math.floor(Math.random() * 3);
+                const startX = V_WIDTH + 60;
+                const centerY = CEILING_Y + 95 + Math.random() * (FLOOR_Y - CEILING_Y - 190);
+                const spacing = 36;
+
+                if (pattern === 0) {
+                    // Sine Wave Arc
+                    for (let i = 0; i < 7; i++) {
+                        coins.push({
+                            x: startX + i * spacing,
+                            y: centerY + Math.sin(i * 0.65) * 45,
+                            r: 12,
+                            collected: false,
+                            bobPhase: i * 0.4
+                        });
+                    }
+                } else if (pattern === 1) {
+                    // 2x4 Grid Block
+                    for (let row = 0; row < 2; row++) {
+                        for (let col = 0; col < 4; col++) {
+                            coins.push({
+                                x: startX + col * spacing,
+                                y: centerY + (row - 0.5) * 36,
+                                r: 12,
+                                collected: false,
+                                bobPhase: col * 0.3
+                            });
+                        }
+                    }
+                } else {
+                    // Diagonal Streak
+                    const dir = Math.random() > 0.5 ? 1 : -1;
+                    for (let i = 0; i < 5; i++) {
+                        const cy = Math.max(CEILING_Y + 35, Math.min(FLOOR_Y - 35, centerY + (i - 2) * 26 * dir));
+                        coins.push({
+                            x: startX + i * spacing,
+                            y: cy,
+                            r: 12,
+                            collected: false,
+                            bobPhase: i * 0.5
+                        });
+                    }
+                }
+            }
+
+            /**
+             * UPDATE LOOP
+             */
+            function update(dt) {
+                if (screenShake > 0) {
+                    screenShake = Math.max(0, screenShake - dt * 35);
+                }
+
+                // Update particles even on gameover for explosion effect
+                for (let i = particles.length - 1; i >= 0; i--) {
+                    const p = particles[i];
+                    p.x += p.vx * dt;
+                    p.y += p.vy * dt;
+                    p.life -= p.decay * dt;
+                    if (p.life <= 0) {
+                        particles.splice(i, 1);
+                    }
+                }
+
+                if (gameState !== 'PLAYING') return;
+
+                // Speed progression
+                gameSpeed = Math.min(720, gameSpeed + dt * 9.5);
+                distance += (gameSpeed * dt) / 28;
+                bgOffset = (bgOffset + gameSpeed * 0.4 * dt) % 60;
+
+                // Background parallax pillars
+                for (let pillar of bgPillars) {
+                    pillar.x -= gameSpeed * 0.35 * dt;
+                    if (pillar.x + pillar.w < 0) {
+                        pillar.x += bgPillars.length * 180;
+                    }
+                }
+
+                // Player Physics
+                if (isThrusting) {
+                    player.vy += player.thrustAccel * dt;
+                    sound.playThrust();
+
+                    // Spawn Jetpack Flame Particles
+                    for (let i = 0; i < 2; i++) {
+                        particles.push({
+                            x: player.x + 4 + (Math.random() * 6 - 3),
+                            y: player.y + player.height - 6,
+                            vx: -gameSpeed * 0.4 + (Math.random() * 80 - 40),
+                            vy: 180 + Math.random() * 160,
+                            size: 5 + Math.random() * 5,
+                            life: 1,
+                            decay: 3.5 + Math.random() * 2,
+                            color: Math.random() > 0.45 ? '#fb923c' : '#fde047'
+                        });
+                    }
+                } else {
+                    player.vy += player.gravity * dt;
+                }
+
+                player.vy = Math.max(player.maxRiseSpeed, Math.min(player.maxFallSpeed, player.vy));
+                player.y += player.vy * dt;
+
+                // Floor & Ceiling Constraints
+                const onFloor = player.y >= FLOOR_Y - player.height;
+                if (onFloor) {
+                    player.y = FLOOR_Y - player.height;
+                    player.vy = 0;
+                    player.legPhase += dt * (gameSpeed * 0.045);
+                } else if (player.y <= CEILING_Y) {
+                    player.y = CEILING_Y;
+                    player.vy = 0;
+                }
+
+                // Slight tilt based on vertical velocity
+                const targetRot = onFloor ? 0 : Math.max(-0.25, Math.min(0.28, player.vy * 0.0005 + (isThrusting ? 0.12 : 0)));
+                player.rotation += (targetRot - player.rotation) * 12 * dt;
+
+                // Spawn Obstacles
+                obstacleTimer -= dt;
+                if (obstacleTimer <= 0) {
+                    spawnObstacle();
+                    const minGap = Math.max(0.65, 1.55 - (gameSpeed - 360) / 500);
+                    obstacleTimer = minGap + Math.random() * 0.65;
+                }
+
+                // Spawn Coins
+                coinTimer -= dt;
+                if (coinTimer <= 0) {
+                    spawnCoinPattern();
+                    coinTimer = 1.8 + Math.random() * 1.4;
+                }
+
+                // Update & Check Obstacles
+                const hitPadding = 6; // Forgiving hitbox padding
+                const px = player.x + hitPadding;
+                const py = player.y + hitPadding;
+                const pw = player.width - hitPadding * 2;
+                const ph = player.height - hitPadding * 2;
+
+                for (let i = obstacles.length - 1; i >= 0; i--) {
+                    const obs = obstacles[i];
+                    const speedMultiplier = obs.speedMult || 1;
+                    obs.x -= gameSpeed * speedMultiplier * dt;
+
+                    if (obs.type === 'zapper') {
+                        obs.pulse += dt * 10;
+                    } else if (obs.type === 'drone') {
+                        obs.phase += dt * 5;
+                        obs.y = obs.baseY + Math.sin(obs.phase) * 28;
+                        // Drone exhaust trail
+                        if (Math.random() < 0.5) {
+                            particles.push({
+                                x: obs.x + obs.w,
+                                y: obs.y + obs.h / 2,
+                                vx: 40,
+                                vy: (Math.random() - 0.5) * 30,
+                                size: 4,
+                                life: 0.7,
+                                decay: 3,
+                                color: '#f43f5e'
+                            });
+                        }
+                    }
+
+                    // AABB Collision Check
+                    if (
+                        px < obs.x + obs.w - 4 &&
+                        px + pw > obs.x + 4 &&
+                        py < obs.y + obs.h - 4 &&
+                        py + ph > obs.y + 4
+                    ) {
+                        triggerGameOver();
+                        return;
+                    }
+
+                    if (obs.x + obs.w < -100) {
+                        obstacles.splice(i, 1);
+                    }
+                }
+
+                // Update & Check Coins
+                const playerCenterX = player.x + player.width / 2;
+                const playerCenterY = player.y + player.height / 2;
+
+                for (let i = coins.length - 1; i >= 0; i--) {
+                    const c = coins[i];
+                    c.x -= gameSpeed * dt;
+                    c.bobPhase += dt * 4;
+
+                    const dx = playerCenterX - c.x;
+                    const dy = playerCenterY - c.y;
+                    const dist = Math.hypot(dx, dy);
+
+                    if (dist < c.r + 22) {
+                        coinsCollected++;
+                        sound.playCoin();
+
+                        // Sparkle particles on coin pickup
+                        for (let k = 0; k < 7; k++) {
+                            const angle = Math.random() * Math.PI * 2;
+                            particles.push({
+                                x: c.x,
+                                y: c.y,
+                                vx: Math.cos(angle) * 90,
+                                vy: Math.sin(angle) * 90,
+                                size: 3.5,
+                                life: 0.8,
+                                decay: 2.8,
+                                color: '#fde047'
+                            });
+                        }
+                        coins.splice(i, 1);
+                        continue;
+                    }
+
+                    if (c.x + c.r < -50) {
+                        coins.splice(i, 1);
+                    }
+                }
+
+                updateScoreUI();
+            }
+
+            /**
+             * RENDER LOOP
+             */
+            function draw() {
+                ctx.save();
+
+                // Scale virtual 960x540 space to actual canvas pixel size
+                const scaleX = canvas.width / V_WIDTH;
+                const scaleY = canvas.height / V_HEIGHT;
+                ctx.scale(scaleX, scaleY);
+
+                // Apply screen shake if active
+                if (screenShake > 0) {
+                    const sx = (Math.random() - 0.5) * screenShake;
+                    const sy = (Math.random() - 0.5) * screenShake;
+                    ctx.translate(sx, sy);
+                }
+
+                // 1. Background Base
+                ctx.fillStyle = '#090d16';
+                ctx.fillRect(0, 0, V_WIDTH, V_HEIGHT);
+
+                // 2. Subtle Grid Lines
+                ctx.strokeStyle = 'rgba(30, 41, 59, 0.45)';
+                ctx.lineWidth = 1;
+                for (let x = -bgOffset; x < V_WIDTH; x += 60) {
+                    ctx.beginPath();
+                    ctx.moveTo(x, CEILING_Y);
+                    ctx.lineTo(x, FLOOR_Y);
+                    ctx.stroke();
+                }
+                for (let y = CEILING_Y + 60; y < FLOOR_Y; y += 60) {
+                    ctx.beginPath();
+                    ctx.moveTo(0, y);
+                    ctx.lineTo(V_WIDTH, y);
+                    ctx.stroke();
+                }
+
+                // 3. Lab Pillars (Parallax Background)
+                for (let pillar of bgPillars) {
+                    ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+                    ctx.fillRect(pillar.x, CEILING_Y, pillar.w, FLOOR_Y - CEILING_Y);
+                    
+                    // Neon vertical strip inside pillar
+                    ctx.fillStyle = pillar.lightColor;
+                    ctx.globalAlpha = 0.25;
+                    ctx.fillRect(pillar.x + pillar.w / 2 - 2, CEILING_Y + 25, 4, FLOOR_Y - CEILING_Y - 50);
+                    ctx.globalAlpha = 1.0;
+                }
+
+                // 4. Ceiling & Floor Industrial Tracks
+                ctx.fillStyle = '#0f172a';
+                ctx.fillRect(0, 0, V_WIDTH, CEILING_Y);
+                ctx.fillRect(0, FLOOR_Y, V_WIDTH, V_HEIGHT - FLOOR_Y);
+
+                // Glowing Floor/Ceiling Rails
+                ctx.strokeStyle = '#0ea5e9';
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.moveTo(0, CEILING_Y);
+                ctx.lineTo(V_WIDTH, CEILING_Y);
+                ctx.moveTo(0, FLOOR_Y);
+                ctx.lineTo(V_WIDTH, FLOOR_Y);
+                ctx.stroke();
+
+                // 5. Draw Coins
+                for (let c of coins) {
+                    const bobY = c.y + Math.sin(c.bobPhase) * 3;
+                    
+                    // Outer Glow
+                    ctx.beginPath();
+                    ctx.arc(c.x, bobY, c.r + 3, 0, Math.PI * 2);
+                    ctx.fillStyle = 'rgba(251, 191, 36, 0.2)';
+                    ctx.fill();
+
+                    // Gold Coin Body
+                    ctx.beginPath();
+                    ctx.arc(c.x, bobY, c.r, 0, Math.PI * 2);
+                    ctx.fillStyle = '#f59e0b';
+                    ctx.fill();
+                    ctx.lineWidth = 2;
+                    ctx.strokeStyle = '#fef08a';
+                    ctx.stroke();
+
+                    // Inner Shine
+                    ctx.fillStyle = '#fef08a';
+                    ctx.fillRect(c.x - 2, bobY - 5, 4, 10);
+                }
+
+                // 6. Draw Obstacles
+                for (let obs of obstacles) {
+                    if (obs.type === 'zapper') {
+                        const cx = obs.x + obs.w / 2;
+                        const cy = obs.y + obs.h / 2;
+                        const isHoriz = obs.w > obs.h;
+
+                        // Outer Plasma Glow
+                        ctx.save();
+                        ctx.shadowColor = '#f43f5e';
+                        ctx.shadowBlur = 15 + Math.sin(obs.pulse) * 5;
+
+                        // Laser Beam Core
+                        ctx.fillStyle = '#fb7185';
+                        if (isHoriz) {
+                            ctx.fillRect(obs.x + 10, cy - 5, obs.w - 20, 10);
+                            ctx.fillStyle = '#fff';
+                            ctx.fillRect(obs.x + 10, cy - 2, obs.w - 20, 4);
+                        } else {
+                            ctx.fillRect(cx - 5, obs.y + 10, 10, obs.h - 20);
+                            ctx.fillStyle = '#fff';
+                            ctx.fillRect(cx - 2, obs.y + 10, 4, obs.h - 20);
+                        }
+                        ctx.restore();
+
+                        // Emitter Nodes at Both Ends
+                        ctx.fillStyle = '#334155';
+                        ctx.strokeStyle = '#f43f5e';
+                        ctx.lineWidth = 2;
+                        if (isHoriz) {
+                            ctx.beginPath();
+                            ctx.roundRect(obs.x, obs.y, 16, obs.h, 5);
+                            ctx.roundRect(obs.x + obs.w - 16, obs.y, 16, obs.h, 5);
+                            ctx.fill();
+                            ctx.stroke();
+                        } else {
+                            ctx.beginPath();
+                            ctx.roundRect(obs.x, obs.y, obs.w, 16, 5);
+                            ctx.roundRect(obs.x, obs.y + obs.h - 16, obs.w, 16, 5);
+                            ctx.fill();
+                            ctx.stroke();
+                        }
+                    } else if (obs.type === 'drone') {
+                        ctx.save();
+                        ctx.translate(obs.x + obs.w / 2, obs.y + obs.h / 2);
+
+                        // Warning Glow
+                        ctx.beginPath();
+                        ctx.arc(0, 0, obs.w / 2 + 5, 0, Math.PI * 2);
+                        ctx.fillStyle = 'rgba(244, 63, 94, 0.25)';
+                        ctx.fill();
+
+                        // Drone Body
+                        ctx.beginPath();
+                        ctx.arc(0, 0, obs.w / 2, 0, Math.PI * 2);
+                        ctx.fillStyle = '#1e293b';
+                        ctx.fill();
+                        ctx.lineWidth = 2.5;
+                        ctx.strokeStyle = '#f43f5e';
+                        ctx.stroke();
+
+                        // Red Eye
+                        ctx.beginPath();
+                        ctx.arc(-4, 0, 5, 0, Math.PI * 2);
+                        ctx.fillStyle = '#f43f5e';
+                        ctx.fill();
+
+                        ctx.restore();
+                    }
+                }
+
+                // 7. Draw Particles
+                for (let p of particles) {
+                    ctx.globalAlpha = Math.max(0, p.life);
+                    ctx.fillStyle = p.color;
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+                ctx.globalAlpha = 1.0;
+
+                // 8. Draw Player (Astronaut with Jetpack)
+                if (gameState !== 'GAMEOVER') {
+                    ctx.save();
+                    ctx.translate(player.x + player.width / 2, player.y + player.height / 2);
+                    ctx.rotate(player.rotation);
+
+                    const w = player.width;
+                    const h = player.height;
+
+                    // Jetpack Tank on Back
+                    ctx.fillStyle = '#64748b';
+                    ctx.beginPath();
+                    ctx.roundRect(-w / 2 - 7, -h / 2 + 10, 10, 24, 4);
+                    ctx.fill();
+
+                    // Jetpack Nozzle
+                    ctx.fillStyle = '#f97316';
+                    ctx.fillRect(-w / 2 - 5, -h / 2 + 34, 6, 4);
+
+                    // Animated Legs
+                    ctx.strokeStyle = '#38bdf8';
+                    ctx.lineWidth = 5;
+                    ctx.lineCap = 'round';
+                    const onGround = player.y >= FLOOR_Y - player.height - 1;
+                    const legSwing = onGround ? Math.sin(player.legPhase) * 7 : -4;
+
+                    ctx.beginPath();
+                    ctx.moveTo(-4, h / 2 - 10);
+                    ctx.lineTo(-4 + legSwing, h / 2);
+                    ctx.moveTo(4, h / 2 - 10);
+                    ctx.lineTo(4 - legSwing, h / 2);
+                    ctx.stroke();
+
+                    // Suit Torso
+                    ctx.fillStyle = '#0ea5e9';
+                    ctx.beginPath();
+                    ctx.roundRect(-w / 2 + 2, -h / 2 + 12, w - 6, h - 20, 7);
+                    ctx.fill();
+
+                    // Helmet
+                    ctx.fillStyle = '#f8fafc';
+                    ctx.beginPath();
+                    ctx.roundRect(-w / 2 + 1, -h / 2, w - 4, 20, 8);
+                    ctx.fill();
+
+                    // Visor
+                    ctx.fillStyle = '#0284c7';
+                    ctx.beginPath();
+                    ctx.roundRect(0, -h / 2 + 4, w / 2 - 3, 11, 4);
+                    ctx.fill();
+
+                    // Visor Glint
+                    ctx.fillStyle = '#bae6fd';
+                    ctx.fillRect(4, -h / 2 + 6, 6, 2);
+
+                    ctx.restore();
+                }
+
+                // 9. In-Canvas Distance HUD (Top Left)
+                ctx.fillStyle = 'rgba(15, 23, 42, 0.75)';
+                ctx.beginPath();
+                ctx.roundRect(18, 12, 145, 32, 8);
+                ctx.fill();
+
+                ctx.font = '700 14px "JetBrains Mono", monospace';
+                ctx.fillStyle = '#38bdf8';
+                ctx.fillText(`DIST: ${Math.floor(distance)}m`, 30, 33);
+
+                ctx.restore();
+            }
+
+            /**
+             * MAIN ANIMATION LOOP
+             */
+            function gameLoop(now) {
+                const dt = Math.min(0.05, (now - lastTime) / 1000);
+                lastTime = now;
+
+                update(dt);
+                draw();
+
+                requestAnimationFrame(gameLoop);
+            }
+
+            /**
+             * INPUT HANDLERS (Keyboard, Mouse, Touch)
+             */
+            function handleThrustStart(e) {
+                // Ignore clicks on buttons or form inputs
+                if (e && e.target && (e.target.closest('button') || e.target.closest('input') || e.target.closest('form'))) {
+                    if (e.target.closest('#btn-thrust-control')) {
+                        // Allow the dedicated thrust control button
+                    } else {
+                        return;
+                    }
+                }
+
+                sound.init();
+                if (gameState === 'PLAYING') {
+                    isThrusting = true;
+                }
+            }
+
+            function handleThrustEnd() {
+                isThrusting = false;
+            }
+
+            // Keyboard Controls
+            window.addEventListener('keydown', (e) => {
+                if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+
+                if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+                    e.preventDefault();
+                    if (gameState === 'START' || gameState === 'GAMEOVER') {
+                        startGame();
+                        isThrusting = true;
+                    } else if (gameState === 'PLAYING') {
+                        isThrusting = true;
+                    }
+                }
+            });
+
+            window.addEventListener('keyup', (e) => {
+                if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+                    isThrusting = false;
+                }
+            });
+
+            // Canvas Pointer & Touch Events
+            canvas.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                handleThrustStart(e);
+            });
+            canvas.addEventListener('touchstart', (e) => {
+                e.preventDefault();
+                handleThrustStart(e);
+            }, { passive: false });
+
+            // Dedicated Thrust Button Events
+            btnThrustControl.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                if (gameState !== 'PLAYING') startGame();
+                isThrusting = true;
+            });
+            btnThrustControl.addEventListener('touchstart', (e) => {
+                e.preventDefault();
+                if (gameState !== 'PLAYING') startGame();
+                isThrusting = true;
+            }, { passive: false });
+
+            window.addEventListener('mouseup', handleThrustEnd);
+            window.addEventListener('touchend', handleThrustEnd);
+            window.addEventListener('blur', handleThrustEnd);
+
+            // UI Overlay Buttons
+            btnStart.addEventListener('click', startGame);
+            btnRestart.addEventListener('click', startGame);
+
+            btnMute.addEventListener('click', () => {
+                sound.init();
+                const isMuted = sound.toggleMute();
+                iconMute.className = isMuted
+                    ? 'fa-solid fa-volume-xmark text-xs text-rose-400'
+                    : 'fa-solid fa-volume-high text-xs';
+            });
+
+            // Placeholder Email Notification Toast
+            const notifyForm = document.getElementById('notify-form');
+            const notifyEmail = document.getElementById('notify-email');
+            const toast = document.getElementById('toast');
+
+            notifyForm.addEventListener('submit', (e) => {
+                e.preventDefault();
+                if (!notifyEmail.value) return;
+                notifyEmail.value = '';
+                toast.classList.remove('opacity-0', 'translate-y-2');
+                setTimeout(() => {
+                    toast.classList.add('opacity-0', 'translate-y-2');
+                }, 3200);
+            });
+
+            // Start the main game loop
+            requestAnimationFrame(gameLoop);
+        };
+    </script>
+</body>
+</html>

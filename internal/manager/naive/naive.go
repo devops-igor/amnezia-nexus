@@ -29,6 +29,7 @@ const (
 const (
 	DecoyThemeMinecraft      = "minecraft"
 	DecoyThemeCreativeStudio = "creative-studio"
+	DecoyThemeJetpackDash    = "jetpack-dash"
 	DecoyThemeDefault        = "default"
 )
 
@@ -38,14 +39,20 @@ var minecraftDecoyHTML []byte
 //go:embed assets/decoy/creative-studio/index.html
 var creativeStudioDecoyHTML []byte
 
+//go:embed assets/decoy/jetpack-dash/index.html
+var jetpackDashDecoyHTML []byte
+
 // GetDecoyHTML returns the static HTML content for the specified decoy theme.
 // It returns the Creative Studio asset for "creative-studio" (or "portfolio"),
+// the Jetpack Dash asset for "jetpack-dash" (or "jetpack", "dash"),
 // and falls back to the Minecraft Community asset for "minecraft", "voxelnet",
 // "default", or any empty/unknown theme.
 func GetDecoyHTML(theme string) []byte {
 	switch strings.ToLower(strings.TrimSpace(theme)) {
 	case DecoyThemeCreativeStudio, "portfolio":
 		return creativeStudioDecoyHTML
+	case DecoyThemeJetpackDash, "jetpack", "dash":
+		return jetpackDashDecoyHTML
 	case DecoyThemeMinecraft, "voxelnet", DecoyThemeDefault:
 		return minecraftDecoyHTML
 	default:
