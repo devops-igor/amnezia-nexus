@@ -222,59 +222,6 @@ func TestProbeNaiveProxy_DaemonH3UDPBlackhole_FallbackToH2(t *testing.T) {
 	}
 }
 
-func TestDialer_H3EarlyStreamReadFailure_SwitchesToH2(t *testing.T) {
-	sd := &mockStreamDialer{
-		dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			clientConn, serverConn := net.Pipe()
-			_ = serverConn.Close()
-			return clientConn, nil
-		},
-	}
-
-	p := models.NaiveProxyParams{
-		Username:    "alice",
-		Password:    "secret-password",
-		Domain:      "camouflage.example.com",
-		EnableH3:    true,
-		H3Supported: true,
-	}
-
-	d, err := New("198.51.100.1:443", p, WithSocks5Dialer(sd))
-	if err != nil {
-		t.Fatalf("New dialer: %v", err)
-	}
-	defer d.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	conn, err := d.DialContext(ctx, "tcp", "target.example.com:80")
-	if err != nil {
-		t.Fatalf("expected DialContext to succeed via local SOCKS, got: %v", err)
-	}
-	defer conn.Close()
-
-	d.daemonMu.Lock()
-	beforeH3 := d.params.H3Supported
-	d.daemonMu.Unlock()
-	if !beforeH3 {
-		t.Fatal("expected H3Supported to be true before stream read failure")
-	}
-
-	buf := make([]byte, 16)
-	_, readErr := conn.Read(buf)
-	if !errors.Is(readErr, io.EOF) {
-		t.Fatalf("expected io.EOF on early stream read, got: %v", readErr)
-	}
-
-	d.daemonMu.Lock()
-	afterH3 := d.params.H3Supported
-	d.daemonMu.Unlock()
-	if afterH3 {
-		t.Fatal("expected H3Supported to be false after early stream read failure, but remained true")
-	}
-}
-
 func TestProbeNaiveProxy_UnauthenticatedRedirect308(t *testing.T) {
 	// Server returns 308 redirect for unauthenticated requests
 	proxyAddr, cleanup := setupTestH2Server(t, "correctUser", "correctPass", true)
@@ -767,25 +714,23 @@ func TestProbeNaiveProxy_CustomPortBackend(t *testing.T) {
 	}
 }
 
-func TestDialer_LocalCancellationDoesNotKillSharedH3Daemon(t *testing.T) {
+func setupSharedH3DaemonDialer(t *testing.T, upstreamHandler func(net.Conn)) (*Dialer, *Daemon, context.Context) {
+	t.Helper()
 	mockBin := buildMockNaiveBinary(t)
 
-	// Start a local TCP echo server to serve as the reachable upstream target for mock naive daemon.
 	upstreamLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("upstream echo listen: %v", err)
 	}
-	defer upstreamLn.Close()
+	t.Cleanup(func() { _ = upstreamLn.Close() })
+
 	go func() {
 		for {
 			conn, err := upstreamLn.Accept()
 			if err != nil {
 				return
 			}
-			go func(c net.Conn) {
-				defer c.Close()
-				_, _ = io.Copy(c, c)
-			}(conn)
+			go upstreamHandler(conn)
 		}
 	}()
 
@@ -806,24 +751,28 @@ func TestDialer_LocalCancellationDoesNotKillSharedH3Daemon(t *testing.T) {
 	dm.SetReadinessTimeout(3 * time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 
 	if err := dm.Start(ctx); err != nil {
 		t.Fatalf("Start daemon: %v", err)
 	}
-	defer func() {
-		_ = dm.Stop()
-	}()
+	t.Cleanup(func() { _ = dm.Stop() })
 
 	d, err := New(upstreamAddr, p, WithDaemon(dm))
 	if err != nil {
 		t.Fatalf("New dialer: %v", err)
 	}
-	defer func() {
-		_ = d.Close()
-	}()
+	t.Cleanup(func() { _ = d.Close() })
 
-	// Establish two flows through the same supervised daemon.
+	return d, dm, ctx
+}
+
+func TestDialer_LocalCancellationDoesNotKillSharedH3Daemon(t *testing.T) {
+	d, dm, ctx := setupSharedH3DaemonDialer(t, func(c net.Conn) {
+		defer c.Close()
+		_, _ = io.Copy(c, c)
+	})
+
 	flow1, err := d.DialContext(ctx, "tcp", "target1.example.com:80")
 	if err != nil {
 		t.Fatalf("Dial flow1: %v", err)
@@ -841,14 +790,10 @@ func TestDialer_LocalCancellationDoesNotKillSharedH3Daemon(t *testing.T) {
 		t.Fatalf("Close flow1: %v", err)
 	}
 
-	// Verify that Read on locally closed flow1 returns an error without killing the daemon.
 	buf := make([]byte, 16)
-	_, readErr := flow1.Read(buf)
-	if readErr == nil {
+	if _, readErr := flow1.Read(buf); readErr == nil {
 		t.Fatal("expected error reading from closed flow1, got nil")
 	}
-
-	// Write on locally closed flow1 must also not trigger daemon shutdown.
 	_, _ = flow1.Write([]byte("ignored"))
 
 	// Verify that the shared daemon remains active and running.
@@ -870,7 +815,116 @@ func TestDialer_LocalCancellationDoesNotKillSharedH3Daemon(t *testing.T) {
 	if _, err := flow2.Write(msg); err != nil {
 		t.Fatalf("write to sibling flow2 failed: %v", err)
 	}
+	recv := make([]byte, len(msg))
+	if _, err := io.ReadFull(flow2, recv); err != nil {
+		t.Fatalf("read from sibling flow2 failed: %v", err)
+	}
+	if string(recv) != string(msg) {
+		t.Fatalf("flow2 payload mismatch: got %q, want %q", string(recv), string(msg))
+	}
+}
 
+func TestDialer_DestinationEOFDoesNotKillSharedH3Daemon(t *testing.T) {
+	var connCount atomic.Int32
+	d, dm, ctx := setupSharedH3DaemonDialer(t, func(c net.Conn) {
+		defer c.Close()
+		if connCount.Add(1) == 1 {
+			// Destination closes immediately without writing response bytes
+			return
+		}
+		_, _ = io.Copy(c, c)
+	})
+
+	flow1, err := d.DialContext(ctx, "tcp", "target1.example.com:80")
+	if err != nil {
+		t.Fatalf("Dial flow1: %v", err)
+	}
+	defer flow1.Close()
+
+	flow2, err := d.DialContext(ctx, "tcp", "target2.example.com:80")
+	if err != nil {
+		t.Fatalf("Dial flow2: %v", err)
+	}
+	defer flow2.Close()
+
+	buf := make([]byte, 16)
+	n, readErr := flow1.Read(buf)
+	if n != 0 || !errors.Is(readErr, io.EOF) {
+		t.Fatalf("expected 0, io.EOF on flow1 after destination close, got n=%d, err=%v", n, readErr)
+	}
+
+	if !dm.IsActive() {
+		t.Fatal("expected shared H3 daemon to remain active after destination EOF")
+	}
+	if d.Daemon() == nil {
+		t.Fatal("expected dialer daemon reference to remain non-nil after destination EOF")
+	}
+	d.daemonMu.Lock()
+	h3Supported := d.params.H3Supported
+	d.daemonMu.Unlock()
+	if !h3Supported {
+		t.Fatal("expected H3Supported to remain true after destination EOF")
+	}
+
+	msg := []byte("hello from sibling flow2")
+	if _, err := flow2.Write(msg); err != nil {
+		t.Fatalf("write to sibling flow2 failed: %v", err)
+	}
+	recv := make([]byte, len(msg))
+	if _, err := io.ReadFull(flow2, recv); err != nil {
+		t.Fatalf("read from sibling flow2 failed: %v", err)
+	}
+	if string(recv) != string(msg) {
+		t.Fatalf("flow2 payload mismatch: got %q, want %q", string(recv), string(msg))
+	}
+}
+
+func TestDialer_PerFlowDeadlineDoesNotKillSharedH3Daemon(t *testing.T) {
+	d, dm, ctx := setupSharedH3DaemonDialer(t, func(c net.Conn) {
+		defer c.Close()
+		_, _ = io.Copy(c, c)
+	})
+
+	flow1, err := d.DialContext(ctx, "tcp", "target1.example.com:80")
+	if err != nil {
+		t.Fatalf("Dial flow1: %v", err)
+	}
+	defer flow1.Close()
+
+	flow2, err := d.DialContext(ctx, "tcp", "target2.example.com:80")
+	if err != nil {
+		t.Fatalf("Dial flow2: %v", err)
+	}
+	defer flow2.Close()
+
+	if err := flow1.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline flow1: %v", err)
+	}
+
+	buf := make([]byte, 16)
+	_, readErr := flow1.Read(buf)
+	var netErr net.Error
+	if readErr == nil || !errors.As(readErr, &netErr) || !netErr.Timeout() {
+		t.Fatalf("expected timeout error on flow1, got: %v", readErr)
+	}
+
+	if !dm.IsActive() {
+		t.Fatal("expected shared H3 daemon to remain active after flow1 read timeout")
+	}
+	if d.Daemon() == nil {
+		t.Fatal("expected dialer daemon reference to remain non-nil after flow1 read timeout")
+	}
+	d.daemonMu.Lock()
+	h3Supported := d.params.H3Supported
+	d.daemonMu.Unlock()
+	if !h3Supported {
+		t.Fatal("expected H3Supported to remain true after flow1 read timeout")
+	}
+
+	msg := []byte("hello from sibling flow2")
+	if _, err := flow2.Write(msg); err != nil {
+		t.Fatalf("write to sibling flow2 failed: %v", err)
+	}
 	recv := make([]byte, len(msg))
 	if _, err := io.ReadFull(flow2, recv); err != nil {
 		t.Fatalf("read from sibling flow2 failed: %v", err)

@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"strconv"
@@ -223,12 +222,6 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 		return nil, fmt.Errorf("naive: native daemon dial failed: %w", err)
 	}
 
-	d.daemonMu.Lock()
-	h3Active := d.params.EnableH3 && d.params.H3Supported
-	d.daemonMu.Unlock()
-	if h3Active {
-		return d.wrapH3Conn(conn), nil
-	}
 	return conn, nil
 }
 
@@ -240,9 +233,6 @@ func (d *Dialer) dialAllowsInProcess(ctx context.Context, network, address strin
 	if sd != nil {
 		conn, err := sd.DialContext(ctx, network, address)
 		if err == nil {
-			if h3Active {
-				return d.wrapH3Conn(conn), nil
-			}
 			return conn, nil
 		}
 		if h3Active && ctx.Err() == nil {
@@ -263,9 +253,6 @@ func (d *Dialer) dialAllowsInProcess(ctx context.Context, network, address strin
 		if err == nil {
 			conn, err := sd.DialContext(ctx, network, address)
 			if err == nil {
-				if h3Active {
-					return d.wrapH3Conn(conn), nil
-				}
 				return conn, nil
 			}
 		}
@@ -469,91 +456,6 @@ func (d *Dialer) fallbackToH2() {
 		_ = d.daemon.Stop()
 		d.daemon = nil
 		d.socks5Dialer = nil
-	}
-}
-
-type h3ConnWrapper struct {
-	net.Conn
-	d             *Dialer
-	readBytes     atomic.Int64
-	done          atomic.Bool
-	locallyClosed atomic.Bool
-}
-
-func (c *h3ConnWrapper) Close() error {
-	c.locallyClosed.Store(true)
-	return c.Conn.Close()
-}
-
-func isLocalClose(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, context.Canceled) {
-		return true
-	}
-	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "use of closed network connection") ||
-		strings.Contains(errStr, "closed network connection") ||
-		strings.Contains(errStr, "closed pipe") ||
-		strings.Contains(errStr, "context canceled") ||
-		strings.Contains(errStr, "operation was canceled")
-}
-
-func (c *h3ConnWrapper) isUnroutableOrBlackhole(err error) bool {
-	if err == nil || c.locallyClosed.Load() || isLocalClose(err) {
-		return false
-	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return true
-	}
-	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "connection reset") ||
-		strings.Contains(errStr, "broken pipe") ||
-		strings.Contains(errStr, "unreachable") ||
-		strings.Contains(errStr, "refused") ||
-		strings.Contains(errStr, "connection closed by remote") ||
-		strings.Contains(errStr, "closed by peer") ||
-		strings.Contains(errStr, "remote error")
-}
-
-func (c *h3ConnWrapper) triggerH2Fallback() {
-	if c.done.CompareAndSwap(false, true) {
-		c.d.fallbackToH2()
-	}
-}
-
-func (c *h3ConnWrapper) Read(b []byte) (int, error) {
-	n, err := c.Conn.Read(b)
-	if n > 0 {
-		c.readBytes.Add(int64(n))
-	}
-	if err != nil && c.readBytes.Load() == 0 && !c.locallyClosed.Load() && !isLocalClose(err) {
-		if c.isUnroutableOrBlackhole(err) {
-			c.triggerH2Fallback()
-		}
-	}
-	return n, err
-}
-
-func (c *h3ConnWrapper) Write(b []byte) (int, error) {
-	n, err := c.Conn.Write(b)
-	if err != nil && c.readBytes.Load() == 0 && !c.locallyClosed.Load() && !isLocalClose(err) {
-		if c.isUnroutableOrBlackhole(err) {
-			c.triggerH2Fallback()
-		}
-	}
-	return n, err
-}
-
-func (d *Dialer) wrapH3Conn(conn net.Conn) net.Conn {
-	return &h3ConnWrapper{
-		Conn: conn,
-		d:    d,
 	}
 }
 
