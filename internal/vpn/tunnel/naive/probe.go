@@ -57,19 +57,41 @@ func resolveProbePort(p models.NaiveProxyParams, target string) int {
 }
 
 func (d *Dialer) probeViaDaemonWithFallback(ctx context.Context, camTarget string, p models.NaiveProxyParams, sd StreamDialer) (int64, error) {
-	latency, probeErr := d.probeViaDaemon(ctx, camTarget, p, sd)
-	if probeErr != nil && d.params.EnableH3 && d.params.H3Supported && ctx.Err() == nil {
-		d.daemonMu.Lock()
-		if d.daemon != nil {
-			_ = d.daemon.Stop()
-			d.daemon = nil
-			d.socks5Dialer = nil
+	d.daemonMu.Lock()
+	h3Active := d.params.EnableH3 && d.params.H3Supported
+	d.daemonMu.Unlock()
+
+	probeCtx := ctx
+	var cancel context.CancelFunc
+	if h3Active {
+		if deadline, ok := ctx.Deadline(); ok {
+			dur := time.Until(deadline) / 2
+			if dur > 2*time.Second {
+				dur = 2 * time.Second
+			}
+			if dur > 0 {
+				probeCtx, cancel = context.WithTimeout(ctx, dur)
+			}
+		} else {
+			probeCtx, cancel = context.WithTimeout(ctx, 2*time.Second)
 		}
-		d.params.H3Supported = false
-		d.daemonMu.Unlock()
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+
+	latency, probeErr := d.probeViaDaemon(probeCtx, camTarget, p, sd)
+	if probeErr != nil && h3Active && ctx.Err() == nil {
+		d.fallbackToH2()
+		p.H3Supported = false
 		if fallbackSd, fallbackErr := d.getOrStartDaemon(ctx); fallbackErr == nil {
-			if fbLatency, fbErr := d.probeViaDaemon(ctx, camTarget, d.params, fallbackSd); fbErr == nil {
+			if fbLatency, fbErr := d.probeViaDaemon(ctx, camTarget, p, fallbackSd); fbErr == nil {
 				return fbLatency, nil
+			}
+		}
+		if d.allowsInProcess() {
+			if status, err := d.probeH2(ctx, camTarget); err == nil {
+				return handleProbeStatus(status, 1)
 			}
 		}
 	}
@@ -115,7 +137,7 @@ func probeNaiveProxy(ctx context.Context, target string, p models.NaiveProxyPara
 		sd, _ = d.getOrStartDaemon(timeoutCtx)
 	}
 	if sd != nil {
-		return d.probeViaDaemon(timeoutCtx, camTarget, p, sd)
+		return d.probeViaDaemonWithFallback(timeoutCtx, camTarget, p, sd)
 	}
 
 	if p.EnableH3 {

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -191,30 +192,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 
 	// 1. If in-process Go transport is allowed and no daemon is configured, use in-process Go transport.
 	if d.allowsInProcess() {
-		d.daemonMu.Lock()
-		sd := d.socks5Dialer
-		d.daemonMu.Unlock()
-		if sd != nil {
-			conn, err := sd.DialContext(ctx, network, address)
-			if err == nil {
-				return conn, nil
-			}
-			if d.inProcessFallback {
-				return d.dialInProcess(ctx, address)
-			}
-			return nil, err
-		}
-		if d.inProcessFallback && testRootCAs == nil {
-			sd, err := d.getOrStartDaemon(ctx)
-			if err == nil {
-				conn, err := sd.DialContext(ctx, network, address)
-				if err == nil {
-					return conn, nil
-				}
-			}
-			return d.dialInProcess(ctx, address)
-		}
-		return d.dialInProcess(ctx, address)
+		return d.dialAllowsInProcess(ctx, network, address)
 	}
 
 	// 2. Production: Native daemon is mandatory. Fail closed on download, startup, or connection failure.
@@ -228,15 +206,11 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 
 	conn, err := sd.DialContext(ctx, network, address)
 	if err != nil {
-		if d.params.EnableH3 && d.params.H3Supported && ctx.Err() == nil {
-			d.daemonMu.Lock()
-			if d.daemon != nil {
-				_ = d.daemon.Stop()
-				d.daemon = nil
-				d.socks5Dialer = nil
-			}
-			d.params.H3Supported = false
-			d.daemonMu.Unlock()
+		d.daemonMu.Lock()
+		h3Active := d.params.EnableH3 && d.params.H3Supported
+		d.daemonMu.Unlock()
+		if h3Active && ctx.Err() == nil {
+			d.fallbackToH2()
 			if fallbackSd, fallbackErr := d.getOrStartDaemon(ctx); fallbackErr == nil {
 				if fbConn, fbErr := fallbackSd.DialContext(ctx, network, address); fbErr == nil {
 					return fbConn, nil
@@ -248,7 +222,56 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 		d.daemonMu.Unlock()
 		return nil, fmt.Errorf("naive: native daemon dial failed: %w", err)
 	}
+
+	d.daemonMu.Lock()
+	h3Active := d.params.EnableH3 && d.params.H3Supported
+	d.daemonMu.Unlock()
+	if h3Active {
+		return d.wrapH3Conn(conn), nil
+	}
 	return conn, nil
+}
+
+func (d *Dialer) dialAllowsInProcess(ctx context.Context, network, address string) (net.Conn, error) {
+	d.daemonMu.Lock()
+	sd := d.socks5Dialer
+	h3Active := d.params.EnableH3 && d.params.H3Supported
+	d.daemonMu.Unlock()
+	if sd != nil {
+		conn, err := sd.DialContext(ctx, network, address)
+		if err == nil {
+			if h3Active {
+				return d.wrapH3Conn(conn), nil
+			}
+			return conn, nil
+		}
+		if h3Active && ctx.Err() == nil {
+			d.fallbackToH2()
+			if fallbackSd, fallbackErr := d.getOrStartDaemon(ctx); fallbackErr == nil {
+				if fbConn, fbErr := fallbackSd.DialContext(ctx, network, address); fbErr == nil {
+					return fbConn, nil
+				}
+			}
+		}
+		if d.inProcessFallback {
+			return d.dialInProcess(ctx, address)
+		}
+		return nil, err
+	}
+	if d.inProcessFallback && testRootCAs == nil {
+		sd, err := d.getOrStartDaemon(ctx)
+		if err == nil {
+			conn, err := sd.DialContext(ctx, network, address)
+			if err == nil {
+				if h3Active {
+					return d.wrapH3Conn(conn), nil
+				}
+				return conn, nil
+			}
+		}
+		return d.dialInProcess(ctx, address)
+	}
+	return d.dialInProcess(ctx, address)
 }
 
 // EnsureReady verifies that the dialer is ready to handle traffic.
@@ -259,12 +282,22 @@ func (d *Dialer) EnsureReady(ctx context.Context) error {
 	if d.allowsInProcess() && d.socks5Dialer == nil {
 		return nil
 	}
-	_, err := d.getOrStartDaemon(ctx)
+	sd, err := d.getOrStartDaemon(ctx)
 	if err != nil {
 		d.daemonMu.Lock()
 		d.lastErr = err
 		d.daemonMu.Unlock()
 		return err
+	}
+	d.daemonMu.Lock()
+	h3Active := d.params.EnableH3 && d.params.H3Supported
+	d.daemonMu.Unlock()
+	if h3Active {
+		port := resolveProbePort(d.params, d.endpoint)
+		camTarget := net.JoinHostPort(d.params.Domain, strconv.Itoa(port))
+		if _, probeErr := d.probeViaDaemonWithFallback(ctx, camTarget, d.params, sd); probeErr != nil {
+			return probeErr
+		}
 	}
 	return nil
 }
@@ -422,6 +455,83 @@ func (d *Dialer) Close() error {
 // SupportsUDP returns false because NaiveProxy only tunnels TCP streams.
 func (d *Dialer) SupportsUDP() bool {
 	return false
+}
+
+// fallbackToH2 disables H3 capability and terminates the supervised H3 daemon if running.
+func (d *Dialer) fallbackToH2() {
+	d.daemonMu.Lock()
+	defer d.daemonMu.Unlock()
+	if !d.params.EnableH3 || !d.params.H3Supported {
+		return
+	}
+	d.params.H3Supported = false
+	if d.daemon != nil {
+		_ = d.daemon.Stop()
+		d.daemon = nil
+		d.socks5Dialer = nil
+	}
+}
+
+type h3ConnWrapper struct {
+	net.Conn
+	d         *Dialer
+	readBytes atomic.Int64
+	done      atomic.Bool
+}
+
+func (c *h3ConnWrapper) isUnroutableOrBlackhole(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "unreachable") ||
+		strings.Contains(errStr, "refused") ||
+		strings.Contains(errStr, "closed")
+}
+
+func (c *h3ConnWrapper) triggerH2Fallback() {
+	if c.done.CompareAndSwap(false, true) {
+		c.d.fallbackToH2()
+	}
+}
+
+func (c *h3ConnWrapper) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.readBytes.Add(int64(n))
+	}
+	if err != nil && c.readBytes.Load() == 0 {
+		if c.isUnroutableOrBlackhole(err) {
+			c.triggerH2Fallback()
+		}
+	}
+	return n, err
+}
+
+func (c *h3ConnWrapper) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if err != nil && c.readBytes.Load() == 0 {
+		if c.isUnroutableOrBlackhole(err) {
+			c.triggerH2Fallback()
+		}
+	}
+	return n, err
+}
+
+func (d *Dialer) wrapH3Conn(conn net.Conn) net.Conn {
+	return &h3ConnWrapper{
+		Conn: conn,
+		d:    d,
+	}
 }
 
 // basicAuth returns the HTTP Basic authentication credentials formatted for Proxy-Authorization.

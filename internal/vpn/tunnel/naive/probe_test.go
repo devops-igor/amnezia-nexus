@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -90,6 +91,187 @@ func TestProbeNaiveProxy_H3FallbackToH2(t *testing.T) {
 
 	if latencyMS < 1 {
 		t.Fatalf("expected latencyMS >= 1, got %d", latencyMS)
+	}
+}
+
+func TestProbeNaiveProxy_H3UDPBlackhole_FallbackToH2(t *testing.T) {
+	// Start H2 server on TCP
+	proxyAddr, cleanup := setupTestH2Server(t, "userA", "passA", true)
+	defer cleanup()
+
+	_, portStr, err := net.SplitHostPort(proxyAddr)
+	if err != nil {
+		t.Fatalf("SplitHostPort failed: %v", err)
+	}
+
+	// Create UDP blackhole on the exact same port: accepts UDP packets but silently drops them
+	udpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort("127.0.0.1", portStr))
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr failed: %v", err)
+	}
+	udpLn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		t.Fatalf("ListenUDP blackhole failed: %v", err)
+	}
+	defer udpLn.Close()
+
+	stopUDP := make(chan struct{})
+	defer close(stopUDP)
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			select {
+			case <-stopUDP:
+				return
+			default:
+				_ = udpLn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+				_, _, _ = udpLn.ReadFromUDP(buf)
+			}
+		}
+	}()
+
+	p := models.NaiveProxyParams{
+		Username: "userA",
+		Password: "passA",
+		Domain:   testCamouflageDomain,
+		EnableH3: true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	// Total timeout is 2 seconds. The bounded H3 sub-deadline should cap H3 attempt at 1 second,
+	// leaving the remaining budget for the H2 probe to succeed within the overall 2s timeout.
+	latencyMS, err := ProbeNaiveProxy(ctx, proxyAddr, p, 2*time.Second)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("ProbeNaiveProxy under UDP blackhole failed: %v", err)
+	}
+	if latencyMS < 1 {
+		t.Fatalf("expected latencyMS >= 1, got %d", latencyMS)
+	}
+	if elapsed >= 2500*time.Millisecond {
+		t.Fatalf("Probe took %v, exceeded bounded budget", elapsed)
+	}
+}
+
+func TestProbeNaiveProxy_DaemonH3UDPBlackhole_FallbackToH2(t *testing.T) {
+	cert, err := generateLeafCert(testCACert, testCAKey, "camouflage.example.com")
+	if err != nil {
+		t.Fatalf("generate leaf cert: %v", err)
+	}
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	ts.TLS = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h2", "http/1.1"},
+	}
+	ts.StartTLS()
+	defer ts.Close()
+
+	h2Port := ts.Listener.Addr().(*net.TCPAddr).Port
+
+	var dialCount atomic.Int32
+	sd := &mockStreamDialer{
+		dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if dialCount.Add(1) == 1 {
+				// First attempt: H3 blackhole — return pipe and hang until sub-deadline
+				clientConn, serverConn := net.Pipe()
+				go func() {
+					<-ctx.Done()
+					_ = serverConn.Close()
+				}()
+				return clientConn, nil
+			}
+			// Second attempt: fallback to H2
+			var netDialer net.Dialer
+			return netDialer.DialContext(ctx, network, ts.Listener.Addr().String())
+		},
+	}
+
+	p := models.NaiveProxyParams{
+		Username:    "alice",
+		Password:    "secret-password",
+		Domain:      "camouflage.example.com",
+		Port:        h2Port,
+		EnableH3:    true,
+		H3Supported: true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	latency, err := ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:"+strconv.Itoa(h2Port), p, 2*time.Second, WithSocks5Dialer(sd))
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("ProbeNaiveProxyWithOptions daemon H3 blackhole fallback failed: %v", err)
+	}
+	if latency < 1 {
+		t.Errorf("expected latency >= 1ms, got %d", latency)
+	}
+	if elapsed >= 2500*time.Millisecond {
+		t.Errorf("Probe took %v, exceeded bounded timeout budget", elapsed)
+	}
+	if dialCount.Load() < 2 {
+		t.Errorf("expected at least 2 dial attempts (H3 followed by H2 fallback), got %d", dialCount.Load())
+	}
+}
+
+func TestDialer_H3EarlyStreamReadFailure_SwitchesToH2(t *testing.T) {
+	sd := &mockStreamDialer{
+		dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			clientConn, serverConn := net.Pipe()
+			_ = serverConn.Close()
+			return clientConn, nil
+		},
+	}
+
+	p := models.NaiveProxyParams{
+		Username:    "alice",
+		Password:    "secret-password",
+		Domain:      "camouflage.example.com",
+		EnableH3:    true,
+		H3Supported: true,
+	}
+
+	d, err := New("198.51.100.1:443", p, WithSocks5Dialer(sd))
+	if err != nil {
+		t.Fatalf("New dialer: %v", err)
+	}
+	defer d.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	conn, err := d.DialContext(ctx, "tcp", "target.example.com:80")
+	if err != nil {
+		t.Fatalf("expected DialContext to succeed via local SOCKS, got: %v", err)
+	}
+	defer conn.Close()
+
+	d.daemonMu.Lock()
+	beforeH3 := d.params.H3Supported
+	d.daemonMu.Unlock()
+	if !beforeH3 {
+		t.Fatal("expected H3Supported to be true before stream read failure")
+	}
+
+	buf := make([]byte, 16)
+	_, readErr := conn.Read(buf)
+	if !errors.Is(readErr, io.EOF) {
+		t.Fatalf("expected io.EOF on early stream read, got: %v", readErr)
+	}
+
+	d.daemonMu.Lock()
+	afterH3 := d.params.H3Supported
+	d.daemonMu.Unlock()
+	if afterH3 {
+		t.Fatal("expected H3Supported to be false after early stream read failure, but remained true")
 	}
 }
 
