@@ -319,3 +319,225 @@ func TestParseCaddyfile_StaticDecoyRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestGetDecoyHTML(t *testing.T) {
+	tests := []struct {
+		name         string
+		theme        string
+		wantSnippet  string
+		wantTemplate []byte
+	}{
+		{
+			name:         "creative-studio returns Creative Studio template",
+			theme:        DecoyThemeCreativeStudio,
+			wantSnippet:  "Aura Creative Studio",
+			wantTemplate: creativeStudioDecoyHTML,
+		},
+		{
+			name:         "creative-studio case-insensitive with whitespace",
+			theme:        "  CREATIVE-STUDIO  ",
+			wantSnippet:  "Aura Creative Studio",
+			wantTemplate: creativeStudioDecoyHTML,
+		},
+		{
+			name:         "portfolio alias returns Creative Studio template",
+			theme:        "portfolio",
+			wantSnippet:  "Aura Creative Studio",
+			wantTemplate: creativeStudioDecoyHTML,
+		},
+		{
+			name:         "minecraft returns Minecraft template",
+			theme:        DecoyThemeMinecraft,
+			wantSnippet:  "VOXELNET",
+			wantTemplate: minecraftDecoyHTML,
+		},
+		{
+			name:         "minecraft case-insensitive with whitespace",
+			theme:        "  MINECRAFT  ",
+			wantSnippet:  "VOXELNET",
+			wantTemplate: minecraftDecoyHTML,
+		},
+		{
+			name:         "voxelnet alias returns Minecraft template",
+			theme:        "voxelnet",
+			wantSnippet:  "VOXELNET",
+			wantTemplate: minecraftDecoyHTML,
+		},
+		{
+			name:         "default returns Minecraft template",
+			theme:        DecoyThemeDefault,
+			wantSnippet:  "VOXELNET",
+			wantTemplate: minecraftDecoyHTML,
+		},
+		{
+			name:         "empty theme falls back to Minecraft template",
+			theme:        "",
+			wantSnippet:  "VOXELNET",
+			wantTemplate: minecraftDecoyHTML,
+		},
+		{
+			name:         "unknown theme falls back to Minecraft template",
+			theme:        "random-portfolio-theme",
+			wantSnippet:  "VOXELNET",
+			wantTemplate: minecraftDecoyHTML,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GetDecoyHTML(tt.theme)
+			if len(got) == 0 {
+				t.Fatalf("GetDecoyHTML(%q) returned empty bytes", tt.theme)
+			}
+			if len(got) != len(tt.wantTemplate) {
+				t.Errorf("GetDecoyHTML(%q) length = %d, want %d", tt.theme, len(got), len(tt.wantTemplate))
+			}
+			if !strings.Contains(string(got), tt.wantSnippet) {
+				t.Errorf("GetDecoyHTML(%q) does not contain %q", tt.theme, tt.wantSnippet)
+			}
+		})
+	}
+}
+
+func TestInstall_UploadsSelectedDecoyTemplate(t *testing.T) {
+	tests := []struct {
+		name          string
+		installParams map[string]any
+		wantSnippet   string
+		wantTemplate  []byte
+	}{
+		{
+			name: "creative-studio theme via NaiveInstallOptions struct",
+			installParams: map[string]any{
+				"port": 443,
+				"naive_options": models.NaiveInstallOptions{
+					Port:          "443",
+					Domain:        "cs.example.com",
+					DecoyTemplate: "creative-studio",
+				},
+			},
+			wantSnippet:  "Aura Creative Studio",
+			wantTemplate: creativeStudioDecoyHTML,
+		},
+		{
+			name: "creative-studio theme via pointer to NaiveInstallOptions",
+			installParams: map[string]any{
+				"port": 443,
+				"naive_options": &models.NaiveInstallOptions{
+					Port:          "443",
+					Domain:        "cs-ptr.example.com",
+					DecoyTemplate: "creative-studio",
+				},
+			},
+			wantSnippet:  "Aura Creative Studio",
+			wantTemplate: creativeStudioDecoyHTML,
+		},
+		{
+			name: "creative-studio theme via map[string]any options",
+			installParams: map[string]any{
+				"port": 443,
+				"naive_options": map[string]any{
+					"port":           "443",
+					"domain":         "cs-map.example.com",
+					"decoy_template": "creative-studio",
+				},
+			},
+			wantSnippet:  "Aura Creative Studio",
+			wantTemplate: creativeStudioDecoyHTML,
+		},
+		{
+			name: "minecraft theme explicit",
+			installParams: map[string]any{
+				"port": 443,
+				"naive_options": models.NaiveInstallOptions{
+					Port:          "443",
+					Domain:        "mc-explicit.example.com",
+					DecoyTemplate: "minecraft",
+				},
+			},
+			wantSnippet:  "VOXELNET",
+			wantTemplate: minecraftDecoyHTML,
+		},
+		{
+			name: "default theme",
+			installParams: map[string]any{
+				"port": 443,
+				"naive_options": models.NaiveInstallOptions{
+					Port:          "443",
+					Domain:        "default-theme.example.com",
+					DecoyTemplate: "default",
+				},
+			},
+			wantSnippet:  "VOXELNET",
+			wantTemplate: minecraftDecoyHTML,
+		},
+		{
+			name: "empty theme defaults to minecraft",
+			installParams: map[string]any{
+				"port": 443,
+				"naive_options": models.NaiveInstallOptions{
+					Port:          "443",
+					Domain:        "empty-theme.example.com",
+					DecoyTemplate: "",
+				},
+			},
+			wantSnippet:  "VOXELNET",
+			wantTemplate: minecraftDecoyHTML,
+		},
+		{
+			name: "unknown theme falls back to minecraft",
+			installParams: map[string]any{
+				"port": 443,
+				"naive_options": models.NaiveInstallOptions{
+					Port:          "443",
+					Domain:        "unknown-theme.example.com",
+					DecoyTemplate: "unsupported-theme",
+				},
+			},
+			wantSnippet:  "VOXELNET",
+			wantTemplate: minecraftDecoyHTML,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockSSH := newDecoyRecordingNaiveSSHClient()
+			pool := &mockNaivePool{client: mockSSH}
+			locks := awg.NewServerLockRegistry()
+			mgr := NewNaiveManagerWithServerLocks(pool, locks)
+
+			server := &models.Server{
+				ID:      700,
+				Host:    "198.51.100.95",
+				SSHPort: 22,
+			}
+			ctx := context.Background()
+
+			if err := mgr.Install(ctx, server, tt.installParams); err != nil {
+				t.Fatalf("Install failed: %v", err)
+			}
+
+			expectedFilePath := "/opt/amnezia/caddy/www/index.html"
+			mockSSH.mu.Lock()
+			uploadedBytes, fileExists := mockSSH.files[expectedFilePath]
+			uploadMode, modeExists := mockSSH.modes[expectedFilePath]
+			mockSSH.mu.Unlock()
+
+			if !fileExists || len(uploadedBytes) == 0 {
+				t.Fatalf("expected decoy index.html to be uploaded to %s", expectedFilePath)
+			}
+
+			if !strings.Contains(string(uploadedBytes), tt.wantSnippet) {
+				t.Errorf("uploaded index.html does not contain snippet %q:\n%s", tt.wantSnippet, string(uploadedBytes)[:min(200, len(uploadedBytes))])
+			}
+
+			if len(uploadedBytes) != len(tt.wantTemplate) {
+				t.Errorf("uploaded index.html size = %d, want template size %d", len(uploadedBytes), len(tt.wantTemplate))
+			}
+
+			if !modeExists || uploadMode != 0644 {
+				t.Errorf("uploaded index.html mode = %04o, want 0644", uploadMode)
+			}
+		})
+	}
+}

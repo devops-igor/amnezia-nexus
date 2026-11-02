@@ -17,47 +17,71 @@ import (
 // ErrDNSValidation is returned when pre-flight domain DNS validation fails.
 var ErrDNSValidation = errors.New("pre-flight DNS validation failed")
 
-func parseNaiveInstallOptions(params map[string]any, defaultHost string) (int, string) {
-	port := 443
-	if p, ok := params["port"]; ok && fmt.Sprint(p) != "" {
-		if pInt, err := strconv.Atoi(fmt.Sprint(p)); err == nil && pInt > 0 {
-			port = pInt
+func parsePortOption(raw any) int {
+	if raw == nil {
+		return 0
+	}
+	s := strings.TrimSpace(fmt.Sprint(raw))
+	if s == "" {
+		return 0
+	}
+	if p, err := strconv.Atoi(s); err == nil && p > 0 {
+		return p
+	}
+	return 0
+}
+
+func extractNaiveOptions(opts any) (int, string, string) {
+	switch v := opts.(type) {
+	case *models.NaiveInstallOptions:
+		if v != nil {
+			return parsePortOption(v.Port), v.Domain, v.DecoyTemplate
 		}
+	case models.NaiveInstallOptions:
+		return parsePortOption(v.Port), v.Domain, v.DecoyTemplate
+	case map[string]any:
+		dt, _ := v["decoy_template"].(string)
+		if dt == "" {
+			dt, _ = v["decoyTemplate"].(string)
+		}
+		domain, _ := v["domain"].(string)
+		return parsePortOption(v["port"]), domain, dt
+	}
+	return 0, "", ""
+}
+
+func parseNaiveInstallOptions(params map[string]any, defaultHost string) (int, string, string) {
+	port := 443
+	if p := parsePortOption(params["port"]); p > 0 {
+		port = p
 	}
 
 	domain := defaultHost
-	if no, ok := params["naive_options"]; ok && no != nil {
-		switch opt := no.(type) {
-		case *models.NaiveInstallOptions:
-			if opt.Port != "" {
-				if pInt, err := strconv.Atoi(opt.Port); err == nil && pInt > 0 {
-					port = pInt
-				}
-			}
-			if opt.Domain != "" {
-				domain = opt.Domain
-			}
-		case models.NaiveInstallOptions:
-			if opt.Port != "" {
-				if pInt, err := strconv.Atoi(opt.Port); err == nil && pInt > 0 {
-					port = pInt
-				}
-			}
-			if opt.Domain != "" {
-				domain = opt.Domain
-			}
-		case map[string]any:
-			if p, ok := opt["port"].(string); ok && p != "" {
-				if pInt, err := strconv.Atoi(p); err == nil && pInt > 0 {
-					port = pInt
-				}
-			}
-			if d, ok := opt["domain"].(string); ok && d != "" {
-				domain = d
-			}
+	decoyTemplate := ""
+	if dt, _ := params["decoy_template"].(string); dt != "" {
+		decoyTemplate = dt
+	} else if dt, _ := params["decoyTemplate"].(string); dt != "" {
+		decoyTemplate = dt
+	}
+
+	opts := params["naive_options"]
+	if opts == nil {
+		opts = params["NaiveOptions"]
+	}
+	if opts != nil {
+		p, d, dt := extractNaiveOptions(opts)
+		if p > 0 {
+			port = p
+		}
+		if d != "" {
+			domain = d
+		}
+		if dt != "" {
+			decoyTemplate = dt
 		}
 	}
-	return port, domain
+
+	return port, domain, decoyTemplate
 }
 
 func shouldSkipDNSValidation(params map[string]any) bool {
@@ -335,7 +359,7 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 	}
 
 	// 2. Parse installation options
-	port, domain := parseNaiveInstallOptions(params, server.Host)
+	port, domain, decoyTemplate := parseNaiveInstallOptions(params, server.Host)
 
 	// Pre-flight DNS validation: ensure public domains resolve to server.Host before writing config or launching container
 	if err := m.validateDomainDNS(ctx, domain, server.Host, params); err != nil {
@@ -353,7 +377,8 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 	}
 
 	// 4. Deploy static decoy website
-	if err := client.UploadSudoFile(ctx, fmt.Sprintf("%s/index.html", NaiveWWWDir), minecraftDecoyHTML, 0644); err != nil {
+	decoyHTML := GetDecoyHTML(decoyTemplate)
+	if err := client.UploadSudoFile(ctx, fmt.Sprintf("%s/index.html", NaiveWWWDir), decoyHTML, 0644); err != nil {
 		return fmt.Errorf("upload decoy index.html: %w", err)
 	}
 
