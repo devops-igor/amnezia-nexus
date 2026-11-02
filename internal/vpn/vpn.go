@@ -346,20 +346,16 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	}
 
 	pool := tunnel.NewPool(db)
+	pool.SetMultiProtocolEnabled(true)
 	healthCfg := tunnel.DefaultHealthConfig()
 	if cfg != nil {
 		if cfg.HealthThresholdMS > 0 {
 			healthCfg.LatencyThresholdMS = int64(cfg.HealthThresholdMS)
 		}
-		if cfg.EnableMultiProtocolBackends {
-			pool.SetMultiProtocolEnabled(true)
-		}
 	}
 
 	prober := tunnel.NewHealthProber(pool, db, healthCfg)
-	if cfg != nil && cfg.EnableMultiProtocolBackends {
-		prober.SetMultiProtocolEnabled(true)
-	}
+	prober.SetMultiProtocolEnabled(true)
 
 	reconnectCfg := tunnel.DefaultReconnectConfig()
 	reconnectMgr := tunnel.NewReconnectManager(pool, prober, reconnectCfg)
@@ -871,12 +867,6 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 		return errors.New("listen_port cannot be changed while the VPN listener is running; restart the panel")
 	}
 
-	multiProtocolChanged := s.cfg != nil && cfg.EnableMultiProtocolBackends != s.cfg.EnableMultiProtocolBackends
-	if multiProtocolChanged && listenerRunning {
-		log.Printf("[vpn] rejecting config update: enable_multi_protocol_backends is immutable while listener is running")
-		return errors.New("enable_multi_protocol_backends cannot be changed while the VPN listener is running; restart the panel")
-	}
-
 	if cfg.ClientQueueSize <= 0 {
 		cfg.ClientQueueSize = forwarder.DefaultClientQueueSize
 	}
@@ -930,10 +920,10 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg *models.VPNConfig) error
 	}
 	s.cfg = cfg
 	if s.pool != nil {
-		s.pool.SetMultiProtocolEnabled(cfg.EnableMultiProtocolBackends)
+		s.pool.SetMultiProtocolEnabled(true)
 	}
 	if s.prober != nil {
-		s.prober.SetMultiProtocolEnabled(cfg.EnableMultiProtocolBackends)
+		s.prober.SetMultiProtocolEnabled(true)
 	}
 
 	s.balancer = newLB

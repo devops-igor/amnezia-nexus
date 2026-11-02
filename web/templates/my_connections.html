@@ -160,7 +160,7 @@
             <button class="config-tab active" onclick="switchConfigTab('conf')">
                 <svg class="icon" style="width:14px;height:14px;"><use href="#icon-file-text"></use></svg> {{ _ "config_tab" }}
             </button>
-            <button class="config-tab" onclick="switchConfigTab('vpn')">
+            <button class="config-tab" id="configTabVpn" onclick="switchConfigTab('vpn')">
                 <svg class="icon" style="width:14px;height:14px;"><use href="#icon-lock"></use></svg> {{ _ "vpn_key_tab" }}
             </button>
             <button class="config-tab" onclick="switchConfigTab('qr')">
@@ -291,6 +291,7 @@
     let currentConfig = '';
     let currentVpnLink = '';
     let currentConfigName = 'connection';
+    let currentProto = '';
 
     const currentUser = {
         role: '{{ if .current_user }}{{ .current_user.Role }}{{ end }}'
@@ -312,14 +313,14 @@
                 document.getElementById('configText').textContent = result.config;
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
 
-                const vpnTab = document.querySelectorAll('.config-tab')[1];
-                if (proto === 'telemt') {
-                    vpnTab.style.display = 'none';
-                } else {
-                    vpnTab.style.display = '';
-                }
+                currentProto = proto || '';
+                const isNoVpnKey = (currentProto === 'telemt' || currentProto === 'naive');
+                const vpnTab = document.getElementById('configTabVpn') || document.querySelectorAll('.config-tab')[1];
+                const panelVpn = document.getElementById('panel-vpn');
+                if (vpnTab) vpnTab.style.display = isNoVpnKey ? 'none' : '';
+                if (panelVpn) panelVpn.style.display = isNoVpnKey ? 'none' : '';
 
-                document.getElementById('qrHint').textContent = (proto === 'telemt') ? _('qr_hint_telemt') : _('qr_hint');
+                document.getElementById('qrHint').textContent = (currentProto === 'telemt') ? _('qr_hint_telemt') : _('qr_hint');
 
                 switchConfigTab('conf');
                 UI.modal.open('configModal');
@@ -331,6 +332,9 @@
     }
 
     function switchConfigTab(tab) {
+        if (tab === 'vpn' && (currentProto === 'naive' || currentProto === 'telemt')) {
+            tab = 'conf';
+        }
         document.querySelectorAll('.config-tab').forEach(t => t.classList.remove('active'));
         document.querySelectorAll('.config-panel').forEach(p => p.classList.remove('active'));
         const tabs = document.querySelectorAll('.config-tab');
@@ -664,12 +668,12 @@
                 document.getElementById('configText').textContent = result.config;
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
 
-                const vpnTab = document.querySelectorAll('.config-tab')[1];
-                if (proto === 'telemt') {
-                    vpnTab.style.display = 'none';
-                } else {
-                    vpnTab.style.display = '';
-                }
+                currentProto = proto || '';
+                const isNoVpnKey = (currentProto === 'telemt' || currentProto === 'naive');
+                const vpnTab = document.getElementById('configTabVpn') || document.querySelectorAll('.config-tab')[1];
+                const panelVpn = document.getElementById('panel-vpn');
+                if (vpnTab) vpnTab.style.display = isNoVpnKey ? 'none' : '';
+                if (panelVpn) panelVpn.style.display = isNoVpnKey ? 'none' : '';
 
                 switchConfigTab('conf');
                 UI.modal.open('configModal');
