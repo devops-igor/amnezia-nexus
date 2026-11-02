@@ -617,3 +617,20 @@ func TestInstall_UploadsSelectedDecoyTemplate(t *testing.T) {
 		})
 	}
 }
+
+func TestJetpackDashDecoy_ComingSoonNotice(t *testing.T) {
+	html := string(GetDecoyHTML(DecoyThemeJetpackDash))
+
+	if !strings.Contains(html, "Email notifications opening soon...") {
+		t.Error("jetpack-dash decoy missing disabled email notice placeholder")
+	}
+	if !strings.Contains(html, "Coming Soon</button>") {
+		t.Error("jetpack-dash decoy missing disabled 'Coming Soon' button")
+	}
+	if strings.Contains(html, "You're on the list!") {
+		t.Error("jetpack-dash decoy contains obsolete false-success toast message")
+	}
+	if strings.Contains(html, "toast.classList.remove") {
+		t.Error("jetpack-dash decoy still contains false-success toast trigger in JavaScript")
+	}
+}
