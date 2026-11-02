@@ -66,7 +66,7 @@
 
         <div class="config-tabs">
             <button class="config-tab active" onclick="switchConfigTab('conf')">{{ _ "config_tab" }}</button>
-            <button class="config-tab" onclick="switchConfigTab('vpn')">{{ _ "vpn_key_tab" }}</button>
+            <button class="config-tab" id="configTabVpn" onclick="switchConfigTab('vpn')">{{ _ "vpn_key_tab" }}</button>
             <button class="config-tab" onclick="switchConfigTab('qr')">{{ _ "qr_code_tab" }}</button>
         </div>
 
@@ -168,7 +168,7 @@
                     </div>
                     <span class="badge badge-success">${_('active')}</span>
                 </div>
-                <button class="btn btn-secondary btn-sm w-full" data-cid="${escapeHtml(c.id)}" data-cname="${escapeHtml(c.name || 'Connection')}" onclick="showConfig(this.dataset.cid, this.dataset.cname)">
+                <button class="btn btn-secondary btn-sm w-full" data-cid="${escapeHtml(c.id)}" data-cname="${escapeHtml(c.name || 'Connection')}" data-cproto="${escapeHtml(c.protocol || '')}" onclick="showConfig(this.dataset.cid, this.dataset.cname, this.dataset.cproto)">
                     ${_('show_settings_btn')}
                 </button>
             </div>
@@ -178,7 +178,12 @@
         }
     }
 
+    let currentConfigProto = '';
+
     function switchConfigTab(tab) {
+        if (tab === 'vpn' && currentConfigProto === 'naive') {
+            tab = 'conf';
+        }
         document.querySelectorAll('.config-tab').forEach(t => t.classList.remove('active'));
         document.querySelectorAll('.config-panel').forEach(p => p.classList.remove('active'));
 
@@ -194,8 +199,9 @@
     let currentVpnLink = '';
     let currentConfigName = 'vpn_config';
 
-    async function showConfig(connId, name) {
+    async function showConfig(connId, name, proto) {
         try {
+            currentConfigProto = proto || '';
             const res = await fetch(`/api/share/${TOKEN}/config/${connId}`, {
                 method: 'POST',
                 headers: {
@@ -212,6 +218,12 @@
             document.getElementById('configText').value = data.config;
             document.getElementById('vpnLinkText').textContent = currentVpnLink;
             document.getElementById('configModalTitle').textContent = name;
+
+            const isNoVpnKey = (currentConfigProto === 'naive');
+            const vpnTab = document.getElementById('configTabVpn') || document.querySelectorAll('.config-tab')[1];
+            const panelVpn = document.getElementById('panel-vpn');
+            if (vpnTab) vpnTab.style.display = isNoVpnKey ? 'none' : '';
+            if (panelVpn) panelVpn.style.display = isNoVpnKey ? 'none' : '';
 
             const dl = document.getElementById('downloadBtn');
             dl.onclick = () => downloadFile(data.config, `${name}.conf`);

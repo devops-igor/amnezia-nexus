@@ -7,6 +7,7 @@ let currentUsername = '';
 let currentConfig = '';
 let currentVpnLink = '';
 let currentConfigName = 'connection';
+let currentConfigProto = '';
 
 let currentPage = 1;
 let pageSize = 12;
@@ -418,9 +419,15 @@ async function addUser(e) {
             currentConfig = result.config;
             currentVpnLink = result.vpn_link || '';
             currentConfigName = body.username;
+            currentConfigProto = body.protocol || '';
             document.getElementById('configModalTitle').textContent = `${_('config')} — ${body.username}`;
             document.getElementById('configText').textContent = result.config;
             document.getElementById('vpnLinkText').textContent = currentVpnLink;
+            const isNoVpnKey = currentConfigProto === 'naive';
+            const vpnTab = document.getElementById('configTabVpn') || document.querySelectorAll('.config-tab')[1];
+            const panelVpn = document.getElementById('panel-vpn');
+            if (vpnTab) vpnTab.style.display = isNoVpnKey ? 'none' : '';
+            if (panelVpn) panelVpn.style.display = isNoVpnKey ? 'none' : '';
             switchConfigTab('conf');
             closeModal('addUserModal');
             openModal('configModal');
@@ -553,9 +560,15 @@ async function doAddUserConnection() {
             currentConfig = result.config;
             currentVpnLink = result.vpn_link || '';
             currentConfigName = document.getElementById('ucName').value.replace(/\s+/g, '_');
+            currentConfigProto = body.protocol || '';
             document.getElementById('configModalTitle').textContent = _('config');
             document.getElementById('configText').textContent = result.config;
             document.getElementById('vpnLinkText').textContent = currentVpnLink;
+            const isNoVpnKey = currentConfigProto === 'naive';
+            const vpnTab = document.getElementById('configTabVpn') || document.querySelectorAll('.config-tab')[1];
+            const panelVpn = document.getElementById('panel-vpn');
+            if (vpnTab) vpnTab.style.display = isNoVpnKey ? 'none' : '';
+            if (panelVpn) panelVpn.style.display = isNoVpnKey ? 'none' : '';
             switchConfigTab('conf');
             openModal('configModal');
             generateQR(result.config);
@@ -712,6 +725,9 @@ async function unlinkUserConnection(connId, connName) {
 }
 
 function switchConfigTab(tab) {
+    if (tab === 'vpn' && currentConfigProto === 'naive') {
+        tab = 'conf';
+    }
     document.querySelectorAll('.config-tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.config-panel').forEach(p => p.classList.remove('active'));
     const tabs = document.querySelectorAll('.config-tab');
@@ -764,9 +780,15 @@ async function showUserConnectionConfig(connIdOrServerId, serverIdOrClientId, cl
             currentConfig = result.config;
             currentVpnLink = result.vpn_link || '';
             currentConfigName = connName.replace(/\s+/g, '_');
+            currentConfigProto = protocol || '';
             document.getElementById('configModalTitle').textContent = `${_('config')} — ${connName}`;
             document.getElementById('configText').textContent = result.config;
             document.getElementById('vpnLinkText').textContent = currentVpnLink;
+            const isNoVpnKey = currentConfigProto === 'naive';
+            const vpnTab = document.getElementById('configTabVpn') || document.querySelectorAll('.config-tab')[1];
+            const panelVpn = document.getElementById('panel-vpn');
+            if (vpnTab) vpnTab.style.display = isNoVpnKey ? 'none' : '';
+            if (panelVpn) panelVpn.style.display = isNoVpnKey ? 'none' : '';
             switchConfigTab('conf');
             openModal('configModal');
             generateQR(result.config);

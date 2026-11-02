@@ -247,8 +247,8 @@ func TestNaiveConfig_CaddyfileAndURI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildNaiveURI failed: %v", err)
 	}
-	if !strings.HasPrefix(uri, "https://") {
-		t.Errorf("expected https:// URI, got: %s", uri)
+	if !strings.HasPrefix(uri, "naive+https://") {
+		t.Errorf("expected naive+https:// URI, got: %s", uri)
 	}
 	if !strings.HasSuffix(uri, "#laptop") {
 		t.Errorf("expected #laptop fragment, got: %s", uri)
@@ -341,8 +341,8 @@ func TestNaiveManager_Lifecycle(t *testing.T) {
 		t.Fatalf("missing username in AddClient response")
 	}
 	configURI, _ := addRes["config"].(string)
-	if !strings.HasPrefix(configURI, "https://") {
-		t.Errorf("expected config https:// URI, got %s", configURI)
+	if !strings.HasPrefix(configURI, "naive+https://") {
+		t.Errorf("expected config naive+https:// URI, got %s", configURI)
 	}
 
 	if mockSSH.reloaded != 1 {

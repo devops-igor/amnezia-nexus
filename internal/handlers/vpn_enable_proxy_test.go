@@ -293,11 +293,11 @@ func TestVPNEnableBackendHandler_ProxyBootstrap_VLESS(t *testing.T) {
 	}
 }
 
-func TestVPNEnableBackendHandler_ProxyDisabled_RejectsWithoutProvisioning(t *testing.T) {
+func TestVPNEnableBackendHandler_ProxyMultiProtocolSucceedsByDefault(t *testing.T) {
 	h, db, _ := setupTestHandlers(t)
 	ctx := context.Background()
 
-	// Multi-protocol backends explicitly disabled
+	// Multi-protocol backends succeed by default even if flag is false
 	vpnCfg := &models.VPNConfig{
 		EnableMultiProtocolBackends: false,
 		ListenPort:                  51820,
@@ -306,13 +306,21 @@ func TestVPNEnableBackendHandler_ProxyDisabled_RejectsWithoutProvisioning(t *tes
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
+	t.Cleanup(func() {
+		ts, _ := vpnSvc.GetTunnels(ctx)
+		for _, tun := range ts {
+			if d := vpnSvc.GetBackendDeviceForTest(tun.ID); d != nil {
+				_ = d.Close()
+			}
+		}
+	})
 	h.vpnSvc = vpnSvc
 
 	r := chi.NewRouter()
 	r.Post("/api/vpn/backends/{server_id}/enable", h.VPNEnableBackendHandler)
 
 	sidVLESS, err := db.CreateServer(ctx, &models.Server{
-		Name:    "vless-node-disabled",
+		Name:    "vless-node-default-enabled",
 		Host:    "127.0.0.1",
 		SSHPort: 22,
 		Protocols: map[string]any{
@@ -344,65 +352,32 @@ func TestVPNEnableBackendHandler_ProxyDisabled_RejectsWithoutProvisioning(t *tes
 	})
 
 	// 1. Admin enable without body (bootstrap from server.Protocols):
-	// Must fail closed with 400 multi_protocol_disabled, and protoMgr.AddClient must NOT be called.
+	// Multi-protocol backends are enabled by default; AddClient must be called and request succeeds.
 	reqEmpty := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sidVLESS), nil)
 	reqEmpty = reqEmpty.WithContext(middleware.WithSession(reqEmpty.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
 	wEmpty := httptest.NewRecorder()
 	r.ServeHTTP(wEmpty, reqEmpty)
 
-	if wEmpty.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 Bad Request with omitted body when feature flag disabled, got %d: %s", wEmpty.Code, wEmpty.Body.String())
+	if wEmpty.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK with omitted body by default, got %d: %s", wEmpty.Code, wEmpty.Body.String())
 	}
-	var respEmpty map[string]any
-	if err := json.Unmarshal(wEmpty.Body.Bytes(), &respEmpty); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
-	if respEmpty["error"] != "multi_protocol_disabled" {
-		t.Fatalf("expected error code multi_protocol_disabled, got: %v", respEmpty["error"])
-	}
-	if calls := vlessAddCalls.Load(); calls != 0 {
-		t.Fatalf("expected 0 AddClient calls on omitted-body enable, got %d", calls)
+	if calls := vlessAddCalls.Load(); calls != 1 {
+		t.Fatalf("expected 1 AddClient call on omitted-body enable, got %d", calls)
 	}
 
-	// 2. Admin enable with explicit proxy payload:
-	// Must also fail closed with 400 multi_protocol_disabled without calling AddClient.
-	vlessParams := models.VLESSRealityParams{
-		UUID:       "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-		PublicKey:  "e-JgU2X7X8aH1pQ1pZqUuWbWw5K2s6J8f8gH9jK1lM4",
-		ShortID:    "0123456789abcdef",
-		ServerName: "gateway.icloud.com",
-		Flow:       "xtls-rprx-vision",
-	}
-	pRaw, _ := json.Marshal(vlessParams)
-	bodyExplicit, _ := json.Marshal(map[string]any{
-		"protocol":        "vless",
-		"protocol_params": json.RawMessage(pRaw),
-	})
-	reqExplicit := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/vpn/backends/%d/enable", sidVLESS), bytes.NewReader(bodyExplicit))
-	reqExplicit = reqExplicit.WithContext(middleware.WithSession(reqExplicit.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
-	wExplicit := httptest.NewRecorder()
-	r.ServeHTTP(wExplicit, reqExplicit)
-
-	if wExplicit.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 Bad Request with explicit proxy body when feature flag disabled, got %d: %s", wExplicit.Code, wExplicit.Body.String())
-	}
-	if calls := vlessAddCalls.Load(); calls != 0 {
-		t.Fatalf("expected 0 AddClient calls on explicit enable, got %d", calls)
-	}
-
-	// 3. Verify no backend tunnel or DB state was created
+	// Verify backend tunnel was created in pool and in DB
 	tun, err := vpnSvc.GetTunnel(sidVLESS)
-	if err == nil && tun != nil {
-		t.Fatalf("expected no tunnel in pool for server %d, got %+v", sidVLESS, tun)
+	if err != nil || tun == nil {
+		t.Fatalf("expected tunnel in pool for server %d, got %+v (err: %v)", sidVLESS, tun, err)
 	}
 	dbTun, err := db.GetBackendTunnelByServerID(ctx, sidVLESS)
-	if err == nil && dbTun != nil {
-		t.Fatalf("expected no backend tunnel in db for server %d, got %+v", sidVLESS, dbTun)
+	if err != nil || dbTun == nil {
+		t.Fatalf("expected backend tunnel in db for server %d, got %+v (err: %v)", sidVLESS, dbTun, err)
 	}
 
-	// 4. Test NaiveProxy server with omitted body when feature flag disabled:
+	// 2. Test NaiveProxy server with omitted body succeeds by default
 	sidNaive, err := db.CreateServer(ctx, &models.Server{
-		Name:    "naive-node-disabled",
+		Name:    "naive-node-default-enabled",
 		Host:    "127.0.0.1",
 		SSHPort: 22,
 		Protocols: map[string]any{
@@ -435,18 +410,11 @@ func TestVPNEnableBackendHandler_ProxyDisabled_RejectsWithoutProvisioning(t *tes
 	wNaive := httptest.NewRecorder()
 	r.ServeHTTP(wNaive, reqNaive)
 
-	if wNaive.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 Bad Request for Naive with omitted body when feature flag disabled, got %d: %s", wNaive.Code, wNaive.Body.String())
+	if wNaive.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for Naive with omitted body by default, got %d: %s", wNaive.Code, wNaive.Body.String())
 	}
-	var respNaive map[string]any
-	if err := json.Unmarshal(wNaive.Body.Bytes(), &respNaive); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
-	if respNaive["error"] != "multi_protocol_disabled" {
-		t.Fatalf("expected error code multi_protocol_disabled for Naive, got: %v", respNaive["error"])
-	}
-	if calls := naiveAddCalls.Load(); calls != 0 {
-		t.Fatalf("expected 0 AddClient calls for Naive on omitted-body enable, got %d", calls)
+	if calls := naiveAddCalls.Load(); calls != 1 {
+		t.Fatalf("expected 1 AddClient call for Naive on omitted-body enable, got %d", calls)
 	}
 }
 

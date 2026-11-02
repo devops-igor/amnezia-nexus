@@ -158,7 +158,6 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 	// Live-session reuse: LastSeen-based validity, no generations. A
 	// healthy live session keeps its backend and route through upstream
 	// rekeys (issue #388: a rekey must not recreate the Nexus session).
-	multiProto := s.cfg != nil && s.cfg.EnableMultiProtocolBackends
 	if live, ok := s.sessionMgr.GetSessionSnapshotByPeer(o.PeerPublicKey); ok && live.UserID == user.ID && live.Status == "connected" {
 		backend, backendErr := s.pool.GetTunnelByID(live.BackendTunnelID)
 		// Same reuse conditions as HandleIncomingPeer minus generation
@@ -166,7 +165,6 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 		// health, plus identity agreement with the durable ownership.
 		if backendErr == nil &&
 			backend.Enabled &&
-			(models.NormalizeTunnelProtocol(backend.Protocol) == models.ProtocolAWG || multiProto) &&
 			strings.EqualFold(backend.Status, models.TunnelStatusActive) &&
 			live.AssignedIP == assignedIP &&
 			live.PeerPublicKey == o.PeerPublicKey &&
@@ -248,19 +246,14 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 			}
 		}
 	}
-	if targetFamily != "" && targetFamily != models.ProtocolAWG && !multiProto {
-		return nil, nil, retirement, loadbalancer.ErrNoActiveBackends
-	}
 	if targetFamily == "" {
 		eligibleFamilies := []string{models.ProtocolAWG}
-		if multiProto {
-			// Multi-protocol ingress: allow VLESS and Naive backends for generic clients (#662).
-			// Streambridge and userspace netstack handle TCP/DNS traffic through Naive forwarder.
-			if conn != nil && models.NormalizeProtocol(conn.Protocol) == models.ProtocolNaive {
-				eligibleFamilies = append(eligibleFamilies, models.ProtocolNaive, models.ProtocolVLESS)
-			} else {
-				eligibleFamilies = append(eligibleFamilies, models.ProtocolVLESS, models.ProtocolNaive)
-			}
+		// Multi-protocol ingress: allow VLESS and Naive backends for generic clients (#662).
+		// Streambridge and userspace netstack handle TCP/DNS traffic through Naive forwarder.
+		if conn != nil && models.NormalizeProtocol(conn.Protocol) == models.ProtocolNaive {
+			eligibleFamilies = append(eligibleFamilies, models.ProtocolNaive, models.ProtocolVLESS)
+		} else {
+			eligibleFamilies = append(eligibleFamilies, models.ProtocolVLESS, models.ProtocolNaive)
 		}
 		for _, fam := range eligibleFamilies {
 			candidates := models.FilterTunnelsByProtocol(activeTunnels, fam)
