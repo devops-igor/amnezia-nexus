@@ -92,12 +92,6 @@ jobs:
   test:
     name: Automated Test Suite
     runs-on: [self-hosted, linux, x64, container-vm]
-    container:
-      image: localhost:5000/nexus-ci-job:latest
-      options: --cpus 4 --memory 6g
-      # This socket belongs to the isolated guest, never the physical host.
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
     timeout-minutes: 20
     steps:
       - name: Checkout Code
@@ -105,50 +99,60 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Trust this job workspace
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
-          cache: true
+          cache: false
 
       - name: Set up Node.js for JSDOM Integration Tests
         uses: actions/setup-node@v7
         with:
           node-version: '20'
 
-      - name: Install Pinned jsdom
+      - name: Run setup and tests in the job image
         run: |
+          # Match guest paths and loopback so sibling Docker fixtures see test files/services.
+          # The socket and /tmp belong to the isolated guest, never the physical host.
+          docker run --rm -i --user 0:0 --network host --cpus 4 --memory 6g \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            --volume /tmp:/tmp \
+            --volume "$RUNNER_TOOL_CACHE:$RUNNER_TOOL_CACHE:ro" \
+            --workdir "$GITHUB_WORKSPACE" \
+            --env https_proxy --env HTTPS_PROXY --env no_proxy --env NO_PROXY \
+            --env GITHUB_WORKSPACE --env GOFLAGS \
+            --env GOROOT="$(go env GOROOT)" \
+            --env NODE_BIN="$(dirname "$(command -v node)")" \
+            localhost:5000/nexus-ci-job:latest bash -seuo pipefail <<'SCRIPT'
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          job_tmp=$(mktemp -d /tmp/nexus-tests.XXXXXX)
+          trap 'rm -rf "$job_tmp"' EXIT
+          # Never reuse /github/home caches: stale modules can lose sqlite vtab build tags.
+          export GOPATH="$job_tmp/go" GOMODCACHE="$job_tmp/mod" GOCACHE="$job_tmp/cache"
+          export npm_config_prefix="$job_tmp/npm"
+          export PATH="$GOROOT/bin:$NODE_BIN:$GOPATH/bin:$npm_config_prefix/bin:$PATH"
+          node --version
           npm install -g jsdom@29.1.1
-          echo "NODE_PATH=$(npm root -g)" >> "$GITHUB_ENV"
+          export NODE_PATH="$(npm root -g)"
 
-      - name: Build Caddy with forwardproxy for Naive Smoke Tests
-        run: |
           go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
-          "$(go env GOPATH)/bin/xcaddy" build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$(go env GOPATH)/bin/caddy"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$GOPATH/bin/xcaddy" build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$GOPATH/bin/caddy"
 
-      - name: Install musl libc and Alpine libgcc for Native NaiveProxy Tests
-        run: |
-          sudo apt-get update && sudo apt-get install -y musl
-          mkdir -p /tmp/musl-lib
-          alpine_container=$(docker create alpine:3.20 sh -c "apk add --no-cache libgcc")
-          trap 'docker rm -f "$alpine_container" >/dev/null' EXIT
-          docker start -a "$alpine_container"
-          test "$(docker inspect -f '{{.State.ExitCode}}' "$alpine_container")" = 0
-          docker cp "$alpine_container:/usr/lib/libgcc_s.so.1" /tmp/musl-lib/libgcc_s.so.1
-          sudo cp /tmp/musl-lib/libgcc_s.so.1 /usr/lib/x86_64-linux-musl/libgcc_s.so.1
+          apt-get update && apt-get install -y musl
+          (
+            alpine_container=$(docker create alpine:3.20 sh -c "apk add --no-cache libgcc")
+            trap 'docker rm -f "$alpine_container" >/dev/null' EXIT
+            docker start -a "$alpine_container"
+            test "$(docker inspect -f '{{.State.ExitCode}}' "$alpine_container")" = 0
+            docker cp "$alpine_container:/usr/lib/libgcc_s.so.1" "$job_tmp/libgcc_s.so.1"
+          )
+          cp "$job_tmp/libgcc_s.so.1" /usr/lib/x86_64-linux-musl/libgcc_s.so.1
 
-      - name: Run Tests with Race Detector
-        run: go test -race -cover -count=1 -coverprofile=coverage.out ./...
-
-      - name: Run Authentic Native Caddy Integration Tests
-        run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
-
-      - name: Run Vision Tests (non-race)
-        run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
+          go test -race -cover -count=1 -coverprofile=coverage.out ./...
+          go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
+          go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
+          SCRIPT
 
       - name: Upload Test Coverage
         uses: actions/upload-artifact@v7
