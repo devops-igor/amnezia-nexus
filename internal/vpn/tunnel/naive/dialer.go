@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -207,8 +208,11 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	if err != nil {
 		d.daemonMu.Lock()
 		h3Active := d.params.EnableH3 && d.params.H3Supported
+		dm := d.daemon
 		d.daemonMu.Unlock()
-		if h3Active && ctx.Err() == nil {
+		daemonUnhealthy := dm != nil && !dm.IsHealthy()
+		isDestErr := isDestinationConnectionError(err, address)
+		if h3Active && ctx.Err() == nil && (daemonUnhealthy || !isDestErr) {
 			d.fallbackToH2()
 			if fallbackSd, fallbackErr := d.getOrStartDaemon(ctx); fallbackErr == nil {
 				if fbConn, fbErr := fallbackSd.DialContext(ctx, network, address); fbErr == nil {
@@ -216,9 +220,11 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 				}
 			}
 		}
-		d.daemonMu.Lock()
-		d.lastErr = err
-		d.daemonMu.Unlock()
+		if !isDestErr {
+			d.daemonMu.Lock()
+			d.lastErr = err
+			d.daemonMu.Unlock()
+		}
 		return nil, fmt.Errorf("naive: native daemon dial failed: %w", err)
 	}
 
@@ -229,19 +235,25 @@ func (d *Dialer) dialAllowsInProcess(ctx context.Context, network, address strin
 	d.daemonMu.Lock()
 	sd := d.socks5Dialer
 	h3Active := d.params.EnableH3 && d.params.H3Supported
+	dm := d.daemon
 	d.daemonMu.Unlock()
 	if sd != nil {
 		conn, err := sd.DialContext(ctx, network, address)
 		if err == nil {
 			return conn, nil
 		}
-		if h3Active && ctx.Err() == nil {
+		daemonUnhealthy := dm != nil && !dm.IsHealthy()
+		isDestErr := isDestinationConnectionError(err, address)
+		if h3Active && ctx.Err() == nil && (daemonUnhealthy || !isDestErr) {
 			d.fallbackToH2()
 			if fallbackSd, fallbackErr := d.getOrStartDaemon(ctx); fallbackErr == nil {
 				if fbConn, fbErr := fallbackSd.DialContext(ctx, network, address); fbErr == nil {
 					return fbConn, nil
 				}
 			}
+		}
+		if isDestErr {
+			return nil, err
 		}
 		if d.inProcessFallback {
 			return d.dialInProcess(ctx, address)
@@ -254,6 +266,9 @@ func (d *Dialer) dialAllowsInProcess(ctx context.Context, network, address strin
 			conn, err := sd.DialContext(ctx, network, address)
 			if err == nil {
 				return conn, nil
+			}
+			if isDestinationConnectionError(err, address) {
+				return nil, err
 			}
 		}
 		return d.dialInProcess(ctx, address)
@@ -463,4 +478,58 @@ func (d *Dialer) fallbackToH2() {
 func basicAuth(username, password string) string {
 	auth := username + ":" + password
 	return base64.StdEncoding.EncodeToString([]byte(auth))
+}
+
+// isDestinationConnectionError reports whether err represents a failure connecting to
+// the remote destination (e.g. SOCKS5 status rejection like connection refused, network/host
+// unreachable), rather than an upstream transport or local proxy daemon failure.
+func isDestinationConnectionError(err error, dstAddress string) bool {
+	if err == nil {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		var innerOp *net.OpError
+		if errors.As(opErr.Err, &innerOp) && innerOp.Op == "dial" {
+			if !isSameTarget(innerOp.Addr, dstAddress) {
+				return false
+			}
+		}
+	}
+	errStr := strings.ToLower(err.Error())
+	for _, p := range []string{
+		"unknown error connection refused", "unknown error host unreachable",
+		"unknown error network unreachable", "unknown error connection not allowed",
+		"unknown error ttl expired", "unknown error command not supported",
+		"unknown error address type not supported", "connection refused",
+		"host unreachable", "network unreachable", "no route to host",
+		"connection not allowed",
+	} {
+		if strings.Contains(errStr, p) {
+			return true
+		}
+	}
+	var sysErr syscall.Errno
+	if errors.As(err, &sysErr) {
+		switch sysErr {
+		case syscall.ECONNREFUSED, syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ETIMEDOUT:
+			return true
+		}
+	}
+	return false
+}
+
+func isSameTarget(addr net.Addr, target string) bool {
+	if addr == nil || target == "" {
+		return false
+	}
+	if addr.String() == target {
+		return true
+	}
+	h1, p1, err1 := net.SplitHostPort(addr.String())
+	h2, p2, err2 := net.SplitHostPort(target)
+	if err1 != nil || err2 != nil || p1 != p2 {
+		return false
+	}
+	return strings.EqualFold(h1, h2) || (h1 == "127.0.0.1" && h2 == "localhost") || (h1 == "localhost" && h2 == "127.0.0.1")
 }

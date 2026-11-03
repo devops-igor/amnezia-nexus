@@ -81,7 +81,12 @@ func (d *Dialer) probeViaDaemonWithFallback(ctx context.Context, camTarget strin
 	}
 
 	latency, probeErr := d.probeViaDaemon(probeCtx, camTarget, p, sd)
-	if probeErr != nil && h3Active && ctx.Err() == nil {
+	d.daemonMu.Lock()
+	dm := d.daemon
+	d.daemonMu.Unlock()
+	daemonUnhealthy := dm != nil && !dm.IsHealthy()
+	isDestErr := isDestinationConnectionError(probeErr, camTarget)
+	if probeErr != nil && h3Active && ctx.Err() == nil && (daemonUnhealthy || !isDestErr) {
 		d.fallbackToH2()
 		p.H3Supported = false
 		if fallbackSd, fallbackErr := d.getOrStartDaemon(ctx); fallbackErr == nil {
