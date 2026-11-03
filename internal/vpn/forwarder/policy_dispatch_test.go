@@ -685,3 +685,85 @@ func TestPolicyDispatch_DirectTransmissionErrorAccounting(t *testing.T) {
 		t.Fatalf("expected 0 accountant RxBytes on failed transmission, got %d", rx)
 	}
 }
+
+func TestPolicyDispatch_R2B1_AuthorizingGenerationMismatchRejected(t *testing.T) {
+	fwd, dem, wanDev, rc := setupForwarderWithPBR(t)
+
+	peerKey := "peer-r2b1"
+	clientIP := "10.100.0.83"
+	sessionID := "s-r2b1"
+	capPath := newTestCaptureReturnPath()
+
+	fwd.RegisterSessionWithReturnPath(sessionID, "c-r2b1", peerKey, clientIP, 204, capPath.path)
+	targetIP := netip.MustParseAddr("1.1.1.1")
+	rc.Set(sessionID, targetIP, policy.Direct)
+
+	pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), targetIP, 10002, 53, []byte("r2b1-data"))
+
+	// Calling RouteDirect with mismatched generation must fail closed
+	err := dem.RouteDirect(peerKey, clientIP, sessionID, 999, pkt, capPath.path)
+	if !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered on generation mismatch, got %v", err)
+	}
+	if len(wanDev.getPackets()) != 0 {
+		t.Fatalf("packet with mismatched generation must not reach WAN, got %d", len(wanDev.getPackets()))
+	}
+
+	// Calling RouteDirect with mismatched sessionID must fail closed
+	err = dem.RouteDirect(peerKey, clientIP, "wrong-session", 1, pkt, capPath.path)
+	if !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered on sessionID mismatch, got %v", err)
+	}
+}
+
+func TestPolicyDispatch_R2H1_DirectWANReplyWriteFenceAndQueueBounding(t *testing.T) {
+	fwd, dem, wanDev, rc := setupForwarderWithPBR(t)
+
+	peerKey := "peer-r2h1"
+	clientIP := "10.100.0.84"
+	sessionID := "s-r2h1"
+	capPath := newTestCaptureReturnPath()
+
+	fwd.RegisterSessionWithReturnPath(sessionID, "c-r2h1", peerKey, clientIP, 205, capPath.path)
+	targetIP := netip.MustParseAddr("1.1.1.1")
+	rc.Set(sessionID, targetIP, policy.Direct)
+
+	pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), targetIP, 10003, 53, []byte("r2h1-data"))
+	if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
+		t.Fatalf("RouteClientToBackend failed: %v", err)
+	}
+
+	wanPkts := wanDev.getPackets()
+	if len(wanPkts) != 1 {
+		t.Fatalf("expected 1 WAN packet, got %d", len(wanPkts))
+	}
+	natPort := binary.BigEndian.Uint16(wanPkts[0][20:22])
+
+	fwd.mu.RLock()
+	route := fwd.routesByPeer[peerKey]
+	fwd.mu.RUnlock()
+
+	// 1. Fill clientQueue to capacity -> HandleWANReply must reject with ErrQueueFull
+	for len(route.clientQueue) < cap(route.clientQueue) {
+		route.clientQueue <- pkt
+	}
+
+	hostWAN := dem.cfg.HostWANIP
+	reply := buildTestIPv4UDPPacket(targetIP, hostWAN, 53, natPort, []byte("reply-full"))
+	err := dem.HandleWANReply(reply)
+	if !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("expected ErrQueueFull on saturated clientQueue, got %v", err)
+	}
+
+	// Drain queue
+	for len(route.clientQueue) > 0 {
+		<-route.clientQueue
+	}
+
+	// 2. Route retirement write fence -> HandleWANReply must reject with ErrSessionNotRegistered
+	route.retired.Store(true)
+	err = dem.HandleWANReply(reply)
+	if !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered on retired route WAN reply, got %v", err)
+	}
+}

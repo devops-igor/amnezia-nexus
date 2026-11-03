@@ -181,7 +181,7 @@ func (f *Forwarder) sendToDirectEgress(directEgress *DirectEgressManager, route 
 	}
 
 	// Call RouteDirect FIRST
-	err := directEgress.RouteDirect(peerKey, route.assignedIP, packet, route.returnPath)
+	err := directEgress.RouteDirect(peerKey, route.assignedIP, sID, route.generation, packet, route.returnPath)
 	if err != nil {
 		f.directDrops.Add(1)
 		return err

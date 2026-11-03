@@ -310,3 +310,74 @@ func (f *Forwarder) reconcileQueueOccupancyLocked(route *sessionRoute) {
 	route.queueOccupancy = occupancy
 	f.queueDwell.observe(time.Now(), f.aggregateQueueOccupancy, f.aggregateQueueCapacity)
 }
+
+// DeliverDirectWANReply admits and delivers a direct WAN reply to a peer's return path
+// under bounded queue admission, rate limiting, and route write fence synchronization.
+func (f *Forwarder) DeliverDirectWANReply(peerKey, sessionID string, generation uint64, retPath *ReturnPath, packet []byte) error {
+	if f == nil {
+		if retPath == nil || retPath.Closed() {
+			return ErrReturnPathClosed
+		}
+		return retPath.WritePacket(peerKey, "", packet)
+	}
+
+	pktLen := int64(len(packet))
+	if pktLen > MaxClientQueuePacketBytes {
+		f.dropsPacketTooLarge.Add(1)
+		f.dropsTotal.Add(1)
+		return ErrPacketTooLarge
+	}
+
+	f.mu.RLock()
+	route, exists := f.routesByPeer[peerKey]
+	if !exists || route == nil {
+		f.mu.RUnlock()
+		return ErrSessionNotRegistered
+	}
+	if route.retired.Load() || (generation != 0 && route.generation != generation) || (sessionID != "" && route.sessionID != sessionID) || (retPath != nil && route.returnPath != retPath) {
+		f.mu.RUnlock()
+		return ErrSessionNotRegistered
+	}
+	if len(route.clientQueue) >= cap(route.clientQueue) {
+		route.queueFullDrops.Add(1)
+		f.dropsQueueFull.Add(1)
+		f.dropsTotal.Add(1)
+		f.mu.RUnlock()
+		return ErrQueueFull
+	}
+	if route.tbDown != nil && !route.tbDown.Allow(pktLen) {
+		f.clientDropsRateLimited.Add(1)
+		f.mu.RUnlock()
+		return ErrRateLimitExceeded
+	}
+	clientIP := route.assignedIP
+	sID := route.sessionID
+	cID := route.connectionID
+	f.mu.RUnlock()
+
+	route.writeMu.Lock()
+	if route.retired.Load() {
+		route.writeMu.Unlock()
+		return ErrSessionNotRegistered
+	}
+	route.writeMu.Unlock()
+
+	if err := retPath.WritePacket(peerKey, clientIP, packet); err != nil {
+		return err
+	}
+
+	route.writeMu.Lock()
+	if route.retired.Load() {
+		route.writeMu.Unlock()
+		return ErrSessionNotRegistered
+	}
+	route.traffic.AddTx(pktLen)
+	f.totalTxBytes.Add(pktLen)
+	f.totalTxPackets.Add(1)
+	if f.accountant != nil {
+		f.accountant.RecordTx(sID, cID, pktLen)
+	}
+	route.writeMu.Unlock()
+
+	return nil
+}
