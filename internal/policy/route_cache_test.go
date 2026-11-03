@@ -383,7 +383,7 @@ func TestRouteCache_CapacityAndQuarantine(t *testing.T) {
 		{IP: ip1, Decision: Direct, ExpiresAt: now.Add(30 * time.Second)},
 		{IP: ip2, Decision: Proxy, ExpiresAt: now.Add(30 * time.Second)},
 	}, now)
-	// Add ip3 as Direct: should evict ip1 (Direct), keep ip2 (Proxy)
+	// Add ip3 as Direct: should evict one Direct entry, keep ip2 (Proxy)
 	err := s.Observe("gen-1", []Observation{
 		{IP: ip3, Decision: Direct, ExpiresAt: now.Add(30 * time.Second)},
 	}, now)
@@ -393,11 +393,15 @@ func TestRouteCache_CapacityAndQuarantine(t *testing.T) {
 	if got := s.Lookup(ip2, "gen-1", now); got != Proxy {
 		t.Errorf("expected ip2 to remain Proxy, got %v", got)
 	}
+	// Eviction has no ordering guarantee; name the survivor ip3 for the steps below.
+	if s.Lookup(ip1, "gen-1", now) == Direct {
+		ip1, ip3 = ip3, ip1
+	}
 	if got := s.Lookup(ip3, "gen-1", now); got != Direct {
-		t.Errorf("expected ip3 to be Direct, got %v", got)
+		t.Errorf("expected surviving Direct entry, got %v", got)
 	}
 	if got := s.Lookup(ip1, "gen-1", now); got != Unknown {
-		t.Errorf("expected evicted ip1 to be Unknown, got %v", got)
+		t.Errorf("expected evicted Direct entry to be Unknown, got %v", got)
 	}
 
 	// 2. Quarantine trigger: when PROXY cannot fit
