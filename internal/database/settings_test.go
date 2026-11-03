@@ -350,7 +350,28 @@ func TestSettingsGigahostEncryptionAndFilePermissions(t *testing.T) {
 	}
 
 	// 5. Test prepareGigahostSettingForStore edge cases
-	if db.prepareGigahostSettingForStore(nil) != nil {
-		t.Error("expected nil for nil input")
+	val, err := db.prepareGigahostSettingForStore(nil)
+	if err != nil || val != nil {
+		t.Errorf("expected nil for nil input, got val=%v err=%v", val, err)
+	}
+
+	// 6. Fail-closed: assert encryption failure rejects settings storage and never stores plaintext
+	dbBroken := &DB{
+		sqlDB:     db.sqlDB,
+		secretKey: "", // empty secret key causes EncryptCredential to fail
+	}
+	sensitiveKey := "flux_live_plaintext_must_never_be_stored"
+	badSetting := map[string]any{
+		"api_key": sensitiveKey,
+	}
+	if err := dbBroken.SetSetting(ctx, "gigahost", badSetting); err == nil {
+		t.Fatal("expected SetSetting to fail closed when encryption fails, got nil error")
+	}
+	if err := dbBroken.SetSettingsBulk(ctx, map[string]any{"gigahost": badSetting}); err == nil {
+		t.Fatal("expected SetSettingsBulk to fail closed when encryption fails, got nil error")
+	}
+	rawAfterFail, _, _ := db.GetSettingRaw(ctx, "gigahost")
+	if strings.Contains(rawAfterFail.String, sensitiveKey) {
+		t.Fatalf("plaintext key leaked into database on failed encryption: %s", rawAfterFail.String)
 	}
 }

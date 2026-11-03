@@ -684,30 +684,62 @@
     async function loadRecentOrders() {
         const container = document.getElementById('recentOrdersContainer');
         if (!container) return;
+        const renderEmpty = () => {
+            const emptySpan = document.createElement('span');
+            emptySpan.className = 'text-muted';
+            emptySpan.textContent = _('no_matching_records');
+            container.replaceChildren(emptySpan);
+        };
         try {
             const res = await API.get('/api/admin/hosting/gigahost/orders');
             const orders = (res && res.orders) ? res.orders : [];
             if (orders.length === 0) {
-                container.innerHTML = '<span class="text-muted">' + _('no_matching_records') + '</span>';
+                renderEmpty();
                 return;
             }
-            let html = '<div style="display:flex; flex-direction:column; gap:6px;">';
+            const list = document.createElement('div');
+            list.style.display = 'flex';
+            list.style.flexDirection = 'column';
+            list.style.gap = '6px';
             orders.slice(0, 5).forEach(o => {
                 const badgeClass = o.status === 'ready' ? 'badge-success' : (o.status === 'failed' ? 'badge-danger' : 'badge-warn');
-                html += `<div style="display:flex; justify-content:space-between; align-items:center; padding:4px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
-                    <div>
-                        <span style="font-family:monospace; font-weight:600;">#${o.order_id}</span>
-                        ${o.assigned_ip ? `<span style="font-family:monospace; margin-left:6px; color:var(--text-secondary);">${o.assigned_ip}</span>` : ''}
-                    </div>
-                    <div>
-                        <span class="badge ${badgeClass}" style="font-size:0.75rem;">${o.status}</span>
-                    </div>
-                </div>`;
+                const row = document.createElement('div');
+                row.style.display = 'flex';
+                row.style.justifyContent = 'space-between';
+                row.style.alignItems = 'center';
+                row.style.padding = '4px 0';
+                row.style.borderBottom = '1px solid rgba(255,255,255,0.05)';
+
+                const left = document.createElement('div');
+                const idSpan = document.createElement('span');
+                idSpan.style.fontFamily = 'monospace';
+                idSpan.style.fontWeight = '600';
+                idSpan.textContent = '#' + (o.order_id || '');
+                left.appendChild(idSpan);
+
+                if (o.assigned_ip) {
+                    const ipSpan = document.createElement('span');
+                    ipSpan.style.fontFamily = 'monospace';
+                    ipSpan.style.marginLeft = '6px';
+                    ipSpan.style.color = 'var(--text-secondary)';
+                    ipSpan.textContent = o.assigned_ip;
+                    left.appendChild(ipSpan);
+                }
+
+                const right = document.createElement('div');
+                const badge = document.createElement('span');
+                badge.className = 'badge ' + badgeClass;
+                badge.style.fontSize = '0.75rem';
+                badge.textContent = o.status || '';
+                right.appendChild(badge);
+
+                row.appendChild(left);
+                row.appendChild(right);
+                list.appendChild(row);
             });
-            html += '</div>';
-            container.innerHTML = html;
+            container.replaceChildren(list);
         } catch (_) {
-            container.innerHTML = '<span class="text-muted">' + _('no_matching_records') + '</span>';
+            renderEmpty();
         }
     }
 

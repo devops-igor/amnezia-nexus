@@ -736,7 +736,7 @@ func TestClient_DocumentedWireContracts(t *testing.T) {
 		}
 	})
 
-	t.Run("documented account without balance returns credit", func(t *testing.T) {
+	t.Run("documented account without balance returns no credit", func(t *testing.T) {
 		accJSON := `{"meta":{"status":200},"data":{"cust_id":"1111","cust_name":"Example AS","sshkeys":[],"orders":[]}}`
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
@@ -752,8 +752,8 @@ func TestClient_DocumentedWireContracts(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !acc.HasCredit() {
-			t.Errorf("expected documented customer with cust_id to have credit, got false")
+		if acc.HasCredit() {
+			t.Errorf("expected customer without balance/credit/arrears to have HasCredit=false, got true")
 		}
 	})
 

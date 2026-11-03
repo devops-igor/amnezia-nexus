@@ -74,6 +74,7 @@ type Handlers struct {
 	upstreamSvc               UpstreamChecker
 	gigahostClient            gigahost.Client
 	gigahostMu                sync.RWMutex
+	budgetMu                  sync.Mutex
 	dialTimeout               func(network, address string, timeout time.Duration) (net.Conn, error)
 	setupMu                   sync.Mutex
 	captchaOnce               sync.Once

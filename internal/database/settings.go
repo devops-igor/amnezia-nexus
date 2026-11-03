@@ -156,7 +156,11 @@ func (d *DB) SetSetting(ctx context.Context, key string, value any) error {
 	if key == "ssl" {
 		valToStore = d.prepareSSLSettingForStore(value)
 	} else if key == "gigahost" {
-		valToStore = d.prepareGigahostSettingForStore(value)
+		var prepErr error
+		valToStore, prepErr = d.prepareGigahostSettingForStore(value)
+		if prepErr != nil {
+			return prepErr
+		}
 	}
 
 	b, err := json.Marshal(valToStore)
@@ -198,7 +202,11 @@ func (d *DB) SetSettingsBulk(ctx context.Context, settings map[string]any) error
 		if key == "ssl" {
 			valToStore = d.prepareSSLSettingForStore(value)
 		} else if key == "gigahost" {
-			valToStore = d.prepareGigahostSettingForStore(value)
+			var prepErr error
+			valToStore, prepErr = d.prepareGigahostSettingForStore(value)
+			if prepErr != nil {
+				return prepErr
+			}
 		}
 
 		b, err := json.Marshal(valToStore)
@@ -375,9 +383,9 @@ func (d *DB) prepareSSLSettingForStore(value any) any {
 	}
 }
 
-func (d *DB) prepareGigahostSettingForStore(value any) any {
+func (d *DB) prepareGigahostSettingForStore(value any) (any, error) {
 	if value == nil {
-		return nil
+		return nil, nil
 	}
 	switch v := value.(type) {
 	case map[string]any:
@@ -386,24 +394,30 @@ func (d *DB) prepareGigahostSettingForStore(value any) any {
 			ghCopy[k] = val
 		}
 		if apiKey, ok := ghCopy["api_key"].(string); ok && apiKey != "" && !security.LooksLikeFernetToken(apiKey) {
-			if enc, err := security.EncryptCredential(apiKey, d.secretKey); err == nil {
-				ghCopy["api_key"] = enc
+			enc, err := security.EncryptCredential(apiKey, d.secretKey)
+			if err != nil {
+				return nil, fmt.Errorf("encrypt gigahost api key: %w", err)
 			}
+			ghCopy["api_key"] = enc
 		}
-		return ghCopy
+		return ghCopy, nil
 	default:
 		b, err := json.Marshal(value)
-		if err == nil {
-			var ghMap map[string]any
-			if err := json.Unmarshal(b, &ghMap); err == nil {
-				if apiKey, ok := ghMap["api_key"].(string); ok && apiKey != "" && !security.LooksLikeFernetToken(apiKey) {
-					if enc, err := security.EncryptCredential(apiKey, d.secretKey); err == nil {
-						ghMap["api_key"] = enc
-						return ghMap
-					}
-				}
-			}
+		if err != nil {
+			return nil, fmt.Errorf("marshal gigahost setting: %w", err)
 		}
-		return value
+		var ghMap map[string]any
+		if err := json.Unmarshal(b, &ghMap); err != nil {
+			return nil, fmt.Errorf("unmarshal gigahost setting: %w", err)
+		}
+		if apiKey, ok := ghMap["api_key"].(string); ok && apiKey != "" && !security.LooksLikeFernetToken(apiKey) {
+			enc, err := security.EncryptCredential(apiKey, d.secretKey)
+			if err != nil {
+				return nil, fmt.Errorf("encrypt gigahost api key: %w", err)
+			}
+			ghMap["api_key"] = enc
+			return ghMap, nil
+		}
+		return value, nil
 	}
 }

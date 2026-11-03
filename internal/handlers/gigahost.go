@@ -281,10 +281,16 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 2. Monthly NOK budget cap enforcement
+	// 2. Concurrency serialization: lock around budget check, intent creation, and reservation
+	h.budgetMu.Lock()
+	defer h.budgetMu.Unlock()
+
+	// Monthly NOK budget cap enforcement
 	if err := h.checkMonthlyBudget(r.Context(), client, req); err != nil {
 		if strings.HasPrefix(err.Error(), "Monthly budget cap exceeded") {
 			h.JSONError(w, http.StatusBadRequest, "budget_exceeded", err.Error())
+		} else if strings.HasPrefix(err.Error(), "invalid_plan:") {
+			h.JSONError(w, http.StatusBadRequest, "invalid_plan", strings.TrimPrefix(err.Error(), "invalid_plan: "))
 		} else {
 			h.JSONError(w, http.StatusBadGateway, "catalog_check_failed", err.Error())
 		}
@@ -348,6 +354,16 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if orderErr != nil {
+		var partialErr *gigahost.OrderPartialError
+		if errors.As(orderErr, &partialErr) {
+			h.JSON(w, http.StatusPaymentRequired, map[string]any{
+				"status":   orderRecord.Status,
+				"message":  partialErr.Message,
+				"order_id": orderRecord.OrderID,
+				"order":    orderRecord,
+			})
+			return
+		}
 		if orderResp != nil && orderResp.Status == gigahost.StatusUnknown {
 			h.JSON(w, http.StatusAccepted, map[string]any{
 				"status":  "unknown",
@@ -414,9 +430,6 @@ func requestMonthlySpend(catalog []gigahost.HourlyPlan, req OrderServerPayload) 
 			}
 			break
 		}
-	}
-	if req.HourlyPriceNOK > 0 {
-		return req.HourlyPriceNOK * 720
 	}
 	return 0
 }
@@ -510,6 +523,34 @@ func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Clien
 		return fmt.Errorf("failed to check catalog for budget verification: %w", catErr)
 	}
 
+	var matchedPlan *gigahost.HourlyPlan
+	for i := range catalog {
+		if catalog[i].ProductID == req.PID && (req.PriceID == 0 || catalog[i].PriceID == req.PriceID) {
+			matchedPlan = &catalog[i]
+			break
+		}
+	}
+	if matchedPlan == nil {
+		return fmt.Errorf("invalid_plan: plan %d (price %d) not found in provider catalog", req.PID, req.PriceID)
+	}
+	if len(matchedPlan.Regions) > 0 {
+		regionValid := false
+		for _, r := range matchedPlan.Regions {
+			if r.ID == req.RegionID && r.Available {
+				regionValid = true
+				break
+			}
+		}
+		if !regionValid {
+			return fmt.Errorf("invalid_plan: region %d is not available for plan %d", req.RegionID, req.PID)
+		}
+	}
+
+	planMonthlyRate := requestMonthlySpend(catalog, req)
+	if planMonthlyRate <= 0 {
+		return fmt.Errorf("invalid_plan: plan %d has zero or negative price in provider catalog", req.PID)
+	}
+
 	servers, srvErr := client.GetServers(ctx)
 	if srvErr != nil {
 		return fmt.Errorf("failed to check existing server inventory for budget verification: %w", srvErr)
@@ -522,7 +563,6 @@ func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Clien
 
 	h.reconcileBudgetOrders(ctx, client, servers, localOrders)
 
-	planMonthlyRate := requestMonthlySpend(catalog, req)
 	committed := calculateCommittedSpend(catalog, servers, localOrders)
 
 	if committed+planMonthlyRate > ghCfg.MonthlyBudgetNOK {
@@ -531,15 +571,32 @@ func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Clien
 	return nil
 }
 
+func isPendingOrInFlight(status string) bool {
+	switch strings.ToLower(status) {
+	case "pending_order", gigahost.StatusUnknown, gigahost.StatusWaiting, "pending_payment",
+		gigahost.StatusPending, gigahost.StatusDeploying, gigahost.StatusInstalling:
+		return true
+	default:
+		return false
+	}
+}
+
 func (h *Handlers) reconcilePendingUnknownOrders(ctx context.Context, client gigahost.Client, req OrderServerPayload) (*GigahostOrderRecord, error) {
 	existingOrders, _ := h.getGigahostOrders(ctx)
+	var servers []gigahost.ServerInfo
+	var checkErr error
+	checkedServers := false
+
 	for i := range existingOrders {
-		if existingOrders[i].Status != gigahost.StatusUnknown && existingOrders[i].Status != "pending_order" {
+		if !isPendingOrInFlight(existingOrders[i].Status) {
 			continue
 		}
-		servers, checkErr := client.GetServers(ctx)
-		if checkErr != nil {
-			return nil, fmt.Errorf("cannot verify provider inventory while order %s is unresolved: %w", existingOrders[i].OrderID, checkErr)
+		if !checkedServers {
+			servers, checkErr = client.GetServers(ctx)
+			if checkErr != nil {
+				return nil, fmt.Errorf("cannot verify provider inventory while order %s is unresolved: %w", existingOrders[i].OrderID, checkErr)
+			}
+			checkedServers = true
 		}
 		matched := false
 		for _, s := range servers {
@@ -558,7 +615,20 @@ func (h *Handlers) reconcilePendingUnknownOrders(ctx context.Context, client gig
 				break
 			}
 		}
-		if !matched && existingOrders[i].PlanID == req.PID && existingOrders[i].RegionID == req.RegionID {
+		if !matched && existingOrders[i].OrderID != "" && !strings.HasPrefix(existingOrders[i].OrderID, "intent_") && !strings.HasPrefix(existingOrders[i].OrderID, "unknown_") {
+			statusResp, err := client.GetDeployStatus(ctx, existingOrders[i].OrderID)
+			if err == nil && statusResp != nil && statusResp.Status != "" {
+				existingOrders[i].Status = statusResp.Status
+				if statusResp.ServerID > 0 {
+					existingOrders[i].ServerID = statusResp.ServerID
+				}
+				if ip := statusResp.GetIP(); ip != "" {
+					existingOrders[i].AssignedIP = ip
+				}
+				_ = h.updateGigahostOrder(ctx, &existingOrders[i])
+			}
+		}
+		if !matched && isPendingOrInFlight(existingOrders[i].Status) && existingOrders[i].PlanID == req.PID && existingOrders[i].RegionID == req.RegionID {
 			return &existingOrders[i], nil
 		}
 	}
@@ -576,6 +646,14 @@ func applyOrderResponseToRecord(orderRecord *GigahostOrderRecord, orderResp *gig
 		if orderResp.Status != "" {
 			orderRecord.Status = orderResp.Status
 		}
+	}
+	var partialErr *gigahost.OrderPartialError
+	if errors.As(orderErr, &partialErr) {
+		if firstID := partialErr.FirstOrderID(); firstID != "" {
+			orderRecord.OrderID = firstID
+		}
+		orderRecord.Status = gigahost.StatusWaiting
+		return
 	}
 	if orderErr != nil {
 		if orderResp != nil && orderResp.Status == gigahost.StatusUnknown {
@@ -655,20 +733,6 @@ func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client giga
 	return false
 }
 
-func (h *Handlers) refreshSingleOrder(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord) bool {
-	if isTerminalStatus(order.Status) {
-		return false
-	}
-
-	if servers, err := client.GetServers(ctx); err == nil {
-		if h.refreshOrderFromServers(servers, order) {
-			return true
-		}
-	}
-
-	return h.refreshOrderFromDeployStatus(ctx, client, order)
-}
-
 // GigahostOrdersHandler handles GET /api/admin/hosting/gigahost/orders.
 // Lists persistent order history and refreshes status for active/pending jobs.
 func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request) {
@@ -687,8 +751,21 @@ func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request)
 	// Refresh all non-terminal orders if client is accessible
 	client, clientErr := h.getGigahostClient(r.Context(), r)
 	if clientErr == nil && len(orders) > 0 {
+		servers, _ := client.GetServers(r.Context())
+		deployQueries := 0
+		const maxDeployQueries = 10
 		for i := range orders {
-			if h.refreshSingleOrder(r.Context(), client, &orders[i]) {
+			if isTerminalStatus(orders[i].Status) {
+				continue
+			}
+			updated := false
+			if len(servers) > 0 && h.refreshOrderFromServers(servers, &orders[i]) {
+				updated = true
+			} else if deployQueries < maxDeployQueries && h.refreshOrderFromDeployStatus(r.Context(), client, &orders[i]) {
+				deployQueries++
+				updated = true
+			}
+			if updated {
 				_ = h.updateGigahostOrder(r.Context(), &orders[i])
 			}
 		}

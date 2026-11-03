@@ -276,6 +276,14 @@ func (c *client) OrderServerSafe(ctx context.Context, req OrderRequest) (*OrderR
 		return resp, nil
 	}
 
+	var partialErr *OrderPartialError
+	if errors.As(orderErr, &partialErr) {
+		c.mu.Lock()
+		delete(c.unknownOrders, reqKey)
+		c.mu.Unlock()
+		return nil, orderErr
+	}
+
 	// 3. Inspect if failure is timeout/network related
 	if isTimeoutOrNetworkError(orderErr) {
 		c.mu.Lock()
@@ -396,6 +404,9 @@ func (c *client) doRequest(ctx context.Context, method, path string, body any, t
 		return fmt.Errorf("%w: %s", ErrNotFound, extractErrorMessage(respBytes))
 
 	default:
+		if partialErr := parsePartialOrderError(resp.StatusCode, respBytes); partialErr != nil {
+			return partialErr
+		}
 		return &APIError{
 			StatusCode: resp.StatusCode,
 			Message:    extractErrorMessage(respBytes),
@@ -462,7 +473,7 @@ func buildTierProduct(p tierProductDTO, regionMap map[int]Region, currency strin
 	}
 
 	var prices []Price
-	if p.AllowHourly || p.PriceID > 0 {
+	if p.AllowHourly && p.PriceID > 0 && p.InStock {
 		prices = append(prices, Price{
 			ID:             p.PriceID,
 			BillingPeriod:  BillingPeriodHourly,
@@ -625,4 +636,76 @@ func isTimeoutOrNetworkError(err error) bool {
 		strings.Contains(errStr, "connection refused") ||
 		strings.Contains(errStr, "connection reset") ||
 		strings.Contains(errStr, "eof")
+}
+
+func parsePartialOrderError(statusCode int, data []byte) *OrderPartialError {
+	if len(data) == 0 {
+		return nil
+	}
+	type rawOrderEnvelope struct {
+		OrderIDs []any `json:"order_ids"`
+		OrderID  any   `json:"order_id"`
+		Orders   []struct {
+			OrderID any `json:"order_id"`
+		} `json:"orders"`
+		Data struct {
+			OrderIDs []any `json:"order_ids"`
+			OrderID  any   `json:"order_id"`
+			Orders   []struct {
+				OrderID any `json:"order_id"`
+			} `json:"orders"`
+		} `json:"data"`
+	}
+	var env rawOrderEnvelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return nil
+	}
+
+	var parsedIDs []int64
+	addID := func(v any) {
+		id := parseInt64Field(v)
+		if id > 0 {
+			for _, existing := range parsedIDs {
+				if existing == id {
+					return
+				}
+			}
+			parsedIDs = append(parsedIDs, id)
+		}
+	}
+
+	for _, id := range env.OrderIDs {
+		addID(id)
+	}
+	if env.OrderID != nil {
+		addID(env.OrderID)
+	}
+	for _, o := range env.Orders {
+		addID(o.OrderID)
+	}
+	for _, id := range env.Data.OrderIDs {
+		addID(id)
+	}
+	if env.Data.OrderID != nil {
+		addID(env.Data.OrderID)
+	}
+	for _, o := range env.Data.Orders {
+		addID(o.OrderID)
+	}
+
+	if len(parsedIDs) == 0 {
+		return nil
+	}
+
+	msg := extractErrorMessage(data)
+	if msg == "" || msg == string(data) {
+		msg = fmt.Sprintf("order pending payment/approval (status %d)", statusCode)
+	}
+
+	return &OrderPartialError{
+		StatusCode: statusCode,
+		Message:    msg,
+		OrderIDs:   parsedIDs,
+		RawBody:    string(data),
+	}
 }

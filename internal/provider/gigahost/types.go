@@ -60,6 +60,26 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("gigahost api error (status %d): %s", e.StatusCode, e.Message)
 }
 
+// OrderPartialError represents an error where the provider returned a non-2xx HTTP status
+// (e.g. 402 Payment Required or approval pending), but order IDs were created and returned.
+type OrderPartialError struct {
+	StatusCode int     `json:"status_code"`
+	Message    string  `json:"message"`
+	OrderIDs   []int64 `json:"order_ids"`
+	RawBody    string  `json:"raw_body,omitempty"`
+}
+
+func (e *OrderPartialError) Error() string {
+	return fmt.Sprintf("order pending payment/approval (status %d, order_ids %v): %s", e.StatusCode, e.OrderIDs, e.Message)
+}
+
+func (e *OrderPartialError) FirstOrderID() string {
+	if len(e.OrderIDs) > 0 {
+		return strconv.FormatInt(e.OrderIDs[0], 10)
+	}
+	return ""
+}
+
 // ValidateAPIKey ensures the key complies with the format: flux_live_<64-hex-chars>.
 func ValidateAPIKey(key string) error {
 	const prefix = "flux_live_"
@@ -159,7 +179,7 @@ type AccountInfo struct {
 	Status           string  `json:"status,omitempty"`
 }
 
-// HasCredit checks if the account has positive balance, credit, arrears qualification, or verified customer standing.
+// HasCredit checks if the account has positive balance, credit, or arrears qualification.
 func (a *AccountInfo) HasCredit() bool {
 	if a == nil {
 		return false
@@ -167,13 +187,7 @@ func (a *AccountInfo) HasCredit() bool {
 	if a.QualifiesArrears {
 		return true
 	}
-	if (a.Balance + a.Credit + a.CreditNOK) > 0 {
-		return true
-	}
-	if a.CustID != "" || a.ID != "" {
-		return true
-	}
-	return false
+	return (a.Balance + a.Credit + a.CreditNOK) > 0
 }
 
 // OrderRequest represents the payload for ordering a VPS.
