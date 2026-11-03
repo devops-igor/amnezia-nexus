@@ -6,15 +6,15 @@ import (
 
 func TestParseVersion(t *testing.T) {
 	tests := []struct {
-		name       string
-		input      string
-		wantErr    bool
-		wantSegs   []int
-		wantPre    string
-		wantBuild  string
-		wantMajor  int
-		wantMinor  int
-		wantPatch  int
+		name      string
+		input     string
+		wantErr   bool
+		wantSegs  []int
+		wantPre   string
+		wantBuild string
+		wantMajor int
+		wantMinor int
+		wantPatch int
 	}{
 		{
 			name:      "standard 3 segments with v prefix",
