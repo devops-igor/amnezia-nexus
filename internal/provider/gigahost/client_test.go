@@ -539,32 +539,28 @@ func TestClient_OrderServerSafe_TimeoutRecoveryAndIdempotency(t *testing.T) {
 		Quantity:      1,
 	}
 
-	// First call: order times out, but OrderServerSafe recovers the server via GetServers()
+	// First call: order times out, OrderServerSafe marks unknown and fails closed
 	resp, err := c.OrderServerSafe(context.Background(), req)
-	if err != nil {
-		t.Fatalf("expected OrderServerSafe to recover server from timeout, got error: %v", err)
+	if err == nil {
+		t.Fatalf("expected timeout error, got nil")
 	}
-
-	if resp.ServerID != 999 {
-		t.Errorf("expected recovered server_id 999, got %d", resp.ServerID)
-	}
-	if resp.Status != StatusDeploying {
-		t.Errorf("expected status 'deploying', got %s", resp.Status)
+	if resp == nil || resp.Status != StatusUnknown {
+		t.Fatalf("expected status 'unknown', got %+v", resp)
 	}
 
 	// Second call with same order parameters:
-	// Explicit replacement order must NOT adopt existing active server; it dispatches a new order!
+	// Prior unknown outcome must refuse duplicate order without dispatching new POST.
 	initialPostCount := atomic.LoadInt32(&postOrderCalls)
 	resp2, err := c.OrderServerSafe(context.Background(), req)
-	if err != nil {
-		t.Fatalf("second call err: %v", err)
+	if err == nil {
+		t.Fatalf("expected duplicate order to be refused while prior order is unknown")
 	}
-	if atomic.LoadInt32(&postOrderCalls) != initialPostCount+1 {
-		t.Errorf("expected new POST for replacement order, count was %d, wanted %d",
-			atomic.LoadInt32(&postOrderCalls), initialPostCount+1)
+	if resp2 == nil || resp2.Status != StatusUnknown {
+		t.Errorf("expected status 'unknown', got %+v", resp2)
 	}
-	if resp2 == nil || resp2.OrderID == "" {
-		t.Errorf("expected valid order response for replacement order, got: %+v", resp2)
+	if atomic.LoadInt32(&postOrderCalls) != initialPostCount {
+		t.Errorf("expected no new POST, count was %d, wanted %d",
+			atomic.LoadInt32(&postOrderCalls), initialPostCount)
 	}
 }
 

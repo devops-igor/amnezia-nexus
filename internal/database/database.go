@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -156,6 +157,12 @@ func Open(dbPath, secretKey string) (*DB, error) {
 	if err := db.InitSchema(ctx); err != nil {
 		_ = sqlDB.Close()
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
+	}
+
+	if dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file::memory:") && !strings.Contains(dbPath, "mode=memory") {
+		_ = os.Chmod(dbPath, 0600)
+		_ = os.Chmod(dbPath+"-wal", 0600)
+		_ = os.Chmod(dbPath+"-shm", 0600)
 	}
 
 	return db, nil

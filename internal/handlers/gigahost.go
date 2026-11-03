@@ -281,7 +281,17 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 2. Reconcile unknown purchase state before allowing retry (fail closed on error)
+	// 2. Monthly NOK budget cap enforcement
+	if err := h.checkMonthlyBudget(r.Context(), client, req); err != nil {
+		if strings.HasPrefix(err.Error(), "Monthly budget cap exceeded") {
+			h.JSONError(w, http.StatusBadRequest, "budget_exceeded", err.Error())
+		} else {
+			h.JSONError(w, http.StatusBadGateway, "catalog_check_failed", err.Error())
+		}
+		return
+	}
+
+	// 3. Reconcile unknown purchase state before allowing retry (fail closed on error)
 	unresolved, reconcileErr := h.reconcilePendingUnknownOrders(r.Context(), client, req)
 	if reconcileErr != nil {
 		h.JSONError(w, http.StatusServiceUnavailable, "reconciliation_failed", reconcileErr.Error())
@@ -356,6 +366,65 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Client, req OrderServerPayload) error {
+	if h.db == nil {
+		return nil
+	}
+	var ghCfg struct {
+		MonthlyBudgetNOK float64 `json:"monthly_budget_nok"`
+	}
+	_ = h.db.GetSetting(ctx, "gigahost", &ghCfg)
+	if ghCfg.MonthlyBudgetNOK <= 0 {
+		return nil
+	}
+
+	catalog, catErr := client.GetCatalog(ctx)
+	if catErr != nil {
+		return fmt.Errorf("failed to check catalog for budget verification: %w", catErr)
+	}
+
+	var planMonthlyRate float64
+	for _, p := range catalog {
+		if p.ProductID == req.PID && (req.PriceID == 0 || p.PriceID == req.PriceID) {
+			if p.MonthlyCeiling > 0 {
+				planMonthlyRate = p.MonthlyCeiling
+			} else if p.HourlyRateNOK > 0 {
+				planMonthlyRate = p.HourlyRateNOK * 720
+			}
+			break
+		}
+	}
+	if planMonthlyRate == 0 && req.HourlyPriceNOK > 0 {
+		planMonthlyRate = req.HourlyPriceNOK * 720
+	}
+
+	var committed float64
+	servers, srvErr := client.GetServers(ctx)
+	if srvErr == nil {
+		for _, s := range servers {
+			if s.Status == gigahost.StatusReady || s.Status == "active" ||
+				s.Status == gigahost.StatusDeploying || s.Status == gigahost.StatusPending ||
+				s.Status == gigahost.StatusWaiting || s.Status == gigahost.StatusInstalling {
+				for _, p := range catalog {
+					if p.ProductID == s.PID {
+						if p.MonthlyCeiling > 0 {
+							committed += p.MonthlyCeiling
+						} else if p.HourlyRateNOK > 0 {
+							committed += p.HourlyRateNOK * 720
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if committed+planMonthlyRate > ghCfg.MonthlyBudgetNOK {
+		return fmt.Errorf("Monthly budget cap exceeded: requested order exceeds configured budget of %v NOK", ghCfg.MonthlyBudgetNOK)
+	}
+	return nil
+}
+
 func (h *Handlers) reconcilePendingUnknownOrders(ctx context.Context, client gigahost.Client, req OrderServerPayload) (*GigahostOrderRecord, error) {
 	existingOrders, _ := h.getGigahostOrders(ctx)
 	for i := range existingOrders {
@@ -368,11 +437,7 @@ func (h *Handlers) reconcilePendingUnknownOrders(ctx context.Context, client gig
 		}
 		matched := false
 		for _, s := range servers {
-			if (s.OrderID != "" && s.OrderID == existingOrders[i].OrderID) ||
-				(s.PID == existingOrders[i].PlanID && s.RegionID == existingOrders[i].RegionID && (s.Status == gigahost.StatusReady || s.Status == "active")) {
-				if s.OrderID != "" {
-					existingOrders[i].OrderID = s.OrderID
-				}
+			if s.OrderID != "" && s.OrderID == existingOrders[i].OrderID {
 				if s.ID > 0 {
 					existingOrders[i].ServerID = s.ID
 				}
@@ -458,11 +523,7 @@ func (h *Handlers) refreshSingleOrder(ctx context.Context, client gigahost.Clien
 	servers, err := client.GetServers(ctx)
 	if err == nil {
 		for _, s := range servers {
-			if (s.OrderID != "" && s.OrderID == order.OrderID) ||
-				(s.PID == order.PlanID && s.RegionID == order.RegionID && (s.Status == gigahost.StatusReady || s.Status == "active")) {
-				if s.OrderID != "" {
-					order.OrderID = s.OrderID
-				}
+			if s.OrderID != "" && s.OrderID == order.OrderID {
 				if s.ID > 0 {
 					order.ServerID = s.ID
 				}

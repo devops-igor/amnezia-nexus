@@ -127,6 +127,15 @@ func (h *Handlers) SaveSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sess := h.GetSession(r)
+	if sess == nil || !sess.IsAdmin() {
+		if req.Gigahost != nil && len(req.Gigahost) > 0 {
+			h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required to configure provider settings")
+			return
+		}
+		req.Gigahost = nil
+	}
+
 	ctx := r.Context()
 	h.preserveSecretsOnSave(ctx, &req)
 

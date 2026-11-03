@@ -689,3 +689,118 @@ func TestGigahost_SecurityAndDurabilityContracts(t *testing.T) {
 		}
 	})
 }
+
+func TestGigahostOrderHandler_BudgetCap(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+
+	// 1. Budget is 50 NOK; plan rate is 90 NOK -> Rejected with 400
+	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 50.0}); err != nil {
+		t.Fatal(err)
+	}
+
+	posts := 0
+	h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+			return &gigahost.AccountInfo{Balance: 100.0}, nil
+		},
+		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+			return []gigahost.HourlyPlan{
+				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0},
+			}, nil
+		},
+		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			posts++
+			return &gigahost.OrderResponse{OrderID: "10001", Status: "pending"}, nil
+		},
+	})
+
+	body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0.14375}`
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	h.GigahostOrderHandler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "Monthly budget cap exceeded") {
+		t.Errorf("expected budget error message, got %s", w.Body.String())
+	}
+	if posts != 0 {
+		t.Errorf("expected 0 posts when budget exceeded, got %d", posts)
+	}
+
+	// 2. Budget increased to 100 NOK -> Allowed with 200
+	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 100.0}); err != nil {
+		t.Fatal(err)
+	}
+	reqOK := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
+	reqOK = reqOK.WithContext(middleware.WithSession(reqOK.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	wOK := httptest.NewRecorder()
+	h.GigahostOrderHandler(wOK, reqOK)
+
+	if wOK.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d (body: %s)", wOK.Code, wOK.Body.String())
+	}
+	if posts != 1 {
+		t.Errorf("expected 1 post, got %d", posts)
+	}
+}
+
+func TestGigahostOrderHandler_UnknownIntentRefusesDuplicatePurchase(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Prior unresolved intent saved with unknown status
+	if err := h.saveGigahostOrder(ctx, &GigahostOrderRecord{
+		OrderID:   "intent_uncertain",
+		Status:    "unknown",
+		PlanID:    101,
+		RegionID:  1,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	posts := 0
+	h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+			return &gigahost.AccountInfo{Balance: 100.0}, nil
+		},
+		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
+			// Old unrelated server in inventory with identical plan and region
+			return []gigahost.ServerInfo{
+				{ID: 3500, OrderID: "9000", Status: "ready", PID: 101, RegionID: 1},
+			}, nil
+		},
+		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			posts++
+			return &gigahost.OrderResponse{OrderID: "10002", Status: "pending"}, nil
+		},
+	})
+
+	body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0.14375}`
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	h.GigahostOrderHandler(w, req)
+
+	// Must return 202 Accepted and refuse duplicate purchase
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	if posts != 0 {
+		t.Fatalf("expected 0 purchases dispatched while intent unresolved, got %d", posts)
+	}
+
+	orders, err := h.getGigahostOrders(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 1 || orders[0].OrderID != "intent_uncertain" {
+		t.Fatalf("unexpected orders: %+v", orders)
+	}
+}

@@ -246,43 +246,25 @@ func (c *client) OrderServer(ctx context.Context, req OrderRequest) (*OrderRespo
 }
 
 // OrderServerSafe executes an order with timeout safety and idempotency inspection.
-// If an order request times out or is severed by network partition, it checks GET /servers
-// before returning to avoid accidental duplicate orders.
+// If an order request times out or is severed by network partition, it marks the request
+// as unknown and fails closed against retries until resolved.
 func (c *client) OrderServerSafe(ctx context.Context, req OrderRequest) (*OrderResponse, error) {
 	// 1. Pre-order inspection: verify existing provider inventory (FAIL CLOSED on error)
-	existingServers, err := c.GetServers(ctx)
-	if err != nil {
+	if _, err := c.GetServers(ctx); err != nil {
 		return nil, fmt.Errorf("failed to verify existing inventory: %w", err)
 	}
 
 	reqKey := fmt.Sprintf("%d:%d:%d:%d", req.PID, req.PriceID, req.RegionID, req.OSID)
 	c.mu.Lock()
-	unknownTime, hasUnknown := c.unknownOrders[reqKey]
+	_, hasUnknown := c.unknownOrders[reqKey]
 	c.mu.Unlock()
 
 	if hasUnknown {
-		// Check if an accepted server has become visible in inventory
-		for _, s := range existingServers {
-			if s.PID == req.PID && s.RegionID == req.RegionID && (s.Status == StatusReady || s.Status == "active") {
-				c.mu.Lock()
-				delete(c.unknownOrders, reqKey)
-				c.mu.Unlock()
-				return &OrderResponse{
-					OrderID:  s.OrderID,
-					ServerID: s.ID,
-					Status:   s.Status,
-					Message:  "server found in inventory from prior order",
-				}, nil
-			}
-		}
-
-		// Server is still invisible after prior unknown outcome: fail closed to prevent duplicates
-		if time.Since(unknownTime) < 5*time.Minute {
-			return &OrderResponse{
-				Status:  StatusUnknown,
-				Message: "prior order status is still unknown; refusing duplicate order until resolved",
-			}, fmt.Errorf("prior order status is still unknown (state unknown)")
-		}
+		// Prior order status is still unknown; fail closed against retries until resolved
+		return &OrderResponse{
+			Status:  StatusUnknown,
+			Message: "prior order status is still unknown; refusing duplicate order until resolved",
+		}, fmt.Errorf("prior order status is still unknown (state unknown)")
 	}
 
 	// 2. Dispatch order
@@ -300,28 +282,7 @@ func (c *client) OrderServerSafe(ctx context.Context, req OrderRequest) (*OrderR
 		c.unknownOrders[reqKey] = time.Now()
 		c.mu.Unlock()
 
-		inspectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		servers, checkErr := c.GetServers(inspectCtx)
-		if checkErr == nil {
-			for _, s := range servers {
-				if s.PID == req.PID && s.RegionID == req.RegionID &&
-					(s.Status == StatusReady || s.Status == StatusDeploying || s.Status == StatusPending || s.Status == StatusWaiting || s.Status == StatusInstalling || s.Status == "active") {
-					c.mu.Lock()
-					delete(c.unknownOrders, reqKey)
-					c.mu.Unlock()
-					return &OrderResponse{
-						OrderID:  s.OrderID,
-						ServerID: s.ID,
-						Status:   s.Status,
-						Message:  "server found after order timeout recovery",
-					}, nil
-				}
-			}
-		}
-
-		// Server not confirmed, mark state as unknown to guard against blind retries
+		// Server not confirmed; fail closed with unknown status to guard against duplicate purchases
 		return &OrderResponse{
 			Status:  StatusUnknown,
 			Message: "order timed out; marked unknown to prevent duplicate order",
