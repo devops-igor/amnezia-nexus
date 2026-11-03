@@ -13,7 +13,7 @@ jobs:
       - name: Verify NET_ADMIN namespaces TUN and NAT in guest container
         run: |
           set -euo pipefail
-          docker run --rm --cap-add NET_ADMIN --cap-add SYS_ADMIN --security-opt apparmor=unconfined --device /dev/net/tun localhost:5000/nexus-ci-job:latest bash -seuo pipefail <<'SCRIPT'
+          docker run --rm -i --cap-add NET_ADMIN --cap-add SYS_ADMIN --security-opt apparmor=unconfined --device /dev/net/tun localhost:5000/nexus-ci-job:latest bash -seuo pipefail <<'SCRIPT'
           command -v ip
           command -v iptables
           ip netns add nexus-canary
