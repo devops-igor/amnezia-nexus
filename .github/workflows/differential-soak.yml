@@ -34,10 +34,17 @@ concurrency:
 env:
   GOFLAGS: -tags=with_utls
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   differential-qualification:
     name: Differential Qualification (${{ github.event.inputs.suite || 'scheduled-soak-full' }})
-    runs-on: [self-hosted, linux, x64, isolated-vm]
+    runs-on: [self-hosted, linux, x64, container-vm]
+    container:
+      image: localhost:5000/nexus-ci-job:latest
+      options: --cpus 4 --memory 6g
     timeout-minutes: 90
     steps:
       - name: Checkout Code

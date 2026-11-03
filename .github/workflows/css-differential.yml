@@ -13,7 +13,10 @@ concurrency:
 jobs:
   css-differential:
     name: CSS Differential Oracle
-    runs-on: [self-hosted, linux, x64, isolated-vm]
+    runs-on: [self-hosted, linux, x64, container-vm]
+    container:
+      image: localhost:5000/nexus-ci-job:latest
+      options: --cpus 4 --memory 6g
     timeout-minutes: 20
     steps:
       - name: Checkout Code
