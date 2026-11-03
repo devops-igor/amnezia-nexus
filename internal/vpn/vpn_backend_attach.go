@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -81,10 +82,34 @@ func (s *Service) ensureBackendDeviceAttached(ctx context.Context, t *models.Bac
 
 	s.mu.RLock()
 	hook := s.ensureDevicePreLockHook
+	alreadyAttached := s.backendDevices != nil && s.backendDevices[t.ID] != nil && !s.backendDevices[t.ID].IsClosed()
 	s.mu.RUnlock()
 	if hook != nil {
 		hook()
 	}
+	if alreadyAttached {
+		return nil
+	}
+
+	var prepMap map[string]any
+	var candCloser io.Closer
+	if t != nil && models.NormalizeTunnelProtocol(t.Protocol) == models.ProtocolNaive {
+		candDev, closer, err := s.prepareNaiveCandidateDevice(context.Background(), t)
+		if err != nil {
+			return err
+		}
+		candCloser = closer
+		prepMap = map[string]any{
+			"candidate_device": candDev,
+			"expected_tunnel":  t,
+			"protocol_params":  append([]byte(nil), t.ProtocolParams...),
+		}
+	}
+	defer func() {
+		if candCloser != nil {
+			_ = candCloser.Close()
+		}
+	}()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -100,9 +125,10 @@ func (s *Service) ensureBackendDeviceAttached(ctx context.Context, t *models.Bac
 		return nil
 	}
 
-	if attachErr := s.attachBackendForwarder(t, awgParams); attachErr != nil {
+	if attachErr := s.attachBackendForwarder(t, awgParams, prepMap); attachErr != nil {
 		log.Printf("[vpn] warning: tunnel %d (server %d) probe succeeded but failed to attach data plane: %v", t.ID, t.ServerID, attachErr)
 		return attachErr
 	}
+	candCloser = nil
 	return nil
 }

@@ -11,6 +11,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -45,9 +46,32 @@ func (s *Service) restoreBackendDevices(ctx context.Context) {
 			}
 		}
 		if attachErr == nil {
-			s.mu.Lock()
-			attachErr = s.attachBackendForwarder(tun, awgParams)
-			s.mu.Unlock()
+			var prepMap map[string]any
+			var candCloser io.Closer
+			if tun != nil && models.NormalizeTunnelProtocol(tun.Protocol) == models.ProtocolNaive {
+				candDev, closer, err := s.prepareNaiveCandidateDevice(ctx, tun)
+				if err != nil {
+					attachErr = err
+				} else {
+					candCloser = closer
+					prepMap = map[string]any{
+						"candidate_device": candDev,
+						"expected_tunnel":  tun,
+						"protocol_params":  append([]byte(nil), tun.ProtocolParams...),
+					}
+				}
+			}
+			if attachErr == nil {
+				s.mu.Lock()
+				attachErr = s.attachBackendForwarder(tun, awgParams, prepMap)
+				if attachErr == nil {
+					candCloser = nil
+				}
+				s.mu.Unlock()
+			}
+			if candCloser != nil {
+				_ = candCloser.Close()
+			}
 		}
 		if attachErr != nil {
 			log.Printf("[vpn] warning: failed to restore data plane for tunnel %d (server %d): %v", tun.ID, tun.ServerID, attachErr)
@@ -345,6 +369,43 @@ func (s *Service) finishEnableBackend(
 	startEpoch uint64,
 	prepared ...map[string]any,
 ) error {
+	var candidateDev BackendDevice
+	var candidateCloser io.Closer
+	defer func() {
+		if candidateCloser != nil {
+			_ = candidateCloser.Close()
+		}
+	}()
+
+	proto := ""
+	if tun != nil {
+		proto = models.NormalizeTunnelProtocol(tun.Protocol)
+	}
+
+	// Prepare native candidate device outside Service.mu to avoid blocking
+	// unrelated service operations across network download and daemon startup (H4).
+	var prepMap map[string]any
+	if len(prepared) > 0 && prepared[0] != nil {
+		prepMap = prepared[0]
+		if cand, ok := prepMap["candidate_device"].(BackendDevice); ok && cand != nil {
+			candidateDev = cand
+		}
+	}
+	if candidateDev == nil && proto == models.ProtocolNaive && tun != nil {
+		cand, closer, err := s.prepareNaiveCandidateDevice(ctx, tun, prepared...)
+		if err != nil {
+			return err
+		}
+		candidateDev = cand
+		candidateCloser = closer
+		if prepMap == nil {
+			prepMap = make(map[string]any)
+		}
+		prepMap["candidate_device"] = candidateDev
+		prepMap["expected_tunnel"] = tun
+		prepMap["protocol_params"] = append([]byte(nil), tun.ProtocolParams...)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -366,9 +427,19 @@ func (s *Service) finishEnableBackend(
 		return errors.New("backend identity modified concurrently; aborting enable")
 	}
 
-	if err := s.attachBackendForwarder(tun, awgParams, prepared...); err != nil {
+	var prepArgs []map[string]any
+	if prepMap != nil {
+		prepArgs = []map[string]any{prepMap}
+	} else if len(prepared) > 0 {
+		prepArgs = prepared
+	}
+
+	if err := s.attachBackendForwarder(tun, awgParams, prepArgs...); err != nil {
 		return err
 	}
+
+	// Successfully attached; transfer ownership to service
+	candidateCloser = nil
 
 	// Issue #50: clear the prober's consecutive-failure counter so the
 	// re-enabled backend gets the full FailureThreshold grace period.
@@ -685,24 +756,28 @@ func (s *Service) attachBackendForwarder(tun *models.BackendTunnel, awgParams ma
 		dev = NewProxyBackendDevice(bridgeDev, nil)
 
 	case models.ProtocolNaive:
-		if len(tun.ProtocolParams) == 0 {
-			return fmt.Errorf("naive protocol params cannot be empty for server %d", tun.ServerID)
+		if len(prepared) > 0 && prepared[0] != nil {
+			if candDev, ok := prepared[0]["candidate_device"].(BackendDevice); ok && candDev != nil {
+				if expTun, ok := prepared[0]["expected_tunnel"].(*models.BackendTunnel); ok && expTun != nil {
+					if (expTun.ID != 0 && tun.ID != expTun.ID) || tun.Endpoint != expTun.Endpoint || !models.EqualJSON(tun.ProtocolParams, expTun.ProtocolParams) {
+						_ = candDev.Close()
+						return fmt.Errorf("%w: naive candidate credentials mismatch current tunnel", ErrStaleCandidate)
+					}
+				} else if expParams, ok := prepared[0]["protocol_params"].([]byte); ok && len(expParams) > 0 {
+					if !models.EqualJSON(tun.ProtocolParams, expParams) {
+						_ = candDev.Close()
+						return fmt.Errorf("%w: naive candidate credentials mismatch current tunnel", ErrStaleCandidate)
+					}
+				}
+				dev = candDev
+				break
+			}
 		}
-		var naiveParams models.NaiveProxyParams
-		if err := json.Unmarshal(tun.ProtocolParams, &naiveParams); err != nil {
-			return fmt.Errorf("failed to decode naive params for server %d: %w", tun.ServerID, err)
-		}
-		dialer, err := naive.New(tun.Endpoint, naiveParams)
+		candDev, _, err := s.prepareNaiveCandidateDevice(context.Background(), tun, prepared...)
 		if err != nil {
-			return fmt.Errorf("failed to create naive dialer for server %d: %w", tun.ServerID, err)
+			return err
 		}
-		bridgeCfg := streambridge.Config{MTU: 1280}
-		bridgeDev, err := streambridge.New(bridgeCfg, dialer)
-		if err != nil {
-			_ = dialer.Close()
-			return fmt.Errorf("failed to create stream bridge device for server %d: %w", tun.ServerID, err)
-		}
-		dev = NewProxyBackendDevice(bridgeDev, dialer)
+		dev = candDev
 
 	default:
 		return fmt.Errorf("unsupported protocol for backend attachment: %s", tun.Protocol)
@@ -856,4 +931,57 @@ execute:
 			log.Printf("[vpn] warning: failed to ensure backend routing and NAT for server %d: %v", serverID, err)
 		}
 	}
+}
+
+// prepareNaiveCandidateDevice initializes and starts the candidate naive client outside Service.mu (H4).
+func (s *Service) prepareNaiveCandidateDevice(
+	ctx context.Context,
+	tun *models.BackendTunnel,
+	prepared ...map[string]any,
+) (BackendDevice, io.Closer, error) {
+	if tun == nil || len(tun.ProtocolParams) == 0 {
+		return nil, nil, fmt.Errorf("naive protocol params cannot be empty for server %d", tun.ServerID)
+	}
+	var naiveParams models.NaiveProxyParams
+	if err := json.Unmarshal(tun.ProtocolParams, &naiveParams); err != nil {
+		return nil, nil, fmt.Errorf("failed to decode naive params for server %d: %w", tun.ServerID, err)
+	}
+	var dialerOpts []naive.Option
+	if testing.Testing() && !naive.IsBinaryAvailable() {
+		dialerOpts = append(dialerOpts, naive.WithInProcessFallback())
+	}
+	if len(prepared) > 0 && prepared[0] != nil {
+		if opt, ok := prepared[0]["naive_dialer_option"].(naive.Option); ok && opt != nil {
+			dialerOpts = append(dialerOpts, opt)
+		}
+		if opts, ok := prepared[0]["naive_dialer_options"].([]naive.Option); ok {
+			dialerOpts = append(dialerOpts, opts...)
+		}
+	}
+	dialer, err := naive.New(tun.Endpoint, naiveParams, dialerOpts...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create naive dialer for server %d: %w", tun.ServerID, err)
+	}
+	readyTimeout := 30 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		dur := time.Until(deadline)
+		if dur > 0 && dur < readyTimeout {
+			readyTimeout = dur
+		}
+	}
+	readyCtx, readyCancel := context.WithTimeout(context.WithoutCancel(ctx), readyTimeout)
+	defer readyCancel()
+
+	if err := dialer.EnsureReady(readyCtx); err != nil {
+		_ = dialer.Close()
+		return nil, nil, fmt.Errorf("failed to start and validate naive client for server %d: %w", tun.ServerID, err)
+	}
+	bridgeCfg := streambridge.Config{MTU: 1280}
+	bridgeDev, err := streambridge.New(bridgeCfg, dialer)
+	if err != nil {
+		_ = dialer.Close()
+		return nil, nil, fmt.Errorf("failed to create stream bridge device for server %d: %w", tun.ServerID, err)
+	}
+	dev := NewProxyBackendDevice(bridgeDev, dialer)
+	return dev, dev, nil
 }

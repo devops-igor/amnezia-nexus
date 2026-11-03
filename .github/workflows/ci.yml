@@ -88,8 +88,18 @@ jobs:
           xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$(go env GOPATH)/bin/caddy"
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
+      - name: Install musl libc and Alpine libgcc for Native NaiveProxy Tests
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl
+          mkdir -p /tmp/musl-lib
+          docker run --rm -v /tmp/musl-lib:/out alpine:3.20 sh -c "apk add --no-cache libgcc && cp /usr/lib/libgcc_s.so.1 /out/"
+          sudo cp /tmp/musl-lib/libgcc_s.so.1 /usr/lib/x86_64-linux-musl/libgcc_s.so.1
+
       - name: Run Tests with Race Detector
         run: go test -race -cover -count=1 -coverprofile=coverage.out ./...
+
+      - name: Run Authentic Native Caddy Integration Tests
+        run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
 
       - name: Run Vision Tests (non-race)
         run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...

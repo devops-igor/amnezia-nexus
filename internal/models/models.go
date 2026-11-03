@@ -313,10 +313,12 @@ type VLESSRealityParams struct {
 
 // NaiveProxyParams holds connection and authentication parameters for NaiveProxy backends.
 type NaiveProxyParams struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Domain   string `json:"domain"`
-	EnableH3 bool   `json:"enable_h3"`
+	Username    string `json:"username"`
+	Password    string `json:"password"`
+	Domain      string `json:"domain"`
+	Port        int    `json:"port,omitempty"`
+	EnableH3    bool   `json:"enable_h3"`
+	H3Supported bool   `json:"h3_supported,omitempty"`
 }
 
 // BackendTunnel represents an in-process tunnel to a backend VPN server.
@@ -394,6 +396,11 @@ func equalJSON(a, b json.RawMessage) bool {
 		return false
 	}
 	return reflect.DeepEqual(valA, valB)
+}
+
+// EqualJSON reports whether two JSON byte slices represent equivalent JSON structures.
+func EqualJSON(a, b json.RawMessage) bool {
+	return equalJSON(a, b)
 }
 
 // SameTunnelIdentity reports whether two backend tunnels have identical immutable

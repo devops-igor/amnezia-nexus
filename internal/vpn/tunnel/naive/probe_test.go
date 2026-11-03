@@ -5,9 +5,14 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -86,6 +91,134 @@ func TestProbeNaiveProxy_H3FallbackToH2(t *testing.T) {
 
 	if latencyMS < 1 {
 		t.Fatalf("expected latencyMS >= 1, got %d", latencyMS)
+	}
+}
+
+func TestProbeNaiveProxy_H3UDPBlackhole_FallbackToH2(t *testing.T) {
+	// Start H2 server on TCP
+	proxyAddr, cleanup := setupTestH2Server(t, "userA", "passA", true)
+	defer cleanup()
+
+	_, portStr, err := net.SplitHostPort(proxyAddr)
+	if err != nil {
+		t.Fatalf("SplitHostPort failed: %v", err)
+	}
+
+	// Create UDP blackhole on the exact same port: accepts UDP packets but silently drops them
+	udpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort("127.0.0.1", portStr))
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr failed: %v", err)
+	}
+	udpLn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		t.Fatalf("ListenUDP blackhole failed: %v", err)
+	}
+	defer udpLn.Close()
+
+	stopUDP := make(chan struct{})
+	defer close(stopUDP)
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			select {
+			case <-stopUDP:
+				return
+			default:
+				_ = udpLn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+				_, _, _ = udpLn.ReadFromUDP(buf)
+			}
+		}
+	}()
+
+	p := models.NaiveProxyParams{
+		Username: "userA",
+		Password: "passA",
+		Domain:   testCamouflageDomain,
+		EnableH3: true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	// Total timeout is 2 seconds. The bounded H3 sub-deadline should cap H3 attempt at 1 second,
+	// leaving the remaining budget for the H2 probe to succeed within the overall 2s timeout.
+	latencyMS, err := ProbeNaiveProxy(ctx, proxyAddr, p, 2*time.Second)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("ProbeNaiveProxy under UDP blackhole failed: %v", err)
+	}
+	if latencyMS < 1 {
+		t.Fatalf("expected latencyMS >= 1, got %d", latencyMS)
+	}
+	if elapsed >= 2500*time.Millisecond {
+		t.Fatalf("Probe took %v, exceeded bounded budget", elapsed)
+	}
+}
+
+func TestProbeNaiveProxy_DaemonH3UDPBlackhole_FallbackToH2(t *testing.T) {
+	cert, err := generateLeafCert(testCACert, testCAKey, "camouflage.example.com")
+	if err != nil {
+		t.Fatalf("generate leaf cert: %v", err)
+	}
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	ts.TLS = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h2", "http/1.1"},
+	}
+	ts.StartTLS()
+	defer ts.Close()
+
+	h2Port := ts.Listener.Addr().(*net.TCPAddr).Port
+
+	var dialCount atomic.Int32
+	sd := &mockStreamDialer{
+		dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if dialCount.Add(1) == 1 {
+				// First attempt: H3 blackhole — return pipe and hang until sub-deadline
+				clientConn, serverConn := net.Pipe()
+				go func() {
+					<-ctx.Done()
+					_ = serverConn.Close()
+				}()
+				return clientConn, nil
+			}
+			// Second attempt: fallback to H2
+			var netDialer net.Dialer
+			return netDialer.DialContext(ctx, network, ts.Listener.Addr().String())
+		},
+	}
+
+	p := models.NaiveProxyParams{
+		Username:    "alice",
+		Password:    "secret-password",
+		Domain:      "camouflage.example.com",
+		Port:        h2Port,
+		EnableH3:    true,
+		H3Supported: true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	latency, err := ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:"+strconv.Itoa(h2Port), p, 2*time.Second, WithSocks5Dialer(sd))
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("ProbeNaiveProxyWithOptions daemon H3 blackhole fallback failed: %v", err)
+	}
+	if latency < 1 {
+		t.Errorf("expected latency >= 1ms, got %d", latency)
+	}
+	if elapsed >= 2500*time.Millisecond {
+		t.Errorf("Probe took %v, exceeded bounded timeout budget", elapsed)
+	}
+	if dialCount.Load() < 2 {
+		t.Errorf("expected at least 2 dial attempts (H3 followed by H2 fallback), got %d", dialCount.Load())
 	}
 }
 
@@ -333,5 +466,470 @@ func TestProbeNaiveProxy_H3_TimeoutDuringResponse(t *testing.T) {
 
 	if elapsed > 1500*time.Millisecond {
 		t.Fatalf("probe did not respect 300ms timeout on slow H3 response: took %v", elapsed)
+	}
+}
+
+func auditProductionCAs(t *testing.T) {
+	t.Helper()
+	old := testRootCAs
+	testRootCAs = nil
+	t.Cleanup(func() { testRootCAs = old })
+}
+
+func TestAuditProbeDownloadFailureMustNotUseGoTransport(t *testing.T) {
+	auditProductionCAs(t)
+	t.Setenv(NaiveBinPathEnv, filepath.Join(t.TempDir(), "missing"))
+	t.Setenv("NAIVE_DISABLE_DOWNLOAD", "1")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var calls atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			c, e := ln.Accept()
+			if e != nil {
+				return
+			}
+			calls.Add(1)
+			_ = c.Close()
+		}
+	}()
+	p := models.NaiveProxyParams{Username: "audit-user", Password: "audit-password", Domain: "naive.example.com"}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = ProbeNaiveProxy(ctx, ln.Addr().String(), p, time.Second)
+	_ = ln.Close()
+	<-done
+	t.Logf("missing native binary: remote Go TCP attempts=%d err=%v", calls.Load(), err)
+	if calls.Load() != 0 {
+		t.Fatal("health probe leaked Go transport traffic after native failure")
+	}
+}
+
+func TestAuditProbeMustRejectUnreachableUpstream(t *testing.T) {
+	auditProductionCAs(t)
+	t.Setenv(NaiveBinPathEnv, buildMockNaiveBinary(t))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := ln.Addr().String()
+	_ = ln.Close() // deterministic refused remote endpoint
+	p := models.NaiveProxyParams{Username: "audit-user", Password: "invalid-audit-credential", Domain: "naive.example.com"}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ms, err := ProbeNaiveProxy(ctx, endpoint, p, time.Second)
+	t.Logf("refused remote endpoint: latency=%d err=%v", ms, err)
+	if err == nil {
+		t.Fatal("health probe accepted local SOCKS success without any authenticated remote roundtrip")
+	}
+}
+
+func TestAuditDownloadFailureMustNotUseGoTransport(t *testing.T) {
+	auditProductionCAs(t)
+	t.Setenv(NaiveBinPathEnv, filepath.Join(t.TempDir(), "missing-naive"))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
+	t.Setenv(NaiveDownloadBaseURLEnv, ts.URL)
+	t.Setenv("NAIVE_DISABLE_DOWNLOAD", "0")
+	var calls atomic.Int32
+	sentinel := errors.New("audit: in-process Go transport reached")
+	d, err := New("198.51.100.1:443", models.NaiveProxyParams{Username: "audit-user", Password: "audit-password", Domain: "naive.example.com"},
+		WithDialContext(func(context.Context, string, string) (net.Conn, error) {
+			calls.Add(1)
+			return nil, sentinel
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err = d.DialContext(ctx, "tcp", "target.example.com:443")
+	t.Logf("download HTTP 503: Go transport calls=%d returned=%v", calls.Load(), err)
+	if calls.Load() != 0 {
+		t.Fatal("download failure silently downgraded to fingerprintable Go transport instead of failing closed")
+	}
+}
+
+type mockStreamDialer struct {
+	dialContext func(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+func (m *mockStreamDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return m.dialContext(ctx, network, address)
+}
+
+func TestProbeNaiveProxy_CustomPortBackend(t *testing.T) {
+	cert, err := generateLeafCert(testCACert, testCAKey, "camouflage.example.com")
+	if err != nil {
+		t.Fatalf("generate leaf cert: %v", err)
+	}
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	ts.TLS = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"http/1.1"},
+	}
+	ts.StartTLS()
+	defer ts.Close()
+
+	customPort := ts.Listener.Addr().(*net.TCPAddr).Port
+	if customPort == 443 {
+		t.Fatal("expected ephemeral test port != 443")
+	}
+
+	var dialedTarget string
+	sd := &mockStreamDialer{
+		dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialedTarget = address
+			var d net.Dialer
+			return d.DialContext(ctx, network, ts.Listener.Addr().String())
+		},
+	}
+
+	p := models.NaiveProxyParams{
+		Username: "alice",
+		Password: "secret-password",
+		Domain:   "camouflage.example.com",
+		Port:     customPort,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	latency, err := ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:"+strconv.Itoa(customPort), p, 3*time.Second, WithSocks5Dialer(sd))
+	if err != nil {
+		t.Fatalf("ProbeNaiveProxy custom port failed: %v", err)
+	}
+	if latency < 1 {
+		t.Errorf("expected latency >= 1ms, got %d", latency)
+	}
+
+	expectedTarget := net.JoinHostPort("camouflage.example.com", strconv.Itoa(customPort))
+	if dialedTarget != expectedTarget {
+		t.Fatalf("expected probe to dial %q, got %q", expectedTarget, dialedTarget)
+	}
+
+	// Verify that dialing with hardcoded 443 against a mock that rejects 443 fails
+	sdReject443 := &mockStreamDialer{
+		dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if strings.HasSuffix(address, ":443") {
+				return nil, errors.New("connection refused: not listening on port 443")
+			}
+			var d net.Dialer
+			return d.DialContext(ctx, network, ts.Listener.Addr().String())
+		},
+	}
+	// With custom port: should succeed
+	latency, err = ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:"+strconv.Itoa(customPort), p, 3*time.Second, WithSocks5Dialer(sdReject443))
+	if err != nil || latency < 1 {
+		t.Fatalf("expected custom port probe to succeed on non-443 server: %v (latency=%d)", err, latency)
+	}
+
+	// With Port == 0 and endpoint target port: falls back to target port and succeeds (H6 regression)
+	pFallback := p
+	pFallback.Port = 0
+	dialedTarget = ""
+	latency, err = ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:"+strconv.Itoa(customPort), pFallback, 3*time.Second, WithSocks5Dialer(sdReject443))
+	if err != nil || latency < 1 {
+		t.Fatalf("expected probe with Port=0 to fallback to endpoint target port and succeed: %v (latency=%d)", err, latency)
+	}
+
+	// Verify that dialed target through mock dialer matches custom port even when Port is 0
+	dialedTarget = ""
+	latency, err = ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:"+strconv.Itoa(customPort), pFallback, 3*time.Second, WithSocks5Dialer(sd))
+	if err != nil || latency < 1 {
+		t.Fatalf("expected fallback probe to succeed: %v", err)
+	}
+	if dialedTarget != expectedTarget {
+		t.Fatalf("expected fallback probe to dial %q, got %q", expectedTarget, dialedTarget)
+	}
+
+	// Without custom port anywhere (Port == 0 and target without port): defaults to 443 and fails against sdReject443
+	_, err = ProbeNaiveProxyWithOptions(ctx, "198.51.100.1", pFallback, 3*time.Second, WithSocks5Dialer(sdReject443))
+	if err == nil {
+		t.Fatal("expected probe without target port and Port=0 to fail against server not listening on 443")
+	}
+
+	// Without custom port anywhere (Port == 0 and target port 443): defaults to 443 and fails against sdReject443
+	_, err = ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:443", pFallback, 3*time.Second, WithSocks5Dialer(sdReject443))
+	if err == nil {
+		t.Fatal("expected probe with target port 443 and Port=0 to fail against server not listening on 443")
+	}
+
+	// Explicit p.Port takes precedence over target port
+	pExplicitDiffTarget := p
+	pExplicitDiffTarget.Port = customPort
+	dialedTarget = ""
+	latency, err = ProbeNaiveProxyWithOptions(ctx, "198.51.100.1:9443", pExplicitDiffTarget, 3*time.Second, WithSocks5Dialer(sd))
+	if err != nil || latency < 1 {
+		t.Fatalf("expected explicit p.Port to succeed: %v", err)
+	}
+	if dialedTarget != expectedTarget {
+		t.Fatalf("expected explicit p.Port to take precedence, got %q, want %q", dialedTarget, expectedTarget)
+	}
+
+	// Verify ProbeNaiveProxyTunnel with custom port
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun := &models.BackendTunnel{
+		ID:             42,
+		Endpoint:       "198.51.100.1:" + strconv.Itoa(customPort),
+		Protocol:       models.ProtocolNaive,
+		ProtocolParams: raw,
+	}
+	tunLatency, err := ProbeNaiveProxyWithOptions(ctx, tun.Endpoint, p, 3*time.Second, WithSocks5Dialer(sd))
+	if err != nil || tunLatency < 1 {
+		t.Fatalf("ProbeNaiveProxy with unmarshaled params failed: %v", err)
+	}
+
+	// Verify ProbeNaiveProxyTunnel with Port == 0 (production normal persisted records)
+	rawFallback, err := json.Marshal(pFallback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tunFallback := &models.BackendTunnel{
+		ID:             43,
+		Endpoint:       "198.51.100.1:" + strconv.Itoa(customPort),
+		Protocol:       models.ProtocolNaive,
+		ProtocolParams: rawFallback,
+	}
+	dialedTarget = ""
+	tunFallbackLatency, err := ProbeNaiveProxyWithOptions(ctx, tunFallback.Endpoint, pFallback, 3*time.Second, WithSocks5Dialer(sd))
+	if err != nil || tunFallbackLatency < 1 {
+		t.Fatalf("ProbeNaiveProxy with Port=0 from tunnel endpoint failed: %v", err)
+	}
+	if dialedTarget != expectedTarget {
+		t.Fatalf("expected tunnel fallback probe to dial %q, got %q", expectedTarget, dialedTarget)
+	}
+}
+
+func setupSharedH3DaemonDialer(t *testing.T, upstreamHandler func(net.Conn)) (*Dialer, *Daemon, context.Context) {
+	t.Helper()
+	mockBin := buildMockNaiveBinary(t)
+
+	upstreamLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("upstream echo listen: %v", err)
+	}
+	t.Cleanup(func() { _ = upstreamLn.Close() })
+
+	go func() {
+		for {
+			conn, err := upstreamLn.Accept()
+			if err != nil {
+				return
+			}
+			go upstreamHandler(conn)
+		}
+	}()
+
+	upstreamAddr := upstreamLn.Addr().String()
+
+	p := models.NaiveProxyParams{
+		Username:    "alice",
+		Password:    "secret-password",
+		Domain:      "camouflage.example.com",
+		EnableH3:    true,
+		H3Supported: true,
+	}
+
+	dm, err := NewDaemon(mockBin, upstreamAddr, p)
+	if err != nil {
+		t.Fatalf("NewDaemon: %v", err)
+	}
+	dm.SetReadinessTimeout(3 * time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+
+	if err := dm.Start(ctx); err != nil {
+		t.Fatalf("Start daemon: %v", err)
+	}
+	t.Cleanup(func() { _ = dm.Stop() })
+
+	d, err := New(upstreamAddr, p, WithDaemon(dm))
+	if err != nil {
+		t.Fatalf("New dialer: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	return d, dm, ctx
+}
+
+func TestDialer_LocalCancellationDoesNotKillSharedH3Daemon(t *testing.T) {
+	d, dm, ctx := setupSharedH3DaemonDialer(t, func(c net.Conn) {
+		defer c.Close()
+		_, _ = io.Copy(c, c)
+	})
+
+	flow1, err := d.DialContext(ctx, "tcp", "target1.example.com:80")
+	if err != nil {
+		t.Fatalf("Dial flow1: %v", err)
+	}
+	defer flow1.Close()
+
+	flow2, err := d.DialContext(ctx, "tcp", "target2.example.com:80")
+	if err != nil {
+		t.Fatalf("Dial flow2: %v", err)
+	}
+	defer flow2.Close()
+
+	// Cancel / close flow1 locally before any payload data is read.
+	if err := flow1.Close(); err != nil {
+		t.Fatalf("Close flow1: %v", err)
+	}
+
+	buf := make([]byte, 16)
+	if _, readErr := flow1.Read(buf); readErr == nil {
+		t.Fatal("expected error reading from closed flow1, got nil")
+	}
+	_, _ = flow1.Write([]byte("ignored"))
+
+	// Verify that the shared daemon remains active and running.
+	if !dm.IsActive() {
+		t.Fatal("expected shared H3 daemon to remain active after flow1 local cancellation")
+	}
+	if d.Daemon() == nil {
+		t.Fatal("expected dialer daemon reference to remain non-nil after flow1 local cancellation")
+	}
+	d.daemonMu.Lock()
+	h3Supported := d.params.H3Supported
+	d.daemonMu.Unlock()
+	if !h3Supported {
+		t.Fatal("expected H3Supported to remain true after flow1 local cancellation")
+	}
+
+	// Verify that the sibling flow continues exchanging payload data cleanly.
+	msg := []byte("hello from sibling flow2")
+	if _, err := flow2.Write(msg); err != nil {
+		t.Fatalf("write to sibling flow2 failed: %v", err)
+	}
+	recv := make([]byte, len(msg))
+	if _, err := io.ReadFull(flow2, recv); err != nil {
+		t.Fatalf("read from sibling flow2 failed: %v", err)
+	}
+	if string(recv) != string(msg) {
+		t.Fatalf("flow2 payload mismatch: got %q, want %q", string(recv), string(msg))
+	}
+}
+
+func TestDialer_DestinationEOFDoesNotKillSharedH3Daemon(t *testing.T) {
+	var connCount atomic.Int32
+	d, dm, ctx := setupSharedH3DaemonDialer(t, func(c net.Conn) {
+		defer c.Close()
+		if connCount.Add(1) == 1 {
+			// Destination closes immediately without writing response bytes
+			return
+		}
+		_, _ = io.Copy(c, c)
+	})
+
+	flow1, err := d.DialContext(ctx, "tcp", "target1.example.com:80")
+	if err != nil {
+		t.Fatalf("Dial flow1: %v", err)
+	}
+	defer flow1.Close()
+
+	flow2, err := d.DialContext(ctx, "tcp", "target2.example.com:80")
+	if err != nil {
+		t.Fatalf("Dial flow2: %v", err)
+	}
+	defer flow2.Close()
+
+	buf := make([]byte, 16)
+	n, readErr := flow1.Read(buf)
+	if n != 0 || !errors.Is(readErr, io.EOF) {
+		t.Fatalf("expected 0, io.EOF on flow1 after destination close, got n=%d, err=%v", n, readErr)
+	}
+
+	if !dm.IsActive() {
+		t.Fatal("expected shared H3 daemon to remain active after destination EOF")
+	}
+	if d.Daemon() == nil {
+		t.Fatal("expected dialer daemon reference to remain non-nil after destination EOF")
+	}
+	d.daemonMu.Lock()
+	h3Supported := d.params.H3Supported
+	d.daemonMu.Unlock()
+	if !h3Supported {
+		t.Fatal("expected H3Supported to remain true after destination EOF")
+	}
+
+	msg := []byte("hello from sibling flow2")
+	if _, err := flow2.Write(msg); err != nil {
+		t.Fatalf("write to sibling flow2 failed: %v", err)
+	}
+	recv := make([]byte, len(msg))
+	if _, err := io.ReadFull(flow2, recv); err != nil {
+		t.Fatalf("read from sibling flow2 failed: %v", err)
+	}
+	if string(recv) != string(msg) {
+		t.Fatalf("flow2 payload mismatch: got %q, want %q", string(recv), string(msg))
+	}
+}
+
+func TestDialer_PerFlowDeadlineDoesNotKillSharedH3Daemon(t *testing.T) {
+	d, dm, ctx := setupSharedH3DaemonDialer(t, func(c net.Conn) {
+		defer c.Close()
+		_, _ = io.Copy(c, c)
+	})
+
+	flow1, err := d.DialContext(ctx, "tcp", "target1.example.com:80")
+	if err != nil {
+		t.Fatalf("Dial flow1: %v", err)
+	}
+	defer flow1.Close()
+
+	flow2, err := d.DialContext(ctx, "tcp", "target2.example.com:80")
+	if err != nil {
+		t.Fatalf("Dial flow2: %v", err)
+	}
+	defer flow2.Close()
+
+	if err := flow1.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline flow1: %v", err)
+	}
+
+	buf := make([]byte, 16)
+	_, readErr := flow1.Read(buf)
+	var netErr net.Error
+	if readErr == nil || !errors.As(readErr, &netErr) || !netErr.Timeout() {
+		t.Fatalf("expected timeout error on flow1, got: %v", readErr)
+	}
+
+	if !dm.IsActive() {
+		t.Fatal("expected shared H3 daemon to remain active after flow1 read timeout")
+	}
+	if d.Daemon() == nil {
+		t.Fatal("expected dialer daemon reference to remain non-nil after flow1 read timeout")
+	}
+	d.daemonMu.Lock()
+	h3Supported := d.params.H3Supported
+	d.daemonMu.Unlock()
+	if !h3Supported {
+		t.Fatal("expected H3Supported to remain true after flow1 read timeout")
+	}
+
+	msg := []byte("hello from sibling flow2")
+	if _, err := flow2.Write(msg); err != nil {
+		t.Fatalf("write to sibling flow2 failed: %v", err)
+	}
+	recv := make([]byte, len(msg))
+	if _, err := io.ReadFull(flow2, recv); err != nil {
+		t.Fatalf("read from sibling flow2 failed: %v", err)
+	}
+	if string(recv) != string(msg) {
+		t.Fatalf("flow2 payload mismatch: got %q, want %q", string(recv), string(msg))
 	}
 }

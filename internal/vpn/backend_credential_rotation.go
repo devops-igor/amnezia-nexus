@@ -138,9 +138,40 @@ func (s *Service) RotateSharedBackendCredential(
 
 	// Only the local commit is serialized with admissions and enable/disable.
 	// Remote compensation is deliberately done after releasing Service.mu.
+	var prepMap map[string]any
+	var candCloser io.Closer
+	if models.NormalizeTunnelProtocol(proto) == models.ProtocolNaive {
+		candTun := &models.BackendTunnel{
+			ID:             current.ID,
+			ServerID:       server.ID,
+			Endpoint:       current.Endpoint,
+			Protocol:       proto,
+			ProtocolParams: params,
+		}
+		candDev, closer, err := s.prepareNaiveCandidateDevice(ctx, candTun)
+		if err != nil {
+			return errors.Join(fmt.Errorf("prepare replacement naive backend: %w", err),
+				cleanupRotatedCredential(ctx, s.db, mgr, server, proto, newID))
+		}
+		candCloser = closer
+		prepMap = map[string]any{
+			"candidate_device": candDev,
+			"expected_tunnel":  candTun,
+			"protocol_params":  append([]byte(nil), params...),
+		}
+	}
+	defer func() {
+		if candCloser != nil {
+			_ = candCloser.Close()
+		}
+	}()
+
 	s.mu.Lock()
-	commitErr, safeToClean := s.commitBackendRotation(ctx, server.ID, generation, current, proto, params, newID, name)
+	commitErr, safeToClean := s.commitBackendRotation(ctx, server.ID, generation, current, proto, params, newID, name, prepMap)
 	s.mu.Unlock()
+	if commitErr == nil {
+		candCloser = nil
+	}
 	if commitErr != nil && safeToClean {
 		return errors.Join(commitErr, cleanupRotatedCredential(ctx, s.db, mgr, server, proto, newID))
 	}
@@ -150,6 +181,7 @@ func (s *Service) RotateSharedBackendCredential(
 func (s *Service) commitBackendRotation(
 	ctx context.Context, serverID int64, generation *models.Server, current *models.BackendTunnel,
 	proto string, params json.RawMessage, newID, name string,
+	prepared ...map[string]any,
 ) (error, bool) {
 	live, err := s.pool.GetTunnel(serverID)
 	if err != nil || s.isServerDeletedLocked(serverID) || !models.SameTunnelIdentity(live, current) {
@@ -187,7 +219,7 @@ func (s *Service) commitBackendRotation(
 	if !live.Enabled {
 		return nil, false
 	}
-	if err := s.attachBackendForwarder(updated, nil); err != nil {
+	if err := s.attachBackendForwarder(updated, nil, prepared...); err != nil {
 		// Old remote identity is still valid; roll back before revoking anything.
 		_, rollbackErr := s.pool.AddTunnelWithConfig(ctx, serverID, current.Endpoint, current.PublicKey,
 			tunnel.BackendTunnelOptions{Protocol: proto, ProtocolParams: current.ProtocolParams})
