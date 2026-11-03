@@ -38,11 +38,12 @@ type Config struct {
 
 // client implements Client using standard net/http.
 type client struct {
-	baseURL       string
-	apiKey        string
-	httpClient    *http.Client
-	mu            sync.Mutex
-	unknownOrders map[string]time.Time
+	baseURL         string
+	apiKey          string
+	httpClient      *http.Client
+	mu              sync.Mutex
+	unknownOrders   map[string]time.Time
+	lastEligibility CatalogEligibility
 }
 
 // Ensure client satisfies the Client interface.
@@ -94,10 +95,13 @@ func (c *client) GetProducts(ctx context.Context) ([]Product, error) {
 		return nil, fmt.Errorf("failed to fetch products: %w", err)
 	}
 
-	products, err := parseProducts(respData)
+	products, elig, err := parseProducts(respData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode catalog products: %w", err)
 	}
+	c.mu.Lock()
+	c.lastEligibility = elig
+	c.mu.Unlock()
 	return products, nil
 }
 
@@ -136,6 +140,7 @@ func (c *client) GetCatalog(ctx context.Context) ([]HourlyPlan, error) {
 					MonthlyCeiling: price.MonthlyCeiling,
 					Regions:        p.Regions,
 					OSList:         p.OSList,
+					Eligibility:    p.Eligibility,
 				}
 				hourlyPlans = append(hourlyPlans, plan)
 			}
@@ -143,6 +148,31 @@ func (c *client) GetCatalog(ctx context.Context) ([]HourlyPlan, error) {
 	}
 
 	return hourlyPlans, nil
+}
+
+// GetCatalogEligibility returns the most recently decoded catalog eligibility.
+func (c *client) GetCatalogEligibility() CatalogEligibility {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastEligibility
+}
+
+// GetCatalogResponse returns catalog plans and account eligibility.
+func (c *client) GetCatalogResponse(ctx context.Context) (*CatalogResponse, error) {
+	plans, err := c.GetCatalog(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	elig := c.lastEligibility
+	c.mu.Unlock()
+	if !elig.QualifiesArrears && elig.CreditNOK == 0 && len(plans) > 0 {
+		elig = plans[0].Eligibility
+	}
+	return &CatalogResponse{
+		Plans:       plans,
+		Eligibility: elig,
+	}, nil
 }
 
 // GetAccount queries account credit and balance via GET /account.
@@ -416,20 +446,21 @@ func (c *client) doRequest(ctx context.Context, method, path string, body any, t
 }
 
 type tierProductDTO struct {
-	ProductID      int     `json:"product_id"`
-	ProductName    string  `json:"product_name"`
-	Type           string  `json:"type"`
-	AllowHourly    bool    `json:"allow_hourly"`
-	AllowRecurring bool    `json:"allow_recurring"`
-	PriceID        int     `json:"price_id"`
-	RateHourly     float64 `json:"rate_hourly"`
-	RateMonthly    float64 `json:"rate_monthly"`
-	RegionIDs      []any   `json:"region_ids"`
-	InStock        bool    `json:"in_stock"`
-	VMCores        string  `json:"vm_cores"`
-	VMMemory       string  `json:"vm_memory"`
-	VMStorage      string  `json:"vm_storage"`
-	VMBW           string  `json:"vm_bw"`
+	ProductID      int                `json:"product_id"`
+	ProductName    string             `json:"product_name"`
+	Type           string             `json:"type"`
+	AllowHourly    bool               `json:"allow_hourly"`
+	AllowRecurring bool               `json:"allow_recurring"`
+	PriceID        int                `json:"price_id"`
+	RateHourly     float64            `json:"rate_hourly"`
+	RateMonthly    float64            `json:"rate_monthly"`
+	RegionIDs      []any              `json:"region_ids"`
+	InStock        bool               `json:"in_stock"`
+	VMCores        string             `json:"vm_cores"`
+	VMMemory       string             `json:"vm_memory"`
+	VMStorage      string             `json:"vm_storage"`
+	VMBW           string             `json:"vm_bw"`
+	Eligibility    CatalogEligibility `json:"eligibility,omitempty"`
 	Specs          struct {
 		CPUCores int `json:"cpu_cores"`
 		RAMGB    int `json:"ram_gb"`
@@ -440,7 +471,7 @@ type tierProductDTO struct {
 	} `json:"specs"`
 }
 
-func buildTierProduct(p tierProductDTO, regionMap map[int]Region, currency string) Product {
+func buildTierProduct(p tierProductDTO, regionMap map[int]Region, currency string, eligibility CatalogEligibility) Product {
 	cores := p.Specs.CPUCores
 	if cores <= 0 && p.VMCores != "" {
 		cores, _ = strconv.Atoi(p.VMCores)
@@ -483,6 +514,10 @@ func buildTierProduct(p tierProductDTO, regionMap map[int]Region, currency strin
 		})
 	}
 
+	if p.Eligibility.QualifiesArrears || p.Eligibility.CreditNOK > 0 {
+		eligibility = p.Eligibility
+	}
+
 	return Product{
 		ID:          p.ProductID,
 		PID:         p.ProductID,
@@ -494,10 +529,11 @@ func buildTierProduct(p tierProductDTO, regionMap map[int]Region, currency strin
 		InStock:     p.InStock,
 		Prices:      prices,
 		Regions:     regions,
+		Eligibility: eligibility,
 	}
 }
 
-func parseProducts(data []byte) ([]Product, error) {
+func parseProducts(data []byte) ([]Product, CatalogEligibility, error) {
 	type docCatalog struct {
 		Meta struct {
 			Status int `json:"status"`
@@ -514,8 +550,10 @@ func parseProducts(data []byte) ([]Product, error) {
 				RegionName string `json:"region_name"`
 				Country    string `json:"region_country"`
 			} `json:"regions"`
-			Currency string `json:"currency"`
+			Currency    string             `json:"currency"`
+			Eligibility CatalogEligibility `json:"eligibility"`
 		} `json:"data"`
+		Eligibility CatalogEligibility `json:"eligibility"`
 	}
 
 	var doc docCatalog
@@ -523,6 +561,10 @@ func parseProducts(data []byte) ([]Product, error) {
 		currency := doc.Data.Currency
 		if currency == "" {
 			currency = "NOK"
+		}
+		eligibility := doc.Data.Eligibility
+		if !eligibility.QualifiesArrears && eligibility.CreditNOK == 0 && (doc.Eligibility.QualifiesArrears || doc.Eligibility.CreditNOK > 0) {
+			eligibility = doc.Eligibility
 		}
 		regionMap := make(map[int]Region)
 		for _, r := range doc.Data.Regions {
@@ -538,37 +580,38 @@ func parseProducts(data []byte) ([]Product, error) {
 		var products []Product
 		for _, tier := range doc.Data.Tiers {
 			for _, p := range tier.Products {
-				products = append(products, buildTierProduct(p, regionMap, currency))
+				products = append(products, buildTierProduct(p, regionMap, currency, eligibility))
 			}
 		}
 		if len(products) > 0 {
-			return products, nil
+			return products, eligibility, nil
 		}
 	}
 
 	var direct []Product
 	if err := json.Unmarshal(data, &direct); err == nil && len(direct) >= 0 {
-		return direct, nil
+		return direct, CatalogEligibility{}, nil
 	}
 
 	var wrapped struct {
-		Products []Product `json:"products"`
-		Data     []Product `json:"data"`
-		Servers  []Product `json:"servers"`
+		Products    []Product          `json:"products"`
+		Data        []Product          `json:"data"`
+		Servers     []Product          `json:"servers"`
+		Eligibility CatalogEligibility `json:"eligibility"`
 	}
 	if err := json.Unmarshal(data, &wrapped); err == nil {
 		if wrapped.Products != nil {
-			return wrapped.Products, nil
+			return wrapped.Products, wrapped.Eligibility, nil
 		}
 		if wrapped.Data != nil {
-			return wrapped.Data, nil
+			return wrapped.Data, wrapped.Eligibility, nil
 		}
 		if wrapped.Servers != nil {
-			return wrapped.Servers, nil
+			return wrapped.Servers, wrapped.Eligibility, nil
 		}
 	}
 
-	return nil, errors.New("unable to parse products response format")
+	return nil, CatalogEligibility{}, errors.New("unable to parse products response format")
 }
 
 func parseServers(data []byte) ([]ServerInfo, error) {

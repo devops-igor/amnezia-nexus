@@ -125,18 +125,19 @@ type Price struct {
 
 // Product represents a server product in the catalog.
 type Product struct {
-	ID          int      `json:"id"`
-	PID         int      `json:"pid"`
-	Name        string   `json:"name"`
-	Description string   `json:"description,omitempty"`
-	CPUCores    int      `json:"cpu_cores"`
-	RAMMB       int      `json:"ram_mb"`
-	DiskGB      int      `json:"disk_gb"`
-	BandwidthTB float64  `json:"bandwidth_tb,omitempty"`
-	InStock     bool     `json:"in_stock"`
-	Prices      []Price  `json:"prices,omitempty"`
-	Regions     []Region `json:"regions,omitempty"`
-	OSList      []OS     `json:"os_list,omitempty"`
+	ID          int                `json:"id"`
+	PID         int                `json:"pid"`
+	Name        string             `json:"name"`
+	Description string             `json:"description,omitempty"`
+	CPUCores    int                `json:"cpu_cores"`
+	RAMMB       int                `json:"ram_mb"`
+	DiskGB      int                `json:"disk_gb"`
+	BandwidthTB float64            `json:"bandwidth_tb,omitempty"`
+	InStock     bool               `json:"in_stock"`
+	Prices      []Price            `json:"prices,omitempty"`
+	Regions     []Region           `json:"regions,omitempty"`
+	OSList      []OS               `json:"os_list,omitempty"`
+	Eligibility CatalogEligibility `json:"eligibility,omitempty"`
 }
 
 // GetID returns the primary product identifier (PID or ID).
@@ -149,20 +150,56 @@ func (p Product) GetID() int {
 
 // HourlyPlan represents an hourly VPS plan formatted for admin inspection.
 type HourlyPlan struct {
-	ProductID      int      `json:"product_id"`
-	Name           string   `json:"name"`
-	Description    string   `json:"description,omitempty"`
-	CPUCores       int      `json:"cpu_cores"`
-	RAMMB          int      `json:"ram_mb"`
-	DiskGB         int      `json:"disk_gb"`
-	BandwidthTB    float64  `json:"bandwidth_tb,omitempty"`
-	InStock        bool     `json:"in_stock"`
-	PriceID        int      `json:"price_id"`
-	Currency       string   `json:"currency"`
-	HourlyRateNOK  float64  `json:"hourly_rate_nok"`
-	MonthlyCeiling float64  `json:"monthly_ceiling_nok"`
-	Regions        []Region `json:"regions"`
-	OSList         []OS     `json:"os_list"`
+	ProductID      int                `json:"product_id"`
+	Name           string             `json:"name"`
+	Description    string             `json:"description,omitempty"`
+	CPUCores       int                `json:"cpu_cores"`
+	RAMMB          int                `json:"ram_mb"`
+	DiskGB         int                `json:"disk_gb"`
+	BandwidthTB    float64            `json:"bandwidth_tb,omitempty"`
+	InStock        bool               `json:"in_stock"`
+	PriceID        int                `json:"price_id"`
+	Currency       string             `json:"currency"`
+	HourlyRateNOK  float64            `json:"hourly_rate_nok"`
+	MonthlyCeiling float64            `json:"monthly_ceiling_nok"`
+	Regions        []Region           `json:"regions"`
+	OSList         []OS               `json:"os_list"`
+	Eligibility    CatalogEligibility `json:"eligibility,omitempty"`
+}
+
+// CatalogEligibility represents account deployment eligibility returned in the catalog.
+type CatalogEligibility struct {
+	QualifiesArrears bool    `json:"qualifies_arrears"`
+	CreditNOK        float64 `json:"credit_nok"`
+}
+
+// Catalog represents catalog plans and account eligibility.
+type Catalog struct {
+	Plans       []HourlyPlan       `json:"plans"`
+	Eligibility CatalogEligibility `json:"eligibility"`
+}
+
+// CatalogResponse is an alias for Catalog.
+type CatalogResponse = Catalog
+
+// HasEligibility evaluates account and catalog eligibility for ordering hourly servers.
+func HasEligibility(account *AccountInfo, catalog *Catalog) bool {
+	if catalog != nil {
+		if catalog.Eligibility.QualifiesArrears || catalog.Eligibility.CreditNOK > 0 {
+			return true
+		}
+		for _, p := range catalog.Plans {
+			if p.Eligibility.QualifiesArrears || p.Eligibility.CreditNOK > 0 {
+				return true
+			}
+		}
+	}
+	if account != nil {
+		if account.QualifiesArrears || (account.Balance+account.Credit+account.CreditNOK) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // AccountInfo represents account balance, credit, and order eligibility.

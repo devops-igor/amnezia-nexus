@@ -290,3 +290,127 @@ func TestClient_HasCredit_Verification(t *testing.T) {
 		})
 	}
 }
+
+func TestClient_CatalogEligibilityParsing(t *testing.T) {
+	catalogJSON := `{
+		"meta": {"status": 200},
+		"data": {
+			"tiers": [
+				{
+					"group_id": 1,
+					"products": [
+						{
+							"product_id": 101,
+							"product_name": "Standard Hourly",
+							"allow_hourly": true,
+							"price_id": 555,
+							"rate_hourly": 0.14375,
+							"rate_monthly": 90,
+							"in_stock": true,
+							"region_ids": [1]
+						}
+					]
+				}
+			],
+			"eligibility": {
+				"qualifies_arrears": true,
+				"credit_nok": 1000.50
+			},
+			"regions": [{"region_id": "1", "region_name": "Norway"}],
+			"currency": "NOK"
+		}
+	}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(catalogJSON))
+	}))
+	defer server.Close()
+
+	c, err := gigahost.NewClient(gigahost.Config{
+		BaseURL: server.URL,
+		APIKey:  "flux_live_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	plans, err := c.GetCatalog(context.Background())
+	if err != nil {
+		t.Fatalf("GetCatalog failed: %v", err)
+	}
+	if len(plans) != 1 {
+		t.Fatalf("expected 1 plan, got %d", len(plans))
+	}
+	if !plans[0].Eligibility.QualifiesArrears {
+		t.Errorf("expected plan eligibility QualifiesArrears to be true")
+	}
+	if plans[0].Eligibility.CreditNOK != 1000.50 {
+		t.Errorf("expected CreditNOK 1000.50, got %v", plans[0].Eligibility.CreditNOK)
+	}
+}
+
+func TestClient_HasEligibility_Evaluation(t *testing.T) {
+	cases := []struct {
+		name     string
+		account  *gigahost.AccountInfo
+		catalog  *gigahost.Catalog
+		expected bool
+	}{
+		{
+			name:     "nil account and nil catalog",
+			account:  nil,
+			catalog:  nil,
+			expected: false,
+		},
+		{
+			name:     "documented account with 0 balance and catalog qualifies_arrears",
+			account:  &gigahost.AccountInfo{CustID: "1111", CustName: "Example AS", Balance: 0},
+			catalog:  &gigahost.Catalog{Eligibility: gigahost.CatalogEligibility{QualifiesArrears: true}},
+			expected: true,
+		},
+		{
+			name:     "documented account with 0 balance and catalog credit_nok",
+			account:  &gigahost.AccountInfo{CustID: "1111", Balance: 0},
+			catalog:  &gigahost.Catalog{Eligibility: gigahost.CatalogEligibility{CreditNOK: 500}},
+			expected: true,
+		},
+		{
+			name:     "account with positive balance and empty catalog eligibility",
+			account:  &gigahost.AccountInfo{CustID: "1111", Balance: 150},
+			catalog:  &gigahost.Catalog{Eligibility: gigahost.CatalogEligibility{}},
+			expected: true,
+		},
+		{
+			name:     "account with credit and empty catalog eligibility",
+			account:  &gigahost.AccountInfo{CustID: "1111", Credit: 50},
+			catalog:  &gigahost.Catalog{Eligibility: gigahost.CatalogEligibility{}},
+			expected: true,
+		},
+		{
+			name:     "zero balance and zero catalog eligibility",
+			account:  &gigahost.AccountInfo{CustID: "1111", Balance: 0, Credit: 0},
+			catalog:  &gigahost.Catalog{Eligibility: gigahost.CatalogEligibility{QualifiesArrears: false, CreditNOK: 0}},
+			expected: false,
+		},
+		{
+			name:    "plan-level eligibility inside catalog",
+			account: &gigahost.AccountInfo{CustID: "1111", Balance: 0},
+			catalog: &gigahost.Catalog{
+				Plans: []gigahost.HourlyPlan{
+					{ProductID: 101, Eligibility: gigahost.CatalogEligibility{QualifiesArrears: true}},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := gigahost.HasEligibility(tc.account, tc.catalog)
+			if got != tc.expected {
+				t.Errorf("HasEligibility() = %v, want %v", got, tc.expected)
+			}
+		})
+	}
+}

@@ -245,6 +245,42 @@ func (h *Handlers) GigahostCatalogHandler(w http.ResponseWriter, r *http.Request
 	})
 }
 
+func (h *Handlers) verifyAccountEligibility(ctx context.Context, client gigahost.Client) ([]gigahost.HourlyPlan, error) {
+	account, err := client.GetAccount(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("account_check_failed: %w", err)
+	}
+
+	catalogPlans, catErr := client.GetCatalog(ctx)
+	if catErr != nil {
+		return nil, fmt.Errorf("catalog_check_failed: %w", catErr)
+	}
+
+	var catalogElig gigahost.CatalogEligibility
+	for _, p := range catalogPlans {
+		if p.Eligibility.QualifiesArrears || p.Eligibility.CreditNOK > 0 {
+			catalogElig = p.Eligibility
+			break
+		}
+	}
+	if !catalogElig.QualifiesArrears && catalogElig.CreditNOK == 0 {
+		if ce, ok := client.(interface {
+			GetCatalogEligibility() gigahost.CatalogEligibility
+		}); ok {
+			catalogElig = ce.GetCatalogEligibility()
+		}
+	}
+
+	catalog := &gigahost.Catalog{
+		Plans:       catalogPlans,
+		Eligibility: catalogElig,
+	}
+	if !gigahost.HasEligibility(account, catalog) {
+		return nil, gigahost.ErrInsufficientCredit
+	}
+	return catalogPlans, nil
+}
+
 // GigahostOrderHandler handles POST /api/admin/hosting/gigahost/order.
 // Verifies account credit, safely dispatches an hourly VPS order, and records the deployment job.
 func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) {
@@ -271,13 +307,15 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// 1. Account balance and credit pre-check
-	account, err := client.GetAccount(r.Context())
+	catalogPlans, err := h.verifyAccountEligibility(r.Context(), client)
 	if err != nil {
-		h.JSONError(w, http.StatusBadGateway, "account_check_failed", fmt.Sprintf("Failed to check account eligibility: %v", err))
-		return
-	}
-	if !account.HasCredit() {
-		h.JSONError(w, http.StatusPaymentRequired, "insufficient_credit", "Gigahost account has insufficient credit or zero balance")
+		if errors.Is(err, gigahost.ErrInsufficientCredit) {
+			h.JSONError(w, http.StatusPaymentRequired, "insufficient_credit", "Gigahost account has insufficient credit or zero balance")
+		} else if strings.HasPrefix(err.Error(), "account_check_failed:") {
+			h.JSONError(w, http.StatusBadGateway, "account_check_failed", fmt.Sprintf("Failed to check account eligibility: %v", err))
+		} else {
+			h.JSONError(w, http.StatusBadGateway, "catalog_check_failed", fmt.Sprintf("Failed to fetch catalog: %v", err))
+		}
 		return
 	}
 
@@ -285,19 +323,7 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	h.budgetMu.Lock()
 	defer h.budgetMu.Unlock()
 
-	// Monthly NOK budget cap enforcement
-	if err := h.checkMonthlyBudget(r.Context(), client, req); err != nil {
-		if strings.HasPrefix(err.Error(), "Monthly budget cap exceeded") {
-			h.JSONError(w, http.StatusBadRequest, "budget_exceeded", err.Error())
-		} else if strings.HasPrefix(err.Error(), "invalid_plan:") {
-			h.JSONError(w, http.StatusBadRequest, "invalid_plan", strings.TrimPrefix(err.Error(), "invalid_plan: "))
-		} else {
-			h.JSONError(w, http.StatusBadGateway, "catalog_check_failed", err.Error())
-		}
-		return
-	}
-
-	// 3. Reconcile unknown purchase state before allowing retry (fail closed on error)
+	// 3. Reconcile unknown purchase state and enforce in-flight duplicate lock
 	unresolved, reconcileErr := h.reconcilePendingUnknownOrders(r.Context(), client, req)
 	if reconcileErr != nil {
 		h.JSONError(w, http.StatusServiceUnavailable, "reconciliation_failed", reconcileErr.Error())
@@ -309,6 +335,18 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 			"message": "Prior purchase order is pending reconciliation; refusing duplicate purchase until resolved",
 			"order":   unresolved,
 		})
+		return
+	}
+
+	// 4. Monthly NOK budget cap enforcement
+	if err := h.checkMonthlyBudget(r.Context(), client, req, catalogPlans); err != nil {
+		if strings.HasPrefix(err.Error(), "Monthly budget cap exceeded") {
+			h.JSONError(w, http.StatusBadRequest, "budget_exceeded", err.Error())
+		} else if strings.HasPrefix(err.Error(), "invalid_plan:") {
+			h.JSONError(w, http.StatusBadRequest, "invalid_plan", strings.TrimPrefix(err.Error(), "invalid_plan: "))
+		} else {
+			h.JSONError(w, http.StatusBadGateway, "catalog_check_failed", err.Error())
+		}
 		return
 	}
 
@@ -442,7 +480,24 @@ func calculateCommittedSpend(catalog []gigahost.HourlyPlan, servers []gigahost.S
 			if s.OrderID != "" {
 				accountedOrders[s.OrderID] = true
 			}
-			committed += planMonthlySpend(catalog, s.PID, 0)
+			var localHourly float64
+			for _, o := range localOrders {
+				if (s.OrderID != "" && o.OrderID == s.OrderID) || (s.ID > 0 && o.ServerID == s.ID) {
+					if o.HourlyPriceNOK > 0 {
+						localHourly = o.HourlyPriceNOK
+						break
+					}
+				}
+			}
+			if localHourly == 0 {
+				for _, o := range localOrders {
+					if o.PlanID == s.PID && o.HourlyPriceNOK > 0 {
+						localHourly = o.HourlyPriceNOK
+						break
+					}
+				}
+			}
+			committed += planMonthlySpend(catalog, s.PID, localHourly)
 		}
 	}
 
@@ -496,7 +551,7 @@ func (h *Handlers) reconcileBudgetOrders(ctx context.Context, client gigahost.Cl
 		}
 
 		if matchedServer != nil {
-			if isTerminalStatus(matchedServer.Status) && order.Status != matchedServer.Status {
+			if (matchedServer.Status == gigahost.StatusReady || matchedServer.Status == gigahost.StatusFailed || strings.HasPrefix(strings.ToLower(matchedServer.Status), "cancel") || matchedServer.Status == "deleted") && order.Status != matchedServer.Status {
 				order.Status = matchedServer.Status
 				_ = h.updateGigahostOrder(ctx, order)
 			}
@@ -506,7 +561,7 @@ func (h *Handlers) reconcileBudgetOrders(ctx context.Context, client gigahost.Cl
 	}
 }
 
-func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Client, req OrderServerPayload) error {
+func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Client, req OrderServerPayload, cachedCatalog ...[]gigahost.HourlyPlan) error {
 	if h.db == nil {
 		return nil
 	}
@@ -518,9 +573,15 @@ func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Clien
 		return nil
 	}
 
-	catalog, catErr := client.GetCatalog(ctx)
-	if catErr != nil {
-		return fmt.Errorf("failed to check catalog for budget verification: %w", catErr)
+	var catalog []gigahost.HourlyPlan
+	if len(cachedCatalog) > 0 && cachedCatalog[0] != nil {
+		catalog = cachedCatalog[0]
+	} else {
+		var catErr error
+		catalog, catErr = client.GetCatalog(ctx)
+		if catErr != nil {
+			return fmt.Errorf("failed to check catalog for budget verification: %w", catErr)
+		}
 	}
 
 	var matchedPlan *gigahost.HourlyPlan
@@ -581,6 +642,46 @@ func isPendingOrInFlight(status string) bool {
 	}
 }
 
+func (h *Handlers) reconcileSingleOrder(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord, servers []gigahost.ServerInfo) {
+	matched := false
+	for _, s := range servers {
+		if s.OrderID != "" && s.OrderID == order.OrderID {
+			if s.ID > 0 {
+				order.ServerID = s.ID
+			}
+			if ip := s.GetIP(); ip != "" {
+				order.AssignedIP = ip
+			}
+			matched = true
+			break
+		}
+	}
+	if order.OrderID != "" && !strings.HasPrefix(order.OrderID, "intent_") && !strings.HasPrefix(order.OrderID, "unknown_") {
+		statusResp, err := client.GetDeployStatus(ctx, order.OrderID)
+		if err == nil && statusResp != nil && statusResp.Status != "" {
+			order.Status = statusResp.Status
+			if statusResp.ServerID > 0 {
+				order.ServerID = statusResp.ServerID
+			}
+			if ip := statusResp.GetIP(); ip != "" {
+				order.AssignedIP = ip
+			}
+		} else if matched {
+			for _, s := range servers {
+				if s.OrderID != "" && s.OrderID == order.OrderID {
+					if s.Status == gigahost.StatusReady {
+						order.Status = gigahost.StatusReady
+					}
+					break
+				}
+			}
+		}
+		_ = h.updateGigahostOrder(ctx, order)
+	} else if matched {
+		_ = h.updateGigahostOrder(ctx, order)
+	}
+}
+
 func (h *Handlers) reconcilePendingUnknownOrders(ctx context.Context, client gigahost.Client, req OrderServerPayload) (*GigahostOrderRecord, error) {
 	existingOrders, _ := h.getGigahostOrders(ctx)
 	var servers []gigahost.ServerInfo
@@ -598,37 +699,9 @@ func (h *Handlers) reconcilePendingUnknownOrders(ctx context.Context, client gig
 			}
 			checkedServers = true
 		}
-		matched := false
-		for _, s := range servers {
-			if s.OrderID != "" && s.OrderID == existingOrders[i].OrderID {
-				if s.ID > 0 {
-					existingOrders[i].ServerID = s.ID
-				}
-				if s.Status != "" {
-					existingOrders[i].Status = s.Status
-				}
-				if ip := s.GetIP(); ip != "" {
-					existingOrders[i].AssignedIP = ip
-				}
-				_ = h.updateGigahostOrder(ctx, &existingOrders[i])
-				matched = true
-				break
-			}
-		}
-		if !matched && existingOrders[i].OrderID != "" && !strings.HasPrefix(existingOrders[i].OrderID, "intent_") && !strings.HasPrefix(existingOrders[i].OrderID, "unknown_") {
-			statusResp, err := client.GetDeployStatus(ctx, existingOrders[i].OrderID)
-			if err == nil && statusResp != nil && statusResp.Status != "" {
-				existingOrders[i].Status = statusResp.Status
-				if statusResp.ServerID > 0 {
-					existingOrders[i].ServerID = statusResp.ServerID
-				}
-				if ip := statusResp.GetIP(); ip != "" {
-					existingOrders[i].AssignedIP = ip
-				}
-				_ = h.updateGigahostOrder(ctx, &existingOrders[i])
-			}
-		}
-		if !matched && isPendingOrInFlight(existingOrders[i].Status) && existingOrders[i].PlanID == req.PID && existingOrders[i].RegionID == req.RegionID {
+		h.reconcileSingleOrder(ctx, client, &existingOrders[i], servers)
+
+		if isPendingOrInFlight(existingOrders[i].Status) && existingOrders[i].PlanID == req.PID && existingOrders[i].RegionID == req.RegionID {
 			return &existingOrders[i], nil
 		}
 	}

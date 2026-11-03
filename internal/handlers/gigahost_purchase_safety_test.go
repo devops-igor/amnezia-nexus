@@ -420,3 +420,279 @@ func TestGigahostPurchaseSafety_OrdersRefreshSingleInventoryFetch(t *testing.T) 
 		t.Errorf("expected 3 orders returned, got %d", resp.Count)
 	}
 }
+
+func TestGigahostPurchaseSafety_DocumentedEligibleAccountAllowsOrder(t *testing.T) {
+	t.Run("eligible account via catalog qualifies_arrears places order", func(t *testing.T) {
+		h, _, _ := setupTestHandlers(t)
+		var posts atomic.Int32
+		h.SetGigahostClient(&mockGigahostClient{
+			getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+				// Documented /account returns customer metadata without financial balance
+				return &gigahost.AccountInfo{
+					CustID:   "cust_1111",
+					CustName: "Example AS",
+					Balance:  0.0,
+					Credit:   0.0,
+				}, nil
+			},
+			getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+				return []gigahost.HourlyPlan{
+					{
+						ProductID:      101,
+						PriceID:        555,
+						HourlyRateNOK:  0.14375,
+						MonthlyCeiling: 90.0,
+						InStock:        true,
+						Regions:        []gigahost.Region{{ID: 1, Available: true}},
+						Eligibility: gigahost.CatalogEligibility{
+							QualifiesArrears: true,
+							CreditNOK:        1000.0,
+						},
+					},
+				}, nil
+			},
+			orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+				posts.Add(1)
+				return &gigahost.OrderResponse{OrderID: "10001", Status: gigahost.StatusPending}, nil
+			},
+		})
+
+		body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0.14375}`
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostOrderHandler(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected HTTP 200 OK for documented eligible account, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		if posts.Load() != 1 {
+			t.Errorf("expected 1 order posted, got %d", posts.Load())
+		}
+	})
+
+	t.Run("ineligible account with zero balance and zero catalog credit rejected with 402", func(t *testing.T) {
+		h, _, _ := setupTestHandlers(t)
+		var posts atomic.Int32
+		h.SetGigahostClient(&mockGigahostClient{
+			getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+				return &gigahost.AccountInfo{
+					CustID:  "cust_2222",
+					Balance: 0.0,
+					Credit:  0.0,
+				}, nil
+			},
+			getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+				return []gigahost.HourlyPlan{
+					{
+						ProductID:      101,
+						PriceID:        555,
+						HourlyRateNOK:  0.14375,
+						MonthlyCeiling: 90.0,
+						InStock:        true,
+						Regions:        []gigahost.Region{{ID: 1, Available: true}},
+						Eligibility: gigahost.CatalogEligibility{
+							QualifiesArrears: false,
+							CreditNOK:        0.0,
+						},
+					},
+				}, nil
+			},
+			orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+				posts.Add(1)
+				return &gigahost.OrderResponse{OrderID: "10002", Status: gigahost.StatusPending}, nil
+			},
+		})
+
+		body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0.14375}`
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostOrderHandler(w, req)
+
+		if w.Code != http.StatusPaymentRequired {
+			t.Fatalf("expected HTTP 402 Payment Required for ineligible account, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		if posts.Load() != 0 {
+			t.Errorf("expected 0 orders posted for ineligible account, got %d", posts.Load())
+		}
+	})
+}
+
+func TestGigahostPurchaseSafety_OutOfStockExistingPlanPreservesSpend(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+
+	// Set monthly budget of 100 NOK
+	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 100.0}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Existing order: ready server with stored rate 0.14375 NOK/hr (~103.5 NOK/mo)
+	now := time.Now().UTC()
+	if err := h.saveGigahostOrder(ctx, &GigahostOrderRecord{
+		OrderID:        "10001",
+		Status:         gigahost.StatusReady,
+		PlanID:         101,
+		RegionID:       1,
+		HourlyPriceNOK: 0.14375,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var posts atomic.Int32
+	h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+			return &gigahost.AccountInfo{Balance: 500.0, Currency: "NOK"}, nil
+		},
+		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+			// Plan 101 is out of stock (filtered from catalog).
+			// Only Plan 102 (90 NOK/mo) is orderable.
+			return []gigahost.HourlyPlan{
+				{
+					ProductID:      102,
+					PriceID:        556,
+					HourlyRateNOK:  0.125,
+					MonthlyCeiling: 90.0,
+					InStock:        true,
+					Regions:        []gigahost.Region{{ID: 1, Available: true}},
+				},
+			}, nil
+		},
+		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
+			// Existing inventory server corresponds to order 10001 (plan 101)
+			return []gigahost.ServerInfo{
+				{
+					ID:      3500,
+					OrderID: "10001",
+					PID:     101,
+					Status:  gigahost.StatusReady,
+				},
+			}, nil
+		},
+		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			posts.Add(1)
+			return &gigahost.OrderResponse{OrderID: "10002", Status: gigahost.StatusPending}, nil
+		},
+	})
+
+	// Placing order for Plan 102 should be rejected because existing 10001 reservation + 90 NOK > 100 NOK budget
+	body := `{"pid":102,"price_id":556,"region_id":1,"os_id":12,"hourly_price_nok":0.125}`
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	h.GigahostOrderHandler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 Bad Request, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "Monthly budget cap exceeded") {
+		t.Errorf("expected budget cap exceeded error, got: %s", w.Body.String())
+	}
+	if posts.Load() != 0 {
+		t.Errorf("expected 0 provider posts when budget exceeded, got %d", posts.Load())
+	}
+}
+
+func TestGigahostPurchaseSafety_InFlightInstallingOrderBlocksDuplicateRetry(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+
+	var posts atomic.Int32
+	var statusCalls atomic.Int32
+	deployStatus := gigahost.StatusInstalling
+
+	h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+			return &gigahost.AccountInfo{Balance: 1000.0, Currency: "NOK"}, nil
+		},
+		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+			return []gigahost.HourlyPlan{
+				{
+					ProductID:      101,
+					PriceID:        555,
+					HourlyRateNOK:  0.14375,
+					MonthlyCeiling: 90.0,
+					InStock:        true,
+					Regions:        []gigahost.Region{{ID: 1, Available: true}},
+				},
+			}, nil
+		},
+		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
+			if posts.Load() > 0 {
+				// Provider inventory reports billing status "active", but server is still installing
+				return []gigahost.ServerInfo{
+					{
+						ID:      3500,
+						OrderID: "10001",
+						PID:     101,
+						Status:  "active",
+					},
+				}, nil
+			}
+			return []gigahost.ServerInfo{}, nil
+		},
+		getDeployStatusFn: func(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error) {
+			statusCalls.Add(1)
+			return &gigahost.DeployStatusResponse{
+				OrderID: orderID,
+				Status:  deployStatus,
+			}, nil
+		},
+		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			posts.Add(1)
+			return &gigahost.OrderResponse{OrderID: "10001", Status: gigahost.StatusPending}, nil
+		},
+	})
+
+	body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0.14375}`
+
+	// Request 1: first purchase succeeds
+	req1 := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
+	req1 = req1.WithContext(middleware.WithSession(req1.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	w1 := httptest.NewRecorder()
+	h.GigahostOrderHandler(w1, req1)
+
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected request 1 HTTP 200, got %d (body: %s)", w1.Code, w1.Body.String())
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("expected 1 post after request 1, got %d", posts.Load())
+	}
+
+	// Request 2: duplicate retry while status is "installing" -> refused with 202 Accepted
+	req2 := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
+	req2 = req2.WithContext(middleware.WithSession(req2.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	w2 := httptest.NewRecorder()
+	h.GigahostOrderHandler(w2, req2)
+
+	if w2.Code != http.StatusAccepted {
+		t.Fatalf("expected request 2 HTTP 202 Accepted duplicate refusal, got %d (body: %s)", w2.Code, w2.Body.String())
+	}
+	if !strings.Contains(w2.Body.String(), "Prior purchase order is pending reconciliation") {
+		t.Errorf("expected pending reconciliation message, got: %s", w2.Body.String())
+	}
+	if posts.Load() != 1 {
+		t.Errorf("expected no additional post on duplicate retry, got %d", posts.Load())
+	}
+	if statusCalls.Load() == 0 {
+		t.Errorf("expected GetDeployStatus to be queried during reconciliation")
+	}
+
+	// Now simulate deployment completion: deployStatus becomes "ready"
+	deployStatus = gigahost.StatusReady
+
+	// Request 3: intentional subsequent purchase after first is ready -> succeeds
+	req3 := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
+	req3 = req3.WithContext(middleware.WithSession(req3.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	w3 := httptest.NewRecorder()
+	h.GigahostOrderHandler(w3, req3)
+
+	if w3.Code != http.StatusOK {
+		t.Fatalf("expected request 3 HTTP 200 OK after ready, got %d (body: %s)", w3.Code, w3.Body.String())
+	}
+	if posts.Load() != 2 {
+		t.Errorf("expected 2 total posts after intentional second order, got %d", posts.Load())
+	}
+}
