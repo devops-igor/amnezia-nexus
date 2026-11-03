@@ -17,6 +17,8 @@ jobs:
     container:
       image: localhost:5000/nexus-ci-job:latest
       options: --cpus 4 --memory 6g
+    env:
+      PIP_CACHE_DIR: /tmp/pip-cache
     timeout-minutes: 20
     steps:
       - name: Checkout Code
