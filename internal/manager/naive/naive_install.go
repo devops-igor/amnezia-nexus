@@ -417,7 +417,7 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 	}
 	caddyVer = determineRunningCaddyVersion(ctx, client, caddyVer)
 
-	pluginVer := "v2.11.7-naive2"
+	pluginVer := "v2.11.7-naive"
 	if pv, ok := params["plugin_version"].(string); ok && strings.TrimSpace(pv) != "" {
 		pluginVer = strings.TrimSpace(pv)
 	}

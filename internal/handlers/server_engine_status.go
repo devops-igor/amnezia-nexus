@@ -66,45 +66,57 @@ func (h *Handlers) resolveServerEngineStatusCached(server *models.Server) map[st
 	if vMeta, ok := getInstalledProtocolMetadata(server.Protocols, models.ProtocolVLESS); ok {
 		profile := extractXrayProfile(vMeta)
 		installedVersion := extractXrayVersion(vMeta)
-		rel, cached := checker.GetCachedRelease(updater.EngineXray)
+		rel, checkedAt, isStale, cached := checker.GetCachedReleaseState(updater.EngineXray)
 		if !cached {
 			h.triggerBackgroundReleaseWarm(checker, updater.EngineXray)
 			result[models.ProtocolVLESS] = buildUnknownStatus(updater.EngineXray, models.ProtocolVLESS, installedVersion, profile)
 		} else {
-			result[models.ProtocolVLESS] = evaluateReleaseStatus(updater.EngineXray, models.ProtocolVLESS, installedVersion, profile, rel)
+			if isStale {
+				h.triggerBackgroundReleaseWarm(checker, updater.EngineXray)
+			}
+			result[models.ProtocolVLESS] = evaluateReleaseStatus(updater.EngineXray, models.ProtocolVLESS, installedVersion, profile, rel, checkedAt, isStale)
 		}
 	}
 
 	// 2. NaiveProxy / Caddy (models.ProtocolNaive = "naive")
 	if nMeta, ok := getInstalledProtocolMetadata(server.Protocols, models.ProtocolNaive); ok {
 		caddyVersion := extractCaddyVersion(nMeta)
-		cRel, cCached := checker.GetCachedRelease(updater.EngineCaddyCore)
+		cRel, cCheckedAt, cStale, cCached := checker.GetCachedReleaseState(updater.EngineCaddyCore)
 		if !cCached {
 			h.triggerBackgroundReleaseWarm(checker, updater.EngineCaddyCore)
 			result["caddy"] = buildUnknownStatus(updater.EngineCaddyCore, "caddy", caddyVersion, "")
 		} else {
-			result["caddy"] = evaluateReleaseStatus(updater.EngineCaddyCore, "caddy", caddyVersion, "", cRel)
+			if cStale {
+				h.triggerBackgroundReleaseWarm(checker, updater.EngineCaddyCore)
+			}
+			result["caddy"] = evaluateReleaseStatus(updater.EngineCaddyCore, "caddy", caddyVersion, "", cRel, cCheckedAt, cStale)
 		}
 
 		pluginVersion := extractNaivePluginVersion(nMeta)
-		pRel, pCached := checker.GetCachedRelease(updater.EngineNaiveForwardProxy)
+		pRel, pCheckedAt, pStale, pCached := checker.GetCachedReleaseState(updater.EngineNaiveForwardProxy)
 		if !pCached {
 			h.triggerBackgroundReleaseWarm(checker, updater.EngineNaiveForwardProxy)
 			result[models.ProtocolNaive] = buildUnknownStatus(updater.EngineNaiveForwardProxy, models.ProtocolNaive, pluginVersion, "")
 		} else {
-			result[models.ProtocolNaive] = evaluateReleaseStatus(updater.EngineNaiveForwardProxy, models.ProtocolNaive, pluginVersion, "", pRel)
+			if pStale {
+				h.triggerBackgroundReleaseWarm(checker, updater.EngineNaiveForwardProxy)
+			}
+			result[models.ProtocolNaive] = evaluateReleaseStatus(updater.EngineNaiveForwardProxy, models.ProtocolNaive, pluginVersion, "", pRel, pCheckedAt, pStale)
 		}
 	}
 
 	// 3. Optional sing-box
 	if sMeta, ok := getInstalledProtocolMetadata(server.Protocols, "sing-box"); ok {
 		version := extractSingBoxVersion(sMeta)
-		sRel, sCached := checker.GetCachedRelease(updater.EngineSingBox)
+		sRel, sCheckedAt, sStale, sCached := checker.GetCachedReleaseState(updater.EngineSingBox)
 		if !sCached {
 			h.triggerBackgroundReleaseWarm(checker, updater.EngineSingBox)
 			result["sing-box"] = buildUnknownStatus(updater.EngineSingBox, "sing-box", version, "")
 		} else {
-			result["sing-box"] = evaluateReleaseStatus(updater.EngineSingBox, "sing-box", version, "", sRel)
+			if sStale {
+				h.triggerBackgroundReleaseWarm(checker, updater.EngineSingBox)
+			}
+			result["sing-box"] = evaluateReleaseStatus(updater.EngineSingBox, "sing-box", version, "", sRel, sCheckedAt, sStale)
 		}
 	}
 
@@ -114,7 +126,7 @@ func (h *Handlers) resolveServerEngineStatusCached(server *models.Server) map[st
 	return result
 }
 
-func evaluateReleaseStatus(engine updater.EngineType, protocol, installedVersion, profile string, rel updater.ReleaseInfo) updater.EngineStatus {
+func evaluateReleaseStatus(engine updater.EngineType, protocol, installedVersion, profile string, rel updater.ReleaseInfo, checkedAt time.Time, isStale bool) updater.EngineStatus {
 	st := updater.CheckUpdateStatus(installedVersion, rel.Version)
 	var upstreamNewer bool
 	var upgradeCompatible bool
@@ -139,7 +151,6 @@ func evaluateReleaseStatus(engine updater.EngineType, protocol, installedVersion
 		updateAvailable = false
 	}
 
-	checkedAt := rel.PublishedAt
 	if checkedAt.IsZero() {
 		checkedAt = time.Now()
 	}
@@ -156,6 +167,7 @@ func evaluateReleaseStatus(engine updater.EngineType, protocol, installedVersion
 		ReleaseURL:        rel.ReleaseURL,
 		CheckedAt:         checkedAt,
 		RequestedAt:       time.Now(),
+		IsStale:           isStale,
 	}
 }
 
@@ -473,7 +485,7 @@ func extractNaivePluginVersion(meta map[string]any) string {
 			if v, ok := meta[key].(string); ok && strings.TrimSpace(v) != "" {
 				s := strings.TrimSpace(v)
 				if strings.HasPrefix(s, "c096d6a") {
-					return "v2.11.7-naive2"
+					return "v2.11.7-naive"
 				}
 				return s
 			}
@@ -483,7 +495,7 @@ func extractNaivePluginVersion(meta map[string]any) string {
 				if v, ok := params[key].(string); ok && strings.TrimSpace(v) != "" {
 					s := strings.TrimSpace(v)
 					if strings.HasPrefix(s, "c096d6a") {
-						return "v2.11.7-naive2"
+						return "v2.11.7-naive"
 					}
 					return s
 				}

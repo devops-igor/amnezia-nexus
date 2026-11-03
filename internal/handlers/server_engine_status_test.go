@@ -760,8 +760,8 @@ func TestExtractCaddyAndNaiveVersion(t *testing.T) {
 	if v := extractNaivePluginVersion(map[string]any{"plugin_version": "v2.11.7-naive1"}); v != "v2.11.7-naive1" {
 		t.Errorf("expected 'v2.11.7-naive1', got %q", v)
 	}
-	if v := extractNaivePluginVersion(map[string]any{"plugin_version": "c096d6a00cb28e019cc1995b04bdc6a9311d8024"}); v != "v2.11.7-naive2" {
-		t.Errorf("expected commit to map to 'v2.11.7-naive2', got %q", v)
+	if v := extractNaivePluginVersion(map[string]any{"plugin_version": "c096d6a00cb28e019cc1995b04bdc6a9311d8024"}); v != "v2.11.7-naive" {
+		t.Errorf("expected commit to map to 'v2.11.7-naive', got %q", v)
 	}
 }
 
