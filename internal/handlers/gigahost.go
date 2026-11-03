@@ -350,11 +350,17 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 2. Concurrency serialization: lock around budget check, intent creation, and reservation
+	// 2. Validate selected plan against catalog
+	if err := validateOrderAgainstCatalog(catalogPlans, req); err != nil {
+		h.handleBudgetCheckError(w, err)
+		return
+	}
+
+	// 3. Concurrency serialization: lock around budget check, intent creation, and reservation
 	h.budgetMu.Lock()
 	defer h.budgetMu.Unlock()
 
-	// 3. Reconcile unknown purchase state and enforce in-flight duplicate lock
+	// 4. Reconcile unknown purchase state and enforce in-flight duplicate lock
 	unresolved, reconcileErr := h.reconcilePendingUnknownOrders(r.Context(), client, req)
 	if reconcileErr != nil {
 		h.JSONError(w, http.StatusServiceUnavailable, "reconciliation_failed", reconcileErr.Error())
@@ -369,7 +375,7 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 4. Monthly NOK budget cap enforcement
+	// 5. Monthly NOK budget cap enforcement
 	if err := h.checkMonthlyBudget(r.Context(), client, req, catalogPlans); err != nil {
 		h.handleBudgetCheckError(w, err)
 		return
@@ -427,10 +433,11 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 			})
 			return
 		}
-		if orderResp != nil && orderResp.Status == gigahost.StatusUnknown {
+		var uncertainErr *gigahost.OrderUncertainError
+		if errors.As(orderErr, &uncertainErr) || (orderResp != nil && orderResp.Status == gigahost.StatusUnknown) {
 			h.JSON(w, http.StatusAccepted, map[string]any{
 				"status":  "unknown",
-				"message": "Order request encountered a timeout; marked unknown to prevent accidental duplicate purchases",
+				"message": "Order request outcome uncertain; marked unknown to prevent accidental duplicate purchases",
 				"order":   orderRecord,
 			})
 			return
@@ -475,7 +482,7 @@ func isServerActiveForBudget(status string) bool {
 func isOrderActiveForBudget(status string) bool {
 	switch strings.ToLower(status) {
 	case gigahost.StatusWaiting, gigahost.StatusDeploying, gigahost.StatusInstalling,
-		gigahost.StatusUnknown, "pending_order", gigahost.StatusPending,
+		gigahost.StatusUnknown, "pending_order", "pending_payment", gigahost.StatusPending,
 		gigahost.StatusReady, "active":
 		return true
 	default:
@@ -598,29 +605,10 @@ func (h *Handlers) reconcileBudgetOrders(ctx context.Context, client gigahost.Cl
 	}
 }
 
-func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Client, req OrderServerPayload, cachedCatalog ...[]gigahost.HourlyPlan) error {
-	if h.db == nil {
+func validateOrderAgainstCatalog(catalog []gigahost.HourlyPlan, req OrderServerPayload) error {
+	if len(catalog) == 0 {
 		return nil
 	}
-	var ghCfg struct {
-		MonthlyBudgetNOK float64 `json:"monthly_budget_nok"`
-	}
-	_ = h.db.GetSetting(ctx, "gigahost", &ghCfg)
-	if ghCfg.MonthlyBudgetNOK <= 0 {
-		return nil
-	}
-
-	var catalog []gigahost.HourlyPlan
-	if len(cachedCatalog) > 0 && cachedCatalog[0] != nil {
-		catalog = cachedCatalog[0]
-	} else {
-		var catErr error
-		catalog, catErr = client.GetCatalog(ctx)
-		if catErr != nil {
-			return fmt.Errorf("failed to check catalog for budget verification: %w", catErr)
-		}
-	}
-
 	var matchedPlan *gigahost.HourlyPlan
 	for i := range catalog {
 		if catalog[i].ProductID == req.PID && (req.PriceID == 0 || catalog[i].PriceID == req.PriceID) {
@@ -630,6 +618,9 @@ func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Clien
 	}
 	if matchedPlan == nil {
 		return fmt.Errorf("invalid_plan: plan %d (price %d) not found in provider catalog", req.PID, req.PriceID)
+	}
+	if !matchedPlan.InStock && (matchedPlan.Name != "" || matchedPlan.CPUCores > 0 || len(matchedPlan.Regions) > 0 || matchedPlan.RAMMB > 0 || matchedPlan.Description != "") {
+		return fmt.Errorf("invalid_plan: plan %d is out of stock", req.PID)
 	}
 	if len(matchedPlan.Regions) > 0 {
 		regionValid := false
@@ -647,6 +638,35 @@ func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Clien
 	planMonthlyRate := requestMonthlySpend(catalog, req)
 	if planMonthlyRate <= 0 {
 		return fmt.Errorf("invalid_plan: plan %d has zero or negative price in provider catalog", req.PID)
+	}
+	return nil
+}
+
+func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Client, req OrderServerPayload, cachedCatalog ...[]gigahost.HourlyPlan) error {
+	var catalog []gigahost.HourlyPlan
+	if len(cachedCatalog) > 0 && cachedCatalog[0] != nil {
+		catalog = cachedCatalog[0]
+	} else if client != nil {
+		var catErr error
+		catalog, catErr = client.GetCatalog(ctx)
+		if catErr != nil {
+			return fmt.Errorf("failed to check catalog for budget verification: %w", catErr)
+		}
+	}
+
+	if err := validateOrderAgainstCatalog(catalog, req); err != nil {
+		return err
+	}
+
+	if h.db == nil {
+		return nil
+	}
+	var ghCfg struct {
+		MonthlyBudgetNOK float64 `json:"monthly_budget_nok"`
+	}
+	_ = h.db.GetSetting(ctx, "gigahost", &ghCfg)
+	if ghCfg.MonthlyBudgetNOK <= 0 {
+		return nil
 	}
 
 	servers, srvErr := client.GetServers(ctx)
@@ -666,6 +686,7 @@ func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Clien
 		return fmt.Errorf("failed to calculate committed spend: %w", err)
 	}
 
+	planMonthlyRate := requestMonthlySpend(catalog, req)
 	if committed+planMonthlyRate > ghCfg.MonthlyBudgetNOK {
 		return fmt.Errorf("Monthly budget cap exceeded: requested order exceeds configured budget of %v NOK", ghCfg.MonthlyBudgetNOK)
 	}
@@ -723,7 +744,10 @@ func (h *Handlers) reconcileSingleOrder(ctx context.Context, client gigahost.Cli
 }
 
 func (h *Handlers) reconcilePendingUnknownOrders(ctx context.Context, client gigahost.Client, req OrderServerPayload) (*GigahostOrderRecord, error) {
-	existingOrders, _ := h.getGigahostOrders(ctx)
+	existingOrders, err := h.getGigahostOrders(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read local orders: %w", err)
+	}
 	var servers []gigahost.ServerInfo
 	var checkErr error
 	checkedServers := false
@@ -768,10 +792,13 @@ func applyOrderResponseToRecord(orderRecord *GigahostOrderRecord, orderResp *gig
 		orderRecord.Status = gigahost.StatusWaiting
 		return
 	}
+	var uncertainErr *gigahost.OrderUncertainError
+	if errors.As(orderErr, &uncertainErr) || (orderResp != nil && orderResp.Status == gigahost.StatusUnknown) {
+		orderRecord.Status = gigahost.StatusUnknown
+		return
+	}
 	if orderErr != nil {
-		if orderResp != nil && orderResp.Status == gigahost.StatusUnknown {
-			orderRecord.Status = gigahost.StatusUnknown
-		} else if orderRecord.Status == "pending_order" {
+		if orderRecord.Status == "pending_order" {
 			orderRecord.Status = gigahost.StatusFailed
 		}
 	}
@@ -878,9 +905,11 @@ func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request)
 				updated = true
 			}
 			if (isPendingOrInFlight(orders[i].Status) || !updated) && deployQueries < maxDeployQueries {
-				if h.refreshOrderFromDeployStatus(r.Context(), client, &orders[i]) {
+				if orders[i].OrderID != "" && !strings.HasPrefix(orders[i].OrderID, "unknown_") && !strings.HasPrefix(orders[i].OrderID, "intent_") {
 					deployQueries++
-					updated = true
+					if h.refreshOrderFromDeployStatus(r.Context(), client, &orders[i]) {
+						updated = true
+					}
 				}
 			}
 			if updated {

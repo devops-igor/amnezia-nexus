@@ -275,6 +275,67 @@ func (c *client) OrderServer(ctx context.Context, req OrderRequest) (*OrderRespo
 	return &resp, nil
 }
 
+// OrderUncertainError represents an order outcome where provider execution is uncertain
+// (e.g. 5xx, timeouts, connection errors, or malformed JSON responses on 200/201).
+type OrderUncertainError struct {
+	StatusCode int    `json:"status_code,omitempty"`
+	Message    string `json:"message"`
+	Err        error  `json:"-"`
+}
+
+func (e *OrderUncertainError) Error() string {
+	if e.StatusCode > 0 {
+		return fmt.Sprintf("order status uncertain (status %d): %s", e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("order status uncertain: %s", e.Message)
+}
+
+func (e *OrderUncertainError) Unwrap() error {
+	return e.Err
+}
+
+func isUncertainOrderError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var uncertainErr *OrderUncertainError
+	if errors.As(err, &uncertainErr) {
+		return true
+	}
+	var partialErr *OrderPartialError
+	if errors.As(err, &partialErr) {
+		return false
+	}
+	if errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrRateLimited) ||
+		errors.Is(err, ErrInvalidBillingPeriod) || errors.Is(err, ErrInvalidQuantity) || errors.Is(err, ErrInvalidOrderParam) {
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+			return false
+		}
+		if apiErr.StatusCode >= 500 {
+			return true
+		}
+	}
+	if isTimeoutOrNetworkError(err) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "failed to unmarshal order response") {
+		return true
+	}
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		return true
+	}
+	var unmarshalErr *json.UnmarshalTypeError
+	if errors.As(err, &unmarshalErr) {
+		return true
+	}
+	return false
+}
+
 // OrderServerSafe executes an order with timeout safety and idempotency inspection.
 // If an order request times out or is severed by network partition, it marks the request
 // as unknown and fails closed against retries until resolved.
@@ -291,10 +352,13 @@ func (c *client) OrderServerSafe(ctx context.Context, req OrderRequest) (*OrderR
 
 	if hasUnknown {
 		// Prior order status is still unknown; fail closed against retries until resolved
+		uncertainErr := &OrderUncertainError{
+			Message: "prior order status is still unknown; refusing duplicate order until resolved",
+		}
 		return &OrderResponse{
 			Status:  StatusUnknown,
-			Message: "prior order status is still unknown; refusing duplicate order until resolved",
-		}, fmt.Errorf("prior order status is still unknown (state unknown)")
+			Message: uncertainErr.Message,
+		}, uncertainErr
 	}
 
 	// 2. Dispatch order
@@ -314,17 +378,26 @@ func (c *client) OrderServerSafe(ctx context.Context, req OrderRequest) (*OrderR
 		return nil, orderErr
 	}
 
-	// 3. Inspect if failure is timeout/network related
-	if isTimeoutOrNetworkError(orderErr) {
+	// 3. Inspect if failure is timeout, 5xx, or malformed JSON (uncertain outcome)
+	if isUncertainOrderError(orderErr) {
 		c.mu.Lock()
 		c.unknownOrders[reqKey] = time.Now()
 		c.mu.Unlock()
 
-		// Server not confirmed; fail closed with unknown status to guard against duplicate purchases
+		var statusCode int
+		var apiErr *APIError
+		if errors.As(orderErr, &apiErr) {
+			statusCode = apiErr.StatusCode
+		}
+		uncertain := &OrderUncertainError{
+			StatusCode: statusCode,
+			Message:    orderErr.Error(),
+			Err:        orderErr,
+		}
 		return &OrderResponse{
 			Status:  StatusUnknown,
-			Message: "order timed out; marked unknown to prevent duplicate order",
-		}, fmt.Errorf("order timed out (state unknown): %w", orderErr)
+			Message: uncertain.Error(),
+		}, uncertain
 	}
 
 	return nil, orderErr

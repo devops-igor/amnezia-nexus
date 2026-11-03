@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
@@ -413,4 +414,169 @@ func TestClient_HasEligibility_Evaluation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClient_OrderServerSafe_AmbiguousResponses(t *testing.T) {
+	req := gigahost.OrderRequest{
+		PID:           201,
+		PriceID:       10,
+		RegionID:      1,
+		OSID:          2,
+		BillingPeriod: gigahost.BillingPeriodHourly,
+		Quantity:      1,
+	}
+
+	t.Run("http 500 marks order unknown and blocks duplicate", func(t *testing.T) {
+		var postCount atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && r.URL.Path == "/servers" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"meta":{"status":200},"data":[]}`))
+				return
+			}
+			if r.Method == http.MethodPost && r.URL.Path == "/deploy/servers" {
+				postCount.Add(1)
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"error":"internal database deadlock"}`))
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		c, err := gigahost.NewClient(gigahost.Config{
+			BaseURL: server.URL,
+			APIKey:  "flux_live_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		})
+		if err != nil {
+			t.Fatalf("failed to create client: %v", err)
+		}
+
+		resp, err := c.OrderServerSafe(context.Background(), req)
+		if err == nil {
+			t.Fatal("expected error on 500 response, got nil")
+		}
+		var uncertainErr *gigahost.OrderUncertainError
+		if !errors.As(err, &uncertainErr) {
+			t.Fatalf("expected error to be *OrderUncertainError, got %T: %v", err, err)
+		}
+		if uncertainErr.StatusCode != http.StatusInternalServerError {
+			t.Errorf("expected StatusCode 500, got %d", uncertainErr.StatusCode)
+		}
+		if resp == nil || resp.Status != gigahost.StatusUnknown {
+			t.Fatalf("expected StatusUnknown, got %+v", resp)
+		}
+
+		// Subsequent call must fail closed without dispatching a new POST
+		resp2, err2 := c.OrderServerSafe(context.Background(), req)
+		if err2 == nil {
+			t.Fatal("expected duplicate order to fail closed, got nil")
+		}
+		var uncertainErr2 *gigahost.OrderUncertainError
+		if !errors.As(err2, &uncertainErr2) {
+			t.Fatalf("expected second error to be *OrderUncertainError, got %T: %v", err2, err2)
+		}
+		if resp2 == nil || resp2.Status != gigahost.StatusUnknown {
+			t.Errorf("expected StatusUnknown on duplicate, got %+v", resp2)
+		}
+		if postCount.Load() != 1 {
+			t.Errorf("expected exactly 1 POST attempt, got %d", postCount.Load())
+		}
+	})
+
+	t.Run("malformed json on http 200 marks order unknown and blocks duplicate", func(t *testing.T) {
+		var postCount atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && r.URL.Path == "/servers" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"meta":{"status":200},"data":[]}`))
+				return
+			}
+			if r.Method == http.MethodPost && r.URL.Path == "/deploy/servers" {
+				postCount.Add(1)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`<html><head><title>502 Bad Gateway</title></head><body>raw html</body></html>`))
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		c, err := gigahost.NewClient(gigahost.Config{
+			BaseURL: server.URL,
+			APIKey:  "flux_live_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		})
+		if err != nil {
+			t.Fatalf("failed to create client: %v", err)
+		}
+
+		resp, err := c.OrderServerSafe(context.Background(), req)
+		if err == nil {
+			t.Fatal("expected error on malformed json, got nil")
+		}
+		var uncertainErr *gigahost.OrderUncertainError
+		if !errors.As(err, &uncertainErr) {
+			t.Fatalf("expected error to be *OrderUncertainError, got %T: %v", err, err)
+		}
+		if resp == nil || resp.Status != gigahost.StatusUnknown {
+			t.Fatalf("expected StatusUnknown, got %+v", resp)
+		}
+
+		// Subsequent call must fail closed without dispatching a new POST
+		resp2, err2 := c.OrderServerSafe(context.Background(), req)
+		if err2 == nil {
+			t.Fatal("expected duplicate order to fail closed, got nil")
+		}
+		if resp2 == nil || resp2.Status != gigahost.StatusUnknown {
+			t.Errorf("expected StatusUnknown on duplicate, got %+v", resp2)
+		}
+		if postCount.Load() != 1 {
+			t.Errorf("expected exactly 1 POST attempt, got %d", postCount.Load())
+		}
+	})
+
+	t.Run("definite 400 rejection does not mark unknown", func(t *testing.T) {
+		var postCount atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && r.URL.Path == "/servers" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"meta":{"status":200},"data":[]}`))
+				return
+			}
+			if r.Method == http.MethodPost && r.URL.Path == "/deploy/servers" {
+				postCount.Add(1)
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"invalid image id"}`))
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		c, err := gigahost.NewClient(gigahost.Config{
+			BaseURL: server.URL,
+			APIKey:  "flux_live_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		})
+		if err != nil {
+			t.Fatalf("failed to create client: %v", err)
+		}
+
+		resp, err := c.OrderServerSafe(context.Background(), req)
+		if err == nil {
+			t.Fatal("expected error on 400, got nil")
+		}
+		var uncertainErr *gigahost.OrderUncertainError
+		if errors.As(err, &uncertainErr) {
+			t.Fatalf("did not expect *OrderUncertainError for definite 400, got %v", err)
+		}
+		if resp != nil {
+			t.Fatalf("expected nil resp on 400, got %+v", resp)
+		}
+
+		// Subsequent call is allowed to dispatch another POST because 400 was definite
+		_, _ = c.OrderServerSafe(context.Background(), req)
+		if postCount.Load() != 2 {
+			t.Errorf("expected 2 POST attempts for definite 400, got %d", postCount.Load())
+		}
+	})
 }
