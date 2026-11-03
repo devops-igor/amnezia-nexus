@@ -651,3 +651,113 @@ func TestServerEngineStatus_RouterSubrouterMount(t *testing.T) {
 		}
 	})
 }
+
+func TestServerEngineStatus_UnversionedNaiveComponents(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "caddy"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tag_name": "v2.8.4",
+				"html_url": "https://github.com/caddyserver/caddy/releases/tag/v2.8.4",
+			})
+		case strings.Contains(r.URL.Path, "forwardproxy"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tag_name": "v2.11.7-naive2",
+				"html_url": "https://github.com/klzgrad/forwardproxy/releases/tag/v2.11.7-naive2",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstreamSrv.Close()
+
+	checker := updater.NewReleaseChecker(
+		updater.WithBaseURL(upstreamSrv.URL),
+		updater.WithHTTPClient(upstreamSrv.Client()),
+	)
+	h.SetUpdaterService(checker)
+
+	ctx := context.Background()
+	// Standard Naive installation metadata without explicit version fields
+	naiveServer := &models.Server{
+		Name: "Unversioned Naive Server",
+		Host: "192.0.2.14",
+		Protocols: map[string]any{
+			models.ProtocolNaive: map[string]any{
+				"installed": true,
+				"port":      443,
+				"domain":    "example.com",
+			},
+		},
+	}
+	sID, err := db.CreateServer(ctx, naiveServer)
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	naiveServer.ID = sID
+
+	statusMap := h.resolveServerEngineStatus(ctx, naiveServer)
+	if statusMap == nil {
+		t.Fatalf("expected statusMap to be populated")
+	}
+
+	// 1. Caddy Core component reporting for unversioned installation
+	caddyStatus, ok := statusMap["caddy"].(updater.EngineStatus)
+	if !ok {
+		t.Fatalf("expected updater.EngineStatus for caddy, got %T", statusMap["caddy"])
+	}
+	if caddyStatus.InstalledVersion != "" {
+		t.Errorf("expected empty installed version for caddy, got %q", caddyStatus.InstalledVersion)
+	}
+	if caddyStatus.UpdateAvailable {
+		t.Errorf("expected caddy UpdateAvailable = false for unversioned installation, got true")
+	}
+	if caddyStatus.Status != updater.UpdateUnknown {
+		t.Errorf("expected caddy status %q, got %q", updater.UpdateUnknown, caddyStatus.Status)
+	}
+
+	// 2. Naive ForwardProxy Plugin component reporting for unversioned installation
+	naiveStatus, ok := statusMap["naive"].(updater.EngineStatus)
+	if !ok {
+		t.Fatalf("expected updater.EngineStatus for naive, got %T", statusMap["naive"])
+	}
+	if naiveStatus.InstalledVersion != "" {
+		t.Errorf("expected empty installed version for naive, got %q", naiveStatus.InstalledVersion)
+	}
+	if naiveStatus.UpdateAvailable {
+		t.Errorf("expected naive UpdateAvailable = false for unversioned installation, got true")
+	}
+	if naiveStatus.Status != updater.UpdateUnknown {
+		t.Errorf("expected naive status %q, got %q", updater.UpdateUnknown, naiveStatus.Status)
+	}
+}
+
+func TestExtractCaddyAndNaiveVersion(t *testing.T) {
+	// extractCaddyVersion returns "" when no authoritative version is in metadata
+	if v := extractCaddyVersion(nil); v != "" {
+		t.Errorf("expected empty string for nil meta, got %q", v)
+	}
+	if v := extractCaddyVersion(map[string]any{"installed": true, "port": 443}); v != "" {
+		t.Errorf("expected empty string for unversioned meta, got %q", v)
+	}
+	if v := extractCaddyVersion(map[string]any{"caddy_version": "v2.8.2"}); v != "v2.8.2" {
+		t.Errorf("expected 'v2.8.2', got %q", v)
+	}
+	if v := extractCaddyVersion(map[string]any{"caddy_image": "caddy:v2.8.3-alpine"}); v != "v2.8.3" {
+		t.Errorf("expected 'v2.8.3', got %q", v)
+	}
+
+	// extractNaivePluginVersion returns "" when no authoritative version is in metadata
+	if v := extractNaivePluginVersion(nil); v != "" {
+		t.Errorf("expected empty string for nil meta, got %q", v)
+	}
+	if v := extractNaivePluginVersion(map[string]any{"installed": true, "port": 443}); v != "" {
+		t.Errorf("expected empty string for unversioned meta, got %q", v)
+	}
+	if v := extractNaivePluginVersion(map[string]any{"plugin_version": "v2.11.7-naive1"}); v != "v2.11.7-naive1" {
+		t.Errorf("expected 'v2.11.7-naive1', got %q", v)
+	}
+}

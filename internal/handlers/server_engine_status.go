@@ -264,7 +264,7 @@ func extractCaddyVersion(meta map[string]any) string {
 			}
 		}
 	}
-	return "v2.8.4"
+	return ""
 }
 
 func extractNaivePluginVersion(meta map[string]any) string {
@@ -275,7 +275,7 @@ func extractNaivePluginVersion(meta map[string]any) string {
 			}
 		}
 	}
-	return "v2.11.7-naive1"
+	return ""
 }
 
 func parseImageTag(img string) string {
