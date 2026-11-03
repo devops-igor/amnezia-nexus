@@ -793,3 +793,193 @@ func TestNaiveManager_Install_E2E_PersistenceToAdminAPI(t *testing.T) {
 		t.Errorf("expected naive update_available = true, got %v", upd)
 	}
 }
+
+// TestXrayManager_Reinstall_FailedDetection_InvalidatesRunningVersion verifies Finding R5-H1:
+// When reinstalling/switching Xray on a server with an existing running_engine_version,
+// if runtime version detection fails on the replaced container, the old running_engine_version
+// is invalidated (removed from metadata and nested params). When persisted to SQLite and retrieved
+// by the admin API, the new profile's static engine version is reported without false update_available.
+func TestXrayManager_Reinstall_FailedDetection_InvalidatesRunningVersion(t *testing.T) {
+	ctx := context.Background()
+
+	priv, _, err := xray.GenerateRealityKeypair()
+	if err != nil {
+		t.Fatalf("GenerateRealityKeypair failed: %v", err)
+	}
+	renderedCfg, err := xray.RenderXrayConfig(443, 54321, "example.com", "example.com:443", priv, []string{"0123456789abcdef"}, nil)
+	if err != nil {
+		t.Fatalf("RenderXrayConfig failed: %v", err)
+	}
+
+	mockSSH := &testMockSSHClient{
+		cmdFunc: func(ctx context.Context, cmd string) (string, string, int, error) {
+			switch {
+			case strings.Contains(cmd, "docker --version"):
+				return "Docker version 25.0.3", "", 0, nil
+			case strings.Contains(cmd, "xray version"):
+				// Simulate failed runtime version detection on the new container
+				return "", "exec failed", 1, nil
+			case strings.Contains(cmd, "cat") && strings.Contains(cmd, "config.json"):
+				return string(renderedCfg), "", 0, nil
+			case strings.Contains(cmd, "docker inspect") && strings.Contains(cmd, "{{.State.Restarting}}"):
+				// Readiness check: running and not restarting
+				return "true false 123\n", "", 0, nil
+			case strings.Contains(cmd, "docker inspect") && strings.Contains(cmd, "{{.State.Running}}"):
+				// Container exists and is running
+				return "true\n", "", 0, nil
+			default:
+				return "ok", "", 0, nil
+			}
+		},
+		downloadFn: func(ctx context.Context, path string) ([]byte, error) {
+			if strings.Contains(path, "config.json") {
+				return renderedCfg, nil
+			}
+			return []byte("ok"), nil
+		},
+	}
+
+	h, db, _ := setupTestHandlersWithMockSSH(t, mockSSH)
+
+	upstreamSrv := newMockUpstreamEngineServer(t)
+	defer upstreamSrv.Close()
+	checker := updater.NewReleaseChecker(
+		updater.WithBaseURL(upstreamSrv.URL),
+		updater.WithHTTPClient(upstreamSrv.Client()),
+	)
+	h.SetUpdaterService(checker)
+
+	// 1. Create server in SQLite database with existing legacy Xray and running_engine_version
+	srv := &models.Server{
+		Name:    "Xray-Replacement-Server",
+		Host:    "127.0.0.1",
+		SSHPort: 22,
+		SSHUser: "root",
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{
+				"installed":              true,
+				"port":                   443,
+				"server_name":            "example.com",
+				"engine_profile":         "legacy",
+				"engine_version":         "1.8.24",
+				"running_engine_version": "1.8.24",
+				"params": map[string]any{
+					"port":                   443,
+					"server_name":            "example.com",
+					"engine_profile":         "legacy",
+					"running_engine_version": "1.8.24",
+				},
+			},
+		},
+	}
+	serverID, err := db.CreateServer(ctx, srv)
+	if err != nil {
+		t.Fatalf("CreateServer failed: %v", err)
+	}
+	srv.ID = serverID
+
+	// 2. Execute XrayManager.Install() switching profile to Modern PQ, where runtime version detection fails
+	xrayMgr := xray.NewXrayManager(h.sshPool)
+	xrayMgr.SetVLESSProbeFunc(func(ctx context.Context, endpoint string, params models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+		return 0, nil
+	})
+
+	switchParams := map[string]any{
+		"engine_profile": "modern_pq",
+	}
+	if err := xrayMgr.Install(ctx, srv, switchParams); err != nil {
+		t.Fatalf("xrayMgr.Install failed: %v", err)
+	}
+
+	// 3. Verify in-memory server metadata: old running_engine_version must be invalidated
+	meta, ok := srv.Protocols[models.ProtocolVLESS].(map[string]any)
+	if !ok {
+		t.Fatalf("expected ProtocolVLESS in server.Protocols after install")
+	}
+	if rv, exists := meta["running_engine_version"]; exists && rv != "" {
+		t.Errorf("expected running_engine_version to be deleted from protoMeta, got %v", rv)
+	}
+	if pMap, ok := meta["params"].(map[string]any); ok {
+		if rv, exists := pMap["running_engine_version"]; exists && rv != "" {
+			t.Errorf("expected running_engine_version to be deleted from params, got %v", rv)
+		}
+	}
+	if meta["engine_profile"] != "modern_pq" {
+		t.Errorf("expected engine_profile = 'modern_pq', got %v", meta["engine_profile"])
+	}
+	if meta["engine_version"] != xray.XrayModernPQVersion {
+		t.Errorf("expected engine_version = %q, got %v", xray.XrayModernPQVersion, meta["engine_version"])
+	}
+
+	// 4. Persist protocol metadata to real SQLite database
+	if err := db.UpdateServerProtocols(ctx, srv.ID, srv.Protocols); err != nil {
+		t.Fatalf("UpdateServerProtocols failed: %v", err)
+	}
+
+	// 5. Initial call: cold cache returns non-blocking and triggers background warm
+	req1 := httptest.NewRequest(http.MethodGet, "/api/servers", nil)
+	req1 = req1.WithContext(middleware.WithSession(req1.Context(), &models.SessionData{
+		UserID: "admin-1",
+		Role:   models.RoleAdmin,
+	}))
+	w1 := httptest.NewRecorder()
+	h.ListServersHandler(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("ListServersHandler returned %d: %s", w1.Code, w1.Body.String())
+	}
+
+	// 6. Wait for background warm to populate cache from mock upstream
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(25 * time.Millisecond) {
+		if !checker.IsCacheExpired(updater.EngineXray) {
+			break
+		}
+	}
+
+	// 7. Second call: cached release is now available
+	req2 := httptest.NewRequest(http.MethodGet, "/api/servers", nil)
+	req2 = req2.WithContext(middleware.WithSession(req2.Context(), &models.SessionData{
+		UserID: "admin-1",
+		Role:   models.RoleAdmin,
+	}))
+	w2 := httptest.NewRecorder()
+	h.ListServersHandler(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("ListServersHandler (warmed) returned %d: %s", w2.Code, w2.Body.String())
+	}
+
+	// 8. Decode response and verify EngineStatus
+	var servers []models.ServerItemResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &servers); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	var found *models.ServerItemResponse
+	for i := range servers {
+		if servers[i].ID == srv.ID {
+			found = &servers[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("server %d not found in ListServersHandler response", srv.ID)
+	}
+	if found.EngineStatus == nil {
+		t.Fatalf("expected EngineStatus to be populated for admin, got nil")
+	}
+
+	vlessStatus, ok := found.EngineStatus[models.ProtocolVLESS].(map[string]any)
+	if !ok {
+		t.Fatalf("expected %q in EngineStatus, got %+v", models.ProtocolVLESS, found.EngineStatus)
+	}
+	// Must report new profile version (26.10.29), NOT retired "1.8.24"
+	if vlessStatus["installed_version"] != xray.XrayModernPQVersion {
+		t.Errorf("expected vless installed_version = %q, got %v", xray.XrayModernPQVersion, vlessStatus["installed_version"])
+	}
+	if vlessStatus["latest_version"] != "v26.10.29" {
+		t.Errorf("expected vless latest_version = 'v26.10.29', got %v", vlessStatus["latest_version"])
+	}
+	// Must NOT report false update_available!
+	if upd, _ := vlessStatus["update_available"].(bool); upd {
+		t.Errorf("expected vless update_available = false, got %v (old running_engine_version leaked!)", upd)
+	}
+}

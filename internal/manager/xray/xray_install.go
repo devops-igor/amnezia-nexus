@@ -899,6 +899,11 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	protoMeta["engine_image"] = profile.Image
 	if runningVersion != "" {
 		protoMeta["running_engine_version"] = runningVersion
+	} else {
+		delete(protoMeta, "running_engine_version")
+		if pMap, ok := protoMeta["params"].(map[string]any); ok && pMap != nil {
+			delete(pMap, "running_engine_version")
+		}
 	}
 	server.Protocols[models.ProtocolVLESS] = protoMeta
 
