@@ -216,8 +216,8 @@ func truncateUDP(req, resp *mdns.Msg) {
 }
 
 // ServeDNSMessage processes a single DNS request, applying inflight limits, upstream resolution,
-// response shaping, and route observation.
-func (s *Server) ServeDNSMessage(ctx context.Context, session *policy.SessionCache, scope any, req *mdns.Msg, isTCP bool) (*mdns.Msg, error) {
+// and response shaping.
+func (s *Server) ServeDNSMessage(ctx context.Context, scope any, req *mdns.Msg, isTCP bool) (*mdns.Msg, error) {
 	select {
 	case <-s.closed:
 		return nil, ErrServerClosed
@@ -243,7 +243,6 @@ func (s *Server) ServeDNSMessage(ctx context.Context, session *policy.SessionCac
 	}
 	defer release()
 
-	recvTime := time.Now()
 	resp, err := s.resolver.Exchange(ctx, req)
 	if err != nil || resp == nil {
 		resp = new(mdns.Msg)
@@ -257,14 +256,6 @@ func (s *Server) ServeDNSMessage(ctx context.Context, session *policy.SessionCac
 
 	if !isTCP {
 		truncateUDP(req, resp)
-	}
-
-	// Observe response and publish client-scoped route evidence if session was provided by caller
-	// and response was complete, non-truncated, and serializable.
-	if session != nil && !resp.Truncated && resp.Rcode == mdns.RcodeSuccess {
-		if _, err := resp.Pack(); err == nil {
-			s.ObserveResponse(req, resp, session, recvTime)
-		}
 	}
 
 	return resp, nil
@@ -297,7 +288,7 @@ func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.Packe
 		}
 
 		recvTime := time.Now()
-		resp, err := s.ServeDNSMessage(ctx, nil, scopeVal, req, false)
+		resp, err := s.ServeDNSMessage(ctx, scopeVal, req, false)
 		if err == nil && resp != nil {
 			if out, err := resp.Pack(); err == nil {
 				if _, err := udp.WriteTo(out, raddr); err == nil && sc != nil {
@@ -341,7 +332,7 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 		}
 
 		recvTime := time.Now()
-		resp, err := s.ServeDNSMessage(ctx, nil, scopeVal, req, true)
+		resp, err := s.ServeDNSMessage(ctx, scopeVal, req, true)
 		if err != nil || resp == nil {
 			return
 		}

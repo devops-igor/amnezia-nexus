@@ -231,7 +231,7 @@ func (g *Gateway) handleUDP(scope *ScopeHandle, ipv4Packet []byte, ihl int, dstI
 	}
 
 	recvTime := time.Now()
-	respMsg, err := g.server.ServeDNSMessage(scope.ctx, nil, scope.Scope, reqMsg, false)
+	respMsg, err := g.server.ServeDNSMessage(scope.ctx, scope.Scope, reqMsg, false)
 	if err != nil || respMsg == nil {
 		return true, nil
 	}

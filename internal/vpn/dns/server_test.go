@@ -67,7 +67,7 @@ func TestServer_QueryValidation(t *testing.T) {
 	reqUpdate := new(mdns.Msg)
 	reqUpdate.Opcode = mdns.OpcodeUpdate
 	reqUpdate.SetQuestion("example.com.", mdns.TypeA)
-	resp, err := srv.ServeDNSMessage(context.Background(), nil, policy.Scope{SessionID: "sess-1", OwnershipEpoch: 1}, reqUpdate, false)
+	resp, err := srv.ServeDNSMessage(context.Background(), policy.Scope{SessionID: "sess-1", OwnershipEpoch: 1}, reqUpdate, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestServer_QueryValidation(t *testing.T) {
 	reqClass := new(mdns.Msg)
 	reqClass.SetQuestion("example.com.", mdns.TypeA)
 	reqClass.Question[0].Qclass = mdns.ClassCHAOS
-	resp, err = srv.ServeDNSMessage(context.Background(), nil, policy.Scope{SessionID: "sess-1", OwnershipEpoch: 1}, reqClass, false)
+	resp, err = srv.ServeDNSMessage(context.Background(), policy.Scope{SessionID: "sess-1", OwnershipEpoch: 1}, reqClass, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestServer_QueryValidation(t *testing.T) {
 	// 3. ANY query -> REFUSED
 	reqANY := new(mdns.Msg)
 	reqANY.SetQuestion("example.com.", mdns.TypeANY)
-	resp, err = srv.ServeDNSMessage(context.Background(), nil, policy.Scope{SessionID: "sess-1", OwnershipEpoch: 1}, reqANY, false)
+	resp, err = srv.ServeDNSMessage(context.Background(), policy.Scope{SessionID: "sess-1", OwnershipEpoch: 1}, reqANY, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -128,14 +128,14 @@ func TestServer_InflightLimits(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_, _ = srv.ServeDNSMessage(context.Background(), nil, policy.Scope{SessionID: "sess-busy", OwnershipEpoch: 1}, req, false)
+		_, _ = srv.ServeDNSMessage(context.Background(), policy.Scope{SessionID: "sess-busy", OwnershipEpoch: 1}, req, false)
 	}()
 
 	// Wait briefly for first query to acquire token
 	time.Sleep(10 * time.Millisecond)
 
 	// Second query for same session should immediately receive SERVFAIL
-	resp, err := srv.ServeDNSMessage(context.Background(), nil, policy.Scope{SessionID: "sess-busy", OwnershipEpoch: 1}, req, false)
+	resp, err := srv.ServeDNSMessage(context.Background(), policy.Scope{SessionID: "sess-busy", OwnershipEpoch: 1}, req, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestServer_ResponseShaping(t *testing.T) {
 	req.Id = 777
 
 	// UDP request without EDNS -> capped at 512 bytes, should be truncated (TC=1)
-	resp, err := srv.ServeDNSMessage(context.Background(), nil, policy.Scope{SessionID: "sess-shape", OwnershipEpoch: 1}, req, false)
+	resp, err := srv.ServeDNSMessage(context.Background(), policy.Scope{SessionID: "sess-shape", OwnershipEpoch: 1}, req, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestServer_ResponseShaping(t *testing.T) {
 	}
 
 	// TCP request -> not truncated
-	respTCP, err := srv.ServeDNSMessage(context.Background(), nil, policy.Scope{SessionID: "sess-shape", OwnershipEpoch: 1}, req, true)
+	respTCP, err := srv.ServeDNSMessage(context.Background(), policy.Scope{SessionID: "sess-shape", OwnershipEpoch: 1}, req, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -518,7 +518,7 @@ func TestServer_OversizedUDPAnswerLeavesDestinationUnknownUntilTCP(t *testing.T)
 	reqUDP.Id = 1001
 
 	// 1. Oversized UDP query: must trigger truncation (TC=1)
-	respUDP, err := srv.ServeDNSMessage(context.Background(), sess, scope, reqUDP, false)
+	respUDP, err := srv.ServeDNSMessage(context.Background(), scope, reqUDP, false)
 	if err != nil {
 		t.Fatalf("UDP ServeDNSMessage failed: %v", err)
 	}
@@ -537,13 +537,16 @@ func TestServer_OversizedUDPAnswerLeavesDestinationUnknownUntilTCP(t *testing.T)
 	reqTCP.SetQuestion("big.example.com.", mdns.TypeA)
 	reqTCP.Id = 1002
 
-	respTCP, err := srv.ServeDNSMessage(context.Background(), sess, scope, reqTCP, true)
+	respTCP, err := srv.ServeDNSMessage(context.Background(), scope, reqTCP, true)
 	if err != nil {
 		t.Fatalf("TCP ServeDNSMessage failed: %v", err)
 	}
 	if respTCP.Truncated {
 		t.Fatalf("expected TCP response not to be truncated")
 	}
+
+	// Simulate successful delivery by explicitly recording observation
+	srv.ObserveResponse(reqTCP, respTCP, sess, now)
 
 	// Destination in cache MUST now be Direct because TCP answer was complete and delivered
 	if got := sess.Lookup(directIP, snap.Generation(), now); got != policy.Direct {
@@ -568,7 +571,7 @@ func TestServer_OversizedUDPAnswerLeavesDestinationUnknownUntilTCP(t *testing.T)
 	reqFail.SetQuestion("fail.example.com.", mdns.TypeA)
 
 	// Resolver executes with session=nil (as done by transport prior to delivery confirmation)
-	respFail, err := srvFail.ServeDNSMessage(context.Background(), nil, scope, reqFail, false)
+	respFail, err := srvFail.ServeDNSMessage(context.Background(), scope, reqFail, false)
 	if err != nil || respFail == nil {
 		t.Fatalf("ServeDNSMessage failed: %v", err)
 	}
@@ -605,7 +608,7 @@ func TestServer_SessionLimiterBoundedLifecycle(t *testing.T) {
 			OwnershipEpoch: uint64(i + 1),
 		}
 
-		resp, err := srv.ServeDNSMessage(scopeCtx, nil, scope, req, false)
+		resp, err := srv.ServeDNSMessage(scopeCtx, scope, req, false)
 		if err != nil || resp == nil {
 			t.Fatalf("iteration %d: ServeDNSMessage failed: %v", i, err)
 		}
@@ -659,7 +662,7 @@ func TestServer_SessionLimiterBoundedLifecycle(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_, _ = srvReused.ServeDNSMessage(ctxV1, nil, scopeV1, req, false)
+		_, _ = srvReused.ServeDNSMessage(ctxV1, scopeV1, req, false)
 	}()
 	time.Sleep(10 * time.Millisecond)
 
@@ -674,7 +677,7 @@ func TestServer_SessionLimiterBoundedLifecycle(t *testing.T) {
 
 	doneV2 := make(chan struct{})
 	go func() {
-		_, _ = srvReused.ServeDNSMessage(ctxV2, nil, scopeV2, req, false)
+		_, _ = srvReused.ServeDNSMessage(ctxV2, scopeV2, req, false)
 		close(doneV2)
 	}()
 
