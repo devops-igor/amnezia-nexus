@@ -33,5 +33,13 @@ jobs:
           pip install -r tests/e2e/requirements.txt
           playwright install --with-deps chromium
 
+      - name: Set up Node for oracle regression test
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Run oracle comparison regression
+        run: pytest tests/test_css_probe_comparison.py -v
+
       - name: Run CSS Computed Style Differential Oracle
         run: pytest tests/e2e/test_css_differential.py -v
