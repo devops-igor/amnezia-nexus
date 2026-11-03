@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"encoding/binary"
+	"errors"
 	"net/netip"
 	"sync"
 	"testing"
@@ -471,5 +472,216 @@ func TestPolicyDispatch_AccountingMetrics(t *testing.T) {
 	}
 	if directDrops != 1 {
 		t.Errorf("expected 1 directDrop, got %d", directDrops)
+	}
+}
+
+type failingMockPacketDev struct {
+	err error
+}
+
+func (f *failingMockPacketDev) Read(p []byte) (int, error) {
+	return 0, nil
+}
+
+func (f *failingMockPacketDev) Write(p []byte) (int, error) {
+	return 0, f.err
+}
+
+func (f *failingMockPacketDev) Close() error {
+	return nil
+}
+
+func TestPolicyDispatch_WANReplyDownstreamAdmission(t *testing.T) {
+	accountant := NewTrafficAccountant(nil, 0)
+	fwd := NewForwarder(accountant, "10.100.0.0/16", 100)
+	fwd.SetPBREnabled(true)
+
+	wanDev := newMockPacketDev()
+	hostWAN := netip.MustParseAddr("203.0.113.1")
+	gwDNS := netip.MustParseAddr("10.100.0.1")
+
+	dem := NewDirectEgressManager(DirectEgressConfig{
+		HostWANIP:    hostWAN,
+		GatewayDNSIP: gwDNS,
+		WANDevice:    wanDev,
+	}, fwd)
+	fwd.SetDirectEgress(dem)
+
+	rc := newTestRouteCache()
+	fwd.SetRouteCache(rc)
+
+	peerKey := "peer-admission"
+	clientIP := "10.100.0.80"
+	sessionID := "s-adm"
+	capPath := newTestCaptureReturnPath()
+
+	// Register with downstream limit = 100 bps
+	_, err := fwd.TryRegisterSessionWithReturnPath(sessionID, "c-adm", peerKey, clientIP, 201, 100, 0, capPath.path)
+	if err != nil {
+		t.Fatalf("register session failed: %v", err)
+	}
+
+	targetIP := netip.MustParseAddr("93.184.216.34")
+	rc.Set(sessionID, targetIP, policy.Direct)
+
+	// Send outbound packet to create NAT entry
+	outPkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), targetIP, 12345, 80, 0x02, nil)
+	if err := fwd.RouteClientToBackend(peerKey, outPkt); err != nil {
+		t.Fatalf("RouteClientToBackend failed: %v", err)
+	}
+
+	wanPkts := wanDev.getPackets()
+	if len(wanPkts) != 1 {
+		t.Fatalf("expected 1 wan packet, got %d", len(wanPkts))
+	}
+	natPort := binary.BigEndian.Uint16(wanPkts[0][20:22])
+
+	// 1. First reply within burst limit (40 bytes)
+	reply1 := buildTestIPv4TCPPacket(targetIP, hostWAN, 80, natPort, 0x12, nil)
+	if err := dem.HandleWANReply(reply1); err != nil {
+		t.Fatalf("HandleWANReply 1 failed: %v", err)
+	}
+	if len(capPath.getPackets()) != 1 {
+		t.Fatalf("expected 1 delivered packet, got %d", len(capPath.getPackets()))
+	}
+	_, tx1 := accountant.GetSessionTraffic(sessionID)
+	if tx1 != int64(len(reply1)) {
+		t.Fatalf("expected accountant TxBytes %d, got %d", len(reply1), tx1)
+	}
+
+	// 2. Second reply immediately exceeds rate limit
+	reply2 := buildTestIPv4TCPPacket(targetIP, hostWAN, 80, natPort, 0x10, make([]byte, 100))
+	err = dem.HandleWANReply(reply2)
+	if !errors.Is(err, ErrRateLimitExceeded) {
+		t.Fatalf("expected ErrRateLimitExceeded on reply 2, got %v", err)
+	}
+	if len(capPath.getPackets()) != 1 {
+		t.Fatalf("rate-limited packet must not be delivered, got count %d", len(capPath.getPackets()))
+	}
+	// Accountant Tx bytes must remain charged ONLY for admitted reply 1
+	_, tx2 := accountant.GetSessionTraffic(sessionID)
+	if tx2 != int64(len(reply1)) {
+		t.Fatalf("accountant TxBytes should not increment on dropped packet, got %d", tx2)
+	}
+
+	// 3. Route retirement fence on WAN replies
+	// Case A: Route retired in forwarder while NAT entry still in table
+	fwd.mu.RLock()
+	r := fwd.routesByPeer[peerKey]
+	fwd.mu.RUnlock()
+	r.retired.Store(true)
+	reply3 := buildTestIPv4TCPPacket(targetIP, hostWAN, 80, natPort, 0x10, nil)
+	err = dem.HandleWANReply(reply3)
+	if !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered on retired route reply, got %v", err)
+	}
+
+	// Case B: Full retirement purges peer NAT state so no NAT entry remains
+	r.retired.Store(false)
+	_ = fwd.RetireRoutesByReturnPath(capPath.path)
+	err = dem.HandleWANReply(reply3)
+	if err == nil {
+		t.Fatalf("expected error on retired route reply, got nil")
+	}
+}
+
+func TestPolicyDispatch_RouteRetirementFlowInvalidation(t *testing.T) {
+	fwd, dem, _, rc := setupForwarderWithPBR(t)
+
+	peerKey := "peer-invalidation"
+	clientIP := "10.100.0.81"
+	sessionID1 := "s-inv-1"
+	capPath1 := newTestCaptureReturnPath()
+
+	fwd.RegisterSessionWithReturnPath(sessionID1, "c-inv-1", peerKey, clientIP, 202, capPath1.path)
+	targetIP := netip.MustParseAddr("1.1.1.1")
+	rc.Set(sessionID1, targetIP, policy.Direct)
+
+	pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), targetIP, 10001, 53, []byte("inv"))
+	if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
+		t.Fatalf("route client failed: %v", err)
+	}
+
+	// Flow should be found
+	choice, found := dem.LookupFlow(peerKey, pkt)
+	if !found || choice != EgressChoiceDirect {
+		t.Fatalf("expected EgressChoiceDirect, got %v, found=%v", choice, found)
+	}
+
+	// Retire route by return path
+	_ = fwd.RetireRoutesByReturnPath(capPath1.path)
+
+	// Flow must be purged and not found
+	choice, found = dem.LookupFlow(peerKey, pkt)
+	if found || choice != EgressChoiceNone {
+		t.Fatalf("expected flow to be invalidated after retirement, got %v, found=%v", choice, found)
+	}
+
+	// Test producer fence in sendToDirectEgress on a retired route
+	retiredRoute := &sessionRoute{
+		peerKey:    peerKey,
+		sessionID:  sessionID1,
+		generation: 1,
+	}
+	retiredRoute.retired.Store(true)
+
+	prevDrops := fwd.DirectDrops()
+	err := fwd.sendToDirectEgress(dem, retiredRoute, peerKey, pkt, int64(len(pkt)), sessionID1, "c-inv-1")
+	if !errors.Is(err, ErrSessionNotRegistered) {
+		t.Fatalf("expected ErrSessionNotRegistered for retired route producer, got %v", err)
+	}
+	if fwd.DirectDrops() != prevDrops+1 {
+		t.Fatalf("expected directDrops to increment on fenced producer drop, got %d", fwd.DirectDrops())
+	}
+}
+
+func TestPolicyDispatch_DirectTransmissionErrorAccounting(t *testing.T) {
+	accountant := NewTrafficAccountant(nil, 0)
+	fwd := NewForwarder(accountant, "10.100.0.0/16", 100)
+	fwd.SetPBREnabled(true)
+
+	wanDev := &failingMockPacketDev{err: errors.New("wan cable disconnected")}
+	hostWAN := netip.MustParseAddr("203.0.113.1")
+	gwDNS := netip.MustParseAddr("10.100.0.1")
+
+	dem := NewDirectEgressManager(DirectEgressConfig{
+		HostWANIP:    hostWAN,
+		GatewayDNSIP: gwDNS,
+		WANDevice:    wanDev,
+	}, fwd)
+	fwd.SetDirectEgress(dem)
+
+	rc := newTestRouteCache()
+	fwd.SetRouteCache(rc)
+
+	peerKey := "peer-f5-fail"
+	clientIP := "10.100.0.82"
+	sessionID := "s-fail-f5"
+	capPath := newTestCaptureReturnPath()
+
+	fwd.RegisterSessionWithReturnPath(sessionID, "c-fail-f5", peerKey, clientIP, 203, capPath.path)
+	targetIP := netip.MustParseAddr("1.1.1.1")
+	rc.Set(sessionID, targetIP, policy.Direct)
+
+	pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), targetIP, 10001, 53, []byte("f5-data"))
+	err := fwd.RouteClientToBackend(peerKey, pkt)
+	if err == nil {
+		t.Fatalf("expected error from failing WAN device, got nil")
+	}
+
+	// Verify accounting: 0 bytes charged, drop metric incremented
+	if fwd.DirectBytes() != 0 {
+		t.Fatalf("expected 0 directBytes on failed transmission, got %d", fwd.DirectBytes())
+	}
+	if fwd.totalRxBytes.Load() != 0 {
+		t.Fatalf("expected 0 totalRxBytes on failed transmission, got %d", fwd.totalRxBytes.Load())
+	}
+	if fwd.DirectDrops() != 1 {
+		t.Fatalf("expected 1 directDrop on failed transmission, got %d", fwd.DirectDrops())
+	}
+
+	rx, _ := accountant.GetSessionTraffic(sessionID)
+	if rx != 0 {
+		t.Fatalf("expected 0 accountant RxBytes on failed transmission, got %d", rx)
 	}
 }

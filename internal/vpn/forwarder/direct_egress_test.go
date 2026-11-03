@@ -437,3 +437,151 @@ func TestDirectEgress_ProhibitedDrops(t *testing.T) {
 		t.Errorf("expected %d directDrops, got %d", len(prohibitedTargets), dem.DirectDrops())
 	}
 }
+
+func TestDirectEgress_LookupExpirationAndBidirectionalRefresh(t *testing.T) {
+	wanDev := newMockPacketDev()
+	hostWAN := netip.MustParseAddr("203.0.113.1")
+	dem := NewDirectEgressManager(DirectEgressConfig{
+		HostWANIP:  hostWAN,
+		WANDevice:  wanDev,
+		UDPTimeout: 60 * time.Millisecond,
+		TCPTimeout: 60 * time.Millisecond,
+		MinPort:    50000,
+		MaxPort:    50001, // exactly 2 ports
+		MaxFlows:   2,
+	}, nil)
+	defer func() { _ = dem.Close() }()
+
+	capPath := newTestCaptureReturnPath()
+	clientIP := netip.MustParseAddr("10.100.0.5")
+	targetIP := netip.MustParseAddr("8.8.8.8")
+	pkt := buildTestIPv4UDPPacket(clientIP, targetIP, 10001, 53, []byte("f3-test"))
+	peerKey := "peer-f3"
+
+	// 1. Record flow and verify it expires on LookupFlow without Sweep
+	dem.RecordFlow(peerKey, pkt, EgressChoiceDirect)
+	if choice, found := dem.LookupFlow(peerKey, pkt); !found || choice != EgressChoiceDirect {
+		t.Fatalf("expected immediate flow lookup success, got %v, %v", choice, found)
+	}
+
+	time.Sleep(80 * time.Millisecond)
+	if choice, found := dem.LookupFlow(peerKey, pkt); found || choice != EgressChoiceNone {
+		t.Fatalf("expected expired flow to return false on LookupFlow, got %v, %v", choice, found)
+	}
+
+	// 2. Bidirectional lastSeen refresh via WAN reply
+	pkt2 := buildTestIPv4UDPPacket(clientIP, targetIP, 10002, 53, []byte("refresh-test"))
+	if err := dem.RouteUDPDirect(peerKey, pkt2, capPath.path); err != nil {
+		t.Fatalf("RouteUDPDirect failed: %v", err)
+	}
+	wanPkts := wanDev.getPackets()
+	if len(wanPkts) != 1 {
+		t.Fatalf("expected 1 wan packet, got %d", len(wanPkts))
+	}
+	natPort := binary.BigEndian.Uint16(wanPkts[0][20:22])
+
+	// Sleep 40ms, send reply to refresh lastSeen
+	time.Sleep(40 * time.Millisecond)
+	reply := buildTestIPv4UDPPacket(targetIP, hostWAN, 53, natPort, []byte("reply-refresh"))
+	if err := dem.HandleWANReply(reply); err != nil {
+		t.Fatalf("HandleWANReply failed: %v", err)
+	}
+
+	// Sleep another 40ms (total elapsed since outbound = 80ms > 60ms timeout, but only 40ms since reply)
+	time.Sleep(40 * time.Millisecond)
+	if choice, found := dem.LookupFlow(peerKey, pkt2); !found || choice != EgressChoiceDirect {
+		t.Fatalf("expected flow to remain active due to WAN reply refresh, got %v, %v", choice, found)
+	}
+
+	// 3. Port exhaustion and automatic sweep during allocation
+	// Wait for pkt2 to expire
+	time.Sleep(80 * time.Millisecond)
+	// We had minPort 50000, maxPort 50001 (2 ports total). Allocate both.
+	p1 := buildTestIPv4UDPPacket(clientIP, targetIP, 20001, 53, []byte("p1"))
+	p2 := buildTestIPv4UDPPacket(clientIP, targetIP, 20002, 53, []byte("p2"))
+	if err := dem.RouteUDPDirect(peerKey, p1, capPath.path); err != nil {
+		t.Fatalf("alloc p1 failed: %v", err)
+	}
+	if err := dem.RouteUDPDirect(peerKey, p2, capPath.path); err != nil {
+		t.Fatalf("alloc p2 failed: %v", err)
+	}
+
+	// Immediate 3rd allocation should fail with ErrNATPortExhaustion
+	p3 := buildTestIPv4UDPPacket(clientIP, targetIP, 20003, 53, []byte("p3"))
+	if err := dem.RouteUDPDirect(peerKey, p3, capPath.path); err != ErrNATPortExhaustion && err != ErrFlowTableFull {
+		t.Fatalf("expected exhaustion error, got: %v", err)
+	}
+
+	// Wait for p1 and p2 to expire (>60ms)
+	time.Sleep(80 * time.Millisecond)
+
+	// Now 3rd allocation should reclaim expired ports during allocation
+	if err := dem.RouteUDPDirect(peerKey, p3, capPath.path); err != nil {
+		t.Fatalf("expected allocation after sweep to succeed, got: %v", err)
+	}
+
+	// 4. MaxFlows strict enforcement
+	p4 := buildTestIPv4UDPPacket(clientIP, targetIP, 20004, 53, []byte("p4"))
+	if err := dem.RouteUDPDirect(peerKey, p4, capPath.path); err != nil {
+		t.Fatalf("alloc p4 failed: %v", err)
+	}
+	// MaxFlows is 2, p3 and p4 are active. 5th flow should hit capacity
+	p5 := buildTestIPv4UDPPacket(clientIP, targetIP, 20005, 53, []byte("p5"))
+	if err := dem.RouteUDPDirect(peerKey, p5, capPath.path); err != ErrFlowTableFull && err != ErrNATPortExhaustion {
+		t.Fatalf("expected ErrFlowTableFull or exhaustion when capacity reached, got: %v", err)
+	}
+}
+
+func TestDirectEgress_WANReplyEndpointVerification(t *testing.T) {
+	wanDev := newMockPacketDev()
+	hostWAN := netip.MustParseAddr("203.0.113.1")
+	dem := NewDirectEgressManager(DirectEgressConfig{
+		HostWANIP: hostWAN,
+		WANDevice: wanDev,
+	}, nil)
+	defer func() { _ = dem.Close() }()
+
+	capPath := newTestCaptureReturnPath()
+	clientIP := netip.MustParseAddr("10.100.0.15")
+	targetIP := netip.MustParseAddr("93.184.216.34")
+	peerKey := "peer-f4"
+
+	pkt := buildTestIPv4TCPPacket(clientIP, targetIP, 12345, 80, 0x02, nil)
+	if err := dem.RouteTCPDirect(peerKey, pkt, capPath.path); err != nil {
+		t.Fatalf("RouteTCPDirect failed: %v", err)
+	}
+
+	wanPkts := wanDev.getPackets()
+	if len(wanPkts) != 1 {
+		t.Fatalf("expected 1 wan packet, got %d", len(wanPkts))
+	}
+	natPort := binary.BigEndian.Uint16(wanPkts[0][20:22])
+
+	// Case 1: Destination IP does not match hostWAN
+	wrongDstReply := buildTestIPv4TCPPacket(targetIP, netip.MustParseAddr("203.0.113.99"), 80, natPort, 0x12, nil)
+	if err := dem.HandleWANReply(wrongDstReply); err == nil {
+		t.Fatalf("expected error for mismatched destination IP, got nil")
+	}
+
+	// Case 2: Spoofed remote source IP
+	spoofedIPReply := buildTestIPv4TCPPacket(netip.MustParseAddr("1.2.3.4"), hostWAN, 80, natPort, 0x12, nil)
+	if err := dem.HandleWANReply(spoofedIPReply); err == nil {
+		t.Fatalf("expected error for spoofed remote source IP, got nil")
+	}
+
+	// Case 3: Spoofed remote source port
+	spoofedPortReply := buildTestIPv4TCPPacket(targetIP, hostWAN, 8080, natPort, 0x12, nil)
+	if err := dem.HandleWANReply(spoofedPortReply); err == nil {
+		t.Fatalf("expected error for spoofed remote source port, got nil")
+	}
+
+	// Case 4: Legitimate reply succeeds
+	validReply := buildTestIPv4TCPPacket(targetIP, hostWAN, 80, natPort, 0x12, nil)
+	if err := dem.HandleWANReply(validReply); err != nil {
+		t.Fatalf("expected valid reply to succeed, got %v", err)
+	}
+
+	if len(capPath.getPackets()) != 1 {
+		t.Fatalf("expected 1 delivered packet to client, got %d", len(capPath.getPackets()))
+	}
+}

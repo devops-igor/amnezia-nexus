@@ -97,6 +97,9 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	if directEgress != nil {
 		if choice, found := directEgress.LookupFlow(peerKey, packet); found {
 			if choice == EgressChoiceDirect {
+				if route.retired.Load() || (route.generation != 0 && f.PeerRegistration(peerKey) != route.generation) {
+					return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
+				}
 				return f.sendToDirectEgress(directEgress, route, peerKey, packet, pktLen, sID, cID)
 			}
 			return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
@@ -120,6 +123,9 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 
 	// Step 3 — DIRECT: Client-scoped DNS evidence observed public destination without proxy match.
 	if routeCache != nil && routeCache.Lookup(sID, dstIP) == policy.Direct {
+		if route.retired.Load() || (route.generation != 0 && f.PeerRegistration(peerKey) != route.generation) {
+			return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
+		}
 		if directEgress != nil {
 			directEgress.RecordFlow(peerKey, packet, EgressChoiceDirect)
 			return f.sendToDirectEgress(directEgress, route, peerKey, packet, pktLen, sID, cID)
@@ -163,14 +169,33 @@ func (f *Forwarder) matchesProxyPolicy(dstIP netip.Addr, sID string, policyMatch
 }
 
 func (f *Forwarder) sendToDirectEgress(directEgress *DirectEgressManager, route *sessionRoute, peerKey string, packet []byte, pktLen int64, sID, cID string) error {
+	// Re-check route not retired and generation matches before installing new flow state or transmitting to WAN
+	if route == nil || route.retired.Load() {
+		f.directDrops.Add(1)
+		return ErrSessionNotRegistered
+	}
+	activeGen, activeSID, active := f.ActivePeerGeneration(peerKey)
+	if !active || (route.generation != 0 && activeGen != route.generation) || (sID != "" && activeSID != sID) {
+		f.directDrops.Add(1)
+		return ErrSessionNotRegistered
+	}
+
+	// Call RouteDirect FIRST
+	err := directEgress.RouteDirect(peerKey, route.assignedIP, packet, route.returnPath)
+	if err != nil {
+		f.directDrops.Add(1)
+		return err
+	}
+
+	// Only increment metrics and accounting after successful transmission
 	f.directBytes.Add(pktLen)
-	route.traffic.record(pktLen, true)
+	f.totalRxBytes.Add(pktLen)
+	f.totalRxPackets.Add(1)
+	route.traffic.AddRx(pktLen)
 	if f.accountant != nil {
 		f.accountant.RecordRx(sID, cID, pktLen)
 	}
-	f.totalRxBytes.Add(pktLen)
-	f.totalRxPackets.Add(1)
-	return directEgress.RouteDirect(peerKey, route.assignedIP, packet, route.returnPath)
+	return nil
 }
 
 func (f *Forwarder) sendToProxyBackend(beQueue chan []byte, hasBeQueue bool, route *sessionRoute, backendTraffic *trafficCounters, sID, cID string, packet []byte, pktLen int64) error {

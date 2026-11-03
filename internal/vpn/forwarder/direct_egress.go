@@ -51,11 +51,13 @@ type FlowKey struct {
 }
 
 type flowEntry struct {
-	choice    EgressChoice
-	natPort   uint16
-	lastSeen  time.Time
-	peerKey   string
-	closeSeen bool
+	choice     EgressChoice
+	natPort    uint16
+	lastSeen   time.Time
+	peerKey    string
+	sessionID  string
+	generation uint64
+	closeSeen  bool
 }
 
 type inboundKey struct {
@@ -65,6 +67,9 @@ type inboundKey struct {
 
 type natEntry struct {
 	peerKey    string
+	sessionID  string
+	generation uint64
+	flowKey    FlowKey
 	clientIP   netip.Addr
 	clientPort uint16
 	remoteIP   netip.Addr
@@ -234,6 +239,18 @@ func (m *DirectEgressManager) IsProhibitedDestination(dst netip.Addr) bool {
 	return false
 }
 
+func (m *DirectEgressManager) isFlowExpiredLocked(f *flowEntry, proto uint8, now time.Time) bool {
+	timeout := m.cfg.UDPTimeout
+	if proto == 6 {
+		if f.closeSeen {
+			timeout = 5 * time.Second
+		} else {
+			timeout = m.cfg.TCPTimeout
+		}
+	}
+	return now.Sub(f.lastSeen) > timeout
+}
+
 // LookupFlow checks if an existing sticky flow decision is recorded for this packet's 5-tuple.
 func (m *DirectEgressManager) LookupFlow(peerKey string, packet []byte) (EgressChoice, bool) {
 	if m == nil || len(packet) < 20 || (packet[0]>>4) != 4 {
@@ -257,13 +274,45 @@ func (m *DirectEgressManager) LookupFlow(peerKey string, packet []byte) (EgressC
 		DstPort:  binary.BigEndian.Uint16(packet[ihl+2 : ihl+4]),
 	}
 
+	var activeGen uint64
+	var activeSID string
+	var hasActive bool
+	if m.fwd != nil {
+		activeGen, activeSID, hasActive = m.fwd.ActivePeerGeneration(peerKey)
+	}
+
 	m.mu.Lock()
 	entry, ok := m.flows[key]
 	if !ok {
 		m.mu.Unlock()
 		return EgressChoiceNone, false
 	}
-	entry.lastSeen = time.Now()
+
+	// Verify cached flow belongs to calling session's active generation
+	if m.fwd != nil {
+		if !hasActive || (entry.generation != 0 && entry.generation != activeGen) || (entry.sessionID != "" && entry.sessionID != activeSID) {
+			delete(m.flows, key)
+			if entry.choice == EgressChoiceDirect && entry.natPort > 0 {
+				delete(m.usedPorts, entry.natPort)
+				delete(m.inboundNAT, inboundKey{protocol: proto, natPort: entry.natPort})
+			}
+			m.mu.Unlock()
+			return EgressChoiceNone, false
+		}
+	}
+
+	now := time.Now()
+	if m.isFlowExpiredLocked(entry, proto, now) {
+		delete(m.flows, key)
+		if entry.choice == EgressChoiceDirect && entry.natPort > 0 {
+			delete(m.usedPorts, entry.natPort)
+			delete(m.inboundNAT, inboundKey{protocol: proto, natPort: entry.natPort})
+		}
+		m.mu.Unlock()
+		return EgressChoiceNone, false
+	}
+
+	entry.lastSeen = now
 	choice := entry.choice
 	m.mu.Unlock()
 
@@ -293,12 +342,25 @@ func (m *DirectEgressManager) RecordFlow(peerKey string, packet []byte, choice E
 		DstPort:  binary.BigEndian.Uint16(packet[ihl+2 : ihl+4]),
 	}
 
+	var activeGen uint64
+	var activeSID string
+	if m.fwd != nil {
+		gen, sID, active := m.fwd.ActivePeerGeneration(peerKey)
+		if !active {
+			return
+		}
+		activeGen = gen
+		activeSID = sID
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if entry, ok := m.flows[key]; ok {
 		entry.choice = choice
 		entry.lastSeen = time.Now()
+		entry.generation = activeGen
+		entry.sessionID = activeSID
 		return
 	}
 
@@ -310,9 +372,11 @@ func (m *DirectEgressManager) RecordFlow(peerKey string, packet []byte, choice E
 	}
 
 	m.flows[key] = &flowEntry{
-		choice:   choice,
-		lastSeen: time.Now(),
-		peerKey:  peerKey,
+		choice:     choice,
+		lastSeen:   time.Now(),
+		peerKey:    peerKey,
+		sessionID:  activeSID,
+		generation: activeGen,
 	}
 }
 
@@ -375,13 +439,43 @@ func (m *DirectEgressManager) routeDirectProtocol(peerKey, assignedIP string, pa
 		DstPort:  dstPort,
 	}
 
+	var activeGen uint64
+	var activeSID string
+	if m.fwd != nil {
+		gen, sID, active := m.fwd.ActivePeerGeneration(peerKey)
+		if active {
+			activeGen = gen
+			activeSID = sID
+		}
+	}
+
 	m.mu.Lock()
 	flow, exists := m.flows[flowKey]
 	var natPort uint16
+	now := time.Now()
 	if exists && flow.natPort > 0 {
-		natPort = flow.natPort
-		flow.lastSeen = time.Now()
-	} else {
+		if m.isFlowExpiredLocked(flow, proto, now) {
+			delete(m.usedPorts, flow.natPort)
+			delete(m.inboundNAT, inboundKey{protocol: proto, natPort: flow.natPort})
+			delete(m.flows, flowKey)
+			flow = nil
+			exists = false
+		} else {
+			natPort = flow.natPort
+			flow.lastSeen = now
+		}
+	}
+
+	if !exists || flow == nil || flow.natPort == 0 {
+		if flow == nil && len(m.flows) >= m.cfg.MaxFlows {
+			m.sweepLocked(now)
+			if len(m.flows) >= m.cfg.MaxFlows {
+				m.mu.Unlock()
+				m.directDrops.Add(1)
+				return ErrFlowTableFull
+			}
+		}
+
 		var err error
 		natPort, err = m.allocatePortLocked()
 		if err != nil {
@@ -391,21 +485,28 @@ func (m *DirectEgressManager) routeDirectProtocol(peerKey, assignedIP string, pa
 		}
 		if flow == nil {
 			flow = &flowEntry{
-				choice:   EgressChoiceDirect,
-				natPort:  natPort,
-				lastSeen: time.Now(),
-				peerKey:  peerKey,
+				choice:     EgressChoiceDirect,
+				natPort:    natPort,
+				lastSeen:   now,
+				peerKey:    peerKey,
+				sessionID:  activeSID,
+				generation: activeGen,
 			}
 			m.flows[flowKey] = flow
 		} else {
 			flow.natPort = natPort
 			flow.choice = EgressChoiceDirect
-			flow.lastSeen = time.Now()
+			flow.lastSeen = now
+			flow.sessionID = activeSID
+			flow.generation = activeGen
 		}
 
 		inKey := inboundKey{protocol: proto, natPort: natPort}
 		m.inboundNAT[inKey] = &natEntry{
 			peerKey:    peerKey,
+			sessionID:  activeSID,
+			generation: activeGen,
+			flowKey:    flowKey,
 			clientIP:   netip.AddrFrom4(srcIP),
 			clientPort: srcPort,
 			remoteIP:   netip.AddrFrom4(dstIP),
@@ -413,7 +514,7 @@ func (m *DirectEgressManager) routeDirectProtocol(peerKey, assignedIP string, pa
 			protocol:   proto,
 			natPort:    natPort,
 			returnPath: path,
-			lastSeen:   time.Now(),
+			lastSeen:   now,
 		}
 	}
 
@@ -469,46 +570,79 @@ func (m *DirectEgressManager) routeDirectProtocol(peerKey, assignedIP string, pa
 	return nil
 }
 
-// HandleWANReply demultiplexes an inbound response packet from the WAN and forwards it to the client.
-func (m *DirectEgressManager) HandleWANReply(packet []byte) error {
+func (m *DirectEgressManager) validateWANReplyHeader(packet []byte) (ihl int, proto uint8, natPort uint16, srcIP netip.Addr, srcPort uint16, err error) {
 	if len(packet) < 20 || (packet[0]>>4) != 4 {
-		return errors.New("invalid ipv4 reply packet")
+		return 0, 0, 0, netip.Addr{}, 0, errors.New("invalid ipv4 reply packet")
 	}
-	ihl := int(packet[0]&0x0f) * 4
+	ihl = int(packet[0]&0x0f) * 4
 	if len(packet) < ihl+4 {
-		return errors.New("truncated reply packet")
+		return 0, 0, 0, netip.Addr{}, 0, errors.New("truncated reply packet")
 	}
-	proto := packet[9]
+	proto = packet[9]
 	if proto != 6 && proto != 17 {
-		return errors.New("unsupported protocol in wan reply")
+		return 0, 0, 0, netip.Addr{}, 0, errors.New("unsupported protocol in wan reply")
 	}
+	dstIP := netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]})
+	if m.cfg.HostWANIP.IsValid() && dstIP != m.cfg.HostWANIP {
+		return 0, 0, 0, netip.Addr{}, 0, errors.New("destination ip does not match host wan ip")
+	}
+	natPort = binary.BigEndian.Uint16(packet[ihl+2 : ihl+4])
+	srcIP = netip.AddrFrom4([4]byte{packet[12], packet[13], packet[14], packet[15]})
+	srcPort = binary.BigEndian.Uint16(packet[ihl : ihl+2])
+	return ihl, proto, natPort, srcIP, srcPort, nil
+}
 
-	natPort := binary.BigEndian.Uint16(packet[ihl+2 : ihl+4])
+func (m *DirectEgressManager) lookupAndRefreshNATReply(proto uint8, natPort uint16, srcIP netip.Addr, srcPort uint16, isClose bool) (natEntry, error) {
 	inKey := inboundKey{protocol: proto, natPort: natPort}
-
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	entry, ok := m.inboundNAT[inKey]
 	if !ok {
-		m.mu.Unlock()
-		return errors.New("no nat entry for reply")
+		return natEntry{}, errors.New("no nat entry for reply")
 	}
-	entry.lastSeen = time.Now()
-	if proto == 6 && len(packet) >= ihl+14 {
-		if packet[ihl+13]&(0x01|0x04) != 0 {
-			entry.closeSeen = true
+	if srcIP != entry.remoteIP || srcPort != entry.remotePort {
+		return natEntry{}, errors.New("remote endpoint does not match nat entry")
+	}
+
+	now := time.Now()
+	entry.lastSeen = now
+	if flow, ok := m.flows[entry.flowKey]; ok {
+		flow.lastSeen = now
+		if isClose {
+			flow.closeSeen = true
 		}
 	}
-	clientIP := entry.clientIP
-	clientPort := entry.clientPort
-	peerKey := entry.peerKey
-	retPath := entry.returnPath
-	m.mu.Unlock()
-
-	if retPath == nil || retPath.Closed() {
-		return ErrReturnPathClosed
+	if isClose {
+		entry.closeSeen = true
 	}
+	return *entry, nil
+}
 
-	// DNAT: Translate destination IP and destination port back to client
+func (m *DirectEgressManager) admitDownstreamReply(peerKey string, retPath *ReturnPath, generation uint64, sessionID string, pktLen int64) (*sessionRoute, string, string, error) {
+	if m.fwd == nil {
+		return nil, "", "", nil
+	}
+	m.fwd.mu.RLock()
+	defer m.fwd.mu.RUnlock()
+
+	r, exists := m.fwd.routesByPeer[peerKey]
+	if exists && r != nil {
+		if r.retired.Load() || (generation != 0 && r.generation != generation) || (sessionID != "" && r.sessionID != sessionID) || (r.returnPath != nil && r.returnPath != retPath) {
+			return nil, "", "", ErrSessionNotRegistered
+		}
+		if r.tbDown != nil && !r.tbDown.Allow(pktLen) {
+			m.fwd.clientDropsRateLimited.Add(1)
+			return nil, "", "", ErrRateLimitExceeded
+		}
+		return r, r.sessionID, r.connectionID, nil
+	} else if generation != 0 || sessionID != "" {
+		return nil, "", "", ErrSessionNotRegistered
+	}
+	return nil, "", "", nil
+}
+
+func applyDNAT(packet []byte, ihl int, proto uint8, clientIP netip.Addr, clientPort uint16) []byte {
 	reply := make([]byte, len(packet))
 	copy(reply, packet)
 	clientIPBytes := clientIP.As4()
@@ -522,34 +656,82 @@ func (m *DirectEgressManager) HandleWANReply(packet []byte) error {
 
 	// Recalculate L4 Checksum
 	srcIPBytes := [4]byte{reply[12], reply[13], reply[14], reply[15]}
-	if proto == 6 {
-		if len(reply) >= ihl+20 {
-			binary.BigEndian.PutUint16(reply[ihl+16:ihl+18], 0)
-			tcpCS := computeL4Checksum(srcIPBytes, clientIPBytes, 6, reply[ihl:])
-			binary.BigEndian.PutUint16(reply[ihl+16:ihl+18], tcpCS)
+	if proto == 6 && len(reply) >= ihl+20 {
+		binary.BigEndian.PutUint16(reply[ihl+16:ihl+18], 0)
+		tcpCS := computeL4Checksum(srcIPBytes, clientIPBytes, 6, reply[ihl:])
+		binary.BigEndian.PutUint16(reply[ihl+16:ihl+18], tcpCS)
+	} else if proto == 17 && len(reply) >= ihl+8 {
+		binary.BigEndian.PutUint16(reply[ihl+6:ihl+8], 0)
+		udpCS := computeL4Checksum(srcIPBytes, clientIPBytes, 17, reply[ihl:])
+		binary.BigEndian.PutUint16(reply[ihl+6:ihl+8], udpCS)
+	}
+	return reply
+}
+
+// HandleWANReply demultiplexes an inbound response packet from the WAN and forwards it to the client.
+func (m *DirectEgressManager) HandleWANReply(packet []byte) error {
+	ihl, proto, natPort, srcIP, srcPort, err := m.validateWANReplyHeader(packet)
+	if err != nil {
+		m.directDrops.Add(1)
+		return err
+	}
+
+	isClose := proto == 6 && len(packet) >= ihl+14 && (packet[ihl+13]&(0x01|0x04) != 0)
+	entry, err := m.lookupAndRefreshNATReply(proto, natPort, srcIP, srcPort, isClose)
+	if err != nil {
+		m.directDrops.Add(1)
+		return err
+	}
+
+	if entry.returnPath == nil || entry.returnPath.Closed() {
+		m.directDrops.Add(1)
+		return ErrReturnPathClosed
+	}
+
+	pktLen := int64(len(packet))
+	route, sID, cID, err := m.admitDownstreamReply(entry.peerKey, entry.returnPath, entry.generation, entry.sessionID, pktLen)
+	if err != nil {
+		m.directDrops.Add(1)
+		return err
+	}
+
+	reply := applyDNAT(packet, ihl, proto, entry.clientIP, entry.clientPort)
+	if err := entry.returnPath.WritePacket(entry.peerKey, entry.clientIP.String(), reply); err != nil {
+		m.directDrops.Add(1)
+		return err
+	}
+
+	m.directBytes.Add(pktLen)
+	if m.fwd != nil {
+		m.fwd.totalTxBytes.Add(pktLen)
+		m.fwd.totalTxPackets.Add(1)
+		if route != nil {
+			route.traffic.AddTx(pktLen)
 		}
-	} else if proto == 17 {
-		if len(reply) >= ihl+8 {
-			binary.BigEndian.PutUint16(reply[ihl+6:ihl+8], 0)
-			udpCS := computeL4Checksum(srcIPBytes, clientIPBytes, 17, reply[ihl:])
-			binary.BigEndian.PutUint16(reply[ihl+6:ihl+8], udpCS)
+		if m.fwd.accountant != nil {
+			m.fwd.accountant.RecordTx(sID, cID, pktLen)
 		}
 	}
 
-	return retPath.WritePacket(peerKey, clientIP.String(), reply)
+	return nil
 }
 
 func (m *DirectEgressManager) allocatePortLocked() (uint16, error) {
 	totalPorts := int(m.cfg.MaxPort - m.cfg.MinPort + 1)
-	for i := 0; i < totalPorts; i++ {
-		port := m.nextPort
-		m.nextPort++
-		if m.nextPort > m.cfg.MaxPort || m.nextPort < m.cfg.MinPort {
-			m.nextPort = m.cfg.MinPort
+	for attempt := 0; attempt < 2; attempt++ {
+		for i := 0; i < totalPorts; i++ {
+			port := m.nextPort
+			m.nextPort++
+			if m.nextPort > m.cfg.MaxPort || m.nextPort < m.cfg.MinPort {
+				m.nextPort = m.cfg.MinPort
+			}
+			if !m.usedPorts[port] {
+				m.usedPorts[port] = true
+				return port, nil
+			}
 		}
-		if !m.usedPorts[port] {
-			m.usedPorts[port] = true
-			return port, nil
+		if attempt == 0 {
+			m.sweepLocked(time.Now())
 		}
 	}
 	return 0, ErrNATPortExhaustion
@@ -564,15 +746,7 @@ func (m *DirectEgressManager) Sweep(now time.Time) {
 
 func (m *DirectEgressManager) sweepLocked(now time.Time) {
 	for k, f := range m.flows {
-		timeout := m.cfg.UDPTimeout
-		if k.Protocol == 6 {
-			if f.closeSeen {
-				timeout = 5 * time.Second
-			} else {
-				timeout = m.cfg.TCPTimeout
-			}
-		}
-		if now.Sub(f.lastSeen) > timeout {
+		if m.isFlowExpiredLocked(f, k.Protocol, now) {
 			if f.choice == EgressChoiceDirect && f.natPort > 0 {
 				delete(m.usedPorts, f.natPort)
 				delete(m.inboundNAT, inboundKey{protocol: k.Protocol, natPort: f.natPort})
@@ -596,6 +770,47 @@ func (m *DirectEgressManager) PurgePeer(peerKey string) {
 			delete(m.flows, k)
 		}
 	}
+	for inK, entry := range m.inboundNAT {
+		if entry.peerKey == peerKey {
+			delete(m.usedPorts, entry.natPort)
+			delete(m.inboundNAT, inK)
+		}
+	}
+}
+
+// PurgeSession purges all active flows and NAT state belonging to sessionID.
+func (m *DirectEgressManager) PurgeSession(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for k, f := range m.flows {
+		if f.sessionID == sessionID {
+			if f.choice == EgressChoiceDirect && f.natPort > 0 {
+				delete(m.usedPorts, f.natPort)
+				delete(m.inboundNAT, inboundKey{protocol: k.Protocol, natPort: f.natPort})
+			}
+			delete(m.flows, k)
+		}
+	}
+	for inK, entry := range m.inboundNAT {
+		if entry.sessionID == sessionID {
+			delete(m.usedPorts, entry.natPort)
+			delete(m.inboundNAT, inK)
+		}
+	}
+}
+
+// PurgeAll purges all flows and NAT state.
+func (m *DirectEgressManager) PurgeAll() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	clear(m.flows)
+	clear(m.inboundNAT)
+	clear(m.usedPorts)
 }
 
 // Close terminates direct egress background routines and closes resources.

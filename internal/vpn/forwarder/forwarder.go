@@ -55,6 +55,7 @@ type sessionRoute struct {
 	peerKey         string
 	assignedIP      string
 	backendTunnelID int64
+	generation      uint64
 	returnPath      *ReturnPath // immutable owner for this route generation; nil means legacy
 	clientQueue     chan []byte
 	queueReady      chan struct{} // coalesced notification; dequeue holds aggregateQueueMu
