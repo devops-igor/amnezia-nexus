@@ -395,7 +395,9 @@ func isServerActiveForBudget(status string) bool {
 
 func isOrderActiveForBudget(status string) bool {
 	switch strings.ToLower(status) {
-	case gigahost.StatusWaiting, gigahost.StatusDeploying, gigahost.StatusInstalling, gigahost.StatusUnknown, "pending_order", gigahost.StatusPending:
+	case gigahost.StatusWaiting, gigahost.StatusDeploying, gigahost.StatusInstalling,
+		gigahost.StatusUnknown, "pending_order", gigahost.StatusPending,
+		gigahost.StatusReady, "active":
 		return true
 	default:
 		return false
