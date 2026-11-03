@@ -116,7 +116,7 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	// Step 2 — PROXY: Policy snapshot CIDR or route cache Proxy match (including shared-IP conflict).
 	if f.matchesProxyPolicy(dstIP, sID, policyMatcher, routeCache) {
 		if directEgress != nil {
-			directEgress.RecordFlow(peerKey, packet, EgressChoiceProxy)
+			directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceProxy)
 		}
 		return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
 	}
@@ -127,7 +127,7 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 			return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
 		}
 		if directEgress != nil {
-			directEgress.RecordFlow(peerKey, packet, EgressChoiceDirect)
+			directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceDirect)
 			return f.sendToDirectEgress(directEgress, route, peerKey, packet, pktLen, sID, cID)
 		}
 		f.directDrops.Add(1)
@@ -136,7 +136,7 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 
 	// Step 4 — PROXY (Safe Default): Missing, expired, or evicted DNS evidence (policy.Unknown).
 	if directEgress != nil {
-		directEgress.RecordFlow(peerKey, packet, EgressChoiceProxy)
+		directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceProxy)
 	}
 	return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
 }

@@ -356,28 +356,21 @@ func (f *Forwarder) DeliverDirectWANReply(peerKey, sessionID string, generation 
 	f.mu.RUnlock()
 
 	route.writeMu.Lock()
+	defer route.writeMu.Unlock()
 	if route.retired.Load() {
-		route.writeMu.Unlock()
 		return ErrSessionNotRegistered
 	}
-	route.writeMu.Unlock()
 
 	if err := retPath.WritePacket(peerKey, clientIP, packet); err != nil {
 		return err
 	}
 
-	route.writeMu.Lock()
-	if route.retired.Load() {
-		route.writeMu.Unlock()
-		return ErrSessionNotRegistered
-	}
 	route.traffic.AddTx(pktLen)
 	f.totalTxBytes.Add(pktLen)
 	f.totalTxPackets.Add(1)
 	if f.accountant != nil {
 		f.accountant.RecordTx(sID, cID, pktLen)
 	}
-	route.writeMu.Unlock()
 
 	return nil
 }

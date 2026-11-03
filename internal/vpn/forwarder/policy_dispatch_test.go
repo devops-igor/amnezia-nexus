@@ -1,11 +1,13 @@
 package forwarder
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"net/netip"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
@@ -765,5 +767,125 @@ func TestPolicyDispatch_R2H1_DirectWANReplyWriteFenceAndQueueBounding(t *testing
 	err = dem.HandleWANReply(reply)
 	if !errors.Is(err, ErrSessionNotRegistered) {
 		t.Fatalf("expected ErrSessionNotRegistered on retired route WAN reply, got %v", err)
+	}
+}
+
+func TestPolicyDispatch_R3B1_RecordFlowAuthorizingIdentityValidation(t *testing.T) {
+	fwd, dem, wanDev, rc := setupForwarderWithPBR(t)
+
+	peerKey := "peer-r3b1"
+	clientIP := "10.100.0.85"
+	capPath := newTestCaptureReturnPath()
+
+	fwd.RegisterSessionWithReturnPath("s-old", "c-old", peerKey, clientIP, 206, capPath.path)
+	targetIP := netip.MustParseAddr("1.1.1.1")
+	rc.Set("s-old", targetIP, policy.Direct)
+
+	pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), targetIP, 10004, 53, []byte("r3b1-data"))
+
+	// 1. Generation/session mismatch must not record flow state
+	dem.RecordFlow(peerKey, "s-old", 999, pkt, EgressChoiceDirect)
+	if _, found := dem.LookupFlow(peerKey, pkt); found {
+		t.Fatal("expected flow not to be recorded on generation mismatch")
+	}
+
+	dem.RecordFlow(peerKey, "wrong-session", 1, pkt, EgressChoiceDirect)
+	if _, found := dem.LookupFlow(peerKey, pkt); found {
+		t.Fatal("expected flow not to be recorded on sessionID mismatch")
+	}
+
+	// 2. Replaced session: old producer cannot install DIRECT flow for new replacement session
+	ret, err := fwd.TryRegisterSessionWithReturnPath("s-new", "c-new", peerKey, clientIP, 206, 0, 0, capPath.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ret.Wait()
+	rc.Set("s-new", targetIP, policy.Proxy)
+
+	// Old caller tries to record with old identity
+	dem.RecordFlow(peerKey, "s-old", 1, pkt, EgressChoiceDirect)
+	if _, found := dem.LookupFlow(peerKey, pkt); found {
+		t.Fatal("expected old session RecordFlow to be rejected for replacement route")
+	}
+
+	// New packet from replacement session must go to proxy, not WAN
+	if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
+		t.Fatal(err)
+	}
+	if len(wanDev.getPackets()) != 0 {
+		t.Fatalf("replacement session traffic leaked to WAN: %d packets", len(wanDev.getPackets()))
+	}
+	if len(fwd.backendQueues[206]) != 1 {
+		t.Fatalf("expected 1 packet queued in proxy backend queue, got %d", len(fwd.backendQueues[206]))
+	}
+}
+
+func TestPolicyDispatch_R3H1_DirectWANReplyRetirementWriteFenceContinuous(t *testing.T) {
+	fwd, dem, wanDev, rc := setupForwarderWithPBR(t)
+
+	peerKey := "peer-r3h1"
+	clientIP := "10.100.0.86"
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	delivered := make(chan struct{}, 1)
+
+	blockingPath := NewReturnPath(func(_, _ string, pkt []byte) (int, error) {
+		close(entered)
+		<-release
+		delivered <- struct{}{}
+		return len(pkt), nil
+	})
+
+	fwd.RegisterSessionWithReturnPath("s-r3h1", "c-r3h1", peerKey, clientIP, 207, blockingPath)
+	targetIP := netip.MustParseAddr("1.1.1.1")
+	rc.Set("s-r3h1", targetIP, policy.Direct)
+
+	pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), targetIP, 10005, 53, []byte("r3h1-data"))
+	if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
+		t.Fatal(err)
+	}
+
+	wanPkts := wanDev.getPackets()
+	if len(wanPkts) != 1 {
+		t.Fatalf("expected 1 WAN packet, got %d", len(wanPkts))
+	}
+	natPort := binary.BigEndian.Uint16(wanPkts[0][20:22])
+
+	reply := buildTestIPv4UDPPacket(targetIP, dem.cfg.HostWANIP, 53, natPort, []byte("r3h1-reply"))
+	done := make(chan error, 1)
+	go func() {
+		done <- dem.HandleWANReply(reply)
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("writer callback not entered")
+	}
+
+	freshPath := newTestCaptureReturnPath()
+	ret, err := fwd.TryRegisterSessionWithReturnPath("s-r3h1-new", "c-r3h1", peerKey, clientIP, 207, 0, 0, freshPath.path)
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	waitErr := ret.WaitContext(ctx)
+	cancel()
+	if waitErr == nil {
+		close(release)
+		t.Fatal("retirement reported quiescence while reply write was still in flight")
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("HandleWANReply failed: %v", err)
+	}
+	<-delivered
+
+	ret.Wait()
+	if fwd.totalTxPackets.Load() == 0 {
+		t.Fatal("expected admitted reply to be accounted in TxPackets")
 	}
 }

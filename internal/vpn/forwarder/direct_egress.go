@@ -319,9 +319,63 @@ func (m *DirectEgressManager) LookupFlow(peerKey string, packet []byte) (EgressC
 	return choice, true
 }
 
+func parseGenerationArg(v any) (uint64, bool) {
+	switch g := v.(type) {
+	case uint64:
+		return g, true
+	case int:
+		if g >= 0 {
+			return uint64(g), true // #nosec G115
+		}
+	case uint:
+		return uint64(g), true
+	case int64:
+		if g >= 0 {
+			return uint64(g), true // #nosec G115
+		}
+	}
+	return 0, false
+}
+
 // RecordFlow records the initial routing decision for a 5-tuple flow to maintain stickiness.
-func (m *DirectEgressManager) RecordFlow(peerKey string, packet []byte, choice EgressChoice) {
-	if m == nil || len(packet) < 20 || (packet[0]>>4) != 4 {
+// Supported invocations:
+//
+//	RecordFlow(peerKey string, packet []byte, choice EgressChoice)
+//	RecordFlow(peerKey, sessionID string, generation uint64, packet []byte, choice EgressChoice)
+func (m *DirectEgressManager) RecordFlow(peerKey string, args ...any) {
+	if m == nil {
+		return
+	}
+	var sessionID string
+	var generation uint64
+	var packet []byte
+	var choice EgressChoice
+
+	switch len(args) {
+	case 2:
+		var ok, ok2 bool
+		packet, ok = args[0].([]byte)
+		choice, ok2 = args[1].(EgressChoice)
+		if !ok || !ok2 {
+			return
+		}
+	case 4:
+		var ok, ok2, okGen bool
+		sessionID, ok = args[0].(string)
+		generation, okGen = parseGenerationArg(args[1])
+		if !ok || !okGen {
+			return
+		}
+		packet, ok = args[2].([]byte)
+		choice, ok2 = args[3].(EgressChoice)
+		if !ok || !ok2 {
+			return
+		}
+	default:
+		return
+	}
+
+	if len(packet) < 20 || (packet[0]>>4) != 4 {
 		return
 	}
 	ihl := int(packet[0]&0x0f) * 4
@@ -342,8 +396,6 @@ func (m *DirectEgressManager) RecordFlow(peerKey string, packet []byte, choice E
 		DstPort:  binary.BigEndian.Uint16(packet[ihl+2 : ihl+4]),
 	}
 
-	var activeGen uint64
-	var activeSID string
 	if m.fwd != nil {
 		m.fwd.mu.RLock()
 		defer m.fwd.mu.RUnlock()
@@ -352,13 +404,18 @@ func (m *DirectEgressManager) RecordFlow(peerKey string, packet []byte, choice E
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	var activeGen uint64
+	var activeSID string
 	if m.fwd != nil {
 		route, ok := m.fwd.routesByPeer[peerKey]
-		if !ok || route == nil || route.retired.Load() {
+		if !ok || route == nil || route.retired.Load() || route.sessionID != sessionID || route.generation != generation {
 			return
 		}
 		activeGen = route.generation
 		activeSID = route.sessionID
+	} else {
+		activeGen = generation
+		activeSID = sessionID
 	}
 
 	if entry, ok := m.flows[key]; ok {
@@ -413,22 +470,9 @@ func (m *DirectEgressManager) RouteDirect(peerKey, assignedIP string, args ...an
 		if !ok {
 			return errors.New("invalid sessionID")
 		}
-		switch g := args[1].(type) {
-		case uint64:
-			generation = g
-		case int:
-			if g < 0 {
-				return errors.New("invalid generation")
-			}
-			generation = uint64(g) // #nosec G115 -- non-negative integer check above
-		case uint:
-			generation = uint64(g)
-		case int64:
-			if g < 0 {
-				return errors.New("invalid generation")
-			}
-			generation = uint64(g) // #nosec G115 -- non-negative integer check above
-		default:
+		var okGen bool
+		generation, okGen = parseGenerationArg(args[1])
+		if !okGen {
 			return errors.New("invalid generation")
 		}
 		packet, ok = args[2].([]byte)
