@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -540,6 +541,151 @@ func TestGigahost_ClientResolution(t *testing.T) {
 		}
 		if client == nil {
 			t.Fatal("expected non-nil client")
+		}
+	})
+}
+
+func TestGigahost_SecurityAndDurabilityContracts(t *testing.T) {
+	t.Run("backup redacts configured api key for support", func(t *testing.T) {
+		h, db, _ := setupTestHandlers(t)
+		key := "flux_live_" + strings.Repeat("e", 64)
+		if err := db.SetSetting(context.Background(), "gigahost", map[string]any{"api_key": key, "monthly_budget_nok": 250.0}); err != nil {
+			t.Fatal(err)
+		}
+		r := chi.NewRouter()
+		r.With(middleware.RequireAdminOrSupport).Get("/api/settings/backup/download", h.DownloadBackupHandler)
+		req := httptest.NewRequest(http.MethodGet, "/api/settings/backup/download", nil)
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "support-user", Role: models.RoleSupport}))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", w.Code)
+		}
+		if bytes.Contains(w.Body.Bytes(), []byte(key)) {
+			t.Errorf("expected backup to redact bearer key, but key was found in export")
+		}
+	})
+
+	t.Run("pre-dispatch persistence failure refuses purchase", func(t *testing.T) {
+		h, db, _ := setupTestHandlers(t)
+		if err := h.ensureGigahostOrdersTable(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SQLDB().Exec("PRAGMA query_only=ON"); err != nil {
+			t.Fatal(err)
+		}
+		calls := 0
+		h.SetGigahostClient(&mockGigahostClient{
+			orderServerSafeFn: func(context.Context, gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+				calls++
+				return &gigahost.OrderResponse{OrderID: "paid_10001", Status: gigahost.StatusPending}, nil
+			},
+		})
+		body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12}`
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostOrderHandler(w, req)
+		if w.Code != http.StatusInternalServerError {
+			t.Errorf("expected 500 when DB is read-only, got %d", w.Code)
+		}
+		if calls != 0 {
+			t.Errorf("expected 0 purchase calls when pre-dispatch fails, got %d", calls)
+		}
+	})
+
+	t.Run("cancellation after provider success still preserves durable job", func(t *testing.T) {
+		h, db, _ := setupTestHandlers(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		h.SetGigahostClient(&mockGigahostClient{
+			orderServerSafeFn: func(context.Context, gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+				cancel() // Client disconnected right after order succeeded
+				return &gigahost.OrderResponse{OrderID: "paid_10002", Status: gigahost.StatusPending}, nil
+			},
+		})
+		body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12}`
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
+		req = req.WithContext(ctx)
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostOrderHandler(w, req)
+		var count int
+		if err := db.SQLDB().QueryRow("SELECT count(*) FROM gigahost_orders WHERE order_id='paid_10002'").Scan(&count); err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if count != 1 {
+			t.Errorf("expected 1 saved order with order_id paid_10002 despite client cancellation, got %d", count)
+		}
+	})
+
+	t.Run("installing state continues polling on subsequent orders requests", func(t *testing.T) {
+		h, _, _ := setupTestHandlers(t)
+		now := time.Now().UTC()
+		if err := h.saveGigahostOrder(context.Background(), &GigahostOrderRecord{
+			OrderID: "10003", Status: "deploying", PlanID: 101, RegionID: 1, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		checks := 0
+		h.SetGigahostClient(&mockGigahostClient{
+			getDeployStatusFn: func(context.Context, string) (*gigahost.DeployStatusResponse, error) {
+				checks++
+				return &gigahost.DeployStatusResponse{Status: "installing"}, nil
+			},
+		})
+		req1 := httptest.NewRequest(http.MethodGet, "/api/admin/hosting/gigahost/orders", nil)
+		req1 = req1.WithContext(middleware.WithSession(req1.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w1 := httptest.NewRecorder()
+		h.GigahostOrdersHandler(w1, req1)
+
+		req2 := httptest.NewRequest(http.MethodGet, "/api/admin/hosting/gigahost/orders", nil)
+		req2 = req2.WithContext(middleware.WithSession(req2.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w2 := httptest.NewRecorder()
+		h.GigahostOrdersHandler(w2, req2)
+
+		if checks != 2 {
+			t.Errorf("expected installing state to continue being polled, checks=%d (wanted 2)", checks)
+		}
+	})
+
+	t.Run("gigahost settings save and get masked", func(t *testing.T) {
+		h, _, _ := setupTestHandlers(t)
+		saveBody := `{
+			"gigahost": {
+				"api_key": "flux_live_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+				"monthly_budget_nok": 500
+			}
+		}`
+		saveReq := httptest.NewRequest(http.MethodPost, "/api/settings/save", strings.NewReader(saveBody))
+		saveReq = saveReq.WithContext(middleware.WithSession(saveReq.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		saveW := httptest.NewRecorder()
+		h.SaveSettingsHandler(saveW, saveReq)
+		if saveW.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK from SaveSettingsHandler, got %d", saveW.Code)
+		}
+
+		getReq := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+		getReq = getReq.WithContext(middleware.WithSession(getReq.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		getW := httptest.NewRecorder()
+		h.GetSettingsHandler(getW, getReq)
+		if getW.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK from GetSettingsHandler, got %d", getW.Code)
+		}
+
+		var resp map[string]any
+		if err := json.Unmarshal(getW.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		gh, ok := resp["gigahost"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected gigahost in settings response, got: %+v", resp)
+		}
+		if gh["api_key"] != "********" {
+			t.Errorf("expected api_key to be masked, got %v", gh["api_key"])
+		}
+		if gh["monthly_budget_nok"] != float64(500) {
+			t.Errorf("expected monthly_budget_nok 500, got %v", gh["monthly_budget_nok"])
 		}
 	})
 }

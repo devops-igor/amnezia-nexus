@@ -141,7 +141,7 @@ func (h *Handlers) saveGigahostOrder(ctx context.Context, order *GigahostOrderRe
 	return nil
 }
 
-// updateGigahostOrder updates status, server_id, and assigned_ip of an order.
+// updateGigahostOrder updates order_id, server_id, status, and assigned_ip of an order.
 func (h *Handlers) updateGigahostOrder(ctx context.Context, order *GigahostOrderRecord) error {
 	if h.db == nil || h.db.SQLDB() == nil {
 		return nil
@@ -149,9 +149,10 @@ func (h *Handlers) updateGigahostOrder(ctx context.Context, order *GigahostOrder
 
 	order.UpdatedAt = time.Now().UTC()
 	q := `UPDATE gigahost_orders
-	      SET server_id = ?, status = ?, assigned_ip = ?, updated_at = ?
+	      SET order_id = ?, server_id = ?, status = ?, assigned_ip = ?, updated_at = ?
 	      WHERE id = ? OR (order_id = ? AND order_id != '')`
 	_, err := h.db.SQLDB().ExecContext(ctx, q,
+		order.OrderID,
 		order.ServerID,
 		order.Status,
 		order.AssignedIP,
@@ -280,7 +281,39 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 2. Safe order dispatch with hourly billing enforcement
+	// 2. Reconcile unknown purchase state before allowing retry (fail closed on error)
+	unresolved, reconcileErr := h.reconcilePendingUnknownOrders(r.Context(), client, req)
+	if reconcileErr != nil {
+		h.JSONError(w, http.StatusServiceUnavailable, "reconciliation_failed", reconcileErr.Error())
+		return
+	}
+	if unresolved != nil {
+		h.JSON(w, http.StatusAccepted, map[string]any{
+			"status":  "unknown",
+			"message": "Prior purchase order is pending reconciliation; refusing duplicate purchase until resolved",
+			"order":   unresolved,
+		})
+		return
+	}
+
+	// 3. Pre-dispatch durable intent persistence; fail closed if DB cannot record intent
+	now := time.Now().UTC()
+	orderRecord := &GigahostOrderRecord{
+		OrderID:        fmt.Sprintf("intent_%d", now.UnixNano()),
+		Status:         "pending_order",
+		PlanID:         req.PID,
+		RegionID:       req.RegionID,
+		HourlyPriceNOK: req.HourlyPriceNOK,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := h.saveGigahostOrder(r.Context(), orderRecord); err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "db_error",
+			fmt.Sprintf("Failed to persist deployment intent: %v", err))
+		return
+	}
+
+	// 4. Safe order dispatch with hourly billing enforcement
 	orderReq := gigahost.OrderRequest{
 		PID:           req.PID,
 		PriceID:       req.PriceID,
@@ -292,29 +325,17 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 
 	orderResp, orderErr := client.OrderServerSafe(r.Context(), orderReq)
 
-	now := time.Now().UTC()
-	orderRecord := &GigahostOrderRecord{
-		PlanID:         req.PID,
-		RegionID:       req.RegionID,
-		HourlyPriceNOK: req.HourlyPriceNOK,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	}
+	// 5. Update record with cancellation-independent context
+	updateCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+	defer cancel()
 
-	if orderResp != nil {
-		orderRecord.OrderID = orderResp.OrderID
-		orderRecord.ServerID = orderResp.ServerID
-		orderRecord.Status = orderResp.Status
-	}
+	applyOrderResponseToRecord(orderRecord, orderResp, orderErr)
 
-	if orderRecord.OrderID == "" {
-		orderRecord.OrderID = fmt.Sprintf("unknown_%d", now.UnixNano())
+	if updateErr := h.updateGigahostOrder(updateCtx, orderRecord); updateErr != nil {
+		h.JSONError(w, http.StatusInternalServerError, "db_update_failed",
+			fmt.Sprintf("Order placed (%s) but failed to update record: %v", orderRecord.OrderID, updateErr))
+		return
 	}
-	if orderRecord.Status == "" {
-		orderRecord.Status = gigahost.StatusUnknown
-	}
-
-	_ = h.saveGigahostOrder(r.Context(), orderRecord)
 
 	if orderErr != nil {
 		if orderResp != nil && orderResp.Status == gigahost.StatusUnknown {
@@ -335,6 +356,129 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func (h *Handlers) reconcilePendingUnknownOrders(ctx context.Context, client gigahost.Client, req OrderServerPayload) (*GigahostOrderRecord, error) {
+	existingOrders, _ := h.getGigahostOrders(ctx)
+	for i := range existingOrders {
+		if existingOrders[i].Status != gigahost.StatusUnknown && existingOrders[i].Status != "pending_order" {
+			continue
+		}
+		servers, checkErr := client.GetServers(ctx)
+		if checkErr != nil {
+			return nil, fmt.Errorf("cannot verify provider inventory while order %s is unresolved: %w", existingOrders[i].OrderID, checkErr)
+		}
+		matched := false
+		for _, s := range servers {
+			if (s.OrderID != "" && s.OrderID == existingOrders[i].OrderID) ||
+				(s.PID == existingOrders[i].PlanID && s.RegionID == existingOrders[i].RegionID && (s.Status == gigahost.StatusReady || s.Status == "active")) {
+				if s.OrderID != "" {
+					existingOrders[i].OrderID = s.OrderID
+				}
+				if s.ID > 0 {
+					existingOrders[i].ServerID = s.ID
+				}
+				if s.Status != "" {
+					existingOrders[i].Status = s.Status
+				}
+				if ip := s.GetIP(); ip != "" {
+					existingOrders[i].AssignedIP = ip
+				}
+				_ = h.updateGigahostOrder(ctx, &existingOrders[i])
+				matched = true
+				break
+			}
+		}
+		if !matched && existingOrders[i].PlanID == req.PID && existingOrders[i].RegionID == req.RegionID {
+			return &existingOrders[i], nil
+		}
+	}
+	return nil, nil
+}
+
+func applyOrderResponseToRecord(orderRecord *GigahostOrderRecord, orderResp *gigahost.OrderResponse, orderErr error) {
+	if orderResp != nil {
+		if orderResp.OrderID != "" {
+			orderRecord.OrderID = orderResp.OrderID
+		}
+		if orderResp.ServerID > 0 {
+			orderRecord.ServerID = orderResp.ServerID
+		}
+		if orderResp.Status != "" {
+			orderRecord.Status = orderResp.Status
+		}
+	}
+	if orderErr != nil {
+		if orderResp != nil && orderResp.Status == gigahost.StatusUnknown {
+			orderRecord.Status = gigahost.StatusUnknown
+		} else if orderRecord.Status == "pending_order" {
+			orderRecord.Status = gigahost.StatusFailed
+		}
+	}
+	if orderRecord.Status == "pending_order" {
+		orderRecord.Status = gigahost.StatusPending
+	}
+}
+
+func isTerminalStatus(status string) bool {
+	s := strings.ToLower(status)
+	switch {
+	case s == gigahost.StatusReady || s == gigahost.StatusFailed || s == "active" || s == "deleted":
+		return true
+	case strings.HasPrefix(s, "cancel"):
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handlers) refreshSingleOrder(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord) bool {
+	if isTerminalStatus(order.Status) {
+		return false
+	}
+	if !strings.HasPrefix(order.OrderID, "unknown_") && !strings.HasPrefix(order.OrderID, "intent_") {
+		statusResp, err := client.GetDeployStatus(ctx, order.OrderID)
+		if err == nil && statusResp != nil {
+			updated := false
+			if statusResp.Status != "" && statusResp.Status != order.Status {
+				order.Status = statusResp.Status
+				updated = true
+			}
+			if ip := statusResp.GetIP(); ip != "" && ip != order.AssignedIP {
+				order.AssignedIP = ip
+				updated = true
+			}
+			if statusResp.ServerID > 0 && order.ServerID == 0 {
+				order.ServerID = statusResp.ServerID
+				updated = true
+			}
+			return updated
+		}
+		return false
+	}
+
+	servers, err := client.GetServers(ctx)
+	if err == nil {
+		for _, s := range servers {
+			if (s.OrderID != "" && s.OrderID == order.OrderID) ||
+				(s.PID == order.PlanID && s.RegionID == order.RegionID && (s.Status == gigahost.StatusReady || s.Status == "active")) {
+				if s.OrderID != "" {
+					order.OrderID = s.OrderID
+				}
+				if s.ID > 0 {
+					order.ServerID = s.ID
+				}
+				if s.Status != "" {
+					order.Status = s.Status
+				}
+				if ip := s.GetIP(); ip != "" {
+					order.AssignedIP = ip
+				}
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // GigahostOrdersHandler handles GET /api/admin/hosting/gigahost/orders.
 // Lists persistent order history and refreshes status for active/pending jobs.
 func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request) {
@@ -350,32 +494,12 @@ func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Try to refresh non-final orders if client is accessible
+	// Refresh all non-terminal orders if client is accessible
 	client, clientErr := h.getGigahostClient(r.Context(), r)
 	if clientErr == nil && len(orders) > 0 {
 		for i := range orders {
-			if orders[i].Status == gigahost.StatusPending || orders[i].Status == gigahost.StatusDeploying || orders[i].Status == gigahost.StatusUnknown {
-				if !strings.HasPrefix(orders[i].OrderID, "unknown_") {
-					statusResp, err := client.GetDeployStatus(r.Context(), orders[i].OrderID)
-					if err == nil && statusResp != nil {
-						updated := false
-						if statusResp.Status != "" && statusResp.Status != orders[i].Status {
-							orders[i].Status = statusResp.Status
-							updated = true
-						}
-						if ip := statusResp.GetIP(); ip != "" && ip != orders[i].AssignedIP {
-							orders[i].AssignedIP = ip
-							updated = true
-						}
-						if statusResp.ServerID > 0 && orders[i].ServerID == 0 {
-							orders[i].ServerID = statusResp.ServerID
-							updated = true
-						}
-						if updated {
-							_ = h.updateGigahostOrder(r.Context(), &orders[i])
-						}
-					}
-				}
+			if h.refreshSingleOrder(r.Context(), client, &orders[i]) {
+				_ = h.updateGigahostOrder(r.Context(), &orders[i])
 			}
 		}
 	}

@@ -553,18 +553,18 @@ func TestClient_OrderServerSafe_TimeoutRecoveryAndIdempotency(t *testing.T) {
 	}
 
 	// Second call with same order parameters:
-	// Pre-inspection detects matching server and reuses without duplicate POST!
+	// Explicit replacement order must NOT adopt existing active server; it dispatches a new order!
 	initialPostCount := atomic.LoadInt32(&postOrderCalls)
 	resp2, err := c.OrderServerSafe(context.Background(), req)
 	if err != nil {
 		t.Fatalf("second call err: %v", err)
 	}
-	if resp2.ServerID != 999 {
-		t.Errorf("expected reused server_id 999, got %d", resp2.ServerID)
+	if atomic.LoadInt32(&postOrderCalls) != initialPostCount+1 {
+		t.Errorf("expected new POST for replacement order, count was %d, wanted %d",
+			atomic.LoadInt32(&postOrderCalls), initialPostCount+1)
 	}
-	if atomic.LoadInt32(&postOrderCalls) != initialPostCount {
-		t.Errorf("expected no additional POST requests, but count increased from %d to %d",
-			initialPostCount, atomic.LoadInt32(&postOrderCalls))
+	if resp2 == nil || resp2.OrderID == "" {
+		t.Errorf("expected valid order response for replacement order, got: %+v", resp2)
 	}
 }
 
@@ -705,6 +705,263 @@ func TestClient_EdgeCasesAndFallbacks(t *testing.T) {
 		p := Product{ID: 99, PID: 0}
 		if p.GetID() != 99 {
 			t.Errorf("expected GetID fallback to ID 99, got %d", p.GetID())
+		}
+	})
+}
+
+// Contract tests verifying remediations for B1, H2, H3 against documented wire shapes.
+func TestClient_DocumentedWireContracts(t *testing.T) {
+	const validKey = "flux_live_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	t.Run("catalog decoding with tiers, specs and regions", func(t *testing.T) {
+		catalogJSON := `{"meta":{"status":200},"data":{"tiers":[{"group_id":1,"products":[{"product_id":101,"product_name":"Cloud 2","type":"vm","allow_hourly":true,"price_id":555,"rate_hourly":0.14375,"rate_monthly":90,"region_ids":[1],"in_stock":true,"specs":{"cpu_cores":2,"ram_gb":4,"disks":[{"size_gb":80}]}}]}],"regions":[{"region_id":"1","region_name":"Norway"}],"currency":"NOK","eligibility":{"qualifies_arrears":true,"credit_nok":0}}}`
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(catalogJSON))
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: validKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		plans, err := c.GetCatalog(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected catalog parse error: %v", err)
+		}
+		if len(plans) != 1 {
+			t.Fatalf("expected 1 plan, got %d", len(plans))
+		}
+		if plans[0].ProductID != 101 || plans[0].PriceID != 555 || plans[0].HourlyRateNOK != 0.14375 {
+			t.Errorf("unexpected plan details: %+v", plans[0])
+		}
+		if len(plans[0].Regions) != 1 || plans[0].Regions[0].Name != "Norway" {
+			t.Errorf("unexpected plan regions: %+v", plans[0].Regions)
+		}
+	})
+
+	t.Run("documented account without balance returns credit", func(t *testing.T) {
+		accJSON := `{"meta":{"status":200},"data":{"cust_id":"1111","cust_name":"Example AS","sshkeys":[],"orders":[]}}`
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(accJSON))
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: validKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		acc, err := c.GetAccount(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !acc.HasCredit() {
+			t.Errorf("expected documented customer with cust_id to have credit, got false")
+		}
+	})
+
+	t.Run("documented order response parses order_ids[0]", func(t *testing.T) {
+		orderJSON := `{"meta":{"status":200},"data":{"success":true,"message":"Servers queued for deployment.","order_ids":[10001],"quantity":1,"rate_hourly":0.14375,"monthly_cap":90,"currency":"NOK"}}`
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(orderJSON))
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: validKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := OrderRequest{PID: 101, PriceID: 555, RegionID: 1, OSID: 12, BillingPeriod: BillingPeriodHourly, Quantity: 1}
+		resp, err := c.OrderServer(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.OrderID != "10001" {
+			t.Errorf("expected OrderID 10001, got %q", resp.OrderID)
+		}
+		if resp.Status != StatusPending {
+			t.Errorf("expected Status pending, got %q", resp.Status)
+		}
+	})
+
+	t.Run("documented status queries ids= and parses servers array", func(t *testing.T) {
+		statusJSON := `{"meta":{"status":200},"data":{"servers":[{"order_id":10001,"srv_id":3500,"ip":"192.0.2.24","status":"ready"}],"all_ready":true}}`
+		var query string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			query = r.URL.RawQuery
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(statusJSON))
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: validKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := c.GetDeployStatus(context.Background(), "10001")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if query != "ids=10001" {
+			t.Errorf("expected query ids=10001, got %s", query)
+		}
+		if resp.Status != "ready" || resp.ServerID != 3500 || resp.GetIP() != "192.0.2.24" {
+			t.Errorf("unexpected status response: %+v", resp)
+		}
+	})
+
+	t.Run("documented inventory parses srv_id and order identity", func(t *testing.T) {
+		serversJSON := `{"meta":{"status":200},"data":[{"srv_id":"3523","srv_name":"web01","srv_status":true,"srv_primary_ip":"192.0.2.24","order":{"order_id":"3081","product_id":"101"},"datacenter":{"region_id":"1"}}]}`
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(serversJSON))
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: validKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		servers, err := c.GetServers(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(servers) != 1 {
+			t.Fatalf("expected 1 server, got %d", len(servers))
+		}
+		if servers[0].ID != 3523 || servers[0].OrderID != "3081" || servers[0].PID != 101 || servers[0].RegionID != 1 {
+			t.Errorf("unexpected server identity: %+v", servers[0])
+		}
+		if servers[0].GetIP() != "192.0.2.24" {
+			t.Errorf("unexpected server IP: %s", servers[0].GetIP())
+		}
+	})
+
+	t.Run("inventory 503 fails closed and stops purchase", func(t *testing.T) {
+		var posts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"message":"service unavailable"}`))
+				return
+			}
+			posts.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":{"order_ids":[10002]}}`))
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: validKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := OrderRequest{PID: 101, PriceID: 555, RegionID: 1, OSID: 12, BillingPeriod: BillingPeriodHourly, Quantity: 1}
+		_, err = c.OrderServerSafe(context.Background(), req)
+		if err == nil {
+			t.Errorf("expected failure when inventory 503, got nil error")
+		}
+		if posts.Load() != 0 {
+			t.Errorf("expected 0 posts on inventory failure, got %d", posts.Load())
+		}
+	})
+
+	t.Run("sequential retry deduplication prevents double purchase", func(t *testing.T) {
+		var posts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"meta":{"status":200},"data":[]}`))
+				return
+			}
+			posts.Add(1)
+			// Simulate slow response causing client timeout
+			time.Sleep(50 * time.Millisecond)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":{"order_ids":[10003]}}`))
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: validKey, Timeout: 10 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := OrderRequest{PID: 101, PriceID: 555, RegionID: 1, OSID: 12, BillingPeriod: BillingPeriodHourly, Quantity: 1}
+		// First call times out -> marked unknown
+		resp1, err1 := c.OrderServerSafe(context.Background(), req)
+		if err1 == nil || resp1 == nil || resp1.Status != StatusUnknown {
+			t.Fatalf("expected unknown status on timeout, got %+v %v", resp1, err1)
+		}
+		// Second call before server appears in inventory refuses duplicate POST
+		resp2, err2 := c.OrderServerSafe(context.Background(), req)
+		if err2 == nil || resp2 == nil || resp2.Status != StatusUnknown {
+			t.Fatalf("expected unknown refusal on retry, got %+v %v", resp2, err2)
+		}
+		if posts.Load() != 1 {
+			t.Errorf("expected exactly 1 post across retries, got %d", posts.Load())
+		}
+	})
+
+	t.Run("existing active server does not suppress replacement", func(t *testing.T) {
+		var posts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"meta":{"status":200},"data":[{"srv_id":"3500","order":{"order_id":"old_10001","product_id":"101"},"datacenter":{"region_id":"1"},"srv_status":true}]}`))
+				return
+			}
+			posts.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"meta":{"status":200},"data":{"order_ids":[10004],"success":true}}`))
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: validKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := OrderRequest{PID: 101, PriceID: 555, RegionID: 1, OSID: 12, BillingPeriod: BillingPeriodHourly, Quantity: 1}
+		resp, err := c.OrderServerSafe(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if posts.Load() != 1 {
+			t.Errorf("expected replacement order to POST, posts=%d", posts.Load())
+		}
+		if resp.OrderID != "10004" {
+			t.Errorf("expected new order ID 10004, got %s", resp.OrderID)
+		}
+	})
+
+	t.Run("EOF error during order classified as unknown", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"meta":{"status":200},"data":[]}`))
+				return
+			}
+			// Close connection to produce EOF
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("hijacking not supported")
+			}
+			conn, _, _ := hj.Hijack()
+			conn.Close()
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: validKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := OrderRequest{PID: 101, PriceID: 555, RegionID: 1, OSID: 12, BillingPeriod: BillingPeriodHourly, Quantity: 1}
+		resp, err := c.OrderServerSafe(context.Background(), req)
+		if err == nil {
+			t.Fatal("expected error on EOF")
+		}
+		if resp == nil || resp.Status != StatusUnknown {
+			t.Errorf("expected StatusUnknown on EOF connection drop, got: %+v", resp)
 		}
 	})
 }

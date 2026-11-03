@@ -319,6 +319,86 @@
                 </div>
             </div>
         </div>
+
+        {{ if is_admin .current_user }}
+        <!-- BLOCK 8: Gigahost Cloud Hosting & Deploy VPS -->
+        <div class="card settings-section-card" id="gigahostCard">
+            <div class="settings-card-header" style="display: flex; align-items: center; justify-content: space-between;">
+                <div style="display: flex; align-items: center; gap: var(--space-sm);">
+                    <svg class="icon"><use href="#icon-cloud"></use></svg>
+                    <h3 class="card-title">{{ _ "gigahost_settings_title" }}</h3>
+                </div>
+            </div>
+            <form id="gigahostForm">
+                {{ $ghSettings := get .settings "gigahost" }}
+                <div class="form-group">
+                    <label class="form-label" for="gigahost_api_key">{{ _ "gigahost_api_key_label" }}</label>
+                    <input type="password" class="form-input" id="gigahost_api_key"
+                        value="{{ if get $ghSettings "api_key" }}********{{ end }}"
+                        placeholder="flux_live_...">
+                    <p class="form-hint">{{ _ "gigahost_api_key_hint" }}</p>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="gigahost_monthly_budget">{{ _ "gigahost_monthly_budget_label" }}</label>
+                    <input type="number" step="any" min="0" class="form-input" id="gigahost_monthly_budget"
+                        value="{{ get $ghSettings "monthly_budget_nok" "" }}"
+                        placeholder="500">
+                    <p class="form-hint">{{ _ "gigahost_monthly_budget_hint" }}</p>
+                </div>
+            </form>
+
+            <div class="divider" style="margin: var(--space-md) 0;"></div>
+
+            <!-- Deploy VPS Section -->
+            <div id="gigahostDeploySection">
+                <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-md);">
+                    <div style="display:flex; align-items:center; gap:var(--space-sm);">
+                        <svg class="icon"><use href="#icon-server"></use></svg>
+                        <h4 style="margin:0; font-size:1rem; font-weight:600;">{{ _ "deploy_vps_title" }}</h4>
+                    </div>
+                    <button type="button" class="btn btn-secondary btn-sm" id="btnRefreshCatalog">
+                        <svg class="icon"><use href="#icon-activity"></use></svg>
+                    </button>
+                </div>
+                <p class="form-hint" style="margin-bottom: var(--space-md);">{{ _ "deploy_vps_desc" }}</p>
+
+                <div id="deployCatalogLoading" style="display:none; text-align:center; padding:var(--space-md);">
+                    <div class="spinner" style="width:20px; height:20px; margin:0 auto;"></div>
+                </div>
+
+                <div id="deployCatalogForm" style="display: flex; flex-direction: column; gap: var(--space-md);">
+                    <div class="form-group">
+                        <label class="form-label" for="deployPlanSelect">{{ _ "deploy_vps_select_plan" }}</label>
+                        <select class="form-select" id="deployPlanSelect"></select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="deployRegionSelect">{{ _ "deploy_vps_select_region" }}</label>
+                        <select class="form-select" id="deployRegionSelect"></select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="deployOSSelect">{{ _ "deploy_vps_select_os" }}</label>
+                        <select class="form-select" id="deployOSSelect">
+                            <option value="72">Ubuntu 24.04 LTS (x86_64)</option>
+                            <option value="12">Debian 12 Bookworm (x86_64)</option>
+                        </select>
+                    </div>
+                    <button type="button" class="btn btn-primary" id="btnDeployVPS" style="display:flex; align-items:center; justify-content:center; gap:var(--space-sm);">
+                        <svg class="icon"><use href="#icon-plus"></use></svg>
+                        <span id="btnDeployVPSText">{{ _ "deploy_vps_btn" }}</span>
+                        <div class="spinner hidden" id="deployVPSSpinner" style="width:14px; height:14px;"></div>
+                    </button>
+                </div>
+
+                <!-- Recent Orders Display -->
+                <div style="margin-top:var(--space-lg); border-top:1px solid var(--border-color); padding-top:var(--space-md);">
+                    <h5 style="margin:0 0 var(--space-sm) 0; font-size:0.9rem; font-weight:600;">{{ _ "deploy_vps_recent_orders" }}</h5>
+                    <div id="recentOrdersContainer" style="font-size:0.85rem;">
+                        <span class="text-muted">...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {{ end }}
     </div>
 </div>
 
@@ -387,8 +467,18 @@
             chat_id: document.getElementById('telegram_chat_id') ? document.getElementById('telegram_chat_id').value.trim() : ''
         };
 
+        const ghApiKeyInput = document.getElementById('gigahost_api_key');
+        const ghBudgetInput = document.getElementById('gigahost_monthly_budget');
+        let gigahost = undefined;
+        if (ghApiKeyInput || ghBudgetInput) {
+            gigahost = {
+                api_key: ghApiKeyInput ? ghApiKeyInput.value.trim() : '',
+                monthly_budget_nok: ghBudgetInput && ghBudgetInput.value ? parseFloat(ghBudgetInput.value) : 0
+            };
+        }
+
         try {
-            await API.post('/api/settings/save', { appearance, captcha, ssl, limits, telegram });
+            await API.post('/api/settings/save', { appearance, captcha, ssl, limits, telegram, gigahost });
             UI.toast(_('settings_saved'), 'success');
             setTimeout(() => window.location.reload(), 1000);
         } catch (err) {
@@ -531,5 +621,145 @@
     document.addEventListener('DOMContentLoaded', () => {
         checkUpstreamStatus(false);
     });
+
+    // Gigahost catalog and deployment workflow
+    const btnRefreshCatalog = document.getElementById('btnRefreshCatalog');
+    const btnDeployVPS = document.getElementById('btnDeployVPS');
+    const deployPlanSelect = document.getElementById('deployPlanSelect');
+    const deployRegionSelect = document.getElementById('deployRegionSelect');
+
+    let cachedPlans = [];
+
+    async function loadGigahostCatalog() {
+        if (!deployPlanSelect) return;
+        const loading = document.getElementById('deployCatalogLoading');
+        if (loading) loading.style.display = 'block';
+        try {
+            const res = await API.get('/api/admin/hosting/gigahost/catalog');
+            cachedPlans = (res && res.plans) ? res.plans : [];
+            deployPlanSelect.innerHTML = '';
+            if (cachedPlans.length === 0) {
+                const opt = document.createElement('option');
+                opt.value = '';
+                opt.textContent = _('no_matching_records');
+                deployPlanSelect.appendChild(opt);
+            } else {
+                cachedPlans.forEach((p, idx) => {
+                    const opt = document.createElement('option');
+                    opt.value = idx;
+                    opt.textContent = `${p.name} — ${p.cpu_cores} vCPU, ${Math.round(p.ram_mb/1024)}GB RAM, ${p.disk_gb}GB NVMe (${p.hourly_rate_nok} NOK/hr, max ${p.monthly_ceiling_nok} NOK/mo)`;
+                    deployPlanSelect.appendChild(opt);
+                });
+                updateDeployRegions();
+            }
+        } catch (err) {
+            if (deployPlanSelect) {
+                deployPlanSelect.innerHTML = '<option value="">' + (err.message || 'Catalog unavailable') + '</option>';
+            }
+        } finally {
+            if (loading) loading.style.display = 'none';
+        }
+    }
+
+    function updateDeployRegions() {
+        if (!deployRegionSelect || cachedPlans.length === 0) return;
+        const planIdx = parseInt(deployPlanSelect.value || '0');
+        const plan = cachedPlans[planIdx] || cachedPlans[0];
+        deployRegionSelect.innerHTML = '';
+        if (plan && plan.regions && plan.regions.length > 0) {
+            plan.regions.forEach(r => {
+                const opt = document.createElement('option');
+                opt.value = r.id;
+                opt.textContent = r.name + (r.country ? ` (${r.country})` : '');
+                deployRegionSelect.appendChild(opt);
+            });
+        } else {
+            const opt = document.createElement('option');
+            opt.value = '1';
+            opt.textContent = 'Norway (Default)';
+            deployRegionSelect.appendChild(opt);
+        }
+    }
+
+    async function loadRecentOrders() {
+        const container = document.getElementById('recentOrdersContainer');
+        if (!container) return;
+        try {
+            const res = await API.get('/api/admin/hosting/gigahost/orders');
+            const orders = (res && res.orders) ? res.orders : [];
+            if (orders.length === 0) {
+                container.innerHTML = '<span class="text-muted">' + _('no_matching_records') + '</span>';
+                return;
+            }
+            let html = '<div style="display:flex; flex-direction:column; gap:6px;">';
+            orders.slice(0, 5).forEach(o => {
+                const badgeClass = o.status === 'ready' ? 'badge-success' : (o.status === 'failed' ? 'badge-danger' : 'badge-warn');
+                html += `<div style="display:flex; justify-content:space-between; align-items:center; padding:4px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
+                    <div>
+                        <span style="font-family:monospace; font-weight:600;">#${o.order_id}</span>
+                        ${o.assigned_ip ? `<span style="font-family:monospace; margin-left:6px; color:var(--text-secondary);">${o.assigned_ip}</span>` : ''}
+                    </div>
+                    <div>
+                        <span class="badge ${badgeClass}" style="font-size:0.75rem;">${o.status}</span>
+                    </div>
+                </div>`;
+            });
+            html += '</div>';
+            container.innerHTML = html;
+        } catch (_) {
+            container.innerHTML = '<span class="text-muted">' + _('no_matching_records') + '</span>';
+        }
+    }
+
+    async function handleDeployVPS() {
+        if (!deployPlanSelect || cachedPlans.length === 0) return;
+        const planIdx = parseInt(deployPlanSelect.value || '0');
+        const plan = cachedPlans[planIdx];
+        if (!plan) return;
+
+        const regionID = deployRegionSelect ? parseInt(deployRegionSelect.value || '1') : 1;
+        const osID = parseInt(document.getElementById('deployOSSelect').value || '72');
+
+        const btn = document.getElementById('btnDeployVPS');
+        const spinner = document.getElementById('deployVPSSpinner');
+        if (btn) btn.disabled = true;
+        if (spinner) spinner.classList.remove('hidden');
+
+        try {
+            const payload = {
+                pid: plan.product_id,
+                price_id: plan.price_id,
+                region_id: regionID,
+                os_id: osID,
+                hourly_price_nok: plan.hourly_rate_nok
+            };
+            const res = await API.post('/api/admin/hosting/gigahost/order', payload);
+            UI.toast(res.message || 'VPS order placed successfully', 'success');
+            loadRecentOrders();
+        } catch (err) {
+            UI.toast(err.message || _('error'), 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+            if (spinner) spinner.classList.add('hidden');
+        }
+    }
+
+    if (deployPlanSelect) {
+        deployPlanSelect.addEventListener('change', updateDeployRegions);
+    }
+    if (btnRefreshCatalog) {
+        btnRefreshCatalog.addEventListener('click', () => {
+            loadGigahostCatalog();
+            loadRecentOrders();
+        });
+    }
+    if (btnDeployVPS) {
+        btnDeployVPS.addEventListener('click', handleDeployVPS);
+    }
+
+    if (deployPlanSelect) {
+        loadGigahostCatalog();
+        loadRecentOrders();
+    }
 </script>
 {{ end }}

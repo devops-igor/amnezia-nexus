@@ -21,12 +21,14 @@ func (h *Handlers) GetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	var sslCfg models.SSLSettings
 	var limitsCfg models.ConnectionLimits
 	telegramCfg := make(map[string]any)
+	gigahostCfg := make(map[string]any)
 
 	_ = h.db.GetSetting(ctx, "appearance", &appearance)
 	_ = h.db.GetSetting(ctx, "captcha", &captchaCfg)
 	_ = h.db.GetSetting(ctx, "telegram", &telegramCfg)
 	_ = h.db.GetSetting(ctx, "ssl", &sslCfg)
 	_ = h.db.GetSetting(ctx, "limits", &limitsCfg)
+	_ = h.db.GetSetting(ctx, "gigahost", &gigahostCfg)
 
 	// Strip sensitive private keys & certificate text from API response
 	sslCfg.KeyText = ""
@@ -40,12 +42,18 @@ func (h *Handlers) GetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		telegramCfg["token"] = "********"
 	}
 
+	// Mask gigahost API key if present
+	if key, ok := gigahostCfg["api_key"].(string); ok && key != "" {
+		gigahostCfg["api_key"] = "********"
+	}
+
 	h.JSON(w, http.StatusOK, map[string]any{
 		"appearance": appearance,
 		"captcha":    captchaCfg,
 		"telegram":   telegramCfg,
 		"ssl":        sslCfg,
 		"limits":     limitsCfg,
+		"gigahost":   gigahostCfg,
 	})
 }
 
@@ -75,6 +83,17 @@ func (h *Handlers) preserveSecretsOnSave(ctx context.Context, req *models.SaveSe
 			}
 		}
 	}
+
+	// 3. Gigahost: Preserve existing api_key if incoming is empty or masked
+	if req.Gigahost != nil {
+		existingGigahost := make(map[string]any)
+		_ = h.db.GetSetting(ctx, "gigahost", &existingGigahost)
+		if key, ok := req.Gigahost["api_key"].(string); !ok || key == "" || key == "********" || strings.HasPrefix(key, "****") {
+			if oldKey, ok := existingGigahost["api_key"].(string); ok && oldKey != "" {
+				req.Gigahost["api_key"] = oldKey
+			}
+		}
+	}
 }
 
 func (h *Handlers) persistSettings(ctx context.Context, req *models.SaveSettingsRequest) error {
@@ -91,6 +110,11 @@ func (h *Handlers) persistSettings(ctx context.Context, req *models.SaveSettings
 	}
 	if err := h.db.SetSetting(ctx, "ssl", req.SSL); err != nil {
 		return err
+	}
+	if req.Gigahost != nil {
+		if err := h.db.SetSetting(ctx, "gigahost", req.Gigahost); err != nil {
+			return err
+		}
 	}
 	return h.db.SetSetting(ctx, "limits", req.Limits)
 }
@@ -189,6 +213,23 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	settingsMap, _ := h.db.GetAllSettings(ctx)
+	if settingsMap != nil {
+		// Scrub provider credentials and bearer API keys from backup to prevent disclosure
+		if gMap, ok := settingsMap["gigahost"].(map[string]any); ok {
+			cleanGigahost := make(map[string]any)
+			for k, v := range gMap {
+				if k != "api_key" {
+					cleanGigahost[k] = v
+				}
+			}
+			if len(cleanGigahost) == 0 {
+				delete(settingsMap, "gigahost")
+			} else {
+				settingsMap["gigahost"] = cleanGigahost
+			}
+		}
+		delete(settingsMap, "gigahost.api_key")
+	}
 
 	// Export SSH host-key fingerprints (TOFU) and leaderboard snapshots for parity
 	// with the Python reference backup format.

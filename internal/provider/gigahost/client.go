@@ -10,7 +10,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,9 +38,11 @@ type Config struct {
 
 // client implements Client using standard net/http.
 type client struct {
-	baseURL    string
-	apiKey     string
-	httpClient *http.Client
+	baseURL       string
+	apiKey        string
+	httpClient    *http.Client
+	mu            sync.Mutex
+	unknownOrders map[string]time.Time
 }
 
 // Ensure client satisfies the Client interface.
@@ -75,9 +79,10 @@ func NewClient(cfg Config) (Client, error) {
 	}
 
 	return &client{
-		baseURL:    baseURL,
-		apiKey:     cfg.APIKey,
-		httpClient: httpClient,
+		baseURL:       baseURL,
+		apiKey:        cfg.APIKey,
+		httpClient:    httpClient,
+		unknownOrders: make(map[string]time.Time),
 	}, nil
 }
 
@@ -148,6 +153,49 @@ func (c *client) GetAccount(ctx context.Context) (*AccountInfo, error) {
 		return nil, fmt.Errorf("failed to get account info: %w", err)
 	}
 
+	type docAccount struct {
+		Meta struct {
+			Status int `json:"status"`
+		} `json:"meta"`
+		Data struct {
+			CustID      string  `json:"cust_id"`
+			CustName    string  `json:"cust_name"`
+			CustEmail   string  `json:"cust_email"`
+			ID          string  `json:"id"`
+			Email       string  `json:"email"`
+			Balance     float64 `json:"balance"`
+			Credit      float64 `json:"credit"`
+			Currency    string  `json:"currency"`
+			Status      string  `json:"status"`
+			Eligibility struct {
+				QualifiesArrears bool    `json:"qualifies_arrears"`
+				CreditNOK        float64 `json:"credit_nok"`
+			} `json:"eligibility"`
+		} `json:"data"`
+	}
+	var doc docAccount
+	if err := json.Unmarshal(rawData, &doc); err == nil && (doc.Data.CustID != "" || doc.Data.ID != "" || doc.Data.CustName != "" || doc.Data.Eligibility.QualifiesArrears) {
+		acc := &AccountInfo{
+			ID:               doc.Data.ID,
+			CustID:           doc.Data.CustID,
+			CustName:         doc.Data.CustName,
+			Email:            doc.Data.CustEmail,
+			Balance:          doc.Data.Balance,
+			Credit:           doc.Data.Credit,
+			CreditNOK:        doc.Data.Eligibility.CreditNOK,
+			QualifiesArrears: doc.Data.Eligibility.QualifiesArrears,
+			Currency:         doc.Data.Currency,
+			Status:           doc.Data.Status,
+		}
+		if acc.ID == "" {
+			acc.ID = doc.Data.CustID
+		}
+		if acc.Email == "" {
+			acc.Email = doc.Data.Email
+		}
+		return acc, nil
+	}
+
 	var wrapped struct {
 		Account *AccountInfo `json:"account"`
 		Data    *AccountInfo `json:"data"`
@@ -186,19 +234,6 @@ func (c *client) OrderServer(ctx context.Context, req OrderRequest) (*OrderRespo
 		return nil, err
 	}
 
-	var wrapped struct {
-		Order *OrderResponse `json:"order"`
-		Data  *OrderResponse `json:"data"`
-	}
-	if wrapErr := json.Unmarshal(rawData, &wrapped); wrapErr == nil {
-		if wrapped.Order != nil {
-			return wrapped.Order, nil
-		}
-		if wrapped.Data != nil {
-			return wrapped.Data, nil
-		}
-	}
-
 	var resp OrderResponse
 	if err := json.Unmarshal(rawData, &resp); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal order response: %w", err)
@@ -214,38 +249,68 @@ func (c *client) OrderServer(ctx context.Context, req OrderRequest) (*OrderRespo
 // If an order request times out or is severed by network partition, it checks GET /servers
 // before returning to avoid accidental duplicate orders.
 func (c *client) OrderServerSafe(ctx context.Context, req OrderRequest) (*OrderResponse, error) {
-	// 1. Pre-order inspection: verify if matching server exists already
+	// 1. Pre-order inspection: verify existing provider inventory (FAIL CLOSED on error)
 	existingServers, err := c.GetServers(ctx)
-	if err == nil {
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify existing inventory: %w", err)
+	}
+
+	reqKey := fmt.Sprintf("%d:%d:%d:%d", req.PID, req.PriceID, req.RegionID, req.OSID)
+	c.mu.Lock()
+	unknownTime, hasUnknown := c.unknownOrders[reqKey]
+	c.mu.Unlock()
+
+	if hasUnknown {
+		// Check if an accepted server has become visible in inventory
 		for _, s := range existingServers {
-			if s.PID == req.PID && s.RegionID == req.RegionID &&
-				(s.Status == StatusPending || s.Status == StatusDeploying || s.Status == StatusReady || s.Status == "active") {
+			if s.PID == req.PID && s.RegionID == req.RegionID && (s.Status == StatusReady || s.Status == "active") {
+				c.mu.Lock()
+				delete(c.unknownOrders, reqKey)
+				c.mu.Unlock()
 				return &OrderResponse{
 					OrderID:  s.OrderID,
 					ServerID: s.ID,
 					Status:   s.Status,
-					Message:  "existing matching server found, reusing without duplicate order",
+					Message:  "server found in inventory from prior order",
 				}, nil
 			}
+		}
+
+		// Server is still invisible after prior unknown outcome: fail closed to prevent duplicates
+		if time.Since(unknownTime) < 5*time.Minute {
+			return &OrderResponse{
+				Status:  StatusUnknown,
+				Message: "prior order status is still unknown; refusing duplicate order until resolved",
+			}, fmt.Errorf("prior order status is still unknown (state unknown)")
 		}
 	}
 
 	// 2. Dispatch order
 	resp, orderErr := c.OrderServer(ctx, req)
 	if orderErr == nil {
+		c.mu.Lock()
+		delete(c.unknownOrders, reqKey)
+		c.mu.Unlock()
 		return resp, nil
 	}
 
 	// 3. Inspect if failure is timeout/network related
 	if isTimeoutOrNetworkError(orderErr) {
+		c.mu.Lock()
+		c.unknownOrders[reqKey] = time.Now()
+		c.mu.Unlock()
+
 		inspectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		servers, checkErr := c.GetServers(inspectCtx)
 		if checkErr == nil {
 			for _, s := range servers {
-				if s.PID == req.PID && s.RegionID == req.RegionID {
-					// Found server provisioned during or right after timeout
+				if s.PID == req.PID && s.RegionID == req.RegionID &&
+					(s.Status == StatusReady || s.Status == StatusDeploying || s.Status == StatusPending || s.Status == StatusWaiting || s.Status == StatusInstalling || s.Status == "active") {
+					c.mu.Lock()
+					delete(c.unknownOrders, reqKey)
+					c.mu.Unlock()
 					return &OrderResponse{
 						OrderID:  s.OrderID,
 						ServerID: s.ID,
@@ -272,36 +337,27 @@ func (c *client) GetDeployStatus(ctx context.Context, orderID string) (*DeploySt
 		return nil, errors.New("order_id is required")
 	}
 
-	path := fmt.Sprintf("/deploy/status?order_id=%s", url.QueryEscape(orderID))
+	path := fmt.Sprintf("/deploy/status?ids=%s", url.QueryEscape(orderID))
 	var rawData []byte
 	err := c.doRequest(ctx, http.MethodGet, path, nil, &rawData)
-	if err != nil {
-		// Fallback to path parameter format if query returns 404
-		if errors.Is(err, ErrNotFound) {
+	if err != nil && errors.Is(err, ErrNotFound) {
+		path = fmt.Sprintf("/deploy/status?order_id=%s", url.QueryEscape(orderID))
+		err = c.doRequest(ctx, http.MethodGet, path, nil, &rawData)
+		if err != nil && errors.Is(err, ErrNotFound) {
 			path = fmt.Sprintf("/deploy/status/%s", url.PathEscape(orderID))
 			err = c.doRequest(ctx, http.MethodGet, path, nil, &rawData)
 		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch deploy status: %w", err)
-		}
 	}
-
-	var wrapped struct {
-		Status *DeployStatusResponse `json:"status"`
-		Data   *DeployStatusResponse `json:"data"`
-	}
-	if wrapErr := json.Unmarshal(rawData, &wrapped); wrapErr == nil {
-		if wrapped.Status != nil {
-			return wrapped.Status, nil
-		}
-		if wrapped.Data != nil {
-			return wrapped.Data, nil
-		}
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch deploy status: %w", err)
 	}
 
 	var statusResp DeployStatusResponse
 	if err := json.Unmarshal(rawData, &statusResp); err != nil {
 		return nil, fmt.Errorf("failed to decode deploy status: %w", err)
+	}
+	if statusResp.OrderID == "" {
+		statusResp.OrderID = orderID
 	}
 	return &statusResp, nil
 }
@@ -387,7 +443,137 @@ func (c *client) doRequest(ctx context.Context, method, path string, body any, t
 	}
 }
 
+type tierProductDTO struct {
+	ProductID      int     `json:"product_id"`
+	ProductName    string  `json:"product_name"`
+	Type           string  `json:"type"`
+	AllowHourly    bool    `json:"allow_hourly"`
+	AllowRecurring bool    `json:"allow_recurring"`
+	PriceID        int     `json:"price_id"`
+	RateHourly     float64 `json:"rate_hourly"`
+	RateMonthly    float64 `json:"rate_monthly"`
+	RegionIDs      []any   `json:"region_ids"`
+	InStock        bool    `json:"in_stock"`
+	VMCores        string  `json:"vm_cores"`
+	VMMemory       string  `json:"vm_memory"`
+	VMStorage      string  `json:"vm_storage"`
+	VMBW           string  `json:"vm_bw"`
+	Specs          struct {
+		CPUCores int `json:"cpu_cores"`
+		RAMGB    int `json:"ram_gb"`
+		Disks    []struct {
+			SizeGB int `json:"size_gb"`
+		} `json:"disks"`
+		BW float64 `json:"bw"`
+	} `json:"specs"`
+}
+
+func buildTierProduct(p tierProductDTO, regionMap map[int]Region, currency string) Product {
+	cores := p.Specs.CPUCores
+	if cores <= 0 && p.VMCores != "" {
+		cores, _ = strconv.Atoi(p.VMCores)
+	}
+	ram := p.Specs.RAMGB * 1024
+	if ram <= 0 && p.VMMemory != "" {
+		v, _ := strconv.Atoi(p.VMMemory)
+		ram = v * 1024
+	}
+	disk := 0
+	for _, d := range p.Specs.Disks {
+		disk += d.SizeGB
+	}
+	if disk <= 0 && p.VMStorage != "" {
+		disk, _ = strconv.Atoi(p.VMStorage)
+	}
+	bw := p.Specs.BW
+	if bw <= 0 && p.VMBW != "" {
+		bw, _ = strconv.ParseFloat(p.VMBW, 64)
+	}
+
+	var regions []Region
+	for _, ridAny := range p.RegionIDs {
+		rid := int(parseInt64Field(ridAny))
+		if reg, ok := regionMap[rid]; ok {
+			regions = append(regions, reg)
+		} else {
+			regions = append(regions, Region{ID: rid, Available: true})
+		}
+	}
+
+	var prices []Price
+	if p.AllowHourly || p.PriceID > 0 {
+		prices = append(prices, Price{
+			ID:             p.PriceID,
+			BillingPeriod:  BillingPeriodHourly,
+			Currency:       currency,
+			HourlyRate:     p.RateHourly,
+			MonthlyCeiling: p.RateMonthly,
+		})
+	}
+
+	return Product{
+		ID:          p.ProductID,
+		PID:         p.ProductID,
+		Name:        p.ProductName,
+		CPUCores:    cores,
+		RAMMB:       ram,
+		DiskGB:      disk,
+		BandwidthTB: bw,
+		InStock:     p.InStock,
+		Prices:      prices,
+		Regions:     regions,
+	}
+}
+
 func parseProducts(data []byte) ([]Product, error) {
+	type docCatalog struct {
+		Meta struct {
+			Status int `json:"status"`
+		} `json:"meta"`
+		Data struct {
+			Tiers []struct {
+				GroupID   int              `json:"group_id"`
+				GroupName string           `json:"group_name"`
+				InStock   bool             `json:"in_stock"`
+				Products  []tierProductDTO `json:"products"`
+			} `json:"tiers"`
+			Regions []struct {
+				RegionID   any    `json:"region_id"`
+				RegionName string `json:"region_name"`
+				Country    string `json:"region_country"`
+			} `json:"regions"`
+			Currency string `json:"currency"`
+		} `json:"data"`
+	}
+
+	var doc docCatalog
+	if err := json.Unmarshal(data, &doc); err == nil && len(doc.Data.Tiers) > 0 {
+		currency := doc.Data.Currency
+		if currency == "" {
+			currency = "NOK"
+		}
+		regionMap := make(map[int]Region)
+		for _, r := range doc.Data.Regions {
+			rID := int(parseInt64Field(r.RegionID))
+			regionMap[rID] = Region{
+				ID:        rID,
+				Name:      r.RegionName,
+				Country:   r.Country,
+				Available: true,
+			}
+		}
+
+		var products []Product
+		for _, tier := range doc.Data.Tiers {
+			for _, p := range tier.Products {
+				products = append(products, buildTierProduct(p, regionMap, currency))
+			}
+		}
+		if len(products) > 0 {
+			return products, nil
+		}
+	}
+
 	var direct []Product
 	if err := json.Unmarshal(data, &direct); err == nil && len(direct) >= 0 {
 		return direct, nil
@@ -462,16 +648,20 @@ func isTimeoutOrNetworkError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
 	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
+	if errors.As(err, &netErr) {
 		return true
 	}
 	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "timeout") ||
 		strings.Contains(errStr, "deadline exceeded") ||
 		strings.Contains(errStr, "connection refused") ||
-		strings.Contains(errStr, "connection reset")
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "eof")
 }
