@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,11 +30,12 @@ func TestCheckEngine_Success(t *testing.T) {
 		engine           EngineType
 		installed        string
 		upstreamTag      string
+		profile          string
 		expectedProtocol string
 		wantUpdate       bool
 	}{
-		{name: "xray update available", engine: EngineXray, installed: "v26.10.28", upstreamTag: "v26.10.29", expectedProtocol: "vless", wantUpdate: true},
-		{name: "xray already latest", engine: EngineXray, installed: "v26.10.29", upstreamTag: "v26.10.29", expectedProtocol: "vless", wantUpdate: false},
+		{name: "xray update available", engine: EngineXray, installed: "v26.10.28", upstreamTag: "v26.10.29", profile: "modern_pq", expectedProtocol: "vless", wantUpdate: true},
+		{name: "xray already latest", engine: EngineXray, installed: "v26.10.29", upstreamTag: "v26.10.29", profile: "modern_pq", expectedProtocol: "vless", wantUpdate: false},
 		{name: "naive update available", engine: EngineNaive, installed: "v154.0.8037.49-1", upstreamTag: "v154.0.8037.49-5", expectedProtocol: "naive", wantUpdate: true},
 		{name: "caddy already latest", engine: EngineCaddy, installed: "v2.8.4", upstreamTag: "v2.8.4", expectedProtocol: "caddy", wantUpdate: false},
 		{name: "sing-box rc to release update available", engine: EngineSingBox, installed: "v1.12.0-rc1", upstreamTag: "v1.12.0", expectedProtocol: "sing-box", wantUpdate: true},
@@ -60,7 +62,11 @@ func TestCheckEngine_Success(t *testing.T) {
 				WithTTL(1*time.Hour),
 			)
 
-			status, err := checker.CheckEngine(context.Background(), tt.engine, tt.installed)
+			var opts []CheckOption
+			if tt.profile != "" {
+				opts = append(opts, WithProfile(tt.profile))
+			}
+			status, err := checker.CheckEngine(context.Background(), tt.engine, tt.installed, opts...)
 			if err != nil {
 				t.Fatalf("CheckEngine returned unexpected error: %v", err)
 			}
@@ -574,7 +580,8 @@ func TestCheckEngine_ProfileAwareness(t *testing.T) {
 		{name: "xray legacy with 1.8 compatible", engine: EngineXray, installed: "v1.8.24", upstreamTag: "v1.8.25", profile: "legacy", wantUpstreamNewer: true, wantCompatible: true, wantUpdate: true},
 		{name: "xray modern_pq with 26.10 newer", engine: EngineXray, installed: "v26.10.29", upstreamTag: "v26.10.31", profile: "modern_pq", wantUpstreamNewer: true, wantCompatible: true, wantUpdate: true},
 		{name: "xray modern_pq with legacy downgrade", engine: EngineXray, installed: "v26.10.29", upstreamTag: "v1.8.24", profile: "modern_pq", wantUpstreamNewer: false, wantCompatible: true, wantUpdate: false},
-		{name: "xray unprofiled defaults compatible", engine: EngineXray, installed: "v1.8.24", upstreamTag: "v26.10.31", profile: "", wantUpstreamNewer: true, wantCompatible: true, wantUpdate: true},
+		{name: "xray unprofiled defaults incompatible", engine: EngineXray, installed: "v1.8.24", upstreamTag: "v26.10.31", profile: "", wantUpstreamNewer: true, wantCompatible: false, wantUpdate: false},
+		{name: "xray unrecognized profile defaults incompatible", engine: EngineXray, installed: "v1.8.24", upstreamTag: "v26.10.31", profile: "custom_unknown", wantUpstreamNewer: true, wantCompatible: false, wantUpdate: false},
 	}
 
 	for _, tt := range tests {
@@ -735,17 +742,30 @@ func TestCheckEngine_RateLimitBackoffSchedule(t *testing.T) {
 		t.Errorf("NextRetryAt = %v, want %v", nextRetry, expectedNextRetry)
 	}
 
-	// Verify maximum backoff capping at 1 hour for large Retry-After
-	retryAfterVal = "86400"
-	_ = calculateNextRetry(&http.Response{
+	// Verify explicit upstream retry deadline is respected without capping at 1 hour for large Retry-After
+	if retryDeadline := calculateNextRetry(&http.Response{
 		StatusCode: http.StatusTooManyRequests,
 		Header:     http.Header{"Retry-After": []string{"86400"}},
-	}, getTime())
-	if capped := calculateNextRetry(&http.Response{
+	}, getTime()); !retryDeadline.Equal(getTime().Add(86400 * time.Second)) {
+		t.Errorf("expected backoff to respect 24h Retry-After without capping at 1h, got %v", retryDeadline)
+	}
+
+	// Verify explicit X-RateLimit-Reset deadline is respected without capping at 1 hour
+	resetTimestamp := getTime().Add(2 * time.Hour).Unix()
+	resetHdr := make(http.Header)
+	resetHdr.Set("X-RateLimit-Reset", strconv.FormatInt(resetTimestamp, 10))
+	if retryDeadline := calculateNextRetry(&http.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     resetHdr,
+	}, getTime()); !retryDeadline.Equal(time.Unix(resetTimestamp, 0)) {
+		t.Errorf("expected backoff to respect X-RateLimit-Reset without capping at 1h, got %v", retryDeadline)
+	}
+
+	// Verify fallback to maxBackoff when no explicit upstream deadline is provided on rate limit
+	if retryDeadline := calculateNextRetry(&http.Response{
 		StatusCode: http.StatusTooManyRequests,
-		Header:     http.Header{"Retry-After": []string{"86400"}},
-	}, getTime()); !capped.Equal(getTime().Add(1 * time.Hour)) {
-		t.Errorf("expected backoff capped at 1h, got %v", capped)
+	}, getTime()); !retryDeadline.Equal(getTime().Add(maxBackoff)) {
+		t.Errorf("expected fallback to maxBackoff (1h) on rate limit with no headers, got %v", retryDeadline)
 	}
 
 	// 3. Repeated call during backoff (e.g. 3 minutes later) MUST NOT hit GitHub

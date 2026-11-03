@@ -136,7 +136,7 @@ func TestCheckEngine_ColdFailure_FullLifecycle(t *testing.T) {
 	}
 	respBody, _ = json.Marshal(resp)
 
-	status5, err5 := checker.CheckEngine(ctx, EngineXray, "v1.8.0")
+	status5, err5 := checker.CheckEngine(ctx, EngineXray, "v1.8.0", WithProfile("legacy"))
 	if err5 != nil {
 		t.Fatalf("expected success after backoff elapsed and upstream recovered, got error: %v", err5)
 	}
@@ -169,7 +169,7 @@ func TestCheckEngine_ColdFailure_FullLifecycle(t *testing.T) {
 	statusCode = http.StatusBadGateway
 	respBody = nil
 
-	status6, err6 := checker.CheckEngine(ctx, EngineXray, "v1.8.0")
+	status6, err6 := checker.CheckEngine(ctx, EngineXray, "v1.8.0", WithProfile("legacy"))
 	if err6 != nil {
 		t.Fatalf("expected fallback to cached release on warm failure, got error: %v", err6)
 	}

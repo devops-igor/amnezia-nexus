@@ -356,21 +356,21 @@ func isProfileCompatible(engine EngineType, profile, upstreamTag string) bool {
 	}
 	norm := strings.ToLower(strings.TrimSpace(profile))
 	if norm == "" {
-		return true
+		return false
 	}
 
 	vLat, err := ParseVersion(upstreamTag)
 	if err != nil {
-		return true
+		return false
 	}
 
 	switch {
 	case norm == "legacy" || norm == "legacy_baseline" || norm == "baseline" || norm == "1.8.24" || norm == "v1.8.24":
 		return vLat.Major() < 20
-	case norm == "modern_pq" || norm == "modern" || norm == "pq" || strings.HasPrefix(norm, "26.10.") || strings.HasPrefix(norm, "v26.10."):
+	case norm == "modern_pq" || norm == "modern" || norm == "pq" || norm == "v26" || norm == "26" || strings.HasPrefix(norm, "26.10.") || strings.HasPrefix(norm, "v26.10."):
 		return vLat.Major() >= 20
 	default:
-		return true
+		return false
 	}
 }
 
@@ -632,24 +632,18 @@ func parseRateLimitReset(header string) (time.Time, bool) {
 }
 
 func calculateNextRetry(resp *http.Response, now time.Time) time.Time {
-	maxTime := now.Add(maxBackoff)
 	if resp != nil && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden) {
 		if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
 			if t, ok := parseRetryAfter(retryAfter, now); ok && t.After(now) {
-				if t.After(maxTime) {
-					return maxTime
-				}
 				return t
 			}
 		}
 		if reset := resp.Header.Get("X-RateLimit-Reset"); reset != "" {
 			if t, ok := parseRateLimitReset(reset); ok && t.After(now) {
-				if t.After(maxTime) {
-					return maxTime
-				}
 				return t
 			}
 		}
+		return now.Add(maxBackoff)
 	}
 	return now.Add(minBackoff)
 }
