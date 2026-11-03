@@ -251,10 +251,22 @@ func TestCompare(t *testing.T) {
 			want: -1,
 		},
 		{
-			name: "prerelease rc1 vs rc10 numeric precedence",
+			name: "prerelease rc1 vs rc10 lexical precedence",
 			v1:   "v1.12.0-rc1",
 			v2:   "v1.12.0-rc10",
 			want: -1,
+		},
+		{
+			name: "prerelease rc10 vs rc2 lexical precedence per SemVer 2.0 (rc10 older than rc2)",
+			v1:   "v1.12.0-rc10",
+			v2:   "v1.12.0-rc2",
+			want: -1,
+		},
+		{
+			name: "prerelease rc2 vs rc10 lexical precedence per SemVer 2.0 (rc2 newer than rc10)",
+			v1:   "v1.12.0-rc2",
+			v2:   "v1.12.0-rc10",
+			want: 1,
 		},
 		{
 			name: "prerelease dot numeric comparison rc.1 vs rc.10",
@@ -414,6 +426,67 @@ func TestIsUpdateAvailable(t *testing.T) {
 			got := IsUpdateAvailable(tt.installed, tt.latest)
 			if got != tt.want {
 				t.Errorf("IsUpdateAvailable(%q, %q) = %v, want %v", tt.installed, tt.latest, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCheckUpdateStatus(t *testing.T) {
+	tests := []struct {
+		name      string
+		installed string
+		latest    string
+		want      UpdateStatus
+	}{
+		{
+			name:      "strictly newer version available",
+			installed: "v1.8.24",
+			latest:    "v1.8.25",
+			want:      UpdateAvailable,
+		},
+		{
+			name:      "installed equals latest",
+			installed: "v1.8.24",
+			latest:    "v1.8.24",
+			want:      UpdateUpToDate,
+		},
+		{
+			name:      "installed is newer than latest",
+			installed: "v1.8.25",
+			latest:    "v1.8.24",
+			want:      UpdateUpToDate,
+		},
+		{
+			name:      "empty installed returns unknown",
+			installed: "",
+			latest:    "v1.8.25",
+			want:      UpdateUnknown,
+		},
+		{
+			name:      "whitespace installed returns unknown",
+			installed: "   ",
+			latest:    "v1.8.25",
+			want:      UpdateUnknown,
+		},
+		{
+			name:      "malformed installed returns unknown",
+			installed: "unknown",
+			latest:    "v1.8.25",
+			want:      UpdateUnknown,
+		},
+		{
+			name:      "malformed latest returns unknown",
+			installed: "v1.8.24",
+			latest:    "invalid-tag",
+			want:      UpdateUnknown,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := CheckUpdateStatus(tt.installed, tt.latest)
+			if got != tt.want {
+				t.Errorf("CheckUpdateStatus(%q, %q) = %v, want %v", tt.installed, tt.latest, got, tt.want)
 			}
 		})
 	}

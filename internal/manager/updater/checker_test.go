@@ -32,46 +32,11 @@ func TestCheckEngine_Success(t *testing.T) {
 		expectedProtocol string
 		wantUpdate       bool
 	}{
-		{
-			name:             "xray update available",
-			engine:           EngineXray,
-			installed:        "v26.10.28",
-			upstreamTag:      "v26.10.29",
-			expectedProtocol: "vless",
-			wantUpdate:       true,
-		},
-		{
-			name:             "xray already latest",
-			engine:           EngineXray,
-			installed:        "v26.10.29",
-			upstreamTag:      "v26.10.29",
-			expectedProtocol: "vless",
-			wantUpdate:       false,
-		},
-		{
-			name:             "naive update available",
-			engine:           EngineNaive,
-			installed:        "v154.0.8037.49-1",
-			upstreamTag:      "v154.0.8037.49-5",
-			expectedProtocol: "naive",
-			wantUpdate:       true,
-		},
-		{
-			name:             "caddy already latest",
-			engine:           EngineCaddy,
-			installed:        "v2.8.4",
-			upstreamTag:      "v2.8.4",
-			expectedProtocol: "caddy",
-			wantUpdate:       false,
-		},
-		{
-			name:             "sing-box rc to release update available",
-			engine:           EngineSingBox,
-			installed:        "v1.12.0-rc1",
-			upstreamTag:      "v1.12.0",
-			expectedProtocol: "sing-box",
-			wantUpdate:       true,
-		},
+		{name: "xray update available", engine: EngineXray, installed: "v26.10.28", upstreamTag: "v26.10.29", expectedProtocol: "vless", wantUpdate: true},
+		{name: "xray already latest", engine: EngineXray, installed: "v26.10.29", upstreamTag: "v26.10.29", expectedProtocol: "vless", wantUpdate: false},
+		{name: "naive update available", engine: EngineNaive, installed: "v154.0.8037.49-1", upstreamTag: "v154.0.8037.49-5", expectedProtocol: "naive", wantUpdate: true},
+		{name: "caddy already latest", engine: EngineCaddy, installed: "v2.8.4", upstreamTag: "v2.8.4", expectedProtocol: "caddy", wantUpdate: false},
+		{name: "sing-box rc to release update available", engine: EngineSingBox, installed: "v1.12.0-rc1", upstreamTag: "v1.12.0", expectedProtocol: "sing-box", wantUpdate: true},
 	}
 
 	for _, tt := range tests {
@@ -252,99 +217,47 @@ func TestCheckEngine_ETag304(t *testing.T) {
 	}
 }
 
-func TestCheckEngine_RateLimit_403_Fallback(t *testing.T) {
-	statusCode := http.StatusOK
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if statusCode != http.StatusOK {
-			w.WriteHeader(statusCode)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		resp := githubReleaseResponse{
-			TagName: "v2.8.4",
-			HTMLURL: "https://github.com/caddyserver/caddy/releases/tag/v2.8.4",
-		}
-		_ = json.NewEncoder(w).Encode(resp)
-	}))
-	defer server.Close()
+func TestCheckEngine_RateLimit_Fallback(t *testing.T) {
+	for _, code := range []int{http.StatusForbidden, http.StatusTooManyRequests} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			statusCode := http.StatusOK
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if statusCode != http.StatusOK {
+					w.WriteHeader(statusCode)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(githubReleaseResponse{
+					TagName: "v2.8.4",
+					HTMLURL: "https://github.com/caddyserver/caddy/releases/tag/v2.8.4",
+				})
+			}))
+			defer server.Close()
 
-	curTime := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
-	checker := NewReleaseChecker(
-		WithBaseURL(server.URL),
-		WithHTTPClient(server.Client()),
-		WithTTL(1*time.Hour),
-		WithTimeFunc(func() time.Time { return curTime }),
-	)
+			curTime := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
+			checker := NewReleaseChecker(
+				WithBaseURL(server.URL),
+				WithHTTPClient(server.Client()),
+				WithTTL(1*time.Hour),
+				WithTimeFunc(func() time.Time { return curTime }),
+			)
 
-	ctx := context.Background()
+			ctx := context.Background()
+			status, err := checker.CheckEngine(ctx, EngineCaddy, "v2.8.0")
+			if err != nil || status.LatestVersion != "v2.8.4" {
+				t.Fatalf("initial check failed: %v", err)
+			}
 
-	// Initial fetch
-	status, err := checker.CheckEngine(ctx, EngineCaddy, "v2.8.0")
-	if err != nil {
-		t.Fatalf("initial check failed: %v", err)
-	}
-	if status.LatestVersion != "v2.8.4" {
-		t.Fatalf("expected latest version v2.8.4, got %q", status.LatestVersion)
-	}
-
-	// Simulate rate limit 403 on expired cache
-	curTime = curTime.Add(2 * time.Hour)
-	statusCode = http.StatusForbidden
-
-	fallbackStatus, err := checker.CheckEngine(ctx, EngineCaddy, "v2.8.0")
-	if err != nil {
-		t.Fatalf("expected fallback to succeed on 403, got error: %v", err)
-	}
-	if fallbackStatus.LatestVersion != "v2.8.4" {
-		t.Errorf("expected fallback to return cached version v2.8.4, got %q", fallbackStatus.LatestVersion)
-	}
-}
-
-func TestCheckEngine_RateLimit_429_Fallback(t *testing.T) {
-	statusCode := http.StatusOK
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if statusCode != http.StatusOK {
-			w.WriteHeader(statusCode)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		resp := githubReleaseResponse{
-			TagName: "v1.12.0",
-			HTMLURL: "https://github.com/SagerNet/sing-box/releases/tag/v1.12.0",
-		}
-		_ = json.NewEncoder(w).Encode(resp)
-	}))
-	defer server.Close()
-
-	curTime := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
-	checker := NewReleaseChecker(
-		WithBaseURL(server.URL),
-		WithHTTPClient(server.Client()),
-		WithTTL(1*time.Hour),
-		WithTimeFunc(func() time.Time { return curTime }),
-	)
-
-	ctx := context.Background()
-
-	// Initial fetch
-	status, err := checker.CheckEngine(ctx, EngineSingBox, "v1.11.0")
-	if err != nil {
-		t.Fatalf("initial check failed: %v", err)
-	}
-	if status.LatestVersion != "v1.12.0" {
-		t.Fatalf("expected latest version v1.12.0, got %q", status.LatestVersion)
-	}
-
-	// Simulate rate limit 429 on expired cache
-	curTime = curTime.Add(2 * time.Hour)
-	statusCode = http.StatusTooManyRequests
-
-	fallbackStatus, err := checker.CheckEngine(ctx, EngineSingBox, "v1.11.0")
-	if err != nil {
-		t.Fatalf("expected fallback to succeed on 429, got error: %v", err)
-	}
-	if fallbackStatus.LatestVersion != "v1.12.0" {
-		t.Errorf("expected fallback to return cached version v1.12.0, got %q", fallbackStatus.LatestVersion)
+			curTime = curTime.Add(2 * time.Hour)
+			statusCode = code
+			fallbackStatus, err := checker.CheckEngine(ctx, EngineCaddy, "v2.8.0")
+			if err != nil {
+				t.Fatalf("expected fallback to succeed on %d, got: %v", code, err)
+			}
+			if fallbackStatus.LatestVersion != "v2.8.4" {
+				t.Errorf("expected cached version v2.8.4, got %q", fallbackStatus.LatestVersion)
+			}
+		})
 	}
 }
 
@@ -644,4 +557,322 @@ func TestReleaseChecker_AdditionalOptionsAndErrors(t *testing.T) {
 			t.Fatal("expected error on empty tag_name, got nil")
 		}
 	})
+}
+
+func TestCheckEngine_ProfileAwareness(t *testing.T) {
+	tests := []struct {
+		name              string
+		engine            EngineType
+		installed         string
+		upstreamTag       string
+		profile           string
+		wantUpstreamNewer bool
+		wantCompatible    bool
+		wantUpdate        bool
+	}{
+		{name: "xray legacy with 26.10 breaking", engine: EngineXray, installed: "v1.8.24", upstreamTag: "v26.10.31", profile: "legacy", wantUpstreamNewer: true, wantCompatible: false, wantUpdate: false},
+		{name: "xray legacy with 1.8 compatible", engine: EngineXray, installed: "v1.8.24", upstreamTag: "v1.8.25", profile: "legacy", wantUpstreamNewer: true, wantCompatible: true, wantUpdate: true},
+		{name: "xray modern_pq with 26.10 newer", engine: EngineXray, installed: "v26.10.29", upstreamTag: "v26.10.31", profile: "modern_pq", wantUpstreamNewer: true, wantCompatible: true, wantUpdate: true},
+		{name: "xray modern_pq with legacy downgrade", engine: EngineXray, installed: "v26.10.29", upstreamTag: "v1.8.24", profile: "modern_pq", wantUpstreamNewer: false, wantCompatible: true, wantUpdate: false},
+		{name: "xray unprofiled defaults compatible", engine: EngineXray, installed: "v1.8.24", upstreamTag: "v26.10.31", profile: "", wantUpstreamNewer: true, wantCompatible: true, wantUpdate: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(githubReleaseResponse{
+					TagName: tt.upstreamTag,
+					HTMLURL: "https://example.com/tag/" + tt.upstreamTag,
+				})
+			}))
+			defer server.Close()
+
+			checker := NewReleaseChecker(WithBaseURL(server.URL), WithHTTPClient(server.Client()))
+
+			status, err := checker.CheckEngineWithProfile(context.Background(), tt.engine, tt.installed, tt.profile)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if status.UpstreamNewer != tt.wantUpstreamNewer {
+				t.Errorf("UpstreamNewer = %v, want %v", status.UpstreamNewer, tt.wantUpstreamNewer)
+			}
+			if status.UpgradeCompatible != tt.wantCompatible {
+				t.Errorf("UpgradeCompatible = %v, want %v", status.UpgradeCompatible, tt.wantCompatible)
+			}
+			if status.UpdateAvailable != tt.wantUpdate {
+				t.Errorf("UpdateAvailable = %v, want %v", status.UpdateAvailable, tt.wantUpdate)
+			}
+			if status.Channel != tt.profile {
+				t.Errorf("Channel = %q, want %q", status.Channel, tt.profile)
+			}
+		})
+	}
+}
+
+func TestCheckEngine_ComponentSeparation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/klzgrad/naiveproxy/releases/latest":
+			_ = json.NewEncoder(w).Encode(githubReleaseResponse{TagName: "v154.0.8037.49-5"})
+		case "/repos/caddyserver/caddy/releases/latest":
+			_ = json.NewEncoder(w).Encode(githubReleaseResponse{TagName: "v2.8.4"})
+		case "/repos/klzgrad/forwardproxy/releases/latest":
+			_ = json.NewEncoder(w).Encode(githubReleaseResponse{TagName: "v2.11.7-naive2"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	checker := NewReleaseChecker(WithBaseURL(server.URL), WithHTTPClient(server.Client()))
+	ctx := context.Background()
+
+	// 1. Naive Client
+	sClient, err := checker.CheckEngine(ctx, EngineNaiveClient, "v154.0.8037.49-1")
+	if err != nil || sClient.LatestVersion != "v154.0.8037.49-5" || sClient.Protocol != "naive" {
+		t.Fatalf("EngineNaiveClient failed: %+v, err: %v", sClient, err)
+	}
+
+	// 2. Caddy Core
+	sCaddy, err := checker.CheckEngine(ctx, EngineCaddyCore, "v2.8.0")
+	if err != nil || sCaddy.LatestVersion != "v2.8.4" || sCaddy.Protocol != "caddy" {
+		t.Fatalf("EngineCaddyCore failed: %+v, err: %v", sCaddy, err)
+	}
+
+	// 3. Naive ForwardProxy Plugin
+	sPlugin, err := checker.CheckEngine(ctx, EngineNaiveForwardProxy, "v2.11.7-naive1")
+	if err != nil || sPlugin.LatestVersion != "v2.11.7-naive2" || sPlugin.Protocol != "naive" {
+		t.Fatalf("EngineNaiveForwardProxy failed: %+v, err: %v", sPlugin, err)
+	}
+}
+
+func TestCheckEngine_RateLimitBackoffSchedule(t *testing.T) {
+	var requestCount int64
+	statusCode := http.StatusOK
+	retryAfterVal := ""
+	resetVal := ""
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&requestCount, 1)
+		if statusCode != http.StatusOK {
+			if retryAfterVal != "" {
+				w.Header().Set("Retry-After", retryAfterVal)
+			}
+			if resetVal != "" {
+				w.Header().Set("X-RateLimit-Reset", resetVal)
+			}
+			w.WriteHeader(statusCode)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(githubReleaseResponse{
+			TagName: "v2.8.4",
+			HTMLURL: "https://example.com/caddy",
+		})
+	}))
+	defer server.Close()
+
+	now := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
+	var timeMu sync.Mutex
+	getTime := func() time.Time {
+		timeMu.Lock()
+		defer timeMu.Unlock()
+		return now
+	}
+	advanceTime := func(d time.Duration) {
+		timeMu.Lock()
+		defer timeMu.Unlock()
+		now = now.Add(d)
+	}
+
+	checker := NewReleaseChecker(
+		WithBaseURL(server.URL),
+		WithHTTPClient(server.Client()),
+		WithTTL(1*time.Hour),
+		WithTimeFunc(getTime),
+	)
+	ctx := context.Background()
+
+	// 1. Initial successful fetch
+	initialStatus, err := checker.CheckEngine(ctx, EngineCaddy, "v2.8.0")
+	if err != nil || initialStatus.LatestVersion != "v2.8.4" {
+		t.Fatalf("initial fetch failed: %+v, err: %v", initialStatus, err)
+	}
+	if initialStatus.IsStale {
+		t.Error("expected fresh status initially")
+	}
+	firstCheckedAt := initialStatus.CheckedAt
+	if atomic.LoadInt64(&requestCount) != 1 {
+		t.Fatalf("expected 1 request, got %d", atomic.LoadInt64(&requestCount))
+	}
+
+	// 2. Expire cache and encounter 429 with Retry-After: 600 (10 minutes)
+	advanceTime(2 * time.Hour)
+	statusCode = http.StatusTooManyRequests
+	retryAfterVal = "600"
+
+	fallbackStatus, err := checker.CheckEngine(ctx, EngineCaddy, "v2.8.0")
+	if err != nil {
+		t.Fatalf("expected fallback on 429, got error: %v", err)
+	}
+	if !fallbackStatus.IsStale {
+		t.Error("expected IsStale = true on rate limit fallback")
+	}
+	if fallbackStatus.CheckedAt != firstCheckedAt {
+		t.Errorf("CheckedAt should retain initial contact time %v, got %v", firstCheckedAt, fallbackStatus.CheckedAt)
+	}
+	if fallbackStatus.RequestedAt != getTime() {
+		t.Errorf("RequestedAt should be current call time %v, got %v", getTime(), fallbackStatus.RequestedAt)
+	}
+	if atomic.LoadInt64(&requestCount) != 2 {
+		t.Fatalf("expected 2 requests, got %d", atomic.LoadInt64(&requestCount))
+	}
+
+	expectedNextRetry := getTime().Add(600 * time.Second)
+	if nextRetry := checker.NextRetryAt(EngineCaddy); !nextRetry.Equal(expectedNextRetry) {
+		t.Errorf("NextRetryAt = %v, want %v", nextRetry, expectedNextRetry)
+	}
+
+	// Verify maximum backoff capping at 1 hour for large Retry-After
+	retryAfterVal = "86400"
+	_ = calculateNextRetry(&http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Retry-After": []string{"86400"}},
+	}, getTime())
+	if capped := calculateNextRetry(&http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Retry-After": []string{"86400"}},
+	}, getTime()); !capped.Equal(getTime().Add(1 * time.Hour)) {
+		t.Errorf("expected backoff capped at 1h, got %v", capped)
+	}
+
+	// 3. Repeated call during backoff (e.g. 3 minutes later) MUST NOT hit GitHub
+	advanceTime(3 * time.Minute)
+	backoffStatus, err := checker.CheckEngine(ctx, EngineCaddy, "v2.8.0")
+	if err != nil {
+		t.Fatalf("expected cached release during backoff, got error: %v", err)
+	}
+	if !backoffStatus.IsStale {
+		t.Error("expected IsStale = true during backoff")
+	}
+	if atomic.LoadInt64(&requestCount) != 2 {
+		t.Fatalf("request count should NOT increment during active backoff, got %d", atomic.LoadInt64(&requestCount))
+	}
+
+	// 4. Advance time past backoff schedule (8 minutes later, total 11 minutes > 10m backoff)
+	// Server recovers with 200 OK
+	advanceTime(8 * time.Minute)
+	statusCode = http.StatusOK
+	recoveredStatus, err := checker.CheckEngine(ctx, EngineCaddy, "v2.8.0")
+	if err != nil {
+		t.Fatalf("expected success after backoff elapsed, got error: %v", err)
+	}
+	if recoveredStatus.IsStale {
+		t.Error("expected fresh status after recovery")
+	}
+	if atomic.LoadInt64(&requestCount) != 3 {
+		t.Fatalf("expected request count 3 after backoff recovery, got %d", atomic.LoadInt64(&requestCount))
+	}
+	if !checker.NextRetryAt(EngineCaddy).IsZero() {
+		t.Errorf("NextRetryAt should be reset after successful contact, got %v", checker.NextRetryAt(EngineCaddy))
+	}
+}
+
+func TestReleaseChecker_SingleflightCancellationDecoupled(t *testing.T) {
+	inFlight := make(chan struct{})
+	releaseBlock := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-inFlight:
+		default:
+			close(inFlight)
+		}
+		<-releaseBlock
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(githubReleaseResponse{
+			TagName: "v26.10.31",
+			HTMLURL: "https://example.com/xray",
+		})
+	}))
+	defer server.Close()
+
+	checker := NewReleaseChecker(
+		WithBaseURL(server.URL),
+		WithHTTPClient(server.Client()),
+		WithTTL(1*time.Hour),
+	)
+
+	ctxA, cancelA := context.WithCancel(context.Background())
+	ctxB, cancelB := context.WithCancel(context.Background())
+	defer cancelB()
+
+	var wg sync.WaitGroup
+	var errA, errB error
+	var resB ReleaseInfo
+
+	// Caller A starts request
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, errA = checker.GetLatestRelease(ctxA, EngineXray)
+	}()
+
+	<-inFlight
+
+	// Caller B joins singleflight for the same engine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resB, errB = checker.GetLatestRelease(ctxB, EngineXray)
+	}()
+
+	// Cancel Caller A while in-flight
+	time.Sleep(20 * time.Millisecond)
+	cancelA()
+
+	// Unblock server response
+	close(releaseBlock)
+	wg.Wait()
+
+	if !errors.Is(errA, context.Canceled) {
+		t.Errorf("expected caller A to receive context.Canceled, got: %v", errA)
+	}
+	if errB != nil {
+		t.Errorf("expected caller B to succeed despite caller A cancellation, got: %v", errB)
+	}
+	if resB.Version != "v26.10.31" {
+		t.Errorf("expected caller B to receive v26.10.31, got: %q", resB.Version)
+	}
+}
+
+func TestCheckEngine_UnknownInstalledVersion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(githubReleaseResponse{
+			TagName: "v1.8.25",
+			HTMLURL: "https://example.com/xray",
+		})
+	}))
+	defer server.Close()
+
+	checker := NewReleaseChecker(WithBaseURL(server.URL), WithHTTPClient(server.Client()))
+
+	for _, invalid := range []string{"", "   ", "unknown", "invalid.version.tag"} {
+		status, err := checker.CheckEngine(context.Background(), EngineXray, invalid)
+		if err != nil {
+			t.Fatalf("unexpected error for %q: %v", invalid, err)
+		}
+		if status.Status != UpdateUnknown {
+			t.Errorf("for %q: Status = %q, want %q", invalid, status.Status, UpdateUnknown)
+		}
+		if status.UpdateAvailable {
+			t.Errorf("for %q: UpdateAvailable should be false", invalid)
+		}
+		if status.UpstreamNewer {
+			t.Errorf("for %q: UpstreamNewer should be false", invalid)
+		}
+	}
 }

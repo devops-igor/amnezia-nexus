@@ -180,20 +180,7 @@ func comparePrereleases(p1, p2 string) int {
 			return 1
 		}
 
-		// Both are alphanumeric: check for common prefix followed by integer (e.g. rc1 vs rc2)
-		prefix1, num1, ok1 := splitAlphaNumeric(id1)
-		prefix2, num2, ok2 := splitAlphaNumeric(id2)
-		if ok1 && ok2 && prefix1 == prefix2 {
-			if num1 < num2 {
-				return -1
-			}
-			if num1 > num2 {
-				return 1
-			}
-			continue
-		}
-
-		// Lexical comparison in ASCII order
+		// Lexical comparison in ASCII order per SemVer 2.0.0
 		if id1 < id2 {
 			return -1
 		}
@@ -208,27 +195,6 @@ func comparePrereleases(p1, p2 string) int {
 		return 1
 	}
 	return 0
-}
-
-// splitAlphaNumeric splits a string into an alphabetical prefix and integer suffix (e.g. "rc1" -> "rc", 1, true).
-func splitAlphaNumeric(s string) (string, int, bool) {
-	i := 0
-	for i < len(s) && (s[i] < '0' || s[i] > '9') {
-		i++
-	}
-	if i == 0 || i == len(s) {
-		return "", 0, false
-	}
-	for j := i; j < len(s); j++ {
-		if s[j] < '0' || s[j] > '9' {
-			return "", 0, false
-		}
-	}
-	num, err := strconv.Atoi(s[i:])
-	if err != nil {
-		return "", 0, false
-	}
-	return s[:i], num, true
 }
 
 // Compare parses and compares two version strings.
@@ -250,16 +216,42 @@ func Compare(raw1, raw2 string) (int, error) {
 	return CompareVersions(v1, v2), nil
 }
 
-// IsUpdateAvailable returns true if latest is strictly newer than installed.
-// It returns false on malformed installed versions or if installed >= latest.
-func IsUpdateAvailable(installed, latest string) bool {
+// UpdateStatus represents the status of an update check.
+type UpdateStatus string
+
+const (
+	UpdateAvailable UpdateStatus = "available"
+	UpdateUpToDate  UpdateStatus = "up_to_date"
+	UpdateUnknown   UpdateStatus = "unknown"
+
+	// VersionStatus aliases for consistency with review specifications.
+	VersionStatusUnknown   = UpdateUnknown
+	VersionStatusAvailable = UpdateAvailable
+	VersionStatusUpToDate  = UpdateUpToDate
+)
+
+// CheckUpdateStatus evaluates whether an update is available between installed and latest versions.
+// If installed is empty or unparseable, it returns UpdateUnknown.
+// If latest is empty or unparseable, it returns UpdateUnknown.
+// If latest is newer than installed, it returns UpdateAvailable.
+// If installed >= latest, it returns UpdateUpToDate.
+func CheckUpdateStatus(installed, latest string) UpdateStatus {
 	vInst, err := ParseVersion(installed)
 	if err != nil {
-		return false
+		return UpdateUnknown
 	}
 	vLat, err := ParseVersion(latest)
 	if err != nil {
-		return false
+		return UpdateUnknown
 	}
-	return CompareVersions(vInst, vLat) < 0
+	if CompareVersions(vInst, vLat) < 0 {
+		return UpdateAvailable
+	}
+	return UpdateUpToDate
+}
+
+// IsUpdateAvailable returns true if latest is strictly newer than installed.
+// It returns false on malformed installed versions or if installed >= latest.
+func IsUpdateAvailable(installed, latest string) bool {
+	return CheckUpdateStatus(installed, latest) == UpdateAvailable
 }
