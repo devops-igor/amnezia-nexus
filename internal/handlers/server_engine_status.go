@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -12,13 +13,36 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
-var bgReleaseWarmGroup singleflight.Group
+var (
+	bgReleaseWarmGroup    singleflight.Group
+	bgReleaseWarmMu       sync.Mutex
+	bgReleaseWarmInFlight = make(map[updater.EngineType]bool)
+)
 
 func (h *Handlers) triggerBackgroundReleaseWarm(checker *updater.ReleaseChecker, engine updater.EngineType) {
 	if checker == nil {
 		return
 	}
+	nextRetry := checker.NextRetryAt(engine)
+	if !nextRetry.IsZero() && time.Now().Before(nextRetry) {
+		return
+	}
+
+	bgReleaseWarmMu.Lock()
+	if bgReleaseWarmInFlight[engine] {
+		bgReleaseWarmMu.Unlock()
+		return
+	}
+	bgReleaseWarmInFlight[engine] = true
+	bgReleaseWarmMu.Unlock()
+
 	go func() {
+		defer func() {
+			bgReleaseWarmMu.Lock()
+			delete(bgReleaseWarmInFlight, engine)
+			bgReleaseWarmMu.Unlock()
+		}()
+
 		key := string(engine)
 		_, _, _ = bgReleaseWarmGroup.Do(key, func() (any, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -391,7 +415,7 @@ func getInstalledProtocolMetadata(protocols map[string]any, protocol string) (ma
 
 func extractXrayProfile(meta map[string]any) string {
 	if meta == nil {
-		return "legacy"
+		return ""
 	}
 	for _, key := range []string{"engine_profile", "engineProfile", "profile"} {
 		if p, ok := meta[key].(string); ok && strings.TrimSpace(p) != "" {
@@ -413,7 +437,7 @@ func extractXrayProfile(meta map[string]any) string {
 			}
 		}
 	}
-	return "legacy"
+	return ""
 }
 
 func extractXrayVersion(meta map[string]any, _ ...string) string {

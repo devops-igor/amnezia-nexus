@@ -339,7 +339,7 @@ func (m *NaiveManager) buildAndLaunchContainer(ctx context.Context, client ssh.S
 	return nil
 }
 
-func determineRunningCaddyVersion(ctx context.Context, client ssh.SSHClient, defaultVersion string) string {
+func determineRunningCaddyVersion(ctx context.Context, client ssh.SSHClient) string {
 	verCmd := fmt.Sprintf("docker exec %s caddy version 2>/dev/null", ssh.EscapeShellArg(NaiveContainerName))
 	if verOut, _, code, err := client.RunSudoCommand(ctx, verCmd); err == nil && code == 0 && strings.TrimSpace(verOut) != "" {
 		fields := strings.Fields(strings.TrimSpace(verOut))
@@ -350,7 +350,7 @@ func determineRunningCaddyVersion(ctx context.Context, client ssh.SSHClient, def
 			}
 		}
 	}
-	return defaultVersion
+	return ""
 }
 
 // Install configures Caddy forward_proxy, deploys the decoy website, and launches amnezia-caddy.
@@ -411,16 +411,8 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 		return err
 	}
 
-	caddyVer := "2.8.4"
-	if cv, ok := params["caddy_version"].(string); ok && strings.TrimSpace(cv) != "" {
-		caddyVer = strings.TrimSpace(cv)
-	}
-	caddyVer = determineRunningCaddyVersion(ctx, client, caddyVer)
-
+	caddyVer := determineRunningCaddyVersion(ctx, client)
 	pluginVer := "v2.11.7-naive"
-	if pv, ok := params["plugin_version"].(string); ok && strings.TrimSpace(pv) != "" {
-		pluginVer = strings.TrimSpace(pv)
-	}
 
 	// Update server.Protocols in-memory
 	if server.Protocols == nil {
@@ -433,7 +425,11 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 	protoMeta["installed"] = true
 	protoMeta["port"] = port
 	protoMeta["domain"] = domain
-	protoMeta["caddy_version"] = caddyVer
+	if caddyVer != "" {
+		protoMeta["caddy_version"] = caddyVer
+	} else {
+		delete(protoMeta, "caddy_version")
+	}
 	protoMeta["plugin_version"] = pluginVer
 	server.Protocols[models.ProtocolNaive] = protoMeta
 
