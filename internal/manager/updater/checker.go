@@ -86,6 +86,7 @@ type cacheEntry struct {
 	fetchedAt   time.Time
 	nextRetryAt time.Time
 	isStale     bool
+	hasRelease  bool
 }
 
 // githubReleaseResponse represents GitHub's release endpoint JSON payload.
@@ -221,7 +222,7 @@ func (r *ReleaseChecker) GetCachedRelease(engine EngineType) (ReleaseInfo, bool)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	entry, ok := r.cache[engine]
-	if !ok {
+	if !ok || !entry.hasRelease || entry.release.Version == "" {
 		return ReleaseInfo{}, false
 	}
 	return entry.release, true
@@ -244,6 +245,7 @@ func (r *ReleaseChecker) SetCachedRelease(engine EngineType, info ReleaseInfo, e
 		fetchedAt:   r.now(),
 		nextRetryAt: time.Time{},
 		isStale:     false,
+		hasRelease:  info.Version != "",
 	}
 }
 
@@ -296,6 +298,10 @@ func (r *ReleaseChecker) CheckEngine(ctx context.Context, engine EngineType, ins
 	r.mu.RLock()
 	entry := r.cache[engine]
 	r.mu.RUnlock()
+
+	if info.Version == "" || !entry.hasRelease {
+		return EngineStatus{}, fmt.Errorf("no valid release version available for %s", engine)
+	}
 
 	checkedAt := entry.fetchedAt
 	if checkedAt.IsZero() {
@@ -389,14 +395,15 @@ func (r *ReleaseChecker) GetLatestRelease(ctx context.Context, engine EngineType
 	r.mu.RUnlock()
 
 	if exists {
-		if now.Sub(entry.fetchedAt) < r.ttl {
-			return entry.release, nil
-		}
-		if !entry.nextRetryAt.IsZero() && now.Before(entry.nextRetryAt) {
-			if entry.release.Version != "" {
+		if entry.hasRelease && entry.release.Version != "" {
+			if now.Sub(entry.fetchedAt) < r.ttl {
 				return entry.release, nil
 			}
-			return ReleaseInfo{}, fmt.Errorf("upstream rate limit backoff active for %s until %s", engine, entry.nextRetryAt)
+			if !entry.nextRetryAt.IsZero() && now.Before(entry.nextRetryAt) {
+				return entry.release, nil
+			}
+		} else if !entry.nextRetryAt.IsZero() && now.Before(entry.nextRetryAt) {
+			return ReleaseInfo{}, fmt.Errorf("upstream release check rate-limited or unavailable; retry after %s", entry.nextRetryAt)
 		}
 	}
 
@@ -410,21 +417,27 @@ func (r *ReleaseChecker) GetLatestRelease(ctx context.Context, engine EngineType
 
 		innerNow := r.now()
 		if innerExists {
-			if innerNow.Sub(innerEntry.fetchedAt) < r.ttl {
-				return innerEntry.release, nil
-			}
-			if !innerEntry.nextRetryAt.IsZero() && innerNow.Before(innerEntry.nextRetryAt) {
-				if innerEntry.release.Version != "" {
+			if innerEntry.hasRelease && innerEntry.release.Version != "" {
+				if innerNow.Sub(innerEntry.fetchedAt) < r.ttl {
 					return innerEntry.release, nil
 				}
-				return ReleaseInfo{}, fmt.Errorf("upstream rate limit backoff active for %s until %s", engine, innerEntry.nextRetryAt)
+				if !innerEntry.nextRetryAt.IsZero() && innerNow.Before(innerEntry.nextRetryAt) {
+					return innerEntry.release, nil
+				}
+			} else if !innerEntry.nextRetryAt.IsZero() && innerNow.Before(innerEntry.nextRetryAt) {
+				return ReleaseInfo{}, fmt.Errorf("upstream release check rate-limited or unavailable; retry after %s", innerEntry.nextRetryAt)
 			}
 		}
 
 		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer fetchCancel()
 
-		return r.fetchRelease(fetchCtx, engine, repo, innerEntry.etag, innerExists, innerEntry.release)
+		hasValidCached := innerExists && innerEntry.hasRelease && innerEntry.release.Version != ""
+		etag := innerEntry.etag
+		if !hasValidCached {
+			etag = ""
+		}
+		return r.fetchRelease(fetchCtx, engine, repo, etag, hasValidCached, innerEntry.release)
 	})
 
 	select {
@@ -447,6 +460,7 @@ func (r *ReleaseChecker) fetchRelease(
 	hasCached bool,
 	cachedRelease ReleaseInfo,
 ) (ReleaseInfo, error) {
+	hasCached = hasCached && cachedRelease.Version != ""
 	reqURL := fmt.Sprintf("%s/repos/%s/releases/latest", r.baseURL, repo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
@@ -485,6 +499,10 @@ func (r *ReleaseChecker) fetchRelease(
 	if resp.StatusCode == http.StatusNotModified {
 		r.mu.Lock()
 		entry := r.cache[engine]
+		if !entry.hasRelease || entry.release.Version == "" {
+			r.mu.Unlock()
+			return ReleaseInfo{}, fmt.Errorf("unexpected 304 Not Modified without cached release for %s", engine)
+		}
 		entry.fetchedAt = now
 		entry.nextRetryAt = time.Time{}
 		entry.isStale = false
@@ -566,6 +584,7 @@ func (r *ReleaseChecker) fetchRelease(
 			fetchedAt:   now,
 			nextRetryAt: time.Time{},
 			isStale:     false,
+			hasRelease:  true,
 		}
 		r.mu.Unlock()
 
