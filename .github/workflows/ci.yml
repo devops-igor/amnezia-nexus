@@ -114,7 +114,7 @@ jobs:
         run: |
           # Match guest paths and loopback so sibling Docker fixtures see test files/services.
           # The socket and /tmp belong to the isolated guest, never the physical host.
-          docker run --rm -i --user 0:0 --network host --cpus 4 --memory 6g \
+          docker run --rm -i --user 0:0 --network host --cpus 6 --memory 10g \
             --volume /var/run/docker.sock:/var/run/docker.sock \
             --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
             --volume /tmp:/tmp \
@@ -132,6 +132,8 @@ jobs:
           export GOPATH="$job_tmp/go" GOMODCACHE="$job_tmp/mod" GOCACHE="$job_tmp/cache"
           export npm_config_prefix="$job_tmp/npm"
           export PATH="$GOROOT/bin:$NODE_BIN:$GOPATH/bin:$npm_config_prefix/bin:$PATH"
+          export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+          export SSL_CERT_DIR=/etc/ssl/certs
           node --version
           npm install -g jsdom@29.1.1
           export NODE_PATH="$(npm root -g)"
@@ -149,7 +151,7 @@ jobs:
           )
           cp "$job_tmp/libgcc_s.so.1" /usr/lib/x86_64-linux-musl/libgcc_s.so.1
 
-          go test -race -cover -count=1 -coverprofile=coverage.out ./...
+          go test -p 2 -race -cover -count=1 -coverprofile=coverage.out ./...
           go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
           go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
           SCRIPT
