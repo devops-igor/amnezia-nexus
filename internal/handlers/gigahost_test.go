@@ -1,0 +1,545 @@
+package handlers
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
+	"github.com/go-chi/chi/v5"
+)
+
+// mockGigahostClient provides a configurable mock implementation of gigahost.Client.
+type mockGigahostClient struct {
+	getCatalogFn      func(ctx context.Context) ([]gigahost.HourlyPlan, error)
+	getProductsFn     func(ctx context.Context) ([]gigahost.Product, error)
+	getAccountFn      func(ctx context.Context) (*gigahost.AccountInfo, error)
+	orderServerFn     func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error)
+	orderServerSafeFn func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error)
+	getDeployStatusFn func(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error)
+	getServersFn      func(ctx context.Context) ([]gigahost.ServerInfo, error)
+}
+
+func (m *mockGigahostClient) GetCatalog(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+	if m.getCatalogFn != nil {
+		return m.getCatalogFn(ctx)
+	}
+	return nil, nil
+}
+
+func (m *mockGigahostClient) GetProducts(ctx context.Context) ([]gigahost.Product, error) {
+	if m.getProductsFn != nil {
+		return m.getProductsFn(ctx)
+	}
+	return nil, nil
+}
+
+func (m *mockGigahostClient) GetAccount(ctx context.Context) (*gigahost.AccountInfo, error) {
+	if m.getAccountFn != nil {
+		return m.getAccountFn(ctx)
+	}
+	return &gigahost.AccountInfo{Balance: 100.0, Currency: "NOK"}, nil
+}
+
+func (m *mockGigahostClient) OrderServer(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+	if m.orderServerFn != nil {
+		return m.orderServerFn(ctx, req)
+	}
+	return &gigahost.OrderResponse{OrderID: "ord_1", Status: gigahost.StatusPending}, nil
+}
+
+func (m *mockGigahostClient) OrderServerSafe(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+	if m.orderServerSafeFn != nil {
+		return m.orderServerSafeFn(ctx, req)
+	}
+	return &gigahost.OrderResponse{OrderID: "ord_1", Status: gigahost.StatusPending}, nil
+}
+
+func (m *mockGigahostClient) GetDeployStatus(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error) {
+	if m.getDeployStatusFn != nil {
+		return m.getDeployStatusFn(ctx, orderID)
+	}
+	return &gigahost.DeployStatusResponse{OrderID: orderID, Status: gigahost.StatusReady, AssignedIP: "192.0.2.1"}, nil
+}
+
+func (m *mockGigahostClient) GetServers(ctx context.Context) ([]gigahost.ServerInfo, error) {
+	if m.getServersFn != nil {
+		return m.getServersFn(ctx)
+	}
+	return nil, nil
+}
+
+func TestGigahostCatalogHandler_RBAC(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	mock := &mockGigahostClient{
+		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+			return []gigahost.HourlyPlan{
+				{ProductID: 1, Name: "VPS-Hourly", HourlyRateNOK: 0.12, Currency: "NOK"},
+			}, nil
+		},
+	}
+	h.SetGigahostClient(mock)
+
+	tests := []struct {
+		name         string
+		role         models.UserRole
+		auth         bool
+		expectedCode int
+	}{
+		{"Admin role allowed", models.RoleAdmin, true, http.StatusOK},
+		{"Support role forbidden", models.RoleSupport, true, http.StatusForbidden},
+		{"User role forbidden", models.RoleUser, true, http.StatusForbidden},
+		{"Unauthenticated forbidden", "", false, http.StatusForbidden},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/admin/hosting/gigahost/catalog", nil)
+			if tt.auth {
+				req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+					UserID: "user_test",
+					Role:   tt.role,
+				}))
+			}
+			w := httptest.NewRecorder()
+			h.GigahostCatalogHandler(w, req)
+
+			if w.Code != tt.expectedCode {
+				t.Errorf("expected code %d, got %d (body: %s)", tt.expectedCode, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestGigahostCatalogHandler_SuccessAndErrors(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+
+	t.Run("success returns plans and count", func(t *testing.T) {
+		h.SetGigahostClient(&mockGigahostClient{
+			getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+				return []gigahost.HourlyPlan{
+					{ProductID: 10, Name: "VPS Oslo", CPUCores: 2, RAMMB: 4096, DiskGB: 50, HourlyRateNOK: 0.25},
+				}, nil
+			},
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/hosting/gigahost/catalog", nil)
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostCatalogHandler(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", w.Code)
+		}
+
+		var resp struct {
+			Status string                `json:"status"`
+			Count  int                   `json:"count"`
+			Plans  []gigahost.HourlyPlan `json:"plans"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to parse json: %v", err)
+		}
+		if resp.Count != 1 || len(resp.Plans) != 1 || resp.Plans[0].ProductID != 10 {
+			t.Errorf("unexpected response: %+v", resp)
+		}
+	})
+
+	t.Run("rate limited upstream", func(t *testing.T) {
+		h.SetGigahostClient(&mockGigahostClient{
+			getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+				return nil, gigahost.ErrRateLimited
+			},
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/hosting/gigahost/catalog", nil)
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostCatalogHandler(w, req)
+
+		if w.Code != http.StatusTooManyRequests {
+			t.Errorf("expected 429, got %d", w.Code)
+		}
+	})
+
+	t.Run("unauthorized upstream", func(t *testing.T) {
+		h.SetGigahostClient(&mockGigahostClient{
+			getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+				return nil, gigahost.ErrUnauthorized
+			},
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/hosting/gigahost/catalog", nil)
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostCatalogHandler(w, req)
+
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("expected 502, got %d", w.Code)
+		}
+	})
+}
+
+func TestGigahostOrderHandler_RBAC(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	body, _ := json.Marshal(OrderServerPayload{
+		PID:            101,
+		PriceID:        1,
+		RegionID:       1,
+		OSID:           1,
+		HourlyPriceNOK: 0.15,
+	})
+
+	tests := []struct {
+		name         string
+		role         models.UserRole
+		auth         bool
+		expectedCode int
+	}{
+		{"Admin role allowed", models.RoleAdmin, true, http.StatusOK},
+		{"Support role forbidden", models.RoleSupport, true, http.StatusForbidden},
+		{"User role forbidden", models.RoleUser, true, http.StatusForbidden},
+		{"Unauthenticated forbidden", "", false, http.StatusForbidden},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h.SetGigahostClient(&mockGigahostClient{
+				getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+					return &gigahost.AccountInfo{Balance: 50.0}, nil
+				},
+				orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+					return &gigahost.OrderResponse{OrderID: "ord_rbac", Status: gigahost.StatusPending}, nil
+				},
+			})
+
+			req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", bytes.NewReader(body))
+			if tt.auth {
+				req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+					UserID: "user_test",
+					Role:   tt.role,
+				}))
+			}
+			w := httptest.NewRecorder()
+			h.GigahostOrderHandler(w, req)
+
+			if w.Code != tt.expectedCode {
+				t.Errorf("expected %d, got %d (body: %s)", tt.expectedCode, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestGigahostOrderHandler_AccountCreditPreCheck(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	var orderCalled bool
+
+	h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+			return &gigahost.AccountInfo{Balance: 0, Credit: 0}, nil
+		},
+		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			orderCalled = true
+			return &gigahost.OrderResponse{OrderID: "ord_should_not_call"}, nil
+		},
+	})
+
+	payload, _ := json.Marshal(OrderServerPayload{
+		PID:            101,
+		PriceID:        1,
+		RegionID:       1,
+		OSID:           1,
+		HourlyPriceNOK: 0.15,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", bytes.NewReader(payload))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	h.GigahostOrderHandler(w, req)
+
+	if w.Code != http.StatusPaymentRequired {
+		t.Fatalf("expected 402 Payment Required, got %d", w.Code)
+	}
+	if orderCalled {
+		t.Fatal("OrderServer must NOT be called when credit pre-check fails")
+	}
+}
+
+func TestGigahostOrderHandler_SuccessAndPersistence(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+
+	var sentReq gigahost.OrderRequest
+	h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+			return &gigahost.AccountInfo{Balance: 120.0, Currency: "NOK"}, nil
+		},
+		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			sentReq = req
+			return &gigahost.OrderResponse{
+				OrderID:   "ord_persist_123",
+				ServerID:  777,
+				Status:    gigahost.StatusPending,
+				Message:   "Deploying VPS",
+				CreatedAt: "2026-11-03T12:00:00Z",
+			}, nil
+		},
+	})
+
+	payload, _ := json.Marshal(OrderServerPayload{
+		PID:            201,
+		PriceID:        2,
+		RegionID:       1,
+		OSID:           3,
+		HourlyPriceNOK: 0.20,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", bytes.NewReader(payload))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	h.GigahostOrderHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	if sentReq.BillingPeriod != gigahost.BillingPeriodHourly {
+		t.Errorf("expected billing_period hourly, got %s", sentReq.BillingPeriod)
+	}
+	if sentReq.Quantity != 1 {
+		t.Errorf("expected quantity 1, got %d", sentReq.Quantity)
+	}
+
+	// Verify persistence in gigahost_orders database
+	orders, err := h.getGigahostOrders(context.Background())
+	if err != nil {
+		t.Fatalf("getGigahostOrders failed: %v", err)
+	}
+	if len(orders) != 1 {
+		t.Fatalf("expected 1 persistent order in database, got %d", len(orders))
+	}
+	o := orders[0]
+	if o.OrderID != "ord_persist_123" || o.ServerID != 777 || o.Status != gigahost.StatusPending {
+		t.Errorf("unexpected database record: %+v", o)
+	}
+	if o.HourlyPriceNOK != 0.20 {
+		t.Errorf("expected hourly price 0.20, got %f", o.HourlyPriceNOK)
+	}
+
+	// Query DB directly via SQL to verify raw schema
+	var count int
+	err = db.SQLDB().QueryRowContext(context.Background(), "SELECT count(*) FROM gigahost_orders WHERE order_id = 'ord_persist_123'").Scan(&count)
+	if err != nil || count != 1 {
+		t.Errorf("SQL verification failed: count=%d, err=%v", count, err)
+	}
+}
+
+func TestGigahostOrderHandler_TimeoutRecovery(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+
+	h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+			return &gigahost.AccountInfo{Balance: 50.0}, nil
+		},
+		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			return &gigahost.OrderResponse{
+				Status:  gigahost.StatusUnknown,
+				Message: "order timed out; marked unknown",
+			}, errors.New("timeout reached")
+		},
+	})
+
+	payload, _ := json.Marshal(OrderServerPayload{
+		PID:            301,
+		PriceID:        1,
+		RegionID:       1,
+		OSID:           1,
+		HourlyPriceNOK: 0.10,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", bytes.NewReader(payload))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	h.GigahostOrderHandler(w, req)
+
+	// When marked unknown due to timeout, handler returns 202 Accepted
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	orders, err := h.getGigahostOrders(context.Background())
+	if err != nil {
+		t.Fatalf("getGigahostOrders failed: %v", err)
+	}
+	if len(orders) == 0 || orders[0].Status != gigahost.StatusUnknown {
+		t.Fatalf("expected order saved with status 'unknown', got %+v", orders)
+	}
+}
+
+func TestGigahostOrdersHandler_ListAndRefresh(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+
+	// Save an initial pending order
+	record := &GigahostOrderRecord{
+		OrderID:        "ord_poll_1",
+		ServerID:       0,
+		Status:         gigahost.StatusPending,
+		PlanID:         100,
+		RegionID:       1,
+		HourlyPriceNOK: 0.15,
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+	}
+	_ = h.saveGigahostOrder(context.Background(), record)
+
+	// Client will report this order as ready with assigned IP
+	h.SetGigahostClient(&mockGigahostClient{
+		getDeployStatusFn: func(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error) {
+			if orderID == "ord_poll_1" {
+				return &gigahost.DeployStatusResponse{
+					OrderID:    orderID,
+					ServerID:   888,
+					Status:     gigahost.StatusReady,
+					AssignedIP: "198.51.100.77",
+				}, nil
+			}
+			return nil, errors.New("not found")
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/hosting/gigahost/orders", nil)
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	h.GigahostOrdersHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w.Code)
+	}
+
+	var resp struct {
+		Status string                `json:"status"`
+		Count  int                   `json:"count"`
+		Orders []GigahostOrderRecord `json:"orders"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp.Count != 1 || len(resp.Orders) != 1 {
+		t.Fatalf("expected 1 order, got %d", resp.Count)
+	}
+
+	o := resp.Orders[0]
+	if o.Status != gigahost.StatusReady {
+		t.Errorf("expected status refreshed to 'ready', got %s", o.Status)
+	}
+	if o.AssignedIP != "198.51.100.77" {
+		t.Errorf("expected assigned IP 198.51.100.77, got %s", o.AssignedIP)
+	}
+	if o.ServerID != 888 {
+		t.Errorf("expected server_id 888, got %d", o.ServerID)
+	}
+}
+
+func TestGigahostRouterEndpoints_Integration(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	r := chi.NewRouter()
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.RequireAdmin)
+		r.Get("/api/admin/hosting/gigahost/catalog", h.GigahostCatalogHandler)
+		r.Post("/api/admin/hosting/gigahost/order", h.GigahostOrderHandler)
+		r.Get("/api/admin/hosting/gigahost/orders", h.GigahostOrdersHandler)
+	})
+
+	h.SetGigahostClient(&mockGigahostClient{
+		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+			return []gigahost.HourlyPlan{{ProductID: 1, Name: "Test Plan"}}, nil
+		},
+	})
+
+	// 1. Unauthenticated request to /api/admin/hosting/gigahost/catalog -> 401
+	unauthReq := httptest.NewRequest(http.MethodGet, "/api/admin/hosting/gigahost/catalog", nil)
+	wUnauth := httptest.NewRecorder()
+	r.ServeHTTP(wUnauth, unauthReq)
+	if wUnauth.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated router request, got %d", wUnauth.Code)
+	}
+
+	// 2. Authenticated Admin request -> 200
+	adminReq := httptest.NewRequest(http.MethodGet, "/api/admin/hosting/gigahost/catalog", nil)
+	adminReq = adminReq.WithContext(middleware.WithSession(adminReq.Context(), &models.SessionData{
+		UserID: "admin_test",
+		Role:   models.RoleAdmin,
+	}))
+	wAdmin := httptest.NewRecorder()
+	r.ServeHTTP(wAdmin, adminReq)
+	if wAdmin.Code != http.StatusOK {
+		t.Errorf("expected 200 for admin router request, got %d", wAdmin.Code)
+	}
+}
+
+func TestGigahostOrderHandler_InvalidPayloads(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	h.SetGigahostClient(&mockGigahostClient{})
+
+	t.Run("malformed json body", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", bytes.NewReader([]byte("{invalid-json")))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostOrderHandler(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+
+	t.Run("non-positive params", func(t *testing.T) {
+		payload, _ := json.Marshal(OrderServerPayload{
+			PID:      0,
+			PriceID:  1,
+			RegionID: 1,
+			OSID:     1,
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", bytes.NewReader(payload))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostOrderHandler(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request, got %d", w.Code)
+		}
+	})
+}
+
+func TestGigahost_ClientResolution(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+
+	t.Run("unconfigured client returns error", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/hosting/gigahost/catalog", nil)
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostCatalogHandler(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 for unconfigured client, got %d", w.Code)
+		}
+	})
+
+	t.Run("client resolved from request header", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/hosting/gigahost/catalog", nil)
+		req.Header.Set("X-Gigahost-API-Key", "flux_live_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+		client, err := h.getGigahostClient(context.Background(), req)
+		if err != nil {
+			t.Fatalf("expected client to resolve from header, got err: %v", err)
+		}
+		if client == nil {
+			t.Fatal("expected non-nil client")
+		}
+	})
+}

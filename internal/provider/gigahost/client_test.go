@@ -81,11 +81,12 @@ func TestNewClient(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if c.baseURL != DefaultBaseURL {
-			t.Errorf("expected baseURL %q, got %q", DefaultBaseURL, c.baseURL)
+		cl := c.(*client)
+		if cl.baseURL != DefaultBaseURL {
+			t.Errorf("expected baseURL %q, got %q", DefaultBaseURL, cl.baseURL)
 		}
-		if c.httpClient.Timeout != 30*time.Second {
-			t.Errorf("expected default timeout 30s, got %v", c.httpClient.Timeout)
+		if cl.httpClient.Timeout != 30*time.Second {
+			t.Errorf("expected default timeout 30s, got %v", cl.httpClient.Timeout)
 		}
 	})
 
@@ -98,7 +99,8 @@ func TestNewClient(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if c.httpClient.Transport != customRT {
+		cl := c.(*client)
+		if cl.httpClient.Transport != customRT {
 			t.Errorf("expected custom transport to be set")
 		}
 	})
@@ -706,4 +708,3 @@ func TestClient_EdgeCasesAndFallbacks(t *testing.T) {
 		}
 	})
 }
-

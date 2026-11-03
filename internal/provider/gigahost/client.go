@@ -34,18 +34,18 @@ type Config struct {
 	Timeout    time.Duration
 }
 
-// GigahostClient implements Client using standard net/http.
-type GigahostClient struct {
+// client implements Client using standard net/http.
+type client struct {
 	baseURL    string
 	apiKey     string
 	httpClient *http.Client
 }
 
-// Ensure GigahostClient satisfies the Client interface.
-var _ Client = (*GigahostClient)(nil)
+// Ensure client satisfies the Client interface.
+var _ Client = (*client)(nil)
 
 // NewClient initializes and validates a new Gigahost API client.
-func NewClient(cfg Config) (*GigahostClient, error) {
+func NewClient(cfg Config) (Client, error) {
 	if err := ValidateAPIKey(cfg.APIKey); err != nil {
 		return nil, err
 	}
@@ -74,7 +74,7 @@ func NewClient(cfg Config) (*GigahostClient, error) {
 		httpClient.Transport = cfg.Transport
 	}
 
-	return &GigahostClient{
+	return &client{
 		baseURL:    baseURL,
 		apiKey:     cfg.APIKey,
 		httpClient: httpClient,
@@ -82,7 +82,7 @@ func NewClient(cfg Config) (*GigahostClient, error) {
 }
 
 // GetProducts queries the raw product catalog from GET /deploy/servers.
-func (c *GigahostClient) GetProducts(ctx context.Context) ([]Product, error) {
+func (c *client) GetProducts(ctx context.Context) ([]Product, error) {
 	var respData []byte
 	err := c.doRequest(ctx, http.MethodGet, "/deploy/servers", nil, &respData)
 	if err != nil {
@@ -97,7 +97,7 @@ func (c *GigahostClient) GetProducts(ctx context.Context) ([]Product, error) {
 }
 
 // GetCatalog queries available products and filters those supporting hourly billing.
-func (c *GigahostClient) GetCatalog(ctx context.Context) ([]HourlyPlan, error) {
+func (c *client) GetCatalog(ctx context.Context) ([]HourlyPlan, error) {
 	products, err := c.GetProducts(ctx)
 	if err != nil {
 		return nil, err
@@ -141,7 +141,7 @@ func (c *GigahostClient) GetCatalog(ctx context.Context) ([]HourlyPlan, error) {
 }
 
 // GetAccount queries account credit and balance via GET /account.
-func (c *GigahostClient) GetAccount(ctx context.Context) (*AccountInfo, error) {
+func (c *client) GetAccount(ctx context.Context) (*AccountInfo, error) {
 	var rawData []byte
 	err := c.doRequest(ctx, http.MethodGet, "/account", nil, &rawData)
 	if err != nil {
@@ -169,7 +169,7 @@ func (c *GigahostClient) GetAccount(ctx context.Context) (*AccountInfo, error) {
 }
 
 // OrderServer dispatches an hourly VPS order via POST /deploy/servers.
-func (c *GigahostClient) OrderServer(ctx context.Context, req OrderRequest) (*OrderResponse, error) {
+func (c *client) OrderServer(ctx context.Context, req OrderRequest) (*OrderResponse, error) {
 	if !strings.EqualFold(req.BillingPeriod, BillingPeriodHourly) {
 		return nil, fmt.Errorf("%w: got %q", ErrInvalidBillingPeriod, req.BillingPeriod)
 	}
@@ -213,7 +213,7 @@ func (c *GigahostClient) OrderServer(ctx context.Context, req OrderRequest) (*Or
 // OrderServerSafe executes an order with timeout safety and idempotency inspection.
 // If an order request times out or is severed by network partition, it checks GET /servers
 // before returning to avoid accidental duplicate orders.
-func (c *GigahostClient) OrderServerSafe(ctx context.Context, req OrderRequest) (*OrderResponse, error) {
+func (c *client) OrderServerSafe(ctx context.Context, req OrderRequest) (*OrderResponse, error) {
 	// 1. Pre-order inspection: verify if matching server exists already
 	existingServers, err := c.GetServers(ctx)
 	if err == nil {
@@ -267,7 +267,7 @@ func (c *GigahostClient) OrderServerSafe(ctx context.Context, req OrderRequest) 
 }
 
 // GetDeployStatus polls deployment progress via GET /deploy/status.
-func (c *GigahostClient) GetDeployStatus(ctx context.Context, orderID string) (*DeployStatusResponse, error) {
+func (c *client) GetDeployStatus(ctx context.Context, orderID string) (*DeployStatusResponse, error) {
 	if orderID == "" {
 		return nil, errors.New("order_id is required")
 	}
@@ -307,7 +307,7 @@ func (c *GigahostClient) GetDeployStatus(ctx context.Context, orderID string) (*
 }
 
 // GetServers queries active servers via GET /servers.
-func (c *GigahostClient) GetServers(ctx context.Context) ([]ServerInfo, error) {
+func (c *client) GetServers(ctx context.Context) ([]ServerInfo, error) {
 	var rawData []byte
 	err := c.doRequest(ctx, http.MethodGet, "/servers", nil, &rawData)
 	if err != nil {
@@ -323,7 +323,7 @@ func (c *GigahostClient) GetServers(ctx context.Context) ([]ServerInfo, error) {
 
 // doRequest performs an HTTP request, injects Authorization and Content-Type headers,
 // and decodes or returns the response body.
-func (c *GigahostClient) doRequest(ctx context.Context, method, path string, body any, target any) error {
+func (c *client) doRequest(ctx context.Context, method, path string, body any, target any) error {
 	fullURL := c.baseURL + path
 	var bodyReader io.Reader
 	if body != nil {

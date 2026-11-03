@@ -278,6 +278,11 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 		r.Use(middleware.RequireAdmin)
 		r.Post("/{server_id}/clear", h.ClearServerHandler)
 		r.Post("/api/settings/backup/restore", h.RestoreBackupHandler)
+		r.Route("/api/admin/hosting/gigahost", func(r chi.Router) {
+			r.Get("/catalog", h.GigahostCatalogHandler)
+			r.Post("/order", h.GigahostOrderHandler)
+			r.Get("/orders", h.GigahostOrdersHandler)
+		})
 	})
 
 	r.Group(func(r chi.Router) {
