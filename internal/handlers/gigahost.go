@@ -366,6 +366,85 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func planMonthlySpend(catalog []gigahost.HourlyPlan, pid int, fallbackHourly float64) float64 {
+	var rate float64
+	for _, p := range catalog {
+		if p.ProductID == pid {
+			if p.MonthlyCeiling > 0 {
+				rate = p.MonthlyCeiling
+			} else if p.HourlyRateNOK > 0 {
+				rate = p.HourlyRateNOK * 720
+			}
+			break
+		}
+	}
+	if rate == 0 && fallbackHourly > 0 {
+		rate = fallbackHourly * 720
+	}
+	return rate
+}
+
+func isServerActiveForBudget(status string) bool {
+	switch strings.ToLower(status) {
+	case gigahost.StatusReady, "active", gigahost.StatusDeploying, gigahost.StatusPending, gigahost.StatusWaiting, gigahost.StatusInstalling:
+		return true
+	default:
+		return false
+	}
+}
+
+func isOrderActiveForBudget(status string) bool {
+	switch strings.ToLower(status) {
+	case gigahost.StatusWaiting, gigahost.StatusDeploying, gigahost.StatusInstalling, gigahost.StatusUnknown, "pending_order", gigahost.StatusPending:
+		return true
+	default:
+		return false
+	}
+}
+
+func requestMonthlySpend(catalog []gigahost.HourlyPlan, req OrderServerPayload) float64 {
+	for _, p := range catalog {
+		if p.ProductID == req.PID && (req.PriceID == 0 || p.PriceID == req.PriceID) {
+			if p.MonthlyCeiling > 0 {
+				return p.MonthlyCeiling
+			} else if p.HourlyRateNOK > 0 {
+				return p.HourlyRateNOK * 720
+			}
+			break
+		}
+	}
+	if req.HourlyPriceNOK > 0 {
+		return req.HourlyPriceNOK * 720
+	}
+	return 0
+}
+
+func calculateCommittedSpend(catalog []gigahost.HourlyPlan, servers []gigahost.ServerInfo, localOrders []GigahostOrderRecord) float64 {
+	var committed float64
+	accountedOrders := make(map[string]bool)
+	for _, s := range servers {
+		if isServerActiveForBudget(s.Status) {
+			if s.OrderID != "" {
+				accountedOrders[s.OrderID] = true
+			}
+			committed += planMonthlySpend(catalog, s.PID, 0)
+		}
+	}
+
+	for _, o := range localOrders {
+		if isOrderActiveForBudget(o.Status) {
+			if o.OrderID != "" && accountedOrders[o.OrderID] {
+				continue
+			}
+			if o.OrderID != "" {
+				accountedOrders[o.OrderID] = true
+			}
+			committed += planMonthlySpend(catalog, o.PlanID, o.HourlyPriceNOK)
+		}
+	}
+	return committed
+}
+
 func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Client, req OrderServerPayload) error {
 	if h.db == nil {
 		return nil
@@ -383,41 +462,18 @@ func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Clien
 		return fmt.Errorf("failed to check catalog for budget verification: %w", catErr)
 	}
 
-	var planMonthlyRate float64
-	for _, p := range catalog {
-		if p.ProductID == req.PID && (req.PriceID == 0 || p.PriceID == req.PriceID) {
-			if p.MonthlyCeiling > 0 {
-				planMonthlyRate = p.MonthlyCeiling
-			} else if p.HourlyRateNOK > 0 {
-				planMonthlyRate = p.HourlyRateNOK * 720
-			}
-			break
-		}
-	}
-	if planMonthlyRate == 0 && req.HourlyPriceNOK > 0 {
-		planMonthlyRate = req.HourlyPriceNOK * 720
+	servers, srvErr := client.GetServers(ctx)
+	if srvErr != nil {
+		return fmt.Errorf("failed to check existing server inventory for budget verification: %w", srvErr)
 	}
 
-	var committed float64
-	servers, srvErr := client.GetServers(ctx)
-	if srvErr == nil {
-		for _, s := range servers {
-			if s.Status == gigahost.StatusReady || s.Status == "active" ||
-				s.Status == gigahost.StatusDeploying || s.Status == gigahost.StatusPending ||
-				s.Status == gigahost.StatusWaiting || s.Status == gigahost.StatusInstalling {
-				for _, p := range catalog {
-					if p.ProductID == s.PID {
-						if p.MonthlyCeiling > 0 {
-							committed += p.MonthlyCeiling
-						} else if p.HourlyRateNOK > 0 {
-							committed += p.HourlyRateNOK * 720
-						}
-						break
-					}
-				}
-			}
-		}
+	localOrders, ordErr := h.getGigahostOrders(ctx)
+	if ordErr != nil {
+		return fmt.Errorf("failed to check local orders for budget verification: %w", ordErr)
 	}
+
+	planMonthlyRate := requestMonthlySpend(catalog, req)
+	committed := calculateCommittedSpend(catalog, servers, localOrders)
 
 	if committed+planMonthlyRate > ghCfg.MonthlyBudgetNOK {
 		return fmt.Errorf("Monthly budget cap exceeded: requested order exceeds configured budget of %v NOK", ghCfg.MonthlyBudgetNOK)
