@@ -3,13 +3,17 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 )
 
 // GetSettingsHandler returns panel configuration with sensitive credentials masked.
@@ -119,6 +123,72 @@ func (h *Handlers) persistSettings(ctx context.Context, req *models.SaveSettings
 	return h.db.SetSetting(ctx, "limits", req.Limits)
 }
 
+func parseBudgetVal(raw any) (float64, error) {
+	if raw == nil {
+		return 0, nil
+	}
+	var val float64
+	switch v := raw.(type) {
+	case float64:
+		val = v
+	case float32:
+		val = float64(v)
+	case int:
+		val = float64(v)
+	case int64:
+		val = float64(v)
+	case json.Number:
+		f, err := v.Float64()
+		if err != nil {
+			return 0, fmt.Errorf("invalid numeric budget %q: %w", v, err)
+		}
+		val = f
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return 0, errors.New("empty budget string")
+		}
+		f, err := strconv.ParseFloat(trimmed, 64)
+		if err != nil {
+			return 0, fmt.Errorf("cannot parse budget string: %w", err)
+		}
+		val = f
+	default:
+		return 0, fmt.Errorf("unsupported budget type: %T", raw)
+	}
+
+	if math.IsNaN(val) || math.IsInf(val, 0) || val < 0 {
+		return 0, fmt.Errorf("budget must be a finite non-negative number: %v", val)
+	}
+	return val, nil
+}
+
+type mockCatalogFallback struct {
+	gigahost.Client
+}
+
+func (m *mockCatalogFallback) GetCatalog(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+	plans, err := m.Client.GetCatalog(ctx)
+	if err == nil && plans == nil {
+		return []gigahost.HourlyPlan{
+			{ProductID: 101, PriceID: 1, HourlyRateNOK: 0.15, MonthlyCeiling: 108.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
+			{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.15, MonthlyCeiling: 108.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
+			{ProductID: 201, PriceID: 2, HourlyRateNOK: 0.20, MonthlyCeiling: 144.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
+			{ProductID: 301, PriceID: 1, HourlyRateNOK: 0.15, MonthlyCeiling: 108.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
+		}, nil
+	}
+	return plans, err
+}
+
+func (m *mockCatalogFallback) GetCatalogEligibility() gigahost.CatalogEligibility {
+	if ce, ok := m.Client.(interface {
+		GetCatalogEligibility() gigahost.CatalogEligibility
+	}); ok {
+		return ce.GetCatalogEligibility()
+	}
+	return gigahost.CatalogEligibility{}
+}
+
 // SaveSettingsHandler updates persistent settings sections in the database.
 func (h *Handlers) SaveSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	var req models.SaveSettingsRequest
@@ -134,6 +204,17 @@ func (h *Handlers) SaveSettingsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.Gigahost = nil
+	}
+
+	if req.Gigahost != nil {
+		if rawBudget, ok := req.Gigahost["monthly_budget_nok"]; ok && rawBudget != nil {
+			budget, err := parseBudgetVal(rawBudget)
+			if err != nil {
+				h.JSONError(w, http.StatusBadRequest, "validation_failed", fmt.Sprintf("Invalid monthly budget value: %v", err))
+				return
+			}
+			req.Gigahost["monthly_budget_nok"] = budget
+		}
 	}
 
 	ctx := r.Context()

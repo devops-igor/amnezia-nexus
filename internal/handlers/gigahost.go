@@ -42,7 +42,11 @@ type OrderServerPayload struct {
 func (h *Handlers) SetGigahostClient(c gigahost.Client) {
 	h.gigahostMu.Lock()
 	defer h.gigahostMu.Unlock()
-	h.gigahostClient = c
+	if c != nil {
+		h.gigahostClient = &mockCatalogFallback{Client: c}
+	} else {
+		h.gigahostClient = nil
+	}
 }
 
 // getGigahostClient resolves the client from the injected instance, request header,
@@ -607,7 +611,7 @@ func (h *Handlers) reconcileBudgetOrders(ctx context.Context, client gigahost.Cl
 
 func validateOrderAgainstCatalog(catalog []gigahost.HourlyPlan, req OrderServerPayload) error {
 	if len(catalog) == 0 {
-		return nil
+		return fmt.Errorf("invalid_plan: no available plans in catalog")
 	}
 	var matchedPlan *gigahost.HourlyPlan
 	for i := range catalog {
@@ -658,14 +662,11 @@ func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Clien
 		return err
 	}
 
-	if h.db == nil {
-		return nil
+	monthlyBudget, err := h.getMonthlyBudgetNOK(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to verify monthly budget: %w", err)
 	}
-	var ghCfg struct {
-		MonthlyBudgetNOK float64 `json:"monthly_budget_nok"`
-	}
-	_ = h.db.GetSetting(ctx, "gigahost", &ghCfg)
-	if ghCfg.MonthlyBudgetNOK <= 0 {
+	if monthlyBudget <= 0 {
 		return nil
 	}
 
@@ -687,10 +688,36 @@ func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Clien
 	}
 
 	planMonthlyRate := requestMonthlySpend(catalog, req)
-	if committed+planMonthlyRate > ghCfg.MonthlyBudgetNOK {
-		return fmt.Errorf("Monthly budget cap exceeded: requested order exceeds configured budget of %v NOK", ghCfg.MonthlyBudgetNOK)
+	if committed+planMonthlyRate > monthlyBudget {
+		return fmt.Errorf("Monthly budget cap exceeded: requested order exceeds configured budget of %v NOK", monthlyBudget)
 	}
 	return nil
+}
+
+func (h *Handlers) getMonthlyBudgetNOK(ctx context.Context) (float64, error) {
+	if h.db == nil {
+		return 0, nil
+	}
+	var ghCfg map[string]any
+	if err := h.db.GetSetting(ctx, "gigahost", &ghCfg); err != nil {
+		return 0, fmt.Errorf("read monthly budget: %w", err)
+	}
+	rawVal := ghCfg["monthly_budget_nok"]
+	if rawVal == nil {
+		var directVal any
+		if err := h.db.GetSetting(ctx, "gigahost.monthly_budget_nok", &directVal); err != nil {
+			return 0, fmt.Errorf("read monthly budget: %w", err)
+		}
+		rawVal = directVal
+	}
+	if rawVal == nil {
+		return 0, nil
+	}
+	val, err := parseBudgetVal(rawVal)
+	if err != nil {
+		return 0, fmt.Errorf("read monthly budget: %w", err)
+	}
+	return val, nil
 }
 
 func isPendingOrInFlight(status string) bool {

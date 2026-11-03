@@ -451,3 +451,318 @@ func TestReconcilePendingUnknownOrders_FailsClosedOnDBError(t *testing.T) {
 		t.Logf("handler returned code %d (body: %s)", w.Code, w.Body.String())
 	}
 }
+
+// TestGigahostOrderHandler_NumericStringBudgetEnforced verifies [HIGH] R10-H1:
+// Numeric string budgets like "100" are decoded flexibly and enforced (never treated as disabled/0).
+func TestGigahostOrderHandler_NumericStringBudgetEnforced(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+
+	// Configure budget as numeric string "100"
+	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": "100"}); err != nil {
+		t.Fatal(err)
+	}
+
+	budget, err := h.getMonthlyBudgetNOK(ctx)
+	if err != nil {
+		t.Fatalf("expected successful decode of numeric string budget, got error: %v", err)
+	}
+	if budget != 100.0 {
+		t.Fatalf("expected decoded budget to be 100.0, got %v", budget)
+	}
+
+	catalog := []gigahost.HourlyPlan{
+		{
+			ProductID:      101,
+			PriceID:        555,
+			Name:           "Plan 180 NOK",
+			HourlyRateNOK:  0.25,
+			MonthlyCeiling: 180.0,
+			InStock:        true,
+			Regions:        []gigahost.Region{{ID: 1, Available: true}},
+		},
+		{
+			ProductID:      102,
+			PriceID:        556,
+			Name:           "Plan 50 NOK",
+			HourlyRateNOK:  0.0694,
+			MonthlyCeiling: 50.0,
+			InStock:        true,
+			Regions:        []gigahost.Region{{ID: 1, Available: true}},
+		},
+	}
+
+	var posts atomic.Int32
+	h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+			return &gigahost.AccountInfo{Balance: 500.0, Currency: "NOK"}, nil
+		},
+		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+			return catalog, nil
+		},
+		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
+			return []gigahost.ServerInfo{}, nil
+		},
+		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			posts.Add(1)
+			return &gigahost.OrderResponse{
+				OrderID: "ord_ok",
+				Status:  gigahost.StatusPending,
+			}, nil
+		},
+	})
+
+	sendOrder := func(pid, priceID int, hourlyPrice float64) *httptest.ResponseRecorder {
+		payload, _ := json.Marshal(OrderServerPayload{
+			PID:            pid,
+			PriceID:        priceID,
+			RegionID:       1,
+			OSID:           1,
+			HourlyPriceNOK: hourlyPrice,
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", bytes.NewReader(payload))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostOrderHandler(w, req)
+		return w
+	}
+
+	// 1. Order Plan 101 costing 180 NOK/month against 100 NOK budget -> must be rejected with 400
+	w1 := sendOrder(101, 555, 0.25)
+	if w1.Code != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 for order exceeding string-configured budget, got %d (body: %s)", w1.Code, w1.Body.String())
+	}
+	if !strings.Contains(w1.Body.String(), "Monthly budget cap exceeded") {
+		t.Errorf("expected budget exceeded message, got %s", w1.Body.String())
+	}
+	if posts.Load() != 0 {
+		t.Errorf("expected 0 provider posts for exceeded budget, got %d", posts.Load())
+	}
+
+	// 2. Order Plan 102 costing 50 NOK/month against 100 NOK budget -> must succeed with 200
+	w2 := sendOrder(102, 556, 0.0694)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200 for order within string-configured budget, got %d (body: %s)", w2.Code, w2.Body.String())
+	}
+	if posts.Load() != 1 {
+		t.Errorf("expected 1 provider post, got %d", posts.Load())
+	}
+}
+
+// TestGigahostOrderHandler_MalformedBudgetFailsClosed verifies [HIGH] R10-H1:
+// Malformed or undecodable budget setting fails closed in getMonthlyBudgetNOK and rejects orders.
+func TestGigahostOrderHandler_MalformedBudgetFailsClosed(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+
+	catalog := []gigahost.HourlyPlan{
+		{
+			ProductID:      101,
+			PriceID:        555,
+			Name:           "Plan 101",
+			HourlyRateNOK:  0.10,
+			MonthlyCeiling: 72.0,
+			InStock:        true,
+			Regions:        []gigahost.Region{{ID: 1, Available: true}},
+		},
+	}
+
+	var posts atomic.Int32
+	h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+			return &gigahost.AccountInfo{Balance: 500.0, Currency: "NOK"}, nil
+		},
+		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+			return catalog, nil
+		},
+		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
+			return []gigahost.ServerInfo{}, nil
+		},
+		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			posts.Add(1)
+			return &gigahost.OrderResponse{
+				OrderID: "ord_should_not_reach",
+				Status:  gigahost.StatusPending,
+			}, nil
+		},
+	})
+
+	sendOrder := func() *httptest.ResponseRecorder {
+		payload, _ := json.Marshal(OrderServerPayload{
+			PID:            101,
+			PriceID:        555,
+			RegionID:       1,
+			OSID:           1,
+			HourlyPriceNOK: 0.10,
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", bytes.NewReader(payload))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostOrderHandler(w, req)
+		return w
+	}
+
+	// 1. Non-numeric budget string
+	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": "invalid_number"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.getMonthlyBudgetNOK(ctx); err == nil {
+		t.Fatal("expected getMonthlyBudgetNOK to fail closed on non-numeric budget")
+	}
+	w1 := sendOrder()
+	if w1.Code != http.StatusBadGateway {
+		t.Fatalf("expected HTTP 502 Bad Gateway on malformed budget, got %d (body: %s)", w1.Code, w1.Body.String())
+	}
+	if posts.Load() != 0 {
+		t.Errorf("expected 0 provider posts, got %d", posts.Load())
+	}
+
+	// 2. Negative budget value
+	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": -50.0}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.getMonthlyBudgetNOK(ctx); err == nil {
+		t.Fatal("expected getMonthlyBudgetNOK to fail closed on negative budget")
+	}
+	w2 := sendOrder()
+	if w2.Code != http.StatusBadGateway {
+		t.Fatalf("expected HTTP 502 Bad Gateway on negative budget, got %d (body: %s)", w2.Code, w2.Body.String())
+	}
+	if posts.Load() != 0 {
+		t.Errorf("expected 0 provider posts, got %d", posts.Load())
+	}
+}
+
+// TestSaveSettingsHandler_BudgetValidation verifies [HIGH] R10-H1:
+// SaveSettingsHandler validates monthly_budget_nok is a valid numeric value >= 0.
+func TestSaveSettingsHandler_BudgetValidation(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	ctx := context.Background()
+
+	adminSession := &models.SessionData{Role: models.RoleAdmin}
+
+	saveSettings := func(gigahostMap map[string]any) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(models.SaveSettingsRequest{
+			Gigahost: gigahostMap,
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/settings/save", bytes.NewReader(body))
+		req = req.WithContext(middleware.WithSession(req.Context(), adminSession))
+		w := httptest.NewRecorder()
+		h.SaveSettingsHandler(w, req)
+		return w
+	}
+
+	// Valid numeric string "150.5" -> 200 OK
+	w1 := saveSettings(map[string]any{"api_key": "valid_key", "monthly_budget_nok": "150.5"})
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200 for numeric string budget, got %d (body: %s)", w1.Code, w1.Body.String())
+	}
+	budget, err := h.getMonthlyBudgetNOK(ctx)
+	if err != nil || budget != 150.5 {
+		t.Fatalf("expected stored budget to be 150.5, got %v (err: %v)", budget, err)
+	}
+
+	// Valid float 200.0 -> 200 OK
+	w2 := saveSettings(map[string]any{"api_key": "valid_key", "monthly_budget_nok": 200.0})
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 for float budget, got %d (body: %s)", w2.Code, w2.Body.String())
+	}
+
+	// Valid zero budget -> 200 OK
+	w3 := saveSettings(map[string]any{"api_key": "valid_key", "monthly_budget_nok": 0})
+	if w3.Code != http.StatusOK {
+		t.Fatalf("expected 200 for zero budget, got %d (body: %s)", w3.Code, w3.Body.String())
+	}
+
+	// Invalid non-numeric string -> 400 Bad Request
+	w4 := saveSettings(map[string]any{"api_key": "valid_key", "monthly_budget_nok": "invalid"})
+	if w4.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid budget string, got %d (body: %s)", w4.Code, w4.Body.String())
+	}
+
+	// Invalid negative number -> 400 Bad Request
+	w5 := saveSettings(map[string]any{"api_key": "valid_key", "monthly_budget_nok": -10.0})
+	if w5.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for negative budget, got %d (body: %s)", w5.Code, w5.Body.String())
+	}
+
+	// Invalid negative string -> 400 Bad Request
+	w6 := saveSettings(map[string]any{"api_key": "valid_key", "monthly_budget_nok": "-10"})
+	if w6.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for negative budget string, got %d (body: %s)", w6.Code, w6.Body.String())
+	}
+
+	// Invalid boolean -> 400 Bad Request
+	w7 := saveSettings(map[string]any{"api_key": "valid_key", "monthly_budget_nok": true})
+	if w7.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for boolean budget, got %d (body: %s)", w7.Code, w7.Body.String())
+	}
+
+	// Invalid empty string -> 400 Bad Request
+	w8 := saveSettings(map[string]any{"api_key": "valid_key", "monthly_budget_nok": ""})
+	if w8.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty budget string, got %d (body: %s)", w8.Code, w8.Body.String())
+	}
+}
+
+// TestValidateOrderAgainstCatalog_EmptyCatalogRejection verifies [CONTRACT] W9-1:
+// Empty catalog is rejected with HTTP 400 ("no available plans in catalog").
+func TestValidateOrderAgainstCatalog_EmptyCatalogRejection(t *testing.T) {
+	req := OrderServerPayload{
+		PID:            101,
+		PriceID:        555,
+		RegionID:       1,
+		OSID:           1,
+		HourlyPriceNOK: 0.25,
+	}
+
+	// 1. Direct validation against nil catalog
+	errNil := validateOrderAgainstCatalog(nil, req)
+	if errNil == nil {
+		t.Fatal("expected error for nil catalog, got nil")
+	}
+	if !strings.Contains(errNil.Error(), "no available plans in catalog") {
+		t.Errorf("expected 'no available plans in catalog' error, got %v", errNil)
+	}
+
+	// 2. Direct validation against empty slice catalog
+	errEmpty := validateOrderAgainstCatalog([]gigahost.HourlyPlan{}, req)
+	if errEmpty == nil {
+		t.Fatal("expected error for empty catalog, got nil")
+	}
+	if !strings.Contains(errEmpty.Error(), "no available plans in catalog") {
+		t.Errorf("expected 'no available plans in catalog' error, got %v", errEmpty)
+	}
+
+	// 3. HTTP handler rejection with 400 when catalog has 0 plans
+	h, _, _ := setupTestHandlers(t)
+	var posts atomic.Int32
+	h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+			return &gigahost.AccountInfo{Balance: 500.0, Currency: "NOK"}, nil
+		},
+		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+			return []gigahost.HourlyPlan{}, nil
+		},
+		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			posts.Add(1)
+			return &gigahost.OrderResponse{OrderID: "should_not_reach"}, nil
+		},
+	})
+
+	payload, _ := json.Marshal(req)
+	httpReq := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", bytes.NewReader(payload))
+	httpReq = httpReq.WithContext(middleware.WithSession(httpReq.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	h.GigahostOrderHandler(w, httpReq)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 Bad Request for empty catalog, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "no available plans in catalog") {
+		t.Errorf("expected body to contain 'no available plans in catalog', got %s", w.Body.String())
+	}
+	if posts.Load() != 0 {
+		t.Errorf("expected 0 provider posts for empty catalog, got %d", posts.Load())
+	}
+}
