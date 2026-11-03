@@ -281,6 +281,43 @@ func (h *Handlers) verifyAccountEligibility(ctx context.Context, client gigahost
 	return catalogPlans, nil
 }
 
+func (h *Handlers) handleEligibilityError(w http.ResponseWriter, err error) {
+	if errors.Is(err, gigahost.ErrInsufficientCredit) {
+		h.JSONError(w, http.StatusPaymentRequired, "insufficient_credit", "Gigahost account has insufficient credit or zero balance")
+	} else if strings.HasPrefix(err.Error(), "account_check_failed:") {
+		h.JSONError(w, http.StatusBadGateway, "account_check_failed", fmt.Sprintf("Failed to check account eligibility: %v", err))
+	} else {
+		h.JSONError(w, http.StatusBadGateway, "catalog_check_failed", fmt.Sprintf("Failed to fetch catalog: %v", err))
+	}
+}
+
+func (h *Handlers) handleBudgetCheckError(w http.ResponseWriter, err error) {
+	if strings.HasPrefix(err.Error(), "Monthly budget cap exceeded") {
+		h.JSONError(w, http.StatusBadRequest, "budget_exceeded", err.Error())
+	} else if strings.HasPrefix(err.Error(), "invalid_plan:") {
+		h.JSONError(w, http.StatusBadRequest, "invalid_plan", strings.TrimPrefix(err.Error(), "invalid_plan: "))
+	} else {
+		h.JSONError(w, http.StatusBadGateway, "catalog_check_failed", err.Error())
+	}
+}
+
+func resolveAuthoritativeHourlyRate(catalogPlans []gigahost.HourlyPlan, req OrderServerPayload) float64 {
+	for _, p := range catalogPlans {
+		if p.ProductID == req.PID && (req.PriceID == 0 || p.PriceID == req.PriceID) {
+			if p.HourlyRateNOK > 0 {
+				return p.HourlyRateNOK
+			} else if p.MonthlyCeiling > 0 {
+				return p.MonthlyCeiling / 720
+			}
+			break
+		}
+	}
+	if req.HourlyPriceNOK > 0 {
+		return req.HourlyPriceNOK
+	}
+	return 0
+}
+
 // GigahostOrderHandler handles POST /api/admin/hosting/gigahost/order.
 // Verifies account credit, safely dispatches an hourly VPS order, and records the deployment job.
 func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) {
@@ -309,13 +346,7 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	// 1. Account balance and credit pre-check
 	catalogPlans, err := h.verifyAccountEligibility(r.Context(), client)
 	if err != nil {
-		if errors.Is(err, gigahost.ErrInsufficientCredit) {
-			h.JSONError(w, http.StatusPaymentRequired, "insufficient_credit", "Gigahost account has insufficient credit or zero balance")
-		} else if strings.HasPrefix(err.Error(), "account_check_failed:") {
-			h.JSONError(w, http.StatusBadGateway, "account_check_failed", fmt.Sprintf("Failed to check account eligibility: %v", err))
-		} else {
-			h.JSONError(w, http.StatusBadGateway, "catalog_check_failed", fmt.Sprintf("Failed to fetch catalog: %v", err))
-		}
+		h.handleEligibilityError(w, err)
 		return
 	}
 
@@ -340,13 +371,7 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 
 	// 4. Monthly NOK budget cap enforcement
 	if err := h.checkMonthlyBudget(r.Context(), client, req, catalogPlans); err != nil {
-		if strings.HasPrefix(err.Error(), "Monthly budget cap exceeded") {
-			h.JSONError(w, http.StatusBadRequest, "budget_exceeded", err.Error())
-		} else if strings.HasPrefix(err.Error(), "invalid_plan:") {
-			h.JSONError(w, http.StatusBadRequest, "invalid_plan", strings.TrimPrefix(err.Error(), "invalid_plan: "))
-		} else {
-			h.JSONError(w, http.StatusBadGateway, "catalog_check_failed", err.Error())
-		}
+		h.handleBudgetCheckError(w, err)
 		return
 	}
 
@@ -357,7 +382,7 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 		Status:         "pending_order",
 		PlanID:         req.PID,
 		RegionID:       req.RegionID,
-		HourlyPriceNOK: req.HourlyPriceNOK,
+		HourlyPriceNOK: resolveAuthoritativeHourlyRate(catalogPlans, req),
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
@@ -472,7 +497,7 @@ func requestMonthlySpend(catalog []gigahost.HourlyPlan, req OrderServerPayload) 
 	return 0
 }
 
-func calculateCommittedSpend(catalog []gigahost.HourlyPlan, servers []gigahost.ServerInfo, localOrders []GigahostOrderRecord) float64 {
+func calculateCommittedSpend(catalog []gigahost.HourlyPlan, servers []gigahost.ServerInfo, localOrders []GigahostOrderRecord) (float64, error) {
 	var committed float64
 	accountedOrders := make(map[string]bool)
 	for _, s := range servers {
@@ -480,9 +505,13 @@ func calculateCommittedSpend(catalog []gigahost.HourlyPlan, servers []gigahost.S
 			if s.OrderID != "" {
 				accountedOrders[s.OrderID] = true
 			}
+			serverPID := s.PID
 			var localHourly float64
 			for _, o := range localOrders {
 				if (s.OrderID != "" && o.OrderID == s.OrderID) || (s.ID > 0 && o.ServerID == s.ID) {
+					if serverPID == 0 && o.PlanID > 0 {
+						serverPID = o.PlanID
+					}
 					if o.HourlyPriceNOK > 0 {
 						localHourly = o.HourlyPriceNOK
 						break
@@ -491,13 +520,17 @@ func calculateCommittedSpend(catalog []gigahost.HourlyPlan, servers []gigahost.S
 			}
 			if localHourly == 0 {
 				for _, o := range localOrders {
-					if o.PlanID == s.PID && o.HourlyPriceNOK > 0 {
+					if o.PlanID == serverPID && o.HourlyPriceNOK > 0 {
 						localHourly = o.HourlyPriceNOK
 						break
 					}
 				}
 			}
-			committed += planMonthlySpend(catalog, s.PID, localHourly)
+			spend := planMonthlySpend(catalog, serverPID, localHourly)
+			if spend <= 0 {
+				return 0, fmt.Errorf("active inventory server %d (plan %d) has unpriced spend and is absent from catalog", s.ID, serverPID)
+			}
+			committed += spend
 		}
 	}
 
@@ -509,10 +542,14 @@ func calculateCommittedSpend(catalog []gigahost.HourlyPlan, servers []gigahost.S
 			if o.OrderID != "" {
 				accountedOrders[o.OrderID] = true
 			}
-			committed += planMonthlySpend(catalog, o.PlanID, o.HourlyPriceNOK)
+			spend := planMonthlySpend(catalog, o.PlanID, o.HourlyPriceNOK)
+			if spend <= 0 {
+				return 0, fmt.Errorf("active order %s (plan %d) has unpriced spend and is absent from catalog", o.OrderID, o.PlanID)
+			}
+			committed += spend
 		}
 	}
-	return committed
+	return committed, nil
 }
 
 //nolint:misspell // "cancelled" matches documented provider status and test assertions
@@ -624,7 +661,10 @@ func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Clien
 
 	h.reconcileBudgetOrders(ctx, client, servers, localOrders)
 
-	committed := calculateCommittedSpend(catalog, servers, localOrders)
+	committed, err := calculateCommittedSpend(catalog, servers, localOrders)
+	if err != nil {
+		return fmt.Errorf("failed to calculate committed spend: %w", err)
+	}
 
 	if committed+planMonthlyRate > ghCfg.MonthlyBudgetNOK {
 		return fmt.Errorf("Monthly budget cap exceeded: requested order exceeds configured budget of %v NOK", ghCfg.MonthlyBudgetNOK)
@@ -756,9 +796,11 @@ func (h *Handlers) refreshOrderFromServers(servers []gigahost.ServerInfo, order 
 	for _, s := range servers {
 		if s.OrderID != "" && s.OrderID == order.OrderID {
 			updated := false
-			if s.Status != "" && s.Status != order.Status {
-				order.Status = s.Status
-				updated = true
+			if s.Status != "" && s.Status != order.Status && !strings.EqualFold(s.Status, "active") {
+				if isTerminalStatus(s.Status) || !isPendingOrInFlight(order.Status) {
+					order.Status = s.Status
+					updated = true
+				}
 			}
 			if s.ID > 0 && order.ServerID != s.ID {
 				order.ServerID = s.ID
@@ -834,9 +876,12 @@ func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request)
 			updated := false
 			if len(servers) > 0 && h.refreshOrderFromServers(servers, &orders[i]) {
 				updated = true
-			} else if deployQueries < maxDeployQueries && h.refreshOrderFromDeployStatus(r.Context(), client, &orders[i]) {
-				deployQueries++
-				updated = true
+			}
+			if (isPendingOrInFlight(orders[i].Status) || !updated) && deployQueries < maxDeployQueries {
+				if h.refreshOrderFromDeployStatus(r.Context(), client, &orders[i]) {
+					deployQueries++
+					updated = true
+				}
 			}
 			if updated {
 				_ = h.updateGigahostOrder(r.Context(), &orders[i])

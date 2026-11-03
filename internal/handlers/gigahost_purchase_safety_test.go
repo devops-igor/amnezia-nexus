@@ -696,3 +696,212 @@ func TestGigahostPurchaseSafety_InFlightInstallingOrderBlocksDuplicateRetry(t *t
 		t.Errorf("expected 2 total posts after intentional second order, got %d", posts.Load())
 	}
 }
+
+func TestGigahostPurchaseSafety_OrderListingPreservesInFlightAndBlocksDuplicateRetry(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+
+	var posts, statusCalls atomic.Int32
+	deployStatus := gigahost.StatusInstalling
+
+	h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+			return &gigahost.AccountInfo{Balance: 1000.0, Currency: "NOK"}, nil
+		},
+		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+			return []gigahost.HourlyPlan{{
+				ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true,
+				Regions: []gigahost.Region{{ID: 1, Available: true}},
+			}}, nil
+		},
+		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
+			if posts.Load() > 0 {
+				return []gigahost.ServerInfo{{ID: 3500, OrderID: "10001", PID: 101, Status: "active"}}, nil
+			}
+			return []gigahost.ServerInfo{}, nil
+		},
+		getDeployStatusFn: func(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error) {
+			statusCalls.Add(1)
+			return &gigahost.DeployStatusResponse{OrderID: orderID, Status: deployStatus}, nil
+		},
+		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			posts.Add(1)
+			return &gigahost.OrderResponse{OrderID: "10001", Status: gigahost.StatusPending}, nil
+		},
+	})
+
+	postOrder := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostOrderHandler(w, req)
+		return w
+	}
+	listOrders := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/hosting/gigahost/orders", nil)
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostOrdersHandler(w, req)
+		return w
+	}
+
+	body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0.14375}`
+
+	// 1. Initial order placement
+	w1 := postOrder(body)
+	if w1.Code != http.StatusOK || posts.Load() != 1 {
+		t.Fatalf("expected order 1 HTTP 200 with 1 post, got code %d, posts %d", w1.Code, posts.Load())
+	}
+
+	// 2. Normal order listing (GET /orders) refreshes against provider inventory where server status is "active".
+	// R8-H1: refreshOrderFromServers MUST NOT overwrite in-flight "installing" status with "active".
+	listW := listOrders()
+	if listW.Code != http.StatusOK {
+		t.Fatalf("expected GET /orders HTTP 200, got %d", listW.Code)
+	}
+
+	dbOrders, err := h.getGigahostOrders(context.Background())
+	if err != nil || len(dbOrders) != 1 {
+		t.Fatalf("failed to query orders: %v (len %d)", err, len(dbOrders))
+	}
+	if strings.ToLower(dbOrders[0].Status) == "active" || dbOrders[0].Status != gigahost.StatusInstalling {
+		t.Fatalf("expected order status to remain in-flight installing, got %q", dbOrders[0].Status)
+	}
+
+	// 3. Duplicate order request while still installing must be refused with 202 Accepted.
+	w2 := postOrder(body)
+	if w2.Code != http.StatusAccepted || !strings.Contains(w2.Body.String(), "Prior purchase order is pending reconciliation") {
+		t.Fatalf("expected 202 duplicate refusal, got %d (body: %s)", w2.Code, w2.Body.String())
+	}
+	if posts.Load() != 1 {
+		t.Errorf("expected duplicate order not to post to provider, posts was %d", posts.Load())
+	}
+
+	// 4. Once deploy status transitions to ready, subsequent order succeeds.
+	deployStatus = gigahost.StatusReady
+	listOrders()
+	w3 := postOrder(body)
+	if w3.Code != http.StatusOK || posts.Load() != 2 {
+		t.Fatalf("expected request 3 HTTP 200 after ready with 2 posts, got code %d, posts %d", w3.Code, posts.Load())
+	}
+}
+
+func TestGigahostPurchaseSafety_OmittedClientRatePersistsCatalogPriceAndPreservesOutOfStockSpend(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+
+	// Set monthly budget of 150 NOK (Plan 101 is ~103.5 NOK, Plan 102 is 90 NOK)
+	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 150.0}); err != nil {
+		t.Fatal(err)
+	}
+
+	var posts atomic.Int32
+	catalogStockPlan101 := true
+
+	h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+			return &gigahost.AccountInfo{Balance: 500.0, Currency: "NOK"}, nil
+		},
+		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+			plans := []gigahost.HourlyPlan{{
+				ProductID: 102, PriceID: 556, HourlyRateNOK: 0.125, MonthlyCeiling: 90.0, InStock: true,
+				Regions: []gigahost.Region{{ID: 1, Available: true}},
+			}}
+			if catalogStockPlan101 {
+				plans = append(plans, gigahost.HourlyPlan{
+					ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 103.5, InStock: true,
+					Regions: []gigahost.Region{{ID: 1, Available: true}},
+				})
+			}
+			return plans, nil
+		},
+		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
+			if posts.Load() > 0 {
+				return []gigahost.ServerInfo{{ID: 3500, OrderID: "10001", PID: 101, Status: gigahost.StatusReady}}, nil
+			}
+			return []gigahost.ServerInfo{}, nil
+		},
+		getDeployStatusFn: func(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error) {
+			return &gigahost.DeployStatusResponse{OrderID: orderID, Status: gigahost.StatusReady}, nil
+		},
+		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			posts.Add(1)
+			return &gigahost.OrderResponse{OrderID: "10001", Status: gigahost.StatusReady}, nil
+		},
+	})
+
+	postOrder := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GigahostOrderHandler(w, req)
+		return w
+	}
+
+	// 1. Order Plan 101 with OMITTED hourly_price_nok
+	w1 := postOrder(`{"pid":101,"price_id":555,"region_id":1,"os_id":12}`)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected order 1 HTTP 200, got %d (body: %s)", w1.Code, w1.Body.String())
+	}
+
+	// Verify the database record has the authoritative catalog rate (0.14375), NOT 0!
+	orders, err := h.getGigahostOrders(ctx)
+	if err != nil || len(orders) != 1 || orders[0].HourlyPriceNOK != 0.14375 {
+		t.Fatalf("expected stored HourlyPriceNOK 0.14375 from catalog, got %v (err: %v)", orders, err)
+	}
+
+	// 2. Plan 101 goes out of stock (removed from catalog)
+	catalogStockPlan101 = false
+
+	// Attempting to place an order for Plan 102 (90 NOK/mo) must be rejected because
+	// existing Plan 101 spend (0.14375 * 720 = 103.5 NOK) already commits the 150 NOK budget (103.5 + 90 > 150).
+	w2 := postOrder(`{"pid":102,"price_id":556,"region_id":1,"os_id":12}`)
+	if w2.Code != http.StatusBadRequest || !strings.Contains(w2.Body.String(), "Monthly budget cap exceeded") {
+		t.Fatalf("expected HTTP 400 budget exceeded, got %d (body: %s)", w2.Code, w2.Body.String())
+	}
+	if posts.Load() != 1 {
+		t.Errorf("expected no additional order posted when budget exceeded, got %d", posts.Load())
+	}
+}
+
+func TestGigahostPurchaseSafety_UnpricedActiveInventoryServerFailsClosed(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+
+	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 100.0}); err != nil {
+		t.Fatal(err)
+	}
+
+	var posts atomic.Int32
+	h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
+			return &gigahost.AccountInfo{Balance: 500.0, Currency: "NOK"}, nil
+		},
+		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+			return []gigahost.HourlyPlan{{
+				ProductID: 102, PriceID: 556, HourlyRateNOK: 0.125, MonthlyCeiling: 90.0, InStock: true,
+				Regions: []gigahost.Region{{ID: 1, Available: true}},
+			}}, nil
+		},
+		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
+			// Active server with PID 999 which is absent from catalog and local orders
+			return []gigahost.ServerInfo{{ID: 3500, OrderID: "unpriced_srv_1", PID: 999, Status: "active"}}, nil
+		},
+		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			posts.Add(1)
+			return &gigahost.OrderResponse{OrderID: "10002", Status: gigahost.StatusPending}, nil
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(`{"pid":102,"price_id":556,"region_id":1,"os_id":12}`))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	h.GigahostOrderHandler(w, req)
+
+	// Fails closed with 502 Bad Gateway / catalog_check_failed
+	if w.Code != http.StatusBadGateway || !strings.Contains(w.Body.String(), "catalog_check_failed") {
+		t.Fatalf("expected HTTP 502 catalog_check_failed, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	if posts.Load() != 0 {
+		t.Errorf("expected 0 order posts when spend cannot be calculated, got %d", posts.Load())
+	}
+}
