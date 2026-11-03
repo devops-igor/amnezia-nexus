@@ -447,6 +447,52 @@ func calculateCommittedSpend(catalog []gigahost.HourlyPlan, servers []gigahost.S
 	return committed
 }
 
+//nolint:misspell // "cancelled" matches documented provider status and test assertions
+const statusCancelled = "cancelled"
+
+func (h *Handlers) reconcileAbsentReadyOrder(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord) {
+	statusResp, err := client.GetDeployStatus(ctx, order.OrderID)
+	if err == nil {
+		if statusResp == nil || statusResp.Status == "" || isTerminalStatus(statusResp.Status) {
+			newStatus := statusCancelled
+			if statusResp != nil && isTerminalStatus(statusResp.Status) {
+				newStatus = statusResp.Status
+			}
+			order.Status = newStatus
+			_ = h.updateGigahostOrder(ctx, order)
+		}
+	} else if errors.Is(err, gigahost.ErrNotFound) {
+		order.Status = statusCancelled
+		_ = h.updateGigahostOrder(ctx, order)
+	}
+}
+
+func (h *Handlers) reconcileBudgetOrders(ctx context.Context, client gigahost.Client, servers []gigahost.ServerInfo, localOrders []GigahostOrderRecord) {
+	for i := range localOrders {
+		order := &localOrders[i]
+		if order.OrderID == "" || strings.HasPrefix(order.OrderID, "unknown_") || strings.HasPrefix(order.OrderID, "intent_") {
+			continue
+		}
+
+		var matchedServer *gigahost.ServerInfo
+		for j := range servers {
+			if servers[j].OrderID != "" && servers[j].OrderID == order.OrderID {
+				matchedServer = &servers[j]
+				break
+			}
+		}
+
+		if matchedServer != nil {
+			if isTerminalStatus(matchedServer.Status) && order.Status != matchedServer.Status {
+				order.Status = matchedServer.Status
+				_ = h.updateGigahostOrder(ctx, order)
+			}
+		} else if order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active" {
+			h.reconcileAbsentReadyOrder(ctx, client, order)
+		}
+	}
+}
+
 func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Client, req OrderServerPayload) error {
 	if h.db == nil {
 		return nil
@@ -473,6 +519,8 @@ func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Clien
 	if ordErr != nil {
 		return fmt.Errorf("failed to check local orders for budget verification: %w", ordErr)
 	}
+
+	h.reconcileBudgetOrders(ctx, client, servers, localOrders)
 
 	planMonthlyRate := requestMonthlySpend(catalog, req)
 	committed := calculateCommittedSpend(catalog, servers, localOrders)
@@ -544,7 +592,7 @@ func applyOrderResponseToRecord(orderRecord *GigahostOrderRecord, orderResp *gig
 func isTerminalStatus(status string) bool {
 	s := strings.ToLower(status)
 	switch {
-	case s == gigahost.StatusReady || s == gigahost.StatusFailed || s == "active" || s == "deleted":
+	case s == gigahost.StatusFailed || s == "deleted" || s == "terminated":
 		return true
 	case strings.HasPrefix(s, "cancel"):
 		return true
@@ -553,49 +601,72 @@ func isTerminalStatus(status string) bool {
 	}
 }
 
-func (h *Handlers) refreshSingleOrder(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord) bool {
-	if isTerminalStatus(order.Status) {
-		return false
-	}
-	if !strings.HasPrefix(order.OrderID, "unknown_") && !strings.HasPrefix(order.OrderID, "intent_") {
-		statusResp, err := client.GetDeployStatus(ctx, order.OrderID)
-		if err == nil && statusResp != nil {
+func (h *Handlers) refreshOrderFromServers(servers []gigahost.ServerInfo, order *GigahostOrderRecord) bool {
+	for _, s := range servers {
+		if s.OrderID != "" && s.OrderID == order.OrderID {
 			updated := false
-			if statusResp.Status != "" && statusResp.Status != order.Status {
-				order.Status = statusResp.Status
+			if s.Status != "" && s.Status != order.Status {
+				order.Status = s.Status
 				updated = true
 			}
-			if ip := statusResp.GetIP(); ip != "" && ip != order.AssignedIP {
+			if s.ID > 0 && order.ServerID != s.ID {
+				order.ServerID = s.ID
+				updated = true
+			}
+			if ip := s.GetIP(); ip != "" && ip != order.AssignedIP {
 				order.AssignedIP = ip
-				updated = true
-			}
-			if statusResp.ServerID > 0 && order.ServerID == 0 {
-				order.ServerID = statusResp.ServerID
 				updated = true
 			}
 			return updated
 		}
+	}
+	return false
+}
+
+func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord) bool {
+	if strings.HasPrefix(order.OrderID, "unknown_") || strings.HasPrefix(order.OrderID, "intent_") || order.OrderID == "" {
+		return false
+	}
+	statusResp, deployErr := client.GetDeployStatus(ctx, order.OrderID)
+	if deployErr == nil {
+		updated := false
+		if statusResp != nil && statusResp.Status != "" && statusResp.Status != order.Status {
+			order.Status = statusResp.Status
+			updated = true
+		} else if (order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active") && (statusResp == nil || statusResp.Status == "") {
+			order.Status = statusCancelled
+			updated = true
+		}
+		if statusResp != nil {
+			if ip := statusResp.GetIP(); ip != "" && ip != order.AssignedIP {
+				order.AssignedIP = ip
+				updated = true
+			}
+			if statusResp.ServerID > 0 && order.ServerID != statusResp.ServerID {
+				order.ServerID = statusResp.ServerID
+				updated = true
+			}
+		}
+		return updated
+	} else if errors.Is(deployErr, gigahost.ErrNotFound) && (order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active") {
+		order.Status = statusCancelled
+		return true
+	}
+	return false
+}
+
+func (h *Handlers) refreshSingleOrder(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord) bool {
+	if isTerminalStatus(order.Status) {
 		return false
 	}
 
-	servers, err := client.GetServers(ctx)
-	if err == nil {
-		for _, s := range servers {
-			if s.OrderID != "" && s.OrderID == order.OrderID {
-				if s.ID > 0 {
-					order.ServerID = s.ID
-				}
-				if s.Status != "" {
-					order.Status = s.Status
-				}
-				if ip := s.GetIP(); ip != "" {
-					order.AssignedIP = ip
-				}
-				return true
-			}
+	if servers, err := client.GetServers(ctx); err == nil {
+		if h.refreshOrderFromServers(servers, order) {
+			return true
 		}
 	}
-	return false
+
+	return h.refreshOrderFromDeployStatus(ctx, client, order)
 }
 
 // GigahostOrdersHandler handles GET /api/admin/hosting/gigahost/orders.
