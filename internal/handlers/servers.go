@@ -938,7 +938,7 @@ func (h *Handlers) ListServersHandler(w http.ResponseWriter, r *http.Request) {
 			if !s.CreatedAt.IsZero() {
 				createdAt = &s.CreatedAt
 			}
-			result = append(result, models.ServerItemResponse{
+			item := models.ServerItemResponse{
 				ID:        s.ID,
 				Name:      s.Name,
 				Host:      s.Host,
@@ -947,7 +947,9 @@ func (h *Handlers) ListServersHandler(w http.ResponseWriter, r *http.Request) {
 				Protocols: protoMap,
 				CreatedAt: createdAt,
 				Status:    status,
-			})
+			}
+			h.populateServerEngineStatus(ctx, &item, &s, sess != nil && sess.Role == models.RoleAdmin)
+			result = append(result, item)
 		}
 	}
 
