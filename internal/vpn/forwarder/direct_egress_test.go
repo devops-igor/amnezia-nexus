@@ -20,8 +20,8 @@ func buildTestIPv4TCPPacket(srcIP, dstIP netip.Addr, srcPort, dstPort uint16, fl
 	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen)) // #nosec G115
 	binary.BigEndian.PutUint16(pkt[4:6], 1234)
 	binary.BigEndian.PutUint16(pkt[6:8], 0x4000) // DF
-	pkt[8] = 64                                 // TTL
-	pkt[9] = 6                                  // TCP
+	pkt[8] = 64                                  // TTL
+	pkt[9] = 6                                   // TCP
 	srcBytes := srcIP.As4()
 	dstBytes := dstIP.As4()
 	copy(pkt[12:16], srcBytes[:])
@@ -437,4 +437,3 @@ func TestDirectEgress_ProhibitedDrops(t *testing.T) {
 		t.Errorf("expected %d directDrops, got %d", len(prohibitedTargets), dem.DirectDrops())
 	}
 }
-

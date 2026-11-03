@@ -130,6 +130,9 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 				delete(f.routesByIP, old.assignedIP)
 			}
 		}
+		if f.directEgress != nil {
+			f.directEgress.PurgePeer(peerKey)
+		}
 	}
 	// Keep the registration count for diagnostics. Route retirement itself
 	// uses the session ID, because rekeys replace routes without a matching
@@ -229,6 +232,9 @@ func (f *Forwarder) beginUnregisterSession(peerKey, sessionID string) (retiremen
 		f.stopRoutePumpLocked(route)
 		f.drainRouteQueueLocked(route)
 		f.changeQueueCapacityLocked(-cap(route.clientQueue))
+		if f.directEgress != nil {
+			f.directEgress.PurgePeer(peerKey)
+		}
 	}
 	return retirement
 }

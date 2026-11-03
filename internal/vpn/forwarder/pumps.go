@@ -2,8 +2,12 @@ package forwarder
 
 import (
 	"context"
+	"errors"
 	"net"
+	"net/netip"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
 // RouteClientToBackend routes a packet from a client peer toward their assigned backend tunnel.
@@ -38,17 +42,7 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 		return ErrSpoofedSourceIP
 	}
 
-	beQueue, ok := f.backendQueues[route.backendTunnelID]
-	if !ok {
-		f.clientDropsNoBackend.Add(1)
-		f.clientDropsTotal.Add(1)
-		f.mu.RUnlock()
-		return ErrBackendNotFound
-	}
-	sID := route.sessionID
-	cID := route.connectionID
 	tbUp := route.tbUp
-	backendTraffic := f.backendTraffic[route.backendTunnelID]
 	f.mu.RUnlock()
 
 	pktLen := int64(len(packet))
@@ -58,33 +52,152 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 		return ErrRateLimitExceeded
 	}
 
-	// The packet copy happens before the send attempt, so the drop path costs
-	// the same allocation it always did; only the ACCOUNTING placement is
-	// under review here (issue #424 round 3, finding 2).
+	if !f.pbrEnabled.Load() {
+		return f.routeClientLegacy(route, packet, pktLen)
+	}
+
+	return f.routeClientPBR(route, peerKey, packet, pktLen)
+}
+
+func (f *Forwarder) routeClientLegacy(route *sessionRoute, packet []byte, pktLen int64) error {
+	f.mu.RLock()
+	beQueue, ok := f.backendQueues[route.backendTunnelID]
+	if !ok {
+		f.clientDropsNoBackend.Add(1)
+		f.clientDropsTotal.Add(1)
+		f.mu.RUnlock()
+		return ErrBackendNotFound
+	}
+	sID := route.sessionID
+	cID := route.connectionID
+	backendTraffic := f.backendTraffic[route.backendTunnelID]
+	f.mu.RUnlock()
+
+	return f.sendToBackendQueue(beQueue, route, backendTraffic, sID, cID, packet, pktLen, false)
+}
+
+func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet []byte, pktLen int64) error {
+	f.mu.RLock()
+	beQueue, hasBeQueue := f.backendQueues[route.backendTunnelID]
+	sID := route.sessionID
+	cID := route.connectionID
+	backendTraffic := f.backendTraffic[route.backendTunnelID]
+	directEgress := f.directEgress
+	routeCache := f.routeCache
+	policyMatcher := f.policyMatcher
+	gwDNS := f.gatewayDNSIP
+	f.mu.RUnlock()
+
+	if len(packet) < 20 || (packet[0]>>4) != 4 {
+		return errors.New("invalid ipv4 packet")
+	}
+	dstIP := netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]})
+
+	// Flow Stickiness: Active 5-tuple flow decisions remain stable across TTL or list refresh.
+	if directEgress != nil {
+		if choice, found := directEgress.LookupFlow(peerKey, packet); found {
+			if choice == EgressChoiceDirect {
+				return f.sendToDirectEgress(directEgress, route, peerKey, packet, pktLen, sID, cID)
+			}
+			return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
+		}
+	}
+
+	// Step 1 — DROP: Prohibited destinations (loopback, link-local, RFC1918, multicast, metadata).
+	// Explicit exception: traffic to designated gateway DNS.
+	if isProhibitedTarget(dstIP, directEgress, gwDNS) {
+		f.directDrops.Add(1)
+		return ErrProhibitedDestination
+	}
+
+	// Step 2 — PROXY: Policy snapshot CIDR or route cache Proxy match (including shared-IP conflict).
+	if f.matchesProxyPolicy(dstIP, sID, policyMatcher, routeCache) {
+		if directEgress != nil {
+			directEgress.RecordFlow(peerKey, packet, EgressChoiceProxy)
+		}
+		return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
+	}
+
+	// Step 3 — DIRECT: Client-scoped DNS evidence observed public destination without proxy match.
+	if routeCache != nil && routeCache.Lookup(sID, dstIP) == policy.Direct {
+		if directEgress != nil {
+			directEgress.RecordFlow(peerKey, packet, EgressChoiceDirect)
+			return f.sendToDirectEgress(directEgress, route, peerKey, packet, pktLen, sID, cID)
+		}
+		f.directDrops.Add(1)
+		return ErrDirectEgressUnavailable
+	}
+
+	// Step 4 — PROXY (Safe Default): Missing, expired, or evicted DNS evidence (policy.Unknown).
+	if directEgress != nil {
+		directEgress.RecordFlow(peerKey, packet, EgressChoiceProxy)
+	}
+	return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
+}
+
+func isProhibitedTarget(dstIP netip.Addr, directEgress *DirectEgressManager, gwDNS netip.Addr) bool {
+	if directEgress != nil {
+		return directEgress.IsProhibitedDestination(dstIP)
+	}
+	if gwDNS.IsValid() && dstIP == gwDNS {
+		return false
+	}
+	if !dstIP.IsValid() || !dstIP.Is4() || dstIP.IsLoopback() || dstIP.IsLinkLocalUnicast() ||
+		dstIP.IsPrivate() || dstIP.IsMulticast() || dstIP.IsUnspecified() ||
+		dstIP == cloudMetadataIP || dstIP.As4()[0] == 0 || dstIP == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
+		return true
+	}
+	return false
+}
+
+func (f *Forwarder) matchesProxyPolicy(dstIP netip.Addr, sID string, policyMatcher *policy.Matcher, routeCache RouteCache) bool {
+	if policyMatcher != nil {
+		if snap := policyMatcher.Current(); snap != nil && snap.MatchIPv4(dstIP) {
+			return true
+		}
+	}
+	if routeCache != nil && routeCache.Lookup(sID, dstIP) == policy.Proxy {
+		return true
+	}
+	return false
+}
+
+func (f *Forwarder) sendToDirectEgress(directEgress *DirectEgressManager, route *sessionRoute, peerKey string, packet []byte, pktLen int64, sID, cID string) error {
+	f.directBytes.Add(pktLen)
+	route.traffic.record(pktLen, true)
+	if f.accountant != nil {
+		f.accountant.RecordRx(sID, cID, pktLen)
+	}
+	f.totalRxBytes.Add(pktLen)
+	f.totalRxPackets.Add(1)
+	return directEgress.RouteDirect(peerKey, route.assignedIP, packet, route.returnPath)
+}
+
+func (f *Forwarder) sendToProxyBackend(beQueue chan []byte, hasBeQueue bool, route *sessionRoute, backendTraffic *trafficCounters, sID, cID string, packet []byte, pktLen int64) error {
+	if !hasBeQueue || beQueue == nil {
+		f.proxyDrops.Add(1)
+		f.clientDropsNoBackend.Add(1)
+		f.clientDropsTotal.Add(1)
+		return ErrBackendNotFound
+	}
+	return f.sendToBackendQueue(beQueue, route, backendTraffic, sID, cID, packet, pktLen, true)
+}
+
+func (f *Forwarder) sendToBackendQueue(beQueue chan []byte, route *sessionRoute, backendTraffic *trafficCounters, sID, cID string, packet []byte, pktLen int64, isPBR bool) error {
 	pktCopy := make([]byte, len(packet))
 	copy(pktCopy, packet)
 
-	// Throughput accounting records ADMITTED traffic: bytes the backend
-	// actually received. It therefore runs only once the packet is on the
-	// backend queue. It used to run before the send, so a packet refused by
-	// a full queue was counted as backend RX AND as a queue-full drop at the
-	// same time — diagnostics could report +1500 bytes of backend throughput
-	// alongside queue-full +1 for one packet the backend never accepted,
-	// which is the opposite of what per-backend traffic is for (#432).
-	//
-	// Rejected traffic is still visible: it is counted by
-	// clientDropsQueueFull/clientDropsTotal below and reported as the
-	// client_backend_queue_full reason, so no packet is lost from the
-	// accounting — it simply stops being reported as carried throughput.
 	select {
 	case beQueue <- pktCopy:
 		f.totalRxBytes.Add(pktLen)
 		f.totalRxPackets.Add(1)
-		// route.traffic also advances the route's last-traffic age (#433),
-		// so a refused packet must not reset "last seen" for a route that
-		// carried nothing.
+		if isPBR {
+			f.proxiedBytes.Add(pktLen)
+		}
 		route.traffic.record(pktLen, true)
-		backendTraffic.record(pktLen, true)
+		if backendTraffic != nil {
+			backendTraffic.record(pktLen, true)
+		}
 		if f.accountant != nil {
 			f.accountant.RecordRx(sID, cID, pktLen)
 		}

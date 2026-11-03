@@ -5,9 +5,12 @@ import (
 	"errors"
 	"log"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
 var (
@@ -39,6 +42,11 @@ type PacketDevice interface {
 	Read(p []byte) (n int, err error)
 	Write(p []byte) (n int, err error)
 	Close() error
+}
+
+// RouteCache queries routing decisions for client sessions.
+type RouteCache interface {
+	Lookup(sessionID string, ip netip.Addr) policy.Decision
 }
 
 type sessionRoute struct {
@@ -181,6 +189,19 @@ type Forwarder struct {
 	// sessionRoute.sessionID, never inferred from this counter.
 	peerRegs    map[string]uint64 // peerKey -> registrations seen
 	stopTimeout time.Duration
+
+	// Policy-based routing and direct egress:
+	pbrEnabled    atomic.Bool
+	directEgress  *DirectEgressManager
+	routeCache    RouteCache
+	policyMatcher *policy.Matcher
+	gatewayDNSIP  netip.Addr
+
+	// Policy routing accounting metrics:
+	proxiedBytes atomic.Int64
+	directBytes  atomic.Int64
+	proxyDrops   atomic.Uint64
+	directDrops  atomic.Uint64
 }
 
 // DefaultClientQueueSize is the default capacity of each per-client downstream packet channel.
@@ -472,4 +493,102 @@ func (f *Forwarder) IsRunning() bool {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.running
+}
+
+// SetPBREnabled toggles policy-based routing. When disabled (default),
+// all client traffic uses the assigned proxy backend.
+func (f *Forwarder) SetPBREnabled(enabled bool) {
+	f.pbrEnabled.Store(enabled)
+}
+
+// PBREnabled reports whether policy-based routing is active.
+func (f *Forwarder) PBREnabled() bool {
+	return f.pbrEnabled.Load()
+}
+
+// SetDirectEgress configures the DirectEgressManager for WAN egress.
+func (f *Forwarder) SetDirectEgress(dem *DirectEgressManager) {
+	f.mu.Lock()
+	f.directEgress = dem
+	if dem != nil {
+		dem.fwd = f
+	}
+	f.mu.Unlock()
+}
+
+// DirectEgress returns the configured DirectEgressManager.
+func (f *Forwarder) DirectEgress() *DirectEgressManager {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.directEgress
+}
+
+// SetRouteCache configures the client route evidence lookup source.
+func (f *Forwarder) SetRouteCache(rc RouteCache) {
+	f.mu.Lock()
+	f.routeCache = rc
+	f.mu.Unlock()
+}
+
+// RouteCache returns the configured route decision source.
+func (f *Forwarder) RouteCache() RouteCache {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.routeCache
+}
+
+// SetPolicyMatcher configures the policy snapshot matcher.
+func (f *Forwarder) SetPolicyMatcher(m *policy.Matcher) {
+	f.mu.Lock()
+	f.policyMatcher = m
+	f.mu.Unlock()
+}
+
+// PolicyMatcher returns the configured policy matcher.
+func (f *Forwarder) PolicyMatcher() *policy.Matcher {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.policyMatcher
+}
+
+// SetGatewayDNSIP configures the designated gateway DNS IPv4 address.
+func (f *Forwarder) SetGatewayDNSIP(ip netip.Addr) {
+	f.mu.Lock()
+	f.gatewayDNSIP = ip
+	if f.directEgress != nil {
+		f.directEgress.cfg.GatewayDNSIP = ip
+	}
+	f.mu.Unlock()
+}
+
+// GatewayDNSIP returns the designated gateway DNS IPv4 address.
+func (f *Forwarder) GatewayDNSIP() netip.Addr {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.gatewayDNSIP
+}
+
+// ProxiedBytes returns the total bytes forwarded to proxy backends under PBR.
+func (f *Forwarder) ProxiedBytes() int64 {
+	return f.proxiedBytes.Load()
+}
+
+// DirectBytes returns the total bytes forwarded to direct WAN under PBR.
+func (f *Forwarder) DirectBytes() int64 {
+	return f.directBytes.Load()
+}
+
+// ProxyDrops returns the total proxy-required drops (e.g. backend unavailable).
+func (f *Forwarder) ProxyDrops() uint64 {
+	return f.proxyDrops.Load()
+}
+
+// DirectDrops returns the total direct WAN drops (e.g. prohibited destinations or egress failures).
+func (f *Forwarder) DirectDrops() uint64 {
+	return f.directDrops.Load()
+}
+
+// DispatchMetrics returns a snapshot of policy routing traffic and drop counters.
+func (f *Forwarder) DispatchMetrics() (proxiedBytes, directBytes int64, proxyDrops, directDrops uint64) {
+	return f.proxiedBytes.Load(), f.directBytes.Load(), f.proxyDrops.Load(), f.directDrops.Load()
 }
