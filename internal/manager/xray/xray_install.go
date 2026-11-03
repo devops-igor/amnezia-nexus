@@ -773,14 +773,14 @@ func updateExistingConfig(existingCfgBytes []byte, portPrimary int, serverName, 
 	return updated, nil
 }
 
-func determineRunningEngineVersion(ctx context.Context, client ssh.SSHClient, defaultVersion string) string {
+func determineRunningEngineVersion(ctx context.Context, client ssh.SSHClient) string {
 	verCmd := fmt.Sprintf("docker exec %s xray version 2>/dev/null", ssh.EscapeShellArg(XrayContainerName))
 	if verOut, _, code, err := client.RunSudoCommand(ctx, verCmd); err == nil && code == 0 && strings.TrimSpace(verOut) != "" {
 		if fields := strings.Fields(strings.TrimSpace(verOut)); len(fields) >= 2 && strings.EqualFold(fields[0], "Xray") {
 			return fields[1]
 		}
 	}
-	return defaultVersion
+	return ""
 }
 
 // Install prepares the host, renders VLESS+REALITY configuration, and launches amnezia-xray.
@@ -878,7 +878,7 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	m.containerCache.set(m.containerCache.keyForServer(server), true)
 
 	// Determine running engine version from container inspect/exec
-	runningVersion := determineRunningEngineVersion(ctx, client, profile.Version)
+	runningVersion := determineRunningEngineVersion(ctx, client)
 
 	// Update server.Protocols in-memory for caller awareness
 	if server.Protocols == nil {
@@ -897,7 +897,14 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	protoMeta["engine_profile"] = string(profile.Name)
 	protoMeta["engine_version"] = profile.Version
 	protoMeta["engine_image"] = profile.Image
-	protoMeta["running_engine_version"] = runningVersion
+	if runningVersion != "" {
+		protoMeta["running_engine_version"] = runningVersion
+	} else {
+		delete(protoMeta, "running_engine_version")
+		if pMap, ok := protoMeta["params"].(map[string]any); ok && pMap != nil {
+			delete(pMap, "running_engine_version")
+		}
+	}
 	server.Protocols[models.ProtocolVLESS] = protoMeta
 
 	return nil

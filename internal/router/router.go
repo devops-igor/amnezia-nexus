@@ -269,6 +269,7 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 				r.Use(middleware.RequireAdmin)
 				r.Post("/{server_id}/clear", h.ClearServerHandler)
 				r.Post("/{server_id}/reality/scan-sni", h.ScanRealitySNIHandler)
+				r.Get("/{server_id}/engine-status", h.ServerEngineStatusHandler)
 			})
 		})
 	})
