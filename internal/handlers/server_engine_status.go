@@ -10,6 +10,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/updater"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/xray"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
@@ -204,10 +205,18 @@ func isXrayProfileCompatible(profile, upstreamTag string) bool {
 	if err != nil {
 		return false
 	}
+	if prof, err := xray.ResolveEngineProfile(norm); err == nil {
+		switch prof.Name {
+		case xray.EngineProfileLegacy:
+			return vLat.Major() < 20
+		case xray.EngineProfileModernPQ:
+			return vLat.Major() >= 20
+		}
+	}
 	switch {
-	case norm == "legacy" || norm == "legacy_baseline" || norm == "baseline" || norm == "1.8.24" || norm == "v1.8.24":
+	case norm == "legacy" || norm == "legacy_baseline" || norm == "legacy compatibility baseline" || norm == "baseline" || norm == "1.8.24" || norm == "v1.8.24":
 		return vLat.Major() < 20
-	case norm == "modern_pq" || norm == "modern" || norm == "pq" || norm == "v26" || norm == "26" || strings.HasPrefix(norm, "26.10.") || strings.HasPrefix(norm, "v26.10."):
+	case norm == "modern_pq" || norm == "modern" || norm == "pq" || norm == "26.10.29" || norm == "v26.10.29" || norm == "modern pq" || norm == "post_quantum" || norm == "post-quantum" || norm == "v26" || norm == "26" || strings.HasPrefix(norm, "26.10.") || strings.HasPrefix(norm, "v26.10."):
 		return vLat.Major() >= 20
 	default:
 		return false
@@ -419,12 +428,18 @@ func extractXrayProfile(meta map[string]any) string {
 	}
 	for _, key := range []string{"engine_profile", "engineProfile", "profile"} {
 		if p, ok := meta[key].(string); ok && strings.TrimSpace(p) != "" {
+			if prof, err := xray.ResolveEngineProfile(p); err == nil {
+				return string(prof.Name)
+			}
 			return strings.TrimSpace(p)
 		}
 	}
 	if params, ok := meta["params"].(map[string]any); ok {
 		for _, key := range []string{"engine_profile", "engineProfile", "profile"} {
 			if p, ok := params[key].(string); ok && strings.TrimSpace(p) != "" {
+				if prof, err := xray.ResolveEngineProfile(p); err == nil {
+					return string(prof.Name)
+				}
 				return strings.TrimSpace(p)
 			}
 		}

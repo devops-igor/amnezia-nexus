@@ -397,9 +397,9 @@ func isProfileCompatible(engine EngineType, profile, upstreamTag string) bool {
 	}
 
 	switch {
-	case norm == "legacy" || norm == "legacy_baseline" || norm == "baseline" || norm == "1.8.24" || norm == "v1.8.24":
+	case norm == "legacy" || norm == "legacy_baseline" || norm == "legacy compatibility baseline" || norm == "baseline" || norm == "1.8.24" || norm == "v1.8.24":
 		return vLat.Major() < 20
-	case norm == "modern_pq" || norm == "modern" || norm == "pq" || norm == "v26" || norm == "26" || strings.HasPrefix(norm, "26.10.") || strings.HasPrefix(norm, "v26.10."):
+	case norm == "modern_pq" || norm == "modern" || norm == "pq" || norm == "26.10.29" || norm == "v26.10.29" || norm == "modern pq" || norm == "post_quantum" || norm == "post-quantum" || norm == "v26" || norm == "26" || strings.HasPrefix(norm, "26.10.") || strings.HasPrefix(norm, "v26.10."):
 		return vLat.Major() >= 20
 	default:
 		return false
