@@ -46,28 +46,38 @@ jobs:
       # the runner's Go 1.26, matching local dev (v1.64.8 built go1.26.6).
       - name: Build golangci-lint from source
         run: |
-          if ! command -v golangci-lint >/dev/null || ! go version -m "$(command -v golangci-lint)" | grep -Eq "^[[:space:]]*mod[[:space:]]+github\.com/golangci/golangci-lint[[:space:]]+v1\.64\.8([[:space:]]|$)" || ! go version -m "$(command -v golangci-lint)" | grep -Eq ": $(go env GOVERSION)$"; then
-            go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+          if ! test -x /usr/local/bin/golangci-lint || ! go version -m "/usr/local/bin/golangci-lint" | grep -Eq "^[[:space:]]*mod[[:space:]]+github\.com/golangci/golangci-lint[[:space:]]+v1\.64\.8([[:space:]]|$)" || ! go version -m "/usr/local/bin/golangci-lint" | grep -Fxq "/usr/local/bin/golangci-lint: $(go env GOVERSION)"; then
+            tool_dir=$(mktemp -d)
+            GOBIN="$tool_dir" go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+            sudo install -m 0755 "$tool_dir/golangci-lint" /usr/local/bin/golangci-lint
+            rm -rf "$tool_dir"
           fi
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run golangci-lint
-        run: golangci-lint run --timeout=5m ./...
+        run: /usr/local/bin/golangci-lint run --timeout=5m ./...
 
       - name: Install Security Scanners
         run: |
-          if ! command -v gosec >/dev/null || ! go version -m "$(command -v gosec)" | grep -Eq "^[[:space:]]*mod[[:space:]]+github\.com/securego/gosec/v2[[:space:]]+v2\.30\.0([[:space:]]|$)" || ! go version -m "$(command -v gosec)" | grep -Eq ": $(go env GOVERSION)$"; then
-            go install github.com/securego/gosec/v2/cmd/gosec@v2.30.0
+          if ! test -x /usr/local/bin/gosec || ! go version -m "/usr/local/bin/gosec" | grep -Eq "^[[:space:]]*mod[[:space:]]+github\.com/securego/gosec/v2[[:space:]]+v2\.30\.0([[:space:]]|$)" || ! go version -m "/usr/local/bin/gosec" | grep -Fxq "/usr/local/bin/gosec: $(go env GOVERSION)"; then
+            tool_dir=$(mktemp -d)
+            GOBIN="$tool_dir" go install github.com/securego/gosec/v2/cmd/gosec@v2.30.0
+            sudo install -m 0755 "$tool_dir/gosec" /usr/local/bin/gosec
+            rm -rf "$tool_dir"
           fi
-          if ! command -v govulncheck >/dev/null || ! go version -m "$(command -v govulncheck)" | grep -Eq "^[[:space:]]*mod[[:space:]]+golang\.org/x/vuln[[:space:]]+v1\.9\.0([[:space:]]|$)" || ! go version -m "$(command -v govulncheck)" | grep -Eq ": $(go env GOVERSION)$"; then
-            go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          if ! test -x /usr/local/bin/govulncheck || ! go version -m "/usr/local/bin/govulncheck" | grep -Eq "^[[:space:]]*mod[[:space:]]+golang\.org/x/vuln[[:space:]]+v1\.9\.0([[:space:]]|$)" || ! go version -m "/usr/local/bin/govulncheck" | grep -Fxq "/usr/local/bin/govulncheck: $(go env GOVERSION)"; then
+            tool_dir=$(mktemp -d)
+            GOBIN="$tool_dir" go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+            sudo install -m 0755 "$tool_dir/govulncheck" /usr/local/bin/govulncheck
+            rm -rf "$tool_dir"
           fi
 
       - name: Run gosec Security Scanner
-        run: gosec -tags with_utls -quiet ./...
+        run: /usr/local/bin/gosec -tags with_utls -quiet ./...
 
       - name: Run govulncheck Vulnerability Scanner
-        run: govulncheck ./...
+        run: /usr/local/bin/govulncheck ./...
 
   test:
     name: Automated Test Suite
