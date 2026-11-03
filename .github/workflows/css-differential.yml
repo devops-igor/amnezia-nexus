@@ -3,6 +3,9 @@ name: CSS Differential Oracle
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: css-differential-${{ github.ref }}
   cancel-in-progress: true
@@ -10,11 +13,13 @@ concurrency:
 jobs:
   css-differential:
     name: CSS Differential Oracle
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, isolated-vm]
     timeout-minutes: 20
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7

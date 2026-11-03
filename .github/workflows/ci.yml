@@ -9,6 +9,9 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -19,10 +22,12 @@ env:
 jobs:
   lint-and-security:
     name: Lint & Security Audit
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, isolated-vm]
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -60,11 +65,13 @@ jobs:
 
   test:
     name: Automated Test Suite
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, isolated-vm]
     timeout-minutes: 20
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -85,7 +92,7 @@ jobs:
       - name: Build Caddy with forwardproxy for Naive Smoke Tests
         run: |
           go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
-          xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$(go env GOPATH)/bin/caddy"
+          "$(go env GOPATH)/bin/xcaddy" build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$(go env GOPATH)/bin/caddy"
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Install musl libc and Alpine libgcc for Native NaiveProxy Tests
@@ -114,7 +121,7 @@ jobs:
 
   build-matrix:
     name: Cross-Compile Matrix (${{ matrix.target.os }}/${{ matrix.target.arch }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, isolated-vm]
     strategy:
       fail-fast: false
       matrix:
@@ -124,6 +131,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v7

@@ -24,18 +24,26 @@ on:
     # Run full unaccelerated soak weekly on Sunday at 02:00 UTC
     - cron: '0 2 * * 0'
 
+permissions:
+  contents: read
+
 concurrency:
   group: differential-soak-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  GOFLAGS: -tags=with_utls
+
 jobs:
   differential-qualification:
     name: Differential Qualification (${{ github.event.inputs.suite || 'scheduled-soak-full' }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, isolated-vm]
     timeout-minutes: 90
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v7
