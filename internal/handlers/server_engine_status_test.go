@@ -760,4 +760,199 @@ func TestExtractCaddyAndNaiveVersion(t *testing.T) {
 	if v := extractNaivePluginVersion(map[string]any{"plugin_version": "v2.11.7-naive1"}); v != "v2.11.7-naive1" {
 		t.Errorf("expected 'v2.11.7-naive1', got %q", v)
 	}
+	if v := extractNaivePluginVersion(map[string]any{"plugin_version": "c096d6a00cb28e019cc1995b04bdc6a9311d8024"}); v != "v2.11.7-naive2" {
+		t.Errorf("expected commit to map to 'v2.11.7-naive2', got %q", v)
+	}
+}
+
+func TestExtractXrayVersion_PrecedenceAndNoGuessing(t *testing.T) {
+	cases := []struct {
+		name     string
+		meta     map[string]any
+		expected string
+	}{
+		{"running version prioritizes over stale engine_version", map[string]any{
+			"running_engine_version": "1.8.24", "engine_version": "1.8.20", "engine_image": "ghcr.io/xtls/xray-core:v1.8.20",
+		}, "1.8.24"},
+		{"image tag fallback when running version absent", map[string]any{"engine_image": "ghcr.io/xtls/xray-core:v26.10.29"}, "v26.10.29"},
+		{"static engine version fallback", map[string]any{"engine_version": "1.8.24"}, "1.8.24"},
+		{"no version returns empty without guessing from legacy profile", map[string]any{"engine_profile": "legacy"}, ""},
+		{"no version returns empty without guessing from modern_pq profile", map[string]any{"engine_profile": "modern_pq"}, ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := extractXrayVersion(tc.meta); got != tc.expected {
+				t.Errorf("extractXrayVersion() = %q, want %q", got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestResolveSingBoxStatus_NoFallback(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	checker := updater.NewReleaseChecker()
+	dest := make(map[string]any)
+
+	h.resolveSingBoxStatus(context.Background(), checker, map[string]any{"installed": true}, dest)
+	st, ok := dest["sing-box"].(updater.EngineStatus)
+	if !ok {
+		t.Fatalf("expected dest[sing-box] to be updater.EngineStatus")
+	}
+	if st.InstalledVersion != "" {
+		t.Errorf("expected empty InstalledVersion, got %q", st.InstalledVersion)
+	}
+	if st.Status != updater.UpdateUnknown {
+		t.Errorf("expected UpdateUnknown for unversioned sing-box, got %q", st.Status)
+	}
+}
+
+func TestResolveServerEngineStatus_UpstreamErrorsPreserved(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+	}))
+	defer errSrv.Close()
+
+	checker := updater.NewReleaseChecker(updater.WithBaseURL(errSrv.URL), updater.WithHTTPClient(errSrv.Client()))
+	h.SetUpdaterService(checker)
+
+	server := &models.Server{
+		Name: "Error Test Server",
+		Host: "192.0.2.20",
+		Protocols: map[string]any{
+			models.ProtocolVLESS: map[string]any{"installed": true, "engine_version": "1.8.24"},
+			models.ProtocolNaive: map[string]any{"installed": true, "caddy_version": "2.8.4", "plugin_version": "v2.11.7-naive2"},
+			"sing-box":           map[string]any{"installed": true, "version": "1.9.1"},
+		},
+	}
+	sID, _ := db.CreateServer(context.Background(), server)
+	server.ID = sID
+
+	statusMap := h.resolveServerEngineStatus(context.Background(), server)
+	if statusMap == nil {
+		t.Fatalf("expected non-nil statusMap on upstream error")
+	}
+
+	for _, key := range []string{"vless", "caddy", "naive", "sing-box"} {
+		st, ok := statusMap[key].(updater.EngineStatus)
+		if !ok {
+			t.Errorf("expected %q to be preserved on upstream error, missing from map", key)
+			continue
+		}
+		if st.Status != updater.UpdateUnknown {
+			t.Errorf("expected %q status %q, got %q", key, updater.UpdateUnknown, st.Status)
+		}
+		if st.UpdateAvailable {
+			t.Errorf("expected %q UpdateAvailable = false on upstream error", key)
+		}
+	}
+}
+
+func TestCanonicalResponseKeys_NoDuplicateAliases(t *testing.T) {
+	h, server, cleanup := setupEngineTestHandlers(t)
+	defer cleanup()
+
+	statusMap := h.resolveServerEngineStatus(context.Background(), server)
+	if statusMap == nil {
+		t.Fatalf("expected populated statusMap")
+	}
+
+	forbiddenAliases := []string{"xray", "caddy_core", "naive-forwardproxy", "forwardproxy"}
+	for _, alias := range forbiddenAliases {
+		if _, exists := statusMap[alias]; exists {
+			t.Errorf("found forbidden alias %q in statusMap; only canonical keys allowed", alias)
+		}
+	}
+
+	requiredCanonical := []string{"vless", "caddy", "naive"}
+	for _, canon := range requiredCanonical {
+		if _, exists := statusMap[canon]; !exists {
+			t.Errorf("expected canonical key %q in statusMap", canon)
+		}
+	}
+}
+
+func TestListServersHandler_DecoupledFromGitHub_FastColdCache(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+
+	slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(3 * time.Second)
+		http.NotFound(w, r)
+	}))
+	defer slowSrv.Close()
+
+	checker := updater.NewReleaseChecker(updater.WithBaseURL(slowSrv.URL), updater.WithHTTPClient(slowSrv.Client()))
+	h.SetUpdaterService(checker)
+
+	ctx := context.Background()
+	for i := 1; i <= 3; i++ {
+		s := &models.Server{
+			Name: fmt.Sprintf("Multi Server %d", i),
+			Host: fmt.Sprintf("192.0.2.%d", 30+i),
+			Protocols: map[string]any{
+				models.ProtocolVLESS: map[string]any{"installed": true, "engine_version": "1.8.24"},
+				models.ProtocolNaive: map[string]any{"installed": true, "caddy_version": "2.8.4"},
+			},
+		}
+		_, err := db.CreateServer(ctx, s)
+		if err != nil {
+			t.Fatalf("CreateServer failed: %v", err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/servers", nil)
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin-1", Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+
+	start := time.Now()
+	h.ListServersHandler(w, req)
+	elapsed := time.Since(start)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w.Code)
+	}
+
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("ListServersHandler took %v (> 500ms); failed decoupling from GitHub", elapsed)
+	}
+
+	var servers []models.ServerItemResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &servers); err != nil {
+		t.Fatalf("failed to parse servers response: %v", err)
+	}
+	for _, s := range servers {
+		if s.EngineStatus == nil {
+			t.Fatalf("expected EngineStatus to be populated on server %d", s.ID)
+		}
+		vless, ok := s.EngineStatus["vless"].(map[string]any)
+		if !ok || vless["status"] != string(updater.UpdateUnknown) {
+			t.Errorf("expected cold cache vless status unknown, got %+v", s.EngineStatus["vless"])
+		}
+	}
+}
+
+func TestNaiveInstall_MetadataPersistenceFlow(t *testing.T) {
+	h, server, cleanup := setupEngineTestHandlers(t)
+	defer cleanup()
+
+	naiveProto, ok := server.Protocols[models.ProtocolNaive].(map[string]any)
+	if !ok {
+		t.Fatalf("expected naive protocol in server")
+	}
+	caddyVer := extractCaddyVersion(naiveProto)
+	pluginVer := extractNaivePluginVersion(naiveProto)
+	if caddyVer == "" || pluginVer == "" {
+		t.Errorf("expected non-empty caddyVer and pluginVer, got %q, %q", caddyVer, pluginVer)
+	}
+
+	statusMap := h.resolveServerEngineStatus(context.Background(), server)
+	cStatus, ok := statusMap["caddy"].(updater.EngineStatus)
+	if !ok || cStatus.InstalledVersion != "v2.8.0" || !cStatus.UpdateAvailable {
+		t.Errorf("unexpected caddy status: %+v", cStatus)
+	}
+	nStatus, ok := statusMap["naive"].(updater.EngineStatus)
+	if !ok || nStatus.InstalledVersion != "v2.11.7-naive1" || !nStatus.UpdateAvailable {
+		t.Errorf("unexpected naive status: %+v", nStatus)
+	}
 }
