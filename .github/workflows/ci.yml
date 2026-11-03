@@ -46,7 +46,9 @@ jobs:
       # the runner's Go 1.26, matching local dev (v1.64.8 built go1.26.6).
       - name: Build golangci-lint from source
         run: |
-          go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+          if ! command -v golangci-lint >/dev/null || ! go version -m "$(command -v golangci-lint)" | grep -q "v1.64.8"; then
+            go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+          fi
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run golangci-lint
@@ -54,8 +56,12 @@ jobs:
 
       - name: Install Security Scanners
         run: |
-          go install github.com/securego/gosec/v2/cmd/gosec@latest
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          if ! command -v gosec >/dev/null || ! go version -m "$(command -v gosec)" | grep -q "v2.30.0"; then
+            go install github.com/securego/gosec/v2/cmd/gosec@v2.30.0
+          fi
+          if ! command -v govulncheck >/dev/null || ! go version -m "$(command -v govulncheck)" | grep -q "v1.9.0"; then
+            go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          fi
 
       - name: Run gosec Security Scanner
         run: gosec -tags with_utls -quiet ./...
