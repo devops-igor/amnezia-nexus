@@ -23,6 +23,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/mtproxyl"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/naive"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/updater"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/xray"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -55,6 +56,7 @@ type Dependencies struct {
 	NaiveManager    *naive.NaiveManager
 	VPNService      *vpn.Service
 	UpstreamService UpstreamChecker
+	UpdaterService  *updater.ReleaseChecker
 }
 
 // Handlers encapsulates all HTTP route handlers and business logic.
@@ -70,6 +72,7 @@ type Handlers struct {
 	naiveMgr                  *naive.NaiveManager
 	vpnSvc                    *vpn.Service
 	upstreamSvc               UpstreamChecker
+	updaterSvc                *updater.ReleaseChecker
 	dialTimeout               func(network, address string, timeout time.Duration) (net.Conn, error)
 	setupMu                   sync.Mutex
 	captchaOnce               sync.Once
@@ -124,6 +127,11 @@ func NewHandlers(deps Dependencies) *Handlers {
 		naiveMgr:    deps.NaiveManager,
 		vpnSvc:      deps.VPNService,
 		upstreamSvc: deps.UpstreamService,
+		updaterSvc:  deps.UpdaterService,
+	}
+
+	if h.updaterSvc == nil {
+		h.updaterSvc = updater.NewReleaseChecker()
 	}
 
 	if h.upstreamSvc == nil {
@@ -163,6 +171,16 @@ func (h *Handlers) UpstreamService() UpstreamChecker {
 // SetUpstreamService sets the upstream service checker.
 func (h *Handlers) SetUpstreamService(svc UpstreamChecker) {
 	h.upstreamSvc = svc
+}
+
+// UpdaterService returns the updater release checker.
+func (h *Handlers) UpdaterService() *updater.ReleaseChecker {
+	return h.updaterSvc
+}
+
+// SetUpdaterService sets the updater release checker.
+func (h *Handlers) SetUpdaterService(svc *updater.ReleaseChecker) {
+	h.updaterSvc = svc
 }
 
 // JSON writes a typed JSON response with status code.
