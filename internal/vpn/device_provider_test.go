@@ -4,13 +4,69 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/orchestrator"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
+
+type mockBackendCanaryDevice struct {
+	mu          sync.Mutex
+	written     [][]byte
+	replyData   []byte
+	canaryHooks map[uint64]tunnel.CanaryResponseHook
+	nextHookID  uint64
+}
+
+var _ tunnel.CanaryResponseDemuxer = (*mockBackendCanaryDevice)(nil)
+var _ BackendDevice = (*mockBackendCanaryDevice)(nil)
+
+func (m *mockBackendCanaryDevice) Read([]byte) (int, error)     { return 0, io.EOF }
+func (m *mockBackendCanaryDevice) Close() error                 { return nil }
+func (m *mockBackendCanaryDevice) IsClosed() bool               { return false }
+func (m *mockBackendCanaryDevice) CreatedAt() time.Time         { return time.Now() }
+func (m *mockBackendCanaryDevice) LastHandshakeTime() time.Time { return time.Now() }
+func (m *mockBackendCanaryDevice) DroppedPackets() uint64       { return 0 }
+
+func (m *mockBackendCanaryDevice) RegisterCanaryResponseHook(hook tunnel.CanaryResponseHook) func() {
+	m.mu.Lock()
+	if m.canaryHooks == nil {
+		m.canaryHooks = make(map[uint64]tunnel.CanaryResponseHook)
+	}
+	m.nextHookID++
+	id := m.nextHookID
+	m.canaryHooks[id] = hook
+	m.mu.Unlock()
+	return func() {
+		m.mu.Lock()
+		delete(m.canaryHooks, id)
+		m.mu.Unlock()
+	}
+}
+
+func (m *mockBackendCanaryDevice) Write(p []byte) (int, error) {
+	m.mu.Lock()
+	cp := make([]byte, len(p))
+	copy(cp, p)
+	m.written = append(m.written, cp)
+
+	if len(m.replyData) > 0 {
+		reply := make([]byte, len(m.replyData))
+		copy(reply, m.replyData)
+		for _, h := range m.canaryHooks {
+			if h != nil {
+				go h(reply)
+			}
+		}
+	}
+	m.mu.Unlock()
+	return len(p), nil
+}
 
 type testCanaryDevice struct {
 	canaryCalls int
@@ -128,7 +184,7 @@ func TestVPNService_DeviceProvider_SubnetCIDRWiring(t *testing.T) {
 		t.Fatalf("expected prober to resolve 10.100.0.0/16, got %s", proberSubnet)
 	}
 
-	// Service config update affects svc.SubnetCIDR() without causing lock-order inversion on prober
+	// Direct service config mutation does not dynamic-callback prober without explicit update
 	svc.cfg.SubnetCIDR = "10.200.0.0/16"
 	if got := svc.SubnetCIDR(); got != "10.200.0.0/16" {
 		t.Fatalf("expected updated subnet 10.200.0.0/16, got %s", got)
@@ -136,6 +192,73 @@ func TestVPNService_DeviceProvider_SubnetCIDRWiring(t *testing.T) {
 	// Prober retains its immutable SubnetCIDR without deadlocking or dynamic cross-lock callbacks
 	if proberSubnet := svc.prober.GetSubnetCIDR(); proberSubnet != "10.100.0.0/16" {
 		t.Fatalf("expected prober to retain immutable subnet 10.100.0.0/16, got %s", proberSubnet)
+	}
+
+	// Explicit update via SetDeviceProvider propagates updated subnet to prober safely
+	svc.prober.SetDeviceProvider(svc)
+	if proberSubnet := svc.prober.GetSubnetCIDR(); proberSubnet != "10.200.0.0/16" {
+		t.Fatalf("expected prober to update to 10.200.0.0/16 via SetDeviceProvider, got %s", proberSubnet)
+	}
+}
+
+func TestVPNService_CustomSubnetCIDR_CanaryGatewaySourceIP(t *testing.T) {
+	db := setupTestDB(t)
+	customCIDR := "10.200.0.0/16"
+	svc, s1, _, _, _ := setupTestVPNService(t, db, func(c *models.VPNConfig) {
+		c.SubnetCIDR = customCIDR
+	})
+
+	if got := svc.SubnetCIDR(); got != customCIDR {
+		t.Fatalf("expected service subnet %s, got %s", customCIDR, got)
+	}
+
+	// Prober must be initialized with the custom SubnetCIDR from Service configuration
+	if got := svc.prober.GetSubnetCIDR(); got != customCIDR {
+		t.Fatalf("expected prober subnet %s, got %s", customCIDR, got)
+	}
+
+	ctx := t.Context()
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tun, err := svc.pool.GetTunnel(s1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Echo reply matching canary request (target responder 1.1.1.1, gateway 10.200.0.1)
+	dev := &mockBackendCanaryDevice{
+		replyData: tunnel.BuildCanaryICMPEchoReply(net.IPv4(1, 1, 1, 1), net.IPv4(10, 200, 0, 1), 0x0713, 1),
+	}
+	svc.backendDevices = map[int64]BackendDevice{tun.ID: dev}
+
+	if err := svc.ProbeCanary(ctx, tun); err != nil {
+		t.Fatalf("expected ProbeCanary to succeed, got %v", err)
+	}
+
+	dev.mu.Lock()
+	defer dev.mu.Unlock()
+	if len(dev.written) == 0 {
+		t.Fatal("expected at least one canary packet written to device")
+	}
+
+	pkt := dev.written[0]
+	if len(pkt) < 20 {
+		t.Fatalf("written packet too short for IPv4 header: %d bytes", len(pkt))
+	}
+
+	// Bytes 12..16 are the IPv4 source address
+	srcIP := net.IP(pkt[12:16])
+	expectedSrcIP := net.IPv4(10, 200, 0, 1).To4()
+	if !srcIP.Equal(expectedSrcIP) {
+		t.Fatalf("expected canary source IP %s derived from %s, got %s", expectedSrcIP, customCIDR, srcIP)
+	}
+
+	// Bytes 16..20 are the IPv4 destination address (public canary responder 1.1.1.1)
+	dstIP := net.IP(pkt[16:20])
+	expectedDstIP := net.IPv4(1, 1, 1, 1).To4()
+	if !dstIP.Equal(expectedDstIP) {
+		t.Fatalf("expected canary destination IP %s, got %s", expectedDstIP, dstIP)
 	}
 }
 

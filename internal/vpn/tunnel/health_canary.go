@@ -56,9 +56,15 @@ type DeviceProvider interface {
 }
 
 // SetDeviceProvider registers a DeviceProvider or lookup callback for retrieving active backend devices by tunnel ID.
+// When provider implements SubnetCIDR() string, the prober's SubnetCIDR is updated without holding prober lock during the lookup.
 func (hp *HealthProber) SetDeviceProvider(provider any) {
 	if hp == nil {
 		return
+	}
+	if sp, ok := provider.(interface{ SubnetCIDR() string }); ok {
+		if c := sp.SubnetCIDR(); c != "" {
+			hp.SetSubnetCIDR(c)
+		}
 	}
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
@@ -83,11 +89,25 @@ func (hp *HealthProber) SetDeviceProvider(provider any) {
 	}
 }
 
-// GetSubnetCIDR returns the immutable configured portal subnet CIDR for canary probes.
-// It is read directly from immutable prober configuration without acquiring hp.mu,
-// eliminating cross-lock contention with Service.mu.
+// SetSubnetCIDR updates the configured portal subnet CIDR for canary probes.
+func (hp *HealthProber) SetSubnetCIDR(cidr string) {
+	if hp == nil || cidr == "" {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	hp.cfg.SubnetCIDR = cidr
+}
+
+// GetSubnetCIDR returns the configured portal subnet CIDR for canary probes.
+// It is read under read lock without making external callbacks, eliminating cross-lock contention with Service.mu.
 func (hp *HealthProber) GetSubnetCIDR() string {
-	if hp == nil || hp.cfg.SubnetCIDR == "" {
+	if hp == nil {
+		return "10.100.0.0/16"
+	}
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	if hp.cfg.SubnetCIDR == "" {
 		return "10.100.0.0/16"
 	}
 	return hp.cfg.SubnetCIDR

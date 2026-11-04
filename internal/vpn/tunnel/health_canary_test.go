@@ -259,6 +259,36 @@ func TestHealthProber_SubnetCIDR_Resolution(t *testing.T) {
 	if got := hpEmpty.GetSubnetCIDR(); got != "10.100.0.0/16" {
 		t.Fatalf("expected fallback 10.100.0.0/16, got %s", got)
 	}
+
+	// Direct update via SetSubnetCIDR
+	hp.SetSubnetCIDR("10.250.0.0/16")
+	if got := hp.GetSubnetCIDR(); got != "10.250.0.0/16" {
+		t.Fatalf("expected SetSubnetCIDR 10.250.0.0/16, got %s", got)
+	}
+
+	// Empty string in SetSubnetCIDR is ignored
+	hp.SetSubnetCIDR("")
+	if got := hp.GetSubnetCIDR(); got != "10.250.0.0/16" {
+		t.Fatalf("expected retained 10.250.0.0/16 after empty update, got %s", got)
+	}
+
+	// Update via SetDeviceProvider when provider implements SubnetCIDR() string
+	hp.SetDeviceProvider(mockSubnetProvider("192.168.50.0/24"))
+	if got := hp.GetSubnetCIDR(); got != "192.168.50.0/24" {
+		t.Fatalf("expected updated 192.168.50.0/24 from DeviceProvider, got %s", got)
+	}
+
+	// Provider with empty subnet string does not overwrite
+	hp.SetDeviceProvider(mockSubnetProvider(""))
+	if got := hp.GetSubnetCIDR(); got != "192.168.50.0/24" {
+		t.Fatalf("expected retained 192.168.50.0/24 after empty provider subnet, got %s", got)
+	}
+}
+
+type mockSubnetProvider string
+
+func (m mockSubnetProvider) SubnetCIDR() string {
+	return string(m)
 }
 
 func TestHealthProber_ConcurrentMarkAdminDisabledAndCanaryNoDeadlock(t *testing.T) {
@@ -321,10 +351,26 @@ func TestHealthProber_ConcurrentMarkAdminDisabledAndCanaryNoDeadlock(t *testing.
 			case <-ctx.Done():
 				return
 			default:
-				if cidr := hp.GetSubnetCIDR(); cidr != "10.100.0.0/16" {
-					t.Errorf("expected subnet 10.100.0.0/16, got %s", cidr)
+				cidr := hp.GetSubnetCIDR()
+				if cidr != "10.100.0.0/16" && cidr != "10.200.0.0/16" && cidr != "172.16.0.0/12" {
+					t.Errorf("unexpected subnet: %s", cidr)
 					return
 				}
+			}
+		}
+	}()
+
+	// Worker 4: repeatedly call SetSubnetCIDR concurrently with Workers 1, 2, and 3
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		cidrs := []string{"10.100.0.0/16", "10.200.0.0/16", "172.16.0.0/12"}
+		for i := 0; i < iterations; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				hp.SetSubnetCIDR(cidrs[i%len(cidrs)])
 			}
 		}
 	}()
@@ -339,7 +385,7 @@ func TestHealthProber_ConcurrentMarkAdminDisabledAndCanaryNoDeadlock(t *testing.
 	case <-done:
 		// Success: no deadlock
 	case <-ctx.Done():
-		t.Fatal("deadlock detected: concurrent MarkAdminDisabled and ProbeCanary did not complete in time")
+		t.Fatal("deadlock detected: concurrent MarkAdminDisabled, ProbeCanary, and SetSubnetCIDR did not complete in time")
 	}
 }
 

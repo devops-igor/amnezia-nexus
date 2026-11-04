@@ -352,6 +352,9 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 		if cfg.HealthThresholdMS > 0 {
 			healthCfg.LatencyThresholdMS = int64(cfg.HealthThresholdMS)
 		}
+		if cfg.SubnetCIDR != "" {
+			healthCfg.SubnetCIDR = cfg.SubnetCIDR
+		}
 	}
 
 	prober := tunnel.NewHealthProber(pool, db, healthCfg)
