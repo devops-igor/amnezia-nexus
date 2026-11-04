@@ -146,6 +146,11 @@ func TestCanaryPacket_ICMP(t *testing.T) {
 	if !srcIP.Equal(net.IPv4(10, 100, 0, 1)) {
 		t.Errorf("expected source IP 10.100.0.1 from authorized portal subnet, got %s", srcIP)
 	}
+	// F5: Destination IP must be a reliable public canary responder (1.1.1.1) routed via WAN
+	dstIP := net.IPv4(pkt[16], pkt[17], pkt[18], pkt[19])
+	if !dstIP.Equal(net.IPv4(1, 1, 1, 1)) {
+		t.Errorf("expected destination IP 1.1.1.1 (public canary responder), got %s", dstIP)
+	}
 	ipCsum := internetChecksum(pkt[0:20])
 	if ipCsum != 0 {
 		t.Errorf("expected IP checksum verification to yield 0, got 0x%x", ipCsum)
@@ -176,6 +181,11 @@ func TestCanaryPacket_DNS(t *testing.T) {
 	if !srcIP.Equal(net.IPv4(10, 100, 0, 1)) {
 		t.Errorf("expected source IP 10.100.0.1 from authorized portal subnet, got %s", srcIP)
 	}
+	// F5: Destination IP must be a reliable public DNS resolver (1.1.1.1)
+	dstIP := net.IPv4(pkt[16], pkt[17], pkt[18], pkt[19])
+	if !dstIP.Equal(net.IPv4(1, 1, 1, 1)) {
+		t.Errorf("expected destination IP 1.1.1.1 (public canary resolver), got %s", dstIP)
+	}
 	ipCsum := internetChecksum(pkt[0:20])
 	if ipCsum != 0 {
 		t.Errorf("expected IP checksum verification 0, got 0x%x", ipCsum)
@@ -192,12 +202,12 @@ func TestCanarySourceIP_AuthorizedSubnetDerivation(t *testing.T) {
 		wantSrc string
 		wantDst string
 	}{
-		{"10.100.0.0/16", "10.100.0.1", "10.100.0.2"},
-		{"10.200.0.0/16", "10.200.0.1", "10.200.0.2"},
-		{"172.16.0.0/12", "172.16.0.1", "172.16.0.2"},
-		{"192.168.1.0/24", "192.168.1.1", "192.168.1.2"},
-		{"", "10.100.0.1", "10.100.0.2"},
-		{"invalid", "10.100.0.1", "10.100.0.2"},
+		{"10.100.0.0/16", "10.100.0.1", "1.1.1.1"},
+		{"10.200.0.0/16", "10.200.0.1", "1.1.1.1"},
+		{"172.16.0.0/12", "172.16.0.1", "1.1.1.1"},
+		{"192.168.1.0/24", "192.168.1.1", "1.1.1.1"},
+		{"", "10.100.0.1", "1.1.1.1"},
+		{"invalid", "10.100.0.1", "1.1.1.1"},
 	}
 
 	for _, tt := range tests {
@@ -216,11 +226,15 @@ func TestCanarySourceIP_AuthorizedSubnetDerivation(t *testing.T) {
 			}
 		}
 
-		// Verify constructed packet carries the derived source IP
+		// Verify constructed packet carries the derived source IP and public canary destination
 		pkt := CanaryPingPacketForSubnet(tt.cidr)
 		pktSrc := net.IPv4(pkt[12], pkt[13], pkt[14], pkt[15])
 		if pktSrc.String() != tt.wantSrc {
 			t.Errorf("CanaryPingPacketForSubnet(%q) src = %s, want %s", tt.cidr, pktSrc, tt.wantSrc)
+		}
+		pktDst := net.IPv4(pkt[16], pkt[17], pkt[18], pkt[19])
+		if pktDst.String() != tt.wantDst {
+			t.Errorf("CanaryPingPacketForSubnet(%q) dst = %s, want %s", tt.cidr, pktDst, tt.wantDst)
 		}
 	}
 }
@@ -260,7 +274,7 @@ func (d dummyProviderWithSubnet) SubnetCIDR() string {
 }
 
 func TestProbePacketDevice_Success(t *testing.T) {
-	echoReply := BuildCanaryICMPEchoReply(net.IPv4(10, 100, 0, 2), net.IPv4(10, 100, 0, 1), 0x0713, 1)
+	echoReply := BuildCanaryICMPEchoReply(net.IPv4(1, 1, 1, 1), net.IPv4(10, 100, 0, 1), 0x0713, 1)
 	dev := &mockPacketDevice{
 		replyData: echoReply,
 	}
@@ -303,7 +317,7 @@ func (b *bareTestPacketDevice) Close() error                { return nil }
 func TestProbePacketDevice_Timeout(t *testing.T) {
 	dev := &mockPacketDevice{
 		delay:     500 * time.Millisecond,
-		replyData: BuildCanaryICMPEchoReply(net.IPv4(10, 100, 0, 2), net.IPv4(10, 100, 0, 1), 0x0713, 1),
+		replyData: BuildCanaryICMPEchoReply(net.IPv4(1, 1, 1, 1), net.IPv4(10, 100, 0, 1), 0x0713, 1),
 	}
 	ctx := context.Background()
 	err := ProbePacketDevice(ctx, dev, 50*time.Millisecond)
@@ -351,7 +365,7 @@ func TestProbePacketDevice_DemuxerSingleReaderConcurrent(t *testing.T) {
 	}()
 
 	// Simulate backend replying to canary probes by dispatching Echo Reply to registered hook
-	echoReply := BuildCanaryICMPEchoReply(net.IPv4(10, 100, 0, 2), net.IPv4(10, 100, 0, 1), 0x0713, 1)
+	echoReply := BuildCanaryICMPEchoReply(net.IPv4(1, 1, 1, 1), net.IPv4(10, 100, 0, 1), 0x0713, 1)
 	dev.setReplyData(echoReply)
 
 	// Run canary probe concurrently with active return pump
@@ -374,7 +388,7 @@ func TestProbePacketDevice_DemuxerSingleReaderConcurrent(t *testing.T) {
 
 func TestProbePacketDevice_DemuxerIgnoresNonCanaryTraffic(t *testing.T) {
 	// A packet with wrong sequence or ID must not satisfy the canary listener
-	wrongReply := BuildCanaryICMPEchoReply(net.IPv4(10, 100, 0, 2), net.IPv4(10, 100, 0, 1), 0x9999, 99)
+	wrongReply := BuildCanaryICMPEchoReply(net.IPv4(1, 1, 1, 1), net.IPv4(10, 100, 0, 1), 0x9999, 99)
 	dev := &mockPacketDevice{
 		replyData: wrongReply,
 	}

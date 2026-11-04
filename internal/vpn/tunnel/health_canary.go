@@ -326,41 +326,39 @@ func CanarySourceIPFromCIDR(cidr string) net.IP {
 	return net.IP(gwBytes)
 }
 
-// CanaryDestinationIPFromCIDR derives a destination IP within the given CIDR subnet
-// for in-tunnel canary probing.
-func CanaryDestinationIPFromCIDR(cidr string) net.IP {
-	if cidr == "" {
-		cidr = "10.100.0.0/16"
-	}
-	ip, ipNet, err := net.ParseCIDR(cidr)
-	if err != nil || ip.To4() == nil {
-		return net.IPv4(10, 100, 0, 2)
-	}
-	ipv4 := ip.To4()
-	netInt := binary.BigEndian.Uint32(ipv4.Mask(ipNet.Mask))
-	maskInt := binary.BigEndian.Uint32(ipNet.Mask)
-	bcastInt := netInt | ^maskInt
-	dstInt := netInt + 2
-	if dstInt >= bcastInt {
-		dstInt = netInt + 1
-	}
-	dstBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(dstBytes, dstInt)
-	return net.IP(dstBytes)
+// DefaultCanaryDestination is the reliable public responder IP (1.1.1.1) used as the
+// canary probe destination. Packets targeting this address route through the backend tunnel
+// to WAN, eliciting responses from the internet rather than local client leases.
+var DefaultCanaryDestination = net.IPv4(1, 1, 1, 1)
+
+// CanaryDestinationIP returns a reliable public canary responder IP (1.1.1.1) that routes
+// through the backend tunnel to the internet WAN.
+func CanaryDestinationIP() net.IP {
+	return net.IPv4(1, 1, 1, 1)
 }
 
-// CanaryPingPacketForSubnet builds a valid ICMP Echo Request packet with source and destination
-// addresses inside the specified portal client subnet.
+// CanaryDestinationIPFromCIDR returns a reachable public responder IP (1.1.1.1) routed via WAN.
+// To ensure the canary probe verifies WAN reachability and is answered by an active internet responder
+// rather than being dropped or misrouted to a client lease, this targets a reliable public responder.
+// The cidr parameter is preserved for API compatibility.
+func CanaryDestinationIPFromCIDR(_ string) net.IP {
+	return CanaryDestinationIP()
+}
+
+// CanaryPingPacketForSubnet builds a valid ICMP Echo Request packet with source address
+// inside the specified portal client subnet and destination address targeting a reliable
+// public canary responder (1.1.1.1) routed via WAN.
 func CanaryPingPacketForSubnet(subnetCIDR string) []byte {
 	src := CanarySourceIPFromCIDR(subnetCIDR)
-	dst := CanaryDestinationIPFromCIDR(subnetCIDR)
+	dst := CanaryDestinationIP()
 	return BuildCanaryICMPEchoRequest(src, dst, 0x0713, 1)
 }
 
-// CanaryDNSPacketForSubnet builds a UDP DNS query with source address inside the specified portal client subnet.
+// CanaryDNSPacketForSubnet builds a UDP DNS query with source address inside the specified portal client subnet
+// and destination address targeting a reliable public DNS resolver (1.1.1.1).
 func CanaryDNSPacketForSubnet(subnetCIDR string) []byte {
 	src := CanarySourceIPFromCIDR(subnetCIDR)
-	dst := CanaryDestinationIPFromCIDR(subnetCIDR)
+	dst := CanaryDestinationIP()
 	return BuildCanaryDNSQuery(src, dst, "canary.nexus.internal")
 }
 
@@ -377,7 +375,7 @@ func BuildCanaryICMPEchoRequest(srcIP, dstIP net.IP, id, seq uint16) []byte {
 	}
 	dst := dstIP.To4()
 	if dst == nil {
-		dst = net.IPv4(10, 100, 0, 2).To4()
+		dst = net.IPv4(1, 1, 1, 1).To4()
 	}
 
 	pkt := make([]byte, 28) // 20 bytes IPv4 header + 8 bytes ICMP header
@@ -412,7 +410,7 @@ func BuildCanaryICMPEchoRequest(srcIP, dstIP net.IP, id, seq uint16) []byte {
 func BuildCanaryICMPEchoReply(srcIP, dstIP net.IP, id, seq uint16) []byte {
 	src := srcIP.To4()
 	if src == nil {
-		src = net.IPv4(10, 100, 0, 2).To4()
+		src = net.IPv4(1, 1, 1, 1).To4()
 	}
 	dst := dstIP.To4()
 	if dst == nil {
@@ -482,7 +480,7 @@ func BuildCanaryDNSQuery(srcIP, dstIP net.IP, domain string) []byte {
 	}
 	dst := dstIP.To4()
 	if dst == nil {
-		dst = net.IPv4(10, 100, 0, 2).To4()
+		dst = net.IPv4(1, 1, 1, 1).To4()
 	}
 
 	// Minimal DNS Query: ID(2), Flags(2), QDCOUNT(2), ANCOUNT(2), NSCOUNT(2), ARCOUNT(2) = 12 bytes
