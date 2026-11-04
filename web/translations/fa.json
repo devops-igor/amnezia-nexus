@@ -712,5 +712,17 @@
   "vpn_unit_bps": "B/s",
   "vpn_diag_probe_suffix": " (کاوش)",
   "vpn_diag_write_suffix": " (نوشتن)",
-  "vpn_diag_backend_option": "پشتیبان #{id}"
+  "vpn_diag_backend_option": "پشتیبان #{id}",
+  "gigahost_settings_title": "میزبانی ابری گیگاهوست",
+  "gigahost_api_key_label": "کلید API",
+  "gigahost_api_key_hint": "کلید دسترسی برای API گیگاهوست (flux_live_...)",
+  "gigahost_monthly_budget_label": "سقف بودجه ماهانه (NOK)",
+  "gigahost_monthly_budget_hint": "حداکثر سقف هزینه ماهانه به کرون نروژ",
+  "deploy_vps_title": "راه‌اندازی سرور مجازی ساعتی",
+  "deploy_vps_desc": "سفارش نمونه‌های سرور مجازی ساعتی از طریق API گیگاهوست",
+  "deploy_vps_select_plan": "انتخاب پلن",
+  "deploy_vps_select_region": "انتخاب منطقه",
+  "deploy_vps_select_os": "سیستم عامل",
+  "deploy_vps_btn": "راه‌اندازی سرور",
+  "deploy_vps_recent_orders": "استقرارهای اخیر"
 }
