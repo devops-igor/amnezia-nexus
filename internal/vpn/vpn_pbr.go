@@ -375,6 +375,55 @@ func (s *Service) ObserveDNSObservation(sessionID string, ip netip.Addr, decisio
 	}
 }
 
+func (s *Service) deriveDefaultGatewayDNSIP() netip.Addr {
+	s.mu.RLock()
+	subnet := ""
+	if s.cfg != nil {
+		subnet = s.cfg.SubnetCIDR
+	}
+	s.mu.RUnlock()
+	if subnet != "" {
+		if prefix, err := netip.ParsePrefix(subnet); err == nil {
+			addr := prefix.Addr()
+			b := addr.As4()
+			b[3] = 1
+			return netip.AddrFrom4(b)
+		}
+	}
+	return netip.MustParseAddr("10.100.0.1")
+}
+
+func initDefaultDNSGateway(gwDNS netip.Addr, matcher *policy.Matcher, rc forwarder.RouteCache) *gatewaydns.Gateway {
+	upstreams := []netip.AddrPort{
+		netip.MustParseAddrPort("1.1.1.1:53"),
+		netip.MustParseAddrPort("8.8.8.8:53"),
+	}
+	resolver, err := gatewaydns.NewUpstreamResolver(gatewaydns.ResolverConfig{
+		Upstreams: upstreams,
+	})
+	if err != nil {
+		return nil
+	}
+	dnsSrv, err := gatewaydns.NewServer(gatewaydns.ServerConfig{
+		Gateway: netip.AddrPortFrom(gwDNS, 53),
+	}, resolver, matcher)
+	if err != nil {
+		return nil
+	}
+	var obs gatewaydns.RouteObserver
+	if ro, ok := rc.(gatewaydns.RouteObserver); ok {
+		obs = ro
+	}
+	gw, err := gatewaydns.NewGateway(gatewaydns.GatewayConfig{
+		Gateway:       netip.AddrPortFrom(gwDNS, 53),
+		RouteObserver: obs,
+	}, dnsSrv)
+	if err != nil {
+		return nil
+	}
+	return gw
+}
+
 // initPBR initializes and configures policy-based routing on the service during startup.
 // It instantiates concrete WAN transport, route cache, and policy matcher if not already configured.
 // It fails closed if prerequisites or initialization fails.
@@ -399,24 +448,7 @@ func (s *Service) initPBR(ctx context.Context) error {
 
 	// 2. Gateway DNS IP: derive if not set
 	if !cfg.GatewayDNSIP.IsValid() {
-		s.mu.RLock()
-		subnet := ""
-		if s.cfg != nil {
-			subnet = s.cfg.SubnetCIDR
-		}
-		s.mu.RUnlock()
-		if subnet != "" {
-			if prefix, err := netip.ParsePrefix(subnet); err == nil {
-				// Gateway is standard first host in client subnet (.1)
-				addr := prefix.Addr()
-				b := addr.As4()
-				b[3] = 1
-				cfg.GatewayDNSIP = netip.AddrFrom4(b)
-			}
-		}
-		if !cfg.GatewayDNSIP.IsValid() {
-			cfg.GatewayDNSIP = netip.MustParseAddr("10.100.0.1")
-		}
+		cfg.GatewayDNSIP = s.deriveDefaultGatewayDNSIP()
 	}
 
 	// 3. WAN PacketDevice: instantiate production TUN device if not already provided
@@ -424,6 +456,9 @@ func (s *Service) initPBR(ctx context.Context) error {
 		wanDev, err := NewProductionWANDevice("nexus-wan0")
 		if err != nil {
 			return fmt.Errorf("create production wan device: %w", err)
+		}
+		if dev, ok := wanDev.(interface{ SetHostWANIP(netip.Addr) }); ok && cfg.HostWANIP.IsValid() {
+			dev.SetHostWANIP(cfg.HostWANIP)
 		}
 		cfg.WANDevice = wanDev
 	}
@@ -454,31 +489,7 @@ func (s *Service) initPBR(ctx context.Context) error {
 
 	// 5b. DNS Gateway: instantiate DNS gateway if not provided and connect RouteCache observer
 	if cfg.DNSGateway == nil && cfg.GatewayDNSIP.IsValid() {
-		upstreams := []netip.AddrPort{
-			netip.MustParseAddrPort("1.1.1.1:53"),
-			netip.MustParseAddrPort("8.8.8.8:53"),
-		}
-		resolver, err := gatewaydns.NewUpstreamResolver(gatewaydns.ResolverConfig{
-			Upstreams: upstreams,
-		})
-		if err == nil {
-			dnsSrv, err := gatewaydns.NewServer(gatewaydns.ServerConfig{
-				Gateway: netip.AddrPortFrom(cfg.GatewayDNSIP, 53),
-			}, resolver, cfg.PolicyMatcher)
-			if err == nil {
-				var obs gatewaydns.RouteObserver
-				if ro, ok := cfg.RouteCache.(gatewaydns.RouteObserver); ok {
-					obs = ro
-				}
-				gw, err := gatewaydns.NewGateway(gatewaydns.GatewayConfig{
-					Gateway:       netip.AddrPortFrom(cfg.GatewayDNSIP, 53),
-					RouteObserver: obs,
-				}, dnsSrv)
-				if err == nil {
-					cfg.DNSGateway = gw
-				}
-			}
-		}
+		cfg.DNSGateway = initDefaultDNSGateway(cfg.GatewayDNSIP, cfg.PolicyMatcher, cfg.RouteCache)
 	}
 
 	// 6. Configure PBR on Service (fails closed if prerequisite validation fails)

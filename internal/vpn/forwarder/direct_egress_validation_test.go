@@ -424,8 +424,8 @@ func TestValidation_NATPortPressure_FailClosedForeignTombstone(t *testing.T) {
 
 	// 4. Tenant B connects to targetB:80 (no foreign tombstone for targetB:80 exists on port 40000).
 	// Must succeed and allow legitimate replies!
-	pktB_safe := buildTestIPv4UDPPacket(clientIP, targetB, 20002, 80, []byte("req-b-safe"))
-	if err := dem.RouteDirect("tenant-b", clientIP.String(), "sess-b", 1, pktB_safe, capPathB.path); err != nil {
+	pktBSafe := buildTestIPv4UDPPacket(clientIP, targetB, 20002, 80, []byte("req-b-safe"))
+	if err := dem.RouteDirect("tenant-b", clientIP.String(), "sess-b", 1, pktBSafe, capPathB.path); err != nil {
 		t.Fatalf("Tenant B to safe destination failed: %v", err)
 	}
 
