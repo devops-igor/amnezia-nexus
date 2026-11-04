@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
@@ -600,14 +601,21 @@ func TestPBR_DNSGatewayPopulatesRouteCache_DirectEgress(t *testing.T) {
 		t.Fatalf("RouteClientToBackend for gateway DNS query failed: %v", err)
 	}
 
-	// Verify DNS reply was written back to client returnPath
-	repliesMu.Lock()
-	numReplies := len(clientReplies)
+	// Verify DNS reply was written back to client returnPath asynchronously
 	var latestReply []byte
-	if numReplies > 0 {
-		latestReply = clientReplies[numReplies-1]
+	numReplies := 0
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		repliesMu.Lock()
+		numReplies = len(clientReplies)
+		if numReplies >= 1 {
+			latestReply = clientReplies[numReplies-1]
+			repliesMu.Unlock()
+			break
+		}
+		repliesMu.Unlock()
+		time.Sleep(5 * time.Millisecond)
 	}
-	repliesMu.Unlock()
 	if numReplies != 1 {
 		t.Fatalf("expected 1 DNS reply delivered to client, got %d", numReplies)
 	}
@@ -651,6 +659,18 @@ func TestPBR_DNSGatewayPopulatesRouteCache_DirectEgress(t *testing.T) {
 		t.Fatalf("RouteClientToBackend for blocked.com query failed: %v", err)
 	}
 
+	// Wait for blocked.com reply to be delivered asynchronously
+	deadlineBlocked := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadlineBlocked) {
+		repliesMu.Lock()
+		n := len(clientReplies)
+		repliesMu.Unlock()
+		if n >= 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
 	// Verify route cache was populated with PROXY for 198.51.200.55
 	if got := rc.Lookup(sessionID, blockedIP); got != policy.Proxy {
 		t.Fatalf("expected route cache to have Proxy for blocked.com, got %v", got)
@@ -664,5 +684,272 @@ func TestPBR_DNSGatewayPopulatesRouteCache_DirectEgress(t *testing.T) {
 	// WAN writes must STILL be 1 (blockedTCP did not write to WAN)
 	if len(wanDev.getWritten()) != 1 {
 		t.Fatalf("expected blocked destination to NOT write to WAN, got %d writes", len(wanDev.getWritten()))
+	}
+}
+
+func TestMemoryRouteCache_R8B1_SharedIP_ProxyWins(t *testing.T) {
+	matcher := policy.NewMatcher()
+	rules, _, err := policy.Parse(context.Background(), strings.NewReader("blocked.com\n"), policy.Source{
+		ID:             "proxy-src",
+		Format:         policy.FormatDomains,
+		BareDomainMode: policy.DomainModeExact,
+	}, policy.DefaultParseLimits())
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	snap, err := policy.CompileSnapshot(1, "gen-shared", []policy.SourceParsedRules{
+		{SourceID: "proxy-src", Rules: rules},
+	})
+	if err != nil {
+		t.Fatalf("CompileSnapshot: %v", err)
+	}
+	matcher.Publish(snap)
+
+	sharedIP := netip.MustParseAddr("198.51.200.77")
+
+	t.Run("DirectThenProxy", func(t *testing.T) {
+		rc := NewMemoryRouteCache()
+		rc.AttachMatcher(matcher)
+		sessionID := "sess-shared-1"
+
+		reqDirect := new(mdns.Msg)
+		reqDirect.SetQuestion("unlisted.com.", mdns.TypeA)
+		respDirect := new(mdns.Msg)
+		respDirect.SetReply(reqDirect)
+		respDirect.Answer = append(respDirect.Answer, &mdns.A{
+			Hdr: mdns.RR_Header{Name: "unlisted.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+			A:   sharedIP.AsSlice(),
+		})
+
+		if err := rc.ObserveDNSResponse(sessionID, reqDirect, respDirect); err != nil {
+			t.Fatalf("ObserveDNSResponse Direct failed: %v", err)
+		}
+		if d := rc.Lookup(sessionID, sharedIP); d != policy.Direct {
+			t.Fatalf("expected Direct initially, got %v", d)
+		}
+
+		reqProxy := new(mdns.Msg)
+		reqProxy.SetQuestion("blocked.com.", mdns.TypeA)
+		respProxy := new(mdns.Msg)
+		respProxy.SetReply(reqProxy)
+		respProxy.Answer = append(respProxy.Answer, &mdns.A{
+			Hdr: mdns.RR_Header{Name: "blocked.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+			A:   sharedIP.AsSlice(),
+		})
+
+		if err := rc.ObserveDNSResponse(sessionID, reqProxy, respProxy); err != nil {
+			t.Fatalf("ObserveDNSResponse Proxy failed: %v", err)
+		}
+		if d := rc.Lookup(sessionID, sharedIP); d != policy.Proxy {
+			t.Fatalf("expected Proxy to override Direct for shared IP, got %v", d)
+		}
+	})
+
+	t.Run("ProxyThenDirect", func(t *testing.T) {
+		rc := NewMemoryRouteCache()
+		rc.AttachMatcher(matcher)
+		sessionID := "sess-shared-2"
+
+		reqProxy := new(mdns.Msg)
+		reqProxy.SetQuestion("blocked.com.", mdns.TypeA)
+		respProxy := new(mdns.Msg)
+		respProxy.SetReply(reqProxy)
+		respProxy.Answer = append(respProxy.Answer, &mdns.A{
+			Hdr: mdns.RR_Header{Name: "blocked.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+			A:   sharedIP.AsSlice(),
+		})
+
+		if err := rc.ObserveDNSResponse(sessionID, reqProxy, respProxy); err != nil {
+			t.Fatalf("ObserveDNSResponse Proxy failed: %v", err)
+		}
+		if d := rc.Lookup(sessionID, sharedIP); d != policy.Proxy {
+			t.Fatalf("expected Proxy initially, got %v", d)
+		}
+
+		reqDirect := new(mdns.Msg)
+		reqDirect.SetQuestion("unlisted.com.", mdns.TypeA)
+		respDirect := new(mdns.Msg)
+		respDirect.SetReply(reqDirect)
+		respDirect.Answer = append(respDirect.Answer, &mdns.A{
+			Hdr: mdns.RR_Header{Name: "unlisted.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+			A:   sharedIP.AsSlice(),
+		})
+
+		if err := rc.ObserveDNSResponse(sessionID, reqDirect, respDirect); err != nil {
+			t.Fatalf("ObserveDNSResponse Direct failed: %v", err)
+		}
+		if d := rc.Lookup(sessionID, sharedIP); d != policy.Proxy {
+			t.Fatalf("expected Proxy to remain winner over Direct, got %v", d)
+		}
+	})
+}
+
+func TestMemoryRouteCache_R8B1_CNAME_ProtectedDomainProxy(t *testing.T) {
+	matcher := policy.NewMatcher()
+	rules, _, _ := policy.Parse(context.Background(), strings.NewReader("protected.com\n"), policy.Source{
+		ID:             "proxy-src",
+		Format:         policy.FormatDomains,
+		BareDomainMode: policy.DomainModeExact,
+	}, policy.DefaultParseLimits())
+	snap, _ := policy.CompileSnapshot(1, "gen-cname", []policy.SourceParsedRules{
+		{SourceID: "proxy-src", Rules: rules},
+	})
+	matcher.Publish(snap)
+
+	rc := NewMemoryRouteCache()
+	rc.AttachMatcher(matcher)
+	sessionID := "sess-cname-1"
+	targetIP := netip.MustParseAddr("198.51.200.88")
+
+	req := new(mdns.Msg)
+	req.SetQuestion("alias.com.", mdns.TypeA)
+	resp := new(mdns.Msg)
+	resp.SetReply(req)
+	resp.Answer = append(resp.Answer, &mdns.CNAME{
+		Hdr:    mdns.RR_Header{Name: "alias.com.", Rrtype: mdns.TypeCNAME, Class: mdns.ClassINET, Ttl: 300},
+		Target: "protected.com.",
+	})
+	resp.Answer = append(resp.Answer, &mdns.A{
+		Hdr: mdns.RR_Header{Name: "protected.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+		A:   targetIP.AsSlice(),
+	})
+
+	if err := rc.ObserveDNSResponse(sessionID, req, resp); err != nil {
+		t.Fatalf("ObserveDNSResponse failed: %v", err)
+	}
+
+	if d := rc.Lookup(sessionID, targetIP); d != policy.Proxy {
+		t.Fatalf("expected CNAME to protected domain to evaluate to Proxy, got %v", d)
+	}
+}
+
+func TestMemoryRouteCache_R8B1_TTLExpiry_And_ZeroTTL(t *testing.T) {
+	rc := NewMemoryRouteCache()
+	sessionID := "sess-ttl-1"
+	testIP := netip.MustParseAddr("198.51.200.99")
+
+	t.Run("ZeroTTLDirectSuppressed", func(t *testing.T) {
+		req := new(mdns.Msg)
+		req.SetQuestion("zero.com.", mdns.TypeA)
+		resp := new(mdns.Msg)
+		resp.SetReply(req)
+		resp.Answer = append(resp.Answer, &mdns.A{
+			Hdr: mdns.RR_Header{Name: "zero.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 0},
+			A:   testIP.AsSlice(),
+		})
+
+		if err := rc.ObserveDNSResponse(sessionID, req, resp); err != nil {
+			t.Fatalf("ObserveDNSResponse: %v", err)
+		}
+		if d := rc.Lookup(sessionID, testIP); d != policy.Unknown {
+			t.Fatalf("expected zero-TTL Direct answer to yield Unknown, got %v", d)
+		}
+	})
+
+	t.Run("ZeroTTLProxyRevokesDirect", func(t *testing.T) {
+		matcher := policy.NewMatcher()
+		rules, _, _ := policy.Parse(context.Background(), strings.NewReader("blocked-zero.com\n"), policy.Source{
+			ID:             "proxy-src",
+			Format:         policy.FormatDomains,
+			BareDomainMode: policy.DomainModeExact,
+		}, policy.DefaultParseLimits())
+		snap, _ := policy.CompileSnapshot(1, "gen-ttl", []policy.SourceParsedRules{
+			{SourceID: "proxy-src", Rules: rules},
+		})
+		matcher.Publish(snap)
+		rc.AttachMatcher(matcher)
+
+		reqDirect := new(mdns.Msg)
+		reqDirect.SetQuestion("normal.com.", mdns.TypeA)
+		respDirect := new(mdns.Msg)
+		respDirect.SetReply(reqDirect)
+		respDirect.Answer = append(respDirect.Answer, &mdns.A{
+			Hdr: mdns.RR_Header{Name: "normal.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+			A:   testIP.AsSlice(),
+		})
+		_ = rc.ObserveDNSResponse(sessionID, reqDirect, respDirect)
+		if d := rc.Lookup(sessionID, testIP); d != policy.Direct {
+			t.Fatalf("expected Direct, got %v", d)
+		}
+
+		reqProxy := new(mdns.Msg)
+		reqProxy.SetQuestion("blocked-zero.com.", mdns.TypeA)
+		respProxy := new(mdns.Msg)
+		respProxy.SetReply(reqProxy)
+		respProxy.Answer = append(respProxy.Answer, &mdns.A{
+			Hdr: mdns.RR_Header{Name: "blocked-zero.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 0},
+			A:   testIP.AsSlice(),
+		})
+		_ = rc.ObserveDNSResponse(sessionID, reqProxy, respProxy)
+		if d := rc.Lookup(sessionID, testIP); d != policy.Unknown {
+			t.Fatalf("expected zero-TTL Proxy to revoke Direct to Unknown, got %v", d)
+		}
+	})
+}
+
+func TestMemoryRouteCache_R8B1_PolicyGenerationInvalidation(t *testing.T) {
+	matcher := policy.NewMatcher()
+	src := policy.NewMemorySource("src1", policy.ParsedRules{})
+	snap1, _ := policy.CompileSnapshot(1, "gen-v1", []policy.SourceParsedRules{src.ToSourceParsedRules()})
+	matcher.Publish(snap1)
+
+	rc := NewMemoryRouteCache()
+	rc.AttachMatcher(matcher)
+	sessionID := "sess-gen-1"
+	testIP := netip.MustParseAddr("93.184.216.34")
+
+	req := new(mdns.Msg)
+	req.SetQuestion("example.com.", mdns.TypeA)
+	resp := new(mdns.Msg)
+	resp.SetReply(req)
+	resp.Answer = append(resp.Answer, &mdns.A{
+		Hdr: mdns.RR_Header{Name: "example.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+		A:   testIP.AsSlice(),
+	})
+
+	if err := rc.ObserveDNSResponse(sessionID, req, resp); err != nil {
+		t.Fatalf("ObserveDNSResponse: %v", err)
+	}
+	if d := rc.Lookup(sessionID, testIP); d != policy.Direct {
+		t.Fatalf("expected Direct under gen-v1, got %v", d)
+	}
+
+	snap2, _ := policy.CompileSnapshot(2, "gen-v2", []policy.SourceParsedRules{src.ToSourceParsedRules()})
+	matcher.Publish(snap2)
+
+	if d := rc.Lookup(sessionID, testIP); d != policy.Unknown {
+		t.Fatalf("expected Unknown after generation change to gen-v2, got %v", d)
+	}
+}
+
+func TestPBRDNSHandler_R8H1_AsyncDrainUnblocked(t *testing.T) {
+	gwIP := netip.MustParseAddr("10.100.0.1")
+	rc := NewMemoryRouteCache()
+	matcher := policy.NewMatcher()
+	gw := initDefaultDNSGateway(gwIP, matcher, rc)
+	h := newPBRDNSHandler(gw, rc)
+	defer func() { _ = h.Close() }()
+
+	retPath := forwarder.NewReturnPath(func(pk, ip string, packet []byte) (int, error) {
+		return len(packet), nil
+	})
+
+	reqMsg := new(mdns.Msg)
+	reqMsg.SetQuestion("slow.com.", mdns.TypeA)
+	reqBytes, _ := reqMsg.Pack()
+	dnsPkt := buildTestPBRUDPPacket(netip.MustParseAddr("10.100.0.2"), gwIP, 12345, 53, reqBytes)
+
+	start := time.Now()
+	handled, err := h.HandleDNSPacket("sess-async", "peer-1", "10.100.0.2", retPath, dnsPkt)
+	duration := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("HandleDNSPacket error: %v", err)
+	}
+	if !handled {
+		t.Fatalf("expected handled == true for DNS packet")
+	}
+	if duration > 20*time.Millisecond {
+		t.Fatalf("HandleDNSPacket blocked for %v (expected < 20ms)", duration)
 	}
 }

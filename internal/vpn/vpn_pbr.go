@@ -2,11 +2,15 @@ package vpn
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
@@ -155,7 +159,12 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 		if obs, ok := cfg.RouteCache.(gatewaydns.RouteObserver); ok {
 			cfg.DNSGateway.SetObserver(obs)
 		}
-		s.forwarder.SetDNSHandler(&pbrDNSHandler{gw: cfg.DNSGateway})
+		if oldH := s.forwarder.DNSHandler(); oldH != nil {
+			if closer, ok := oldH.(io.Closer); ok {
+				_ = closer.Close()
+			}
+		}
+		s.forwarder.SetDNSHandler(newPBRDNSHandler(cfg.DNSGateway, cfg.RouteCache))
 	}
 
 	servicePBRConfigsMu.Lock()
@@ -175,26 +184,132 @@ func (s *Service) DNSGateway() *gatewaydns.Gateway {
 	return nil
 }
 
+type dnsJob struct {
+	sessionID  string
+	peerKey    string
+	assignedIP string
+	path       *forwarder.ReturnPath
+	packet     []byte
+}
+
 type pbrDNSHandler struct {
-	gw *gatewaydns.Gateway
+	gw      *gatewaydns.Gateway
+	rc      forwarder.RouteCache
+	queue   chan dnsJob
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	closed  atomic.Bool
+	dropped atomic.Uint64
+}
+
+const (
+	defaultDNSWorkerCount = 8
+	defaultDNSQueueCap    = 256
+)
+
+func newPBRDNSHandler(gw *gatewaydns.Gateway, rc forwarder.RouteCache) *pbrDNSHandler {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &pbrDNSHandler{
+		gw:     gw,
+		rc:     rc,
+		queue:  make(chan dnsJob, defaultDNSQueueCap),
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	h.wg.Add(defaultDNSWorkerCount)
+	for i := 0; i < defaultDNSWorkerCount; i++ {
+		go h.worker()
+	}
+	return h
+}
+
+func (h *pbrDNSHandler) Close() error {
+	if h == nil {
+		return nil
+	}
+	if h.closed.CompareAndSwap(false, true) {
+		h.cancel()
+		h.wg.Wait()
+	}
+	return nil
+}
+
+func (h *pbrDNSHandler) worker() {
+	defer h.wg.Done()
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case job, ok := <-h.queue:
+			if !ok {
+				return
+			}
+			h.processJob(job)
+		}
+	}
+}
+
+func (h *pbrDNSHandler) processJob(job dnsJob) {
+	if h.gw == nil {
+		return
+	}
+	writer := &pbrReplyWriter{
+		path:       job.path,
+		peerKey:    job.peerKey,
+		assignedIP: job.assignedIP,
+	}
+	var sc *policy.SessionCache
+	if opener, ok := h.rc.(interface{ Open(policy.Scope) (*policy.SessionCache, error) }); ok {
+		sc, _ = opener.Open(policy.Scope{SessionID: job.sessionID, OwnershipEpoch: 1})
+	}
+	scope := gatewaydns.NewScopeHandle(
+		h.ctx,
+		policy.Scope{SessionID: job.sessionID, OwnershipEpoch: 1},
+		sc,
+		writer,
+	)
+	_, _ = h.gw.TrySubmit(scope, job.packet)
 }
 
 func (h *pbrDNSHandler) HandleDNSPacket(sessionID, peerKey, assignedIP string, path *forwarder.ReturnPath, packet []byte) (bool, error) {
-	if h.gw == nil {
+	if h == nil || h.gw == nil || h.closed.Load() {
 		return false, nil
 	}
-	writer := &pbrReplyWriter{
-		path:       path,
+	if len(packet) < 20 {
+		return false, nil
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	if len(packet) < ihl+8 {
+		return false, nil
+	}
+	proto := packet[9]
+	if proto != 17 && proto != 6 {
+		return false, nil
+	}
+	dstPort := binary.BigEndian.Uint16(packet[ihl+2 : ihl+4])
+	if dstPort != 53 {
+		return false, nil
+	}
+
+	pktCopy := make([]byte, len(packet))
+	copy(pktCopy, packet)
+
+	job := dnsJob{
+		sessionID:  sessionID,
 		peerKey:    peerKey,
 		assignedIP: assignedIP,
+		path:       path,
+		packet:     pktCopy,
 	}
-	scope := gatewaydns.NewScopeHandle(
-		context.Background(),
-		policy.Scope{SessionID: sessionID, OwnershipEpoch: 1},
-		nil,
-		writer,
-	)
-	return h.gw.TrySubmit(scope, packet)
+
+	select {
+	case h.queue <- job:
+		return true, nil
+	default:
+		h.dropped.Add(1)
+		return true, nil
+	}
 }
 
 type pbrReplyWriter struct {
@@ -246,17 +361,29 @@ func (s *Service) getPBRConfig() *PBRConfig {
 	return servicePBRConfigs[s]
 }
 
-// MemoryRouteCache provides an in-memory implementation of forwarder.RouteCache.
+// MemoryRouteCache provides an in-memory implementation of forwarder.RouteCache
+// backed by authentic policy.RouteCache with PROXY-wins, CNAME, TTL, and generation invalidation.
 type MemoryRouteCache struct {
-	mu        sync.RWMutex
-	decisions map[string]map[netip.Addr]policy.Decision
-	matcher   *policy.Matcher
+	mu      sync.RWMutex
+	rc      *policy.RouteCache
+	matcher *policy.Matcher
+	gen     string
 }
 
-// NewMemoryRouteCache creates an in-memory RouteCache.
+// NewMemoryRouteCache creates an in-memory RouteCache backed by authentic policy.RouteCache.
 func NewMemoryRouteCache() *MemoryRouteCache {
+	rc, _ := policy.NewRouteCache(policy.CacheConfig{})
+	const initialGen = "gen-initial"
+	rc.SetPolicyGeneration(initialGen)
+	m := policy.NewMatcher()
+	initSrc := policy.NewMemorySource("default", policy.ParsedRules{})
+	if snap, err := policy.CompileSnapshot(1, initialGen, []policy.SourceParsedRules{initSrc.ToSourceParsedRules()}); err == nil {
+		m.Publish(snap)
+	}
 	return &MemoryRouteCache{
-		decisions: make(map[string]map[netip.Addr]policy.Decision),
+		rc:      rc,
+		matcher: m,
+		gen:     initialGen,
 	}
 }
 
@@ -265,6 +392,12 @@ func (c *MemoryRouteCache) AttachMatcher(m *policy.Matcher) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.matcher = m
+	if m != nil {
+		if snap := m.Current(); snap != nil && snap.Generation() != "" {
+			c.gen = snap.Generation()
+			c.rc.SetPolicyGeneration(c.gen)
+		}
+	}
 }
 
 // PolicyMatcher returns the attached policy matcher.
@@ -276,24 +409,47 @@ func (c *MemoryRouteCache) PolicyMatcher() *policy.Matcher {
 
 // Lookup queries the routing decision for a destination IP in the session scope.
 func (c *MemoryRouteCache) Lookup(sessionID string, ip netip.Addr) policy.Decision {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if sess, ok := c.decisions[sessionID]; ok {
-		if d, ok := sess[ip]; ok {
-			return d
+	if c == nil || sessionID == "" || !ip.IsValid() || !ip.Is4() {
+		return policy.Unknown
+	}
+	c.mu.Lock()
+	if c.matcher != nil {
+		if snap := c.matcher.Current(); snap != nil && snap.Generation() != "" && snap.Generation() != c.gen {
+			c.gen = snap.Generation()
+			c.rc.SetPolicyGeneration(c.gen)
 		}
 	}
-	return policy.Unknown
+	gen := c.gen
+	sc, err := c.rc.Open(policy.Scope{SessionID: sessionID, OwnershipEpoch: 1})
+	c.mu.Unlock()
+
+	if err != nil || sc == nil {
+		return policy.Unknown
+	}
+	return sc.Lookup(ip, gen, time.Now())
 }
 
 // Set stores a routing decision for an IP in the session scope.
 func (c *MemoryRouteCache) Set(sessionID string, ip netip.Addr, d policy.Decision) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.decisions[sessionID] == nil {
-		c.decisions[sessionID] = make(map[netip.Addr]policy.Decision)
+	if c == nil || sessionID == "" || !ip.IsValid() || !ip.Is4() {
+		return
 	}
-	c.decisions[sessionID][ip] = d
+	c.mu.Lock()
+	gen := c.gen
+	sc, err := c.rc.Open(policy.Scope{SessionID: sessionID, OwnershipEpoch: 1})
+	c.mu.Unlock()
+	if err != nil || sc == nil {
+		return
+	}
+	if d == policy.Direct || d == policy.Proxy {
+		_ = sc.Observe(gen, []policy.Observation{
+			{
+				IP:        ip,
+				Decision:  d,
+				ExpiresAt: time.Now().Add(time.Hour),
+			},
+		}, time.Now())
+	}
 }
 
 // Observe records a routing decision for an IP in the session scope.
@@ -307,39 +463,50 @@ func (c *MemoryRouteCache) ObserveDNSResponse(sessionID string, req, resp *mdns.
 	if c == nil || req == nil || resp == nil || sessionID == "" {
 		return nil
 	}
-	c.mu.RLock()
+	c.mu.Lock()
+	if c.matcher != nil {
+		if snap := c.matcher.Current(); snap != nil && snap.Generation() != "" && snap.Generation() != c.gen {
+			c.gen = snap.Generation()
+			c.rc.SetPolicyGeneration(c.gen)
+		}
+	}
 	matcher := c.matcher
-	c.mu.RUnlock()
-
+	sc, err := c.rc.Open(policy.Scope{SessionID: sessionID, OwnershipEpoch: 1})
+	c.mu.Unlock()
+	if err != nil || sc == nil {
+		return err
+	}
 	var snap *policy.Snapshot
 	if matcher != nil {
 		snap = matcher.Current()
 	}
-
-	qName := ""
-	if len(req.Question) > 0 {
-		qName = req.Question[0].Name
+	if snap == nil {
+		return nil
 	}
+	_, err = gatewaydns.ObserveResponse(req, resp, snap, sc, time.Now(), 3600*time.Second)
+	return err
+}
 
-	requiresProxy := false
-	if snap != nil && qName != "" {
-		requiresProxy = snap.MatchDomain(qName)
-	}
+// Open opens or retrieves the session cache for the given scope.
+func (c *MemoryRouteCache) Open(scope policy.Scope) (*policy.SessionCache, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.rc.Open(scope)
+}
 
-	for _, ans := range resp.Answer {
-		if aRec, ok := ans.(*mdns.A); ok {
-			ip, ok := netip.AddrFromSlice(aRec.A)
-			if !ok || !ip.IsValid() || !ip.Is4() {
-				continue
-			}
-			decision := policy.Direct
-			if requiresProxy || (snap != nil && snap.MatchIPv4(ip)) {
-				decision = policy.Proxy
-			}
-			c.Set(sessionID, ip, decision)
-		}
-	}
-	return nil
+// RouteCache returns the underlying authentic policy.RouteCache.
+func (c *MemoryRouteCache) RouteCache() *policy.RouteCache {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.rc
+}
+
+// SetPolicyGeneration updates the active policy generation string on the route cache.
+func (c *MemoryRouteCache) SetPolicyGeneration(generation string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.gen = generation
+	c.rc.SetPolicyGeneration(generation)
 }
 
 // ObserveDNSResponse records client DNS observations into the active route cache used by the forwarder.
@@ -514,6 +681,11 @@ func (s *Service) TeardownPBR() error {
 
 	if s.forwarder == nil {
 		return nil
+	}
+	if oldH := s.forwarder.DNSHandler(); oldH != nil {
+		if closer, ok := oldH.(io.Closer); ok {
+			_ = closer.Close()
+		}
 	}
 	s.forwarder.SetDNSHandler(nil)
 	s.forwarder.SetPBREnabled(false)
