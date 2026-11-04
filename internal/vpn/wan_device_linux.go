@@ -60,9 +60,9 @@ func (d *linuxWANDevice) runner() iptablesRunner {
 	return defaultIPTablesRunner
 }
 
-func (d *linuxWANDevice) installResetSuppressionRulesLocked() {
+func (d *linuxWANDevice) installResetSuppressionRulesLocked() error {
 	if !d.hostWANIP.IsValid() || !d.hostWANIP.Is4() || d.hostWANIP.IsLoopback() || d.hostWANIP.IsUnspecified() {
-		return
+		return nil
 	}
 	minP := d.minPort
 	if minP == 0 {
@@ -77,17 +77,50 @@ func (d *linuxWANDevice) installResetSuppressionRulesLocked() {
 	portArg := fmt.Sprintf("%d:%d", minP, maxP)
 	ipArg := d.hostWANIP.String()
 
+	var installedRules [][]string
+	rollback := func() {
+		for i := len(installedRules) - 1; i >= 0; i-- {
+			_ = run(installedRules[i]...)
+		}
+		d.iptablesInstalled = false
+		d.installedIP = netip.Addr{}
+		d.installedMinPort = 0
+		d.installedMaxPort = 0
+	}
+
 	for _, proto := range []string{"tcp", "udp"} {
-		checkArgs := []string{"-C", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
-		if err := run(checkArgs...); err != nil {
-			insertArgs := []string{"-I", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
-			_ = run(insertArgs...)
+		// 1. Inbound packets without a local socket in the direct egress NAT range are dropped (R8-B2)
+		// to prevent the host kernel network stack from emitting TCP resets or ICMP port unreachable.
+		checkDrop := []string{"-C", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
+		if err := run(checkDrop...); err != nil {
+			dropArgs := []string{"-A", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
+			if err := run(dropArgs...); err != nil {
+				rollback()
+				return fmt.Errorf("install %s drop reset suppression rule: %w", proto, err)
+			}
+			delDrop := []string{"-D", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
+			installedRules = append(installedRules, delDrop)
+		}
+
+		// 2. Inbound packets matching an existing host socket (e.g. host DNS resolver, outbound HTTPS)
+		// must be accepted at the top of the INPUT chain before any DROP rule (R9-B1).
+		checkAccept := []string{"-C", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
+		if err := run(checkAccept...); err != nil {
+			acceptArgs := []string{"-I", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
+			if err := run(acceptArgs...); err != nil {
+				rollback()
+				return fmt.Errorf("install %s socket accept rule: %w", proto, err)
+			}
+			delAccept := []string{"-D", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
+			installedRules = append(installedRules, delAccept)
 		}
 	}
+
 	d.iptablesInstalled = true
 	d.installedIP = d.hostWANIP
 	d.installedMinPort = minP
 	d.installedMaxPort = maxP
+	return nil
 }
 
 func (d *linuxWANDevice) removeResetSuppressionRulesLocked() {
@@ -99,39 +132,46 @@ func (d *linuxWANDevice) removeResetSuppressionRulesLocked() {
 	ipArg := d.installedIP.String()
 
 	for _, proto := range []string{"tcp", "udp"} {
-		deleteArgs := []string{"-D", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
-		_ = run(deleteArgs...)
+		deleteAccept := []string{"-D", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
+		_ = run(deleteAccept...)
+		deleteDrop := []string{"-D", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
+		_ = run(deleteDrop...)
 	}
 	d.iptablesInstalled = false
 	d.installedIP = netip.Addr{}
+	d.installedMinPort = 0
+	d.installedMaxPort = 0
 }
 
-func (d *linuxWANDevice) SetHostWANIP(ip netip.Addr) {
+func (d *linuxWANDevice) SetHostWANIP(ip netip.Addr) error {
 	if d == nil {
-		return
+		return nil
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.hostWANIP == ip && d.iptablesInstalled {
-		return
+		return nil
 	}
 	if d.iptablesInstalled {
 		d.removeResetSuppressionRulesLocked()
 	}
 	d.hostWANIP = ip
 	if ip.IsValid() && ip.Is4() && !ip.IsLoopback() && !ip.IsUnspecified() {
-		d.installResetSuppressionRulesLocked()
+		if err := d.installResetSuppressionRulesLocked(); err != nil {
+			return fmt.Errorf("set host wan ip: %w", err)
+		}
 	}
+	return nil
 }
 
-func (d *linuxWANDevice) SetNATPortRange(minPort, maxPort uint16) {
+func (d *linuxWANDevice) SetNATPortRange(minPort, maxPort uint16) error {
 	if d == nil {
-		return
+		return nil
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.minPort == minPort && d.maxPort == maxPort {
-		return
+		return nil
 	}
 	if d.iptablesInstalled {
 		d.removeResetSuppressionRulesLocked()
@@ -139,8 +179,11 @@ func (d *linuxWANDevice) SetNATPortRange(minPort, maxPort uint16) {
 	d.minPort = minPort
 	d.maxPort = maxPort
 	if d.hostWANIP.IsValid() && d.hostWANIP.Is4() && !d.hostWANIP.IsLoopback() && !d.hostWANIP.IsUnspecified() {
-		d.installResetSuppressionRulesLocked()
+		if err := d.installResetSuppressionRulesLocked(); err != nil {
+			return fmt.Errorf("set nat port range: %w", err)
+		}
 	}
+	return nil
 }
 
 func (d *linuxWANDevice) Read(p []byte) (int, error) {
@@ -255,7 +298,7 @@ func newLinuxWANDeviceWithFiles(file, rawFile *os.File, name string, minPort, ma
 		hostWANIP: hostWANIP,
 	}
 	if hostWANIP.IsValid() && hostWANIP.Is4() && !hostWANIP.IsLoopback() && !hostWANIP.IsUnspecified() {
-		dev.SetHostWANIP(hostWANIP)
+		_ = dev.SetHostWANIP(hostWANIP)
 	}
 	return dev
 }
@@ -341,7 +384,10 @@ func NewProductionWANDevice(name string) (forwarder.PacketDevice, error) {
 		maxPort: 65000,
 	}
 	if hostIP, err := DeriveHostWANIP(); err == nil && hostIP.IsValid() && hostIP.Is4() {
-		dev.SetHostWANIP(hostIP)
+		if err := dev.SetHostWANIP(hostIP); err != nil {
+			_ = dev.Close()
+			return nil, fmt.Errorf("install reset suppression: %w", err)
+		}
 	}
 	return dev, nil
 }
