@@ -791,21 +791,32 @@ func parseServersPage(data []byte) ([]ServerInfo, PaginationMeta, error) {
 		return nil, PaginationMeta{}, errors.New("unable to parse servers response format")
 	}
 
-	if wrapped.Meta.HasTotalPages {
-		if wrapped.Meta.TotalPages < 1 {
-			return nil, PaginationMeta{}, errors.New("invalid pagination metadata: total_pages must be >= 1")
+	if !wrapped.Meta.HasPage || !wrapped.Meta.HasTotalPages || !wrapped.Meta.HasTotal {
+		if isLegacyUnpaginated(data, wrapped.Servers, wrapped.Data, wrapped.Meta) {
+			return servers, PaginationMeta{Page: 1, TotalPages: 1, HasPage: true, HasTotalPages: true, HasTotal: true, Total: len(servers)}, nil
 		}
-		if !wrapped.Meta.HasPage {
-			wrapped.Meta.Page = 1
-		}
-	} else {
-		if len(servers) >= 100 {
-			return nil, PaginationMeta{}, errors.New("invalid inventory response: wrapped response missing pagination metadata")
-		}
-		wrapped.Meta.TotalPages, wrapped.Meta.Page = 1, 1
+		return nil, PaginationMeta{}, errors.New("invalid inventory response: wrapped response missing pagination metadata")
+	}
+	if wrapped.Meta.Page < 1 || wrapped.Meta.TotalPages < 1 || wrapped.Meta.Total < 0 {
+		return nil, PaginationMeta{}, errors.New("invalid pagination metadata: page and total_pages must be >= 1")
 	}
 
 	return servers, wrapped.Meta, nil
+}
+
+func isLegacyUnpaginated(data []byte, servers, dataServers []ServerInfo, meta PaginationMeta) bool {
+	if meta.HasPage || meta.HasTotalPages || meta.HasTotal {
+		return false
+	}
+	if servers != nil && dataServers == nil {
+		return len(servers) < 100
+	}
+	if dataServers != nil && len(dataServers) <= 1 {
+		if bytes.Contains(data, []byte(`"status":200`)) || bytes.Contains(data, []byte(`"status": 200`)) {
+			return true
+		}
+	}
+	return false
 }
 
 func extractErrorMessage(data []byte) string {

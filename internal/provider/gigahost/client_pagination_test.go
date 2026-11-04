@@ -38,6 +38,7 @@ func TestClient_GetServers_Pagination(t *testing.T) {
 					"meta": map[string]any{
 						"page":        1,
 						"total_pages": 2,
+						"total":       105,
 					},
 					"data": servers,
 				})
@@ -60,6 +61,7 @@ func TestClient_GetServers_Pagination(t *testing.T) {
 					"meta": map[string]any{
 						"page":        2,
 						"total_pages": 2,
+						"total":       105,
 					},
 					"data": servers,
 				})
@@ -204,7 +206,7 @@ func TestClient_OrderServer_OrderIDRequirement(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet && r.URL.Path == "/servers" {
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"data":[]}`))
+				_, _ = w.Write([]byte(`{"meta":{"page":1,"total_pages":1,"total":0},"data":[]}`))
 				return
 			}
 			posts.Add(1)
@@ -245,7 +247,7 @@ func TestClient_OrderServer_OrderIDRequirement(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet && r.URL.Path == "/servers" {
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"data":[]}`))
+				_, _ = w.Write([]byte(`{"meta":{"page":1,"total_pages":1,"total":0},"data":[]}`))
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -276,7 +278,7 @@ func TestClient_OrderServer_OrderIDRequirement(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet && r.URL.Path == "/servers" {
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"data":[]}`))
+				_, _ = w.Write([]byte(`{"meta":{"page":1,"total_pages":1,"total":0},"data":[]}`))
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -307,7 +309,7 @@ func TestClient_OrderServer_OrderIDRequirement(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet && r.URL.Path == "/servers" {
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"data":[]}`))
+				_, _ = w.Write([]byte(`{"meta":{"page":1,"total_pages":1,"total":0},"data":[]}`))
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -501,7 +503,7 @@ func TestClient_GetServers_Pagination_Integrity(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"meta": map[string]any{"page": 2, "total_pages": 2},
+				"meta": map[string]any{"page": 2, "total_pages": 2, "total": 2},
 				"data": []map[string]any{{"id": 1}},
 			})
 		}))
@@ -527,14 +529,14 @@ func TestClient_GetServers_Pagination_Integrity(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			if page == "1" || page == "" {
 				_ = json.NewEncoder(w).Encode(map[string]any{
-					"meta": map[string]any{"page": 1, "total_pages": 2},
+					"meta": map[string]any{"page": 1, "total_pages": 2, "total": 2},
 					"data": []map[string]any{{"id": 1}},
 				})
 				return
 			}
 			if page == "2" {
 				_ = json.NewEncoder(w).Encode(map[string]any{
-					"meta": map[string]any{"page": 2, "total_pages": 3},
+					"meta": map[string]any{"page": 2, "total_pages": 3, "total": 2},
 					"data": []map[string]any{{"id": 2}},
 				})
 				return
@@ -739,7 +741,7 @@ func TestClient_GetServers_RejectJSONNull(t *testing.T) {
 			body string
 		}{
 			{"explicit empty array", `[]`},
-			{"explicit empty data envelope", `{"data": []}`},
+			{"explicit empty status envelope", `{"meta": {"status": 200}, "data": []}`},
 			{"explicit empty servers envelope", `{"servers": []}`},
 			{"explicit empty envelope with zero total", `{"meta": {"page": 1, "total_pages": 1, "total": 0}, "data": []}`},
 		}
@@ -855,8 +857,8 @@ func TestClient_GetServers_ExplicitZeroTotals(t *testing.T) {
 }
 
 func TestClient_GetServers_MissingPaginationMetadata(t *testing.T) {
-	t.Run("100-record response with missing total_pages returns error and purchasing fails closed", func(t *testing.T) {
-		servers := make([]map[string]any, 100)
+	assertMissingMetaFails := func(t *testing.T, count int) {
+		servers := make([]map[string]any, count)
 		for i := range servers {
 			servers[i] = map[string]any{"id": int64(1000 + i), "status": "ready"}
 		}
@@ -891,6 +893,14 @@ func TestClient_GetServers_MissingPaginationMetadata(t *testing.T) {
 		if postCalls.Load() != 0 {
 			t.Errorf("expected 0 order POST calls when inventory fails, got %d", postCalls.Load())
 		}
+	}
+
+	t.Run("100-record response with missing total_pages returns error and purchasing fails closed", func(t *testing.T) {
+		assertMissingMetaFails(t, 100)
+	})
+
+	t.Run("50-record response with missing pagination metadata returns error and purchasing fails closed", func(t *testing.T) {
+		assertMissingMetaFails(t, 50)
 	})
 
 	t.Run("100-record direct array without pagination metadata returns error", func(t *testing.T) {
