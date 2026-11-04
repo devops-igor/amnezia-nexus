@@ -86,6 +86,28 @@ func (s *Service) Start(ctx context.Context) error {
 		s.forwarder.StartPumps(ctx)
 	}
 
+	// 3b. Configure PBR direct egress if enabled (#677)
+	pbrEnabled := false
+	s.mu.RLock()
+	if s.cfg != nil && s.cfg.PBREnabled {
+		pbrEnabled = true
+	}
+	s.mu.RUnlock()
+	if !pbrEnabled && s.db != nil {
+		if dbCfg, err := s.db.GetVPNConfig(ctx); err == nil && dbCfg != nil && dbCfg.PBREnabled {
+			pbrEnabled = true
+		}
+	}
+	if pbrEnabled {
+		if err := s.initPBR(ctx); err != nil {
+			s.mu.Lock()
+			s.running = false
+			s.startedAt = time.Time{}
+			s.mu.Unlock()
+			return fmt.Errorf("failed to initialize PBR direct egress: %w", err)
+		}
+	}
+
 	// 4. Establish fresh backend health before accepting client traffic.
 	// ResetEnabledHealthForStartup intentionally made every enabled backend
 	// unroutable ("connecting"). Run one synchronous sweep here so the endpoint

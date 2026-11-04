@@ -1,12 +1,14 @@
 package vpn
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/netip"
 	"sync"
 	"testing"
 
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
@@ -194,5 +196,103 @@ func TestService_DeriveHostWANIPNoFallback(t *testing.T) {
 	forbiddenTestIP := netip.MustParseAddr("203.0.113.1")
 	if ip == forbiddenTestIP {
 		t.Fatalf("DeriveHostWANIP returned forbidden test address 203.0.113.1")
+	}
+}
+
+func TestService_StartWithPBREnabled(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db, func(c *models.VPNConfig) {
+		c.PBREnabled = true
+	})
+
+	validWAN := netip.MustParseAddr("198.51.200.1")
+	dev := &mockPBRDevice{}
+	rc := &mockRouteCache{}
+	matcher := policy.NewMatcher()
+	snap, _ := policy.CompileSnapshot(1, "gen-1", nil)
+	matcher.Publish(snap)
+
+	svc.SetPBRConfig(PBRConfig{
+		HostWANIP:     validWAN,
+		GatewayDNSIP:  netip.MustParseAddr("10.100.0.1"),
+		WANDevice:     dev,
+		RouteCache:    rc,
+		PolicyMatcher: matcher,
+	})
+
+	if err := svc.Start(context.Background()); err != nil {
+		t.Fatalf("svc.Start with PBREnabled failed: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	if !svc.PBREnabled() {
+		t.Fatal("expected PBR to be enabled on running service")
+	}
+	if svc.DirectEgress() == nil {
+		t.Fatal("expected DirectEgress to be non-nil on running service")
+	}
+}
+
+func TestService_StartWithPBREnabled_FailsClosedWhenInitFails(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db, func(c *models.VPNConfig) {
+		c.PBREnabled = true
+	})
+
+	// Invalid WAN IP causes prerequisite validation to fail
+	svc.SetPBRConfig(PBRConfig{
+		HostWANIP: netip.Addr{}, // Invalid
+		WANDevice: &mockPBRDevice{},
+	})
+
+	err := svc.Start(context.Background())
+	if err == nil {
+		_ = svc.Stop()
+		t.Fatal("expected svc.Start to fail when PBR initialization prerequisites fail")
+	}
+
+	if svc.IsRunning() {
+		t.Fatal("service must not be running after PBR startup failure (fail closed)")
+	}
+	if svc.PBREnabled() {
+		t.Fatal("PBR must not be enabled when initialization fails")
+	}
+}
+
+func TestService_StartWithPBRDisabled_Default(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db)
+
+	if err := svc.Start(context.Background()); err != nil {
+		t.Fatalf("svc.Start failed: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	if svc.PBREnabled() {
+		t.Fatal("expected PBR to be disabled by default")
+	}
+	if svc.DirectEgress() != nil {
+		t.Fatal("expected DirectEgress to be nil when disabled")
+	}
+}
+
+func TestMemoryRouteCache(t *testing.T) {
+	rc := NewMemoryRouteCache()
+	ip := netip.MustParseAddr("1.1.1.1")
+	sessionID := "sess-test-1"
+
+	if d := rc.Lookup(sessionID, ip); d != policy.Unknown {
+		t.Fatalf("expected policy.Unknown for unrecorded IP, got %v", d)
+	}
+
+	rc.Set(sessionID, ip, policy.Direct)
+	if d := rc.Lookup(sessionID, ip); d != policy.Direct {
+		t.Fatalf("expected policy.Direct after Set, got %v", d)
+	}
+
+	ip2 := netip.MustParseAddr("8.8.8.8")
+	rc.Set(sessionID, ip2, policy.Proxy)
+	if d := rc.Lookup(sessionID, ip2); d != policy.Proxy {
+		t.Fatalf("expected policy.Proxy after Set, got %v", d)
 	}
 }

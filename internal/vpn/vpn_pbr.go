@@ -1,10 +1,12 @@
 package vpn
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
@@ -173,10 +175,144 @@ func (s *Service) DirectEgress() *forwarder.DirectEgressManager {
 	return s.forwarder.DirectEgress()
 }
 
+var (
+	servicePBRConfigsMu sync.RWMutex
+	servicePBRConfigs   = make(map[*Service]*PBRConfig)
+)
+
+// SetPBRConfig registers an explicit PBR configuration for service startup.
+func (s *Service) SetPBRConfig(cfg PBRConfig) {
+	servicePBRConfigsMu.Lock()
+	defer servicePBRConfigsMu.Unlock()
+	servicePBRConfigs[s] = &cfg
+}
+
+func (s *Service) getPBRConfig() *PBRConfig {
+	servicePBRConfigsMu.RLock()
+	defer servicePBRConfigsMu.RUnlock()
+	return servicePBRConfigs[s]
+}
+
+// MemoryRouteCache provides an in-memory implementation of forwarder.RouteCache.
+type MemoryRouteCache struct {
+	mu        sync.RWMutex
+	decisions map[string]map[netip.Addr]policy.Decision
+}
+
+// NewMemoryRouteCache creates an in-memory RouteCache.
+func NewMemoryRouteCache() *MemoryRouteCache {
+	return &MemoryRouteCache{
+		decisions: make(map[string]map[netip.Addr]policy.Decision),
+	}
+}
+
+// Lookup queries the routing decision for a destination IP in the session scope.
+func (c *MemoryRouteCache) Lookup(sessionID string, ip netip.Addr) policy.Decision {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if sess, ok := c.decisions[sessionID]; ok {
+		if d, ok := sess[ip]; ok {
+			return d
+		}
+	}
+	return policy.Unknown
+}
+
+// Set stores a routing decision for an IP in the session scope.
+func (c *MemoryRouteCache) Set(sessionID string, ip netip.Addr, d policy.Decision) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.decisions[sessionID] == nil {
+		c.decisions[sessionID] = make(map[netip.Addr]policy.Decision)
+	}
+	c.decisions[sessionID][ip] = d
+}
+
+// initPBR initializes and configures policy-based routing on the service during startup.
+// It instantiates concrete WAN transport, route cache, and policy matcher if not already configured.
+// It fails closed if prerequisites or initialization fails.
+func (s *Service) initPBR(ctx context.Context) error {
+	pbrCfg := s.getPBRConfig()
+	var cfg PBRConfig
+	if pbrCfg != nil {
+		cfg = *pbrCfg
+	}
+	cfg.Enabled = true
+
+	// 1. Host WAN IP: derive if not set
+	if !cfg.HostWANIP.IsValid() {
+		derived, err := DeriveHostWANIP()
+		if err != nil {
+			return fmt.Errorf("derive host wan ip: %w", err)
+		}
+		cfg.HostWANIP = derived
+	}
+
+	// 2. Gateway DNS IP: derive if not set
+	if !cfg.GatewayDNSIP.IsValid() {
+		s.mu.RLock()
+		subnet := ""
+		if s.cfg != nil {
+			subnet = s.cfg.SubnetCIDR
+		}
+		s.mu.RUnlock()
+		if subnet != "" {
+			if prefix, err := netip.ParsePrefix(subnet); err == nil {
+				// Gateway is standard first host in client subnet (.1)
+				addr := prefix.Addr()
+				b := addr.As4()
+				b[3] = 1
+				cfg.GatewayDNSIP = netip.AddrFrom4(b)
+			}
+		}
+		if !cfg.GatewayDNSIP.IsValid() {
+			cfg.GatewayDNSIP = netip.MustParseAddr("10.100.0.1")
+		}
+	}
+
+	// 3. WAN PacketDevice: instantiate production TUN device if not already provided
+	if cfg.WANDevice == nil {
+		wanDev, err := NewProductionWANDevice("nexus-wan0")
+		if err != nil {
+			return fmt.Errorf("create production wan device: %w", err)
+		}
+		cfg.WANDevice = wanDev
+	}
+
+	// 4. Policy Matcher: instantiate and compile initial empty snapshot if not provided
+	if cfg.PolicyMatcher == nil {
+		matcher := policy.NewMatcher()
+		snap, err := policy.CompileSnapshot(1, "gen-initial", nil)
+		if err != nil {
+			_ = cfg.WANDevice.Close()
+			return fmt.Errorf("compile initial policy snapshot: %w", err)
+		}
+		matcher.Publish(snap)
+		cfg.PolicyMatcher = matcher
+	}
+
+	// 5. Route Cache: instantiate in-memory route cache if not provided
+	if cfg.RouteCache == nil {
+		cfg.RouteCache = NewMemoryRouteCache()
+	}
+
+	// 6. Configure PBR on Service (fails closed if prerequisite validation fails)
+	if err := s.ConfigurePBR(cfg); err != nil {
+		_ = cfg.WANDevice.Close()
+		return fmt.Errorf("configure pbr: %w", err)
+	}
+
+	return nil
+}
+
 // TeardownPBR disables PBR and cleanly closes the DirectEgressManager.
 func (s *Service) TeardownPBR() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	servicePBRConfigsMu.Lock()
+	delete(servicePBRConfigs, s)
+	servicePBRConfigsMu.Unlock()
 
 	if s.forwarder == nil {
 		return nil
