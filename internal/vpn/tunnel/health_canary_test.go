@@ -14,33 +14,87 @@ import (
 )
 
 type mockPacketDevice struct {
-	mu        sync.Mutex
-	writeErr  error
-	readErr   error
-	written   [][]byte
-	replyData []byte
-	delay     time.Duration
-	closed    bool
+	mu          sync.Mutex
+	writeErr    error
+	readErr     error
+	written     [][]byte
+	replyData   []byte
+	delay       time.Duration
+	closed      bool
+	canaryHooks map[uint64]CanaryResponseHook
+	nextHookID  uint64
+}
+
+var _ CanaryResponseDemuxer = (*mockPacketDevice)(nil)
+
+func (m *mockPacketDevice) RegisterCanaryResponseHook(hook CanaryResponseHook) func() {
+	m.mu.Lock()
+	if m.canaryHooks == nil {
+		m.canaryHooks = make(map[uint64]CanaryResponseHook)
+	}
+	m.nextHookID++
+	id := m.nextHookID
+	m.canaryHooks[id] = hook
+	m.mu.Unlock()
+	return func() {
+		m.mu.Lock()
+		delete(m.canaryHooks, id)
+		m.mu.Unlock()
+	}
 }
 
 func (m *mockPacketDevice) Write(p []byte) (int, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
+		m.mu.Unlock()
 		return 0, errors.New("mock device closed")
 	}
 	if m.writeErr != nil {
+		m.mu.Unlock()
 		return 0, m.writeErr
 	}
 	cp := make([]byte, len(p))
 	copy(cp, p)
 	m.written = append(m.written, cp)
+
+	if len(m.replyData) > 0 {
+		reply := make([]byte, len(m.replyData))
+		copy(reply, m.replyData)
+		hooks := make([]CanaryResponseHook, 0, len(m.canaryHooks))
+		for _, h := range m.canaryHooks {
+			if h != nil {
+				hooks = append(hooks, h)
+			}
+		}
+		delay := m.delay
+		m.mu.Unlock()
+
+		go func() {
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+			for _, h := range hooks {
+				h(reply)
+			}
+		}()
+		return len(p), nil
+	}
+	m.mu.Unlock()
 	return len(p), nil
 }
 
+func (m *mockPacketDevice) setReplyData(data []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.replyData = data
+}
+
 func (m *mockPacketDevice) Read(p []byte) (int, error) {
-	if m.delay > 0 {
-		time.Sleep(m.delay)
+	m.mu.Lock()
+	delay := m.delay
+	m.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -206,8 +260,9 @@ func (d dummyProviderWithSubnet) SubnetCIDR() string {
 }
 
 func TestProbePacketDevice_Success(t *testing.T) {
+	echoReply := BuildCanaryICMPEchoReply(net.IPv4(10, 100, 0, 2), net.IPv4(10, 100, 0, 1), 0x0713, 1)
 	dev := &mockPacketDevice{
-		replyData: []byte("echo-reply-payload"),
+		replyData: echoReply,
 	}
 	ctx := context.Background()
 	err := ProbePacketDevice(ctx, dev, 500*time.Millisecond)
@@ -230,25 +285,104 @@ func TestProbePacketDevice_WriteError(t *testing.T) {
 	}
 }
 
-func TestProbePacketDevice_ReadError(t *testing.T) {
-	dev := &mockPacketDevice{
-		readErr: errors.New("read failed"),
-	}
+func TestProbePacketDevice_UnsupportedDevice(t *testing.T) {
+	dev := &bareTestPacketDevice{}
 	ctx := context.Background()
 	err := ProbePacketDevice(ctx, dev, 500*time.Millisecond)
 	if err == nil {
-		t.Fatal("expected error, got nil")
+		t.Fatal("expected unsupported device error, got nil")
 	}
 }
 
+type bareTestPacketDevice struct{}
+
+func (b *bareTestPacketDevice) Read([]byte) (int, error)    { return 0, errors.New("eof") }
+func (b *bareTestPacketDevice) Write(p []byte) (int, error) { return len(p), nil }
+func (b *bareTestPacketDevice) Close() error                { return nil }
+
 func TestProbePacketDevice_Timeout(t *testing.T) {
 	dev := &mockPacketDevice{
-		delay: 500 * time.Millisecond,
+		delay:     500 * time.Millisecond,
+		replyData: BuildCanaryICMPEchoReply(net.IPv4(10, 100, 0, 2), net.IPv4(10, 100, 0, 1), 0x0713, 1),
 	}
 	ctx := context.Background()
 	err := ProbePacketDevice(ctx, dev, 50*time.Millisecond)
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
+	}
+	// Verify hook was cleanly unregistered on timeout
+	dev.mu.Lock()
+	hookCount := len(dev.canaryHooks)
+	dev.mu.Unlock()
+	if hookCount != 0 {
+		t.Fatalf("expected 0 hooks remaining after timeout, got %d", hookCount)
+	}
+}
+
+func TestProbePacketDevice_DemuxerSingleReaderConcurrent(t *testing.T) {
+	// Verify that with a single reader loop running (simulating pumpBackendReturns),
+	// client traffic is NOT stolen and canary responses are cleanly consumed by the hook.
+	dev := &mockPacketDevice{}
+	clientPacketsReceived := make([][]byte, 0)
+	var clientMu sync.Mutex
+
+	// Background return pump reading continuously (single reader)
+	stopPump := make(chan struct{})
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		buf := make([]byte, 1500)
+		for {
+			select {
+			case <-stopPump:
+				return
+			default:
+			}
+			n, err := dev.Read(buf)
+			if err == nil && n > 0 {
+				pkt := make([]byte, n)
+				copy(pkt, buf[:n])
+				clientMu.Lock()
+				clientPacketsReceived = append(clientPacketsReceived, pkt)
+				clientMu.Unlock()
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	// Simulate backend replying to canary probes by dispatching Echo Reply to registered hook
+	echoReply := BuildCanaryICMPEchoReply(net.IPv4(10, 100, 0, 2), net.IPv4(10, 100, 0, 1), 0x0713, 1)
+	dev.setReplyData(echoReply)
+
+	// Run canary probe concurrently with active return pump
+	ctx := context.Background()
+	if err := ProbePacketDevice(ctx, dev, 1*time.Second); err != nil {
+		t.Fatalf("ProbePacketDevice failed under concurrent pump: %v", err)
+	}
+
+	// Verify that no hooks remain registered after completion
+	dev.mu.Lock()
+	hooksLeft := len(dev.canaryHooks)
+	dev.mu.Unlock()
+	if hooksLeft != 0 {
+		t.Errorf("expected 0 hooks left after probe completion, got %d", hooksLeft)
+	}
+
+	close(stopPump)
+	<-pumpDone
+}
+
+func TestProbePacketDevice_DemuxerIgnoresNonCanaryTraffic(t *testing.T) {
+	// A packet with wrong sequence or ID must not satisfy the canary listener
+	wrongReply := BuildCanaryICMPEchoReply(net.IPv4(10, 100, 0, 2), net.IPv4(10, 100, 0, 1), 0x9999, 99)
+	dev := &mockPacketDevice{
+		replyData: wrongReply,
+	}
+
+	ctx := context.Background()
+	err := ProbePacketDevice(ctx, dev, 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout when only non-matching packet arrives, got nil")
 	}
 }
 

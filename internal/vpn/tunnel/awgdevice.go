@@ -34,7 +34,16 @@ type AWGClientDevice struct {
 	createdAt       time.Time
 	handshakeTimeFn func() time.Time
 	once            sync.Once
+	canaryMu        sync.RWMutex
+	canaryHooks     map[uint64]CanaryResponseHook
+	nextHookID      uint64
 }
+
+// Ensure AWGClientDevice satisfies PacketDevice and CanaryResponseDemuxer at compile time.
+var (
+	_ PacketDevice          = (*AWGClientDevice)(nil)
+	_ CanaryResponseDemuxer = (*AWGClientDevice)(nil)
+)
 
 // VirtualTUN is the ownership-neutral in-memory tun.Device, extracted into
 // the internal/vpn/virtualtun package. The alias keeps AWGClientDevice and
@@ -325,15 +334,47 @@ func buildAWGIPCConfig(privateKeyHex, publicKeyHex, endpoint string, awgParams m
 // this rework's sanctioned scope. The device-level drain inside VirtualTUN.Close
 // makes the raw receive safe: after Close returns the queue is empty, so no
 // packet is lost unaccounted.
+// RegisterCanaryResponseHook registers a callback to demultiplex in-tunnel canary responses
+// during single-reader return pumping. The returned function unregisters the hook cleanly.
+func (d *AWGClientDevice) RegisterCanaryResponseHook(hook CanaryResponseHook) func() {
+	d.canaryMu.Lock()
+	if d.canaryHooks == nil {
+		d.canaryHooks = make(map[uint64]CanaryResponseHook)
+	}
+	d.nextHookID++
+	id := d.nextHookID
+	d.canaryHooks[id] = hook
+	d.canaryMu.Unlock()
+	return func() {
+		d.canaryMu.Lock()
+		delete(d.canaryHooks, id)
+		d.canaryMu.Unlock()
+	}
+}
+
 func (d *AWGClientDevice) Read(p []byte) (int, error) {
-	select {
-	case pkt, ok := <-d.vtun.Outbound():
-		if !ok {
+	for {
+		select {
+		case pkt, ok := <-d.vtun.Outbound():
+			if !ok {
+				return 0, errors.New("device closed")
+			}
+			d.canaryMu.RLock()
+			consumed := false
+			for _, h := range d.canaryHooks {
+				if h != nil && h(pkt) {
+					consumed = true
+					break
+				}
+			}
+			d.canaryMu.RUnlock()
+			if consumed {
+				continue
+			}
+			return copy(p, pkt), nil
+		case <-d.doneCh:
 			return 0, errors.New("device closed")
 		}
-		return copy(p, pkt), nil
-	case <-d.doneCh:
-		return 0, errors.New("device closed")
 	}
 }
 

@@ -26,6 +26,16 @@ type CanaryDevice interface {
 	ProbeCanary(ctx context.Context, timeout time.Duration) error
 }
 
+// CanaryResponseHook defines the callback signature used by return listeners to inspect packets.
+// It returns true if the packet was recognized and consumed as an in-tunnel canary response.
+type CanaryResponseHook func(packet []byte) bool
+
+// CanaryResponseDemuxer is implemented by PacketDevices or return paths that demultiplex
+// in-tunnel canary responses from the single return reader loop (e.g. pumpBackendReturns).
+type CanaryResponseDemuxer interface {
+	RegisterCanaryResponseHook(hook CanaryResponseHook) (unregister func())
+}
+
 type outboundChannelHolder interface {
 	Outbound() <-chan []byte
 }
@@ -194,6 +204,9 @@ func (hp *HealthProber) defaultCanaryProbe(ctx context.Context, tunnel *models.B
 }
 
 // ProbePacketDevice sends an in-tunnel canary packet and waits for response or data-plane loopback.
+// Canary responses are demultiplexed via return listener hooks to ensure only ONE reader consumes
+// backend packets, eliminating reader race conditions with the production return pump and avoiding
+// orphaned goroutines on timeout.
 func ProbePacketDevice(ctx context.Context, dev PacketDevice, timeout time.Duration, subnetCIDR ...string) error {
 	if dev == nil {
 		return errors.New("packet device is nil")
@@ -208,16 +221,47 @@ func ProbePacketDevice(ctx context.Context, dev PacketDevice, timeout time.Durat
 		cidr = subnetCIDR[0]
 	}
 
+	canaryID := uint16(0x0713)
+	canarySeq := uint16(1)
 	pkt := CanaryPingPacketForSubnet(cidr)
-	if _, err := dev.Write(pkt); err != nil {
-		return fmt.Errorf("canary packet write failed: %w", err)
-	}
 
 	ctxTimeout, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// If device exposes an Outbound channel (like VirtualTUN), read directly without leaking a goroutine
+	// If device implements CanaryResponseDemuxer, register a response listener hook.
+	// The single reader (e.g. pumpBackendReturns) will invoke the hook without reader contention.
+	if demux, ok := dev.(CanaryResponseDemuxer); ok {
+		respCh := make(chan struct{}, 1)
+		unregister := demux.RegisterCanaryResponseHook(func(packet []byte) bool {
+			if IsCanaryEchoReply(packet, canaryID, canarySeq) {
+				select {
+				case respCh <- struct{}{}:
+				default:
+				}
+				return true
+			}
+			return false
+		})
+		defer unregister()
+
+		if _, err := dev.Write(pkt); err != nil {
+			return fmt.Errorf("canary packet write failed: %w", err)
+		}
+
+		select {
+		case <-ctxTimeout.Done():
+			return fmt.Errorf("canary probe timed out: %w", ctxTimeout.Err())
+		case <-respCh:
+			return nil
+		}
+	}
+
+	// If device exposes an Outbound channel (like VirtualTUN in standalone tests),
+	// read directly without leaking a goroutine.
 	if chDev, ok := dev.(outboundChannelHolder); ok {
+		if _, err := dev.Write(pkt); err != nil {
+			return fmt.Errorf("canary packet write failed: %w", err)
+		}
 		select {
 		case <-ctxTimeout.Done():
 			return fmt.Errorf("canary probe timed out: %w", ctxTimeout.Err())
@@ -232,27 +276,7 @@ func ProbePacketDevice(ctx context.Context, dev PacketDevice, timeout time.Durat
 		}
 	}
 
-	readCh := make(chan error, 1)
-	go func() {
-		buf := make([]byte, 1500)
-		n, err := dev.Read(buf)
-		if err != nil {
-			readCh <- fmt.Errorf("canary packet read failed: %w", err)
-			return
-		}
-		if n <= 0 {
-			readCh <- errors.New("canary packet read returned 0 bytes")
-			return
-		}
-		readCh <- nil
-	}()
-
-	select {
-	case <-ctxTimeout.Done():
-		return fmt.Errorf("canary probe timed out: %w", ctxTimeout.Err())
-	case err := <-readCh:
-		return err
-	}
+	return fmt.Errorf("packet device of type %T does not support canary response demultiplexing", dev)
 }
 
 // ProbeVirtualTUN probes an in-memory VirtualTUN directly using InjectInbound and Outbound.
@@ -382,6 +406,67 @@ func BuildCanaryICMPEchoRequest(srcIP, dstIP net.IP, id, seq uint16) []byte {
 	binary.BigEndian.PutUint16(pkt[22:24], icmpCsum)
 
 	return pkt
+}
+
+// BuildCanaryICMPEchoReply builds a complete IPv4 packet containing an ICMP Echo Reply matching a canary request.
+func BuildCanaryICMPEchoReply(srcIP, dstIP net.IP, id, seq uint16) []byte {
+	src := srcIP.To4()
+	if src == nil {
+		src = net.IPv4(10, 100, 0, 2).To4()
+	}
+	dst := dstIP.To4()
+	if dst == nil {
+		dst = net.IPv4(10, 100, 0, 1).To4()
+	}
+
+	pkt := make([]byte, 28)
+	// IPv4 Header
+	pkt[0] = 0x45
+	pkt[1] = 0x00
+	binary.BigEndian.PutUint16(pkt[2:4], 28)
+	binary.BigEndian.PutUint16(pkt[4:6], id)
+	pkt[6] = 0x40
+	pkt[7] = 0x00
+	pkt[8] = 64
+	pkt[9] = 1 // Protocol: ICMP
+	copy(pkt[12:16], src)
+	copy(pkt[16:20], dst)
+	ipCsum := internetChecksum(pkt[0:20])
+	binary.BigEndian.PutUint16(pkt[10:12], ipCsum)
+
+	// ICMP Echo Reply
+	pkt[20] = 0 // Type: Echo Reply
+	pkt[21] = 0 // Code: 0
+	binary.BigEndian.PutUint16(pkt[24:26], id)
+	binary.BigEndian.PutUint16(pkt[26:28], seq)
+	icmpCsum := internetChecksum(pkt[20:28])
+	binary.BigEndian.PutUint16(pkt[22:24], icmpCsum)
+
+	return pkt
+}
+
+// IsCanaryEchoReply verifies whether an incoming IPv4 datagram is an ICMP Echo Reply
+// corresponding to the canary probe with the given identifier and sequence number.
+func IsCanaryEchoReply(pkt []byte, expectedID, expectedSeq uint16) bool {
+	if len(pkt) < 28 {
+		return false
+	}
+	if pkt[0]>>4 != 4 {
+		return false
+	}
+	ihl := int(pkt[0]&0x0f) * 4
+	if ihl < 20 || ihl+8 > len(pkt) {
+		return false
+	}
+	if pkt[9] != 1 { // Protocol: ICMP
+		return false
+	}
+	if pkt[ihl] != 0 || pkt[ihl+1] != 0 { // ICMP Type 0 (Echo Reply), Code 0
+		return false
+	}
+	id := binary.BigEndian.Uint16(pkt[ihl+4 : ihl+6])
+	seq := binary.BigEndian.Uint16(pkt[ihl+6 : ihl+8])
+	return id == expectedID && seq == expectedSeq
 }
 
 // DefaultCanaryDNSPacket returns a lightweight UDP DNS query packet with source IP inside the default portal subnet.
