@@ -4,8 +4,11 @@ package vpn
 
 import (
 	"encoding/binary"
+	"errors"
 	"net/netip"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -145,6 +148,140 @@ func TestLinuxWANDevice_ReturnPacketCaptureAndFiltering(t *testing.T) {
 	}
 
 	// 7. Test Close
+	if err := dev.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+}
+
+func TestLinuxWANDevice_R8B2_ResetSuppressionRuleLifecycle(t *testing.T) {
+	tunR, tunW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create pipe: %v", err)
+	}
+	defer func() { _ = tunR.Close(); _ = tunW.Close() }()
+
+	var mu sync.Mutex
+	var executedCommands [][]string
+	mockRunner := func(args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		cp := make([]string, len(args))
+		copy(cp, args)
+		executedCommands = append(executedCommands, cp)
+		if len(args) > 0 && args[0] == "-C" {
+			// Rule does not exist yet -> trigger -I
+			return errors.New("rule does not exist")
+		}
+		return nil
+	}
+
+	dev := newLinuxWANDeviceWithFiles(tunW, nil, "test-wan", 40000, 65000, netip.Addr{})
+	dev.iptablesRunner = mockRunner
+
+	// 1. Initial SetHostWANIP installs DROP rules for both TCP and UDP
+	ip1 := netip.MustParseAddr("203.0.113.10")
+	dev.SetHostWANIP(ip1)
+
+	mu.Lock()
+	cmds := make([][]string, len(executedCommands))
+	copy(cmds, executedCommands)
+	mu.Unlock()
+
+	hasTCPInsert := false
+	hasUDPInsert := false
+	for _, cmd := range cmds {
+		joined := strings.Join(cmd, " ")
+		if strings.Contains(joined, "-I INPUT -p tcp --dport 40000:65000 -d 203.0.113.10 -j DROP") {
+			hasTCPInsert = true
+		}
+		if strings.Contains(joined, "-I INPUT -p udp --dport 40000:65000 -d 203.0.113.10 -j DROP") {
+			hasUDPInsert = true
+		}
+	}
+	if !hasTCPInsert || !hasUDPInsert {
+		t.Fatalf("expected -I INPUT rules for tcp and udp, got: %v", cmds)
+	}
+
+	// 2. Calling SetHostWANIP with the same IP is idempotent
+	mu.Lock()
+	countBefore := len(executedCommands)
+	mu.Unlock()
+	dev.SetHostWANIP(ip1)
+	mu.Lock()
+	countAfter := len(executedCommands)
+	mu.Unlock()
+	if countAfter != countBefore {
+		t.Fatalf("expected idempotent SetHostWANIP to not re-run iptables, ran %d additional commands", countAfter-countBefore)
+	}
+
+	// 3. Changing HostWANIP tears down old rules and installs new ones
+	ip2 := netip.MustParseAddr("203.0.113.20")
+	dev.SetHostWANIP(ip2)
+
+	mu.Lock()
+	cmdsAfterChange := make([][]string, len(executedCommands))
+	copy(cmdsAfterChange, executedCommands)
+	mu.Unlock()
+
+	hasOldTCPDelete := false
+	hasNewTCPInsert := false
+	for _, cmd := range cmdsAfterChange[countBefore:] {
+		joined := strings.Join(cmd, " ")
+		if strings.Contains(joined, "-D INPUT -p tcp --dport 40000:65000 -d 203.0.113.10 -j DROP") {
+			hasOldTCPDelete = true
+		}
+		if strings.Contains(joined, "-I INPUT -p tcp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
+			hasNewTCPInsert = true
+		}
+	}
+	if !hasOldTCPDelete || !hasNewTCPInsert {
+		t.Fatalf("expected old TCP rule deleted and new TCP rule inserted on IP change, got: %v", cmdsAfterChange[countBefore:])
+	}
+
+	// 4. Close cleans up all active rules
+	if err := dev.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	mu.Lock()
+	finalCmds := make([][]string, len(executedCommands))
+	copy(finalCmds, executedCommands)
+	mu.Unlock()
+
+	hasFinalTCPDelete := false
+	hasFinalUDPDelete := false
+	for _, cmd := range finalCmds {
+		joined := strings.Join(cmd, " ")
+		if strings.Contains(joined, "-D INPUT -p tcp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
+			hasFinalTCPDelete = true
+		}
+		if strings.Contains(joined, "-D INPUT -p udp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
+			hasFinalUDPDelete = true
+		}
+	}
+	if !hasFinalTCPDelete || !hasFinalUDPDelete {
+		t.Fatalf("expected Close to delete active rules for %s, got: %v", ip2, finalCmds)
+	}
+}
+
+func TestLinuxWANDevice_R8B2_GracefulDegradationOnFailure(t *testing.T) {
+	tunR, tunW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create pipe: %v", err)
+	}
+	defer func() { _ = tunR.Close(); _ = tunW.Close() }()
+
+	mockErrorRunner := func(args ...string) error {
+		return errors.New("iptables: permission denied")
+	}
+
+	dev := newLinuxWANDeviceWithFiles(tunW, nil, "test-wan", 40000, 65000, netip.Addr{})
+	dev.iptablesRunner = mockErrorRunner
+
+	// Must not panic on failed rule install
+	dev.SetHostWANIP(netip.MustParseAddr("203.0.113.30"))
+
+	// Must not panic on failed rule cleanup
 	if err := dev.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
 	}

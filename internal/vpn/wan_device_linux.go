@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -17,14 +19,32 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+type iptablesRunner func(args ...string) error
+
+var defaultIPTablesRunner = func(args ...string) error {
+	path, err := exec.LookPath("iptables")
+	if err != nil {
+		return err
+	}
+	// #nosec G204 -- arguments are constructed internally from validated IPv4 and numeric port ranges
+	cmd := exec.Command(path, args...)
+	return cmd.Run()
+}
+
 type linuxWANDevice struct {
-	file      *os.File // TUN device for write
-	rawFile   *os.File // AF_PACKET socket for return packet capture
-	name      string
-	closed    atomic.Bool
-	minPort   uint16
-	maxPort   uint16
-	hostWANIP netip.Addr
+	file              *os.File // TUN device for write
+	rawFile           *os.File // AF_PACKET socket for return packet capture
+	name              string
+	closed            atomic.Bool
+	minPort           uint16
+	maxPort           uint16
+	hostWANIP         netip.Addr
+	mu                sync.RWMutex
+	iptablesInstalled bool
+	installedIP       netip.Addr
+	installedMinPort  uint16
+	installedMaxPort  uint16
+	iptablesRunner    iptablesRunner
 }
 
 func htons(v uint16) uint16 {
@@ -33,16 +53,93 @@ func htons(v uint16) uint16 {
 	return binary.NativeEndian.Uint16(b[:])
 }
 
+func (d *linuxWANDevice) runner() iptablesRunner {
+	if d.iptablesRunner != nil {
+		return d.iptablesRunner
+	}
+	return defaultIPTablesRunner
+}
+
+func (d *linuxWANDevice) installResetSuppressionRulesLocked() {
+	if !d.hostWANIP.IsValid() || !d.hostWANIP.Is4() || d.hostWANIP.IsLoopback() || d.hostWANIP.IsUnspecified() {
+		return
+	}
+	minP := d.minPort
+	if minP == 0 {
+		minP = 40000
+	}
+	maxP := d.maxPort
+	if maxP == 0 {
+		maxP = 65000
+	}
+
+	run := d.runner()
+	portArg := fmt.Sprintf("%d:%d", minP, maxP)
+	ipArg := d.hostWANIP.String()
+
+	for _, proto := range []string{"tcp", "udp"} {
+		checkArgs := []string{"-C", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
+		if err := run(checkArgs...); err != nil {
+			insertArgs := []string{"-I", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
+			_ = run(insertArgs...)
+		}
+	}
+	d.iptablesInstalled = true
+	d.installedIP = d.hostWANIP
+	d.installedMinPort = minP
+	d.installedMaxPort = maxP
+}
+
+func (d *linuxWANDevice) removeResetSuppressionRulesLocked() {
+	if !d.iptablesInstalled || !d.installedIP.IsValid() {
+		return
+	}
+	run := d.runner()
+	portArg := fmt.Sprintf("%d:%d", d.installedMinPort, d.installedMaxPort)
+	ipArg := d.installedIP.String()
+
+	for _, proto := range []string{"tcp", "udp"} {
+		deleteArgs := []string{"-D", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
+		_ = run(deleteArgs...)
+	}
+	d.iptablesInstalled = false
+	d.installedIP = netip.Addr{}
+}
+
 func (d *linuxWANDevice) SetHostWANIP(ip netip.Addr) {
-	if d != nil {
-		d.hostWANIP = ip
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.hostWANIP == ip && d.iptablesInstalled {
+		return
+	}
+	if d.iptablesInstalled {
+		d.removeResetSuppressionRulesLocked()
+	}
+	d.hostWANIP = ip
+	if ip.IsValid() && ip.Is4() && !ip.IsLoopback() && !ip.IsUnspecified() {
+		d.installResetSuppressionRulesLocked()
 	}
 }
 
 func (d *linuxWANDevice) SetNATPortRange(minPort, maxPort uint16) {
-	if d != nil {
-		d.minPort = minPort
-		d.maxPort = maxPort
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.minPort == minPort && d.maxPort == maxPort {
+		return
+	}
+	if d.iptablesInstalled {
+		d.removeResetSuppressionRulesLocked()
+	}
+	d.minPort = minPort
+	d.maxPort = maxPort
+	if d.hostWANIP.IsValid() && d.hostWANIP.Is4() && !d.hostWANIP.IsLoopback() && !d.hostWANIP.IsUnspecified() {
+		d.installResetSuppressionRulesLocked()
 	}
 }
 
@@ -89,20 +186,24 @@ func (d *linuxWANDevice) Read(p []byte) (int, error) {
 			continue
 		}
 		dstPort := binary.BigEndian.Uint16(p[ihl+2 : ihl+4])
+		d.mu.RLock()
 		minP := d.minPort
+		maxP := d.maxPort
+		hIP := d.hostWANIP
+		d.mu.RUnlock()
+
 		if minP == 0 {
 			minP = 40000
 		}
-		maxP := d.maxPort
 		if maxP == 0 {
 			maxP = 65000
 		}
 		if dstPort < minP || dstPort > maxP {
 			continue
 		}
-		if d.hostWANIP.IsValid() && d.hostWANIP.Is4() {
+		if hIP.IsValid() && hIP.Is4() {
 			dstIP := netip.AddrFrom4([4]byte{p[16], p[17], p[18], p[19]})
-			if dstIP != d.hostWANIP {
+			if dstIP != hIP {
 				continue
 			}
 		}
@@ -116,6 +217,12 @@ func (d *linuxWANDevice) Write(p []byte) (int, error) {
 
 func (d *linuxWANDevice) Close() error {
 	if d.closed.CompareAndSwap(false, true) {
+		d.mu.Lock()
+		if d.iptablesInstalled {
+			d.removeResetSuppressionRulesLocked()
+		}
+		d.mu.Unlock()
+
 		var errs []error
 		if d.rawFile != nil {
 			if err := d.rawFile.Close(); err != nil {
@@ -139,7 +246,7 @@ func newLinuxWANDeviceWithFiles(file, rawFile *os.File, name string, minPort, ma
 	if maxPort == 0 {
 		maxPort = 65000
 	}
-	return &linuxWANDevice{
+	dev := &linuxWANDevice{
 		file:      file,
 		rawFile:   rawFile,
 		name:      name,
@@ -147,6 +254,10 @@ func newLinuxWANDeviceWithFiles(file, rawFile *os.File, name string, minPort, ma
 		maxPort:   maxPort,
 		hostWANIP: hostWANIP,
 	}
+	if hostWANIP.IsValid() && hostWANIP.Is4() && !hostWANIP.IsLoopback() && !hostWANIP.IsUnspecified() {
+		dev.SetHostWANIP(hostWANIP)
+	}
+	return dev
 }
 
 // NewProductionWANDevice creates a real Linux TUN device and raw socket capture for production WAN egress/ingress.
@@ -222,11 +333,15 @@ func NewProductionWANDevice(name string) (forwarder.PacketDevice, error) {
 	}
 	_ = unix.Bind(rawSock, sll)
 
-	return &linuxWANDevice{
+	dev := &linuxWANDevice{
 		file:    os.NewFile(uintptr(fd), actualName),
 		rawFile: os.NewFile(uintptr(rawSock), "nexus-wan-raw"),
 		name:    actualName,
 		minPort: 40000,
 		maxPort: 65000,
-	}, nil
+	}
+	if hostIP, err := DeriveHostWANIP(); err == nil && hostIP.IsValid() && hostIP.Is4() {
+		dev.SetHostWANIP(hostIP)
+	}
+	return dev, nil
 }

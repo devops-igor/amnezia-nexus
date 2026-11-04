@@ -260,7 +260,9 @@ func (h *pbrDNSHandler) processJob(job dnsJob) {
 		assignedIP: job.assignedIP,
 	}
 	var sc *policy.SessionCache
-	if opener, ok := h.rc.(interface{ Open(policy.Scope) (*policy.SessionCache, error) }); ok {
+	if opener, ok := h.rc.(interface {
+		Open(policy.Scope) (*policy.SessionCache, error)
+	}); ok {
 		sc, _ = opener.Open(policy.Scope{SessionID: job.sessionID, OwnershipEpoch: 1})
 	}
 	scope := gatewaydns.NewScopeHandle(
