@@ -2,7 +2,6 @@ package forwarder
 
 import (
 	"context"
-	"errors"
 	"net"
 	"net/netip"
 	"time"
@@ -88,10 +87,12 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	gwDNS := f.gatewayDNSIP
 	f.mu.RUnlock()
 
-	if len(packet) < 20 || (packet[0]>>4) != 4 {
-		return errors.New("invalid ipv4 packet")
+	parsed, err := ParseAndValidateClientIPv4(packet, route.assignedIP)
+	if err != nil {
+		f.directDrops.Add(1)
+		return err
 	}
-	dstIP := netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]})
+	dstIP := parsed.DstIP
 
 	// Flow Stickiness: Active 5-tuple flow decisions remain stable across TTL or list refresh.
 	if directEgress != nil {
@@ -106,17 +107,17 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 		}
 	}
 
-	// Step 1 — DROP: Prohibited destinations (loopback, link-local, RFC1918, multicast, metadata).
-	// Explicit exception: traffic to designated gateway DNS.
-	if isProhibitedTarget(dstIP, directEgress, gwDNS) {
+	// Step 1 — DROP: Prohibited destinations (loopback, link-local, RFC1918, CGNAT, multicast, metadata).
+	// Explicit exception: traffic to designated gateway DNS on port 53 strictly.
+	if err := ValidateDirectDestination(dstIP, parsed.DstPort, gwDNS); err != nil {
 		f.directDrops.Add(1)
-		return ErrProhibitedDestination
+		return err
 	}
 
 	// Step 2 — PROXY: Policy snapshot CIDR or route cache Proxy match (including shared-IP conflict).
 	if f.matchesProxyPolicy(dstIP, sID, policyMatcher, routeCache) {
 		if directEgress != nil {
-			directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceProxy)
+			_ = directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceProxy)
 		}
 		return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
 	}
@@ -127,7 +128,10 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 			return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
 		}
 		if directEgress != nil {
-			directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceDirect)
+			if err := directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceDirect); err != nil {
+				f.directDrops.Add(1)
+				return err
+			}
 			return f.sendToDirectEgress(directEgress, route, peerKey, packet, pktLen, sID, cID)
 		}
 		f.directDrops.Add(1)
@@ -136,7 +140,7 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 
 	// Step 4 — PROXY (Safe Default): Missing, expired, or evicted DNS evidence (policy.Unknown).
 	if directEgress != nil {
-		directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceProxy)
+		_ = directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceProxy)
 	}
 	return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
 }
@@ -148,12 +152,7 @@ func isProhibitedTarget(dstIP netip.Addr, directEgress *DirectEgressManager, gwD
 	if gwDNS.IsValid() && dstIP == gwDNS {
 		return false
 	}
-	if !dstIP.IsValid() || !dstIP.Is4() || dstIP.IsLoopback() || dstIP.IsLinkLocalUnicast() ||
-		dstIP.IsPrivate() || dstIP.IsMulticast() || dstIP.IsUnspecified() ||
-		dstIP == cloudMetadataIP || dstIP.As4()[0] == 0 || dstIP == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
-		return true
-	}
-	return false
+	return IsProhibitedIPv4Destination(dstIP)
 }
 
 func (f *Forwarder) matchesProxyPolicy(dstIP netip.Addr, sID string, policyMatcher *policy.Matcher, routeCache RouteCache) bool {

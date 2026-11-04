@@ -35,6 +35,23 @@ func (e *errDevice) writeCount() int {
 	return e.writes
 }
 
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
 // TestPumpClientQueueLogsWriteErrors pins issue #43 visibility requirement:
 // a failed dev.Write on the return leg (client queue -> client device) must
 // be LOGGED (throttled to ~1 line/second like the queue-full drop counters),
@@ -51,7 +68,7 @@ func TestPumpClientQueueLogsWriteErrors(t *testing.T) {
 	f.RegisterSessionWithReturnPath("sess-1", "conn-1", "peer-a", "10.100.0.3", 1, path)
 
 	// Capture the standard logger for the duration of the burst.
-	var buf bytes.Buffer
+	var buf syncBuffer
 	log.SetOutput(&buf)
 	defer log.SetOutput(os.Stderr)
 

@@ -556,10 +556,11 @@ func (f *Forwarder) PolicyMatcher() *policy.Matcher {
 func (f *Forwarder) SetGatewayDNSIP(ip netip.Addr) {
 	f.mu.Lock()
 	f.gatewayDNSIP = ip
-	if f.directEgress != nil {
-		f.directEgress.cfg.GatewayDNSIP = ip
-	}
+	dem := f.directEgress
 	f.mu.Unlock()
+	if dem != nil {
+		dem.SetGatewayDNSIP(ip)
+	}
 }
 
 // GatewayDNSIP returns the designated gateway DNS IPv4 address.

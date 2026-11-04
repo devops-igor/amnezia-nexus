@@ -160,7 +160,7 @@ func TestPolicyDispatch_GatewayDNSException(t *testing.T) {
 func TestPolicyDispatch_PolicySnapshotCIDRMatch(t *testing.T) {
 	fwd, _, _, _ := setupForwarderWithPBR(t)
 
-	proxyCIDR := netip.MustParsePrefix("198.51.100.0/24")
+	proxyCIDR := netip.MustParsePrefix("198.51.200.0/24")
 	snap, err := policy.CompileSnapshot(1, "gen-snap", []policy.SourceParsedRules{
 		{
 			SourceID: "test-rules",
@@ -184,7 +184,7 @@ func TestPolicyDispatch_PolicySnapshotCIDRMatch(t *testing.T) {
 	fwd.RegisterSessionWithReturnPath("s-snap", "c-snap", peerKey, clientIP, backendID, capPath.path)
 
 	// Destination within policy proxy CIDR: routes to proxy backend
-	targetIP := netip.MustParseAddr("198.51.100.42")
+	targetIP := netip.MustParseAddr("198.51.200.42")
 	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), targetIP, 23456, 443, 0x02, nil)
 
 	err = fwd.RouteClientToBackend(peerKey, pkt)
