@@ -853,3 +853,97 @@ func TestClient_GetServers_ExplicitZeroTotals(t *testing.T) {
 		}
 	})
 }
+
+func TestClient_GetServers_MissingPaginationMetadata(t *testing.T) {
+	t.Run("100-record response with missing total_pages returns error and purchasing fails closed", func(t *testing.T) {
+		servers := make([]map[string]any, 100)
+		for i := range servers {
+			servers[i] = map[string]any{"id": int64(1000 + i), "status": "ready"}
+		}
+		var postCalls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch {
+			case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/servers"):
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": servers})
+			case r.Method == http.MethodPost && r.URL.Path == "/deploy/servers":
+				postCalls.Add(1)
+				_ = json.NewEncoder(w).Encode(map[string]any{"order_ids": []int64{999}})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := c.GetServers(context.Background()); err == nil || !strings.Contains(err.Error(), "wrapped response missing pagination metadata") {
+			t.Fatalf("expected 'wrapped response missing pagination metadata' error, got: %v", err)
+		}
+
+		req := OrderRequest{PID: 101, PriceID: 555, RegionID: 1, OSID: 12, BillingPeriod: BillingPeriodHourly, Quantity: 1}
+		if _, err := c.OrderServerSafe(context.Background(), req); err == nil {
+			t.Fatal("expected purchasing to fail closed, got nil error")
+		}
+		if postCalls.Load() != 0 {
+			t.Errorf("expected 0 order POST calls when inventory fails, got %d", postCalls.Load())
+		}
+	})
+
+	t.Run("100-record direct array without pagination metadata returns error", func(t *testing.T) {
+		servers := make([]map[string]any, 100)
+		for i := range servers {
+			servers[i] = map[string]any{"id": int64(2000 + i), "status": "ready"}
+		}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(servers)
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := c.GetServers(context.Background()); err == nil || !strings.Contains(err.Error(), "direct array missing pagination metadata") {
+			t.Fatalf("expected 'direct array missing pagination metadata' error, got: %v", err)
+		}
+	})
+}
+
+func TestClient_GetServers_DuplicateServerIDs(t *testing.T) {
+	t.Run("multi-page response with duplicate server ID returns error", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			page := r.URL.Query().Get("page")
+			switch page {
+			case "1", "":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"meta": map[string]any{"page": 1, "total_pages": 2, "total": 2},
+					"data": []map[string]any{{"id": int64(1001), "status": "ready"}},
+				})
+			case "2":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"meta": map[string]any{"page": 2, "total_pages": 2, "total": 2},
+					"data": []map[string]any{{"id": int64(1001), "status": "ready"}},
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := c.GetServers(context.Background()); err == nil || !strings.Contains(err.Error(), "duplicate server id 1001 across pages") {
+			t.Fatalf("expected 'duplicate server id 1001 across pages' error, got: %v", err)
+		}
+	})
+}

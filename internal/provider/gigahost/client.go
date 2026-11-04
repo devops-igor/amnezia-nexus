@@ -477,6 +477,15 @@ func (c *client) GetServers(ctx context.Context) ([]ServerInfo, error) {
 	if err := meta.Validate(1, totalPages, hasExpectedTotal, expectedTotal, len(servers), len(servers)); err != nil {
 		return nil, err
 	}
+	seenIDs := make(map[int64]struct{}, len(servers))
+	for _, s := range servers {
+		if s.ID > 0 {
+			if _, seen := seenIDs[s.ID]; seen {
+				return nil, fmt.Errorf("inconsistent inventory: duplicate server id %d across pages", s.ID)
+			}
+			seenIDs[s.ID] = struct{}{}
+		}
+	}
 	allServers := append([]ServerInfo(nil), servers...)
 	for page := 2; page <= totalPages; page++ {
 		var pageData []byte
@@ -493,6 +502,14 @@ func (c *client) GetServers(ctx context.Context) ([]ServerInfo, error) {
 		if !hasExpectedTotal && pageMeta.HasTotal {
 			hasExpectedTotal = true
 			expectedTotal = pageMeta.Total
+		}
+		for _, s := range pageServers {
+			if s.ID > 0 {
+				if _, seen := seenIDs[s.ID]; seen {
+					return nil, fmt.Errorf("inconsistent inventory: duplicate server id %d across pages", s.ID)
+				}
+				seenIDs[s.ID] = struct{}{}
+			}
 		}
 		allServers = append(allServers, pageServers...)
 	}
@@ -750,6 +767,9 @@ func parseServersPage(data []byte) ([]ServerInfo, PaginationMeta, error) {
 		if direct == nil {
 			return nil, PaginationMeta{}, errors.New("servers payload cannot be null")
 		}
+		if len(direct) >= 100 {
+			return nil, PaginationMeta{}, errors.New("invalid inventory response: direct array missing pagination metadata")
+		}
 		return direct, PaginationMeta{Page: 1, TotalPages: 1, HasPage: true, HasTotalPages: true}, nil
 	}
 
@@ -762,20 +782,30 @@ func parseServersPage(data []byte) ([]ServerInfo, PaginationMeta, error) {
 		return nil, PaginationMeta{}, fmt.Errorf("failed to parse servers response: %w", err)
 	}
 
-	// Normalize unpaginated responses
-	if !wrapped.Meta.HasTotalPages {
-		wrapped.Meta.TotalPages, wrapped.Meta.Page = 1, 1
-	} else if !wrapped.Meta.HasPage {
-		wrapped.Meta.Page = 1
-	}
-
+	var servers []ServerInfo
 	if wrapped.Servers != nil {
-		return wrapped.Servers, wrapped.Meta, nil
+		servers = wrapped.Servers
 	} else if wrapped.Data != nil {
-		return wrapped.Data, wrapped.Meta, nil
+		servers = wrapped.Data
+	} else {
+		return nil, PaginationMeta{}, errors.New("unable to parse servers response format")
 	}
 
-	return nil, PaginationMeta{}, errors.New("unable to parse servers response format")
+	if wrapped.Meta.HasTotalPages {
+		if wrapped.Meta.TotalPages < 1 {
+			return nil, PaginationMeta{}, errors.New("invalid pagination metadata: total_pages must be >= 1")
+		}
+		if !wrapped.Meta.HasPage {
+			wrapped.Meta.Page = 1
+		}
+	} else {
+		if len(servers) >= 100 {
+			return nil, PaginationMeta{}, errors.New("invalid inventory response: wrapped response missing pagination metadata")
+		}
+		wrapped.Meta.TotalPages, wrapped.Meta.Page = 1, 1
+	}
+
+	return servers, wrapped.Meta, nil
 }
 
 func extractErrorMessage(data []byte) string {
