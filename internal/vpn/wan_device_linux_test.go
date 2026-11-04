@@ -196,26 +196,33 @@ func TestLinuxWANDevice_R8B2_ResetSuppressionRuleLifecycle(t *testing.T) {
 	hasUDPAccept := false
 	hasTCPDrop := false
 	hasUDPDrop := false
+	hasInputJump := false
 	for _, cmd := range cmds {
 		joined := strings.Join(cmd, " ")
-		if strings.Contains(joined, "-I INPUT -p tcp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j ACCEPT") {
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j ACCEPT") {
 			hasTCPAccept = true
 		}
-		if strings.Contains(joined, "-I INPUT -p udp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j ACCEPT") {
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p udp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j ACCEPT") {
 			hasUDPAccept = true
 		}
-		if strings.Contains(joined, "-A INPUT -p tcp --dport 40000:65000 -d 203.0.113.10 -j DROP") {
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.10 -j DROP") {
 			hasTCPDrop = true
 		}
-		if strings.Contains(joined, "-A INPUT -p udp --dport 40000:65000 -d 203.0.113.10 -j DROP") {
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p udp --dport 40000:65000 -d 203.0.113.10 -j DROP") {
 			hasUDPDrop = true
+		}
+		if strings.Contains(joined, "-I INPUT 1 -j NEXUS_WAN_RESET") {
+			hasInputJump = true
 		}
 	}
 	if !hasTCPAccept || !hasUDPAccept {
-		t.Fatalf("expected -I INPUT socket ACCEPT rules for tcp and udp, got: %v", cmds)
+		t.Fatalf("expected NEXUS_WAN_RESET socket ACCEPT rules for tcp and udp, got: %v", cmds)
 	}
 	if !hasTCPDrop || !hasUDPDrop {
-		t.Fatalf("expected -A INPUT DROP rules for tcp and udp, got: %v", cmds)
+		t.Fatalf("expected NEXUS_WAN_RESET DROP rules for tcp and udp, got: %v", cmds)
+	}
+	if !hasInputJump {
+		t.Fatalf("expected -I INPUT 1 -j NEXUS_WAN_RESET jump rule, got: %v", cmds)
 	}
 
 	// 2. Calling SetHostWANIP with the same IP is idempotent
@@ -249,16 +256,16 @@ func TestLinuxWANDevice_R8B2_ResetSuppressionRuleLifecycle(t *testing.T) {
 	hasNewTCPDropIns := false
 	for _, cmd := range cmdsAfterChange[countBefore:] {
 		joined := strings.Join(cmd, " ")
-		if strings.Contains(joined, "-D INPUT -p tcp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j ACCEPT") {
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j ACCEPT") {
 			hasOldTCPAcceptDel = true
 		}
-		if strings.Contains(joined, "-D INPUT -p tcp --dport 40000:65000 -d 203.0.113.10 -j DROP") {
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.10 -j DROP") {
 			hasOldTCPDropDel = true
 		}
-		if strings.Contains(joined, "-I INPUT -p tcp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j ACCEPT") {
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j ACCEPT") {
 			hasNewTCPAcceptIns = true
 		}
-		if strings.Contains(joined, "-A INPUT -p tcp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
 			hasNewTCPDropIns = true
 		}
 	}
@@ -280,23 +287,27 @@ func TestLinuxWANDevice_R8B2_ResetSuppressionRuleLifecycle(t *testing.T) {
 	hasFinalTCPDropDel := false
 	hasFinalUDPAcceptDel := false
 	hasFinalUDPDropDel := false
+	hasFinalJumpDel := false
 	for _, cmd := range finalCmds {
 		joined := strings.Join(cmd, " ")
-		if strings.Contains(joined, "-D INPUT -p tcp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j ACCEPT") {
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j ACCEPT") {
 			hasFinalTCPAcceptDel = true
 		}
-		if strings.Contains(joined, "-D INPUT -p tcp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
 			hasFinalTCPDropDel = true
 		}
-		if strings.Contains(joined, "-D INPUT -p udp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j ACCEPT") {
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p udp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j ACCEPT") {
 			hasFinalUDPAcceptDel = true
 		}
-		if strings.Contains(joined, "-D INPUT -p udp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p udp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
 			hasFinalUDPDropDel = true
 		}
+		if strings.Contains(joined, "-D INPUT -j NEXUS_WAN_RESET") {
+			hasFinalJumpDel = true
+		}
 	}
-	if !hasFinalTCPAcceptDel || !hasFinalTCPDropDel || !hasFinalUDPAcceptDel || !hasFinalUDPDropDel {
-		t.Fatalf("expected Close to delete all active rules for %s, got: %v", ip2, finalCmds)
+	if !hasFinalTCPAcceptDel || !hasFinalTCPDropDel || !hasFinalUDPAcceptDel || !hasFinalUDPDropDel || !hasFinalJumpDel {
+		t.Fatalf("expected Close to delete all active rules and jump for %s, got: %v", ip2, finalCmds)
 	}
 }
 
@@ -392,7 +403,7 @@ func TestLinuxWANDevice_R9H1_RollbackOnPartialFailure(t *testing.T) {
 		}
 		// Simulate failure on UDP socket accept rule
 		joined := strings.Join(args, " ")
-		if strings.Contains(joined, "-I INPUT -p udp") && strings.Contains(joined, "-m socket") {
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p udp") && strings.Contains(joined, "-m socket") {
 			return errors.New("iptables: kernel module not available for udp socket match")
 		}
 		return nil
@@ -421,10 +432,10 @@ func TestLinuxWANDevice_R9H1_RollbackOnPartialFailure(t *testing.T) {
 	hasRollbackTCPAccept := false
 	for _, cmd := range cmds {
 		joined := strings.Join(cmd, " ")
-		if strings.Contains(joined, "-D INPUT -p tcp --dport 40000:65000 -d 203.0.113.40 -j DROP") {
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.40 -j DROP") {
 			hasRollbackTCPDrop = true
 		}
-		if strings.Contains(joined, "-D INPUT -p tcp --dport 40000:65000 -d 203.0.113.40 -m socket --nowildcard -j ACCEPT") {
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.40 -m socket --nowildcard -j ACCEPT") {
 			hasRollbackTCPAccept = true
 		}
 	}
@@ -445,7 +456,7 @@ func TestLinuxWANDevice_R9B1_AuditProbeExcludesHostTraffic(t *testing.T) {
 		if len(args) > 0 && args[0] == "-C" {
 			return errors.New("absent")
 		}
-		if len(args) > 0 && args[0] == "-I" {
+		if len(args) > 0 && (args[0] == "-I" || args[0] == "-A") {
 			rules = append(rules, strings.Join(args, " "))
 		}
 		return nil
@@ -461,24 +472,185 @@ func TestLinuxWANDevice_R9B1_AuditProbeExcludesHostTraffic(t *testing.T) {
 	}
 
 	// Ordinary established host HTTPS/DNS return to local ephemeral port 50000.
-	// Verify no unconditional -I DROP rule exists that would drop host traffic without socket matching.
+	// Verify no unconditional DROP rule exists in INPUT.
 	for _, rule := range rules {
-		if strings.Contains(rule, "--dport 40000:65000 -d 203.0.113.10 -j DROP") &&
-			!strings.Contains(rule, "--ctstate") &&
-			!strings.Contains(rule, "--socket") &&
-			!strings.Contains(rule, "--mark") {
-			t.Errorf("host-owned established reply to port 50000 matches unconditional rule: %s", rule)
+		if strings.Contains(rule, "INPUT") && strings.Contains(rule, "--dport 40000:65000 -d 203.0.113.10 -j DROP") {
+			t.Errorf("unconditional DROP rule found in INPUT: %s", rule)
 		}
 	}
 
-	// Verify that socket-match rules are emitted
+	// Verify that socket-match rules are emitted in NEXUS_WAN_RESET
 	hasSocketMatch := false
 	for _, rule := range rules {
-		if strings.Contains(rule, "-m socket --nowildcard -j ACCEPT") {
+		if strings.Contains(rule, "NEXUS_WAN_RESET") && strings.Contains(rule, "-m socket --nowildcard -j ACCEPT") {
 			hasSocketMatch = true
 		}
 	}
 	if !hasSocketMatch {
-		t.Fatalf("expected socket match ACCEPT rule in -I emitted rules: %v", rules)
+		t.Fatalf("expected socket match ACCEPT rule in NEXUS_WAN_RESET: %v", rules)
+	}
+}
+
+func TestLinuxWANDevice_R10B1_INPUTSeededEstablishedAccept_NoSocketDropsAndHostSurvives(t *testing.T) {
+	tunR, tunW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create pipe: %v", err)
+	}
+	defer func() { _ = tunR.Close(); _ = tunW.Close() }()
+
+	// Seed INPUT chain with a conventional firewall established ACCEPT rule:
+	// -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+	type iptablesRule struct {
+		args []string
+	}
+	var mu sync.Mutex
+	chains := map[string][]iptablesRule{
+		"INPUT": {
+			{args: []string{"-A", "INPUT", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"}},
+		},
+	}
+
+	runner := func(args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(args) == 0 {
+			return nil
+		}
+		switch args[0] {
+		case "-N":
+			chain := args[1]
+			if _, exists := chains[chain]; exists {
+				return errors.New("chain already exists")
+			}
+			chains[chain] = []iptablesRule{}
+			return nil
+		case "-F":
+			chain := args[1]
+			chains[chain] = []iptablesRule{}
+			return nil
+		case "-X":
+			chain := args[1]
+			delete(chains, chain)
+			return nil
+		case "-C":
+			chain := args[1]
+			rules := chains[chain]
+			target := strings.Join(args[2:], " ")
+			for _, r := range rules {
+				if strings.Join(r.args[2:], " ") == target {
+					return nil
+				}
+			}
+			return errors.New("rule does not exist")
+		case "-I":
+			chain := args[1]
+			ruleArgs := args[2:]
+			pos := 0
+			if len(ruleArgs) > 0 && ruleArgs[0] == "1" {
+				ruleArgs = ruleArgs[1:]
+			}
+			newRule := iptablesRule{args: append([]string{"-A", chain}, ruleArgs...)}
+			if pos >= len(chains[chain]) {
+				chains[chain] = append(chains[chain], newRule)
+			} else {
+				chains[chain] = append(chains[chain][:pos+1], chains[chain][pos:]...)
+				chains[chain][pos] = newRule
+			}
+			return nil
+		case "-A":
+			chain := args[1]
+			chains[chain] = append(chains[chain], iptablesRule{args: args})
+			return nil
+		case "-D":
+			chain := args[1]
+			target := strings.Join(args[2:], " ")
+			rules := chains[chain]
+			for i, r := range rules {
+				if strings.Join(r.args[2:], " ") == target {
+					chains[chain] = append(rules[:i], rules[i+1:]...)
+					return nil
+				}
+			}
+			return nil
+		}
+		return nil
+	}
+
+	dev := newLinuxWANDeviceWithFiles(tunW, nil, "wan-r10b1", 40000, 65000, netip.Addr{})
+	dev.iptablesRunner = runner
+	defer func() { _ = dev.Close() }()
+
+	hostIP := netip.MustParseAddr("203.0.113.50")
+	if err := dev.SetHostWANIP(hostIP); err != nil {
+		t.Fatalf("SetHostWANIP failed: %v", err)
+	}
+
+	// Packet evaluation model simulating netfilter traversal across INPUT and NEXUS_WAN_RESET:
+	evalPacket := func(proto string, dport uint16, dst netip.Addr, hasSocket bool, ctstate string) string {
+		mu.Lock()
+		defer mu.Unlock()
+
+		var evalChain func(chainName string) (decision string, returned bool)
+		evalChain = func(chainName string) (decision string, returned bool) {
+			rules := chains[chainName]
+			for _, r := range rules {
+				cmd := strings.Join(r.args, " ")
+				if strings.Contains(cmd, "-j NEXUS_WAN_RESET") {
+					dec, ret := evalChain("NEXUS_WAN_RESET")
+					if !ret {
+						return dec, false
+					}
+					continue
+				}
+				if strings.Contains(cmd, "-m conntrack --ctstate RELATED,ESTABLISHED") && strings.Contains(cmd, "-j ACCEPT") {
+					if ctstate == "ESTABLISHED" || ctstate == "RELATED" {
+						return "ACCEPT", false
+					}
+				}
+				ruleMatchesPortRange := strings.Contains(cmd, "--dport 40000:65000")
+				portMatches := ruleMatchesPortRange && (dport >= 40000 && dport <= 65000)
+				ipMatches := strings.Contains(cmd, "-d "+hostIP.String()) && dst == hostIP
+				protoMatches := strings.Contains(cmd, "-p "+proto)
+
+				if portMatches && ipMatches && protoMatches {
+					if strings.Contains(cmd, "-m socket --nowildcard") && strings.Contains(cmd, "-j ACCEPT") {
+						if hasSocket {
+							return "ACCEPT", false
+						}
+					} else if strings.Contains(cmd, "-j DROP") {
+						return "DROP", false
+					}
+				}
+			}
+			return "NONE", true
+		}
+
+		dec, _ := evalChain("INPUT")
+		return dec
+	}
+
+	// 1. Direct return packet for direct NAT egress:
+	// Conntrack sees it as ESTABLISHED (because outbound SYN was tracked),
+	// but there is NO local host socket (hasSocket = false).
+	// Before R10-B1 fix (DROP appended after established ACCEPT), this returned "ACCEPT" -> kernel RST.
+	// With R10-B1 fix (NEXUS_WAN_RESET at position 1), this MUST hit DROP!
+	decisionNoSocket := evalPacket("tcp", 50000, hostIP, false, "ESTABLISHED")
+	if decisionNoSocket != "DROP" {
+		t.Fatalf("expected direct no-socket return packet to hit DROP, got: %s", decisionNoSocket)
+	}
+
+	// 2. Host socket return packet (e.g. host curl / DNS resolver on host):
+	// Conntrack ESTABLISHED, local host socket exists (hasSocket = true).
+	// MUST hit socket ACCEPT in NEXUS_WAN_RESET and survive!
+	decisionHostSocket := evalPacket("tcp", 50000, hostIP, true, "ESTABLISHED")
+	if decisionHostSocket != "ACCEPT" {
+		t.Fatalf("expected host socket return packet to hit ACCEPT, got: %s", decisionHostSocket)
+	}
+
+	// 3. Unrelated host traffic (e.g. port 22 SSH):
+	// Traverses NEXUS_WAN_RESET without matching, falls through to INPUT's established rule, hits ACCEPT.
+	decisionUnrelated := evalPacket("tcp", 22, hostIP, false, "ESTABLISHED")
+	if decisionUnrelated != "ACCEPT" {
+		t.Fatalf("expected unrelated established traffic to hit INPUT ACCEPT, got: %s", decisionUnrelated)
 	}
 }

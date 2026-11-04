@@ -626,10 +626,13 @@ func (s *Service) initPBR(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("create production wan device: %w", err)
 		}
-		if dev, ok := wanDev.(interface{ SetHostWANIP(netip.Addr) }); ok && cfg.HostWANIP.IsValid() {
-			dev.SetHostWANIP(cfg.HostWANIP)
-		}
 		cfg.WANDevice = wanDev
+	}
+	if dev, ok := cfg.WANDevice.(interface{ SetHostWANIP(netip.Addr) error }); ok && cfg.HostWANIP.IsValid() {
+		if err := dev.SetHostWANIP(cfg.HostWANIP); err != nil {
+			_ = cfg.WANDevice.Close()
+			return fmt.Errorf("configure wan device host wan ip: %w", err)
+		}
 	}
 
 	// 4. Policy Matcher: instantiate and compile initial snapshot with valid sources if not provided

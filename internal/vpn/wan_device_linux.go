@@ -60,6 +60,8 @@ func (d *linuxWANDevice) runner() iptablesRunner {
 	return defaultIPTablesRunner
 }
 
+const resetSubchain = "NEXUS_WAN_RESET"
+
 func (d *linuxWANDevice) installResetSuppressionRulesLocked() error {
 	if !d.hostWANIP.IsValid() || !d.hostWANIP.Is4() || d.hostWANIP.IsLoopback() || d.hostWANIP.IsUnspecified() {
 		return nil
@@ -82,39 +84,64 @@ func (d *linuxWANDevice) installResetSuppressionRulesLocked() error {
 		for i := len(installedRules) - 1; i >= 0; i-- {
 			_ = run(installedRules[i]...)
 		}
+		_ = run("-F", resetSubchain)
+		_ = run("-X", resetSubchain)
 		d.iptablesInstalled = false
 		d.installedIP = netip.Addr{}
 		d.installedMinPort = 0
 		d.installedMaxPort = 0
 	}
 
-	for _, proto := range []string{"tcp", "udp"} {
-		// 1. Inbound packets without a local socket in the direct egress NAT range are dropped (R8-B2)
-		// to prevent the host kernel network stack from emitting TCP resets or ICMP port unreachable.
-		checkDrop := []string{"-C", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
-		if err := run(checkDrop...); err != nil {
-			dropArgs := []string{"-A", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
-			if err := run(dropArgs...); err != nil {
-				rollback()
-				return fmt.Errorf("install %s drop reset suppression rule: %w", proto, err)
-			}
-			delDrop := []string{"-D", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
-			installedRules = append(installedRules, delDrop)
+	// 1. Ensure dedicated reset suppression sub-chain exists (R10-B1).
+	// If it already exists, flush any stale rules.
+	if err := run("-N", resetSubchain); err != nil {
+		if flushErr := run("-F", resetSubchain); flushErr != nil {
+			rollback()
+			return fmt.Errorf("create %s subchain: %w", resetSubchain, err)
 		}
+	}
 
+	for _, proto := range []string{"tcp", "udp"} {
 		// 2. Inbound packets matching an existing host socket (e.g. host DNS resolver, outbound HTTPS)
-		// must be accepted at the top of the INPUT chain before any DROP rule (R9-B1).
-		checkAccept := []string{"-C", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
+		// must be accepted before any DROP rule within the sub-chain (R9-B1).
+		checkAccept := []string{"-C", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
 		if err := run(checkAccept...); err != nil {
-			acceptArgs := []string{"-I", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
+			acceptArgs := []string{"-A", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
 			if err := run(acceptArgs...); err != nil {
 				rollback()
 				return fmt.Errorf("install %s socket accept rule: %w", proto, err)
 			}
-			delAccept := []string{"-D", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
+			delAccept := []string{"-D", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
 			installedRules = append(installedRules, delAccept)
 		}
+
+		// 3. Inbound packets without a local socket in the direct egress NAT range are dropped (R8-B2)
+		// within the sub-chain to prevent host kernel from emitting TCP resets or ICMP port unreachable.
+		checkDrop := []string{"-C", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
+		if err := run(checkDrop...); err != nil {
+			dropArgs := []string{"-A", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
+			if err := run(dropArgs...); err != nil {
+				rollback()
+				return fmt.Errorf("install %s drop reset suppression rule: %w", proto, err)
+			}
+			delDrop := []string{"-D", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
+			installedRules = append(installedRules, delDrop)
+		}
 	}
+
+	// 4. Jump to the dedicated sub-chain at position 1 of INPUT (R10-B1),
+	// ensuring no-socket DROP executes before any pre-existing established ACCEPT rules.
+	checkJump := []string{"-C", "INPUT", "-j", resetSubchain}
+	if err := run(checkJump...); err == nil {
+		_ = run("-D", "INPUT", "-j", resetSubchain)
+	}
+	jumpArgs := []string{"-I", "INPUT", "1", "-j", resetSubchain}
+	if err := run(jumpArgs...); err != nil {
+		rollback()
+		return fmt.Errorf("insert %s jump in INPUT: %w", resetSubchain, err)
+	}
+	delJump := []string{"-D", "INPUT", "-j", resetSubchain}
+	installedRules = append(installedRules, delJump)
 
 	d.iptablesInstalled = true
 	d.installedIP = d.hostWANIP
@@ -124,19 +151,30 @@ func (d *linuxWANDevice) installResetSuppressionRulesLocked() error {
 }
 
 func (d *linuxWANDevice) removeResetSuppressionRulesLocked() {
-	if !d.iptablesInstalled || !d.installedIP.IsValid() {
+	if !d.iptablesInstalled {
 		return
 	}
 	run := d.runner()
 	portArg := fmt.Sprintf("%d:%d", d.installedMinPort, d.installedMaxPort)
 	ipArg := d.installedIP.String()
 
-	for _, proto := range []string{"tcp", "udp"} {
-		deleteAccept := []string{"-D", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
-		_ = run(deleteAccept...)
-		deleteDrop := []string{"-D", "INPUT", "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
-		_ = run(deleteDrop...)
+	// 1. Remove jump from INPUT first so incoming packets stop entering the subchain.
+	_ = run("-D", "INPUT", "-j", resetSubchain)
+
+	// 2. Remove rules inside the subchain.
+	if d.installedIP.IsValid() {
+		for _, proto := range []string{"tcp", "udp"} {
+			deleteAccept := []string{"-D", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
+			_ = run(deleteAccept...)
+			deleteDrop := []string{"-D", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
+			_ = run(deleteDrop...)
+		}
 	}
+
+	// 3. Flush and delete the dedicated subchain.
+	_ = run("-F", resetSubchain)
+	_ = run("-X", resetSubchain)
+
 	d.iptablesInstalled = false
 	d.installedIP = netip.Addr{}
 	d.installedMinPort = 0
