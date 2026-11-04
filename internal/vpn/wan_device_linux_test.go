@@ -20,6 +20,14 @@ func TestProductionWANDevice_PermissionsAndLifecycle(t *testing.T) {
 		return
 	}
 
+	// Even as root, /dev/net/tun may be absent (e.g. CI containers without kernel TUN).
+	// Skip rather than fail in that case — the test's purpose is to verify the ioctl
+	// lifecycle on a real TUN device, which requires the kernel module.
+	if _, err := os.Stat("/dev/net/tun"); err != nil {
+		t.Skip("/dev/net/tun not available; skipping TUN lifecycle test")
+		return
+	}
+
 	dev, err := NewProductionWANDevice("nexus-wan-test")
 	if err != nil {
 		t.Fatalf("NewProductionWANDevice failed: %v", err)
