@@ -2,6 +2,9 @@ package database
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -287,5 +290,88 @@ func TestGetSettingRaw(t *testing.T) {
 	}
 	if found {
 		t.Fatal("expected found=false on error, got true")
+	}
+}
+
+func TestSettingsGigahostEncryptionAndFilePermissions(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "secure_panel.db")
+	secKey := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	db, err := Open(dbPath, secKey)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	// 1. Check file permissions are 0600
+	stat, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	if perm := stat.Mode().Perm(); perm&0077 != 0 {
+		t.Errorf("expected restrictive file permissions (0600/0640), got %04o", perm)
+	}
+
+	// 2. Save gigahost setting with sensitive api_key
+	plainKey := "flux_live_" + strings.Repeat("x", 64)
+	ctx := context.Background()
+	ghSetting := map[string]any{
+		"api_key":            plainKey,
+		"monthly_budget_nok": 250.0,
+	}
+	if err := db.SetSetting(ctx, "gigahost", ghSetting); err != nil {
+		t.Fatalf("SetSetting gigahost failed: %v", err)
+	}
+
+	// 3. Verify SQLite raw data does not contain plaintext api_key
+	raw, found, err := db.GetSettingRaw(ctx, "gigahost")
+	if err != nil || !found {
+		t.Fatalf("GetSettingRaw failed: %v", err)
+	}
+	if strings.Contains(raw.String, plainKey) {
+		t.Fatalf("plaintext key found in raw database setting: %s", raw.String)
+	}
+
+	// 4. Verify GetSetting and GetAllSettings return decrypted key
+	var loaded map[string]any
+	if err := db.GetSetting(ctx, "gigahost", &loaded); err != nil {
+		t.Fatalf("GetSetting failed: %v", err)
+	}
+	if loaded["api_key"] != plainKey {
+		t.Errorf("GetSetting api_key = %v, want %v", loaded["api_key"], plainKey)
+	}
+
+	all, err := db.GetAllSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetAllSettings failed: %v", err)
+	}
+	allGH, ok := all["gigahost"].(map[string]any)
+	if !ok || allGH["api_key"] != plainKey {
+		t.Errorf("GetAllSettings gigahost api_key = %v, want %v", allGH["api_key"], plainKey)
+	}
+
+	// 5. Test prepareGigahostSettingForStore edge cases
+	val, err := db.prepareGigahostSettingForStore(nil)
+	if err != nil || val != nil {
+		t.Errorf("expected nil for nil input, got val=%v err=%v", val, err)
+	}
+
+	// 6. Fail-closed: assert encryption failure rejects settings storage and never stores plaintext
+	dbBroken := &DB{
+		sqlDB:     db.sqlDB,
+		secretKey: "", // empty secret key causes EncryptCredential to fail
+	}
+	sensitiveKey := "flux_live_plaintext_must_never_be_stored"
+	badSetting := map[string]any{
+		"api_key": sensitiveKey,
+	}
+	if err := dbBroken.SetSetting(ctx, "gigahost", badSetting); err == nil {
+		t.Fatal("expected SetSetting to fail closed when encryption fails, got nil error")
+	}
+	if err := dbBroken.SetSettingsBulk(ctx, map[string]any{"gigahost": badSetting}); err == nil {
+		t.Fatal("expected SetSettingsBulk to fail closed when encryption fails, got nil error")
+	}
+	rawAfterFail, _, _ := db.GetSettingRaw(ctx, "gigahost")
+	if strings.Contains(rawAfterFail.String, sensitiveKey) {
+		t.Fatalf("plaintext key leaked into database on failed encryption: %s", rawAfterFail.String)
 	}
 }

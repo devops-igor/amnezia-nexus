@@ -351,3 +351,87 @@ func TestSettingsSave_PreservesSSLCertAndSecrets(t *testing.T) {
 		t.Errorf("expected malicious setting to not be stored, got %v", injected)
 	}
 }
+
+func TestSaveSettingsHandler_GigahostRBAC(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+
+	adminKey := "flux_live_admin_secret_key_0123456789abcdef0123456789abcdef01234567"
+	supportKey := "flux_live_support_hacker_key_9999999999999999999999999999999999999"
+
+	// Admin initially configures Gigahost setting
+	if err := db.SetSetting(ctx, "gigahost", map[string]any{"api_key": adminKey, "monthly_budget_nok": 500}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Support user attempts to modify gigahost settings -> 403 Forbidden
+	supportPayload, _ := json.Marshal(map[string]any{
+		"gigahost": map[string]any{
+			"api_key": supportKey,
+		},
+	})
+	reqSupport := httptest.NewRequest(http.MethodPost, "/api/settings/save", bytes.NewReader(supportPayload))
+	reqSupport = reqSupport.WithContext(middleware.WithSession(reqSupport.Context(), &models.SessionData{
+		UserID: "support_user",
+		Role:   models.RoleSupport,
+	}))
+	wSupport := httptest.NewRecorder()
+	h.SaveSettingsHandler(wSupport, reqSupport)
+
+	if wSupport.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for Support updating gigahost, got %d", wSupport.Code)
+	}
+
+	// Verify key was NOT overwritten
+	var checkCfg map[string]any
+	if err := db.GetSetting(ctx, "gigahost", &checkCfg); err != nil {
+		t.Fatal(err)
+	}
+	if checkCfg["api_key"] != adminKey {
+		t.Fatalf("Support user modified admin api_key! Got %v, want %v", checkCfg["api_key"], adminKey)
+	}
+
+	// 2. Support user can save appearance settings without gigahost -> 200 OK
+	nonPrivPayload, _ := json.Marshal(map[string]any{
+		"appearance": map[string]any{
+			"title": "Support Theme",
+		},
+	})
+	reqSupportOK := httptest.NewRequest(http.MethodPost, "/api/settings/save", bytes.NewReader(nonPrivPayload))
+	reqSupportOK = reqSupportOK.WithContext(middleware.WithSession(reqSupportOK.Context(), &models.SessionData{
+		UserID: "support_user",
+		Role:   models.RoleSupport,
+	}))
+	wSupportOK := httptest.NewRecorder()
+	h.SaveSettingsHandler(wSupportOK, reqSupportOK)
+
+	if wSupportOK.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for Support updating appearance, got %d", wSupportOK.Code)
+	}
+
+	// 3. Admin user modifies gigahost settings -> 200 OK
+	newAdminKey := "flux_live_new_admin_key_abcdefabcdefabcdefabcdefabcdefabcdefabcdef"
+	adminPayload, _ := json.Marshal(map[string]any{
+		"gigahost": map[string]any{
+			"api_key": newAdminKey,
+		},
+	})
+	reqAdmin := httptest.NewRequest(http.MethodPost, "/api/settings/save", bytes.NewReader(adminPayload))
+	reqAdmin = reqAdmin.WithContext(middleware.WithSession(reqAdmin.Context(), &models.SessionData{
+		UserID: "admin_user",
+		Role:   models.RoleAdmin,
+	}))
+	wAdmin := httptest.NewRecorder()
+	h.SaveSettingsHandler(wAdmin, reqAdmin)
+
+	if wAdmin.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for Admin updating gigahost, got %d", wAdmin.Code)
+	}
+
+	if err := db.GetSetting(ctx, "gigahost", &checkCfg); err != nil {
+		t.Fatal(err)
+	}
+	if checkCfg["api_key"] != newAdminKey {
+		t.Fatalf("Admin update failed! Got %v, want %v", checkCfg["api_key"], newAdminKey)
+	}
+}
