@@ -115,6 +115,7 @@ jobs:
           # Match guest paths and loopback so sibling Docker fixtures see test files/services.
           # The socket and /tmp belong to the isolated guest, never the physical host.
           docker run --rm -i --user 0:0 --network host --cpus 6 --memory 10g \
+            --cap-add NET_ADMIN --cap-add SYS_ADMIN --security-opt apparmor=unconfined --device /dev/net/tun \
             --volume /var/run/docker.sock:/var/run/docker.sock \
             --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
             --volume /tmp:/tmp \
