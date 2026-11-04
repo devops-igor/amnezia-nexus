@@ -706,7 +706,7 @@ func TestGigahostOrderHandler_BudgetCap(t *testing.T) {
 		},
 		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
 			return []gigahost.HourlyPlan{
-				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0},
+				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
 			}, nil
 		},
 		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
@@ -832,7 +832,7 @@ func TestGigahostOrderHandler_BudgetPendingLocalOrderRejected(t *testing.T) {
 		},
 		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
 			return []gigahost.HourlyPlan{
-				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0},
+				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
 			}, nil
 		},
 		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
@@ -876,7 +876,7 @@ func TestGigahostOrderHandler_BudgetInventoryReadErrorFailsClosed(t *testing.T) 
 		},
 		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
 			return []gigahost.HourlyPlan{
-				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0},
+				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
 			}, nil
 		},
 		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
@@ -932,7 +932,7 @@ func TestGigahostOrderHandler_BudgetDeduplicatesOpenOrderInInventory(t *testing.
 		},
 		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
 			return []gigahost.HourlyPlan{
-				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0},
+				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
 			}, nil
 		},
 		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {

@@ -438,7 +438,7 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		var uncertainErr *gigahost.OrderUncertainError
-		if errors.As(orderErr, &uncertainErr) || (orderResp != nil && orderResp.Status == gigahost.StatusUnknown) {
+		if errors.As(orderErr, &uncertainErr) || (orderResp != nil && (orderResp.Status == gigahost.StatusUnknown || orderResp.OrderID == "")) {
 			h.JSON(w, http.StatusAccepted, map[string]any{
 				"status":  "unknown",
 				"message": "Order request outcome uncertain; marked unknown to prevent accidental duplicate purchases",
@@ -447,6 +447,15 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		h.JSONError(w, http.StatusBadGateway, "order_failed", orderErr.Error())
+		return
+	}
+
+	if orderResp != nil && (orderResp.Status == gigahost.StatusUnknown || orderResp.OrderID == "") {
+		h.JSON(w, http.StatusAccepted, map[string]any{
+			"status":  "unknown",
+			"message": "Order request outcome uncertain; marked unknown to prevent accidental duplicate purchases",
+			"order":   orderRecord,
+		})
 		return
 	}
 
@@ -513,6 +522,9 @@ func calculateCommittedSpend(catalog []gigahost.HourlyPlan, servers []gigahost.S
 	accountedOrders := make(map[string]bool)
 	for _, s := range servers {
 		if isServerActiveForBudget(s.Status) {
+			if !s.IsHourlyVPS() {
+				continue
+			}
 			if s.OrderID != "" {
 				accountedOrders[s.OrderID] = true
 			}
@@ -623,20 +635,21 @@ func validateOrderAgainstCatalog(catalog []gigahost.HourlyPlan, req OrderServerP
 	if matchedPlan == nil {
 		return fmt.Errorf("invalid_plan: plan %d (price %d) not found in provider catalog", req.PID, req.PriceID)
 	}
-	if !matchedPlan.InStock && (matchedPlan.Name != "" || matchedPlan.CPUCores > 0 || len(matchedPlan.Regions) > 0 || matchedPlan.RAMMB > 0 || matchedPlan.Description != "") {
+	if !matchedPlan.InStock {
 		return fmt.Errorf("invalid_plan: plan %d is out of stock", req.PID)
 	}
-	if len(matchedPlan.Regions) > 0 {
-		regionValid := false
-		for _, r := range matchedPlan.Regions {
-			if r.ID == req.RegionID && r.Available {
-				regionValid = true
-				break
-			}
+	if len(matchedPlan.Regions) == 0 {
+		return fmt.Errorf("invalid_plan: plan %d has no available regions in catalog", req.PID)
+	}
+	regionValid := false
+	for _, r := range matchedPlan.Regions {
+		if r.ID == req.RegionID && r.Available {
+			regionValid = true
+			break
 		}
-		if !regionValid {
-			return fmt.Errorf("invalid_plan: region %d is not available for plan %d", req.RegionID, req.PID)
-		}
+	}
+	if !regionValid {
+		return fmt.Errorf("invalid_plan: region %d is not available for plan %d", req.RegionID, req.PID)
 	}
 
 	planMonthlyRate := requestMonthlySpend(catalog, req)
@@ -820,7 +833,7 @@ func applyOrderResponseToRecord(orderRecord *GigahostOrderRecord, orderResp *gig
 		return
 	}
 	var uncertainErr *gigahost.OrderUncertainError
-	if errors.As(orderErr, &uncertainErr) || (orderResp != nil && orderResp.Status == gigahost.StatusUnknown) {
+	if errors.As(orderErr, &uncertainErr) || (orderResp != nil && (orderResp.Status == gigahost.StatusUnknown || orderResp.OrderID == "")) {
 		orderRecord.Status = gigahost.StatusUnknown
 		return
 	}

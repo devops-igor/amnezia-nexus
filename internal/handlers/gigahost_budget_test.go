@@ -40,7 +40,7 @@ func TestGigahostOrderHandler_BudgetRetainsReadyOrderAbsentFromInventory(t *test
 		},
 		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
 			return []gigahost.HourlyPlan{
-				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0},
+				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
 			}, nil
 		},
 		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
@@ -80,7 +80,7 @@ func TestGigahostOrderHandler_BudgetRetainsReadyOrderAbsentFromInventory(t *test
 		},
 		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
 			return []gigahost.HourlyPlan{
-				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0},
+				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
 			}, nil
 		},
 		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
@@ -134,7 +134,7 @@ func TestGigahostOrderHandler_BudgetRetainsActiveOrderAbsentFromInventory(t *tes
 		},
 		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
 			return []gigahost.HourlyPlan{
-				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0},
+				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
 			}, nil
 		},
 		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
@@ -262,7 +262,7 @@ func TestGigahostOrderHandler_BudgetReconcilesCancelledServer(t *testing.T) {
 			},
 			getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
 				return []gigahost.HourlyPlan{
-					{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0},
+					{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
 				}, nil
 			},
 			getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
@@ -336,7 +336,7 @@ func TestGigahostOrderHandler_BudgetReconcilesCancelledServer(t *testing.T) {
 			},
 			getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
 				return []gigahost.HourlyPlan{
-					{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0},
+					{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
 				}, nil
 			},
 			getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
@@ -412,7 +412,7 @@ func TestGigahostOrderHandler_BudgetReconcilesCancelledServer(t *testing.T) {
 			},
 			getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
 				return []gigahost.HourlyPlan{
-					{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0},
+					{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
 				}, nil
 			},
 			getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
