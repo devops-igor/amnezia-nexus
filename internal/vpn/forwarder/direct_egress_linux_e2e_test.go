@@ -394,14 +394,17 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 		capPath := newTestCaptureReturnPath()
 
 		fwd.RegisterSessionWithReturnPath(sessionID, "conn-5", peerKey, clientIP, missingBackendID, capPath.path)
+		fwd.mu.Lock()
+		delete(fwd.backendQueues, missingBackendID)
+		fwd.mu.Unlock()
 
 		proxyDst := netip.MustParseAddr("198.51.200.88")
 		rc.Set(sessionID, proxyDst, policy.Proxy)
 
 		pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), proxyDst, 4444, 80, []byte("outage-proxy"))
 		err := fwd.RouteClientToBackend(peerKey, pkt)
-		if err == nil {
-			t.Fatalf("expected error on backend outage, got nil")
+		if !errors.Is(err, ErrBackendNotFound) {
+			t.Fatalf("expected ErrBackendNotFound on backend outage, got %v", err)
 		}
 
 		// Must NOT have forwarded to direct egress
