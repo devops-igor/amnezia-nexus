@@ -712,5 +712,17 @@
   "vpn_unit_bps": "B/s",
   "vpn_diag_probe_suffix": " (sonde)",
   "vpn_diag_write_suffix": " (écriture)",
-  "vpn_diag_backend_option": "Serveur #{id}"
+  "vpn_diag_backend_option": "Serveur #{id}",
+  "gigahost_settings_title": "Hébergement Gigahost Cloud",
+  "gigahost_api_key_label": "Clé API",
+  "gigahost_api_key_hint": "Clé Bearer pour l'API Gigahost (flux_live_...)",
+  "gigahost_monthly_budget_label": "Plafond budgétaire mensuel (NOK)",
+  "gigahost_monthly_budget_hint": "Plafond mensuel maximal en couronnes norvégiennes",
+  "deploy_vps_title": "Déployer un VPS à l'heure",
+  "deploy_vps_desc": "Commander des instances VPS à l'heure via l'API Gigahost Cloud",
+  "deploy_vps_select_plan": "Sélectionner un forfait",
+  "deploy_vps_select_region": "Sélectionner une région",
+  "deploy_vps_select_os": "Système d'exploitation",
+  "deploy_vps_btn": "Déployer le VPS",
+  "deploy_vps_recent_orders": "Déploiements récents"
 }

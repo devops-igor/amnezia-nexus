@@ -27,6 +27,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/xray"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 	"github.com/devops-igor/amnezia-nexus/internal/service/upstream"
 	"github.com/devops-igor/amnezia-nexus/internal/service/userops"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
@@ -56,6 +57,7 @@ type Dependencies struct {
 	NaiveManager    *naive.NaiveManager
 	VPNService      *vpn.Service
 	UpstreamService UpstreamChecker
+	GigahostClient  gigahost.Client
 	UpdaterService  *updater.ReleaseChecker
 }
 
@@ -72,6 +74,9 @@ type Handlers struct {
 	naiveMgr                  *naive.NaiveManager
 	vpnSvc                    *vpn.Service
 	upstreamSvc               UpstreamChecker
+	gigahostClient            gigahost.Client
+	gigahostMu                sync.RWMutex
+	budgetMu                  sync.Mutex
 	updaterSvc                *updater.ReleaseChecker
 	dialTimeout               func(network, address string, timeout time.Duration) (net.Conn, error)
 	setupMu                   sync.Mutex
@@ -116,18 +121,19 @@ func (h *Handlers) lockServerHost(serverID int64) func() {
 // NewHandlers creates a new Handlers instance with provided dependencies.
 func NewHandlers(deps Dependencies) *Handlers {
 	h := &Handlers{
-		cfg:         deps.Config,
-		db:          deps.DB,
-		registry:    deps.Registry,
-		sshPool:     deps.SSHPool,
-		awgMgr:      deps.AWGManager,
-		mtproxylMgr: deps.MTProxyLManager,
-		dnsMgr:      deps.DNSManager,
-		xrayMgr:     deps.XrayManager,
-		naiveMgr:    deps.NaiveManager,
-		vpnSvc:      deps.VPNService,
-		upstreamSvc: deps.UpstreamService,
-		updaterSvc:  deps.UpdaterService,
+		cfg:            deps.Config,
+		db:             deps.DB,
+		registry:       deps.Registry,
+		sshPool:        deps.SSHPool,
+		awgMgr:         deps.AWGManager,
+		mtproxylMgr:    deps.MTProxyLManager,
+		dnsMgr:         deps.DNSManager,
+		xrayMgr:        deps.XrayManager,
+		naiveMgr:       deps.NaiveManager,
+		vpnSvc:         deps.VPNService,
+		upstreamSvc:    deps.UpstreamService,
+		gigahostClient: deps.GigahostClient,
+		updaterSvc:     deps.UpdaterService,
 	}
 
 	if h.updaterSvc == nil {

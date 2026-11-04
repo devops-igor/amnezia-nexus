@@ -712,5 +712,17 @@
   "vpn_unit_bps": "B/s",
   "vpn_diag_probe_suffix": " (探测)",
   "vpn_diag_write_suffix": " (写入)",
-  "vpn_diag_backend_option": "后端 #{id}"
+  "vpn_diag_backend_option": "后端 #{id}",
+  "gigahost_settings_title": "Gigahost 云主机",
+  "gigahost_api_key_label": "API 密钥",
+  "gigahost_api_key_hint": "Gigahost API 的 Bearer 密钥 (flux_live_...)",
+  "gigahost_monthly_budget_label": "每月预算上限 (NOK)",
+  "gigahost_monthly_budget_hint": "挪威克朗每月最高支出限额",
+  "deploy_vps_title": "部署按小时计费 VPS",
+  "deploy_vps_desc": "通过 Gigahost Cloud API 按需订购按小时计费的 VPS 实例",
+  "deploy_vps_select_plan": "选择配置方案",
+  "deploy_vps_select_region": "选择地区",
+  "deploy_vps_select_os": "操作系统",
+  "deploy_vps_btn": "部署 VPS",
+  "deploy_vps_recent_orders": "近期部署"
 }

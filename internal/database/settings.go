@@ -45,6 +45,18 @@ func (d *DB) GetSetting(ctx context.Context, key string, target any) error {
 			}
 			return json.Unmarshal(b, target)
 		}
+	} else if key == "gigahost" {
+		var ghMap map[string]any
+		if err := json.Unmarshal([]byte(val.String), &ghMap); err == nil {
+			if apiKey, ok := ghMap["api_key"].(string); ok && apiKey != "" {
+				ghMap["api_key"] = security.DecryptCredentialSafe(apiKey, d.secretKey)
+			}
+			b, err := json.Marshal(ghMap)
+			if err != nil {
+				return err
+			}
+			return json.Unmarshal(b, target)
+		}
 	}
 
 	return json.Unmarshal([]byte(val.String), target)
@@ -102,6 +114,13 @@ func (d *DB) GetAllSettings(ctx context.Context) (map[string]any, error) {
 					}
 					parsed = sslMap
 				}
+			} else if k == "gigahost" {
+				if ghMap, ok := parsed.(map[string]any); ok {
+					if apiKey, ok := ghMap["api_key"].(string); ok && apiKey != "" {
+						ghMap["api_key"] = security.DecryptCredentialSafe(apiKey, d.secretKey)
+					}
+					parsed = ghMap
+				}
 			}
 			result[k] = parsed
 		} else {
@@ -136,6 +155,12 @@ func (d *DB) SetSetting(ctx context.Context, key string, value any) error {
 	valToStore := value
 	if key == "ssl" {
 		valToStore = d.prepareSSLSettingForStore(value)
+	} else if key == "gigahost" {
+		var prepErr error
+		valToStore, prepErr = d.prepareGigahostSettingForStore(value)
+		if prepErr != nil {
+			return prepErr
+		}
 	}
 
 	b, err := json.Marshal(valToStore)
@@ -176,6 +201,12 @@ func (d *DB) SetSettingsBulk(ctx context.Context, settings map[string]any) error
 		valToStore := value
 		if key == "ssl" {
 			valToStore = d.prepareSSLSettingForStore(value)
+		} else if key == "gigahost" {
+			var prepErr error
+			valToStore, prepErr = d.prepareGigahostSettingForStore(value)
+			if prepErr != nil {
+				return prepErr
+			}
 		}
 
 		b, err := json.Marshal(valToStore)
@@ -349,5 +380,44 @@ func (d *DB) prepareSSLSettingForStore(value any) any {
 		return sslCopy
 	default:
 		return value
+	}
+}
+
+func (d *DB) prepareGigahostSettingForStore(value any) (any, error) {
+	if value == nil {
+		return nil, nil
+	}
+	switch v := value.(type) {
+	case map[string]any:
+		ghCopy := make(map[string]any, len(v))
+		for k, val := range v {
+			ghCopy[k] = val
+		}
+		if apiKey, ok := ghCopy["api_key"].(string); ok && apiKey != "" && !security.LooksLikeFernetToken(apiKey) {
+			enc, err := security.EncryptCredential(apiKey, d.secretKey)
+			if err != nil {
+				return nil, fmt.Errorf("encrypt gigahost api key: %w", err)
+			}
+			ghCopy["api_key"] = enc
+		}
+		return ghCopy, nil
+	default:
+		b, err := json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf("marshal gigahost setting: %w", err)
+		}
+		var ghMap map[string]any
+		if err := json.Unmarshal(b, &ghMap); err != nil {
+			return nil, fmt.Errorf("unmarshal gigahost setting: %w", err)
+		}
+		if apiKey, ok := ghMap["api_key"].(string); ok && apiKey != "" && !security.LooksLikeFernetToken(apiKey) {
+			enc, err := security.EncryptCredential(apiKey, d.secretKey)
+			if err != nil {
+				return nil, fmt.Errorf("encrypt gigahost api key: %w", err)
+			}
+			ghMap["api_key"] = enc
+			return ghMap, nil
+		}
+		return value, nil
 	}
 }

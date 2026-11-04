@@ -613,4 +613,5 @@ type SaveSettingsRequest struct {
 	Telegram   map[string]interface{} `json:"telegram,omitempty"`
 	SSL        SSLSettings            `json:"ssl"`
 	Limits     ConnectionLimits       `json:"limits"`
+	Gigahost   map[string]interface{} `json:"gigahost,omitempty"`
 }

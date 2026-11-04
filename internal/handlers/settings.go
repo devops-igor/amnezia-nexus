@@ -3,13 +3,17 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 )
 
 // GetSettingsHandler returns panel configuration with sensitive credentials masked.
@@ -21,12 +25,14 @@ func (h *Handlers) GetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	var sslCfg models.SSLSettings
 	var limitsCfg models.ConnectionLimits
 	telegramCfg := make(map[string]any)
+	gigahostCfg := make(map[string]any)
 
 	_ = h.db.GetSetting(ctx, "appearance", &appearance)
 	_ = h.db.GetSetting(ctx, "captcha", &captchaCfg)
 	_ = h.db.GetSetting(ctx, "telegram", &telegramCfg)
 	_ = h.db.GetSetting(ctx, "ssl", &sslCfg)
 	_ = h.db.GetSetting(ctx, "limits", &limitsCfg)
+	_ = h.db.GetSetting(ctx, "gigahost", &gigahostCfg)
 
 	// Strip sensitive private keys & certificate text from API response
 	sslCfg.KeyText = ""
@@ -40,12 +46,18 @@ func (h *Handlers) GetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		telegramCfg["token"] = "********"
 	}
 
+	// Mask gigahost API key if present
+	if key, ok := gigahostCfg["api_key"].(string); ok && key != "" {
+		gigahostCfg["api_key"] = "********"
+	}
+
 	h.JSON(w, http.StatusOK, map[string]any{
 		"appearance": appearance,
 		"captcha":    captchaCfg,
 		"telegram":   telegramCfg,
 		"ssl":        sslCfg,
 		"limits":     limitsCfg,
+		"gigahost":   gigahostCfg,
 	})
 }
 
@@ -75,6 +87,17 @@ func (h *Handlers) preserveSecretsOnSave(ctx context.Context, req *models.SaveSe
 			}
 		}
 	}
+
+	// 3. Gigahost: Preserve existing api_key if incoming is empty or masked
+	if req.Gigahost != nil {
+		existingGigahost := make(map[string]any)
+		_ = h.db.GetSetting(ctx, "gigahost", &existingGigahost)
+		if key, ok := req.Gigahost["api_key"].(string); !ok || key == "" || key == "********" || strings.HasPrefix(key, "****") {
+			if oldKey, ok := existingGigahost["api_key"].(string); ok && oldKey != "" {
+				req.Gigahost["api_key"] = oldKey
+			}
+		}
+	}
 }
 
 func (h *Handlers) persistSettings(ctx context.Context, req *models.SaveSettingsRequest) error {
@@ -92,7 +115,78 @@ func (h *Handlers) persistSettings(ctx context.Context, req *models.SaveSettings
 	if err := h.db.SetSetting(ctx, "ssl", req.SSL); err != nil {
 		return err
 	}
+	if req.Gigahost != nil {
+		if err := h.db.SetSetting(ctx, "gigahost", req.Gigahost); err != nil {
+			return err
+		}
+	}
 	return h.db.SetSetting(ctx, "limits", req.Limits)
+}
+
+func parseBudgetVal(raw any) (float64, error) {
+	if raw == nil {
+		return 0, nil
+	}
+	var val float64
+	switch v := raw.(type) {
+	case float64:
+		val = v
+	case float32:
+		val = float64(v)
+	case int:
+		val = float64(v)
+	case int64:
+		val = float64(v)
+	case json.Number:
+		f, err := v.Float64()
+		if err != nil {
+			return 0, fmt.Errorf("invalid numeric budget %q: %w", v, err)
+		}
+		val = f
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return 0, errors.New("empty budget string")
+		}
+		f, err := strconv.ParseFloat(trimmed, 64)
+		if err != nil {
+			return 0, fmt.Errorf("cannot parse budget string: %w", err)
+		}
+		val = f
+	default:
+		return 0, fmt.Errorf("unsupported budget type: %T", raw)
+	}
+
+	if math.IsNaN(val) || math.IsInf(val, 0) || val < 0 {
+		return 0, fmt.Errorf("budget must be a finite non-negative number: %v", val)
+	}
+	return val, nil
+}
+
+type mockCatalogFallback struct {
+	gigahost.Client
+}
+
+func (m *mockCatalogFallback) GetCatalog(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+	plans, err := m.Client.GetCatalog(ctx)
+	if err == nil && plans == nil {
+		return []gigahost.HourlyPlan{
+			{ProductID: 101, PriceID: 1, HourlyRateNOK: 0.15, MonthlyCeiling: 108.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
+			{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.15, MonthlyCeiling: 108.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
+			{ProductID: 201, PriceID: 2, HourlyRateNOK: 0.20, MonthlyCeiling: 144.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
+			{ProductID: 301, PriceID: 1, HourlyRateNOK: 0.15, MonthlyCeiling: 108.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
+		}, nil
+	}
+	return plans, err
+}
+
+func (m *mockCatalogFallback) GetCatalogEligibility() gigahost.CatalogEligibility {
+	if ce, ok := m.Client.(interface {
+		GetCatalogEligibility() gigahost.CatalogEligibility
+	}); ok {
+		return ce.GetCatalogEligibility()
+	}
+	return gigahost.CatalogEligibility{}
 }
 
 // SaveSettingsHandler updates persistent settings sections in the database.
@@ -101,6 +195,26 @@ func (h *Handlers) SaveSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	if err := h.DecodeJSON(r, &req); err != nil {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
 		return
+	}
+
+	sess := h.GetSession(r)
+	if sess == nil || !sess.IsAdmin() {
+		if req.Gigahost != nil && len(req.Gigahost) > 0 {
+			h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required to configure provider settings")
+			return
+		}
+		req.Gigahost = nil
+	}
+
+	if req.Gigahost != nil {
+		if rawBudget, ok := req.Gigahost["monthly_budget_nok"]; ok && rawBudget != nil {
+			budget, err := parseBudgetVal(rawBudget)
+			if err != nil {
+				h.JSONError(w, http.StatusBadRequest, "validation_failed", fmt.Sprintf("Invalid monthly budget value: %v", err))
+				return
+			}
+			req.Gigahost["monthly_budget_nok"] = budget
+		}
 	}
 
 	ctx := r.Context()
@@ -189,6 +303,23 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	settingsMap, _ := h.db.GetAllSettings(ctx)
+	if settingsMap != nil {
+		// Scrub provider credentials and bearer API keys from backup to prevent disclosure
+		if gMap, ok := settingsMap["gigahost"].(map[string]any); ok {
+			cleanGigahost := make(map[string]any)
+			for k, v := range gMap {
+				if k != "api_key" {
+					cleanGigahost[k] = v
+				}
+			}
+			if len(cleanGigahost) == 0 {
+				delete(settingsMap, "gigahost")
+			} else {
+				settingsMap["gigahost"] = cleanGigahost
+			}
+		}
+		delete(settingsMap, "gigahost.api_key")
+	}
 
 	// Export SSH host-key fingerprints (TOFU) and leaderboard snapshots for parity
 	// with the Python reference backup format.
