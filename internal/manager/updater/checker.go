@@ -228,6 +228,24 @@ func (r *ReleaseChecker) GetCachedRelease(engine EngineType) (ReleaseInfo, bool)
 	return entry.release, true
 }
 
+// GetCachedReleaseState returns cached release info along with its fetch timestamp, staleness, and whether it exists.
+func (r *ReleaseChecker) GetCachedReleaseState(engine EngineType) (ReleaseInfo, time.Time, bool, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	entry, ok := r.cache[engine]
+	if !ok || !entry.hasRelease || entry.release.Version == "" {
+		return ReleaseInfo{}, time.Time{}, true, false
+	}
+	isStale := entry.isStale || r.now().Sub(entry.fetchedAt) >= r.ttl
+	return entry.release, entry.fetchedAt, isStale, true
+}
+
+// IsCacheExpired reports whether the cached release for an engine is absent, marked stale, or past its TTL.
+func (r *ReleaseChecker) IsCacheExpired(engine EngineType) bool {
+	_, _, isStale, ok := r.GetCachedReleaseState(engine)
+	return !ok || isStale
+}
+
 // NextRetryAt returns the scheduled backoff retry time for an engine, or a zero time if not in backoff.
 func (r *ReleaseChecker) NextRetryAt(engine EngineType) time.Time {
 	r.mu.RLock()
@@ -245,6 +263,20 @@ func (r *ReleaseChecker) SetCachedRelease(engine EngineType, info ReleaseInfo, e
 		fetchedAt:   r.now(),
 		nextRetryAt: time.Time{},
 		isStale:     false,
+		hasRelease:  info.Version != "",
+	}
+}
+
+// SetCachedReleaseWithTime manually sets a cache entry with an explicit fetchedAt timestamp and stale flag.
+func (r *ReleaseChecker) SetCachedReleaseWithTime(engine EngineType, info ReleaseInfo, etag string, fetchedAt time.Time, isStale bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cache[engine] = cacheEntry{
+		release:     info,
+		etag:        etag,
+		fetchedAt:   fetchedAt,
+		nextRetryAt: time.Time{},
+		isStale:     isStale,
 		hasRelease:  info.Version != "",
 	}
 }
@@ -365,9 +397,9 @@ func isProfileCompatible(engine EngineType, profile, upstreamTag string) bool {
 	}
 
 	switch {
-	case norm == "legacy" || norm == "legacy_baseline" || norm == "baseline" || norm == "1.8.24" || norm == "v1.8.24":
+	case norm == "legacy" || norm == "legacy_baseline" || norm == "legacy compatibility baseline" || norm == "baseline" || norm == "1.8.24" || norm == "v1.8.24":
 		return vLat.Major() < 20
-	case norm == "modern_pq" || norm == "modern" || norm == "pq" || norm == "v26" || norm == "26" || strings.HasPrefix(norm, "26.10.") || strings.HasPrefix(norm, "v26.10."):
+	case norm == "modern_pq" || norm == "modern" || norm == "pq" || norm == "26.10.29" || norm == "v26.10.29" || norm == "modern pq" || norm == "post_quantum" || norm == "post-quantum" || norm == "v26" || norm == "26" || strings.HasPrefix(norm, "26.10.") || strings.HasPrefix(norm, "v26.10."):
 		return vLat.Major() >= 20
 	default:
 		return false
