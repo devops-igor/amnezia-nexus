@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 	"unsafe"
@@ -195,20 +196,6 @@ func waitPackets(capPath *testCaptureReturnPath, count int, timeout time.Duratio
 	return capPath.getPackets()
 }
 
-// OnPacket delivers an authentic return packet directly to the ReturnPath.
-func (p *ReturnPath) OnPacket(packet []byte) error {
-	var dst string
-	if len(packet) >= 20 && packet[0]>>4 == 4 {
-		dst = netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]}).String()
-	}
-	_, err := p.Write("", dst, packet)
-	return err
-}
-
-func (c *testCaptureReturnPath) OnPacket(packet []byte) error {
-	return c.path.OnPacket(packet)
-}
-
 // TestLinuxE2E_DirectEgress exercises policy-based direct egress and proxy dispatching
 // against the real Linux kernel network stack, TUN devices, and a live echo responder.
 func TestLinuxE2E_DirectEgress(t *testing.T) {
@@ -300,6 +287,9 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 
 	rc := newTestRouteCache()
 	fwd.SetRouteCache(rc)
+
+	fwd.StartPumps(t.Context())
+	defer fwd.StopPumps()
 
 	// Subtest 1: Real UDP direct egress with authentic Linux kernel socket echo reply
 	t.Run("UDP_Direct_Egress_And_Reply", func(t *testing.T) {
@@ -413,8 +403,21 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 		clientIP := "10.100.0.12"
 		sessionID := "sess-e2e-dual"
 		backendID := int64(301)
-		capPath := newTestCaptureReturnPath()
-		capProxy := capPath
+
+		var capMu sync.Mutex
+		var capturedPeers []string
+		capPath := &testCaptureReturnPath{}
+		capPath.path = NewReturnPath(func(pKey, assignedIP string, packet []byte) (int, error) {
+			capMu.Lock()
+			capturedPeers = append(capturedPeers, pKey)
+			capMu.Unlock()
+			capPath.mu.Lock()
+			defer capPath.mu.Unlock()
+			cp := make([]byte, len(packet))
+			copy(cp, packet)
+			capPath.packets = append(capPath.packets, cp)
+			return len(packet), nil
+		})
 
 		fwd.RegisterSessionWithReturnPath(sessionID, "conn-3", peerKey, clientIP, backendID, capPath.path)
 
@@ -436,26 +439,40 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 			t.Fatalf("expected 1 packet in proxy backend queue, got %d", len(beQueue))
 		}
 
-		// Attached proxy consumer/pump: read from backend queue and deliver authentic reply to client ReturnPath
+		// Attached proxy consumer: read from backend queue and route return packet via authentic RouteBackendToClient
 		select {
 		case proxyPkt := <-beQueue:
 			if len(proxyPkt) < 28 || string(proxyPkt[28:]) != "to-proxy" {
 				t.Fatalf("unexpected proxy payload: %q", string(proxyPkt))
 			}
 			proxyReply := buildTestIPv4UDPPacket(proxyDst, netip.MustParseAddr(clientIP), 80, 1111, []byte("proxy-reply"))
-			if err := capProxy.path.OnPacket(proxyReply); err != nil {
-				t.Fatalf("delivering proxy reply failed: %v", err)
+
+			// Verify backend ownership validation: reply from wrong backend is rejected
+			if err := fwd.RouteBackendToClient(backendID+999, proxyReply, clientIP); !errors.Is(err, ErrReturnRouteMismatch) {
+				t.Fatalf("expected ErrReturnRouteMismatch for wrong backend, got %v", err)
+			}
+
+			// Route return packet using authentic production return method
+			if err := fwd.RouteBackendToClient(backendID, proxyReply, clientIP); err != nil {
+				t.Fatalf("RouteBackendToClient failed: %v", err)
 			}
 		case <-time.After(time.Second):
 			t.Fatalf("timed out waiting for proxy packet in backend queue")
 		}
 
-		if len(capProxy.getPackets()) != 1 {
-			t.Fatalf("expected 1 packet in capProxy, got %d", len(capProxy.getPackets()))
+		// Wait for proxy reply to arrive via client pump and assert client-owner delivery
+		pkts := waitPackets(capPath, 1, 3*time.Second)
+		if len(pkts) != 1 {
+			t.Fatalf("expected 1 packet in capPath after proxy reply, got %d", len(pkts))
 		}
-		if string(capProxy.getPackets()[0][28:]) != "proxy-reply" {
-			t.Fatalf("expected proxy-reply, got %q", string(capProxy.getPackets()[0][28:]))
+		if string(pkts[0][28:]) != "proxy-reply" {
+			t.Fatalf("expected proxy-reply, got %q", string(pkts[0][28:]))
 		}
+		capMu.Lock()
+		if len(capturedPeers) < 1 || capturedPeers[0] != peerKey {
+			t.Fatalf("expected proxy reply delivered to client owner %q, got %v", peerKey, capturedPeers)
+		}
+		capMu.Unlock()
 
 		// Route Direct
 		if err := fwd.RouteClientToBackend(peerKey, pktDirect); err != nil {
@@ -473,6 +490,11 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 		if string(retPkts[1][28:]) != "ECHO:to-direct" {
 			t.Fatalf("expected ECHO:to-direct in retPkts[1], got %q", string(retPkts[1][28:]))
 		}
+		capMu.Lock()
+		if len(capturedPeers) < 2 || capturedPeers[1] != peerKey {
+			t.Fatalf("expected direct reply delivered to client owner %q, got %v", peerKey, capturedPeers)
+		}
+		capMu.Unlock()
 	})
 
 	// Subtest 4: Unknown destinations defaulting to PROXY
