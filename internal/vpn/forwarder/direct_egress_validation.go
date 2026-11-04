@@ -29,11 +29,11 @@ var prohibitedCIDRs = []netip.Prefix{
 	netip.MustParsePrefix("192.0.0.0/24"), // IETF protocol assignments
 	netip.MustParsePrefix("192.0.2.0/24"), // TEST-NET-1
 	netip.MustParsePrefix("192.168.0.0/16"),
-	netip.MustParsePrefix("198.18.0.0/15"),    // Benchmarking
-	netip.MustParsePrefix("198.51.100.0/24"),  // TEST-NET-2
-	netip.MustParsePrefix("203.0.113.0/24"),   // TEST-NET-3
-	netip.MustParsePrefix("224.0.0.0/4"),      // Multicast
-	netip.MustParsePrefix("240.0.0.0/4"),      // Reserved
+	netip.MustParsePrefix("198.18.0.0/15"),      // Benchmarking
+	netip.MustParsePrefix("198.51.100.0/24"),    // TEST-NET-2
+	netip.MustParsePrefix("203.0.113.0/24"),     // TEST-NET-3
+	netip.MustParsePrefix("224.0.0.0/4"),        // Multicast
+	netip.MustParsePrefix("240.0.0.0/4"),        // Reserved
 	netip.MustParsePrefix("255.255.255.255/32"), // Broadcast
 }
 

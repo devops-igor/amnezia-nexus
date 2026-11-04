@@ -145,16 +145,6 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
 }
 
-func isProhibitedTarget(dstIP netip.Addr, directEgress *DirectEgressManager, gwDNS netip.Addr) bool {
-	if directEgress != nil {
-		return directEgress.IsProhibitedDestination(dstIP)
-	}
-	if gwDNS.IsValid() && dstIP == gwDNS {
-		return false
-	}
-	return IsProhibitedIPv4Destination(dstIP)
-}
-
 func (f *Forwarder) matchesProxyPolicy(dstIP netip.Addr, sID string, policyMatcher *policy.Matcher, routeCache RouteCache) bool {
 	if policyMatcher != nil {
 		if snap := policyMatcher.Current(); snap != nil && snap.MatchIPv4(dstIP) {

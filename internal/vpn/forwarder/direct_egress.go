@@ -102,8 +102,6 @@ const (
 	defaultMaxFlows         = 65536
 )
 
-var cloudMetadataIP = netip.MustParseAddr("169.254.169.254")
-
 // DirectEgressManager manages direct host WAN forwarding, SNAT, response demultiplexing,
 // and 5-tuple flow stickiness.
 type DirectEgressManager struct {
