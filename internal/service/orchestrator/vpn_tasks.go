@@ -100,6 +100,17 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			}
 		}
 
+		isBlocked := strings.EqualFold(t.Status, models.TunnelStatusHandshakeBlocked)
+		if gu, ok := o.statusUpdater.(interface {
+			GetTunnel(int64) (*models.BackendTunnel, error)
+		}); ok {
+			if poolTun, err := gu.GetTunnel(t.ServerID); err == nil && poolTun != nil {
+				if strings.EqualFold(poolTun.Status, models.TunnelStatusHandshakeBlocked) {
+					isBlocked = true
+				}
+			}
+		}
+
 		tCopy := t
 		rtt, err := probeFn(
 			ctx,
@@ -141,10 +152,56 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 					"threshold", threshold,
 					"err", err,
 				)
-				if !strings.EqualFold(t.Status, "degraded") {
+				if !strings.EqualFold(t.Status, "degraded") && !isBlocked {
 					healthyTunnels = append(healthyTunnels, &tCopy)
 				}
 				continue
+			}
+
+			// Failures reached or exceeded threshold.
+			// Dual-tier check: if the tunnel is in handshake_blocked, or if canary prober
+			// verifies data plane is viable, preserve handshake_blocked instead of degrading.
+			canaryProber := o.getCanaryProber()
+			if isBlocked {
+				if canaryProber != nil {
+					if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
+						slog.Warn("Handshake blocked tunnel inner canary also failed, marking degraded",
+							"tunnel_id", t.ID,
+							"endpoint", t.Endpoint,
+							"err", cErr,
+						)
+						if o.updateTunnelStatus(ctx, &t, "degraded", 0) {
+							degradedTunnels = append(degradedTunnels, t.ID)
+							o.mu.Lock()
+							if o.probeFailVersions != nil && t.StateVersion > 0 {
+								o.probeFailVersions[t.ID] = t.StateVersion + 1
+							}
+							o.mu.Unlock()
+						} else {
+							o.revertProbeFailure(t.ID, t.StateVersion)
+						}
+						continue
+					}
+				}
+				// Inner canary succeeded (or no canary prober available): preserve handshake_blocked!
+				slog.Info("Preserving handshake_blocked tunnel with viable data plane during scheduled health check",
+					"tunnel_id", t.ID,
+					"endpoint", t.Endpoint,
+				)
+				continue
+			}
+
+			// Tunnel was not yet handshake_blocked, but reached outer failure threshold.
+			// Run dual-tier inner canary probe if available.
+			if canaryProber != nil {
+				if cErr := canaryProber.ProbeCanary(ctx, &t); cErr == nil {
+					slog.Info("Outer handshake probe failed but inner canary succeeded; marking handshake_blocked",
+						"tunnel_id", t.ID,
+						"endpoint", t.Endpoint,
+					)
+					o.updateTunnelStatus(ctx, &t, models.TunnelStatusHandshakeBlocked, 0)
+					continue
+				}
 			}
 
 			slog.Warn("Backend tunnel health probe failed",
@@ -168,6 +225,27 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 		}
 
 		o.ResetProbeFailCount(t.ID)
+
+		// Dual-tier recovery: if the tunnel was in handshake_blocked state,
+		// it MUST NOT be promoted to active unless both outer and inner canary probes succeed!
+		if isBlocked {
+			canaryProber := o.getCanaryProber()
+			if canaryProber == nil {
+				slog.Warn("Backend tunnel outer probe recovered but no canary prober available to verify inner plane; preserving handshake_blocked",
+					"tunnel_id", t.ID,
+					"endpoint", t.Endpoint,
+				)
+				continue
+			}
+			if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
+				slog.Warn("Backend tunnel outer probe recovered but inner canary probe failed; preserving handshake_blocked",
+					"tunnel_id", t.ID,
+					"endpoint", t.Endpoint,
+					"err", cErr,
+				)
+				continue
+			}
+		}
 
 		latencyMS := int64(rtt.Milliseconds())
 		if latencyMS <= 0 {
@@ -222,6 +300,9 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 		if degradedMap[s.BackendTunnelID] {
 			sourceTun, err := o.db.GetBackendTunnel(ctx, s.BackendTunnelID)
 			if err != nil || sourceTun == nil {
+				continue
+			}
+			if strings.EqualFold(sourceTun.Status, models.TunnelStatusHandshakeBlocked) {
 				continue
 			}
 			sourceProto := models.NormalizeTunnelProtocol(sourceTun.Protocol)
@@ -596,4 +677,21 @@ func (o *Orchestrator) drainTunnelExcess(ctx context.Context, sessList []models.
 		}
 	}
 	return drained
+}
+
+// CanaryProber defines an optional interface for probing the inner data-plane canary of a backend tunnel.
+type CanaryProber interface {
+	ProbeCanary(ctx context.Context, tunnel *models.BackendTunnel) error
+}
+
+func (o *Orchestrator) getCanaryProber() CanaryProber {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if cp, ok := o.statusUpdater.(CanaryProber); ok {
+		return cp
+	}
+	if cp, ok := o.sessionMigrator.(CanaryProber); ok {
+		return cp
+	}
+	return nil
 }
