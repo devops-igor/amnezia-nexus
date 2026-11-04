@@ -10,6 +10,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+	mdns "github.com/miekg/dns"
 )
 
 var (
@@ -124,20 +125,14 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 		return nil
 	}
 
-	// If HostWANIP is not set, derive from host interfaces
-	if !cfg.HostWANIP.IsValid() {
-		derived, err := DeriveHostWANIP()
-		if err != nil {
-			s.forwarder.SetPBREnabled(false)
-			return fmt.Errorf("derive host wan ip: %w", err)
-		}
-		cfg.HostWANIP = derived
-	}
-
 	// Validate prerequisites before enabling PBR
 	if err := ValidatePBRPrerequisites(cfg); err != nil {
 		s.forwarder.SetPBREnabled(false)
 		return fmt.Errorf("pbr prerequisites: %w", err)
+	}
+
+	if mem, ok := cfg.RouteCache.(*MemoryRouteCache); ok {
+		mem.AttachMatcher(cfg.PolicyMatcher)
 	}
 
 	dem := forwarder.NewDirectEgressManager(forwarder.DirectEgressConfig{
@@ -197,6 +192,7 @@ func (s *Service) getPBRConfig() *PBRConfig {
 type MemoryRouteCache struct {
 	mu        sync.RWMutex
 	decisions map[string]map[netip.Addr]policy.Decision
+	matcher   *policy.Matcher
 }
 
 // NewMemoryRouteCache creates an in-memory RouteCache.
@@ -204,6 +200,20 @@ func NewMemoryRouteCache() *MemoryRouteCache {
 	return &MemoryRouteCache{
 		decisions: make(map[string]map[netip.Addr]policy.Decision),
 	}
+}
+
+// AttachMatcher connects the active policy matcher to the route cache for evaluating DNS observations.
+func (c *MemoryRouteCache) AttachMatcher(m *policy.Matcher) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.matcher = m
+}
+
+// PolicyMatcher returns the attached policy matcher.
+func (c *MemoryRouteCache) PolicyMatcher() *policy.Matcher {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.matcher
 }
 
 // Lookup queries the routing decision for a destination IP in the session scope.
@@ -228,6 +238,85 @@ func (c *MemoryRouteCache) Set(sessionID string, ip netip.Addr, d policy.Decisio
 	c.decisions[sessionID][ip] = d
 }
 
+// Observe records a routing decision for an IP in the session scope.
+func (c *MemoryRouteCache) Observe(sessionID string, ip netip.Addr, d policy.Decision) {
+	c.Set(sessionID, ip, d)
+}
+
+// ObserveDNSResponse evaluates a DNS query and response pair against the policy matcher
+// and feeds client-scoped route evidence directly into the route cache (Direct or Proxy).
+func (c *MemoryRouteCache) ObserveDNSResponse(sessionID string, req, resp *mdns.Msg) error {
+	if c == nil || req == nil || resp == nil || sessionID == "" {
+		return nil
+	}
+	c.mu.RLock()
+	matcher := c.matcher
+	c.mu.RUnlock()
+
+	var snap *policy.Snapshot
+	if matcher != nil {
+		snap = matcher.Current()
+	}
+
+	qName := ""
+	if len(req.Question) > 0 {
+		qName = req.Question[0].Name
+	}
+
+	requiresProxy := false
+	if snap != nil && qName != "" {
+		requiresProxy = snap.MatchDomain(qName)
+	}
+
+	for _, ans := range resp.Answer {
+		if aRec, ok := ans.(*mdns.A); ok {
+			ip, ok := netip.AddrFromSlice(aRec.A)
+			if !ok || !ip.IsValid() || !ip.Is4() {
+				continue
+			}
+			decision := policy.Direct
+			if requiresProxy || (snap != nil && snap.MatchIPv4(ip)) {
+				decision = policy.Proxy
+			}
+			c.Set(sessionID, ip, decision)
+		}
+	}
+	return nil
+}
+
+// ObserveDNSResponse records client DNS observations into the active route cache used by the forwarder.
+func (s *Service) ObserveDNSResponse(sessionID string, req, resp *mdns.Msg) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.forwarder == nil {
+		return nil
+	}
+	rc := s.forwarder.RouteCache()
+	if rc == nil {
+		return nil
+	}
+	if mem, ok := rc.(*MemoryRouteCache); ok {
+		return mem.ObserveDNSResponse(sessionID, req, resp)
+	}
+	return nil
+}
+
+// ObserveDNSObservation records a direct route decision observation into the active route cache.
+func (s *Service) ObserveDNSObservation(sessionID string, ip netip.Addr, decision policy.Decision) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.forwarder == nil {
+		return
+	}
+	rc := s.forwarder.RouteCache()
+	if rc == nil {
+		return
+	}
+	if mem, ok := rc.(*MemoryRouteCache); ok {
+		mem.Set(sessionID, ip, decision)
+	}
+}
+
 // initPBR initializes and configures policy-based routing on the service during startup.
 // It instantiates concrete WAN transport, route cache, and policy matcher if not already configured.
 // It fails closed if prerequisites or initialization fails.
@@ -239,13 +328,15 @@ func (s *Service) initPBR(ctx context.Context) error {
 	}
 	cfg.Enabled = true
 
-	// 1. Host WAN IP: derive if not set
+	// 1. Host WAN IP: derive if not set (in default production startup)
 	if !cfg.HostWANIP.IsValid() {
-		derived, err := DeriveHostWANIP()
-		if err != nil {
-			return fmt.Errorf("derive host wan ip: %w", err)
+		if pbrCfg == nil {
+			derived, err := DeriveHostWANIP()
+			if err != nil {
+				return fmt.Errorf("derive host wan ip: %w", err)
+			}
+			cfg.HostWANIP = derived
 		}
-		cfg.HostWANIP = derived
 	}
 
 	// 2. Gateway DNS IP: derive if not set
@@ -279,26 +370,35 @@ func (s *Service) initPBR(ctx context.Context) error {
 		cfg.WANDevice = wanDev
 	}
 
-	// 4. Policy Matcher: instantiate and compile initial empty snapshot if not provided
+	// 4. Policy Matcher: instantiate and compile initial snapshot with valid sources if not provided
 	if cfg.PolicyMatcher == nil {
 		matcher := policy.NewMatcher()
-		snap, err := policy.CompileSnapshot(1, "gen-initial", nil)
+		initialSrc := policy.NewMemorySource("default-production-policy", policy.ParsedRules{})
+		snap, err := policy.CompileSnapshot(1, "gen-initial", []policy.SourceParsedRules{initialSrc.ToSourceParsedRules()})
 		if err != nil {
-			_ = cfg.WANDevice.Close()
+			if cfg.WANDevice != nil {
+				_ = cfg.WANDevice.Close()
+			}
 			return fmt.Errorf("compile initial policy snapshot: %w", err)
 		}
 		matcher.Publish(snap)
 		cfg.PolicyMatcher = matcher
 	}
 
-	// 5. Route Cache: instantiate in-memory route cache if not provided
+	// 5. Route Cache: instantiate in-memory route cache if not provided and connect to matcher
 	if cfg.RouteCache == nil {
-		cfg.RouteCache = NewMemoryRouteCache()
+		memCache := NewMemoryRouteCache()
+		memCache.AttachMatcher(cfg.PolicyMatcher)
+		cfg.RouteCache = memCache
+	} else if mem, ok := cfg.RouteCache.(*MemoryRouteCache); ok {
+		mem.AttachMatcher(cfg.PolicyMatcher)
 	}
 
 	// 6. Configure PBR on Service (fails closed if prerequisite validation fails)
 	if err := s.ConfigurePBR(cfg); err != nil {
-		_ = cfg.WANDevice.Close()
+		if cfg.WANDevice != nil {
+			_ = cfg.WANDevice.Close()
+		}
 		return fmt.Errorf("configure pbr: %w", err)
 	}
 

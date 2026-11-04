@@ -20,8 +20,6 @@ var (
 	ErrStaleSessionReply = errors.New("forwarder: stale reply for inactive or mismatched session")
 )
 
-const defaultTombstoneCooldown = 5 * time.Second
-
 type remoteBindingKey struct {
 	protocol   uint8
 	natPort    uint16

@@ -5,11 +5,13 @@ import (
 	"errors"
 	"io"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
+	mdns "github.com/miekg/dns"
 )
 
 type mockPBRDevice struct {
@@ -294,5 +296,111 @@ func TestMemoryRouteCache(t *testing.T) {
 	rc.Set(sessionID, ip2, policy.Proxy)
 	if d := rc.Lookup(sessionID, ip2); d != policy.Proxy {
 		t.Fatalf("expected policy.Proxy after Set, got %v", d)
+	}
+}
+
+func TestService_StartWithPBR_DefaultDependencies(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db, func(c *models.VPNConfig) {
+		c.PBREnabled = true
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	svc.SetPBRConfig(PBRConfig{
+		HostWANIP: netip.MustParseAddr("198.51.200.1"),
+		WANDevice: &mockPBRDevice{},
+	})
+
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("svc.Start failed: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	if !svc.PBREnabled() {
+		t.Fatal("expected PBR to be enabled on service")
+	}
+
+	rc := svc.forwarder.RouteCache()
+	if rc == nil {
+		t.Fatal("expected forwarder route cache to be non-nil")
+	}
+	mem, ok := rc.(*MemoryRouteCache)
+	if !ok {
+		t.Fatalf("expected MemoryRouteCache, got %T", rc)
+	}
+
+	sessionID := "sess-dns-obs-1"
+	directIP := netip.MustParseAddr("93.184.216.34")
+
+	// 1. Initial lookup is Unknown
+	if d := mem.Lookup(sessionID, directIP); d != policy.Unknown {
+		t.Fatalf("expected Unknown before DNS observation, got %v", d)
+	}
+
+	// 2. Observe DNS query and response (unmatched public domain -> Direct)
+	req := new(mdns.Msg)
+	req.SetQuestion("example.com.", mdns.TypeA)
+	resp := new(mdns.Msg)
+	resp.SetReply(req)
+	resp.Answer = append(resp.Answer, &mdns.A{
+		Hdr: mdns.RR_Header{Name: "example.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+		A:   directIP.AsSlice(),
+	})
+
+	if err := svc.ObserveDNSResponse(sessionID, req, resp); err != nil {
+		t.Fatalf("ObserveDNSResponse failed: %v", err)
+	}
+
+	// 3. Subsequent lookup reflects Direct decision
+	if d := mem.Lookup(sessionID, directIP); d != policy.Direct {
+		t.Fatalf("expected Direct after DNS observation, got %v", d)
+	}
+}
+
+func TestMemoryRouteCache_ObserveDNSResponse_ProxyMatching(t *testing.T) {
+	rc := NewMemoryRouteCache()
+	matcher := policy.NewMatcher()
+
+	// Parse proxy rule "blocked.com"
+	rules, _, err := policy.Parse(context.Background(), strings.NewReader("blocked.com\n"), policy.Source{
+		ID:             "proxy-list",
+		Format:         policy.FormatDomains,
+		BareDomainMode: policy.DomainModeExact,
+	}, policy.DefaultParseLimits())
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	snap, err := policy.CompileSnapshot(1, "gen-proxy", []policy.SourceParsedRules{
+		{
+			SourceID: "proxy-list",
+			Rules:    rules,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompileSnapshot failed: %v", err)
+	}
+	matcher.Publish(snap)
+	rc.AttachMatcher(matcher)
+
+	sessionID := "sess-proxy-1"
+	proxyIP := netip.MustParseAddr("198.51.200.55")
+
+	req := new(mdns.Msg)
+	req.SetQuestion("blocked.com.", mdns.TypeA)
+	resp := new(mdns.Msg)
+	resp.SetReply(req)
+	resp.Answer = append(resp.Answer, &mdns.A{
+		Hdr: mdns.RR_Header{Name: "blocked.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+		A:   proxyIP.AsSlice(),
+	})
+
+	if err := rc.ObserveDNSResponse(sessionID, req, resp); err != nil {
+		t.Fatalf("ObserveDNSResponse failed: %v", err)
+	}
+
+	if d := rc.Lookup(sessionID, proxyIP); d != policy.Proxy {
+		t.Fatalf("expected Proxy decision for blocked.com, got %v", d)
 	}
 }
