@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -326,6 +327,356 @@ func TestClient_OrderServer_OrderIDRequirement(t *testing.T) {
 		}
 		if resp == nil || resp.OrderID != "998811" || resp.Status != StatusPending {
 			t.Fatalf("unexpected order response: %+v", resp)
+		}
+	})
+}
+
+func TestClient_GetServers_Pagination_Integrity(t *testing.T) {
+	t.Run("valid multi-page inventory matching meta.total succeeds", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			page := r.URL.Query().Get("page")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if page == "1" || page == "" {
+				servers := make([]map[string]any, 50)
+				for i := 0; i < 50; i++ {
+					servers[i] = map[string]any{"id": int64(100 + i), "status": "ready"}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"meta": map[string]any{"page": 1, "total_pages": 2, "total": 55},
+					"data": servers,
+				})
+				return
+			}
+			if page == "2" {
+				servers := make([]map[string]any, 5)
+				for i := 0; i < 5; i++ {
+					servers[i] = map[string]any{"id": int64(200 + i), "status": "ready"}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"meta": map[string]any{"page": 2, "total_pages": 2, "total": 55},
+					"data": servers,
+				})
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		servers, err := c.GetServers(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(servers) != 55 {
+			t.Fatalf("expected 55 servers, got %d", len(servers))
+		}
+	})
+
+	t.Run("empty intermediate page fails closed", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			page := r.URL.Query().Get("page")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if page == "1" || page == "" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"meta": map[string]any{"page": 1, "total_pages": 3, "total": 10},
+					"data": []map[string]any{{"id": 1, "status": "ready"}},
+				})
+				return
+			}
+			if page == "2" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"meta": map[string]any{"page": 2, "total_pages": 3, "total": 10},
+					"data": []map[string]any{},
+				})
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.GetServers(context.Background())
+		if err == nil {
+			t.Fatal("expected error on empty intermediate page, got nil")
+		}
+		if !strings.Contains(err.Error(), "intermediate page 2") {
+			t.Fatalf("expected intermediate page error, got: %v", err)
+		}
+	})
+
+	t.Run("empty final page with total > len(servers) fails closed", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			page := r.URL.Query().Get("page")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if page == "1" || page == "" {
+				servers := make([]map[string]any, 100)
+				for i := 0; i < 100; i++ {
+					servers[i] = map[string]any{"id": int64(1000 + i), "status": "ready"}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"meta": map[string]any{"page": 1, "total_pages": 2, "total": 101},
+					"data": servers,
+				})
+				return
+			}
+			if page == "2" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"meta": map[string]any{"page": 2, "total_pages": 2, "total": 101},
+					"data": []map[string]any{},
+				})
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.GetServers(context.Background())
+		if err == nil {
+			t.Fatal("expected error on empty final page with total > len, got nil")
+		}
+		if !strings.Contains(err.Error(), "incomplete inventory") {
+			t.Fatalf("expected incomplete inventory error, got: %v", err)
+		}
+	})
+
+	t.Run("aggregate count mismatch with partial page fails closed", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			page := r.URL.Query().Get("page")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if page == "1" || page == "" {
+				servers := make([]map[string]any, 50)
+				for i := 0; i < 50; i++ {
+					servers[i] = map[string]any{"id": int64(100 + i), "status": "ready"}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"meta": map[string]any{"page": 1, "total_pages": 2, "total": 101},
+					"data": servers,
+				})
+				return
+			}
+			if page == "2" {
+				servers := make([]map[string]any, 50)
+				for i := 0; i < 50; i++ {
+					servers[i] = map[string]any{"id": int64(200 + i), "status": "ready"}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"meta": map[string]any{"page": 2, "total_pages": 2, "total": 101},
+					"data": servers,
+				})
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.GetServers(context.Background())
+		if err == nil {
+			t.Fatal("expected error on count mismatch, got nil")
+		}
+		if !strings.Contains(err.Error(), "incomplete inventory: expected 101 servers from meta.total, got 100") {
+			t.Fatalf("expected exact count mismatch error, got: %v", err)
+		}
+	})
+
+	t.Run("inconsistent requested page number fails closed", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"meta": map[string]any{"page": 2, "total_pages": 2},
+				"data": []map[string]any{{"id": 1}},
+			})
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.GetServers(context.Background())
+		if err == nil {
+			t.Fatal("expected error on requested page mismatch, got nil")
+		}
+		if !strings.Contains(err.Error(), "requested page 1 but got page 2") {
+			t.Fatalf("expected page mismatch error, got: %v", err)
+		}
+	})
+
+	t.Run("inconsistent total_pages across pages fails closed", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			page := r.URL.Query().Get("page")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if page == "1" || page == "" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"meta": map[string]any{"page": 1, "total_pages": 2},
+					"data": []map[string]any{{"id": 1}},
+				})
+				return
+			}
+			if page == "2" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"meta": map[string]any{"page": 2, "total_pages": 3},
+					"data": []map[string]any{{"id": 2}},
+				})
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.GetServers(context.Background())
+		if err == nil {
+			t.Fatal("expected error on total_pages change, got nil")
+		}
+		if !strings.Contains(err.Error(), "total_pages changed from 2 to 3") {
+			t.Fatalf("expected total_pages change error, got: %v", err)
+		}
+	})
+
+	t.Run("inconsistent total across pages fails closed", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			page := r.URL.Query().Get("page")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if page == "1" || page == "" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"meta": map[string]any{"page": 1, "total_pages": 2, "total": 10},
+					"data": []map[string]any{{"id": 1}},
+				})
+				return
+			}
+			if page == "2" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"meta": map[string]any{"page": 2, "total_pages": 2, "total": 20},
+					"data": []map[string]any{{"id": 2}},
+				})
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.GetServers(context.Background())
+		if err == nil {
+			t.Fatal("expected error on total mismatch across pages, got nil")
+		}
+		if !strings.Contains(err.Error(), "total changed from 10 to 20") {
+			t.Fatalf("expected total change error, got: %v", err)
+		}
+	})
+
+	t.Run("malformed metadata fails closed", func(t *testing.T) {
+		cases := []struct {
+			name string
+			json string
+		}{
+			{"total_pages zero", `{"meta":{"page":1,"total_pages":0},"data":[{"id":1}]}`},
+			{"total_pages negative", `{"meta":{"page":1,"total_pages":-1},"data":[{"id":1}]}`},
+			{"total negative", `{"meta":{"page":1,"total_pages":1,"total":-5},"data":[{"id":1}]}`},
+			{"page invalid string", `{"meta":{"page":"notanumber","total_pages":1},"data":[{"id":1}]}`},
+			{"total_pages invalid string", `{"meta":{"page":1,"total_pages":"invalid"},"data":[{"id":1}]}`},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(tc.json))
+				}))
+				defer server.Close()
+
+				c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = c.GetServers(context.Background())
+				if err == nil {
+					t.Fatalf("expected error for malformed metadata in %s, got nil", tc.name)
+				}
+			})
+		}
+	})
+}
+
+func TestServerInfo_IsHourlyVPS_MalformedBillingFlag(t *testing.T) {
+	t.Run("treats malformed billing flag safely as unknown for VPS", func(t *testing.T) {
+		raw := `{"id": 101, "srv_type": "vps", "bw_is_hourly": "invalid_flag"}`
+		var s ServerInfo
+		if err := json.Unmarshal([]byte(raw), &s); err != nil {
+			t.Fatalf("unexpected unmarshal error: %v", err)
+		}
+		if s.BwIsHourly != nil {
+			t.Fatalf("expected nil BwIsHourly for malformed flag, got %v", *s.BwIsHourly)
+		}
+		if !s.IsHourlyVPS() {
+			t.Fatal("expected IsHourlyVPS to return true (fail closed) for VPS with unknown billing flag")
+		}
+	})
+
+	t.Run("respects explicit false boolean flag", func(t *testing.T) {
+		raw := `{"id": 102, "srv_type": "vps", "bw_is_hourly": false}`
+		var s ServerInfo
+		if err := json.Unmarshal([]byte(raw), &s); err != nil {
+			t.Fatalf("unexpected unmarshal error: %v", err)
+		}
+		if s.BwIsHourly == nil || *s.BwIsHourly {
+			t.Fatalf("expected explicit false BwIsHourly, got %+v", s.BwIsHourly)
+		}
+		if s.IsHourlyVPS() {
+			t.Fatal("expected IsHourlyVPS to return false for explicit non-hourly flag")
+		}
+	})
+
+	t.Run("respects explicit true boolean flag", func(t *testing.T) {
+		raw := `{"id": 103, "srv_type": "vps", "bw_is_hourly": true}`
+		var s ServerInfo
+		if err := json.Unmarshal([]byte(raw), &s); err != nil {
+			t.Fatalf("unexpected unmarshal error: %v", err)
+		}
+		if s.BwIsHourly == nil || !*s.BwIsHourly {
+			t.Fatalf("expected explicit true BwIsHourly, got %+v", s.BwIsHourly)
+		}
+		if !s.IsHourlyVPS() {
+			t.Fatal("expected IsHourlyVPS to return true for explicit hourly flag")
+		}
+	})
+
+	t.Run("non-vps server remains non-hourly even with malformed flag", func(t *testing.T) {
+		raw := `{"id": 104, "srv_type": "dedicated", "bw_is_hourly": "garbage"}`
+		var s ServerInfo
+		if err := json.Unmarshal([]byte(raw), &s); err != nil {
+			t.Fatalf("unexpected unmarshal error: %v", err)
+		}
+		if s.IsHourlyVPS() {
+			t.Fatal("expected dedicated server to remain non-hourly even with malformed flag")
 		}
 	})
 }

@@ -460,8 +460,7 @@ func (c *client) GetDeployStatus(ctx context.Context, orderID string) (*DeploySt
 // GetServers queries active servers via GET /servers with pagination aggregation.
 func (c *client) GetServers(ctx context.Context) ([]ServerInfo, error) {
 	var rawData []byte
-	err := c.doRequest(ctx, http.MethodGet, "/servers?page=1", nil, &rawData)
-	if err != nil {
+	if err := c.doRequest(ctx, http.MethodGet, "/servers?page=1", nil, &rawData); err != nil {
 		return nil, fmt.Errorf("failed to list servers: %w", err)
 	}
 
@@ -469,21 +468,36 @@ func (c *client) GetServers(ctx context.Context) ([]ServerInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse servers list: %w", err)
 	}
+	totalPages, expectedTotal := meta.TotalPages, 0
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	if meta.HasTotal && meta.Total > 0 {
+		expectedTotal = meta.Total
+	}
+	if err := meta.Validate(1, totalPages, expectedTotal, len(servers), len(servers)); err != nil {
+		return nil, err
+	}
 	allServers := append([]ServerInfo(nil), servers...)
-
-	if meta.TotalPages > 1 {
-		for page := 2; page <= meta.TotalPages; page++ {
-			var pageData []byte
-			path := fmt.Sprintf("/servers?page=%d", page)
-			if err := c.doRequest(ctx, http.MethodGet, path, nil, &pageData); err != nil {
-				return nil, fmt.Errorf("failed to list servers page %d: %w", page, err)
-			}
-			pageServers, _, err := parseServersPage(pageData)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse servers page %d: %w", page, err)
-			}
-			allServers = append(allServers, pageServers...)
+	for page := 2; page <= totalPages; page++ {
+		var pageData []byte
+		if err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/servers?page=%d", page), nil, &pageData); err != nil {
+			return nil, fmt.Errorf("failed to list servers page %d: %w", page, err)
 		}
+		pageServers, pageMeta, err := parseServersPage(pageData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse servers page %d: %w", page, err)
+		}
+		if err := pageMeta.Validate(page, totalPages, expectedTotal, len(pageServers), len(allServers)); err != nil {
+			return nil, err
+		}
+		if expectedTotal == 0 && pageMeta.HasTotal && pageMeta.Total > 0 {
+			expectedTotal = pageMeta.Total
+		}
+		allServers = append(allServers, pageServers...)
+	}
+	if expectedTotal > 0 && len(allServers) != expectedTotal {
+		return nil, fmt.Errorf("incomplete inventory: expected %d servers from meta.total, got %d", expectedTotal, len(allServers))
 	}
 	return allServers, nil
 }
@@ -728,8 +742,8 @@ func parseProducts(data []byte) ([]Product, CatalogEligibility, error) {
 
 func parseServersPage(data []byte) ([]ServerInfo, PaginationMeta, error) {
 	var direct []ServerInfo
-	if err := json.Unmarshal(data, &direct); err == nil && len(direct) >= 0 {
-		return direct, PaginationMeta{Page: 1, TotalPages: 1}, nil
+	if err := json.Unmarshal(data, &direct); err == nil {
+		return direct, PaginationMeta{Page: 1, TotalPages: 1, HasPage: true, HasTotalPages: true}, nil
 	}
 
 	var wrapped struct {
@@ -737,13 +751,21 @@ func parseServersPage(data []byte) ([]ServerInfo, PaginationMeta, error) {
 		Data    []ServerInfo   `json:"data"`
 		Meta    PaginationMeta `json:"meta"`
 	}
-	if err := json.Unmarshal(data, &wrapped); err == nil {
-		if wrapped.Servers != nil {
-			return wrapped.Servers, wrapped.Meta, nil
-		}
-		if wrapped.Data != nil {
-			return wrapped.Data, wrapped.Meta, nil
-		}
+	if err := json.Unmarshal(data, &wrapped); err != nil {
+		return nil, PaginationMeta{}, fmt.Errorf("failed to parse servers response: %w", err)
+	}
+
+	// Normalize unpaginated responses
+	if !wrapped.Meta.HasTotalPages {
+		wrapped.Meta.TotalPages, wrapped.Meta.Page = 1, 1
+	} else if !wrapped.Meta.HasPage {
+		wrapped.Meta.Page = 1
+	}
+
+	if wrapped.Servers != nil {
+		return wrapped.Servers, wrapped.Meta, nil
+	} else if wrapped.Data != nil {
+		return wrapped.Data, wrapped.Meta, nil
 	}
 
 	return nil, PaginationMeta{}, errors.New("unable to parse servers response format")

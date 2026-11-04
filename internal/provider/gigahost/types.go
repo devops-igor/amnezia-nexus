@@ -451,10 +451,13 @@ func (d *DeployStatusResponse) GetIP() string {
 
 // PaginationMeta represents pagination metadata returned in list endpoints.
 type PaginationMeta struct {
-	Page       int `json:"page"`
-	TotalPages int `json:"total_pages"`
-	PerPage    int `json:"per_page,omitempty"`
-	Total      int `json:"total,omitempty"`
+	Page          int  `json:"page"`
+	TotalPages    int  `json:"total_pages"`
+	PerPage       int  `json:"per_page,omitempty"`
+	Total         int  `json:"total,omitempty"`
+	HasPage       bool `json:"-"`
+	HasTotalPages bool `json:"-"`
+	HasTotal      bool `json:"-"`
 }
 
 // UnmarshalJSON handles flexible numeric and string types for pagination metadata.
@@ -469,10 +472,60 @@ func (m *PaginationMeta) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	m.Page = int(parseInt64Field(raw.Page))
-	m.TotalPages = int(parseInt64Field(raw.TotalPages))
-	m.PerPage = int(parseInt64Field(raw.PerPage))
-	m.Total = int(parseInt64Field(raw.Total))
+	if raw.Page != nil {
+		v, ok := parseIntFieldStrict(raw.Page)
+		if !ok || v <= 0 {
+			return fmt.Errorf("invalid pagination metadata: page must be positive integer, got %v", raw.Page)
+		}
+		m.Page = v
+		m.HasPage = true
+	}
+	if raw.TotalPages != nil {
+		v, ok := parseIntFieldStrict(raw.TotalPages)
+		if !ok || v < 1 {
+			return fmt.Errorf("invalid pagination metadata: total_pages must be >= 1, got %v", raw.TotalPages)
+		}
+		m.TotalPages = v
+		m.HasTotalPages = true
+	}
+	if raw.Total != nil {
+		v, ok := parseIntFieldStrict(raw.Total)
+		if !ok || v < 0 {
+			return fmt.Errorf("invalid pagination metadata: total must be >= 0, got %v", raw.Total)
+		}
+		m.Total = v
+		m.HasTotal = true
+	}
+	if raw.PerPage != nil {
+		if v, ok := parseIntFieldStrict(raw.PerPage); ok && v >= 0 {
+			m.PerPage = v
+		}
+	}
+	return nil
+}
+
+// Validate checks pagination consistency and rejects malformed, incomplete, or inconsistent metadata.
+func (m PaginationMeta) Validate(page, expectedPages, expectedTotal, pageCount, currentAggregate int) error {
+	if m.HasPage && m.Page != page {
+		return fmt.Errorf("inconsistent pagination metadata: requested page %d but got page %d", page, m.Page)
+	}
+	if m.HasTotalPages {
+		if m.TotalPages < 1 {
+			return fmt.Errorf("invalid pagination metadata: total_pages must be >= 1, got %d", m.TotalPages)
+		}
+		if expectedPages > 0 && m.TotalPages != expectedPages {
+			return fmt.Errorf("inconsistent pagination metadata: total_pages changed from %d to %d on page %d", expectedPages, m.TotalPages, page)
+		}
+	}
+	if m.HasTotal && m.Total > 0 && expectedTotal > 0 && m.Total != expectedTotal {
+		return fmt.Errorf("inconsistent pagination metadata: total changed from %d to %d on page %d", expectedTotal, m.Total, page)
+	}
+	if expectedPages > 1 && page < expectedPages && pageCount == 0 {
+		return fmt.Errorf("incomplete inventory: intermediate page %d of %d returned 0 servers", page, expectedPages)
+	}
+	if expectedTotal > 0 && pageCount == 0 && currentAggregate < expectedTotal {
+		return fmt.Errorf("incomplete inventory: page %d returned 0 servers but expected total is %d (received %d)", page, expectedTotal, currentAggregate)
+	}
 	return nil
 }
 
@@ -501,11 +554,8 @@ func (s *ServerInfo) IsHourlyVPS() bool {
 	if srvType == "dedicated" || srvType == "baremetal" || srvType == "recurring" {
 		return false
 	}
-	if s.BwIsHourly != nil && !*s.BwIsHourly {
-		return false
-	}
-	if s.BwIsHourly != nil && *s.BwIsHourly {
-		return true
+	if s.BwIsHourly != nil {
+		return *s.BwIsHourly
 	}
 	if srvType == "vps" {
 		return true
@@ -551,8 +601,11 @@ func (s *ServerInfo) UnmarshalJSON(data []byte) error {
 	s.SrvType = raw.SrvType
 	s.SrvVPSType = raw.SrvVPSType
 	if raw.BwIsHourly != nil {
-		b := parseBoolField(raw.BwIsHourly)
-		s.BwIsHourly = &b
+		if b, ok := parseBoolFieldStrict(raw.BwIsHourly); ok {
+			s.BwIsHourly = &b
+		} else {
+			s.BwIsHourly = nil
+		}
 	}
 
 	if raw.SrvName != "" {
@@ -655,23 +708,75 @@ func parseInt64Field(val any) int64 {
 	}
 }
 
-func parseBoolField(val any) bool {
+func parseIntFieldStrict(val any) (int, bool) {
 	if val == nil {
-		return false
+		return 0, false
+	}
+	switch v := val.(type) {
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case float64:
+		if v != float64(int64(v)) {
+			return 0, false
+		}
+		return int(v), true
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return 0, false
+		}
+		n, err := strconv.ParseInt(trimmed, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return int(n), true
+	default:
+		return 0, false
+	}
+}
+
+func parseBoolFieldStrict(val any) (bool, bool) {
+	if val == nil {
+		return false, false
 	}
 	switch v := val.(type) {
 	case bool:
-		return v
+		return v, true
 	case int:
-		return v == 1
+		if v == 1 {
+			return true, true
+		} else if v == 0 {
+			return false, true
+		}
+		return false, false
 	case int64:
-		return v == 1
+		if v == 1 {
+			return true, true
+		} else if v == 0 {
+			return false, true
+		}
+		return false, false
 	case float64:
-		return v == 1
+		if v == 1 {
+			return true, true
+		} else if v == 0 {
+			return false, true
+		}
+		return false, false
 	case string:
-		b, _ := strconv.ParseBool(strings.TrimSpace(v))
-		return b
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return false, false
+		}
+		b, err := strconv.ParseBool(trimmed)
+		if err != nil {
+			return false, false
+		}
+		return b, true
 	default:
-		return false
+		return false, false
 	}
 }
+
