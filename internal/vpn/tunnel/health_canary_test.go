@@ -780,7 +780,7 @@ func TestHealthProber_DualTier_RecoveryToActive(t *testing.T) {
 		t.Fatalf("expected handshake_blocked, got %q", current.Status)
 	}
 
-	// Outer probe succeeds -> cleanly restores active status without inner canary check
+	// Outer probe succeeds but inner canary fails -> remains handshake_blocked
 	outerSuccess = true
 	canarySuccess = false
 
@@ -789,8 +789,20 @@ func TestHealthProber_DualTier_RecoveryToActive(t *testing.T) {
 		t.Fatalf("expected ProbeTunnel success when outer probe succeeds, got %v", err)
 	}
 	current, _ = pool.GetTunnel(sID)
+	if current.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("expected status handshake_blocked when inner canary fails, got %q", current.Status)
+	}
+
+	// Both outer probe and inner canary succeed -> restores active status
+	canarySuccess = true
+
+	_, err = hp.ProbeTunnel(ctx, tun)
+	if err != nil {
+		t.Fatalf("expected ProbeTunnel success when both probes succeed, got %v", err)
+	}
+	current, _ = pool.GetTunnel(sID)
 	if current.Status != models.TunnelStatusActive {
-		t.Fatalf("expected status active after outer probe succeeds, got %q", current.Status)
+		t.Fatalf("expected status active after both probes succeed, got %q", current.Status)
 	}
 	if hp.GetFailCount(sID) != 0 {
 		t.Errorf("expected failCount 0, got %d", hp.GetFailCount(sID))

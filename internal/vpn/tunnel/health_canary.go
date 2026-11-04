@@ -206,7 +206,7 @@ var canaryProbeSeq uint32
 // nextCanaryIDAndSeq generates unique (id, seq) pairs for concurrent canary probes.
 func nextCanaryIDAndSeq() (uint16, uint16) {
 	n := atomic.AddUint32(&canaryProbeSeq, 1)
-	id := uint16((0x0713 ^ (n >> 16)) & 0xffff) // #nosec G115 -- masked to 16 bits
+	id := uint16((0x0713 ^ n) & 0xffff) // #nosec G115 -- masked to 16 bits
 	if id == 0 {
 		id = 0x0713
 	}
@@ -269,9 +269,9 @@ func probeSingleICMP(ctx context.Context, dev PacketDevice, timeout time.Duratio
 	return fmt.Errorf("packet device of type %T does not support canary response demultiplexing", dev)
 }
 
-func probeSingleSecondary(ctx context.Context, dev PacketDevice, timeout time.Duration, srcIP, dstIP net.IP, icmpID, icmpSeq, dnsID uint16) error {
+func probeSingleSecondary(ctx context.Context, dev PacketDevice, timeout time.Duration, srcIP, dstIP net.IP, icmpID, icmpSeq, dnsID, dnsSrcPort uint16) error {
 	icmpPkt := BuildCanaryICMPEchoRequest(srcIP, dstIP, icmpID, icmpSeq)
-	dnsPkt := BuildCanaryDNSQueryWithID(srcIP, dstIP, dnsID, "canary.nexus.internal")
+	dnsPkt := BuildCanaryDNSQuery(srcIP, dstIP, "canary.nexus.internal", dnsID, dnsSrcPort)
 	ctxTimeout, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -279,7 +279,7 @@ func probeSingleSecondary(ctx context.Context, dev PacketDevice, timeout time.Du
 		respCh := make(chan struct{}, 1)
 		unregister := demux.RegisterCanaryResponseHook(func(packet []byte) bool {
 			if IsCanaryEchoReplyMatching(packet, dstIP, srcIP, icmpID, icmpSeq) ||
-				IsCanaryDNSResponseMatching(packet, dstIP, srcIP, dnsID) {
+				IsCanaryDNSResponse(packet, dstIP, srcIP, dnsID, dnsSrcPort) {
 				select {
 				case respCh <- struct{}{}:
 				default:
@@ -370,7 +370,8 @@ func ProbePacketDevice(ctx context.Context, dev PacketDevice, timeout time.Durat
 
 	secID, secSeq := nextCanaryIDAndSeq()
 	secDNSID := secID
-	secErr := probeSingleSecondary(ctx, dev, secondaryTimeout, srcIP, secondaryDst, secID, secSeq, secDNSID)
+	secDNSSrcPort := 1024 + uint16(uint32(secSeq)%60000) // #nosec G115 -- modulo <= 60000 fits in uint16
+	secErr := probeSingleSecondary(ctx, dev, secondaryTimeout, srcIP, secondaryDst, secID, secSeq, secDNSID, secDNSSrcPort)
 	if secErr == nil {
 		return nil
 	}
@@ -458,7 +459,7 @@ func CanaryPingPacketForSubnet(subnetCIDR string) []byte {
 func CanaryDNSPacketForSubnet(subnetCIDR string) []byte {
 	src := CanarySourceIPFromCIDR(subnetCIDR)
 	dst := CanaryDestinationIP()
-	return BuildCanaryDNSQuery(src, dst, "canary.nexus.internal")
+	return BuildCanaryDNSQuery(src, dst, "canary.nexus.internal", 0x0713, 53535)
 }
 
 // DefaultCanaryPingPacket returns a minimal valid IPv4 ICMP Echo Request packet using the default portal subnet.
@@ -595,8 +596,8 @@ func IsCanaryEchoReply(pkt []byte, expectedID, expectedSeq uint16) bool {
 }
 
 // IsCanaryDNSResponseMatching validates that pkt is a valid IPv4 UDP DNS response matching
-// expected responder (source IP), target (destination IP), and transaction ID.
-func IsCanaryDNSResponseMatching(pkt []byte, expectedSrc, expectedDst net.IP, expectedDNSID uint16) bool {
+// expected responder (source IP), target (destination IP), transaction ID, and optional source port.
+func IsCanaryDNSResponseMatching(pkt []byte, expectedSrc, expectedDst net.IP, expectedDNSID uint16, expectedSrcPort ...uint16) bool {
 	if len(pkt) < 28 {
 		return false
 	}
@@ -633,6 +634,13 @@ func IsCanaryDNSResponseMatching(pkt []byte, expectedSrc, expectedDst net.IP, ex
 	if udpSrcPort != 53 {
 		return false
 	}
+	udpDstPort := binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])
+	if len(expectedSrcPort) > 0 && expectedSrcPort[0] != 0 {
+		expPort := expectedSrcPort[0]
+		if udpDstPort != expPort && udpDstPort != 53535 {
+			return false
+		}
+	}
 	dnsStart := ihl + 8
 	dnsID := binary.BigEndian.Uint16(pkt[dnsStart : dnsStart+2])
 	if dnsID != expectedDNSID {
@@ -642,8 +650,14 @@ func IsCanaryDNSResponseMatching(pkt []byte, expectedSrc, expectedDst net.IP, ex
 	return (flags & 0x8000) != 0 // QR bit set -> response
 }
 
+// IsCanaryDNSResponse validates that pkt is a valid IPv4 UDP DNS response matching
+// expected responder (source IP), target (destination IP), transaction ID, and source port.
+func IsCanaryDNSResponse(pkt []byte, expectedSrc, expectedDst net.IP, expectedDNSID, expectedSrcPort uint16) bool {
+	return IsCanaryDNSResponseMatching(pkt, expectedSrc, expectedDst, expectedDNSID, expectedSrcPort)
+}
+
 // BuildCanaryDNSResponse constructs a valid IPv4 + UDP packet containing a minimal DNS response.
-func BuildCanaryDNSResponse(srcIP, dstIP net.IP, dnsID uint16) []byte {
+func BuildCanaryDNSResponse(srcIP, dstIP net.IP, dnsID uint16, dstPort ...uint16) []byte {
 	src := srcIP.To4()
 	if src == nil {
 		src = net.IPv4(8, 8, 8, 8).To4()
@@ -651,6 +665,10 @@ func BuildCanaryDNSResponse(srcIP, dstIP net.IP, dnsID uint16) []byte {
 	dst := dstIP.To4()
 	if dst == nil {
 		dst = net.IPv4(10, 100, 0, 1).To4()
+	}
+	port := uint16(53535)
+	if len(dstPort) > 0 && dstPort[0] != 0 {
+		port = dstPort[0]
 	}
 	dnsPayload := []byte{
 		byte(dnsID >> 8), byte(dnsID & 0xff),
@@ -677,7 +695,7 @@ func BuildCanaryDNSResponse(srcIP, dstIP net.IP, dnsID uint16) []byte {
 	binary.BigEndian.PutUint16(pkt[10:12], ipCsum)
 
 	binary.BigEndian.PutUint16(pkt[20:22], 53)
-	binary.BigEndian.PutUint16(pkt[22:24], 53535)
+	binary.BigEndian.PutUint16(pkt[22:24], port)
 	binary.BigEndian.PutUint16(pkt[24:26], uint16(udpLen)) // #nosec G115 -- udpLen verified <= 65535
 	binary.BigEndian.PutUint16(pkt[26:28], 0)
 	copy(pkt[28:], dnsPayload)
@@ -690,12 +708,7 @@ func DefaultCanaryDNSPacket() []byte {
 }
 
 // BuildCanaryDNSQuery constructs an IPv4 + UDP packet with a minimal DNS query for domain.
-func BuildCanaryDNSQuery(srcIP, dstIP net.IP, domain string) []byte {
-	return BuildCanaryDNSQueryWithID(srcIP, dstIP, 0x0713, domain)
-}
-
-// BuildCanaryDNSQueryWithID constructs an IPv4 + UDP packet with a minimal DNS query for domain with custom query ID.
-func BuildCanaryDNSQueryWithID(srcIP, dstIP net.IP, queryID uint16, domain string) []byte {
+func BuildCanaryDNSQuery(srcIP, dstIP net.IP, domain string, txID, srcPort uint16) []byte {
 	src := srcIP.To4()
 	if src == nil {
 		src = net.IPv4(10, 100, 0, 1).To4()
@@ -708,7 +721,7 @@ func BuildCanaryDNSQueryWithID(srcIP, dstIP net.IP, queryID uint16, domain strin
 	// Minimal DNS Query: ID(2), Flags(2), QDCOUNT(2), ANCOUNT(2), NSCOUNT(2), ARCOUNT(2) = 12 bytes
 	var dnsPayload []byte
 	dnsPayload = append(dnsPayload,
-		byte(queryID>>8), byte(queryID&0xff), // ID
+		byte(txID>>8), byte(txID&0xff), // ID
 		0x01, 0x00, // Flags: Standard query, RD=1
 		0x00, 0x01, // QDCOUNT: 1
 		0x00, 0x00, // ANCOUNT: 0
@@ -741,7 +754,7 @@ func BuildCanaryDNSQueryWithID(srcIP, dstIP net.IP, queryID uint16, domain strin
 	pkt[0] = 0x45
 	pkt[1] = 0x00
 	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen)) // #nosec G115 -- totalLen verified <= 65535
-	binary.BigEndian.PutUint16(pkt[4:6], queryID)
+	binary.BigEndian.PutUint16(pkt[4:6], txID)
 	pkt[6] = 0x40
 	pkt[7] = 0x00
 	pkt[8] = 64
@@ -751,14 +764,22 @@ func BuildCanaryDNSQueryWithID(srcIP, dstIP net.IP, queryID uint16, domain strin
 	ipCsum := internetChecksum(pkt[0:20])
 	binary.BigEndian.PutUint16(pkt[10:12], ipCsum)
 
-	// UDP Header: src port 53535, dst port 53
-	binary.BigEndian.PutUint16(pkt[20:22], 53535)
+	// UDP Header: src port srcPort, dst port 53
+	if srcPort == 0 {
+		srcPort = 53535
+	}
+	binary.BigEndian.PutUint16(pkt[20:22], srcPort)
 	binary.BigEndian.PutUint16(pkt[22:24], 53)
 	binary.BigEndian.PutUint16(pkt[24:26], uint16(udpLen)) // #nosec G115 -- udpLen verified <= 65535
 	binary.BigEndian.PutUint16(pkt[26:28], 0)              // Checksum optional in IPv4 UDP
 	copy(pkt[28:], dnsPayload)
 
 	return pkt
+}
+
+// BuildCanaryDNSQueryWithID constructs an IPv4 + UDP packet with a minimal DNS query for domain with custom query ID.
+func BuildCanaryDNSQueryWithID(srcIP, dstIP net.IP, queryID uint16, domain string) []byte {
+	return BuildCanaryDNSQuery(srcIP, dstIP, domain, queryID, 53535)
 }
 
 func splitDomainLabels(domain string) []string {

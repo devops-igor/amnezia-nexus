@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -55,7 +56,21 @@ func (m *mockBackendCanaryDevice) Write(p []byte) (int, error) {
 	copy(cp, p)
 	m.written = append(m.written, cp)
 
-	if len(m.replyData) > 0 {
+	if len(p) >= 28 && p[9] == 1 {
+		ihl := int(p[0]&0x0f) * 4
+		if len(p) >= ihl+8 {
+			id := binary.BigEndian.Uint16(p[ihl+4 : ihl+6])
+			seq := binary.BigEndian.Uint16(p[ihl+6 : ihl+8])
+			src := net.IP(p[12:16])
+			dst := net.IP(p[16:20])
+			reply := tunnel.BuildCanaryICMPEchoReply(dst, src, id, seq)
+			for _, h := range m.canaryHooks {
+				if h != nil {
+					go h(reply)
+				}
+			}
+		}
+	} else if len(m.replyData) > 0 {
 		reply := make([]byte, len(m.replyData))
 		copy(reply, m.replyData)
 		for _, h := range m.canaryHooks {
@@ -351,5 +366,51 @@ func TestScheduledHealth_PreservesHandshakeBlocked(t *testing.T) {
 				t.Error("scheduled outer-only health moved an established viable session")
 			}
 		})
+	}
+}
+
+func TestAudit713ProductionRecoveryAdmitsBrokenDataPlane(t *testing.T) {
+	db := setupTestDB(t)
+	svc, sid, other, _, _ := setupTestVPNService(t, db)
+	ctx := t.Context()
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tun, err := svc.pool.GetTunnel(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Attached, not closed, but payload is not transiting: the real active hook only checks attachment.
+	svc.backendDevices = map[int64]BackendDevice{tun.ID: &mockBackendCanaryDevice{}}
+	if err := svc.pool.SetTunnelStatus(ctx, sid, models.TunnelStatusHandshakeBlocked, 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.pool.SetTunnelStatus(ctx, other, models.TunnelStatusDisabled, 0); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	svc.prober.SetCanaryProbeFunc(func(context.Context, *models.BackendTunnel) error {
+		calls++
+		return errors.New("data peer remains blackholed")
+	})
+	svc.prober.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+		return 20 * time.Millisecond, nil
+	})
+	// Keep the constructor's actual active hook and provider unchanged.
+	_, probeErr := svc.prober.ProbeTunnel(ctx, tun)
+	peer := seedIngressPeer(t, db, "audit-recovery", "audit-recovery-peer-key", "10.100.3.81")
+	session, backend, _, admitErr := svc.EnsureBackendSessionForIngress(ctx, ownershipFor(peer))
+	persisted, _ := db.GetBackendTunnel(ctx, tun.ID)
+	route := false
+	sessionStatus := "none"
+	selected := int64(0)
+	if session != nil && backend != nil {
+		selected = backend.ID
+		sessionStatus = session.Status
+		route = svc.forwarder.HasSessionRoute(peer.peerKey, session.ID, peer.connID, peer.ip.String(), backend.ID)
+	}
+	t.Logf("real_active_hook=true canary_calls=%d probe_err=%v db_status=%s admission_err=%v new_session=%s backend=%d broken_backend=%d registered_route=%t", calls, probeErr, persisted.Status, admitErr, sessionStatus, selected, tun.ID, route)
+	if admitErr == nil {
+		t.Error("fresh peer admitted to broken payload path after outer-only recovery")
 	}
 }

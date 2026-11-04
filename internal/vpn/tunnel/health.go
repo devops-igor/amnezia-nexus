@@ -365,6 +365,14 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		return 0, err
 	}
 
+	// Issue #713: When returning from handshake_blocked, both outer and inner probes must succeed.
+	if (snapshot != nil && snapshot.Status == models.TunnelStatusHandshakeBlocked) ||
+		probeTarget.Status == models.TunnelStatusHandshakeBlocked {
+		if canaryErr := hp.probeCanary(ctx, &probeTarget); canaryErr != nil {
+			return latencyMS, nil
+		}
+	}
+
 	status := "active"
 	if latencyMS > hp.cfg.LatencyThresholdMS {
 		status = "degraded"
