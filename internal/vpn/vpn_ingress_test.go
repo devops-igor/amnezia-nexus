@@ -595,3 +595,54 @@ func TestEnsureBackendSessionForIngress_DeletedSourceDoesNotFallbackToAWG(t *tes
 	}
 	_ = sess
 }
+
+// TestEnsureBackendSessionForIngressReusesHandshakeBlockedBackend verifies that established
+// connected sessions are preserved and reused when their backend transitions to handshake_blocked,
+// while new client admissions strictly exclude handshake_blocked backends (Issue #713 / PR #714).
+func TestEnsureBackendSessionForIngressReusesHandshakeBlockedBackend(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db)
+	ctx := t.Context()
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Initial admission succeeds on active backend1
+	peer1 := seedIngressPeer(t, db, "ingress-carol", "ingress-peer-cccccccccc3", "10.100.3.50")
+	o1 := ownershipFor(peer1)
+	sess1, backend1, _, err := svc.EnsureBackendSessionForIngress(ctx, o1)
+	if err != nil {
+		t.Fatalf("first admission failed: %v", err)
+	}
+
+	// 2. Transition backend1 to handshake_blocked
+	if err := svc.pool.SetTunnelStatus(ctx, backend1.ServerID, models.TunnelStatusHandshakeBlocked, 50); err != nil {
+		t.Fatalf("SetTunnelStatus failed: %v", err)
+	}
+
+	// 3. Existing connected session re-admitting on adopted route reuses the handshake_blocked backend!
+	sessReused, backendReused, _, err := svc.EnsureBackendSessionForIngress(ctx, o1)
+	if err != nil {
+		t.Fatalf("re-admission failed: %v", err)
+	}
+	if sessReused.ID != sess1.ID {
+		t.Fatalf("expected reused session ID %s, got %s", sess1.ID, sessReused.ID)
+	}
+	if backendReused.ID != backend1.ID {
+		t.Fatalf("expected reused backend ID %d, got %d", backend1.ID, backendReused.ID)
+	}
+
+	// 4. A new client attempting admission CANNOT select the handshake_blocked backend!
+	allTunnels := svc.pool.ListTunnels()
+	for _, tun := range allTunnels {
+		if tun.ID != backend1.ID {
+			_ = svc.pool.SetTunnelStatus(ctx, tun.ServerID, models.TunnelStatusDisabled, 0)
+		}
+	}
+	peer2 := seedIngressPeer(t, db, "ingress-dave", "ingress-peer-dddddddddd4", "10.100.3.51")
+	o2 := ownershipFor(peer2)
+	_, _, _, err = svc.EnsureBackendSessionForIngress(ctx, o2)
+	if !errors.Is(err, loadbalancer.ErrNoActiveBackends) {
+		t.Fatalf("expected ErrNoActiveBackends for new peer when only handshake_blocked exists, got %v", err)
+	}
+}

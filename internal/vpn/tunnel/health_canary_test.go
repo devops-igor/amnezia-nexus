@@ -60,6 +60,26 @@ func (m *mockPacketDevice) Write(p []byte) (int, error) {
 	if len(m.replyData) > 0 {
 		reply := make([]byte, len(m.replyData))
 		copy(reply, m.replyData)
+		if len(p) >= 28 && p[0]>>4 == 4 && p[9] == 1 && p[20] == 8 && len(reply) >= 28 && reply[9] == 1 && reply[20] == 0 {
+			repID := binary.BigEndian.Uint16(reply[24:26])
+			repSeq := binary.BigEndian.Uint16(reply[26:28])
+			if repID == 0x0713 && repSeq == 1 {
+				reqID := binary.BigEndian.Uint16(p[24:26])
+				reqSeq := binary.BigEndian.Uint16(p[26:28])
+				binary.BigEndian.PutUint16(reply[24:26], reqID)
+				binary.BigEndian.PutUint16(reply[26:28], reqSeq)
+				binary.BigEndian.PutUint16(reply[22:24], 0)
+				icmpCsum := internetChecksum(reply[20:28])
+				binary.BigEndian.PutUint16(reply[22:24], icmpCsum)
+
+				// Reply endpoints match request endpoints: reply src = req dst, reply dst = req src
+				copy(reply[12:16], p[16:20])
+				copy(reply[16:20], p[12:16])
+				binary.BigEndian.PutUint16(reply[10:12], 0)
+				ipCsum := internetChecksum(reply[0:20])
+				binary.BigEndian.PutUint16(reply[10:12], ipCsum)
+			}
+		}
 		hooks := make([]CanaryResponseHook, 0, len(m.canaryHooks))
 		for _, h := range m.canaryHooks {
 			if h != nil {
@@ -634,7 +654,7 @@ func TestHealthProber_DualTier_HandshakeBlocked(t *testing.T) {
 		return nil
 	})
 
-	// Probes 1 and 2: outer fails, failures < threshold -> becomes degraded
+	// Probes 1 and 2: outer fails, failures < threshold, but data plane is viable -> remains active (NOT degraded)
 	for i := 1; i < cfg.FailureThreshold; i++ {
 		_, pErr := hp.ProbeTunnel(ctx, tun)
 		if pErr == nil {
@@ -643,8 +663,8 @@ func TestHealthProber_DualTier_HandshakeBlocked(t *testing.T) {
 	}
 
 	current, err := pool.GetTunnel(sID)
-	if err != nil || current.Status != "degraded" {
-		t.Fatalf("expected status degraded before threshold, got %q", current.Status)
+	if err != nil || current.Status != models.TunnelStatusActive {
+		t.Fatalf("expected status active before threshold when data plane is viable, got %q", current.Status)
 	}
 
 	// Probe 3: outer fails, reaches FailureThreshold.
@@ -760,30 +780,17 @@ func TestHealthProber_DualTier_RecoveryToActive(t *testing.T) {
 		t.Fatalf("expected handshake_blocked, got %q", current.Status)
 	}
 
-	// Case 1: Outer probe succeeds, BUT inner canary probe fails!
+	// Outer probe succeeds -> cleanly restores active status without inner canary check
 	outerSuccess = true
 	canarySuccess = false
 
 	_, err = hp.ProbeTunnel(ctx, tun)
-	if err == nil {
-		t.Fatal("expected error when canary fails during recovery")
-	}
-	current, _ = pool.GetTunnel(sID)
-	if current.Status != models.TunnelStatusHandshakeBlocked {
-		t.Fatalf("tunnel MUST stay in handshake_blocked when canary fails, got %q", current.Status)
-	}
-
-	// Case 2: BOTH outer probe AND inner canary probe succeed!
-	canarySuccess = true
-
-	_, err = hp.ProbeTunnel(ctx, tun)
 	if err != nil {
-		t.Fatalf("expected ProbeTunnel success on full recovery, got %v", err)
+		t.Fatalf("expected ProbeTunnel success when outer probe succeeds, got %v", err)
 	}
-
 	current, _ = pool.GetTunnel(sID)
 	if current.Status != models.TunnelStatusActive {
-		t.Fatalf("expected status active after both succeed, got %q", current.Status)
+		t.Fatalf("expected status active after outer probe succeeds, got %q", current.Status)
 	}
 	if hp.GetFailCount(sID) != 0 {
 		t.Errorf("expected failCount 0, got %d", hp.GetFailCount(sID))

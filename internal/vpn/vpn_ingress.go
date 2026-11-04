@@ -165,7 +165,8 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 		// health, plus identity agreement with the durable ownership.
 		if backendErr == nil &&
 			backend.Enabled &&
-			strings.EqualFold(backend.Status, models.TunnelStatusActive) &&
+			(strings.EqualFold(backend.Status, models.TunnelStatusActive) ||
+				strings.EqualFold(backend.Status, models.TunnelStatusHandshakeBlocked)) &&
 			live.AssignedIP == assignedIP &&
 			live.PeerPublicKey == o.PeerPublicKey &&
 			(s.forwarder == nil || s.forwarder.HasSessionRoute(o.PeerPublicKey, live.ID, conn.ID, live.AssignedIP, backend.ID)) {

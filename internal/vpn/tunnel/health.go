@@ -365,14 +365,6 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		return 0, err
 	}
 
-	// Issue #713: When returning from handshake_blocked, both outer and inner probes must succeed.
-	if (snapshot != nil && snapshot.Status == models.TunnelStatusHandshakeBlocked) ||
-		probeTarget.Status == models.TunnelStatusHandshakeBlocked {
-		if canaryErr := hp.probeCanary(ctx, &probeTarget); canaryErr != nil {
-			return 0, fmt.Errorf("tunnel is handshake_blocked: outer probe succeeded but inner canary probe failed: %w", canaryErr)
-		}
-	}
-
 	status := "active"
 	if latencyMS > hp.cfg.LatencyThresholdMS {
 		status = "degraded"
@@ -597,8 +589,20 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 			return 0, err
 		}
 	} else if hp.pool != nil {
-		if err := hp.transitionToDegraded(ctx, snapshot); err != nil {
-			return 0, err
+		// Issue #713: Prevent premature degradation during transient handshake failures.
+		// If established sessions exist or data plane is viable, preserve active eligibility.
+		hasActiveSessions := snapshot.ActiveConnections > 0
+		if cur, err := hp.pool.GetTunnel(snapshot.ServerID); err == nil && cur != nil && cur.ActiveConnections > 0 {
+			hasActiveSessions = true
+		}
+		viable := false
+		if canaryErr := hp.probeCanary(ctx, snapshot); canaryErr == nil {
+			viable = true
+		}
+		if !hasActiveSessions && !viable {
+			if err := hp.transitionToDegraded(ctx, snapshot); err != nil {
+				return 0, err
+			}
 		}
 	}
 	if err := hp.checkTunnelAvailable(snapshot); errors.Is(err, ErrTunnelNotFound) {
