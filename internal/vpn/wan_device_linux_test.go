@@ -178,7 +178,7 @@ func TestLinuxWANDevice_R8B2_ResetSuppressionRuleLifecycle(t *testing.T) {
 	dev := newLinuxWANDeviceWithFiles(tunW, nil, "test-wan", 40000, 65000, netip.Addr{})
 	dev.iptablesRunner = mockRunner
 
-	// 1. Initial SetHostWANIP installs socket ACCEPT and DROP rules for both TCP and UDP
+	// 1. Initial SetHostWANIP installs socket RETURN and DROP rules for both TCP and UDP
 	ip1 := netip.MustParseAddr("203.0.113.10")
 	if err := dev.SetHostWANIP(ip1); err != nil {
 		t.Fatalf("SetHostWANIP failed: %v", err)
@@ -192,18 +192,18 @@ func TestLinuxWANDevice_R8B2_ResetSuppressionRuleLifecycle(t *testing.T) {
 	copy(cmds, executedCommands)
 	mu.Unlock()
 
-	hasTCPAccept := false
-	hasUDPAccept := false
+	hasTCPReturn := false
+	hasUDPReturn := false
 	hasTCPDrop := false
 	hasUDPDrop := false
 	hasInputJump := false
 	for _, cmd := range cmds {
 		joined := strings.Join(cmd, " ")
-		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j ACCEPT") {
-			hasTCPAccept = true
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j RETURN") {
+			hasTCPReturn = true
 		}
-		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p udp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j ACCEPT") {
-			hasUDPAccept = true
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p udp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j RETURN") {
+			hasUDPReturn = true
 		}
 		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.10 -j DROP") {
 			hasTCPDrop = true
@@ -215,8 +215,8 @@ func TestLinuxWANDevice_R8B2_ResetSuppressionRuleLifecycle(t *testing.T) {
 			hasInputJump = true
 		}
 	}
-	if !hasTCPAccept || !hasUDPAccept {
-		t.Fatalf("expected NEXUS_WAN_RESET socket ACCEPT rules for tcp and udp, got: %v", cmds)
+	if !hasTCPReturn || !hasUDPReturn {
+		t.Fatalf("expected NEXUS_WAN_RESET socket RETURN rules for tcp and udp, got: %v", cmds)
 	}
 	if !hasTCPDrop || !hasUDPDrop {
 		t.Fatalf("expected NEXUS_WAN_RESET DROP rules for tcp and udp, got: %v", cmds)
@@ -250,26 +250,26 @@ func TestLinuxWANDevice_R8B2_ResetSuppressionRuleLifecycle(t *testing.T) {
 	copy(cmdsAfterChange, executedCommands)
 	mu.Unlock()
 
-	hasOldTCPAcceptDel := false
+	hasOldTCPReturnDel := false
 	hasOldTCPDropDel := false
-	hasNewTCPAcceptIns := false
+	hasNewTCPReturnIns := false
 	hasNewTCPDropIns := false
 	for _, cmd := range cmdsAfterChange[countBefore:] {
 		joined := strings.Join(cmd, " ")
-		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j ACCEPT") {
-			hasOldTCPAcceptDel = true
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j RETURN") {
+			hasOldTCPReturnDel = true
 		}
 		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.10 -j DROP") {
 			hasOldTCPDropDel = true
 		}
-		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j ACCEPT") {
-			hasNewTCPAcceptIns = true
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j RETURN") {
+			hasNewTCPReturnIns = true
 		}
 		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
 			hasNewTCPDropIns = true
 		}
 	}
-	if !hasOldTCPAcceptDel || !hasOldTCPDropDel || !hasNewTCPAcceptIns || !hasNewTCPDropIns {
+	if !hasOldTCPReturnDel || !hasOldTCPDropDel || !hasNewTCPReturnIns || !hasNewTCPDropIns {
 		t.Fatalf("expected old TCP rules deleted and new TCP rules inserted on IP change, got: %v", cmdsAfterChange[countBefore:])
 	}
 
@@ -283,21 +283,21 @@ func TestLinuxWANDevice_R8B2_ResetSuppressionRuleLifecycle(t *testing.T) {
 	copy(finalCmds, executedCommands)
 	mu.Unlock()
 
-	hasFinalTCPAcceptDel := false
+	hasFinalTCPReturnDel := false
 	hasFinalTCPDropDel := false
-	hasFinalUDPAcceptDel := false
+	hasFinalUDPReturnDel := false
 	hasFinalUDPDropDel := false
 	hasFinalJumpDel := false
 	for _, cmd := range finalCmds {
 		joined := strings.Join(cmd, " ")
-		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j ACCEPT") {
-			hasFinalTCPAcceptDel = true
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j RETURN") {
+			hasFinalTCPReturnDel = true
 		}
 		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
 			hasFinalTCPDropDel = true
 		}
-		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p udp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j ACCEPT") {
-			hasFinalUDPAcceptDel = true
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p udp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j RETURN") {
+			hasFinalUDPReturnDel = true
 		}
 		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p udp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
 			hasFinalUDPDropDel = true
@@ -306,7 +306,7 @@ func TestLinuxWANDevice_R8B2_ResetSuppressionRuleLifecycle(t *testing.T) {
 			hasFinalJumpDel = true
 		}
 	}
-	if !hasFinalTCPAcceptDel || !hasFinalTCPDropDel || !hasFinalUDPAcceptDel || !hasFinalUDPDropDel || !hasFinalJumpDel {
+	if !hasFinalTCPReturnDel || !hasFinalTCPDropDel || !hasFinalUDPReturnDel || !hasFinalUDPDropDel || !hasFinalJumpDel {
 		t.Fatalf("expected Close to delete all active rules and jump for %s, got: %v", ip2, finalCmds)
 	}
 }
@@ -429,18 +429,18 @@ func TestLinuxWANDevice_R9H1_RollbackOnPartialFailure(t *testing.T) {
 	mu.Unlock()
 
 	hasRollbackTCPDrop := false
-	hasRollbackTCPAccept := false
+	hasRollbackTCPReturn := false
 	for _, cmd := range cmds {
 		joined := strings.Join(cmd, " ")
 		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.40 -j DROP") {
 			hasRollbackTCPDrop = true
 		}
-		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.40 -m socket --nowildcard -j ACCEPT") {
-			hasRollbackTCPAccept = true
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.40 -m socket --nowildcard -j RETURN") {
+			hasRollbackTCPReturn = true
 		}
 	}
-	if !hasRollbackTCPDrop || !hasRollbackTCPAccept {
-		t.Fatalf("expected rollback to delete installed TCP drop and accept rules, executed commands: %v", cmds)
+	if !hasRollbackTCPDrop || !hasRollbackTCPReturn {
+		t.Fatalf("expected rollback to delete installed TCP drop and return rules, executed commands: %v", cmds)
 	}
 }
 
@@ -479,15 +479,15 @@ func TestLinuxWANDevice_R9B1_AuditProbeExcludesHostTraffic(t *testing.T) {
 		}
 	}
 
-	// Verify that socket-match rules are emitted in NEXUS_WAN_RESET
+	// Verify that socket-match rules are emitted in NEXUS_WAN_RESET with RETURN target (R11-B1)
 	hasSocketMatch := false
 	for _, rule := range rules {
-		if strings.Contains(rule, "NEXUS_WAN_RESET") && strings.Contains(rule, "-m socket --nowildcard -j ACCEPT") {
+		if strings.Contains(rule, "NEXUS_WAN_RESET") && strings.Contains(rule, "-m socket --nowildcard -j RETURN") {
 			hasSocketMatch = true
 		}
 	}
 	if !hasSocketMatch {
-		t.Fatalf("expected socket match ACCEPT rule in NEXUS_WAN_RESET: %v", rules)
+		t.Fatalf("expected socket match RETURN rule in NEXUS_WAN_RESET: %v", rules)
 	}
 }
 
@@ -613,9 +613,9 @@ func TestLinuxWANDevice_R10B1_INPUTSeededEstablishedAccept_NoSocketDropsAndHostS
 				protoMatches := strings.Contains(cmd, "-p "+proto)
 
 				if portMatches && ipMatches && protoMatches {
-					if strings.Contains(cmd, "-m socket --nowildcard") && strings.Contains(cmd, "-j ACCEPT") {
+					if strings.Contains(cmd, "-m socket --nowildcard") && strings.Contains(cmd, "-j RETURN") {
 						if hasSocket {
-							return "ACCEPT", false
+							return "RETURN", true
 						}
 					} else if strings.Contains(cmd, "-j DROP") {
 						return "DROP", false
@@ -641,7 +641,7 @@ func TestLinuxWANDevice_R10B1_INPUTSeededEstablishedAccept_NoSocketDropsAndHostS
 
 	// 2. Host socket return packet (e.g. host curl / DNS resolver on host):
 	// Conntrack ESTABLISHED, local host socket exists (hasSocket = true).
-	// MUST hit socket ACCEPT in NEXUS_WAN_RESET and survive!
+	// Returns from NEXUS_WAN_RESET to INPUT and hits established ACCEPT!
 	decisionHostSocket := evalPacket("tcp", 50000, hostIP, true, "ESTABLISHED")
 	if decisionHostSocket != "ACCEPT" {
 		t.Fatalf("expected host socket return packet to hit ACCEPT, got: %s", decisionHostSocket)
@@ -652,5 +652,183 @@ func TestLinuxWANDevice_R10B1_INPUTSeededEstablishedAccept_NoSocketDropsAndHostS
 	decisionUnrelated := evalPacket("tcp", 22, hostIP, false, "ESTABLISHED")
 	if decisionUnrelated != "ACCEPT" {
 		t.Fatalf("expected unrelated established traffic to hit INPUT ACCEPT, got: %s", decisionUnrelated)
+	}
+}
+
+func TestLinuxWANDevice_R11B1_SocketReturnAllowsHostFirewallPolicy(t *testing.T) {
+	tunR, tunW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create pipe: %v", err)
+	}
+	defer func() { _ = tunR.Close(); _ = tunW.Close() }()
+
+	// Seed INPUT chain with:
+	// 1. Host firewall rule dropping traffic from a blocked IP (e.g. 198.51.100.99):
+	//    -A INPUT -s 198.51.100.99 -j DROP
+	// 2. Host firewall rule accepting established connections:
+	//    -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+	type iptablesRule struct {
+		args []string
+	}
+	var mu sync.Mutex
+	chains := map[string][]iptablesRule{
+		"INPUT": {
+			{args: []string{"-A", "INPUT", "-s", "198.51.100.99", "-j", "DROP"}},
+			{args: []string{"-A", "INPUT", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"}},
+		},
+	}
+
+	runner := func(args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(args) == 0 {
+			return nil
+		}
+		switch args[0] {
+		case "-N":
+			chain := args[1]
+			if _, exists := chains[chain]; exists {
+				return errors.New("chain already exists")
+			}
+			chains[chain] = []iptablesRule{}
+			return nil
+		case "-F":
+			chain := args[1]
+			chains[chain] = []iptablesRule{}
+			return nil
+		case "-X":
+			chain := args[1]
+			delete(chains, chain)
+			return nil
+		case "-C":
+			chain := args[1]
+			rules := chains[chain]
+			target := strings.Join(args[2:], " ")
+			for _, r := range rules {
+				if strings.Join(r.args[2:], " ") == target {
+					return nil
+				}
+			}
+			return errors.New("rule does not exist")
+		case "-I":
+			chain := args[1]
+			ruleArgs := args[2:]
+			pos := 0
+			if len(ruleArgs) > 0 && ruleArgs[0] == "1" {
+				ruleArgs = ruleArgs[1:]
+			}
+			newRule := iptablesRule{args: append([]string{"-A", chain}, ruleArgs...)}
+			if pos >= len(chains[chain]) {
+				chains[chain] = append(chains[chain], newRule)
+			} else {
+				chains[chain] = append(chains[chain][:pos+1], chains[chain][pos:]...)
+				chains[chain][pos] = newRule
+			}
+			return nil
+		case "-A":
+			chain := args[1]
+			chains[chain] = append(chains[chain], iptablesRule{args: args})
+			return nil
+		case "-D":
+			chain := args[1]
+			target := strings.Join(args[2:], " ")
+			rules := chains[chain]
+			for i, r := range rules {
+				if strings.Join(r.args[2:], " ") == target {
+					chains[chain] = append(rules[:i], rules[i+1:]...)
+					return nil
+				}
+			}
+			return nil
+		}
+		return nil
+	}
+
+	dev := newLinuxWANDeviceWithFiles(tunW, nil, "wan-r11b1", 40000, 65000, netip.Addr{})
+	dev.iptablesRunner = runner
+	defer func() { _ = dev.Close() }()
+
+	hostIP := netip.MustParseAddr("203.0.113.60")
+	if err := dev.SetHostWANIP(hostIP); err != nil {
+		t.Fatalf("SetHostWANIP failed: %v", err)
+	}
+
+	evalPacket := func(proto string, dport uint16, dst netip.Addr, srcIP string, hasSocket bool, ctstate string) string {
+		mu.Lock()
+		defer mu.Unlock()
+
+		var evalChain func(chainName string) (decision string, returned bool)
+		evalChain = func(chainName string) (decision string, returned bool) {
+			rules := chains[chainName]
+			for _, r := range rules {
+				cmd := strings.Join(r.args, " ")
+				if strings.Contains(cmd, "-j NEXUS_WAN_RESET") {
+					dec, ret := evalChain("NEXUS_WAN_RESET")
+					if !ret {
+						return dec, false
+					}
+					continue
+				}
+				if strings.Contains(cmd, "-s 198.51.100.99") && strings.Contains(cmd, "-j DROP") {
+					if srcIP == "198.51.100.99" {
+						return "DROP", false
+					}
+				}
+				if strings.Contains(cmd, "-m conntrack --ctstate RELATED,ESTABLISHED") && strings.Contains(cmd, "-j ACCEPT") {
+					if ctstate == "ESTABLISHED" || ctstate == "RELATED" {
+						return "ACCEPT", false
+					}
+				}
+				ruleMatchesPortRange := strings.Contains(cmd, "--dport 40000:65000")
+				portMatches := ruleMatchesPortRange && (dport >= 40000 && dport <= 65000)
+				ipMatches := strings.Contains(cmd, "-d "+hostIP.String()) && dst == hostIP
+				protoMatches := strings.Contains(cmd, "-p "+proto)
+
+				if portMatches && ipMatches && protoMatches {
+					if strings.Contains(cmd, "-m socket --nowildcard") && strings.Contains(cmd, "-j RETURN") {
+						if hasSocket {
+							return "RETURN", true
+						}
+					} else if strings.Contains(cmd, "-j DROP") {
+						return "DROP", false
+					}
+				}
+			}
+			return "NONE", true
+		}
+
+		dec, _ := evalChain("INPUT")
+		return dec
+	}
+
+	// 1. Direct return packet for direct NAT egress:
+	// No socket -> dropped in NEXUS_WAN_RESET before reaching INPUT rules.
+	decNoSocket := evalPacket("tcp", 50000, hostIP, "1.1.1.1", false, "ESTABLISHED")
+	if decNoSocket != "DROP" {
+		t.Fatalf("expected direct no-socket packet to hit DROP, got: %s", decNoSocket)
+	}
+
+	// 2. Host socket packet from blocked IP:
+	// Matches socket in NEXUS_WAN_RESET -> returns to INPUT.
+	// In INPUT, hits -s 198.51.100.99 -j DROP.
+	// With the R11-B1 fix (RETURN instead of ACCEPT), host firewall policy is preserved!
+	decBlockedHost := evalPacket("tcp", 50000, hostIP, "198.51.100.99", true, "ESTABLISHED")
+	if decBlockedHost != "DROP" {
+		t.Fatalf("expected host socket packet from blocked IP to hit DROP in INPUT, got: %s", decBlockedHost)
+	}
+
+	// 3. Host socket packet from allowed IP:
+	// Matches socket in NEXUS_WAN_RESET -> returns to INPUT.
+	// Passes blocked-IP check, hits established ACCEPT in INPUT.
+	decAllowedHost := evalPacket("tcp", 50000, hostIP, "1.1.1.1", true, "ESTABLISHED")
+	if decAllowedHost != "ACCEPT" {
+		t.Fatalf("expected host socket packet from allowed IP to hit ACCEPT in INPUT, got: %s", decAllowedHost)
+	}
+
+	// 4. Unrelated traffic:
+	// Falls through NEXUS_WAN_RESET, hits established ACCEPT in INPUT.
+	decUnrelated := evalPacket("tcp", 22, hostIP, "1.1.1.1", false, "ESTABLISHED")
+	if decUnrelated != "ACCEPT" {
+		t.Fatalf("expected unrelated traffic to hit ACCEPT in INPUT, got: %s", decUnrelated)
 	}
 }

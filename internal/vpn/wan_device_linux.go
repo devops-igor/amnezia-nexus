@@ -103,16 +103,17 @@ func (d *linuxWANDevice) installResetSuppressionRulesLocked() error {
 
 	for _, proto := range []string{"tcp", "udp"} {
 		// 2. Inbound packets matching an existing host socket (e.g. host DNS resolver, outbound HTTPS)
-		// must be accepted before any DROP rule within the sub-chain (R9-B1).
-		checkAccept := []string{"-C", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
-		if err := run(checkAccept...); err != nil {
-			acceptArgs := []string{"-A", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
-			if err := run(acceptArgs...); err != nil {
+		// must return to the calling chain (INPUT) before any DROP rule within the sub-chain (R11-B1)
+		// so that existing host firewall policy applies normally.
+		checkReturn := []string{"-C", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "RETURN"}
+		if err := run(checkReturn...); err != nil {
+			returnArgs := []string{"-A", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "RETURN"}
+			if err := run(returnArgs...); err != nil {
 				rollback()
-				return fmt.Errorf("install %s socket accept rule: %w", proto, err)
+				return fmt.Errorf("install %s socket return rule: %w", proto, err)
 			}
-			delAccept := []string{"-D", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
-			installedRules = append(installedRules, delAccept)
+			delReturn := []string{"-D", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "RETURN"}
+			installedRules = append(installedRules, delReturn)
 		}
 
 		// 3. Inbound packets without a local socket in the direct egress NAT range are dropped (R8-B2)
@@ -164,8 +165,8 @@ func (d *linuxWANDevice) removeResetSuppressionRulesLocked() {
 	// 2. Remove rules inside the subchain.
 	if d.installedIP.IsValid() {
 		for _, proto := range []string{"tcp", "udp"} {
-			deleteAccept := []string{"-D", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "ACCEPT"}
-			_ = run(deleteAccept...)
+			deleteReturn := []string{"-D", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-m", "socket", "--nowildcard", "-j", "RETURN"}
+			_ = run(deleteReturn...)
 			deleteDrop := []string{"-D", resetSubchain, "-p", proto, "--dport", portArg, "-d", ipArg, "-j", "DROP"}
 			_ = run(deleteDrop...)
 		}
