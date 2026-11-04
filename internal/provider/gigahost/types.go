@@ -254,7 +254,7 @@ func (o *OrderResponse) UnmarshalJSON(data []byte) error {
 		Status    string `json:"status"`
 		Message   string `json:"message"`
 		CreatedAt string `json:"created_at"`
-		Success   bool   `json:"success"`
+		Success   *bool  `json:"success"`
 		OrderIDs  []any  `json:"order_ids"`
 	}
 	type envelope struct {
@@ -265,7 +265,7 @@ func (o *OrderResponse) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	var env envelope
-	if err := json.Unmarshal(data, &env); err == nil && (len(env.Data.OrderIDs) > 0 || env.Data.OrderID != nil || env.Data.Success) {
+	if err := json.Unmarshal(data, &env); err == nil && (len(env.Data.OrderIDs) > 0 || env.Data.OrderID != nil || (env.Data.Success != nil && *env.Data.Success)) {
 		raw = env.Data
 	}
 
@@ -280,7 +280,14 @@ func (o *OrderResponse) UnmarshalJSON(data []byte) error {
 	}
 	o.ServerID = parseInt64Field(raw.ServerID)
 
-	if o.Status == "" && (raw.Success || o.OrderID != "") {
+	if raw.Success != nil && !*raw.Success {
+		return errors.New("provider reported order failure (success=false)")
+	}
+	if o.OrderID == "" {
+		return errors.New("provider accepted request but returned no order id")
+	}
+
+	if o.Status == "" {
 		o.Status = StatusPending
 	}
 	return nil
@@ -442,17 +449,68 @@ func (d *DeployStatusResponse) GetIP() string {
 	return d.IPv4
 }
 
+// PaginationMeta represents pagination metadata returned in list endpoints.
+type PaginationMeta struct {
+	Page       int `json:"page"`
+	TotalPages int `json:"total_pages"`
+	PerPage    int `json:"per_page,omitempty"`
+	Total      int `json:"total,omitempty"`
+}
+
+// UnmarshalJSON handles flexible numeric and string types for pagination metadata.
+func (m *PaginationMeta) UnmarshalJSON(data []byte) error {
+	type rawMeta struct {
+		Page       any `json:"page"`
+		TotalPages any `json:"total_pages"`
+		PerPage    any `json:"per_page"`
+		Total      any `json:"total"`
+	}
+	var raw rawMeta
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	m.Page = int(parseInt64Field(raw.Page))
+	m.TotalPages = int(parseInt64Field(raw.TotalPages))
+	m.PerPage = int(parseInt64Field(raw.PerPage))
+	m.Total = int(parseInt64Field(raw.Total))
+	return nil
+}
+
 // ServerInfo represents an existing server instance.
 type ServerInfo struct {
-	ID        int64  `json:"id"`
-	OrderID   string `json:"order_id,omitempty"`
-	Name      string `json:"name"`
-	Status    string `json:"status"`
-	IPv4      string `json:"ipv4,omitempty"`
-	IPAddress string `json:"ip_address,omitempty"`
-	RegionID  int    `json:"region_id,omitempty"`
-	PID       int    `json:"pid,omitempty"`
-	CreatedAt string `json:"created_at,omitempty"`
+	ID         int64  `json:"id"`
+	OrderID    string `json:"order_id,omitempty"`
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	IPv4       string `json:"ipv4,omitempty"`
+	IPAddress  string `json:"ip_address,omitempty"`
+	RegionID   int    `json:"region_id,omitempty"`
+	PID        int    `json:"pid,omitempty"`
+	CreatedAt  string `json:"created_at,omitempty"`
+	SrvType    string `json:"srv_type,omitempty"`
+	SrvVPSType string `json:"srv_vps_type,omitempty"`
+	BwIsHourly *bool  `json:"bw_is_hourly,omitempty"`
+}
+
+// IsHourlyVPS checks if a server is relevant to hourly VPS budget calculations.
+func (s *ServerInfo) IsHourlyVPS() bool {
+	if s == nil {
+		return false
+	}
+	srvType := strings.ToLower(strings.TrimSpace(s.SrvType))
+	if srvType == "dedicated" || srvType == "baremetal" || srvType == "recurring" {
+		return false
+	}
+	if s.BwIsHourly != nil && !*s.BwIsHourly {
+		return false
+	}
+	if s.BwIsHourly != nil && *s.BwIsHourly {
+		return true
+	}
+	if srvType == "vps" {
+		return true
+	}
+	return srvType == ""
 }
 
 // UnmarshalJSON handles flexible ID/OrderID types and documented /servers structures.
@@ -481,10 +539,20 @@ func (s *ServerInfo) UnmarshalJSON(data []byte) error {
 		CreatedAt  string   `json:"created_at"`
 		Order      rawOrder `json:"order"`
 		Datacenter rawDC    `json:"datacenter"`
+		SrvType    string   `json:"srv_type"`
+		SrvVPSType string   `json:"srv_vps_type"`
+		BwIsHourly any      `json:"bw_is_hourly"`
 	}
 	var raw rawServer
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
+	}
+
+	s.SrvType = raw.SrvType
+	s.SrvVPSType = raw.SrvVPSType
+	if raw.BwIsHourly != nil {
+		b := parseBoolField(raw.BwIsHourly)
+		s.BwIsHourly = &b
 	}
 
 	if raw.SrvName != "" {
@@ -584,5 +652,26 @@ func parseInt64Field(val any) int64 {
 		return n
 	default:
 		return 0
+	}
+}
+
+func parseBoolField(val any) bool {
+	if val == nil {
+		return false
+	}
+	switch v := val.(type) {
+	case bool:
+		return v
+	case int:
+		return v == 1
+	case int64:
+		return v == 1
+	case float64:
+		return v == 1
+	case string:
+		b, _ := strconv.ParseBool(strings.TrimSpace(v))
+		return b
+	default:
+		return false
 	}
 }

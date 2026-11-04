@@ -266,7 +266,18 @@ func (c *client) OrderServer(ctx context.Context, req OrderRequest) (*OrderRespo
 
 	var resp OrderResponse
 	if err := json.Unmarshal(rawData, &resp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal order response: %w", err)
+		return nil, &OrderUncertainError{
+			StatusCode: http.StatusOK,
+			Message:    fmt.Sprintf("provider accepted request but returned no order id: %v", err),
+			Err:        err,
+		}
+	}
+
+	if resp.OrderID == "" {
+		return nil, &OrderUncertainError{
+			StatusCode: http.StatusOK,
+			Message:    "provider accepted request but returned no order id",
+		}
 	}
 
 	if resp.Status == "" {
@@ -364,6 +375,18 @@ func (c *client) OrderServerSafe(ctx context.Context, req OrderRequest) (*OrderR
 	// 2. Dispatch order
 	resp, orderErr := c.OrderServer(ctx, req)
 	if orderErr == nil {
+		if resp == nil || resp.OrderID == "" {
+			uncertainErr := &OrderUncertainError{
+				Message: "provider accepted request but returned no order id",
+			}
+			c.mu.Lock()
+			c.unknownOrders[reqKey] = time.Now()
+			c.mu.Unlock()
+			return &OrderResponse{
+				Status:  StatusUnknown,
+				Message: uncertainErr.Message,
+			}, uncertainErr
+		}
 		c.mu.Lock()
 		delete(c.unknownOrders, reqKey)
 		c.mu.Unlock()
@@ -434,19 +457,35 @@ func (c *client) GetDeployStatus(ctx context.Context, orderID string) (*DeploySt
 	return &statusResp, nil
 }
 
-// GetServers queries active servers via GET /servers.
+// GetServers queries active servers via GET /servers with pagination aggregation.
 func (c *client) GetServers(ctx context.Context) ([]ServerInfo, error) {
 	var rawData []byte
-	err := c.doRequest(ctx, http.MethodGet, "/servers", nil, &rawData)
+	err := c.doRequest(ctx, http.MethodGet, "/servers?page=1", nil, &rawData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list servers: %w", err)
 	}
 
-	servers, err := parseServers(rawData)
+	servers, meta, err := parseServersPage(rawData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse servers list: %w", err)
 	}
-	return servers, nil
+	allServers := append([]ServerInfo(nil), servers...)
+
+	if meta.TotalPages > 1 {
+		for page := 2; page <= meta.TotalPages; page++ {
+			var pageData []byte
+			path := fmt.Sprintf("/servers?page=%d", page)
+			if err := c.doRequest(ctx, http.MethodGet, path, nil, &pageData); err != nil {
+				return nil, fmt.Errorf("failed to list servers page %d: %w", page, err)
+			}
+			pageServers, _, err := parseServersPage(pageData)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse servers page %d: %w", page, err)
+			}
+			allServers = append(allServers, pageServers...)
+		}
+	}
+	return allServers, nil
 }
 
 // doRequest performs an HTTP request, injects Authorization and Content-Type headers,
@@ -687,26 +726,27 @@ func parseProducts(data []byte) ([]Product, CatalogEligibility, error) {
 	return nil, CatalogEligibility{}, errors.New("unable to parse products response format")
 }
 
-func parseServers(data []byte) ([]ServerInfo, error) {
+func parseServersPage(data []byte) ([]ServerInfo, PaginationMeta, error) {
 	var direct []ServerInfo
 	if err := json.Unmarshal(data, &direct); err == nil && len(direct) >= 0 {
-		return direct, nil
+		return direct, PaginationMeta{Page: 1, TotalPages: 1}, nil
 	}
 
 	var wrapped struct {
-		Servers []ServerInfo `json:"servers"`
-		Data    []ServerInfo `json:"data"`
+		Servers []ServerInfo   `json:"servers"`
+		Data    []ServerInfo   `json:"data"`
+		Meta    PaginationMeta `json:"meta"`
 	}
 	if err := json.Unmarshal(data, &wrapped); err == nil {
 		if wrapped.Servers != nil {
-			return wrapped.Servers, nil
+			return wrapped.Servers, wrapped.Meta, nil
 		}
 		if wrapped.Data != nil {
-			return wrapped.Data, nil
+			return wrapped.Data, wrapped.Meta, nil
 		}
 	}
 
-	return nil, errors.New("unable to parse servers response format")
+	return nil, PaginationMeta{}, errors.New("unable to parse servers response format")
 }
 
 func extractErrorMessage(data []byte) string {
