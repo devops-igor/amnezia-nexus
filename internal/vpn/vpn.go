@@ -516,6 +516,7 @@ func NewVPNService(db *database.DB, cfg *models.VPNConfig) (*Service, error) {
 	svc.prober.SetOnSelfHealHook(func(ctx context.Context, t *models.BackendTunnel) error {
 		return svc.EnableBackend(tunnel.ContextWithSelfHealing(ctx), t.ServerID)
 	})
+	svc.prober.SetDeviceProvider(svc)
 
 	return svc, nil
 }

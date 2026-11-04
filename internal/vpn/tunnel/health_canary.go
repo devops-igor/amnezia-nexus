@@ -40,14 +40,37 @@ func (hp *HealthProber) SetCanaryProbeFunc(fn CanaryProbeFunc) {
 	hp.probeCanaryFn = fn
 }
 
-// SetDeviceProvider registers a lookup callback for retrieving active backend devices by tunnel ID.
-func (hp *HealthProber) SetDeviceProvider(provider func(tunnelID int64) PacketDevice) {
+// DeviceProvider provides access to active backend PacketDevices by tunnel or server ID.
+type DeviceProvider interface {
+	GetDevice(id int64) (PacketDevice, bool)
+}
+
+// SetDeviceProvider registers a DeviceProvider or lookup callback for retrieving active backend devices by tunnel ID.
+func (hp *HealthProber) SetDeviceProvider(provider any) {
 	if hp == nil {
 		return
 	}
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
-	hp.deviceProvider = provider
+	switch p := provider.(type) {
+	case DeviceProvider:
+		hp.deviceProvider = func(tunnelID int64) PacketDevice {
+			dev, ok := p.GetDevice(tunnelID)
+			if !ok {
+				return nil
+			}
+			return dev
+		}
+	case func(tunnelID int64) PacketDevice:
+		hp.deviceProvider = p
+	case func(tunnelID int64) (PacketDevice, bool):
+		hp.deviceProvider = func(tunnelID int64) PacketDevice {
+			dev, _ := p(tunnelID)
+			return dev
+		}
+	case nil:
+		hp.deviceProvider = nil
+	}
 }
 
 // RegisterDevice registers an active PacketDevice for a backend tunnel.
@@ -81,12 +104,17 @@ func (hp *HealthProber) GetDevice(tunnelID int64) PacketDevice {
 		return nil
 	}
 	hp.mu.RLock()
-	defer hp.mu.RUnlock()
-	if hp.deviceProvider != nil {
-		if dev := hp.deviceProvider(tunnelID); dev != nil {
+	provider := hp.deviceProvider
+	hp.mu.RUnlock()
+
+	if provider != nil {
+		if dev := provider(tunnelID); dev != nil {
 			return dev
 		}
 	}
+
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
 	if hp.devices != nil {
 		return hp.devices[tunnelID]
 	}
