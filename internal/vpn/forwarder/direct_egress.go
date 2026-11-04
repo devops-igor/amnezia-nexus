@@ -566,6 +566,7 @@ func (m *DirectEgressManager) ensureDirectNATLocked(
 		var err error
 		natPort, err = m.allocatePortLocked(peerKey, proto, netip.AddrFrom4(dstIP), dstPort)
 		if err != nil {
+			delete(m.flows, flowKey)
 			return 0, nil, err
 		}
 		if flow == nil {
@@ -841,9 +842,7 @@ func (m *DirectEgressManager) allocatePortLocked(peerKey string, proto uint8, re
 		if !m.usedPorts[port] {
 			bKey := remoteBindingKey{protocol: proto, natPort: port, remoteIP: remoteIP, remotePort: remotePort}
 			if b, exists := m.remoteBindings[bKey]; exists && b.peerKey != peerKey {
-				if len(m.usedPorts) < totalPorts-1 || totalPorts <= 2 {
-					continue
-				}
+				continue
 			}
 			delete(m.quarantinedPorts, port)
 			m.usedPorts[port] = true

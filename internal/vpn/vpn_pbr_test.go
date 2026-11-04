@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net/netip"
@@ -11,12 +12,15 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
+	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	mdns "github.com/miekg/dns"
 )
 
 type mockPBRDevice struct {
-	mu     sync.Mutex
-	closed bool
+	mu      sync.Mutex
+	closed  bool
+	written [][]byte
 }
 
 func (m *mockPBRDevice) Read(b []byte) (int, error) {
@@ -24,6 +28,11 @@ func (m *mockPBRDevice) Read(b []byte) (int, error) {
 }
 
 func (m *mockPBRDevice) Write(b []byte) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := make([]byte, len(b))
+	copy(cp, b)
+	m.written = append(m.written, cp)
 	return len(b), nil
 }
 
@@ -32,6 +41,25 @@ func (m *mockPBRDevice) Close() error {
 	defer m.mu.Unlock()
 	m.closed = true
 	return nil
+}
+
+func (m *mockPBRDevice) getWritten() [][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([][]byte, len(m.written))
+	copy(out, m.written)
+	return out
+}
+
+type mockPBRResolver struct {
+	exchange func(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error)
+}
+
+func (r *mockPBRResolver) Exchange(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error) {
+	if r.exchange != nil {
+		return r.exchange(ctx, req)
+	}
+	return nil, errors.New("not implemented")
 }
 
 type mockRouteCache struct{}
@@ -402,5 +430,239 @@ func TestMemoryRouteCache_ObserveDNSResponse_ProxyMatching(t *testing.T) {
 
 	if d := rc.Lookup(sessionID, proxyIP); d != policy.Proxy {
 		t.Fatalf("expected Proxy decision for blocked.com, got %v", d)
+	}
+}
+
+func buildTestPBRUDPPacket(srcIP, dstIP netip.Addr, srcPort, dstPort uint16, payload []byte) []byte {
+	totalLen := 20 + 8 + len(payload)
+	pkt := make([]byte, totalLen)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
+	pkt[8] = 64
+	pkt[9] = 17 // UDP
+	srcBytes := srcIP.As4()
+	dstBytes := dstIP.As4()
+	copy(pkt[12:16], srcBytes[:])
+	copy(pkt[16:20], dstBytes[:])
+	binary.BigEndian.PutUint16(pkt[20:22], srcPort)
+	binary.BigEndian.PutUint16(pkt[22:24], dstPort)
+	binary.BigEndian.PutUint16(pkt[24:26], uint16(8+len(payload)))
+	copy(pkt[28:], payload)
+	return pkt
+}
+
+func buildTestPBRTCPPacket(srcIP, dstIP netip.Addr, srcPort, dstPort uint16, payload []byte) []byte {
+	totalLen := 20 + 20 + len(payload)
+	pkt := make([]byte, totalLen)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
+	pkt[8] = 64
+	pkt[9] = 6 // TCP
+	srcBytes := srcIP.As4()
+	dstBytes := dstIP.As4()
+	copy(pkt[12:16], srcBytes[:])
+	copy(pkt[16:20], dstBytes[:])
+	binary.BigEndian.PutUint16(pkt[20:22], srcPort)
+	binary.BigEndian.PutUint16(pkt[22:24], dstPort)
+	pkt[32] = 0x50 // data offset: 5 32-bit words (20 bytes)
+	pkt[33] = 0x02 // SYN
+	copy(pkt[40:], payload)
+	return pkt
+}
+
+func TestPBR_DNSGatewayPopulatesRouteCache_DirectEgress(t *testing.T) {
+	hostWAN := netip.MustParseAddr("203.0.113.1")
+	gwDNS := netip.MustParseAddr("10.100.0.1")
+	clientIP := netip.MustParseAddr("10.100.0.10")
+	peerKey := "peer-dns-e2e"
+	sessionID := "sess-dns-e2e"
+	backendID := int64(101)
+
+	wanDev := &mockPBRDevice{}
+	backendDev := &mockPBRDevice{}
+	rc := NewMemoryRouteCache()
+	matcher := policy.NewMatcher()
+
+	// Policy snapshot: blocked.com -> Proxy
+	rules, _, err := policy.Parse(context.Background(), strings.NewReader("blocked.com\n"), policy.Source{
+		ID:             "proxy-rules",
+		Format:         policy.FormatDomains,
+		BareDomainMode: policy.DomainModeExact,
+	}, policy.DefaultParseLimits())
+	if err != nil {
+		t.Fatalf("policy Parse: %v", err)
+	}
+	snap, err := policy.CompileSnapshot(1, "gen-1", []policy.SourceParsedRules{
+		{SourceID: "proxy-rules", Rules: rules},
+	})
+	if err != nil {
+		t.Fatalf("CompileSnapshot: %v", err)
+	}
+	matcher.Publish(snap)
+	rc.AttachMatcher(matcher)
+
+	// Mock DNS Resolver
+	exampleIP := netip.MustParseAddr("93.184.216.34")
+	blockedIP := netip.MustParseAddr("198.51.200.55")
+	mockRes := &mockPBRResolver{
+		exchange: func(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error) {
+			resp := new(mdns.Msg)
+			resp.SetReply(req)
+			if len(req.Question) == 0 {
+				return resp, nil
+			}
+			q := req.Question[0]
+			switch q.Name {
+			case "example.com.":
+				resp.Answer = append(resp.Answer, &mdns.A{
+					Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+					A:   exampleIP.AsSlice(),
+				})
+			case "blocked.com.":
+				resp.Answer = append(resp.Answer, &mdns.A{
+					Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+					A:   blockedIP.AsSlice(),
+				})
+			}
+			return resp, nil
+		},
+	}
+
+	dnsSrv, err := gatewaydns.NewServer(gatewaydns.ServerConfig{
+		Gateway: netip.AddrPortFrom(gwDNS, 53),
+	}, mockRes, matcher)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	gw, err := gatewaydns.NewGateway(gatewaydns.GatewayConfig{
+		Gateway:       netip.AddrPortFrom(gwDNS, 53),
+		RouteObserver: rc,
+	}, dnsSrv)
+	if err != nil {
+		t.Fatalf("NewGateway: %v", err)
+	}
+
+	fwd := forwarder.NewForwarder(nil, "10.100.0.0/16", 64)
+	fwd.AttachBackendDevice(backendID, backendDev)
+
+	var clientReplies [][]byte
+	var repliesMu sync.Mutex
+	returnPath := forwarder.NewReturnPath(func(pk, ip string, packet []byte) (int, error) {
+		repliesMu.Lock()
+		defer repliesMu.Unlock()
+		cp := make([]byte, len(packet))
+		copy(cp, packet)
+		clientReplies = append(clientReplies, cp)
+		return len(packet), nil
+	})
+
+	fwd.RegisterSessionWithReturnPath(sessionID, "conn-1", peerKey, clientIP.String(), backendID, returnPath)
+
+	cfg := PBRConfig{
+		Enabled:       true,
+		HostWANIP:     hostWAN,
+		GatewayDNSIP:  gwDNS,
+		WANDevice:     wanDev,
+		RouteCache:    rc,
+		PolicyMatcher: matcher,
+		DNSGateway:    gw,
+	}
+
+	svc := &Service{
+		forwarder: fwd,
+	}
+	if err := svc.ConfigurePBR(cfg); err != nil {
+		t.Fatalf("ConfigurePBR: %v", err)
+	}
+	defer func() { _ = svc.TeardownPBR() }()
+
+	// 1. Verify UNKNOWN destinations go to proxy backend, never DIRECT
+	unqueriedIP := netip.MustParseAddr("8.8.4.4")
+	unqueriedPkt := buildTestPBRTCPPacket(clientIP, unqueriedIP, 10001, 80, []byte("unqueried"))
+	if err := fwd.RouteClientToBackend(peerKey, unqueriedPkt); err != nil {
+		t.Fatalf("RouteClientToBackend for unqueried IP failed: %v", err)
+	}
+	if len(wanDev.getWritten()) != 0 {
+		t.Fatalf("expected unqueried packet to not go to WAN, got %d writes", len(wanDev.getWritten()))
+	}
+
+	// 2. Client performs DNS lookup for example.com. through GatewayDNSIP:53
+	reqMsg := new(mdns.Msg)
+	reqMsg.SetQuestion("example.com.", mdns.TypeA)
+	reqMsg.Id = 0xbeef
+	reqBytes, err := reqMsg.Pack()
+	if err != nil {
+		t.Fatalf("Pack DNS request: %v", err)
+	}
+	dnsQueryPkt := buildTestPBRUDPPacket(clientIP, gwDNS, 54321, 53, reqBytes)
+
+	if err := fwd.RouteClientToBackend(peerKey, dnsQueryPkt); err != nil {
+		t.Fatalf("RouteClientToBackend for gateway DNS query failed: %v", err)
+	}
+
+	// Verify DNS reply was written back to client returnPath
+	repliesMu.Lock()
+	numReplies := len(clientReplies)
+	var latestReply []byte
+	if numReplies > 0 {
+		latestReply = clientReplies[numReplies-1]
+	}
+	repliesMu.Unlock()
+	if numReplies != 1 {
+		t.Fatalf("expected 1 DNS reply delivered to client, got %d", numReplies)
+	}
+	if len(latestReply) < 28 {
+		t.Fatalf("DNS reply packet too short: %d", len(latestReply))
+	}
+	respMsg := new(mdns.Msg)
+	if err := respMsg.Unpack(latestReply[28:]); err != nil {
+		t.Fatalf("Unpack DNS reply message failed: %v", err)
+	}
+	if len(respMsg.Answer) == 0 {
+		t.Fatalf("expected at least 1 Answer in DNS reply, got 0")
+	}
+
+	// 3. Verify route cache was populated with DIRECT for 93.184.216.34 (WITHOUT manual injection!)
+	if got := rc.Lookup(sessionID, exampleIP); got != policy.Direct {
+		t.Fatalf("expected route cache to have Direct for example.com, got %v", got)
+	}
+
+	// 4. Subsequent packets to 93.184.216.34:80 must be dispatched DIRECT to WAN device!
+	tcpPkt := buildTestPBRTCPPacket(clientIP, exampleIP, 12345, 80, []byte("get-example"))
+	if err := fwd.RouteClientToBackend(peerKey, tcpPkt); err != nil {
+		t.Fatalf("RouteClientToBackend for direct IP failed: %v", err)
+	}
+	wanWrites := wanDev.getWritten()
+	if len(wanWrites) != 1 {
+		t.Fatalf("expected 1 packet written directly to WAN device, got %d", len(wanWrites))
+	}
+	if fwd.DirectBytes() == 0 {
+		t.Errorf("expected DirectBytes > 0, got %d", fwd.DirectBytes())
+	}
+
+	// 5. Client performs DNS lookup for blocked.com. through GatewayDNSIP:53
+	reqBlocked := new(mdns.Msg)
+	reqBlocked.SetQuestion("blocked.com.", mdns.TypeA)
+	reqBlocked.Id = 0xcafe
+	reqBlockedBytes, _ := reqBlocked.Pack()
+	dnsBlockedPkt := buildTestPBRUDPPacket(clientIP, gwDNS, 54322, 53, reqBlockedBytes)
+
+	if err := fwd.RouteClientToBackend(peerKey, dnsBlockedPkt); err != nil {
+		t.Fatalf("RouteClientToBackend for blocked.com query failed: %v", err)
+	}
+
+	// Verify route cache was populated with PROXY for 198.51.200.55
+	if got := rc.Lookup(sessionID, blockedIP); got != policy.Proxy {
+		t.Fatalf("expected route cache to have Proxy for blocked.com, got %v", got)
+	}
+
+	// 6. Subsequent packets to 198.51.200.55:80 must NOT go to WAN device (proxy wins!)
+	blockedTCP := buildTestPBRTCPPacket(clientIP, blockedIP, 12346, 80, []byte("get-blocked"))
+	if err := fwd.RouteClientToBackend(peerKey, blockedTCP); err != nil {
+		t.Fatalf("RouteClientToBackend for proxy IP failed: %v", err)
+	}
+	// WAN writes must STILL be 1 (blockedTCP did not write to WAN)
+	if len(wanDev.getWritten()) != 1 {
+		t.Fatalf("expected blocked destination to NOT write to WAN, got %d writes", len(wanDev.getWritten()))
 	}
 }

@@ -85,6 +85,7 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	routeCache := f.routeCache
 	policyMatcher := f.policyMatcher
 	gwDNS := f.gatewayDNSIP
+	dnsHandler := f.dnsHandler
 	f.mu.RUnlock()
 
 	parsed, err := ParseAndValidateClientIPv4(packet, route.assignedIP)
@@ -112,6 +113,14 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	if err := ValidateDirectDestination(dstIP, parsed.DstPort, gwDNS); err != nil {
 		f.directDrops.Add(1)
 		return err
+	}
+
+	// Ingress DNS interception: if addressed to gateway DNS on port 53, submit to DNS handler.
+	if dnsHandler != nil && gwDNS.IsValid() && dstIP == gwDNS && parsed.DstPort == 53 {
+		handled, err := dnsHandler.HandleDNSPacket(sID, peerKey, route.assignedIP, route.returnPath, packet)
+		if handled {
+			return err
+		}
 	}
 
 	// Step 2 — PROXY: Policy snapshot CIDR or route cache Proxy match (including shared-IP conflict).

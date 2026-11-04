@@ -372,3 +372,79 @@ func TestValidation_TenantIsolationNormalCooldownOldReplyBlocked(t *testing.T) {
 		t.Fatalf("session 2 received delayed reply belonging to session 1 after cooldown; tenant isolation violated")
 	}
 }
+
+func TestValidation_NATPortPressure_FailClosedForeignTombstone(t *testing.T) {
+	hostWAN := netip.MustParseAddr("203.0.113.1")
+	targetA := netip.MustParseAddr("1.1.1.1")
+	targetB := netip.MustParseAddr("8.8.8.8")
+	clientIP := netip.MustParseAddr("10.100.0.5")
+
+	// Config with 3 ports: 40000, 40001, 40002
+	wanDev := newMockPacketDev()
+	dem := NewDirectEgressManager(DirectEgressConfig{
+		HostWANIP: hostWAN,
+		WANDevice: wanDev,
+		MinPort:   40000,
+		MaxPort:   40002,
+		MaxFlows:  10,
+	}, nil)
+	defer func() { _ = dem.Close() }()
+	dem.SetPortCooldown(0)
+
+	capPathA := newTestCaptureReturnPath()
+	capPathB := newTestCaptureReturnPath()
+
+	// 1. Tenant A uses port 40000 for targetA:53
+	pktA1 := buildTestIPv4UDPPacket(clientIP, targetA, 10001, 53, []byte("req-a1"))
+	if err := dem.RouteDirect("tenant-a", clientIP.String(), "sess-a", 1, pktA1, capPathA.path); err != nil {
+		t.Fatalf("Tenant A RouteDirect failed: %v", err)
+	}
+
+	// Terminate Tenant A session; leaves tombstone on port 40000 for targetA:53
+	dem.PurgeSession("sess-a")
+
+	// 2. Active allocations occupy ports 40001 and 40002
+	pktFill1 := buildTestIPv4UDPPacket(clientIP, targetB, 10002, 53, []byte("fill-1"))
+	if err := dem.RouteDirect("tenant-fill", clientIP.String(), "sess-fill-1", 1, pktFill1, capPathA.path); err != nil {
+		t.Fatalf("Fill port 40001 failed: %v", err)
+	}
+	pktFill2 := buildTestIPv4UDPPacket(clientIP, targetB, 10003, 53, []byte("fill-2"))
+	if err := dem.RouteDirect("tenant-fill", clientIP.String(), "sess-fill-2", 1, pktFill2, capPathA.path); err != nil {
+		t.Fatalf("Fill port 40002 failed: %v", err)
+	}
+
+	// 3. Now all 3 ports are either active (40001, 40002) or tombstoned to tenant-a for targetA:53 (40000).
+	// Tenant B connects to targetA:53.
+	// Must fail closed with ErrNATPortExhaustion, NEVER admit an unusable tuple!
+	pktB := buildTestIPv4UDPPacket(clientIP, targetA, 20001, 53, []byte("req-b"))
+	err := dem.RouteDirect("tenant-b", clientIP.String(), "sess-b", 1, pktB, capPathB.path)
+	if !errors.Is(err, ErrNATPortExhaustion) {
+		t.Fatalf("expected ErrNATPortExhaustion when only tombstoned foreign tuple is available, got: %v", err)
+	}
+
+	// 4. Tenant B connects to targetB:80 (no foreign tombstone for targetB:80 exists on port 40000).
+	// Must succeed and allow legitimate replies!
+	pktB_safe := buildTestIPv4UDPPacket(clientIP, targetB, 20002, 80, []byte("req-b-safe"))
+	if err := dem.RouteDirect("tenant-b", clientIP.String(), "sess-b", 1, pktB_safe, capPathB.path); err != nil {
+		t.Fatalf("Tenant B to safe destination failed: %v", err)
+	}
+
+	// Send legitimate reply from targetB:80 to NAT port 40000
+	legitReply := buildTestIPv4UDPPacket(targetB, hostWAN, 80, 40000, []byte("legit-reply-b"))
+	if err := dem.HandleWANReply(legitReply); err != nil {
+		t.Fatalf("HandleWANReply for legitimate reply failed: %v", err)
+	}
+	pktsB := capPathB.getPackets()
+	if len(pktsB) != 1 {
+		t.Fatalf("expected 1 packet delivered to tenant-b, got: %d", len(pktsB))
+	}
+
+	// Old reply from targetA:53 to port 40000 must still be rejected as stale session reply
+	oldReply := buildTestIPv4UDPPacket(targetA, hostWAN, 53, 40000, []byte("old-reply-a"))
+	if err := dem.HandleWANReply(oldReply); !errors.Is(err, ErrStaleSessionReply) {
+		t.Fatalf("expected old reply to be rejected as ErrStaleSessionReply, got: %v", err)
+	}
+	if len(capPathB.getPackets()) != 1 {
+		t.Fatalf("tenant-b received old reply intended for tenant-a; cross-tenant leak")
+	}
+}

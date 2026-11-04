@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
+	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	mdns "github.com/miekg/dns"
 )
@@ -32,6 +33,7 @@ type PBRConfig struct {
 	WANDevice     forwarder.PacketDevice
 	RouteCache    forwarder.RouteCache
 	PolicyMatcher *policy.Matcher
+	DNSGateway    *gatewaydns.Gateway
 }
 
 // ValidatePBRPrerequisites checks that all required direct egress components are present
@@ -149,8 +151,64 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 		s.forwarder.SetGatewayDNSIP(cfg.GatewayDNSIP)
 	}
 
+	if cfg.DNSGateway != nil {
+		if obs, ok := cfg.RouteCache.(gatewaydns.RouteObserver); ok {
+			cfg.DNSGateway.SetObserver(obs)
+		}
+		s.forwarder.SetDNSHandler(&pbrDNSHandler{gw: cfg.DNSGateway})
+	}
+
+	servicePBRConfigsMu.Lock()
+	servicePBRConfigs[s] = &cfg
+	servicePBRConfigsMu.Unlock()
+
 	s.forwarder.SetPBREnabled(true)
 	return nil
+}
+
+// DNSGateway returns the DNS gateway configured on the service, if any.
+func (s *Service) DNSGateway() *gatewaydns.Gateway {
+	pbrCfg := s.getPBRConfig()
+	if pbrCfg != nil {
+		return pbrCfg.DNSGateway
+	}
+	return nil
+}
+
+type pbrDNSHandler struct {
+	gw *gatewaydns.Gateway
+}
+
+func (h *pbrDNSHandler) HandleDNSPacket(sessionID, peerKey, assignedIP string, path *forwarder.ReturnPath, packet []byte) (bool, error) {
+	if h.gw == nil {
+		return false, nil
+	}
+	writer := &pbrReplyWriter{
+		path:       path,
+		peerKey:    peerKey,
+		assignedIP: assignedIP,
+	}
+	scope := gatewaydns.NewScopeHandle(
+		context.Background(),
+		policy.Scope{SessionID: sessionID, OwnershipEpoch: 1},
+		nil,
+		writer,
+	)
+	return h.gw.TrySubmit(scope, packet)
+}
+
+type pbrReplyWriter struct {
+	path       *forwarder.ReturnPath
+	peerKey    string
+	assignedIP string
+}
+
+func (w *pbrReplyWriter) WritePacket(_ policy.Scope, packet []byte) error {
+	if w.path == nil {
+		return forwarder.ErrReturnPathClosed
+	}
+	_, err := w.path.Write(w.peerKey, w.assignedIP, packet)
+	return err
 }
 
 // PBREnabled reports whether policy-based routing is active on the service.
@@ -394,6 +452,35 @@ func (s *Service) initPBR(ctx context.Context) error {
 		mem.AttachMatcher(cfg.PolicyMatcher)
 	}
 
+	// 5b. DNS Gateway: instantiate DNS gateway if not provided and connect RouteCache observer
+	if cfg.DNSGateway == nil && cfg.GatewayDNSIP.IsValid() {
+		upstreams := []netip.AddrPort{
+			netip.MustParseAddrPort("1.1.1.1:53"),
+			netip.MustParseAddrPort("8.8.8.8:53"),
+		}
+		resolver, err := gatewaydns.NewUpstreamResolver(gatewaydns.ResolverConfig{
+			Upstreams: upstreams,
+		})
+		if err == nil {
+			dnsSrv, err := gatewaydns.NewServer(gatewaydns.ServerConfig{
+				Gateway: netip.AddrPortFrom(cfg.GatewayDNSIP, 53),
+			}, resolver, cfg.PolicyMatcher)
+			if err == nil {
+				var obs gatewaydns.RouteObserver
+				if ro, ok := cfg.RouteCache.(gatewaydns.RouteObserver); ok {
+					obs = ro
+				}
+				gw, err := gatewaydns.NewGateway(gatewaydns.GatewayConfig{
+					Gateway:       netip.AddrPortFrom(cfg.GatewayDNSIP, 53),
+					RouteObserver: obs,
+				}, dnsSrv)
+				if err == nil {
+					cfg.DNSGateway = gw
+				}
+			}
+		}
+	}
+
 	// 6. Configure PBR on Service (fails closed if prerequisite validation fails)
 	if err := s.ConfigurePBR(cfg); err != nil {
 		if cfg.WANDevice != nil {
@@ -417,6 +504,7 @@ func (s *Service) TeardownPBR() error {
 	if s.forwarder == nil {
 		return nil
 	}
+	s.forwarder.SetDNSHandler(nil)
 	s.forwarder.SetPBREnabled(false)
 	if dem := s.forwarder.DirectEgress(); dem != nil {
 		_ = dem.Close()

@@ -49,6 +49,11 @@ type RouteCache interface {
 	Lookup(sessionID string, ip netip.Addr) policy.Decision
 }
 
+// DNSHandler processes DNS packets addressed to the designated gateway DNS IPv4 address.
+type DNSHandler interface {
+	HandleDNSPacket(sessionID, peerKey, assignedIP string, path *ReturnPath, packet []byte) (bool, error)
+}
+
 type sessionRoute struct {
 	sessionID       string
 	connectionID    string
@@ -197,6 +202,7 @@ type Forwarder struct {
 	routeCache    RouteCache
 	policyMatcher *policy.Matcher
 	gatewayDNSIP  netip.Addr
+	dnsHandler    DNSHandler
 
 	// Policy routing accounting metrics:
 	proxiedBytes atomic.Int64
@@ -568,6 +574,20 @@ func (f *Forwarder) GatewayDNSIP() netip.Addr {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.gatewayDNSIP
+}
+
+// SetDNSHandler installs an ingress DNS handler for packets addressed to GatewayDNSIP:53.
+func (f *Forwarder) SetDNSHandler(h DNSHandler) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dnsHandler = h
+}
+
+// DNSHandler returns the installed ingress DNS handler.
+func (f *Forwarder) DNSHandler() DNSHandler {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.dnsHandler
 }
 
 // ProxiedBytes returns the total bytes forwarded to proxy backends under PBR.
