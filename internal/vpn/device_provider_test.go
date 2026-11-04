@@ -114,6 +114,30 @@ func TestVPNService_DeviceProvider_GetDeviceByServerID(t *testing.T) {
 	}
 }
 
+func TestVPNService_DeviceProvider_SubnetCIDRWiring(t *testing.T) {
+	db := setupTestDB(t)
+	svc, _, _, _, _ := setupTestVPNService(t, db)
+
+	// Default configured SubnetCIDR in test setup (10.100.0.0/16)
+	if got := svc.SubnetCIDR(); got != "10.100.0.0/16" {
+		t.Fatalf("expected default subnet 10.100.0.0/16, got %s", got)
+	}
+
+	// HealthProber must receive the subnet via SetDeviceProvider(svc)
+	if proberSubnet := svc.prober.GetSubnetCIDR(); proberSubnet != "10.100.0.0/16" {
+		t.Fatalf("expected prober to resolve 10.100.0.0/16, got %s", proberSubnet)
+	}
+
+	// Change SubnetCIDR on service config
+	svc.cfg.SubnetCIDR = "10.200.0.0/16"
+	if got := svc.SubnetCIDR(); got != "10.200.0.0/16" {
+		t.Fatalf("expected updated subnet 10.200.0.0/16, got %s", got)
+	}
+	if proberSubnet := svc.prober.GetSubnetCIDR(); proberSubnet != "10.200.0.0/16" {
+		t.Fatalf("expected prober to reflect updated 10.200.0.0/16, got %s", proberSubnet)
+	}
+}
+
 func TestScheduledHealth_PreservesHandshakeBlocked(t *testing.T) {
 	for _, outerRecovers := range []bool{false, true} {
 		name := "outer_still_blocked"

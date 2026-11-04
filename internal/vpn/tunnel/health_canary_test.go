@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -86,6 +87,11 @@ func TestCanaryPacket_ICMP(t *testing.T) {
 	if pkt[9] != 1 {
 		t.Errorf("expected protocol 1 (ICMP), got %d", pkt[9])
 	}
+	// F3: Source IP must be within authorized portal subnet (default 10.100.0.1)
+	srcIP := net.IPv4(pkt[12], pkt[13], pkt[14], pkt[15])
+	if !srcIP.Equal(net.IPv4(10, 100, 0, 1)) {
+		t.Errorf("expected source IP 10.100.0.1 from authorized portal subnet, got %s", srcIP)
+	}
 	ipCsum := internetChecksum(pkt[0:20])
 	if ipCsum != 0 {
 		t.Errorf("expected IP checksum verification to yield 0, got 0x%x", ipCsum)
@@ -111,6 +117,11 @@ func TestCanaryPacket_DNS(t *testing.T) {
 	if pkt[9] != 17 {
 		t.Errorf("expected protocol 17 (UDP), got %d", pkt[9])
 	}
+	// F3: Source IP must be within authorized portal subnet (default 10.100.0.1)
+	srcIP := net.IPv4(pkt[12], pkt[13], pkt[14], pkt[15])
+	if !srcIP.Equal(net.IPv4(10, 100, 0, 1)) {
+		t.Errorf("expected source IP 10.100.0.1 from authorized portal subnet, got %s", srcIP)
+	}
 	ipCsum := internetChecksum(pkt[0:20])
 	if ipCsum != 0 {
 		t.Errorf("expected IP checksum verification 0, got 0x%x", ipCsum)
@@ -119,6 +130,79 @@ func TestCanaryPacket_DNS(t *testing.T) {
 	if dstPort != 53 {
 		t.Errorf("expected DNS destination port 53, got %d", dstPort)
 	}
+}
+
+func TestCanarySourceIP_AuthorizedSubnetDerivation(t *testing.T) {
+	tests := []struct {
+		cidr    string
+		wantSrc string
+		wantDst string
+	}{
+		{"10.100.0.0/16", "10.100.0.1", "10.100.0.2"},
+		{"10.200.0.0/16", "10.200.0.1", "10.200.0.2"},
+		{"172.16.0.0/12", "172.16.0.1", "172.16.0.2"},
+		{"192.168.1.0/24", "192.168.1.1", "192.168.1.2"},
+		{"", "10.100.0.1", "10.100.0.2"},
+		{"invalid", "10.100.0.1", "10.100.0.2"},
+	}
+
+	for _, tt := range tests {
+		src := CanarySourceIPFromCIDR(tt.cidr)
+		if src.String() != tt.wantSrc {
+			t.Errorf("CanarySourceIPFromCIDR(%q) = %s, want %s", tt.cidr, src, tt.wantSrc)
+		}
+		dst := CanaryDestinationIPFromCIDR(tt.cidr)
+		if dst.String() != tt.wantDst {
+			t.Errorf("CanaryDestinationIPFromCIDR(%q) = %s, want %s", tt.cidr, dst, tt.wantDst)
+		}
+		if tt.cidr != "" && tt.cidr != "invalid" {
+			_, ipNet, err := net.ParseCIDR(tt.cidr)
+			if err == nil && !ipNet.Contains(src) {
+				t.Errorf("derived source IP %s is outside authorized subnet %s", src, tt.cidr)
+			}
+		}
+
+		// Verify constructed packet carries the derived source IP
+		pkt := CanaryPingPacketForSubnet(tt.cidr)
+		pktSrc := net.IPv4(pkt[12], pkt[13], pkt[14], pkt[15])
+		if pktSrc.String() != tt.wantSrc {
+			t.Errorf("CanaryPingPacketForSubnet(%q) src = %s, want %s", tt.cidr, pktSrc, tt.wantSrc)
+		}
+	}
+}
+
+func TestHealthProber_SubnetCIDR_Resolution(t *testing.T) {
+	hp := NewHealthProber(nil, nil, DefaultHealthConfig())
+	// Default before configuration
+	if got := hp.GetSubnetCIDR(); got != "10.100.0.0/16" {
+		t.Fatalf("expected default 10.100.0.0/16, got %s", got)
+	}
+
+	// Direct configuration
+	hp.SetSubnetCIDR("10.200.0.0/16")
+	if got := hp.GetSubnetCIDR(); got != "10.200.0.0/16" {
+		t.Fatalf("expected configured 10.200.0.0/16, got %s", got)
+	}
+
+	// Reset direct configuration
+	hp.SetSubnetCIDR("")
+
+	// Provider fallback
+	type dummySubnetProvider struct{}
+	mockProv := &struct {
+		dummySubnetProvider
+	}{}
+	_ = mockProv
+	hp.SetDeviceProvider(dummyProviderWithSubnet("172.16.0.0/12"))
+	if got := hp.GetSubnetCIDR(); got != "172.16.0.0/12" {
+		t.Fatalf("expected provider subnet 172.16.0.0/12, got %s", got)
+	}
+}
+
+type dummyProviderWithSubnet string
+
+func (d dummyProviderWithSubnet) SubnetCIDR() string {
+	return string(d)
 }
 
 func TestProbePacketDevice_Success(t *testing.T) {

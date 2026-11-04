@@ -68,6 +68,8 @@ type HealthProber struct {
 	probeCanaryFn        CanaryProbeFunc
 	deviceProvider       func(tunnelID int64) PacketDevice
 	devices              map[int64]PacketDevice
+	subnetCIDR           string
+	subnetProvider       func() string
 	multiProtocolEnabled bool
 	onActiveHook         func(ctx context.Context, tunnel *models.BackendTunnel) error
 	onSelfHealHook       func(ctx context.Context, tunnel *models.BackendTunnel) error

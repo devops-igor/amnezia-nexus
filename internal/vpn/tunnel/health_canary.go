@@ -71,6 +71,39 @@ func (hp *HealthProber) SetDeviceProvider(provider any) {
 	case nil:
 		hp.deviceProvider = nil
 	}
+	if sp, ok := provider.(interface{ SubnetCIDR() string }); ok {
+		hp.subnetProvider = sp.SubnetCIDR
+	} else if provider == nil {
+		hp.subnetProvider = nil
+	}
+}
+
+// SetSubnetCIDR configures the portal client subnet CIDR used to derive canary probe addresses.
+func (hp *HealthProber) SetSubnetCIDR(cidr string) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	hp.subnetCIDR = cidr
+}
+
+// GetSubnetCIDR returns the effective portal subnet CIDR for canary probes.
+func (hp *HealthProber) GetSubnetCIDR() string {
+	if hp == nil {
+		return "10.100.0.0/16"
+	}
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	if hp.subnetCIDR != "" {
+		return hp.subnetCIDR
+	}
+	if hp.subnetProvider != nil {
+		if c := hp.subnetProvider(); c != "" {
+			return c
+		}
+	}
+	return "10.100.0.0/16"
 }
 
 // RegisterDevice registers an active PacketDevice for a backend tunnel.
@@ -157,11 +190,11 @@ func (hp *HealthProber) defaultCanaryProbe(ctx context.Context, tunnel *models.B
 		timeout = 3 * time.Second
 	}
 
-	return ProbePacketDevice(ctx, dev, timeout)
+	return ProbePacketDevice(ctx, dev, timeout, hp.GetSubnetCIDR())
 }
 
 // ProbePacketDevice sends an in-tunnel canary packet and waits for response or data-plane loopback.
-func ProbePacketDevice(ctx context.Context, dev PacketDevice, timeout time.Duration) error {
+func ProbePacketDevice(ctx context.Context, dev PacketDevice, timeout time.Duration, subnetCIDR ...string) error {
 	if dev == nil {
 		return errors.New("packet device is nil")
 	}
@@ -170,7 +203,12 @@ func ProbePacketDevice(ctx context.Context, dev PacketDevice, timeout time.Durat
 		return cd.ProbeCanary(ctx, timeout)
 	}
 
-	pkt := DefaultCanaryPingPacket()
+	cidr := "10.100.0.0/16"
+	if len(subnetCIDR) > 0 && subnetCIDR[0] != "" {
+		cidr = subnetCIDR[0]
+	}
+
+	pkt := CanaryPingPacketForSubnet(cidr)
 	if _, err := dev.Write(pkt); err != nil {
 		return fmt.Errorf("canary packet write failed: %w", err)
 	}
@@ -245,20 +283,77 @@ func ProbeVirtualTUN(ctx context.Context, vt *virtualtun.VirtualTUN, timeout tim
 	}
 }
 
-// DefaultCanaryPingPacket returns a minimal valid IPv4 ICMP Echo Request packet.
+// CanarySourceIPFromCIDR derives a valid source IP within the given CIDR subnet.
+// It uses the gateway address (netInt + 1), which is within the authorized AllowedIPs
+// of the portal data peer on the remote backend and reserved in IPAM.
+func CanarySourceIPFromCIDR(cidr string) net.IP {
+	if cidr == "" {
+		cidr = "10.100.0.0/16"
+	}
+	ip, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil || ip.To4() == nil {
+		return net.IPv4(10, 100, 0, 1)
+	}
+	ipv4 := ip.To4()
+	netInt := binary.BigEndian.Uint32(ipv4.Mask(ipNet.Mask))
+	gwInt := netInt + 1
+	gwBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(gwBytes, gwInt)
+	return net.IP(gwBytes)
+}
+
+// CanaryDestinationIPFromCIDR derives a destination IP within the given CIDR subnet
+// for in-tunnel canary probing.
+func CanaryDestinationIPFromCIDR(cidr string) net.IP {
+	if cidr == "" {
+		cidr = "10.100.0.0/16"
+	}
+	ip, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil || ip.To4() == nil {
+		return net.IPv4(10, 100, 0, 2)
+	}
+	ipv4 := ip.To4()
+	netInt := binary.BigEndian.Uint32(ipv4.Mask(ipNet.Mask))
+	maskInt := binary.BigEndian.Uint32(ipNet.Mask)
+	bcastInt := netInt | ^maskInt
+	dstInt := netInt + 2
+	if dstInt >= bcastInt {
+		dstInt = netInt + 1
+	}
+	dstBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(dstBytes, dstInt)
+	return net.IP(dstBytes)
+}
+
+// CanaryPingPacketForSubnet builds a valid ICMP Echo Request packet with source and destination
+// addresses inside the specified portal client subnet.
+func CanaryPingPacketForSubnet(subnetCIDR string) []byte {
+	src := CanarySourceIPFromCIDR(subnetCIDR)
+	dst := CanaryDestinationIPFromCIDR(subnetCIDR)
+	return BuildCanaryICMPEchoRequest(src, dst, 0x0713, 1)
+}
+
+// CanaryDNSPacketForSubnet builds a UDP DNS query with source address inside the specified portal client subnet.
+func CanaryDNSPacketForSubnet(subnetCIDR string) []byte {
+	src := CanarySourceIPFromCIDR(subnetCIDR)
+	dst := CanaryDestinationIPFromCIDR(subnetCIDR)
+	return BuildCanaryDNSQuery(src, dst, "canary.nexus.internal")
+}
+
+// DefaultCanaryPingPacket returns a minimal valid IPv4 ICMP Echo Request packet using the default portal subnet.
 func DefaultCanaryPingPacket() []byte {
-	return BuildCanaryICMPEchoRequest(net.IPv4(10, 0, 0, 2), net.IPv4(10, 0, 0, 1), 0x0713, 1)
+	return CanaryPingPacketForSubnet("10.100.0.0/16")
 }
 
 // BuildCanaryICMPEchoRequest builds a complete IPv4 packet containing an ICMP Echo Request.
 func BuildCanaryICMPEchoRequest(srcIP, dstIP net.IP, id, seq uint16) []byte {
 	src := srcIP.To4()
 	if src == nil {
-		src = net.IPv4(10, 0, 0, 2).To4()
+		src = net.IPv4(10, 100, 0, 1).To4()
 	}
 	dst := dstIP.To4()
 	if dst == nil {
-		dst = net.IPv4(10, 0, 0, 1).To4()
+		dst = net.IPv4(10, 100, 0, 2).To4()
 	}
 
 	pkt := make([]byte, 28) // 20 bytes IPv4 header + 8 bytes ICMP header
@@ -289,20 +384,20 @@ func BuildCanaryICMPEchoRequest(srcIP, dstIP net.IP, id, seq uint16) []byte {
 	return pkt
 }
 
-// DefaultCanaryDNSPacket returns a lightweight UDP DNS query packet for "canary.nexus.internal".
+// DefaultCanaryDNSPacket returns a lightweight UDP DNS query packet with source IP inside the default portal subnet.
 func DefaultCanaryDNSPacket() []byte {
-	return BuildCanaryDNSQuery(net.IPv4(10, 0, 0, 2), net.IPv4(10, 0, 0, 1), "canary.nexus.internal")
+	return CanaryDNSPacketForSubnet("10.100.0.0/16")
 }
 
 // BuildCanaryDNSQuery constructs an IPv4 + UDP packet with a minimal DNS query for domain.
 func BuildCanaryDNSQuery(srcIP, dstIP net.IP, domain string) []byte {
 	src := srcIP.To4()
 	if src == nil {
-		src = net.IPv4(10, 0, 0, 2).To4()
+		src = net.IPv4(10, 100, 0, 1).To4()
 	}
 	dst := dstIP.To4()
 	if dst == nil {
-		dst = net.IPv4(10, 0, 0, 1).To4()
+		dst = net.IPv4(10, 100, 0, 2).To4()
 	}
 
 	// Minimal DNS Query: ID(2), Flags(2), QDCOUNT(2), ANCOUNT(2), NSCOUNT(2), ARCOUNT(2) = 12 bytes

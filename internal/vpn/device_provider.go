@@ -32,6 +32,12 @@ func (s *Service) GetDevice(id int64) (tunnel.PacketDevice, bool) {
 	return nil, false
 }
 
+// SubnetCIDR implements the subnet provider interface for HealthProber so canary probes
+// are generated with source IPs authorized by the remote peer's AllowedIPs.
+func (s *Service) SubnetCIDR() string {
+	return s.getPortalSubnet()
+}
+
 // ProbeCanary probes the data plane of a backend tunnel using the service's health prober.
 func (s *Service) ProbeCanary(ctx context.Context, t *models.BackendTunnel) error {
 	if s.prober == nil {
