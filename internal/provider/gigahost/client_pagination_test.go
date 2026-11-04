@@ -680,3 +680,176 @@ func TestServerInfo_IsHourlyVPS_MalformedBillingFlag(t *testing.T) {
 		}
 	})
 }
+
+func TestClient_GetServers_RejectJSONNull(t *testing.T) {
+	t.Run("rejects JSON null body variants and fails closed", func(t *testing.T) {
+		cases := []struct {
+			name string
+			body string
+		}{
+			{"raw null", `null`},
+			{"whitespace padded null", `   null  ` + "\n"},
+			{"wrapped data null", `{"data": null}`},
+			{"wrapped servers null", `{"servers": null}`},
+			{"data null with pagination meta", `{"meta": {"page": 1, "total_pages": 1}, "data": null}`},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(tc.body))
+				}))
+				defer server.Close()
+
+				c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				servers, err := c.GetServers(context.Background())
+				if err == nil {
+					t.Fatalf("expected error for JSON null body in %s, got nil (servers: %+v)", tc.name, servers)
+				}
+
+				// Verify budget check fail-closed contract:
+				// If inventory listing fails, budget verification must not proceed or treat it as zero servers.
+				verifyBudgetSimulation := func(c Client) error {
+					srvs, srvErr := c.GetServers(context.Background())
+					if srvErr != nil {
+						return fmt.Errorf("failed to check existing server inventory for budget verification: %w", srvErr)
+					}
+					if len(srvs) == 0 {
+						return nil // Bypassed budget!
+					}
+					return nil
+				}
+
+				if err := verifyBudgetSimulation(c); err == nil {
+					t.Fatal("budget check simulation unexpectedly succeeded; must fail closed on JSON null")
+				}
+			})
+		}
+	})
+
+	t.Run("accepts explicit empty inventory representations", func(t *testing.T) {
+		cases := []struct {
+			name string
+			body string
+		}{
+			{"explicit empty array", `[]`},
+			{"explicit empty data envelope", `{"data": []}`},
+			{"explicit empty servers envelope", `{"servers": []}`},
+			{"explicit empty envelope with zero total", `{"meta": {"page": 1, "total_pages": 1, "total": 0}, "data": []}`},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(tc.body))
+				}))
+				defer server.Close()
+
+				c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				servers, err := c.GetServers(context.Background())
+				if err != nil {
+					t.Fatalf("unexpected error for %s: %v", tc.name, err)
+				}
+				if len(servers) != 0 {
+					t.Fatalf("expected 0 servers for %s, got %d", tc.name, len(servers))
+				}
+			})
+		}
+	})
+}
+
+func TestClient_GetServers_ExplicitZeroTotals(t *testing.T) {
+	t.Run("rejects contradictory response with total 0 and servers present", func(t *testing.T) {
+		cases := []struct {
+			name string
+			body string
+		}{
+			{
+				name: "single page total 0 with 1 server",
+				body: `{"meta": {"page": 1, "total_pages": 1, "total": 0}, "data": [{"id": 101, "status": "ready"}]}`,
+			},
+			{
+				name: "single page string total 0 with 1 server",
+				body: `{"meta": {"page": 1, "total_pages": 1, "total": "0"}, "data": [{"id": 102, "status": "ready"}]}`,
+			},
+			{
+				name: "single page total 0 in servers field",
+				body: `{"meta": {"page": 1, "total_pages": 1, "total": 0}, "servers": [{"id": 103, "status": "ready"}]}`,
+			},
+			{
+				name: "multi-page total 0 with servers on page 1",
+				body: `{"meta": {"page": 1, "total_pages": 2, "total": 0}, "data": [{"id": 104, "status": "ready"}]}`,
+			},
+			{
+				name: "single page count mismatch: total 2 but 1 server",
+				body: `{"meta": {"page": 1, "total_pages": 1, "total": 2}, "data": [{"id": 105, "status": "ready"}]}`,
+			},
+			{
+				name: "single page count mismatch: total 1 but 0 servers",
+				body: `{"meta": {"page": 1, "total_pages": 1, "total": 1}, "data": []}`,
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(tc.body))
+				}))
+				defer server.Close()
+
+				c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				servers, err := c.GetServers(context.Background())
+				if err == nil {
+					t.Fatalf("expected error for %s, got nil (servers: %+v)", tc.name, servers)
+				}
+			})
+		}
+	})
+
+	t.Run("accepts consistent explicit zero total with empty inventory", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"meta": map[string]any{
+					"page":        1,
+					"total_pages": 1,
+					"total":       0,
+				},
+				"data": []any{},
+			})
+		}))
+		defer server.Close()
+
+		c, err := NewClient(Config{BaseURL: server.URL, APIKey: paginationTestAPIKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		servers, err := c.GetServers(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error for consistent total 0: %v", err)
+		}
+		if len(servers) != 0 {
+			t.Fatalf("expected 0 servers, got %d", len(servers))
+		}
+	})
+}

@@ -468,14 +468,13 @@ func (c *client) GetServers(ctx context.Context) ([]ServerInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse servers list: %w", err)
 	}
-	totalPages, expectedTotal := meta.TotalPages, 0
+	totalPages := meta.TotalPages
 	if totalPages < 1 {
 		totalPages = 1
 	}
-	if meta.HasTotal && meta.Total > 0 {
-		expectedTotal = meta.Total
-	}
-	if err := meta.Validate(1, totalPages, expectedTotal, len(servers), len(servers)); err != nil {
+	hasExpectedTotal := meta.HasTotal
+	expectedTotal := meta.Total
+	if err := meta.Validate(1, totalPages, hasExpectedTotal, expectedTotal, len(servers), len(servers)); err != nil {
 		return nil, err
 	}
 	allServers := append([]ServerInfo(nil), servers...)
@@ -488,15 +487,16 @@ func (c *client) GetServers(ctx context.Context) ([]ServerInfo, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse servers page %d: %w", page, err)
 		}
-		if err := pageMeta.Validate(page, totalPages, expectedTotal, len(pageServers), len(allServers)); err != nil {
+		if err := pageMeta.Validate(page, totalPages, hasExpectedTotal, expectedTotal, len(pageServers), len(allServers)); err != nil {
 			return nil, err
 		}
-		if expectedTotal == 0 && pageMeta.HasTotal && pageMeta.Total > 0 {
+		if !hasExpectedTotal && pageMeta.HasTotal {
+			hasExpectedTotal = true
 			expectedTotal = pageMeta.Total
 		}
 		allServers = append(allServers, pageServers...)
 	}
-	if expectedTotal > 0 && len(allServers) != expectedTotal {
+	if hasExpectedTotal && len(allServers) != expectedTotal {
 		return nil, fmt.Errorf("incomplete inventory: expected %d servers from meta.total, got %d", expectedTotal, len(allServers))
 	}
 	return allServers, nil
@@ -715,7 +715,7 @@ func parseProducts(data []byte) ([]Product, CatalogEligibility, error) {
 	}
 
 	var direct []Product
-	if err := json.Unmarshal(data, &direct); err == nil && len(direct) >= 0 {
+	if err := json.Unmarshal(data, &direct); err == nil && direct != nil {
 		return direct, CatalogEligibility{}, nil
 	}
 
@@ -741,8 +741,15 @@ func parseProducts(data []byte) ([]Product, CatalogEligibility, error) {
 }
 
 func parseServersPage(data []byte) ([]ServerInfo, PaginationMeta, error) {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return nil, PaginationMeta{}, errors.New("servers payload cannot be null")
+	}
+
 	var direct []ServerInfo
 	if err := json.Unmarshal(data, &direct); err == nil {
+		if direct == nil {
+			return nil, PaginationMeta{}, errors.New("servers payload cannot be null")
+		}
 		return direct, PaginationMeta{Page: 1, TotalPages: 1, HasPage: true, HasTotalPages: true}, nil
 	}
 

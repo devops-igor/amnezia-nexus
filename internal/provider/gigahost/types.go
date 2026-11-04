@@ -505,7 +505,7 @@ func (m *PaginationMeta) UnmarshalJSON(data []byte) error {
 }
 
 // Validate checks pagination consistency and rejects malformed, incomplete, or inconsistent metadata.
-func (m PaginationMeta) Validate(page, expectedPages, expectedTotal, pageCount, currentAggregate int) error {
+func (m PaginationMeta) Validate(page, expectedPages int, hasExpectedTotal bool, expectedTotal, pageCount, currentAggregate int) error {
 	if m.HasPage && m.Page != page {
 		return fmt.Errorf("inconsistent pagination metadata: requested page %d but got page %d", page, m.Page)
 	}
@@ -517,13 +517,19 @@ func (m PaginationMeta) Validate(page, expectedPages, expectedTotal, pageCount, 
 			return fmt.Errorf("inconsistent pagination metadata: total_pages changed from %d to %d on page %d", expectedPages, m.TotalPages, page)
 		}
 	}
-	if m.HasTotal && m.Total > 0 && expectedTotal > 0 && m.Total != expectedTotal {
+	if m.HasTotal && hasExpectedTotal && m.Total != expectedTotal {
 		return fmt.Errorf("inconsistent pagination metadata: total changed from %d to %d on page %d", expectedTotal, m.Total, page)
+	}
+	if m.HasTotal && m.Total == 0 && pageCount > 0 {
+		return fmt.Errorf("contradictory inventory: meta.total is 0 but page %d returned %d servers", page, pageCount)
+	}
+	if hasExpectedTotal && expectedTotal == 0 && pageCount > 0 {
+		return fmt.Errorf("contradictory inventory: meta.total is 0 but page %d returned %d servers", page, pageCount)
 	}
 	if expectedPages > 1 && page < expectedPages && pageCount == 0 {
 		return fmt.Errorf("incomplete inventory: intermediate page %d of %d returned 0 servers", page, expectedPages)
 	}
-	if expectedTotal > 0 && pageCount == 0 && currentAggregate < expectedTotal {
+	if hasExpectedTotal && expectedTotal > 0 && pageCount == 0 && currentAggregate < expectedTotal {
 		return fmt.Errorf("incomplete inventory: page %d returned 0 servers but expected total is %d (received %d)", page, expectedTotal, currentAggregate)
 	}
 	return nil
@@ -779,4 +785,3 @@ func parseBoolFieldStrict(val any) (bool, bool) {
 		return false, false
 	}
 }
-
