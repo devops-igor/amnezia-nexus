@@ -122,6 +122,8 @@ type DirectEgressManager struct {
 	portEpoch        map[uint16]uint64
 	quarantinedPorts map[uint16]time.Time
 	portCooldown     time.Duration
+	remoteBindings   map[remoteBindingKey]*remoteBindingEntry
+	portOwners       map[uint16]string
 }
 
 // DirectDrops returns the total number of packets dropped by direct egress.
@@ -163,6 +165,8 @@ func NewDirectEgressManager(cfg DirectEgressConfig, fwd *Forwarder) *DirectEgres
 		portEpoch:        make(map[uint16]uint64),
 		quarantinedPorts: make(map[uint16]time.Time),
 		portCooldown:     5 * time.Second,
+		remoteBindings:   make(map[remoteBindingKey]*remoteBindingEntry),
+		portOwners:       make(map[uint16]string),
 		gwDNSIP:          cfg.GatewayDNSIP,
 	}
 
@@ -251,32 +255,6 @@ func (m *DirectEgressManager) readWANLoop(dev PacketDevice, stopCh chan struct{}
 	}
 }
 
-// IsProhibitedDestination tests whether dst is a restricted network address:
-// Loopback, link-local, RFC1918 private, CGNAT (100.64.0.0/10), multicast, metadata, or reserved.
-// Traffic to the designated gateway DNS address is permitted without port qualification here
-// (strict port 53 scoping is enforced on full packets in RouteDirect/pumps).
-func (m *DirectEgressManager) IsProhibitedDestination(dst netip.Addr) bool {
-	if m != nil {
-		gw := m.GatewayDNSIP()
-		if gw.IsValid() && dst == gw {
-			return false
-		}
-	}
-	return IsProhibitedIPv4Destination(dst)
-}
-
-func (m *DirectEgressManager) isFlowExpiredLocked(f *flowEntry, proto uint8, now time.Time) bool {
-	timeout := m.cfg.UDPTimeout
-	if proto == 6 {
-		if f.closeSeen {
-			timeout = 5 * time.Second
-		} else {
-			timeout = m.cfg.TCPTimeout
-		}
-	}
-	return now.Sub(f.lastSeen) > timeout
-}
-
 // LookupFlow checks if an existing sticky flow decision is recorded for this packet's 5-tuple.
 func (m *DirectEgressManager) LookupFlow(peerKey string, packet []byte) (EgressChoice, bool) {
 	if m == nil || len(packet) < 20 || (packet[0]>>4) != 4 {
@@ -343,24 +321,6 @@ func (m *DirectEgressManager) LookupFlow(peerKey string, packet []byte) (EgressC
 	m.mu.Unlock()
 
 	return choice, true
-}
-
-func parseGenerationArg(v any) (uint64, bool) {
-	switch g := v.(type) {
-	case uint64:
-		return g, true
-	case int:
-		if g >= 0 {
-			return uint64(g), true // #nosec G115
-		}
-	case uint:
-		return uint64(g), true
-	case int64:
-		if g >= 0 {
-			return uint64(g), true // #nosec G115
-		}
-	}
-	return 0, false
 }
 
 // RecordFlow records the initial routing decision for a 5-tuple flow to maintain stickiness.
@@ -604,7 +564,7 @@ func (m *DirectEgressManager) ensureDirectNATLocked(
 		}
 
 		var err error
-		natPort, err = m.allocatePortLocked()
+		natPort, err = m.allocatePortLocked(peerKey, proto, netip.AddrFrom4(dstIP), dstPort)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -641,6 +601,14 @@ func (m *DirectEgressManager) ensureDirectNATLocked(
 			natPort:    natPort,
 			returnPath: path,
 			lastSeen:   now,
+		}
+		bKey := remoteBindingKey{protocol: proto, natPort: natPort, remoteIP: netip.AddrFrom4(dstIP), remotePort: dstPort}
+		m.remoteBindings[bKey] = &remoteBindingEntry{
+			peerKey:    peerKey,
+			sessionID:  sessionID,
+			generation: generation,
+			epoch:      m.portEpoch[natPort],
+			active:     true,
 		}
 	}
 
@@ -721,20 +689,27 @@ func (m *DirectEgressManager) lookupAndRefreshNATReply(proto uint8, natPort uint
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	bKey := remoteBindingKey{protocol: proto, natPort: natPort, remoteIP: srcIP, remotePort: srcPort}
+
 	entry, ok := m.inboundNAT[inKey]
 	if !ok {
+		if _, exists := m.remoteBindings[bKey]; exists {
+			return natEntry{}, ErrStaleSessionReply
+		}
 		return natEntry{}, errors.New("no nat entry for reply")
 	}
 	if srcIP != entry.remoteIP || srcPort != entry.remotePort {
+		if _, exists := m.remoteBindings[bKey]; exists {
+			return natEntry{}, ErrStaleSessionReply
+		}
 		return natEntry{}, errors.New("remote endpoint does not match nat entry")
 	}
 	if entry.epoch != m.portEpoch[natPort] {
 		return natEntry{}, ErrStaleSessionReply
 	}
-	if m.fwd != nil {
-		activeGen, activeSID, hasActive := m.fwd.ActivePeerGeneration(entry.peerKey)
-		if !hasActive || (entry.generation != 0 && entry.generation != activeGen) || (entry.sessionID != "" && entry.sessionID != activeSID) {
-			return natEntry{}, ErrSessionNotRegistered
+	if b, exists := m.remoteBindings[bKey]; exists {
+		if !b.active || b.peerKey != entry.peerKey || b.sessionID != entry.sessionID || b.epoch != entry.epoch {
+			return natEntry{}, ErrStaleSessionReply
 		}
 	}
 
@@ -801,6 +776,16 @@ func (m *DirectEgressManager) isPortQuarantinedLocked(port uint16, now time.Time
 	}
 	if now.Sub(rel) >= m.portCooldown {
 		delete(m.quarantinedPorts, port)
+		delete(m.portOwners, port)
+		tombstoneTTL := m.portCooldown
+		if tombstoneTTL < defaultTombstoneCooldown {
+			tombstoneTTL = defaultTombstoneCooldown
+		}
+		for k, b := range m.remoteBindings {
+			if k.natPort == port && !b.active && now.Sub(b.releasedAt) >= tombstoneTTL {
+				delete(m.remoteBindings, k)
+			}
+		}
 		return false
 	}
 	return true
@@ -809,11 +794,21 @@ func (m *DirectEgressManager) isPortQuarantinedLocked(port uint16, now time.Time
 func (m *DirectEgressManager) releasePortLocked(port uint16, now time.Time) {
 	if port > 0 {
 		delete(m.usedPorts, port)
-		m.quarantinedPorts[port] = now
+		if m.portCooldown > 0 {
+			m.quarantinedPorts[port] = now
+		} else {
+			delete(m.portOwners, port)
+		}
+		for k, b := range m.remoteBindings {
+			if k.natPort == port {
+				b.active = false
+				b.releasedAt = now
+			}
+		}
 	}
 }
 
-func (m *DirectEgressManager) allocatePortLocked() (uint16, error) {
+func (m *DirectEgressManager) allocatePortLocked(peerKey string, proto uint8, remoteIP netip.Addr, remotePort uint16) (uint16, error) {
 	totalPorts := int(m.cfg.MaxPort - m.cfg.MinPort + 1)
 	now := time.Now()
 	for attempt := 0; attempt < 2; attempt++ {
@@ -824,7 +819,15 @@ func (m *DirectEgressManager) allocatePortLocked() (uint16, error) {
 				m.nextPort = m.cfg.MinPort
 			}
 			if !m.usedPorts[port] && !m.isPortQuarantinedLocked(port, now) {
+				if owner, ok := m.portOwners[port]; ok && owner != "" && owner != peerKey {
+					continue
+				}
+				bKey := remoteBindingKey{protocol: proto, natPort: port, remoteIP: remoteIP, remotePort: remotePort}
+				if b, exists := m.remoteBindings[bKey]; exists && b.peerKey != peerKey {
+					continue
+				}
 				m.usedPorts[port] = true
+				m.portOwners[port] = peerKey
 				m.portEpoch[port]++
 				return port, nil
 			}
@@ -843,8 +846,13 @@ func (m *DirectEgressManager) allocatePortLocked() (uint16, error) {
 			m.nextPort = m.cfg.MinPort
 		}
 		if !m.usedPorts[port] {
+			bKey := remoteBindingKey{protocol: proto, natPort: port, remoteIP: remoteIP, remotePort: remotePort}
+			if b, exists := m.remoteBindings[bKey]; exists && b.peerKey != peerKey {
+				continue
+			}
 			delete(m.quarantinedPorts, port)
 			m.usedPorts[port] = true
+			m.portOwners[port] = peerKey
 			m.portEpoch[port]++
 			return port, nil
 		}
@@ -928,6 +936,8 @@ func (m *DirectEgressManager) PurgeAll() {
 	clear(m.inboundNAT)
 	clear(m.usedPorts)
 	clear(m.quarantinedPorts)
+	clear(m.remoteBindings)
+	clear(m.portOwners)
 }
 
 // Close terminates direct egress background routines and closes resources.

@@ -215,24 +215,20 @@ func TestValidation_DelayedRepliesOnNATPortReuse(t *testing.T) {
 	// 2. Terminate Session 1
 	dem.PurgeSession(session1)
 
-	// 3. Session 2 allocates the same recycled NAT port 55000
+	// 3. Session 2 allocates the same recycled NAT port 55000 for a different destination
 	capPath2 := newTestCaptureReturnPath()
 	session2 := "session-2"
-	pkt2 := buildTestIPv4UDPPacket(clientIP, targetIP, 20002, 53, []byte("req-2"))
+	targetIP2 := netip.MustParseAddr("8.8.8.8")
+	pkt2 := buildTestIPv4UDPPacket(clientIP, targetIP2, 20002, 53, []byte("req-2"))
 	if err := dem.RouteDirect("peer-2", clientIP.String(), session2, uint64(2), pkt2, capPath2.path); err != nil {
 		t.Fatalf("Session 2 RouteDirect failed: %v", err)
 	}
 
 	// 4. Delayed reply arrives from Session 1 (same targetIP, same natPort)
-	// Because Session 2 reallocated the port with a new epoch, Session 1's reply must be rejected
+	// Because Session 2 reallocated the port with a new epoch, Session 1's reply must be rejected as stale
 	delayedReply := buildTestIPv4UDPPacket(targetIP, hostWAN, 53, natPort, []byte("delayed-reply-session-1"))
 
 	// In dem.inboundNAT, the active entry belongs to Session 2 with epoch 2.
-	// If a reply arrives, it is processed under Session 2's mapping.
-	// If the returnPath or session is mismatched:
-	// Verify that Session 2's return path receives Session 2's reply, but delayed reply from Session 1 is fenced
-	// if targeted at Session 1's identity.
-	// Now test epoch mismatch directly:
 	dem.mu.Lock()
 	inKey := inboundKey{protocol: 17, natPort: natPort}
 	activeEntry := dem.inboundNAT[inKey]
@@ -240,13 +236,62 @@ func TestValidation_DelayedRepliesOnNATPortReuse(t *testing.T) {
 		dem.mu.Unlock()
 		t.Fatalf("expected active entry for session-2, got %v", activeEntry)
 	}
-	// Simulate an old epoch on the entry to verify rejection
-	dem.portEpoch[natPort] = 999
 	dem.mu.Unlock()
 
+	// Verify delayed reply from Session 1 is fenced via tombstone and does NOT leak to Session 2
 	err := dem.HandleWANReply(delayedReply)
 	if !errors.Is(err, ErrStaleSessionReply) {
-		t.Fatalf("expected ErrStaleSessionReply on recycled port epoch mismatch, got: %v", err)
+		t.Fatalf("expected ErrStaleSessionReply on recycled port tombstone match, got: %v", err)
+	}
+	if len(capPath2.getPackets()) != 0 {
+		t.Fatalf("session 2 received delayed reply belonging to session 1; tenant isolation violated")
+	}
+
+	// Verify valid reply for Session 2 is admitted and delivered
+	validReply2 := buildTestIPv4UDPPacket(targetIP2, hostWAN, 53, natPort, []byte("reply-2"))
+	if err := dem.HandleWANReply(validReply2); err != nil {
+		t.Fatalf("expected Session 2 reply to succeed, got: %v", err)
+	}
+	if len(capPath2.getPackets()) != 1 {
+		t.Fatalf("expected exactly 1 packet delivered to session 2, got %d", len(capPath2.getPackets()))
+	}
+}
+
+func TestValidation_TenantIsolationBlocksPortReuseSameRemoteEndpoint(t *testing.T) {
+	wanDev := newMockPacketDev()
+	hostWAN := netip.MustParseAddr("203.0.113.10")
+	dem := NewDirectEgressManager(DirectEgressConfig{
+		HostWANIP:  hostWAN,
+		WANDevice:  wanDev,
+		UDPTimeout: 5 * time.Second,
+		TCPTimeout: 5 * time.Second,
+		MinPort:    55000,
+		MaxPort:    55000, // exactly 1 port to force conflict
+	}, nil)
+	defer func() { _ = dem.Close() }()
+	dem.SetPortCooldown(0)
+
+	capPath1 := newTestCaptureReturnPath()
+	clientIP := netip.MustParseAddr("10.100.0.5")
+	targetIP := netip.MustParseAddr("1.1.1.1")
+
+	// Session 1 from peer-1
+	session1 := "session-1"
+	pkt1 := buildTestIPv4UDPPacket(clientIP, targetIP, 10001, 53, []byte("req-1"))
+	if err := dem.RouteDirect("peer-1", clientIP.String(), session1, uint64(1), pkt1, capPath1.path); err != nil {
+		t.Fatalf("Session 1 RouteDirect failed: %v", err)
+	}
+
+	// Terminate Session 1
+	dem.PurgeSession(session1)
+
+	// Session 2 from peer-2 (different tenant) tries to use same port for same targetIP:53
+	capPath2 := newTestCaptureReturnPath()
+	session2 := "session-2"
+	pkt2 := buildTestIPv4UDPPacket(clientIP, targetIP, 20002, 53, []byte("req-2"))
+	err := dem.RouteDirect("peer-2", clientIP.String(), session2, uint64(2), pkt2, capPath2.path)
+	if !errors.Is(err, ErrNATPortExhaustion) {
+		t.Fatalf("expected ErrNATPortExhaustion when reusing port for same remote endpoint across tenants, got: %v", err)
 	}
 }
 

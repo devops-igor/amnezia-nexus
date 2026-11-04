@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net/netip"
+	"time"
 )
 
 var (
@@ -18,6 +19,24 @@ var (
 	// ErrStaleSessionReply indicates a reply matching a recycled NAT port from an inactive session.
 	ErrStaleSessionReply = errors.New("forwarder: stale reply for inactive or mismatched session")
 )
+
+const defaultTombstoneCooldown = 5 * time.Second
+
+type remoteBindingKey struct {
+	protocol   uint8
+	natPort    uint16
+	remoteIP   netip.Addr
+	remotePort uint16
+}
+
+type remoteBindingEntry struct {
+	peerKey    string
+	sessionID  string
+	generation uint64
+	epoch      uint64
+	releasedAt time.Time
+	active     bool
+}
 
 var prohibitedCIDRs = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),
@@ -323,4 +342,47 @@ func computeL4Checksum(srcIP, dstIP [4]byte, protocol uint8, l4Data []byte) uint
 		return 0xffff
 	}
 	return c
+}
+
+// IsProhibitedDestination checks whether dst is permitted for direct egress.
+// Traffic to the designated gateway DNS address is permitted without port qualification here
+// (strict port 53 scoping is enforced on full packets in RouteDirect/pumps).
+func (m *DirectEgressManager) IsProhibitedDestination(dst netip.Addr) bool {
+	if m != nil {
+		gw := m.GatewayDNSIP()
+		if gw.IsValid() && dst == gw {
+			return false
+		}
+	}
+	return IsProhibitedIPv4Destination(dst)
+}
+
+func (m *DirectEgressManager) isFlowExpiredLocked(f *flowEntry, proto uint8, now time.Time) bool {
+	timeout := m.cfg.UDPTimeout
+	if proto == 6 {
+		if f.closeSeen {
+			timeout = 5 * time.Second
+		} else {
+			timeout = m.cfg.TCPTimeout
+		}
+	}
+	return now.Sub(f.lastSeen) > timeout
+}
+
+func parseGenerationArg(v any) (uint64, bool) {
+	switch g := v.(type) {
+	case uint64:
+		return g, true
+	case int:
+		if g >= 0 {
+			return uint64(g), true // #nosec G115
+		}
+	case uint:
+		return uint64(g), true
+	case int64:
+		if g >= 0 {
+			return uint64(g), true // #nosec G115
+		}
+	}
+	return 0, false
 }
