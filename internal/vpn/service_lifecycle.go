@@ -426,6 +426,7 @@ func (s *Service) Stop() error {
 		s.reconnectMgr.Stop()
 	}
 	if s.forwarder != nil {
+		_ = s.TeardownPBR()
 		recordErr(s.forwarder.Stop())
 	}
 	s.stopRollingHistory()
