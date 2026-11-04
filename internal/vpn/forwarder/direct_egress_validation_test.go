@@ -322,3 +322,53 @@ func TestValidation_FlowTableExhaustion(t *testing.T) {
 		t.Fatalf("expected ErrFlowTableFull on 3rd flow, got: %v", err)
 	}
 }
+
+func TestValidation_TenantIsolationNormalCooldownOldReplyBlocked(t *testing.T) {
+	wanDev := newMockPacketDev()
+	hostWAN := netip.MustParseAddr("203.0.113.10")
+	dem := NewDirectEgressManager(DirectEgressConfig{
+		HostWANIP:  hostWAN,
+		WANDevice:  wanDev,
+		UDPTimeout: 5 * time.Second,
+		TCPTimeout: 5 * time.Second,
+		MinPort:    55000,
+		MaxPort:    55000, // 1 port
+	}, nil)
+	defer func() { _ = dem.Close() }()
+	dem.SetPortCooldown(50 * time.Millisecond)
+
+	capPath1 := newTestCaptureReturnPath()
+	clientIP := netip.MustParseAddr("10.100.0.5")
+	targetIP := netip.MustParseAddr("1.1.1.1")
+
+	// Session 1 from peer-1 sends outbound request
+	session1 := "session-1"
+	pkt1 := buildTestIPv4UDPPacket(clientIP, targetIP, 10001, 53, []byte("req-1"))
+	if err := dem.RouteDirect("peer-1", clientIP.String(), session1, uint64(1), pkt1, capPath1.path); err != nil {
+		t.Fatalf("Session 1 RouteDirect failed: %v", err)
+	}
+
+	// Prepare old reply from targetIP:53
+	oldReply := buildTestIPv4UDPPacket(targetIP, hostWAN, 53, 55000, []byte("old-reply-session-1"))
+
+	// Terminate Session 1
+	dem.PurgeSession(session1)
+
+	// Wait past cooldown
+	time.Sleep(60 * time.Millisecond)
+
+	// Session 2 from peer-2 (different tenant) tries to allocate the same port for the same targetIP:53
+	capPath2 := newTestCaptureReturnPath()
+	session2 := "session-2"
+	pkt2 := buildTestIPv4UDPPacket(clientIP, targetIP, 20002, 53, []byte("req-2"))
+	_ = dem.RouteDirect("peer-2", clientIP.String(), session2, uint64(2), pkt2, capPath2.path)
+
+	// Even if port was recycled or if old reply arrives, old reply must be rejected as stale and NEVER delivered to session 2
+	err := dem.HandleWANReply(oldReply)
+	if !errors.Is(err, ErrStaleSessionReply) {
+		t.Fatalf("expected ErrStaleSessionReply, got: %v", err)
+	}
+	if len(capPath2.getPackets()) != 0 {
+		t.Fatalf("session 2 received delayed reply belonging to session 1 after cooldown; tenant isolation violated")
+	}
+}

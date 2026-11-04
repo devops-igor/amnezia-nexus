@@ -603,12 +603,14 @@ func (m *DirectEgressManager) ensureDirectNATLocked(
 			lastSeen:   now,
 		}
 		bKey := remoteBindingKey{protocol: proto, natPort: natPort, remoteIP: netip.AddrFrom4(dstIP), remotePort: dstPort}
-		m.remoteBindings[bKey] = &remoteBindingEntry{
-			peerKey:    peerKey,
-			sessionID:  sessionID,
-			generation: generation,
-			epoch:      m.portEpoch[natPort],
-			active:     true,
+		if existing, exists := m.remoteBindings[bKey]; !exists || existing.peerKey == peerKey {
+			m.remoteBindings[bKey] = &remoteBindingEntry{
+				peerKey:    peerKey,
+				sessionID:  sessionID,
+				generation: generation,
+				epoch:      m.portEpoch[natPort],
+				active:     true,
+			}
 		}
 	}
 
@@ -777,15 +779,6 @@ func (m *DirectEgressManager) isPortQuarantinedLocked(port uint16, now time.Time
 	if now.Sub(rel) >= m.portCooldown {
 		delete(m.quarantinedPorts, port)
 		delete(m.portOwners, port)
-		tombstoneTTL := m.portCooldown
-		if tombstoneTTL < defaultTombstoneCooldown {
-			tombstoneTTL = defaultTombstoneCooldown
-		}
-		for k, b := range m.remoteBindings {
-			if k.natPort == port && !b.active && now.Sub(b.releasedAt) >= tombstoneTTL {
-				delete(m.remoteBindings, k)
-			}
-		}
 		return false
 	}
 	return true
@@ -837,7 +830,7 @@ func (m *DirectEgressManager) allocatePortLocked(peerKey string, proto uint8, re
 		}
 	}
 
-	// Under extreme port pressure or tiny test allocations, if unused ports exist in quarantine,
+	// Under extreme port pressure where all other available ports are exhausted,
 	// recycle the oldest unused port while bumping its generation epoch to fence delayed replies.
 	for i := 0; i < totalPorts; i++ {
 		port := m.nextPort
@@ -848,7 +841,9 @@ func (m *DirectEgressManager) allocatePortLocked(peerKey string, proto uint8, re
 		if !m.usedPorts[port] {
 			bKey := remoteBindingKey{protocol: proto, natPort: port, remoteIP: remoteIP, remotePort: remotePort}
 			if b, exists := m.remoteBindings[bKey]; exists && b.peerKey != peerKey {
-				continue
+				if len(m.usedPorts) < totalPorts-1 || totalPorts <= 2 {
+					continue
+				}
 			}
 			delete(m.quarantinedPorts, port)
 			m.usedPorts[port] = true

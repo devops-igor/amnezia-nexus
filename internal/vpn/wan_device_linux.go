@@ -5,7 +5,9 @@ package vpn
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -59,8 +61,39 @@ func NewProductionWANDevice(name string) (forwarder.PacketDevice, error) {
 		return nil, errno
 	}
 
+	actualName := strings.TrimRight(string(ifr[:16]), "\x00")
+	if actualName == "" {
+		actualName = name
+	}
+
+	// Bring the interface UP programmatically (IFF_UP | IFF_RUNNING) via socket ioctl SIOCSIFFLAGS
+	sock, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("open socket for ifreq ioctl: %w", err)
+	}
+	defer unix.Close(sock)
+
+	ifReq, err := unix.NewIfreq(actualName)
+	if err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("create ifreq for %s: %w", actualName, err)
+	}
+
+	if err := unix.IoctlIfreq(sock, unix.SIOCGIFFLAGS, ifReq); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("get interface flags for %s: %w", actualName, err)
+	}
+
+	flags := ifReq.Uint16() | uint16(unix.IFF_UP|unix.IFF_RUNNING)
+	ifReq.SetUint16(flags)
+	if err := unix.IoctlIfreq(sock, unix.SIOCSIFFLAGS, ifReq); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("set interface flags up for %s: %w", actualName, err)
+	}
+
 	return &linuxWANDevice{
-		file: os.NewFile(uintptr(fd), name),
-		name: name,
+		file: os.NewFile(uintptr(fd), actualName),
+		name: actualName,
 	}, nil
 }
