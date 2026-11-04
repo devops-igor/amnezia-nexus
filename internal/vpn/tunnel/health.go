@@ -37,7 +37,11 @@ type HealthConfig struct {
 	SelfHealingInterval  time.Duration
 	SelfHealingThreshold int
 	DisableSelfHealing   bool
+	SubnetCIDR           string
 }
+
+// HealthProberConfig is an alias for HealthConfig.
+type HealthProberConfig = HealthConfig
 
 // DefaultHealthConfig returns standard default prober settings.
 func DefaultHealthConfig() HealthConfig {
@@ -53,6 +57,7 @@ func DefaultHealthConfig() HealthConfig {
 		SelfHealingInterval:  1 * time.Minute,
 		SelfHealingThreshold: 2,
 		DisableSelfHealing:   false,
+		SubnetCIDR:           "10.100.0.0/16",
 	}
 }
 
@@ -68,8 +73,6 @@ type HealthProber struct {
 	probeCanaryFn        CanaryProbeFunc
 	deviceProvider       func(tunnelID int64) PacketDevice
 	devices              map[int64]PacketDevice
-	subnetCIDR           string
-	subnetProvider       func() string
 	multiProtocolEnabled bool
 	onActiveHook         func(ctx context.Context, tunnel *models.BackendTunnel) error
 	onSelfHealHook       func(ctx context.Context, tunnel *models.BackendTunnel) error
@@ -118,6 +121,9 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 	}
 	if cfg.SelfHealingThreshold <= 0 {
 		cfg.SelfHealingThreshold = 2
+	}
+	if cfg.SubnetCIDR == "" {
+		cfg.SubnetCIDR = "10.100.0.0/16"
 	}
 
 	pFn := health.ProbeAWGEndpointRange

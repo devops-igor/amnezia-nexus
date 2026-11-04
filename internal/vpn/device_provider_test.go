@@ -123,18 +123,19 @@ func TestVPNService_DeviceProvider_SubnetCIDRWiring(t *testing.T) {
 		t.Fatalf("expected default subnet 10.100.0.0/16, got %s", got)
 	}
 
-	// HealthProber must receive the subnet via SetDeviceProvider(svc)
+	// HealthProber resolves default subnet 10.100.0.0/16 immutably configured from DefaultHealthConfig
 	if proberSubnet := svc.prober.GetSubnetCIDR(); proberSubnet != "10.100.0.0/16" {
 		t.Fatalf("expected prober to resolve 10.100.0.0/16, got %s", proberSubnet)
 	}
 
-	// Change SubnetCIDR on service config
+	// Service config update affects svc.SubnetCIDR() without causing lock-order inversion on prober
 	svc.cfg.SubnetCIDR = "10.200.0.0/16"
 	if got := svc.SubnetCIDR(); got != "10.200.0.0/16" {
 		t.Fatalf("expected updated subnet 10.200.0.0/16, got %s", got)
 	}
-	if proberSubnet := svc.prober.GetSubnetCIDR(); proberSubnet != "10.200.0.0/16" {
-		t.Fatalf("expected prober to reflect updated 10.200.0.0/16, got %s", proberSubnet)
+	// Prober retains its immutable SubnetCIDR without deadlocking or dynamic cross-lock callbacks
+	if proberSubnet := svc.prober.GetSubnetCIDR(); proberSubnet != "10.100.0.0/16" {
+		t.Fatalf("expected prober to retain immutable subnet 10.100.0.0/16, got %s", proberSubnet)
 	}
 }
 

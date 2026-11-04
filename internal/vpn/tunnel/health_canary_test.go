@@ -246,31 +246,101 @@ func TestHealthProber_SubnetCIDR_Resolution(t *testing.T) {
 		t.Fatalf("expected default 10.100.0.0/16, got %s", got)
 	}
 
-	// Direct configuration
-	hp.SetSubnetCIDR("10.200.0.0/16")
-	if got := hp.GetSubnetCIDR(); got != "10.200.0.0/16" {
+	// Immutable configuration via HealthConfig
+	cfg := DefaultHealthConfig()
+	cfg.SubnetCIDR = "10.200.0.0/16"
+	hpCustom := NewHealthProber(nil, nil, cfg)
+	if got := hpCustom.GetSubnetCIDR(); got != "10.200.0.0/16" {
 		t.Fatalf("expected configured 10.200.0.0/16, got %s", got)
 	}
 
-	// Reset direct configuration
-	hp.SetSubnetCIDR("")
-
-	// Provider fallback
-	type dummySubnetProvider struct{}
-	mockProv := &struct {
-		dummySubnetProvider
-	}{}
-	_ = mockProv
-	hp.SetDeviceProvider(dummyProviderWithSubnet("172.16.0.0/12"))
-	if got := hp.GetSubnetCIDR(); got != "172.16.0.0/12" {
-		t.Fatalf("expected provider subnet 172.16.0.0/12, got %s", got)
+	// Empty SubnetCIDR falls back to default
+	hpEmpty := NewHealthProber(nil, nil, HealthConfig{})
+	if got := hpEmpty.GetSubnetCIDR(); got != "10.100.0.0/16" {
+		t.Fatalf("expected fallback 10.100.0.0/16, got %s", got)
 	}
 }
 
-type dummyProviderWithSubnet string
+func TestHealthProber_ConcurrentMarkAdminDisabledAndCanaryNoDeadlock(t *testing.T) {
+	echoReply := BuildCanaryICMPEchoReply(net.IPv4(1, 1, 1, 1), net.IPv4(10, 100, 0, 1), 0x0713, 1)
+	dev := &mockPacketDevice{
+		replyData: echoReply,
+	}
 
-func (d dummyProviderWithSubnet) SubnetCIDR() string {
-	return string(d)
+	cfg := DefaultHealthConfig()
+	cfg.SubnetCIDR = "10.100.0.0/16"
+	hp := NewHealthProber(nil, nil, cfg)
+	tun := &models.BackendTunnel{
+		ID:       101,
+		ServerID: 1,
+		Status:   models.TunnelStatusActive,
+		Enabled:  true,
+	}
+	hp.RegisterDevice(tun.ID, dev)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	const iterations = 100
+
+	// Worker 1: repeatedly call MarkAdminDisabled (acquires hp.mu.Lock)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				hp.MarkAdminDisabled(tun.ServerID)
+			}
+		}
+	}()
+
+	// Worker 2: repeatedly call ProbeCanary (exercises defaultCanaryProbe and GetSubnetCIDR)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				_ = hp.ProbeCanary(ctx, tun)
+			}
+		}
+	}()
+
+	// Worker 3: repeatedly read GetSubnetCIDR directly
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				if cidr := hp.GetSubnetCIDR(); cidr != "10.100.0.0/16" {
+					t.Errorf("expected subnet 10.100.0.0/16, got %s", cidr)
+					return
+				}
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success: no deadlock
+	case <-ctx.Done():
+		t.Fatal("deadlock detected: concurrent MarkAdminDisabled and ProbeCanary did not complete in time")
+	}
 }
 
 func TestProbePacketDevice_Success(t *testing.T) {
