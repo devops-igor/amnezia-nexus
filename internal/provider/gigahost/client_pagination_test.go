@@ -741,8 +741,6 @@ func TestClient_GetServers_RejectJSONNull(t *testing.T) {
 			body string
 		}{
 			{"explicit empty array", `[]`},
-			{"explicit empty status envelope", `{"meta": {"status": 200}, "data": []}`},
-			{"explicit empty servers envelope", `{"servers": []}`},
 			{"explicit empty envelope with zero total", `{"meta": {"page": 1, "total_pages": 1, "total": 0}, "data": []}`},
 		}
 

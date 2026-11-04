@@ -67,7 +67,7 @@ func TestClient_HTTP402PreservesOrderIDs(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodGet && r.URL.Path == "/servers" {
 					w.WriteHeader(http.StatusOK)
-					_, _ = w.Write([]byte(`{"meta":{"status":200},"data":[]}`))
+					_, _ = w.Write([]byte(`{"meta":{"status":200,"page":1,"total_pages":1,"total":0},"data":[]}`))
 					return
 				}
 				w.WriteHeader(tc.statusCode)
@@ -431,7 +431,7 @@ func TestClient_OrderServerSafe_AmbiguousResponses(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet && r.URL.Path == "/servers" {
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"meta":{"status":200},"data":[]}`))
+				_, _ = w.Write([]byte(`{"meta":{"status":200,"page":1,"total_pages":1,"total":0},"data":[]}`))
 				return
 			}
 			if r.Method == http.MethodPost && r.URL.Path == "/deploy/servers" {
@@ -489,7 +489,7 @@ func TestClient_OrderServerSafe_AmbiguousResponses(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet && r.URL.Path == "/servers" {
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"meta":{"status":200},"data":[]}`))
+				_, _ = w.Write([]byte(`{"meta":{"status":200,"page":1,"total_pages":1,"total":0},"data":[]}`))
 				return
 			}
 			if r.Method == http.MethodPost && r.URL.Path == "/deploy/servers" {
@@ -540,7 +540,7 @@ func TestClient_OrderServerSafe_AmbiguousResponses(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet && r.URL.Path == "/servers" {
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"meta":{"status":200},"data":[]}`))
+				_, _ = w.Write([]byte(`{"meta":{"status":200,"page":1,"total_pages":1,"total":0},"data":[]}`))
 				return
 			}
 			if r.Method == http.MethodPost && r.URL.Path == "/deploy/servers" {

@@ -628,6 +628,7 @@ func TestClient_EdgeCasesAndFallbacks(t *testing.T) {
 					"servers": []ServerInfo{
 						{ID: 20, Name: "S20", Status: "running", IPAddress: "192.0.2.100"},
 					},
+					"meta": map[string]any{"page": 1, "total_pages": 1, "total": 1},
 				})
 			case "/account":
 				_ = json.NewEncoder(w).Encode(map[string]any{
@@ -809,7 +810,7 @@ func TestClient_DocumentedWireContracts(t *testing.T) {
 	})
 
 	t.Run("documented inventory parses srv_id and order identity", func(t *testing.T) {
-		serversJSON := `{"meta":{"status":200},"data":[{"srv_id":"3523","srv_name":"web01","srv_status":true,"srv_primary_ip":"192.0.2.24","order":{"order_id":"3081","product_id":"101"},"datacenter":{"region_id":"1"}}]}`
+		serversJSON := `{"meta":{"status":200,"page":1,"total_pages":1,"total":1},"data":[{"srv_id":"3523","srv_name":"web01","srv_status":true,"srv_primary_ip":"192.0.2.24","order":{"order_id":"3081","product_id":"101"},"datacenter":{"region_id":"1"}}]}`
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(serversJSON))
@@ -868,7 +869,7 @@ func TestClient_DocumentedWireContracts(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet {
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"meta":{"status":200},"data":[]}`))
+				_, _ = w.Write([]byte(`{"meta":{"status":200,"page":1,"total_pages":1,"total":0},"data":[]}`))
 				return
 			}
 			posts.Add(1)
@@ -904,7 +905,7 @@ func TestClient_DocumentedWireContracts(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet {
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"meta":{"status":200},"data":[{"srv_id":"3500","order":{"order_id":"old_10001","product_id":"101"},"datacenter":{"region_id":"1"},"srv_status":true}]}`))
+				_, _ = w.Write([]byte(`{"meta":{"status":200,"page":1,"total_pages":1,"total":1},"data":[{"srv_id":"3500","order":{"order_id":"old_10001","product_id":"101"},"datacenter":{"region_id":"1"},"srv_status":true}]}`))
 				return
 			}
 			posts.Add(1)
@@ -934,7 +935,7 @@ func TestClient_DocumentedWireContracts(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet {
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"meta":{"status":200},"data":[]}`))
+				_, _ = w.Write([]byte(`{"meta":{"status":200,"page":1,"total_pages":1,"total":0},"data":[]}`))
 				return
 			}
 			// Close connection to produce EOF
