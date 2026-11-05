@@ -48,8 +48,8 @@ func TestOrchestrator_Rework13_OuterPass_InnerFail_AllowsNormalFailover(t *testi
 	tun2, _ := db.GetBackendTunnel(ctx, t2)
 	updater := newMockCanaryUpdater(db, tun1, tun2)
 
-	// Outer probe always succeeds
-	orch := New(db, nil, WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+	// Outer probe always succeeds; threshold=1 ensures 1 failure reaches threshold to trigger failover
+	orch := New(db, nil, WithProbeFailureThreshold(1), WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 20 * time.Millisecond, nil
 	}), WithTunnelStatusUpdater(updater))
 

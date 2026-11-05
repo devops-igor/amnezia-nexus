@@ -68,6 +68,7 @@ type Orchestrator struct {
 	healthProbeKeys   map[int64]healthProbeKey
 	probeFailCounts   map[int64]int
 	probeFailVersions map[int64]int64
+	canaryFailCounts  map[int64]int
 
 	running     bool
 	cancel      context.CancelFunc
@@ -169,6 +170,7 @@ func New(db *database.DB, registry ProtocolResolver, opts ...Option) *Orchestrat
 		healthProbeKeys:       make(map[int64]healthProbeKey),
 		probeFailCounts:       make(map[int64]int),
 		probeFailVersions:     make(map[int64]int64),
+		canaryFailCounts:      make(map[int64]int),
 		stopCh:                make(chan struct{}),
 	}
 
@@ -439,4 +441,46 @@ func (o *Orchestrator) revertProbeFailure(tunnelID int64, version int64) {
 	if o.probeFailCounts[tunnelID] > 0 {
 		o.probeFailCounts[tunnelID]--
 	}
+}
+
+// recordProbeFailVersion stores the expected next state version after a failure transition.
+func (o *Orchestrator) recordProbeFailVersion(tunnelID int64, stateVersion int64) {
+	if stateVersion <= 0 {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.probeFailVersions != nil {
+		o.probeFailVersions[tunnelID] = stateVersion + 1
+	}
+}
+
+// recordCanaryFailure increments and returns the consecutive canary failure count for a backend tunnel.
+func (o *Orchestrator) recordCanaryFailure(tunnelID int64) int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.canaryFailCounts == nil {
+		o.canaryFailCounts = make(map[int64]int)
+	}
+	o.canaryFailCounts[tunnelID]++
+	return o.canaryFailCounts[tunnelID]
+}
+
+// ResetCanaryFailCount clears the consecutive canary failure count for a backend tunnel.
+func (o *Orchestrator) ResetCanaryFailCount(tunnelID int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.canaryFailCounts != nil {
+		delete(o.canaryFailCounts, tunnelID)
+	}
+}
+
+// GetCanaryFailCount returns the current consecutive canary failure count for a backend tunnel.
+func (o *Orchestrator) GetCanaryFailCount(tunnelID int64) int {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.canaryFailCounts == nil {
+		return 0
+	}
+	return o.canaryFailCounts[tunnelID]
 }
