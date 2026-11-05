@@ -57,3 +57,11 @@ func (s *Service) HasCanaryProber(t *models.BackendTunnel) bool {
 	}
 	return s.prober.HasCanaryProber(t)
 }
+
+// SetCanarySuccessCallback registers a callback invoked whenever HealthProber verifies inner canary success.
+func (s *Service) SetCanarySuccessCallback(cb func(tunnelID int64)) {
+	if s == nil || s.prober == nil {
+		return
+	}
+	s.prober.SetCanarySuccessCallback(cb)
+}

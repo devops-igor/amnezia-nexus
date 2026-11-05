@@ -360,6 +360,9 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 					}
 					continue
 				}
+
+				// Data plane verified healthy via inner canary; clear failure history
+				o.ResetCanaryFailCount(t.ID)
 			} else {
 				// Already active backend: verify data plane if canary prober is configured.
 				if canaryProber != nil {
@@ -416,6 +419,8 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 				tCopy.LatencyMS = latencyMS
 				healthyTunnels = append(healthyTunnels, &tCopy)
 			}
+		} else if status == "active" {
+			o.ResetCanaryFailCount(t.ID)
 		}
 	}
 

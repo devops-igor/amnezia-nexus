@@ -14,13 +14,14 @@ import (
 )
 
 type mockCanaryUpdater struct {
-	db          *database.DB
-	mu          sync.Mutex
-	tunnels     map[int64]*models.BackendTunnel
-	canaryErr   error
-	canaryCalls int
-	hasCanary   bool
-	updates     []string
+	db              *database.DB
+	mu              sync.Mutex
+	tunnels         map[int64]*models.BackendTunnel
+	canaryErr       error
+	canaryCalls     int
+	hasCanary       bool
+	onCanarySuccess func(tunnelID int64)
+	updates         []string
 }
 
 func newMockCanaryUpdater(db *database.DB, tunnels ...*models.BackendTunnel) *mockCanaryUpdater {
@@ -65,11 +66,22 @@ func (m *mockCanaryUpdater) SetTunnelStatusWithVersion(ctx context.Context, serv
 	return m.SetTunnelStatus(ctx, serverID, status, latencyMS)
 }
 
-func (m *mockCanaryUpdater) ProbeCanary(ctx context.Context, tunnel *models.BackendTunnel) error {
+func (m *mockCanaryUpdater) SetCanarySuccessCallback(cb func(tunnelID int64)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.onCanarySuccess = cb
+}
+
+func (m *mockCanaryUpdater) ProbeCanary(ctx context.Context, tunnel *models.BackendTunnel) error {
+	m.mu.Lock()
 	m.canaryCalls++
-	return m.canaryErr
+	err := m.canaryErr
+	cb := m.onCanarySuccess
+	m.mu.Unlock()
+	if err == nil && cb != nil && tunnel != nil {
+		cb(tunnel.ID)
+	}
+	return err
 }
 
 func (m *mockCanaryUpdater) HasCanaryProber(tunnel *models.BackendTunnel) bool {

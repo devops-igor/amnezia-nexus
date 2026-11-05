@@ -37,6 +37,11 @@ type SessionMigrator interface {
 	MigrateSession(ctx context.Context, sessionID string, targetTunnelID int64) error
 }
 
+// CanarySuccessRegistrar defines an interface for status updaters or probers that can notify when canary probes succeed.
+type CanarySuccessRegistrar interface {
+	SetCanarySuccessCallback(cb func(tunnelID int64))
+}
+
 type healthProbeKey struct {
 	clientPriv string
 	serverPub  string
@@ -180,6 +185,16 @@ func New(db *database.DB, registry ProtocolResolver, opts ...Option) *Orchestrat
 		opt(o)
 	}
 
+	if reg, ok := o.statusUpdater.(CanarySuccessRegistrar); ok {
+		reg.SetCanarySuccessCallback(func(tunnelID int64) {
+			o.ResetCanaryFailCount(tunnelID)
+		})
+	} else if reg, ok := o.sessionMigrator.(CanarySuccessRegistrar); ok {
+		reg.SetCanarySuccessCallback(func(tunnelID int64) {
+			o.ResetCanaryFailCount(tunnelID)
+		})
+	}
+
 	return o
 }
 
@@ -188,6 +203,11 @@ func (o *Orchestrator) SetTunnelStatusUpdater(u TunnelStatusUpdater) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.statusUpdater = u
+	if reg, ok := u.(CanarySuccessRegistrar); ok {
+		reg.SetCanarySuccessCallback(func(tunnelID int64) {
+			o.ResetCanaryFailCount(tunnelID)
+		})
+	}
 }
 
 // SetSessionMigrator configures the session migrator (e.g. VPN service) for live rebalancing (issue #289).
@@ -195,6 +215,11 @@ func (o *Orchestrator) SetSessionMigrator(m SessionMigrator) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.sessionMigrator = m
+	if reg, ok := m.(CanarySuccessRegistrar); ok && o.statusUpdater == nil {
+		reg.SetCanarySuccessCallback(func(tunnelID int64) {
+			o.ResetCanaryFailCount(tunnelID)
+		})
+	}
 }
 
 // Name returns the service identifier for supervisor registration.

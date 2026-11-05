@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -196,6 +197,26 @@ func (hp *HealthProber) ProbeCanary(ctx context.Context, tunnel *models.BackendT
 	return hp.probeCanary(ctx, tunnel)
 }
 
+var (
+	canarySuccessMu        sync.RWMutex
+	canarySuccessCallbacks = make(map[*HealthProber]func(tunnelID int64))
+)
+
+// SetCanarySuccessCallback registers a callback invoked whenever an inner data-plane canary probe
+// succeeds on this HealthProber. Setting a nil callback unregisters the handler.
+func (hp *HealthProber) SetCanarySuccessCallback(cb func(tunnelID int64)) {
+	if hp == nil {
+		return
+	}
+	canarySuccessMu.Lock()
+	defer canarySuccessMu.Unlock()
+	if cb == nil {
+		delete(canarySuccessCallbacks, hp)
+	} else {
+		canarySuccessCallbacks[hp] = cb
+	}
+}
+
 func (hp *HealthProber) probeCanary(ctx context.Context, tunnel *models.BackendTunnel) error {
 	if hp == nil {
 		return errors.New("health prober is nil")
@@ -208,11 +229,29 @@ func (hp *HealthProber) probeCanary(ctx context.Context, tunnel *models.BackendT
 	fn := hp.probeCanaryFn
 	hp.mu.RUnlock()
 
+	var err error
 	if fn != nil {
-		return fn(ctx, tunnel)
+		err = fn(ctx, tunnel)
+	} else {
+		err = hp.defaultCanaryProbe(ctx, tunnel)
 	}
-
-	return hp.defaultCanaryProbe(ctx, tunnel)
+	if err == nil {
+		tID := tunnel.ID
+		if tID == 0 && hp.pool != nil {
+			if pt, pErr := hp.pool.GetTunnel(tunnel.ServerID); pErr == nil && pt != nil {
+				tID = pt.ID
+			}
+		}
+		if tID != 0 {
+			canarySuccessMu.RLock()
+			cb := canarySuccessCallbacks[hp]
+			canarySuccessMu.RUnlock()
+			if cb != nil {
+				cb(tID)
+			}
+		}
+	}
+	return err
 }
 
 func (hp *HealthProber) defaultCanaryProbe(ctx context.Context, tunnel *models.BackendTunnel) error {
