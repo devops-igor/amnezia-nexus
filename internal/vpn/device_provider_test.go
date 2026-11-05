@@ -102,6 +102,7 @@ func (d *testCanaryDevice) ProbeCanary(context.Context, time.Duration) error {
 func TestVPNService_DeviceProvider_ProductionCanaryWiring(t *testing.T) {
 	db := setupTestDB(t)
 	svc, s1, _, _, _ := setupTestVPNService(t, db)
+	svc.SetCanaryProbeFunc(nil)
 	ctx := t.Context()
 
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
@@ -222,6 +223,7 @@ func TestVPNService_CustomSubnetCIDR_CanaryGatewaySourceIP(t *testing.T) {
 	svc, s1, _, _, _ := setupTestVPNService(t, db, func(c *models.VPNConfig) {
 		c.SubnetCIDR = customCIDR
 	})
+	svc.SetCanaryProbeFunc(nil)
 
 	if got := svc.SubnetCIDR(); got != customCIDR {
 		t.Fatalf("expected service subnet %s, got %s", customCIDR, got)

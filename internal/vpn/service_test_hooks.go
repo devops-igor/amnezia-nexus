@@ -17,6 +17,18 @@ func (s *Service) SetProbeFunc(fn tunnel.ProbeFunc) {
 	}
 }
 
+// SetCanaryProbeFunc sets the canary probe function for testing or customized reachability probing.
+func (s *Service) SetCanaryProbeFunc(fn tunnel.CanaryProbeFunc) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.prober != nil {
+		s.prober.SetCanaryProbeFunc(fn)
+	}
+}
+
 // SetBackendDeviceForTest sets a backend device for testing.
 func (s *Service) SetBackendDeviceForTest(tunID int64, dev BackendDevice) {
 	s.mu.Lock()
