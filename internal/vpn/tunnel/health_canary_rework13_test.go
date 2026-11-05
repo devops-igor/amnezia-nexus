@@ -66,16 +66,13 @@ func TestHealthCanary_Rework13_OuterPass_InnerFail_AllowsNormalFailover(t *testi
 		t.Fatal("expected inner canary probe to be executed")
 	}
 
-	// Verify status is degraded, NOT handshake_blocked
+	// Verify status is handshake_blocked under bounded confirmation (preserving established sessions)
 	cur, err := pool.GetTunnel(sID)
 	if err != nil {
 		t.Fatalf("failed to get tunnel: %v", err)
 	}
-	if cur.Status == models.TunnelStatusHandshakeBlocked {
-		t.Fatalf("[BLOCKER 1 REGRESSION] outer PASS / inner FAIL assigned handshake_blocked! Must be degraded")
-	}
-	if cur.Status != models.TunnelStatusDegraded {
-		t.Fatalf("expected status degraded, got %q", cur.Status)
+	if cur.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("expected status %s under bounded confirmation, got %q", models.TunnelStatusHandshakeBlocked, cur.Status)
 	}
 
 	// Verify new client admissions denied
@@ -88,11 +85,11 @@ func TestHealthCanary_Rework13_OuterPass_InnerFail_AllowsNormalFailover(t *testi
 		t.Fatalf("expected canary fail count 1, got %d", fc)
 	}
 
-	// Cycle 2: Second canary failure
+	// Cycle 2: Second canary failure (2 < 3) maintains handshake_blocked
 	_, _ = hp.ProbeTunnel(ctx, tun)
 	cur, _ = pool.GetTunnel(sID)
-	if cur.Status != models.TunnelStatusDegraded {
-		t.Fatalf("expected status degraded on second failure, got %q", cur.Status)
+	if cur.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("expected status %s on second failure below threshold, got %q", models.TunnelStatusHandshakeBlocked, cur.Status)
 	}
 	if fc := hp.GetCanaryFailCount(sID); fc != 2 {
 		t.Fatalf("expected canary fail count 2, got %d", fc)

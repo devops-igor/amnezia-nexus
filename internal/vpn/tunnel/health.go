@@ -473,6 +473,16 @@ func (hp *HealthProber) verifyActiveEligibility(ctx context.Context, snapshot, p
 			if failures >= hp.cfg.FailureThreshold {
 				return false, hp.transitionToThresholdDisabled(ctx, snapshot)
 			}
+			hasActiveSessions := (snapshot != nil && snapshot.ActiveConnections > 0) ||
+				(probeTarget != nil && probeTarget.ActiveConnections > 0)
+			if hp.pool != nil {
+				if cur, err := hp.pool.GetTunnel(probeTarget.ServerID); err == nil && cur != nil && cur.ActiveConnections > 0 {
+					hasActiveSessions = true
+				}
+			}
+			if hasActiveSessions {
+				return false, hp.transitionToHandshakeBlocked(ctx, snapshot)
+			}
 			return false, hp.transitionToDegraded(ctx, snapshot)
 		}
 		hp.mu.Lock()
