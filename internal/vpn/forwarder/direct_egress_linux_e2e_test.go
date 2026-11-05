@@ -95,11 +95,6 @@ func runLinuxE2EEchoServer() {
 	_, _ = io.Copy(io.Discard, os.Stdin)
 }
 
-func htons(v uint16) uint16 {
-	var b [2]byte
-	binary.BigEndian.PutUint16(b[:], v)
-	return binary.NativeEndian.Uint16(b[:])
-}
 
 func checkLinuxCapabilities(t *testing.T) bool {
 	inCI := os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != ""
@@ -239,7 +234,7 @@ func createLinuxE2EWANDevice(name, captureIface string, hostWAN netip.Addr) (*li
 		ifIndex = ifi.Index
 	}
 
-	rawSock, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM, int(htons(unix.ETH_P_IP)))
+	rawSock, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM, int(unix.ETH_P_IP))
 	if err != nil {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("open raw packet socket: %w", err)
@@ -250,7 +245,7 @@ func createLinuxE2EWANDevice(name, captureIface string, hostWAN netip.Addr) (*li
 		return nil, err
 	}
 	sll := &unix.SockaddrLinklayer{
-		Protocol: htons(unix.ETH_P_IP),
+		Protocol: unix.ETH_P_IP,
 		Ifindex:  ifIndex,
 	}
 	if err := unix.Bind(rawSock, sll); err != nil {
