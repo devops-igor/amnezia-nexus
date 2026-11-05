@@ -95,7 +95,6 @@ func runLinuxE2EEchoServer() {
 	_, _ = io.Copy(io.Discard, os.Stdin)
 }
 
-
 func checkLinuxCapabilities(t *testing.T) bool {
 	inCI := os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != ""
 	failOrSkip := func(format string, args ...any) {
@@ -211,6 +210,12 @@ func (d *linuxE2EWANDevice) Close() error {
 	return errors.Join(errs...)
 }
 
+func htons(v uint16) uint16 {
+	var b [2]byte
+	binary.BigEndian.PutUint16(b[:], v)
+	return binary.NativeEndian.Uint16(b[:])
+}
+
 func createLinuxE2EWANDevice(name, captureIface string, hostWAN netip.Addr) (*linuxE2EWANDevice, error) {
 	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_NONBLOCK, 0)
 	if err != nil {
@@ -234,7 +239,7 @@ func createLinuxE2EWANDevice(name, captureIface string, hostWAN netip.Addr) (*li
 		ifIndex = ifi.Index
 	}
 
-	rawSock, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM, int(unix.ETH_P_IP))
+	rawSock, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM, int(htons(unix.ETH_P_IP)))
 	if err != nil {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("open raw packet socket: %w", err)
@@ -245,7 +250,7 @@ func createLinuxE2EWANDevice(name, captureIface string, hostWAN netip.Addr) (*li
 		return nil, err
 	}
 	sll := &unix.SockaddrLinklayer{
-		Protocol: unix.ETH_P_IP,
+		Protocol: htons(unix.ETH_P_IP),
 		Ifindex:  ifIndex,
 	}
 	if err := unix.Bind(rawSock, sll); err != nil {
@@ -351,9 +356,13 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 		t.Fatalf("ip link set netns failed: %v", err)
 	}
 
+	runCmd := func(args ...string) {
+		_ = exec.Command(args[0], args[1:]...).Run()
+	}
+
 	// Host-side WAN interface configuration & kernel forwarding verification
-	_ = exec.Command("ip", "addr", "add", "198.51.100.1/24", "dev", vethHost).Run()
-	_ = exec.Command("ip", "link", "set", vethHost, "up").Run()
+	runCmd("ip", "addr", "add", "198.51.100.1/24", "dev", vethHost)
+	runCmd("ip", "link", "set", vethHost, "up")
 
 	// 3. Create authentic host WAN TUN device with AF_PACKET return capture on vethHost
 	tunDev, err := createLinuxE2EWANDevice(tunName, vethHost, hostWAN)
@@ -362,33 +371,44 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 	}
 	defer func() { _ = tunDev.Close() }()
 
-	_ = exec.Command("ip", "link", "set", tunName, "up").Run()
-	_ = exec.Command("ip", "addr", "add", "10.254.1.1/30", "dev", tunName).Run()
+	runCmd("ip", "link", "set", tunName, "up")
+	runCmd("ip", "addr", "add", "10.254.1.1/30", "dev", tunName)
 
 	// Verify and configure kernel prerequisites: IP forwarding and reverse-path filtering
-	_ = exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
-	_ = exec.Command("sysctl", "-w", "net.ipv4.conf.all.rp_filter=2").Run()
-	_ = exec.Command("sysctl", "-w", fmt.Sprintf("net.ipv4.conf.%s.rp_filter=0", tunName)).Run()
-	_ = exec.Command("sysctl", "-w", fmt.Sprintf("net.ipv4.conf.%s.rp_filter=2", vethHost)).Run()
+	runCmd("sysctl", "-w", "net.ipv4.ip_forward=1")
+	runCmd("sysctl", "-w", "net.ipv4.conf.all.rp_filter=2")
+	runCmd("sysctl", "-w", fmt.Sprintf("net.ipv4.conf.%s.rp_filter=0", tunName))
+	runCmd("sysctl", "-w", fmt.Sprintf("net.ipv4.conf.%s.rp_filter=0", vethHost))
+	runCmd("sysctl", "-w", "net.ipv4.conf.all.accept_local=1")
+	runCmd("sysctl", "-w", fmt.Sprintf("net.ipv4.conf.%s.accept_local=1", tunName))
 
 	// Add test-scoped iptables FORWARD rules to permit traffic between tun and veth in Docker CI
-	_ = exec.Command("iptables", "-I", "FORWARD", "1", "-i", tunName, "-o", vethHost, "-j", "ACCEPT").Run()
-	_ = exec.Command("iptables", "-I", "FORWARD", "2", "-i", vethHost, "-j", "ACCEPT").Run()
+	runCmd("iptables", "-I", "FORWARD", "1", "-i", tunName, "-o", vethHost, "-j", "ACCEPT")
+	runCmd("iptables", "-I", "FORWARD", "2", "-i", vethHost, "-j", "ACCEPT")
 	defer func() {
 		_ = exec.Command("iptables", "-D", "FORWARD", "-i", tunName, "-o", vethHost, "-j", "ACCEPT").Run()
 		_ = exec.Command("iptables", "-D", "FORWARD", "-i", vethHost, "-j", "ACCEPT").Run()
 	}()
 
+	// Install test-scoped iptables INPUT drop rules for hostWANIP and NAT port range (40000-65000)
+	// so the host kernel does not emit TCP RST or ICMP Port Unreachable on return packets
+	runCmd("iptables", "-I", "INPUT", "1", "-d", hostWAN.String(), "-p", "tcp", "--dport", "40000:65000", "-j", "DROP")
+	runCmd("iptables", "-I", "INPUT", "2", "-d", hostWAN.String(), "-p", "udp", "--dport", "40000:65000", "-j", "DROP")
+	defer func() {
+		_ = exec.Command("iptables", "-D", "INPUT", "-d", hostWAN.String(), "-p", "tcp", "--dport", "40000:65000", "-j", "DROP").Run()
+		_ = exec.Command("iptables", "-D", "INPUT", "-d", hostWAN.String(), "-p", "udp", "--dport", "40000:65000", "-j", "DROP").Run()
+	}()
+
 	// Route traffic for the second network (198.51.200.0/24) via external gateway on veth
-	_ = exec.Command("ip", "route", "add", "198.51.200.0/24", "via", "198.51.100.2", "dev", vethHost).Run()
+	runCmd("ip", "route", "add", "198.51.200.0/24", "via", "198.51.100.2", "dev", vethHost)
 
 	// Configure external WAN namespace
-	_ = exec.Command("ip", "-n", netnsName, "link", "set", "lo", "up").Run()
-	_ = exec.Command("ip", "-n", netnsName, "addr", "add", "198.51.100.2/24", "dev", vethWAN).Run()
-	_ = exec.Command("ip", "-n", netnsName, "link", "set", vethWAN, "up").Run()
-	_ = exec.Command("ip", "-n", netnsName, "addr", "add", "198.51.200.2/32", "dev", "lo").Run()
-	_ = exec.Command("ip", "-n", netnsName, "route", "add", "default", "via", "198.51.100.1", "dev", vethWAN).Run()
-	_ = exec.Command("ip", "-n", netnsName, "sysctl", "-w", "net.ipv4.ip_forward=1").Run()
+	runCmd("ip", "-n", netnsName, "link", "set", "lo", "up")
+	runCmd("ip", "-n", netnsName, "addr", "add", "198.51.100.2/24", "dev", vethWAN)
+	runCmd("ip", "-n", netnsName, "link", "set", vethWAN, "up")
+	runCmd("ip", "-n", netnsName, "addr", "add", "198.51.200.2/32", "dev", "lo")
+	runCmd("ip", "-n", netnsName, "route", "add", "default", "via", "198.51.100.1", "dev", vethWAN)
+	runCmd("ip", "netns", "exec", netnsName, "sysctl", "-w", "net.ipv4.ip_forward=1")
 
 	// 4. Start live TCP and UDP echo server inside the netns
 	cmd := exec.Command("ip", "netns", "exec", netnsName, os.Args[0], "-test.run=TestHelperPlaceholder")
