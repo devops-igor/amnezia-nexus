@@ -488,11 +488,15 @@ func NewProductionWANDevice(name string) (forwarder.PacketDevice, error) {
 	// Configure accept_local=1 on the TUN interface so locally sourced SNAT packets are accepted
 	devAcceptLocalPath := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/accept_local", actualName)
 	if err := setAcceptLocal(devAcceptLocalPath, fmt.Sprintf("net.ipv4.conf.%s.accept_local", actualName)); err != nil {
-		if !isAllAcceptLocalEnabled() {
+		// Fallback: if the per-device value is already 1, proceed; otherwise
+		// fail closed only if neither host-wide nor per-device accept_local is enabled.
+		devData, devErr := os.ReadFile(devAcceptLocalPath)
+		alreadyEnabled := devErr == nil && strings.TrimSpace(string(devData)) == "1"
+		if !alreadyEnabled && !isAllAcceptLocalEnabled() {
 			_ = unix.Close(fd)
 			return nil, fmt.Errorf("enable accept_local for %s: %w", actualName, err)
 		}
-		log.Printf("[vpn] warning: enable per-device accept_local for %s failed (%v), but all.accept_local is enabled", actualName, err)
+		log.Printf("[vpn] warning: enable per-device accept_local for %s failed (%v), but accept_local is already enabled", actualName, err)
 	}
 
 	// Inbound return path packet reader: raw packet socket on host network interface

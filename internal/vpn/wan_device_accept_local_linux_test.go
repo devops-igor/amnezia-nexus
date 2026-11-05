@@ -75,6 +75,9 @@ func TestIsAllAcceptLocalEnabled(t *testing.T) {
 }
 
 func TestSetAcceptLocal_ReadOnlyFileFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permission bits; read-only test not meaningful as non-root")
+	}
 	tmpDir := t.TempDir()
 	procFile := filepath.Join(tmpDir, "accept_local")
 	if err := os.WriteFile(procFile, []byte("0\n"), 0400); err != nil {
