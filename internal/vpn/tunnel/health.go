@@ -463,12 +463,8 @@ func (hp *HealthProber) verifyActiveEligibility(ctx context.Context, snapshot, p
 				hp.mu.Unlock()
 				return false, err
 			}
-			if hp.canaryFailCounts == nil {
-				hp.canaryFailCounts = make(map[int64]int)
-			}
-			hp.canaryFailCounts[probeTarget.ServerID]++
-			failures := hp.canaryFailCounts[probeTarget.ServerID]
 			hp.mu.Unlock()
+			failures := hp.recordCanaryFailure(probeTarget.ServerID)
 
 			if failures >= hp.cfg.FailureThreshold {
 				return false, hp.transitionToThresholdDisabled(ctx, snapshot)
@@ -485,11 +481,7 @@ func (hp *HealthProber) verifyActiveEligibility(ctx context.Context, snapshot, p
 			}
 			return false, hp.transitionToDegraded(ctx, snapshot)
 		}
-		hp.mu.Lock()
-		if hp.canaryFailCounts != nil {
-			hp.canaryFailCounts[probeTarget.ServerID] = 0
-		}
-		hp.mu.Unlock()
+		hp.resetCanaryFailure(probeTarget.ServerID)
 		return true, nil
 	}
 
@@ -692,22 +684,27 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 		if cur, err := hp.pool.GetTunnel(snapshot.ServerID); err == nil && cur != nil && cur.ActiveConnections > 0 {
 			hasActiveSessions = true
 		}
-		viable := false
+		var transErr error
 		if hp.hasCanaryProber(snapshot) {
-			if canaryErr := hp.probeCanary(ctx, snapshot); canaryErr == nil {
-				viable = true
+			if canaryErr := hp.probeCanary(ctx, snapshot); canaryErr != nil {
+				canaryFails := hp.recordCanaryFailure(snapshot.ServerID)
+				if canaryFails >= hp.cfg.FailureThreshold {
+					transErr = hp.transitionToThresholdDisabled(ctx, snapshot)
+				} else if hasActiveSessions {
+					transErr = hp.transitionToHandshakeBlocked(ctx, snapshot)
+				} else {
+					transErr = hp.transitionToDegraded(ctx, snapshot)
+				}
+			} else {
+				transErr = hp.transitionToHandshakeBlocked(ctx, snapshot)
 			}
 		} else if hasActiveSessions {
-			viable = true
-		}
-		if viable {
-			if err := hp.transitionToHandshakeBlocked(ctx, snapshot); err != nil {
-				return 0, err
-			}
+			transErr = hp.transitionToHandshakeBlocked(ctx, snapshot)
 		} else {
-			if err := hp.transitionToDegraded(ctx, snapshot); err != nil {
-				return 0, err
-			}
+			transErr = hp.transitionToDegraded(ctx, snapshot)
+		}
+		if transErr != nil {
+			return 0, transErr
 		}
 	}
 	if err := hp.checkTunnelAvailable(snapshot); errors.Is(err, ErrTunnelNotFound) {

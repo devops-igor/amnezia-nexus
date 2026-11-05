@@ -236,11 +236,21 @@ func (hp *HealthProber) probeCanary(ctx context.Context, tunnel *models.BackendT
 		err = hp.defaultCanaryProbe(ctx, tunnel)
 	}
 	if err == nil {
+		sID := tunnel.ServerID
 		tID := tunnel.ID
-		if tID == 0 && hp.pool != nil {
-			if pt, pErr := hp.pool.GetTunnel(tunnel.ServerID); pErr == nil && pt != nil {
-				tID = pt.ID
+		if hp.pool != nil {
+			if sID == 0 && tID != 0 {
+				if pt, pErr := hp.pool.GetTunnelByID(tID); pErr == nil && pt != nil {
+					sID = pt.ServerID
+				}
+			} else if sID != 0 && tID == 0 {
+				if pt, pErr := hp.pool.GetTunnel(sID); pErr == nil && pt != nil {
+					tID = pt.ID
+				}
 			}
+		}
+		if sID != 0 {
+			hp.resetCanaryFailure(sID)
 		}
 		if tID != 0 {
 			canarySuccessMu.RLock()
@@ -252,6 +262,24 @@ func (hp *HealthProber) probeCanary(ctx context.Context, tunnel *models.BackendT
 		}
 	}
 	return err
+}
+
+func (hp *HealthProber) recordCanaryFailure(serverID int64) int {
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	if hp.canaryFailCounts == nil {
+		hp.canaryFailCounts = make(map[int64]int)
+	}
+	hp.canaryFailCounts[serverID]++
+	return hp.canaryFailCounts[serverID]
+}
+
+func (hp *HealthProber) resetCanaryFailure(serverID int64) {
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	if hp.canaryFailCounts != nil {
+		hp.canaryFailCounts[serverID] = 0
+	}
 }
 
 func (hp *HealthProber) defaultCanaryProbe(ctx context.Context, tunnel *models.BackendTunnel) error {

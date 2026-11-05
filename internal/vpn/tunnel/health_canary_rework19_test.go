@@ -251,3 +251,127 @@ func TestHealthCanary_Rework19_OuterPass_HandshakeBlocked_WithSessions_NoCanary_
 		t.Fatalf("expected 0 active tunnels for client admission, got %d", len(active))
 	}
 }
+
+// TestHealthCanary_Rework20_OuterFailureSibling_PreservesHandshakeBlocked_UnderBoundedConfirmation verifies [HIGH F14]:
+// When an established backend is in handshake_blocked status and the next probe experiences outer handshake failure,
+// handleProbeFailure must evaluate the inner canary probe under bounded confirmation and maintain handshake_blocked
+// until consecutive inner failures reach FailureThreshold.
+func TestHealthCanary_Rework20_OuterFailureSibling_PreservesHandshakeBlocked_UnderBoundedConfirmation(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	pool := NewPool(db)
+
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "Sibling-Server", Host: "10.0.0.84"})
+	tun, _ := pool.AddTunnel(ctx, sID, "10.0.0.84:51820", "pubkey-rework20-1")
+	_ = pool.SetTunnelStatus(ctx, sID, models.TunnelStatusActive, 20)
+	pool.IncrementConnections(sID) // established session
+
+	cfg := DefaultHealthConfig()
+	cfg.FailureThreshold = 3
+
+	var outerShouldFail atomic.Bool
+	outerProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		if outerShouldFail.Load() {
+			return 0, errors.New("simulated outer handshake failure")
+		}
+		return 15 * time.Millisecond, nil
+	}
+
+	hp := NewHealthProber(pool, db, cfg, outerProbe)
+	hp.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		return errors.New("simulated inner canary timeout")
+	})
+
+	// Pass 1: Outer PASS, Inner FAIL -> handshake_blocked (inner count = 1)
+	_, _ = hp.ProbeTunnel(ctx, tun)
+	cur, _ := pool.GetTunnel(sID)
+	if cur.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("Pass 1: expected status %s, got %s", models.TunnelStatusHandshakeBlocked, cur.Status)
+	}
+	if fc := hp.GetCanaryFailCount(sID); fc != 1 {
+		t.Fatalf("Pass 1: expected canary fail count 1, got %d", fc)
+	}
+
+	// Pass 2: Outer FAIL, Inner FAIL (outer-failure sibling path) -> maintains handshake_blocked (inner count = 2)
+	outerShouldFail.Store(true)
+	_, _ = hp.ProbeTunnel(ctx, tun)
+	cur2, _ := pool.GetTunnel(sID)
+	if cur2.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("[HIGH F14 REGRESSION] Pass 2: outer failure sibling degraded established backend! got status %s", cur2.Status)
+	}
+	if fc := hp.GetCanaryFailCount(sID); fc != 2 {
+		t.Fatalf("Pass 2: expected canary fail count 2, got %d", fc)
+	}
+
+	// Pass 3: Outer FAIL, Inner FAIL -> reaches FailureThreshold (3 >= 3) -> transitions to disabled
+	_, _ = hp.ProbeTunnel(ctx, tun)
+	cur3, _ := pool.GetTunnel(sID)
+	if cur3.Status != models.TunnelStatusDisabled {
+		t.Fatalf("Pass 3: expected status %s after reaching threshold, got %s", models.TunnelStatusDisabled, cur3.Status)
+	}
+}
+
+// TestHealthCanary_Rework20_SharedProbeCanarySuccess_ClearsHealthProberFailCount verifies [HIGH F15]:
+// When an established backend has an inner failure recorded by HealthProber (canaryFailCount=1),
+// and a subsequent inner canary probe succeeds via hp.ProbeCanary (shared dispatcher),
+// HealthProber's own failure counter MUST be reset to 0.
+func TestHealthCanary_Rework20_SharedProbeCanarySuccess_ClearsHealthProberFailCount(t *testing.T) {
+	ctx := context.Background()
+	db := setupTestDB(t)
+	pool := NewPool(db)
+
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "Streak-Server", Host: "10.0.0.85"})
+	tun, _ := pool.AddTunnel(ctx, sID, "10.0.0.85:51820", "pubkey-rework20-2")
+	_ = pool.SetTunnelStatus(ctx, sID, models.TunnelStatusActive, 20)
+	pool.IncrementConnections(sID) // established session
+
+	cfg := DefaultHealthConfig()
+	cfg.FailureThreshold = 3
+
+	outerProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 15 * time.Millisecond, nil
+	}
+
+	hp := NewHealthProber(pool, db, cfg, outerProbe)
+
+	var canaryShouldFail atomic.Bool
+	canaryShouldFail.Store(true)
+	hp.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		if canaryShouldFail.Load() {
+			return errors.New("simulated canary failure")
+		}
+		return nil
+	})
+
+	// Pass 1: Outer PASS, Inner FAIL -> handshake_blocked, canaryFailCount = 1
+	_, _ = hp.ProbeTunnel(ctx, tun)
+	cur, _ := pool.GetTunnel(sID)
+	if cur.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("Pass 1: expected status %s, got %s", models.TunnelStatusHandshakeBlocked, cur.Status)
+	}
+	if fc := hp.GetCanaryFailCount(sID); fc != 1 {
+		t.Fatalf("Pass 1: expected canary fail count 1, got %d", fc)
+	}
+
+	// Intervening shared inner canary probe succeeds (e.g. called by Service.ProbeCanary during scheduler check)
+	canaryShouldFail.Store(false)
+	if err := hp.ProbeCanary(ctx, tun); err != nil {
+		t.Fatalf("ProbeCanary failed: %v", err)
+	}
+
+	// [HIGH F15 CHECK]: HealthProber's own canaryFailCount MUST be reset to 0!
+	if fc := hp.GetCanaryFailCount(sID); fc != 0 {
+		t.Fatalf("[HIGH F15 REGRESSION] HealthProber canary fail count not reset on inner canary success! got %d", fc)
+	}
+
+	// Subsequent failure is recorded as 1, NOT 2
+	canaryShouldFail.Store(true)
+	_, _ = hp.ProbeTunnel(ctx, tun)
+	cur2, _ := pool.GetTunnel(sID)
+	if cur2.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("Pass 2: expected status %s, got %s", models.TunnelStatusHandshakeBlocked, cur2.Status)
+	}
+	if fc := hp.GetCanaryFailCount(sID); fc != 1 {
+		t.Fatalf("Pass 2: expected canary fail count 1 after recovery, got %d", fc)
+	}
+}
