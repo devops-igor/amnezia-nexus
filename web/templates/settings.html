@@ -695,11 +695,19 @@
     async function triggerGigahostSetup(orderId) {
         const password = prompt(_('deploy_ssh_password_prompt') || 'Enter SSH Password for VPS:');
         if (!password) return;
+        const protoChoice = (prompt(_('deploy_protocol_prompt') || 'Select protocol (awg, vless, naive):', 'awg') || 'awg').toLowerCase().trim();
+        const protocol = (protoChoice === 'vless' || protoChoice === 'naive') ? protoChoice : 'awg';
+        let tlsDomain = '';
+        if (protocol === 'naive' || protocol === 'vless') {
+            tlsDomain = prompt(_('deploy_domain_prompt') || 'Enter TLS domain (required for naive, optional for vless):') || '';
+        }
         UI.toast(_('deploy_status_polling') || 'Setting up VPN backend...', 'info');
         try {
             await API.post('/api/admin/hosting/gigahost/orders/' + encodeURIComponent(orderId) + '/setup', {
                 ssh_password: password,
-                protocol: 'awg'
+                protocol: protocol,
+                tls_domain: tlsDomain,
+                confirm_host_key: true
             });
             UI.toast(_('success') || 'Setup completed', 'success');
         } catch (err) {
@@ -726,12 +734,28 @@
                 return;
             }
             scheduleRecentOrdersPolling(orders);
+
+            // Enrich active/recent orders with deploy status DTO diagnostics
+            await Promise.all(orders.slice(0, 5).map(async (o) => {
+                if (!o.order_id) return;
+                try {
+                    const st = await API.get('/api/admin/hosting/gigahost/orders/' + encodeURIComponent(o.order_id) + '/status');
+                    if (st) {
+                        if (st.step) o.step = st.step;
+                        if (st.error) o.last_error = st.error;
+                        if (st.server_id) o.nexus_server_id = st.server_id;
+                        if (st.status === 'failed') o.status = 'failed';
+                        else if (st.status === 'ready' && st.server_id > 0) o.nexus_onboarded = true;
+                    }
+                } catch (_) {}
+            }));
+
             const list = document.createElement('div');
             list.style.display = 'flex';
             list.style.flexDirection = 'column';
             list.style.gap = '6px';
             orders.slice(0, 5).forEach(o => {
-                const badgeClass = o.status === 'ready' ? 'badge-success' : (o.status === 'failed' ? 'badge-danger' : 'badge-warn');
+                const badgeClass = (o.status === 'ready' && o.nexus_onboarded) ? 'badge-success' : (o.status === 'failed' ? 'badge-danger' : 'badge-warn');
                 const row = document.createElement('div');
                 row.style.display = 'flex';
                 row.style.justifyContent = 'space-between';
@@ -755,7 +779,7 @@
                     left.appendChild(ipSpan);
                 }
 
-                if (o.step && o.status !== 'ready') {
+                if (o.step && (!o.nexus_onboarded || o.status !== 'ready')) {
                     const stepSpan = document.createElement('span');
                     stepSpan.style.fontSize = '0.75rem';
                     stepSpan.style.marginLeft = '8px';
@@ -781,7 +805,7 @@
                 const badge = document.createElement('span');
                 badge.className = 'badge ' + badgeClass;
                 badge.style.fontSize = '0.75rem';
-                badge.textContent = o.status || '';
+                badge.textContent = (o.status === 'ready' && !o.nexus_onboarded) ? 'vps_ready' : (o.status || '');
                 right.appendChild(badge);
 
                 if (o.status === 'failed') {
@@ -793,7 +817,7 @@
                     btnRetry.textContent = _('deploy_retry_btn') || 'Retry';
                     btnRetry.addEventListener('click', () => triggerGigahostSetup(o.order_id));
                     right.appendChild(btnRetry);
-                } else if (o.status !== 'ready' && o.assigned_ip) {
+                } else if ((!o.nexus_onboarded || o.status !== 'ready') && o.assigned_ip) {
                     const btnSetup = document.createElement('button');
                     btnSetup.type = 'button';
                     btnSetup.className = 'btn btn-primary';

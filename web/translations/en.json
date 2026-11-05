@@ -728,5 +728,7 @@
   "deploy_setup_btn": "Setup Backend",
   "deploy_retry_btn": "Retry",
   "deploy_ssh_password_prompt": "Enter SSH Password for VPS:",
-  "deploy_status_polling": "Setting up VPN backend..."
+  "deploy_status_polling": "Setting up VPN backend...",
+  "deploy_protocol_prompt": "Select protocol (awg, vless, naive):",
+  "deploy_domain_prompt": "Enter TLS domain (required for naive, optional for vless):"
 }

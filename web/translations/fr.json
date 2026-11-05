@@ -728,5 +728,7 @@
   "deploy_setup_btn": "Configurer",
   "deploy_retry_btn": "Réessayer",
   "deploy_ssh_password_prompt": "Entrez le mot de passe SSH pour le VPS :",
-  "deploy_status_polling": "Configuration du serveur VPN..."
+  "deploy_status_polling": "Configuration du serveur VPN...",
+  "deploy_protocol_prompt": "Sélectionnez le protocole (awg, vless, naive) :",
+  "deploy_domain_prompt": "Entrez le domaine TLS (requis pour naive, optionnel pour vless) :"
 }

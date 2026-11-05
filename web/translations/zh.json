@@ -728,5 +728,7 @@
   "deploy_setup_btn": "配置后端",
   "deploy_retry_btn": "重试",
   "deploy_ssh_password_prompt": "输入 VPS 的 SSH 密码：",
-  "deploy_status_polling": "正在配置 VPN 后端..."
+  "deploy_status_polling": "正在配置 VPN 后端...",
+  "deploy_protocol_prompt": "选择协议 (awg, vless, naive)：",
+  "deploy_domain_prompt": "输入 TLS 域名（naive 必需，vless 可选）："
 }

@@ -17,6 +17,12 @@ type BackendTunnelOptions struct {
 	ProtocolParams json.RawMessage
 }
 
+type deployEnrollmentContextKey struct{}
+
+// DeployEnrollmentKey is used in context to signal that initial enrollment
+// should start in non-eligible connecting status until traffic is qualified.
+var DeployEnrollmentKey = deployEnrollmentContextKey{}
+
 // AddTunnel establishes or registers an in-process AWG backend tunnel for a server.
 // Optional options allow specifying protocol and protocol parameters.
 func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPubKey string, opts ...BackendTunnelOptions) (*models.BackendTunnel, error) {
@@ -217,6 +223,12 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 		_ = probePrivPub
 
 		ifName := fmt.Sprintf("awg-be-%d", serverID)
+		initStatus := models.TunnelStatusActive
+		initLatency := int64(10)
+		if ctx != nil && (ctx.Value(DeployEnrollmentKey) != nil || opts.Protocol != "") {
+			initStatus = models.TunnelStatusConnecting
+			initLatency = 0
+		}
 		tunnel = &models.BackendTunnel{
 			ServerID:          serverID,
 			InterfaceName:     ifName,
@@ -225,11 +237,11 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 			ProbePrivateKey:   probePrivKey,
 			Endpoint:          endpoint,
 			Enabled:           true,
-			Status:            models.TunnelStatusActive,
+			Status:            initStatus,
 			DisableReason:     models.DisableReasonNone,
 			StateVersion:      1,
-			LastHealthCheck:   &now,
-			LatencyMS:         10,
+			LastHealthCheck:   nil,
+			LatencyMS:         initLatency,
 			ActiveConnections: 0,
 			CreatedAt:         now,
 			Protocol:          models.ProtocolAWG,

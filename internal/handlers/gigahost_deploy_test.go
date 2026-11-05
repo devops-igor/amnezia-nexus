@@ -51,6 +51,9 @@ func setupDeployTestEnv(t *testing.T) (*Handlers, *chi.Mux, *mockGigahostClient)
 		t.Fatalf("failed to init vpn service: %v", err)
 	}
 	h.vpnSvc = vpnSvc
+	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 10 * time.Millisecond, nil
+	})
 
 	mockClient := &mockGigahostClient{
 		getDeployStatusFn: func(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error) {
@@ -89,7 +92,7 @@ func setupDeployTestEnv(t *testing.T) (*Handlers, *chi.Mux, *mockGigahostClient)
 			server.Protocols["awg"] = map[string]any{
 				"installed":  true,
 				"port":       float64(51820),
-				"public_key": "x9aB1234567890abcdef1234567890abcdef123456=",
+				"public_key": "x9aB1234567890abcdef1234567890abcdef1234567=",
 			}
 			return nil
 		},
@@ -569,7 +572,7 @@ func TestGigahostDeploy_RestartResumeBehavior(t *testing.T) {
 			server.Protocols["awg"] = map[string]any{
 				"installed":  true,
 				"port":       float64(51820),
-				"public_key": "x9aB1234567890abcdef1234567890abcdef123456=",
+				"public_key": "x9aB1234567890abcdef1234567890abcdef1234567=",
 			}
 			return nil
 		},

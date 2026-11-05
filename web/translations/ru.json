@@ -728,5 +728,7 @@
   "deploy_setup_btn": "Настроить",
   "deploy_retry_btn": "Повторить",
   "deploy_ssh_password_prompt": "Введите SSH пароль для VPS:",
-  "deploy_status_polling": "Настройка VPN сервера..."
+  "deploy_status_polling": "Настройка VPN сервера...",
+  "deploy_protocol_prompt": "Выберите протокол (awg, vless, naive):",
+  "deploy_domain_prompt": "Введите TLS домен (обязательно для naive, опционально для vless):"
 }

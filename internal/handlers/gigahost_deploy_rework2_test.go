@@ -263,14 +263,15 @@ func TestRework2_RetryFailureDisablesBackend(t *testing.T) {
 // and is not admitted to the healthy load balancer pool before traffic qualification (F3).
 func TestRework2_AWGNonEligibleBeforeTrafficQualification(t *testing.T) {
 	h, _, _ := setupDeployTestEnv(t)
-	st, err := h.DeployGigahostOrder(context.Background(), GigahostDeployRequest{
-		OrderID:     "rework2-awg-traffic",
-		SSHPassword: "fixture-only",
-		Protocol:    models.ProtocolAWG,
+	h.vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 0, errors.New("unqualified traffic")
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	st, _ := h.DeployGigahostOrder(context.Background(), GigahostDeployRequest{
+		OrderID:        "rework2-awg-traffic",
+		SSHPassword:    "fixture-only",
+		Protocol:       models.ProtocolAWG,
+		ConfirmHostKey: true,
+	})
 
 	tun, err := h.vpnSvc.GetTunnel(st.ServerID)
 	if err != nil {

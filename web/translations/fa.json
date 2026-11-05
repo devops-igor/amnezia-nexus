@@ -728,5 +728,7 @@
   "deploy_setup_btn": "راه‌اندازی سرور",
   "deploy_retry_btn": "تلاش مجدد",
   "deploy_ssh_password_prompt": "رمز عبور SSH برای سرور مجازی را وارد کنید:",
-  "deploy_status_polling": "در حال راه‌اندازی سرور VPN..."
+  "deploy_status_polling": "در حال راه‌اندازی سرور VPN...",
+  "deploy_protocol_prompt": "پروتکل را انتخاب کنید (awg, vless, naive):",
+  "deploy_domain_prompt": "دامنه TLS را وارد کنید (برای naive الزامی، برای vless اختیاری):"
 }
