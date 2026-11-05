@@ -261,6 +261,28 @@ func (hp *HealthProber) invokeSelfHealHook(ctx context.Context, tunNow *models.B
 	return true
 }
 
+func (hp *HealthProber) determineSelfHealStatus(
+	ctx context.Context,
+	tun *models.BackendTunnel,
+	latencyMS int64,
+	latencyThreshold int64,
+) string {
+	if hp.hasCanaryProber(tun) {
+		if canaryErr := hp.probeCanary(ctx, tun); canaryErr != nil {
+			slog.Warn("self-healing outer probe succeeded but inner canary failed; promoting to handshake_blocked",
+				"server_id", tun.ServerID,
+				"tunnel_id", tun.ID,
+				"error", canaryErr,
+			)
+			return models.TunnelStatusHandshakeBlocked
+		}
+	}
+	if latencyMS > latencyThreshold {
+		return "degraded"
+	}
+	return "active"
+}
+
 func (hp *HealthProber) finalizeSelfHealRecovery(
 	ctx context.Context,
 	tun *models.BackendTunnel,
@@ -285,10 +307,7 @@ func (hp *HealthProber) finalizeSelfHealRecovery(
 		return false
 	}
 
-	newStatus := "active"
-	if latencyMS > latencyThreshold {
-		newStatus = "degraded"
-	}
+	newStatus := hp.determineSelfHealStatus(ctx, tunAfterHook, latencyMS, latencyThreshold)
 
 	swapped, err := hp.pool.CompareAndSwapTunnelStatusForTunnel(
 		ctx,
