@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -355,6 +356,18 @@ func (m *mockTimeoutProtocolManager) resetDeadline() {
 	m.deadlineFound = false
 }
 
+func (m *mockTimeoutProtocolManager) unblock() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.blockChan != nil {
+		select {
+		case <-m.blockChan:
+		default:
+			close(m.blockChan)
+		}
+	}
+}
+
 func TestProductionRouter_EffectiveContextTimeouts(t *testing.T) {
 	db, cfg := setupTestRouterDB(t)
 	mgr := &mockTimeoutProtocolManager{protocol: "awg"}
@@ -526,13 +539,36 @@ func TestProductionRouter_EffectiveContextTimeouts(t *testing.T) {
 	})
 }
 
-func TestProductionRouter_RequestCancellation(t *testing.T) {
+type testFataler interface {
+	Fatal(args ...any)
+	Fatalf(format string, args ...any)
+}
+
+type mockTestFataler struct {
+	failed  bool
+	message string
+}
+
+func (m *mockTestFataler) Fatal(args ...any) {
+	m.failed = true
+	m.message = fmt.Sprint(args...)
+}
+
+func (m *mockTestFataler) Fatalf(format string, args ...any) {
+	m.failed = true
+	m.message = fmt.Sprintf(format, args...)
+}
+
+func setupCancellationTestServer(t *testing.T) (*mockTimeoutProtocolManager, http.Handler, int64) {
+	t.Helper()
 	db, cfg := setupTestRouterDB(t)
 	mgr := &mockTimeoutProtocolManager{
 		protocol:       "awg",
 		blockChan:      make(chan struct{}),
 		cancelObserved: make(chan struct{}),
 	}
+	t.Cleanup(mgr.unblock)
+
 	reg := manager.NewRegistry()
 	reg.Register(mgr)
 
@@ -557,13 +593,15 @@ func TestProductionRouter_RequestCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create server: %v", err)
 	}
+	return mgr, r, serverID
+}
 
+func newCancellationTestRequest(ctx context.Context, serverID int64) *http.Request {
 	body, _ := json.Marshal(models.InstallProtocolRequest{
 		Protocol: "awg",
 		Port:     "55424",
 	})
-	reqCtx, reqCancel := context.WithCancel(context.Background())
-	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/install", serverID), bytes.NewReader(body)).WithContext(reqCtx)
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/servers/%d/install", serverID), bytes.NewReader(body)).WithContext(ctx)
 	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
 		UserID:   "admin-id",
 		Username: "admin",
@@ -573,7 +611,56 @@ func TestProductionRouter_RequestCancellation(t *testing.T) {
 	req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: "csrf-token-test"})
 	req.Header.Set(middleware.CSRFHeaderName, "csrf-token-test")
 	req.Header.Set("Content-Type", "application/json")
+	return req
+}
 
+func runProductionRouterCancellationGuard(
+	tb testFataler,
+	r http.Handler,
+	req *http.Request,
+	rec *httptest.ResponseRecorder,
+	mgr *mockTimeoutProtocolManager,
+	guardTimeout time.Duration,
+) {
+	reqDone := make(chan struct{})
+	go func() {
+		defer close(reqDone)
+		r.ServeHTTP(rec, req)
+	}()
+
+	select {
+	case <-mgr.cancelObserved:
+		// cancellation successfully propagated to protocol manager
+	case <-time.After(guardTimeout):
+		mgr.unblock()
+		select {
+		case <-reqDone:
+		case <-time.After(2 * time.Second):
+			tb.Fatal("handler failed to exit after unblocking mock")
+			return
+		}
+		tb.Fatal("expected client cancellation to immediately cancel handler context on production router")
+		return
+	}
+
+	select {
+	case <-reqDone:
+	case <-time.After(2 * time.Second):
+		tb.Fatal("handler failed to exit after cancellation")
+		return
+	}
+
+	if rec.Code != http.StatusInternalServerError {
+		tb.Fatalf("expected 500 status when canceled, got %d", rec.Code)
+	}
+}
+
+func TestProductionRouter_RequestCancellation(t *testing.T) {
+	mgr, r, serverID := setupCancellationTestServer(t)
+
+	reqCtx, reqCancel := context.WithCancel(context.Background())
+	defer reqCancel()
+	req := newCancellationTestRequest(reqCtx, serverID)
 	rec := httptest.NewRecorder()
 
 	go func() {
@@ -581,16 +668,25 @@ func TestProductionRouter_RequestCancellation(t *testing.T) {
 		reqCancel()
 	}()
 
-	r.ServeHTTP(rec, req)
+	runProductionRouterCancellationGuard(t, r, req, rec, mgr, 3*time.Second)
+}
 
-	select {
-	case <-mgr.cancelObserved:
-		// cancellation successfully propagated to protocol manager
-	case <-time.After(3 * time.Second):
-		t.Fatal("expected client cancellation to immediately cancel handler context on production router")
+func TestProductionRouter_RequestCancellation_UnpropagatedGuardTimeout(t *testing.T) {
+	mgr, r, serverID := setupCancellationTestServer(t)
+
+	// Context is intentionally not canceled to simulate a regression where
+	// client cancellation fails to propagate and the mock backend remains blocked.
+	req := newCancellationTestRequest(context.Background(), serverID)
+	rec := httptest.NewRecorder()
+	mockTB := &mockTestFataler{}
+
+	runProductionRouterCancellationGuard(mockTB, r, req, rec, mgr, 100*time.Millisecond)
+
+	if !mockTB.failed {
+		t.Fatal("expected cancellation guard to fail when cancellation does not propagate")
 	}
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500 status when canceled, got %d", rec.Code)
+	expectedMsg := "expected client cancellation to immediately cancel handler context on production router"
+	if !strings.Contains(mockTB.message, expectedMsg) {
+		t.Fatalf("expected fatal message %q, got %q", expectedMsg, mockTB.message)
 	}
 }
