@@ -274,6 +274,11 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 			return nil, fmt.Errorf("failed to persist backend tunnel: %w", err)
 		}
 		tunnel.ID = id
+		if ctx != nil && ctx.Value(DeployEnrollmentKey) != nil {
+			writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_ = p.db.SetBackendPendingEnrollment(writeCtx, serverID, true)
+		}
 	} else {
 		tunnel.ID = serverID
 	}

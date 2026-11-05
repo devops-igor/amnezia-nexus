@@ -126,7 +126,7 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 		pFn = probeFn[0]
 	}
 
-	return &HealthProber{
+	hp := &HealthProber{
 		pool:              pool,
 		db:                db,
 		cfg:               cfg,
@@ -140,6 +140,18 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 		pendingEnrollment: make(map[int64]bool),
 		stopCh:            make(chan struct{}),
 	}
+	if db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if pendingMap, err := db.GetBackendPendingEnrollments(ctx); err == nil {
+			for sid, isPending := range pendingMap {
+				if isPending {
+					hp.pendingEnrollment[sid] = true
+				}
+			}
+		}
+	}
+	return hp
 }
 
 // SetPendingEnrollment sets whether a backend server is currently undergoing initial enrollment qualification.
@@ -149,7 +161,6 @@ func (hp *HealthProber) SetPendingEnrollment(serverID int64, pending bool) {
 		return
 	}
 	hp.mu.Lock()
-	defer hp.mu.Unlock()
 	if hp.pendingEnrollment == nil {
 		hp.pendingEnrollment = make(map[int64]bool)
 	}
@@ -157,6 +168,14 @@ func (hp *HealthProber) SetPendingEnrollment(serverID int64, pending bool) {
 		hp.pendingEnrollment[serverID] = true
 	} else {
 		delete(hp.pendingEnrollment, serverID)
+	}
+	db := hp.db
+	hp.mu.Unlock()
+
+	if db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = db.SetBackendPendingEnrollment(ctx, serverID, pending)
 	}
 }
 
@@ -405,6 +424,10 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	if latencyMS > hp.cfg.LatencyThresholdMS {
 		status = "degraded"
 	}
+	isPending := hp.checkAndRecordPendingEnrollment(ctx, probeTarget.ServerID)
+	if isPending {
+		status = models.TunnelStatusConnecting
+	}
 
 	// If transitioning to active, verify data-plane readiness via hook
 	if status == "active" {
@@ -448,14 +471,22 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 
 func (hp *HealthProber) checkAndRecordPendingEnrollment(ctx context.Context, serverID int64) bool {
 	hp.mu.Lock()
-	defer hp.mu.Unlock()
 	if ctx != nil && ctx.Value(DeployEnrollmentKey) != nil {
 		if hp.pendingEnrollment == nil {
 			hp.pendingEnrollment = make(map[int64]bool)
 		}
 		hp.pendingEnrollment[serverID] = true
 	}
-	return hp.pendingEnrollment != nil && hp.pendingEnrollment[serverID]
+	isPending := hp.pendingEnrollment != nil && hp.pendingEnrollment[serverID]
+	db := hp.db
+	hp.mu.Unlock()
+
+	if isPending && ctx != nil && ctx.Value(DeployEnrollmentKey) != nil && db != nil {
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = db.SetBackendPendingEnrollment(writeCtx, serverID, true)
+	}
+	return isPending
 }
 
 func (hp *HealthProber) commitProbeSuccess(ctx context.Context, snapshot, probeTarget *models.BackendTunnel, status string, latencyMS int64) error {
@@ -468,7 +499,7 @@ func (hp *HealthProber) commitProbeSuccess(ctx context.Context, snapshot, probeT
 		expectedVersion = snapshot.StateVersion
 	}
 	targetStatus := status
-	if isPending && ((snapshot != nil && snapshot.Status == models.TunnelStatusConnecting) || probeTarget.Status == models.TunnelStatusConnecting) {
+	if isPending {
 		targetStatus = models.TunnelStatusConnecting
 	}
 	if err := hp.pool.SetTunnelStatusIfCurrentWithVersion(ctx, probeTarget.ServerID, probeTarget.ID, expectedVersion, targetStatus, latencyMS); err != nil {

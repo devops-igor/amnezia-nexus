@@ -289,6 +289,9 @@ func (hp *HealthProber) finalizeSelfHealRecovery(
 	if latencyMS > latencyThreshold {
 		newStatus = "degraded"
 	}
+	if hp.IsPendingEnrollment(tun.ServerID) {
+		newStatus = models.TunnelStatusConnecting
+	}
 
 	swapped, err := hp.pool.CompareAndSwapTunnelStatusForTunnel(
 		ctx,

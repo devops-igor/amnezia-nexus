@@ -26,6 +26,7 @@ func (p *Pool) persistTunnelEnrollment(ctx context.Context, existing *models.Bac
 	if !swapped {
 		return fmt.Errorf("backend enrollment changed concurrently or row is missing: %w", ErrStaleStateVersion)
 	}
+	_ = p.db.SetBackendPendingEnrollment(writeCtx, existing.ServerID, true)
 	return nil
 }
 

@@ -320,6 +320,9 @@ func (d *DB) DeleteServer(ctx context.Context, id int64) (bool, error) {
 	if _, err := tx.ExecContext(ctx, "DELETE FROM backend_tunnels WHERE server_id = ?", id); err != nil {
 		slog.Warn("failed to delete backend_tunnels for server", "server_id", id, "error", err)
 	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM settings WHERE key = ?", fmt.Sprintf("backend_pending_enrollment:%d", id)); err != nil {
+		slog.Warn("failed to delete pending enrollment setting for server", "server_id", id, "error", err)
+	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM awg_ip_allocations WHERE server_id = ?", id); err != nil {
 		slog.Warn("failed to delete awg_ip_allocations for server", "server_id", id, "error", err)
 	}

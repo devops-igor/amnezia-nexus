@@ -127,3 +127,78 @@ func TestResetBackendTunnelEnrollmentConcurrentHealth(t *testing.T) {
 		}
 	}
 }
+
+func TestBackendPendingEnrollment_DurablePersistence(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "pending_quarantine.db")
+	const key = "test-secret-key-1234567890123456"
+
+	db, err := Open(dbPath, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sid, err := db.CreateServer(ctx, &models.Server{Name: "quarantine-server", Host: "192.0.2.80"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.SetBackendPendingEnrollment(ctx, sid, true); err != nil {
+		t.Fatalf("SetBackendPendingEnrollment true failed: %v", err)
+	}
+
+	pending, err := db.GetBackendPendingEnrollments(ctx)
+	if err != nil {
+		t.Fatalf("GetBackendPendingEnrollments failed: %v", err)
+	}
+	if !pending[sid] {
+		t.Fatalf("expected server %d to be in pending enrollments", sid)
+	}
+
+	// Close and reopen DB to verify durable persistence
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(dbPath, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	pending2, err := db2.GetBackendPendingEnrollments(ctx)
+	if err != nil {
+		t.Fatalf("GetBackendPendingEnrollments after reopen failed: %v", err)
+	}
+	if !pending2[sid] {
+		t.Fatalf("expected server %d to persist in pending enrollments across DB reopen", sid)
+	}
+
+	// Clear pending enrollment
+	if err := db2.SetBackendPendingEnrollment(ctx, sid, false); err != nil {
+		t.Fatalf("SetBackendPendingEnrollment false failed: %v", err)
+	}
+
+	pending3, err := db2.GetBackendPendingEnrollments(ctx)
+	if err != nil {
+		t.Fatalf("GetBackendPendingEnrollments after clear failed: %v", err)
+	}
+	if pending3[sid] {
+		t.Fatalf("expected server %d to be removed from pending enrollments", sid)
+	}
+
+	// Re-add and verify DeleteServer cleans up pending enrollment
+	if err := db2.SetBackendPendingEnrollment(ctx, sid, true); err != nil {
+		t.Fatalf("SetBackendPendingEnrollment re-add failed: %v", err)
+	}
+	if _, err := db2.DeleteServer(ctx, sid); err != nil {
+		t.Fatalf("DeleteServer failed: %v", err)
+	}
+	pending4, err := db2.GetBackendPendingEnrollments(ctx)
+	if err != nil {
+		t.Fatalf("GetBackendPendingEnrollments after DeleteServer failed: %v", err)
+	}
+	if pending4[sid] {
+		t.Fatalf("expected DeleteServer to remove pending enrollment for server %d", sid)
+	}
+}

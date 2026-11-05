@@ -8,11 +8,13 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 )
 
@@ -164,5 +166,94 @@ func TestRework6_BackgroundProbeCollisionDuringCanaryDoesNotAdmit(t *testing.T) 
 	}
 	if w.Code != 502 {
 		t.Fatalf("expected HTTP 502, got %d", w.Code)
+	}
+}
+
+// TestRework7_RoutedSetupQuarantineAdjacentStates verifies finding F8:
+// Unqualified routed setup must remain quarantined (eligible=0) across background probe failures
+// followed by reconnect, as well as across service reconstruction / restart.
+func TestRework7_RoutedSetupQuarantineAdjacentStates(t *testing.T) {
+	for _, scenario := range []string{"background-failure-then-real-handshake", "reconstructed-service-real-handshake"} {
+		t.Run(scenario, func(t *testing.T) {
+			h, r, provider := setupDeployTestEnv(t)
+			_, pub, host, port := rework5HandshakeOnlyServer(t, health.DefaultH1, health.DefaultH2, health.DefaultS1, health.DefaultS2)
+			provider.getDeployStatusFn = func(context.Context, string) (*gigahost.DeployStatusResponse, error) {
+				return &gigahost.DeployStatusResponse{ServerID: 9021, Status: gigahost.StatusReady, AssignedIP: host}, nil
+			}
+			h.registry.Register(&mockProtocolManager{protocol: models.ProtocolAWG, installFn: func(_ context.Context, s *models.Server, _ map[string]any) error {
+				s.Protocols["awg"] = map[string]any{
+					"port":       strconv.Itoa(port),
+					"public_key": base64.StdEncoding.EncodeToString(pub),
+					"awg_params": map[string]any{
+						"H1": strconv.FormatUint(uint64(health.DefaultH1), 10),
+						"H2": strconv.FormatUint(uint64(health.DefaultH2), 10),
+						"S1": strconv.Itoa(health.DefaultS1),
+						"S2": strconv.Itoa(health.DefaultS2),
+					},
+				}
+				return nil
+			}})
+			h.vpnSvc.SetProbeFunc(health.ProbeAWGEndpointRange)
+			eligible := -1
+			h.vpnSvc.SetCanaryProbeFunc(func(ctx context.Context, tun *models.BackendTunnel) error {
+				svc := h.vpnSvc
+				if scenario == "background-failure-then-real-handshake" {
+					svc.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
+						return 0, errors.New("transient UDP probe loss")
+					})
+					current, err := svc.GetTunnel(tun.ServerID)
+					if err != nil {
+						return err
+					}
+					if _, err = svc.ProbeTunnel(context.Background(), current); err == nil {
+						return errors.New("fixture failure expected")
+					}
+					after, _ := svc.GetTunnel(tun.ServerID)
+					t.Logf("BEFORE CANARY REPLY: background failure -> enabled=%v status=%s", after.Enabled, after.Status)
+				} else {
+					var err error
+					svc, err = vpn.NewVPNService(h.db, &models.VPNConfig{EnableMultiProtocolBackends: true, ListenPort: 51820})
+					if err != nil {
+						return err
+					}
+					if err = svc.SyncBackendTunnelsForTest(context.Background()); err != nil {
+						return err
+					}
+					defer func() { _ = svc.DisableBackend(context.Background(), tun.ServerID) }()
+				}
+				svc.SetProbeFunc(health.ProbeAWGEndpointRange)
+				canaries := 0
+				svc.SetCanaryProbeFunc(func(context.Context, *models.BackendTunnel) error {
+					canaries++
+					return errors.New("still no forwarding")
+				})
+				current, err := svc.GetTunnel(tun.ServerID)
+				if err != nil {
+					return err
+				}
+				if _, err = svc.ProbeTunnel(context.Background(), current); err != nil {
+					return err
+				}
+				backends, err := svc.GetBackends(context.Background())
+				if err != nil {
+					return err
+				}
+				eligible = len(loadbalancer.FilterHealthy(backends, 0))
+				after, _ := svc.GetTunnel(tun.ServerID)
+				t.Logf("BEFORE CANARY SUCCESS: real handshake enabled=%v status=%s eligible=%d recovery_canary_calls=%d", after.Enabled, after.Status, eligible, canaries)
+				return errors.New("fixture: data forwarding blackholed")
+			})
+			req := httptest.NewRequest("POST", "/api/admin/hosting/gigahost/orders/audit-r6-adjacent/setup", strings.NewReader(`{"ssh_password":"fixture-only"}`))
+			req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			t.Logf("FINAL HTTP=%d", w.Code)
+			if w.Code != 502 {
+				t.Fatalf("fixture must fail qualification: %d %s", w.Code, w.Body.String())
+			}
+			if eligible != 0 {
+				t.Fatalf("unqualified routed setup became selectable through %s: eligible=%d", scenario, eligible)
+			}
+		})
 	}
 }

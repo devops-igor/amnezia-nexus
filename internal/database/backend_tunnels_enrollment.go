@@ -3,10 +3,68 @@ package database
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
+
+const pendingEnrollmentKeyPrefix = "backend_pending_enrollment:"
+
+func pendingEnrollmentKey(serverID int64) string {
+	return fmt.Sprintf("%s%d", pendingEnrollmentKeyPrefix, serverID)
+}
+
+// SetBackendPendingEnrollment records or clears durable enrollment quarantine for a server.
+func (d *DB) SetBackendPendingEnrollment(ctx context.Context, serverID int64, pending bool) error {
+	if d == nil || d.sqlDB == nil {
+		return nil
+	}
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	key := pendingEnrollmentKey(serverID)
+	if pending {
+		query := `INSERT INTO settings (key, value) VALUES (?, '1')
+			ON CONFLICT(key) DO UPDATE SET value = '1'`
+		if _, err := d.sqlDB.ExecContext(ctx, query, key); err != nil {
+			return fmt.Errorf("failed to record pending enrollment for server %d: %w", serverID, err)
+		}
+	} else {
+		if _, err := d.sqlDB.ExecContext(ctx, "DELETE FROM settings WHERE key = ?", key); err != nil {
+			return fmt.Errorf("failed to delete pending enrollment for server %d: %w", serverID, err)
+		}
+	}
+	return nil
+}
+
+// GetBackendPendingEnrollments retrieves all server IDs currently under durable enrollment quarantine.
+func (d *DB) GetBackendPendingEnrollments(ctx context.Context) (map[int64]bool, error) {
+	if d == nil || d.sqlDB == nil {
+		return make(map[int64]bool), nil
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.sqlDB.QueryContext(ctx, "SELECT key FROM settings WHERE key LIKE ?", pendingEnrollmentKeyPrefix+"%")
+	if err != nil {
+		return nil, fmt.Errorf("failed to query pending enrollments: %w", err)
+	}
+	defer rows.Close()
+
+	pending := make(map[int64]bool)
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		idStr := strings.TrimPrefix(key, pendingEnrollmentKeyPrefix)
+		if sid, err := strconv.ParseInt(idStr, 10, 64); err == nil {
+			pending[sid] = true
+		}
+	}
+	return pending, rows.Err()
+}
 
 // ResetBackendTunnelForEnrollment atomically refreshes identity and invalidates
 // runtime health, including for disabled rows. It preserves administrative intent.
