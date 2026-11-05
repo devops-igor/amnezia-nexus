@@ -342,8 +342,57 @@ func newLinuxWANDeviceWithFiles(file, rawFile *os.File, name string, minPort, ma
 	return dev
 }
 
+var (
+	// ErrIPForwardingDisabled indicates Linux kernel IPv4 forwarding is not enabled.
+	ErrIPForwardingDisabled = errors.New("kernel prerequisite failed: net.ipv4.ip_forward must be enabled (value 1)")
+	// ErrStrictRPFilter indicates Linux kernel reverse path filtering is in strict mode (1).
+	ErrStrictRPFilter = errors.New("kernel prerequisite failed: net.ipv4.conf.all.rp_filter is strict (1); direct WAN egress requires 0 or 2 (loose mode)")
+	// ErrNoDefaultWANRoute indicates no active route exists to forward WAN egress traffic.
+	ErrNoDefaultWANRoute = errors.New("kernel prerequisite failed: no active outbound WAN route detected")
+)
+
+// ValidateKernelPrerequisites validates host Linux kernel settings required for direct WAN egress:
+// 1. net.ipv4.ip_forward == 1
+// 2. net.ipv4.conf.all.rp_filter != 1 (strict reverse path filtering drops asymmetric WAN replies)
+// 3. Outbound WAN route exists
+// 4. iptables firewall utility is available
+func ValidateKernelPrerequisites() error {
+	// 1. IP Forwarding
+	fwdData, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward")
+	if err != nil {
+		return fmt.Errorf("read net.ipv4.ip_forward: %w", err)
+	}
+	if strings.TrimSpace(string(fwdData)) != "1" {
+		return ErrIPForwardingDisabled
+	}
+
+	// 2. Reverse-path filtering
+	rpData, err := os.ReadFile("/proc/sys/net/ipv4/conf/all/rp_filter")
+	if err == nil {
+		val := strings.TrimSpace(string(rpData))
+		if val == "1" {
+			return ErrStrictRPFilter
+		}
+	}
+
+	// 3. Outbound WAN route viability
+	if _, err := DeriveHostWANIP(); err != nil {
+		return fmt.Errorf("%w: %v", ErrNoDefaultWANRoute, err)
+	}
+
+	// 4. Firewall / iptables availability
+	if _, err := exec.LookPath("iptables"); err != nil {
+		return fmt.Errorf("iptables not found: %w", err)
+	}
+
+	return nil
+}
+
 // NewProductionWANDevice creates a real Linux TUN device and raw socket capture for production WAN egress/ingress.
 func NewProductionWANDevice(name string) (forwarder.PacketDevice, error) {
+	if err := ValidateKernelPrerequisites(); err != nil {
+		return nil, fmt.Errorf("wan prerequisites: %w", err)
+	}
 	if name == "" {
 		name = "nexus-wan0"
 	}

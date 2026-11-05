@@ -105,8 +105,15 @@ func TestService_PBRPrerequisitesValidation(t *testing.T) {
 	dev := &mockPBRDevice{}
 	rc := &mockRouteCache{}
 	matcher := policy.NewMatcher()
-	snap, _ := policy.CompileSnapshot(1, "gen-1", nil)
+	testSrc := policy.NewMemorySource("test-src", policy.ParsedRules{
+		CIDRs: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
+	})
+	snap, _ := policy.CompileSnapshot(1, "gen-1", []policy.SourceParsedRules{testSrc.ToSourceParsedRules()})
 	matcher.Publish(snap)
+
+	emptyMatcher := policy.NewMatcher()
+	emptySnap, _ := policy.CompileSnapshot(1, "gen-empty", []policy.SourceParsedRules{policy.NewMemorySource("empty", policy.ParsedRules{}).ToSourceParsedRules()})
+	emptyMatcher.Publish(emptySnap)
 
 	tests := []struct {
 		name    string
@@ -118,6 +125,7 @@ func TestService_PBRPrerequisitesValidation(t *testing.T) {
 		{name: "missing WAN packet device", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: nil, RouteCache: rc, PolicyMatcher: matcher}, wantErr: ErrPBRMissingWANDevice},
 		{name: "missing route cache", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: dev, RouteCache: nil, PolicyMatcher: matcher}, wantErr: ErrPBRMissingRouteCache},
 		{name: "missing policy matcher", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: dev, RouteCache: rc, PolicyMatcher: nil}, wantErr: ErrPBRMissingPolicy},
+		{name: "empty policy matcher rules", cfg: PBRConfig{Enabled: true, HostWANIP: validWAN, WANDevice: dev, RouteCache: rc, PolicyMatcher: emptyMatcher}, wantErr: ErrPBREmptyPolicy},
 	}
 
 	for _, tt := range tests {
@@ -147,7 +155,10 @@ func TestService_PBREnableAndTeardown(t *testing.T) {
 	dev := &mockPBRDevice{}
 	rc := &mockRouteCache{}
 	matcher := policy.NewMatcher()
-	snap, _ := policy.CompileSnapshot(1, "gen-1", nil)
+	testSrc := policy.NewMemorySource("test-src", policy.ParsedRules{
+		CIDRs: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
+	})
+	snap, _ := policy.CompileSnapshot(1, "gen-1", []policy.SourceParsedRules{testSrc.ToSourceParsedRules()})
 	matcher.Publish(snap)
 
 	cfg := PBRConfig{
@@ -201,7 +212,10 @@ func TestService_StartWithPBREnabled(t *testing.T) {
 	dev := &mockPBRDevice{}
 	rc := &mockRouteCache{}
 	matcher := policy.NewMatcher()
-	snap, _ := policy.CompileSnapshot(1, "gen-1", nil)
+	testSrc := policy.NewMemorySource("test-src", policy.ParsedRules{
+		CIDRs: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
+	})
+	snap, _ := policy.CompileSnapshot(1, "gen-1", []policy.SourceParsedRules{testSrc.ToSourceParsedRules()})
 	matcher.Publish(snap)
 
 	svc.SetPBRConfig(PBRConfig{
@@ -297,9 +311,13 @@ func TestService_StartWithPBR_DefaultDependencies(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	testSrc := policy.NewMemorySource("default-production-policy", policy.ParsedRules{
+		CIDRs: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
+	})
 	svc.SetPBRConfig(PBRConfig{
-		HostWANIP: netip.MustParseAddr("198.51.200.1"),
-		WANDevice: &mockPBRDevice{},
+		HostWANIP:     netip.MustParseAddr("198.51.200.1"),
+		WANDevice:     &mockPBRDevice{},
+		PolicySources: []policy.SourceParsedRules{testSrc.ToSourceParsedRules()},
 	})
 
 	if err := svc.Start(ctx); err != nil {
@@ -918,9 +936,16 @@ func TestPBRDNSHandler_R8H1_AsyncDrainUnblocked(t *testing.T) {
 func TestService_R10H1_ConfiguredHostWANIPReachesDeviceAndManager(t *testing.T) {
 	db := setupTestDB(t)
 	svc, _, _, _, _ := setupTestVPNService(t, db, func(c *models.VPNConfig) { c.PBREnabled = true })
+	testSrc := policy.NewMemorySource("default-production-policy", policy.ParsedRules{
+		CIDRs: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
+	})
 	cfgIP := netip.MustParseAddr("198.51.100.77")
 	dev := &mockPBRDevice{}
-	svc.SetPBRConfig(PBRConfig{HostWANIP: cfgIP, WANDevice: dev})
+	svc.SetPBRConfig(PBRConfig{
+		HostWANIP:     cfgIP,
+		WANDevice:     dev,
+		PolicySources: []policy.SourceParsedRules{testSrc.ToSourceParsedRules()},
+	})
 	if err := svc.initPBR(context.Background()); err != nil {
 		t.Fatalf("initPBR failed: %v", err)
 	}
@@ -940,7 +965,11 @@ func TestService_R10H1_ConfiguredHostWANIPReachesDeviceAndManager(t *testing.T) 
 		t.Fatalf("manager rejected valid reply for configured HostWANIP: %v", err)
 	}
 	failDev := &mockPBRDevice{setIPErr: errors.New("setter err")}
-	svc.SetPBRConfig(PBRConfig{HostWANIP: cfgIP, WANDevice: failDev})
+	svc.SetPBRConfig(PBRConfig{
+		HostWANIP:     cfgIP,
+		WANDevice:     failDev,
+		PolicySources: []policy.SourceParsedRules{testSrc.ToSourceParsedRules()},
+	})
 	if err := svc.initPBR(context.Background()); err == nil {
 		t.Fatal("expected setter error propagated, got nil")
 	}

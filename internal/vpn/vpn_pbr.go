@@ -27,6 +27,8 @@ var (
 	ErrPBRMissingRouteCache = errors.New("vpn: pbr direct egress requires a route cache")
 	// ErrPBRMissingPolicy indicates PBR cannot be enabled without a compiled policy matcher.
 	ErrPBRMissingPolicy = errors.New("vpn: pbr direct egress requires a policy matcher")
+	// ErrPBREmptyPolicy indicates PBR cannot be enabled with an empty or uncompiled policy snapshot.
+	ErrPBREmptyPolicy = errors.New("vpn: pbr direct egress requires a non-empty policy snapshot")
 )
 
 // PBRConfig holds Policy-Based Routing direct egress configuration for Service.
@@ -37,6 +39,7 @@ type PBRConfig struct {
 	WANDevice     forwarder.PacketDevice
 	RouteCache    forwarder.RouteCache
 	PolicyMatcher *policy.Matcher
+	PolicySources []policy.SourceParsedRules
 	DNSGateway    *gatewaydns.Gateway
 }
 
@@ -57,6 +60,10 @@ func ValidatePBRPrerequisites(cfg PBRConfig) error {
 	}
 	if cfg.PolicyMatcher == nil {
 		return ErrPBRMissingPolicy
+	}
+	snap := cfg.PolicyMatcher.Current()
+	if snap == nil || (snap.DomainCount() == 0 && snap.CIDRCount() == 0) {
+		return ErrPBREmptyPolicy
 	}
 	return nil
 }
@@ -147,7 +154,6 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 		WANDevice:    cfg.WANDevice,
 	}, s.forwarder)
 
-	dem.AttachWANDevice(cfg.WANDevice)
 	s.forwarder.SetDirectEgress(dem)
 	s.forwarder.SetRouteCache(cfg.RouteCache)
 	s.forwarder.SetPolicyMatcher(cfg.PolicyMatcher)
@@ -593,34 +599,7 @@ func initDefaultDNSGateway(gwDNS netip.Addr, matcher *policy.Matcher, rc forward
 	return gw
 }
 
-// initPBR initializes and configures policy-based routing on the service during startup.
-// It instantiates concrete WAN transport, route cache, and policy matcher if not already configured.
-// It fails closed if prerequisites or initialization fails.
-func (s *Service) initPBR(ctx context.Context) error {
-	pbrCfg := s.getPBRConfig()
-	var cfg PBRConfig
-	if pbrCfg != nil {
-		cfg = *pbrCfg
-	}
-	cfg.Enabled = true
-
-	// 1. Host WAN IP: derive if not set (in default production startup)
-	if !cfg.HostWANIP.IsValid() {
-		if pbrCfg == nil {
-			derived, err := DeriveHostWANIP()
-			if err != nil {
-				return fmt.Errorf("derive host wan ip: %w", err)
-			}
-			cfg.HostWANIP = derived
-		}
-	}
-
-	// 2. Gateway DNS IP: derive if not set
-	if !cfg.GatewayDNSIP.IsValid() {
-		cfg.GatewayDNSIP = s.deriveDefaultGatewayDNSIP()
-	}
-
-	// 3. WAN PacketDevice: instantiate production TUN device if not already provided
+func initPBRWANDevice(cfg *PBRConfig) error {
 	if cfg.WANDevice == nil {
 		wanDev, err := NewProductionWANDevice("nexus-wan0")
 		if err != nil {
@@ -634,20 +613,79 @@ func (s *Service) initPBR(ctx context.Context) error {
 			return fmt.Errorf("configure wan device host wan ip: %w", err)
 		}
 	}
+	return nil
+}
 
-	// 4. Policy Matcher: instantiate and compile initial snapshot with valid sources if not provided
+func initPBRPolicyMatcher(cfg *PBRConfig) error {
 	if cfg.PolicyMatcher == nil {
+		sources := cfg.PolicySources
+		if len(sources) == 0 {
+			if cfg.WANDevice != nil {
+				_ = cfg.WANDevice.Close()
+			}
+			return ErrPBREmptyPolicy
+		}
 		matcher := policy.NewMatcher()
-		initialSrc := policy.NewMemorySource("default-production-policy", policy.ParsedRules{})
-		snap, err := policy.CompileSnapshot(1, "gen-initial", []policy.SourceParsedRules{initialSrc.ToSourceParsedRules()})
+		snap, err := policy.CompileSnapshot(1, "gen-initial", sources)
 		if err != nil {
 			if cfg.WANDevice != nil {
 				_ = cfg.WANDevice.Close()
 			}
 			return fmt.Errorf("compile initial policy snapshot: %w", err)
 		}
+		if snap.DomainCount() == 0 && snap.CIDRCount() == 0 {
+			if cfg.WANDevice != nil {
+				_ = cfg.WANDevice.Close()
+			}
+			return ErrPBREmptyPolicy
+		}
 		matcher.Publish(snap)
 		cfg.PolicyMatcher = matcher
+		return nil
+	}
+	snap := cfg.PolicyMatcher.Current()
+	if snap == nil || (snap.DomainCount() == 0 && snap.CIDRCount() == 0) {
+		if cfg.WANDevice != nil {
+			_ = cfg.WANDevice.Close()
+		}
+		return ErrPBREmptyPolicy
+	}
+	return nil
+}
+
+// initPBR initializes and configures policy-based routing on the service during startup.
+// It instantiates concrete WAN transport, route cache, and policy matcher if not already configured.
+// It fails closed if prerequisites or initialization fails.
+func (s *Service) initPBR(ctx context.Context) error {
+	pbrCfg := s.getPBRConfig()
+	var cfg PBRConfig
+	if pbrCfg != nil {
+		cfg = *pbrCfg
+	}
+	cfg.Enabled = true
+
+	// 1. Host WAN IP: derive if not set (in default production startup)
+	if !cfg.HostWANIP.IsValid() && pbrCfg == nil {
+		derived, err := DeriveHostWANIP()
+		if err != nil {
+			return fmt.Errorf("derive host wan ip: %w", err)
+		}
+		cfg.HostWANIP = derived
+	}
+
+	// 2. Gateway DNS IP: derive if not set
+	if !cfg.GatewayDNSIP.IsValid() {
+		cfg.GatewayDNSIP = s.deriveDefaultGatewayDNSIP()
+	}
+
+	// 3. WAN PacketDevice: instantiate production TUN device if not already provided
+	if err := initPBRWANDevice(&cfg); err != nil {
+		return err
+	}
+
+	// 4. Policy Matcher: instantiate and compile initial snapshot with valid configured sources if not provided
+	if err := initPBRPolicyMatcher(&cfg); err != nil {
+		return err
 	}
 
 	// 5. Route Cache: instantiate in-memory route cache if not provided and connect to matcher
@@ -681,8 +719,13 @@ func (s *Service) TeardownPBR() error {
 	defer s.mu.Unlock()
 
 	servicePBRConfigsMu.Lock()
+	pbrCfg := servicePBRConfigs[s]
 	delete(servicePBRConfigs, s)
 	servicePBRConfigsMu.Unlock()
+
+	if pbrCfg != nil && pbrCfg.WANDevice != nil {
+		_ = pbrCfg.WANDevice.Close()
+	}
 
 	if s.forwarder == nil {
 		return nil
@@ -698,5 +741,28 @@ func (s *Service) TeardownPBR() error {
 		_ = dem.Close()
 		s.forwarder.SetDirectEgress(nil)
 	}
+	return nil
+}
+
+// UpdatePolicySnapshot compiles and atomically publishes new policy sources.
+// If compilation or validation fails, it preserves the last valid compiled snapshot (HIGH 3).
+func (s *Service) UpdatePolicySnapshot(version uint64, genID string, sources []policy.SourceParsedRules) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	pbrCfg := s.getPBRConfig()
+	if pbrCfg == nil || pbrCfg.PolicyMatcher == nil {
+		return errors.New("vpn: policy matcher not initialized")
+	}
+	if len(sources) == 0 {
+		return errors.New("vpn: cannot update policy with zero sources")
+	}
+	newSnap, err := policy.CompileSnapshot(version, genID, sources)
+	if err != nil {
+		return fmt.Errorf("compile policy snapshot: %w (retaining existing snapshot)", err)
+	}
+	if newSnap.DomainCount() == 0 && newSnap.CIDRCount() == 0 {
+		return errors.New("vpn: compiled snapshot contains no rules (retaining existing snapshot)")
+	}
+	pbrCfg.PolicyMatcher.Publish(newSnap)
 	return nil
 }

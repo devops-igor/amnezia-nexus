@@ -20,22 +20,6 @@ var (
 	ErrStaleSessionReply = errors.New("forwarder: stale reply for inactive or mismatched session")
 )
 
-type remoteBindingKey struct {
-	protocol   uint8
-	natPort    uint16
-	remoteIP   netip.Addr
-	remotePort uint16
-}
-
-type remoteBindingEntry struct {
-	peerKey    string
-	sessionID  string
-	generation uint64
-	epoch      uint64
-	releasedAt time.Time
-	active     bool
-}
-
 var prohibitedCIDRs = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("10.0.0.0/8"),
@@ -134,12 +118,9 @@ func ParseAndValidateClientIPv4(packet []byte, assignedIP string) (*ParsedClient
 	}
 
 	proto := packet[9]
-	if proto != 6 && proto != 17 {
-		return nil, errors.New("forwarder: unsupported protocol for direct egress")
-	}
-
-	// Minimum transport header size & offsets
-	if proto == 6 {
+	var srcPort, dstPort uint16
+	switch proto {
+	case 6: // TCP
 		if totalLen < ihl+20 {
 			return nil, ErrInvalidTransportHdr
 		}
@@ -147,7 +128,9 @@ func ParseAndValidateClientIPv4(packet []byte, assignedIP string) (*ParsedClient
 		if dataOffset < 20 || ihl+dataOffset > totalLen {
 			return nil, ErrInvalidTransportHdr
 		}
-	} else { // UDP
+		srcPort = binary.BigEndian.Uint16(packet[ihl : ihl+2])
+		dstPort = binary.BigEndian.Uint16(packet[ihl+2 : ihl+4])
+	case 17: // UDP
 		if totalLen < ihl+8 {
 			return nil, ErrInvalidTransportHdr
 		}
@@ -155,6 +138,14 @@ func ParseAndValidateClientIPv4(packet []byte, assignedIP string) (*ParsedClient
 		if udpLen < 8 || ihl+udpLen > totalLen {
 			return nil, ErrInvalidTransportHdr
 		}
+		srcPort = binary.BigEndian.Uint16(packet[ihl : ihl+2])
+		dstPort = binary.BigEndian.Uint16(packet[ihl+2 : ihl+4])
+	case 1: // ICMP
+		if totalLen < ihl+8 {
+			return nil, ErrInvalidTransportHdr
+		}
+	default:
+		// Unsupported DIRECT transport protocol; passes IPv4 validation for PROXY fallback.
 	}
 
 	// Source IP validation
@@ -170,8 +161,6 @@ func ParseAndValidateClientIPv4(packet []byte, assignedIP string) (*ParsedClient
 	}
 
 	dstIP := netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]})
-	srcPort := binary.BigEndian.Uint16(packet[ihl : ihl+2])
-	dstPort := binary.BigEndian.Uint16(packet[ihl+2 : ihl+4])
 
 	return &ParsedClientPacket{
 		IHL:      ihl,

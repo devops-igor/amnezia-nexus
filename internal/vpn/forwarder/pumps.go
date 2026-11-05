@@ -96,16 +96,8 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	dstIP := parsed.DstIP
 
 	// Flow Stickiness: Active 5-tuple flow decisions remain stable across TTL or list refresh.
-	if directEgress != nil {
-		if choice, found := directEgress.LookupFlow(peerKey, packet); found {
-			if choice == EgressChoiceDirect {
-				if route.retired.Load() || (route.generation != 0 && f.PeerRegistration(peerKey) != route.generation) {
-					return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
-				}
-				return f.sendToDirectEgress(directEgress, route, peerKey, packet, pktLen, sID, cID)
-			}
-			return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
-		}
+	if handled, err := f.handleStickyFlow(directEgress, route, peerKey, packet, pktLen, beQueue, hasBeQueue, backendTraffic, sID, cID); handled {
+		return err
 	}
 
 	// Step 1 — DROP: Prohibited destinations (loopback, link-local, RFC1918, CGNAT, multicast, metadata).
@@ -113,6 +105,12 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	if err := ValidateDirectDestination(dstIP, parsed.DstPort, gwDNS); err != nil {
 		f.directDrops.Add(1)
 		return err
+	}
+
+	// Step 1b — PROXY FALLBACK: Non-TCP/UDP protocols (such as ICMP ping) cannot be NAT'd via direct egress.
+	// Route them safely through the proxy backend, preserving connectivity.
+	if parsed.Protocol != 6 && parsed.Protocol != 17 {
+		return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
 	}
 
 	// Ingress DNS interception: if addressed to gateway DNS on port 53, submit to DNS handler.
@@ -133,18 +131,7 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 
 	// Step 3 — DIRECT: Client-scoped DNS evidence observed public destination without proxy match.
 	if routeCache != nil && routeCache.Lookup(sID, dstIP) == policy.Direct {
-		if route.retired.Load() || (route.generation != 0 && f.PeerRegistration(peerKey) != route.generation) {
-			return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
-		}
-		if directEgress != nil {
-			if err := directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceDirect); err != nil {
-				f.directDrops.Add(1)
-				return err
-			}
-			return f.sendToDirectEgress(directEgress, route, peerKey, packet, pktLen, sID, cID)
-		}
-		f.directDrops.Add(1)
-		return ErrDirectEgressUnavailable
+		return f.routeDirectDecision(directEgress, route, peerKey, packet, pktLen, beQueue, hasBeQueue, backendTraffic, sID, cID)
 	}
 
 	// Step 4 — PROXY (Safe Default): Missing, expired, or evicted DNS evidence (policy.Unknown).
@@ -152,6 +139,38 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 		_ = directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceProxy)
 	}
 	return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
+}
+
+func (f *Forwarder) handleStickyFlow(directEgress *DirectEgressManager, route *sessionRoute, peerKey string, packet []byte, pktLen int64, beQueue chan []byte, hasBeQueue bool, backendTraffic *trafficCounters, sID, cID string) (bool, error) {
+	if directEgress == nil {
+		return false, nil
+	}
+	choice, found := directEgress.LookupFlow(peerKey, packet)
+	if !found {
+		return false, nil
+	}
+	if choice == EgressChoiceDirect {
+		if route.retired.Load() || (route.generation != 0 && f.PeerRegistration(peerKey) != route.generation) {
+			return true, f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
+		}
+		return true, f.sendToDirectEgress(directEgress, route, peerKey, packet, pktLen, sID, cID)
+	}
+	return true, f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
+}
+
+func (f *Forwarder) routeDirectDecision(directEgress *DirectEgressManager, route *sessionRoute, peerKey string, packet []byte, pktLen int64, beQueue chan []byte, hasBeQueue bool, backendTraffic *trafficCounters, sID, cID string) error {
+	if route.retired.Load() || (route.generation != 0 && f.PeerRegistration(peerKey) != route.generation) {
+		return f.sendToProxyBackend(beQueue, hasBeQueue, route, backendTraffic, sID, cID, packet, pktLen)
+	}
+	if directEgress != nil {
+		if err := directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceDirect); err != nil {
+			f.directDrops.Add(1)
+			return err
+		}
+		return f.sendToDirectEgress(directEgress, route, peerKey, packet, pktLen, sID, cID)
+	}
+	f.directDrops.Add(1)
+	return ErrDirectEgressUnavailable
 }
 
 func (f *Forwarder) matchesProxyPolicy(dstIP netip.Addr, sID string, policyMatcher *policy.Matcher, routeCache RouteCache) bool {

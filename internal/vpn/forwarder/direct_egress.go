@@ -84,14 +84,16 @@ type natEntry struct {
 
 // DirectEgressConfig configures DirectEgressManager.
 type DirectEgressConfig struct {
-	HostWANIP    netip.Addr
-	GatewayDNSIP netip.Addr
-	WANDevice    PacketDevice
-	TCPTimeout   time.Duration
-	UDPTimeout   time.Duration
-	MinPort      uint16
-	MaxPort      uint16
-	MaxFlows     int
+	HostWANIP     netip.Addr
+	GatewayDNSIP  netip.Addr
+	WANDevice     PacketDevice
+	TCPTimeout    time.Duration
+	UDPTimeout    time.Duration
+	MinPort       uint16
+	MaxPort       uint16
+	MaxFlows      int
+	TCPQuarantine time.Duration
+	UDPQuarantine time.Duration
 }
 
 const (
@@ -115,6 +117,8 @@ type DirectEgressManager struct {
 	nextPort         uint16
 	stopCh           chan struct{}
 	closed           bool
+	readerWG         sync.WaitGroup
+	readerRunning    bool
 	directDrops      atomic.Uint64
 	directBytes      atomic.Int64
 	gwDNSMu          sync.RWMutex
@@ -122,6 +126,8 @@ type DirectEgressManager struct {
 	portEpoch        map[uint16]uint64
 	quarantinedPorts map[uint16]time.Time
 	portCooldown     time.Duration
+	tcpQuarantine    time.Duration
+	udpQuarantine    time.Duration
 	remoteBindings   map[remoteBindingKey]*remoteBindingEntry
 	portOwners       map[uint16]string
 }
@@ -165,6 +171,8 @@ func NewDirectEgressManager(cfg DirectEgressConfig, fwd *Forwarder) *DirectEgres
 		portEpoch:        make(map[uint16]uint64),
 		quarantinedPorts: make(map[uint16]time.Time),
 		portCooldown:     5 * time.Second,
+		tcpQuarantine:    cfg.TCPQuarantine,
+		udpQuarantine:    cfg.UDPQuarantine,
 		remoteBindings:   make(map[remoteBindingKey]*remoteBindingEntry),
 		portOwners:       make(map[uint16]string),
 		gwDNSIP:          cfg.GatewayDNSIP,
@@ -172,6 +180,8 @@ func NewDirectEgressManager(cfg DirectEgressConfig, fwd *Forwarder) *DirectEgres
 
 	if cfg.WANDevice != nil {
 		dem.stopCh = make(chan struct{})
+		dem.readerRunning = true
+		dem.readerWG.Add(1)
 		go dem.readWANLoop(cfg.WANDevice, dem.stopCh)
 	}
 
@@ -219,23 +229,44 @@ func (p *ReturnPath) WritePacket(peerKey, assignedIP string, packet []byte) erro
 }
 
 // AttachWANDevice attaches or replaces the WAN egress packet device.
+// Exactly one reader goroutine runs per device; any running reader is stopped and joined before replacement.
 func (m *DirectEgressManager) AttachWANDevice(dev PacketDevice) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	if m.wanDevice == dev && m.readerRunning {
+		m.mu.Unlock()
+		return
+	}
+	oldStopCh := m.stopCh
+	m.stopCh = nil
+	oldDev := m.wanDevice
+	m.wanDevice = nil
+	m.readerRunning = false
+	m.mu.Unlock()
 
-	if m.stopCh != nil {
-		close(m.stopCh)
-		m.stopCh = nil
+	if oldStopCh != nil {
+		close(oldStopCh)
+		if oldDev != nil && oldDev != dev {
+			_ = oldDev.Close()
+		}
+		m.readerWG.Wait()
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return
+	}
 	m.wanDevice = dev
-	if dev != nil && !m.closed {
+	if dev != nil {
 		m.stopCh = make(chan struct{})
+		m.readerRunning = true
+		m.readerWG.Add(1)
 		go m.readWANLoop(dev, m.stopCh)
 	}
 }
 
 func (m *DirectEgressManager) readWANLoop(dev PacketDevice, stopCh chan struct{}) {
+	defer m.readerWG.Done()
 	buf := make([]byte, 65535)
 	for {
 		select {
@@ -246,6 +277,11 @@ func (m *DirectEgressManager) readWANLoop(dev PacketDevice, stopCh chan struct{}
 		n, err := dev.Read(buf)
 		if err != nil {
 			return
+		}
+		select {
+		case <-stopCh:
+			return
+		default:
 		}
 		if n > 0 {
 			pkt := make([]byte, n)
@@ -604,15 +640,7 @@ func (m *DirectEgressManager) ensureDirectNATLocked(
 			lastSeen:   now,
 		}
 		bKey := remoteBindingKey{protocol: proto, natPort: natPort, remoteIP: netip.AddrFrom4(dstIP), remotePort: dstPort}
-		if existing, exists := m.remoteBindings[bKey]; !exists || existing.peerKey == peerKey {
-			m.remoteBindings[bKey] = &remoteBindingEntry{
-				peerKey:    peerKey,
-				sessionID:  sessionID,
-				generation: generation,
-				epoch:      m.portEpoch[natPort],
-				active:     true,
-			}
-		}
+		m.recordRemoteBindingLocked(bKey, peerKey, sessionID, generation, m.portEpoch[natPort], now)
 	}
 
 	return natPort, flow, nil
@@ -769,186 +797,28 @@ func (m *DirectEgressManager) HandleWANReply(packet []byte) error {
 	return nil
 }
 
-func (m *DirectEgressManager) isPortQuarantinedLocked(port uint16, now time.Time) bool {
-	if m.portCooldown <= 0 {
-		return false
-	}
-	rel, ok := m.quarantinedPorts[port]
-	if !ok {
-		return false
-	}
-	if now.Sub(rel) >= m.portCooldown {
-		delete(m.quarantinedPorts, port)
-		delete(m.portOwners, port)
-		return false
-	}
-	return true
-}
-
-func (m *DirectEgressManager) releasePortLocked(port uint16, now time.Time) {
-	if port > 0 {
-		delete(m.usedPorts, port)
-		if m.portCooldown > 0 {
-			m.quarantinedPorts[port] = now
-		} else {
-			delete(m.portOwners, port)
-		}
-		for k, b := range m.remoteBindings {
-			if k.natPort == port {
-				b.active = false
-				b.releasedAt = now
-			}
-		}
-	}
-}
-
-func (m *DirectEgressManager) allocatePortLocked(peerKey string, proto uint8, remoteIP netip.Addr, remotePort uint16) (uint16, error) {
-	totalPorts := int(m.cfg.MaxPort - m.cfg.MinPort + 1)
-	now := time.Now()
-	for attempt := 0; attempt < 2; attempt++ {
-		for i := 0; i < totalPorts; i++ {
-			port := m.nextPort
-			m.nextPort++
-			if m.nextPort > m.cfg.MaxPort || m.nextPort < m.cfg.MinPort {
-				m.nextPort = m.cfg.MinPort
-			}
-			if !m.usedPorts[port] && !m.isPortQuarantinedLocked(port, now) {
-				if owner, ok := m.portOwners[port]; ok && owner != "" && owner != peerKey {
-					continue
-				}
-				bKey := remoteBindingKey{protocol: proto, natPort: port, remoteIP: remoteIP, remotePort: remotePort}
-				if b, exists := m.remoteBindings[bKey]; exists && b.peerKey != peerKey {
-					continue
-				}
-				m.usedPorts[port] = true
-				m.portOwners[port] = peerKey
-				m.portEpoch[port]++
-				return port, nil
-			}
-		}
-		if attempt == 0 {
-			m.sweepLocked(now)
-		}
-	}
-
-	// Under extreme port pressure where all other available ports are exhausted,
-	// recycle the oldest unused port while bumping its generation epoch to fence delayed replies.
-	for i := 0; i < totalPorts; i++ {
-		port := m.nextPort
-		m.nextPort++
-		if m.nextPort > m.cfg.MaxPort || m.nextPort < m.cfg.MinPort {
-			m.nextPort = m.cfg.MinPort
-		}
-		if !m.usedPorts[port] {
-			bKey := remoteBindingKey{protocol: proto, natPort: port, remoteIP: remoteIP, remotePort: remotePort}
-			if b, exists := m.remoteBindings[bKey]; exists && b.peerKey != peerKey {
-				continue
-			}
-			delete(m.quarantinedPorts, port)
-			m.usedPorts[port] = true
-			m.portOwners[port] = peerKey
-			m.portEpoch[port]++
-			return port, nil
-		}
-	}
-
-	return 0, ErrNATPortExhaustion
-}
-
-// Sweep removes expired idle flows and releases unused NAT ports.
-func (m *DirectEgressManager) Sweep(now time.Time) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.sweepLocked(now)
-}
-
-func (m *DirectEgressManager) sweepLocked(now time.Time) {
-	for k, f := range m.flows {
-		if m.isFlowExpiredLocked(f, k.Protocol, now) {
-			if f.choice == EgressChoiceDirect && f.natPort > 0 {
-				m.releasePortLocked(f.natPort, now)
-				delete(m.inboundNAT, inboundKey{protocol: k.Protocol, natPort: f.natPort})
-			}
-			delete(m.flows, k)
-		}
-	}
-}
-
-// PurgePeer purges all active flows and NAT state belonging to peerKey.
-func (m *DirectEgressManager) PurgePeer(peerKey string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	now := time.Now()
-	for k, f := range m.flows {
-		if f.peerKey == peerKey {
-			if f.choice == EgressChoiceDirect && f.natPort > 0 {
-				m.releasePortLocked(f.natPort, now)
-				delete(m.inboundNAT, inboundKey{protocol: k.Protocol, natPort: f.natPort})
-			}
-			delete(m.flows, k)
-		}
-	}
-	for inK, entry := range m.inboundNAT {
-		if entry.peerKey == peerKey {
-			m.releasePortLocked(entry.natPort, now)
-			delete(m.inboundNAT, inK)
-		}
-	}
-}
-
-// PurgeSession purges all active flows and NAT state belonging to sessionID.
-func (m *DirectEgressManager) PurgeSession(sessionID string) {
-	if sessionID == "" {
-		return
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	now := time.Now()
-	for k, f := range m.flows {
-		if f.sessionID == sessionID {
-			if f.choice == EgressChoiceDirect && f.natPort > 0 {
-				m.releasePortLocked(f.natPort, now)
-				delete(m.inboundNAT, inboundKey{protocol: k.Protocol, natPort: f.natPort})
-			}
-			delete(m.flows, k)
-		}
-	}
-	for inK, entry := range m.inboundNAT {
-		if entry.sessionID == sessionID {
-			m.releasePortLocked(entry.natPort, now)
-			delete(m.inboundNAT, inK)
-		}
-	}
-}
-
-// PurgeAll purges all flows and NAT state.
-func (m *DirectEgressManager) PurgeAll() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	clear(m.flows)
-	clear(m.inboundNAT)
-	clear(m.usedPorts)
-	clear(m.quarantinedPorts)
-	clear(m.remoteBindings)
-	clear(m.portOwners)
-}
-
 // Close terminates direct egress background routines and closes resources.
 func (m *DirectEgressManager) Close() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if m.closed {
+		m.mu.Unlock()
 		return nil
 	}
 	m.closed = true
-	if m.stopCh != nil {
-		close(m.stopCh)
-		m.stopCh = nil
+	m.readerRunning = false
+	oldStopCh := m.stopCh
+	m.stopCh = nil
+	dev := m.wanDevice
+	m.wanDevice = nil
+	m.mu.Unlock()
+
+	if oldStopCh != nil {
+		close(oldStopCh)
 	}
-	if m.wanDevice != nil {
-		_ = m.wanDevice.Close()
+	var err error
+	if dev != nil {
+		err = dev.Close()
 	}
-	return nil
+	m.readerWG.Wait()
+	return err
 }

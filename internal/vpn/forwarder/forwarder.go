@@ -357,6 +357,16 @@ func (f *Forwarder) InPortalSubnet(ip string) bool {
 	return f.portalSubnet.Contains(parsed)
 }
 
+// PumpsRunning reports whether forwarder pumps are active.
+func (f *Forwarder) PumpsRunning() bool {
+	if f == nil {
+		return false
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.pumpsRunning
+}
+
 func (f *Forwarder) stopPumpsSignalOnly() {
 	f.mu.Lock()
 	if !f.pumpsRunning {

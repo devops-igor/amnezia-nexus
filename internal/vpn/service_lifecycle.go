@@ -100,10 +100,7 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 	if pbrEnabled {
 		if err := s.initPBR(ctx); err != nil {
-			s.mu.Lock()
-			s.running = false
-			s.startedAt = time.Time{}
-			s.mu.Unlock()
+			s.rollbackStartup(ctx)
 			return fmt.Errorf("failed to initialize PBR direct egress: %w", err)
 		}
 	}
@@ -178,7 +175,8 @@ func (s *Service) resetDiagnosticsGeneration() {
 	}())
 }
 
-func (s *Service) cleanupEngineStartupFailure() {
+func (s *Service) rollbackStartup(ctx context.Context) {
+	_ = s.TeardownPBR()
 	if s.prober != nil {
 		s.prober.Stop()
 	}
@@ -186,12 +184,17 @@ func (s *Service) cleanupEngineStartupFailure() {
 		s.reconnectMgr.Stop()
 	}
 	if s.forwarder != nil {
+		s.forwarder.StopPumps()
 		_ = s.forwarder.Stop()
 	}
 	s.mu.Lock()
 	s.running = false
 	s.startedAt = time.Time{}
 	s.mu.Unlock()
+}
+
+func (s *Service) cleanupEngineStartupFailure() {
+	s.rollbackStartup(context.Background())
 }
 
 func (s *Service) startUpstreamClientEngine(ctx context.Context) error {
