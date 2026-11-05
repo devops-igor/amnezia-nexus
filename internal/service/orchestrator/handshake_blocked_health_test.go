@@ -10,6 +10,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
 type mockCanaryUpdater struct {
@@ -18,13 +19,15 @@ type mockCanaryUpdater struct {
 	tunnels     map[int64]*models.BackendTunnel
 	canaryErr   error
 	canaryCalls int
+	hasCanary   bool
 	updates     []string
 }
 
 func newMockCanaryUpdater(db *database.DB, tunnels ...*models.BackendTunnel) *mockCanaryUpdater {
 	m := &mockCanaryUpdater{
-		db:      db,
-		tunnels: make(map[int64]*models.BackendTunnel),
+		db:        db,
+		tunnels:   make(map[int64]*models.BackendTunnel),
+		hasCanary: true,
 	}
 	for _, t := range tunnels {
 		cp := *t
@@ -67,6 +70,12 @@ func (m *mockCanaryUpdater) ProbeCanary(ctx context.Context, tunnel *models.Back
 	defer m.mu.Unlock()
 	m.canaryCalls++
 	return m.canaryErr
+}
+
+func (m *mockCanaryUpdater) HasCanaryProber(tunnel *models.BackendTunnel) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.hasCanary
 }
 
 func TestOrchestrator_HandshakeBlocked_PreservesSessionsUnderOuterFailure(t *testing.T) {
@@ -341,5 +350,89 @@ func TestOrchestrator_Rework8_InitialOuterFailure_TransitionsToHandshakeBlocked_
 	}
 	if sess.BackendTunnelID != t1 {
 		t.Fatalf("expected session to remain on tunnel %d, but migrated to %d", t1, sess.BackendTunnelID)
+	}
+}
+
+func TestOrchestrator_Rework9_ActivePromotionAllowedWhenNoCanaryDevice(t *testing.T) {
+	cases := []struct {
+		name           string
+		initialStatus  string
+		hasCanary      bool
+		canaryErr      error
+		expectedStatus string
+	}{
+		{
+			name:           "connecting without canary prober promotes to active",
+			initialStatus:  models.TunnelStatusConnecting,
+			hasCanary:      false,
+			canaryErr:      nil,
+			expectedStatus: models.TunnelStatusActive,
+		},
+		{
+			name:           "degraded with ErrNoActiveDevice promotes to active",
+			initialStatus:  models.TunnelStatusDegraded,
+			hasCanary:      true,
+			canaryErr:      tunnel.ErrNoActiveDevice,
+			expectedStatus: models.TunnelStatusActive,
+		},
+		{
+			name:           "handshake_blocked without canary prober remains blocked",
+			initialStatus:  models.TunnelStatusHandshakeBlocked,
+			hasCanary:      false,
+			canaryErr:      nil,
+			expectedStatus: models.TunnelStatusHandshakeBlocked,
+		},
+		{
+			name:           "handshake_blocked with ErrNoActiveDevice remains blocked",
+			initialStatus:  models.TunnelStatusHandshakeBlocked,
+			hasCanary:      true,
+			canaryErr:      tunnel.ErrNoActiveDevice,
+			expectedStatus: models.TunnelStatusHandshakeBlocked,
+		},
+		{
+			name:           "connecting with true canary failure transitions to handshake_blocked",
+			initialStatus:  models.TunnelStatusConnecting,
+			hasCanary:      true,
+			canaryErr:      errors.New("inner canary drop"),
+			expectedStatus: models.TunnelStatusHandshakeBlocked,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, cleanup := setupTestDB(t)
+			defer cleanup()
+			ctx := context.Background()
+
+			_ = db.SaveVPNConfig(ctx, &models.VPNConfig{HealthThresholdMS: 500})
+
+			s1, _ := db.CreateServer(ctx, &models.Server{Name: "Server-" + tc.name, Host: "10.0.0.1"})
+			t1, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+				ServerID:      s1,
+				InterfaceName: "awg0",
+				PublicKey:     "pub1",
+				Endpoint:      "10.0.0.1:51820",
+				Status:        tc.initialStatus,
+				Enabled:       true,
+			})
+
+			tun1, _ := db.GetBackendTunnel(ctx, t1)
+			updater := newMockCanaryUpdater(db, tun1)
+			updater.hasCanary = tc.hasCanary
+			updater.canaryErr = tc.canaryErr
+
+			orch := New(db, nil, WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+				return 20 * time.Millisecond, nil
+			}), WithTunnelStatusUpdater(updater))
+
+			if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
+				t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+			}
+
+			res, _ := db.GetBackendTunnel(ctx, t1)
+			if res.Status != tc.expectedStatus {
+				t.Fatalf("expected status %s, got %s", tc.expectedStatus, res.Status)
+			}
+		})
 	}
 }

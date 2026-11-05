@@ -276,23 +276,50 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 
 		// Dual-tier verification: before promoting ANY backend to active
 		// (whether recovering from handshake_blocked, connecting, or degraded),
-		// inner canary probe must succeed!
+		// inner canary probe must succeed if available!
 		if status == "active" {
 			canaryProber := o.getCanaryProber()
 			if canaryProber != nil {
-				if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
-					slog.Warn("Backend tunnel outer probe succeeded but inner canary probe failed; denying active promotion",
-						"tunnel_id", t.ID,
-						"endpoint", t.Endpoint,
-						"err", cErr,
-					)
-					if !isBlocked {
-						if o.updateTunnelStatus(ctx, &t, models.TunnelStatusHandshakeBlocked, latencyMS) {
-							t.Status = models.TunnelStatusHandshakeBlocked
-							t.StateVersion++
+				hasCanary := true
+				if cp, ok := canaryProber.(interface {
+					HasCanaryProber(tunnel *models.BackendTunnel) bool
+				}); ok {
+					hasCanary = cp.HasCanaryProber(&t)
+				}
+
+				if isBlocked {
+					if !hasCanary {
+						slog.Warn("Backend tunnel outer probe recovered but no canary prober available to verify inner plane; preserving handshake_blocked",
+							"tunnel_id", t.ID,
+							"endpoint", t.Endpoint,
+						)
+						continue
+					}
+					if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
+						slog.Warn("Backend tunnel outer probe recovered but inner canary probe failed; preserving handshake_blocked",
+							"tunnel_id", t.ID,
+							"endpoint", t.Endpoint,
+							"err", cErr,
+						)
+						continue
+					}
+				} else if hasCanary {
+					if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
+						if errors.Is(cErr, tunnel.ErrNoActiveDevice) {
+							// No active device configured; do not treat as canary failure when not already blocked.
+						} else {
+							slog.Warn("Backend tunnel outer probe succeeded but inner canary probe failed; denying active promotion",
+								"tunnel_id", t.ID,
+								"endpoint", t.Endpoint,
+								"err", cErr,
+							)
+							if o.updateTunnelStatus(ctx, &t, models.TunnelStatusHandshakeBlocked, latencyMS) {
+								t.Status = models.TunnelStatusHandshakeBlocked
+								t.StateVersion++
+							}
+							continue
 						}
 					}
-					continue
 				}
 			} else if isBlocked {
 				slog.Warn("Backend tunnel outer probe recovered but no canary prober available to verify inner plane; preserving handshake_blocked",

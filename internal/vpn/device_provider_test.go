@@ -414,3 +414,32 @@ func TestAudit713ProductionRecoveryAdmitsBrokenDataPlane(t *testing.T) {
 		t.Error("fresh peer admitted to broken payload path after outer-only recovery")
 	}
 }
+
+func TestVPNService_HasCanaryProber(t *testing.T) {
+	var nilSvc *Service
+	tun := &models.BackendTunnel{ID: 42}
+	if nilSvc.HasCanaryProber(tun) {
+		t.Error("expected nil service to return false for HasCanaryProber")
+	}
+
+	svc := &Service{}
+	if svc.HasCanaryProber(tun) {
+		t.Error("expected service without prober to return false for HasCanaryProber")
+	}
+
+	db := setupTestDB(t)
+	pool := tunnel.NewPool(db)
+	cfg := tunnel.DefaultHealthConfig()
+	svc.prober = tunnel.NewHealthProber(pool, db, cfg, nil)
+
+	if svc.HasCanaryProber(tun) {
+		t.Error("expected prober without device or probe function to return false for HasCanaryProber")
+	}
+
+	svc.prober.SetCanaryProbeFunc(func(context.Context, *models.BackendTunnel) error {
+		return nil
+	})
+	if !svc.HasCanaryProber(tun) {
+		t.Error("expected prober with probe function to return true for HasCanaryProber")
+	}
+}

@@ -45,3 +45,11 @@ func (s *Service) ProbeCanary(ctx context.Context, t *models.BackendTunnel) erro
 	}
 	return s.prober.ProbeCanary(ctx, t)
 }
+
+// HasCanaryProber reports whether a canary prober or active device is available for the tunnel.
+func (s *Service) HasCanaryProber(t *models.BackendTunnel) bool {
+	if s == nil || s.prober == nil {
+		return false
+	}
+	return s.prober.HasCanaryProber(t)
+}

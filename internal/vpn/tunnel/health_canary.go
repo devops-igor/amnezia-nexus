@@ -162,8 +162,8 @@ func (hp *HealthProber) GetDevice(tunnelID int64) PacketDevice {
 	return nil
 }
 
-// hasCanaryProber reports whether a canary prober or active device is available for the tunnel.
-func (hp *HealthProber) hasCanaryProber(tunnel *models.BackendTunnel) bool {
+// HasCanaryProber reports whether a canary prober or active device is available for the tunnel.
+func (hp *HealthProber) HasCanaryProber(tunnel *models.BackendTunnel) bool {
 	if hp == nil || tunnel == nil {
 		return false
 	}
@@ -174,6 +174,10 @@ func (hp *HealthProber) hasCanaryProber(tunnel *models.BackendTunnel) bool {
 		return true
 	}
 	return hp.GetDevice(tunnel.ID) != nil
+}
+
+func (hp *HealthProber) hasCanaryProber(tunnel *models.BackendTunnel) bool {
+	return hp.HasCanaryProber(tunnel)
 }
 
 // ProbeCanary executes an in-tunnel canary probe against the given backend tunnel.
