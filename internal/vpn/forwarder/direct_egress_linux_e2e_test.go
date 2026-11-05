@@ -124,6 +124,10 @@ func checkLinuxCapabilities(t *testing.T) bool {
 		failOrSkip("skipping Linux E2E test: ip command not found")
 		return false
 	}
+	if _, err := exec.LookPath("iptables"); err != nil {
+		failOrSkip("skipping Linux E2E test: iptables command not found")
+		return false
+	}
 	_ = os.MkdirAll("/run/netns", 0o755)
 	testNS := fmt.Sprintf("nexus-probe-%d", time.Now().UnixNano()%100000)
 	if err := exec.Command("ip", "netns", "add", testNS).Run(); err != nil {
@@ -212,7 +216,7 @@ func (d *linuxE2EWANDevice) Close() error {
 	return errors.Join(errs...)
 }
 
-func createLinuxE2EWANDevice(name string, hostWAN netip.Addr) (*linuxE2EWANDevice, error) {
+func createLinuxE2EWANDevice(name, captureIface string, hostWAN netip.Addr) (*linuxE2EWANDevice, error) {
 	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
@@ -223,6 +227,16 @@ func createLinuxE2EWANDevice(name string, hostWAN netip.Addr) (*linuxE2EWANDevic
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.TUNSETIFF), uintptr(unsafe.Pointer(&ifr[0]))); errno != 0 {
 		_ = unix.Close(fd)
 		return nil, errno
+	}
+
+	var ifIndex int
+	if captureIface != "" {
+		ifi, err := net.InterfaceByName(captureIface)
+		if err != nil {
+			_ = unix.Close(fd)
+			return nil, fmt.Errorf("resolve interface %s: %w", captureIface, err)
+		}
+		ifIndex = ifi.Index
 	}
 
 	rawSock, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM, int(htons(unix.ETH_P_IP)))
@@ -237,9 +251,13 @@ func createLinuxE2EWANDevice(name string, hostWAN netip.Addr) (*linuxE2EWANDevic
 	}
 	sll := &unix.SockaddrLinklayer{
 		Protocol: htons(unix.ETH_P_IP),
-		Ifindex:  0,
+		Ifindex:  ifIndex,
 	}
-	_ = unix.Bind(rawSock, sll)
+	if err := unix.Bind(rawSock, sll); err != nil {
+		_ = unix.Close(rawSock)
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("bind raw packet socket to %s (index %d): %w", captureIface, ifIndex, err)
+	}
 
 	return &linuxE2EWANDevice{
 		file:    os.NewFile(uintptr(fd), name),
@@ -320,17 +338,7 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 	hostWAN := netip.MustParseAddr("198.51.100.1")
 	targetIP := netip.MustParseAddr("198.51.200.2")
 
-	// 1. Create authentic host WAN TUN device with AF_PACKET return capture
-	tunDev, err := createLinuxE2EWANDevice(tunName, hostWAN)
-	if err != nil {
-		t.Fatalf("createLinuxE2EWANDevice failed: %v", err)
-	}
-	defer func() { _ = tunDev.Close() }()
-
-	_ = exec.Command("ip", "link", "set", tunName, "up").Run()
-	_ = exec.Command("ip", "addr", "add", "10.254.1.1/30", "dev", tunName).Run()
-
-	// 2. Create isolated network namespace for external WAN network
+	// 1. Create isolated network namespace for external WAN network
 	if err := exec.Command("ip", "netns", "add", netnsName).Run(); err != nil {
 		t.Fatalf("ip netns add failed: %v", err)
 	}
@@ -340,7 +348,7 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 		_ = exec.Command("ip", "route", "del", "198.51.200.0/24").Run()
 	}()
 
-	// 3. Create separate WAN-facing veth interface connecting host to external network
+	// 2. Create separate WAN-facing veth interface connecting host to external network
 	if err := exec.Command("ip", "link", "add", vethHost, "type", "veth", "peer", "name", vethWAN).Run(); err != nil {
 		t.Fatalf("ip link add veth failed: %v", err)
 	}
@@ -352,11 +360,29 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 	_ = exec.Command("ip", "addr", "add", "198.51.100.1/24", "dev", vethHost).Run()
 	_ = exec.Command("ip", "link", "set", vethHost, "up").Run()
 
+	// 3. Create authentic host WAN TUN device with AF_PACKET return capture on vethHost
+	tunDev, err := createLinuxE2EWANDevice(tunName, vethHost, hostWAN)
+	if err != nil {
+		t.Fatalf("createLinuxE2EWANDevice failed: %v", err)
+	}
+	defer func() { _ = tunDev.Close() }()
+
+	_ = exec.Command("ip", "link", "set", tunName, "up").Run()
+	_ = exec.Command("ip", "addr", "add", "10.254.1.1/30", "dev", tunName).Run()
+
 	// Verify and configure kernel prerequisites: IP forwarding and reverse-path filtering
 	_ = exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
 	_ = exec.Command("sysctl", "-w", "net.ipv4.conf.all.rp_filter=2").Run()
 	_ = exec.Command("sysctl", "-w", fmt.Sprintf("net.ipv4.conf.%s.rp_filter=0", tunName)).Run()
 	_ = exec.Command("sysctl", "-w", fmt.Sprintf("net.ipv4.conf.%s.rp_filter=2", vethHost)).Run()
+
+	// Add test-scoped iptables FORWARD rules to permit traffic between tun and veth in Docker CI
+	_ = exec.Command("iptables", "-I", "FORWARD", "1", "-i", tunName, "-o", vethHost, "-j", "ACCEPT").Run()
+	_ = exec.Command("iptables", "-I", "FORWARD", "2", "-i", vethHost, "-j", "ACCEPT").Run()
+	defer func() {
+		_ = exec.Command("iptables", "-D", "FORWARD", "-i", tunName, "-o", vethHost, "-j", "ACCEPT").Run()
+		_ = exec.Command("iptables", "-D", "FORWARD", "-i", vethHost, "-j", "ACCEPT").Run()
+	}()
 
 	// Route traffic for the second network (198.51.200.0/24) via external gateway on veth
 	_ = exec.Command("ip", "route", "add", "198.51.200.0/24", "via", "198.51.100.2", "dev", vethHost).Run()
