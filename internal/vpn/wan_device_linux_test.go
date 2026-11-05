@@ -41,6 +41,13 @@ func TestProductionWANDevice_PermissionsAndLifecycle(t *testing.T) {
 	}
 	defer func() { _ = dev.Close() }()
 
+	// Verify accept_local=1 was configured on the device interface
+	if alData, alErr := os.ReadFile("/proc/sys/net/ipv4/conf/nexus-wan-test/accept_local"); alErr == nil {
+		if strings.TrimSpace(string(alData)) != "1" {
+			t.Fatalf("expected accept_local=1 on nexus-wan-test, got %q", string(alData))
+		}
+	}
+
 	// Verify device is writable (UP state allows writes without EIO)
 	pkt := []byte{
 		0x45, 0x00, 0x00, 0x14,

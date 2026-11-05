@@ -100,6 +100,14 @@ func (m *DirectEgressManager) releasePortLocked(port uint16, now time.Time) {
 	}
 }
 
+func (m *DirectEgressManager) retireFlowLocked(key FlowKey, entry *flowEntry, proto uint8, now time.Time) {
+	if entry.choice == EgressChoiceDirect && entry.natPort > 0 {
+		m.releasePortLocked(entry.natPort, now)
+		delete(m.inboundNAT, inboundKey{protocol: proto, natPort: entry.natPort})
+	}
+	delete(m.flows, key)
+}
+
 func (m *DirectEgressManager) allocatePortLocked(peerKey string, proto uint8, remoteIP netip.Addr, remotePort uint16) (uint16, error) {
 	totalPorts := int(m.cfg.MaxPort - m.cfg.MinPort + 1)
 	now := time.Now()
@@ -229,11 +237,7 @@ func (m *DirectEgressManager) Sweep(now time.Time) {
 func (m *DirectEgressManager) sweepLocked(now time.Time) {
 	for k, f := range m.flows {
 		if m.isFlowExpiredLocked(f, k.Protocol, now) {
-			if f.choice == EgressChoiceDirect && f.natPort > 0 {
-				m.releasePortLocked(f.natPort, now)
-				delete(m.inboundNAT, inboundKey{protocol: k.Protocol, natPort: f.natPort})
-			}
-			delete(m.flows, k)
+			m.retireFlowLocked(k, f, k.Protocol, now)
 		}
 	}
 	m.sweepRemoteBindingsLocked(now)
@@ -246,11 +250,7 @@ func (m *DirectEgressManager) PurgePeer(peerKey string) {
 	now := time.Now()
 	for k, f := range m.flows {
 		if f.peerKey == peerKey {
-			if f.choice == EgressChoiceDirect && f.natPort > 0 {
-				m.releasePortLocked(f.natPort, now)
-				delete(m.inboundNAT, inboundKey{protocol: k.Protocol, natPort: f.natPort})
-			}
-			delete(m.flows, k)
+			m.retireFlowLocked(k, f, k.Protocol, now)
 		}
 	}
 	for inK, entry := range m.inboundNAT {
@@ -272,11 +272,7 @@ func (m *DirectEgressManager) PurgeSession(sessionID string) {
 	now := time.Now()
 	for k, f := range m.flows {
 		if f.sessionID == sessionID {
-			if f.choice == EgressChoiceDirect && f.natPort > 0 {
-				m.releasePortLocked(f.natPort, now)
-				delete(m.inboundNAT, inboundKey{protocol: k.Protocol, natPort: f.natPort})
-			}
-			delete(m.flows, k)
+			m.retireFlowLocked(k, f, k.Protocol, now)
 		}
 	}
 	for inK, entry := range m.inboundNAT {

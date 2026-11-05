@@ -7,6 +7,8 @@ import (
 	"net/netip"
 	"testing"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
 // TestNAT_PeerChurnAndSafePortReuse verifies that remote bindings are bounded,
@@ -192,5 +194,119 @@ func TestWANReader_NoDuplicateGoroutines(t *testing.T) {
 	// Closing manager cleanly joins the reader
 	if err := dem.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
+	}
+}
+
+// TestNAT_LookupExpiryRetiresRemoteBindingAndReclaimsPort verifies HIGH R18-B2:
+// When an idle flow expires during LookupFlow, its remote binding must be retired
+// with a release timestamp so it can be swept and allow different peers to reuse the port.
+func TestNAT_LookupExpiryRetiresRemoteBindingAndReclaimsPort(t *testing.T) {
+	dev := newMockPacketDev()
+	m := NewDirectEgressManager(DirectEgressConfig{
+		HostWANIP: netip.MustParseAddr("203.0.113.1"),
+		WANDevice: dev,
+		MinPort:   45000,
+		MaxPort:   45000,
+	}, nil)
+	defer func() { _ = m.Close() }()
+
+	a := netip.MustParseAddr("10.100.0.1")
+	target := netip.MustParseAddr("1.1.1.1")
+	pkt := buildTestIPv4UDPPacket(a, target, 12345, 53, []byte("one"))
+	if err := m.RouteDirect("peer-a", a.String(), "session-a", uint64(1), pkt, newTestCaptureReturnPath().path); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	for _, f := range m.flows {
+		f.lastSeen = time.Now().Add(-time.Minute)
+	}
+	m.mu.Unlock()
+	if _, found := m.LookupFlow("peer-a", pkt); found {
+		t.Fatal("idle flow did not expire")
+	}
+	// Explicit sweep after quarantine cleans the retired binding
+	m.Sweep(time.Now().Add(time.Hour))
+	m.mu.RLock()
+	var active int
+	for _, b := range m.remoteBindings {
+		if b.active {
+			active++
+		}
+	}
+	if active != 0 {
+		t.Fatalf("expected 0 active bindings after idle expiry and sweep, got %d", active)
+	}
+	m.mu.RUnlock()
+
+	b := netip.MustParseAddr("10.100.0.2")
+	other := buildTestIPv4UDPPacket(b, target, 23456, 53, []byte("two"))
+	err := m.RouteDirect("peer-b", b.String(), "session-b", uint64(1), other, newTestCaptureReturnPath().path)
+	if errors.Is(err, ErrNATPortExhaustion) {
+		t.Fatalf("orphaned active remote binding permanently prevents different peer from reusing otherwise free NAT port: %v", err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestNAT_ProductionDispatchAfterDNSEvidenceExpiry verifies HIGH R18-B2 across full dispatch:
+// After DNS evidence expires and flow moves to PROXY, NAT port and remote binding are retired.
+func TestNAT_ProductionDispatchAfterDNSEvidenceExpiry(t *testing.T) {
+	f, m, dev, rc := setupForwarderWithPBR(t)
+	defer func() { _ = m.Close() }()
+	m.mu.Lock()
+	m.cfg.MinPort = 45000
+	m.cfg.MaxPort = 45000
+	m.nextPort = 45000
+	m.mu.Unlock()
+
+	target := netip.MustParseAddr("1.1.1.1")
+	a := netip.MustParseAddr("10.100.0.10")
+	b := netip.MustParseAddr("10.100.0.11")
+	f.RegisterSessionWithReturnPath("session-a", "connection-a", "peer-a", a.String(), 101, newTestCaptureReturnPath().path)
+	rc.Set("session-a", target, policy.Direct)
+	packet := buildTestIPv4UDPPacket(a, target, 12345, 53, []byte("initial-direct"))
+	if err := f.RouteClientToBackend("peer-a", packet); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	for _, flow := range m.flows {
+		flow.lastSeen = time.Now().Add(-time.Minute)
+	}
+	m.mu.Unlock()
+
+	// Simulate the ordinary expiry of client DNS evidence before the next packet
+	rc.Set("session-a", target, policy.Unknown)
+	if err := f.RouteClientToBackend("peer-a", packet); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(f.backendQueues[101]); got != 1 {
+		t.Fatalf("expected expired evidence to use PROXY, queued=%d", got)
+	}
+	if got := len(dev.getPackets()); got != 1 {
+		t.Fatalf("expired evidence unexpectedly emitted another WAN packet, total=%d", got)
+	}
+	m.Sweep(time.Now().Add(time.Hour))
+	m.mu.RLock()
+	active := 0
+	for _, binding := range m.remoteBindings {
+		if binding.active {
+			active++
+		}
+	}
+	if active != 0 {
+		t.Fatalf("expected 0 active bindings, got %d", active)
+	}
+	m.mu.RUnlock()
+
+	f.RegisterSessionWithReturnPath("session-b", "connection-b", "peer-b", b.String(), 101, newTestCaptureReturnPath().path)
+	rc.Set("session-b", target, policy.Direct)
+	other := buildTestIPv4UDPPacket(b, target, 23456, 53, []byte("other-peer-direct"))
+	err := f.RouteClientToBackend("peer-b", other)
+	if errors.Is(err, ErrNATPortExhaustion) {
+		t.Fatalf("production dispatch left active orphan preventing free-port reuse: %v", err)
+	}
+	if err != nil {
+		t.Fatal(err)
 	}
 }

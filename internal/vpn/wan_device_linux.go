@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -349,13 +350,39 @@ var (
 	ErrStrictRPFilter = errors.New("kernel prerequisite failed: net.ipv4.conf.all.rp_filter is strict (1); direct WAN egress requires 0 or 2 (loose mode)")
 	// ErrNoDefaultWANRoute indicates no active route exists to forward WAN egress traffic.
 	ErrNoDefaultWANRoute = errors.New("kernel prerequisite failed: no active outbound WAN route detected")
+	// ErrAcceptLocalDisabled indicates Linux kernel local-source acceptance is not enabled.
+	ErrAcceptLocalDisabled = errors.New("kernel prerequisite failed: net.ipv4.conf.all.accept_local must be enabled (value 1)")
 )
+
+func setAcceptLocal(procPath, sysctlKey string) error {
+	cleanPath := filepath.Clean(procPath)
+	// #nosec G304 -- cleanPath is constructed internally from trusted kernel procfs paths
+	_ = os.WriteFile(cleanPath, []byte("1\n"), 0600)
+	// #nosec G304 -- cleanPath is constructed internally from trusted kernel procfs paths
+	data, err := os.ReadFile(cleanPath)
+	if err == nil && strings.TrimSpace(string(data)) == "1" {
+		return nil
+	}
+	sysctlPath, lookErr := exec.LookPath("sysctl")
+	if lookErr == nil {
+		// #nosec G204 -- sysctlKey is constructed internally from validated dev names
+		cmd := exec.Command(sysctlPath, "-w", sysctlKey+"=1")
+		_ = cmd.Run()
+		// #nosec G304 -- cleanPath is constructed internally from trusted kernel procfs paths
+		data, err = os.ReadFile(cleanPath)
+		if err == nil && strings.TrimSpace(string(data)) == "1" {
+			return nil
+		}
+	}
+	return fmt.Errorf("configure %s: value is not 1", sysctlKey)
+}
 
 // ValidateKernelPrerequisites validates host Linux kernel settings required for direct WAN egress:
 // 1. net.ipv4.ip_forward == 1
 // 2. net.ipv4.conf.all.rp_filter != 1 (strict reverse path filtering drops asymmetric WAN replies)
 // 3. Outbound WAN route exists
-// 4. iptables firewall utility is available
+// 4. net.ipv4.conf.all.accept_local == 1 (permits locally sourced SNAT packets)
+// 5. iptables firewall utility is available
 func ValidateKernelPrerequisites() error {
 	// 1. IP Forwarding
 	fwdData, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward")
@@ -380,7 +407,19 @@ func ValidateKernelPrerequisites() error {
 		return fmt.Errorf("%w: %v", ErrNoDefaultWANRoute, err)
 	}
 
-	// 4. Firewall / iptables availability
+	// 4. Local-source acceptance (accept_local=1)
+	allAcceptLocalPath := "/proc/sys/net/ipv4/conf/all/accept_local"
+	alData, err := os.ReadFile(allAcceptLocalPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", allAcceptLocalPath, err)
+	}
+	if strings.TrimSpace(string(alData)) != "1" {
+		if err := setAcceptLocal(allAcceptLocalPath, "net.ipv4.conf.all.accept_local"); err != nil {
+			return ErrAcceptLocalDisabled
+		}
+	}
+
+	// 5. Firewall / iptables availability
 	if _, err := exec.LookPath("iptables"); err != nil {
 		return fmt.Errorf("iptables not found: %w", err)
 	}
@@ -442,6 +481,13 @@ func NewProductionWANDevice(name string) (forwarder.PacketDevice, error) {
 	if err := unix.IoctlIfreq(sock, unix.SIOCSIFFLAGS, ifReq); err != nil {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("set interface flags up for %s: %w", actualName, err)
+	}
+
+	// Configure accept_local=1 on the TUN interface so locally sourced SNAT packets are accepted
+	devAcceptLocalPath := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/accept_local", actualName)
+	if err := setAcceptLocal(devAcceptLocalPath, fmt.Sprintf("net.ipv4.conf.%s.accept_local", actualName)); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("enable accept_local for %s: %w", actualName, err)
 	}
 
 	// Inbound return path packet reader: raw packet socket on host network interface

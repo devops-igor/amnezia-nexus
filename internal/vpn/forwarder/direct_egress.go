@@ -331,11 +331,7 @@ func (m *DirectEgressManager) LookupFlow(peerKey string, packet []byte) (EgressC
 	// Verify cached flow belongs to calling session's active generation
 	if m.fwd != nil {
 		if !hasActive || (entry.generation != 0 && entry.generation != activeGen) || (entry.sessionID != "" && entry.sessionID != activeSID) {
-			delete(m.flows, key)
-			if entry.choice == EgressChoiceDirect && entry.natPort > 0 {
-				delete(m.usedPorts, entry.natPort)
-				delete(m.inboundNAT, inboundKey{protocol: proto, natPort: entry.natPort})
-			}
+			m.retireFlowLocked(key, entry, proto, time.Now())
 			m.mu.Unlock()
 			return EgressChoiceNone, false
 		}
@@ -343,11 +339,7 @@ func (m *DirectEgressManager) LookupFlow(peerKey string, packet []byte) (EgressC
 
 	now := time.Now()
 	if m.isFlowExpiredLocked(entry, proto, now) {
-		delete(m.flows, key)
-		if entry.choice == EgressChoiceDirect && entry.natPort > 0 {
-			delete(m.usedPorts, entry.natPort)
-			delete(m.inboundNAT, inboundKey{protocol: proto, natPort: entry.natPort})
-		}
+		m.retireFlowLocked(key, entry, proto, now)
 		m.mu.Unlock()
 		return EgressChoiceNone, false
 	}
@@ -580,9 +572,7 @@ func (m *DirectEgressManager) ensureDirectNATLocked(
 	var natPort uint16
 	if exists && flow.natPort > 0 {
 		if m.isFlowExpiredLocked(flow, proto, now) {
-			m.releasePortLocked(flow.natPort, now)
-			delete(m.inboundNAT, inboundKey{protocol: proto, natPort: flow.natPort})
-			delete(m.flows, flowKey)
+			m.retireFlowLocked(flowKey, flow, proto, now)
 			flow = nil
 			exists = false
 		} else {
