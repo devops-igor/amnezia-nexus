@@ -68,3 +68,21 @@ func TestValidateKernelPrerequisites_Execution(t *testing.T) {
 		}
 	}
 }
+
+func TestIsAllAcceptLocalEnabled(t *testing.T) {
+	enabled := isAllAcceptLocalEnabled()
+	t.Logf("isAllAcceptLocalEnabled returned %v", enabled)
+}
+
+func TestSetAcceptLocal_ReadOnlyFileFails(t *testing.T) {
+	tmpDir := t.TempDir()
+	procFile := filepath.Join(tmpDir, "accept_local")
+	if err := os.WriteFile(procFile, []byte("0\n"), 0400); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	err := setAcceptLocal(procFile, "net.ipv4.conf.test.accept_local")
+	if err == nil {
+		t.Fatal("expected setAcceptLocal to fail on read-only file, got nil")
+	}
+}

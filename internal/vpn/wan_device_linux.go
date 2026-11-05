@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -354,6 +355,11 @@ var (
 	ErrAcceptLocalDisabled = errors.New("kernel prerequisite failed: net.ipv4.conf.all.accept_local must be enabled (value 1)")
 )
 
+func isAllAcceptLocalEnabled() bool {
+	data, err := os.ReadFile("/proc/sys/net/ipv4/conf/all/accept_local")
+	return err == nil && strings.TrimSpace(string(data)) == "1"
+}
+
 func setAcceptLocal(procPath, sysctlKey string) error {
 	cleanPath := filepath.Clean(procPath)
 	// #nosec G304 -- cleanPath is constructed internally from trusted kernel procfs paths
@@ -408,14 +414,10 @@ func ValidateKernelPrerequisites() error {
 	}
 
 	// 4. Local-source acceptance (accept_local=1)
-	allAcceptLocalPath := "/proc/sys/net/ipv4/conf/all/accept_local"
-	alData, err := os.ReadFile(allAcceptLocalPath)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", allAcceptLocalPath, err)
-	}
-	if strings.TrimSpace(string(alData)) != "1" {
+	if !isAllAcceptLocalEnabled() {
+		allAcceptLocalPath := "/proc/sys/net/ipv4/conf/all/accept_local"
 		if err := setAcceptLocal(allAcceptLocalPath, "net.ipv4.conf.all.accept_local"); err != nil {
-			return ErrAcceptLocalDisabled
+			log.Printf("[vpn] warning: unable to enable %s: %v; relying on per-device accept_local", allAcceptLocalPath, err)
 		}
 	}
 
@@ -486,8 +488,11 @@ func NewProductionWANDevice(name string) (forwarder.PacketDevice, error) {
 	// Configure accept_local=1 on the TUN interface so locally sourced SNAT packets are accepted
 	devAcceptLocalPath := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/accept_local", actualName)
 	if err := setAcceptLocal(devAcceptLocalPath, fmt.Sprintf("net.ipv4.conf.%s.accept_local", actualName)); err != nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("enable accept_local for %s: %w", actualName, err)
+		if !isAllAcceptLocalEnabled() {
+			_ = unix.Close(fd)
+			return nil, fmt.Errorf("enable accept_local for %s: %w", actualName, err)
+		}
+		log.Printf("[vpn] warning: enable per-device accept_local for %s failed (%v), but all.accept_local is enabled", actualName, err)
 	}
 
 	// Inbound return path packet reader: raw packet socket on host network interface
