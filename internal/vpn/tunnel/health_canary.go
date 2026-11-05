@@ -194,6 +194,15 @@ func (hp *HealthProber) hasCanaryProber(tunnel *models.BackendTunnel) bool {
 // ProbeCanary executes an in-tunnel canary probe against the given backend tunnel.
 // If a custom CanaryProbeFunc is configured, it is invoked; otherwise defaultCanaryProbe is used.
 func (hp *HealthProber) ProbeCanary(ctx context.Context, tunnel *models.BackendTunnel) error {
+	// Like ProbeTunnel, take a fresh snapshot of the same identity before I/O.
+	// Never substitute a replacement tunnel for the caller's identity.
+	if hp != nil && hp.pool != nil && tunnel != nil {
+		current, err := hp.pool.GetTunnelByID(tunnel.ID)
+		if err != nil {
+			return err
+		}
+		tunnel = current
+	}
 	return hp.probeCanary(ctx, tunnel)
 }
 
@@ -228,6 +237,7 @@ func (hp *HealthProber) probeCanary(ctx context.Context, tunnel *models.BackendT
 	hp.mu.RLock()
 	fn := hp.probeCanaryFn
 	hp.mu.RUnlock()
+	sequence := hp.beginCanaryObservation()
 
 	var err error
 	if fn != nil {
@@ -235,30 +245,23 @@ func (hp *HealthProber) probeCanary(ctx context.Context, tunnel *models.BackendT
 	} else {
 		err = hp.defaultCanaryProbe(ctx, tunnel)
 	}
-	if err == nil {
-		sID := tunnel.ServerID
-		tID := tunnel.ID
-		if hp.pool != nil {
-			if sID == 0 && tID != 0 {
-				if pt, pErr := hp.pool.GetTunnelByID(tID); pErr == nil && pt != nil {
-					sID = pt.ServerID
-				}
-			} else if sID != 0 && tID == 0 {
-				if pt, pErr := hp.pool.GetTunnel(sID); pErr == nil && pt != nil {
-					tID = pt.ID
-				}
-			}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if stateErr := hp.acceptCanaryObservation(tunnel, sequence, err == nil); stateErr != nil {
+		return stateErr
+	}
+	if err == nil && tunnel.ID != 0 {
+		canarySuccessMu.RLock()
+		cb := canarySuccessCallbacks[hp]
+		canarySuccessMu.RUnlock()
+		if cb != nil {
+			cb(tunnel.ID)
 		}
-		if sID != 0 {
-			hp.resetCanaryFailure(sID)
-		}
-		if tID != 0 {
-			canarySuccessMu.RLock()
-			cb := canarySuccessCallbacks[hp]
-			canarySuccessMu.RUnlock()
-			if cb != nil {
-				cb(tID)
-			}
+		// Notifications run without our locks and may be delayed by another
+		// worker. Do not return usable success after that worker accepted loss.
+		if stateErr := hp.canaryObservationCurrent(tunnel, sequence); stateErr != nil {
+			return stateErr
 		}
 	}
 	return err
@@ -272,14 +275,6 @@ func (hp *HealthProber) recordCanaryFailure(serverID int64) int {
 	}
 	hp.canaryFailCounts[serverID]++
 	return hp.canaryFailCounts[serverID]
-}
-
-func (hp *HealthProber) resetCanaryFailure(serverID int64) {
-	hp.mu.Lock()
-	defer hp.mu.Unlock()
-	if hp.canaryFailCounts != nil {
-		hp.canaryFailCounts[serverID] = 0
-	}
 }
 
 func (hp *HealthProber) defaultCanaryProbe(ctx context.Context, tunnel *models.BackendTunnel) error {

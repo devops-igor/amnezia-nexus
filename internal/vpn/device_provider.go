@@ -65,3 +65,12 @@ func (s *Service) SetCanarySuccessCallback(cb func(tunnelID int64)) {
 	}
 	s.prober.SetCanarySuccessCallback(cb)
 }
+
+// CanaryFailureCount exposes the shared, generation-fenced inner history to
+// scheduled health checks. Legacy success notifications do not own this state.
+func (s *Service) CanaryFailureCount(tunnelID int64) int {
+	if s == nil || s.prober == nil {
+		return 0
+	}
+	return s.prober.CanaryFailureCount(tunnelID)
+}

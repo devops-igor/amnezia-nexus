@@ -484,6 +484,9 @@ func (o *Orchestrator) recordProbeFailVersion(tunnelID int64, stateVersion int64
 
 // recordCanaryFailure increments and returns the consecutive canary failure count for a backend tunnel.
 func (o *Orchestrator) recordCanaryFailure(tunnelID int64) int {
+	if history, ok := o.getCanaryProber().(interface{ CanaryFailureCount(int64) int }); ok {
+		return history.CanaryFailureCount(tunnelID)
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.canaryFailCounts == nil {
@@ -504,6 +507,9 @@ func (o *Orchestrator) ResetCanaryFailCount(tunnelID int64) {
 
 // GetCanaryFailCount returns the current consecutive canary failure count for a backend tunnel.
 func (o *Orchestrator) GetCanaryFailCount(tunnelID int64) int {
+	if history, ok := o.getCanaryProber().(interface{ CanaryFailureCount(int64) int }); ok {
+		return history.CanaryFailureCount(tunnelID)
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.canaryFailCounts == nil {

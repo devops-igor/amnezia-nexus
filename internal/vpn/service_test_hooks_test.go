@@ -61,7 +61,14 @@ func TestNewVPNService_RetainsRealCanary(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = svc.Stop() })
-	backend := &models.BackendTunnel{ID: 713}
+	sid, err := svc.db.CreateServer(t.Context(), &models.Server{Name: "real-canary", Host: "192.0.2.71"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend, err := svc.pool.AddTunnel(t.Context(), sid, "192.0.2.71:51820", "fixture-public-key")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if svc.prober.HasCanaryProber(backend) {
 		t.Fatal("production constructor pre-installed a canary override")
 	}

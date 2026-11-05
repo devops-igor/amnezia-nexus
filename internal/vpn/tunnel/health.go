@@ -78,6 +78,8 @@ type HealthProber struct {
 	onSelfHealHook       func(ctx context.Context, tunnel *models.BackendTunnel) error
 	failCounts           map[int64]int
 	canaryFailCounts     map[int64]int
+	canarySequence       uint64
+	canaryResults        map[int64]canaryResult
 	autoDisabled         map[int64]bool
 	successCounts        map[int64]int
 	// Counter maps use server IDs for the public diagnostics API. This fence
@@ -192,6 +194,8 @@ func (hp *HealthProber) ResetFailCount(serverID int64) {
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
 	hp.failCounts[serverID] = 0
+	delete(hp.canaryFailCounts, serverID)
+	delete(hp.canaryResults, serverID)
 	delete(hp.autoDisabled, serverID)
 	delete(hp.successCounts, serverID)
 	hp.recordCurrentGenerationLocked(serverID)
@@ -442,9 +446,7 @@ func (hp *HealthProber) commitActiveProbeSuccess(ctx context.Context, snapshot, 
 		return err
 	}
 	hp.failCounts[probeTarget.ServerID] = 0
-	if hp.canaryFailCounts != nil {
-		hp.canaryFailCounts[probeTarget.ServerID] = 0
-	}
+
 	delete(hp.autoDisabled, probeTarget.ServerID)
 	delete(hp.successCounts, probeTarget.ServerID)
 	hp.mu.Unlock()
@@ -456,15 +458,12 @@ func (hp *HealthProber) commitActiveProbeSuccess(ctx context.Context, snapshot, 
 func (hp *HealthProber) verifyActiveEligibility(ctx context.Context, snapshot, probeTarget *models.BackendTunnel, isBlocked bool) (bool, error) {
 	if hp.hasCanaryProber(probeTarget) {
 		if canaryErr := hp.probeCanary(ctx, probeTarget); canaryErr != nil {
+			if isObsoleteCanary(canaryErr) {
+				return false, canaryErr
+			}
 			slog.Warn("Backend tunnel outer probe succeeded but inner canary failed; denying active promotion",
 				"tunnel_id", probeTarget.ID, "server_id", probeTarget.ServerID, "status", probeTarget.Status, "err", canaryErr)
-			hp.mu.Lock()
-			if err := hp.checkHealthGenerationLocked(probeTarget); err != nil {
-				hp.mu.Unlock()
-				return false, err
-			}
-			hp.mu.Unlock()
-			failures := hp.recordCanaryFailure(probeTarget.ServerID)
+			failures := hp.GetCanaryFailCount(probeTarget.ServerID)
 
 			if failures >= hp.cfg.FailureThreshold {
 				return false, hp.transitionToThresholdDisabled(ctx, snapshot)
@@ -481,7 +480,6 @@ func (hp *HealthProber) verifyActiveEligibility(ctx context.Context, snapshot, p
 			}
 			return false, hp.transitionToDegraded(ctx, snapshot)
 		}
-		hp.resetCanaryFailure(probeTarget.ServerID)
 		return true, nil
 	}
 
@@ -662,50 +660,8 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 	failures := hp.failCounts[snapshot.ServerID]
 	hp.mu.Unlock()
 
-	if failures >= hp.cfg.FailureThreshold {
-		// Issue #713: Tier 2 in-tunnel data-plane canary probe.
-		// If canary succeeds: mark status handshake_blocked (connection kept alive at all costs!).
-		// If canary also fails: mark status disabled (DisableReasonHealth).
-		canaryErr := hp.probeCanary(ctx, snapshot)
-		if canaryErr == nil {
-			if err := hp.transitionToHandshakeBlocked(ctx, snapshot); err != nil {
-				return 0, err
-			}
-			return 0, probeErr
-		}
-
-		if err := hp.transitionToThresholdDisabled(ctx, snapshot); err != nil {
-			return 0, err
-		}
-	} else if hp.pool != nil {
-		// Issue #713: When outer handshake probe fails below the threshold,
-		// prevent new client admissions while preserving established sessions.
-		hasActiveSessions := snapshot.ActiveConnections > 0
-		if cur, err := hp.pool.GetTunnel(snapshot.ServerID); err == nil && cur != nil && cur.ActiveConnections > 0 {
-			hasActiveSessions = true
-		}
-		var transErr error
-		if hp.hasCanaryProber(snapshot) {
-			if canaryErr := hp.probeCanary(ctx, snapshot); canaryErr != nil {
-				canaryFails := hp.recordCanaryFailure(snapshot.ServerID)
-				if canaryFails >= hp.cfg.FailureThreshold {
-					transErr = hp.transitionToThresholdDisabled(ctx, snapshot)
-				} else if hasActiveSessions {
-					transErr = hp.transitionToHandshakeBlocked(ctx, snapshot)
-				} else {
-					transErr = hp.transitionToDegraded(ctx, snapshot)
-				}
-			} else {
-				transErr = hp.transitionToHandshakeBlocked(ctx, snapshot)
-			}
-		} else if hasActiveSessions {
-			transErr = hp.transitionToHandshakeBlocked(ctx, snapshot)
-		} else {
-			transErr = hp.transitionToDegraded(ctx, snapshot)
-		}
-		if transErr != nil {
-			return 0, transErr
-		}
+	if err := hp.confirmOuterFailure(ctx, snapshot, failures); err != nil {
+		return 0, err
 	}
 	if err := hp.checkTunnelAvailable(snapshot); errors.Is(err, ErrTunnelNotFound) {
 		return 0, err
@@ -716,9 +672,6 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 
 func (hp *HealthProber) transitionToHandshakeBlocked(ctx context.Context, snapshot *models.BackendTunnel) error {
 	if hp.pool != nil {
-		if snapshot.Status == models.TunnelStatusHandshakeBlocked {
-			return nil
-		}
 		swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
 			ctx,
 			snapshot.ServerID,

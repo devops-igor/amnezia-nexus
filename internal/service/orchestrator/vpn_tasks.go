@@ -151,95 +151,19 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			}
 
 			failures := o.recordProbeFailure(t.ID, t.StateVersion)
-			if failures < threshold {
-				slog.Warn("Backend tunnel health probe failed (below failure threshold)",
-					"tunnel_id", t.ID,
-					"endpoint", t.Endpoint,
-					"failures", failures,
-					"threshold", threshold,
-					"err", err,
-				)
-
-				// Issue #713: When dual-tier probing is available, prevent new client admissions
-				// during transient outer probe failures while preserving established sessions.
-				canaryProber := o.getCanaryProber()
-				if canaryProber != nil {
-					hasActiveSessions := t.ActiveConnections > 0
-					if poolTun != nil && poolTun.ActiveConnections > 0 {
-						hasActiveSessions = true
-					}
-					viable := false
-					if cErr := canaryProber.ProbeCanary(ctx, &t); cErr == nil {
-						viable = true
-						o.ResetCanaryFailCount(t.ID)
-					}
-
-					if hasActiveSessions || viable {
-						if !isBlocked {
-							if o.updateTunnelStatus(ctx, &t, models.TunnelStatusHandshakeBlocked, 0) {
-								t.Status = models.TunnelStatusHandshakeBlocked
-								t.StateVersion++
-							}
-						}
-					} else {
-						if o.updateTunnelStatus(ctx, &t, "degraded", 0) {
-							degradedTunnels = append(degradedTunnels, t.ID)
-							o.recordProbeFailVersion(t.ID, t.StateVersion)
-						} else {
-							o.revertProbeFailure(t.ID, t.StateVersion)
-						}
-					}
-					continue
-				}
-
+			decision, canaryErr := o.confirmOuterFailure(ctx, &t, poolTun, failures, threshold, isBlocked)
+			if canaryErr != nil {
+				continue
+			}
+			if decision == "" {
 				if !strings.EqualFold(t.Status, "degraded") && !isBlocked {
 					healthyTunnels = append(healthyTunnels, &tCopy)
 				}
 				continue
 			}
-
-			// Failures reached or exceeded threshold.
-			// Dual-tier check: if the tunnel is in handshake_blocked, or if canary prober
-			// verifies data plane is viable, preserve handshake_blocked instead of degrading.
-			canaryProber := o.getCanaryProber()
-			if isBlocked {
-				if canaryProber != nil {
-					if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
-						slog.Warn("Handshake blocked tunnel inner canary also failed, marking degraded",
-							"tunnel_id", t.ID,
-							"endpoint", t.Endpoint,
-							"err", cErr,
-						)
-						if o.updateTunnelStatus(ctx, &t, "degraded", 0) {
-							degradedTunnels = append(degradedTunnels, t.ID)
-							o.recordProbeFailVersion(t.ID, t.StateVersion)
-						} else {
-							o.revertProbeFailure(t.ID, t.StateVersion)
-						}
-						continue
-					}
-				}
-				// Inner canary succeeded (or no canary prober available): preserve handshake_blocked!
-				o.ResetCanaryFailCount(t.ID)
-				slog.Info("Preserving handshake_blocked tunnel with viable data plane during scheduled health check",
-					"tunnel_id", t.ID,
-					"endpoint", t.Endpoint,
-				)
+			if decision == models.TunnelStatusHandshakeBlocked {
+				o.updateTunnelStatus(ctx, &t, decision, 0)
 				continue
-			}
-
-			// Tunnel was not yet handshake_blocked, but reached outer failure threshold.
-			// Run dual-tier inner canary probe if available.
-			if canaryProber != nil {
-				if cErr := canaryProber.ProbeCanary(ctx, &t); cErr == nil {
-					o.ResetCanaryFailCount(t.ID)
-					slog.Info("Outer handshake probe failed but inner canary succeeded; marking handshake_blocked",
-						"tunnel_id", t.ID,
-						"endpoint", t.Endpoint,
-					)
-					o.updateTunnelStatus(ctx, &t, models.TunnelStatusHandshakeBlocked, 0)
-					continue
-				}
 			}
 
 			slog.Warn("Backend tunnel health probe failed",
@@ -293,6 +217,9 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 				}
 
 				cErr := canaryProber.ProbeCanary(ctx, &t)
+				if obsoleteCanary(cErr) {
+					continue
+				}
 
 				hasCanary := true
 				if cp, ok := canaryProber.(interface {
@@ -378,6 +305,9 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 					}
 					if hasCanary {
 						if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
+							if obsoleteCanary(cErr) {
+								continue
+							}
 							fails := o.recordCanaryFailure(t.ID)
 							if fails < threshold {
 								slog.Warn("Active backend tunnel outer probe succeeded but inner canary probe failed (below threshold); marking handshake_blocked",
