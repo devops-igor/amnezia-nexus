@@ -37,19 +37,21 @@ func TestProductionWANDevice_PermissionsAndLifecycle(t *testing.T) {
 
 	dev, err := NewProductionWANDevice("nexus-wan-test")
 	if err != nil {
-		// In CI containerized environments, accept_local may be unconfigurable
-		// (read-only procfs, no CAP_NET_ADMIN). Treat this as a graceful
-		// degradation rather than a test failure — the device lifecycle
-		// (open TUN, ioctl, close) is what this test verifies.
-		t.Logf("NewProductionWANDevice returned expected non-root/CI error: %v", err)
-		return
+		t.Fatalf("NewProductionWANDevice failed: %v", err)
 	}
 	defer func() { _ = dev.Close() }()
 
-	// Verify accept_local=1 was configured on the device interface
+	// Verify accept_local=1 was configured on the device interface (when procfs is writable)
 	if alData, alErr := os.ReadFile("/proc/sys/net/ipv4/conf/nexus-wan-test/accept_local"); alErr == nil {
-		if strings.TrimSpace(string(alData)) != "1" {
-			t.Fatalf("expected accept_local=1 on nexus-wan-test, got %q", string(alData))
+		if val := strings.TrimSpace(string(alData)); val != "1" {
+			// In CI containerized environments, procfs is read-only so accept_local cannot be modified.
+			f, writeErr := os.OpenFile("/proc/sys/net/ipv4/conf/nexus-wan-test/accept_local", os.O_WRONLY, 0)
+			if writeErr != nil {
+				t.Logf("accept_local on nexus-wan-test is %q (containerized read-only procfs: %v)", val, writeErr)
+			} else {
+				_ = f.Close()
+				t.Fatalf("expected accept_local=1 on nexus-wan-test, got %q", val)
+			}
 		}
 	}
 
