@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/userops"
 )
 
@@ -477,10 +479,21 @@ func (o *Orchestrator) ResetCanaryFailCount(tunnelID int64) {
 
 // GetCanaryFailCount returns the current consecutive canary failure count for a backend tunnel.
 func (o *Orchestrator) GetCanaryFailCount(tunnelID int64) int {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	if o.canaryFailCounts == nil {
 		return 0
 	}
-	return o.canaryFailCounts[tunnelID]
+	count := o.canaryFailCounts[tunnelID]
+	if count == 0 {
+		return 0
+	}
+	if o.db != nil {
+		tun, err := o.db.GetBackendTunnel(context.Background(), tunnelID)
+		if err == nil && tun != nil && strings.EqualFold(tun.Status, models.TunnelStatusActive) {
+			delete(o.canaryFailCounts, tunnelID)
+			return 0
+		}
+	}
+	return count
 }

@@ -113,6 +113,11 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			}
 		}
 
+		if strings.EqualFold(t.Status, models.TunnelStatusActive) ||
+			(poolTun != nil && strings.EqualFold(poolTun.Status, models.TunnelStatusActive)) {
+			o.ResetCanaryFailCount(t.ID)
+		}
+
 		tCopy := t
 		rtt, err := probeFn(
 			ctx,
@@ -166,6 +171,7 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 					viable := false
 					if cErr := canaryProber.ProbeCanary(ctx, &t); cErr == nil {
 						viable = true
+						o.ResetCanaryFailCount(t.ID)
 					}
 
 					if hasActiveSessions || viable {
@@ -214,6 +220,7 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 					}
 				}
 				// Inner canary succeeded (or no canary prober available): preserve handshake_blocked!
+				o.ResetCanaryFailCount(t.ID)
 				slog.Info("Preserving handshake_blocked tunnel with viable data plane during scheduled health check",
 					"tunnel_id", t.ID,
 					"endpoint", t.Endpoint,
@@ -225,6 +232,7 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			// Run dual-tier inner canary probe if available.
 			if canaryProber != nil {
 				if cErr := canaryProber.ProbeCanary(ctx, &t); cErr == nil {
+					o.ResetCanaryFailCount(t.ID)
 					slog.Info("Outer handshake probe failed but inner canary succeeded; marking handshake_blocked",
 						"tunnel_id", t.ID,
 						"endpoint", t.Endpoint,
@@ -266,9 +274,9 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 		// (whether connecting, degraded, or handshake_blocked),
 		// data-plane device attachment AND successful inner canary probe are strictly required!
 		if status == "active" {
-			canaryFails := o.GetCanaryFailCount(t.ID)
-			isCurrentlyActive := (strings.EqualFold(t.Status, models.TunnelStatusActive) || (isBlocked && canaryFails > 0)) &&
-				(poolTun == nil || strings.EqualFold(poolTun.Status, models.TunnelStatusActive) || (isBlocked && canaryFails > 0))
+			hasActiveSessions := t.ActiveConnections > 0 || (poolTun != nil && poolTun.ActiveConnections > 0)
+			isCurrentlyActive := (strings.EqualFold(t.Status, models.TunnelStatusActive) || (isBlocked && hasActiveSessions)) &&
+				(poolTun == nil || strings.EqualFold(poolTun.Status, models.TunnelStatusActive) || (isBlocked && hasActiveSessions))
 
 			canaryProber := o.getCanaryProber()
 
