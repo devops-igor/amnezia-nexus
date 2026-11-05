@@ -179,15 +179,15 @@ func TestOrchestrator_HandshakeBlocked_RecoveryRequiresInnerCanary(t *testing.T)
 		return 20 * time.Millisecond, nil
 	}), WithTunnelStatusUpdater(updater))
 
-	// Case 1: Outer probe succeeds, but inner canary probe fails!
+	// Case 1: Outer probe succeeds, but inner canary probe fails -> must transition to degraded (BLOCKER 1: data-plane failure)
 	updater.canaryErr = errors.New("inner data plane blackhole")
 	if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
 		t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
 	}
 
 	res1, _ := db.GetBackendTunnel(ctx, t1)
-	if res1.Status != models.TunnelStatusHandshakeBlocked {
-		t.Fatalf("tunnel MUST stay in handshake_blocked when canary fails, got %s", res1.Status)
+	if res1.Status != models.TunnelStatusDegraded {
+		t.Fatalf("tunnel MUST transition to degraded when canary fails, got %s", res1.Status)
 	}
 	if updater.canaryCalls == 0 {
 		t.Fatal("expected canary probe to be called during recovery check")
@@ -283,13 +283,13 @@ func TestOrchestrator_Rework8_PromotionToActiveRejectedWhenInnerCanaryFails(t *t
 				t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
 			}
 
-			// Must NOT be active! Must transition to/stay handshake_blocked
+			// Must NOT be active! Must transition to/stay degraded (BLOCKER 1: inner failure is data-plane failure)
 			res, _ := db.GetBackendTunnel(ctx, t1)
 			if res.Status == models.TunnelStatusActive {
 				t.Fatalf("tunnel MUST NOT be promoted to active when canary fails, got %s", res.Status)
 			}
-			if res.Status != models.TunnelStatusHandshakeBlocked {
-				t.Fatalf("expected status handshake_blocked, got %s", res.Status)
+			if res.Status != models.TunnelStatusDegraded {
+				t.Fatalf("expected status degraded, got %s", res.Status)
 			}
 		})
 	}
@@ -369,11 +369,11 @@ func TestOrchestrator_Rework9_ActivePromotionAllowedWhenNoCanaryDevice(t *testin
 			expectedStatus: models.TunnelStatusActive,
 		},
 		{
-			name:           "degraded with ErrNoActiveDevice promotes to active",
+			name:           "degraded with ErrNoActiveDevice does not promote to active",
 			initialStatus:  models.TunnelStatusDegraded,
 			hasCanary:      true,
 			canaryErr:      tunnel.ErrNoActiveDevice,
-			expectedStatus: models.TunnelStatusActive,
+			expectedStatus: models.TunnelStatusDegraded,
 		},
 		{
 			name:           "handshake_blocked without canary prober remains blocked",
@@ -383,18 +383,18 @@ func TestOrchestrator_Rework9_ActivePromotionAllowedWhenNoCanaryDevice(t *testin
 			expectedStatus: models.TunnelStatusHandshakeBlocked,
 		},
 		{
-			name:           "handshake_blocked with ErrNoActiveDevice remains blocked",
+			name:           "handshake_blocked with ErrNoActiveDevice degrades",
 			initialStatus:  models.TunnelStatusHandshakeBlocked,
 			hasCanary:      true,
 			canaryErr:      tunnel.ErrNoActiveDevice,
-			expectedStatus: models.TunnelStatusHandshakeBlocked,
+			expectedStatus: models.TunnelStatusDegraded,
 		},
 		{
-			name:           "connecting with true canary failure transitions to handshake_blocked",
+			name:           "connecting with true canary failure transitions to degraded",
 			initialStatus:  models.TunnelStatusConnecting,
 			hasCanary:      true,
 			canaryErr:      errors.New("inner canary drop"),
-			expectedStatus: models.TunnelStatusHandshakeBlocked,
+			expectedStatus: models.TunnelStatusDegraded,
 		},
 	}
 

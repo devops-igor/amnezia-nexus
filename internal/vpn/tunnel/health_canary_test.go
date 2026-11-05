@@ -784,7 +784,7 @@ func TestHealthProber_DualTier_RecoveryToActive(t *testing.T) {
 		t.Fatalf("expected handshake_blocked, got %q", current.Status)
 	}
 
-	// Outer probe succeeds but inner canary fails -> remains handshake_blocked
+	// Outer probe succeeds but inner canary fails -> transitions to degraded (BLOCKER 1: inner failure is data-plane failure)
 	outerSuccess = true
 	canarySuccess = false
 
@@ -793,8 +793,8 @@ func TestHealthProber_DualTier_RecoveryToActive(t *testing.T) {
 		t.Fatalf("expected ProbeTunnel success when outer probe succeeds, got %v", err)
 	}
 	current, _ = pool.GetTunnel(sID)
-	if current.Status != models.TunnelStatusHandshakeBlocked {
-		t.Fatalf("expected status handshake_blocked when inner canary fails, got %q", current.Status)
+	if current.Status != models.TunnelStatusDegraded {
+		t.Fatalf("expected status degraded when inner canary fails, got %q", current.Status)
 	}
 
 	// Both outer probe and inner canary succeed -> restores active status

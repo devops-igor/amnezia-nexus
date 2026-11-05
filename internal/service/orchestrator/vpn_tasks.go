@@ -296,29 +296,35 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 						continue
 					}
 					if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
-						slog.Warn("Backend tunnel outer probe recovered but inner canary probe failed; preserving handshake_blocked",
+						slog.Warn("Backend tunnel outer probe recovered but inner canary probe failed; marking degraded",
 							"tunnel_id", t.ID,
 							"endpoint", t.Endpoint,
 							"err", cErr,
 						)
+						if o.updateTunnelStatus(ctx, &t, models.TunnelStatusDegraded, latencyMS) {
+							degradedTunnels = append(degradedTunnels, t.ID)
+							t.Status = models.TunnelStatusDegraded
+							if o.probeFailVersions != nil && t.StateVersion > 0 {
+								o.probeFailVersions[t.ID] = t.StateVersion + 1
+							}
+						}
 						continue
 					}
 				} else if hasCanary {
 					if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
-						if errors.Is(cErr, tunnel.ErrNoActiveDevice) {
-							// No active device configured; do not treat as canary failure when not already blocked.
-						} else {
-							slog.Warn("Backend tunnel outer probe succeeded but inner canary probe failed; denying active promotion",
-								"tunnel_id", t.ID,
-								"endpoint", t.Endpoint,
-								"err", cErr,
-							)
-							if o.updateTunnelStatus(ctx, &t, models.TunnelStatusHandshakeBlocked, latencyMS) {
-								t.Status = models.TunnelStatusHandshakeBlocked
-								t.StateVersion++
+						slog.Warn("Backend tunnel outer probe succeeded but inner canary probe failed; denying active promotion",
+							"tunnel_id", t.ID,
+							"endpoint", t.Endpoint,
+							"err", cErr,
+						)
+						if o.updateTunnelStatus(ctx, &t, models.TunnelStatusDegraded, latencyMS) {
+							degradedTunnels = append(degradedTunnels, t.ID)
+							t.Status = models.TunnelStatusDegraded
+							if o.probeFailVersions != nil && t.StateVersion > 0 {
+								o.probeFailVersions[t.ID] = t.StateVersion + 1
 							}
-							continue
 						}
+						continue
 					}
 				}
 			} else if isBlocked {

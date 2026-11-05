@@ -297,6 +297,9 @@ func TestStart_RequiresFreshProbeBeforeRestoringBackendDevice(t *testing.T) {
 			return 0, ctx.Err()
 		}
 	})
+	svc.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		return nil
+	})
 
 	startDone := make(chan error, 1)
 	go func() {

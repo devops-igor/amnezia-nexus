@@ -15,14 +15,14 @@ import (
 // tunnel to active status.
 //
 // If outer handshake probe succeeds but inner canary fails:
-// - Status MUST transition to handshake_blocked (NOT active).
+// - Recovery is denied, status MUST remain disabled (NOT active, NOT handshake_blocked).
 // - New client admission via GetActiveTunnels() MUST be denied.
-// - Database persisted status MUST match handshake_blocked.
+// - Database persisted status MUST match disabled.
 // - When inner canary recovers, status recovers to active.
 func TestHealthSelfHeal_RespectsInnerCanary(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("outer_good_inner_failed_promotes_to_handshake_blocked", func(t *testing.T) {
+	t.Run("outer_good_inner_failed_denies_self_heal_recovery", func(t *testing.T) {
 		db := setupTestDB(t)
 		pool := NewPool(db)
 
@@ -97,7 +97,7 @@ func TestHealthSelfHeal_RespectsInnerCanary(t *testing.T) {
 			t.Fatal("expected inner canary probe to be evaluated during self-healing")
 		}
 
-		// Verify pool status is handshake_blocked, NOT active
+		// Verify pool status remains disabled, NOT active or handshake_blocked
 		curPool, err := pool.GetTunnel(sID)
 		if err != nil {
 			t.Fatalf("failed to get pool tunnel: %v", err)
@@ -105,17 +105,17 @@ func TestHealthSelfHeal_RespectsInnerCanary(t *testing.T) {
 		if curPool.Status == models.TunnelStatusActive {
 			t.Fatal("self-healing promoted tunnel to active despite failing inner canary!")
 		}
-		if curPool.Status != models.TunnelStatusHandshakeBlocked {
-			t.Fatalf("expected pool status %q, got %q", models.TunnelStatusHandshakeBlocked, curPool.Status)
+		if curPool.Status != models.TunnelStatusDisabled {
+			t.Fatalf("expected pool status %q, got %q", models.TunnelStatusDisabled, curPool.Status)
 		}
 
-		// Verify DB status is handshake_blocked, NOT active
+		// Verify DB status remains disabled, NOT active or handshake_blocked
 		storedDB, err := db.GetBackendTunnel(ctx, tun.ID)
 		if err != nil {
 			t.Fatalf("failed to get db tunnel: %v", err)
 		}
-		if storedDB.Status != models.TunnelStatusHandshakeBlocked {
-			t.Fatalf("expected db status %q, got %q", models.TunnelStatusHandshakeBlocked, storedDB.Status)
+		if storedDB.Status != models.TunnelStatusDisabled {
+			t.Fatalf("expected db status %q, got %q", models.TunnelStatusDisabled, storedDB.Status)
 		}
 
 		// Verify GetActiveTunnels() excludes the tunnel (no new admissions)
@@ -125,8 +125,8 @@ func TestHealthSelfHeal_RespectsInnerCanary(t *testing.T) {
 
 		// 3. Inner canary recovers -> normal probe promotes to active
 		canaryFails.Store(false)
-		if _, err := hp.ProbeTunnel(ctx, tun); err != nil {
-			t.Fatalf("expected ProbeTunnel success on recovery: %v", err)
+		for i := 0; i < cfg.SelfHealingThreshold; i++ {
+			hp.SelfHealSweep(ctx)
 		}
 
 		curRecovered, err := pool.GetTunnel(sID)

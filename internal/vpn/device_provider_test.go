@@ -361,8 +361,12 @@ func TestScheduledHealth_PreservesHandshakeBlocked(t *testing.T) {
 			live, ok := svc.sessionMgr.GetSessionSnapshotByPeer(peer.peerKey)
 			t.Logf("outer_recovers=%t threshold=%d canary_calls_during_orchestrator=%d source=%d alternative=%d pool_status=%s db_status=%s session_backend=%d memory_backend=%d route_on_original=%t",
 				outerRecovers, orch.ProbeFailureThreshold(), canaryCalls-callsBefore, a.ID, b.ID, got.Status, persisted.Status, sess.BackendTunnelID, live.BackendTunnelID, svc.forwarder.HasSessionRoute(peer.peerKey, initial.ID, peer.connID, peer.ip.String(), a.ID))
-			if got.Status != models.TunnelStatusHandshakeBlocked || persisted.Status != models.TunnelStatusHandshakeBlocked {
-				t.Errorf("scheduler bypassed dual-tier health: pool=%s db=%s", got.Status, persisted.Status)
+			expectedStatus := models.TunnelStatusHandshakeBlocked
+			if outerRecovers {
+				expectedStatus = models.TunnelStatusDegraded
+			}
+			if got.Status != expectedStatus || persisted.Status != expectedStatus {
+				t.Errorf("expected status %s: pool=%s db=%s", expectedStatus, got.Status, persisted.Status)
 			}
 			if !outerRecovers && (sess.BackendTunnelID != a.ID || !ok || live.BackendTunnelID != a.ID) {
 				t.Error("scheduled outer-only health moved an established viable session")

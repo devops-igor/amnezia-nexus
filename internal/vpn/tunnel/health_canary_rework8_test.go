@@ -71,7 +71,7 @@ func TestHealthCanary_Rework8_PromotionToActiveRejectedWhenInnerCanaryFails(t *t
 				t.Fatal("expected inner canary probe to be executed before active promotion")
 			}
 
-			// 1. In-memory pool status MUST NOT be active; must be handshake_blocked
+			// 1. In-memory pool status MUST NOT be active; must be degraded (BLOCKER 1: inner failure is data-plane failure)
 			cur, err := pool.GetTunnel(sID)
 			if err != nil {
 				t.Fatalf("failed to get tunnel from pool: %v", err)
@@ -79,11 +79,11 @@ func TestHealthCanary_Rework8_PromotionToActiveRejectedWhenInnerCanaryFails(t *t
 			if cur.Status == models.TunnelStatusActive {
 				t.Fatalf("promotion to active MUST be rejected when canary fails; got status %q", cur.Status)
 			}
-			if cur.Status != models.TunnelStatusHandshakeBlocked {
-				t.Fatalf("expected status %q, got %q", models.TunnelStatusHandshakeBlocked, cur.Status)
+			if cur.Status != models.TunnelStatusDegraded {
+				t.Fatalf("expected status %q, got %q", models.TunnelStatusDegraded, cur.Status)
 			}
 
-			// 2. Database persisted status MUST NOT be active; must be handshake_blocked
+			// 2. Database persisted status MUST NOT be active; must be degraded
 			persisted, err := db.GetBackendTunnel(ctx, tun.ID)
 			if err != nil {
 				t.Fatalf("failed to get tunnel from db: %v", err)
@@ -91,8 +91,8 @@ func TestHealthCanary_Rework8_PromotionToActiveRejectedWhenInnerCanaryFails(t *t
 			if persisted.Status == models.TunnelStatusActive {
 				t.Fatalf("persisted db status MUST NOT be active; got %q", persisted.Status)
 			}
-			if persisted.Status != models.TunnelStatusHandshakeBlocked {
-				t.Fatalf("expected persisted db status %q, got %q", models.TunnelStatusHandshakeBlocked, persisted.Status)
+			if persisted.Status != models.TunnelStatusDegraded {
+				t.Fatalf("expected persisted db status %q, got %q", models.TunnelStatusDegraded, persisted.Status)
 			}
 
 			// 3. New client admission via GetActiveTunnels() MUST be denied

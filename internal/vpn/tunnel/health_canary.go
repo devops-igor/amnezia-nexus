@@ -208,6 +208,15 @@ func (hp *HealthProber) probeCanary(ctx context.Context, tunnel *models.BackendT
 func (hp *HealthProber) defaultCanaryProbe(ctx context.Context, tunnel *models.BackendTunnel) error {
 	dev := hp.GetDevice(tunnel.ID)
 	if dev == nil {
+		hp.mu.RLock()
+		hook := hp.onActiveHook
+		hp.mu.RUnlock()
+		if hook != nil {
+			_ = hook(ctx, tunnel)
+			dev = hp.GetDevice(tunnel.ID)
+		}
+	}
+	if dev == nil {
 		return fmt.Errorf("%w: tunnel %d", ErrNoActiveDevice, tunnel.ID)
 	}
 

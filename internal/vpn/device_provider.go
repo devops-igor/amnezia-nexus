@@ -3,6 +3,7 @@ package vpn
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
@@ -40,8 +41,11 @@ func (s *Service) SubnetCIDR() string {
 
 // ProbeCanary probes the data plane of a backend tunnel using the service's health prober.
 func (s *Service) ProbeCanary(ctx context.Context, t *models.BackendTunnel) error {
-	if s.prober == nil {
+	if s == nil || s.prober == nil {
 		return errors.New("health prober not initialized")
+	}
+	if err := s.ensureBackendDeviceAttached(ctx, t); err != nil {
+		return fmt.Errorf("failed to ensure backend device attached: %w", err)
 	}
 	return s.prober.ProbeCanary(ctx, t)
 }

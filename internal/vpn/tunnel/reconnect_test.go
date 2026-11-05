@@ -242,11 +242,11 @@ func TestReconnectManager_RespectsInnerCanaryRecoveryDecision(t *testing.T) {
 				if reconnected != 0 {
 					t.Errorf("expected 0 reconnected tunnels when inner canary fails, got %d", reconnected)
 				}
-				if latestPool.Status != models.TunnelStatusHandshakeBlocked {
-					t.Errorf("expected pool status to remain %s, got %s", models.TunnelStatusHandshakeBlocked, latestPool.Status)
+				if latestPool.Status != models.TunnelStatusDegraded {
+					t.Errorf("expected pool status to be %s, got %s", models.TunnelStatusDegraded, latestPool.Status)
 				}
-				if storedDB.Status != models.TunnelStatusHandshakeBlocked {
-					t.Errorf("expected DB status to remain %s, got %s", models.TunnelStatusHandshakeBlocked, storedDB.Status)
+				if storedDB.Status != models.TunnelStatusDegraded {
+					t.Errorf("expected DB status to be %s, got %s", models.TunnelStatusDegraded, storedDB.Status)
 				}
 				if len(activeTunnels) != 0 {
 					t.Errorf("expected 0 active tunnels (new client admission rejected), got %d", len(activeTunnels))
