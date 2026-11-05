@@ -1,4 +1,5 @@
 {
+  "deploy_host_key_confirm": "信任此服务器前，请通过独立渠道核实此 SSH 指纹。是否信任此身份？",
   "vpn_diag_memory_limit_unavailable": "内存限制不可用",
   "vpn_diag_heap_memory": "堆内存：{value} MiB",
   "vpn_diag_queue_unavailable": "队列不可用",

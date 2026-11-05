@@ -76,7 +76,8 @@ func TestRework3_AWGRetryIdempotentContainerManagement(t *testing.T) {
 	for _, running := range []bool{true, false} {
 		t.Run(fmt.Sprintf("running=%t", running), func(t *testing.T) {
 			created := false
-			mockClient := &testStatefulSSHClient{
+			var mockClient *testStatefulSSHClient
+			mockClient = &testStatefulSSHClient{
 				mockAWGSSHClient: newMockAWGSSHClient(),
 				cmdFunc: func(ctx context.Context, cmd string) (string, string, int, error) {
 					if cmd == "docker --version" {
@@ -84,6 +85,21 @@ func TestRework3_AWGRetryIdempotentContainerManagement(t *testing.T) {
 					}
 					if strings.Contains(cmd, "docker ps --filter publish=") && created && running {
 						return "0.0.0.0:51820->51820/udp", "", 0, nil
+					}
+					if strings.Contains(cmd, "docker ps -a") {
+						if created {
+							return "amnezia-awg2", "", 0, nil
+						}
+						return "", "", 0, nil
+					}
+					if strings.Contains(cmd, "find /opt/amnezia") {
+						return "", "", 0, nil
+					}
+					if strings.Contains(cmd, "tar -xOf") || strings.Contains(cmd, "showconf awg0") {
+						return string(mockClient.files["/opt/amnezia/awg/awg0.conf"]), "", 0, nil
+					}
+					if strings.Contains(cmd, "docker cp") {
+						return mockClient.defaultRunSudo(cmd)
 					}
 					if strings.Contains(cmd, "docker inspect -f '{{.State.Status}}'") {
 						if created {

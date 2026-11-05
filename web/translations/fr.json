@@ -1,4 +1,5 @@
 {
+  "deploy_host_key_confirm": "Vérifiez indépendamment cette empreinte SSH avant de faire confiance au serveur. Accepter cette identité ?",
   "vpn_diag_memory_limit_unavailable": "Limite indisponible",
   "vpn_diag_heap_memory": "Tas : {value} MiB",
   "vpn_diag_queue_unavailable": "File indisponible",

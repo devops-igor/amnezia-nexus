@@ -77,11 +77,12 @@ func TestRework3_FirstContactHostKeyEnforcement(t *testing.T) {
 		t.Fatal("expected mismatched fingerprint to be rejected")
 	}
 
-	// 4. Explicit confirmation flag succeeds
+	// 4. Confirmation must name the identity that was displayed.
 	gotFP, err = h.verifyDeploySSHAccess(ctx, "198.51.100.50", GigahostDeployRequest{
-		OrderID:        "ord_f1_confirmed",
-		SSHPassword:    "fixture-password",
-		ConfirmHostKey: true,
+		OrderID:             "ord_f1_confirmed",
+		SSHPassword:         "fixture-password",
+		ConfirmHostKey:      true,
+		ExpectedFingerprint: fp,
 	})
 	if err != nil {
 		t.Fatalf("expected explicitly confirmed first contact to succeed, got: %v", err)
@@ -154,8 +155,8 @@ func TestRework3_TrafficQualificationFailClosed(t *testing.T) {
 		SSHPassword:    "fixture-password",
 		ConfirmHostKey: true,
 	})
-	if err != nil {
-		t.Fatalf("DeployGigahostOrder returned error instead of failed deploy DTO: %v", err)
+	if err == nil {
+		t.Fatal("qualification failure must return an error alongside diagnostics")
 	}
 	if st.Status != DeployStatusFailed {
 		t.Fatalf("expected deploy status %q on probe failure, got %q", DeployStatusFailed, st.Status)

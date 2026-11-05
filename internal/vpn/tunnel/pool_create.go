@@ -118,7 +118,7 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 				ProbePrivateKey: candProbePrivKey,
 				Protocol:        models.ProtocolAWG,
 			}
-			changed := !models.SameTunnelIdentity(existing, &cand)
+			changed := !models.SameTunnelIdentity(existing, &cand) || (ctx != nil && ctx.Value(DeployEnrollmentKey) != nil)
 
 			candStateVersion := existing.StateVersion
 			if changed {
@@ -138,7 +138,7 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 				if changed {
 					updates["state_version"] = candStateVersion
 				}
-				if err := p.db.UpdateBackendTunnel(ctx, existing.ID, updates); err != nil {
+				if err := p.persistTunnelEnrollment(ctx, existing, updates); err != nil {
 					return nil, fmt.Errorf("failed to persist backend tunnel updates: %w", err)
 				}
 			}
@@ -147,6 +147,7 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 			existing.PublicKey = candPubKey
 			existing.PrivateKey = candPrivKey
 			existing.ProbePrivateKey = candProbePrivKey
+			resetTunnelEnrollmentHealth(ctx, existing)
 			if changed {
 				existing.StateVersion = candStateVersion
 			}
@@ -161,7 +162,7 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 			Protocol:       proto,
 			ProtocolParams: bytes.Clone(opts.ProtocolParams),
 		}
-		changed := !models.SameTunnelIdentity(existing, &cand)
+		changed := !models.SameTunnelIdentity(existing, &cand) || (ctx != nil && ctx.Value(DeployEnrollmentKey) != nil)
 
 		candStateVersion := existing.StateVersion
 		if changed {
@@ -180,7 +181,7 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 			if changed {
 				updates["state_version"] = candStateVersion
 			}
-			if err := p.db.UpdateBackendTunnel(ctx, existing.ID, updates); err != nil {
+			if err := p.persistTunnelEnrollment(ctx, existing, updates); err != nil {
 				return nil, fmt.Errorf("failed to persist backend tunnel updates: %w", err)
 			}
 		}
@@ -188,6 +189,7 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 		existing.Endpoint = endpoint
 		existing.Protocol = proto
 		existing.ProtocolParams = bytes.Clone(opts.ProtocolParams)
+		resetTunnelEnrollmentHealth(ctx, existing)
 		if changed {
 			existing.StateVersion = candStateVersion
 		}

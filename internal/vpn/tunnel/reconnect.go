@@ -196,7 +196,8 @@ func (rm *ReconnectManager) CheckAndReconnect(ctx context.Context) int {
 			delete(rm.backoffs, t.ServerID)
 			delete(rm.retries, t.ServerID)
 			delete(rm.nextAttempt, t.ServerID)
-			_ = rm.pool.SetTunnelStatus(ctx, t.ServerID, "active", latency)
+			// ProbeTunnel already committed a generation-fenced health result.
+			// A second unversioned write could resurrect a reenrolled tunnel.
 			reconnectedCount++
 		} else {
 			// Failed, increase backoff

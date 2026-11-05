@@ -72,34 +72,16 @@ fi
 // mid-build with a stale local cache.
 const awgBaseImage = "devopsigor/amneziawg:v3.1.20260828-1"
 
-func (m *AWGManager) buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port string, preserve ...bool) error {
+func (m *AWGManager) buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port string) error {
 	cName := m.containerName()
 	if !IsValidContainerName(cName) {
 		cName = "amnezia-awg2"
 	}
-	preserveContainers := len(preserve) > 0 && preserve[0]
-
-	if preserveContainers {
-		inspectCmd := fmt.Sprintf("docker inspect -f '{{.State.Status}}' %s 2>/dev/null || true", ssh.EscapeShellArg(cName))
-		out, _, _, _ := client.RunSudoCommand(ctx, inspectCmd)
-		status := strings.TrimSpace(out)
-		if status == "running" {
-			_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker network connect amnezia-dns-net %s 2>/dev/null || true", ssh.EscapeShellArg(cName)))
-			return nil
-		}
-		if status == "exited" || status == "created" || status == "stopped" {
-			startCmd := fmt.Sprintf("docker start %s 2>/dev/null || true", ssh.EscapeShellArg(cName))
-			if _, _, code, err := client.RunSudoCommand(ctx, startCmd); err == nil && code == 0 {
-				_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker network connect amnezia-dns-net %s 2>/dev/null || true", ssh.EscapeShellArg(cName)))
-				return nil
-			}
-		}
-	}
-
-	if !preserveContainers {
-		if err := checkUDPPortAvailable(ctx, client, port); err != nil {
-			return err
-		}
+	// Preservation/recovery is decided before provisioning, under the remote
+	// installation lock. A container appearing here is a conflict, not permission
+	// to initialize its identity or replace its peers.
+	if err := checkUDPPortAvailable(ctx, client, port); err != nil {
+		return err
 	}
 	dockerfile := fmt.Sprintf(`FROM %s
 LABEL maintainer="AmneziaVPN"
@@ -132,12 +114,6 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
 %s`, ssh.EscapeShellArg(port), ssh.EscapeShellArg(port), ssh.EscapeShellArg(cName), ssh.EscapeShellArg(cName))
 
 	if _, errOut, rCode, err := client.RunSudoCommand(ctx, runCmd); err != nil || rCode != 0 {
-		if preserveContainers && (rCode == 125 || strings.Contains(errOut, "already in use") || strings.Contains(errOut, "Conflict")) {
-			startCmd := fmt.Sprintf("docker start %s 2>/dev/null || true", ssh.EscapeShellArg(cName))
-			_, _, _, _ = client.RunSudoCommand(ctx, startCmd)
-			_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker network connect amnezia-dns-net %s 2>/dev/null || true", ssh.EscapeShellArg(cName)))
-			return nil
-		}
 		return fmt.Errorf("failed to run container (code %d): %s, %w", rCode, errOut, err)
 	}
 
@@ -404,13 +380,32 @@ func initializeServerKeysAndConfig(ctx context.Context, client ssh.SSHClient, po
 
 // Install deploys Docker (if missing), builds the AWG container, configures parameters, and starts the service.
 func (m *AWGManager) Install(ctx context.Context, server *models.Server, params map[string]any) error {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
 	client, err := m.getSSHClient(ctx, server)
 	if err != nil {
 		return err
 	}
 
+	if err := ensureDockerInstalled(ctx, client); err != nil {
+		return err
+	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	installHook := m.installHook
+	m.mu.Unlock()
+	unlock, err := m.acquireRemoteServerLock(ctx, client, server.ID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	preserveContainers := preserveAWGInstallation(params)
+	if preserveContainers {
+		recovered, err := m.recoverAWGInstallation(ctx, client, server)
+		if err != nil || recovered {
+			return err
+		}
+	}
 
 	port := AWGDefaults["port"]
 	if p, ok := params["port"]; ok && fmt.Sprint(p) != "" {
@@ -451,25 +446,14 @@ func (m *AWGManager) Install(ctx context.Context, server *models.Server, params 
 		awgParams.I4 = cpsPackets["i4"]
 		awgParams.I5 = cpsPackets["i5"]
 	}
-	if m.installHook != nil {
-		m.installHook(awgParams)
+	if installHook != nil {
+		installHook(awgParams)
 	}
 
-	preserveContainers := false
-	if p, ok := parseBoolParam(params["preserve_containers"]); ok {
-		preserveContainers = p
-	}
-	if p, ok := parseBoolParam(params["reconcile"]); ok && p {
-		preserveContainers = true
-	}
-
-	if err := ensureDockerInstalled(ctx, client); err != nil {
-		return err
-	}
 	if err := prepareHostAndContainers(ctx, client, preserveContainers); err != nil {
 		return err
 	}
-	if err := m.buildAndRunAWGContainer(ctx, client, port, preserveContainers); err != nil {
+	if err := m.buildAndRunAWGContainer(ctx, client, port); err != nil {
 		return err
 	}
 	return m.initializeServerKeysAndConfig(ctx, client, port, awgParams, params, server)

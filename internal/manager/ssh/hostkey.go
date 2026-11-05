@@ -104,10 +104,9 @@ func CompareFingerprints(stored, actual string) bool {
 		return true
 	}
 
-	// 4. Case-insensitive constant-time compare
-	sLower := strings.ToLower(s)
-	aLower := strings.ToLower(a)
-	if len(sLower) == len(aLower) && subtle.ConstantTimeCompare([]byte(sLower), []byte(aLower)) == 1 {
+	// SHA256 payload is case-sensitive Base64. Case folding is permitted
+	// only for the legacy colon-separated hexadecimal representation.
+	if strings.Contains(s, ":") && strings.Contains(a, ":") && !strings.Contains(s, "SHA256:") && !strings.Contains(a, "SHA256:") && strings.EqualFold(s, a) {
 		return true
 	}
 

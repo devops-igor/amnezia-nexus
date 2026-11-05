@@ -176,11 +176,29 @@ func TestRework2_AWGRetryPreservesIdentity(t *testing.T) {
 	}
 
 	destructive := false
-	var uploadedConfig string
+	priv, _, keyErr := awg.GenerateWGKeypair()
+	if keyErr != nil {
+		t.Fatal(keyErr)
+	}
+	wire, keyErr := awg.GenerateAWGParams("standard", true)
+	if keyErr != nil {
+		t.Fatal(keyErr)
+	}
+	savedConfig := awg.RenderServerConfig(priv, "192.0.2.1", "24", "51820", "1320", wire, nil)
+	uploadedConfig := savedConfig
 	client := &testMockSSHClient{
 		cmdFunc: func(ctx context.Context, cmd string) (string, string, int, error) {
 			if strings.Contains(cmd, "docker rm -fv") {
 				destructive = true
+			}
+			if strings.Contains(cmd, "docker ps -a") {
+				return "amnezia-awg2", "", 0, nil
+			}
+			if strings.Contains(cmd, "docker inspect") {
+				return "running", "", 0, nil
+			}
+			if strings.Contains(cmd, "tar -xOf") || strings.Contains(cmd, "showconf awg0") {
+				return savedConfig, "", 0, nil
 			}
 			return "", "", 0, nil
 		},
@@ -200,8 +218,8 @@ func TestRework2_AWGRetryPreservesIdentity(t *testing.T) {
 	if destructive {
 		t.Errorf("retry executed destructive container removal (docker rm -fv)")
 	}
-	if uploadedConfig == "" {
-		t.Errorf("expected configuration to be written on retry")
+	if uploadedConfig != savedConfig {
+		t.Fatal("retry overwrote the installed configuration")
 	}
 
 	after, err := h.db.GetServer(ctx, first.ServerID)

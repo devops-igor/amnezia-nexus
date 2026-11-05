@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -18,7 +17,6 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 	"github.com/go-chi/chi/v5"
-	gossh "golang.org/x/crypto/ssh"
 )
 
 // Detailed deployment progression status constants.
@@ -237,155 +235,6 @@ func (h *Handlers) failDeployStatus(
 	}, err
 }
 
-func (h *Handlers) resolveDeployServerID(ctx context.Context, assignedIP string, req GigahostDeployRequest) *int64 {
-	if h.db != nil {
-		if servers, err := h.db.GetAllServers(ctx); err == nil {
-			for _, s := range servers {
-				if strings.EqualFold(strings.TrimSpace(s.Host), strings.TrimSpace(assignedIP)) ||
-					(req.ProviderServerID > 0 && matchProviderServerID(s.Protocols["provider_server_id"], req.ProviderServerID)) {
-					id := s.ID
-					return &id
-				}
-			}
-		}
-	}
-	if req.OrderID != "" {
-		if _, nexusID, _, _, err := h.getDeployOrderByID(ctx, req.OrderID); err == nil && nexusID > 0 {
-			return &nexusID
-		}
-	}
-	return nil
-}
-
-func validateSSHKeyInvariants(key gossh.PublicKey) error {
-	if key == nil || len(key.Marshal()) < 32 {
-		return errors.New("invalid host key: key material too short or nil")
-	}
-	keyType := key.Type()
-	if keyType == gossh.KeyAlgoED25519 || keyType == gossh.KeyAlgoRSA ||
-		strings.HasPrefix(keyType, "ecdsa-") || strings.HasPrefix(keyType, "ssh-") {
-		return nil
-	}
-	return fmt.Errorf("invalid host key type: %s", keyType)
-}
-
-func (h *Handlers) buildDeployHostKeyCallback(
-	ctx context.Context,
-	req GigahostDeployRequest,
-	serverID *int64,
-	capturedFPOut *string,
-) gossh.HostKeyCallback {
-	expectedFP := strings.TrimSpace(req.ExpectedFingerprint)
-	if expectedFP == "" {
-		expectedFP = strings.TrimSpace(req.HostKeyFingerprint)
-	}
-
-	return func(hostname string, remote net.Addr, key gossh.PublicKey) error {
-		if err := validateSSHKeyInvariants(key); err != nil {
-			return err
-		}
-
-		actualFP := ssh.FingerprintSHA256(key)
-		if capturedFPOut != nil {
-			*capturedFPOut = actualFP
-		}
-
-		if expectedFP != "" {
-			if !ssh.CompareFingerprints(expectedFP, actualFP) {
-				return fmt.Errorf("host key fingerprint mismatch: expected %s, got %s", expectedFP, actualFP)
-			}
-			return nil
-		}
-
-		if serverID != nil && h.db != nil {
-			knownFP, err := h.db.GetKnownHostFingerprint(ctx, *serverID)
-			if err != nil {
-				return fmt.Errorf("failed to query known host fingerprint: %w", err)
-			}
-			if strings.TrimSpace(knownFP) != "" {
-				if ssh.CompareFingerprints(knownFP, actualFP) {
-					return nil
-				}
-				return &ssh.ErrHostKeyMismatch{
-					ServerID: *serverID,
-					Host:     hostname,
-					Expected: knownFP,
-					Actual:   actualFP,
-				}
-			}
-		}
-
-		if !req.ConfirmHostKey {
-			return fmt.Errorf("unconfirmed host key on first contact (%s); explicit confirmation or expected fingerprint required", actualFP)
-		}
-		return nil
-	}
-}
-
-func (h *Handlers) verifyDeploySSHAccess(
-	ctx context.Context,
-	assignedIP string,
-	req GigahostDeployRequest,
-) (string, error) {
-	sshPort := req.SSHPort
-	if sshPort <= 0 {
-		sshPort = 22
-	}
-	sshUser := strings.TrimSpace(req.SSHUser)
-	if sshUser == "" {
-		sshUser = "root"
-	}
-
-	serverID := h.resolveDeployServerID(ctx, assignedIP, req)
-	var capturedFP string
-	hostKeyCallback := h.buildDeployHostKeyCallback(ctx, req, serverID, &capturedFP)
-
-	expectedFP := strings.TrimSpace(req.ExpectedFingerprint)
-	if expectedFP == "" {
-		expectedFP = strings.TrimSpace(req.HostKeyFingerprint)
-	}
-
-	sshCfg := ssh.Config{
-		Host:                      assignedIP,
-		Port:                      sshPort,
-		User:                      sshUser,
-		Password:                  req.SSHPassword,
-		PrivateKey:                req.SSHPrivateKey,
-		Timeout:                   15 * time.Second,
-		Store:                     h.db,
-		ServerID:                  serverID,
-		RequireFingerprintConfirm: serverID == nil && expectedFP == "" && !req.ConfirmHostKey,
-		HostKeyCallback:           hostKeyCallback,
-	}
-
-	client, err := h.dialDeploySSH(ctx, sshCfg)
-	if err != nil {
-		return "", err
-	}
-	defer client.Close()
-
-	if fc, ok := client.(interface{ CapturedFingerprint() string }); ok {
-		capturedFP = fc.CapturedFingerprint()
-	}
-	if capturedFP != "" {
-		if err := validateFingerprintFormat(capturedFP); err != nil {
-			return "", fmt.Errorf("invalid host key fingerprint received: %w", err)
-		}
-	}
-	return capturedFP, nil
-}
-
-func validateFingerprintFormat(fp string) error {
-	s := strings.TrimSpace(fp)
-	if s == "" {
-		return errors.New("empty host key fingerprint")
-	}
-	if len(s) < 8 {
-		return fmt.Errorf("invalid host key fingerprint: %s", s)
-	}
-	return nil
-}
-
 func isDeployOrderResume(existingServer *models.Server, nexusServerID, providerServerID int64, order *GigahostOrderRecord, req GigahostDeployRequest, assignedIP string) bool {
 	return (nexusServerID > 0 && nexusServerID == existingServer.ID) ||
 		(order != nil && order.OrderID == req.OrderID && (order.ServerID == providerServerID || strings.EqualFold(order.AssignedIP, assignedIP)))
@@ -397,21 +246,16 @@ func (h *Handlers) reconcileExistingServerResume(
 	req GigahostDeployRequest,
 	fingerprint string,
 ) error {
-	if fingerprint != "" {
-		knownFP, err := h.db.GetKnownHostFingerprint(ctx, existingServer.ID)
-		if err != nil {
-			return fmt.Errorf("failed to query known host fingerprint: %w", err)
-		}
-		if strings.TrimSpace(knownFP) == "" {
-			if err := h.db.SaveKnownHostFingerprint(ctx, existingServer.ID, fingerprint); err != nil {
-				return fmt.Errorf("failed to save host key fingerprint: %w", err)
-			}
-		} else if !ssh.CompareFingerprints(knownFP, fingerprint) {
-			return fmt.Errorf("host key mismatch for server %d: expected %s, got %s", existingServer.ID, knownFP, fingerprint)
-		}
+	if err := validateFingerprintFormat(fingerprint); err != nil {
+		return err
+	}
+	if err := h.db.BindKnownHostFingerprint(ctx, existingServer.ID, fingerprint); err != nil {
+		return err
 	}
 	if req.SSHPassword != "" || req.SSHPrivateKey != "" {
-		_ = h.db.UpdateServerCredentials(ctx, existingServer.ID, req.SSHPassword, req.SSHPrivateKey)
+		if err := h.db.UpdateServerCredentials(ctx, existingServer.ID, req.SSHPassword, req.SSHPrivateKey); err != nil {
+			return fmt.Errorf("update SSH credentials: %w", err)
+		}
 		if req.SSHPassword != "" {
 			existingServer.SSHPass = req.SSHPassword
 		}
@@ -475,20 +319,14 @@ func (h *Handlers) registerDeployServer(
 		CreatedAt: time.Now().UTC(),
 	}
 
-	createdID, err := h.db.CreateServer(ctx, newServer)
+	if err := validateFingerprintFormat(fingerprint); err != nil {
+		return nil, err
+	}
+	createdID, err := h.db.CreateServerWithFingerprint(ctx, newServer, fingerprint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to register server in database: %w", err)
 	}
 	newServer.ID = createdID
-
-	if fingerprint != "" {
-		if err := validateFingerprintFormat(fingerprint); err != nil {
-			return nil, fmt.Errorf("invalid host key fingerprint: %w", err)
-		}
-		if err := h.db.SaveKnownHostFingerprint(ctx, createdID, fingerprint); err != nil {
-			return nil, fmt.Errorf("failed to persist host key fingerprint: %w", err)
-		}
-	}
 
 	return newServer, nil
 }
@@ -567,6 +405,7 @@ func (h *Handlers) enableDeployBackend(
 		return nil
 	}
 
+	ctx = context.WithValue(ctx, tunnel.DeployEnrollmentKey, true)
 	normProto := models.NormalizeTunnelProtocol(protocol)
 	if normProto == models.ProtocolVLESS || normProto == models.ProtocolNaive {
 		params, _, _, err := h.resolveInstalledProxyParamsForProto(ctx, server, normProto)
@@ -605,16 +444,13 @@ func (h *Handlers) qualifyBackendTraffic(ctx context.Context, server *models.Ser
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	latency, err := h.vpnSvc.ProbeTunnel(probeCtx, tun)
+	_, err = h.vpnSvc.ProbeTunnel(probeCtx, tun)
 	if err != nil {
-		_ = h.vpnSvc.SetTunnelStatus(ctx, server.ID, models.TunnelStatusDegraded, 0)
 		_ = h.vpnSvc.DisableBackend(ctx, server.ID)
 		return fmt.Errorf("backend traffic qualification probe failed: %w", err)
 	}
-	if latency <= 0 {
-		latency = 10
-	}
-	return h.vpnSvc.SetTunnelStatus(ctx, server.ID, models.TunnelStatusActive, latency)
+	// HealthProber commits with identity/version fencing; never repeat an unfenced write.
+	return nil
 }
 
 // DeployGigahostOrder orchestrates the multi-step onboarding of a ready Gigahost VPS into an active VPN backend.
@@ -663,6 +499,7 @@ func (h *Handlers) DeployGigahostOrder(ctx context.Context, req GigahostDeployRe
 
 	// 2. SSH Verification & Host Identity Check
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusSSHVerifying, DeployStatusSSHVerifying, "", providerServerID, nexusServerID, assignedIP)
+	req.ProviderServerID = providerServerID
 	fingerprint, err := h.verifyDeploySSHAccess(ctx, assignedIP, req)
 	if err != nil {
 		return h.failDeployStatus(ctx, req.OrderID, DeployStatusSSHVerifying, fmt.Errorf("SSH verification failed: %w", err), providerServerID, nexusServerID, assignedIP, "", "")
@@ -693,10 +530,6 @@ func (h *Handlers) DeployGigahostOrder(ctx context.Context, req GigahostDeployRe
 	if err := h.enableDeployBackend(ctx, server, protocol); err != nil {
 		if nexusServerID > 0 && h.vpnSvc != nil {
 			_ = h.vpnSvc.DisableBackend(ctx, nexusServerID)
-		}
-		if strings.Contains(err.Error(), "traffic qualification") {
-			st, _ := h.failDeployStatus(ctx, req.OrderID, DeployStatusEnablingBackend, fmt.Errorf("backend enablement failed: %w", err), providerServerID, nexusServerID, assignedIP, protocol, port)
-			return st, nil
 		}
 		return h.failDeployStatus(ctx, req.OrderID, DeployStatusEnablingBackend, fmt.Errorf("backend enablement failed: %w", err), providerServerID, nexusServerID, assignedIP, protocol, port)
 	}
@@ -789,6 +622,11 @@ func (h *Handlers) GigahostDeployHandler(w http.ResponseWriter, r *http.Request)
 
 	status, err := h.DeployGigahostOrder(r.Context(), req)
 	if err != nil {
+		var confirmation *ssh.ErrFingerprintRequired
+		if errors.As(err, &confirmation) {
+			h.JSON(w, http.StatusConflict, map[string]any{"status": "host_key_confirmation_required", "host": confirmation.Host, "fingerprint": confirmation.Fingerprint, "deploy": status})
+			return
+		}
 		if errors.Is(err, ErrDuplicateServerID) || strings.Contains(err.Error(), "duplicate server registration rejected") {
 			h.JSONError(w, http.StatusConflict, "duplicate_server_id", err.Error())
 			return

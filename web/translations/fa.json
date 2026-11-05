@@ -1,4 +1,5 @@
 {
+  "deploy_host_key_confirm": "پیش از اعتماد به سرور، اثر انگشت SSH را مستقل بررسی کنید. به این هویت اعتماد می‌کنید؟",
   "vpn_diag_memory_limit_unavailable": "محدودیت در دسترس نیست",
   "vpn_diag_heap_memory": "حافظه هیپ: {value} MiB",
   "vpn_diag_queue_unavailable": "صف در دسترس نیست",

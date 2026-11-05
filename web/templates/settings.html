@@ -410,6 +410,7 @@
     </button>
 </div>
 
+<script src="/static/js/gigahost_setup.js"></script>
 <script>
     document.getElementById('ssl_enabled').addEventListener('change', (e) => {
         document.getElementById('sslFields').style.display = e.target.checked ? 'block' : 'none';
@@ -692,31 +693,6 @@
         }
     }
 
-    async function triggerGigahostSetup(orderId) {
-        const password = prompt(_('deploy_ssh_password_prompt') || 'Enter SSH Password for VPS:');
-        if (!password) return;
-        const protoChoice = (prompt(_('deploy_protocol_prompt') || 'Select protocol (awg, vless, naive):', 'awg') || 'awg').toLowerCase().trim();
-        const protocol = (protoChoice === 'vless' || protoChoice === 'naive') ? protoChoice : 'awg';
-        let tlsDomain = '';
-        if (protocol === 'naive' || protocol === 'vless') {
-            tlsDomain = prompt(_('deploy_domain_prompt') || 'Enter TLS domain (required for naive, optional for vless):') || '';
-        }
-        UI.toast(_('deploy_status_polling') || 'Setting up VPN backend...', 'info');
-        try {
-            await API.post('/api/admin/hosting/gigahost/orders/' + encodeURIComponent(orderId) + '/setup', {
-                ssh_password: password,
-                protocol: protocol,
-                tls_domain: tlsDomain,
-                confirm_host_key: true
-            });
-            UI.toast(_('success') || 'Setup completed', 'success');
-        } catch (err) {
-            UI.toast(err.message || _('error'), 'error');
-        } finally {
-            loadRecentOrders();
-        }
-    }
-
     async function loadRecentOrders() {
         const container = document.getElementById('recentOrdersContainer');
         if (!container) return;
@@ -739,7 +715,8 @@
             await Promise.all(orders.slice(0, 5).map(async (o) => {
                 if (!o.order_id) return;
                 try {
-                    const st = await API.get('/api/admin/hosting/gigahost/orders/' + encodeURIComponent(o.order_id) + '/status');
+                    const response = await API.get('/api/admin/hosting/gigahost/orders/' + encodeURIComponent(o.order_id) + '/status');
+                    const st = response && (response.deploy || response);
                     if (st) {
                         if (st.step) o.step = st.step;
                         if (st.error) o.last_error = st.error;

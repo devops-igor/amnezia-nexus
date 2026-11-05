@@ -30,7 +30,7 @@ func (m *mockDeploySSHClient) CapturedFingerprint() string {
 	if m.fingerprint != "" {
 		return m.fingerprint
 	}
-	return "SHA256:mock_deploy_fingerprint_abc123"
+	return "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 }
 
 func (m *mockDeploySSHClient) Close() error {
@@ -78,7 +78,7 @@ func setupDeployTestEnv(t *testing.T) (*Handlers, *chi.Mux, *mockGigahostClient)
 	h.SetGigahostClient(mockClient)
 
 	h.SetSSHDialerForTest(func(ctx context.Context, cfg ssh.Config) (ssh.SSHClient, error) {
-		return &mockDeploySSHClient{fingerprint: "SHA256:test_fingerprint_1001"}, nil
+		return &mockDeploySSHClient{fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}, nil
 	})
 
 	// Setup managers in registry
@@ -220,8 +220,8 @@ func TestGigahostDeploy_Success_AWG(t *testing.T) {
 
 	// Verify host key fingerprint was saved
 	fp, err := h.db.GetKnownHostFingerprint(ctx, status.ServerID)
-	if err != nil || fp != "SHA256:test_fingerprint_1001" {
-		t.Errorf("expected saved fingerprint SHA256:test_fingerprint_1001, got %s (err: %v)", fp, err)
+	if err != nil || fp != "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" {
+		t.Errorf("expected saved fingerprint SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, got %s (err: %v)", fp, err)
 	}
 
 	// Verify backend is active in VPN service
