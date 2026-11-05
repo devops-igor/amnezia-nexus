@@ -449,6 +449,14 @@ func (h *Handlers) qualifyBackendTraffic(ctx context.Context, server *models.Ser
 		_ = h.vpnSvc.DisableBackend(ctx, server.ID)
 		return fmt.Errorf("backend traffic qualification probe failed: %w", err)
 	}
+
+	// Finding F8: Outer handshake is necessary but not sufficient.
+	// Verify real data-plane payload forwarding before declaring the backend ready.
+	if err := h.vpnSvc.ProbeCanary(probeCtx, tun); err != nil {
+		_ = h.vpnSvc.DisableBackend(ctx, server.ID)
+		_ = h.vpnSvc.SetTunnelStatus(ctx, server.ID, models.TunnelStatusDisabled, 0)
+		return fmt.Errorf("data-plane payload verification failed: %w", err)
+	}
 	// HealthProber commits with identity/version fencing; never repeat an unfenced write.
 	return nil
 }

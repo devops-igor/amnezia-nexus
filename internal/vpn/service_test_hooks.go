@@ -3,17 +3,42 @@ package vpn
 import (
 	"context"
 	"errors"
+	"reflect"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
+// isRealProbeFunc reports whether fn is one of the production probe implementations
+// rather than an offline test mock closure.
+func isRealProbeFunc(fn tunnel.ProbeFunc) bool {
+	if fn == nil {
+		return false
+	}
+	p := reflect.ValueOf(fn).Pointer()
+	return p == reflect.ValueOf(health.ProbeAWGEndpointRange).Pointer() ||
+		p == reflect.ValueOf(health.ProbeAWGEndpoint).Pointer()
+}
+
 // SetProbeFunc sets the health probe function for testing or customized reachability probing.
+// When an offline mock probe closure is supplied, a default offline canary is installed
+// unless a custom canary probe function has already been set or real probing is requested.
 func (s *Service) SetProbeFunc(fn tunnel.ProbeFunc) {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.prober != nil {
 		s.prober.SetProbeFunc(fn)
+		if isRealProbeFunc(fn) {
+			s.prober.SetCanaryProbeFunc(nil)
+		} else if fn != nil && s.prober.GetCanaryProbeFunc() == nil {
+			s.prober.SetCanaryProbeFunc(func(context.Context, *models.BackendTunnel) error {
+				return nil
+			})
+		}
 	}
 }
 

@@ -37,6 +37,7 @@ type HealthConfig struct {
 	SelfHealingInterval  time.Duration
 	SelfHealingThreshold int
 	DisableSelfHealing   bool
+	SubnetCIDR           string
 }
 
 // DefaultHealthConfig returns standard default prober settings.
@@ -80,6 +81,9 @@ type HealthProber struct {
 	stopCh               chan struct{}
 	wg                   sync.WaitGroup
 	running              bool
+	probeCanaryFn        CanaryProbeFunc
+	devices              map[int64]PacketDevice
+	deviceProvider       func(tunnelID int64) PacketDevice
 }
 
 // NewHealthProber initializes a new HealthProber instance.
