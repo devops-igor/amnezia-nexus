@@ -51,6 +51,16 @@ func (hp *HealthProber) SetCanaryProbeFunc(fn CanaryProbeFunc) {
 	hp.probeCanaryFn = fn
 }
 
+// GetCanaryProbeFunc returns the custom canary override, or nil for real device probing.
+func (hp *HealthProber) GetCanaryProbeFunc() CanaryProbeFunc {
+	if hp == nil {
+		return nil
+	}
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	return hp.probeCanaryFn
+}
+
 // DeviceProvider provides access to active backend PacketDevices by tunnel or server ID.
 type DeviceProvider interface {
 	GetDevice(id int64) (PacketDevice, bool)

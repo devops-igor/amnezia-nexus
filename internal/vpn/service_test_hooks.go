@@ -8,12 +8,23 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
-// SetProbeFunc sets the health probe function for testing or customized reachability probing.
+// SetProbeFunc configures an outer probe and a default successful canary for test fixtures.
+// Custom canaries are preserved; use SetCanaryProbeFunc(nil) afterward to test real probing.
+// Production constructors must configure HealthProber directly instead.
 func (s *Service) SetProbeFunc(fn tunnel.ProbeFunc) {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.prober != nil {
 		s.prober.SetProbeFunc(fn)
+		// Service-level probe setters share s.mu, preserving custom fixture overrides.
+		if s.prober.GetCanaryProbeFunc() == nil {
+			s.prober.SetCanaryProbeFunc(func(context.Context, *models.BackendTunnel) error {
+				return nil
+			})
+		}
 	}
 }
 

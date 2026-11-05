@@ -13,6 +13,27 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
 )
 
+func TestGetCanaryProbeFunc(t *testing.T) {
+	var absent *HealthProber
+	if absent.GetCanaryProbeFunc() != nil {
+		t.Fatal("nil prober must not have a canary override")
+	}
+	hp := NewHealthProber(nil, nil, HealthConfig{})
+	if hp.GetCanaryProbeFunc() != nil {
+		t.Fatal("new prober must use real device probing")
+	}
+	want := errors.New("custom canary failure")
+	hp.SetCanaryProbeFunc(func(context.Context, *models.BackendTunnel) error { return want })
+	fn := hp.GetCanaryProbeFunc()
+	if fn == nil || !errors.Is(fn(t.Context(), &models.BackendTunnel{}), want) {
+		t.Fatal("getter did not return the custom canary")
+	}
+	hp.SetCanaryProbeFunc(nil)
+	if hp.GetCanaryProbeFunc() != nil {
+		t.Fatal("clearing override must restore real device probing")
+	}
+}
+
 type mockPacketDevice struct {
 	mu          sync.Mutex
 	writeErr    error
