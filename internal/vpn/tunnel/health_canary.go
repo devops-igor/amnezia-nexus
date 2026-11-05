@@ -71,13 +71,18 @@ func (hp *HealthProber) SetDeviceProvider(provider any) {
 	if hp == nil {
 		return
 	}
+	var subnetProv func() string
 	if sp, ok := provider.(interface{ SubnetCIDR() string }); ok {
+		subnetProv = sp.SubnetCIDR
 		if c := sp.SubnetCIDR(); c != "" {
 			hp.SetSubnetCIDR(c)
 		}
 	}
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
+	if subnetProv != nil {
+		hp.subnetProvider = subnetProv
+	}
 	switch p := provider.(type) {
 	case DeviceProvider:
 		hp.deviceProvider = func(tunnelID int64) PacketDevice {
@@ -96,7 +101,18 @@ func (hp *HealthProber) SetDeviceProvider(provider any) {
 		}
 	case nil:
 		hp.deviceProvider = nil
+		hp.subnetProvider = nil
 	}
+}
+
+// SetSubnetProvider sets a dynamic callback function for resolving the configured portal subnet CIDR.
+func (hp *HealthProber) SetSubnetProvider(provider func() string) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	hp.subnetProvider = provider
 }
 
 // SetSubnetCIDR updates the configured portal subnet CIDR for canary probes.
@@ -115,11 +131,18 @@ func (hp *HealthProber) GetSubnetCIDR() string {
 		return "10.100.0.0/16"
 	}
 	hp.mu.RLock()
-	defer hp.mu.RUnlock()
-	if hp.cfg.SubnetCIDR == "" {
-		return "10.100.0.0/16"
+	provider := hp.subnetProvider
+	cidr := hp.cfg.SubnetCIDR
+	hp.mu.RUnlock()
+	if provider != nil {
+		if c := provider(); c != "" {
+			return c
+		}
 	}
-	return hp.cfg.SubnetCIDR
+	if cidr != "" {
+		return cidr
+	}
+	return "10.100.0.0/16"
 }
 
 // RegisterDevice registers an active PacketDevice for a backend tunnel.

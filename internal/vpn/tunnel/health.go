@@ -84,6 +84,8 @@ type HealthProber struct {
 	probeCanaryFn        CanaryProbeFunc
 	devices              map[int64]PacketDevice
 	deviceProvider       func(tunnelID int64) PacketDevice
+	subnetProvider       func() string
+	pendingEnrollment    map[int64]bool
 }
 
 // NewHealthProber initializes a new HealthProber instance.
@@ -135,8 +137,50 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 		autoDisabled:      make(map[int64]bool),
 		successCounts:     make(map[int64]int),
 		healthGenerations: make(map[int64]int64),
+		pendingEnrollment: make(map[int64]bool),
 		stopCh:            make(chan struct{}),
 	}
+}
+
+// SetPendingEnrollment sets whether a backend server is currently undergoing initial enrollment qualification.
+// While guarded, outer handshake-only probes will not commit active status, keeping the backend quarantined as connecting.
+func (hp *HealthProber) SetPendingEnrollment(serverID int64, pending bool) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	if hp.pendingEnrollment == nil {
+		hp.pendingEnrollment = make(map[int64]bool)
+	}
+	if pending {
+		hp.pendingEnrollment[serverID] = true
+	} else {
+		delete(hp.pendingEnrollment, serverID)
+	}
+}
+
+// IsPendingEnrollment reports whether a backend server is currently undergoing initial enrollment qualification.
+func (hp *HealthProber) IsPendingEnrollment(serverID int64) bool {
+	if hp == nil {
+		return false
+	}
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	return hp.pendingEnrollment != nil && hp.pendingEnrollment[serverID]
+}
+
+// LatencyThresholdMS returns the configured latency threshold in milliseconds.
+func (hp *HealthProber) LatencyThresholdMS() int64 {
+	if hp == nil {
+		return 500
+	}
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	if hp.cfg.LatencyThresholdMS <= 0 {
+		return 500
+	}
+	return hp.cfg.LatencyThresholdMS
 }
 
 // SetMultiProtocolEnabled configures whether the prober inspects proxy tunnels.
@@ -383,15 +427,8 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		hp.preStatusCommitHook()
 	}
 
-	if hp.pool != nil {
-		expectedVersion := probeTarget.StateVersion
-		if snapshot != nil && snapshot.StateVersion > 0 {
-			expectedVersion = snapshot.StateVersion
-		}
-		if err := hp.pool.SetTunnelStatusIfCurrentWithVersion(ctx, probeTarget.ServerID, probeTarget.ID, expectedVersion, status, latencyMS); err != nil {
-			return 0, err
-		}
-		probeTarget.StateVersion = expectedVersion + 1
+	if err := hp.commitProbeSuccess(ctx, snapshot, &probeTarget, status, latencyMS); err != nil {
+		return 0, err
 	}
 	if err := hp.checkTunnelAvailable(&probeTarget); err != nil {
 		return 0, err
@@ -407,6 +444,38 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	hp.mu.Unlock()
 
 	return latencyMS, nil
+}
+
+func (hp *HealthProber) checkAndRecordPendingEnrollment(ctx context.Context, serverID int64) bool {
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	if ctx != nil && ctx.Value(DeployEnrollmentKey) != nil {
+		if hp.pendingEnrollment == nil {
+			hp.pendingEnrollment = make(map[int64]bool)
+		}
+		hp.pendingEnrollment[serverID] = true
+	}
+	return hp.pendingEnrollment != nil && hp.pendingEnrollment[serverID]
+}
+
+func (hp *HealthProber) commitProbeSuccess(ctx context.Context, snapshot, probeTarget *models.BackendTunnel, status string, latencyMS int64) error {
+	isPending := hp.checkAndRecordPendingEnrollment(ctx, probeTarget.ServerID)
+	if hp.pool == nil {
+		return nil
+	}
+	expectedVersion := probeTarget.StateVersion
+	if snapshot != nil && snapshot.StateVersion > 0 {
+		expectedVersion = snapshot.StateVersion
+	}
+	targetStatus := status
+	if isPending && ((snapshot != nil && snapshot.Status == models.TunnelStatusConnecting) || probeTarget.Status == models.TunnelStatusConnecting) {
+		targetStatus = models.TunnelStatusConnecting
+	}
+	if err := hp.pool.SetTunnelStatusIfCurrentWithVersion(ctx, probeTarget.ServerID, probeTarget.ID, expectedVersion, targetStatus, latencyMS); err != nil {
+		return err
+	}
+	probeTarget.StateVersion = expectedVersion + 1
+	return nil
 }
 
 func (hp *HealthProber) executeActiveHook(ctx context.Context, snapshot, tunnel *models.BackendTunnel) (int64, error) {

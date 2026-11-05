@@ -3,6 +3,7 @@ package vpn
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
@@ -47,6 +48,9 @@ func (s *Service) ProbeCanary(ctx context.Context, t *models.BackendTunnel) erro
 	if s == nil || s.prober == nil {
 		return errors.New("health prober not initialized")
 	}
+	if cidr := s.SubnetCIDR(); cidr != "" {
+		s.prober.SetSubnetCIDR(cidr)
+	}
 	s.mu.RLock()
 	var dev tunnel.PacketDevice
 	if s.backendDevices != nil && t != nil {
@@ -57,6 +61,58 @@ func (s *Service) ProbeCanary(ctx context.Context, t *models.BackendTunnel) erro
 	}
 	s.mu.RUnlock()
 	return s.prober.ProbeCanaryWithDevice(ctx, t, dev)
+}
+
+// PromoteQualifiedTunnel promotes a connecting backend tunnel to active (or degraded if latency is high)
+// after both outer handshake and inner canary probe have succeeded.
+func (s *Service) PromoteQualifiedTunnel(ctx context.Context, serverID int64, latencyMS int64) error {
+	if s == nil || s.pool == nil {
+		return errors.New("vpn service or pool not initialized")
+	}
+	if s.prober != nil {
+		defer s.prober.SetPendingEnrollment(serverID, false)
+	}
+	targetStatus := s.targetStatusForLatency(latencyMS)
+	return s.commitPromoteWithRetry(ctx, serverID, targetStatus, latencyMS)
+}
+
+func (s *Service) targetStatusForLatency(latencyMS int64) string {
+	thresh := int64(500)
+	if s.prober != nil {
+		thresh = s.prober.LatencyThresholdMS()
+	}
+	if latencyMS > thresh {
+		return models.TunnelStatusDegraded
+	}
+	return models.TunnelStatusActive
+}
+
+func (s *Service) commitPromoteWithRetry(ctx context.Context, serverID int64, targetStatus string, latencyMS int64) error {
+	for attempts := 0; attempts < 3; attempts++ {
+		tun, err := s.pool.GetTunnel(serverID)
+		if err != nil || tun == nil {
+			return fmt.Errorf("backend tunnel not found for server %d", serverID)
+		}
+		if !tun.Enabled {
+			return errors.New("cannot promote disabled tunnel")
+		}
+		err = s.pool.SetTunnelStatusIfCurrentWithVersion(ctx, serverID, tun.ID, tun.StateVersion, targetStatus, latencyMS)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, tunnel.ErrStaleStateVersion) {
+			return err
+		}
+	}
+	return tunnel.ErrStaleStateVersion
+}
+
+// SetPendingEnrollment sets whether a backend server is undergoing initial enrollment qualification.
+func (s *Service) SetPendingEnrollment(serverID int64, pending bool) {
+	if s == nil || s.prober == nil {
+		return
+	}
+	s.prober.SetPendingEnrollment(serverID, pending)
 }
 
 // SetCanaryProbeFunc configures a custom canary probe function on the health prober for testing.

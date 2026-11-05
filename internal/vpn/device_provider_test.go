@@ -108,3 +108,59 @@ func TestVPNService_SubnetCIDR(t *testing.T) {
 		t.Fatalf("expected custom 10.200.0.0/16, got %s", got)
 	}
 }
+
+func TestVPNService_PromoteQualifiedTunnel(t *testing.T) {
+	db := setupTestDB(t)
+	svc, s1, _, _, _ := setupTestVPNService(t, db)
+	ctx := context.Background()
+
+	if err := svc.pool.SyncFromDB(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	svc.SetPendingEnrollment(s1, true)
+	if !svc.prober.IsPendingEnrollment(s1) {
+		t.Fatal("expected pending enrollment to be set on prober")
+	}
+
+	// Put tunnel in connecting status
+	if err := svc.pool.SetTunnelStatus(ctx, s1, models.TunnelStatusConnecting, 0); err != nil {
+		t.Fatal(err)
+	}
+	tun, err := svc.pool.GetTunnel(s1)
+	if err != nil || tun.Status != models.TunnelStatusConnecting {
+		t.Fatalf("expected connecting status, got %v", tun)
+	}
+
+	// Promote with normal latency (< threshold 500ms)
+	if err := svc.PromoteQualifiedTunnel(ctx, s1, 45); err != nil {
+		t.Fatalf("PromoteQualifiedTunnel failed: %v", err)
+	}
+	tunAfter, err := svc.pool.GetTunnel(s1)
+	if err != nil || tunAfter.Status != models.TunnelStatusActive || tunAfter.LatencyMS != 45 {
+		t.Fatalf("expected active status with 45ms latency, got %+v", tunAfter)
+	}
+
+	// Reset to connecting and promote with high latency (> threshold)
+	if err := svc.pool.SetTunnelStatus(ctx, s1, models.TunnelStatusConnecting, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.PromoteQualifiedTunnel(ctx, s1, 650); err != nil {
+		t.Fatalf("PromoteQualifiedTunnel high latency failed: %v", err)
+	}
+	tunDegraded, err := svc.pool.GetTunnel(s1)
+	if err != nil || tunDegraded.Status != models.TunnelStatusDegraded || tunDegraded.LatencyMS != 650 {
+		t.Fatalf("expected degraded status with 650ms latency, got %+v", tunDegraded)
+	}
+
+	// Cannot promote disabled tunnel
+	if err := svc.pool.SetTunnelStatus(ctx, s1, models.TunnelStatusDisabled, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DisableBackend(ctx, s1); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.PromoteQualifiedTunnel(ctx, s1, 10); err == nil {
+		t.Fatal("expected error promoting disabled tunnel")
+	}
+}

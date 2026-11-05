@@ -421,6 +421,9 @@ func (h *Handlers) enableDeployBackend(
 		return h.vpnSvc.EnableBackendWithConfig(ctx, server.ID, opts...)
 	}
 
+	if h.vpnSvc != nil {
+		h.vpnSvc.SetPendingEnrollment(server.ID, true)
+	}
 	enrollCtx := context.WithValue(ctx, tunnel.DeployEnrollmentKey, true)
 	opts := []tunnel.BackendTunnelOptions{
 		{
@@ -428,6 +431,9 @@ func (h *Handlers) enableDeployBackend(
 		},
 	}
 	if err := h.vpnSvc.EnableBackendWithConfig(enrollCtx, server.ID, opts...); err != nil {
+		if h.vpnSvc != nil {
+			h.vpnSvc.SetPendingEnrollment(server.ID, false)
+		}
 		return err
 	}
 	return h.qualifyBackendTraffic(ctx, server, protocol)
@@ -439,13 +445,15 @@ func (h *Handlers) qualifyBackendTraffic(ctx context.Context, server *models.Ser
 	}
 	tun, err := h.vpnSvc.GetTunnel(server.ID)
 	if err != nil || tun == nil {
+		h.vpnSvc.SetPendingEnrollment(server.ID, false)
 		return fmt.Errorf("backend tunnel not found for server %d", server.ID)
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	_, err = h.vpnSvc.ProbeTunnel(probeCtx, tun)
+	latencyMS, err := h.vpnSvc.ProbeTunnel(probeCtx, tun)
 	if err != nil {
+		h.vpnSvc.SetPendingEnrollment(server.ID, false)
 		_ = h.vpnSvc.DisableBackend(ctx, server.ID)
 		return fmt.Errorf("backend traffic qualification probe failed: %w", err)
 	}
@@ -453,11 +461,18 @@ func (h *Handlers) qualifyBackendTraffic(ctx context.Context, server *models.Ser
 	// Finding F8: Outer handshake is necessary but not sufficient.
 	// Verify real data-plane payload forwarding before declaring the backend ready.
 	if err := h.vpnSvc.ProbeCanary(probeCtx, tun); err != nil {
+		h.vpnSvc.SetPendingEnrollment(server.ID, false)
 		_ = h.vpnSvc.DisableBackend(ctx, server.ID)
 		_ = h.vpnSvc.SetTunnelStatus(ctx, server.ID, models.TunnelStatusDisabled, 0)
 		return fmt.Errorf("data-plane payload verification failed: %w", err)
 	}
-	// HealthProber commits with identity/version fencing; never repeat an unfenced write.
+
+	// Outer handshake and inner canary payload verification have both succeeded.
+	// Promote the quarantined connecting backend tunnel to active.
+	if err := h.vpnSvc.PromoteQualifiedTunnel(ctx, server.ID, latencyMS); err != nil {
+		_ = h.vpnSvc.DisableBackend(ctx, server.ID)
+		return fmt.Errorf("failed to commit active status after canary probe: %w", err)
+	}
 	return nil
 }
 
