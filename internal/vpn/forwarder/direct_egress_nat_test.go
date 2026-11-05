@@ -310,3 +310,190 @@ func TestNAT_ProductionDispatchAfterDNSEvidenceExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestNAT_TableSaturationPreservesQuarantineAndFailsClosed verifies BLOCKER 2:
+// Under table capacity pressure where all bindings are in active quarantine,
+// pruneOldestBindingsLocked must NEVER evict unexpired quarantined bindings.
+// Instead, it must fail closed (ErrNATTableFull / ErrNoAvailablePorts),
+// ensuring delayed packets for quarantined sessions cannot reach new peers.
+func TestNAT_TableSaturationPreservesQuarantineAndFailsClosed(t *testing.T) {
+	wanDev := newMockPacketDev()
+	hostWAN := netip.MustParseAddr("203.0.113.1")
+	target1, target2, target3 := netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("2.2.2.2"), netip.MustParseAddr("3.3.3.3")
+	clientBase := "10.100.0."
+
+	// Saturated table: exactly 2 remote bindings max, with 5 available NAT ports
+	dem := NewDirectEgressManager(DirectEgressConfig{
+		HostWANIP:   hostWAN,
+		WANDevice:   wanDev,
+		UDPTimeout:  5 * time.Second,
+		TCPTimeout:  5 * time.Second,
+		MinPort:     40000,
+		MaxPort:     40005,
+		MaxBindings: 2,
+	}, nil)
+	defer func() { _ = dem.Close() }()
+
+	quarantine := 80 * time.Millisecond
+	dem.SetPortCooldown(0) // Zero port cooldown to isolate remote binding quarantine behavior
+	dem.SetQuarantineDurations(quarantine, quarantine)
+
+	capPath1 := newTestCaptureReturnPath()
+	client1 := clientBase + "1"
+	pkt1 := buildTestIPv4UDPPacket(netip.MustParseAddr(client1), target1, 10001, 53, []byte("req-1"))
+	if err := dem.RouteDirect("peer-1", client1, "sess-1", 1, pkt1, capPath1.path); err != nil {
+		t.Fatalf("peer-1 RouteDirect failed: %v", err)
+	}
+
+	capPath2 := newTestCaptureReturnPath()
+	client2 := clientBase + "2"
+	pkt2 := buildTestIPv4UDPPacket(netip.MustParseAddr(client2), target2, 10002, 53, []byte("req-2"))
+	if err := dem.RouteDirect("peer-2", client2, "sess-2", 1, pkt2, capPath2.path); err != nil {
+		t.Fatalf("peer-2 RouteDirect failed: %v", err)
+	}
+
+	if count := dem.RemoteBindingCount(); count != 2 {
+		t.Fatalf("expected 2 active bindings, got %d", count)
+	}
+
+	// Purge both sessions so both bindings enter active quarantine (unexpired)
+	dem.PurgeSession("sess-1")
+	dem.PurgeSession("sess-2")
+
+	// Verify both bindings are still present and in quarantine
+	if count := dem.RemoteBindingCount(); count != 2 {
+		t.Fatalf("expected 2 quarantined bindings preserved, got %d", count)
+	}
+
+	// Now table is saturated with 2 unexpired quarantined bindings.
+	// Peer-3 attempts to route to a new destination (target3:53).
+	// Because table is full of unexpired quarantine, it MUST fail closed:
+	// it must NOT evict unexpired quarantine records!
+	capPath3 := newTestCaptureReturnPath()
+	client3 := clientBase + "3"
+	pkt3 := buildTestIPv4UDPPacket(netip.MustParseAddr(client3), target3, 10003, 53, []byte("req-3"))
+	err := dem.RouteDirect("peer-3", client3, "sess-3", 1, pkt3, capPath3.path)
+	if !errors.Is(err, ErrNATTableFull) && !errors.Is(err, ErrNoAvailablePorts) {
+		t.Fatalf("expected ErrNATTableFull or ErrNoAvailablePorts under table saturation, got: %v", err)
+	}
+
+	// Verify unexpired quarantine records were strictly preserved
+	if count := dem.RemoteBindingCount(); count != 2 {
+		t.Fatalf("expected table to retain 2 quarantined bindings without premature eviction, got %d", count)
+	}
+
+	// Delayed packets arrive from target1:53 and target2:53 targeting NAT ports 40000 and 40001
+	delayedReply1 := buildTestIPv4UDPPacket(target1, hostWAN, 53, 40000, []byte("delayed-reply-1"))
+	if err := dem.HandleWANReply(delayedReply1); !errors.Is(err, ErrStaleSessionReply) {
+		t.Fatalf("expected delayed packet 1 to be rejected as ErrStaleSessionReply, got: %v", err)
+	}
+
+	delayedReply2 := buildTestIPv4UDPPacket(target2, hostWAN, 53, 40001, []byte("delayed-reply-2"))
+	if err := dem.HandleWANReply(delayedReply2); !errors.Is(err, ErrStaleSessionReply) {
+		t.Fatalf("expected delayed packet 2 to be rejected as ErrStaleSessionReply, got: %v", err)
+	}
+
+	// Ensure no delayed packets were delivered to peer-3
+	if pkts := capPath3.getPackets(); len(pkts) != 0 {
+		t.Fatalf("delayed packets leaked to peer-3! count=%d", len(pkts))
+	}
+
+	// Wait past quarantine window
+	time.Sleep(quarantine + 20*time.Millisecond)
+
+	// Now that quarantine has expired, new connection should safely succeed
+	err = dem.RouteDirect("peer-3", client3, "sess-3", 1, pkt3, capPath3.path)
+	if err != nil {
+		t.Fatalf("peer-3 RouteDirect failed after quarantine expiration: %v", err)
+	}
+}
+
+// TestNAT_DirectRetirementDoesNotMutateUnrelatedBindingTimestamps verifies HIGH 3:
+// releasePortLocked retires specific matching bindings in O(1) without scanning the map
+// and without updating releasedAt timestamps of other bindings.
+func TestNAT_DirectRetirementDoesNotMutateUnrelatedBindingTimestamps(t *testing.T) {
+	wanDev := newMockPacketDev()
+	hostWAN := netip.MustParseAddr("203.0.113.1")
+	target1 := netip.MustParseAddr("1.1.1.1")
+	target2 := netip.MustParseAddr("2.2.2.2")
+	clientIP := netip.MustParseAddr("10.100.0.10")
+
+	dem := NewDirectEgressManager(DirectEgressConfig{
+		HostWANIP: hostWAN,
+		WANDevice: wanDev,
+		MinPort:   40000,
+		MaxPort:   40001,
+	}, nil)
+	defer func() { _ = dem.Close() }()
+	dem.SetPortCooldown(0)
+
+	capPath1 := newTestCaptureReturnPath()
+	pkt1 := buildTestIPv4UDPPacket(clientIP, target1, 10001, 53, []byte("one"))
+	if err := dem.RouteDirect("peer-1", clientIP.String(), "sess-1", 1, pkt1, capPath1.path); err != nil {
+		t.Fatal(err)
+	}
+
+	capPath2 := newTestCaptureReturnPath()
+	pkt2 := buildTestIPv4UDPPacket(clientIP, target2, 10002, 53, []byte("two"))
+	if err := dem.RouteDirect("peer-2", clientIP.String(), "sess-2", 1, pkt2, capPath2.path); err != nil {
+		t.Fatal(err)
+	}
+
+	// Retire flow 1
+	dem.PurgeSession("sess-1")
+
+	// Get releasedAt timestamp of binding 1
+	dem.mu.RLock()
+	var releasedAt1 time.Time
+	bKey1 := remoteBindingKey{protocol: 17, natPort: 40000, remoteIP: target1, remotePort: 53}
+	if b1, ok := dem.remoteBindings[bKey1]; ok && b1 != nil {
+		releasedAt1 = b1.releasedAt
+	} else {
+		t.Fatal("binding 1 not found in remoteBindings")
+	}
+	dem.mu.RUnlock()
+
+	if releasedAt1.IsZero() {
+		t.Fatal("expected binding 1 to have non-zero releasedAt")
+	}
+
+	// Advance time and retire flow 2
+	time.Sleep(30 * time.Millisecond)
+	dem.PurgeSession("sess-2")
+
+	// Verify binding 1's timestamp was NOT updated by session 2's retirement
+	dem.mu.RLock()
+	b1After := dem.remoteBindings[bKey1]
+	if b1After == nil {
+		t.Fatal("binding 1 unexpectedly disappeared")
+	}
+	if !b1After.releasedAt.Equal(releasedAt1) {
+		t.Fatalf("binding 1 releasedAt mutated by unrelated release! before=%v, after=%v", releasedAt1, b1After.releasedAt)
+	}
+	dem.mu.RUnlock()
+}
+
+func TestNAT_SetMaxBindingsAndNilReceiver(t *testing.T) {
+	var nilDem *DirectEgressManager
+	nilDem.SetMaxBindings(10)
+	if count := nilDem.RemoteBindingCount(); count != 0 {
+		t.Fatalf("expected 0 for nil receiver, got %d", count)
+	}
+
+	dem := NewDirectEgressManager(DirectEgressConfig{}, nil)
+	defer func() { _ = dem.Close() }()
+
+	dem.SetMaxBindings(50)
+	dem.mu.RLock()
+	if dem.maxBindings != 50 {
+		t.Fatalf("expected maxBindings=50, got %d", dem.maxBindings)
+	}
+	dem.mu.RUnlock()
+
+	dem.SetMaxBindings(0)
+	dem.mu.RLock()
+	if dem.maxBindings != defaultMaxRemoteBindings {
+		t.Fatalf("expected defaultMaxRemoteBindings, got %d", dem.maxBindings)
+	}
+	dem.mu.RUnlock()
+}

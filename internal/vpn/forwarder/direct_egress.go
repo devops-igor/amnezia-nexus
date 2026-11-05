@@ -16,6 +16,10 @@ var (
 	ErrDirectEgressUnavailable = errors.New("forwarder: direct egress unavailable")
 	// ErrNATPortExhaustion is returned when no unused NAT port is available.
 	ErrNATPortExhaustion = errors.New("forwarder: direct egress nat port exhaustion")
+	// ErrNoAvailablePorts is an alias for ErrNATPortExhaustion when ports are in use or quarantine.
+	ErrNoAvailablePorts = ErrNATPortExhaustion
+	// ErrNATTableFull is returned when the NAT binding table capacity is reached and all entries are active or quarantined.
+	ErrNATTableFull = errors.New("forwarder: direct egress nat table full")
 	// ErrFlowTableFull is returned when flow tracking capacity is reached.
 	ErrFlowTableFull = errors.New("forwarder: flow table capacity reached")
 )
@@ -84,16 +88,18 @@ type natEntry struct {
 
 // DirectEgressConfig configures DirectEgressManager.
 type DirectEgressConfig struct {
-	HostWANIP     netip.Addr
-	GatewayDNSIP  netip.Addr
-	WANDevice     PacketDevice
-	TCPTimeout    time.Duration
-	UDPTimeout    time.Duration
-	MinPort       uint16
-	MaxPort       uint16
-	MaxFlows      int
-	TCPQuarantine time.Duration
-	UDPQuarantine time.Duration
+	HostWANIP         netip.Addr
+	GatewayDNSIP      netip.Addr
+	WANDevice         PacketDevice
+	TCPTimeout        time.Duration
+	UDPTimeout        time.Duration
+	MinPort           uint16
+	MaxPort           uint16
+	MaxFlows          int
+	TCPQuarantine     time.Duration
+	UDPQuarantine     time.Duration
+	MaxBindings       int
+	MaxRemoteBindings int
 }
 
 const (
@@ -130,6 +136,7 @@ type DirectEgressManager struct {
 	udpQuarantine    time.Duration
 	remoteBindings   map[remoteBindingKey]*remoteBindingEntry
 	portOwners       map[uint16]string
+	maxBindings      int
 }
 
 // DirectDrops returns the total number of packets dropped by direct egress.
@@ -160,6 +167,14 @@ func NewDirectEgressManager(cfg DirectEgressConfig, fwd *Forwarder) *DirectEgres
 		cfg.MaxFlows = defaultMaxFlows
 	}
 
+	maxBindings := cfg.MaxBindings
+	if maxBindings <= 0 {
+		maxBindings = cfg.MaxRemoteBindings
+	}
+	if maxBindings <= 0 {
+		maxBindings = defaultMaxRemoteBindings
+	}
+
 	dem := &DirectEgressManager{
 		cfg:              cfg,
 		fwd:              fwd,
@@ -173,6 +188,7 @@ func NewDirectEgressManager(cfg DirectEgressConfig, fwd *Forwarder) *DirectEgres
 		portCooldown:     5 * time.Second,
 		tcpQuarantine:    cfg.TCPQuarantine,
 		udpQuarantine:    cfg.UDPQuarantine,
+		maxBindings:      maxBindings,
 		remoteBindings:   make(map[remoteBindingKey]*remoteBindingEntry),
 		portOwners:       make(map[uint16]string),
 		gwDNSIP:          cfg.GatewayDNSIP,
