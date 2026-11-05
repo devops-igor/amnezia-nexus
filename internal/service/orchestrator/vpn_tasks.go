@@ -101,10 +101,12 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 		}
 
 		isBlocked := strings.EqualFold(t.Status, models.TunnelStatusHandshakeBlocked)
+		var poolTun *models.BackendTunnel
 		if gu, ok := o.statusUpdater.(interface {
 			GetTunnel(int64) (*models.BackendTunnel, error)
 		}); ok {
-			if poolTun, err := gu.GetTunnel(t.ServerID); err == nil && poolTun != nil {
+			if pt, err := gu.GetTunnel(t.ServerID); err == nil && pt != nil {
+				poolTun = pt
 				if strings.EqualFold(poolTun.Status, models.TunnelStatusHandshakeBlocked) {
 					isBlocked = true
 				}
@@ -152,6 +154,42 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 					"threshold", threshold,
 					"err", err,
 				)
+
+				// Issue #713: When dual-tier probing is available, prevent new client admissions
+				// during transient outer probe failures while preserving established sessions.
+				canaryProber := o.getCanaryProber()
+				if canaryProber != nil {
+					hasActiveSessions := t.ActiveConnections > 0
+					if poolTun != nil && poolTun.ActiveConnections > 0 {
+						hasActiveSessions = true
+					}
+					viable := false
+					if cErr := canaryProber.ProbeCanary(ctx, &t); cErr == nil {
+						viable = true
+					}
+
+					if hasActiveSessions || viable {
+						if !isBlocked {
+							if o.updateTunnelStatus(ctx, &t, models.TunnelStatusHandshakeBlocked, 0) {
+								t.Status = models.TunnelStatusHandshakeBlocked
+								t.StateVersion++
+							}
+						}
+					} else {
+						if o.updateTunnelStatus(ctx, &t, "degraded", 0) {
+							degradedTunnels = append(degradedTunnels, t.ID)
+							o.mu.Lock()
+							if o.probeFailVersions != nil && t.StateVersion > 0 {
+								o.probeFailVersions[t.ID] = t.StateVersion + 1
+							}
+							o.mu.Unlock()
+						} else {
+							o.revertProbeFailure(t.ID, t.StateVersion)
+						}
+					}
+					continue
+				}
+
 				if !strings.EqualFold(t.Status, "degraded") && !isBlocked {
 					healthyTunnels = append(healthyTunnels, &tCopy)
 				}
@@ -226,27 +264,6 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 
 		o.ResetProbeFailCount(t.ID)
 
-		// Dual-tier recovery: if the tunnel was in handshake_blocked state,
-		// it MUST NOT be promoted to active unless both outer and inner canary probes succeed!
-		if isBlocked {
-			canaryProber := o.getCanaryProber()
-			if canaryProber == nil {
-				slog.Warn("Backend tunnel outer probe recovered but no canary prober available to verify inner plane; preserving handshake_blocked",
-					"tunnel_id", t.ID,
-					"endpoint", t.Endpoint,
-				)
-				continue
-			}
-			if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
-				slog.Warn("Backend tunnel outer probe recovered but inner canary probe failed; preserving handshake_blocked",
-					"tunnel_id", t.ID,
-					"endpoint", t.Endpoint,
-					"err", cErr,
-				)
-				continue
-			}
-		}
-
 		latencyMS := int64(rtt.Milliseconds())
 		if latencyMS <= 0 {
 			latencyMS = 1
@@ -257,10 +274,41 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			status = "degraded"
 		}
 
+		// Dual-tier verification: before promoting ANY backend to active
+		// (whether recovering from handshake_blocked, connecting, or degraded),
+		// inner canary probe must succeed!
+		if status == "active" {
+			canaryProber := o.getCanaryProber()
+			if canaryProber != nil {
+				if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
+					slog.Warn("Backend tunnel outer probe succeeded but inner canary probe failed; denying active promotion",
+						"tunnel_id", t.ID,
+						"endpoint", t.Endpoint,
+						"err", cErr,
+					)
+					if !isBlocked {
+						if o.updateTunnelStatus(ctx, &t, models.TunnelStatusHandshakeBlocked, latencyMS) {
+							t.Status = models.TunnelStatusHandshakeBlocked
+							t.StateVersion++
+						}
+					}
+					continue
+				}
+			} else if isBlocked {
+				slog.Warn("Backend tunnel outer probe recovered but no canary prober available to verify inner plane; preserving handshake_blocked",
+					"tunnel_id", t.ID,
+					"endpoint", t.Endpoint,
+				)
+				continue
+			}
+		}
+
 		if o.updateTunnelStatus(ctx, &t, status, latencyMS) {
 			if status == "degraded" {
 				degradedTunnels = append(degradedTunnels, t.ID)
 			} else {
+				tCopy.Status = status
+				tCopy.LatencyMS = latencyMS
 				healthyTunnels = append(healthyTunnels, &tCopy)
 			}
 		}

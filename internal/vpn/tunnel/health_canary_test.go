@@ -654,7 +654,8 @@ func TestHealthProber_DualTier_HandshakeBlocked(t *testing.T) {
 		return nil
 	})
 
-	// Probes 1 and 2: outer fails, failures < threshold, but data plane is viable -> remains active (NOT degraded)
+	// Probes 1 and 2: outer fails, failures < threshold, but data plane is viable -> transitions to handshake_blocked
+	// to prevent new client admission while preserving existing sessions.
 	for i := 1; i < cfg.FailureThreshold; i++ {
 		_, pErr := hp.ProbeTunnel(ctx, tun)
 		if pErr == nil {
@@ -663,8 +664,11 @@ func TestHealthProber_DualTier_HandshakeBlocked(t *testing.T) {
 	}
 
 	current, err := pool.GetTunnel(sID)
-	if err != nil || current.Status != models.TunnelStatusActive {
-		t.Fatalf("expected status active before threshold when data plane is viable, got %q", current.Status)
+	if err != nil || current.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("expected status handshake_blocked before threshold when data plane is viable, got %q", current.Status)
+	}
+	if len(pool.GetActiveTunnels()) != 0 {
+		t.Fatalf("expected tunnel excluded from active pool, got %d active tunnels", len(pool.GetActiveTunnels()))
 	}
 
 	// Probe 3: outer fails, reaches FailureThreshold.

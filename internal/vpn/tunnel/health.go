@@ -365,30 +365,29 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		return 0, err
 	}
 
-	// Issue #713: When returning from handshake_blocked, both outer and inner probes must succeed.
-	if (snapshot != nil && snapshot.Status == models.TunnelStatusHandshakeBlocked) ||
-		probeTarget.Status == models.TunnelStatusHandshakeBlocked {
-		if canaryErr := hp.probeCanary(ctx, &probeTarget); canaryErr != nil {
-			return latencyMS, nil
-		}
-	}
+	// Issue #713: Before promoting ANY backend to active (whether recovering from
+	// handshake_blocked, connecting, or degraded), verify real data-plane transit via inner canary.
+	isBlocked := (snapshot != nil && snapshot.Status == models.TunnelStatusHandshakeBlocked) ||
+		probeTarget.Status == models.TunnelStatusHandshakeBlocked
 
 	status := "active"
 	if latencyMS > hp.cfg.LatencyThresholdMS {
 		status = "degraded"
 	}
 
+	if status == "active" || isBlocked {
+		eligible, elErr := hp.verifyActiveEligibility(ctx, snapshot, &probeTarget, isBlocked)
+		if elErr != nil {
+			return 0, elErr
+		}
+		if !eligible {
+			return latencyMS, nil
+		}
+	}
+
 	// If transitioning to active, verify data-plane readiness via hook
-	if status == "active" {
-		hp.mu.RLock()
-		preActiveHook := hp.preActiveHookHook
-		hp.mu.RUnlock()
-		if preActiveHook != nil {
-			preActiveHook()
-		}
-		if _, hookErr := hp.executeActiveHook(ctx, snapshot, &probeTarget); hookErr != nil {
-			return 0, hookErr
-		}
+	if err := hp.runActiveHookIfActive(ctx, snapshot, &probeTarget, status); err != nil {
+		return 0, err
 	}
 
 	// Re-check status before final status write
@@ -423,6 +422,48 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	hp.mu.Unlock()
 
 	return latencyMS, nil
+}
+
+// verifyActiveEligibility verifies that the inner data plane is functional before promoting
+// or restoring a tunnel to active status.
+func (hp *HealthProber) verifyActiveEligibility(ctx context.Context, snapshot, probeTarget *models.BackendTunnel, isBlocked bool) (bool, error) {
+	if isBlocked {
+		if canaryErr := hp.probeCanary(ctx, probeTarget); canaryErr != nil {
+			return false, nil
+		}
+		return true, nil
+	}
+
+	if hp.hasCanaryProber(probeTarget) {
+		if canaryErr := hp.probeCanary(ctx, probeTarget); canaryErr != nil {
+			slog.Warn("Backend tunnel outer probe succeeded but inner canary failed; denying active promotion",
+				"tunnel_id", probeTarget.ID,
+				"server_id", probeTarget.ServerID,
+				"status", probeTarget.Status,
+				"err", canaryErr,
+			)
+			if err := hp.transitionToHandshakeBlocked(ctx, snapshot); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+func (hp *HealthProber) runActiveHookIfActive(ctx context.Context, snapshot, probeTarget *models.BackendTunnel, status string) error {
+	if status != "active" {
+		return nil
+	}
+	hp.mu.RLock()
+	preActiveHook := hp.preActiveHookHook
+	hp.mu.RUnlock()
+	if preActiveHook != nil {
+		preActiveHook()
+	}
+	_, err := hp.executeActiveHook(ctx, snapshot, probeTarget)
+	return err
 }
 
 func (hp *HealthProber) executeActiveHook(ctx context.Context, snapshot, tunnel *models.BackendTunnel) (int64, error) {
@@ -597,8 +638,8 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 			return 0, err
 		}
 	} else if hp.pool != nil {
-		// Issue #713: Prevent premature degradation during transient handshake failures.
-		// If established sessions exist or data plane is viable, preserve active eligibility.
+		// Issue #713: When outer handshake probe fails below the threshold,
+		// prevent new client admissions while preserving established sessions.
 		hasActiveSessions := snapshot.ActiveConnections > 0
 		if cur, err := hp.pool.GetTunnel(snapshot.ServerID); err == nil && cur != nil && cur.ActiveConnections > 0 {
 			hasActiveSessions = true
@@ -607,7 +648,11 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 		if canaryErr := hp.probeCanary(ctx, snapshot); canaryErr == nil {
 			viable = true
 		}
-		if !hasActiveSessions && !viable {
+		if hasActiveSessions || viable {
+			if err := hp.transitionToHandshakeBlocked(ctx, snapshot); err != nil {
+				return 0, err
+			}
+		} else {
 			if err := hp.transitionToDegraded(ctx, snapshot); err != nil {
 				return 0, err
 			}

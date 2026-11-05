@@ -45,24 +45,31 @@ func TestHealthProber_TransientFailures_PreservesActiveUnderViableDataPlane(t *t
 		return nil
 	})
 
-	// Failure 1: failures (1) < threshold (3), data plane viable -> MUST remain active!
+	// Failure 1: failures (1) < threshold (3), data plane viable -> transitions to handshake_blocked
+	// to prevent new client admissions while preserving established sessions!
 	_, err = hp.ProbeTunnel(ctx, tun)
 	if err == nil {
 		t.Fatal("expected probe error on outer probe failure 1")
 	}
 	cur, _ := pool.GetTunnel(sID)
-	if cur.Status != models.TunnelStatusActive {
-		t.Fatalf("failure 1: expected status active when data plane viable, got %q", cur.Status)
+	if cur.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("failure 1: expected status handshake_blocked when data plane viable, got %q", cur.Status)
+	}
+	if len(pool.GetActiveTunnels()) != 0 {
+		t.Fatalf("failure 1: expected tunnel excluded from active pool, got %d active tunnels", len(pool.GetActiveTunnels()))
 	}
 
-	// Failure 2: failures (2) < threshold (3), data plane viable -> MUST remain active!
+	// Failure 2: failures (2) < threshold (3), data plane viable -> remains handshake_blocked!
 	_, err = hp.ProbeTunnel(ctx, tun)
 	if err == nil {
 		t.Fatal("expected probe error on outer probe failure 2")
 	}
 	cur, _ = pool.GetTunnel(sID)
-	if cur.Status != models.TunnelStatusActive {
-		t.Fatalf("failure 2: expected status active when data plane viable, got %q", cur.Status)
+	if cur.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("failure 2: expected status handshake_blocked when data plane viable, got %q", cur.Status)
+	}
+	if len(pool.GetActiveTunnels()) != 0 {
+		t.Fatalf("failure 2: expected tunnel excluded from active pool, got %d active tunnels", len(pool.GetActiveTunnels()))
 	}
 
 	// Failure 3: reaches FailureThreshold (3), canary succeeds -> transitions to handshake_blocked!
@@ -106,18 +113,31 @@ func TestHealthProber_TransientFailures_PreservesActiveWithEstablishedSessions(t
 
 	hp := NewHealthProber(pool, db, cfg, failOuterProbe)
 
-	// Failure 1: below threshold, has active connections -> MUST NOT degrade!
+	// Failure 1: below threshold, has active connections -> transitions to handshake_blocked
+	// to prevent new client admissions while preserving established connections!
 	_, _ = hp.ProbeTunnel(ctx, tun)
 	cur, _ := pool.GetTunnel(sID)
-	if cur.Status != models.TunnelStatusActive {
-		t.Fatalf("failure 1: expected status active with active connections, got %q", cur.Status)
+	if cur.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("failure 1: expected status handshake_blocked with active connections, got %q", cur.Status)
+	}
+	if len(pool.GetActiveTunnels()) != 0 {
+		t.Fatalf("failure 1: expected tunnel excluded from active pool, got %d active tunnels", len(pool.GetActiveTunnels()))
+	}
+	if cur.ActiveConnections != 1 {
+		t.Fatalf("failure 1: expected active connections preserved at 1, got %d", cur.ActiveConnections)
 	}
 
-	// Failure 2: below threshold, has active connections -> MUST NOT degrade!
+	// Failure 2: below threshold, has active connections -> remains handshake_blocked!
 	_, _ = hp.ProbeTunnel(ctx, tun)
 	cur, _ = pool.GetTunnel(sID)
-	if cur.Status != models.TunnelStatusActive {
-		t.Fatalf("failure 2: expected status active with active connections, got %q", cur.Status)
+	if cur.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("failure 2: expected status handshake_blocked with active connections, got %q", cur.Status)
+	}
+	if len(pool.GetActiveTunnels()) != 0 {
+		t.Fatalf("failure 2: expected tunnel excluded from active pool, got %d active tunnels", len(pool.GetActiveTunnels()))
+	}
+	if cur.ActiveConnections != 1 {
+		t.Fatalf("failure 2: expected active connections preserved at 1, got %d", cur.ActiveConnections)
 	}
 }
 

@@ -162,6 +162,20 @@ func (hp *HealthProber) GetDevice(tunnelID int64) PacketDevice {
 	return nil
 }
 
+// hasCanaryProber reports whether a canary prober or active device is available for the tunnel.
+func (hp *HealthProber) hasCanaryProber(tunnel *models.BackendTunnel) bool {
+	if hp == nil || tunnel == nil {
+		return false
+	}
+	hp.mu.RLock()
+	hasFn := hp.probeCanaryFn != nil
+	hp.mu.RUnlock()
+	if hasFn {
+		return true
+	}
+	return hp.GetDevice(tunnel.ID) != nil
+}
+
 // ProbeCanary executes an in-tunnel canary probe against the given backend tunnel.
 // If a custom CanaryProbeFunc is configured, it is invoked; otherwise defaultCanaryProbe is used.
 func (hp *HealthProber) ProbeCanary(ctx context.Context, tunnel *models.BackendTunnel) error {

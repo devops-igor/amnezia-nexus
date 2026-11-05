@@ -232,3 +232,114 @@ func TestOrchestrator_HandshakeBlocked_BothProbesFail_Degrades(t *testing.T) {
 		t.Fatalf("expected status degraded when both probes fail, got %s", res.Status)
 	}
 }
+
+func TestOrchestrator_Rework8_PromotionToActiveRejectedWhenInnerCanaryFails(t *testing.T) {
+	cases := []struct {
+		name          string
+		initialStatus string
+	}{
+		{name: "from connecting", initialStatus: models.TunnelStatusConnecting},
+		{name: "from degraded", initialStatus: models.TunnelStatusDegraded},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, cleanup := setupTestDB(t)
+			defer cleanup()
+			ctx := context.Background()
+
+			_ = db.SaveVPNConfig(ctx, &models.VPNConfig{HealthThresholdMS: 500})
+
+			s1, _ := db.CreateServer(ctx, &models.Server{Name: "Server-" + tc.name, Host: "10.0.0.1"})
+			t1, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+				ServerID:      s1,
+				InterfaceName: "awg0",
+				PublicKey:     "pub1",
+				Endpoint:      "10.0.0.1:51820",
+				Status:        tc.initialStatus,
+				Enabled:       true,
+			})
+
+			tun1, _ := db.GetBackendTunnel(ctx, t1)
+			updater := newMockCanaryUpdater(db, tun1)
+
+			// Outer probe succeeds (20ms latency)
+			orch := New(db, nil, WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+				return 20 * time.Millisecond, nil
+			}), WithTunnelStatusUpdater(updater))
+
+			// Inner canary probe fails!
+			updater.canaryErr = errors.New("inner data plane blackhole")
+			if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
+				t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+			}
+
+			// Must NOT be active! Must transition to/stay handshake_blocked
+			res, _ := db.GetBackendTunnel(ctx, t1)
+			if res.Status == models.TunnelStatusActive {
+				t.Fatalf("tunnel MUST NOT be promoted to active when canary fails, got %s", res.Status)
+			}
+			if res.Status != models.TunnelStatusHandshakeBlocked {
+				t.Fatalf("expected status handshake_blocked, got %s", res.Status)
+			}
+		})
+	}
+}
+
+func TestOrchestrator_Rework8_InitialOuterFailure_TransitionsToHandshakeBlocked_PreservesConnectedClient(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	_ = db.SaveVPNConfig(ctx, &models.VPNConfig{HealthThresholdMS: 500})
+
+	s1, _ := db.CreateServer(ctx, &models.Server{Name: "Server 1", Host: "10.0.0.1"})
+	t1, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID:          s1,
+		InterfaceName:     "awg0",
+		PublicKey:         "pub1",
+		Endpoint:          "10.0.0.1:51820",
+		Status:            models.TunnelStatusActive,
+		Enabled:           true,
+		ActiveConnections: 1,
+	})
+
+	uID, _ := db.CreateUser(ctx, &models.User{Username: "bob", Role: models.RoleUser})
+	sessID := "session-bob-1"
+	_ = db.CreateVPNSession(ctx, &models.VPNSession{
+		ID:              sessID,
+		UserID:          uID,
+		BackendTunnelID: t1,
+		PeerPublicKey:   "peer-bob-pub",
+		AssignedIP:      "10.100.1.20",
+		Status:          "connected",
+	})
+
+	tun1, _ := db.GetBackendTunnel(ctx, t1)
+	updater := newMockCanaryUpdater(db, tun1)
+
+	// Outer probe fails on cycle 1 (< threshold 3); inner canary succeeds
+	orch := New(db, nil, WithProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 0, errors.New("initial DPI outer handshake packet drop")
+	}), WithTunnelStatusUpdater(updater))
+
+	// Run single health check (failures=1 < threshold=3)
+	if err := orch.CheckBackendTunnelHealth(ctx); err != nil {
+		t.Fatalf("CheckBackendTunnelHealth failed: %v", err)
+	}
+
+	// Verify tunnel transitioned to handshake_blocked (not active, not degraded)
+	res1, _ := db.GetBackendTunnel(ctx, t1)
+	if res1.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("expected status %s during initial outer failure with active sessions, got %s", models.TunnelStatusHandshakeBlocked, res1.Status)
+	}
+
+	// Verify session on t1 was NOT migrated
+	sess, err := db.GetVPNSessionByID(ctx, sessID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.BackendTunnelID != t1 {
+		t.Fatalf("expected session to remain on tunnel %d, but migrated to %d", t1, sess.BackendTunnelID)
+	}
+}
