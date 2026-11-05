@@ -724,5 +724,9 @@
   "deploy_vps_select_region": "选择地区",
   "deploy_vps_select_os": "操作系统",
   "deploy_vps_btn": "部署 VPS",
-  "deploy_vps_recent_orders": "近期部署"
+  "deploy_vps_recent_orders": "近期部署",
+  "deploy_setup_btn": "配置后端",
+  "deploy_retry_btn": "重试",
+  "deploy_ssh_password_prompt": "输入 VPS 的 SSH 密码：",
+  "deploy_status_polling": "正在配置 VPN 后端..."
 }

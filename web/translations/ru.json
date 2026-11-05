@@ -724,5 +724,9 @@
   "deploy_vps_select_region": "Выберите регион",
   "deploy_vps_select_os": "Операционная система",
   "deploy_vps_btn": "Развернуть VPS",
-  "deploy_vps_recent_orders": "Недавние развертывания"
+  "deploy_vps_recent_orders": "Недавние развертывания",
+  "deploy_setup_btn": "Настроить",
+  "deploy_retry_btn": "Повторить",
+  "deploy_ssh_password_prompt": "Введите SSH пароль для VPS:",
+  "deploy_status_polling": "Настройка VPN сервера..."
 }

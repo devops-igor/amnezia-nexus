@@ -724,5 +724,9 @@
   "deploy_vps_select_region": "انتخاب منطقه",
   "deploy_vps_select_os": "سیستم عامل",
   "deploy_vps_btn": "راه‌اندازی سرور",
-  "deploy_vps_recent_orders": "استقرارهای اخیر"
+  "deploy_vps_recent_orders": "استقرارهای اخیر",
+  "deploy_setup_btn": "راه‌اندازی سرور",
+  "deploy_retry_btn": "تلاش مجدد",
+  "deploy_ssh_password_prompt": "رمز عبور SSH برای سرور مجازی را وارد کنید:",
+  "deploy_status_polling": "در حال راه‌اندازی سرور VPN..."
 }

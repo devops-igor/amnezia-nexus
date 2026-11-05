@@ -123,6 +123,11 @@ func NewXrayManagerWithServerLocks(pool SSHProvider, locks *awg.ServerLockRegist
 	}
 }
 
+// SSHProvider returns the underlying SSHProvider.
+func (m *XrayManager) SSHProvider() SSHProvider {
+	return m.sshPool
+}
+
 // SetVLESSProbeFunc configures an optional authenticated handshake probe function for container readiness checks.
 // When set, it also clears any configured traffic probe function so test mocks apply cleanly across both probe modes.
 func (m *XrayManager) SetVLESSProbeFunc(fn VLESSProbeFunc) {

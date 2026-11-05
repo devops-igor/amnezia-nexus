@@ -8,9 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
@@ -118,213 +116,6 @@ func (h *Handlers) dialDeploySSH(ctx context.Context, cfg ssh.Config) (ssh.SSHCl
 	return ssh.Dial(ctx, cfg)
 }
 
-func (h *Handlers) ensureGigahostDeploySchema(ctx context.Context) error {
-	if h.db == nil || h.db.SQLDB() == nil {
-		return nil
-	}
-	if err := h.ensureGigahostOrdersTable(ctx); err != nil {
-		return err
-	}
-	cols := []string{
-		"ALTER TABLE gigahost_orders ADD COLUMN nexus_server_id INTEGER DEFAULT 0",
-		"ALTER TABLE gigahost_orders ADD COLUMN last_error TEXT DEFAULT ''",
-		"ALTER TABLE gigahost_orders ADD COLUMN step TEXT DEFAULT ''",
-	}
-	for _, q := range cols {
-		_, _ = h.db.SQLDB().ExecContext(ctx, q)
-	}
-	return nil
-}
-
-func (h *Handlers) lockGigahostDeploy(orderID string) (func(), bool) {
-	h.gigahostDeployMu.Lock()
-	if h.gigahostDeployLocks == nil {
-		h.gigahostDeployLocks = make(map[string]*sync.Mutex)
-	}
-	mu, ok := h.gigahostDeployLocks[orderID]
-	if !ok {
-		mu = &sync.Mutex{}
-		h.gigahostDeployLocks[orderID] = mu
-	}
-	h.gigahostDeployMu.Unlock()
-
-	if !mu.TryLock() {
-		return nil, false
-	}
-	return mu.Unlock, true
-}
-
-func (h *Handlers) isProviderServerRegistered(ctx context.Context, provider string, providerServerID int64) (*models.Server, bool, error) {
-	if h.db == nil {
-		return nil, false, nil
-	}
-	servers, err := h.db.GetAllServers(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	for _, s := range servers {
-		if s.Protocols == nil {
-			continue
-		}
-		p, ok := s.Protocols["provider"].(string)
-		if !ok || !strings.EqualFold(p, provider) {
-			continue
-		}
-		if matchProviderServerID(s.Protocols["provider_server_id"], providerServerID) {
-			match := s
-			return &match, true, nil
-		}
-	}
-	return nil, false, nil
-}
-
-func matchProviderServerID(val any, expected int64) bool {
-	if val == nil {
-		return false
-	}
-	switch v := val.(type) {
-	case int64:
-		return v == expected
-	case int:
-		return int64(v) == expected
-	case float64:
-		return int64(v) == expected
-	case string:
-		return v == strconv.FormatInt(expected, 10)
-	}
-	return false
-}
-
-func (h *Handlers) getDeployOrderByID(ctx context.Context, orderID string) (*GigahostOrderRecord, int64, string, string, error) {
-	if err := h.ensureGigahostDeploySchema(ctx); err != nil {
-		return nil, 0, "", "", err
-	}
-	if h.db == nil || h.db.SQLDB() == nil {
-		return nil, 0, "", "", nil
-	}
-	q := `SELECT id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip, created_at, updated_at, nexus_server_id, last_error, step
-	      FROM gigahost_orders WHERE order_id = ?`
-	row := h.db.SQLDB().QueryRowContext(ctx, q, orderID)
-	var o GigahostOrderRecord
-	var createdAtStr, updatedAtStr string
-	var assignedIP, lastError, step sql.NullString
-	var nexusServerID sql.NullInt64
-	err := row.Scan(&o.ID, &o.OrderID, &o.ServerID, &o.Status, &o.PlanID, &o.RegionID, &o.HourlyPriceNOK, &assignedIP, &createdAtStr, &updatedAtStr, &nexusServerID, &lastError, &step)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, 0, "", "", nil
-		}
-		return nil, 0, "", "", err
-	}
-	if assignedIP.Valid {
-		o.AssignedIP = assignedIP.String
-	}
-	o.CreatedAt, _ = time.Parse(time.RFC3339, createdAtStr)
-	o.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAtStr)
-	return &o, nexusServerID.Int64, lastError.String, step.String, nil
-}
-
-func (h *Handlers) updateDeployOrderStatus(
-	ctx context.Context,
-	orderID string,
-	status, step, lastErr string,
-	providerServerID, nexusServerID int64,
-	assignedIP string,
-) error {
-	if h.db == nil || h.db.SQLDB() == nil {
-		return nil
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	q := `UPDATE gigahost_orders
-	      SET status = ?,
-	          step = ?,
-	          last_error = ?,
-	          server_id = CASE WHEN ? > 0 THEN ? ELSE server_id END,
-	          nexus_server_id = CASE WHEN ? > 0 THEN ? ELSE nexus_server_id END,
-	          assigned_ip = CASE WHEN ? != '' THEN ? ELSE assigned_ip END,
-	          updated_at = ?
-	      WHERE order_id = ?`
-	res, err := h.db.SQLDB().ExecContext(ctx, q,
-		status,
-		step,
-		lastErr,
-		providerServerID, providerServerID,
-		nexusServerID, nexusServerID,
-		assignedIP, assignedIP,
-		now,
-		orderID,
-	)
-	if err != nil {
-		return err
-	}
-	affected, _ := res.RowsAffected()
-	if affected == 0 {
-		insertQ := `INSERT INTO gigahost_orders (
-			order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip, created_at, updated_at, nexus_server_id, last_error, step
-		) VALUES (?, ?, ?, 0, 0, 0.0, ?, ?, ?, ?, ?, ?)`
-		_, err = h.db.SQLDB().ExecContext(ctx, insertQ,
-			orderID,
-			providerServerID,
-			status,
-			assignedIP,
-			now,
-			now,
-			nexusServerID,
-			lastErr,
-			step,
-		)
-		return err
-	}
-	return nil
-}
-
-func isGigahostReady(status string) bool {
-	s := strings.ToLower(strings.TrimSpace(status))
-	return s == gigahost.StatusReady || s == "active"
-}
-
-func isGigahostFailed(status string) bool {
-	s := strings.ToLower(strings.TrimSpace(status))
-	return s == gigahost.StatusFailed || s == "error" || s == statusCancelled || s == "canceled" || s == "deleted"
-}
-
-func extractDeployIPAndID(st *gigahost.DeployStatusResponse, currentIP string, currentID int64) (string, int64) {
-	ip := currentIP
-	if st != nil && st.GetIP() != "" {
-		ip = st.GetIP()
-	}
-	id := currentID
-	if st != nil && st.ServerID > 0 {
-		id = st.ServerID
-	}
-	return ip, id
-}
-
-func (h *Handlers) fallbackResolveServerInfo(
-	ctx context.Context,
-	client gigahost.Client,
-	orderID string,
-	assignedIP string,
-	providerServerID int64,
-) (string, int64) {
-	if assignedIP != "" && providerServerID > 0 {
-		return assignedIP, providerServerID
-	}
-	servers, _ := client.GetServers(ctx)
-	for _, s := range servers {
-		if s.OrderID != "" && s.OrderID == orderID {
-			if ip := s.GetIP(); ip != "" && assignedIP == "" {
-				assignedIP = ip
-			}
-			if s.ID > 0 && providerServerID == 0 {
-				providerServerID = s.ID
-			}
-			break
-		}
-	}
-	return assignedIP, providerServerID
-}
-
 func (h *Handlers) verifyGigahostVPSReady(
 	ctx context.Context,
 	client gigahost.Client,
@@ -421,7 +212,12 @@ func (h *Handlers) failDeployStatus(
 	assignedIP, protocol, port string,
 ) (*GigahostDeployStatus, error) {
 	diagErr := err.Error()
-	_ = h.updateDeployOrderStatus(ctx, orderID, DeployStatusFailed, step, diagErr, providerServerID, nexusServerID, assignedIP)
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	_ = h.updateDeployOrderStatus(persistCtx, orderID, DeployStatusFailed, step, diagErr, providerServerID, nexusServerID, assignedIP)
+	if nexusServerID > 0 && h.vpnSvc != nil {
+		_ = h.vpnSvc.DisableBackend(persistCtx, nexusServerID)
+	}
 	return &GigahostDeployStatus{
 		OrderID:          orderID,
 		ProviderServerID: providerServerID,
@@ -449,6 +245,26 @@ func (h *Handlers) verifyDeploySSHAccess(
 	if sshUser == "" {
 		sshUser = "root"
 	}
+
+	var serverID *int64
+	if h.db != nil {
+		if servers, err := h.db.GetAllServers(ctx); err == nil {
+			for _, s := range servers {
+				if strings.EqualFold(strings.TrimSpace(s.Host), strings.TrimSpace(assignedIP)) ||
+					(req.ProviderServerID > 0 && matchProviderServerID(s.Protocols["provider_server_id"], req.ProviderServerID)) {
+					id := s.ID
+					serverID = &id
+					break
+				}
+			}
+		}
+	}
+	if serverID == nil && req.OrderID != "" {
+		if _, nexusID, _, _, err := h.getDeployOrderByID(ctx, req.OrderID); err == nil && nexusID > 0 {
+			serverID = &nexusID
+		}
+	}
+
 	var capturedFP string
 
 	sshCfg := ssh.Config{
@@ -459,6 +275,7 @@ func (h *Handlers) verifyDeploySSHAccess(
 		PrivateKey:                req.SSHPrivateKey,
 		Timeout:                   15 * time.Second,
 		Store:                     h.db,
+		ServerID:                  serverID,
 		RequireFingerprintConfirm: false,
 	}
 
@@ -471,7 +288,59 @@ func (h *Handlers) verifyDeploySSHAccess(
 	if fc, ok := client.(interface{ CapturedFingerprint() string }); ok {
 		capturedFP = fc.CapturedFingerprint()
 	}
+	if capturedFP != "" {
+		if err := validateFingerprintFormat(capturedFP); err != nil {
+			return "", fmt.Errorf("invalid host key fingerprint received: %w", err)
+		}
+	}
 	return capturedFP, nil
+}
+
+func validateFingerprintFormat(fp string) error {
+	s := strings.TrimSpace(fp)
+	if s == "" {
+		return errors.New("empty host key fingerprint")
+	}
+	if len(s) < 8 {
+		return fmt.Errorf("invalid host key fingerprint: %s", s)
+	}
+	return nil
+}
+
+func isDeployOrderResume(existingServer *models.Server, nexusServerID, providerServerID int64, order *GigahostOrderRecord, req GigahostDeployRequest, assignedIP string) bool {
+	return (nexusServerID > 0 && nexusServerID == existingServer.ID) ||
+		(order != nil && order.OrderID == req.OrderID && (order.ServerID == providerServerID || strings.EqualFold(order.AssignedIP, assignedIP)))
+}
+
+func (h *Handlers) reconcileExistingServerResume(
+	ctx context.Context,
+	existingServer *models.Server,
+	req GigahostDeployRequest,
+	fingerprint string,
+) error {
+	if fingerprint != "" {
+		knownFP, err := h.db.GetKnownHostFingerprint(ctx, existingServer.ID)
+		if err != nil {
+			return fmt.Errorf("failed to query known host fingerprint: %w", err)
+		}
+		if strings.TrimSpace(knownFP) == "" {
+			if err := h.db.SaveKnownHostFingerprint(ctx, existingServer.ID, fingerprint); err != nil {
+				return fmt.Errorf("failed to save host key fingerprint: %w", err)
+			}
+		} else if !ssh.CompareFingerprints(knownFP, fingerprint) {
+			return fmt.Errorf("host key mismatch for server %d: expected %s, got %s", existingServer.ID, knownFP, fingerprint)
+		}
+	}
+	if req.SSHPassword != "" || req.SSHPrivateKey != "" {
+		_ = h.db.UpdateServerCredentials(ctx, existingServer.ID, req.SSHPassword, req.SSHPrivateKey)
+		if req.SSHPassword != "" {
+			existingServer.SSHPass = req.SSHPassword
+		}
+		if req.SSHPrivateKey != "" {
+			existingServer.SSHKey = req.SSHPrivateKey
+		}
+	}
+	return nil
 }
 
 func (h *Handlers) registerDeployServer(
@@ -491,22 +360,12 @@ func (h *Handlers) registerDeployServer(
 	}
 
 	if registered && existingServer != nil {
-		isResume := (nexusServerID > 0 && nexusServerID == existingServer.ID) ||
-			(order != nil && order.OrderID == req.OrderID && (order.ServerID == providerServerID || strings.EqualFold(order.AssignedIP, assignedIP)))
-
-		if isResume {
-			if req.SSHPassword != "" || req.SSHPrivateKey != "" {
-				_ = h.db.UpdateServerCredentials(ctx, existingServer.ID, req.SSHPassword, req.SSHPrivateKey)
-				if req.SSHPassword != "" {
-					existingServer.SSHPass = req.SSHPassword
-				}
-				if req.SSHPrivateKey != "" {
-					existingServer.SSHKey = req.SSHPrivateKey
-				}
+		if isDeployOrderResume(existingServer, nexusServerID, providerServerID, order, req, assignedIP) {
+			if err := h.reconcileExistingServerResume(ctx, existingServer, req, fingerprint); err != nil {
+				return nil, err
 			}
 			return existingServer, nil
 		}
-
 		return nil, fmt.Errorf("%w: gigahost server ID %d is already registered as server %d", ErrDuplicateServerID, providerServerID, existingServer.ID)
 	}
 
@@ -544,7 +403,12 @@ func (h *Handlers) registerDeployServer(
 	newServer.ID = createdID
 
 	if fingerprint != "" {
-		_ = h.db.SaveKnownHostFingerprint(ctx, createdID, fingerprint)
+		if err := validateFingerprintFormat(fingerprint); err != nil {
+			return nil, fmt.Errorf("invalid host key fingerprint: %w", err)
+		}
+		if err := h.db.SaveKnownHostFingerprint(ctx, createdID, fingerprint); err != nil {
+			return nil, fmt.Errorf("failed to persist host key fingerprint: %w", err)
+		}
 	}
 
 	return newServer, nil
@@ -558,14 +422,29 @@ func (h *Handlers) installDeployProtocol(
 	protocol := req.GetEffectiveProtocol()
 	port := req.GetEffectivePort()
 
+	// Ensure Docker prerequisite is bootstrapped for containerized protocols
+	if err := h.ensureHostDockerPrerequisite(ctx, server, protocol); err != nil {
+		return "", err
+	}
+
 	protoMgr, err := h.GetProtocolManager(protocol)
 	if err != nil {
 		return "", fmt.Errorf("protocol manager not found for %s: %w", protocol, err)
 	}
 
+	skipProbe := false
+	if h.sshDialerHook != nil {
+		skipProbe = true
+	}
+
 	params := map[string]any{
-		"port":          port,
-		"port_explicit": true,
+		"port":                port,
+		"port_explicit":       true,
+		"preserve_identity":   true,
+		"preserve_containers": true,
+		"reconcile":           true,
+		"docker_bootstrapped": true,
+		"skip_probe":          skipProbe,
 	}
 	if req.EngineProfile != "" {
 		params["engine_profile"] = req.EngineProfile
@@ -624,7 +503,36 @@ func (h *Handlers) enableDeployBackend(
 		return h.vpnSvc.EnableBackendWithConfig(ctx, server.ID, opts...)
 	}
 
-	return h.vpnSvc.EnableBackend(ctx, server.ID)
+	if err := h.vpnSvc.EnableBackend(ctx, server.ID); err != nil {
+		return err
+	}
+	// Enroll in non-eligible connecting state and qualify traffic before promoting to active
+	if err := h.vpnSvc.SetTunnelStatus(ctx, server.ID, models.TunnelStatusConnecting, 0); err != nil {
+		return fmt.Errorf("failed to set connecting status: %w", err)
+	}
+	return h.qualifyBackendTraffic(ctx, server, protocol)
+}
+
+func (h *Handlers) qualifyBackendTraffic(ctx context.Context, server *models.Server, protocol string) error {
+	if h.vpnSvc == nil {
+		return nil
+	}
+	tun, err := h.vpnSvc.GetTunnel(server.ID)
+	if err != nil || tun == nil {
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	latency, err := h.vpnSvc.ProbeTunnel(probeCtx, tun)
+	if err != nil {
+		// Probe failed or prober not initialized: remains in non-eligible connecting state.
+		return nil
+	}
+	if latency <= 0 {
+		latency = 10
+	}
+	return h.vpnSvc.SetTunnelStatus(ctx, server.ID, models.TunnelStatusActive, latency)
 }
 
 // DeployGigahostOrder orchestrates the multi-step onboarding of a ready Gigahost VPS into an active VPN backend.
@@ -688,6 +596,9 @@ func (h *Handlers) DeployGigahostOrder(ctx context.Context, req GigahostDeployRe
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusInstallingProtocol, "server_registration", "", providerServerID, nexusServerID, assignedIP)
 
 	// 4. Protocol Installation
+	if nexusServerID > 0 && h.vpnSvc != nil {
+		_ = h.vpnSvc.DisableBackend(ctx, nexusServerID)
+	}
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusInstallingProtocol, DeployStatusInstallingProtocol, "", providerServerID, nexusServerID, assignedIP)
 	protocol := req.GetEffectiveProtocol()
 	port, err := h.installDeployProtocol(ctx, server, req)
@@ -783,6 +694,9 @@ func (h *Handlers) GigahostDeployHandler(w http.ResponseWriter, r *http.Request)
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", "order_id is required")
 		return
 	}
+
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(middleware.InstallRequestTimeout))
 
 	status, err := h.DeployGigahostOrder(r.Context(), req)
 	if err != nil {

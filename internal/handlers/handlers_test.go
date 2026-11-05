@@ -176,16 +176,51 @@ func (m *mockProtocolManager) GetClientConfig(ctx context.Context, server *model
 }
 
 type testMockSSHClient struct {
-	serverID       *int64
-	cmdFunc        func(ctx context.Context, cmd string) (string, string, int, error)
-	downloadFn     func(ctx context.Context, path string) ([]byte, error)
-	uploadFn       func(ctx context.Context, path string, content []byte) error
-	uploadSudoMode os.FileMode
+	serverID          *int64
+	cmdFunc           func(ctx context.Context, cmd string) (string, string, int, error)
+	downloadFn        func(ctx context.Context, path string) ([]byte, error)
+	uploadFn          func(ctx context.Context, path string, content []byte) error
+	fileExistsFn      func(ctx context.Context, path string) (bool, error)
+	uploadSudoMode    os.FileMode
+	uploadedFiles     map[string][]byte
+	startedContainers map[string]bool
 }
 
 func (m *testMockSSHClient) RunCommand(ctx context.Context, cmd string) (string, string, int, error) {
 	if m.cmdFunc != nil {
-		return m.cmdFunc(ctx, cmd)
+		out, errOut, code, err := m.cmdFunc(ctx, cmd)
+		if strings.Contains(cmd, "docker inspect") && out == "" && errOut == "" && code == 0 && err == nil {
+			cName := ""
+			if strings.Contains(cmd, "xray") {
+				cName = "xray"
+			} else if strings.Contains(cmd, "caddy") {
+				cName = "caddy"
+			} else if strings.Contains(cmd, "amnezia") {
+				cName = "amnezia"
+			}
+			if cName != "" && (m.startedContainers == nil || !m.startedContainers[cName]) {
+				return "", "Error: No such container: " + cName, 1, nil
+			}
+			return "true false 123\n", "", 0, nil
+		}
+		if strings.Contains(cmd, "docker run") {
+			if m.startedContainers == nil {
+				m.startedContainers = make(map[string]bool)
+			}
+			if strings.Contains(cmd, "xray") {
+				m.startedContainers["xray"] = true
+			}
+			if strings.Contains(cmd, "caddy") {
+				m.startedContainers["caddy"] = true
+			}
+			if strings.Contains(cmd, "amnezia") {
+				m.startedContainers["amnezia"] = true
+			}
+		}
+		return out, errOut, code, err
+	}
+	if strings.Contains(cmd, "docker inspect") {
+		return "true false 123\n", "", 0, nil
 	}
 	if strings.Contains(cmd, "clientsTable") {
 		return `[{"clientId":"client-1","client_id":"client-1","userData":{"clientName":"Test Client","clientPrivateKey":"c29tZXByaXZhdGVrZXk="},"config":"[Interface]\nAddress = 10.8.0.2/24\n"}]`, "", 0, nil
@@ -202,9 +237,6 @@ func (m *testMockSSHClient) RunCommand(ctx context.Context, cmd string) (string,
 	if strings.Contains(cmd, "ss -lun") {
 		// Preflight: no UDP listener on the requested port.
 		return "", "", 0, nil
-	}
-	if strings.Contains(cmd, "docker inspect") && strings.Contains(cmd, ".State.Running") {
-		return "true false 123\n", "", 0, nil
 	}
 	if strings.Contains(cmd, "docker ps") {
 		// Preflight: publish filter finds no existing binding.
@@ -226,6 +258,10 @@ func (m *testMockSSHClient) RunSudoCommand(ctx context.Context, cmd string) (str
 }
 
 func (m *testMockSSHClient) UploadFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error {
+	if m.uploadedFiles == nil {
+		m.uploadedFiles = make(map[string][]byte)
+	}
+	m.uploadedFiles[remotePath] = content
 	if m.uploadFn != nil {
 		return m.uploadFn(ctx, remotePath, content)
 	}
@@ -234,6 +270,10 @@ func (m *testMockSSHClient) UploadFile(ctx context.Context, remotePath string, c
 
 func (m *testMockSSHClient) UploadSudoFile(ctx context.Context, remotePath string, content []byte, mode os.FileMode) error {
 	m.uploadSudoMode = mode
+	if m.uploadedFiles == nil {
+		m.uploadedFiles = make(map[string][]byte)
+	}
+	m.uploadedFiles[remotePath] = content
 	if m.uploadFn != nil {
 		return m.uploadFn(ctx, remotePath, content)
 	}
@@ -244,8 +284,19 @@ func (m *testMockSSHClient) DownloadFile(ctx context.Context, remotePath string)
 	if m.downloadFn != nil {
 		return m.downloadFn(ctx, remotePath)
 	}
+	if m.uploadedFiles != nil {
+		if content, ok := m.uploadedFiles[remotePath]; ok {
+			return content, nil
+		}
+	}
 	if strings.Contains(remotePath, "clientsTable") {
 		return []byte(`[{"clientId":"client-1","client_id":"client-1","userData":{"clientName":"Test Client"},"config":"[Interface]\nAddress = 10.8.0.2/24\n"}]`), nil
+	}
+	if strings.Contains(remotePath, "xray/config.json") {
+		return []byte("{}"), nil
+	}
+	if strings.Contains(remotePath, "caddy/Caddyfile") {
+		return []byte(":443 {\n}\n"), nil
 	}
 	return []byte("[Interface]\nAddress = 10.8.0.1/24\nPrivateKey = privkey\n"), nil
 }
@@ -255,6 +306,9 @@ func (m *testMockSSHClient) DownloadSudoFile(ctx context.Context, remotePath str
 }
 
 func (m *testMockSSHClient) FileExists(ctx context.Context, remotePath string) (bool, error) {
+	if m.fileExistsFn != nil {
+		return m.fileExistsFn(ctx, remotePath)
+	}
 	return true, nil
 }
 

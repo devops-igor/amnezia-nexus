@@ -681,6 +681,34 @@
         }
     }
 
+    let gigahostPollTimer = null;
+    function scheduleRecentOrdersPolling(orders) {
+        const inProgress = orders && orders.some(o => o.status === 'deploying' || o.status === 'pending' || o.status === 'waiting' || o.status === 'ssh_verifying' || o.status === 'installing_protocol' || o.status === 'enabling_backend');
+        if (inProgress && !gigahostPollTimer) {
+            gigahostPollTimer = setTimeout(() => {
+                gigahostPollTimer = null;
+                loadRecentOrders();
+            }, 3000);
+        }
+    }
+
+    async function triggerGigahostSetup(orderId) {
+        const password = prompt(_('deploy_ssh_password_prompt') || 'Enter SSH Password for VPS:');
+        if (!password) return;
+        UI.toast(_('deploy_status_polling') || 'Setting up VPN backend...', 'info');
+        try {
+            await API.post('/api/admin/hosting/gigahost/orders/' + encodeURIComponent(orderId) + '/setup', {
+                ssh_password: password,
+                protocol: 'awg'
+            });
+            UI.toast(_('success') || 'Setup completed', 'success');
+        } catch (err) {
+            UI.toast(err.message || _('error'), 'error');
+        } finally {
+            loadRecentOrders();
+        }
+    }
+
     async function loadRecentOrders() {
         const container = document.getElementById('recentOrdersContainer');
         if (!container) return;
@@ -697,6 +725,7 @@
                 renderEmpty();
                 return;
             }
+            scheduleRecentOrdersPolling(orders);
             const list = document.createElement('div');
             list.style.display = 'flex';
             list.style.flexDirection = 'column';
@@ -707,7 +736,7 @@
                 row.style.display = 'flex';
                 row.style.justifyContent = 'space-between';
                 row.style.alignItems = 'center';
-                row.style.padding = '4px 0';
+                row.style.padding = '6px 0';
                 row.style.borderBottom = '1px solid rgba(255,255,255,0.05)';
 
                 const left = document.createElement('div');
@@ -726,12 +755,54 @@
                     left.appendChild(ipSpan);
                 }
 
+                if (o.step && o.status !== 'ready') {
+                    const stepSpan = document.createElement('span');
+                    stepSpan.style.fontSize = '0.75rem';
+                    stepSpan.style.marginLeft = '8px';
+                    stepSpan.style.color = 'var(--text-muted)';
+                    stepSpan.textContent = '[' + o.step + ']';
+                    left.appendChild(stepSpan);
+                }
+
+                if (o.last_error && o.status === 'failed') {
+                    const errSpan = document.createElement('span');
+                    errSpan.style.fontSize = '0.75rem';
+                    errSpan.style.marginLeft = '8px';
+                    errSpan.style.color = 'var(--danger-color, #e53e3e)';
+                    errSpan.textContent = o.last_error;
+                    left.appendChild(errSpan);
+                }
+
                 const right = document.createElement('div');
+                right.style.display = 'flex';
+                right.style.alignItems = 'center';
+                right.style.gap = '6px';
+
                 const badge = document.createElement('span');
                 badge.className = 'badge ' + badgeClass;
                 badge.style.fontSize = '0.75rem';
                 badge.textContent = o.status || '';
                 right.appendChild(badge);
+
+                if (o.status === 'failed') {
+                    const btnRetry = document.createElement('button');
+                    btnRetry.type = 'button';
+                    btnRetry.className = 'btn btn-secondary';
+                    btnRetry.style.padding = '2px 8px';
+                    btnRetry.style.fontSize = '0.75rem';
+                    btnRetry.textContent = _('deploy_retry_btn') || 'Retry';
+                    btnRetry.addEventListener('click', () => triggerGigahostSetup(o.order_id));
+                    right.appendChild(btnRetry);
+                } else if (o.status !== 'ready' && o.assigned_ip) {
+                    const btnSetup = document.createElement('button');
+                    btnSetup.type = 'button';
+                    btnSetup.className = 'btn btn-primary';
+                    btnSetup.style.padding = '2px 8px';
+                    btnSetup.style.fontSize = '0.75rem';
+                    btnSetup.textContent = _('deploy_setup_btn') || 'Setup Backend';
+                    btnSetup.addEventListener('click', () => triggerGigahostSetup(o.order_id));
+                    right.appendChild(btnSetup);
+                }
 
                 row.appendChild(left);
                 row.appendChild(right);

@@ -724,5 +724,9 @@
   "deploy_vps_select_region": "Select Region",
   "deploy_vps_select_os": "Operating System",
   "deploy_vps_btn": "Deploy VPS",
-  "deploy_vps_recent_orders": "Recent Deployments"
+  "deploy_vps_recent_orders": "Recent Deployments",
+  "deploy_setup_btn": "Setup Backend",
+  "deploy_retry_btn": "Retry",
+  "deploy_ssh_password_prompt": "Enter SSH Password for VPS:",
+  "deploy_status_polling": "Setting up VPN backend..."
 }
