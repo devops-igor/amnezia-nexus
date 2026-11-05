@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -318,6 +319,55 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 		return
 	}
 
+	if os.Getenv("NEXUS_E2E_IN_TEST_NETNS") != "1" {
+		hostNS := fmt.Sprintf("nx-thost-%d", time.Now().UnixNano()%100000)
+		wanNS := fmt.Sprintf("nx-twan-%d", time.Now().UnixNano()%100000)
+		if err := exec.Command("ip", "netns", "add", hostNS).Run(); err != nil {
+			t.Fatalf("create host test netns failed: %v", err)
+		}
+		defer func() {
+			_ = exec.Command("ip", "netns", "del", hostNS).Run()
+		}()
+		if err := exec.Command("ip", "netns", "add", wanNS).Run(); err != nil {
+			t.Fatalf("create wan test netns failed: %v", err)
+		}
+		defer func() {
+			_ = exec.Command("ip", "netns", "del", wanNS).Run()
+		}()
+		_ = exec.Command("ip", "-n", hostNS, "link", "set", "lo", "up").Run()
+
+		var childArgs []string
+		skipNext := false
+		for _, arg := range os.Args[1:] {
+			if skipNext {
+				skipNext = false
+				continue
+			}
+			if arg == "-test.run" {
+				skipNext = true
+				continue
+			}
+			if strings.HasPrefix(arg, "-test.run=") {
+				continue
+			}
+			childArgs = append(childArgs, arg)
+		}
+		childArgs = append(childArgs, "-test.run=^TestLinuxE2E_DirectEgress$")
+
+		cmdArgs := append([]string{"netns", "exec", hostNS, os.Args[0]}, childArgs...)
+		cmd := exec.Command("ip", cmdArgs...)
+		cmd.Env = append(os.Environ(),
+			"NEXUS_E2E_IN_TEST_NETNS=1",
+			"NEXUS_E2E_WAN_NETNS="+wanNS,
+		)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("e2e test inside host netns %s failed: %v", hostNS, err)
+		}
+		return
+	}
+
 	tunName := fmt.Sprintf("tun-%d", time.Now().UnixNano()%10000)
 	if len(tunName) > 15 {
 		tunName = tunName[:15]
@@ -330,18 +380,20 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 	if len(vethWAN) > 15 {
 		vethWAN = vethWAN[:15]
 	}
-	netnsName := fmt.Sprintf("nexus-ns-%d", time.Now().UnixNano()%10000)
-	if len(netnsName) > 15 {
-		netnsName = netnsName[:15]
+	netnsName := os.Getenv("NEXUS_E2E_WAN_NETNS")
+	if netnsName == "" {
+		netnsName = fmt.Sprintf("nexus-ns-%d", time.Now().UnixNano()%10000)
+		if len(netnsName) > 15 {
+			netnsName = netnsName[:15]
+		}
+		if err := exec.Command("ip", "netns", "add", netnsName).Run(); err != nil {
+			t.Fatalf("ip netns add failed: %v", err)
+		}
 	}
 
 	hostWAN := netip.MustParseAddr("198.51.100.1")
 	targetIP := netip.MustParseAddr("198.51.200.2")
 
-	// 1. Create isolated network namespace for external WAN network
-	if err := exec.Command("ip", "netns", "add", netnsName).Run(); err != nil {
-		t.Fatalf("ip netns add failed: %v", err)
-	}
 	defer func() {
 		_ = exec.Command("ip", "netns", "del", netnsName).Run()
 		_ = exec.Command("ip", "link", "del", vethHost).Run()
