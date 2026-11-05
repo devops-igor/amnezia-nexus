@@ -283,6 +283,10 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			r.Get("/catalog", h.GigahostCatalogHandler)
 			r.Post("/order", h.GigahostOrderHandler)
 			r.Get("/orders", h.GigahostOrdersHandler)
+			r.Post("/deploy", h.GigahostDeployHandler)
+			r.Post("/orders/{order_id}/setup", h.GigahostDeployHandler)
+			r.Get("/deploy/{order_id}", h.GigahostDeployStatusHandler)
+			r.Get("/orders/{order_id}/status", h.GigahostDeployStatusHandler)
 		})
 	})
 
