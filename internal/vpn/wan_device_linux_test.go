@@ -37,21 +37,24 @@ func TestProductionWANDevice_PermissionsAndLifecycle(t *testing.T) {
 
 	dev, err := NewProductionWANDevice("nexus-wan-test")
 	if err != nil {
+		if strings.Contains(err.Error(), "accept_local is disabled on both all and") {
+			if isAllAcceptLocalEnabled() {
+				t.Fatalf("unexpected accept_local prerequisite failure when all.accept_local is enabled: %v", err)
+			}
+			t.Skipf("skipping TUN lifecycle assertions: accept_local is disabled on both all and device (read-only procfs in container): %v", err)
+			return
+		}
 		t.Fatalf("NewProductionWANDevice failed: %v", err)
 	}
 	defer func() { _ = dev.Close() }()
 
-	// Verify accept_local=1 was configured on the device interface (when procfs is writable)
+	// Verify accept_local is effective (either configured on device or enabled host-wide)
 	if alData, alErr := os.ReadFile("/proc/sys/net/ipv4/conf/nexus-wan-test/accept_local"); alErr == nil {
 		if val := strings.TrimSpace(string(alData)); val != "1" {
-			// In CI containerized environments, procfs is read-only so accept_local cannot be modified.
-			f, writeErr := os.OpenFile("/proc/sys/net/ipv4/conf/nexus-wan-test/accept_local", os.O_WRONLY, 0)
-			if writeErr != nil {
-				t.Logf("accept_local on nexus-wan-test is %q (containerized read-only procfs: %v)", val, writeErr)
-			} else {
-				_ = f.Close()
-				t.Fatalf("expected accept_local=1 on nexus-wan-test, got %q", val)
+			if !isAllAcceptLocalEnabled() {
+				t.Fatalf("expected accept_local=1 on nexus-wan-test or all, got dev=%q, all=%v", val, isAllAcceptLocalEnabled())
 			}
+			t.Logf("accept_local on nexus-wan-test is %q, but all.accept_local is enabled", val)
 		}
 	}
 

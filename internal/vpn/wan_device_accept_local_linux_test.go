@@ -89,3 +89,35 @@ func TestSetAcceptLocal_ReadOnlyFileFails(t *testing.T) {
 		t.Fatal("expected setAcceptLocal to fail on read-only file, got nil")
 	}
 }
+
+func TestCheckAcceptLocalPrerequisite_AllStates(t *testing.T) {
+	fakeErr := errors.New("read-only procfs: permission denied")
+
+	// State 1: per-device succeeds, global disabled -> proceeds (nil)
+	if err := checkAcceptLocalPrerequisite(nil, false, "nexus-wan0"); err != nil {
+		t.Fatalf("expected nil when per-device succeeds, got %v", err)
+	}
+
+	// State 2: per-device fails, global enabled -> proceeds (nil, fallback logged)
+	if err := checkAcceptLocalPrerequisite(fakeErr, true, "nexus-wan0"); err != nil {
+		t.Fatalf("expected nil when global is enabled, got %v", err)
+	}
+
+	// State 3: per-device fails, global disabled -> fails closed with error
+	err := checkAcceptLocalPrerequisite(fakeErr, false, "nexus-wan0")
+	if err == nil {
+		t.Fatal("expected error when both per-device and global are disabled/unconfigurable, got nil")
+	}
+	expectedSub := "wan prerequisites: accept_local is disabled on both all and nexus-wan0 (cannot inject SNAT packets without martian drop)"
+	if !strings.Contains(err.Error(), expectedSub) {
+		t.Fatalf("expected error containing %q, got %q", expectedSub, err.Error())
+	}
+	if !errors.Is(err, fakeErr) {
+		t.Fatalf("expected wrapped error %v, got %v", fakeErr, err)
+	}
+
+	// State 4: per-device succeeds, global enabled -> proceeds (nil)
+	if err := checkAcceptLocalPrerequisite(nil, true, "nexus-wan0"); err != nil {
+		t.Fatalf("expected nil when both succeed, got %v", err)
+	}
+}

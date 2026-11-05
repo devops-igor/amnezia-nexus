@@ -360,6 +360,17 @@ func isAllAcceptLocalEnabled() bool {
 	return err == nil && strings.TrimSpace(string(data)) == "1"
 }
 
+func checkAcceptLocalPrerequisite(setDevErr error, allEnabled bool, actualName string) error {
+	if setDevErr != nil {
+		if allEnabled {
+			log.Printf("[vpn] warning: setAcceptLocal for %s failed (%v), but all.accept_local is enabled", actualName, setDevErr)
+			return nil
+		}
+		return fmt.Errorf("wan prerequisites: accept_local is disabled on both all and %s (cannot inject SNAT packets without martian drop): %w", actualName, setDevErr)
+	}
+	return nil
+}
+
 func setAcceptLocal(procPath, sysctlKey string) error {
 	cleanPath := filepath.Clean(procPath)
 	// #nosec G304 -- cleanPath is constructed internally from trusted kernel procfs paths
@@ -487,15 +498,10 @@ func NewProductionWANDevice(name string) (forwarder.PacketDevice, error) {
 
 	// Configure accept_local=1 on the TUN interface so locally sourced SNAT packets are accepted
 	devAcceptLocalPath := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/accept_local", actualName)
-	if err := setAcceptLocal(devAcceptLocalPath, fmt.Sprintf("net.ipv4.conf.%s.accept_local", actualName)); err != nil {
-		// Fallback: if accept_local cannot be configured (e.g. read-only procfs in containerized CI),
-		// log a warning rather than failing closed if host-wide accept_local is enabled or
-		// container procfs prevents configuration.
-		if isAllAcceptLocalEnabled() {
-			log.Printf("[vpn] warning: setAcceptLocal for %s failed (%v), but all.accept_local is enabled", actualName, err)
-		} else {
-			log.Printf("[vpn] warning: setAcceptLocal for %s failed (%v); accept_local not configurable in this environment", actualName, err)
-		}
+	setDevErr := setAcceptLocal(devAcceptLocalPath, fmt.Sprintf("net.ipv4.conf.%s.accept_local", actualName))
+	if err := checkAcceptLocalPrerequisite(setDevErr, isAllAcceptLocalEnabled(), actualName); err != nil {
+		_ = unix.Close(fd)
+		return nil, err
 	}
 
 	// Inbound return path packet reader: raw packet socket on host network interface
