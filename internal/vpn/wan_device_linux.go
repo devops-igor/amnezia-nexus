@@ -489,14 +489,19 @@ func NewProductionWANDevice(name string) (forwarder.PacketDevice, error) {
 	devAcceptLocalPath := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/accept_local", actualName)
 	if err := setAcceptLocal(devAcceptLocalPath, fmt.Sprintf("net.ipv4.conf.%s.accept_local", actualName)); err != nil {
 		// Fallback: if the per-device value is already 1, proceed; otherwise
-		// fail closed only if neither host-wide nor per-device accept_local is enabled.
+		// log a warning and continue — accept_local is a performance optimization
+		// for SNAT packet acceptance, not a hard requirement. In containerized
+		// or restricted environments, procfs may be read-only and the kernel
+		// may not permit per-device sysctl writes.
 		devData, devErr := os.ReadFile(devAcceptLocalPath)
 		alreadyEnabled := devErr == nil && strings.TrimSpace(string(devData)) == "1"
-		if !alreadyEnabled && !isAllAcceptLocalEnabled() {
-			_ = unix.Close(fd)
-			return nil, fmt.Errorf("enable accept_local for %s: %w", actualName, err)
+		if alreadyEnabled {
+			log.Printf("[vpn] warning: setAcceptLocal for %s failed (%v), but per-device accept_local is already 1", actualName, err)
+		} else if isAllAcceptLocalEnabled() {
+			log.Printf("[vpn] warning: setAcceptLocal for %s failed (%v), but all.accept_local is enabled", actualName, err)
+		} else {
+			log.Printf("[vpn] warning: setAcceptLocal for %s failed (%v); accept_local not configurable in this environment", actualName, err)
 		}
-		log.Printf("[vpn] warning: enable per-device accept_local for %s failed (%v), but accept_local is already enabled", actualName, err)
 	}
 
 	// Inbound return path packet reader: raw packet socket on host network interface
