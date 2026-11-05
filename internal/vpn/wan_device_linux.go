@@ -353,10 +353,20 @@ var (
 	ErrNoDefaultWANRoute = errors.New("kernel prerequisite failed: no active outbound WAN route detected")
 	// ErrAcceptLocalDisabled indicates Linux kernel local-source acceptance is not enabled.
 	ErrAcceptLocalDisabled = errors.New("kernel prerequisite failed: net.ipv4.conf.all.accept_local must be enabled (value 1)")
+	// ErrWANCaptureDenied indicates the process may not open the AF_PACKET socket used to
+	// capture direct-WAN return traffic. Opening it requires CAP_NET_RAW, which the
+	// production binary does not receive from CAP_NET_ADMIN alone.
+	ErrWANCaptureDenied = errors.New("kernel prerequisite failed: opening the AF_PACKET WAN capture socket requires CAP_NET_RAW (grant NET_RAW to the container and keep cap_net_raw in the binary's file capabilities)")
 )
 
 func isAllAcceptLocalEnabled() bool {
-	data, err := os.ReadFile("/proc/sys/net/ipv4/conf/all/accept_local")
+	return isAcceptLocalEnabled("/proc/sys/net/ipv4/conf/all/accept_local")
+}
+
+// isAcceptLocalEnabled reports whether the accept_local setting at procPath is 1.
+func isAcceptLocalEnabled(procPath string) bool {
+	// #nosec G304 -- procPath is a kernel procfs setting path constructed internally
+	data, err := os.ReadFile(procPath)
 	return err == nil && strings.TrimSpace(string(data)) == "1"
 }
 
@@ -400,8 +410,27 @@ func setAcceptLocal(procPath, sysctlKey string) error {
 // 3. Outbound WAN route exists
 // 4. net.ipv4.conf.all.accept_local == 1 (permits locally sourced SNAT packets)
 // 5. iptables firewall utility is available
+// 6. CAP_NET_RAW is available to open the AF_PACKET WAN capture socket
+//
+// The checks run in order so a failure names the first unmet prerequisite.
 func ValidateKernelPrerequisites() error {
-	// 1. IP Forwarding
+	for _, check := range []func() error{
+		checkIPForwarding,
+		checkLooseReversePathFilter,
+		checkWANRoute,
+		checkHostAcceptLocal,
+		checkIPTablesAvailable,
+		checkWANCaptureCapability,
+	} {
+		if err := check(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkIPForwarding requires net.ipv4.ip_forward == 1.
+func checkIPForwarding() error {
 	fwdData, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward")
 	if err != nil {
 		return fmt.Errorf("read net.ipv4.ip_forward: %w", err)
@@ -409,35 +438,79 @@ func ValidateKernelPrerequisites() error {
 	if strings.TrimSpace(string(fwdData)) != "1" {
 		return ErrIPForwardingDisabled
 	}
+	return nil
+}
 
-	// 2. Reverse-path filtering
+// checkLooseReversePathFilter rejects strict (1) rp_filter, which drops asymmetric
+// WAN replies. An unreadable setting is tolerated so read-only procfs mounts work.
+func checkLooseReversePathFilter() error {
 	rpData, err := os.ReadFile("/proc/sys/net/ipv4/conf/all/rp_filter")
-	if err == nil {
-		val := strings.TrimSpace(string(rpData))
-		if val == "1" {
-			return ErrStrictRPFilter
-		}
+	if err != nil {
+		return nil
 	}
+	if strings.TrimSpace(string(rpData)) == "1" {
+		return ErrStrictRPFilter
+	}
+	return nil
+}
 
-	// 3. Outbound WAN route viability
+// checkWANRoute requires an outbound WAN route.
+func checkWANRoute() error {
 	if _, err := DeriveHostWANIP(); err != nil {
 		return fmt.Errorf("%w: %v", ErrNoDefaultWANRoute, err)
 	}
+	return nil
+}
 
-	// 4. Local-source acceptance (accept_local=1)
-	if !isAllAcceptLocalEnabled() {
-		allAcceptLocalPath := "/proc/sys/net/ipv4/conf/all/accept_local"
-		if err := setAcceptLocal(allAcceptLocalPath, "net.ipv4.conf.all.accept_local"); err != nil {
-			log.Printf("[vpn] warning: unable to enable %s: %v; relying on per-device accept_local", allAcceptLocalPath, err)
-		}
+// ensureAcceptLocal enables accept_local at procPath, tolerating failure because the
+// per-device setting is applied when the TUN device is created.
+func ensureAcceptLocal(procPath, sysctlKey string) error {
+	if isAcceptLocalEnabled(procPath) {
+		return nil
 	}
+	if err := setAcceptLocal(procPath, sysctlKey); err != nil {
+		log.Printf("[vpn] warning: unable to enable %s: %v; relying on per-device accept_local", procPath, err)
+	}
+	return nil
+}
 
-	// 5. Firewall / iptables availability
+// checkHostAcceptLocal applies the host-wide accept_local prerequisite.
+func checkHostAcceptLocal() error {
+	return ensureAcceptLocal("/proc/sys/net/ipv4/conf/all/accept_local", "net.ipv4.conf.all.accept_local")
+}
+
+// checkIPTablesAvailable requires the iptables utility.
+func checkIPTablesAvailable() error {
 	if _, err := exec.LookPath("iptables"); err != nil {
 		return fmt.Errorf("iptables not found: %w", err)
 	}
-
 	return nil
+}
+
+// checkWANCaptureCapability requires CAP_NET_RAW for the AF_PACKET capture socket
+// that direct-WAN return traffic is read from.
+func checkWANCaptureCapability() error {
+	captureFD, err := openWANCaptureSocket()
+	if err != nil {
+		return err
+	}
+	_ = unix.Close(captureFD)
+	return nil
+}
+
+// openWANCaptureSocket opens the AF_PACKET socket used to capture direct-WAN return
+// traffic. Creating an AF_PACKET socket requires CAP_NET_RAW; CAP_NET_ADMIN alone is
+// not sufficient, so a permission failure is reported as ErrWANCaptureDenied with the
+// required capability named instead of a bare EPERM.
+func openWANCaptureSocket() (int, error) {
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM, int(htons(unix.ETH_P_IP)))
+	if err != nil {
+		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+			return -1, fmt.Errorf("open raw packet socket for wan return traffic: %w", ErrWANCaptureDenied)
+		}
+		return -1, fmt.Errorf("open raw packet socket for wan return traffic: %w", err)
+	}
+	return fd, nil
 }
 
 // NewProductionWANDevice creates a real Linux TUN device and raw socket capture for production WAN egress/ingress.
@@ -506,10 +579,10 @@ func NewProductionWANDevice(name string) (forwarder.PacketDevice, error) {
 
 	// Inbound return path packet reader: raw packet socket on host network interface
 	// filtering for return traffic on allocated NAT ports (40000 - 65000).
-	rawSock, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM, int(htons(unix.ETH_P_IP)))
+	rawSock, err := openWANCaptureSocket()
 	if err != nil {
 		_ = unix.Close(fd)
-		return nil, fmt.Errorf("open raw packet socket for wan return traffic: %w", err)
+		return nil, err
 	}
 
 	if err := unix.SetNonblock(rawSock, true); err != nil {
