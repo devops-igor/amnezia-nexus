@@ -274,65 +274,126 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			status = "degraded"
 		}
 
-		// Dual-tier verification: before promoting ANY backend to active
-		// (whether recovering from handshake_blocked, connecting, or degraded),
-		// inner canary probe must succeed if available!
+		// Dual-tier verification: before promoting ANY non-active backend to active
+		// (whether connecting, degraded, or handshake_blocked),
+		// data-plane device attachment AND successful inner canary probe are strictly required!
 		if status == "active" {
+			isCurrentlyActive := strings.EqualFold(t.Status, models.TunnelStatusActive) &&
+				(poolTun == nil || strings.EqualFold(poolTun.Status, models.TunnelStatusActive))
+
 			canaryProber := o.getCanaryProber()
-			if canaryProber != nil {
+
+			if !isCurrentlyActive {
+				if canaryProber == nil {
+					if isBlocked {
+						slog.Warn("Backend tunnel outer probe recovered but no canary prober available to verify inner plane; preserving handshake_blocked",
+							"tunnel_id", t.ID,
+							"endpoint", t.Endpoint,
+						)
+					} else {
+						slog.Warn("Backend tunnel outer probe succeeded but no canary prober available to verify inner plane; denying active promotion",
+							"tunnel_id", t.ID,
+							"endpoint", t.Endpoint,
+							"status", t.Status,
+						)
+					}
+					continue
+				}
+
+				cErr := canaryProber.ProbeCanary(ctx, &t)
+
 				hasCanary := true
 				if cp, ok := canaryProber.(interface {
 					HasCanaryProber(tunnel *models.BackendTunnel) bool
 				}); ok {
 					hasCanary = cp.HasCanaryProber(&t)
 				}
-
-				if isBlocked {
-					if !hasCanary {
-						slog.Warn("Backend tunnel outer probe recovered but no canary prober available to verify inner plane; preserving handshake_blocked",
-							"tunnel_id", t.ID,
-							"endpoint", t.Endpoint,
-						)
-						continue
-					}
-					if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
-						slog.Warn("Backend tunnel outer probe recovered but inner canary probe failed; marking degraded",
-							"tunnel_id", t.ID,
-							"endpoint", t.Endpoint,
-							"err", cErr,
-						)
-						if o.updateTunnelStatus(ctx, &t, models.TunnelStatusDegraded, latencyMS) {
-							degradedTunnels = append(degradedTunnels, t.ID)
-							t.Status = models.TunnelStatusDegraded
-							if o.probeFailVersions != nil && t.StateVersion > 0 {
-								o.probeFailVersions[t.ID] = t.StateVersion + 1
-							}
-						}
-						continue
-					}
-				} else if hasCanary {
-					if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
-						slog.Warn("Backend tunnel outer probe succeeded but inner canary probe failed; denying active promotion",
-							"tunnel_id", t.ID,
-							"endpoint", t.Endpoint,
-							"err", cErr,
-						)
-						if o.updateTunnelStatus(ctx, &t, models.TunnelStatusDegraded, latencyMS) {
-							degradedTunnels = append(degradedTunnels, t.ID)
-							t.Status = models.TunnelStatusDegraded
-							if o.probeFailVersions != nil && t.StateVersion > 0 {
-								o.probeFailVersions[t.ID] = t.StateVersion + 1
-							}
-						}
-						continue
+				if cErr != nil {
+					msg := cErr.Error()
+					if errors.Is(cErr, tunnel.ErrNoActiveDevice) ||
+						strings.Contains(msg, "ensure backend device attached") ||
+						strings.Contains(msg, "no active data-plane device") {
+						hasCanary = false
 					}
 				}
-			} else if isBlocked {
-				slog.Warn("Backend tunnel outer probe recovered but no canary prober available to verify inner plane; preserving handshake_blocked",
-					"tunnel_id", t.ID,
-					"endpoint", t.Endpoint,
-				)
-				continue
+
+				if cErr != nil || !hasCanary {
+					if isBlocked {
+						if !hasCanary && cErr == nil {
+							slog.Warn("Backend tunnel outer probe recovered but no canary prober available to verify inner plane; preserving handshake_blocked",
+								"tunnel_id", t.ID,
+								"endpoint", t.Endpoint,
+							)
+						} else {
+							slog.Warn("Backend tunnel outer probe recovered but inner canary probe failed; marking degraded",
+								"tunnel_id", t.ID,
+								"endpoint", t.Endpoint,
+								"err", cErr,
+							)
+							if o.updateTunnelStatus(ctx, &t, models.TunnelStatusDegraded, latencyMS) {
+								degradedTunnels = append(degradedTunnels, t.ID)
+								t.Status = models.TunnelStatusDegraded
+								if o.probeFailVersions != nil && t.StateVersion > 0 {
+									o.probeFailVersions[t.ID] = t.StateVersion + 1
+								}
+							}
+						}
+						continue
+					}
+
+					// Non-blocked backend (connecting or degraded)
+					if !hasCanary {
+						slog.Warn("Backend tunnel outer probe succeeded but data-plane device is not attached; denying active promotion",
+							"tunnel_id", t.ID,
+							"endpoint", t.Endpoint,
+							"err", cErr,
+						)
+						// Maintain connecting (or degraded) status without promoting to active
+						continue
+					}
+
+					// Data-plane device is attached, but inner canary probe failed: mark degraded
+					slog.Warn("Backend tunnel outer probe succeeded but inner canary probe failed; denying active promotion",
+						"tunnel_id", t.ID,
+						"endpoint", t.Endpoint,
+						"err", cErr,
+					)
+					if o.updateTunnelStatus(ctx, &t, models.TunnelStatusDegraded, latencyMS) {
+						degradedTunnels = append(degradedTunnels, t.ID)
+						t.Status = models.TunnelStatusDegraded
+						if o.probeFailVersions != nil && t.StateVersion > 0 {
+							o.probeFailVersions[t.ID] = t.StateVersion + 1
+						}
+					}
+					continue
+				}
+			} else {
+				// Already active backend: verify data plane if canary prober is configured.
+				if canaryProber != nil {
+					hasCanary := true
+					if cp, ok := canaryProber.(interface {
+						HasCanaryProber(tunnel *models.BackendTunnel) bool
+					}); ok {
+						hasCanary = cp.HasCanaryProber(&t)
+					}
+					if hasCanary {
+						if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
+							slog.Warn("Backend tunnel outer probe succeeded but inner canary probe failed; marking degraded",
+								"tunnel_id", t.ID,
+								"endpoint", t.Endpoint,
+								"err", cErr,
+							)
+							if o.updateTunnelStatus(ctx, &t, models.TunnelStatusDegraded, latencyMS) {
+								degradedTunnels = append(degradedTunnels, t.ID)
+								t.Status = models.TunnelStatusDegraded
+								if o.probeFailVersions != nil && t.StateVersion > 0 {
+									o.probeFailVersions[t.ID] = t.StateVersion + 1
+								}
+							}
+							continue
+						}
+					}
+				}
 			}
 		}
 

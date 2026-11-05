@@ -353,7 +353,7 @@ func TestOrchestrator_Rework8_InitialOuterFailure_TransitionsToHandshakeBlocked_
 	}
 }
 
-func TestOrchestrator_Rework9_ActivePromotionAllowedWhenNoCanaryDevice(t *testing.T) {
+func TestOrchestrator_Rework14_ScheduledBootstrapRequiresInnerProof(t *testing.T) {
 	cases := []struct {
 		name           string
 		initialStatus  string
@@ -362,11 +362,11 @@ func TestOrchestrator_Rework9_ActivePromotionAllowedWhenNoCanaryDevice(t *testin
 		expectedStatus string
 	}{
 		{
-			name:           "connecting without canary prober promotes to active",
+			name:           "connecting without canary prober remains connecting",
 			initialStatus:  models.TunnelStatusConnecting,
 			hasCanary:      false,
 			canaryErr:      nil,
-			expectedStatus: models.TunnelStatusActive,
+			expectedStatus: models.TunnelStatusConnecting,
 		},
 		{
 			name:           "degraded with ErrNoActiveDevice does not promote to active",
@@ -395,6 +395,13 @@ func TestOrchestrator_Rework9_ActivePromotionAllowedWhenNoCanaryDevice(t *testin
 			hasCanary:      true,
 			canaryErr:      errors.New("inner canary drop"),
 			expectedStatus: models.TunnelStatusDegraded,
+		},
+		{
+			name:           "connecting with attached good canary promotes to active",
+			initialStatus:  models.TunnelStatusConnecting,
+			hasCanary:      true,
+			canaryErr:      nil,
+			expectedStatus: models.TunnelStatusActive,
 		},
 	}
 
