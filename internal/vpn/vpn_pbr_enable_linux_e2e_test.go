@@ -61,6 +61,11 @@ func init() {
 	if os.Getenv(envPolicyE2EChild) == "1" {
 		os.Exit(runPolicyEnablementChild())
 	}
+	// One-shot context readback: same re-exec mechanism, prints one synthetic
+	// observation line and exits. It configures and writes nothing.
+	if os.Getenv(envPolicyE2EContextProbe) == "1" {
+		os.Exit(runPolicyE2EContextProbe())
+	}
 }
 
 // policyE2EGate reports whether this environment can run the privileged flow.
@@ -123,14 +128,39 @@ func TestLinuxE2E_PolicyEnablement(t *testing.T) {
 		"net.ipv4.conf.all.accept_local=1",
 	} {
 		if out, err := exec.Command("ip", "netns", "exec", ns, "sysctl", "-w", sysctl).CombinedOutput(); err != nil {
-			t.Fatalf("cannot set %s in the test namespace: %v (%s)", sysctl, err, strings.TrimSpace(string(out)))
+			// The utility's own output is not echoed: only its failure class and the
+			// prerequisite it was asked to set are, so a host path or address in a
+			// utility message cannot reach CI logs.
+			t.Fatalf("cannot set %s in the test namespace: category=%s (%s)", sysctl,
+				classifyPolicyE2EPrepareFailure(err), firstPolicyE2EToken(string(out)))
 		}
+	}
+
+	// Observe the prerequisites in the exact wrapper family that prepared them, so
+	// the child's readback has a same-boundary reference instead of an inference.
+	// One extra process start; it writes nothing.
+	prepReadback, prepOK := observePreparationContext(t, ns)
+	switch {
+	case !prepOK:
+		// The observation itself is unavailable: say so and let the production guard
+		// decide. An unavailable readback is never reported as a passing gate.
+		t.Logf("preparation-context readback unavailable; the production guard remains the deciding check")
+	case !prerequisitesObserved(prepReadback):
+		// The preparation loop above succeeded but the prepared values are not
+		// visible to a fresh invocation in the same namespace wrapper. This is an
+		// environment fact, not a product defect: name it instead of letting the
+		// activation guard report it as a missing kernel prerequisite.
+		class, _ := classifyPreparationReadback(prepReadback)
+		t.Fatalf("test environment cannot provide its own prerequisites: %s (%s); "+
+			"the production guard was never loosened and activation was not attempted",
+			class, prepReadback.report())
 	}
 
 	// Re-exec this binary inside the namespace so procfs reads resolve to the
 	// namespace's own values.
 	cmd := exec.Command("ip", "netns", "exec", ns, os.Args[0], "-test.run=TestLinuxE2E_PolicyEnablementChild", "-test.v")
-	cmd.Env = append(os.Environ(), envPolicyE2EChild+"=1", envPolicyE2ENetns+"="+ns)
+	cmd.Env = append(os.Environ(), envPolicyE2EChild+"=1", envPolicyE2ENetns+"="+ns,
+		envPolicyE2EPrepReadback+"="+prepReadback.line())
 	out, err := cmd.CombinedOutput()
 	t.Logf("child output:\n%s", out)
 	if err != nil {
@@ -172,6 +202,14 @@ func runPolicyEnablementChild() int {
 		return 1
 	}
 	say := func(line string) { fmt.Println(line) }
+
+	// ---- Prerequisite readback at the activation boundary ---------------------
+	// Observed in this process, which is the one that runs the real activation and
+	// therefore the one whose procfs view the production guard reads. Reported, not
+	// asserted here: the guard below still decides, unchanged and fail-closed.
+	activationRB, activationClass, activationOK := policyE2EActivationBoundary()
+	say("READBACK activation-context " + activationRB.report() + " class=" + activationClass +
+		" prerequisites=" + policyE2EObservedToken(activationOK))
 
 	// ---- Bring up the namespace's own network plumbing ------------------------
 	steps := [][]string{
@@ -246,6 +284,11 @@ func runPolicyEnablementChild() int {
 		return fail("new service: %v", err)
 	}
 	if err := activatePolicyE2E(svc, settings, store); err != nil {
+		// Name the environment facts the guard's own error cannot: the per-device
+		// key it tried to configure, and this context's re-read after the refusal.
+		// The guard still decides; this only makes a refusal actionable.
+		fmt.Fprintf(os.Stderr, "READBACK activation-failure %s class=%s %s\n",
+			describePolicyE2EDeviceReadback(), activationClass, readPolicyE2EContext("").report())
 		return fail("activation: %v", err)
 	}
 	if !svc.PBREnabled() {
