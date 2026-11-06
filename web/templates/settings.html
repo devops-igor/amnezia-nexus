@@ -410,6 +410,7 @@
     </button>
 </div>
 
+<script src="/static/js/gigahost_setup.js"></script>
 <script>
     document.getElementById('ssl_enabled').addEventListener('change', (e) => {
         document.getElementById('sslFields').style.display = e.target.checked ? 'block' : 'none';
@@ -681,6 +682,17 @@
         }
     }
 
+    let gigahostPollTimer = null;
+    function scheduleRecentOrdersPolling(orders) {
+        const inProgress = orders && orders.some(o => o.status === 'deploying' || o.status === 'pending' || o.status === 'waiting' || o.status === 'ssh_verifying' || o.status === 'installing_protocol' || o.status === 'enabling_backend');
+        if (inProgress && !gigahostPollTimer) {
+            gigahostPollTimer = setTimeout(() => {
+                gigahostPollTimer = null;
+                loadRecentOrders();
+            }, 3000);
+        }
+    }
+
     async function loadRecentOrders() {
         const container = document.getElementById('recentOrdersContainer');
         if (!container) return;
@@ -697,17 +709,35 @@
                 renderEmpty();
                 return;
             }
+            scheduleRecentOrdersPolling(orders);
+
+            // Enrich active/recent orders with deploy status DTO diagnostics
+            await Promise.all(orders.slice(0, 5).map(async (o) => {
+                if (!o.order_id) return;
+                try {
+                    const response = await API.get('/api/admin/hosting/gigahost/orders/' + encodeURIComponent(o.order_id) + '/status');
+                    const st = response && (response.deploy || response);
+                    if (st) {
+                        if (st.step) o.step = st.step;
+                        if (st.error) o.last_error = st.error;
+                        if (st.server_id) o.nexus_server_id = st.server_id;
+                        if (st.status === 'failed') o.status = 'failed';
+                        else if (st.status === 'ready' && st.server_id > 0) o.nexus_onboarded = true;
+                    }
+                } catch (_) {}
+            }));
+
             const list = document.createElement('div');
             list.style.display = 'flex';
             list.style.flexDirection = 'column';
             list.style.gap = '6px';
             orders.slice(0, 5).forEach(o => {
-                const badgeClass = o.status === 'ready' ? 'badge-success' : (o.status === 'failed' ? 'badge-danger' : 'badge-warn');
+                const badgeClass = (o.status === 'ready' && o.nexus_onboarded) ? 'badge-success' : (o.status === 'failed' ? 'badge-danger' : 'badge-warn');
                 const row = document.createElement('div');
                 row.style.display = 'flex';
                 row.style.justifyContent = 'space-between';
                 row.style.alignItems = 'center';
-                row.style.padding = '4px 0';
+                row.style.padding = '6px 0';
                 row.style.borderBottom = '1px solid rgba(255,255,255,0.05)';
 
                 const left = document.createElement('div');
@@ -726,12 +756,54 @@
                     left.appendChild(ipSpan);
                 }
 
+                if (o.step && (!o.nexus_onboarded || o.status !== 'ready')) {
+                    const stepSpan = document.createElement('span');
+                    stepSpan.style.fontSize = '0.75rem';
+                    stepSpan.style.marginLeft = '8px';
+                    stepSpan.style.color = 'var(--text-muted)';
+                    stepSpan.textContent = '[' + o.step + ']';
+                    left.appendChild(stepSpan);
+                }
+
+                if (o.last_error && o.status === 'failed') {
+                    const errSpan = document.createElement('span');
+                    errSpan.style.fontSize = '0.75rem';
+                    errSpan.style.marginLeft = '8px';
+                    errSpan.style.color = 'var(--danger-color, #e53e3e)';
+                    errSpan.textContent = o.last_error;
+                    left.appendChild(errSpan);
+                }
+
                 const right = document.createElement('div');
+                right.style.display = 'flex';
+                right.style.alignItems = 'center';
+                right.style.gap = '6px';
+
                 const badge = document.createElement('span');
                 badge.className = 'badge ' + badgeClass;
                 badge.style.fontSize = '0.75rem';
-                badge.textContent = o.status || '';
+                badge.textContent = (o.status === 'ready' && !o.nexus_onboarded) ? 'vps_ready' : (o.status || '');
                 right.appendChild(badge);
+
+                if (o.status === 'failed') {
+                    const btnRetry = document.createElement('button');
+                    btnRetry.type = 'button';
+                    btnRetry.className = 'btn btn-secondary';
+                    btnRetry.style.padding = '2px 8px';
+                    btnRetry.style.fontSize = '0.75rem';
+                    btnRetry.textContent = _('deploy_retry_btn') || 'Retry';
+                    btnRetry.addEventListener('click', () => triggerGigahostSetup(o.order_id));
+                    right.appendChild(btnRetry);
+                } else if ((!o.nexus_onboarded || o.status !== 'ready') && o.assigned_ip) {
+                    const btnSetup = document.createElement('button');
+                    btnSetup.type = 'button';
+                    btnSetup.className = 'btn btn-primary';
+                    btnSetup.style.padding = '2px 8px';
+                    btnSetup.style.fontSize = '0.75rem';
+                    btnSetup.textContent = _('deploy_setup_btn') || 'Setup Backend';
+                    btnSetup.addEventListener('click', () => triggerGigahostSetup(o.order_id));
+                    right.appendChild(btnSetup);
+                }
 
                 row.appendChild(left);
                 row.appendChild(right);

@@ -85,6 +85,9 @@ type Handlers struct {
 	serverHostMu              sync.Mutex
 	serverHostLocks           map[int64]*sync.Mutex
 	updateServerProtocolsHook func(context.Context, int64, map[string]any) error
+	sshDialerHook             func(context.Context, ssh.Config) (ssh.SSHClient, error)
+	gigahostDeployMu          sync.RWMutex
+	gigahostDeployLocks       map[string]*sync.Mutex
 }
 
 // lockUser serializes credential admission and user disabling; the lock is shared

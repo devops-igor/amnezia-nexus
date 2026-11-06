@@ -1,4 +1,5 @@
 {
+  "deploy_host_key_confirm": "Verify this SSH host fingerprint independently before trusting the server. Trust this identity?",
   "vpn_diag_memory_limit_unavailable": "Limit unavailable",
   "vpn_diag_heap_memory": "Heap: {value} MiB",
   "vpn_diag_queue_unavailable": "Queue unavailable",
@@ -724,5 +725,11 @@
   "deploy_vps_select_region": "Select Region",
   "deploy_vps_select_os": "Operating System",
   "deploy_vps_btn": "Deploy VPS",
-  "deploy_vps_recent_orders": "Recent Deployments"
+  "deploy_vps_recent_orders": "Recent Deployments",
+  "deploy_setup_btn": "Setup Backend",
+  "deploy_retry_btn": "Retry",
+  "deploy_ssh_password_prompt": "Enter SSH Password for VPS:",
+  "deploy_status_polling": "Setting up VPN backend...",
+  "deploy_protocol_prompt": "Select protocol (awg, vless, naive):",
+  "deploy_domain_prompt": "Enter TLS domain (required for naive, optional for vless):"
 }

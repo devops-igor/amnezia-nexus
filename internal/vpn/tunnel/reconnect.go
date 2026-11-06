@@ -201,6 +201,8 @@ func (rm *ReconnectManager) CheckAndReconnect(ctx context.Context) int {
 			delete(rm.backoffs, t.ServerID)
 			delete(rm.retries, t.ServerID)
 			delete(rm.nextAttempt, t.ServerID)
+			// ProbeTunnel already committed a generation-fenced health result.
+			// A second unversioned write could resurrect a reenrolled tunnel.
 			reconnectedCount++
 		} else if err == nil && getErr == nil && latest != nil && strings.EqualFold(latest.Status, models.TunnelStatusHandshakeBlocked) {
 			// Outer probe succeeded but inner canary failed:

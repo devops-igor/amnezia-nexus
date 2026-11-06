@@ -1,4 +1,5 @@
 {
+  "deploy_host_key_confirm": "Vérifiez indépendamment cette empreinte SSH avant de faire confiance au serveur. Accepter cette identité ?",
   "vpn_diag_memory_limit_unavailable": "Limite indisponible",
   "vpn_diag_heap_memory": "Tas : {value} MiB",
   "vpn_diag_queue_unavailable": "File indisponible",
@@ -724,5 +725,11 @@
   "deploy_vps_select_region": "Sélectionner une région",
   "deploy_vps_select_os": "Système d'exploitation",
   "deploy_vps_btn": "Déployer le VPS",
-  "deploy_vps_recent_orders": "Déploiements récents"
+  "deploy_vps_recent_orders": "Déploiements récents",
+  "deploy_setup_btn": "Configurer",
+  "deploy_retry_btn": "Réessayer",
+  "deploy_ssh_password_prompt": "Entrez le mot de passe SSH pour le VPS :",
+  "deploy_status_polling": "Configuration du serveur VPN...",
+  "deploy_protocol_prompt": "Sélectionnez le protocole (awg, vless, naive) :",
+  "deploy_domain_prompt": "Entrez le domaine TLS (requis pour naive, optionnel pour vless) :"
 }

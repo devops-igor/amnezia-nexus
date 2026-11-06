@@ -367,9 +367,11 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 	defer unlock()
 
 	// 1. Check Docker is installed
-	out, _, code, _ := client.RunCommand(ctx, "docker --version")
-	if code != 0 || !strings.Contains(strings.ToLower(out), "docker") {
-		return errors.New("docker is not installed on the remote server")
+	if b, ok := params["docker_bootstrapped"].(bool); !ok || !b {
+		out, _, code, _ := client.RunCommand(ctx, "docker --version")
+		if code != 0 || !strings.Contains(strings.ToLower(out), "docker") {
+			return errors.New("docker is not installed on the remote server")
+		}
 	}
 
 	// 2. Parse installation options
