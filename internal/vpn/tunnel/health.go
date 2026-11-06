@@ -92,9 +92,13 @@ type HealthProber struct {
 	// data plane owner so established sessions pinned to the backend move off
 	// it. Nil means "status only", the historical behavior.
 	healthDisabledNotifier func(ctx context.Context, tunnel *models.BackendTunnel) error
-	stopCh                 chan struct{}
-	wg                     sync.WaitGroup
-	running                bool
+	// selfHealFailoverRetrier settles an automatic failover that could not
+	// complete when it was first attempted (F16). Invoked by the bounded
+	// self-healing sweep, never by the probe hot path.
+	selfHealFailoverRetrier func(ctx context.Context) int
+	stopCh                  chan struct{}
+	wg                      sync.WaitGroup
+	running                 bool
 }
 
 // NewHealthProber initializes a new HealthProber instance.

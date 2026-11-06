@@ -59,6 +59,21 @@ func (hp *HealthProber) applyProviderCapabilities(provider any) {
 	if notifier, ok := provider.(HealthDisabledNotifier); ok {
 		hp.SetHealthDisabledNotifier(notifier.BackendHealthDisabled)
 	}
+	// F16: the data plane owner also owns the unfinished-failover bookkeeping.
+	// Discovering the retrier here means the existing self-healing sweep can
+	// settle an outstanding automatic failover without a new goroutine, a new
+	// loop, or a composition-root edit.
+	if retrier, ok := provider.(FailoverRetrier); ok {
+		hp.mu.Lock()
+		hp.selfHealFailoverRetrier = retrier.RetryPendingHealthFailovers
+		hp.mu.Unlock()
+	}
+}
+
+// FailoverRetrier is implemented by the owner of established sessions that can
+// settle an automatic health-disable failover it previously could not complete.
+type FailoverRetrier interface {
+	RetryPendingHealthFailovers(ctx context.Context) int
 }
 
 // healthDisableNotifyTarget reports whether a live tunnel is the backend the

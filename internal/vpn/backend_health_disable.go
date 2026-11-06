@@ -75,20 +75,41 @@ func (s *Service) BackendHealthDisabled(ctx context.Context, disabled *models.Ba
 
 	targets := s.healthDisableTargets(live)
 	if len(targets) == 0 {
-		log.Printf("[vpn] backend %d (tunnel %d) disabled by health probing; no healthy alternative for its established sessions", live.ServerID, live.ID)
+		// F16: no alternative right now. The sessions stay pinned (correct for
+		// this instant) but the obligation is NOT discharged — record it so a
+		// bounded worker retries once an alternative becomes eligible.
+		log.Printf("[vpn] backend %d (tunnel %d) disabled by health probing; no healthy alternative, deferring its established sessions to the retry worker", live.ServerID, live.ID)
+		s.recordHealthFailoverDebt(live)
 		return nil
 	}
 	sessions, err := s.healthDisableSessions(opCtx, live.ID)
 	if err != nil {
+		// Could not enumerate: the debt must survive so a later sweep retries.
+		s.recordHealthFailoverDebt(live)
 		return fmt.Errorf("list established sessions on health-disabled backend %d: %w", live.ID, err)
 	}
 	if len(sessions) == 0 {
+		// Nothing is pinned any more: the obligation is genuinely complete.
+		s.clearHealthFailoverDebt(live.ID)
 		return nil
 	}
 	log.Printf("[vpn] backend %d (tunnel %d) disabled by health probing; migrating %d established session(s)",
 		live.ServerID, live.ID, len(sessions))
 	s.migrateSessionsToHealthy(opCtx, live, sessions, targets)
+	s.settleHealthFailoverDebtAfterMigration(opCtx, live)
 	return nil
+}
+
+// settleHealthFailoverDebtAfterMigration records or clears the unfinished-
+// failover debt according to whether every pinned session actually moved. A
+// partial or total migration failure keeps the debt outstanding for the retry
+// worker, so a later alternative is never silently ignored.
+func (s *Service) settleHealthFailoverDebtAfterMigration(ctx context.Context, live *models.BackendTunnel) {
+	if s.healthFailoverSettled(ctx, live) {
+		s.clearHealthFailoverDebt(live.ID)
+		return
+	}
+	s.recordHealthFailoverDebt(live)
 }
 
 // healthDisableEligible reports whether a committed health disable is still the

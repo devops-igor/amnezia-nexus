@@ -116,6 +116,10 @@ func (hp *HealthProber) SelfHealSweep(ctx context.Context) int {
 
 	targets := hp.collectSelfHealTargets()
 	if len(targets) == 0 {
+		// Even with nothing to recover, an automatic failover that previously
+		// found no target may now be completable (F16), so still let the data
+		// plane owner settle its outstanding debt.
+		hp.retryPendingFailovers(ctx)
 		return 0
 	}
 
@@ -134,7 +138,23 @@ func (hp *HealthProber) SelfHealSweep(ctx context.Context) int {
 	}
 
 	wg.Wait()
+	// A backend that just recovered may be exactly the alternative an earlier
+	// health failover was waiting for, so settle that debt in the same sweep.
+	hp.retryPendingFailovers(ctx)
 	return int(reconnectedCount.Load())
+}
+
+// retryPendingFailovers invokes the data plane owner's unfinished-failover
+// settlement, if one was registered. It runs outside hp.mu/pool.mu and never
+// panics the sweep because of a nil/absent owner.
+func (hp *HealthProber) retryPendingFailovers(ctx context.Context) {
+	hp.mu.RLock()
+	retry := hp.selfHealFailoverRetrier
+	hp.mu.RUnlock()
+	if retry == nil {
+		return
+	}
+	retry(ctx)
 }
 
 func (hp *HealthProber) collectSelfHealTargets() []*models.BackendTunnel {
