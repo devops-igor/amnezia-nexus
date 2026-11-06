@@ -424,7 +424,7 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 		engineProfile string
 	}{
 		{name: "legacy_1_8_24", image: pinnedLegacyImage, engineProfile: "legacy"},
-		{name: "modern_26_10_29", image: pinnedModernImage, engineProfile: "modern_pq"},
+		{name: "modern_26_10_31", image: pinnedModernImage, engineProfile: "modern_pq"},
 	}
 
 	for _, tc := range fixtures {
