@@ -24,9 +24,14 @@ const (
 	XrayLegacyDigest  = "sha256:6b3ef1780d4be55c1bc4848232a90272d31c28cc3d0de1f2a50a56f48993be9d"
 	XrayLegacyImage   = "ghcr.io/xtls/xray-core:1.8.24@sha256:6b3ef1780d4be55c1bc4848232a90272d31c28cc3d0de1f2a50a56f48993be9d"
 
-	XrayModernPQVersion = "26.10.29"
-	XrayModernPQDigest  = "sha256:c9443f3ee297f6481bc245269d61720c6f989195ee9b58fa90fdd99f03c21044"
-	XrayModernPQImage   = "ghcr.io/xtls/xray-core:26.10.29@sha256:c9443f3ee297f6481bc245269d61720c6f989195ee9b58fa90fdd99f03c21044"
+	// XrayModernPQ* pins the supported Post-Quantum engine release.
+	// v26.10.29 was retracted by upstream (GHCR manifest + GitHub release deleted after an
+	// IPv4 MPTCP local-privilege-escalation advisory); v26.10.31 supersedes it explicitly.
+	// Revalidate this digest against the registry before changing it: the tag alone is mutable
+	// and upstream deletes retracted versions together with their digests.
+	XrayModernPQVersion = "26.10.31"
+	XrayModernPQDigest  = "sha256:ceabeac03a89d991d2a247361825c1d1d2e9c91cd5dc010f298c7dc0c2f325c9"
+	XrayModernPQImage   = "ghcr.io/xtls/xray-core:26.10.31@sha256:ceabeac03a89d991d2a247361825c1d1d2e9c91cd5dc010f298c7dc0c2f325c9"
 
 	// DefaultEngineProfile is the Legacy Compatibility Baseline (default for broad third-party client compatibility).
 	DefaultEngineProfile = EngineProfileLegacy
@@ -66,16 +71,27 @@ var SupportedEngineProfiles = map[EngineProfile]EngineProfileInfo{
 		Version:     XrayModernPQVersion,
 		ImageDigest: XrayModernPQDigest,
 		Image:       XrayModernPQImage,
-		Description: "Modern PQ (v26.10.29) — Post-Quantum REALITY (X25519MLKEM768)",
+		Description: "Modern PQ (v26.10.31) — Post-Quantum REALITY (X25519MLKEM768)",
 	},
 }
 
 // ResolveEngineProfile normalizes user input into a known EngineProfileInfo.
+//
+// It maps a *requested* profile to the currently pinned engine, so it never reports what is
+// deployed — installed/running versions are read from server metadata instead.
+//
+// "26.10.29" remains an accepted alias for the modern_pq profile on purpose: operator-saved
+// configuration and server metadata may carry that string, and resolveInstallProfileParam feeds
+// it back here on every reinstall/AddClient. The version is withdrawn upstream, so the alias is
+// compatibility for the *selector* only — it resolves to the current pinned release
+// (XrayModernPQVersion), i.e. selecting it deploys the supported image rather than a withdrawn
+// one. It is not a claim that an already-deployed 26.10.29 was upgraded.
 func ResolveEngineProfile(profileName string) (EngineProfileInfo, error) {
 	norm := strings.ToLower(strings.TrimSpace(profileName))
 	switch {
 	case norm == "" || norm == "legacy" || norm == "legacy_baseline" || norm == "legacy compatibility baseline" || norm == "baseline" || norm == "1.8.24" || norm == "v1.8.24":
 		return SupportedEngineProfiles[EngineProfileLegacy], nil
+	// The 26.10.* prefixes cover both the current pin and the retracted 26.10.29 alias.
 	case norm == "modern_pq" || norm == "modern" || norm == "pq" || norm == "26.10.29" || norm == "v26.10.29" || norm == "modern pq" || norm == "post_quantum" || norm == "post-quantum" || strings.HasPrefix(norm, "26.10.") || strings.HasPrefix(norm, "v26.10."):
 		return SupportedEngineProfiles[EngineProfileModernPQ], nil
 	default:

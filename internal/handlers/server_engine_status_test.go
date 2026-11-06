@@ -42,8 +42,8 @@ func newMockUpstreamEngineServer(t *testing.T) *httptest.Server {
 			})
 		case strings.Contains(r.URL.Path, "Xray-core"):
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"tag_name":     "v26.10.29",
-				"html_url":     "https://github.com/XTLS/Xray-core/releases/tag/v26.10.29",
+				"tag_name":     "v26.10.31",
+				"html_url":     "https://github.com/XTLS/Xray-core/releases/tag/v26.10.31",
 				"published_at": time.Now().Format(time.RFC3339),
 			})
 		default:
@@ -331,10 +331,10 @@ func TestServerEngineStatus_XrayProfileAwareness(t *testing.T) {
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.Contains(r.URL.Path, "Xray-core") {
-			// Upstream is at modern CalVer 26.10.29
+			// Upstream is at the current modern CalVer release
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"tag_name": "v26.10.29",
-				"html_url": "https://github.com/XTLS/Xray-core/releases/tag/v26.10.29",
+				"tag_name": "v26.10.31",
+				"html_url": "https://github.com/XTLS/Xray-core/releases/tag/v26.10.31",
 			})
 			return
 		}
@@ -350,7 +350,7 @@ func TestServerEngineStatus_XrayProfileAwareness(t *testing.T) {
 
 	ctx := context.Background()
 
-	// 1. Legacy Profile: installed 1.8.24 with upstream 26.10.29
+	// 1. Legacy Profile: installed 1.8.24 with upstream 26.10.31
 	// Should be: UpstreamNewer = true, UpgradeCompatible = false, UpdateAvailable = false
 	t.Run("legacy profile incompatibility protection", func(t *testing.T) {
 		legacyServer := &models.Server{
@@ -381,7 +381,7 @@ func TestServerEngineStatus_XrayProfileAwareness(t *testing.T) {
 		}
 
 		if !vStatus.UpstreamNewer {
-			t.Errorf("expected UpstreamNewer = true for legacy 1.8.24 vs 26.10.29")
+			t.Errorf("expected UpstreamNewer = true for legacy 1.8.24 vs 26.10.31")
 		}
 		if vStatus.UpgradeCompatible {
 			t.Errorf("expected UpgradeCompatible = false for legacy profile crossing into modern 26.x")
@@ -394,7 +394,7 @@ func TestServerEngineStatus_XrayProfileAwareness(t *testing.T) {
 		}
 	})
 
-	// 2. Modern PQ Profile: installed 26.10.28 with upstream 26.10.29
+	// 2. Modern PQ Profile: installed 26.10.28 with upstream 26.10.31
 	// Should be: UpstreamNewer = true, UpgradeCompatible = true, UpdateAvailable = true
 	t.Run("modern_pq profile safe update", func(t *testing.T) {
 		modernServer := &models.Server{
@@ -425,7 +425,7 @@ func TestServerEngineStatus_XrayProfileAwareness(t *testing.T) {
 		}
 
 		if !vStatus.UpstreamNewer {
-			t.Errorf("expected UpstreamNewer = true for 26.10.28 vs 26.10.29")
+			t.Errorf("expected UpstreamNewer = true for 26.10.28 vs 26.10.31")
 		}
 		if !vStatus.UpgradeCompatible {
 			t.Errorf("expected UpgradeCompatible = true for modern_pq profile on 26.x")
@@ -438,7 +438,7 @@ func TestServerEngineStatus_XrayProfileAwareness(t *testing.T) {
 		}
 	})
 
-	// 3. Modern PQ Profile: installed 26.10.29 (already latest)
+	// 3. Modern PQ Profile: installed 26.10.31 (already latest, the current pin)
 	// Should be: UpstreamNewer = false, UpgradeCompatible = true, UpdateAvailable = false
 	t.Run("modern_pq profile up to date", func(t *testing.T) {
 		upToDateServer := &models.Server{
@@ -448,7 +448,7 @@ func TestServerEngineStatus_XrayProfileAwareness(t *testing.T) {
 				models.ProtocolVLESS: map[string]any{
 					"installed":      true,
 					"engine_profile": "modern_pq",
-					"engine_version": "26.10.29",
+					"engine_version": "26.10.31",
 				},
 			},
 		}
@@ -469,7 +469,7 @@ func TestServerEngineStatus_XrayProfileAwareness(t *testing.T) {
 		}
 
 		if vStatus.UpstreamNewer {
-			t.Errorf("expected UpstreamNewer = false when installed is 26.10.29")
+			t.Errorf("expected UpstreamNewer = false when installed is 26.10.31")
 		}
 		if vStatus.UpdateAvailable {
 			t.Errorf("expected UpdateAvailable = false when already up to date")
