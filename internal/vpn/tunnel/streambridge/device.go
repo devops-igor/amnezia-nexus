@@ -233,6 +233,17 @@ func (d *Device) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// StreamDialer returns the outbound stream dialer this bridge splices flows onto.
+// It exists so a caller that owns the device (the backend data plane and its
+// health consumer) can perform a protocol-appropriate application exchange
+// through the same egress path without opening a second reader on the device.
+func (d *Device) StreamDialer() StreamDialer {
+	if d == nil {
+		return nil
+	}
+	return d.dialer
+}
+
 // RegisterCanaryResponseHook registers a callback to demultiplex in-tunnel canary responses
 // during single-reader return pumping. The returned function unregisters the hook cleanly.
 func (d *Device) RegisterCanaryResponseHook(hook func([]byte) bool) func() {

@@ -298,6 +298,14 @@ func (hp *HealthProber) defaultCanaryProbe(ctx context.Context, tunnel *models.B
 		timeout = 3 * time.Second
 	}
 
+	// Finding F11: a proxy transport cannot satisfy a packet canary at all, so it
+	// is health-checked with a protocol-appropriate authenticated application
+	// exchange over its own egress. AWG keeps the unchanged in-tunnel packet
+	// canary below (ICMP/DNS, dual-tier and quarantine semantics included).
+	if _, isProxy := newProxyPayloadCanary(tunnel, hp.proxyCanaryDestination); isProxy {
+		return probeProxyDeviceCanary(ctx, dev, tunnel, timeout, hp.proxyCanaryDestination)
+	}
+
 	return ProbePacketDevice(ctx, dev, timeout, hp.GetSubnetCIDR())
 }
 

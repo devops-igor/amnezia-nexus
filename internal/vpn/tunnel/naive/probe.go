@@ -198,10 +198,7 @@ func (d *Dialer) probeViaDaemon(ctx context.Context, camTarget string, p models.
 	start := time.Now()
 	conn, err := sd.DialContext(ctx, "tcp", camTarget)
 	if err != nil {
-		if ctx.Err() != nil {
-			return 0, ctx.Err()
-		}
-		return 0, fmt.Errorf("naive: probe failed via daemon: %w", err)
+		return 0, naiveStepErr(ctx, "probe failed via daemon", err)
 	}
 	defer conn.Close()
 
@@ -219,30 +216,95 @@ func (d *Dialer) probeViaDaemon(ctx context.Context, camTarget string, p models.
 			RootCAs:    testRootCAs,
 		}
 	}
+	return probeNaiveExchange(ctx, conn, tlsCfg, p.Domain, start)
+}
+
+// ProbeNaiveTrafficViaDialer performs the authenticated Naive application
+// exchange — authenticated TLS stream through the proxy, real HTTP request,
+// verified application reply — over an existing stream egress.
+//
+// The destination is the endpoint's own Domain:port (the proxy's camouflage
+// listener), exactly as the F10 qualification exchange addresses it, so the
+// backend's existing allowed destination is reused rather than widened.
+func ProbeNaiveTrafficViaDialer(ctx context.Context, egress StreamDialer, p models.NaiveProxyParams, timeout time.Duration) (int64, error) {
+	domain := strings.TrimSpace(p.Domain)
+	if domain == "" {
+		return 0, errors.New("naive: domain cannot be empty")
+	}
+	return ProbeNaiveTrafficViaDialerTo(ctx, egress, p, net.JoinHostPort(domain, strconv.Itoa(resolveProbePortForParams(p))), timeout)
+}
+
+// ProbeNaiveTrafficViaDialerTo is ProbeNaiveTrafficViaDialer with an explicit
+// destination host:port, mirroring the VLESS WithTarget/ViaDialerTo pair. It
+// exists for the same reason: a local fixture cannot serve the endpoint's real
+// Domain, and the exchange performed is identical.
+func ProbeNaiveTrafficViaDialerTo(ctx context.Context, egress StreamDialer, p models.NaiveProxyParams, destination string, timeout time.Duration) (int64, error) {
+	if egress == nil {
+		return 0, errors.New("naive: nil stream egress")
+	}
+	domain := strings.TrimSpace(p.Domain)
+	if domain == "" {
+		return 0, errors.New("naive: domain cannot be empty")
+	}
+	if destination == "" {
+		return 0, errors.New("naive: health destination cannot be empty")
+	}
+
+	timeoutCtx := ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		timeoutCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	start := time.Now()
+	conn, err := egress.DialContext(timeoutCtx, "tcp", destination)
+	if err != nil {
+		if timeoutCtx.Err() != nil {
+			return 0, timeoutCtx.Err()
+		}
+		return 0, fmt.Errorf("naive: health dial %s: %w", destination, err)
+	}
+	defer conn.Close()
+	if deadline, ok := timeoutCtx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: domain,
+		RootCAs:    testRootCAs,
+	}
+	return probeNaiveExchange(timeoutCtx, conn, tlsCfg, domain, start)
+}
+
+// resolveProbePortForParams selects the proxy port for a params-only exchange,
+// preferring the explicitly configured port and defaulting to 443.
+func resolveProbePortForParams(p models.NaiveProxyParams) int {
+	if p.Port > 0 && p.Port <= 65535 {
+		return p.Port
+	}
+	return 443
+}
+
+// probeNaiveExchange performs the authenticated TLS + HTTP request/reply over an
+// already-dialed stream and reports roundtrip latency on success.
+func probeNaiveExchange(ctx context.Context, conn net.Conn, tlsCfg *tls.Config, domain string, start time.Time) (int64, error) {
 	tlsConn := tls.Client(conn, tlsCfg)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		if ctx.Err() != nil {
-			return 0, ctx.Err()
-		}
-		return 0, fmt.Errorf("naive: remote probe tls handshake failed: %w", err)
+		return 0, naiveStepErr(ctx, "remote probe tls handshake", err)
 	}
 	defer tlsConn.Close()
 
 	// Send minimal HTTP request through the authenticated TLS stream
-	req := fmt.Sprintf("HEAD / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", p.Domain)
+	req := fmt.Sprintf("HEAD / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", domain)
 	if _, err := tlsConn.Write([]byte(req)); err != nil {
-		if ctx.Err() != nil {
-			return 0, ctx.Err()
-		}
-		return 0, fmt.Errorf("naive: remote probe write failed: %w", err)
+		return 0, naiveStepErr(ctx, "remote probe write", err)
 	}
 
 	buf := make([]byte, 16)
 	if _, err := io.ReadAtLeast(tlsConn, buf, 4); err != nil {
-		if ctx.Err() != nil {
-			return 0, ctx.Err()
-		}
-		return 0, fmt.Errorf("naive: remote probe read failed: %w", err)
+		return 0, naiveStepErr(ctx, "remote probe read", err)
 	}
 
 	if !strings.HasPrefix(string(buf), "HTTP/") {
@@ -254,6 +316,15 @@ func (d *Dialer) probeViaDaemon(ctx context.Context, camTarget string, p models.
 		elapsed = 1
 	}
 	return elapsed, nil
+}
+
+// naiveStepErr reports a failed exchange step, preferring the caller's context
+// error when the exchange was canceled or timed out.
+func naiveStepErr(ctx context.Context, step string, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return fmt.Errorf("naive: %s failed: %w", step, err)
 }
 
 func handleProbeStatus(status int, elapsed int64) (int64, error) {
