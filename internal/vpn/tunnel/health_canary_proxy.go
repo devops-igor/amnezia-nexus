@@ -60,6 +60,10 @@ func (hp *HealthProber) SetProxyCanaryDestinationForTest(destination string) {
 type proxyPayloadCanary struct {
 	proto string
 	raw   json.RawMessage
+	// endpoint is the tunnel's stored backend endpoint (host:port). It carries
+	// the installed port for records whose protocol params omit it, so the inner
+	// exchange resolves the same effective port qualification used.
+	endpoint string
 	// destination overrides the protocol-derived destination; empty in production.
 	destination string
 }
@@ -77,6 +81,7 @@ func newProxyPayloadCanary(tunnel *models.BackendTunnel, destination string) (pr
 		return proxyPayloadCanary{
 			proto:       proto,
 			raw:         tunnel.ProtocolParams,
+			endpoint:    tunnel.Endpoint,
 			destination: destination,
 		}, true
 	default:
@@ -110,7 +115,7 @@ func probeNaiveViaEgress(ctx context.Context, egress ProxyStreamDialer, canary p
 		_, err := naive.ProbeNaiveTrafficViaDialerTo(ctx, egress, params, canary.destination, timeout)
 		return err
 	}
-	_, err := naive.ProbeNaiveTrafficViaDialer(ctx, egress, params, timeout)
+	_, err := naive.ProbeNaiveTrafficViaDialer(ctx, egress, params, canary.endpoint, timeout)
 	return err
 }
 

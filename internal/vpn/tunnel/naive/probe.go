@@ -224,14 +224,17 @@ func (d *Dialer) probeViaDaemon(ctx context.Context, camTarget string, p models.
 // verified application reply — over an existing stream egress.
 //
 // The destination is the endpoint's own Domain:port (the proxy's camouflage
-// listener), exactly as the F10 qualification exchange addresses it, so the
-// backend's existing allowed destination is reused rather than widened.
-func ProbeNaiveTrafficViaDialer(ctx context.Context, egress StreamDialer, p models.NaiveProxyParams, timeout time.Duration) (int64, error) {
+// listener), resolved by the same rule ProbeNaiveProxy uses, so the inner
+// exchange addresses exactly the listener the backend was qualified on. The
+// endpoint carries the installed port when the ordinary producer omits
+// params.Port (existing Port 0 rows included), so the fallback must not be
+// re-derived here with a different default.
+func ProbeNaiveTrafficViaDialer(ctx context.Context, egress StreamDialer, p models.NaiveProxyParams, endpoint string, timeout time.Duration) (int64, error) {
 	domain := strings.TrimSpace(p.Domain)
 	if domain == "" {
 		return 0, errors.New("naive: domain cannot be empty")
 	}
-	return ProbeNaiveTrafficViaDialerTo(ctx, egress, p, net.JoinHostPort(domain, strconv.Itoa(resolveProbePortForParams(p))), timeout)
+	return ProbeNaiveTrafficViaDialerTo(ctx, egress, p, net.JoinHostPort(domain, strconv.Itoa(resolveProbePort(p, endpoint))), timeout)
 }
 
 // ProbeNaiveTrafficViaDialerTo is ProbeNaiveTrafficViaDialer with an explicit
@@ -276,15 +279,6 @@ func ProbeNaiveTrafficViaDialerTo(ctx context.Context, egress StreamDialer, p mo
 		RootCAs:    testRootCAs,
 	}
 	return probeNaiveExchange(timeoutCtx, conn, tlsCfg, domain, start)
-}
-
-// resolveProbePortForParams selects the proxy port for a params-only exchange,
-// preferring the explicitly configured port and defaulting to 443.
-func resolveProbePortForParams(p models.NaiveProxyParams) int {
-	if p.Port > 0 && p.Port <= 65535 {
-		return p.Port
-	}
-	return 443
 }
 
 // probeNaiveExchange performs the authenticated TLS + HTTP request/reply over an
