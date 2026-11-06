@@ -49,6 +49,15 @@ jobs:
         run: |
           python3 scripts/architecture_health.py --check --nonblocking
 
+      # Offline control for the #726 qualification preflight and collector. The shipped step
+      # bodies are extracted from .github/workflows/ci.yml and executed against a throwaway
+      # runner sandbox, so a regression in partial-initialization handling or in the
+      # invocation-local Git trust fails here instead of on the self-hosted runner. Needs only
+      # bash and git: no container, no runner state, no operator setup, and no dependency on a
+      # previous run's success.
+      - name: Verify CI qualification preflight controls
+        run: python3 scripts/check_ci_qualification_controls.py
+
       - name: Upload Architecture Health Report
         uses: actions/upload-artifact@v7
         if: always()

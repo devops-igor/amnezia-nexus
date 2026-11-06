@@ -113,9 +113,24 @@ jobs:
           qual_ident="run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}-job-${GITHUB_JOB}"
           qual_dir="$(mktemp -d "$RUNNER_TEMP/nexus-qual-host.XXXXXX")"
           qual_path_file="$RUNNER_TEMP/nexus-qual-path.${qual_ident}.txt"
-          printf '%s\n' "$qual_dir" > "$qual_path_file"
           mkdir "$qual_dir/host"
-          head_sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+          # This step runs in the runner's own context, not inside the action. actions/checkout
+          # records its safe.directory exception under a temporary HOME that is discarded when
+          # the action exits, so a workspace owned by another uid is "dubious" here and the first
+          # git call dies with exit 128. Acquire exactly that one repository for THIS invocation
+          # in a config file this step owns, pointed at by GIT_CONFIG_GLOBAL: exact path, no
+          # wildcard, no persistent user or system configuration, no ownership change, and
+          # nothing written outside qual_dir. The job container below already runs with the same
+          # ephemeral scope; this restores that parity on the host side.
+          gitcfg="$qual_dir/gitconfig"
+          {
+            printf '[safe]\n\tdirectory = %s\n' "$GITHUB_WORKSPACE"
+          } > "$gitcfg"
+          export GIT_CONFIG_GLOBAL="$gitcfg"
+          if ! head_sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null)"; then
+            echo "::error::cannot resolve the workspace revision with this invocation's own Git trust file; refusing to record a baseline that cannot be bound to a commit"
+            exit 1
+          fi
           {
             echo "state=started"
             echo "run_id=$GITHUB_RUN_ID"
@@ -127,6 +142,7 @@ jobs:
             echo "runner_uid=$(id -u) runner_gid=$(id -g) runner_user=$(id -un)"
             echo "workspace=$GITHUB_WORKSPACE"
             echo "workspace_owner_uid=$(stat -c '%u' "$GITHUB_WORKSPACE")"
+            echo "git_trust_scope=invocation_local exact_workspace=true"
             echo "runner_temp=$RUNNER_TEMP"
             echo "qual_dir=$qual_dir"
           } > "$qual_dir/host/identity.txt"
@@ -149,8 +165,28 @@ jobs:
           else
             echo "inherited_repo_task_area=absent" > "$qual_dir/host/tasks-pre-test.txt"
           fi
+          # Completeness marker, written only once every file the collector compares against
+          # exists. Its absence is how the collector distinguishes "initialization never
+          # finished" from "baseline ready": a run 42252613084-style death between directory
+          # creation and the last baseline file must read as NOT RUN, not as a broken collector.
+          baseline_files="identity.txt workspace-pre-test.ls workspace-pre-test.names unwritable-pre-test.txt tasks-pre-test.txt"
+          for f in $baseline_files; do
+            test -f "$qual_dir/host/$f" || {
+              echo "::error::baseline file $f was not recorded; not publishing this invocation's evidence pointer"
+              exit 1
+            }
+          done
+          printf 'baseline_files=%s\n' "$baseline_files" > "$qual_dir/host/baseline.state"
+          # Publish the pointer LAST, and publish only the mktemp basename: the collector
+          # re-roots it at its own $RUNNER_TEMP, so the uploaded artifact does not disclose a
+          # host filesystem layout. Until this file exists, nothing is claimed about this run.
+          printf '%s\n' "$(basename "$qual_dir")" > "$qual_path_file"
           {
-            cat "$qual_dir/host/identity.txt"
+            echo "state=baseline-complete"
+            echo "run_id=$GITHUB_RUN_ID run_attempt=$GITHUB_RUN_ATTEMPT job=$GITHUB_JOB"
+            echo "repository=$GITHUB_REPOSITORY head=$head_sha"
+            echo "runner_host=$(hostname) runner_uid=$(id -u)"
+            echo "git_trust_scope=invocation_local exact_workspace=true"
             echo "--- unwritable directories inherited before the tests ---"
             cat "$qual_dir/host/unwritable-pre-test.txt"
             echo "--- inherited repository task area ---"
@@ -332,18 +368,61 @@ jobs:
           note "run_id=$GITHUB_RUN_ID run_attempt=$GITHUB_RUN_ATTEMPT job=$GITHUB_JOB repository=$GITHUB_REPOSITORY"
           note "cleaner_uid=$(id -u) cleaner_user=$(id -un) tests_outcome=${TESTS_OUTCOME:-unknown}"
 
-          # The pre-test step's own directory, if it produced one. Its absence means the
-          # checkout/early steps never completed, so nothing here can be a verdict.
+          # Same invocation-local Git trust as the pre-test step. This step also runs in the
+          # runner's context, where the action's temporary-HOME safe.directory entry no longer
+          # applies; without this its own git calls fail on a foreign-owned workspace. Exact
+          # workspace path in a file this step owns, nothing persistent, no ownership change.
+          gitcfg="$RUNNER_TEMP/nexus-qual-gitconfig.${qual_ident}.txt"
+          {
+            printf '[safe]\n\tdirectory = %s\n' "$GITHUB_WORKSPACE"
+          } > "$gitcfg"
+          export GIT_CONFIG_GLOBAL="$gitcfg"
+
+          # Three distinct baseline states, never conflated:
+          #   absent pointer            -> initialization never happened
+          #   pointer but no marker     -> partial initialization (the step died mid-way)
+          #   marker + every file       -> baseline ready, comparisons are meaningful
+          # Both failure modes are NOT RUN and exit 0 here: the originating step failure is the
+          # real error and must not be masked by a second, misleading collector error.
           host_dir=""
-          if [ -s "$host_dir_file" ]; then
-            host_dir="$(cat "$host_dir_file")"
-          fi
-          if [ -z "$host_dir" ] || [ ! -d "$host_dir" ]; then
+          if [ ! -s "$host_dir_file" ]; then
             note "qualification=NOT_RUN reason=pre_test_step_did_not_complete"
             exit 0
           fi
+          # The pointer carries only the mktemp basename, so re-root it here rather than trusting
+          # an absolute host path from a file inside the uploaded artifact.
+          published="$(head -1 "$host_dir_file" | tr -d '\r')"
+          case "$published" in
+            nexus-qual-host.?*)
+              case "$published" in
+                */*|*..*) published="" ;;
+                *) host_dir="$RUNNER_TEMP/$published" ;;
+              esac ;;
+            *) published="" ;;
+          esac
+          if [ -z "$published" ] || [ ! -d "$host_dir" ]; then
+            note "qualification=NOT_RUN reason=pre_test_baseline_incomplete detail=pointer_not_usable"
+            exit 0
+          fi
+          # The step publishes its pointer only after writing this marker, so a pointer without a
+          # marker means a death between directory creation and baseline completion. That is the
+          # observed 42252613084 counterexample: report it as NOT RUN, do not compare against
+          # files that were never written.
+          baseline_files="identity.txt workspace-pre-test.ls workspace-pre-test.names unwritable-pre-test.txt tasks-pre-test.txt"
+          if [ ! -s "$host_dir/host/baseline.state" ]; then
+            note "qualification=NOT_RUN reason=pre_test_baseline_incomplete detail=no_completeness_marker"
+            exit 0
+          fi
+          missing=""
+          for f in $baseline_files; do
+            [ -f "$host_dir/host/$f" ] || missing="$missing $f"
+          done
+          if [ -n "$missing" ]; then
+            note "qualification=NOT_RUN reason=pre_test_baseline_incomplete missing:${missing}"
+            exit 0
+          fi
           head_sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null || echo unknown)"
-          note "host_qual_dir=$host_dir head=$head_sha"
+          note "host_qual_dir=${host_dir#"$RUNNER_TEMP"/} head=$head_sha baseline=complete"
 
           # ---- post-test workspace state -------------------------------------------------
           ls -lan "$GITHUB_WORKSPACE" > "$host_dir/host/workspace-post-test.ls"
@@ -407,7 +486,7 @@ jobs:
           if [ -n "$reason" ]; then
             note "qualification=$verdict reason=$reason"
           elif [ ! -s "$container_dir/identity.txt" ]; then
-            note "qualification=$verdict reason=container_identity_missing dir=$container_dir"
+            note "qualification=$verdict reason=container_identity_missing dir=$(basename "$container_dir")"
           else
             ident="$container_dir/identity.txt"
             field() { sed -n "s/^$1=//p" "$ident" | tail -1; }
@@ -420,7 +499,7 @@ jobs:
             [ "$(field repository)" = "$GITHUB_REPOSITORY" ] || mismatch="$mismatch repository"
             [ "$(field head)" = "$head_sha" ] || mismatch="$mismatch head"
             state="$(field state)"
-            note "container_qual_dir=$container_dir container_state=${state:-unknown}"
+            note "container_qual_dir=$(basename "$container_dir") container_state=${state:-unknown}"
             if [ -n "$mismatch" ]; then
               note "qualification=$verdict reason=foreign_evidence_binding_mismatch fields:$mismatch"
             elif [ "$state" != "complete" ]; then
@@ -442,7 +521,18 @@ jobs:
                 note "qualification=$verdict"
               fi
             fi
-            cp "$ident" "$RUNNER_TEMP/nexus-qual-container.${qual_ident}.txt"
+            # The uploaded copy keeps every field the verdict depends on — run/attempt/job/
+            # repository/head binding, terminal state and the four assertions — and drops the
+            # container's absolute filesystem paths, which are irrelevant to the verdict and
+            # must not be published as evidence.
+            r_ident="$RUNNER_TEMP/nexus-qual-container.${qual_ident}.txt"
+            : > "$r_ident"
+            while IFS= read -r line; do
+              case "$line" in
+                job_tmp=*|qual_dir=*|gocache=*|gomodcache=*|repo_root=*|workspace=*|runner_temp=*) continue ;;
+              esac
+              printf '%s\n' "$line" >> "$r_ident"
+            done < "$ident"
           fi
 
           # Only this invocation's own identity-derived directory is removed, and only when it
