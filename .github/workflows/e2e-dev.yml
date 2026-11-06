@@ -102,6 +102,7 @@ jobs:
           source ~/e2e-venv/bin/activate
           pip install --quiet -r tests/e2e/requirements.txt
           python -m pytest tests/test_vpn_diagnostics_oracle.py -p no:cacheprovider
+          python -m pytest tests/test_e2e_diagnostics_privacy.py -p no:cacheprovider
           playwright install --with-deps chromium
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
@@ -120,7 +121,18 @@ jobs:
           E2E_SERVER_SSH_KEY="${HOME}/.ssh/id_ed25519" \
           E2E_TESTING="true" \
           E2E_REQUIRE_DATAPLANE="true" \
+          E2E_TESTED_SOURCE_SHA="${{ github.sha }}" \
+          E2E_TESTED_IMAGE_LABEL="ghcr.io/devops-igor/amnezia-nexus:pr-${{ github.event.pull_request.number || 'manual' }}" \
           ./scripts/run_e2e_lifecycle.sh
+
+      - name: Upload Lifecycle Diagnostics
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: e2e-lifecycle-diagnostics-${{ github.run_id }}
+          path: test-artifacts/e2e-diagnostics/
+          retention-days: 14
+          if-no-files-found: warn
 
       - name: Clean Residual Containers Before Qualification
         if: ${{ steps.qual-mode.outputs.mode != 'standard' }}
