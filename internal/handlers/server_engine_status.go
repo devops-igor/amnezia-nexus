@@ -217,6 +217,8 @@ func isXrayProfileCompatible(profile, upstreamTag string) bool {
 	case norm == "legacy" || norm == "legacy_baseline" || norm == "legacy compatibility baseline" || norm == "baseline" || norm == "1.8.24" || norm == "v1.8.24":
 		return vLat.Major() < 20
 	case norm == "modern_pq" || norm == "modern" || norm == "pq" || norm == "26.10.29" || norm == "v26.10.29" || norm == "modern pq" || norm == "post_quantum" || norm == "post-quantum" || norm == "v26" || norm == "26" || strings.HasPrefix(norm, "26.10.") || strings.HasPrefix(norm, "v26.10."):
+		// The 26.10.* prefixes include the current pin (26.10.31) and the retracted 26.10.29
+		// alias still present in operator-saved metadata; both are the modern CalVer family.
 		return vLat.Major() >= 20
 	default:
 		return false
