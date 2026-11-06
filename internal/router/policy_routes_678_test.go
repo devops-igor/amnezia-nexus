@@ -6,13 +6,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
+	"github.com/devops-igor/amnezia-nexus/internal/handlers"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 )
 
 // These tests exercise the four #678 policy endpoints through the real router,
@@ -323,17 +326,124 @@ func TestPutPolicyEnableFailsClosedWithoutDataPlane(t *testing.T) {
 	}
 }
 
-// Sync must fail with a clear response when policy routing was never started
-// rather than silently reporting success.
+// Sync must report a clear, correct status for each documented state rather than
+// silently reporting success.
 func TestSyncPolicyWithoutStartReportsFailure(t *testing.T) {
 	db, cfg := setupTestRouterDB(t)
 	seedPolicySessions(t, db)
-	r := NewRouter(cfg, db, nil)
+
+	// 1. No VPN service at all (management-only deployment): 503.
+	rNoSvc := NewRouter(cfg, db, nil)
+	wNoSvc := httptest.NewRecorder()
+	rNoSvc.ServeHTTP(wNoSvc, adminRequest(t, http.MethodPost, "/api/vpn/policy/sync", nil))
+	if wNoSvc.Code != http.StatusServiceUnavailable {
+		t.Fatalf("sync without a VPN service = %d, want 503; body=%s", wNoSvc.Code, wNoSvc.Body.String())
+	}
+
+	// 2. VPN service present but policy routing never started: 422 with a reason.
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	rWithSvc := NewRouterWithDeps(handlers.Dependencies{Config: cfg, DB: db, VPNService: vpnSvc})
+	w := httptest.NewRecorder()
+	rWithSvc.ServeHTTP(w, adminRequest(t, http.MethodPost, "/api/vpn/policy/sync", nil))
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("sync with policy not started = %d, want 422; body=%s", w.Code, w.Body.String())
+	}
+	out := decodeJSON(t, w)
+	if detail, _ := out["detail"].(string); detail == "" {
+		t.Errorf("sync failure response carries no operator-facing detail: %v", out)
+	}
+}
+
+// A 409 must be returned when a sync is already running, so an operator does not
+// queue duplicate downloads. The syncer is put into its in-progress state through
+// the real single-flight guard, not by stubbing the handler.
+func TestSyncPolicyRespondsConflictWhenAlreadyRunning(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	seedPolicySessions(t, db)
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+
+	settings := policy.DefaultSettings()
+	settings.Preset = policy.PresetAntifilterDomains
+	syncCfg, err := settings.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	syncer, err := policy.NewSyncer(policy.NewMatcher(), nil, policy.NewFileStore(t.TempDir()), syncCfg)
+	if err != nil {
+		t.Fatalf("NewSyncer: %v", err)
+	}
+	syncer.SetActiveForTest(true)
+	t.Cleanup(func() { syncer.SetActiveForTest(false) })
+	vpnSvc.SetPolicySyncerForTest(syncer, string(settings.Preset))
+
+	r := NewRouterWithDeps(handlers.Dependencies{Config: cfg, DB: db, VPNService: vpnSvc})
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, adminRequest(t, http.MethodPost, "/api/vpn/policy/sync", nil))
-	if w.Code == http.StatusOK {
-		t.Fatalf("POST /api/vpn/policy/sync with no active policy = 200, want an error status; body=%s", w.Body.String())
+	if w.Code != http.StatusConflict {
+		t.Fatalf("sync while running = %d, want 409; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// Stats must stay well-formed with a real VPN service whose policy routing was
+// never started, reporting the documented zero baseline.
+func TestPolicyStatsBaselineWithoutPBRActive(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	seedPolicySessions(t, db)
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	r := NewRouterWithDeps(handlers.Dependencies{Config: cfg, DB: db, VPNService: vpnSvc})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, adminRequest(t, http.MethodGet, "/api/vpn/policy/stats", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET stats = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	out := decodeJSON(t, w)
+	for _, key := range []string{"proxy_bytes", "direct_bytes", "proxy_drops", "direct_drops", "route_cache", "route_sessions", "active_rules"} {
+		v, ok := out[key]
+		if !ok {
+			t.Fatalf("stats missing %q", key)
+		}
+		if n, isNum := v.(float64); isNum && n != 0 {
+			t.Errorf("stats[%q] = %v, want 0 with PBR never started", key, v)
+		}
+	}
+	if enabled, _ := out["enabled"].(bool); enabled {
+		t.Error("stats reports enabled=true with PBR never started")
+	}
+}
+
+// policyStoreDir must resolve under the panel data directory so the durable
+// last-known-good snapshot survives a restart.
+func TestPolicyStoreDirResolvesUnderDataDir(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+
+	// 1. Configured DataDir: the store lives in <DataDir>/policy.
+	dataDir := t.TempDir()
+	cfg.DataDir = dataDir
+	h := handlers.NewHandlers(handlers.Dependencies{Config: cfg, DB: db})
+	want := filepath.Join(dataDir, "policy")
+	if got := h.PolicyStoreDirForTest(); got != want {
+		t.Fatalf("policy store dir = %q, want %q", got, want)
+	}
+
+	// 2. No DataDir configured: a non-empty relative fallback, never an empty path
+	// (an empty path would resolve to the process cwd's parent, which is wrong).
+	cfg.DataDir = ""
+	h2 := handlers.NewHandlers(handlers.Dependencies{Config: cfg, DB: db})
+	if got := h2.PolicyStoreDirForTest(); got == "" {
+		t.Fatal("policy store dir resolved to an empty path without DataDir")
 	}
 }
 

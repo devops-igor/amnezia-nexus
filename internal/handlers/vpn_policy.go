@@ -105,29 +105,8 @@ func customURLsOrEmpty(urls []string) []string {
 
 // PutPolicyHandler serves PUT /api/vpn/policy.
 func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Body == nil {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Request body is empty")
-		return
-	}
-	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil || len(bodyBytes) == 0 {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
-		return
-	}
-	defer func() { _ = r.Body.Close() }()
-
-	var incoming policy.Settings
-	if err := json.Unmarshal(bodyBytes, &incoming); err != nil {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
-		return
-	}
-	incoming = incoming.Normalize()
-
-	// Reject invalid settings before any persistence or activation, so a bad
-	// request cannot destroy a working configuration.
-	if err := incoming.Validate(); err != nil {
-		h.audit(r, "policy.settings_save", map[string]any{"result": "rejected", "reason": err.Error()})
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
+	incoming, ok := h.decodePolicyPut(w, r)
+	if !ok {
 		return
 	}
 
@@ -161,18 +140,53 @@ func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		"result": "ok", "enabled": incoming.Enabled, "preset": string(incoming.Preset),
 		"custom_url_count": len(incoming.CustomURLs), "sync_interval_seconds": incoming.SyncInterval,
 	})
+	h.JSON(w, http.StatusOK, h.policyPutResponse(incoming))
+}
 
+// decodePolicyPut reads and validates the request body. It writes the error
+// response itself and reports whether the caller may proceed. Validation happens
+// here, before any persistence, so a bad request cannot destroy a working
+// configuration.
+func (h *Handlers) decodePolicyPut(w http.ResponseWriter, r *http.Request) (policy.Settings, bool) {
+	var incoming policy.Settings
+	if r.Body == nil {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Request body is empty")
+		return incoming, false
+	}
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil || len(bodyBytes) == 0 {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
+		return incoming, false
+	}
+	defer func() { _ = r.Body.Close() }()
+
+	if err := json.Unmarshal(bodyBytes, &incoming); err != nil {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
+		return incoming, false
+	}
+	incoming = incoming.Normalize()
+
+	if err := incoming.Validate(); err != nil {
+		h.audit(r, "policy.settings_save", map[string]any{"result": "rejected", "reason": err.Error()})
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
+		return incoming, false
+	}
+	return incoming, true
+}
+
+// policyPutResponse renders the saved record plus live status.
+func (h *Handlers) policyPutResponse(saved policy.Settings) map[string]any {
 	response := map[string]any{
 		"status":                "ok",
-		"enabled":               incoming.Enabled,
-		"preset":                string(incoming.Preset),
-		"custom_urls":           customURLsOrEmpty(incoming.CustomURLs),
-		"sync_interval_seconds": incoming.SyncInterval,
+		"enabled":               saved.Enabled,
+		"preset":                string(saved.Preset),
+		"custom_urls":           customURLsOrEmpty(saved.CustomURLs),
+		"sync_interval_seconds": saved.SyncInterval,
 	}
 	if h.vpnSvc != nil {
 		response["policy_status"] = h.vpnSvc.PolicyStatusSnapshot()
 	}
-	h.JSON(w, http.StatusOK, response)
+	return response
 }
 
 // applyPolicySettings reconciles the runtime with the saved record: it either
@@ -287,3 +301,10 @@ func (h *Handlers) GetPolicyStatsHandler(w http.ResponseWriter, r *http.Request)
 // Compile-time assertion that the status type stays JSON-serializable through the
 // API surface above.
 var _ = vpn.PolicyStatus{}
+
+// PolicyStoreDirForTest exposes the durable policy store directory so a test can
+// assert it resolves under the panel data directory. Test-only seam: the value is
+// a path, not mutable state.
+func (h *Handlers) PolicyStoreDirForTest() string {
+	return h.policyStoreDir()
+}

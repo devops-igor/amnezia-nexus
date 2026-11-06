@@ -3,7 +3,9 @@ package vpn
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
@@ -128,6 +130,10 @@ func TestStartPolicyRoutingFailsClosedWhenEgressUnavailable(t *testing.T) {
 	if _, syncErr := svc.SyncPolicyNow(context.Background()); syncErr == nil {
 		t.Fatal("refused activation left a sync runtime registered")
 	}
+	// Nor may it leave a half-registered PBR configuration behind.
+	if cfg := svc.getPBRConfig(); cfg != nil {
+		t.Fatalf("refused activation left PBR config registered: %+v", cfg)
+	}
 }
 
 // Invalid settings must be rejected before any network work or runtime change.
@@ -230,6 +236,133 @@ func TestLoadLastKnownGoodRejectsUnusableStores(t *testing.T) {
 	}
 }
 
+// The status view must be covered for both the syncer-backed and matcher-only
+// paths, since the API returns it on every GET and after every PUT/sync.
+func TestPolicyStatusSnapshotReportsSyncerAndMatcherState(t *testing.T) {
+	svc := serviceForActivation(t)
+
+	// 1. Matcher-only path: a published snapshot with no syncer status.
+	matcher := policy.NewMatcher()
+	gen := &policy.Generation{
+		SchemaVersion: policy.SchemaVersion,
+		GenerationID:  "gen-status-1",
+		Version:       3,
+		Domains:       map[string]uint8{"example.com": 2},
+		CIDRs:         []string{"198.51.100.0/24"},
+	}
+	if err := loadLastKnownGood(context.Background(), &memoryStore{committed: gen}, matcher); err != nil {
+		t.Fatalf("seed matcher: %v", err)
+	}
+	policyRuntimeMu.Lock()
+	policyRuntimes[svc] = &policyRuntime{matcher: matcher, presetID: "geoblock"}
+	policyRuntimeMu.Unlock()
+	t.Cleanup(func() {
+		policyRuntimeMu.Lock()
+		delete(policyRuntimes, svc)
+		policyRuntimeMu.Unlock()
+	})
+
+	got := svc.PolicyStatusSnapshot()
+	if !got.Ready {
+		t.Error("matcher-only status Ready = false, want true")
+	}
+	if got.GenerationID != "gen-status-1" {
+		t.Errorf("GenerationID = %q, want %q", got.GenerationID, "gen-status-1")
+	}
+	if got.Version != 3 {
+		t.Errorf("Version = %d, want 3", got.Version)
+	}
+	if got.DomainCount != 1 {
+		t.Errorf("DomainCount = %d, want 1", got.DomainCount)
+	}
+	if got.CIDRCount != 1 {
+		t.Errorf("CIDRCount = %d, want 1", got.CIDRCount)
+	}
+	if got.SyncState != "synced" {
+		t.Errorf("SyncState = %q, want %q", got.SyncState, "synced")
+	}
+
+	// 2. Syncer-backed path with a recorded failure.
+	store := &memoryStore{}
+	failingSettings := policy.DefaultSettings()
+	failingSettings.Preset = policy.PresetCustom
+	failingSettings.CustomURLs = []string{"https://unreachable.example.invalid/x.lst"}
+	cfg, err := failingSettings.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	syncer, err := policy.NewSyncer(policy.NewMatcher(), nil, store, cfg)
+	if err != nil {
+		t.Fatalf("NewSyncer: %v", err)
+	}
+	// Force a recorded failure without network: an empty source list is rejected by
+	// the constructor, so drive a failure through SyncOnce on an unroutable host.
+	syncCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	_, _ = syncer.SyncOnce(syncCtx)
+	cancel()
+
+	policyRuntimeMu.Lock()
+	policyRuntimes[svc] = &policyRuntime{
+		syncer:   syncer,
+		matcher:  matcher,
+		presetID: "custom",
+	}
+	policyRuntimeMu.Unlock()
+
+	got2 := svc.PolicyStatusSnapshot()
+	if got2.Preset != "custom" {
+		t.Errorf("Preset = %q, want %q", got2.Preset, "custom")
+	}
+	if got2.SyncState != "error" {
+		t.Errorf("SyncState after a failed sync = %q, want %q", got2.SyncState, "error")
+	}
+	if got2.LastError == "" {
+		t.Error("LastError not exposed after a failed sync")
+	}
+}
+
+// applyMatcherStatus must be a no-op for a nil matcher or an unpublished one, so
+// the status cannot claim readiness without a snapshot.
+func TestApplyMatcherStatusNoOpWithoutSnapshot(t *testing.T) {
+	status := PolicyStatus{SyncState: "disabled"}
+	applyMatcherStatus(&status, nil)
+	if status.Ready {
+		t.Error("nil matcher produced Ready=true")
+	}
+	applyMatcherStatus(&status, policy.NewMatcher())
+	if status.Ready {
+		t.Error("unpublished matcher produced Ready=true")
+	}
+	if status.SyncState != "disabled" {
+		t.Errorf("SyncState = %q, want unchanged %q", status.SyncState, "disabled")
+	}
+}
+
+// StopPolicyRouting must cancel a registered runtime and clear it, so a later
+// disable cannot leave a fetcher scheduling against a torn-down data path.
+func TestStopPolicyRoutingCancelsRegisteredRuntime(t *testing.T) {
+	svc := serviceForActivation(t)
+
+	cancelled := make(chan struct{})
+	policyRuntimeMu.Lock()
+	policyRuntimes[svc] = &policyRuntime{
+		matcher: policy.NewMatcher(),
+		cancel:  func() { close(cancelled) },
+	}
+	policyRuntimeMu.Unlock()
+
+	svc.StopPolicyRouting()
+
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("StopPolicyRouting did not cancel the registered runtime")
+	}
+	if svc.policyRuntime() != nil {
+		t.Fatal("StopPolicyRouting left the runtime registered")
+	}
+}
+
 // StopPolicyRouting must be safe on a service that never started policy routing.
 func TestStopPolicyRoutingIsIdempotentWhenNotStarted(t *testing.T) {
 	svc := serviceForActivation(t)
@@ -316,5 +449,181 @@ func TestPolicyActivationErrorIsDescriptive(t *testing.T) {
 	err := ErrPolicyActivationNoRules
 	if err == nil || len(err.Error()) < 20 {
 		t.Fatalf("activation error %v is not descriptive enough for an operator", err)
+	}
+}
+
+// nonMemoryRouteCache satisfies forwarder.RouteCache but is not the in-memory
+// implementation, so PolicyRouteCacheSize must reject it.
+type nonMemoryRouteCache struct{}
+
+func (nonMemoryRouteCache) Lookup(string, netip.Addr) policy.Decision { return policy.Unknown }
+
+// PolicyRouteCacheSize must report the real route-cache size once PBR is
+// configured, since the stats endpoint publishes it. Each type-assertion branch is
+// asserted so a regression to a silent zero is caught.
+func TestPolicyRouteCacheSizeReportsConfiguredCache(t *testing.T) {
+	svc := serviceForActivation(t)
+
+	// 1. Runtime present but no PBR config: (0, 0), not a panic.
+	policyRuntimeMu.Lock()
+	policyRuntimes[svc] = &policyRuntime{matcher: policy.NewMatcher()}
+	policyRuntimeMu.Unlock()
+	t.Cleanup(func() {
+		policyRuntimeMu.Lock()
+		delete(policyRuntimes, svc)
+		policyRuntimeMu.Unlock()
+	})
+	if entries, sessions := svc.PolicyRouteCacheSize(); entries != 0 || sessions != 0 {
+		t.Fatalf("without PBR config = (%d, %d), want (0, 0)", entries, sessions)
+	}
+
+	// 2. A PBR config whose route cache is not a MemoryRouteCache: (0, 0).
+	svc.SetPBRConfig(PBRConfig{Enabled: true, RouteCache: nonMemoryRouteCache{}})
+	if entries, sessions := svc.PolicyRouteCacheSize(); entries != 0 || sessions != 0 {
+		t.Fatalf("with foreign route cache = (%d, %d), want (0, 0)", entries, sessions)
+	}
+
+	// 3. A real MemoryRouteCache with one observed entry: (1, 1).
+	mem := NewMemoryRouteCache()
+	sc, err := mem.Open(policy.Scope{SessionID: "s1", OwnershipEpoch: 1})
+	if err != nil {
+		t.Fatalf("open session cache: %v", err)
+	}
+	gen := "gen-size-1"
+	mem.SetPolicyGeneration(gen)
+	now := time.Now()
+	if err := sc.Observe(gen, []policy.Observation{
+		{IP: netip.MustParseAddr("93.184.216.34"), Decision: policy.Direct, ExpiresAt: now.Add(time.Hour)},
+	}, now); err != nil {
+		t.Fatalf("observe: %v", err)
+	}
+
+	svc.SetPBRConfig(PBRConfig{Enabled: true, RouteCache: mem})
+	entries, sessions := svc.PolicyRouteCacheSize()
+	if entries != 1 || sessions != 1 {
+		t.Fatalf("configured cache = (%d, %d), want (1, 1)", entries, sessions)
+	}
+}
+
+// ensureInitialSnapshot must accept a matcher that already holds rules, and must
+// refuse one that holds nothing, so activation cannot proceed on an empty policy.
+func TestEnsureInitialSnapshotRequiresRules(t *testing.T) {
+	// A syncer that cannot publish (unroutable source) plus a store holding a
+	// usable generation: the last-known-good fallback must supply the rules.
+	usable := policy.NewMatcher()
+	gen := &policy.Generation{
+		SchemaVersion: policy.SchemaVersion,
+		GenerationID:  "gen-ensure-1",
+		Version:       1,
+		Domains:       map[string]uint8{"example.com": 2},
+	}
+	if err := loadLastKnownGood(context.Background(), &memoryStore{committed: gen}, usable); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	settings := policy.DefaultSettings()
+	settings.Preset = policy.PresetCustom
+	settings.CustomURLs = []string{"https://unreachable.example.invalid/x.lst"}
+	cfg, err := settings.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	syncer, err := policy.NewSyncer(usable, nil, &memoryStore{committed: gen}, cfg)
+	if err != nil {
+		t.Fatalf("NewSyncer: %v", err)
+	}
+
+	// The sync fails, but the seeded matcher already holds rules, so this must pass
+	// through the last-known-good branch.
+	if err := ensureInitialSnapshot(context.Background(), syncer, &memoryStore{committed: gen}, usable); err != nil {
+		t.Fatalf("ensureInitialSnapshot rejected a matcher holding rules: %v", err)
+	}
+
+	// An empty matcher with no usable store must be refused.
+	empty := policy.NewMatcher()
+	emptySyncer, err := policy.NewSyncer(empty, nil, &memoryStore{loadErr: errors.New("no cache")}, cfg)
+	if err != nil {
+		t.Fatalf("NewSyncer: %v", err)
+	}
+	if err := ensureInitialSnapshot(context.Background(), emptySyncer, &memoryStore{loadErr: errors.New("no cache")}, empty); err == nil {
+		t.Fatal("ensureInitialSnapshot accepted an empty matcher with no usable store")
+	} else if !errors.Is(err, ErrPolicyActivationNoRules) {
+		t.Fatalf("expected ErrPolicyActivationNoRules, got: %v", err)
+	}
+}
+
+// StartPolicyRouting must reject a nil syncer-store and a nil service safely, and
+// must not leave a runtime when the policy source cannot be built.
+func TestStartPolicyRoutingRejectsNilReceiverAndStore(t *testing.T) {
+	settings := policy.DefaultSettings()
+	settings.Enabled = true
+	settings.Preset = policy.PresetGeoblock
+
+	var nilSvc *Service
+	if err := nilSvc.StartPolicyRouting(context.Background(), settings, &memoryStore{}, "geoblock"); err == nil {
+		t.Fatal("nil service accepted a policy activation")
+	}
+
+	// A store that fails on both paths must produce the documented refusal and must
+	// not register a runtime on a real service.
+	svc := serviceForActivation(t)
+	store := &memoryStore{loadErr: errors.New("no cache")}
+	if err := svc.StartPolicyRouting(context.Background(), settings, store, "geoblock"); err == nil {
+		t.Fatal("activation succeeded with an unusable store")
+	}
+	if svc.policyRuntime() != nil {
+		t.Fatal("failed activation registered a runtime")
+	}
+	if svc.getPBRConfig() != nil {
+		t.Fatal("failed activation left a PBR config registered")
+	}
+}
+
+// startPolicyLoop must register the runtime and start the scheduling loop, then
+// release both when the context is cancelled. This is the step that ties the
+// syncer's background refresh to the service lifetime.
+func TestStartPolicyLoopRegistersAndStops(t *testing.T) {
+	svc := serviceForActivation(t)
+
+	settings := policy.DefaultSettings()
+	settings.Preset = policy.PresetCustom
+	settings.CustomURLs = []string{"https://unreachable.example.invalid/x.lst"}
+	cfg, err := settings.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	store := &memoryStore{}
+	syncer, err := policy.NewSyncer(policy.NewMatcher(), nil, store, cfg)
+	if err != nil {
+		t.Fatalf("NewSyncer: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	svc.startPolicyLoop(ctx, syncer, policy.NewMatcher(), settings, "custom")
+	t.Cleanup(func() {
+		policyRuntimeMu.Lock()
+		delete(policyRuntimes, svc)
+		policyRuntimeMu.Unlock()
+	})
+
+	rt := svc.policyRuntime()
+	if rt == nil {
+		t.Fatal("startPolicyLoop did not register a runtime")
+	}
+	if rt.syncer != syncer {
+		t.Error("registered runtime does not reference the supplied syncer")
+	}
+	if rt.presetID != "custom" {
+		t.Errorf("registered presetID = %q, want %q", rt.presetID, "custom")
+	}
+	if rt.cancel == nil {
+		t.Fatal("registered runtime has no cancel function")
+	}
+
+	// Cancelling must stop the loop; the goroutine exits via ctx.Done.
+	cancel()
+	// StopPolicyRouting cancels again and tears down PBR, so it must be safe here.
+	svc.StopPolicyRouting()
+	if svc.policyRuntime() != nil {
+		t.Fatal("StopPolicyRouting left the runtime registered after startPolicyLoop")
 	}
 }

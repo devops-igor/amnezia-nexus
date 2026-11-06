@@ -28,3 +28,13 @@ func (s *Syncer) SyncOnce(ctx context.Context) (SyncResult, error) {
 	}
 	return s.executeUpdate(ctx)
 }
+
+// SetActiveForTest forces the single-flight guard into the given state. It exists
+// so a handler test can observe the already-running branch without starting a
+// second real download; production code has no reason to call it.
+func (s *Syncer) SetActiveForTest(active bool) {
+	if s == nil {
+		return
+	}
+	s.active.Store(active)
+}

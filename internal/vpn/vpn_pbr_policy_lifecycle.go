@@ -88,6 +88,9 @@ type policyRuntime struct {
 // operator's settings, so a failed activation cannot overwrite a previously
 // working configuration.
 func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settings, store policy.Store, presetID string) error {
+	if s == nil {
+		return errors.New("vpn: policy activation requires a service")
+	}
 	cfg, err := settings.SyncConfig()
 	if err != nil {
 		return fmt.Errorf("policy settings: %w", err)
@@ -102,30 +105,12 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 		return fmt.Errorf("policy syncer: %w", err)
 	}
 
-	// Bound the startup sync. A failure here is not fatal to the panel: PBR stays
-	// disabled and the operator sees the reason, which is the documented
-	// "missing initial rules prevents enablement with a useful error" behavior.
-	syncCtx, cancelSync := context.WithTimeout(ctx, policyActivationTimeout)
-	syncRes, syncErr := syncer.SyncOnce(syncCtx)
-	cancelSync()
-
-	switch {
-	case syncErr != nil:
-		// A durable last-known-good snapshot may still be loadable. Publishing it
-		// is the "preserve last-known-good policy on transient sync failure" half
-		// of the contract, so activation remains legal if it yields rules.
-		if loadErr := loadLastKnownGood(ctx, store, matcher); loadErr != nil {
-			return fmt.Errorf("%w: initial sync failed (%v) and no usable last-known-good policy was found: %w",
-				ErrPolicyActivationNoRules, syncErr, loadErr)
-		}
-		slog.Warn("Policy sync failed at startup; activated last-known-good policy instead", "err", syncErr)
-	case !syncRes.Published:
-		return fmt.Errorf("%w: sync did not publish a snapshot", ErrPolicyActivationNoRules)
-	}
-
-	snap := matcher.Current()
-	if snap == nil || (snap.DomainCount() == 0 && snap.CIDRCount() == 0) {
-		return ErrPolicyActivationNoRules
+	// Obtain a snapshot BEFORE the data path can accept traffic. A failure here is
+	// not fatal to the panel: PBR stays disabled and the operator sees the reason,
+	// which is the documented "missing initial rules prevents enablement with a
+	// useful error" behavior.
+	if err := ensureInitialSnapshot(ctx, syncer, store, matcher); err != nil {
+		return err
 	}
 
 	// Hand initPBR the compiled matcher so it installs exactly this snapshot
@@ -136,11 +121,21 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 	})
 
 	if err := s.initPBR(ctx); err != nil {
+		// Leave no half-registered PBR configuration behind: a refused activation
+		// must look exactly like "policy routing was never configured", so a later
+		// disable or status read cannot observe a phantom matcher.
+		s.clearPBRConfig()
 		return fmt.Errorf("activate policy routing: %w", err)
 	}
 
-	// Hand the syncer its scheduling loop only after activation succeeded, so a
-	// refused activation never leaves a background fetcher running.
+	s.startPolicyLoop(ctx, syncer, matcher, settings, presetID)
+	return nil
+}
+
+// startPolicyLoop registers the live runtime and hands the syncer its scheduling
+// loop. It runs only after activation succeeded, so a refused activation never
+// leaves a background fetcher running.
+func (s *Service) startPolicyLoop(ctx context.Context, syncer *policy.Syncer, matcher *policy.Matcher, settings policy.Settings, presetID string) {
 	runCtx, runCancel := context.WithCancel(ctx)
 	policyRuntimeMu.Lock()
 	policyRuntimes[s] = &policyRuntime{
@@ -157,7 +152,42 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 			slog.Warn("Policy syncer stopped", "err", runErr)
 		}
 	}()
+}
 
+// clearPBRConfig removes the registered PBR configuration for this service, so a
+// refused activation leaves no half-installed state behind.
+func (s *Service) clearPBRConfig() {
+	servicePBRConfigsMu.Lock()
+	delete(servicePBRConfigs, s)
+	servicePBRConfigsMu.Unlock()
+}
+
+// ensureInitialSnapshot guarantees the matcher holds a non-empty policy snapshot
+// before activation proceeds.
+//
+// One synchronous sync runs first. If it fails, the durable last-known-good
+// generation is published instead: that is the "preserve last-known-good policy on
+// transient sync failure" half of the contract. If neither yields rules, activation
+// is refused with an error an operator can act on.
+func ensureInitialSnapshot(ctx context.Context, syncer *policy.Syncer, store policy.Store, matcher *policy.Matcher) error {
+	syncCtx, cancelSync := context.WithTimeout(ctx, policyActivationTimeout)
+	syncRes, syncErr := syncer.SyncOnce(syncCtx)
+	cancelSync()
+
+	if syncErr != nil {
+		if loadErr := loadLastKnownGood(ctx, store, matcher); loadErr != nil {
+			return fmt.Errorf("%w: initial sync failed (%v) and no usable last-known-good policy was found: %w",
+				ErrPolicyActivationNoRules, syncErr, loadErr)
+		}
+		slog.Warn("Policy sync failed at startup; activated last-known-good policy instead", "err", syncErr)
+	} else if !syncRes.Published {
+		return fmt.Errorf("%w: sync did not publish a snapshot", ErrPolicyActivationNoRules)
+	}
+
+	snap := matcher.Current()
+	if snap == nil || (snap.DomainCount() == 0 && snap.CIDRCount() == 0) {
+		return ErrPolicyActivationNoRules
+	}
 	return nil
 }
 
@@ -278,48 +308,61 @@ func (s *Service) PolicyRouteCacheSize() (entries, sessions int) {
 func (s *Service) PolicyStatusSnapshot() PolicyStatus {
 	runtime := s.policyRuntime()
 	status := PolicyStatus{SyncState: "disabled"}
-
 	if runtime != nil && runtime.syncer != nil {
-		live := runtime.syncer.Status()
-		status.Ready = live.Ready
-		status.GenerationID = live.GenerationID
-		status.Version = live.Version
-		status.DomainCount = live.DomainCount
-		status.CIDRCount = live.CIDRCount
-		status.LastError = live.LastError
-		if !live.LastSyncTime.IsZero() {
-			status.LastSyncTime = live.LastSyncTime.UTC().Format(time.RFC3339)
-		}
-		if !live.LastSuccess.IsZero() {
-			status.LastSuccess = live.LastSuccess.UTC().Format(time.RFC3339)
-		}
-		switch {
-		case live.LastError != "":
-			status.SyncState = "error"
-		case live.Ready:
-			status.SyncState = "synced"
-		default:
-			status.SyncState = "pending"
-		}
-		status.Preset = runtime.presetID
+		applySyncerStatus(&status, runtime)
 	}
-
 	status.Enabled = s.PBREnabled()
 
 	// Fall back to the matcher when the syncer has no status yet but a snapshot is
 	// published (e.g. activated straight from last-known-good).
-	if !status.Ready && runtime != nil && runtime.matcher != nil {
-		if snap := runtime.matcher.Current(); snap != nil {
-			status.Ready = true
-			status.GenerationID = snap.Generation()
-			status.Version = snap.Version()
-			status.DomainCount = snap.DomainCount()
-			status.CIDRCount = snap.CIDRCount()
-			if status.SyncState == "disabled" {
-				status.SyncState = "synced"
-			}
-		}
+	if !status.Ready && runtime != nil {
+		applyMatcherStatus(&status, runtime.matcher)
 	}
-
 	return status
+}
+
+// applySyncerStatus copies the live syncer's counters and sync outcome into status.
+func applySyncerStatus(status *PolicyStatus, runtime *policyRuntime) {
+	live := runtime.syncer.Status()
+	status.Ready = live.Ready
+	status.GenerationID = live.GenerationID
+	status.Version = live.Version
+	status.DomainCount = live.DomainCount
+	status.CIDRCount = live.CIDRCount
+	status.LastError = live.LastError
+	status.Preset = runtime.presetID
+	if !live.LastSyncTime.IsZero() {
+		status.LastSyncTime = live.LastSyncTime.UTC().Format(time.RFC3339)
+	}
+	if !live.LastSuccess.IsZero() {
+		status.LastSuccess = live.LastSuccess.UTC().Format(time.RFC3339)
+	}
+	switch {
+	case live.LastError != "":
+		status.SyncState = "error"
+	case live.Ready:
+		status.SyncState = "synced"
+	default:
+		status.SyncState = "pending"
+	}
+}
+
+// applyMatcherStatus fills status from a published snapshot when no syncer status
+// is available.
+func applyMatcherStatus(status *PolicyStatus, matcher *policy.Matcher) {
+	if matcher == nil {
+		return
+	}
+	snap := matcher.Current()
+	if snap == nil {
+		return
+	}
+	status.Ready = true
+	status.GenerationID = snap.Generation()
+	status.Version = snap.Version()
+	status.DomainCount = snap.DomainCount()
+	status.CIDRCount = snap.CIDRCount()
+	if status.SyncState == "disabled" {
+		status.SyncState = "synced"
+	}
 }

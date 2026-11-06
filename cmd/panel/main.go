@@ -151,6 +151,40 @@ func loadPolicySettings(ctx context.Context, db *database.DB) (policy.Settings, 
 	return stored.Normalize(), nil
 }
 
+// startPersistedPolicyRouting activates policy routing from the persisted record
+// before the data plane accepts traffic (#678).
+//
+// The persisted record is authoritative and activation fails closed through the
+// VPN prerequisite guards: a missing policy snapshot or an unavailable direct
+// egress path leaves PBR disabled with a logged reason instead of routing traffic
+// unproxied. A disabled record is the default for existing and fresh installs and
+// does nothing here.
+func startPersistedPolicyRouting(ctx context.Context, db *database.DB, vpnSvc *vpn.Service, cfg *config.Config) error {
+	policySettings, err := loadPolicySettings(ctx, db)
+	if err != nil {
+		// Policy routing is an optional feature and its configuration read is not
+		// worth failing panel start over. Failing closed here means leaving PBR
+		// disabled, which is exactly the existing all-proxy behavior, so nothing
+		// is routed more permissively than before the read was attempted.
+		slog.Warn("Could not load policy routing settings; policy routing stays disabled", "err", err)
+		return nil
+	}
+	if !policySettings.Enabled || !cfg.VPNEnabled {
+		return nil
+	}
+
+	policyStore := policy.NewFileStore(filepath.Join(cfg.DataDir, "policy"))
+	if startErr := vpnSvc.StartPolicyRouting(ctx, policySettings, policyStore, string(policySettings.Preset)); startErr != nil {
+		// Fail closed: never start the data plane with PBR enabled but not
+		// actually activated, because that would silently proxy everything while
+		// the operator believes policy routing is on.
+		return fmt.Errorf("failed to activate persisted policy routing: %w", startErr)
+	}
+	slog.Info("Policy routing activated from persisted settings",
+		"preset", string(policySettings.Preset), "interval_seconds", policySettings.SyncInterval)
+	return nil
+}
+
 func run(ctx context.Context) error {
 	// 1. Load configuration
 	cfg, err := config.Load()
@@ -243,25 +277,9 @@ func run(ctx context.Context) error {
 	userOps.SetVPNService(vpnSvc)
 
 	// 8b. Start persisted policy routing (#678) before the data plane accepts
-	// traffic. The persisted record is authoritative, and activation fails closed
-	// through the VPN prerequisite guards: a missing policy snapshot or an
-	// unavailable direct egress path leaves PBR disabled with a logged reason
-	// instead of routing traffic unproxied. A disabled record is the default for
-	// existing and fresh installs and does nothing here.
-	policySettings, policyErr := loadPolicySettings(ctx, db)
-	if policyErr != nil {
-		return fmt.Errorf("failed to load policy routing settings: %w", policyErr)
-	}
-	if policySettings.Enabled && cfg.VPNEnabled {
-		policyStore := policy.NewFileStore(filepath.Join(cfg.DataDir, "policy"))
-		if startErr := vpnSvc.StartPolicyRouting(ctx, policySettings, policyStore, string(policySettings.Preset)); startErr != nil {
-			// Fail closed: never start the data plane with PBR enabled but not
-			// actually activated, because that would silently proxy everything
-			// while the operator believes policy routing is on.
-			return fmt.Errorf("failed to activate persisted policy routing: %w", startErr)
-		}
-		slog.Info("Policy routing activated from persisted settings",
-			"preset", string(policySettings.Preset), "interval_seconds", policySettings.SyncInterval)
+	// traffic.
+	if err := startPersistedPolicyRouting(ctx, db, vpnSvc, cfg); err != nil {
+		return err
 	}
 
 	vpnStarted, poolSynced, err := startVPNDataPlane(ctx, vpnSvc, cfg)
