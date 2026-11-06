@@ -104,6 +104,21 @@ jobs:
       - name: Run Vision Tests (non-race)
         run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
 
+      # R12 (issue #703 work9 / Tests): the original acceptance requires real
+      # selected-protocol traffic before a backend may be used. This step drives
+      # the production qualification seam against a REAL VLESS+REALITY server and
+      # a real loopback HTTP origin, then asserts admission, durable finalization
+      # and selectability, plus the negative no-traffic path. The Naive leg reuses
+      # the real Caddy+naive binaries installed by the steps above. No injected
+      # success values, no live provider, no Docker.
+      #
+      # The Naive test SKIPS when its binaries are absent, so a plain local run is
+      # not evidence; this step runs it where the binaries exist.
+      - name: Run Authentic R12 Whole-Flow Qualification Tests
+        run: |
+          go test -v -race -tags with_utls -run 'TestR12_' ./internal/vpn/
+          go test -v -race -tags with_utls -run 'TestR12_Naive' ./internal/vpn/tunnel/naive/
+
       - name: Upload Test Coverage
         uses: actions/upload-artifact@v7
         if: always()
