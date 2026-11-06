@@ -22,6 +22,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/naive"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/xray"
+	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/router"
 	"github.com/devops-igor/amnezia-nexus/internal/service"
 	"github.com/devops-igor/amnezia-nexus/internal/service/orchestrator"
@@ -130,6 +131,26 @@ func startVPNDataPlane(ctx context.Context, vpnSvc *vpn.Service, cfg *config.Con
 	return true, true, nil
 }
 
+// loadPolicySettings reads the persisted policy routing record. An absent row
+// yields the disabled default, which keeps existing and fresh installs on the
+// old all-proxy route.
+func loadPolicySettings(ctx context.Context, db *database.DB) (policy.Settings, error) {
+	settings := policy.DefaultSettings()
+	if db == nil {
+		return settings, nil
+	}
+	var stored policy.Settings
+	if err := db.GetSetting(ctx, policy.SettingsKey, &stored); err != nil {
+		return settings, err
+	}
+	// Settings contains a slice and is not comparable, so emptiness is checked
+	// field by field. An absent row leaves the target untouched.
+	if stored.Preset == "" && !stored.Enabled && stored.SyncInterval == 0 && len(stored.CustomURLs) == 0 {
+		return settings, nil
+	}
+	return stored.Normalize(), nil
+}
+
 func run(ctx context.Context) error {
 	// 1. Load configuration
 	cfg, err := config.Load()
@@ -220,6 +241,28 @@ func run(ctx context.Context) error {
 	vpnSvc.SetAWGStatusProvider(awgMgr)
 	reconciler.SetVPNService(vpnSvc)
 	userOps.SetVPNService(vpnSvc)
+
+	// 8b. Start persisted policy routing (#678) before the data plane accepts
+	// traffic. The persisted record is authoritative, and activation fails closed
+	// through the VPN prerequisite guards: a missing policy snapshot or an
+	// unavailable direct egress path leaves PBR disabled with a logged reason
+	// instead of routing traffic unproxied. A disabled record is the default for
+	// existing and fresh installs and does nothing here.
+	policySettings, policyErr := loadPolicySettings(ctx, db)
+	if policyErr != nil {
+		return fmt.Errorf("failed to load policy routing settings: %w", policyErr)
+	}
+	if policySettings.Enabled && cfg.VPNEnabled {
+		policyStore := policy.NewFileStore(filepath.Join(cfg.DataDir, "policy"))
+		if startErr := vpnSvc.StartPolicyRouting(ctx, policySettings, policyStore, string(policySettings.Preset)); startErr != nil {
+			// Fail closed: never start the data plane with PBR enabled but not
+			// actually activated, because that would silently proxy everything
+			// while the operator believes policy routing is on.
+			return fmt.Errorf("failed to activate persisted policy routing: %w", startErr)
+		}
+		slog.Info("Policy routing activated from persisted settings",
+			"preset", string(policySettings.Preset), "interval_seconds", policySettings.SyncInterval)
+	}
 
 	vpnStarted, poolSynced, err := startVPNDataPlane(ctx, vpnSvc, cfg)
 	if err != nil {
