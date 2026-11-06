@@ -322,6 +322,12 @@ The evidence aggregator verifies that all qualification requirements are strictl
 | `NEXUS_ARTIFACT_DIR` | Custom directory for outputting JSON evidence manifests and soak reports | `./test-artifacts` |
 | `GO_DIR` | Custom path to repository root for test scripts | `.` (current directory) |
 
+> [!NOTE]
+> When `NEXUS_ARTIFACT_DIR` is unset, the differential tests write their JSON evidence into the
+> Go test invocation's own artifact directory and it is discarded with that invocation. Nothing is
+> written into the repository working tree, so an ordinary `go test` run leaves no debris behind
+> for a later checkout on the same machine to trip over.
+
 ---
 
 ## 9. Privacy & Security Invariants
