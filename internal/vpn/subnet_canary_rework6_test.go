@@ -96,17 +96,30 @@ func (d *auditR5RealSubnetDevice) RegisterCanaryResponseHook(h tunnel.CanaryResp
 // allowing canary packets to match the remote data peer's AllowedIPs.
 func TestAuditR5_CustomSubnetReachesCanary(t *testing.T) {
 	db := setupTestDB(t)
-	svc, _, _, _, _ := setupTestVPNService(t, db, func(cfg *models.VPNConfig) {
+	svc, s1, _, _, _ := setupTestVPNService(t, db, func(cfg *models.VPNConfig) {
 		cfg.SubnetCIDR = "10.200.0.0/16"
 	})
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	// Service.ProbeCanary now verifies the tunnel against the live pool and
+	// ensures its data-plane device is attached before probing, so the fixture
+	// must supply a real synchronized tunnel rather than a synthetic identity.
+	if err := svc.pool.SyncFromDB(context.Background()); err != nil {
+		t.Fatalf("SyncFromDB: %v", err)
+	}
+	tun, err := svc.pool.GetTunnel(s1)
+	if err != nil {
+		t.Fatalf("GetTunnel: %v", err)
+	}
+
 	_, subnet, _ := net.ParseCIDR(svc.cfg.SubnetCIDR)
 	inner := &auditR5SubnetDevice{subnet: subnet}
 	dev := &auditR5RealSubnetDevice{inner: inner}
-	svc.backendDevices = map[int64]BackendDevice{9001: dev}
+	svc.backendDevices = map[int64]BackendDevice{tun.ID: dev}
 	svc.SetCanaryProbeFunc(nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-	defer cancel()
-	err := svc.ProbeCanary(ctx, &models.BackendTunnel{ID: 9001, ServerID: 9002})
+
+	err = svc.ProbeCanary(ctx, tun)
 	t.Logf("configured=%s prober=%s source_packets=%v accepted=%d error=%v", svc.SubnetCIDR(), svc.prober.GetSubnetCIDR(), inner.sources, inner.accepted, err)
 
 	// Control: same actual canary/device succeeds with the configured CIDR.

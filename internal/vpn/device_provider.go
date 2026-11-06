@@ -33,14 +33,12 @@ func (s *Service) GetDevice(id int64) (tunnel.PacketDevice, bool) {
 	return nil, false
 }
 
-// SubnetCIDR returns the configured portal subnet CIDR or defaults to "10.100.0.0/16".
+// SubnetCIDR implements the subnet provider interface for HealthProber so canary probes
+// are generated with source IPs authorized by the remote peer's AllowedIPs.
+// It resolves through getPortalSubnet so there is a single source of truth for the
+// configured portal CIDR; the value and the 10.100.0.0/16 fallback are unchanged.
 func (s *Service) SubnetCIDR() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.cfg != nil && s.cfg.SubnetCIDR != "" {
-		return s.cfg.SubnetCIDR
-	}
-	return "10.100.0.0/16"
+	return s.getPortalSubnet()
 }
 
 // ProbeCanary probes the data plane of a backend tunnel using the service's health prober.
@@ -48,19 +46,41 @@ func (s *Service) ProbeCanary(ctx context.Context, t *models.BackendTunnel) erro
 	if s == nil || s.prober == nil {
 		return errors.New("health prober not initialized")
 	}
+	// Keep the prober's canary source subnet in step with the portal configuration
+	// before probing (the subnet can change at runtime). SetSubnetCIDR takes the
+	// prober lock only, and no service lock is held across this call.
 	if cidr := s.SubnetCIDR(); cidr != "" {
 		s.prober.SetSubnetCIDR(cidr)
 	}
-	s.mu.RLock()
-	var dev tunnel.PacketDevice
-	if s.backendDevices != nil && t != nil {
-		dev = s.backendDevices[t.ID]
-		if dev == nil && t.ServerID > 0 {
-			dev = s.backendDevices[t.ServerID]
-		}
+	if err := s.ensureBackendDeviceAttached(ctx, t); err != nil {
+		return fmt.Errorf("failed to ensure backend device attached: %w", err)
 	}
-	s.mu.RUnlock()
-	return s.prober.ProbeCanaryWithDevice(ctx, t, dev)
+	return s.prober.ProbeCanary(ctx, t)
+}
+
+// HasCanaryProber reports whether a canary prober or active device is available for the tunnel.
+func (s *Service) HasCanaryProber(t *models.BackendTunnel) bool {
+	if s == nil || s.prober == nil {
+		return false
+	}
+	return s.prober.HasCanaryProber(t)
+}
+
+// SetCanarySuccessCallback registers a callback invoked whenever HealthProber verifies inner canary success.
+func (s *Service) SetCanarySuccessCallback(cb func(tunnelID int64)) {
+	if s == nil || s.prober == nil {
+		return
+	}
+	s.prober.SetCanarySuccessCallback(cb)
+}
+
+// CanaryFailureCount exposes the shared, generation-fenced inner history to
+// scheduled health checks. Legacy success notifications do not own this state.
+func (s *Service) CanaryFailureCount(tunnelID int64) int {
+	if s == nil || s.prober == nil {
+		return 0
+	}
+	return s.prober.CanaryFailureCount(tunnelID)
 }
 
 // PromoteQualifiedTunnel promotes a connecting backend tunnel to active (or degraded if latency is high)

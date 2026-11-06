@@ -469,7 +469,18 @@ func (h *Handlers) qualifyBackendTraffic(ctx context.Context, server *models.Ser
 
 	// Finding F8: Outer handshake is necessary but not sufficient.
 	// Verify real data-plane payload forwarding before declaring the backend ready.
-	if err := h.vpnSvc.ProbeCanary(probeCtx, tun); err != nil {
+	//
+	// ProbeTunnel commits through a version-fenced write, so the snapshot above is
+	// now stale. Service.ProbeCanary verifies the tunnel against the live pool and
+	// would reject that stale StateVersion, so re-read the current row first rather
+	// than passing a superseded identity forward.
+	current, curErr := h.vpnSvc.GetTunnel(server.ID)
+	if curErr != nil || current == nil {
+		h.vpnSvc.SetPendingEnrollment(server.ID, false)
+		_ = h.vpnSvc.DisableBackend(ctx, server.ID)
+		return fmt.Errorf("backend tunnel disappeared after qualification probe: %v", curErr)
+	}
+	if err := h.vpnSvc.ProbeCanary(probeCtx, current); err != nil {
 		h.vpnSvc.SetPendingEnrollment(server.ID, false)
 		_ = h.vpnSvc.DisableBackend(ctx, server.ID)
 		_ = h.vpnSvc.SetTunnelStatus(ctx, server.ID, models.TunnelStatusDisabled, 0)

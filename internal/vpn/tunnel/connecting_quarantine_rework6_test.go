@@ -38,9 +38,11 @@ func TestProbeTunnel_ConnectingTunnelQuarantinedUntilCanary(t *testing.T) {
 	if thresh := prober.LatencyThresholdMS(); thresh <= 0 {
 		t.Fatalf("expected positive LatencyThresholdMS, got %d", thresh)
 	}
-	prober.SetSubnetProvider(func() string { return "10.200.0.0/16" })
+	// Subnet resolution: the dynamic callback provider was retired upstream in
+	// favour of a lock-free configured CIDR, so this asserts the supported path.
+	prober.SetSubnetCIDR("10.200.0.0/16")
 	if got := prober.GetSubnetCIDR(); got != "10.200.0.0/16" {
-		t.Fatalf("expected 10.200.0.0/16 from dynamic provider, got %s", got)
+		t.Fatalf("expected 10.200.0.0/16 from configured subnet, got %s", got)
 	}
 
 	lat, err := prober.ProbeTunnel(ctx, tun)

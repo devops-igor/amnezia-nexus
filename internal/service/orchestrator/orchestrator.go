@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/manager"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/userops"
 )
 
@@ -33,6 +35,11 @@ type TunnelStatusUpdater interface {
 // SessionMigrator defines the interface for coordinated live VPN session migration across backend tunnels (issue #289).
 type SessionMigrator interface {
 	MigrateSession(ctx context.Context, sessionID string, targetTunnelID int64) error
+}
+
+// CanarySuccessRegistrar defines an interface for status updaters or probers that can notify when canary probes succeed.
+type CanarySuccessRegistrar interface {
+	SetCanarySuccessCallback(cb func(tunnelID int64))
 }
 
 type healthProbeKey struct {
@@ -68,6 +75,7 @@ type Orchestrator struct {
 	healthProbeKeys   map[int64]healthProbeKey
 	probeFailCounts   map[int64]int
 	probeFailVersions map[int64]int64
+	canaryFailCounts  map[int64]int
 
 	running     bool
 	cancel      context.CancelFunc
@@ -169,11 +177,22 @@ func New(db *database.DB, registry ProtocolResolver, opts ...Option) *Orchestrat
 		healthProbeKeys:       make(map[int64]healthProbeKey),
 		probeFailCounts:       make(map[int64]int),
 		probeFailVersions:     make(map[int64]int64),
+		canaryFailCounts:      make(map[int64]int),
 		stopCh:                make(chan struct{}),
 	}
 
 	for _, opt := range opts {
 		opt(o)
+	}
+
+	if reg, ok := o.statusUpdater.(CanarySuccessRegistrar); ok {
+		reg.SetCanarySuccessCallback(func(tunnelID int64) {
+			o.ResetCanaryFailCount(tunnelID)
+		})
+	} else if reg, ok := o.sessionMigrator.(CanarySuccessRegistrar); ok {
+		reg.SetCanarySuccessCallback(func(tunnelID int64) {
+			o.ResetCanaryFailCount(tunnelID)
+		})
 	}
 
 	return o
@@ -184,6 +203,11 @@ func (o *Orchestrator) SetTunnelStatusUpdater(u TunnelStatusUpdater) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.statusUpdater = u
+	if reg, ok := u.(CanarySuccessRegistrar); ok {
+		reg.SetCanarySuccessCallback(func(tunnelID int64) {
+			o.ResetCanaryFailCount(tunnelID)
+		})
+	}
 }
 
 // SetSessionMigrator configures the session migrator (e.g. VPN service) for live rebalancing (issue #289).
@@ -191,6 +215,11 @@ func (o *Orchestrator) SetSessionMigrator(m SessionMigrator) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.sessionMigrator = m
+	if reg, ok := m.(CanarySuccessRegistrar); ok && o.statusUpdater == nil {
+		reg.SetCanarySuccessCallback(func(tunnelID int64) {
+			o.ResetCanaryFailCount(tunnelID)
+		})
+	}
 }
 
 // Name returns the service identifier for supervisor registration.
@@ -439,4 +468,63 @@ func (o *Orchestrator) revertProbeFailure(tunnelID int64, version int64) {
 	if o.probeFailCounts[tunnelID] > 0 {
 		o.probeFailCounts[tunnelID]--
 	}
+}
+
+// recordProbeFailVersion stores the expected next state version after a failure transition.
+func (o *Orchestrator) recordProbeFailVersion(tunnelID int64, stateVersion int64) {
+	if stateVersion <= 0 {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.probeFailVersions != nil {
+		o.probeFailVersions[tunnelID] = stateVersion + 1
+	}
+}
+
+// recordCanaryFailure increments and returns the consecutive canary failure count for a backend tunnel.
+func (o *Orchestrator) recordCanaryFailure(tunnelID int64) int {
+	if history, ok := o.getCanaryProber().(interface{ CanaryFailureCount(int64) int }); ok {
+		return history.CanaryFailureCount(tunnelID)
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.canaryFailCounts == nil {
+		o.canaryFailCounts = make(map[int64]int)
+	}
+	o.canaryFailCounts[tunnelID]++
+	return o.canaryFailCounts[tunnelID]
+}
+
+// ResetCanaryFailCount clears the consecutive canary failure count for a backend tunnel.
+func (o *Orchestrator) ResetCanaryFailCount(tunnelID int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.canaryFailCounts != nil {
+		delete(o.canaryFailCounts, tunnelID)
+	}
+}
+
+// GetCanaryFailCount returns the current consecutive canary failure count for a backend tunnel.
+func (o *Orchestrator) GetCanaryFailCount(tunnelID int64) int {
+	if history, ok := o.getCanaryProber().(interface{ CanaryFailureCount(int64) int }); ok {
+		return history.CanaryFailureCount(tunnelID)
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.canaryFailCounts == nil {
+		return 0
+	}
+	count := o.canaryFailCounts[tunnelID]
+	if count == 0 {
+		return 0
+	}
+	if o.db != nil {
+		tun, err := o.db.GetBackendTunnel(context.Background(), tunnelID)
+		if err == nil && tun != nil && strings.EqualFold(tun.Status, models.TunnelStatusActive) {
+			delete(o.canaryFailCounts, tunnelID)
+			return 0
+		}
+	}
+	return count
 }

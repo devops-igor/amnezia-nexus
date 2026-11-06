@@ -24,6 +24,8 @@ func isRealProbeFunc(fn tunnel.ProbeFunc) bool {
 // SetProbeFunc sets the health probe function for testing or customized reachability probing.
 // When an offline mock probe closure is supplied, a default offline canary is installed
 // unless a custom canary probe function has already been set or real probing is requested.
+// Custom canaries are preserved; use SetCanaryProbeFunc(nil) afterward to test real probing.
+// Production constructors must configure HealthProber directly instead.
 func (s *Service) SetProbeFunc(fn tunnel.ProbeFunc) {
 	if s == nil {
 		return
@@ -32,6 +34,7 @@ func (s *Service) SetProbeFunc(fn tunnel.ProbeFunc) {
 	defer s.mu.Unlock()
 	if s.prober != nil {
 		s.prober.SetProbeFunc(fn)
+		// Service-level probe setters share s.mu, preserving custom fixture overrides.
 		if isRealProbeFunc(fn) {
 			s.prober.SetCanaryProbeFunc(nil)
 		} else if fn != nil && s.prober.GetCanaryProbeFunc() == nil {

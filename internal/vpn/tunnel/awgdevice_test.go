@@ -475,3 +475,81 @@ func TestNewAWGClientDevice_I1NewlineInjection(t *testing.T) {
 		t.Errorf("expected empty I1 on newline injection, got %q", dev.I1())
 	}
 }
+
+func TestAWGClientDevice_CanaryResponseHook(t *testing.T) {
+	vtun, err := virtualtun.New(virtualtun.Config{
+		Name:             "test-awg-canary",
+		MTU:              1340,
+		InboundCapacity:  DefaultVirtualTUNInboundCapacity,
+		OutboundCapacity: 1024,
+	})
+	if err != nil {
+		t.Fatalf("virtualtun.New failed: %v", err)
+	}
+	dev := &AWGClientDevice{
+		name:      "test-awg-canary",
+		mtu:       1340,
+		vtun:      vtun,
+		doneCh:    make(chan struct{}),
+		createdAt: time.Now(),
+	}
+	defer dev.Close()
+
+	// 1. Hook catches canary packet and consumes it
+	canaryPkt := BuildCanaryICMPEchoReply(nil, nil, 0x0713, 1)
+	clientPkt := []byte("client-data-packet")
+
+	canaryReceived := make(chan []byte, 1)
+	unregister := dev.RegisterCanaryResponseHook(func(packet []byte) bool {
+		if IsCanaryEchoReply(packet, 0x0713, 1) {
+			canaryReceived <- packet
+			return true
+		}
+		return false
+	})
+
+	// Inject canary reply, then client packet into vtun's outbound channel
+	if _, err := vtun.Write([][]byte{canaryPkt}, 0); err != nil {
+		t.Fatalf("Write canary failed: %v", err)
+	}
+	if _, err := vtun.Write([][]byte{clientPkt}, 0); err != nil {
+		t.Fatalf("Write client failed: %v", err)
+	}
+
+	// Reader (simulating pumpBackendReturns) reads
+	readBuf := make([]byte, 1500)
+	n, rErr := dev.Read(readBuf)
+	if rErr != nil {
+		t.Fatalf("dev.Read failed: %v", rErr)
+	}
+
+	// The reader must have received the client packet, NOT the canary packet!
+	if string(readBuf[:n]) != string(clientPkt) {
+		t.Fatalf("expected reader to receive client packet, got %q", string(readBuf[:n]))
+	}
+
+	// Canary hook must have received the canary reply
+	select {
+	case gotCanary := <-canaryReceived:
+		if !bytes.Equal(gotCanary, canaryPkt) {
+			t.Fatalf("canary hook received unexpected packet: %v", gotCanary)
+		}
+	default:
+		t.Fatal("canary hook was not invoked for canary packet")
+	}
+
+	// 2. Unregister hook: subsequent canary packets should now be delivered to Read()
+	unregister()
+
+	if _, err := vtun.Write([][]byte{canaryPkt}, 0); err != nil {
+		t.Fatalf("Write canary after unregister failed: %v", err)
+	}
+
+	n, rErr = dev.Read(readBuf)
+	if rErr != nil {
+		t.Fatalf("dev.Read after unregister failed: %v", rErr)
+	}
+	if !bytes.Equal(readBuf[:n], canaryPkt) {
+		t.Fatalf("expected reader to receive canary packet after unregister, got %v", readBuf[:n])
+	}
+}

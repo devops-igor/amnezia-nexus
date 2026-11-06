@@ -2,8 +2,11 @@ package tunnel
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
 // ReconnectConfig defines exponential backoff reconnection parameters.
@@ -189,16 +192,21 @@ func (rm *ReconnectManager) CheckAndReconnect(ctx context.Context) int {
 		}
 		rm.mu.Unlock()
 
-		latency, err := rm.prober.ProbeTunnel(ctx, t)
+		_, err := rm.prober.ProbeTunnel(ctx, t)
+		latest, getErr := rm.pool.GetTunnel(t.ServerID)
+
 		rm.mu.Lock()
-		if err == nil && latency <= rm.prober.Config().LatencyThresholdMS {
-			// Successful reconnection!
+		if err == nil && getErr == nil && latest != nil && strings.EqualFold(latest.Status, models.TunnelStatusActive) {
+			// Successful reconnection to active!
 			delete(rm.backoffs, t.ServerID)
 			delete(rm.retries, t.ServerID)
 			delete(rm.nextAttempt, t.ServerID)
 			// ProbeTunnel already committed a generation-fenced health result.
 			// A second unversioned write could resurrect a reenrolled tunnel.
 			reconnectedCount++
+		} else if err == nil && getErr == nil && latest != nil && strings.EqualFold(latest.Status, models.TunnelStatusHandshakeBlocked) {
+			// Outer probe succeeded but inner canary failed:
+			// Prober correctly preserved handshake_blocked. Do NOT overwrite status to active!
 		} else {
 			// Failed, increase backoff
 			nextBackoff := time.Duration(float64(backoff) * cfg.Multiplier)

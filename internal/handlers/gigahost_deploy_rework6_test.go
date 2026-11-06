@@ -195,8 +195,20 @@ func TestRework7_RoutedSetupQuarantineAdjacentStates(t *testing.T) {
 			}})
 			h.vpnSvc.SetProbeFunc(health.ProbeAWGEndpointRange)
 			eligible := -1
+			// This fixture's canary callback deliberately drives another probe to
+			// model a concurrent background probe. Now that a failed outer probe runs
+			// the canary itself before deciding status, a nested ProbeTunnel would
+			// re-enter this callback from inside its own execution and recurse
+			// without bound. Guard re-entry so the nested probe uses a leaf canary
+			// while the outer call keeps the fixture's injected outcome.
+			canaryBusy := false
 			h.vpnSvc.SetCanaryProbeFunc(func(ctx context.Context, tun *models.BackendTunnel) error {
 				svc := h.vpnSvc
+				if canaryBusy {
+					return errors.New("fixture: nested canary probe (no forwarding)")
+				}
+				canaryBusy = true
+				defer func() { canaryBusy = false }()
 				if scenario == "background-failure-then-real-handshake" {
 					svc.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
 						return 0, errors.New("transient UDP probe loss")
