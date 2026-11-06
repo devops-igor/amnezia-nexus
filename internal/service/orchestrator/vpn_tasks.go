@@ -100,6 +100,24 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			}
 		}
 
+		isBlocked := strings.EqualFold(t.Status, models.TunnelStatusHandshakeBlocked)
+		var poolTun *models.BackendTunnel
+		if gu, ok := o.statusUpdater.(interface {
+			GetTunnel(int64) (*models.BackendTunnel, error)
+		}); ok {
+			if pt, err := gu.GetTunnel(t.ServerID); err == nil && pt != nil {
+				poolTun = pt
+				if strings.EqualFold(poolTun.Status, models.TunnelStatusHandshakeBlocked) {
+					isBlocked = true
+				}
+			}
+		}
+
+		if strings.EqualFold(t.Status, models.TunnelStatusActive) ||
+			(poolTun != nil && strings.EqualFold(poolTun.Status, models.TunnelStatusActive)) {
+			o.ResetCanaryFailCount(t.ID)
+		}
+
 		tCopy := t
 		rtt, err := probeFn(
 			ctx,
@@ -133,17 +151,18 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			}
 
 			failures := o.recordProbeFailure(t.ID, t.StateVersion)
-			if failures < threshold {
-				slog.Warn("Backend tunnel health probe failed (below failure threshold)",
-					"tunnel_id", t.ID,
-					"endpoint", t.Endpoint,
-					"failures", failures,
-					"threshold", threshold,
-					"err", err,
-				)
-				if !strings.EqualFold(t.Status, "degraded") {
+			decision, canaryErr := o.confirmOuterFailure(ctx, &t, poolTun, failures, threshold, isBlocked)
+			if canaryErr != nil {
+				continue
+			}
+			if decision == "" {
+				if !strings.EqualFold(t.Status, "degraded") && !isBlocked {
 					healthyTunnels = append(healthyTunnels, &tCopy)
 				}
+				continue
+			}
+			if decision == models.TunnelStatusHandshakeBlocked {
+				o.updateTunnelStatus(ctx, &t, decision, 0)
 				continue
 			}
 
@@ -156,11 +175,7 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			)
 			if o.updateTunnelStatus(ctx, &t, "degraded", 0) {
 				degradedTunnels = append(degradedTunnels, t.ID)
-				o.mu.Lock()
-				if o.probeFailVersions != nil && t.StateVersion > 0 {
-					o.probeFailVersions[t.ID] = t.StateVersion + 1
-				}
-				o.mu.Unlock()
+				o.recordProbeFailVersion(t.ID, t.StateVersion)
 			} else {
 				o.revertProbeFailure(t.ID, t.StateVersion)
 			}
@@ -179,12 +194,157 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			status = "degraded"
 		}
 
+		// Dual-tier verification: before promoting ANY non-active backend to active
+		// (whether connecting, degraded, or handshake_blocked),
+		// data-plane device attachment AND successful inner canary probe are strictly required!
+		if status == "active" {
+			hasActiveSessions := t.ActiveConnections > 0 || (poolTun != nil && poolTun.ActiveConnections > 0)
+			isCurrentlyActive := strings.EqualFold(t.Status, models.TunnelStatusActive) &&
+				(poolTun == nil || strings.EqualFold(poolTun.Status, models.TunnelStatusActive))
+
+			canaryProber := o.getCanaryProber()
+
+			if !isCurrentlyActive {
+				if canaryProber == nil {
+					if isBlocked {
+						slog.Warn("Backend tunnel outer probe recovered but no canary prober available to verify inner plane; preserving handshake_blocked",
+							"tunnel_id", t.ID, "endpoint", t.Endpoint)
+					} else {
+						slog.Warn("Backend tunnel outer probe succeeded but no canary prober available to verify inner plane; denying active promotion",
+							"tunnel_id", t.ID, "endpoint", t.Endpoint, "status", t.Status)
+					}
+					continue
+				}
+
+				cErr := canaryProber.ProbeCanary(ctx, &t)
+				if obsoleteCanary(cErr) {
+					continue
+				}
+
+				hasCanary := true
+				if cp, ok := canaryProber.(interface {
+					HasCanaryProber(tunnel *models.BackendTunnel) bool
+				}); ok {
+					hasCanary = cp.HasCanaryProber(&t)
+				}
+				if cErr != nil {
+					msg := cErr.Error()
+					if errors.Is(cErr, tunnel.ErrNoActiveDevice) ||
+						strings.Contains(msg, "ensure backend device attached") ||
+						strings.Contains(msg, "no active data-plane device") {
+						hasCanary = false
+					}
+				}
+
+				if cErr != nil || !hasCanary {
+					if isBlocked {
+						if !hasCanary && cErr == nil {
+							slog.Warn("Backend tunnel outer probe recovered but no canary prober available to verify inner plane; preserving handshake_blocked",
+								"tunnel_id", t.ID, "endpoint", t.Endpoint)
+							continue
+						}
+						if hasActiveSessions {
+							fails := o.recordCanaryFailure(t.ID)
+							if fails < threshold {
+								slog.Warn("Blocked backend tunnel outer probe recovered but inner canary probe failed (below threshold); preserving handshake_blocked",
+									"tunnel_id", t.ID, "endpoint", t.Endpoint, "failures", fails, "threshold", threshold, "err", cErr)
+								if o.updateTunnelStatus(ctx, &t, models.TunnelStatusHandshakeBlocked, latencyMS) {
+									t.Status = models.TunnelStatusHandshakeBlocked
+								}
+								continue
+							}
+							slog.Warn("Blocked backend tunnel inner canary probe sustained failures reached threshold; marking degraded",
+								"tunnel_id", t.ID, "endpoint", t.Endpoint, "failures", fails, "threshold", threshold, "err", cErr)
+							if o.updateTunnelStatus(ctx, &t, models.TunnelStatusDegraded, latencyMS) {
+								degradedTunnels = append(degradedTunnels, t.ID)
+								t.Status = models.TunnelStatusDegraded
+								o.recordProbeFailVersion(t.ID, t.StateVersion)
+								o.ResetCanaryFailCount(t.ID)
+							}
+							continue
+						}
+						slog.Warn("Backend tunnel outer probe recovered but inner canary probe failed; marking degraded",
+							"tunnel_id", t.ID, "endpoint", t.Endpoint, "err", cErr)
+						if o.updateTunnelStatus(ctx, &t, models.TunnelStatusDegraded, latencyMS) {
+							degradedTunnels = append(degradedTunnels, t.ID)
+							t.Status = models.TunnelStatusDegraded
+							o.recordProbeFailVersion(t.ID, t.StateVersion)
+						}
+						continue
+					}
+
+					// Non-blocked backend (connecting or degraded)
+					if !hasCanary {
+						slog.Warn("Backend tunnel outer probe succeeded but data-plane device is not attached; denying active promotion",
+							"tunnel_id", t.ID, "endpoint", t.Endpoint, "err", cErr)
+						// Maintain connecting (or degraded) status without promoting to active
+						continue
+					}
+
+					// Data-plane device is attached, but inner canary probe failed: mark degraded
+					slog.Warn("Backend tunnel outer probe succeeded but inner canary probe failed; denying active promotion",
+						"tunnel_id", t.ID, "endpoint", t.Endpoint, "err", cErr)
+					if o.updateTunnelStatus(ctx, &t, models.TunnelStatusDegraded, latencyMS) {
+						degradedTunnels = append(degradedTunnels, t.ID)
+						t.Status = models.TunnelStatusDegraded
+						o.recordProbeFailVersion(t.ID, t.StateVersion)
+					}
+					continue
+				}
+
+				// Data plane verified healthy via inner canary; clear failure history
+				o.ResetCanaryFailCount(t.ID)
+			} else {
+				// Already active backend: verify data plane if canary prober is configured.
+				if canaryProber != nil {
+					hasCanary := true
+					if cp, ok := canaryProber.(interface {
+						HasCanaryProber(tunnel *models.BackendTunnel) bool
+					}); ok {
+						hasCanary = cp.HasCanaryProber(&t)
+					}
+					if hasCanary {
+						if cErr := canaryProber.ProbeCanary(ctx, &t); cErr != nil {
+							if obsoleteCanary(cErr) {
+								continue
+							}
+							fails := o.recordCanaryFailure(t.ID)
+							if fails < threshold {
+								slog.Warn("Active backend tunnel outer probe succeeded but inner canary probe failed (below threshold); marking handshake_blocked",
+									"tunnel_id", t.ID, "endpoint", t.Endpoint, "failures", fails, "threshold", threshold, "err", cErr)
+								if o.updateTunnelStatus(ctx, &t, models.TunnelStatusHandshakeBlocked, latencyMS) {
+									t.Status = models.TunnelStatusHandshakeBlocked
+								}
+								continue
+							}
+
+							slog.Warn("Active backend tunnel inner canary probe sustained failures reached threshold; marking degraded",
+								"tunnel_id", t.ID, "endpoint", t.Endpoint, "failures", fails, "threshold", threshold, "err", cErr)
+							if o.updateTunnelStatus(ctx, &t, models.TunnelStatusDegraded, latencyMS) {
+								degradedTunnels = append(degradedTunnels, t.ID)
+								t.Status = models.TunnelStatusDegraded
+								o.recordProbeFailVersion(t.ID, t.StateVersion)
+								o.ResetCanaryFailCount(t.ID)
+							}
+							continue
+						}
+						o.ResetCanaryFailCount(t.ID)
+					}
+				}
+			}
+		}
+
 		if o.updateTunnelStatus(ctx, &t, status, latencyMS) {
 			if status == "degraded" {
 				degradedTunnels = append(degradedTunnels, t.ID)
 			} else {
+				o.ResetCanaryFailCount(t.ID)
+				tCopy.Status = status
+				tCopy.LatencyMS = latencyMS
 				healthyTunnels = append(healthyTunnels, &tCopy)
 			}
+		} else if status == "active" {
+			o.ResetCanaryFailCount(t.ID)
 		}
 	}
 
@@ -222,6 +382,9 @@ func (o *Orchestrator) migrateDegradedTunnelSessions(ctx context.Context, degrad
 		if degradedMap[s.BackendTunnelID] {
 			sourceTun, err := o.db.GetBackendTunnel(ctx, s.BackendTunnelID)
 			if err != nil || sourceTun == nil {
+				continue
+			}
+			if strings.EqualFold(sourceTun.Status, models.TunnelStatusHandshakeBlocked) {
 				continue
 			}
 			sourceProto := models.NormalizeTunnelProtocol(sourceTun.Protocol)
@@ -596,4 +759,21 @@ func (o *Orchestrator) drainTunnelExcess(ctx context.Context, sessList []models.
 		}
 	}
 	return drained
+}
+
+// CanaryProber defines an optional interface for probing the inner data-plane canary of a backend tunnel.
+type CanaryProber interface {
+	ProbeCanary(ctx context.Context, tunnel *models.BackendTunnel) error
+}
+
+func (o *Orchestrator) getCanaryProber() CanaryProber {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if cp, ok := o.statusUpdater.(CanaryProber); ok {
+		return cp
+	}
+	if cp, ok := o.sessionMigrator.(CanaryProber); ok {
+		return cp
+	}
+	return nil
 }

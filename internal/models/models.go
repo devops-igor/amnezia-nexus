@@ -289,10 +289,11 @@ type ConnectionLogEntry struct {
 
 // Backend tunnel statuses and disable reasons.
 const (
-	TunnelStatusConnecting = "connecting"
-	TunnelStatusActive     = "active"
-	TunnelStatusDegraded   = "degraded"
-	TunnelStatusDisabled   = "disabled"
+	TunnelStatusConnecting       = "connecting"
+	TunnelStatusActive           = "active"
+	TunnelStatusDegraded         = "degraded"
+	TunnelStatusDisabled         = "disabled"
+	TunnelStatusHandshakeBlocked = "handshake_blocked"
 
 	DisableReasonNone   = ""
 	DisableReasonHealth = "health"

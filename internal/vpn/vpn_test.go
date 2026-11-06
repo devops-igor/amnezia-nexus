@@ -153,6 +153,9 @@ func setupTestVPNService(t *testing.T, db *database.DB, cfgMutators ...func(*mod
 		return 20 * time.Millisecond, nil
 	}
 	vpnSvc.SetProbeFunc(mockProbe)
+	vpnSvc.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		return nil
+	})
 
 	return vpnSvc, s1ID, s2ID, uID, peerKeyAlice
 }
