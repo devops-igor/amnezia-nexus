@@ -301,6 +301,7 @@ func TestDifferential_FaultSchedule_DuplicateInitiation(t *testing.T) {
 	}
 	shimRef.DuplicateNextInitiation()
 
+	refPreDevice := time.Now()
 	refClient, err := harness.NewClientViaShim(shimRef)
 	if err != nil {
 		_ = shimRef.Close()
@@ -310,8 +311,10 @@ func TestDifferential_FaultSchedule_DuplicateInitiation(t *testing.T) {
 
 	dialCtx, cancelDial := context.WithTimeout(ctx, 15*time.Second)
 	defer cancelDial()
+	refDialStart := time.Now()
 	refTCP, err := refClient.DialTCP(dialCtx)
 	if err != nil {
+		logDialFailureObservation(t, phaseReference, refClient, shimRef, refPreDevice, refDialStart)
 		_ = refClient.Close()
 		_ = shimRef.Close()
 		_ = harness.StopReferenceServer(refServer)
@@ -348,6 +351,7 @@ func TestDifferential_FaultSchedule_DuplicateInitiation(t *testing.T) {
 	}
 	shimSub.DuplicateNextInitiation()
 
+	subPreDevice := time.Now()
 	subClient, err := harness.NewClientViaShim(shimSub)
 	if err != nil {
 		_ = shimSub.Close()
@@ -357,8 +361,10 @@ func TestDifferential_FaultSchedule_DuplicateInitiation(t *testing.T) {
 
 	subDialCtx, cancelSubDial := context.WithTimeout(ctx, 15*time.Second)
 	defer cancelSubDial()
+	subDialStart := time.Now()
 	subTCP, err := subClient.DialTCP(subDialCtx)
 	if err != nil {
+		logDialFailureObservation(t, phaseSubject, subClient, shimSub, subPreDevice, subDialStart)
 		_ = subClient.Close()
 		_ = shimSub.Close()
 		_ = harness.StopSubjectServer(subServer)
