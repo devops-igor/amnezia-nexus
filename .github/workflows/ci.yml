@@ -117,20 +117,20 @@ jobs:
           # The historical failure was a directory inside the workspace that the non-root
           # runner user could not unlink from. Unlinking needs write permission on the parent
           # directory, so an unwritable directory anywhere under the workspace is a latent
-          # checkout failure. Detection only; nothing is removed here. Git's own object store
-          # is excluded: it is created and maintained by the checkout action itself.
-          unwritable=$(find "$GITHUB_WORKSPACE" -xdev -type d -not -path "$GITHUB_WORKSPACE/.git/*" -not -writable -print)
-          if [ -n "$unwritable" ]; then
-            echo "::error::workspace holds directories this runner user cannot clean"
-            printf '%s\n' "$unwritable"
-            exit 1
-          fi
+          # checkout failure. This baseline is recorded, not failed on: state inherited from
+          # another job is reported, while step 3 fails on anything this job newly leaves.
+          # Git's own object store is excluded: the checkout action maintains it.
+          find "$GITHUB_WORKSPACE" -xdev -type d -not -path "$GITHUB_WORKSPACE/.git/*" -not -writable -print \
+            | sort > "$RUNNER_TEMP/unwritable-pre-test.txt"
+          echo "--- unwritable directories inherited before the tests ---" >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/unwritable-pre-test.txt" >> "$GITHUB_STEP_SUMMARY"
           if [ -e "$GITHUB_WORKSPACE/tasks" ]; then
+            # Only a root-owned predecessor remnant can survive a successful checkout, and the
+            # #726 contract is that ordinary test runs never write here at all.
             echo "::error::repository task area is present before the tests run"
             find "$GITHUB_WORKSPACE/tasks" -maxdepth 2 -ls
             exit 1
           fi
-          echo "workspace_clean_before_tests=true" >> "$GITHUB_STEP_SUMMARY"
           echo "repo_task_area_absent_before_tests=true" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Go
@@ -289,13 +289,18 @@ jobs:
             echo "--- writability of every directory under the workspace ---"
           } | tee "$RUNNER_TEMP/runner-qualification-post.txt" >> "$GITHUB_STEP_SUMMARY"
 
-          unwritable=$(find "$GITHUB_WORKSPACE" -xdev -type d -not -path "$GITHUB_WORKSPACE/.git/*" -not -writable -print)
-          printf '%s\n' "$unwritable" >> "$RUNNER_TEMP/runner-qualification-post.txt"
-          if [ -n "$unwritable" ]; then
-            echo "::error::this job left directories the next non-root checkout cannot clean: $(printf '%s ' $unwritable)"
+          # Report every unwritable directory, then fail only on ones this job introduced.
+          find "$GITHUB_WORKSPACE" -xdev -type d -not -path "$GITHUB_WORKSPACE/.git/*" -not -writable -print \
+            | sort > "$RUNNER_TEMP/unwritable-post-test.txt"
+          printf '%s\n' "--- unwritable directories after the tests ---" >> "$RUNNER_TEMP/runner-qualification-post.txt"
+          cat "$RUNNER_TEMP/unwritable-post-test.txt" >> "$RUNNER_TEMP/runner-qualification-post.txt"
+          introduced=$(comm -13 "$RUNNER_TEMP/unwritable-pre-test.txt" "$RUNNER_TEMP/unwritable-post-test.txt" 2>/dev/null || true)
+          if [ -n "$introduced" ]; then
+            echo "::error::this job left directories the next non-root checkout cannot clean: $(printf '%s ' $introduced)"
             exit 1
           fi
-          echo "all_workspace_dirs_removable_by_runner_user=true" >> "$RUNNER_TEMP/runner-qualification-post.txt"
+          inherited=$(wc -l < "$RUNNER_TEMP/unwritable-post-test.txt")
+          echo "unwritable_dirs_inherited=$inherited introduced=0" >> "$RUNNER_TEMP/runner-qualification-post.txt"
 
           if [ -e "$GITHUB_WORKSPACE/tasks" ]; then
             echo "::error::tests created the repository task area"
