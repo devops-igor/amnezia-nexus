@@ -101,6 +101,18 @@ services:
       - "51820:51820/udp"     # VPN port
     volumes:
       - panel-data:/app/data
+    # The panel runs as a non-root user and carries file capabilities, so these
+    # capabilities must also be in the container's bounding set. Without them the
+    # container cannot even start the binary ("exec: Operation not permitted").
+    cap_add:
+      - NET_ADMIN              # TUN device, iptables rules, kernel settings
+      - NET_RAW                # capture direct-WAN return traffic
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: 1
+      net.ipv4.conf.all.rp_filter: 2
+      net.ipv4.conf.all.accept_local: 1
     environment:
       - PORT=5000
       - DATA_DIR=/app/data
@@ -117,6 +129,12 @@ services:
 
 volumes:
   panel-data:
+```
+
+`NET_ADMIN` alone is not enough: opening the raw packet socket that captures direct-WAN reply traffic requires `NET_RAW`, and the panel reports a missing capability instead of silently routing everything through the proxy. Check a running deployment with:
+
+```bash
+docker compose exec amnezia-panel /app/panel --check-wan-capabilities
 ```
 
 ### 2. Start Nexus
@@ -159,19 +177,44 @@ net.ipv6.conf.all.forwarding = 1
 # Loose reverse path filtering (prevents the kernel from dropping return packets on asymmetric paths)
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
+
+# Accept locally sourced packets after source NAT for direct WAN egress
+net.ipv4.conf.all.accept_local = 1
 EOF
 
 sudo sysctl --system
 ```
 
-Check the setting:
+Check the settings:
 
 ```bash
 sysctl net.ipv4.ip_forward
 # Should return: net.ipv4.ip_forward = 1
+sysctl net.ipv4.conf.all.accept_local
+# Should return: net.ipv4.conf.all.accept_local = 1
 ```
 
-The `rp_filter = 2` setting allows loose reverse-path filtering. Strict filtering can drop legitimate VPN traffic if the return route uses a different interface.
+The `rp_filter = 2` setting allows loose reverse-path filtering. Strict filtering can drop legitimate VPN traffic if the return route uses a different interface. `accept_local = 1` lets the kernel accept the source-NATed packets direct egress injects back into the host stack.
+
+### 1a. Load the TUN module and confirm the device node
+
+Direct WAN egress creates a TUN interface, so the `tun` kernel module must be loaded and `/dev/net/tun` must exist inside the container:
+
+```bash
+sudo modprobe tun
+ls -l /dev/net/tun
+# Should return: crw-rw-rw- 1 root root 10, 200 ... /dev/net/tun
+```
+
+If the node is missing, create it:
+
+```bash
+sudo mkdir -p /dev/net
+sudo mknod /dev/net/tun c 10 200
+sudo chmod 600 /dev/net/tun
+```
+
+The compose example above passes the device through with `devices:`. A deployment that mounts `/dev/net` instead must keep the node writable by the container's `appuser` (uid 1000).
 
 ### 2. Configure the firewall
 

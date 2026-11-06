@@ -35,6 +35,23 @@ func (e *errDevice) writeCount() int {
 	return e.writes
 }
 
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
 // TestPumpClientQueueLogsWriteErrors pins issue #43 visibility requirement:
 // a failed dev.Write on the return leg (client queue -> client device) must
 // be LOGGED (throttled to ~1 line/second like the queue-full drop counters),
@@ -51,7 +68,7 @@ func TestPumpClientQueueLogsWriteErrors(t *testing.T) {
 	f.RegisterSessionWithReturnPath("sess-1", "conn-1", "peer-a", "10.100.0.3", 1, path)
 
 	// Capture the standard logger for the duration of the burst.
-	var buf bytes.Buffer
+	var buf syncBuffer
 	log.SetOutput(&buf)
 	defer log.SetOutput(os.Stderr)
 
@@ -91,7 +108,9 @@ func TestPumpClientQueueLogsWriteErrors(t *testing.T) {
 	// Throttle: a tight burst must produce a bounded number of lines
 	// (~1/sec), not one per packet. Keep feeding until 60 more writes were
 	// attempted (queue-full drops are by-design under bursts); allow up to
-	// 3 lines for a pathologically stalled runner.
+	// 5 lines for a loaded runner where Phase 1's initial emission plus
+	// crossing up to 3 second-boundaries under CPU scheduling allows up to
+	// 4-5 lines for 65 packets.
 	for i := 0; i < 300 && dev.writeCount() < n+60; i++ {
 		_ = f.RouteBackendToClient(1, pkt, "10.100.0.3")
 		time.Sleep(2 * time.Millisecond)
@@ -101,7 +120,7 @@ func TestPumpClientQueueLogsWriteErrors(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	time.Sleep(200 * time.Millisecond)
-	if got := strings.Count(buf.String(), "return-path device write error"); got > 3 {
+	if got := strings.Count(buf.String(), "return-path device write error"); got > 5 {
 		t.Fatalf("write-error logging not throttled: %d lines for %d packets", got, n+60)
 	}
 }

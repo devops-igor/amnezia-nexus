@@ -196,6 +196,14 @@ func (c *RouteCache) Open(scope Scope) (*SessionCache, error) {
 	return s, nil
 }
 
+// Scope returns the authentication scope for this session cache.
+func (s *SessionCache) Scope() Scope {
+	if s == nil {
+		return Scope{}
+	}
+	return s.scope
+}
+
 // Lookup queries the route decision for destination IPv4 under the active policy generation.
 // Reader path is zero-mutex contention: single atomic view load, generation, quarantine, and expiry checks.
 func (s *SessionCache) Lookup(ip netip.Addr, policyGeneration string, now time.Time) Decision {

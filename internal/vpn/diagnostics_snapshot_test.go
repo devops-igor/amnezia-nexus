@@ -232,6 +232,7 @@ func TestGetStatusDoesNotInvertPeerReconciliationLockOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = engine.Stop() })
 	engine.peerSync.portal = &orphanDiagnosticPortal{present: true}
 	entered, release := make(chan struct{}), make(chan struct{})
 	skipRevoke := false
@@ -254,6 +255,11 @@ func TestGetStatusDoesNotInvertPeerReconciliationLockOrder(t *testing.T) {
 	for time.Now().Before(deadline) {
 		stack := make([]byte, 1<<18)
 		n := runtime.Stack(stack, true)
+		// All-goroutine dumps can exceed the initial buffer in the full suite.
+		for n == len(stack) {
+			stack = make([]byte, 2*len(stack))
+			n = runtime.Stack(stack, true)
+		}
 		if bytes.Contains(stack[:n], []byte("(*peerSynchronizer).Status")) {
 			parked = true
 			break

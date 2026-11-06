@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -768,27 +767,11 @@ SoakDone:
 		t.Fatalf("marshal report json: %v", err)
 	}
 
-	repoRoot, err := FindRepoRoot()
-	if err == nil {
-		artifactDir := filepath.Join(repoRoot, "tasks", "issue-392-phase3-soak")
-		_ = os.MkdirAll(artifactDir, 0o755)
-		artifactFile := filepath.Join(artifactDir, fmt.Sprintf("soak_report_%s_%s.json", serverType, runMode))
-		if err := os.WriteFile(artifactFile, reportJSON, 0o600); err != nil {
-			t.Logf("warning: failed to write soak report artifact: %v", err)
-		}
-	}
-	if customDir := os.Getenv("NEXUS_ARTIFACT_DIR"); customDir != "" {
-		if !filepath.IsAbs(customDir) {
-			if repoRoot != "" {
-				customDir = filepath.Join(repoRoot, customDir)
-			}
-		}
-		_ = os.MkdirAll(customDir, 0o755)
-		customFile := filepath.Join(customDir, fmt.Sprintf("soak_report_%s_%s.json", serverType, runMode))
-		if err := os.WriteFile(customFile, reportJSON, 0o600); err != nil {
-			t.Logf("warning: failed to write custom soak report artifact: %v", err)
-		}
-	}
+	// Emit the soak report to this invocation's artifact directory. Ordinary runs must not
+	// write into the repository working tree (see differential_artifacts_test.go); an
+	// explicit NEXUS_ARTIFACT_DIR export still receives the report for qualification.
+	artifactDir := differentialArtifactDir(t)
+	emitDifferentialArtifact(t, artifactDir, fmt.Sprintf("soak_report_%s_%s.json", serverType, runMode), reportJSON)
 
 	return report
 }
