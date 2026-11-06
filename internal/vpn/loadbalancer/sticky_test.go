@@ -533,3 +533,105 @@ func TestStickySessionManager_GetAffinity_PhysicalPruneOnLookup(t *testing.T) {
 		t.Fatalf("expected both maps to be physically empty (0, 0), got (%d, %d)", uCount, pCount)
 	}
 }
+
+func TestStickySessionManager_HandshakeBlocked_PreservesAffinity(t *testing.T) {
+	ctx := context.Background()
+	caps := CapacityConfig{MaxPeersPerBackend: 100, AffinityTTL: 10 * time.Minute}
+	base := NewLeastConnectionsBalancer(caps)
+	sm := NewStickySessionManager(nil, base, caps)
+
+	t1 := &models.BackendTunnel{ID: 1, Enabled: true, Status: models.TunnelStatusHandshakeBlocked, ActiveConnections: 5}
+	t2 := &models.BackendTunnel{ID: 2, Enabled: true, Status: models.TunnelStatusActive, ActiveConnections: 2}
+	tunnels := []*models.BackendTunnel{t1, t2}
+
+	// Peer has existing affinity to tunnel 1 (which is handshake_blocked)
+	sm.AssignPeerAffinity("peer-established", 1)
+
+	// Existing peer request MUST remain pinned to handshake_blocked tunnel 1
+	req1 := &RoutingRequest{
+		PeerPublicKey:    "peer-established",
+		AvailableTunnels: tunnels,
+	}
+	selected, assignedNew, err := sm.GetOrAssignBackend(ctx, req1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if assignedNew {
+		t.Error("expected assignedNew to be false for preserved affinity")
+	}
+	if selected.ID != 1 {
+		t.Errorf("expected peer to stay pinned to tunnel 1, got tunnel %d", selected.ID)
+	}
+
+	// New peer (no affinity) MUST NOT be assigned to handshake_blocked tunnel 1!
+	// FilterHealthy rejects tunnel 1, so base balancer selects active tunnel 2.
+	req2 := &RoutingRequest{
+		PeerPublicKey:    "peer-new",
+		AvailableTunnels: tunnels,
+	}
+	selectedNew, assignedNew2, err := sm.GetOrAssignBackend(ctx, req2)
+	if err != nil {
+		t.Fatalf("unexpected error for new peer: %v", err)
+	}
+	if !assignedNew2 {
+		t.Error("expected assignedNew to be true for new peer")
+	}
+	if selectedNew.ID != 2 {
+		t.Errorf("expected new peer to be assigned to active tunnel 2, got tunnel %d", selectedNew.ID)
+	}
+}
+
+func TestStickySessionManager_HandshakeBlocked_FailoverPreserved(t *testing.T) {
+	ctx := context.Background()
+	caps := CapacityConfig{MaxPeersPerBackend: 100, AffinityTTL: 10 * time.Minute}
+	base := NewLeastConnectionsBalancer(caps)
+	sm := NewStickySessionManager(nil, base, caps)
+
+	t1 := &models.BackendTunnel{ID: 1, Enabled: true, Status: models.TunnelStatusHandshakeBlocked, Protocol: models.ProtocolAWG}
+	t2 := &models.BackendTunnel{ID: 2, Enabled: true, Status: models.TunnelStatusActive, Protocol: models.ProtocolAWG}
+	tunnels := []*models.BackendTunnel{t1, t2}
+
+	sm.AssignPeerAffinity("peer-1", 1)
+	sm.AssignAffinity("user-1", 1)
+
+	// Calling HandleFailover on a handshake_blocked backend MUST NOT evict sessions
+	res, err := sm.HandleFailover(ctx, 1, tunnels, models.ProtocolAWG)
+	if err != nil {
+		t.Fatalf("unexpected error from HandleFailover: %v", err)
+	}
+	if len(res.Migrations) != 0 {
+		t.Errorf("expected 0 migrations for handshake_blocked backend, got %d", len(res.Migrations))
+	}
+	// Verify affinities remain on tunnel 1
+	if aff, ok := sm.GetPeerAffinity("peer-1"); !ok || aff != 1 {
+		t.Errorf("expected peer-1 affinity to stay on tunnel 1, got (%d, %v)", aff, ok)
+	}
+	if aff, ok := sm.GetAffinity("user-1"); !ok || aff != 1 {
+		t.Errorf("expected user-1 affinity to stay on tunnel 1, got (%d, %v)", aff, ok)
+	}
+
+	// Now mark tunnel 1 as disabled and verify failover DOES migrate sessions to active tunnel 2
+	t1.Status = models.TunnelStatusDisabled
+	resDisabled, err := sm.HandleFailover(ctx, 1, tunnels, models.ProtocolAWG)
+	if err != nil {
+		t.Fatalf("unexpected error on disabled failover: %v", err)
+	}
+	if len(resDisabled.Migrations) != 1 || resDisabled.Migrations[0].NewBackendTunnelID != 2 {
+		t.Errorf("expected session to migrate to tunnel 2, got %+v", resDisabled.Migrations)
+	}
+	if aff, ok := sm.GetPeerAffinity("peer-1"); !ok || aff != 2 {
+		t.Errorf("expected peer-1 affinity to migrate to tunnel 2, got (%d, %v)", aff, ok)
+	}
+}
+
+func TestFilterHealthy_ExcludesHandshakeBlocked(t *testing.T) {
+	t1 := &models.BackendTunnel{ID: 1, Enabled: true, Status: models.TunnelStatusHandshakeBlocked}
+	t2 := &models.BackendTunnel{ID: 2, Enabled: true, Status: models.TunnelStatusActive}
+	t3 := &models.BackendTunnel{ID: 3, Enabled: true, Status: models.TunnelStatusDisabled}
+	t4 := &models.BackendTunnel{ID: 4, Enabled: false, Status: models.TunnelStatusActive}
+
+	filtered := FilterHealthy([]*models.BackendTunnel{t1, t2, t3, t4}, 0)
+	if len(filtered) != 1 || filtered[0].ID != 2 {
+		t.Fatalf("expected only active enabled tunnel 2, got %+v", filtered)
+	}
+}

@@ -37,7 +37,11 @@ type HealthConfig struct {
 	SelfHealingInterval  time.Duration
 	SelfHealingThreshold int
 	DisableSelfHealing   bool
+	SubnetCIDR           string
 }
+
+// HealthProberConfig is an alias for HealthConfig.
+type HealthProberConfig = HealthConfig
 
 // DefaultHealthConfig returns standard default prober settings.
 func DefaultHealthConfig() HealthConfig {
@@ -53,6 +57,7 @@ func DefaultHealthConfig() HealthConfig {
 		SelfHealingInterval:  1 * time.Minute,
 		SelfHealingThreshold: 2,
 		DisableSelfHealing:   false,
+		SubnetCIDR:           "10.100.0.0/16",
 	}
 }
 
@@ -65,10 +70,16 @@ type HealthProber struct {
 	probeFn              ProbeFunc
 	probeVLESSFn         VLESSProbeFunc
 	probeNaiveFn         NaiveProbeFunc
+	probeCanaryFn        CanaryProbeFunc
+	deviceProvider       func(tunnelID int64) PacketDevice
+	devices              map[int64]PacketDevice
 	multiProtocolEnabled bool
 	onActiveHook         func(ctx context.Context, tunnel *models.BackendTunnel) error
 	onSelfHealHook       func(ctx context.Context, tunnel *models.BackendTunnel) error
 	failCounts           map[int64]int
+	canaryFailCounts     map[int64]int
+	canarySequence       uint64
+	canaryResults        map[int64]canaryResult
 	autoDisabled         map[int64]bool
 	successCounts        map[int64]int
 	// Counter maps use server IDs for the public diagnostics API. This fence
@@ -77,9 +88,17 @@ type HealthProber struct {
 	preStatusCommitHook  func() // test synchronization, after the identity check
 	preFailureCommitHook func() // test synchronization, after the identity check
 	preActiveHookHook    func() // test synchronization, before executeActiveHook
-	stopCh               chan struct{}
-	wg                   sync.WaitGroup
-	running              bool
+	// healthDisabledNotifier carries the terminal health auto-disable to the
+	// data plane owner so established sessions pinned to the backend move off
+	// it. Nil means "status only", the historical behavior.
+	healthDisabledNotifier func(ctx context.Context, tunnel *models.BackendTunnel) error
+	// selfHealFailoverRetrier settles an automatic failover that could not
+	// complete when it was first attempted (F16). Invoked by the bounded
+	// self-healing sweep, never by the probe hot path.
+	selfHealFailoverRetrier func(ctx context.Context) int
+	stopCh                  chan struct{}
+	wg                      sync.WaitGroup
+	running                 bool
 }
 
 // NewHealthProber initializes a new HealthProber instance.
@@ -114,6 +133,9 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 	if cfg.SelfHealingThreshold <= 0 {
 		cfg.SelfHealingThreshold = 2
 	}
+	if cfg.SubnetCIDR == "" {
+		cfg.SubnetCIDR = "10.100.0.0/16"
+	}
 
 	pFn := health.ProbeAWGEndpointRange
 	if len(probeFn) > 0 && probeFn[0] != nil {
@@ -127,7 +149,9 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 		probeFn:           pFn,
 		probeVLESSFn:      vless.ProbeVLESSReality,
 		probeNaiveFn:      naive.ProbeNaiveProxy,
+		devices:           make(map[int64]PacketDevice),
 		failCounts:        make(map[int64]int),
+		canaryFailCounts:  make(map[int64]int),
 		autoDisabled:      make(map[int64]bool),
 		successCounts:     make(map[int64]int),
 		healthGenerations: make(map[int64]int64),
@@ -178,6 +202,8 @@ func (hp *HealthProber) ResetFailCount(serverID int64) {
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
 	hp.failCounts[serverID] = 0
+	delete(hp.canaryFailCounts, serverID)
+	delete(hp.canaryResults, serverID)
 	delete(hp.autoDisabled, serverID)
 	delete(hp.successCounts, serverID)
 	hp.recordCurrentGenerationLocked(serverID)
@@ -192,6 +218,20 @@ func (hp *HealthProber) GetFailCount(serverID int64) int {
 	hp.mu.RLock()
 	defer hp.mu.RUnlock()
 	return hp.failCounts[serverID]
+}
+
+// GetCanaryFailCount returns the consecutive data-plane canary failure count for the given server ID.
+// Nil-receiver safe.
+func (hp *HealthProber) GetCanaryFailCount(serverID int64) int {
+	if hp == nil {
+		return 0
+	}
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	if hp.canaryFailCounts == nil {
+		return 0
+	}
+	return hp.canaryFailCounts[serverID]
 }
 
 // recordCurrentGenerationLocked associates server-level state with the pool's
@@ -353,21 +393,29 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		return 0, err
 	}
 
+	// Issue #713: Before promoting ANY backend to active (whether recovering from
+	// handshake_blocked, connecting, or degraded), verify real data-plane transit via inner canary.
+	isBlocked := (snapshot != nil && snapshot.Status == models.TunnelStatusHandshakeBlocked) ||
+		probeTarget.Status == models.TunnelStatusHandshakeBlocked
+
 	status := "active"
 	if latencyMS > hp.cfg.LatencyThresholdMS {
 		status = "degraded"
 	}
 
-	// If transitioning to active, verify data-plane readiness via hook
 	if status == "active" {
-		hp.mu.RLock()
-		preActiveHook := hp.preActiveHookHook
-		hp.mu.RUnlock()
-		if preActiveHook != nil {
-			preActiveHook()
+		if err := hp.runActiveHookIfActive(ctx, snapshot, &probeTarget, status); err != nil {
+			return 0, err
 		}
-		if _, hookErr := hp.executeActiveHook(ctx, snapshot, &probeTarget); hookErr != nil {
-			return 0, hookErr
+	}
+
+	if status == "active" || isBlocked {
+		eligible, elErr := hp.verifyActiveEligibility(ctx, snapshot, &probeTarget, isBlocked)
+		if elErr != nil {
+			return 0, elErr
+		}
+		if !eligible {
+			return latencyMS, nil
 		}
 	}
 
@@ -379,30 +427,89 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		hp.preStatusCommitHook()
 	}
 
+	if err := hp.commitActiveProbeSuccess(ctx, snapshot, &probeTarget, status, latencyMS); err != nil {
+		return 0, err
+	}
+
+	return latencyMS, nil
+}
+
+func (hp *HealthProber) commitActiveProbeSuccess(ctx context.Context, snapshot, probeTarget *models.BackendTunnel, status string, latencyMS int64) error {
 	if hp.pool != nil {
 		expectedVersion := probeTarget.StateVersion
 		if snapshot != nil && snapshot.StateVersion > 0 {
 			expectedVersion = snapshot.StateVersion
 		}
 		if err := hp.pool.SetTunnelStatusIfCurrentWithVersion(ctx, probeTarget.ServerID, probeTarget.ID, expectedVersion, status, latencyMS); err != nil {
-			return 0, err
+			return err
 		}
 		probeTarget.StateVersion = expectedVersion + 1
 	}
-	if err := hp.checkTunnelAvailable(&probeTarget); err != nil {
-		return 0, err
+	if err := hp.checkTunnelAvailable(probeTarget); err != nil {
+		return err
 	}
 	hp.mu.Lock()
-	if err := hp.checkHealthGenerationLocked(&probeTarget); err != nil {
+	if err := hp.checkHealthGenerationLocked(probeTarget); err != nil {
 		hp.mu.Unlock()
-		return 0, err
+		return err
 	}
 	hp.failCounts[probeTarget.ServerID] = 0
+
 	delete(hp.autoDisabled, probeTarget.ServerID)
 	delete(hp.successCounts, probeTarget.ServerID)
 	hp.mu.Unlock()
+	return nil
+}
 
-	return latencyMS, nil
+// verifyActiveEligibility verifies that the inner data plane is functional before promoting
+// or restoring a tunnel to active status.
+func (hp *HealthProber) verifyActiveEligibility(ctx context.Context, snapshot, probeTarget *models.BackendTunnel, isBlocked bool) (bool, error) {
+	if hp.hasCanaryProber(probeTarget) {
+		if canaryErr := hp.probeCanary(ctx, probeTarget); canaryErr != nil {
+			if isObsoleteCanary(canaryErr) {
+				return false, canaryErr
+			}
+			slog.Warn("Backend tunnel outer probe succeeded but inner canary failed; denying active promotion",
+				"tunnel_id", probeTarget.ID, "server_id", probeTarget.ServerID, "status", probeTarget.Status, "err", canaryErr)
+			failures := hp.GetCanaryFailCount(probeTarget.ServerID)
+
+			if failures >= hp.cfg.FailureThreshold {
+				return false, hp.transitionToThresholdDisabled(ctx, snapshot)
+			}
+			hasActiveSessions := (snapshot != nil && snapshot.ActiveConnections > 0) ||
+				(probeTarget != nil && probeTarget.ActiveConnections > 0)
+			if hp.pool != nil {
+				if cur, err := hp.pool.GetTunnel(probeTarget.ServerID); err == nil && cur != nil && cur.ActiveConnections > 0 {
+					hasActiveSessions = true
+				}
+			}
+			if hasActiveSessions {
+				return false, hp.transitionToHandshakeBlocked(ctx, snapshot)
+			}
+			return false, hp.transitionToDegraded(ctx, snapshot)
+		}
+		return true, nil
+	}
+
+	if isBlocked {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func (hp *HealthProber) runActiveHookIfActive(ctx context.Context, snapshot, probeTarget *models.BackendTunnel, status string) error {
+	if status != "active" {
+		return nil
+	}
+	hp.mu.RLock()
+	preActiveHook := hp.preActiveHookHook
+	hp.mu.RUnlock()
+	if preActiveHook != nil {
+		preActiveHook()
+	}
+	_, err := hp.executeActiveHook(ctx, snapshot, probeTarget)
+	return err
 }
 
 func (hp *HealthProber) executeActiveHook(ctx context.Context, snapshot, tunnel *models.BackendTunnel) (int64, error) {
@@ -463,6 +570,10 @@ func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serve
 		})
 	}
 
+	if currentTunnel.Status == models.TunnelStatusHandshakeBlocked {
+		return true, nil
+	}
+
 	if currentTunnel.Status == models.TunnelStatusDisabled && currentTunnel.DisableReason == models.DisableReasonHealth {
 		if err := hp.updateHealthIfCurrent(currentTunnel, func() {
 			hp.autoDisabled[serverID] = true
@@ -502,10 +613,11 @@ func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serve
 	}
 	if swapped {
 		currentTunnel.StateVersion++
-		if err := hp.updateHealthIfCurrent(currentTunnel, func() {
-			hp.autoDisabled[serverID] = true
-			hp.successCounts[serverID] = 0
-		}); err != nil {
+		// This reconciliation IS the terminal health-disable commit for a
+		// sibling probe whose own CAS missed, so it owns the failover
+		// notification. The "already disabled/health" branch below does not:
+		// whoever committed that transition already notified.
+		if err := hp.commitThresholdDisable(ctx, currentTunnel); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -557,96 +669,151 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 	failures := hp.failCounts[snapshot.ServerID]
 	hp.mu.Unlock()
 
-	if failures >= hp.cfg.FailureThreshold {
-		if hp.pool != nil {
-			swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
-				ctx,
-				snapshot.ServerID,
-				snapshot.ID,
-				snapshot.Status,
-				snapshot.DisableReason,
-				snapshot.StateVersion,
-				"disabled",
-				models.DisableReasonHealth,
-				0,
-			)
-			if casErr != nil {
-				return 0, casErr
-			}
-			if swapped {
-				snapshot.StateVersion++
-				if err := hp.updateHealthIfCurrent(snapshot, func() {
-					hp.autoDisabled[snapshot.ServerID] = true
-					hp.successCounts[snapshot.ServerID] = 0
-				}); err != nil {
-					return 0, err
-				}
-			} else {
-				reconciled, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID, snapshot.ID)
-				if recErr != nil {
-					return 0, recErr
-				}
-				if !reconciled {
-					hp.mu.Lock()
-					if hp.failCounts[snapshot.ServerID] > 0 {
-						hp.failCounts[snapshot.ServerID]--
-					}
-					hp.mu.Unlock()
-				}
-			}
-		} else {
-			if err := hp.updateHealthIfCurrent(snapshot, func() {
-				hp.autoDisabled[snapshot.ServerID] = true
-				hp.successCounts[snapshot.ServerID] = 0
-			}); err != nil {
-				return 0, err
-			}
-		}
-	} else if hp.pool != nil {
-		if snapshot.Status != "degraded" {
-			swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
-				ctx,
-				snapshot.ServerID,
-				snapshot.ID,
-				snapshot.Status,
-				snapshot.DisableReason,
-				snapshot.StateVersion,
-				"degraded",
-				snapshot.DisableReason,
-				0,
-			)
-			if casErr != nil {
-				return 0, casErr
-			}
-			if !swapped {
-				slog.Debug("probe degraded CAS missed due to concurrent tunnel update",
-					"server_id", snapshot.ServerID,
-					"expected_status", snapshot.Status,
-					"expected_version", snapshot.StateVersion,
-				)
-				hp.mu.Lock()
-				if hp.failCounts[snapshot.ServerID] > 0 {
-					hp.failCounts[snapshot.ServerID]--
-				}
-				hp.mu.Unlock()
-				if hp.isTunnelAdminDisabled(snapshot.ServerID) {
-					if err := hp.updateHealthIfCurrent(snapshot, func() {
-						hp.failCounts[snapshot.ServerID] = 0
-						delete(hp.autoDisabled, snapshot.ServerID)
-					}); err != nil {
-						return 0, err
-					}
-				}
-			} else {
-				snapshot.StateVersion++
-			}
-		}
+	if err := hp.confirmOuterFailure(ctx, snapshot, failures); err != nil {
+		return 0, err
 	}
 	if err := hp.checkTunnelAvailable(snapshot); errors.Is(err, ErrTunnelNotFound) {
 		return 0, err
 	}
 
 	return 0, probeErr
+}
+
+func (hp *HealthProber) transitionToHandshakeBlocked(ctx context.Context, snapshot *models.BackendTunnel) error {
+	if hp.pool != nil {
+		swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
+			ctx,
+			snapshot.ServerID,
+			snapshot.ID,
+			snapshot.Status,
+			snapshot.DisableReason,
+			snapshot.StateVersion,
+			models.TunnelStatusHandshakeBlocked,
+			models.DisableReasonNone,
+			0,
+		)
+		if casErr != nil {
+			return casErr
+		}
+		if swapped {
+			snapshot.StateVersion++
+			snapshot.Status = models.TunnelStatusHandshakeBlocked
+			snapshot.DisableReason = models.DisableReasonNone
+			return hp.updateHealthIfCurrent(snapshot, func() {
+				delete(hp.autoDisabled, snapshot.ServerID)
+				hp.successCounts[snapshot.ServerID] = 0
+			})
+		}
+		cur, err := hp.pool.GetTunnel(snapshot.ServerID)
+		if err == nil && cur != nil && cur.Status == models.TunnelStatusHandshakeBlocked {
+			snapshot.StateVersion = cur.StateVersion
+			snapshot.Status = cur.Status
+			snapshot.DisableReason = cur.DisableReason
+		}
+		return nil
+	}
+	snapshot.Status = models.TunnelStatusHandshakeBlocked
+	snapshot.DisableReason = models.DisableReasonNone
+	return hp.updateHealthIfCurrent(snapshot, func() {
+		delete(hp.autoDisabled, snapshot.ServerID)
+		hp.successCounts[snapshot.ServerID] = 0
+	})
+}
+
+// commitThresholdDisable records the consecutive-failure bookkeeping for a
+// committed health auto-disable and, only when that write is accepted for the
+// current tunnel generation, reports the disable to the data plane owner so it
+// can migrate the sessions still pinned to the backend. A rejected write means
+// a newer generation owns this backend, so there is nothing to report.
+func (hp *HealthProber) commitThresholdDisable(ctx context.Context, snapshot *models.BackendTunnel) error {
+	if err := hp.updateHealthIfCurrent(snapshot, func() {
+		hp.autoDisabled[snapshot.ServerID] = true
+		hp.successCounts[snapshot.ServerID] = 0
+	}); err != nil {
+		return err
+	}
+	hp.notifyHealthDisabled(ctx, snapshot.ServerID, snapshot.ID)
+	return nil
+}
+
+func (hp *HealthProber) transitionToThresholdDisabled(ctx context.Context, snapshot *models.BackendTunnel) error {
+	if hp.pool != nil {
+		swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
+			ctx,
+			snapshot.ServerID,
+			snapshot.ID,
+			snapshot.Status,
+			snapshot.DisableReason,
+			snapshot.StateVersion,
+			models.TunnelStatusDisabled,
+			models.DisableReasonHealth,
+			0,
+		)
+		if casErr != nil {
+			return casErr
+		}
+		if swapped {
+			snapshot.StateVersion++
+			snapshot.Status = models.TunnelStatusDisabled
+			snapshot.DisableReason = models.DisableReasonHealth
+			// Terminal health disable committed: hand the established sessions
+			// pinned to this backend to the data plane owner so it can migrate
+			// them. Runs outside hp.mu/pool.mu and is idempotent.
+			return hp.commitThresholdDisable(ctx, snapshot)
+		}
+		reconciled, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID, snapshot.ID)
+		if recErr != nil {
+			return recErr
+		}
+		if !reconciled {
+			hp.mu.Lock()
+			if hp.failCounts[snapshot.ServerID] > 0 {
+				hp.failCounts[snapshot.ServerID]--
+			}
+			hp.mu.Unlock()
+		}
+		return nil
+	}
+	snapshot.Status = models.TunnelStatusDisabled
+	snapshot.DisableReason = models.DisableReasonHealth
+	return hp.updateHealthIfCurrent(snapshot, func() {
+		hp.autoDisabled[snapshot.ServerID] = true
+		hp.successCounts[snapshot.ServerID] = 0
+	})
+}
+
+func (hp *HealthProber) transitionToDegraded(ctx context.Context, snapshot *models.BackendTunnel) error {
+	if snapshot.Status == "degraded" {
+		return nil
+	}
+	if hp.pool != nil {
+		swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
+			ctx, snapshot.ServerID, snapshot.ID, snapshot.Status, snapshot.DisableReason, snapshot.StateVersion, "degraded", snapshot.DisableReason, 0)
+		if casErr != nil {
+			return casErr
+		}
+		if !swapped {
+			slog.Debug("probe degraded CAS missed due to concurrent tunnel update",
+				"server_id", snapshot.ServerID, "expected_status", snapshot.Status, "expected_version", snapshot.StateVersion)
+			hp.mu.Lock()
+			if hp.failCounts[snapshot.ServerID] > 0 {
+				hp.failCounts[snapshot.ServerID]--
+			}
+			hp.mu.Unlock()
+			if hp.isTunnelAdminDisabled(snapshot.ServerID) {
+				return hp.updateHealthIfCurrent(snapshot, func() {
+					hp.failCounts[snapshot.ServerID] = 0
+					delete(hp.autoDisabled, snapshot.ServerID)
+				})
+			}
+			return nil
+		}
+		snapshot.StateVersion++
+	}
+	snapshot.Status = "degraded"
+	return hp.updateHealthIfCurrent(snapshot, func() {
+		hp.successCounts[snapshot.ServerID] = 0
+	})
 }
 
 func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.BackendTunnel, hookErr error) (int64, error) {
@@ -685,10 +852,7 @@ func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.
 			}
 			if swapped {
 				snapshot.StateVersion++
-				if err := hp.updateHealthIfCurrent(snapshot, func() {
-					hp.autoDisabled[snapshot.ServerID] = true
-					hp.successCounts[snapshot.ServerID] = 0
-				}); err != nil {
+				if err := hp.commitThresholdDisable(ctx, snapshot); err != nil {
 					return 0, err
 				}
 			} else {
