@@ -42,6 +42,24 @@ func (s *Service) SetProbeFunc(fn tunnel.ProbeFunc) {
 	}
 }
 
+// SetProxyProbeFuncsForTest configures the protocol health probe test fixtures.
+func (s *Service) SetProxyProbeFuncsForTest(vless tunnel.VLESSProbeFunc, naive tunnel.NaiveProbeFunc) {
+	if s.prober == nil {
+		return
+	}
+	s.prober.SetVLESSProbeFunc(vless)
+	s.prober.SetNaiveProbeFunc(naive)
+}
+
+// SetProxyTrafficProbeFuncForTest configures the proxy application-traffic
+// qualification fixture used to verify the enrollment lifecycle.
+func (s *Service) SetProxyTrafficProbeFuncForTest(fn tunnel.ProxyTrafficProbeFunc) {
+	if s.prober == nil {
+		return
+	}
+	s.prober.SetProxyTrafficProbeFunc(fn)
+}
+
 // SetBackendDeviceForTest sets a backend device for testing.
 func (s *Service) SetBackendDeviceForTest(tunID int64, dev BackendDevice) {
 	s.mu.Lock()

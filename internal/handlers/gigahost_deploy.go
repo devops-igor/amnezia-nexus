@@ -412,13 +412,22 @@ func (h *Handlers) enableDeployBackend(
 		if err != nil {
 			return fmt.Errorf("failed to provision proxy client credentials: %w", err)
 		}
+		h.vpnSvc.SetPendingEnrollment(server.ID, true)
 		opts := []tunnel.BackendTunnelOptions{
 			{
 				Protocol:       normProto,
 				ProtocolParams: params,
 			},
 		}
-		return h.vpnSvc.EnableBackendWithConfig(ctx, server.ID, opts...)
+		if err := h.vpnSvc.EnableBackendWithConfig(ctx, server.ID, opts...); err != nil {
+			h.vpnSvc.SetPendingEnrollment(server.ID, false)
+			return err
+		}
+		// Finding F10: proxies share the durable enrollment marker with AWG but
+		// previously had no terminal finalizer, so a proxy was reported ready
+		// while still durably quarantined. Qualify with a real authenticated
+		// application exchange before reporting ready.
+		return h.qualifyProxyBackendTraffic(ctx, server, normProto)
 	}
 
 	if h.vpnSvc != nil {

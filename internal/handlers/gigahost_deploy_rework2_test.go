@@ -124,6 +124,12 @@ func TestRework2_FreshProxyHostBootstrapsDocker(t *testing.T) {
 	for _, proto := range []string{models.ProtocolVLESS, models.ProtocolNaive} {
 		t.Run(proto, func(t *testing.T) {
 			h, _, _ := setupDeployTestEnv(t)
+			// Onboarding now requires an authenticated application traffic
+			// qualification before ready; this test targets Docker bootstrap
+			// (F5), so supply the network outcome rather than assert it.
+			h.vpnSvc.SetProxyTrafficProbeFuncForTest(
+				func(context.Context, *models.BackendTunnel) (int64, error) { return 5, nil },
+			)
 			dockerInstalled := false
 			client := &testMockSSHClient{
 				fileExistsFn: func(ctx context.Context, path string) (bool, error) {

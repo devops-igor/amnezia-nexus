@@ -234,6 +234,11 @@ func TestGigahostDeploy_Success_AWG(t *testing.T) {
 func TestGigahostDeploy_Success_VLESS(t *testing.T) {
 	h, _, mockClient := setupDeployTestEnv(t)
 	ctx := context.Background()
+	// A proxy is only reported ready after an authenticated application
+	// traffic qualification succeeds; supply that network outcome.
+	h.vpnSvc.SetProxyTrafficProbeFuncForTest(
+		func(context.Context, *models.BackendTunnel) (int64, error) { return 5, nil },
+	)
 
 	mockClient.getDeployStatusFn = func(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error) {
 		return &gigahost.DeployStatusResponse{
@@ -277,6 +282,11 @@ func TestGigahostDeploy_Success_VLESS(t *testing.T) {
 func TestGigahostDeploy_Success_Naive(t *testing.T) {
 	h, _, mockClient := setupDeployTestEnv(t)
 	ctx := context.Background()
+	// A proxy is only reported ready after an authenticated application
+	// traffic qualification succeeds; supply that network outcome.
+	h.vpnSvc.SetProxyTrafficProbeFuncForTest(
+		func(context.Context, *models.BackendTunnel) (int64, error) { return 5, nil },
+	)
 
 	mockClient.getDeployStatusFn = func(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error) {
 		return &gigahost.DeployStatusResponse{

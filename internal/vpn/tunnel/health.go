@@ -82,6 +82,7 @@ type HealthProber struct {
 	wg                   sync.WaitGroup
 	running              bool
 	probeCanaryFn        CanaryProbeFunc
+	proxyTrafficProbeFn  ProxyTrafficProbeFunc
 	devices              map[int64]PacketDevice
 	deviceProvider       func(tunnelID int64) PacketDevice
 	subnetProvider       func() string

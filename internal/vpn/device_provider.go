@@ -69,11 +69,17 @@ func (s *Service) PromoteQualifiedTunnel(ctx context.Context, serverID int64, la
 	if s == nil || s.pool == nil {
 		return errors.New("vpn service or pool not initialized")
 	}
-	if s.prober != nil {
-		defer s.prober.SetPendingEnrollment(serverID, false)
-	}
 	targetStatus := s.targetStatusForLatency(latencyMS)
-	return s.commitPromoteWithRetry(ctx, serverID, targetStatus, latencyMS)
+	if err := s.commitPromoteWithRetry(ctx, serverID, targetStatus, latencyMS); err != nil {
+		return err
+	}
+	// commitPromoteWithRetry releases the durable marker atomically with the
+	// status commit (finding F10). Only the in-memory prober map still needs
+	// clearing, and only after the durable release actually succeeded.
+	if s.prober != nil {
+		s.prober.SetPendingEnrollment(serverID, false)
+	}
+	return nil
 }
 
 func (s *Service) targetStatusForLatency(latencyMS int64) string {
@@ -96,7 +102,10 @@ func (s *Service) commitPromoteWithRetry(ctx context.Context, serverID int64, ta
 		if !tun.Enabled {
 			return errors.New("cannot promote disabled tunnel")
 		}
-		err = s.pool.SetTunnelStatusIfCurrentWithVersion(ctx, serverID, tun.ID, tun.StateVersion, targetStatus, latencyMS)
+		// Finding F10: the qualification verdict and the durable enrollment
+		// release commit in one transaction, so no crash can leave a qualified
+		// backend still marked unqualified.
+		err = s.pool.PromoteTunnelWithEnrollmentRelease(ctx, serverID, tun.ID, tun.StateVersion, targetStatus, latencyMS)
 		if err == nil {
 			return nil
 		}
@@ -113,6 +122,16 @@ func (s *Service) SetPendingEnrollment(serverID int64, pending bool) {
 		return
 	}
 	s.prober.SetPendingEnrollment(serverID, pending)
+}
+
+// QualifyProxyTraffic performs the protocol-appropriate authenticated
+// application request/reply that must succeed before a proxy backend is admitted.
+// Finding F10: this is the terminal qualification VLESS/Naive enrollment lacked.
+func (s *Service) QualifyProxyTraffic(ctx context.Context, t *models.BackendTunnel) (int64, error) {
+	if s == nil || s.prober == nil {
+		return 0, errors.New("health prober not initialized")
+	}
+	return s.prober.QualifyProxyTraffic(ctx, t)
 }
 
 // SetCanaryProbeFunc configures a custom canary probe function on the health prober for testing.
