@@ -9,6 +9,9 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -16,13 +19,25 @@ concurrency:
 env:
   GOFLAGS: -tags=with_utls
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   lint-and-security:
     name: Lint & Security Audit
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, container-vm]
+    container:
+      image: localhost:5000/nexus-ci-job:latest
+      options: --cpus 4 --memory 6g
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Trust this job workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -41,68 +56,107 @@ jobs:
       # the runner's Go 1.26, matching local dev (v1.64.8 built go1.26.6).
       - name: Build golangci-lint from source
         run: |
-          go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+          if ! test -x /usr/local/bin/golangci-lint || ! go version -m "/usr/local/bin/golangci-lint" | grep -Eq "^[[:space:]]*mod[[:space:]]+github\.com/golangci/golangci-lint[[:space:]]+v1\.64\.8([[:space:]]|$)" || ! go version -m "/usr/local/bin/golangci-lint" | grep -Fxq "/usr/local/bin/golangci-lint: $(go env GOVERSION)"; then
+            tool_dir=$(mktemp -d)
+            GOBIN="$tool_dir" go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+            sudo install -m 0755 "$tool_dir/golangci-lint" /usr/local/bin/golangci-lint
+            rm -rf "$tool_dir"
+          fi
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run golangci-lint
-        run: golangci-lint run --timeout=5m ./...
+        run: /usr/local/bin/golangci-lint run --timeout=5m ./...
 
       - name: Install Security Scanners
         run: |
-          go install github.com/securego/gosec/v2/cmd/gosec@latest
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          if ! test -x /usr/local/bin/gosec || ! go version -m "/usr/local/bin/gosec" | grep -Eq "^[[:space:]]*mod[[:space:]]+github\.com/securego/gosec/v2[[:space:]]+v2\.30\.0([[:space:]]|$)" || ! go version -m "/usr/local/bin/gosec" | grep -Fxq "/usr/local/bin/gosec: $(go env GOVERSION)"; then
+            tool_dir=$(mktemp -d)
+            GOBIN="$tool_dir" go install github.com/securego/gosec/v2/cmd/gosec@v2.30.0
+            sudo install -m 0755 "$tool_dir/gosec" /usr/local/bin/gosec
+            rm -rf "$tool_dir"
+          fi
+          if ! test -x /usr/local/bin/govulncheck || ! go version -m "/usr/local/bin/govulncheck" | grep -Eq "^[[:space:]]*mod[[:space:]]+golang\.org/x/vuln[[:space:]]+v1\.9\.0([[:space:]]|$)" || ! go version -m "/usr/local/bin/govulncheck" | grep -Fxq "/usr/local/bin/govulncheck: $(go env GOVERSION)"; then
+            tool_dir=$(mktemp -d)
+            GOBIN="$tool_dir" go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+            sudo install -m 0755 "$tool_dir/govulncheck" /usr/local/bin/govulncheck
+            rm -rf "$tool_dir"
+          fi
 
       - name: Run gosec Security Scanner
-        run: gosec -tags with_utls -quiet ./...
+        run: /usr/local/bin/gosec -tags with_utls -quiet ./...
 
       - name: Run govulncheck Vulnerability Scanner
-        run: govulncheck ./...
+        run: /usr/local/bin/govulncheck ./...
 
   test:
     name: Automated Test Suite
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, container-vm]
     timeout-minutes: 20
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
-          cache: true
+          cache: false
 
       - name: Set up Node.js for JSDOM Integration Tests
         uses: actions/setup-node@v7
         with:
           node-version: '20'
 
-      - name: Install Pinned jsdom
+      - name: Run setup and tests in the job image
         run: |
+          # Match guest paths and loopback so sibling Docker fixtures see test files/services.
+          # The socket and /tmp belong to the isolated guest, never the physical host.
+          docker run --rm -i --user 0:0 --network host --cpus 6 --memory 10g \
+            --cap-add NET_ADMIN --cap-add SYS_ADMIN --security-opt apparmor=unconfined --device /dev/net/tun \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            --volume /tmp:/tmp \
+            --volume "$RUNNER_TOOL_CACHE:$RUNNER_TOOL_CACHE:ro" \
+            --workdir "$GITHUB_WORKSPACE" \
+            --env https_proxy --env HTTPS_PROXY --env no_proxy --env NO_PROXY \
+            --env GITHUB_WORKSPACE --env GOFLAGS \
+            --env GOROOT="$(go env GOROOT)" \
+            --env NODE_BIN="$(dirname "$(command -v node)")" \
+            localhost:5000/nexus-ci-job:latest bash -seuo pipefail <<'SCRIPT'
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          job_tmp=$(mktemp -d /tmp/nexus-tests.XXXXXX)
+          trap 'rm -rf "$job_tmp"' EXIT
+          # Never reuse /github/home caches: stale modules can lose sqlite vtab build tags.
+          export GOPATH="$job_tmp/go" GOMODCACHE="$job_tmp/mod" GOCACHE="$job_tmp/cache"
+          export npm_config_prefix="$job_tmp/npm"
+          export PATH="$GOROOT/bin:$NODE_BIN:$GOPATH/bin:$npm_config_prefix/bin:$PATH"
+          export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+          export SSL_CERT_DIR=/etc/ssl/certs
+          node --version
           npm install -g jsdom@29.1.1
-          echo "NODE_PATH=$(npm root -g)" >> "$GITHUB_ENV"
+          export NODE_PATH="$(npm root -g)"
 
-      - name: Build Caddy with forwardproxy for Naive Smoke Tests
-        run: |
           go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
-          xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$(go env GOPATH)/bin/caddy"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$GOPATH/bin/xcaddy" build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$GOPATH/bin/caddy"
 
-      - name: Install musl libc and Alpine libgcc for Native NaiveProxy Tests
-        run: |
-          sudo apt-get update && sudo apt-get install -y musl
-          mkdir -p /tmp/musl-lib
-          docker run --rm -v /tmp/musl-lib:/out alpine:3.20 sh -c "apk add --no-cache libgcc && cp /usr/lib/libgcc_s.so.1 /out/"
-          sudo cp /tmp/musl-lib/libgcc_s.so.1 /usr/lib/x86_64-linux-musl/libgcc_s.so.1
+          apt-get update && apt-get install -y musl
+          (
+            alpine_container=$(docker create alpine:3.20 sh -c "apk add --no-cache libgcc")
+            trap 'docker rm -f "$alpine_container" >/dev/null' EXIT
+            docker start -a "$alpine_container"
+            test "$(docker inspect -f '{{.State.ExitCode}}' "$alpine_container")" = 0
+            docker cp "$alpine_container:/usr/lib/libgcc_s.so.1" "$job_tmp/libgcc_s.so.1"
+          )
+          cp "$job_tmp/libgcc_s.so.1" /usr/lib/x86_64-linux-musl/libgcc_s.so.1
 
-      - name: Run Tests with Race Detector
-        run: go test -race -cover -count=1 -coverprofile=coverage.out ./...
-
-      - name: Run Authentic Native Caddy Integration Tests
-        run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
-
-      - name: Run Vision Tests (non-race)
-        run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
+          go test -p 2 -race -cover -count=1 -coverprofile=coverage.out ./...
+          go test -v -tags with_utls -race -run TestLinuxE2E ./internal/vpn/forwarder/...
+          go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
+          go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
+          SCRIPT
 
       - name: Upload Test Coverage
         uses: actions/upload-artifact@v7
@@ -114,7 +168,10 @@ jobs:
 
   build-matrix:
     name: Cross-Compile Matrix (${{ matrix.target.os }}/${{ matrix.target.arch }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, container-vm]
+    container:
+      image: localhost:5000/nexus-ci-job:latest
+      options: --cpus 4 --memory 6g
     strategy:
       fail-fast: false
       matrix:
@@ -124,6 +181,11 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Trust this job workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Set up Go
         uses: actions/setup-go@v7

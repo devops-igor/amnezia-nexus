@@ -130,11 +130,15 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 				delete(f.routesByIP, old.assignedIP)
 			}
 		}
+		if f.directEgress != nil {
+			f.directEgress.PurgePeer(peerKey)
+		}
 	}
 	// Keep the registration count for diagnostics. Route retirement itself
 	// uses the session ID, because rekeys replace routes without a matching
 	// unregister call for each replaced session.
 	f.peerRegs[peerKey]++
+	route.generation = f.peerRegs[peerKey]
 
 	f.routesByPeer[peerKey] = route
 	f.changeQueueCapacityLocked(cap(route.clientQueue))
@@ -229,6 +233,9 @@ func (f *Forwarder) beginUnregisterSession(peerKey, sessionID string) (retiremen
 		f.stopRoutePumpLocked(route)
 		f.drainRouteQueueLocked(route)
 		f.changeQueueCapacityLocked(-cap(route.clientQueue))
+		if f.directEgress != nil {
+			f.directEgress.PurgePeer(peerKey)
+		}
 	}
 	return retirement
 }
@@ -269,6 +276,9 @@ func (f *Forwarder) retireRoutesMatchingLocked(predicate func(*sessionRoute) boo
 		f.stopRoutePumpLocked(route)
 		f.drainRouteQueueLocked(route)
 		f.changeQueueCapacityLocked(-cap(route.clientQueue))
+		if f.directEgress != nil {
+			f.directEgress.PurgePeer(route.peerKey)
+		}
 	}
 	return retirements
 }
@@ -284,6 +294,9 @@ func (f *Forwarder) RetireAllRoutes() (wait func(ctx context.Context) error) {
 	retirements := f.retireRoutesMatchingLocked(nil)
 	clear(f.routesByPeer)
 	clear(f.routesByIP)
+	if f.directEgress != nil {
+		f.directEgress.PurgeAll()
+	}
 	f.aggregateQueueMu.Lock()
 	f.aggregateQueueOccupancy = 0
 	f.aggregateQueueCapacity = 0
@@ -351,10 +364,25 @@ func (f *Forwarder) PeerRegistration(peerKey string) uint64 {
 func (f *Forwarder) RouteSessionID(peerKey string) string {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if route, ok := f.routesByPeer[peerKey]; ok && route != nil {
+	if route, ok := f.routesByPeer[peerKey]; ok && route != nil && !route.retired.Load() {
 		return route.sessionID
 	}
 	return ""
+}
+
+// ActivePeerGeneration returns the active registration generation, session ID, and true
+// if the peer currently has a non-retired registered route.
+func (f *Forwarder) ActivePeerGeneration(peerKey string) (uint64, string, bool) {
+	if f == nil {
+		return 0, "", false
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	route, ok := f.routesByPeer[peerKey]
+	if !ok || route == nil || route.retired.Load() {
+		return 0, "", false
+	}
+	return route.generation, route.sessionID, true
 }
 
 // HasSessionRoute checks that the live route still belongs to the session and

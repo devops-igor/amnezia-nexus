@@ -86,6 +86,25 @@ func (s *Service) Start(ctx context.Context) error {
 		s.forwarder.StartPumps(ctx)
 	}
 
+	// 3b. Configure PBR direct egress if enabled (#677)
+	pbrEnabled := false
+	s.mu.RLock()
+	if s.cfg != nil && s.cfg.PBREnabled {
+		pbrEnabled = true
+	}
+	s.mu.RUnlock()
+	if !pbrEnabled && s.db != nil {
+		if dbCfg, err := s.db.GetVPNConfig(ctx); err == nil && dbCfg != nil && dbCfg.PBREnabled {
+			pbrEnabled = true
+		}
+	}
+	if pbrEnabled {
+		if err := s.initPBR(ctx); err != nil {
+			s.rollbackStartup(ctx)
+			return fmt.Errorf("failed to initialize PBR direct egress: %w", err)
+		}
+	}
+
 	// 4. Establish fresh backend health before accepting client traffic.
 	// ResetEnabledHealthForStartup intentionally made every enabled backend
 	// unroutable ("connecting"). Run one synchronous sweep here so the endpoint
@@ -156,7 +175,8 @@ func (s *Service) resetDiagnosticsGeneration() {
 	}())
 }
 
-func (s *Service) cleanupEngineStartupFailure() {
+func (s *Service) rollbackStartup(ctx context.Context) {
+	_ = s.TeardownPBR()
 	if s.prober != nil {
 		s.prober.Stop()
 	}
@@ -164,12 +184,17 @@ func (s *Service) cleanupEngineStartupFailure() {
 		s.reconnectMgr.Stop()
 	}
 	if s.forwarder != nil {
+		s.forwarder.StopPumps()
 		_ = s.forwarder.Stop()
 	}
 	s.mu.Lock()
 	s.running = false
 	s.startedAt = time.Time{}
 	s.mu.Unlock()
+}
+
+func (s *Service) cleanupEngineStartupFailure() {
+	s.rollbackStartup(context.Background())
 }
 
 func (s *Service) startUpstreamClientEngine(ctx context.Context) error {
@@ -426,6 +451,7 @@ func (s *Service) Stop() error {
 		s.reconnectMgr.Stop()
 	}
 	if s.forwarder != nil {
+		_ = s.TeardownPBR()
 		recordErr(s.forwarder.Stop())
 	}
 	s.stopRollingHistory()

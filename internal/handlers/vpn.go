@@ -630,6 +630,7 @@ type vpnConfigPresence struct {
 	disableCookies              bool
 	dataPlaneI1                 bool
 	enableMultiProtocolBackends bool
+	pbrEnabled                  bool
 }
 
 // hasRawKey reports whether the caller sent the named JSON key, matching the
@@ -718,6 +719,12 @@ func mergeVPNConfig(current *models.VPNConfig, cfg *models.VPNConfig, present vp
 	if !present.enableMultiProtocolBackends {
 		cfg.EnableMultiProtocolBackends = current.EnableMultiProtocolBackends
 	}
+	// Same omission semantics for policy-based routing: an unrelated partial
+	// update must not durably disable PBR, which is what happened when the field
+	// decoded to false and was persisted (#677 stabilization S2).
+	if !present.pbrEnabled {
+		cfg.PBREnabled = current.PBREnabled
+	}
 }
 
 // VPNUpdateConfigHandler applies new routing policy and rebalances existing pools.
@@ -758,6 +765,7 @@ func (h *Handlers) VPNUpdateConfigHandler(w http.ResponseWriter, r *http.Request
 		disableCookies:              hasRawKey(raw, "disable_cookies"),
 		dataPlaneI1:                 hasRawKey(raw, "vpn_data_plane_i1_protocol"),
 		enableMultiProtocolBackends: hasRawKey(raw, "enable_multi_protocol_backends"),
+		pbrEnabled:                  hasRawKey(raw, "pbr_enabled"),
 	}
 
 	ctx := r.Context()

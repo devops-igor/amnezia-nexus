@@ -34,6 +34,22 @@ func main() {
 		case "--version", "-version", "-v", "version":
 			fmt.Printf("amnezia-nexus %s (%s)\n", config.AppVersion, config.AppCodename)
 			return
+		case "--check-wan-capabilities":
+			// Deployment smoke assertion: report whether this process holds the
+			// capabilities direct WAN egress needs, and exit non-zero when it does
+			// not, so a container start-up probe or CI step fails here instead of
+			// discovering the gap when PBR is first enabled.
+			fmt.Printf("effective capabilities: %s\n", strings.Join(vpn.EffectiveCapabilityNames(), " "))
+			failed := false
+			for _, result := range vpn.RunStandaloneWANChecks(os.Stdout) {
+				if !result.OK() {
+					failed = true
+				}
+			}
+			if failed {
+				os.Exit(1)
+			}
+			return
 		}
 	}
 
