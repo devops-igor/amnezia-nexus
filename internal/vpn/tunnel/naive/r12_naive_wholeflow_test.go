@@ -24,7 +24,9 @@ package naive
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"os"
@@ -47,6 +49,62 @@ func mustJSONNaive(t *testing.T, p models.NaiveProxyParams) []byte {
 	return b
 }
 
+// writeCaddyCertsForTestRootCAs provisions a Caddy serving certificate that is
+// signed by the SAME root CA the package TestMain installed into testRootCAs.
+//
+// Why this exists (R12 CI failure, run 42150221196):
+//   - production New() sets tlsCfg.RootCAs = testRootCAs (dialer.go), and
+//     probeViaDaemon verifies the proxy leaf against that pool.
+//   - TestMain seeds testRootCAs with the fixture CA ("NaiveProxy Root CA").
+//   - generateTestCerts() instead signs Caddy's leaf with its own separate CA
+//     ("NaiveTestCA") and only exports it via SSL_CERT_FILE, which no non-test
+//     file in this package reads.
+//
+// The result was x509 "certificate signed by unknown authority".
+//
+// The correction signs the leaf with testCACert/testCAKey, i.e. the CA that is
+// genuinely in the verification pool, so certificate verification stays fully
+// enabled. It does not disable TLS, trust arbitrary certs, or alter production
+// trust policy.
+func writeCaddyCertsForTestRootCAs(t *testing.T, dir string) (caCertPath, srvCertPath, srvKeyPath string) {
+	t.Helper()
+	if testCACert == nil || testCAKey == nil {
+		t.Fatal("package test CA is not initialized; TestMain must run first")
+	}
+	if testRootCAs == nil {
+		t.Fatal("testRootCAs is nil; the probe would use system roots and cannot trust the fixture CA")
+	}
+
+	leaf, err := generateLeafCert(testCACert, testCAKey, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("generate leaf cert: %v", err)
+	}
+
+	srvCertPath = filepath.Join(dir, "server.crt")
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.Certificate[0]})
+	if err := os.WriteFile(srvCertPath, certPEM, 0o600); err != nil {
+		t.Fatalf("write server.crt: %v", err)
+	}
+
+	srvKeyPath = filepath.Join(dir, "server.key")
+	keyDER, err := x509.MarshalPKCS8PrivateKey(leaf.PrivateKey)
+	if err != nil {
+		t.Fatalf("marshal server key: %v", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	if err := os.WriteFile(srvKeyPath, keyPEM, 0o600); err != nil {
+		t.Fatalf("write server.key: %v", err)
+	}
+
+	// The native naive daemon connects to Caddy as its upstream and needs to
+	// trust the same CA; SSL_CERT_FILE covers that process-level path.
+	caCertPath = filepath.Join(dir, "ca.crt")
+	if err := os.WriteFile(caCertPath, testCACertPEM, 0o600); err != nil {
+		t.Fatalf("write ca.crt: %v", err)
+	}
+	return caCertPath, srvCertPath, srvKeyPath
+}
+
 // TestR12_NaiveAuthenticQualificationRequestReply runs the production
 // qualification probe end-to-end over the real native naive + Caddy stack.
 func TestR12_NaiveAuthenticQualificationRequestReply(t *testing.T) {
@@ -63,7 +121,9 @@ func TestR12_NaiveAuthenticQualificationRequestReply(t *testing.T) {
 	}
 
 	tmpDir := t.TempDir()
-	caCertPath, srvCertPath, srvKeyPath := generateTestCerts(t, tmpDir)
+	// Sign the Caddy leaf with the CA actually present in testRootCAs so the
+	// production probe's verification succeeds for the right reason.
+	caCertPath, srvCertPath, srvKeyPath := writeCaddyCertsForTestRootCAs(t, tmpDir)
 	t.Setenv("SSL_CERT_FILE", caCertPath)
 
 	// Real echo origin the tunneled HTTP request will reach.
