@@ -172,23 +172,13 @@ func TestDifferential_ConfigFreezingAndRedactedManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	taskArtifactPath := filepath.Join(repoRoot, "tasks", "issue-392-differential-compatibility", "evidence_manifest.json")
-	if err := os.MkdirAll(filepath.Dir(taskArtifactPath), 0o755); err != nil {
-		t.Fatalf("failed to create directory for evidence manifest: %v", err)
-	}
-	if err := os.WriteFile(taskArtifactPath, evidenceJSON, 0o600); err != nil {
-		t.Fatalf("failed to write evidence manifest to %s: %v", taskArtifactPath, err)
-	}
-	if customDir := os.Getenv("NEXUS_ARTIFACT_DIR"); customDir != "" {
-		if !filepath.IsAbs(customDir) {
-			customDir = filepath.Join(repoRoot, customDir)
-		}
-		_ = os.MkdirAll(customDir, 0o755)
-		customPath := filepath.Join(customDir, "evidence_manifest.json")
-		if err := os.WriteFile(customPath, evidenceJSON, 0o600); err != nil {
-			t.Logf("warning: failed to write custom evidence manifest to %s: %v", customPath, err)
-		}
-	}
+	// Emit the compatibility evidence manifest to this invocation's artifact directory.
+	// Ordinary runs must not write into the repository working tree: under CI the test
+	// container bind-mounts a persistent workspace as root, so any such file outlives the
+	// run and blocks the next checkout's clean. An explicit NEXUS_ARTIFACT_DIR export still
+	// receives the manifest for qualification.
+	artifactDir := differentialArtifactDir(t)
+	emitDifferentialArtifact(t, artifactDir, "evidence_manifest.json", evidenceJSON)
 }
 
 // TestDifferential_SequentialReferenceVsSubjectBaseline runs reference server, connects client,
