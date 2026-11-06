@@ -77,6 +77,14 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=20s \
 # Run as non-root user (capabilities granted at container level via compose cap_add)
 USER appuser
 
-# Default command: launch Amnezia Web Panel
-CMD ["/app/panel"]
+# ENTRYPOINT names the binary so `docker run <image> --flag` passes the flag to the
+# panel instead of trying to exec it as a program. With only CMD, the first
+# argument of `docker run` replaces CMD wholesale, which broke the image
+# capability smoke (`docker run <image> --check-wan-capabilities` resolved to
+# `exec --check-wan-capabilities` and failed with 127).
+ENTRYPOINT ["/app/panel"]
+
+# Default command: launch Amnezia Web Panel (arguments after the image name are
+# appended to the entrypoint).
+CMD []
 
