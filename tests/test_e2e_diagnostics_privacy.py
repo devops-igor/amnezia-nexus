@@ -309,39 +309,111 @@ def test_version_report_records_actual_environment(tmp_path: Path) -> None:
     assert recorded["browser"]["name"] == "chromium"
 
 
-def test_version_report_rejects_unmeasured_fields(tmp_path: Path) -> None:
-    """An origin smuggled into a version report is refused."""
+def test_version_report_claims_requested_provenance_only(tmp_path: Path) -> None:
+    """Provenance is labelled requested-only, never as runtime-verified."""
     versions = diagnostics.environment_versions()
-    versions["tested_image"] = f"https://{PRIVATE_HOST}/img"
+    assert versions["provenance"] == diagnostics.PROVENANCE_REQUESTED_ONLY
+
+    path = diagnostics.write_versions_artifact(tmp_path, versions, {})
+    assert path is not None
+    recorded = json.loads(path.read_text(encoding="utf-8"))
+    assert recorded["provenance"] == "requested-only"
+    for unverified in (
+        "tested_sha",
+        "tested_image",
+        "image_id",
+        "image_digest",
+        "runtime_verified",
+    ):
+        assert unverified not in recorded
+
+
+def test_version_report_rejects_verified_provenance_claim() -> None:
+    """A report claiming runtime-verified provenance is refused."""
+    versions = diagnostics.environment_versions()
+    versions["provenance"] = "runtime-verified"
+    assert diagnostics.validate_versions(versions) == [
+        "provenance must be claimed as requested-only"
+    ]
+
+
+def test_version_report_rejects_unmeasured_fields(tmp_path: Path) -> None:
+    """An origin smuggled into a requested field is refused."""
+    versions = diagnostics.environment_versions()
+    versions["requested_image_label"] = f"https://{PRIVATE_HOST}/img"
     assert diagnostics.write_versions_artifact(tmp_path, versions, {}) is None
     assert not any(tmp_path.iterdir())
 
 
-def test_cli_validator_prunes_invalid_evidence(tmp_path: Path) -> None:
-    """The pre-upload gate fails closed and removes unvalidated files."""
+def test_version_report_accepts_requested_sha_and_label(tmp_path: Path) -> None:
+    """A well-formed requested SHA and image label are recorded as requested."""
+    versions = diagnostics.environment_versions()
+    versions["requested_source_sha"] = "ff46142e5bef3c6f31a392d550baa09842190e65"
+    versions["requested_image_label"] = "ghcr.io/devops-igor/amnezia-nexus:pr-724"
+    path = diagnostics.write_versions_artifact(tmp_path, versions, {})
+    assert path is not None
+    recorded = json.loads(path.read_text(encoding="utf-8"))
+    assert recorded["requested_source_sha"].startswith("ff46142")
+    assert recorded["requested_image_label"].endswith("pr-724")
+
+
+def test_gate_withholds_whole_directory_on_one_rejection(tmp_path: Path) -> None:
+    """One bad file withholds every sibling, not just itself."""
     recorder = build_recorder()
     drive_full_cycle(recorder)
     good = diagnostics.build_payload("setup", recorder)
-    (tmp_path / "setup-setup.json").write_text(json.dumps(good), encoding="utf-8")
-    (tmp_path / "setup-legacy.json").write_text(
+    (tmp_path / "setup-valid.json").write_text(json.dumps(good), encoding="utf-8")
+    (tmp_path / "setup-poisoned.json").write_text(
         json.dumps({"schema_version": 1, "url": f"https://{PRIVATE_HOST}/setup?{PRIVATE_QUERY}"}),
         encoding="utf-8",
     )
 
-    assert diagnostics.main(["--validate-dir", str(tmp_path), "--prune"]) == 1
-    assert [p.name for p in tmp_path.iterdir()] == ["setup-setup.json"]
+    assert diagnostics.main(["--validate-dir", str(tmp_path)]) == 1
+    assert not tmp_path.exists()
 
 
-def test_cli_validator_accepts_clean_directory(tmp_path: Path) -> None:
-    """A directory holding only validated evidence passes the gate."""
+def test_gate_withholds_on_unreadable_file(tmp_path: Path) -> None:
+    """Unparseable evidence is uncertainty, so nothing is published."""
+    (tmp_path / "setup-broken.json").write_text("{not json", encoding="utf-8")
+    assert diagnostics.main(["--validate-dir", str(tmp_path)]) == 1
+    assert not tmp_path.exists()
+
+
+def test_gate_never_echoes_rejected_content(tmp_path: Path, capsys) -> None:
+    """Rejection prints counts only; no marker secret reaches stdout or logs."""
+    (tmp_path / "setup-leaky.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "url": f"https://{PRIVATE_HOST}/setup?{PRIVATE_QUERY}",
+                "password": SECRET_PASSWORD,
+                "cookie": SECRET_COOKIE,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert diagnostics.main(["--validate-dir", str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    emitted = captured.out + captured.err
+    assert "files=1" in emitted and "rejected=1" in emitted
+    assert_no_secrets(emitted)
+    assert "setup-leaky.json" not in emitted
+
+
+def test_gate_leaves_clean_directory_intact(tmp_path: Path) -> None:
+    """A directory holding only validated evidence survives the gate."""
     recorder = build_recorder()
     drive_full_cycle(recorder)
     payload = diagnostics.build_payload("setup", recorder)
-    (tmp_path / "setup-setup.json").write_text(json.dumps(payload), encoding="utf-8")
+    path = tmp_path / "setup-valid.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
     assert diagnostics.main(["--validate-dir", str(tmp_path)]) == 0
+    assert path.exists()
 
 
-def test_cli_validator_tolerates_absent_directory(tmp_path: Path) -> None:
+def test_gate_tolerates_absent_directory(tmp_path: Path) -> None:
     """No captured evidence is not a privacy failure."""
     assert diagnostics.main(["--validate-dir", str(tmp_path / "missing")]) == 0
 

@@ -82,16 +82,16 @@ print_summary() {
 }
 
 # Privacy-first evidence gate. Runs in this lifecycle job (never a separate
-# qualification job) and fails closed: when validation is uncertain the whole
-# diagnostics directory is removed, so the upload step publishes nothing.
+# qualification job). Withholding is all-or-nothing inside the module: on any
+# rejection the whole diagnostics directory is removed, so the upload step
+# publishes nothing.
 finalize() {
     local validate_status=0
     if ! (cd "$REPO_ROOT" && python3 -m tests.e2e.diagnostics \
-            --validate-dir "$E2E_DIAGNOSTICS_DIR" --prune); then
+            --validate-dir "$E2E_DIAGNOSTICS_DIR"); then
         echo "ERROR: E2E diagnostics failed validation; evidence withheld." >&2
         validate_status=1
         OVERALL_STATUS=1
-        rm -rf "$E2E_DIAGNOSTICS_DIR"
     fi
     echo "==> Diagnostics directory: ${E2E_DIAGNOSTICS_DIR} (validation exit ${validate_status})"
     print_summary

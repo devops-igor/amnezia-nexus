@@ -73,9 +73,21 @@ _ROUTES = frozenset(name for _, name in _ROUTE_CATEGORIES) | {"static", "other"}
 _PACKAGE_NAMES = ("pytest", "playwright", "pytest-playwright", "pytest-asyncio", "pytest-cov")
 _PAYLOAD_KEYS = frozenset({"schema_version", "test", "events", "dropped", "browser"})
 _VERSION_FIELDS = ("python", "implementation", "system", "machine")
+# Provenance here is *requested*, never verified: the checked-out revision and the
+# image label the workflow intended to run. Nothing in an offline artifact can
+# prove which image was actually launched or deployed.
 _REPORT_KEYS = frozenset(
-    {"schema_version", *_VERSION_FIELDS, "packages", "tested_sha", "tested_image", "browser"}
+    {
+        "schema_version",
+        *_VERSION_FIELDS,
+        "packages",
+        "provenance",
+        "requested_source_sha",
+        "requested_image_label",
+        "browser",
+    }
 )
+PROVENANCE_REQUESTED_ONLY = "requested-only"
 _BROWSER_KEYS = frozenset({"name", "version"})
 _KINDS = ("request", "response", "request_failed", "navigation", "load")
 
@@ -390,10 +402,14 @@ def validate_versions(payload: Any) -> List[str]:
     for key in _VERSION_FIELDS:
         if not _VERSION_RE.match(str(payload.get(key, ""))):
             return [f"version report {key} invalid"]
-    if "tested_sha" in payload and not _SHA_RE.match(str(payload["tested_sha"])):
-        return ["sha invalid"]
-    if "tested_image" in payload and not _IMAGE_RE.match(str(payload["tested_image"])):
-        return ["image invalid"]
+    if payload.get("provenance", PROVENANCE_REQUESTED_ONLY) != PROVENANCE_REQUESTED_ONLY:
+        return ["provenance must be claimed as requested-only"]
+    sha = payload.get("requested_source_sha")
+    if sha is not None and not _SHA_RE.match(str(sha)):
+        return ["requested_source_sha invalid"]
+    image = payload.get("requested_image_label")
+    if image is not None and not _IMAGE_RE.match(str(image)):
+        return ["requested_image_label invalid"]
     packages = payload.get("packages", {})
     if not isinstance(packages, dict):
         return ["packages is not an object"]
@@ -435,18 +451,19 @@ def environment_versions() -> Dict[str, Any]:
             packages[name] = version
     versions: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
+        "provenance": PROVENANCE_REQUESTED_ONLY,
         "python": platform.python_version(),
         "implementation": platform.python_implementation(),
         "system": platform.system(),
         "machine": platform.machine(),
         "packages": packages,
     }
-    sha = _env_value("GITHUB_SHA", "E2E_TESTED_SHA", pattern=_SHA_RE)
+    sha = _env_value("GITHUB_SHA", "E2E_TESTED_SOURCE_SHA", pattern=_SHA_RE)
     if sha:
-        versions["tested_sha"] = sha
-    image = _env_value("E2E_TESTED_IMAGE", pattern=_IMAGE_RE)
+        versions["requested_source_sha"] = sha
+    image = _env_value("E2E_TESTED_IMAGE_LABEL", pattern=_IMAGE_RE)
     if image:
-        versions["tested_image"] = image
+        versions["requested_image_label"] = image
     return versions
 
 
@@ -508,18 +525,18 @@ def _write_checked(
         return None
 
 
-# ── CLI: re-validate an artifact directory before upload ──────────────
+# ── CLI: gate the artifact directory before upload ────────────────────
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    """Validate diagnostics artifacts; non-zero means do not upload."""
-    parser = argparse.ArgumentParser(description="Validate E2E diagnostics artifacts")
-    parser.add_argument("--validate-dir", required=True, help="directory holding JSON evidence")
-    parser.add_argument(
-        "--prune", action="store_true", help="delete files that fail validation (fail closed)"
-    )
-    args = parser.parse_args(argv)
-    directory = Path(args.validate_dir)
+def gate(directory: Path) -> int:
+    """Validate every artifact and withhold the whole directory on rejection.
+
+    Withholding is all-or-nothing on purpose: a partially pruned directory could
+    still publish evidence whose sibling failed validation, and the caller's
+    upload step cannot tell the difference. Rejection therefore removes the
+    directory outright, so ``upload-artifact`` finds nothing to publish. Only
+    counts are printed — never file contents, names or rejected values.
+    """
     if not directory.is_dir():
         # Nothing captured: no evidence to withhold, nothing to publish.
         print("E2E diagnostics: files=0 rejected=0 (directory absent)")
@@ -536,13 +553,36 @@ def main(argv: Optional[List[str]] = None) -> int:
             problems = validate_payload(payload) if is_payload else validate_versions(payload)
         if problems:
             rejected += 1
-            if args.prune:
-                try:
-                    path.unlink()
-                except OSError:
-                    logger.warning("E2E diagnostics: could not remove invalid evidence")
-    print(f"E2E diagnostics: files={len(files)} rejected={rejected}")
-    return 1 if rejected else 0
+    if rejected:
+        withheld = _withhold(directory)
+        print(f"E2E diagnostics: files={len(files)} rejected={rejected} withheld={withheld}")
+        return 1
+    print(f"E2E diagnostics: files={len(files)} rejected=0")
+    return 0
+
+
+def _withhold(directory: Path) -> bool:
+    """Remove the evidence directory entirely; True when nothing is left behind."""
+    try:
+        for path in directory.rglob("*"):
+            if path.is_file():
+                path.unlink()
+        for path in sorted(directory.rglob("*"), reverse=True):
+            if path.is_dir():
+                path.rmdir()
+        directory.rmdir()
+        return True
+    except OSError:
+        logger.warning("E2E diagnostics: could not withhold evidence directory")
+        return False
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Validate diagnostics artifacts; non-zero means do not upload."""
+    parser = argparse.ArgumentParser(description="Gate E2E diagnostics artifacts before upload")
+    parser.add_argument("--validate-dir", required=True, help="directory holding JSON evidence")
+    args = parser.parse_args(argv)
+    return gate(Path(args.validate_dir))
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
