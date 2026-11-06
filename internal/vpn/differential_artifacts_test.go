@@ -20,11 +20,17 @@ const artifactDirEnv = "NEXUS_ARTIFACT_DIR"
 // testArtifactDir (the per-test directory behind t.ArtifactDir()), which belongs to this
 // invocation only and is discarded with it. A relative export keeps its documented meaning
 // and is anchored at repoRoot, so callers such as the qualification runner are unaffected.
+//
+// The repository's tasks/ directory is never a valid unexported destination: those files
+// outlive the invocation, and a later checkout on the same machine then has to clean them.
 func differentialArtifactDirFor(exported, testArtifactDir, repoRoot string) (string, error) {
 	exported = strings.TrimSpace(exported)
 	if exported == "" {
 		if testArtifactDir == "" {
 			return "", errors.New("no invocation-owned artifact directory available")
+		}
+		if repoRoot != "" && isWithin(filepath.Join(repoRoot, "tasks"), testArtifactDir) {
+			return "", fmt.Errorf("invocation artifact directory %q is inside the repository task area", testArtifactDir)
 		}
 		return testArtifactDir, nil
 	}
@@ -35,6 +41,15 @@ func differentialArtifactDirFor(exported, testArtifactDir, repoRoot string) (str
 		return "", fmt.Errorf("relative %s %q needs a repository root to resolve against", artifactDirEnv, exported)
 	}
 	return filepath.Join(repoRoot, exported), nil
+}
+
+// isWithin reports whether path is parent itself or below it, after cleaning both.
+func isWithin(parent, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(parent), filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 // differentialArtifactDir returns the directory that receives this test's differential
@@ -95,14 +110,6 @@ func emitDifferentialArtifact(t *testing.T, dir, name string, data []byte) {
 	}
 }
 
-// upstreamCompatibilityDir and upstreamSoakDir are the repository working-tree paths the
-// differential producers used to write into unconditionally. They are retained here only as a
-// negative control: no ordinary run may recreate them.
-const (
-	upstreamCompatibilityDir = "tasks/issue-392-differential-compatibility"
-	upstreamSoakDir          = "tasks/issue-392-phase3-soak"
-)
-
 // TestDifferentialArtifactDirFor covers destination resolution, including the explicit export
 // contract that scripts/run_differential_qualification.sh and the evidence verifier rely on.
 func TestDifferentialArtifactDirFor(t *testing.T) {
@@ -144,6 +151,30 @@ func TestDifferentialArtifactDirFor(t *testing.T) {
 			name:        "no export and no invocation directory is an error",
 			wantErrPart: "invocation-owned",
 		},
+		{
+			name:        "invocation directory inside the repository task area is rejected",
+			testDir:     "/repo/tasks/issue-392-phase3-soak",
+			repoRoot:    "/repo",
+			wantErrPart: "repository task area",
+		},
+		{
+			name:     "invocation directory outside the task area is accepted",
+			testDir:  "/repo/test-artifacts/t",
+			repoRoot: "/repo",
+			want:     "/repo/test-artifacts/t",
+		},
+		{
+			name:        "invocation directory equal to the task area is rejected",
+			testDir:     "/repo/tasks",
+			repoRoot:    "/repo",
+			wantErrPart: "repository task area",
+		},
+		{
+			name:     "sibling path sharing the tasks prefix is accepted",
+			testDir:  "/repo/tasks-backup/t",
+			repoRoot: "/repo",
+			want:     "/repo/tasks-backup/t",
+		},
 	}
 
 	for _, tt := range tests {
@@ -169,8 +200,8 @@ func TestDifferentialArtifactDirFor(t *testing.T) {
 }
 
 // TestDifferentialArtifactDefaultIsInvocationOwned proves the ordinary path: with no export the
-// artifact lands in a directory owned by this test invocation, and repeated runs over a stale
-// partial file (a cancelled predecessor) converge on complete content only.
+// artifact lands in a directory owned by this test invocation, outside the repository working
+// tree and outside its task area.
 func TestDifferentialArtifactDefaultIsInvocationOwned(t *testing.T) {
 	t.Setenv(artifactDirEnv, "")
 
@@ -178,25 +209,37 @@ func TestDifferentialArtifactDefaultIsInvocationOwned(t *testing.T) {
 	if dir == "" {
 		t.Fatal("artifact directory is empty")
 	}
-	if repoRoot, err := FindRepoRoot(); err == nil {
-		if rel, err := filepath.Rel(repoRoot, dir); err == nil && !strings.HasPrefix(rel, "..") {
-			t.Fatalf("artifact directory %q is inside the repository working tree %q", dir, repoRoot)
-		}
+	repoRoot, err := FindRepoRoot()
+	if err != nil {
+		t.Fatalf("FindRepoRoot: %v", err)
 	}
+	if isWithin(filepath.Join(repoRoot, "tasks"), dir) {
+		t.Fatalf("artifact directory %q is inside the repository task area", dir)
+	}
+	if isWithin(repoRoot, dir) {
+		t.Fatalf("artifact directory %q is inside the repository working tree %q", dir, repoRoot)
+	}
+}
 
-	// A predecessor that was cancelled mid-write can leave a truncated file behind. Simulating
-	// that with a partial write first makes the repeat assertion meaningful.
+// TestDifferentialArtifactRepeatReplacesPredecessorOutput proves idempotency: a truncated file
+// left by a cancelled predecessor is replaced completely, with the original mode, and no
+// half-written temporary file survives.
+func TestDifferentialArtifactRepeatReplacesPredecessorOutput(t *testing.T) {
+	t.Setenv(artifactDirEnv, "")
+
+	dir := differentialArtifactDir(t)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("seed artifact dir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "evidence_manifest.json"), []byte(`{"schema_ver`), 0o600); err != nil {
+	artifactPath := filepath.Join(dir, "evidence_manifest.json")
+	if err := os.WriteFile(artifactPath, []byte(`{"schema_ver`), 0o600); err != nil {
 		t.Fatalf("seed stale artifact: %v", err)
 	}
 
 	first := []byte(`{"schema_version":"1.0.0","run":"first"}`)
 	emitDifferentialArtifact(t, dir, "evidence_manifest.json", first)
 	assertArtifactContent(t, dir, "evidence_manifest.json", first)
-	firstInfo, err := os.Stat(filepath.Join(dir, "evidence_manifest.json"))
+	firstInfo, err := os.Stat(artifactPath)
 	if err != nil {
 		t.Fatalf("stat artifact: %v", err)
 	}
@@ -290,50 +333,71 @@ func TestDifferentialArtifactConcurrentInvocationsIndependent(t *testing.T) {
 	})
 }
 
-// TestDifferentialProducersLeaveNoRepoTasksOutput is the ownership regression for the reported
-// failure: after the producers run, the legacy repository working-tree artifact directories must
-// not exist unless something outside these producers created them. A pre-existing leftover from
-// an earlier revision is not repaired here (that is not a durable contract), so the check only
-// asserts the producers write nothing there.
-func TestDifferentialProducersLeaveNoRepoTasksOutput(t *testing.T) {
+// TestDifferentialProducersWriteOnlyInvocationArtifacts is the ownership regression for the
+// reported failure. It runs the real baseline producer test function and asserts the only file
+// produced is the one in this invocation's own artifact directory — nothing appears under the
+// repository's tasks/ tree. Against the pre-fix producer (which wrote
+// <repoRoot>/tasks/issue-392-differential-compatibility/evidence_manifest.json unconditionally)
+// this test fails.
+//
+// The soak producer shares the same destination helper; its own end-to-end proof is the
+// recorded cold/repeat/interrupted/concurrent evidence run, which executes the real bounded soak
+// rather than nesting a ~15s network test inside this one.
+func TestDifferentialProducersWriteOnlyInvocationArtifacts(t *testing.T) {
 	repoRoot, err := FindRepoRoot()
 	if err != nil {
 		t.Fatalf("FindRepoRoot: %v", err)
 	}
-	legacyDirs := []string{
-		filepath.Join(repoRoot, upstreamCompatibilityDir),
-		filepath.Join(repoRoot, upstreamSoakDir),
-	}
-	before := make([]bool, len(legacyDirs))
-	for i, dir := range legacyDirs {
-		if _, err := os.Stat(dir); err == nil {
-			before[i] = true
-		} else if !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("stat legacy dir %q: %v", dir, err)
-		}
-	}
+	taskRoot := filepath.Join(repoRoot, "tasks")
+	before := snapshotTree(t, taskRoot)
 
-	// Exercise both producer paths at their shared seam, in the ordinary (no-export) mode.
 	t.Setenv(artifactDirEnv, "")
-	dir := differentialArtifactDir(t)
-	emitDifferentialArtifact(t, dir, "evidence_manifest.json", []byte(`{"schema_version":"1.0.0"}`))
-	emitDifferentialArtifact(t, dir, "soak_report_subject_bounded_verification.json", []byte(`{"run_mode":"bounded_verification"}`))
+	t.Run("baseline-producer", func(t *testing.T) {
+		TestDifferential_ConfigFreezingAndRedactedManifest(t)
 
-	for i, legacyDir := range legacyDirs {
-		_, statErr := os.Stat(legacyDir)
-		if before[i] {
-			if statErr != nil {
-				t.Fatalf("pre-existing legacy dir %q disappeared: %v", legacyDir, statErr)
-			}
-			continue
+		manifestPath := filepath.Join(differentialArtifactDir(t), "evidence_manifest.json")
+		if info, err := os.Stat(manifestPath); err != nil {
+			t.Fatalf("baseline producer did not publish its manifest to the invocation directory: %v", err)
+		} else if info.Size() == 0 {
+			t.Fatalf("baseline producer published an empty manifest to %s", manifestPath)
 		}
-		if statErr == nil {
-			t.Fatalf("producer recreated repository working-tree artifact dir %q", legacyDir)
-		}
-		if !errors.Is(statErr, os.ErrNotExist) {
-			t.Fatalf("stat legacy dir %q: %v", legacyDir, statErr)
+	})
+
+	// The soak producer names its report after the server and run mode; exercising the shared
+	// publish seam keeps the filename convention covered without rerunning the network soak.
+	soakName := fmt.Sprintf("soak_report_%s_%s.json", "subject", "bounded_verification")
+	emitDifferentialArtifact(t, differentialArtifactDir(t), soakName, []byte(`{"run_mode":"bounded_verification"}`))
+
+	after := snapshotTree(t, taskRoot)
+	for path := range after {
+		if _, existed := before[path]; !existed {
+			t.Errorf("test run created %s under the repository tasks/ tree", path)
 		}
 	}
+}
+
+// snapshotTree records every regular file path below root. A missing root is not an error:
+// an absent tasks/ directory means the run started from a clean checkout.
+func snapshotTree(t *testing.T, root string) map[string]struct{} {
+	t.Helper()
+	files := map[string]struct{}{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		files[path] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+	return files
 }
 
 // assertArtifactContent asserts the artifact exists with exactly want as its content.
