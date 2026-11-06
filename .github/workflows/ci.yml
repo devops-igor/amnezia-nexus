@@ -114,8 +114,11 @@ jobs:
         run: |
           # Match guest paths and loopback so sibling Docker fixtures see test files/services.
           # The socket and /tmp belong to the isolated guest, never the physical host.
+          # NET_RAW is required by the #678 policy enablement E2E: the production WAN
+          # device opens an AF_PACKET capture socket for direct-WAN return traffic,
+          # which CAP_NET_ADMIN alone does not permit.
           docker run --rm -i --user 0:0 --network host --cpus 6 --memory 10g \
-            --cap-add NET_ADMIN --cap-add SYS_ADMIN --security-opt apparmor=unconfined --device /dev/net/tun \
+            --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN --security-opt apparmor=unconfined --device /dev/net/tun \
             --volume /var/run/docker.sock:/var/run/docker.sock \
             --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
             --volume /tmp:/tmp \
@@ -154,6 +157,12 @@ jobs:
 
           go test -p 2 -race -cover -count=1 -coverprofile=coverage.out ./...
           go test -v -tags with_utls -race -run TestLinuxE2E ./internal/vpn/forwarder/...
+          # Policy enablement (#678). A separate package selection is required
+          # because ./internal/vpn/forwarder/... does not include ./internal/vpn,
+          # so without this step the policy E2E would be compiled but never run.
+          # The production WAN device opens an AF_PACKET capture socket, which needs
+          # CAP_NET_RAW in addition to the NET_ADMIN the container already has.
+          go test -v -tags with_utls -race -run TestLinuxE2E ./internal/vpn/
           go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
           go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
           SCRIPT
