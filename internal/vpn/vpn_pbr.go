@@ -664,8 +664,13 @@ func (s *Service) initPBR(ctx context.Context) error {
 	}
 	cfg.Enabled = true
 
-	// 1. Host WAN IP: derive if not set (in default production startup)
-	if !cfg.HostWANIP.IsValid() && pbrCfg == nil {
+	// 1. Host WAN IP: derive from the routing table when the caller supplied no
+	// explicit address. This must not depend on whether a PBRConfig was registered:
+	// callers that pre-seed configuration (a compiled policy matcher from saved
+	// settings, or a test supplying only WANDevice/PolicySources) legitimately leave
+	// HostWANIP at its zero value and rely on derivation. Gating on `pbrCfg == nil`
+	// made every such activation fail with ErrPBRMissingHostWAN.
+	if !cfg.HostWANIP.IsValid() {
 		derived, err := DeriveHostWANIP()
 		if err != nil {
 			return fmt.Errorf("derive host wan ip: %w", err)

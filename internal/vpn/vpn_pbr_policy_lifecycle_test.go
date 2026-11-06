@@ -627,3 +627,48 @@ func TestStartPolicyLoopRegistersAndStops(t *testing.T) {
 		t.Fatal("StopPolicyRouting left the runtime registered after startPolicyLoop")
 	}
 }
+
+// Regression: a pre-seeded PBRConfig lacking HostWANIP must still have the WAN
+// address derived by initPBR.
+//
+// The original derivation was gated on `pbrCfg == nil`, so any caller that
+// registered configuration first (notably StartPolicyRouting handing over a
+// compiled matcher, and tests supplying only WANDevice/PolicySources) left
+// HostWANIP unset and failed every activation with ErrPBRMissingHostWAN. That made
+// the positive enablement path unreachable by construction, not merely unavailable
+// in a sandbox.
+//
+// This asserts the observable contract: initPBR either derives a usable address and
+// proceeds past the WAN-IP prerequisite, or fails for a *later* reason. It must
+// never fail with ErrPBRMissingHostWAN when a config is registered and no address
+// was supplied.
+func TestInitPBRDerivesHostWANIPForPreseededConfig(t *testing.T) {
+	svc := serviceForActivation(t)
+
+	matcher := policy.NewMatcher()
+	src := policy.NewMemorySource("seed", policy.ParsedRules{
+		CIDRs: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
+	})
+	snap, err := policy.CompileSnapshot(1, "gen-seed", []policy.SourceParsedRules{src.ToSourceParsedRules()})
+	if err != nil {
+		t.Fatalf("compile snapshot: %v", err)
+	}
+	matcher.Publish(snap)
+
+	// Exactly what StartPolicyRouting registers: a matcher, no WAN address.
+	svc.SetPBRConfig(PBRConfig{Enabled: true, PolicyMatcher: matcher})
+	t.Cleanup(func() { svc.clearPBRConfig() })
+
+	err = svc.initPBR(context.Background())
+	if err == nil {
+		// This host satisfies every WAN prerequisite; activation is legal.
+		t.Cleanup(func() { _ = svc.TeardownPBR() })
+		return
+	}
+	if errors.Is(err, ErrPBRMissingHostWAN) {
+		t.Fatalf("initPBR failed to derive HostWANIP for a pre-seeded config: %v", err)
+	}
+	// Any other failure is a genuine environment/host gate, which is what we want to
+	// observe rather than mask.
+	t.Logf("initPBR progressed past WAN-IP derivation and stopped at a later gate: %v", err)
+}

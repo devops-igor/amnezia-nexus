@@ -115,6 +115,13 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 
 	// Hand initPBR the compiled matcher so it installs exactly this snapshot
 	// instead of compiling from an empty source list.
+	//
+	// Every other PBRConfig field is left at its zero value deliberately, including
+	// HostWANIP and GatewayDNSIP. A non-nil PBRConfig suppresses initPBR's
+	// derivation of those values, so supplying our own zero-valued struct would
+	// leave HostWANIP unset and make ValidatePBRPrerequisites fail with
+	// ErrPBRMissingHostWAN on every activation. initPBR must therefore be allowed
+	// to derive the WAN address and gateway itself; only the matcher is ours.
 	s.SetPBRConfig(PBRConfig{
 		Enabled:       true,
 		PolicyMatcher: matcher,
