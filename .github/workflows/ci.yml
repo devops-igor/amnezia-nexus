@@ -99,6 +99,40 @@ jobs:
         with:
           persist-credentials: false
 
+      # #726 runner qualification, step 1 of 3: bind the evidence to this revision and record
+      # the workspace state the tests start from. Read-only; no privilege change.
+      - name: Record pre-test runner ownership and workspace state
+        run: |
+          set -euo pipefail
+          {
+            echo "runner_host=$(hostname)"
+            echo "runner_uid=$(id -u) runner_gid=$(id -g) runner_user=$(id -un)"
+            echo "workspace=$GITHUB_WORKSPACE"
+            echo "workspace_owner_uid=$(stat -c '%u' "$GITHUB_WORKSPACE")"
+            echo "head=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+            echo "runner_temp=$RUNNER_TEMP"
+          } | tee "$RUNNER_TEMP/runner-qualification-pre.txt" >> "$GITHUB_STEP_SUMMARY"
+          ls -lan "$GITHUB_WORKSPACE" | tee "$RUNNER_TEMP/workspace-pre-test.ls" >> "$GITHUB_STEP_SUMMARY"
+          ls -1A "$GITHUB_WORKSPACE" | sort > "$RUNNER_TEMP/workspace-pre-test.names"
+          # The historical failure was a directory inside the workspace that the non-root
+          # runner user could not unlink from. Unlinking needs write permission on the parent
+          # directory, so an unwritable directory anywhere under the workspace is a latent
+          # checkout failure. Detection only; nothing is removed here. Git's own object store
+          # is excluded: it is created and maintained by the checkout action itself.
+          unwritable=$(find "$GITHUB_WORKSPACE" -xdev -type d -not -path "$GITHUB_WORKSPACE/.git/*" -not -writable -print)
+          if [ -n "$unwritable" ]; then
+            echo "::error::workspace holds directories this runner user cannot clean"
+            printf '%s\n' "$unwritable"
+            exit 1
+          fi
+          if [ -e "$GITHUB_WORKSPACE/tasks" ]; then
+            echo "::error::repository task area is present before the tests run"
+            find "$GITHUB_WORKSPACE/tasks" -maxdepth 2 -ls
+            exit 1
+          fi
+          echo "workspace_clean_before_tests=true" >> "$GITHUB_STEP_SUMMARY"
+          echo "repo_task_area_absent_before_tests=true" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
@@ -111,6 +145,7 @@ jobs:
           node-version: '20'
 
       - name: Run setup and tests in the job image
+        id: tests
         run: |
           # Match guest paths and loopback so sibling Docker fixtures see test files/services.
           # The socket and /tmp belong to the isolated guest, never the physical host.
@@ -165,7 +200,143 @@ jobs:
           go test -v -tags with_utls -race -run TestLinuxE2E ./internal/vpn/
           go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
           go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
+
+          # #726 runner qualification, step 2 of 3. Runs inside this same root container and
+          # proves, with the real producer: caches are invocation-owned (cold by
+          # construction), cleanup stays inside this job, and a failed predecessor's partial
+          # export cannot leak into this run. No test is skipped; the same named producer
+          # test that the suite above already runs is invoked once more against an explicit
+          # export directory owned by this invocation.
+          qual="$job_tmp/qualification"
+          out="$qual/export"
+          mkdir -p "$out"
+          # /tmp is bind-mounted from the runner, so this directory is how the host-side
+          # post-test step reads the container's evidence. Scoped to this invocation only.
+          qual_evidence=/tmp/nexus-runner-qualification
+          rm -rf "$qual_evidence"
+          mkdir -p "$qual_evidence"
+          {
+            echo "container_uid=$(id -u) container_gid=$(id -g)"
+            echo "job_tmp=$job_tmp"
+            echo "gocache=$GOCACHE"
+            echo "gomodcache=$GOMODCACHE"
+            echo "repo_root=$GITHUB_WORKSPACE"
+            echo "head=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+          } | tee "$qual_evidence/container.txt"
+          case "$GOCACHE" in "$job_tmp"/*) echo "gocache_invocation_owned=true" ;; *)
+            echo "::error::GOCACHE is not owned by this invocation: $GOCACHE"; exit 1 ;; esac
+          case "$out" in "$job_tmp"/*) echo "export_invocation_owned=true" ;; *)
+            echo "::error::export directory is not owned by this invocation: $out"; exit 1 ;; esac
+
+          # Predecessor remnants that a cancelled run could leave behind: a truncated public
+          # manifest and an orphan temporary file from the same writer.
+          printf '{"schema_version":"1.0.0","truncated":' > "$out/evidence_manifest.json"
+          printf 'orphan from a cancelled predecessor\n' > "$out/.evidence_manifest.json.tmp-predecessor"
+          for attempt in 1 2; do
+            NEXUS_ARTIFACT_DIR="$out" go test -tags with_utls -count=1 -timeout 180s \
+              -run '^TestDifferential_ConfigFreezingAndRedactedManifest$' ./internal/vpn/
+            filedir="$out"
+            test -f "$filedir/evidence_manifest.json" || { echo "::error::manifest missing after attempt $attempt"; exit 1; }
+            test "$(stat -c '%a' "$filedir/evidence_manifest.json")" = "600" || {
+              echo "::error::manifest mode is $(stat -c '%a' "$filedir/evidence_manifest.json"), want 600"; exit 1; }
+            test "$(tail -c 1 "$filedir/evidence_manifest.json")" = "}" || {
+              echo "::error::manifest is not a complete JSON document after attempt $attempt"; exit 1; }
+            grep -q '"schema_version"' "$filedir/evidence_manifest.json" || {
+              echo "::error::manifest lacks the expected schema_version field"; exit 1; }
+            test -f "$filedir/.evidence_manifest.json.tmp-predecessor" || {
+              echo "::error::this invocation deleted a predecessor's temporary file"; exit 1; }
+            entries=$(ls -1A "$filedir" | sort | tr '\n' ' ')
+            echo "attempt=$attempt entries=$entries"
+            test "$entries" = ".evidence_manifest.json.tmp-predecessor evidence_manifest.json " || {
+              echo "::error::unexpected entries in the export directory: $entries"; exit 1; }
+          done
+          echo "predecessor_replaced=true" >> "$qual_evidence/container.txt"
+          # Ordinary runs must not write into the repository working tree at all.
+          if [ -e "$GITHUB_WORKSPACE/tasks" ]; then
+            echo "::error::tests created the repository task area"
+            find "$GITHUB_WORKSPACE/tasks" -maxdepth 2 -ls
+            exit 1
+          fi
+          echo "repo_task_area_absent=true" >> "$qual_evidence/container.txt"
           SCRIPT
+
+      # #726 runner qualification, step 3 of 3: prove the next checkout's non-root clean can
+      # remove everything this job leaves behind. The historical failure was a root-owned
+      # directory the runner user could not unlink from, so the criterion is parent-directory
+      # writability, not file modes. Non-destructive apart from this invocation's own /tmp
+      # evidence directory.
+      - name: Record post-test runner ownership and workspace state
+        if: always()
+        env:
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          set -euo pipefail
+          ls -lan "$GITHUB_WORKSPACE" | tee "$RUNNER_TEMP/workspace-post-test.ls" >> "$GITHUB_STEP_SUMMARY"
+          ls -1A "$GITHUB_WORKSPACE" | sort > "$RUNNER_TEMP/workspace-post-test.names"
+          # If the checkout itself failed there is no pre-test baseline to compare against;
+          # report that distinctly instead of crashing on a missing file.
+          if [ ! -f "$RUNNER_TEMP/workspace-pre-test.names" ]; then
+            : > "$RUNNER_TEMP/workspace-pre-test.names"
+          fi
+          {
+            echo "cleaner_uid=$(id -u) cleaner_user=$(id -un)"
+            echo "--- new top-level workspace entries created by this job ---"
+            if [ -s "$RUNNER_TEMP/workspace-pre-test.names" ]; then
+              comm -13 "$RUNNER_TEMP/workspace-pre-test.names" "$RUNNER_TEMP/workspace-post-test.names"
+            else
+              echo "(no pre-test baseline: the checkout step did not complete)"
+            fi
+            echo "--- writability of every directory under the workspace ---"
+          } | tee "$RUNNER_TEMP/runner-qualification-post.txt" >> "$GITHUB_STEP_SUMMARY"
+
+          unwritable=$(find "$GITHUB_WORKSPACE" -xdev -type d -not -path "$GITHUB_WORKSPACE/.git/*" -not -writable -print)
+          printf '%s\n' "$unwritable" >> "$RUNNER_TEMP/runner-qualification-post.txt"
+          if [ -n "$unwritable" ]; then
+            echo "::error::this job left directories the next non-root checkout cannot clean: $(printf '%s ' $unwritable)"
+            exit 1
+          fi
+          echo "all_workspace_dirs_removable_by_runner_user=true" >> "$RUNNER_TEMP/runner-qualification-post.txt"
+
+          if [ -e "$GITHUB_WORKSPACE/tasks" ]; then
+            echo "::error::tests created the repository task area"
+            find "$GITHUB_WORKSPACE/tasks" -maxdepth 2 -ls
+            exit 1
+          fi
+          {
+            echo "repo_task_area_absent_after_tests=true"
+            echo "--- in-container qualification evidence ---"
+            cat /tmp/nexus-runner-qualification/container.txt 2>/dev/null \
+              || echo "container evidence absent: the in-container qualification step did not complete"
+          } | tee -a "$RUNNER_TEMP/runner-qualification-post.txt" >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -s /tmp/nexus-runner-qualification/container.txt ]; then
+            # Absent evidence is only an error when the test step claimed success. If the
+            # tests themselves failed, that failure is the real result and must not be
+            # masked by a second, misleading qualification error.
+            if [ "${TESTS_OUTCOME:-}" = "success" ]; then
+              echo "::error::the test step reported success but produced no qualification evidence"
+              exit 1
+            fi
+            echo "qualification_not_produced_because_tests_outcome=${TESTS_OUTCOME:-unknown}" \
+              >> "$RUNNER_TEMP/runner-qualification-post.txt"
+            exit 0
+          fi
+          cp /tmp/nexus-runner-qualification/container.txt "$RUNNER_TEMP/container-qualification.txt"
+          # Cleanup stays inside this invocation and its own evidence directory.
+          rm -rf /tmp/nexus-runner-qualification
+
+      - name: Upload runner qualification evidence
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: runner-qualification-evidence
+          path: |
+            ${{ runner.temp }}/runner-qualification-pre.txt
+            ${{ runner.temp }}/workspace-pre-test.ls
+            ${{ runner.temp }}/workspace-post-test.ls
+            ${{ runner.temp }}/runner-qualification-post.txt
+            ${{ runner.temp }}/container-qualification.txt
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload Test Coverage
         uses: actions/upload-artifact@v7
