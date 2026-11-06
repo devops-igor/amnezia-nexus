@@ -36,6 +36,8 @@ export E2E_SERVER_SSH_USER="${E2E_SERVER_SSH_USER:-ubuntu}"
 export E2E_SERVER_SSH_PASS="${E2E_SERVER_SSH_PASS:-}"
 export E2E_TESTING="${E2E_TESTING:-true}"
 export E2E_REQUIRE_DATAPLANE="${E2E_REQUIRE_DATAPLANE:-false}"
+# Privacy-first diagnostics: allowlisted request/navigation events only.
+export E2E_DIAGNOSTICS_DIR="${E2E_DIAGNOSTICS_DIR:-$REPO_ROOT/test-artifacts/e2e-diagnostics}"
 
 # Stage status trackers
 STAGE1_STATUS="SKIPPED"
@@ -77,6 +79,23 @@ print_summary() {
         echo "  OVERALL VERDICT: LIFECYCLE VERIFICATION FAILED [EXIT ${OVERALL_STATUS}]"
     fi
     echo "=================================================================="
+}
+
+# Privacy-first evidence gate. Runs in this lifecycle job (never a separate
+# qualification job) and fails closed: when validation is uncertain the whole
+# diagnostics directory is removed, so the upload step publishes nothing.
+finalize() {
+    local validate_status=0
+    if ! (cd "$REPO_ROOT" && python3 -m tests.e2e.diagnostics \
+            --validate-dir "$E2E_DIAGNOSTICS_DIR" --prune); then
+        echo "ERROR: E2E diagnostics failed validation; evidence withheld." >&2
+        validate_status=1
+        OVERALL_STATUS=1
+        rm -rf "$E2E_DIAGNOSTICS_DIR"
+    fi
+    echo "==> Diagnostics directory: ${E2E_DIAGNOSTICS_DIR} (validation exit ${validate_status})"
+    print_summary
+    exit "$OVERALL_STATUS"
 }
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
@@ -121,8 +140,7 @@ if [ "$READY" -ne 1 ]; then
     echo "ERROR: Panel fixture failed readiness probe within 30s." >&2
     echo "Please ensure the panel is running on a clean-slate database before running this script." >&2
     OVERALL_STATUS=1
-    print_summary
-    exit 1
+    finalize
 fi
 echo "==> Panel fixture is healthy."
 
@@ -140,8 +158,7 @@ else
     STAGE1_STATUS="FAILED"
     OVERALL_STATUS=1
     echo "ERROR: Stage 1 FAILED. Aborting subsequent stages." >&2
-    print_summary
-    exit "$OVERALL_STATUS"
+    finalize
 fi
 
 # ------------------------------------------------------------------------------
@@ -158,8 +175,7 @@ else
     STAGE2_STATUS="FAILED"
     OVERALL_STATUS=1
     echo "ERROR: Stage 2 FAILED. Aborting subsequent stages." >&2
-    print_summary
-    exit "$OVERALL_STATUS"
+    finalize
 fi
 
 # ------------------------------------------------------------------------------
@@ -188,5 +204,5 @@ else
     echo "ERROR: Stage 3 FAILED." >&2
 fi
 
-print_summary
-exit "$OVERALL_STATUS"
+finalize
+

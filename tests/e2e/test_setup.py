@@ -35,8 +35,18 @@ def test_setup_client_validation_password_mismatch(page: Page, base_url: str) ->
 
 
 @pytest.mark.e2e
-def test_setup_success(page: Page, base_url: str, admin_user: str, admin_pass: str) -> None:
-    """Successful initial setup creates admin user and redirects."""
+def test_setup_success(
+    page: Page,
+    base_url: str,
+    admin_user: str,
+    admin_pass: str,
+    request_navigation_evidence,
+) -> None:
+    """Successful initial setup creates admin user and redirects.
+
+    ``request_navigation_evidence`` only records allowlisted request and
+    navigation facts; it changes no assertion or timing (issue #724).
+    """
     page.goto(f"{base_url}/setup")
     page.wait_for_load_state("networkidle")
 
