@@ -57,7 +57,7 @@ func setupVLESSPipelineTestRouter(t *testing.T) (*chi.Mux, *Handlers, map[string
 			case strings.Contains(cmd, "docker inspect"):
 				return "true false 123", "", 0, nil
 			case strings.Contains(cmd, "xray version"):
-				return "Xray 26.10.29", "", 0, nil
+				return "Xray 26.10.31", "", 0, nil
 			default:
 				return "OK", "", 0, nil
 			}

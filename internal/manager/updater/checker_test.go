@@ -34,8 +34,8 @@ func TestCheckEngine_Success(t *testing.T) {
 		expectedProtocol string
 		wantUpdate       bool
 	}{
-		{name: "xray update available", engine: EngineXray, installed: "v26.10.28", upstreamTag: "v26.10.29", profile: "modern_pq", expectedProtocol: "vless", wantUpdate: true},
-		{name: "xray already latest", engine: EngineXray, installed: "v26.10.29", upstreamTag: "v26.10.29", profile: "modern_pq", expectedProtocol: "vless", wantUpdate: false},
+		{name: "xray update available", engine: EngineXray, installed: "v26.10.28", upstreamTag: "v26.10.31", profile: "modern_pq", expectedProtocol: "vless", wantUpdate: true},
+		{name: "xray already latest", engine: EngineXray, installed: "v26.10.31", upstreamTag: "v26.10.31", profile: "modern_pq", expectedProtocol: "vless", wantUpdate: false},
 		{name: "naive update available", engine: EngineNaive, installed: "v154.0.8037.49-1", upstreamTag: "v154.0.8037.49-5", expectedProtocol: "naive", wantUpdate: true},
 		{name: "caddy already latest", engine: EngineCaddy, installed: "v2.8.4", upstreamTag: "v2.8.4", expectedProtocol: "caddy", wantUpdate: false},
 		{name: "sing-box rc to release update available", engine: EngineSingBox, installed: "v1.12.0-rc1", upstreamTag: "v1.12.0", expectedProtocol: "sing-box", wantUpdate: true},
@@ -579,6 +579,10 @@ func TestCheckEngine_ProfileAwareness(t *testing.T) {
 		{name: "xray legacy with 26.10 breaking", engine: EngineXray, installed: "v1.8.24", upstreamTag: "v26.10.31", profile: "legacy", wantUpstreamNewer: true, wantCompatible: false, wantUpdate: false},
 		{name: "xray legacy with 1.8 compatible", engine: EngineXray, installed: "v1.8.24", upstreamTag: "v1.8.25", profile: "legacy", wantUpstreamNewer: true, wantCompatible: true, wantUpdate: true},
 		{name: "xray modern_pq with 26.10 newer", engine: EngineXray, installed: "v26.10.29", upstreamTag: "v26.10.31", profile: "modern_pq", wantUpstreamNewer: true, wantCompatible: true, wantUpdate: true},
+		// An operator whose saved profile string is the retracted version keeps a working,
+		// compatible selector — but must still be offered the supported release as an update.
+		{name: "xray retracted version saved as profile", engine: EngineXray, installed: "v26.10.29", upstreamTag: "v26.10.31", profile: "26.10.29", wantUpstreamNewer: true, wantCompatible: true, wantUpdate: true},
+		{name: "xray current pin already up to date", engine: EngineXray, installed: "v26.10.31", upstreamTag: "v26.10.31", profile: "modern_pq", wantUpstreamNewer: false, wantCompatible: true, wantUpdate: false},
 		{name: "xray modern pq alias with 26.10 newer", engine: EngineXray, installed: "v26.10.29", upstreamTag: "v26.10.31", profile: "modern pq", wantUpstreamNewer: true, wantCompatible: true, wantUpdate: true},
 		{name: "xray post_quantum alias with 26.10 newer", engine: EngineXray, installed: "v26.10.29", upstreamTag: "v26.10.31", profile: "post_quantum", wantUpstreamNewer: true, wantCompatible: true, wantUpdate: true},
 		{name: "xray post-quantum alias with 26.10 newer", engine: EngineXray, installed: "v26.10.29", upstreamTag: "v26.10.31", profile: "post-quantum", wantUpstreamNewer: true, wantCompatible: true, wantUpdate: true},
