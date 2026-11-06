@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,17 @@ import (
 // private namespace and configuring *that* namespace lets the real prerequisite
 // checks pass legitimately, instead of loosening them or injecting fake success.
 // No host sysctl is touched.
+//
+// Why the child also isolates a mount namespace: the CI job container mounts
+// `/proc` read-write but `/proc/sys` as a separate read-only mount (measured as
+// `proc=rw proc_sys=ro` in evidence/namespace-readback-ci/test-job.log). A
+// `sysctl -w` in that container therefore cannot take effect while still exiting
+// 0, which is why a previous revision prepared nothing and the activation child
+// read `accept_local=0`. The child now mounts its own private procfs inside a
+// mount namespace that is verified private first, so the prerequisites are
+// written and read back by the same process whose view the guard consumes. That
+// uses only the capabilities the job already grants (SYS_ADMIN for the mount
+// namespace, NET_ADMIN/NET_RAW and /dev/net/tun as before).
 //
 // CI registration is deliberate: .github/workflows/ci.yml's existing Linux-E2E
 // step targets ./internal/vpn/forwarder/..., which does NOT include this package.
@@ -60,11 +72,6 @@ func init() {
 	// runs the real activation and exits non-zero on any failure.
 	if os.Getenv(envPolicyE2EChild) == "1" {
 		os.Exit(runPolicyEnablementChild())
-	}
-	// One-shot context readback: same re-exec mechanism, prints one synthetic
-	// observation line and exits. It configures and writes nothing.
-	if os.Getenv(envPolicyE2EContextProbe) == "1" {
-		os.Exit(runPolicyE2EContextProbe())
 	}
 }
 
@@ -121,46 +128,12 @@ func TestLinuxE2E_PolicyEnablement(t *testing.T) {
 	}
 	defer func() { _ = exec.Command("ip", "netns", "del", ns).Run() }()
 
-	// Authentic prerequisites, scoped to this namespace only.
-	for _, sysctl := range []string{
-		"net.ipv4.ip_forward=1",
-		"net.ipv4.conf.all.rp_filter=2",
-		"net.ipv4.conf.all.accept_local=1",
-	} {
-		if out, err := exec.Command("ip", "netns", "exec", ns, "sysctl", "-w", sysctl).CombinedOutput(); err != nil {
-			// The utility's own output is not echoed: only its failure class and the
-			// prerequisite it was asked to set are, so a host path or address in a
-			// utility message cannot reach CI logs.
-			t.Fatalf("cannot set %s in the test namespace: category=%s (%s)", sysctl,
-				classifyPolicyE2EPrepareFailure(err), firstPolicyE2EToken(string(out)))
-		}
-	}
-
-	// Observe the prerequisites in the exact wrapper family that prepared them, so
-	// the child's readback has a same-boundary reference instead of an inference.
-	// One extra process start; it writes nothing.
-	prepReadback, prepOK := observePreparationContext(t, ns)
-	switch {
-	case !prepOK:
-		// The observation itself is unavailable: say so and let the production guard
-		// decide. An unavailable readback is never reported as a passing gate.
-		t.Logf("preparation-context readback unavailable; the production guard remains the deciding check")
-	case !prerequisitesObserved(prepReadback):
-		// The preparation loop above succeeded but the prepared values are not
-		// visible to a fresh invocation in the same namespace wrapper. This is an
-		// environment fact, not a product defect: name it instead of letting the
-		// activation guard report it as a missing kernel prerequisite.
-		class, _ := classifyPreparationReadback(prepReadback)
-		t.Fatalf("test environment cannot provide its own prerequisites: %s (%s); "+
-			"the production guard was never loosened and activation was not attempted",
-			class, prepReadback.report())
-	}
-
 	// Re-exec this binary inside the namespace so procfs reads resolve to the
-	// namespace's own values.
+	// namespace's own values. The child also isolates its mount namespace and
+	// prepares the prerequisites there, because it is the process whose view the
+	// production guard reads; see the file comment.
 	cmd := exec.Command("ip", "netns", "exec", ns, os.Args[0], "-test.run=TestLinuxE2E_PolicyEnablementChild", "-test.v")
-	cmd.Env = append(os.Environ(), envPolicyE2EChild+"=1", envPolicyE2ENetns+"="+ns,
-		envPolicyE2EPrepReadback+"="+prepReadback.line())
+	cmd.Env = append(os.Environ(), envPolicyE2EChild+"=1", envPolicyE2ENetns+"="+ns)
 	out, err := cmd.CombinedOutput()
 	t.Logf("child output:\n%s", out)
 	if err != nil {
@@ -194,22 +167,55 @@ func TestLinuxE2E_PolicyEnablementChild(t *testing.T) {
 	// exited by now if the re-exec worked.
 }
 
-// runPolicyEnablementChild performs the full positive cycle inside the namespace
-// and returns a process exit code.
+// runPolicyEnablementChild isolates the test's own mount namespace, prepares the
+// production guard's prerequisites inside it, then performs the full positive
+// cycle. It returns a process exit code.
+//
+// The isolation and its cleanup live in this function rather than in the re-exec
+// entry point so the deferred detach runs on both the success and the failure
+// path; os.Exit is only reached after this function has returned.
 func runPolicyEnablementChild() int {
+	// A mount namespace is per-thread, so the fresh procfs is only visible to the
+	// thread that mounted it. Pin this goroutine for the whole privileged section
+	// so the synchronous production prerequisite reads stay on that thread instead
+	// of resolving against another thread's mount view.
+	//
+	// Deliberately not unlocked: this process exits immediately after the child
+	// returns, and Go terminates a thread that exits while locked rather than
+	// returning it to the runtime pool. Unlocking would hand a thread whose mount
+	// namespace this test rewrote back to the scheduler in a live process.
+	runtime.LockOSThread()
+
+	cleanup, err := enterPolicyE2EPrivateProcfs(realPolicyE2EMountOps())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL: isolate test mount namespace: %v\n", err)
+		return 1
+	}
+	defer cleanup()
+
+	return runPolicyEnablementChildInPrivateProcfs()
+}
+
+// runPolicyEnablementChildInPrivateProcfs performs the positive cycle inside the
+// namespace and private procfs established by runPolicyEnablementChild.
+func runPolicyEnablementChildInPrivateProcfs() int {
 	fail := func(format string, args ...any) int {
 		fmt.Fprintf(os.Stderr, "FAIL: "+format+"\n", args...)
 		return 1
 	}
 	say := func(line string) { fmt.Println(line) }
 
-	// ---- Prerequisite readback at the activation boundary ---------------------
-	// Observed in this process, which is the one that runs the real activation and
-	// therefore the one whose procfs view the production guard reads. Reported, not
-	// asserted here: the guard below still decides, unchanged and fail-closed.
-	activationRB, activationClass, activationOK := policyE2EActivationBoundary()
-	say("READBACK activation-context " + activationRB.report() + " class=" + activationClass +
-		" prerequisites=" + policyE2EObservedToken(activationOK))
+	// ---- Prepare and verify the production guard's prerequisites -------------
+	// Written and read back in this process, which is the one that runs the real
+	// activation and therefore the one whose procfs view the guard reads. A step
+	// that does not take effect fails here, naming the class, instead of surfacing
+	// later as a product prerequisite failure.
+	if err := applyPolicyE2EPrerequisites(policyE2ESysctlRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "READBACK preparation-context %s\n", reportPolicyE2EContext())
+		return fail("test environment cannot provide its own prerequisites: %v; "+
+			"the production guard was never loosened and activation was not attempted", err)
+	}
+	say("READBACK preparation-context " + reportPolicyE2EContext())
 
 	// ---- Bring up the namespace's own network plumbing ------------------------
 	steps := [][]string{
@@ -224,7 +230,8 @@ func runPolicyEnablementChild() int {
 	}
 	for _, step := range steps {
 		if out, err := exec.Command(step[0], step[1:]...).CombinedOutput(); err != nil {
-			return fail("network setup %q: %v (%s)", strings.Join(step, " "), err, strings.TrimSpace(string(out)))
+			return fail("network setup %q: %s (%s)", strings.Join(step, " "),
+				classifyPolicyE2EPrepareFailure(err), strings.TrimSpace(string(out)))
 		}
 	}
 
@@ -287,8 +294,7 @@ func runPolicyEnablementChild() int {
 		// Name the environment facts the guard's own error cannot: the per-device
 		// key it tried to configure, and this context's re-read after the refusal.
 		// The guard still decides; this only makes a refusal actionable.
-		fmt.Fprintf(os.Stderr, "READBACK activation-failure %s class=%s %s\n",
-			describePolicyE2EDeviceReadback(), activationClass, readPolicyE2EContext("").report())
+		fmt.Fprintf(os.Stderr, "READBACK activation-failure %s\n", reportPolicyE2EContext())
 		return fail("activation: %v", err)
 	}
 	if !svc.PBREnabled() {
