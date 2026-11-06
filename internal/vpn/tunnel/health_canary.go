@@ -69,15 +69,16 @@ type DeviceProvider interface {
 
 // SetDeviceProvider registers a DeviceProvider or lookup callback for retrieving active backend devices by tunnel ID.
 // When provider implements SubnetCIDR() string, the prober's SubnetCIDR is updated without holding prober lock during the lookup.
+// When it also implements HealthDisabledNotifier, the prober registers it as the
+// automatic health-disable failover target. That is the same optional-interface
+// composition used for SubnetCIDR: the data plane owner is already handed to the
+// prober here, so the terminal health-disable notification needs no extra
+// construction step at the composition root.
 func (hp *HealthProber) SetDeviceProvider(provider any) {
 	if hp == nil {
 		return
 	}
-	if sp, ok := provider.(interface{ SubnetCIDR() string }); ok {
-		if c := sp.SubnetCIDR(); c != "" {
-			hp.SetSubnetCIDR(c)
-		}
-	}
+	hp.applyProviderCapabilities(provider)
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
 	switch p := provider.(type) {

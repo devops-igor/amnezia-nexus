@@ -88,9 +88,13 @@ type HealthProber struct {
 	preStatusCommitHook  func() // test synchronization, after the identity check
 	preFailureCommitHook func() // test synchronization, after the identity check
 	preActiveHookHook    func() // test synchronization, before executeActiveHook
-	stopCh               chan struct{}
-	wg                   sync.WaitGroup
-	running              bool
+	// healthDisabledNotifier carries the terminal health auto-disable to the
+	// data plane owner so established sessions pinned to the backend move off
+	// it. Nil means "status only", the historical behavior.
+	healthDisabledNotifier func(ctx context.Context, tunnel *models.BackendTunnel) error
+	stopCh                 chan struct{}
+	wg                     sync.WaitGroup
+	running                bool
 }
 
 // NewHealthProber initializes a new HealthProber instance.
@@ -605,10 +609,11 @@ func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serve
 	}
 	if swapped {
 		currentTunnel.StateVersion++
-		if err := hp.updateHealthIfCurrent(currentTunnel, func() {
-			hp.autoDisabled[serverID] = true
-			hp.successCounts[serverID] = 0
-		}); err != nil {
+		// This reconciliation IS the terminal health-disable commit for a
+		// sibling probe whose own CAS missed, so it owns the failover
+		// notification. The "already disabled/health" branch below does not:
+		// whoever committed that transition already notified.
+		if err := hp.commitThresholdDisable(ctx, currentTunnel); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -711,6 +716,22 @@ func (hp *HealthProber) transitionToHandshakeBlocked(ctx context.Context, snapsh
 	})
 }
 
+// commitThresholdDisable records the consecutive-failure bookkeeping for a
+// committed health auto-disable and, only when that write is accepted for the
+// current tunnel generation, reports the disable to the data plane owner so it
+// can migrate the sessions still pinned to the backend. A rejected write means
+// a newer generation owns this backend, so there is nothing to report.
+func (hp *HealthProber) commitThresholdDisable(ctx context.Context, snapshot *models.BackendTunnel) error {
+	if err := hp.updateHealthIfCurrent(snapshot, func() {
+		hp.autoDisabled[snapshot.ServerID] = true
+		hp.successCounts[snapshot.ServerID] = 0
+	}); err != nil {
+		return err
+	}
+	hp.notifyHealthDisabled(ctx, snapshot.ServerID, snapshot.ID)
+	return nil
+}
+
 func (hp *HealthProber) transitionToThresholdDisabled(ctx context.Context, snapshot *models.BackendTunnel) error {
 	if hp.pool != nil {
 		swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
@@ -731,10 +752,10 @@ func (hp *HealthProber) transitionToThresholdDisabled(ctx context.Context, snaps
 			snapshot.StateVersion++
 			snapshot.Status = models.TunnelStatusDisabled
 			snapshot.DisableReason = models.DisableReasonHealth
-			return hp.updateHealthIfCurrent(snapshot, func() {
-				hp.autoDisabled[snapshot.ServerID] = true
-				hp.successCounts[snapshot.ServerID] = 0
-			})
+			// Terminal health disable committed: hand the established sessions
+			// pinned to this backend to the data plane owner so it can migrate
+			// them. Runs outside hp.mu/pool.mu and is idempotent.
+			return hp.commitThresholdDisable(ctx, snapshot)
 		}
 		reconciled, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID, snapshot.ID)
 		if recErr != nil {
@@ -827,10 +848,7 @@ func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.
 			}
 			if swapped {
 				snapshot.StateVersion++
-				if err := hp.updateHealthIfCurrent(snapshot, func() {
-					hp.autoDisabled[snapshot.ServerID] = true
-					hp.successCounts[snapshot.ServerID] = 0
-				}); err != nil {
+				if err := hp.commitThresholdDisable(ctx, snapshot); err != nil {
 					return 0, err
 				}
 			} else {
