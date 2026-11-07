@@ -20,7 +20,12 @@ from urllib.parse import urljoin
 import pytest
 from playwright.sync_api import Page
 
+from tests.e2e import diagnostics
+
 logger = logging.getLogger(__name__)
+
+# Latest observed browser identity, folded into the runtime version report.
+_BROWSER_VERSIONS: Dict[str, str] = {}
 
 # ── Marker registration ──────────────────────────────────────────────
 
@@ -51,6 +56,10 @@ def pytest_runtest_makereport(item: pytest.Item, call):
     report = outcome.get_result()
     if report.when == "call" and report.failed:
         funcargs = getattr(item, "funcargs", {})
+        recorder = funcargs.get("request_navigation_evidence")
+        if recorder is not None:
+            payload = diagnostics.build_payload(item.nodeid, recorder)
+            diagnostics.write_failure_artifact(diagnostics.diagnostics_dir(), payload)
         page_obj = funcargs.get("page") or funcargs.get("authenticated_page")
         if page_obj and not page_obj.is_closed():
             screenshot_dir = os.path.join(os.path.dirname(__file__), "screenshots")
@@ -61,6 +70,14 @@ def pytest_runtest_makereport(item: pytest.Item, call):
                 logger.info("Screenshot saved: %s", path)
             except Exception:
                 pass
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Record the exact runtime versions of the run that produced evidence."""
+    if _BROWSER_VERSIONS:
+        diagnostics.write_versions_artifact(
+            diagnostics.diagnostics_dir(), diagnostics.environment_versions(), _BROWSER_VERSIONS
+        )
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────
@@ -164,6 +181,20 @@ def _do_login_inner(page: Page, base_url: str, username: str, password: str) -> 
     # Verify we're on an authenticated page (not redirected to login)
     if "/login" in page.url:
         raise RuntimeError(f"Login succeeded but page redirected to login. URL: {page.url}")
+
+
+@pytest.fixture
+def request_navigation_evidence(page: Page):
+    """Record allowlisted request/navigation events for the current test.
+
+    Attaches to every page listener, then yields the recorder so the failure
+    hook can persist a validated payload when this test fails.
+    """
+    recorder = diagnostics.RequestNavigationRecorder()
+    diagnostics.attach(page, recorder)
+    _BROWSER_VERSIONS.clear()
+    _BROWSER_VERSIONS.update(recorder.browser)
+    return recorder
 
 
 @pytest.fixture
