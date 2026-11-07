@@ -44,6 +44,25 @@ COLLECTOR_STEP = "Record post-test runner ownership and workspace state"
 PREFLIGHT_INDENT = " " * 10
 
 
+def extract_container_body() -> str:
+    """Return the shell script fed to `docker run` as a heredoc, exactly as shipped.
+
+    The test step pipes a quoted heredoc (`<<'SCRIPT' ... SCRIPT`) into the container, so
+    the body is reproduced verbatim between the heredoc opener and its terminator. This is
+    what actually executes as root inside the job image, including the evidence-directory
+    setup whose ownership the host collector depends on.
+    """
+    lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if "<<'SCRIPT'" in line)
+    except StopIteration:  # pragma: no cover - guards a rewritten step
+        raise SystemExit(f"container heredoc not found in {WORKFLOW}") from None
+    end = next(
+        i for i in range(start + 1, len(lines)) if lines[i].strip() == "SCRIPT"
+    )
+    return "\n".join(line.strip() for line in lines[start + 1 : end])
+
+
 def extract_step_body(step_name: str) -> str:
     """Return the `run:` script of the named step, exactly as shipped."""
     lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
@@ -187,6 +206,10 @@ def check(name: str, passed: bool, detail: str) -> None:
 def main() -> int:
     preflight = extract_step_body(PREFLIGHT_STEP)
     collector = extract_step_body(COLLECTOR_STEP)
+    # The container's own shell is the heredoc fed to `docker run` inside the test step.
+    # O4 asserts against it verbatim, so the ownership hand-over is checked on the shipped
+    # script rather than on a paraphrase.
+    container_body = extract_container_body()
 
     for label, body in (("preflight", preflight), ("collector", collector)):
         parsed = subprocess.run(
@@ -436,6 +459,137 @@ def main() -> int:
             "A0/baseline-comparison-ran",
             (host / "workspace-post-test.names").is_file(),
             "post-test snapshot written",
+        )
+    finally:
+        sandbox.cleanup()
+
+    # ---- ownership boundary between the root container and the host collector ----------
+    #
+    # The observed failure: the container created /tmp/nexus-qualified.XXXXXX as root with
+    # mode 0700, so the non-root collector could neither read identity.txt (it reported
+    # container_identity_missing and lost the real qualification) nor remove the directory
+    # (rm: Operation not permitted), which failed the step.
+    #
+    # These controls exercise the real collector body against real directories in a
+    # disposable sandbox. The root-owned case cannot be reproduced without root or a chown,
+    # which is out of scope here, so it is modelled by a directory owned by another uid when
+    # the test user can create one; otherwise the ownership branch is asserted structurally
+    # and the limitation is stated rather than papered over.
+    sandbox = Sandbox()
+    try:
+        host = sandbox.complete_baseline()
+        head = subprocess.run(
+            ["git", "-C", str(sandbox.workspace), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        out_dir = Path(sandbox.shared_tmp / f"nexus-qual-out-{sandbox.root.name}")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_file = out_dir / "1-1-test.txt"
+
+        def seed_container_dir(complete: bool = True) -> Path:
+            d = Path(tempfile.mkdtemp(prefix="nexus-qualified.", dir=sandbox.shared_tmp))
+            (d / "identity.txt").write_text(
+                (("state=complete\n") if complete else "")
+                + "run_id=1\nrun_attempt=1\njob=test\nrepository=example/example\n"
+                f"head={head}\ncontainer_uid=0 container_gid=0\n"
+                "gocache_invocation_owned=true\nexport_invocation_owned=true\n"
+                "predecessor_replaced=true\nrepo_task_area_absent=true\n",
+                encoding="utf-8",
+            )
+            out_file.write_text(f"{d}\n", encoding="utf-8")
+            return d
+
+        # O1: a readable directory owned by this user is removed and the step succeeds.
+        owned = seed_container_dir()
+        result = sandbox.run(collector, TESTS_OUTCOME="success")
+        stream = result.stdout + result.stderr + sandbox.summary.read_text(encoding="utf-8")
+        check("O1/exit", result.returncode == 0, f"exit {result.returncode}")
+        check("O1/removed-own-dir", not owned.exists(), "own evidence dir removed")
+        check("O1/verdict-kept", "qualification=COMPLETE" in stream, "COMPLETE preserved")
+        if owned.exists():  # pragma: no cover - defensive cleanup
+            shutil.rmtree(owned, ignore_errors=True)
+
+        # O2: a directory this user does NOT own must not fail the step. It is reported and
+        # left untouched, because rm on a foreign-owned directory in sticky /tmp is EPERM and
+        # is not this step's contract to force.
+        foreign = seed_container_dir()
+        foreign_uid = None
+        try:
+            other = os.getuid() + 1 if os.getuid() != 0 else 1
+            os.chown(foreign, other, os.getgid())
+            foreign_uid = other
+        except (PermissionError, OSError):
+            foreign_uid = None
+        if foreign_uid is None:
+            check(
+                "O2/foreign-owner-skipped",
+                True,
+                "cannot create a foreign-owned directory without root; ownership branch "
+                "asserted structurally (see O4)",
+            )
+        else:
+            result = sandbox.run(collector, TESTS_OUTCOME="success")
+            stream = result.stdout + result.stderr + sandbox.summary.read_text(encoding="utf-8")
+            check("O2/exit", result.returncode == 0, f"exit {result.returncode}")
+            check(
+                "O2/not-owned-reported",
+                "container_evidence_dir_not_owned" in stream,
+                "foreign ownership reported, not failed",
+            )
+            check("O2/left-untouched", foreign.exists(), "foreign dir not removed")
+        if foreign.exists():  # pragma: no cover - defensive cleanup
+            try:
+                os.chown(foreign, os.getuid(), os.getgid())
+            except OSError:
+                pass
+            shutil.rmtree(foreign, ignore_errors=True)
+
+        # O3: a symlink at the announced path must never be followed or removed.
+        target = Path(tempfile.mkdtemp(prefix="nexus-target.", dir=sandbox.shared_tmp))
+        link = Path(sandbox.shared_tmp) / f"nexus-qualified.link{sandbox.root.name}"
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(target)
+        out_file.write_text(f"{link}\n", encoding="utf-8")
+        result = sandbox.run(collector, TESTS_OUTCOME="success")
+        stream = result.stdout + result.stderr + sandbox.summary.read_text(encoding="utf-8")
+        # A refused handoff means no usable evidence. With TESTS_OUTCOME=success that is the
+        # documented fail-closed X1 contract (exit 1, explicit error), not a cleanup failure:
+        # the step must never report success for a run whose qualification it could not collect.
+        check("O3/exit", result.returncode == 1, f"exit {result.returncode}, want 1 (fail-closed)")
+        check("O3/symlink-refused", "handoff_path_is_symlink" in stream, "symlink refused")
+        check("O3/target-intact", target.exists(), "symlink target untouched")
+        check(
+            "O3/no-misleading-cleanup-error",
+            "Operation not permitted" not in stream,
+            "failure is the explicit evidence error, not a raw rm error",
+        )
+        link.unlink(missing_ok=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+        # O4: the shipped container body must hand the directory to the host identity, and the
+        # collector must treat a non-owned directory as a report rather than a hard failure.
+        # Asserted on the real extracted bodies, so this tracks the shipped shell.
+        check(
+            "O4/container-hands-ownership",
+            "chown \"$NEXUS_HOST_UID:$NEXUS_HOST_GID\" \"$qual\"" in container_body
+            and "NEXUS_HOST_UID" in container_body,
+            "container chowns its evidence dir to the host uid",
+        )
+        check(
+            "O4/host-uid-exported",
+            '--env NEXUS_HOST_UID="$(id -u)"' in WORKFLOW.read_text(encoding="utf-8"),
+            "host uid/gid passed into the container",
+        )
+        check(
+            "O4/collector-ownership-aware",
+            "-O \"$d\"" in collector and "container_evidence_dir_not_owned" in collector,
+            "collector checks ownership before removing",
+        )
+        check(
+            "O4/no-silent-swallow",
+            "|| true" not in collector.split("removed_own_evidence_dir")[0][-400:],
+            "cleanup is not silenced with || true",
         )
     finally:
         sandbox.cleanup()

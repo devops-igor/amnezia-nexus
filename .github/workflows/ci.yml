@@ -235,12 +235,17 @@ jobs:
             --env GITHUB_WORKSPACE --env GOFLAGS \
             --env GITHUB_RUN_ID --env GITHUB_RUN_ATTEMPT --env GITHUB_JOB --env GITHUB_REPOSITORY \
             --env NEXUS_QUAL_OUT_FILE="$NEXUS_QUAL_OUT_FILE" \
+            --env NEXUS_HOST_UID="$(id -u)" --env NEXUS_HOST_GID="$(id -g)" \
             --env GOROOT="$(go env GOROOT)" \
             --env NODE_BIN="$(dirname "$(command -v node)")" \
             localhost:5000/nexus-ci-job:latest bash -seuo pipefail <<'SCRIPT'
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           job_tmp=$(mktemp -d /tmp/nexus-tests.XXXXXX)
-          trap 'rm -rf "$job_tmp"' EXIT
+          # Hand the evidence directory to the host collector's identity on every exit path,
+          # including an early failure: the collector must always be able to read (and later
+          # remove) what this root container wrote through the shared /tmp mount. A failure
+          # here is announced rather than hidden, and never replaces the job_tmp cleanup.
+          trap 'if [ -n "${qual:-}" ] && ! chown -R "${NEXUS_HOST_UID:-0}:${NEXUS_HOST_GID:-0}" "$qual"; then echo "::warning::could not hand the evidence directory to the host collector identity"; fi; rm -rf "$job_tmp"' EXIT
           # Never reuse /github/home caches: stale modules can lose sqlite vtab build tags.
           export GOPATH="$job_tmp/go" GOMODCACHE="$job_tmp/mod" GOCACHE="$job_tmp/cache"
           export npm_config_prefix="$job_tmp/npm"
@@ -282,8 +287,19 @@ jobs:
           # test that the suite above already runs is invoked once more against an explicit
           # export directory owned by this invocation.
           qual="$(mktemp -d /tmp/nexus-qualified.XXXXXX)" || { echo "::error::cannot allocate an invocation-owned evidence directory"; exit 1; }
+          # This container runs as root but its evidence directory is read and removed by the
+          # non-root host collector step, through the shared /tmp mount. A root-owned 0700
+          # directory in a sticky /tmp is neither readable nor removable by that user, which
+          # is exactly how a previous run lost its real qualification: the collector reported
+          # container_identity_missing (it could not even read identity.txt) and then failed
+          # removing the directory. Hand the directory to the host collector's identity, so
+          # ownership follows the reader rather than the writer.
+          chmod 0755 "$qual"
+          chown "$NEXUS_HOST_UID:$NEXUS_HOST_GID" "$qual"
+          test "$(stat -c '%u' "$qual")" = "$NEXUS_HOST_UID" || { echo "::error::evidence directory is not owned by the host collector identity"; exit 1; }
           out="$qual/export"
           mkdir "$out"
+          chown "$NEXUS_HOST_UID:$NEXUS_HOST_GID" "$out"
           head_sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
           {
             echo "state=container-started"
@@ -537,14 +553,25 @@ jobs:
 
           # Only this invocation's own identity-derived directory is removed, and only when it
           # is exactly what mktemp created. A symlink or unexpected shape is left alone.
+          #
+          # The container hands the directory to this user's identity, so a normal run can
+          # read and remove it. If ownership did not follow (an older container image, or a
+          # hand-over that failed), the directory is reported as inherited state rather than
+          # turned into a step failure: this step must never fail on a path it does not own,
+          # and `rm` on a root-owned directory in sticky /tmp is not recoverable here.
           for d in "$container_dir"; do
             [ -n "$d" ] || continue
             case "$d" in /tmp/nexus-qualified.*) ;; *) continue ;; esac
             if [ -L "$d" ]; then
-              note "left_untouched_symlink=$d"
-            elif [ -d "$d" ]; then
-              rm -rf -- "$d"
-              note "removed_own_evidence_dir=$d"
+              note "left_untouched_symlink=$(basename "$d")"
+            elif [ ! -d "$d" ]; then
+              note "container_evidence_dir_absent=$(basename "$d")"
+            elif [ ! -O "$d" ]; then
+              note "container_evidence_dir_not_owned=$(basename "$d") owner_uid=$(stat -c '%u' "$d") cleaner_uid=$(id -u)"
+            elif rm -rf -- "$d" && [ ! -e "$d" ]; then
+              note "removed_own_evidence_dir=$(basename "$d")"
+            else
+              note "container_evidence_dir_removal_failed=$(basename "$d")"
             fi
           done
           if [ "$verdict" != "COMPLETE" ]; then
