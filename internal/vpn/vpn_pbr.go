@@ -599,9 +599,15 @@ func initDefaultDNSGateway(gwDNS netip.Addr, matcher *policy.Matcher, rc forward
 	return gw
 }
 
+// newProductionWANDevice is the substitution point for the production WAN device
+// constructor. Production always uses NewProductionWANDevice; tests swap it to
+// model the kernel's device-name lifetime (one owner per name) without a TUN
+// capability. Same pattern as defaultIPTablesRunner in wan_device_linux.go.
+var newProductionWANDevice = NewProductionWANDevice
+
 func initPBRWANDevice(cfg *PBRConfig) error {
 	if cfg.WANDevice == nil {
-		wanDev, err := NewProductionWANDevice("nexus-wan0")
+		wanDev, err := newProductionWANDevice("nexus-wan0")
 		if err != nil {
 			return fmt.Errorf("create production wan device: %w", err)
 		}

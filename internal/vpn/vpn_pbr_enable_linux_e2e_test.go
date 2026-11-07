@@ -309,6 +309,21 @@ func runPolicyEnablementChildInPrivateProcfs() int {
 	say("PHASE activation-enabled")
 
 	// ---- 3. restart: new service + new startup, same durable store -----------
+	// Release the first data path before the replacement starts. A real panel
+	// restart is a process restart, where the old TUN descriptor dies with the
+	// process and the device name becomes free; here both Services live in one
+	// process, so the first must hand the name over explicitly or the second
+	// creation fails with EBUSY. This models the restart boundary at the
+	// resource-lifetime level instead of asserting an ownership the fixture does
+	// not have.
+	svc.StopPolicyRouting()
+	// Assert the hand-over really happened, so a regression names the boundary
+	// instead of surfacing as a device conflict during the replacement.
+	if svc.PBREnabled() || svc.DirectEgress() != nil || svc.PolicyMatcher() != nil {
+		return fail("the first service still owns its data path after restart hand-over "+
+			"(pbr_enabled=%t direct_egress_set=%t matcher_set=%t)",
+			svc.PBREnabled(), svc.DirectEgress() != nil, svc.PolicyMatcher() != nil)
+	}
 	svc2, err := newPolicyE2EService()
 	if err != nil {
 		return fail("new service (restart): %v", err)

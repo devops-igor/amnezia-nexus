@@ -39,6 +39,15 @@ var (
 
 	policyRuntimeMu sync.RWMutex
 	policyRuntimes  = make(map[*Service]*policyRuntime)
+
+	// policyActivationMu serializes activation against disable for the same
+	// process. A repeated enabled update must observe a stable runtime (reuse the
+	// live data path or create the first one), and a concurrent disable must not
+	// interleave with either. It is a lifecycle mutex only: no network, device or
+	// database I/O is performed while holding it on the disable side, and the
+	// bounded activation work it guards is the same work that already ran
+	// unsynchronized.
+	policyActivationMu sync.Mutex
 )
 
 // policyActivationTimeout bounds the startup sync so a hung upstream cannot
@@ -99,6 +108,24 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 		return errors.New("vpn: policy activation requires a durable policy store")
 	}
 
+	policyActivationMu.Lock()
+	defer policyActivationMu.Unlock()
+
+	// A repeated enabled update arrives whenever an operator saves settings while
+	// policy routing is already on: the admin PUT path only calls
+	// StopPolicyRouting when disabling, so it re-enters activation with the data
+	// path still live.
+	//
+	// That must not rebuild the data path. The WAN device name is a single-owner
+	// kernel resource, so constructing a second device fails EBUSY while the first
+	// is open; and tearing the healthy one down would drop every live flow for a
+	// settings change that does not alter the device at all. Reuse the installed
+	// matcher and data path instead and let the sync publish the new rules into it
+	// atomically, so the change takes effect without interrupting traffic.
+	if live := s.policyRuntime(); live != nil && live.matcher != nil {
+		return s.updateLivePolicyRouting(ctx, live.matcher, store, cfg, settings, presetID)
+	}
+
 	matcher := policy.NewMatcher()
 	syncer, err := policy.NewSyncer(matcher, nil, store, cfg)
 	if err != nil {
@@ -139,12 +166,56 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 	return nil
 }
 
+// updateLivePolicyRouting applies new settings to an already-active data path.
+//
+// It deliberately does not rebuild the WAN device, route cache or DNS gateway:
+// those do not depend on the operator's source/interval choice, and rebuilding
+// them would fail on the single-owner device name and drop live flows. What does
+// change is the policy content and the sync schedule, so this:
+//
+//  1. syncs once into the live matcher, which publishes atomically — a sync
+//     failure keeps the previous snapshot (the syncer's own contract) and is
+//     reported rather than silently ignored;
+//  2. replaces the scheduling loop so the new interval/preset takes effect, and
+//     only after the sync succeeded, so a failed update leaves the old loop
+//     running on the old rules.
+//
+// A refused update therefore leaves the previous working configuration intact and
+// in effect, which is what the admin PUT's rollback expects.
+func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.Matcher, store policy.Store, cfg policy.SyncConfig, settings policy.Settings, presetID string) error {
+	syncer, err := policy.NewSyncer(matcher, nil, store, cfg)
+	if err != nil {
+		return fmt.Errorf("policy syncer: %w", err)
+	}
+	syncCtx, cancelSync := context.WithTimeout(ctx, policyActivationTimeout)
+	syncRes, syncErr := syncer.SyncOnce(syncCtx)
+	cancelSync()
+	if syncErr != nil {
+		// The live matcher keeps its previous snapshot. Report the failure so the
+		// caller can answer 422 and roll the record back, instead of pretending the
+		// new settings are in effect.
+		return fmt.Errorf("%w: policy update sync failed: %v", ErrPolicyActivationNoRules, syncErr)
+	}
+	if !syncRes.Published {
+		return fmt.Errorf("%w: policy update sync did not publish a snapshot", ErrPolicyActivationNoRules)
+	}
+	// Only after the content is published does the schedule change, so a refused
+	// update leaves the previous loop running on the previous rules.
+	s.startPolicyLoop(ctx, syncer, matcher, settings, presetID)
+	return nil
+}
+
 // startPolicyLoop registers the live runtime and hands the syncer its scheduling
 // loop. It runs only after activation succeeded, so a refused activation never
 // leaves a background fetcher running.
+//
+// It replaces any previously registered runtime and cancels that runtime's loop
+// first: on a repeated enabled update the old syncer must stop rather than keep
+// polling on a superseded schedule, or every save would leak a fetcher.
 func (s *Service) startPolicyLoop(ctx context.Context, syncer *policy.Syncer, matcher *policy.Matcher, settings policy.Settings, presetID string) {
 	runCtx, runCancel := context.WithCancel(ctx)
 	policyRuntimeMu.Lock()
+	old := policyRuntimes[s]
 	policyRuntimes[s] = &policyRuntime{
 		syncer:   syncer,
 		matcher:  matcher,
@@ -153,6 +224,10 @@ func (s *Service) startPolicyLoop(ctx context.Context, syncer *policy.Syncer, ma
 		cancel:   runCancel,
 	}
 	policyRuntimeMu.Unlock()
+
+	if old != nil && old.cancel != nil {
+		old.cancel()
+	}
 
 	go func() {
 		if runErr := syncer.Run(runCtx); runErr != nil && !errors.Is(runErr, context.Canceled) {
@@ -221,6 +296,11 @@ func loadLastKnownGood(ctx context.Context, store policy.Store, matcher *policy.
 // StopPolicyRouting stops the scheduling loop and tears the PBR data path down.
 // It is safe to call when policy routing was never started.
 func (s *Service) StopPolicyRouting() {
+	// Serialize against activation so a disable cannot interleave with a
+	// re-activation that is publishing new rules into the same data path.
+	policyActivationMu.Lock()
+	defer policyActivationMu.Unlock()
+
 	policyRuntimeMu.Lock()
 	runtime := policyRuntimes[s]
 	delete(policyRuntimes, s)
