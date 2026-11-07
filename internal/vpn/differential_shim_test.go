@@ -118,6 +118,11 @@ type UDPFaultShim struct {
 	ResponsesForwarded    atomic.Int64
 	TransportForwarded    atomic.Int64
 	TotalPacketsForwarded atomic.Int64
+
+	// First-arrival milestones (unix nanos, first-wins) for the cold handshake
+	// observation. Written from the existing forward loop only; no extra goroutine.
+	firstInitiationNanos atomic.Int64
+	firstResponseNanos   atomic.Int64
 }
 
 // NewUDPFaultShim binds a free UDP port on 127.0.0.1 and starts proxying towards serverPort.
@@ -264,6 +269,7 @@ func (s *UDPFaultShim) forwardLoop() {
 		}
 
 		pktType := s.ClassifyPacket(dir, n)
+		s.markFirstArrival(dir, pktType)
 		action, delay := s.evaluateAction(dir, pktType, pkt)
 
 		switch action {
