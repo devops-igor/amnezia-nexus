@@ -345,11 +345,36 @@ func (d *DB) UpdateGigahostOrder(ctx context.Context, o *models.GigahostOrder) e
 // ErrGigahostOrderAlreadyReleased reports a repeated release attempt.
 var ErrGigahostOrderAlreadyReleased = errors.New("gigahost order reservation already released")
 
-// ReleaseGigahostOrder marks a reservation as released and appends an audit
-// row, inside one transaction. Releasing an already released row is a no-op
-// reported as ErrGigahostOrderAlreadyReleased so a repeated run is visibly
-// idempotent rather than silently rewriting history.
+// ErrGigahostOrderChanged reports that the ledger row no longer carries the
+// identity the release evidence was gathered against.
+var ErrGigahostOrderChanged = errors.New("gigahost order changed since the release evidence was observed")
+
+// ReleaseExpectation is the identity the caller observed and wants verified
+// inside the release transaction.
+//
+// A pre-write check outside the transaction cannot be authoritative: the row can
+// be updated between the check and the write. The release therefore re-reads the
+// row under the write lock and refuses if the identity moved.
+type ReleaseExpectation struct {
+	OrderID  string
+	ServerID int64
+}
+
 func (d *DB) ReleaseGigahostOrder(ctx context.Context, recordID int64, reason, detail string) error {
+	return d.ReleaseGigahostOrderIfCurrent(ctx, recordID, ReleaseExpectation{}, reason, detail)
+}
+
+// ReleaseGigahostOrderIfCurrent marks a reservation as released and appends an
+// audit row, inside one transaction, and only if the stored identity still
+// matches expect. An empty expectation skips the identity check (used where the
+// caller has no observation, e.g. a test fixture).
+//
+// Releasing an already released row is a no-op reported as
+// ErrGigahostOrderAlreadyReleased, so a repeated run is visibly idempotent rather
+// than silently rewriting history.
+func (d *DB) ReleaseGigahostOrderIfCurrent(
+	ctx context.Context, recordID int64, expect ReleaseExpectation, reason, detail string,
+) error {
 	if d == nil || d.sqlDB == nil {
 		return errors.New("no database handle")
 	}
@@ -359,9 +384,10 @@ func (d *DB) ReleaseGigahostOrder(ctx context.Context, recordID int64, reason, d
 	now := time.Now().UTC().Format(time.RFC3339)
 	return d.WithTransaction(ctx, func(tx *sql.Tx) error {
 		var orderID, releasedAt string
+		var serverID int64
 		err := tx.QueryRowContext(ctx,
-			`SELECT order_id, COALESCE(released_at, '') FROM gigahost_orders WHERE id = ?`, recordID).
-			Scan(&orderID, &releasedAt)
+			`SELECT order_id, COALESCE(server_id, 0), COALESCE(released_at, '') FROM gigahost_orders WHERE id = ?`, recordID).
+			Scan(&orderID, &serverID, &releasedAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("gigahost order %d not found", recordID)
 		}
@@ -370,6 +396,12 @@ func (d *DB) ReleaseGigahostOrder(ctx context.Context, recordID int64, reason, d
 		}
 		if releasedAt != "" {
 			return ErrGigahostOrderAlreadyReleased
+		}
+		if expect.OrderID != "" && expect.OrderID != orderID {
+			return ErrGigahostOrderChanged
+		}
+		if expect.ServerID != 0 && expect.ServerID != serverID {
+			return ErrGigahostOrderChanged
 		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE gigahost_orders SET released_at = ?, release_reason = ?, updated_at = ? WHERE id = ?`,

@@ -252,7 +252,10 @@ func TestGigahostBudget_UnresolvedReservationIsNeverAutoReleased(t *testing.T) {
 // TestGigahostBudget_ConclusiveProviderEvidenceReleases is the positive control:
 // the same machinery MUST release a reservation the provider conclusively ended.
 func TestGigahostBudget_ConclusiveProviderEvidenceReleases(t *testing.T) {
-	t.Run("provider reports the matching server cancelled", func(t *testing.T) {
+	// A1 correction: "cancelled" is a PENDING cancellation that keeps billing
+	// until termination (contract E2), so the positive control uses a terminated
+	// server, which the contract does support as ending the commitment.
+	t.Run("provider reports the matching server terminated", func(t *testing.T) {
 		h, db, _ := setupTestHandlers(t)
 		ctx := context.Background()
 		if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 100.0}); err != nil {
@@ -280,7 +283,7 @@ func TestGigahostBudget_ConclusiveProviderEvidenceReleases(t *testing.T) {
 			},
 			getCatalogFn: func(context.Context) ([]gigahost.HourlyPlan, error) { return catalog, nil },
 			getServersFn: func(context.Context) ([]gigahost.ServerInfo, error) {
-				return []gigahost.ServerInfo{{ID: 7, OrderID: "10001", PID: 202, Status: "cancelled", BwIsHourly: &hourly}}, nil
+				return []gigahost.ServerInfo{{ID: 7, OrderID: "10001", PID: 202, Status: "terminated", BwIsHourly: &hourly}}, nil
 			},
 			orderServerSafeFn: func(context.Context, gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 				atomic.AddInt32(&posts, 1)
@@ -305,8 +308,8 @@ func TestGigahostBudget_ConclusiveProviderEvidenceReleases(t *testing.T) {
 		for _, o := range orders {
 			if o.OrderID == "10001" {
 				released = o.ReleasedAt != ""
-				if released && o.ReleaseReason != "provider_terminal_status" {
-					t.Errorf("release reason = %q, want provider_terminal_status", o.ReleaseReason)
+				if released && o.ReleaseReason != "provider_terminated" {
+					t.Errorf("release reason = %q, want provider_terminated", o.ReleaseReason)
 				}
 			}
 		}

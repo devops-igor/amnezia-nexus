@@ -8,26 +8,29 @@
 // Safety model:
 //
 //   - Read-only by default. A run without --apply only reports.
-//   - It never contacts the provider, so it cannot confirm or deny a charge and
-//     therefore never releases a reservation on provider evidence. Only an
-//     explicit operator acknowledgement (--confirm-record) can release a record
-//     that carries no provider identity, and only for a record the operator has
-//     named by database id after verifying with the provider that no charge or
-//     server exists.
-//   - Every write is preceded by a full database backup written next to the
-//     database, and the backup path is part of the proposal output.
+//   - It never contacts the provider, so it has NO authoritative proof available
+//     and therefore releases NOTHING on its own. There is deliberately no
+//     operator waiver: the approved scope forbids an administrator
+//     acknowledgement standing in for authoritative reconciliation, and a
+//     free-text note is not proof of anything. A reservation whose outcome is
+//     genuinely unknowable is reported as unresolved, kept in the committed
+//     total, and named so whoever holds real provider evidence can act.
+//   - The only release evidence that exists is provider evidence (a terminated or
+//     deleted server, or a waitlist reservation the contract states is not
+//     billed). An offline run cannot obtain it, so an offline run proposes no
+//     change.
+//   - A backup is taken before any write. NOTE: the backup is currently a plain
+//     file copy of database/-wal/-shm and is NOT a coherent SQLite snapshot under
+//     WAL mutation. Making it coherent is the queued A2 work, so until then
+//     --apply must not be run against a live database.
 //   - Releasing writes a marker plus an audit row and keeps the original status,
 //     so a repeated run reports "already released" and changes nothing.
 //   - Nothing here can order, cancel or delete a VPS.
 //
 // Usage:
 //
-//	gigahost-recovery --db /path/panel.db                 # dry run (default)
-//	gigahost-recovery --db /path/panel.db --json           # machine-readable plan
-//	gigahost-recovery --db /path/panel.db --apply          # apply safe releases
-//	gigahost-recovery --db /path/panel.db \
-//	    --confirm-record 12 --confirm-record 19 --apply \
-//	    --note "provider panel shows no charge for these two attempts"
+//	gigahost-recovery --db /path/panel.db          # dry run (default, read-only)
+//	gigahost-recovery --db /path/panel.db --json    # machine-readable report
 package main
 
 import (
@@ -39,8 +42,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
@@ -58,39 +59,14 @@ const (
 
 // config is one invocation.
 type config struct {
-	dbPath         string
-	budgetNOK      float64
-	apply          bool
-	asJSON         bool
-	jsonOutPath    string
-	backupPath     string
-	noBackup       bool
-	confirmRecords int64Slice
-	note           string
-	catalogPath    string
-}
-
-// int64Slice collects a repeatable integer flag.
-type int64Slice []int64
-
-func (s *int64Slice) String() string {
-	parts := make([]string, 0, len(*s))
-	for _, v := range *s {
-		parts = append(parts, fmt.Sprint(v))
-	}
-	return strings.Join(parts, ",")
-}
-
-func (s *int64Slice) Set(v string) error {
-	var id int64
-	if _, err := fmt.Sscan(strings.TrimSpace(v), &id); err != nil {
-		return fmt.Errorf("invalid record id %q", v)
-	}
-	if id <= 0 {
-		return fmt.Errorf("record id must be positive, got %d", id)
-	}
-	*s = append(*s, id)
-	return nil
+	dbPath      string
+	budgetNOK   float64
+	apply       bool
+	asJSON      bool
+	jsonOutPath string
+	backupPath  string
+	noBackup    bool
+	catalogPath string
 }
 
 // report is what one run found and did.
@@ -127,8 +103,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&cfg.jsonOutPath, "out", "", "write the JSON plan to this path as well")
 	fs.StringVar(&cfg.backupPath, "backup", "", "backup file path for --apply (default: <db>.gigahost-backup-<timestamp>)")
 	fs.BoolVar(&cfg.noBackup, "no-backup", false, "skip the safety backup (not recommended)")
-	fs.Var(&cfg.confirmRecords, "confirm-record", "database id of a record you verified carries no charge; repeatable")
-	fs.StringVar(&cfg.note, "note", "", "operator note recorded in the audit trail with --confirm-record")
 	fs.StringVar(&cfg.catalogPath, "catalog", "", "JSON file of catalog rows, for pricing legacy records offline (never fetched)")
 	fs.BoolVar(&showHelp, "help", false, "show this help")
 	if err := fs.Parse(args); err != nil {
@@ -219,8 +193,12 @@ func execute(cfg config) (report, int, error) {
 		return rep, 0, err
 	}
 
-	entries, evidence, warnings := prepareEntries(orders, cfg.confirmRecords, cfg.note, plans)
-	rep.Warnings = append(rep.Warnings, warnings...)
+	entries, evidence := prepareEntries(orders)
+	// This run has no provider evidence available, so nothing can be released.
+	// Saying so explicitly keeps the report truthful rather than looking like a
+	// clean bill of health.
+	rep.Warnings = append(rep.Warnings,
+		"offline run: no provider evidence is available, so no release is proposed; unresolved reservations are kept and named")
 
 	proposal, err := gigahostbudget.Propose(gigahostbudget.Input{
 		CapNOK:   cfg.budgetNOK,
@@ -273,41 +251,15 @@ func execute(cfg config) (report, int, error) {
 	return rep, len(rep.Unresolved), nil
 }
 
-// prepareEntries builds the shared input from the ledger and the operator's
-// explicit confirmations.
+// prepareEntries builds the shared input from the ledger.
 //
-// A confirmation is the ONLY way this tool produces release evidence, because
-// the tool never talks to the provider. It applies to one record id, requires a
-// note, and is refused for any record that already carries a provider identity
-// the tool could not verify.
-func prepareEntries(
-	orders []models.GigahostOrder, confirmed int64Slice, note string, plans []gigahostbudget.Plan,
-) ([]gigahostbudget.Entry, map[int64]gigahostbudget.Evidence, []string) {
+// It supplies no release evidence at all, and that is the point: this tool is
+// offline, so any evidence it could hand over would be an operator assertion
+// rather than provider fact. A note-only waiver was explicitly rejected by the
+// approved scope, so the function that used to build one no longer exists.
+func prepareEntries(orders []models.GigahostOrder) ([]gigahostbudget.Entry, map[int64]gigahostbudget.Evidence) {
 	entries := make([]gigahostbudget.Entry, 0, len(orders))
-	evidence := make(map[int64]gigahostbudget.Evidence, len(confirmed))
-	var warnings []string
-
-	known := make(map[int64]models.GigahostOrder, len(orders))
-	for _, o := range orders {
-		known[o.ID] = o
-	}
-	for _, id := range confirmed {
-		o, ok := known[id]
-		if !ok {
-			warnings = append(warnings, fmt.Sprintf("--confirm-record %d: no such record; ignored", id))
-			continue
-		}
-		if strings.TrimSpace(note) == "" {
-			warnings = append(warnings, fmt.Sprintf("--confirm-record %d: a --note is required to record why no charge exists; ignored", id))
-			continue
-		}
-		if o.OrderID != "" && !gigahostbudget.IsSyntheticOrderID(o.OrderID) {
-			warnings = append(warnings,
-				fmt.Sprintf("--confirm-record %d: the record carries provider order id %s; this tool cannot verify it, so it will not release it", id, o.OrderID))
-			continue
-		}
-		evidence[id] = gigahostbudget.Evidence{OperatorConfirmed: true, OperatorNote: note}
-	}
+	evidence := make(map[int64]gigahostbudget.Evidence)
 
 	for _, o := range orders {
 		entries = append(entries, gigahostbudget.Entry{
@@ -326,7 +278,7 @@ func prepareEntries(
 			ReleaseReason:  o.ReleaseReason,
 		})
 	}
-	return entries, evidence, warnings
+	return entries, evidence
 }
 
 // reasonFor returns the audit reason for one proposed change, or "" when the
@@ -499,24 +451,12 @@ func writeText(w io.Writer, rep report) {
 		if rep.IncompleteTotal {
 			fmt.Fprintf(w, "committed before is a LOWER BOUND: at least one counted reservation has no identifiable price.\n")
 		}
-		fmt.Fprintf(w, "These cannot be released without conclusive proof. Check each one in the provider panel.\n")
-		var confirmable []int64
-		for _, c := range rep.Unresolved {
-			if !providerIdentified(c) {
-				confirmable = append(confirmable, c.RecordID)
-			}
-		}
-		if len(confirmable) > 0 {
-			sort.Slice(confirmable, func(i, j int) bool { return confirmable[i] < confirmable[j] })
-			fmt.Fprintf(w, "A record with no provider identity can be released only after you verify no charge exists for it:\n")
-			fmt.Fprintf(w, "  --confirm-record %s --note \"verified in the provider panel: no charge for this attempt\"\n",
-				joinIDs(confirmable))
-		}
-		identified := len(rep.Unresolved) - len(confirmable)
-		if identified > 0 {
-			fmt.Fprintf(w, "%d of them carry a provider order id: this tool cannot verify those and will NOT release them;\n", identified)
-			fmt.Fprintf(w, "their outcome has to be resolved by the provider or by the panel, not by a local acknowledgement.\n")
-		}
+		fmt.Fprintf(w, "This tool cannot release them: it is offline and holds no provider evidence.\n")
+		fmt.Fprintf(w, "Each one needs a provider fact that the panel has not recorded yet:\n")
+		fmt.Fprintf(w, "  - a terminated or deleted server for the matching provider server id, which ends the commitment, or\n")
+		fmt.Fprintf(w, "  - a waitlist order, which the provider states is not billed while it waits.\n")
+		fmt.Fprintf(w, "Once the panel sees one of those, its own reconciliation releases the reservation, with an audit row.\n")
+		fmt.Fprintf(w, "There is no local waiver: a note cannot stand in for provider evidence.\n")
 	}
 	for _, warning := range rep.Warnings {
 		fmt.Fprintf(w, "warning: %s\n", warning)
@@ -525,21 +465,6 @@ func writeText(w io.Writer, rep report) {
 		fmt.Fprintf(w, "error: %s\n", e)
 	}
 	if rep.Mode != "applied" {
-		fmt.Fprintf(w, "\nThis was a dry run: nothing was written. Re-run with the same arguments plus --apply to write.\n")
+		fmt.Fprintf(w, "\nThis was a dry run: nothing was written.\n")
 	}
-}
-
-// providerIdentified reports whether a proposed change carries a provider order
-// id (rather than a synthetic local one), which this offline tool may not
-// release.
-func providerIdentified(c gigahostbudget.ProposedChange) bool {
-	return c.OrderID != "" && !gigahostbudget.IsSyntheticOrderID(c.OrderID)
-}
-
-func joinIDs(ids []int64) string {
-	parts := make([]string, 0, len(ids))
-	for _, id := range ids {
-		parts = append(parts, fmt.Sprint(id))
-	}
-	return strings.Join(parts, " --confirm-record ")
 }

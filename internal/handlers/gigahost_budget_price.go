@@ -43,7 +43,6 @@ func budgetServers(servers []gigahost.ServerInfo) []gigahostbudget.Server {
 			OrderID: s.OrderID,
 			PlanID:  s.PID,
 			Status:  s.Status,
-			IP:      s.GetIP(),
 			Hourly:  s.IsHourlyVPS(),
 		})
 	}

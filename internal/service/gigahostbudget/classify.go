@@ -1,5 +1,37 @@
 package gigahostbudget
 
+// Accounting classification of one ledger row, derived from the provider
+// contract rather than from convenient-looking labels.
+//
+//nolint:misspell // this file quotes the provider's own status spelling ("cancelled")
+//
+// The distinction this file exists to protect is between
+//
+//	(a) "the deployment is not running right now" (a resource or deployment
+//	    state), and
+//	(b) "the provider states no further charge accrues for this order"
+//	    (authoritative non-billability).
+//
+// Only (b) may release a reservation. Conflating the two is how a still-billed
+// server gets removed from the committed total, which then lets a second VPS be
+// bought against budget the first one is still consuming.
+//
+// Provider contract reference: https://gigahost.no/en/api-dokumentasjon
+// The relevant contract facts are:
+//
+//	E1  GET /deploy/status omits canceled orders and orders whose server was
+//	    deleted, and silently ignores orders that are not yours. Its omission is
+//	    therefore not proof of anything, even for a real provider order id.
+//	E2  `cancelled` on a server is a PENDING cancellation: the server keeps
+//	    running until termination_date and hourly billing continues.
+//	E3  A terminated/deleted server is not a running pay-as-you-go service, so
+//	    its recurring commitment ends (hours already used are billed on the next
+//	    invoice, which is a past cost, not a reservation). stopped, expired and
+//	    refunded have no documented billing meaning at all.
+//	E4  A waitlist reservation is explicitly "not billed while a reservation
+//	    waits".
+//	E5  A routed IP can be moved between servers, so an address is not identity.
+
 import (
 	"strings"
 )
@@ -11,31 +43,26 @@ import (
 //
 // The zero value means "nothing observed", which is never conclusive.
 type Evidence struct {
-	// ServerStatus is the status the provider inventory reports for a server
-	// whose identity matches the ledger row.
-	ServerStatus string
-	// ServerFound reports that the provider inventory contains such a server.
+	// ServerFound reports that the provider inventory contains a server whose
+	// identity matches the ledger row.
 	ServerFound bool
-	// OrderQueried reports that GET /deploy/status was answered for a REAL
-	// provider order id. Only real ids are ever queried.
-	OrderQueried bool
-	// OrderNotFound is the provider's conclusive answer that the queried order
-	// id does not exist.
-	OrderNotFound bool
-	// OrderEnded is the provider's answer, for a real order id it issued, that
-	// no live order exists any more (a terminated/canceled order has no status
-	// to report). It is conclusive because the id is the provider's own.
-	OrderEnded bool
+	// ServerStatus is that server's status as the provider reports it.
+	ServerStatus string
+
+	// ProviderOrderFound reports that GET /deploy/status returned this order.
+	ProviderOrderFound bool
+	// ProviderOrderStatus is the deployment status the provider reports.
+	ProviderOrderStatus string
+	// OrderOmittedFromDeployStatus reports that the order id WAS queried and the
+	// provider's list did not contain it. This is kept as a distinct
+	// observation precisely because it proves nothing: the contract states the
+	// endpoint omits canceled orders and orders whose server was deleted, and
+	// silently ignores orders that are not yours (E1).
+	OrderOmittedFromDeployStatus bool
+
 	// OrderQueryFailed is a communication failure or an unknown outcome. It is
 	// explicitly NOT evidence of absence.
 	OrderQueryFailed bool
-	// OperatorConfirmed is an explicit operator acknowledgement, recorded with
-	// a note, that a reservation carrying no provider identity was verified at
-	// the provider to carry no charge. It is the only non-provider evidence that
-	// can release a reservation, and only an out-of-band recovery tool sets it.
-	OperatorConfirmed bool
-	// OperatorNote records why the operator concluded no charge exists.
-	OperatorNote string
 }
 
 // Verdict is the accounting classification of one ledger row.
@@ -45,39 +72,72 @@ type Verdict struct {
 	Reason string
 	// Explanation is an operator-readable sentence.
 	Explanation string
-	// Releasable reports that the evidence conclusively shows no commitment is
-	// left for this row, so the release marker may be written.
+	// Releasable reports that the evidence conclusively shows no further charge
+	// accrues for this row, so the release marker may be written.
 	Releasable bool
 }
 
-// Local statuses that mean the reservation carries no commitment any more.
-// The set matches the pre-existing budget classification exactly, so a state
-// that was already excluded stays excluded.
-var obsoleteLocalStatuses = map[string]bool{
-	"failed": true,
-	//nolint:misspell // "cancelled" is the provider's and the panel's own status spelling
-	"cancelled":  true,
-	"canceled":   true,
+// locallyTerminalStatuses are local ledger labels that end a reservation attempt
+// by themselves. The documentation gives them an unambiguous meaning here: the
+// order attempt failed, or the resource is gone.
+//
+// This set is deliberately NOT the place to add convenience labels. A local label
+// can never be more than an attempt record, and a recognized live provider server
+// contradicts it (see Classify).
+var locallyTerminalStatuses = map[string]bool{
+	"failed":     true,
 	"deleted":    true,
 	"terminated": true,
-	"stopped":    true,
-	"expired":    true,
-	"refunded":   true,
 }
 
-// activeLocalStatuses that consume budget when the financial outcome is known.
-// The set is exactly the pre-existing budget classification: adding a status
-// here would silently start counting spend that was not counted before.
-var activeLocalStatuses = map[string]bool{
-	"ready":           true,
-	"active":          true,
+// releaseConclusiveServerStatuses are the provider server statuses that end the
+// recurring commitment, with the contract basis quoted above.
+//
+// The provider's cancellation label is deliberately ABSENT: it is a *pending* cancellation and the
+// server is still billed (E2). "stopped", "expired" and "refunded" are absent
+// because the documentation assigns them no billing meaning (E3).
+var releaseConclusiveServerStatuses = map[string]string{
+	"deleted":    "provider_deleted",
+	"terminated": "provider_terminated",
+}
+
+// waitlistStatus is the one deployment status the provider states carries no
+// charge (E4).
+const waitlistStatus = "waitlist"
+
+// runningServerStatuses are provider statuses that positively describe a live
+// server, so they outrank a stale or locally terminal label.
+var runningServerStatuses = map[string]bool{
+	"ready":        true,
+	"active":       true,
+	"rescue":       true,
+	"iso":          true,
+	"installing":   true,
+	"deploying":    true,
+	"waiting":      true,
+	"provisioning": true,
+	"pending":      true,
+}
+
+// recognizedLocalStatuses are the ledger states this application writes
+// deliberately. A status outside this set is not a statement about billing, so
+// the reservation stays counted and is reported as unresolved.
+var recognizedLocalStatuses = map[string]bool{
 	"pending":         true,
 	"pending_order":   true,
 	"pending_payment": true,
+	"waiting":         true,
 	"deploying":       true,
 	"installing":      true,
-	"waiting":         true,
+	"ready":           true,
+	"active":          true,
 	"unknown":         true,
+	"failed":          true,
+	"deleted":         true,
+	"terminated":      true,
+	//nolint:misspell // "cancelled" is the panel's own stored spelling
+	"cancelled": true,
+	"canceled":  true,
 }
 
 // IsSyntheticOrderID reports a local application identifier that is NOT a
@@ -89,133 +149,68 @@ func IsSyntheticOrderID(id string) bool {
 	return strings.HasPrefix(id, "intent_") || strings.HasPrefix(id, "unknown_")
 }
 
-// IsTerminalStatus reports a status that ends a reservation.
-func IsTerminalStatus(status string) bool {
-	return obsoleteLocalStatuses[strings.ToLower(strings.TrimSpace(status))]
+// IsLocallyTerminal reports a local label that ends a reservation attempt on its
+// own.
+func IsLocallyTerminal(status string) bool {
+	return locallyTerminalStatuses[strings.ToLower(strings.TrimSpace(status))]
 }
 
-// releaseConclusiveStatuses are the provider statuses that prove the binding
-// ended: the resource was canceled, deleted, terminated, stopped, expired or
-// refunded.
+// IsActiveForBudget reports whether a local ledger label can represent a
+// commitment.
 //
-// "failed" is deliberately NOT here. A failed deployment can still have been
-// billed (the server may have existed long enough to incur an hourly charge), so
-// it ends the deployment without proving the commitment is gone. The local
-// reservation therefore stays counted and stays visible, which is the
-// pre-existing safety behavior for inactive provider inventory.
-var releaseConclusiveStatuses = map[string]bool{
-	//nolint:misspell // "cancelled" is the provider's own status spelling
-	"cancelled":  true,
-	"canceled":   true,
-	"deleted":    true,
-	"terminated": true,
-	"stopped":    true,
-	"expired":    true,
-	"refunded":   true,
-}
-
-// IsReleaseConclusiveStatus reports whether a provider status is conclusive
-// proof that a reservation carries no remaining commitment.
-func IsReleaseConclusiveStatus(status string) bool {
-	return releaseConclusiveStatuses[strings.ToLower(strings.TrimSpace(status))]
-}
-
-// IsActiveForBudget reports whether a local ledger status consumes budget,
-// independently of whether its financial outcome is known.
+// Every label that is not locally terminal counts, so an unrecognized or
+// unexpected local label keeps its reservation instead of silently vanishing
+// from the committed total. Whether the money is real is decided by Classify.
 func IsActiveForBudget(status string) bool {
-	s := strings.ToLower(strings.TrimSpace(status))
-	if IsTerminalStatus(s) {
-		return false
-	}
-	return activeLocalStatuses[s]
+	return !IsLocallyTerminal(status)
 }
 
-// IsServerActiveForBudget reports whether a provider inventory record is an
-// active commitment. Kept identical to the pre-existing budget scope so no
-// existing decision changes.
+// IsServerActiveForBudget reports whether a provider inventory record can be a
+// commitment. Anything the contract does not say is over counts, except the
+// contractually unbilled waitlist.
 func IsServerActiveForBudget(status string) bool {
-	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "ready", "active", "deploying", "pending", "waiting", "installing":
-		return true
-	default:
+	s := strings.ToLower(strings.TrimSpace(status))
+	if _, conclusive := releaseConclusiveServerStatuses[s]; conclusive {
 		return false
 	}
+	return s != waitlistStatus
 }
 
 // EntryMatchesServer reports whether a ledger row and a provider inventory row
 // describe the same VPS.
 //
-// Only identities that actually establish equivalence are used: the provider
-// order id, a positive provider server id, or - as the weakest form - an equal
-// assigned public IP when that IP is the ledger row's only identifier and the
-// row's outcome is already known. A shared plan id, region, hourly rate or
-// price is never evidence: distinct VPS routinely share all of them.
+// Two rules, both required by contract E5 and by the intake counterexample:
+//
+//  1. Only a provider order id or a provider server id can establish
+//     equivalence. A shared plan, price, region, hourly rate or assigned address
+//     never can, because distinct VPS routinely share all of them and a routed
+//     address moves between servers.
+//  2. When both sides carry a non-empty provider order id and those ids differ,
+//     the records are NOT the same reservation whatever else matches. Merging two
+//     commitments into one hides spend.
 func EntryMatchesServer(e Entry, s Server) bool {
+	if e.OrderID != "" && s.OrderID != "" && e.OrderID != s.OrderID {
+		return false
+	}
 	if s.OrderID != "" && e.OrderID == s.OrderID {
 		return true
 	}
-	if s.ID > 0 && e.ServerID == s.ID {
-		return true
-	}
-	if s.IP == "" || e.AssignedIP == "" || s.IP != e.AssignedIP {
-		return false
-	}
-	// IP reuse over time is possible, so an address match is only accepted when
-	// nothing stronger is recorded locally and the row is not an unresolved
-	// attempt whose outcome must stay visible.
-	if e.ServerID > 0 {
-		return false
-	}
-	if e.OrderID != "" && !IsSyntheticOrderID(e.OrderID) {
-		return false
-	}
-	return !isUncertainStatus(e.Status)
-}
-
-// isUncertainStatus reports a state whose financial outcome is unknown.
-func isUncertainStatus(status string) bool {
-	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "unknown", "pending_order":
-		return true
-	default:
-		return false
-	}
+	return s.ID > 0 && e.ServerID == s.ID
 }
 
 // Classify decides the accounting state of one ledger row from its own fields
 // and the provider evidence the caller collected for it.
+//
+// Provider evidence about a real identity is evaluated before the local label,
+// because the provider's current answer outranks a stale attempt record. A local
+// label can keep a reservation counted, and can end one the provider is silent
+// about; it can never release a reservation the provider shows alive.
 func Classify(e Entry, ev Evidence) Verdict {
 	if e.ReleasedAt != "" {
 		return Verdict{
 			State:       StateReleased,
 			Reason:      "released",
 			Explanation: "already released" + releaseNote(e.ReleaseReason),
-		}
-	}
-	if IsTerminalStatus(e.Status) {
-		return Verdict{
-			State:       StateObsolete,
-			Reason:      "terminal_local_status",
-			Explanation: "local status " + strOrUnknown(e.Status) + " ends the reservation",
-		}
-	}
-	if ev.ServerFound && IsReleaseConclusiveStatus(ev.ServerStatus) {
-		return Verdict{
-			State:       StateObsolete,
-			Reason:      "provider_terminal_status",
-			Explanation: "the provider reports the matching server as " + strOrUnknown(ev.ServerStatus),
-			Releasable:  true,
-		}
-	}
-	// A provider status that ended the deployment WITHOUT proving the binding
-	// ended (for example "failed", which can still have been billed) keeps the
-	// reservation counted and unresolved rather than releasing spend.
-	if ev.ServerFound && IsTerminalStatus(ev.ServerStatus) {
-		return Verdict{
-			State:  StateUnresolved,
-			Reason: "provider_failed_status",
-			Explanation: "the provider reports the matching server as " + strOrUnknown(ev.ServerStatus) +
-				", which ended the deployment but does not prove a charge was never incurred",
 		}
 	}
 	if ev.OrderQueryFailed {
@@ -225,40 +220,95 @@ func Classify(e Entry, ev Evidence) Verdict {
 			Explanation: "the provider could not be asked about this order; the reservation stays reserved",
 		}
 	}
-	if ev.OrderNotFound && ev.OrderQueried && e.OrderID != "" && !IsSyntheticOrderID(e.OrderID) {
+
+	// 1. A recognized provider server describes the resource itself.
+	if ev.ServerFound {
+		status := strings.ToLower(strings.TrimSpace(ev.ServerStatus))
+		if reason, conclusive := releaseConclusiveServerStatuses[status]; conclusive {
+			return Verdict{
+				State:  StateObsolete,
+				Reason: reason,
+				Explanation: "the provider reports the matching server as " + strOrUnknown(ev.ServerStatus) +
+					", so it is no longer a running pay-as-you-go service",
+				Releasable: true,
+			}
+		}
+		if runningServerStatuses[status] {
+			return Verdict{
+				State:  StateActive,
+				Reason: "provider_resource_running",
+				Explanation: "the provider reports the matching server as " + strOrUnknown(ev.ServerStatus) +
+					", so the commitment is live",
+			}
+		}
+		// Any other recognized server status is a resource state the
+		// documentation does not tie to billing (a pending cancellation, a stop,
+		// a suspension, an unknown label). It keeps the reservation counted and
+		// unresolved rather than releasing spend.
 		return Verdict{
-			State:       StateObsolete,
-			Reason:      "provider_order_not_found",
-			Explanation: "the provider owns its order ids and reports no such order",
-			Releasable:  true,
+			State:  StateUnresolved,
+			Reason: "provider_status_not_billability",
+			Explanation: "the provider reports the matching server as " + strOrUnknown(ev.ServerStatus) +
+				", which is a resource state the provider contract does not tie to billing",
 		}
 	}
-	if ev.OrderEnded && ev.OrderQueried && e.OrderID != "" && !IsSyntheticOrderID(e.OrderID) && !ev.ServerFound {
+
+	// 2. A deployment-level answer. The only status the contract states is
+	// unbilled is the waitlist.
+	if ev.ProviderOrderFound {
+		status := strings.ToLower(strings.TrimSpace(ev.ProviderOrderStatus))
+		if status == waitlistStatus {
+			return Verdict{
+				State:       StateObsolete,
+				Reason:      "provider_waitlist_not_billed",
+				Explanation: "the provider reports this order as a waitlist reservation, and nothing is billed while a reservation waits",
+				Releasable:  true,
+			}
+		}
+		if status != "" {
+			return Verdict{
+				State:  StateActive,
+				Reason: "provider_order_live",
+				Explanation: "the provider reports this order as " + strOrUnknown(ev.ProviderOrderStatus) +
+					", so the deployment exists and is billed",
+			}
+		}
 		return Verdict{
-			State:       StateObsolete,
-			Reason:      "provider_order_ended",
-			Explanation: "the provider owns this order id and reports no live order for it",
-			Releasable:  true,
+			State:       StateUnresolved,
+			Reason:      "provider_order_status_absent",
+			Explanation: "the provider listed this order without a status, which does not establish whether a charge exists",
 		}
 	}
-	// An operator acknowledgement releases only a record that carries no
-	// provider identity at all: once the provider issued an order id, only the
-	// provider's own answer may end the reservation.
-	if ev.OperatorConfirmed && e.ServerID == 0 && (e.OrderID == "" || IsSyntheticOrderID(e.OrderID)) {
+	// A not-found answer from GET /deploy/status is deliberately handled
+	// nowhere: the contract states that endpoint omits canceled orders and
+	// orders whose server was deleted, and silently ignores orders that are not
+	// yours (E1), so its omission cannot release a reservation.
+
+	// 3. A locally terminal attempt record, with no contradicting provider
+	// answer above.
+	if IsLocallyTerminal(e.Status) {
 		return Verdict{
 			State:       StateObsolete,
-			Reason:      "operator_confirmed_no_charge",
-			Explanation: "an operator verified at the provider that this attempt carries no charge",
-			Releasable:  true,
+			Reason:      "terminal_local_status",
+			Explanation: "local status " + strOrUnknown(e.Status) + " ends the order attempt",
 		}
 	}
-	if !IsActiveForBudget(e.Status) {
+	// A stored cancellation label is a real state this panel writes, but the provider
+	// contract shows a cancellation does not by itself end billing (E2). With no
+	// provider answer the financial outcome is therefore unknown, and the
+	// reservation stays counted rather than being treated as either active or
+	// over.
+	//nolint:misspell // "cancelled" is the spelling this panel stores
+	if s := strings.ToLower(strings.TrimSpace(e.Status)); s == "cancelled" || s == "canceled" {
 		return Verdict{
-			State:       StateObsolete,
-			Reason:      "inactive_status",
-			Explanation: "status " + strOrUnknown(e.Status) + " is not an active reservation",
+			State:  StateUnresolved,
+			Reason: "local_cancelled_unsupported",
+			Explanation: "local status " + strOrUnknown(e.Status) +
+				" is recorded, but the provider contract shows a cancellation still bills until termination, so no provider server is available to confirm the outcome",
 		}
 	}
+
+	// 4. No identity that could be resolved, and no terminal evidence.
 	if IsSyntheticOrderID(e.OrderID) {
 		return Verdict{
 			State:  StateUnresolved,
@@ -274,10 +324,22 @@ func Classify(e Entry, ev Evidence) Verdict {
 			Explanation: "no provider order id and no provider server id; the commitment cannot be identified",
 		}
 	}
+	// 5. A recognized local label with a provider identity behind it. The label
+	// must be one this application writes deliberately; anything else is an
+	// unknown state and stays unresolved rather than being assumed active.
+	status := strings.ToLower(strings.TrimSpace(e.Status))
+	if !recognizedLocalStatuses[status] {
+		return Verdict{
+			State:  StateUnresolved,
+			Reason: "unrecognized_local_status",
+			Explanation: "local status " + strOrUnknown(e.Status) +
+				" is not a state this application writes, so whether the commitment is live is unknown",
+		}
+	}
 	return Verdict{
 		State:       StateActive,
 		Reason:      "committed",
-		Explanation: "active reservation with a known provider identity",
+		Explanation: "active reservation with a known provider identity and a recognized local state",
 	}
 }
 
@@ -304,9 +366,6 @@ func serverIdentity(s Server) string {
 	if s.ID > 0 {
 		return "provider server " + itoa(s.ID)
 	}
-	if s.IP != "" {
-		return "provider server at " + s.IP
-	}
 	return "provider inventory row"
 }
 
@@ -318,9 +377,6 @@ func entryIdentity(e Entry) string {
 	if e.ServerID > 0 {
 		return "provider server " + itoa(e.ServerID)
 	}
-	if e.AssignedIP != "" {
-		return "server at " + e.AssignedIP
-	}
 	return "local record " + itoa(e.RecordID)
 }
 
@@ -331,24 +387,23 @@ func serverIdentityKey(s Server) string {
 		return "order:" + s.OrderID
 	case s.ID > 0:
 		return "server:" + itoa(s.ID)
-	case s.IP != "":
-		return "ip:" + s.IP
 	default:
 		return ""
 	}
 }
 
-// entryIdentityKey is the dedupe key for a ledger row, or "" when the row has
-// no identity that another row could legitimately share.
+// entryIdentityKey is the dedupe key for a ledger row, or "" when the row has no
+// identity another row could legitimately share.
+//
+// An assigned address is NOT an identity key: the provider documents that a
+// routed address can move between servers, so two records sharing an address are
+// still two possible commitments.
 func entryIdentityKey(e Entry) string {
 	if e.OrderID != "" && !IsSyntheticOrderID(e.OrderID) {
 		return "order:" + e.OrderID
 	}
 	if e.ServerID > 0 {
 		return "server:" + itoa(e.ServerID)
-	}
-	if e.AssignedIP != "" && !isUncertainStatus(e.Status) {
-		return "ip:" + e.AssignedIP
 	}
 	return ""
 }

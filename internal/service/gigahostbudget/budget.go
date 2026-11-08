@@ -4,9 +4,10 @@
 // One reservation is one VPS. Provider inventory (GET /deploy/servers) and the
 // local gigahost_orders ledger are the same money seen from two sides, so the
 // two are paired by identity before anything is priced. Pairing uses only
-// identities that actually establish equivalence - a provider order id, a
-// positive provider server id, or an assigned public IP - never a coincidental
-// plan id or price, because two distinct VPS can share both.
+// identities that actually establish equivalence - a provider order id or a
+// positive provider server id - never a coincidental plan id, price or assigned
+// address, because distinct VPS share plan and price and a routed address can be
+// moved between servers.
 //
 // Price identity: the authoritative amount for one reservation is the contract
 // the provider returned when the order was placed (hourly rate, monthly cap,
@@ -131,7 +132,6 @@ type Server struct {
 	OrderID string
 	PlanID  int
 	Status  string
-	IP      string
 	Hourly  bool
 }
 

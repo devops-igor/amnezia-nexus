@@ -52,12 +52,17 @@ type Proposal struct {
 // purchase path uses, so the two can never disagree.
 //
 // A change is proposed ONLY for a reservation the classification marks
-// Releasable, which requires conclusive evidence: a terminal provider status for
-// a matching server, the provider reporting that it does not own a real provider
-// order id, or an explicit operator acknowledgement for a record that carries no
-// provider identity at all. A synthetic local id is never evidence of absence,
-// and an unreachable or unanswered provider leaves the reservation exactly where
-// it is.
+// Releasable, and only two evidences can do that: a contract-supported
+// provider terminal status for a matching server (terminated/deleted), or the
+// provider reporting a waitlist reservation, which the contract states is not
+// billed. A synthetic local id is never evidence of absence, a deploy-status
+// omission is not evidence of absence, and an unreachable or unanswered provider
+// leaves the reservation exactly where it is.
+//
+// There is deliberately NO operator-acknowledgement path. The approved scope
+// forbids an administrator waiver in place of authoritative proof, and a
+// free-text note is not proof of anything. A reservation whose outcome is
+// genuinely unknowable is reported as unresolved instead of being waived.
 //
 // CommittedBefore is computed WITHOUT the release evidence, because it must show
 // what the panel charges today; CommittedAfter subtracts exactly the released
@@ -158,17 +163,10 @@ func orderIDFor(entries []Entry, recordID int64) string {
 // own words, so an operator can audit what the decision rested on.
 func evidenceSummary(ev Evidence) string {
 	switch {
-	case ev.OperatorConfirmed:
-		if ev.OperatorNote != "" {
-			return "operator verification: " + ev.OperatorNote
-		}
-		return "operator verification: no charge exists for this attempt"
+	case ev.ProviderOrderFound && ev.ProviderOrderStatus != "":
+		return "provider reports this order as " + ev.ProviderOrderStatus
 	case ev.ServerFound && ev.ServerStatus != "":
 		return "provider reports the matching server as " + ev.ServerStatus
-	case ev.OrderNotFound && ev.OrderQueried:
-		return "provider reports no such order"
-	case ev.OrderEnded && ev.OrderQueried:
-		return "provider reports no live order for this id"
 	case ev.OrderQueryFailed:
 		return "provider query failed; no conclusion"
 	case ev.ServerFound:
@@ -179,12 +177,13 @@ func evidenceSummary(ev Evidence) string {
 }
 
 // ValidateObservation rejects an observation that must never justify a release.
-// It exists so an operator mistake cannot become a financial decision: a
-// not-found answer for a synthetic local id proves nothing, because the provider
-// never issued that id.
+// It exists so a caller mistake cannot become a financial decision: the provider
+// contract states GET /deploy/status omits canceled orders, so a not-found
+// answer for an order id proves nothing about a charge, whether the id is local
+// or real.
 func ValidateObservation(orderID string, ev Evidence) error {
-	if ev.OrderNotFound && IsSyntheticOrderID(orderID) {
-		return fmt.Errorf("order %s: a not-found answer for a synthetic local id is not evidence that no charge exists", orderID)
+	if ev.OrderQueryFailed && ev.ProviderOrderFound {
+		return fmt.Errorf("order %s: a failed query cannot also report the order as found", orderID)
 	}
 	return nil
 }

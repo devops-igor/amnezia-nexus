@@ -183,13 +183,15 @@ func TestIsOrderActiveForBudget(t *testing.T) {
 		}
 	}
 
+	// A1 correction: only labels that end the order attempt stop counting.
+	// "cancelled" is no longer inactive-quietly: the provider contract shows a
+	// cancellation keeps billing until termination (contract E2), so it is
+	// counted and reported unresolved rather than dropped. "stopped" and "" are
+	// undocumented states and likewise keep their reservation.
 	inactiveStatuses := []string{
 		"failed",
-		"cancelled",
 		"terminated",
 		"deleted",
-		"stopped",
-		"",
 	}
 
 	for _, s := range inactiveStatuses {
@@ -234,8 +236,33 @@ func TestIsTerminalStatus(t *testing.T) {
 	}
 }
 
+// TestGigahostOrderHandler_BudgetReconcilesCancelledServer covers the
+// reconciliation of a provider-cancelled server.
+//
+// A1 CORRECTION (intake finding 1). The pre-A1 version of this test asserted that
+// a provider server reported as "cancelled" frees its budget, and that a
+// deploy-status answer with an empty status frees it too. Both contradict the
+// provider contract:
+//
+//	"By default the server keeps running until the end of the paid period and is
+//	 terminated on termination_date ... Hourly-billed servers are always
+//	 terminated right away and their final hours are billed on the next monthly
+//	 invoice."  (contract E2)
+//
+//	"Each server includes ... any pending cancellation (cancelled, null when
+//	 none)"  (contract E2)
+//
+//	"[deploy status] ... orders that have been cancelled or whose server has been
+//	 deleted are left out of the list."  (contract E1)
+//
+// A "cancelled" server is still running and still billed, and an omission from
+// GET /deploy/status is indistinguishable from "never existed", "cancelled" or
+// "not yours". Releasing on either let a second VPS be bought against budget the
+// first one was still consuming. The subtest that asserted the release is now
+// "terminated-in-inventory-releases-and-allows-replacement", which keeps the
+// legitimate contract-supported positive.
 func TestGigahostOrderHandler_BudgetReconcilesCancelledServer(t *testing.T) {
-	t.Run("terminal-in-inventory", func(t *testing.T) {
+	t.Run("cancelled-in-inventory-still-counts", func(t *testing.T) {
 		h, db, _ := setupTestHandlers(t)
 		ctx := context.Background()
 
@@ -290,26 +317,29 @@ func TestGigahostOrderHandler_BudgetReconcilesCancelledServer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(orders) != 1 || orders[0].Status != "cancelled" {
-			t.Fatalf("expected local order status 'cancelled', got %+v", orders)
+		if len(orders) != 1 || orders[0].ReleasedAt != "" {
+			t.Fatalf("a pending cancellation must not release the reservation, got %+v", orders)
 		}
 
-		// Subsequent 90 NOK replacement under 100 NOK cap succeeds
+		// 90 committed + 90 requested exceeds the 100 cap: the replacement must
+		// be refused, because the cancelled server is still billed until
+		// termination.
 		body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0.14375}`
 		orderReq := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
 		orderReq = orderReq.WithContext(middleware.WithSession(orderReq.Context(), &models.SessionData{Role: models.RoleAdmin}))
 		orderW := httptest.NewRecorder()
 		h.GigahostOrderHandler(orderW, orderReq)
 
-		if orderW.Code != http.StatusOK {
-			t.Fatalf("expected replacement order 200 OK, got %d (body: %s)", orderW.Code, orderW.Body.String())
+		if orderW.Code != http.StatusBadRequest || !strings.Contains(orderW.Body.String(), "budget_exceeded") {
+			t.Fatalf("expected 400 budget_exceeded for a still-billed cancelled server, got %d (body: %s)",
+				orderW.Code, orderW.Body.String())
 		}
-		if posts != 1 {
-			t.Errorf("expected 1 replacement order dispatched, got %d", posts)
+		if posts != 0 {
+			t.Errorf("expected 0 replacement orders dispatched, got %d", posts)
 		}
 	})
 
-	t.Run("removed-from-inventory", func(t *testing.T) {
+	t.Run("deploy-status-empty-response-still-counts", func(t *testing.T) {
 		h, db, _ := setupTestHandlers(t)
 		ctx := context.Background()
 
@@ -366,26 +396,28 @@ func TestGigahostOrderHandler_BudgetReconcilesCancelledServer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(orders) != 1 || orders[0].Status != "cancelled" {
-			t.Fatalf("expected local order status 'cancelled', got %+v", orders)
+		if len(orders) != 1 || orders[0].ReleasedAt != "" {
+			t.Fatalf("an ambiguous deploy-status answer must not release the reservation, got %+v", orders)
 		}
 
-		// Subsequent 90 NOK replacement under 100 NOK cap succeeds
+		// An empty deploy-status answer is indistinguishable from "cancelled",
+		// "deleted" or "not yours", so the commitment stays counted.
 		body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0.14375}`
 		orderReq := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
 		orderReq = orderReq.WithContext(middleware.WithSession(orderReq.Context(), &models.SessionData{Role: models.RoleAdmin}))
 		orderW := httptest.NewRecorder()
 		h.GigahostOrderHandler(orderW, orderReq)
 
-		if orderW.Code != http.StatusOK {
-			t.Fatalf("expected replacement order 200 OK, got %d (body: %s)", orderW.Code, orderW.Body.String())
+		if orderW.Code != http.StatusBadRequest || !strings.Contains(orderW.Body.String(), "budget_exceeded") {
+			t.Fatalf("expected 400 budget_exceeded: an ambiguous order answer is not proof of no charge, got %d (body: %s)",
+				orderW.Code, orderW.Body.String())
 		}
-		if posts != 1 {
-			t.Errorf("expected 1 replacement order dispatched, got %d", posts)
+		if posts != 0 {
+			t.Errorf("expected 0 replacement orders dispatched, got %d", posts)
 		}
 	})
 
-	t.Run("direct-order-reconciles-cancelled-without-explicit-refresh", func(t *testing.T) {
+	t.Run("terminated-in-inventory-releases-and-allows-replacement", func(t *testing.T) {
 		h, db, _ := setupTestHandlers(t)
 		ctx := context.Background()
 
@@ -416,10 +448,9 @@ func TestGigahostOrderHandler_BudgetReconcilesCancelledServer(t *testing.T) {
 				}, nil
 			},
 			getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
-				return []gigahost.ServerInfo{}, nil
-			},
-			getDeployStatusFn: func(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error) {
-				return &gigahost.DeployStatusResponse{OrderID: orderID, Status: ""}, nil
+				return []gigahost.ServerInfo{
+					{ID: 201, OrderID: "local_direct_1", Status: "terminated", PID: 101, RegionID: 1},
+				}, nil
 			},
 			orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 				posts++
@@ -427,7 +458,9 @@ func TestGigahostOrderHandler_BudgetReconcilesCancelledServer(t *testing.T) {
 			},
 		})
 
-		// Direct replacement order without prior refresh: checkMonthlyBudget should reconcile it
+		// A direct replacement order, with no prior explicit refresh: the budget
+		// check itself must reconcile the terminated reservation, or a legitimate
+		// replacement after a real termination would be refused forever.
 		body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0.14375}`
 		orderReq := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
 		orderReq = orderReq.WithContext(middleware.WithSession(orderReq.Context(), &models.SessionData{Role: models.RoleAdmin}))
@@ -441,7 +474,7 @@ func TestGigahostOrderHandler_BudgetReconcilesCancelledServer(t *testing.T) {
 			t.Errorf("expected 1 replacement order dispatched, got %d", posts)
 		}
 
-		// Verify order was persisted as cancelled in DB
+		// The original row keeps its own status and gains a release marker.
 		orders, err := h.getGigahostOrders(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -450,13 +483,16 @@ func TestGigahostOrderHandler_BudgetReconcilesCancelledServer(t *testing.T) {
 		for _, o := range orders {
 			if o.OrderID == "local_direct_1" {
 				found = true
-				if o.Status != "cancelled" {
-					t.Errorf("expected local_direct_1 status to be 'cancelled', got %s", o.Status)
+				if o.ReleasedAt == "" {
+					t.Error("expected local_direct_1 to carry a release marker")
+				}
+				if o.Status != gigahost.StatusReady {
+					t.Errorf("a release must not rewrite the stored status, got %q", o.Status)
 				}
 			}
 		}
 		if !found {
-			t.Errorf("expected to find local_direct_1 in DB orders")
+			t.Error("expected to find local_direct_1 in DB orders")
 		}
 	})
 }

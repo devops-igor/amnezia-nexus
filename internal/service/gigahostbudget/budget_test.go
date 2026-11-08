@@ -77,11 +77,15 @@ func TestEvaluate_CountsEachReservationOnce(t *testing.T) {
 			wantStates:   map[int64]State{1: StateActive},
 		},
 		{
-			name:         "a terminal local status is not a commitment",
+			// A1 correction: a stored "cancelled" does not end billing by
+			// itself (contract E2: still running and billed until
+			// termination_date), so with no provider answer the outcome is
+			// unknown and the spend stays counted.
+			name:         "a locally cancelled row with no provider answer stays counted",
 			servers:      nil,
 			entries:      []Entry{entry(1, "10001", 7, "cancelled", 202, 0.057)},
-			wantComitted: 0,
-			wantStates:   map[int64]State{1: StateObsolete},
+			wantComitted: 41,
+			wantStates:   map[int64]State{1: StateUnresolved},
 		},
 		{
 			name:         "an already released reservation is not counted",
@@ -192,40 +196,43 @@ func TestClassify_UnknownOutcomesStayCounted(t *testing.T) {
 		{
 			name:     "a not-found answer about a synthetic id proves nothing",
 			entry:    entry(1, "intent_1700000000000000000", 0, "unknown", 202, 0.057),
-			evidence: Evidence{OrderQueried: true, OrderNotFound: true},
+			evidence: Evidence{},
 			want:     StateUnresolved,
 		},
 		{
 			name:     "a failing provider query is not evidence of absence",
 			entry:    entry(1, "10001", 7, "ready", 202, 0.057),
-			evidence: Evidence{OrderQueried: true, OrderQueryFailed: true},
+			evidence: Evidence{OrderQueryFailed: true},
 			want:     StateUnresolved,
 		},
 		{
-			name:     "a real provider order the provider denies is obsolete",
+			// A1 correction: GET /deploy/status omits cancelled orders and
+			// orders whose server was deleted (contract E1), so its omission
+			// proves nothing about a charge.
+			name:     "a real provider order omitted from deploy status is not obsolete",
 			entry:    entry(1, "10001", 7, "ready", 202, 0.057),
-			evidence: Evidence{OrderQueried: true, OrderNotFound: true},
-			want:     StateObsolete,
-			releasab: true,
+			evidence: Evidence{OrderOmittedFromDeployStatus: true},
+			want:     StateActive,
 		},
 		{
 			name:     "a provider terminal server status is obsolete",
 			entry:    entry(1, "10001", 7, "ready", 202, 0.057),
-			evidence: Evidence{ServerFound: true, ServerStatus: "cancelled"},
+			evidence: Evidence{ServerFound: true, ServerStatus: "terminated"},
 			want:     StateObsolete,
 			releasab: true,
 		},
 		{
-			name:     "an operator confirmation releases a record with no provider identity",
-			entry:    entry(1, "intent_1700000000000000000", 0, "unknown", 202, 0.057),
-			evidence: Evidence{OperatorConfirmed: true, OperatorNote: "checked"},
-			want:     StateObsolete,
-			releasab: true,
+			// A1 correction: there is no operator-waiver release path. The
+			// approved scope forbids an administrator acknowledgement standing
+			// in for authoritative provider proof.
+			name:  "a record with no provider identity cannot be released by acknowledgement",
+			entry: entry(1, "intent_1700000000000000000", 0, "unknown", 202, 0.057),
+			want:  StateUnresolved,
 		},
 		{
 			name:     "an operator confirmation cannot release a provider-identified record",
 			entry:    entry(1, "10001", 7, "ready", 202, 0.057),
-			evidence: Evidence{OperatorConfirmed: true, OperatorNote: "checked"},
+			evidence: Evidence{},
 			want:     StateActive,
 		},
 		{
@@ -363,7 +370,7 @@ func TestPropose_ReleasesOnlyOnEvidence(t *testing.T) {
 		Plans:   catalog,
 		Entries: entries,
 		Evidence: map[int64]Evidence{
-			2: {OperatorConfirmed: true, OperatorNote: "cannot release, provider id"},
+			2: {ServerFound: true, ServerStatus: "ready"},
 		},
 	}
 	p, err := Propose(in)
@@ -378,7 +385,7 @@ func TestPropose_ReleasesOnlyOnEvidence(t *testing.T) {
 	}
 
 	// Now confirm the record that carries no provider identity.
-	in.Evidence[1] = Evidence{OperatorConfirmed: true, OperatorNote: "verified"}
+	in.Evidence[1] = Evidence{ProviderOrderFound: true, ProviderOrderStatus: "waitlist"}
 	p, err = Propose(in)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -409,7 +416,7 @@ func TestClassify_FailedProviderStatusIsNotProofOfNoCharge(t *testing.T) {
 		}
 	}
 	// The statuses that really end the binding stay releasable.
-	for _, status := range []string{"cancelled", "deleted", "terminated", "stopped", "expired", "refunded"} {
+	for _, status := range []string{"deleted", "terminated"} {
 		v := Classify(e, Evidence{ServerFound: true, ServerStatus: status})
 		if v.State != StateObsolete || !v.Releasable {
 			t.Errorf("status %q: state = %q releasable = %v, want obsolete + releasable", status, v.State, v.Releasable)
@@ -420,14 +427,18 @@ func TestClassify_FailedProviderStatusIsNotProofOfNoCharge(t *testing.T) {
 // TestIsActiveForBudget_StatusSetUnchanged guards the classification against a
 // silent widening: a status that was not counted before must not start counting.
 func TestIsActiveForBudget_StatusSetUnchanged(t *testing.T) {
+	// A1 correction: every local label that is not a terminal attempt record
+	// keeps its reservation. An unrecognised label must not silently drop spend,
+	// so "" / "provisioning" / "building" now count as well.
 	active := []string{"ready", "active", "pending", "pending_order", "pending_payment",
-		"deploying", "installing", "waiting", "unknown"}
+		"deploying", "installing", "waiting", "unknown",
+		"stopped", "expired", "refunded", "provisioning", "building", ""}
 	for _, s := range active {
 		if !IsActiveForBudget(s) {
 			t.Errorf("expected %q to count toward the budget", s)
 		}
 	}
-	inactive := []string{"failed", "cancelled", "canceled", "deleted", "terminated", "stopped", "", "provisioning", "building"}
+	inactive := []string{"failed", "deleted", "terminated"}
 	for _, s := range inactive {
 		if IsActiveForBudget(s) {
 			t.Errorf("expected %q NOT to count toward the budget", s)

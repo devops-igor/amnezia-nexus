@@ -276,14 +276,13 @@ func TestIsOrderActiveForBudget_PendingPaymentAndUnknown(t *testing.T) {
 		}
 	}
 
-	// Terminal / inactive statuses
+	// A1 correction: only labels that end the order attempt stop counting.
+	// "cancelled"/"stopped"/"" now keep their reservation, because the provider
+	// contract does not support reading them as "no further charge accrues".
 	inactive := []string{
 		"failed",
-		"cancelled",
 		"deleted",
 		"terminated",
-		"stopped",
-		"",
 	}
 	for _, s := range inactive {
 		if isOrderActiveForBudget(s) {
