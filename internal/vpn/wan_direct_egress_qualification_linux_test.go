@@ -7,10 +7,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -46,22 +48,94 @@ import (
 //   - R7  separate proxied/direct counters that only move on real delivery
 //   - R6  replies reach the owning peer's return path and nobody else's
 //
-// The gate always runs wherever an isolated user+network namespace can be created.
-// Only an environment that cannot create one is skipped, and it says why, so a
-// green run can never be produced by silently not executing the check.
+// The gate must not be able to pass by not running. In required CI it always
+// executes and any inability to build the isolated topology is a FAILURE with the
+// captured evidence, never a skip. Outside CI a skip is allowed only when the
+// environment provably cannot provide namespaces, and the reason is printed.
 func TestS4ProductionContainerHostWANQualification(t *testing.T) {
-	// Run the whole check inside a private user+network namespace so the fixture
-	// can build its own uplink, firewall and kernel settings without touching the
-	// host. A namespace that cannot be created is an environment limitation, and
-	// is reported as a skip with the reason, never as a pass.
 	out, err := runS4QualificationProbe()
 	if err != nil {
-		t.Skipf("cannot create isolated user+network namespace here: %v\n%s", err, out)
+		if s4RequiredEnvironment() {
+			t.Fatalf("S4 qualification could not execute in required CI, so the claimed production gate is unproven: %v\n%s", err, out)
+		}
+		t.Skipf("cannot create isolated user+network namespace in this optional environment: %v\n%s", err, out)
 	}
 	if !strings.Contains(out, "S4 RESULT: PASS") {
 		t.Fatalf("S4 qualification failed:\n%s", out)
 	}
 	t.Logf("S4 qualification output:\n%s", out)
+}
+
+// s4RequiredEnvironment reports whether this run is a required CI gate, where a
+// skipped S4 qualification would be misrepresented as a pass.
+//
+// The CI job container runs `go test` inside a Docker container that does not
+// propagate GITHUB_ACTIONS, so the marker is an explicit environment variable the
+// workflow sets, defaulting to "required" for any GITHUB_ACTIONS run.
+func s4RequiredEnvironment() bool {
+	if v := os.Getenv("NEXUS_S4_REQUIRED"); v != "" {
+		return v != "0"
+	}
+	return os.Getenv("GITHUB_ACTIONS") != "" || os.Getenv("CI") != ""
+}
+
+// TestS4RequiredEnvironment pins the anti-silent-skip contract: a required CI run
+// must never be able to report success by not executing the gate.
+func TestS4RequiredEnvironment(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want bool
+	}{
+		{"explicit required", map[string]string{"NEXUS_S4_REQUIRED": "1"}, true},
+		{"explicit optional", map[string]string{"NEXUS_S4_REQUIRED": "0"}, false},
+		{"github actions default", map[string]string{"GITHUB_ACTIONS": "true"}, true},
+		{"ci default", map[string]string{"CI": "true"}, true},
+		{"plain developer shell", map[string]string{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, key := range []string{"NEXUS_S4_REQUIRED", "GITHUB_ACTIONS", "CI"} {
+				t.Setenv(key, "")
+			}
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+			if got := s4RequiredEnvironment(); got != tc.want {
+				t.Fatalf("s4RequiredEnvironment() = %v, want %v for env %v", got, tc.want, tc.env)
+			}
+		})
+	}
+}
+
+// TestS4QualificationFailsWhenNamespaceUnavailable pins that a required run whose
+// namespace cannot be created is a FAILURE, and that an optional run is a skip.
+// A skipped required gate would let the claimed S4 acceptance pass without ever
+// exercising the subject.
+func TestS4QualificationFailsWhenNamespaceUnavailable(t *testing.T) {
+	// Put a non-functional `unshare` first on PATH so namespace creation fails.
+	dir := t.TempDir()
+	script := filepath.Join(dir, "unshare")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatalf("write fake unshare: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	t.Run("required_fails", func(t *testing.T) {
+		t.Setenv("NEXUS_S4_REQUIRED", "1")
+		if _, err := runS4QualificationProbe(); err == nil {
+			t.Fatal("a required run must report an error when the namespace cannot be created")
+		}
+	})
+
+	t.Run("optional_skips", func(t *testing.T) {
+		t.Setenv("NEXUS_S4_REQUIRED", "0")
+		// The probe still errors; the *test* decides skip vs fail, and this asserts
+		// the marker that drives that decision.
+		if s4RequiredEnvironment() {
+			t.Fatal("NEXUS_S4_REQUIRED=0 must not be treated as a required environment")
+		}
+	})
 }
 
 // s4ProbeEnv marks the re-executed qualification body.
@@ -74,9 +148,14 @@ func init() {
 	os.Exit(runS4QualificationBody())
 }
 
-// runS4QualificationProbe re-executes this test binary inside `unshare -Urn` so the
-// qualification owns a private network namespace with the capabilities the
-// deployed container gains from `cap_add`.
+// runS4QualificationProbe runs the qualification in a private user+network
+// namespace created for this run, and returns its output.
+//
+// The namespace is the fixture: it owns its uplink, firewall, TUN device and kernel
+// settings, and disappears with the process, so no host state is read or written.
+//
+// If the namespace cannot be created, the caller decides whether that is a failure
+// or a skip — in required CI it is a FAILURE, never a silent pass.
 func runS4QualificationProbe() (string, error) {
 	// #nosec G204 -- os.Args[0] is this test binary; the namespace flags are literals
 	cmd := exec.Command("unshare", "-Urn", "--map-root-user", os.Args[0], "-test.run=^$")
@@ -88,12 +167,48 @@ func runS4QualificationProbe() (string, error) {
 	return string(out), nil
 }
 
-// runS4QualificationBody is the qualification itself. It returns a process exit
-// code and prints a single machine-readable verdict line.
+// runS4QualificationBody is the qualification run as a re-executed process inside the
+// private namespace. It returns a process exit code.
 func runS4QualificationBody() int {
-	fail := func(format string, args ...any) int {
-		fmt.Printf("S4 RESULT: FAIL: "+format+"\n", args...)
+	// This process was started by runS4QualificationProbe inside a private
+	// `unshare -Urn` namespace that it owns and that disappears when it exits, so
+	// configuring that namespace is fixture setup, not a host change.
+	if err := configurePrivateNamespaceSetup(); err != nil {
+		fmt.Printf("S4 RESULT: FAIL: %v\n", err)
 		return 1
+	}
+	return runS4QualificationBodyTo(os.Stdout)
+}
+
+// configurePrivateNamespaceSetup applies the direct-egress settings to the private
+// namespace this process created for itself. It must only ever be called from the
+// re-executed probe (s4ProbeEnv), which by construction owns a throwaway namespace
+// that vanishes with the process; it never runs against a deployment or the host.
+func configurePrivateNamespaceSetup() error {
+	for _, setting := range []struct{ key, value string }{
+		{"net.ipv4.ip_forward", "1"},
+		{"net.ipv4.conf.all.rp_filter", "0"},
+		{"net.ipv4.conf.default.rp_filter", "0"},
+		{"net.ipv4.conf.all.accept_local", "1"},
+	} {
+		if out, err := s4Command("sysctl", "-w", setting.key+"="+setting.value); err != nil {
+			return fmt.Errorf("configure private namespace %s: %w: %s", setting.key, err, strings.TrimSpace(out))
+		}
+	}
+	return nil
+}
+
+// runS4QualificationBodyTo is the qualification itself, writing everything to w so
+// it can run either as a re-executed process or in-process. It returns an exit code
+// and emits exactly one machine-readable verdict line.
+func runS4QualificationBodyTo(w io.Writer) int {
+	fail := func(format string, args ...any) int {
+		fmt.Fprintf(w, "S4 RESULT: FAIL: "+format+"\n", args...)
+		return 1
+	}
+	// logf keeps narrative output (the red-phase evidence) next to the verdict.
+	logf := func(format string, args ...any) {
+		fmt.Fprintf(w, format+"\n", args...)
 	}
 
 	fixture, err := newS4Fixture()
@@ -102,19 +217,44 @@ func runS4QualificationBody() int {
 	}
 	defer fixture.Close()
 
-	if failed := applyS4DeploymentSysctls(); len(failed) > 0 {
-		return fail("documented deployment settings did not apply: %v", failed)
+	// --- Phase 1: the documented deployment is REFUSED by the production path ---
+	// With the settings the README used to prescribe (rp_filter=2), direct egress
+	// cannot forward: the dispatcher SNATs to the host WAN address, which is local to
+	// this host, and source validation drops the packet as a martian. The production
+	// constructor must therefore reject that configuration instead of starting a data
+	// plane that silently forwards nothing.
+	//
+	// This runs the REAL production validator over a synthetic sysctl tree rather than
+	// editing this container's sysctls: a deployed container mounts /proc/sys
+	// read-only, and rewriting the environment under test would prove something the
+	// deployment does not do. The synthetic tree is the only way to hold two
+	// configurations in one run.
+	if err := s4AssertDocumentedConfigRejected(); err != nil {
+		return fail("%v", err)
 	}
-	if err := s4ForwardingRules(fixture.wanIface, s4WANDeviceName); err != nil {
-		return fail("install forwarding rules: %v", err)
+
+	// --- Phase 2: the deployed configuration, which must qualify end to end -------
+	// The settings are OBSERVED, never written: they arrive from `--sysctl` or the
+	// host. A gate that cannot see a usable configuration must fail, not pass quietly.
+	reported := s4SourceValidationSettings()
+	if effective := reported["effective_rp_filter"]; effective != "0" {
+		return fail("qualifying requires rp_filter=0 as the effective value (observed %q from all=%q default=%q); start the container with rp_filter=0 via --sysctl",
+			effective, reported["all_rp_filter"], reported["default_rp_filter"])
 	}
 
 	// Production WAN device: real TUN, real AF_PACKET capture, real iptables.
 	wanDev, err := NewProductionWANDevice(s4WANDeviceName)
 	if err != nil {
-		return fail("NewProductionWANDevice: %v", err)
+		return fail("NewProductionWANDevice with rp_filter=0: %v", err)
 	}
 	defer func() { _ = wanDev.Close() }()
+
+	if failed := s4RequireForwardingSettings(); len(failed) > 0 {
+		return fail("forwarding settings are not in effect: %v", failed)
+	}
+	if err := s4ForwardingRules(fixture.wanIface, s4WANDeviceName); err != nil {
+		return fail("install forwarding rules: %v", err)
+	}
 
 	if err := fixture.peer.waitReady(); err != nil {
 		return fail("%v", err)
@@ -132,35 +272,6 @@ func runS4QualificationBody() int {
 	}
 	defer cleanup()
 
-	// --- Phase 1: the documented deployment alone does NOT deliver --------------
-	// With exactly the settings the README prescribes (rp_filter=2), the dispatcher
-	// SNATs direct egress to the host WAN address, which is local to this host, and
-	// the kernel's reverse-path check drops the injected packet as a martian before
-	// it is ever forwarded. This is asserted as a negative control so the passing
-	// phase below cannot be an artefact of a permissive environment: if this phase
-	// starts delivering, the deployment gap has changed and the qualification must
-	// be re-derived rather than silently keep passing.
-	strictStats := s4SnapshotIPStats()
-	if err := s4SendClientPacket(svc, "peer-s4-udp", "10.100.0.10", "sess-s4-udp", 12345, fixture.peerIP, s4RemotePort, []byte("s4-strict-probe"), 17); err != nil {
-		return fail("route direct UDP packet under documented settings: %v", err)
-	}
-	if _, delivered := s4WaitReply(replies, "peer-s4-udp", 1500*time.Millisecond); delivered {
-		return fail("documented deployment delivered a direct reply without relaxing reverse-path filtering; the S4 finding no longer reproduces and this qualification must be re-derived")
-	}
-	strictDelta := s4StatDelta(strictStats, s4SnapshotIPStats())
-	if strictDelta["IpForwDatagrams"] != 0 {
-		return fail("expected zero forwarded datagrams under the documented settings, got %d", strictDelta["IpForwDatagrams"])
-	}
-
-	// --- Phase 2: the prerequisite the deployment must add ---------------------
-	// The dispatcher injects an already-SNATed packet, so source validation must be
-	// off for the device it enters. Relaxing it is the documented-deployment gap
-	// this gate reports; it is applied here as an explicit, measured prerequisite
-	// rather than a silent workaround.
-	if err := s4SetReversePathFilter("0"); err != nil {
-		return fail("relax reverse-path filtering: %v", err)
-	}
-
 	// --- UDP: direct egress, real reply, DNAT back to the owning peer ------------
 	directDropBase := dem.DirectDrops()
 	udpPayload := []byte("s4-udp-probe")
@@ -169,8 +280,8 @@ func runS4QualificationBody() int {
 	}
 	udpReply, ok := s4WaitReply(replies, "peer-s4-udp", 5*time.Second)
 	if !ok {
-		return fail("no UDP reply reached the owning peer (directDrops %d -> %d) after writing to the production WAN device",
-			directDropBase, dem.DirectDrops())
+		return fail("no UDP reply reached the owning peer (directDrops %d -> %d) after writing to the production WAN device; kernel drop evidence: %v",
+			directDropBase, dem.DirectDrops(), s4KernelDropEvidence())
 	}
 	if want := "ECHO:" + string(udpPayload); !strings.HasSuffix(string(udpReply), want) {
 		return fail("UDP reply payload %q does not end with %q", string(udpReply[len(udpReply)-16:]), want)
@@ -240,7 +351,7 @@ func runS4QualificationBody() int {
 		return fail("proxied traffic incremented directBytes (%d -> %d)", bytesBeforeProxy, got)
 	}
 
-	fmt.Printf("S4 RESULT: PASS: production WAN device + dispatcher delivered direct UDP and TCP replies from %s:%d to the owning peer with DNAT (directBytes=%d, directDrops=%d)\n",
+	logf("S4 RESULT: PASS: production WAN device + dispatcher delivered direct UDP and TCP replies from %s:%d to the owning peer with DNAT (directBytes=%d, directDrops=%d)",
 		fixture.peerIP, s4RemotePort, dem.DirectBytes(), dem.DirectDrops())
 	return 0
 }

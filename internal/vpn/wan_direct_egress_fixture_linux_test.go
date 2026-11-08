@@ -3,12 +3,14 @@
 package vpn
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -55,8 +57,10 @@ const (
 	s4WANIface     = "wan0"
 	s4WANPeerIface = "wan-peer"
 
-	// s4WANDeviceName is the WAN tunnel device the production constructor creates.
-	s4WANDeviceName = "nexus-wan-s4"
+	// s4WANDeviceName is the WAN tunnel device the fixture creates. It is the
+	// production default name so the production prerequisite check validates exactly
+	// the interface the fixture then builds, with no name divergence to hide a gap.
+	s4WANDeviceName = defaultWANTunnelDeviceName
 
 	// s4RolePeer selects the nested-namespace participant.
 	s4RolePeer = "peer"
@@ -308,27 +312,124 @@ func s4Command(name string, args ...string) (string, error) {
 	return string(out), err
 }
 
-// s4DeploymentSysctls are the kernel settings the documented deployment block sets
-// for direct WAN egress. The fixture applies exactly these before proving the
-// path, so the qualification covers the shipped deployment rather than a
-// permissive superset of it.
-var s4DeploymentSysctls = []struct{ key, value string }{
-	{"net.ipv4.ip_forward", "1"},
-	{"net.ipv4.conf.all.rp_filter", "2"},
-	{"net.ipv4.conf.all.accept_local", "1"},
+// s4KernelDropEvidence summarises the kernel counters that identify where a direct
+// packet was dropped, so a failure names the mechanism rather than only the symptom.
+func s4KernelDropEvidence() map[string]int64 {
+	stats := s4SnapshotIPStats()
+	evidence := map[string]int64{}
+	for _, key := range []string{
+		"IpForwDatagrams", "IpInReceives", "TcpExtIPReversePathFilter",
+		"IpInAddrErrors", "UdpInDatagrams", "IpOutRequests",
+	} {
+		evidence[key] = stats[key]
+	}
+	return evidence
 }
 
-// applyS4DeploymentSysctls applies the documented settings and returns the ones
-// that did not take effect, so a caller can report an unusable environment instead
-// of asserting against it.
-func applyS4DeploymentSysctls() []string {
-	var failed []string
-	for _, setting := range s4DeploymentSysctls {
-		if out, err := s4Command("sysctl", "-w", setting.key+"="+setting.value); err != nil {
-			failed = append(failed, fmt.Sprintf("%s: %v (%s)", setting.key, err, strings.TrimSpace(out)))
+// s4AssertDocumentedConfigRejected drives the real production validator over a
+// synthetic sysctl tree describing the formerly documented deployment (rp_filter=2)
+// and requires it to be refused with the actionable error. This is the red half of
+// the counterexample, and it is the only honest way to hold an incompatible
+// configuration alongside the qualifying one in a single container whose /proc/sys is
+// read-only.
+func s4AssertDocumentedConfigRejected() error {
+	root, err := os.MkdirTemp("", "s4-sysctl")
+	if err != nil {
+		return fmt.Errorf("create synthetic sysctl root: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(root) }()
+
+	for _, scope := range []string{"all", "default"} {
+		dir := filepath.Join(root, "net/ipv4/conf", scope)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create %s: %w", dir, err)
+		}
+		// The formerly documented deployment.
+		if err := os.WriteFile(filepath.Join(dir, "rp_filter"), []byte("2\n"), 0o600); err != nil {
+			return fmt.Errorf("write %s rp_filter: %w", scope, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "accept_local"), []byte("1\n"), 0o600); err != nil {
+			return fmt.Errorf("write %s accept_local: %w", scope, err)
 		}
 	}
-	return failed
+	if err := os.WriteFile(filepath.Join(root, "net/ipv4/ip_forward"), []byte("1\n"), 0o600); err != nil {
+		return fmt.Errorf("write ip_forward: %w", err)
+	}
+
+	original := sourceValidationRoot
+	sourceValidationRoot = root
+	defer func() { sourceValidationRoot = original }()
+
+	rejectErr := validateDirectEgressSourceValidation(root, defaultWANTunnelDeviceName)
+	if rejectErr == nil {
+		return fmt.Errorf("the production prerequisite accepted rp_filter=2, which was measured to forward no direct traffic; the fail-closed guard is not effective")
+	}
+	if !errors.Is(rejectErr, ErrHostWANSourceValidation) {
+		return fmt.Errorf("production prerequisite rejected the documented configuration with an unexpected error: %w", rejectErr)
+	}
+	fmt.Printf("S4 red phase: production prerequisite refused rp_filter=2: %v\n", rejectErr)
+	return nil
+}
+
+// s4SourceValidationSettings reports the kernel source-validation inputs and their
+// effective values, reading procfs only. The gate compares these against what a
+// deployment must provide; it never writes them, because a deployed container mounts
+// /proc/sys read-only and supplies them through `--sysctl` or the host.
+func s4SourceValidationSettings() map[string]string {
+	read := func(rel string) string {
+		// #nosec G304 -- fixed procfs paths
+		data, err := os.ReadFile("/proc/sys/net/ipv4/" + rel)
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(data))
+	}
+	out := map[string]string{
+		"all_rp_filter":        read("conf/all/rp_filter"),
+		"default_rp_filter":    read("conf/default/rp_filter"),
+		"all_accept_local":     read("conf/all/accept_local"),
+		"default_accept_local": read("conf/default/accept_local"),
+		"ip_forward":           read("ip_forward"),
+	}
+	// IN_DEV_RPFILTER = max(all, dev); a device that does not exist yet inherits
+	// conf/default, which is exactly the case before NewProductionWANDevice runs.
+	out["effective_rp_filter"] = s4MaxNumeric(out["all_rp_filter"], out["default_rp_filter"])
+	return out
+}
+
+// s4MaxNumeric returns the larger of two sysctl values as a decimal string.
+func s4MaxNumeric(a, b string) string {
+	ai, aErr := strconv.Atoi(a)
+	bi, bErr := strconv.Atoi(b)
+	switch {
+	case aErr != nil:
+		return ""
+	case bErr != nil:
+		return a
+	case bi > ai:
+		return b
+	default:
+		return a
+	}
+}
+
+// s4RequireForwardingSettings verifies the forwarding prerequisites are already in
+// effect and reports any that are not. Like the source-validation check it observes
+// rather than writes, so the gate cannot pass by configuring the environment it is
+// supposed to be qualifying.
+func s4RequireForwardingSettings() []string {
+	reported := s4SourceValidationSettings()
+	var missing []string
+	if reported["ip_forward"] != "1" {
+		missing = append(missing, fmt.Sprintf("ip_forward=%q (want 1)", reported["ip_forward"]))
+	}
+	// IN_DEV_ACCEPT_LOCAL = all || dev; the daemon may also set the device value
+	// itself when it creates the tunnel, so only a proven 0/0 is a failure.
+	if reported["all_accept_local"] != "1" && reported["default_accept_local"] != "1" {
+		missing = append(missing, fmt.Sprintf("accept_local all=%q default=%q (want at least one = 1)",
+			reported["all_accept_local"], reported["default_accept_local"]))
+	}
+	return missing
 }
 
 // s4ForwardingRules installs the forwarding and NAT rules direct WAN egress needs.
@@ -343,36 +444,6 @@ func s4ForwardingRules(wanIface, tunnelDev string) error {
 	} {
 		if out, err := s4Command("iptables", args...); err != nil {
 			return fmt.Errorf("iptables %v: %w: %s", args, err, out)
-		}
-	}
-	return nil
-}
-
-// s4SetReversePathFilter sets the reverse-path filter to 0 on the whole namespace
-// (all and every device), which is the prerequisite source validation needs for a
-// packet whose source address is local to the box.
-func s4SetReversePathFilter(value string) error {
-	for _, scope := range []string{"all", "default"} {
-		if out, err := s4Command("sysctl", "-w", "net.ipv4.conf."+scope+".rp_filter="+value); err != nil {
-			return fmt.Errorf("set %s rp_filter: %w: %s", scope, err, out)
-		}
-	}
-	entries, err := os.ReadDir("/proc/sys/net/ipv4/conf")
-	if err != nil {
-		return fmt.Errorf("list conf devices: %w", err)
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		// #nosec G204 -- name comes from the kernel's own conf directory listing
-		if out, err := s4Command("sysctl", "-w", "net.ipv4.conf."+name+".rp_filter="+value); err != nil {
-			// A device that vanished mid-loop is not a failure of the fixture.
-			if strings.Contains(out, "cannot stat") {
-				continue
-			}
-			return fmt.Errorf("set %s rp_filter: %w: %s", name, err, out)
 		}
 	}
 	return nil
@@ -395,15 +466,4 @@ func s4SnapshotIPStats() map[string]int64 {
 		stats[fields[0]] = value
 	}
 	return stats
-}
-
-// s4StatDelta reports the counters that moved between two snapshots.
-func s4StatDelta(before, after map[string]int64) map[string]int64 {
-	delta := map[string]int64{}
-	for key, value := range after {
-		if d := value - before[key]; d != 0 {
-			delta[key] = d
-		}
-	}
-	return delta
 }

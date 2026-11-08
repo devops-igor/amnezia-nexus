@@ -347,8 +347,11 @@ func newLinuxWANDeviceWithFiles(file, rawFile *os.File, name string, minPort, ma
 var (
 	// ErrIPForwardingDisabled indicates Linux kernel IPv4 forwarding is not enabled.
 	ErrIPForwardingDisabled = errors.New("kernel prerequisite failed: net.ipv4.ip_forward must be enabled (value 1)")
-	// ErrStrictRPFilter indicates Linux kernel reverse path filtering is in strict mode (1).
-	ErrStrictRPFilter = errors.New("kernel prerequisite failed: net.ipv4.conf.all.rp_filter is strict (1); direct WAN egress requires 0 or 2 (loose mode)")
+	// ErrStrictRPFilter is retained for callers and receipts that reference it. It is
+	// no longer produced by prerequisite validation: strict filtering was the wrong
+	// model (loose mode 2 does not rescue direct egress either), so validation now
+	// reports ErrHostWANSourceValidation for any non-zero effective rp_filter.
+	ErrStrictRPFilter = errors.New("kernel prerequisite failed: net.ipv4.conf.all.rp_filter is strict (1); direct WAN egress requires an effective rp_filter of 0")
 	// ErrNoDefaultWANRoute indicates no active route exists to forward WAN egress traffic.
 	ErrNoDefaultWANRoute = errors.New("kernel prerequisite failed: no active outbound WAN route detected")
 	// ErrAcceptLocalDisabled indicates Linux kernel local-source acceptance is not enabled.
@@ -358,6 +361,10 @@ var (
 	// production binary does not receive from CAP_NET_ADMIN alone.
 	ErrWANCaptureDenied = errors.New("kernel prerequisite failed: opening the AF_PACKET WAN capture socket requires CAP_NET_RAW (grant NET_RAW to the container and keep cap_net_raw in the binary's file capabilities)")
 )
+
+// defaultWANTunnelDeviceName is the WAN tunnel device the production constructor
+// creates, and therefore the device whose per-interface prerequisites matter.
+const defaultWANTunnelDeviceName = "nexus-wan0"
 
 func isAllAcceptLocalEnabled() bool {
 	return isAcceptLocalEnabled("/proc/sys/net/ipv4/conf/all/accept_local")
@@ -405,18 +412,27 @@ func setAcceptLocal(procPath, sysctlKey string) error {
 }
 
 // ValidateKernelPrerequisites validates host Linux kernel settings required for direct WAN egress:
-// 1. net.ipv4.ip_forward == 1
-// 2. net.ipv4.conf.all.rp_filter != 1 (strict reverse path filtering drops asymmetric WAN replies)
-// 3. Outbound WAN route exists
-// 4. net.ipv4.conf.all.accept_local == 1 (permits locally sourced SNAT packets)
-// 5. iptables firewall utility is available
-// 6. CAP_NET_RAW is available to open the AF_PACKET WAN capture socket
+//  1. net.ipv4.ip_forward == 1
+//  2. Effective source validation for the WAN tunnel device permits a locally
+//     sourced, source-NATed packet (rp_filter=0 and accept_local=1 as effective
+//     max(all,device) / all||device values — see wan_source_validation.go)
+//  3. Outbound WAN route exists
+//  4. iptables firewall utility is available
+//  5. CAP_NET_RAW is available to open the AF_PACKET WAN capture socket
 //
 // The checks run in order so a failure names the first unmet prerequisite.
 func ValidateKernelPrerequisites() error {
+	return validateKernelPrerequisitesForDevice(defaultWANTunnelDeviceName)
+}
+
+// validateKernelPrerequisitesForDevice is ValidateKernelPrerequisites for an
+// explicitly named WAN tunnel device, which is what the production constructor
+// creates. It is separated so tests can exercise the real ordering and error
+// surfaces against a device name of their choosing.
+func validateKernelPrerequisitesForDevice(wanDeviceName string) error {
 	for _, check := range []func() error{
 		checkIPForwarding,
-		checkLooseReversePathFilter,
+		func() error { return validateDirectEgressSourceValidation(sourceValidationRoot, wanDeviceName) },
 		checkWANRoute,
 		checkHostAcceptLocal,
 		checkIPTablesAvailable,
@@ -437,19 +453,6 @@ func checkIPForwarding() error {
 	}
 	if strings.TrimSpace(string(fwdData)) != "1" {
 		return ErrIPForwardingDisabled
-	}
-	return nil
-}
-
-// checkLooseReversePathFilter rejects strict (1) rp_filter, which drops asymmetric
-// WAN replies. An unreadable setting is tolerated so read-only procfs mounts work.
-func checkLooseReversePathFilter() error {
-	rpData, err := os.ReadFile("/proc/sys/net/ipv4/conf/all/rp_filter")
-	if err != nil {
-		return nil
-	}
-	if strings.TrimSpace(string(rpData)) == "1" {
-		return ErrStrictRPFilter
 	}
 	return nil
 }

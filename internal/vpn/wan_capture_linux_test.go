@@ -284,7 +284,15 @@ func applyProbeSysctls() bool {
 	}
 	settings := []struct{ rel, value string }{
 		{"net/ipv4/ip_forward", "1"},
-		{"net/ipv4/conf/all/rp_filter", "2"},
+		// rp_filter must be 0 for the direct-egress source-validation prerequisite
+		// (see wan_source_validation.go): loose mode 2 was measured to drop the
+		// locally sourced SNAT packet, so a probe that configured 2 was asking
+		// ValidateKernelPrerequisites to pass a configuration that cannot forward.
+		{"net/ipv4/conf/all/rp_filter", "0"},
+		// conf/default decides the per-device value a newly created interface
+		// inherits, and rp_filter is the max of conf/all and the device. Configuring
+		// only conf/all would leave the effective value at the inherited default.
+		{"net/ipv4/conf/default/rp_filter", "0"},
 		{"net/ipv4/conf/all/accept_local", "1"},
 	}
 	for _, setting := range settings {
