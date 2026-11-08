@@ -514,8 +514,9 @@ func (h *Handlers) ServerCheckHandler(w http.ResponseWriter, r *http.Request) {
 	_ = h.db.UpdateServerReachability(ctx, serverID, models.ReachabilityOnline)
 
 	// Check docker
-	dockerOut, _, code, _ := client.RunCommand(ctx, "docker --version")
-	dockerInstalled := code == 0 && strings.Contains(strings.ToLower(dockerOut), "docker")
+	dockerProbe := probeDockerPresence(ctx, client)
+	dockerProbe.logFailure(serverID)
+	dockerInstalled := dockerProbe.Installed
 
 	protocolsStatus := h.queryProtocolsStatus(ctx, server)
 	if syncDiscoveredProtocols(server, protocolsStatus) {
