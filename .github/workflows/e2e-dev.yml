@@ -123,6 +123,7 @@ jobs:
           E2E_REQUIRE_DATAPLANE="true" \
           E2E_TESTED_SOURCE_SHA="${{ github.sha }}" \
           E2E_TESTED_IMAGE_LABEL="ghcr.io/devops-igor/amnezia-nexus:pr-${{ github.event.pull_request.number || 'manual' }}" \
+          E2E_PANEL_LOG_CONTAINER="amnezia-panel" \
           ./scripts/run_e2e_lifecycle.sh
 
       - name: Upload Lifecycle Diagnostics
