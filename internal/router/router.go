@@ -284,6 +284,16 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			r.Post("/order", h.GigahostOrderHandler)
 			r.Get("/orders", h.GigahostOrdersHandler)
 		})
+
+		// Policy routing settings and status (#678). Admin-only for every
+		// verb including the reads: roles without admin must not be able to
+		// read or mutate policy configuration.
+		r.Route("/api/vpn/policy", func(r chi.Router) {
+			r.Get("/", h.GetPolicyHandler)
+			r.Put("/", h.PutPolicyHandler)
+			r.Post("/sync", h.SyncPolicyHandler)
+			r.Get("/stats", h.GetPolicyStatsHandler)
+		})
 	})
 
 	r.Group(func(r chi.Router) {

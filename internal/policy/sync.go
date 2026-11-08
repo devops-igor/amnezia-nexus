@@ -137,27 +137,18 @@ func NewSyncer(m *Matcher, fetcher *Fetcher, store Store, cfg SyncConfig) (*Sync
 	}, nil
 }
 
+// BaselineStatus, BaselineAbsent, BaselinePrimed, BaselineForeign and
+// PrimeBaseline live in baseline.go: the last-known-good baseline a syncer
+// establishes before evaluating its first candidate replacement.
+
 // Run executes the single-owner update and scheduling loop until ctx is canceled.
 func (s *Syncer) Run(ctx context.Context) error {
-	// Attempt initial recovery from last-known-good cache on startup
-	if s.store != nil {
-		if gen, err := s.store.Load(ctx); err == nil && gen != nil {
-			if gen.ConfigHash == s.computeConfigHash() {
-				if snap, snapErr := GenerationToSnapshot(gen); snapErr == nil && (snap.DomainCount() > 0 || snap.CIDRCount() > 0) {
-					s.matcher.Publish(snap)
-					s.cachedGen = gen
-					s.statusMu.Lock()
-					s.status.Ready = true
-					s.status.Version = gen.Version
-					s.status.GenerationID = gen.GenerationID
-					s.status.LastSuccess = gen.CreatedAt
-					s.status.DomainCount = snap.DomainCount()
-					s.status.CIDRCount = snap.CIDRCount()
-					s.statusMu.Unlock()
-				}
-			}
-		}
-	}
+	// Recover the last-known-good baseline before the initial update, so a
+	// shortened first response is evaluated against it instead of being accepted
+	// as the first-ever snapshot. A failure is deliberately not fatal here: the
+	// loop's own update reports content problems through its status, and refusing
+	// to run would leave a previously working policy unpublished.
+	_, _ = s.PrimeBaseline(ctx)
 
 	// Trigger initial sync to fetch current rules
 	_, _ = s.executeUpdate(ctx)

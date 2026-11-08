@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
@@ -205,4 +206,14 @@ func (s *Service) SetTunnelEndpointHookForTest(fn func(ctx context.Context, tunn
 		return
 	}
 	s.pool.SetSetTunnelEndpointHookForTest(fn)
+}
+
+// SetPolicySyncerForTest registers a policy syncer as the service's live policy
+// runtime, so handlers exercising the sync endpoint can drive the
+// already-running branch without a real fetch. It is test-only and exists because
+// the policy runtime registry is package-private.
+func (s *Service) SetPolicySyncerForTest(syncer *policy.Syncer, presetID string) {
+	policyRuntimeMu.Lock()
+	defer policyRuntimeMu.Unlock()
+	policyRuntimes[s] = &policyRuntime{syncer: syncer, presetID: presetID}
 }

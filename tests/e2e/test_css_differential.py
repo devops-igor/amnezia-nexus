@@ -73,6 +73,25 @@ PROBE_SCRIPT = """
 """
 
 
+COMPARE_SCRIPT = """
+({baseline, probeScript}) => {
+  // probeScript is the trusted static PROBE_SCRIPT, not page-supplied code.
+  const records = (0, eval)('(' + probeScript + ')')();
+  const differences = [];
+  if (baseline.length === records.length) {
+    for (let i = 0; i < baseline.length; i++) {
+      const [, path, before] = baseline[i];
+      const after = records[i][2];
+      for (const [j, pseudo] of ['', '::before', '::after'].entries()) {
+        if (before[j] !== after[j]) differences.push(path + pseudo);
+      }
+    }
+  }
+  return {baselineCount: baseline.length, modularCount: records.length, differences};
+}
+"""
+
+
 class StylesheetLinkParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -218,31 +237,32 @@ def test_css_computed_style_differential(repo_root: Path):
                         "() => document.activeElement && document.activeElement.blur"
                         " && document.activeElement.blur()"
                     )
-                    mono_records = page.evaluate(PROBE_SCRIPT)
+                    mono_records = page.evaluate_handle(PROBE_SCRIPT)
+                    try:
+                        page.set_content(wrap_html(modular_modules, body, theme))
+                        page.evaluate(
+                            "() => document.querySelectorAll('[autofocus]')"
+                            ".forEach(el => el.removeAttribute('autofocus'))"
+                        )
+                        page.evaluate(
+                            "() => document.activeElement && document.activeElement.blur"
+                            " && document.activeElement.blur()"
+                        )
+                        comparison = page.evaluate(
+                            COMPARE_SCRIPT,
+                            {"baseline": mono_records, "probeScript": PROBE_SCRIPT},
+                        )
+                    finally:
+                        mono_records.dispose()
 
-                    page.set_content(wrap_html(modular_modules, body, theme))
-                    page.evaluate(
-                        "() => document.querySelectorAll('[autofocus]')"
-                        ".forEach(el => el.removeAttribute('autofocus'))"
-                    )
-                    page.evaluate(
-                        "() => document.activeElement && document.activeElement.blur"
-                        " && document.activeElement.blur()"
-                    )
-                    mod_records = page.evaluate(PROBE_SCRIPT)
-
-                    assert len(mono_records) == len(mod_records)
-
-                    pairs = zip(mono_records, mod_records, strict=True)
-                    for (_, path, ra), (_, _, rb) in pairs:
-                        for pe_idx, pe_name in enumerate(["", "::before", "::after"]):
-                            if ra[pe_idx] != rb[pe_idx]:
-                                diffs.append({
-                                    "page": page_name,
-                                    "viewport": f"{width}x{height}",
-                                    "theme": theme,
-                                    "element": path + pe_name,
-                                })
+                    assert comparison["baselineCount"] == comparison["modularCount"]
+                    for element in comparison["differences"]:
+                        diffs.append({
+                            "page": page_name,
+                            "viewport": f"{width}x{height}",
+                            "theme": theme,
+                            "element": element,
+                        })
         browser.close()
 
     if diffs:

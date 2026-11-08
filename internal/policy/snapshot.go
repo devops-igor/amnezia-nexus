@@ -124,6 +124,34 @@ type SourceParsedRules struct {
 	Rules    ParsedRules
 }
 
+// MemorySource provides an in-memory rule source for snapshot compilation.
+type MemorySource struct {
+	SourceID string
+	Rules    ParsedRules
+}
+
+// NewMemorySource creates a MemorySource with the given ID and rules.
+func NewMemorySource(id string, rules ParsedRules) MemorySource {
+	if id == "" {
+		id = "memory-default"
+	}
+	if rules.Domains == nil {
+		rules.Domains = make(map[string]domainFlags)
+	}
+	return MemorySource{
+		SourceID: id,
+		Rules:    rules,
+	}
+}
+
+// ToSourceParsedRules converts MemorySource to SourceParsedRules.
+func (m MemorySource) ToSourceParsedRules() SourceParsedRules {
+	return SourceParsedRules{
+		SourceID: m.SourceID,
+		Rules:    m.Rules,
+	}
+}
+
 // CompileSnapshot creates a new immutable Snapshot from source parsed rules.
 func CompileSnapshot(version uint64, generationID string, sources []SourceParsedRules) (*Snapshot, error) {
 	if len(sources) == 0 {

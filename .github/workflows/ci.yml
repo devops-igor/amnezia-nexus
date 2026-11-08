@@ -9,6 +9,9 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -16,13 +19,25 @@ concurrency:
 env:
   GOFLAGS: -tags=with_utls
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   lint-and-security:
     name: Lint & Security Audit
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, container-vm]
+    container:
+      image: localhost:5000/nexus-ci-job:latest
+      options: --cpus 4 --memory 6g
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Trust this job workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -41,68 +56,545 @@ jobs:
       # the runner's Go 1.26, matching local dev (v1.64.8 built go1.26.6).
       - name: Build golangci-lint from source
         run: |
-          go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+          if ! test -x /usr/local/bin/golangci-lint || ! go version -m "/usr/local/bin/golangci-lint" | grep -Eq "^[[:space:]]*mod[[:space:]]+github\.com/golangci/golangci-lint[[:space:]]+v1\.64\.8([[:space:]]|$)" || ! go version -m "/usr/local/bin/golangci-lint" | grep -Fxq "/usr/local/bin/golangci-lint: $(go env GOVERSION)"; then
+            tool_dir=$(mktemp -d)
+            GOBIN="$tool_dir" go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+            sudo install -m 0755 "$tool_dir/golangci-lint" /usr/local/bin/golangci-lint
+            rm -rf "$tool_dir"
+          fi
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run golangci-lint
-        run: golangci-lint run --timeout=5m ./...
+        run: /usr/local/bin/golangci-lint run --timeout=5m ./...
 
       - name: Install Security Scanners
         run: |
-          go install github.com/securego/gosec/v2/cmd/gosec@latest
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          if ! test -x /usr/local/bin/gosec || ! go version -m "/usr/local/bin/gosec" | grep -Eq "^[[:space:]]*mod[[:space:]]+github\.com/securego/gosec/v2[[:space:]]+v2\.30\.0([[:space:]]|$)" || ! go version -m "/usr/local/bin/gosec" | grep -Fxq "/usr/local/bin/gosec: $(go env GOVERSION)"; then
+            tool_dir=$(mktemp -d)
+            GOBIN="$tool_dir" go install github.com/securego/gosec/v2/cmd/gosec@v2.30.0
+            sudo install -m 0755 "$tool_dir/gosec" /usr/local/bin/gosec
+            rm -rf "$tool_dir"
+          fi
+          if ! test -x /usr/local/bin/govulncheck || ! go version -m "/usr/local/bin/govulncheck" | grep -Eq "^[[:space:]]*mod[[:space:]]+golang\.org/x/vuln[[:space:]]+v1\.9\.0([[:space:]]|$)" || ! go version -m "/usr/local/bin/govulncheck" | grep -Fxq "/usr/local/bin/govulncheck: $(go env GOVERSION)"; then
+            tool_dir=$(mktemp -d)
+            GOBIN="$tool_dir" go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+            sudo install -m 0755 "$tool_dir/govulncheck" /usr/local/bin/govulncheck
+            rm -rf "$tool_dir"
+          fi
 
       - name: Run gosec Security Scanner
-        run: gosec -tags with_utls -quiet ./...
+        run: /usr/local/bin/gosec -tags with_utls -quiet ./...
 
       - name: Run govulncheck Vulnerability Scanner
-        run: govulncheck ./...
+        run: /usr/local/bin/govulncheck ./...
 
   test:
     name: Automated Test Suite
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, container-vm]
     timeout-minutes: 20
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # #726 runner qualification, step 1 of 4: bind the evidence to THIS run and record the
+      # workspace state the tests start from. Read-only: nothing is removed, and nothing is
+      # assumed about what a predecessor left behind.
+      - name: Record pre-test runner ownership and workspace state
+        run: |
+          set -euo pipefail
+          # Invocation identity. Every path this qualification uses is derived from it, so two
+          # jobs on one runner cannot read, trust, or delete each other's evidence. mktemp -d
+          # guarantees the directory is new: it never reuses or clears an existing path.
+          # Host evidence lives under RUNNER_TEMP (host-only, and what the artifact upload
+          # collects); only the container hand-off has to be under the shared /tmp mount.
+          qual_ident="run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}-job-${GITHUB_JOB}"
+          qual_dir="$(mktemp -d "$RUNNER_TEMP/nexus-qual-host.XXXXXX")"
+          qual_path_file="$RUNNER_TEMP/nexus-qual-path.${qual_ident}.txt"
+          mkdir "$qual_dir/host"
+          # This step runs in the runner's own context, not inside the action. actions/checkout
+          # records its safe.directory exception under a temporary HOME that is discarded when
+          # the action exits, so a workspace owned by another uid is "dubious" here and the first
+          # git call dies with exit 128. Acquire exactly that one repository for THIS invocation
+          # in a config file this step owns, pointed at by GIT_CONFIG_GLOBAL: exact path, no
+          # wildcard, no persistent user or system configuration, no ownership change, and
+          # nothing written outside qual_dir. The job container below already runs with the same
+          # ephemeral scope; this restores that parity on the host side.
+          gitcfg="$qual_dir/gitconfig"
+          {
+            printf '[safe]\n\tdirectory = %s\n' "$GITHUB_WORKSPACE"
+          } > "$gitcfg"
+          export GIT_CONFIG_GLOBAL="$gitcfg"
+          if ! head_sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null)"; then
+            echo "::error::cannot resolve the workspace revision with this invocation's own Git trust file; refusing to record a baseline that cannot be bound to a commit"
+            exit 1
+          fi
+          {
+            echo "state=started"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "job=$GITHUB_JOB"
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "head=$head_sha"
+            echo "runner_host=$(hostname)"
+            echo "runner_uid=$(id -u) runner_gid=$(id -g) runner_user=$(id -un)"
+            echo "workspace=$GITHUB_WORKSPACE"
+            echo "workspace_owner_uid=$(stat -c '%u' "$GITHUB_WORKSPACE")"
+            echo "git_trust_scope=invocation_local exact_workspace=true"
+            echo "runner_temp=$RUNNER_TEMP"
+            echo "qual_dir=$qual_dir"
+          } > "$qual_dir/host/identity.txt"
+          ls -lan "$GITHUB_WORKSPACE" > "$qual_dir/host/workspace-pre-test.ls"
+          ls -1A "$GITHUB_WORKSPACE" | sort > "$qual_dir/host/workspace-pre-test.names"
+          # The historical failure was a directory inside the workspace that the non-root
+          # runner user could not unlink from. Unlinking needs write permission on the parent
+          # directory, so an unwritable directory is a latent checkout failure. This is a
+          # baseline, not a verdict: inherited state is reported, and step 3 fails only on
+          # directories this job introduced. Git's object store is excluded (action-owned).
+          find "$GITHUB_WORKSPACE" -xdev -type d -not -path "$GITHUB_WORKSPACE/.git/*" -not -writable -print \
+            | sort > "$qual_dir/host/unwritable-pre-test.txt"
+          # An existing repository task area is INHERITED state. It is recorded and reported,
+          # never failed on: this job must not require an operator or a predecessor run to have
+          # cleaned anything. Only a task area that appears after this point is our defect.
+          if [ -e "$GITHUB_WORKSPACE/tasks" ]; then
+            echo "inherited_repo_task_area=present" > "$qual_dir/host/tasks-pre-test.txt"
+            find "$GITHUB_WORKSPACE/tasks" -maxdepth 2 -print | sort \
+              >> "$qual_dir/host/tasks-pre-test.txt"
+          else
+            echo "inherited_repo_task_area=absent" > "$qual_dir/host/tasks-pre-test.txt"
+          fi
+          # Completeness marker, written only once every file the collector compares against
+          # exists. Its absence is how the collector distinguishes "initialization never
+          # finished" from "baseline ready": a run 42252613084-style death between directory
+          # creation and the last baseline file must read as NOT RUN, not as a broken collector.
+          baseline_files="identity.txt workspace-pre-test.ls workspace-pre-test.names unwritable-pre-test.txt tasks-pre-test.txt"
+          for f in $baseline_files; do
+            test -f "$qual_dir/host/$f" || {
+              echo "::error::baseline file $f was not recorded; not publishing this invocation's evidence pointer"
+              exit 1
+            }
+          done
+          printf 'baseline_files=%s\n' "$baseline_files" > "$qual_dir/host/baseline.state"
+          # Publish the pointer LAST, and publish only the mktemp basename: the collector
+          # re-roots it at its own $RUNNER_TEMP, so the uploaded artifact does not disclose a
+          # host filesystem layout. Until this file exists, nothing is claimed about this run.
+          printf '%s\n' "$(basename "$qual_dir")" > "$qual_path_file"
+          {
+            echo "state=baseline-complete"
+            echo "run_id=$GITHUB_RUN_ID run_attempt=$GITHUB_RUN_ATTEMPT job=$GITHUB_JOB"
+            echo "repository=$GITHUB_REPOSITORY head=$head_sha"
+            echo "runner_host=$(hostname) runner_uid=$(id -u)"
+            echo "git_trust_scope=invocation_local exact_workspace=true"
+            echo "--- unwritable directories inherited before the tests ---"
+            cat "$qual_dir/host/unwritable-pre-test.txt"
+            echo "--- inherited repository task area ---"
+            cat "$qual_dir/host/tasks-pre-test.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
-          cache: true
+          cache: false
 
       - name: Set up Node.js for JSDOM Integration Tests
         uses: actions/setup-node@v7
         with:
           node-version: '20'
 
-      - name: Install Pinned jsdom
+      - name: Run setup and tests in the job image
+        id: tests
+        env:
+          # Must be under /tmp: that is the only writable host-visible mount inside the job
+          # container besides the workspace itself. The name is unique per invocation.
+          NEXUS_QUAL_OUT_FILE: /tmp/nexus-qual-out/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}.txt
         run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$NEXUS_QUAL_OUT_FILE")"
+          # A hand-off file from a previous invocation must never be adopted as this run's
+          # evidence. It cannot legitimately exist before the container writes it.
+          if [ -e "$NEXUS_QUAL_OUT_FILE" ]; then
+            echo "::error::a qualification hand-off file from another invocation exists: $NEXUS_QUAL_OUT_FILE"
+            exit 1
+          fi
+          # Match guest paths and loopback so sibling Docker fixtures see test files/services.
+          # The socket and /tmp belong to the isolated guest, never the physical host.
+          # NET_RAW is required by the #678 policy enablement E2E: the production WAN
+          # device opens an AF_PACKET capture socket for direct-WAN return traffic,
+          # which CAP_NET_ADMIN alone does not permit.
+          docker run --rm -i --user 0:0 --network host --cpus 6 --memory 10g \
+            --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN --security-opt apparmor=unconfined --device /dev/net/tun \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            --volume /tmp:/tmp \
+            --volume "$RUNNER_TOOL_CACHE:$RUNNER_TOOL_CACHE:ro" \
+            --workdir "$GITHUB_WORKSPACE" \
+            --env https_proxy --env HTTPS_PROXY --env no_proxy --env NO_PROXY \
+            --env GITHUB_WORKSPACE --env GOFLAGS \
+            --env GITHUB_RUN_ID --env GITHUB_RUN_ATTEMPT --env GITHUB_JOB --env GITHUB_REPOSITORY \
+            --env NEXUS_QUAL_OUT_FILE="$NEXUS_QUAL_OUT_FILE" \
+            --env NEXUS_HOST_UID="$(id -u)" --env NEXUS_HOST_GID="$(id -g)" \
+            --env GOROOT="$(go env GOROOT)" \
+            --env NODE_BIN="$(dirname "$(command -v node)")" \
+            localhost:5000/nexus-ci-job:latest bash -seuo pipefail <<'SCRIPT'
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          job_tmp=$(mktemp -d /tmp/nexus-tests.XXXXXX)
+          # Hand the evidence directory to the host collector's identity on every exit path,
+          # including an early failure: the collector must always be able to read (and later
+          # remove) what this root container wrote through the shared /tmp mount. A failure
+          # here is announced rather than hidden, and never replaces the job_tmp cleanup.
+          trap 'if [ -n "${qual:-}" ] && ! chown -R "${NEXUS_HOST_UID:-0}:${NEXUS_HOST_GID:-0}" "$qual"; then echo "::warning::could not hand the evidence directory to the host collector identity"; fi; rm -rf "$job_tmp"' EXIT
+          # Never reuse /github/home caches: stale modules can lose sqlite vtab build tags.
+          export GOPATH="$job_tmp/go" GOMODCACHE="$job_tmp/mod" GOCACHE="$job_tmp/cache"
+          export npm_config_prefix="$job_tmp/npm"
+          export PATH="$GOROOT/bin:$NODE_BIN:$GOPATH/bin:$npm_config_prefix/bin:$PATH"
+          export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+          export SSL_CERT_DIR=/etc/ssl/certs
+          node --version
           npm install -g jsdom@29.1.1
-          echo "NODE_PATH=$(npm root -g)" >> "$GITHUB_ENV"
+          export NODE_PATH="$(npm root -g)"
 
-      - name: Build Caddy with forwardproxy for Naive Smoke Tests
-        run: |
           go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
-          xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$(go env GOPATH)/bin/caddy"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$GOPATH/bin/xcaddy" build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$GOPATH/bin/caddy"
 
-      - name: Install musl libc and Alpine libgcc for Native NaiveProxy Tests
+          apt-get update && apt-get install -y musl
+          (
+            alpine_container=$(docker create alpine:3.20 sh -c "apk add --no-cache libgcc")
+            trap 'docker rm -f "$alpine_container" >/dev/null' EXIT
+            docker start -a "$alpine_container"
+            test "$(docker inspect -f '{{.State.ExitCode}}' "$alpine_container")" = 0
+            docker cp "$alpine_container:/usr/lib/libgcc_s.so.1" "$job_tmp/libgcc_s.so.1"
+          )
+          cp "$job_tmp/libgcc_s.so.1" /usr/lib/x86_64-linux-musl/libgcc_s.so.1
+
+          go test -p 2 -race -cover -count=1 -coverprofile=coverage.out ./...
+          go test -v -tags with_utls -race -run TestLinuxE2E ./internal/vpn/forwarder/...
+          # Policy enablement (#678). A separate package selection is required
+          # because ./internal/vpn/forwarder/... does not include ./internal/vpn,
+          # so without this step the policy E2E would be compiled but never run.
+          # The production WAN device opens an AF_PACKET capture socket, which needs
+          # CAP_NET_RAW in addition to the NET_ADMIN the container already has.
+          go test -v -tags with_utls -race -run TestLinuxE2E ./internal/vpn/
+          go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
+          go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
+
+          # #726 runner qualification, step 2 of 4. Runs inside this same root container and
+          # proves, with the real producer: caches are invocation-owned (cold by
+          # construction), cleanup stays inside this job, and a failed predecessor's partial
+          # export cannot leak into this run. No test is skipped; the same named producer
+          # test that the suite above already runs is invoked once more against an explicit
+          # export directory owned by this invocation.
+          qual="$(mktemp -d /tmp/nexus-qualified.XXXXXX)" || { echo "::error::cannot allocate an invocation-owned evidence directory"; exit 1; }
+          # This container runs as root but its evidence directory is read and removed by the
+          # non-root host collector step, through the shared /tmp mount. A root-owned 0700
+          # directory in a sticky /tmp is neither readable nor removable by that user, which
+          # is exactly how a previous run lost its real qualification: the collector reported
+          # container_identity_missing (it could not even read identity.txt) and then failed
+          # removing the directory. Hand the directory to the host collector's identity, so
+          # ownership follows the reader rather than the writer.
+          chmod 0755 "$qual"
+          chown "$NEXUS_HOST_UID:$NEXUS_HOST_GID" "$qual"
+          test "$(stat -c '%u' "$qual")" = "$NEXUS_HOST_UID" || { echo "::error::evidence directory is not owned by the host collector identity"; exit 1; }
+          out="$qual/export"
+          mkdir "$out"
+          chown "$NEXUS_HOST_UID:$NEXUS_HOST_GID" "$out"
+          head_sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+          {
+            echo "state=container-started"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "job=$GITHUB_JOB"
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "head=$head_sha"
+            echo "container_uid=$(id -u) container_gid=$(id -g)"
+            echo "job_tmp=$job_tmp"
+            echo "qual_dir=$qual"
+            echo "gocache=$GOCACHE"
+            echo "gomodcache=$GOMODCACHE"
+            echo "repo_root=$GITHUB_WORKSPACE"
+          } > "$qual/identity.txt"
+          case "$GOCACHE" in "$job_tmp"/*) echo "gocache_invocation_owned=true" >> "$qual/identity.txt" ;; *)
+            echo "::error::GOCACHE is not owned by this invocation: $GOCACHE"; exit 1 ;; esac
+          case "$out" in "$qual"/*) echo "export_invocation_owned=true" >> "$qual/identity.txt" ;; *)
+            echo "::error::export directory is not owned by this invocation: $out"; exit 1 ;; esac
+          # Announce this container's evidence directory to the host step through the only
+          # writable host-visible mount (/tmp). The file name carries this invocation's
+          # identity. An already-existing file is a foreign artifact: refused, never adopted
+          # or deleted.
+          : "${NEXUS_QUAL_OUT_FILE:?qualification hand-off path is not provided}"
+          test ! -e "$NEXUS_QUAL_OUT_FILE" || { echo "::error::refusing to reuse a qualification hand-off file: $NEXUS_QUAL_OUT_FILE"; exit 1; }
+          printf '%s\n' "$qual" > "$NEXUS_QUAL_OUT_FILE"
+
+          # Predecessor remnants that a cancelled run could leave behind: a truncated public
+          # manifest and an orphan temporary file from the same writer.
+          printf '{"schema_version":"1.0.0","truncated":' > "$out/evidence_manifest.json"
+          printf 'orphan from a cancelled predecessor\n' > "$out/.evidence_manifest.json.tmp-predecessor"
+          for attempt in 1 2; do
+            NEXUS_ARTIFACT_DIR="$out" go test -tags with_utls -count=1 -timeout 180s \
+              -run '^TestDifferential_ConfigFreezingAndRedactedManifest$' ./internal/vpn/
+            filedir="$out"
+            test -f "$filedir/evidence_manifest.json" || { echo "::error::manifest missing after attempt $attempt"; exit 1; }
+            test "$(stat -c '%a' "$filedir/evidence_manifest.json")" = "600" || {
+              echo "::error::manifest mode is $(stat -c '%a' "$filedir/evidence_manifest.json"), want 600"; exit 1; }
+            test "$(tail -c 1 "$filedir/evidence_manifest.json")" = "}" || {
+              echo "::error::manifest is not a complete JSON document after attempt $attempt"; exit 1; }
+            grep -q '"schema_version"' "$filedir/evidence_manifest.json" || {
+              echo "::error::manifest lacks the expected schema_version field"; exit 1; }
+            test -f "$filedir/.evidence_manifest.json.tmp-predecessor" || {
+              echo "::error::this invocation deleted a predecessor's temporary file"; exit 1; }
+            entries=$(ls -1A "$filedir" | sort | tr '\n' ' ')
+            echo "attempt=$attempt entries=$entries"
+            test "$entries" = ".evidence_manifest.json.tmp-predecessor evidence_manifest.json " || {
+              echo "::error::unexpected entries in the export directory: $entries"; exit 1; }
+          done
+          echo "predecessor_replaced=true" >> "$qual/identity.txt"
+          # Ordinary runs must not write into the repository working tree at all.
+          if [ -e "$GITHUB_WORKSPACE/tasks" ]; then
+            echo "::error::tests created the repository task area"
+            find "$GITHUB_WORKSPACE/tasks" -maxdepth 2 -ls
+            echo "state=failed" >> "$qual/identity.txt"
+            exit 1
+          fi
+          echo "repo_task_area_absent=true" >> "$qual/identity.txt"
+          # Written last: terminal state. A consumer that does not see state=complete must
+          # treat the qualification as NOT RUN rather than infer success from other keys.
+          echo "state=complete" >> "$qual/identity.txt"
+          SCRIPT
+
+      # #726 runner qualification, step 3 of 4: collect THIS invocation's container evidence
+      # only after proving it belongs to this run, then report the outcome. Any predecessor,
+      # foreign, partial or missing evidence is reported as NOT RUN; nothing is deleted except
+      # this invocation's own identity-derived directory.
+      - name: Record post-test runner ownership and workspace state
+        if: always()
+        env:
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          # Same identity-derived path the container was told to write, under the shared /tmp.
+          NEXUS_QUAL_OUT_FILE: /tmp/nexus-qual-out/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}.txt
         run: |
-          sudo apt-get update && sudo apt-get install -y musl
-          mkdir -p /tmp/musl-lib
-          docker run --rm -v /tmp/musl-lib:/out alpine:3.20 sh -c "apk add --no-cache libgcc && cp /usr/lib/libgcc_s.so.1 /out/"
-          sudo cp /tmp/musl-lib/libgcc_s.so.1 /usr/lib/x86_64-linux-musl/libgcc_s.so.1
+          set -euo pipefail
+          qual_ident="run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}-job-${GITHUB_JOB}"
+          host_dir_file="$RUNNER_TEMP/nexus-qual-path.${qual_ident}.txt"
+          post="$RUNNER_TEMP/nexus-qual-post.${qual_ident}.txt"
+          : > "$post"
+          note() { printf '%s\n' "$*" | tee -a "$post" >> "$GITHUB_STEP_SUMMARY"; }
 
-      - name: Run Tests with Race Detector
-        run: go test -race -cover -count=1 -coverprofile=coverage.out ./...
+          note "run_id=$GITHUB_RUN_ID run_attempt=$GITHUB_RUN_ATTEMPT job=$GITHUB_JOB repository=$GITHUB_REPOSITORY"
+          note "cleaner_uid=$(id -u) cleaner_user=$(id -un) tests_outcome=${TESTS_OUTCOME:-unknown}"
 
-      - name: Run Authentic Native Caddy Integration Tests
-        run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
+          # Same invocation-local Git trust as the pre-test step. This step also runs in the
+          # runner's context, where the action's temporary-HOME safe.directory entry no longer
+          # applies; without this its own git calls fail on a foreign-owned workspace. Exact
+          # workspace path in a file this step owns, nothing persistent, no ownership change.
+          gitcfg="$RUNNER_TEMP/nexus-qual-gitconfig.${qual_ident}.txt"
+          {
+            printf '[safe]\n\tdirectory = %s\n' "$GITHUB_WORKSPACE"
+          } > "$gitcfg"
+          export GIT_CONFIG_GLOBAL="$gitcfg"
 
-      - name: Run Vision Tests (non-race)
-        run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
+          # Three distinct baseline states, never conflated:
+          #   absent pointer            -> initialization never happened
+          #   pointer but no marker     -> partial initialization (the step died mid-way)
+          #   marker + every file       -> baseline ready, comparisons are meaningful
+          # Both failure modes are NOT RUN and exit 0 here: the originating step failure is the
+          # real error and must not be masked by a second, misleading collector error.
+          host_dir=""
+          if [ ! -s "$host_dir_file" ]; then
+            note "qualification=NOT_RUN reason=pre_test_step_did_not_complete"
+            exit 0
+          fi
+          # The pointer carries only the mktemp basename, so re-root it here rather than trusting
+          # an absolute host path from a file inside the uploaded artifact.
+          published="$(head -1 "$host_dir_file" | tr -d '\r')"
+          case "$published" in
+            nexus-qual-host.?*)
+              case "$published" in
+                */*|*..*) published="" ;;
+                *) host_dir="$RUNNER_TEMP/$published" ;;
+              esac ;;
+            *) published="" ;;
+          esac
+          if [ -z "$published" ] || [ ! -d "$host_dir" ]; then
+            note "qualification=NOT_RUN reason=pre_test_baseline_incomplete detail=pointer_not_usable"
+            exit 0
+          fi
+          # The step publishes its pointer only after writing this marker, so a pointer without a
+          # marker means a death between directory creation and baseline completion. That is the
+          # observed 42252613084 counterexample: report it as NOT RUN, do not compare against
+          # files that were never written.
+          baseline_files="identity.txt workspace-pre-test.ls workspace-pre-test.names unwritable-pre-test.txt tasks-pre-test.txt"
+          if [ ! -s "$host_dir/host/baseline.state" ]; then
+            note "qualification=NOT_RUN reason=pre_test_baseline_incomplete detail=no_completeness_marker"
+            exit 0
+          fi
+          missing=""
+          for f in $baseline_files; do
+            [ -f "$host_dir/host/$f" ] || missing="$missing $f"
+          done
+          if [ -n "$missing" ]; then
+            note "qualification=NOT_RUN reason=pre_test_baseline_incomplete missing:${missing}"
+            exit 0
+          fi
+          head_sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null || echo unknown)"
+          note "host_qual_dir=${host_dir#"$RUNNER_TEMP"/} head=$head_sha baseline=complete"
+
+          # ---- post-test workspace state -------------------------------------------------
+          ls -lan "$GITHUB_WORKSPACE" > "$host_dir/host/workspace-post-test.ls"
+          ls -1A "$GITHUB_WORKSPACE" | sort > "$host_dir/host/workspace-post-test.names"
+          note "--- new top-level workspace entries created by this job ---"
+          comm -13 "$host_dir/host/workspace-pre-test.names" "$host_dir/host/workspace-post-test.names" \
+            | tee -a "$post" >> "$GITHUB_STEP_SUMMARY"
+
+          find "$GITHUB_WORKSPACE" -xdev -type d -not -path "$GITHUB_WORKSPACE/.git/*" -not -writable -print \
+            | sort > "$host_dir/host/unwritable-post-test.txt"
+          introduced=$(comm -13 "$host_dir/host/unwritable-pre-test.txt" "$host_dir/host/unwritable-post-test.txt" || true)
+          inherited=$(wc -l < "$host_dir/host/unwritable-post-test.txt")
+          note "unwritable_dirs_inherited=$inherited"
+          if [ -n "$introduced" ]; then
+            echo "::error::this job left directories the next non-root checkout cannot clean: $(printf '%s ' $introduced)"
+            exit 1
+          fi
+          note "unwritable_dirs_introduced=0"
+
+          # A task area that we did not start with is this job's defect; an inherited one is
+          # reported, never failed on, and never modified.
+          if [ -e "$GITHUB_WORKSPACE/tasks" ]; then
+            if grep -q "inherited_repo_task_area=present" "$host_dir/host/tasks-pre-test.txt" 2>/dev/null; then
+              note "repo_task_area_after_tests=inherited_not_ours"
+            else
+              echo "::error::tests created the repository task area"
+              find "$GITHUB_WORKSPACE/tasks" -maxdepth 2 -ls
+              exit 1
+            fi
+          else
+            note "repo_task_area_absent_after_tests=true"
+          fi
+
+          # ---- container evidence, authenticated against THIS invocation -----------------
+          # The container announces its directory through a file under the shared /tmp mount,
+          # so the string itself is untrusted input. Accept only a plausible mktemp path with
+          # no traversal, then require it to be a real directory and not a symlink.
+          verdict=NOT_RUN
+          reason=""
+          container_dir=""
+          if [ ! -s "$NEXUS_QUAL_OUT_FILE" ]; then
+            reason="no_container_evidence_file"
+          else
+            candidate="$(head -1 "$NEXUS_QUAL_OUT_FILE" | tr -d '\r')"
+            case "$candidate" in
+              /tmp/nexus-qualified.*)
+                case "$candidate" in
+                  *..*) reason="handoff_path_has_traversal" ;;
+                  *) container_dir="$candidate" ;;
+                esac ;;
+              *) reason="handoff_path_not_invocation_shaped" ;;
+            esac
+            if [ -n "$container_dir" ] && [ -L "$container_dir" ]; then
+              reason="handoff_path_is_symlink"
+              container_dir=""
+            elif [ -n "$container_dir" ] && [ ! -d "$container_dir" ]; then
+              reason="handoff_path_not_a_directory"
+              container_dir=""
+            fi
+          fi
+          if [ -n "$reason" ]; then
+            note "qualification=$verdict reason=$reason"
+          elif [ ! -s "$container_dir/identity.txt" ]; then
+            note "qualification=$verdict reason=container_identity_missing dir=$(basename "$container_dir")"
+          else
+            ident="$container_dir/identity.txt"
+            field() { sed -n "s/^$1=//p" "$ident" | tail -1; }
+            # Every binding must match this context. A mismatch is foreign evidence that must
+            # never be promoted to this run's proof.
+            mismatch=""
+            [ "$(field run_id)" = "$GITHUB_RUN_ID" ] || mismatch="$mismatch run_id"
+            [ "$(field run_attempt)" = "$GITHUB_RUN_ATTEMPT" ] || mismatch="$mismatch run_attempt"
+            [ "$(field job)" = "$GITHUB_JOB" ] || mismatch="$mismatch job"
+            [ "$(field repository)" = "$GITHUB_REPOSITORY" ] || mismatch="$mismatch repository"
+            [ "$(field head)" = "$head_sha" ] || mismatch="$mismatch head"
+            state="$(field state)"
+            note "container_qual_dir=$(basename "$container_dir") container_state=${state:-unknown}"
+            if [ -n "$mismatch" ]; then
+              note "qualification=$verdict reason=foreign_evidence_binding_mismatch fields:$mismatch"
+            elif [ "$state" != "complete" ]; then
+              # Identity proves it is ours, but it never reached its terminal state: a mid-way
+              # death or a failed assertion. That is NOT RUN, never success.
+              note "qualification=$verdict reason=container_state_not_complete state=${state:-unknown}"
+            else
+              for key in gocache_invocation_owned export_invocation_owned predecessor_replaced repo_task_area_absent; do
+                if grep -qx "$key=true" "$ident"; then
+                  note "$key=true"
+                else
+                  mismatch="$mismatch $key"
+                fi
+              done
+              if [ -n "$mismatch" ]; then
+                note "qualification=$verdict reason=missing_terminal_assertions:${mismatch}"
+              else
+                verdict=COMPLETE
+                note "qualification=$verdict"
+              fi
+            fi
+            # The uploaded copy keeps every field the verdict depends on — run/attempt/job/
+            # repository/head binding, terminal state and the four assertions — and drops the
+            # container's absolute filesystem paths, which are irrelevant to the verdict and
+            # must not be published as evidence.
+            r_ident="$RUNNER_TEMP/nexus-qual-container.${qual_ident}.txt"
+            : > "$r_ident"
+            while IFS= read -r line; do
+              case "$line" in
+                job_tmp=*|qual_dir=*|gocache=*|gomodcache=*|repo_root=*|workspace=*|runner_temp=*) continue ;;
+              esac
+              printf '%s\n' "$line" >> "$r_ident"
+            done < "$ident"
+          fi
+
+          # Only this invocation's own identity-derived directory is removed, and only when it
+          # is exactly what mktemp created. A symlink or unexpected shape is left alone.
+          #
+          # The container hands the directory to this user's identity, so a normal run can
+          # read and remove it. If ownership did not follow (an older container image, or a
+          # hand-over that failed), the directory is reported as inherited state rather than
+          # turned into a step failure: this step must never fail on a path it does not own,
+          # and `rm` on a root-owned directory in sticky /tmp is not recoverable here.
+          for d in "$container_dir"; do
+            [ -n "$d" ] || continue
+            case "$d" in /tmp/nexus-qualified.*) ;; *) continue ;; esac
+            if [ -L "$d" ]; then
+              note "left_untouched_symlink=$(basename "$d")"
+            elif [ ! -d "$d" ]; then
+              note "container_evidence_dir_absent=$(basename "$d")"
+            elif [ ! -O "$d" ]; then
+              note "container_evidence_dir_not_owned=$(basename "$d") owner_uid=$(stat -c '%u' "$d") cleaner_uid=$(id -u)"
+            elif rm -rf -- "$d" && [ ! -e "$d" ]; then
+              note "removed_own_evidence_dir=$(basename "$d")"
+            else
+              note "container_evidence_dir_removal_failed=$(basename "$d")"
+            fi
+          done
+          if [ "$verdict" != "COMPLETE" ]; then
+            # Absent qualification is only an error when the tests claimed success; a real test
+            # failure must not be masked by a second, misleading error.
+            if [ "${TESTS_OUTCOME:-}" = "success" ]; then
+              echo "::error::the test step reported success but produced no complete qualification evidence"
+              exit 1
+            fi
+          fi
+
+      - name: Upload runner qualification evidence
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: runner-qualification-evidence
+          path: |
+            ${{ runner.temp }}/nexus-qual-path.*.txt
+            ${{ runner.temp }}/nexus-qual-post.*.txt
+            ${{ runner.temp }}/nexus-qual-container.*.txt
+            ${{ runner.temp }}/nexus-qual-out/*.txt
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload Test Coverage
         uses: actions/upload-artifact@v7
@@ -142,7 +634,10 @@ jobs:
 
   build-matrix:
     name: Cross-Compile Matrix (${{ matrix.target.os }}/${{ matrix.target.arch }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, container-vm]
+    container:
+      image: localhost:5000/nexus-ci-job:latest
+      options: --cpus 4 --memory 6g
     strategy:
       fail-fast: false
       matrix:
@@ -152,6 +647,11 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Trust this job workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Set up Go
         uses: actions/setup-go@v7

@@ -572,6 +572,7 @@ type VPNConfig struct {
 	// Multi-protocol backends are unconditionally active out-of-the-box (#661).
 	// Retained for backward-compatible JSON serialization.
 	EnableMultiProtocolBackends bool `json:"enable_multi_protocol_backends"`
+	PBREnabled                  bool `json:"pbr_enabled,omitempty"` // policy-based routing & direct egress (#677)
 }
 
 // AppearanceSettings holds UI display configuration.

@@ -21,6 +21,11 @@ type ReplyWriter interface {
 	WritePacket(scope policy.Scope, packet []byte) error
 }
 
+// RouteObserver records DNS response observations into an active route cache.
+type RouteObserver interface {
+	ObserveDNSResponse(sessionID string, req, resp *mdns.Msg) error
+}
+
 // ScopeHandle represents an active authenticated DNS session capability.
 type ScopeHandle struct {
 	Scope        policy.Scope
@@ -80,7 +85,8 @@ type Retirement struct {
 
 // GatewayConfig configures the Gateway transport adapter.
 type GatewayConfig struct {
-	Gateway netip.AddrPort
+	Gateway       netip.AddrPort
+	RouteObserver RouteObserver
 }
 
 type gatewayTCPTransport struct {
@@ -118,11 +124,24 @@ func NewGateway(cfg GatewayConfig, server *Server) (*Gateway, error) {
 	if server == nil {
 		return nil, errors.New("server cannot be nil")
 	}
+	if cfg.RouteObserver != nil {
+		server.SetObserver(cfg.RouteObserver)
+	}
 	return &Gateway{
 		cfg:        cfg,
 		server:     server,
 		transports: make(map[policy.Scope]*gatewayTCPTransport),
 	}, nil
+}
+
+// SetObserver updates the active route observer.
+func (g *Gateway) SetObserver(obs RouteObserver) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.cfg.RouteObserver = obs
+	if g.server != nil {
+		g.server.SetObserver(obs)
+	}
 }
 
 func (g *Gateway) getOrCreateTransport(scope *ScopeHandle) (*gatewayTCPTransport, error) {
@@ -246,7 +265,7 @@ func (g *Gateway) handleUDP(scope *ScopeHandle, ipv4Packet []byte, ihl int, dstI
 		replyPkt := buildIPv4UDPPacket(dstIP, 53, srcIP, srcPort, respBytes)
 		if replyPkt != nil {
 			if err := scope.ReplyWriter.WritePacket(scope.Scope, replyPkt); err == nil {
-				g.server.ObserveResponse(reqMsg, respMsg, scope.SessionCache, recvTime)
+				g.server.ObserveResponseWithSessionID(reqMsg, respMsg, scope.SessionCache, scope.Scope.SessionID, recvTime)
 			}
 		}
 	}

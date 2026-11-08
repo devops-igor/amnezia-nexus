@@ -243,11 +243,14 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 		_ = cmd.Wait()
 	}()
 
-	// Wait for Caddy to start listening on proxyPort
+	// A listening socket precedes async certificate issuance; wait for localhost TLS too.
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
 	ready := false
 	for start := time.Now(); time.Since(start) < 15*time.Second; {
-		conn, dialErr := net.DialTimeout("tcp", proxyAddr, 100*time.Millisecond)
+		conn, dialErr := tls.DialWithDialer(&net.Dialer{Timeout: 100 * time.Millisecond}, "tcp", proxyAddr, &tls.Config{
+			ServerName:         "localhost",
+			InsecureSkipVerify: true, // Internal self-signed testing CA
+		})
 		if dialErr == nil {
 			_ = conn.Close()
 			ready = true
@@ -256,7 +259,7 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	if !ready {
-		t.Fatalf("caddy failed to listen on %s within 15s. Stderr: %s", proxyAddr, stderrBuf.String())
+		t.Fatalf("caddy failed to complete localhost TLS handshake on %s within 15s. Stderr: %s", proxyAddr, stderrBuf.String())
 	}
 
 	baseTLSConfig := &tls.Config{
