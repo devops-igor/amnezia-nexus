@@ -95,6 +95,8 @@ def test_playwright_call_log_is_redacted() -> None:
         f"AUTHORIZATION: Bearer {BEARER}",
         f"x-csrf-token: {CSRF}",
         f"X-CSRF-Token: {CSRF}",
+        f"X-CSRFToken: {CSRF}",
+        f"csrf-token: {CSRF}",
         f"X-XSRF-Token: {CSRF}",
         f"proxy-authorization: Basic {AUTH_HEADER}",
     ],
@@ -104,6 +106,8 @@ def test_header_casing_and_spacing_variants_are_redacted(line: str) -> None:
     cleaned = log_privacy.redact(line)
     assert_clean(cleaned)
     assert log_privacy.REDACTED in cleaned
+    # The header name itself is the actionable detail and must survive.
+    assert line.split(":", 1)[0] in cleaned
 
 
 def test_multiline_folded_header_value_is_redacted() -> None:
