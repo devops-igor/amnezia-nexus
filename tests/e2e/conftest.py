@@ -20,7 +20,7 @@ from urllib.parse import urljoin
 import pytest
 from playwright.sync_api import Page
 
-from tests.e2e import diagnostics
+from tests.e2e import diagnostics, log_privacy
 
 logger = logging.getLogger(__name__)
 
@@ -110,10 +110,15 @@ def _get_csrf_cookie(page: Page) -> str:
     The CSRF cookie is set as HttpOnly by BunkerWeb, so JavaScript cannot
     read it from document.cookie. Playwright's context.cookies() bypasses
     this restriction because it uses the CDP protocol, not JS.
+
+    The value is registered with the console privacy filter so it cannot leak
+    through a traceback that mentions it without a header name.
     """
     for cookie in page.context.cookies():
         if cookie["name"] == "csrftoken":
-            return cookie["value"]
+            value = cookie["value"]
+            log_privacy.register_secret(value)
+            return value
     return ""
 
 
@@ -211,6 +216,10 @@ def csrf_token(authenticated_page: Page, base_url: str) -> str:
     After login, the app populates <meta name="csrf-token" content="...">
     on every authenticated page. Falls back to Playwright's cookie API if
     the meta tag is empty (e.g. on pages that don't inject it).
+
+    The value actually returned is registered with the console privacy filter
+    regardless of which source produced it, so a meta-tag token is covered by
+    bare-substring redaction exactly like a cookie-sourced one.
     """
     # The authenticated_page is already on an authenticated page (post-login
     # redirect). Read the CSRF from the meta tag or cookie store.
@@ -224,6 +233,9 @@ def csrf_token(authenticated_page: Page, base_url: str) -> str:
         # Fallback: read from Playwright's cookie store (bypasses HttpOnly)
         token = _get_csrf_cookie(authenticated_page)
 
+    # Registration is source-independent: cover meta, cookie and any future
+    # origin in one place, at the single value that leaves this fixture.
+    log_privacy.register_secret(token)
     return token
 
 
