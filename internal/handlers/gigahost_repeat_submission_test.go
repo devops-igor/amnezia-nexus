@@ -345,3 +345,66 @@ func TestRepeatedSubmission_ProviderErrorIsNotHidden(t *testing.T) {
 		t.Fatalf("provider failure = %d %s, want 502 account_check_failed", attempt.code, attempt.body)
 	}
 }
+
+// TestRepeatedSubmission_TableIsBoundedAndSelfPruning covers the eviction paths:
+// the in-memory table must not grow without bound, must drop expired entries
+// first, and must still work when every entry is fresh.
+func TestRepeatedSubmission_TableIsBoundedAndSelfPruning(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+
+	// Fill to the cap with FRESH entries: the table is full but nothing is
+	// expired, so an insert must evict to stay bounded.
+	for i := 0; i < maxAdmissionEntries; i++ {
+		h.recordRejectedOrderAttempt("fresh-"+string(rune('a'+i%26))+string(rune('a'+i/26)), time.Now())
+	}
+	table := h.admission()
+	table.mu.Lock()
+	sizeAfterFreshFill := len(table.rejectedA)
+	table.mu.Unlock()
+	if sizeAfterFreshFill > maxAdmissionEntries {
+		t.Fatalf("table grew to %d entries, cap is %d", sizeAfterFreshFill, maxAdmissionEntries)
+	}
+
+	// Now make everything expired and insert: expired entries are purged first.
+	for key := range table.rejectedA {
+		h.recordRejectedOrderAttempt(key, time.Now().Add(-2*repeatedSubmitCooldown()))
+	}
+	h.recordRejectedOrderAttempt("after-expiry", time.Now())
+	table.mu.Lock()
+	size := len(table.rejectedA)
+	_, hasNew := table.rejectedA["after-expiry"]
+	table.mu.Unlock()
+	if !hasNew {
+		t.Fatal("the new entry must be recorded")
+	}
+	if size > maxAdmissionEntries {
+		t.Fatalf("table grew to %d entries after purge, cap is %d", size, maxAdmissionEntries)
+	}
+
+	// An empty user id is never recorded and never blocked.
+	h.recordRejectedOrderAttempt("", time.Now())
+	if blocked, _ := h.orderAdmissionBlocked(""); blocked {
+		t.Fatal("an empty identity must never be throttled")
+	}
+}
+
+// TestRepeatedSubmission_InvalidPlanAndCreditArmTheWindow covers the remaining
+// persistent-rejection classifications, so the classifier is not tested only for
+// the budget case.
+func TestRepeatedSubmission_InvalidPlanAndCreditArmTheWindow(t *testing.T) {
+	if !isPersistentRejection(400, "invalid_plan: plan 999 not found") {
+		t.Error("400 invalid_plan must be a persistent rejection")
+	}
+	if !isPersistentRejection(402, "insufficient_credit") {
+		t.Error("402 insufficient_credit must be a persistent rejection")
+	}
+	if isPersistentRejection(502, "account_check_failed") {
+		t.Error("502 account_check_failed must NOT be a persistent rejection")
+	}
+	if isPersistentRejection(502, "catalog_check_failed") {
+		t.Error("502 catalog_check_failed must NOT be a persistent rejection")
+	}
+	if isPersistentRejection(500, "db_error") {
+		t.Error("500 must NOT be a persistent rejection")
+	}
+}
