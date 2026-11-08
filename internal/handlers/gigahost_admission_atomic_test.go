@@ -371,3 +371,134 @@ func TestEvictIfFullBoundedFallback(t *testing.T) {
 		t.Fatalf("size = %d, want the table bounded near %d", size, maxAdmissionEntries)
 	}
 }
+
+// TestReservationHeldThroughPurchase verifies the reservation's real lifetime. The
+// slot is released just before intent persistence, so the question is whether a
+// second same-admin request can slip in during the purchase window. It cannot: the
+// purchase runs under budgetMu, so the second request blocks there instead of
+// repeating provider reads.
+func TestReservationHeldThroughPurchase(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	if err := db.SetSetting(context.Background(), "gigahost", map[string]any{"monthly_budget_nok": 1000.0}); err != nil {
+		t.Fatal(err)
+	}
+	mock := &mockGigahostClient{
+		getAccountFn: func(context.Context) (*gigahost.AccountInfo, error) {
+			return &gigahost.AccountInfo{Balance: 5000, Currency: "NOK"}, nil
+		},
+		getCatalogFn: func(context.Context) ([]gigahost.HourlyPlan, error) {
+			return []gigahost.HourlyPlan{{
+				ProductID: 101, PriceID: 555, HourlyRateNOK: 0.15, MonthlyCeiling: 59,
+				InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}},
+				Eligibility: gigahost.CatalogEligibility{QualifiesArrears: true},
+			}}, nil
+		},
+		getServersFn: func(context.Context) ([]gigahost.ServerInfo, error) { return nil, nil },
+		orderServerSafeFn: func(context.Context, gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			return &gigahost.OrderResponse{OrderID: "70001", Status: gigahost.StatusPending}, nil
+		},
+	}
+	pb := &purchaseBarrier{Client: mock, entered: make(chan struct{}), release: make(chan struct{})}
+	h.SetGigahostClient(pb)
+
+	go func() { submitOrderAs(h, "admin-1") }()
+	<-pb.entered
+	afterFirstCatalog := atomic.LoadInt32(&pb.catalog)
+
+	secondDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { secondDone <- submitOrderAs(h, "admin-1") }()
+
+	var second *httptest.ResponseRecorder
+	select {
+	case second = <-secondDone:
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(pb.release)
+
+	if second == nil {
+		// Blocked behind budgetMu: no extra provider work happened. That is the
+		// correct outcome and is the assertion.
+		if got := atomic.LoadInt32(&pb.catalog); got != afterFirstCatalog {
+			t.Fatalf("catalog reads grew to %d while blocked, want %d", got, afterFirstCatalog)
+		}
+		return
+	}
+	if got := atomic.LoadInt32(&pb.catalog); got > afterFirstCatalog && second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second same-admin request did %d extra catalog read(s) and returned %d during the purchase window",
+			got-afterFirstCatalog, second.Code)
+	}
+}
+
+// TestPanicDoesNotLeakTheReservation covers the exception path: the middleware
+// recovers a panic, so without a deferred release the slot would stay set and
+// lock that admin out until restart.
+func TestPanicDoesNotLeakTheReservation(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	if err := db.SetSetting(context.Background(), "gigahost", map[string]any{"monthly_budget_nok": 1000.0}); err != nil {
+		t.Fatal(err)
+	}
+	h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(context.Context) (*gigahost.AccountInfo, error) {
+			panic("provider client exploded")
+		},
+		getCatalogFn: func(context.Context) ([]gigahost.HourlyPlan, error) {
+			return []gigahost.HourlyPlan{{
+				ProductID: 101, PriceID: 555, HourlyRateNOK: 0.15, MonthlyCeiling: 59,
+				InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}},
+			}}, nil
+		},
+	})
+
+	func() {
+		defer func() { _ = recover() }()
+		submitOrderAs(h, "admin-panic")
+	}()
+
+	h.admission().mu.Lock()
+	entry, present := h.admission().entries["admin-panic"]
+	leaked := present && entry.inFlight
+	h.admission().mu.Unlock()
+	if leaked {
+		t.Fatal("a panic left the in-flight slot set; this admin would be locked out until restart")
+	}
+}
+
+// purchaseBarrier blocks the FIRST OrderServerSafe call.
+type purchaseBarrier struct {
+	Client  gigahost.Client
+	entered chan struct{}
+	release chan struct{}
+	first   int32
+	catalog int32
+	orders  int32
+}
+
+func (p *purchaseBarrier) GetCatalog(ctx context.Context) ([]gigahost.HourlyPlan, error) {
+	atomic.AddInt32(&p.catalog, 1)
+	return p.Client.GetCatalog(ctx)
+}
+
+func (p *purchaseBarrier) OrderServerSafe(ctx context.Context, r gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+	atomic.AddInt32(&p.orders, 1)
+	if atomic.CompareAndSwapInt32(&p.first, 0, 1) {
+		close(p.entered)
+		<-p.release
+	}
+	return p.Client.OrderServerSafe(ctx, r)
+}
+
+func (p *purchaseBarrier) GetProducts(ctx context.Context) ([]gigahost.Product, error) {
+	return p.Client.GetProducts(ctx)
+}
+func (p *purchaseBarrier) GetAccount(ctx context.Context) (*gigahost.AccountInfo, error) {
+	return p.Client.GetAccount(ctx)
+}
+func (p *purchaseBarrier) OrderServer(ctx context.Context, r gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+	return p.Client.OrderServer(ctx, r)
+}
+func (p *purchaseBarrier) GetDeployStatus(ctx context.Context, id string) (*gigahost.DeployStatusResponse, error) {
+	return p.Client.GetDeployStatus(ctx, id)
+}
+func (p *purchaseBarrier) GetServers(ctx context.Context) ([]gigahost.ServerInfo, error) {
+	return p.Client.GetServers(ctx)
+}

@@ -440,9 +440,19 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// The reservation must survive a panic: the middleware recovers, but a slot
+	// left set would lock this admin out until restart. releaseAttempt is
+	// idempotent, so this deferred net and the explicit releases below cannot
+	// double-release, and no path can leak the slot.
+	failureKind := failureProviderError
+	releaseOnAbort := func(kind string) {
+		h.releaseAttempt(ticket, kind)
+	}
+	defer func() { releaseOnAbort(failureKind) }()
+
 	catalogPlans, handled, admissionFailure := h.orderEligibilityAdmission(r.Context(), w, client, req)
 	if handled {
-		h.releaseAttempt(ticket, admissionFailure)
+		releaseOnAbort(admissionFailure)
 		return
 	}
 
@@ -453,14 +463,14 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	// 4. Reconcile unknown purchase state and enforce in-flight duplicate lock
 	unresolved, reconcileErr := h.reconcilePendingUnknownOrders(r.Context(), client, req)
 	if reconcileErr != nil {
-		h.releaseAttempt(ticket, failureProviderError)
+		releaseOnAbort(failureProviderError)
 		h.JSONError(w, http.StatusServiceUnavailable, "reconciliation_failed", reconcileErr.Error())
 		return
 	}
 	if unresolved != nil {
 		// An unresolved prior purchase is not this attempt's failure, but the
 		// slot must still be released or the admin would be locked out.
-		h.releaseAttempt(ticket, "")
+		releaseOnAbort("")
 		h.JSON(w, http.StatusAccepted, map[string]any{
 			"status":  "unknown",
 			"message": "Prior purchase order is pending reconciliation; refusing duplicate purchase until resolved",
@@ -471,14 +481,17 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 
 	// 5. Monthly NOK budget cap enforcement
 	if err := h.checkMonthlyBudget(r.Context(), client, req, catalogPlans); err != nil {
-		h.releaseAttempt(ticket, failureBudget)
+		releaseOnAbort(failureBudget)
 		h.handleBudgetCheckError(w, err)
 		return
 	}
 
-	// The attempt passed the pre-provider gates; release the reservation so a
-	// stale rejection can never gate a later legitimate order.
-	h.releaseAttempt(ticket, "")
+	// The attempt passed the pre-provider gates but is NOT finished: intent
+	// persistence and the provider purchase still follow, and both are expensive.
+	// The reservation is therefore held until the purchase itself terminates, so
+	// a second same-admin request cannot repeat the provider reads during that
+	// window. Each terminal path below releases explicitly; the deferred release
+	// covers a panic.
 
 	// 3. Pre-dispatch durable intent persistence; fail closed if DB cannot record intent
 	now := time.Now().UTC()
@@ -520,6 +533,12 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 			fmt.Sprintf("Order placed (%s) but failed to update record: %v", orderRecord.OrderID, updateErr))
 		return
 	}
+
+	// The purchase cycle is finished; release the reservation on every remaining
+	// outcome (partial, uncertain, failed, or success). A purchase failure arms
+	// the cooldown; a success clears it.
+	failureKind = failureKindFor(0, orderErr)
+	releaseOnAbort(failureKind)
 
 	if orderErr != nil {
 		var partialErr *gigahost.OrderPartialError

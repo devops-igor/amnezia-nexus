@@ -151,7 +151,9 @@ func (h *Handlers) admitAttempt(userID string) (ticket *admissionEntry, wait tim
 }
 
 // releaseAttempt ends an attempt. A non-empty failureKind arms the cooldown; an
-// empty one clears it. Every terminal path must call this or the slot leaks.
+// empty one clears it. It is idempotent: releasing an already-released ticket is a
+// no-op, so the deferred safety net can coexist with explicit releases on the
+// paths that finish the purchase cycle.
 func (h *Handlers) releaseAttempt(ticket *admissionEntry, failureKind string) {
 	if ticket == nil {
 		return
@@ -159,6 +161,9 @@ func (h *Handlers) releaseAttempt(ticket *admissionEntry, failureKind string) {
 	table := h.admission()
 	table.mu.Lock()
 	defer table.mu.Unlock()
+	if !ticket.inFlight {
+		return
+	}
 	ticket.inFlight = false
 	if failureKind == "" {
 		ticket.failedAt = time.Time{}
