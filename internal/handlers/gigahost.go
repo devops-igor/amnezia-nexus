@@ -337,13 +337,38 @@ func (h *Handlers) verifyAccountEligibility(ctx context.Context, client gigahost
 }
 
 func (h *Handlers) handleEligibilityError(w http.ResponseWriter, err error) {
+	h.JSONError(w, eligibilityErrorStatus(err), eligibilityErrorCode(err), eligibilityErrorDetail(err))
+}
+
+// eligibilityErrorStatus maps an eligibility failure to its HTTP status, so the
+// admission cooldown can classify it without duplicating the mapping.
+func eligibilityErrorStatus(err error) int {
 	if errors.Is(err, gigahost.ErrInsufficientCredit) {
-		h.JSONError(w, http.StatusPaymentRequired, "insufficient_credit", "Gigahost account has insufficient credit or zero balance")
-	} else if strings.HasPrefix(err.Error(), "account_check_failed:") {
-		h.JSONError(w, http.StatusBadGateway, "account_check_failed", fmt.Sprintf("Failed to check account eligibility: %v", err))
-	} else {
-		h.JSONError(w, http.StatusBadGateway, "catalog_check_failed", fmt.Sprintf("Failed to fetch catalog: %v", err))
+		return http.StatusPaymentRequired
 	}
+	return http.StatusBadGateway
+}
+
+// eligibilityErrorCode is the machine-readable error code for the response.
+func eligibilityErrorCode(err error) string {
+	if errors.Is(err, gigahost.ErrInsufficientCredit) {
+		return "insufficient_credit"
+	}
+	if strings.HasPrefix(err.Error(), "account_check_failed:") {
+		return "account_check_failed"
+	}
+	return "catalog_check_failed"
+}
+
+// eligibilityErrorDetail is the human-readable explanation.
+func eligibilityErrorDetail(err error) string {
+	if errors.Is(err, gigahost.ErrInsufficientCredit) {
+		return "Gigahost account has insufficient credit or zero balance"
+	}
+	if strings.HasPrefix(err.Error(), "account_check_failed:") {
+		return fmt.Sprintf("Failed to check account eligibility: %v", err)
+	}
+	return fmt.Sprintf("Failed to fetch catalog: %v", err)
 }
 
 func (h *Handlers) handleBudgetCheckError(w http.ResponseWriter, err error) {
@@ -398,18 +423,17 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 1. Account balance and credit pre-check
-	catalogPlans, err := h.verifyAccountEligibility(r.Context(), client)
-	if err != nil {
-		h.handleEligibilityError(w, err)
+	// Repeated rejected attempts are suppressed here, before any provider read:
+	// an admin who just hit a persistent rejection gains nothing from re-running
+	// the catalog/account/inventory sequence, and the provider is already the
+	// suspect. This is a retry suppression, not a cached decision - nothing about
+	// eligibility or price is remembered. The same helper performs the eligibility
+	// and catalog validation gates that follow it.
+	catalogPlans, handled := h.orderEligibilityAdmission(r.Context(), w, client, req, sess.UserID)
+	if handled {
 		return
 	}
-
-	// 2. Validate selected plan against catalog
-	if err := validateOrderAgainstCatalog(catalogPlans, req); err != nil {
-		h.handleBudgetCheckError(w, err)
-		return
-	}
+	adminID := sess.UserID
 
 	// 3. Concurrency serialization: lock around budget check, intent creation, and reservation
 	h.budgetMu.Lock()
@@ -432,9 +456,14 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 
 	// 5. Monthly NOK budget cap enforcement
 	if err := h.checkMonthlyBudget(r.Context(), client, req, catalogPlans); err != nil {
+		h.recordRejectedOrderAttempt(adminID, time.Now())
 		h.handleBudgetCheckError(w, err)
 		return
 	}
+
+	// The attempt passed every pre-provider gate; drop any stale rejection so a
+	// successful order is never gated by an older failure.
+	h.clearOrderAdmission(adminID)
 
 	// 3. Pre-dispatch durable intent persistence; fail closed if DB cannot record intent
 	now := time.Now().UTC()

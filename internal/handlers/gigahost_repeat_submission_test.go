@@ -1,0 +1,347 @@
+package handlers
+
+// Repeated-submission protection (finding: repeated rejected deploy attempts).
+//
+// A rejected order attempt costs provider reads (catalog, then inventory). When
+// the rejection is persistent - a budget cap already crossed - an admin clicking
+// again, or a scripted retry, re-issues the whole read sequence against a
+// provider that is already the suspect. This is a bounded, per-admin admission
+// cooldown on that expensive pre-provider path.
+//
+// What it must NOT do, asserted here:
+//   - never cache a positive financial/eligibility decision (no purchase fast-path)
+//   - never retry a purchase
+//   - never create a permanent lockout
+//   - never couple unrelated admins
+//   - never hide a genuine provider error behind a cooldown message
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
+)
+
+// orderCounters counts provider work done for one attempt.
+type orderCounters struct {
+	catalog int32
+	servers int32
+	account int32
+	posts   int32
+}
+
+// orderAttempt is what one order request observed.
+type orderAttempt struct {
+	code       int
+	body       string
+	posts      int32
+	reads      int32
+	retryAfter string
+	suppressed bool
+}
+
+// repeatedSubmitHarness drives the real handler with per-attempt provider counts.
+type repeatedSubmitHarness struct {
+	t      *testing.T
+	h      *Handlers
+	budget float64
+	counts orderCounters
+}
+
+func newRepeatedSubmitHarness(t *testing.T, budget float64) *repeatedSubmitHarness {
+	t.Helper()
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": budget}); err != nil {
+		t.Fatal(err)
+	}
+	return &repeatedSubmitHarness{t: t, h: h, budget: budget}
+}
+
+// install wires a mock client whose reads are counted into the harness counters.
+func (rs *repeatedSubmitHarness) install(planMonthly, existingMonthly float64) {
+	catalog := []gigahost.HourlyPlan{
+		{
+			ProductID: 101, PriceID: 555, Currency: "NOK", HourlyRateNOK: 0.15,
+			MonthlyCeiling: planMonthly, InStock: true,
+			Regions:     []gigahost.Region{{ID: 1, Available: true}},
+			Eligibility: gigahost.CatalogEligibility{QualifiesArrears: true},
+		},
+	}
+	var servers []gigahost.ServerInfo
+	if existingMonthly > 0 {
+		hourly := true
+		catalog = append(catalog, gigahost.HourlyPlan{
+			ProductID: 202, PriceID: 666, Currency: "NOK", HourlyRateNOK: 0.0555,
+			MonthlyCeiling: existingMonthly, InStock: true,
+			Regions: []gigahost.Region{{ID: 1, Available: true}},
+		})
+		servers = []gigahost.ServerInfo{
+			{ID: 1, PID: 202, Status: gigahost.StatusReady, BwIsHourly: &hourly},
+		}
+	}
+
+	rs.h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(context.Context) (*gigahost.AccountInfo, error) {
+			atomic.AddInt32(&rs.counts.account, 1)
+			return &gigahost.AccountInfo{Balance: 500, Currency: "NOK"}, nil
+		},
+		getCatalogFn: func(context.Context) ([]gigahost.HourlyPlan, error) {
+			atomic.AddInt32(&rs.counts.catalog, 1)
+			return catalog, nil
+		},
+		getServersFn: func(context.Context) ([]gigahost.ServerInfo, error) {
+			atomic.AddInt32(&rs.counts.servers, 1)
+			return servers, nil
+		},
+		getDeployStatusFn: func(_ context.Context, id string) (*gigahost.DeployStatusResponse, error) {
+			return &gigahost.DeployStatusResponse{OrderID: id, Status: gigahost.StatusReady}, nil
+		},
+		orderServerSafeFn: func(context.Context, gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+			atomic.AddInt32(&rs.counts.posts, 1)
+			return &gigahost.OrderResponse{OrderID: "70001", Status: gigahost.StatusPending}, nil
+		},
+	})
+
+	// Seed the existing commitment as a server-linked local order.
+	if existingMonthly > 0 {
+		now := time.Now().UTC()
+		rec := GigahostOrderRecord{
+			OrderID: "existing", ServerID: 1, Status: gigahost.StatusReady,
+			PlanID: 202, RegionID: 1, HourlyPriceNOK: 0.0555, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := rs.h.saveGigahostOrder(context.Background(), &rec); err != nil {
+			rs.t.Fatal(err)
+		}
+	}
+}
+
+// submit places one order as the given admin and reports the delta it caused.
+func (rs *repeatedSubmitHarness) submit(userID string) orderAttempt {
+	rs.t.Helper()
+	before := orderCounters{
+		catalog: atomic.LoadInt32(&rs.counts.catalog),
+		servers: atomic.LoadInt32(&rs.counts.servers),
+		account: atomic.LoadInt32(&rs.counts.account),
+		posts:   atomic.LoadInt32(&rs.counts.posts),
+	}
+
+	body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12}`
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+		UserID: userID, Username: userID, Role: models.RoleAdmin,
+	}))
+	w := httptest.NewRecorder()
+	rs.h.GigahostOrderHandler(w, req)
+
+	reads := (atomic.LoadInt32(&rs.counts.catalog) - before.catalog) +
+		(atomic.LoadInt32(&rs.counts.servers) - before.servers) +
+		(atomic.LoadInt32(&rs.counts.account) - before.account)
+	return orderAttempt{
+		code:       w.Code,
+		body:       w.Body.String(),
+		posts:      atomic.LoadInt32(&rs.counts.posts) - before.posts,
+		reads:      reads,
+		retryAfter: w.Header().Get("Retry-After"),
+		suppressed: strings.Contains(w.Body.String(), "repeat_suppressed"),
+	}
+}
+
+// TestRepeatedSubmission_RejectedAttemptsDoNotReissueProviderReads is the core
+// regression: a persistent budget rejection must not spend provider reads on
+// every click.
+func TestRepeatedSubmission_RejectedAttemptsDoNotReissueProviderReads(t *testing.T) {
+	// 100 NOK committed against a 100 budget: 100 + 59 > 100, every attempt fails.
+	rs := newRepeatedSubmitHarness(t, 100)
+	rs.install(59, 100)
+
+	first := rs.submit("admin-1")
+	if first.code != http.StatusBadRequest || !strings.Contains(first.body, "budget_exceeded") {
+		t.Fatalf("first attempt = %d %s, want 400 budget_exceeded", first.code, first.body)
+	}
+	if first.suppressed {
+		t.Fatal("the first attempt must reach the provider, not be suppressed")
+	}
+	if first.reads == 0 {
+		t.Fatal("expected the first attempt to read the provider")
+	}
+	if first.posts != 0 {
+		t.Fatalf("rejected attempt dispatched %d orders, want 0", first.posts)
+	}
+
+	// Immediate repeats must be suppressed before any provider work.
+	for i := 0; i < 3; i++ {
+		repeat := rs.submit("admin-1")
+		if !repeat.suppressed {
+			t.Fatalf("repeat %d was not suppressed (code=%d body=%s)", i, repeat.code, repeat.body)
+		}
+		if repeat.reads != 0 || repeat.posts != 0 {
+			t.Fatalf("suppressed repeat %d still did provider work: reads=%d posts=%d",
+				i, repeat.reads, repeat.posts)
+		}
+		if repeat.code != http.StatusTooManyRequests {
+			t.Errorf("suppressed repeat %d = %d, want 429", i, repeat.code)
+		}
+		if repeat.retryAfter == "" {
+			t.Errorf("suppressed repeat %d has no Retry-After header", i)
+		}
+	}
+}
+
+// TestRepeatedSubmission_RecoversAfterWindow proves no permanent lockout.
+func TestRepeatedSubmission_RecoversAfterWindow(t *testing.T) {
+	rs := newRepeatedSubmitHarness(t, 100)
+	rs.install(59, 100)
+
+	cooldown := repeatedSubmitCooldown()
+	if cooldown <= 0 {
+		t.Fatalf("cooldown = %v, want a positive bounded duration", cooldown)
+	}
+	// A rejection recorded before the window must not block.
+	rs.h.recordRejectedOrderAttempt("admin-1", time.Now().Add(-2*cooldown))
+	if blocked, _ := rs.h.orderAdmissionBlocked("admin-1"); blocked {
+		t.Fatal("an expired window must not block a later attempt")
+	}
+	// And through the handler, that attempt reaches the provider again.
+	attempt := rs.submit("admin-1")
+	if attempt.suppressed {
+		t.Fatal("an expired window suppressed a real attempt")
+	}
+	if attempt.reads == 0 {
+		t.Fatal("expected the recovered attempt to reach the provider")
+	}
+}
+
+// TestRepeatedSubmission_ConcurrentSubmitsAdmitAtMostOne: parallel submits from
+// one admin must not all reach the provider.
+func TestRepeatedSubmission_ConcurrentSubmitsAdmitAtMostOne(t *testing.T) {
+	rs := newRepeatedSubmitHarness(t, 100)
+	rs.install(59, 100)
+
+	// Prime the cooldown so the concurrent burst is entirely in-window.
+	first := rs.submit("admin-concurrent")
+	if first.suppressed {
+		t.Fatal("the priming attempt must not be suppressed")
+	}
+
+	const attempts = 6
+	results := make([]orderAttempt, attempts)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			results[idx] = rs.submit("admin-concurrent")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	admits := 0
+	for _, r := range results {
+		if !r.suppressed {
+			admits++
+		}
+	}
+	if admits > 1 {
+		t.Fatalf("%d concurrent submits were admitted past the cooldown, want at most 1", admits)
+	}
+	for _, r := range results {
+		if r.posts != 0 {
+			t.Fatalf("a concurrent submit dispatched a provider order")
+		}
+	}
+}
+
+// TestRepeatedSubmission_SeparateAdminsUnaffected proves no cross-admin coupling.
+func TestRepeatedSubmission_SeparateAdminsUnaffected(t *testing.T) {
+	rs := newRepeatedSubmitHarness(t, 100)
+	rs.install(59, 100)
+	rs.h.recordRejectedOrderAttempt("admin-1", time.Now())
+
+	if blocked, _ := rs.h.orderAdmissionBlocked("admin-1"); !blocked {
+		t.Fatal("admin-1 should be cooling down")
+	}
+	if blocked, _ := rs.h.orderAdmissionBlocked("admin-2"); blocked {
+		t.Fatal("admin-2 must not be affected by admin-1's rejection")
+	}
+
+	// admin-2 still does real work.
+	attempt := rs.submit("admin-2")
+	if attempt.suppressed {
+		t.Fatal("admin-2 was suppressed by another admin's cooldown")
+	}
+	if attempt.reads == 0 {
+		t.Fatal("admin-2's attempt did no provider work")
+	}
+}
+
+// TestRepeatedSubmission_SuccessClearsCooldown proves a successful order is never
+// gated by a stale rejection, and no positive decision is cached.
+func TestRepeatedSubmission_SuccessClearsCooldown(t *testing.T) {
+	rs := newRepeatedSubmitHarness(t, 100)
+	rs.install(59, 0) // no existing commitment: 59 <= 100, the order succeeds
+
+	rs.h.recordRejectedOrderAttempt("admin-1", time.Now())
+	rs.h.clearOrderAdmission("admin-1")
+	if blocked, _ := rs.h.orderAdmissionBlocked("admin-1"); blocked {
+		t.Fatal("a cleared entry must not block")
+	}
+
+	attempt := rs.submit("admin-1")
+	if attempt.suppressed {
+		t.Fatal("a cleared cooldown suppressed a legitimate attempt")
+	}
+	if attempt.code != http.StatusOK || attempt.posts != 1 {
+		t.Fatalf("expected a successful order, got %d (posts=%d body=%s)", attempt.code, attempt.posts, attempt.body)
+	}
+}
+
+// TestRepeatedSubmission_CooldownIsBounded guards the policy constants so a later
+// edit cannot silently turn a short cooldown into a lockout.
+func TestRepeatedSubmission_CooldownIsBounded(t *testing.T) {
+	d := repeatedSubmitCooldown()
+	if d <= 0 {
+		t.Fatalf("cooldown = %v, want positive", d)
+	}
+	if d > 2*time.Minute {
+		t.Fatalf("cooldown = %v, want a bounded retry hint (<= 2m), not a lockout", d)
+	}
+}
+
+// TestRepeatedSubmission_ProviderErrorIsNotHidden proves a genuine provider
+// failure is still reported as itself, not as a cooldown.
+func TestRepeatedSubmission_ProviderErrorIsNotHidden(t *testing.T) {
+	rs := newRepeatedSubmitHarness(t, 100)
+	rs.install(59, 0)
+
+	// Non-qualifying catalog forces the account path, which times out.
+	rs.h.SetGigahostClient(&mockGigahostClient{
+		getAccountFn: func(context.Context) (*gigahost.AccountInfo, error) {
+			return nil, context.DeadlineExceeded
+		},
+		getCatalogFn: func(context.Context) ([]gigahost.HourlyPlan, error) {
+			return []gigahost.HourlyPlan{{
+				ProductID: 101, PriceID: 555, HourlyRateNOK: 0.15, MonthlyCeiling: 59,
+				InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}},
+			}}, nil
+		},
+	})
+	attempt := rs.submit("admin-1")
+	if attempt.suppressed {
+		t.Fatal("a provider failure must not be reported as a cooldown")
+	}
+	if attempt.code != http.StatusBadGateway || !strings.Contains(attempt.body, "account_check_failed") {
+		t.Fatalf("provider failure = %d %s, want 502 account_check_failed", attempt.code, attempt.body)
+	}
+}

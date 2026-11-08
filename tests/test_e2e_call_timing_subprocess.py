@@ -98,7 +98,12 @@ def harness_binary(tmp_path_factory) -> Iterator[Path]:
     """Build the harness inside the module so the real package resolves."""
     go = os.environ.get("GO_BINARY") or shutil.which("go")
     if not go:
-        pytest.skip("go toolchain not available")
+        # The dedicated CI job sets TIMING_COLLECTOR_REQUIRE_GO=1 so a missing
+        # toolchain fails the job instead of silently skipping the only proof
+        # that the collector works on real panel output.
+        if os.environ.get("TIMING_COLLECTOR_REQUIRE_GO") == "1":
+            pytest.fail("go toolchain is required for the subprocess collector proof")
+        pytest.skip("go toolchain not available (set TIMING_COLLECTOR_REQUIRE_GO=1 to require it)")
     # The harness must live under the module to import internal packages, so it
     # is written into a scratch directory inside the repo and removed afterwards.
     workdir = REPO_ROOT / "test-artifacts" / "call-timing-harness"

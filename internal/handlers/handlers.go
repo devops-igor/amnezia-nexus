@@ -88,6 +88,10 @@ type Handlers struct {
 	sshDialerHook             func(context.Context, ssh.Config) (ssh.SSHClient, error)
 	gigahostDeployMu          sync.RWMutex
 	gigahostDeployLocks       map[string]*sync.Mutex
+	// Repeated rejected deploy attempts are suppressed per admin for a short
+	// window; see gigahost_admission.go.
+	admissionOnce  sync.Once
+	admissionState *orderAdmission
 }
 
 // lockUser serializes credential admission and user disabling; the lock is shared
