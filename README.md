@@ -257,6 +257,33 @@ sudo iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE
 sudo apt-get install -y iptables-persistent && sudo netfilter-persistent save
 ```
 
+#### Direct WAN egress (PBR) reverse-path filtering
+
+Direct WAN egress injects already source-NATed packets into the WAN tunnel device,
+so they re-enter the stack addressed to a remote host with a **local** source
+address. The kernel's reverse-path check treats that as a martian and drops it
+before forwarding, so no direct traffic ever leaves the host and replies never
+return.
+
+`net.ipv4.conf.all.rp_filter=2` (loose mode, set in the compose block above) is not
+sufficient: the effective value is the maximum of the `all` and per-device
+settings, and loose mode still rejects a local source arriving on a non-loopback
+device. Set the filter to `0` for the devices direct egress uses when you enable
+PBR:
+
+```bash
+# Host WAN interface and the WAN tunnel device direct egress writes into
+WAN_IFACE=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
+sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+sudo sysctl -w "net.ipv4.conf.${WAN_IFACE}.rp_filter=0"
+sudo sysctl -w net.ipv4.conf.nexus-wan0.rp_filter=0
+```
+
+This is asserted by the S4 qualification gate
+(`internal/vpn/wan_direct_egress_qualification_linux_test.go`): with the settings
+above the direct TCP/UDP reply path is proven end to end, and with `rp_filter=2`
+the same run proves zero datagrams are forwarded.
+
 ### 3. Install Docker
 
 Install Docker Engine and the Docker Compose plugin using the [official Docker instructions](https://docs.docker.com/engine/install/) for your Linux distribution.
