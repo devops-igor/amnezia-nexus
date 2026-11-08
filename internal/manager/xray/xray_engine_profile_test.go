@@ -47,8 +47,17 @@ func TestResolveEngineProfile(t *testing.T) {
 			wantErr:     false,
 		},
 		{
-			name:        "modern_pq version tag",
+			// Operator-saved config/metadata may still carry the retracted "26.10.29" string.
+			// It must keep resolving to the modern_pq profile but deploy the current pin.
+			name:        "retracted version alias resolves to current pin",
 			input:       "26.10.29",
+			wantProfile: EngineProfileModernPQ,
+			wantVersion: XrayModernPQVersion,
+			wantErr:     false,
+		},
+		{
+			name:        "current pinned version tag",
+			input:       "26.10.31",
 			wantProfile: EngineProfileModernPQ,
 			wantVersion: XrayModernPQVersion,
 			wantErr:     false,
@@ -142,7 +151,7 @@ func TestXrayManager_ProfileSwitchingPreservesConfigAndCredentials(t *testing.T)
 		t.Errorf("initial client engine_profile = %v, want %s", addedClient["engine_profile"], EngineProfileLegacy)
 	}
 
-	// 2. Switch engine profile to Modern PQ (26.10.29)
+	// 2. Switch engine profile to Modern PQ (current modern pin)
 	switchParams := map[string]any{
 		"engine_profile": string(EngineProfileModernPQ),
 	}

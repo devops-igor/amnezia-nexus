@@ -92,7 +92,7 @@ func TestResolveServerEngineStatusCached_ExpiredCacheTriggersBackgroundWarm(t *t
 	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(25 * time.Millisecond) {
 		if !checker.IsCacheExpired(updater.EngineXray) {
 			rel, ok := checker.GetCachedRelease(updater.EngineXray)
-			if ok && rel.Version == "v26.10.29" {
+			if ok && rel.Version == "v26.10.31" {
 				refreshed = true
 				break
 			}
@@ -114,8 +114,8 @@ func TestResolveServerEngineStatusCached_ExpiredCacheTriggersBackgroundWarm(t *t
 	if freshVless.IsStale {
 		t.Errorf("expected IsStale = false after cache refresh, got true")
 	}
-	if freshVless.LatestVersion != "v26.10.29" {
-		t.Errorf("expected LatestVersion = 'v26.10.29', got %q", freshVless.LatestVersion)
+	if freshVless.LatestVersion != "v26.10.31" {
+		t.Errorf("expected LatestVersion = 'v26.10.31', got %q", freshVless.LatestVersion)
 	}
 	if freshVless.CheckedAt.Before(start) {
 		t.Errorf("expected refreshed CheckedAt to be after start %v, got %v", start, freshVless.CheckedAt)
@@ -971,12 +971,12 @@ func TestXrayManager_Reinstall_FailedDetection_InvalidatesRunningVersion(t *test
 	if !ok {
 		t.Fatalf("expected %q in EngineStatus, got %+v", models.ProtocolVLESS, found.EngineStatus)
 	}
-	// Must report new profile version (26.10.29), NOT retired "1.8.24"
+	// Must report new profile version (the current modern pin), NOT retired "1.8.24"
 	if vlessStatus["installed_version"] != xray.XrayModernPQVersion {
 		t.Errorf("expected vless installed_version = %q, got %v", xray.XrayModernPQVersion, vlessStatus["installed_version"])
 	}
-	if vlessStatus["latest_version"] != "v26.10.29" {
-		t.Errorf("expected vless latest_version = 'v26.10.29', got %v", vlessStatus["latest_version"])
+	if vlessStatus["latest_version"] != "v26.10.31" {
+		t.Errorf("expected vless latest_version = 'v26.10.31', got %v", vlessStatus["latest_version"])
 	}
 	// Must NOT report false update_available!
 	if upd, _ := vlessStatus["update_available"].(bool); upd {

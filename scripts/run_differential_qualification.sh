@@ -260,12 +260,9 @@ if [[ "$SUITE" == "lifecycle" || "$SUITE" == "all" ]]; then
     fi
 fi
 
-# Collect artifacts from tasks/ directories into output directory if present
-for task_json in "$REPO_ROOT"/tasks/issue-392-*/*.json; do
-    if [[ -f "$task_json" ]]; then
-        cp -u "$task_json" "$OUTPUT_DIR/" 2>/dev/null || cp "$task_json" "$OUTPUT_DIR/" 2>/dev/null || true
-    fi
-done
+# Differential artifacts are written directly to NEXUS_ARTIFACT_DIR above by the tests
+# themselves. Nothing is copied out of the repository working tree here: a file left in
+# tasks/ would be a predecessor's output, not this invocation's evidence.
 
 # Perform Automated Privacy Audit on Artifacts
 echo ""
