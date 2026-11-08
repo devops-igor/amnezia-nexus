@@ -249,12 +249,23 @@ func (h *Handlers) GigahostCatalogHandler(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// verifyAccountEligibility decides whether the account may order an hourly
+// server, and returns the catalog it fetched.
+//
+// The catalog is fetched first because it is needed for the rest of the order
+// path anyway, and because the provider documents the same eligibility facts on
+// it (qualifies_arrears, credit_nok) that GET /account is consulted for.
+// gigahost.HasEligibility is an OR with no deny branch, so the account can only
+// ever ADD eligibility: when the catalog already qualifies, consulting the
+// account cannot change the decision and is skipped. That removes a provider
+// round-trip which has been observed to stall; it does not fix a general
+// network fault and it does not explain the historical timeout.
+//
+// When the catalog does NOT qualify the account is still consulted, with the
+// same outcomes as before: a failed call is account_check_failed (fail closed,
+// no order) and a reaching call with no credit is ErrInsufficientCredit. No
+// credit guard is removed.
 func (h *Handlers) verifyAccountEligibility(ctx context.Context, client gigahost.Client) ([]gigahost.HourlyPlan, error) {
-	account, err := client.GetAccount(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("account_check_failed: %w", err)
-	}
-
 	catalogPlans, catErr := client.GetCatalog(ctx)
 	if catErr != nil {
 		return nil, fmt.Errorf("catalog_check_failed: %w", catErr)
@@ -278,6 +289,17 @@ func (h *Handlers) verifyAccountEligibility(ctx context.Context, client gigahost
 	catalog := &gigahost.Catalog{
 		Plans:       catalogPlans,
 		Eligibility: catalogElig,
+	}
+	// Catalog-only decision: the account is nil here precisely to prove the
+	// skip took effect. HasEligibility(account, catalog) can never be false for
+	// a qualifying catalog, so this is equivalent to consulting the account.
+	if gigahost.HasEligibility(nil, catalog) {
+		return catalogPlans, nil
+	}
+
+	account, accErr := client.GetAccount(ctx)
+	if accErr != nil {
+		return nil, fmt.Errorf("account_check_failed: %w", accErr)
 	}
 	if !gigahost.HasEligibility(account, catalog) {
 		return nil, gigahost.ErrInsufficientCredit
