@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -42,25 +43,69 @@ func (h *Handlers) policyStoreDir() string {
 	return "policy"
 }
 
+// policyCompensationTimeout bounds the compensating write that undoes a
+// committed settings change whose activation was refused.
+//
+// Compensation must not inherit the request's cancellation: F678-02 showed that
+// a client disconnect or the shipped 60-second request deadline arrives exactly
+// when activation fails, so reusing the request context made the rollback itself
+// fail with "context canceled" and left the rejected record durable. A bounded,
+// cancellation-independent context keeps the write short and request-unowned.
+const policyCompensationTimeout = 10 * time.Second
+
+// errPolicySettingsSuperseded reports that a compensating write was skipped
+// because a later save had already replaced the record this request wrote.
+// Overwriting it would discard an accepted configuration, which is strictly
+// worse than leaving the newer one in place.
+var errPolicySettingsSuperseded = errors.New("policy settings were replaced by a later save")
+
+// previousPolicyRecord is the durable state a request must restore if its own
+// activation is refused. present distinguishes "the record existed" from "the
+// key was absent", so compensation restores the previous record exactly instead
+// of materializing a default one.
+type previousPolicyRecord struct {
+	settings policy.Settings
+	present  bool
+}
+
+// loadPolicyRecord reads the persisted record together with its presence. An
+// absent or all-zero row yields the disabled default, which is what keeps
+// existing and fresh installs on the old all-proxy route.
+func (h *Handlers) loadPolicyRecord(ctx context.Context) (previousPolicyRecord, error) {
+	rec := previousPolicyRecord{settings: policy.DefaultSettings()}
+	if h.db == nil {
+		return rec, nil
+	}
+	raw, found, err := h.db.GetSettingRaw(ctx, policy.SettingsKey)
+	if err != nil {
+		return rec, fmt.Errorf("read policy settings: %w", err)
+	}
+	if !found || !raw.Valid || raw.String == "" {
+		return rec, nil
+	}
+	var stored policy.Settings
+	if err := json.Unmarshal([]byte(raw.String), &stored); err != nil {
+		return rec, fmt.Errorf("decode policy settings: %w", err)
+	}
+	// A row that says nothing is treated as absent, the same way the admin GET
+	// and the panel startup loader have always interpreted it.
+	if stored.IsZero() {
+		return rec, nil
+	}
+	rec.settings = stored.Normalize()
+	rec.present = true
+	return rec, nil
+}
+
 // policySettingsOrDefault loads the persisted record. An absent row yields the
 // disabled default, which is what keeps existing and fresh installs on the old
 // all-proxy route.
 func (h *Handlers) policySettingsOrDefault(ctx context.Context) (policy.Settings, error) {
-	settings := policy.DefaultSettings()
-	if h.db == nil {
-		return settings, nil
+	rec, err := h.loadPolicyRecord(ctx)
+	if err != nil {
+		return policy.DefaultSettings(), err
 	}
-	var stored policy.Settings
-	if err := h.db.GetSetting(ctx, policy.SettingsKey, &stored); err != nil {
-		return settings, err
-	}
-	// GetSetting leaves the target untouched when the row is absent, so a stored
-	// record is only adopted when it says something. Settings contains a slice and
-	// is therefore not comparable, so emptiness is checked field by field.
-	if stored.Preset == "" && !stored.Enabled && stored.SyncInterval == 0 && len(stored.CustomURLs) == 0 {
-		return settings, nil
-	}
-	return stored.Normalize(), nil
+	return rec.settings, nil
 }
 
 // savePolicySettings durably writes the record.
@@ -69,6 +114,53 @@ func (h *Handlers) savePolicySettings(ctx context.Context, settings policy.Setti
 		return errors.New("database unavailable")
 	}
 	return h.db.SetSetting(ctx, policy.SettingsKey, settings)
+}
+
+// policySettingsEqual reports whether two records describe the same
+// configuration. Settings contains a slice, so == is unavailable.
+func policySettingsEqual(a, b policy.Settings) bool {
+	if a.Enabled != b.Enabled || a.Preset != b.Preset || a.SyncInterval != b.SyncInterval {
+		return false
+	}
+	if len(a.CustomURLs) != len(b.CustomURLs) {
+		return false
+	}
+	for i := range a.CustomURLs {
+		if a.CustomURLs[i] != b.CustomURLs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// restorePolicySettings compensates a committed settings write whose activation
+// was refused, on a bounded context that is independent of the request.
+//
+// Two properties matter beyond "write the old value back":
+//   - it re-reads the record first and does nothing when the durable value is no
+//     longer the one this request wrote, so a concurrent accepted save (another
+//     admin, a backup restore) is never clobbered;
+//   - returning an error means the durable record and the live runtime may now
+//     disagree, which the caller surfaces as an inconsistent-state outcome
+//     instead of a log line.
+func (h *Handlers) restorePolicySettings(ctx context.Context, previous previousPolicyRecord, written policy.Settings) error {
+	compCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), policyCompensationTimeout)
+	defer cancel()
+
+	current, err := h.policySettingsOrDefault(compCtx)
+	if err != nil {
+		return fmt.Errorf("re-read policy settings before rollback: %w", err)
+	}
+	if !policySettingsEqual(current, written) {
+		return errPolicySettingsSuperseded
+	}
+	if !previous.present {
+		if h.db == nil {
+			return errors.New("database unavailable")
+		}
+		return h.db.DeleteSetting(compCtx, policy.SettingsKey)
+	}
+	return h.savePolicySettings(compCtx, previous.settings)
 }
 
 // GetPolicyHandler serves GET /api/vpn/policy.
@@ -111,28 +203,26 @@ func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	previous, prevErr := h.policySettingsOrDefault(ctx)
+	previous, prevErr := h.loadPolicyRecord(ctx)
 	if prevErr != nil {
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to load current policy settings")
 		return
 	}
 
 	// Persist first so a restart reproduces the operator's intent, then activate.
-	// Activation failure rolls the record back to the exact previous value.
+	// Activation failure compensates the committed write.
+	//
+	// The post-commit barrier below is deliberate: persistence happens before any
+	// activation work, so a cancellation during activation always arrives after
+	// the row this request owns is durable. That is what makes the compensation
+	// path reachable and what keeps its regression test non-vacuous.
 	if err := h.savePolicySettings(ctx, incoming); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to save policy settings")
 		return
 	}
 
 	if err := h.applyPolicySettings(ctx, incoming); err != nil {
-		if rollbackErr := h.savePolicySettings(ctx, previous); rollbackErr != nil {
-			slog.Error("Failed to roll back policy settings after activation failure",
-				"err", rollbackErr, "activation_err", err)
-		}
-		h.audit(r, "policy.settings_save", map[string]any{
-			"result": "failed", "enabled": incoming.Enabled, "preset": string(incoming.Preset), "reason": err.Error(),
-		})
-		h.JSONError(w, http.StatusUnprocessableEntity, "activation_failed", err.Error())
+		h.rollbackPolicySettings(w, r, previous, incoming, err)
 		return
 	}
 
@@ -141,6 +231,48 @@ func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		"custom_url_count": len(incoming.CustomURLs), "sync_interval_seconds": incoming.SyncInterval,
 	})
 	h.JSON(w, http.StatusOK, h.policyPutResponse(incoming))
+}
+
+// rollbackPolicySettings compensates a committed settings write whose activation
+// was refused, and renders the operator-facing outcome.
+//
+// Three outcomes are distinguished instead of collapsing into one log line:
+//   - compensation restored the previous record: 422 with the activation reason,
+//     which is the documented "rejected enablement with a useful error" contract;
+//   - a later save replaced the record this request wrote: 422 as well, because
+//     this request's configuration is not in effect, but the durable value is a
+//     newer accepted one and is deliberately left alone;
+//   - compensation itself failed: 500. The rejected settings may still be
+//     durable while the runtime stays on the previous policy, so a restart could
+//     pick up intent that was never activated. Reporting success or a plain
+//     activation error would hide a material inconsistent state.
+func (h *Handlers) rollbackPolicySettings(w http.ResponseWriter, r *http.Request, previous previousPolicyRecord, written policy.Settings, activationErr error) {
+	rollbackErr := h.restorePolicySettings(r.Context(), previous, written)
+
+	details := map[string]any{
+		"result": "failed", "enabled": written.Enabled, "preset": string(written.Preset), "reason": activationErr.Error(),
+	}
+	switch {
+	case rollbackErr == nil:
+		details["rollback"] = "restored"
+	case errors.Is(rollbackErr, errPolicySettingsSuperseded):
+		details["rollback"] = "superseded"
+	default:
+		details["rollback"] = "failed"
+		details["rollback_error"] = rollbackErr.Error()
+	}
+	h.audit(r, "policy.settings_save", details)
+
+	if rollbackErr != nil && !errors.Is(rollbackErr, errPolicySettingsSuperseded) {
+		slog.Error("Policy settings rollback failed after activation failure; durable settings and the running policy may disagree",
+			"rollback_err", rollbackErr, "activation_err", activationErr,
+			"enabled", written.Enabled, "preset", string(written.Preset))
+		h.JSONError(w, http.StatusInternalServerError, "state_inconsistent",
+			"Policy activation failed and the rejected settings could not be rolled back: "+rollbackErr.Error()+"; activation error: "+activationErr.Error())
+		return
+	}
+
+	h.JSONError(w, http.StatusUnprocessableEntity, "activation_failed", activationErr.Error())
 }
 
 // decodePolicyPut reads and validates the request body. It writes the error

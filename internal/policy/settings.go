@@ -100,6 +100,21 @@ func (s Settings) Interval() time.Duration {
 	return time.Duration(s.SyncInterval) * time.Second
 }
 
+// IsZero reports whether the record says nothing at all.
+//
+// An absent settings row deserializes to this value, so "zero" is the
+// fresh-install state: policy routing disabled, no source selected. Three
+// callers need exactly that distinction — the admin handler's loader, the
+// panel's startup loader, and the compensation path that must restore "no
+// record" rather than materialize a default one — so the predicate lives with
+// the type instead of being repeated as a field-by-field comparison.
+//
+// Settings contains a slice and is therefore not comparable with ==, which is
+// why this exists rather than a comparison at each call site.
+func (s Settings) IsZero() bool {
+	return s.Preset == "" && !s.Enabled && s.SyncInterval == 0 && len(s.CustomURLs) == 0
+}
+
 // Validate reports whether the configuration may be persisted. A nil result
 // means the record is internally coherent and every URL is fetchable under the
 // same SSRF rules the fetcher enforces.

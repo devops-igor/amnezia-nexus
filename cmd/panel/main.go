@@ -143,9 +143,9 @@ func loadPolicySettings(ctx context.Context, db *database.DB) (policy.Settings, 
 	if err := db.GetSetting(ctx, policy.SettingsKey, &stored); err != nil {
 		return settings, err
 	}
-	// Settings contains a slice and is not comparable, so emptiness is checked
-	// field by field. An absent row leaves the target untouched.
-	if stored.Preset == "" && !stored.Enabled && stored.SyncInterval == 0 && len(stored.CustomURLs) == 0 {
+	// An absent row leaves the target untouched. A row that says nothing at all
+	// is the same fresh-install state, so both yield the disabled default.
+	if stored.IsZero() {
 		return settings, nil
 	}
 	return stored.Normalize(), nil

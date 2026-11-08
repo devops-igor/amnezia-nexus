@@ -125,7 +125,6 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 	if live := s.policyRuntime(); live != nil && live.matcher != nil {
 		return s.updateLivePolicyRouting(ctx, live.matcher, store, cfg, settings, presetID)
 	}
-
 	matcher := policy.NewMatcher()
 	syncer, err := policy.NewSyncer(matcher, nil, store, cfg)
 	if err != nil {
@@ -212,8 +211,23 @@ func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.M
 // It replaces any previously registered runtime and cancels that runtime's loop
 // first: on a repeated enabled update the old syncer must stop rather than keep
 // polling on a superseded schedule, or every save would leak a fetcher.
+//
+// Lifetime (fix F678-01): the loop must outlive the call that started it. An
+// admin PUT reaches this through the HTTP request context, and that context is
+// canceled the moment the handler returns — by the shipped
+// middleware.OperationTimeout and by net/http's own request lifetime. Deriving
+// it from the request made a *successful* save permanently close the syncer: PBR
+// stayed enabled with stale rules, the periodic refresh stopped and
+// SyncPolicyNow answered ErrSyncerClosed until the process restarted.
+//
+// So the loop is deliberately detached from the caller's cancellation
+// (context.WithoutCancel) and owned by this service instead. Only the
+// synchronous work that produced the snapshot stays bounded by the caller's
+// context; the long-running fetch schedule is stopped by explicit disable or
+// replacement (StopPolicyRouting / a later startPolicyLoop) and by service
+// shutdown (Service.Stop and rollbackStartup call StopPolicyRouting).
 func (s *Service) startPolicyLoop(ctx context.Context, syncer *policy.Syncer, matcher *policy.Matcher, settings policy.Settings, presetID string) {
-	runCtx, runCancel := context.WithCancel(ctx)
+	runCtx, runCancel := context.WithCancel(context.WithoutCancel(ctx))
 	policyRuntimeMu.Lock()
 	old := policyRuntimes[s]
 	policyRuntimes[s] = &policyRuntime{
@@ -301,20 +315,32 @@ func (s *Service) StopPolicyRouting() {
 	policyActivationMu.Lock()
 	defer policyActivationMu.Unlock()
 
+	runtime := s.stopPolicyLoop()
+	if runtime == nil {
+		return
+	}
+	if err := s.TeardownPBR(); err != nil {
+		slog.Warn("PBR teardown error", "err", err)
+	}
+}
+
+// stopPolicyLoop unregisters and cancels the service's policy scheduling loop,
+// returning the runtime it removed.
+//
+// The loop is detached from any request lifetime (see startPolicyLoop), so this
+// is the only thing that stops it. It is called from StopPolicyRouting (explicit
+// disable and replacement) and from service shutdown, which is what keeps the
+// detached lifetime from becoming a process-lifetime goroutine leak.
+func (s *Service) stopPolicyLoop() *policyRuntime {
 	policyRuntimeMu.Lock()
 	runtime := policyRuntimes[s]
 	delete(policyRuntimes, s)
 	policyRuntimeMu.Unlock()
 
-	if runtime == nil {
-		return
-	}
-	if runtime.cancel != nil {
+	if runtime != nil && runtime.cancel != nil {
 		runtime.cancel()
 	}
-	if err := s.TeardownPBR(); err != nil {
-		slog.Warn("PBR teardown error", "err", err)
-	}
+	return runtime
 }
 
 func (s *Service) policyRuntime() *policyRuntime {
