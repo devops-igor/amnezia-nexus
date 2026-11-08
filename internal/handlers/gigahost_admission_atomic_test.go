@@ -309,7 +309,7 @@ func TestReservationIsReleasedOnEveryTerminalPath(t *testing.T) {
 			// irrelevant, in_flight must be false.
 			h.admission().mu.Lock()
 			entry, present := h.admission().entries["admin-x"]
-			inFlight := present && entry.inFlight
+			inFlight := present && entry.activeToken != 0
 			h.admission().mu.Unlock()
 			if inFlight {
 				t.Fatal("the reservation leaked: in_flight is still true after a terminal failure")
@@ -352,7 +352,7 @@ func TestEvictIfFullBoundedFallback(t *testing.T) {
 	for i := 0; i < maxAdmissionEntries; i++ {
 		table.entries[fmt.Sprintf("fresh-%d", i)] = &admissionEntry{failedAt: time.Now()}
 	}
-	table.entries["busy"] = &admissionEntry{inFlight: true}
+	table.entries["busy"] = &admissionEntry{activeToken: 1}
 	table.mu.Unlock()
 
 	h.recordRejectedOrderAttempt("overflow-insert", time.Now())
@@ -456,7 +456,7 @@ func TestPanicDoesNotLeakTheReservation(t *testing.T) {
 
 	h.admission().mu.Lock()
 	entry, present := h.admission().entries["admin-panic"]
-	leaked := present && entry.inFlight
+	leaked := present && entry.activeToken != 0
 	h.admission().mu.Unlock()
 	if leaked {
 		t.Fatal("a panic left the in-flight slot set; this admin would be locked out until restart")
@@ -501,4 +501,96 @@ func (p *purchaseBarrier) GetDeployStatus(ctx context.Context, id string) (*giga
 }
 func (p *purchaseBarrier) GetServers(ctx context.Context) ([]gigahost.ServerInfo, error) {
 	return p.Client.GetServers(ctx)
+}
+
+// TestBoundHoldsWhenAllEntriesInFlight proves the cap is a real bound. The prior
+// implementation inserted before evicting and skipped every in-flight entry while
+// purging, so 256 in-flight admins plus one more reached 257. Eviction now runs
+// before the insert and refuses admission when nothing is evictable.
+func TestBoundHoldsWhenAllEntriesInFlight(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+
+	for i := 0; i < maxAdmissionEntries; i++ {
+		if _, _, _, ok := h.admitToken(fmt.Sprintf("admin-%d", i)); !ok {
+			t.Fatalf("admin-%d was refused before the table was full", i)
+		}
+	}
+	table := h.admission()
+	table.mu.Lock()
+	sizeBefore := len(table.entries)
+	table.mu.Unlock()
+	if sizeBefore != maxAdmissionEntries {
+		t.Fatalf("table held %d entries, want %d", sizeBefore, maxAdmissionEntries)
+	}
+
+	// A distinct 257th admin arrives while every entry is in flight.
+	_, _, _, overflowAdmitted := h.admitToken("admin-overflow")
+
+	table.mu.Lock()
+	sizeAfter := len(table.entries)
+	table.mu.Unlock()
+	if sizeAfter > maxAdmissionEntries {
+		t.Fatalf("table grew to %d entries with cap %d", sizeAfter, maxAdmissionEntries)
+	}
+	if overflowAdmitted {
+		t.Fatal("the 257th concurrent attempt must be refused, not admitted past the bound")
+	}
+	if sizeAfter != maxAdmissionEntries {
+		t.Fatalf("table held %d entries after refusal, want %d", sizeAfter, maxAdmissionEntries)
+	}
+}
+
+// TestStaleTokenCannotClearNewOwnership is the generation-safety contract. The
+// old design returned a raw *admissionEntry, so a late deferred release from a
+// completed attempt cleared a NEW attempt that had reused the same entry, letting
+// a third concurrent attempt in. A token names the generation, so the stale
+// release is a no-op.
+func TestStaleTokenCannotClearNewOwnership(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+
+	token1, _, _, ok1 := h.admitToken("admin-stale")
+	if !ok1 {
+		t.Fatal("attempt 1 must be admitted")
+	}
+	h.releaseToken("admin-stale", token1, "")
+
+	token2, _, _, ok2 := h.admitToken("admin-stale")
+	if !ok2 {
+		t.Fatal("attempt 2 must be admitted after attempt 1 released")
+	}
+	if token1 == token2 {
+		t.Fatalf("attempt tokens must differ, both were %d", token1)
+	}
+
+	// Attempt 1's deferred safety net runs late, with its own now-inactive token,
+	// on the success path (empty kind) that previously cleared ownership.
+	h.releaseToken("admin-stale", token1, "")
+
+	_, _, _, ok3 := h.admitToken("admin-stale")
+	if ok3 {
+		t.Fatalf("a stale token cleared the live attempt's ownership (token1=%d token2=%d): a third concurrent attempt was admitted", token1, token2)
+	}
+
+	// And the live attempt can still release itself normally.
+	h.releaseToken("admin-stale", token2, "")
+	if _, _, _, ok4 := h.admitToken("admin-stale"); !ok4 {
+		t.Fatal("the live owner's own release must free the slot")
+	}
+}
+
+// TestPositionalReleaseAfterSlotFreedDoesNotAffectAnotherAdmin proves releases are
+// scoped to their own admin as well as their own generation.
+func TestPositionalReleaseAfterSlotFreedDoesNotAffectAnotherAdmin(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+
+	tokenA, _, _, _ := h.admitToken("admin-a")
+	tokenB, _, _, _ := h.admitToken("admin-b")
+	if tokenA == tokenB {
+		t.Fatalf("tokens must be unique across admins, both were %d", tokenA)
+	}
+	// A's token must not release B.
+	h.releaseToken("admin-b", tokenA, "")
+	if blocked, _ := h.orderAdmissionBlocked("admin-b"); !blocked {
+		t.Fatal("admin-b's slot was cleared by admin-a's token")
+	}
 }

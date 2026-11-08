@@ -53,18 +53,24 @@ const (
 	failureProviderError   = "provider_error"
 )
 
-// admissionEntry is one admin's state: at most one attempt in flight, plus when
-// and why the last attempt failed.
+// admissionEntry is one admin's state: the token of the attempt currently
+// holding the slot (0 = idle), plus when and why the last attempt failed.
+//
+// Ownership is a TOKEN, not a bool. A bool cannot distinguish "the attempt I
+// released" from "a later attempt that reused this entry", so a deferred release
+// from an old attempt could clear a live attempt's ownership. Comparing the token
+// makes a stale release a genuine no-op.
 type admissionEntry struct {
-	inFlight   bool
-	failedAt   time.Time
-	failedKind string
+	activeToken uint64
+	failedAt    time.Time
+	failedKind  string
 }
 
 // orderAdmission is the per-admin admission table.
 type orderAdmission struct {
-	mu      sync.Mutex
-	entries map[string]*admissionEntry
+	mu        sync.Mutex
+	entries   map[string]*admissionEntry
+	nextToken uint64
 }
 
 // repeatedSubmitCooldown reports the configured suppression window.
@@ -93,26 +99,34 @@ func remainingWindow(entry *admissionEntry) time.Duration {
 
 // evictIfFull keeps the table bounded. Caller holds the lock.
 //
-// Two passes: drop expired idle entries, then - only if still full - drop one
-// arbitrary idle entry. An in-flight entry is never evicted, because that would
-// strand an attempt's release.
-func evictIfFull(table *orderAdmission, keep string) {
+// Called BEFORE inserting the new entry, so the cap holds on return and the
+// caller can refuse admission when nothing is evictable. Two passes: drop expired
+// idle entries, then one idle entry; if every entry is genuinely in flight the
+// oldest attempt is dropped and the caller is told, so the bound is never silently
+// exceeded.
+func evictIfFull(table *orderAdmission, keep string) bool {
 	if len(table.entries) < maxAdmissionEntries {
-		return
+		return true
 	}
 	purge(table, keep, func(entry *admissionEntry) bool {
-		return time.Since(entry.failedAt) > repeatedSubmitWindow
+		return entry.activeToken == 0 && time.Since(entry.failedAt) > repeatedSubmitWindow
 	})
 	if len(table.entries) < maxAdmissionEntries {
-		return
+		return true
 	}
-	purge(table, keep, func(*admissionEntry) bool { return true })
+	purge(table, keep, func(entry *admissionEntry) bool { return entry.activeToken == 0 })
+	if len(table.entries) < maxAdmissionEntries {
+		return true
+	}
+	// Every entry is in flight. The 257th concurrent attempt is refused rather
+	// than growing the table: the bound is a real bound, not an aspiration.
+	return false
 }
 
 // purge removes one matching idle entry. Caller holds the lock.
 func purge(table *orderAdmission, keep string, match func(*admissionEntry) bool) {
 	for key, entry := range table.entries {
-		if key == keep || entry.inFlight || !match(entry) {
+		if key == keep || entry.activeToken != 0 || !match(entry) {
 			continue
 		}
 		delete(table.entries, key)
@@ -120,15 +134,16 @@ func purge(table *orderAdmission, keep string, match func(*admissionEntry) bool)
 	}
 }
 
-// admitAttempt atomically claims the admin's single in-flight slot.
+// admitToken atomically claims the admin's single in-flight slot and returns the
+// token identifying that specific attempt.
 //
-// The check and the claim share one lock, so two concurrent callers can never
-// both be admitted. It performs no provider I/O. On refusal it returns the
-// remaining wait and the prior failure label so the response can explain itself.
-func (h *Handlers) admitAttempt(userID string) (ticket *admissionEntry, wait time.Duration, priorFailure string, ok bool) {
+// The check, the token issuance and the claim share one lock, so two concurrent
+// callers can never both be admitted and each admitted attempt owns a distinct
+// generation. It performs no provider I/O.
+func (h *Handlers) admitToken(userID string) (token uint64, wait time.Duration, priorFailure string, ok bool) {
 	if userID == "" {
-		// No stable identity: never throttle. A nil ticket needs no release.
-		return nil, 0, "", true
+		// No stable identity: never throttle. Token 0 needs no release.
+		return 0, 0, "", true
 	}
 	table := h.admission()
 	table.mu.Lock()
@@ -136,42 +151,51 @@ func (h *Handlers) admitAttempt(userID string) (ticket *admissionEntry, wait tim
 
 	entry, present := table.entries[userID]
 	if !present {
+		// Evict BEFORE inserting so the cap holds on return.
+		if !evictIfFull(table, userID) {
+			return 0, 0, "", false
+		}
 		entry = &admissionEntry{}
 		table.entries[userID] = entry
-		evictIfFull(table, userID)
 	}
-	if entry.inFlight {
-		return nil, remainingWindow(entry), entry.failedKind, false
+	if entry.activeToken != 0 {
+		return 0, remainingWindow(entry), entry.failedKind, false
 	}
 	if left := remainingWindow(entry); left > 0 {
-		return nil, left, entry.failedKind, false
+		return 0, left, entry.failedKind, false
 	}
-	entry.inFlight = true
-	return entry, 0, "", true
+	table.nextToken++
+	if table.nextToken == 0 {
+		// 0 is the idle sentinel; skip it on wrap. Unreachable in practice.
+		table.nextToken++
+	}
+	entry.activeToken = table.nextToken
+	return entry.activeToken, 0, "", true
 }
 
-// releaseAttempt ends an attempt. A non-empty failureKind arms the cooldown; an
-// empty one clears it. It is idempotent: releasing an already-released ticket is a
-// no-op, so the deferred safety net can coexist with explicit releases on the
-// paths that finish the purchase cycle.
-func (h *Handlers) releaseAttempt(ticket *admissionEntry, failureKind string) {
-	if ticket == nil {
+// releaseToken ends the attempt that owns token. It is generation-safe: a release
+// carrying a token that is no longer active (a late deferred call from an earlier
+// attempt that has since been superseded) is a no-op, so it cannot clear a live
+// attempt's ownership.
+func (h *Handlers) releaseToken(userID string, token uint64, failureKind string) {
+	if userID == "" || token == 0 {
 		return
 	}
 	table := h.admission()
 	table.mu.Lock()
 	defer table.mu.Unlock()
-	if !ticket.inFlight {
+	entry, present := table.entries[userID]
+	if !present || entry.activeToken != token {
 		return
 	}
-	ticket.inFlight = false
+	entry.activeToken = 0
 	if failureKind == "" {
-		ticket.failedAt = time.Time{}
-		ticket.failedKind = ""
+		entry.failedAt = time.Time{}
+		entry.failedKind = ""
 		return
 	}
-	ticket.failedAt = time.Now()
-	ticket.failedKind = failureKind
+	entry.failedAt = time.Now()
+	entry.failedKind = failureKind
 }
 
 // orderAdmissionBlocked reports whether the admin must wait, and for how long.
@@ -186,7 +210,7 @@ func (h *Handlers) orderAdmissionBlocked(userID string) (bool, time.Duration) {
 	if !present {
 		return false, 0
 	}
-	if entry.inFlight {
+	if entry.activeToken != 0 {
 		return true, 0
 	}
 	left := remainingWindow(entry)

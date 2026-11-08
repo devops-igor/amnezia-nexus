@@ -434,19 +434,20 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	// the first is blocked on the network. It is released on every terminal path
 	// below; no mutex is held across a provider call.
 	adminID := sess.UserID
-	ticket, _, _, admitted := h.admitAttempt(adminID)
+	token, _, _, admitted := h.admitToken(adminID)
 	if !admitted {
 		h.suppressionWriting(w, adminID)
 		return
 	}
 
 	// The reservation must survive a panic: the middleware recovers, but a slot
-	// left set would lock this admin out until restart. releaseAttempt is
-	// idempotent, so this deferred net and the explicit releases below cannot
-	// double-release, and no path can leak the slot.
+	// left set would lock this admin out until restart. releaseToken is
+	// generation-safe - a late call from this attempt cannot clear a later
+	// attempt's ownership - so the deferred net and the explicit releases below
+	// cannot interfere with each other.
 	failureKind := failureProviderError
 	releaseOnAbort := func(kind string) {
-		h.releaseAttempt(ticket, kind)
+		h.releaseToken(adminID, token, kind)
 	}
 	defer func() { releaseOnAbort(failureKind) }()
 
