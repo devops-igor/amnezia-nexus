@@ -289,7 +289,7 @@ func TestXrayConfig_CryptoAndURI(t *testing.T) {
 	clients := []XrayClient{
 		{ID: "c1-uuid", Flow: "xtls-rprx-vision", Email: "alice"},
 	}
-	cfgBytes, err := RenderXrayConfig(443, 54321, "www.microsoft.com", "www.microsoft.com:443", privB64, []string{sid}, clients)
+	cfgBytes, err := RenderXrayConfig(443, "www.microsoft.com", "www.microsoft.com:443", privB64, []string{sid}, clients)
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}

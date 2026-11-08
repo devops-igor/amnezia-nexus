@@ -14,21 +14,14 @@ import (
 	"github.com/google/uuid"
 )
 
-type muxContextKeyType struct{}
-
-var muxContextKey = muxContextKeyType{}
-
-// WithMuxContext returns a new context with the mux setting explicitly specified.
-func WithMuxContext(ctx context.Context, mux bool) context.Context {
-	return context.WithValue(ctx, muxContextKey, mux)
-}
-
-func resolveMuxSetting(ctx context.Context, server *models.Server) bool {
-	if ctx != nil {
-		if val, ok := ctx.Value(muxContextKey).(bool); ok {
-			return val
-		}
-	}
+// resolveMuxPreference reports the operator's stored mux preference for a server.
+//
+// This is recorded metadata only, never a transport directive: VLESS + XTLS Vision
+// cannot carry TCP mux.cool (xray: "common/mux: unexpected network TCP") and there is
+// no interoperable share-link spelling for mux, so BuildVLESSURI deliberately does not
+// serialize it. The accessor is kept so the preference survives a read-modify-write and
+// so callers can surface it; enabling mux will require a transport that supports it.
+func resolveMuxPreference(server *models.Server) bool {
 	if server == nil || server.Protocols == nil {
 		return false
 	}
@@ -200,7 +193,10 @@ func (m *XrayManager) AddClient(ctx context.Context, server *models.Server, clie
 	port := cfg.Inbounds[0].Port
 	host := server.Host
 
-	mux := resolveMuxSetting(ctx, server)
+	// The operator's mux preference is reported, not applied: it is recorded in the
+	// returned metadata so the setting survives, but BuildVLESSURI does not serialize
+	// it (see resolveMuxPreference for why).
+	mux := resolveMuxPreference(server)
 	if clientParams != nil {
 		if m, ok := clientParams["mux"].(bool); ok {
 			mux = m
@@ -209,7 +205,7 @@ func (m *XrayManager) AddClient(ctx context.Context, server *models.Server, clie
 		}
 	}
 
-	vlessURI, err := BuildVLESSURI(host, port, clientID, name, serverName, pubKey, shortID, flow, mux)
+	vlessURI, err := BuildVLESSURI(host, port, clientID, name, serverName, pubKey, shortID, flow)
 	if err != nil {
 		return nil, fmt.Errorf("build vless URI: %w", err)
 	}
@@ -359,8 +355,6 @@ func (m *XrayManager) GetClientConfig(ctx context.Context, server *models.Server
 		return "", fmt.Errorf("derive reality public key: %w", err)
 	}
 
-	mux := resolveMuxSetting(ctx, server)
-
 	return BuildVLESSURI(
 		server.Host,
 		cfg.Inbounds[0].Port,
@@ -370,18 +364,5 @@ func (m *XrayManager) GetClientConfig(ctx context.Context, server *models.Server
 		pubKey,
 		shortID,
 		foundClient.Flow,
-		mux,
 	)
-}
-
-// GetClientConfigWithParams reconstructs the vless:// connection URI supporting per-client parameters like mux.
-func (m *XrayManager) GetClientConfigWithParams(ctx context.Context, server *models.Server, clientID string, clientParams map[string]any) (string, error) {
-	if clientParams != nil {
-		if m, ok := clientParams["mux"].(bool); ok {
-			ctx = WithMuxContext(ctx, m)
-		} else if m, ok := clientParams["mux"].(string); ok {
-			ctx = WithMuxContext(ctx, strings.EqualFold(m, "true"))
-		}
-	}
-	return m.GetClientConfig(ctx, server, clientID)
 }

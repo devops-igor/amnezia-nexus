@@ -137,7 +137,7 @@ function openInstallModal(proto) {
         portLabel.textContent = _('port') + ' (TCP)';
         portInput.value = '443';
         portInput.disabled = false;
-        portHint.textContent = 'Port 443 TCP (REALITY) + 54321 (Vision)';
+        portHint.textContent = _('port_vless_hint');
         if (vlessOpts) vlessOpts.style.display = 'block';
     } else if (proto === 'naive') {
         portLabel.textContent = _('port') + ' (TCP)';

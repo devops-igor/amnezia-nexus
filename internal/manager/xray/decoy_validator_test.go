@@ -213,7 +213,7 @@ func TestRenderXrayConfig_SinglePortStrictEnforcement(t *testing.T) {
 	}
 
 	// 1. Rendering must only produce a single inbound on portPrimary (443)
-	cfgBytes, err := RenderXrayConfig(443, 54321, "www.microsoft.com", "www.microsoft.com:443", privB64, nil, []XrayClient{})
+	cfgBytes, err := RenderXrayConfig(443, "www.microsoft.com", "www.microsoft.com:443", privB64, nil, []XrayClient{})
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -244,13 +244,13 @@ func TestRenderXrayConfig_SinglePortStrictEnforcement(t *testing.T) {
 	}
 
 	// 2. Reject blacklisted SNI
-	_, err = RenderXrayConfig(443, 54321, "gateway.icloud.com", "", privB64, nil, nil)
+	_, err = RenderXrayConfig(443, "gateway.icloud.com", "", privB64, nil, nil)
 	if err == nil {
 		t.Fatalf("expected error when rendering config with blacklisted SNI, got nil")
 	}
 
 	// 3. Default SNI when empty must be www.microsoft.com
-	cfgDefault, err := RenderXrayConfig(443, 54321, "", "", privB64, nil, nil)
+	cfgDefault, err := RenderXrayConfig(443, "", "", privB64, nil, nil)
 	if err != nil {
 		t.Fatalf("RenderXrayConfig with empty SNI: %v", err)
 	}
@@ -264,31 +264,35 @@ func TestRenderXrayConfig_SinglePortStrictEnforcement(t *testing.T) {
 	}
 }
 
-func TestBuildVLESSURI_Mux(t *testing.T) {
-	// 1. Without mux
+func TestBuildVLESSURI_MuxNotSerialized(t *testing.T) {
+	// VLESS + XTLS Vision rejects TCP mux.cool ("common/mux: unexpected network TCP") and
+	// there is no interoperable share-link spelling for mux, so the URI must not carry it.
+	// The mux argument is accepted for API compatibility but must never leak into the link.
 	uriNoMux, err := BuildVLESSURI("192.0.2.1", 443, "uuid-123", "alice", "www.microsoft.com", "pubkey", "sid123", "xtls-rprx-vision")
 	if err != nil {
 		t.Fatalf("BuildVLESSURI without mux: %v", err)
 	}
-	parsedNoMux, err := url.Parse(uriNoMux)
-	if err != nil {
-		t.Fatalf("url.Parse: %v", err)
-	}
-	if parsedNoMux.Query().Get("mux") != "" {
-		t.Errorf("expected no mux query param, got %q", parsedNoMux.Query().Get("mux"))
-	}
-
-	// 2. With mux = true
 	uriMux, err := BuildVLESSURI("192.0.2.1", 443, "uuid-123", "alice", "www.microsoft.com", "pubkey", "sid123", "xtls-rprx-vision", true)
 	if err != nil {
 		t.Fatalf("BuildVLESSURI with mux: %v", err)
 	}
-	parsedMux, err := url.Parse(uriMux)
+	if uriNoMux != uriMux {
+		t.Errorf("mux argument must not change the URI:\n no-mux: %s\n    mux: %s", uriNoMux, uriMux)
+	}
+
+	parsed, err := url.Parse(uriMux)
 	if err != nil {
 		t.Fatalf("url.Parse: %v", err)
 	}
-	if parsedMux.Query().Get("mux") != "true" {
-		t.Errorf("expected mux=true, got %q", parsedMux.Query().Get("mux"))
+	if got := parsed.Query().Get("mux"); got != "" {
+		t.Errorf("expected no mux query param, got %q", got)
+	}
+	// The real contract that must survive: REALITY + Vision parameters.
+	if got := parsed.Query().Get("security"); got != "reality" {
+		t.Errorf("security = %q, want reality", got)
+	}
+	if got := parsed.Query().Get("flow"); got != "xtls-rprx-vision" {
+		t.Errorf("flow = %q, want xtls-rprx-vision", got)
 	}
 }
 
@@ -322,7 +326,7 @@ func TestGetClientConfig_MuxAndRotation(t *testing.T) {
 		{ID: "client-uuid-2", Email: "client-uuid-2", Flow: "xtls-rprx-vision"},
 	}
 
-	cfgBytes, err := RenderXrayConfig(443, 54321, "www.microsoft.com", "www.microsoft.com:443", privB64, pool, cls)
+	cfgBytes, err := RenderXrayConfig(443, "www.microsoft.com", "www.microsoft.com:443", privB64, pool, cls)
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -338,9 +342,10 @@ func TestGetClientConfig_MuxAndRotation(t *testing.T) {
 		t.Fatalf("url.Parse: %v", err)
 	}
 
-	// Verify mux=true was picked up from server.Protocols["vless"]["mux"]
-	if parsed1.Query().Get("mux") != "true" {
-		t.Errorf("expected mux=true in client URI, got %q", parsed1.Query().Get("mux"))
+	// mux must NOT appear in the link even though server.Protocols["vless"]["mux"] is true:
+	// VLESS+Vision rejects TCP mux.cool and there is no interoperable URI spelling for it.
+	if got := parsed1.Query().Get("mux"); got != "" {
+		t.Errorf("mux preference leaked into client URI: mux=%q", got)
 	}
 	if parsed1.Query().Get("pbk") != pubB64 {
 		t.Errorf("expected pubKey %q, got %q", pubB64, parsed1.Query().Get("pbk"))
@@ -362,17 +367,20 @@ func TestGetClientConfig_MuxAndRotation(t *testing.T) {
 		t.Errorf("expected non-empty shortIDs, got sid1=%q sid2=%q", sid1, sid2)
 	}
 
-	// Context override: disable mux
-	ctxNoMux := WithMuxContext(ctx, false)
-	uriNoMux, err := mgr.GetClientConfig(ctxNoMux, server, "client-uuid-1")
+	// mux is server metadata only and is never serialized into the client URI, so the
+	// link must be stable across calls even though server.Protocols["mux"] is true.
+	uriAgain, err := mgr.GetClientConfig(ctx, server, "client-uuid-1")
 	if err != nil {
-		t.Fatalf("GetClientConfig with ctxNoMux: %v", err)
+		t.Fatalf("GetClientConfig second call: %v", err)
 	}
-	parsedNoMux, err := url.Parse(uriNoMux)
+	if uri1 != uriAgain {
+		t.Errorf("expected stable URI across calls, got %q vs %q", uri1, uriAgain)
+	}
+	parsedAgain, err := url.Parse(uriAgain)
 	if err != nil {
 		t.Fatalf("url.Parse: %v", err)
 	}
-	if parsedNoMux.Query().Get("mux") != "" {
-		t.Errorf("expected no mux query param with false context, got %q", parsedNoMux.Query().Get("mux"))
+	if parsedAgain.Query().Get("mux") != "" {
+		t.Errorf("expected no mux query param, got %q", parsedAgain.Query().Get("mux"))
 	}
 }

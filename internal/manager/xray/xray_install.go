@@ -16,153 +16,28 @@ import (
 	"github.com/google/uuid"
 )
 
-func extractVLESSOptions(vo any) (portStr, serverName, flow string, flowSpecified bool) {
-	switch opt := vo.(type) {
-	case *models.VLESSInstallOptions:
-		if opt != nil {
-			return opt.Port, opt.ServerName, opt.Flow, opt.FlowSet || opt.Flow != ""
-		}
-	case models.VLESSInstallOptions:
-		return opt.Port, opt.ServerName, opt.Flow, opt.FlowSet || opt.Flow != ""
-	case map[string]any:
-		p, _ := opt["port"].(string)
-		sn, _ := opt["server_name"].(string)
-		fl, ok := opt["flow"].(string)
-		return p, sn, fl, ok
+// validateDecoyForInstall bounds decoy validation (which performs DNS lookups) so a
+// slow or blackholed resolver cannot stall an install. Validation failure is fatal:
+// an operator-supplied decoy that cannot be verified is rejected rather than
+// silently accepted, because a wrong decoy is exactly the camouflage mismatch the
+// hardening is meant to prevent.
+func validateDecoyForInstall(ctx context.Context, serverName string, server *models.Server) error {
+	serverHost := ""
+	if server != nil {
+		serverHost = server.Host
 	}
-	return "", "", "", false
-}
-
-func resolveInstallNetworkOptions(params map[string]any) (int, string, string, bool, bool, bool) {
-	portPrimary := 443
-	hasPort := false
-	if p, ok := params["port"]; ok && fmt.Sprint(p) != "" {
-		if pInt, err := strconv.Atoi(fmt.Sprint(p)); err == nil && pInt > 0 {
-			portPrimary = pInt
-			hasPort = true
-		}
+	vCtx, cancel := context.WithTimeout(ctx, decoyValidationTimeout)
+	defer cancel()
+	if err := ValidateDecoyDomainContext(vCtx, serverName, serverHost, nil); err != nil {
+		return fmt.Errorf("reject decoy domain %q: %w", serverName, err)
 	}
-
-	serverName := DefaultDecoyDomain
-	hasServerName := false
-	flow := "xtls-rprx-vision"
-	hasFlow := false
-
-	if sn, ok := params["server_name"]; ok && fmt.Sprint(sn) != "" {
-		serverName = fmt.Sprint(sn)
-		hasServerName = true
-	}
-	if f, ok := params["flow"]; ok {
-		flow = fmt.Sprint(f)
-		hasFlow = true
-	}
-	if vo, ok := params["vless_options"]; ok && vo != nil {
-		pStr, sn, fl, flSet := extractVLESSOptions(vo)
-		if pStr != "" {
-			if pInt, err := strconv.Atoi(pStr); err == nil && pInt > 0 {
-				portPrimary = pInt
-				hasPort = true
-			}
-		}
-		if sn != "" {
-			serverName = sn
-			hasServerName = true
-		}
-		if flSet {
-			flow = fl
-			hasFlow = true
-		}
-	}
-	if flow == "none" {
-		flow = ""
-	}
-	if exp, ok := params["port_explicit"].(bool); ok {
-		hasPort = exp
-	}
-	return portPrimary, serverName, flow, hasPort, hasServerName, hasFlow
-}
-
-func detectRunningEngineProfile(ctx context.Context, client ssh.SSHClient) string {
-	if client == nil {
-		return ""
-	}
-	verCmd := fmt.Sprintf("docker exec %s xray version 2>/dev/null", ssh.EscapeShellArg(XrayContainerName))
-	if verOut, _, code, err := client.RunSudoCommand(ctx, verCmd); err == nil && code == 0 && strings.TrimSpace(verOut) != "" {
-		fields := strings.Fields(strings.TrimSpace(verOut))
-		if len(fields) >= 2 && strings.EqualFold(fields[0], "Xray") {
-			ver := fields[1]
-			if strings.HasPrefix(ver, "26.10.") || strings.HasPrefix(ver, "v26.10.") {
-				return string(EngineProfileModernPQ)
-			}
-			if strings.HasPrefix(ver, "1.8.") || strings.HasPrefix(ver, "v1.8.") {
-				return string(EngineProfileLegacy)
-			}
-		}
-	}
-
-	imgCmd := fmt.Sprintf("docker inspect -f '{{.Config.Image}}' %s 2>/dev/null", ssh.EscapeShellArg(XrayContainerName))
-	if imgOut, _, code, err := client.RunSudoCommand(ctx, imgCmd); err == nil && code == 0 && strings.TrimSpace(imgOut) != "" {
-		img := strings.TrimSpace(imgOut)
-		if strings.Contains(img, "26.10.") {
-			return string(EngineProfileModernPQ)
-		}
-		if strings.Contains(img, "1.8.") {
-			return string(EngineProfileLegacy)
-		}
-	}
-	return ""
-}
-
-func resolveInstallProfileParam(ctx context.Context, client ssh.SSHClient, params map[string]any, server *models.Server) string {
-	keys := []string{"engine_profile", "profile", "engine_version"}
-	for _, k := range keys {
-		if p, ok := params[k]; ok && fmt.Sprint(p) != "" {
-			return fmt.Sprint(p)
-		}
-	}
-	if vo, ok := params["vless_options"]; ok && vo != nil {
-		switch v := vo.(type) {
-		case map[string]any:
-			for _, k := range []string{"engine_profile", "profile"} {
-				if p, ok := v[k]; ok && fmt.Sprint(p) != "" {
-					return fmt.Sprint(p)
-				}
-			}
-		case *models.VLESSInstallOptions:
-			if v != nil && v.EngineProfile != "" {
-				return v.EngineProfile
-			}
-		case models.VLESSInstallOptions:
-			if v.EngineProfile != "" {
-				return v.EngineProfile
-			}
-		}
-	}
-	if server != nil && server.Protocols != nil {
-		if vMeta, ok := server.Protocols[models.ProtocolVLESS].(map[string]any); ok {
-			for _, k := range []string{"engine_profile", "engine_version"} {
-				if val, ok := vMeta[k].(string); ok && val != "" {
-					return val
-				}
-			}
-		}
-	}
-	if client != nil {
-		if detected := detectRunningEngineProfile(ctx, client); detected != "" {
-			return detected
-		}
-	}
-	return ""
+	return nil
 }
 
 func parseXrayInstallOptions(ctx context.Context, client ssh.SSHClient, params map[string]any, server *models.Server) (int, string, string, bool, bool, bool, EngineProfileInfo, error) {
 	portPrimary, serverName, flow, hasPort, hasServerName, hasFlow := resolveInstallNetworkOptions(params)
 	if hasServerName {
-		serverHost := ""
-		if server != nil {
-			serverHost = server.Host
-		}
-		if err := ValidateDecoyDomain(serverName, serverHost, nil); err != nil {
+		if err := validateDecoyForInstall(ctx, serverName, server); err != nil {
 			return 0, "", "", false, false, false, EngineProfileInfo{}, err
 		}
 	}
@@ -699,9 +574,8 @@ func (m *XrayManager) prepareConfigBytes(
 	server *models.Server,
 ) ([]byte, int, string, string, []XrayClient, error) {
 	if existingCfgBytes == nil || existingParsed == nil || len(existingParsed.Inbounds) == 0 {
-		portHigh := 54321
 		dest := netJoinHostPort(serverName, "443")
-		rendered, err := RenderXrayConfig(portPrimary, portHigh, serverName, dest, privB64, shortIDs, clients)
+		rendered, err := RenderXrayConfig(portPrimary, serverName, dest, privB64, shortIDs, clients)
 		if err != nil {
 			return nil, 0, "", "", nil, fmt.Errorf("render xray config: %w", err)
 		}
@@ -745,44 +619,108 @@ func (m *XrayManager) prepareConfigBytes(
 	return updated, portPrimary, serverName, flow, clients, nil
 }
 
+// updateExistingConfig rewrites the primary REALITY inbound in place, leaving every
+// other inbound untouched.
+//
+// The previous implementation assigned doc["inbounds"] = inbounds[:1], which silently
+// deleted every inbound after index 0 — including inbounds this manager never created.
+// That is destructive for any operator who added their own inbounds, so the rewrite is
+// now scoped to the single REALITY inbound that this feature owns: the auxiliary
+// non-443 REALITY mirror (the port-54321 leak) is dropped, everything else is preserved
+// and order is retained.
 func updateExistingConfig(existingCfgBytes []byte, portPrimary int, serverName, flow string, portChanged, sniChanged, flowChanged bool) ([]byte, error) {
 	var doc map[string]any
 	if err := json.Unmarshal(existingCfgBytes, &doc); err != nil {
 		return nil, fmt.Errorf("unmarshal existing xray config: %w", err)
 	}
-	if inbounds, ok := doc["inbounds"].([]any); ok && len(inbounds) > 0 {
-		// Strictly enforce single inbound on portPrimary, removing auxiliary REALITY inbounds
-		doc["inbounds"] = inbounds[:1]
-		if in0, ok := inbounds[0].(map[string]any); ok {
-			if portChanged {
-				in0["port"] = portPrimary
-			}
-			if sniChanged {
-				if ss, ok := in0["streamSettings"].(map[string]any); ok {
-					if rs, ok := ss["realitySettings"].(map[string]any); ok {
-						rs["serverNames"] = []any{serverName}
-						rs["dest"] = netJoinHostPort(serverName, "443")
-					}
-				}
-			}
-			if flowChanged {
-				if settings, ok := in0["settings"].(map[string]any); ok {
-					if cls, ok := settings["clients"].([]any); ok {
-						for _, c := range cls {
-							if cm, ok := c.(map[string]any); ok {
-								cm["flow"] = flow
-							}
-						}
-					}
-				}
-			}
-		}
+	rawInbounds, ok := doc["inbounds"].([]any)
+	if !ok || len(rawInbounds) == 0 {
+		return nil, errors.New("existing xray config has no inbounds to update")
 	}
+
+	kept := make([]any, 0, len(rawInbounds))
+	primaryUpdated := false
+	for idx, raw := range rawInbounds {
+		in0, isObj := raw.(map[string]any)
+		if !isObj {
+			kept = append(kept, raw)
+			continue
+		}
+		if idx > 0 && isAuxiliaryRealityInbound(in0, portPrimary) {
+			// Drop the auxiliary REALITY mirror that leaks proxying on a high port.
+			continue
+		}
+		if idx == 0 {
+			applyPrimaryInboundUpdates(in0, portPrimary, serverName, flow, portChanged, sniChanged, flowChanged)
+			primaryUpdated = true
+		}
+		kept = append(kept, in0)
+	}
+	if !primaryUpdated {
+		return nil, errors.New("existing xray config primary inbound is not an object")
+	}
+	doc["inbounds"] = kept
+
 	updated, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal updated xray config: %w", err)
 	}
 	return updated, nil
+}
+
+// isAuxiliaryRealityInbound reports whether in0 is a REALITY inbound on a port other than
+// the primary one. Only these are removed; any other protocol or plaintext inbound is kept.
+func isAuxiliaryRealityInbound(in0 map[string]any, portPrimary int) bool {
+	if port, ok := inboundPort(in0); ok && port == portPrimary {
+		return false
+	}
+	ss, ok := in0["streamSettings"].(map[string]any)
+	if !ok {
+		return false
+	}
+	security, _ := ss["security"].(string)
+	return strings.EqualFold(security, "reality")
+}
+
+// inboundPort extracts the numeric inbound port, tolerating JSON numbers and strings.
+func inboundPort(in0 map[string]any) (int, bool) {
+	switch p := in0["port"].(type) {
+	case float64:
+		return int(p), true
+	case int:
+		return p, true
+	case string:
+		if v, err := strconv.Atoi(strings.TrimSpace(p)); err == nil {
+			return v, true
+		}
+	}
+	return 0, false
+}
+
+// applyPrimaryInboundUpdates applies the requested port/SNI/flow changes to the primary inbound.
+func applyPrimaryInboundUpdates(in0 map[string]any, portPrimary int, serverName, flow string, portChanged, sniChanged, flowChanged bool) {
+	if portChanged {
+		in0["port"] = portPrimary
+	}
+	if sniChanged {
+		if ss, ok := in0["streamSettings"].(map[string]any); ok {
+			if rs, ok := ss["realitySettings"].(map[string]any); ok {
+				rs["serverNames"] = []any{serverName}
+				rs["dest"] = netJoinHostPort(serverName, "443")
+			}
+		}
+	}
+	if flowChanged {
+		if settings, ok := in0["settings"].(map[string]any); ok {
+			if cls, ok := settings["clients"].([]any); ok {
+				for _, c := range cls {
+					if cm, ok := c.(map[string]any); ok {
+						cm["flow"] = flow
+					}
+				}
+			}
+		}
+	}
 }
 
 func determineRunningEngineVersion(ctx context.Context, client ssh.SSHClient) string {
@@ -999,34 +937,4 @@ func netJoinHostPort(host, port string) string {
 		return host
 	}
 	return fmt.Sprintf("%s:%s", host, port)
-}
-
-func parseMuxParam(params map[string]any) (bool, bool) {
-	if params == nil {
-		return false, false
-	}
-	if m, ok := params["mux"].(bool); ok {
-		return m, true
-	}
-	if m, ok := params["mux"].(string); ok {
-		return strings.EqualFold(m, "true"), true
-	}
-	switch vo := params["vless_options"].(type) {
-	case map[string]any:
-		if m, ok := vo["mux"].(bool); ok {
-			return m, true
-		}
-		if m, ok := vo["mux"].(string); ok {
-			return strings.EqualFold(m, "true"), true
-		}
-	case *models.VLESSInstallOptions:
-		if vo != nil && vo.Mux != nil {
-			return *vo.Mux, true
-		}
-	case models.VLESSInstallOptions:
-		if vo.Mux != nil {
-			return *vo.Mux, true
-		}
-	}
-	return false, false
 }

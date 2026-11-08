@@ -806,7 +806,7 @@ func TestXrayManager_Reinstall_FailedDetection_InvalidatesRunningVersion(t *test
 	if err != nil {
 		t.Fatalf("GenerateRealityKeypair failed: %v", err)
 	}
-	renderedCfg, err := xray.RenderXrayConfig(443, 54321, "example.com", "example.com:443", priv, []string{"0123456789abcdef"}, nil)
+	renderedCfg, err := xray.RenderXrayConfig(443, "example.com", "example.com:443", priv, []string{"0123456789abcdef"}, nil)
 	if err != nil {
 		t.Fatalf("RenderXrayConfig failed: %v", err)
 	}

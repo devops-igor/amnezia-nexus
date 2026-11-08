@@ -141,9 +141,12 @@ func GenerateShortIDPool(count int) ([]string, error) {
 }
 
 // RenderXrayConfig generates a production-hardened xray.json configuration.
+//
+// Exactly one REALITY inbound is emitted, on portPrimary. The former auxiliary
+// high-port mirror is gone: a REALITY fallback on a non-standard port leaks
+// cryptographic proof of proxying to any active scanner that reaches it.
 func RenderXrayConfig(
 	portPrimary int,
-	portHigh int,
 	sni string,
 	dest string,
 	realityPrivKey string,
@@ -240,6 +243,17 @@ func ParseXrayConfig(data []byte) (*XrayConfig, error) {
 }
 
 // BuildVLESSURI constructs a standard client vless:// URI.
+//
+// muxOpts is retained as an explicit parameter so callers do not silently drop an
+// operator's mux preference, but no "mux" query parameter is emitted. VLESS + XTLS
+// Vision (the flow every client of this manager uses) rejects TCP mux.cool: xray
+// answers the mux handshake with "common/mux: unexpected network TCP" and the tunnel
+// passes no traffic. There is also no interoperable share-link spelling for mux —
+// sing-box's own VLESS URL parser set is (protocol, max_connections, min_streams,
+// max_streams) and clients that model it reject "mux" outright. Emitting it would
+// therefore publish a link that either fails to import or breaks the tunnel, so the
+// preference stays in server metadata and out of the URI until a contract-backed
+// transport exists.
 func BuildVLESSURI(
 	host string,
 	port int,
@@ -249,7 +263,7 @@ func BuildVLESSURI(
 	pbk string,
 	sid string,
 	flow string,
-	opts ...bool,
+	muxOpts ...bool,
 ) (string, error) {
 	if host == "" {
 		return "", errors.New("host cannot be empty")
@@ -263,11 +277,8 @@ func BuildVLESSURI(
 	if sni == "" {
 		sni = DefaultDecoyDomain
 	}
-
-	mux := false
-	if len(opts) > 0 && opts[0] {
-		mux = true
-	}
+	// muxOpts[0] is intentionally not serialized; see the doc comment above.
+	_ = len(muxOpts) > 0 && muxOpts[0]
 
 	query := url.Values{}
 	query.Set("security", "reality")
@@ -280,9 +291,6 @@ func BuildVLESSURI(
 	query.Set("type", "tcp")
 	if flow != "" && flow != "none" {
 		query.Set("flow", flow)
-	}
-	if mux {
-		query.Set("mux", "true")
 	}
 
 	u := url.URL{

@@ -17,15 +17,16 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
+// muxCaptureMockManager records the context it was handed and returns a real VLESS URI
+// built by the production builder, so the test exercises the actual URI contract rather
+// than a hand-rolled string.
 type muxCaptureMockManager struct {
-	proto          string
-	capturedParams map[string]any
-	capturedCtx    context.Context
+	proto       string
+	capturedCtx context.Context
 }
 
 func (m *muxCaptureMockManager) Protocol() string { return m.proto }
 func (m *muxCaptureMockManager) Install(ctx context.Context, server *models.Server, params map[string]any) error {
-	m.capturedParams = params
 	if server.Protocols == nil {
 		server.Protocols = make(map[string]any)
 	}
@@ -52,18 +53,15 @@ func (m *muxCaptureMockManager) RemoveClient(ctx context.Context, server *models
 }
 func (m *muxCaptureMockManager) GetClientConfig(ctx context.Context, server *models.Server, clientID string) (string, error) {
 	m.capturedCtx = ctx
-	mux := false
-	if server != nil && server.Protocols != nil {
-		if vMeta, ok := server.Protocols[m.proto].(map[string]any); ok {
-			if b, ok := vMeta["mux"].(bool); ok && b {
-				mux = true
-			}
-		}
-	}
-	return xray.BuildVLESSURI("192.0.2.1", 443, clientID, "test-client", "www.microsoft.com", "pub123", "sid123", "xtls-rprx-vision", mux)
+	return xray.BuildVLESSURI("192.0.2.1", 443, clientID, "test-client", "www.microsoft.com", "pub123", "sid123", "xtls-rprx-vision")
 }
 
-func TestVLESS_MuxHandlingInHandlers(t *testing.T) {
+// TestVLESS_MuxPreferenceIsNotSerializedIntoShareLink locks the safe behaviour: even when
+// the server records mux:true, the connection-config endpoint must return a REALITY+Vision
+// link with no "mux" parameter, because VLESS Vision cannot carry TCP mux.cool and no
+// interoperable share-link spelling exists. It also pins that a stray ?mux= query
+// parameter cannot alter the generated link.
+func TestVLESS_MuxPreferenceIsNotSerializedIntoShareLink(t *testing.T) {
 	h, db, _ := setupTestHandlers(t)
 
 	serverID, err := db.CreateServer(context.Background(), &models.Server{
@@ -107,56 +105,48 @@ func TestVLESS_MuxHandlingInHandlers(t *testing.T) {
 	h.registry = manager.NewRegistry()
 	h.registry.Register(mockMgr)
 
-	// Test UserGetConnectionConfigHandler with server-level mux: true
-	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/my/connections/%s/config", conn.ID), nil)
-	rctx := chi.NewRouteContext()
-	rctx.URLParams.Add("id", conn.ID)
-	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
-	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: userID, Role: models.RoleAdmin}))
-	w := httptest.NewRecorder()
+	fetch := func(rawQuery string) *url.URL {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/my/connections/%s/config%s", conn.ID, rawQuery), nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", conn.ID)
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: userID, Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
 
-	h.UserGetConnectionConfigHandler(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		h.UserGetConnectionConfigHandler(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		var res map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		cfgStr, _ := res["config"].(string)
+		parsed, err := url.Parse(cfgStr)
+		if err != nil {
+			t.Fatalf("parse vless URI %q: %v", cfgStr, err)
+		}
+		return parsed
 	}
 
-	var res map[string]any
-	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
-		t.Fatalf("unmarshal response: %v", err)
+	base := fetch("")
+	if got := base.Query().Get("mux"); got != "" {
+		t.Errorf("server-level mux:true leaked into share link: mux=%q", got)
 	}
-	cfgStr, _ := res["config"].(string)
-	parsedURL, err := url.Parse(cfgStr)
-	if err != nil {
-		t.Fatalf("parse vless URI: %v", err)
+	if got := base.Query().Get("security"); got != "reality" {
+		t.Errorf("security = %q, want reality", got)
 	}
-	if parsedURL.Query().Get("mux") != "true" {
-		t.Errorf("expected mux=true in vless URI, got: %s", cfgStr)
+	if got := base.Query().Get("flow"); got != "xtls-rprx-vision" {
+		t.Errorf("flow = %q, want xtls-rprx-vision", got)
 	}
 
-	// Test with query param ?mux=false overriding server default
-	reqFalse := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/my/connections/%s/config?mux=false", conn.ID), nil)
-	rctxFalse := chi.NewRouteContext()
-	rctxFalse.URLParams.Add("id", conn.ID)
-	reqFalse = reqFalse.WithContext(context.WithValue(reqFalse.Context(), chi.RouteCtxKey, rctxFalse))
-	reqFalse = reqFalse.WithContext(middleware.WithSession(reqFalse.Context(), &models.SessionData{UserID: userID, Role: models.RoleAdmin}))
-	wFalse := httptest.NewRecorder()
-
-	h.UserGetConnectionConfigHandler(wFalse, reqFalse)
-	if wFalse.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", wFalse.Code, wFalse.Body.String())
+	// A caller-supplied ?mux=true must not be able to inject anything into the link.
+	withQuery := fetch("?mux=true")
+	if got := withQuery.Query().Get("mux"); got != "" {
+		t.Errorf("?mux=true query param leaked into share link: mux=%q", got)
 	}
-	var resFalse map[string]any
-	if err := json.Unmarshal(wFalse.Body.Bytes(), &resFalse); err != nil {
-		t.Fatalf("unmarshal response: %v", err)
+	if withQuery.String() != base.String() {
+		t.Errorf("?mux= changed the generated link:\n base: %s\n  mux: %s", base, withQuery)
 	}
-	cfgStrFalse, _ := resFalse["config"].(string)
-	parsedURLFalse, err := url.Parse(cfgStrFalse)
-	if err != nil {
-		t.Fatalf("parse vless URI: %v", err)
-	}
-	// The mock manager checks server protocols unless ctx override is observed:
-	if val, ok := mockMgr.capturedCtx.Value(xray.WithMuxContext(context.Background(), false)).(bool); ok && val {
-		t.Errorf("expected capturedCtx to have mux=false")
-	}
-	_ = parsedURLFalse
 }
