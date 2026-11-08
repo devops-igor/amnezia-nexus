@@ -517,64 +517,6 @@ func requestMonthlySpend(catalog []gigahost.HourlyPlan, req OrderServerPayload) 
 	return 0
 }
 
-func calculateCommittedSpend(catalog []gigahost.HourlyPlan, servers []gigahost.ServerInfo, localOrders []GigahostOrderRecord) (float64, error) {
-	var committed float64
-	accountedOrders := make(map[string]bool)
-	for _, s := range servers {
-		if isServerActiveForBudget(s.Status) {
-			if !s.IsHourlyVPS() {
-				continue
-			}
-			if s.OrderID != "" {
-				accountedOrders[s.OrderID] = true
-			}
-			serverPID := s.PID
-			var localHourly float64
-			for _, o := range localOrders {
-				if (s.OrderID != "" && o.OrderID == s.OrderID) || (s.ID > 0 && o.ServerID == s.ID) {
-					if serverPID == 0 && o.PlanID > 0 {
-						serverPID = o.PlanID
-					}
-					if o.HourlyPriceNOK > 0 {
-						localHourly = o.HourlyPriceNOK
-						break
-					}
-				}
-			}
-			if localHourly == 0 {
-				for _, o := range localOrders {
-					if o.PlanID == serverPID && o.HourlyPriceNOK > 0 {
-						localHourly = o.HourlyPriceNOK
-						break
-					}
-				}
-			}
-			spend := planMonthlySpend(catalog, serverPID, localHourly)
-			if spend <= 0 {
-				return 0, fmt.Errorf("active inventory server %d (plan %d) has unpriced spend and is absent from catalog", s.ID, serverPID)
-			}
-			committed += spend
-		}
-	}
-
-	for _, o := range localOrders {
-		if isOrderActiveForBudget(o.Status) {
-			if o.OrderID != "" && accountedOrders[o.OrderID] {
-				continue
-			}
-			if o.OrderID != "" {
-				accountedOrders[o.OrderID] = true
-			}
-			spend := planMonthlySpend(catalog, o.PlanID, o.HourlyPriceNOK)
-			if spend <= 0 {
-				return 0, fmt.Errorf("active order %s (plan %d) has unpriced spend and is absent from catalog", o.OrderID, o.PlanID)
-			}
-			committed += spend
-		}
-	}
-	return committed, nil
-}
-
 //nolint:misspell // "cancelled" matches documented provider status and test assertions
 const statusCancelled = "cancelled"
 
