@@ -517,13 +517,9 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// isServerActiveForBudget / isOrderActiveForBudget delegate to the shared
-// budget contract so the purchase path, the admin breakdown and the recovery
-// utility cannot classify a status differently.
-func isServerActiveForBudget(status string) bool {
-	return gigahostbudget.IsServerActiveForBudget(status)
-}
-
+// isOrderActiveForBudget delegates to the shared budget contract so the
+// purchase path, the admin breakdown and the recovery utility cannot classify a
+// status differently.
 func isOrderActiveForBudget(status string) bool {
 	return gigahostbudget.IsActiveForBudget(status)
 }
@@ -544,49 +540,6 @@ func requestMonthlySpend(catalog []gigahost.HourlyPlan, req OrderServerPayload) 
 
 //nolint:misspell // "cancelled" matches documented provider status and test assertions
 const statusCancelled = "cancelled"
-
-func (h *Handlers) reconcileAbsentReadyOrder(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord) {
-	statusResp, err := client.GetDeployStatus(ctx, order.OrderID)
-	if err == nil {
-		if statusResp == nil || statusResp.Status == "" || isTerminalStatus(statusResp.Status) {
-			newStatus := statusCancelled
-			if statusResp != nil && isTerminalStatus(statusResp.Status) {
-				newStatus = statusResp.Status
-			}
-			order.Status = newStatus
-			_ = h.updateGigahostOrder(ctx, order)
-		}
-	} else if errors.Is(err, gigahost.ErrNotFound) {
-		order.Status = statusCancelled
-		_ = h.updateGigahostOrder(ctx, order)
-	}
-}
-
-func (h *Handlers) reconcileBudgetOrders(ctx context.Context, client gigahost.Client, servers []gigahost.ServerInfo, localOrders []GigahostOrderRecord) {
-	for i := range localOrders {
-		order := &localOrders[i]
-		if order.OrderID == "" || strings.HasPrefix(order.OrderID, "unknown_") || strings.HasPrefix(order.OrderID, "intent_") {
-			continue
-		}
-
-		var matchedServer *gigahost.ServerInfo
-		for j := range servers {
-			if servers[j].OrderID != "" && servers[j].OrderID == order.OrderID {
-				matchedServer = &servers[j]
-				break
-			}
-		}
-
-		if matchedServer != nil {
-			if (matchedServer.Status == gigahost.StatusReady || matchedServer.Status == gigahost.StatusFailed || strings.HasPrefix(strings.ToLower(matchedServer.Status), "cancel") || matchedServer.Status == "deleted") && order.Status != matchedServer.Status {
-				order.Status = matchedServer.Status
-				_ = h.updateGigahostOrder(ctx, order)
-			}
-		} else if order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active" {
-			h.reconcileAbsentReadyOrder(ctx, client, order)
-		}
-	}
-}
 
 func validateOrderAgainstCatalog(catalog []gigahost.HourlyPlan, req OrderServerPayload) error {
 	if len(catalog) == 0 {

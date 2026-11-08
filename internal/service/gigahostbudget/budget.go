@@ -92,7 +92,7 @@ const (
 	// PriceCatalog is the single monthly amount the catalog offers for a plan.
 	PriceCatalog PriceSource = "catalog_single_amount"
 	// PriceRecorded is the hourly rate recorded at order time, times 720, used
-	// only when the plan is absent from the catalog (pre-existing behaviour).
+	// only when the plan is absent from the catalog (pre-existing behavior).
 	PriceRecorded PriceSource = "recorded_hourly_rate"
 	// PriceNone marks a reservation that contributes no amount.
 	PriceNone PriceSource = "none"
@@ -202,6 +202,10 @@ type Result struct {
 	Reservations []Reservation
 	// Unresolved lists the counted reservations whose outcome is unknown.
 	Unresolved []Reservation
+	// IncompleteTotal reports that at least one counted reservation exists
+	// whose amount could not be determined, so CommittedNOK is a lower bound.
+	// A total that silently omitted such a reservation would understate spend.
+	IncompleteTotal bool
 }
 
 // ReasonBudgetExceeded is the machine reason for a denied request.
@@ -213,31 +217,57 @@ const ReasonBudgetExceeded = "budget_exceeded"
 // spending an unknown amount must fail closed. A denied request is a Result
 // with Allowed=false, not an error.
 func Evaluate(in Input) (Result, error) {
-	res := Result{CapNOK: in.CapNOK}
-
 	entries := append([]Entry(nil), in.Entries...)
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].RecordID < entries[j].RecordID })
 
-	// Pair every ledger row with at most one inventory row first: inventory
-	// identity is the strongest evidence available.
-	serverOf := make([]int, len(entries))
-	for i := range serverOf {
-		serverOf[i] = -1
+	seen := make(map[string]struct{})
+	consumed := make([]bool, len(entries))
+	reservations, err := inventoryReservations(in, entries, consumed, seen)
+	if err != nil {
+		return Result{}, err
 	}
+	ledger, err := ledgerReservations(in, entries, consumed, seen)
+	if err != nil {
+		return Result{}, err
+	}
+	reservations = append(reservations, ledger...)
+
+	res := Result{CapNOK: in.CapNOK, Reservations: reservations}
+	for _, r := range res.Reservations {
+		if !r.State.Counts() {
+			continue
+		}
+		res.CommittedNOK += r.AmountNOK
+		if r.State == StateUnresolved {
+			res.Unresolved = append(res.Unresolved, r)
+		}
+	}
+	return decide(res, in)
+}
+
+// pairEntriesWithServers maps each ledger row to at most one inventory row.
+// Inventory identity is the strongest evidence available, so it is resolved
+// before anything is priced.
+func pairEntriesWithServers(entries []Entry, servers []Server) []int {
+	serverOf := make([]int, len(entries))
 	for i := range entries {
-		for j := range in.Servers {
-			if EntryMatchesServer(entries[i], in.Servers[j]) {
+		serverOf[i] = -1
+		for j := range servers {
+			if EntryMatchesServer(entries[i], servers[j]) {
 				serverOf[i] = j
 				break
 			}
 		}
 	}
-	consumed := make([]bool, len(entries))
-	seen := make(map[string]struct{})
+	return serverOf
+}
 
-	// 1. Counted provider inventory. A ledger row is consumed only when its
-	// inventory row is counted, so an inactive server never releases a local
-	// reservation.
+// inventoryReservations prices counted provider inventory and marks the ledger
+// rows it consumed. A ledger row is consumed only when its inventory row is
+// counted, so an inactive server never releases a local reservation.
+func inventoryReservations(in Input, entries []Entry, consumed []bool, seen map[string]struct{}) ([]Reservation, error) {
+	serverOf := pairEntriesWithServers(entries, in.Servers)
+	var out []Reservation
 	for j := range in.Servers {
 		s := in.Servers[j]
 		if !IsServerActiveForBudget(s.Status) || !s.Hourly {
@@ -252,73 +282,67 @@ func Evaluate(in Input) (Result, error) {
 		canonical, rest := pickCanonical(members, entries)
 		r, err := inventoryReservation(in.Plans, in.Entries, s, canonical, entries)
 		if err != nil {
-			return Result{}, fmt.Errorf("active inventory server %d: %w", s.ID, err)
+			return nil, fmt.Errorf("active inventory server %d: %w", s.ID, err)
 		}
-		res.Reservations = append(res.Reservations, r)
-		seen[serverIdentityKey(s)] = struct{}{}
+		out = append(out, r)
+		if key := serverIdentityKey(s); key != "" {
+			seen[key] = struct{}{}
+		}
 		for _, i := range rest {
-			res.Reservations = append(res.Reservations, duplicateReservation(entries[i], r.Identity))
+			out = append(out, duplicateReservation(entries[i], r.Identity))
 		}
 		for _, i := range members {
 			consumed[i] = true
 		}
 	}
+	return out, nil
+}
 
-	// 2. Ledger rows that no counted inventory row represents.
+// ledgerReservations prices the ledger rows no counted inventory row represents.
+func ledgerReservations(in Input, entries []Entry, consumed []bool, seen map[string]struct{}) ([]Reservation, error) {
+	var out []Reservation
 	for i := range entries {
 		if consumed[i] {
 			continue
 		}
 		e := entries[i]
 		verdict := Classify(e, in.Evidence[e.RecordID])
+		base := Reservation{
+			Source:      "ledger",
+			RecordID:    e.RecordID,
+			Identity:    entryIdentity(e),
+			Status:      e.Status,
+			State:       verdict.State,
+			Reason:      verdict.Reason,
+			Explanation: verdict.Explanation,
+			PriceSource: PriceNone,
+		}
 		if !verdict.State.Counts() {
-			res.Reservations = append(res.Reservations, Reservation{
-				Source:      "ledger",
-				RecordID:    e.RecordID,
-				Identity:    entryIdentity(e),
-				Status:      e.Status,
-				State:       verdict.State,
-				Reason:      verdict.Reason,
-				Explanation: verdict.Explanation,
-				PriceSource: PriceNone,
-			})
+			out = append(out, base)
 			continue
 		}
 		key := entryIdentityKey(e)
 		if key != "" {
 			if _, dup := seen[key]; dup {
-				res.Reservations = append(res.Reservations, duplicateReservation(e, key))
+				out = append(out, duplicateReservation(e, key))
 				continue
 			}
 			seen[key] = struct{}{}
 		}
 		amount, src, why, err := priceExisting(in.Plans, e.PlanID, e.MonthlyCapNOK, e.Currency, e.HourlyPriceNOK)
 		if err != nil {
-			return Result{}, fmt.Errorf("active order %s: %w", entryIdentity(e), err)
+			return nil, fmt.Errorf("active order %s: %w", entryIdentity(e), err)
 		}
-		res.Reservations = append(res.Reservations, Reservation{
-			Source:      "ledger",
-			RecordID:    e.RecordID,
-			Identity:    entryIdentity(e),
-			Status:      e.Status,
-			AmountNOK:   amount,
-			PriceSource: src,
-			State:       verdict.State,
-			Reason:      verdict.Reason,
-			Explanation: joinExplanation(verdict.Explanation, why),
-		})
+		base.AmountNOK = amount
+		base.PriceSource = src
+		base.Explanation = joinExplanation(verdict.Explanation, why)
+		out = append(out, base)
 	}
+	return out, nil
+}
 
-	for _, r := range res.Reservations {
-		if !r.State.Counts() {
-			continue
-		}
-		res.CommittedNOK += r.AmountNOK
-		if r.State == StateUnresolved {
-			res.Unresolved = append(res.Unresolved, r)
-		}
-	}
-
+// decide applies the request to the priced commitments.
+func decide(res Result, in Input) (Result, error) {
 	if in.Request == nil {
 		res.Allowed = true
 		return res, nil
@@ -331,14 +355,75 @@ func Evaluate(in Input) (Result, error) {
 	res.ProjectedNOK = res.CommittedNOK + requested
 	if res.CapNOK > 0 {
 		res.RemainingNOK = res.CapNOK - res.CommittedNOK
-	} else {
-		res.RemainingNOK = 0
 	}
 	res.Allowed = res.CapNOK <= 0 || res.ProjectedNOK <= res.CapNOK
 	if !res.Allowed {
 		res.Reason = ReasonBudgetExceeded
 	}
 	return res, nil
+}
+
+// Report classifies every ledger row without ever failing.
+//
+// Evaluate is deliberately strict: an active commitment it cannot price aborts
+// the decision, because spending an unknown amount must fail closed. An operator
+// report must instead be able to say "this reservation exists and its price is
+// unknown", so this function prices what it can and marks what it cannot.
+func Report(in Input) (Result, error) {
+	res, err := Evaluate(in)
+	if err == nil {
+		return res, nil
+	}
+
+	// Price per row instead of as a whole, so one unpriceable legacy record does
+	// not hide every other reservation from the operator.
+	out := Result{CapNOK: in.CapNOK, Allowed: true}
+	accounted := make(map[string]struct{})
+	for _, e := range in.Entries {
+		verdict := Classify(e, in.Evidence[e.RecordID])
+		r := Reservation{
+			Source:      "ledger",
+			RecordID:    e.RecordID,
+			Identity:    entryIdentity(e),
+			Status:      e.Status,
+			State:       verdict.State,
+			Reason:      verdict.Reason,
+			Explanation: verdict.Explanation,
+			PriceSource: PriceNone,
+		}
+		if verdict.State.Counts() {
+			amount, src, why, priceErr := priceExisting(in.Plans, e.PlanID, e.MonthlyCapNOK, e.Currency, e.HourlyPriceNOK)
+			if priceErr != nil {
+				r.Explanation = joinExplanation(verdict.Explanation, "price unknown: "+priceErr.Error())
+				r.Reason = "price_unidentifiable"
+				// The reservation still counts, but as an explicitly unknown
+				// amount: reporting it as zero would understate committed spend.
+				r.State = StateUnresolved
+				out.IncompleteTotal = true
+			} else {
+				r.AmountNOK = amount
+				r.PriceSource = src
+				r.Explanation = joinExplanation(verdict.Explanation, why)
+			}
+			key := entryIdentityKey(e)
+			if key != "" {
+				if _, dup := accounted[key]; dup {
+					r.State = StateDuplicate
+					r.AmountNOK = 0
+					r.Explanation = "already counted under the same identity"
+					out.Reservations = append(out.Reservations, r)
+					continue
+				}
+				accounted[key] = struct{}{}
+			}
+			out.CommittedNOK += r.AmountNOK
+			if r.State == StateUnresolved {
+				out.Unresolved = append(out.Unresolved, r)
+			}
+		}
+		out.Reservations = append(out.Reservations, r)
+	}
+	return out, nil
 }
 
 // pickCanonical chooses the ledger row that represents the reservation when

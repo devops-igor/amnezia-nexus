@@ -15,9 +15,8 @@ import (
 
 // Re-exported shared errors so existing callers and tests keep their oracle.
 var (
-	errSpendUnpriced         = gigahostbudget.ErrSpendUnpriced
-	errPriceNotIdentifiable  = gigahostbudget.ErrPriceNotIdentifiable
-	errCurrencyNotComparable = gigahostbudget.ErrCurrencyNotComparable
+	errSpendUnpriced        = gigahostbudget.ErrSpendUnpriced
+	errPriceNotIdentifiable = gigahostbudget.ErrPriceNotIdentifiable
 )
 
 // budgetPlans converts catalog rows for the shared calculation.

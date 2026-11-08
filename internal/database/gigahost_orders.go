@@ -17,6 +17,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
@@ -163,10 +164,82 @@ func (d *DB) ListGigahostOrders(ctx context.Context) ([]models.GigahostOrder, er
 	if err := d.EnsureGigahostOrdersSchema(ctx); err != nil {
 		return nil, err
 	}
+	return d.readGigahostOrders(ctx)
+}
+
+// ListGigahostOrdersReadOnly reads the ledger without creating or upgrading
+// anything.
+//
+// A database written by an earlier version has only the original columns, and
+// that legacy database is exactly the one an operator needs to inspect, so the
+// missing price/release columns are read as their zero values instead of
+// failing the inspection. Columns are never added here.
+func (d *DB) ListGigahostOrdersReadOnly(ctx context.Context) ([]models.GigahostOrder, error) {
+	if d == nil || d.sqlDB == nil {
+		return []models.GigahostOrder{}, nil
+	}
+	rows, err := d.sqlDB.QueryContext(ctx, "SELECT name FROM pragma_table_info('gigahost_orders')")
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect gigahost_orders: %w", err)
+	}
+	present := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		present[name] = true
+	}
+	_ = rows.Close()
+	if !present["id"] {
+		return []models.GigahostOrder{}, nil
+	}
+
+	// Only columns that exist are selected. A legacy row therefore reports
+	// price_id 0 / currency "" / monthly_cap 0, which the budget reads as "not
+	// recorded" - never as a guessed value.
+	optional := []struct {
+		name     string
+		selectAs string
+	}{
+		{"price_id", "COALESCE(price_id, 0)"},
+		{"monthly_cap_nok", "COALESCE(monthly_cap_nok, 0)"},
+		{"currency", "COALESCE(currency, '')"},
+		{"released_at", "COALESCE(released_at, '')"},
+		{"release_reason", "COALESCE(release_reason, '')"},
+	}
+	cols := []string{"id", "order_id", "server_id", "status", "plan_id", "region_id",
+		"hourly_price_nok", "assigned_ip", "created_at", "updated_at"}
+	var exprs []string
+	for _, c := range optional {
+		if present[c.name] {
+			exprs = append(exprs, c.selectAs)
+		} else {
+			switch c.name {
+			case "currency", "released_at", "release_reason":
+				exprs = append(exprs, "''")
+			default:
+				exprs = append(exprs, "0")
+			}
+		}
+	}
+	q := fmt.Sprintf("SELECT %s, %s FROM gigahost_orders ORDER BY id DESC",
+		strings.Join(cols, ", "), strings.Join(exprs, ", "))
+	return d.scanGigahostOrders(ctx, q)
+}
+
+// readGigahostOrders is the shared SELECT body.
+func (d *DB) readGigahostOrders(ctx context.Context) ([]models.GigahostOrder, error) {
 	q := `SELECT id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
 	             created_at, updated_at, price_id, monthly_cap_nok, currency, released_at, release_reason
 	      FROM gigahost_orders
 	      ORDER BY id DESC`
+	return d.scanGigahostOrders(ctx, q)
+}
+
+// scanGigahostOrders runs a query with the canonical column order and scans it.
+func (d *DB) scanGigahostOrders(ctx context.Context, q string) ([]models.GigahostOrder, error) {
 	rows, err := d.sqlDB.QueryContext(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query gigahost orders: %w", err)
@@ -253,6 +326,7 @@ func (d *DB) UpdateGigahostOrder(ctx context.Context, o *models.GigahostOrder) e
 	      SET order_id = ?, server_id = ?, status = ?, assigned_ip = ?, updated_at = ?,
 	          price_id = CASE WHEN ? > 0 THEN ? ELSE price_id END,
 	          monthly_cap_nok = CASE WHEN ? > 0 THEN ? ELSE monthly_cap_nok END,
+	          hourly_price_nok = CASE WHEN ? > 0 THEN ? ELSE hourly_price_nok END,
 	          currency = CASE WHEN ? != '' THEN ? ELSE currency END
 	      WHERE id = ? OR (order_id = ? AND order_id != '')`
 	d.writeMu.Lock()
@@ -261,6 +335,7 @@ func (d *DB) UpdateGigahostOrder(ctx context.Context, o *models.GigahostOrder) e
 		o.OrderID, o.ServerID, o.Status, o.AssignedIP, o.UpdatedAt.Format(time.RFC3339),
 		o.PriceID, o.PriceID,
 		o.MonthlyCapNOK, o.MonthlyCapNOK,
+		o.HourlyPriceNOK, o.HourlyPriceNOK,
 		o.Currency, o.Currency,
 		o.ID, o.OrderID,
 	)

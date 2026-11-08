@@ -73,6 +73,7 @@ func (h *Handlers) gatherLedgerEvidence(
 			continue
 		}
 		ev := gigahostbudget.Evidence{}
+		inventoryTerminal := false
 		for _, s := range sharedServers {
 			if !gigahostbudget.EntryMatchesServer(budgetEntries([]GigahostOrderRecord{o})[0], s) {
 				continue
@@ -83,6 +84,7 @@ func (h *Handlers) gatherLedgerEvidence(
 			ev.ServerFound = true
 			if s.Status != "" {
 				ev.ServerStatus = s.Status
+				inventoryTerminal = gigahostbudget.IsTerminalStatus(s.Status)
 			}
 			break
 		}
@@ -96,11 +98,17 @@ func (h *Handlers) gatherLedgerEvidence(
 			switch {
 			case err == nil && resp != nil && resp.Status != "":
 				ev.OrderQueried = true
-				ev.ServerFound = true
-				ev.ServerStatus = resp.Status
+				// The live inventory row for a matching server is the more
+				// specific statement: a terminal inventory status must not be
+				// overridden by an order-level non-terminal answer, or a
+				// canceled server would look alive again.
+				if !inventoryTerminal {
+					ev.ServerFound = true
+					ev.ServerStatus = resp.Status
+				}
 			case err == nil:
 				// The provider answered about an id it issued but described no
-				// live order: the pre-existing behaviour treated that as an
+				// live order: the pre-existing behavior treated that as an
 				// ended order, and the id being the provider's own makes the
 				// answer conclusive.
 				ev.OrderQueried = true
@@ -138,15 +146,18 @@ func (h *Handlers) reconcileLedgerReservations(
 		}
 		verdict := gigahostbudget.Classify(budgetEntries([]GigahostOrderRecord{*order})[0], ev)
 
-		// Keep the pre-existing status reconciliation: a provider terminal
-		// status is written onto the row so an operator sees it, and an order
-		// id the provider no longer has a live order for is recorded as
-		// cancelled exactly as before this change.
+		// Keep the pre-existing status reconciliation, but only for statuses
+		// that genuinely end the binding. A provider "failed" status ends the
+		// deployment without proving no charge was incurred, so writing it onto
+		// the row would silently release the reservation; that case keeps the
+		// local status and is reported as unresolved instead.
 		newStatus := ""
 		switch {
-		case ev.ServerFound && ev.ServerStatus != "" && gigahostbudget.IsTerminalStatus(ev.ServerStatus):
+		case ev.ServerFound && gigahostbudget.IsReleaseConclusiveStatus(ev.ServerStatus):
 			newStatus = ev.ServerStatus
-		case ev.OrderEnded || ev.OrderNotFound:
+		case (ev.OrderEnded || ev.OrderNotFound) && !ev.ServerFound:
+			// The provider owns this order id and has no live order for it: the
+			// pre-existing behavior recorded that as canceled.
 			newStatus = statusCancelled
 		}
 		if newStatus != "" && newStatus != order.Status {

@@ -23,12 +23,19 @@ type Evidence struct {
 	// id does not exist.
 	OrderNotFound bool
 	// OrderEnded is the provider's answer, for a real order id it issued, that
-	// no live order exists any more (a terminated/cancelled order has no status
+	// no live order exists any more (a terminated/canceled order has no status
 	// to report). It is conclusive because the id is the provider's own.
 	OrderEnded bool
 	// OrderQueryFailed is a communication failure or an unknown outcome. It is
 	// explicitly NOT evidence of absence.
 	OrderQueryFailed bool
+	// OperatorConfirmed is an explicit operator acknowledgement, recorded with
+	// a note, that a reservation carrying no provider identity was verified at
+	// the provider to carry no charge. It is the only non-provider evidence that
+	// can release a reservation, and only an out-of-band recovery tool sets it.
+	OperatorConfirmed bool
+	// OperatorNote records why the operator concluded no charge exists.
+	OperatorNote string
 }
 
 // Verdict is the accounting classification of one ledger row.
@@ -47,7 +54,8 @@ type Verdict struct {
 // The set matches the pre-existing budget classification exactly, so a state
 // that was already excluded stays excluded.
 var obsoleteLocalStatuses = map[string]bool{
-	"failed":     true,
+	"failed": true,
+	//nolint:misspell // "cancelled" is the provider's and the panel's own status spelling
 	"cancelled":  true,
 	"canceled":   true,
 	"deleted":    true,
@@ -84,6 +92,32 @@ func IsSyntheticOrderID(id string) bool {
 // IsTerminalStatus reports a status that ends a reservation.
 func IsTerminalStatus(status string) bool {
 	return obsoleteLocalStatuses[strings.ToLower(strings.TrimSpace(status))]
+}
+
+// releaseConclusiveStatuses are the provider statuses that prove the binding
+// ended: the resource was canceled, deleted, terminated, stopped, expired or
+// refunded.
+//
+// "failed" is deliberately NOT here. A failed deployment can still have been
+// billed (the server may have existed long enough to incur an hourly charge), so
+// it ends the deployment without proving the commitment is gone. The local
+// reservation therefore stays counted and stays visible, which is the
+// pre-existing safety behavior for inactive provider inventory.
+var releaseConclusiveStatuses = map[string]bool{
+	//nolint:misspell // "cancelled" is the provider's own status spelling
+	"cancelled":  true,
+	"canceled":   true,
+	"deleted":    true,
+	"terminated": true,
+	"stopped":    true,
+	"expired":    true,
+	"refunded":   true,
+}
+
+// IsReleaseConclusiveStatus reports whether a provider status is conclusive
+// proof that a reservation carries no remaining commitment.
+func IsReleaseConclusiveStatus(status string) bool {
+	return releaseConclusiveStatuses[strings.ToLower(strings.TrimSpace(status))]
 }
 
 // IsActiveForBudget reports whether a local ledger status consumes budget,
@@ -165,12 +199,23 @@ func Classify(e Entry, ev Evidence) Verdict {
 			Explanation: "local status " + strOrUnknown(e.Status) + " ends the reservation",
 		}
 	}
-	if ev.ServerFound && IsTerminalStatus(ev.ServerStatus) {
+	if ev.ServerFound && IsReleaseConclusiveStatus(ev.ServerStatus) {
 		return Verdict{
 			State:       StateObsolete,
 			Reason:      "provider_terminal_status",
 			Explanation: "the provider reports the matching server as " + strOrUnknown(ev.ServerStatus),
 			Releasable:  true,
+		}
+	}
+	// A provider status that ended the deployment WITHOUT proving the binding
+	// ended (for example "failed", which can still have been billed) keeps the
+	// reservation counted and unresolved rather than releasing spend.
+	if ev.ServerFound && IsTerminalStatus(ev.ServerStatus) {
+		return Verdict{
+			State:  StateUnresolved,
+			Reason: "provider_failed_status",
+			Explanation: "the provider reports the matching server as " + strOrUnknown(ev.ServerStatus) +
+				", which ended the deployment but does not prove a charge was never incurred",
 		}
 	}
 	if ev.OrderQueryFailed {
@@ -193,6 +238,17 @@ func Classify(e Entry, ev Evidence) Verdict {
 			State:       StateObsolete,
 			Reason:      "provider_order_ended",
 			Explanation: "the provider owns this order id and reports no live order for it",
+			Releasable:  true,
+		}
+	}
+	// An operator acknowledgement releases only a record that carries no
+	// provider identity at all: once the provider issued an order id, only the
+	// provider's own answer may end the reservation.
+	if ev.OperatorConfirmed && e.ServerID == 0 && (e.OrderID == "" || IsSyntheticOrderID(e.OrderID)) {
+		return Verdict{
+			State:       StateObsolete,
+			Reason:      "operator_confirmed_no_charge",
+			Explanation: "an operator verified at the provider that this attempt carries no charge",
 			Releasable:  true,
 		}
 	}
