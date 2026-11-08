@@ -20,7 +20,7 @@ from urllib.parse import urljoin
 import pytest
 from playwright.sync_api import Page
 
-from tests.e2e import diagnostics
+from tests.e2e import diagnostics, log_privacy
 
 logger = logging.getLogger(__name__)
 
@@ -110,10 +110,15 @@ def _get_csrf_cookie(page: Page) -> str:
     The CSRF cookie is set as HttpOnly by BunkerWeb, so JavaScript cannot
     read it from document.cookie. Playwright's context.cookies() bypasses
     this restriction because it uses the CDP protocol, not JS.
+
+    The value is registered with the console privacy filter so it cannot leak
+    through a traceback that mentions it without a header name.
     """
     for cookie in page.context.cookies():
         if cookie["name"] == "csrftoken":
-            return cookie["value"]
+            value = cookie["value"]
+            log_privacy.register_secret(value)
+            return value
     return ""
 
 
