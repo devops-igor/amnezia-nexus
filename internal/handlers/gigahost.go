@@ -249,6 +249,28 @@ func (h *Handlers) GigahostCatalogHandler(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// catalogEligibility derives the eligibility the provider exposes on the
+// catalog itself: the first plan that carries a qualifying fact, else the
+// client's own report. It is the catalog half of gigahost.HasEligibility.
+func catalogEligibility(client gigahost.Client, catalogPlans []gigahost.HourlyPlan) gigahost.CatalogEligibility {
+	var catalogElig gigahost.CatalogEligibility
+	for _, p := range catalogPlans {
+		if p.Eligibility.QualifiesArrears || p.Eligibility.CreditNOK > 0 {
+			catalogElig = p.Eligibility
+			break
+		}
+	}
+	if catalogElig.QualifiesArrears || catalogElig.CreditNOK > 0 {
+		return catalogElig
+	}
+	if ce, ok := client.(interface {
+		GetCatalogEligibility() gigahost.CatalogEligibility
+	}); ok {
+		return ce.GetCatalogEligibility()
+	}
+	return catalogElig
+}
+
 // verifyAccountEligibility decides whether the account may order an hourly
 // server, and returns the catalog it fetched.
 //
@@ -271,24 +293,9 @@ func (h *Handlers) verifyAccountEligibility(ctx context.Context, client gigahost
 		return nil, fmt.Errorf("catalog_check_failed: %w", catErr)
 	}
 
-	var catalogElig gigahost.CatalogEligibility
-	for _, p := range catalogPlans {
-		if p.Eligibility.QualifiesArrears || p.Eligibility.CreditNOK > 0 {
-			catalogElig = p.Eligibility
-			break
-		}
-	}
-	if !catalogElig.QualifiesArrears && catalogElig.CreditNOK == 0 {
-		if ce, ok := client.(interface {
-			GetCatalogEligibility() gigahost.CatalogEligibility
-		}); ok {
-			catalogElig = ce.GetCatalogEligibility()
-		}
-	}
-
 	catalog := &gigahost.Catalog{
 		Plans:       catalogPlans,
-		Eligibility: catalogElig,
+		Eligibility: catalogEligibility(client, catalogPlans),
 	}
 	// Catalog-only decision: the account is nil here precisely to prove the
 	// skip took effect. HasEligibility(account, catalog) can never be false for
