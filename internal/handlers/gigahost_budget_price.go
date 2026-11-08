@@ -2,23 +2,25 @@ package handlers
 
 // Order-independent monthly commitment for an EXISTING Gigahost reservation.
 //
-// The provider's contract for an hourly order is the per-order rate/monthly cap
-// that the order call returns; a local record only carries the plan id and the
-// hourly rate resolved at order time, and no server, order or billing object
-// carries the catalog price id. An existing reservation therefore cannot be
-// mapped back to one catalog row by identity, and picking "the first row for
-// the plan" made the same reservation cost 41 or 120 NOK depending only on
-// catalog order.
+// The provider's contract for an hourly order is the per-order rate / monthly
+// cap / currency that the order call returns; a local record only carries the
+// plan id and the hourly rate that was looked up at order time, and no server,
+// order or billing object carries the catalog price id. An existing reservation
+// therefore cannot be mapped back to one catalog row by identity, and picking
+// "the first row for the plan" made the same reservation cost 41 or 120 NOK
+// depending only on catalog order.
 //
-// The amount is resolved from what is unambiguously available and otherwise
-// fails closed:
+// Only one amount can be used, and only when the evidence is unambiguous:
 //  1. Catalog rows for the plan are reduced to their DISTINCT monthly amounts.
 //     A single amount is the answer: catalog order cannot matter.
-//  2. With several amounts, the hourly rate recorded when the order was placed
-//     may select the rows carrying it. Exactly one remaining amount is the
-//     answer.
-//  3. Otherwise the contracted cost is not identifiable: report an error. Never
-//     the cheapest row, never the first row, never zero.
+//  2. More than one distinct amount means the contracted amount is unknown,
+//     because no authoritative per-order contract is persisted. Report an
+//     error. Never the cheapest row, never the first row, never zero.
+//
+// A catalog hourly rate equal to the rate recorded at order time is NOT an
+// identity: two products can share a rate, and a rate is not the monthly
+// contract. Matching it was tried and rejected as an inference, so it does not
+// select a row here.
 //
 // The pre-existing "plan absent from catalog" behavior (recorded hourly rate
 // times 720, else fail closed) is deliberately unchanged.
@@ -26,7 +28,7 @@ package handlers
 // Known limitation: when the only catalog row for a plan has changed price
 // since the order, step 1 reports the current catalog amount and the drift is
 // not detected. Only the provider's own order-time contract can resolve that,
-// which needs the order response to be persisted.
+// which needs the order response to be persisted (P4/D3, not in this change).
 
 import (
 	"errors"
@@ -95,36 +97,19 @@ func distinctMonthlyAmounts(rows []gigahost.HourlyPlan) []float64 {
 	return amounts
 }
 
-// rowsPricedAtHourly returns the rows whose catalog hourly rate equals the rate
-// recorded when the order was placed.
-func rowsPricedAtHourly(rows []gigahost.HourlyPlan, recordedHourly float64) []gigahost.HourlyPlan {
-	if recordedHourly <= 0 {
-		return nil
-	}
-	var matched []gigahost.HourlyPlan
-	for _, r := range rows {
-		if r.HourlyRateNOK > 0 && math.Abs(r.HourlyRateNOK-recordedHourly) <= priceAmountEpsilon {
-			matched = append(matched, r)
-		}
-	}
-	return matched
-}
-
 // existingMonthlySpend resolves the monthly commitment of an existing hourly
-// reservation for plan pid, given the hourly rate recorded at order time (which
-// may be zero when no local order is linked). The result is independent of
-// catalog order, and an error is returned whenever the evidence cannot identify
-// one contracted monthly cost.
+// reservation for plan pid. The result is independent of catalog order, and an
+// error is returned whenever more than one contracted monthly cost is possible.
+//
+// recordedHourly is the hourly rate looked up when the order was placed. It is
+// used ONLY for the pre-existing absent-from-catalog estimate; it never selects
+// between catalog amounts, because a coincident rate is not a contract identity.
 func existingMonthlySpend(catalog []gigahost.HourlyPlan, pid int, recordedHourly float64) (float64, error) {
-	rows := catalogRowsForPlan(catalog, pid)
-	amounts := distinctMonthlyAmounts(rows)
+	amounts := distinctMonthlyAmounts(catalogRowsForPlan(catalog, pid))
 	switch {
 	case len(amounts) == 1:
 		return amounts[0], nil
 	case len(amounts) > 1:
-		if selected := distinctMonthlyAmounts(rowsPricedAtHourly(rows, recordedHourly)); len(selected) == 1 {
-			return selected[0], nil
-		}
 		return 0, fmt.Errorf("plan %d %w", pid, errPriceNotIdentifiable)
 	case recordedHourly > 0:
 		return recordedHourly * 720, nil

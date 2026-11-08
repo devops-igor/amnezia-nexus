@@ -3,19 +3,26 @@ package handlers
 // Real-consumer regression for price-identity finding B3: the monthly
 // commitment of an EXISTING Gigahost reservation must resolve to the same
 // amount under every ordering of the provider catalog, and must fail closed
-// when the available evidence cannot identify one contracted monthly cost.
+// unless the available evidence identifies exactly one monthly cost.
 //
 // The test drives the production purchase path (GigahostOrderHandler), because
 // the defect is a financial decision: the same existing server was priced at
 // 41 NOK or 120 NOK depending only on which catalog row happened to come
 // first, which flipped a legitimate order between "allowed" and "budget
-// exceeded" and, in the ambiguous shape, could let an unidentified commitment
+// exceeded" and, in the ambiguous shape, let an unidentified commitment
 // through.
+//
+// Matching a catalog row's hourly rate against the rate recorded at order time
+// does NOT identify the contracted monthly price: two products can share a
+// rate, and a rate is not the per-order contract. Every shape with more than
+// one distinct catalog amount is therefore an error, whatever the recorded
+// rate, unless an authoritative contract amount is available (none is
+// persisted today; that is P4/D3, out of this group's scope).
 //
 // Guards that must stay intact and are asserted here: no provider order is
 // dispatched when the price cannot be identified, no purchase intent is
-// persisted, and a distinguishable price still permits the order at an exact
-// budget boundary.
+// persisted, and a plainly unambiguous single-amount plan still permits the
+// order at an exact budget boundary.
 
 import (
 	"context"
@@ -130,10 +137,9 @@ func runExistingPriceOrder(t *testing.T, budget float64, existingRows []gigahost
 }
 
 // TestGigahostOrderHandler_AmbiguousExistingPriceFailsClosedInEveryCatalogOrder
-// covers the reproduced B3 shape: one product with two different monthly
-// amounts whose rows carry the SAME hourly rate, so nothing distinguishes
-// them. The contracted cost cannot be identified, therefore no purchase may
-// happen - in any catalog order.
+// covers every shape where one product has two different monthly amounts. The
+// contracted cost cannot be identified, therefore no purchase may happen - in
+// any catalog order, and regardless of the hourly rate recorded at order time.
 func TestGigahostOrderHandler_AmbiguousExistingPriceFailsClosedInEveryCatalogOrder(t *testing.T) {
 	cases := []struct {
 		name string
@@ -157,6 +163,17 @@ func TestGigahostOrderHandler_AmbiguousExistingPriceFailsClosedInEveryCatalogOrd
 			},
 			recorded: 0,
 		},
+		{
+			// A coincidentally matching hourly rate is not the contracted
+			// monthly amount: it must not turn an ambiguous plan into a priced
+			// one. This is the shape the first delivery wrongly accepted.
+			name: "different amounts, recorded rate equals one row",
+			rows: []gigahost.HourlyPlan{
+				priceIdentityPlan(202, 666, 0.057, 41),
+				priceIdentityPlan(202, 777, 0.1667, 120),
+			},
+			recorded: 0.057,
+		},
 	}
 
 	for _, tc := range cases {
@@ -179,19 +196,23 @@ func TestGigahostOrderHandler_AmbiguousExistingPriceFailsClosedInEveryCatalogOrd
 				if out.ordersStored != 1 {
 					t.Errorf("permutation %d: stored orders = %d, want only the pre-existing one", i, out.ordersStored)
 				}
+				if out.committedErr == nil {
+					t.Errorf("permutation %d: committed spend resolved to %v with no error", i, out.committed)
+				}
 			}
 		})
 	}
 }
 
 // TestGigahostOrderHandler_UnambiguousExistingPriceAtBudgetBoundary covers the
-// resolvable shape: the distinct monthly amounts are separable because the
-// order-time recorded hourly rate selects exactly one of them. 41 + 59 == the
-// 100 NOK budget, so the order must succeed identically in both catalog orders.
+// genuinely unambiguous shape: the plan has one monthly amount in the catalog,
+// which is a single store of evidence rather than a guess, and an inactive
+// unrelated plan keeps two catalog rows to permute. 41 + 59 == the 100 NOK
+// budget, so the order must succeed identically in both catalog orders.
 func TestGigahostOrderHandler_UnambiguousExistingPriceAtBudgetBoundary(t *testing.T) {
 	rows := []gigahost.HourlyPlan{
 		priceIdentityPlan(202, 666, 0.057, 41),
-		priceIdentityPlan(202, 777, 0.1667, 120),
+		priceIdentityPlan(303, 1, 0.1, 72),
 	}
 	perms := catalogPermutations(rows)
 	if len(perms) != 2 {
@@ -217,10 +238,10 @@ func TestGigahostOrderHandler_UnambiguousExistingPriceAtBudgetBoundary(t *testin
 	}
 }
 
-// TestExistingMonthlySpend_EveryCatalogPermutation pins the documented
-// resolution policy at the smallest grain: the value and the error class must be
-// identical under every ordering of the catalog rows, and every state that
-// cannot identify one contracted monthly cost must fail closed.
+// TestExistingMonthlySpend_EveryCatalogPermutation pins the resolution policy at
+// the smallest grain: the value and the error class must be identical under
+// every ordering of the catalog rows, and any plan with more than one distinct
+// monthly amount must fail closed because the contracted amount is unknown.
 func TestExistingMonthlySpend_EveryCatalogPermutation(t *testing.T) {
 	rowPair := func(pid, priceA, priceB int, hourlyA, hourlyB, monthlyA, monthlyB float64) []gigahost.HourlyPlan {
 		return []gigahost.HourlyPlan{
@@ -252,18 +273,27 @@ func TestExistingMonthlySpend_EveryCatalogPermutation(t *testing.T) {
 			want:     41,
 		},
 		{
-			name:     "two amounts, recorded rate selects exactly one",
-			catalog:  rowPair(202, 666, 777, 0.057, 0.1667, 41, 120),
+			name:     "two price_ids sharing one amount are not an ambiguity",
+			catalog:  rowPair(202, 666, 777, 0.057, 0.1667, 41, 41),
 			pid:      202,
-			recorded: 0.057,
+			recorded: 0,
 			want:     41,
 		},
 		{
-			name:     "two amounts, recorded rate selects the other one",
+			// The corrected behaviour: a matching recorded rate does not
+			// identify which monthly amount is contracted.
+			name:     "two amounts, recorded rate equals one row - still unidentified",
+			catalog:  rowPair(202, 666, 777, 0.057, 0.1667, 41, 120),
+			pid:      202,
+			recorded: 0.057,
+			wantErr:  errPriceNotIdentifiable,
+		},
+		{
+			name:     "two amounts, recorded rate equals the other row - still unidentified",
 			catalog:  rowPair(202, 666, 777, 0.057, 0.1667, 41, 120),
 			pid:      202,
 			recorded: 0.1667,
-			want:     120,
+			wantErr:  errPriceNotIdentifiable,
 		},
 		{
 			name:     "same hourly rate on two rows leaves the amount unidentified",
@@ -344,7 +374,7 @@ func TestExistingMonthlySpend_EveryCatalogPermutation(t *testing.T) {
 // TestCalculateCommittedSpend_LedgerPathsKeepReservationsDistinct covers the
 // order-ledger pass that shares the resolver: an unidentifiable price fails the
 // whole calculation closed (so no order can proceed), while distinct
-// reservations with identifiable prices still sum exactly once in any catalog
+// reservations with unambiguous prices still sum exactly once in any catalog
 // order.
 func TestCalculateCommittedSpend_LedgerPathsKeepReservationsDistinct(t *testing.T) {
 	localOrder := func(orderID string, planID int, hourly float64) GigahostOrderRecord {
@@ -355,14 +385,15 @@ func TestCalculateCommittedSpend_LedgerPathsKeepReservationsDistinct(t *testing.
 		}
 	}
 
-	ambiguousRows := []gigahost.HourlyPlan{
-		priceIdentityPlan(202, 666, 0.05, 41),
-		priceIdentityPlan(202, 777, 0.05, 120),
-	}
-
 	t.Run("unidentifiable ledger price fails the whole calculation closed", func(t *testing.T) {
-		for i, rows := range catalogPermutations(ambiguousRows) {
-			committed, err := calculateCommittedSpend(rows, nil, []GigahostOrderRecord{localOrder("a", 202, 0.05)})
+		// Two distinct amounts where the recorded rate happens to equal one of
+		// the rows: the first delivery priced this at 41; it must stay an error.
+		rows := []gigahost.HourlyPlan{
+			priceIdentityPlan(202, 666, 0.057, 41),
+			priceIdentityPlan(202, 777, 0.1667, 120),
+		}
+		for i, perm := range catalogPermutations(rows) {
+			committed, err := calculateCommittedSpend(perm, nil, []GigahostOrderRecord{localOrder("a", 202, 0.057)})
 			if !errors.Is(err, errPriceNotIdentifiable) {
 				t.Fatalf("permutation %d: error = %v, want %v", i, err, errPriceNotIdentifiable)
 			}
@@ -375,20 +406,20 @@ func TestCalculateCommittedSpend_LedgerPathsKeepReservationsDistinct(t *testing.
 	t.Run("distinct reservations each count once in every catalog order", func(t *testing.T) {
 		rows := []gigahost.HourlyPlan{
 			priceIdentityPlan(202, 666, 0.057, 41),
-			priceIdentityPlan(202, 777, 0.1667, 120),
 			priceIdentityPlan(303, 1, 0.1, 72),
+			priceIdentityPlan(404, 2, 0.1667, 120),
 		}
 		orders := []GigahostOrderRecord{
 			localOrder("a", 202, 0.057),
-			localOrder("b", 202, 0.1667),
-			localOrder("c", 303, 0.1),
+			localOrder("b", 303, 0.1),
+			localOrder("c", 404, 0.1667),
 		}
 		for i, perm := range catalogPermutations(rows) {
 			committed, err := calculateCommittedSpend(perm, nil, orders)
 			if err != nil {
 				t.Fatalf("permutation %d: unexpected error: %v", i, err)
 			}
-			if committed != 41+120+72 {
+			if committed != 41+72+120 {
 				t.Fatalf("permutation %d: committed = %v, want 233", i, committed)
 			}
 		}
