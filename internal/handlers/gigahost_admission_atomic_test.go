@@ -15,6 +15,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -198,11 +199,17 @@ func TestConcurrentSeparateAdminsAreIndependent(t *testing.T) {
 	first := <-firstDone
 	other := <-otherDone
 
-	if first.Code != http.StatusOK {
-		t.Fatalf("admin-1 = %d, want 200", first.Code)
+	// The contract under test is ADMISSION, not the final verdict: two admins can
+	// legitimately race for the same remaining budget, so either may end 400. What
+	// must never happen is admin-2 being refused by admin-1's in-flight slot.
+	for name, resp := range map[string]*httptest.ResponseRecorder{"admin-1": first, "admin-2": other} {
+		if resp.Code == http.StatusTooManyRequests {
+			t.Fatalf("%s was throttled by the other admin's in-flight attempt (body: %s)", name, resp.Body.String())
+		}
 	}
-	if other.Code == http.StatusTooManyRequests {
-		t.Fatalf("admin-2 was throttled by admin-1's in-flight attempt (body: %s)", other.Body.String())
+	// Both reached the provider path, which is what proves independent admission.
+	if got := atomic.LoadInt32(&barrier.calls); got != 2 {
+		t.Errorf("provider catalog calls = %d, want 2 (both admins admitted)", got)
 	}
 }
 
@@ -308,5 +315,59 @@ func TestReservationIsReleasedOnEveryTerminalPath(t *testing.T) {
 				t.Fatal("the reservation leaked: in_flight is still true after a terminal failure")
 			}
 		})
+	}
+}
+
+// TestEvictIfFullBoundedFallback covers the eviction branches: expired entries are
+// dropped first, and when every remaining entry is fresh (or in flight) a single
+// foreign entry is evicted rather than letting the table grow.
+func TestEvictIfFullBoundedFallback(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	table := h.admission()
+
+	// Fill to the cap with EXPIRED entries: they are purged first.
+	table.mu.Lock()
+	for i := 0; i < maxAdmissionEntries; i++ {
+		table.entries[fmt.Sprintf("expired-%d", i)] = &admissionEntry{
+			failedAt: time.Now().Add(-2 * repeatedSubmitWindow),
+		}
+	}
+	table.mu.Unlock()
+
+	h.recordRejectedOrderAttempt("fresh-insert", time.Now())
+	table.mu.Lock()
+	size := len(table.entries)
+	_, present := table.entries["fresh-insert"]
+	table.mu.Unlock()
+	if !present {
+		t.Fatal("the new entry must be recorded")
+	}
+	if size > maxAdmissionEntries {
+		t.Fatalf("size = %d after expired purge, want <= %d", size, maxAdmissionEntries)
+	}
+
+	// Now fill with FRESH entries and one in-flight entry that must be preserved.
+	table.mu.Lock()
+	table.entries = make(map[string]*admissionEntry)
+	for i := 0; i < maxAdmissionEntries; i++ {
+		table.entries[fmt.Sprintf("fresh-%d", i)] = &admissionEntry{failedAt: time.Now()}
+	}
+	table.entries["busy"] = &admissionEntry{inFlight: true}
+	table.mu.Unlock()
+
+	h.recordRejectedOrderAttempt("overflow-insert", time.Now())
+	table.mu.Lock()
+	size = len(table.entries)
+	_, keptBusy := table.entries["busy"]
+	_, hasOverflow := table.entries["overflow-insert"]
+	table.mu.Unlock()
+	if !hasOverflow {
+		t.Fatal("the overflow entry must still be recorded")
+	}
+	if !keptBusy {
+		t.Fatal("an in-flight entry must never be evicted")
+	}
+	if size > maxAdmissionEntries+1 {
+		t.Fatalf("size = %d, want the table bounded near %d", size, maxAdmissionEntries)
 	}
 }

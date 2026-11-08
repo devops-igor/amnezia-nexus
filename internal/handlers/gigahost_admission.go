@@ -92,24 +92,27 @@ func remainingWindow(entry *admissionEntry) time.Duration {
 }
 
 // evictIfFull keeps the table bounded. Caller holds the lock.
+//
+// Two passes: drop expired idle entries, then - only if still full - drop one
+// arbitrary idle entry. An in-flight entry is never evicted, because that would
+// strand an attempt's release.
 func evictIfFull(table *orderAdmission, keep string) {
 	if len(table.entries) < maxAdmissionEntries {
 		return
 	}
-	now := time.Now()
-	for key, entry := range table.entries {
-		if key == keep || entry.inFlight {
-			continue
-		}
-		if now.Sub(entry.failedAt) > repeatedSubmitWindow {
-			delete(table.entries, key)
-		}
-	}
+	purge(table, keep, func(entry *admissionEntry) bool {
+		return time.Since(entry.failedAt) > repeatedSubmitWindow
+	})
 	if len(table.entries) < maxAdmissionEntries {
 		return
 	}
+	purge(table, keep, func(*admissionEntry) bool { return true })
+}
+
+// purge removes one matching idle entry. Caller holds the lock.
+func purge(table *orderAdmission, keep string, match func(*admissionEntry) bool) {
 	for key, entry := range table.entries {
-		if key == keep || entry.inFlight {
+		if key == keep || entry.inFlight || !match(entry) {
 			continue
 		}
 		delete(table.entries, key)
