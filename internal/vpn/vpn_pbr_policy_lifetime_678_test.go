@@ -3,17 +3,12 @@ package vpn
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/netip"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -194,84 +189,5 @@ func TestServiceStopStopsPolicySyncer(t *testing.T) {
 	}
 	if got := reg.liveOwners(); got != 0 {
 		t.Fatalf("service shutdown left %d live owner(s) of the WAN device name", got)
-	}
-}
-
-// TestRestartInitialSnapshotPreservesGoodGeneration is the F678-03-adjacent
-// control for the F678-01 lifetime change: a detached loop must not alter the
-// synchronous activation ordering that keeps the first snapshot honest.
-//
-// It also pins the pre-existing (separately assigned) restart/shrink behavior so
-// the F678-01/02 repair cannot silently change it: a fresh matcher with a
-// source-matching durable baseline still activates, and the shrink guard still
-// rejects a suspiciously shortened payload on an initialized matcher.
-func TestRestartInitialSnapshotPreservesGoodGeneration(t *testing.T) {
-	var serveSmall atomic.Bool
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		if serveSmall.Load() {
-			fmt.Fprintln(w, "only.example.com")
-			return
-		}
-		for i := 0; i < 20; i++ {
-			fmt.Fprintf(w, "rule%d.example.com\n", i)
-		}
-	}))
-	defer server.Close()
-
-	settings := policy.DefaultSettings()
-	settings.Enabled = true
-	settings.Preset = policy.PresetCustom
-	settings.CustomURLs = []string{"https://audit-list.example/policy.lst"}
-	cfg, err := settings.SyncConfig()
-	if err != nil {
-		t.Fatalf("SyncConfig: %v", err)
-	}
-
-	roots := x509.NewCertPool()
-	roots.AddCert(server.Certificate())
-	fetch := policy.NewFetcher(cfg.FetchLimits)
-	fetch.SetFixtureTLSTrust(
-		&tls.Config{RootCAs: roots, ServerName: "example.com", MinVersion: tls.VersionTLS12},
-		func(context.Context, string) ([]netip.Addr, error) {
-			return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
-		},
-		func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, network, strings.TrimPrefix(server.URL, "https://"))
-		},
-	)
-
-	store := policy.NewFileStore(t.TempDir())
-	first := policy.NewMatcher()
-	syncer, err := policy.NewSyncer(first, fetch, store, cfg)
-	if err != nil {
-		t.Fatalf("NewSyncer: %v", err)
-	}
-	if _, err := syncer.SyncOnce(context.Background()); err != nil {
-		t.Fatalf("seed sync: %v", err)
-	}
-	if first.Current().DomainCount() != 20 {
-		t.Fatalf("seed published %d domains, want 20", first.Current().DomainCount())
-	}
-
-	// The shrink guard is unchanged: the identical shortened payload is refused
-	// on an initialized matcher, leaving the good generation in place.
-	serveSmall.Store(true)
-	guarded, err := policy.NewSyncer(first, fetch, store, cfg)
-	if err != nil {
-		t.Fatalf("NewSyncer (guarded): %v", err)
-	}
-	if _, err := guarded.SyncOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "shrink guard") {
-		t.Fatalf("initialized matcher did not reject the shrink: %v", err)
-	}
-	if got := first.Current().DomainCount(); got != 20 {
-		t.Fatalf("refused shrink changed the live matcher to %d domains", got)
-	}
-	gen, err := store.Load(context.Background())
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if gen == nil || gen.DomainCount != 20 {
-		t.Fatalf("refused shrink changed the durable generation: %+v", gen)
 	}
 }

@@ -258,54 +258,9 @@ func (s *Service) clearPBRConfig() {
 	servicePBRConfigsMu.Unlock()
 }
 
-// ensureInitialSnapshot guarantees the matcher holds a non-empty policy snapshot
-// before activation proceeds.
-//
-// One synchronous sync runs first. If it fails, the durable last-known-good
-// generation is published instead: that is the "preserve last-known-good policy on
-// transient sync failure" half of the contract. If neither yields rules, activation
-// is refused with an error an operator can act on.
-func ensureInitialSnapshot(ctx context.Context, syncer *policy.Syncer, store policy.Store, matcher *policy.Matcher) error {
-	syncCtx, cancelSync := context.WithTimeout(ctx, policyActivationTimeout)
-	syncRes, syncErr := syncer.SyncOnce(syncCtx)
-	cancelSync()
-
-	if syncErr != nil {
-		if loadErr := loadLastKnownGood(ctx, store, matcher); loadErr != nil {
-			return fmt.Errorf("%w: initial sync failed (%v) and no usable last-known-good policy was found: %w",
-				ErrPolicyActivationNoRules, syncErr, loadErr)
-		}
-		slog.Warn("Policy sync failed at startup; activated last-known-good policy instead", "err", syncErr)
-	} else if !syncRes.Published {
-		return fmt.Errorf("%w: sync did not publish a snapshot", ErrPolicyActivationNoRules)
-	}
-
-	snap := matcher.Current()
-	if snap == nil || (snap.DomainCount() == 0 && snap.CIDRCount() == 0) {
-		return ErrPolicyActivationNoRules
-	}
-	return nil
-}
-
-// loadLastKnownGood publishes the durable last-known-good generation, if any.
-func loadLastKnownGood(ctx context.Context, store policy.Store, matcher *policy.Matcher) error {
-	gen, err := store.Load(ctx)
-	if err != nil {
-		return err
-	}
-	if gen == nil {
-		return errors.New("no last-known-good policy generation stored")
-	}
-	snap, err := policy.GenerationToSnapshot(gen)
-	if err != nil {
-		return err
-	}
-	if snap.DomainCount() == 0 && snap.CIDRCount() == 0 {
-		return errors.New("stored policy generation contains no rules")
-	}
-	matcher.Publish(snap)
-	return nil
-}
+// ensureInitialSnapshot, settleInitialSync and loadLastKnownGood live in
+// vpn_pbr_policy_snapshot.go: the activation handshake and the ordering that
+// keeps the first sync honest (#678 F678-03).
 
 // StopPolicyRouting stops the scheduling loop and tears the PBR data path down.
 // It is safe to call when policy routing was never started.
