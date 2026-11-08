@@ -525,6 +525,163 @@ def _write_checked(
         return None
 
 
+# ── Failed-probe evidence: closed-schema facts from the operator log ──
+
+# The panel emits one structured warning when its unprivileged Docker CLI probe
+# answers negative (ServerCheckHandler). Those facts are the only thing this
+# collector reads: every other byte of the log — and every other field of the
+# matching line — is discarded before anything is written or printed.
+PROBE_LOG_MARKER = "ServerCheckHandler: docker CLI probe failed"
+PROBE_SOURCE = "failed-probe-log"
+
+_PROBE_KEYS = frozenset({"schema_version", "source", "occurrences", "observations"})
+_OBSERVATION_KEYS = frozenset(
+    {"server_id", "exit_code", "transport_error", "stdout_state", "stdout_len", "stderr_len"}
+)
+# Closed sets mirrored from internal/handlers/docker_probe.go. A value outside
+# these collapses the whole line to a rejection; it is never passed through.
+_TRANSPORT_ERRORS = frozenset({"", "not_connected", "timeout", "canceled", "other"})
+_STDOUT_STATES = frozenset({"empty", "docker_token", "other_text"})
+MAX_PROBE_OCCURRENCES = 100000
+MAX_OBSERVATIONS = 16
+MAX_LOG_BYTES = 8 * 1024 * 1024
+
+# A logfmt field: key=value, value optionally double-quoted with backslash
+# escapes. Anchored so a crafted line cannot smuggle a second assignment in.
+_LOGFMT_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)=("(?:[^"\\]|\\.)*"|[^\s]*)')
+
+
+def _unquote_logfmt(value: str) -> str:
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        body = value[1:-1]
+        return re.sub(r"\\(.)", r"\1", body)
+    return value
+
+
+def _bounded_int_field(fields: Dict[str, str], key: str) -> Optional[int]:
+    raw = fields.get(key)
+    if raw is None:
+        return None
+    if not re.fullmatch(r"-?\d{1,9}", raw):
+        return None
+    return _bounded_int(raw, -1, 10**6)
+
+
+def parse_probe_log(text: str) -> Optional[Dict[str, Any]]:
+    """Extract closed-schema probe facts from operator log text.
+
+    Returns None when no line carries the marker: absent evidence must not be
+    confused with a clean result. Only allowlisted keys are read; the marker
+    line's timestamp, level, message and any unknown/crafted field are dropped.
+    """
+    observations: Dict[tuple, int] = {}
+    occurrences = 0
+    for line in text.splitlines():
+        if PROBE_LOG_MARKER not in line:
+            continue
+        fields = {k: _unquote_logfmt(v) for k, v in _LOGFMT_RE.findall(line)}
+        transport = fields.get("transport_error", "")
+        stdout_state = fields.get("stdout_state", "")
+        if transport not in _TRANSPORT_ERRORS or stdout_state not in _STDOUT_STATES:
+            # Unknown category: the Go side would never emit it, so treat the
+            # line as unparseable rather than publishing an unchecked value.
+            continue
+        server_id = _bounded_int_field(fields, "server_id")
+        exit_code = _bounded_int_field(fields, "exit_code")
+        stdout_len = _bounded_int_field(fields, "stdout_len")
+        stderr_len = _bounded_int_field(fields, "stderr_len")
+        if None in (server_id, exit_code, stdout_len, stderr_len):
+            continue
+        occurrences += 1
+        key = (server_id, exit_code, transport, stdout_state, stdout_len, stderr_len)
+        observations[key] = observations.get(key, 0) + 1
+
+    if not occurrences:
+        return None
+
+    ranked = sorted(observations.items(), key=lambda item: (-item[1], item[0]))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "source": PROBE_SOURCE,
+        "occurrences": occurrences,
+        "observations": [
+            {
+                "server_id": key[0],
+                "exit_code": key[1],
+                "transport_error": key[2],
+                "stdout_state": key[3],
+                "stdout_len": key[4],
+                "stderr_len": key[5],
+            }
+            for key, _ in ranked[:MAX_OBSERVATIONS]
+        ],
+    }
+
+
+def validate_probe_report(payload: Any) -> List[str]:
+    """Return the reasons a probe report is unpublishable; empty means safe."""
+    if not isinstance(payload, dict):
+        return ["probe report is not an object"]
+    if frozenset(payload) != _PROBE_KEYS:
+        return ["probe report keys are not the allowlisted set"]
+    if payload.get("schema_version") != SCHEMA_VERSION:
+        return ["probe report schema mismatch"]
+    if payload.get("source") != PROBE_SOURCE:
+        return ["probe report source not allowlisted"]
+    if _bounded_int(payload.get("occurrences"), 1, MAX_PROBE_OCCURRENCES) is None:
+        return ["probe report occurrences not a bounded integer"]
+    observations = payload.get("observations")
+    if not isinstance(observations, list):
+        return ["probe report observations is not a list"]
+    if not 1 <= len(observations) <= MAX_OBSERVATIONS:
+        return ["probe report observations length out of bounds"]
+    problems: List[str] = []
+    for observation in observations:
+        if not isinstance(observation, dict):
+            problems.append("probe observation is not an object")
+            continue
+        if frozenset(observation) != _OBSERVATION_KEYS:
+            problems.append("probe observation keys are not the allowlisted set")
+            continue
+        if _bounded_int(observation.get("server_id"), 0, 10**6) is None:
+            problems.append("probe observation server_id not bounded")
+        if _bounded_int(observation.get("exit_code"), -1, 10**6) is None:
+            problems.append("probe observation exit_code not bounded")
+        if observation.get("transport_error") not in _TRANSPORT_ERRORS:
+            problems.append("probe observation transport_error not allowlisted")
+        if observation.get("stdout_state") not in _STDOUT_STATES:
+            problems.append("probe observation stdout_state not allowlisted")
+        if _bounded_int(observation.get("stdout_len"), 0, 10**6) is None:
+            problems.append("probe observation stdout_len not bounded")
+        if _bounded_int(observation.get("stderr_len"), 0, 10**6) is None:
+            problems.append("probe observation stderr_len not bounded")
+    return problems + _scan_for_forbidden(payload)
+
+
+def write_probe_artifact(directory: Path, payload: Dict[str, Any]) -> Optional[Path]:
+    """Write the probe report if, and only if, it validates."""
+    return _write_checked(directory / "docker-probe.json", payload, validate_probe_report)
+
+
+def collect_probe_log(raw: str, directory: Path) -> int:
+    """Parse operator log text and persist the bounded report. 0 = nothing failed.
+
+    Log content is held in memory only. When no marker line is present nothing
+    is written and the exit status stays 0, so a clean run publishes no report
+    and a collection failure never fails the lifecycle by itself.
+    """
+    payload = parse_probe_log(raw)
+    if payload is None:
+        print("E2E diagnostics: probe log collected, 0 failed-probe line(s)")
+        return 0
+    written = write_probe_artifact(directory, payload)
+    print(
+        f"E2E diagnostics: probe log collected, {payload['occurrences']} failed-probe line(s), "
+        f"observations={len(payload['observations'])}, written={1 if written else 0}"
+    )
+    return 0
+
+
 # ── CLI: gate the artifact directory before upload ────────────────────
 
 
@@ -550,7 +707,13 @@ def gate(directory: Path) -> int:
             problems = ["unreadable JSON"]
         else:
             is_payload = isinstance(payload, dict) and ("events" in payload or "test" in payload)
-            problems = validate_payload(payload) if is_payload else validate_versions(payload)
+            is_probe = isinstance(payload, dict) and "observations" in payload
+            if is_payload:
+                problems = validate_payload(payload)
+            elif is_probe:
+                problems = validate_probe_report(payload)
+            else:
+                problems = validate_versions(payload)
         if problems:
             rejected += 1
     if rejected:
@@ -581,8 +744,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     """Validate diagnostics artifacts; non-zero means do not upload."""
     parser = argparse.ArgumentParser(description="Gate E2E diagnostics artifacts before upload")
     parser.add_argument("--validate-dir", required=True, help="directory holding JSON evidence")
+    parser.add_argument(
+        "--probe-log",
+        help="operator log file to reduce to closed-schema failed-probe facts",
+    )
     args = parser.parse_args(argv)
-    return gate(Path(args.validate_dir))
+    directory = Path(args.validate_dir)
+    if args.probe_log:
+        # Runs before the gate so the gate validates the artifact this produced.
+        # Collection is best-effort: a missing log means nothing to collect.
+        log_path = Path(args.probe_log)
+        try:
+            if not log_path.is_file():
+                raise OSError("not a regular file")
+            raw = ""
+            if log_path.stat().st_size <= MAX_LOG_BYTES:
+                raw = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            print("E2E diagnostics: probe log unreadable, nothing collected")
+            raw = ""
+        collect_probe_log(raw, directory)
+    return gate(directory)
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
