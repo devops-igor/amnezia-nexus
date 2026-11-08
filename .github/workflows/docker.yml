@@ -199,9 +199,17 @@ jobs:
         id: meta
         run: |
           REPO="ghcr.io/$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
-          TAGS="${REPO}:latest,${REPO}:${{ github.sha }}"
+          # Every build publishes its full commit SHA, so a branch build is
+          # addressable and testable by the exact revision it came from.
+          TAGS="${REPO}:${{ github.sha }}"
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            TAGS="${TAGS},${REPO}:${{ github.ref_name }}"
+            # Release tags keep their version tag and still move :latest.
+            TAGS="${TAGS},${REPO}:${{ github.ref_name }},${REPO}:latest"
+          elif [ "${GITHUB_REF:-}" = "refs/heads/main" ]; then
+            # :latest follows main only (see the push trigger above). A manual
+            # dispatch of a feature branch must not re-point :latest. GITHUB_REF
+            # is read from the environment, not interpolated into this script.
+            TAGS="${TAGS},${REPO}:latest"
           fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
