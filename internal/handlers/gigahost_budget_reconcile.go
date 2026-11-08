@@ -62,6 +62,11 @@ type budgetReconciliation struct {
 	// stale lists the records whose evidence no longer matched the stored row,
 	// so the release was correctly refused.
 	stale []int64
+	// evidence is the provider observation per record id. The budget decision
+	// must see it: without it a stored release marker could never be overridden
+	// by a live provider statement, and a held order could be missing from the
+	// total it is still consuming.
+	evidence map[int64]gigahostbudget.Evidence
 }
 
 // ledgerObservation is one provider observation plus the identity it was made
@@ -86,7 +91,11 @@ func (h *Handlers) gatherLedgerEvidence(
 	lookups := 0
 
 	for _, o := range orders {
-		if o.ReleasedAt != "" || gigahostbudget.IsLocallyTerminal(o.Status) {
+		// A released row is NOT skipped: its marker is a past decision, and the
+		// provider may since have made the obligation live (a held order deploys
+		// by itself). The observation is what lets the decision override a stale
+		// marker, so skipping it here would make that impossible.
+		if gigahostbudget.IsLocallyTerminal(o.Status) && o.ReleasedAt == "" {
 			continue
 		}
 		obs := ledgerObservation{orderID: o.OrderID, serverID: o.ServerID}
@@ -140,9 +149,21 @@ func (h *Handlers) reconcileLedgerReservations(
 	var out budgetReconciliation
 	observed := h.gatherLedgerEvidence(ctx, client, servers, orders)
 
+	// Publish the observation for every row, including released ones, so the
+	// budget decision can see a live obligation behind a stale marker.
+	out.evidence = make(map[int64]gigahostbudget.Evidence, len(observed))
+	for id, obs := range observed {
+		out.evidence[id] = obs.evidence
+	}
+
 	for i := range orders {
 		order := &orders[i]
-		if order.ReleasedAt != "" || gigahostbudget.IsLocallyTerminal(order.Status) {
+		if order.ReleasedAt != "" {
+			// A released row is never released again; whether it should still
+			// count is the decision's job, using the evidence published above.
+			continue
+		}
+		if gigahostbudget.IsLocallyTerminal(order.Status) {
 			continue
 		}
 		obs, seen := observed[order.ID]

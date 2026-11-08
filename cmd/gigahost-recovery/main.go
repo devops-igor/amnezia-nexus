@@ -216,8 +216,11 @@ func execute(cfg config) (report, int, error) {
 	rep.CommittedBefore = proposal.CommittedBefore
 	rep.CommittedAfter = proposal.CommittedAfter
 	rep.IncompleteTotal = proposal.IncompleteTotal
-	rep.Released = proposal.Changes
-	rep.Retained = proposal.Retained
+	// Emit empty slices rather than nil so a machine-readable plan always carries
+	// real arrays: a null here is indistinguishable from "not reported".
+	rep.Released = append([]gigahostbudget.ProposedChange{}, proposal.Changes...)
+	rep.Retained = append([]gigahostbudget.ProposedChange{}, proposal.Retained...)
+	rep.Unresolved = []gigahostbudget.ProposedChange{}
 	for _, r := range proposal.Retained {
 		if r.State == gigahostbudget.StateUnresolved {
 			rep.Unresolved = append(rep.Unresolved, r)
@@ -453,9 +456,10 @@ func writeText(w io.Writer, rep report) {
 		}
 		fmt.Fprintf(w, "This tool cannot release them: it is offline and holds no provider evidence.\n")
 		fmt.Fprintf(w, "Each one needs a provider fact that the panel has not recorded yet:\n")
-		fmt.Fprintf(w, "  - a terminated or deleted server for the matching provider server id, which ends the commitment, or\n")
-		fmt.Fprintf(w, "  - a waitlist order, which the provider states is not billed while it waits.\n")
-		fmt.Fprintf(w, "Once the panel sees one of those, its own reconciliation releases the reservation, with an audit row.\n")
+		fmt.Fprintf(w, "  - a terminated or deleted server for the matching provider server id, which ends the commitment.\n")
+		fmt.Fprintf(w, "A waitlist order is NOT such a fact: it is unbilled only while it waits and deploys automatically,\n")
+		fmt.Fprintf(w, "so it stays a pending commitment until the provider actually deploys or ends it.\n")
+		fmt.Fprintf(w, "Once the panel sees a conclusive fact, its own reconciliation releases the reservation, with an audit row.\n")
 		fmt.Fprintf(w, "There is no local waiver: a note cannot stand in for provider evidence.\n")
 	}
 	for _, warning := range rep.Warnings {

@@ -644,6 +644,7 @@ func (h *Handlers) evaluateBudget(ctx context.Context, client gigahost.Client, r
 	// a reservation the provider has conclusively ended must not be counted as
 	// committed, and this is the pre-existing automatic reconciliation.
 	reconciled := h.reconcileLedgerReservations(ctx, client, servers, localOrders)
+	evidence := reconciled.evidence
 	if len(reconciled.released) > 0 {
 		// Re-read so the priced snapshot includes the releases just written.
 		// Failing here must not silently keep released spend in the total.
@@ -655,10 +656,11 @@ func (h *Handlers) evaluateBudget(ctx context.Context, client gigahost.Client, r
 	}
 
 	res, err := gigahostbudget.Evaluate(gigahostbudget.Input{
-		CapNOK:  monthlyBudget,
-		Plans:   budgetPlans(catalog),
-		Servers: budgetServers(servers),
-		Entries: budgetEntries(localOrders),
+		CapNOK:   monthlyBudget,
+		Plans:    budgetPlans(catalog),
+		Servers:  budgetServers(servers),
+		Entries:  budgetEntries(localOrders),
+		Evidence: evidence,
 		Request: &gigahostbudget.Request{
 			PlanID:         req.PID,
 			PriceID:        req.PriceID,

@@ -93,21 +93,46 @@ var locallyTerminalStatuses = map[string]bool{
 // releaseConclusiveServerStatuses are the provider server statuses that end the
 // recurring commitment, with the contract basis quoted above.
 //
-// The provider's cancellation label is deliberately ABSENT: it is a *pending* cancellation and the
+// The cancellation label is deliberately ABSENT: it is a *pending* cancellation and the
 // server is still billed (E2). "stopped", "expired" and "refunded" are absent
 // because the documentation assigns them no billing meaning (E3).
+//
+// Residual obligation, stated rather than waived. Releasing on termination is the
+// behavior the approved scope requires ("proven obsolete auto release"), but the
+// contract also says of an hourly order: "the server is billed per hour at
+// rate_hourly, never more than monthly_cap per month" and that a
+// terminated hourly server's "final hours are billed on the next monthly invoice".
+// So an order terminated mid-month can still bill up to its own
+// monthly_cap *within that month*. Counting it as zero for the rest of the month
+// therefore under-counts real spend by at most one order's monthly_cap.
+//
+// That residual is a genuine product-policy choice, not a derivation:
+//
+//	(a) release on termination (approved scope, current behavior) and accept a
+//	    bounded under-count of at most one monthly_cap per order terminated in the
+//	    current month, or
+//	(b) keep a terminated order counted until its billing month ends, which would
+//	    need a billing-period anchor this ledger does not carry and would contradict
+//	    the approved "proven obsolete auto release" regression.
+//
+// (a) is kept because the approved scope chose it explicitly. This comment is the
+// record of the limit; it is not permission to present the monthly cap as an exact
+// bound on hourly spend.
 var releaseConclusiveServerStatuses = map[string]string{
 	"deleted":    "provider_deleted",
 	"terminated": "provider_terminated",
 }
 
-// waitlistStatus is the one deployment status the provider states carries no
-// charge (E4).
+// waitlistStatus is a HELD order, not a finished one. The contract states it is
+// unbilled *while it waits* AND that it "deploys automatically once capacity
+// frees up" (lines 5748, 5840). Temporary non-billing is therefore not final
+// obsolescence: the commitment is still armed and will activate without any new
+// budget check, so it must count.
 const waitlistStatus = "waitlist"
 
-// runningServerStatuses are provider statuses that positively describe a live
-// server, so they outrank a stale or locally terminal label.
-var runningServerStatuses = map[string]bool{
+// providerLiveStatuses are statuses that mean the provider has the order or the
+// resource in hand, so the obligation is live.
+var providerLiveStatuses = map[string]bool{
 	"ready":        true,
 	"active":       true,
 	"rescue":       true,
@@ -153,6 +178,34 @@ func IsSyntheticOrderID(id string) bool {
 // own.
 func IsLocallyTerminal(status string) bool {
 	return locallyTerminalStatuses[strings.ToLower(strings.TrimSpace(status))]
+}
+
+// obligationIsLive reports whether the provider's current observation shows a
+// live obligation, and why. It is used to decide whether a stored release marker
+// still describes reality.
+//
+// Only a positive statement about the resource or the order counts as live: a
+// failed query, an omission, an absent status and an unknown label are not
+// evidence either way, and must not be used to resurrect or to suppress spend.
+func obligationIsLive(ev Evidence) (bool, string) {
+	if ev.OrderQueryFailed {
+		return false, ""
+	}
+	if ev.ServerFound {
+		status := strings.ToLower(strings.TrimSpace(ev.ServerStatus))
+		if _, conclusive := releaseConclusiveServerStatuses[status]; conclusive {
+			return false, ""
+		}
+		if providerLiveStatuses[status] || status == waitlistStatus {
+			return true, "the provider reports the matching server as " + strOrUnknown(ev.ServerStatus)
+		}
+		return false, ""
+	}
+	if ev.ProviderOrderFound && strings.TrimSpace(ev.ProviderOrderStatus) != "" {
+		status := strings.ToLower(strings.TrimSpace(ev.ProviderOrderStatus))
+		return true, "the provider reports this order as " + status
+	}
+	return false, ""
 }
 
 // IsActiveForBudget reports whether a local ledger label can represent a
@@ -206,7 +259,25 @@ func EntryMatchesServer(e Entry, s Server) bool {
 // label can keep a reservation counted, and can end one the provider is silent
 // about; it can never release a reservation the provider shows alive.
 func Classify(e Entry, ev Evidence) Verdict {
+	// A release marker is a record of a past decision, not a statement about the
+	// provider's current state. It must not suppress a live obligation:
+	//
+	//   "Reservations are held orders that deploy automatically when capacity
+	//    frees up"
+	//
+	// A reservation released while it was merely unbilled can activate later with
+	// no new budget check. The provider's current answer therefore outranks the
+	// marker, and the obligation is counted again. Only a terminal observation (or
+	// no observation at all) lets the marker stand.
 	if e.ReleasedAt != "" {
+		if live, why := obligationIsLive(ev); live {
+			return Verdict{
+				State:  StateActive,
+				Reason: "released_but_provider_live",
+				Explanation: "this reservation was released on evidence that is no longer current: " + why +
+					"; the release marker does not erase the live obligation",
+			}
+		}
 		return Verdict{
 			State:       StateReleased,
 			Reason:      "released",
@@ -233,7 +304,7 @@ func Classify(e Entry, ev Evidence) Verdict {
 				Releasable: true,
 			}
 		}
-		if runningServerStatuses[status] {
+		if providerLiveStatuses[status] {
 			return Verdict{
 				State:  StateActive,
 				Reason: "provider_resource_running",
@@ -253,16 +324,18 @@ func Classify(e Entry, ev Evidence) Verdict {
 		}
 	}
 
-	// 2. A deployment-level answer. The only status the contract states is
-	// unbilled is the waitlist.
+	// 2. A deployment-level answer.
 	if ev.ProviderOrderFound {
 		status := strings.ToLower(strings.TrimSpace(ev.ProviderOrderStatus))
 		if status == waitlistStatus {
+			// Debited nothing YET, but still an armed commitment that deploys by
+			// itself. Counting it is what keeps a later automatic deployment
+			// inside the cap and inside duplicate protection.
 			return Verdict{
-				State:       StateObsolete,
-				Reason:      "provider_waitlist_not_billed",
-				Explanation: "the provider reports this order as a waitlist reservation, and nothing is billed while a reservation waits",
-				Releasable:  true,
+				State:  StateActive,
+				Reason: "provider_waitlist_pending",
+				Explanation: "the provider reports this order as a waitlist reservation: nothing is billed while it waits, " +
+					"but it deploys automatically once capacity frees up, so the commitment is pending, not over",
 			}
 		}
 		if status != "" {

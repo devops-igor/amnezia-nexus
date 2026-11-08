@@ -384,14 +384,20 @@ func TestPropose_ReleasesOnlyOnEvidence(t *testing.T) {
 		t.Errorf("totals = %v -> %v, want 82 -> 82", p.CommittedBefore, p.CommittedAfter)
 	}
 
-	// Now confirm the record that carries no provider identity.
-	in.Evidence[1] = Evidence{ProviderOrderFound: true, ProviderOrderStatus: "waitlist"}
+	// A1b CORRECTION: the second half of this test used to "release" record 1 by
+	// declaring it a waitlist order. A waitlist order deploys automatically, so it
+	// is a pending commitment and never releasable. The release positive control
+	// now uses a contract-supported termination instead.
+	in.Evidence[1] = Evidence{ServerFound: true, ServerStatus: "terminated"}
 	p, err = Propose(in)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(p.Changes) != 1 || p.Changes[0].RecordID != 1 {
 		t.Fatalf("changes = %+v, want exactly record 1", p.Changes)
+	}
+	if p.Changes[0].Reason != "provider_terminated" {
+		t.Errorf("release reason = %q, want provider_terminated", p.Changes[0].Reason)
 	}
 	if p.CommittedBefore != 82 {
 		t.Errorf("committed before = %v, want 82: it must show what the panel charges today", p.CommittedBefore)

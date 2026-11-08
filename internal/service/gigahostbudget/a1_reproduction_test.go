@@ -105,11 +105,15 @@ func TestA1_RetainedConclusivePositives(t *testing.T) {
 				v.State, v.Releasable, v.Reason)
 		}
 	})
-	t.Run("waitlist reservation is contractually not billed", func(t *testing.T) {
+	t.Run("waitlist reservation is a pending commitment, not a release", func(t *testing.T) {
+		// A1b CORRECTION. A1 read "nothing is billed while a reservation waits"
+		// as final obsolescence. The contract in the same paragraph says the held
+		// order "deploys automatically when capacity frees up", so the obligation
+		// is still armed: it must count and must never be releasable.
 		e := entry(1, "10001", 0, "waitlist", 202, 0.057)
 		v := Classify(e, Evidence{ProviderOrderStatus: "waitlist", ProviderOrderFound: true})
-		if v.State != StateObsolete || !v.Releasable || v.Reason != "provider_waitlist_not_billed" {
-			t.Fatalf("state=%q releasable=%v reason=%q, want obsolete+releasable provider_waitlist_not_billed",
+		if v.State != StateActive || v.Releasable || v.Reason != "provider_waitlist_pending" {
+			t.Fatalf("state=%q releasable=%v reason=%q, want active+not-releasable provider_waitlist_pending",
 				v.State, v.Releasable, v.Reason)
 		}
 	})
