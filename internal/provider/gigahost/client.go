@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strconv"
 	"strings"
@@ -34,6 +35,10 @@ type Config struct {
 	HTTPClient *http.Client
 	Transport  http.RoundTripper
 	Timeout    time.Duration
+	// OnCall, when set, receives one bounded timing record per provider call.
+	// It is opt-in: a nil callback attaches no httptrace client, so the request
+	// path is unchanged. Implementations must not block or panic.
+	OnCall func(CallTiming)
 }
 
 // client implements Client using standard net/http.
@@ -41,6 +46,7 @@ type client struct {
 	baseURL         string
 	apiKey          string
 	httpClient      *http.Client
+	onCall          func(CallTiming)
 	mu              sync.Mutex
 	unknownOrders   map[string]time.Time
 	lastEligibility CatalogEligibility
@@ -83,6 +89,7 @@ func NewClient(cfg Config) (Client, error) {
 		baseURL:       baseURL,
 		apiKey:        cfg.APIKey,
 		httpClient:    httpClient,
+		onCall:        cfg.OnCall,
 		unknownOrders: make(map[string]time.Time),
 	}, nil
 }
@@ -532,6 +539,14 @@ func (c *client) doRequest(ctx context.Context, method, path string, body any, t
 		bodyReader = bytes.NewReader(jsonBytes)
 	}
 
+	// Timing is opt-in: with no sink configured no recorder and no trace are
+	// created, leaving this path byte-for-byte unchanged.
+	var recorder *timingRecorder
+	if c.onCall != nil {
+		recorder = newTimingRecorder(method, path)
+		ctx = httptrace.WithClientTrace(ctx, recorder.clientTrace())
+	}
+
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
 	if err != nil {
 		return fmt.Errorf("failed to create http request: %w", err)
@@ -545,13 +560,22 @@ func (c *client) doRequest(ctx context.Context, method, path string, body any, t
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if recorder != nil {
+			recorder.finish(ctx, c.onCall, 0, err)
+		}
 		return err
 	}
 	defer resp.Body.Close()
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if recorder != nil {
+			recorder.finish(ctx, c.onCall, resp.StatusCode, err)
+		}
 		return fmt.Errorf("failed to read response body: %w", err)
+	}
+	if recorder != nil {
+		recorder.finish(ctx, c.onCall, resp.StatusCode, nil)
 	}
 
 	switch {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -78,9 +79,30 @@ func (h *Handlers) getGigahostClient(ctx context.Context, r *http.Request) (giga
 		return nil, errors.New("gigahost api key not configured: set GIGAHOST_API_KEY, gigahost setting, or X-Gigahost-API-Key header")
 	}
 
+	// Build the client with one fixed-key timing record per provider call. The
+	// record carries only closed-set labels, bounded phase offsets and an
+	// outcome class - never a URL, host, id, header, body or error text - so
+	// the operator log can be reduced to an allowlisted artifact.
+	var onCall func(gigahost.CallTiming)
+	if timingEnabled() {
+		onCall = func(t gigahost.CallTiming) {
+			slog.Info(gigahost.CallTimingMarker, gigahost.TimingRecord(t)...)
+		}
+	}
+
 	return gigahost.NewClient(gigahost.Config{
 		APIKey: apiKey,
+		OnCall: onCall,
 	})
+}
+
+// timingEnabled reports whether provider call timing is switched on.
+//
+// Off by default: the record exists to diagnose a specific stall, and an
+// operator turns it on deliberately for that run. Only the literal "1" enables
+// it, so a stray non-empty value cannot silently start publishing records.
+func timingEnabled() bool {
+	return os.Getenv("GIGAHOST_CALL_TIMING") == "1"
 }
 
 // ensureGigahostOrdersTable creates the gigahost_orders schema if missing.
