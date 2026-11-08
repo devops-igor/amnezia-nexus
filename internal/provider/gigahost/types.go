@@ -238,24 +238,37 @@ type OrderRequest struct {
 }
 
 // OrderResponse represents the response when an order is submitted.
+//
+// RateHourly, MonthlyCap and Currency are the per-order price contract the
+// provider returns at order time. They are the only authoritative record of
+// what an existing hourly reservation costs, so they are decoded here and
+// persisted by the caller; the provider does not expose price_id on any later
+// read.
 type OrderResponse struct {
 	OrderID   string `json:"order_id"`
 	ServerID  int64  `json:"server_id,omitempty"`
 	Status    string `json:"status"`
 	Message   string `json:"message,omitempty"`
 	CreatedAt string `json:"created_at,omitempty"`
+
+	RateHourly float64 `json:"rate_hourly,omitempty"`
+	MonthlyCap float64 `json:"monthly_cap,omitempty"`
+	Currency   string  `json:"currency,omitempty"`
 }
 
 // UnmarshalJSON supports string or integer order_id and server_id, and handles {data: {order_ids: [...]}}.
 func (o *OrderResponse) UnmarshalJSON(data []byte) error {
 	type rawOrder struct {
-		OrderID   any    `json:"order_id"`
-		ServerID  any    `json:"server_id"`
-		Status    string `json:"status"`
-		Message   string `json:"message"`
-		CreatedAt string `json:"created_at"`
-		Success   *bool  `json:"success"`
-		OrderIDs  []any  `json:"order_ids"`
+		OrderID    any     `json:"order_id"`
+		ServerID   any     `json:"server_id"`
+		Status     string  `json:"status"`
+		Message    string  `json:"message"`
+		CreatedAt  string  `json:"created_at"`
+		Success    *bool   `json:"success"`
+		OrderIDs   []any   `json:"order_ids"`
+		RateHourly float64 `json:"rate_hourly"`
+		MonthlyCap float64 `json:"monthly_cap"`
+		Currency   string  `json:"currency"`
 	}
 	type envelope struct {
 		Data rawOrder `json:"data"`
@@ -272,6 +285,9 @@ func (o *OrderResponse) UnmarshalJSON(data []byte) error {
 	o.Status = raw.Status
 	o.Message = raw.Message
 	o.CreatedAt = raw.CreatedAt
+	o.RateHourly = raw.RateHourly
+	o.MonthlyCap = raw.MonthlyCap
+	o.Currency = raw.Currency
 
 	if len(raw.OrderIDs) > 0 {
 		o.OrderID = parseStringField(raw.OrderIDs[0])

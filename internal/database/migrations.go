@@ -49,6 +49,9 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 	if err := d.migrateAWGIPAllocations(ctx); err != nil {
 		return err
 	}
+	if err := d.migrateGigahostOrders(ctx); err != nil {
+		return err
+	}
 	return d.migratePeerLifecycle(ctx)
 }
 
