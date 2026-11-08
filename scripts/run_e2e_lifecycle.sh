@@ -36,6 +36,18 @@ export E2E_SERVER_SSH_USER="${E2E_SERVER_SSH_USER:-ubuntu}"
 export E2E_SERVER_SSH_PASS="${E2E_SERVER_SSH_PASS:-}"
 export E2E_TESTING="${E2E_TESTING:-true}"
 export E2E_REQUIRE_DATAPLANE="${E2E_REQUIRE_DATAPLANE:-false}"
+# Privacy-first diagnostics: allowlisted request/navigation events only.
+export E2E_DIAGNOSTICS_DIR="${E2E_DIAGNOSTICS_DIR:-$REPO_ROOT/test-artifacts/e2e-diagnostics}"
+
+# Operator log source for failed-probe facts. Exactly one of these is normally
+# set; both are optional and unset means no probe evidence is collected.
+#   E2E_PANEL_LOG_PATH       read an already-captured log file
+#   E2E_PANEL_LOG_CONTAINER  run `docker logs <container>` at collection time
+# The container form is the default CI wiring because the probe failure happens
+# *during* the run: a log captured before it would miss the evidence, and the
+# post-test teardown removes the container.
+export E2E_PANEL_LOG_PATH="${E2E_PANEL_LOG_PATH:-}"
+export E2E_PANEL_LOG_CONTAINER="${E2E_PANEL_LOG_CONTAINER:-}"
 
 # Stage status trackers
 STAGE1_STATUS="SKIPPED"
@@ -77,6 +89,45 @@ print_summary() {
         echo "  OVERALL VERDICT: LIFECYCLE VERIFICATION FAILED [EXIT ${OVERALL_STATUS}]"
     fi
     echo "=================================================================="
+}
+
+# Privacy-first evidence gate. Runs in this lifecycle job (never a separate
+# qualification job). Withholding is all-or-nothing inside the module: on any
+# rejection the whole diagnostics directory is removed, so the upload step
+# publishes nothing.
+finalize() {
+    local validate_status=0
+    # Resolve the operator-log source at collection time, then reduce it to
+    # closed-schema failed-probe facts before the gate runs, so the gate
+    # validates the artifact this produces. Collection happens here — before the
+    # caller's teardown removes the container — because the probe fails *during*
+    # the run. Every failure mode (no source, missing container, docker absent,
+    # unreadable file) collects nothing and never changes the verdict.
+    local probe_args=()
+    local probe_tmp=""
+    if [ -n "${E2E_PANEL_LOG_CONTAINER:-}" ]; then
+        probe_tmp="$(mktemp -t panel-operator-XXXXXX.log)"
+        if ! docker logs "$E2E_PANEL_LOG_CONTAINER" > "$probe_tmp" 2>&1; then
+            echo "==> Operator log from container '${E2E_PANEL_LOG_CONTAINER}' unavailable; no probe evidence collected."
+        fi
+        probe_args=(--probe-log "$probe_tmp")
+    elif [ -n "${E2E_PANEL_LOG_PATH:-}" ]; then
+        probe_args=(--probe-log "$E2E_PANEL_LOG_PATH")
+    fi
+    if ! (cd "$REPO_ROOT" && python3 -m tests.e2e.diagnostics \
+            --validate-dir "$E2E_DIAGNOSTICS_DIR" "${probe_args[@]}"); then
+        echo "ERROR: E2E diagnostics failed validation; evidence withheld." >&2
+        validate_status=1
+        OVERALL_STATUS=1
+    fi
+    # The raw log never leaves the host: it is deleted as soon as the bounded
+    # facts are extracted, so no full operator log can be uploaded by accident.
+    if [ -n "$probe_tmp" ]; then
+        rm -f "$probe_tmp"
+    fi
+    echo "==> Diagnostics directory: ${E2E_DIAGNOSTICS_DIR} (validation exit ${validate_status})"
+    print_summary
+    exit "$OVERALL_STATUS"
 }
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
@@ -121,8 +172,7 @@ if [ "$READY" -ne 1 ]; then
     echo "ERROR: Panel fixture failed readiness probe within 30s." >&2
     echo "Please ensure the panel is running on a clean-slate database before running this script." >&2
     OVERALL_STATUS=1
-    print_summary
-    exit 1
+    finalize
 fi
 echo "==> Panel fixture is healthy."
 
@@ -140,8 +190,7 @@ else
     STAGE1_STATUS="FAILED"
     OVERALL_STATUS=1
     echo "ERROR: Stage 1 FAILED. Aborting subsequent stages." >&2
-    print_summary
-    exit "$OVERALL_STATUS"
+    finalize
 fi
 
 # ------------------------------------------------------------------------------
@@ -158,8 +207,7 @@ else
     STAGE2_STATUS="FAILED"
     OVERALL_STATUS=1
     echo "ERROR: Stage 2 FAILED. Aborting subsequent stages." >&2
-    print_summary
-    exit "$OVERALL_STATUS"
+    finalize
 fi
 
 # ------------------------------------------------------------------------------
@@ -188,5 +236,5 @@ else
     echo "ERROR: Stage 3 FAILED." >&2
 fi
 
-print_summary
-exit "$OVERALL_STATUS"
+finalize
+

@@ -204,13 +204,26 @@ func New(endpoint string, p models.VLESSRealityParams) (*Dialer, error) {
 	}, nil
 }
 
+// modernPQProfileAliases holds the profile *names* that select the modern Post-Quantum engine.
+// Version strings are handled by prefix in isModernPQ so a pin change does not need an edit here.
+var modernPQProfileAliases = map[string]bool{
+	"modern_pq":    true,
+	"modern":       true,
+	"pq":           true,
+	"modern pq":    true,
+	"post_quantum": true,
+	"post-quantum": true,
+}
+
 func (d *Dialer) isModernPQ() bool {
-	switch d.engineProfile {
-	case "modern_pq", "modern", "pq", "26.10.29", "v26.10.29", "modern pq", "post_quantum", "post-quantum":
+	profile := strings.ToLower(strings.TrimSpace(d.engineProfile))
+	if modernPQProfileAliases[profile] {
 		return true
-	default:
-		return false
 	}
+	// The 26.10.* family is matched by prefix so the current pin (26.10.31) or a legacy saved
+	// alias (26.10.29) is always treated as modern PQ. An exact-literal version list silently
+	// downgraded the handshake whenever the pin moved.
+	return strings.HasPrefix(profile, "26.10.") || strings.HasPrefix(profile, "v26.10.")
 }
 
 // configureKeyShares validates and adapts the ClientHello key shares to match the engine profile.

@@ -116,6 +116,10 @@ func (hp *HealthProber) SelfHealSweep(ctx context.Context) int {
 
 	targets := hp.collectSelfHealTargets()
 	if len(targets) == 0 {
+		// Even with nothing to recover, an automatic failover that previously
+		// found no target may now be completable (F16), so still let the data
+		// plane owner settle its outstanding debt.
+		hp.retryPendingFailovers(ctx)
 		return 0
 	}
 
@@ -134,7 +138,23 @@ func (hp *HealthProber) SelfHealSweep(ctx context.Context) int {
 	}
 
 	wg.Wait()
+	// A backend that just recovered may be exactly the alternative an earlier
+	// health failover was waiting for, so settle that debt in the same sweep.
+	hp.retryPendingFailovers(ctx)
 	return int(reconnectedCount.Load())
+}
+
+// retryPendingFailovers invokes the data plane owner's unfinished-failover
+// settlement, if one was registered. It runs outside hp.mu/pool.mu and never
+// panics the sweep because of a nil/absent owner.
+func (hp *HealthProber) retryPendingFailovers(ctx context.Context) {
+	hp.mu.RLock()
+	retry := hp.selfHealFailoverRetrier
+	hp.mu.RUnlock()
+	if retry == nil {
+		return
+	}
+	retry(ctx)
 }
 
 func (hp *HealthProber) collectSelfHealTargets() []*models.BackendTunnel {
@@ -261,6 +281,28 @@ func (hp *HealthProber) invokeSelfHealHook(ctx context.Context, tunNow *models.B
 	return true
 }
 
+func (hp *HealthProber) determineSelfHealStatus(
+	ctx context.Context,
+	tun *models.BackendTunnel,
+	latencyMS int64,
+	latencyThreshold int64,
+) string {
+	if hp.hasCanaryProber(tun) {
+		if canaryErr := hp.probeCanary(ctx, tun); canaryErr != nil {
+			slog.Warn("self-healing outer probe succeeded but inner canary failed; denying self-healing recovery",
+				"server_id", tun.ServerID,
+				"tunnel_id", tun.ID,
+				"error", canaryErr,
+			)
+			return ""
+		}
+	}
+	if latencyMS > latencyThreshold {
+		return "degraded"
+	}
+	return "active"
+}
+
 func (hp *HealthProber) finalizeSelfHealRecovery(
 	ctx context.Context,
 	tun *models.BackendTunnel,
@@ -285,9 +327,13 @@ func (hp *HealthProber) finalizeSelfHealRecovery(
 		return false
 	}
 
-	newStatus := "active"
-	if latencyMS > latencyThreshold {
-		newStatus = "degraded"
+	newStatus := hp.determineSelfHealStatus(ctx, tunAfterHook, latencyMS, latencyThreshold)
+	if newStatus == "" {
+		slog.Warn("self-healing recovery denied: inner canary verification failed",
+			"server_id", tun.ServerID,
+			"tunnel_id", tun.ID,
+		)
+		return false
 	}
 
 	swapped, err := hp.pool.CompareAndSwapTunnelStatusForTunnel(

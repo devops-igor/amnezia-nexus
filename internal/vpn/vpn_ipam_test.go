@@ -104,6 +104,9 @@ func TestGenerateClientConfig_ServerRestartIPAMRestoration(t *testing.T) {
 	vpnSvc2.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 20 * time.Millisecond, nil
 	})
+	vpnSvc2.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		return nil
+	})
 	if err := vpnSvc2.Start(ctx); err != nil {
 		t.Fatalf("vpnSvc2.Start failed: %v", err)
 	}

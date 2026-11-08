@@ -34,6 +34,12 @@ func TestSelfHealing_EndToEndRecovery(t *testing.T) {
 		}
 		return 25 * time.Millisecond, nil
 	})
+	vpnSvc.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		if probeFails.Load() {
+			return errors.New("simulated canary timeout")
+		}
+		return nil
+	})
 
 	tun := tunMust(t, vpnSvc, s1ID)
 
@@ -122,6 +128,12 @@ func TestSelfHealing_SubsequentFailureGracePeriodRestored(t *testing.T) {
 			return 0, errors.New("simulated probe timeout")
 		}
 		return 20 * time.Millisecond, nil
+	})
+	vpnSvc.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		if probeFails.Load() {
+			return errors.New("simulated canary timeout")
+		}
+		return nil
 	})
 
 	tun := tunMust(t, vpnSvc, s1ID)
@@ -260,6 +272,12 @@ func TestSelfHealing_AutoDisabledSurvivesRestartAndRecovers(t *testing.T) {
 		}
 		return 20 * time.Millisecond, nil
 	})
+	vpnSvc1.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		if probeFails.Load() {
+			return errors.New("simulated canary timeout")
+		}
+		return nil
+	})
 
 	tun := tunMust(t, vpnSvc1, s1ID)
 	for i := 0; i < 3; i++ {
@@ -300,6 +318,9 @@ func TestSelfHealing_AutoDisabledSurvivesRestartAndRecovers(t *testing.T) {
 	probeFails.Store(false)
 	vpnSvc2.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
 		return 20 * time.Millisecond, nil
+	})
+	vpnSvc2.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		return nil
 	})
 	if got := vpnSvc2.SelfHealSweep(ctx); got != 0 {
 		t.Fatalf("first flap-damping sweep reconnected %d tunnels, want 0", got)
@@ -403,6 +424,12 @@ func TestSelfHealing_ConcurrentDisableBackendDuringSelfHeal(t *testing.T) {
 			return 0, errors.New("simulated probe timeout")
 		}
 		return 20 * time.Millisecond, nil
+	})
+	vpnSvc.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		if probeFails.Load() {
+			return errors.New("simulated canary timeout")
+		}
+		return nil
 	})
 
 	tun := tunMust(t, vpnSvc, s1ID)
@@ -512,6 +539,12 @@ func TestSelfHealing_HighLatencyProductionRecoveryMarkedDegraded(t *testing.T) {
 			return 0, errors.New("simulated probe failure")
 		}
 		return 700 * time.Millisecond, nil
+	})
+	vpnSvc.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		if probeFails.Load() {
+			return errors.New("simulated canary failure")
+		}
+		return nil
 	})
 
 	tun := tunMust(t, vpnSvc, s1ID)

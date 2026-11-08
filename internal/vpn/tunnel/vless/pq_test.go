@@ -370,17 +370,24 @@ func TestDialer_XrayV26_StrictPQHandshakeAndDataStream(t *testing.T) {
 // Pinned container image tags and multi-arch manifest list digests.
 // Verified against published GitHub package metadata (ghcr.io/xtls/xray-core).
 //   - 1.8.24: multi-arch manifest list sha256:6b3ef1780d4be55c1bc4848232a90272d31c28cc3d0de1f2a50a56f48993be9d
-//     (published 2024-03-24 by XTLS/Xray-core releases)
-//   - 26.10.29: multi-arch manifest list sha256:c9443f3ee297f6481bc245269d61720c6f989195ee9b58fa90fdd99f03c21044
-//     (published 2024-10-29 by XTLS/Xray-core releases)
+//     (upstream release published 2024-08-30T07:01:34Z)
+//   - 26.10.31: multi-arch manifest list sha256:ceabeac03a89d991d2a247361825c1d1d2e9c91cd5dc010f298c7dc0c2f325c9
+//     (upstream release published 2026-10-31T13:37:42Z; supersedes the retracted 26.10.29)
+//
+// These digests are checked against hardcoded literals by TestPinnedImageDigests, which cannot
+// detect upstream withdrawal — it passed while the previous 26.10.29 manifest was already 404.
+// Registry existence is proven at implementation time by TestDialer_ContainerFixtures, whose
+// pre-pull of pinnedModernImage fails loudly on MANIFEST_UNKNOWN.
 const (
 	pinnedLegacyDigest = "sha256:6b3ef1780d4be55c1bc4848232a90272d31c28cc3d0de1f2a50a56f48993be9d"
 	pinnedLegacyImage  = "ghcr.io/xtls/xray-core:1.8.24@" + pinnedLegacyDigest
-	pinnedModernDigest = "sha256:c9443f3ee297f6481bc245269d61720c6f989195ee9b58fa90fdd99f03c21044"
-	pinnedModernImage  = "ghcr.io/xtls/xray-core:26.10.29@" + pinnedModernDigest
+	pinnedModernDigest = "sha256:ceabeac03a89d991d2a247361825c1d1d2e9c91cd5dc010f298c7dc0c2f325c9"
+	pinnedModernImage  = "ghcr.io/xtls/xray-core:26.10.31@" + pinnedModernDigest
 )
 
 // TestPinnedImageDigests verifies that pinned image digests conform to published GitHub package metadata.
+// It is a literal-coherence check only; it cannot detect upstream withdrawal of a digest — see
+// TestPinnedModernImageIsNotWithdrawn for the anti-regression controls around the retracted pin.
 func TestPinnedImageDigests(t *testing.T) {
 	wantLegacy := "sha256:6b3ef1780d4be55c1bc4848232a90272d31c28cc3d0de1f2a50a56f48993be9d"
 	if pinnedLegacyDigest != wantLegacy {
@@ -390,7 +397,7 @@ func TestPinnedImageDigests(t *testing.T) {
 		t.Errorf("pinnedLegacyImage %q does not embed expected digest %q", pinnedLegacyImage, wantLegacy)
 	}
 
-	wantModern := "sha256:c9443f3ee297f6481bc245269d61720c6f989195ee9b58fa90fdd99f03c21044"
+	wantModern := "sha256:ceabeac03a89d991d2a247361825c1d1d2e9c91cd5dc010f298c7dc0c2f325c9"
 	if pinnedModernDigest != wantModern {
 		t.Errorf("pinnedModernDigest = %q, want %q", pinnedModernDigest, wantModern)
 	}
@@ -401,7 +408,7 @@ func TestPinnedImageDigests(t *testing.T) {
 
 // TestDialer_ContainerFixtures runs when a local Docker daemon is present, testing real
 // authenticated REALITY handshakes, bidirectional TCP data streams, wrong-key rejection,
-// and restart recovery against both pinned 1.8.24 and 26.10.29 container fixtures.
+// and restart recovery against both pinned 1.8.24 and 26.10.31 container fixtures.
 func TestDialer_ContainerFixtures(t *testing.T) {
 	dockerPath, err := exec.LookPath("docker")
 	if err != nil {
@@ -417,7 +424,7 @@ func TestDialer_ContainerFixtures(t *testing.T) {
 		engineProfile string
 	}{
 		{name: "legacy_1_8_24", image: pinnedLegacyImage, engineProfile: "legacy"},
-		{name: "modern_26_10_29", image: pinnedModernImage, engineProfile: "modern_pq"},
+		{name: "modern_26_10_31", image: pinnedModernImage, engineProfile: "modern_pq"},
 	}
 
 	for _, tc := range fixtures {

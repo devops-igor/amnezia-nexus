@@ -88,6 +88,9 @@ type Device struct {
 	beforeCreateEndpointHook func()
 	createdAt                time.Time
 	stats                    deviceStats
+	canaryMu                 sync.RWMutex
+	canaryHooks              map[uint64]func([]byte) bool
+	nextHookID               uint64
 }
 
 // New creates and initializes a stream bridge Device with gVisor netstack.
@@ -230,28 +233,64 @@ func (d *Device) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// RegisterCanaryResponseHook registers a callback to demultiplex in-tunnel canary responses
+// during single-reader return pumping. The returned function unregisters the hook cleanly.
+func (d *Device) RegisterCanaryResponseHook(hook func([]byte) bool) func() {
+	d.canaryMu.Lock()
+	if d.canaryHooks == nil {
+		d.canaryHooks = make(map[uint64]func([]byte) bool)
+	}
+	d.nextHookID++
+	id := d.nextHookID
+	d.canaryHooks[id] = hook
+	d.canaryMu.Unlock()
+	return func() {
+		d.canaryMu.Lock()
+		delete(d.canaryHooks, id)
+		d.canaryMu.Unlock()
+	}
+}
+
 // Read extracts an outbound L3 packet emitted by the netstack into p.
 // It unblocks and returns net.ErrClosed only when the device is closed.
 // Oversize packets are safely dropped without returning an error.
 func (d *Device) Read(p []byte) (int, error) {
-	pkt := d.ep.ReadContext(d.ctx)
-	if pkt == nil {
-		return 0, net.ErrClosed
-	}
-	defer pkt.DecRef()
+	for {
+		pkt := d.ep.ReadContext(d.ctx)
+		if pkt == nil {
+			return 0, net.ErrClosed
+		}
+		v := pkt.ToView()
+		pkt.DecRef()
+		if v == nil {
+			return 0, nil
+		}
 
-	v := pkt.ToView()
-	if v == nil {
-		return 0, nil
-	}
-	defer v.Release()
+		slice := v.AsSlice()
+		d.canaryMu.RLock()
+		consumed := false
+		for _, h := range d.canaryHooks {
+			if h != nil && h(slice) {
+				consumed = true
+				break
+			}
+		}
+		d.canaryMu.RUnlock()
+		if consumed {
+			v.Release()
+			continue
+		}
 
-	if v.Size() > len(p) {
-		d.stats.oversize.Add(1)
-		return 0, nil
-	}
+		if v.Size() > len(p) {
+			d.stats.oversize.Add(1)
+			v.Release()
+			return 0, nil
+		}
 
-	return copy(p, v.AsSlice()), nil
+		n := copy(p, slice)
+		v.Release()
+		return n, nil
+	}
 }
 
 // Close gracefully terminates the device, canceling active flows, closing the netstack,

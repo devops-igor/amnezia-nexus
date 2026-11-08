@@ -122,10 +122,13 @@ func (sm *StickySessionManager) GetOrAssignBackend(ctx context.Context, req *Rou
 		}
 	}
 
-	// Verify if the sticky backend is still active and within capacity
+	// Verify if the sticky backend is still active and within capacity.
+	// Issue #713: Do NOT evict pinned client sessions from handshake_blocked backends!
+	// Keep established sessions pinned to the backend as long as the data plane is viable.
 	if hasAffinity {
 		for _, t := range req.AvailableTunnels {
-			if t.ID == targetTunnelID && t.Enabled && strings.EqualFold(t.Status, "active") {
+			isViable := strings.EqualFold(t.Status, models.TunnelStatusActive) || strings.EqualFold(t.Status, models.TunnelStatusHandshakeBlocked)
+			if t.ID == targetTunnelID && t.Enabled && isViable {
 				if sm.caps.MaxPeersPerBackend <= 0 || t.ActiveConnections < sm.caps.MaxPeersPerBackend {
 					// Sticky affinity preserved: refresh lastSeen
 					rec := affinityRecord{tunnelID: targetTunnelID, lastSeen: now}
@@ -442,6 +445,15 @@ func (sm *StickySessionManager) persistFailoverMoves(ctx context.Context, dbMove
 }
 
 func (sm *StickySessionManager) HandleFailover(ctx context.Context, degradedTunnelID int64, availableTunnels []*models.BackendTunnel, sourceProto ...string) (*FailoverResult, error) {
+	// Issue #713: Do NOT evict pinned client sessions from handshake_blocked backends!
+	// Keep established sessions pinned to the backend as long as the data plane is viable.
+	// Only truly disabled (or non-handshake_blocked degraded) backends trigger failover moves.
+	for _, t := range availableTunnels {
+		if t != nil && t.ID == degradedTunnelID && strings.EqualFold(t.Status, models.TunnelStatusHandshakeBlocked) {
+			return &FailoverResult{}, nil
+		}
+	}
+
 	family := models.ProtocolAWG
 	if len(sourceProto) > 0 && sourceProto[0] != "" {
 		family = models.NormalizeTunnelProtocol(sourceProto[0])

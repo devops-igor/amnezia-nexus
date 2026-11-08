@@ -30,6 +30,9 @@ func TestEnableBackendResetsHealthFailCount(t *testing.T) {
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 0, errors.New("simulated handshake timeout")
 	})
+	vpnSvc.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		return errors.New("simulated canary timeout")
+	})
 
 	tun := tunMust(t, vpnSvc, s1ID)
 
@@ -106,6 +109,9 @@ func TestEnableBackend_ReenablesAdminDisabledHealthState(t *testing.T) {
 	vpnSvc.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
 		return 0, errors.New("simulated handshake timeout")
 	})
+	vpnSvc.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		return errors.New("simulated canary timeout")
+	})
 
 	tun := tunMust(t, vpnSvc, s1ID)
 	for i := 0; i < 3; i++ {
@@ -149,6 +155,9 @@ func TestEnableBackend_ReenablesAdminDisabledHealthState(t *testing.T) {
 
 	vpnSvc.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
 		return 20 * time.Millisecond, nil
+	})
+	vpnSvc.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		return nil
 	})
 	if got := vpnSvc.SelfHealSweep(ctx); got != 0 {
 		t.Fatalf("first self-heal sweep must respect flap damping, got %d recoveries", got)

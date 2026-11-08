@@ -125,8 +125,19 @@ type peerSynchronizer struct {
 	// the PeerChangeListener visible to the database, so there is no
 	// instant at which a durable commit can reach this synchronizer and
 	// find the enqueue path unarmed.
-	lcMu      sync.Mutex
-	lcState   peerSyncLifecycle
+	lcMu    sync.Mutex
+	lcState peerSyncLifecycle
+	// lcGen is the live notify-worker generation, guarded by lcMu; it
+	// advances on every start and stop. Stop retires the generation and
+	// settles the queued count in the same critical section, so a token
+	// from a retired generation must neither serve a pass nor decrement
+	// the settled count (issue #729).
+	lcGen uint64
+	// runOwner is the generation currently inside reconcileNow (0: none),
+	// guarded by lcMu; running is its boolean projection. Tracking the
+	// owner stops a retired worker from clearing a NEWER generation's
+	// marker.
+	runOwner  uint64
 	armedFlag atomic.Bool
 	notifySeq atomic.Int64 // notifications accepted (armed or rejected)
 	doneSeq   atomic.Int64 // notifications whose enforcement has finished
@@ -227,6 +238,11 @@ func (s *peerSynchronizer) startNotifyWorker() (stop func() error, err error) {
 	// sender can rewrite or close, so the drain cannot hang on a nil or
 	// closed-channel receive race (the round-4a Stop hang).
 	wake := make(chan struct{}, 1)
+	// Every start opens a new accounting generation: the worker captures it
+	// so a pass it still owns after the stop transition cannot be mistaken
+	// for the live generation's work (issue #729).
+	s.lcGen++
+	gen := s.lcGen
 	s.lcState = peerSyncLifecycle{
 		kick: func() {
 			select {
@@ -241,63 +257,20 @@ func (s *peerSynchronizer) startNotifyWorker() (stop func() error, err error) {
 		armed: true,
 	}
 	s.armedFlag.Store(true)
+	// A restarted worker is live again, so the stop marker describes the
+	// current generation rather than a retired one: a later enqueue failure
+	// must report "not running"/"stopped" truthfully for this generation.
+	s.stoppedFlag.Store(false)
 	s.lcMu.Unlock()
 
 	stopCh := make(chan struct{})
 	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			select {
-			case <-stopCh:
-				return
-			case <-wake:
-				// This run serves exactly one enqueued token; counts
-				// whose kick coalesced into it are re-armed after the
-				// run so the backlog always drains. The pass re-reads
-				// durable state, so it covers every notification
-				// accepted before it started: snapshot the sequence
-				// here, before the pass, and publish that watermark
-				// with the pass outcome below.
-				covered := s.notifySeq.Load()
-				s.running.Store(true)
-				s.pending.Add(-1)
-				err := s.reconcileNow(context.Background())
-				s.running.Store(false)
-				s.publishConvergence(covered, err)
-				if s.pending.Load() > 0 {
-					select {
-					case wake <- struct{}{}:
-					default:
-					}
-				}
-			}
-		}
-	}()
+	go s.runNotifyWorker(gen, wake, stopCh, done)
+
 	var stopOnce sync.Once
 	return func() error {
 		// Idempotent: teardown paths may stop an already-stopped worker.
-		stopOnce.Do(func() {
-			// Invalidate the enqueue path under lcMu, so a concurrent
-			// notification either observed the armed state and enqueued
-			// before this point, or observes the disarmed state and
-			// records a visible enqueue failure. There is no unsynchronized
-			// window in which kick is read half-written.
-			s.lcMu.Lock()
-			s.lcState = peerSyncLifecycle{}
-			s.lcMu.Unlock()
-			s.armedFlag.Store(false)
-			s.stoppedFlag.Store(true)
-			// Closing stopCh releases a parked worker immediately; an
-			// in-flight reconcile is awaited below up to
-			// peerSyncDrainTimeout so a portal device wedged in a
-			// blocking call cannot hang Stop.
-			close(stopCh)
-			// Release any convergence waiter: no further pass will ever
-			// cover the notifications still outstanding, so they must be
-			// failed explicitly rather than waited out to a timeout.
-			s.failOutstandingConvergence()
-		})
+		stopOnce.Do(func() { s.retireNotifyWorker(stopCh) })
 		select {
 		case <-done:
 			return nil
@@ -305,6 +278,109 @@ func (s *peerSynchronizer) startNotifyWorker() (stop func() error, err error) {
 			return fmt.Errorf("peer sync worker did not drain within %s; engine stop proceeds", peerSyncDrainTimeout)
 		}
 	}, nil
+}
+
+// runNotifyWorker is the serialized reconcile loop of one generation. It
+// closes done when it exits, which is what the stop closure's bounded drain
+// waits on.
+func (s *peerSynchronizer) runNotifyWorker(gen uint64, wake chan struct{}, stopCh <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-wake:
+			if !s.beginNotifyPass(gen) {
+				// The stop transition retired this generation and settled
+				// the queued count itself: serving the token now would
+				// publish an outcome for notifications the stop already
+				// failed, and decrementing would underflow the settled
+				// count.
+				return
+			}
+			s.serveNotifyPass(gen, wake)
+		}
+	}
+}
+
+// serveNotifyPass runs one claimed reconcile and re-arms the wake token if
+// more notifications queued behind it. It serves exactly one token; counts
+// whose kick coalesced into it are re-armed afterwards so the backlog always
+// drains. The sequence is snapshotted before the pass and published with its
+// outcome, so the pass covers every notification accepted before it started.
+func (s *peerSynchronizer) serveNotifyPass(gen uint64, wake chan<- struct{}) {
+	covered := s.notifySeq.Load()
+	err := s.reconcileNow(context.Background())
+	s.endNotifyPass(gen, covered, err)
+	if s.pending.Load() > 0 {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// retireNotifyWorker performs the one-shot stop transition.
+//
+// It invalidates the enqueue path, retires the generation and settles the
+// queued count in ONE critical section (issue #729): acceptance increments
+// that count under the same lock, so an accepted notification can no longer
+// land its increment after the stop transition, and no token is left queued
+// with no worker to serve it. Retired workers see the generation mismatch and
+// neither decrement the settled count nor clear a newer generation's running
+// marker; their notifications are reported to waiters by
+// failOutstandingConvergence, never silently dropped.
+func (s *peerSynchronizer) retireNotifyWorker(stopCh chan struct{}) {
+	s.lcMu.Lock()
+	s.lcState = peerSyncLifecycle{}
+	s.lcGen++
+	s.pending.Store(0)
+	s.lcMu.Unlock()
+	s.armedFlag.Store(false)
+	s.stoppedFlag.Store(true)
+	// Closing stopCh releases a parked worker immediately; an in-flight
+	// reconcile is awaited by the caller up to peerSyncDrainTimeout so a
+	// wedged portal device cannot hang Stop.
+	close(stopCh)
+	s.failOutstandingConvergence()
+}
+
+// beginNotifyPass claims one queued token for the worker's generation and
+// reports whether the pass may run.
+//
+// A token whose generation the stop transition retired is refused: that stop
+// settled the queued count and failed the outstanding notifications, so this
+// worker must neither serve the token nor decrement the count (an underflow
+// would make quiesceNotifyWorker observe no queued work and return early).
+// Claiming the token and raising running happen in one critical section, with
+// running raised BEFORE the decrement, so a reader that sees a drained count
+// is guaranteed to see this in-flight pass.
+func (s *peerSynchronizer) beginNotifyPass(gen uint64) bool {
+	s.lcMu.Lock()
+	defer s.lcMu.Unlock()
+	if gen != s.lcGen {
+		return false
+	}
+	s.running.Store(true)
+	s.runOwner = gen
+	s.pending.Add(-1)
+	return true
+}
+
+// endNotifyPass publishes the outcome of a claimed pass.
+//
+// The running marker is cleared only while this generation still owns it: a
+// retired worker finishing after a restart must not clear the live
+// generation's marker, which would let quiesceNotifyWorker report a
+// convergence for a pass that is still running (issue #729).
+func (s *peerSynchronizer) endNotifyPass(gen uint64, covered int64, err error) {
+	s.lcMu.Lock()
+	if s.runOwner == gen {
+		s.runOwner = 0
+		s.running.Store(false)
+	}
+	s.lcMu.Unlock()
+	s.publishConvergence(covered, err)
 }
 
 // peerSyncDrainTimeout bounds the stop-time wait for an in-flight reconcile.
@@ -340,8 +416,19 @@ var peerSyncConvergeTimeout = 10 * time.Second
 // as the outcome of a convergence wait, so a caller is told the truth.
 func (s *peerSynchronizer) enqueuePeerReconcile() {
 	seq := s.notifySeq.Add(1)
+	// Acceptance and the queued-count increment are ONE critical section
+	// (issue #729). Reading the armed state and incrementing separately left
+	// a window in which the stop transition could retire the worker between
+	// them, stranding the count at a value no worker would ever decrement —
+	// which is exactly what hung the drain seam for 7 minutes. An accepted
+	// notification now increments while the enqueue path is observably
+	// armed, and the stop transition settles the count under the same lock,
+	// so the two can no longer interleave.
 	s.lcMu.Lock()
 	kick, armed := s.lcState.kick, s.lcState.armed
+	if armed && kick != nil {
+		s.pending.Add(1)
+	}
 	s.lcMu.Unlock()
 	if !armed || kick == nil {
 		reason := "peer sync notify worker is not running"
@@ -355,7 +442,9 @@ func (s *peerSynchronizer) enqueuePeerReconcile() {
 		s.publishConvergence(seq, errPeerSyncNotEnqueued(reason))
 		return
 	}
-	s.pending.Add(1)
+	// kick is the non-blocking coalescing wake, so it never blocks and
+	// needs no lock; it is called outside lcMu because the worker takes
+	// lcMu to claim the token.
 	kick()
 }
 

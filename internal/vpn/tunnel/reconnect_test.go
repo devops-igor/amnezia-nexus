@@ -156,3 +156,102 @@ func TestReconnectManager(t *testing.T) {
 		t.Errorf("expected 0 for nil pool reconnect")
 	}
 }
+
+func TestReconnectManager_RespectsInnerCanaryRecoveryDecision(t *testing.T) {
+	for _, healthy := range []bool{false, true} {
+		name := "outer_good_inner_blackhole"
+		if healthy {
+			name = "both_good_control"
+		}
+		t.Run(name, func(t *testing.T) {
+			db := setupTestDB(t)
+			ctx := t.Context()
+
+			pool := NewPool(db)
+
+			s1ID, err := db.CreateServer(ctx, &models.Server{Name: "Host 1", Host: "1.1.1.1"})
+			if err != nil {
+				t.Fatalf("CreateServer failed: %v", err)
+			}
+			tun, err := pool.AddTunnel(ctx, s1ID, "1.1.1.1:51820", "pub1")
+			if err != nil {
+				t.Fatalf("AddTunnel failed: %v", err)
+			}
+
+			if err := pool.SetTunnelStatus(ctx, s1ID, models.TunnelStatusHandshakeBlocked, 20); err != nil {
+				t.Fatalf("SetTunnelStatus failed: %v", err)
+			}
+
+			mockOuterLatency := 20 * time.Millisecond
+			mockProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+				return mockOuterLatency, nil
+			}
+
+			hCfg := HealthConfig{
+				Timeout:            500 * time.Millisecond,
+				LatencyThresholdMS: 200,
+			}
+			prober := NewHealthProber(pool, db, hCfg, mockProbe)
+
+			canaryCalls := 0
+			prober.SetCanaryProbeFunc(func(ctx context.Context, bt *models.BackendTunnel) error {
+				canaryCalls++
+				if healthy {
+					return nil
+				}
+				return errors.New("inner canary failed: payload blackholed")
+			})
+
+			rCfg := DefaultReconnectConfig()
+			reconnectMgr := NewReconnectManager(pool, prober, rCfg)
+
+			reconnected := reconnectMgr.CheckAndReconnect(ctx)
+
+			latestPool, err := pool.GetTunnel(s1ID)
+			if err != nil {
+				t.Fatalf("pool.GetTunnel failed: %v", err)
+			}
+
+			storedDB, err := db.GetBackendTunnel(ctx, tun.ID)
+			if err != nil {
+				t.Fatalf("db.GetBackendTunnel failed: %v", err)
+			}
+
+			activeTunnels := pool.GetActiveTunnels()
+
+			if healthy {
+				if canaryCalls != 1 {
+					t.Errorf("expected 1 canary call, got %d", canaryCalls)
+				}
+				if reconnected != 1 {
+					t.Errorf("expected 1 reconnected tunnel, got %d", reconnected)
+				}
+				if latestPool.Status != models.TunnelStatusActive {
+					t.Errorf("expected pool status %s, got %s", models.TunnelStatusActive, latestPool.Status)
+				}
+				if storedDB.Status != models.TunnelStatusActive {
+					t.Errorf("expected DB status %s, got %s", models.TunnelStatusActive, storedDB.Status)
+				}
+				if len(activeTunnels) != 1 {
+					t.Errorf("expected 1 active tunnel available for client admission, got %d", len(activeTunnels))
+				}
+			} else {
+				if canaryCalls != 1 {
+					t.Errorf("expected 1 canary call, got %d", canaryCalls)
+				}
+				if reconnected != 0 {
+					t.Errorf("expected 0 reconnected tunnels when inner canary fails, got %d", reconnected)
+				}
+				if latestPool.Status != models.TunnelStatusDegraded {
+					t.Errorf("expected pool status to be %s, got %s", models.TunnelStatusDegraded, latestPool.Status)
+				}
+				if storedDB.Status != models.TunnelStatusDegraded {
+					t.Errorf("expected DB status to be %s, got %s", models.TunnelStatusDegraded, storedDB.Status)
+				}
+				if len(activeTunnels) != 0 {
+					t.Errorf("expected 0 active tunnels (new client admission rejected), got %d", len(activeTunnels))
+				}
+			}
+		})
+	}
+}

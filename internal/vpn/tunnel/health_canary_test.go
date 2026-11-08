@@ -1,0 +1,835 @@
+package tunnel
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"net"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
+)
+
+func TestGetCanaryProbeFunc(t *testing.T) {
+	var absent *HealthProber
+	if absent.GetCanaryProbeFunc() != nil {
+		t.Fatal("nil prober must not have a canary override")
+	}
+	hp := NewHealthProber(nil, nil, HealthConfig{})
+	if hp.GetCanaryProbeFunc() != nil {
+		t.Fatal("new prober must use real device probing")
+	}
+	want := errors.New("custom canary failure")
+	hp.SetCanaryProbeFunc(func(context.Context, *models.BackendTunnel) error { return want })
+	fn := hp.GetCanaryProbeFunc()
+	if fn == nil || !errors.Is(fn(t.Context(), &models.BackendTunnel{}), want) {
+		t.Fatal("getter did not return the custom canary")
+	}
+	hp.SetCanaryProbeFunc(nil)
+	if hp.GetCanaryProbeFunc() != nil {
+		t.Fatal("clearing override must restore real device probing")
+	}
+}
+
+type mockPacketDevice struct {
+	mu          sync.Mutex
+	writeErr    error
+	readErr     error
+	written     [][]byte
+	replyData   []byte
+	delay       time.Duration
+	closed      bool
+	canaryHooks map[uint64]CanaryResponseHook
+	nextHookID  uint64
+}
+
+var _ CanaryResponseDemuxer = (*mockPacketDevice)(nil)
+
+func (m *mockPacketDevice) RegisterCanaryResponseHook(hook CanaryResponseHook) func() {
+	m.mu.Lock()
+	if m.canaryHooks == nil {
+		m.canaryHooks = make(map[uint64]CanaryResponseHook)
+	}
+	m.nextHookID++
+	id := m.nextHookID
+	m.canaryHooks[id] = hook
+	m.mu.Unlock()
+	return func() {
+		m.mu.Lock()
+		delete(m.canaryHooks, id)
+		m.mu.Unlock()
+	}
+}
+
+func (m *mockPacketDevice) Write(p []byte) (int, error) {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return 0, errors.New("mock device closed")
+	}
+	if m.writeErr != nil {
+		m.mu.Unlock()
+		return 0, m.writeErr
+	}
+	cp := make([]byte, len(p))
+	copy(cp, p)
+	m.written = append(m.written, cp)
+
+	if len(m.replyData) > 0 {
+		reply := make([]byte, len(m.replyData))
+		copy(reply, m.replyData)
+		if len(p) >= 28 && p[0]>>4 == 4 && p[9] == 1 && p[20] == 8 && len(reply) >= 28 && reply[9] == 1 && reply[20] == 0 {
+			repID := binary.BigEndian.Uint16(reply[24:26])
+			repSeq := binary.BigEndian.Uint16(reply[26:28])
+			if repID == 0x0713 && repSeq == 1 {
+				reqID := binary.BigEndian.Uint16(p[24:26])
+				reqSeq := binary.BigEndian.Uint16(p[26:28])
+				binary.BigEndian.PutUint16(reply[24:26], reqID)
+				binary.BigEndian.PutUint16(reply[26:28], reqSeq)
+				binary.BigEndian.PutUint16(reply[22:24], 0)
+				icmpCsum := internetChecksum(reply[20:28])
+				binary.BigEndian.PutUint16(reply[22:24], icmpCsum)
+
+				// Reply endpoints match request endpoints: reply src = req dst, reply dst = req src
+				copy(reply[12:16], p[16:20])
+				copy(reply[16:20], p[12:16])
+				binary.BigEndian.PutUint16(reply[10:12], 0)
+				ipCsum := internetChecksum(reply[0:20])
+				binary.BigEndian.PutUint16(reply[10:12], ipCsum)
+			}
+		}
+		hooks := make([]CanaryResponseHook, 0, len(m.canaryHooks))
+		for _, h := range m.canaryHooks {
+			if h != nil {
+				hooks = append(hooks, h)
+			}
+		}
+		delay := m.delay
+		m.mu.Unlock()
+
+		go func() {
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+			for _, h := range hooks {
+				h(reply)
+			}
+		}()
+		return len(p), nil
+	}
+	m.mu.Unlock()
+	return len(p), nil
+}
+
+func (m *mockPacketDevice) setReplyData(data []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.replyData = data
+}
+
+func (m *mockPacketDevice) Read(p []byte) (int, error) {
+	m.mu.Lock()
+	delay := m.delay
+	m.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return 0, errors.New("mock device closed")
+	}
+	if m.readErr != nil {
+		return 0, m.readErr
+	}
+	if len(m.replyData) > 0 {
+		n := copy(p, m.replyData)
+		return n, nil
+	}
+	return 0, errors.New("no reply data")
+}
+
+func (m *mockPacketDevice) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.closed = true
+	return nil
+}
+
+type mockCustomCanaryDevice struct {
+	mockPacketDevice
+	probed bool
+	err    error
+}
+
+func (m *mockCustomCanaryDevice) ProbeCanary(ctx context.Context, timeout time.Duration) error {
+	m.probed = true
+	return m.err
+}
+
+func TestCanaryPacket_ICMP(t *testing.T) {
+	pkt := DefaultCanaryPingPacket()
+	if len(pkt) != 28 {
+		t.Fatalf("expected 28 bytes, got %d", len(pkt))
+	}
+	// Verify IPv4 header
+	if pkt[0] != 0x45 {
+		t.Errorf("expected version 4 IHL 5, got 0x%x", pkt[0])
+	}
+	if pkt[9] != 1 {
+		t.Errorf("expected protocol 1 (ICMP), got %d", pkt[9])
+	}
+	// F3: Source IP must be within authorized portal subnet (default 10.100.0.1)
+	srcIP := net.IPv4(pkt[12], pkt[13], pkt[14], pkt[15])
+	if !srcIP.Equal(net.IPv4(10, 100, 0, 1)) {
+		t.Errorf("expected source IP 10.100.0.1 from authorized portal subnet, got %s", srcIP)
+	}
+	// F5: Destination IP must be a reliable public canary responder (1.1.1.1) routed via WAN
+	dstIP := net.IPv4(pkt[16], pkt[17], pkt[18], pkt[19])
+	if !dstIP.Equal(net.IPv4(1, 1, 1, 1)) {
+		t.Errorf("expected destination IP 1.1.1.1 (public canary responder), got %s", dstIP)
+	}
+	ipCsum := internetChecksum(pkt[0:20])
+	if ipCsum != 0 {
+		t.Errorf("expected IP checksum verification to yield 0, got 0x%x", ipCsum)
+	}
+	// Verify ICMP header
+	if pkt[20] != 8 {
+		t.Errorf("expected ICMP type 8 (Echo Request), got %d", pkt[20])
+	}
+	icmpCsum := internetChecksum(pkt[20:28])
+	if icmpCsum != 0 {
+		t.Errorf("expected ICMP checksum verification to yield 0, got 0x%x", icmpCsum)
+	}
+}
+
+func TestCanaryPacket_DNS(t *testing.T) {
+	pkt := DefaultCanaryDNSPacket()
+	if len(pkt) < 28 {
+		t.Fatalf("expected packet >= 28 bytes, got %d", len(pkt))
+	}
+	if pkt[0] != 0x45 {
+		t.Errorf("expected IPv4 version 4, got 0x%x", pkt[0])
+	}
+	if pkt[9] != 17 {
+		t.Errorf("expected protocol 17 (UDP), got %d", pkt[9])
+	}
+	// F3: Source IP must be within authorized portal subnet (default 10.100.0.1)
+	srcIP := net.IPv4(pkt[12], pkt[13], pkt[14], pkt[15])
+	if !srcIP.Equal(net.IPv4(10, 100, 0, 1)) {
+		t.Errorf("expected source IP 10.100.0.1 from authorized portal subnet, got %s", srcIP)
+	}
+	// F5: Destination IP must be a reliable public DNS resolver (1.1.1.1)
+	dstIP := net.IPv4(pkt[16], pkt[17], pkt[18], pkt[19])
+	if !dstIP.Equal(net.IPv4(1, 1, 1, 1)) {
+		t.Errorf("expected destination IP 1.1.1.1 (public canary resolver), got %s", dstIP)
+	}
+	ipCsum := internetChecksum(pkt[0:20])
+	if ipCsum != 0 {
+		t.Errorf("expected IP checksum verification 0, got 0x%x", ipCsum)
+	}
+	dstPort := binary.BigEndian.Uint16(pkt[22:24])
+	if dstPort != 53 {
+		t.Errorf("expected DNS destination port 53, got %d", dstPort)
+	}
+}
+
+func TestCanarySourceIP_AuthorizedSubnetDerivation(t *testing.T) {
+	tests := []struct {
+		cidr    string
+		wantSrc string
+		wantDst string
+	}{
+		{"10.100.0.0/16", "10.100.0.1", "1.1.1.1"},
+		{"10.200.0.0/16", "10.200.0.1", "1.1.1.1"},
+		{"172.16.0.0/12", "172.16.0.1", "1.1.1.1"},
+		{"192.168.1.0/24", "192.168.1.1", "1.1.1.1"},
+		{"", "10.100.0.1", "1.1.1.1"},
+		{"invalid", "10.100.0.1", "1.1.1.1"},
+	}
+
+	for _, tt := range tests {
+		src := CanarySourceIPFromCIDR(tt.cidr)
+		if src.String() != tt.wantSrc {
+			t.Errorf("CanarySourceIPFromCIDR(%q) = %s, want %s", tt.cidr, src, tt.wantSrc)
+		}
+		dst := CanaryDestinationIPFromCIDR(tt.cidr)
+		if dst.String() != tt.wantDst {
+			t.Errorf("CanaryDestinationIPFromCIDR(%q) = %s, want %s", tt.cidr, dst, tt.wantDst)
+		}
+		if tt.cidr != "" && tt.cidr != "invalid" {
+			_, ipNet, err := net.ParseCIDR(tt.cidr)
+			if err == nil && !ipNet.Contains(src) {
+				t.Errorf("derived source IP %s is outside authorized subnet %s", src, tt.cidr)
+			}
+		}
+
+		// Verify constructed packet carries the derived source IP and public canary destination
+		pkt := CanaryPingPacketForSubnet(tt.cidr)
+		pktSrc := net.IPv4(pkt[12], pkt[13], pkt[14], pkt[15])
+		if pktSrc.String() != tt.wantSrc {
+			t.Errorf("CanaryPingPacketForSubnet(%q) src = %s, want %s", tt.cidr, pktSrc, tt.wantSrc)
+		}
+		pktDst := net.IPv4(pkt[16], pkt[17], pkt[18], pkt[19])
+		if pktDst.String() != tt.wantDst {
+			t.Errorf("CanaryPingPacketForSubnet(%q) dst = %s, want %s", tt.cidr, pktDst, tt.wantDst)
+		}
+	}
+}
+
+func TestHealthProber_SubnetCIDR_Resolution(t *testing.T) {
+	hp := NewHealthProber(nil, nil, DefaultHealthConfig())
+	// Default before configuration
+	if got := hp.GetSubnetCIDR(); got != "10.100.0.0/16" {
+		t.Fatalf("expected default 10.100.0.0/16, got %s", got)
+	}
+
+	// Immutable configuration via HealthConfig
+	cfg := DefaultHealthConfig()
+	cfg.SubnetCIDR = "10.200.0.0/16"
+	hpCustom := NewHealthProber(nil, nil, cfg)
+	if got := hpCustom.GetSubnetCIDR(); got != "10.200.0.0/16" {
+		t.Fatalf("expected configured 10.200.0.0/16, got %s", got)
+	}
+
+	// Empty SubnetCIDR falls back to default
+	hpEmpty := NewHealthProber(nil, nil, HealthConfig{})
+	if got := hpEmpty.GetSubnetCIDR(); got != "10.100.0.0/16" {
+		t.Fatalf("expected fallback 10.100.0.0/16, got %s", got)
+	}
+
+	// Direct update via SetSubnetCIDR
+	hp.SetSubnetCIDR("10.250.0.0/16")
+	if got := hp.GetSubnetCIDR(); got != "10.250.0.0/16" {
+		t.Fatalf("expected SetSubnetCIDR 10.250.0.0/16, got %s", got)
+	}
+
+	// Empty string in SetSubnetCIDR is ignored
+	hp.SetSubnetCIDR("")
+	if got := hp.GetSubnetCIDR(); got != "10.250.0.0/16" {
+		t.Fatalf("expected retained 10.250.0.0/16 after empty update, got %s", got)
+	}
+
+	// Update via SetDeviceProvider when provider implements SubnetCIDR() string
+	hp.SetDeviceProvider(mockSubnetProvider("192.168.50.0/24"))
+	if got := hp.GetSubnetCIDR(); got != "192.168.50.0/24" {
+		t.Fatalf("expected updated 192.168.50.0/24 from DeviceProvider, got %s", got)
+	}
+
+	// Provider with empty subnet string does not overwrite
+	hp.SetDeviceProvider(mockSubnetProvider(""))
+	if got := hp.GetSubnetCIDR(); got != "192.168.50.0/24" {
+		t.Fatalf("expected retained 192.168.50.0/24 after empty provider subnet, got %s", got)
+	}
+}
+
+type mockSubnetProvider string
+
+func (m mockSubnetProvider) SubnetCIDR() string {
+	return string(m)
+}
+
+func TestHealthProber_ConcurrentMarkAdminDisabledAndCanaryNoDeadlock(t *testing.T) {
+	echoReply := BuildCanaryICMPEchoReply(net.IPv4(1, 1, 1, 1), net.IPv4(10, 100, 0, 1), 0x0713, 1)
+	dev := &mockPacketDevice{
+		replyData: echoReply,
+	}
+
+	cfg := DefaultHealthConfig()
+	cfg.SubnetCIDR = "10.100.0.0/16"
+	hp := NewHealthProber(nil, nil, cfg)
+	tun := &models.BackendTunnel{
+		ID:       101,
+		ServerID: 1,
+		Status:   models.TunnelStatusActive,
+		Enabled:  true,
+	}
+	hp.RegisterDevice(tun.ID, dev)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	const iterations = 100
+
+	// Worker 1: repeatedly call MarkAdminDisabled (acquires hp.mu.Lock)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				hp.MarkAdminDisabled(tun.ServerID)
+			}
+		}
+	}()
+
+	// Worker 2: repeatedly call ProbeCanary (exercises defaultCanaryProbe and GetSubnetCIDR)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				_ = hp.ProbeCanary(ctx, tun)
+			}
+		}
+	}()
+
+	// Worker 3: repeatedly read GetSubnetCIDR directly
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				cidr := hp.GetSubnetCIDR()
+				if cidr != "10.100.0.0/16" && cidr != "10.200.0.0/16" && cidr != "172.16.0.0/12" {
+					t.Errorf("unexpected subnet: %s", cidr)
+					return
+				}
+			}
+		}
+	}()
+
+	// Worker 4: repeatedly call SetSubnetCIDR concurrently with Workers 1, 2, and 3
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		cidrs := []string{"10.100.0.0/16", "10.200.0.0/16", "172.16.0.0/12"}
+		for i := 0; i < iterations; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				hp.SetSubnetCIDR(cidrs[i%len(cidrs)])
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success: no deadlock
+	case <-ctx.Done():
+		t.Fatal("deadlock detected: concurrent MarkAdminDisabled, ProbeCanary, and SetSubnetCIDR did not complete in time")
+	}
+}
+
+func TestProbePacketDevice_Success(t *testing.T) {
+	echoReply := BuildCanaryICMPEchoReply(net.IPv4(1, 1, 1, 1), net.IPv4(10, 100, 0, 1), 0x0713, 1)
+	dev := &mockPacketDevice{
+		replyData: echoReply,
+	}
+	ctx := context.Background()
+	err := ProbePacketDevice(ctx, dev, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("ProbePacketDevice failed: %v", err)
+	}
+	if len(dev.written) != 1 {
+		t.Errorf("expected 1 written packet, got %d", len(dev.written))
+	}
+}
+
+func TestProbePacketDevice_WriteError(t *testing.T) {
+	dev := &mockPacketDevice{
+		writeErr: errors.New("network down"),
+	}
+	ctx := context.Background()
+	err := ProbePacketDevice(ctx, dev, 500*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestProbePacketDevice_UnsupportedDevice(t *testing.T) {
+	dev := &bareTestPacketDevice{}
+	ctx := context.Background()
+	err := ProbePacketDevice(ctx, dev, 500*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected unsupported device error, got nil")
+	}
+}
+
+type bareTestPacketDevice struct{}
+
+func (b *bareTestPacketDevice) Read([]byte) (int, error)    { return 0, errors.New("eof") }
+func (b *bareTestPacketDevice) Write(p []byte) (int, error) { return len(p), nil }
+func (b *bareTestPacketDevice) Close() error                { return nil }
+
+func TestProbePacketDevice_Timeout(t *testing.T) {
+	dev := &mockPacketDevice{
+		delay:     500 * time.Millisecond,
+		replyData: BuildCanaryICMPEchoReply(net.IPv4(1, 1, 1, 1), net.IPv4(10, 100, 0, 1), 0x0713, 1),
+	}
+	ctx := context.Background()
+	err := ProbePacketDevice(ctx, dev, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	// Verify hook was cleanly unregistered on timeout
+	dev.mu.Lock()
+	hookCount := len(dev.canaryHooks)
+	dev.mu.Unlock()
+	if hookCount != 0 {
+		t.Fatalf("expected 0 hooks remaining after timeout, got %d", hookCount)
+	}
+}
+
+func TestProbePacketDevice_DemuxerSingleReaderConcurrent(t *testing.T) {
+	// Verify that with a single reader loop running (simulating pumpBackendReturns),
+	// client traffic is NOT stolen and canary responses are cleanly consumed by the hook.
+	dev := &mockPacketDevice{}
+	clientPacketsReceived := make([][]byte, 0)
+	var clientMu sync.Mutex
+
+	// Background return pump reading continuously (single reader)
+	stopPump := make(chan struct{})
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		buf := make([]byte, 1500)
+		for {
+			select {
+			case <-stopPump:
+				return
+			default:
+			}
+			n, err := dev.Read(buf)
+			if err == nil && n > 0 {
+				pkt := make([]byte, n)
+				copy(pkt, buf[:n])
+				clientMu.Lock()
+				clientPacketsReceived = append(clientPacketsReceived, pkt)
+				clientMu.Unlock()
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	// Simulate backend replying to canary probes by dispatching Echo Reply to registered hook
+	echoReply := BuildCanaryICMPEchoReply(net.IPv4(1, 1, 1, 1), net.IPv4(10, 100, 0, 1), 0x0713, 1)
+	dev.setReplyData(echoReply)
+
+	// Run canary probe concurrently with active return pump
+	ctx := context.Background()
+	if err := ProbePacketDevice(ctx, dev, 1*time.Second); err != nil {
+		t.Fatalf("ProbePacketDevice failed under concurrent pump: %v", err)
+	}
+
+	// Verify that no hooks remain registered after completion
+	dev.mu.Lock()
+	hooksLeft := len(dev.canaryHooks)
+	dev.mu.Unlock()
+	if hooksLeft != 0 {
+		t.Errorf("expected 0 hooks left after probe completion, got %d", hooksLeft)
+	}
+
+	close(stopPump)
+	<-pumpDone
+}
+
+func TestProbePacketDevice_DemuxerIgnoresNonCanaryTraffic(t *testing.T) {
+	// A packet with wrong sequence or ID must not satisfy the canary listener
+	wrongReply := BuildCanaryICMPEchoReply(net.IPv4(1, 1, 1, 1), net.IPv4(10, 100, 0, 1), 0x9999, 99)
+	dev := &mockPacketDevice{
+		replyData: wrongReply,
+	}
+
+	ctx := context.Background()
+	err := ProbePacketDevice(ctx, dev, 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout when only non-matching packet arrives, got nil")
+	}
+}
+
+func TestProbePacketDevice_CustomInterface(t *testing.T) {
+	dev := &mockCustomCanaryDevice{
+		err: nil,
+	}
+	ctx := context.Background()
+	err := ProbePacketDevice(ctx, dev, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if !dev.probed {
+		t.Fatal("expected ProbeCanary on custom device to be invoked")
+	}
+}
+
+func TestProbeVirtualTUN(t *testing.T) {
+	vt, err := virtualtun.New(virtualtun.Config{
+		Name:            "canary-vt0",
+		MTU:             1420,
+		InboundCapacity: 16,
+	})
+	if err != nil {
+		t.Fatalf("virtualtun.New failed: %v", err)
+	}
+	defer func() { _ = vt.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// In background, act as the WireGuard engine: read from tun, echo to tun
+	go func() {
+		buf := make([][]byte, 1)
+		buf[0] = make([]byte, 1500)
+		sizes := make([]int, 1)
+		n, rErr := vt.Read(buf, sizes, 0)
+		if rErr == nil && n > 0 {
+			// Write response back to engine -> outbound
+			_, _ = vt.Write(buf, 0)
+		}
+	}()
+
+	probeErr := ProbeVirtualTUN(ctx, vt, 1*time.Second)
+	if probeErr != nil {
+		t.Fatalf("ProbeVirtualTUN failed: %v", probeErr)
+	}
+}
+
+func TestHealthProber_DeviceManagement(t *testing.T) {
+	hp := NewHealthProber(nil, nil, DefaultHealthConfig())
+	tunID := int64(42)
+	dev := &mockPacketDevice{replyData: []byte("pong")}
+
+	if got := hp.GetDevice(tunID); got != nil {
+		t.Fatalf("expected nil device before registration, got %v", got)
+	}
+
+	hp.RegisterDevice(tunID, dev)
+	if got := hp.GetDevice(tunID); got != dev {
+		t.Fatalf("expected registered device, got %v", got)
+	}
+
+	hp.UnregisterDevice(tunID)
+	if got := hp.GetDevice(tunID); got != nil {
+		t.Fatalf("expected nil device after unregistration, got %v", got)
+	}
+
+	// Test SetDeviceProvider
+	hp.SetDeviceProvider(func(id int64) PacketDevice {
+		if id == 99 {
+			return dev
+		}
+		return nil
+	})
+	if got := hp.GetDevice(99); got != dev {
+		t.Fatalf("expected device from provider for 99, got %v", got)
+	}
+	if got := hp.GetDevice(100); got != nil {
+		t.Fatalf("expected nil for 100, got %v", got)
+	}
+}
+
+func TestHealthProber_CanaryProbe_NoDevice(t *testing.T) {
+	hp := NewHealthProber(nil, nil, DefaultHealthConfig())
+	tunnel := &models.BackendTunnel{ID: 10, ServerID: 1}
+	err := hp.ProbeCanary(context.Background(), tunnel)
+	if err == nil || !errors.Is(err, ErrNoActiveDevice) {
+		t.Fatalf("expected ErrNoActiveDevice, got %v", err)
+	}
+}
+
+func TestHealthProber_DualTier_HandshakeBlocked(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	pool := NewPool(db)
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "Host 1", Host: "10.0.0.1"})
+	tun, err := pool.AddTunnel(ctx, sID, "10.0.0.1:51820", "pubkey1")
+	if err != nil {
+		t.Fatalf("failed to add tunnel: %v", err)
+	}
+	_ = pool.SetTunnelStatus(ctx, sID, "active", 50)
+
+	cfg := DefaultHealthConfig()
+	cfg.FailureThreshold = 3
+
+	// Outer handshake probe always fails (e.g. DPI blocks handshake IK)
+	failOuterProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 0, errors.New("DPI handshake packet drop")
+	}
+
+	hp := NewHealthProber(pool, db, cfg, failOuterProbe)
+
+	// Inner canary probe succeeds (payload data plane is passing traffic)
+	canaryCalled := 0
+	hp.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		canaryCalled++
+		return nil
+	})
+
+	// Probes 1 and 2: outer fails, failures < threshold, but data plane is viable -> transitions to handshake_blocked
+	// to prevent new client admission while preserving existing sessions.
+	for i := 1; i < cfg.FailureThreshold; i++ {
+		_, pErr := hp.ProbeTunnel(ctx, tun)
+		if pErr == nil {
+			t.Fatalf("expected probe error on failure %d", i)
+		}
+	}
+
+	current, err := pool.GetTunnel(sID)
+	if err != nil || current.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("expected status handshake_blocked before threshold when data plane is viable, got %q", current.Status)
+	}
+	if len(pool.GetActiveTunnels()) != 0 {
+		t.Fatalf("expected tunnel excluded from active pool, got %d active tunnels", len(pool.GetActiveTunnels()))
+	}
+
+	// Probe 3: outer fails, reaches FailureThreshold.
+	// Tier 2 canary probe runs and succeeds! Status MUST become handshake_blocked (NOT disabled).
+	_, pErr := hp.ProbeTunnel(ctx, tun)
+	if pErr == nil {
+		t.Fatal("expected probe error from ProbeTunnel")
+	}
+
+	if canaryCalled == 0 {
+		t.Fatal("expected canary probe to be called when reaching FailureThreshold")
+	}
+
+	current, err = pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("failed to get tunnel: %v", err)
+	}
+	if current.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("expected status %q, got %q", models.TunnelStatusHandshakeBlocked, current.Status)
+	}
+	if current.DisableReason != models.DisableReasonNone {
+		t.Fatalf("expected DisableReason none, got %q", current.DisableReason)
+	}
+	if hp.IsAutoDisabled(sID) {
+		t.Fatal("tunnel in handshake_blocked must NOT be autoDisabled")
+	}
+}
+
+func TestHealthProber_DualTier_BothProbesFail_Disabled(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	pool := NewPool(db)
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "Host 2", Host: "10.0.0.2"})
+	tun, err := pool.AddTunnel(ctx, sID, "10.0.0.2:51820", "pubkey2")
+	if err != nil {
+		t.Fatalf("failed to add tunnel: %v", err)
+	}
+	_ = pool.SetTunnelStatus(ctx, sID, "active", 50)
+
+	cfg := DefaultHealthConfig()
+	cfg.FailureThreshold = 2
+
+	failOuterProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		return 0, errors.New("network failure")
+	}
+
+	hp := NewHealthProber(pool, db, cfg, failOuterProbe)
+
+	// Inner canary probe ALSO fails
+	hp.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		return errors.New("canary data plane failed")
+	})
+
+	// Probe 1: failures=1
+	_, _ = hp.ProbeTunnel(ctx, tun)
+	// Probe 2: failures=2 >= FailureThreshold. Both outer and inner fail -> disabled
+	_, _ = hp.ProbeTunnel(ctx, tun)
+
+	current, err := pool.GetTunnel(sID)
+	if err != nil {
+		t.Fatalf("failed to get tunnel: %v", err)
+	}
+	if current.Status != models.TunnelStatusDisabled {
+		t.Fatalf("expected status %q, got %q", models.TunnelStatusDisabled, current.Status)
+	}
+	if current.DisableReason != models.DisableReasonHealth {
+		t.Fatalf("expected DisableReason %q, got %q", models.DisableReasonHealth, current.DisableReason)
+	}
+	if !hp.IsAutoDisabled(sID) {
+		t.Fatal("expected tunnel to be autoDisabled")
+	}
+}
+
+func TestHealthProber_DualTier_RecoveryToActive(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	pool := NewPool(db)
+	sID, _ := db.CreateServer(ctx, &models.Server{Name: "Host 3", Host: "10.0.0.3"})
+	tun, err := pool.AddTunnel(ctx, sID, "10.0.0.3:51820", "pubkey3")
+	if err != nil {
+		t.Fatalf("failed to add tunnel: %v", err)
+	}
+
+	cfg := DefaultHealthConfig()
+	cfg.FailureThreshold = 2
+
+	outerSuccess := false
+	outerProbe := func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
+		if !outerSuccess {
+			return 0, errors.New("outer handshake failed")
+		}
+		return 35 * time.Millisecond, nil
+	}
+
+	hp := NewHealthProber(pool, db, cfg, outerProbe)
+
+	canarySuccess := true
+	hp.SetCanaryProbeFunc(func(ctx context.Context, tunnel *models.BackendTunnel) error {
+		if !canarySuccess {
+			return errors.New("inner canary probe failed")
+		}
+		return nil
+	})
+
+	// Put tunnel into handshake_blocked
+	_, _ = hp.ProbeTunnel(ctx, tun)
+	_, _ = hp.ProbeTunnel(ctx, tun)
+
+	current, _ := pool.GetTunnel(sID)
+	if current.Status != models.TunnelStatusHandshakeBlocked {
+		t.Fatalf("expected handshake_blocked, got %q", current.Status)
+	}
+
+	// Outer probe succeeds but inner canary fails -> transitions to degraded (BLOCKER 1: inner failure is data-plane failure)
+	outerSuccess = true
+	canarySuccess = false
+
+	_, err = hp.ProbeTunnel(ctx, tun)
+	if err != nil {
+		t.Fatalf("expected ProbeTunnel success when outer probe succeeds, got %v", err)
+	}
+	current, _ = pool.GetTunnel(sID)
+	if current.Status != models.TunnelStatusDegraded {
+		t.Fatalf("expected status degraded when inner canary fails, got %q", current.Status)
+	}
+
+	// Both outer probe and inner canary succeed -> restores active status
+	canarySuccess = true
+
+	_, err = hp.ProbeTunnel(ctx, tun)
+	if err != nil {
+		t.Fatalf("expected ProbeTunnel success when both probes succeed, got %v", err)
+	}
+	current, _ = pool.GetTunnel(sID)
+	if current.Status != models.TunnelStatusActive {
+		t.Fatalf("expected status active after both probes succeed, got %q", current.Status)
+	}
+	if hp.GetFailCount(sID) != 0 {
+		t.Errorf("expected failCount 0, got %d", hp.GetFailCount(sID))
+	}
+}

@@ -30,16 +30,25 @@ const udpQueueSize = 512
 // client-datagrams to the socket. Establishing full AWG sessions to each
 // backend server is a follow-up.
 type UDPDevice struct {
-	name    string
-	mtu     int
-	conn    *net.UDPConn
-	packets chan []byte
-	errCh   chan error
-	doneCh  chan struct{}
-	closed  atomic.Bool
-	once    sync.Once
-	wg      sync.WaitGroup
+	name        string
+	mtu         int
+	conn        *net.UDPConn
+	packets     chan []byte
+	errCh       chan error
+	doneCh      chan struct{}
+	closed      atomic.Bool
+	once        sync.Once
+	wg          sync.WaitGroup
+	canaryMu    sync.RWMutex
+	canaryHooks map[uint64]CanaryResponseHook
+	nextHookID  uint64
 }
+
+// Ensure UDPDevice satisfies PacketDevice and CanaryResponseDemuxer at compile time.
+var (
+	_ PacketDevice          = (*UDPDevice)(nil)
+	_ CanaryResponseDemuxer = (*UDPDevice)(nil)
+)
 
 // NewUDPDevice creates a UDP packet device connected to the given backend
 // endpoint ("host:port"). mtu is advisory metadata for forwarders.
@@ -97,19 +106,51 @@ func (d *UDPDevice) startReadLoop() {
 	}()
 }
 
+// RegisterCanaryResponseHook registers a callback to demultiplex in-tunnel canary responses
+// during single-reader return pumping. The returned function unregisters the hook cleanly.
+func (d *UDPDevice) RegisterCanaryResponseHook(hook CanaryResponseHook) func() {
+	d.canaryMu.Lock()
+	if d.canaryHooks == nil {
+		d.canaryHooks = make(map[uint64]CanaryResponseHook)
+	}
+	d.nextHookID++
+	id := d.nextHookID
+	d.canaryHooks[id] = hook
+	d.canaryMu.Unlock()
+	return func() {
+		d.canaryMu.Lock()
+		delete(d.canaryHooks, id)
+		d.canaryMu.Unlock()
+	}
+}
+
 // Read blocks until an inbound backend datagram is available or the device is
 // closed / the socket fails.
 func (d *UDPDevice) Read(p []byte) (int, error) {
-	select {
-	case pkt, ok := <-d.packets:
-		if !ok {
+	for {
+		select {
+		case pkt, ok := <-d.packets:
+			if !ok {
+				return 0, errors.New("device closed")
+			}
+			d.canaryMu.RLock()
+			consumed := false
+			for _, h := range d.canaryHooks {
+				if h != nil && h(pkt) {
+					consumed = true
+					break
+				}
+			}
+			d.canaryMu.RUnlock()
+			if consumed {
+				continue
+			}
+			return copy(p, pkt), nil
+		case err := <-d.errCh:
+			return 0, err
+		case <-d.doneCh:
 			return 0, errors.New("device closed")
 		}
-		return copy(p, pkt), nil
-	case err := <-d.errCh:
-		return 0, err
-	case <-d.doneCh:
-		return 0, errors.New("device closed")
 	}
 }
 
