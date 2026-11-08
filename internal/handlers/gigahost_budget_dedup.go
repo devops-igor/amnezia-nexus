@@ -78,9 +78,9 @@ func committedSpendFromServers(
 		if localHourly == 0 {
 			localHourly = planHourlyFromOrders(localOrders, serverPID)
 		}
-		spend := planMonthlySpend(catalog, serverPID, localHourly)
-		if spend <= 0 {
-			return 0, fmt.Errorf("active inventory server %d (plan %d) has unpriced spend and is absent from catalog", s.ID, serverPID)
+		spend, priceErr := existingMonthlySpend(catalog, serverPID, localHourly)
+		if priceErr != nil {
+			return 0, fmt.Errorf("active inventory server %d: %w", s.ID, priceErr)
 		}
 		committed += spend
 	}
@@ -104,9 +104,9 @@ func committedSpendFromOrders(
 		if o.OrderID != "" {
 			accountedOrders[o.OrderID] = true
 		}
-		spend := planMonthlySpend(catalog, o.PlanID, o.HourlyPriceNOK)
-		if spend <= 0 {
-			return 0, fmt.Errorf("active order %s (plan %d) has unpriced spend and is absent from catalog", o.OrderID, o.PlanID)
+		spend, priceErr := existingMonthlySpend(catalog, o.PlanID, o.HourlyPriceNOK)
+		if priceErr != nil {
+			return 0, fmt.Errorf("active order %s: %w", o.OrderID, priceErr)
 		}
 		committed += spend
 	}

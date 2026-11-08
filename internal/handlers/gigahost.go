@@ -465,24 +465,6 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-func planMonthlySpend(catalog []gigahost.HourlyPlan, pid int, fallbackHourly float64) float64 {
-	var rate float64
-	for _, p := range catalog {
-		if p.ProductID == pid {
-			if p.MonthlyCeiling > 0 {
-				rate = p.MonthlyCeiling
-			} else if p.HourlyRateNOK > 0 {
-				rate = p.HourlyRateNOK * 720
-			}
-			break
-		}
-	}
-	if rate == 0 && fallbackHourly > 0 {
-		rate = fallbackHourly * 720
-	}
-	return rate
-}
-
 func isServerActiveForBudget(status string) bool {
 	switch strings.ToLower(status) {
 	case gigahost.StatusReady, "active", gigahost.StatusDeploying, gigahost.StatusPending, gigahost.StatusWaiting, gigahost.StatusInstalling:
