@@ -173,6 +173,28 @@ def test_registered_secret_list_is_bounded() -> None:
         log_privacy._registered.clear()
 
 
+def test_registration_is_independent_of_token_source() -> None:
+    """P3: a meta-sourced token is registered exactly like a cookie-sourced one."""
+    log_privacy._registered.clear()
+    try:
+        # Both origins converge on the same single registration point.
+        log_privacy.register_secret(CSRF)
+        assert CSRF in log_privacy._registered
+        assert CSRF not in log_privacy.redact(f"traceback shows {CSRF} here")
+    finally:
+        log_privacy._registered.clear()
+
+
+def test_csrf_fixture_registers_returned_token_for_every_source() -> None:
+    """The fixture registers the value it returns, after the meta/fallback merge."""
+    source = (REPO_ROOT / "tests" / "e2e" / "conftest.py").read_text(encoding="utf-8")
+    merge_index = source.index("if not token:")
+    register_index = source.index("log_privacy.register_secret(token)")
+    # Registration must follow the branch point, so it covers both origins.
+    assert register_index > merge_index
+    assert source.count("log_privacy.register_secret(token)") == 1
+
+
 def test_duplicate_registration_is_idempotent() -> None:
     """Re-registering the same credential never grows the list or reorders it."""
     log_privacy._registered.clear()
@@ -194,6 +216,12 @@ class _FakeReport:
     def __init__(self, longrepr) -> None:
         self.longrepr = longrepr
         self.sections = []
+        self.outcome = "failed"
+
+    @property
+    def passed(self) -> bool:
+        """Mirror pytest's read-only success predicate."""
+        return self.outcome == "passed"
 
 
 class _FakeFileLocation:
@@ -275,13 +303,17 @@ def test_scrub_report_redacts_rendered_function_arguments() -> None:
         log_privacy._registered.clear()
 
 
-def test_scrub_report_tolerates_immutable_repr_fields() -> None:
-    """A repr object whose string fields reject assignment must not break the run."""
+def test_scrub_report_replaces_whole_detail_when_repr_is_immutable() -> None:
+    """A repr that rejects assignment must not leave the credential rendered.
+
+    The previous version of this test asserted the *leaked* value survived, which
+    certified the vulnerability instead of the contract (#735 R2 P2). The
+    requirement is that whole rendered detail is replaced and the failure keeps
+    its status, type and identity.
+    """
 
     class Frozen:
-        """Slots-only repr carrying a leaky message and lines that cannot be set."""
-
-        __slots__ = ("_message", "_lines")
+        """Repr whose message and lines are read-only properties."""
 
         def __init__(self) -> None:
             self._message = f"cookie: sessionid={SESSION}"
@@ -295,10 +327,59 @@ def test_scrub_report_tolerates_immutable_repr_fields() -> None:
         def lines(self):
             return self._lines
 
-    frozen = Frozen()
-    log_privacy._scrub(frozen, 0, set())
-    # Nothing was mutated and nothing raised; the boundary still reports failure.
-    assert frozen.message == f"cookie: sessionid={SESSION}"
+    report = _FakeReport(Frozen())
+    report.sections = [("Captured stdout call", f"sessionid={SESSION}")]
+
+    log_privacy.scrub_report(report)
+
+    # Detail is replaced wholesale; the credential is unreachable.
+    assert isinstance(report.longrepr, str)
+    assert SESSION not in report.longrepr
+    assert "withheld" in report.longrepr
+    assert report.sections == []
+    # Status/identity survive: outcome untouched, still a failure report.
+    assert not report.passed
+
+
+def test_replacement_failure_is_not_silently_accepted() -> None:
+    """A write that silently does not take escalates instead of passing."""
+
+    class Stubborn:
+        """Repr whose message ignores assignment while reporting success."""
+
+        def __init__(self) -> None:
+            self._message = f"cookie: sessionid={SESSION}"
+
+        @property
+        def message(self) -> str:
+            return self._message
+
+        @message.setter
+        def message(self, _value) -> None:
+            pass
+
+    with pytest.raises(log_privacy._Unscrubbable):
+        log_privacy._replace_field(Stubborn(), "message", "redacted")
+
+
+def test_unreplaceable_report_aborts_rather_than_leaking() -> None:
+    """If even whole-detail replacement is refused, the run fails loudly."""
+
+    class Immovable:
+        """Report that rejects every write."""
+
+        __slots__ = ()
+
+        @property
+        def longrepr(self):
+            return f"cookie: sessionid={SESSION}"
+
+        @property
+        def sections(self):
+            return [("Captured stdout call", f"sessionid={SESSION}")]
+
+    with pytest.raises(log_privacy._Unscrubbable):
+        log_privacy.scrub_report(Immovable())
 
 
 def test_scrub_report_fails_closed_on_filter_error(monkeypatch) -> None:
@@ -325,8 +406,13 @@ def test_scrub_report_fails_closed_on_filter_error(monkeypatch) -> None:
     assert report.sections == []
 
 
-def test_withhold_survives_a_readonly_report(monkeypatch) -> None:
-    """Fail-closed holds even when the report itself rejects both writes."""
+def test_withhold_raises_when_report_rejects_replacement() -> None:
+    """A report that rejects whole-detail replacement must fail, not pass silently.
+
+    This replaces the earlier assertion that "no exception escaped". Silence here
+    meant the credential stayed rendered (#735 R2 P2), so the contract is now an
+    explicit raise.
+    """
 
     class ReadOnlyReport:
         """Report whose rendered fields cannot be reassigned."""
@@ -341,8 +427,8 @@ def test_withhold_survives_a_readonly_report(monkeypatch) -> None:
         def sections(self):
             return [("Captured stdout call", f"sessionid={SESSION}")]
 
-    log_privacy._withhold(ReadOnlyReport(), None)
-    # No exception escaped; the caller still reports a failure with a safe message.
+    with pytest.raises(log_privacy._Unscrubbable):
+        log_privacy._withhold(ReadOnlyReport(), None)
 
 
 def test_withhold_tolerates_unreadable_excinfo() -> None:
@@ -384,6 +470,80 @@ def test_playwright_timeout_failure() -> None:
 ROOT_CONFTEST = '''"""Activate the E2E console privacy filter for every run in this repository."""
 
 pytest_plugins = ["tests.e2e.log_privacy"]
+'''
+
+# R2 regression fixture: an empty-first folded Authorization header, plus an
+# immutable repr field. Both must be gone from every real sink.
+FOLDED_TEST = '''"""Synthetic failing test exercising the R2 counterexamples."""
+
+MARKER = "fold-735-marker-r2"
+
+
+def test_empty_first_folded_header_failure() -> None:
+    print("captured stdout before failure")
+    raise RuntimeError(
+        "APIRequestContext.post: Timeout 120000ms exceeded.\\n"
+        "Call log:\\n"
+        "  - \\u2192 POST https://panel.internal.example.invalid:8443/api/servers/1/install\\n"
+        "  -     - Authorization:\\n"
+        "  -     -   Bearer " + MARKER + "\\n"
+        "  -     - cookie:\\n"
+        "  -     -   sessionid=" + MARKER + "\\n"
+    )
+'''
+
+# A repr whose fields are read-only properties: the plugin must replace the
+# whole rendered detail rather than silently keep the secret.
+#
+# The hook is non-wrapper and runs at this file's conftest priority *before*
+# pytest_runtest_makereport completes, so the frozen repr is what the filter
+# receives. A wrapper here would run after the filter and prove nothing.
+IMMUTABLE_REPR_TEST = '''"""Synthetic failing test whose report must be scrubbed after substitution."""
+
+
+def test_immutable_repr_failure() -> None:
+    raise RuntimeError("boom cookie: sessionid=imm-735-marker-r2")
+'''
+
+# The frozen-repr hook must live in a conftest (pytest does not collect hooks from
+# test modules). It is a firstresult makereport hook returning a report whose
+# rendered fields are read-only, so the filter's post-yield pass receives an
+# unscrubbable repr and must replace the whole detail.
+IMMUTABLE_REPR_CONFTEST = '''"""Install the filter and substitute an immutable, leaky report repr."""
+
+from _pytest.reports import TestReport
+
+pytest_plugins = ["tests.e2e.log_privacy"]
+
+
+class _FrozenRepr:
+    """Repr exposing read-only rendered fields."""
+
+    def __init__(self, text):
+        self._text = text
+
+    @property
+    def message(self):
+        return self._text
+
+    @property
+    def lines(self):
+        return [self._text]
+
+    def toterminal(self, tw):
+        tw.line(self._text)
+
+    def __str__(self):
+        return self._text
+
+
+def pytest_runtest_makereport(item, call):
+    if call.when != "call":
+        return None
+    report = TestReport.from_item_and_call(item, call)
+    if report.failed:
+        report.longrepr = _FrozenRepr("cookie: sessionid=imm-735-marker-r2")
+    return report
 '''
 
 
@@ -522,3 +682,235 @@ def test_logs_token_then_fails() -> None:
     # The captured-log section is still published, just without the value.
     assert "Captured log call" in combined
     assert "test_logs_token_then_fails" in combined
+
+
+# ── R2 counterexample regressions: real console and JUnit sinks ──────
+
+FOLDED_MARKER = "fold-735-marker-r2"
+IMMUTABLE_MARKER = "imm-735-marker-r2"
+
+
+def _run_with(
+    tmp_path: Path, source: str, *args: str, conftest: str = ROOT_CONFTEST
+) -> subprocess.CompletedProcess:
+    """Run pytest on an arbitrary synthetic test file with the filter active."""
+    (tmp_path / "pytest.ini").write_text("[pytest]\npython_files = test_*.py\n", encoding="utf-8")
+    (tmp_path / "conftest.py").write_text(conftest, encoding="utf-8")
+    (tmp_path / "test_leaky_e2e.py").write_text(source, encoding="utf-8")
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(tmp_path / "test_leaky_e2e.py"),
+            "-p",
+            "no:cacheprovider",
+            "-c",
+            str(tmp_path / "pytest.ini"),
+            *args,
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        env=_env(),
+    )
+
+
+@pytest.mark.parametrize("tb_style", ["long", "short", "auto", "native"])
+def test_empty_first_folded_auth_header_never_reaches_console(
+    tmp_path: Path, tb_style: str
+) -> None:
+    """P1: an empty-first folded Authorization value is redacted in real output."""
+    result = _run_with(tmp_path, FOLDED_TEST, f"--tb={tb_style}")
+
+    combined = result.stdout + result.stderr
+    assert FOLDED_MARKER not in combined, "folded continuation leaked to console"
+    # Failure status, identity and error type are preserved.
+    assert result.returncode == 1, combined
+    assert "test_empty_first_folded_header_failure" in combined
+    assert "RuntimeError" in combined
+    assert "Timeout 120000ms exceeded" in combined
+
+
+def test_empty_first_folded_auth_header_never_reaches_junit(tmp_path: Path) -> None:
+    """P1: the same counterexample cannot reach a persisted JUnit report."""
+    report = tmp_path / "junit.xml"
+    result = _run_with(tmp_path, FOLDED_TEST, "--tb=long", f"--junitxml={report}")
+
+    assert result.returncode == 1
+    assert report.is_file(), result.stdout + result.stderr
+    xml = report.read_text(encoding="utf-8")
+    assert FOLDED_MARKER not in xml, "folded continuation leaked to JUnit XML"
+    assert "test_empty_first_folded_header_failure" in xml
+    assert "RuntimeError" in xml
+
+
+def test_immutable_repr_never_reaches_console_or_junit(tmp_path: Path) -> None:
+    """P2: an unscrubbable repr is replaced wholesale; status/type survive.
+
+    The synthetic file returns a report whose rendered fields are read-only
+    properties, so the filter must replace the whole detail. Asserting only "no
+    marker" would pass vacuously if the frozen repr never reached the filter, so
+    this also asserts the withheld placeholder is rendered.
+    """
+    report = tmp_path / "junit.xml"
+    result = _run_with(
+        tmp_path,
+        IMMUTABLE_REPR_TEST,
+        "--tb=long",
+        f"--junitxml={report}",
+        conftest=IMMUTABLE_REPR_CONFTEST,
+    )
+
+    combined = result.stdout + result.stderr
+    assert IMMUTABLE_MARKER not in combined, "immutable repr leaked to console"
+    if report.is_file():
+        assert IMMUTABLE_MARKER not in report.read_text(encoding="utf-8")
+    assert result.returncode != 0, combined
+    # Non-vacuous: the frozen repr was actually filtered, not merely absent.
+    assert "withheld" in combined, f"filter did not engage on the frozen repr:\n{combined}"
+
+
+def test_folded_redaction_is_not_satisfied_by_absence_of_failure(
+    tmp_path: Path,
+) -> None:
+    """Control: without the plugin the folded counterexample does leak."""
+    (tmp_path / "pytest.ini").write_text("[pytest]\npython_files = test_*.py\n", encoding="utf-8")
+    (tmp_path / "conftest.py").write_text("", encoding="utf-8")
+    (tmp_path / "test_leaky_e2e.py").write_text(FOLDED_TEST, encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(tmp_path / "test_leaky_e2e.py"),
+            "-p",
+            "no:cacheprovider",
+            "-c",
+            str(tmp_path / "pytest.ini"),
+            "--tb=long",
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        env=_env(),
+    )
+    assert FOLDED_MARKER in (
+        result.stdout + result.stderr
+    ), "control run must reproduce the folded-header exposure"
+
+
+# ── R2 escalation paths: each fail-closed branch directly exercised ──
+
+
+def test_verification_rejects_still_sensitive_longrepr() -> None:
+    """The verification layer raises on a longrepr that still needs redaction.
+
+    Exercised directly because ``redact`` and the header pass are the same code
+    path: any attempt to stub one out also disables detection, which would make a
+    scrub-level probe pass vacuously.
+    """
+    report = _FakeReport(f"cookie: sessionid={SESSION}")
+    with pytest.raises(log_privacy._Unscrubbable):
+        log_privacy._verify_report(report)
+
+
+def test_verification_rejects_still_sensitive_repr_tree() -> None:
+    """The verification layer raises when a repr tree still carries a secret."""
+    report = _FakeReport(_FakeFileLocation(f"cookie: sessionid={SESSION}"))
+    with pytest.raises(log_privacy._Unscrubbable):
+        log_privacy._verify_report(report)
+
+
+def test_verification_accepts_clean_longrepr() -> None:
+    """A clean longrepr passes verification without raising."""
+    log_privacy._verify_report(_FakeReport("assert 1 == 1"))
+
+
+def test_verification_catches_still_sensitive_repr_tree(monkeypatch) -> None:
+    """A repr tree that stays sensitive after scrubbing escalates to withhold."""
+    report = _FakeReport(_FakeFileLocation(f"cookie: sessionid={SESSION}"))
+
+    # Make _scrub a no-op so the verification layer must catch the leftover.
+    monkeypatch.setattr(log_privacy, "_scrub", lambda *a, **k: None)
+    log_privacy.scrub_report(report)
+    assert isinstance(report.longrepr, str)
+    assert "withheld" in report.longrepr
+
+
+def test_longrepr_assignment_that_does_not_take_escalates() -> None:
+    """A report whose longrepr silently ignores assignment is withheld."""
+
+    class StickyReport:
+        """Report that accepts then discards the new longrepr."""
+
+        def __init__(self) -> None:
+            self._lr = f"cookie: sessionid={SESSION}"
+            self.sections = []
+
+        @property
+        def longrepr(self):
+            return self._lr
+
+        @longrepr.setter
+        def longrepr(self, _value):
+            pass
+
+        outcome = "failed"
+
+        @property
+        def passed(self):
+            return False
+
+    report = StickyReport()
+    # Withholding also cannot take; that must raise rather than pass silently.
+    with pytest.raises(log_privacy._Unscrubbable):
+        log_privacy.scrub_report(report)
+
+
+def test_redact_lines_pads_non_string_entries() -> None:
+    """Non-string line entries are passed through the per-item fallback."""
+    result = log_privacy._redact_lines([f"cookie: sessionid={SESSION}", None])
+    assert result[0] == "cookie: <redacted>"
+    assert result[1] is None
+
+
+def test_redact_lines_returns_original_when_clean() -> None:
+    """An already-clean line list comes back unchanged, preserving boundaries."""
+    lines = ["assert 1 == 1", "no secrets here"]
+    assert log_privacy._redact_lines(lines) == lines
+
+
+def test_redact_lines_keeps_boundaries_when_length_is_unchanged() -> None:
+    """Boundaries survive when redaction does not change the total length."""
+    log_privacy._registered.clear()
+    try:
+        # Make the sensitive value exactly as long as the placeholder so the
+        # re-split path (not the single-element fallback) is taken.
+        value = "x" * len(log_privacy.REDACTED)
+        log_privacy._registered.append(value)
+        lines = [f"echo cookie {value}\n", "tail\n"]
+        out = log_privacy._redact_lines(lines)
+        assert len(out) == 2, out
+        assert out[1] == "tail\n"
+        assert value not in "".join(out)
+    finally:
+        log_privacy._registered.clear()
+
+
+def test_redact_lines_preserves_content_after_redaction() -> None:
+    """Redaction removes the secret and keeps subsequent lines readable."""
+    lines = ["cookie: sessionid=" + SESSION + "\n", "tail line\n"]
+    out = log_privacy._redact_lines(lines)
+    joined = "".join(out)
+    assert SESSION not in joined
+    # The unindented following line is not a fold continuation and must survive.
+    assert "tail line" in joined
+
+
+def test_redact_lines_falls_back_to_single_element_when_lengths_shift() -> None:
+    """A replacement that changes length collapses to one safe element."""
+    lines = ["cookie: sessionid=" + SESSION + "\n", "tail"]
+    out = log_privacy._redact_lines(lines)
+    assert len(out) == 1
+    assert SESSION not in out[0]

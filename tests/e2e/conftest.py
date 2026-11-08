@@ -216,6 +216,10 @@ def csrf_token(authenticated_page: Page, base_url: str) -> str:
     After login, the app populates <meta name="csrf-token" content="...">
     on every authenticated page. Falls back to Playwright's cookie API if
     the meta tag is empty (e.g. on pages that don't inject it).
+
+    The value actually returned is registered with the console privacy filter
+    regardless of which source produced it, so a meta-tag token is covered by
+    bare-substring redaction exactly like a cookie-sourced one.
     """
     # The authenticated_page is already on an authenticated page (post-login
     # redirect). Read the CSRF from the meta tag or cookie store.
@@ -229,6 +233,9 @@ def csrf_token(authenticated_page: Page, base_url: str) -> str:
         # Fallback: read from Playwright's cookie store (bypasses HttpOnly)
         token = _get_csrf_cookie(authenticated_page)
 
+    # Registration is source-independent: cover meta, cookie and any future
+    # origin in one place, at the single value that leaves this fixture.
+    log_privacy.register_secret(token)
     return token
 
 
