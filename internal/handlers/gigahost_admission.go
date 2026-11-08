@@ -1,29 +1,34 @@
 package handlers
 
-// Bounded per-admin admission cooldown for repeated rejected deploy attempts.
+// Bounded per-admin admission control for Gigahost deploy attempts.
 //
-// A rejected Gigahost order attempt costs provider reads (catalog, then server
-// inventory). When the rejection is persistent - a budget cap already crossed, a
-// stalled account call - pressing the button again re-runs the whole sequence
-// against a provider that is already the suspect, and does so while the admin
-// learns nothing new.
+// Two distinct mechanisms are needed and were previously conflated:
 //
-// This is deliberately NOT a cache of decisions:
-//   - only REJECTIONS are recorded, so a positive eligibility or financial
-//     verdict is never reused and no purchase can ever be fast-pathed;
-//   - the entry is dropped on a successful attempt;
-//   - the window is short and stateless in memory, so nothing survives a restart
-//     and nothing becomes a permanent lockout;
-//   - the key is the authenticated admin's own user id, so one admin can never
-//     throttle another.
+//  1. IN-FLIGHT RESERVATION (atomicity). An attempt claims the admin's single
+//     slot BEFORE any provider I/O, in the same critical section as the check.
+//     A check -> I/O -> record sequence lets every concurrent request pass the
+//     check while the first is still blocked on the network; that is precisely
+//     the retry storm this exists to stop. The reservation is released on every
+//     terminal path, and no mutex is ever held across a provider call.
 //
-// The cooldown suppresses the retry, not the information: the response names the
-// condition, says how long to wait, and carries Retry-After. A genuine provider
-// error is never turned into a cooldown - only failures that were themselves
-// classified as a persistent rejection arm the window.
+//  2. COOLDOWN (after a failure). When an attempt ends badly - a persistent
+//     rejection OR a provider timeout/error - the admin is suppressed for a
+//     short window so an immediate repeat does not re-run an expensive sequence
+//     that just failed. Provider timeouts qualify: repeated stalled account
+//     reads were previously unlimited.
+//
+// This is deliberately NOT a cache of decisions: no eligibility, credit or price
+// verdict is stored or reused, so no purchase can be fast-pathed. The FIRST
+// genuine provider error is returned as itself with its own status; the cooldown
+// only speaks about the prior failure on LATER attempts, and labels it rather
+// than echoing error text.
+//
+// The window is short and in memory: no schema, no persistence, no background
+// goroutine, so nothing becomes a permanent lockout.
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"sync"
@@ -32,20 +37,34 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 )
 
-// repeatedSubmitWindow is how long a rejected attempt suppresses an immediate
-// retry by the same admin. Short on purpose: it must absorb double-clicks and
-// scripted retry storms without being a lockout, and it is only a hint - the
-// admin can retry successfully the moment the underlying condition changes.
+// repeatedSubmitWindow is an explicit operational limit: how long a failed
+// attempt suppresses an immediate retry by the same admin. Short on purpose - it
+// must absorb double-clicks and retry storms without being a lockout.
 const repeatedSubmitWindow = 20 * time.Second
 
-// maxAdmissionEntries caps the in-memory table so a long-lived process with many
-// admins cannot grow it without bound.
+// maxAdmissionEntries caps the in-memory table.
 const maxAdmissionEntries = 256
 
-// orderAdmission tracks the last rejected attempt per admin.
+// Closed set of prior-failure labels. A label, never err.Error() text.
+const (
+	failureBudget          = "budget"
+	failureCredit          = "credit"
+	failureProviderTimeout = "provider_timeout"
+	failureProviderError   = "provider_error"
+)
+
+// admissionEntry is one admin's state: at most one attempt in flight, plus when
+// and why the last attempt failed.
+type admissionEntry struct {
+	inFlight   bool
+	failedAt   time.Time
+	failedKind string
+}
+
+// orderAdmission is the per-admin admission table.
 type orderAdmission struct {
-	mu        sync.Mutex
-	rejectedA map[string]time.Time
+	mu      sync.Mutex
+	entries map[string]*admissionEntry
 }
 
 // repeatedSubmitCooldown reports the configured suppression window.
@@ -53,69 +72,124 @@ func repeatedSubmitCooldown() time.Duration {
 	return repeatedSubmitWindow
 }
 
-// admission returns the lazily created table. The handlers struct is shared, so
-// creation is guarded by a sync.Once held on the struct itself.
+// admission returns the lazily created table.
 func (h *Handlers) admission() *orderAdmission {
 	h.admissionOnce.Do(func() {
-		h.admissionState = &orderAdmission{rejectedA: make(map[string]time.Time)}
+		h.admissionState = &orderAdmission{entries: make(map[string]*admissionEntry)}
 	})
 	return h.admissionState
 }
 
-// orderAdmissionBlocked reports whether the admin must wait, and for how long.
+// remainingWindow is how much of the failure cooldown is left. Caller holds the lock.
+func remainingWindow(entry *admissionEntry) time.Duration {
+	if entry.failedAt.IsZero() {
+		return 0
+	}
+	if left := repeatedSubmitWindow - time.Since(entry.failedAt); left > 0 {
+		return left
+	}
+	return 0
+}
+
+// evictIfFull keeps the table bounded. Caller holds the lock.
+func evictIfFull(table *orderAdmission, keep string) {
+	if len(table.entries) < maxAdmissionEntries {
+		return
+	}
+	now := time.Now()
+	for key, entry := range table.entries {
+		if key == keep || entry.inFlight {
+			continue
+		}
+		if now.Sub(entry.failedAt) > repeatedSubmitWindow {
+			delete(table.entries, key)
+		}
+	}
+	if len(table.entries) < maxAdmissionEntries {
+		return
+	}
+	for key, entry := range table.entries {
+		if key == keep || entry.inFlight {
+			continue
+		}
+		delete(table.entries, key)
+		return
+	}
+}
+
+// admitAttempt atomically claims the admin's single in-flight slot.
 //
-// Purging happens on read, so an expired window disappears without a background
-// goroutine and no entry can outlive its usefulness.
-func (h *Handlers) orderAdmissionBlocked(userID string) (bool, time.Duration) {
+// The check and the claim share one lock, so two concurrent callers can never
+// both be admitted. It performs no provider I/O. On refusal it returns the
+// remaining wait and the prior failure label so the response can explain itself.
+func (h *Handlers) admitAttempt(userID string) (ticket *admissionEntry, wait time.Duration, priorFailure string, ok bool) {
 	if userID == "" {
-		// Without a stable identity there is nothing to key on; never throttle.
-		return false, 0
+		// No stable identity: never throttle. A nil ticket needs no release.
+		return nil, 0, "", true
 	}
 	table := h.admission()
 	table.mu.Lock()
 	defer table.mu.Unlock()
-	rejectedAt, ok := table.rejectedA[userID]
-	if !ok {
-		return false, 0
+
+	entry, present := table.entries[userID]
+	if !present {
+		entry = &admissionEntry{}
+		table.entries[userID] = entry
+		evictIfFull(table, userID)
 	}
-	remaining := repeatedSubmitWindow - time.Since(rejectedAt)
-	if remaining <= 0 {
-		delete(table.rejectedA, userID)
-		return false, 0
+	if entry.inFlight {
+		return nil, remainingWindow(entry), entry.failedKind, false
 	}
-	return true, remaining
+	if left := remainingWindow(entry); left > 0 {
+		return nil, left, entry.failedKind, false
+	}
+	entry.inFlight = true
+	return entry, 0, "", true
 }
 
-// recordRejectedOrderAttempt arms the cooldown for the admin. Only called for
-// failures that are persistent rejections, never for transient provider errors.
-func (h *Handlers) recordRejectedOrderAttempt(userID string, at time.Time) {
-	if userID == "" {
+// releaseAttempt ends an attempt. A non-empty failureKind arms the cooldown; an
+// empty one clears it. Every terminal path must call this or the slot leaks.
+func (h *Handlers) releaseAttempt(ticket *admissionEntry, failureKind string) {
+	if ticket == nil {
 		return
 	}
 	table := h.admission()
 	table.mu.Lock()
 	defer table.mu.Unlock()
-	// Bound the table: drop expired entries, and if it is still full, keep the
-	// newest by evicting an arbitrary stale one rather than growing forever.
-	if len(table.rejectedA) >= maxAdmissionEntries {
-		now := time.Now()
-		for key, when := range table.rejectedA {
-			if now.Sub(when) > repeatedSubmitWindow {
-				delete(table.rejectedA, key)
-			}
-		}
-		if len(table.rejectedA) >= maxAdmissionEntries {
-			for key := range table.rejectedA {
-				delete(table.rejectedA, key)
-				break
-			}
-		}
+	ticket.inFlight = false
+	if failureKind == "" {
+		ticket.failedAt = time.Time{}
+		ticket.failedKind = ""
+		return
 	}
-	table.rejectedA[userID] = at
+	ticket.failedAt = time.Now()
+	ticket.failedKind = failureKind
 }
 
-// clearOrderAdmission drops the admin's entry after a successful attempt, so a
-// stale rejection can never gate a later legitimate order.
+// orderAdmissionBlocked reports whether the admin must wait, and for how long.
+func (h *Handlers) orderAdmissionBlocked(userID string) (bool, time.Duration) {
+	if userID == "" {
+		return false, 0
+	}
+	table := h.admission()
+	table.mu.Lock()
+	defer table.mu.Unlock()
+	entry, present := table.entries[userID]
+	if !present {
+		return false, 0
+	}
+	if entry.inFlight {
+		return true, 0
+	}
+	left := remainingWindow(entry)
+	if left <= 0 {
+		delete(table.entries, userID)
+		return false, 0
+	}
+	return true, left
+}
+
+// clearOrderAdmission drops the admin's entry entirely.
 func (h *Handlers) clearOrderAdmission(userID string) {
 	if userID == "" {
 		return
@@ -123,69 +197,116 @@ func (h *Handlers) clearOrderAdmission(userID string) {
 	table := h.admission()
 	table.mu.Lock()
 	defer table.mu.Unlock()
-	delete(table.rejectedA, userID)
+	delete(table.entries, userID)
 }
 
-// repeatedSubmitSuppressed writes the cooldown response when the admin is inside
-// a window and reports whether it handled the request. Extracted from the order
-// handler to keep that function under the repository complexity limit.
-func (h *Handlers) repeatedSubmitSuppressed(w http.ResponseWriter, adminID string) bool {
+// recordRejectedOrderAttempt arms the cooldown without a live ticket.
+func (h *Handlers) recordRejectedOrderAttempt(userID string, at time.Time) {
+	if userID == "" {
+		return
+	}
+	table := h.admission()
+	table.mu.Lock()
+	defer table.mu.Unlock()
+	entry, present := table.entries[userID]
+	if !present {
+		entry = &admissionEntry{}
+		table.entries[userID] = entry
+		evictIfFull(table, userID)
+	}
+	entry.failedAt = at
+	if entry.failedKind == "" {
+		entry.failedKind = failureBudget
+	}
+}
+
+// suppressionWriting writes the admission refusal and reports whether it handled
+// the request. The response names the PRIOR failure so the admin knows what to
+// fix, and never implies the current attempt was placed.
+func (h *Handlers) suppressionWriting(w http.ResponseWriter, adminID string) bool {
 	blocked, wait := h.orderAdmissionBlocked(adminID)
 	if !blocked {
 		return false
 	}
+	table := h.admission()
+	table.mu.Lock()
+	prior := ""
+	if entry, present := table.entries[adminID]; present {
+		prior = entry.failedKind
+	}
+	table.mu.Unlock()
+
+	if wait <= 0 {
+		wait = time.Second
+	}
 	w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
-	h.JSON(w, http.StatusTooManyRequests, map[string]any{
+	body := map[string]any{
 		"status":         "repeat_suppressed",
 		"error":          "repeat_suppressed",
-		"message":        "A previous deployment attempt was rejected moments ago; wait for the current state to change before retrying.",
 		"retry_after_ms": wait.Milliseconds(),
-	})
+		"message":        suppressionMessage(prior),
+	}
+	if prior != "" {
+		body["prior_failure"] = prior
+	}
+	h.JSON(w, http.StatusTooManyRequests, body)
 	return true
 }
 
-// preProviderRejection records a rejected attempt when the failure is one where an
-// immediate retry cannot help, then writes the existing error response.
-func (h *Handlers) preProviderRejection(adminID string, err error, status int) {
-	if isPersistentRejection(status, err.Error()) {
-		h.recordRejectedOrderAttempt(adminID, time.Now())
+// suppressionMessage explains the refusal in terms of the prior failure.
+func suppressionMessage(priorFailure string) string {
+	switch priorFailure {
+	case failureProviderTimeout:
+		return "A previous attempt did not reach Gigahost within its timeout. Wait before retrying so the provider is not re-queried while it is unhealthy; this request was not sent."
+	case failureProviderError:
+		return "A previous attempt failed while talking to Gigahost. Wait before retrying so the provider is not re-queried while it is unhealthy; this request was not sent."
+	case failureBudget:
+		return "A previous attempt was rejected by the monthly budget. Wait for the budget to change before retrying."
+	case failureCredit:
+		return "A previous attempt was rejected for insufficient credit. Wait for the account credit to change before retrying."
+	default:
+		return "A previous deployment attempt was rejected moments ago; wait for the current state to change before retrying."
+	}
+}
+
+// failureKindFor classifies a completed failing attempt for the cooldown.
+//
+// A provider timeout/error DOES arm the cooldown: repeated stalled account reads
+// were unlimited before this, and a stalled call is the expensive case. The kind
+// is a closed label, never err.Error() text.
+func failureKindFor(status int, err error) string {
+	switch {
+	case status == http.StatusPaymentRequired:
+		return failureCredit
+	case status == http.StatusBadRequest:
+		return failureBudget
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return failureProviderTimeout
+	case err != nil:
+		return failureProviderError
+	case status == http.StatusBadGateway:
+		return failureProviderError
+	default:
+		return ""
 	}
 }
 
 // orderEligibilityAdmission performs the pre-provider gates that precede the
-// budget mutex: the repeated-submission cooldown, the eligibility check and the
-// catalog validation. It reports handled=true when the request was already
-// answered, so the order handler keeps a single branch for all three.
+// budget mutex. It reports handled=true when the request was already answered,
+// plus the closed failure label the caller must use when releasing its
+// reservation, so a provider timeout arms the cooldown instead of leaving
+// repeated stalled reads unlimited.
 func (h *Handlers) orderEligibilityAdmission(
-	ctx context.Context, w http.ResponseWriter, client gigahost.Client, req OrderServerPayload, adminID string,
-) ([]gigahost.HourlyPlan, bool) {
-	if h.repeatedSubmitSuppressed(w, adminID) {
-		return nil, true
-	}
+	ctx context.Context, w http.ResponseWriter, client gigahost.Client, req OrderServerPayload,
+) (plans []gigahost.HourlyPlan, handled bool, failureKind string) {
 	catalogPlans, err := h.verifyAccountEligibility(ctx, client)
 	if err != nil {
-		h.preProviderRejection(adminID, err, eligibilityErrorStatus(err))
 		h.handleEligibilityError(w, err)
-		return nil, true
+		return nil, true, failureKindFor(eligibilityErrorStatus(err), err)
 	}
 	if err := validateOrderAgainstCatalog(catalogPlans, req); err != nil {
-		h.recordRejectedOrderAttempt(adminID, time.Now())
 		h.handleBudgetCheckError(w, err)
-		return nil, true
+		return nil, true, failureBudget
 	}
-	return catalogPlans, false
-}
-
-// isPersistentRejection classifies a pre-provider failure as one where retrying
-// immediately cannot help. Transient transport failures are deliberately NOT
-// included: those must surface as themselves.
-func isPersistentRejection(status int, body string) bool {
-	switch status {
-	case 400: // budget_exceeded / invalid_plan: the request or state is wrong
-		return true
-	case 402: // insufficient_credit: a financial rejection
-		return true
-	default:
-		return false
-	}
+	return catalogPlans, false, ""
 }

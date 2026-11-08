@@ -17,6 +17,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -359,20 +360,26 @@ func TestRepeatedSubmission_TableIsBoundedAndSelfPruning(t *testing.T) {
 	}
 	table := h.admission()
 	table.mu.Lock()
-	sizeAfterFreshFill := len(table.rejectedA)
+	sizeAfterFreshFill := len(table.entries)
 	table.mu.Unlock()
 	if sizeAfterFreshFill > maxAdmissionEntries {
 		t.Fatalf("table grew to %d entries, cap is %d", sizeAfterFreshFill, maxAdmissionEntries)
 	}
 
 	// Now make everything expired and insert: expired entries are purged first.
-	for key := range table.rejectedA {
+	table.mu.Lock()
+	keys := make([]string, 0, len(table.entries))
+	for key := range table.entries {
+		keys = append(keys, key)
+	}
+	table.mu.Unlock()
+	for _, key := range keys {
 		h.recordRejectedOrderAttempt(key, time.Now().Add(-2*repeatedSubmitCooldown()))
 	}
 	h.recordRejectedOrderAttempt("after-expiry", time.Now())
 	table.mu.Lock()
-	size := len(table.rejectedA)
-	_, hasNew := table.rejectedA["after-expiry"]
+	size := len(table.entries)
+	_, hasNew := table.entries["after-expiry"]
 	table.mu.Unlock()
 	if !hasNew {
 		t.Fatal("the new entry must be recorded")
@@ -388,23 +395,24 @@ func TestRepeatedSubmission_TableIsBoundedAndSelfPruning(t *testing.T) {
 	}
 }
 
-// TestRepeatedSubmission_InvalidPlanAndCreditArmTheWindow covers the remaining
-// persistent-rejection classifications, so the classifier is not tested only for
-// the budget case.
-func TestRepeatedSubmission_InvalidPlanAndCreditArmTheWindow(t *testing.T) {
-	if !isPersistentRejection(400, "invalid_plan: plan 999 not found") {
-		t.Error("400 invalid_plan must be a persistent rejection")
+// TestRepeatedSubmission_FailureClassification covers every cooldown label. A
+// provider timeout MUST arm the window: repeated stalled account reads were
+// unlimited before the correction.
+func TestRepeatedSubmission_FailureClassification(t *testing.T) {
+	if got := failureKindFor(http.StatusBadRequest, errors.New("invalid_plan: plan 999 not found")); got != failureBudget {
+		t.Errorf("400 = %q, want %q", got, failureBudget)
 	}
-	if !isPersistentRejection(402, "insufficient_credit") {
-		t.Error("402 insufficient_credit must be a persistent rejection")
+	if got := failureKindFor(http.StatusPaymentRequired, gigahost.ErrInsufficientCredit); got != failureCredit {
+		t.Errorf("402 = %q, want %q", got, failureCredit)
 	}
-	if isPersistentRejection(502, "account_check_failed") {
-		t.Error("502 account_check_failed must NOT be a persistent rejection")
+	// The corrected case: a provider timeout arms the cooldown.
+	if got := failureKindFor(http.StatusBadGateway, context.DeadlineExceeded); got != failureProviderTimeout {
+		t.Errorf("502 deadline = %q, want %q", got, failureProviderTimeout)
 	}
-	if isPersistentRejection(502, "catalog_check_failed") {
-		t.Error("502 catalog_check_failed must NOT be a persistent rejection")
+	if got := failureKindFor(http.StatusBadGateway, errors.New("failed to fetch catalog: boom")); got != failureProviderError {
+		t.Errorf("502 error = %q, want %q", got, failureProviderError)
 	}
-	if isPersistentRejection(500, "db_error") {
-		t.Error("500 must NOT be a persistent rejection")
+	if got := failureKindFor(http.StatusOK, nil); got != "" {
+		t.Errorf("success must not arm a cooldown, got %q", got)
 	}
 }

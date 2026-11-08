@@ -427,13 +427,24 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	// an admin who just hit a persistent rejection gains nothing from re-running
 	// the catalog/account/inventory sequence, and the provider is already the
 	// suspect. This is a retry suppression, not a cached decision - nothing about
-	// eligibility or price is remembered. The same helper performs the eligibility
-	// and catalog validation gates that follow it.
-	catalogPlans, handled := h.orderEligibilityAdmission(r.Context(), w, client, req, sess.UserID)
-	if handled {
+	// eligibility or price is remembered.
+	//
+	// The reservation is taken ATOMICALLY with the check, before any provider
+	// I/O, so concurrent requests from one admin cannot all slip through while
+	// the first is blocked on the network. It is released on every terminal path
+	// below; no mutex is held across a provider call.
+	adminID := sess.UserID
+	ticket, _, _, admitted := h.admitAttempt(adminID)
+	if !admitted {
+		h.suppressionWriting(w, adminID)
 		return
 	}
-	adminID := sess.UserID
+
+	catalogPlans, handled, admissionFailure := h.orderEligibilityAdmission(r.Context(), w, client, req)
+	if handled {
+		h.releaseAttempt(ticket, admissionFailure)
+		return
+	}
 
 	// 3. Concurrency serialization: lock around budget check, intent creation, and reservation
 	h.budgetMu.Lock()
@@ -442,10 +453,14 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	// 4. Reconcile unknown purchase state and enforce in-flight duplicate lock
 	unresolved, reconcileErr := h.reconcilePendingUnknownOrders(r.Context(), client, req)
 	if reconcileErr != nil {
+		h.releaseAttempt(ticket, failureProviderError)
 		h.JSONError(w, http.StatusServiceUnavailable, "reconciliation_failed", reconcileErr.Error())
 		return
 	}
 	if unresolved != nil {
+		// An unresolved prior purchase is not this attempt's failure, but the
+		// slot must still be released or the admin would be locked out.
+		h.releaseAttempt(ticket, "")
 		h.JSON(w, http.StatusAccepted, map[string]any{
 			"status":  "unknown",
 			"message": "Prior purchase order is pending reconciliation; refusing duplicate purchase until resolved",
@@ -456,14 +471,14 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 
 	// 5. Monthly NOK budget cap enforcement
 	if err := h.checkMonthlyBudget(r.Context(), client, req, catalogPlans); err != nil {
-		h.recordRejectedOrderAttempt(adminID, time.Now())
+		h.releaseAttempt(ticket, failureBudget)
 		h.handleBudgetCheckError(w, err)
 		return
 	}
 
-	// The attempt passed every pre-provider gate; drop any stale rejection so a
-	// successful order is never gated by an older failure.
-	h.clearOrderAdmission(adminID)
+	// The attempt passed the pre-provider gates; release the reservation so a
+	// stale rejection can never gate a later legitimate order.
+	h.releaseAttempt(ticket, "")
 
 	// 3. Pre-dispatch durable intent persistence; fail closed if DB cannot record intent
 	now := time.Now().UTC()
