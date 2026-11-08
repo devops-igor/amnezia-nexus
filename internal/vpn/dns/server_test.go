@@ -356,7 +356,9 @@ func TestServer_ShutdownDrainWithLateConnections(t *testing.T) {
 }
 
 func TestServer_ScopeRetirementDoesNotAbortSiblingTCPQueries(t *testing.T) {
-	clientBEntered := make(chan struct{})
+	// Buffered so the resolver-side notification survives the window between the
+	// query reaching the resolver and this goroutine parking on the select below.
+	clientBEntered := make(chan struct{}, 1)
 	clientBRelease := make(chan struct{})
 
 	res := &mockResolver{
