@@ -74,40 +74,76 @@ func stripObsoleteGigahostKeys(cfg map[string]any) {
 }
 
 func (h *Handlers) preserveSecretsOnSave(ctx context.Context, req *models.SaveSettingsRequest) {
-	// 1. SSL: Preserve existing KeyText / CertText if incoming are empty or masked
-	var existingSSL models.SSLSettings
-	_ = h.db.GetSetting(ctx, "ssl", &existingSSL)
-	if req.SSL.KeyText == "" || req.SSL.KeyText == "********" {
-		req.SSL.KeyText = existingSSL.KeyText
-	}
-	if req.SSL.CertText == "" || req.SSL.CertText == "********" {
-		req.SSL.CertText = existingSSL.CertText
-	}
-
-	// 2. Telegram: Preserve existing bot_token / token if incoming is empty or masked
-	if req.Telegram != nil {
-		existingTelegram := make(map[string]any)
-		_ = h.db.GetSetting(ctx, "telegram", &existingTelegram)
-		if bt, ok := req.Telegram["bot_token"].(string); !ok || bt == "" || bt == "********" {
-			if oldBt, ok := existingTelegram["bot_token"].(string); ok && oldBt != "" {
-				req.Telegram["bot_token"] = oldBt
-			}
-		}
-		if tok, ok := req.Telegram["token"].(string); !ok || tok == "" || tok == "********" {
-			if oldTok, ok := existingTelegram["token"].(string); ok && oldTok != "" {
-				req.Telegram["token"] = oldTok
-			}
-		}
-	}
-
-	// 3. Gigahost: Preserve existing api_key if incoming is empty or masked
+	h.preserveSSLOnSave(ctx, &req.SSL)
+	h.preserveTelegramOnSave(ctx, req.Telegram)
+	// Gigahost: Preserve existing api_key if incoming is empty or masked
 	if req.Gigahost != nil {
-		existingGigahost := make(map[string]any)
-		_ = h.db.GetSetting(ctx, "gigahost", &existingGigahost)
-		if key, ok := req.Gigahost["api_key"].(string); !ok || key == "" || key == "********" || strings.HasPrefix(key, "****") {
-			if oldKey, ok := existingGigahost["api_key"].(string); ok && oldKey != "" {
-				req.Gigahost["api_key"] = oldKey
-			}
+		h.preserveGigahostOnSave(ctx, req.Gigahost)
+	}
+}
+
+// preserveSSLOnSave keeps the stored certificate material when the incoming
+// values are empty or the masked placeholder the settings page renders.
+func (h *Handlers) preserveSSLOnSave(ctx context.Context, incoming *models.SSLSettings) {
+	var existing models.SSLSettings
+	_ = h.db.GetSetting(ctx, "ssl", &existing)
+	if incoming.KeyText == "" || incoming.KeyText == "********" {
+		incoming.KeyText = existing.KeyText
+	}
+	if incoming.CertText == "" || incoming.CertText == "********" {
+		incoming.CertText = existing.CertText
+	}
+}
+
+// preserveTelegramOnSave keeps the stored bot token when the incoming value is
+// absent, empty or masked. A nil section means "not edited", not "erase".
+func (h *Handlers) preserveTelegramOnSave(ctx context.Context, incoming map[string]any) {
+	if incoming == nil {
+		return
+	}
+	existing := make(map[string]any)
+	_ = h.db.GetSetting(ctx, "telegram", &existing)
+	for _, key := range []string{"bot_token", "token"} {
+		value, ok := incoming[key].(string)
+		if ok && value != "" && value != "********" {
+			continue
+		}
+		if old, ok := existing[key].(string); ok && old != "" {
+			incoming[key] = old
+		}
+	}
+}
+
+// preserveGigahostOnSave keeps the stored Gigahost secrets and retired fields
+// that the incoming payload does not supply.
+//
+// The API key is preserved exactly like the other masked secrets. The retired
+// fields are stripped from what the panel ACCEPTS (see stripObsoleteGigahostKeys)
+// but carried through on write, so saving unrelated settings never destroys a
+// value an older panel stored. Nothing reads them.
+func (h *Handlers) preserveGigahostOnSave(ctx context.Context, incoming map[string]any) {
+	existing := make(map[string]any)
+	_ = h.db.GetSetting(ctx, "gigahost", &existing)
+
+	if key, ok := incoming["api_key"].(string); !ok || key == "" || key == "********" || strings.HasPrefix(key, "****") {
+		if oldKey, ok := existing["api_key"].(string); ok && oldKey != "" {
+			incoming["api_key"] = oldKey
+		}
+	}
+
+	carryObsoleteGigahostKeys(incoming, existing)
+}
+
+// carryObsoleteGigahostKeys copies retired setting fields from the stored row into
+// the row being written, unless the request supplied one. This is a byte-preserving
+// carry-through, never a read: no panel path interprets these values.
+func carryObsoleteGigahostKeys(incoming, existing map[string]any) {
+	for _, key := range obsoleteGigahostKeys {
+		if _, provided := incoming[key]; provided {
+			continue
+		}
+		if old, ok := existing[key]; ok {
+			incoming[key] = old
 		}
 	}
 }

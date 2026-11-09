@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -333,5 +334,68 @@ func TestGigahostOrderHandler_RestartKeepsUnknownPurchaseBlocked(t *testing.T) {
 	}
 	if got := posts.Load(); got != 0 {
 		t.Errorf("provider purchase calls after restart = %d, want 0", got)
+	}
+}
+
+// TestSettingsHandlers_HideRetiredBudgetSetting proves the retired cap cannot
+// come back through the read API or be re-saved, while the stored bytes are left
+// untouched (an existing database is not rewritten).
+func TestSettingsHandlers_HideRetiredBudgetSetting(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+
+	// A settings row written by an older panel still carries the retired field.
+	if err := db.SetSetting(ctx, "gigahost", map[string]any{
+		"api_key":            "flux_live_legacy_0123456789abcdef0123456789abcdef0123",
+		"monthly_budget_nok": 30.0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	readGH := func() map[string]any {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+		w := httptest.NewRecorder()
+		h.GetSettingsHandler(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET /api/settings = %d (body: %s)", w.Code, w.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode settings response: %v", err)
+		}
+		gh, _ := resp["gigahost"].(map[string]any)
+		return gh
+	}
+
+	gh := readGH()
+	if _, present := gh["monthly_budget_nok"]; present {
+		t.Errorf("settings response exposes the retired budget field: %v", gh["monthly_budget_nok"])
+	}
+	if gh["api_key"] != "********" {
+		t.Errorf("api_key = %v, want it masked", gh["api_key"])
+	}
+
+	// Saving a stale client payload cannot reintroduce it.
+	body := `{"gigahost":{"monthly_budget_nok":9999}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/settings/save", strings.NewReader(body))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
+	w := httptest.NewRecorder()
+	h.SaveSettingsHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST /api/settings/save = %d (body: %s)", w.Code, w.Body.String())
+	}
+	if _, present := readGH()["monthly_budget_nok"]; present {
+		t.Error("a stale save reintroduced the retired budget field")
+	}
+
+	// The stored bytes are preserved: this is inert storage, not a migration.
+	var stored map[string]any
+	if err := db.GetSetting(ctx, "gigahost", &stored); err != nil {
+		t.Fatalf("GetSetting: %v", err)
+	}
+	if _, kept := stored["monthly_budget_nok"]; !kept {
+		t.Error("the stored legacy setting was destroyed; it should be left inert")
 	}
 }
