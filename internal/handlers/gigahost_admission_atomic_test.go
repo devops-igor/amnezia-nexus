@@ -367,11 +367,16 @@ func TestEvictIfFullBoundedFallback(t *testing.T) {
 	}
 }
 
-// TestReservationHeldThroughPurchase verifies the reservation's real lifetime. The
-// slot is released just before intent persistence, so the question is whether a
-// second same-admin request can slip in during the purchase window. It cannot: the
-// purchase runs under purchaseMu, so the second request blocks there instead of
-// repeating provider reads.
+// TestReservationHeldThroughPurchase verifies the admission reservation's real
+// lifetime. The slot is released just before the purchase, so the question is
+// whether a second same-admin request can slip in during the purchase window.
+//
+// It cannot, for two independent reasons, and this test asserts the weaker one:
+// purchaseMu is held across the duplicate check AND the intent write, so the second
+// request either blocks there or finds the durable intent and is refused. (The
+// per-admin admission token, which this test observes, additionally returns 429 for
+// the same admin.) The cross-admin duplicate window itself is covered
+// deterministically by TestDuplicateIntent_*.
 func TestReservationHeldThroughPurchase(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)
 	mock := &mockGigahostClient{

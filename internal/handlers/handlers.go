@@ -76,8 +76,11 @@ type Handlers struct {
 	upstreamSvc    UpstreamChecker
 	gigahostClient gigahost.Client
 	gigahostMu     sync.RWMutex
-	// purchaseMu serializes the duplicate-purchase check with the purchase
-	// itself, so two concurrent order attempts cannot both pass it.
+	// purchaseMu serializes the duplicate-purchase check with the durable intent
+	// row that makes its decision visible, so two concurrent order attempts cannot
+	// both pass the check. It is deliberately released before the provider call:
+	// holding it across network I/O would serialize every Gigahost purchase in the
+	// process. See beginPurchaseWithIntent for the exact boundary.
 	purchaseMu                sync.Mutex
 	updaterSvc                *updater.ReleaseChecker
 	dialTimeout               func(network, address string, timeout time.Duration) (net.Conn, error)
@@ -90,6 +93,11 @@ type Handlers struct {
 	sshDialerHook             func(context.Context, ssh.Config) (ssh.SSHClient, error)
 	gigahostDeployMu          sync.RWMutex
 	gigahostDeployLocks       map[string]*sync.Mutex
+	// gigahostIntentHook, when set, runs immediately before the durable order
+	// intent is written. It exists so a test can hold an attempt inside the
+	// duplicate-check-to-intent window deterministically instead of racing for
+	// it; it is nil in production and adds one nil check on that path.
+	gigahostIntentHook func()
 	// Repeated rejected deploy attempts are suppressed per admin for a short
 	// window; see gigahost_admission.go.
 	admissionOnce  sync.Once

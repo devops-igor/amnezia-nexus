@@ -117,6 +117,9 @@ func (h *Handlers) ensureGigahostOrdersTable(ctx context.Context) error {
 
 // saveGigahostOrder writes a new order record into the database.
 func (h *Handlers) saveGigahostOrder(ctx context.Context, order *GigahostOrderRecord) error {
+	if h.gigahostIntentHook != nil {
+		h.gigahostIntentHook()
+	}
 	if h.db == nil {
 		return nil
 	}
@@ -406,27 +409,20 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 3-4. Serialize the duplicate check and the purchase within this process, so
-	// two concurrent requests cannot both conclude that no duplicate exists, then
-	// refuse when a prior attempt's outcome is still unknown.
-	if !h.gateDuplicatePurchase(w, r, client, req, releaseOnAbort) {
+	// 3-4. Serialize the duplicate check together with the durable intent that makes
+	// its decision visible to later attempts. The check and the intent write are ONE
+	// critical section on purpose: releasing the lock between them let a second
+	// request find no durable intent and purchase as well (CI run 42576536602).
+	// The lock is dropped before the provider call, so no network I/O runs under it
+	// and a genuinely different purchase is not blocked behind this one.
+	orderRecord, unlockPurchase, gated := h.beginPurchaseWithIntent(r.Context(), w, client, req, catalogPlans, releaseOnAbort)
+	if !gated {
 		return
 	}
 
-	// The attempt passed the pre-provider gates but is NOT finished: intent
-	// persistence and the provider purchase still follow, and both are expensive.
-	// The reservation is therefore held until the purchase itself terminates, so
-	// a second same-admin request cannot repeat the provider reads during that
-	// window. Each terminal path below releases explicitly; the deferred release
-	// covers a panic.
+	orderResp, orderErr := h.dispatchOrderPurchase(r.Context(), client, req, orderRecord)
+	unlockPurchase()
 
-	// 3. Pre-dispatch durable intent persistence; fail closed if DB cannot record intent
-	orderRecord, orderResp, orderErr, ok := h.persistIntentAndPurchase(r.Context(), client, req, catalogPlans)
-	if !ok {
-		h.JSONError(w, http.StatusInternalServerError, "db_error",
-			"Failed to persist the order intent; no purchase was attempted")
-		return
-	}
 	if orderRecord == nil {
 		h.JSONError(w, http.StatusInternalServerError, "db_update_failed",
 			"The order was placed but its record could not be updated; the durable intent remains and blocks a retry")
@@ -509,55 +505,80 @@ func orderOutcomeUnknown(resp *gigahost.OrderResponse) bool {
 	return resp == nil || resp.Status == gigahost.StatusUnknown || resp.OrderID == ""
 }
 
-// gateDuplicatePurchase holds the purchase lock and refuses an attempt while a
-// prior purchase outcome is unresolved. It reports false after writing the
-// refusal; the caller releases its admission slot and returns.
+// beginPurchaseWithIntent is the atomic duplicate-decision-plus-intent step.
 //
-// The lock is held from the duplicate check through the purchase and the record
-// update, so two concurrent same-process requests cannot both conclude that no
-// duplicate exists. It is released by the caller's unwind, and no failure is
-// hidden: a reconciliation read error is a hard refusal, and an unresolved prior
-// order releases the slot without arming a cooldown because it is not this
-// attempt's failure.
-func (h *Handlers) gateDuplicatePurchase(
-	w http.ResponseWriter, r *http.Request, client gigahost.Client, req OrderServerPayload,
+// Invariant: for one logical purchase, the "no unresolved prior order" decision and
+// the durable intent row that makes that decision visible to later checks are ONE
+// critical section, and the provider purchase cannot begin until that row is
+// committed. Splitting them is a real duplicate-purchase defect: a second request
+// that takes the lock in the gap sees an empty ledger and purchases too (observed
+// in CI run 42576536602 as two provider order calls for five identical requests).
+//
+// The lock is released before the caller dispatches the purchase. Holding it across
+// the provider call would also be correct for duplicate safety, but it would
+// serialize every Gigahost purchase in the process (including genuinely different
+// plans and regions) and put network I/O under a mutex. The returned unlock is
+// idempotent so the caller can call it once, unconditionally, after dispatch.
+//
+// gated=false means the request was already answered (a refusal was written) and
+// the caller must return without purchasing.
+func (h *Handlers) beginPurchaseWithIntent(
+	ctx context.Context,
+	w http.ResponseWriter,
+	client gigahost.Client,
+	req OrderServerPayload,
+	catalogPlans []gigahost.HourlyPlan,
 	releaseOnAbort func(string),
-) bool {
+) (orderRecord *GigahostOrderRecord, unlock func(), gated bool) {
 	h.purchaseMu.Lock()
-	defer h.purchaseMu.Unlock()
+	locked := true
+	unlock = func() {
+		if locked {
+			locked = false
+			h.purchaseMu.Unlock()
+		}
+	}
 
-	unresolved, reconcileErr := h.reconcilePendingUnknownOrders(r.Context(), client, req)
+	unresolved, reconcileErr := h.reconcilePendingUnknownOrders(ctx, client, req)
 	if reconcileErr != nil {
+		unlock()
 		releaseOnAbort(failureProviderError)
 		h.JSONError(w, http.StatusServiceUnavailable, "reconciliation_failed", reconcileErr.Error())
-		return false
+		return nil, nil, false
 	}
 	if unresolved != nil {
+		unlock()
 		releaseOnAbort("")
 		h.respondUnresolvedDuplicate(w, unresolved)
-		return false
+		return nil, nil, false
 	}
-	return true
+
+	// The intent is written INSIDE the lock, so the duplicate decision above becomes
+	// visible to the next attempt the moment the lock is released.
+	record, ok := h.persistOrderIntent(ctx, req, catalogPlans)
+	if !ok {
+		unlock()
+		releaseOnAbort(failureProviderError)
+		h.JSONError(w, http.StatusInternalServerError, "db_error",
+			"Failed to persist the order intent; no purchase was attempted")
+		return nil, nil, false
+	}
+	return record, unlock, true
 }
 
-// persistIntentAndPurchase records the durable intent, asks the provider to place
-// the hourly order, then records the provider's answer.
+// persistOrderIntent writes the durable pre-purchase intent row.
 //
-// It reports ok=false only when the intent itself could not be written, in which
-// case no purchase was attempted and the caller must fail closed. A nil record
-// with ok=true means the purchase happened but the record update failed: the
-// durable intent row remains, so the duplicate guard still blocks a retry and the
-// caller reports db_update_failed rather than pretending the order does not exist.
-//
-// The intent is written BEFORE the provider call on purpose. The provider does not
-// return the catalog price id on any later read, so an intent that lost the price
-// identity could not be reconciled back to the catalog row that was ordered.
-func (h *Handlers) persistIntentAndPurchase(
-	ctx context.Context, client gigahost.Client, req OrderServerPayload, catalogPlans []gigahost.HourlyPlan,
-) (*GigahostOrderRecord, *gigahost.OrderResponse, error, bool) {
+// It reports ok=false only when the intent could not be written, in which case no
+// purchase may be attempted. The intent is written before the provider call on
+// purpose: the provider does not return the catalog price id on any later read, so
+// an intent that lost the price identity could not be reconciled back to the
+// catalog row that was ordered.
+func (h *Handlers) persistOrderIntent(
+	ctx context.Context, req OrderServerPayload, catalogPlans []gigahost.HourlyPlan,
+) (*GigahostOrderRecord, bool) {
 	now := time.Now().UTC()
 	priceIdentity := resolveOrderPriceIdentity(catalogPlans, req)
-	orderRecord := &GigahostOrderRecord{
+	record := &GigahostOrderRecord{
 		OrderID:        fmt.Sprintf("intent_%d", now.UnixNano()),
 		Status:         "pending_order",
 		PlanID:         req.PID,
@@ -569,17 +590,24 @@ func (h *Handlers) persistIntentAndPurchase(
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
-	if err := h.saveGigahostOrder(ctx, orderRecord); err != nil {
-		return nil, nil, nil, false
+	if err := h.saveGigahostOrder(ctx, record); err != nil {
+		return nil, false
 	}
+	return record, true
+}
 
-	// The managed SSH key is registered and proven before the order is sent, and
-	// the failure is reported as a refusal, so a credential problem costs zero
-	// purchases. It runs after the intent row exists so the credential has a
-	// durable owner even if this process dies mid-registration.
+// dispatchOrderPurchase sends the one authorized hourly order and records the
+// provider answer.
+func (h *Handlers) dispatchOrderPurchase(
+	ctx context.Context, client gigahost.Client, req OrderServerPayload, orderRecord *GigahostOrderRecord,
+) (*gigahost.OrderResponse, error) {
+	// The managed SSH key is registered and proven before the order is sent, and the
+	// failure is reported as a refusal, so a credential problem costs zero purchases.
 	sshKeyIDs, credErr := h.prepareOrderSSHCredential(ctx, client, orderRecord)
 	if credErr != nil {
-		return h.refuseBeforePurchase(ctx, orderRecord, credErr)
+		record, _, refusalErr, _ := h.refuseBeforePurchase(ctx, orderRecord, credErr)
+		_ = record
+		return nil, refusalErr
 	}
 
 	orderResp, orderErr := client.OrderServerSafe(ctx, gigahost.OrderRequest{
@@ -597,10 +625,8 @@ func (h *Handlers) persistIntentAndPurchase(
 	updateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	applyOrderResponseToRecord(orderRecord, orderResp, orderErr)
-	if updateErr := h.updateGigahostOrder(updateCtx, orderRecord); updateErr != nil {
-		return nil, orderResp, orderErr, true
-	}
-	return orderRecord, orderResp, orderErr, true
+	_ = h.updateGigahostOrder(updateCtx, orderRecord)
+	return orderResp, orderErr
 }
 
 // orderRequestAndClient decodes and validates the order payload and resolves the
