@@ -419,12 +419,20 @@ func (h *Handlers) GigahostSetupConfirmHostHandler(w http.ResponseWriter, r *htt
 	})
 }
 
-// ResumeGigahostSetup asks the installer to continue a paused job.
+// ResumeGigahostSetup continues a paused job.
 //
-// Only states that stopped and asked for a decision are resumable, and the claim
-// is a compare-and-set that increments the install generation, so a resume cannot
-// revive a completed install, a revocation or a provider terminal failure - and
-// it fences out any attempt that was already running.
+// Two different jobs answer this one action, and they must not share a transition:
+//
+//   - a trust pause, a credential pause or a paused install resumes into the
+//     install handoff, under a compare-and-set that increments the install
+//     generation, so a resume cannot revive a completed install, a revocation or a
+//     provider terminal failure and it fences out any attempt that was already
+//     running;
+//   - a job whose first-contact discovery could not reach the address has no
+//     confirmed identity and no install journal. Resuming it into the install path
+//     would be the defect: its trust precheck pauses before any discovery call, so
+//     the operator's retry could never produce an identity. It is instead re-armed
+//     for tracking, which is the state machine that owns discovery.
 func (h *Handlers) ResumeGigahostSetup(
 	ctx context.Context, orderID string,
 ) (*models.GigahostSetupIntent, bool, error) {
@@ -441,10 +449,30 @@ func (h *Handlers) ResumeGigahostSetup(
 	if !found {
 		return nil, false, nil
 	}
+	if isDiscoveryRetryState(current) {
+		return h.reArmSetupDiscovery(ctx, orderID)
+	}
 	if !isResumableSetupState(current.State) {
 		return current, false, nil
 	}
 	return h.db.ResumeGigahostSetupInstall(ctx, orderID)
+}
+
+// reArmSetupDiscovery sends a job whose first-contact discovery could not reach
+// the address back to the state machine that owns discovery, and asks the tracker
+// to run a pass now.
+//
+// Only a successful re-arm is nudged: a refused one means the row already left
+// this state, so a nudge would only be a pass over somebody else's work.
+func (h *Handlers) reArmSetupDiscovery(
+	ctx context.Context, orderID string,
+) (*models.GigahostSetupIntent, bool, error) {
+	rearmed, changed, err := h.db.ReArmGigahostSetupDiscovery(ctx, orderID)
+	if err != nil || !changed {
+		return rearmed, changed, err
+	}
+	h.nudgeSetupTracker()
+	return rearmed, true, nil
 }
 
 // ConfirmGigahostSetupHost records the exact host identity an administrator
@@ -459,6 +487,24 @@ func (h *Handlers) ConfirmGigahostSetupHost(
 		return nil, false, errors.New("database not available")
 	}
 	return h.db.ConfirmGigahostSetupHostFingerprint(ctx, orderID, fingerprint)
+}
+
+// isDiscoveryRetryState reports whether this row is a job whose first-contact
+// discovery is waiting to try again.
+//
+// The step is the whole test, and it is deliberately narrow: the row must be
+// pending *and* recorded under the discovery step. A pending row in any other step
+// is ordinary provider polling, which the tracker already does on its own and
+// which a resume must not push through the install path.
+//
+// This state has no confirmed identity and no install journal, so it is safe to
+// re-arm: there is no remote effect that could be repeated and no trust decision
+// that could be skipped.
+func isDiscoveryRetryState(intent *models.GigahostSetupIntent) bool {
+	if intent == nil || intent.State != models.SetupStatePending {
+		return false
+	}
+	return intent.Step == "host_identity_unreachable"
 }
 
 // isResumableSetupState mirrors the states a resume may act on. It is kept next

@@ -257,7 +257,7 @@ func (t *Tracker) RunOnce(ctx context.Context) error {
 		if resolveErr != nil {
 			// Without a provider we cannot ask. Record the failure so the
 			// operator sees why nothing moved, and leave the intent pending.
-			t.recordReadFailure(ctx, &due[i], resolveErr)
+			t.recordReadFailure(ctx, &due[i], providerReadFailure(resolveErr))
 			continue
 		}
 		if err := t.observe(ctx, reader, &due[i]); err != nil {
@@ -287,17 +287,58 @@ func (t *Tracker) observe(ctx context.Context, reader ProviderReader, intent *mo
 
 	status, err := reader.GetDeployStatus(callCtx, intent.OrderID)
 	if err != nil {
-		t.recordReadFailure(ctx, intent, err)
+		t.recordReadFailure(ctx, intent, providerReadFailure(err))
 		return nil
 	}
 	return t.recordProviderStatus(ctx, reader, intent, status)
 }
 
-// recordReadFailure keeps the intent pending and backs the next read off.
+// Step names recorded on a row whose pass could not obtain an answer.
+const (
+	stepProviderUnreadable = "provider_unreadable"
+	stepHostUnreachable    = "host_identity_unreachable"
+)
+
+// readFailure is one "could not ask" outcome: the step it is recorded under and
+// the bounded reason an operator reads. Both are carried together so no caller
+// can record a reason under a step that describes a different question.
+type readFailure struct {
+	step    string
+	message string
+}
+
+// providerReadFailure reports that the provider could not be asked about the
+// order. Nothing is known about the VPS, so no state transition may claim
+// otherwise.
+func providerReadFailure(err error) readFailure {
+	return readFailure{step: stepProviderUnreadable, message: summarizeReadFailure(err)}
+}
+
+// hostChallengeFailure reports that the read-only first-contact challenge could
+// not obtain an identity.
 //
-// This is the "could not ask" case: no provider answer arrived, so nothing is
-// known about the VPS and no state transition may claim otherwise.
-func (t *Tracker) recordReadFailure(ctx context.Context, intent *models.GigahostSetupIntent, cause error) {
+// This is the same category as an unreadable provider: a temporary condition
+// rather than an answer, so it is recorded with the same growing backoff. The job
+// keeps its place in the scheduled pass and asks again later; the identity stays
+// unconfirmed and nothing is displayed to confirm. Settling it would be the
+// defect, because a settled row produces no further provider read and none of the
+// shipped actions can restore it.
+func hostChallengeFailure(err error) readFailure {
+	return readFailure{
+		step:    stepHostUnreachable,
+		message: "the host identity challenge did not complete: " + summarizeCause(err),
+	}
+}
+
+// recordReadFailure keeps the intent pending and backs the next attempt off.
+//
+// This is the "could not ask" case: no answer arrived, so nothing is known about
+// the VPS and no state transition may claim otherwise. Keeping the row pending
+// with a due time is what makes a later scheduled pass retry the same question on
+// the same approval, instead of settling a temporary condition into a state nobody
+// can act on. The delay grows with consecutive failures and is capped, so a
+// persistent outage is retried without becoming a poll loop.
+func (t *Tracker) recordReadFailure(ctx context.Context, intent *models.GigahostSetupIntent, failure readFailure) {
 	if intent == nil {
 		return
 	}
@@ -307,8 +348,8 @@ func (t *Tracker) recordReadFailure(ctx context.Context, intent *models.Gigahost
 	next.Attempts = intent.Attempts + 1
 	next.LastCheckedAt = t.now()
 	next.NextAttemptAt = t.now().Add(t.backoffFor(failures))
-	next.Step = "provider_unreadable"
-	next.LastError = summarizeReadFailure(cause)
+	next.Step = failure.step
+	next.LastError = failure.message
 	next.State = models.SetupStatePending
 
 	if _, err := t.store.TransitionGigahostSetupIntent(ctx, next, []string{models.SetupStatePending}); err != nil {
@@ -330,6 +371,14 @@ func (t *Tracker) backoffFor(failures int) time.Duration {
 }
 
 // recordProviderStatus applies a real provider answer.
+//
+// ReadFailures is deliberately NOT reset here. The provider answered, but the pass
+// may still stop on a gate that could not obtain its own answer (a first-contact
+// challenge against a host that is still booting). Resetting the counter at the
+// provider boundary would make those consecutive failures indistinguishable from
+// the first one, and the backoff would stay flat for a job whose host keeps
+// refusing. The counter is cleared where a pass actually decided something: the
+// provisioning branch below and settleProvisioned.
 func (t *Tracker) recordProviderStatus(
 	ctx context.Context,
 	reader ProviderReader,
@@ -337,7 +386,6 @@ func (t *Tracker) recordProviderStatus(
 	status *gigahost.DeployStatusResponse,
 ) error {
 	next := *intent
-	next.ReadFailures = 0
 	next.Attempts = intent.Attempts + 1
 	next.LastCheckedAt = t.now()
 	next.LastError = ""
@@ -355,6 +403,7 @@ func (t *Tracker) recordProviderStatus(
 	case isProviderFailed(next.ProviderStatus):
 		return t.settle(ctx, &next, models.SetupStateFailed, "provider_failed", providerFailureDetail(status))
 	case !isProviderReady(next.ProviderStatus):
+		next.ReadFailures = 0
 		next.State = models.SetupStatePending
 		next.Step = "provisioning"
 		next.NextAttemptAt = t.now().Add(t.interval)
@@ -380,7 +429,7 @@ type handoffDecision struct {
 	// readFailure marks a gate that could not obtain an answer. It keeps the
 	// intent pending with a backed-off retry rather than claiming anything.
 	readFailure bool
-	cause       error
+	cause       readFailure
 }
 
 // settleProvisioned decides the handoff state for a server the provider says is
@@ -392,13 +441,19 @@ func (t *Tracker) settleProvisioned(
 	intent *models.GigahostSetupIntent,
 ) error {
 	decision := t.decideHandoff(ctx, reader, intent)
+	// A pass that observed the address and got no identity clears the displayed
+	// candidate before anything else is decided, so a stale value cannot stay
+	// confirmable. This applies to the retryable case as well as to a clean pause.
+	if decision.candidate != nil {
+		intent.HostCandidateFingerprint = *decision.candidate
+	}
 	if decision.readFailure {
 		t.recordReadFailure(ctx, intent, decision.cause)
 		return nil
 	}
-	if decision.candidate != nil {
-		intent.HostCandidateFingerprint = *decision.candidate
-	}
+	// The pass reached a real decision, so any prior unanswered gate is over and
+	// the next failure starts a fresh backoff.
+	intent.ReadFailures = 0
 	return t.settle(ctx, intent, decision.state, decision.step, decision.detail)
 }
 
@@ -427,7 +482,7 @@ func (t *Tracker) decideHandoff(
 	// stale association and must not be adopted.
 	assoc, err := t.checkAssociation(ctx, reader, intent)
 	if err != nil {
-		return handoffDecision{readFailure: true, cause: err}
+		return handoffDecision{readFailure: true, cause: providerReadFailure(err)}
 	}
 	if assoc != "" {
 		return handoffDecision{
@@ -478,7 +533,7 @@ func (t *Tracker) decideCredential(ctx context.Context, intent *models.GigahostS
 	}
 	has, err := t.store.HasGigahostOrderCredential(ctx, intent.OrderID)
 	if err != nil {
-		return handoffDecision{readFailure: true, cause: err}, true
+		return handoffDecision{readFailure: true, cause: providerReadFailure(err)}, true
 	}
 	if !has {
 		return handoffDecision{
@@ -497,7 +552,7 @@ func (t *Tracker) decideCredential(ctx context.Context, intent *models.GigahostS
 func (t *Tracker) decideHostTrust(ctx context.Context, intent *models.GigahostSetupIntent) handoffDecision {
 	serverID, err := t.registeredServerID(ctx, intent.ProviderServerID)
 	if err != nil {
-		return handoffDecision{readFailure: true, cause: err}
+		return handoffDecision{readFailure: true, cause: providerReadFailure(err)}
 	}
 	confirmed := strings.TrimSpace(intent.HostFingerprint)
 
@@ -512,7 +567,7 @@ func (t *Tracker) decideHostTrust(ctx context.Context, intent *models.GigahostSe
 
 	bound, err := t.store.GetKnownHostFingerprint(ctx, serverID)
 	if err != nil {
-		return handoffDecision{readFailure: true, cause: err}
+		return handoffDecision{readFailure: true, cause: providerReadFailure(err)}
 	}
 	if bound == "" {
 		if confirmed == "" {
@@ -532,14 +587,24 @@ func (t *Tracker) decideHostTrust(ctx context.Context, intent *models.GigahostSe
 	return handoffDecision{state: models.SetupStateReadyForSetup, step: "ready_for_setup"}
 }
 
-// discoverHostIdentity pauses for confirmation and, when a challenge is
-// available, records the identity the address actually presented.
+// discoverHostIdentity asks the address which host key it presents.
 //
 // The challenge is a handshake that stops at host-key verification: it sends no
 // credential, runs no command, binds nothing and does not authorize the job. Its
-// only product is the exact value an administrator can be shown and confirm. A
-// challenge that fails leaves the same pause with the reason recorded, which is
-// strictly more informative than an empty identity.
+// only product is the exact value an administrator can be shown and confirm.
+//
+// Two outcomes are possible:
+//
+//   - the challenge answered. The value becomes a displayed candidate and the row
+//     pauses for confirmation. Nothing is confirmed on the administrator's behalf.
+//   - the challenge could not run. That is a temporary condition and is reported
+//     as a read failure, so the same approval retries on a later pass. The pause
+//     is not written: a settled pause produces no further provider read, which
+//     would leave the job with nothing to confirm and nothing to act on.
+//
+// A row for which no challenge is expressible (no challenge wired, no address, no
+// provider server id) keeps the original pause, where the administrator supplies
+// the identity out of band.
 func (t *Tracker) discoverHostIdentity(ctx context.Context, intent *models.GigahostSetupIntent) handoffDecision {
 	decision := handoffDecision{
 		state: models.SetupStateAwaitingHostConfirm, step: "awaiting_host_confirmation",
@@ -554,13 +619,15 @@ func (t *Tracker) discoverHostIdentity(ctx context.Context, intent *models.Gigah
 	defer cancel()
 	fingerprint, err := t.challenge(callCtx, *intent)
 	if err != nil {
-		// The challenge ran and produced no identity: record that, so an identity
-		// displayed by an earlier pass cannot be confirmed after the address
-		// stopped presenting it.
-		decision.detail = "the host identity challenge did not complete: " + summarizeReadFailure(err)
+		// Retryable, not settled. An identity displayed by an earlier pass is
+		// still cleared: the address did not present it this time, so it must not
+		// stay confirmable.
 		empty := ""
-		decision.candidate = &empty
-		return decision
+		return handoffDecision{
+			readFailure: true,
+			cause:       hostChallengeFailure(err),
+			candidate:   &empty,
+		}
 	}
 	trimmed := strings.TrimSpace(fingerprint)
 	decision.candidate = &trimmed
@@ -692,10 +759,20 @@ func summarizeReadFailure(err error) string {
 	if err == nil {
 		return ""
 	}
+	return "could not read provider status: " + summarizeCause(err)
+}
+
+// summarizeCause renders an error as one bounded line. Collapsing whitespace is
+// what keeps a multi-line transport error from becoming several diagnoses, and the
+// limit keeps the stored reason readable.
+func summarizeCause(err error) string {
+	if err == nil {
+		return ""
+	}
 	msg := strings.Join(strings.Fields(err.Error()), " ")
 	const limit = 240
 	if len(msg) > limit {
 		msg = msg[:limit] + "..."
 	}
-	return "could not read provider status: " + msg
+	return msg
 }

@@ -683,8 +683,14 @@ func TestTrackerFreshOrderRecordsTheChallengedIdentity(t *testing.T) {
 }
 
 // TestTrackerFailedChallengeKeepsThePauseInformative proves a challenge that
-// cannot complete does not become a silent dead end: the job still pauses for
-// confirmation and the reason is recorded, with no identity to confirm.
+// cannot complete does not become a silent dead end: the reason is recorded and no
+// identity is invented.
+//
+// A challenge that cannot run is a temporary condition, not an identity decision,
+// so the row stays pending with a scheduled retry rather than settling into a trust
+// pause. A settled pause would produce no further provider read, and none of the
+// shipped actions can turn it back into a discovery attempt, so the saved approval
+// would be stranded on a host that was merely still booting.
 func TestTrackerFailedChallengeKeepsThePauseInformative(t *testing.T) {
 	h := newHarness(t)
 	h.seedOrder("order_nochallenge", 5151, "198.51.100.22")
@@ -703,14 +709,24 @@ func TestTrackerFailedChallengeKeepsThePauseInformative(t *testing.T) {
 	h.runOnce(tracker)
 
 	got := h.load("order_nochallenge")
-	if got.State != models.SetupStateAwaitingHostConfirm {
-		t.Fatalf("state = %q, want %q", got.State, models.SetupStateAwaitingHostConfirm)
+	if got.State != models.SetupStatePending {
+		t.Fatalf("state = %q, want %q: an unreachable host is not an identity decision",
+			got.State, models.SetupStatePending)
+	}
+	if got.Step != stepHostUnreachable {
+		t.Fatalf("step = %q, want %q", got.Step, stepHostUnreachable)
 	}
 	if got.HostCandidateFingerprint != "" {
 		t.Fatalf("a failed challenge recorded candidate %q", got.HostCandidateFingerprint)
 	}
+	if got.HostFingerprint != "" {
+		t.Fatalf("a failed challenge confirmed identity %q", got.HostFingerprint)
+	}
 	if got.LastError == "" {
 		t.Fatal("a failed challenge recorded no reason")
+	}
+	if got.NextAttemptAt.IsZero() {
+		t.Fatal("a failed challenge scheduled no retry, so the approval is stranded")
 	}
 }
 

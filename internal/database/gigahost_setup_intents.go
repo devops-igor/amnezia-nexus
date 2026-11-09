@@ -929,6 +929,48 @@ func (d *DB) applyHostConfirmation(
 	return current, affected > 0, nil
 }
 
+// ReArmGigahostSetupDiscovery makes a job whose first-contact discovery could not
+// reach the address due for an immediate tracking attempt.
+//
+// It is a narrow compare-and-set: the row must still be pending and still recorded
+// under the discovery step, so it cannot re-arm ordinary provider polling, a trust
+// pause, an install attempt or a terminal row. It writes no trust decision and no
+// journal, because the row has neither yet - the only thing it changes is the
+// schedule, which is what a retry needs.
+//
+// The step is cleared along with the schedule so the tracker re-evaluates the job
+// from the beginning instead of claiming a stale diagnosis. changed=false means the
+// row left this state (a revocation, or a pass that already retried it), and the
+// caller explains the real state.
+func (d *DB) ReArmGigahostSetupDiscovery(ctx context.Context, orderID string) (*models.GigahostSetupIntent, bool, error) {
+	if d == nil || d.sqlDB == nil || strings.TrimSpace(orderID) == "" {
+		return nil, false, nil
+	}
+	if err := d.EnsureGigahostSetupIntentsSchema(ctx); err != nil {
+		return nil, false, err
+	}
+	q := `UPDATE gigahost_setup_intents
+	      SET step = ?,
+	          last_error = '',
+	          next_attempt_at = '',
+	          updated_at = ?
+	      WHERE order_id = ? AND state = ? AND step = ?`
+	res, err := d.execWrite(ctx, q,
+		"discovery_rearmed", formatSetupTimestamp(time.Now().UTC()), orderID,
+		models.SetupStatePending, setupStepHostUnreachable)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to re-arm gigahost setup discovery: %w", err)
+	}
+	// Reporting the outcome is the same question a resume asks: did this statement
+	// win, and what is stored now. resumeOutcome answers exactly that.
+	return d.resumeOutcome(ctx, orderID, res)
+}
+
+// setupStepHostUnreachable is the recorded step of a discovery that could not
+// obtain an identity. It is duplicated here rather than imported from the tracking
+// package because this package owns the durable vocabulary of its own table.
+const setupStepHostUnreachable = "host_identity_unreachable"
+
 // hasInstallHistory reports whether any install attempt ever touched this row.
 //
 // It is the boundary between a pre-install trust pause and a job whose remote
