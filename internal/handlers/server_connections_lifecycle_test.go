@@ -165,8 +165,16 @@ func TestConcurrentAssignmentOfUnassignedClient(t *testing.T) {
 
 	// Hold the client lock so both requests pass their unassigned pre-check and queue on it.
 	unlock := lockClient(serverID, models.ProtocolVLESS, clientID)
-	codes := make(chan int, len(userIDs))
-	bodies := make(chan string, len(userIDs))
+
+	// One completion carries the status and body of the SAME response. Two separate
+	// channels would let one request's status be examined against the other
+	// request's body whenever they complete in opposite orders, which fails this
+	// test while the handler is behaving correctly.
+	type assignmentResult struct {
+		code int
+		body string
+	}
+	results := make(chan assignmentResult, len(userIDs))
 	for _, userID := range userIDs {
 		go func() {
 			path := fmt.Sprintf("/api/servers/%d/connections/edit", serverID)
@@ -176,8 +184,7 @@ func TestConcurrentAssignmentOfUnassignedClient(t *testing.T) {
 					ClientID: clientID,
 					UserID:   &userID,
 				})
-			codes <- w.Code
-			bodies <- w.Body.String()
+			results <- assignmentResult{code: w.Code, body: w.Body.String()}
 		}()
 	}
 	time.Sleep(200 * time.Millisecond)
@@ -186,18 +193,17 @@ func TestConcurrentAssignmentOfUnassignedClient(t *testing.T) {
 	var ok, conflict int
 	for range userIDs {
 		select {
-		case code := <-codes:
-			body := <-bodies
-			switch code {
+		case result := <-results:
+			switch result.code {
 			case http.StatusOK:
 				ok++
 			case http.StatusConflict:
 				conflict++
-				if !strings.Contains(body, "connection_already_assigned") {
-					t.Errorf("409 body = %s, want connection_already_assigned", body)
+				if !strings.Contains(result.body, "connection_already_assigned") {
+					t.Errorf("409 body = %s, want connection_already_assigned", result.body)
 				}
 			default:
-				t.Errorf("unexpected status %d: %s", code, body)
+				t.Errorf("unexpected status %d: %s", result.code, result.body)
 			}
 		case <-time.After(5 * time.Second):
 			t.Fatal("assignment request did not complete")
