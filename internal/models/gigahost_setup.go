@@ -29,15 +29,44 @@ const (
 	// operator supplies credentials out of band; nothing is stored.
 	SetupStateAwaitingCredentials = "awaiting_credentials"
 	// SetupStateReadyForSetup means the provider server is ready, associated with
-	// this exact order, and its credential and host trust are settled. This is
-	// the handoff point; no installer has run.
+	// this exact order, and its credential and host trust are settled. It is the
+	// install handoff point: a claimed install (below) may pick it up.
 	SetupStateReadyForSetup = "ready_for_setup"
+	// SetupStateInstalling means one install attempt owns this row. It records a
+	// generation, so a worker that lost its claim cannot issue further remote
+	// commands. A row still in this state when a pass begins is a leftover claim
+	// from an attempt that never finished; its effects must be verified, never
+	// replayed blindly.
+	SetupStateInstalling = "installing"
+	// SetupStateInstallPaused means an install attempt stopped without a proven
+	// outcome, or could not continue safely (missing credential, changed host,
+	// failed step, unverifiable partial effect). Progressing again requires an
+	// explicit administrator resume; nothing retries this on its own.
+	SetupStateInstallPaused = "install_paused"
+	// SetupStateReady means the selected protocol is installed, the backend was
+	// admitted only after real traffic qualification, and the order is complete.
+	// An admitted backend is removed through the existing backend disable path,
+	// not by revoking the setup approval.
+	SetupStateReady = "ready"
 	// SetupStateFailed means the provider reported a terminal failure. The order
 	// and the VPS are kept; nothing is canceled or deleted.
 	SetupStateFailed = "failed"
 	// SetupStateCanceled means the administrator revoked the approval. No
 	// further panel effects may follow from this intent.
 	SetupStateCanceled = "canceled"
+)
+
+// Install phases, recorded durably around every side-effecting install step.
+//
+// The pair (install_phase, install_phase_done) is the crash journal: phase names
+// the step that was in flight, phase_done names the last step whose effect is
+// proven complete. A restart reads the pair and either proves the in-flight step
+// finished or pauses, so a completed remote command is never re-issued.
+const (
+	SetupPhaseVerified   = "ssh_verified"
+	SetupPhaseRegistered = "server_registered"
+	SetupPhaseInstalled  = "protocol_installed"
+	SetupPhaseEnabled    = "backend_enabled"
 )
 
 // Credential modes recorded on a setup intent.
@@ -93,6 +122,23 @@ type GigahostSetupIntent struct {
 	ReadFailures int `json:"read_failures"`
 	Attempts     int `json:"attempts"`
 
+	// InstallGeneration is the fencing token of the install attempt that owns
+	// this row. Every remote command is issued only by the attempt holding the
+	// current generation, so a worker that was superseded cannot keep acting.
+	InstallGeneration int64 `json:"install_generation"`
+	// InstallPhase is the side-effecting step that was in flight, and
+	// InstallPhaseDone the last one whose effect is proven complete. Together
+	// they are the crash journal read on restart.
+	InstallPhase     string `json:"install_phase,omitempty"`
+	InstallPhaseDone string `json:"install_phase_done,omitempty"`
+	// InstallAttempts counts how many times an install was started, so an
+	// operator can see that a paused job has already been tried.
+	InstallAttempts int `json:"install_attempts"`
+	// NexusServerID is the registered panel server once registration completed.
+	// It is 0 before registration, and it is the identity a resumed install
+	// must find rather than create.
+	NexusServerID int64 `json:"nexus_server_id,omitempty"`
+
 	// NextAttemptAt is when the tracker may read the provider again. It is
 	// persisted so a restart neither hammers the provider nor waits a full
 	// interval for work that is already due.
@@ -119,8 +165,9 @@ func (i *GigahostSetupIntent) IsSettled() bool {
 		return false
 	}
 	switch i.State {
-	case SetupStateReadyForSetup, SetupStateFailed, SetupStateCanceled,
-		SetupStateAwaitingHostConfirm, SetupStateAwaitingCredentials:
+	case SetupStateReadyForSetup, SetupStateReady, SetupStateFailed, SetupStateCanceled,
+		SetupStateAwaitingHostConfirm, SetupStateAwaitingCredentials,
+		SetupStateInstallPaused:
 		return true
 	default:
 		return false
@@ -139,11 +186,22 @@ func (i *GigahostSetupIntent) NeedsOperator() bool {
 		return false
 	}
 	switch i.State {
-	case SetupStateAwaitingHostConfirm, SetupStateAwaitingCredentials:
+	case SetupStateAwaitingHostConfirm, SetupStateAwaitingCredentials, SetupStateInstallPaused:
 		return true
 	default:
 		return false
 	}
+}
+
+// IsInstallable reports whether the intent is at the install handoff point and a
+// pass may claim it.
+func (i *GigahostSetupIntent) IsInstallable() bool {
+	return i != nil && i.State == SetupStateReadyForSetup
+}
+
+// IsInstalling reports whether an install attempt currently owns this row.
+func (i *GigahostSetupIntent) IsInstalling() bool {
+	return i != nil && i.State == SetupStateInstalling
 }
 
 // EffectiveProtocol returns the recorded protocol, normalized.

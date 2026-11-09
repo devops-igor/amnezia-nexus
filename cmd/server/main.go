@@ -244,10 +244,7 @@ func run(ctx context.Context) error {
 	// NewRouterWithDeps does, so it is applied here explicitly.
 	router.EnsureAWGStatusProvider(hDeps)
 	hSet := handlers.NewHandlers(hDeps)
-	if tracker := hSet.NewGigahostSetupTracker(); tracker != nil {
-		hSet.SetGigahostSetupNudge(tracker.Nudge)
-		sup.RegisterService(tracker)
-	}
+	registerGigahostSetupWorkers(sup, hSet)
 
 	supErrCh := make(chan error, 1)
 	go func() {
@@ -302,4 +299,27 @@ func run(ctx context.Context) error {
 
 	slog.Info("Amnezia Web Panel Server stopped cleanly")
 	return nil
+}
+
+// registerGigahostSetupWorkers registers the two workers that carry one approved
+// setup job through its whole life:
+//
+//   - the tracker reads the provider and settles the credential/host-trust gates;
+//   - the installer performs the side-effecting install and admission steps.
+//
+// They are separate supervised workers because their failure policies are
+// opposite: a tracker pass is a read that can be repeated freely, while an install
+// pass issues a remote command that must never be repeated blindly.
+//
+// Extracted from run() so the startup function keeps its own complexity budget;
+// this is a move of the same statements, not a behavior change.
+func registerGigahostSetupWorkers(sup *service.Supervisor, hSet *handlers.Handlers) {
+	if tracker := hSet.NewGigahostSetupTracker(); tracker != nil {
+		hSet.SetGigahostSetupNudge(tracker.Nudge)
+		sup.RegisterService(tracker)
+	}
+	if installer := hSet.NewGigahostSetupInstaller(); installer != nil {
+		hSet.SetGigahostInstallNudge(installer.Nudge)
+		sup.RegisterService(installer)
+	}
 }

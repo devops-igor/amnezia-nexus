@@ -103,6 +103,10 @@ type Handlers struct {
 	// tests and costs one nil check; the interval sweep is what actually
 	// guarantees a pending intent is observed.
 	setupNudge func()
+	// installNudge does the same for the installer that performs the
+	// side-effecting install steps, which is a separate worker with a separate
+	// (never-blindly-repeat) failure policy.
+	installNudge func()
 	// Repeated rejected deploy attempts are suppressed per admin for a short
 	// window; see gigahost_admission.go.
 	admissionOnce  sync.Once

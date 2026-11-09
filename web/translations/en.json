@@ -747,5 +747,14 @@
   "setup_state_awaiting_credentials": "Credentials required",
   "setup_state_ready_for_setup": "Ready for setup",
   "setup_state_failed": "Failed",
-  "setup_state_cancelled": "Revoked"
+  "setup_state_cancelled": "Revoked",
+  "setup_state_installing": "Installing",
+  "setup_state_install_paused": "Paused - needs a decision",
+  "setup_state_ready": "Ready",
+  "setup_intents_resume": "Resume",
+  "setup_intents_resume_confirm": "Resume this setup job? The panel will continue installing on the server it already registered. A step whose outcome is unknown is verified, not repeated.",
+  "setup_intents_resumed": "Setup job resumed",
+  "setup_intents_confirm_host": "Confirm host identity",
+  "setup_intents_host_confirmed": "Host identity confirmed",
+  "setup_intents_credentials_hint": "This job needs an SSH credential. Place the order with a managed key, or run setup manually with a password."
 }

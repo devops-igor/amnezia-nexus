@@ -316,6 +316,159 @@ func (h *Handlers) ListGigahostSetupIntents(ctx context.Context) ([]models.Gigah
 	return h.db.ListGigahostSetupIntents(ctx)
 }
 
+// GigahostSetupResumeHandler handles POST /api/admin/hosting/gigahost/orders/{order_id}/setup-resume.
+//
+// Resuming is the administrator's decision that a paused job may proceed. It is
+// explicit because the alternative - an automatic retry - would re-issue remote
+// commands whose outcome was never proven. The handler reports the row's actual
+// state when the resume does not apply, so a caller is never told a job resumed
+// when it did not.
+func (h *Handlers) GigahostSetupResumeHandler(w http.ResponseWriter, r *http.Request) {
+	sess := middleware.GetSession(r.Context())
+	if sess == nil || sess.Role != models.RoleAdmin {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required")
+		return
+	}
+	orderID := strings.TrimSpace(chi.URLParam(r, "order_id"))
+
+	intent, changed, err := h.ResumeGigahostSetup(r.Context(), orderID)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+	if intent == nil {
+		h.JSONError(w, http.StatusNotFound, "not_found",
+			fmt.Sprintf("no setup approval is recorded for order %s", orderID))
+		return
+	}
+	if !changed {
+		h.JSON(w, http.StatusConflict, map[string]any{
+			"status": "not_resumable",
+			"error":  "this setup job is not in a state a resume can act on",
+			"setup":  intent,
+		})
+		return
+	}
+	h.nudgeSetupInstaller()
+	h.JSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"resumed": true,
+		"setup":   intent,
+	})
+}
+
+// GigahostSetupConfirmHostHandler handles
+// POST /api/admin/hosting/gigahost/orders/{order_id}/setup-host-confirmation.
+//
+// The confirmation is bound to the exact fingerprint the administrator saw, so a
+// later connection presenting a different identity is a contradiction rather than
+// an accepted host. The endpoint refuses a malformed fingerprint here as well,
+// because a stored malformed value would only fail much later, at the handshake.
+func (h *Handlers) GigahostSetupConfirmHostHandler(w http.ResponseWriter, r *http.Request) {
+	sess := middleware.GetSession(r.Context())
+	if sess == nil || sess.Role != models.RoleAdmin {
+		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required")
+		return
+	}
+	orderID := strings.TrimSpace(chi.URLParam(r, "order_id"))
+
+	var req struct {
+		Fingerprint string `json:"fingerprint"`
+	}
+	if r.Body != nil && r.Body != http.NoBody {
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+			h.JSONError(w, http.StatusBadRequest, "invalid_payload", "Failed to parse request JSON")
+			return
+		}
+	}
+	fingerprint := strings.TrimSpace(req.Fingerprint)
+	if err := validateFingerprintFormat(fingerprint); err != nil {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed",
+			"expected_fingerprint must be the canonical SHA256 SSH fingerprint that was displayed")
+		return
+	}
+
+	intent, changed, err := h.ConfirmGigahostSetupHost(r.Context(), orderID, fingerprint)
+	if err != nil {
+		h.JSONError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+	if intent == nil {
+		h.JSONError(w, http.StatusNotFound, "not_found",
+			fmt.Sprintf("no setup approval is recorded for order %s", orderID))
+		return
+	}
+	if !changed {
+		h.JSON(w, http.StatusConflict, map[string]any{
+			"status": "not_confirmable",
+			"error":  "this setup job is not waiting for host confirmation",
+			"setup":  intent,
+		})
+		return
+	}
+	h.nudgeSetupTracker()
+	h.JSON(w, http.StatusOK, map[string]any{
+		"status":      "ok",
+		"confirmed":   true,
+		"fingerprint": fingerprint,
+		"setup":       intent,
+	})
+}
+
+// ResumeGigahostSetup asks the installer to continue a paused job.
+//
+// Only states that stopped and asked for a decision are resumable, and the claim
+// is a compare-and-set that increments the install generation, so a resume cannot
+// revive a completed install, a revocation or a provider terminal failure - and
+// it fences out any attempt that was already running.
+func (h *Handlers) ResumeGigahostSetup(
+	ctx context.Context, orderID string,
+) (*models.GigahostSetupIntent, bool, error) {
+	if strings.TrimSpace(orderID) == "" {
+		return nil, false, newSetupValidationError("order_id is required")
+	}
+	if h.db == nil {
+		return nil, false, errors.New("database not available")
+	}
+	current, found, err := h.db.GetGigahostSetupIntent(ctx, orderID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !found {
+		return nil, false, nil
+	}
+	if !isResumableSetupState(current.State) {
+		return current, false, nil
+	}
+	return h.db.ResumeGigahostSetupInstall(ctx, orderID)
+}
+
+// ConfirmGigahostSetupHost records the exact host identity an administrator
+// confirmed and re-arms provider tracking.
+func (h *Handlers) ConfirmGigahostSetupHost(
+	ctx context.Context, orderID, fingerprint string,
+) (*models.GigahostSetupIntent, bool, error) {
+	if strings.TrimSpace(orderID) == "" {
+		return nil, false, newSetupValidationError("order_id is required")
+	}
+	if h.db == nil {
+		return nil, false, errors.New("database not available")
+	}
+	return h.db.ConfirmGigahostSetupHostFingerprint(ctx, orderID, fingerprint)
+}
+
+// isResumableSetupState mirrors the states a resume may act on. It is kept next
+// to the handler so the refusal explanation and the database guard cannot drift.
+func isResumableSetupState(state string) bool {
+	switch state {
+	case models.SetupStateReadyForSetup, models.SetupStateAwaitingHostConfirm,
+		models.SetupStateAwaitingCredentials, models.SetupStateInstallPaused:
+		return true
+	default:
+		return false
+	}
+}
+
 // nudgeSetupTracker asks the background worker to run a pass now instead of
 // waiting for its next interval, so a fresh approval is observed promptly.
 //

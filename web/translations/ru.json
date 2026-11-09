@@ -747,5 +747,14 @@
   "setup_state_awaiting_credentials": "Требуются учётные данные",
   "setup_state_ready_for_setup": "Готово к настройке",
   "setup_state_failed": "Ошибка",
-  "setup_state_cancelled": "Отозвано"
+  "setup_state_cancelled": "Отозвано",
+  "setup_state_installing": "Установка",
+  "setup_state_install_paused": "Приостановлено — нужно решение",
+  "setup_state_ready": "Готово",
+  "setup_intents_resume": "Продолжить",
+  "setup_intents_resume_confirm": "Продолжить это задание настройки? Панель продолжит установку на уже зарегистрированном сервере. Шаг с неизвестным результатом проверяется, а не повторяется.",
+  "setup_intents_resumed": "Задание настройки продолжено",
+  "setup_intents_confirm_host": "Подтвердить идентичность хоста",
+  "setup_intents_host_confirmed": "Идентичность хоста подтверждена",
+  "setup_intents_credentials_hint": "Этому заданию нужны SSH-учётные данные. Разместите заказ с управляемым ключом или запустите настройку вручную с паролем."
 }

@@ -381,27 +381,28 @@ func TestCancelUnknownOrderReportsAbsent(t *testing.T) {
 	}
 }
 
-// TestCancelSettledIntentDoesNotRewriteHistory proves a revoked handoff cannot be
-// re-cancelled into a different state: a ready_for_setup intent stays ready.
+// TestCancelSettledIntentDoesNotRewriteHistory proves a completed install cannot be
+// cancelled into a different state: an admitted backend is removed through the
+// existing backend-disable path, not by rewriting the setup history.
 func TestCancelSettledIntentDoesNotRewriteHistory(t *testing.T) {
 	db := openSetupIntentTestDB(t)
 	ctx := context.Background()
 
-	intent := newPendingIntent("ord_handed_off")
-	intent.State = models.SetupStateReadyForSetup
+	intent := newPendingIntent("ord_installed")
+	intent.State = models.SetupStateReady
 	if err := db.CreateGigahostSetupIntent(ctx, intent); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 
-	got, changed, err := db.CancelGigahostSetupIntent(ctx, "ord_handed_off", "late revoke")
+	got, changed, err := db.CancelGigahostSetupIntent(ctx, "ord_installed", "late revoke")
 	if err != nil {
 		t.Fatalf("cancel: %v", err)
 	}
 	if changed {
-		t.Fatal("a settled handoff was cancelled")
+		t.Fatal("a completed install was cancelled")
 	}
-	if got == nil || got.State != models.SetupStateReadyForSetup {
-		t.Fatalf("state = %+v, want unchanged ready_for_setup", got)
+	if got == nil || got.State != models.SetupStateReady {
+		t.Fatalf("state = %+v, want unchanged ready", got)
 	}
 }
 
@@ -474,18 +475,26 @@ func TestValidateTransitionInputCoversEveryGuard(t *testing.T) {
 	}
 }
 
-// TestCancelableSetupStateExcludesHandoffAndCanceled proves which states a
-// revocation may change.
-func TestCancelableSetupStateExcludesHandoffAndCanceled(t *testing.T) {
+// TestCancelableSetupStateExcludesCompletedInstallAndRevoked proves which states
+// a revocation may change.
+//
+// ready_for_setup and the two install states ARE revocable on purpose: a
+// revocation has to reach work that has not started or is still in progress, not
+// only the provider poll that precedes it. A completed install is excluded because
+// removing an admitted backend is the existing backend-disable path, and a revoked
+// row is excluded because it is already revoked.
+func TestCancelableSetupStateExcludesCompletedInstallAndRevoked(t *testing.T) {
 	for _, state := range []string{
 		models.SetupStatePending, models.SetupStateAwaitingHostConfirm,
 		models.SetupStateAwaitingCredentials, models.SetupStateFailed,
+		models.SetupStateReadyForSetup, models.SetupStateInstalling,
+		models.SetupStateInstallPaused,
 	} {
 		if !isCancelableSetupState(state) {
 			t.Fatalf("%q should be cancelable", state)
 		}
 	}
-	for _, state := range []string{models.SetupStateReadyForSetup, models.SetupStateCanceled} {
+	for _, state := range []string{models.SetupStateReady, models.SetupStateCanceled} {
 		if isCancelableSetupState(state) {
 			t.Fatalf("%q must not be cancelable", state)
 		}
@@ -526,34 +535,34 @@ func TestApplyRevocationReportsWhetherItWon(t *testing.T) {
 	}
 }
 
-// TestCancelLosesToAConcurrentHandoff proves the read-then-write window: if the
+// TestCancelLosesToAConcurrentCompletion proves the read-then-write window: if the
 // row left the cancelable states between the read and the write, the cancel
 // reports the actual state and does not rewrite it.
 func TestCancelLosesToAConcurrentHandoff(t *testing.T) {
 	db := openSetupIntentTestDB(t)
 	ctx := context.Background()
 
-	intent := newPendingIntent("ord_race_handoff")
+	intent := newPendingIntent("ord_race_done")
 	if err := db.CreateGigahostSetupIntent(ctx, intent); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	// Simulate the tracker winning the race and settling the handoff.
-	handoff := newPendingIntent("ord_race_handoff")
-	handoff.State = models.SetupStateReadyForSetup
-	if changed, err := db.TransitionGigahostSetupIntent(ctx, handoff,
+	// Simulate the installer winning the race and completing the order.
+	completed := newPendingIntent("ord_race_done")
+	completed.State = models.SetupStateReady
+	if changed, err := db.TransitionGigahostSetupIntent(ctx, completed,
 		[]string{models.SetupStatePending}); err != nil || !changed {
-		t.Fatalf("handoff transition: changed=%v err=%v", changed, err)
+		t.Fatalf("completion transition: changed=%v err=%v", changed, err)
 	}
 
-	got, changed, err := db.CancelGigahostSetupIntent(ctx, "ord_race_handoff", "late")
+	got, changed, err := db.CancelGigahostSetupIntent(ctx, "ord_race_done", "late")
 	if err != nil {
 		t.Fatalf("cancel: %v", err)
 	}
 	if changed {
-		t.Fatal("cancel won against an already-settled handoff")
+		t.Fatal("cancel won against an already-completed order")
 	}
-	if got == nil || got.State != models.SetupStateReadyForSetup {
-		t.Fatalf("state = %+v, want the settled handoff reported unchanged", got)
+	if got == nil || got.State != models.SetupStateReady {
+		t.Fatalf("state = %+v, want the completed order reported unchanged", got)
 	}
 }
 
@@ -609,37 +618,37 @@ func TestCancelReReadsAfterConcurrentSettlement(t *testing.T) {
 	if err := db.CreateGigahostSetupIntent(ctx, newPendingIntent("ord_concurrent")); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	// Move the row while the cancel has already read it: do the handoff transition
+	// Move the row while the cancel has already read it: complete the install
 	// first, then attempt the cancel from a pre-read snapshot.
 	stale, found, err := db.GetGigahostSetupIntent(ctx, "ord_concurrent")
 	if err != nil || !found {
 		t.Fatalf("read: found=%v err=%v", found, err)
 	}
-	handoff := newPendingIntent("ord_concurrent")
-	handoff.State = models.SetupStateReadyForSetup
-	if changed, err := db.TransitionGigahostSetupIntent(ctx, handoff,
+	completed := newPendingIntent("ord_concurrent")
+	completed.State = models.SetupStateReady
+	if changed, err := db.TransitionGigahostSetupIntent(ctx, completed,
 		[]string{models.SetupStatePending}); err != nil || !changed {
-		t.Fatalf("handoff: changed=%v err=%v", changed, err)
+		t.Fatalf("completion: changed=%v err=%v", changed, err)
 	}
 	if stale.State != models.SetupStatePending {
 		t.Fatalf("precondition: snapshot should still read pending, got %q", stale.State)
 	}
 
 	// The revocation's transition must lose, and the re-read must report the
-	// settled state rather than the stale snapshot.
+	// completed state rather than the stale snapshot.
 	changed, err := db.applyRevocation(ctx, stale, "late revoke")
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	if changed {
-		t.Fatal("revocation won against a settled handoff")
+		t.Fatal("revocation won against a completed order")
 	}
 	latest, foundLatest, err := db.GetGigahostSetupIntent(ctx, "ord_concurrent")
 	if err != nil || !foundLatest {
 		t.Fatalf("re-read: found=%v err=%v", foundLatest, err)
 	}
-	if latest.State != models.SetupStateReadyForSetup {
-		t.Fatalf("re-read state = %q, want the settled handoff", latest.State)
+	if latest.State != models.SetupStateReady {
+		t.Fatalf("re-read state = %q, want the completed order", latest.State)
 	}
 }
 
@@ -683,11 +692,11 @@ func TestCancelThroughPublicPathAfterSettlement(t *testing.T) {
 	if err := db.CreateGigahostSetupIntent(ctx, newPendingIntent("ord_public_race")); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	handoff := newPendingIntent("ord_public_race")
-	handoff.State = models.SetupStateReadyForSetup
-	if changed, err := db.TransitionGigahostSetupIntent(ctx, handoff,
+	completed := newPendingIntent("ord_public_race")
+	completed.State = models.SetupStateReady
+	if changed, err := db.TransitionGigahostSetupIntent(ctx, completed,
 		[]string{models.SetupStatePending}); err != nil || !changed {
-		t.Fatalf("handoff: changed=%v err=%v", changed, err)
+		t.Fatalf("completion: changed=%v err=%v", changed, err)
 	}
 
 	got, changed, err := db.CancelGigahostSetupIntent(ctx, "ord_public_race", "late revoke")
@@ -695,10 +704,10 @@ func TestCancelThroughPublicPathAfterSettlement(t *testing.T) {
 		t.Fatalf("cancel: %v", err)
 	}
 	if changed {
-		t.Fatal("public cancel won against a settled handoff")
+		t.Fatal("public cancel won against a completed order")
 	}
-	if got == nil || got.State != models.SetupStateReadyForSetup {
-		t.Fatalf("reported state = %+v, want the settled handoff", got)
+	if got == nil || got.State != models.SetupStateReady {
+		t.Fatalf("reported state = %+v, want the completed order", got)
 	}
 }
 

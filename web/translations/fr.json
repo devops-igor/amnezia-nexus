@@ -747,5 +747,14 @@
   "setup_state_awaiting_credentials": "Identifiants requis",
   "setup_state_ready_for_setup": "Prêt pour la configuration",
   "setup_state_failed": "Échec",
-  "setup_state_cancelled": "Révoquée"
+  "setup_state_cancelled": "Révoquée",
+  "setup_state_installing": "Installation",
+  "setup_state_install_paused": "En pause — décision requise",
+  "setup_state_ready": "Prêt",
+  "setup_intents_resume": "Reprendre",
+  "setup_intents_resume_confirm": "Reprendre cette tâche de configuration ? Le panneau continuera l'installation sur le serveur déjà enregistré. Une étape au résultat inconnu est vérifiée, pas répétée.",
+  "setup_intents_resumed": "Tâche de configuration reprise",
+  "setup_intents_confirm_host": "Confirmer l'identité de l'hôte",
+  "setup_intents_host_confirmed": "Identité de l'hôte confirmée",
+  "setup_intents_credentials_hint": "Cette tâche nécessite un identifiant SSH. Passez la commande avec une clé gérée, ou lancez la configuration manuellement avec un mot de passe."
 }

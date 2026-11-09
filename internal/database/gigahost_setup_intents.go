@@ -48,6 +48,11 @@ var gigahostSetupIntentsSchema = `CREATE TABLE IF NOT EXISTS gigahost_setup_inte
 	host_mismatch INTEGER NOT NULL DEFAULT 0,
 	read_failures INTEGER NOT NULL DEFAULT 0,
 	attempts INTEGER NOT NULL DEFAULT 0,
+	install_generation INTEGER NOT NULL DEFAULT 0,
+	install_phase TEXT NOT NULL DEFAULT '',
+	install_phase_done TEXT NOT NULL DEFAULT '',
+	install_attempts INTEGER NOT NULL DEFAULT 0,
+	nexus_server_id INTEGER NOT NULL DEFAULT 0,
 	next_attempt_at TEXT NOT NULL DEFAULT '',
 	last_checked_at TEXT NOT NULL DEFAULT '',
 	approved_by TEXT NOT NULL DEFAULT '',
@@ -55,6 +60,21 @@ var gigahostSetupIntentsSchema = `CREATE TABLE IF NOT EXISTS gigahost_setup_inte
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 )`
+
+// gigahostSetupIntentColumnUpgrades adds the install-journal columns to a table
+// created by an earlier version. SQLite refuses a NOT NULL column without a
+// default, so every entry carries one and an existing row reads as "no install
+// has started".
+var gigahostSetupIntentColumnUpgrades = []struct {
+	name string
+	ddl  string
+}{
+	{"install_generation", `ALTER TABLE gigahost_setup_intents ADD COLUMN install_generation INTEGER NOT NULL DEFAULT 0`},
+	{"install_phase", `ALTER TABLE gigahost_setup_intents ADD COLUMN install_phase TEXT NOT NULL DEFAULT ''`},
+	{"install_phase_done", `ALTER TABLE gigahost_setup_intents ADD COLUMN install_phase_done TEXT NOT NULL DEFAULT ''`},
+	{"install_attempts", `ALTER TABLE gigahost_setup_intents ADD COLUMN install_attempts INTEGER NOT NULL DEFAULT 0`},
+	{"nexus_server_id", `ALTER TABLE gigahost_setup_intents ADD COLUMN nexus_server_id INTEGER NOT NULL DEFAULT 0`},
+}
 
 // gigahostSetupIntentIndexes are created after the table and column upgrades.
 //
@@ -83,6 +103,13 @@ func (d *DB) ensureGigahostSetupIntentsSchemaLocked(ctx context.Context) error {
 	if _, err := d.sqlDB.ExecContext(ctx, gigahostSetupIntentsSchema); err != nil {
 		return fmt.Errorf("failed to init gigahost_setup_intents schema: %w", err)
 	}
+	for _, col := range gigahostSetupIntentColumnUpgrades {
+		// A duplicate column means the upgrade already ran; any other error is
+		// real and must not be swallowed.
+		if _, err := d.sqlDB.ExecContext(ctx, col.ddl); err != nil && !isDuplicateColumnError(err) {
+			return fmt.Errorf("failed to add gigahost_setup_intents column %s: %w", col.name, err)
+		}
+	}
 	for _, q := range gigahostSetupIntentIndexes {
 		if _, err := d.sqlDB.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("failed to create gigahost_setup_intents index: %w", err)
@@ -106,6 +133,8 @@ const setupIntentColumns = `id, order_id, provider_server_id, assigned_ip,
 	protocol, port, tls_domain, engine_profile, credential_mode,
 	state, provider_status, step, last_error,
 	host_fingerprint, host_mismatch, read_failures, attempts,
+	install_generation, install_phase, install_phase_done, install_attempts,
+	nexus_server_id,
 	next_attempt_at, last_checked_at, approved_by, revoked_at,
 	created_at, updated_at`
 
@@ -121,6 +150,8 @@ func scanSetupIntent(scanner interface {
 		&i.Protocol, &i.Port, &i.TLSDomain, &i.EngineProfile, &i.CredentialMode,
 		&i.State, &i.ProviderStatus, &i.Step, &i.LastError,
 		&i.HostFingerprint, &hostMismatch, &i.ReadFailures, &i.Attempts,
+		&i.InstallGeneration, &i.InstallPhase, &i.InstallPhaseDone, &i.InstallAttempts,
+		&i.NexusServerID,
 		&nextAttempt, &lastChecked, &i.ApprovedBy, &revokedAt,
 		&createdAt, &updatedAt,
 	); err != nil {
@@ -178,7 +209,7 @@ func (d *DB) CreateGigahostSetupIntent(ctx context.Context, intent *models.Gigah
 	intent.UpdatedAt = now
 
 	q := `INSERT INTO gigahost_setup_intents (` + setupIntentColumns + `)
-	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 	res, err := d.sqlDB.ExecContext(ctx, q,
@@ -186,6 +217,8 @@ func (d *DB) CreateGigahostSetupIntent(ctx context.Context, intent *models.Gigah
 		intent.Protocol, intent.Port, intent.TLSDomain, intent.EngineProfile, intent.CredentialMode,
 		intent.State, intent.ProviderStatus, intent.Step, intent.LastError,
 		intent.HostFingerprint, boolToInt(intent.HostMismatch), intent.ReadFailures, intent.Attempts,
+		intent.InstallGeneration, intent.InstallPhase, intent.InstallPhaseDone, intent.InstallAttempts,
+		intent.NexusServerID,
 		formatSetupTimestamp(intent.NextAttemptAt), formatSetupTimestamp(intent.LastCheckedAt),
 		intent.ApprovedBy, formatSetupTimestamp(intent.RevokedAt),
 		formatSetupTimestamp(intent.CreatedAt), formatSetupTimestamp(intent.UpdatedAt),
@@ -384,6 +417,11 @@ func buildTransitionStatement(
 	          host_mismatch = ?,
 	          read_failures = ?,
 	          attempts = ?,
+	          install_generation = ?,
+	          install_phase = ?,
+	          install_phase_done = ?,
+	          install_attempts = ?,
+	          nexus_server_id = CASE WHEN ? > 0 THEN ? ELSE nexus_server_id END,
 	          next_attempt_at = ?,
 	          last_checked_at = ?,
 	          revoked_at = CASE WHEN ? != '' THEN ? ELSE revoked_at END,
@@ -402,6 +440,11 @@ func buildTransitionStatement(
 		boolToInt(intent.HostMismatch),
 		intent.ReadFailures,
 		intent.Attempts,
+		intent.InstallGeneration,
+		intent.InstallPhase,
+		intent.InstallPhaseDone,
+		intent.InstallAttempts,
+		intent.NexusServerID, intent.NexusServerID,
 		formatSetupTimestamp(intent.NextAttemptAt),
 		formatSetupTimestamp(intent.LastCheckedAt),
 		formatSetupTimestamp(intent.RevokedAt), formatSetupTimestamp(intent.RevokedAt),
@@ -474,12 +517,359 @@ func (d *DB) applyRevocation(
 	return d.TransitionGigahostSetupIntent(ctx, current, cancelableSetupStates)
 }
 
-// cancelableSetupStates are the states a revocation may change. A handoff that
-// already happened is deliberately absent: it is settled, not revocable.
+// ListDueGigahostSetupInstalls returns the intents an install pass may act on:
+// rows at the install handoff point, and rows still marked installing because a
+// previous attempt never wrote a terminal outcome.
+//
+// install_paused is deliberately absent. A paused install stopped without a
+// proven result, so failing again on its own would replay an unknown remote
+// effect; only an explicit administrator resume puts it back in this set.
+func (d *DB) ListDueGigahostSetupInstalls(ctx context.Context, now time.Time, limit int) ([]models.GigahostSetupIntent, error) {
+	if d == nil || d.sqlDB == nil {
+		return []models.GigahostSetupIntent{}, nil
+	}
+	if limit <= 0 {
+		return []models.GigahostSetupIntent{}, nil
+	}
+	if err := d.EnsureGigahostSetupIntentsSchema(ctx); err != nil {
+		return nil, err
+	}
+	q := `SELECT ` + setupIntentColumns + `
+	      FROM gigahost_setup_intents
+	      WHERE state IN (?, ?)
+	        AND (next_attempt_at = '' OR next_attempt_at <= ?)
+	      ORDER BY next_attempt_at, id
+	      LIMIT ?`
+	rows, err := d.sqlDB.QueryContext(ctx, q,
+		models.SetupStateReadyForSetup, models.SetupStateInstalling,
+		formatSetupTimestamp(now), limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list due gigahost setup installs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	list := []models.GigahostSetupIntent{}
+	for rows.Next() {
+		intent, scanErr := scanSetupIntent(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		list = append(list, *intent)
+	}
+	return list, rows.Err()
+}
+
+// ClaimGigahostSetupInstall takes exclusive ownership of one install attempt.
+//
+// The claim is a single statement whose WHERE clause names the handoff state, so
+// exactly one caller can win: RowsAffected is the arbiter, not a value this
+// process read earlier. The generation is incremented in the same statement, so
+// the returned row carries the fencing token the attempt must present for every
+// later journal write.
+func (d *DB) ClaimGigahostSetupInstall(ctx context.Context, orderID string) (*models.GigahostSetupIntent, bool, error) {
+	if d == nil || d.sqlDB == nil || strings.TrimSpace(orderID) == "" {
+		return nil, false, nil
+	}
+	if err := d.EnsureGigahostSetupIntentsSchema(ctx); err != nil {
+		return nil, false, err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	q := `UPDATE gigahost_setup_intents
+	      SET state = ?,
+	          install_generation = install_generation + 1,
+	          install_attempts = install_attempts + 1,
+	          install_phase = '',
+	          step = 'install_claimed',
+	          last_error = '',
+	          next_attempt_at = '',
+	          updated_at = ?
+	      WHERE order_id = ? AND state = ?`
+	d.writeMu.Lock()
+	res, err := d.sqlDB.ExecContext(ctx, q,
+		models.SetupStateInstalling, now, orderID, models.SetupStateReadyForSetup)
+	d.writeMu.Unlock()
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to claim gigahost setup install: %w", err)
+	}
+	// RowsAffected is the arbiter: a competing claim that matched no row lost, and
+	// must not be told it owns an attempt it never started.
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to confirm gigahost setup claim: %w", err)
+	}
+	if affected == 0 {
+		return nil, false, nil
+	}
+	return d.rereadSetupIntent(ctx, orderID)
+}
+
+// TakeOverGigahostSetupInstall re-owns an install attempt that a previous pass
+// left in the installing state, and issues a new fencing token for it.
+//
+// The expected generation is part of the WHERE clause, so a takeover cannot
+// silently capture a row some other writer already advanced. Taking over does
+// NOT clear the phase journal: the audit of what was in flight is exactly what
+// the next attempt needs in order to verify instead of replay.
+func (d *DB) TakeOverGigahostSetupInstall(
+	ctx context.Context, orderID string, expectGeneration int64,
+) (*models.GigahostSetupIntent, bool, error) {
+	if d == nil || d.sqlDB == nil || strings.TrimSpace(orderID) == "" {
+		return nil, false, nil
+	}
+	if err := d.EnsureGigahostSetupIntentsSchema(ctx); err != nil {
+		return nil, false, err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	q := `UPDATE gigahost_setup_intents
+	      SET install_generation = install_generation + 1,
+	          install_attempts = install_attempts + 1,
+	          step = 'install_taken_over',
+	          next_attempt_at = '',
+	          updated_at = ?
+	      WHERE order_id = ? AND state = ? AND install_generation = ?`
+	d.writeMu.Lock()
+	res, err := d.sqlDB.ExecContext(ctx, q,
+		now, orderID, models.SetupStateInstalling, expectGeneration)
+	d.writeMu.Unlock()
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to take over gigahost setup install: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to confirm gigahost setup takeover: %w", err)
+	}
+	if affected == 0 {
+		return nil, false, nil
+	}
+	return d.rereadSetupIntent(ctx, orderID)
+}
+
+// UpdateGigahostSetupInstall is the only writer of an in-flight install attempt,
+// and it is fenced by both the installing state and the attempt's generation.
+//
+// changed=false means this attempt no longer owns the row - the administrator
+// revoked the approval or a newer attempt took over. The caller must then issue
+// no further remote command: that refusal is the guarantee that a cancellation
+// reaches the install, not just the provider poll.
+func (d *DB) UpdateGigahostSetupInstall(
+	ctx context.Context, intent *models.GigahostSetupIntent, expectedGeneration int64,
+) (bool, error) {
+	if d == nil || d.sqlDB == nil {
+		return false, nil
+	}
+	if err := validateInstallUpdate(intent, expectedGeneration); err != nil {
+		return false, err
+	}
+	if err := d.EnsureGigahostSetupIntentsSchema(ctx); err != nil {
+		return false, err
+	}
+	intent.UpdatedAt = time.Now().UTC()
+	q := `UPDATE gigahost_setup_intents
+	      SET state = ?,
+	          step = ?,
+	          last_error = ?,
+	          install_phase = ?,
+	          install_phase_done = ?,
+	          nexus_server_id = CASE WHEN ? > 0 THEN ? ELSE nexus_server_id END,
+	          next_attempt_at = ?,
+	          updated_at = ?
+	      WHERE order_id = ? AND state = ? AND install_generation = ?`
+	d.writeMu.Lock()
+	res, err := d.sqlDB.ExecContext(ctx, q,
+		intent.State, intent.Step, intent.LastError,
+		intent.InstallPhase, intent.InstallPhaseDone,
+		intent.NexusServerID, intent.NexusServerID,
+		formatSetupTimestamp(intent.NextAttemptAt),
+		formatSetupTimestamp(intent.UpdatedAt),
+		intent.OrderID, models.SetupStateInstalling, expectedGeneration)
+	d.writeMu.Unlock()
+	if err != nil {
+		return false, fmt.Errorf("failed to update gigahost setup install: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to confirm gigahost setup install update: %w", err)
+	}
+	return affected > 0, nil
+}
+
+// installUpdateStates are the states an in-flight attempt may write. A completed
+// install, a revocation and a provider terminal failure are not reachable from
+// here: each of those has its own writer, so no attempt can fake one.
+var installUpdateStates = []string{
+	models.SetupStateInstalling,
+	models.SetupStateInstallPaused,
+	models.SetupStateReady,
+}
+
+// validateInstallUpdate rejects a journal update that could not describe a real
+// attempt, so a malformed call fails loudly instead of matching nothing.
+func validateInstallUpdate(intent *models.GigahostSetupIntent, expectedGeneration int64) error {
+	switch {
+	case intent == nil || strings.TrimSpace(intent.OrderID) == "":
+		return errors.New("gigahost setup install update requires an order id")
+	case expectedGeneration <= 0:
+		return errors.New("gigahost setup install update requires the attempt generation")
+	case strings.TrimSpace(intent.Step) == "":
+		return errors.New("gigahost setup install update requires a step")
+	}
+	for _, s := range installUpdateStates {
+		if intent.State == s {
+			return nil
+		}
+	}
+	return fmt.Errorf("gigahost setup install cannot write state %q", intent.State)
+}
+
+// rereadSetupIntent returns the stored row after a claim or takeover.
+func (d *DB) rereadSetupIntent(ctx context.Context, orderID string) (*models.GigahostSetupIntent, bool, error) {
+	return d.GetGigahostSetupIntent(ctx, orderID)
+}
+
+// ResumeGigahostSetupInstall claims an intent that an operator has explicitly
+// resumed: a trust pause, a credential pause, or a paused install attempt.
+//
+// The expected-state list is the guard. A completed install, a revocation and a
+// provider terminal failure are absent, so a resume cannot pass those states, and
+// the generation increments in the same statement so any attempt that was already
+// running is fenced out by the resume.
+func (d *DB) ResumeGigahostSetupInstall(ctx context.Context, orderID string) (*models.GigahostSetupIntent, bool, error) {
+	if d == nil || d.sqlDB == nil || strings.TrimSpace(orderID) == "" {
+		return nil, false, nil
+	}
+	if err := d.EnsureGigahostSetupIntentsSchema(ctx); err != nil {
+		return nil, false, err
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(resumableSetupStates)), ",")
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	q := `UPDATE gigahost_setup_intents
+	      SET state = ?,
+	          install_generation = install_generation + 1,
+	          install_attempts = install_attempts + 1,
+	          step = 'install_resumed',
+	          last_error = '',
+	          next_attempt_at = '',
+	          updated_at = ?
+	      WHERE order_id = ? AND state IN (` + placeholders + `)` // #nosec G202 -- placeholder count only; all values are bound arguments
+	args := []any{models.SetupStateInstalling, now, orderID}
+	for _, s := range resumableSetupStates {
+		args = append(args, s)
+	}
+	d.writeMu.Lock()
+	res, err := d.sqlDB.ExecContext(ctx, q, args...)
+	d.writeMu.Unlock()
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to resume gigahost setup install: %w", err)
+	}
+	return d.resumeOutcome(ctx, orderID, res)
+}
+
+// resumeOutcome reports what a resume attempt actually achieved.
+//
+// changed=false means the row was not in a resumable state; the stored row is
+// returned so the caller explains the real state instead of claiming a resume.
+func (d *DB) resumeOutcome(
+	ctx context.Context, orderID string, res sql.Result,
+) (*models.GigahostSetupIntent, bool, error) {
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to confirm gigahost setup resume: %w", err)
+	}
+	current, found, err := d.GetGigahostSetupIntent(ctx, orderID)
+	if err != nil || !found {
+		return nil, false, err
+	}
+	return current, affected > 0, nil
+}
+
+// resumableSetupStates are the states an explicit administrator resume may act
+// on. They are exactly the states that stopped and asked for a decision: a trust
+// pause, a credential pause, a paused attempt, and the untouched handoff.
+var resumableSetupStates = []string{
+	models.SetupStateReadyForSetup,
+	models.SetupStateAwaitingHostConfirm,
+	models.SetupStateAwaitingCredentials,
+	models.SetupStateInstallPaused,
+}
+
+// ConfirmGigahostSetupHostFingerprint records the identity the administrator
+// confirmed for an order and re-arms provider tracking.
+//
+// It is a compare-and-set from the trust-pause states back to pending, so
+// confirming cannot resurrect a revoked or completed job, and the stored binding
+// of any registered server is left untouched: the tracker re-evaluates it and
+// pauses again if the confirmation contradicts it. changed=false means the row
+// was not in a state this confirmation applies to; the returned row is then the
+// stored truth, so the caller explains the real state instead of claiming a
+// confirmation happened. A nil row means no approval exists for the order.
+func (d *DB) ConfirmGigahostSetupHostFingerprint(
+	ctx context.Context, orderID, fingerprint string,
+) (*models.GigahostSetupIntent, bool, error) {
+	if d == nil || d.sqlDB == nil || strings.TrimSpace(orderID) == "" {
+		return nil, false, nil
+	}
+	if strings.TrimSpace(fingerprint) == "" {
+		return nil, false, errors.New("a confirmed host fingerprint is required")
+	}
+	if err := d.EnsureGigahostSetupIntentsSchema(ctx); err != nil {
+		return nil, false, err
+	}
+	return d.applyHostConfirmation(ctx, orderID, fingerprint)
+}
+
+// applyHostConfirmation writes the confirmed identity over the states a
+// confirmation applies to, and reports whether this call was the one that changed
+// the row together with the stored row afterwards.
+func (d *DB) applyHostConfirmation(
+	ctx context.Context, orderID, fingerprint string,
+) (*models.GigahostSetupIntent, bool, error) {
+	now := time.Now().UTC()
+	q := `UPDATE gigahost_setup_intents
+	      SET host_fingerprint = ?,
+	          host_mismatch = 0,
+	          state = ?,
+	          step = 'host_confirmed',
+	          last_error = '',
+	          next_attempt_at = '',
+	          updated_at = ?
+	      WHERE order_id = ? AND state IN (?, ?)`
+	res, err := d.execWrite(ctx, q, fingerprint, models.SetupStatePending,
+		formatSetupTimestamp(now), orderID,
+		models.SetupStateAwaitingHostConfirm, models.SetupStateInstallPaused)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to confirm gigahost setup host identity: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to confirm gigahost setup host identity write: %w", err)
+	}
+	current, found, err := d.GetGigahostSetupIntent(ctx, orderID)
+	if err != nil || !found {
+		return nil, false, err
+	}
+	return current, affected > 0, nil
+}
+
+// execWrite runs a statement under the database write lock, so every statement
+// that mutates this table is serialized with the rest of the ledger's writers.
+func (d *DB) execWrite(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	return d.sqlDB.ExecContext(ctx, query, args...)
+}
+
+// cancelableSetupStates are the states a revocation may change. A completed
+// install is deliberately absent: it is finished, and removing an admitted
+// backend goes through the existing backend disable path. The install states are
+// present because revocation must reach an install that is still in progress,
+// not only the provider poll that precedes it.
 var cancelableSetupStates = []string{
 	models.SetupStatePending,
 	models.SetupStateAwaitingHostConfirm,
 	models.SetupStateAwaitingCredentials,
+	models.SetupStateReadyForSetup,
+	models.SetupStateInstalling,
+	models.SetupStateInstallPaused,
 	models.SetupStateFailed,
 }
 

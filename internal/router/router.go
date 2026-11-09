@@ -300,11 +300,14 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			r.Get("/orders/{order_id}/status", h.GigahostDeployStatusHandler)
 			// Durable setup approval, revocation and status. These record the
 			// administrator's intent and expose the background tracker's progress;
-			// they do not install a protocol or enable a backend.
+			// the resume and host-confirmation routes are the two actions a pause
+			// asks the administrator to take.
 			r.Get("/setup-intents", h.GigahostSetupIntentsHandler)
 			r.Post("/orders/{order_id}/setup-approval", h.GigahostSetupApproveHandler)
 			r.Get("/orders/{order_id}/setup-approval", h.GigahostSetupStatusHandler)
 			r.Delete("/orders/{order_id}/setup-approval", h.GigahostSetupCancelHandler)
+			r.Post("/orders/{order_id}/setup-resume", h.GigahostSetupResumeHandler)
+			r.Post("/orders/{order_id}/setup-host-confirmation", h.GigahostSetupConfirmHostHandler)
 		})
 	})
 
