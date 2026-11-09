@@ -119,16 +119,31 @@ func setupTCPEchoServerOnAddr(t *testing.T, listenAddr string) (string, func()) 
 	if err != nil {
 		t.Fatalf("listen tcp echo on %s: %v", listenAddr, err)
 	}
+	return serveTCPEcho(t, ln)
+}
+
+// serveTCPEcho runs the echo producer on an already-bound listener and returns
+// its address plus a cleanup func that stops the producer and drains it.
+func serveTCPEcho(t *testing.T, ln net.Listener) (string, func()) {
+	t.Helper()
 
 	var wg sync.WaitGroup
-	closed := make(chan struct{})
+	// acceptDone is closed after the producer exits. cleanup waits for it
+	// before calling wg.Wait, so every wg.Add is ordered before the wait and
+	// no handler can be registered once the counter has been observed at zero.
+	acceptDone := make(chan struct{})
+	// conns is written only by the producer goroutine; cleanup reads it after
+	// the producer has signalled exit.
+	var conns []net.Conn
 
 	go func() {
+		defer close(acceptDone)
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
+			conns = append(conns, conn)
 			wg.Add(1)
 			go func(c net.Conn) {
 				defer wg.Done()
@@ -139,8 +154,16 @@ func setupTCPEchoServerOnAddr(t *testing.T, listenAddr string) (string, func()) 
 	}()
 
 	cleanup := func() {
-		close(closed)
+		// Closing the listener first makes Accept return, so the producer
+		// reaches its exit signal instead of idling.
 		_ = ln.Close()
+		<-acceptDone
+		// A connection accepted in the close window belongs to the fixture and
+		// an idle peer would keep io.Copy blocked, so close them before waiting.
+		// Handlers close their own conn too; a repeated Close is harmless.
+		for _, c := range conns {
+			_ = c.Close()
+		}
 		wg.Wait()
 	}
 
