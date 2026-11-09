@@ -8,17 +8,23 @@
 // Safety model:
 //
 //   - Read-only by default. A run without --apply only reports.
-//   - It never contacts the provider, so it has NO authoritative proof available
-//     and therefore releases NOTHING on its own. There is deliberately no
-//     operator waiver: the approved scope forbids an administrator
-//     acknowledgement standing in for authoritative reconciliation, and a
-//     free-text note is not proof of anything. A reservation whose outcome is
-//     genuinely unknowable is reported as unresolved, kept in the committed
-//     total, and named so whoever holds real provider evidence can act.
-//   - The only release evidence that exists is provider evidence (a terminated or
-//     deleted server, or a waitlist reservation the contract states is not
-//     billed). An offline run cannot obtain it, so an offline run proposes no
-//     change.
+//   - Offline by default too. A run without --provider-read reads nothing but
+//     the local database, so it holds NO authoritative proof and releases
+//     NOTHING. There is deliberately no operator waiver: the approved scope
+//     forbids an administrator acknowledgement standing in for authoritative
+//     reconciliation, and a free-text note is not proof of anything.
+//   - --provider-read is the opt-in evidence path. It performs read-only GETs
+//     (catalog, server inventory, deployment status) through the same client and
+//     the same collector as the purchase path, bounded by an explicit timeout
+//     and a per-run lookup limit. It cannot order, cancel or delete anything.
+//     The only observation that can justify a release is a provider-reported
+//     matching server that is terminated or deleted, which ends the recurring
+//     commitment.
+//   - Anything else stays counted and is named with the exact proof it needs. An
+//     omission from the provider's deployment status list is not proof of
+//     absence, a failed or timed-out read is not proof of absence, a locally
+//     generated order id is never queried at all, and a waitlist reservation is
+//     an armed commitment that must keep counting.
 //   - --apply ALWAYS takes a coherent SQLite snapshot first (VACUUM INTO inside
 //     one read transaction, one self-contained file, mode 0600) and verifies it:
 //     SQLite integrity_check, the schema inventory, per-table row counts, and the
@@ -36,8 +42,9 @@
 //
 // Usage:
 //
-//	gigahost-recovery --db /path/panel.db          # dry run (default, read-only)
-//	gigahost-recovery --db /path/panel.db --json    # machine-readable report
+//	gigahost-recovery --db /path/panel.db                     # dry run (default, offline, read-only)
+//	gigahost-recovery --db /path/panel.db --provider-read     # read-only provider evidence, still a proposal
+//	gigahost-recovery --db /path/panel.db --json              # machine-readable report
 //	gigahost-recovery --db /path/panel.backup.db --restore-to /path/restored.db
 package main
 
@@ -55,6 +62,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/gigahostbudget"
+	"github.com/devops-igor/amnezia-nexus/internal/service/gigahostevidence"
 )
 
 // exit codes, so a script can distinguish the outcomes.
@@ -77,6 +85,7 @@ type config struct {
 	restoreTo   string
 	catalogPath string
 	showHelp    bool
+	provider    providerConfig
 }
 
 // report is what one run found and did.
@@ -95,8 +104,18 @@ type report struct {
 	Unresolved      []gigahostbudget.ProposedChange `json:"unresolved"`
 	AlreadyReleased int                             `json:"already_released"`
 	IncompleteTotal bool                            `json:"incomplete_total"`
-	Warnings        []string                        `json:"warnings,omitempty"`
-	ApplyErrors     []string                        `json:"apply_errors,omitempty"`
+	// EvidenceSource names what the proposal's conclusions rest on:
+	// "offline" (ledger only, never conclusive) or "provider_read".
+	EvidenceSource string `json:"evidence_source"`
+	// OrderLookups is how many provider deployment-status reads were issued.
+	OrderLookups int `json:"order_lookups"`
+	// Bindings is the stale-safe anchor a later apply must match. It is only
+	// present when a provider read actually happened.
+	Bindings *evidenceBindings `json:"bindings,omitempty"`
+	Warnings []string          `json:"warnings,omitempty"`
+	// ApplyErrors are failures of a write. They are separate from Warnings
+	// because a failed write must fail the run, not merely annotate it.
+	ApplyErrors []string `json:"apply_errors,omitempty"`
 }
 
 func main() {
@@ -143,6 +162,11 @@ func parseConfig(args []string, stderr io.Writer) (cfg config, ok bool) {
 	fs.BoolVar(&cfg.noBackup, "no-backup", false, "refused: --apply always takes a verified snapshot before writing")
 	fs.StringVar(&cfg.restoreTo, "restore-to", "", "restore the --db snapshot into this NEW path (never overwrites anything)")
 	fs.StringVar(&cfg.catalogPath, "catalog", "", "JSON file of catalog rows, for pricing legacy records offline (never fetched)")
+	fs.BoolVar(&cfg.provider.enabled, "provider-read", false, "read the provider read-only to obtain authoritative evidence (opt-in; default is a local, offline report)")
+	fs.StringVar(&cfg.provider.apiKey, "api-key", "", "provider credential for --provider-read (prefer the GIGAHOST_API_KEY environment variable)")
+	fs.StringVar(&cfg.provider.baseURL, "provider-url", "", "provider API base URL for --provider-read (default: the provider's own)")
+	fs.DurationVar(&cfg.provider.timeout, "provider-timeout", defaultProviderTimeout, "overall timeout for one --provider-read pass")
+	fs.IntVar(&cfg.provider.maxLookups, "max-order-lookups", defaultOrderLookups, "maximum deployment-status reads one --provider-read pass may issue")
 	fs.BoolVar(&cfg.showHelp, "help", false, "show this help")
 	if err := fs.Parse(args); err != nil {
 		return cfg, false
@@ -151,6 +175,7 @@ func parseConfig(args []string, stderr io.Writer) (cfg config, ok bool) {
 		fs.Usage()
 		return cfg, true
 	}
+	cfg.provider.apiKey = resolveAPIKey(cfg.provider.apiKey)
 	return cfg, true
 }
 
@@ -189,13 +214,36 @@ func validateConfig(cfg config) error {
 	if cfg.apply && cfg.noBackup {
 		return errors.New("--no-backup is not supported: --apply always takes a verified snapshot first")
 	}
-	if cfg.restoreTo != "" {
-		if cfg.apply {
-			return errors.New("--restore-to and --apply are separate operations; restore into a new file first, then inspect it")
-		}
-		if cfg.noBackup || cfg.backupPath != "" {
-			return errors.New("--restore-to does not take a snapshot destination; it writes only to --restore-to")
-		}
+	if err := validateRestoreConfig(cfg); err != nil {
+		return err
+	}
+	if cfg.provider.enabled && cfg.provider.maxLookups <= 0 {
+		return errors.New("--provider-read with --max-order-lookups <= 0 would disable order lookups entirely; omit --provider-read for an offline report")
+	}
+	if cfg.apply && cfg.provider.enabled {
+		// Applying provider evidence needs the stale-safe write path (re-check the
+		// observed row inside the release transaction). This checkpoint delivers
+		// the read-only proposal and its bindings; applying it is the next step,
+		// so the combination is refused rather than silently written unbound.
+		return errors.New("--apply with --provider-read is not supported yet: review the proposal, then apply it with the fresh-evidence write path (the read-only report and its bindings are kept for that step)")
+	}
+	return nil
+}
+
+// validateRestoreConfig rejects the flag combinations a snapshot restore cannot
+// honor: a restore is a file copy, not a financial decision.
+func validateRestoreConfig(cfg config) error {
+	if cfg.restoreTo == "" {
+		return nil
+	}
+	if cfg.apply {
+		return errors.New("--restore-to and --apply are separate operations; restore into a new file first, then inspect it")
+	}
+	if cfg.noBackup || cfg.backupPath != "" {
+		return errors.New("--restore-to does not take a snapshot destination; it writes only to --restore-to")
+	}
+	if cfg.provider.enabled {
+		return errors.New("--restore-to copies a file and takes no provider evidence; drop --provider-read")
 	}
 	return nil
 }
@@ -227,9 +275,10 @@ func executeRestore(ctx context.Context, cfg config) (report, int, error) {
 // plan, and applies it when asked.
 func executePlan(ctx context.Context, cfg config) (report, int, error) {
 	rep := report{
-		Database: cfg.dbPath,
-		Mode:     "dry-run",
-		CapNOK:   cfg.budgetNOK,
+		Database:       cfg.dbPath,
+		Mode:           "dry-run",
+		CapNOK:         cfg.budgetNOK,
+		EvidenceSource: "offline",
 	}
 
 	// A dry run opens the database strictly read-only and never migrates: an
@@ -260,13 +309,12 @@ func executePlan(ctx context.Context, cfg config) (report, int, error) {
 		return rep, 0, err
 	}
 
-	// This run has no provider evidence available, so nothing can be released.
-	// Saying so explicitly keeps the report truthful rather than looking like a
-	// clean bill of health.
-	rep.Warnings = append(rep.Warnings,
-		"offline run: no provider evidence is available, so no release is proposed; unresolved reservations are kept and named")
+	evidence, err := collectEvidence(ctx, cfg, &rep, orders, &plans)
+	if err != nil {
+		return rep, 0, err
+	}
 
-	entries, evidence := prepareEntries(orders)
+	entries := prepareEntries(orders)
 	proposal, err := gigahostbudget.Propose(gigahostbudget.Input{
 		CapNOK:   cfg.budgetNOK,
 		Plans:    plans,
@@ -287,6 +335,43 @@ func executePlan(ctx context.Context, cfg config) (report, int, error) {
 	rep.Mode = "applied"
 	applyProposedReleases(ctx, db, proposal.Changes, &rep)
 	return rep, len(rep.Unresolved), nil
+}
+
+// collectEvidence produces the observation map the shared calculation needs.
+//
+// An offline run supplies none, and says so: every evidence field of the zero
+// value means "nothing observed", which is never conclusive, so an offline
+// report proposes nothing and names what a human must verify. A provider run
+// supplies real observations and the bindings a later apply must match.
+func collectEvidence(
+	ctx context.Context, cfg config, rep *report, orders []models.GigahostOrder, plans *[]gigahostbudget.Plan,
+) (map[int64]gigahostbudget.Evidence, error) {
+	if !cfg.provider.enabled {
+		rep.Warnings = append(rep.Warnings,
+			"offline run: no provider evidence is available, so no release is proposed; unresolved reservations are kept and named")
+		return nil, nil
+	}
+
+	client, err := cfg.provider.newClient()
+	if err != nil {
+		return nil, err
+	}
+	pe, err := collectProviderEvidence(ctx, client, cfg.dbPath, orders, cfg.provider)
+	if err != nil {
+		// A failed provider pass is reported as a failure, not as "no evidence":
+		// the operator asked for provider proof and did not get it.
+		return nil, err
+	}
+	rep.EvidenceSource = "provider_read"
+	rep.OrderLookups = pe.OrderLookups
+	rep.Bindings = &pe.Bindings
+	rep.Warnings = append(rep.Warnings, pe.Warnings...)
+	if len(pe.Plans) > 0 {
+		// The provider catalog is authoritative for pricing, so it outranks an
+		// operator-supplied offline export when both are present.
+		*plans = pe.Plans
+	}
+	return pe.Evidence, nil
 }
 
 // openLedgerDB opens the database read-only for a dry run and read-write (which
@@ -363,32 +448,13 @@ func applyProposedReleases(ctx context.Context, db *database.DB, changes []gigah
 
 // prepareEntries builds the shared input from the ledger.
 //
-// It supplies no release evidence at all, and that is the point: this tool is
-// offline, so any evidence it could hand over would be an operator assertion
-// rather than provider fact. A note-only waiver was explicitly rejected by the
-// approved scope, so the function that used to build one no longer exists.
-func prepareEntries(orders []models.GigahostOrder) ([]gigahostbudget.Entry, map[int64]gigahostbudget.Evidence) {
-	entries := make([]gigahostbudget.Entry, 0, len(orders))
-	evidence := make(map[int64]gigahostbudget.Evidence)
-
-	for _, o := range orders {
-		entries = append(entries, gigahostbudget.Entry{
-			RecordID:       o.ID,
-			OrderID:        o.OrderID,
-			ServerID:       o.ServerID,
-			Status:         o.Status,
-			PlanID:         o.PlanID,
-			RegionID:       o.RegionID,
-			HourlyPriceNOK: o.HourlyPriceNOK,
-			PriceID:        o.PriceID,
-			MonthlyCapNOK:  o.MonthlyCapNOK,
-			Currency:       o.Currency,
-			AssignedIP:     o.AssignedIP,
-			ReleasedAt:     o.ReleasedAt,
-			ReleaseReason:  o.ReleaseReason,
-		})
-	}
-	return entries, evidence
+// It supplies no release evidence, and that is the point: this function is the
+// offline path, so any evidence it could hand over would be an operator
+// assertion rather than provider fact. A note-only waiver was explicitly
+// rejected by the approved scope. Provider observations are supplied separately
+// by collectEvidence.
+func prepareEntries(orders []models.GigahostOrder) []gigahostbudget.Entry {
+	return gigahostevidence.Entries(orders)
 }
 
 // reasonFor returns the audit reason for one proposed change, or "" when the
@@ -511,11 +577,25 @@ func writeText(w io.Writer, rep report) {
 		writeRestoreTail(w, rep)
 		return
 	}
+	writeEvidenceSource(w, rep)
 	writePlanTotals(w, rep)
 	writeChangeList(w, "\nproposed releases: none\n", "\nproposed releases: %d\n", rep.Released)
 	writeChangeList(w, "\nretained reservations: none\n", "\nretained reservations: %d (keep counting)\n", rep.Retained)
 	writeUnresolvedBlock(w, rep)
 	writeReportTail(w, rep)
+}
+
+// writeEvidenceSource states what the conclusions rest on, so an operator cannot
+// mistake a local report for a provider answer.
+func writeEvidenceSource(w io.Writer, rep report) {
+	switch rep.EvidenceSource {
+	case "provider_read":
+		fmt.Fprintf(w, "evidence: provider read (read-only), %d deployment-status lookup(s)\n", rep.OrderLookups)
+	case "", "offline":
+		fmt.Fprintf(w, "evidence: none - this report was produced offline from the ledger alone\n")
+	default:
+		fmt.Fprintf(w, "evidence: %s\n", rep.EvidenceSource)
+	}
 }
 
 // writePlanTotals prints the cap and the before/after totals.
@@ -542,6 +622,9 @@ func writeChangeList(w io.Writer, empty, header string, changes []gigahostbudget
 	for _, c := range changes {
 		fmt.Fprintf(w, "  record %d  %-14s %-10s %8.2f NOK  %s\n",
 			c.RecordID, c.Identity, c.State, c.AmountNOK, c.Explanation)
+		if c.ProofNeeded != "" {
+			fmt.Fprintf(w, "      proof needed: %s\n", c.ProofNeeded)
+		}
 	}
 }
 
@@ -555,12 +638,17 @@ func writeUnresolvedBlock(w io.Writer, rep report) {
 	if rep.IncompleteTotal {
 		fmt.Fprintf(w, "committed before is a LOWER BOUND: at least one counted reservation has no identifiable price.\n")
 	}
-	fmt.Fprintf(w, "This tool cannot release them: it is offline and holds no provider evidence.\n")
-	fmt.Fprintf(w, "Each one needs a provider fact that the panel has not recorded yet:\n")
-	fmt.Fprintf(w, "  - a terminated or deleted server for the matching provider server id, which ends the commitment.\n")
+	if rep.EvidenceSource != "provider_read" {
+		fmt.Fprintf(w, "This run holds no provider evidence, so it cannot release them.\n")
+	} else {
+		fmt.Fprintf(w, "The provider was read, but its answer did not establish that these carry no further charge.\n")
+	}
+	fmt.Fprintf(w, "Each one needs a provider fact this application can record for the row's own identity:\n")
+	fmt.Fprintf(w, "  - a matching provider server reported as terminated or deleted, which ends the recurring commitment.\n")
 	fmt.Fprintf(w, "A waitlist order is NOT such a fact: it is unbilled only while it waits and deploys automatically,\n")
-	fmt.Fprintf(w, "so it stays a pending commitment until the provider actually deploys or ends it.\n")
-	fmt.Fprintf(w, "Once the panel sees a conclusive fact, its own reconciliation releases the reservation, with an audit row.\n")
+	fmt.Fprintf(w, "so it stays a pending commitment until the provider deploys or ends it, and it must keep counting.\n")
+	fmt.Fprintf(w, "A provider omission from its deployment status list is not such a fact either: the contract states\n")
+	fmt.Fprintf(w, "that endpoint also omits canceled orders and servers that were deleted, and ignores foreign orders.\n")
 	fmt.Fprintf(w, "There is no local waiver: a note cannot stand in for provider evidence.\n")
 }
 

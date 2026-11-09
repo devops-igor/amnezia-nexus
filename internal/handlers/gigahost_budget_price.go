@@ -11,6 +11,7 @@ package handlers
 import (
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 	"github.com/devops-igor/amnezia-nexus/internal/service/gigahostbudget"
+	"github.com/devops-igor/amnezia-nexus/internal/service/gigahostevidence"
 )
 
 // Re-exported shared errors so existing callers and tests keep their oracle.
@@ -21,55 +22,17 @@ var (
 
 // budgetPlans converts catalog rows for the shared calculation.
 func budgetPlans(catalog []gigahost.HourlyPlan) []gigahostbudget.Plan {
-	plans := make([]gigahostbudget.Plan, 0, len(catalog))
-	for _, p := range catalog {
-		plans = append(plans, gigahostbudget.Plan{
-			ProductID:      p.ProductID,
-			PriceID:        p.PriceID,
-			Currency:       p.Currency,
-			HourlyRateNOK:  p.HourlyRateNOK,
-			MonthlyCeiling: p.MonthlyCeiling,
-		})
-	}
-	return plans
+	return gigahostevidence.Plans(catalog)
 }
 
 // budgetServers converts provider inventory rows for the shared calculation.
 func budgetServers(servers []gigahost.ServerInfo) []gigahostbudget.Server {
-	out := make([]gigahostbudget.Server, 0, len(servers))
-	for _, s := range servers {
-		out = append(out, gigahostbudget.Server{
-			ID:      s.ID,
-			OrderID: s.OrderID,
-			PlanID:  s.PID,
-			Status:  s.Status,
-			Hourly:  s.IsHourlyVPS(),
-		})
-	}
-	return out
+	return gigahostevidence.Servers(servers)
 }
 
 // budgetEntries converts ledger rows for the shared calculation.
 func budgetEntries(orders []GigahostOrderRecord) []gigahostbudget.Entry {
-	out := make([]gigahostbudget.Entry, 0, len(orders))
-	for _, o := range orders {
-		out = append(out, gigahostbudget.Entry{
-			RecordID:       o.ID,
-			OrderID:        o.OrderID,
-			ServerID:       o.ServerID,
-			Status:         o.Status,
-			PlanID:         o.PlanID,
-			RegionID:       o.RegionID,
-			HourlyPriceNOK: o.HourlyPriceNOK,
-			PriceID:        o.PriceID,
-			MonthlyCapNOK:  o.MonthlyCapNOK,
-			Currency:       o.Currency,
-			AssignedIP:     o.AssignedIP,
-			ReleasedAt:     o.ReleasedAt,
-			ReleaseReason:  o.ReleaseReason,
-		})
-	}
-	return out
+	return gigahostevidence.Entries(orders)
 }
 
 // existingMonthlySpend resolves the monthly commitment of an existing hourly

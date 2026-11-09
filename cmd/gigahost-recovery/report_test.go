@@ -67,6 +67,52 @@ func TestReasonForRequiresConclusiveEvidence(t *testing.T) {
 	}
 }
 
+// TestWriteTextRendersTheEvidenceSource proves the human report states what the
+// conclusions rest on. An operator reading "proposed releases" must be able to
+// tell a provider-backed proposal from a local inspection.
+func TestWriteTextRendersTheEvidenceSource(t *testing.T) {
+	offline := report{Database: "/tmp/panel.db", Mode: "dry-run", CapNOK: 100, EvidenceSource: "offline"}
+	var buf bytes.Buffer
+	writeText(&buf, offline)
+	if !strings.Contains(buf.String(), "evidence: none") {
+		t.Fatalf("an offline report must say it holds no evidence:\n%s", buf.String())
+	}
+
+	provider := offline
+	provider.EvidenceSource = "provider_read"
+	provider.OrderLookups = 3
+	provider.Unresolved = []gigahostbudget.ProposedChange{{RecordID: 1, Identity: "order 10001", State: "unresolved"}}
+	buf.Reset()
+	writeText(&buf, provider)
+	out := buf.String()
+	if !strings.Contains(out, "evidence: provider read (read-only), 3 deployment-status lookup(s)") {
+		t.Fatalf("a provider report must name its source and lookups:\n%s", out)
+	}
+	if strings.Contains(out, "This run holds no provider evidence") {
+		t.Fatalf("a provider-backed report must not claim it has no evidence:\n%s", out)
+	}
+	if !strings.Contains(out, "did not establish") {
+		t.Fatalf("a provider-backed report must say why rows stay unresolved:\n%s", out)
+	}
+}
+
+// TestWriteTextRendersPerRecordProof proves the retained list names the proof each
+// kept reservation needs, so an operator has a next step instead of a warning.
+func TestWriteTextRendersPerRecordProof(t *testing.T) {
+	rep := report{
+		Database: "/tmp/panel.db", Mode: "dry-run", CapNOK: 100, EvidenceSource: "offline",
+		Retained: []gigahostbudget.ProposedChange{{
+			RecordID: 1, Identity: "intent_1", State: "unresolved", AmountNOK: 41,
+			Explanation: "a local identifier", ProofNeeded: "a real provider order id",
+		}},
+	}
+	var buf bytes.Buffer
+	writeText(&buf, rep)
+	if !strings.Contains(buf.String(), "proof needed: a real provider order id") {
+		t.Fatalf("the retained list must name the proof needed:\n%s", buf.String())
+	}
+}
+
 // TestLoadPlansReadsAnOfflineCatalog proves the optional catalog file is read as
 // given, and that a broken file is an error rather than a silent empty catalog.
 func TestLoadPlansReadsAnOfflineCatalog(t *testing.T) {

@@ -41,6 +41,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 	"github.com/devops-igor/amnezia-nexus/internal/service/gigahostbudget"
+	"github.com/devops-igor/amnezia-nexus/internal/service/gigahostevidence"
 )
 
 // maxBudgetReconcileLookups bounds the provider reads one order attempt may
@@ -73,11 +74,10 @@ type budgetReconciliation struct {
 }
 
 // ledgerObservation binds provider evidence to the complete pre-I/O ledger
-// snapshot, not just the nonempty provider identifiers.
-type ledgerObservation struct {
-	evidence gigahostbudget.Evidence
-	expect   database.ReleaseExpectation
-}
+// snapshot, not just the nonempty provider identifiers. Collection itself lives
+// in internal/service/gigahostevidence, so the purchase path and the offline
+// operator utility observe the provider through one implementation.
+type ledgerObservation = gigahostevidence.Observation
 
 // gatherLedgerEvidence observes the provider for each ledger row that still
 // counts, using only authoritative identities. Provider calls are bounded and
@@ -86,58 +86,9 @@ type ledgerObservation struct {
 func (h *Handlers) gatherLedgerEvidence(
 	ctx context.Context, client gigahost.Client, servers []gigahost.ServerInfo, orders []GigahostOrderRecord,
 ) map[int64]ledgerObservation {
-	out := make(map[int64]ledgerObservation, len(orders))
-	sharedServers := budgetServers(servers)
-	lookups := 0
-
-	for _, o := range orders {
-		// A released row is NOT skipped: its marker is a past decision, and the
-		// provider may since have made the obligation live (a held order deploys
-		// by itself). The observation is what lets the decision override a stale
-		// marker, so skipping it here would make that impossible.
-		if gigahostbudget.IsLocallyTerminal(o.Status) && o.ReleasedAt == "" {
-			continue
-		}
-		obs := ledgerObservation{expect: o}
-		entry := budgetEntries([]GigahostOrderRecord{o})[0]
-
-		// A matching inventory row describes the resource itself, and is the
-		// most specific statement available.
-		for _, s := range sharedServers {
-			if !gigahostbudget.EntryMatchesServer(entry, s) {
-				continue
-			}
-			obs.evidence.ServerFound = true
-			obs.evidence.ServerStatus = s.Status
-			break
-		}
-
-		// Only a real provider order id may be queried: a synthetic local id
-		// names nothing at the provider.
-		queryable := o.OrderID != "" && !gigahostbudget.IsSyntheticOrderID(o.OrderID)
-		if queryable && lookups < maxBudgetReconcileLookups {
-			lookups++
-			resp, err := client.GetDeployStatus(ctx, o.OrderID)
-			switch {
-			case err == nil && resp != nil && resp.Status != "":
-				obs.evidence.ProviderOrderFound = true
-				obs.evidence.ProviderOrderStatus = resp.Status
-			case err == nil:
-				// The provider listed the order with no status. That is not a
-				// statement about billing, so nothing is concluded from it.
-			case errors.Is(err, gigahost.ErrNotFound):
-				// Recorded as an observation, and deliberately never treated as
-				// evidence: the contract states this endpoint omits canceled
-				// orders and orders whose server was deleted (E1), so omission
-				// cannot prove a charge does not exist.
-				obs.evidence.OrderOmittedFromDeployStatus = true
-			default:
-				obs.evidence.OrderQueryFailed = true
-			}
-		}
-		out[o.ID] = obs
-	}
-	return out
+	collected := gigahostevidence.Collect(ctx, client, servers, orders,
+		gigahostevidence.Limits{MaxOrderLookups: maxBudgetReconcileLookups})
+	return collected.Observations
 }
 
 // reconcileLedgerReservations runs one automatic reconciliation pass and writes
@@ -153,7 +104,7 @@ func (h *Handlers) reconcileLedgerReservations(
 	// budget decision can see a live obligation behind a stale marker.
 	out.evidence = make(map[int64]gigahostbudget.Evidence, len(observed))
 	for id, obs := range observed {
-		out.evidence[id] = obs.evidence
+		out.evidence[id] = obs.Evidence
 	}
 
 	for i := range orders {
@@ -170,7 +121,7 @@ func (h *Handlers) reconcileLedgerReservations(
 		if !seen {
 			continue
 		}
-		verdict := gigahostbudget.Classify(budgetEntries([]GigahostOrderRecord{*order})[0], obs.evidence)
+		verdict := gigahostbudget.Classify(gigahostevidence.Entries([]GigahostOrderRecord{*order})[0], obs.Evidence)
 
 		if !verdict.Releasable {
 			if verdict.State == gigahostbudget.StateUnresolved {
@@ -184,7 +135,7 @@ func (h *Handlers) reconcileLedgerReservations(
 		// commitment. The check is passed into the release transaction, which
 		// re-reads the row under the write lock, because a check outside the
 		// transaction can be invalidated between the check and the write.
-		err := h.db.ReleaseGigahostOrderIfCurrent(ctx, order.ID, obs.expect,
+		err := h.db.ReleaseGigahostOrderIfCurrent(ctx, order.ID, obs.Expect,
 			verdict.Reason, verdict.Explanation)
 		switch {
 		case err == nil:

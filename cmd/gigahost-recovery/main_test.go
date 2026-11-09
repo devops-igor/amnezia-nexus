@@ -322,11 +322,27 @@ func TestCLIRefusesIncoherentFlagCombinations(t *testing.T) {
 	cases := [][]string{
 		{"--db", db, "--apply", "--restore-to", filepath.Join(dir, "x.db")},
 		{"--db", db, "--restore-to", filepath.Join(dir, "y.db"), "--backup", filepath.Join(dir, "z.db")},
+		// A restore is a file copy: it cannot also claim to take provider evidence.
+		{"--db", db, "--restore-to", filepath.Join(dir, "w.db"), "--provider-read", "--api-key", "x"},
 	}
 	for _, args := range cases {
 		code, _, stderr := runCLI(t, args...)
 		if code != exitUsage {
 			t.Fatalf("%v exit = %d, want %d (%q)", args, code, exitUsage, stderr)
+		}
+	}
+}
+
+// TestCLIHelpDocumentsTheProviderRead proves the new opt-in flag is discoverable,
+// so an operator cannot conclude the tool can never obtain evidence.
+func TestCLIHelpDocumentsTheProviderRead(t *testing.T) {
+	code, _, stderr := runCLI(t, "--help")
+	if code != exitOK {
+		t.Fatalf("--help exit = %d, want 0", code)
+	}
+	for _, want := range []string{"-provider-read", "-max-order-lookups", "GIGAHOST_API_KEY"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("help must document %q:\n%s", want, stderr)
 		}
 	}
 }
