@@ -332,7 +332,7 @@ func TestA1_StaleObservationCannotReleaseAChangedRecord(t *testing.T) {
 	}
 
 	// A stale observation (order 10001) must be refused by the transaction.
-	stale := database.ReleaseExpectation{OrderID: "10001", ServerID: 7}
+	stale := database.ReleaseExpectation(orders[0])
 	err = db.ReleaseGigahostOrderIfCurrent(ctx, recordID, stale, "provider_terminated", "stale observation")
 	if !errors.Is(err, database.ErrGigahostOrderChanged) {
 		t.Fatalf("stale release error = %v, want %v", err, database.ErrGigahostOrderChanged)
@@ -348,7 +348,7 @@ func TestA1_StaleObservationCannotReleaseAChangedRecord(t *testing.T) {
 
 	// The matching identity is accepted and records exactly one audit row, so the
 	// guard is not simply "always refuse".
-	fresh := database.ReleaseExpectation{OrderID: "10099", ServerID: 7}
+	fresh := database.ReleaseExpectation(after[0])
 	if err := db.ReleaseGigahostOrderIfCurrent(ctx, recordID, fresh, "provider_terminated", "current observation"); err != nil {
 		t.Fatalf("the freshness guard rejected an unchanged identity: %v", err)
 	}

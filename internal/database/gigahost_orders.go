@@ -345,35 +345,38 @@ func (d *DB) UpdateGigahostOrder(ctx context.Context, o *models.GigahostOrder) e
 // ErrGigahostOrderAlreadyReleased reports a repeated release attempt.
 var ErrGigahostOrderAlreadyReleased = errors.New("gigahost order reservation already released")
 
-// ErrGigahostOrderChanged reports that the ledger row no longer carries the
-// identity the release evidence was gathered against.
+// ErrGigahostOrderChanged reports that the ledger row no longer matches the
+// accounting/lifecycle snapshot the release evidence was gathered against.
 var ErrGigahostOrderChanged = errors.New("gigahost order changed since the release evidence was observed")
 
-// ReleaseExpectation is the identity the caller observed and wants verified
-// inside the release transaction.
-//
-// A pre-write check outside the transaction cannot be authoritative: the row can
-// be updated between the check and the write. The release therefore re-reads the
-// row under the write lock and refuses if the identity moved.
-type ReleaseExpectation struct {
-	OrderID  string
-	ServerID int64
-}
+// ReleaseExpectation is the complete ledger snapshot observed before collecting
+// provider evidence. Zero and blank fields are observations, never wildcards.
+// The transaction compares every persisted accounting/lifecycle field, including
+// timestamps, so an unchanged provider identity alone cannot authorize release.
+type ReleaseExpectation = models.GigahostOrder
 
+// ReleaseGigahostOrder releases without a prior observation. Kept for the
+// separately scoped offline recovery path and fixtures; live reconciliation must
+// use ReleaseGigahostOrderIfCurrent instead.
 func (d *DB) ReleaseGigahostOrder(ctx context.Context, recordID int64, reason, detail string) error {
-	return d.ReleaseGigahostOrderIfCurrent(ctx, recordID, ReleaseExpectation{}, reason, detail)
+	return d.releaseGigahostOrder(ctx, recordID, nil, reason, detail)
 }
 
 // ReleaseGigahostOrderIfCurrent marks a reservation as released and appends an
-// audit row, inside one transaction, and only if the stored identity still
-// matches expect. An empty expectation skips the identity check (used where the
-// caller has no observation, e.g. a test fixture).
+// audit row in one transaction, only if every observed field still matches.
+// Unlike ReleaseGigahostOrder, even a zero expectation performs strict checks.
 //
 // Releasing an already released row is a no-op reported as
 // ErrGigahostOrderAlreadyReleased, so a repeated run is visibly idempotent rather
 // than silently rewriting history.
 func (d *DB) ReleaseGigahostOrderIfCurrent(
 	ctx context.Context, recordID int64, expect ReleaseExpectation, reason, detail string,
+) error {
+	return d.releaseGigahostOrder(ctx, recordID, &expect, reason, detail)
+}
+
+func (d *DB) releaseGigahostOrder(
+	ctx context.Context, recordID int64, expect *ReleaseExpectation, reason, detail string,
 ) error {
 	if d == nil || d.sqlDB == nil {
 		return errors.New("no database handle")
@@ -384,10 +387,9 @@ func (d *DB) ReleaseGigahostOrderIfCurrent(
 	now := time.Now().UTC().Format(time.RFC3339)
 	return d.WithTransaction(ctx, func(tx *sql.Tx) error {
 		var orderID, releasedAt string
-		var serverID int64
 		err := tx.QueryRowContext(ctx,
-			`SELECT order_id, COALESCE(server_id, 0), COALESCE(released_at, '') FROM gigahost_orders WHERE id = ?`, recordID).
-			Scan(&orderID, &serverID, &releasedAt)
+			`SELECT order_id, COALESCE(released_at, '') FROM gigahost_orders WHERE id = ?`, recordID).
+			Scan(&orderID, &releasedAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("gigahost order %d not found", recordID)
 		}
@@ -397,11 +399,8 @@ func (d *DB) ReleaseGigahostOrderIfCurrent(
 		if releasedAt != "" {
 			return ErrGigahostOrderAlreadyReleased
 		}
-		if expect.OrderID != "" && expect.OrderID != orderID {
-			return ErrGigahostOrderChanged
-		}
-		if expect.ServerID != 0 && expect.ServerID != serverID {
-			return ErrGigahostOrderChanged
+		if err := checkGigahostReleaseSnapshot(ctx, tx, recordID, expect); err != nil {
+			return err
 		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE gigahost_orders SET released_at = ?, release_reason = ?, updated_at = ? WHERE id = ?`,
@@ -414,6 +413,37 @@ func (d *DB) ReleaseGigahostOrderIfCurrent(
 			recordID, orderID, GigahostOrderActionReleased, reason, detail, now)
 		return err
 	})
+}
+
+// checkGigahostReleaseSnapshot compares the complete persisted model inside the
+// same transaction as the release/audit write. SQL equality preserves timestamp
+// precision and rejects malformed/changed stored times rather than normalizing
+// them into apparent equality. NULL optional fields match their read defaults.
+func checkGigahostReleaseSnapshot(ctx context.Context, tx *sql.Tx, recordID int64, expect *ReleaseExpectation) error {
+	if expect == nil {
+		return nil
+	}
+	var matches bool
+	err := tx.QueryRowContext(ctx, `SELECT
+		id = ? AND order_id = ? AND COALESCE(server_id, 0) = ? AND status = ?
+		AND plan_id = ? AND region_id = ? AND hourly_price_nok = ?
+		AND COALESCE(assigned_ip, '') = ? AND created_at = ? AND updated_at = ?
+		AND COALESCE(price_id, 0) = ? AND COALESCE(monthly_cap_nok, 0) = ?
+		AND COALESCE(currency, '') = ? AND COALESCE(released_at, '') = ?
+		AND COALESCE(release_reason, '') = ?
+		FROM gigahost_orders WHERE id = ?`,
+		expect.ID, expect.OrderID, expect.ServerID, expect.Status,
+		expect.PlanID, expect.RegionID, expect.HourlyPriceNOK, expect.AssignedIP,
+		expect.CreatedAt.Format(time.RFC3339Nano), expect.UpdatedAt.Format(time.RFC3339Nano),
+		expect.PriceID, expect.MonthlyCapNOK, expect.Currency, expect.ReleasedAt, expect.ReleaseReason,
+		recordID).Scan(&matches)
+	if err != nil {
+		return err
+	}
+	if !matches {
+		return ErrGigahostOrderChanged
+	}
+	return nil
 }
 
 // GigahostOrderAuditRow is one audit entry for a ledger row.

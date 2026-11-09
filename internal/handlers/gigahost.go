@@ -266,7 +266,9 @@ func eligibilityErrorDetail(err error) string {
 }
 
 func (h *Handlers) handleBudgetCheckError(w http.ResponseWriter, err error) {
-	if strings.HasPrefix(err.Error(), "Monthly budget cap exceeded") {
+	if errors.Is(err, errBudgetReconciliationUnresolved) {
+		h.JSONError(w, http.StatusServiceUnavailable, "budget_reconciliation_unresolved", err.Error())
+	} else if strings.HasPrefix(err.Error(), "Monthly budget cap exceeded") {
 		h.JSONError(w, http.StatusBadRequest, "budget_exceeded", err.Error())
 	} else if strings.HasPrefix(err.Error(), "invalid_plan:") {
 		h.JSONError(w, http.StatusBadRequest, "invalid_plan", strings.TrimPrefix(err.Error(), "invalid_plan: "))
@@ -599,9 +601,8 @@ func budgetError(err error) error {
 }
 
 // evaluateBudget computes the single authoritative budget result for one
-// request. It does not write anything: reconciliation of provider status into
-// the ledger happens separately so a read-only reporting path cannot mutate
-// state.
+// request. It reconciles conclusive releases durably before pricing; a rejected
+// or failed transition aborts the decision instead of freeing budget in memory.
 func (h *Handlers) evaluateBudget(ctx context.Context, client gigahost.Client, req OrderServerPayload, cachedCatalog ...[]gigahost.HourlyPlan) (budgetEvaluation, error) {
 	var catalog []gigahost.HourlyPlan
 	if len(cachedCatalog) > 0 && cachedCatalog[0] != nil {
@@ -644,6 +645,9 @@ func (h *Handlers) evaluateBudget(ctx context.Context, client gigahost.Client, r
 	// a reservation the provider has conclusively ended must not be counted as
 	// committed, and this is the pre-existing automatic reconciliation.
 	reconciled := h.reconcileLedgerReservations(ctx, client, servers, localOrders)
+	if reconciled.err != nil {
+		return budgetEvaluation{}, reconciled.err
+	}
 	evidence := reconciled.evidence
 	if len(reconciled.released) > 0 {
 		// Re-read so the priced snapshot includes the releases just written.

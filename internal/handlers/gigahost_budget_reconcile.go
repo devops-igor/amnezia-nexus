@@ -6,13 +6,9 @@ package handlers
 // charge accrues, and an unknown financial outcome must stay counted. This file
 // is the only place that decides a reservation is over.
 //
-// It can distinguish exactly two evidences, described in the provider contract:
-// https://gigahost.no/en/api-dokumentasjon
-//
-//   - the provider reporting a matching server as terminated or deleted, which
-//     ends the recurring pay-as-you-go commitment, or
-//   - the provider reporting the order as a waitlist reservation, which the
-//     contract states is not billed while it waits.
+// Release evidence is limited to a provider-reported matching server that is
+// terminated or deleted, ending its recurring pay-as-you-go commitment. A
+// waitlist order is still armed to deploy automatically and stays counted.
 //
 // Everything else keeps the reservation. In particular this file must NOT treat
 // as proof of non-billability:
@@ -39,6 +35,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 
 	"github.com/devops-igor/amnezia-nexus/internal/database"
@@ -51,6 +48,8 @@ import (
 // large legacy ledger cannot turn every purchase attempt into a provider
 // hammering loop.
 const maxBudgetReconcileLookups = 10
+
+var errBudgetReconciliationUnresolved = errors.New("budget reconciliation unresolved; reservation retained")
 
 // budgetReconciliation is the outcome of one reconciliation pass.
 type budgetReconciliation struct {
@@ -67,16 +66,17 @@ type budgetReconciliation struct {
 	// by a live provider statement, and a held order could be missing from the
 	// total it is still consuming.
 	evidence map[int64]gigahostbudget.Evidence
+	// err forbids using this pass as a purchase decision when a release could
+	// not be durably established. Diagnostic unresolved rows alone are not a
+	// financial guard: Classify could still price the old evidence as obsolete.
+	err error
 }
 
-// ledgerObservation is one provider observation plus the identity it was made
-// against. The identity is kept so the release can verify the record has not
-// changed since it was observed.
+// ledgerObservation binds provider evidence to the complete pre-I/O ledger
+// snapshot, not just the nonempty provider identifiers.
 type ledgerObservation struct {
 	evidence gigahostbudget.Evidence
-	// orderID and serverID are the identity values the observation is about.
-	orderID  string
-	serverID int64
+	expect   database.ReleaseExpectation
 }
 
 // gatherLedgerEvidence observes the provider for each ledger row that still
@@ -98,7 +98,7 @@ func (h *Handlers) gatherLedgerEvidence(
 		if gigahostbudget.IsLocallyTerminal(o.Status) && o.ReleasedAt == "" {
 			continue
 		}
-		obs := ledgerObservation{orderID: o.OrderID, serverID: o.ServerID}
+		obs := ledgerObservation{expect: o}
 		entry := budgetEntries([]GigahostOrderRecord{o})[0]
 
 		// A matching inventory row describes the resource itself, and is the
@@ -184,16 +184,17 @@ func (h *Handlers) reconcileLedgerReservations(
 		// commitment. The check is passed into the release transaction, which
 		// re-reads the row under the write lock, because a check outside the
 		// transaction can be invalidated between the check and the write.
-		err := h.db.ReleaseGigahostOrderIfCurrent(ctx, order.ID,
-			database.ReleaseExpectation{OrderID: obs.orderID, ServerID: obs.serverID},
+		err := h.db.ReleaseGigahostOrderIfCurrent(ctx, order.ID, obs.expect,
 			verdict.Reason, verdict.Explanation)
 		switch {
 		case err == nil:
 			out.released = append(out.released, order.ID)
 		case errors.Is(err, database.ErrGigahostOrderAlreadyReleased):
-			// Another pass or another worker released it; nothing to do.
+			// Re-read this concurrent durable release too, not the pre-release row.
+			out.released = append(out.released, order.ID)
 		case errors.Is(err, database.ErrGigahostOrderChanged):
 			out.stale = append(out.stale, order.ID)
+			out.err = fmt.Errorf("%w: release_evidence_stale for record %d", errBudgetReconciliationUnresolved, order.ID)
 			out.unresolved = append(out.unresolved, gigahostbudget.Reservation{
 				Source:      "ledger",
 				RecordID:    order.ID,
@@ -206,6 +207,7 @@ func (h *Handlers) reconcileLedgerReservations(
 		default:
 			// A failed release must never be reported as released: the
 			// reservation stays counted and the failure is visible.
+			out.err = fmt.Errorf("%w: release_write_failed for record %d", errBudgetReconciliationUnresolved, order.ID)
 			slog.Warn("gigahost reconciliation: failed to release reservation",
 				"record_id", order.ID, "error", err)
 			out.unresolved = append(out.unresolved, gigahostbudget.Reservation{
