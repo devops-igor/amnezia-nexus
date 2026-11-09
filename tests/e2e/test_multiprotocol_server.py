@@ -507,10 +507,10 @@ def test_naiveproxy_install_modal_ui_flow(
     port_input.fill("8443")
     expect(port_input).to_have_value("8443")
 
-    # Verify decoy selection
+    # Verify decoy selection defaults to the shipped template's selected option
     decoy_select = modal.locator("#installNaiveDecoy")
     expect(decoy_select).to_be_visible()
-    expect(decoy_select).to_have_value("default")
+    expect(decoy_select).to_have_value("minecraft")
 
     captured_install: Dict[str, Any] = {}
 
@@ -554,7 +554,7 @@ def test_naiveproxy_install_modal_ui_flow(
         assert str(captured_install.get("port")) == "8443"
         naive_opts = captured_install.get("naive_options", {})
         assert naive_opts.get("domain") == "proxy.example.com"
-        assert naive_opts.get("decoy_template") == "default"
+        assert naive_opts.get("decoy_template") == "minecraft"
 
         # Complete installation via Done button
         done_div = modal.locator("#installDone")

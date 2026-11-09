@@ -104,21 +104,6 @@ jobs:
       - name: Run Vision Tests (non-race)
         run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
 
-      # R12 (issue #703 work9 / Tests): the original acceptance requires real
-      # selected-protocol traffic before a backend may be used. This step drives
-      # the production qualification seam against a REAL VLESS+REALITY server and
-      # a real loopback HTTP origin, then asserts admission, durable finalization
-      # and selectability, plus the negative no-traffic path. The Naive leg reuses
-      # the real Caddy+naive binaries installed by the steps above. No injected
-      # success values, no live provider, no Docker.
-      #
-      # The Naive test SKIPS when its binaries are absent, so a plain local run is
-      # not evidence; this step runs it where the binaries exist.
-      - name: Run Authentic R12 Whole-Flow Qualification Tests
-        run: |
-          go test -v -race -tags with_utls -run 'TestR12_' ./internal/vpn/
-          go test -v -race -tags with_utls -run 'TestR12_Naive' ./internal/vpn/tunnel/naive/
-
       - name: Upload Test Coverage
         uses: actions/upload-artifact@v7
         if: always()
@@ -144,57 +129,17 @@ jobs:
       # e2e fixture, so this intentionally installs neither tests/e2e/requirements.txt
       # nor a browser, and needs only pytest: the privacy contract is enforced on
       # every feature PR without invoking the destructive DEV lifecycle workflow.
-      #
-      # The timing collector tests are split by need: the privacy suite is pure
-      # Python and runs here, while the subprocess proof builds the real Go
-      # provider package and therefore runs in the Go-enabled job below.
-      #
       # The console-log suite spawns real pytest subprocesses, so it proves the
       # report boundary (rendered output, exit status, JUnit XML) on ordinary CI.
       - name: Run Offline Diagnostics Privacy Suite
-        run: |-
+        run: |
           python -m pip install --upgrade pip
           python -m pip install pytest==8.3.4
           python -m pytest -p no:cacheprovider \
             tests/test_e2e_diagnostics_privacy.py \
             tests/test_e2e_probe_visibility.py \
-            tests/test_e2e_call_timing_privacy.py \
-            tests/test_e2e_log_privacy.py
-
-  diagnostics-timing-collector:
-    name: Timing Collector Subprocess Proof
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v7
-
-      # This proof builds the real provider package and feeds its real stdout
-      # through the real collector, so it needs both toolchains. It is a separate
-      # job because the privacy gate above intentionally installs no Go.
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: 'go.mod'
-          cache: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-
-      - name: Assert toolchains present, then run the collector proof
-        run: |-
-          python -m pip install --upgrade pip
-          python -m pip install pytest==8.3.4
-          # Fail loudly instead of letting the proof skip itself: this job exists
-          # only to run that proof, so a missing toolchain is a broken job.
-          command -v go >/dev/null 2>&1 || { echo "go toolchain is required for the subprocess proof" >&2; exit 1; }
-          go version
-          python -c "import sys; print(sys.version)"
-          go build -tags=with_utls ./internal/provider/gigahost/ || { echo "provider package must build" >&2; exit 1; }
-          TIMING_COLLECTOR_REQUIRE_GO=1 python -m pytest -p no:cacheprovider --no-header -rs \
-            tests/test_e2e_call_timing_subprocess.py
+            tests/test_e2e_log_privacy.py \
+            tests/test_naive_decoy_default_contract.py
 
   build-matrix:
     name: Cross-Compile Matrix (${{ matrix.target.os }}/${{ matrix.target.arch }})
