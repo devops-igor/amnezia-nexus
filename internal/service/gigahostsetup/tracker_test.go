@@ -620,6 +620,158 @@ func TestTrackerUnconfirmedHostPauses(t *testing.T) {
 	}
 }
 
+// challengeTracker builds a Tracker whose host-identity challenge is the supplied
+// function, so a fresh-order pass is exercised end to end without a real host.
+func (h *harness) challengeTracker(fn func(ctx context.Context, intent models.GigahostSetupIntent) (string, error)) *Tracker {
+	t := h.tracker()
+	t.challenge = fn
+	return t
+}
+
+// TestTrackerFreshOrderRecordsTheChallengedIdentity is the F13 positive half.
+//
+// A fresh managed order has no confirmed identity and no registered server, which
+// is the state every newly approved VPS starts in. The pass must pause for
+// confirmation AND name the identity the address actually presented, because a
+// pause with an empty identity is a dead end an administrator cannot act on.
+//
+// The challenge here is only allowed to answer; it must not be able to authorize
+// anything, so the assertion is that the row is still waiting for a human.
+func TestTrackerFreshOrderRecordsTheChallengedIdentity(t *testing.T) {
+	h := newHarness(t)
+	h.seedOrder("order_fresh", 5050, "198.51.100.21")
+	h.seedManagedCredential("order_fresh")
+	h.approve(&models.GigahostSetupIntent{
+		OrderID: "order_fresh", Protocol: models.ProtocolAWG, Port: "51820",
+		CredentialMode: models.SetupCredentialManaged,
+		// No HostFingerprint: nobody has confirmed an identity yet.
+	})
+	h.provider.statusFn = readyProvider(t, &gigahost.DeployStatusResponse{
+		OrderID: "order_fresh", Status: gigahost.StatusReady, ServerID: 5050, AssignedIP: "198.51.100.21",
+	})
+
+	const presented = "SHA256:DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+	challenged := 0
+	var challengedWith models.GigahostSetupIntent
+	tracker := h.challengeTracker(func(_ context.Context, intent models.GigahostSetupIntent) (string, error) {
+		challenged++
+		challengedWith = intent
+		return presented, nil
+	})
+	h.runOnce(tracker)
+
+	got := h.load("order_fresh")
+	if got.State != models.SetupStateAwaitingHostConfirm {
+		t.Fatalf("state = %q, want %q: discovery must not approve anything", got.State, models.SetupStateAwaitingHostConfirm)
+	}
+	if got.HostCandidateFingerprint != presented {
+		t.Fatalf("candidate = %q, want the identity the host presented (%q)",
+			got.HostCandidateFingerprint, presented)
+	}
+	if got.HostFingerprint != "" {
+		t.Fatalf("a confirmed identity was written without an administrator: %q", got.HostFingerprint)
+	}
+	if challenged != 1 {
+		t.Fatalf("challenge calls = %d, want exactly 1", challenged)
+	}
+	// The challenge must observe the row's own provider identity and address, so
+	// it cannot be pointed at something other than this order.
+	if challengedWith.AssignedIP != "198.51.100.21" || challengedWith.ProviderServerID != 5050 {
+		t.Fatalf("the challenge was asked about %s/%d, want the approval's own address/identity",
+			challengedWith.AssignedIP, challengedWith.ProviderServerID)
+	}
+}
+
+// TestTrackerFailedChallengeKeepsThePauseInformative proves a challenge that
+// cannot complete does not become a silent dead end: the job still pauses for
+// confirmation and the reason is recorded, with no identity to confirm.
+func TestTrackerFailedChallengeKeepsThePauseInformative(t *testing.T) {
+	h := newHarness(t)
+	h.seedOrder("order_nochallenge", 5151, "198.51.100.22")
+	h.seedManagedCredential("order_nochallenge")
+	h.approve(&models.GigahostSetupIntent{
+		OrderID: "order_nochallenge", Protocol: models.ProtocolAWG, Port: "51820",
+		CredentialMode: models.SetupCredentialManaged,
+	})
+	h.provider.statusFn = readyProvider(t, &gigahost.DeployStatusResponse{
+		OrderID: "order_nochallenge", Status: gigahost.StatusReady, ServerID: 5151, AssignedIP: "198.51.100.22",
+	})
+
+	tracker := h.challengeTracker(func(context.Context, models.GigahostSetupIntent) (string, error) {
+		return "", errors.New("connection refused")
+	})
+	h.runOnce(tracker)
+
+	got := h.load("order_nochallenge")
+	if got.State != models.SetupStateAwaitingHostConfirm {
+		t.Fatalf("state = %q, want %q", got.State, models.SetupStateAwaitingHostConfirm)
+	}
+	if got.HostCandidateFingerprint != "" {
+		t.Fatalf("a failed challenge recorded candidate %q", got.HostCandidateFingerprint)
+	}
+	if got.LastError == "" {
+		t.Fatal("a failed challenge recorded no reason")
+	}
+}
+
+// TestTrackerChallengeClearsAStaleCandidate proves a displayed identity does not
+// outlive the host that presented it. If a later challenge cannot confirm the same
+// key, the stale candidate must be cleared rather than left as confirmable.
+func TestTrackerChallengeClearsAStaleCandidate(t *testing.T) {
+	h := newHarness(t)
+	const stale = "SHA256:EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
+	h.seedOrder("order_stale", 5252, "198.51.100.23")
+	h.seedManagedCredential("order_stale")
+	intent := h.approve(&models.GigahostSetupIntent{
+		OrderID: "order_stale", Protocol: models.ProtocolAWG, Port: "51820",
+		CredentialMode: models.SetupCredentialManaged,
+	})
+	if _, err := h.db.SQLDB().ExecContext(context.Background(),
+		`UPDATE gigahost_setup_intents SET host_candidate_fingerprint = ? WHERE order_id = ?`,
+		stale, intent.OrderID); err != nil {
+		t.Fatalf("seed candidate: %v", err)
+	}
+	h.provider.statusFn = readyProvider(t, &gigahost.DeployStatusResponse{
+		OrderID: "order_stale", Status: gigahost.StatusReady, ServerID: 5252, AssignedIP: "198.51.100.23",
+	})
+
+	tracker := h.challengeTracker(func(context.Context, models.GigahostSetupIntent) (string, error) {
+		return "", errors.New("host stopped responding")
+	})
+	h.runOnce(tracker)
+
+	got := h.load("order_stale")
+	if got.HostCandidateFingerprint != "" {
+		t.Fatalf("a stale candidate survived a failed challenge: %q", got.HostCandidateFingerprint)
+	}
+}
+
+// TestTrackerNoChallengeKeepsTheOriginalPause proves the unconfigured case is
+// unchanged: with no challenge available the pause still stands and nothing is
+// invented.
+func TestTrackerNoChallengeKeepsTheOriginalPause(t *testing.T) {
+	h := newHarness(t)
+	h.seedOrder("order_noclient", 5353, "198.51.100.24")
+	h.seedManagedCredential("order_noclient")
+	h.approve(&models.GigahostSetupIntent{
+		OrderID: "order_noclient", Protocol: models.ProtocolAWG, Port: "51820",
+		CredentialMode: models.SetupCredentialManaged,
+	})
+	h.provider.statusFn = readyProvider(t, &gigahost.DeployStatusResponse{
+		OrderID: "order_noclient", Status: gigahost.StatusReady, ServerID: 5353, AssignedIP: "198.51.100.24",
+	})
+
+	h.runOnce(h.tracker())
+
+	got := h.load("order_noclient")
+	if got.State != models.SetupStateAwaitingHostConfirm {
+		t.Fatalf("state = %q, want %q", got.State, models.SetupStateAwaitingHostConfirm)
+	}
+	if got.HostCandidateFingerprint != "" {
+		t.Fatalf("an identity was invented without a challenge: %q", got.HostCandidateFingerprint)
+	}
+}
+
 // TestTrackerChangedHostIdentityPauses is the changed-host control: when the
 // identity already bound to a registered server contradicts the approval, trust
 // pauses and the stored identity is not rewritten.

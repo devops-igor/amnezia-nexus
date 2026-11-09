@@ -71,6 +71,14 @@ type Options struct {
 	// Resolve returns the provider reader for this pass. It is called per pass,
 	// not once, so a key configured after startup is picked up without a restart.
 	Resolve func(ctx context.Context) (ProviderReader, error)
+	// ChallengeHost performs the read-only first-contact identity challenge for
+	// an approval that has no confirmed identity yet, and reports the identity
+	// the address actually presented. It must not authenticate, run a command,
+	// bind anything or authorize the job: it only answers "which key is there",
+	// so an administrator can be shown an exact value to confirm. It is nil when
+	// no such challenge can be built, in which case the intent keeps pausing for
+	// an identity the administrator supplies out of band.
+	ChallengeHost func(ctx context.Context, intent models.GigahostSetupIntent) (string, error)
 	// Now is the clock. The zero value means time.Now; tests inject a fake and
 	// advance it, which is how a >60 minute progress window is exercised without
 	// a literal wait.
@@ -84,10 +92,11 @@ type Options struct {
 
 // Tracker drives pending setup intents to a settled state.
 type Tracker struct {
-	store   Store
-	resolve func(ctx context.Context) (ProviderReader, error)
-	now     func() time.Time
-	nudgeCh chan struct{}
+	store     Store
+	resolve   func(ctx context.Context) (ProviderReader, error)
+	challenge func(ctx context.Context, intent models.GigahostSetupIntent) (string, error)
+	now       func() time.Time
+	nudgeCh   chan struct{}
 
 	interval    time.Duration
 	failureBack time.Duration
@@ -106,6 +115,7 @@ func New(store Store, opts Options) *Tracker {
 	t := &Tracker{
 		store:       store,
 		resolve:     opts.Resolve,
+		challenge:   opts.ChallengeHost,
 		now:         opts.Now,
 		nudgeCh:     make(chan struct{}, 1),
 		interval:    opts.Interval,
@@ -360,6 +370,13 @@ type handoffDecision struct {
 	state  string
 	step   string
 	detail string
+	// candidate is the host identity this pass observed on a read-only
+	// first-contact challenge. It is recorded so the administrator is shown the
+	// exact value to confirm, and it authorizes nothing: the pause it accompanies
+	// still requires an explicit confirmation. Nil means this pass made no
+	// observation and the stored value stands; a non-nil empty string means the
+	// challenge ran and produced no identity, so a stale value must not survive.
+	candidate *string
 	// readFailure marks a gate that could not obtain an answer. It keeps the
 	// intent pending with a backed-off retry rather than claiming anything.
 	readFailure bool
@@ -378,6 +395,9 @@ func (t *Tracker) settleProvisioned(
 	if decision.readFailure {
 		t.recordReadFailure(ctx, intent, decision.cause)
 		return nil
+	}
+	if decision.candidate != nil {
+		intent.HostCandidateFingerprint = *decision.candidate
 	}
 	return t.settle(ctx, intent, decision.state, decision.step, decision.detail)
 }
@@ -469,6 +489,11 @@ func (t *Tracker) decideCredential(ctx context.Context, intent *models.GigahostS
 }
 
 // decideHostTrust reports a pause when the SSH host identity is not settled.
+//
+// The unconfirmed case is the one a fresh managed order always hits, so it is
+// also the one that must stay actionable: the pause names the exact identity the
+// address presented on a read-only first-contact challenge, and confirmation of
+// that value is still required. Discovery authorizes nothing on its own.
 func (t *Tracker) decideHostTrust(ctx context.Context, intent *models.GigahostSetupIntent) handoffDecision {
 	serverID, err := t.registeredServerID(ctx, intent.ProviderServerID)
 	if err != nil {
@@ -480,9 +505,7 @@ func (t *Tracker) decideHostTrust(ctx context.Context, intent *models.GigahostSe
 		// Nothing registered yet, so the only acceptable identity is the one the
 		// administrator confirmed in this approval.
 		if confirmed == "" {
-			return handoffDecision{
-				state: models.SetupStateAwaitingHostConfirm, step: "awaiting_host_confirmation",
-			}
+			return t.discoverHostIdentity(ctx, intent)
 		}
 		return handoffDecision{state: models.SetupStateReadyForSetup, step: "ready_for_setup"}
 	}
@@ -493,9 +516,7 @@ func (t *Tracker) decideHostTrust(ctx context.Context, intent *models.GigahostSe
 	}
 	if bound == "" {
 		if confirmed == "" {
-			return handoffDecision{
-				state: models.SetupStateAwaitingHostConfirm, step: "awaiting_host_confirmation",
-			}
+			return t.discoverHostIdentity(ctx, intent)
 		}
 		return handoffDecision{state: models.SetupStateReadyForSetup, step: "ready_for_setup"}
 	}
@@ -509,6 +530,41 @@ func (t *Tracker) decideHostTrust(ctx context.Context, intent *models.GigahostSe
 		}
 	}
 	return handoffDecision{state: models.SetupStateReadyForSetup, step: "ready_for_setup"}
+}
+
+// discoverHostIdentity pauses for confirmation and, when a challenge is
+// available, records the identity the address actually presented.
+//
+// The challenge is a handshake that stops at host-key verification: it sends no
+// credential, runs no command, binds nothing and does not authorize the job. Its
+// only product is the exact value an administrator can be shown and confirm. A
+// challenge that fails leaves the same pause with the reason recorded, which is
+// strictly more informative than an empty identity.
+func (t *Tracker) discoverHostIdentity(ctx context.Context, intent *models.GigahostSetupIntent) handoffDecision {
+	decision := handoffDecision{
+		state: models.SetupStateAwaitingHostConfirm, step: "awaiting_host_confirmation",
+	}
+	if t.challenge == nil || strings.TrimSpace(intent.AssignedIP) == "" ||
+		intent.ProviderServerID <= 0 {
+		// No challenge is expressible for this row: the pause stands and the
+		// admin supplies the identity out of band, exactly as before.
+		return decision
+	}
+	callCtx, cancel := context.WithTimeout(ctx, t.callTimeout)
+	defer cancel()
+	fingerprint, err := t.challenge(callCtx, *intent)
+	if err != nil {
+		// The challenge ran and produced no identity: record that, so an identity
+		// displayed by an earlier pass cannot be confirmed after the address
+		// stopped presenting it.
+		decision.detail = "the host identity challenge did not complete: " + summarizeReadFailure(err)
+		empty := ""
+		decision.candidate = &empty
+		return decision
+	}
+	trimmed := strings.TrimSpace(fingerprint)
+	decision.candidate = &trimmed
+	return decision
 }
 
 // settle writes a terminal state with no further scheduling.

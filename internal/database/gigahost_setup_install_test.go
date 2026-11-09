@@ -174,14 +174,31 @@ func TestResumeAcceptsEveryStoppedState(t *testing.T) {
 	}
 }
 
-// TestConfirmHostBindsExactIdentity proves the confirmation stores the exact value
-// and re-arms tracking, and refuses every other state.
+// TestConfirmHostBindsExactIdentity proves the confirmation stores the exact
+// displayed value, re-arms tracking, and refuses everything else.
+//
+// "Refuses everything else" is the load-bearing half: a value the panel never
+// displayed for this job cannot become a trusted host, so an approval with no
+// observation and a value differing from the observation are both refusals.
 func TestConfirmHostBindsExactIdentity(t *testing.T) {
 	db := openSetupIntentTestDB(t)
 	ctx := context.Background()
 	const fp = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	const other = "SHA256:ERERERERERERERERERERERERERERERERERERERERERE"
 
 	seedInstallIntent(t, db, "ord_confirm", models.SetupStateAwaitingHostConfirm)
+	seedHostCandidate(t, db, "ord_confirm", fp)
+
+	// A value the panel did not display is refused and changes nothing.
+	if got, changed, err := db.ConfirmGigahostSetupHostFingerprint(ctx, "ord_confirm", other); err != nil {
+		t.Fatalf("confirm with an undisplayed identity: %v", err)
+	} else if changed {
+		t.Fatalf("an identity the panel never displayed was accepted: %+v", got)
+	}
+	if got, _, _ := db.GetGigahostSetupIntent(ctx, "ord_confirm"); got.HostFingerprint != "" {
+		t.Fatalf("a refused confirmation stored %q", got.HostFingerprint)
+	}
+
 	got, changed, err := db.ConfirmGigahostSetupHostFingerprint(ctx, "ord_confirm", fp)
 	if err != nil || !changed {
 		t.Fatalf("confirm: changed=%v err=%v", changed, err)
@@ -189,12 +206,16 @@ func TestConfirmHostBindsExactIdentity(t *testing.T) {
 	if got.HostFingerprint != fp {
 		t.Fatalf("stored identity = %q, want %q", got.HostFingerprint, fp)
 	}
+	if got.HostCandidateFingerprint != "" {
+		t.Fatalf("the confirmed candidate was left on the row: %q", got.HostCandidateFingerprint)
+	}
 	if got.State != models.SetupStatePending {
 		t.Fatalf("state = %q, want %q", got.State, models.SetupStatePending)
 	}
 
 	// A completed job is not a confirmation target.
 	seedInstallIntent(t, db, "ord_confirm_done", models.SetupStateReady)
+	seedHostCandidate(t, db, "ord_confirm_done", fp)
 	done, changed, err := db.ConfirmGigahostSetupHostFingerprint(ctx, "ord_confirm_done", fp)
 	if err != nil {
 		t.Fatalf("confirm on completed: %v", err)
@@ -209,6 +230,118 @@ func TestConfirmHostBindsExactIdentity(t *testing.T) {
 	// An empty identity is refused outright.
 	if _, _, err := db.ConfirmGigahostSetupHostFingerprint(ctx, "ord_confirm", "  "); err == nil {
 		t.Fatal("an empty host identity was accepted")
+	}
+}
+
+// TestConfirmHostPreservesAnUnknownInstallJournal proves the uncertainty boundary
+// survives a trust decision.
+//
+// An interrupted install has remote effects nobody can prove. Confirming the same
+// correct identity is a trust decision, and it must not become an installation
+// decision: the journal is kept, a new attempt generation is issued so the
+// existing verify-not-replay path owns the row, and the row returns to the
+// installing state rather than to the handoff that would install again.
+func TestConfirmHostPreservesAnUnknownInstallJournal(t *testing.T) {
+	db := openSetupIntentTestDB(t)
+	ctx := context.Background()
+	const fp = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	const orderID = "ord_unknown_install"
+
+	seedInstallIntent(t, db, orderID, models.SetupStateInstallPaused)
+	seedHostCandidate(t, db, orderID, fp)
+	// The persisted shape of an install that stopped inside the protocol phase.
+	if _, err := db.SQLDB().ExecContext(ctx,
+		`UPDATE gigahost_setup_intents
+		    SET install_generation = 1, install_phase = ?, install_phase_done = ?
+		  WHERE order_id = ?`,
+		models.SetupPhaseInstalled, models.SetupPhaseRegistered, orderID); err != nil {
+		t.Fatalf("seed interrupted install: %v", err)
+	}
+
+	got, changed, err := db.ConfirmGigahostSetupHostFingerprint(ctx, orderID, fp)
+	if err != nil || !changed {
+		t.Fatalf("confirm: changed=%v err=%v", changed, err)
+	}
+	if got.InstallPhase != models.SetupPhaseInstalled || got.InstallPhaseDone != models.SetupPhaseRegistered {
+		t.Fatalf("the install journal was discarded: phase=%q done=%q",
+			got.InstallPhase, got.InstallPhaseDone)
+	}
+	if got.InstallGeneration != 2 {
+		t.Fatalf("generation = %d, want a new attempt generation (2)", got.InstallGeneration)
+	}
+	if got.State != models.SetupStateInstalling {
+		t.Fatalf("state = %q, want %q so the verify path owns the row", got.State, models.SetupStateInstalling)
+	}
+
+	// The confirmed row is in the installing state with a new generation and no
+	// live owner, which is exactly the leftover-claim shape the takeover branch
+	// exists for. Taking it over must keep the journal the new attempt verifies.
+	taken, ok, err := db.TakeOverGigahostSetupInstall(ctx, orderID, got.InstallGeneration)
+	if err != nil || !ok {
+		t.Fatalf("takeover after confirmation: ok=%v err=%v", ok, err)
+	}
+	if taken.InstallPhase != models.SetupPhaseInstalled || taken.InstallPhaseDone != models.SetupPhaseRegistered {
+		t.Fatalf("the takeover erased the journal: phase=%q done=%q",
+			taken.InstallPhase, taken.InstallPhaseDone)
+	}
+	if taken.InstallGeneration != 3 {
+		t.Fatalf("generation = %d, want 3 after the takeover", taken.InstallGeneration)
+	}
+}
+
+// TestClaimKeepsJournal proves the claim is journal-safe.
+//
+// Two cases, because a claim of a handoff row must not invent a journal while a
+// claim of a row that carries history must not destroy it. The second case is the
+// consumer half of the replay window: the plan reads exactly these columns to
+// decide "verify" instead of "run", so a claim that cleared them silently turned
+// an unknown remote effect back into an authorized installation.
+func TestClaimKeepsJournal(t *testing.T) {
+	db := openSetupIntentTestDB(t)
+	ctx := context.Background()
+
+	seedInstallIntent(t, db, "ord_handoff_clean", models.SetupStateReadyForSetup)
+	claimed, ok, err := db.ClaimGigahostSetupInstall(ctx, "ord_handoff_clean")
+	if err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	if claimed.InstallPhase != "" || claimed.InstallPhaseDone != "" {
+		t.Fatalf("a fresh claim invented a journal: phase=%q done=%q",
+			claimed.InstallPhase, claimed.InstallPhaseDone)
+	}
+
+	// A row that reaches the handoff carrying history: the claim is the same
+	// transition, and it must leave the journal for the plan to read.
+	seedInstallIntent(t, db, "ord_handoff_history", models.SetupStateReadyForSetup)
+	if _, err := db.SQLDB().ExecContext(ctx,
+		`UPDATE gigahost_setup_intents
+		    SET install_generation = 2, install_phase = ?, install_phase_done = ?
+		  WHERE order_id = ?`,
+		models.SetupPhaseInstalled, models.SetupPhaseRegistered, "ord_handoff_history"); err != nil {
+		t.Fatalf("seed history: %v", err)
+	}
+	historical, ok, err := db.ClaimGigahostSetupInstall(ctx, "ord_handoff_history")
+	if err != nil || !ok {
+		t.Fatalf("claim with history: ok=%v err=%v", ok, err)
+	}
+	if historical.InstallPhase != models.SetupPhaseInstalled ||
+		historical.InstallPhaseDone != models.SetupPhaseRegistered {
+		t.Fatalf("the claim erased the journal: phase=%q done=%q",
+			historical.InstallPhase, historical.InstallPhaseDone)
+	}
+	if historical.InstallGeneration != 3 {
+		t.Fatalf("generation = %d, want 3 after the claim", historical.InstallGeneration)
+	}
+}
+
+// seedHostCandidate records the identity the panel's read-only challenge observed
+// for an approval, which is what makes that exact value confirmable.
+func seedHostCandidate(t *testing.T, db *DB, orderID, fingerprint string) {
+	t.Helper()
+	if _, err := db.SQLDB().ExecContext(context.Background(),
+		`UPDATE gigahost_setup_intents SET host_candidate_fingerprint = ? WHERE order_id = ?`,
+		fingerprint, orderID); err != nil {
+		t.Fatalf("seed host candidate for %s: %v", orderID, err)
 	}
 }
 

@@ -116,6 +116,12 @@ type GigahostSetupIntent struct {
 	// registered server's bound identity contradicts it.
 	HostFingerprint string `json:"host_fingerprint,omitempty"`
 	HostMismatch    bool   `json:"host_mismatch,omitempty"`
+	// HostCandidateFingerprint is the identity the panel observed on its own
+	// read-only first-contact challenge, and nothing more. It exists so an
+	// administrator can be shown exactly which identity the address presented;
+	// it authorizes nothing, and confirmation is accepted only for this exact
+	// value. It is cleared when a confirmation records HostFingerprint.
+	HostCandidateFingerprint string `json:"host_candidate_fingerprint,omitempty"`
 
 	// ReadFailures counts consecutive provider read failures and resets on the
 	// next successful read. Attempts counts every scheduled provider read.

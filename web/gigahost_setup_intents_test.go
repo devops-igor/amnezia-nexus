@@ -22,17 +22,18 @@ package web
 //	pending                     revoke only
 //	install_paused              resume only
 //	awaiting_credentials        resume only, plus the credential hint
-//	awaiting_host_confirmation  confirm-host only, and ONLY when the row records the
-//	                            exact fingerprint it is waiting on
+//	awaiting_host_confirmation  confirm-host only, and ONLY when the panel displayed
+//	                            an identity for this job - the first-contact candidate
+//	                            it observed, or the identity the approval carries
 //	installing / ready / failed / canceled / ready_for_setup
 //	                            no action: a running or finished job must not offer a
 //	                            button that would issue a second effect
 //
-// The negative controls are the important half: a trust pause with no recorded
-// fingerprint must offer NO confirmation (otherwise the UI would authorize a host
-// identity nobody displayed), a terminal state must offer nothing, a refused
-// response must not be reported as success, and a second click while a request is
-// in flight must not issue a second request.
+// The negative controls are the important half: a trust pause with no displayed
+// identity must offer NO confirmation (otherwise the UI would authorize a host
+// nobody displayed), a terminal state must offer nothing, a refused response must
+// not be reported as success, and a second click while a request is in flight must
+// not issue a second request.
 
 import (
 	"encoding/json"
@@ -124,10 +125,11 @@ async function render(intents) {
  assert.match(root.textContent, /setup_intents_credentials_hint/);
  assert.equal(root.querySelector('input'), null);
 
- // 5. A trust pause with a recorded identity asks for exactly that identity, and
- //    the confirm action posts that exact value for that exact order.
+ // 5. A trust pause asks for exactly the identity the panel displayed, and the
+ //    confirm action posts that exact value for that exact order.
  root = await render([{order_id:'ord-host', protocol:'vless', state:'awaiting_host_confirmation', host_fingerprint:FP}]);
  assert.deepEqual(labels(root), ['setup_intents_confirm_host']);
+ assert.ok(root.textContent.indexOf(FP) !== -1, 'the identity must be readable in the row');
  calls.length = 0;
  await w.confirmSetupHost('ord-host', FP);
  assert.equal(byMethod('POST').length, 1);
@@ -135,7 +137,20 @@ async function render(intents) {
  assert.deepEqual(byMethod('POST')[0].body, {fingerprint: FP});
  assert.ok(toasts.some(t => t.text === 'setup_intents_host_confirmed'));
 
- // 6. NEGATIVE CONTROL: a trust pause with NO recorded identity offers no
+ // 5b. FRESH-ORDER CONTROL: the panel's own first-contact challenge is what a
+ //     newly approved job carries, and it is actionable without any approval-time
+ //     fingerprint. The displayed candidate is what the button confirms.
+ const CANDIDATE = 'SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+ root = await render([{order_id:'ord-host-fresh', protocol:'vless', state:'awaiting_host_confirmation',
+   host_candidate_fingerprint: CANDIDATE}]);
+ assert.deepEqual(labels(root), ['setup_intents_confirm_host'], 'a fresh trust pause must be actionable');
+ assert.ok(root.textContent.indexOf(CANDIDATE) !== -1, 'the observed candidate must be displayed');
+ calls.length = 0;
+ await w.confirmSetupHost('ord-host-fresh', CANDIDATE);
+ assert.equal(byMethod('POST').length, 1);
+ assert.deepEqual(byMethod('POST')[0].body, {fingerprint: CANDIDATE});
+
+ // 6. NEGATIVE CONTROL: a trust pause with NO displayed identity offers no
  //    confirmation at all. Confirming here would authorize a host the panel never
  //    displayed, so the button must not exist and no request may be made.
  root = await render([{order_id:'ord-host-missing', protocol:'vless', state:'awaiting_host_confirmation'}]);

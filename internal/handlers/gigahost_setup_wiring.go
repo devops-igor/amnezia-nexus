@@ -18,8 +18,12 @@ package handlers
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 	"github.com/devops-igor/amnezia-nexus/internal/service/gigahostsetup"
 )
@@ -38,10 +42,67 @@ func (h *Handlers) NewGigahostSetupTracker() *gigahostsetup.Tracker {
 		return nil
 	}
 	return gigahostsetup.New(h.db, gigahostsetup.Options{
-		Resolve:     h.ResolveGigahostSetupProvider,
-		Interval:    gigahostsetup.DefaultInterval,
-		CallTimeout: 30 * time.Second,
+		Resolve:       h.ResolveGigahostSetupProvider,
+		ChallengeHost: h.challengeGigahostSetupHostIdentity,
+		Interval:      gigahostsetup.DefaultInterval,
+		CallTimeout:   30 * time.Second,
 	})
+}
+
+// challengeGigahostSetupHostIdentity reports the SSH host identity the address
+// presented, using the panel's existing trust machinery and nothing else.
+//
+// It calls the same verification the install path calls, with the same client
+// configuration, credentials and strict host-key callback, and it stops at host
+// key verification: host key checks run before authentication, so a first contact
+// sends no credential and runs no command. The answer is carried by the existing
+// typed challenge, which names the exact key the host presented. A host whose key
+// contradicts a bound identity still raises the existing mismatch error.
+//
+// What comes back is a candidate for an administrator to confirm. It confers no
+// authority: the challenge binds no key, records no approval and issues no
+// install, and confirmation of the same value is still required.
+func (h *Handlers) challengeGigahostSetupHostIdentity(
+	ctx context.Context, intent models.GigahostSetupIntent,
+) (string, error) {
+	req, err := h.buildChallengeRequest(ctx, intent)
+	if err != nil {
+		return "", err
+	}
+	fingerprint, err := h.verifyDeploySSHAccess(ctx, req.AssignedIP, req)
+	if err == nil {
+		// A registered server with a bound identity: the presented key already
+		// matches it, and the verification returned that same value.
+		return fingerprint, nil
+	}
+	var required *ssh.ErrFingerprintRequired
+	if errors.As(err, &required) && validateFingerprintFormat(required.Fingerprint) == nil {
+		// First contact: the typed challenge is the answer.
+		return required.Fingerprint, nil
+	}
+	return "", err
+}
+
+// buildChallengeRequest assembles the credential the challenge needs. It reuses
+// the install path's own request builder so the challenge observes the host with
+// the same identity and options the install would use.
+func (h *Handlers) buildChallengeRequest(
+	ctx context.Context, intent models.GigahostSetupIntent,
+) (GigahostDeployRequest, error) {
+	req := GigahostDeployRequest{
+		OrderID:          intent.OrderID,
+		ProviderServerID: intent.ProviderServerID,
+		AssignedIP:       strings.TrimSpace(intent.AssignedIP),
+		Protocol:         intent.EffectiveProtocol(),
+		Port:             intent.Port,
+	}
+	if req.AssignedIP == "" || req.ProviderServerID <= 0 {
+		return req, errors.New("the approval has no provider address or server identity to challenge")
+	}
+	if intent.CredentialMode == models.SetupCredentialManaged {
+		req.UseOrderCredential = true
+	}
+	return h.applyStoredOrderCredential(ctx, req)
 }
 
 // ResolveGigahostSetupProvider returns a read-only provider reader built from the

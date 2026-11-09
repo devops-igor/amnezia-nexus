@@ -101,6 +101,21 @@ function setupIntentRow(i) {
         left.appendChild(errSpan);
     }
 
+    /* A trust pause shows the identity it is asking about. An administrator
+     * confirms a value they can read and compare, so it is part of the record
+     * rather than hidden behind the button. */
+    const displayedHost = i.state === 'awaiting_host_confirmation'
+        ? setupIntentDisplayedIdentity(i)
+        : '';
+    if (displayedHost) {
+        const hostSpan = document.createElement('div');
+        hostSpan.style.fontSize = '0.7rem';
+        hostSpan.style.fontFamily = 'monospace';
+        hostSpan.style.color = 'var(--text-secondary)';
+        hostSpan.textContent = displayedHost;
+        left.appendChild(hostSpan);
+    }
+
     const right = document.createElement('div');
     right.style.display = 'flex';
     right.style.alignItems = 'center';
@@ -126,6 +141,21 @@ function setupIntentBadgeClass(state) {
     return 'badge-warn';
 }
 
+/* setupIntentDisplayedIdentity returns the host identity this job actually put in
+ * front of an administrator, or '' when there is none.
+ *
+ * The panel's own read-only challenge records a candidate first; a job whose
+ * approval already carried a confirmed identity reports that instead. Both are
+ * values the panel displayed, so both are confirmable. An empty result means no
+ * identity was ever shown, and the confirmation action must not exist: the
+ * browser may not invent one. */
+function setupIntentDisplayedIdentity(i) {
+    if (!i) return '';
+    const candidate = (i.host_candidate_fingerprint || '').trim();
+    if (candidate) return candidate;
+    return (i.host_fingerprint || '').trim();
+}
+
 /* setupIntentActions returns the buttons a state allows.
  *
  * Only a pending approval can be revoked: a job past the install handoff is
@@ -133,7 +163,7 @@ function setupIntentBadgeClass(state) {
  * follow. Only a paused job can be resumed, because a resume is the
  * administrator's statement that an unproven outcome may be retried. Only a
  * trust pause asks for an identity confirmation, and it carries the exact
- * fingerprint the job is waiting on. */
+ * fingerprint the panel displayed for this job - never a value from this page. */
 function setupIntentActions(i) {
     const buttons = [];
     const add = (label, kind, handler) => {
@@ -150,11 +180,12 @@ function setupIntentActions(i) {
     if (i.state === 'pending') {
         add(_('setup_intents_cancel'), 'secondary', () => cancelSetupIntent(i.order_id));
     }
+    const displayed = setupIntentDisplayedIdentity(i);
     if (i.state === 'install_paused' || i.state === 'awaiting_credentials') {
         add(_('setup_intents_resume'), 'primary', () => resumeSetupIntent(i.order_id));
     }
-    if (i.state === 'awaiting_host_confirmation' && i.host_fingerprint) {
-        add(_('setup_intents_confirm_host'), 'primary', () => confirmSetupHost(i.order_id, i.host_fingerprint));
+    if (i.state === 'awaiting_host_confirmation' && displayed) {
+        add(_('setup_intents_confirm_host'), 'primary', () => confirmSetupHost(i.order_id, displayed));
     }
     if (i.state === 'awaiting_credentials') {
         const hint = document.createElement('span');

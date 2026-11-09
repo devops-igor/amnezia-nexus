@@ -360,10 +360,14 @@ func (h *Handlers) GigahostSetupResumeHandler(w http.ResponseWriter, r *http.Req
 // GigahostSetupConfirmHostHandler handles
 // POST /api/admin/hosting/gigahost/orders/{order_id}/setup-host-confirmation.
 //
-// The confirmation is bound to the exact fingerprint the administrator saw, so a
-// later connection presenting a different identity is a contradiction rather than
-// an accepted host. The endpoint refuses a malformed fingerprint here as well,
-// because a stored malformed value would only fail much later, at the handshake.
+// The confirmation is bound to the exact identity the panel displayed for this
+// job, so a later connection presenting a different key is a contradiction rather
+// than an accepted host, and a client cannot supply a host the panel never showed.
+// The endpoint refuses a malformed fingerprint here as well, because a stored
+// malformed value would only fail much later, at the handshake.
+//
+// A refused confirmation answers 409 with the stored row, so the caller explains
+// the real state instead of inferring one.
 func (h *Handlers) GigahostSetupConfirmHostHandler(w http.ResponseWriter, r *http.Request) {
 	sess := middleware.GetSession(r.Context())
 	if sess == nil || sess.Role != models.RoleAdmin {

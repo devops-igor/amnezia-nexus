@@ -256,6 +256,11 @@ func (e *installEnv) approve(orderID, protocol, port, fingerprint string) *model
 }
 
 // tracker builds a tracker over the environment's own provider and clock.
+//
+// The host-identity challenge is the production one, wired exactly as the
+// application wires it, so a pass over a fresh approval exercises the real
+// challenge path (`h.challengeGigahostSetupHostIdentity`) rather than a stub. The
+// install fixture's dialer hook is what that challenge dials.
 func (e *installEnv) tracker(now func() time.Time) *gigahostsetup.Tracker {
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
@@ -264,12 +269,13 @@ func (e *installEnv) tracker(now func() time.Time) *gigahostsetup.Tracker {
 		Resolve: func(context.Context) (gigahostsetup.ProviderReader, error) {
 			return readOnlyGigahostProvider{client: e.h.gigahostClient}, nil
 		},
-		Now:         now,
-		Interval:    time.Minute,
-		FailureBack: time.Second,
-		MaxBackoff:  time.Minute,
-		Batch:       10,
-		CallTimeout: 5 * time.Second,
+		ChallengeHost: e.h.challengeGigahostSetupHostIdentity,
+		Now:           now,
+		Interval:      time.Minute,
+		FailureBack:   time.Second,
+		MaxBackoff:    time.Minute,
+		Batch:         10,
+		CallTimeout:   5 * time.Second,
 	})
 }
 

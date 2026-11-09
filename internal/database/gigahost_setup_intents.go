@@ -46,6 +46,7 @@ var gigahostSetupIntentsSchema = `CREATE TABLE IF NOT EXISTS gigahost_setup_inte
 	last_error TEXT NOT NULL DEFAULT '',
 	host_fingerprint TEXT NOT NULL DEFAULT '',
 	host_mismatch INTEGER NOT NULL DEFAULT 0,
+	host_candidate_fingerprint TEXT NOT NULL DEFAULT '',
 	read_failures INTEGER NOT NULL DEFAULT 0,
 	attempts INTEGER NOT NULL DEFAULT 0,
 	install_generation INTEGER NOT NULL DEFAULT 0,
@@ -69,6 +70,7 @@ var gigahostSetupIntentColumnUpgrades = []struct {
 	name string
 	ddl  string
 }{
+	{"host_candidate_fingerprint", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_candidate_fingerprint TEXT NOT NULL DEFAULT ''`},
 	{"install_generation", `ALTER TABLE gigahost_setup_intents ADD COLUMN install_generation INTEGER NOT NULL DEFAULT 0`},
 	{"install_phase", `ALTER TABLE gigahost_setup_intents ADD COLUMN install_phase TEXT NOT NULL DEFAULT ''`},
 	{"install_phase_done", `ALTER TABLE gigahost_setup_intents ADD COLUMN install_phase_done TEXT NOT NULL DEFAULT ''`},
@@ -132,7 +134,7 @@ var ErrSetupIntentExists = errors.New("a setup intent already exists for this or
 const setupIntentColumns = `id, order_id, provider_server_id, assigned_ip,
 	protocol, port, tls_domain, engine_profile, credential_mode,
 	state, provider_status, step, last_error,
-	host_fingerprint, host_mismatch, read_failures, attempts,
+	host_fingerprint, host_mismatch, host_candidate_fingerprint, read_failures, attempts,
 	install_generation, install_phase, install_phase_done, install_attempts,
 	nexus_server_id,
 	next_attempt_at, last_checked_at, approved_by, revoked_at,
@@ -149,7 +151,7 @@ func scanSetupIntent(scanner interface {
 		&i.ID, &i.OrderID, &i.ProviderServerID, &i.AssignedIP,
 		&i.Protocol, &i.Port, &i.TLSDomain, &i.EngineProfile, &i.CredentialMode,
 		&i.State, &i.ProviderStatus, &i.Step, &i.LastError,
-		&i.HostFingerprint, &hostMismatch, &i.ReadFailures, &i.Attempts,
+		&i.HostFingerprint, &hostMismatch, &i.HostCandidateFingerprint, &i.ReadFailures, &i.Attempts,
 		&i.InstallGeneration, &i.InstallPhase, &i.InstallPhaseDone, &i.InstallAttempts,
 		&i.NexusServerID,
 		&nextAttempt, &lastChecked, &i.ApprovedBy, &revokedAt,
@@ -209,14 +211,15 @@ func (d *DB) CreateGigahostSetupIntent(ctx context.Context, intent *models.Gigah
 	intent.UpdatedAt = now
 
 	q := `INSERT INTO gigahost_setup_intents (` + setupIntentColumns + `)
-	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 	res, err := d.sqlDB.ExecContext(ctx, q,
 		nil, intent.OrderID, intent.ProviderServerID, intent.AssignedIP,
 		intent.Protocol, intent.Port, intent.TLSDomain, intent.EngineProfile, intent.CredentialMode,
 		intent.State, intent.ProviderStatus, intent.Step, intent.LastError,
-		intent.HostFingerprint, boolToInt(intent.HostMismatch), intent.ReadFailures, intent.Attempts,
+		intent.HostFingerprint, boolToInt(intent.HostMismatch), intent.HostCandidateFingerprint,
+		intent.ReadFailures, intent.Attempts,
 		intent.InstallGeneration, intent.InstallPhase, intent.InstallPhaseDone, intent.InstallAttempts,
 		intent.NexusServerID,
 		formatSetupTimestamp(intent.NextAttemptAt), formatSetupTimestamp(intent.LastCheckedAt),
@@ -415,6 +418,7 @@ func buildTransitionStatement(
 	          last_error = ?,
 	          host_fingerprint = CASE WHEN ? != '' THEN ? ELSE host_fingerprint END,
 	          host_mismatch = ?,
+	          host_candidate_fingerprint = ?,
 	          read_failures = ?,
 	          attempts = ?,
 	          install_generation = ?,
@@ -438,6 +442,7 @@ func buildTransitionStatement(
 		intent.LastError,
 		intent.HostFingerprint, intent.HostFingerprint,
 		boolToInt(intent.HostMismatch),
+		intent.HostCandidateFingerprint,
 		intent.ReadFailures,
 		intent.Attempts,
 		intent.InstallGeneration,
@@ -566,6 +571,13 @@ func (d *DB) ListDueGigahostSetupInstalls(ctx context.Context, now time.Time, li
 // process read earlier. The generation is incremented in the same statement, so
 // the returned row carries the fencing token the attempt must present for every
 // later journal write.
+//
+// The claim deliberately does NOT clear the phase journal. A row can reach this
+// claim carrying history - a trust confirmation over an interrupted install
+// returns it here - and the plan needs that history to verify an unknown remote
+// effect instead of re-running it. Clearing it here was the second half of the
+// replay window: the in-flight phase vanished, every phase looked unfinished, and
+// the plan selected the install action again.
 func (d *DB) ClaimGigahostSetupInstall(ctx context.Context, orderID string) (*models.GigahostSetupIntent, bool, error) {
 	if d == nil || d.sqlDB == nil || strings.TrimSpace(orderID) == "" {
 		return nil, false, nil
@@ -578,7 +590,6 @@ func (d *DB) ClaimGigahostSetupInstall(ctx context.Context, orderID string) (*mo
 	      SET state = ?,
 	          install_generation = install_generation + 1,
 	          install_attempts = install_attempts + 1,
-	          install_phase = '',
 	          step = 'install_claimed',
 	          last_error = '',
 	          next_attempt_at = '',
@@ -793,47 +804,115 @@ var resumableSetupStates = []string{
 }
 
 // ConfirmGigahostSetupHostFingerprint records the identity the administrator
-// confirmed for an order and re-arms provider tracking.
+// confirmed for an order.
 //
-// It is a compare-and-set from the trust-pause states back to pending, so
-// confirming cannot resurrect a revoked or completed job, and the stored binding
-// of any registered server is left untouched: the tracker re-evaluates it and
-// pauses again if the confirmation contradicts it. changed=false means the row
-// was not in a state this confirmation applies to; the returned row is then the
-// stored truth, so the caller explains the real state instead of claiming a
-// confirmation happened. A nil row means no approval exists for the order.
+// Two guarantees are enforced here rather than in the caller, because the HTTP
+// endpoint and any future caller must obey the same rules:
+//
+//  1. The confirmed value must be an identity this job actually displayed: the
+//     candidate observed on the panel's own first-contact challenge, or the
+//     identity already recorded for this approval. Nothing else is confirmable,
+//     so an arbitrary value from a client can never become a trusted host.
+//  2. An interrupted install keeps its journal. When the row already carries
+//     install history the confirmation issues a new attempt generation in the
+//     same statement, so the job goes back to the installing state and the
+//     existing verify-not-replay path owns it. A trust decision therefore can
+//     neither erase an unknown remote effect nor authorize a second install.
+//
+// A row with no install history is a genuine pre-install trust pause: it returns
+// to pending so the tracker re-reads the provider and reaches the handoff.
+//
+// changed=false means the row was not in a state this confirmation applies to,
+// or the value was not one this job displayed; the returned row is then the stored
+// truth, so the caller explains the real state instead of claiming a confirmation
+// happened. A nil row means no approval exists for the order.
 func (d *DB) ConfirmGigahostSetupHostFingerprint(
 	ctx context.Context, orderID, fingerprint string,
 ) (*models.GigahostSetupIntent, bool, error) {
 	if d == nil || d.sqlDB == nil || strings.TrimSpace(orderID) == "" {
 		return nil, false, nil
 	}
-	if strings.TrimSpace(fingerprint) == "" {
+	fingerprint = strings.TrimSpace(fingerprint)
+	if fingerprint == "" {
 		return nil, false, errors.New("a confirmed host fingerprint is required")
 	}
+	current, applies, err := d.confirmableHostIntent(ctx, orderID, fingerprint)
+	if err != nil || current == nil {
+		return nil, false, err
+	}
+	if !applies {
+		return current, false, nil
+	}
+	return d.applyHostConfirmation(ctx, orderID, fingerprint, hasInstallHistory(current))
+}
+
+// confirmableHostIntent loads the row and decides whether this exact confirmation
+// applies to it.
+//
+// Two independent refusals live here because both are "this confirmation is not
+// about this job": the row is not in a state that stopped for identity, or the
+// value is not an identity the panel displayed for it. A not-found row returns
+// (nil, false, nil) so the caller can answer 404 rather than inventing a refusal.
+func (d *DB) confirmableHostIntent(
+	ctx context.Context, orderID, fingerprint string,
+) (*models.GigahostSetupIntent, bool, error) {
 	if err := d.EnsureGigahostSetupIntentsSchema(ctx); err != nil {
 		return nil, false, err
 	}
-	return d.applyHostConfirmation(ctx, orderID, fingerprint)
+	current, found, err := d.GetGigahostSetupIntent(ctx, orderID)
+	if err != nil || !found {
+		return nil, false, err
+	}
+	if !isConfirmableSetupState(current.State) || !isDisplayedHostIdentity(current, fingerprint) {
+		return current, false, nil
+	}
+	return current, true, nil
 }
 
-// applyHostConfirmation writes the confirmed identity over the states a
-// confirmation applies to, and reports whether this call was the one that changed
-// the row together with the stored row afterwards.
+// isDisplayedHostIdentity reports whether this exact value is an identity the
+// panel displayed for this approval: the first-contact candidate, or the identity
+// the approval already carries. Nothing else is confirmable.
+func isDisplayedHostIdentity(intent *models.GigahostSetupIntent, fingerprint string) bool {
+	if intent == nil {
+		return false
+	}
+	if observed := strings.TrimSpace(intent.HostCandidateFingerprint); observed != "" && observed == fingerprint {
+		return true
+	}
+	return strings.TrimSpace(intent.HostFingerprint) == fingerprint
+}
+
+// applyHostConfirmation writes the confirmed identity and decides what the job
+// continues as, without ever discarding install history.
+//
+// The journal columns are set explicitly: `withHistory` returns the row to the
+// installing state with a fresh generation and the journal kept, so a resumed
+// attempt verifies the interrupted phase instead of replaying it. Without
+// history the row returns to pending and the tracker re-reads the provider.
 func (d *DB) applyHostConfirmation(
-	ctx context.Context, orderID, fingerprint string,
+	ctx context.Context, orderID, fingerprint string, withHistory bool,
 ) (*models.GigahostSetupIntent, bool, error) {
 	now := time.Now().UTC()
+	state := models.SetupStatePending
+	step := "host_confirmed"
+	if withHistory {
+		state = models.SetupStateInstalling
+		step = "install_resumed"
+	}
 	q := `UPDATE gigahost_setup_intents
 	      SET host_fingerprint = ?,
 	          host_mismatch = 0,
+	          host_candidate_fingerprint = '',
 	          state = ?,
-	          step = 'host_confirmed',
+	          step = ?,
 	          last_error = '',
+	          install_generation = CASE WHEN ? THEN install_generation + 1 ELSE install_generation END,
+	          install_attempts = CASE WHEN ? THEN install_attempts + 1 ELSE install_attempts END,
 	          next_attempt_at = '',
 	          updated_at = ?
 	      WHERE order_id = ? AND state IN (?, ?)`
-	res, err := d.execWrite(ctx, q, fingerprint, models.SetupStatePending,
+	res, err := d.execWrite(ctx, q, fingerprint, state, step,
+		withHistory, withHistory,
 		formatSetupTimestamp(now), orderID,
 		models.SetupStateAwaitingHostConfirm, models.SetupStateInstallPaused)
 	if err != nil {
@@ -848,6 +927,28 @@ func (d *DB) applyHostConfirmation(
 		return nil, false, err
 	}
 	return current, affected > 0, nil
+}
+
+// hasInstallHistory reports whether any install attempt ever touched this row.
+//
+// It is the boundary between a pre-install trust pause and a job whose remote
+// effects are partly unknown. Either evidence is sufficient: a generation means
+// an attempt was claimed, and a journal phase names a step that was in flight.
+func hasInstallHistory(intent *models.GigahostSetupIntent) bool {
+	if intent == nil {
+		return false
+	}
+	return intent.InstallGeneration > 0 ||
+		strings.TrimSpace(intent.InstallPhase) != "" ||
+		strings.TrimSpace(intent.InstallPhaseDone) != ""
+}
+
+// isConfirmableSetupState reports whether a host confirmation may act on this
+// state. Only a job that stopped for identity, or one whose install paused, is
+// waiting for that decision; a provider poll, a running attempt, a completed job
+// and a revocation are all absent.
+func isConfirmableSetupState(state string) bool {
+	return state == models.SetupStateAwaitingHostConfirm || state == models.SetupStateInstallPaused
 }
 
 // execWrite runs a statement under the database write lock, so every statement
