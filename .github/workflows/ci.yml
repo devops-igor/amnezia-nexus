@@ -138,7 +138,8 @@ jobs:
           python -m pytest -p no:cacheprovider \
             tests/test_e2e_diagnostics_privacy.py \
             tests/test_e2e_probe_visibility.py \
-            tests/test_e2e_log_privacy.py
+            tests/test_e2e_log_privacy.py \
+            tests/test_naive_decoy_default_contract.py
 
   build-matrix:
     name: Cross-Compile Matrix (${{ matrix.target.os }}/${{ matrix.target.arch }})
