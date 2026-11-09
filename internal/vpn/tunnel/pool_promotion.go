@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
@@ -24,6 +25,12 @@ func (p *Pool) promotionTargetLocked(serverID, expectedTunnelID, expectedVersion
 	}
 	return tunnel, nil
 }
+
+// ErrSetupApprovalRevoked reports that the setup approval owning a backend was
+// revoked before the backend could be admitted. It is re-exported here so the
+// tunnel layer and its callers can distinguish "the authority was withdrawn" from
+// "the tunnel state moved".
+var ErrSetupApprovalRevoked = database.ErrSetupApprovalRevoked
 
 // PromoteTunnelWithEnrollmentRelease commits a qualified backend's runtime health
 // and releases its durable enrollment quarantine in one transaction.

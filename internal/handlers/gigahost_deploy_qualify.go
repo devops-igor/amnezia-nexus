@@ -45,13 +45,34 @@ func (h *Handlers) qualifyProxyBackendTraffic(ctx context.Context, server *model
 	if err != nil {
 		// Keep the durable quarantine: an unproven payload path must not be
 		// admitted, and reporting ready here was the defect.
-		_ = h.vpnSvc.DisableBackend(ctx, server.ID)
+		h.quarantineEnrollment(ctx, server.ID)
 		return fmt.Errorf("%s application traffic qualification failed: %w", protocol, err)
 	}
 
-	if err := h.vpnSvc.PromoteQualifiedTunnel(ctx, server.ID, latencyMS); err != nil {
-		_ = h.vpnSvc.DisableBackend(ctx, server.ID)
+	if err := h.vpnSvc.PromoteQualifiedTunnel(probeCtx, server.ID, latencyMS); err != nil {
+		// A revoked approval is one of the two reasons promotion is refused, and
+		// the backend must not be left enabled behind a canceled job either way.
+		h.quarantineEnrollment(ctx, server.ID)
 		return fmt.Errorf("failed to commit healthy status after %s traffic qualification: %w", protocol, err)
 	}
 	return nil
+}
+
+// quarantineEnrollment withdraws a backend that failed or was refused admission:
+// enrollment stays durably quarantined, the backend is administratively disabled
+// and its forwarder device detaches, so it cannot receive client traffic.
+//
+// It runs on a context detached from the caller's, because the refusal is exactly
+// what happens when the caller's own deadline expires; a cleanup that inherits
+// that deadline would never run. The withdrawal is bounded on its own.
+func (h *Handlers) quarantineEnrollment(ctx context.Context, serverID int64) {
+	if h.vpnSvc == nil || serverID <= 0 {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	// The marker is set before the disable so a crash between the two leaves the
+	// stronger state (quarantined and enabled) rather than the weaker one.
+	h.vpnSvc.SetPendingEnrollment(serverID, true)
+	_ = h.vpnSvc.DisableBackend(cleanupCtx, serverID)
 }

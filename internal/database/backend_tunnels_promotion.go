@@ -20,6 +20,19 @@ func promoteAndRelease(
 	latencyMS int64,
 	serverID int64,
 ) (bool, error) {
+	// F14: admission authority is decided inside the transaction, not before the
+	// network work and not after the commit. A revoked setup approval must not be
+	// able to promote its backend, and because revocation and this transaction
+	// both serialize on the database write mutex, a revocation that committed
+	// before this point is visible here.
+	revoked, err := setupApprovalRevoked(ctx, tx, serverID)
+	if err != nil {
+		return false, err
+	}
+	if revoked {
+		return false, ErrSetupApprovalRevoked
+	}
+
 	const casQuery = `UPDATE backend_tunnels SET status = ?, disable_reason = ?, latency_ms = ?, last_health_check = ?, state_version = state_version + 1
 		WHERE id = ? AND enabled = 1 AND status = ? AND disable_reason = ? AND state_version = ?`
 	nowStr := time.Now().Format(time.RFC3339)

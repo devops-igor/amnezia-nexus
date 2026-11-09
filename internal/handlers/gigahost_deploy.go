@@ -469,38 +469,58 @@ func (h *Handlers) qualifyBackendTraffic(ctx context.Context, server *models.Ser
 
 	latencyMS, err := h.vpnSvc.ProbeTunnel(probeCtx, tun)
 	if err != nil {
-		h.vpnSvc.SetPendingEnrollment(server.ID, false)
-		_ = h.vpnSvc.DisableBackend(ctx, server.ID)
-		return fmt.Errorf("backend traffic qualification probe failed: %w", err)
+		return h.failBackendAdmission(ctx, server.ID, "backend traffic qualification probe failed", err)
 	}
 
 	// Finding F8: Outer handshake is necessary but not sufficient.
 	// Verify real data-plane payload forwarding before declaring the backend ready.
-	//
-	// ProbeTunnel commits through a version-fenced write, so the snapshot above is
-	// now stale. Service.ProbeCanary verifies the tunnel against the live pool and
-	// would reject that stale StateVersion, so re-read the current row first rather
-	// than passing a superseded identity forward.
-	current, curErr := h.vpnSvc.GetTunnel(server.ID)
-	if curErr != nil || current == nil {
-		h.vpnSvc.SetPendingEnrollment(server.ID, false)
-		_ = h.vpnSvc.DisableBackend(ctx, server.ID)
-		return fmt.Errorf("backend tunnel disappeared after qualification probe: %v", curErr)
+	current, err := h.reReadQualifiedTunnel(ctx, server.ID)
+	if err != nil {
+		return h.failBackendAdmission(ctx, server.ID, "backend tunnel disappeared after qualification probe", err)
 	}
 	if err := h.vpnSvc.ProbeCanary(probeCtx, current); err != nil {
 		h.vpnSvc.SetPendingEnrollment(server.ID, false)
-		_ = h.vpnSvc.DisableBackend(ctx, server.ID)
 		_ = h.vpnSvc.SetTunnelStatus(ctx, server.ID, models.TunnelStatusDisabled, 0)
-		return fmt.Errorf("data-plane payload verification failed: %w", err)
+		return h.failBackendAdmission(ctx, server.ID, "data-plane payload verification failed", err)
 	}
 
 	// Outer handshake and inner canary payload verification have both succeeded.
 	// Promote the quarantined connecting backend tunnel to active.
-	if err := h.vpnSvc.PromoteQualifiedTunnel(ctx, server.ID, latencyMS); err != nil {
-		_ = h.vpnSvc.DisableBackend(ctx, server.ID)
-		return fmt.Errorf("failed to commit active status after canary probe: %w", err)
+	//
+	// F14: promotion decides admission authority inside its own transaction, so a
+	// setup approval revoked during this network work cannot be admitted here. A
+	// refusal quarantines the enrollment instead of leaving it enabled.
+	if err := h.vpnSvc.PromoteQualifiedTunnel(probeCtx, server.ID, latencyMS); err != nil {
+		return h.failBackendAdmission(ctx, server.ID, "failed to commit active status after canary probe", err)
 	}
 	return nil
+}
+
+// failBackendAdmission withdraws a backend whose admission did not happen and
+// returns the reason, so every failure branch of the qualification path leaves the
+// same safe state instead of each repeating the cleanup.
+//
+// The withdrawal keeps the durable enrollment quarantine: the backend is enrolled
+// but not qualified, which is exactly what prevents it from being selectable.
+func (h *Handlers) failBackendAdmission(ctx context.Context, serverID int64, reason string, cause error) error {
+	h.quarantineEnrollment(ctx, serverID)
+	return fmt.Errorf("%s: %w", reason, cause)
+}
+
+// reReadQualifiedTunnel re-reads the tunnel after the outer probe committed.
+//
+// ProbeTunnel commits through a version-fenced write, so the snapshot taken before
+// it is stale, and Service.ProbeCanary rejects a stale StateVersion. Re-reading is
+// therefore part of qualifying the inner canary, not an optional refresh.
+func (h *Handlers) reReadQualifiedTunnel(ctx context.Context, serverID int64) (*models.BackendTunnel, error) {
+	current, err := h.vpnSvc.GetTunnel(serverID)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil {
+		return nil, fmt.Errorf("backend tunnel not found for server %d", serverID)
+	}
+	return current, nil
 }
 
 // DeployGigahostOrder orchestrates the multi-step onboarding of a ready Gigahost VPS into an active VPN backend.

@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -414,22 +415,33 @@ func TestSetupInstallTransientProviderErrorKeepsJobPending(t *testing.T) {
 }
 
 // TestSetupInstallProxyAdmitsOnlyAfterQualification proves the stronger proxy
-// requirement is preserved: a proxy install that fails application-traffic
-// qualification is not admitted, and the job pauses.
+// requirement is preserved: a proxy install whose application-traffic
+// qualification FAILS is not admitted, and the job pauses.
+//
+// The oracle is deliberate about the reason: it asserts the qualification callback
+// actually ran. An earlier version accepted any error mentioning "enablement", which
+// a failure before the callback would also satisfy - so it could pass without ever
+// reaching the boundary it claimed to protect.
 func TestSetupInstallProxyAdmitsOnlyAfterQualification(t *testing.T) {
 	env := newInstallEnv(t, models.ProtocolVLESS)
+	validVLESSClientFixture(t, env)
 	env.seedOrder("ord_proxy", 6011, "198.51.100.71")
 	env.seedManagedCredential("ord_proxy")
 	env.providerServes("ord_proxy", 6011, "198.51.100.71")
+	var reached atomic.Bool
 	env.h.vpnSvc.SetProxyTrafficProbeFuncForTest(func(context.Context, *models.BackendTunnel) (int64, error) {
+		reached.Store(true)
 		return 0, errors.New("authenticated application exchange failed")
 	})
 	env.approve("ord_proxy", models.ProtocolVLESS, "443", installFixtureFingerprint)
 
 	env.trackerAndInstall()
 
+	if !reached.Load() {
+		t.Fatal("the qualification callback never ran: the negative would prove nothing")
+	}
 	got := env.requireState("ord_proxy", models.SetupStateInstallPaused)
-	if !strings.Contains(got.LastError, "qualification") && !strings.Contains(got.LastError, "enablement") {
+	if !strings.Contains(got.LastError, "qualification") {
 		t.Fatalf("pause reason = %q, want the qualification failure", got.LastError)
 	}
 	if got.NexusServerID <= 0 {
@@ -439,8 +451,14 @@ func TestSetupInstallProxyAdmitsOnlyAfterQualification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read tunnel: %v", err)
 	}
-	if tun != nil && tun.Status == models.TunnelStatusActive {
-		t.Fatal("an unqualified proxy backend was admitted as active")
+	if tun != nil && tun.Enabled {
+		t.Error("an unqualified proxy backend was left administratively enabled")
+	}
+	if tun != nil && (tun.Status == models.TunnelStatusActive || tun.Status == models.TunnelStatusDegraded) {
+		t.Errorf("an unqualified proxy backend was admitted (status %q)", tun.Status)
+	}
+	if !durableQuarantine(t, env, got.NexusServerID) {
+		t.Error("an unqualified proxy backend released its durable quarantine")
 	}
 }
 

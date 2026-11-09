@@ -125,9 +125,16 @@ func (s *Service) commitPromoteWithRetry(ctx context.Context, serverID int64, ta
 		// Finding F10: the qualification verdict and the durable enrollment
 		// release commit in one transaction, so no crash can leave a qualified
 		// backend still marked unqualified.
+		//
+		// F14: that transaction also decides admission authority. A withdrawn
+		// setup approval is a refusal, not a stale version, so it must not be
+		// retried into a fresh promotion attempt.
 		err = s.pool.PromoteTunnelWithEnrollmentRelease(ctx, serverID, tun.ID, tun.StateVersion, targetStatus, latencyMS)
 		if err == nil {
 			return nil
+		}
+		if errors.Is(err, tunnel.ErrSetupApprovalRevoked) {
+			return err
 		}
 		if !errors.Is(err, tunnel.ErrStaleStateVersion) {
 			return err
