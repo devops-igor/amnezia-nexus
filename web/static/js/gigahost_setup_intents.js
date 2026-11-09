@@ -32,6 +32,97 @@ async function withSetupIntentAction(orderId, run) {
     }
 }
 
+/* setupApprovalURL is the one place this module spells an order's approval
+ * route. The order id is a provider identifier, so it is encoded: an id with a
+ * separator in it must address its own order and no other. */
+function setupApprovalURL(orderId) {
+    return '/api/admin/hosting/gigahost/orders/' + encodeURIComponent(orderId) + '/setup-approval';
+}
+
+/* The protocols an approval may name, in the order the prompt offers them. This
+ * list is only for validating what the administrator typed; the panel decides
+ * what it supports and refuses anything else. */
+const setupApprovalProtocols = ['awg', 'vless', 'naive'];
+
+/* setupApprovalPayload asks what to install and returns the exact approval body,
+ * or null when the administrator cancelled.
+ *
+ * Cancelling a prompt is an answer: a cancelled choice must produce no approval
+ * at all. That is why nothing here has a fallback protocol - the pre-existing
+ * immediate setup path defaults a missing answer to awg, but a durable approval
+ * is the administrator's own statement about work the panel performs later, so a
+ * default would record a decision nobody made.
+ *
+ * The body carries no credential: the approval references the managed key the
+ * order was placed with. An order without one pauses for credentials in the
+ * panel, which is the supported safe stop, rather than claiming it can install
+ * unattended. */
+function setupApprovalPayload() {
+    const typed = prompt(_('deploy_protocol_prompt'));
+    if (typed === null) return null;
+    const protocol = typed.toLowerCase().trim();
+    if (setupApprovalProtocols.indexOf(protocol) === -1) {
+        UI.toast(_('setup_intents_protocol_invalid'), 'error');
+        return null;
+    }
+    const payload = {protocol: protocol, use_order_credential: true};
+    if (protocol === 'awg') return payload;
+    const domain = prompt(_('deploy_domain_prompt'));
+    if (domain === null) return null;
+    const trimmed = domain.trim();
+    if (trimmed) payload.tls_domain = trimmed;
+    return payload;
+}
+
+/* approveSetupIntent records the administrator's setup approval for one order.
+ *
+ * The approval is the explicit decision to hand this order to the panel's own
+ * worker: from here the job is tracked in the panel and continues when this
+ * browser is closed. It is not a request to install now, and it confirms no host
+ * identity - the panel shows the identity it observed, and the administrator
+ * confirms that value later from the saved list.
+ *
+ * The posted body is exactly what the endpoint validates, and its answer is the
+ * existing DTO: created=false is a repeated approval, not a failure, because the
+ * panel answers a repeat with the job it already has instead of starting a second
+ * one. */
+async function approveSetupIntent(orderId) {
+    if (!orderId) return;
+    const payload = setupApprovalPayload();
+    if (!payload) return;
+    if (!confirm(_('setup_intents_approve_confirm'))) return;
+    await withSetupIntentAction(orderId, async () => {
+        try {
+            const res = await API.post(setupApprovalURL(orderId), payload, {silent: true});
+            const created = !!(res && res.created);
+            UI.toast(_(created ? 'setup_intents_saved' : 'setup_intents_already_saved'),
+                created ? 'success' : 'info');
+        } catch (err) {
+            UI.toast(err.message || _('error'), 'error');
+        } finally {
+            loadSetupIntents();
+        }
+    });
+}
+
+/* appendSetupApprovalAction adds the save-for-setup action to one recent order.
+ *
+ * It is offered only for an order that has an address to install on: approving a
+ * job with no reachable server would record work the panel can never perform. The
+ * immediate setup button stays next to it, so the administrator chooses between
+ * setup that runs in this window and setup the panel keeps on its own. */
+function appendSetupApprovalAction(container, orderId, assignedIP) {
+    if (!container || !orderId || !assignedIP) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-secondary';
+    btn.style.padding = '2px 8px';
+    btn.style.fontSize = '0.75rem';
+    btn.textContent = _('setup_intents_approve');
+    btn.addEventListener('click', () => approveSetupIntent(orderId));
+    container.appendChild(btn);
+}
+
 async function loadSetupIntents() {
     const container = document.getElementById('setupIntentsContainer');
     if (!container) return;
@@ -217,7 +308,7 @@ async function cancelSetupIntent(orderId) {
     if (!confirm(_('setup_intents_cancel_confirm'))) return;
     await withSetupIntentAction(orderId, async () => {
         try {
-            await API.delete('/api/admin/hosting/gigahost/orders/' + encodeURIComponent(orderId) + '/setup-approval');
+            await API.delete(setupApprovalURL(orderId));
             UI.toast(_('setup_intents_cancelled'), 'info');
         } catch (err) {
             UI.toast(err.message || _('error'), 'error');

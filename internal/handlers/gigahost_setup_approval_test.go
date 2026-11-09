@@ -44,6 +44,8 @@ func setupIntentTestRouter(t *testing.T, h *Handlers) *chi.Mux {
 		r.Post("/orders/{order_id}/setup-approval", h.GigahostSetupApproveHandler)
 		r.Get("/orders/{order_id}/setup-approval", h.GigahostSetupStatusHandler)
 		r.Delete("/orders/{order_id}/setup-approval", h.GigahostSetupCancelHandler)
+		r.Post("/orders/{order_id}/setup-resume", h.GigahostSetupResumeHandler)
+		r.Post("/orders/{order_id}/setup-host-confirmation", h.GigahostSetupConfirmHostHandler)
 	})
 	return r
 }

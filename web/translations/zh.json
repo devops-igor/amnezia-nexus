@@ -756,5 +756,10 @@
   "setup_intents_resumed": "安装任务已继续",
   "setup_intents_confirm_host": "确认主机身份",
   "setup_intents_host_confirmed": "主机身份已确认",
-  "setup_intents_credentials_hint": "此任务需要 SSH 凭据。请使用受管密钥下单，或使用密码手动执行安装。"
+  "setup_intents_credentials_hint": "此任务需要 SSH 凭据。请使用受管密钥下单，或使用密码手动执行安装。",
+  "setup_intents_approve": "保存以便安装",
+  "setup_intents_approve_confirm": "批准此订单的安装？面板会跟踪它，并在关闭此浏览器后继续执行。在服务器就绪且其主机身份被确认之前，不会安装任何内容。",
+  "setup_intents_saved": "安装审批已保存 — 面板将继续跟踪此订单",
+  "setup_intents_already_saved": "此订单已有保存的安装审批",
+  "setup_intents_protocol_invalid": "请输入以下之一：awg、vless、naive"
 }

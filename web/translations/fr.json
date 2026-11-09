@@ -756,5 +756,10 @@
   "setup_intents_resumed": "Tâche de configuration reprise",
   "setup_intents_confirm_host": "Confirmer l'identité de l'hôte",
   "setup_intents_host_confirmed": "Identité de l'hôte confirmée",
-  "setup_intents_credentials_hint": "Cette tâche nécessite un identifiant SSH. Passez la commande avec une clé gérée, ou lancez la configuration manuellement avec un mot de passe."
+  "setup_intents_credentials_hint": "Cette tâche nécessite un identifiant SSH. Passez la commande avec une clé gérée, ou lancez la configuration manuellement avec un mot de passe.",
+  "setup_intents_approve": "Enregistrer pour configuration",
+  "setup_intents_approve_confirm": "Approuver la configuration de cette commande ? Le panneau la suivra et continuera après la fermeture de ce navigateur. Rien n'est installé avant que le serveur soit prêt et que l'identité de son hôte soit confirmée.",
+  "setup_intents_saved": "Approbation de configuration enregistrée — le panneau suivra cette commande",
+  "setup_intents_already_saved": "Une approbation de configuration est déjà enregistrée pour cette commande",
+  "setup_intents_protocol_invalid": "Saisissez l'un des éléments suivants : awg, vless, naive"
 }

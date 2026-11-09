@@ -756,5 +756,10 @@
   "setup_intents_resumed": "Setup job resumed",
   "setup_intents_confirm_host": "Confirm host identity",
   "setup_intents_host_confirmed": "Host identity confirmed",
-  "setup_intents_credentials_hint": "This job needs an SSH credential. Place the order with a managed key, or run setup manually with a password."
+  "setup_intents_credentials_hint": "This job needs an SSH credential. Place the order with a managed key, or run setup manually with a password.",
+  "setup_intents_approve": "Save for setup",
+  "setup_intents_approve_confirm": "Approve setup for this order? The panel will track it and keep working after this browser is closed. Nothing is installed until the server is ready and its host identity is confirmed.",
+  "setup_intents_saved": "Setup approval saved - the panel will keep tracking this order",
+  "setup_intents_already_saved": "A setup approval is already saved for this order",
+  "setup_intents_protocol_invalid": "Enter one of: awg, vless, naive"
 }

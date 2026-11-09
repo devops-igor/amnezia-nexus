@@ -894,6 +894,10 @@
                     btnSetup.textContent = _('deploy_setup_btn') || 'Setup Backend';
                     btnSetup.addEventListener('click', () => triggerGigahostSetup(o.order_id));
                     right.appendChild(btnSetup);
+                    // The saved path sits beside the immediate one so the choice
+                    // is explicit: setup now in this window, or a durable job the
+                    // panel keeps tracking after it closes.
+                    appendSetupApprovalAction(right, o.order_id, o.assigned_ip);
                 }
 
                 row.appendChild(left);
