@@ -115,26 +115,34 @@ func (c *client) GetOperatingSystems(ctx context.Context) ([]OperatingSystem, er
 		if d.Inactive() {
 			continue
 		}
-		var pageData []byte
-		path := fmt.Sprintf("/reinstall/distro/%d", d.ID)
-		if err := c.doRequest(ctx, http.MethodGet, path, nil, &pageData); err != nil {
-			return nil, fmt.Errorf("failed to fetch operating systems for distribution %d: %w", d.ID, err)
-		}
-		images, err := parseOperatingSystems(pageData)
+		images, err := c.distributionImages(ctx, d)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode operating systems for distribution %d: %w", d.ID, err)
+			return nil, err
 		}
-		for i := range images {
-			if images[i].DistName == "" {
-				images[i].DistName = d.Name
-			}
-			if images[i].DistID == 0 {
-				images[i].DistID = d.ID
-			}
-			systems = append(systems, images[i])
-		}
+		systems = append(systems, images...)
 	}
 	return systems, nil
+}
+
+// distributionImages reads and labels the images of one distribution.
+func (c *client) distributionImages(ctx context.Context, d distrib) ([]OperatingSystem, error) {
+	var pageData []byte
+	if err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/reinstall/distro/%d", d.ID), nil, &pageData); err != nil {
+		return nil, fmt.Errorf("failed to fetch operating systems for distribution %d: %w", d.ID, err)
+	}
+	images, err := parseOperatingSystems(pageData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode operating systems for distribution %d: %w", d.ID, err)
+	}
+	for i := range images {
+		if images[i].DistName == "" {
+			images[i].DistName = d.Name
+		}
+		if images[i].DistID == 0 {
+			images[i].DistID = d.ID
+		}
+	}
+	return images, nil
 }
 
 // distrib is one entry from GET /reinstall/distro.
@@ -257,28 +265,6 @@ func (c *client) GetCatalog(ctx context.Context) ([]HourlyPlan, error) {
 	}
 
 	return hourlyPlans, nil
-}
-
-// GetSelectableCatalog returns the hourly catalog with each plan's documented
-// region, datacenter and operating-system choices. It is the read the portal and
-// the order path both use: an image list that could not be read fails the whole
-// call, so a plan is never offered with a guessed or partial image set.
-func (c *client) GetSelectableCatalog(ctx context.Context) ([]HourlyPlan, error) {
-	plans, err := c.GetCatalog(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if len(plans) == 0 {
-		return plans, nil
-	}
-	images, err := c.GetOperatingSystems(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read provider images: %w", err)
-	}
-	for i := range plans {
-		plans[i].OSOptions = plans[i].InstallableImages(images)
-	}
-	return plans, nil
 }
 
 // GetCatalogEligibility returns the most recently decoded catalog eligibility.
@@ -775,44 +761,76 @@ type dcPlacement struct {
 	Country  string
 }
 
-// buildTierProduct converts one documented catalog product into the plan shape
-// the portal and handler use, keeping every placement fact the provider
-// documents: the region list, the per-product datacenters and their stock.
-func buildTierProduct(p tierProductDTO, regionMap map[int]Region, dcMap map[int]dcPlacement, currency string, eligibility CatalogEligibility) Product {
-	cores := p.Specs.CPUCores
-	if cores <= 0 && p.VMCores != "" {
-		cores, _ = strconv.Atoi(p.VMCores)
+// productSpecs is the machine-readable spec set a catalog product documents.
+type productSpecs struct {
+	cores int
+	ramMB int
+	disk  int
+	bw    float64
+}
+
+// firstPositiveInt returns primary when it carries a value, else the parsed
+// fallback, else primary unchanged. The provider documents the machine-readable
+// specs as authoritative and the legacy string fields as the older shape, so a
+// value present in the structured object always wins.
+func firstPositiveInt(primary int, fallback string) int {
+	if primary > 0 {
+		return primary
 	}
-	ram := p.Specs.RAMGB * 1024
-	if ram <= 0 && p.VMMemory != "" {
-		v, _ := strconv.Atoi(p.VMMemory)
-		ram = v * 1024
+	if v, err := strconv.Atoi(fallback); err == nil {
+		return v
 	}
+	return primary
+}
+
+// firstPositiveFloat is firstPositiveInt for the bandwidth figure.
+func firstPositiveFloat(primary float64, fallback string) float64 {
+	if primary > 0 {
+		return primary
+	}
+	if v, err := strconv.ParseFloat(fallback, 64); err == nil {
+		return v
+	}
+	return primary
+}
+
+// resolveSpecs reads the structured specs object and falls back to the legacy
+// string fields only when the structured value is absent.
+func resolveSpecs(p tierProductDTO) productSpecs {
 	disk := 0
 	for _, d := range p.Specs.Disks {
 		disk += d.SizeGB
 	}
-	if disk <= 0 && p.VMStorage != "" {
-		disk, _ = strconv.Atoi(p.VMStorage)
+	return productSpecs{
+		cores: firstPositiveInt(p.Specs.CPUCores, p.VMCores),
+		ramMB: firstPositiveInt(p.Specs.RAMGB, p.VMMemory) * 1024,
+		disk:  firstPositiveInt(disk, p.VMStorage),
+		bw:    firstPositiveFloat(p.Specs.BW, p.VMBW),
 	}
-	bw := p.Specs.BW
-	if bw <= 0 && p.VMBW != "" {
-		bw, _ = strconv.ParseFloat(p.VMBW, 64)
-	}
+}
 
+// hourlyPrices returns the price row the plan may be ordered at, or nothing when
+// the provider does not offer the product hourly or has no hourly price id.
+func hourlyPrices(p tierProductDTO, inStock bool, currency string) []Price {
+	if !p.AllowHourly || p.PriceID <= 0 || !inStock {
+		return nil
+	}
+	return []Price{{
+		ID:             p.PriceID,
+		BillingPeriod:  BillingPeriodHourly,
+		Currency:       currency,
+		HourlyRate:     p.RateHourly,
+		MonthlyCeiling: p.RateMonthly,
+	}}
+}
+
+// buildTierProduct converts one documented catalog product into the plan shape
+// the portal and handler use, keeping every placement fact the provider
+// documents: the region list, the per-product datacenters and their stock.
+func buildTierProduct(p tierProductDTO, regionMap map[int]Region, dcMap map[int]dcPlacement, currency string, eligibility CatalogEligibility) Product {
+	specs := resolveSpecs(p)
 	datacenters, dcStockKnown := placementFor(p, dcMap)
 	regions := regionsFor(p, regionMap, datacenters, dcStockKnown)
-
-	var prices []Price
-	if p.AllowHourly && p.PriceID > 0 && p.InStock {
-		prices = append(prices, Price{
-			ID:             p.PriceID,
-			BillingPeriod:  BillingPeriodHourly,
-			Currency:       currency,
-			HourlyRate:     p.RateHourly,
-			MonthlyCeiling: p.RateMonthly,
-		})
-	}
 
 	if p.Eligibility.QualifiesArrears || p.Eligibility.CreditNOK > 0 {
 		eligibility = p.Eligibility
@@ -823,14 +841,14 @@ func buildTierProduct(p tierProductDTO, regionMap map[int]Region, dcMap map[int]
 		PID:          p.ProductID,
 		Name:         p.ProductName,
 		Type:         p.Type,
-		CPUCores:     cores,
-		RAMMB:        ram,
-		DiskGB:       disk,
-		BandwidthTB:  bw,
+		CPUCores:     specs.cores,
+		RAMMB:        specs.ramMB,
+		DiskGB:       specs.disk,
+		BandwidthTB:  specs.bw,
 		InStock:      p.InStock,
 		BuiltToOrder: p.BuiltToOrder,
 		WaitlistOK:   p.WaitlistOK,
-		Prices:       prices,
+		Prices:       hourlyPrices(p, p.InStock, currency),
 		Regions:      regions,
 		Datacenters:  datacenters,
 		Eligibility:  eligibility,
@@ -892,7 +910,7 @@ func regionsFor(p tierProductDTO, regionMap map[int]Region, datacenters []Datace
 	return regions
 }
 
-// regionStock summarises the product's datacenter stock inside one region: true
+// regionStock summarizes the product's datacenter stock inside one region: true
 // when any of its datacenters in that region reports stock, false when they all
 // report none, and unknown (nil) when the catalog carried no stock fact or no
 // documented datacenter maps to the region.
@@ -918,109 +936,151 @@ func regionStock(regionID int, datacenters []Datacenter, dcStockKnown bool) *boo
 	return &inStock
 }
 
-func parseProducts(data []byte) ([]Product, CatalogEligibility, error) {
-	type docCatalog struct {
-		Meta struct {
-			Status int `json:"status"`
-		} `json:"meta"`
-		Data struct {
-			Tiers []struct {
-				GroupID   int              `json:"group_id"`
-				GroupName string           `json:"group_name"`
-				InStock   bool             `json:"in_stock"`
-				Products  []tierProductDTO `json:"products"`
-			} `json:"tiers"`
-			Regions []struct {
-				RegionID   any    `json:"region_id"`
-				RegionName string `json:"region_name"`
-				Country    string `json:"region_country"`
-			} `json:"regions"`
-			Datacenters []struct {
-				DCID           any    `json:"dc_id"`
-				DCName         string `json:"dc_name"`
-				RegionID       any    `json:"region_id"`
-				RegionName     string `json:"region_name"`
-				RegionLocation string `json:"region_location"`
-				RegionCountry  string `json:"region_country"`
-			} `json:"datacenters"`
-			Currency    string             `json:"currency"`
-			Eligibility CatalogEligibility `json:"eligibility"`
-		} `json:"data"`
+// tierDTO is one documented catalog tier: a named group of products.
+type tierDTO struct {
+	GroupID   int              `json:"group_id"`
+	GroupName string           `json:"group_name"`
+	InStock   bool             `json:"in_stock"`
+	Products  []tierProductDTO `json:"products"`
+}
+
+// catalogDoc is the documented GET /deploy/servers body.
+type catalogDoc struct {
+	Meta struct {
+		Status int `json:"status"`
+	} `json:"meta"`
+	Data struct {
+		Tiers   []tierDTO `json:"tiers"`
+		Regions []struct {
+			RegionID   any    `json:"region_id"`
+			RegionName string `json:"region_name"`
+			Country    string `json:"region_country"`
+		} `json:"regions"`
+		Datacenters []struct {
+			DCID           any    `json:"dc_id"`
+			DCName         string `json:"dc_name"`
+			RegionID       any    `json:"region_id"`
+			RegionName     string `json:"region_name"`
+			RegionLocation string `json:"region_location"`
+			RegionCountry  string `json:"region_country"`
+		} `json:"datacenters"`
+		Currency    string             `json:"currency"`
 		Eligibility CatalogEligibility `json:"eligibility"`
-	}
+	} `json:"data"`
+	Eligibility CatalogEligibility `json:"eligibility"`
+}
 
-	var doc docCatalog
-	if err := json.Unmarshal(data, &doc); err == nil && len(doc.Data.Tiers) > 0 {
-		currency := doc.Data.Currency
-		if currency == "" {
-			currency = "NOK"
-		}
-		eligibility := doc.Data.Eligibility
-		if !eligibility.QualifiesArrears && eligibility.CreditNOK == 0 && (doc.Eligibility.QualifiesArrears || doc.Eligibility.CreditNOK > 0) {
-			eligibility = doc.Eligibility
-		}
-		regionMap := make(map[int]Region)
-		for _, r := range doc.Data.Regions {
-			rID := int(parseInt64Field(r.RegionID))
-			regionMap[rID] = Region{
-				ID:        rID,
-				Name:      r.RegionName,
-				Country:   r.Country,
-				Available: true,
-			}
-		}
-		dcMap := make(map[int]dcPlacement)
-		for _, dc := range doc.Data.Datacenters {
-			id := int(parseInt64Field(dc.DCID))
-			regionID := int(parseInt64Field(dc.RegionID))
-			if regionID == 0 {
-				if reg, ok := regionMap[0]; ok {
-					regionID = reg.ID
-				}
-			}
-			dcMap[id] = dcPlacement{
-				ID:       id,
-				Name:     dc.DCName,
-				RegionID: regionID,
-				Location: dc.RegionLocation,
-				Country:  dc.RegionCountry,
-			}
-		}
-
-		var products []Product
-		for _, tier := range doc.Data.Tiers {
-			for _, p := range tier.Products {
-				products = append(products, buildTierProduct(p, regionMap, dcMap, currency, eligibility))
-			}
-		}
-		if len(products) > 0 {
-			return products, eligibility, nil
+// regionMap indexes the documented region list by provider region id.
+func (d catalogDoc) regionMap() map[int]Region {
+	regions := make(map[int]Region, len(d.Data.Regions))
+	for _, r := range d.Data.Regions {
+		rID := int(parseInt64Field(r.RegionID))
+		regions[rID] = Region{
+			ID:        rID,
+			Name:      r.RegionName,
+			Country:   r.Country,
+			Available: true,
 		}
 	}
+	return regions
+}
 
+// dcMap indexes the documented datacenter list by provider datacenter id. A
+// datacenter whose region the catalog left out keeps region 0, which no
+// documented region matches, so it never contributes stock to a region by
+// accident.
+func (d catalogDoc) dcMap() map[int]dcPlacement {
+	datacenters := make(map[int]dcPlacement, len(d.Data.Datacenters))
+	for _, dc := range d.Data.Datacenters {
+		id := int(parseInt64Field(dc.DCID))
+		datacenters[id] = dcPlacement{
+			ID:       id,
+			Name:     dc.DCName,
+			RegionID: int(parseInt64Field(dc.RegionID)),
+			Location: dc.RegionLocation,
+			Country:  dc.RegionCountry,
+		}
+	}
+	return datacenters
+}
+
+// eligibility prefers whichever source reports a qualifying fact, so a plan set
+// is never published as ineligible on the strength of one absent field.
+func (d catalogDoc) eligibility() CatalogEligibility {
+	eligibility := d.Data.Eligibility
+	if !eligibility.QualifiesArrears && eligibility.CreditNOK == 0 &&
+		(d.Eligibility.QualifiesArrears || d.Eligibility.CreditNOK > 0) {
+		eligibility = d.Eligibility
+	}
+	return eligibility
+}
+
+// currency reports the documented catalog currency, defaulting to the provider's
+// billing currency when the field is absent.
+func (d catalogDoc) currency() string {
+	if d.Data.Currency == "" {
+		return "NOK"
+	}
+	return d.Data.Currency
+}
+
+// productsFromTiers flattens the documented tiers into plans.
+func productsFromTiers(tiers []tierDTO, regionMap map[int]Region, dcMap map[int]dcPlacement, currency string, eligibility CatalogEligibility) []Product {
+	var products []Product
+	for _, tier := range tiers {
+		for _, p := range tier.Products {
+			products = append(products, buildTierProduct(p, regionMap, dcMap, currency, eligibility))
+		}
+	}
+	return products
+}
+
+// productsFromDocument reads the documented tiered catalog body. It reports a
+// nil slice when the body is not that shape, so the caller can fall through to
+// the legacy shapes.
+func productsFromDocument(data []byte) ([]Product, CatalogEligibility, bool) {
+	var doc catalogDoc
+	if err := json.Unmarshal(data, &doc); err != nil || len(doc.Data.Tiers) == 0 {
+		return nil, CatalogEligibility{}, false
+	}
+	eligibility := doc.eligibility()
+	products := productsFromTiers(doc.Data.Tiers, doc.regionMap(), doc.dcMap(), doc.currency(), eligibility)
+	if len(products) == 0 {
+		return nil, CatalogEligibility{}, false
+	}
+	return products, eligibility, true
+}
+
+// productsFromLegacyShape reads the two older documented catalog wrappers.
+// Neither shape carries eligibility, so the caller keeps the zero value it has.
+func productsFromLegacyShape(data []byte) ([]Product, bool) {
 	var direct []Product
 	if err := json.Unmarshal(data, &direct); err == nil && direct != nil {
-		return direct, CatalogEligibility{}, nil
+		return direct, true
 	}
-
 	var wrapped struct {
-		Products    []Product          `json:"products"`
-		Data        []Product          `json:"data"`
-		Servers     []Product          `json:"servers"`
-		Eligibility CatalogEligibility `json:"eligibility"`
+		Products []Product `json:"products"`
+		Data     []Product `json:"data"`
+		Servers  []Product `json:"servers"`
 	}
-	if err := json.Unmarshal(data, &wrapped); err == nil {
-		if wrapped.Products != nil {
-			return wrapped.Products, wrapped.Eligibility, nil
-		}
-		if wrapped.Data != nil {
-			return wrapped.Data, wrapped.Eligibility, nil
-		}
-		if wrapped.Servers != nil {
-			return wrapped.Servers, wrapped.Eligibility, nil
+	if err := json.Unmarshal(data, &wrapped); err != nil {
+		return nil, false
+	}
+	for _, candidate := range [][]Product{wrapped.Products, wrapped.Data, wrapped.Servers} {
+		if candidate != nil {
+			return candidate, true
 		}
 	}
+	return nil, false
+}
 
+func parseProducts(data []byte) ([]Product, CatalogEligibility, error) {
+	if products, eligibility, ok := productsFromDocument(data); ok {
+		return products, eligibility, nil
+	}
+	if products, ok := productsFromLegacyShape(data); ok {
+		return products, CatalogEligibility{}, nil
+	}
 	return nil, CatalogEligibility{}, errors.New("unable to parse products response format")
 }
 

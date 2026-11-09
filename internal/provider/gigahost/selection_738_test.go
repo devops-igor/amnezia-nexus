@@ -70,12 +70,6 @@ const distroListDoc = `{"meta":{"status":200},"data":[
   {"dist_id":"20","type_id":"3","dist_name":"Retired","dist_value":"retired","dist_active":"0"}
 ]}`
 
-const distroImagesDoc = `{"meta":{"status":200},"data":[
-  {"os_id":"%s","dist_id":"%s","os_name":"%s","os_release":"%s","os_dist":"12","os_arch":"amd64",
-   "os_custom_partition":"0","os_single_disk_only":"0","os_support_raid":"1",
-   "os_dedicated_only":"%s","os_minram":"%s","os_slow_install":"0"}
-]}`
-
 // selectionProvider serves the documented catalog and image bodies.
 func selectionProvider(t *testing.T, imagesByDist map[string]string, distErr bool) *httptest.Server {
 	t.Helper()
@@ -243,7 +237,84 @@ func TestGetOperatingSystems_DistroFailureIsAnError(t *testing.T) {
 	}
 }
 
+// TestGetCatalog_LegacySpecFallback pins the documented fallback: a product that
+// carries only the legacy string spec fields (no machine-readable specs object)
+// still yields the documented numbers, so a plan is never published with zero
+// vCPU or zero RAM that would then reject every image.
+func TestGetCatalog_LegacySpecFallback(t *testing.T) {
+	doc := `{"meta":{"status":200},"data":{
+	  "tiers":[{"group_id":1,"group_name":"Cloud","in_stock":true,"products":[{
+	    "product_id":101,"product_name":"Cloud 2","type":"vm","in_stock":true,
+	    "allow_hourly":true,"rate_hourly":0.14375,"rate_monthly":90,"price_id":555,
+	    "region_ids":[1],"dc_ids":[1],"dc_stock":{"1":true},
+	    "vm_cores":"2","vm_memory":"4","vm_storage":"80","vm_bw":"5"
+	  }]}],
+	  "regions":[{"region_id":"1","region_name":"Norway","region_country":"NO"}],
+	  "datacenters":[{"dc_id":1,"dc_name":"DC1","region_id":1,"region_name":"Norway"}],
+	  "currency":"NOK"}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(doc))
+	}))
+	defer server.Close()
+
+	c, err := NewClient(Config{BaseURL: server.URL, APIKey: testAPIKey})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	plans, err := c.GetCatalog(context.Background())
+	if err != nil {
+		t.Fatalf("GetCatalog: %v", err)
+	}
+	if len(plans) != 1 {
+		t.Fatalf("plans = %d, want 1", len(plans))
+	}
+	plan := plans[0]
+	if plan.CPUCores != 2 || plan.RAMMB != 4*1024 || plan.DiskGB != 80 || plan.BandwidthTB != 5 {
+		t.Errorf("legacy specs = %d vCPU / %d MB / %d GB / %v TB, want 2 / 4096 / 80 / 5",
+			plan.CPUCores, plan.RAMMB, plan.DiskGB, plan.BandwidthTB)
+	}
+}
+
+// TestGetCatalog_CurrencyDefaultsToNOK pins the documented absence case: the
+// provider bills in NOK, so an omitted currency field must not produce an empty
+// currency on a plan the portal prices against.
+func TestGetCatalog_CurrencyDefaultsToNOK(t *testing.T) {
+	doc := `{"meta":{"status":200},"data":{
+	  "tiers":[{"group_id":1,"group_name":"Cloud","in_stock":true,"products":[{
+	    "product_id":101,"product_name":"Cloud 2","type":"vm","in_stock":true,
+	    "allow_hourly":true,"rate_hourly":0.14375,"rate_monthly":90,"price_id":555,
+	    "region_ids":[1],"dc_ids":[1],"dc_stock":{"1":true},
+	    "specs":{"cpu_cores":2,"ram_gb":4,"disks":[{"size_gb":80}],"bw":5}
+	  }]}],
+	  "regions":[{"region_id":"1","region_name":"Norway","region_country":"NO"}],
+	  "datacenters":[{"dc_id":1,"dc_name":"DC1"}]}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(doc))
+	}))
+	defer server.Close()
+
+	c, err := NewClient(Config{BaseURL: server.URL, APIKey: testAPIKey})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	plans, err := c.GetCatalog(context.Background())
+	if err != nil {
+		t.Fatalf("GetCatalog: %v", err)
+	}
+	if len(plans) != 1 || plans[0].Currency != "NOK" {
+		t.Fatalf("currency = %q, want the provider billing currency NOK", plans[0].Currency)
+	}
+	// A datacenter whose documented region is absent must not contribute stock to
+	// any region.
+	if plans[0].Regions[0].InStock != nil {
+		t.Errorf("region stock = %v, want unknown when no datacenter maps to the region", *plans[0].Regions[0].InStock)
+	}
+}
+
 func TestOperatingSystem_CompatibleWith(t *testing.T) {
+
 	cloudPlan := HourlyPlan{ProductID: 101, Type: "vm", RAMMB: 4 * 1024, DiskGB: 80}
 	dedicatedPlan := HourlyPlan{ProductID: 120, Type: "dedicated", RAMMB: 64 * 1024, DiskGB: 960}
 
