@@ -370,10 +370,7 @@
                     </div>
                     <div class="form-group">
                         <label class="form-label" for="deployOSSelect">{{ _ "deploy_vps_select_os" }}</label>
-                        <select class="form-select" id="deployOSSelect">
-                            <option value="72">Ubuntu 24.04 LTS (x86_64)</option>
-                            <option value="12">Debian 12 Bookworm (x86_64)</option>
-                        </select>
+                        <select class="form-select" id="deployOSSelect"></select>
                     </div>
                     <button type="button" class="btn btn-primary" id="btnDeployVPS" style="display:flex; align-items:center; justify-content:center; gap:var(--space-sm);">
                         <svg class="icon"><use href="#icon-plus"></use></svg>
@@ -619,8 +616,49 @@
     const btnDeployVPS = document.getElementById('btnDeployVPS');
     const deployPlanSelect = document.getElementById('deployPlanSelect');
     const deployRegionSelect = document.getElementById('deployRegionSelect');
+    const deployOSSelect = document.getElementById('deployOSSelect');
 
     let cachedPlans = [];
+
+    // deployPlanAt returns the plan the plan selector currently points at, or
+    // null. The selector's value is the plan index into cachedPlans; an empty
+    // value means the catalog had nothing selectable.
+    function deployPlanAt() {
+        if (!deployPlanSelect || cachedPlans.length === 0) return null;
+        if (deployPlanSelect.value === '') return null;
+        const idx = parseInt(deployPlanSelect.value, 10);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= cachedPlans.length) return null;
+        return cachedPlans[idx];
+    }
+
+    // deployPlanLabel renders the authoritative provider price facts: the hourly
+    // rate, the currency and the monthly ceiling the provider documents. Nothing
+    // is converted or capped.
+    function deployPlanLabel(p) {
+        const parts = [];
+        if (p.cpu_cores) parts.push(p.cpu_cores + ' vCPU');
+        if (p.ram_mb) parts.push(Math.round(p.ram_mb / 1024) + 'GB RAM');
+        if (p.disk_gb) parts.push(p.disk_gb + 'GB NVMe');
+        const currency = p.currency || 'NOK';
+        const price = [];
+        if (p.hourly_rate_nok > 0) price.push(p.hourly_rate_nok + ' ' + currency + '/hr');
+        if (p.monthly_ceiling_nok > 0) price.push('max ' + p.monthly_ceiling_nok + ' ' + currency + '/mo');
+        const spec = parts.join(', ');
+        return p.name + (spec ? ' — ' + spec : '') + (price.length ? ' (' + price.join(', ') + ')' : '');
+    }
+
+    // appendDeployOption adds one disabled-by-default placeholder option, used
+    // when the provider returned nothing selectable. It carries no id, so
+    // nothing can be ordered from it.
+    function appendDeployOption(select, text) {
+        if (!select) return;
+        select.innerHTML = '';
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = text;
+        select.appendChild(opt);
+        select.disabled = true;
+    }
 
     async function loadGigahostCatalog() {
         if (!deployPlanSelect) return;
@@ -629,48 +667,98 @@
         try {
             const res = await API.get('/api/admin/hosting/gigahost/catalog');
             cachedPlans = (res && res.plans) ? res.plans : [];
-            deployPlanSelect.innerHTML = '';
             if (cachedPlans.length === 0) {
+                appendDeployOption(deployPlanSelect, _('deploy_vps_no_plans'));
+                appendDeployOption(deployRegionSelect, _('deploy_vps_no_plans'));
+                appendDeployOption(deployOSSelect, _('deploy_vps_no_plans'));
+                updateDeployButtonState();
+                return;
+            }
+            deployPlanSelect.innerHTML = '';
+            deployPlanSelect.disabled = false;
+            cachedPlans.forEach((p, idx) => {
                 const opt = document.createElement('option');
-                opt.value = '';
-                opt.textContent = _('no_matching_records');
+                opt.value = idx;
+                opt.textContent = deployPlanLabel(p);
                 deployPlanSelect.appendChild(opt);
-            } else {
-                cachedPlans.forEach((p, idx) => {
-                    const opt = document.createElement('option');
-                    opt.value = idx;
-                    opt.textContent = `${p.name} — ${p.cpu_cores} vCPU, ${Math.round(p.ram_mb/1024)}GB RAM, ${p.disk_gb}GB NVMe (${p.hourly_rate_nok} NOK/hr, max ${p.monthly_ceiling_nok} NOK/mo)`;
-                    deployPlanSelect.appendChild(opt);
-                });
-                updateDeployRegions();
-            }
+            });
+            updateDeploySelections(null);
         } catch (err) {
-            if (deployPlanSelect) {
-                deployPlanSelect.innerHTML = '<option value="">' + (err.message || 'Catalog unavailable') + '</option>';
-            }
+            cachedPlans = [];
+            const message = _('deploy_vps_catalog_unavailable');
+            appendDeployOption(deployPlanSelect, message);
+            appendDeployOption(deployRegionSelect, message);
+            appendDeployOption(deployOSSelect, message);
+            updateDeployButtonState();
         } finally {
             if (loading) loading.style.display = 'none';
         }
     }
 
-    function updateDeployRegions() {
-        if (!deployRegionSelect || cachedPlans.length === 0) return;
-        const planIdx = parseInt(deployPlanSelect.value || '0');
-        const plan = cachedPlans[planIdx] || cachedPlans[0];
-        deployRegionSelect.innerHTML = '';
-        if (plan && plan.regions && plan.regions.length > 0) {
-            plan.regions.forEach(r => {
+    // updateDeploySelections rebuilds the region and image selectors from the
+    // plan the provider actually returned. It keeps a selection only when that
+    // value is still valid for the new plan, so a plan change cannot leave an
+    // incompatible region or image selected. previous holds the values the user
+    // had chosen; pass null to take the provider's first valid choice.
+    function updateDeploySelections(previous) {
+        const plan = deployPlanAt();
+        const keepRegion = previous ? previous.region : null;
+        const keepOS = previous ? previous.os : null;
+
+        if (!plan) {
+            appendDeployOption(deployRegionSelect, _('deploy_vps_no_plans'));
+            appendDeployOption(deployOSSelect, _('deploy_vps_no_plans'));
+            updateDeployButtonState();
+            return;
+        }
+
+        const regions = (plan.regions || []).filter(r => r.available && r.in_stock !== false);
+        if (deployRegionSelect) {
+            deployRegionSelect.innerHTML = '';
+            regions.forEach(r => {
                 const opt = document.createElement('option');
                 opt.value = r.id;
-                opt.textContent = r.name + (r.country ? ` (${r.country})` : '');
+                const label = r.name || String(r.id);
+                opt.textContent = r.country ? (label + ' (' + r.country + ')') : label;
+                if (keepRegion !== null && String(r.id) === String(keepRegion)) opt.selected = true;
                 deployRegionSelect.appendChild(opt);
             });
-        } else {
-            const opt = document.createElement('option');
-            opt.value = '1';
-            opt.textContent = 'Norway (Default)';
-            deployRegionSelect.appendChild(opt);
+            if (regions.length === 0) {
+                appendDeployOption(deployRegionSelect, _('deploy_vps_no_region_stock'));
+            } else {
+                deployRegionSelect.disabled = false;
+            }
         }
+
+        const images = plan.os_options || [];
+        if (deployOSSelect) {
+            deployOSSelect.innerHTML = '';
+            images.forEach(os => {
+                const opt = document.createElement('option');
+                opt.value = os.os_id;
+                opt.textContent = os.os_name || String(os.os_id);
+                if (keepOS !== null && String(os.os_id) === String(keepOS)) opt.selected = true;
+                deployOSSelect.appendChild(opt);
+            });
+            if (images.length === 0) {
+                appendDeployOption(deployOSSelect, _('deploy_vps_no_os'));
+            } else {
+                deployOSSelect.disabled = false;
+            }
+        }
+
+        updateDeployButtonState();
+    }
+
+    // updateDeployButtonState disables ordering unless the plan, region and image
+    // selectors all carry a real provider value. A disabled button cannot post a
+    // guessed selection.
+    function updateDeployButtonState() {
+        if (!btnDeployVPS) return;
+        const ready = !!deployPlanAt()
+            && !!deployRegionSelect && deployRegionSelect.value !== ''
+            && !!deployOSSelect && deployOSSelect.value !== '';
+        btnDeployVPS.disabled = !ready;
     }
 
     let gigahostPollTimer = null;
@@ -807,13 +895,18 @@
     }
 
     async function handleDeployVPS() {
-        if (!deployPlanSelect || cachedPlans.length === 0) return;
-        const planIdx = parseInt(deployPlanSelect.value || '0');
-        const plan = cachedPlans[planIdx];
+        const plan = deployPlanAt();
         if (!plan) return;
 
-        const regionID = deployRegionSelect ? parseInt(deployRegionSelect.value || '1') : 1;
-        const osID = parseInt(document.getElementById('deployOSSelect').value || '72');
+        // The payload is built only from values the provider returned. Each
+        // selector is re-read here rather than defaulted, so an empty selector
+        // stops the order instead of posting a guess.
+        const regionID = deployRegionSelect ? parseInt(deployRegionSelect.value, 10) : NaN;
+        const osID = deployOSSelect ? parseInt(deployOSSelect.value, 10) : NaN;
+        if (!Number.isInteger(regionID) || regionID <= 0 || !Number.isInteger(osID) || osID <= 0) {
+            UI.toast(_('deploy_vps_select_required'), 'error');
+            return;
+        }
 
         const btn = document.getElementById('btnDeployVPS');
         const spinner = document.getElementById('deployVPSSpinner');
@@ -829,18 +922,32 @@
                 hourly_price_nok: plan.hourly_rate_nok
             };
             const res = await API.post('/api/admin/hosting/gigahost/order', payload);
-            UI.toast(res.message || 'VPS order placed successfully', 'success');
+            UI.toast(res.message || _('deploy_vps_order_placed'), 'success');
             loadRecentOrders();
         } catch (err) {
             UI.toast(err.message || _('error'), 'error');
         } finally {
-            if (btn) btn.disabled = false;
+            updateDeployButtonState();
             if (spinner) spinner.classList.add('hidden');
         }
     }
 
     if (deployPlanSelect) {
-        deployPlanSelect.addEventListener('change', updateDeployRegions);
+        deployPlanSelect.addEventListener('change', () => {
+            // Plan change rebuilds both dependent selectors from the new plan. The
+            // values selected so far are offered back so a choice the new plan
+            // still supports is preserved, and one it does not support is dropped.
+            updateDeploySelections({
+                region: deployRegionSelect ? deployRegionSelect.value : null,
+                os: deployOSSelect ? deployOSSelect.value : null
+            });
+        });
+    }
+    if (deployRegionSelect) {
+        deployRegionSelect.addEventListener('change', updateDeployButtonState);
+    }
+    if (deployOSSelect) {
+        deployOSSelect.addEventListener('change', updateDeployButtonState);
     }
     if (btnRefreshCatalog) {
         btnRefreshCatalog.addEventListener('click', () => {

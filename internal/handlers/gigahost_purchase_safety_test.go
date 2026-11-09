@@ -26,6 +26,7 @@ func TestGigahostPurchaseSafety_HTTP402PreservesOrderIDAndBlocksDuplicate(t *tes
 		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
 			return &gigahost.AccountInfo{Balance: 200.0, Currency: "NOK"}, nil
 		},
+		getCatalogFn: fixtureCatalogFn,
 		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 			posts.Add(1)
 			return nil, &gigahost.OrderPartialError{
@@ -104,6 +105,7 @@ func TestGigahostPurchaseSafety_ConcurrentOrdersSerialized(t *testing.T) {
 		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
 			return &gigahost.AccountInfo{Balance: 500.0, Currency: "NOK"}, nil
 		},
+		getCatalogFn: fixtureCatalogFn,
 		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 			n := posts.Add(1)
 			// Simulate order dispatch latency

@@ -171,24 +171,19 @@ func (h *Handlers) persistSettings(ctx context.Context, req *models.SaveSettings
 	return h.db.SetSetting(ctx, "limits", req.Limits)
 }
 
-type mockCatalogFallback struct {
+// providerCatalogClient forwards every Client method to the injected client
+// unchanged and additionally exposes the last catalog eligibility it decoded.
+//
+// It previously synthesized a hardcoded hourly plan list whenever the inner
+// client returned no plans. That fabricated pids, price ids, rates and a region,
+// so the portal could offer - and the order path could accept - a "plan" the
+// provider never published. Nothing may be invented on the way to a purchase, so
+// the fallback is gone and the provider answer passes through unchanged.
+type providerCatalogClient struct {
 	gigahost.Client
 }
 
-func (m *mockCatalogFallback) GetCatalog(ctx context.Context) ([]gigahost.HourlyPlan, error) {
-	plans, err := m.Client.GetCatalog(ctx)
-	if err == nil && plans == nil {
-		return []gigahost.HourlyPlan{
-			{ProductID: 101, PriceID: 1, HourlyRateNOK: 0.15, MonthlyCeiling: 108.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
-			{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.15, MonthlyCeiling: 108.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
-			{ProductID: 201, PriceID: 2, HourlyRateNOK: 0.20, MonthlyCeiling: 144.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
-			{ProductID: 301, PriceID: 1, HourlyRateNOK: 0.15, MonthlyCeiling: 108.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
-		}, nil
-	}
-	return plans, err
-}
-
-func (m *mockCatalogFallback) GetCatalogEligibility() gigahost.CatalogEligibility {
+func (m *providerCatalogClient) GetCatalogEligibility() gigahost.CatalogEligibility {
 	if ce, ok := m.Client.(interface {
 		GetCatalogEligibility() gigahost.CatalogEligibility
 	}); ok {

@@ -21,6 +21,7 @@ import (
 type mockGigahostClient struct {
 	getCatalogFn      func(ctx context.Context) ([]gigahost.HourlyPlan, error)
 	getProductsFn     func(ctx context.Context) ([]gigahost.Product, error)
+	getOSFn           func(ctx context.Context) ([]gigahost.OperatingSystem, error)
 	getAccountFn      func(ctx context.Context) (*gigahost.AccountInfo, error)
 	orderServerFn     func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error)
 	orderServerSafeFn func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error)
@@ -40,6 +41,68 @@ func (m *mockGigahostClient) GetProducts(ctx context.Context) ([]gigahost.Produc
 		return m.getProductsFn(ctx)
 	}
 	return nil, nil
+}
+
+// GetOperatingSystems returns the documented fixture image catalog unless the
+// test overrides it. The fixture mirrors the documented /reinstall/distro shape:
+// one general image plus one dedicated-only image, which is what makes the
+// per-plan narrowing observable.
+func (m *mockGigahostClient) GetOperatingSystems(ctx context.Context) ([]gigahost.OperatingSystem, error) {
+	if m.getOSFn != nil {
+		return m.getOSFn(ctx)
+	}
+	return fixtureOperatingSystems(), nil
+}
+
+// fixtureOperatingSystems is the shared image catalog for handler tests. It
+// mirrors the documented GET /reinstall/distro shape (string-encoded numeric and
+// boolean fields decoded by OperatingSystem.UnmarshalJSON) and deliberately
+// contains one image per documented restriction so the per-plan narrowing is
+// observable: a plain image, a dedicated-only image and a RAM-gated image.
+func fixtureOperatingSystems() []gigahost.OperatingSystem {
+	return []gigahost.OperatingSystem{
+		{OSID: 12, DistID: 1, DistName: "Debian", Name: "Debian 12 Bookworm", Arch: "amd64"},
+		{OSID: 72, DistID: 9, DistName: "Ubuntu", Name: "Ubuntu 24.04 LTS", Arch: "amd64"},
+		{OSID: 90, DistID: 9, DistName: "Ubuntu", Name: "Ubuntu 24.04 LTS (dedicated)", Arch: "amd64", DedicatedOnly: true},
+		{OSID: 93, DistID: 1, DistName: "Debian", Name: "Debian 12 (8 GB minimum)", Arch: "amd64", MinRAMGB: 8},
+	}
+}
+
+// The provider os_id values the fixtures order with, so a test never spells a
+// bare number and never relies on an image the fixture does not contain.
+const (
+	testOSDebian12 int = 12
+	testOSUbuntu   int = 72
+)
+
+// fixtureHourlyPlan is one documented catalog row: product 101 / price 555 with
+// a documented hourly rate, monthly ceiling, region 1 in stock and one in-stock
+// datacenter. Tests that are not about catalog contents start from this row so
+// their order has a real selection to validate.
+func fixtureHourlyPlan() gigahost.HourlyPlan {
+	inStock := true
+	return gigahost.HourlyPlan{
+		ProductID:      101,
+		Name:           "Cloud 2",
+		Type:           "vm",
+		CPUCores:       2,
+		RAMMB:          4096,
+		DiskGB:         80,
+		InStock:        true,
+		PriceID:        555,
+		Currency:       "NOK",
+		HourlyRateNOK:  0.14375,
+		MonthlyCeiling: 90,
+		Regions:        []gigahost.Region{{ID: 1, Name: "Norway", Country: "NO", Available: true, InStock: &inStock}},
+		Datacenters:    []gigahost.Datacenter{{ID: 1, Name: "DC1", RegionID: 1, Location: "Sandefjord", Country: "NO", InStock: true}},
+		Eligibility:    gigahost.CatalogEligibility{QualifiesArrears: true},
+	}
+}
+
+// fixtureCatalogFn is the getCatalogFn a non-catalog test supplies so the order
+// path has a real provider answer instead of an invented one.
+func fixtureCatalogFn(context.Context) ([]gigahost.HourlyPlan, error) {
+	return []gigahost.HourlyPlan{fixtureHourlyPlan()}, nil
 }
 
 func (m *mockGigahostClient) GetAccount(ctx context.Context) (*gigahost.AccountInfo, error) {
@@ -192,10 +255,10 @@ func TestGigahostOrderHandler_RBAC(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)
 	body, _ := json.Marshal(OrderServerPayload{
 		PID:            101,
-		PriceID:        1,
+		PriceID:        555,
 		RegionID:       1,
-		OSID:           1,
-		HourlyPriceNOK: 0.15,
+		OSID:           testOSDebian12,
+		HourlyPriceNOK: 0.14375,
 	})
 
 	tests := []struct {
@@ -216,6 +279,7 @@ func TestGigahostOrderHandler_RBAC(t *testing.T) {
 				getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
 					return &gigahost.AccountInfo{Balance: 50.0}, nil
 				},
+				getCatalogFn: fixtureCatalogFn,
 				orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 					return &gigahost.OrderResponse{OrderID: "ord_rbac", Status: gigahost.StatusPending}, nil
 				},
@@ -246,6 +310,11 @@ func TestGigahostOrderHandler_AccountCreditPreCheck(t *testing.T) {
 		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
 			return &gigahost.AccountInfo{Balance: 0, Credit: 0}, nil
 		},
+		getCatalogFn: func(context.Context) ([]gigahost.HourlyPlan, error) {
+			plan := fixtureHourlyPlan()
+			plan.Eligibility = gigahost.CatalogEligibility{}
+			return []gigahost.HourlyPlan{plan}, nil
+		},
 		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 			orderCalled = true
 			return &gigahost.OrderResponse{OrderID: "ord_should_not_call"}, nil
@@ -254,10 +323,10 @@ func TestGigahostOrderHandler_AccountCreditPreCheck(t *testing.T) {
 
 	payload, _ := json.Marshal(OrderServerPayload{
 		PID:            101,
-		PriceID:        1,
+		PriceID:        555,
 		RegionID:       1,
-		OSID:           1,
-		HourlyPriceNOK: 0.15,
+		OSID:           testOSDebian12,
+		HourlyPriceNOK: 0.14375,
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", bytes.NewReader(payload))
@@ -281,6 +350,7 @@ func TestGigahostOrderHandler_SuccessAndPersistence(t *testing.T) {
 		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
 			return &gigahost.AccountInfo{Balance: 120.0, Currency: "NOK"}, nil
 		},
+		getCatalogFn: fixtureCatalogFn,
 		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 			sentReq = req
 			return &gigahost.OrderResponse{
@@ -294,11 +364,11 @@ func TestGigahostOrderHandler_SuccessAndPersistence(t *testing.T) {
 	})
 
 	payload, _ := json.Marshal(OrderServerPayload{
-		PID:            201,
-		PriceID:        2,
+		PID:            101,
+		PriceID:        555,
 		RegionID:       1,
-		OSID:           3,
-		HourlyPriceNOK: 0.20,
+		OSID:           testOSDebian12,
+		HourlyPriceNOK: 0.14375,
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", bytes.NewReader(payload))
@@ -329,8 +399,8 @@ func TestGigahostOrderHandler_SuccessAndPersistence(t *testing.T) {
 	if o.OrderID != "ord_persist_123" || o.ServerID != 777 || o.Status != gigahost.StatusPending {
 		t.Errorf("unexpected database record: %+v", o)
 	}
-	if o.HourlyPriceNOK != 0.20 {
-		t.Errorf("expected hourly price 0.20, got %f", o.HourlyPriceNOK)
+	if o.HourlyPriceNOK != 0.14375 {
+		t.Errorf("expected the catalog hourly price 0.14375, got %f", o.HourlyPriceNOK)
 	}
 
 	// Query DB directly via SQL to verify raw schema
@@ -348,6 +418,7 @@ func TestGigahostOrderHandler_TimeoutRecovery(t *testing.T) {
 		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
 			return &gigahost.AccountInfo{Balance: 50.0}, nil
 		},
+		getCatalogFn: fixtureCatalogFn,
 		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 			return &gigahost.OrderResponse{
 				Status:  gigahost.StatusUnknown,
@@ -357,11 +428,11 @@ func TestGigahostOrderHandler_TimeoutRecovery(t *testing.T) {
 	})
 
 	payload, _ := json.Marshal(OrderServerPayload{
-		PID:            301,
-		PriceID:        1,
+		PID:            101,
+		PriceID:        555,
 		RegionID:       1,
-		OSID:           1,
-		HourlyPriceNOK: 0.10,
+		OSID:           testOSDebian12,
+		HourlyPriceNOK: 0.14375,
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", bytes.NewReader(payload))
@@ -576,6 +647,7 @@ func TestGigahost_SecurityAndDurabilityContracts(t *testing.T) {
 		}
 		calls := 0
 		h.SetGigahostClient(&mockGigahostClient{
+			getCatalogFn: fixtureCatalogFn,
 			orderServerSafeFn: func(context.Context, gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 				calls++
 				return &gigahost.OrderResponse{OrderID: "paid_10001", Status: gigahost.StatusPending}, nil
@@ -599,6 +671,7 @@ func TestGigahost_SecurityAndDurabilityContracts(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		h.SetGigahostClient(&mockGigahostClient{
+			getCatalogFn: fixtureCatalogFn,
 			orderServerSafeFn: func(context.Context, gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 				cancel() // Client disconnected right after order succeeded
 				return &gigahost.OrderResponse{OrderID: "paid_10002", Status: gigahost.StatusPending}, nil

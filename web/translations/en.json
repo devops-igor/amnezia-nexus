@@ -729,5 +729,11 @@
   "deploy_ssh_password_prompt": "Enter SSH Password for VPS:",
   "deploy_status_polling": "Setting up VPN backend...",
   "deploy_protocol_prompt": "Select protocol (awg, vless, naive):",
-  "deploy_domain_prompt": "Enter TLS domain (required for naive, optional for vless):"
+  "deploy_domain_prompt": "Enter TLS domain (required for naive, optional for vless):",
+  "deploy_vps_no_plans": "No deployable plans were returned by the provider",
+  "deploy_vps_no_region_stock": "No region currently has stock for this plan",
+  "deploy_vps_no_os": "No operating system is installable on this plan",
+  "deploy_vps_catalog_unavailable": "Provider catalog unavailable",
+  "deploy_vps_select_required": "Select a region and an operating system first",
+  "deploy_vps_order_placed": "VPS order placed successfully"
 }

@@ -21,6 +21,7 @@ import (
 type Client interface {
 	GetCatalog(ctx context.Context) ([]HourlyPlan, error)
 	GetProducts(ctx context.Context) ([]Product, error)
+	GetOperatingSystems(ctx context.Context) ([]OperatingSystem, error)
 	GetAccount(ctx context.Context) (*AccountInfo, error)
 	OrderServer(ctx context.Context, req OrderRequest) (*OrderResponse, error)
 	OrderServerSafe(ctx context.Context, req OrderRequest) (*OrderResponse, error)
@@ -94,6 +95,102 @@ func NewClient(cfg Config) (Client, error) {
 	}, nil
 }
 
+// GetOperatingSystems returns the provider's installable images for
+// GET /reinstall/distro plus one GET /reinstall/distro/{dist_id} per
+// distribution, which is the documented way to discover os_id values. The
+// distribution list is small and closed; an error from any distribution fails
+// the whole call so a partial image list is never presented as complete.
+func (c *client) GetOperatingSystems(ctx context.Context) ([]OperatingSystem, error) {
+	var distroData []byte
+	if err := c.doRequest(ctx, http.MethodGet, "/reinstall/distro", nil, &distroData); err != nil {
+		return nil, fmt.Errorf("failed to fetch distributions: %w", err)
+	}
+	distros, err := parseDistros(distroData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode distributions: %w", err)
+	}
+
+	var systems []OperatingSystem
+	for _, d := range distros {
+		if d.Inactive() {
+			continue
+		}
+		var pageData []byte
+		path := fmt.Sprintf("/reinstall/distro/%d", d.ID)
+		if err := c.doRequest(ctx, http.MethodGet, path, nil, &pageData); err != nil {
+			return nil, fmt.Errorf("failed to fetch operating systems for distribution %d: %w", d.ID, err)
+		}
+		images, err := parseOperatingSystems(pageData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode operating systems for distribution %d: %w", d.ID, err)
+		}
+		for i := range images {
+			if images[i].DistName == "" {
+				images[i].DistName = d.Name
+			}
+			if images[i].DistID == 0 {
+				images[i].DistID = d.ID
+			}
+			systems = append(systems, images[i])
+		}
+	}
+	return systems, nil
+}
+
+// distrib is one entry from GET /reinstall/distro.
+type distrib struct {
+	ID     int    `json:"dist_id"`
+	Name   string `json:"dist_name"`
+	Value  string `json:"dist_value"`
+	Active *bool  `json:"dist_active"`
+}
+
+// Inactive reports whether the provider explicitly marked the distribution
+// inactive. An absent flag is not treated as inactive.
+func (d distrib) Inactive() bool {
+	return d.Active != nil && !*d.Active
+}
+
+// UnmarshalJSON decodes the documented string-encoded dist_id and dist_active.
+func (d *distrib) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ID     any    `json:"dist_id"`
+		Name   string `json:"dist_name"`
+		Value  string `json:"dist_value"`
+		Active any    `json:"dist_active"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	d.ID = int(parseInt64Field(raw.ID))
+	d.Name = raw.Name
+	d.Value = raw.Value
+	if b, ok := parseBoolFieldStrict(raw.Active); ok {
+		d.Active = &b
+	}
+	return nil
+}
+
+func parseDistros(data []byte) ([]distrib, error) {
+	var doc struct {
+		Data []distrib `json:"data"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	return doc.Data, nil
+}
+
+func parseOperatingSystems(data []byte) ([]OperatingSystem, error) {
+	var doc struct {
+		Data []OperatingSystem `json:"data"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	return doc.Data, nil
+}
+
 // GetProducts queries the raw product catalog from GET /deploy/servers.
 func (c *client) GetProducts(ctx context.Context) ([]Product, error) {
 	var respData []byte
@@ -112,7 +209,9 @@ func (c *client) GetProducts(ctx context.Context) ([]Product, error) {
 	return products, nil
 }
 
-// GetCatalog queries available products and filters those supporting hourly billing.
+// GetCatalog queries available products and filters those supporting hourly
+// billing. Each plan carries the provider's own placement and image facts so
+// the portal can offer only real choices and the handler can revalidate them.
 func (c *client) GetCatalog(ctx context.Context) ([]HourlyPlan, error) {
 	products, err := c.GetProducts(ctx)
 	if err != nil {
@@ -136,17 +235,20 @@ func (c *client) GetCatalog(ctx context.Context) ([]HourlyPlan, error) {
 					ProductID:      p.GetID(),
 					Name:           p.Name,
 					Description:    p.Description,
+					Type:           p.Type,
 					CPUCores:       p.CPUCores,
 					RAMMB:          p.RAMMB,
 					DiskGB:         p.DiskGB,
 					BandwidthTB:    p.BandwidthTB,
 					InStock:        p.InStock,
+					BuiltToOrder:   p.BuiltToOrder,
+					WaitlistOK:     p.WaitlistOK,
 					PriceID:        price.ID,
 					Currency:       currency,
 					HourlyRateNOK:  rate,
 					MonthlyCeiling: price.MonthlyCeiling,
 					Regions:        p.Regions,
-					OSList:         p.OSList,
+					Datacenters:    p.Datacenters,
 					Eligibility:    p.Eligibility,
 				}
 				hourlyPlans = append(hourlyPlans, plan)
@@ -155,6 +257,28 @@ func (c *client) GetCatalog(ctx context.Context) ([]HourlyPlan, error) {
 	}
 
 	return hourlyPlans, nil
+}
+
+// GetSelectableCatalog returns the hourly catalog with each plan's documented
+// region, datacenter and operating-system choices. It is the read the portal and
+// the order path both use: an image list that could not be read fails the whole
+// call, so a plan is never offered with a guessed or partial image set.
+func (c *client) GetSelectableCatalog(ctx context.Context) ([]HourlyPlan, error) {
+	plans, err := c.GetCatalog(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(plans) == 0 {
+		return plans, nil
+	}
+	images, err := c.GetOperatingSystems(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read provider images: %w", err)
+	}
+	for i := range plans {
+		plans[i].OSOptions = plans[i].InstallableImages(images)
+	}
+	return plans, nil
 }
 
 // GetCatalogEligibility returns the most recently decoded catalog eligibility.
@@ -622,7 +746,11 @@ type tierProductDTO struct {
 	RateHourly     float64            `json:"rate_hourly"`
 	RateMonthly    float64            `json:"rate_monthly"`
 	RegionIDs      []any              `json:"region_ids"`
+	DCIDs          []any              `json:"dc_ids"`
+	DCStock        map[string]any     `json:"dc_stock"`
 	InStock        bool               `json:"in_stock"`
+	BuiltToOrder   bool               `json:"built_to_order"`
+	WaitlistOK     bool               `json:"waitlist_eligible"`
 	VMCores        string             `json:"vm_cores"`
 	VMMemory       string             `json:"vm_memory"`
 	VMStorage      string             `json:"vm_storage"`
@@ -638,7 +766,19 @@ type tierProductDTO struct {
 	} `json:"specs"`
 }
 
-func buildTierProduct(p tierProductDTO, regionMap map[int]Region, currency string, eligibility CatalogEligibility) Product {
+// dcPlacement is one datacenter the provider listed in the catalog.
+type dcPlacement struct {
+	ID       int
+	Name     string
+	RegionID int
+	Location string
+	Country  string
+}
+
+// buildTierProduct converts one documented catalog product into the plan shape
+// the portal and handler use, keeping every placement fact the provider
+// documents: the region list, the per-product datacenters and their stock.
+func buildTierProduct(p tierProductDTO, regionMap map[int]Region, dcMap map[int]dcPlacement, currency string, eligibility CatalogEligibility) Product {
 	cores := p.Specs.CPUCores
 	if cores <= 0 && p.VMCores != "" {
 		cores, _ = strconv.Atoi(p.VMCores)
@@ -660,15 +800,8 @@ func buildTierProduct(p tierProductDTO, regionMap map[int]Region, currency strin
 		bw, _ = strconv.ParseFloat(p.VMBW, 64)
 	}
 
-	var regions []Region
-	for _, ridAny := range p.RegionIDs {
-		rid := int(parseInt64Field(ridAny))
-		if reg, ok := regionMap[rid]; ok {
-			regions = append(regions, reg)
-		} else {
-			regions = append(regions, Region{ID: rid, Available: true})
-		}
-	}
+	datacenters, dcStockKnown := placementFor(p, dcMap)
+	regions := regionsFor(p, regionMap, datacenters, dcStockKnown)
 
 	var prices []Price
 	if p.AllowHourly && p.PriceID > 0 && p.InStock {
@@ -686,18 +819,103 @@ func buildTierProduct(p tierProductDTO, regionMap map[int]Region, currency strin
 	}
 
 	return Product{
-		ID:          p.ProductID,
-		PID:         p.ProductID,
-		Name:        p.ProductName,
-		CPUCores:    cores,
-		RAMMB:       ram,
-		DiskGB:      disk,
-		BandwidthTB: bw,
-		InStock:     p.InStock,
-		Prices:      prices,
-		Regions:     regions,
-		Eligibility: eligibility,
+		ID:           p.ProductID,
+		PID:          p.ProductID,
+		Name:         p.ProductName,
+		Type:         p.Type,
+		CPUCores:     cores,
+		RAMMB:        ram,
+		DiskGB:       disk,
+		BandwidthTB:  bw,
+		InStock:      p.InStock,
+		BuiltToOrder: p.BuiltToOrder,
+		WaitlistOK:   p.WaitlistOK,
+		Prices:       prices,
+		Regions:      regions,
+		Datacenters:  datacenters,
+		Eligibility:  eligibility,
 	}
+}
+
+// placementFor returns the product's own datacenters with the provider's stock
+// fact for each. dcStockKnown reports whether the catalog carried dc_stock at
+// all, so an absent fact is never read as "sold out".
+func placementFor(p tierProductDTO, dcMap map[int]dcPlacement) ([]Datacenter, bool) {
+	dcStockKnown := len(p.DCStock) > 0
+	var datacenters []Datacenter
+	for _, dcAny := range p.DCIDs {
+		id := int(parseInt64Field(dcAny))
+		dc := Datacenter{ID: id}
+		if known, ok := dcMap[id]; ok {
+			dc.Name = known.Name
+			dc.RegionID = known.RegionID
+			dc.Location = known.Location
+			dc.Country = known.Country
+		}
+		if inStock, ok := dcStockValue(p.DCStock, id); ok {
+			dc.InStock = inStock
+		}
+		datacenters = append(datacenters, dc)
+	}
+	return datacenters, dcStockKnown
+}
+
+// dcStockValue reads one dc_stock entry, whose key is a datacenter id and whose
+// value may be a JSON boolean or a "0"/"1" string.
+func dcStockValue(stock map[string]any, dcID int) (bool, bool) {
+	if len(stock) == 0 {
+		return false, false
+	}
+	raw, ok := stock[strconv.Itoa(dcID)]
+	if !ok {
+		return false, false
+	}
+	return parseBoolFieldStrict(raw)
+}
+
+// regionsFor builds the plan's region list. Availability comes from region_ids;
+// the per-region stock is true when at least one of the product's datacenters in
+// that region reports stock, false when every such datacenter reports none, and
+// left unknown (nil) when the catalog carried no stock fact.
+func regionsFor(p tierProductDTO, regionMap map[int]Region, datacenters []Datacenter, dcStockKnown bool) []Region {
+	var regions []Region
+	for _, ridAny := range p.RegionIDs {
+		rid := int(parseInt64Field(ridAny))
+		reg, known := regionMap[rid]
+		if !known {
+			reg = Region{ID: rid}
+		}
+		reg.Available = true
+		reg.InStock = regionStock(rid, datacenters, dcStockKnown)
+		regions = append(regions, reg)
+	}
+	return regions
+}
+
+// regionStock summarises the product's datacenter stock inside one region: true
+// when any of its datacenters in that region reports stock, false when they all
+// report none, and unknown (nil) when the catalog carried no stock fact or no
+// documented datacenter maps to the region.
+func regionStock(regionID int, datacenters []Datacenter, dcStockKnown bool) *bool {
+	if !dcStockKnown {
+		return nil
+	}
+	matched := false
+	for _, dc := range datacenters {
+		if dc.RegionID != regionID {
+			continue
+		}
+		matched = true
+		if dc.InStock {
+			inStock := true
+			return &inStock
+		}
+	}
+	if !matched {
+		return nil
+	}
+	inStock := false
+	return &inStock
 }
 
 func parseProducts(data []byte) ([]Product, CatalogEligibility, error) {
@@ -717,6 +935,14 @@ func parseProducts(data []byte) ([]Product, CatalogEligibility, error) {
 				RegionName string `json:"region_name"`
 				Country    string `json:"region_country"`
 			} `json:"regions"`
+			Datacenters []struct {
+				DCID           any    `json:"dc_id"`
+				DCName         string `json:"dc_name"`
+				RegionID       any    `json:"region_id"`
+				RegionName     string `json:"region_name"`
+				RegionLocation string `json:"region_location"`
+				RegionCountry  string `json:"region_country"`
+			} `json:"datacenters"`
 			Currency    string             `json:"currency"`
 			Eligibility CatalogEligibility `json:"eligibility"`
 		} `json:"data"`
@@ -743,11 +969,28 @@ func parseProducts(data []byte) ([]Product, CatalogEligibility, error) {
 				Available: true,
 			}
 		}
+		dcMap := make(map[int]dcPlacement)
+		for _, dc := range doc.Data.Datacenters {
+			id := int(parseInt64Field(dc.DCID))
+			regionID := int(parseInt64Field(dc.RegionID))
+			if regionID == 0 {
+				if reg, ok := regionMap[0]; ok {
+					regionID = reg.ID
+				}
+			}
+			dcMap[id] = dcPlacement{
+				ID:       id,
+				Name:     dc.DCName,
+				RegionID: regionID,
+				Location: dc.RegionLocation,
+				Country:  dc.RegionCountry,
+			}
+		}
 
 		var products []Product
 		for _, tier := range doc.Data.Tiers {
 			for _, p := range tier.Products {
-				products = append(products, buildTierProduct(p, regionMap, currency, eligibility))
+				products = append(products, buildTierProduct(p, regionMap, dcMap, currency, eligibility))
 			}
 		}
 		if len(products) > 0 {

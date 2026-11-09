@@ -44,7 +44,7 @@ func (h *Handlers) SetGigahostClient(c gigahost.Client) {
 	h.gigahostMu.Lock()
 	defer h.gigahostMu.Unlock()
 	if c != nil {
-		h.gigahostClient = &mockCatalogFallback{Client: c}
+		h.gigahostClient = &providerCatalogClient{Client: c}
 	} else {
 		h.gigahostClient = nil
 	}
@@ -140,7 +140,8 @@ func (h *Handlers) getGigahostOrders(ctx context.Context) ([]GigahostOrderRecord
 }
 
 // GigahostCatalogHandler handles GET /api/admin/hosting/gigahost/catalog.
-// Retrieves available hourly VPS plans, pricing, regions, and stock status.
+// Retrieves available hourly VPS plans with the provider's documented region,
+// datacenter and operating-system choices, plus hourly price and currency.
 func (h *Handlers) GigahostCatalogHandler(w http.ResponseWriter, r *http.Request) {
 	sess := middleware.GetSession(r.Context())
 	if sess == nil || sess.Role != models.RoleAdmin {
@@ -154,7 +155,7 @@ func (h *Handlers) GigahostCatalogHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	plans, err := client.GetCatalog(r.Context())
+	plans, images, err := h.loadSelectablePlans(r.Context(), client)
 	if err != nil {
 		if errors.Is(err, gigahost.ErrUnauthorized) {
 			h.JSONError(w, http.StatusBadGateway, "upstream_auth_failed", "Gigahost API authentication failed")
@@ -169,9 +170,31 @@ func (h *Handlers) GigahostCatalogHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	h.JSONOK(w, map[string]any{
-		"plans": plans,
-		"count": len(plans),
+		"plans":            plans,
+		"count":            len(plans),
+		"operating_system": images,
+		"os_count":         len(images),
 	})
+}
+
+// loadSelectablePlans reads the provider catalog and its documented image
+// catalog, then attaches to every plan the images that can actually be installed
+// on it. Both reads are required: a plan is never published with a guessed or
+// partial selection set, because an order built from one would be rejected by
+// the provider after the money-moving request.
+func (h *Handlers) loadSelectablePlans(ctx context.Context, client gigahost.Client) ([]gigahost.HourlyPlan, []gigahost.OperatingSystem, error) {
+	plans, err := client.GetCatalog(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	images, err := client.GetOperatingSystems(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read provider operating systems: %w", err)
+	}
+	for i := range plans {
+		plans[i].OSOptions = plans[i].InstallableImages(images)
+	}
+	return plans, images, nil
 }
 
 // catalogEligibility derives the eligibility the provider exposes on the
@@ -213,7 +236,7 @@ func catalogEligibility(client gigahost.Client, catalogPlans []gigahost.HourlyPl
 // no order) and a reaching call with no credit is ErrInsufficientCredit. No
 // credit guard is removed.
 func (h *Handlers) verifyAccountEligibility(ctx context.Context, client gigahost.Client) ([]gigahost.HourlyPlan, error) {
-	catalogPlans, catErr := client.GetCatalog(ctx)
+	catalogPlans, _, catErr := h.loadSelectablePlans(ctx, client)
 	if catErr != nil {
 		return nil, fmt.Errorf("catalog_check_failed: %w", catErr)
 	}
@@ -610,35 +633,63 @@ func validateOrderAgainstCatalog(catalog []gigahost.HourlyPlan, req OrderServerP
 	if matchedPlan == nil {
 		return fmt.Errorf("invalid_plan: plan %d (price %d) not found in provider catalog", req.PID, req.PriceID)
 	}
-	if !matchedPlan.InStock {
+	if !matchedPlan.HasStock() {
 		return fmt.Errorf("invalid_plan: plan %d is out of stock", req.PID)
-	}
-	if err := validatePlanRegion(matchedPlan, req); err != nil {
-		return err
 	}
 
 	// A plan the provider prices at zero would be ordered without an
 	// authoritative rate, so ordering stays refused. This is a price-integrity
 	// check on the provider catalog entry, not a spending ceiling: nothing
-	// compares the plan against a configured amount any more.
+	// compares the plan against a configured amount any more. It is evaluated on
+	// the plan alone, before the selection checks, so the operator is told the
+	// real reason a plan cannot be ordered at all.
 	if matchedPlan.MonthlyCeiling <= 0 && matchedPlan.HourlyRateNOK <= 0 {
 		return fmt.Errorf("invalid_plan: plan %d has zero or negative price in provider catalog", req.PID)
+	}
+
+	if err := validatePlanRegion(matchedPlan, req); err != nil {
+		return err
+	}
+	if err := validatePlanOS(matchedPlan, req); err != nil {
+		return err
 	}
 	return nil
 }
 
-// validatePlanRegion requires the selected region to be present and available in
-// the plan the provider actually returned.
+// validatePlanRegion requires the selected region to be one the plan documents
+// and to have capacity right now. A region the catalog reported without a stock
+// fact is accepted (the provider documents dc_stock as optional), but a region
+// the provider marked sold out is refused here rather than by a failed purchase.
 func validatePlanRegion(plan *gigahost.HourlyPlan, req OrderServerPayload) error {
 	if len(plan.Regions) == 0 {
 		return fmt.Errorf("invalid_plan: plan %d has no available regions in catalog", req.PID)
 	}
 	for _, r := range plan.Regions {
-		if r.ID == req.RegionID && r.Available {
+		if r.ID != req.RegionID {
+			continue
+		}
+		if !r.Sellable() {
+			return fmt.Errorf("invalid_plan: region %d is not available for plan %d", req.RegionID, req.PID)
+		}
+		return nil
+	}
+	return fmt.Errorf("invalid_plan: region %d is not available for plan %d", req.RegionID, req.PID)
+}
+
+// validatePlanOS requires the selected image to be one the provider catalog
+// actually returned for this plan. A stale or tampered os_id therefore fails
+// before any purchase request is built, instead of ordering an image the
+// provider would reject — or silently swapping in a different one.
+func validatePlanOS(plan *gigahost.HourlyPlan, req OrderServerPayload) error {
+	if len(plan.OSOptions) == 0 {
+		return fmt.Errorf("invalid_plan: plan %d has no installable operating systems in provider catalog", req.PID)
+	}
+	for _, image := range plan.OSOptions {
+		if image.OSID == req.OSID {
 			return nil
 		}
 	}
-	return fmt.Errorf("invalid_plan: region %d is not available for plan %d", req.RegionID, req.PID)
+	return fmt.Errorf("invalid_plan: operating system %d is not available for plan %d", req.OSID, req.PID)
 }
 
 func isPendingOrInFlight(status string) bool {

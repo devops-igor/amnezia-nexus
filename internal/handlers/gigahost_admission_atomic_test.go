@@ -70,6 +70,9 @@ func (b *barrierClient) GetCatalog(ctx context.Context) ([]gigahost.HourlyPlan, 
 func (b *barrierClient) GetProducts(ctx context.Context) ([]gigahost.Product, error) {
 	return b.inner.GetProducts(ctx)
 }
+func (b *barrierClient) GetOperatingSystems(ctx context.Context) ([]gigahost.OperatingSystem, error) {
+	return b.inner.GetOperatingSystems(ctx)
+}
 func (b *barrierClient) GetAccount(ctx context.Context) (*gigahost.AccountInfo, error) {
 	return b.inner.GetAccount(ctx)
 }
@@ -469,6 +472,9 @@ func (p *purchaseBarrier) OrderServerSafe(ctx context.Context, r gigahost.OrderR
 
 func (p *purchaseBarrier) GetProducts(ctx context.Context) ([]gigahost.Product, error) {
 	return p.Client.GetProducts(ctx)
+}
+func (p *purchaseBarrier) GetOperatingSystems(ctx context.Context) ([]gigahost.OperatingSystem, error) {
+	return p.Client.GetOperatingSystems(ctx)
 }
 func (p *purchaseBarrier) GetAccount(ctx context.Context) (*gigahost.AccountInfo, error) {
 	return p.Client.GetAccount(ctx)

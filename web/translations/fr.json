@@ -729,5 +729,11 @@
   "deploy_ssh_password_prompt": "Entrez le mot de passe SSH pour le VPS :",
   "deploy_status_polling": "Configuration du serveur VPN...",
   "deploy_protocol_prompt": "Sélectionnez le protocole (awg, vless, naive) :",
-  "deploy_domain_prompt": "Entrez le domaine TLS (requis pour naive, optionnel pour vless) :"
+  "deploy_domain_prompt": "Entrez le domaine TLS (requis pour naive, optionnel pour vless) :",
+  "deploy_vps_no_plans": "Aucune offre déployable renvoyée par le fournisseur",
+  "deploy_vps_no_region_stock": "Aucune région n'a de stock pour cette offre",
+  "deploy_vps_no_os": "Aucun système d'exploitation installable sur cette offre",
+  "deploy_vps_catalog_unavailable": "Catalogue du fournisseur indisponible",
+  "deploy_vps_select_required": "Sélectionnez d'abord une région et un système d'exploitation",
+  "deploy_vps_order_placed": "Commande VPS passée avec succès"
 }

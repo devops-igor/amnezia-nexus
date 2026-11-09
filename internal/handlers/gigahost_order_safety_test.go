@@ -96,7 +96,7 @@ func TestGigahostOrderHandler_ValidateCatalogAgainstProvider(t *testing.T) {
 	}
 
 	t.Run("invalid plan absent from catalog returns 400", func(t *testing.T) {
-		w := sendOrder(999, 555, 1, 1, 0.25)
+		w := sendOrder(999, 555, 1, testOSDebian12, 0.25)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("expected 400 Bad Request, got %d (body: %s)", w.Code, w.Body.String())
 		}
@@ -106,7 +106,7 @@ func TestGigahostOrderHandler_ValidateCatalogAgainstProvider(t *testing.T) {
 	})
 
 	t.Run("out-of-stock plan returns 400", func(t *testing.T) {
-		w := sendOrder(102, 556, 1, 1, 0.25)
+		w := sendOrder(102, 556, 1, testOSDebian12, 0.25)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("expected 400 Bad Request, got %d (body: %s)", w.Code, w.Body.String())
 		}
@@ -116,7 +116,7 @@ func TestGigahostOrderHandler_ValidateCatalogAgainstProvider(t *testing.T) {
 	})
 
 	t.Run("unpriced zero-rate plan returns 400", func(t *testing.T) {
-		w := sendOrder(103, 557, 1, 1, 0.0)
+		w := sendOrder(103, 557, 1, testOSDebian12, 0.0)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("expected 400 Bad Request, got %d (body: %s)", w.Code, w.Body.String())
 		}
@@ -126,7 +126,7 @@ func TestGigahostOrderHandler_ValidateCatalogAgainstProvider(t *testing.T) {
 	})
 
 	t.Run("unavailable region returns 400", func(t *testing.T) {
-		w := sendOrder(104, 558, 2, 1, 0.25)
+		w := sendOrder(104, 558, 2, testOSDebian12, 0.25)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("expected 400 Bad Request, got %d (body: %s)", w.Code, w.Body.String())
 		}
@@ -136,7 +136,7 @@ func TestGigahostOrderHandler_ValidateCatalogAgainstProvider(t *testing.T) {
 	})
 
 	t.Run("valid plan succeeds with 200", func(t *testing.T) {
-		w := sendOrder(101, 555, 1, 1, 0.25)
+		w := sendOrder(101, 555, 1, testOSDebian12, 0.25)
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200 OK for valid plan, got %d (body: %s)", w.Code, w.Body.String())
 		}
@@ -189,7 +189,7 @@ func TestGigahostOrderHandler_AmbiguousProviderErrorBlocksDuplicates(t *testing.
 		PID:            201,
 		PriceID:        555,
 		RegionID:       1,
-		OSID:           1,
+		OSID:           testOSDebian12,
 		HourlyPriceNOK: 0.20,
 	})
 

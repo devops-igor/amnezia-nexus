@@ -729,5 +729,11 @@
   "deploy_ssh_password_prompt": "输入 VPS 的 SSH 密码：",
   "deploy_status_polling": "正在配置 VPN 后端...",
   "deploy_protocol_prompt": "选择协议 (awg, vless, naive)：",
-  "deploy_domain_prompt": "输入 TLS 域名（naive 必需，vless 可选）："
+  "deploy_domain_prompt": "输入 TLS 域名（naive 必需，vless 可选）：",
+  "deploy_vps_no_plans": "提供商未返回可部署的方案",
+  "deploy_vps_no_region_stock": "该方案当前在任何区域都没有库存",
+  "deploy_vps_no_os": "该方案没有可安装的操作系统",
+  "deploy_vps_catalog_unavailable": "提供商目录不可用",
+  "deploy_vps_select_required": "请先选择区域和操作系统",
+  "deploy_vps_order_placed": "VPS 订单已成功提交"
 }

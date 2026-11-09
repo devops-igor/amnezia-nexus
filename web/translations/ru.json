@@ -729,5 +729,11 @@
   "deploy_ssh_password_prompt": "Введите SSH пароль для VPS:",
   "deploy_status_polling": "Настройка VPN сервера...",
   "deploy_protocol_prompt": "Выберите протокол (awg, vless, naive):",
-  "deploy_domain_prompt": "Введите TLS домен (обязательно для naive, опционально для vless):"
+  "deploy_domain_prompt": "Введите TLS домен (обязательно для naive, опционально для vless):",
+  "deploy_vps_no_plans": "Провайдер не вернул ни одного доступного тарифа",
+  "deploy_vps_no_region_stock": "Ни в одном регионе нет запаса для этого тарифа",
+  "deploy_vps_no_os": "Для этого тарифа нет устанавливаемой операционной системы",
+  "deploy_vps_catalog_unavailable": "Каталог провайдера недоступен",
+  "deploy_vps_select_required": "Сначала выберите регион и операционную систему",
+  "deploy_vps_order_placed": "Заказ VPS успешно размещён"
 }

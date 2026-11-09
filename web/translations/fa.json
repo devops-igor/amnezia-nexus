@@ -729,5 +729,11 @@
   "deploy_ssh_password_prompt": "رمز عبور SSH برای سرور مجازی را وارد کنید:",
   "deploy_status_polling": "در حال راه‌اندازی سرور VPN...",
   "deploy_protocol_prompt": "پروتکل را انتخاب کنید (awg, vless, naive):",
-  "deploy_domain_prompt": "دامنه TLS را وارد کنید (برای naive الزامی، برای vless اختیاری):"
+  "deploy_domain_prompt": "دامنه TLS را وارد کنید (برای naive الزامی، برای vless اختیاری):",
+  "deploy_vps_no_plans": "ارائه‌دهنده هیچ طرح قابل استقرار برنگرداند",
+  "deploy_vps_no_region_stock": "هیچ منطقه‌ای برای این طرح موجودی ندارد",
+  "deploy_vps_no_os": "هیچ سیستم عاملی برای این طرح قابل نصب نیست",
+  "deploy_vps_catalog_unavailable": "کاتالوگ ارائه‌دهنده در دسترس نیست",
+  "deploy_vps_select_required": "ابتدا منطقه و سیستم عامل را انتخاب کنید",
+  "deploy_vps_order_placed": "سفارش VPS با موفقیت ثبت شد"
 }
