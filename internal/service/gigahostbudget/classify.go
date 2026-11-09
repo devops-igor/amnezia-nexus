@@ -17,7 +17,8 @@ package gigahostbudget
 // bought against budget the first one is still consuming.
 //
 // Provider contract reference: https://gigahost.no/en/api-dokumentasjon
-// The relevant contract facts are:
+// See deployment status, server cancellation, hourly billing, waitlist
+// reservations and routed IPv4 addresses. The relevant contract facts are:
 //
 //	E1  GET /deploy/status omits canceled orders and orders whose server was
 //	    deleted, and silently ignores orders that are not yours. Its omission is
@@ -232,7 +233,7 @@ func IsServerActiveForBudget(status string) bool {
 // EntryMatchesServer reports whether a ledger row and a provider inventory row
 // describe the same VPS.
 //
-// Two rules, both required by contract E5 and by the intake counterexample:
+// Two rules preserve contract E5 and prevent conflicting identity matches:
 //
 //  1. Only a provider order id or a provider server id can establish
 //     equivalence. A shared plan, price, region, hourly rate or assigned address

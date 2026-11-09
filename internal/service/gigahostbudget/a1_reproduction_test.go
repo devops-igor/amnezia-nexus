@@ -1,19 +1,17 @@
 package gigahostbudget
 
-// Reproduction and refutation oracles for the A1 intake findings.
+// Regression oracles for provider-contract accounting and identity rules.
 //
-// These are deliberately written as executable counterexamples against the
-// public provider contract: https://gigahost.no/en/api-dokumentasjon
-// Each test describes the contract fact it protects. A test that fails before
-// the A1 correction and passes after it is the reproduction; a test that passes
-// both before and after
-// is the refutation of an intake claim.
+// Public contract reference: https://gigahost.no/en/api-dokumentasjon
+// See deployment status, server cancellation, hourly billing and routed IPv4
+// addresses. Each test describes the contract fact or accounting invariant it
+// protects; no private evidence document is needed to interpret its assertions.
 
 import (
 	"testing"
 )
 
-// TestA1_CancelledServerStillBilled is intake finding 1, confirmed.
+// TestA1_CancelledServerStillBilled preserves pending cancellation accounting.
 //
 // Contract E2: `cancelled` on a server is a PENDING
 // cancellation. The server keeps running until termination_date and the hourly
@@ -34,7 +32,7 @@ func TestA1_CancelledServerStillBilled(t *testing.T) {
 	}
 }
 
-// TestA1_UndocumentedTerminalLabelsAreNotProof is intake finding 1, confirmed.
+// TestA1_UndocumentedTerminalLabelsAreNotProof rejects unsupported billing inferences.
 //
 // Contract E3: the documentation gives no billing semantics for stopped,
 // expired or refunded. An undocumented label cannot prove a charge does not
@@ -49,7 +47,7 @@ func TestA1_UndocumentedTerminalLabelsAreNotProof(t *testing.T) {
 	}
 }
 
-// TestA1_DeployStatusOmissionIsNotProof is intake finding 1, confirmed.
+// TestA1_DeployStatusOmissionIsNotProof retains omitted commitments.
 //
 // Contract E1: GET /deploy/status deliberately omits cancelled and
 // deleted orders, so absence cannot distinguish "never existed" from "served and
@@ -168,7 +166,7 @@ func TestA1_LocalTerminalLabelDoesNotHideProviderContradiction(t *testing.T) {
 	}
 }
 
-// TestA1_OperatorNoteIsNotReleaseProof is intake finding 2, confirmed.
+// TestA1_OperatorNoteIsNotReleaseProof requires authoritative release evidence.
 //
 // The approved scope forbids an administrator waiver in place of authoritative
 // reconciliation. Evidence carrying only an operator note and a confirmation
@@ -187,7 +185,7 @@ func TestA1_OperatorNoteIsNotReleaseProof(t *testing.T) {
 	}
 }
 
-// TestA1_IPAloneIsNotIdentity is intake finding 3, confirmed.
+// TestA1_IPAloneIsNotIdentity rejects reusable addresses as identity.
 //
 // Contract E5: a routed IP "can be moved between your servers". Addresses are
 // therefore reusable and cannot bind two records to one commitment.
@@ -215,9 +213,9 @@ func TestA1_IPAloneIsNotIdentity(t *testing.T) {
 	})
 }
 
-// TestA1_ConflictingIdentitiesKeepTheCommitment is intake finding 3, confirmed.
+// TestA1_ConflictingIdentitiesKeepTheCommitment preserves distinct commitments.
 //
-// The intake's concrete claim: a ledger row whose provider server id matches an
+// A ledger row whose provider server id matches an
 // inventory row was paired even when its non-empty provider order id named a
 // different order. That drops or merges a distinct commitment.
 func TestA1_ConflictingIdentitiesKeepTheCommitment(t *testing.T) {
