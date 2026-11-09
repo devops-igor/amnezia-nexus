@@ -549,7 +549,7 @@ func TestGigahost_SecurityAndDurabilityContracts(t *testing.T) {
 	t.Run("backup redacts configured api key for support", func(t *testing.T) {
 		h, db, _ := setupTestHandlers(t)
 		key := "flux_live_" + strings.Repeat("e", 64)
-		if err := db.SetSetting(context.Background(), "gigahost", map[string]any{"api_key": key, "monthly_budget_nok": 250.0}); err != nil {
+		if err := db.SetSetting(context.Background(), "gigahost", map[string]any{"api_key": key}); err != nil {
 			t.Fatal(err)
 		}
 		r := chi.NewRouter()
@@ -653,8 +653,7 @@ func TestGigahost_SecurityAndDurabilityContracts(t *testing.T) {
 		h, _, _ := setupTestHandlers(t)
 		saveBody := `{
 			"gigahost": {
-				"api_key": "flux_live_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-				"monthly_budget_nok": 500
+				"api_key": "flux_live_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 			}
 		}`
 		saveReq := httptest.NewRequest(http.MethodPost, "/api/settings/save", strings.NewReader(saveBody))
@@ -684,139 +683,20 @@ func TestGigahost_SecurityAndDurabilityContracts(t *testing.T) {
 		if gh["api_key"] != "********" {
 			t.Errorf("expected api_key to be masked, got %v", gh["api_key"])
 		}
-		if gh["monthly_budget_nok"] != float64(500) {
-			t.Errorf("expected monthly_budget_nok 500, got %v", gh["monthly_budget_nok"])
+		if _, present := gh["monthly_budget_nok"]; present {
+			t.Errorf("settings response still exposes a monthly budget: %v", gh["monthly_budget_nok"])
 		}
 	})
 }
 
-func TestGigahostOrderHandler_BudgetCap(t *testing.T) {
-	h, db, _ := setupTestHandlers(t)
-	ctx := context.Background()
-
-	// 1. Budget is 50 NOK; plan rate is 90 NOK -> Rejected with 400
-	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 50.0}); err != nil {
-		t.Fatal(err)
-	}
-
-	posts := 0
-	h.SetGigahostClient(&mockGigahostClient{
-		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
-			return &gigahost.AccountInfo{Balance: 100.0}, nil
-		},
-		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
-			return []gigahost.HourlyPlan{
-				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
-			}, nil
-		},
-		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
-			posts++
-			return &gigahost.OrderResponse{OrderID: "10001", Status: "pending"}, nil
-		},
-	})
-
-	body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0.14375}`
-	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
-	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
-	w := httptest.NewRecorder()
-	h.GigahostOrderHandler(w, req)
-
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 Bad Request, got %d (body: %s)", w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), "Monthly budget cap exceeded") {
-		t.Errorf("expected budget error message, got %s", w.Body.String())
-	}
-	if posts != 0 {
-		t.Errorf("expected 0 posts when budget exceeded, got %d", posts)
-	}
-
-	// 2. Budget increased to 100 NOK -> Allowed with 200
-	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 100.0}); err != nil {
-		t.Fatal(err)
-	}
-	reqOK := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
-	reqOK = reqOK.WithContext(middleware.WithSession(reqOK.Context(), &models.SessionData{Role: models.RoleAdmin}))
-	wOK := httptest.NewRecorder()
-	h.GigahostOrderHandler(wOK, reqOK)
-
-	if wOK.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d (body: %s)", wOK.Code, wOK.Body.String())
-	}
-	if posts != 1 {
-		t.Errorf("expected 1 post, got %d", posts)
-	}
-}
-
-func TestGigahostOrderHandler_UnknownIntentRefusesDuplicatePurchase(t *testing.T) {
+func TestGigahostOrderHandler_InventoryReadErrorWhileReconcilingFailsClosed(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)
 	ctx := context.Background()
-	now := time.Now().UTC()
-
-	// Prior unresolved intent saved with unknown status
-	if err := h.saveGigahostOrder(ctx, &GigahostOrderRecord{
-		OrderID:   "intent_uncertain",
-		Status:    "unknown",
-		PlanID:    101,
-		RegionID:  1,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	posts := 0
-	h.SetGigahostClient(&mockGigahostClient{
-		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
-			return &gigahost.AccountInfo{Balance: 100.0}, nil
-		},
-		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
-			// Old unrelated server in inventory with identical plan and region
-			return []gigahost.ServerInfo{
-				{ID: 3500, OrderID: "9000", Status: "ready", PID: 101, RegionID: 1},
-			}, nil
-		},
-		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
-			posts++
-			return &gigahost.OrderResponse{OrderID: "10002", Status: "pending"}, nil
-		},
-	})
-
-	body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0.14375}`
-	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
-	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
-	w := httptest.NewRecorder()
-	h.GigahostOrderHandler(w, req)
-
-	// Must return 202 Accepted and refuse duplicate purchase
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("expected 202 Accepted, got %d (body: %s)", w.Code, w.Body.String())
-	}
-	if posts != 0 {
-		t.Fatalf("expected 0 purchases dispatched while intent unresolved, got %d", posts)
-	}
-
-	orders, err := h.getGigahostOrders(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(orders) != 1 || orders[0].OrderID != "intent_uncertain" {
-		t.Fatalf("unexpected orders: %+v", orders)
-	}
-}
-
-func TestGigahostOrderHandler_BudgetPendingLocalOrderRejected(t *testing.T) {
-	h, db, _ := setupTestHandlers(t)
-	ctx := context.Background()
-
-	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 150.0}); err != nil {
-		t.Fatal(err)
-	}
 
 	now := time.Now().UTC()
 	if err := h.saveGigahostOrder(ctx, &GigahostOrderRecord{
-		OrderID:   "local_pending_1",
-		Status:    "waiting",
+		OrderID:   "unknown_pending_1",
+		Status:    gigahost.StatusUnknown,
 		PlanID:    101,
 		RegionID:  1,
 		CreatedAt: now,
@@ -832,51 +712,8 @@ func TestGigahostOrderHandler_BudgetPendingLocalOrderRejected(t *testing.T) {
 		},
 		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
 			return []gigahost.HourlyPlan{
-				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
-			}, nil
-		},
-		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
-			return []gigahost.ServerInfo{}, nil
-		},
-		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
-			posts++
-			return &gigahost.OrderResponse{OrderID: "10002", Status: "pending"}, nil
-		},
-	})
-
-	body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0.14375}`
-	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
-	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
-	w := httptest.NewRecorder()
-	h.GigahostOrderHandler(w, req)
-
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 Bad Request, got %d (body: %s)", w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), "Monthly budget cap exceeded") {
-		t.Errorf("expected budget cap exceeded error, got %s", w.Body.String())
-	}
-	if posts != 0 {
-		t.Errorf("expected 0 orders dispatched, got %d", posts)
-	}
-}
-
-func TestGigahostOrderHandler_BudgetInventoryReadErrorFailsClosed(t *testing.T) {
-	h, db, _ := setupTestHandlers(t)
-	ctx := context.Background()
-
-	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 500.0}); err != nil {
-		t.Fatal(err)
-	}
-
-	posts := 0
-	h.SetGigahostClient(&mockGigahostClient{
-		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
-			return &gigahost.AccountInfo{Balance: 100.0}, nil
-		},
-		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
-			return []gigahost.HourlyPlan{
-				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
+				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true,
+					Regions: []gigahost.Region{{ID: 1, Available: true}}, Eligibility: gigahost.CatalogEligibility{QualifiesArrears: true}},
 			}, nil
 		},
 		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
@@ -894,29 +731,25 @@ func TestGigahostOrderHandler_BudgetInventoryReadErrorFailsClosed(t *testing.T) 
 	w := httptest.NewRecorder()
 	h.GigahostOrderHandler(w, req)
 
-	if w.Code != http.StatusBadGateway {
-		t.Fatalf("expected 502 Bad Gateway, got %d (body: %s)", w.Code, w.Body.String())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 while an unknown purchase cannot be reconciled, got %d (body: %s)", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "failed to check existing server inventory") {
-		t.Errorf("expected inventory check error message, got %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), "cannot verify provider inventory") {
+		t.Errorf("expected an inventory verification error, got %s", w.Body.String())
 	}
 	if posts != 0 {
-		t.Errorf("expected 0 orders dispatched on inventory failure, got %d", posts)
+		t.Errorf("expected 0 orders dispatched when the unknown purchase cannot be resolved, got %d", posts)
 	}
 }
 
-func TestGigahostOrderHandler_BudgetDeduplicatesOpenOrderInInventory(t *testing.T) {
-	h, db, _ := setupTestHandlers(t)
+func TestGigahostOrderHandler_DuplicateInFlightOrderIsNotRepurchased(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
 	ctx := context.Background()
-
-	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 200.0}); err != nil {
-		t.Fatal(err)
-	}
 
 	now := time.Now().UTC()
 	if err := h.saveGigahostOrder(ctx, &GigahostOrderRecord{
 		OrderID:   "order_transitioned_1",
-		Status:    "deploying",
+		Status:    gigahost.StatusDeploying,
 		PlanID:    101,
 		RegionID:  1,
 		CreatedAt: now,
@@ -932,13 +765,19 @@ func TestGigahostOrderHandler_BudgetDeduplicatesOpenOrderInInventory(t *testing.
 		},
 		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
 			return []gigahost.HourlyPlan{
-				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
+				{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.14375, MonthlyCeiling: 90.0, InStock: true,
+					Regions: []gigahost.Region{{ID: 1, Available: true}}, Eligibility: gigahost.CatalogEligibility{QualifiesArrears: true}},
 			}, nil
 		},
 		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
 			return []gigahost.ServerInfo{
-				{ID: 888, OrderID: "order_transitioned_1", Status: "deploying", PID: 101, RegionID: 1},
+				{ID: 888, OrderID: "order_transitioned_1", Status: gigahost.StatusDeploying, PID: 101, RegionID: 1},
 			}, nil
+		},
+		// The provider cannot report progress, and its inventory still shows the
+		// order mid-flight: the duplicate must not be re-purchased on a guess.
+		getDeployStatusFn: func(context.Context, string) (*gigahost.DeployStatusResponse, error) {
+			return nil, errors.New("deploy status unavailable")
 		},
 		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 			posts++
@@ -952,10 +791,12 @@ func TestGigahostOrderHandler_BudgetDeduplicatesOpenOrderInInventory(t *testing.
 	w := httptest.NewRecorder()
 	h.GigahostOrderHandler(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+	// The in-flight order for the same plan and region is an unresolved
+	// duplicate: refused as "unknown", with no second purchase.
+	if w.Code != http.StatusAccepted || !strings.Contains(w.Body.String(), "refusing duplicate purchase") {
+		t.Fatalf("expected 202 duplicate refusal, got %d (body: %s)", w.Code, w.Body.String())
 	}
-	if posts != 1 {
-		t.Errorf("expected 1 order dispatched when deduplicated, got %d", posts)
+	if posts != 0 {
+		t.Errorf("expected 0 additional orders against an in-flight duplicate, got %d", posts)
 	}
 }

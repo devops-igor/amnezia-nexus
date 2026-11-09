@@ -2,15 +2,14 @@ package database
 
 import (
 	"context"
-	"errors"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
-func seedReleaseSnapshot(t *testing.T, db *DB) models.GigahostOrder {
+// seedLedgerRow inserts one complete order row through the real API.
+func seedLedgerRow(t *testing.T, db *DB) models.GigahostOrder {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
 	o := models.GigahostOrder{OrderID: "10001", ServerID: 7, Status: "ready",
@@ -22,95 +21,61 @@ func seedReleaseSnapshot(t *testing.T, db *DB) models.GigahostOrder {
 	return o
 }
 
-// Every field that can change the financial/lifecycle meaning is compared, not
-// just the provider identifiers. Writes deliberately preserve updated_at so the
-// timestamp alone cannot accidentally make these tests pass.
-func TestGigahostReleaseSnapshotFields(t *testing.T) {
-	for _, tc := range []struct{ name, query string }{
-		{"order", `UPDATE gigahost_orders SET order_id = '10002' WHERE id = ?`},
-		{"server", `UPDATE gigahost_orders SET server_id = 8 WHERE id = ?`},
-		{"status", `UPDATE gigahost_orders SET status = 'active' WHERE id = ?`},
-		{"plan", `UPDATE gigahost_orders SET plan_id = 203 WHERE id = ?`},
-		{"region", `UPDATE gigahost_orders SET region_id = 3 WHERE id = ?`},
-		{"hourly", `UPDATE gigahost_orders SET hourly_price_nok = 0.15 WHERE id = ?`},
-		{"address", `UPDATE gigahost_orders SET assigned_ip = '192.0.2.1' WHERE id = ?`},
-		{"created", `UPDATE gigahost_orders SET created_at = '2030-01-01T00:00:00Z' WHERE id = ?`},
-		{"updated_subsecond", `UPDATE gigahost_orders SET updated_at = updated_at || '.changed' WHERE id = ?`},
-		{"price", `UPDATE gigahost_orders SET price_id = 667 WHERE id = ?`},
-		{"cap", `UPDATE gigahost_orders SET monthly_cap_nok = 59 WHERE id = ?`},
-		{"currency", `UPDATE gigahost_orders SET currency = 'EUR' WHERE id = ?`},
-		{"release_reason", `UPDATE gigahost_orders SET release_reason = 'changed' WHERE id = ?`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			db, _ := setupTestDB(t)
-			o := seedReleaseSnapshot(t, db)
-			ctx := context.Background()
-			if _, err := db.ExecContext(ctx, tc.query, o.ID); err != nil {
-				t.Fatal(err)
-			}
-			if err := db.ReleaseGigahostOrderIfCurrent(ctx, o.ID, o, "provider_terminated", "old observation"); !errors.Is(err, ErrGigahostOrderChanged) {
-				t.Fatalf("release = %v, want stale", err)
-			}
-			after, err := db.GetGigahostOrderByID(ctx, o.ID)
-			if err != nil || after == nil || after.ReleasedAt != "" {
-				t.Fatalf("row = %+v, %v", after, err)
-			}
-			audit, err := db.ListGigahostOrderAudit(ctx, o.ID)
-			if err != nil || len(audit) != 0 {
-				t.Fatalf("audit = %+v, %v", audit, err)
-			}
-		})
-	}
-}
-
-func TestGigahostReleaseConcurrentAuditExactlyOnce(t *testing.T) {
+// TestGigahostOrderLedgerRoundTrip pins the retained order-history contract:
+// every recorded field, including the provider price identity, survives a write
+// and a read, and nothing in the read path invents a value for an absent field.
+func TestGigahostOrderLedgerRoundTrip(t *testing.T) {
 	db, _ := setupTestDB(t)
-	o := seedReleaseSnapshot(t, db)
 	ctx := context.Background()
-	var wg sync.WaitGroup
-	results := make(chan error, 2)
-	for range 2 {
-		wg.Go(func() {
-			results <- db.ReleaseGigahostOrderIfCurrent(ctx, o.ID, o, "provider_terminated", "same observation")
-		})
-	}
-	wg.Wait()
-	close(results)
-	var success, repeated int
-	for err := range results {
-		switch {
-		case err == nil:
-			success++
-		case errors.Is(err, ErrGigahostOrderAlreadyReleased):
-			repeated++
-		default:
-			t.Fatalf("release: %v", err)
-		}
-	}
-	if success != 1 || repeated != 1 {
-		t.Fatalf("success=%d repeated=%d", success, repeated)
-	}
-	audit, err := db.ListGigahostOrderAudit(ctx, o.ID)
-	if err != nil || len(audit) != 1 || audit[0].Reason != "provider_terminated" {
-		t.Fatalf("audit = %+v, %v", audit, err)
-	}
-}
+	seed := seedLedgerRow(t, db)
 
-func TestGigahostReleaseRequiresExplicitSnapshot(t *testing.T) {
-	db, _ := setupTestDB(t)
-	o := seedReleaseSnapshot(t, db)
-	ctx := context.Background()
-	if err := db.ReleaseGigahostOrderIfCurrent(ctx, o.ID, ReleaseExpectation{}, "provider_terminated", "empty observation"); !errors.Is(err, ErrGigahostOrderChanged) {
-		t.Fatalf("empty snapshot = %v, want stale", err)
+	orders, err := db.ListGigahostOrders(ctx)
+	if err != nil {
+		t.Fatalf("ListGigahostOrders: %v", err)
 	}
-	if err := db.ReleaseGigahostOrderIfCurrent(ctx, o.ID, o, "", "no reason"); err == nil {
-		t.Fatal("empty reason accepted")
+	if len(orders) != 1 {
+		t.Fatalf("rows = %d, want 1", len(orders))
 	}
-	if err := db.ReleaseGigahostOrderIfCurrent(ctx, o.ID+1, o, "provider_terminated", "missing row"); err == nil {
-		t.Fatal("missing row accepted")
+	got := orders[0]
+	if got.ID != seed.ID || got.OrderID != seed.OrderID || got.ServerID != seed.ServerID {
+		t.Fatalf("identity = %+v, want %+v", got, seed)
 	}
-	var missing *DB
-	if err := missing.ReleaseGigahostOrderIfCurrent(ctx, o.ID, o, "provider_terminated", "no handle"); err == nil {
-		t.Fatal("nil handle accepted")
+	if got.Status != "ready" || got.PlanID != 202 || got.RegionID != 2 {
+		t.Fatalf("lifecycle = %+v", got)
+	}
+	if got.HourlyPriceNOK != 0.057 || got.MonthlyCapNOK != 41 ||
+		got.PriceID != 666 || got.Currency != "NOK" {
+		t.Fatalf("price identity = %+v", got)
+	}
+	if got.AssignedIP != "" {
+		t.Fatalf("assigned_ip = %q, want the stored empty default", got.AssignedIP)
+	}
+
+	// An update records the provider answer without rewriting the order-time
+	// price identity, so history stays readable after the order has progressed.
+	got.Status = "active"
+	got.AssignedIP = "192.0.2.10"
+	got.ServerID = 8
+	got.MonthlyCapNOK = 0
+	got.Currency = ""
+	if err := db.UpdateGigahostOrder(ctx, &got); err != nil {
+		t.Fatalf("UpdateGigahostOrder: %v", err)
+	}
+
+	after, err := db.ListGigahostOrders(ctx)
+	if err != nil {
+		t.Fatalf("ListGigahostOrders after update: %v", err)
+	}
+	if len(after) != 1 {
+		t.Fatalf("rows = %d, want 1", len(after))
+	}
+	if after[0].Status != "active" || after[0].AssignedIP != "192.0.2.10" || after[0].ServerID != 8 {
+		t.Fatalf("lifecycle after update = %+v", after[0])
+	}
+	if after[0].PriceID != 666 || after[0].HourlyPriceNOK != 0.057 {
+		t.Fatalf("price identity rewritten by update: %+v", after[0])
+	}
+	if after[0].MonthlyCapNOK != 41 || after[0].Currency != "NOK" {
+		t.Fatalf("an empty update value overwrote recorded price data: %+v", after[0])
 	}
 }

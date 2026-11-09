@@ -717,8 +717,6 @@
   "gigahost_settings_title": "Хостинг Gigahost Cloud",
   "gigahost_api_key_label": "API-ключ",
   "gigahost_api_key_hint": "Bearer-ключ для Gigahost API (flux_live_...)",
-  "gigahost_monthly_budget_label": "Месячный лимит бюджета (NOK)",
-  "gigahost_monthly_budget_hint": "Максимальный месячный бюджет в норвежских кронах",
   "deploy_vps_title": "Развернуть почасовой VPS",
   "deploy_vps_desc": "Заказ почасовых VPS-инстансов через Gigahost Cloud API",
   "deploy_vps_select_plan": "Выберите тариф",

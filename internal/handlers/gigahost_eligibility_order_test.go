@@ -63,11 +63,7 @@ func runEligibilityOrder(
 	account *gigahost.AccountInfo,
 ) eligibilityOutcome {
 	t.Helper()
-	h, db, _ := setupTestHandlers(t)
-	ctx := context.Background()
-	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 0.0}); err != nil {
-		t.Fatal(err)
-	}
+	h, _, _ := setupTestHandlers(t)
 
 	var out eligibilityOutcome
 	h.SetGigahostClient(&mockGigahostClient{
@@ -237,20 +233,13 @@ func TestHasEligibility_AccountNeverReducesCatalogEligibility(t *testing.T) {
 
 // TestGigahostOrderHandler_SkippedAccountKeepsEveryGuard is the control that the
 // evaluation-order change did not become a purchase bypass: with a qualifying
-// catalog, the budget cap, the unknown-purchase block and B2 accounting must
+// catalog, the unknown-purchase block and the matchable-plan requirement must
 // still stop an order exactly as before.
 func TestGigahostOrderHandler_SkippedAccountKeepsEveryGuard(t *testing.T) {
-	t.Run("budget cap still rejects a qualifying catalog", func(t *testing.T) {
-		h, db, _ := setupTestHandlers(t)
+	t.Run("unknown purchase still blocks a qualifying catalog", func(t *testing.T) {
+		h, _, _ := setupTestHandlers(t)
 		ctx := context.Background()
-		if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 90.0}); err != nil {
-			t.Fatal(err)
-		}
-		catalog := []gigahost.HourlyPlan{
-			eligibilityPlan(101, 555, true, 0),
-			priceIdentityPlan(202, 666, 0.057, 41),
-		}
-		hourly := true
+		catalog := []gigahost.HourlyPlan{eligibilityPlan(101, 555, true, 0)}
 		var posts int32
 		var accountCalls int32
 		h.SetGigahostClient(&mockGigahostClient{
@@ -260,17 +249,19 @@ func TestGigahostOrderHandler_SkippedAccountKeepsEveryGuard(t *testing.T) {
 			},
 			getCatalogFn: func(context.Context) ([]gigahost.HourlyPlan, error) { return catalog, nil },
 			getServersFn: func(context.Context) ([]gigahost.ServerInfo, error) {
-				// 60 NOK of existing commitment + the 59 request crosses the cap.
-				return []gigahost.ServerInfo{{ID: 7, PID: 202, Status: gigahost.StatusReady, BwIsHourly: &hourly}}, nil
+				return []gigahost.ServerInfo{}, nil
+			},
+			getDeployStatusFn: func(context.Context, string) (*gigahost.DeployStatusResponse, error) {
+				return nil, errors.New("deploy status unavailable")
 			},
 			orderServerSafeFn: func(context.Context, gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 				atomic.AddInt32(&posts, 1)
 				return &gigahost.OrderResponse{OrderID: "70001", Status: gigahost.StatusPending}, nil
 			},
 		})
-		// Seed the 41 NOK commitment as a server-linked local order.
+		// A prior purchase whose outcome the provider still cannot establish.
 		now := time.Now().UTC()
-		rec := GigahostOrderRecord{OrderID: "existing", ServerID: 7, Status: gigahost.StatusReady, PlanID: 202, RegionID: 1, HourlyPriceNOK: 0.057, CreatedAt: now, UpdatedAt: now}
+		rec := GigahostOrderRecord{OrderID: "unknown_prior", Status: gigahost.StatusUnknown, PlanID: 101, RegionID: 1, CreatedAt: now, UpdatedAt: now}
 		if err := h.saveGigahostOrder(ctx, &rec); err != nil {
 			t.Fatal(err)
 		}
@@ -281,12 +272,14 @@ func TestGigahostOrderHandler_SkippedAccountKeepsEveryGuard(t *testing.T) {
 		w := httptest.NewRecorder()
 		h.GigahostOrderHandler(w, req)
 
-		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "budget_exceeded") {
-			t.Errorf("status = %d, want 400 budget_exceeded (body: %s)", w.Code, w.Body.String())
+		if w.Code != http.StatusAccepted || !strings.Contains(w.Body.String(), "unknown") {
+			t.Errorf("status = %d, want 202 unknown (body: %s)", w.Code, w.Body.String())
 		}
 		if posts != 0 {
 			t.Errorf("provider orders dispatched = %d, want 0", posts)
 		}
+		// The catalog already qualifies, so the eligibility path must not have
+		// needed GET /account at all.
 		if accountCalls != 0 {
 			t.Errorf("GET /account calls = %d, want 0", accountCalls)
 		}

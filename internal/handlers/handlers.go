@@ -63,20 +63,22 @@ type Dependencies struct {
 
 // Handlers encapsulates all HTTP route handlers and business logic.
 type Handlers struct {
-	cfg                       *config.Config
-	db                        *database.DB
-	registry                  *manager.Registry
-	sshPool                   SSHPoolProvider
-	awgMgr                    *awg.AWGManager
-	mtproxylMgr               *mtproxyl.MTProxyLManager
-	dnsMgr                    *dns.DNSManager
-	xrayMgr                   *xray.XrayManager
-	naiveMgr                  *naive.NaiveManager
-	vpnSvc                    *vpn.Service
-	upstreamSvc               UpstreamChecker
-	gigahostClient            gigahost.Client
-	gigahostMu                sync.RWMutex
-	budgetMu                  sync.Mutex
+	cfg            *config.Config
+	db             *database.DB
+	registry       *manager.Registry
+	sshPool        SSHPoolProvider
+	awgMgr         *awg.AWGManager
+	mtproxylMgr    *mtproxyl.MTProxyLManager
+	dnsMgr         *dns.DNSManager
+	xrayMgr        *xray.XrayManager
+	naiveMgr       *naive.NaiveManager
+	vpnSvc         *vpn.Service
+	upstreamSvc    UpstreamChecker
+	gigahostClient gigahost.Client
+	gigahostMu     sync.RWMutex
+	// purchaseMu serializes the duplicate-purchase check with the purchase
+	// itself, so two concurrent order attempts cannot both pass it.
+	purchaseMu                sync.Mutex
 	updaterSvc                *updater.ReleaseChecker
 	dialTimeout               func(network, address string, timeout time.Duration) (net.Conn, error)
 	setupMu                   sync.Mutex

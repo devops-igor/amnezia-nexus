@@ -717,8 +717,6 @@
   "gigahost_settings_title": "Gigahost 云主机",
   "gigahost_api_key_label": "API 密钥",
   "gigahost_api_key_hint": "Gigahost API 的 Bearer 密钥 (flux_live_...)",
-  "gigahost_monthly_budget_label": "每月预算上限 (NOK)",
-  "gigahost_monthly_budget_hint": "挪威克朗每月最高支出限额",
   "deploy_vps_title": "部署按小时计费 VPS",
   "deploy_vps_desc": "通过 Gigahost Cloud API 按需订购按小时计费的 VPS 实例",
   "deploy_vps_select_plan": "选择配置方案",

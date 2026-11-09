@@ -2,30 +2,22 @@ package database
 
 // Persistence for the Gigahost hourly order ledger.
 //
-// The ledger is the durable half of the monthly budget calculation, so it keeps
-// the price identity the provider contracted at order time (price id, monthly
-// cap, hourly rate, currency) and never deletes a row. Releasing a reservation
-// writes a release marker plus an audit row and leaves the original status
-// intact, so the accounting history stays readable and a repeated recovery run
-// is a no-op.
+// The ledger is the durable record of what was ordered and what the provider
+// answered, so it keeps the price identity the provider contracted at order time
+// (price id, hourly rate, currency, provider monthly ceiling) and never deletes a
+// row. Those price fields are recorded history: nothing compares them against a
+// configured spending limit.
 //
 // Only this package issues SQL for the table (module ownership rules, section
-// 6.1). The handlers and the recovery utility call these methods.
+// 6.1). The handlers call these methods.
 
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-)
-
-// Gigahost order release/audit actions.
-const (
-	GigahostOrderActionReleased = "released"
 )
 
 // gigahostOrdersSchema is the current table definition. It is created when
@@ -44,9 +36,7 @@ var gigahostOrdersSchema = `CREATE TABLE IF NOT EXISTS gigahost_orders (
 	updated_at TEXT NOT NULL,
 	price_id INTEGER DEFAULT 0,
 	monthly_cap_nok REAL DEFAULT 0.0,
-	currency TEXT DEFAULT '',
-	released_at TEXT DEFAULT '',
-	release_reason TEXT DEFAULT ''
+	currency TEXT DEFAULT ''
 )`
 
 // gigahostOrderColumns lists every optional column added after the original
@@ -62,8 +52,6 @@ var gigahostOrderColumns = []struct {
 	{"price_id", `ALTER TABLE gigahost_orders ADD COLUMN price_id INTEGER DEFAULT 0`},
 	{"monthly_cap_nok", `ALTER TABLE gigahost_orders ADD COLUMN monthly_cap_nok REAL DEFAULT 0.0`},
 	{"currency", `ALTER TABLE gigahost_orders ADD COLUMN currency TEXT DEFAULT ''`},
-	{"released_at", `ALTER TABLE gigahost_orders ADD COLUMN released_at TEXT DEFAULT ''`},
-	{"release_reason", `ALTER TABLE gigahost_orders ADD COLUMN release_reason TEXT DEFAULT ''`},
 }
 
 var gigahostOrderIndexes = []string{
@@ -138,21 +126,6 @@ func containsFold(haystack, needle string) bool {
 // It runs from runMigrationsLocked, which already holds writeMu, so it must not
 // take the lock itself.
 func (d *DB) migrateGigahostOrders(ctx context.Context) error {
-	if _, err := d.sqlDB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS gigahost_order_audit (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		record_id INTEGER NOT NULL,
-		order_id TEXT DEFAULT '',
-		action TEXT NOT NULL,
-		reason TEXT DEFAULT '',
-		detail TEXT DEFAULT '',
-		created_at TEXT NOT NULL
-	)`); err != nil {
-		return fmt.Errorf("failed to init gigahost_order_audit schema: %w", err)
-	}
-	if _, err := d.sqlDB.ExecContext(ctx,
-		`CREATE INDEX IF NOT EXISTS idx_gigahost_order_audit_record ON gigahost_order_audit(record_id)`); err != nil {
-		return fmt.Errorf("failed to create gigahost_order_audit index: %w", err)
-	}
 	return d.ensureGigahostOrdersSchemaLocked(ctx)
 }
 
@@ -167,72 +140,10 @@ func (d *DB) ListGigahostOrders(ctx context.Context) ([]models.GigahostOrder, er
 	return d.readGigahostOrders(ctx)
 }
 
-// ListGigahostOrdersReadOnly reads the ledger without creating or upgrading
-// anything.
-//
-// A database written by an earlier version has only the original columns, and
-// that legacy database is exactly the one an operator needs to inspect, so the
-// missing price/release columns are read as their zero values instead of
-// failing the inspection. Columns are never added here.
-func (d *DB) ListGigahostOrdersReadOnly(ctx context.Context) ([]models.GigahostOrder, error) {
-	if d == nil || d.sqlDB == nil {
-		return []models.GigahostOrder{}, nil
-	}
-	rows, err := d.sqlDB.QueryContext(ctx, "SELECT name FROM pragma_table_info('gigahost_orders')")
-	if err != nil {
-		return nil, fmt.Errorf("failed to inspect gigahost_orders: %w", err)
-	}
-	present := map[string]bool{}
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		present[name] = true
-	}
-	_ = rows.Close()
-	if !present["id"] {
-		return []models.GigahostOrder{}, nil
-	}
-
-	// Only columns that exist are selected. A legacy row therefore reports
-	// price_id 0 / currency "" / monthly_cap 0, which the budget reads as "not
-	// recorded" - never as a guessed value.
-	optional := []struct {
-		name     string
-		selectAs string
-	}{
-		{"price_id", "COALESCE(price_id, 0)"},
-		{"monthly_cap_nok", "COALESCE(monthly_cap_nok, 0)"},
-		{"currency", "COALESCE(currency, '')"},
-		{"released_at", "COALESCE(released_at, '')"},
-		{"release_reason", "COALESCE(release_reason, '')"},
-	}
-	cols := []string{"id", "order_id", "server_id", "status", "plan_id", "region_id",
-		"hourly_price_nok", "assigned_ip", "created_at", "updated_at"}
-	var exprs []string
-	for _, c := range optional {
-		if present[c.name] {
-			exprs = append(exprs, c.selectAs)
-		} else {
-			switch c.name {
-			case "currency", "released_at", "release_reason":
-				exprs = append(exprs, "''")
-			default:
-				exprs = append(exprs, "0")
-			}
-		}
-	}
-	q := fmt.Sprintf("SELECT %s, %s FROM gigahost_orders ORDER BY id DESC",
-		strings.Join(cols, ", "), strings.Join(exprs, ", "))
-	return d.scanGigahostOrders(ctx, q)
-}
-
 // readGigahostOrders is the shared SELECT body.
 func (d *DB) readGigahostOrders(ctx context.Context) ([]models.GigahostOrder, error) {
 	q := `SELECT id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
-	             created_at, updated_at, price_id, monthly_cap_nok, currency, released_at, release_reason
+	             created_at, updated_at, price_id, monthly_cap_nok, currency
 	      FROM gigahost_orders
 	      ORDER BY id DESC`
 	return d.scanGigahostOrders(ctx, q)
@@ -250,20 +161,18 @@ func (d *DB) scanGigahostOrders(ctx context.Context, q string) ([]models.Gigahos
 	for rows.Next() {
 		var o models.GigahostOrder
 		var createdAt, updatedAt string
-		var assignedIP, currency, releasedAt, releaseReason sql.NullString
+		var assignedIP, currency sql.NullString
 		var priceID sql.NullInt64
 		var monthlyCap sql.NullFloat64
 		if err := rows.Scan(
 			&o.ID, &o.OrderID, &o.ServerID, &o.Status, &o.PlanID, &o.RegionID,
 			&o.HourlyPriceNOK, &assignedIP, &createdAt, &updatedAt,
-			&priceID, &monthlyCap, &currency, &releasedAt, &releaseReason,
+			&priceID, &monthlyCap, &currency,
 		); err != nil {
 			return nil, err
 		}
 		o.AssignedIP = assignedIP.String
 		o.Currency = currency.String
-		o.ReleasedAt = releasedAt.String
-		o.ReleaseReason = releaseReason.String
 		o.PriceID = int(priceID.Int64)
 		o.MonthlyCapNOK = monthlyCap.Float64
 		o.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
@@ -271,20 +180,6 @@ func (d *DB) scanGigahostOrders(ctx context.Context, q string) ([]models.Gigahos
 		list = append(list, o)
 	}
 	return list, rows.Err()
-}
-
-// GetGigahostOrderByID returns one ledger row by primary key.
-func (d *DB) GetGigahostOrderByID(ctx context.Context, id int64) (*models.GigahostOrder, error) {
-	list, err := d.ListGigahostOrders(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for i := range list {
-		if list[i].ID == id {
-			return &list[i], nil
-		}
-	}
-	return nil, nil
 }
 
 // InsertGigahostOrder writes a new ledger row and sets its ID.
@@ -340,148 +235,4 @@ func (d *DB) UpdateGigahostOrder(ctx context.Context, o *models.GigahostOrder) e
 		o.ID, o.OrderID,
 	)
 	return err
-}
-
-// ErrGigahostOrderAlreadyReleased reports a repeated release attempt.
-var ErrGigahostOrderAlreadyReleased = errors.New("gigahost order reservation already released")
-
-// ErrGigahostOrderChanged reports that the ledger row no longer matches the
-// accounting/lifecycle snapshot the release evidence was gathered against.
-var ErrGigahostOrderChanged = errors.New("gigahost order changed since the release evidence was observed")
-
-// ReleaseExpectation is the complete ledger snapshot observed before collecting
-// provider evidence. Zero and blank fields are observations, never wildcards.
-// The transaction compares every persisted accounting/lifecycle field, including
-// timestamps, so an unchanged provider identity alone cannot authorize release.
-type ReleaseExpectation = models.GigahostOrder
-
-// ReleaseGigahostOrder releases without a prior observation. Kept for the
-// separately scoped offline recovery path and fixtures; live reconciliation must
-// use ReleaseGigahostOrderIfCurrent instead.
-func (d *DB) ReleaseGigahostOrder(ctx context.Context, recordID int64, reason, detail string) error {
-	return d.releaseGigahostOrder(ctx, recordID, nil, reason, detail)
-}
-
-// ReleaseGigahostOrderIfCurrent marks a reservation as released and appends an
-// audit row in one transaction, only if every observed field still matches.
-// Unlike ReleaseGigahostOrder, even a zero expectation performs strict checks.
-//
-// Releasing an already released row is a no-op reported as
-// ErrGigahostOrderAlreadyReleased, so a repeated run is visibly idempotent rather
-// than silently rewriting history.
-func (d *DB) ReleaseGigahostOrderIfCurrent(
-	ctx context.Context, recordID int64, expect ReleaseExpectation, reason, detail string,
-) error {
-	return d.releaseGigahostOrder(ctx, recordID, &expect, reason, detail)
-}
-
-func (d *DB) releaseGigahostOrder(
-	ctx context.Context, recordID int64, expect *ReleaseExpectation, reason, detail string,
-) error {
-	if d == nil || d.sqlDB == nil {
-		return errors.New("no database handle")
-	}
-	if reason == "" {
-		return errors.New("a release reason is required")
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	return d.WithTransaction(ctx, func(tx *sql.Tx) error {
-		var orderID, releasedAt string
-		err := tx.QueryRowContext(ctx,
-			`SELECT order_id, COALESCE(released_at, '') FROM gigahost_orders WHERE id = ?`, recordID).
-			Scan(&orderID, &releasedAt)
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("gigahost order %d not found", recordID)
-		}
-		if err != nil {
-			return err
-		}
-		if releasedAt != "" {
-			return ErrGigahostOrderAlreadyReleased
-		}
-		if err := checkGigahostReleaseSnapshot(ctx, tx, recordID, expect); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE gigahost_orders SET released_at = ?, release_reason = ?, updated_at = ? WHERE id = ?`,
-			now, reason, now, recordID); err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx,
-			`INSERT INTO gigahost_order_audit (record_id, order_id, action, reason, detail, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-			recordID, orderID, GigahostOrderActionReleased, reason, detail, now)
-		return err
-	})
-}
-
-// checkGigahostReleaseSnapshot compares the complete persisted model inside the
-// same transaction as the release/audit write. SQL equality preserves timestamp
-// precision and rejects malformed/changed stored times rather than normalizing
-// them into apparent equality. NULL optional fields match their read defaults.
-func checkGigahostReleaseSnapshot(ctx context.Context, tx *sql.Tx, recordID int64, expect *ReleaseExpectation) error {
-	if expect == nil {
-		return nil
-	}
-	var matches bool
-	err := tx.QueryRowContext(ctx, `SELECT
-		id = ? AND order_id = ? AND COALESCE(server_id, 0) = ? AND status = ?
-		AND plan_id = ? AND region_id = ? AND hourly_price_nok = ?
-		AND COALESCE(assigned_ip, '') = ? AND created_at = ? AND updated_at = ?
-		AND COALESCE(price_id, 0) = ? AND COALESCE(monthly_cap_nok, 0) = ?
-		AND COALESCE(currency, '') = ? AND COALESCE(released_at, '') = ?
-		AND COALESCE(release_reason, '') = ?
-		FROM gigahost_orders WHERE id = ?`,
-		expect.ID, expect.OrderID, expect.ServerID, expect.Status,
-		expect.PlanID, expect.RegionID, expect.HourlyPriceNOK, expect.AssignedIP,
-		expect.CreatedAt.Format(time.RFC3339Nano), expect.UpdatedAt.Format(time.RFC3339Nano),
-		expect.PriceID, expect.MonthlyCapNOK, expect.Currency, expect.ReleasedAt, expect.ReleaseReason,
-		recordID).Scan(&matches)
-	if err != nil {
-		return err
-	}
-	if !matches {
-		return ErrGigahostOrderChanged
-	}
-	return nil
-}
-
-// GigahostOrderAuditRow is one audit entry for a ledger row.
-type GigahostOrderAuditRow struct {
-	ID        int64
-	RecordID  int64
-	OrderID   string
-	Action    string
-	Reason    string
-	Detail    string
-	CreatedAt string
-}
-
-// ListGigahostOrderAudit returns the audit history, newest first. A recordID of
-// zero returns the whole history.
-func (d *DB) ListGigahostOrderAudit(ctx context.Context, recordID int64) ([]GigahostOrderAuditRow, error) {
-	if d == nil || d.sqlDB == nil {
-		return nil, nil
-	}
-	q := `SELECT id, record_id, order_id, action, reason, detail, created_at FROM gigahost_order_audit`
-	args := []any{}
-	if recordID > 0 {
-		q += ` WHERE record_id = ?`
-		args = append(args, recordID)
-	}
-	q += ` ORDER BY id DESC`
-	rows, err := d.sqlDB.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []GigahostOrderAuditRow
-	for rows.Next() {
-		var r GigahostOrderAuditRow
-		if err := rows.Scan(&r.ID, &r.RecordID, &r.OrderID, &r.Action, &r.Reason, &r.Detail, &r.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
 }

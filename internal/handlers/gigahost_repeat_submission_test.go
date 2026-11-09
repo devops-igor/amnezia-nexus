@@ -3,13 +3,14 @@ package handlers
 // Repeated-submission protection (finding: repeated rejected deploy attempts).
 //
 // A rejected order attempt costs provider reads (catalog, then inventory). When
-// the rejection is persistent - a budget cap already crossed - an admin clicking
-// again, or a scripted retry, re-issues the whole read sequence against a
-// provider that is already the suspect. This is a bounded, per-admin admission
-// cooldown on that expensive pre-provider path.
+// the rejection is persistent - a plan the catalog does not carry, or a
+// provider that keeps failing - an admin clicking again, or a scripted retry,
+// re-issues the whole read sequence against a provider that is already the
+// suspect. This is a bounded, per-admin admission cooldown on that expensive
+// pre-provider path.
 //
 // What it must NOT do, asserted here:
-//   - never cache a positive financial/eligibility decision (no purchase fast-path)
+//   - never cache a positive eligibility/price decision (no purchase fast-path)
 //   - never retry a purchase
 //   - never create a permanent lockout
 //   - never couple unrelated admins
@@ -53,42 +54,34 @@ type orderAttempt struct {
 type repeatedSubmitHarness struct {
 	t      *testing.T
 	h      *Handlers
-	budget float64
 	counts orderCounters
 }
 
-func newRepeatedSubmitHarness(t *testing.T, budget float64) *repeatedSubmitHarness {
+func newRepeatedSubmitHarness(t *testing.T) *repeatedSubmitHarness {
 	t.Helper()
-	h, db, _ := setupTestHandlers(t)
-	ctx := context.Background()
-	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": budget}); err != nil {
-		t.Fatal(err)
-	}
-	return &repeatedSubmitHarness{t: t, h: h, budget: budget}
+	h, _, _ := setupTestHandlers(t)
+	return &repeatedSubmitHarness{t: t, h: h}
 }
 
 // install wires a mock client whose reads are counted into the harness counters.
-func (rs *repeatedSubmitHarness) install(planMonthly, existingMonthly float64) {
-	catalog := []gigahost.HourlyPlan{
-		{
-			ProductID: 101, PriceID: 555, Currency: "NOK", HourlyRateNOK: 0.15,
-			MonthlyCeiling: planMonthly, InStock: true,
-			Regions:     []gigahost.Region{{ID: 1, Available: true}},
-			Eligibility: gigahost.CatalogEligibility{QualifiesArrears: true},
-		},
+//
+// The catalog carries either a plan the submitted request never selects
+// (reject=true: a persistent, non-financial rejection) or exactly the requested
+// plan (reject=false: the order succeeds). Both qualify eligibility from the
+// catalog, so the account path is not exercised here.
+func (rs *repeatedSubmitHarness) install(reject bool) {
+	plan := gigahost.HourlyPlan{
+		ProductID: 101, PriceID: 555, Currency: "NOK", HourlyRateNOK: 0.15,
+		MonthlyCeiling: 108, InStock: true,
+		Regions:     []gigahost.Region{{ID: 1, Available: true}},
+		Eligibility: gigahost.CatalogEligibility{QualifiesArrears: true},
 	}
-	var servers []gigahost.ServerInfo
-	if existingMonthly > 0 {
-		hourly := true
-		catalog = append(catalog, gigahost.HourlyPlan{
-			ProductID: 202, PriceID: 666, Currency: "NOK", HourlyRateNOK: 0.0555,
-			MonthlyCeiling: existingMonthly, InStock: true,
-			Regions: []gigahost.Region{{ID: 1, Available: true}},
-		})
-		servers = []gigahost.ServerInfo{
-			{ID: 1, PID: 202, Status: gigahost.StatusReady, BwIsHourly: &hourly},
-		}
+	if reject {
+		plan.ProductID = 909
+		plan.PriceID = 999
 	}
+	catalog := []gigahost.HourlyPlan{plan}
+	servers := []gigahost.ServerInfo{}
 
 	rs.h.SetGigahostClient(&mockGigahostClient{
 		getAccountFn: func(context.Context) (*gigahost.AccountInfo, error) {
@@ -111,18 +104,6 @@ func (rs *repeatedSubmitHarness) install(planMonthly, existingMonthly float64) {
 			return &gigahost.OrderResponse{OrderID: "70001", Status: gigahost.StatusPending}, nil
 		},
 	})
-
-	// Seed the existing commitment as a server-linked local order.
-	if existingMonthly > 0 {
-		now := time.Now().UTC()
-		rec := GigahostOrderRecord{
-			OrderID: "existing", ServerID: 1, Status: gigahost.StatusReady,
-			PlanID: 202, RegionID: 1, HourlyPriceNOK: 0.0555, CreatedAt: now, UpdatedAt: now,
-		}
-		if err := rs.h.saveGigahostOrder(context.Background(), &rec); err != nil {
-			rs.t.Fatal(err)
-		}
-	}
 }
 
 // submit places one order as the given admin and reports the delta it caused.
@@ -157,16 +138,15 @@ func (rs *repeatedSubmitHarness) submit(userID string) orderAttempt {
 }
 
 // TestRepeatedSubmission_RejectedAttemptsDoNotReissueProviderReads is the core
-// regression: a persistent budget rejection must not spend provider reads on
-// every click.
+// regression: a persistent rejection must not spend provider reads on every
+// click.
 func TestRepeatedSubmission_RejectedAttemptsDoNotReissueProviderReads(t *testing.T) {
-	// 100 NOK committed against a 100 budget: 100 + 59 > 100, every attempt fails.
-	rs := newRepeatedSubmitHarness(t, 100)
-	rs.install(59, 100)
+	rs := newRepeatedSubmitHarness(t)
+	rs.install(true)
 
 	first := rs.submit("admin-1")
-	if first.code != http.StatusBadRequest || !strings.Contains(first.body, "budget_exceeded") {
-		t.Fatalf("first attempt = %d %s, want 400 budget_exceeded", first.code, first.body)
+	if first.code != http.StatusBadRequest || !strings.Contains(first.body, "invalid_plan") {
+		t.Fatalf("first attempt = %d %s, want 400 invalid_plan", first.code, first.body)
 	}
 	if first.suppressed {
 		t.Fatal("the first attempt must reach the provider, not be suppressed")
@@ -194,13 +174,16 @@ func TestRepeatedSubmission_RejectedAttemptsDoNotReissueProviderReads(t *testing
 		if repeat.retryAfter == "" {
 			t.Errorf("suppressed repeat %d has no Retry-After header", i)
 		}
+		if strings.Contains(repeat.body, "budget") {
+			t.Errorf("suppression text still mentions a budget: %s", repeat.body)
+		}
 	}
 }
 
 // TestRepeatedSubmission_RecoversAfterWindow proves no permanent lockout.
 func TestRepeatedSubmission_RecoversAfterWindow(t *testing.T) {
-	rs := newRepeatedSubmitHarness(t, 100)
-	rs.install(59, 100)
+	rs := newRepeatedSubmitHarness(t)
+	rs.install(true)
 
 	cooldown := repeatedSubmitCooldown()
 	if cooldown <= 0 {
@@ -224,8 +207,8 @@ func TestRepeatedSubmission_RecoversAfterWindow(t *testing.T) {
 // TestRepeatedSubmission_ConcurrentSubmitsAdmitAtMostOne: parallel submits from
 // one admin must not all reach the provider.
 func TestRepeatedSubmission_ConcurrentSubmitsAdmitAtMostOne(t *testing.T) {
-	rs := newRepeatedSubmitHarness(t, 100)
-	rs.install(59, 100)
+	rs := newRepeatedSubmitHarness(t)
+	rs.install(true)
 
 	// Prime the cooldown so the concurrent burst is entirely in-window.
 	first := rs.submit("admin-concurrent")
@@ -266,8 +249,8 @@ func TestRepeatedSubmission_ConcurrentSubmitsAdmitAtMostOne(t *testing.T) {
 
 // TestRepeatedSubmission_SeparateAdminsUnaffected proves no cross-admin coupling.
 func TestRepeatedSubmission_SeparateAdminsUnaffected(t *testing.T) {
-	rs := newRepeatedSubmitHarness(t, 100)
-	rs.install(59, 100)
+	rs := newRepeatedSubmitHarness(t)
+	rs.install(true)
 	rs.h.recordRejectedOrderAttempt("admin-1", time.Now())
 
 	if blocked, _ := rs.h.orderAdmissionBlocked("admin-1"); !blocked {
@@ -290,8 +273,8 @@ func TestRepeatedSubmission_SeparateAdminsUnaffected(t *testing.T) {
 // TestRepeatedSubmission_SuccessClearsCooldown proves a successful order is never
 // gated by a stale rejection, and no positive decision is cached.
 func TestRepeatedSubmission_SuccessClearsCooldown(t *testing.T) {
-	rs := newRepeatedSubmitHarness(t, 100)
-	rs.install(59, 0) // no existing commitment: 59 <= 100, the order succeeds
+	rs := newRepeatedSubmitHarness(t)
+	rs.install(false)
 
 	rs.h.recordRejectedOrderAttempt("admin-1", time.Now())
 	rs.h.clearOrderAdmission("admin-1")
@@ -323,8 +306,8 @@ func TestRepeatedSubmission_CooldownIsBounded(t *testing.T) {
 // TestRepeatedSubmission_ProviderErrorIsNotHidden proves a genuine provider
 // failure is still reported as itself, not as a cooldown.
 func TestRepeatedSubmission_ProviderErrorIsNotHidden(t *testing.T) {
-	rs := newRepeatedSubmitHarness(t, 100)
-	rs.install(59, 0)
+	rs := newRepeatedSubmitHarness(t)
+	rs.install(false)
 
 	// Non-qualifying catalog forces the account path, which times out.
 	rs.h.SetGigahostClient(&mockGigahostClient{
@@ -399,8 +382,8 @@ func TestRepeatedSubmission_TableIsBoundedAndSelfPruning(t *testing.T) {
 // provider timeout MUST arm the window: repeated stalled account reads were
 // unlimited before the correction.
 func TestRepeatedSubmission_FailureClassification(t *testing.T) {
-	if got := failureKindFor(http.StatusBadRequest, errors.New("invalid_plan: plan 999 not found")); got != failureBudget {
-		t.Errorf("400 = %q, want %q", got, failureBudget)
+	if got := failureKindFor(http.StatusBadRequest, errors.New("invalid_plan: plan 999 not found")); got != failureRequest {
+		t.Errorf("400 = %q, want %q", got, failureRequest)
 	}
 	if got := failureKindFor(http.StatusPaymentRequired, gigahost.ErrInsufficientCredit); got != failureCredit {
 		t.Errorf("402 = %q, want %q", got, failureCredit)

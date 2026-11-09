@@ -47,7 +47,7 @@ const maxAdmissionEntries = 256
 
 // Closed set of prior-failure labels. A label, never err.Error() text.
 const (
-	failureBudget          = "budget"
+	failureRequest         = "request_rejected"
 	failureCredit          = "credit"
 	failureProviderTimeout = "provider_timeout"
 	failureProviderError   = "provider_error"
@@ -248,7 +248,7 @@ func (h *Handlers) recordRejectedOrderAttempt(userID string, at time.Time) {
 	}
 	entry.failedAt = at
 	if entry.failedKind == "" {
-		entry.failedKind = failureBudget
+		entry.failedKind = failureRequest
 	}
 }
 
@@ -292,8 +292,8 @@ func suppressionMessage(priorFailure string) string {
 		return "A previous attempt did not reach Gigahost within its timeout. Wait before retrying so the provider is not re-queried while it is unhealthy; this request was not sent."
 	case failureProviderError:
 		return "A previous attempt failed while talking to Gigahost. Wait before retrying so the provider is not re-queried while it is unhealthy; this request was not sent."
-	case failureBudget:
-		return "A previous attempt was rejected by the monthly budget. Wait for the budget to change before retrying."
+	case failureRequest:
+		return "A previous attempt was rejected for this plan or request. Correct the request or wait for the provider catalog to change before retrying."
 	case failureCredit:
 		return "A previous attempt was rejected for insufficient credit. Wait for the account credit to change before retrying."
 	default:
@@ -311,7 +311,7 @@ func failureKindFor(status int, err error) string {
 	case status == http.StatusPaymentRequired:
 		return failureCredit
 	case status == http.StatusBadRequest:
-		return failureBudget
+		return failureRequest
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return failureProviderTimeout
 	case err != nil:
@@ -324,7 +324,7 @@ func failureKindFor(status int, err error) string {
 }
 
 // orderEligibilityAdmission performs the pre-provider gates that precede the
-// budget mutex. It reports handled=true when the request was already answered,
+// purchase. It reports handled=true when the request was already answered,
 // plus the closed failure label the caller must use when releasing its
 // reservation, so a provider timeout arms the cooldown instead of leaving
 // repeated stalled reads unlimited.
@@ -337,8 +337,8 @@ func (h *Handlers) orderEligibilityAdmission(
 		return nil, true, failureKindFor(eligibilityErrorStatus(err), err)
 	}
 	if err := validateOrderAgainstCatalog(catalogPlans, req); err != nil {
-		h.handleBudgetCheckError(w, err)
-		return nil, true, failureBudget
+		h.handleCatalogCheckError(w, err)
+		return nil, true, failureRequest
 	}
 	return catalogPlans, false, ""
 }

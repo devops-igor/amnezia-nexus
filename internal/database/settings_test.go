@@ -314,6 +314,9 @@ func TestSettingsGigahostEncryptionAndFilePermissions(t *testing.T) {
 	// 2. Save gigahost setting with sensitive api_key
 	plainKey := "flux_live_" + strings.Repeat("x", 64)
 	ctx := context.Background()
+	// monthly_budget_nok is retired but deliberately kept in this fixture as
+	// extra payload: a settings row written by an older version must still
+	// round-trip at the storage layer without the panel reading it.
 	ghSetting := map[string]any{
 		"api_key":            plainKey,
 		"monthly_budget_nok": 250.0,

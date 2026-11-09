@@ -13,7 +13,6 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
-	"github.com/devops-igor/amnezia-nexus/internal/service/gigahostbudget"
 )
 
 // GigahostOrderRecord is the persisted ledger row. The type lives in models
@@ -28,6 +27,16 @@ type OrderServerPayload struct {
 	RegionID       int     `json:"region_id"`
 	OSID           int     `json:"os_id"`
 	HourlyPriceNOK float64 `json:"hourly_price_nok"`
+}
+
+// validate rejects a payload the provider cannot be asked to fulfill. Every
+// selection key is required; the client-supplied hourly rate is not, because the
+// provider catalog is the authoritative price.
+func (p OrderServerPayload) validate() error {
+	if p.PID <= 0 || p.PriceID <= 0 || p.RegionID <= 0 || p.OSID <= 0 {
+		return errors.New("pid, price_id, region_id, os_id must be positive integers")
+	}
+	return nil
 }
 
 // SetGigahostClient allows injecting or replacing the Gigahost API client.
@@ -265,12 +274,11 @@ func eligibilityErrorDetail(err error) string {
 	return fmt.Sprintf("Failed to fetch catalog: %v", err)
 }
 
-func (h *Handlers) handleBudgetCheckError(w http.ResponseWriter, err error) {
-	if errors.Is(err, errBudgetReconciliationUnresolved) {
-		h.JSONError(w, http.StatusServiceUnavailable, "budget_reconciliation_unresolved", err.Error())
-	} else if strings.HasPrefix(err.Error(), "Monthly budget cap exceeded") {
-		h.JSONError(w, http.StatusBadRequest, "budget_exceeded", err.Error())
-	} else if strings.HasPrefix(err.Error(), "invalid_plan:") {
+// handleCatalogCheckError maps a catalog/plan validation failure to the
+// handler's HTTP contract. Every branch here is about what the provider
+// catalog says about the requested plan, never about a spending decision.
+func (h *Handlers) handleCatalogCheckError(w http.ResponseWriter, err error) {
+	if strings.HasPrefix(err.Error(), "invalid_plan:") {
 		h.JSONError(w, http.StatusBadRequest, "invalid_plan", strings.TrimPrefix(err.Error(), "invalid_plan: "))
 	} else {
 		h.JSONError(w, http.StatusBadGateway, "catalog_check_failed", err.Error())
@@ -336,19 +344,8 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var req OrderServerPayload
-	if err := h.DecodeJSON(r, &req); err != nil {
-		h.JSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	if req.PID <= 0 || req.PriceID <= 0 || req.RegionID <= 0 || req.OSID <= 0 {
-		h.JSONError(w, http.StatusBadRequest, "invalid_params", "pid, price_id, region_id, os_id must be positive integers")
-		return
-	}
-
-	client, err := h.getGigahostClient(r.Context(), r)
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "unconfigured", err.Error())
+	req, client, ok := h.orderRequestAndClient(w, r)
+	if !ok {
 		return
 	}
 
@@ -386,33 +383,10 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 3. Concurrency serialization: lock around budget check, intent creation, and reservation
-	h.budgetMu.Lock()
-	defer h.budgetMu.Unlock()
-
-	// 4. Reconcile unknown purchase state and enforce in-flight duplicate lock
-	unresolved, reconcileErr := h.reconcilePendingUnknownOrders(r.Context(), client, req)
-	if reconcileErr != nil {
-		releaseOnAbort(failureProviderError)
-		h.JSONError(w, http.StatusServiceUnavailable, "reconciliation_failed", reconcileErr.Error())
-		return
-	}
-	if unresolved != nil {
-		// An unresolved prior purchase is not this attempt's failure, but the
-		// slot must still be released or the admin would be locked out.
-		releaseOnAbort("")
-		h.JSON(w, http.StatusAccepted, map[string]any{
-			"status":  "unknown",
-			"message": "Prior purchase order is pending reconciliation; refusing duplicate purchase until resolved",
-			"order":   unresolved,
-		})
-		return
-	}
-
-	// 5. Monthly NOK budget cap enforcement
-	if err := h.checkMonthlyBudget(r.Context(), client, req, catalogPlans); err != nil {
-		releaseOnAbort(failureBudget)
-		h.handleBudgetCheckError(w, err)
+	// 3-4. Serialize the duplicate check and the purchase within this process, so
+	// two concurrent requests cannot both conclude that no duplicate exists, then
+	// refuse when a prior attempt's outcome is still unknown.
+	if !h.gateDuplicatePurchase(w, r, client, req, releaseOnAbort) {
 		return
 	}
 
@@ -424,53 +398,15 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	// covers a panic.
 
 	// 3. Pre-dispatch durable intent persistence; fail closed if DB cannot record intent
-	now := time.Now().UTC()
-	// The price identity of the requested order is resolved from the catalog
-	// row the admin selected (product id + price id) and persisted with the
-	// intent. The provider does not return price id on any later read, and an
-	// existing reservation cannot be mapped back to a catalog row without it,
-	// so losing it here is what made the same VPS cost 41 or 120 NOK depending
-	// on catalog order.
-	priceIdentity := resolveOrderPriceIdentity(catalogPlans, req)
-	orderRecord := &GigahostOrderRecord{
-		OrderID:        fmt.Sprintf("intent_%d", now.UnixNano()),
-		Status:         "pending_order",
-		PlanID:         req.PID,
-		RegionID:       req.RegionID,
-		HourlyPriceNOK: priceIdentity.hourlyNOK,
-		PriceID:        priceIdentity.priceID,
-		MonthlyCapNOK:  priceIdentity.monthlyCapNOK,
-		Currency:       priceIdentity.currency,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	}
-	if err := h.saveGigahostOrder(r.Context(), orderRecord); err != nil {
+	orderRecord, orderResp, orderErr, ok := h.persistIntentAndPurchase(r.Context(), client, req, catalogPlans)
+	if !ok {
 		h.JSONError(w, http.StatusInternalServerError, "db_error",
-			fmt.Sprintf("Failed to persist deployment intent: %v", err))
+			"Failed to persist the order intent; no purchase was attempted")
 		return
 	}
-
-	// 4. Safe order dispatch with hourly billing enforcement
-	orderReq := gigahost.OrderRequest{
-		PID:           req.PID,
-		PriceID:       req.PriceID,
-		RegionID:      req.RegionID,
-		OSID:          req.OSID,
-		BillingPeriod: gigahost.BillingPeriodHourly,
-		Quantity:      1,
-	}
-
-	orderResp, orderErr := client.OrderServerSafe(r.Context(), orderReq)
-
-	// 5. Update record with cancellation-independent context
-	updateCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
-	defer cancel()
-
-	applyOrderResponseToRecord(orderRecord, orderResp, orderErr)
-
-	if updateErr := h.updateGigahostOrder(updateCtx, orderRecord); updateErr != nil {
+	if orderRecord == nil {
 		h.JSONError(w, http.StatusInternalServerError, "db_update_failed",
-			fmt.Sprintf("Order placed (%s) but failed to update record: %v", orderRecord.OrderID, updateErr))
+			"The order was placed but its record could not be updated; the durable intent remains and blocks a retry")
 		return
 	}
 
@@ -479,6 +415,36 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	// the cooldown; a success clears it.
 	failureKind = failureKindFor(0, orderErr)
 	releaseOnAbort(failureKind)
+
+	h.respondToOrderOutcome(w, orderRecord, orderResp, orderErr)
+}
+
+// respondUnresolvedDuplicate refuses a second purchase while a prior attempt's
+// outcome is still unknown, and shows the admin which order blocks them.
+func (h *Handlers) respondUnresolvedDuplicate(w http.ResponseWriter, unresolved *GigahostOrderRecord) {
+	h.JSON(w, http.StatusAccepted, map[string]any{
+		"status":  "unknown",
+		"message": "Prior purchase order is pending reconciliation; refusing duplicate purchase until resolved",
+		"order":   unresolved,
+	})
+}
+
+// respondToOrderOutcome writes the response for a completed purchase attempt.
+//
+// The three interesting outcomes are ordered by how much is known: a partial
+// order has a real id and a known message, an uncertain outcome is explicitly
+// NOT retryable (it is reported as unknown so a second purchase cannot be
+// guessed into existence), and anything else is a plain provider failure. A
+// success whose provider response carries no usable id is treated as uncertain
+// for the same reason.
+func (h *Handlers) respondToOrderOutcome(
+	w http.ResponseWriter, orderRecord *GigahostOrderRecord, orderResp *gigahost.OrderResponse, orderErr error,
+) {
+	unknownBody := map[string]any{
+		"status":  "unknown",
+		"message": "Order request outcome uncertain; marked unknown to prevent accidental duplicate purchases",
+		"order":   orderRecord,
+	}
 
 	if orderErr != nil {
 		var partialErr *gigahost.OrderPartialError
@@ -492,24 +458,16 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		var uncertainErr *gigahost.OrderUncertainError
-		if errors.As(orderErr, &uncertainErr) || (orderResp != nil && (orderResp.Status == gigahost.StatusUnknown || orderResp.OrderID == "")) {
-			h.JSON(w, http.StatusAccepted, map[string]any{
-				"status":  "unknown",
-				"message": "Order request outcome uncertain; marked unknown to prevent accidental duplicate purchases",
-				"order":   orderRecord,
-			})
+		if errors.As(orderErr, &uncertainErr) || orderOutcomeUnknown(orderResp) {
+			h.JSON(w, http.StatusAccepted, unknownBody)
 			return
 		}
 		h.JSONError(w, http.StatusBadGateway, "order_failed", orderErr.Error())
 		return
 	}
 
-	if orderResp != nil && (orderResp.Status == gigahost.StatusUnknown || orderResp.OrderID == "") {
-		h.JSON(w, http.StatusAccepted, map[string]any{
-			"status":  "unknown",
-			"message": "Order request outcome uncertain; marked unknown to prevent accidental duplicate purchases",
-			"order":   orderRecord,
-		})
+	if orderOutcomeUnknown(orderResp) {
+		h.JSON(w, http.StatusAccepted, unknownBody)
 		return
 	}
 
@@ -519,25 +477,126 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// isOrderActiveForBudget delegates to the shared budget contract so the
-// purchase path, the admin breakdown and the recovery utility cannot classify a
-// status differently.
-func isOrderActiveForBudget(status string) bool {
-	return gigahostbudget.IsActiveForBudget(status)
+// orderOutcomeUnknown reports whether a provider order response fails to
+// identify what was ordered, which makes the outcome unsafe to retry.
+func orderOutcomeUnknown(resp *gigahost.OrderResponse) bool {
+	return resp == nil || resp.Status == gigahost.StatusUnknown || resp.OrderID == ""
 }
 
-// requestMonthlySpend resolves the monthly ceiling of the order being requested
-// through the shared calculation. It returns 0 when the requested plan is not
-// resolvable, which the caller already treats as an invalid plan.
-func requestMonthlySpend(catalog []gigahost.HourlyPlan, req OrderServerPayload) float64 {
-	res, err := gigahostbudget.Evaluate(gigahostbudget.Input{
-		Plans:   budgetPlans(catalog),
-		Request: &gigahostbudget.Request{PlanID: req.PID, PriceID: req.PriceID},
-	})
-	if err != nil {
-		return 0
+// gateDuplicatePurchase holds the purchase lock and refuses an attempt while a
+// prior purchase outcome is unresolved. It reports false after writing the
+// refusal; the caller releases its admission slot and returns.
+//
+// The lock is held from the duplicate check through the purchase and the record
+// update, so two concurrent same-process requests cannot both conclude that no
+// duplicate exists. It is released by the caller's unwind, and no failure is
+// hidden: a reconciliation read error is a hard refusal, and an unresolved prior
+// order releases the slot without arming a cooldown because it is not this
+// attempt's failure.
+func (h *Handlers) gateDuplicatePurchase(
+	w http.ResponseWriter, r *http.Request, client gigahost.Client, req OrderServerPayload,
+	releaseOnAbort func(string),
+) bool {
+	h.purchaseMu.Lock()
+	defer h.purchaseMu.Unlock()
+
+	unresolved, reconcileErr := h.reconcilePendingUnknownOrders(r.Context(), client, req)
+	if reconcileErr != nil {
+		releaseOnAbort(failureProviderError)
+		h.JSONError(w, http.StatusServiceUnavailable, "reconciliation_failed", reconcileErr.Error())
+		return false
 	}
-	return res.RequestedNOK
+	if unresolved != nil {
+		releaseOnAbort("")
+		h.respondUnresolvedDuplicate(w, unresolved)
+		return false
+	}
+	return true
+}
+
+// persistIntentAndPurchase records the durable intent, asks the provider to place
+// the hourly order, then records the provider's answer.
+//
+// It reports ok=false only when the intent itself could not be written, in which
+// case no purchase was attempted and the caller must fail closed. A nil record
+// with ok=true means the purchase happened but the record update failed: the
+// durable intent row remains, so the duplicate guard still blocks a retry and the
+// caller reports db_update_failed rather than pretending the order does not exist.
+//
+// The intent is written BEFORE the provider call on purpose. The provider does not
+// return the catalog price id on any later read, so an intent that lost the price
+// identity could not be reconciled back to the catalog row that was ordered.
+func (h *Handlers) persistIntentAndPurchase(
+	ctx context.Context, client gigahost.Client, req OrderServerPayload, catalogPlans []gigahost.HourlyPlan,
+) (*GigahostOrderRecord, *gigahost.OrderResponse, error, bool) {
+	now := time.Now().UTC()
+	priceIdentity := resolveOrderPriceIdentity(catalogPlans, req)
+	orderRecord := &GigahostOrderRecord{
+		OrderID:        fmt.Sprintf("intent_%d", now.UnixNano()),
+		Status:         "pending_order",
+		PlanID:         req.PID,
+		RegionID:       req.RegionID,
+		HourlyPriceNOK: priceIdentity.hourlyNOK,
+		PriceID:        priceIdentity.priceID,
+		MonthlyCapNOK:  priceIdentity.monthlyCapNOK,
+		Currency:       priceIdentity.currency,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := h.saveGigahostOrder(ctx, orderRecord); err != nil {
+		return nil, nil, nil, false
+	}
+
+	orderResp, orderErr := client.OrderServerSafe(ctx, gigahost.OrderRequest{
+		PID:           req.PID,
+		PriceID:       req.PriceID,
+		RegionID:      req.RegionID,
+		OSID:          req.OSID,
+		BillingPeriod: gigahost.BillingPeriodHourly,
+		Quantity:      1,
+	})
+
+	// The record update must survive client cancellation: the purchase already
+	// happened, and an unrecorded purchase is the duplicate hazard.
+	updateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	applyOrderResponseToRecord(orderRecord, orderResp, orderErr)
+	if updateErr := h.updateGigahostOrder(updateCtx, orderRecord); updateErr != nil {
+		return nil, orderResp, orderErr, true
+	}
+	return orderRecord, orderResp, orderErr, true
+}
+
+// orderRequestAndClient decodes and validates the order payload and resolves the
+// provider client. It reports ok=false after writing the refusal, so the caller
+// returns without repeating the error mapping.
+func (h *Handlers) orderRequestAndClient(w http.ResponseWriter, r *http.Request) (OrderServerPayload, gigahost.Client, bool) {
+	var req OrderServerPayload
+	if err := h.DecodeJSON(r, &req); err != nil {
+		h.JSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return req, nil, false
+	}
+	if err := req.validate(); err != nil {
+		h.JSONError(w, http.StatusBadRequest, "invalid_params", err.Error())
+		return req, nil, false
+	}
+	client, err := h.getGigahostClient(r.Context(), r)
+	if err != nil {
+		h.JSONError(w, http.StatusBadRequest, "unconfigured", err.Error())
+		return req, nil, false
+	}
+	return req, client, true
+}
+
+// catalogPlanFor returns the catalog row the request selected, or nil when the
+// provider catalog does not carry that product/price pair.
+func catalogPlanFor(catalog []gigahost.HourlyPlan, req OrderServerPayload) *gigahost.HourlyPlan {
+	for i := range catalog {
+		if catalog[i].ProductID == req.PID && (req.PriceID == 0 || catalog[i].PriceID == req.PriceID) {
+			return &catalog[i]
+		}
+	}
+	return nil
 }
 
 //nolint:misspell // "cancelled" matches documented provider status and test assertions
@@ -547,172 +606,39 @@ func validateOrderAgainstCatalog(catalog []gigahost.HourlyPlan, req OrderServerP
 	if len(catalog) == 0 {
 		return fmt.Errorf("invalid_plan: no available plans in catalog")
 	}
-	var matchedPlan *gigahost.HourlyPlan
-	for i := range catalog {
-		if catalog[i].ProductID == req.PID && (req.PriceID == 0 || catalog[i].PriceID == req.PriceID) {
-			matchedPlan = &catalog[i]
-			break
-		}
-	}
+	matchedPlan := catalogPlanFor(catalog, req)
 	if matchedPlan == nil {
 		return fmt.Errorf("invalid_plan: plan %d (price %d) not found in provider catalog", req.PID, req.PriceID)
 	}
 	if !matchedPlan.InStock {
 		return fmt.Errorf("invalid_plan: plan %d is out of stock", req.PID)
 	}
-	if len(matchedPlan.Regions) == 0 {
-		return fmt.Errorf("invalid_plan: plan %d has no available regions in catalog", req.PID)
-	}
-	regionValid := false
-	for _, r := range matchedPlan.Regions {
-		if r.ID == req.RegionID && r.Available {
-			regionValid = true
-			break
-		}
-	}
-	if !regionValid {
-		return fmt.Errorf("invalid_plan: region %d is not available for plan %d", req.RegionID, req.PID)
+	if err := validatePlanRegion(matchedPlan, req); err != nil {
+		return err
 	}
 
-	planMonthlyRate := requestMonthlySpend(catalog, req)
-	if planMonthlyRate <= 0 {
+	// A plan the provider prices at zero would be ordered without an
+	// authoritative rate, so ordering stays refused. This is a price-integrity
+	// check on the provider catalog entry, not a spending ceiling: nothing
+	// compares the plan against a configured amount any more.
+	if matchedPlan.MonthlyCeiling <= 0 && matchedPlan.HourlyRateNOK <= 0 {
 		return fmt.Errorf("invalid_plan: plan %d has zero or negative price in provider catalog", req.PID)
 	}
 	return nil
 }
 
-// budgetEvaluation is one complete budget decision plus the evidence it was
-// derived from. The purchase path, the admin breakdown endpoint and the operator
-// recovery utility all consume this same structure, so display and decision
-// cannot diverge.
-type budgetEvaluation struct {
-	result gigahostbudget.Result
-	// servers/localOrders are the observations the decision used, kept so the
-	// reconciliation pass can write status updates without a second read.
-	servers     []gigahost.ServerInfo
-	localOrders []GigahostOrderRecord
-}
-
-// budgetError maps a shared budget error to the handler's HTTP contract. The
-// pre-existing 502 catalog_check_failed shape is preserved for an unpriceable
-// commitment, because an operator must not mistake it for a budget rejection.
-func budgetError(err error) error {
-	return fmt.Errorf("failed to calculate committed spend: %w", err)
-}
-
-// evaluateBudget computes the single authoritative budget result for one
-// request. It reconciles conclusive releases durably before pricing; a rejected
-// or failed transition aborts the decision instead of freeing budget in memory.
-func (h *Handlers) evaluateBudget(ctx context.Context, client gigahost.Client, req OrderServerPayload, cachedCatalog ...[]gigahost.HourlyPlan) (budgetEvaluation, error) {
-	var catalog []gigahost.HourlyPlan
-	if len(cachedCatalog) > 0 && cachedCatalog[0] != nil {
-		catalog = cachedCatalog[0]
-	} else if client != nil {
-		var catErr error
-		catalog, catErr = client.GetCatalog(ctx)
-		if catErr != nil {
-			return budgetEvaluation{}, fmt.Errorf("failed to check catalog for budget verification: %w", catErr)
+// validatePlanRegion requires the selected region to be present and available in
+// the plan the provider actually returned.
+func validatePlanRegion(plan *gigahost.HourlyPlan, req OrderServerPayload) error {
+	if len(plan.Regions) == 0 {
+		return fmt.Errorf("invalid_plan: plan %d has no available regions in catalog", req.PID)
+	}
+	for _, r := range plan.Regions {
+		if r.ID == req.RegionID && r.Available {
+			return nil
 		}
 	}
-
-	if err := validateOrderAgainstCatalog(catalog, req); err != nil {
-		return budgetEvaluation{}, err
-	}
-
-	monthlyBudget, err := h.getMonthlyBudgetNOK(ctx)
-	if err != nil {
-		return budgetEvaluation{}, fmt.Errorf("failed to verify monthly budget: %w", err)
-	}
-
-	// A cap of zero disables the check, exactly as before: no inventory or
-	// ledger read is issued in that case, so a disabled cap cannot start
-	// failing order attempts on a provider read it never used to make.
-	if monthlyBudget <= 0 {
-		return budgetEvaluation{result: gigahostbudget.Result{CapNOK: 0, Allowed: true}}, nil
-	}
-
-	servers, srvErr := client.GetServers(ctx)
-	if srvErr != nil {
-		return budgetEvaluation{}, fmt.Errorf("failed to check existing server inventory for budget verification: %w", srvErr)
-	}
-
-	localOrders, ordErr := h.getGigahostOrders(ctx)
-	if ordErr != nil {
-		return budgetEvaluation{}, fmt.Errorf("failed to check local orders for budget verification: %w", ordErr)
-	}
-
-	// Reconcile provider status into the ledger first, then price the result:
-	// a reservation the provider has conclusively ended must not be counted as
-	// committed, and this is the pre-existing automatic reconciliation.
-	reconciled := h.reconcileLedgerReservations(ctx, client, servers, localOrders)
-	if reconciled.err != nil {
-		return budgetEvaluation{}, reconciled.err
-	}
-	evidence := reconciled.evidence
-	if len(reconciled.released) > 0 {
-		// Re-read so the priced snapshot includes the releases just written.
-		// Failing here must not silently keep released spend in the total.
-		fresh, freshErr := h.getGigahostOrders(ctx)
-		if freshErr != nil {
-			return budgetEvaluation{}, fmt.Errorf("failed to re-read local orders after reconciliation: %w", freshErr)
-		}
-		localOrders = fresh
-	}
-
-	res, err := gigahostbudget.Evaluate(gigahostbudget.Input{
-		CapNOK:   monthlyBudget,
-		Plans:    budgetPlans(catalog),
-		Servers:  budgetServers(servers),
-		Entries:  budgetEntries(localOrders),
-		Evidence: evidence,
-		Request: &gigahostbudget.Request{
-			PlanID:         req.PID,
-			PriceID:        req.PriceID,
-			HourlyPriceNOK: req.HourlyPriceNOK,
-		},
-	})
-	if err != nil {
-		return budgetEvaluation{}, budgetError(err)
-	}
-	return budgetEvaluation{result: res, servers: servers, localOrders: localOrders}, nil
-}
-
-func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Client, req OrderServerPayload, cachedCatalog ...[]gigahost.HourlyPlan) error {
-	evaluated, err := h.evaluateBudget(ctx, client, req, cachedCatalog...)
-	if err != nil {
-		return err
-	}
-	if !evaluated.result.Allowed {
-		return fmt.Errorf("Monthly budget cap exceeded: requested order exceeds configured budget of %v NOK (committed %v + requested %v)",
-			evaluated.result.CapNOK, evaluated.result.CommittedNOK, evaluated.result.RequestedNOK)
-	}
-	return nil
-}
-
-func (h *Handlers) getMonthlyBudgetNOK(ctx context.Context) (float64, error) {
-	if h.db == nil {
-		return 0, nil
-	}
-	var ghCfg map[string]any
-	if err := h.db.GetSetting(ctx, "gigahost", &ghCfg); err != nil {
-		return 0, fmt.Errorf("read monthly budget: %w", err)
-	}
-	rawVal := ghCfg["monthly_budget_nok"]
-	if rawVal == nil {
-		var directVal any
-		if err := h.db.GetSetting(ctx, "gigahost.monthly_budget_nok", &directVal); err != nil {
-			return 0, fmt.Errorf("read monthly budget: %w", err)
-		}
-		rawVal = directVal
-	}
-	if rawVal == nil {
-		return 0, nil
-	}
-	val, err := parseBudgetVal(rawVal)
-	if err != nil {
-		return 0, fmt.Errorf("read monthly budget: %w", err)
-	}
-	return val, nil
+	return fmt.Errorf("invalid_plan: region %d is not available for plan %d", req.RegionID, req.PID)
 }
 
 func isPendingOrInFlight(status string) bool {

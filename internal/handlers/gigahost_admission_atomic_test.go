@@ -102,10 +102,7 @@ func submitOrderAs(h *Handlers, userID string) *httptest.ResponseRecorder {
 // one attempt is blocked inside provider I/O, every other same-admin request must
 // be refused WITHOUT issuing provider work.
 func TestConcurrentSameAdminAdmitsOnlyOneAttempt(t *testing.T) {
-	h, db, _ := setupTestHandlers(t)
-	if err := db.SetSetting(context.Background(), "gigahost", map[string]any{"monthly_budget_nok": 100.0}); err != nil {
-		t.Fatal(err)
-	}
+	h, _, _ := setupTestHandlers(t)
 
 	mock := &mockGigahostClient{
 		getAccountFn: func(context.Context) (*gigahost.AccountInfo, error) {
@@ -165,10 +162,7 @@ func TestConcurrentSameAdminAdmitsOnlyOneAttempt(t *testing.T) {
 
 // TestConcurrentSeparateAdminsAreIndependent proves the reservation is per admin.
 func TestConcurrentSeparateAdminsAreIndependent(t *testing.T) {
-	h, db, _ := setupTestHandlers(t)
-	if err := db.SetSetting(context.Background(), "gigahost", map[string]any{"monthly_budget_nok": 100.0}); err != nil {
-		t.Fatal(err)
-	}
+	h, _, _ := setupTestHandlers(t)
 	mock := &mockGigahostClient{
 		getAccountFn: func(context.Context) (*gigahost.AccountInfo, error) {
 			return &gigahost.AccountInfo{Balance: 500, Currency: "NOK"}, nil
@@ -217,10 +211,7 @@ func TestConcurrentSeparateAdminsAreIndependent(t *testing.T) {
 // stalled account reads must not keep re-issuing, and the FIRST genuine provider
 // error must be preserved rather than replaced.
 func TestRepeatedAccountTimeoutsAreSuppressed(t *testing.T) {
-	h, db, _ := setupTestHandlers(t)
-	if err := db.SetSetting(context.Background(), "gigahost", map[string]any{"monthly_budget_nok": 100.0}); err != nil {
-		t.Fatal(err)
-	}
+	h, _, _ := setupTestHandlers(t)
 
 	var accountCalls int32
 	h.SetGigahostClient(&mockGigahostClient{
@@ -276,9 +267,8 @@ func TestProviderErrorRecoversAfterWindow(t *testing.T) {
 // which would be a permanent lockout for that admin.
 func TestReservationIsReleasedOnEveryTerminalPath(t *testing.T) {
 	cases := []struct {
-		name   string
-		mock   *mockGigahostClient
-		budget float64
+		name string
+		mock *mockGigahostClient
 	}{
 		{
 			name: "provider failure releases the slot",
@@ -293,15 +283,11 @@ func TestReservationIsReleasedOnEveryTerminalPath(t *testing.T) {
 					}}, nil
 				},
 			},
-			budget: 100,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h, db, _ := setupTestHandlers(t)
-			if err := db.SetSetting(context.Background(), "gigahost", map[string]any{"monthly_budget_nok": tc.budget}); err != nil {
-				t.Fatal(err)
-			}
+			h, _, _ := setupTestHandlers(t)
 			h.SetGigahostClient(tc.mock)
 			submitOrderAs(h, "admin-x")
 
@@ -375,13 +361,10 @@ func TestEvictIfFullBoundedFallback(t *testing.T) {
 // TestReservationHeldThroughPurchase verifies the reservation's real lifetime. The
 // slot is released just before intent persistence, so the question is whether a
 // second same-admin request can slip in during the purchase window. It cannot: the
-// purchase runs under budgetMu, so the second request blocks there instead of
+// purchase runs under purchaseMu, so the second request blocks there instead of
 // repeating provider reads.
 func TestReservationHeldThroughPurchase(t *testing.T) {
-	h, db, _ := setupTestHandlers(t)
-	if err := db.SetSetting(context.Background(), "gigahost", map[string]any{"monthly_budget_nok": 1000.0}); err != nil {
-		t.Fatal(err)
-	}
+	h, _, _ := setupTestHandlers(t)
 	mock := &mockGigahostClient{
 		getAccountFn: func(context.Context) (*gigahost.AccountInfo, error) {
 			return &gigahost.AccountInfo{Balance: 5000, Currency: "NOK"}, nil
@@ -416,7 +399,7 @@ func TestReservationHeldThroughPurchase(t *testing.T) {
 	close(pb.release)
 
 	if second == nil {
-		// Blocked behind budgetMu: no extra provider work happened. That is the
+		// Blocked behind purchaseMu: no extra provider work happened. That is the
 		// correct outcome and is the assertion.
 		if got := atomic.LoadInt32(&pb.catalog); got != afterFirstCatalog {
 			t.Fatalf("catalog reads grew to %d while blocked, want %d", got, afterFirstCatalog)
@@ -433,10 +416,7 @@ func TestReservationHeldThroughPurchase(t *testing.T) {
 // recovers a panic, so without a deferred release the slot would stay set and
 // lock that admin out until restart.
 func TestPanicDoesNotLeakTheReservation(t *testing.T) {
-	h, db, _ := setupTestHandlers(t)
-	if err := db.SetSetting(context.Background(), "gigahost", map[string]any{"monthly_budget_nok": 1000.0}); err != nil {
-		t.Fatal(err)
-	}
+	h, _, _ := setupTestHandlers(t)
 	h.SetGigahostClient(&mockGigahostClient{
 		getAccountFn: func(context.Context) (*gigahost.AccountInfo, error) {
 			panic("provider client exploded")

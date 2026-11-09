@@ -3,10 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -50,6 +47,7 @@ func (h *Handlers) GetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	if key, ok := gigahostCfg["api_key"].(string); ok && key != "" {
 		gigahostCfg["api_key"] = "********"
 	}
+	stripObsoleteGigahostKeys(gigahostCfg)
 
 	h.JSON(w, http.StatusOK, map[string]any{
 		"appearance": appearance,
@@ -59,6 +57,20 @@ func (h *Handlers) GetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		"limits":     limitsCfg,
 		"gigahost":   gigahostCfg,
 	})
+}
+
+// obsoleteGigahostKeys are setting fields the panel no longer reads or writes.
+// They are not migrated away: an existing row keeps the bytes so nothing in the
+// database is destroyed, but the panel neither reports them nor accepts them.
+var obsoleteGigahostKeys = []string{"monthly_budget_nok"}
+
+// stripObsoleteGigahostKeys removes retired Gigahost setting fields from a
+// decoded settings map, so the retired surface cannot come back through the read
+// API or be re-saved by a stale client.
+func stripObsoleteGigahostKeys(cfg map[string]any) {
+	for _, key := range obsoleteGigahostKeys {
+		delete(cfg, key)
+	}
 }
 
 func (h *Handlers) preserveSecretsOnSave(ctx context.Context, req *models.SaveSettingsRequest) {
@@ -123,46 +135,6 @@ func (h *Handlers) persistSettings(ctx context.Context, req *models.SaveSettings
 	return h.db.SetSetting(ctx, "limits", req.Limits)
 }
 
-func parseBudgetVal(raw any) (float64, error) {
-	if raw == nil {
-		return 0, nil
-	}
-	var val float64
-	switch v := raw.(type) {
-	case float64:
-		val = v
-	case float32:
-		val = float64(v)
-	case int:
-		val = float64(v)
-	case int64:
-		val = float64(v)
-	case json.Number:
-		f, err := v.Float64()
-		if err != nil {
-			return 0, fmt.Errorf("invalid numeric budget %q: %w", v, err)
-		}
-		val = f
-	case string:
-		trimmed := strings.TrimSpace(v)
-		if trimmed == "" {
-			return 0, errors.New("empty budget string")
-		}
-		f, err := strconv.ParseFloat(trimmed, 64)
-		if err != nil {
-			return 0, fmt.Errorf("cannot parse budget string: %w", err)
-		}
-		val = f
-	default:
-		return 0, fmt.Errorf("unsupported budget type: %T", raw)
-	}
-
-	if math.IsNaN(val) || math.IsInf(val, 0) || val < 0 {
-		return 0, fmt.Errorf("budget must be a finite non-negative number: %v", val)
-	}
-	return val, nil
-}
-
 type mockCatalogFallback struct {
 	gigahost.Client
 }
@@ -206,18 +178,10 @@ func (h *Handlers) SaveSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		req.Gigahost = nil
 	}
 
-	if req.Gigahost != nil {
-		if rawBudget, ok := req.Gigahost["monthly_budget_nok"]; ok && rawBudget != nil {
-			budget, err := parseBudgetVal(rawBudget)
-			if err != nil {
-				h.JSONError(w, http.StatusBadRequest, "validation_failed", fmt.Sprintf("Invalid monthly budget value: %v", err))
-				return
-			}
-			req.Gigahost["monthly_budget_nok"] = budget
-		}
-	}
-
 	ctx := r.Context()
+	if req.Gigahost != nil {
+		stripObsoleteGigahostKeys(req.Gigahost)
+	}
 	h.preserveSecretsOnSave(ctx, &req)
 
 	if err := h.persistSettings(ctx, &req); err != nil {

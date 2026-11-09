@@ -338,13 +338,6 @@
                         placeholder="flux_live_...">
                     <p class="form-hint">{{ _ "gigahost_api_key_hint" }}</p>
                 </div>
-                <div class="form-group">
-                    <label class="form-label" for="gigahost_monthly_budget">{{ _ "gigahost_monthly_budget_label" }}</label>
-                    <input type="number" step="any" min="0" class="form-input" id="gigahost_monthly_budget"
-                        value="{{ get $ghSettings "monthly_budget_nok" "" }}"
-                        placeholder="500">
-                    <p class="form-hint">{{ _ "gigahost_monthly_budget_hint" }}</p>
-                </div>
             </form>
 
             <div class="divider" style="margin: var(--space-md) 0;"></div>
@@ -469,12 +462,10 @@
         };
 
         const ghApiKeyInput = document.getElementById('gigahost_api_key');
-        const ghBudgetInput = document.getElementById('gigahost_monthly_budget');
         let gigahost = undefined;
-        if (ghApiKeyInput || ghBudgetInput) {
+        if (ghApiKeyInput) {
             gigahost = {
-                api_key: ghApiKeyInput ? ghApiKeyInput.value.trim() : '',
-                monthly_budget_nok: ghBudgetInput && ghBudgetInput.value ? parseFloat(ghBudgetInput.value) : 0
+                api_key: ghApiKeyInput.value.trim()
             };
         }
 
