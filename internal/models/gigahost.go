@@ -35,3 +35,18 @@ type GigahostOrder struct {
 	// and is treated as NOK, the pre-existing assumption.
 	Currency string `json:"currency"`
 }
+
+// GigahostOrderCredential is the managed SSH credential attached to one order
+// attempt.
+//
+// It exists so a purchase and the access to the purchased server are one
+// durable unit: the public key is registered with the provider before the order,
+// and the private material needed to log in afterwards is stored against the same
+// order. PrivateKey holds plaintext in memory only; the database layer encrypts
+// it on write and decrypts it on read, exactly as it does for the server table.
+type GigahostOrderCredential struct {
+	OrderID       string
+	PrivateKey    string
+	PublicKey     string
+	ProviderKeyID int64
+}

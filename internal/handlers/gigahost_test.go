@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,10 +24,39 @@ type mockGigahostClient struct {
 	getProductsFn     func(ctx context.Context) ([]gigahost.Product, error)
 	getOSFn           func(ctx context.Context) ([]gigahost.OperatingSystem, error)
 	getAccountFn      func(ctx context.Context) (*gigahost.AccountInfo, error)
+	listSSHKeysFn     func(ctx context.Context) ([]gigahost.SSHKeyInfo, error)
+	registerSSHKeyFn  func(ctx context.Context, name, publicKey string) error
 	orderServerFn     func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error)
 	orderServerSafeFn func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error)
 	getDeployStatusFn func(ctx context.Context, orderID string) (*gigahost.DeployStatusResponse, error)
 	getServersFn      func(ctx context.Context) ([]gigahost.ServerInfo, error)
+
+	// registeredKeys is the account key list this fake provider maintains when a
+	// test does not supply listSSHKeysFn: RegisterSSHKey appends to it (unless
+	// registerSSHKeyFn overrides) and ListSSHKeys reads it. It makes the
+	// documented "register then re-read the account" contract observable without
+	// every test having to wire both halves by hand.
+	registeredKeys []gigahost.SSHKeyInfo
+}
+
+func (m *mockGigahostClient) ListSSHKeys(ctx context.Context) ([]gigahost.SSHKeyInfo, error) {
+	if m.listSSHKeysFn != nil {
+		return m.listSSHKeysFn(ctx)
+	}
+	return append([]gigahost.SSHKeyInfo(nil), m.registeredKeys...), nil
+}
+
+func (m *mockGigahostClient) RegisterSSHKey(ctx context.Context, name, publicKey string) error {
+	if m.registerSSHKeyFn != nil {
+		return m.registerSSHKeyFn(ctx, name, publicKey)
+	}
+	m.registeredKeys = append(m.registeredKeys, gigahost.SSHKeyInfo{
+		KeyID:    strconv.Itoa(len(m.registeredKeys) + 1),
+		KeyName:  name,
+		KeyData:  publicKey,
+		KeyAdded: "1700000000",
+	})
+	return nil
 }
 
 func (m *mockGigahostClient) GetCatalog(ctx context.Context) ([]gigahost.HourlyPlan, error) {

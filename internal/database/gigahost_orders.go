@@ -14,10 +14,13 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/security"
 )
 
 // gigahostOrdersSchema is the current table definition. It is created when
@@ -52,6 +55,9 @@ var gigahostOrderColumns = []struct {
 	{"price_id", `ALTER TABLE gigahost_orders ADD COLUMN price_id INTEGER DEFAULT 0`},
 	{"monthly_cap_nok", `ALTER TABLE gigahost_orders ADD COLUMN monthly_cap_nok REAL DEFAULT 0.0`},
 	{"currency", `ALTER TABLE gigahost_orders ADD COLUMN currency TEXT DEFAULT ''`},
+	{"ssh_key_enc", `ALTER TABLE gigahost_orders ADD COLUMN ssh_key_enc TEXT DEFAULT ''`},
+	{"ssh_public_key", `ALTER TABLE gigahost_orders ADD COLUMN ssh_public_key TEXT DEFAULT ''`},
+	{"provider_ssh_key_id", `ALTER TABLE gigahost_orders ADD COLUMN provider_ssh_key_id INTEGER DEFAULT 0`},
 }
 
 var gigahostOrderIndexes = []string{
@@ -235,4 +241,153 @@ func (d *DB) UpdateGigahostOrder(ctx context.Context, o *models.GigahostOrder) e
 		o.ID, o.OrderID,
 	)
 	return err
+}
+
+// orderCredentialQuery is the shared SELECT for one credential row. Both readers
+// use it so the column list and scan order cannot drift apart.
+const orderCredentialQuery = `SELECT order_id, ssh_key_enc, ssh_public_key, provider_ssh_key_id
+	FROM gigahost_orders`
+
+// scanOrderCredential reads one credential row, decrypting the private key.
+//
+// A row with no stored credential reports found=false without an error; a stored
+// credential that cannot be decrypted is an error, never a silent absence.
+func (d *DB) scanOrderCredential(row *sql.Row, what string) (*models.GigahostOrderCredential, bool, error) {
+	var cred models.GigahostOrderCredential
+	var encKey, publicKey sql.NullString
+	var providerKeyID sql.NullInt64
+	if err := row.Scan(&cred.OrderID, &encKey, &publicKey, &providerKeyID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("failed to read %s: %w", what, err)
+	}
+	if !encKey.Valid || encKey.String == "" {
+		return nil, false, nil
+	}
+	plain, err := security.DecryptCredential(encKey.String, d.secretKey)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to decrypt %s: %w", what, err)
+	}
+	cred.PrivateKey = plain
+	cred.PublicKey = publicKey.String
+	cred.ProviderKeyID = providerKeyID.Int64
+	return &cred, true, nil
+}
+
+// SetGigahostOrderCredential attaches the managed SSH credential to an existing
+// ledger row, addressed by the row's order_id.
+//
+// The private key is encrypted with the same credential encryption the server
+// table uses, so the panel holds one encryption boundary rather than a second
+// key store. PublicKey and ProviderKeyID are the correlation between what this
+// order authorized at the provider and the material the panel will log in with;
+// they are deliberately stored in clear because neither is a secret.
+//
+// An update that matches no row is an error: a credential with no order would be
+// access material nobody owns, and silently dropping it would lose the ability to
+// ever reach the server.
+func (d *DB) SetGigahostOrderCredential(ctx context.Context, cred *models.GigahostOrderCredential) error {
+	if d == nil || d.sqlDB == nil {
+		return nil
+	}
+	if err := validateOrderCredential(cred); err != nil {
+		return err
+	}
+	if err := d.EnsureGigahostOrdersSchema(ctx); err != nil {
+		return err
+	}
+	encKey, err := d.encryptOrderCredential(cred.PrivateKey)
+	if err != nil {
+		return err
+	}
+	return d.writeOrderCredential(ctx, cred, encKey)
+}
+
+// writeOrderCredential performs the row update and refuses an update that matched
+// no row, so a credential can never exist without the order it belongs to.
+func (d *DB) writeOrderCredential(ctx context.Context, cred *models.GigahostOrderCredential, encKey string) error {
+	q := `UPDATE gigahost_orders
+	      SET ssh_key_enc = ?, ssh_public_key = ?, provider_ssh_key_id = ?, updated_at = ?
+	      WHERE order_id = ?`
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	res, err := d.sqlDB.ExecContext(ctx, q,
+		encKey, cred.PublicKey, cred.ProviderKeyID, time.Now().UTC().Format(time.RFC3339), cred.OrderID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to store gigahost order ssh credential: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to confirm gigahost order ssh credential write: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("no gigahost order row matches order id %q", cred.OrderID)
+	}
+	return nil
+}
+
+// validateOrderCredential rejects a credential that could not be stored
+// meaningfully: it must name an existing order and carry material.
+func validateOrderCredential(cred *models.GigahostOrderCredential) error {
+	if cred == nil || strings.TrimSpace(cred.OrderID) == "" {
+		return errors.New("gigahost order credential requires an order id")
+	}
+	if strings.TrimSpace(cred.PrivateKey) == "" {
+		return errors.New("gigahost order credential requires private key material")
+	}
+	return nil
+}
+
+// encryptOrderCredential applies the repository credential encryption, and leaves
+// an already-encrypted value untouched so a re-store cannot double-encrypt.
+func (d *DB) encryptOrderCredential(privateKey string) (string, error) {
+	if security.LooksLikeFernetToken(privateKey) {
+		return privateKey, nil
+	}
+	enc, err := security.EncryptCredential(privateKey, d.secretKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to encrypt gigahost order ssh key: %w", err)
+	}
+	return enc, nil
+}
+
+// GetGigahostOrderCredential returns the managed credential stored against an
+// order id, with the private key decrypted.
+//
+// It reports found=false when the row has no credential recorded (every order
+// created before this existed, and any order placed without a managed key).
+// A stored credential that cannot be decrypted is an error, never a silent
+// "no credential": the server would otherwise look unreachable for a reason the
+// operator cannot see.
+func (d *DB) GetGigahostOrderCredential(ctx context.Context, orderID string) (*models.GigahostOrderCredential, bool, error) {
+	if d == nil || d.sqlDB == nil || strings.TrimSpace(orderID) == "" {
+		return nil, false, nil
+	}
+	if err := d.EnsureGigahostOrdersSchema(ctx); err != nil {
+		return nil, false, err
+	}
+	row := d.sqlDB.QueryRowContext(ctx, orderCredentialQuery+` WHERE order_id = ?`, orderID)
+	return d.scanOrderCredential(row, "gigahost order ssh credential")
+}
+
+// LatestGigahostOrderCredential returns the most recently written managed
+// credential, with the private key decrypted.
+//
+// It exists so a new order does not add another account key: the account has a
+// finite, operator-visible key list, and re-using the material already recorded
+// keeps that list from growing on every order. found=false means no order has ever
+// recorded a credential, which is the only case that needs new key material.
+func (d *DB) LatestGigahostOrderCredential(ctx context.Context) (*models.GigahostOrderCredential, bool, error) {
+	if d == nil || d.sqlDB == nil {
+		return nil, false, nil
+	}
+	if err := d.EnsureGigahostOrdersSchema(ctx); err != nil {
+		return nil, false, err
+	}
+	row := d.sqlDB.QueryRowContext(ctx, orderCredentialQuery+`
+		WHERE ssh_key_enc IS NOT NULL AND ssh_key_enc != ''
+		ORDER BY id DESC LIMIT 1`)
+	return d.scanOrderCredential(row, "reusable gigahost order ssh credential")
 }

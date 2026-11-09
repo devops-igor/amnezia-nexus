@@ -52,6 +52,13 @@ type GigahostDeployRequest struct {
 	ExpectedFingerprint string `json:"expected_fingerprint,omitempty"`
 	HostKeyFingerprint  string `json:"host_key_fingerprint,omitempty"`
 	ConfirmHostKey      bool   `json:"confirm_host_key,omitempty"`
+
+	// UseOrderCredential asks setup to reload the managed SSH credential the
+	// order was placed with, instead of a password or a pasted key. It is
+	// explicit so the pre-existing manual/password path stays byte-for-byte
+	// unchanged and its "ssh_password or ssh_key is required" refusal still
+	// applies to a request that asks for neither.
+	UseOrderCredential bool `json:"use_order_credential,omitempty"`
 }
 
 // Validate validates required inputs and protocol choice.
@@ -59,7 +66,7 @@ func (r *GigahostDeployRequest) Validate() error {
 	if strings.TrimSpace(r.OrderID) == "" {
 		return errors.New("order_id is required")
 	}
-	if strings.TrimSpace(r.SSHPassword) == "" && strings.TrimSpace(r.SSHPrivateKey) == "" {
+	if !r.UseOrderCredential && strings.TrimSpace(r.SSHPassword) == "" && strings.TrimSpace(r.SSHPrivateKey) == "" {
 		return errors.New("ssh_password or ssh_key is required")
 	}
 	proto := r.GetEffectiveProtocol()
@@ -498,29 +505,11 @@ func (h *Handlers) qualifyBackendTraffic(ctx context.Context, server *models.Ser
 
 // DeployGigahostOrder orchestrates the multi-step onboarding of a ready Gigahost VPS into an active VPN backend.
 func (h *Handlers) DeployGigahostOrder(ctx context.Context, req GigahostDeployRequest) (*GigahostDeployStatus, error) {
-	if err := req.Validate(); err != nil {
+	client, order, nexusServerID, unlock, err := h.beginGigahostDeploy(ctx, req)
+	if err != nil {
 		return nil, err
 	}
-
-	client, err := h.getGigahostClient(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("gigahost client unavailable: %w", err)
-	}
-
-	if err := h.ensureGigahostDeploySchema(ctx); err != nil {
-		return nil, fmt.Errorf("failed to init deploy schema: %w", err)
-	}
-
-	unlock, ok := h.lockGigahostDeploy(req.OrderID)
-	if !ok {
-		return nil, fmt.Errorf("deployment already in progress for order %s", req.OrderID)
-	}
 	defer unlock()
-
-	order, nexusServerID, _, _, err := h.getDeployOrderByID(ctx, req.OrderID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load order %s: %w", req.OrderID, err)
-	}
 
 	// 1. Verify Deployment Status
 	assignedIP, providerServerID, err := h.verifyGigahostVPSReady(ctx, client, req, order)
@@ -529,20 +518,16 @@ func (h *Handlers) DeployGigahostOrder(ctx context.Context, req GigahostDeployRe
 	}
 	if assignedIP == "" {
 		_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusDeploying, DeployStatusDeploying, "", providerServerID, nexusServerID, "")
-		return &GigahostDeployStatus{
-			OrderID:          req.OrderID,
-			ProviderServerID: providerServerID,
-			ServerID:         nexusServerID,
-			Status:           DeployStatusDeploying,
-			Step:             DeployStatusDeploying,
-			Message:          "Gigahost VPS is currently deploying",
-			UpdatedAt:        time.Now().UTC(),
-		}, nil
+		return deployingStatus(req.OrderID, providerServerID, nexusServerID), nil
 	}
 
 	// 2. SSH Verification & Host Identity Check
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusSSHVerifying, DeployStatusSSHVerifying, "", providerServerID, nexusServerID, assignedIP)
 	req.ProviderServerID = providerServerID
+	req, err = h.applyStoredOrderCredential(ctx, req)
+	if err != nil {
+		return h.failDeployStatus(ctx, req.OrderID, DeployStatusSSHVerifying, err, providerServerID, nexusServerID, assignedIP, "", "")
+	}
 	fingerprint, err := h.verifyDeploySSHAccess(ctx, assignedIP, req)
 	if err != nil {
 		return h.failDeployStatus(ctx, req.OrderID, DeployStatusSSHVerifying, fmt.Errorf("SSH verification failed: %w", err), providerServerID, nexusServerID, assignedIP, "", "")
@@ -557,6 +542,62 @@ func (h *Handlers) DeployGigahostOrder(ctx context.Context, req GigahostDeployRe
 	nexusServerID = server.ID
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusInstallingProtocol, "server_registration", "", providerServerID, nexusServerID, assignedIP)
 
+	return h.installAndEnableDeploy(ctx, req, server, providerServerID, nexusServerID, assignedIP)
+}
+
+// beginGigahostDeploy performs the guarded preamble: validate, resolve the client,
+// ensure the deploy schema, take the per-order lock and load the order row.
+//
+// The returned unlock must be deferred by the caller. A nil error with an unsent
+// unlock cannot happen: every success path returns a real function.
+func (h *Handlers) beginGigahostDeploy(
+	ctx context.Context, req GigahostDeployRequest,
+) (client gigahost.Client, order *GigahostOrderRecord, nexusServerID int64, unlock func(), err error) {
+	if err := req.Validate(); err != nil {
+		return nil, nil, 0, nil, err
+	}
+	client, err = h.getGigahostClient(ctx, nil)
+	if err != nil {
+		return nil, nil, 0, nil, fmt.Errorf("gigahost client unavailable: %w", err)
+	}
+	if err := h.ensureGigahostDeploySchema(ctx); err != nil {
+		return nil, nil, 0, nil, fmt.Errorf("failed to init deploy schema: %w", err)
+	}
+	release, ok := h.lockGigahostDeploy(req.OrderID)
+	if !ok {
+		return nil, nil, 0, nil, fmt.Errorf("deployment already in progress for order %s", req.OrderID)
+	}
+	order, nexusServerID, _, _, err = h.getDeployOrderByID(ctx, req.OrderID)
+	if err != nil {
+		release()
+		return nil, nil, 0, nil, fmt.Errorf("failed to load order %s: %w", req.OrderID, err)
+	}
+	return client, order, nexusServerID, release, nil
+}
+
+// deployingStatus is the "provider is still provisioning" answer, which is a
+// normal in-progress state and not a failure.
+func deployingStatus(orderID string, providerServerID, nexusServerID int64) *GigahostDeployStatus {
+	return &GigahostDeployStatus{
+		OrderID:          orderID,
+		ProviderServerID: providerServerID,
+		ServerID:         nexusServerID,
+		Status:           DeployStatusDeploying,
+		Step:             DeployStatusDeploying,
+		Message:          "Gigahost VPS is currently deploying",
+		UpdatedAt:        time.Now().UTC(),
+	}
+}
+
+// installAndEnableDeploy performs steps 4-6: install the selected protocol, enable
+// the backend and report the ready state.
+func (h *Handlers) installAndEnableDeploy(
+	ctx context.Context,
+	req GigahostDeployRequest,
+	server *models.Server,
+	providerServerID, nexusServerID int64,
+	assignedIP string,
+) (*GigahostDeployStatus, error) {
 	// 4. Protocol Installation
 	if nexusServerID > 0 && h.vpnSvc != nil {
 		_ = h.vpnSvc.DisableBackend(ctx, nexusServerID)
@@ -665,28 +706,7 @@ func (h *Handlers) GigahostDeployHandler(w http.ResponseWriter, r *http.Request)
 
 	status, err := h.DeployGigahostOrder(r.Context(), req)
 	if err != nil {
-		var confirmation *ssh.ErrFingerprintRequired
-		if errors.As(err, &confirmation) {
-			h.JSON(w, http.StatusConflict, map[string]any{"status": "host_key_confirmation_required", "host": confirmation.Host, "fingerprint": confirmation.Fingerprint, "deploy": status})
-			return
-		}
-		if errors.Is(err, ErrDuplicateServerID) || strings.Contains(err.Error(), "duplicate server registration rejected") {
-			h.JSONError(w, http.StatusConflict, "duplicate_server_id", err.Error())
-			return
-		}
-		if strings.Contains(err.Error(), "already in progress") {
-			h.JSONError(w, http.StatusConflict, "in_progress", err.Error())
-			return
-		}
-		if strings.Contains(err.Error(), "validation") || strings.Contains(err.Error(), "required") || strings.Contains(err.Error(), "unsupported protocol") {
-			h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
-			return
-		}
-		h.JSON(w, http.StatusBadGateway, map[string]any{
-			"status": DeployStatusFailed,
-			"error":  err.Error(),
-			"deploy": status,
-		})
+		h.writeGigahostDeployFailure(w, status, err)
 		return
 	}
 
@@ -694,6 +714,59 @@ func (h *Handlers) GigahostDeployHandler(w http.ResponseWriter, r *http.Request)
 		"status": "ok",
 		"deploy": status,
 	})
+}
+
+// writeGigahostDeployFailure maps a deployment error to its HTTP response.
+//
+// The two first cases are identity decisions rather than failures: an unnamed
+// host key must be confirmed by the administrator, and a missing managed
+// credential is a pause with instructions. Everything else is a real failure, and
+// the ordering below keeps the most specific cause first.
+func (h *Handlers) writeGigahostDeployFailure(w http.ResponseWriter, status *GigahostDeployStatus, err error) {
+	var confirmation *ssh.ErrFingerprintRequired
+	if errors.As(err, &confirmation) {
+		h.JSON(w, http.StatusConflict, map[string]any{
+			"status":      "host_key_confirmation_required",
+			"host":        confirmation.Host,
+			"fingerprint": confirmation.Fingerprint,
+			"deploy":      status,
+		})
+		return
+	}
+	if errors.Is(err, errMissingOrderCredential) {
+		h.JSON(w, http.StatusConflict, map[string]any{
+			"status": DeployStatusFailed,
+			"code":   codeCredentialMissing,
+			"error":  errMissingOrderCredential.Error(),
+			"deploy": status,
+		})
+		return
+	}
+	if errors.Is(err, ErrDuplicateServerID) {
+		h.JSONError(w, http.StatusConflict, "duplicate_server_id", err.Error())
+		return
+	}
+	if strings.Contains(err.Error(), "already in progress") {
+		h.JSONError(w, http.StatusConflict, "in_progress", err.Error())
+		return
+	}
+	if isDeployValidationError(err) {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", err.Error())
+		return
+	}
+	h.JSON(w, http.StatusBadGateway, map[string]any{
+		"status": DeployStatusFailed,
+		"error":  err.Error(),
+		"deploy": status,
+	})
+}
+
+// isDeployValidationError reports the request-shape failures that must not be
+// reported as an upstream fault.
+func isDeployValidationError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "validation") || strings.Contains(msg, "required") ||
+		strings.Contains(msg, "unsupported protocol")
 }
 
 // GigahostDeployStatusHandler handles GET /api/admin/hosting/gigahost/deploy/{order_id}.

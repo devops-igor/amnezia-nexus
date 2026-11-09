@@ -378,6 +378,14 @@ type OrderRequest struct {
 	OSID          int    `json:"os_id"`
 	BillingPeriod string `json:"billing_period"`
 	Quantity      int    `json:"quantity"`
+
+	// SSHKeys carries the numeric account key ids to authorize for root on the
+	// ordered server, from GET /account. The provider documents that ids which
+	// are not on the account are IGNORED, so an unverified id buys a server the
+	// operator cannot log into. Callers must prove the association before
+	// ordering. Omitted entirely when empty, so an order that authorizes no key
+	// serializes exactly as before.
+	SSHKeys []int64 `json:"ssh_keys,omitempty"`
 }
 
 // OrderResponse represents the response when an order is submitted.

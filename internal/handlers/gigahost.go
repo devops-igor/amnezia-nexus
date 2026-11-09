@@ -480,6 +480,9 @@ func (h *Handlers) respondToOrderOutcome(
 			})
 			return
 		}
+		if writePrePurchaseRefusal(w, orderErr, h) {
+			return
+		}
 		var uncertainErr *gigahost.OrderUncertainError
 		if errors.As(orderErr, &uncertainErr) || orderOutcomeUnknown(orderResp) {
 			h.JSON(w, http.StatusAccepted, unknownBody)
@@ -570,6 +573,15 @@ func (h *Handlers) persistIntentAndPurchase(
 		return nil, nil, nil, false
 	}
 
+	// The managed SSH key is registered and proven before the order is sent, and
+	// the failure is reported as a refusal, so a credential problem costs zero
+	// purchases. It runs after the intent row exists so the credential has a
+	// durable owner even if this process dies mid-registration.
+	sshKeyIDs, credErr := h.prepareOrderSSHCredential(ctx, client, orderRecord)
+	if credErr != nil {
+		return h.refuseBeforePurchase(ctx, orderRecord, credErr)
+	}
+
 	orderResp, orderErr := client.OrderServerSafe(ctx, gigahost.OrderRequest{
 		PID:           req.PID,
 		PriceID:       req.PriceID,
@@ -577,6 +589,7 @@ func (h *Handlers) persistIntentAndPurchase(
 		OSID:          req.OSID,
 		BillingPeriod: gigahost.BillingPeriodHourly,
 		Quantity:      1,
+		SSHKeys:       []int64{sshKeyIDs},
 	})
 
 	// The record update must survive client cancellation: the purchase already

@@ -22,6 +22,8 @@ type Client interface {
 	GetProducts(ctx context.Context) ([]Product, error)
 	GetOperatingSystems(ctx context.Context) ([]OperatingSystem, error)
 	GetAccount(ctx context.Context) (*AccountInfo, error)
+	ListSSHKeys(ctx context.Context) ([]SSHKeyInfo, error)
+	RegisterSSHKey(ctx context.Context, name, publicKey string) error
 	OrderServer(ctx context.Context, req OrderRequest) (*OrderResponse, error)
 	OrderServerSafe(ctx context.Context, req OrderRequest) (*OrderResponse, error)
 	GetDeployStatus(ctx context.Context, orderID string) (*DeployStatusResponse, error)

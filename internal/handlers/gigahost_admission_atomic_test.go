@@ -76,6 +76,12 @@ func (b *barrierClient) GetOperatingSystems(ctx context.Context) ([]gigahost.Ope
 func (b *barrierClient) GetAccount(ctx context.Context) (*gigahost.AccountInfo, error) {
 	return b.inner.GetAccount(ctx)
 }
+func (b *barrierClient) ListSSHKeys(ctx context.Context) ([]gigahost.SSHKeyInfo, error) {
+	return b.inner.ListSSHKeys(ctx)
+}
+func (b *barrierClient) RegisterSSHKey(ctx context.Context, name, publicKey string) error {
+	return b.inner.RegisterSSHKey(ctx, name, publicKey)
+}
 func (b *barrierClient) OrderServer(ctx context.Context, r gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 	return b.inner.OrderServer(ctx, r)
 }
@@ -478,6 +484,12 @@ func (p *purchaseBarrier) GetOperatingSystems(ctx context.Context) ([]gigahost.O
 }
 func (p *purchaseBarrier) GetAccount(ctx context.Context) (*gigahost.AccountInfo, error) {
 	return p.Client.GetAccount(ctx)
+}
+func (p *purchaseBarrier) ListSSHKeys(ctx context.Context) ([]gigahost.SSHKeyInfo, error) {
+	return p.Client.ListSSHKeys(ctx)
+}
+func (p *purchaseBarrier) RegisterSSHKey(ctx context.Context, name, publicKey string) error {
+	return p.Client.RegisterSSHKey(ctx, name, publicKey)
 }
 func (p *purchaseBarrier) OrderServer(ctx context.Context, r gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 	return p.Client.OrderServer(ctx, r)
