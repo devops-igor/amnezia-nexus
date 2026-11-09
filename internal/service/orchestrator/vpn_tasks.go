@@ -194,6 +194,19 @@ func (o *Orchestrator) CheckBackendTunnelHealth(ctx context.Context) error {
 			status = "degraded"
 		}
 
+		// A handshake_blocked backend that still carries established sessions is
+		// only moved off that state by evidence about its inner data plane, never
+		// by outer latency alone (#713 preservation contract). A slow *successful*
+		// outer probe used to skip the dual-tier block below and be written
+		// straight to degraded, which then migrated live sessions even while the
+		// inner path was working.
+		if status == models.TunnelStatusDegraded && isBlocked {
+			if o.preserveBlockedSlowOuterSuccess(ctx, &t, poolTun, latencyMS, threshold) {
+				degradedTunnels = append(degradedTunnels, t.ID)
+			}
+			continue
+		}
+
 		// Dual-tier verification: before promoting ANY non-active backend to active
 		// (whether connecting, degraded, or handshake_blocked),
 		// data-plane device attachment AND successful inner canary probe are strictly required!
