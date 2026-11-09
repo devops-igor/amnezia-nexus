@@ -110,6 +110,15 @@ func (h *Handlers) GigahostSetupCancelHandler(w http.ResponseWriter, r *http.Req
 
 	intent, changed, err := h.CancelGigahostSetup(r.Context(), orderID)
 	if err != nil {
+		// A recorded revocation whose owned backend could not be withdrawn is
+		// reported as a server-side failure, not as a completed cancellation: the
+		// intent really is canceled, but the backend it owns is still selectable
+		// and the caller must not believe otherwise.
+		var withdrawal *setupWithdrawalError
+		if errors.As(err, &withdrawal) {
+			h.JSONError(w, http.StatusInternalServerError, "withdrawal_failed", err.Error())
+			return
+		}
 		h.JSONError(w, http.StatusInternalServerError, "db_error", err.Error())
 		return
 	}
@@ -285,7 +294,20 @@ func isSyntheticOrderID(orderID string) bool {
 	return strings.HasPrefix(orderID, "intent_") || strings.HasPrefix(orderID, "unknown_")
 }
 
-// CancelGigahostSetup revokes the approval for an order.
+// CancelGigahostSetup revokes the approval for an order and withdraws the backend
+// that approval owns.
+//
+// The revocation itself is a durable compare-and-set in the store. The withdrawal
+// is the cancellation-side effect the audit finding was about: a job whose
+// promotion and enrollment already committed keeps an enabled, selectable backend
+// after its approval is canceled unless the cancellation removes it. That applies
+// in both orderings - a cancellation that lands just after a promotion, and a
+// cancellation of a job left at a persisted interrupted finalization.
+//
+// The intent write and the withdrawal are one safety outcome but not one atomic
+// operation, so a withdrawal failure is returned with the canceled intent already
+// persisted. The caller reports that truthfully instead of claiming the
+// cancellation completed.
 func (h *Handlers) CancelGigahostSetup(
 	ctx context.Context, orderID string,
 ) (*models.GigahostSetupIntent, bool, error) {
@@ -295,7 +317,22 @@ func (h *Handlers) CancelGigahostSetup(
 	if h.db == nil {
 		return nil, false, errors.New("database not available")
 	}
-	return h.db.CancelGigahostSetupIntent(ctx, orderID, "setup approval revoked by administrator")
+	intent, changed, err := h.db.CancelGigahostSetupIntent(ctx, orderID, "setup approval revoked by administrator")
+	if err != nil || intent == nil {
+		return intent, changed, err
+	}
+	if !changed {
+		// Already canceled (an idempotent repeat) or settled in a state a
+		// revocation cannot change. A repeat still withdraws, which is how a
+		// failed withdrawal is retried; a refusal withdraws nothing.
+		if intent.State != models.SetupStateCanceled {
+			return intent, false, nil
+		}
+	}
+	if err := h.withdrawCanceledSetupEnrollment(ctx, intent); err != nil {
+		return intent, changed, err
+	}
+	return intent, changed, nil
 }
 
 // GetGigahostSetupIntent returns the recorded approval for an order.
