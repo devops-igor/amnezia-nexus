@@ -419,6 +419,15 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		}
 	}
 
+	// A slow successful outer sample is not evidence that the inner plane was
+	// lost. Degraded status is exactly what makes established sessions
+	// migration-eligible, so an already-blocked backend that still serves
+	// sessions keeps its preservation status and only refreshes the latency
+	// diagnostic. Inner loss still reaches degraded above through the
+	// threshold path in verifyActiveEligibility, and fast recovery is unaffected
+	// because it computes "active", not "degraded".
+	status = hp.preservedProbeStatus(snapshot, &probeTarget, isBlocked, status)
+
 	// Re-check status before final status write
 	if err := hp.checkTunnelAvailable(&probeTarget); err != nil {
 		return 0, err
@@ -476,14 +485,7 @@ func (hp *HealthProber) verifyActiveEligibility(ctx context.Context, snapshot, p
 			if failures >= hp.cfg.FailureThreshold {
 				return false, hp.transitionToThresholdDisabled(ctx, snapshot)
 			}
-			hasActiveSessions := (snapshot != nil && snapshot.ActiveConnections > 0) ||
-				(probeTarget != nil && probeTarget.ActiveConnections > 0)
-			if hp.pool != nil {
-				if cur, err := hp.pool.GetTunnel(probeTarget.ServerID); err == nil && cur != nil && cur.ActiveConnections > 0 {
-					hasActiveSessions = true
-				}
-			}
-			if hasActiveSessions {
+			if hp.hasEstablishedSessions(snapshot, probeTarget) {
 				return false, hp.transitionToHandshakeBlocked(ctx, snapshot)
 			}
 			return false, hp.transitionToDegraded(ctx, snapshot)
@@ -496,6 +498,37 @@ func (hp *HealthProber) verifyActiveEligibility(ctx context.Context, snapshot, p
 	}
 
 	return true, nil
+}
+
+// hasEstablishedSessions reports whether a backend currently serves live
+// sessions, consulting the probe snapshots first and the pool when available.
+// Established sessions are the resource that blocked-backend preservation
+// protects, so every decision on this path asks the same question.
+func (hp *HealthProber) hasEstablishedSessions(snapshot, probeTarget *models.BackendTunnel) bool {
+	if snapshot != nil && snapshot.ActiveConnections > 0 {
+		return true
+	}
+	if probeTarget != nil && probeTarget.ActiveConnections > 0 {
+		return true
+	}
+	if hp.pool == nil || probeTarget == nil {
+		return false
+	}
+	cur, err := hp.pool.GetTunnel(probeTarget.ServerID)
+	return err == nil && cur != nil && cur.ActiveConnections > 0
+}
+
+// preservedProbeStatus keeps the blocked-backend preservation status when a slow
+// outer success carries no inner-loss evidence. It returns the final status the
+// caller should commit.
+func (hp *HealthProber) preservedProbeStatus(snapshot, probeTarget *models.BackendTunnel, isBlocked bool, status string) string {
+	if !isBlocked || status != models.TunnelStatusDegraded {
+		return status
+	}
+	if !hp.hasEstablishedSessions(snapshot, probeTarget) {
+		return status
+	}
+	return models.TunnelStatusHandshakeBlocked
 }
 
 func (hp *HealthProber) runActiveHookIfActive(ctx context.Context, snapshot, probeTarget *models.BackendTunnel, status string) error {
