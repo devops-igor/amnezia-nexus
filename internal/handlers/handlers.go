@@ -98,6 +98,11 @@ type Handlers struct {
 	// duplicate-check-to-intent window deterministically instead of racing for
 	// it; it is nil in production and adds one nil check on that path.
 	gigahostIntentHook func()
+	// setupNudge, when set, asks the background setup tracker to run a pass
+	// immediately instead of waiting for its next interval. It is nil in unit
+	// tests and costs one nil check; the interval sweep is what actually
+	// guarantees a pending intent is observed.
+	setupNudge func()
 	// Repeated rejected deploy attempts are suppressed per admin for a short
 	// window; see gigahost_admission.go.
 	admissionOnce  sync.Once

@@ -735,5 +735,17 @@
   "deploy_vps_no_os": "No operating system is installable on this plan",
   "deploy_vps_catalog_unavailable": "Provider catalog unavailable",
   "deploy_vps_select_required": "Select a region and an operating system first",
-  "deploy_vps_order_placed": "VPS order placed successfully"
+  "deploy_vps_order_placed": "VPS order placed successfully",
+  "setup_intents_title": "Saved Setup Approvals",
+  "setup_intents_desc": "Durable setup jobs tracked by the panel itself. They keep progressing when no browser is open.",
+  "setup_intents_none": "No setup approval has been recorded",
+  "setup_intents_cancel": "Revoke",
+  "setup_intents_cancel_confirm": "Revoke this setup approval? The panel will stop tracking this order. The VPS itself is not cancelled.",
+  "setup_intents_cancelled": "Setup approval revoked",
+  "setup_state_pending": "Provisioning",
+  "setup_state_awaiting_host_confirmation": "Host confirmation required",
+  "setup_state_awaiting_credentials": "Credentials required",
+  "setup_state_ready_for_setup": "Ready for setup",
+  "setup_state_failed": "Failed",
+  "setup_state_cancelled": "Revoked"
 }

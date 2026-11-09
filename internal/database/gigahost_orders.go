@@ -353,6 +353,80 @@ func (d *DB) encryptOrderCredential(privateKey string) (string, error) {
 	return enc, nil
 }
 
+// GetGigahostOrder returns one ledger row addressed by its provider order id.
+// found=false means the ledger has no such order.
+func (d *DB) GetGigahostOrder(ctx context.Context, orderID string) (*models.GigahostOrder, bool, error) {
+	if d == nil || d.sqlDB == nil || strings.TrimSpace(orderID) == "" {
+		return nil, false, nil
+	}
+	if err := d.EnsureGigahostOrdersSchema(ctx); err != nil {
+		return nil, false, err
+	}
+	q := `SELECT id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
+	             created_at, updated_at, price_id, monthly_cap_nok, currency
+	      FROM gigahost_orders WHERE order_id = ? ORDER BY id DESC LIMIT 1`
+	row := d.sqlDB.QueryRowContext(ctx, q, orderID)
+	order, err := scanGigahostOrderRow(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("failed to read gigahost order: %w", err)
+	}
+	return order, true, nil
+}
+
+// scanGigahostOrderRow scans one row in the canonical column order used by
+// readGigahostOrders, so a single-order read cannot drift from the list read.
+func scanGigahostOrderRow(row *sql.Row) (*models.GigahostOrder, error) {
+	var o models.GigahostOrder
+	var createdAt, updatedAt string
+	var assignedIP, currency sql.NullString
+	var priceID sql.NullInt64
+	var monthlyCap sql.NullFloat64
+	if err := row.Scan(
+		&o.ID, &o.OrderID, &o.ServerID, &o.Status, &o.PlanID, &o.RegionID,
+		&o.HourlyPriceNOK, &assignedIP, &createdAt, &updatedAt,
+		&priceID, &monthlyCap, &currency,
+	); err != nil {
+		return nil, err
+	}
+	o.AssignedIP = assignedIP.String
+	o.Currency = currency.String
+	o.PriceID = int(priceID.Int64)
+	o.MonthlyCapNOK = monthlyCap.Float64
+	o.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+	o.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+	return &o, nil
+}
+
+// HasGigahostOrderCredential reports whether the order row carries a non-empty
+// stored credential.
+//
+// It deliberately does not decrypt: a background tracker only needs to know
+// whether a usable credential reference exists, and there is no reason to bring
+// private key material into a scheduler loop. An undecryptable credential is
+// still reported as present here; the setup path that actually uses it will fail
+// loudly at that point.
+func (d *DB) HasGigahostOrderCredential(ctx context.Context, orderID string) (bool, error) {
+	if d == nil || d.sqlDB == nil || strings.TrimSpace(orderID) == "" {
+		return false, nil
+	}
+	if err := d.EnsureGigahostOrdersSchema(ctx); err != nil {
+		return false, err
+	}
+	var encKey sql.NullString
+	err := d.sqlDB.QueryRowContext(ctx,
+		`SELECT ssh_key_enc FROM gigahost_orders WHERE order_id = ?`, orderID).Scan(&encKey)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to read gigahost order credential presence: %w", err)
+	}
+	return encKey.Valid && strings.TrimSpace(encKey.String) != "", nil
+}
+
 // GetGigahostOrderCredential returns the managed credential stored against an
 // order id, with the private key decrypted.
 //

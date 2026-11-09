@@ -735,5 +735,17 @@
   "deploy_vps_no_os": "Aucun système d'exploitation installable sur cette offre",
   "deploy_vps_catalog_unavailable": "Catalogue du fournisseur indisponible",
   "deploy_vps_select_required": "Sélectionnez d'abord une région et un système d'exploitation",
-  "deploy_vps_order_placed": "Commande VPS passée avec succès"
+  "deploy_vps_order_placed": "Commande VPS passée avec succès",
+  "setup_intents_title": "Approbations de configuration enregistrées",
+  "setup_intents_desc": "Tâches de configuration suivies par le panneau lui-même. Elles continuent même sans navigateur ouvert.",
+  "setup_intents_none": "Aucune approbation de configuration enregistrée",
+  "setup_intents_cancel": "Révoquer",
+  "setup_intents_cancel_confirm": "Révoquer cette approbation de configuration ? Le panneau cessera de suivre cette commande. Le VPS lui-même n'est pas annulé.",
+  "setup_intents_cancelled": "Approbation de configuration révoquée",
+  "setup_state_pending": "Provisionnement",
+  "setup_state_awaiting_host_confirmation": "Confirmation de l'hôte requise",
+  "setup_state_awaiting_credentials": "Identifiants requis",
+  "setup_state_ready_for_setup": "Prêt pour la configuration",
+  "setup_state_failed": "Échec",
+  "setup_state_cancelled": "Révoquée"
 }

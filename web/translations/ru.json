@@ -735,5 +735,17 @@
   "deploy_vps_no_os": "Для этого тарифа нет устанавливаемой операционной системы",
   "deploy_vps_catalog_unavailable": "Каталог провайдера недоступен",
   "deploy_vps_select_required": "Сначала выберите регион и операционную систему",
-  "deploy_vps_order_placed": "Заказ VPS успешно размещён"
+  "deploy_vps_order_placed": "Заказ VPS успешно размещён",
+  "setup_intents_title": "Сохранённые одобрения настройки",
+  "setup_intents_desc": "Задания настройки, отслеживаемые самой панелью. Они продолжаются, даже когда браузер закрыт.",
+  "setup_intents_none": "Одобрения настройки не записаны",
+  "setup_intents_cancel": "Отозвать",
+  "setup_intents_cancel_confirm": "Отозвать это одобрение настройки? Панель перестанет отслеживать этот заказ. Сам VPS не отменяется.",
+  "setup_intents_cancelled": "Одобрение настройки отозвано",
+  "setup_state_pending": "Подготовка",
+  "setup_state_awaiting_host_confirmation": "Требуется подтверждение хоста",
+  "setup_state_awaiting_credentials": "Требуются учётные данные",
+  "setup_state_ready_for_setup": "Готово к настройке",
+  "setup_state_failed": "Ошибка",
+  "setup_state_cancelled": "Отозвано"
 }

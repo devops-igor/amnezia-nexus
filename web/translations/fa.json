@@ -735,5 +735,17 @@
   "deploy_vps_no_os": "هیچ سیستم عاملی برای این طرح قابل نصب نیست",
   "deploy_vps_catalog_unavailable": "کاتالوگ ارائه‌دهنده در دسترس نیست",
   "deploy_vps_select_required": "ابتدا منطقه و سیستم عامل را انتخاب کنید",
-  "deploy_vps_order_placed": "سفارش VPS با موفقیت ثبت شد"
+  "deploy_vps_order_placed": "سفارش VPS با موفقیت ثبت شد",
+  "setup_intents_title": "تأییدهای ذخیره‌شدهٔ راه‌اندازی",
+  "setup_intents_desc": "کارهای راه‌اندازی که خود پنل پیگیری می‌کند. این کارها حتی بدون باز بودن مرورگر ادامه می‌یابند.",
+  "setup_intents_none": "هیچ تأیید راه‌اندازی ثبت نشده است",
+  "setup_intents_cancel": "لغو تأیید",
+  "setup_intents_cancel_confirm": "این تأیید راه‌اندازی لغو شود؟ پنل پیگیری این سفارش را متوقف می‌کند. خود VPS لغو نمی‌شود.",
+  "setup_intents_cancelled": "تأیید راه‌اندازی لغو شد",
+  "setup_state_pending": "در حال آماده‌سازی",
+  "setup_state_awaiting_host_confirmation": "نیازمند تأیید میزبان",
+  "setup_state_awaiting_credentials": "نیازمند اعتبارنامه",
+  "setup_state_ready_for_setup": "آمادهٔ راه‌اندازی",
+  "setup_state_failed": "ناموفق",
+  "setup_state_cancelled": "لغوشده"
 }

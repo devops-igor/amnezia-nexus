@@ -52,6 +52,9 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 	if err := d.migrateGigahostOrders(ctx); err != nil {
 		return err
 	}
+	if err := d.migrateGigahostSetupIntents(ctx); err != nil {
+		return err
+	}
 	return d.migratePeerLifecycle(ctx)
 }
 

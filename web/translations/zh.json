@@ -735,5 +735,17 @@
   "deploy_vps_no_os": "该方案没有可安装的操作系统",
   "deploy_vps_catalog_unavailable": "提供商目录不可用",
   "deploy_vps_select_required": "请先选择区域和操作系统",
-  "deploy_vps_order_placed": "VPS 订单已成功提交"
+  "deploy_vps_order_placed": "VPS 订单已成功提交",
+  "setup_intents_title": "已保存的安装审批",
+  "setup_intents_desc": "由面板自身跟踪的持久安装任务，即使没有打开浏览器也会继续进行。",
+  "setup_intents_none": "尚未记录任何安装审批",
+  "setup_intents_cancel": "撤销",
+  "setup_intents_cancel_confirm": "撤销此安装审批？面板将停止跟踪该订单。VPS 本身不会被取消。",
+  "setup_intents_cancelled": "安装审批已撤销",
+  "setup_state_pending": "正在配置",
+  "setup_state_awaiting_host_confirmation": "需要确认主机",
+  "setup_state_awaiting_credentials": "需要凭据",
+  "setup_state_ready_for_setup": "可以安装",
+  "setup_state_failed": "失败",
+  "setup_state_cancelled": "已撤销"
 }

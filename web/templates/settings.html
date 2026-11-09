@@ -386,6 +386,17 @@
                         <span class="text-muted">...</span>
                     </div>
                 </div>
+
+                <!-- Saved setup approvals. These are durable jobs tracked by the
+                     panel itself, so they are shown even when the ordering browser
+                     is long closed. The original browser is not the source of truth. -->
+                <div style="margin-top:var(--space-lg); border-top:1px solid var(--border-color); padding-top:var(--space-md);">
+                    <h5 style="margin:0 0 var(--space-sm) 0; font-size:0.9rem; font-weight:600;">{{ _ "setup_intents_title" }}</h5>
+                    <p class="form-hint" style="margin-bottom:var(--space-sm);">{{ _ "setup_intents_desc" }}</p>
+                    <div id="setupIntentsContainer" style="font-size:0.85rem;">
+                        <span class="text-muted">...</span>
+                    </div>
+                </div>
             </div>
         </div>
         {{ end }}
@@ -401,6 +412,7 @@
 </div>
 
 <script src="/static/js/gigahost_setup.js"></script>
+<script src="/static/js/gigahost_setup_intents.js"></script>
 <script>
     document.getElementById('ssl_enabled').addEventListener('change', (e) => {
         document.getElementById('sslFields').style.display = e.target.checked ? 'block' : 'none';
@@ -962,6 +974,7 @@
     if (deployPlanSelect) {
         loadGigahostCatalog();
         loadRecentOrders();
+        loadSetupIntents();
     }
 </script>
 {{ end }}

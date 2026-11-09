@@ -219,13 +219,16 @@ func run(ctx context.Context) error {
 	sup.RegisterService(orch)
 	sup.RegisterService(reconciler)
 
-	supErrCh := make(chan error, 1)
-	go func() {
-		supErrCh <- sup.Start(ctx)
-	}()
-
-	// 10. Initialize HTTP Router and Server
-	r := router.NewRouterWithDeps(handlers.Dependencies{
+	// 9a. Durable Gigahost setup tracking.
+	//
+	// The tracker is a supervised worker, so its lifetime is the panel's: closing
+	// a browser cannot stop provisioning, and a panel restart resumes the same
+	// saved approvals from the database. It only reads from the provider, so it
+	// can never place a second order.
+	//
+	// It is built from the same Handlers instance the router serves, so the
+	// approval path and the tracker share one provider resolution and one tracker.
+	hDeps := handlers.Dependencies{
 		Config:          cfg,
 		DB:              db,
 		Registry:        reg,
@@ -236,6 +239,26 @@ func run(ctx context.Context) error {
 		XrayManager:     xrayMgr,
 		NaiveManager:    naiveMgr,
 		VPNService:      vpnSvc,
+	}
+	// NewRouterWithOptions does not perform the AWG status-provider wiring that
+	// NewRouterWithDeps does, so it is applied here explicitly.
+	router.EnsureAWGStatusProvider(hDeps)
+	hSet := handlers.NewHandlers(hDeps)
+	if tracker := hSet.NewGigahostSetupTracker(); tracker != nil {
+		hSet.SetGigahostSetupNudge(tracker.Nudge)
+		sup.RegisterService(tracker)
+	}
+
+	supErrCh := make(chan error, 1)
+	go func() {
+		supErrCh <- sup.Start(ctx)
+	}()
+
+	// 10. Initialize HTTP Router and Server
+	r := router.NewRouterWithOptions(router.Options{
+		Config:   cfg,
+		DB:       db,
+		Handlers: hSet,
 	})
 	srv := router.NewServer(cfg, r, db)
 
