@@ -178,6 +178,107 @@ func captureRouterState(snap *udpExchangeSnapshot, router *ingress.Router) {
 	snap.RouterKnown = true
 }
 
+// captureReferenceUDPExchangeSnapshot is the reference-leg counterpart of the subject
+// capture under phase=ref. That leg has no ingress router, so router_* stays unknown.
+func captureReferenceUDPExchangeSnapshot(client *HarnessClient, ref *ReferenceServer) udpExchangeSnapshot {
+	snap := udpExchangeSnapshot{Phase: phaseReference, ClientHandshake: handshakeOutcomeUnknown, PortalHandshake: handshakeOutcomeUnknown}
+	captureClientState(&snap, client)
+	if ref != nil && ref.dev != nil {
+		if raw, err := ref.dev.IpcGet(); err == nil {
+			parseReferencePeerState(&snap, raw)
+		}
+	}
+	return snap
+}
+
+// parseReferencePeerState reads only the client path's allowlisted keys. Any peer count
+// but the fixture's single peer leaves the last-wins byte parsers unknown.
+func parseReferencePeerState(snap *udpExchangeSnapshot, raw string) {
+	peers := strings.Count(raw, "public_key=")
+	snap.PortalPeers = counterReading{known: true, value: uint64(peers)}
+	if peers == 1 {
+		snap.PortalTx, snap.PortalRx = parseClientByteCounters(raw)
+		snap.PortalHandshake = handshakePresence(parseHandshakeCompletion(raw))
+	}
+}
+
+// referenceUDPExchangeFailureReport captures the pair before teardown, gated on the
+// predicate the call site asserts with: a passing exchange reads nothing.
+func referenceUDPExchangeFailureReport(client *HarnessClient, ref *ReferenceServer, err error, echo, payload []byte) string {
+	if !udpExchangeFailed(err, echo, payload) {
+		return ""
+	}
+	return udpExchangeSnapshotSuffix(captureReferenceUDPExchangeSnapshot(client, ref))
+}
+
+// TestReferenceUDPExchangeSnapshot proves the reference-leg report separates a missing
+// handshake from post-handshake payload loss on the real pair and stays silent on pass.
+func TestReferenceUDPExchangeSnapshot(t *testing.T) {
+	// exchange withholds one packet class via the existing shim (typ 0 forwards all).
+	exchange := func(dir PacketDirection, typ PacketType) (udpExchangeSnapshot, string, error) {
+		fatal := func(err error, what string) {
+			if err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+		}
+		h := NewDifferentialHarness(t)
+		ref, err := h.StartReferenceServer()
+		fatal(err, "StartReferenceServer")
+		m := h.manifest
+		shim, err := NewUDPFaultShim(t, h.listenPort, m.S1, m.S2, m.S3, m.S4)
+		fatal(err, "NewUDPFaultShim")
+		if typ != 0 {
+			shim.SetHook(func(got PacketDirection, gt PacketType, _ []byte) (FaultAction, time.Duration) {
+				if got == dir && gt == typ {
+					return ActionDrop, 0
+				}
+				return ActionForward, 0
+			})
+		}
+		client, err := h.NewClientViaShim(shim)
+		fatal(err, "NewClientViaShim")
+		conn, err := client.DialUDP()
+		fatal(err, "DialUDP")
+		defer func() { _ = conn.Close(); _ = client.Close(); _ = shim.Close(); _ = h.StopReferenceServer(ref) }()
+
+		payload := []byte("ref-snapshot-control")
+		echo, exchangeErr := client.ExchangeUDP(conn, payload)
+		return captureReferenceUDPExchangeSnapshot(client, ref),
+			referenceUDPExchangeFailureReport(client, ref, exchangeErr, echo, payload), exchangeErr
+	}
+	cases := []struct {
+		name         string
+		dir          PacketDirection
+		typ          PacketType
+		shake        handshakeOutcome
+		wantTraffic  bool
+		wantExchange bool
+	}{
+		{"passing exchange", 0, 0, handshakeOutcomeCompleted, true, true},
+		{"no handshake", DirClientToServer, PacketTypeInitiation, handshakeOutcomeNotCompleted, false, false},
+		{"post-handshake loss", DirServerToClient, PacketTypeTransport, handshakeOutcomeCompleted, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snap, report, err := exchange(tc.dir, tc.typ)
+			if (err == nil) != tc.wantExchange || (report != "") == tc.wantExchange || snap.Phase != phaseReference {
+				t.Fatalf("exchange ok=%t report=%q phase=%s", err == nil, report, snap.Phase)
+			}
+			if snap.ClientHandshake != tc.shake || snap.PortalHandshake != tc.shake || snap.RouterKnown {
+				t.Errorf("want handshake %s at both ends and no router claim: %s", tc.shake, snap)
+			}
+			if measured := snap.PortalRx.value != 0; measured != tc.wantTraffic || !snap.PortalPeers.known {
+				t.Errorf("measured traffic = %t, want %t: %s", measured, tc.wantTraffic, snap)
+			}
+			for _, marker := range hostileUDPMarkers {
+				if strings.Contains(report, marker) {
+					t.Errorf("report leaked %q: %q", marker, report)
+				}
+			}
+		})
+	}
+}
+
 // udpSnapshotRouterKeys names the router counters in emission order. The order
 // is fixed here so the validated role of each value cannot drift.
 var udpSnapshotRouterKeys = [...]string{
