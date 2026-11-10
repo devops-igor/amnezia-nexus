@@ -194,6 +194,46 @@ func (b *safeBuffer) Len() int {
 	return b.buf.Len()
 }
 
+// caddyStartupBudget bounds the fixture's whole startup wait: the listener probe
+// and the known-site TLS gate below share it.
+const caddyStartupBudget = 15 * time.Second
+
+// awaitKnownSiteTLS returns nil once one handshake on the configured site (known
+// SNI) completes, which is when Caddy holds that site's certificate. The listener
+// opens before the managed certificate reaches the cache, so a TCP accept is not TLS
+// readiness. Attempts, waits and backoff are bounded and observe ctx.
+func awaitKnownSiteTLS(ctx context.Context, addr, site string, budget time.Duration) error {
+	var lastErr error
+	// InsecureSkipVerify accepts the fixture's internal CA, as all four assertions do.
+	for deadline, wait := time.Now().Add(budget), 10*time.Millisecond; time.Now().Before(deadline); wait = min(2*wait, 100*time.Millisecond) {
+		conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", addr,
+			&tls.Config{ServerName: site, InsecureSkipVerify: true})
+		if err == nil {
+			return conn.Close()
+		}
+		if lastErr = err; ctx.Err() != nil {
+			return lastErr
+		}
+		time.Sleep(wait)
+	}
+	return lastErr
+}
+
+// TestKnownSiteTLSReadiness_Controls pins both gate outcomes.
+func TestKnownSiteTLSReadiness_Controls(t *testing.T) {
+	ready := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	plain := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer ready.Close()
+	defer plain.Close()
+	if err := awaitKnownSiteTLS(context.Background(), ready.Listener.Addr().String(), "localhost", 5*time.Second); err != nil {
+		t.Fatalf("gate rejected a ready TLS endpoint: %v", err)
+	}
+	start := time.Now()
+	if err := awaitKnownSiteTLS(context.Background(), plain.Listener.Addr().String(), "localhost", 300*time.Millisecond); err == nil || time.Since(start) > 5*time.Second {
+		t.Fatalf("never-ready endpoint: err=%v after %s", err, time.Since(start))
+	}
+}
+
 // TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel exercises the four mandatory
 // runtime behaviors of the hardened Caddy deployment in Issue #684:
 // 1. Caddy configuration validation passes for authenticated configurations.
@@ -250,8 +290,12 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 	}
 	_ = tmp.Close()
 
-	// 1. Validate configuration before launching
+	// 1. Validate in the fixture's own Caddy storage: no host CA, no cached cert.
+	fixtureHome := t.TempDir()
+	env := append(os.Environ(), "TRUST_STORES=none",
+		"XDG_DATA_HOME="+fixtureHome, "XDG_CONFIG_HOME="+filepath.Join(fixtureHome, "config"))
 	valCmd := exec.Command(caddyBin, "validate", "--adapter", "caddyfile", "--config", tmpPath)
+	valCmd.Env = env
 	if valOut, err := valCmd.CombinedOutput(); err != nil {
 		t.Fatalf("pre-run caddy validate failed: %v\nOutput: %s", err, string(valOut))
 	}
@@ -261,7 +305,7 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, caddyBin, "run", "--adapter", "caddyfile", "--config", tmpPath)
-	cmd.Env = append(os.Environ(), "TRUST_STORES=none")
+	cmd.Env = env
 	var stderrBuf safeBuffer
 	cmd.Stderr = &stderrBuf
 
@@ -311,10 +355,12 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 	// such as the TCP listener never becoming ready.
 	reportOnFailure(t, "fixture")
 
-	// Wait for Caddy to start listening on proxyPort
+	// Wait for Caddy to start listening on proxyPort; the gate below shares this
+	// one startup allowance, so it cannot extend how long the fixture waits.
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
+	startupDeadline := time.Now().Add(caddyStartupBudget)
 	ready := false
-	for start := time.Now(); time.Since(start) < 15*time.Second; {
+	for time.Now().Before(startupDeadline) {
 		conn, dialErr := net.DialTimeout("tcp", proxyAddr, 100*time.Millisecond)
 		if dialErr == nil {
 			_ = conn.Close()
@@ -324,7 +370,16 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	if !ready {
-		t.Fatalf("caddy failed to listen on %s within 15s. Stderr: %s", proxyAddr, stderrBuf.String())
+		t.Fatalf("caddy failed to listen on %s within %s. Stderr: %s", proxyAddr, caddyStartupBudget, stderrBuf.String())
+	}
+
+	// A TCP accept is not TLS readiness: Caddy opens the HTTPS listener before the
+	// managed certificate reaches the cache, so a ClientHello inside that window is
+	// rejected for every SNI. Wait for the configured site (known SNI "localhost") to
+	// complete one handshake, which means the certificate is cached. The four
+	// assertions below are unchanged and none runs before this gate.
+	if err := awaitKnownSiteTLS(ctx, proxyAddr, "localhost", time.Until(startupDeadline)); err != nil {
+		t.Fatalf("caddy did not become TLS-ready for the configured site on %s: %v", proxyAddr, err)
 	}
 
 	baseTLSConfig := &tls.Config{
