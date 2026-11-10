@@ -1057,13 +1057,14 @@ func TestDifferential_ParameterMatrixAndS4Regression(t *testing.T) {
 				t.Fatalf("DialUDP sub: %v", err)
 			}
 			subEcho, err := subClient.ExchangeUDP(subUDP, payload)
+			subReport := udpExchangeFailureReport(subClient, subServer, err, subEcho, payload)
 			_ = subUDP.Close()
 			_ = subClient.Close()
 			_ = harness.StopSubjectServer(subServer)
 			harness.AssertPortFree(5 * time.Second)
 
 			if err != nil || !bytes.Equal(subEcho, payload) {
-				t.Fatalf("sub ExchangeUDP failed for %s: got %q, err %v", tc.name, subEcho, err)
+				t.Fatalf("sub ExchangeUDP failed for %s: got %q, err %v%s", tc.name, subEcho, err, subReport)
 			}
 
 			// Parity assertion
