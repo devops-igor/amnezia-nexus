@@ -201,37 +201,118 @@ const caddyStartupBudget = 15 * time.Second
 // awaitKnownSiteTLS returns nil once one handshake on the configured site (known
 // SNI) completes, which is when Caddy holds that site's certificate. The listener
 // opens before the managed certificate reaches the cache, so a TCP accept is not TLS
-// readiness. Attempts, waits and backoff are bounded and observe ctx.
+// readiness. Every attempt and wait is bounded by what is left of the shared startup
+// budget and by ctx: an exhausted budget or a cancelled caller neither dials nor
+// reports readiness, and no attempt outlives the time it was given.
 func awaitKnownSiteTLS(ctx context.Context, addr, site string, budget time.Duration) error {
-	var lastErr error
-	// InsecureSkipVerify accepts the fixture's internal CA, as all four assertions do.
-	for deadline, wait := time.Now().Add(budget), 10*time.Millisecond; time.Now().Before(deadline); wait = min(2*wait, 100*time.Millisecond) {
-		conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", addr,
-			&tls.Config{ServerName: site, InsecureSkipVerify: true})
+	if budget <= 0 {
+		return fmt.Errorf("no startup budget left for known-site TLS readiness of %q", site)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(budget)
+	// Never nil: a gate that ran out of time before any attempt is a failure too.
+	lastErr := fmt.Errorf("no TLS handshake for %q could start within %s", site, budget)
+	// InsecureSkipVerify accepts the fixture's internal CA, as the assertions do.
+	dialer := &tls.Dialer{Config: &tls.Config{ServerName: site, InsecureSkipVerify: true}}
+	for wait := 10 * time.Millisecond; ; wait = min(2*wait, 100*time.Millisecond) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return lastErr
+		}
+		// DialContext carries the handshake itself, closes the raw connection when
+		// the handshake fails, and is bounded by what is left of the shared budget.
+		attemptCtx, cancel := context.WithTimeout(ctx, remaining)
+		conn, err := dialer.DialContext(attemptCtx, "tcp", addr)
+		cancel()
 		if err == nil {
 			return conn.Close()
 		}
-		if lastErr = err; ctx.Err() != nil {
+		lastErr = err
+		select {
+		case <-ctx.Done():
 			return lastErr
+		case <-time.After(min(wait, time.Until(deadline))):
 		}
-		time.Sleep(wait)
 	}
-	return lastErr
 }
 
-// TestKnownSiteTLSReadiness_Controls pins both gate outcomes.
+// tlsStallPeer listens but never accepts, so a client's TCP connect completes in the
+// kernel backlog and its TLS handshake is never answered. The returned function
+// reports whether any connection was queued, which proves a dial either happened or
+// did not.
+func tlsStallPeer(t *testing.T) (advertise string, dialed func() bool) {
+	t.Helper()
+	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("failed to open stall listener: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	return ln.Addr().String(), func() bool {
+		_ = ln.SetDeadline(time.Now().Add(100 * time.Millisecond))
+		conn, err := ln.Accept()
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
+	}
+}
+
+// TestKnownSiteTLSReadiness_Controls pins the gate's outcomes. A ready endpoint
+// passes; an exhausted budget, a cancelled caller, and a peer that accepts TCP but
+// never answers TLS all fail, the last inside its real elapsed budget.
 func TestKnownSiteTLSReadiness_Controls(t *testing.T) {
 	ready := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	plain := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	defer ready.Close()
-	defer plain.Close()
 	if err := awaitKnownSiteTLS(context.Background(), ready.Listener.Addr().String(), "localhost", 5*time.Second); err != nil {
 		t.Fatalf("gate rejected a ready TLS endpoint: %v", err)
 	}
-	start := time.Now()
-	if err := awaitKnownSiteTLS(context.Background(), plain.Listener.Addr().String(), "localhost", 300*time.Millisecond); err == nil || time.Since(start) > 5*time.Second {
-		t.Fatalf("never-ready endpoint: err=%v after %s", err, time.Since(start))
+
+	// Neither an exhausted budget nor a cancelled caller may reach the peer at all.
+	for _, tc := range []struct {
+		name   string
+		budget time.Duration
+		ctx    func() context.Context
+	}{
+		{"exhausted budget", 0, func() context.Context { return context.Background() }},
+		{"cancelled caller", 5 * time.Second, func() context.Context {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx
+		}},
+	} {
+		t.Run(tc.name+" does not dial", func(t *testing.T) {
+			addr, dialed := tlsStallPeer(t)
+			if err := awaitKnownSiteTLS(tc.ctx(), addr, "localhost", tc.budget); err == nil {
+				t.Fatal("gate reported readiness without an attempt it was allowed to make")
+			}
+			if dialed() {
+				t.Fatal("gate dialled when it had no attempt left to make")
+			}
+		})
 	}
+
+	t.Run("stalled TLS ends at the budget", func(t *testing.T) {
+		addr, dialed := tlsStallPeer(t)
+		const budget = 300 * time.Millisecond
+		start := time.Now()
+		err := awaitKnownSiteTLS(context.Background(), addr, "localhost", budget)
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("gate reported readiness for a peer that never answered TLS")
+		}
+		// A fresh fixed per-attempt allowance overran this contract; the attempt is
+		// bounded by what remains of the budget it was given.
+		if elapsed <= budget/2 || elapsed > budget+250*time.Millisecond {
+			t.Fatalf("gate did not honour a %s contract: gave up after %s", budget, elapsed)
+		}
+		if !dialed() {
+			t.Fatal("control never reached the stalled listener")
+		}
+		t.Logf("stalled TLS: %v after %s", err, elapsed.Round(time.Millisecond))
+	})
 }
 
 // TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel exercises the four mandatory
