@@ -93,19 +93,25 @@ func peerSyncLockOrderRun(t *testing.T, ballast int, fixedDump, inverted bool) (
 		statusDone <- err
 	}()
 	parked, complete = false, true
+	// One observation budget for the whole oracle: waiter discovery and the
+	// Service.mu availability probe share this deadline, as the original test
+	// did. A probe that finds no free lock inside it fails; the budget is never
+	// restarted, and the separate per-worker join bounds below stay separate.
 	deadline := time.Now().Add(2 * time.Second)
-	// Poll until the wait is seen, the deadline expires, or the observation is
+	// Poll until the wait is seen, the budget expires, or the observation is
 	// cut: a cut dump cannot become complete by polling again.
 	for time.Now().Before(deadline) && !parked && complete {
 		parked, complete = peerSyncParkedDump(fixedDump)
 		runtime.Gosched()
 	}
-	// Service.mu must be free while the caller waits. Probe it over a bounded
-	// window instead of once: a healthy caller takes its own read lock early,
-	// so a single sample can lose that race, while a real inversion holds the
-	// lock for the whole contention and is never observed free.
+	// Service.mu must be free while the caller waits. Sample it repeatedly for
+	// whatever is left of the SAME budget: a healthy caller takes its own read
+	// lock early, so a single instant can lose that race, while a real inversion
+	// holds the lock for the whole contention and is never observed free. If
+	// discovery consumed the budget this stays false and the check fails, which
+	// is the honest outcome rather than an invented pass.
 	svcFree = false
-	for probe := time.Now().Add(2 * time.Second); time.Now().Before(probe); {
+	for time.Now().Before(deadline) {
 		if svc.mu.TryLock() {
 			svc.mu.Unlock()
 			svcFree = true
