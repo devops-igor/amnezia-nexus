@@ -338,13 +338,6 @@
                         placeholder="flux_live_...">
                     <p class="form-hint">{{ _ "gigahost_api_key_hint" }}</p>
                 </div>
-                <div class="form-group">
-                    <label class="form-label" for="gigahost_monthly_budget">{{ _ "gigahost_monthly_budget_label" }}</label>
-                    <input type="number" step="any" min="0" class="form-input" id="gigahost_monthly_budget"
-                        value="{{ get $ghSettings "monthly_budget_nok" "" }}"
-                        placeholder="500">
-                    <p class="form-hint">{{ _ "gigahost_monthly_budget_hint" }}</p>
-                </div>
             </form>
 
             <div class="divider" style="margin: var(--space-md) 0;"></div>
@@ -377,10 +370,7 @@
                     </div>
                     <div class="form-group">
                         <label class="form-label" for="deployOSSelect">{{ _ "deploy_vps_select_os" }}</label>
-                        <select class="form-select" id="deployOSSelect">
-                            <option value="72">Ubuntu 24.04 LTS (x86_64)</option>
-                            <option value="12">Debian 12 Bookworm (x86_64)</option>
-                        </select>
+                        <select class="form-select" id="deployOSSelect"></select>
                     </div>
                     <button type="button" class="btn btn-primary" id="btnDeployVPS" style="display:flex; align-items:center; justify-content:center; gap:var(--space-sm);">
                         <svg class="icon"><use href="#icon-plus"></use></svg>
@@ -393,6 +383,17 @@
                 <div style="margin-top:var(--space-lg); border-top:1px solid var(--border-color); padding-top:var(--space-md);">
                     <h5 style="margin:0 0 var(--space-sm) 0; font-size:0.9rem; font-weight:600;">{{ _ "deploy_vps_recent_orders" }}</h5>
                     <div id="recentOrdersContainer" style="font-size:0.85rem;">
+                        <span class="text-muted">...</span>
+                    </div>
+                </div>
+
+                <!-- Saved setup approvals. These are durable jobs tracked by the
+                     panel itself, so they are shown even when the ordering browser
+                     is long closed. The original browser is not the source of truth. -->
+                <div style="margin-top:var(--space-lg); border-top:1px solid var(--border-color); padding-top:var(--space-md);">
+                    <h5 style="margin:0 0 var(--space-sm) 0; font-size:0.9rem; font-weight:600;">{{ _ "setup_intents_title" }}</h5>
+                    <p class="form-hint" style="margin-bottom:var(--space-sm);">{{ _ "setup_intents_desc" }}</p>
+                    <div id="setupIntentsContainer" style="font-size:0.85rem;">
                         <span class="text-muted">...</span>
                     </div>
                 </div>
@@ -410,6 +411,8 @@
     </button>
 </div>
 
+<script src="/static/js/gigahost_setup.js"></script>
+<script src="/static/js/gigahost_setup_intents.js"></script>
 <script>
     document.getElementById('ssl_enabled').addEventListener('change', (e) => {
         document.getElementById('sslFields').style.display = e.target.checked ? 'block' : 'none';
@@ -468,12 +471,10 @@
         };
 
         const ghApiKeyInput = document.getElementById('gigahost_api_key');
-        const ghBudgetInput = document.getElementById('gigahost_monthly_budget');
         let gigahost = undefined;
-        if (ghApiKeyInput || ghBudgetInput) {
+        if (ghApiKeyInput) {
             gigahost = {
-                api_key: ghApiKeyInput ? ghApiKeyInput.value.trim() : '',
-                monthly_budget_nok: ghBudgetInput && ghBudgetInput.value ? parseFloat(ghBudgetInput.value) : 0
+                api_key: ghApiKeyInput.value.trim()
             };
         }
 
@@ -627,8 +628,49 @@
     const btnDeployVPS = document.getElementById('btnDeployVPS');
     const deployPlanSelect = document.getElementById('deployPlanSelect');
     const deployRegionSelect = document.getElementById('deployRegionSelect');
+    const deployOSSelect = document.getElementById('deployOSSelect');
 
     let cachedPlans = [];
+
+    // deployPlanAt returns the plan the plan selector currently points at, or
+    // null. The selector's value is the plan index into cachedPlans; an empty
+    // value means the catalog had nothing selectable.
+    function deployPlanAt() {
+        if (!deployPlanSelect || cachedPlans.length === 0) return null;
+        if (deployPlanSelect.value === '') return null;
+        const idx = parseInt(deployPlanSelect.value, 10);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= cachedPlans.length) return null;
+        return cachedPlans[idx];
+    }
+
+    // deployPlanLabel renders the authoritative provider price facts: the hourly
+    // rate, the currency and the monthly ceiling the provider documents. Nothing
+    // is converted or capped.
+    function deployPlanLabel(p) {
+        const parts = [];
+        if (p.cpu_cores) parts.push(p.cpu_cores + ' vCPU');
+        if (p.ram_mb) parts.push(Math.round(p.ram_mb / 1024) + 'GB RAM');
+        if (p.disk_gb) parts.push(p.disk_gb + 'GB NVMe');
+        const currency = p.currency || 'NOK';
+        const price = [];
+        if (p.hourly_rate_nok > 0) price.push(p.hourly_rate_nok + ' ' + currency + '/hr');
+        if (p.monthly_ceiling_nok > 0) price.push('max ' + p.monthly_ceiling_nok + ' ' + currency + '/mo');
+        const spec = parts.join(', ');
+        return p.name + (spec ? ' — ' + spec : '') + (price.length ? ' (' + price.join(', ') + ')' : '');
+    }
+
+    // appendDeployOption adds one disabled-by-default placeholder option, used
+    // when the provider returned nothing selectable. It carries no id, so
+    // nothing can be ordered from it.
+    function appendDeployOption(select, text) {
+        if (!select) return;
+        select.innerHTML = '';
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = text;
+        select.appendChild(opt);
+        select.disabled = true;
+    }
 
     async function loadGigahostCatalog() {
         if (!deployPlanSelect) return;
@@ -637,47 +679,108 @@
         try {
             const res = await API.get('/api/admin/hosting/gigahost/catalog');
             cachedPlans = (res && res.plans) ? res.plans : [];
-            deployPlanSelect.innerHTML = '';
             if (cachedPlans.length === 0) {
+                appendDeployOption(deployPlanSelect, _('deploy_vps_no_plans'));
+                appendDeployOption(deployRegionSelect, _('deploy_vps_no_plans'));
+                appendDeployOption(deployOSSelect, _('deploy_vps_no_plans'));
+                updateDeployButtonState();
+                return;
+            }
+            deployPlanSelect.innerHTML = '';
+            deployPlanSelect.disabled = false;
+            cachedPlans.forEach((p, idx) => {
                 const opt = document.createElement('option');
-                opt.value = '';
-                opt.textContent = _('no_matching_records');
+                opt.value = idx;
+                opt.textContent = deployPlanLabel(p);
                 deployPlanSelect.appendChild(opt);
-            } else {
-                cachedPlans.forEach((p, idx) => {
-                    const opt = document.createElement('option');
-                    opt.value = idx;
-                    opt.textContent = `${p.name} — ${p.cpu_cores} vCPU, ${Math.round(p.ram_mb/1024)}GB RAM, ${p.disk_gb}GB NVMe (${p.hourly_rate_nok} NOK/hr, max ${p.monthly_ceiling_nok} NOK/mo)`;
-                    deployPlanSelect.appendChild(opt);
-                });
-                updateDeployRegions();
-            }
+            });
+            updateDeploySelections(null);
         } catch (err) {
-            if (deployPlanSelect) {
-                deployPlanSelect.innerHTML = '<option value="">' + (err.message || 'Catalog unavailable') + '</option>';
-            }
+            cachedPlans = [];
+            const message = _('deploy_vps_catalog_unavailable');
+            appendDeployOption(deployPlanSelect, message);
+            appendDeployOption(deployRegionSelect, message);
+            appendDeployOption(deployOSSelect, message);
+            updateDeployButtonState();
         } finally {
             if (loading) loading.style.display = 'none';
         }
     }
 
-    function updateDeployRegions() {
-        if (!deployRegionSelect || cachedPlans.length === 0) return;
-        const planIdx = parseInt(deployPlanSelect.value || '0');
-        const plan = cachedPlans[planIdx] || cachedPlans[0];
-        deployRegionSelect.innerHTML = '';
-        if (plan && plan.regions && plan.regions.length > 0) {
-            plan.regions.forEach(r => {
+    // updateDeploySelections rebuilds the region and image selectors from the
+    // plan the provider actually returned. It keeps a selection only when that
+    // value is still valid for the new plan, so a plan change cannot leave an
+    // incompatible region or image selected. previous holds the values the user
+    // had chosen; pass null to take the provider's first valid choice.
+    function updateDeploySelections(previous) {
+        const plan = deployPlanAt();
+        const keepRegion = previous ? previous.region : null;
+        const keepOS = previous ? previous.os : null;
+
+        if (!plan) {
+            appendDeployOption(deployRegionSelect, _('deploy_vps_no_plans'));
+            appendDeployOption(deployOSSelect, _('deploy_vps_no_plans'));
+            updateDeployButtonState();
+            return;
+        }
+
+        const regions = (plan.regions || []).filter(r => r.available && r.in_stock !== false);
+        if (deployRegionSelect) {
+            deployRegionSelect.innerHTML = '';
+            regions.forEach(r => {
                 const opt = document.createElement('option');
                 opt.value = r.id;
-                opt.textContent = r.name + (r.country ? ` (${r.country})` : '');
+                const label = r.name || String(r.id);
+                opt.textContent = r.country ? (label + ' (' + r.country + ')') : label;
+                if (keepRegion !== null && String(r.id) === String(keepRegion)) opt.selected = true;
                 deployRegionSelect.appendChild(opt);
             });
-        } else {
-            const opt = document.createElement('option');
-            opt.value = '1';
-            opt.textContent = 'Norway (Default)';
-            deployRegionSelect.appendChild(opt);
+            if (regions.length === 0) {
+                appendDeployOption(deployRegionSelect, _('deploy_vps_no_region_stock'));
+            } else {
+                deployRegionSelect.disabled = false;
+            }
+        }
+
+        const images = plan.os_options || [];
+        if (deployOSSelect) {
+            deployOSSelect.innerHTML = '';
+            images.forEach(os => {
+                const opt = document.createElement('option');
+                opt.value = os.os_id;
+                opt.textContent = os.os_name || String(os.os_id);
+                if (keepOS !== null && String(os.os_id) === String(keepOS)) opt.selected = true;
+                deployOSSelect.appendChild(opt);
+            });
+            if (images.length === 0) {
+                appendDeployOption(deployOSSelect, _('deploy_vps_no_os'));
+            } else {
+                deployOSSelect.disabled = false;
+            }
+        }
+
+        updateDeployButtonState();
+    }
+
+    // updateDeployButtonState disables ordering unless the plan, region and image
+    // selectors all carry a real provider value. A disabled button cannot post a
+    // guessed selection.
+    function updateDeployButtonState() {
+        if (!btnDeployVPS) return;
+        const ready = !!deployPlanAt()
+            && !!deployRegionSelect && deployRegionSelect.value !== ''
+            && !!deployOSSelect && deployOSSelect.value !== '';
+        btnDeployVPS.disabled = !ready;
+    }
+
+    let gigahostPollTimer = null;
+    function scheduleRecentOrdersPolling(orders) {
+        const inProgress = orders && orders.some(o => o.status === 'deploying' || o.status === 'pending' || o.status === 'waiting' || o.status === 'ssh_verifying' || o.status === 'installing_protocol' || o.status === 'enabling_backend');
+        if (inProgress && !gigahostPollTimer) {
+            gigahostPollTimer = setTimeout(() => {
+                gigahostPollTimer = null;
+                loadRecentOrders();
+            }, 3000);
         }
     }
 
@@ -697,17 +800,35 @@
                 renderEmpty();
                 return;
             }
+            scheduleRecentOrdersPolling(orders);
+
+            // Enrich active/recent orders with deploy status DTO diagnostics
+            await Promise.all(orders.slice(0, 5).map(async (o) => {
+                if (!o.order_id) return;
+                try {
+                    const response = await API.get('/api/admin/hosting/gigahost/orders/' + encodeURIComponent(o.order_id) + '/status');
+                    const st = response && (response.deploy || response);
+                    if (st) {
+                        if (st.step) o.step = st.step;
+                        if (st.error) o.last_error = st.error;
+                        if (st.server_id) o.nexus_server_id = st.server_id;
+                        if (st.status === 'failed') o.status = 'failed';
+                        else if (st.status === 'ready' && st.server_id > 0) o.nexus_onboarded = true;
+                    }
+                } catch (_) {}
+            }));
+
             const list = document.createElement('div');
             list.style.display = 'flex';
             list.style.flexDirection = 'column';
             list.style.gap = '6px';
             orders.slice(0, 5).forEach(o => {
-                const badgeClass = o.status === 'ready' ? 'badge-success' : (o.status === 'failed' ? 'badge-danger' : 'badge-warn');
+                const badgeClass = (o.status === 'ready' && o.nexus_onboarded) ? 'badge-success' : (o.status === 'failed' ? 'badge-danger' : 'badge-warn');
                 const row = document.createElement('div');
                 row.style.display = 'flex';
                 row.style.justifyContent = 'space-between';
                 row.style.alignItems = 'center';
-                row.style.padding = '4px 0';
+                row.style.padding = '6px 0';
                 row.style.borderBottom = '1px solid rgba(255,255,255,0.05)';
 
                 const left = document.createElement('div');
@@ -726,12 +847,62 @@
                     left.appendChild(ipSpan);
                 }
 
+                if (o.step && (!o.nexus_onboarded || o.status !== 'ready')) {
+                    const stepSpan = document.createElement('span');
+                    stepSpan.style.fontSize = '0.75rem';
+                    stepSpan.style.marginLeft = '8px';
+                    stepSpan.style.color = 'var(--text-muted)';
+                    stepSpan.textContent = '[' + o.step + ']';
+                    left.appendChild(stepSpan);
+                }
+
+                if (o.last_error && o.status === 'failed') {
+                    const errSpan = document.createElement('span');
+                    errSpan.style.fontSize = '0.75rem';
+                    errSpan.style.marginLeft = '8px';
+                    errSpan.style.color = 'var(--danger-color, #e53e3e)';
+                    errSpan.textContent = o.last_error;
+                    left.appendChild(errSpan);
+                }
+
                 const right = document.createElement('div');
+                right.style.display = 'flex';
+                right.style.alignItems = 'center';
+                right.style.gap = '6px';
+
                 const badge = document.createElement('span');
                 badge.className = 'badge ' + badgeClass;
                 badge.style.fontSize = '0.75rem';
-                badge.textContent = o.status || '';
+                badge.textContent = (o.status === 'ready' && !o.nexus_onboarded) ? 'vps_ready' : (o.status || '');
                 right.appendChild(badge);
+
+                if (o.status === 'failed') {
+                    const btnRetry = document.createElement('button');
+                    btnRetry.type = 'button';
+                    btnRetry.className = 'btn btn-secondary';
+                    btnRetry.style.padding = '2px 8px';
+                    btnRetry.style.fontSize = '0.75rem';
+                    btnRetry.textContent = _('deploy_retry_btn') || 'Retry';
+                    btnRetry.addEventListener('click', () => triggerGigahostSetup(o.order_id));
+                    right.appendChild(btnRetry);
+                } else if (!o.nexus_onboarded || o.status !== 'ready') {
+                    // The immediate path needs an address to reach right now;
+                    // the saved path does not, because the panel keeps working
+                    // after this browser closes and discovers the address when
+                    // the provider assigns it. Offering only the first is what
+                    // made the provisioning interval unusable.
+                    if (o.assigned_ip) {
+                        const btnSetup = document.createElement('button');
+                        btnSetup.type = 'button';
+                        btnSetup.className = 'btn btn-primary';
+                        btnSetup.style.padding = '2px 8px';
+                        btnSetup.style.fontSize = '0.75rem';
+                        btnSetup.textContent = _('deploy_setup_btn') || 'Setup Backend';
+                        btnSetup.addEventListener('click', () => triggerGigahostSetup(o.order_id));
+                        right.appendChild(btnSetup);
+                    }
+                    appendSetupApprovalAction(right, o.order_id);
+                }
 
                 row.appendChild(left);
                 row.appendChild(right);
@@ -744,13 +915,18 @@
     }
 
     async function handleDeployVPS() {
-        if (!deployPlanSelect || cachedPlans.length === 0) return;
-        const planIdx = parseInt(deployPlanSelect.value || '0');
-        const plan = cachedPlans[planIdx];
+        const plan = deployPlanAt();
         if (!plan) return;
 
-        const regionID = deployRegionSelect ? parseInt(deployRegionSelect.value || '1') : 1;
-        const osID = parseInt(document.getElementById('deployOSSelect').value || '72');
+        // The payload is built only from values the provider returned. Each
+        // selector is re-read here rather than defaulted, so an empty selector
+        // stops the order instead of posting a guess.
+        const regionID = deployRegionSelect ? parseInt(deployRegionSelect.value, 10) : NaN;
+        const osID = deployOSSelect ? parseInt(deployOSSelect.value, 10) : NaN;
+        if (!Number.isInteger(regionID) || regionID <= 0 || !Number.isInteger(osID) || osID <= 0) {
+            UI.toast(_('deploy_vps_select_required'), 'error');
+            return;
+        }
 
         const btn = document.getElementById('btnDeployVPS');
         const spinner = document.getElementById('deployVPSSpinner');
@@ -766,18 +942,32 @@
                 hourly_price_nok: plan.hourly_rate_nok
             };
             const res = await API.post('/api/admin/hosting/gigahost/order', payload);
-            UI.toast(res.message || 'VPS order placed successfully', 'success');
+            UI.toast(res.message || _('deploy_vps_order_placed'), 'success');
             loadRecentOrders();
         } catch (err) {
             UI.toast(err.message || _('error'), 'error');
         } finally {
-            if (btn) btn.disabled = false;
+            updateDeployButtonState();
             if (spinner) spinner.classList.add('hidden');
         }
     }
 
     if (deployPlanSelect) {
-        deployPlanSelect.addEventListener('change', updateDeployRegions);
+        deployPlanSelect.addEventListener('change', () => {
+            // Plan change rebuilds both dependent selectors from the new plan. The
+            // values selected so far are offered back so a choice the new plan
+            // still supports is preserved, and one it does not support is dropped.
+            updateDeploySelections({
+                region: deployRegionSelect ? deployRegionSelect.value : null,
+                os: deployOSSelect ? deployOSSelect.value : null
+            });
+        });
+    }
+    if (deployRegionSelect) {
+        deployRegionSelect.addEventListener('change', updateDeployButtonState);
+    }
+    if (deployOSSelect) {
+        deployOSSelect.addEventListener('change', updateDeployButtonState);
     }
     if (btnRefreshCatalog) {
         btnRefreshCatalog.addEventListener('click', () => {
@@ -792,6 +982,7 @@
     if (deployPlanSelect) {
         loadGigahostCatalog();
         loadRecentOrders();
+        loadSetupIntents();
     }
 </script>
 {{ end }}

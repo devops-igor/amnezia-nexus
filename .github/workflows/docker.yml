@@ -90,8 +90,24 @@ jobs:
         id: meta
         run: |
           REPO="ghcr.io/$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
-          TAGS="${REPO}:latest,${REPO}:${{ github.sha }}"
+          SHA="${{ github.sha }}"
+          TAGS="${REPO}:${SHA}"
+          # :latest tracks main and release tags only. A feature-branch build --
+          # including a manual workflow_dispatch used to produce a testable image
+          # before merge -- publishes the exact full-SHA tag alone, so an unmerged
+          # commit can never move :latest. The scanner gate above is unaffected.
+          IS_DEFAULT_BRANCH="false"
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            IS_DEFAULT_BRANCH="true"
+          fi
+          IS_RELEASE_TAG="false"
           if [ "${{ github.ref_type }}" = "tag" ]; then
+            IS_RELEASE_TAG="true"
+          fi
+          if [ "$IS_DEFAULT_BRANCH" = "true" ] || [ "$IS_RELEASE_TAG" = "true" ]; then
+            TAGS="${REPO}:latest,${TAGS}"
+          fi
+          if [ "$IS_RELEASE_TAG" = "true" ]; then
             TAGS="${TAGS},${REPO}:${{ github.ref_name }}"
           fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"

@@ -66,6 +66,7 @@ jobs:
               image: ghcr.io/devops-igor/amnezia-nexus:${PR_TAG}
               environment:
                 - E2E_TESTING=true
+                - GIGAHOST_CALL_TIMING=1
           EOF
           cd ~ && docker compose up -d
           echo "Waiting for panel health endpoint..."
@@ -93,6 +94,15 @@ jobs:
           echo "Verifying E2E_TESTING flag inside container..."
           if [ "$(docker exec amnezia-panel printenv E2E_TESTING)" != "true" ]; then
             echo "Error: E2E_TESTING is not enabled inside container" >&2
+            exit 1
+          fi
+          # The host shell does not propagate into the container: assert the
+          # timing flag actually ARRIVED in the panel process, otherwise the
+          # collector would legitimately find nothing and the run would silently
+          # produce no timing evidence.
+          echo "Verifying GIGAHOST_CALL_TIMING flag inside container..."
+          if [ "$(docker exec amnezia-panel printenv GIGAHOST_CALL_TIMING)" != "1" ]; then
+            echo "Error: GIGAHOST_CALL_TIMING is not enabled inside container" >&2
             exit 1
           fi
 

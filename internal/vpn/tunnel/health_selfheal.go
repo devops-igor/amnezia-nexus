@@ -335,6 +335,9 @@ func (hp *HealthProber) finalizeSelfHealRecovery(
 		)
 		return false
 	}
+	if hp.IsPendingEnrollment(tun.ServerID) {
+		newStatus = models.TunnelStatusConnecting
+	}
 
 	swapped, err := hp.pool.CompareAndSwapTunnelStatusForTunnel(
 		ctx,

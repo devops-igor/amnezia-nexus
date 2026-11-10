@@ -70,7 +70,48 @@ func ProbeVLESSTrafficWithTarget(ctx context.Context, target string, p models.VL
 	if err != nil {
 		return 0, err
 	}
+	return probeVLESSTraffic(ctx, d, p, destination, timeout)
+}
 
+// StreamDialer is the outbound stream egress an exchange can be performed over.
+// It is satisfied by *Dialer (a fresh REALITY session per dial) and by a live
+// backend device's proxy egress, so health can verify the exact path client
+// traffic uses without constructing a second tunnel.
+type StreamDialer interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+// ProbeVLESSTrafficViaDialer performs the authenticated VLESS application
+// exchange — authenticated session, real HTTP request to the configured
+// destination, verified application reply — over an existing egress.
+//
+// The destination is the same one ProbeVLESSTraffic derives from the tunnel's
+// configured ServerName, so this is the identical exchange the F10 qualification
+// already proved for the backend; nothing additional is dialed.
+func ProbeVLESSTrafficViaDialer(ctx context.Context, egress StreamDialer, p models.VLESSRealityParams, timeout time.Duration) (int64, error) {
+	if egress == nil {
+		return 0, errors.New("vless: nil stream egress")
+	}
+	dest := p.ServerName
+	if _, _, err := net.SplitHostPort(dest); err != nil {
+		dest = net.JoinHostPort(dest, "443")
+	}
+	return probeVLESSTraffic(ctx, egress, p, dest, timeout)
+}
+
+// ProbeVLESSTrafficViaDialerTo is ProbeVLESSTrafficViaDialer with an explicit
+// destination, mirroring the existing ProbeVLESSTrafficWithTarget pair. It exists
+// for the same reason: the destination a real deployment uses is derived from the
+// REALITY ServerName, which cannot address a loopback origin in a local fixture.
+// The exchange performed is identical.
+func ProbeVLESSTrafficViaDialerTo(ctx context.Context, egress StreamDialer, p models.VLESSRealityParams, destination string, timeout time.Duration) (int64, error) {
+	if egress == nil {
+		return 0, errors.New("vless: nil stream egress")
+	}
+	return probeVLESSTraffic(ctx, egress, p, destination, timeout)
+}
+
+func probeVLESSTraffic(ctx context.Context, egress StreamDialer, p models.VLESSRealityParams, destination string, timeout time.Duration) (int64, error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -80,10 +121,10 @@ func ProbeVLESSTrafficWithTarget(ctx context.Context, target string, p models.VL
 
 	// Port 443 (standard HTTPS) or 8443 targets use TLS directly.
 	if port == "443" || port == "8443" {
-		return probeTrafficTarget(timeoutCtx, d, destination, host, sni, start, true)
+		return probeTrafficTarget(timeoutCtx, egress, destination, host, sni, start, true)
 	}
 
-	latencyMS, err := probeTrafficTarget(timeoutCtx, d, destination, host, sni, start, false)
+	latencyMS, err := probeTrafficTarget(timeoutCtx, egress, destination, host, sni, start, false)
 	if err == nil {
 		return latencyMS, nil
 	}
@@ -91,7 +132,7 @@ func ProbeVLESSTrafficWithTarget(ctx context.Context, target string, p models.VL
 	// If plaintext probe failed because target is a TLS server (empty response / EOF / reset)
 	// and context has not expired, retry with TLS to support HTTPS targets on arbitrary test ports.
 	if timeoutCtx.Err() == nil && isRetryableTLSError(err) {
-		if tlsLatency, tlsErr := probeTrafficTarget(timeoutCtx, d, destination, host, sni, start, true); tlsErr == nil {
+		if tlsLatency, tlsErr := probeTrafficTarget(timeoutCtx, egress, destination, host, sni, start, true); tlsErr == nil {
 			return tlsLatency, nil
 		}
 	}
@@ -137,7 +178,7 @@ func isRetryableTLSError(err error) bool {
 
 func probeTrafficTarget(
 	ctx context.Context,
-	d *Dialer,
+	d StreamDialer,
 	destination, host, sni string,
 	start time.Time,
 	useTLS bool,

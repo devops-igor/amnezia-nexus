@@ -108,11 +108,11 @@ finalize() {
     if [ -n "${E2E_PANEL_LOG_CONTAINER:-}" ]; then
         probe_tmp="$(mktemp -t panel-operator-XXXXXX.log)"
         if ! docker logs "$E2E_PANEL_LOG_CONTAINER" > "$probe_tmp" 2>&1; then
-            echo "==> Operator log from container '${E2E_PANEL_LOG_CONTAINER}' unavailable; no probe evidence collected."
+            echo "==> Operator log from container '${E2E_PANEL_LOG_CONTAINER}' unavailable; no diagnostics collected."
         fi
-        probe_args=(--probe-log "$probe_tmp")
+        probe_args=(--probe-log "$probe_tmp" --call-timing-log "$probe_tmp")
     elif [ -n "${E2E_PANEL_LOG_PATH:-}" ]; then
-        probe_args=(--probe-log "$E2E_PANEL_LOG_PATH")
+        probe_args=(--probe-log "$E2E_PANEL_LOG_PATH" --call-timing-log "$E2E_PANEL_LOG_PATH")
     fi
     if ! (cd "$REPO_ROOT" && python3 -m tests.e2e.diagnostics \
             --validate-dir "$E2E_DIAGNOSTICS_DIR" "${probe_args[@]}"); then

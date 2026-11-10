@@ -270,6 +270,7 @@ type containerLaunchOptions struct {
 	shortID          string
 	flow             string
 	clients          []XrayClient
+	skipProbe        bool
 }
 
 func (m *XrayManager) pullImage(ctx context.Context, client ssh.SSHClient, image string) error {
@@ -481,7 +482,7 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 		probeMode = "REALITY handshake"
 	}
 
-	if activeProbeFn != nil && opts.server != nil && opts.portPrimary > 0 {
+	if !opts.skipProbe && activeProbeFn != nil && opts.server != nil && opts.portPrimary > 0 {
 		probeUUID := ""
 		probeFlow := opts.flow
 		if hasClients {
@@ -797,9 +798,11 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	defer unlock()
 
 	// 1. Check Docker is installed
-	out, _, code, _ := client.RunCommand(ctx, "docker --version")
-	if code != 0 || !strings.Contains(strings.ToLower(out), "docker") {
-		return errors.New("docker is not installed on the remote server")
+	if b, ok := params["docker_bootstrapped"].(bool); !ok || !b {
+		out, _, code, _ := client.RunCommand(ctx, "docker --version")
+		if code != 0 || !strings.Contains(strings.ToLower(out), "docker") {
+			return errors.New("docker is not installed on the remote server")
+		}
 	}
 
 	// 2. Parse installation options and resolve engine profile
@@ -859,6 +862,7 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	}
 
 	// 7. Launch amnezia-xray container with resolved profile image and verify readiness before deleting backup
+	skipProbe, _ := params["skip_probe"].(bool)
 	launchOpts := containerLaunchOptions{
 		image:            profile.Image,
 		engineProfile:    string(profile.Name),
@@ -870,6 +874,7 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 		shortID:          shortID,
 		flow:             flow,
 		clients:          clients,
+		skipProbe:        skipProbe,
 	}
 	if err := m.launchContainer(ctx, client, launchOpts); err != nil {
 		return err

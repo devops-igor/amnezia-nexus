@@ -83,14 +83,25 @@ func NewRouter(cfg *config.Config, db *database.DB, vpnSvc *vpn.Service) *chi.Mu
 // NewRouterWithDeps builds the router around caller-owned managers and registry, so HTTP
 // handlers and background services (orchestrator, reconciler, userops) share the same instances.
 func NewRouterWithDeps(deps handlers.Dependencies) *chi.Mux {
-	if vpnSvc := deps.VPNService; vpnSvc != nil && deps.AWGManager != nil && !vpnSvc.HasAWGStatusProvider() {
-		vpnSvc.SetAWGStatusProvider(deps.AWGManager)
-	}
+	EnsureAWGStatusProvider(deps)
 	return NewRouterWithOptions(Options{
 		Config:   deps.Config,
 		DB:       deps.DB,
 		Handlers: handlers.NewHandlers(deps),
 	})
+}
+
+// EnsureAWGStatusProvider wires the AWG status provider into the VPN service when
+// both are present and it is not already set.
+//
+// It is exported because an entrypoint that builds its own *handlers.Handlers (so
+// that the HTTP layer and a background worker share one instance) constructs the
+// router with NewRouterWithOptions and would otherwise skip this wiring.
+// Callers that use NewRouterWithDeps get it automatically.
+func EnsureAWGStatusProvider(deps handlers.Dependencies) {
+	if vpnSvc := deps.VPNService; vpnSvc != nil && deps.AWGManager != nil && !vpnSvc.HasAWGStatusProvider() {
+		vpnSvc.SetAWGStatusProvider(deps.AWGManager)
+	}
 }
 
 // NewRouterWithOptions builds the complete router given explicit Options and dependencies.
@@ -283,6 +294,20 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			r.Get("/catalog", h.GigahostCatalogHandler)
 			r.Post("/order", h.GigahostOrderHandler)
 			r.Get("/orders", h.GigahostOrdersHandler)
+			r.Post("/deploy", h.GigahostDeployHandler)
+			r.Post("/orders/{order_id}/setup", h.GigahostDeployHandler)
+			r.Get("/deploy/{order_id}", h.GigahostDeployStatusHandler)
+			r.Get("/orders/{order_id}/status", h.GigahostDeployStatusHandler)
+			// Durable setup approval, revocation and status. These record the
+			// administrator's intent and expose the background tracker's progress;
+			// the resume and host-confirmation routes are the two actions a pause
+			// asks the administrator to take.
+			r.Get("/setup-intents", h.GigahostSetupIntentsHandler)
+			r.Post("/orders/{order_id}/setup-approval", h.GigahostSetupApproveHandler)
+			r.Get("/orders/{order_id}/setup-approval", h.GigahostSetupStatusHandler)
+			r.Delete("/orders/{order_id}/setup-approval", h.GigahostSetupCancelHandler)
+			r.Post("/orders/{order_id}/setup-resume", h.GigahostSetupResumeHandler)
+			r.Post("/orders/{order_id}/setup-host-confirmation", h.GigahostSetupConfirmHostHandler)
 		})
 	})
 

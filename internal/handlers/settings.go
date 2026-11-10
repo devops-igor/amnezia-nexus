@@ -3,10 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -50,6 +47,7 @@ func (h *Handlers) GetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	if key, ok := gigahostCfg["api_key"].(string); ok && key != "" {
 		gigahostCfg["api_key"] = "********"
 	}
+	stripObsoleteGigahostKeys(gigahostCfg)
 
 	h.JSON(w, http.StatusOK, map[string]any{
 		"appearance": appearance,
@@ -61,41 +59,91 @@ func (h *Handlers) GetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// obsoleteGigahostKeys are setting fields the panel no longer reads or writes.
+// They are not migrated away: an existing row keeps the bytes so nothing in the
+// database is destroyed, but the panel neither reports them nor accepts them.
+var obsoleteGigahostKeys = []string{"monthly_budget_nok"}
+
+// stripObsoleteGigahostKeys removes retired Gigahost setting fields from a
+// decoded settings map, so the retired surface cannot come back through the read
+// API or be re-saved by a stale client.
+func stripObsoleteGigahostKeys(cfg map[string]any) {
+	for _, key := range obsoleteGigahostKeys {
+		delete(cfg, key)
+	}
+}
+
 func (h *Handlers) preserveSecretsOnSave(ctx context.Context, req *models.SaveSettingsRequest) {
-	// 1. SSL: Preserve existing KeyText / CertText if incoming are empty or masked
-	var existingSSL models.SSLSettings
-	_ = h.db.GetSetting(ctx, "ssl", &existingSSL)
-	if req.SSL.KeyText == "" || req.SSL.KeyText == "********" {
-		req.SSL.KeyText = existingSSL.KeyText
-	}
-	if req.SSL.CertText == "" || req.SSL.CertText == "********" {
-		req.SSL.CertText = existingSSL.CertText
-	}
-
-	// 2. Telegram: Preserve existing bot_token / token if incoming is empty or masked
-	if req.Telegram != nil {
-		existingTelegram := make(map[string]any)
-		_ = h.db.GetSetting(ctx, "telegram", &existingTelegram)
-		if bt, ok := req.Telegram["bot_token"].(string); !ok || bt == "" || bt == "********" {
-			if oldBt, ok := existingTelegram["bot_token"].(string); ok && oldBt != "" {
-				req.Telegram["bot_token"] = oldBt
-			}
-		}
-		if tok, ok := req.Telegram["token"].(string); !ok || tok == "" || tok == "********" {
-			if oldTok, ok := existingTelegram["token"].(string); ok && oldTok != "" {
-				req.Telegram["token"] = oldTok
-			}
-		}
-	}
-
-	// 3. Gigahost: Preserve existing api_key if incoming is empty or masked
+	h.preserveSSLOnSave(ctx, &req.SSL)
+	h.preserveTelegramOnSave(ctx, req.Telegram)
+	// Gigahost: Preserve existing api_key if incoming is empty or masked
 	if req.Gigahost != nil {
-		existingGigahost := make(map[string]any)
-		_ = h.db.GetSetting(ctx, "gigahost", &existingGigahost)
-		if key, ok := req.Gigahost["api_key"].(string); !ok || key == "" || key == "********" || strings.HasPrefix(key, "****") {
-			if oldKey, ok := existingGigahost["api_key"].(string); ok && oldKey != "" {
-				req.Gigahost["api_key"] = oldKey
-			}
+		h.preserveGigahostOnSave(ctx, req.Gigahost)
+	}
+}
+
+// preserveSSLOnSave keeps the stored certificate material when the incoming
+// values are empty or the masked placeholder the settings page renders.
+func (h *Handlers) preserveSSLOnSave(ctx context.Context, incoming *models.SSLSettings) {
+	var existing models.SSLSettings
+	_ = h.db.GetSetting(ctx, "ssl", &existing)
+	if incoming.KeyText == "" || incoming.KeyText == "********" {
+		incoming.KeyText = existing.KeyText
+	}
+	if incoming.CertText == "" || incoming.CertText == "********" {
+		incoming.CertText = existing.CertText
+	}
+}
+
+// preserveTelegramOnSave keeps the stored bot token when the incoming value is
+// absent, empty or masked. A nil section means "not edited", not "erase".
+func (h *Handlers) preserveTelegramOnSave(ctx context.Context, incoming map[string]any) {
+	if incoming == nil {
+		return
+	}
+	existing := make(map[string]any)
+	_ = h.db.GetSetting(ctx, "telegram", &existing)
+	for _, key := range []string{"bot_token", "token"} {
+		value, ok := incoming[key].(string)
+		if ok && value != "" && value != "********" {
+			continue
+		}
+		if old, ok := existing[key].(string); ok && old != "" {
+			incoming[key] = old
+		}
+	}
+}
+
+// preserveGigahostOnSave keeps the stored Gigahost secrets and retired fields
+// that the incoming payload does not supply.
+//
+// The API key is preserved exactly like the other masked secrets. The retired
+// fields are stripped from what the panel ACCEPTS (see stripObsoleteGigahostKeys)
+// but carried through on write, so saving unrelated settings never destroys a
+// value an older panel stored. Nothing reads them.
+func (h *Handlers) preserveGigahostOnSave(ctx context.Context, incoming map[string]any) {
+	existing := make(map[string]any)
+	_ = h.db.GetSetting(ctx, "gigahost", &existing)
+
+	if key, ok := incoming["api_key"].(string); !ok || key == "" || key == "********" || strings.HasPrefix(key, "****") {
+		if oldKey, ok := existing["api_key"].(string); ok && oldKey != "" {
+			incoming["api_key"] = oldKey
+		}
+	}
+
+	carryObsoleteGigahostKeys(incoming, existing)
+}
+
+// carryObsoleteGigahostKeys copies retired setting fields from the stored row into
+// the row being written, unless the request supplied one. This is a byte-preserving
+// carry-through, never a read: no panel path interprets these values.
+func carryObsoleteGigahostKeys(incoming, existing map[string]any) {
+	for _, key := range obsoleteGigahostKeys {
+		if _, provided := incoming[key]; provided {
+			continue
+		}
+		if old, ok := existing[key]; ok {
+			incoming[key] = old
 		}
 	}
 }
@@ -123,64 +171,19 @@ func (h *Handlers) persistSettings(ctx context.Context, req *models.SaveSettings
 	return h.db.SetSetting(ctx, "limits", req.Limits)
 }
 
-func parseBudgetVal(raw any) (float64, error) {
-	if raw == nil {
-		return 0, nil
-	}
-	var val float64
-	switch v := raw.(type) {
-	case float64:
-		val = v
-	case float32:
-		val = float64(v)
-	case int:
-		val = float64(v)
-	case int64:
-		val = float64(v)
-	case json.Number:
-		f, err := v.Float64()
-		if err != nil {
-			return 0, fmt.Errorf("invalid numeric budget %q: %w", v, err)
-		}
-		val = f
-	case string:
-		trimmed := strings.TrimSpace(v)
-		if trimmed == "" {
-			return 0, errors.New("empty budget string")
-		}
-		f, err := strconv.ParseFloat(trimmed, 64)
-		if err != nil {
-			return 0, fmt.Errorf("cannot parse budget string: %w", err)
-		}
-		val = f
-	default:
-		return 0, fmt.Errorf("unsupported budget type: %T", raw)
-	}
-
-	if math.IsNaN(val) || math.IsInf(val, 0) || val < 0 {
-		return 0, fmt.Errorf("budget must be a finite non-negative number: %v", val)
-	}
-	return val, nil
-}
-
-type mockCatalogFallback struct {
+// providerCatalogClient forwards every Client method to the injected client
+// unchanged and additionally exposes the last catalog eligibility it decoded.
+//
+// It previously synthesized a hardcoded hourly plan list whenever the inner
+// client returned no plans. That fabricated pids, price ids, rates and a region,
+// so the portal could offer - and the order path could accept - a "plan" the
+// provider never published. Nothing may be invented on the way to a purchase, so
+// the fallback is gone and the provider answer passes through unchanged.
+type providerCatalogClient struct {
 	gigahost.Client
 }
 
-func (m *mockCatalogFallback) GetCatalog(ctx context.Context) ([]gigahost.HourlyPlan, error) {
-	plans, err := m.Client.GetCatalog(ctx)
-	if err == nil && plans == nil {
-		return []gigahost.HourlyPlan{
-			{ProductID: 101, PriceID: 1, HourlyRateNOK: 0.15, MonthlyCeiling: 108.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
-			{ProductID: 101, PriceID: 555, HourlyRateNOK: 0.15, MonthlyCeiling: 108.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
-			{ProductID: 201, PriceID: 2, HourlyRateNOK: 0.20, MonthlyCeiling: 144.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
-			{ProductID: 301, PriceID: 1, HourlyRateNOK: 0.15, MonthlyCeiling: 108.0, InStock: true, Regions: []gigahost.Region{{ID: 1, Available: true}}},
-		}, nil
-	}
-	return plans, err
-}
-
-func (m *mockCatalogFallback) GetCatalogEligibility() gigahost.CatalogEligibility {
+func (m *providerCatalogClient) GetCatalogEligibility() gigahost.CatalogEligibility {
 	if ce, ok := m.Client.(interface {
 		GetCatalogEligibility() gigahost.CatalogEligibility
 	}); ok {
@@ -206,18 +209,10 @@ func (h *Handlers) SaveSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		req.Gigahost = nil
 	}
 
-	if req.Gigahost != nil {
-		if rawBudget, ok := req.Gigahost["monthly_budget_nok"]; ok && rawBudget != nil {
-			budget, err := parseBudgetVal(rawBudget)
-			if err != nil {
-				h.JSONError(w, http.StatusBadRequest, "validation_failed", fmt.Sprintf("Invalid monthly budget value: %v", err))
-				return
-			}
-			req.Gigahost["monthly_budget_nok"] = budget
-		}
-	}
-
 	ctx := r.Context()
+	if req.Gigahost != nil {
+		stripObsoleteGigahostKeys(req.Gigahost)
+	}
 	h.preserveSecretsOnSave(ctx, &req)
 
 	if err := h.persistSettings(ctx, &req); err != nil {

@@ -160,16 +160,38 @@ type safeBuffer struct {
 	buf bytes.Buffer
 }
 
+// caddyStderrBufferLimit caps how much child output is retained. `debug` logging
+// is verbose, and a failing fixture must not grow the buffer without bound while
+// it is being torn down.
+const caddyStderrBufferLimit = 4 << 20
+
 func (b *safeBuffer) Write(p []byte) (n int, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.buf.Write(p)
+	if room := caddyStderrBufferLimit - b.buf.Len(); room > 0 {
+		if len(p) > room {
+			b.buf.Write(p[:room])
+		} else {
+			b.buf.Write(p)
+		}
+	}
+	// Always report the full length consumed: a short Write would make the child
+	// see an I/O error on its own stderr and change its behaviour.
+	return len(p), nil
 }
 
 func (b *safeBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// Len reports the number of captured bytes. It is used to detect that the child
+// has stopped producing output before a failure report is taken.
+func (b *safeBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
 }
 
 // TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel exercises the four mandatory
@@ -191,10 +213,21 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 
 	// Replace loopback admin port with allocated test port, specify http_port, and disable auto_https redirects to prevent 308 redirects.
 	// Allow loopback in forward_proxy ACL for hermetic in-process fixture tunneling.
+	//
+	// `debug` is enabled so the child records the certificate cache and
+	// certificate-selection decisions for each ClientHello; at the default info
+	// level Caddy omits them, which is exactly the evidence a failed TLS
+	// obligation needs. It changes no TLS or routing behaviour, and the failure
+	// report whitelists what it may print.
+	//
+	// `skip_install_trust` is required rather than optional: TRUST_STORES=none in
+	// the child environment does not stop Caddy from adding its internal root to
+	// the user NSS database, so without this the fixture mutates the host trust
+	// store on every local run. It changes no TLS, routing or assertion.
 	caddyfile = strings.Replace(
 		caddyfile,
 		"admin 127.0.0.1:2019",
-		fmt.Sprintf("admin 127.0.0.1:%d\n    http_port %d\n    auto_https disable_redirects", adminPort, httpPort),
+		fmt.Sprintf("admin 127.0.0.1:%d\n    http_port %d\n    auto_https disable_redirects\n    debug\n    skip_install_trust", adminPort, httpPort),
 		1,
 	)
 	caddyfile = strings.Replace(
@@ -243,6 +276,41 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 		_ = cmd.Wait()
 	}()
 
+	// A subtest failure must leave behind why the child rejected the handshake.
+	// The digest is taken while the child is still alive (subtest cleanups run
+	// before the deferred kill above), and it is whitelisted so the CI log gains
+	// certificate/handshake facts rather than raw paths or request headers.
+	//
+	// A subtest cleanup runs before the parent's, and a failed subtest also fails
+	// the parent, so only the first failure reports. The digest holds the child's
+	// whole timeline, so one report covers every obligation in the run.
+	var (
+		diagMu       sync.Mutex
+		diagReported bool
+	)
+	reportOnFailure := func(t *testing.T, label string) {
+		t.Cleanup(func() {
+			if !t.Failed() {
+				return
+			}
+			diagMu.Lock()
+			alreadyReported := diagReported
+			diagReported = true
+			diagMu.Unlock()
+			if alreadyReported {
+				return
+			}
+			// Let the child finish writing the record for the ClientHello that
+			// just failed; the child is still alive here, so its final line is
+			// normally already in flight.
+			waitForCaddyStderrSettled(&stderrBuf, 40*time.Millisecond, 2*time.Second)
+			reportCaddyDiagnostics(t, label, &stderrBuf)
+		})
+	}
+	// The parent covers a failure that stops the run before any subtest starts,
+	// such as the TCP listener never becoming ready.
+	reportOnFailure(t, "fixture")
+
 	// Wait for Caddy to start listening on proxyPort
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
 	ready := false
@@ -265,6 +333,7 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 
 	// 2. Unknown-SNI TLS handshake completion
 	t.Run("UnknownSNI_CompletesHandshakeWithoutAlert", func(t *testing.T) {
+		reportOnFailure(t, "UnknownSNI_CompletesHandshakeWithoutAlert")
 		conf := baseTLSConfig.Clone()
 		conf.ServerName = "unrecognized.random-sni.net"
 
@@ -282,6 +351,7 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 
 	// 3. Active HTTP probe returns HTTP 404 without Server or Alt-Svc headers
 	t.Run("ActiveProbe_Returns404WithCamouflagedHeaders", func(t *testing.T) {
+		reportOnFailure(t, "ActiveProbe_Returns404WithCamouflagedHeaders")
 		conf := baseTLSConfig.Clone()
 		conf.ServerName = "unrecognized.random-sni.net"
 
@@ -331,6 +401,7 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 
 	// 4a. Probe resistance: unauthenticated CONNECT returns 404 (not 407)
 	t.Run("ProbeResistance_UnauthenticatedCONNECTReturns404", func(t *testing.T) {
+		reportOnFailure(t, "ProbeResistance_UnauthenticatedCONNECTReturns404")
 		conf := baseTLSConfig.Clone()
 		conf.ServerName = "localhost"
 
@@ -368,6 +439,7 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 
 	// 4b. Authenticated CONNECT successfully establishes proxy tunnel
 	t.Run("AuthenticatedCONNECT_EstablishesProxyTunnel", func(t *testing.T) {
+		reportOnFailure(t, "AuthenticatedCONNECT_EstablishesProxyTunnel")
 		conf := baseTLSConfig.Clone()
 		conf.ServerName = "localhost"
 

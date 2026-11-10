@@ -47,6 +47,7 @@ var (
 	ErrUnauthorized         = errors.New("gigahost api authentication failed (401/403)")
 	ErrNotFound             = errors.New("gigahost resource not found (404)")
 	ErrInvalidOrderParam    = errors.New("invalid order parameter: pid, price_id, region_id, os_id must be positive")
+	ErrOSNotAvailable       = errors.New("operating system is not available")
 )
 
 // APIError represents a structured error returned by the Gigahost API.
@@ -99,18 +100,136 @@ func ValidateAPIKey(key string) error {
 }
 
 // Region represents a datacenter region.
+//
+// Available is whether the plan may be deployed in the region at all
+// (region_ids). InStock is whether at least one datacenter of that region
+// currently has capacity for the plan (dc_ids + dc_stock). InStock is a
+// pointer on purpose: nil means the provider catalog carried no per-datacenter
+// stock fact, which is not the same as "sold out", and the handler must not
+// treat an absent fact as a guess in either direction.
 type Region struct {
 	ID        int    `json:"id"`
 	Name      string `json:"name"`
 	Country   string `json:"country,omitempty"`
 	Available bool   `json:"available"`
+	InStock   *bool  `json:"in_stock,omitempty"`
 }
 
-// OS represents an available operating system image.
+// Sellable reports whether the plan may be ordered in this region right now.
+func (r Region) Sellable() bool {
+	if !r.Available {
+		return false
+	}
+	return r.InStock == nil || *r.InStock
+}
+
+// OS is an available operating system image.
 type OS struct {
 	ID      int    `json:"id"`
 	Name    string `json:"name"`
 	Version string `json:"version,omitempty"`
+}
+
+// OperatingSystem is one installable image from GET /reinstall/distro/{dist_id}.
+//
+// Only documented fields are decoded: os_dedicated_only, os_minram,
+// os_single_disk_only, os_support_raid, os_custom_partition, os_slow_install
+// and, on GET /reinstall/os/{os_id}, os_limited_support. The distro endpoint
+// documents no minimum disk for plain images (os_min_disk exists for one-click
+// apps only), so no disk requirement is claimed here.
+//
+// Provider ids are the only identity that matters: an image is offered and
+// accepted only when the provider catalog returned that os_id.
+type OperatingSystem struct {
+	OSID           int    `json:"os_id"`
+	DistID         int    `json:"dist_id"`
+	DistName       string `json:"dist_name,omitempty"`
+	Name           string `json:"os_name"`
+	Arch           string `json:"os_arch,omitempty"`
+	MinRAMGB       int    `json:"os_minram"`
+	DedicatedOnly  bool   `json:"os_dedicated_only"`
+	LimitedSupport bool   `json:"os_limited_support,omitempty"`
+}
+
+// UnmarshalJSON accepts the documented string-encoded numeric and boolean
+// fields ("147", "0"/"1") as well as real JSON numbers and booleans.
+func (o *OperatingSystem) UnmarshalJSON(data []byte) error {
+	type rawOS struct {
+		OSID           any    `json:"os_id"`
+		DistID         any    `json:"dist_id"`
+		DistName       string `json:"dist_name"`
+		Name           string `json:"os_name"`
+		Arch           string `json:"os_arch"`
+		MinRAMGB       any    `json:"os_minram"`
+		DedicatedOnly  any    `json:"os_dedicated_only"`
+		LimitedSupport any    `json:"os_limited_support"`
+	}
+	var raw rawOS
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	o.OSID = int(parseInt64Field(raw.OSID))
+	o.DistID = int(parseInt64Field(raw.DistID))
+	o.DistName = raw.DistName
+	o.Name = raw.Name
+	o.Arch = raw.Arch
+	o.MinRAMGB = int(parseInt64Field(raw.MinRAMGB))
+	if b, ok := parseBoolFieldStrict(raw.DedicatedOnly); ok {
+		o.DedicatedOnly = b
+	}
+	if b, ok := parseBoolFieldStrict(raw.LimitedSupport); ok {
+		o.LimitedSupport = b
+	}
+	return nil
+}
+
+// CompatibleWith reports whether the image can be installed on the plan using
+// only documented requirements: os_dedicated_only needs a dedicated or auction
+// server and os_minram is the minimum memory in GB (0 = none). A plan whose
+// memory or type the catalog did not report therefore rejects an image that
+// states a requirement, which fails closed instead of guessing.
+func (o OperatingSystem) CompatibleWith(plan HourlyPlan) error {
+	if o.OSID <= 0 {
+		return fmt.Errorf("%w: image has no os_id", ErrOSNotAvailable)
+	}
+	if o.DedicatedOnly && !plan.IsDedicated() {
+		return fmt.Errorf("%w: image %d is dedicated-only but plan %d is not a dedicated server", ErrOSNotAvailable, o.OSID, plan.ProductID)
+	}
+	if ramGB := plan.RAMMB / 1024; o.MinRAMGB > 0 && ramGB < o.MinRAMGB {
+		return fmt.Errorf("%w: image %d needs %d GB RAM but plan %d has %d GB", ErrOSNotAvailable, o.OSID, o.MinRAMGB, plan.ProductID, ramGB)
+	}
+	return nil
+}
+
+// IsDedicated reports whether the plan is a dedicated or auction server, which
+// is what os_dedicated_only images require.
+func (p HourlyPlan) IsDedicated() bool {
+	switch strings.ToLower(strings.TrimSpace(p.Type)) {
+	case "dedicated", "auction", "baremetal":
+		return true
+	default:
+		return false
+	}
+}
+
+// HasStock reports whether the plan can be deployed at all right now: either the
+// provider reports it in stock or documents it as built to order.
+func (p HourlyPlan) HasStock() bool {
+	return p.InStock || p.BuiltToOrder
+}
+
+// InstallableImages returns the images that can actually be installed on this
+// plan, in the order the provider listed them. The provider catalog has no
+// per-product image list, so the supported set is the provider's documented
+// image catalog narrowed by each image's documented requirements.
+func (p HourlyPlan) InstallableImages(catalog []OperatingSystem) []OperatingSystem {
+	options := make([]OperatingSystem, 0, len(catalog))
+	for _, os := range catalog {
+		if os.CompatibleWith(p) == nil {
+			options = append(options, os)
+		}
+	}
+	return options
 }
 
 // Price represents billing details for a product.
@@ -125,19 +244,23 @@ type Price struct {
 
 // Product represents a server product in the catalog.
 type Product struct {
-	ID          int                `json:"id"`
-	PID         int                `json:"pid"`
-	Name        string             `json:"name"`
-	Description string             `json:"description,omitempty"`
-	CPUCores    int                `json:"cpu_cores"`
-	RAMMB       int                `json:"ram_mb"`
-	DiskGB      int                `json:"disk_gb"`
-	BandwidthTB float64            `json:"bandwidth_tb,omitempty"`
-	InStock     bool               `json:"in_stock"`
-	Prices      []Price            `json:"prices,omitempty"`
-	Regions     []Region           `json:"regions,omitempty"`
-	OSList      []OS               `json:"os_list,omitempty"`
-	Eligibility CatalogEligibility `json:"eligibility,omitempty"`
+	ID           int                `json:"id"`
+	PID          int                `json:"pid"`
+	Name         string             `json:"name"`
+	Description  string             `json:"description,omitempty"`
+	Type         string             `json:"type,omitempty"`
+	CPUCores     int                `json:"cpu_cores"`
+	RAMMB        int                `json:"ram_mb"`
+	DiskGB       int                `json:"disk_gb"`
+	BandwidthTB  float64            `json:"bandwidth_tb,omitempty"`
+	InStock      bool               `json:"in_stock"`
+	BuiltToOrder bool               `json:"built_to_order,omitempty"`
+	WaitlistOK   bool               `json:"waitlist_eligible,omitempty"`
+	Prices       []Price            `json:"prices,omitempty"`
+	Regions      []Region           `json:"regions,omitempty"`
+	Datacenters  []Datacenter       `json:"datacenters,omitempty"`
+	OSList       []OS               `json:"os_list,omitempty"`
+	Eligibility  CatalogEligibility `json:"eligibility,omitempty"`
 }
 
 // GetID returns the primary product identifier (PID or ID).
@@ -149,22 +272,42 @@ func (p Product) GetID() int {
 }
 
 // HourlyPlan represents an hourly VPS plan formatted for admin inspection.
+//
+// Type, BuiltToOrder and Datacenters are documented catalog facts
+// (type, built_to_order, dc_ids/dc_stock). They exist so the portal can offer
+// only selections the provider will actually accept, and so the handler can
+// revalidate them instead of assuming them.
 type HourlyPlan struct {
 	ProductID      int                `json:"product_id"`
 	Name           string             `json:"name"`
 	Description    string             `json:"description,omitempty"`
+	Type           string             `json:"type,omitempty"`
 	CPUCores       int                `json:"cpu_cores"`
 	RAMMB          int                `json:"ram_mb"`
 	DiskGB         int                `json:"disk_gb"`
 	BandwidthTB    float64            `json:"bandwidth_tb,omitempty"`
 	InStock        bool               `json:"in_stock"`
+	BuiltToOrder   bool               `json:"built_to_order,omitempty"`
+	WaitlistOK     bool               `json:"waitlist_eligible,omitempty"`
 	PriceID        int                `json:"price_id"`
 	Currency       string             `json:"currency"`
 	HourlyRateNOK  float64            `json:"hourly_rate_nok"`
 	MonthlyCeiling float64            `json:"monthly_ceiling_nok"`
 	Regions        []Region           `json:"regions"`
-	OSList         []OS               `json:"os_list"`
+	Datacenters    []Datacenter       `json:"datacenters,omitempty"`
+	OSOptions      []OperatingSystem  `json:"os_options"`
 	Eligibility    CatalogEligibility `json:"eligibility,omitempty"`
+}
+
+// Datacenter is a placement location the plan documents, with its own stock
+// fact. Only datacenters referenced by the plan's dc_ids are listed.
+type Datacenter struct {
+	ID       int    `json:"id"`
+	Name     string `json:"name"`
+	RegionID int    `json:"region_id"`
+	Location string `json:"location,omitempty"`
+	Country  string `json:"country,omitempty"`
+	InStock  bool   `json:"in_stock"`
 }
 
 // CatalogEligibility represents account deployment eligibility returned in the catalog.
@@ -235,27 +378,48 @@ type OrderRequest struct {
 	OSID          int    `json:"os_id"`
 	BillingPeriod string `json:"billing_period"`
 	Quantity      int    `json:"quantity"`
+
+	// SSHKeys carries the numeric account key ids to authorize for root on the
+	// ordered server, from GET /account. The provider documents that ids which
+	// are not on the account are IGNORED, so an unverified id buys a server the
+	// operator cannot log into. Callers must prove the association before
+	// ordering. Omitted entirely when empty, so an order that authorizes no key
+	// serializes exactly as before.
+	SSHKeys []int64 `json:"ssh_keys,omitempty"`
 }
 
 // OrderResponse represents the response when an order is submitted.
+//
+// RateHourly, MonthlyCap and Currency are the per-order price contract the
+// provider returns at order time. They are the only authoritative record of
+// what an existing hourly reservation costs, so they are decoded here and
+// persisted by the caller; the provider does not expose price_id on any later
+// read.
 type OrderResponse struct {
 	OrderID   string `json:"order_id"`
 	ServerID  int64  `json:"server_id,omitempty"`
 	Status    string `json:"status"`
 	Message   string `json:"message,omitempty"`
 	CreatedAt string `json:"created_at,omitempty"`
+
+	RateHourly float64 `json:"rate_hourly,omitempty"`
+	MonthlyCap float64 `json:"monthly_cap,omitempty"`
+	Currency   string  `json:"currency,omitempty"`
 }
 
 // UnmarshalJSON supports string or integer order_id and server_id, and handles {data: {order_ids: [...]}}.
 func (o *OrderResponse) UnmarshalJSON(data []byte) error {
 	type rawOrder struct {
-		OrderID   any    `json:"order_id"`
-		ServerID  any    `json:"server_id"`
-		Status    string `json:"status"`
-		Message   string `json:"message"`
-		CreatedAt string `json:"created_at"`
-		Success   *bool  `json:"success"`
-		OrderIDs  []any  `json:"order_ids"`
+		OrderID    any     `json:"order_id"`
+		ServerID   any     `json:"server_id"`
+		Status     string  `json:"status"`
+		Message    string  `json:"message"`
+		CreatedAt  string  `json:"created_at"`
+		Success    *bool   `json:"success"`
+		OrderIDs   []any   `json:"order_ids"`
+		RateHourly float64 `json:"rate_hourly"`
+		MonthlyCap float64 `json:"monthly_cap"`
+		Currency   string  `json:"currency"`
 	}
 	type envelope struct {
 		Data rawOrder `json:"data"`
@@ -272,6 +436,9 @@ func (o *OrderResponse) UnmarshalJSON(data []byte) error {
 	o.Status = raw.Status
 	o.Message = raw.Message
 	o.CreatedAt = raw.CreatedAt
+	o.RateHourly = raw.RateHourly
+	o.MonthlyCap = raw.MonthlyCap
+	o.Currency = raw.Currency
 
 	if len(raw.OrderIDs) > 0 {
 		o.OrderID = parseStringField(raw.OrderIDs[0])
