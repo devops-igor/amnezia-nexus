@@ -1029,13 +1029,14 @@ func TestDifferential_ParameterMatrixAndS4Regression(t *testing.T) {
 				t.Fatalf("DialUDP ref: %v", err)
 			}
 			refEcho, err := refClient.ExchangeUDP(refUDP, payload)
+			refReport := referenceUDPExchangeFailureReport(refClient, refServer, err, refEcho, payload)
 			_ = refUDP.Close()
 			_ = refClient.Close()
 			_ = harness.StopReferenceServer(refServer)
 			harness.AssertPortFree(5 * time.Second)
 
 			if err != nil || !bytes.Equal(refEcho, payload) {
-				t.Fatalf("ref ExchangeUDP failed for %s: got %q, err %v", tc.name, refEcho, err)
+				t.Fatalf("ref ExchangeUDP failed for %s: got %q, err %v%s", tc.name, refEcho, err, refReport)
 			}
 
 			// 2. Subject
