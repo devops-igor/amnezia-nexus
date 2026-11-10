@@ -58,6 +58,11 @@ type client struct {
 var _ Client = (*client)(nil)
 
 // NewClient initializes and validates a new Gigahost API client.
+//
+// A client built without an injected HTTPClient/Transport owns a transport of
+// its own (see newOwnedTransport): the standard transport settings with
+// connection reuse disabled. Nothing written here ever reaches
+// http.DefaultTransport or a transport the caller supplied.
 func NewClient(cfg Config) (Client, error) {
 	if err := ValidateAPIKey(cfg.APIKey); err != nil {
 		return nil, err
@@ -77,7 +82,7 @@ func NewClient(cfg Config) (Client, error) {
 		}
 		transport := cfg.Transport
 		if transport == nil {
-			transport = http.DefaultTransport
+			transport = newOwnedTransport()
 		}
 		httpClient = &http.Client{
 			Timeout:   timeout,

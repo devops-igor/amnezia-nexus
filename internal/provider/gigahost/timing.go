@@ -25,6 +25,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -166,12 +167,24 @@ func OperationLabel(method, path string) string {
 	}
 }
 
-// timingRecorder accumulates httptrace phase marks for one call. All fields are
-// written from the same goroutine that owns the request, so no lock is needed;
-// the sink is called after the request completes.
+// timingRecorder accumulates httptrace phase marks for one call.
+//
+// The request goroutine is not the only writer. Under HTTP/2 the transport runs
+// WroteRequest and GotFirstResponseByte from its own stream-write and connection
+// read-loop goroutines, so the mutable record is guarded by mu: every trace
+// callback and the finish-time snapshot take it, which is what orders the
+// callbacks against each other and against finish. The lock is only ever held to
+// copy a few integers — never across the sink call, which may block or panic.
+//
+// finish closes the recorder. One call yields exactly one record, and a callback
+// that arrives afterwards is dropped instead of mutating a record that has
+// already been handed to the sink.
 type timingRecorder struct {
-	start  time.Time
-	timing CallTiming
+	start time.Time
+
+	mu       sync.Mutex
+	timing   CallTiming
+	finished bool
 }
 
 func newTimingRecorder(method, path string) *timingRecorder {
@@ -191,6 +204,9 @@ func newTimingRecorder(method, path string) *timingRecorder {
 }
 
 // elapsedMS returns milliseconds since the call started, clamped at 0.
+//
+// start is written once at construction and never mutated, so reading it needs
+// no lock.
 func (r *timingRecorder) elapsedMS() int64 {
 	delta := time.Since(r.start).Milliseconds()
 	if delta < 0 {
@@ -199,46 +215,70 @@ func (r *timingRecorder) elapsedMS() int64 {
 	return delta
 }
 
-// mark records that a phase completed at the current offset.
-func (r *timingRecorder) mark(phase string) int64 {
+// update applies fn to the accumulated record under the lock. Once finish has
+// closed the record, the update is dropped.
+func (r *timingRecorder) update(fn func(*CallTiming)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.finished {
+		return
+	}
+	fn(&r.timing)
+}
+
+// markPhase records that phase completed now, storing its offset through set
+// when the phase carries one. The phase name and its offset land in the same
+// critical section, so a finished record can never hold one without the other.
+func (r *timingRecorder) markPhase(phase string, set func(*CallTiming, int64)) {
 	at := r.elapsedMS()
-	r.timing.LastPhase = phase
-	return at
+	r.update(func(t *CallTiming) {
+		t.LastPhase = phase
+		if set != nil {
+			set(t, at)
+		}
+	})
 }
 
 // clientTrace builds the httptrace.ClientTrace for this call.
+//
+// Every callback writes through the recorder's locked helpers: the standard
+// library invokes these from whichever goroutine owns the connection, and that
+// is not always the goroutine that started the request.
 func (r *timingRecorder) clientTrace() *httptrace.ClientTrace {
 	return &httptrace.ClientTrace{
 		GetConn: func(string) {
-			r.timing.GetConnMS = r.mark(phaseGetConn)
+			r.markPhase(phaseGetConn, func(t *CallTiming, at int64) { t.GetConnMS = at })
 		},
 		GotConn: func(info httptrace.GotConnInfo) {
-			r.timing.Reused = info.Reused
+			r.update(func(t *CallTiming) { t.Reused = info.Reused })
 		},
 		DNSStart: func(httptrace.DNSStartInfo) {
-			r.mark(phaseDNSStart)
+			r.markPhase(phaseDNSStart, nil)
 		},
 		DNSDone: func(httptrace.DNSDoneInfo) {
-			r.timing.DNSMS = r.mark(phaseDNSDone)
+			r.markPhase(phaseDNSDone, func(t *CallTiming, at int64) { t.DNSMS = at })
 		},
 		ConnectStart: func(string, string) {
-			r.mark(phaseConnectStart)
+			r.markPhase(phaseConnectStart, nil)
 		},
 		ConnectDone: func(string, string, error) {
-			r.timing.ConnectMS = r.mark(phaseConnectDone)
+			r.markPhase(phaseConnectDone, func(t *CallTiming, at int64) { t.ConnectMS = at })
 		},
 		TLSHandshakeStart: func() {
-			r.mark(phaseTLSStart)
+			r.markPhase(phaseTLSStart, nil)
 		},
 		TLSHandshakeDone: func(state tls.ConnectionState, _ error) {
-			r.timing.TLSMS = r.mark(phaseTLSDone)
-			r.timing.Proto = normalizeProto(state)
+			proto := normalizeProto(state)
+			r.markPhase(phaseTLSDone, func(t *CallTiming, at int64) {
+				t.TLSMS = at
+				t.Proto = proto
+			})
 		},
 		WroteRequest: func(httptrace.WroteRequestInfo) {
-			r.timing.RequestWrittenMS = r.mark(phaseRequestWritten)
+			r.markPhase(phaseRequestWritten, func(t *CallTiming, at int64) { t.RequestWrittenMS = at })
 		},
 		GotFirstResponseByte: func() {
-			r.timing.FirstByteMS = r.mark(phaseFirstByte)
+			r.markPhase(phaseFirstByte, func(t *CallTiming, at int64) { t.FirstByteMS = at })
 		},
 	}
 }
@@ -253,18 +293,37 @@ func normalizeProto(state tls.ConnectionState) string {
 
 // finish completes the record with the outcome and hands it to the sink.
 //
-// A panicking sink must never change a purchase outcome, so the call is
-// guarded. A sink failure is the caller's business; it cannot propagate here.
+// The snapshot is taken under the lock and the recorder closed in the same
+// critical section, so exactly one record is produced per call and no late
+// callback can mutate it afterwards. The sink runs after the lock is released:
+// a blocking observer must not stall an in-flight callback, and a panicking one
+// must never change a purchase outcome, so the call is guarded. A sink failure
+// is the caller's business; it cannot propagate here.
 func (r *timingRecorder) finish(ctx context.Context, sink func(CallTiming), status int, err error) {
-	r.timing.TotalMS = r.elapsedMS()
+	total := r.elapsedMS()
+	outcome := classifyOutcome(ctx, status, err)
+
+	r.mu.Lock()
+	if r.finished {
+		// One record per request: a second finish (the error and body-read
+		// paths are exclusive, but the guard keeps that a property of the
+		// recorder rather than of its call sites) must not publish again.
+		r.mu.Unlock()
+		return
+	}
+	r.finished = true
+	r.timing.TotalMS = total
 	r.timing.Status = status
-	r.timing.Outcome = classifyOutcome(ctx, status, err)
+	r.timing.Outcome = outcome
 	if r.timing.Proto == "" {
 		// h1 has no ALPN; report the explicit value rather than "" so an
 		// unnamed protocol is not confused with a failed handshake.
 		r.timing.Proto = "http/1.1"
 	}
-	safeInvoke(sink, r.timing)
+	record := r.timing
+	r.mu.Unlock()
+
+	safeInvoke(sink, record)
 }
 
 // safeInvoke calls the sink with panic containment.
