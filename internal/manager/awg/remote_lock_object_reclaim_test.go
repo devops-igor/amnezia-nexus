@@ -31,7 +31,6 @@ func scratchLock(t *testing.T) (res, lockPath string) {
 	return res, lockPath
 }
 
-// runShell returns the shell's own exit status; a spawn failure is fatal, not success.
 func runShell(t *testing.T, cmd string) (int, string) {
 	t.Helper()
 	out, err := exec.CommandContext(context.Background(), "bash", "-c", cmd).CombinedOutput()
@@ -61,12 +60,21 @@ func staleFile(t *testing.T, path string, age time.Duration) {
 	}
 }
 
+// mustGlob returns glob matches, failing only on a malformed pattern.
+func mustGlob(t *testing.T, pattern string) []string {
+	t.Helper()
+	m, err := filepath.Glob(pattern)
+	if err != nil {
+		t.Fatalf("bad glob %q: %v", pattern, err)
+	}
+	return m
+}
+
 func sq(t *testing.T, s string) string {
 	t.Helper()
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// pauseAt parks the real builder at anchor until the test writes the resume marker.
 func pauseAt(t *testing.T, cmd, anchor, snippet string) string {
 	t.Helper()
 	if !strings.Contains(cmd, anchor) {
@@ -75,8 +83,8 @@ func pauseAt(t *testing.T, cmd, anchor, snippet string) string {
 	return strings.Replace(cmd, anchor, snippet+anchor, 1)
 }
 
-// barrier returns a snippet that parks the builder, a wait for the park, and a resume. The
-// park and the resume are separate so the caller can act in the window between them.
+// barrier parks the builder, waits for the park, and resumes it, so the caller can act in
+// the window between the two.
 func barrier(t *testing.T) (snippet string, waitHit func(), resume func()) {
 	t.Helper()
 	d := t.TempDir()
@@ -271,7 +279,6 @@ func TestRemoteLock_ReclaimPreservesSuccessor(t *testing.T) {
 		if err := os.WriteFile(swap, []byte(script), 0o600); err != nil {
 			t.Fatalf("failed to write swap script: %v", err)
 		}
-		t.Cleanup(func() { _ = os.RemoveAll(swapDir) })
 
 		injected := pauseAt(t, remoteLockAcquireCmd(c.res, "contender"), `mv "`+c.pathVar+`" "$os_ren"`, ". "+swap+"; ")
 		if code, out := runShell(t, bounded(injected)); code == 0 {
@@ -302,6 +309,56 @@ func TestRemoteLock_StagingReplacementRefused(t *testing.T) {
 	if _, err := os.Lstat(lockPath); !os.IsNotExist(err) {
 		t.Fatalf("foreign staging object was promoted onto the canonical lock path")
 	}
+}
+
+// TestRemoteLock_CanonicalSuccessorAfterReclaim covers the post-rename case the others do not:
+// the reclaim rename already landed and a live successor takes the canonical path before
+// revalidation. Its token and content stay canonical, it is never nested or deleted, and the
+// contender never becomes a second holder.
+func TestRemoteLock_CanonicalSuccessorAfterReclaim(t *testing.T) {
+	bothPaths(t, func(t *testing.T, c pathCase) {
+		staleFile(t, c.target, time.Hour)
+		successorTok := "post-reclaim-successor"
+		// Our reclaim rename already landed, so the canonical path is free for a live successor.
+		ownerLine := successorTok + " 1234 " + c.label
+		script := fmt.Sprintf("mkdir %s; printf '%s\\n' > %s/owner; touch -m -c %s",
+			sq(t, c.target), ownerLine, sq(t, c.target), sq(t, c.target))
+		swap := filepath.Join(t.TempDir(), "post-rename.sh")
+		if err := os.WriteFile(swap, []byte(script), 0o600); err != nil {
+			t.Fatalf("failed to write successor script: %v", err)
+		}
+
+		// Select the branch by its own path variable: `then os_ren_ino=$(stat` is identical in
+		// both, gate first. Splice in after the completed `mv ...; then`, i.e. post-rename.
+		old := `mv "` + c.pathVar + `" "$os_ren" 2>/dev/null; then os_ren_ino=$(stat`
+		cmd := remoteLockAcquireCmd(c.res, "contender")
+		if !strings.Contains(cmd, old) {
+			t.Fatalf("%s: post-rename revalidation anchor missing", c.label)
+		}
+		injected := strings.Replace(cmd, old,
+			`mv "`+c.pathVar+`" "$os_ren" 2>/dev/null; then . `+swap+`; os_ren_ino=$(stat`, 1)
+		code, out := runShell(t, bounded(injected))
+
+		// 1. No second successful holder: the contender must not acquire.
+		if code == 0 {
+			t.Fatalf("%s: contender became a second holder over a live successor: out=%s", c.label, out)
+		}
+		// 2. Exact successor token and content stay canonical.
+		assertLockOwnerEquals(t, c.target, successorTok, c.label+" successor token kept")
+		content, err := os.ReadFile(filepath.Join(c.target, "owner"))
+		if err != nil {
+			t.Fatalf("%s: successor owner file unreadable: %v", c.label, err)
+		}
+		if strings.TrimSpace(string(content)) != successorTok+" 1234 "+c.label {
+			t.Fatalf("%s: successor content altered: %q", c.label, strings.TrimSpace(string(content)))
+		}
+		// 3. Never nested under a staging name and never deleted while canonical.
+		for _, staged := range mustGlob(t, c.target+".objstale.*") {
+			if _, err := os.Lstat(filepath.Join(staged, filepath.Base(c.target))); err == nil {
+				t.Fatalf("%s: successor nested under %s instead of staying canonical", c.label, staged)
+			}
+		}
+	})
 }
 
 // TestRemoteLock_ConcurrentContendersPreserveMutualExclusion repeats acquire/release under
