@@ -114,10 +114,39 @@ func GenerateShortID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// GenerateShortIDPool provisions a pool of 4 to 8 distinct random 8-byte hexadecimal short IDs,
+// plus an optional empty short ID ("") for REALITY clients that do not specify a short ID.
+func GenerateShortIDPool(count int) ([]string, error) {
+	if count < 4 {
+		count = 4
+	}
+	if count > 8 {
+		count = 8
+	}
+
+	seen := make(map[string]bool)
+	pool := make([]string, 0, count+1)
+	for len(pool) < count {
+		sid, err := GenerateShortID()
+		if err != nil {
+			return nil, fmt.Errorf("generate short id: %w", err)
+		}
+		if !seen[sid] {
+			seen[sid] = true
+			pool = append(pool, sid)
+		}
+	}
+	pool = append(pool, "")
+	return pool, nil
+}
+
 // RenderXrayConfig generates a production-hardened xray.json configuration.
+//
+// Exactly one REALITY inbound is emitted, on portPrimary. The former auxiliary
+// high-port mirror is gone: a REALITY fallback on a non-standard port leaks
+// cryptographic proof of proxying to any active scanner that reaches it.
 func RenderXrayConfig(
 	portPrimary int,
-	portHigh int,
 	sni string,
 	dest string,
 	realityPrivKey string,
@@ -127,11 +156,11 @@ func RenderXrayConfig(
 	if portPrimary <= 0 {
 		portPrimary = 443
 	}
-	if portHigh <= 0 {
-		portHigh = 54321
-	}
 	if sni == "" {
-		sni = "gateway.icloud.com"
+		sni = DefaultDecoyDomain
+	}
+	if IsBlacklistedDecoyDomain(sni) {
+		return nil, fmt.Errorf("decoy domain %q is blacklisted as a known censor target", sni)
 	}
 	if dest == "" {
 		dest = net.JoinHostPort(sni, "443")
@@ -139,21 +168,11 @@ func RenderXrayConfig(
 		dest = net.JoinHostPort(dest, "443")
 	}
 	if len(shortIDs) == 0 {
-		sid, err := GenerateShortID()
+		pool, err := GenerateShortIDPool(8)
 		if err != nil {
 			return nil, err
 		}
-		shortIDs = []string{sid}
-	}
-
-	// Prepare vision clients
-	visionClients := make([]XrayClient, len(clients))
-	for i, c := range clients {
-		visionClients[i] = XrayClient{
-			ID:    c.ID,
-			Email: c.Email,
-			Flow:  "xtls-rprx-vision",
-		}
+		shortIDs = pool
 	}
 
 	cfg := XrayConfig{
@@ -166,26 +185,6 @@ func RenderXrayConfig(
 				Protocol: "vless",
 				Settings: XrayInboundSettings{
 					Clients:    clients,
-					Decryption: "none",
-				},
-				StreamSettings: XrayStreamSettings{
-					Network:  "tcp",
-					Security: "reality",
-					RealitySettings: XrayRealitySettings{
-						Show:        false,
-						Dest:        dest,
-						Xver:        0,
-						ServerNames: []string{sni},
-						PrivateKey:  realityPrivKey,
-						ShortIDs:    shortIDs,
-					},
-				},
-			},
-			{
-				Port:     portHigh,
-				Protocol: "vless",
-				Settings: XrayInboundSettings{
-					Clients:    visionClients,
 					Decryption: "none",
 				},
 				StreamSettings: XrayStreamSettings{
@@ -244,6 +243,17 @@ func ParseXrayConfig(data []byte) (*XrayConfig, error) {
 }
 
 // BuildVLESSURI constructs a standard client vless:// URI.
+//
+// muxOpts is retained as an explicit parameter so callers do not silently drop an
+// operator's mux preference, but no "mux" query parameter is emitted. VLESS + XTLS
+// Vision (the flow every client of this manager uses) rejects TCP mux.cool: xray
+// answers the mux handshake with "common/mux: unexpected network TCP" and the tunnel
+// passes no traffic. There is also no interoperable share-link spelling for mux —
+// sing-box's own VLESS URL parser set is (protocol, max_connections, min_streams,
+// max_streams) and clients that model it reject "mux" outright. Emitting it would
+// therefore publish a link that either fails to import or breaks the tunnel, so the
+// preference stays in server metadata and out of the URI until a contract-backed
+// transport exists.
 func BuildVLESSURI(
 	host string,
 	port int,
@@ -253,6 +263,7 @@ func BuildVLESSURI(
 	pbk string,
 	sid string,
 	flow string,
+	muxOpts ...bool,
 ) (string, error) {
 	if host == "" {
 		return "", errors.New("host cannot be empty")
@@ -264,8 +275,10 @@ func BuildVLESSURI(
 		return "", errors.New("clientID cannot be empty")
 	}
 	if sni == "" {
-		sni = "gateway.icloud.com"
+		sni = DefaultDecoyDomain
 	}
+	// muxOpts[0] is intentionally not serialized; see the doc comment above.
+	_ = len(muxOpts) > 0 && muxOpts[0]
 
 	query := url.Values{}
 	query.Set("security", "reality")

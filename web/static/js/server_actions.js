@@ -137,7 +137,7 @@ function openInstallModal(proto) {
         portLabel.textContent = _('port') + ' (TCP)';
         portInput.value = '443';
         portInput.disabled = false;
-        portHint.textContent = 'Port 443 TCP (REALITY) + 54321 (Vision)';
+        portHint.textContent = _('port_vless_hint');
         if (vlessOpts) vlessOpts.style.display = 'block';
     } else if (proto === 'naive') {
         portLabel.textContent = _('port') + ' (TCP)';
@@ -204,7 +204,7 @@ async function installProtocol() {
             const vlessFlowEl = document.getElementById('installVlessFlow');
             params.vless_options = {
                 port: port,
-                server_name: vlessSniEl ? vlessSniEl.value.trim() : 'gateway.icloud.com',
+                server_name: vlessSniEl ? vlessSniEl.value.trim() : 'www.microsoft.com',
                 flow: vlessFlowEl ? vlessFlowEl.value : 'xtls-rprx-vision'
             };
         }

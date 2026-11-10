@@ -413,7 +413,7 @@ func auditR14Launch(t *testing.T, traffic VLESSProbeFunc, handshake VLESSProbeFu
 		t.Fatal(err)
 	}
 	clients := []XrayClient{{ID: "b2c3d4e5-f6a1-4b2c-9d3e-4f5a6b7c8d9e", Flow: "", Email: "audit@example.com"}}
-	cfg, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, clients)
+	cfg, err := RenderXrayConfig(8443, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, clients)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -28,7 +28,7 @@ func TestXrayManagerReinstallPreservesEmptyFirstShortIDs(t *testing.T) {
 		t.Fatalf("GenerateRealityKeypair: %v", err)
 	}
 	want := []string{"", "aabb"}
-	config, err := RenderXrayConfig(443, 54321, "gateway.icloud.com", "", privateKey, want, []XrayClient{})
+	config, err := RenderXrayConfig(443, "www.microsoft.com", "", privateKey, want, []XrayClient{})
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestXrayManagerProfileSwitchPreservesCustomPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateRealityKeypair: %v", err)
 	}
-	config, err := RenderXrayConfig(8443, 54321, "gateway.icloud.com", "", privateKey, []string{"0123456789abcdef"}, []XrayClient{})
+	config, err := RenderXrayConfig(8443, "www.microsoft.com", "", privateKey, []string{"0123456789abcdef"}, []XrayClient{})
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestXrayManagerUnprofiledExistingInstallation_ResolvesModernPQ(t *testing.T
 	if err != nil {
 		t.Fatalf("GenerateRealityKeypair: %v", err)
 	}
-	config, err := RenderXrayConfig(443, 54321, "gateway.icloud.com", "", privateKey, []string{"0123456789abcdef"}, []XrayClient{})
+	config, err := RenderXrayConfig(443, "www.microsoft.com", "", privateKey, []string{"0123456789abcdef"}, []XrayClient{})
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestXrayManagerLaunchContainer_RollbackOnFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateRealityKeypair: %v", err)
 	}
-	config, err := RenderXrayConfig(443, 54321, "gateway.icloud.com", "", privateKey, []string{"0123456789abcdef"}, []XrayClient{})
+	config, err := RenderXrayConfig(443, "www.microsoft.com", "", privateKey, []string{"0123456789abcdef"}, []XrayClient{})
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -267,7 +267,7 @@ func TestXrayManagerLaunchContainer_RollbackRestoresPreviousConfig(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	initialConfig, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
+	initialConfig, err := RenderXrayConfig(8443, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
 		{ID: "e8512bce-e575-4805-a678-1d64c033e83e", Flow: "xtls-rprx-vision", Email: "retained"},
 	})
 	if err != nil {
@@ -332,7 +332,7 @@ func TestXrayManagerInstall_ImagePullFailurePreservesConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	initialConfig, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
+	initialConfig, err := RenderXrayConfig(8443, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
 		{ID: "e8512bce-e575-4805-a678-1d64c033e83e", Flow: "xtls-rprx-vision", Email: "retained"},
 	})
 	if err != nil {
@@ -409,7 +409,7 @@ func TestXrayManagerLaunchContainer_DelayedStartupFailureRollback(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	initialConfig, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
+	initialConfig, err := RenderXrayConfig(8443, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
 		{ID: "e8512bce-e575-4805-a678-1d64c033e83e", Flow: "xtls-rprx-vision", Email: "retained"},
 	})
 	if err != nil {
@@ -491,7 +491,7 @@ func TestXrayManagerLaunchContainer_FailedHandshakeRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	initialConfig, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
+	initialConfig, err := RenderXrayConfig(8443, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
 		{ID: "e8512bce-e575-4805-a678-1d64c033e83e", Flow: "xtls-rprx-vision", Email: "retained"},
 	})
 	if err != nil {
@@ -575,7 +575,7 @@ func TestXrayManager_DefaultConstructor_AuthenticatesReadinessAndRollsBackOnFail
 	if err != nil {
 		t.Fatal(err)
 	}
-	initialConfig, err := RenderXrayConfig(closedPort, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
+	initialConfig, err := RenderXrayConfig(closedPort, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
 		{ID: "e8512bce-e575-4805-a678-1d64c033e83e", Flow: "xtls-rprx-vision", Email: "retained"},
 	})
 	if err != nil {
@@ -662,7 +662,7 @@ func TestXrayManager_ProbeParams_ForwardsEngineProfile(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			initialConfig, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
+			initialConfig, err := RenderXrayConfig(8443, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{
 				{ID: "a1b2c3d4-e5f6-4a1b-8c2d-3e4f5a6b7c8d", Flow: "xtls-rprx-vision", Email: "user1"},
 			})
 			if err != nil {
@@ -771,7 +771,7 @@ func setupInitialXrayConfig(t *testing.T, clientID string) []byte {
 	if clientID != "" {
 		cls = []XrayClient{{ID: clientID, Flow: "xtls-rprx-vision", Email: "retained"}}
 	}
-	cfg, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, cls)
+	cfg, err := RenderXrayConfig(8443, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, cls)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -489,7 +490,7 @@ func TestXrayManager_UpgradeWithExistingClient_EmptyFlowProbedWithEmptyFlow(t *t
 	}
 	// Existing client configured with empty Flow ("")
 	cls := []XrayClient{{ID: clientUUID, Flow: "", Email: "plain-vless-client"}}
-	cfg, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, cls)
+	cfg, err := RenderXrayConfig(8443, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, cls)
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -557,7 +558,7 @@ func TestXrayManager_FlowConversion_PlainToVision(t *testing.T) {
 	}
 	// 1. Existing client configured with empty Flow ("")
 	cls := []XrayClient{{ID: clientUUID, Flow: "", Email: "plain-vless-client"}}
-	cfg, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, cls)
+	cfg, err := RenderXrayConfig(8443, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, cls)
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -633,7 +634,7 @@ func TestXrayManager_FlowConversion_VisionToPlain(t *testing.T) {
 	}
 	// 1. Existing client configured with Vision Flow ("xtls-rprx-vision")
 	cls := []XrayClient{{ID: clientUUID, Flow: "xtls-rprx-vision", Email: "vision-vless-client"}}
-	cfg, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, cls)
+	cfg, err := RenderXrayConfig(8443, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, cls)
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -711,7 +712,7 @@ func TestXrayManager_ProfileSwitch_OmittedPortPreservesExistingInboundPort(t *te
 		t.Fatalf("GenerateRealityKeypair: %v", err)
 	}
 	// Remote Xray inbound configuration is on port 8443
-	cfg, err := RenderXrayConfig(8443, 54321, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{})
+	cfg, err := RenderXrayConfig(8443, "example.com", "example.com:443", key, []string{"0123456789abcdef"}, []XrayClient{})
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -758,7 +759,18 @@ func TestXrayManager_ProfileSwitch_OmittedPortPreservesExistingInboundPort(t *te
 	}
 }
 
+// stubDecoyResolution keeps install-path tests hermetic: decoy validation performs a real
+// DNS lookup, which must not be depended on in unit tests. Any hostname resolves to a
+// Microsoft (AS8075, multi-region CDN) address so geo/ASN alignment always passes.
+func stubDecoyResolution(t *testing.T) {
+	t.Helper()
+	withLookupIP(t, func(ctx context.Context, network, host string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("13.107.4.50")}, nil
+	})
+}
+
 func TestXrayManager_H2OnlyDestination_NoRollback(t *testing.T) {
+	stubDecoyResolution(t)
 	mockSSH := newMockXraySSHClient()
 	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
 
@@ -768,7 +780,7 @@ func TestXrayManager_H2OnlyDestination_NoRollback(t *testing.T) {
 		t.Fatalf("GenerateRealityKeypair: %v", err)
 	}
 	cls := []XrayClient{{ID: clientUUID, Flow: "xtls-rprx-vision", Email: "h2user@example.com"}}
-	cfg, err := RenderXrayConfig(8443, 54321, "h2only-decoy.com", "h2only-decoy.com:443", key, []string{"0123456789abcdef"}, cls)
+	cfg, err := RenderXrayConfig(8443, "h2only-decoy.com", "h2only-decoy.com:443", key, []string{"0123456789abcdef"}, cls)
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -819,6 +831,7 @@ func TestXrayManager_H2OnlyDestination_NoRollback(t *testing.T) {
 }
 
 func TestXrayManager_ExternalDestinationError_NoRollback(t *testing.T) {
+	stubDecoyResolution(t)
 	mockSSH := newMockXraySSHClient()
 	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
 
@@ -828,7 +841,7 @@ func TestXrayManager_ExternalDestinationError_NoRollback(t *testing.T) {
 		t.Fatalf("GenerateRealityKeypair: %v", err)
 	}
 	cls := []XrayClient{{ID: clientUUID, Flow: "xtls-rprx-vision", Email: "extuser@example.com"}}
-	cfg, err := RenderXrayConfig(8443, 54321, "external-target.com", "external-target.com:443", key, []string{"0123456789abcdef"}, cls)
+	cfg, err := RenderXrayConfig(8443, "external-target.com", "external-target.com:443", key, []string{"0123456789abcdef"}, cls)
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
@@ -872,6 +885,7 @@ func TestXrayManager_ExternalDestinationError_NoRollback(t *testing.T) {
 }
 
 func TestXrayManager_InternalVLESSFailure_TriggersRollback(t *testing.T) {
+	stubDecoyResolution(t)
 	mockSSH := newMockXraySSHClient()
 	mgr := NewXrayManagerWithServerLocks(&mockXrayPool{client: mockSSH}, awg.NewServerLockRegistry())
 
@@ -881,7 +895,7 @@ func TestXrayManager_InternalVLESSFailure_TriggersRollback(t *testing.T) {
 		t.Fatalf("GenerateRealityKeypair: %v", err)
 	}
 	cls := []XrayClient{{ID: clientUUID, Flow: "xtls-rprx-vision", Email: "failuser@example.com"}}
-	cfg, err := RenderXrayConfig(8443, 54321, "fail-target.com", "fail-target.com:443", key, []string{"0123456789abcdef"}, cls)
+	cfg, err := RenderXrayConfig(8443, "fail-target.com", "fail-target.com:443", key, []string{"0123456789abcdef"}, cls)
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}

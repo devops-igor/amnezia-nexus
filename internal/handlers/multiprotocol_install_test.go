@@ -34,7 +34,7 @@ func (m *captureMockProtocolManager) Install(ctx context.Context, server *models
 		"installed":   true,
 		"public_key":  "pubkey123",
 		"short_id":    "shortid123",
-		"server_name": "gateway.icloud.com",
+		"server_name": "www.microsoft.com",
 		"flow":        "xtls-rprx-vision",
 	}
 	return nil
@@ -93,7 +93,7 @@ func TestInstallProtocolHandler_VLESSAndNaiveForwarding(t *testing.T) {
 		Port:     "443",
 		VLESSOptions: &models.VLESSInstallOptions{
 			Port:       "443",
-			ServerName: "gateway.icloud.com",
+			ServerName: "www.microsoft.com",
 			Flow:       "xtls-rprx-vision",
 		},
 	}
@@ -113,7 +113,7 @@ func TestInstallProtocolHandler_VLESSAndNaiveForwarding(t *testing.T) {
 		t.Fatalf("expected vlessMock to capture install params")
 	}
 	vo, ok := vlessMock.capturedParams["vless_options"].(*models.VLESSInstallOptions)
-	if !ok || vo == nil || vo.ServerName != "gateway.icloud.com" {
+	if !ok || vo == nil || vo.ServerName != "www.microsoft.com" {
 		t.Errorf("vless_options not forwarded correctly: %+v", vlessMock.capturedParams["vless_options"])
 	}
 
@@ -359,7 +359,7 @@ func TestInstallProtocolHandler_PreservesProtocolMetadata(t *testing.T) {
 		Port:     "443",
 		VLESSOptions: &models.VLESSInstallOptions{
 			Port:       "443",
-			ServerName: "gateway.icloud.com",
+			ServerName: "www.microsoft.com",
 			Flow:       "xtls-rprx-vision",
 		},
 	}
@@ -396,8 +396,8 @@ func TestInstallProtocolHandler_PreservesProtocolMetadata(t *testing.T) {
 	if pMap["short_id"] != "shortid123" {
 		t.Errorf("expected short_id: shortid123, got %v", pMap["short_id"])
 	}
-	if pMap["server_name"] != "gateway.icloud.com" {
-		t.Errorf("expected server_name: gateway.icloud.com, got %v", pMap["server_name"])
+	if pMap["server_name"] != "www.microsoft.com" {
+		t.Errorf("expected server_name: www.microsoft.com, got %v", pMap["server_name"])
 	}
 }
 

@@ -41,7 +41,7 @@ func setupVLESSPipelineTestRouter(t *testing.T) (*chi.Mux, *Handlers, map[string
 	if err != nil {
 		t.Fatalf("GenerateRealityKeypair: %v", err)
 	}
-	doc, err := xray.RenderXrayConfig(443, 54321, "example.com", "example.com:443", priv, []string{"0123456789abcdef"}, nil)
+	doc, err := xray.RenderXrayConfig(443, "example.com", "example.com:443", priv, []string{"0123456789abcdef"}, nil)
 	if err != nil {
 		t.Fatalf("RenderXrayConfig: %v", err)
 	}
