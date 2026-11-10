@@ -194,6 +194,95 @@ func (b *safeBuffer) Len() int {
 	return b.buf.Len()
 }
 
+// caddyStartupBudget is the fixture's whole startup allowance.
+const caddyStartupBudget = 15 * time.Second
+
+// awaitKnownSiteTLS returns nil once one handshake on the configured site (known SNI)
+// completes, i.e. once its certificate is cached; the listener opens before that, so a
+// TCP accept is not TLS readiness. The budget becomes one deadline every attempt and
+// wait inherits, so an exhausted budget or cancelled caller fails without dialling.
+func awaitKnownSiteTLS(ctx context.Context, addr, site string, budget time.Duration) error {
+	if budget <= 0 {
+		return fmt.Errorf("no startup budget left for known-site TLS readiness of %q", site)
+	}
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	// InsecureSkipVerify accepts the fixture's internal CA, as the assertions do.
+	dialer := &tls.Dialer{Config: &tls.Config{ServerName: site, InsecureSkipVerify: true}}
+	var lastErr error
+	for wait := 10 * time.Millisecond; ; wait = min(2*wait, 100*time.Millisecond) {
+		// Refuses a cancelled context, carries the handshake, closes the raw conn on failure.
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			return conn.Close()
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return lastErr
+		case <-time.After(wait):
+		}
+	}
+}
+
+// tlsStallPeer listens and never accepts: a connect completes in the kernel backlog and
+// is never answered. It reports whether one was queued.
+func tlsStallPeer(t *testing.T) (advertise string, dialed func() bool) {
+	t.Helper()
+	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("failed to open stall listener: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	return ln.Addr().String(), func() bool {
+		_ = ln.SetDeadline(time.Now().Add(100 * time.Millisecond))
+		conn, err := ln.Accept()
+		if err != nil {
+			return false
+		}
+		return conn.Close() == nil
+	}
+}
+
+// TestKnownSiteTLSReadiness_Controls pins the gate's outcomes.
+func TestKnownSiteTLSReadiness_Controls(t *testing.T) {
+	ready := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer ready.Close()
+	if err := awaitKnownSiteTLS(context.Background(), ready.Listener.Addr().String(), "localhost", 5*time.Second); err != nil {
+		t.Fatalf("gate rejected a ready TLS endpoint: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		budget    time.Duration
+		cancelled bool
+		wantDial  bool
+	}{
+		// The first two must not reach the peer; the third must end inside 300ms.
+		{"exhausted budget", 0, false, false},
+		{"cancelled caller", 5 * time.Second, true, false},
+		{"stalled TLS", 300 * time.Millisecond, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, dialed := tlsStallPeer(t)
+			ctx := context.Background()
+			if tc.cancelled {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			start := time.Now()
+			err := awaitKnownSiteTLS(ctx, addr, "localhost", tc.budget)
+			if elapsed := time.Since(start); err == nil || elapsed > tc.budget+250*time.Millisecond {
+				t.Fatalf("gate did not honour a %s contract: err=%v after %s", tc.budget, err, elapsed)
+			}
+			if got := dialed(); got != tc.wantDial {
+				t.Fatalf("dialled=%t, want %t", got, tc.wantDial)
+			}
+		})
+	}
+}
+
 // TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel exercises the four mandatory
 // runtime behaviors of the hardened Caddy deployment in Issue #684:
 // 1. Caddy configuration validation passes for authenticated configurations.
@@ -250,8 +339,12 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 	}
 	_ = tmp.Close()
 
-	// 1. Validate configuration before launching
+	// 1. Validate in the fixture's own Caddy storage: no host CA, no cached cert.
+	fixtureHome := t.TempDir()
+	env := append(os.Environ(), "TRUST_STORES=none",
+		"XDG_DATA_HOME="+fixtureHome, "XDG_CONFIG_HOME="+filepath.Join(fixtureHome, "config"))
 	valCmd := exec.Command(caddyBin, "validate", "--adapter", "caddyfile", "--config", tmpPath)
+	valCmd.Env = env
 	if valOut, err := valCmd.CombinedOutput(); err != nil {
 		t.Fatalf("pre-run caddy validate failed: %v\nOutput: %s", err, string(valOut))
 	}
@@ -261,7 +354,7 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, caddyBin, "run", "--adapter", "caddyfile", "--config", tmpPath)
-	cmd.Env = append(os.Environ(), "TRUST_STORES=none")
+	cmd.Env = env
 	var stderrBuf safeBuffer
 	cmd.Stderr = &stderrBuf
 
@@ -311,20 +404,12 @@ func TestCaddyRuntimeSmoke_ProbingDefenseAndProxyTunnel(t *testing.T) {
 	// such as the TCP listener never becoming ready.
 	reportOnFailure(t, "fixture")
 
-	// Wait for Caddy to start listening on proxyPort
+	// A known-site handshake also proves the listener is up: Caddy opens it before the
+	// certificate is cached, so a ClientHello in that window is rejected for every SNI.
+	// The four assertions below are unchanged; none runs before this gate.
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	ready := false
-	for start := time.Now(); time.Since(start) < 15*time.Second; {
-		conn, dialErr := net.DialTimeout("tcp", proxyAddr, 100*time.Millisecond)
-		if dialErr == nil {
-			_ = conn.Close()
-			ready = true
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if !ready {
-		t.Fatalf("caddy failed to listen on %s within 15s. Stderr: %s", proxyAddr, stderrBuf.String())
+	if err := awaitKnownSiteTLS(ctx, proxyAddr, "localhost", caddyStartupBudget); err != nil {
+		t.Fatalf("caddy did not become TLS-ready for the configured site on %s: %v", proxyAddr, err)
 	}
 
 	baseTLSConfig := &tls.Config{

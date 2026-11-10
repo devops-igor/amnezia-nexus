@@ -80,8 +80,16 @@ type HealthProber struct {
 	canaryFailCounts     map[int64]int
 	canarySequence       uint64
 	canaryResults        map[int64]canaryResult
-	autoDisabled         map[int64]bool
-	successCounts        map[int64]int
+	// canarySuccesses records the last accepted inner success per server, bound
+	// to the tunnel generation and the backend device that produced it. It is
+	// the evidence a NEW admission onto a handshake-blocked backend needs; the
+	// status label is not.
+	canarySuccesses map[int64]canarySuccess
+	// nowFn is the injectable time source for evidence freshness. Nil means the
+	// wall clock. Swapped only by SetNowFuncForTest before a fixture reads it.
+	nowFn         func() time.Time
+	autoDisabled  map[int64]bool
+	successCounts map[int64]int
 	// Counter maps use server IDs for the public diagnostics API. This fence
 	// records which tunnel generation owns each server's counters.
 	healthGenerations    map[int64]int64
@@ -277,6 +285,7 @@ func (hp *HealthProber) ResetFailCount(serverID int64) {
 	hp.failCounts[serverID] = 0
 	delete(hp.canaryFailCounts, serverID)
 	delete(hp.canaryResults, serverID)
+	delete(hp.canarySuccesses, serverID)
 	delete(hp.autoDisabled, serverID)
 	delete(hp.successCounts, serverID)
 	hp.recordCurrentGenerationLocked(serverID)
