@@ -6,12 +6,23 @@ package vpn
 // The fixture and helpers live in canary_admission_e2e_test.go.
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
+
+// canaryTestClock is the freshness clock the stale-evidence case steps. The
+// prober reads it from the ingress engine goroutine, not the test goroutine that
+// advances it, so a plain time.Time there is a data race. Nanoseconds since the
+// epoch make each step one atomic store, so a reader sees a coherent instant.
+type canaryTestClock struct{ nanos atomic.Int64 }
+
+func (c *canaryTestClock) now() time.Time          { return time.Unix(0, c.nanos.Load()).UTC() }
+func (c *canaryTestClock) set(t time.Time)         { c.nanos.Store(t.UnixNano()) }
+func (c *canaryTestClock) advance(d time.Duration) { c.set(c.now().Add(d)) }
 
 // TestCanaryAdmission_RefusesWithoutFreshEvidence is the label-only negative
 // control: every blocked-but-unproven backend must still refuse a first
@@ -67,15 +78,18 @@ func TestCanaryAdmission_RefusesWithoutFreshEvidence(t *testing.T) {
 
 	t.Run("stale evidence", func(t *testing.T) {
 		e := newCanaryAdmissionEnv(t)
-		clock := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
-		e.svc.prober.SetNowFuncForTest(func() time.Time { return clock })
+		// Atomic hand-off: the prober reads the clock from the ingress engine
+		// goroutine. The threshold below is unchanged.
+		clock := &canaryTestClock{}
+		clock.set(time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC))
+		e.svc.prober.SetNowFuncForTest(clock.now)
 		t.Cleanup(func() { e.svc.prober.SetNowFuncForTest(nil) })
 		if cur := e.sweepFailingOuter(t); cur.Status != models.TunnelStatusHandshakeBlocked {
 			t.Fatalf("fixture: status = %q", cur.Status)
 		}
 		// Step past the freshness bound derived from the probe cadence.
 		cfg := e.svc.prober.Config()
-		clock = clock.Add(cfg.Interval*2 + cfg.Timeout)
+		clock.advance(cfg.Interval*2 + cfg.Timeout)
 		e.requireRefusedNewAdmission(t, "stale-evidence")
 	})
 
