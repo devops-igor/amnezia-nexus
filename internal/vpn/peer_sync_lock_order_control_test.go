@@ -22,33 +22,27 @@ const (
 	peerSyncDumpMax = 1 << 26
 )
 
-// peerSyncParkedDump reports whether the goroutine dump holds the peer-sync wait
-// frame and whether that dump was complete. runtime.Stack truncates silently at
-// len(buf), and a finished package run parks thousands of goroutines, so a full
-// buffer means the dump was cut, possibly before the goroutine just started.
-// Growing repeats the observation instead of turning the cut into a missed
-// waiter; fixedDump reproduces the pre-growth single-shot buffer.
+// peerSyncParkedDump reports whether the dump holds the peer-sync wait frame and
+// whether the whole dump was observed. runtime.Stack truncates silently at
+// len(buf), so a cut dump cannot show a missing waiter; growth repeats the
+// observation up to peerSyncDumpMax. fixedDump keeps the pre-growth buffer.
 func peerSyncParkedDump(fixedDump bool) (parked, complete bool) {
 	for size := peerSyncDumpInitial; ; size *= 2 {
 		buf := make([]byte, size)
 		n := runtime.Stack(buf, true)
-		if bytes.Contains(buf[:n], peerSyncWaitFrame) {
-			return true, true
-		}
 		if n < len(buf) {
-			return false, true // whole dump examined: waiter really absent
+			return bytes.Contains(buf[:n], peerSyncWaitFrame), true
 		}
 		if fixedDump || size >= peerSyncDumpMax {
-			return false, false // truncated: nothing may be concluded
+			return false, false // cut dump: the waiter is unproven, not absent
 		}
 	}
 }
 
 // peerSyncLockOrderRun holds a real status caller against a real reconciliation
-// owning the peer synchronizer, and reports whether the observer saw the wait,
-// whether its dump was complete, and whether Service.mu stayed free. ballast is
-// the parked-goroutine load, fixedDump the blind single-shot observation, and
-// inverted the defective caller that holds Service.mu across the peer-sync wait.
+// owning the peer synchronizer. ballast is the parked-goroutine load, fixedDump
+// the blind pre-growth observation, inverted the defective caller that holds
+// Service.mu across the peer-sync wait.
 func peerSyncLockOrderRun(t *testing.T, ballast int, fixedDump, inverted bool) (parked, complete, svcFree bool) {
 	t.Helper()
 	if ballast > 0 {
@@ -100,14 +94,26 @@ func peerSyncLockOrderRun(t *testing.T, ballast int, fixedDump, inverted bool) (
 	}()
 	parked, complete = false, true
 	deadline := time.Now().Add(2 * time.Second)
+	// Poll until the wait is seen, the deadline expires, or the observation is
+	// cut: a cut dump cannot become complete by polling again.
 	for time.Now().Before(deadline) && !parked && complete {
 		parked, complete = peerSyncParkedDump(fixedDump)
 		runtime.Gosched()
 	}
-	svcFree = svc.mu.TryLock()
-	if svcFree {
-		svc.mu.Unlock()
-	} else {
+	// Service.mu must be free while the caller waits. Probe it over a bounded
+	// window instead of once: a healthy caller takes its own read lock early,
+	// so a single sample can lose that race, while a real inversion holds the
+	// lock for the whole contention and is never observed free.
+	svcFree = false
+	for probe := time.Now().Add(2 * time.Second); time.Now().Before(probe); {
+		if svc.mu.TryLock() {
+			svc.mu.Unlock()
+			svcFree = true
+			break
+		}
+		runtime.Gosched()
+	}
+	if !svcFree {
 		skipRevoke = true
 	}
 	close(release)
@@ -132,8 +138,8 @@ func peerSyncLockOrderRun(t *testing.T, ballast int, fixedDump, inverted bool) (
 
 // TestPeerSyncLockOrderObserverControls re-runs the lock-order oracle with the
 // observation and the lock order as explicit knobs at controlled goroutine
-// volume: it pins the truncation defect the growing observation removes, and
-// proves the corrected observer still fails for Service.mu ownership.
+// volume: it pins the truncation the growing observation removes, and proves the
+// corrected observer still fails for Service.mu ownership.
 func TestPeerSyncLockOrderObserverControls(t *testing.T) {
 	for _, tc := range []struct {
 		name              string
@@ -142,10 +148,12 @@ func TestPeerSyncLockOrderObserverControls(t *testing.T) {
 		parked, complete  bool
 		svcFree           bool
 	}{
-		// Real load, corrected observer: waiter found, Service.mu free, real revoke done.
+		// Real load, corrected observer: the waiter is found, Service.mu is
+		// free, and the real revoke completed.
 		{"grown sees the real waiter under load", 3000, true, false, true, true, true},
-		// Same load and correct product lock order, blind observer misses the waiter.
-		{"fixed buffer truncates under load", 3000, false, false, false, false, true},
+		// Same load and correct product lock order, blind observer: the 256 KiB
+		// dump is always cut, so a missing waiter here proves nothing.
+		{"fixed buffer leaves the waiter unproven", 3000, false, false, false, false, true},
 		// The corrected observer must still fail for Service.mu ownership.
 		{"inversion negative stays detected", 0, true, true, true, true, false},
 	} {
