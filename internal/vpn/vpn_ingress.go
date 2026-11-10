@@ -401,6 +401,21 @@ func (s *Service) admissibleBlockedCandidateLocked(t *models.BackendTunnel) (*mo
 	if t == nil || !t.Enabled || !strings.EqualFold(t.Status, models.TunnelStatusHandshakeBlocked) {
 		return nil, false
 	}
+	// Durable enrollment quarantine is an INDEPENDENT admission authority, not a
+	// consequence of canary evidence. A backend that is still being qualified is
+	// deliberately enabled and can carry fresh inner-canary evidence while it is
+	// not yet admitted; the ordinary active-only pool selection used to exclude
+	// it through its status alone, and the blocked branch below must not become a
+	// second release point. Fresh canary success withdraws the "blocked" doubt,
+	// never the enrollment quarantine: only the explicit qualification/promotion
+	// transaction (Pool.PromoteTunnelWithEnrollmentRelease) may release that.
+	//
+	// This is the existing enrollment authority and the established lock order:
+	// IsPendingEnrollment is a pure in-memory read under the prober's own lock,
+	// taken after Service.mu exactly like CanaryAdmissible below.
+	if s.prober.IsPendingEnrollment(t.ServerID) {
+		return nil, false
+	}
 	// Read the attached device straight from the map we already hold s.mu for.
 	// Calling Service.GetDevice/HealthProber.GetDevice here would take
 	// s.mu.RLock while this admission holds s.mu.Lock: a self-deadlock.
