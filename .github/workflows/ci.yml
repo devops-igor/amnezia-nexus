@@ -131,6 +131,9 @@ jobs:
       # every feature PR without invoking the destructive DEV lifecycle workflow.
       # The console-log suite spawns real pytest subprocesses, so it proves the
       # report boundary (rendered output, exit status, JUnit XML) on ordinary CI.
+      # The finalizer suite drives the real lifecycle finalize() path against
+      # local stubs (no Docker, SSH, network or provider calls), so the
+      # install-failure retention oracle is proven here too, not only locally.
       - name: Run Offline Diagnostics Privacy Suite
         run: |
           python -m pip install --upgrade pip
@@ -138,6 +141,8 @@ jobs:
           python -m pytest -p no:cacheprovider \
             tests/test_e2e_diagnostics_privacy.py \
             tests/test_e2e_probe_visibility.py \
+            tests/test_e2e_install_failure.py \
+            tests/test_e2e_install_failure_finalizer.py \
             tests/test_e2e_log_privacy.py \
             tests/test_naive_decoy_default_contract.py
 
