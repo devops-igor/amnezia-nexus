@@ -161,11 +161,21 @@ func lockObjectReclaimBranchShell(pathExpr, label string, ttl int) string {
 		`os_ren_now=$(date +%s); ` +
 		`os_ren_mt=$(stat -c %Y "$os_ren" 2>/dev/null || stat -f %m "$os_ren" 2>/dev/null); ` +
 		`case "$os_ren_mt" in ''|*[!0-9]*) os_ren_mt="$os_ren_now" ;; esac; ` +
+		// Ownership-bearing directory at the staging name: either we moved a live successor
+		// that appeared between inspection and mv, or the staging name was replaced. These
+		// states are indistinguishable by type alone, so the owner record decides: a holder
+		// of this protocol keeps its owner fresh, while a dead/planted object does not.
+		// Restore only a fresh-owned directory and never remove it; anything else refuses.
 		`if [ -f "$os_ren" ] && [ ! -L "$os_ren" ] && [ "$os_ren_ino" = "$os_ino" ] && ` +
 		fmt.Sprintf(`[ $((os_ren_now - os_ren_mt)) -ge %d ]; then rm -f "$os_ren"; `, ttl) +
-		`else if [ ! -e ` + pathExpr + ` ] && [ ! -L ` + pathExpr + ` ]; then mv "$os_ren" ` + pathExpr + ` 2>/dev/null; ` +
-		`else echo "concurrent replacement at remote ` + label + ` ` + pathVar + `; refusing to reclaim" >&2; exit 1; fi; ` +
-		`fi; fi; fi; fi; `
+		`elif [ ! -d "$os_ren" ] || [ -L "$os_ren" ] || [ ! -e "$os_ren" ]; then ` +
+		`echo "concurrent replacement at remote ` + label + ` ` + pathVar + `; refusing to reclaim" >&2; exit 1; ` +
+		`else os_ren_own=$(cat "$os_ren/owner" 2>/dev/null); set -- $os_ren_own; os_ren_own_ts="$2"; ` +
+		`case "$os_ren_own_ts" in ''|*[!0-9]*) os_ren_own_ts="$os_ren_now" ;; esac; ` +
+		fmt.Sprintf(`if [ $((os_ren_now - os_ren_own_ts)) -ge %d ] || [ -e `, ttl) + pathExpr + ` ] || [ -L ` + pathExpr + ` ]; then ` +
+		`echo "concurrent replacement at remote ` + label + ` ` + pathVar + `; refusing to reclaim" >&2; exit 1; fi; ` +
+		`mv "$os_ren" ` + pathExpr + ` 2>/dev/null; fi; ` +
+		`fi; fi; fi; `
 }
 
 func remoteLockAcquireCmd(resource any, token string) string {
