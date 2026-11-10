@@ -967,12 +967,17 @@ def gate(directory: Path) -> int:
             is_payload = isinstance(payload, dict) and ("events" in payload or "test" in payload)
             is_probe = isinstance(payload, dict) and "observations" in payload
             is_timing = isinstance(payload, dict) and "calls" in payload
+            is_install_failure = isinstance(payload, dict) and "failures" in payload
             if is_payload:
                 problems = validate_payload(payload)
             elif is_probe:
                 problems = validate_probe_report(payload)
             elif is_timing:
                 problems = validate_timing_report(payload)
+            elif is_install_failure:
+                from tests.e2e.install_failure import validate_install_failure_report
+
+                problems = validate_install_failure_report(payload)
             else:
                 problems = validate_versions(payload)
         if problems:
@@ -1013,11 +1018,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--call-timing-log",
         help="operator log file to reduce to closed-schema provider call timings",
     )
+    parser.add_argument(
+        "--install-failure-log",
+        help="operator log file to reduce to closed-schema protocol install failures",
+    )
     args = parser.parse_args(argv)
     directory = Path(args.validate_dir)
+    from tests.e2e.install_failure import collect_install_failure_log
+
     for flag, collect in (
         ("probe_log", collect_probe_log),
         ("call_timing_log", collect_timing_log),
+        ("install_failure_log", collect_install_failure_log),
     ):
         log_arg = getattr(args, flag)
         if not log_arg:
