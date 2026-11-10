@@ -21,10 +21,10 @@ func drainEvents(vt *VirtualTUN) <-chan []tun.Event {
 	return ch
 }
 
-// TestCloseTerminatesEventConsumer: a consumer ranging over Events exits once
-// Close runs, and events accepted before the close are delivered first and in
-// order. Under concurrent SendEvent floods the transition must neither panic on
-// the closed channel nor deadlock, and a post-close send is a silent no-op.
+// TestCloseTerminatesEventConsumer: a consumer ranging over Events exits once Close
+// runs, and events accepted before the close are delivered first and in order. Under
+// concurrent SendEvent floods the transition must neither panic on the closed channel
+// nor deadlock, and a post-close send is a silent no-op.
 func TestCloseTerminatesEventConsumer(t *testing.T) {
 	vt := mustNew(t, Config{})
 	vt.SendEvent(tun.EventDown)
@@ -41,7 +41,6 @@ func TestCloseTerminatesEventConsumer(t *testing.T) {
 	case <-timeout(t):
 		t.Fatal("event consumer did not exit after Close")
 	}
-
 	for iter := 0; iter < 20; iter++ {
 		vt, err := New(Config{})
 		if err != nil {
@@ -81,10 +80,9 @@ func TestCloseTerminatesEventConsumer(t *testing.T) {
 	}
 }
 
-// TestEventsClosePreservesPacketAccounting: closing the event channel must not
-// change packet drop accounting, and the packet channels must stay open while the
-// event channel closes — that asymmetry is what makes a racing packet sender
-// panic-free and the upstream reader terminate.
+// TestEventsClosePreservesPacketAccounting: closing the event channel must not change
+// packet drop accounting, and the packet channels must stay open while the event channel
+// closes — that asymmetry makes a racing packet sender panic-free and lets the reader exit.
 func TestEventsClosePreservesPacketAccounting(t *testing.T) {
 	vt := mustNew(t, Config{InboundCapacity: 4, OutboundCapacity: 4})
 	if err := vt.InjectInbound([]byte{1}); err != nil {
