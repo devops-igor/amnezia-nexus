@@ -203,7 +203,7 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 
 	// New admission: select through the existing sticky/LB/capacity
 	// primitives (all under s.mu — issue #86).
-	activeTunnels := s.pool.GetActiveTunnels()
+	activeTunnels := s.admissibleIngressCandidatesLocked()
 	if len(activeTunnels) == 0 {
 		return nil, nil, retirement, loadbalancer.ErrNoActiveBackends
 	}
@@ -361,6 +361,53 @@ func (s *Service) ensureBackendSessionForIngress(ctx context.Context, o ingress.
 
 	log.Printf("[vpn/ingress] admitted peer %s ip=%s backend=%d session=%s", ingress.RedactKey(o.PeerPublicKey), assignedIP, backend.ID, sess.ID)
 	return sess, backend, retirement, nil
+}
+
+// admissibleIngressCandidatesLocked builds the candidate list for a NEW ingress
+// admission (first assignment and route-loss re-admission share this branch).
+// Called with s.mu held.
+//
+// It starts from the unchanged active snapshot and appends handshake-blocked
+// backends that carry fresh, device-bound inner canary evidence (issue #731).
+// The appended entries are status-normalised COPIES: only the identity and the
+// capacity gauge are consumed downstream, so the pool row, its durable status
+// and every other GetActiveTunnels/FilterHealthy consumer stay untouched — a
+// blocked backend never becomes a failover or migration target.
+//
+// A blocked backend without recorded fresh evidence, or whose attached device
+// changed since that evidence was produced, is simply not a candidate: new
+// clients are refused there while established routes keep running.
+func (s *Service) admissibleIngressCandidatesLocked() []*models.BackendTunnel {
+	active := s.pool.GetActiveTunnels()
+	if s.prober == nil {
+		return active
+	}
+	var candidates []*models.BackendTunnel
+	for _, t := range s.pool.ListTunnels() {
+		if t == nil || !t.Enabled {
+			continue
+		}
+		if !strings.EqualFold(t.Status, models.TunnelStatusHandshakeBlocked) {
+			continue
+		}
+		// Read the attached device straight from the map we already hold s.mu
+		// for. Calling Service.GetDevice/HealthProber.GetDevice here would take
+		// s.mu.RLock while this admission holds s.mu.Lock: a self-deadlock.
+		dev := s.backendDevices[t.ID]
+		if dev == nil || dev.IsClosed() {
+			continue
+		}
+		if !s.prober.CanaryAdmissible(t, dev.CreatedAt()) {
+			continue
+		}
+		candidate := *t
+		candidate.Status = models.TunnelStatusActive
+		candidates = append(candidates, &candidate)
+	}
+	if len(candidates) == 0 {
+		return active
+	}
+	return append(active[:len(active):len(active)], candidates...)
 }
 
 // rollbackIngressSession closes a session created for a failed admission —

@@ -31,6 +31,9 @@ func (hp *HealthProber) MarkAdminDisabled(serverID int64) {
 	hp.failCounts[serverID] = 0
 	delete(hp.autoDisabled, serverID)
 	delete(hp.successCounts, serverID)
+	// An administrative disable withdraws admission authority immediately: the
+	// backend must earn fresh evidence after it is re-enabled.
+	delete(hp.canarySuccesses, serverID)
 	hp.recordCurrentGenerationLocked(serverID)
 }
 
