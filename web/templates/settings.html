@@ -885,19 +885,23 @@
                     btnRetry.textContent = _('deploy_retry_btn') || 'Retry';
                     btnRetry.addEventListener('click', () => triggerGigahostSetup(o.order_id));
                     right.appendChild(btnRetry);
-                } else if ((!o.nexus_onboarded || o.status !== 'ready') && o.assigned_ip) {
-                    const btnSetup = document.createElement('button');
-                    btnSetup.type = 'button';
-                    btnSetup.className = 'btn btn-primary';
-                    btnSetup.style.padding = '2px 8px';
-                    btnSetup.style.fontSize = '0.75rem';
-                    btnSetup.textContent = _('deploy_setup_btn') || 'Setup Backend';
-                    btnSetup.addEventListener('click', () => triggerGigahostSetup(o.order_id));
-                    right.appendChild(btnSetup);
-                    // The saved path sits beside the immediate one so the choice
-                    // is explicit: setup now in this window, or a durable job the
-                    // panel keeps tracking after it closes.
-                    appendSetupApprovalAction(right, o.order_id, o.assigned_ip);
+                } else if (!o.nexus_onboarded || o.status !== 'ready') {
+                    // The immediate path needs an address to reach right now;
+                    // the saved path does not, because the panel keeps working
+                    // after this browser closes and discovers the address when
+                    // the provider assigns it. Offering only the first is what
+                    // made the provisioning interval unusable.
+                    if (o.assigned_ip) {
+                        const btnSetup = document.createElement('button');
+                        btnSetup.type = 'button';
+                        btnSetup.className = 'btn btn-primary';
+                        btnSetup.style.padding = '2px 8px';
+                        btnSetup.style.fontSize = '0.75rem';
+                        btnSetup.textContent = _('deploy_setup_btn') || 'Setup Backend';
+                        btnSetup.addEventListener('click', () => triggerGigahostSetup(o.order_id));
+                        right.appendChild(btnSetup);
+                    }
+                    appendSetupApprovalAction(right, o.order_id);
                 }
 
                 row.appendChild(left);

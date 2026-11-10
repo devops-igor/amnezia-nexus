@@ -41,9 +41,10 @@ func TestGigahostSetupApprovalInitiationConsumerDOM(t *testing.T) {
 		t.Fatalf("read settings template: %v", err)
 	}
 	templateStr := string(templates)
-	// The saved action must be offered from the shipped renderer, next to the
-	// immediate setup button it deliberately sits beside.
-	if !strings.Contains(templateStr, "appendSetupApprovalAction(right, o.order_id, o.assigned_ip)") {
+	// The saved action must be offered from the shipped renderer. It is not
+	// conditioned on the provider having assigned an address: the provisioning
+	// interval before an address exists is exactly what a saved job covers.
+	if !strings.Contains(templateStr, "appendSetupApprovalAction(right, o.order_id)") {
 		t.Fatal("settings.html does not offer the saved setup approval action")
 	}
 	if !strings.Contains(templateStr, `src="/static/js/gigahost_setup_intents.js"`) {
@@ -207,11 +208,47 @@ w.eval(%s);
  await Promise.all([first, second]);
  assert.equal(byMethod('POST').length, 1, 'the in-flight guard let a second approval through');
 
- // 11. An order with no address cannot be approved: there is nothing to install
- //     on, and the saved action must not exist for it.
+ // 11. THE DEFECT ORACLE: a real pending order the provider has not addressed yet
+ //     still offers the saved action, and only that. This is the state the saved
+ //     path exists for: the administrator approves now and closes the browser while
+ //     provisioning continues.
  orders = [{order_id:'ord-noip', status:'pending'}];
  await w.loadRecentOrders();
- assert.deepEqual(rowButtons(), [], 'an order with no address must offer no setup action');
+ assert.deepEqual(rowButtons(), ['setup_intents_approve'],
+   'a pending order with no address must offer the saved action and no immediate setup, got ' + JSON.stringify(rowButtons()));
+
+ // 12. That approval posts exactly one existing approval request - the same route
+ //     and body as an addressed order - and the saved job is shown afterwards.
+ calls.length = 0; toasts.length = 0; intents.length = 0;
+ w.prompt = q => q === 'deploy_protocol_prompt' ? 'vless' : 'vpn.example.com';
+ w.confirm = () => true;
+ const savedJob = {order_id:'ord-noip', protocol:'vless', port:'443', state:'pending', step:'approved'};
+ approveResponse = {status:'ok', created:true, setup: savedJob};
+ intents = [savedJob];
+ approveBtn().click();
+ await flush();
+ assert.equal(byMethod('POST').length, 1, 'the pre-address approval must post exactly once, got ' + JSON.stringify(byMethod('POST')));
+ assert.equal(byMethod('POST')[0].url, '/api/admin/hosting/gigahost/orders/ord-noip/setup-approval');
+ assert.deepEqual(byMethod('POST')[0].body, {protocol:'vless', use_order_credential:true, tls_domain:'vpn.example.com'});
+ assert.equal(postsTo('/setup').length, 0, 'the saved path must not post the synchronous setup request');
+ assert.match(intentsContainer.textContent, /ord-noip/, 'the saved job for a pre-address order must be visible');
+ assert.match(intentsContainer.textContent, /setup_state_pending/);
+ assert.ok(toasts.some(t => t.text === 'setup_intents_saved' && t.kind === 'success'));
+
+ // 13. NEGATIVE: the same pre-address order with a cancelled prompt posts nothing.
+ calls.length = 0; toasts.length = 0;
+ w.prompt = () => null;
+ approveBtn().click();
+ await flush();
+ assert.equal(byMethod('POST').length, 0, 'a cancelled choice on a pre-address order must post nothing');
+ assert.equal(postsTo('/setup').length, 0);
+
+ // 14. NEGATIVE: a ledger placeholder id has no confirmed provider order behind it,
+ //     so it offers no saved action even though the endpoint would refuse it too.
+ approveResponse = {status:'ok', created:true, setup:{order_id:'ord-101', protocol:'awg', state:'pending'}};
+ orders = [{order_id:'intent_1700000000000', status:'pending'}];
+ await w.loadRecentOrders();
+ assert.deepEqual(rowButtons(), [], 'a placeholder order must offer no setup action, got ' + JSON.stringify(rowButtons()));
 
  console.log('SETUP_APPROVAL_INITIATION_DOM_OK');dom.window.close();
 })().catch(err=>{console.error(err);process.exit(1)});

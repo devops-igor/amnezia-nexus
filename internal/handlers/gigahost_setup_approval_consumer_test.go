@@ -25,6 +25,7 @@ package handlers
 import (
 	"context"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -217,20 +218,7 @@ func TestPortalApprovalIsConsumedByLaterTrackerPass(t *testing.T) {
 	start := time.Now().UTC()
 	clock := &virtualClock{now: start}
 	provider := &trackerFakeProvider{}
-	challenged := 0
-	tracker := gigahostsetup.New(db, gigahostsetup.Options{
-		Resolve: func(context.Context) (gigahostsetup.ProviderReader, error) { return provider, nil },
-		ChallengeHost: func(context.Context, models.GigahostSetupIntent) (string, error) {
-			challenged++
-			return "SHA256:REREREREREREREREREREREREREREREREREREREREREQ", nil
-		},
-		Now:         clock.Now,
-		Interval:    5 * time.Minute,
-		FailureBack: time.Minute,
-		MaxBackoff:  time.Hour,
-		Batch:       10,
-		CallTimeout: 5 * time.Second,
-	})
+	tracker, challengedFn := newPortalTracker(t, db, provider, clock)
 
 	// Ten virtual minutes apart, eleven times: the server provisions for 100
 	// virtual minutes. Nothing here waits on real time.
@@ -267,8 +255,8 @@ func TestPortalApprovalIsConsumedByLaterTrackerPass(t *testing.T) {
 	if saved.State != models.SetupStateAwaitingHostConfirm {
 		t.Fatalf("state = %q, want %q (detail %q)", saved.State, models.SetupStateAwaitingHostConfirm, saved.LastError)
 	}
-	if challenged != 1 {
-		t.Fatalf("host challenges = %d, want 1", challenged)
+	if challengedFn() != 1 {
+		t.Fatalf("host challenges = %d, want 1", challengedFn())
 	}
 	const observed = "SHA256:REREREREREREREREREREREREREREREREREREREREREQ"
 	if saved.HostCandidateFingerprint != observed {
@@ -378,6 +366,181 @@ func TestPortalApprovalRefusalsCreateNothing(t *testing.T) {
 	if counts.orders != 0 || counts.safeOrders != 0 || counts.keyRegistrars != 0 {
 		t.Fatalf("the approval journey caused provider writes: orders=%d safe=%d keys=%d",
 			counts.orders, counts.safeOrders, counts.keyRegistrars)
+	}
+}
+
+// TestPortalApprovalBeforeProviderAddressIsSupported is the consumer-side control
+// for the state the saved path exists for: a confirmed, recorded order the provider
+// has not yet addressed. The portal approves it now; the panel owns the job and
+// discovers the address and provider identity on a later pass, so the approving
+// browser can close.
+//
+// Nothing here is faked on the backend side: the real router, the real SQLite file
+// and the real tracker are driven, and the fake provider only stands in for the
+// remote API. The assertions are exactly the two facts the portal relies on - the
+// approval succeeds with no address, and the worker picks the address up later
+// without any further request from the administrator.
+func TestPortalApprovalBeforeProviderAddressIsSupported(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	// A real placed order with a real provider order id, still provisioning: no
+	// public address and no nexus server id yet.
+	seedPlacedOrder(t, h, "ord_portal_noip", 0, "")
+	if err := db.SetGigahostOrderCredential(context.Background(), &models.GigahostOrderCredential{
+		OrderID:    "ord_portal_noip",
+		PrivateKey: "FIXTURE-PRIVATE-MATERIAL-NOT-A-KEY",
+		PublicKey:  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureKeyMaterialForTestsOnly0000",
+	}); err != nil {
+		t.Fatalf("seed managed credential: %v", err)
+	}
+
+	counts := &providerCallCounts{}
+	h.SetGigahostClient(&countingProvider{counts: counts})
+	r := setupIntentTestRouter(t, h)
+
+	// The approval must be accepted while there is nothing to install on yet.
+	started := time.Now()
+	code, body := portalApproval(t, r, "ord_portal_noip", "awg")
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("approval took %s: it must not wait for an address", elapsed)
+	}
+	if code != http.StatusAccepted {
+		t.Fatalf("approve = %d, want 202 (body: %v)", code, body)
+	}
+	if created, _ := body["created"].(bool); !created {
+		t.Fatal("approval reported created=false on its first request")
+	}
+	setup, ok := body["setup"].(map[string]any)
+	if !ok {
+		t.Fatalf("response has no setup object: %v", body)
+	}
+	// Both fields are omitted from the DTO when unset, which is exactly the state
+	// the approval recorded: no address and no provider server id yet.
+	if ip, present := setup["assigned_ip"]; present {
+		t.Fatalf("assigned_ip = %v, want absent: no address had been assigned", ip)
+	}
+	if sid, present := setup["provider_server_id"]; present {
+		t.Fatalf("provider_server_id = %v, want absent before the provider assigns one", sid)
+	}
+	if setup["state"] != models.SetupStatePending {
+		t.Fatalf("state = %v, want %q", setup["state"], models.SetupStatePending)
+	}
+
+	// The approving request is over. A restarted panel builds its worker over the
+	// same database and a fake provider; no further request from the administrator
+	// is made in this test.
+	restarted := newApprovalConsumerHandlers(t, db)
+	clock := &virtualClock{now: time.Now().UTC()}
+	provider := &trackerFakeProvider{}
+	tracker, challengedFn := newPortalTracker(t, db, provider, clock)
+
+	// Six passes, ten virtual minutes apart: an hour of provisioning with no address.
+	for i := 0; i < 6; i++ {
+		if err := tracker.RunOnce(context.Background()); err != nil {
+			t.Fatalf("tracking pass %d: %v", i, err)
+		}
+		saved, found, err := db.GetGigahostSetupIntent(context.Background(), "ord_portal_noip")
+		if err != nil || !found {
+			t.Fatalf("read intent after pass %d: found=%v err=%v", i, found, err)
+		}
+		if saved.State != models.SetupStatePending {
+			t.Fatalf("pass %d: state = %q, want %q while provisioning (detail %q)",
+				i, saved.State, models.SetupStatePending, saved.LastError)
+		}
+		if saved.AssignedIP != "" || saved.ProviderServerID != 0 {
+			t.Fatalf("pass %d: identity = %q/%d, want none before the provider assigns it",
+				i, saved.AssignedIP, saved.ProviderServerID)
+		}
+		clock.Advance(10 * time.Minute)
+	}
+
+	// The provider now reports the address and server identity. The worker learns
+	// both from that read alone and stops at the trust pause with the identity it
+	// observed - it authorizes nothing on its own.
+	provider.ready = true
+	if err := tracker.RunOnce(context.Background()); err != nil {
+		t.Fatalf("tracking pass after readiness: %v", err)
+	}
+	saved, found, err := db.GetGigahostSetupIntent(context.Background(), "ord_portal_noip")
+	if err != nil || !found {
+		t.Fatalf("read intent: found=%v err=%v", found, err)
+	}
+	if saved.AssignedIP != "198.51.100.20" || saved.ProviderServerID != 7777 {
+		t.Fatalf("discovered identity = %q/%d, want 198.51.100.20/7777",
+			saved.AssignedIP, saved.ProviderServerID)
+	}
+	if saved.State != models.SetupStateAwaitingHostConfirm {
+		t.Fatalf("state = %q, want %q (detail %q)",
+			saved.State, models.SetupStateAwaitingHostConfirm, saved.LastError)
+	}
+	if challengedFn() != 1 {
+		t.Fatalf("host challenges = %d, want 1", challengedFn())
+	}
+	const observed = "SHA256:REREREREREREREREREREREREREREREREREREREREREQ"
+	if saved.HostCandidateFingerprint != observed {
+		t.Fatalf("displayed candidate = %q, want %q", saved.HostCandidateFingerprint, observed)
+	}
+
+	// Confirming the displayed value from the saved list - the same round trip an
+	// administrator performs in another browser - advances the job.
+	code, body = doJSON(t, setupIntentTestRouter(t, restarted), http.MethodPost,
+		"/api/admin/hosting/gigahost/orders/ord_portal_noip/setup-host-confirmation",
+		map[string]any{"fingerprint": observed})
+	if code != http.StatusOK {
+		t.Fatalf("host confirmation = %d, want 200 (body: %v)", code, body)
+	}
+	if err := tracker.RunOnce(context.Background()); err != nil {
+		t.Fatalf("tracking pass after confirmation: %v", err)
+	}
+	saved, found, err = db.GetGigahostSetupIntent(context.Background(), "ord_portal_noip")
+	if err != nil || !found {
+		t.Fatalf("read intent after confirmation: found=%v err=%v", found, err)
+	}
+	if saved.State != models.SetupStateReadyForSetup {
+		t.Fatalf("state = %q, want %q (detail %q)",
+			saved.State, models.SetupStateReadyForSetup, saved.LastError)
+	}
+
+	// Approving before an address existed bought and registered nothing.
+	if counts.orders != 0 || counts.safeOrders != 0 || counts.keyRegistrars != 0 {
+		t.Fatalf("the addressless journey caused provider writes: orders=%d safe=%d keys=%d",
+			counts.orders, counts.safeOrders, counts.keyRegistrars)
+	}
+	if provider.orders != 0 || provider.keyRegistrations != 0 {
+		t.Fatalf("the worker caused provider writes: orders=%d keys=%d",
+			provider.orders, provider.keyRegistrations)
+	}
+}
+
+// newPortalTracker builds the worker a restarted panel would build over the same
+// database: a fake provider, a virtual clock and a host challenge that answers with
+// a fixed identity. It returns the tracker plus a counter of how many times that
+// challenge ran, because "the panel observed the identity exactly once" is a claim
+// both consumer tests make.
+func newPortalTracker(
+	t *testing.T, db *database.DB, provider *trackerFakeProvider, clock *virtualClock,
+) (*gigahostsetup.Tracker, func() int) {
+	t.Helper()
+	var mu sync.Mutex
+	challenged := 0
+	tracker := gigahostsetup.New(db, gigahostsetup.Options{
+		Resolve: func(context.Context) (gigahostsetup.ProviderReader, error) { return provider, nil },
+		ChallengeHost: func(context.Context, models.GigahostSetupIntent) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			challenged++
+			return "SHA256:REREREREREREREREREREREREREREREREREREREREREQ", nil
+		},
+		Now:         clock.Now,
+		Interval:    5 * time.Minute,
+		FailureBack: time.Minute,
+		MaxBackoff:  time.Hour,
+		Batch:       10,
+		CallTimeout: 5 * time.Second,
+	})
+	return tracker, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return challenged
 	}
 }
 

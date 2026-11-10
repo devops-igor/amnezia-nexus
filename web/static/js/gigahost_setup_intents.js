@@ -107,12 +107,19 @@ async function approveSetupIntent(orderId) {
 
 /* appendSetupApprovalAction adds the save-for-setup action to one recent order.
  *
- * It is offered only for an order that has an address to install on: approving a
- * job with no reachable server would record work the panel can never perform. The
- * immediate setup button stays next to it, so the administrator chooses between
- * setup that runs in this window and setup the panel keeps on its own. */
-function appendSetupApprovalAction(container, orderId, assignedIP) {
-    if (!container || !orderId || !assignedIP) return;
+ * It is offered for any order the page displays. The saved path exists precisely
+ * for the interval the immediate path cannot cover: the provider may not have
+ * assigned an address yet, and the panel discovers it later on its own. Requiring
+ * an address here would make the durable approval unreachable in the one state it
+ * was built for.
+ *
+ * An order whose id is still a ledger placeholder is not offered, because there is
+ * no confirmed provider order behind it. That refusal is the server's to make and
+ * this is only the matching client-side affordance; the endpoint refuses the same
+ * ids independently.
+ */
+function appendSetupApprovalAction(container, orderId) {
+    if (!container || !orderId || isPlaceholderOrderID(orderId)) return;
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'btn btn-secondary';
@@ -121,6 +128,13 @@ function appendSetupApprovalAction(container, orderId, assignedIP) {
     btn.textContent = _('setup_intents_approve');
     btn.addEventListener('click', () => approveSetupIntent(orderId));
     container.appendChild(btn);
+}
+
+/* isPlaceholderOrderID mirrors the ledger's placeholder ids for an order whose
+ * purchase never resolved. Such a row has no confirmed provider order, so no setup
+ * can be approved for it - the endpoint says so as well. */
+function isPlaceholderOrderID(orderId) {
+    return orderId.indexOf('intent_') === 0 || orderId.indexOf('unknown_') === 0;
 }
 
 async function loadSetupIntents() {
