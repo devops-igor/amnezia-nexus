@@ -15,7 +15,7 @@ type canaryResult struct {
 	sequence uint64
 }
 
-// canarySuccess is the recorded inner data-plane success that authorises a NEW
+// canarySuccess is the recorded inner data-plane success that authorizes a NEW
 // admission onto an otherwise handshake-blocked backend (issue #731). Owned by
 // HealthProber.mu.
 //
@@ -78,15 +78,7 @@ func (hp *HealthProber) acceptCanaryObservation(t *models.BackendTunnel, sequenc
 	if sequence <= previous.sequence {
 		return ErrStaleStateVersion
 	}
-	if hp.canaryResults == nil {
-		hp.canaryResults = make(map[int64]canaryResult)
-	}
-	if hp.canaryFailCounts == nil {
-		hp.canaryFailCounts = make(map[int64]int)
-	}
-	if hp.canarySuccesses == nil {
-		hp.canarySuccesses = make(map[int64]canarySuccess)
-	}
+	hp.ensureCanaryMapsLocked()
 	if success || previous.tunnelID != t.ID {
 		hp.canaryFailCounts[t.ServerID] = 0
 	}
@@ -107,7 +99,21 @@ func (hp *HealthProber) acceptCanaryObservation(t *models.BackendTunnel, sequenc
 	return nil
 }
 
-// CanaryAdmissible reports whether recorded inner data-plane evidence authorises
+// ensureCanaryMapsLocked allocates the canary history maps on first write.
+// Callers hold hp.mu.
+func (hp *HealthProber) ensureCanaryMapsLocked() {
+	if hp.canaryResults == nil {
+		hp.canaryResults = make(map[int64]canaryResult)
+	}
+	if hp.canaryFailCounts == nil {
+		hp.canaryFailCounts = make(map[int64]int)
+	}
+	if hp.canarySuccesses == nil {
+		hp.canarySuccesses = make(map[int64]canarySuccess)
+	}
+}
+
+// CanaryAdmissible reports whether recorded inner data-plane evidence authorizes
 // a NEW admission onto t. It is a pure in-memory read: no I/O, no callbacks, no
 // pool lock, so it is safe on the admission path while Service.mu is held
 // (established order: Service.mu then prober mu; see Service.SetCanaryProbeFunc).
@@ -128,12 +134,25 @@ func (hp *HealthProber) CanaryAdmissible(t *models.BackendTunnel, deviceCreated 
 	hp.mu.RLock()
 	defer hp.mu.RUnlock()
 	rec, ok := hp.canarySuccesses[t.ServerID]
-	if !ok || rec.tunnelID != t.ID || !rec.deviceCreated.Equal(deviceCreated) {
+	if !ok || !rec.matches(t.ID, deviceCreated) {
 		return false
 	}
 	if hp.canaryFailCounts[t.ServerID] != 0 {
 		return false
 	}
+	return hp.evidenceFreshLocked(rec)
+}
+
+// matches reports whether this record belongs to the given tunnel generation and
+// the given backend device.
+func (r canarySuccess) matches(tunnelID int64, deviceCreated time.Time) bool {
+	return r.tunnelID == tunnelID && r.deviceCreated.Equal(deviceCreated)
+}
+
+// evidenceFreshLocked reports whether the record is within the derived freshness
+// bound. A negative age means the clock moved backwards, which is not freshness.
+// Callers hold hp.mu.
+func (hp *HealthProber) evidenceFreshLocked(rec canarySuccess) bool {
 	age := hp.now().Sub(rec.at)
 	return age >= 0 && age <= hp.maxCanaryEvidenceAgeLocked()
 }

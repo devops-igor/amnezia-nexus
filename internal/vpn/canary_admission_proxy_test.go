@@ -67,17 +67,29 @@ func newProxyAdmissionService(t *testing.T) *Service {
 	return svc
 }
 
-// seedProxySession admits one real portal peer onto the proxy backend so later
-// inner failures keep the blocked label (session-carrying preservation).
-func seedProxySession(t *testing.T, svc *Service, name string) ingressTestPeer {
+// seedProxySession books one real session row and forwards route onto the proxy
+// backend, so a later inner canary failure keeps the blocked label (the
+// session-carrying preservation rule). It deliberately does NOT go through
+// admission: at seed time the proxy has no canary evidence yet, so admission
+// would (correctly) refuse and the fixture would be unable to create the very
+// precondition it needs. Creating the session directly mirrors the state a real
+// admission leaves behind.
+func seedProxySession(t *testing.T, svc *Service, tun *models.BackendTunnel, name string) ingressTestPeer {
 	t.Helper()
 	peer := seedIngressPeer(t, svc.db, name, "proxy-"+name+"-peer-key", "10.100.9."+proxyLastOctet(name))
-	sess, backend, _, err := svc.EnsureBackendSessionForIngress(t.Context(), ownershipFor(peer))
+	sess, delta, err := svc.sessionMgr.CreateSessionWithDeltaAndSource(t.Context(),
+		peer.userID, peer.peerKey, peer.ip.String(), tun.ID, name+"-device", models.SessionAdmissionIngress)
 	if err != nil {
-		t.Fatalf("seed admission onto the proxy backend: %v", err)
+		t.Fatalf("seed session on the proxy backend: %v", err)
 	}
-	if backend == nil || sess == nil {
-		t.Fatalf("seed admission returned no session/backend")
+	if sess == nil {
+		t.Fatal("seed session returned no session")
+	}
+	if !delta.HasInc {
+		svc.pool.IncrementConnections(tun.ID)
+	}
+	if svc.forwarder != nil {
+		svc.forwarder.RegisterSession(sess.ID, peer.connID, peer.peerKey, peer.ip.String(), tun.ID)
 	}
 	t.Cleanup(func() { svc.forwarder.UnregisterSession(peer.peerKey) })
 	return peer
@@ -210,7 +222,7 @@ func TestCanaryAdmission_VLESSProxyConsumer(t *testing.T) {
 	if err := svc.PromoteQualifiedTunnel(ctx, tun.ServerID, latencyMS); err != nil {
 		t.Fatalf("promote vless backend: %v", err)
 	}
-	seedProxySession(t, svc, "vless")
+	seedProxySession(t, svc, tun, "vless")
 
 	// Positive: blocked label, authenticated payload path alive.
 	cur := env.sweepOuterFailing(t)
@@ -304,7 +316,7 @@ func TestCanaryAdmission_NaiveProxyConsumer(t *testing.T) {
 	if err := svc.PromoteQualifiedTunnel(ctx, tun.ServerID, latencyMS); err != nil {
 		t.Fatalf("promote naive backend: %v", err)
 	}
-	seedProxySession(t, svc, "naive")
+	seedProxySession(t, svc, tun, "naive")
 
 	cur := env.sweepOuterFailing(t)
 	if cur.Status != models.TunnelStatusHandshakeBlocked {

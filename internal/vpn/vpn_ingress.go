@@ -384,30 +384,36 @@ func (s *Service) admissibleIngressCandidatesLocked() []*models.BackendTunnel {
 	}
 	var candidates []*models.BackendTunnel
 	for _, t := range s.pool.ListTunnels() {
-		if t == nil || !t.Enabled {
-			continue
+		if candidate, ok := s.admissibleBlockedCandidateLocked(t); ok {
+			candidates = append(candidates, candidate)
 		}
-		if !strings.EqualFold(t.Status, models.TunnelStatusHandshakeBlocked) {
-			continue
-		}
-		// Read the attached device straight from the map we already hold s.mu
-		// for. Calling Service.GetDevice/HealthProber.GetDevice here would take
-		// s.mu.RLock while this admission holds s.mu.Lock: a self-deadlock.
-		dev := s.backendDevices[t.ID]
-		if dev == nil || dev.IsClosed() {
-			continue
-		}
-		if !s.prober.CanaryAdmissible(t, dev.CreatedAt()) {
-			continue
-		}
-		candidate := *t
-		candidate.Status = models.TunnelStatusActive
-		candidates = append(candidates, &candidate)
 	}
 	if len(candidates) == 0 {
 		return active
 	}
 	return append(active[:len(active):len(active)], candidates...)
+}
+
+// admissibleBlockedCandidateLocked returns a status-normalised copy of t when t
+// is a handshake-blocked backend whose attached device has fresh inner canary
+// evidence. Called with s.mu held.
+func (s *Service) admissibleBlockedCandidateLocked(t *models.BackendTunnel) (*models.BackendTunnel, bool) {
+	if t == nil || !t.Enabled || !strings.EqualFold(t.Status, models.TunnelStatusHandshakeBlocked) {
+		return nil, false
+	}
+	// Read the attached device straight from the map we already hold s.mu for.
+	// Calling Service.GetDevice/HealthProber.GetDevice here would take
+	// s.mu.RLock while this admission holds s.mu.Lock: a self-deadlock.
+	dev := s.backendDevices[t.ID]
+	if dev == nil || dev.IsClosed() {
+		return nil, false
+	}
+	if !s.prober.CanaryAdmissible(t, dev.CreatedAt()) {
+		return nil, false
+	}
+	candidate := *t
+	candidate.Status = models.TunnelStatusActive
+	return &candidate, true
 }
 
 // rollbackIngressSession closes a session created for a failed admission —

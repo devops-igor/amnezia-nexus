@@ -16,7 +16,6 @@ import (
 type admissionEvidenceDevice struct {
 	created time.Time
 	closed  bool
-	fail    bool
 }
 
 var (
