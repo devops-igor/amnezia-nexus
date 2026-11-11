@@ -195,19 +195,22 @@ func TestGigahostOrderStatusManualRefreshKeepsNewestResult(t *testing.T) {
  w.document.getElementById('refresh').click();
  await flush();
 
- // The held scheduled read was superseded and aborted, so it is no longer work in flight.
- assert.equal(aborted, 1, 'the superseded read must be aborted, saw ' + aborted + ' aborts');
- assert.equal(w.gigahostOrderStatusRefreshState().reading, true,
-   'the newer read owns the view, so a read is outstanding');
+ // The click did not start a competing read: it queued one follow-up behind the live read.
+ assert.equal(w.gigahostOrderStatusRefreshState().followUp, true,
+   'the click must be queued as a follow-up, not dropped');
+ assert.equal(w.gigahostOrderStatusRefreshState().reads, 1,
+   'the click must not start a second full read');
  assert.equal(maxConcurrent, 1, 'no two full reads may be outstanding, saw ' + maxConcurrent);
 
- // 3. The newer read answers ready and renders it.
+ // 3. The live read settles; the queued follow-up then runs and answers ready.
  release(held.length - 1);
  await flush();
- assert.equal(stage(), 'ready', 'the newer read must render its own answer');
+ release(held.length - 1);
+ await flush();
+ assert.equal(stage(), 'ready', 'the follow-up must render current readiness');
  const readyAt = w.gigahostOrderStatusRefreshState().lastSuccessAt;
 
- // 4. The obsolete scheduled response now arrives late. It must change nothing: not the
+ // 4. Releasing the already-settled first response again must change nothing: not the
  //    stage, not the success time, not the stale state.
  release(0);
  await flush();
@@ -234,12 +237,14 @@ func TestGigahostOrderStatusTimerDoesNotSupersedeAUserRead(t *testing.T) {
  announce('ready');
  w.document.getElementById('refresh').click();
  await flush();
- assert.equal(aborted, 0, 'no read was outstanding to supersede yet');
+ assert.equal(w.gigahostOrderStatusRefreshState().followUp, false,
+   'nothing was queued while the read started immediately');
  const manualCalls = detailCalls;
 
  // A scheduled tick arrives while the manual read is held. It must skip, not supersede.
  await clock.tick(30000);
- assert.equal(aborted, 0, 'polling must not abort a read the operator started');
+ assert.equal(w.gigahostOrderStatusRefreshState().followUp, false,
+   'polling must not queue work behind a read the operator started');
  assert.equal(detailCalls, manualCalls, 'the skipped tick must not start its own detail read');
  assert.equal(clock.pending(), 1, 'the skipped tick must re-arm its timer');
 
@@ -284,7 +289,8 @@ func TestGigahostOrderStatusStopRetiresOutstandingRead(t *testing.T) {
  assert.equal(w.document.getElementById('recentOrdersContainer').getAttribute('data-stale'), null);
  w.dispatchEvent(new w.Event('pagehide'));
  assert.equal(w.gigahostOrderStatusRefreshState().scheduled, false, 'pagehide must stop the timer');
- assert.ok(aborted >= 2, 'pagehide must abort the outstanding read, saw ' + aborted);
+ assert.equal(w.gigahostOrderStatusRefreshState().followUp, false,
+   'pagehide must drop any queued follow-up');
  release(unloadIndex);
  await flush();
  assert.equal(stage(), 'ready', 'a read retired by pagehide must not commit');
@@ -306,7 +312,10 @@ func TestGigahostOrderStatusPostActionReadOwnsTheResult(t *testing.T) {
  announce('ready');
  w.loadRecentOrders();
  await flush();
- assert.equal(aborted, 1, 'a post-action read must take ownership, saw ' + aborted + ' aborts');
+ assert.equal(w.gigahostOrderStatusRefreshState().followUp, true,
+   'a post-action read during a live read must queue a follow-up');
+ release(held.length - 1);
+ await flush();
  release(held.length - 1);
  await flush();
  assert.equal(stage(), 'ready');

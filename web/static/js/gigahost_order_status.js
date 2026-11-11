@@ -28,9 +28,22 @@ let gigahostOrderStatusLastSuccessAt = '';
 let gigahostOrderStatusLifecycleBound = false;
 let gigahostOrderStatusDetailsCounter = 0;
 let gigahostOrderStatusBackendIndex = null;
-// gigahostOrderStatusCurrentRead is the one read allowed to commit: {token, controller, retired}.
+// gigahostOrderStatusCurrentRead is the one running full read ({token, controller, retired}).
+// It is cleared only when that chain actually settles, so its presence means "a full read is
+// live" and never "a read was asked to stop".
 let gigahostOrderStatusCurrentRead = null;
+// gigahostOrderStatusPendingFollowUp records that a caller asked for a read while one was
+// running. It is coalesced: many clicks produce one follow-up after settlement.
+let gigahostOrderStatusPendingFollowUp = false;
 let gigahostOrderStatusReadSequence = 0;
+// gigahostOrderStatusSettledReads counts full read chains that ran to completion. It is the
+// lifetime fact a caller (and a test) needs to distinguish "the chain finished" from "the chain
+// was asked to abort": only this counter may be used to decide that a new read may begin.
+let gigahostOrderStatusSettledReads = 0;
+// gigahostOrderStatusOverlapDetected counts admissions that happened while a previous chain was
+// still running. It must remain 0: it is the direct measurement of the original requirement,
+// taken at admission rather than inferred from abort notifications or from test timing.
+let gigahostOrderStatusOverlapDetected = 0;
 
 /* gigahostOrderStatusBadgeClass maps a stage to the existing badge vocabulary. */
 function gigahostOrderStatusBadgeClass(stage) {
@@ -298,25 +311,76 @@ function scheduleGigahostOrderStatusRefresh() {
     gigahostOrderStatusRefreshTimer = setTimeout(runGigahostOrderStatusRefresh, GIGAHOST_ORDER_STATUS_REFRESH_MS);
 }
 
-/* loadRecentOrders is the one entry point for a status read at every call site: the
- * initial page read, the manual Refresh control, the post-purchase read and the
- * post-setup read all call it, and the timer runs it too.
+/* gigahostOrderStatusRead is the one entry point into a full status read, and it enforces two
+ * separate invariants at once:
  *
- * One read is authoritative at a time. A caller arriving while a read is outstanding
- * supersedes it: the older read is retired and its request aborted, so it can neither
- * keep running as a full status read nor write anything when it resolves. That is what
- * makes a slow response unable to overwrite a newer answer, which is the defect this
- * boundary exists to remove.
+ *   lifetime  at most one full read chain (list, intents, backends, per-order details) is
+ *             running at any moment. A full read is only started when the previous chain has
+ *             truly settled — not when it is asked to abort. This is the original
+ *             "no overlapping refresh" requirement.
  *
- * The timer does not supersede: a tick that arrives while a read is outstanding skips
- * and re-arms, so polling can never cut a user-initiated read short.
+ *   ownership only the current read may commit. A read that was retired cannot write the DOM,
+ *             the backend index, the freshness/stale state or the last-success time, even if
+ *             it keeps running to completion.
  *
- * Nothing here writes to the panel: no order is placed, no setup is started and no
- * approval is touched. */
+ * A caller arriving while a read is running is therefore not dropped and not allowed to start
+ * a second read: it records one coalesced follow-up that starts after the running chain
+ * settles. That is what makes an operator's click during a slow refresh produce a current
+ * answer instead of nothing, without ever overlapping. This resolves the earlier conflict in
+ * which either the click was lost or two reads ran at once.
+ *
+ * The scheduled tick does not queue a follow-up at all: it defers, because polling has another
+ * tick in 30 seconds and must never stack work behind a user's read.
+ *
+ * Nothing here writes to the panel: no order is placed, no setup is started and no approval is
+ * touched. */
 async function loadRecentOrders(options) {
     const container = document.getElementById('recentOrdersContainer');
     if (!container) return;
     await gigahostOrderStatusRead(container, options);
+}
+
+async function gigahostOrderStatusRead(container, options) {
+    const settings = options || {};
+    const supersede = settings.supersede !== false;
+
+    if (gigahostOrderStatusCurrentRead) {
+        if (!supersede) return false;
+        // A full read is running. Request exactly one follow-up; it starts when this chain
+        // settles, so the two never overlap.
+        gigahostOrderStatusPendingFollowUp = true;
+        return false;
+    }
+
+    if (gigahostOrderStatusCurrentRead) gigahostOrderStatusOverlapDetected += 1;
+    const read = {
+        token: gigahostOrderStatusReadSequence += 1,
+        controller: gigahostOrderStatusNewAbortController()
+    };
+    gigahostOrderStatusCurrentRead = read;
+    try {
+        const outcome = await gigahostOrderStatusAwaitRead(read);
+        if (!gigahostOrderStatusIsCurrentRead(read)) return false;
+        gigahostOrderStatusCommitRead(container, outcome);
+        return true;
+    } finally {
+        // The chain has genuinely settled here, which is the only moment a new full read may
+        // begin. Abort only asks; this is where the lifetime actually ends.
+        if (gigahostOrderStatusCurrentRead === read) gigahostOrderStatusCurrentRead = null;
+        gigahostOrderStatusSettledReads += 1;
+        gigahostOrderStatusStartPendingFollowUp(container);
+    }
+}
+
+/* gigahostOrderStatusStartPendingFollowUp starts the coalesced follow-up, if one was requested
+ * while a read was running. It is called from the settled read's finally, so it can never
+ * overlap the chain that just finished. */
+function gigahostOrderStatusStartPendingFollowUp(container) {
+    if (!gigahostOrderStatusPendingFollowUp) return;
+    gigahostOrderStatusPendingFollowUp = false;
+    if (!container) return;
+    // Supersede is irrelevant when nothing is running; the call simply starts the read.
+    gigahostOrderStatusRead(container, {supersede: true});
 }
 
 /* runGigahostOrderStatusRefresh runs one scheduled refresh. A tick that finds a read
@@ -407,10 +471,16 @@ function gigahostOrderStatusRefreshState() {
         scheduled: gigahostOrderStatusRefreshTimer !== null,
         inFlight: gigahostOrderStatusRefreshInFlight,
         running: typeof gigahostOrderStatusRefreshTask === 'function',
-        // reading reports that a read currently owns the view, whatever started it. It is
-        // the ownership fact a caller or a test needs; inFlight only describes the timer.
+        // reading reports that a full read chain is actually live, whatever started it;
+        // inFlight only describes the timer's scheduled work. followUp reports a queued
+        // coalesced read that will start once the live chain settles.
         reading: gigahostOrderStatusCurrentRead !== null,
+        followUp: gigahostOrderStatusPendingFollowUp,
         reads: gigahostOrderStatusReadSequence,
+        // settledReads counts chains that finished; reads counts chains that started. A new
+        // full read is admitted only when these are equal.
+        settledReads: gigahostOrderStatusSettledReads,
+        overlapDetected: gigahostOrderStatusOverlapDetected,
         lastSuccessAt: gigahostOrderStatusLastSuccessAt
     };
 }
@@ -588,23 +658,6 @@ function mergeGigahostOrderDetail(order, deploy) {
  * state or the backend index once it is no longer current. The backend index is
  * deliberately returned by the reader rather than written as a side effect, so a retired
  * read has nothing to overwrite. */
-async function gigahostOrderStatusRead(container, options) {
-    const supersede = !options || options.supersede !== false;
-    if (supersede) gigahostOrderStatusRetireCurrentRead();
-
-    const read = {
-        token: gigahostOrderStatusReadSequence += 1,
-        controller: gigahostOrderStatusNewAbortController()
-    };
-    gigahostOrderStatusCurrentRead = read;
-
-    const outcome = await gigahostOrderStatusAwaitRead(read);
-    // Retired while awaiting, or a newer read has taken over: this one writes nothing.
-    if (!gigahostOrderStatusClaimCommit(read, container)) return false;
-    gigahostOrderStatusCommitRead(container, outcome);
-    return true;
-}
-
 /* gigahostOrderStatusAwaitRead runs the requests and never throws: a failed read is an
  * outcome, because "could not read" is a state the view has to show rather than an error
  * to propagate into a timer tick. */
@@ -614,21 +667,6 @@ async function gigahostOrderStatusAwaitRead(read) {
     } catch (_) {
         return {ok: false};
     }
-}
-
-/* gigahostOrderStatusClaimCommit takes the right to write this read's result, or refuses
- * it. Ownership is a single comparison and it is checked after the await, which is the only
- * moment that matters: between requests the owner may have changed.
- *
- * The pointer is cleared only when the claim succeeds, so "current" stays meaningful right
- * up to the write. */
-function gigahostOrderStatusClaimCommit(read, container) {
-    if (!gigahostOrderStatusIsCurrentRead(read) || !container) {
-        if (gigahostOrderStatusCurrentRead === read) gigahostOrderStatusCurrentRead = null;
-        return false;
-    }
-    gigahostOrderStatusCurrentRead = null;
-    return true;
 }
 
 /* gigahostOrderStatusCommitRead applies one claimed read's result to the view. The caller
@@ -660,16 +698,18 @@ function gigahostOrderStatusIsCurrentRead(read) {
     return !!read && gigahostOrderStatusCurrentRead === read && !read.retired;
 }
 
-/* gigahostOrderStatusRetireCurrentRead retires and aborts the outstanding read, if any.
+/* gigahostOrderStatusRetireCurrentRead retires and aborts the outstanding read, if any, and
+ * drops any follow-up it had queued.
  *
- * Retiring is what stops it writing; aborting is what stops it holding a connection for
- * an answer nobody will use. A caller that cannot abort (an environment without
- * AbortController) still gets correct behavior: the read resolves and is discarded. */
+ * Retiring is what stops it writing; aborting is what asks it to stop running. Neither ends
+ * the read's lifetime — the chain ends when its own await settles, and only then may another
+ * full read begin. Dropping the follow-up is what keeps a stopped view from resurrecting
+ * itself one tick later. */
 function gigahostOrderStatusRetireCurrentRead() {
     const read = gigahostOrderStatusCurrentRead;
+    gigahostOrderStatusPendingFollowUp = false;
     if (!read) return;
     read.retired = true;
-    gigahostOrderStatusCurrentRead = null;
     if (read.controller && typeof read.controller.abort === 'function') {
         read.controller.abort();
     }
