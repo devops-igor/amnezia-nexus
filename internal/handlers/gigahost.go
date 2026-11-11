@@ -21,17 +21,23 @@ import (
 type GigahostOrderRecord = models.GigahostOrder
 
 // OrderServerPayload defines the incoming payload for manual hourly VPS orders.
+// DCID optionally pins one datacenter inside RegionID (see gigahost_placement.go).
 type OrderServerPayload struct {
 	PID            int     `json:"pid"`
 	PriceID        int     `json:"price_id"`
 	RegionID       int     `json:"region_id"`
+	DCID           int     `json:"dc_id,omitempty"`
 	OSID           int     `json:"os_id"`
 	HourlyPriceNOK float64 `json:"hourly_price_nok"`
 }
 
-// validate rejects a payload the provider cannot be asked to fulfill. Every
-// selection key is required; the client-supplied hourly rate is not, because the
-// provider catalog is the authoritative price.
+// validate rejects a payload the provider cannot be asked to fulfill.
+//
+// region_id is required even for a datacenter pin: the page posts to the panel, so
+// region_id is the region the operator saw, the duplicate guard's key and the ledger
+// field. Only the outbound provider body drops it for a pin
+// (gigahost.OrderRequest.wireBody). The client-supplied hourly rate is not required:
+// the provider catalog is the authoritative price.
 func (p OrderServerPayload) validate() error {
 	if p.PID <= 0 || p.PriceID <= 0 || p.RegionID <= 0 || p.OSID <= 0 {
 		return errors.New("pid, price_id, region_id, os_id must be positive integers")
@@ -629,6 +635,7 @@ func (h *Handlers) dispatchOrderPurchase(
 		PID:           req.PID,
 		PriceID:       req.PriceID,
 		RegionID:      req.RegionID,
+		DCID:          req.DCID,
 		OSID:          req.OSID,
 		BillingPeriod: gigahost.BillingPeriodHourly,
 		Quantity:      1,
@@ -701,6 +708,10 @@ func validateOrderAgainstCatalog(catalog []gigahost.HourlyPlan, req OrderServerP
 		return fmt.Errorf("invalid_plan: plan %d has zero or negative price in provider catalog", req.PID)
 	}
 
+	// Placement before the region summary: for a pin the datacenter reason is accurate.
+	if err := validatePlanPlacement(matchedPlan, req); err != nil {
+		return err
+	}
 	if err := validatePlanRegion(matchedPlan, req); err != nil {
 		return err
 	}
@@ -909,9 +920,20 @@ func (h *Handlers) refreshOrderFromServers(servers []gigahost.ServerInfo, order 
 	return false
 }
 
-func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord) bool {
+// refreshOrderFromDeployStatus refreshes one order from the provider's order detail
+// and reports both whether the row changed and what the provider actually answered.
+//
+// The two are different questions: a provider that repeats the status already on the
+// row changed nothing, yet it is still the freshest confirmation the panel has. Only
+// the returned observation may be presented as a provider read.
+//
+// live is the inventory already read for this request, and inventoryKnown says whether that
+// read succeeded. Together they decide one thing - whether a "no such order" answer may be
+// trusted as a cancellation. An inventory that could not be read is not evidence that the
+// order is gone, so it must not be allowed to stand in for absence.
+func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord, live []gigahost.ServerInfo, inventoryKnown bool) (bool, GigahostProviderObservation) {
 	if strings.HasPrefix(order.OrderID, "unknown_") || strings.HasPrefix(order.OrderID, "intent_") || order.OrderID == "" {
-		return false
+		return false, GigahostProviderObservation{Outcome: gigahostObservationNotChecked}
 	}
 	statusResp, deployErr := client.GetDeployStatus(ctx, order.OrderID)
 	if deployErr == nil {
@@ -919,10 +941,21 @@ func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client giga
 		if statusResp != nil && statusResp.Status != "" && statusResp.Status != order.Status {
 			order.Status = statusResp.Status
 			updated = true
-		} else if (order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active") && (statusResp == nil || statusResp.Status == "") {
-			order.Status = statusCancelled
-			updated = true
 		}
+		/* An answer that carries no status is not a cancellation.
+		 *
+		 * The provider's decoder accepts an empty body (`{}`, or an empty
+		 * data.servers[] envelope) into a zero response with no error, so "the provider
+		 * answered and there is no such deployment" is indistinguishable here from "the
+		 * provider answered with nothing useful". Treating the absent status as a
+		 * cancellation therefore turned a live, inventory-confirmed ready row into a
+		 * durable terminal one: the row was persisted with the terminal value, and the
+		 * next list read skipped it as terminal, so continued positive inventory could
+		 * never repair it.
+		 *
+		 * Genuine termination still reaches this row by a non-empty provider status (above)
+		 * or by ErrNotFound (below), so nothing is lost by not inventing a terminal state
+		 * from silence. This branch used to claim the opposite; it was wrong. */
 		if statusResp != nil {
 			if ip := statusResp.GetIP(); ip != "" && ip != order.AssignedIP {
 				order.AssignedIP = ip
@@ -933,16 +966,54 @@ func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client giga
 				updated = true
 			}
 		}
-		return updated
-	} else if errors.Is(deployErr, gigahost.ErrNotFound) && (order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active") {
-		order.Status = statusCancelled
-		return true
+		observation := GigahostProviderObservation{Outcome: gigahostObservationUnconfirmed}
+		if statusResp != nil {
+			if status := strings.TrimSpace(statusResp.Status); status != "" {
+				observation = GigahostProviderObservation{Outcome: gigahostObservationConfirmed, Status: status}
+			}
+			observation.Error = statusResp.Error
+		}
+		return updated, observation
 	}
-	return false
+	if errors.Is(deployErr, gigahost.ErrNotFound) && (order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active") {
+		/* "No such order" only means cancellation when the inventory could corroborate it.
+		 *
+		 * The inventory read is what distinguishes "the provider no longer has this order"
+		 * from "I could not find out": it either names the order (live, or with the
+		 * provider's own terminal status), or it answered and named nobody. When the
+		 * inventory read FAILED, none of those is true, and the terminal value would be
+		 * sticky here - the next list read skips a terminal row before consulting the
+		 * inventory again, so an ordinary 503 would strand a live order in the terminal state
+		 * forever. Report the gap instead and leave the row live, so the next read can
+		 * repair it. */
+		if !inventoryKnown {
+			return false, GigahostProviderObservation{
+				Outcome: gigahostObservationUnavailable,
+				Error:   "provider inventory could not be read, so a missing deployment record is not evidence of cancellation",
+			}
+		}
+		// Only a cancellation nothing contradicts: live inventory for this order means the
+		// missing detail record is a partial read failure, and the terminal value would be
+		// sticky, so later reads would skip the row and inventory could never repair it.
+		if gigahostProviderServerLive(live, order.OrderID) {
+			return false, GigahostProviderObservation{
+				Outcome: gigahostObservationUnconfirmed,
+				Error:   "provider has no detail record for this order while inventory still lists it",
+			}
+		}
+		order.Status = statusCancelled
+		return true, GigahostProviderObservation{Outcome: gigahostObservationConfirmed, Status: statusCancelled}
+	}
+	return false, GigahostProviderObservation{Outcome: gigahostObservationUnavailable, Error: deployErr.Error()}
 }
 
 // GigahostOrdersHandler handles GET /api/admin/hosting/gigahost/orders.
 // Lists persistent order history and refreshes status for active/pending jobs.
+//
+// Each order carries a provider observation alongside its row: the row is the
+// panel's copy of the last answer and is served whether or not the provider could
+// be reached, so a 200 here does not mean the provider was read. The observation
+// says which it was, per order, without changing the rows themselves.
 func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	sess := middleware.GetSession(r.Context())
 	if sess == nil || sess.Role != models.RoleAdmin {
@@ -956,36 +1027,11 @@ func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Refresh all non-terminal orders if client is accessible
-	client, clientErr := h.getGigahostClient(r.Context(), r)
-	if clientErr == nil && len(orders) > 0 {
-		servers, _ := client.GetServers(r.Context())
-		deployQueries := 0
-		const maxDeployQueries = 10
-		for i := range orders {
-			if isTerminalStatus(orders[i].Status) {
-				continue
-			}
-			updated := false
-			if len(servers) > 0 && h.refreshOrderFromServers(servers, &orders[i]) {
-				updated = true
-			}
-			if (isPendingOrInFlight(orders[i].Status) || !updated) && deployQueries < maxDeployQueries {
-				if orders[i].OrderID != "" && !strings.HasPrefix(orders[i].OrderID, "unknown_") && !strings.HasPrefix(orders[i].OrderID, "intent_") {
-					deployQueries++
-					if h.refreshOrderFromDeployStatus(r.Context(), client, &orders[i]) {
-						updated = true
-					}
-				}
-			}
-			if updated {
-				_ = h.updateGigahostOrder(r.Context(), &orders[i])
-			}
-		}
-	}
+	observations := h.gigahostListObservations(r.Context(), r, orders)
 
 	h.JSONOK(w, map[string]any{
-		"orders": orders,
-		"count":  len(orders),
+		"orders":                orders,
+		"count":                 len(orders),
+		"provider_observations": observations,
 	})
 }

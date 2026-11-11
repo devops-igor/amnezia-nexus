@@ -32,6 +32,14 @@ func TestGigahostDeploySelectionContract(t *testing.T) {
 		"function deployPlanLabel",
 		"function updateDeploySelections",
 		"function updateDeployButtonState",
+		// updateDeploySelections now rebuilds the placement selector, so the
+		// placement helpers it calls must be extracted with it: the harness runs the
+		// page's real functions, and a partial extraction would fail on a missing
+		// reference rather than on a behaviour.
+		"function deployPlacementChoices",
+		"function rebuildDeployPlacement",
+		"function showDeployPlacementHint",
+		"function deployPlacementNeedsChoice",
 	}
 	var extracted strings.Builder
 	for _, fn := range functions {
@@ -42,8 +50,16 @@ func TestGigahostDeploySelectionContract(t *testing.T) {
 		extracted.WriteString(code + "\n")
 	}
 	encodedFunctions, _ := json.Marshal(extracted.String())
+	// The page loads the placement module before its own script, and
+	// updateDeploySelections delegates to it, so the harness loads it the same way
+	// rather than stubbing the decisions the page really makes.
+	placementModule, err := StaticFS.ReadFile("static/js/gigahost_placement.js")
+	if err != nil {
+		t.Fatalf("read placement module: %v", err)
+	}
+	encodedPlacement, _ := json.Marshal(string(placementModule))
 	script := jsdomBootstrapSnippet + fmt.Sprintf(`
-const dom = new JSDOM('<select id="deployPlanSelect"></select><select id="deployRegionSelect"></select><select id="deployOSSelect"></select><button id="btnDeployVPS"></button>', {runScripts:'outside-only'});
+const dom = new JSDOM('<select id="deployPlanSelect"></select><select id="deployRegionSelect"></select><select id="deployPlacementSelect"></select><p id="deployPlacementHint"></p><select id="deployOSSelect"></select><button id="btnDeployVPS"></button>', {runScripts:'outside-only'});
 const w = dom.window;
 w._ = key => key;
 
@@ -52,10 +68,19 @@ w._ = key => key;
 w.cachedPlans = [];
 w.deployPlanSelect = w.document.getElementById('deployPlanSelect');
 w.deployRegionSelect = w.document.getElementById('deployRegionSelect');
+w.deployPlacementSelect = w.document.getElementById('deployPlacementSelect');
+w.deployPlacementHint = w.document.getElementById('deployPlacementHint');
 w.deployOSSelect = w.document.getElementById('deployOSSelect');
 w.btnDeployVPS = w.document.getElementById('btnDeployVPS');
-
-w.eval(%s);
+w.eval(%s);   // the shipped placement module, as the page loads it
+// The page declares its placement-intent owner as a module-scope const, which a
+// function extractor cannot lift. Create the same instance the page creates, after
+// the module defines the constructor and before the helpers use it.
+// Resolve the constructor through the window object: the module was evaluated in
+// the window's script scope, so the bare name is visible to the extracted helpers but
+// not to this harness line.
+w.deploymentPlacementIntent = new w.placementIntent();
+w.eval(%s);   // the extracted page helpers
 
 function setPlans(plans) {
   w.cachedPlans.length = 0;
@@ -149,7 +174,7 @@ w.updateDeployButtonState();
 assert.equal(btn.disabled, true, 'no plans must not be orderable');
 
 console.log('GIGAHOST_SELECTION_OK');dom.window.close();
-`, string(encodedFunctions))
+`, string(encodedPlacement), string(encodedFunctions))
 	out, err := execNodeScript(node, script)
 	if err != nil || !strings.Contains(string(out), "GIGAHOST_SELECTION_OK") {
 		t.Fatalf("deploy selection contract failed: %v\n%s", err, out)

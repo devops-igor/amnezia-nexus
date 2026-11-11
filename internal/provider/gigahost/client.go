@@ -172,7 +172,50 @@ func (c *client) GetAccount(ctx context.Context) (*AccountInfo, error) {
 	return &acc, nil
 }
 
+// orderBody is the documented POST /deploy/servers request body. Field order is
+// kept identical to OrderRequest's, so a provider-chosen (region-only) order
+// serializes to exactly the bytes it did before dc_id existed.
+type orderBody struct {
+	PID           int     `json:"pid"`
+	PriceID       int     `json:"price_id"`
+	RegionID      int     `json:"region_id,omitempty"`
+	DCID          int     `json:"dc_id,omitempty"`
+	OSID          int     `json:"os_id"`
+	BillingPeriod string  `json:"billing_period"`
+	Quantity      int     `json:"quantity"`
+	SSHKeys       []int64 `json:"ssh_keys,omitempty"`
+}
+
+// wireBody renders the placement-specific request body. A pinned order never
+// carries region_id: the provider takes the region from the datacenter, and
+// sending a combination whose precedence the documentation does not define is
+// avoided rather than guessed. An unpinned order never carries dc_id.
+func (r OrderRequest) wireBody() orderBody {
+	body := orderBody{
+		PID:           r.PID,
+		PriceID:       r.PriceID,
+		RegionID:      r.RegionID,
+		OSID:          r.OSID,
+		BillingPeriod: r.BillingPeriod,
+		Quantity:      r.Quantity,
+		SSHKeys:       r.SSHKeys,
+	}
+	if r.DCID > 0 {
+		body.DCID = r.DCID
+		body.RegionID = 0
+	}
+	return body
+}
+
 // OrderServer dispatches an hourly VPS order via POST /deploy/servers.
+//
+// The body is built explicitly per placement mode, because the two documented
+// shapes are different requests, not one request with an optional extra field:
+//
+//   - pinned (DCID > 0): dc_id is sent and region_id is omitted, per "region_id
+//     is then taken from the datacenter and can be left out";
+//   - provider-chosen (DCID == 0): region_id is sent and dc_id is omitted, which
+//     is byte-identical to the body this client sent before dc_id existed.
 func (c *client) OrderServer(ctx context.Context, req OrderRequest) (*OrderResponse, error) {
 	if !strings.EqualFold(req.BillingPeriod, BillingPeriodHourly) {
 		return nil, fmt.Errorf("%w: got %q", ErrInvalidBillingPeriod, req.BillingPeriod)
@@ -180,12 +223,12 @@ func (c *client) OrderServer(ctx context.Context, req OrderRequest) (*OrderRespo
 	if req.Quantity != 1 {
 		return nil, fmt.Errorf("%w: got %d", ErrInvalidQuantity, req.Quantity)
 	}
-	if req.PID <= 0 || req.PriceID <= 0 || req.RegionID <= 0 || req.OSID <= 0 {
+	if req.PID <= 0 || req.PriceID <= 0 || req.OSID <= 0 || (req.RegionID <= 0 && req.DCID <= 0) {
 		return nil, ErrInvalidOrderParam
 	}
 
 	var rawData []byte
-	err := c.doRequest(ctx, http.MethodPost, "/deploy/servers", req, &rawData)
+	err := c.doRequest(ctx, http.MethodPost, "/deploy/servers", req.wireBody(), &rawData)
 	if err != nil {
 		return nil, err
 	}
