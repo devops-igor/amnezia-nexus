@@ -655,8 +655,8 @@ func catalogPlanFor(catalog []gigahost.HourlyPlan, req OrderServerPayload) *giga
 	return nil
 }
 
-//nolint:misspell // "canceled" matches documented provider status and test assertions
-const statusCancelled = "canceled"
+//nolint:misspell // "cancelled" matches documented provider status and test assertions
+const statusCancelled = "cancelled"
 
 func validateOrderAgainstCatalog(catalog []gigahost.HourlyPlan, req OrderServerPayload) error {
 	if len(catalog) == 0 {
