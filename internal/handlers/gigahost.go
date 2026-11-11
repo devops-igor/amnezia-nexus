@@ -926,7 +926,10 @@ func (h *Handlers) refreshOrderFromServers(servers []gigahost.ServerInfo, order 
 // The two are different questions: a provider that repeats the status already on the
 // row changed nothing, yet it is still the freshest confirmation the panel has. Only
 // the returned observation may be presented as a provider read.
-func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord) (bool, GigahostProviderObservation) {
+//
+// live is the inventory already read for this request; it decides one thing - whether a
+// "no such order" answer may be trusted as a cancellation.
+func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord, live []gigahost.ServerInfo) (bool, GigahostProviderObservation) {
 	if strings.HasPrefix(order.OrderID, "unknown_") || strings.HasPrefix(order.OrderID, "intent_") || order.OrderID == "" {
 		return false, GigahostProviderObservation{Outcome: gigahostObservationNotChecked}
 	}
@@ -971,8 +974,15 @@ func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client giga
 		return updated, observation
 	}
 	if errors.Is(deployErr, gigahost.ErrNotFound) && (order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active") {
-		// The provider answered: it has no such order, which is a confirmation of a
-		// cancellation rather than a read failure.
+		// Only a cancellation nothing contradicts: live inventory for this order means the
+		// missing detail record is a partial read failure, and `cancelled` would be terminal,
+		// so later reads would skip the row and inventory could never repair it.
+		if gigahostProviderServerLive(live, order.OrderID) {
+			return false, GigahostProviderObservation{
+				Outcome: gigahostObservationUnconfirmed,
+				Error:   "provider has no detail record for this order while inventory still lists it",
+			}
+		}
 		order.Status = statusCancelled
 		return true, GigahostProviderObservation{Outcome: gigahostObservationConfirmed, Status: statusCancelled}
 	}

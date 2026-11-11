@@ -93,6 +93,21 @@ func isRefreshableOrderID(orderID string) bool {
 		!strings.HasPrefix(orderID, "intent_")
 }
 
+// gigahostProviderServerLive reports whether the inventory lists a live server for this
+// order, i.e. a match whose provider status is not a terminal one.
+//
+// It answers a narrower question than gigahostProviderServerStatus on purpose. A row may
+// legitimately be terminal in the panel while the provider still lists it, so "the
+// inventory mentions this order" alone is not enough to argue against a cancellation -
+// only a match that the provider itself reports as live is.
+func gigahostProviderServerLive(servers []gigahost.ServerInfo, orderID string) bool {
+	status, ok := gigahostProviderServerStatus(servers, orderID)
+	if !ok {
+		return false
+	}
+	return !isTerminalStatus(status)
+}
+
 // gigahostOrderObservations performs the list's provider reads and records what each
 // one actually answered, per order. The rows are modified in place exactly as before;
 // the returned map is the only new fact.
@@ -142,7 +157,7 @@ func (h *Handlers) gigahostOrderObservations(
 		if (isPendingOrInFlight(orders[i].Status) || !updated) && deployQueries < maxDeployQueries {
 			if isRefreshableOrderID(orders[i].OrderID) {
 				deployQueries++
-				rowUpdated, obs := h.refreshOrderFromDeployStatus(ctx, client, &orders[i])
+				rowUpdated, obs := h.refreshOrderFromDeployStatus(ctx, client, &orders[i], servers)
 				if rowUpdated {
 					updated = true
 				}
