@@ -44,8 +44,14 @@ func (h *Handlers) NewGigahostSetupTracker() *gigahostsetup.Tracker {
 	return gigahostsetup.New(h.db, gigahostsetup.Options{
 		Resolve:       h.ResolveGigahostSetupProvider,
 		ChallengeHost: h.challengeGigahostSetupHostIdentity,
-		Interval:      gigahostsetup.DefaultInterval,
-		CallTimeout:   30 * time.Second,
+		// Automatic host trust is wired with both halves it needs: the durable pin
+		// and the ownership proof. Neither is reachable from a request, so wiring
+		// them here grants no job authority; a job must already carry the policy
+		// before either is consulted.
+		FirstContactEligible: h.firstContactEligible,
+		Pinner:               h.db,
+		Interval:             gigahostsetup.DefaultInterval,
+		CallTimeout:          30 * time.Second,
 	})
 }
 
