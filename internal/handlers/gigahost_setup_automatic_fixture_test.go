@@ -69,6 +69,11 @@ const stepHostTrustUnavailableLiteral = "host_trust_unavailable"
 // is the current policy rather than an unreadable host. Spelled for the same reason.
 const stepAutomaticDisabledLiteral = "automatic_setup_disabled"
 
+// stepAutomaticUnavailableLiteral is the step of a job that could not acquire authority
+// because the current policy did not permit it. Distinct from the pin-time step: nothing
+// was granted, so nothing about a host is involved yet.
+const stepAutomaticUnavailableLiteral = "automatic_setup_unavailable"
+
 // automaticOptions is the explicit option set the entry accepts.
 var automaticOptions = AutomaticGigahostSetupOptions{
 	Protocol: models.ProtocolAWG,

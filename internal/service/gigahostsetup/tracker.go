@@ -93,6 +93,11 @@ type Options struct {
 	// assumed enabled. It is consulted at the pin and before each phase, not once
 	// per job, because the setting can change while a job runs.
 	AutomaticEffectAllowed AutomaticEffectAllowed
+	// AutomaticBindingGrantor acquires the scoped authority for an automatic job that
+	// has none yet, from the provider's own association for the order. Nil means no
+	// grant can be issued here, and such a job stays inert exactly as it did before
+	// this existed.
+	AutomaticBindingGrantor AutomaticBindingGrantor
 	// Now is the clock. The zero value means time.Now; tests inject a fake and
 	// advance it, which is how a >60 minute progress window is exercised without
 	// a literal wait.
@@ -114,8 +119,10 @@ type Tracker struct {
 	// effectAllowed is the current unattended-setup permission, asked at each
 	// effect boundary rather than cached.
 	effectAllowed AutomaticEffectAllowed
-	now           func() time.Time
-	nudgeCh       chan struct{}
+	// grantor issues the scoped authority for an automatic job that has none yet.
+	grantor AutomaticBindingGrantor
+	now     func() time.Time
+	nudgeCh chan struct{}
 
 	interval    time.Duration
 	failureBack time.Duration
@@ -138,6 +145,7 @@ func New(store Store, opts Options) *Tracker {
 		eligible:      opts.FirstContactEligible,
 		pinner:        opts.Pinner,
 		effectAllowed: opts.AutomaticEffectAllowed,
+		grantor:       opts.AutomaticBindingGrantor,
 		now:           opts.Now,
 		nudgeCh:       make(chan struct{}, 1),
 		interval:      opts.Interval,
@@ -521,7 +529,19 @@ func (t *Tracker) decideHandoff(
 		return decision
 	}
 
-	// 3. Host identity must be settled: either already bound to a registered
+	// 3. A job that carries automation authority but no binding acquires it here,
+	// from the provider's own association for this exact order. It is asked after the
+	// provider's readiness and association checks above, because those are the facts
+	// the grant is built from, and it is asked before the trust decision below,
+	// because the pin is what the binding authorizes.
+	if decision, granted, ok := t.acquireAutomaticBinding(ctx, reader, intent); ok {
+		if granted != nil {
+			*intent = *granted
+		}
+		return decision
+	}
+
+	// 4. Host identity must be settled: either already bound to a registered
 	// server, or explicitly confirmed by this approval.
 	return t.decideHostTrust(ctx, intent)
 }

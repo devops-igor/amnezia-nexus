@@ -23,13 +23,19 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
-// TestAutomaticJobWithoutAGrantIsInert is the real-consumer negative control.
+// TestAutomaticJobWithoutAGrantIsInert is the real-consumer negative control for a
+// deployment that cannot grant.
 //
-// The job the entry creates has a policy and no binding. The production tracker is
-// run over it with the production challenge against a real loopback peer, and the
-// measured result must be: the identity is observed and offered for confirmation,
-// nothing is pinned, nothing authenticates, and the installer has nothing to claim.
-// The job keeps retrying, which is the fail-closed behaviour, not a lost job.
+// A job the entry created carries a policy and no binding. When this panel has no grantor
+// wired - a supported configuration, and the state of every build until the production
+// tracker wires one - the production tracker runs over it against a real loopback peer
+// and the measured result must be: the identity is observed and offered for
+// confirmation, nothing is pinned, nothing authenticates, and the installer has nothing
+// to claim. The job keeps retrying, which is the fail-closed behaviour, not a lost job.
+//
+// The grant itself is a separate decision with its own controls; see the automatic
+// binding tests. What this case pins down is that the absence of a grantor cannot
+// silently become an absence of gating.
 func TestAutomaticJobWithoutAGrantIsInert(t *testing.T) {
 	env := newInstallEnv(t, models.ProtocolAWG)
 	env.enableAutomaticSetup(true)
@@ -46,7 +52,9 @@ func TestAutomaticJobWithoutAGrantIsInert(t *testing.T) {
 
 	env.startAutomatic(orderID, automaticOptions)
 
-	tracker := env.h.NewGigahostSetupTracker()
+	// A tracker built without a grantor: this deployment cannot issue automatic
+	// authority at all, which is what keeps the job inert.
+	tracker := env.trackerWithGrantor(nil, nil)
 	if tracker == nil {
 		t.Fatal("the tracker was not constructed")
 	}

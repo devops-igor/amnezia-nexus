@@ -61,6 +61,21 @@ type FirstContactEligibility func(ctx context.Context, intent models.GigahostSet
 // approved by a person and is not subject to an unattended-setup setting.
 type AutomaticEffectAllowed func(ctx context.Context, intent models.GigahostSetupIntent) (bool, string)
 
+// AutomaticBindingGrantor acquires the scoped automation authority for a job that
+// carries the policy but no binding yet.
+//
+// It is the one place authority is issued unattended, so it is injected rather than
+// implemented here: the proof depends on the order ledger, the managed credential and
+// the provider's association, none of which this package can read. It returns the
+// current row so the pass continues from what is actually stored - a grant that did not
+// apply is answered with the real state, not with an optimistic copy.
+//
+// Nil means no grant can be issued here, which is a supported configuration: the job
+// simply stays inert, which is the C1 behavior.
+type AutomaticBindingGrantor func(
+	ctx context.Context, intent models.GigahostSetupIntent, reader ProviderReader,
+) (models.GigahostSetupIntent, error)
+
 // stepHostTrustedFirstContact is the recorded step of a job that trusted its own
 // first observation. It is the durable evidence that no person confirmed this
 // identity, which is what the confirmation path refuses to overwrite.
@@ -71,6 +86,18 @@ const stepHostTrustedFirstContact = "host_trusted_first_contact"
 // operator's next action is different: nothing is wrong with the host, and the panel
 // deliberately did not act.
 const stepAutomaticDisabled = "automatic_setup_disabled"
+
+// stepAutomaticUnavailable names a job that could not acquire its authority because the
+// current policy does not permit it. It is separate from the pin-time step because the
+// operator question is different: nothing was granted, so nothing about the host is
+// involved yet.
+const stepAutomaticUnavailable = "automatic_setup_unavailable"
+
+// stepAutomaticGrantUnproven names a job whose scoped authority could not be established
+// from the provider and ledger facts on this pass. It is retryable: the provider may not
+// have published the association yet, and a purchase that is still provisioning is the
+// normal case rather than a fault.
+const stepAutomaticGrantUnproven = "automatic_grant_unproven"
 
 // firstContactEligible asks the injected ownership check whether this job may trust
 // its own first observation.
