@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,6 +31,14 @@ import (
 // h2 is proven rather than assumed.
 func newH2TimingClient(t *testing.T, h http.Handler, onCall func(CallTiming), timeout time.Duration) Client {
 	t.Helper()
+	return newH2TimingClientWithTransport(t, h, onCall, timeout, nil)
+}
+
+// newH2TimingClientWithTransport is newH2TimingClient with the fixture's h2
+// transport optionally wrapped, so a control can intervene in the real
+// transport path without rebuilding the fixture.
+func newH2TimingClientWithTransport(t *testing.T, h http.Handler, onCall func(CallTiming), timeout time.Duration, wrap func(*http.Transport) http.RoundTripper) Client {
+	t.Helper()
 
 	server := httptest.NewUnstartedServer(h)
 	server.EnableHTTP2 = true
@@ -40,10 +50,15 @@ func newH2TimingClient(t *testing.T, h http.Handler, onCall func(CallTiming), ti
 	tr := ownedTransportOf(t, mustDefaultClient(t)).Clone()
 	tr.TLSClientConfig = &tls.Config{RootCAs: roots}
 
+	var transport http.RoundTripper = tr
+	if wrap != nil {
+		transport = wrap(tr)
+	}
+
 	c, err := NewClient(Config{
 		BaseURL:   server.URL,
 		APIKey:    testAPIKey,
-		Transport: tr,
+		Transport: transport,
 		Timeout:   timeout,
 		OnCall:    onCall,
 	})
@@ -61,10 +76,76 @@ func serveEmptyOK(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(emptyServersDoc))
 }
 
+// servedH2RecordViolations lists every way a record from a successful call over
+// a negotiated h2 connection fails the served-response contract. An acceptable
+// record yields an empty list.
+//
+// RequestWrittenMS is deliberately optional. The standard library documents that
+// trace hooks "may be called concurrently from different goroutines and some may
+// be called after the request has completed or failed", and h2 traces the
+// response byte from the connection read loop while it reports the write from
+// the per-stream goroutine. A fast server can therefore answer before that
+// goroutine reports, so demanding the offset asserts an ordering the transport
+// does not provide. What the record must not do is blur the two facts: when the
+// phase was reached its offset is a real measurement, and when it was not it
+// stays the not-reached sentinel instead of a fabricated zero.
+//
+// The offsets are not compared against TotalMS. finish samples the total before
+// it takes the recorder's lock, so a callback that lands in that window stores an
+// offset a few milliseconds past the total the record carries; asserting
+// offset <= TotalMS would fail for a legal interleaving. ValidateTiming already
+// bounds every offset by the record's own duration limit, which is a bound the
+// recorder does guarantee.
+func servedH2RecordViolations(r CallTiming) []string {
+	var violations []string
+
+	if r.Proto != "h2" {
+		violations = append(violations, fmt.Sprintf("proto = %q, want h2", r.Proto))
+	}
+	if r.Outcome != OutcomeOK {
+		violations = append(violations, fmt.Sprintf("outcome = %q, want %q", r.Outcome, OutcomeOK))
+	}
+	if r.Status != http.StatusOK {
+		violations = append(violations, fmt.Sprintf("status = %d, want 200", r.Status))
+	}
+	if r.Operation != "servers_get" {
+		violations = append(violations, fmt.Sprintf("operation = %q, want servers_get", r.Operation))
+	}
+	for _, reached := range []struct {
+		name   string
+		offset int64
+	}{
+		{"get_conn", r.GetConnMS},
+		{"connect", r.ConnectMS},
+		{"first_byte", r.FirstByteMS},
+	} {
+		if reached.offset == phaseNotReached {
+			violations = append(violations, reached.name+" phase not reached")
+		}
+	}
+	if r.LastPhase != phaseFirstByte {
+		violations = append(violations, fmt.Sprintf("last phase = %q, want %q after a served response", r.LastPhase, phaseFirstByte))
+	}
+	if err := ValidateTiming(r); err != nil {
+		violations = append(violations, "record failed its own validation: "+err.Error())
+	}
+	return violations
+}
+
+// requireServedH2Record applies that oracle. The live test and its controls share
+// this one call, so a control cannot pass against a laxer assertion than the one
+// guarding the real transport.
+func requireServedH2Record(t *testing.T, r CallTiming) {
+	t.Helper()
+	for _, violation := range servedH2RecordViolations(r) {
+		t.Errorf("published record: %s (record %+v)", violation, r)
+	}
+}
+
 // TestTimingHTTP2CallRecordsPhasesAndProtocol is the regression: a successful
-// call over a negotiated h2 connection records every phase, the status and the
-// protocol, and publishes exactly one record. On the unsynchronised recorder the
-// race detector reports this test.
+// call over a negotiated h2 connection records the phases it reached, the status
+// and the protocol, and publishes exactly one immutable record. On the
+// unsynchronised recorder the race detector reports this test.
 func TestTimingHTTP2CallRecordsPhasesAndProtocol(t *testing.T) {
 	s := &sink{}
 	c := newH2TimingClient(t, http.HandlerFunc(serveEmptyOK), s.collect, 5*time.Second)
@@ -81,24 +162,190 @@ func TestTimingHTTP2CallRecordsPhasesAndProtocol(t *testing.T) {
 	if r.Proto != "h2" {
 		t.Fatalf("proto = %q, want h2 (the fixture must negotiate HTTP/2 for this test to mean anything)", r.Proto)
 	}
-	if r.Outcome != OutcomeOK {
-		t.Errorf("outcome = %q, want %q", r.Outcome, OutcomeOK)
+	requireServedH2Record(t, r)
+}
+
+// h2WroteRequestGate wraps the fixture's transport and installs an observer
+// trace on the request context. httptrace composes a newer trace ahead of the
+// existing one, so this hook runs before the recorder's hook for the same
+// event: holding it here holds the transport's real WroteRequest callback
+// without inventing, replaying or timestamping a mark.
+type h2WroteRequestGate struct {
+	base    http.RoundTripper
+	entered chan<- struct{}
+	release <-chan struct{}
+	wrote   chan<- struct{}
+}
+
+func (g *h2WroteRequestGate) RoundTrip(req *http.Request) (*http.Response, error) {
+	trace := &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			// WroteRequest may be called more than once for a retried request;
+			// the sends must never block, or a retry would deadlock the fixture.
+			select {
+			case g.entered <- struct{}{}:
+			default:
+			}
+			<-g.release
+			select {
+			case g.wrote <- struct{}{}:
+			default:
+			}
+		},
 	}
-	if r.Status != http.StatusOK {
-		t.Errorf("status = %d, want 200", r.Status)
+	return g.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
+}
+
+// awaitOrFail waits for one value on ch, failing the test with msg if the
+// control's own bounded wait expires. Each waiting step in the controls below is
+// a hard precondition, so a settled step and a hang must not share an assertion.
+func awaitOrFail[T any](t *testing.T, ch <-chan T, wait time.Duration, msg string) T {
+	t.Helper()
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(wait):
+		t.Fatal(msg)
+		var zero T
+		return zero
 	}
-	if r.Operation != "servers_get" {
-		t.Errorf("operation = %q, want servers_get", r.Operation)
+}
+
+// TestTimingHTTP2RequestWrittenAfterPublicationKeepsTruthfulRecord is the
+// deterministic control for the optional phase, driven through the real h2
+// transport.
+//
+// The request headers are flushed before the transport traces the write, so the
+// server answers, the read loop traces the first response byte and the request
+// goroutine publishes the record while WroteRequest is still held. This is the
+// ordering the earlier strict assertion could not survive: the record legitimately
+// carries the not-reached sentinel for a phase the transport reports later than
+// the response. The shared oracle must accept that record, and the callback that
+// resumes afterwards must not reach it.
+func TestTimingHTTP2RequestWrittenAfterPublicationKeepsTruthfulRecord(t *testing.T) {
+	const wait = 5 * time.Second
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	wrote := make(chan struct{}, 1)
+
+	// Released on every exit path so a failed assertion cannot strand the
+	// transport's stream goroutine and block fixture teardown.
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseGate()
+
+	published := make(chan CallTiming, 1)
+	s := &sink{}
+	collect := func(rec CallTiming) {
+		s.collect(rec)
+		published <- rec
 	}
-	if r.GetConnMS == phaseNotReached || r.ConnectMS == phaseNotReached ||
-		r.RequestWrittenMS == phaseNotReached || r.FirstByteMS == phaseNotReached {
-		t.Errorf("expected connection and response phases reached over h2, got %+v", r)
+
+	c := newH2TimingClientWithTransport(t, http.HandlerFunc(serveEmptyOK), collect, wait,
+		func(tr *http.Transport) http.RoundTripper {
+			return &h2WroteRequestGate{base: tr, entered: entered, release: release, wrote: wrote}
+		})
+
+	callErr := make(chan error, 1)
+	go func() {
+		_, err := c.GetServers(context.Background())
+		callErr <- err
+	}()
+
+	awaitOrFail(t, entered, wait,
+		"the h2 transport never traced WroteRequest: the control did not reach the write path")
+	record := awaitOrFail(t, published, wait,
+		"no record was published while WroteRequest was held: publication is waiting on the write callback")
+
+	// The strict assertion this control exists for required this offset. Stating
+	// it as a fact about the record is what makes the control sensitive to it.
+	if record.RequestWrittenMS != phaseNotReached {
+		t.Fatalf("request written = %d ms, want the not-reached sentinel: the control did not produce the late-callback ordering",
+			record.RequestWrittenMS)
 	}
-	if r.LastPhase != phaseFirstByte {
-		t.Errorf("last phase = %q, want %q after a served response", r.LastPhase, phaseFirstByte)
+	if record.LastPhase != phaseFirstByte {
+		t.Errorf("last phase = %q, want %q", record.LastPhase, phaseFirstByte)
 	}
-	if err := ValidateTiming(r); err != nil {
-		t.Errorf("record failed its own validation: %v", err)
+	requireServedH2Record(t, record)
+
+	// Release the held callback: it must actually resume on the real transport,
+	// which is what makes it a late callback rather than one that never fired.
+	releaseGate()
+	awaitOrFail(t, wrote, wait,
+		"the held WroteRequest callback never resumed on the real h2 transport")
+	if err := awaitOrFail(t, callErr, wait,
+		"GetServers did not return after the write callback was released"); err != nil {
+		t.Fatalf("GetServers over h2: %v", err)
+	}
+
+	// The assertions below hold whichever way the resumed callback races the
+	// request goroutine: finish is closed, so it can neither append a record nor
+	// alter the copy already handed to the sink.
+	records := s.all()
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want exactly 1", len(records))
+	}
+	if records[0] != record {
+		t.Errorf("the late request-written callback mutated the published record:\n got %+v\nwant %+v", records[0], record)
+	}
+}
+
+// TestServedH2RecordOracleRejectsUnreachedOrInvalidPhases is the sensitivity
+// control for the shared oracle: each case must fail for its own stated reason,
+// so an empty violation list means the record was examined rather than ignored.
+// These are records assembled in memory to probe the oracle, not transport claims.
+func TestServedH2RecordOracleRejectsUnreachedOrInvalidPhases(t *testing.T) {
+	// A record with request_written absent, which is the ordering the transport
+	// is allowed to produce and the one the live control publishes.
+	served := CallTiming{
+		Method: "GET", Operation: "servers_get", Outcome: OutcomeOK,
+		Status: http.StatusOK, TotalMS: 20, LastPhase: phaseFirstByte, Proto: "h2",
+		GetConnMS: 1, DNSMS: 2, ConnectMS: 3, TLSMS: 4,
+		RequestWrittenMS: phaseNotReached, FirstByteMS: 10,
+	}
+	if violations := servedH2RecordViolations(served); len(violations) != 0 {
+		t.Fatalf("oracle rejected a valid served record: %v (record %+v)", violations, served)
+	}
+
+	// The same record with the phase measured: also acceptable, so the absent
+	// offset is tolerated rather than required.
+	onTime := served
+	onTime.RequestWrittenMS = 8
+	if violations := servedH2RecordViolations(onTime); len(violations) != 0 {
+		t.Fatalf("oracle rejected a valid record with a measured write offset: %v (record %+v)", violations, onTime)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*CallTiming)
+		want   string
+	}{
+		{"first byte never reached", func(c *CallTiming) { c.FirstByteMS = phaseNotReached }, "first_byte phase not reached"},
+		{"connection never reached", func(c *CallTiming) { c.GetConnMS = phaseNotReached }, "get_conn phase not reached"},
+		{"connect never reached", func(c *CallTiming) { c.ConnectMS = phaseNotReached }, "connect phase not reached"},
+		{"write offset below the sentinel", func(c *CallTiming) { c.RequestWrittenMS = -2 }, "phase offset out of bounds"},
+		{"first byte offset above the duration limit", func(c *CallTiming) { c.FirstByteMS = maxCallDurationMS + 1 }, "phase offset out of bounds"},
+		{"write offset above the duration limit", func(c *CallTiming) { c.RequestWrittenMS = maxCallDurationMS + 1 }, "phase offset out of bounds"},
+		{"total above the duration limit", func(c *CallTiming) { c.TotalMS = maxCallDurationMS + 1 }, "duration"},
+		{"last phase behind the response", func(c *CallTiming) { c.LastPhase = phaseRequestWritten }, "last phase"},
+		{"last phase outside the closed set", func(c *CallTiming) { c.LastPhase = "/deploy/servers" }, "not allowlisted"},
+		{"protocol not negotiated", func(c *CallTiming) { c.Proto = "http/1.1" }, "proto"},
+		{"outcome not successful", func(c *CallTiming) { c.Outcome = OutcomeHTTPStatus }, "outcome"},
+		{"status not successful", func(c *CallTiming) { c.Status = http.StatusBadGateway }, "status"},
+		{"operation not the fixed label", func(c *CallTiming) { c.Operation = "other" }, "operation"},
+	}
+	for _, tc := range cases {
+		record := served
+		tc.mutate(&record)
+		violations := servedH2RecordViolations(record)
+		if len(violations) == 0 {
+			t.Errorf("%s: oracle accepted an invalid record %+v", tc.name, record)
+			continue
+		}
+		if !strings.Contains(strings.Join(violations, "; "), tc.want) {
+			t.Errorf("%s: violations = %v, want one mentioning %q", tc.name, violations, tc.want)
+		}
 	}
 }
 
