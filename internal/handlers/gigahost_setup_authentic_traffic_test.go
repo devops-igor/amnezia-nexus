@@ -18,11 +18,18 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 )
+
+// errFixturePurchaseRefused is returned by the fixture provider when any purchase path is
+// called. Reaching it at all is the failure the counter exists to detect.
+var errFixturePurchaseRefused = errors.New("this fixture never performs purchase work")
 
 // authenticTrafficFixture wires one automatic job to a real VLESS endpoint.
 type authenticTrafficFixture struct {
@@ -31,69 +38,202 @@ type authenticTrafficFixture struct {
 	orderID          string
 	providerServerID int64
 	pinnedPresented  string
+	// purchaseAttempts counts purchase-path calls the provider client received.
+	purchaseAttempts *atomic.Int64
 }
 
-// newAuthenticTrafficJob builds a production-entry automatic job whose install will qualify
-// against a real VLESS endpoint.
+// newAuthenticTrafficJob builds the starting state a real purchase leaves: purchase stamp plus
+// managed credential, and NO resource association, grant or pin.
 //
-// The SSH boundary is installed BEFORE the tracking pass, so the first-contact challenge and
-// the install see the same identity and the pin is preserved rather than re-pointed.
+// It deliberately does not call grantAutomationTrust, does not seed an address, and does not
+// touch the stored fingerprint. Those facts are produced by the production tracking pass below,
+// which is the point of this checkpoint.
 func newAuthenticTrafficJob(
 	t *testing.T, orderID string, providerServerID int64, acceptRequests bool,
 ) *authenticTrafficFixture {
 	t.Helper()
 
 	env := newInstallEnv(t, models.ProtocolVLESS)
-	// One SSH identity for the whole job: challenge and install observe the same peer.
+	// One SSH identity for the whole job: the first-contact challenge and the install observe
+	// the same peer, so the pin is preserved rather than re-pointed later.
 	env.useAuthenticSSHBoundary()
-	// And qualification is the PRODUCTION probe, not the shared fixture's success callback.
+	// Qualification is the PRODUCTION probe, not the shared fixture's success callback.
 	env.useAuthenticQualification()
 
 	endpoint := startAuthenticTrafficFixture(t, acceptRequests)
 	t.Cleanup(endpoint.stop)
 
-	const ip = "127.0.0.1"
-	env.seedAutomaticOrder(orderID, providerServerID, ip)
-	env.providerServes(orderID, providerServerID, ip)
+	// --- the purchase: stamp + credential, and nothing else -------------------------------
+	key := newManagedTestKey(t)
+	env.seedFreshPurchase(orderID, key)
+	// The provider knows the order and its server; the LEDGER does not, which is exactly the
+	// state after a purchase whose provisioning has just finished.
+	env.providerServes(orderID, providerServerID, "127.0.0.1")
+
+	// A rejecting purchase counter: any purchase-path call is recorded and refused, so "zero
+	// purchases" is a counted fact from the process that would have made them.
+	var purchases atomic.Int64
+	env.provider.orderServerFn = func(context.Context, gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+		purchases.Add(1)
+		return nil, errFixturePurchaseRefused
+	}
+	env.provider.orderServerSafeFn = func(context.Context, gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
+		purchases.Add(1)
+		return nil, errFixturePurchaseRefused
+	}
 
 	// The protocol manager's AddClient is the production provisioning contract: it returns the
-	// credentials the backend will actually use. Returning this fixture's real VLESS
-	// parameters is what makes production derivation produce this endpoint and this
-	// forwarding destination - no override, no rewrite of any stored row.
+	// credentials the backend will actually use, which is how production derivation ends up
+	// pointing at this fixture's endpoint and origin with no override.
 	host, port := splitEndpointHostPort(t, endpoint.endpoint)
 	env.provisionVLESSIdentity(t, host, port, endpoint.params)
 
 	env.enableAutomaticSetup(true)
-	// The recorded port must be the port the real endpoint listens on: production dials
-	// `FormatEndpoint(server.Host, port)` from the tunnel, so a mismatch would be a fixture
-	// error masquerading as a qualification failure.
 	_, endpointPort := splitEndpointHostPort(t, endpoint.endpoint)
 	env.startAutomatic(orderID, AutomaticGigahostSetupOptions{
 		Protocol: models.ProtocolVLESS,
 		Port:     fmt.Sprintf("%d", endpointPort),
 	})
-	env.grantAutomationTrust(orderID, providerServerID)
 
-	// A production tracking pass discovers, associates, grants and pins.
+	// --- assert the starting state is genuinely bare --------------------------------------
+	requireNoAuthorityYet(t, env, orderID, "before the production tracking pass")
+
+	// --- production background consumers acquire everything --------------------------------
 	if err := env.h.NewGigahostSetupTracker().RunOnce(context.Background()); err != nil {
 		t.Fatalf("tracking pass: %v", err)
 	}
 	env.requireState(orderID, models.SetupStateReadyForSetup)
 
-	pinned := env.intent(orderID).HostFingerprint
-	if pinned == "" {
-		t.Fatal("precondition: the job was not pinned")
+	// The chain produced the association, the grant and the pin. Each is asserted, because a
+	// pass that silently skipped one could still reach ready_for_setup in some configurations.
+	order, found, err := env.db.GetGigahostOrder(context.Background(), orderID)
+	if err != nil || !found {
+		t.Fatalf("read order after tracking: found=%v err=%v", found, err)
 	}
-	// The pin must already be the identity this fixture's SSH boundary presents. If it were
-	// not, a later "alignment" would be a rewrite, which this checkpoint forbids.
-	requireNoFingerprintRewrite(t, pinned, installFixtureFingerprint, "before install")
+	if order.ServerID != providerServerID {
+		t.Fatalf("the background pass did not record the provider server id: ledger has %d, want %d",
+			order.ServerID, providerServerID)
+	}
+	if order.AssignedIP == "" {
+		t.Fatal("the background pass did not record the provider address on the ledger")
+	}
+
+	granted := env.intent(orderID)
+	if granted.HostTrustOrderID != orderID || granted.HostTrustServerID != providerServerID {
+		t.Fatalf("the background pass did not acquire the scoped grant: order=%q server=%d",
+			granted.HostTrustOrderID, granted.HostTrustServerID)
+	}
+	if granted.HostTrustGrantedAt.IsZero() {
+		t.Fatal("the background pass did not record when the grant was issued")
+	}
+	if granted.HostFingerprint == "" {
+		t.Fatal("the background pass did not pin a host identity")
+	}
+	// The pin is the identity this fixture's SSH boundary presents, and it was never rewritten.
+	requireNoFingerprintRewrite(t, granted.HostFingerprint, installFixtureFingerprint, "after tracking")
 
 	return &authenticTrafficFixture{
 		installEnv:       env,
 		endpoint:         endpoint,
 		orderID:          orderID,
 		providerServerID: providerServerID,
-		pinnedPresented:  pinned,
+		pinnedPresented:  granted.HostFingerprint,
+		purchaseAttempts: &purchases,
+	}
+}
+
+// requireNoAuthorityYet asserts the starting state carries no resource association, no grant and
+// no pin - the facts the production background chain must produce.
+func requireNoAuthorityYet(t *testing.T, env *installEnv, orderID, when string) {
+	t.Helper()
+	ctx := context.Background()
+
+	intent := env.intent(orderID)
+	if intent.HostTrustOrderID != "" || intent.HostTrustServerID != 0 ||
+		intent.HostTrustAddress != "" || intent.HostTrustKeyID != 0 {
+		t.Fatalf("%s: the job already carries a binding: order=%q server=%d address=%q key=%d",
+			when, intent.HostTrustOrderID, intent.HostTrustServerID,
+			intent.HostTrustAddress, intent.HostTrustKeyID)
+	}
+	if !intent.HostTrustGrantedAt.IsZero() {
+		t.Fatalf("%s: the job already carries a grant timestamp", when)
+	}
+	if intent.HostFingerprint != "" {
+		t.Fatalf("%s: the job already carries a pinned identity: %q", when, intent.HostFingerprint)
+	}
+	if intent.HostTrustPolicy != models.SetupTrustPolicyFirstContact {
+		t.Fatalf("%s: policy = %q, want %q", when, intent.HostTrustPolicy,
+			models.SetupTrustPolicyFirstContact)
+	}
+
+	order, found, err := env.db.GetGigahostOrder(ctx, orderID)
+	if err != nil || !found {
+		t.Fatalf("%s: read order: found=%v err=%v", when, found, err)
+	}
+	if order.AssignedIP != "" || order.ServerID != 0 {
+		t.Fatalf("%s: the ledger already carries a resource association: address=%q server=%d",
+			when, order.AssignedIP, order.ServerID)
+	}
+	if order.PurchaseOrigin != models.PurchaseOriginPanelPurchase {
+		t.Fatalf("%s: the purchase stamp is %q, want %q", when, order.PurchaseOrigin,
+			models.PurchaseOriginPanelPurchase)
+	}
+}
+
+// countRegisteredServersForProvider counts the panel server rows claiming this provider server.
+func (f *authenticTrafficFixture) countRegisteredServersForProvider(t *testing.T) int {
+	t.Helper()
+	servers, err := f.db.GetAllServers(context.Background())
+	if err != nil {
+		t.Fatalf("list servers: %v", err)
+	}
+	count := 0
+	for k := range servers {
+		if servers[k].Protocols == nil {
+			continue
+		}
+		if provider, _ := servers[k].Protocols["provider"].(string); provider != "gigahost" {
+			continue
+		}
+		if matchProviderServerID(servers[k].Protocols["provider_server_id"], f.providerServerID) {
+			count++
+		}
+	}
+	return count
+}
+
+// countEnrollmentsForProvider counts durable enrollment markers for this backend.
+func (f *authenticTrafficFixture) countEnrollmentsForProvider(t *testing.T) int {
+	t.Helper()
+	servers, err := f.db.GetAllServers(context.Background())
+	if err != nil {
+		t.Fatalf("list servers: %v", err)
+	}
+	marks, err := f.db.GetBackendPendingEnrollments(context.Background())
+	if err != nil {
+		t.Fatalf("read durable enrollment markers: %v", err)
+	}
+	count := 0
+	for k := range servers {
+		if servers[k].Protocols == nil {
+			continue
+		}
+		if provider, _ := servers[k].Protocols["provider"].(string); provider != "gigahost" {
+			continue
+		}
+		if matchProviderServerID(servers[k].Protocols["provider_server_id"], f.providerServerID) &&
+			marks[servers[k].ID] {
+			count++
+		}
+	}
+	return count
+}
+
+// requireNoPurchases asserts no purchase-path call was made.
+func (f *authenticTrafficFixture) requireNoPurchases(t *testing.T, when string) {
+	t.Helper()
+	if n := f.purchaseAttempts.Load(); n != 0 {
+		t.Fatalf("%s: the provider received %d purchase-path calls, want 0", when, n)
 	}
 }
 
@@ -156,10 +296,47 @@ func TestAutomaticSetupAdmitsAfterAuthenticVLESSRequestReply(t *testing.T) {
 	if final.HostTrustPolicy != models.SetupTrustPolicyFirstContact {
 		t.Fatalf("the automation provenance was rewritten to %q", final.HostTrustPolicy)
 	}
-	// One install, one enrollment, no replay.
+	// One install, one registration, one enrollment, and no purchase anywhere.
 	if n := f.counters.totalInstalls(); n != 1 {
 		t.Fatalf("protocol installs = %d, want exactly 1", n)
 	}
+	if n := f.countRegisteredServersForProvider(t); n != 1 {
+		t.Fatalf("registered panel servers for this provider server = %d, want exactly 1", n)
+	}
+	if n := f.countEnrollmentsForProvider(t); n != 0 {
+		t.Fatalf("durable enrollment markers for the admitted backend = %d, want 0", n)
+	}
+	f.requireNoPurchases(t, "after admission")
+
+	// A repeated normal tracker+installer pass must add nothing: no second install, no second
+	// registration, no second enrollment, and still no purchase.
+	beforeInstalls := f.counters.totalInstalls()
+	beforeServers := f.countRegisteredServersForProvider(t)
+	if err := f.h.NewGigahostSetupTracker().RunOnce(ctx); err != nil {
+		t.Fatalf("second tracking pass: %v", err)
+	}
+	if err := f.h.NewGigahostSetupInstaller().RunOnce(ctx); err != nil {
+		t.Fatalf("second install pass: %v", err)
+	}
+	if n := f.counters.totalInstalls(); n != beforeInstalls {
+		t.Fatalf("a repeated pass installed again: installs went from %d to %d", beforeInstalls, n)
+	}
+	if n := f.countRegisteredServersForProvider(t); n != beforeServers {
+		t.Fatalf("a repeated pass registered another server: %d, want %d", n, beforeServers)
+	}
+	if n := f.countEnrollmentsForProvider(t); n != 0 {
+		t.Fatalf("a repeated pass left %d durable enrollment markers", n)
+	}
+	f.requireNoPurchases(t, "after a repeated pass")
+
+	// The backend is still admitted exactly once after the repeat.
+	if !authenticPoolContains(t, f.installEnv, server.ID) {
+		t.Fatal("a repeated pass removed the admitted backend from the pool")
+	}
+	if got := f.intent(orderID); got.State != models.SetupStateReady {
+		t.Fatalf("a repeated pass changed the terminal state to %q", got.State)
+	}
+	requireNoFingerprintRewrite(t, f.intent(orderID).HostFingerprint, f.pinnedPresented, "after a repeated pass")
 }
 
 // TestAutomaticSetupRefusesWhenTheOriginNeverReplies is the A2 negative for the subtlest case.
@@ -211,6 +388,7 @@ func TestAutomaticSetupRefusesWhenTheOriginNeverReplies(t *testing.T) {
 	}
 	// The pin survives the refusal untouched.
 	requireNoFingerprintRewrite(t, final.HostFingerprint, f.pinnedPresented, "after refusal")
+	f.requireNoPurchases(t, "after a refused admission")
 }
 
 // TestAutomaticSetupRefusesWhenVLESSAuthenticationIsRejected is the A2 negative for wrong
@@ -261,4 +439,5 @@ func TestAutomaticSetupRefusesWhenVLESSAuthenticationIsRejected(t *testing.T) {
 	if !authenticDurableQuarantine(t, f.installEnv, reg.ID) {
 		t.Fatal("the durable quarantine was released without authentication")
 	}
+	f.requireNoPurchases(t, "after a rejected authentication")
 }
