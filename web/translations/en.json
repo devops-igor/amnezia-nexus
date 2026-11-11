@@ -734,6 +734,7 @@
   "deploy_vps_no_region_stock": "No region currently has stock for this plan",
   "deploy_vps_no_os": "No operating system is installable on this plan",
   "deploy_vps_catalog_unavailable": "Provider catalog unavailable",
+  "deploy_vps_catalog_stale": "Showing a cached catalog from {age}. Prices and availability may be out of date.",
   "deploy_vps_select_required": "Select a region and an operating system first",
   "deploy_vps_order_placed": "VPS order placed successfully",
   "setup_intents_title": "Saved Setup Approvals",
