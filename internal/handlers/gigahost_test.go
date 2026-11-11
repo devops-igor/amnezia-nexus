@@ -124,7 +124,7 @@ func fixtureHourlyPlan() gigahost.HourlyPlan {
 		HourlyRateNOK:  0.14375,
 		MonthlyCeiling: 90,
 		Regions:        []gigahost.Region{{ID: 1, Name: "Norway", Country: "NO", Available: true, InStock: &inStock}},
-		Datacenters:    []gigahost.Datacenter{{ID: 1, Name: "DC1", RegionID: 1, Location: "Sandefjord", Country: "NO", InStock: true}},
+		Datacenters:    []gigahost.Datacenter{{ID: 1, Name: "DC1", RegionID: 1, Location: "Sandefjord", Country: "NO", InStock: &inStock}},
 		Eligibility:    gigahost.CatalogEligibility{QualifiesArrears: true},
 	}
 }

@@ -373,6 +373,11 @@
                         <select class="form-select" id="deployRegionSelect"></select>
                     </div>
                     <div class="form-group">
+                        <label class="form-label" for="deployPlacementSelect">{{ _ "deploy_vps_placement_label" }}</label>
+                        <select class="form-select" id="deployPlacementSelect"></select>
+                        <p class="form-hint" id="deployPlacementHint" style="display:none;"></p>
+                    </div>
+                    <div class="form-group">
                         <label class="form-label" for="deployOSSelect">{{ _ "deploy_vps_select_os" }}</label>
                         <select class="form-select" id="deployOSSelect"></select>
                     </div>
@@ -418,6 +423,9 @@
 <script src="/static/js/gigahost_catalog_status.js"></script>
 <script src="/static/js/gigahost_setup.js"></script>
 <script src="/static/js/gigahost_setup_intents.js"></script>
+<script src="/static/js/gigahost_order_status_model.js"></script>
+<script src="/static/js/gigahost_order_status.js"></script>
+<script src="/static/js/gigahost_placement.js"></script>
 <script>
     document.getElementById('ssl_enabled').addEventListener('change', (e) => {
         document.getElementById('sslFields').style.display = e.target.checked ? 'block' : 'none';
@@ -633,9 +641,60 @@
     const btnDeployVPS = document.getElementById('btnDeployVPS');
     const deployPlanSelect = document.getElementById('deployPlanSelect');
     const deployRegionSelect = document.getElementById('deployRegionSelect');
+    const deployPlacementSelect = document.getElementById('deployPlacementSelect');
+    const deployPlacementHint = document.getElementById('deployPlacementHint');
     const deployOSSelect = document.getElementById('deployOSSelect');
 
     let cachedPlans = [];
+
+    // The rule lives in the module so it cannot drift between rebuilds and choice.
+    const deploymentPlacementIntent = placementNewIntent();
+
+    // Recomputed per call, so a catalog refresh is always the authority.
+    function deployPlacementChoices() {
+        return placementChoices(deployPlanAt(), deployRegionSelect ? deployRegionSelect.value : null);
+    }
+
+    // Explains a refusal or dropped choice; never enables ordering.
+    function showDeployPlacementHint(text) {
+        if (!deployPlacementHint) return;
+        deployPlacementHint.textContent = text || '';
+        deployPlacementHint.style.display = text ? 'block' : 'none';
+    }
+    // Rebuilds from the provider's facts; may only ARM the latch, never release it.
+    function rebuildDeployPlacement(previous) {
+        const choices = deployPlacementChoices();
+        if (!deployPlacementSelect) return {value: '', cleared: false, reason: ''};
+        deployPlacementSelect.innerHTML = '';
+
+        const managed = document.createElement('option');
+        managed.value = choices.managed.value;
+        managed.textContent = choices.managed.label;
+        deployPlacementSelect.appendChild(managed);
+
+        choices.options.forEach(option => {
+            const opt = document.createElement('option');
+            // A refused datacenter still carries a distinct value, so choosing it is
+            // an explicit refusal rather than a silent default.
+            opt.value = option.value;
+            opt.textContent = placementLabel(option);
+            opt.disabled = !option.selectable;
+            deployPlacementSelect.appendChild(opt);
+        });
+
+        const decision = placementSelection(choices, previous);
+        deployPlacementSelect.value = decision.value;
+        deployPlacementSelect.disabled = false;
+        showDeployPlacementHint(decision.cleared ? decision.reason : (choices.note || ''));
+        // Automatic rebuild: this can only arm the outstanding-choice latch.
+        deploymentPlacementIntent.rebind(decision);
+        return decision;
+    }
+
+    // deployPlacementNeedsChoice reports whether a dropped pin still needs a choice.
+    function deployPlacementNeedsChoice() {
+        return deploymentPlacementIntent.needed();
+    }
 
     // deployPlanAt returns the plan the plan selector currently points at, or
     // null. The selector's value is the plan index into cachedPlans; an empty
@@ -686,9 +745,15 @@
             renderDeployCatalogStale(res);
             cachedPlans = (res && res.plans) ? res.plans : [];
             if (cachedPlans.length === 0) {
+                // An empty result destroys the pin, so record the loss first: the
+                // operator's explicit choice must not evaporate into a later
+                // recovery that looks like a fresh managed selection.
+                deploymentPlacementIntent.lost(deployPlacementSelect ? deployPlacementSelect.value : null);
                 appendDeployOption(deployPlanSelect, _('deploy_vps_no_plans'));
                 appendDeployOption(deployRegionSelect, _('deploy_vps_no_plans'));
+                if (deployPlacementSelect) appendDeployOption(deployPlacementSelect, _('deploy_vps_no_plans'));
                 appendDeployOption(deployOSSelect, _('deploy_vps_no_plans'));
+                // Automatic event: an outstanding choice survives it.
                 updateDeployButtonState();
                 return;
             }
@@ -700,14 +765,27 @@
                 opt.textContent = deployPlanLabel(p);
                 deployPlanSelect.appendChild(opt);
             });
-            updateDeploySelections(null);
+            // Re-examine the CURRENT choices, so a datacenter whose stock vanished
+            // between reads is dropped rather than re-defaulted to region-managed.
+            updateDeploySelections({
+                region: deployRegionSelect ? deployRegionSelect.value : null,
+                os: deployOSSelect ? deployOSSelect.value : null,
+                placement: deployPlacementSelect ? deployPlacementSelect.value : null
+            });
         } catch (err) {
+            // A failed read destroys the pin and the displayed catalog answer, so
+            // record the loss before the selectors are replaced.
+            deploymentPlacementIntent.lost(deployPlacementSelect ? deployPlacementSelect.value : null);
             renderDeployCatalogStale(null);
             cachedPlans = [];
             const message = _('deploy_vps_catalog_unavailable');
             appendDeployOption(deployPlanSelect, message);
             appendDeployOption(deployRegionSelect, message);
+            if (deployPlacementSelect) appendDeployOption(deployPlacementSelect, message);
             appendDeployOption(deployOSSelect, message);
+            // No pin survives a failed read, but the latch stays armed so the
+            // recovery cannot become an unchosen region-managed purchase.
+            showDeployPlacementHint('');
             updateDeployButtonState();
         } finally {
             if (loading) loading.style.display = 'none';
@@ -726,7 +804,9 @@
 
         if (!plan) {
             appendDeployOption(deployRegionSelect, _('deploy_vps_no_plans'));
+            if (deployPlacementSelect) appendDeployOption(deployPlacementSelect, _('deploy_vps_no_plans'));
             appendDeployOption(deployOSSelect, _('deploy_vps_no_plans'));
+            // Automatic rebuild: never clears an outstanding choice.
             updateDeployButtonState();
             return;
         }
@@ -748,6 +828,11 @@
                 deployRegionSelect.disabled = false;
             }
         }
+
+        // Rebuild from the new plan and the surviving region, so a pin the new pair
+        // cannot honour is dropped rather than reaching the payload.
+        // The rebuild sets the latch itself when it drops a pin; it never clears it.
+        rebuildDeployPlacement(previous ? previous.placement : null);
 
         const images = plan.os_options || [];
         if (deployOSSelect) {
@@ -776,149 +861,11 @@
         if (!btnDeployVPS) return;
         const ready = !!deployPlanAt()
             && !!deployRegionSelect && deployRegionSelect.value !== ''
-            && !!deployOSSelect && deployOSSelect.value !== '';
+            && !!deployOSSelect && deployOSSelect.value !== ''
+            // A dropped pin blocks ordering until the operator chooses again. The
+            // stored choice is not silently read as region-managed placement.
+            && !deployPlacementNeedsChoice();
         btnDeployVPS.disabled = !ready;
-    }
-
-    let gigahostPollTimer = null;
-    function scheduleRecentOrdersPolling(orders) {
-        const inProgress = orders && orders.some(o => o.status === 'deploying' || o.status === 'pending' || o.status === 'waiting' || o.status === 'ssh_verifying' || o.status === 'installing_protocol' || o.status === 'enabling_backend');
-        if (inProgress && !gigahostPollTimer) {
-            gigahostPollTimer = setTimeout(() => {
-                gigahostPollTimer = null;
-                loadRecentOrders();
-            }, 3000);
-        }
-    }
-
-    async function loadRecentOrders() {
-        const container = document.getElementById('recentOrdersContainer');
-        if (!container) return;
-        const renderEmpty = () => {
-            const emptySpan = document.createElement('span');
-            emptySpan.className = 'text-muted';
-            emptySpan.textContent = _('no_matching_records');
-            container.replaceChildren(emptySpan);
-        };
-        try {
-            const res = await API.get('/api/admin/hosting/gigahost/orders');
-            const orders = (res && res.orders) ? res.orders : [];
-            if (orders.length === 0) {
-                renderEmpty();
-                return;
-            }
-            scheduleRecentOrdersPolling(orders);
-
-            // Enrich active/recent orders with deploy status DTO diagnostics
-            await Promise.all(orders.slice(0, 5).map(async (o) => {
-                if (!o.order_id) return;
-                try {
-                    const response = await API.get('/api/admin/hosting/gigahost/orders/' + encodeURIComponent(o.order_id) + '/status');
-                    const st = response && (response.deploy || response);
-                    if (st) {
-                        if (st.step) o.step = st.step;
-                        if (st.error) o.last_error = st.error;
-                        if (st.server_id) o.nexus_server_id = st.server_id;
-                        if (st.status === 'failed') o.status = 'failed';
-                        else if (st.status === 'ready' && st.server_id > 0) o.nexus_onboarded = true;
-                    }
-                } catch (_) {}
-            }));
-
-            const list = document.createElement('div');
-            list.style.display = 'flex';
-            list.style.flexDirection = 'column';
-            list.style.gap = '6px';
-            orders.slice(0, 5).forEach(o => {
-                const badgeClass = (o.status === 'ready' && o.nexus_onboarded) ? 'badge-success' : (o.status === 'failed' ? 'badge-danger' : 'badge-warn');
-                const row = document.createElement('div');
-                row.style.display = 'flex';
-                row.style.justifyContent = 'space-between';
-                row.style.alignItems = 'center';
-                row.style.padding = '6px 0';
-                row.style.borderBottom = '1px solid rgba(255,255,255,0.05)';
-
-                const left = document.createElement('div');
-                const idSpan = document.createElement('span');
-                idSpan.style.fontFamily = 'monospace';
-                idSpan.style.fontWeight = '600';
-                idSpan.textContent = '#' + (o.order_id || '');
-                left.appendChild(idSpan);
-
-                if (o.assigned_ip) {
-                    const ipSpan = document.createElement('span');
-                    ipSpan.style.fontFamily = 'monospace';
-                    ipSpan.style.marginLeft = '6px';
-                    ipSpan.style.color = 'var(--text-secondary)';
-                    ipSpan.textContent = o.assigned_ip;
-                    left.appendChild(ipSpan);
-                }
-
-                if (o.step && (!o.nexus_onboarded || o.status !== 'ready')) {
-                    const stepSpan = document.createElement('span');
-                    stepSpan.style.fontSize = '0.75rem';
-                    stepSpan.style.marginLeft = '8px';
-                    stepSpan.style.color = 'var(--text-muted)';
-                    stepSpan.textContent = '[' + o.step + ']';
-                    left.appendChild(stepSpan);
-                }
-
-                if (o.last_error && o.status === 'failed') {
-                    const errSpan = document.createElement('span');
-                    errSpan.style.fontSize = '0.75rem';
-                    errSpan.style.marginLeft = '8px';
-                    errSpan.style.color = 'var(--danger-color, #e53e3e)';
-                    errSpan.textContent = o.last_error;
-                    left.appendChild(errSpan);
-                }
-
-                const right = document.createElement('div');
-                right.style.display = 'flex';
-                right.style.alignItems = 'center';
-                right.style.gap = '6px';
-
-                const badge = document.createElement('span');
-                badge.className = 'badge ' + badgeClass;
-                badge.style.fontSize = '0.75rem';
-                badge.textContent = (o.status === 'ready' && !o.nexus_onboarded) ? 'vps_ready' : (o.status || '');
-                right.appendChild(badge);
-
-                if (o.status === 'failed') {
-                    const btnRetry = document.createElement('button');
-                    btnRetry.type = 'button';
-                    btnRetry.className = 'btn btn-secondary';
-                    btnRetry.style.padding = '2px 8px';
-                    btnRetry.style.fontSize = '0.75rem';
-                    btnRetry.textContent = _('deploy_retry_btn') || 'Retry';
-                    btnRetry.addEventListener('click', () => triggerGigahostSetup(o.order_id));
-                    right.appendChild(btnRetry);
-                } else if (!o.nexus_onboarded || o.status !== 'ready') {
-                    // The immediate path needs an address to reach right now;
-                    // the saved path does not, because the panel keeps working
-                    // after this browser closes and discovers the address when
-                    // the provider assigns it. Offering only the first is what
-                    // made the provisioning interval unusable.
-                    if (o.assigned_ip) {
-                        const btnSetup = document.createElement('button');
-                        btnSetup.type = 'button';
-                        btnSetup.className = 'btn btn-primary';
-                        btnSetup.style.padding = '2px 8px';
-                        btnSetup.style.fontSize = '0.75rem';
-                        btnSetup.textContent = _('deploy_setup_btn') || 'Setup Backend';
-                        btnSetup.addEventListener('click', () => triggerGigahostSetup(o.order_id));
-                        right.appendChild(btnSetup);
-                    }
-                    appendSetupApprovalAction(right, o.order_id);
-                }
-
-                row.appendChild(left);
-                row.appendChild(right);
-                list.appendChild(row);
-            });
-            container.replaceChildren(list);
-        } catch (_) {
-            renderEmpty();
-        }
     }
 
     async function handleDeployVPS() {
@@ -935,19 +882,50 @@
             return;
         }
 
+        // A dropped pin must be re-chosen before anything is bought.
+        if (deployPlacementNeedsChoice()) {
+            UI.toast(_('deploy_vps_placement_choice_cleared'), 'error');
+            return;
+        }
+
+        // The placement half of the payload comes from the module, which returns
+        // null for any choice it cannot send. A null therefore stops the order
+        // instead of falling back to a different location.
+        //
+        // A vanished option reads as '' (which a <select> produces for an unknown
+        // value), and '' means region-managed. That is the silent downgrade this
+        // path forbids, so the value is verified against the option list.
+        const placementValue = placementReadValue(deployPlacementSelect);
+        if (placementValue === null) {
+            UI.toast(_('deploy_vps_placement_choice_cleared'), 'error');
+            return;
+        }
+        const placementField = placementPayloadField(
+            deployPlacementChoices(),
+            placementValue,
+            regionID
+        );
+        if (!placementField) {
+            UI.toast(_('deploy_vps_select_required'), 'error');
+            return;
+        }
+
         const btn = document.getElementById('btnDeployVPS');
         const spinner = document.getElementById('deployVPSSpinner');
         if (btn) btn.disabled = true;
         if (spinner) spinner.classList.remove('hidden');
 
         try {
-            const payload = {
+            // region_id is always sent to the panel: it is the region the operator
+            // saw, the duplicate-guard key and the ledger field. A pin adds dc_id
+            // beside it; the provider client drops region_id on the outbound wire.
+            const payload = Object.assign({
                 pid: plan.product_id,
                 price_id: plan.price_id,
                 region_id: regionID,
                 os_id: osID,
                 hourly_price_nok: plan.hourly_rate_nok
-            };
+            }, placementField);
             const res = await API.post('/api/admin/hosting/gigahost/order', payload);
             UI.toast(res.message || _('deploy_vps_order_placed'), 'success');
             loadRecentOrders();
@@ -966,20 +944,43 @@
             // still supports is preserved, and one it does not support is dropped.
             updateDeploySelections({
                 region: deployRegionSelect ? deployRegionSelect.value : null,
-                os: deployOSSelect ? deployOSSelect.value : null
+                os: deployOSSelect ? deployOSSelect.value : null,
+                placement: deployPlacementSelect ? deployPlacementSelect.value : null
             });
         });
     }
     if (deployRegionSelect) {
-        deployRegionSelect.addEventListener('change', updateDeployButtonState);
+        deployRegionSelect.addEventListener('change', () => {
+            // A region change can invalidate a pin; rebuild so the drop is visible.
+            rebuildDeployPlacement(deployPlacementSelect ? deployPlacementSelect.value : null);
+            updateDeployButtonState();
+        });
+    }
+    if (deployPlacementSelect) {
+        deployPlacementSelect.addEventListener('change', () => {
+            // The only place the latch may be released: the operator acting on the
+            // selector itself. placementHandleChoice owns every part of that rule.
+            const outcome = placementHandleChoice(
+                deploymentPlacementIntent, deployPlacementSelect, deployPlacementChoices());
+            deployPlacementSelect.value = outcome.value;
+            showDeployPlacementHint(outcome.hint);
+            // The outcome reports whether ordering stays blocked; it is applied here
+            // rather than re-derived, so a refusal cannot be lost between the two.
+            deploymentPlacementIntent.apply(outcome.blocked);
+            updateDeployButtonState();
+        });
     }
     if (deployOSSelect) {
         deployOSSelect.addEventListener('change', updateDeployButtonState);
     }
     if (btnRefreshCatalog) {
         btnRefreshCatalog.addEventListener('click', () => {
+            // The manual refresh re-reads the catalog and then the orders, and it
+            // restarts the one refresh timer so the manual read also counts as the
+            // start of the next 30-second interval instead of racing it.
             loadGigahostCatalog();
             loadRecentOrders();
+            startGigahostOrderStatusRefresh(loadRecentOrders);
         });
     }
     if (btnDeployVPS) {
@@ -988,7 +989,11 @@
 
     if (deployPlanSelect) {
         loadGigahostCatalog();
+        // One initial read, then the status view owns the only repeating read. It
+        // is registered once here, and starting it again would replace it rather
+        // than add a second timer.
         loadRecentOrders();
+        startGigahostOrderStatusRefresh(loadRecentOrders);
         loadSetupIntents();
     }
 </script>

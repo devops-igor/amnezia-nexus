@@ -7,14 +7,21 @@ import (
 	"testing"
 )
 
+// TestGigahostSettingsConsumerDOM runs the shipped recent-orders renderer against
+// the shipped setup module, so the assertions describe the request and reading
+// paths an administrator actually gets.
+//
+// The status cell moved into its own module, so the fixture evaluates that module
+// instead of extracting an inline function: an inline copy could silently diverge
+// from the asset the page loads.
 func TestGigahostSettingsConsumerDOM(t *testing.T) {
 	node := requireNode(t)
 	requireJSDOM(t)
-	source, err := TemplatesFS.ReadFile("templates/settings.html")
+	statusModule, err := StaticFS.ReadFile("static/js/gigahost_order_status.js")
 	if err != nil {
 		t.Fatal(err)
 	}
-	consumer, err := extractJSFunction(string(source), "async function loadRecentOrders")
+	modelModule, err := StaticFS.ReadFile("static/js/gigahost_order_status_model.js")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,30 +29,47 @@ func TestGigahostSettingsConsumerDOM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encodedConsumer, _ := json.Marshal(consumer)
+	encodedStatus, _ := json.Marshal(string(statusModule))
+	encodedModel, _ := json.Marshal(string(modelModule))
 	encodedSetup, _ := json.Marshal(string(setup))
 	script := jsdomBootstrapSnippet + fmt.Sprintf(`
 const dom = new JSDOM('<div id="recentOrdersContainer"></div>', {runScripts:'outside-only'});
 const w = dom.window;
 w._ = key => key;
-w.scheduleRecentOrdersPolling = () => {};
 const toasts = [];
 w.UI = {toast:(text,kind)=>toasts.push({text,kind})};
+w.appendSetupApprovalAction = () => {};
+w.eval(%s);
 w.eval(%s);
 let failed = true;
-w.API = {get:async url => url.endsWith('/status') ? {status:'ok',deploy:failed ? {status:'failed',step:'installing_protocol',error:'<img src=x onerror=evil()>',server_id:42} : {status:'ready',step:'ready',server_id:42}} : {orders:[{order_id:'order-1',status:'ready',assigned_ip:'198.51.100.10'}]}};
+w.API = {get:async url => {
+  // The provider observation is what the real list handler returns: the provider's own
+  // answer for this order. The deploy DTO alongside it is the onboarding journal, and
+  // this fixture deliberately keeps both so the two axes stay distinguishable.
+  if (url === '/api/admin/hosting/gigahost/orders') return {orders:[{order_id:'order-1',status:'ready',assigned_ip:'198.51.100.10'}],
+    provider_observations:{'order-1': failed ? {outcome:'confirmed',status:'failed'} : {outcome:'confirmed',status:'ready'}}};
+  if (url === '/api/admin/hosting/gigahost/setup-intents') return {setup_intents:[]};
+  if (url === '/api/vpn/backends') return {backends:[]};
+  if (url.endsWith('/status')) return {status:'ok',deploy:failed
+    ? {status:'failed',step:'installing_protocol',error:'<img src=x onerror=evil()>',server_id:42}
+    : {status:'ready',step:'ready',server_id:42}};
+  throw new Error('unexpected GET ' + url);
+}};
+// A provider diagnostic is untrusted input: it belongs in the details as text.
+const stage = root => { const el = root.querySelector('.gigahost-order-status'); return el && el.getAttribute('data-stage'); };
+const actions = root => Array.from(root.querySelectorAll('button:not(.gigahost-order-status-toggle)')).map(b => b.textContent);
 (async()=>{
  await w.loadRecentOrders();
  let root = w.document.getElementById('recentOrdersContainer');
  assert.match(root.textContent,/installing_protocol/);
- assert.match(root.textContent,/<img src=x onerror=evil\(\)>/);
+ assert.ok(root.textContent.indexOf('<img src=x onerror=evil()>') !== -1, 'the diagnostic must be shown as text');
  assert.equal(root.querySelector('img'),null);
- assert.equal(root.querySelector('.badge').textContent,'failed');
- assert.equal(root.querySelector('button').textContent,'deploy_retry_btn');
+ assert.equal(stage(root),'failed');
+ assert.deepEqual(actions(root),['deploy_retry_btn']);
  failed=false;
  await w.loadRecentOrders();
- assert.equal(root.querySelector('.badge').textContent,'ready');
- assert.equal(root.querySelector('button'),null);
+ assert.equal(stage(root),'ready');
+ assert.deepEqual(actions(root),[]);
  w.eval(%s);
  w.loadRecentOrders=()=>{};
  w.prompt = key => key==='deploy_protocol_prompt' ? 'awg' : 'fixture-only';
@@ -107,7 +131,8 @@ w.API = {get:async url => url.endsWith('/status') ? {status:'ok',deploy:failed ?
  assert.equal(toasts.some(t=>t.kind==='success'),false);
  console.log('GIGAHOST_DOM_OK');dom.window.close();
 })().catch(err=>{console.error(err);process.exit(1)});
-`, string(encodedConsumer), string(encodedSetup))
+`, string(encodedModel), string(encodedStatus), string(encodedSetup))
+
 	out, err := execNodeScript(node, script)
 	if err != nil || !strings.Contains(string(out), "GIGAHOST_DOM_OK") {
 		t.Fatalf("DOM consumer failed: %v\n%s", err, out)

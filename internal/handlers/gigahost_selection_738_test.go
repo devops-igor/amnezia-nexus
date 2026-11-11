@@ -138,7 +138,7 @@ func TestGigahostSelection_StaleOrTamperedSelectionNeverPurchases(t *testing.T) 
 	emptyRegionPlan.ProductID = 104
 	emptyRegionPlan.PriceID = 558
 	emptyRegionPlan.Regions = []gigahost.Region{{ID: 1, Name: "Norway", Available: true, InStock: &noStock}}
-	emptyRegionPlan.Datacenters = []gigahost.Datacenter{{ID: 1, RegionID: 1, InStock: false}}
+	emptyRegionPlan.Datacenters = []gigahost.Datacenter{{ID: 1, RegionID: 1, InStock: &noStock}}
 
 	cases := []struct {
 		name      string
@@ -228,8 +228,8 @@ func TestGigahostSelection_CatalogHandlerPublishesProviderChoices(t *testing.T) 
 		{ID: 2, Name: "Sweden", Country: "SE", Available: true, InStock: &noStock},
 	}
 	planMixed.Datacenters = []gigahost.Datacenter{
-		{ID: 1, Name: "DC1", RegionID: 1, InStock: true},
-		{ID: 2, Name: "DC2", RegionID: 2, InStock: false},
+		{ID: 1, Name: "DC1", RegionID: 1, InStock: &inStock},
+		{ID: 2, Name: "DC2", RegionID: 2, InStock: &noStock},
 	}
 
 	h, _, _ := setupTestHandlers(t)
