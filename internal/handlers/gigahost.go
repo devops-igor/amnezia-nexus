@@ -975,8 +975,8 @@ func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client giga
 	}
 	if errors.Is(deployErr, gigahost.ErrNotFound) && (order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active") {
 		// Only a cancellation nothing contradicts: live inventory for this order means the
-		// missing detail record is a partial read failure, and `cancelled` would be terminal,
-		// so later reads would skip the row and inventory could never repair it.
+		// missing detail record is a partial read failure, and the terminal value would be
+		// sticky, so later reads would skip the row and inventory could never repair it.
 		if gigahostProviderServerLive(live, order.OrderID) {
 			return false, GigahostProviderObservation{
 				Outcome: gigahostObservationUnconfirmed,
