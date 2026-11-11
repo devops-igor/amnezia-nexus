@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"runtime"
@@ -234,13 +235,64 @@ func runOrderedHandshakeFailure(t *testing.T, cause error, socketCloserFirst boo
 	}
 }
 
+// TestAttributeContextCause covers the decision table of the attribution helper
+// directly, so each branch has a behavioral assertion independent of the loaded
+// handshake ordering.
+func TestAttributeContextCause(t *testing.T) {
+	baseErr := errors.New("use of closed network connection")
+
+	t.Run("nil error stays nil", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if got := attributeContextCause(ctx, nil); got != nil {
+			t.Fatalf("want nil, got %v", got)
+		}
+	})
+
+	t.Run("live context leaves the error untouched", func(t *testing.T) {
+		ctx := context.Background()
+		got := attributeContextCause(ctx, baseErr)
+		if got != baseErr {
+			t.Fatalf("want the original error, got %v", got)
+		}
+		if errors.Is(got, context.DeadlineExceeded) || errors.Is(got, context.Canceled) {
+			t.Fatalf("live context introduced a cause: %v", got)
+		}
+	})
+
+	t.Run("expired context adds the cause and keeps the original", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+		defer cancel()
+		<-ctx.Done()
+
+		got := attributeContextCause(ctx, baseErr)
+		if !errors.Is(got, context.DeadlineExceeded) {
+			t.Fatalf("missing deadline cause: %v", got)
+		}
+		if !errors.Is(got, baseErr) {
+			t.Fatalf("original error dropped from the chain: %v", got)
+		}
+	})
+
+	t.Run("error already carrying the cause is not re-wrapped", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		already := fmt.Errorf("handshake: %w", context.Canceled)
+
+		got := attributeContextCause(ctx, already)
+		if got != already {
+			t.Fatalf("already-attributed error was re-wrapped: %v", got)
+		}
+	})
+}
+
 // TestDialer_HandshakeContextCause pins the error classification of a REALITY
 // handshake that ends with the caller's context.
 //
 // The deadline and cancellation cases fail without the cause attribution in
 // (*Dialer).handshake: the returned error is the socket close error and
-// errors.Is finds no context cause. The remaining subtests are controls that
-// must hold both before and after that change.
+// errors.Is finds no context cause. The remaining pieces are controls that must
+// hold both before and after that change.
 func TestDialer_HandshakeContextCause(t *testing.T) {
 	t.Run("deadline survives socket close first", func(t *testing.T) {
 		err, order := runOrderedHandshakeFailure(t, context.DeadlineExceeded, true)
@@ -281,84 +333,89 @@ func TestDialer_HandshakeContextCause(t *testing.T) {
 			t.Fatalf("deadline cause lost: %v (registration order: %v)", err, order)
 		}
 	})
+}
 
-	t.Run("remote EOF with a live context is not a context cause", func(t *testing.T) {
-		fixture := setupTestServer(t, "", 0)
-		defer fixture.ServerClose()
+// TestDialer_HandshakeLiveContextControl proves the attribution does not reach a
+// handshake that failed for its own reasons: the peer closes immediately and the
+// context is still live, so no context cause is attached.
+func TestDialer_HandshakeLiveContextControl(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
 
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("listen: %v", err)
-		}
-		defer func() { _ = ln.Close() }()
-		go func() {
-			for {
-				conn, err := ln.Accept()
-				if err != nil {
-					return
-				}
-				_ = conn.Close()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
 			}
-		}()
+			_ = conn.Close()
+		}
+	}()
 
-		d, err := New(ln.Addr().String(), fixture.Params)
-		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
+	d, err := New(ln.Addr().String(), fixture.Params)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-		_, _, err = d.handshake(ctx)
-		if err == nil {
-			t.Fatal("expected an error from a peer that closes immediately, got nil")
-		}
-		if ctx.Err() != nil {
-			t.Fatalf("control invalid: context already finished: %v", ctx.Err())
-		}
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			t.Fatalf("live-context remote failure misclassified as a context cause: %v", err)
-		}
-		if errors.Is(err, net.ErrClosed) {
-			t.Fatalf("live-context remote failure reported as a local close: %v", err)
-		}
-		t.Logf("remote failure with live context: %v", err)
-	})
+	_, _, err = d.handshake(ctx)
+	if err == nil {
+		t.Fatal("expected an error from a peer that closes immediately, got nil")
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("control invalid: context already finished: %v", ctx.Err())
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		t.Fatalf("live-context remote failure misclassified as a context cause: %v", err)
+	}
+	if errors.Is(err, net.ErrClosed) {
+		t.Fatalf("live-context remote failure reported as a local close: %v", err)
+	}
+	t.Logf("remote failure with live context: %v", err)
+}
 
-	t.Run("successful handshake stays usable", func(t *testing.T) {
-		fixture := setupTestServer(t, "", 0)
-		defer fixture.ServerClose()
+// TestDialer_HandshakeSuccessControl proves a handshake that completes before its
+// context ends still yields a usable stream.
+func TestDialer_HandshakeSuccessControl(t *testing.T) {
+	fixture := setupTestServer(t, "", 0)
+	defer fixture.ServerClose()
 
-		echoAddr, cleanup := startTCPEchoServer(t)
-		defer cleanup()
+	echoAddr, cleanup := startTCPEchoServer(t)
+	defer cleanup()
 
-		d, err := New(fixture.Endpoint, fixture.Params)
-		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
+	d, err := New(fixture.Endpoint, fixture.Params)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 
-		conn, err := d.DialContext(ctx, "tcp", echoAddr)
-		if err != nil {
-			t.Fatalf("DialContext: %v", err)
-		}
-		defer func() { _ = conn.Close() }()
+	conn, err := d.DialContext(ctx, "tcp", echoAddr)
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
 
-		payload := []byte("handshake cause regression payload")
-		if _, err := conn.Write(payload); err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		got := make([]byte, len(payload))
-		if _, err := io.ReadFull(conn, got); err != nil {
-			t.Fatalf("read: %v", err)
-		}
-		if !bytes.Equal(got, payload) {
-			t.Fatalf("echo mismatch: %q", got)
-		}
-		if ctx.Err() != nil {
-			t.Fatalf("context ended during a successful handshake: %v", ctx.Err())
-		}
-	})
+	payload := []byte("handshake cause regression payload")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("echo mismatch: %q", got)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("context ended during a successful handshake: %v", ctx.Err())
+	}
 }
