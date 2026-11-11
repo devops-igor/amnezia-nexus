@@ -72,8 +72,14 @@ w.deployPlacementSelect = w.document.getElementById('deployPlacementSelect');
 w.deployPlacementHint = w.document.getElementById('deployPlacementHint');
 w.deployOSSelect = w.document.getElementById('deployOSSelect');
 w.btnDeployVPS = w.document.getElementById('btnDeployVPS');
-
 w.eval(%s);   // the shipped placement module, as the page loads it
+// The page declares its placement-intent owner as a module-scope const, which a
+// function extractor cannot lift. Create the same instance the page creates, after
+// the module defines the constructor and before the helpers use it.
+// Resolve the constructor through the window object: the module was evaluated in
+// the window's script scope, so the bare name is visible to the extracted helpers but
+// not to this harness line.
+w.deploymentPlacementIntent = new w.placementIntent();
 w.eval(%s);   // the extracted page helpers
 
 function setPlans(plans) {

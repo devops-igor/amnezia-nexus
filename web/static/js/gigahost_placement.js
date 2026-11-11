@@ -241,6 +241,124 @@ function placementReadValue(select) {
     return null;
 }
 
+/* placementIntent is the outstanding-choice latch: once a pin has been dropped, an
+ * order is refused until the operator makes a deliberate, valid placement choice.
+ *
+ * The stickiness is the whole point. Every automatic path - a plan change, a region
+ * change, a catalog refresh, a failed or empty catalog, a recovery - rebuilds the
+ * placement selector and then sees the value the rebuild itself wrote. If a rebuild
+ * could release the latch whenever that value looked valid, the second automatic
+ * event would silently turn a dropped pin into provider-managed placement and buy a
+ * location the operator never chose. So:
+ *
+ *   rebind(decision)  may only ARM the latch, never release it;
+ *   choose(value, choices) releases it only for a value that can actually be
+ *                   ordered, which can only come from the operator's own change
+ *                   event on the selector.
+ *
+ * The page owns one instance; this constructor owns the rule, so the rule cannot
+ * drift between the four automatic call sites and the one deliberate one.
+ *
+ * It is a constructor function rather than a class on purpose: the page loads this
+ * file as a classic script, and a constructor function is a plain global binding
+ * that both a browser and the test harness's script evaluation can reach.
+ */
+function placementIntent() {
+    this.outstanding = false;
+}
+
+/* rebind records an automatic rebuild. A rebuild that dropped a pin arms the latch;
+ * a rebuild with nothing to drop leaves it exactly as it was. */
+placementIntent.prototype.rebind = function (decision) {
+    if (decision && decision.cleared) this.outstanding = true;
+    return this.outstanding;
+};
+
+/* choose records the operator's own selection. It releases the latch only when the
+ * value is a real, orderable choice - a selectable pin or an explicit
+ * provider-managed selection - and re-arms it otherwise. */
+placementIntent.prototype.choose = function (value, choices) {
+    const decision = placementSelection(choices, value);
+    this.outstanding = decision.cleared;
+    return decision;
+};
+
+/* needed reports whether ordering must stay refused. */
+placementIntent.prototype.needed = function () {
+    return this.outstanding;
+};
+
+/* refuse arms the latch unconditionally. Use it when the operator's action itself was
+ * rejected (an unknown, vanished or unselectable value): that is not a lost pin, so
+ * `lost()` - which only arms for an explicit pin - would wrongly stay disarmed. */
+placementIntent.prototype.refuse = function () {
+    this.outstanding = true;
+    return this.outstanding;
+};
+
+/* lost records that an automatic event destroyed the current selector value. It
+ * arms the latch only when that value was a real explicit pin: a cold managed
+ * selection (or a visit with no pin at all) must not arm a block it never earned.
+ * The caller passes the value read BEFORE it replaces the selector. */
+placementIntent.prototype.lost = function (value) {
+    if (placementIsExplicit(value)) this.outstanding = true;
+    return this.outstanding;
+};
+
+/* placementHandleChoice applies the operator's own placement-selection change and
+ * reports what the page must do: which value to show, what to explain, and whether
+ * ordering stays blocked.
+ *
+ * It exists as one function because the rule has several parts that must not drift:
+ *
+ *   - a value matching no option reads as '' from a <select>, which means "nothing
+ *     chosen". That is NOT a deliberate choice of provider-managed placement, and it
+ *     must neither be treated as one nor silently converted into one: the value is
+ *     snapped back to the managed option and the block stays armed;
+ *   - a refused or vanished option snaps back and keeps the block;
+ *   - only a real, orderable value (a selectable pin or an explicit managed choice)
+ *     releases it.
+ *
+ * Returns {value, hint, blocked}.
+ */
+function placementHandleChoice(intent, select, choices) {
+    const chosen = placementReadValue(select);
+    if (chosen === null) {
+        // An unreadable/unknown value is a refusal, not a choice. Snap back to the
+        // managed option but keep (and arm) the block: silently ordering managed
+        // placement here would be the same silent location change.
+        const fallback = choices && choices.managed ? choices.managed.value : placementRegionManagedValue;
+        intent.refuse();
+        return {
+            value: fallback,
+            hint: _('deploy_vps_placement_invalid_id'),
+            blocked: true
+        };
+    }
+    const decision = intent.choose(chosen, choices);
+    if (decision.cleared) {
+        return {value: decision.value, hint: decision.reason, blocked: intent.needed()};
+    }
+    return {value: chosen, hint: (choices && choices.note) || '', blocked: intent.needed()};
+}
+
+/* placementApplyOutcome stores a decision reported by placementHandleChoice. Keeping
+ * this as the only writer of the field outside the class methods means the page never
+ * pokes internal state directly. */
+placementIntent.prototype.apply = function (blocked) {
+    this.outstanding = !!blocked;
+    return this.outstanding;
+};
+
+/* placementNewIntent returns a fresh latch. It exists so the page can obtain its
+ * instance through a function call rather than a module-scope binding: the module and
+ * the page are separate classic scripts, and a function call is reachable from
+ * another script's scope in every environment, including a test harness that
+ * evaluates each file separately. */
+function placementNewIntent() {
+    return new placementIntent();
+}
+
 /* placementIsExplicit reports whether a selector value names a datacenter pin
  * rather than region-managed placement. It says nothing about validity: an
  * unselectable pin is still explicit, which is what a caller needs to know in
