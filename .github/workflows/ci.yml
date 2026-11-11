@@ -139,6 +139,44 @@ jobs:
             -run '^(TestAutomaticSetupAdmitsAfterAuthenticAWGTraffic|TestAutomaticSetupRefusesWhenTheAWGPeerNeverAnswers)$' \
             ./internal/handlers/
 
+      # The automatic Naive admission trio runs inside the package job above, but a
+      # package-level PASS reports neither which tests ran nor whether the payload
+      # actually traversed the proxy. This selects them by anchored name and keeps -v
+      # so each result and its payload counters are individually visible. It adds no
+      # assertion and changes no qualification semantics; a failure here fails the job.
+      #
+      # A SKIP is the one outcome that would prove nothing: the consumer tests skip when
+      # the native binary or the forwardproxy Caddy build is unavailable. Both are
+      # provisioned by the steps above, so verify them first and fail closed here rather
+      # than letting a missing dependency degrade into a silent skip.
+      - name: Verify Automatic Naive Consumer Prerequisites
+        run: |
+          set -euo pipefail
+          caddy_bin="$(command -v caddy || true)"
+          if [ -z "$caddy_bin" ]; then
+            caddy_bin="$(go env GOPATH)/bin/caddy"
+          fi
+          test -x "$caddy_bin"
+          "$caddy_bin" list-modules | grep -qx 'http.handlers.forward_proxy'
+          # The pinned NaiveProxy release is musl-linked; the loader must resolve it.
+          /lib/ld-musl-x86_64.so.1 --list /usr/lib/x86_64-linux-musl/libgcc_s.so.1 >/dev/null
+
+      - name: Run Automatic Naive Admission Consumers
+        run: |
+          set -uo pipefail
+          log="$(mktemp)"
+          go test -v -race -count=1 -p 2 -parallel 2 -timeout 10m \
+            -run '^(TestAutomaticSetupAdmitsAfterAuthenticNaivePayload|TestAutomaticSetupRefusesWhenTheNaivePayloadIsNeverAnswered|TestAutomaticSetupRefusesWhenNaiveAuthenticationIsRejected|TestNaiveConsumerFixturesAreNotHandshakeOnly)$' \
+            ./internal/handlers/ 2>&1 | tee "$log"
+          status="${PIPESTATUS[0]}"
+          # A skip is not evidence. This job provisions both prerequisites above, so a
+          # skip means the proof did not run and this step must not report success.
+          if grep -qE '^--- SKIP: ' "$log"; then
+            echo "::error::a Naive admission consumer was skipped, so no traffic proof was produced"
+            exit 1
+          fi
+          exit "$status"
+
       - name: Upload Test Coverage
         uses: actions/upload-artifact@v7
         if: always()
