@@ -26,6 +26,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -349,6 +350,162 @@ func (f *failingGatedClient) GetCatalog(ctx context.Context) ([]gigahost.HourlyP
 }
 
 func (f *failingGatedClient) releaseNow() { close(f.release) }
+
+// flakyInjectedClient answers with one distinguishable plan, but can be switched to
+// fail, so a replacement's own provider can be unavailable exactly when it is first
+// asked.
+type flakyInjectedClient struct {
+	*mockGigahostClient
+	plan   gigahost.HourlyPlan
+	calls  atomic.Int32
+	broken atomic.Bool
+}
+
+func newFlakyInjectedClient(planID, priceID int) *flakyInjectedClient {
+	plan := fixtureHourlyPlan()
+	plan.ProductID = planID
+	plan.PriceID = priceID
+	plan.Name = "plan-" + itoaTest(planID)
+	return &flakyInjectedClient{mockGigahostClient: &mockGigahostClient{}, plan: plan}
+}
+
+func (f *flakyInjectedClient) GetCatalog(context.Context) ([]gigahost.HourlyPlan, error) {
+	f.calls.Add(1)
+	if f.broken.Load() {
+		return nil, errors.New("replacement provider is unavailable")
+	}
+	return []gigahost.HourlyPlan{f.plan}, nil
+}
+
+// TestCatalogCache_LateSuccessBeforeReplacementFirstRead is the decisive case: the
+// superseded client finishes successfully AFTER being replaced and BEFORE the
+// replacement has ever read.
+//
+// A refresh in flight for client A must not publish into the retired scope. The
+// table is empty at that moment, so "is a newer entry present?" cannot be the
+// retirement test; retirement has to be a property of the cache itself.
+func TestCatalogCache_LateSuccessBeforeReplacementFirstRead(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	clock := &fakeClock{now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+	h.catalogCache().now = clock.Now
+
+	clientA := newGatedInjectedClient(101, 555)
+	h.SetGigahostClient(clientA)
+
+	// 1. Client A's read starts and is provably inside the provider read.
+	doneA := make(chan struct{})
+	go func() {
+		defer close(doneA)
+		_, _ = getCatalog(t, h, "")
+	}()
+	select {
+	case <-clientA.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client A never entered the provider read")
+	}
+
+	// 2. B replaces A while A is still blocked; the setter has returned.
+	clientB := newUngatedInjectedClient(202, 777)
+	h.SetGigahostClient(clientB)
+
+	// 3. A completes successfully before B has made any request at all.
+	clientA.releaseNow()
+	select {
+	case <-doneA:
+	case <-time.After(10 * time.Second):
+		t.Fatal("client A never completed after release")
+	}
+
+	// 4. B's FIRST request must be answered by B, from B's own read.
+	w, body := getCatalog(t, h, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("client B first read status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	if body.Count != 1 || body.Plans[0].ProductID != 202 {
+		t.Fatalf("client B first read = %+v, want its own plan 202: a superseded success was published as the replacement's catalog",
+			body.Plans)
+	}
+	if body.State != "fresh" || body.Stale {
+		t.Errorf("client B first read state = %q stale=%v, want fresh/false", body.State, body.Stale)
+	}
+	if got := clientB.calls.Load(); got != 1 {
+		t.Errorf("client B provider reads = %d, want 1 (it must perform its own read)", got)
+	}
+
+	// 5. B's next read is warm: B's snapshot, still no extra provider read.
+	_, warm := getCatalog(t, h, "")
+	if warm.Count != 1 || warm.Plans[0].ProductID != 202 {
+		t.Errorf("client B warm read = %+v, want its own plan 202", warm.Plans)
+	}
+	if warm.State != "fresh" {
+		t.Errorf("client B warm read state = %q, want fresh", warm.State)
+	}
+	if got := clientB.calls.Load(); got != 1 {
+		t.Errorf("client B provider reads after the warm read = %d, want 1", got)
+	}
+	if got := clientA.calls.Load(); got != 1 {
+		t.Errorf("client A provider reads = %d, want 1", got)
+	}
+}
+
+// TestCatalogCache_ReplacementFailureDoesNotServePredecessorSnapshot is the
+// adjacent sequential schedule: the replacement's provider is unavailable, so the
+// previous account's retained catalog must not be served as its fallback.
+//
+// An unavailable replacement is a real provider state, and serving the predecessor's
+// plans as "stale" would present another account's prices and images as this
+// account's own last known answer.
+func TestCatalogCache_ReplacementFailureDoesNotServePredecessorSnapshot(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	clock := &fakeClock{now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+	h.catalogCache().now = clock.Now
+
+	// 1. Client A reads successfully: its snapshot is retained and fresh.
+	clientA := newUngatedInjectedClient(303, 808)
+	h.SetGigahostClient(clientA)
+	wA, bodyA := getCatalog(t, h, "")
+	if wA.Code != http.StatusOK || bodyA.Count != 1 || bodyA.Plans[0].ProductID != 303 {
+		t.Fatalf("client A first read = %d %+v, want its own 303", wA.Code, bodyA.Plans)
+	}
+
+	// 2. B replaces A, and B's provider is down.
+	clientB := newFlakyInjectedClient(404, 1004)
+	clientB.broken.Store(true)
+	h.SetGigahostClient(clientB)
+
+	wB, _ := getCatalog(t, h, "")
+	if wB.Code != http.StatusBadGateway {
+		t.Fatalf("client B read status = %d, want 502 (body: %s): the replacement was served the previous client's snapshot instead of reporting the provider failure",
+			wB.Code, wB.Body.String())
+	}
+	if strings.Contains(wB.Body.String(), "303") {
+		t.Errorf("client B failure body leaked the previous client's catalog: %s", wB.Body.String())
+	}
+
+	// 3. The provider recovers. B's OWN read now serves B's catalog fresh, and the
+	//    failure backoff suppressed the provider calls made inside its window.
+	clientB.broken.Store(false)
+	clock.advance(gigahostCatalogFailureBackoff + time.Second)
+	_, recovered := getCatalog(t, h, "")
+	if recovered.Count != 1 || recovered.Plans[0].ProductID != 404 {
+		t.Errorf("client B recovered read = %+v, want its own 404", recovered.Plans)
+	}
+	if recovered.State != "fresh" {
+		t.Errorf("client B recovered read state = %q, want fresh", recovered.State)
+	}
+	if got := clientB.calls.Load(); got != 2 {
+		t.Errorf("client B provider reads = %d, want 2 (the failed read, then one recovery read after the backoff)", got)
+	}
+
+	// 4. B's snapshot is now retained: a warm read must not read the provider again.
+	_, warm := getCatalog(t, h, "")
+	if warm.Count != 1 || warm.Plans[0].ProductID != 404 {
+		t.Errorf("client B warm read = %+v, want its own 404", warm.Plans)
+	}
+	if got := clientB.calls.Load(); got != 2 {
+		t.Errorf("client B provider reads after the warm read = %d, want 2", got)
+	}
+}
 
 // TestCatalogCache_SupersededFailureCannotSeedReplacementBackoff is the case where
 // the generation fence is load-bearing.

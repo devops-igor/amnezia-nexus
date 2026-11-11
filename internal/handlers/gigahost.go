@@ -42,18 +42,12 @@ func (p OrderServerPayload) validate() error {
 // SetGigahostClient allows injecting or replacing the Gigahost API client.
 //
 // A replaced client is a different provider account identity for this handler, so
-// every retained display snapshot is dropped with it. The generation is advanced
-// under the same accessor: an in-flight refresh that belongs to the previous client
-// can then neither be joined by the replacement nor publish over it.
+// every retained display snapshot is dropped with it, and the catalog generation is
+// advanced in the same step. An in-flight refresh that belongs to the previous
+// client can then neither be joined by the replacement nor publish over it - not
+// even while the replacement's table is still empty.
 func (h *Handlers) SetGigahostClient(c gigahost.Client) {
-	h.gigahostMu.Lock()
-	if c != nil {
-		h.gigahostClient = &providerCatalogClient{Client: c}
-	} else {
-		h.gigahostClient = nil
-	}
-	h.gigahostMu.Unlock()
-	h.bumpCatalogGeneration()
+	h.advanceGeneration(c)
 }
 
 // gigahostClientResolution is a resolved provider client plus the account
@@ -63,9 +57,14 @@ func (h *Handlers) SetGigahostClient(c gigahost.Client) {
 // for an explicitly injected client. It is carried out of resolution because the
 // display cache is scoped per account; nothing that receives it may log, return,
 // store or otherwise expose it.
+//
+// generation is the catalog client epoch this client was resolved under. Client and
+// generation are read under one lock so a request can never act as one client while
+// labeling its work with another client's epoch.
 type gigahostClientResolution struct {
 	client     gigahost.Client
 	credential string
+	generation uint64
 }
 
 // getGigahostClient resolves the client from the injected instance, request header,
@@ -83,26 +82,15 @@ func (h *Handlers) getGigahostClient(ctx context.Context, r *http.Request) (giga
 func (h *Handlers) resolveGigahostClient(ctx context.Context, r *http.Request) (gigahostClientResolution, error) {
 	h.gigahostMu.RLock()
 	client := h.gigahostClient
+	// Same critical section as the client read: a replacement swaps the client and
+	// the epoch together under the write lock, so this pair is never mixed.
+	generation := h.catalogCache().currentGeneration()
 	h.gigahostMu.RUnlock()
 	if client != nil {
-		return gigahostClientResolution{client: client}, nil
+		return gigahostClientResolution{client: client, generation: generation}, nil
 	}
 
-	var apiKey string
-	if r != nil {
-		apiKey = r.Header.Get("X-Gigahost-API-Key")
-	}
-	if apiKey == "" {
-		apiKey = os.Getenv("GIGAHOST_API_KEY")
-	}
-	if apiKey == "" && h.db != nil {
-		var cfg struct {
-			APIKey string `json:"api_key"`
-		}
-		_ = h.db.GetSetting(ctx, "gigahost", &cfg)
-		apiKey = cfg.APIKey
-	}
-
+	apiKey := h.gigahostCredential(ctx, r)
 	if apiKey == "" {
 		return gigahostClientResolution{}, errors.New("gigahost api key not configured: set GIGAHOST_API_KEY, gigahost setting, or X-Gigahost-API-Key header")
 	}
@@ -125,7 +113,33 @@ func (h *Handlers) resolveGigahostClient(ctx context.Context, r *http.Request) (
 	if err != nil {
 		return gigahostClientResolution{}, err
 	}
-	return gigahostClientResolution{client: built, credential: apiKey}, nil
+	// The built client belongs to whatever client generation is current now. The
+	// epoch is re-read here because building the client happens outside the lock and
+	// a replacement may have raced it; reading it late keeps client and epoch
+	// coherent, and the caller's own read then carries that paired identity.
+	generation = h.catalogCache().currentGeneration()
+	return gigahostClientResolution{client: built, credential: apiKey, generation: generation}, nil
+}
+
+// gigahostCredential resolves the provider API key from the request header, the
+// environment or the settings database, in that precedence. It returns "" when
+// none is configured.
+func (h *Handlers) gigahostCredential(ctx context.Context, r *http.Request) string {
+	var apiKey string
+	if r != nil {
+		apiKey = r.Header.Get("X-Gigahost-API-Key")
+	}
+	if apiKey == "" {
+		apiKey = os.Getenv("GIGAHOST_API_KEY")
+	}
+	if apiKey == "" && h.db != nil {
+		var cfg struct {
+			APIKey string `json:"api_key"`
+		}
+		_ = h.db.GetSetting(ctx, "gigahost", &cfg)
+		apiKey = cfg.APIKey
+	}
+	return apiKey
 }
 
 // timingEnabled reports whether provider call timing is switched on.

@@ -141,13 +141,22 @@ type catalogRefreshOutcome struct {
 
 // gigahostCatalogCache is the bounded per-account snapshot cache.
 //
-// mu guards the table only. No provider I/O and no other handler lock is ever
-// taken while it is held; a refresh runs outside it, coalesced by group.
+// mu guards the table and the client generation together. No provider I/O and no
+// other handler lock is ever taken while it is held; a refresh runs outside it,
+// coalesced by group.
 type gigahostCatalogCache struct {
 	mu      sync.Mutex
 	entries map[string]*gigahostCatalogEntry
-	group   singleflight.Group
-	now     func() time.Time
+	// generation is the identity epoch of the provider client this handler
+	// currently serves. It advances on every client replacement and never resets.
+	//
+	// It lives here, next to the table it retires, and not in an entry: retirement
+	// is a property of the cache, so it survives an empty table, an eviction of the
+	// scope and a scope that has never been written. An entry existing "somewhere"
+	// is not retirement evidence - a cleared table has none.
+	generation uint64
+	group      singleflight.Group
+	now        func() time.Time
 }
 
 // newGigahostCatalogCache builds an empty cache on the wall clock.
@@ -170,30 +179,27 @@ func (h *Handlers) catalogCache() *gigahostCatalogCache {
 	return h.catalogCacheState
 }
 
-// catalogGeneration reports the current injected-client generation.
+// advanceGeneration installs a new provider client and retires the catalog identity
+// it replaces.
 //
-// It increments every time the provider client is replaced. The value is only ever
-// compared for equality, so a wrapped counter is still correct.
-func (h *Handlers) catalogGeneration() uint64 {
-	h.catalogGenMu.Lock()
-	defer h.catalogGenMu.Unlock()
-	return h.catalogGen
-}
-
-// bumpCatalogGeneration invalidates the retained cache and returns the new
-// generation.
+// It swaps the provider client and advances the epoch under one lock, so a request
+// can never resolve one client and label its work with another client's epoch. The
+// table is cleared inside the same critical section: retirement and the removal of
+// the state it retires are one step, so no window exists in which a retired entry
+// looks current.
 //
-// It goes through the synchronized accessor so it cannot race lazy initialization,
-// and it advances the generation so that a refresh still in flight for the previous
-// client can neither be joined by the replacement nor publish over it.
-func (h *Handlers) bumpCatalogGeneration() uint64 {
-	h.catalogGenMu.Lock()
-	h.catalogGen++
-	generation := h.catalogGen
-	h.catalogGenMu.Unlock()
-
+// Client and generation are swapped under one lock, so a request that resolved the
+// old client can never be labeled with the new epoch, or the reverse. Callers read
+// the pair through resolveGigahostClient.
+func (h *Handlers) advanceGeneration(client gigahost.Client) {
+	h.gigahostMu.Lock()
+	defer h.gigahostMu.Unlock()
+	if client != nil {
+		h.gigahostClient = &providerCatalogClient{Client: client}
+	} else {
+		h.gigahostClient = nil
+	}
 	h.catalogCache().invalidateAll()
-	return generation
 }
 
 // catalogScopeKey is the cache scope of one provider account.
@@ -237,18 +243,19 @@ func (c *gigahostCatalogCache) peek(scope string, now time.Time) gigahostCatalog
 // load answers one catalog request, reading the provider only when the retained
 // answer is from an earlier freshness window.
 //
-// generation identifies the provider-client generation the caller resolved. A
-// refresh started under one generation is never joined by a call from another, so a
-// replaced client cannot inherit an in-flight answer, and a superseded refresh
-// cannot publish over the replacement's snapshot.
+// generation identifies the provider-client generation the caller resolved. Only
+// state written by that SAME generation is this caller's answer: a refresh started
+// under one generation is never joined by a call from another, a superseded refresh
+// cannot publish over the replacement's snapshot, and a superseded snapshot (or its
+// recorded failure backoff) is never served to the replacement.
 func (c *gigahostCatalogCache) load(ctx context.Context, scope string, generation uint64, fetch catalogFetcher) (catalogRead, error) {
 	now := c.now()
 	entry := c.peek(scope, now)
-	// Retained state written by a superseded client is not this caller's answer.
-	// Without this, a replacement client would be served the previous client's
-	// snapshot - or, worse, its recorded failure backoff - simply because both
-	// injected clients share one scope.
-	if entry.generation < generation {
+	// Retained state written by another client generation is not this caller's
+	// answer, in either direction. Without this, a replacement client would be served
+	// the previous client's snapshot - or, worse, its recorded failure backoff -
+	// simply because both injected clients share one scope.
+	if entry.generation != generation {
 		entry = gigahostCatalogEntry{}
 	}
 	if entry.fresh(now) {
@@ -279,18 +286,22 @@ func (c *gigahostCatalogCache) load(ctx context.Context, scope string, generatio
 func (c *gigahostCatalogCache) refresh(ctx context.Context, scope string, generation uint64, fetch catalogFetcher) (catalogRead, error) {
 	ch := c.group.DoChan(refreshKey(scope, generation), func() (any, error) {
 		// A caller that queued behind the slot holder may already have been
-		// overtaken by it, so the cache is re-checked inside the slot. The retained
-		// entry is read ONCE: a second read could observe an entry a concurrent
-		// client replacement has since cleared, and would then publish a nil answer.
-		if now := c.now(); c.peek(scope, now).fresh(now) {
-			return c.recordRetained(scope, generation, now), nil
+		// overtaken by it, so the cache is re-checked inside the slot. The check and
+		// the captured snapshot are one critical section over the caller's own
+		// generation: a second lookup could observe an entry a concurrent client
+		// replacement has since cleared or replaced.
+		if retained, ok := c.freshSnapshot(scope, generation, c.now()); ok {
+			return &catalogRefreshOutcome{snapshot: retained}, nil
 		}
 		// The leader's request may be abandoned while peers wait on it: the
 		// shared read is detached from that one caller and bounded on its own.
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gigahostCatalogFetchTimeout)
 		defer cancel()
 		snapshot, fetchErr := fetch(fetchCtx)
-		return c.record(scope, generation, snapshot, fetchErr, c.now()), nil
+		// Re-read the epoch AFTER the provider read: it is the only way to learn
+		// whether this result was retired while it was being fetched.
+		live := c.currentGeneration()
+		return c.record(scope, generation, live, snapshot, fetchErr, c.now()), nil
 	})
 
 	// A caller whose own request was canceled stops waiting; the shared read
@@ -320,19 +331,28 @@ func refreshKey(scope string, generation uint64) string {
 	return scope + "\x00" + strconv.FormatUint(generation, 10)
 }
 
-// recordRetained answers from the entry observed to be fresh inside the refresh
-// slot.
+// currentGeneration reports the live client generation.
+func (c *gigahostCatalogCache) currentGeneration() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.generation
+}
+
+// freshSnapshot returns the scope's snapshot when it is fresh AND belongs to the
+// caller's generation.
 //
-// The snapshot is read exactly once by the caller. If a concurrent client
-// replacement cleared it in the meantime, this reports the missing snapshot as a
-// failure rather than handing back a nil pointer, so a request never dereferences
-// an empty answer.
-func (c *gigahostCatalogCache) recordRetained(scope string, generation uint64, now time.Time) *catalogRefreshOutcome {
-	snapshot := c.peek(scope, now).snapshot
-	if snapshot == nil {
-		return &catalogRefreshOutcome{err: errCatalogSnapshotMissing}
+// The lookup, the generation test and the capture are one critical section, so a
+// request never answers from state that a concurrent client replacement retired
+// between two separate reads.
+func (c *gigahostCatalogCache) freshSnapshot(scope string, generation uint64, now time.Time) (*catalogSnapshot, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, present := c.entries[scope]
+	if !present || entry.generation != generation || !entry.fresh(now) {
+		return nil, false
 	}
-	return &catalogRefreshOutcome{snapshot: snapshot}
+	entry.lastUsed = now
+	return entry.snapshot, true
 }
 
 // record stores one refresh outcome and decides what that refresh serves.
@@ -342,59 +362,69 @@ func (c *gigahostCatalogCache) recordRetained(scope string, generation uint64, n
 // snapshot to fall back on, the provider error is returned so the handler keeps
 // its existing status mapping.
 //
-// The generation fences the write. A refresh that was superseded while it was in
-// flight still answers its own caller, but it cannot publish a snapshot over a
-// newer generation's, and it cannot arm a backoff on top of one either.
-func (c *gigahostCatalogCache) record(scope string, generation uint64, snapshot *catalogSnapshot, fetchErr error, now time.Time) *catalogRefreshOutcome {
+// generation is the epoch the caller resolved and live is the epoch current when the
+// provider read finished. They differ when the client was replaced mid-read, and
+// nothing from a retired epoch may be published or used to arm a backoff: the
+// replacement's table is empty at that point, so "a newer entry exists" cannot be
+// the test.
+func (c *gigahostCatalogCache) record(scope string, generation, live uint64, snapshot *catalogSnapshot, fetchErr error, now time.Time) *catalogRefreshOutcome {
 	if fetchErr == nil && snapshot != nil {
-		c.publish(scope, generation, snapshot, now)
+		if c.publish(scope, generation, live, snapshot, now) {
+			return &catalogRefreshOutcome{snapshot: snapshot}
+		}
+		// The client was replaced while this read was in flight. Its own caller
+		// still receives the answer it legitimately fetched; only the retained
+		// state is fenced, and the replacement keeps an empty table to read from.
 		return &catalogRefreshOutcome{snapshot: snapshot}
 	}
 	failure := fetchErr
 	if failure == nil {
 		failure = errCatalogSnapshotMissing
 	}
-	if retained := c.fail(scope, generation, failure, now); retained != nil {
+	if retained := c.fail(scope, generation, live, failure, now); retained != nil {
 		return &catalogRefreshOutcome{snapshot: retained, stale: true}
 	}
 	return &catalogRefreshOutcome{err: failure}
 }
 
-// publish stores a complete snapshot, replacing any retained answer.
+// publish stores a complete snapshot, replacing any retained answer. It reports
+// whether the snapshot was retained.
 //
-// A snapshot from an older generation is dropped rather than written: the client
+// A snapshot from a retired generation is dropped rather than written: the client
 // that fetched it has already been replaced, and its answer must not become the
 // replacement's catalog. Caller keeps its own copy either way, so this only fences
 // the retained state.
-func (c *gigahostCatalogCache) publish(scope string, generation uint64, snapshot *catalogSnapshot, now time.Time) {
+func (c *gigahostCatalogCache) publish(scope string, generation, live uint64, snapshot *catalogSnapshot, now time.Time) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if existing, present := c.entries[scope]; present && existing.generation > generation {
-		return
+	if generation != c.generation || live != c.generation {
+		return false
 	}
 	snapshot.capturedAt = now
 	if _, present := c.entries[scope]; !present {
 		c.evictLocked()
 	}
 	c.entries[scope] = &gigahostCatalogEntry{snapshot: snapshot, generation: generation, lastUsed: now}
+	return true
 }
 
 // fail records a failed refresh and returns the snapshot that remains servable.
 //
-// A failure from an older generation is not recorded: it describes a client that has
-// already been replaced, and arming its backoff would suppress the replacement's own
-// first read.
-func (c *gigahostCatalogCache) fail(scope string, generation uint64, failure error, now time.Time) *catalogSnapshot {
+// A failure from a retired generation is not recorded: it describes a client that
+// has already been replaced, and neither its backoff nor its retained snapshot
+// belongs to the replacement. Callers of the retired generation get their own error
+// back instead of another client's catalog.
+func (c *gigahostCatalogCache) fail(scope string, generation, live uint64, failure error, now time.Time) *catalogSnapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if generation != c.generation || live != c.generation {
+		return nil
+	}
 	entry, present := c.entries[scope]
 	if !present {
 		c.evictLocked()
 		entry = &gigahostCatalogEntry{generation: generation}
 		c.entries[scope] = entry
-	}
-	if entry.generation > generation {
-		return nil
 	}
 	entry.failedAt = now
 	entry.lastErr = failure
@@ -418,14 +448,21 @@ func (c *gigahostCatalogCache) evictLocked() {
 	delete(c.entries, oldestKey)
 }
 
-// invalidateAll drops every retained answer.
+// invalidateAll retires every retained answer and advances the generation.
 //
-// A replaced provider client is a different account identity for this handler, so
-// no earlier answer may outlive it.
+// A replaced provider client is a different account identity for this handler, so no
+// earlier answer may outlive it. The advance is what makes that retirement durable:
+// it is recorded in the cache rather than inferred from an entry being present, so a
+// refresh still in flight for the retired generation can neither publish into the
+// emptied table nor be served out of it.
+//
+// It takes only the table mutex; the caller's own lock ordering keeps it outside any
+// provider I/O.
 func (c *gigahostCatalogCache) invalidateAll() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	clear(c.entries)
+	c.generation++
 }
 
 // newCatalogRead describes one answer against the freshness policy.

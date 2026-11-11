@@ -41,7 +41,7 @@ func (h *Handlers) GigahostCatalogHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	read, err := h.catalogCache().load(r.Context(), catalogScopeKey(resolved.credential), h.catalogGeneration(), h.catalogFetcher(resolved.client))
+	read, err := h.catalogCache().load(r.Context(), catalogScopeKey(resolved.credential), resolved.generation, h.catalogFetcher(resolved.client))
 	if err != nil {
 		h.catalogUpstreamError(w, err)
 		return

@@ -496,11 +496,12 @@ func TestCatalogCache_AccountsNeverShareSnapshots(t *testing.T) {
 	}
 
 	// The scopes come from the same derivation the handler uses above.
-	readA, err := cache.load(context.Background(), catalogScopeKey(keyA), 0, fetchA)
+	live := cache.currentGeneration()
+	readA, err := cache.load(context.Background(), catalogScopeKey(keyA), live, fetchA)
 	if err != nil {
 		t.Fatalf("account A load: %v", err)
 	}
-	readB, err := cache.load(context.Background(), catalogScopeKey(keyB), 0, fetchB)
+	readB, err := cache.load(context.Background(), catalogScopeKey(keyB), live, fetchB)
 	if err != nil {
 		t.Fatalf("account B load: %v", err)
 	}
@@ -512,11 +513,11 @@ func TestCatalogCache_AccountsNeverShareSnapshots(t *testing.T) {
 	}
 
 	// Warm reads must not cross-serve either, and must not re-read the provider.
-	warmA, err := cache.load(context.Background(), catalogScopeKey(keyA), 0, fetchA)
+	warmA, err := cache.load(context.Background(), catalogScopeKey(keyA), live, fetchA)
 	if err != nil {
 		t.Fatalf("account A warm load: %v", err)
 	}
-	warmB, err := cache.load(context.Background(), catalogScopeKey(keyB), 0, fetchB)
+	warmB, err := cache.load(context.Background(), catalogScopeKey(keyB), live, fetchB)
 	if err != nil {
 		t.Fatalf("account B warm load: %v", err)
 	}
@@ -599,7 +600,7 @@ func TestCatalogCache_OrderPathNeverUsesCache(t *testing.T) {
 	// cache, the order below would pass every selection check and buy.
 	selectable := fixtureHourlyPlan()
 	selectable.OSOptions = selectable.InstallableImages(fixtureOperatingSystems())
-	h.catalogCache().publish(gigahostCatalogInjectedScope, h.catalogGeneration(), &catalogSnapshot{
+	h.catalogCache().publish(gigahostCatalogInjectedScope, h.catalogCache().currentGeneration(), h.catalogCache().currentGeneration(), &catalogSnapshot{
 		plans:  []gigahost.HourlyPlan{selectable},
 		images: fixtureOperatingSystems(),
 	}, time.Now())
@@ -725,7 +726,7 @@ func TestCatalogCache_RetainsRenewedSnapshotWithoutASecondRead(t *testing.T) {
 // mustCatalogLoad is one catalog load that fails the test on error.
 func mustCatalogLoad(t *testing.T, cache *gigahostCatalogCache, scope string, fetch catalogFetcher) catalogRead {
 	t.Helper()
-	read, err := cache.load(context.Background(), scope, 0, fetch)
+	read, err := cache.load(context.Background(), scope, cache.currentGeneration(), fetch)
 	if err != nil {
 		t.Errorf("catalog load: %v", err)
 	}
@@ -817,14 +818,15 @@ func TestCatalogCache_SlotRecheckPreventsDoubleRefresh(t *testing.T) {
 	renewed := fixtureHourlyPlan()
 	renewed.ProductID = 909
 	renewed.PriceID = 1001
-	cache.publish(gigahostCatalogInjectedScope, 0, &catalogSnapshot{
+	live := cache.currentGeneration()
+	cache.publish(gigahostCatalogInjectedScope, live, live, &catalogSnapshot{
 		plans:  []gigahost.HourlyPlan{renewed},
 		images: fixtureOperatingSystems(),
 	}, now)
 	readsBefore := reads.Load()
 
 	// The late caller enters the slot after that refresh and must not re-read.
-	read, err := cache.refresh(context.Background(), gigahostCatalogInjectedScope, 0, fetch)
+	read, err := cache.refresh(context.Background(), gigahostCatalogInjectedScope, live, fetch)
 	if err != nil {
 		t.Fatalf("late refresh: %v", err)
 	}

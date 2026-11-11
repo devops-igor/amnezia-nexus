@@ -113,16 +113,12 @@ type Handlers struct {
 	admissionState *orderAdmission
 	// Display-side provider catalog cache, one complete snapshot per provider
 	// account; see gigahost_catalog_cache.go. It is consulted only by
-	// GigahostCatalogHandler - never by the purchase path.
+	// GigahostCatalogHandler - never by the purchase path. The cache also owns the
+	// current provider-client generation, so retirement of a replaced client's
+	// retained state is recorded next to that state instead of being inferred from
+	// an entry still being present.
 	catalogCacheOnce  sync.Once
 	catalogCacheState *gigahostCatalogCache
-	// catalogGen identifies the current provider-client generation. It is advanced
-	// by every client replacement so an in-flight refresh belonging to a superseded
-	// client can neither be joined by the replacement nor publish over it.
-	// catalogGenMu guards the counter; the cache pointer itself is only ever reached
-	// through catalogCache().
-	catalogGenMu sync.Mutex
-	catalogGen   uint64
 }
 
 // lockUser serializes credential admission and user disabling; the lock is shared
