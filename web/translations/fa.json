@@ -763,6 +763,7 @@
   "setup_intents_already_saved": "قبلاً یک تأیید راه‌اندازی برای این سفارش ذخیره شده است",
   "setup_intents_protocol_invalid": "یکی از این موارد را وارد کنید: awg، vless، naive",
   "gigahost_status_provider": "ارائه‌دهنده",
+  "gigahost_status_provider_error": "خطای ارائه‌دهنده",
   "gigahost_status_vpn_setup": "راه‌اندازی VPN",
   "gigahost_status_backend_health": "سلامت بک‌اند",
   "gigahost_status_stage_requested": "درخواست شد",

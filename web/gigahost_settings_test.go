@@ -21,11 +21,16 @@ func TestGigahostSettingsConsumerDOM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	modelModule, err := StaticFS.ReadFile("static/js/gigahost_order_status_model.js")
+	if err != nil {
+		t.Fatal(err)
+	}
 	setup, err := StaticFS.ReadFile("static/js/gigahost_setup.js")
 	if err != nil {
 		t.Fatal(err)
 	}
 	encodedStatus, _ := json.Marshal(string(statusModule))
+	encodedModel, _ := json.Marshal(string(modelModule))
 	encodedSetup, _ := json.Marshal(string(setup))
 	script := jsdomBootstrapSnippet + fmt.Sprintf(`
 const dom = new JSDOM('<div id="recentOrdersContainer"></div>', {runScripts:'outside-only'});
@@ -35,9 +40,14 @@ const toasts = [];
 w.UI = {toast:(text,kind)=>toasts.push({text,kind})};
 w.appendSetupApprovalAction = () => {};
 w.eval(%s);
+w.eval(%s);
 let failed = true;
 w.API = {get:async url => {
-  if (url === '/api/admin/hosting/gigahost/orders') return {orders:[{order_id:'order-1',status:'ready',assigned_ip:'198.51.100.10'}]};
+  // The provider observation is what the real list handler returns: the provider's own
+  // answer for this order. The deploy DTO alongside it is the onboarding journal, and
+  // this fixture deliberately keeps both so the two axes stay distinguishable.
+  if (url === '/api/admin/hosting/gigahost/orders') return {orders:[{order_id:'order-1',status:'ready',assigned_ip:'198.51.100.10'}],
+    provider_observations:{'order-1': failed ? {outcome:'confirmed',status:'failed'} : {outcome:'confirmed',status:'ready'}}};
   if (url === '/api/admin/hosting/gigahost/setup-intents') return {setup_intents:[]};
   if (url === '/api/vpn/backends') return {backends:[]};
   if (url.endsWith('/status')) return {status:'ok',deploy:failed
@@ -121,7 +131,7 @@ const actions = root => Array.from(root.querySelectorAll('button:not(.gigahost-o
  assert.equal(toasts.some(t=>t.kind==='success'),false);
  console.log('GIGAHOST_DOM_OK');dom.window.close();
 })().catch(err=>{console.error(err);process.exit(1)});
-`, string(encodedStatus), string(encodedSetup))
+`, string(encodedModel), string(encodedStatus), string(encodedSetup))
 
 	out, err := execNodeScript(node, script)
 	if err != nil || !strings.Contains(string(out), "GIGAHOST_DOM_OK") {

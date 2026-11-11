@@ -763,6 +763,7 @@
   "setup_intents_already_saved": "A setup approval is already saved for this order",
   "setup_intents_protocol_invalid": "Enter one of: awg, vless, naive",
   "gigahost_status_provider": "Provider",
+  "gigahost_status_provider_error": "Provider error",
   "gigahost_status_vpn_setup": "VPN setup",
   "gigahost_status_backend_health": "Backend health",
   "gigahost_status_stage_requested": "Requested",

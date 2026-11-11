@@ -20,45 +20,6 @@
 // GIGAHOST_ORDER_STATUS_REFRESH_MS is the one refresh interval the status view owns.
 const GIGAHOST_ORDER_STATUS_REFRESH_MS = 30000;
 
-// gigahostOrderStatusStages are the provider stages an order passes through, in
-// order. VPN setup and backend health are separate axes, never drawn as stages.
-const gigahostOrderStatusStages = ['requested', 'deploying', 'ready'];
-
-// Provider/ledger status spellings that decide a stage. A provider answer wins
-// over the ledger row, which is only the panel's copy of the last answer.
-const gigahostOrderStatusReadySpellings = ['ready', 'active'];
-const gigahostOrderStatusFailedSpellings = ['failed', 'error'];
-const gigahostOrderStatusCancelledSpellings = ['cancelled', 'canceled', 'deleted'];
-
-// gigahostOrderStatusSetupStates maps a saved setup-intent state to the setup axis.
-// A state outside this table is reported as unknown rather than guessed into a
-// group: reporting "not started" for a state the panel does not recognise would
-// hide an approval that exists.
-const gigahostOrderStatusSetupStates = {
-    pending: 'scheduled',
-    ready_for_setup: 'scheduled',
-    installing: 'installing',
-    install_paused: 'needs_operator',
-    awaiting_credentials: 'needs_operator',
-    awaiting_host_confirmation: 'needs_operator',
-    ready: 'ready',
-    failed: 'failed',
-    cancelled: 'revoked',
-    canceled: 'revoked'
-};
-
-// gigahostOrderStatusHealthStates maps a backend runtime status to the health axis.
-// `active` is the panel's own word for a verified healthy tunnel. Any spelling
-// outside this table is unknown, never healthy.
-const gigahostOrderStatusHealthStates = {
-    active: 'healthy',
-    degraded: 'degraded',
-    connecting: 'pending',
-    disabled: 'disabled',
-    unhealthy: 'unhealthy',
-    failed: 'unhealthy'
-};
-
 let gigahostOrderStatusRefreshTimer = null;
 let gigahostOrderStatusRefreshTask = null;
 let gigahostOrderStatusRefreshInFlight = false;
@@ -67,172 +28,6 @@ let gigahostOrderStatusLastSuccessAt = '';
 let gigahostOrderStatusLifecycleBound = false;
 let gigahostOrderStatusDetailsCounter = 0;
 let gigahostOrderStatusBackendIndex = null;
-
-/* gigahostOrderStatusNow is the clock. It is one function so a test can pin it
- * and assert an exact rendered timestamp instead of a moving one. */
-function gigahostOrderStatusNow() {
-    return new Date();
-}
-
-/* gigahostOrderStatusProviderStage maps a provider/ledger status spelling to one
- * stage. It reads no address: a VPS is ready only when the provider said so. */
-function gigahostOrderStatusProviderStage(status) {
-    const s = String(status || '').trim().toLowerCase();
-    if (gigahostOrderStatusReadySpellings.indexOf(s) !== -1) return 'ready';
-    if (gigahostOrderStatusFailedSpellings.indexOf(s) !== -1) return 'failed';
-    if (gigahostOrderStatusCancelledSpellings.indexOf(s) !== -1) return 'cancelled';
-    if (s === 'unknown' || s === '') return 'unknown';
-    return 'deploying';
-}
-
-/* gigahostOrderStatusIsPlaceholderID reports a ledger id whose purchase never
- * resolved. There is no provider order behind such a row, so its stage is unknown
- * rather than whatever status the placeholder carries: claiming progress for an
- * order the provider never acknowledged is the invention this view must not make. */
-function gigahostOrderStatusIsPlaceholderID(orderId) {
-    const id = String(orderId || '');
-    return id.indexOf('intent_') === 0 || id.indexOf('unknown_') === 0;
-}
-
-/* gigahostOrderStatusStageChain returns the progression to draw, each entry marked
- * done, current or pending. Steps the current state contradicts are not returned:
- * a failed, cancelled or unknown order does not claim it ever deployed. */
-function gigahostOrderStatusStageChain(stage) {
-    if (stage === 'failed' || stage === 'cancelled' || stage === 'unknown') {
-        return [
-            {stage: 'requested', state: 'done'},
-            {stage: stage, state: 'current'}
-        ];
-    }
-    const currentIndex = gigahostOrderStatusStages.indexOf(stage);
-    return gigahostOrderStatusStages.map((name, index) => ({
-        stage: name,
-        state: index < currentIndex ? 'done' : (index === currentIndex ? 'current' : 'pending')
-    }));
-}
-
-/* gigahostOrderStatusSetupState maps a saved setup approval to the setup axis.
- * known=false means the approval list has not been read, which is not the same
- * statement as "no approval exists". */
-function gigahostOrderStatusSetupState(setup) {
-    if (!setup || !setup.known) return 'unknown';
-    if (!setup.intent) return 'none';
-    return gigahostOrderStatusSetupStates[String(setup.intent.state || '')] || 'unknown';
-}
-
-/* gigahostOrderStatusHealthState maps the panel's own backend record to the health
- * axis. A server that is not a backend has no health to report, and a read that
- * has not happened is unknown rather than healthy. */
-function gigahostOrderStatusHealthState(health) {
-    if (!health || !health.known) return 'unknown';
-    const backend = health.backend;
-    if (!backend) return 'none';
-    // A backend the operator switched off carries no runtime health to report.
-    if (backend.enabled === false) return 'disabled';
-    const status = String(backend.status || '').trim().toLowerCase();
-    return gigahostOrderStatusHealthStates[status] || 'unknown';
-}
-
-/* gigahostOrderStatusNextAction names the one thing an operator can do next for
- * this state. It never names a step the current stage forbids, so a provider that
- * has not finished deploying is always "wait", whatever else is recorded.
- *
- * The setup axis is only consulted once the provider side is settled, and an
- * unreadable setup or health axis yields no advice rather than a guess. */
-function gigahostOrderStatusNextAction(model) {
-    if (model.stage === 'unknown') return 'gigahost_status_next_action_check_provider';
-    if (model.stage === 'cancelled') return 'gigahost_status_next_action_none';
-    if (model.stage === 'deploying') return 'gigahost_status_next_action_wait';
-    if (model.stage === 'failed' || model.setup === 'failed') return 'gigahost_status_next_action_retry';
-    return gigahostOrderStatusSettledNextAction(model);
-}
-
-/* gigahostOrderStatusSettledNextAction is the advice for a provider-ready order,
- * where the remaining question is whether setup and health are actually done. */
-function gigahostOrderStatusSettledNextAction(model) {
-    if (model.setup === 'needs_operator') return 'gigahost_status_next_action_resume';
-    if (model.setup === 'none') return 'gigahost_status_next_action_approve_setup';
-    if (model.setup !== 'ready') return 'gigahost_status_next_action_none';
-    if (model.health === 'healthy') return 'gigahost_status_next_action_none';
-    return 'gigahost_status_next_action_check_health';
-}
-
-/* gigahostOrderStatusText returns the first non-empty value as a string, or ''.
- * It exists so "the provider's answer, else the panel's copy" reads the same way at
- * every field instead of repeating a null guard that can drift per field. */
-function gigahostOrderStatusText(...values) {
-    for (const value of values) {
-        if (value === null || value === undefined) continue;
-        const text = String(value);
-        if (text !== '') return text;
-    }
-    return '';
-}
-
-/* gigahostOrderStatusProviderFacts classifies the provider axis for one order.
- *
- * A provider answer outranks the ledger row, which is only the panel's copy of the
- * last answer; the ledger is the fallback when that read failed, and providerSource
- * then says so. providerStage is the stage the view may claim, and it is `unknown`
- * for a ledger placeholder: no provider order was ever acknowledged there, so no
- * progress may be claimed for it whatever the row says. */
-function gigahostOrderStatusProviderFacts(order, deploy) {
-    const record = order || {};
-    const detail = deploy || {};
-    const orderId = String(record.order_id || '');
-    // The provider's answer is authoritative when there is one. The ledger row is
-    // the panel's copy of an earlier answer and is only the fallback.
-    const providerStatus = gigahostOrderStatusText(detail.status);
-    const orderStage = gigahostOrderStatusProviderStage(providerStatus || record.status);
-    const stage = gigahostOrderStatusIsPlaceholderID(orderId) ? 'unknown' : orderStage;
-    const assignedIP = gigahostOrderStatusText(detail.assigned_ip, record.assigned_ip);
-    return {
-        orderId: orderId,
-        providerStatus: gigahostOrderStatusText(providerStatus, record.status),
-        providerSource: providerStatus ? 'provider' : 'ledger',
-        // A provider that has not confirmed readiness has not handed over a usable
-        // address, whatever the order row shows.
-        addressWhileProvisioning: assignedIP !== '' && stage !== 'ready',
-        assignedIP: assignedIP,
-        stage: stage,
-        step: gigahostOrderStatusText(detail.step, record.step),
-        failure: gigahostOrderStatusText(detail.error, record.last_error),
-        lastChangeAt: gigahostOrderStatusText(detail.updated_at, record.updated_at)
-    };
-}
-
-/* gigahostOrderStatusModel is the whole classification, and it is pure: the same
- * inputs always produce the same model, so the rendered view can be asserted
- * without a browser. context carries what the page already read:
- *   {deploy, detailOK, setup:{known,intent}, health:{known,backend}, checkedAt} */
-function gigahostOrderStatusModel(order, context) {
-    const ctx = context || {};
-    const provider = gigahostOrderStatusProviderFacts(order, ctx.deploy);
-    const setup = ctx.setup || {known: false, intent: null};
-    const health = ctx.health || {known: false, backend: null};
-
-    const model = {
-        orderId: provider.orderId,
-        stage: provider.stage,
-        chain: gigahostOrderStatusStageChain(provider.stage),
-        providerStatus: provider.providerStatus,
-        providerSource: provider.providerSource,
-        providerConfirmed: provider.stage === 'ready',
-        detailOK: ctx.detailOK !== false,
-        assignedIP: provider.assignedIP,
-        addressWhileProvisioning: provider.addressWhileProvisioning,
-        step: provider.step,
-        failure: provider.failure,
-        setup: gigahostOrderStatusSetupState(setup),
-        setupIntent: setup.intent || null,
-        health: gigahostOrderStatusHealthState(health),
-        healthBackend: health.backend || null,
-        lastCheckedAt: String(ctx.checkedAt || ''),
-        lastChangeAt: provider.lastChangeAt
-    };
-    model.nextActionKey = gigahostOrderStatusNextAction(model);
-    return model;
-}
 
 /* gigahostOrderStatusBadgeClass maps a stage to the existing badge vocabulary. */
 function gigahostOrderStatusBadgeClass(stage) {
@@ -341,7 +136,9 @@ function gigahostOrderStatusFailureDetail(panel, model) {
 function gigahostOrderStatusAddressDetail(panel, model) {
     if (!model.assignedIP) return;
     gigahostOrderStatusDetail(panel, 'gigahost_status_address', model.assignedIP);
-    if (!model.addressWhileProvisioning) return;
+    // An address proves nothing about readiness when the provider state is unknown, so
+    // the explanation is due in that case too, not only while actively deploying.
+    if (!model.addressWhileProvisioning && !model.providerUnknown) return;
     const hint = document.createElement('div');
     hint.style.color = 'var(--text-muted)';
     hint.textContent = _('gigahost_status_ip_while_provisioning');
@@ -403,8 +200,9 @@ function gigahostOrderStatusCell(order, context) {
     return wrapper;
 }
 
-/* gigahostOrderStatusLoaded records a successful read and clears the stale notice,
- * because what is on screen is current again. */
+/* gigahostOrderStatusLoaded records a provider read that actually succeeded. It is
+ * the only place "last successful check" advances, so a panel read that returned
+ * cached rows cannot certify a provider check nobody completed. */
 function gigahostOrderStatusLoaded(container, checkedAt) {
     gigahostOrderStatusLastSuccessAt = String(checkedAt || '');
     if (!container) return;
@@ -413,8 +211,22 @@ function gigahostOrderStatusLoaded(container, checkedAt) {
     if (stale) stale.remove();
 }
 
-/* gigahostOrderStatusStaleNotice builds the explicit stale marker. */
-function gigahostOrderStatusStaleNotice() {
+/* gigahostOrderStatusProviderFailed marks the view stale without inventing a
+ * result: the rows already on screen are kept and labelled, and the last successful
+ * check keeps the time of the last read that genuinely answered. When nothing was
+ * ever confirmed, the notice says so instead of borrowing a time. */
+function gigahostOrderStatusProviderFailed(container, reason) {
+    if (!container) return;
+    container.setAttribute('data-stale', 'true');
+    const existing = container.querySelector('#recentOrdersStale');
+    if (existing) existing.remove();
+    container.insertBefore(gigahostOrderStatusStaleNotice(reason), container.firstChild);
+}
+
+/* gigahostOrderStatusStaleNotice builds the explicit stale marker. The time it shows
+ * is the last check that genuinely confirmed a provider state, and it says so when
+ * there is none: an unconfirmed view must not display a time as if one had answered. */
+function gigahostOrderStatusStaleNotice(reason) {
     const notice = document.createElement('div');
     notice.id = 'recentOrdersStale';
     notice.setAttribute('role', 'status');
@@ -427,6 +239,14 @@ function gigahostOrderStatusStaleNotice() {
     notice.textContent = _('gigahost_status_stale');
     notice.appendChild(document.createTextNode(' '));
     notice.appendChild(gigahostOrderStatusTime(gigahostOrderStatusLastSuccessAt, 'gigahost_status_stale_never'));
+    if (reason) {
+        const detail = document.createElement('div');
+        detail.style.marginTop = '2px';
+        detail.style.fontSize = '0.75rem';
+        // A provider diagnostic is untrusted input: text, never markup.
+        detail.textContent = _('gigahost_status_provider_error') + ': ' + reason;
+        notice.appendChild(detail);
+    }
     return notice;
 }
 
@@ -691,67 +511,140 @@ function mergeGigahostOrderDetail(order, deploy) {
 
 /* loadRecentOrders reads the recent orders once and renders their status.
  *
- * One tick reads the order list (the server refreshes it from the provider), the
- * saved setup approvals and the panel's backend records, then the per-order deploy
- * detail. Only the order list decides staleness: the other reads each have an
- * explicit unknown outcome, so a partial failure cannot become a claim about
- * readiness. Nothing here writes: no order is placed, no setup is started and no
+ * One tick reads the order list (the server refreshes it from the provider and says,
+ * per order, what the provider actually answered), the saved setup approvals and the
+ * panel's backend records, then the per-order deploy detail as onboarding-journal
+ * evidence. Only a response in which the provider actually answered counts as a
+ * successful check: a 200 carrying cached rows is a read of the panel, not of the
+ * provider, and it must not advance the last successful check or clear a stale
+ * notice. Nothing here writes: no order is placed, no setup is started and no
  * approval is touched. */
 async function loadRecentOrders() {
     const container = document.getElementById('recentOrdersContainer');
     if (!container) return;
 
+    const read = await gigahostOrderStatusReadOnce();
+    if (!read.ok) {
+        gigahostOrderStatusLoadFailed(container);
+        return;
+    }
+
+    const {merged, details, setupIndex, observations, checkedAt} = read;
+    const freshness = gigahostOrderStatusFreshness(container, merged, observations, checkedAt);
+    if (freshness.providerFailed && merged.length > 0) {
+        gigahostOrderStatusProviderFailed(container, freshness.reason);
+    }
+
+    if (merged.length === 0) {
+        gigahostOrderStatusRenderEmpty(container, freshness);
+        return;
+    }
+    gigahostOrderStatusRenderList(container, merged, details, setupIndex, observations, checkedAt);
+}
+
+/* gigahostOrderStatusReadOnce performs one tick's reads and reports them as data.
+ *
+ * Only the order list can fail the tick: it is the read that decides whether anything
+ * is known at all. The approval list, the backend records and the per-order detail each
+ * carry their own explicit unknown, so a partial failure there cannot become a claim
+ * about readiness. A null setupIndex means the approval list was unreadable. */
+async function gigahostOrderStatusReadOnce() {
     let orders;
+    let observations;
     try {
         const res = await API.get('/api/admin/hosting/gigahost/orders');
         orders = (res && res.orders) ? res.orders : [];
+        observations = (res && res.provider_observations) ? res.provider_observations : {};
     } catch (_) {
-        gigahostOrderStatusLoadFailed(container);
-        return;
+        return {ok: false};
     }
 
     const checkedAt = gigahostOrderStatusNow().toISOString();
     const setupIndex = await readGigahostSetupIntents();
     await refreshGigahostBackendHealth();
-
     const details = await Promise.all(orders.map((order) => readGigahostOrderDeploy(order && order.order_id)));
     const merged = orders.map((order, index) => mergeGigahostOrderDetail(order, (details[index] || {}).deploy));
+    return {ok: true, merged: merged, details: details, setupIndex: setupIndex, observations: observations, checkedAt: checkedAt};
+}
 
-    gigahostOrderStatusLoaded(container, checkedAt);
-
-    if (merged.length === 0) {
-        const empty = document.createElement('span');
-        empty.className = 'text-muted';
-        empty.textContent = _('gigahost_status_empty');
-        container.replaceChildren(empty);
-        return;
-    }
-
+/* gigahostOrderStatusRenderList renders the first five orders and keeps any stale
+ * notice above them, so a stale label survives a rerender of the same rows. */
+function gigahostOrderStatusRenderList(container, merged, details, setupIndex, observations, checkedAt) {
     const list = document.createElement('div');
     list.style.display = 'flex';
     list.style.flexDirection = 'column';
     list.style.gap = '6px';
     merged.slice(0, 5).forEach((order, index) => {
         list.appendChild(gigahostOrderStatusRow(order,
-            gigahostOrderStatusContext(order, details[index], setupIndex, checkedAt)));
+            gigahostOrderStatusContext(order, details[index], setupIndex, checkedAt, observations)));
     });
+    const stale = container.querySelector('#recentOrdersStale');
     container.replaceChildren(list);
+    if (stale) container.insertBefore(stale, container.firstChild);
 }
 
-/* gigahostOrderStatusContext assembles the context one row classifies, from the
- * reads this tick already performed. setupIndex of null means the approval list could
- * not be read, which is reported as an unknown setup axis rather than "none". */
-function gigahostOrderStatusContext(order, detail, setupIndex, checkedAt) {
+/* gigahostOrderStatusFreshness decides what this tick established about the provider,
+ * and records the last successful check only when one actually happened.
+ *
+ * A 200 carrying cached rows is a read of the panel, not of the provider, so it can
+ * neither advance the last successful check nor clear a stale notice. Only an
+ * observation that says the provider answered may do that. */
+function gigahostOrderStatusFreshness(container, merged, observations, checkedAt) {
+    const reads = observations || {};
+    const outcomes = merged.map((order) =>
+        gigahostOrderStatusObservation(reads[String(order.order_id || '')]));
+    const failures = outcomes.filter((obs) => obs.outcome === 'unavailable');
+    const confirmed = outcomes.some((obs) => obs.outcome === 'confirmed');
+
+    if (confirmed) {
+        gigahostOrderStatusLoaded(container, checkedAt);
+        return {confirmed: true, providerFailed: false, reason: ''};
+    }
+    if (failures.length > 0) {
+        return {confirmed: false, providerFailed: true, reason: failures[0].error};
+    }
+    // No read was attempted for anything on screen (an all-terminal list). That is not
+    // a failure, and it is not a confirmation either: nothing is advanced.
+    return {confirmed: false, providerFailed: false, reason: ''};
+}
+
+/* gigahostOrderStatusRenderEmpty renders a list with no orders.
+ *
+ * "No orders have been placed" is a statement about the provider's answer, so it is
+ * only made when a provider read confirmed it. An empty list whose provider read failed
+ * is an unreachable panel read, and saying "no orders" there would invent a history. */
+function gigahostOrderStatusRenderEmpty(container, freshness) {
+    const empty = document.createElement('span');
+    empty.className = 'text-muted';
+    empty.textContent = freshness.providerFailed
+        ? _('gigahost_status_load_failed')
+        : _('gigahost_status_empty');
+    container.replaceChildren(empty);
+    if (!freshness.providerFailed) return;
+    container.setAttribute('data-stale', 'true');
+    container.insertBefore(gigahostOrderStatusStaleNotice(freshness.reason), container.firstChild);
+}
+
+/* gigahostOrderStatusContext assembles the context one row classifies, from the reads
+ * this tick already performed. setupIndex of null means the approval list could not be
+ * read, which is reported as an unknown setup axis rather than "none"; the deploy DTO
+ * supplies the onboarding-journal evidence the immediate setup path writes. */
+function gigahostOrderStatusContext(order, detail, setupIndex, checkedAt, observations) {
     const deploy = detail || {};
+    const orderId = String(order.order_id || '');
     const setupKnown = setupIndex !== null;
+    const reads = observations || {};
     return {
         deploy: deploy.deploy || null,
         detailOK: deploy.detailOK === true,
         checkedAt: checkedAt,
+        observation: reads[orderId] || null,
         setup: {
             known: setupKnown,
-            intent: setupKnown ? setupIndex[String(order.order_id || '')] || null : null
+            intent: setupKnown ? setupIndex[orderId] || null : null,
+            journal: gigahostOrderStatusJournalEvidence(deploy.deploy)
         },
         health: gigahostOrderStatusHealthFor(order)
     };
 }
+

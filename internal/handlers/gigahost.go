@@ -894,9 +894,15 @@ func (h *Handlers) refreshOrderFromServers(servers []gigahost.ServerInfo, order 
 	return false
 }
 
-func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord) bool {
+// refreshOrderFromDeployStatus refreshes one order from the provider's order detail
+// and reports both whether the row changed and what the provider actually answered.
+//
+// The two are different questions: a provider that repeats the status already on the
+// row changed nothing, yet it is still the freshest confirmation the panel has. Only
+// the returned observation may be presented as a provider read.
+func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord) (bool, GigahostProviderObservation) {
 	if strings.HasPrefix(order.OrderID, "unknown_") || strings.HasPrefix(order.OrderID, "intent_") || order.OrderID == "" {
-		return false
+		return false, GigahostProviderObservation{Outcome: gigahostObservationNotChecked}
 	}
 	statusResp, deployErr := client.GetDeployStatus(ctx, order.OrderID)
 	if deployErr == nil {
@@ -918,16 +924,31 @@ func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client giga
 				updated = true
 			}
 		}
-		return updated
-	} else if errors.Is(deployErr, gigahost.ErrNotFound) && (order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active") {
-		order.Status = statusCancelled
-		return true
+		observation := GigahostProviderObservation{Outcome: gigahostObservationUnconfirmed}
+		if statusResp != nil {
+			if status := strings.TrimSpace(statusResp.Status); status != "" {
+				observation = GigahostProviderObservation{Outcome: gigahostObservationConfirmed, Status: status}
+			}
+			observation.Error = statusResp.Error
+		}
+		return updated, observation
 	}
-	return false
+	if errors.Is(deployErr, gigahost.ErrNotFound) && (order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active") {
+		// The provider answered: it has no such order, which is a confirmation of a
+		// cancellation rather than a read failure.
+		order.Status = statusCancelled
+		return true, GigahostProviderObservation{Outcome: gigahostObservationConfirmed, Status: statusCancelled}
+	}
+	return false, GigahostProviderObservation{Outcome: gigahostObservationUnavailable, Error: deployErr.Error()}
 }
 
 // GigahostOrdersHandler handles GET /api/admin/hosting/gigahost/orders.
 // Lists persistent order history and refreshes status for active/pending jobs.
+//
+// Each order carries a provider observation alongside its row: the row is the
+// panel's copy of the last answer and is served whether or not the provider could
+// be reached, so a 200 here does not mean the provider was read. The observation
+// says which it was, per order, without changing the rows themselves.
 func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	sess := middleware.GetSession(r.Context())
 	if sess == nil || sess.Role != models.RoleAdmin {
@@ -941,36 +962,22 @@ func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Every order starts as "a provider read was not attempted"; the refresh below
+	// records what each read actually answered.
+	observations := make(map[string]GigahostProviderObservation, len(orders))
+	for i := range orders {
+		observations[orders[i].OrderID] = GigahostProviderObservation{Outcome: gigahostObservationNotChecked}
+	}
+
 	// Refresh all non-terminal orders if client is accessible
 	client, clientErr := h.getGigahostClient(r.Context(), r)
 	if clientErr == nil && len(orders) > 0 {
-		servers, _ := client.GetServers(r.Context())
-		deployQueries := 0
-		const maxDeployQueries = 10
-		for i := range orders {
-			if isTerminalStatus(orders[i].Status) {
-				continue
-			}
-			updated := false
-			if len(servers) > 0 && h.refreshOrderFromServers(servers, &orders[i]) {
-				updated = true
-			}
-			if (isPendingOrInFlight(orders[i].Status) || !updated) && deployQueries < maxDeployQueries {
-				if orders[i].OrderID != "" && !strings.HasPrefix(orders[i].OrderID, "unknown_") && !strings.HasPrefix(orders[i].OrderID, "intent_") {
-					deployQueries++
-					if h.refreshOrderFromDeployStatus(r.Context(), client, &orders[i]) {
-						updated = true
-					}
-				}
-			}
-			if updated {
-				_ = h.updateGigahostOrder(r.Context(), &orders[i])
-			}
-		}
+		observations = h.gigahostOrderObservations(r.Context(), client, orders)
 	}
 
 	h.JSONOK(w, map[string]any{
-		"orders": orders,
-		"count":  len(orders),
+		"orders":                orders,
+		"count":                 len(orders),
+		"provider_observations": observations,
 	})
 }

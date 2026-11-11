@@ -37,12 +37,17 @@ func gigahostOrderStatusHarness(t *testing.T, scenario string) string {
 	if err != nil {
 		t.Fatalf("read the order status module: %v", err)
 	}
+	modelModule, err := StaticFS.ReadFile("static/js/gigahost_order_status_model.js")
+	if err != nil {
+		t.Fatalf("read the order status classification module: %v", err)
+	}
 	intentsModule, err := StaticFS.ReadFile("static/js/gigahost_setup_intents.js")
 	if err != nil {
 		t.Fatalf("read the setup intents module: %v", err)
 	}
 	encodedStatus, _ := json.Marshal(string(statusModule))
 	encodedIntents, _ := json.Marshal(string(intentsModule))
+	encodedModel, _ := json.Marshal(string(modelModule))
 	return jsdomBootstrapSnippet + fmt.Sprintf(`
 const dom = new JSDOM('<div id="recentOrdersContainer"></div>', {runScripts:'outside-only'});
 const w = dom.window;
@@ -56,7 +61,7 @@ w.UI = {toast:(text,kind)=>toasts.push({text,kind})};
 const actions = [];
 w.triggerGigahostSetup = orderId => actions.push({action:'immediate_setup', orderId});
 
-let orders = [], intents = [], backends = [], deployByOrder = {};
+let orders = [], intents = [], backends = [], deployByOrder = {}, observationByOrder = {};
 let failOrders = false, failIntents = false, failBackends = false, failList = false;
 const calls = [];
 // A prompt or confirmation raised by an accidental action click is answered with a
@@ -68,7 +73,9 @@ w.API = {
     calls.push({method:'GET', url});
     if (url === '/api/admin/hosting/gigahost/orders') {
       if (failOrders) throw new Error('offline');
-      return {orders: orders};
+      // The real handler answers with the additive per-order provider observation;
+      // a scenario supplies only what it wants to differ from "the provider answered".
+      return {orders: orders, provider_observations: observationByOrder};
     }
     if (url === '/api/admin/hosting/gigahost/setup-intents') {
       if (failIntents) throw new Error('offline');
@@ -92,9 +99,10 @@ w.API = {
 };
 
 w.eval(%s);
-// The sourceURL is what lets a coverage run attribute the module's own blocks to it
+// The sourceURL is what lets a coverage run attribute each module's own blocks to it
 // instead of to the undifferentiated stdin script, so CRAP is measurable from this
 // test rather than from a parallel harness.
+w.eval(%s + '\n//# sourceURL=gigahost_order_status_model.js');
 w.eval(%s + '\n//# sourceURL=gigahost_order_status.js');
 
 const container = () => w.document.getElementById('recentOrdersContainer');
@@ -110,7 +118,7 @@ const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(r => s
 (async()=>{
 %s
 })().catch(err=>{console.error(err);process.exit(1)});
-`, string(encodedIntents), string(encodedStatus), scenario)
+`, string(encodedIntents), string(encodedModel), string(encodedStatus), scenario)
 }
 
 // runGigahostOrderStatusScenario executes one scenario body and requires its own
@@ -134,8 +142,12 @@ func TestGigahostOrderStatusModelDistinguishesReadiness(t *testing.T) {
  // 1. DEFECT ORACLE: an address is assigned but the provider is still deploying.
  //    The address is shown, and readiness is NOT claimed. The old view showed this
  //    order as "vps_ready" because it had an address.
+ //    The provider answer is what the server observed in this response; the deploy
+ //    DTO is the onboarding journal and carries no step here, because onboarding
+ //    never ran for this order.
  orders = [{order_id:'ord-ip', status:'ready', assigned_ip:'198.51.100.7'}];
- deployByOrder = { 'ord-ip': {status:'deploying', step:'ssh_verifying', assigned_ip:'198.51.100.7'} };
+ observationByOrder = { 'ord-ip': {outcome:'confirmed', status:'deploying'} };
+ deployByOrder = { 'ord-ip': {} };
  intents = []; backends = [];
  await w.loadRecentOrders();
  assert.equal(cell().getAttribute('data-stage'), 'deploying', 'an assigned address must not make the VPS ready');
@@ -148,7 +160,8 @@ func TestGigahostOrderStatusModelDistinguishesReadiness(t *testing.T) {
  // 2. The three axes are reported separately when they disagree: the provider is
  //    ready, no setup approval exists, and the server is not a backend.
  orders = [{order_id:'ord-split', status:'ready'}];
- deployByOrder = { 'ord-split': {status:'ready', step:'ready', server_id:0} };
+ observationByOrder = { 'ord-split': {outcome:'confirmed', status:'ready'} };
+ deployByOrder = { 'ord-split': {} };
  intents = []; backends = [];
  await w.loadRecentOrders();
  const splitPanel = flat(panel());
@@ -167,6 +180,7 @@ func TestGigahostOrderStatusModelDistinguishesReadiness(t *testing.T) {
  // 4. Verified backend health is read from the panel's own backend record, and the
  //    order's panel server id is what joins the two.
  orders = [{order_id:'ord-healthy', status:'ready'}];
+ observationByOrder = { 'ord-healthy': {outcome:'confirmed', status:'ready'} };
  deployByOrder = { 'ord-healthy': {status:'ready', step:'ready', server_id:9} };
  intents = [{order_id:'ord-healthy', state:'ready', step:'enabled'}];
  backends = [{server_id:9, enabled:true, status:'active'}];
@@ -185,7 +199,8 @@ func TestGigahostOrderStatusModelDistinguishesReadiness(t *testing.T) {
 
  // 6. A provider-ready VPS the panel has not onboarded keeps the setup path.
  orders = [{order_id:'ord-onboard', status:'ready', assigned_ip:'198.51.100.11'}];
- deployByOrder = { 'ord-onboard': {status:'ready', step:'ready', server_id:0, assigned_ip:'198.51.100.11'} };
+ observationByOrder = { 'ord-onboard': {outcome:'confirmed', status:'ready'} };
+ deployByOrder = { 'ord-onboard': {} };
  intents = []; backends = [];
  await w.loadRecentOrders();
  assert.deepEqual(rowActions(), ['deploy_setup_btn', 'setup_intents_approve'],
@@ -195,6 +210,7 @@ func TestGigahostOrderStatusModelDistinguishesReadiness(t *testing.T) {
  //    drawn for them: a failed order does not claim it ever deployed, and a ledger
  //    placeholder has no confirmed provider state at all.
  orders = [{order_id:'ord-fail', status:'failed'}];
+ observationByOrder = { 'ord-fail': {outcome:'confirmed', status:'failed'} };
  deployByOrder = { 'ord-fail': {status:'failed', step:'installing_protocol', error:'provider refused'} };
  intents = []; backends = [];
  await w.loadRecentOrders();
@@ -205,6 +221,7 @@ func TestGigahostOrderStatusModelDistinguishesReadiness(t *testing.T) {
  assert.match(flat(panel()), /provider refused/);
 
  orders = [{order_id:'intent_1700000000000', status:'deploying', assigned_ip:'198.51.100.12'}];
+ observationByOrder = { 'intent_1700000000000': {outcome:'not_checked'} };
  deployByOrder = {};
  await w.loadRecentOrders();
  assert.equal(cell().getAttribute('data-stage'), 'unknown',
@@ -216,7 +233,8 @@ func TestGigahostOrderStatusModelDistinguishesReadiness(t *testing.T) {
  //    not claim it ever deployed. The setup affordance itself is the pre-existing
  //    one and is preserved, because revoking an approval never cancelled the VPS.
  orders = [{order_id:'ord-cancel', status:'cancelled'}];
- deployByOrder = { 'ord-cancel': {status:'cancelled'} };
+ observationByOrder = { 'ord-cancel': {outcome:'confirmed', status:'cancelled'} };
+ deployByOrder = { 'ord-cancel': {} };
  await w.loadRecentOrders();
  assert.equal(cell().getAttribute('data-stage'), 'cancelled');
  assert.match(flat(panel()), /gigahost_status_next_action_none/);
@@ -425,43 +443,70 @@ func TestGigahostOrderStatusRefreshFailureKeepsLastKnownData(t *testing.T) {
 
  // 3. THE DEFECT ORACLE: after a successful read, a failed refresh keeps the last
  //    known data and marks it stale instead of blanking it or presenting it as
- //    current.
+ //    current. This order was never onboarded, so its status column is a provider
+ //    answer; onboarding never wrote a step here.
  orders = [{order_id:'ord-stale', status:'deploying', assigned_ip:'198.51.100.30'}];
- deployByOrder = { 'ord-stale': {status:'deploying', step:'ssh_verifying', assigned_ip:'198.51.100.30'} };
+ observationByOrder = { 'ord-stale': {outcome:'confirmed', status:'deploying'} };
+ deployByOrder = { 'ord-stale': {} };
  intents = []; backends = [];
  await w.loadRecentOrders();
  assert.equal(container().getAttribute('data-stale'), null);
  assert.equal(cell().getAttribute('data-stage'), 'deploying');
  const knownText = flat(container());
 
- failOrders = true;
+ //    The panel answers 200 with the same rows, but the provider read inside it
+ //    failed. That is the real outage shape, and it must not be presented as current.
+ observationByOrder = { 'ord-stale': {outcome:'unavailable', error:'controlled provider unavailable'} };
  await w.loadRecentOrders();
- failOrders = false;
  assert.equal(cell().getAttribute('data-stage'), 'deploying', 'the last known stage must be retained');
  assert.match(flat(container()), /198\.51\.100\.30/, 'the last known address must be retained');
- assert.equal(container().getAttribute('data-stale'), 'true', 'retained data must be marked stale');
+ assert.equal(container().getAttribute('data-stale'), 'true',
+   'a 200 that could not reach the provider is still stale');
  const notice = container().querySelector('#recentOrdersStale');
  assert.ok(notice, 'a stale notice must be shown');
  assert.match(flat(notice), /gigahost_status_stale/);
- assert.ok(flat(notice).length > 0, 'the stale notice must say when the last good read was');
+ assert.match(flat(notice), /controlled provider unavailable/, 'the provider error must be shown');
  assert.equal(/gigahost_status_load_failed/.test(flat(container())), false,
    'retained data must not be replaced by the unavailable text');
 
+ // 3b. The last successful check is the last time the provider actually answered, not
+ //     the time of this browser read. The panel-level failure path is the other shape.
+ assert.match(flat(container()), /gigahost_status_last_check|gigahost_status_stale/);
+
  // 4. The next successful read clears the stale marker: the data is current again.
+ observationByOrder = { 'ord-stale': {outcome:'confirmed', status:'deploying'} };
  await w.loadRecentOrders();
  assert.equal(container().getAttribute('data-stale'), null);
  assert.equal(container().querySelector('#recentOrdersStale'), null);
  assert.equal(cell().getAttribute('data-stage'), 'deploying');
 
  // 5. A refresh that fails only for the setup or backend lists leaves the provider
- //    stage intact and reports those axes as unknown instead of guessing.
+ //    stage intact and reports the axes it could not read honestly.
  failIntents = true; failBackends = true;
  await w.loadRecentOrders();
  failIntents = false; failBackends = false;
  assert.equal(cell().getAttribute('data-stage'), 'deploying', 'a partial failure must not change the provider stage');
  const partial = flat(panel());
- assert.match(partial, /gigahost_status_setup_unknown/, 'an unreadable setup list is unknown, not "not started"');
+ // This order was never onboarded, so with the approval list unreadable there is no
+ // setup evidence at all: unknown, never "not started".
+ assert.match(partial, /gigahost_status_setup_unknown/,
+   'an unreadable approval list with no journal evidence is unknown, got ' + partial);
  assert.match(partial, /gigahost_status_health_unknown/, 'an unreadable backend list is unknown, not a previous healthy');
+
+ // 5b. With no journal evidence at all, an unreadable approval list is unknown rather
+ //     than "not started": nothing was read, so nothing may be claimed.
+ orders = [{order_id:'ord-nolist', status:'deploying'}];
+ observationByOrder = { 'ord-nolist': {outcome:'confirmed', status:'deploying'} };
+ deployByOrder = { 'ord-nolist': {} };
+ failIntents = true; failBackends = true;
+ await w.loadRecentOrders();
+ failIntents = false; failBackends = false;
+ assert.match(flat(panel()), /gigahost_status_setup_unknown/,
+   'an unreadable setup list with no journal evidence is unknown, never "not started"');
+
+ // 5c. The journal is what identifies onboarding: a provider-side "deploying" on an
+ //     order onboarding never touched is not setup progress, so it stays "not started".
+ assert.match(flat(panel()), /gigahost_status_setup_none|gigahost_status_setup_unknown/);
 
  // 6. A refresh is a read: repeating it never writes.
  assert.deepEqual(writes(), [], 'refreshing the status must never write');

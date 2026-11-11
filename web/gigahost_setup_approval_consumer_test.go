@@ -51,6 +51,20 @@ func TestGigahostSetupApprovalInitiationConsumerDOM(t *testing.T) {
 	if !strings.Contains(templateStr, `src="/static/js/gigahost_order_status.js"`) {
 		t.Fatal("settings.html does not load the module that renders the recent orders")
 	}
+	// The classification is a separate shipped module, and it must be loaded before the
+	// renderer that consumes it.
+	modelAt := strings.Index(templateStr, `src="/static/js/gigahost_order_status_model.js"`)
+	rendererAt := strings.Index(templateStr, `src="/static/js/gigahost_order_status.js"`)
+	if modelAt < 0 {
+		t.Fatal("settings.html does not load the order-status classification module")
+	}
+	if modelAt > rendererAt {
+		t.Fatal("the classification module must load before the renderer that uses it")
+	}
+	modelModule, err := StaticFS.ReadFile("static/js/gigahost_order_status_model.js")
+	if err != nil {
+		t.Fatalf("read the classification module: %v", err)
+	}
 	consumer, err := StaticFS.ReadFile("static/js/gigahost_order_status.js")
 	if err != nil {
 		t.Fatalf("read the recent-orders renderer: %v", err)
@@ -61,6 +75,7 @@ func TestGigahostSetupApprovalInitiationConsumerDOM(t *testing.T) {
 
 	encodedModule, _ := json.Marshal(string(module))
 	encodedConsumer, _ := json.Marshal(string(consumer))
+	encodedModel, _ := json.Marshal(string(modelModule))
 	script := jsdomBootstrapSnippet + fmt.Sprintf(`
 const dom = new JSDOM('<div id="recentOrdersContainer"></div><div id="setupIntentsContainer"></div>', {runScripts:'outside-only'});
 const w = dom.window;
@@ -104,6 +119,7 @@ const intentsContainer = w.document.getElementById('setupIntentsContainer');
 const approveBtn = () => Array.from(w.document.querySelectorAll('#recentOrdersContainer button:not(.gigahost-order-status-toggle)'))
   .find(b => b.textContent === 'setup_intents_approve');
 
+w.eval(%s);
 w.eval(%s);
 w.eval(%s);
 
@@ -258,7 +274,7 @@ w.eval(%s);
 
  console.log('SETUP_APPROVAL_INITIATION_DOM_OK');dom.window.close();
 })().catch(err=>{console.error(err);process.exit(1)});
-`, string(encodedModule), string(encodedConsumer))
+`, string(encodedModule), string(encodedModel), string(encodedConsumer))
 
 	out, err := execNodeScript(node, script)
 	if err != nil || !strings.Contains(string(out), "SETUP_APPROVAL_INITIATION_DOM_OK") {

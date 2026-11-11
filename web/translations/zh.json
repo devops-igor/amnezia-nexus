@@ -763,6 +763,7 @@
   "setup_intents_already_saved": "此订单已有保存的安装审批",
   "setup_intents_protocol_invalid": "请输入以下之一：awg、vless、naive",
   "gigahost_status_provider": "服务商",
+  "gigahost_status_provider_error": "提供商错误",
   "gigahost_status_vpn_setup": "VPN 部署",
   "gigahost_status_backend_health": "后端健康状态",
   "gigahost_status_stage_requested": "已请求",

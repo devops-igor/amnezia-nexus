@@ -763,6 +763,7 @@
   "setup_intents_already_saved": "Одобрение настройки для этого заказа уже сохранено",
   "setup_intents_protocol_invalid": "Введите одно из значений: awg, vless, naive",
   "gigahost_status_provider": "Провайдер",
+  "gigahost_status_provider_error": "Ошибка провайдера",
   "gigahost_status_vpn_setup": "Настройка VPN",
   "gigahost_status_backend_health": "Состояние бэкенда",
   "gigahost_status_stage_requested": "Запрошено",
