@@ -369,6 +369,11 @@
                         <select class="form-select" id="deployRegionSelect"></select>
                     </div>
                     <div class="form-group">
+                        <label class="form-label" for="deployPlacementSelect">{{ _ "deploy_vps_placement_label" }}</label>
+                        <select class="form-select" id="deployPlacementSelect"></select>
+                        <p class="form-hint" id="deployPlacementHint" style="display:none; margin-top:var(--space-xs);"></p>
+                    </div>
+                    <div class="form-group">
                         <label class="form-label" for="deployOSSelect">{{ _ "deploy_vps_select_os" }}</label>
                         <select class="form-select" id="deployOSSelect"></select>
                     </div>
@@ -415,6 +420,7 @@
 <script src="/static/js/gigahost_setup_intents.js"></script>
 <script src="/static/js/gigahost_order_status_model.js"></script>
 <script src="/static/js/gigahost_order_status.js"></script>
+<script src="/static/js/gigahost_placement.js"></script>
 <script>
     document.getElementById('ssl_enabled').addEventListener('change', (e) => {
         document.getElementById('sslFields').style.display = e.target.checked ? 'block' : 'none';
@@ -630,9 +636,64 @@
     const btnDeployVPS = document.getElementById('btnDeployVPS');
     const deployPlanSelect = document.getElementById('deployPlanSelect');
     const deployRegionSelect = document.getElementById('deployRegionSelect');
+    const deployPlacementSelect = document.getElementById('deployPlacementSelect');
+    const deployPlacementHint = document.getElementById('deployPlacementHint');
     const deployOSSelect = document.getElementById('deployOSSelect');
 
     let cachedPlans = [];
+
+    // deploymentPlacementCleared is true while a dropped pin still needs a fresh
+    // deliberate choice. Ordering is refused until then.
+    let deploymentPlacementCleared = false;
+
+    // deployPlacementChoices recomputes the options each time, so a catalog refresh
+    // is always the authority and no stale choice can be posted.
+    function deployPlacementChoices() {
+        return placementChoices(deployPlanAt(), deployRegionSelect ? deployRegionSelect.value : null);
+    }
+
+    // showDeployPlacementHint explains a refusal or a dropped choice. It never
+    // enables ordering.
+    function showDeployPlacementHint(text) {
+        if (!deployPlacementHint) return;
+        deployPlacementHint.textContent = text || '';
+        deployPlacementHint.style.display = text ? 'block' : 'none';
+    }
+
+    // rebuildDeployPlacement repopulates the selector from the provider's placement
+    // facts: every datacenter is listed, only a selectable one may be chosen, and a
+    // previous choice the new plan/region cannot honour is dropped and explained.
+    function rebuildDeployPlacement(previous) {
+        const choices = deployPlacementChoices();
+        if (!deployPlacementSelect) return {value: '', cleared: false, reason: ''};
+        deployPlacementSelect.innerHTML = '';
+
+        const managed = document.createElement('option');
+        managed.value = choices.managed.value;
+        managed.textContent = choices.managed.label;
+        deployPlacementSelect.appendChild(managed);
+
+        choices.options.forEach(option => {
+            const opt = document.createElement('option');
+            // A refused datacenter still carries a distinct value, so choosing it is
+            // an explicit refusal rather than a silent default.
+            opt.value = option.value;
+            opt.textContent = placementLabel(option);
+            opt.disabled = !option.selectable;
+            deployPlacementSelect.appendChild(opt);
+        });
+
+        const decision = placementSelection(choices, previous);
+        deployPlacementSelect.value = decision.value;
+        deployPlacementSelect.disabled = false;
+        showDeployPlacementHint(decision.cleared ? decision.reason : (choices.note || ''));
+        return decision;
+    }
+
+    // deployPlacementNeedsChoice reports whether a dropped pin still needs a choice.
+    function deployPlacementNeedsChoice() {
+        return deploymentPlacementCleared;
+    }
 
     // deployPlanAt returns the plan the plan selector currently points at, or
     // null. The selector's value is the plan index into cachedPlans; an empty
@@ -684,7 +745,9 @@
             if (cachedPlans.length === 0) {
                 appendDeployOption(deployPlanSelect, _('deploy_vps_no_plans'));
                 appendDeployOption(deployRegionSelect, _('deploy_vps_no_plans'));
+                if (deployPlacementSelect) appendDeployOption(deployPlacementSelect, _('deploy_vps_no_plans'));
                 appendDeployOption(deployOSSelect, _('deploy_vps_no_plans'));
+                deploymentPlacementCleared = false;
                 updateDeployButtonState();
                 return;
             }
@@ -696,13 +759,23 @@
                 opt.textContent = deployPlanLabel(p);
                 deployPlanSelect.appendChild(opt);
             });
-            updateDeploySelections(null);
+            // Re-examine the CURRENT choices, so a datacenter whose stock vanished
+            // between reads is dropped rather than re-defaulted to region-managed.
+            updateDeploySelections({
+                region: deployRegionSelect ? deployRegionSelect.value : null,
+                os: deployOSSelect ? deployOSSelect.value : null,
+                placement: deployPlacementSelect ? deployPlacementSelect.value : null
+            });
         } catch (err) {
             cachedPlans = [];
             const message = _('deploy_vps_catalog_unavailable');
             appendDeployOption(deployPlanSelect, message);
             appendDeployOption(deployRegionSelect, message);
+            if (deployPlacementSelect) appendDeployOption(deployPlacementSelect, message);
             appendDeployOption(deployOSSelect, message);
+            // A failed read proves nothing about placement, so no pin survives it.
+            deploymentPlacementCleared = false;
+            showDeployPlacementHint('');
             updateDeployButtonState();
         } finally {
             if (loading) loading.style.display = 'none';
@@ -721,7 +794,9 @@
 
         if (!plan) {
             appendDeployOption(deployRegionSelect, _('deploy_vps_no_plans'));
+            if (deployPlacementSelect) appendDeployOption(deployPlacementSelect, _('deploy_vps_no_plans'));
             appendDeployOption(deployOSSelect, _('deploy_vps_no_plans'));
+            deploymentPlacementCleared = false;
             updateDeployButtonState();
             return;
         }
@@ -743,6 +818,11 @@
                 deployRegionSelect.disabled = false;
             }
         }
+
+        // Rebuild from the new plan and the surviving region, so a pin the new pair
+        // cannot honour is dropped rather than reaching the payload.
+        const placementDecision = rebuildDeployPlacement(previous ? previous.placement : null);
+        deploymentPlacementCleared = placementDecision.cleared;
 
         const images = plan.os_options || [];
         if (deployOSSelect) {
@@ -771,7 +851,10 @@
         if (!btnDeployVPS) return;
         const ready = !!deployPlanAt()
             && !!deployRegionSelect && deployRegionSelect.value !== ''
-            && !!deployOSSelect && deployOSSelect.value !== '';
+            && !!deployOSSelect && deployOSSelect.value !== ''
+            // A dropped pin blocks ordering until the operator chooses again. The
+            // stored choice is not silently read as region-managed placement.
+            && !deployPlacementNeedsChoice();
         btnDeployVPS.disabled = !ready;
     }
 
@@ -789,19 +872,50 @@
             return;
         }
 
+        // A dropped pin must be re-chosen before anything is bought.
+        if (deployPlacementNeedsChoice()) {
+            UI.toast(_('deploy_vps_placement_choice_cleared'), 'error');
+            return;
+        }
+
+        // The placement half of the payload comes from the module, which returns
+        // null for any choice it cannot send. A null therefore stops the order
+        // instead of falling back to a different location.
+        //
+        // A vanished option reads as '' (which a <select> produces for an unknown
+        // value), and '' means region-managed. That is the silent downgrade this
+        // path forbids, so the value is verified against the option list.
+        const placementValue = placementReadValue(deployPlacementSelect);
+        if (placementValue === null) {
+            UI.toast(_('deploy_vps_placement_choice_cleared'), 'error');
+            return;
+        }
+        const placementField = placementPayloadField(
+            deployPlacementChoices(),
+            placementValue,
+            regionID
+        );
+        if (!placementField) {
+            UI.toast(_('deploy_vps_select_required'), 'error');
+            return;
+        }
+
         const btn = document.getElementById('btnDeployVPS');
         const spinner = document.getElementById('deployVPSSpinner');
         if (btn) btn.disabled = true;
         if (spinner) spinner.classList.remove('hidden');
 
         try {
-            const payload = {
+            // region_id is always sent to the panel: it is the region the operator
+            // saw, the duplicate-guard key and the ledger field. A pin adds dc_id
+            // beside it; the provider client drops region_id on the outbound wire.
+            const payload = Object.assign({
                 pid: plan.product_id,
                 price_id: plan.price_id,
                 region_id: regionID,
                 os_id: osID,
                 hourly_price_nok: plan.hourly_rate_nok
-            };
+            }, placementField);
             const res = await API.post('/api/admin/hosting/gigahost/order', payload);
             UI.toast(res.message || _('deploy_vps_order_placed'), 'success');
             loadRecentOrders();
@@ -820,12 +934,30 @@
             // still supports is preserved, and one it does not support is dropped.
             updateDeploySelections({
                 region: deployRegionSelect ? deployRegionSelect.value : null,
-                os: deployOSSelect ? deployOSSelect.value : null
+                os: deployOSSelect ? deployOSSelect.value : null,
+                placement: deployPlacementSelect ? deployPlacementSelect.value : null
             });
         });
     }
     if (deployRegionSelect) {
-        deployRegionSelect.addEventListener('change', updateDeployButtonState);
+        deployRegionSelect.addEventListener('change', () => {
+            // A region change can invalidate a pin; rebuild so the drop is visible.
+            const decision = rebuildDeployPlacement(deployPlacementSelect ? deployPlacementSelect.value : null);
+            deploymentPlacementCleared = decision.cleared;
+            updateDeployButtonState();
+        });
+    }
+    if (deployPlacementSelect) {
+        deployPlacementSelect.addEventListener('change', () => {
+            // A deliberate choice (including an explicit region-managed one) clears
+            // the "choose again" state.
+            const choices = deployPlacementChoices();
+            const decision = placementSelection(choices, deployPlacementSelect.value);
+            deploymentPlacementCleared = decision.cleared;
+            if (decision.cleared) deployPlacementSelect.value = decision.value;
+            showDeployPlacementHint(decision.cleared ? decision.reason : (choices.note || ''));
+            updateDeployButtonState();
+        });
     }
     if (deployOSSelect) {
         deployOSSelect.addEventListener('change', updateDeployButtonState);

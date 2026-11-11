@@ -32,9 +32,15 @@ type OrderServerPayload struct {
 	HourlyPriceNOK float64 `json:"hourly_price_nok"`
 }
 
-// validate rejects a payload the provider cannot be asked to fulfill. Every
-// selection key is required; the client-supplied hourly rate is not, because the
-// provider catalog is the authoritative price.
+// validate rejects a payload the provider cannot be asked to fulfill.
+//
+// region_id is required in every case, including a datacenter pin: the page posts
+// to the panel, so region_id is the region the operator saw, the key the duplicate
+// guard uses and the field the ledger records. Only the outbound provider body drops
+// it for a pin, and that happens in gigahost.OrderRequest.wireBody.
+//
+// The client-supplied hourly rate is not required: the provider catalog is the
+// authoritative price.
 func (p OrderServerPayload) validate() error {
 	if p.PID <= 0 || p.PriceID <= 0 || p.RegionID <= 0 || p.OSID <= 0 {
 		return errors.New("pid, price_id, region_id, os_id must be positive integers")

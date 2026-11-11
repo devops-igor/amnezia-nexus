@@ -221,6 +221,26 @@ function placementPayloadField(choices, value, regionId) {
     return null;
 }
 
+/* placementReadValue returns a selector's value, or null when it does not name one
+ * of that selector's own options.
+ *
+ * This exists because a <select> silently resets to '' when a value matches no
+ * option, and an empty value is indistinguishable from "region-managed". Without
+ * this check, a datacenter option that vanished (a stale render, a removed option, a
+ * tampered value) would be posted as a region-managed order - a different location
+ * than the operator chose, which is the one outcome this whole path exists to
+ * prevent.
+ */
+function placementReadValue(select) {
+    if (!select) return null;
+    const value = select.value;
+    if (value === '' || value === undefined || value === null) return null;
+    for (const option of select.options) {
+        if (option.value === value) return value;
+    }
+    return null;
+}
+
 /* placementIsExplicit reports whether a selector value names a datacenter pin
  * rather than region-managed placement. It says nothing about validity: an
  * unselectable pin is still explicit, which is what a caller needs to know in
