@@ -595,8 +595,15 @@ func (h *Handlers) persistOrderIntent(
 		PriceID:        priceIdentity.priceID,
 		MonthlyCapNOK:  priceIdentity.monthlyCapNOK,
 		Currency:       priceIdentity.currency,
-		CreatedAt:      now,
-		UpdatedAt:      now,
+		// This is the one writer that may claim the row as a panel purchase, because
+		// it is the writer that commits before the provider is asked to sell
+		// anything. Stamping it here and nowhere else is what lets the setup pipeline
+		// tell a row this panel bought from one that appeared some other way,
+		// whatever plan or credential that row happens to carry.
+		PurchaseOrigin:     models.PurchaseOriginPanelPurchase,
+		PurchaseRecordedAt: now,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 	if err := h.saveGigahostOrder(ctx, record); err != nil {
 		return nil, false

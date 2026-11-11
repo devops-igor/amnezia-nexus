@@ -79,6 +79,14 @@ type Options struct {
 	// no such challenge can be built, in which case the intent keeps pausing for
 	// an identity the administrator supplies out of band.
 	ChallengeHost func(ctx context.Context, intent models.GigahostSetupIntent) (string, error)
+	// FirstContactEligible answers whether a job carrying the automation host
+	// trust policy may pin the identity its own challenge observed. Nil means this
+	// panel cannot answer, and every such job keeps the manual confirmation pause.
+	FirstContactEligible FirstContactEligibility
+	// Pinner records the observed identity as durable trust. Nil means automatic
+	// trust is not available here, which is a supported configuration: the manual
+	// path needs no pin.
+	Pinner FirstContactPinner
 	// Now is the clock. The zero value means time.Now; tests inject a fake and
 	// advance it, which is how a >60 minute progress window is exercised without
 	// a literal wait.
@@ -95,6 +103,8 @@ type Tracker struct {
 	store     Store
 	resolve   func(ctx context.Context) (ProviderReader, error)
 	challenge func(ctx context.Context, intent models.GigahostSetupIntent) (string, error)
+	eligible  FirstContactEligibility
+	pinner    FirstContactPinner
 	now       func() time.Time
 	nudgeCh   chan struct{}
 
@@ -116,6 +126,8 @@ func New(store Store, opts Options) *Tracker {
 		store:       store,
 		resolve:     opts.Resolve,
 		challenge:   opts.ChallengeHost,
+		eligible:    opts.FirstContactEligible,
+		pinner:      opts.Pinner,
 		now:         opts.Now,
 		nudgeCh:     make(chan struct{}, 1),
 		interval:    opts.Interval,
@@ -297,6 +309,10 @@ func (t *Tracker) observe(ctx context.Context, reader ProviderReader, intent *mo
 const (
 	stepProviderUnreadable = "provider_unreadable"
 	stepHostUnreachable    = "host_identity_unreachable"
+	// stepHostTrustUnavailable names a job whose host answered with an identity the
+	// panel could not record. It is separate from unreachable because the operator's
+	// next action differs: the host is there and the trust write is the problem.
+	stepHostTrustUnavailable = "host_trust_unavailable"
 )
 
 // readFailure is one "could not ask" outcome: the step it is recorded under and
@@ -591,12 +607,18 @@ func (t *Tracker) decideHostTrust(ctx context.Context, intent *models.GigahostSe
 //
 // The challenge is a handshake that stops at host-key verification: it sends no
 // credential, runs no command, binds nothing and does not authorize the job. Its
-// only product is the exact value an administrator can be shown and confirm.
+// only product is the exact value an administrator can be shown and confirm, or -
+// when the job carries durable automation authority and the ownership question
+// answers yes - the exact value the panel may pin itself.
 //
-// Two outcomes are possible:
+// Three outcomes are possible:
 //
-//   - the challenge answered. The value becomes a displayed candidate and the row
-//     pauses for confirmation. Nothing is confirmed on the administrator's behalf.
+//   - the challenge answered and this job may pin it (see decideObservedIdentity).
+//     The observed identity becomes the durable trusted one and the handoff
+//     continues with no confirmation step;
+//   - the challenge answered and this job may not pin it. The value becomes a
+//     displayed candidate and the row pauses for confirmation. Nothing is
+//     confirmed on the administrator's behalf;
 //   - the challenge could not run. That is a temporary condition and is reported
 //     as a read failure, so the same approval retries on a later pass. The pause
 //     is not written: a settled pause produces no further provider read, which
@@ -631,7 +653,35 @@ func (t *Tracker) discoverHostIdentity(ctx context.Context, intent *models.Gigah
 	}
 	trimmed := strings.TrimSpace(fingerprint)
 	decision.candidate = &trimmed
-	return decision
+	return t.decideObservedIdentity(ctx, intent, decision, trimmed)
+}
+
+// decideObservedIdentity decides what a successful challenge means for this job.
+//
+// The observed value and the eligibility answer are both required, and a job that
+// cannot pin is left exactly as it was: the candidate stays displayed and the row
+// pauses. That is the whole manual behavior, unchanged, and it is also the reason
+// an ineligible job records a reason instead of failing.
+func (t *Tracker) decideObservedIdentity(
+	ctx context.Context,
+	intent *models.GigahostSetupIntent,
+	manual handoffDecision,
+	fingerprint string,
+) handoffDecision {
+	if err := models.ValidateHostFingerprint(fingerprint); err != nil {
+		// The challenge returned something this panel cannot store or compare. The
+		// value is still shown, and a person decides; automatic trust must never
+		// be built on a value that cannot be re-verified.
+		return manual
+	}
+	pinnable, reason := t.firstContactEligible(ctx, *intent)
+	if !pinnable {
+		if reason != "" {
+			manual.detail = reason
+		}
+		return manual
+	}
+	return t.pinFirstContactIdentity(ctx, *intent, fingerprint)
 }
 
 // settle writes a terminal state with no further scheduling.
