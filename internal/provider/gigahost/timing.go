@@ -15,6 +15,11 @@ package gigahost
 //
 // Timing is opt-in: with no sink configured, no httptrace client is attached and
 // the request path is byte-for-byte unchanged.
+//
+// The standard library does not promise that its hooks fire in protocol order;
+// it calls them from whichever goroutine owns the connection. The record
+// therefore reports the furthest phase the call reached, not whichever callback
+// happened to arrive last. See markPhase.
 
 import (
 	"context"
@@ -59,7 +64,7 @@ const (
 // CallTiming is one bounded, allowlisted provider call record.
 //
 // Phase offsets are milliseconds since the call started, or phaseNotReached.
-// LastPhase is the name of the last phase that completed, never a URL.
+// LastPhase is the name of the furthest phase the call reached, never a URL.
 type CallTiming struct {
 	// Method is one of GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, other.
 	Method string
@@ -71,7 +76,9 @@ type CallTiming struct {
 	Status int
 	// TotalMS is the wall duration of the call in milliseconds.
 	TotalMS int64
-	// LastPhase names the last completed phase, or "" when none completed.
+	// LastPhase names the furthest phase the call reached, or "" when none
+	// completed. It is a protocol position, not the last callback to arrive:
+	// the transport may fire a later phase before an earlier one.
 	LastPhase string
 	// Reused reports whether the connection was reused.
 	Reused bool
@@ -229,14 +236,43 @@ func (r *timingRecorder) update(fn func(*CallTiming)) {
 // markPhase records that phase completed now, storing its offset through set
 // when the phase carries one. The phase name and its offset land in the same
 // critical section, so a finished record can never hold one without the other.
+//
+// LastPhase only ever advances, because the transports do not promise to fire
+// the hooks in protocol order. The offsets are unaffected: each one is written
+// by its own callback and keeps its own measurement, so an offset still proves
+// the phase was reached even when the phase name did not move.
 func (r *timingRecorder) markPhase(phase string, set func(*CallTiming, int64)) {
 	at := r.elapsedMS()
 	r.update(func(t *CallTiming) {
-		t.LastPhase = phase
+		if phaseAdvancesProgress(t.LastPhase, phase) {
+			t.LastPhase = phase
+		}
 		if set != nil {
 			set(t, at)
 		}
 	})
+}
+
+// phaseAdvancesProgress reports whether phase is further along the call than the
+// phase already recorded as the furthest one reached.
+//
+// Only one transition is corrected here, and it is the one that changes the
+// answer for a served call. Over HTTP/2 the response headers are traced by the
+// connection read loop, while WroteRequest is traced by the per-stream write
+// goroutine after it has flushed the request; a fast server can answer before
+// that goroutine reports, so request_written can arrive after first_byte for the
+// same call. The response headers are the furthest point this record tracks, so
+// they cannot be replaced by any earlier phase arriving late.
+//
+// The remaining phases keep the behavior they already had. This is a correction
+// for one undefined transition, not a global phase ranking: a ranking would have
+// to encode an order for the dial path that this record does not need and that
+// the transports do not guarantee either.
+func phaseAdvancesProgress(current, phase string) bool {
+	if current == phaseFirstByte && phase != phaseFirstByte {
+		return false
+	}
+	return true
 }
 
 // clientTrace builds the httptrace.ClientTrace for this call.
