@@ -734,6 +734,7 @@
   "deploy_vps_no_region_stock": "该方案当前在任何区域都没有库存",
   "deploy_vps_no_os": "该方案没有可安装的操作系统",
   "deploy_vps_catalog_unavailable": "提供商目录不可用",
+  "deploy_vps_catalog_stale": "显示 {age} 的缓存目录。价格和可用性可能已过时。",
   "deploy_vps_select_required": "请先选择区域和操作系统",
   "deploy_vps_order_placed": "VPS 订单已成功提交",
   "deploy_vps_placement_label": "数据中心",

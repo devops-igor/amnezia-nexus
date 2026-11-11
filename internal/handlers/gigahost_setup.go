@@ -291,7 +291,7 @@ func defaultSetupPort(protocol string) string {
 // purchase never resolved, or an unknown purchase outcome. Neither is a provider
 // order, so neither can be set up.
 func isSyntheticOrderID(orderID string) bool {
-	return strings.HasPrefix(orderID, "intent_") || strings.HasPrefix(orderID, "unknown_")
+	return models.IsSyntheticGigahostOrderID(orderID)
 }
 
 // CancelGigahostSetup revokes the approval for an order and withdraws the backend

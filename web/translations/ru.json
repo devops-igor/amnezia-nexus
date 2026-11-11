@@ -734,6 +734,7 @@
   "deploy_vps_no_region_stock": "Ни в одном регионе нет запаса для этого тарифа",
   "deploy_vps_no_os": "Для этого тарифа нет устанавливаемой операционной системы",
   "deploy_vps_catalog_unavailable": "Каталог провайдера недоступен",
+  "deploy_vps_catalog_stale": "Показан кэшированный каталог от {age}. Цены и доступность могут быть устаревшими.",
   "deploy_vps_select_required": "Сначала выберите регион и операционную систему",
   "deploy_vps_order_placed": "Заказ VPS успешно размещён",
   "deploy_vps_placement_label": "Дата-центр",

@@ -111,6 +111,14 @@ type Handlers struct {
 	// window; see gigahost_admission.go.
 	admissionOnce  sync.Once
 	admissionState *orderAdmission
+	// Display-side provider catalog cache, one complete snapshot per provider
+	// account; see gigahost_catalog_cache.go. It is consulted only by
+	// GigahostCatalogHandler - never by the purchase path. The cache also owns the
+	// current provider-client generation, so retirement of a replaced client's
+	// retained state is recorded next to that state instead of being inferred from
+	// an entry still being present.
+	catalogCacheOnce  sync.Once
+	catalogCacheState *gigahostCatalogCache
 }
 
 // lockUser serializes credential admission and user disabling; the lock is shared

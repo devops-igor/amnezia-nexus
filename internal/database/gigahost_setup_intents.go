@@ -47,6 +47,13 @@ var gigahostSetupIntentsSchema = `CREATE TABLE IF NOT EXISTS gigahost_setup_inte
 	host_fingerprint TEXT NOT NULL DEFAULT '',
 	host_mismatch INTEGER NOT NULL DEFAULT 0,
 	host_candidate_fingerprint TEXT NOT NULL DEFAULT '',
+	host_trust_policy TEXT NOT NULL DEFAULT '',
+	host_trust_mode TEXT NOT NULL DEFAULT '',
+	host_trust_order_id TEXT NOT NULL DEFAULT '',
+	host_trust_server_id INTEGER NOT NULL DEFAULT 0,
+	host_trust_address TEXT NOT NULL DEFAULT '',
+	host_trust_key_id INTEGER NOT NULL DEFAULT 0,
+	host_trust_granted_at TEXT NOT NULL DEFAULT '',
 	read_failures INTEGER NOT NULL DEFAULT 0,
 	attempts INTEGER NOT NULL DEFAULT 0,
 	install_generation INTEGER NOT NULL DEFAULT 0,
@@ -76,6 +83,13 @@ var gigahostSetupIntentColumnUpgrades = []struct {
 	{"install_phase_done", `ALTER TABLE gigahost_setup_intents ADD COLUMN install_phase_done TEXT NOT NULL DEFAULT ''`},
 	{"install_attempts", `ALTER TABLE gigahost_setup_intents ADD COLUMN install_attempts INTEGER NOT NULL DEFAULT 0`},
 	{"nexus_server_id", `ALTER TABLE gigahost_setup_intents ADD COLUMN nexus_server_id INTEGER NOT NULL DEFAULT 0`},
+	{"host_trust_policy", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_trust_policy TEXT NOT NULL DEFAULT ''`},
+	{"host_trust_mode", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_trust_mode TEXT NOT NULL DEFAULT ''`},
+	{"host_trust_order_id", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_trust_order_id TEXT NOT NULL DEFAULT ''`},
+	{"host_trust_server_id", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_trust_server_id INTEGER NOT NULL DEFAULT 0`},
+	{"host_trust_address", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_trust_address TEXT NOT NULL DEFAULT ''`},
+	{"host_trust_key_id", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_trust_key_id INTEGER NOT NULL DEFAULT 0`},
+	{"host_trust_granted_at", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_trust_granted_at TEXT NOT NULL DEFAULT ''`},
 }
 
 // gigahostSetupIntentIndexes are created after the table and column upgrades.
@@ -134,7 +148,9 @@ var ErrSetupIntentExists = errors.New("a setup intent already exists for this or
 const setupIntentColumns = `id, order_id, provider_server_id, assigned_ip,
 	protocol, port, tls_domain, engine_profile, credential_mode,
 	state, provider_status, step, last_error,
-	host_fingerprint, host_mismatch, host_candidate_fingerprint, read_failures, attempts,
+	host_fingerprint, host_mismatch, host_candidate_fingerprint, host_trust_policy, host_trust_mode,
+	host_trust_order_id, host_trust_server_id, host_trust_address, host_trust_key_id, host_trust_granted_at,
+	read_failures, attempts,
 	install_generation, install_phase, install_phase_done, install_attempts,
 	nexus_server_id,
 	next_attempt_at, last_checked_at, approved_by, revoked_at,
@@ -146,12 +162,15 @@ func scanSetupIntent(scanner interface {
 }) (*models.GigahostSetupIntent, error) {
 	var i models.GigahostSetupIntent
 	var hostMismatch int
-	var nextAttempt, lastChecked, revokedAt, createdAt, updatedAt string
+	var nextAttempt, lastChecked, revokedAt, createdAt, updatedAt, trustGrantedAt string
 	if err := scanner.Scan(
 		&i.ID, &i.OrderID, &i.ProviderServerID, &i.AssignedIP,
 		&i.Protocol, &i.Port, &i.TLSDomain, &i.EngineProfile, &i.CredentialMode,
 		&i.State, &i.ProviderStatus, &i.Step, &i.LastError,
-		&i.HostFingerprint, &hostMismatch, &i.HostCandidateFingerprint, &i.ReadFailures, &i.Attempts,
+		&i.HostFingerprint, &hostMismatch, &i.HostCandidateFingerprint,
+		&i.HostTrustPolicy, &i.HostTrustMode,
+		&i.HostTrustOrderID, &i.HostTrustServerID, &i.HostTrustAddress, &i.HostTrustKeyID, &trustGrantedAt,
+		&i.ReadFailures, &i.Attempts,
 		&i.InstallGeneration, &i.InstallPhase, &i.InstallPhaseDone, &i.InstallAttempts,
 		&i.NexusServerID,
 		&nextAttempt, &lastChecked, &i.ApprovedBy, &revokedAt,
@@ -160,6 +179,7 @@ func scanSetupIntent(scanner interface {
 		return nil, err
 	}
 	i.HostMismatch = hostMismatch != 0
+	i.HostTrustGrantedAt = parseSetupTimestamp(trustGrantedAt)
 	i.NextAttemptAt = parseSetupTimestamp(nextAttempt)
 	i.LastCheckedAt = parseSetupTimestamp(lastChecked)
 	i.RevokedAt = parseSetupTimestamp(revokedAt)
@@ -211,7 +231,7 @@ func (d *DB) CreateGigahostSetupIntent(ctx context.Context, intent *models.Gigah
 	intent.UpdatedAt = now
 
 	q := `INSERT INTO gigahost_setup_intents (` + setupIntentColumns + `)
-	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 	res, err := d.sqlDB.ExecContext(ctx, q,
@@ -219,6 +239,9 @@ func (d *DB) CreateGigahostSetupIntent(ctx context.Context, intent *models.Gigah
 		intent.Protocol, intent.Port, intent.TLSDomain, intent.EngineProfile, intent.CredentialMode,
 		intent.State, intent.ProviderStatus, intent.Step, intent.LastError,
 		intent.HostFingerprint, boolToInt(intent.HostMismatch), intent.HostCandidateFingerprint,
+		intent.HostTrustPolicy, intent.HostTrustMode,
+		intent.HostTrustOrderID, intent.HostTrustServerID, intent.HostTrustAddress,
+		intent.HostTrustKeyID, formatSetupTimestamp(intent.HostTrustGrantedAt),
 		intent.ReadFailures, intent.Attempts,
 		intent.InstallGeneration, intent.InstallPhase, intent.InstallPhaseDone, intent.InstallAttempts,
 		intent.NexusServerID,
@@ -416,7 +439,12 @@ func buildTransitionStatement(
 	          provider_status = CASE WHEN ? != '' THEN ? ELSE provider_status END,
 	          step = ?,
 	          last_error = ?,
-	          host_fingerprint = CASE WHEN ? != '' THEN ? ELSE host_fingerprint END,
+	          host_fingerprint = CASE WHEN ? != '' AND host_fingerprint = '' THEN ? ELSE host_fingerprint END,
+	          host_trust_mode = CASE WHEN host_trust_mode = '' AND ? != '' THEN ? ELSE host_trust_mode END,
+	          host_trust_order_id = CASE WHEN host_trust_order_id = '' AND ? != '' THEN ? ELSE host_trust_order_id END,
+	          host_trust_server_id = CASE WHEN host_trust_server_id = 0 AND ? > 0 THEN ? ELSE host_trust_server_id END,
+	          host_trust_address = CASE WHEN host_trust_address = '' AND ? != '' THEN ? ELSE host_trust_address END,
+	          host_trust_key_id = CASE WHEN host_trust_key_id = 0 AND ? > 0 THEN ? ELSE host_trust_key_id END,
 	          host_mismatch = ?,
 	          host_candidate_fingerprint = ?,
 	          read_failures = ?,
@@ -441,6 +469,11 @@ func buildTransitionStatement(
 		intent.Step,
 		intent.LastError,
 		intent.HostFingerprint, intent.HostFingerprint,
+		intent.HostTrustMode, intent.HostTrustMode,
+		intent.HostTrustOrderID, intent.HostTrustOrderID,
+		intent.HostTrustServerID, intent.HostTrustServerID,
+		intent.HostTrustAddress, intent.HostTrustAddress,
+		intent.HostTrustKeyID, intent.HostTrustKeyID,
 		boolToInt(intent.HostMismatch),
 		intent.HostCandidateFingerprint,
 		intent.ReadFailures,
@@ -801,132 +834,6 @@ var resumableSetupStates = []string{
 	models.SetupStateAwaitingHostConfirm,
 	models.SetupStateAwaitingCredentials,
 	models.SetupStateInstallPaused,
-}
-
-// ConfirmGigahostSetupHostFingerprint records the identity the administrator
-// confirmed for an order.
-//
-// Two guarantees are enforced here rather than in the caller, because the HTTP
-// endpoint and any future caller must obey the same rules:
-//
-//  1. The confirmed value must be an identity this job actually displayed: the
-//     candidate observed on the panel's own first-contact challenge, or the
-//     identity already recorded for this approval. Nothing else is confirmable,
-//     so an arbitrary value from a client can never become a trusted host.
-//  2. An interrupted install keeps its journal. When the row already carries
-//     install history the confirmation issues a new attempt generation in the
-//     same statement, so the job goes back to the installing state and the
-//     existing verify-not-replay path owns it. A trust decision therefore can
-//     neither erase an unknown remote effect nor authorize a second install.
-//
-// A row with no install history is a genuine pre-install trust pause: it returns
-// to pending so the tracker re-reads the provider and reaches the handoff.
-//
-// changed=false means the row was not in a state this confirmation applies to,
-// or the value was not one this job displayed; the returned row is then the stored
-// truth, so the caller explains the real state instead of claiming a confirmation
-// happened. A nil row means no approval exists for the order.
-func (d *DB) ConfirmGigahostSetupHostFingerprint(
-	ctx context.Context, orderID, fingerprint string,
-) (*models.GigahostSetupIntent, bool, error) {
-	if d == nil || d.sqlDB == nil || strings.TrimSpace(orderID) == "" {
-		return nil, false, nil
-	}
-	fingerprint = strings.TrimSpace(fingerprint)
-	if fingerprint == "" {
-		return nil, false, errors.New("a confirmed host fingerprint is required")
-	}
-	current, applies, err := d.confirmableHostIntent(ctx, orderID, fingerprint)
-	if err != nil || current == nil {
-		return nil, false, err
-	}
-	if !applies {
-		return current, false, nil
-	}
-	return d.applyHostConfirmation(ctx, orderID, fingerprint, hasInstallHistory(current))
-}
-
-// confirmableHostIntent loads the row and decides whether this exact confirmation
-// applies to it.
-//
-// Two independent refusals live here because both are "this confirmation is not
-// about this job": the row is not in a state that stopped for identity, or the
-// value is not an identity the panel displayed for it. A not-found row returns
-// (nil, false, nil) so the caller can answer 404 rather than inventing a refusal.
-func (d *DB) confirmableHostIntent(
-	ctx context.Context, orderID, fingerprint string,
-) (*models.GigahostSetupIntent, bool, error) {
-	if err := d.EnsureGigahostSetupIntentsSchema(ctx); err != nil {
-		return nil, false, err
-	}
-	current, found, err := d.GetGigahostSetupIntent(ctx, orderID)
-	if err != nil || !found {
-		return nil, false, err
-	}
-	if !isConfirmableSetupState(current.State) || !isDisplayedHostIdentity(current, fingerprint) {
-		return current, false, nil
-	}
-	return current, true, nil
-}
-
-// isDisplayedHostIdentity reports whether this exact value is an identity the
-// panel displayed for this approval: the first-contact candidate, or the identity
-// the approval already carries. Nothing else is confirmable.
-func isDisplayedHostIdentity(intent *models.GigahostSetupIntent, fingerprint string) bool {
-	if intent == nil {
-		return false
-	}
-	if observed := strings.TrimSpace(intent.HostCandidateFingerprint); observed != "" && observed == fingerprint {
-		return true
-	}
-	return strings.TrimSpace(intent.HostFingerprint) == fingerprint
-}
-
-// applyHostConfirmation writes the confirmed identity and decides what the job
-// continues as, without ever discarding install history.
-//
-// The journal columns are set explicitly: `withHistory` returns the row to the
-// installing state with a fresh generation and the journal kept, so a resumed
-// attempt verifies the interrupted phase instead of replaying it. Without
-// history the row returns to pending and the tracker re-reads the provider.
-func (d *DB) applyHostConfirmation(
-	ctx context.Context, orderID, fingerprint string, withHistory bool,
-) (*models.GigahostSetupIntent, bool, error) {
-	now := time.Now().UTC()
-	state := models.SetupStatePending
-	step := "host_confirmed"
-	if withHistory {
-		state = models.SetupStateInstalling
-		step = "install_resumed"
-	}
-	q := `UPDATE gigahost_setup_intents
-	      SET host_fingerprint = ?,
-	          host_mismatch = 0,
-	          host_candidate_fingerprint = '',
-	          state = ?,
-	          step = ?,
-	          last_error = '',
-	          install_generation = CASE WHEN ? THEN install_generation + 1 ELSE install_generation END,
-	          install_attempts = CASE WHEN ? THEN install_attempts + 1 ELSE install_attempts END,
-	          next_attempt_at = '',
-	          updated_at = ?
-	      WHERE order_id = ? AND state IN (?, ?)`
-	res, err := d.execWrite(ctx, q, fingerprint, state, step,
-		withHistory, withHistory,
-		formatSetupTimestamp(now), orderID,
-		models.SetupStateAwaitingHostConfirm, models.SetupStateInstallPaused)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to confirm gigahost setup host identity: %w", err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to confirm gigahost setup host identity write: %w", err)
-	}
-	current, found, err := d.GetGigahostSetupIntent(ctx, orderID)
-	if err != nil || !found {
-		return nil, false, err
-	}
-	return current, affected > 0, nil
 }
 
 // ReArmGigahostSetupDiscovery makes a job whose first-contact discovery could not

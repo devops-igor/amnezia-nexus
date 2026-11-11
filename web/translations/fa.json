@@ -734,6 +734,7 @@
   "deploy_vps_no_region_stock": "هیچ منطقه‌ای برای این طرح موجودی ندارد",
   "deploy_vps_no_os": "هیچ سیستم عاملی برای این طرح قابل نصب نیست",
   "deploy_vps_catalog_unavailable": "کاتالوگ ارائه‌دهنده در دسترس نیست",
+  "deploy_vps_catalog_stale": "نمایش کاتالوگ ذخیره‌شده از {age}. قیمت‌ها و موجودی ممکن است قدیمی باشند.",
   "deploy_vps_select_required": "ابتدا منطقه و سیستم عامل را انتخاب کنید",
   "deploy_vps_order_placed": "سفارش VPS با موفقیت ثبت شد",
   "deploy_vps_placement_label": "دیتاسنتر",

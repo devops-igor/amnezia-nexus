@@ -1,6 +1,7 @@
 package gigahost
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -94,24 +95,79 @@ func (d *distrib) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// errMalformedDistributionEnvelope reports a distribution-list response that
+// arrived with HTTP success but without the documented identity fields.
+var errMalformedDistributionEnvelope = errors.New("malformed distribution list: response carries no distribution data")
+
+// errMalformedImageEnvelope reports a distribution's image response that arrived
+// with HTTP success but without the documented identity fields.
+var errMalformedImageEnvelope = errors.New("malformed operating system list: response carries no image data")
+
+// parseDistros reads the documented distribution list.
+//
+// The envelope is required to be the documented shape: a `data` array whose
+// entries each carry a positive dist_id. Go's JSON decoding accepts an absent
+// field and a JSON null, so a body like {"meta":{...}} with no data key, or a
+// null body, would otherwise decode into an empty list and be reported as a
+// successful read. That distinction matters to the caller: an explicitly empty
+// list is a legitimate provider answer, while a missing envelope is a broken
+// response that must not be mistaken for "no distributions exist".
 func parseDistros(data []byte) ([]distrib, error) {
+	if isJSONNull(data) {
+		return nil, errMalformedDistributionEnvelope
+	}
 	var doc struct {
 		Data []distrib `json:"data"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, err
 	}
+	if doc.Data == nil {
+		return nil, errMalformedDistributionEnvelope
+	}
+	for _, d := range doc.Data {
+		if d.ID <= 0 {
+			return nil, fmt.Errorf("%w: distribution entry without a dist_id", errMalformedDistributionEnvelope)
+		}
+	}
 	return doc.Data, nil
 }
 
+// parseOperatingSystems reads one distribution's documented image list.
+//
+// Same contract as parseDistros, with os_id as the required identity: every image
+// the panel offers must name the os_id an order would send, so an entry without
+// one is a broken response rather than an image that can be silently filtered out
+// later. An explicitly empty array remains a valid answer (the distribution really
+// can publish no image), and it is distinguishable here from a missing envelope.
 func parseOperatingSystems(data []byte) ([]OperatingSystem, error) {
+	if isJSONNull(data) {
+		return nil, errMalformedImageEnvelope
+	}
 	var doc struct {
 		Data []OperatingSystem `json:"data"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, err
 	}
+	if doc.Data == nil {
+		return nil, errMalformedImageEnvelope
+	}
+	for _, os := range doc.Data {
+		if os.OSID <= 0 {
+			return nil, fmt.Errorf("%w: image entry without an os_id", errMalformedImageEnvelope)
+		}
+	}
 	return doc.Data, nil
+}
+
+// isJSONNull reports whether the body is the JSON literal null.
+//
+// A bare `null` unmarshals into a nil slice without error, so it has to be
+// recognized before decoding. The check is on the trimmed bytes to match the
+// existing inventory parser, which rejects the same shape for the same reason.
+func isJSONNull(data []byte) bool {
+	return bytes.Equal(bytes.TrimSpace(data), []byte("null"))
 }
 
 // GetProducts queries the raw product catalog from GET /deploy/servers.

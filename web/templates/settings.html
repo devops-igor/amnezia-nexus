@@ -355,6 +355,10 @@
                 </div>
                 <p class="form-hint" style="margin-bottom: var(--space-md);">{{ _ "deploy_vps_desc" }}</p>
 
+                <!-- Shown when the displayed catalog is a retained snapshot whose
+                     refresh failed, so it never looks current when it is not. -->
+                <div id="deployCatalogStale" role="status" style="display:none; padding: var(--space-sm) var(--space-md); border-radius: var(--radius-sm); background: rgba(245, 158, 11, 0.12); border: 1px solid var(--warning, #f59e0b); color: var(--text-primary); font-size: 0.85rem; margin-bottom: var(--space-md);"></div>
+
                 <div id="deployCatalogLoading" style="display:none; text-align:center; padding:var(--space-md);">
                     <div class="spinner" style="width:20px; height:20px; margin:0 auto;"></div>
                 </div>
@@ -371,7 +375,7 @@
                     <div class="form-group">
                         <label class="form-label" for="deployPlacementSelect">{{ _ "deploy_vps_placement_label" }}</label>
                         <select class="form-select" id="deployPlacementSelect"></select>
-                        <p class="form-hint" id="deployPlacementHint" style="display:none; margin-top:var(--space-xs);"></p>
+                        <p class="form-hint" id="deployPlacementHint" style="display:none;"></p>
                     </div>
                     <div class="form-group">
                         <label class="form-label" for="deployOSSelect">{{ _ "deploy_vps_select_os" }}</label>
@@ -416,6 +420,7 @@
     </button>
 </div>
 
+<script src="/static/js/gigahost_catalog_status.js"></script>
 <script src="/static/js/gigahost_setup.js"></script>
 <script src="/static/js/gigahost_setup_intents.js"></script>
 <script src="/static/js/gigahost_order_status_model.js"></script>
@@ -642,28 +647,21 @@
 
     let cachedPlans = [];
 
-    // deploymentPlacementIntent owns the outstanding-choice rule (armed by an
-    // automatic rebuild that dropped a pin; released only by the operator's own
-    // placement choice). Keeping the rule in the module stops it drifting between
-    // the four automatic call sites and the one deliberate one.
+    // The rule lives in the module so it cannot drift between rebuilds and choice.
     const deploymentPlacementIntent = placementNewIntent();
 
-    // Recomputed each time, so a catalog refresh is always the authority.
+    // Recomputed per call, so a catalog refresh is always the authority.
     function deployPlacementChoices() {
         return placementChoices(deployPlanAt(), deployRegionSelect ? deployRegionSelect.value : null);
     }
 
-    // Explains a refusal or a dropped choice. Never enables ordering.
+    // Explains a refusal or dropped choice; never enables ordering.
     function showDeployPlacementHint(text) {
         if (!deployPlacementHint) return;
         deployPlacementHint.textContent = text || '';
         deployPlacementHint.style.display = text ? 'block' : 'none';
     }
-
-    // Repopulates the selector from the provider's placement facts: every datacenter
-    // is listed, only a selectable one may be chosen, and a pin the new plan/region
-    // cannot honour is dropped and explained. It may only ARM the outstanding-choice
-    // latch (see placementIntent), never release it.
+    // Rebuilds from the provider's facts; may only ARM the latch, never release it.
     function rebuildDeployPlacement(previous) {
         const choices = deployPlacementChoices();
         if (!deployPlacementSelect) return {value: '', cleared: false, reason: ''};
@@ -744,6 +742,7 @@
         if (loading) loading.style.display = 'block';
         try {
             const res = await API.get('/api/admin/hosting/gigahost/catalog');
+            renderDeployCatalogStale(res);
             cachedPlans = (res && res.plans) ? res.plans : [];
             if (cachedPlans.length === 0) {
                 // An empty result destroys the pin, so record the loss first: the
@@ -774,9 +773,10 @@
                 placement: deployPlacementSelect ? deployPlacementSelect.value : null
             });
         } catch (err) {
-            // A failed read destroys the pin too; record the loss before the
-            // selectors are replaced, so the recovery cannot buy an unchosen order.
+            // A failed read destroys the pin and the displayed catalog answer, so
+            // record the loss before the selectors are replaced.
             deploymentPlacementIntent.lost(deployPlacementSelect ? deployPlacementSelect.value : null);
+            renderDeployCatalogStale(null);
             cachedPlans = [];
             const message = _('deploy_vps_catalog_unavailable');
             appendDeployOption(deployPlanSelect, message);
