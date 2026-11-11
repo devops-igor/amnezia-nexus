@@ -174,6 +174,12 @@ func pageOrderPayload(t *testing.T, placementValue string) string {
 	if err != nil {
 		t.Fatalf("read placement module: %v", err)
 	}
+	// The page calls the catalog-freshness module from its own catalog read, so the
+	// harness loads it too, exactly as the page does.
+	catalogStatus, err := web.StaticFS.ReadFile("static/js/gigahost_catalog_status.js")
+	if err != nil {
+		t.Fatalf("read catalog status module: %v", err)
+	}
 	pageJS, err := pageScriptForTest(string(template))
 	if err != nil {
 		t.Fatalf("extract the page script: %v", err)
@@ -181,6 +187,7 @@ func pageOrderPayload(t *testing.T, placementValue string) string {
 
 	pageEncoded, _ := json.Marshal(pageJS)
 	moduleEncoded, _ := json.Marshal(string(module))
+	catalogStatusEncoded, _ := json.Marshal(string(catalogStatus))
 	idsEncoded, _ := json.Marshal(pageElementIDsForTest(pageJS))
 	placementEncoded, _ := json.Marshal(placementValue)
 
@@ -240,8 +247,9 @@ w.saveSettings = () => {};
 w.checkUpstreamStatus = () => {};
 w.setupIntentsInFlight = new Set();
 
-w.eval(%s);
-w.eval(%s);
+w.eval(%s);   // catalog-freshness module
+w.eval(%s);   // placement module
+w.eval(%s);   // the page script
 
 (async () => {
   await w.loadGigahostCatalog();
@@ -263,7 +271,7 @@ w.eval(%s);
   else { console.log('ORDER_BODY:' + JSON.stringify(orders[0].body)); }
   dom.window.close();
 })().catch(e => { console.error('FAILED: ' + (e && e.stack || e)); process.exit(1); });
-`, string(idsEncoded), string(moduleEncoded), string(pageEncoded), string(placementEncoded))
+`, string(idsEncoded), string(catalogStatusEncoded), string(moduleEncoded), string(pageEncoded), string(placementEncoded))
 
 	cmd := exec.Command(node)
 	cmd.Stdin = strings.NewReader(script)

@@ -131,8 +131,15 @@ func TestGigahostPlacementPageWiringDOM(t *testing.T) {
 		t.Fatalf("read placement module: %v", err)
 	}
 
+	// The page calls the catalog-freshness module from its own catalog read, so the
+	// harness loads it too, exactly as the page does.
+	catalogStatusJS, err := StaticFS.ReadFile("static/js/gigahost_catalog_status.js")
+	if err != nil {
+		t.Fatalf("read catalog status module: %v", err)
+	}
 	pageEncoded, _ := json.Marshal(pageJS)
 	moduleEncoded, _ := json.Marshal(string(moduleJS))
+	catalogStatusEncoded, _ := json.Marshal(string(catalogStatusJS))
 	// The ids the page's own script binds, read from the script it will run. The
 	// harness creates an element for each so the shipped script executes unmodified.
 	pageIDListJSON, _ := json.Marshal(pageElementIDs(pageJS))
@@ -205,8 +212,9 @@ for (const [tag, id] of [['select','deployPlanSelect'],['select','deployRegionSe
 
 // The module is loaded the way the template loads it, then the page script, so the
 // page sees the real exported placement helpers.
-w.eval(%s);
-w.eval(%s);
+w.eval(%s);   // catalog-freshness module, as the page loads it
+w.eval(%s);   // placement module
+w.eval(%s);   // the page script
 
 // The page script binds its own DOMContentLoaded/initial load; run them now.
 if (w.document.readyState !== 'loading') {
@@ -427,7 +435,7 @@ async function loadCatalog(plans) {
 
   console.log('GIGAHOST_PLACEMENT_PAGE_OK');dom.window.close();
 })().catch(e => {console.error('PAGE_TEST_FAILED: ' + (e && e.stack || e)); process.exit(1);});
-`, string(pageIDListJSON), string(moduleEncoded), string(pageEncoded))
+`, string(pageIDListJSON), string(catalogStatusEncoded), string(moduleEncoded), string(pageEncoded))
 
 	out, err := execNodeScript(node, script)
 	if err != nil || !strings.Contains(string(out), "GIGAHOST_PLACEMENT_PAGE_OK") {

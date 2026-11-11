@@ -44,14 +44,23 @@ func TestGigahostPlacementIntentStaysBlockedUntilDeliberateChoice(t *testing.T) 
 	if err != nil {
 		t.Fatalf("read placement module: %v", err)
 	}
+	// The page also loads the catalog-freshness module and calls it from its own
+	// catalog read, so the harness must provide it exactly as the page does.
+	catalogStatusJS, err := StaticFS.ReadFile("static/js/gigahost_catalog_status.js")
+	if err != nil {
+		t.Fatalf("read catalog status module: %v", err)
+	}
 	// The page must actually use the module's intent owner, not a local flag: a
 	// local latch is what allowed the rule to drift in the first place.
-	if !strings.Contains(pageJS, "placementIntent") {
-		t.Fatal("the page does not use the module's placement intent owner")
+	// The page must obtain its latch from the module, not keep a local flag: a local
+	// latch is what let the rule drift in the first place.
+	if !strings.Contains(pageJS, "placementNewIntent()") {
+		t.Fatal("the page does not obtain the module's placement intent owner")
 	}
 
 	pageEncoded, _ := json.Marshal(pageJS)
 	moduleEncoded, _ := json.Marshal(string(moduleJS))
+	catalogStatusEncoded, _ := json.Marshal(string(catalogStatusJS))
 	idsEncoded, _ := json.Marshal(pageElementIDs(pageJS))
 
 	script := jsdomBootstrapSnippet + fmt.Sprintf(`
@@ -99,8 +108,9 @@ w.saveSettings = () => {};
 w.checkUpstreamStatus = () => {};
 w.setupIntentsInFlight = new Set();
 
-w.eval(%s);
-w.eval(%s);
+w.eval(%s);   // catalog-freshness module, as the page loads it
+w.eval(%s);   // placement module
+w.eval(%s);   // the page script
 
 const planSel = w.document.getElementById('deployPlanSelect');
 const regionSel = w.document.getElementById('deployRegionSelect');
@@ -244,7 +254,7 @@ async function orderedWithoutChoice() {
 
   console.log('GIGAHOST_PLACEMENT_INTENT_OK');dom.window.close();
 })().catch(e => {console.error('INTENT_TEST_FAILED: ' + (e && e.stack || e)); process.exit(1);});
-`, string(idsEncoded), string(moduleEncoded), string(pageEncoded))
+`, string(idsEncoded), string(catalogStatusEncoded), string(moduleEncoded), string(pageEncoded))
 
 	out, err := execNodeScript(node, script)
 	if err != nil || !strings.Contains(string(out), "GIGAHOST_PLACEMENT_INTENT_OK") {
