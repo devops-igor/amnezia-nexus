@@ -28,6 +28,10 @@ let gigahostOrderStatusLastSuccessAt = '';
 let gigahostOrderStatusLifecycleBound = false;
 let gigahostOrderStatusDetailsCounter = 0;
 let gigahostOrderStatusBackendIndex = null;
+// gigahostOrderStatusConfirmedAt remembers, per order, the last time the provider actually
+// confirmed that order. It is the view's own record of observed truth, so a failed or absent
+// read can never overwrite it and cannot lend another order's success to this row.
+let gigahostOrderStatusConfirmedAt = {};
 // gigahostOrderStatusCurrentRead is the one running full read ({token, controller, retired}).
 // It is cleared only when that chain actually settles, so its presence means "a full read is
 // live" and never "a read was asked to stop".
@@ -136,14 +140,22 @@ function gigahostOrderStatusStepDetail(panel, model) {
 }
 
 /* gigahostOrderStatusFailureDetail shows the reported reason as text: a provider
- * diagnostic is untrusted input and must never become markup. */
+ * diagnostic is untrusted input and must never become markup.
+ *
+ * A row whose provider read failed shows that read's own diagnostic here, because that is
+ * this order's known failure. Without it the failure would only exist in an aggregate notice
+ * that a different order's success can hide. */
 function gigahostOrderStatusFailureDetail(panel, model) {
-    const failure = model.failure || (model.setupIntent && model.setupIntent.last_error) || '';
+    const failure = model.failure
+        || (model.setupIntent && model.setupIntent.last_error)
+        || (model.providerReadFailed ? model.providerError : '')
+        || '';
     if (!failure) return;
     const node = document.createElement('span');
     node.style.color = 'var(--danger-color, #e53e3e)';
     node.textContent = failure;
-    gigahostOrderStatusDetail(panel, 'gigahost_status_failure', node);
+    if (model.providerReadFailed) node.setAttribute('data-provider-error', 'true');
+    gigahostOrderStatusDetail(panel, model.providerReadFailed ? 'gigahost_status_provider_error' : 'gigahost_status_failure', node);
 }
 
 /* gigahostOrderStatusAddressDetail shows the address when there is one, and says
@@ -179,6 +191,10 @@ function gigahostOrderStatusCell(order, context) {
     wrapper.className = 'gigahost-order-status';
     wrapper.setAttribute('data-stage', model.stage);
     if (model.orderId) wrapper.setAttribute('data-order-id', model.orderId);
+    // A row whose provider read failed is stale in its own right. Marking the row (not only
+    // the view) is what keeps the failure visible when a different order in the same response
+    // succeeded, which is the case an aggregate banner cannot express.
+    if (model.providerReadFailed) wrapper.setAttribute('data-stale', 'true');
 
     const toggle = document.createElement('button');
     toggle.type = 'button';
@@ -231,18 +247,18 @@ function gigahostOrderStatusLoaded(container, checkedAt) {
  * result: the rows already on screen are kept and labelled, and the last successful
  * check keeps the time of the last read that genuinely answered. When nothing was
  * ever confirmed, the notice says so instead of borrowing a time. */
-function gigahostOrderStatusProviderFailed(container, reason) {
+function gigahostOrderStatusProviderFailed(container, reason, failures) {
     if (!container) return;
     container.setAttribute('data-stale', 'true');
     const existing = container.querySelector('#recentOrdersStale');
     if (existing) existing.remove();
-    container.insertBefore(gigahostOrderStatusStaleNotice(reason), container.firstChild);
+    container.insertBefore(gigahostOrderStatusStaleNotice(reason, failures), container.firstChild);
 }
 
 /* gigahostOrderStatusStaleNotice builds the explicit stale marker. The time it shows
  * is the last check that genuinely confirmed a provider state, and it says so when
  * there is none: an unconfirmed view must not display a time as if one had answered. */
-function gigahostOrderStatusStaleNotice(reason) {
+function gigahostOrderStatusStaleNotice(reason, failures) {
     const notice = document.createElement('div');
     notice.id = 'recentOrdersStale';
     notice.setAttribute('role', 'status');
@@ -255,11 +271,30 @@ function gigahostOrderStatusStaleNotice(reason) {
     notice.textContent = _('gigahost_status_stale');
     notice.appendChild(document.createTextNode(' '));
     notice.appendChild(gigahostOrderStatusTime(gigahostOrderStatusLastSuccessAt, 'gigahost_status_stale_never'));
+    // Every failed order is named with its own diagnostic, so a mixed response cannot show
+    // one headline reason that belongs to a different row. A diagnostic is untrusted input:
+    // text, never markup.
+    const named = (failures || []).filter((entry) => entry && entry.orderId);
+    if (named.length > 0) {
+        named.forEach((entry) => {
+            const detail = document.createElement('div');
+            detail.style.marginTop = '2px';
+            detail.style.fontSize = '0.75rem';
+            detail.setAttribute('data-failed-order', entry.orderId);
+            const who = document.createElement('span');
+            who.style.fontFamily = 'monospace';
+            who.textContent = '#' + entry.orderId + ' ';
+            detail.appendChild(who);
+            detail.appendChild(document.createTextNode(
+                _('gigahost_status_provider_error') + ': ' + String(entry.error || '')));
+            notice.appendChild(detail);
+        });
+        return notice;
+    }
     if (reason) {
         const detail = document.createElement('div');
         detail.style.marginTop = '2px';
         detail.style.fontSize = '0.75rem';
-        // A provider diagnostic is untrusted input: text, never markup.
         detail.textContent = _('gigahost_status_provider_error') + ': ' + reason;
         notice.appendChild(detail);
     }
@@ -682,7 +717,7 @@ function gigahostOrderStatusCommitRead(container, outcome) {
 
     const freshness = gigahostOrderStatusFreshness(container, merged, observations, checkedAt);
     if (freshness.providerFailed && merged.length > 0) {
-        gigahostOrderStatusProviderFailed(container, freshness.reason);
+        gigahostOrderStatusProviderFailed(container, freshness.reason, freshness.failures);
     }
 
     if (merged.length === 0) {
@@ -782,23 +817,42 @@ function gigahostOrderStatusRenderList(container, merged, details, setupIndex, o
  * A 200 carrying cached rows is a read of the panel, not of the provider, so it can
  * neither advance the last successful check nor clear a stale notice. Only an
  * observation that says the provider answered may do that. */
+/* gigahostOrderStatusFreshness records what this read established, and reports the failures
+ * this read must make visible.
+ *
+ * Confirmation and failure are evaluated independently, because they belong to different
+ * orders. One order answering successfully is not evidence about another order, so a success
+ * may advance the global last-success time but must never suppress a failure reported for
+ * some other displayed order. The earlier shape returned on the first confirmation, which
+ * silently dropped every failure in a mixed response.
+ *
+ * A read that confirmed nothing and failed nothing was not attempted at all (an all-terminal
+ * list); that is neither a confirmation nor a failure, and nothing is advanced. */
 function gigahostOrderStatusFreshness(container, merged, observations, checkedAt) {
     const reads = observations || {};
     const outcomes = merged.map((order) =>
         gigahostOrderStatusObservation(reads[String(order.order_id || '')]));
-    const failures = outcomes.filter((obs) => obs.outcome === 'unavailable');
     const confirmed = outcomes.some((obs) => obs.outcome === 'confirmed');
 
-    if (confirmed) {
-        gigahostOrderStatusLoaded(container, checkedAt);
-        return {confirmed: true, providerFailed: false, reason: ''};
+    if (confirmed) gigahostOrderStatusLoaded(container, checkedAt);
+
+    const failures = merged
+        .map((order, index) => ({order: order, observation: outcomes[index]}))
+        .filter((entry) => entry.observation.outcome === 'unavailable');
+    if (failures.length === 0) {
+        return {confirmed: confirmed, providerFailed: false, reason: '', failures: []};
     }
-    if (failures.length > 0) {
-        return {confirmed: false, providerFailed: true, reason: failures[0].error};
-    }
-    // No read was attempted for anything on screen (an all-terminal list). That is not
-    // a failure, and it is not a confirmation either: nothing is advanced.
-    return {confirmed: false, providerFailed: false, reason: ''};
+    return {
+        confirmed: confirmed,
+        providerFailed: true,
+        // The first failure is the notice's headline reason; every failed order is named
+        // below, and each failed row carries its own diagnostic as well.
+        reason: failures[0].observation.error,
+        failures: failures.map((entry) => ({
+            orderId: String((entry.order.order_id) || ''),
+            error: entry.observation.error
+        }))
+    };
 }
 
 /* gigahostOrderStatusRenderEmpty renders a list with no orders.
@@ -821,17 +875,25 @@ function gigahostOrderStatusRenderEmpty(container, freshness) {
 /* gigahostOrderStatusContext assembles the context one row classifies, from the reads
  * this tick already performed. setupIndex of null means the approval list could not be
  * read, which is reported as an unknown setup axis rather than "none"; the deploy DTO
- * supplies the onboarding-journal evidence the immediate setup path writes. */
+ * supplies the onboarding-journal evidence the immediate setup path writes.
+ *
+ * The check time is per order, because "last successful check" is a statement about that
+ * order's provider answer and not about this page read. It is this read's time only when
+ * this read actually confirmed this order; otherwise the order keeps the last time it was
+ * confirmed, and a never-confirmed order keeps an empty value so the panel says "Not
+ * checked" rather than borrowing a success nobody observed for it. */
 function gigahostOrderStatusContext(order, detail, setupIndex, checkedAt, observations) {
     const deploy = detail || {};
     const orderId = String(order.order_id || '');
     const setupKnown = setupIndex !== null;
     const reads = observations || {};
+    const observation = reads[orderId] || null;
+    const confirmedHere = gigahostOrderStatusObservation(observation).outcome === 'confirmed';
     return {
         deploy: deploy.deploy || null,
         detailOK: deploy.detailOK === true,
-        checkedAt: checkedAt,
-        observation: reads[orderId] || null,
+        checkedAt: gigahostOrderStatusOrderCheckedAt(orderId, checkedAt, confirmedHere),
+        observation: observation,
         setup: {
             known: setupKnown,
             intent: setupKnown ? setupIndex[orderId] || null : null,
@@ -839,5 +901,20 @@ function gigahostOrderStatusContext(order, detail, setupIndex, checkedAt, observ
         },
         health: gigahostOrderStatusHealthFor(order)
     };
+}
+
+/* gigahostOrderStatusOrderCheckedAt returns the check time this row may display, and
+ * records a new one only when this read confirmed the order.
+ *
+ * The map is the view's own memory of what it has actually seen confirmed, so it survives
+ * an outage: a failed read cannot overwrite a confirmed time, and one order's confirmation
+ * cannot supply a time for another. */
+function gigahostOrderStatusOrderCheckedAt(orderId, readAt, confirmedHere) {
+    if (!orderId) return confirmedHere ? readAt : '';
+    if (confirmedHere) {
+        gigahostOrderStatusConfirmedAt[orderId] = String(readAt || '');
+        return gigahostOrderStatusConfirmedAt[orderId];
+    }
+    return gigahostOrderStatusConfirmedAt[orderId] || '';
 }
 
