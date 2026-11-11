@@ -936,10 +936,21 @@ func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client giga
 		if statusResp != nil && statusResp.Status != "" && statusResp.Status != order.Status {
 			order.Status = statusResp.Status
 			updated = true
-		} else if (order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active") && (statusResp == nil || statusResp.Status == "") {
-			order.Status = statusCancelled
-			updated = true
 		}
+		/* An answer that carries no status is not a cancellation.
+		 *
+		 * The provider's decoder accepts an empty body (`{}`, or an empty
+		 * data.servers[] envelope) into a zero response with no error, so "the provider
+		 * answered and there is no such deployment" is indistinguishable here from "the
+		 * provider answered with nothing useful". Treating the absent status as a
+		 * cancellation therefore turned a live, inventory-confirmed ready row into a
+		 * durable terminal one: the row was persisted with the terminal value, and the
+		 * next list read skipped it as terminal, so continued positive inventory could
+		 * never repair it.
+		 *
+		 * Genuine termination still reaches this row by a non-empty provider status (above)
+		 * or by ErrNotFound (below), so nothing is lost by not inventing a terminal state
+		 * from silence. This branch used to claim the opposite; it was wrong. */
 		if statusResp != nil {
 			if ip := statusResp.GetIP(); ip != "" && ip != order.AssignedIP {
 				order.AssignedIP = ip
@@ -988,18 +999,7 @@ func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Every order starts as "a provider read was not attempted"; the refresh below
-	// records what each read actually answered.
-	observations := make(map[string]GigahostProviderObservation, len(orders))
-	for i := range orders {
-		observations[orders[i].OrderID] = GigahostProviderObservation{Outcome: gigahostObservationNotChecked}
-	}
-
-	// Refresh all non-terminal orders if client is accessible
-	client, clientErr := h.getGigahostClient(r.Context(), r)
-	if clientErr == nil && len(orders) > 0 {
-		observations = h.gigahostOrderObservations(r.Context(), client, orders)
-	}
+	observations := h.gigahostListObservations(r.Context(), r, orders)
 
 	h.JSONOK(w, map[string]any{
 		"orders":                orders,
