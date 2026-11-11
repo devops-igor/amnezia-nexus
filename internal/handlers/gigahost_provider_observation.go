@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"net/http"
 	"strings"
 
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
@@ -18,6 +19,15 @@ import (
 // This file only reads. It performs the same provider calls the list always performed
 // and records what they answered; it decides nothing about provisioning and writes no
 // state of its own beyond the row refresh the handler already did.
+
+// gigahostObservationClientUnavailable is the diagnostic reported when the provider
+// client could not be resolved for a list request.
+//
+// It is a fixed string on purpose. The resolution error can come from API-key
+// validation, which reports the offending character of a rejected key; echoing that
+// error into a response body would publish a fragment of configured material. The
+// operator needs to know the provider was unreachable, not which byte was wrong.
+const gigahostObservationClientUnavailable = "gigahost provider client unavailable"
 
 // Provider observation outcomes for one order in one list response.
 const (
@@ -47,11 +57,13 @@ type GigahostProviderObservation struct {
 	Error string `json:"error,omitempty"`
 }
 
-// settled reports whether a provider read was attempted at all. Only an attempted and
-// failed read makes displayed state stale; a terminal order that is deliberately not
-// re-read is not a read failure.
-func (o GigahostProviderObservation) settled() bool {
-	return o.Outcome != ""
+// confirmed reports whether this observation states a provider-confirmed status.
+//
+// It answers both precedence questions this file asks, because they are the same
+// question: a confirmation is the only thing a less specific read may not displace, and
+// it is the only thing a later read that failed may not invalidate.
+func (o GigahostProviderObservation) confirmed() bool {
+	return o.Outcome == gigahostObservationConfirmed
 }
 
 // gigahostProviderServerStatus returns the provider's own status for an order from an
@@ -134,9 +146,12 @@ func (h *Handlers) gigahostOrderObservations(
 				if rowUpdated {
 					updated = true
 				}
-				// The order detail is the more specific read, so it outranks the
-				// inventory answer for the same order.
-				if obs.settled() {
+				// The order detail is the more specific read, so a confirmed answer from
+				// it outranks the inventory answer for the same order. A failed or silent
+				// detail read does not: the inventory already established a real provider
+				// status for this order, and overwriting it with "unavailable" would mark
+				// a confirmed order stale and refuse to advance its confirmed check time.
+				if obs.confirmed() || !observations[orders[i].OrderID].confirmed() {
 					observations[orders[i].OrderID] = obs
 				}
 			}
@@ -146,4 +161,40 @@ func (h *Handlers) gigahostOrderObservations(
 		}
 	}
 	return observations
+}
+
+// gigahostListObservations answers, per order, what the list request could prove about the
+// provider. Every order starts at "no read was attempted", which is the truth for a terminal
+// row; a resolution failure or the real reads then overwrite that where they can say more.
+//
+// It lives here rather than in the handler so the handler stays a handler and the accounting
+// rules stay in one file. A failure to resolve the provider client is reported as
+// unavailable for every non-terminal order, because the provider was not "not asked" - it
+// could not be reached - and leaving it at not_checked would let a stale ledger row display
+// with no warning. Terminal rows keep not_checked, since re-reading them changes nothing.
+func (h *Handlers) gigahostListObservations(
+	ctx context.Context, r *http.Request, orders []GigahostOrderRecord,
+) map[string]GigahostProviderObservation {
+	observations := make(map[string]GigahostProviderObservation, len(orders))
+	for i := range orders {
+		observations[orders[i].OrderID] = GigahostProviderObservation{Outcome: gigahostObservationNotChecked}
+	}
+
+	client, clientErr := h.getGigahostClient(ctx, r)
+	if clientErr != nil {
+		for i := range orders {
+			if isTerminalStatus(orders[i].Status) {
+				continue
+			}
+			observations[orders[i].OrderID] = GigahostProviderObservation{
+				Outcome: gigahostObservationUnavailable,
+				Error:   gigahostObservationClientUnavailable,
+			}
+		}
+		return observations
+	}
+	if len(orders) == 0 {
+		return observations
+	}
+	return h.gigahostOrderObservations(ctx, client, orders)
 }

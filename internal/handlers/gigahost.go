@@ -977,18 +977,7 @@ func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Every order starts as "a provider read was not attempted"; the refresh below
-	// records what each read actually answered.
-	observations := make(map[string]GigahostProviderObservation, len(orders))
-	for i := range orders {
-		observations[orders[i].OrderID] = GigahostProviderObservation{Outcome: gigahostObservationNotChecked}
-	}
-
-	// Refresh all non-terminal orders if client is accessible
-	client, clientErr := h.getGigahostClient(r.Context(), r)
-	if clientErr == nil && len(orders) > 0 {
-		observations = h.gigahostOrderObservations(r.Context(), client, orders)
-	}
+	observations := h.gigahostListObservations(r.Context(), r, orders)
 
 	h.JSONOK(w, map[string]any{
 		"orders":                orders,
