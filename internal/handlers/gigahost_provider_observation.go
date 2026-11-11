@@ -66,6 +66,21 @@ func (o GigahostProviderObservation) confirmed() bool {
 	return o.Outcome == gigahostObservationConfirmed
 }
 
+// authoritativeTerminal reports whether this observation is a provider answer that ends the
+// order's life - as opposed to a confirmed status that merely reports progress.
+//
+// It exists for one case: when the inventory read failed, the read as a whole is "the provider
+// was not fully reachable", so an ordinary confirmation must not clear the stale state. An
+// explicit terminal answer about the order itself is different in kind - the provider has told
+// us how the deployment ended - and suppressing it would lose real information. Only the
+// provider's own terminal spelling qualifies; `ready` and `deploying` are progress, not ends.
+func (o GigahostProviderObservation) authoritativeTerminal() bool {
+	if o.Outcome != gigahostObservationConfirmed {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(o.Status), statusCancelled)
+}
+
 // gigahostProviderServerStatus returns the provider's own status for an order from an
 // already-fetched server inventory. A match without a status is not an answer, so it is
 // reported as absent rather than as a confirmation.
@@ -122,7 +137,8 @@ func (h *Handlers) gigahostOrderObservations(
 	}
 
 	servers, serversErr := client.GetServers(ctx)
-	if serversErr != nil {
+	inventoryKnown := serversErr == nil
+	if !inventoryKnown {
 		// An inventory that could not be read answers for nobody. Every non-terminal
 		// order it would have covered is reported unavailable, which is the one thing
 		// the failure does establish.
@@ -157,7 +173,7 @@ func (h *Handlers) gigahostOrderObservations(
 		if (isPendingOrInFlight(orders[i].Status) || !updated) && deployQueries < maxDeployQueries {
 			if isRefreshableOrderID(orders[i].OrderID) {
 				deployQueries++
-				rowUpdated, obs := h.refreshOrderFromDeployStatus(ctx, client, &orders[i], servers)
+				rowUpdated, obs := h.refreshOrderFromDeployStatus(ctx, client, &orders[i], servers, inventoryKnown)
 				if rowUpdated {
 					updated = true
 				}
@@ -166,7 +182,16 @@ func (h *Handlers) gigahostOrderObservations(
 				// detail read does not: the inventory already established a real provider
 				// status for this order, and overwriting it with "unavailable" would mark
 				// a confirmed order stale and refuse to advance its confirmed check time.
-				if obs.confirmed() || !observations[orders[i].OrderID].confirmed() {
+				//
+				// The exception is when the inventory itself could not be read: then the
+				// provenance of this whole read is "the provider was not fully reachable",
+				// and a confirmation from the detail alone must not erase that, because the
+				// view has to stay visibly stale and keep its last confirmed time.
+				if inventoryKnown && (obs.confirmed() || !observations[orders[i].OrderID].confirmed()) {
+					observations[orders[i].OrderID] = obs
+				} else if !inventoryKnown && obs.authoritativeTerminal() {
+					// An explicit terminal status is a real provider answer about the order
+					// itself, so it still applies even while the inventory read failed.
 					observations[orders[i].OrderID] = obs
 				}
 			}

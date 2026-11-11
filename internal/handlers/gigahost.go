@@ -927,9 +927,11 @@ func (h *Handlers) refreshOrderFromServers(servers []gigahost.ServerInfo, order 
 // row changed nothing, yet it is still the freshest confirmation the panel has. Only
 // the returned observation may be presented as a provider read.
 //
-// live is the inventory already read for this request; it decides one thing - whether a
-// "no such order" answer may be trusted as a cancellation.
-func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord, live []gigahost.ServerInfo) (bool, GigahostProviderObservation) {
+// live is the inventory already read for this request, and inventoryKnown says whether that
+// read succeeded. Together they decide one thing - whether a "no such order" answer may be
+// trusted as a cancellation. An inventory that could not be read is not evidence that the
+// order is gone, so it must not be allowed to stand in for absence.
+func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord, live []gigahost.ServerInfo, inventoryKnown bool) (bool, GigahostProviderObservation) {
 	if strings.HasPrefix(order.OrderID, "unknown_") || strings.HasPrefix(order.OrderID, "intent_") || order.OrderID == "" {
 		return false, GigahostProviderObservation{Outcome: gigahostObservationNotChecked}
 	}
@@ -974,6 +976,22 @@ func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client giga
 		return updated, observation
 	}
 	if errors.Is(deployErr, gigahost.ErrNotFound) && (order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active") {
+		/* "No such order" only means cancellation when the inventory could corroborate it.
+		 *
+		 * The inventory read is what distinguishes "the provider no longer has this order"
+		 * from "I could not find out": it either names the order (live, or with the
+		 * provider's own terminal status), or it answered and named nobody. When the
+		 * inventory read FAILED, none of those is true, and the terminal value would be
+		 * sticky here - the next list read skips a terminal row before consulting the
+		 * inventory again, so an ordinary 503 would strand a live order in the terminal state
+		 * forever. Report the gap instead and leave the row live, so the next read can
+		 * repair it. */
+		if !inventoryKnown {
+			return false, GigahostProviderObservation{
+				Outcome: gigahostObservationUnavailable,
+				Error:   "provider inventory could not be read, so a missing deployment record is not evidence of cancellation",
+			}
+		}
 		// Only a cancellation nothing contradicts: live inventory for this order means the
 		// missing detail record is a partial read failure, and the terminal value would be
 		// sticky, so later reads would skip the row and inventory could never repair it.
