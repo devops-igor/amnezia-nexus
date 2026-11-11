@@ -88,12 +88,35 @@ jobs:
           xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$(go env GOPATH)/bin/caddy"
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: Install musl libc and Alpine libgcc for Native NaiveProxy Tests
+      # The musl loader comes from the same digest-pinned Alpine image as libgcc,
+      # so this step no longer depends on any Ubuntu package mirror. Alpine's
+      # loader resolves libc.so from itself and libgcc_s.so.1 through
+      # /etc/ld-musl-x86_64.path, which is the layout the pinned NaiveProxy
+      # release asset declares (interpreter /lib/ld-musl-x86_64.so.1,
+      # NEEDED libgcc_s.so.1 + libc.so). Every step below fails closed; a bad
+      # copy must fail here rather than turn the native tests into skips.
+      - name: Install musl loader and libgcc for Native NaiveProxy Tests
         run: |
-          sudo apt-get update && sudo apt-get install -y musl
-          mkdir -p /tmp/musl-lib
-          docker run --rm -v /tmp/musl-lib:/out alpine:3.20 sh -c "apk add --no-cache libgcc && cp /usr/lib/libgcc_s.so.1 /out/"
-          sudo cp /tmp/musl-lib/libgcc_s.so.1 /usr/lib/x86_64-linux-musl/libgcc_s.so.1
+          set -euo pipefail
+          ALPINE="alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
+          staging="$(mktemp -d)"
+          trap 'rm -rf "$staging"' EXIT
+          docker run --rm -v "$staging:/out" "$ALPINE" sh -euc \
+            'apk add --no-cache libgcc && cp -L /lib/ld-musl-x86_64.so.1 /usr/lib/libgcc_s.so.1 /out/'
+          test -s "$staging/ld-musl-x86_64.so.1"
+          test -s "$staging/libgcc_s.so.1"
+          sudo install -D -m 0755 "$staging/ld-musl-x86_64.so.1" /lib/ld-musl-x86_64.so.1
+          sudo install -D -m 0644 "$staging/libgcc_s.so.1" /usr/lib/x86_64-linux-musl/libgcc_s.so.1
+          printf '/lib\n/usr/lib/x86_64-linux-musl\n' | sudo tee /etc/ld-musl-x86_64.path >/dev/null
+          # Usability proof. The loader exits 1 and prints its banner even when
+          # nothing loads, so grepping that banner proves nothing; --list must
+          # actually execute the loader and parse the installed libgcc as a
+          # dynamic object with resolvable dependencies.
+          /lib/ld-musl-x86_64.so.1 --list /usr/lib/x86_64-linux-musl/libgcc_s.so.1 >/dev/null
+          # NaiveProxy needs these 128-bit helpers; a wrong or truncated libgcc
+          # fails relocation at native-test time, so assert them up front.
+          grep -qa '__umodti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
+          grep -qa '__udivti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
 
       - name: Run Tests with Race Detector
         run: go test -race -cover -count=1 -coverprofile=coverage.out ./...
@@ -144,7 +167,8 @@ jobs:
             tests/test_e2e_install_failure.py \
             tests/test_e2e_install_failure_finalizer.py \
             tests/test_e2e_log_privacy.py \
-            tests/test_naive_decoy_default_contract.py
+            tests/test_naive_decoy_default_contract.py \
+            tests/test_ci_native_dependencies.py
 
   build-matrix:
     name: Cross-Compile Matrix (${{ matrix.target.os }}/${{ matrix.target.arch }})
