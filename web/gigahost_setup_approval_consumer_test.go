@@ -41,29 +41,47 @@ func TestGigahostSetupApprovalInitiationConsumerDOM(t *testing.T) {
 		t.Fatalf("read settings template: %v", err)
 	}
 	templateStr := string(templates)
-	// The saved action must be offered from the shipped renderer. It is not
-	// conditioned on the provider having assigned an address: the provisioning
-	// interval before an address exists is exactly what a saved job covers.
-	if !strings.Contains(templateStr, "appendSetupApprovalAction(right, o.order_id)") {
-		t.Fatal("settings.html does not offer the saved setup approval action")
-	}
+	// The saved action must be offered from the shipped renderer, and the renderer
+	// itself must be the shipped module: an inline copy could diverge from it. The
+	// offer is not conditioned on the provider having assigned an address, because
+	// the provisioning interval before an address exists is what a saved job covers.
 	if !strings.Contains(templateStr, `src="/static/js/gigahost_setup_intents.js"`) {
 		t.Fatal("settings.html does not load the module that defines the action")
 	}
-	consumer, err := extractJSFunction(templateStr, "async function loadRecentOrders")
+	if !strings.Contains(templateStr, `src="/static/js/gigahost_order_status.js"`) {
+		t.Fatal("settings.html does not load the module that renders the recent orders")
+	}
+	// The classification is a separate shipped module, and it must be loaded before the
+	// renderer that consumes it.
+	modelAt := strings.Index(templateStr, `src="/static/js/gigahost_order_status_model.js"`)
+	rendererAt := strings.Index(templateStr, `src="/static/js/gigahost_order_status.js"`)
+	if modelAt < 0 {
+		t.Fatal("settings.html does not load the order-status classification module")
+	}
+	if modelAt > rendererAt {
+		t.Fatal("the classification module must load before the renderer that uses it")
+	}
+	modelModule, err := StaticFS.ReadFile("static/js/gigahost_order_status_model.js")
 	if err != nil {
-		t.Fatalf("extract loadRecentOrders: %v", err)
+		t.Fatalf("read the classification module: %v", err)
+	}
+	consumer, err := StaticFS.ReadFile("static/js/gigahost_order_status.js")
+	if err != nil {
+		t.Fatalf("read the recent-orders renderer: %v", err)
+	}
+	if !strings.Contains(string(consumer), "appendSetupApprovalAction(right, order.order_id)") {
+		t.Fatal("the shipped renderer does not offer the saved setup approval action")
 	}
 
 	encodedModule, _ := json.Marshal(string(module))
-	encodedConsumer, _ := json.Marshal(consumer)
+	encodedConsumer, _ := json.Marshal(string(consumer))
+	encodedModel, _ := json.Marshal(string(modelModule))
 	script := jsdomBootstrapSnippet + fmt.Sprintf(`
 const dom = new JSDOM('<div id="recentOrdersContainer"></div><div id="setupIntentsContainer"></div>', {runScripts:'outside-only'});
 const w = dom.window;
 w._ = key => key;
 const toasts = [];
 w.UI = {toast:(text,kind)=>toasts.push({text,kind})};
-w.scheduleRecentOrdersPolling = () => {};
 
 const calls = [];
 let orders = [];
@@ -79,6 +97,7 @@ w.API = {
     if (url === '/api/admin/hosting/gigahost/orders') return {orders: orders};
     if (url.indexOf('/status') !== -1) return {status:'ok', deploy:{status:'deploying'}};
     if (url === '/api/admin/hosting/gigahost/setup-intents') return {setup_intents: intents};
+    if (url === '/api/vpn/backends') return {backends: []};
     return {};
   },
   post: async (url, body) => {
@@ -92,12 +111,15 @@ w.API = {
 const byMethod = m => calls.filter(c => c.method === m);
 const postsTo = suffix => byMethod('POST').filter(c => c.url.slice(-suffix.length) === suffix);
 const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(r => setTimeout(r, 0)); };
-const rowButtons = () => Array.from(w.document.querySelectorAll('#recentOrdersContainer button')).map(b => b.textContent);
+// The status cell is a button as well, so the action assertions select every button
+// except that disclosure control: the actions are the rest of them.
+const rowButtons = () => Array.from(w.document.querySelectorAll('#recentOrdersContainer button:not(.gigahost-order-status-toggle)')).map(b => b.textContent);
 const container = w.document.getElementById('recentOrdersContainer');
 const intentsContainer = w.document.getElementById('setupIntentsContainer');
-const approveBtn = () => Array.from(w.document.querySelectorAll('#recentOrdersContainer button'))
+const approveBtn = () => Array.from(w.document.querySelectorAll('#recentOrdersContainer button:not(.gigahost-order-status-toggle)'))
   .find(b => b.textContent === 'setup_intents_approve');
 
+w.eval(%s);
 w.eval(%s);
 w.eval(%s);
 
@@ -252,7 +274,7 @@ w.eval(%s);
 
  console.log('SETUP_APPROVAL_INITIATION_DOM_OK');dom.window.close();
 })().catch(err=>{console.error(err);process.exit(1)});
-`, string(encodedModule), string(encodedConsumer))
+`, string(encodedModule), string(encodedModel), string(encodedConsumer))
 
 	out, err := execNodeScript(node, script)
 	if err != nil || !strings.Contains(string(out), "SETUP_APPROVAL_INITIATION_DOM_OK") {
