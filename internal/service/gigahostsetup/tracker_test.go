@@ -30,6 +30,10 @@ import (
 
 const trackerTestSecretKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
+// trackerTestProviderKeyID is the provider-side account key id the fixtures record, so the
+// managed credential carries the correlation a real purchase produces.
+const trackerTestProviderKeyID = int64(4242)
+
 // fakeClock is an explicit virtual clock. Nothing in these tests waits on it.
 type fakeClock struct{ now time.Time }
 
@@ -115,8 +119,13 @@ func (h *harness) seedOrder(orderID string, providerServerID int64, ip string) {
 		ServerID:   providerServerID,
 		Status:     gigahost.StatusPending,
 		AssignedIP: ip,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		// This fixture stands for an order the panel placed, so it records the same
+		// provenance stamp the pre-purchase writer records. A test that needs an
+		// unpurchased row writes it explicitly.
+		PurchaseOrigin:     models.PurchaseOriginPanelPurchase,
+		PurchaseRecordedAt: now,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 	if err := h.db.InsertGigahostOrder(context.Background(), order); err != nil {
 		h.t.Fatalf("seed order: %v", err)
@@ -129,8 +138,11 @@ func (h *harness) seedManagedCredential(orderID string) {
 	h.t.Helper()
 	err := h.db.SetGigahostOrderCredential(context.Background(), &models.GigahostOrderCredential{
 		OrderID:    orderID,
-		PrivateKey: "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n-----END OPENSSH PRIVATE KEY-----",
+		PrivateKey: "[REDACTED PRIVATE KEY]",
 		PublicKey:  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureKeyMaterialForTestsOnly0000",
+		// A registered provider key id is part of the ownership binding: it is the
+		// correlation between what the order authorised and the stored material.
+		ProviderKeyID: trackerTestProviderKeyID,
 	})
 	if err != nil {
 		h.t.Fatalf("seed managed credential: %v", err)

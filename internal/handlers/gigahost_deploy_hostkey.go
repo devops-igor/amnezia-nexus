@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rsa"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -156,13 +156,5 @@ func (h *Handlers) verifyDeploySSHAccess(ctx context.Context, assignedIP string,
 }
 
 func validateFingerprintFormat(fp string) error {
-	if !strings.HasPrefix(fp, "SHA256:") {
-		return errors.New("expected canonical SHA256 SSH fingerprint")
-	}
-	raw := strings.TrimPrefix(fp, "SHA256:")
-	decoded, err := base64.RawStdEncoding.Strict().DecodeString(raw)
-	if err != nil || len(decoded) != 32 || base64.RawStdEncoding.EncodeToString(decoded) != raw {
-		return errors.New("invalid SHA256 SSH fingerprint")
-	}
-	return nil
+	return models.ValidateHostFingerprint(fp)
 }
