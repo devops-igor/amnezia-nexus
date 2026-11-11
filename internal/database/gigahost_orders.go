@@ -58,6 +58,11 @@ var gigahostOrderColumns = []struct {
 	{"ssh_key_enc", `ALTER TABLE gigahost_orders ADD COLUMN ssh_key_enc TEXT DEFAULT ''`},
 	{"ssh_public_key", `ALTER TABLE gigahost_orders ADD COLUMN ssh_public_key TEXT DEFAULT ''`},
 	{"provider_ssh_key_id", `ALTER TABLE gigahost_orders ADD COLUMN provider_ssh_key_id INTEGER DEFAULT 0`},
+	// The purchase-provenance stamp. It is added last and defaults to the empty
+	// value, so every row that already exists - legacy, imported, mirror-created -
+	// reads as "not purchased by this panel" and can never gain the stamp later.
+	{"purchase_origin", `ALTER TABLE gigahost_orders ADD COLUMN purchase_origin TEXT NOT NULL DEFAULT ''`},
+	{"purchase_recorded_at", `ALTER TABLE gigahost_orders ADD COLUMN purchase_recorded_at TEXT NOT NULL DEFAULT ''`},
 }
 
 var gigahostOrderIndexes = []string{
@@ -149,7 +154,8 @@ func (d *DB) ListGigahostOrders(ctx context.Context) ([]models.GigahostOrder, er
 // readGigahostOrders is the shared SELECT body.
 func (d *DB) readGigahostOrders(ctx context.Context) ([]models.GigahostOrder, error) {
 	q := `SELECT id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
-	             created_at, updated_at, price_id, monthly_cap_nok, currency
+	             created_at, updated_at, price_id, monthly_cap_nok, currency,
+	             purchase_origin, purchase_recorded_at
 	      FROM gigahost_orders
 	      ORDER BY id DESC`
 	return d.scanGigahostOrders(ctx, q)
@@ -168,12 +174,14 @@ func (d *DB) scanGigahostOrders(ctx context.Context, q string) ([]models.Gigahos
 		var o models.GigahostOrder
 		var createdAt, updatedAt string
 		var assignedIP, currency sql.NullString
+		var purchaseOrigin, purchaseRecordedAt sql.NullString
 		var priceID sql.NullInt64
 		var monthlyCap sql.NullFloat64
 		if err := rows.Scan(
 			&o.ID, &o.OrderID, &o.ServerID, &o.Status, &o.PlanID, &o.RegionID,
 			&o.HourlyPriceNOK, &assignedIP, &createdAt, &updatedAt,
 			&priceID, &monthlyCap, &currency,
+			&purchaseOrigin, &purchaseRecordedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -181,6 +189,8 @@ func (d *DB) scanGigahostOrders(ctx context.Context, q string) ([]models.Gigahos
 		o.Currency = currency.String
 		o.PriceID = int(priceID.Int64)
 		o.MonthlyCapNOK = monthlyCap.Float64
+		o.PurchaseOrigin = purchaseOrigin.String
+		o.PurchaseRecordedAt = parseSetupTimestamp(purchaseRecordedAt.String)
 		o.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 		o.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 		list = append(list, o)
@@ -196,16 +206,30 @@ func (d *DB) InsertGigahostOrder(ctx context.Context, o *models.GigahostOrder) e
 	if err := d.EnsureGigahostOrdersSchema(ctx); err != nil {
 		return err
 	}
+	// The provenance stamp is written here and nowhere else. It is one statement with
+	// the row it describes, so a row cannot exist that claims a purchase origin
+	// without having been written by the purchase path, and no later writer can add
+	// the stamp to a row that appeared some other way.
+	origin := strings.TrimSpace(o.PurchaseOrigin)
+	recordedAt := ""
+	if origin != "" {
+		if o.PurchaseRecordedAt.IsZero() {
+			o.PurchaseRecordedAt = o.CreatedAt
+		}
+		recordedAt = o.PurchaseRecordedAt.UTC().Format(time.RFC3339Nano)
+	}
 	q := `INSERT INTO gigahost_orders
 	      (order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
-	       created_at, updated_at, price_id, monthly_cap_nok, currency)
-	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	       created_at, updated_at, price_id, monthly_cap_nok, currency,
+	       purchase_origin, purchase_recorded_at)
+	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 	res, err := d.sqlDB.ExecContext(ctx, q,
 		o.OrderID, o.ServerID, o.Status, o.PlanID, o.RegionID, o.HourlyPriceNOK, o.AssignedIP,
 		o.CreatedAt.Format(time.RFC3339), o.UpdatedAt.Format(time.RFC3339),
 		o.PriceID, o.MonthlyCapNOK, o.Currency,
+		origin, recordedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert gigahost order: %w", err)
@@ -217,7 +241,11 @@ func (d *DB) InsertGigahostOrder(ctx context.Context, o *models.GigahostOrder) e
 }
 
 // UpdateGigahostOrder updates the provider identity and status of a row.
-// Price identity is written once at order time and is not rewritten here.
+//
+// Price identity is written once at order time and is not rewritten here, and neither
+// is purchase provenance: this is not the purchase writer, so a row that reached the
+// ledger some other way must not be able to acquire the stamp by being updated. The
+// columns are simply absent from the SET list, which is the enforcement.
 func (d *DB) UpdateGigahostOrder(ctx context.Context, o *models.GigahostOrder) error {
 	if d == nil || d.sqlDB == nil {
 		return nil
@@ -363,7 +391,8 @@ func (d *DB) GetGigahostOrder(ctx context.Context, orderID string) (*models.Giga
 		return nil, false, err
 	}
 	q := `SELECT id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip,
-	             created_at, updated_at, price_id, monthly_cap_nok, currency
+	             created_at, updated_at, price_id, monthly_cap_nok, currency,
+	             purchase_origin, purchase_recorded_at
 	      FROM gigahost_orders WHERE order_id = ? ORDER BY id DESC LIMIT 1`
 	row := d.sqlDB.QueryRowContext(ctx, q, orderID)
 	order, err := scanGigahostOrderRow(row)
@@ -382,12 +411,14 @@ func scanGigahostOrderRow(row *sql.Row) (*models.GigahostOrder, error) {
 	var o models.GigahostOrder
 	var createdAt, updatedAt string
 	var assignedIP, currency sql.NullString
+	var purchaseOrigin, purchaseRecordedAt sql.NullString
 	var priceID sql.NullInt64
 	var monthlyCap sql.NullFloat64
 	if err := row.Scan(
 		&o.ID, &o.OrderID, &o.ServerID, &o.Status, &o.PlanID, &o.RegionID,
 		&o.HourlyPriceNOK, &assignedIP, &createdAt, &updatedAt,
 		&priceID, &monthlyCap, &currency,
+		&purchaseOrigin, &purchaseRecordedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -395,6 +426,8 @@ func scanGigahostOrderRow(row *sql.Row) (*models.GigahostOrder, error) {
 	o.Currency = currency.String
 	o.PriceID = int(priceID.Int64)
 	o.MonthlyCapNOK = monthlyCap.Float64
+	o.PurchaseOrigin = purchaseOrigin.String
+	o.PurchaseRecordedAt = parseSetupTimestamp(purchaseRecordedAt.String)
 	o.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	o.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 	return &o, nil

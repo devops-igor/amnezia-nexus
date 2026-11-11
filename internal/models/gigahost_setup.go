@@ -1,6 +1,8 @@
 package models
 
 import (
+	"encoding/base64"
+	"errors"
 	"strings"
 	"time"
 )
@@ -79,6 +81,79 @@ const (
 	SetupCredentialManual  = "manual"
 )
 
+// Host trust policies recorded on a setup intent.
+//
+// The policy is the durable authority a job carries for its SSH host identity,
+// and the empty value is the default because it is the safe one: an identity
+// becomes trusted only when an administrator confirms the exact value the panel
+// displayed. The automation policy is deliberately not reachable from an HTTP
+// payload; only an internal caller that already owns the automation decision can
+// grant it, so approving or resuming a job can never widen its own authority.
+const (
+	// SetupTrustPolicyManual requires an administrator's confirmation. It is the
+	// zero value, so every row created before this existed is manual and stays
+	// manual.
+	SetupTrustPolicyManual = ""
+	// SetupTrustPolicyFirstContact allows the panel to pin the host identity it
+	// observed on its own read-only first-contact challenge, which is the only
+	// supported fallback when the provider offers no authenticated host identity.
+	SetupTrustPolicyFirstContact = "first_contact"
+)
+
+// Host trust modes record how a stored identity became trusted.
+//
+// The mode is provenance, not authority: it says whether a person confirmed the
+// value or the panel pinned its own first observation. It is written together
+// with the fingerprint so the two can never disagree, and it is what keeps an
+// automatic pin from being replaced by an ordinary confirmation.
+const (
+	// SetupTrustModeNone is the zero value: no identity is trusted.
+	SetupTrustModeNone = ""
+	// SetupTrustModeConfirmed means an administrator confirmed the value.
+	SetupTrustModeConfirmed = "confirmed"
+	// SetupTrustModeFirstContact means the panel pinned the identity it observed
+	// on its own challenge, under SetupTrustPolicyFirstContact.
+	SetupTrustModeFirstContact = "first_contact"
+)
+
+// Purchase provenance recorded on an order ledger row.
+//
+// It exists because the setup pipeline must distinguish an order this panel actually
+// bought from every other way a row can appear. A ledger row can be created by the
+// deploy-status mirror for an order the panel never placed, and such a row can carry a
+// plausible plan id and even a credential, so neither of those is evidence of
+// ownership. This stamp is written by one producer only - the pre-purchase intent that
+// is committed before any provider call - and no other writer sets it.
+const (
+	// PurchaseOriginNone is the zero value: nothing proves this panel purchased the
+	// order. Legacy, imported, bootstrap and synthetic rows all read as this.
+	PurchaseOriginNone = ""
+	// PurchaseOriginPanelPurchase means the pre-purchase intent writer recorded the
+	// row before the provider was asked to sell anything.
+	PurchaseOriginPanelPurchase = "panel_purchase"
+)
+
+// First-contact pin outcomes, reported by the store to the tracker that asked for
+// the pin.
+//
+// They live here because both the writer and the decision maker must agree on the
+// exact vocabulary: a caller that confused "a different identity is pinned" with
+// "this call pinned it" would either trust a changed host or retry a decision that
+// was in fact final.
+const (
+	// FirstContactPinned means the call recorded the identity.
+	FirstContactPinned = "pinned"
+	// FirstContactAlreadyPinnedSame means the same identity was already recorded
+	// for this job, which is the same answer, not a second decision.
+	FirstContactAlreadyPinnedSame = "already_pinned_same"
+	// FirstContactIdentityChanged means a different identity is already recorded.
+	// Trust does not move.
+	FirstContactIdentityChanged = "identity_changed"
+	// FirstContactNotEligible means the row was not in a state automatic trust may
+	// act on.
+	FirstContactNotEligible = "not_eligible"
+)
+
 // GigahostSetupIntent is the durable, administrator-approved setup job for one
 // Gigahost order.
 //
@@ -122,6 +197,34 @@ type GigahostSetupIntent struct {
 	// it authorizes nothing, and confirmation is accepted only for this exact
 	// value. It is cleared when a confirmation records HostFingerprint.
 	HostCandidateFingerprint string `json:"host_candidate_fingerprint,omitempty"`
+	// HostTrustPolicy is the durable authority this job carries for its host
+	// identity. See SetupTrustPolicy*: the empty default is manual, and only an
+	// internal caller can record the automation policy. It is not part of any
+	// approval payload, so no request can widen a job's own authority.
+	HostTrustPolicy string `json:"host_trust_policy,omitempty"`
+	// HostTrustMode is the provenance of HostFingerprint: empty for none,
+	// "confirmed" for an administrator's confirmation, "first_contact" for an
+	// identity the panel pinned itself. It is written in the same statement as the
+	// fingerprint, so the two cannot disagree, and it is what keeps an automatic
+	// pin from being overwritten by an ordinary confirmation.
+	HostTrustMode string `json:"host_trust_mode,omitempty"`
+
+	// The binding below records exactly which resource the automation authority was
+	// granted for, at the moment it was granted. It exists so the pin is checked
+	// against a recorded decision rather than against a live re-read that a later
+	// writer could have moved: a job whose order, server, address or managed key has
+	// changed since the grant must not be trusted automatically.
+	//
+	// All five are written together by the single grant statement and are never
+	// overwritten afterwards, so a partially bound row cannot exist.
+	HostTrustOrderID  string `json:"host_trust_order_id,omitempty"`
+	HostTrustServerID int64  `json:"host_trust_server_id,omitempty"`
+	HostTrustAddress  string `json:"host_trust_address,omitempty"`
+	HostTrustKeyID    int64  `json:"host_trust_key_id,omitempty"`
+	// HostTrustGrantedAt is when this binding was recorded. A zero value means no
+	// binding was ever granted, which is also what keeps automatic trust inert for
+	// every row that predates it.
+	HostTrustGrantedAt time.Time `json:"host_trust_granted_at,omitempty"`
 
 	// ReadFailures counts consecutive provider read failures and resets on the
 	// next successful read. Attempts counts every scheduled provider read.
@@ -216,4 +319,36 @@ func (i *GigahostSetupIntent) EffectiveProtocol() string {
 		return ""
 	}
 	return NormalizeProtocol(strings.TrimSpace(i.Protocol))
+}
+
+// IsSyntheticGigahostOrderID reports the order ledger's placeholder order ids: an
+// intent a purchase never resolved, or an unknown purchase outcome. Neither is a
+// provider order, so neither can be set up and neither can ever prove automatic
+// authority.
+//
+// It lives here, next to the model, because the approval path and the trust
+// decision must agree: a second copy of these prefixes would drift into a
+// disagreement about which rows are real.
+func IsSyntheticGigahostOrderID(orderID string) bool {
+	return strings.HasPrefix(orderID, "intent_") || strings.HasPrefix(orderID, "unknown_")
+}
+
+// ValidateHostFingerprint reports whether fp is the canonical SHA256 SSH host
+// fingerprint this panel stores and compares: the "SHA256:" prefix followed by
+// the strict unpadded base64 of a 32-byte digest.
+//
+// The check is strict because the value is compared by string equality against a
+// computed fingerprint. An accepted near-miss (padding, an alternative base64
+// alphabet, a re-encoded buffer) would be stored happily and then never match the
+// host, turning a mismatch into a permanent pause with no diagnosable cause.
+func ValidateHostFingerprint(fp string) error {
+	if !strings.HasPrefix(fp, "SHA256:") {
+		return errors.New("expected canonical SHA256 SSH fingerprint")
+	}
+	raw := strings.TrimPrefix(fp, "SHA256:")
+	decoded, err := base64.RawStdEncoding.Strict().DecodeString(raw)
+	if err != nil || len(decoded) != 32 || base64.RawStdEncoding.EncodeToString(decoded) != raw {
+		return errors.New("invalid SHA256 SSH fingerprint")
+	}
+	return nil
 }

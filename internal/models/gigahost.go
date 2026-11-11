@@ -34,6 +34,16 @@ type GigahostOrder struct {
 	// Currency is the order's billing currency. Empty means "not recorded"
 	// and is treated as NOK, the pre-existing assumption.
 	Currency string `json:"currency"`
+
+	// PurchaseOrigin records who created this row, and is the only evidence the
+	// setup pipeline accepts that this panel actually purchased the order. See
+	// PurchaseOrigin*: only the pre-purchase intent writer stamps it, so a row the
+	// deploy-status mirror created - however plausible its plan and credential
+	// happen to look - reads as PurchaseOriginNone forever.
+	PurchaseOrigin string `json:"purchase_origin,omitempty"`
+	// PurchaseRecordedAt is when the purchase intent was committed. It is recorded
+	// with the stamp in the same INSERT so the two cannot disagree.
+	PurchaseRecordedAt time.Time `json:"purchase_recorded_at,omitempty"`
 }
 
 // GigahostOrderCredential is the managed SSH credential attached to one order
