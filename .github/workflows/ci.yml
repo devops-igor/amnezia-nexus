@@ -127,6 +127,18 @@ jobs:
       - name: Run Vision Tests (non-race)
         run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
 
+      # The automatic AWG admission pair runs inside the package job above, but a
+      # package-level PASS reports neither which tests ran nor what the pre-rollback
+      # capture observed, so a remote-only AWG stall could not be attributed. This
+      # selects the two existing tests by anchored name and keeps -v so their
+      # privacy-safe observations reach the log. It adds no assertion and changes no
+      # qualification semantics: a failure here still fails the job.
+      - name: Run Automatic AWG Admission Consumers
+        run: |
+          go test -v -race -count=1 -p 2 -parallel 2 -timeout 10m \
+            -run '^(TestAutomaticSetupAdmitsAfterAuthenticAWGTraffic|TestAutomaticSetupRefusesWhenTheAWGPeerNeverAnswers)$' \
+            ./internal/handlers/
+
       - name: Upload Test Coverage
         uses: actions/upload-artifact@v7
         if: always()
