@@ -157,11 +157,17 @@ func TestFreshProcessLeavesACompletedJobInert(t *testing.T) {
 	}
 }
 
-// TestFreshProcessProvisioningFailureThenRecovery covers the temporary-failure boundary.
+// TestFreshProcessProvisioningFailureThenRecovery covers the HOST-CONTACT retry boundary.
 //
-// A provider that cannot be read leaves the job pending with its purchase identity intact,
-// and a later fresh process completes it once the provider answers. Long provisioning is
-// demonstrated with the child's pinned clock, not an hour-long wait.
+// This is not the provider-outage proof, and it must not be read as one: the provider keeps
+// answering "ready" throughout, and what fails is the SSH dial to a closed port. Both events
+// leave the job pending, which is precisely why a state label cannot distinguish them - see
+// the provider-recovery tests for the outage case, which counts provider reads rather than
+// inferring from the state.
+//
+// What this test does hold: an unreachable host leaves the job pending with its purchase
+// identity intact, and a later fresh process completes it once the host answers. Long
+// provisioning is demonstrated with the child's pinned clock, not an hour-long wait.
 func TestFreshProcessProvisioningFailureThenRecovery(t *testing.T) {
 	const orderID = autoProcessOrderID
 	env, _, _ := newAutomaticProcessEnv(t, orderID)
