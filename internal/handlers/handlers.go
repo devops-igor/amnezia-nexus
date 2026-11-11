@@ -107,6 +107,11 @@ type Handlers struct {
 	// side-effecting install steps, which is a separate worker with a separate
 	// (never-blindly-repeat) failure policy.
 	installNudge func()
+	// setupAutomationPolicy is the opt-in source for unattended setup. It is nil
+	// in every shipped configuration, which is the default-off deployment: the
+	// internal entry refuses before it reads anything, so no automatic job can be
+	// created without an explicit policy installed here.
+	setupAutomationPolicy AutomationPolicy
 	// Repeated rejected deploy attempts are suppressed per admin for a short
 	// window; see gigahost_admission.go.
 	admissionOnce  sync.Once
