@@ -49,6 +49,11 @@ var gigahostSetupIntentsSchema = `CREATE TABLE IF NOT EXISTS gigahost_setup_inte
 	host_candidate_fingerprint TEXT NOT NULL DEFAULT '',
 	host_trust_policy TEXT NOT NULL DEFAULT '',
 	host_trust_mode TEXT NOT NULL DEFAULT '',
+	host_trust_order_id TEXT NOT NULL DEFAULT '',
+	host_trust_server_id INTEGER NOT NULL DEFAULT 0,
+	host_trust_address TEXT NOT NULL DEFAULT '',
+	host_trust_key_id INTEGER NOT NULL DEFAULT 0,
+	host_trust_granted_at TEXT NOT NULL DEFAULT '',
 	read_failures INTEGER NOT NULL DEFAULT 0,
 	attempts INTEGER NOT NULL DEFAULT 0,
 	install_generation INTEGER NOT NULL DEFAULT 0,
@@ -80,6 +85,11 @@ var gigahostSetupIntentColumnUpgrades = []struct {
 	{"nexus_server_id", `ALTER TABLE gigahost_setup_intents ADD COLUMN nexus_server_id INTEGER NOT NULL DEFAULT 0`},
 	{"host_trust_policy", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_trust_policy TEXT NOT NULL DEFAULT ''`},
 	{"host_trust_mode", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_trust_mode TEXT NOT NULL DEFAULT ''`},
+	{"host_trust_order_id", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_trust_order_id TEXT NOT NULL DEFAULT ''`},
+	{"host_trust_server_id", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_trust_server_id INTEGER NOT NULL DEFAULT 0`},
+	{"host_trust_address", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_trust_address TEXT NOT NULL DEFAULT ''`},
+	{"host_trust_key_id", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_trust_key_id INTEGER NOT NULL DEFAULT 0`},
+	{"host_trust_granted_at", `ALTER TABLE gigahost_setup_intents ADD COLUMN host_trust_granted_at TEXT NOT NULL DEFAULT ''`},
 }
 
 // gigahostSetupIntentIndexes are created after the table and column upgrades.
@@ -139,6 +149,7 @@ const setupIntentColumns = `id, order_id, provider_server_id, assigned_ip,
 	protocol, port, tls_domain, engine_profile, credential_mode,
 	state, provider_status, step, last_error,
 	host_fingerprint, host_mismatch, host_candidate_fingerprint, host_trust_policy, host_trust_mode,
+	host_trust_order_id, host_trust_server_id, host_trust_address, host_trust_key_id, host_trust_granted_at,
 	read_failures, attempts,
 	install_generation, install_phase, install_phase_done, install_attempts,
 	nexus_server_id,
@@ -151,13 +162,15 @@ func scanSetupIntent(scanner interface {
 }) (*models.GigahostSetupIntent, error) {
 	var i models.GigahostSetupIntent
 	var hostMismatch int
-	var nextAttempt, lastChecked, revokedAt, createdAt, updatedAt string
+	var nextAttempt, lastChecked, revokedAt, createdAt, updatedAt, trustGrantedAt string
 	if err := scanner.Scan(
 		&i.ID, &i.OrderID, &i.ProviderServerID, &i.AssignedIP,
 		&i.Protocol, &i.Port, &i.TLSDomain, &i.EngineProfile, &i.CredentialMode,
 		&i.State, &i.ProviderStatus, &i.Step, &i.LastError,
 		&i.HostFingerprint, &hostMismatch, &i.HostCandidateFingerprint,
-		&i.HostTrustPolicy, &i.HostTrustMode, &i.ReadFailures, &i.Attempts,
+		&i.HostTrustPolicy, &i.HostTrustMode,
+		&i.HostTrustOrderID, &i.HostTrustServerID, &i.HostTrustAddress, &i.HostTrustKeyID, &trustGrantedAt,
+		&i.ReadFailures, &i.Attempts,
 		&i.InstallGeneration, &i.InstallPhase, &i.InstallPhaseDone, &i.InstallAttempts,
 		&i.NexusServerID,
 		&nextAttempt, &lastChecked, &i.ApprovedBy, &revokedAt,
@@ -166,6 +179,7 @@ func scanSetupIntent(scanner interface {
 		return nil, err
 	}
 	i.HostMismatch = hostMismatch != 0
+	i.HostTrustGrantedAt = parseSetupTimestamp(trustGrantedAt)
 	i.NextAttemptAt = parseSetupTimestamp(nextAttempt)
 	i.LastCheckedAt = parseSetupTimestamp(lastChecked)
 	i.RevokedAt = parseSetupTimestamp(revokedAt)
@@ -217,7 +231,7 @@ func (d *DB) CreateGigahostSetupIntent(ctx context.Context, intent *models.Gigah
 	intent.UpdatedAt = now
 
 	q := `INSERT INTO gigahost_setup_intents (` + setupIntentColumns + `)
-	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 	res, err := d.sqlDB.ExecContext(ctx, q,
@@ -226,6 +240,8 @@ func (d *DB) CreateGigahostSetupIntent(ctx context.Context, intent *models.Gigah
 		intent.State, intent.ProviderStatus, intent.Step, intent.LastError,
 		intent.HostFingerprint, boolToInt(intent.HostMismatch), intent.HostCandidateFingerprint,
 		intent.HostTrustPolicy, intent.HostTrustMode,
+		intent.HostTrustOrderID, intent.HostTrustServerID, intent.HostTrustAddress,
+		intent.HostTrustKeyID, formatSetupTimestamp(intent.HostTrustGrantedAt),
 		intent.ReadFailures, intent.Attempts,
 		intent.InstallGeneration, intent.InstallPhase, intent.InstallPhaseDone, intent.InstallAttempts,
 		intent.NexusServerID,
@@ -425,6 +441,10 @@ func buildTransitionStatement(
 	          last_error = ?,
 	          host_fingerprint = CASE WHEN ? != '' AND host_fingerprint = '' THEN ? ELSE host_fingerprint END,
 	          host_trust_mode = CASE WHEN host_trust_mode = '' AND ? != '' THEN ? ELSE host_trust_mode END,
+	          host_trust_order_id = CASE WHEN host_trust_order_id = '' AND ? != '' THEN ? ELSE host_trust_order_id END,
+	          host_trust_server_id = CASE WHEN host_trust_server_id = 0 AND ? > 0 THEN ? ELSE host_trust_server_id END,
+	          host_trust_address = CASE WHEN host_trust_address = '' AND ? != '' THEN ? ELSE host_trust_address END,
+	          host_trust_key_id = CASE WHEN host_trust_key_id = 0 AND ? > 0 THEN ? ELSE host_trust_key_id END,
 	          host_mismatch = ?,
 	          host_candidate_fingerprint = ?,
 	          read_failures = ?,
@@ -450,6 +470,10 @@ func buildTransitionStatement(
 		intent.LastError,
 		intent.HostFingerprint, intent.HostFingerprint,
 		intent.HostTrustMode, intent.HostTrustMode,
+		intent.HostTrustOrderID, intent.HostTrustOrderID,
+		intent.HostTrustServerID, intent.HostTrustServerID,
+		intent.HostTrustAddress, intent.HostTrustAddress,
+		intent.HostTrustKeyID, intent.HostTrustKeyID,
 		boolToInt(intent.HostMismatch),
 		intent.HostCandidateFingerprint,
 		intent.ReadFailures,

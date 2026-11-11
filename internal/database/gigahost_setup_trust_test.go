@@ -56,6 +56,45 @@ func seedTrustIntent(t *testing.T, db *DB, orderID, policy string) {
 	}
 }
 
+// seedPurchasedOrder records what the purchase-intent writer records: a ledger row that
+// carries the provenance stamp, the provider server identity and an address, plus the
+// managed credential registered at the provider.
+func seedPurchasedOrder(t *testing.T, db *DB, orderID string, providerServerID int64, ip string) {
+	t.Helper()
+	now := time.Now().UTC()
+	if err := db.InsertGigahostOrder(context.Background(), &models.GigahostOrder{
+		OrderID: orderID, ServerID: providerServerID, Status: "pending",
+		PlanID: 7, RegionID: 3, AssignedIP: ip,
+		PurchaseOrigin:     models.PurchaseOriginPanelPurchase,
+		PurchaseRecordedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed purchased order %s: %v", orderID, err)
+	}
+	if err := db.SetGigahostOrderCredential(context.Background(), &models.GigahostOrderCredential{
+		OrderID: orderID, PrivateKey: "[REDACTED PRIVATE KEY]",
+		PublicKey:     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureKeyMaterialForTestsOnly0000",
+		ProviderKeyID: 4242,
+	}); err != nil {
+		t.Fatalf("seed managed credential for %s: %v", orderID, err)
+	}
+}
+
+// grantBinding records the automation authority for a purchased order, as the internal
+// caller does: prove the binding, then store it.
+func grantBinding(t *testing.T, db *DB, orderID string, providerServerID int64) *models.GigahostSetupIntent {
+	t.Helper()
+	ctx := context.Background()
+	binding, err := db.ProveAutomationBinding(ctx, orderID, providerServerID)
+	if err != nil {
+		t.Fatalf("prove binding for %s: %v", orderID, err)
+	}
+	intent, changed, err := db.SetGigahostSetupAutomationBinding(ctx, binding)
+	if err != nil || !changed {
+		t.Fatalf("grant binding for %s: changed=%v err=%v", orderID, changed, err)
+	}
+	return intent
+}
+
 // TestTrustStorePinRefusesWithoutAnOrder proves the pin cannot be attempted against a
 // row it cannot name, and that it validates the identity before touching storage.
 func TestTrustStorePinRefusesWithoutAnOrder(t *testing.T) {
@@ -76,58 +115,107 @@ func TestTrustStorePinRefusesWithoutAnOrder(t *testing.T) {
 	}
 }
 
-// TestTrustStorePolicyWriteRefusesAnUnsupportedPolicy proves durable authority cannot be
-// invented: a value nothing enforces would read as permission in the database and be one
-// in no code path.
-func TestTrustStorePolicyWriteRefusesAnUnsupportedPolicy(t *testing.T) {
+// TestTrustStoreGrantRefusesAnIncompleteBinding proves durable authority cannot exist
+// without saying which resource it is for: an incomplete binding is not a weaker grant,
+// it is no grant at all.
+func TestTrustStoreGrantRefusesAnIncompleteBinding(t *testing.T) {
 	db := newTrustDB(t)
 	ctx := context.Background()
-	seedTrustIntent(t, db, "ord_policy", models.SetupTrustPolicyManual)
+	seedTrustIntent(t, db, "ord_incomplete", models.SetupTrustPolicyManual)
 
-	for _, bad := range []string{"always_trust", "first-contact", "FIRST_CONTACT", "automation"} {
-		if _, _, err := db.SetGigahostSetupHostTrustPolicy(ctx, "ord_policy", bad); err == nil {
-			t.Fatalf("unsupported policy %q was accepted", bad)
+	cases := map[string]AutomationBinding{
+		"no order id":     {ProviderServerID: 42, Address: "198.51.100.5", ProviderKeyID: 4242},
+		"no server id":    {OrderID: "ord_incomplete", Address: "198.51.100.5", ProviderKeyID: 4242},
+		"no address":      {OrderID: "ord_incomplete", ProviderServerID: 42, ProviderKeyID: 4242},
+		"no provider key": {OrderID: "ord_incomplete", ProviderServerID: 42, Address: "198.51.100.5"},
+		"nothing at all":  {},
+	}
+	for name, binding := range cases {
+		if intent, changed, err := db.SetGigahostSetupAutomationBinding(ctx, binding); err != nil || changed || intent != nil {
+			t.Fatalf("%s = (%v, %v, %v), want (nil, false, nil)", name, intent, changed, err)
 		}
 	}
-	stored, found, err := db.GetGigahostSetupIntent(ctx, "ord_policy")
-	if err != nil || !found {
-		t.Fatalf("read intent: found=%v err=%v", found, err)
-	}
-	if stored.HostTrustPolicy != models.SetupTrustPolicyManual {
-		t.Fatalf("a refused policy write changed the row to %q", stored.HostTrustPolicy)
+	stored, _, _ := db.GetGigahostSetupIntent(ctx, "ord_incomplete")
+	if stored.HostTrustPolicy != models.SetupTrustPolicyManual || stored.HostTrustGrantedAt != (time.Time{}) {
+		t.Fatalf("a refused grant changed the row: policy=%q granted=%v",
+			stored.HostTrustPolicy, stored.HostTrustGrantedAt)
 	}
 }
 
-// TestTrustStorePolicyWriteIsIdempotentAndThenRefusesOtherValues proves the two answers a
-// policy write must give after the first one: the same value again is not a change, and a
-// different value is refused because authority is granted once, before trust is decided.
-func TestTrustStorePolicyWriteRefusesAfterTrustIsDecided(t *testing.T) {
+// TestTrustStoreGrantRecordsTheExactBinding proves the grant stores every fact it was
+// granted for, in one write, so a later step can compare against a recorded decision
+// rather than a live re-read.
+func TestTrustStoreGrantRecordsTheExactBinding(t *testing.T) {
 	db := newTrustDB(t)
 	ctx := context.Background()
-	seedTrustIntent(t, db, "ord_policy_once", models.SetupTrustPolicyManual)
+	seedTrustIntent(t, db, "ord_grant", models.SetupTrustPolicyManual)
+	seedPurchasedOrder(t, db, "ord_grant", 4242, "198.51.100.42")
 
-	granted, changed, err := db.SetGigahostSetupHostTrustPolicy(
-		ctx, "ord_policy_once", models.SetupTrustPolicyFirstContact)
-	if err != nil || !changed {
-		t.Fatalf("grant: changed=%v err=%v", changed, err)
-	}
+	granted := grantBinding(t, db, "ord_grant", 4242)
 	if granted.HostTrustPolicy != models.SetupTrustPolicyFirstContact {
-		t.Fatalf("granted policy = %q", granted.HostTrustPolicy)
+		t.Fatalf("policy = %q", granted.HostTrustPolicy)
+	}
+	if granted.HostTrustOrderID != "ord_grant" || granted.HostTrustServerID != 4242 {
+		t.Fatalf("binding order/server = (%q, %d)", granted.HostTrustOrderID, granted.HostTrustServerID)
+	}
+	if granted.HostTrustAddress != "198.51.100.42" || granted.HostTrustKeyID != 4242 {
+		t.Fatalf("binding address/key = (%q, %d)", granted.HostTrustAddress, granted.HostTrustKeyID)
+	}
+	if granted.HostTrustGrantedAt.IsZero() {
+		t.Fatal("the grant recorded no timestamp")
 	}
 
-	// The same request twice is not a second change.
-	if _, changed, err := db.SetGigahostSetupHostTrustPolicy(
-		ctx, "ord_policy_once", models.SetupTrustPolicyFirstContact); err != nil || changed {
+	// A repeat grant is not a second decision.
+	if _, changed, err := db.SetGigahostSetupAutomationBinding(ctx, AutomationBinding{
+		OrderID: "ord_grant", ProviderServerID: 4242,
+		Address: "198.51.100.42", ProviderKeyID: 4242,
+	}); err != nil || changed {
 		t.Fatalf("repeat grant: changed=%v err=%v, want false/nil", changed, err)
 	}
+}
 
-	// Once trust is decided, the authority behind it is history and cannot be edited.
-	if _, changed, err := db.SetGigahostSetupHostTrustPolicy(
-		ctx, "ord_policy_once", models.SetupTrustPolicyFirstContact); err != nil || changed {
-		t.Fatalf("post-trust grant: changed=%v err=%v, want false/nil", changed, err)
+// TestTrustStoreGrantRefusesAfterTrustIsDecided proves authority is granted before trust
+// is decided and never after: a row with an identity, or one that left pending, must not
+// acquire a binding.
+func TestTrustStoreGrantRefusesAfterTrustIsDecided(t *testing.T) {
+	db := newTrustDB(t)
+	ctx := context.Background()
+	seedTrustIntent(t, db, "ord_late", models.SetupTrustPolicyManual)
+	seedPurchasedOrder(t, db, "ord_late", 4242, "198.51.100.43")
+	seedTrustIntent(t, db, "ord_left", models.SetupTrustPolicyManual)
+	seedPurchasedOrder(t, db, "ord_left", 4243, "198.51.100.44")
+
+	// Handed off already.
+	current, _, _ := db.GetGigahostSetupIntent(ctx, "ord_left")
+	current.State = models.SetupStateReadyForSetup
+	current.Step = "ready_for_setup"
+	if _, err := db.TransitionGigahostSetupIntent(ctx, current, []string{models.SetupStatePending}); err != nil {
+		t.Fatalf("move the row out of pending: %v", err)
 	}
-	if _, _, err := db.SetGigahostSetupHostTrustPolicy(ctx, "  ", models.SetupTrustPolicyFirstContact); err != nil {
-		t.Fatalf("empty order id returned an error instead of a no-op: %v", err)
+	if _, changed, err := db.SetGigahostSetupAutomationBinding(ctx, AutomationBinding{
+		OrderID: "ord_left", ProviderServerID: 4243, Address: "198.51.100.44", ProviderKeyID: 4242,
+	}); err != nil || changed {
+		t.Fatalf("grant on a handed-off row: changed=%v err=%v, want false/nil", changed, err)
+	}
+}
+
+// TestTrustStoreGrantNoOpOnAnUnusableStore proves a partially constructed store answers
+// rather than panicking, which a caller must be able to rely on at startup.
+func TestTrustStoreGrantNoOpOnAnUnusableStore(t *testing.T) {
+	ctx := context.Background()
+	binding := AutomationBinding{OrderID: "ord_x", ProviderServerID: 1, Address: "198.51.100.9", ProviderKeyID: 1}
+
+	var nilDB *DB
+	if intent, changed, err := nilDB.SetGigahostSetupAutomationBinding(ctx, binding); err != nil || changed || intent != nil {
+		t.Fatalf("nil store = (%v, %v, %v), want (nil, false, nil)", intent, changed, err)
+	}
+	closed := &DB{}
+	if intent, changed, err := closed.SetGigahostSetupAutomationBinding(ctx, binding); err != nil || changed || intent != nil {
+		t.Fatalf("store with no handle = (%v, %v, %v), want (nil, false, nil)", intent, changed, err)
+	}
+	db := newTrustDB(t)
+	if intent, changed, err := db.SetGigahostSetupAutomationBinding(ctx, binding); err != nil || changed || intent != nil {
+		t.Fatalf("no such job = (%v, %v, %v), want (nil, false, nil)", intent, changed, err)
 	}
 }
 
@@ -137,9 +225,11 @@ func TestTrustStorePolicyWriteRefusesAfterTrustIsDecided(t *testing.T) {
 func TestTrustStorePinOutcomeExplainsANonMatchingRow(t *testing.T) {
 	db := newTrustDB(t)
 	ctx := context.Background()
-	seedTrustIntent(t, db, "ord_outcome", models.SetupTrustPolicyFirstContact)
+	seedTrustIntent(t, db, "ord_outcome", models.SetupTrustPolicyManual)
+	seedPurchasedOrder(t, db, "ord_outcome", 4101, "198.51.100.61")
+	grantBinding(t, db, "ord_outcome", 4101)
 
-	// Pin once, so the identity exists under attended trust.
+	// Pin once, so the identity exists under the granted authority.
 	if outcome, err := db.PinGigahostSetupFirstContact(ctx, "ord_outcome", trustTestFingerprint); err != nil {
 		t.Fatalf("pin: %v", err)
 	} else if outcome != models.FirstContactPinned {
@@ -163,9 +253,11 @@ func TestTrustStorePinOutcomeExplainsANonMatchingRow(t *testing.T) {
 		t.Fatalf("stored identity = %q, want %q", stored.HostFingerprint, trustTestFingerprint)
 	}
 
-	// A row with a policy but no identity that has left the pinnable state is not
-	// eligible, and the outcome must say that rather than inventing an identity change.
-	seedTrustIntent(t, db, "ord_left", models.SetupTrustPolicyFirstContact)
+	// A granted row that has left the pinnable state is not eligible, and the outcome
+	// must say that rather than inventing an identity change.
+	seedTrustIntent(t, db, "ord_left", models.SetupTrustPolicyManual)
+	seedPurchasedOrder(t, db, "ord_left", 4102, "198.51.100.62")
+	grantBinding(t, db, "ord_left", 4102)
 	current, _, _ := db.GetGigahostSetupIntent(ctx, "ord_left")
 	current.State = models.SetupStateReadyForSetup
 	current.Step = "ready_for_setup"
@@ -179,35 +271,13 @@ func TestTrustStorePinOutcomeExplainsANonMatchingRow(t *testing.T) {
 	}
 }
 
-// TestTrustStorePolicyWriteOnAnUnusableStoreIsANoOp proves the guard that a partially
-// constructed store answers rather than panicking, which is what a caller has to be able to
-// rely on when the panel starts before its database is ready.
-func TestTrustStorePolicyWriteOnAnUnusableStoreIsANoOp(t *testing.T) {
-	ctx := context.Background()
-
-	var nilDB *DB
-	if intent, changed, err := nilDB.SetGigahostSetupHostTrustPolicy(ctx, "ord_x", models.SetupTrustPolicyManual); err != nil || changed || intent != nil {
-		t.Fatalf("nil store = (%v, %v, %v), want (nil, false, nil)", intent, changed, err)
-	}
-	closed := &DB{}
-	if intent, changed, err := closed.SetGigahostSetupHostTrustPolicy(ctx, "ord_x", models.SetupTrustPolicyManual); err != nil || changed || intent != nil {
-		t.Fatalf("store with no handle = (%v, %v, %v), want (nil, false, nil)", intent, changed, err)
-	}
-
-	// A policy write against an order that has no intent row is a no-op with no error:
-	// "no such job" is an answer, not a fault.
-	db := newTrustDB(t)
-	if intent, changed, err := db.SetGigahostSetupHostTrustPolicy(
-		ctx, "ord_no_such_job", models.SetupTrustPolicyFirstContact); err != nil || changed || intent != nil {
-		t.Fatalf("missing order = (%v, %v, %v), want (nil, false, nil)", intent, changed, err)
-	}
-}
-
 // TestTrustStorePinRejectsAForeignFingerprintShape proves the store validates the exact
 // canonical shape it later compares by string equality.
 func TestTrustStorePinRejectsAForeignFingerprintShape(t *testing.T) {
 	db := newTrustDB(t)
-	seedTrustIntent(t, db, "ord_shape", models.SetupTrustPolicyFirstContact)
+	seedTrustIntent(t, db, "ord_shape", models.SetupTrustPolicyManual)
+	seedPurchasedOrder(t, db, "ord_shape", 4103, "198.51.100.63")
+	grantBinding(t, db, "ord_shape", 4103)
 
 	// The canonical value is 43 base64 characters decoding to 32 bytes, so the
 	// neighbouring lengths are the ones that must be refused: 42 decodes to 31 bytes

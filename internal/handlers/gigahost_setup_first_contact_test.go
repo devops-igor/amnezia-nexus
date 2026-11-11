@@ -40,9 +40,14 @@ func sshFingerprintOf(t *testing.T, signer gossh.Signer) string {
 func (e *installEnv) seedFirstContactOrder(orderID string, providerServerID int64, ip string) {
 	e.t.Helper()
 	now := time.Now().UTC()
+	// The provenance stamp is what makes this row a purchase this panel made. It is
+	// the fact the trust predicate requires now, so the fixture records it exactly as
+	// the purchase-intent writer does rather than relying on a plan id.
 	if err := e.db.InsertGigahostOrder(context.Background(), &models.GigahostOrder{
 		OrderID: orderID, ServerID: providerServerID, Status: gigahost.StatusReady,
-		PlanID: 7, RegionID: 3, AssignedIP: ip, CreatedAt: now, UpdatedAt: now,
+		PlanID: 7, RegionID: 3, AssignedIP: ip,
+		PurchaseOrigin:     models.PurchaseOriginPanelPurchase,
+		PurchaseRecordedAt: now, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		e.t.Fatalf("seed order %s: %v", orderID, err)
 	}
@@ -73,10 +78,14 @@ func (e *installEnv) seedFirstContactOrder(orderID string, providerServerID int6
 // grantAutomationTrust gives the approval the internal automation authority, using the
 // same single writer the future controller will use. It is never reachable from a
 // request, which is what keeps a client from widening a job's authority.
-func (e *installEnv) grantAutomationTrust(orderID string) {
+func (e *installEnv) grantAutomationTrust(orderID string, providerServerID int64) {
 	e.t.Helper()
-	if _, changed, err := e.db.SetGigahostSetupHostTrustPolicy(
-		context.Background(), orderID, models.SetupTrustPolicyFirstContact); err != nil || !changed {
+	ctx := context.Background()
+	binding, err := e.db.ProveAutomationBinding(ctx, orderID, providerServerID)
+	if err != nil {
+		e.t.Fatalf("prove the binding for %s: %v", orderID, err)
+	}
+	if _, changed, err := e.db.SetGigahostSetupAutomationBinding(ctx, binding); err != nil || !changed {
 		e.t.Fatalf("grant automation trust for %s: changed=%v err=%v", orderID, changed, err)
 	}
 }
@@ -108,7 +117,7 @@ func TestSetupFirstContactTrustPinsBeforeAuthentication(t *testing.T) {
 		t.Fatalf("seed credential: %v", err)
 	}
 	env.approve(orderID, models.ProtocolAWG, "51820", "")
-	env.grantAutomationTrust(orderID)
+	env.grantAutomationTrust(orderID, providerServerID)
 	env.realSSHAt(map[string]int{"127.0.0.1": peer.port()}, 2*time.Second)
 
 	tracker := env.h.NewGigahostSetupTracker()
@@ -171,7 +180,7 @@ func TestSetupFirstContactTrustThenInstallsWithThePinnedIdentity(t *testing.T) {
 		t.Fatalf("seed credential: %v", err)
 	}
 	env.approve(orderID, models.ProtocolAWG, "51820", "")
-	env.grantAutomationTrust(orderID)
+	env.grantAutomationTrust(orderID, providerServerID)
 
 	// The install fixture's dialer answers with the fixture identity; the trust pass
 	// must therefore pin exactly that, so trust and install agree.
@@ -249,7 +258,7 @@ func TestSetupFirstContactRefusesAChangedKeyAfterThePin(t *testing.T) {
 		t.Fatalf("seed credential: %v", err)
 	}
 	env.approve(orderID, models.ProtocolAWG, "51820", "")
-	env.grantAutomationTrust(orderID)
+	env.grantAutomationTrust(orderID, providerServerID)
 	env.realSSHAt(map[string]int{"127.0.0.1": pinnedPeer.port()}, 2*time.Second)
 
 	if err := env.h.NewGigahostSetupTracker().RunOnce(ctx); err != nil {
@@ -312,10 +321,13 @@ func TestSetupFirstContactRefusesIneligibleOwnership(t *testing.T) {
 		prepare func(t *testing.T, e *installEnv, orderID string, providerServerID int64, ip string)
 	}{
 		{
-			name:      "no contracted plan",
+			name:      "no purchase provenance",
 			wantState: models.SetupStateAwaitingHostConfirm,
 			prepare: func(t *testing.T, e *installEnv, orderID string, _ int64, _ string) {
-				e.executeSQL(`UPDATE gigahost_orders SET plan_id = 0 WHERE order_id = ?`, orderID)
+				// The row keeps a plausible plan id and a registered key id, and still
+				// must not qualify: only the purchase-origin stamp proves the panel
+				// bought it. This is the case the previous version got wrong.
+				e.executeSQL(`UPDATE gigahost_orders SET purchase_origin = '' WHERE order_id = ?`, orderID)
 			},
 		},
 		{
@@ -386,7 +398,7 @@ func TestSetupFirstContactRefusesIneligibleOwnership(t *testing.T) {
 				}
 			}
 			env.approve(orderID, models.ProtocolAWG, "51820", "")
-			env.grantAutomationTrust(orderID)
+			env.grantAutomationTrust(orderID, providerServerID)
 			tc.prepare(t, env, orderID, providerServerID, ip)
 			env.realSSHAt(map[string]int{ip: peer.port()}, 2*time.Second)
 
@@ -440,7 +452,7 @@ func TestSetupFirstContactRefusesAnImportedServerAtTheSameAddress(t *testing.T) 
 
 	env.seedFirstContactOrder(orderID, providerServerID, ip)
 	env.approve(orderID, models.ProtocolAWG, "51820", "")
-	env.grantAutomationTrust(orderID)
+	env.grantAutomationTrust(orderID, providerServerID)
 
 	// An imported server (no provider identity at all) already answers at this
 	// address.
@@ -560,7 +572,7 @@ func TestSetupFirstContactPinSurvivesTheInstallJournal(t *testing.T) {
 		t.Fatalf("seed credential: %v", err)
 	}
 	env.approve(orderID, models.ProtocolAWG, "51820", "")
-	env.grantAutomationTrust(orderID)
+	env.grantAutomationTrust(orderID, providerServerID)
 	env.realSSHAt(map[string]int{"127.0.0.1": peer.port()}, 2*time.Second)
 
 	if err := env.h.NewGigahostSetupTracker().RunOnce(ctx); err != nil {

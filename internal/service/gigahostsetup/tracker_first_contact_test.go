@@ -67,6 +67,30 @@ func allowAllEligibility(context.Context, models.GigahostSetupIntent) (bool, str
 	return true, ""
 }
 
+// executeSQL applies a fixture statement to the ledger. It is used only to place a row in a
+// state a real operator action or provider answer produces; the behaviour under test always
+// runs through production code.
+func (h *harness) executeSQL(query string, args ...any) {
+	h.t.Helper()
+	if _, err := h.db.SQLDB().ExecContext(context.Background(), query, args...); err != nil {
+		h.t.Fatalf("fixture statement failed: %v", err)
+	}
+}
+
+// grantBoundAuthority proves the ownership binding for this harness order and records it,
+// exactly as the internal caller does: proof first, then the grant.
+func (h *harness) grantBoundAuthority(orderID string, providerServerID int64) {
+	h.t.Helper()
+	ctx := context.Background()
+	binding, err := h.db.ProveAutomationBinding(ctx, orderID, providerServerID)
+	if err != nil {
+		h.t.Fatalf("prove binding for %s: %v", orderID, err)
+	}
+	if _, changed, err := h.db.SetGigahostSetupAutomationBinding(ctx, binding); err != nil || !changed {
+		h.t.Fatalf("grant bound authority for %s: changed=%v err=%v", orderID, changed, err)
+	}
+}
+
 // seedFirstContactJob records a ready order that a first-contact pass can act on,
 // grants it the automation policy through the real writer, and returns the intent.
 func (h *harness) seedFirstContactJob(orderID string, providerServerID int64, ip string) *models.GigahostSetupIntent {
@@ -90,12 +114,8 @@ func (h *harness) seedFirstContactJob(orderID string, providerServerID int64, ip
 		Port:             "51820",
 		CredentialMode:   models.SetupCredentialManaged,
 	})
-	updated, changed, err := h.db.SetGigahostSetupHostTrustPolicy(
-		context.Background(), orderID, models.SetupTrustPolicyFirstContact)
-	if err != nil || !changed {
-		h.t.Fatalf("grant automation policy: changed=%v err=%v", changed, err)
-	}
-	return updated
+	h.grantBoundAuthority(orderID, providerServerID)
+	return h.load(orderID)
 }
 
 // TestTrackerFirstContactPinsObservedIdentity is the positive tracking proof.
@@ -298,16 +318,14 @@ func TestFirstContactPinRefusesAnIneligibleRow(t *testing.T) {
 			},
 		},
 		{
-			name: "policy withdrawn",
+			name: "authority withdrawn before the pin",
 			prepare: func(t *testing.T, h *harness) string {
 				h.seedFirstContactJob("ord_fc_withdrawn", 5202, "198.51.100.22")
-				// Withdrawal goes through the same single writer that grants it: the
-				// generic transition does not carry the policy column at all, so this
-				// is the only path that can change it.
-				if _, changed, err := h.db.SetGigahostSetupHostTrustPolicy(
-					context.Background(), "ord_fc_withdrawn", models.SetupTrustPolicyManual); err != nil || !changed {
-					t.Fatalf("withdraw policy: changed=%v err=%v", changed, err)
-				}
+				// The ledger row stops being the panel's purchase, which is what the
+				// binding re-proves at pin time: the authority no longer describes the
+				// resource, so the pin must not happen.
+				h.t.Helper()
+				h.executeSQL(`UPDATE gigahost_orders SET purchase_origin = '' WHERE order_id = ?`, "ord_fc_withdrawn")
 				return "ord_fc_withdrawn"
 			},
 		},
@@ -444,10 +462,7 @@ func TestFirstContactIneligibleJobsKeepTheManualPause(t *testing.T) {
 				CredentialMode: models.SetupCredentialManaged,
 			})
 			if tc.policy == models.SetupTrustPolicyFirstContact {
-				if _, changed, err := h.db.SetGigahostSetupHostTrustPolicy(
-					context.Background(), "ord_fc_neg", models.SetupTrustPolicyFirstContact); err != nil || !changed {
-					t.Fatalf("grant policy: changed=%v err=%v", changed, err)
-				}
+				h.grantBoundAuthority("ord_fc_neg", 5401)
 			}
 
 			h.runOnce(h.firstContactTracker(firstContactFingerprintA, tc.eligible))
@@ -603,25 +618,28 @@ func TestConfirmationCannotReplaceAFirstContactPin(t *testing.T) {
 	}
 }
 
-// TestTrustPolicyWriterRefusesAfterTrustIsDecided proves the authority grant cannot
-// be applied retroactively. Policy is what permits a pin, so a row that already has an
+// TestTrustBindingGrantRefusesAfterTrustIsDecided proves the authority grant cannot be
+// applied retroactively. The binding is what permits a pin, so a row that already has an
 // identity, or has already left pending, must not acquire it afterwards.
-func TestTrustPolicyWriterRefusesAfterTrustIsDecided(t *testing.T) {
+func TestTrustBindingGrantRefusesAfterTrustIsDecided(t *testing.T) {
 	h := newHarness(t)
 	h.seedFirstContactJob("ord_fc_latepolicy", 5801, "198.51.100.81")
 	h.runOnce(h.firstContactTracker(firstContactFingerprintA, allowAllEligibility))
 
-	if _, changed, err := h.db.SetGigahostSetupHostTrustPolicy(
-		context.Background(), "ord_fc_latepolicy", models.SetupTrustPolicyManual); err != nil {
-		t.Fatalf("policy write: %v", err)
+	ctx := context.Background()
+	if _, changed, err := h.db.SetGigahostSetupAutomationBinding(ctx, database.AutomationBinding{
+		OrderID: "ord_fc_latepolicy", ProviderServerID: 5801,
+		Address: "198.51.100.81", ProviderKeyID: trackerTestProviderKeyID,
+	}); err != nil {
+		t.Fatalf("binding write: %v", err)
 	} else if changed {
-		t.Fatal("a policy write applied to a row whose trust was already decided")
+		t.Fatal("a binding grant applied to a row whose trust was already decided")
 	}
 
-	// An unknown policy is refused rather than stored: it would be durable authority
-	// nothing enforces.
-	if _, _, err := h.db.SetGigahostSetupHostTrustPolicy(
-		context.Background(), "ord_fc_latepolicy", "always_trust"); err == nil {
-		t.Fatal("an unknown trust policy was accepted")
+	// An incomplete binding is refused rather than stored: it would be durable authority
+	// that names no resource.
+	if intent, changed, err := h.db.SetGigahostSetupAutomationBinding(
+		ctx, database.AutomationBinding{OrderID: "ord_fc_latepolicy"}); err != nil || changed || intent != nil {
+		t.Fatalf("incomplete binding = (%v, %v, %v), want (nil, false, nil)", intent, changed, err)
 	}
 }

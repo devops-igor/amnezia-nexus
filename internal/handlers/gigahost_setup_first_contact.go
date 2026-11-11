@@ -29,9 +29,11 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 )
@@ -51,10 +53,7 @@ func (h *Handlers) firstContactEligible(
 		return false, reason
 	}
 
-	if reason, ok := h.firstContactOrderProof(ctx, intent, orderID); !ok {
-		return false, reason
-	}
-	if reason, ok := h.firstContactCredentialProof(ctx, orderID); !ok {
+	if reason, ok := h.firstContactBindingProof(ctx, intent, orderID); !ok {
 		return false, reason
 	}
 
@@ -98,51 +97,65 @@ func (h *Handlers) firstContactAuthority(intent models.GigahostSetupIntent) (str
 	return orderID, "", true
 }
 
-// firstContactOrderProof checks the ledger facts that only a purchase this panel made
-// produces: a recorded order with a contracted plan, described by the same provider
-// server identity and address the job is about to use.
+// firstContactBindingProof asks the durable rows whether this panel provably purchased
+// exactly the resource this job describes.
 //
-// A row the deploy-status mirror created for an order the panel never placed has no
-// plan, and that is precisely what this refuses. It is a proxy for "this panel owns
-// the resource" until the automation controller supplies an explicit origin.
-func (h *Handlers) firstContactOrderProof(
+// It deliberately does not look at a plan id or at "a credential exists". Both are
+// fields an imported, mirror-created or hand-built row can carry, so neither proves the
+// panel bought anything; the store's binding proof requires the purchase-origin stamp
+// that only the pre-purchase intent writer sets, the same provider server id, a
+// non-empty address, and the provider-registered managed key id.
+//
+// A job that was granted authority must also still be bound to the same facts it was
+// granted for, so a job whose order moved since the grant is refused here instead of
+// pinning a resource nobody authorized.
+func (h *Handlers) firstContactBindingProof(
 	ctx context.Context, intent models.GigahostSetupIntent, orderID string,
 ) (string, bool) {
-	order, found, err := h.db.GetGigahostOrder(ctx, orderID)
+	binding, err := h.db.ProveAutomationBinding(ctx, orderID, intent.ProviderServerID)
 	if err != nil {
-		return "the order ledger could not be read", false
+		if errors.Is(err, database.ErrAutomationBindingUnproven) {
+			return "this order has no proven application-owned purchase binding", false
+		}
+		return "the order binding could not be read", false
 	}
-	if !found || order == nil {
-		return "the order is not recorded in the ledger", false
+	if reason, ok := matchJobAddress(intent, binding); !ok {
+		return reason, false
 	}
-	if order.PlanID <= 0 {
-		return "the order records no contracted plan, so the panel did not place it", false
-	}
-	if intent.ProviderServerID <= 0 || order.ServerID != intent.ProviderServerID {
-		return "the order and the job disagree about the provider server identity", false
-	}
-	if strings.TrimSpace(intent.AssignedIP) == "" {
+	return matchGrantedBinding(intent, binding)
+}
+
+// matchJobAddress checks the address the job is about to dial against the proven binding.
+//
+// A job with no address has nothing to trust, and a job whose address is not the one the
+// purchase recorded is describing a different host.
+func matchJobAddress(intent models.GigahostSetupIntent, binding database.AutomationBinding) (string, bool) {
+	jobAddress := strings.TrimSpace(intent.AssignedIP)
+	if jobAddress == "" {
 		return "the job records no address to trust", false
+	}
+	if binding.Address != jobAddress {
+		return "the job and the purchase binding disagree about the address", false
 	}
 	return "", true
 }
 
-// firstContactCredentialProof checks that the managed credential exists and was
-// registered at the provider.
+// matchGrantedBinding checks a job that already carries a grant against the proven binding.
 //
-// The provider-side key id is the correlation between what this order authorized and
-// the material the panel will log in with, and only the purchase path produces it. An
-// imported order, a hand-entered key or a bootstrap row therefore fails here.
-func (h *Handlers) firstContactCredentialProof(ctx context.Context, orderID string) (string, bool) {
-	credential, hasCredential, err := h.db.GetGigahostOrderCredential(ctx, orderID)
-	if err != nil {
-		return "the managed credential could not be read", false
+// Comparing against what was recorded at grant time is what refuses a resource that moved
+// afterwards, before any challenge is spent on it. A job with no grant has nothing to
+// compare, which is not a refusal: the grant itself has to happen first.
+func matchGrantedBinding(
+	intent models.GigahostSetupIntent, binding database.AutomationBinding,
+) (string, bool) {
+	if strings.TrimSpace(intent.HostTrustOrderID) == "" {
+		return "", true
 	}
-	if !hasCredential || credential == nil {
-		return "the order carries no managed credential", false
-	}
-	if credential.ProviderKeyID <= 0 {
-		return "the managed credential was not registered with the provider", false
+	if intent.HostTrustOrderID != binding.OrderID ||
+		intent.HostTrustServerID != binding.ProviderServerID ||
+		strings.TrimSpace(intent.HostTrustAddress) != binding.Address ||
+		intent.HostTrustKeyID != binding.ProviderKeyID {
+		return "the resource changed after the automation authority was granted", false
 	}
 	return "", true
 }
@@ -191,8 +204,11 @@ func matchListedProviderServer(s gigahost.ServerInfo, intent models.GigahostSetu
 	case s.OrderID == "":
 		// The provider knows the server but does not attribute it to any order.
 		return "the provider does not attribute that server to this order", false
-	case strings.TrimSpace(s.GetIP()) != "" && strings.TrimSpace(s.GetIP()) != strings.TrimSpace(intent.AssignedIP):
-		return "the provider lists that server at a different address", false
+	case strings.TrimSpace(s.GetIP()) != strings.TrimSpace(intent.AssignedIP):
+		// A missing address and a different address are one answer here: the provider
+		// did not confirm this exact address, and the address is the fact the panel is
+		// about to trust. Missing is not matching.
+		return "the provider does not confirm that address for this server", false
 	default:
 		return "", true
 	}

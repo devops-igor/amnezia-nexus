@@ -116,6 +116,23 @@ const (
 	SetupTrustModeFirstContact = "first_contact"
 )
 
+// Purchase provenance recorded on an order ledger row.
+//
+// It exists because the setup pipeline must distinguish an order this panel actually
+// bought from every other way a row can appear. A ledger row can be created by the
+// deploy-status mirror for an order the panel never placed, and such a row can carry a
+// plausible plan id and even a credential, so neither of those is evidence of
+// ownership. This stamp is written by one producer only - the pre-purchase intent that
+// is committed before any provider call - and no other writer sets it.
+const (
+	// PurchaseOriginNone is the zero value: nothing proves this panel purchased the
+	// order. Legacy, imported, bootstrap and synthetic rows all read as this.
+	PurchaseOriginNone = ""
+	// PurchaseOriginPanelPurchase means the pre-purchase intent writer recorded the
+	// row before the provider was asked to sell anything.
+	PurchaseOriginPanelPurchase = "panel_purchase"
+)
+
 // First-contact pin outcomes, reported by the store to the tracker that asked for
 // the pin.
 //
@@ -191,6 +208,23 @@ type GigahostSetupIntent struct {
 	// fingerprint, so the two cannot disagree, and it is what keeps an automatic
 	// pin from being overwritten by an ordinary confirmation.
 	HostTrustMode string `json:"host_trust_mode,omitempty"`
+
+	// The binding below records exactly which resource the automation authority was
+	// granted for, at the moment it was granted. It exists so the pin is checked
+	// against a recorded decision rather than against a live re-read that a later
+	// writer could have moved: a job whose order, server, address or managed key has
+	// changed since the grant must not be trusted automatically.
+	//
+	// All five are written together by the single grant statement and are never
+	// overwritten afterwards, so a partially bound row cannot exist.
+	HostTrustOrderID  string `json:"host_trust_order_id,omitempty"`
+	HostTrustServerID int64  `json:"host_trust_server_id,omitempty"`
+	HostTrustAddress  string `json:"host_trust_address,omitempty"`
+	HostTrustKeyID    int64  `json:"host_trust_key_id,omitempty"`
+	// HostTrustGrantedAt is when this binding was recorded. A zero value means no
+	// binding was ever granted, which is also what keeps automatic trust inert for
+	// every row that predates it.
+	HostTrustGrantedAt time.Time `json:"host_trust_granted_at,omitempty"`
 
 	// ReadFailures counts consecutive provider read failures and resets on the
 	// next successful read. Attempts counts every scheduled provider read.
