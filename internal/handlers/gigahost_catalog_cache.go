@@ -52,6 +52,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"strconv"
 	"sync"
 	"time"
 
@@ -106,9 +107,14 @@ type catalogSnapshot struct {
 // gigahostCatalogEntry is the retained state of one account scope.
 type gigahostCatalogEntry struct {
 	snapshot *catalogSnapshot
-	failedAt time.Time
-	lastErr  error
-	lastUsed time.Time
+	// generation is the provider-client generation that produced snapshot (or, for
+	// a failure-only entry, the generation the failure belongs to). A write from an
+	// older generation is refused, so a superseded client cannot publish over its
+	// replacement.
+	generation uint64
+	failedAt   time.Time
+	lastErr    error
+	lastUsed   time.Time
 }
 
 // catalogRead is one answer for the handler: the snapshot, whether it is being
@@ -153,11 +159,41 @@ func newGigahostCatalogCache() *gigahostCatalogCache {
 }
 
 // catalogCache returns the lazily created catalog cache.
+//
+// Every reader and writer of the cache pointer goes through this accessor. The
+// replacement path must not read catalogCacheState directly: the field is written
+// inside the Once above, so an unsynchronized read races that initialization.
 func (h *Handlers) catalogCache() *gigahostCatalogCache {
 	h.catalogCacheOnce.Do(func() {
 		h.catalogCacheState = newGigahostCatalogCache()
 	})
 	return h.catalogCacheState
+}
+
+// catalogGeneration reports the current injected-client generation.
+//
+// It increments every time the provider client is replaced. The value is only ever
+// compared for equality, so a wrapped counter is still correct.
+func (h *Handlers) catalogGeneration() uint64 {
+	h.catalogGenMu.Lock()
+	defer h.catalogGenMu.Unlock()
+	return h.catalogGen
+}
+
+// bumpCatalogGeneration invalidates the retained cache and returns the new
+// generation.
+//
+// It goes through the synchronized accessor so it cannot race lazy initialization,
+// and it advances the generation so that a refresh still in flight for the previous
+// client can neither be joined by the replacement nor publish over it.
+func (h *Handlers) bumpCatalogGeneration() uint64 {
+	h.catalogGenMu.Lock()
+	h.catalogGen++
+	generation := h.catalogGen
+	h.catalogGenMu.Unlock()
+
+	h.catalogCache().invalidateAll()
+	return generation
 }
 
 // catalogScopeKey is the cache scope of one provider account.
@@ -200,9 +236,21 @@ func (c *gigahostCatalogCache) peek(scope string, now time.Time) gigahostCatalog
 
 // load answers one catalog request, reading the provider only when the retained
 // answer is from an earlier freshness window.
-func (c *gigahostCatalogCache) load(ctx context.Context, scope string, fetch catalogFetcher) (catalogRead, error) {
+//
+// generation identifies the provider-client generation the caller resolved. A
+// refresh started under one generation is never joined by a call from another, so a
+// replaced client cannot inherit an in-flight answer, and a superseded refresh
+// cannot publish over the replacement's snapshot.
+func (c *gigahostCatalogCache) load(ctx context.Context, scope string, generation uint64, fetch catalogFetcher) (catalogRead, error) {
 	now := c.now()
 	entry := c.peek(scope, now)
+	// Retained state written by a superseded client is not this caller's answer.
+	// Without this, a replacement client would be served the previous client's
+	// snapshot - or, worse, its recorded failure backoff - simply because both
+	// injected clients share one scope.
+	if entry.generation < generation {
+		entry = gigahostCatalogEntry{}
+	}
 	if entry.fresh(now) {
 		return newCatalogRead(entry.snapshot, false, now), nil
 	}
@@ -216,24 +264,33 @@ func (c *gigahostCatalogCache) load(ctx context.Context, scope string, fetch cat
 	if entry.snapshot == nil && entry.lastErr != nil && entry.blocked(now) {
 		return catalogRead{}, entry.lastErr
 	}
-	return c.refresh(ctx, scope, fetch)
+	return c.refresh(ctx, scope, generation, fetch)
 }
 
-// refresh performs one provider read for the scope, coalescing concurrent
-// callers so they share a single read.
-func (c *gigahostCatalogCache) refresh(ctx context.Context, scope string, fetch catalogFetcher) (catalogRead, error) {
-	ch := c.group.DoChan(scope, func() (any, error) {
+// refresh performs one provider read for the scope, coalescing concurrent callers
+// that resolved the SAME client generation so they share a single read.
+//
+// The generation is part of the coalescing key on purpose. Two callers holding
+// different clients must never share a read: the flight's `fetch` closure belongs to
+// whichever client led it, so a joiner from another generation would be served an
+// answer fetched for a client it is not using. Because the replacement also bumps
+// the generation, a caller that arrives after `SetGigahostClient` starts its own
+// read instead of attaching to the superseded one.
+func (c *gigahostCatalogCache) refresh(ctx context.Context, scope string, generation uint64, fetch catalogFetcher) (catalogRead, error) {
+	ch := c.group.DoChan(refreshKey(scope, generation), func() (any, error) {
 		// A caller that queued behind the slot holder may already have been
-		// overtaken by it, so the cache is re-checked inside the slot.
+		// overtaken by it, so the cache is re-checked inside the slot. The retained
+		// entry is read ONCE: a second read could observe an entry a concurrent
+		// client replacement has since cleared, and would then publish a nil answer.
 		if now := c.now(); c.peek(scope, now).fresh(now) {
-			return c.serveRetained(scope, now), nil
+			return c.recordRetained(scope, generation, now), nil
 		}
 		// The leader's request may be abandoned while peers wait on it: the
 		// shared read is detached from that one caller and bounded on its own.
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gigahostCatalogFetchTimeout)
 		defer cancel()
 		snapshot, fetchErr := fetch(fetchCtx)
-		return c.record(scope, snapshot, fetchErr, c.now()), nil
+		return c.record(scope, generation, snapshot, fetchErr, c.now()), nil
 	})
 
 	// A caller whose own request was canceled stops waiting; the shared read
@@ -249,14 +306,33 @@ func (c *gigahostCatalogCache) refresh(ctx context.Context, scope string, fetch 
 		if outcome.err != nil {
 			return catalogRead{}, outcome.err
 		}
+		if outcome.snapshot == nil {
+			// Defensive: an outcome without an answer is not servable.
+			return catalogRead{}, errCatalogSnapshotMissing
+		}
 		return newCatalogRead(outcome.snapshot, outcome.stale, c.now()), nil
 	}
 }
 
-// serveRetained describes the currently retained snapshot as fresh. Caller has
-// already observed it as fresh.
-func (c *gigahostCatalogCache) serveRetained(scope string, now time.Time) *catalogRefreshOutcome {
-	return &catalogRefreshOutcome{snapshot: c.peek(scope, now).snapshot}
+// refreshKey is the coalescing identity of one refresh: the account scope plus the
+// client generation that is asking.
+func refreshKey(scope string, generation uint64) string {
+	return scope + "\x00" + strconv.FormatUint(generation, 10)
+}
+
+// recordRetained answers from the entry observed to be fresh inside the refresh
+// slot.
+//
+// The snapshot is read exactly once by the caller. If a concurrent client
+// replacement cleared it in the meantime, this reports the missing snapshot as a
+// failure rather than handing back a nil pointer, so a request never dereferences
+// an empty answer.
+func (c *gigahostCatalogCache) recordRetained(scope string, generation uint64, now time.Time) *catalogRefreshOutcome {
+	snapshot := c.peek(scope, now).snapshot
+	if snapshot == nil {
+		return &catalogRefreshOutcome{err: errCatalogSnapshotMissing}
+	}
+	return &catalogRefreshOutcome{snapshot: snapshot}
 }
 
 // record stores one refresh outcome and decides what that refresh serves.
@@ -265,41 +341,60 @@ func (c *gigahostCatalogCache) serveRetained(scope string, now time.Time) *catal
 // failure arms the backoff and the previous snapshot is served as stale. With no
 // snapshot to fall back on, the provider error is returned so the handler keeps
 // its existing status mapping.
-func (c *gigahostCatalogCache) record(scope string, snapshot *catalogSnapshot, fetchErr error, now time.Time) *catalogRefreshOutcome {
+//
+// The generation fences the write. A refresh that was superseded while it was in
+// flight still answers its own caller, but it cannot publish a snapshot over a
+// newer generation's, and it cannot arm a backoff on top of one either.
+func (c *gigahostCatalogCache) record(scope string, generation uint64, snapshot *catalogSnapshot, fetchErr error, now time.Time) *catalogRefreshOutcome {
 	if fetchErr == nil && snapshot != nil {
-		c.publish(scope, snapshot, now)
+		c.publish(scope, generation, snapshot, now)
 		return &catalogRefreshOutcome{snapshot: snapshot}
 	}
 	failure := fetchErr
 	if failure == nil {
 		failure = errCatalogSnapshotMissing
 	}
-	if retained := c.fail(scope, failure, now); retained != nil {
+	if retained := c.fail(scope, generation, failure, now); retained != nil {
 		return &catalogRefreshOutcome{snapshot: retained, stale: true}
 	}
 	return &catalogRefreshOutcome{err: failure}
 }
 
 // publish stores a complete snapshot, replacing any retained answer.
-func (c *gigahostCatalogCache) publish(scope string, snapshot *catalogSnapshot, now time.Time) {
-	snapshot.capturedAt = now
+//
+// A snapshot from an older generation is dropped rather than written: the client
+// that fetched it has already been replaced, and its answer must not become the
+// replacement's catalog. Caller keeps its own copy either way, so this only fences
+// the retained state.
+func (c *gigahostCatalogCache) publish(scope string, generation uint64, snapshot *catalogSnapshot, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if existing, present := c.entries[scope]; present && existing.generation > generation {
+		return
+	}
+	snapshot.capturedAt = now
 	if _, present := c.entries[scope]; !present {
 		c.evictLocked()
 	}
-	c.entries[scope] = &gigahostCatalogEntry{snapshot: snapshot, lastUsed: now}
+	c.entries[scope] = &gigahostCatalogEntry{snapshot: snapshot, generation: generation, lastUsed: now}
 }
 
 // fail records a failed refresh and returns the snapshot that remains servable.
-func (c *gigahostCatalogCache) fail(scope string, failure error, now time.Time) *catalogSnapshot {
+//
+// A failure from an older generation is not recorded: it describes a client that has
+// already been replaced, and arming its backoff would suppress the replacement's own
+// first read.
+func (c *gigahostCatalogCache) fail(scope string, generation uint64, failure error, now time.Time) *catalogSnapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, present := c.entries[scope]
 	if !present {
 		c.evictLocked()
-		entry = &gigahostCatalogEntry{}
+		entry = &gigahostCatalogEntry{generation: generation}
 		c.entries[scope] = entry
+	}
+	if entry.generation > generation {
+		return nil
 	}
 	entry.failedAt = now
 	entry.lastErr = failure

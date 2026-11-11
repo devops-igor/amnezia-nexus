@@ -116,6 +116,13 @@ type Handlers struct {
 	// GigahostCatalogHandler - never by the purchase path.
 	catalogCacheOnce  sync.Once
 	catalogCacheState *gigahostCatalogCache
+	// catalogGen identifies the current provider-client generation. It is advanced
+	// by every client replacement so an in-flight refresh belonging to a superseded
+	// client can neither be joined by the replacement nor publish over it.
+	// catalogGenMu guards the counter; the cache pointer itself is only ever reached
+	// through catalogCache().
+	catalogGenMu sync.Mutex
+	catalogGen   uint64
 }
 
 // lockUser serializes credential admission and user disabling; the lock is shared

@@ -42,7 +42,9 @@ func (p OrderServerPayload) validate() error {
 // SetGigahostClient allows injecting or replacing the Gigahost API client.
 //
 // A replaced client is a different provider account identity for this handler, so
-// every retained display snapshot is dropped with it.
+// every retained display snapshot is dropped with it. The generation is advanced
+// under the same accessor: an in-flight refresh that belongs to the previous client
+// can then neither be joined by the replacement nor publish over it.
 func (h *Handlers) SetGigahostClient(c gigahost.Client) {
 	h.gigahostMu.Lock()
 	if c != nil {
@@ -51,9 +53,7 @@ func (h *Handlers) SetGigahostClient(c gigahost.Client) {
 		h.gigahostClient = nil
 	}
 	h.gigahostMu.Unlock()
-	if h.catalogCacheState != nil {
-		h.catalogCache().invalidateAll()
-	}
+	h.bumpCatalogGeneration()
 }
 
 // gigahostClientResolution is a resolved provider client plus the account
