@@ -128,6 +128,8 @@ func runProcessHelperMode(mode string) int {
 		return runInstallOwnershipMode(ctx, mode, dbPath, secret, journal)
 	case procAutomaticTrack, procAutomaticInstall, procAutomaticTrackAndInstall:
 		return runAutomaticMode(ctx, mode)
+	case procProviderRecoveryTrack:
+		return runProviderRecoveryMode(ctx, mode)
 	default:
 		fmt.Fprintf(os.Stderr, "process helper: unknown mode %q\n", mode)
 		return 4
