@@ -355,6 +355,10 @@
                 </div>
                 <p class="form-hint" style="margin-bottom: var(--space-md);">{{ _ "deploy_vps_desc" }}</p>
 
+                <!-- Shown when the displayed catalog is a retained snapshot whose
+                     refresh failed, so it never looks current when it is not. -->
+                <div id="deployCatalogStale" role="status" style="display:none; padding: var(--space-sm) var(--space-md); border-radius: var(--radius-sm); background: rgba(245, 158, 11, 0.12); border: 1px solid var(--warning, #f59e0b); color: var(--text-primary); font-size: 0.85rem; margin-bottom: var(--space-md);"></div>
+
                 <div id="deployCatalogLoading" style="display:none; text-align:center; padding:var(--space-md);">
                     <div class="spinner" style="width:20px; height:20px; margin:0 auto;"></div>
                 </div>
@@ -411,6 +415,7 @@
     </button>
 </div>
 
+<script src="/static/js/gigahost_catalog_status.js"></script>
 <script src="/static/js/gigahost_setup.js"></script>
 <script src="/static/js/gigahost_setup_intents.js"></script>
 <script src="/static/js/gigahost_order_status_model.js"></script>
@@ -680,6 +685,7 @@
         if (loading) loading.style.display = 'block';
         try {
             const res = await API.get('/api/admin/hosting/gigahost/catalog');
+            renderDeployCatalogStale(res);
             cachedPlans = (res && res.plans) ? res.plans : [];
             if (cachedPlans.length === 0) {
                 appendDeployOption(deployPlanSelect, _('deploy_vps_no_plans'));
@@ -698,6 +704,7 @@
             });
             updateDeploySelections(null);
         } catch (err) {
+            renderDeployCatalogStale(null);
             cachedPlans = [];
             const message = _('deploy_vps_catalog_unavailable');
             appendDeployOption(deployPlanSelect, message);

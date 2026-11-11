@@ -734,6 +734,7 @@
   "deploy_vps_no_region_stock": "Aucune région n'a de stock pour cette offre",
   "deploy_vps_no_os": "Aucun système d'exploitation installable sur cette offre",
   "deploy_vps_catalog_unavailable": "Catalogue du fournisseur indisponible",
+  "deploy_vps_catalog_stale": "Affichage d'un catalogue en cache datant de {age}. Les prix et la disponibilité peuvent être obsolètes.",
   "deploy_vps_select_required": "Sélectionnez d'abord une région et un système d'exploitation",
   "deploy_vps_order_placed": "Commande VPS passée avec succès",
   "setup_intents_title": "Approbations de configuration enregistrées",
