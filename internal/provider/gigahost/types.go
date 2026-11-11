@@ -46,7 +46,7 @@ var (
 	ErrRateLimited          = errors.New("gigahost api rate limit exceeded (429)")
 	ErrUnauthorized         = errors.New("gigahost api authentication failed (401/403)")
 	ErrNotFound             = errors.New("gigahost resource not found (404)")
-	ErrInvalidOrderParam    = errors.New("invalid order parameter: pid, price_id, region_id, os_id must be positive")
+	ErrInvalidOrderParam    = errors.New("invalid order parameter: pid, price_id, os_id must be positive and one of region_id or dc_id must be positive")
 	ErrOSNotAvailable       = errors.New("operating system is not available")
 )
 
@@ -301,13 +301,26 @@ type HourlyPlan struct {
 
 // Datacenter is a placement location the plan documents, with its own stock
 // fact. Only datacenters referenced by the plan's dc_ids are listed.
+//
+// InStock is a pointer for the same reason Region.InStock is: the provider
+// documents dc_stock as a per-datacenter map, so a datacenter the catalog did
+// not report is UNKNOWN, which is not "sold out". Only an explicit true can
+// authorize pinning a purchase to one datacenter.
 type Datacenter struct {
 	ID       int    `json:"id"`
 	Name     string `json:"name"`
 	RegionID int    `json:"region_id"`
 	Location string `json:"location,omitempty"`
 	Country  string `json:"country,omitempty"`
-	InStock  bool   `json:"in_stock"`
+	InStock  *bool  `json:"in_stock"`
+}
+
+// Stocked reports whether the provider catalog explicitly reports stock in this
+// datacenter. Unknown is deliberately not stocked: an absent dc_stock fact never
+// authorizes an explicit placement, because the provider offers no promise that
+// an unreported datacenter still has capacity.
+func (d Datacenter) Stocked() bool {
+	return d.InStock != nil && *d.InStock
 }
 
 // CatalogEligibility represents account deployment eligibility returned in the catalog.
@@ -371,10 +384,21 @@ func (a *AccountInfo) HasCredit() bool {
 }
 
 // OrderRequest represents the payload for ordering a VPS.
+//
+// Placement is either provider-chosen inside a region (RegionID only, the
+// documented "let us place the server in any datacenter in that region" shape)
+// or pinned to one datacenter (DCID only). The provider documents that region_id
+// "is then taken from the datacenter and can be left out" when dc_id is given, so
+// the pinned shape omits RegionID from the wire: sending both risks a
+// combination the documentation does not define.
 type OrderRequest struct {
-	PID           int    `json:"pid"`
-	PriceID       int    `json:"price_id"`
-	RegionID      int    `json:"region_id"`
+	PID      int `json:"pid"`
+	PriceID  int `json:"price_id"`
+	RegionID int `json:"region_id,omitempty"`
+	// DCID pins the purchase to one datacenter from the catalog's datacenters.
+	// Omitted entirely for provider-chosen placement, so a region-only order
+	// serializes exactly as it did before this field existed.
+	DCID          int    `json:"dc_id,omitempty"`
 	OSID          int    `json:"os_id"`
 	BillingPeriod string `json:"billing_period"`
 	Quantity      int    `json:"quantity"`

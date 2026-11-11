@@ -343,11 +343,23 @@ func buildTierProduct(p tierProductDTO, regionMap map[int]Region, dcMap map[int]
 // placementFor returns the product's own datacenters with the provider's stock
 // fact for each. dcStockKnown reports whether the catalog carried dc_stock at
 // all, so an absent fact is never read as "sold out".
+//
+// Two documented shapes are dropped rather than published:
+//
+//   - a dc_ids entry that is not a positive integer yields no usable identity, so
+//     it lists nothing (an id of 0 would be indistinguishable from "unset");
+//   - a dc_ids entry with no datacenter record keeps its id and no name, region
+//     or stock. Its region relationship is unproven, so the handler can never
+//     place a server there; it stays listed so a reader sees the provider
+//     mentioned it, but it is never selectable.
 func placementFor(p tierProductDTO, dcMap map[int]dcPlacement) ([]Datacenter, bool) {
 	dcStockKnown := len(p.DCStock) > 0
 	var datacenters []Datacenter
 	for _, dcAny := range p.DCIDs {
 		id := int(parseInt64Field(dcAny))
+		if id <= 0 {
+			continue
+		}
 		dc := Datacenter{ID: id}
 		if known, ok := dcMap[id]; ok {
 			dc.Name = known.Name
@@ -356,7 +368,7 @@ func placementFor(p tierProductDTO, dcMap map[int]dcPlacement) ([]Datacenter, bo
 			dc.Country = known.Country
 		}
 		if inStock, ok := dcStockValue(p.DCStock, id); ok {
-			dc.InStock = inStock
+			dc.InStock = &inStock
 		}
 		datacenters = append(datacenters, dc)
 	}
@@ -396,25 +408,33 @@ func regionsFor(p tierProductDTO, regionMap map[int]Region, datacenters []Datace
 }
 
 // regionStock summarizes the product's datacenter stock inside one region: true
-// when any of its datacenters in that region reports stock, false when they all
-// report none, and unknown (nil) when the catalog carried no stock fact or no
-// documented datacenter maps to the region.
+// when any of its datacenters in that region reports stock, false only when every
+// datacenter that maps to the region reports no stock, and unknown (nil)
+// otherwise.
+//
+// "Otherwise" covers two distinct cases that must not collapse into "sold out":
+// the catalog carried no stock fact at all, and a region where some datacenters
+// report no stock while others report nothing (an absent entry is not a
+// sold-out entry).
 func regionStock(regionID int, datacenters []Datacenter, dcStockKnown bool) *bool {
 	if !dcStockKnown {
 		return nil
 	}
-	matched := false
+	matched, unknown := false, false
 	for _, dc := range datacenters {
 		if dc.RegionID != regionID {
 			continue
 		}
 		matched = true
-		if dc.InStock {
+		if dc.Stocked() {
 			inStock := true
 			return &inStock
 		}
+		if dc.InStock == nil {
+			unknown = true
+		}
 	}
-	if !matched {
+	if !matched || unknown {
 		return nil
 	}
 	inStock := false

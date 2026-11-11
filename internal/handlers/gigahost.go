@@ -21,10 +21,13 @@ import (
 type GigahostOrderRecord = models.GigahostOrder
 
 // OrderServerPayload defines the incoming payload for manual hourly VPS orders.
+// RegionID is the region the operator saw and the key the duplicate guard uses;
+// DCID optionally pins one datacenter inside it (see gigahost_placement.go).
 type OrderServerPayload struct {
 	PID            int     `json:"pid"`
 	PriceID        int     `json:"price_id"`
 	RegionID       int     `json:"region_id"`
+	DCID           int     `json:"dc_id,omitempty"`
 	OSID           int     `json:"os_id"`
 	HourlyPriceNOK float64 `json:"hourly_price_nok"`
 }
@@ -614,6 +617,7 @@ func (h *Handlers) dispatchOrderPurchase(
 		PID:           req.PID,
 		PriceID:       req.PriceID,
 		RegionID:      req.RegionID,
+		DCID:          req.DCID,
 		OSID:          req.OSID,
 		BillingPeriod: gigahost.BillingPeriodHourly,
 		Quantity:      1,
@@ -686,6 +690,11 @@ func validateOrderAgainstCatalog(catalog []gigahost.HourlyPlan, req OrderServerP
 		return fmt.Errorf("invalid_plan: plan %d has zero or negative price in provider catalog", req.PID)
 	}
 
+	// Placement before the region summary: for a pinned request the
+	// datacenter-specific reason is the accurate one.
+	if err := validatePlanPlacement(matchedPlan, req); err != nil {
+		return err
+	}
 	if err := validatePlanRegion(matchedPlan, req); err != nil {
 		return err
 	}

@@ -137,11 +137,11 @@ func TestGetCatalog_ParsesDocumentedPlacementAndStock(t *testing.T) {
 	if len(plan.Datacenters) != 2 {
 		t.Fatalf("datacenters = %d, want the two documented dc_ids", len(plan.Datacenters))
 	}
-	if plan.Datacenters[0].Name != "DC1" || !plan.Datacenters[0].InStock {
-		t.Errorf("dc1 = %+v, want DC1 in stock", plan.Datacenters[0])
+	if plan.Datacenters[0].Name != "DC1" || !plan.Datacenters[0].Stocked() || plan.Datacenters[0].InStock == nil {
+		t.Errorf("dc1 = %+v, want DC1 explicitly in stock", plan.Datacenters[0])
 	}
-	if plan.Datacenters[1].Name != "DC2" || plan.Datacenters[1].InStock {
-		t.Errorf("dc2 = %+v, want DC2 out of stock", plan.Datacenters[1])
+	if plan.Datacenters[1].Name != "DC2" || plan.Datacenters[1].Stocked() || plan.Datacenters[1].InStock == nil {
+		t.Errorf("dc2 = %+v, want DC2 explicitly out of stock", plan.Datacenters[1])
 	}
 }
 
