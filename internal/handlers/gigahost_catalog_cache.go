@@ -1,0 +1,344 @@
+package handlers
+
+// Server-side catalog cache for the Gigahost ordering page.
+//
+// The ordering page used to re-read the whole provider catalog (products plus
+// one image read per distribution) on every load. This cache keeps one complete
+// answer per provider account for a bounded freshness window.
+//
+// Four properties are load-bearing and each has an explicit control here:
+//
+//  1. SCOPE. An answer belongs to exactly one provider account. The map key is a
+//     digest of the resolved credential, never the credential itself; the digest
+//     is an in-process map key only and is never written to a response, a log
+//     record, the database or an artifact. One account's snapshot therefore
+//     cannot be served to another, and the key cannot be replayed.
+//
+//  2. COMPLETENESS. A snapshot is the plan list AND the image catalog they were
+//     narrowed against, captured together. A refresh that fails half way
+//     publishes nothing, so a partial or malformed answer never replaces a
+//     complete one.
+//
+//  3. FRESHNESS. Fresh snapshots are served without any provider read. Expired
+//     ones are refreshed; concurrent refreshes of the same scope are coalesced
+//     into one provider read. A failed refresh keeps the previous complete
+//     snapshot and serves it as explicitly stale, and the failure arms a short
+//     backoff so an unavailable provider is not re-asked on every page load.
+//
+//  4. AUTHORITY. Nothing here authorizes a purchase. This cache is read only by
+//     GigahostCatalogHandler, the display endpoint. The order path keeps reading
+//     the live provider catalog and revalidating price, stock, placement and
+//     operating system before it sends a paid request.
+//
+// FRESHNESS POLICY (the documented contract for this cache):
+//
+//	fresh window     60s   a snapshot inside this window is served with no
+//	                       provider read; the window is short because display
+//	                       cannot detect a change the provider made
+//	failure backoff  15s   after a failed refresh the provider is not asked
+//	                       again for that scope, so an outage cannot turn every
+//	                       page load into a provider call
+//	refresh timeout  30s   matches the provider client's request timeout, so a
+//	                       stalled read cannot hold the refresh slot open
+//	retained scopes   64   one per provider account; the least recently used is
+//	                       evicted at the bound
+//
+// Freshness is reported to the caller rather than assumed: the response carries
+// state ("fresh"|"stale"), stale, fetched_at, age_seconds and ttl_seconds, so the
+// portal can say why a snapshot is old instead of implying it is current.
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/singleflight"
+
+	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
+)
+
+const (
+	// gigahostCatalogTTL is how long one complete provider answer is served
+	// without a new provider read. Short on purpose: the snapshot carries prices
+	// and stock that an operator reads as current, and the purchase path - not
+	// this window - is what actually guards a purchase.
+	gigahostCatalogTTL = 60 * time.Second
+
+	// gigahostCatalogFailureBackoff is how long a failed refresh suppresses the
+	// next provider read for the same scope. It bounds provider calls while the
+	// provider is unavailable, including a provider that stalls.
+	gigahostCatalogFailureBackoff = 15 * time.Second
+
+	// gigahostCatalogFetchTimeout bounds one refresh. It matches the provider
+	// client's own request timeout, so a stalled read cannot hold the refresh
+	// slot open.
+	gigahostCatalogFetchTimeout = 30 * time.Second
+
+	// gigahostCatalogMaxScopes bounds the in-memory table. Each entry is one
+	// account's last answer, so the bound is per configured account, not per
+	// request.
+	gigahostCatalogMaxScopes = 64
+
+	// gigahostCatalogInjectedScope is the scope of an explicitly injected
+	// provider client. Such a client carries no credential of its own, so it is
+	// one provider account identity for this handler instance; replacing it
+	// invalidates the cache.
+	gigahostCatalogInjectedScope = "injected"
+)
+
+// errCatalogSnapshotMissing reports a refresh that reported neither a failure nor
+// an answer. It is a defensive value: the only production fetcher either returns
+// a complete snapshot or an error.
+var errCatalogSnapshotMissing = errors.New("gigahost catalog refresh produced no snapshot")
+
+// catalogSnapshot is one complete catalog answer.
+//
+// The slices are immutable once published: concurrent readers only encode them.
+type catalogSnapshot struct {
+	plans      []gigahost.HourlyPlan
+	images     []gigahost.OperatingSystem
+	capturedAt time.Time
+}
+
+// gigahostCatalogEntry is the retained state of one account scope.
+type gigahostCatalogEntry struct {
+	snapshot *catalogSnapshot
+	failedAt time.Time
+	lastErr  error
+	lastUsed time.Time
+}
+
+// catalogRead is one answer for the handler: the snapshot, whether it is being
+// served as stale, and the freshness policy it was measured against.
+type catalogRead struct {
+	snapshot *catalogSnapshot
+	stale    bool
+	age      time.Duration
+	ttl      time.Duration
+}
+
+// catalogFetcher performs one complete provider catalog read. Both halves must
+// succeed for the snapshot to be publishable.
+type catalogFetcher func(context.Context) (*catalogSnapshot, error)
+
+// catalogRefreshOutcome is what one coalesced refresh produced. The provider
+// failure is a value rather than the singleflight error so every caller that
+// joined the refresh observes the same answer, including a shared failure.
+type catalogRefreshOutcome struct {
+	snapshot *catalogSnapshot
+	stale    bool
+	err      error
+}
+
+// gigahostCatalogCache is the bounded per-account snapshot cache.
+//
+// mu guards the table only. No provider I/O and no other handler lock is ever
+// taken while it is held; a refresh runs outside it, coalesced by group.
+type gigahostCatalogCache struct {
+	mu      sync.Mutex
+	entries map[string]*gigahostCatalogEntry
+	group   singleflight.Group
+	now     func() time.Time
+}
+
+// newGigahostCatalogCache builds an empty cache on the wall clock.
+func newGigahostCatalogCache() *gigahostCatalogCache {
+	return &gigahostCatalogCache{
+		entries: make(map[string]*gigahostCatalogEntry),
+		now:     time.Now,
+	}
+}
+
+// catalogCache returns the lazily created catalog cache.
+func (h *Handlers) catalogCache() *gigahostCatalogCache {
+	h.catalogCacheOnce.Do(func() {
+		h.catalogCacheState = newGigahostCatalogCache()
+	})
+	return h.catalogCacheState
+}
+
+// catalogScopeKey is the cache scope of one provider account.
+//
+// An empty credential means an injected client, which has no account of its own.
+// Otherwise the scope is a domain-separated SHA-256 digest: one-way, stable for
+// the life of the process, and never exposed. This is not a password hash and is
+// never persisted - it exists to keep two accounts' answers apart in memory.
+func catalogScopeKey(credential string) string {
+	if credential == "" {
+		return gigahostCatalogInjectedScope
+	}
+	digest := sha256.Sum256([]byte("gigahost-catalog\x00" + credential))
+	return hex.EncodeToString(digest[:])
+}
+
+// fresh reports whether the entry can be served without a provider read.
+func (e gigahostCatalogEntry) fresh(now time.Time) bool {
+	return e.snapshot != nil && now.Sub(e.snapshot.capturedAt) < gigahostCatalogTTL
+}
+
+// blocked reports whether a failed refresh is recent enough that the provider
+// must not be asked again yet.
+func (e gigahostCatalogEntry) blocked(now time.Time) bool {
+	return !e.failedAt.IsZero() && now.Sub(e.failedAt) < gigahostCatalogFailureBackoff
+}
+
+// peek returns a copy of the scope's entry and records the access. Caller must
+// not hold the lock.
+func (c *gigahostCatalogCache) peek(scope string, now time.Time) gigahostCatalogEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, present := c.entries[scope]
+	if !present {
+		return gigahostCatalogEntry{}
+	}
+	entry.lastUsed = now
+	return *entry
+}
+
+// load answers one catalog request, reading the provider only when the retained
+// answer is from an earlier freshness window.
+func (c *gigahostCatalogCache) load(ctx context.Context, scope string, fetch catalogFetcher) (catalogRead, error) {
+	now := c.now()
+	entry := c.peek(scope, now)
+	if entry.fresh(now) {
+		return newCatalogRead(entry.snapshot, false, now), nil
+	}
+	// An expired snapshot whose refresh just failed is still the best complete
+	// answer available, and it is labeled stale rather than presented as fresh.
+	if entry.snapshot != nil && entry.blocked(now) {
+		return newCatalogRead(entry.snapshot, true, now), nil
+	}
+	// With no snapshot at all there is nothing to serve; the recorded failure is
+	// returned instead of re-asking the provider inside its backoff window.
+	if entry.snapshot == nil && entry.lastErr != nil && entry.blocked(now) {
+		return catalogRead{}, entry.lastErr
+	}
+	return c.refresh(ctx, scope, fetch)
+}
+
+// refresh performs one provider read for the scope, coalescing concurrent
+// callers so they share a single read.
+func (c *gigahostCatalogCache) refresh(ctx context.Context, scope string, fetch catalogFetcher) (catalogRead, error) {
+	ch := c.group.DoChan(scope, func() (any, error) {
+		// A caller that queued behind the slot holder may already have been
+		// overtaken by it, so the cache is re-checked inside the slot.
+		if now := c.now(); c.peek(scope, now).fresh(now) {
+			return c.serveRetained(scope, now), nil
+		}
+		// The leader's request may be abandoned while peers wait on it: the
+		// shared read is detached from that one caller and bounded on its own.
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gigahostCatalogFetchTimeout)
+		defer cancel()
+		snapshot, fetchErr := fetch(fetchCtx)
+		return c.record(scope, snapshot, fetchErr, c.now()), nil
+	})
+
+	// A caller whose own request was canceled stops waiting; the shared read
+	// still completes for the peers that remain.
+	select {
+	case <-ctx.Done():
+		return catalogRead{}, ctx.Err()
+	case result := <-ch:
+		outcome, ok := result.Val.(*catalogRefreshOutcome)
+		if !ok {
+			return catalogRead{}, errCatalogSnapshotMissing
+		}
+		if outcome.err != nil {
+			return catalogRead{}, outcome.err
+		}
+		return newCatalogRead(outcome.snapshot, outcome.stale, c.now()), nil
+	}
+}
+
+// serveRetained describes the currently retained snapshot as fresh. Caller has
+// already observed it as fresh.
+func (c *gigahostCatalogCache) serveRetained(scope string, now time.Time) *catalogRefreshOutcome {
+	return &catalogRefreshOutcome{snapshot: c.peek(scope, now).snapshot}
+}
+
+// record stores one refresh outcome and decides what that refresh serves.
+//
+// A failed, partial or malformed refresh never displaces a complete snapshot: the
+// failure arms the backoff and the previous snapshot is served as stale. With no
+// snapshot to fall back on, the provider error is returned so the handler keeps
+// its existing status mapping.
+func (c *gigahostCatalogCache) record(scope string, snapshot *catalogSnapshot, fetchErr error, now time.Time) *catalogRefreshOutcome {
+	if fetchErr == nil && snapshot != nil {
+		c.publish(scope, snapshot, now)
+		return &catalogRefreshOutcome{snapshot: snapshot}
+	}
+	failure := fetchErr
+	if failure == nil {
+		failure = errCatalogSnapshotMissing
+	}
+	if retained := c.fail(scope, failure, now); retained != nil {
+		return &catalogRefreshOutcome{snapshot: retained, stale: true}
+	}
+	return &catalogRefreshOutcome{err: failure}
+}
+
+// publish stores a complete snapshot, replacing any retained answer.
+func (c *gigahostCatalogCache) publish(scope string, snapshot *catalogSnapshot, now time.Time) {
+	snapshot.capturedAt = now
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, present := c.entries[scope]; !present {
+		c.evictLocked()
+	}
+	c.entries[scope] = &gigahostCatalogEntry{snapshot: snapshot, lastUsed: now}
+}
+
+// fail records a failed refresh and returns the snapshot that remains servable.
+func (c *gigahostCatalogCache) fail(scope string, failure error, now time.Time) *catalogSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, present := c.entries[scope]
+	if !present {
+		c.evictLocked()
+		entry = &gigahostCatalogEntry{}
+		c.entries[scope] = entry
+	}
+	entry.failedAt = now
+	entry.lastErr = failure
+	entry.lastUsed = now
+	return entry.snapshot
+}
+
+// evictLocked keeps the table bounded by dropping the least recently used scope.
+// Caller holds the lock.
+func (c *gigahostCatalogCache) evictLocked() {
+	if len(c.entries) < gigahostCatalogMaxScopes {
+		return
+	}
+	var oldestKey string
+	var oldest time.Time
+	for key, entry := range c.entries {
+		if oldestKey == "" || entry.lastUsed.Before(oldest) {
+			oldestKey, oldest = key, entry.lastUsed
+		}
+	}
+	delete(c.entries, oldestKey)
+}
+
+// invalidateAll drops every retained answer.
+//
+// A replaced provider client is a different account identity for this handler, so
+// no earlier answer may outlive it.
+func (c *gigahostCatalogCache) invalidateAll() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	clear(c.entries)
+}
+
+// newCatalogRead describes one answer against the freshness policy.
+func newCatalogRead(snapshot *catalogSnapshot, stale bool, now time.Time) catalogRead {
+	return catalogRead{
+		snapshot: snapshot,
+		stale:    stale,
+		age:      now.Sub(snapshot.capturedAt),
+		ttl:      gigahostCatalogTTL,
+	}
+}

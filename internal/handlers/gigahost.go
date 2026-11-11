@@ -40,24 +40,52 @@ func (p OrderServerPayload) validate() error {
 }
 
 // SetGigahostClient allows injecting or replacing the Gigahost API client.
+//
+// A replaced client is a different provider account identity for this handler, so
+// every retained display snapshot is dropped with it.
 func (h *Handlers) SetGigahostClient(c gigahost.Client) {
 	h.gigahostMu.Lock()
-	defer h.gigahostMu.Unlock()
 	if c != nil {
 		h.gigahostClient = &providerCatalogClient{Client: c}
 	} else {
 		h.gigahostClient = nil
 	}
+	h.gigahostMu.Unlock()
+	if h.catalogCacheState != nil {
+		h.catalogCache().invalidateAll()
+	}
+}
+
+// gigahostClientResolution is a resolved provider client plus the account
+// identity it acts for.
+//
+// credential is the provider API key the client was built from, and it is empty
+// for an explicitly injected client. It is carried out of resolution because the
+// display cache is scoped per account; nothing that receives it may log, return,
+// store or otherwise expose it.
+type gigahostClientResolution struct {
+	client     gigahost.Client
+	credential string
 }
 
 // getGigahostClient resolves the client from the injected instance, request header,
 // environment variable, or settings database.
 func (h *Handlers) getGigahostClient(ctx context.Context, r *http.Request) (gigahost.Client, error) {
+	resolved, err := h.resolveGigahostClient(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	return resolved.client, nil
+}
+
+// resolveGigahostClient resolves the provider client together with the account
+// identity it acts for. See gigahostClientResolution.
+func (h *Handlers) resolveGigahostClient(ctx context.Context, r *http.Request) (gigahostClientResolution, error) {
 	h.gigahostMu.RLock()
 	client := h.gigahostClient
 	h.gigahostMu.RUnlock()
 	if client != nil {
-		return client, nil
+		return gigahostClientResolution{client: client}, nil
 	}
 
 	var apiKey string
@@ -76,7 +104,7 @@ func (h *Handlers) getGigahostClient(ctx context.Context, r *http.Request) (giga
 	}
 
 	if apiKey == "" {
-		return nil, errors.New("gigahost api key not configured: set GIGAHOST_API_KEY, gigahost setting, or X-Gigahost-API-Key header")
+		return gigahostClientResolution{}, errors.New("gigahost api key not configured: set GIGAHOST_API_KEY, gigahost setting, or X-Gigahost-API-Key header")
 	}
 
 	// Build the client with one fixed-key timing record per provider call. The
@@ -90,10 +118,14 @@ func (h *Handlers) getGigahostClient(ctx context.Context, r *http.Request) (giga
 		}
 	}
 
-	return gigahost.NewClient(gigahost.Config{
+	built, err := gigahost.NewClient(gigahost.Config{
 		APIKey: apiKey,
 		OnCall: onCall,
 	})
+	if err != nil {
+		return gigahostClientResolution{}, err
+	}
+	return gigahostClientResolution{client: built, credential: apiKey}, nil
 }
 
 // timingEnabled reports whether provider call timing is switched on.
@@ -140,44 +172,6 @@ func (h *Handlers) getGigahostOrders(ctx context.Context) ([]GigahostOrderRecord
 		return []GigahostOrderRecord{}, nil
 	}
 	return h.db.ListGigahostOrders(ctx)
-}
-
-// GigahostCatalogHandler handles GET /api/admin/hosting/gigahost/catalog.
-// Retrieves available hourly VPS plans with the provider's documented region,
-// datacenter and operating-system choices, plus hourly price and currency.
-func (h *Handlers) GigahostCatalogHandler(w http.ResponseWriter, r *http.Request) {
-	sess := middleware.GetSession(r.Context())
-	if sess == nil || sess.Role != models.RoleAdmin {
-		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required")
-		return
-	}
-
-	client, err := h.getGigahostClient(r.Context(), r)
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "unconfigured", err.Error())
-		return
-	}
-
-	plans, images, err := h.loadSelectablePlans(r.Context(), client)
-	if err != nil {
-		if errors.Is(err, gigahost.ErrUnauthorized) {
-			h.JSONError(w, http.StatusBadGateway, "upstream_auth_failed", "Gigahost API authentication failed")
-			return
-		}
-		if errors.Is(err, gigahost.ErrRateLimited) {
-			h.JSONError(w, http.StatusTooManyRequests, "rate_limited", "Gigahost API rate limit exceeded")
-			return
-		}
-		h.JSONError(w, http.StatusBadGateway, "upstream_error", err.Error())
-		return
-	}
-
-	h.JSONOK(w, map[string]any{
-		"plans":            plans,
-		"count":            len(plans),
-		"operating_system": images,
-		"os_count":         len(images),
-	})
 }
 
 // loadSelectablePlans reads the provider catalog and its documented image
@@ -661,8 +655,8 @@ func catalogPlanFor(catalog []gigahost.HourlyPlan, req OrderServerPayload) *giga
 	return nil
 }
 
-//nolint:misspell // "cancelled" matches documented provider status and test assertions
-const statusCancelled = "cancelled"
+//nolint:misspell // "canceled" matches documented provider status and test assertions
+const statusCancelled = "canceled"
 
 func validateOrderAgainstCatalog(catalog []gigahost.HourlyPlan, req OrderServerPayload) error {
 	if len(catalog) == 0 {
