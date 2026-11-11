@@ -28,6 +28,9 @@ let gigahostOrderStatusLastSuccessAt = '';
 let gigahostOrderStatusLifecycleBound = false;
 let gigahostOrderStatusDetailsCounter = 0;
 let gigahostOrderStatusBackendIndex = null;
+// gigahostOrderStatusCurrentRead is the one read allowed to commit: {token, controller, retired}.
+let gigahostOrderStatusCurrentRead = null;
+let gigahostOrderStatusReadSequence = 0;
 
 /* gigahostOrderStatusBadgeClass maps a stage to the existing badge vocabulary. */
 function gigahostOrderStatusBadgeClass(stage) {
@@ -295,50 +298,95 @@ function scheduleGigahostOrderStatusRefresh() {
     gigahostOrderStatusRefreshTimer = setTimeout(runGigahostOrderStatusRefresh, GIGAHOST_ORDER_STATUS_REFRESH_MS);
 }
 
-/* runGigahostOrderStatusRefresh runs one scheduled refresh. The next one is armed
- * only after this one settles, so two refreshes cannot overlap however slow a
- * request is, and at most one timer is ever pending.
+/* loadRecentOrders is the one entry point for a status read at every call site: the
+ * initial page read, the manual Refresh control, the post-purchase read and the
+ * post-setup read all call it, and the timer runs it too.
  *
- * The generation token is what makes a restart safe: a refresh left over from a
- * stopped view resolves into a view that has moved on, and it must neither clear
- * the new view's in-flight flag nor re-arm its own timer. */
+ * One read is authoritative at a time. A caller arriving while a read is outstanding
+ * supersedes it: the older read is retired and its request aborted, so it can neither
+ * keep running as a full status read nor write anything when it resolves. That is what
+ * makes a slow response unable to overwrite a newer answer, which is the defect this
+ * boundary exists to remove.
+ *
+ * The timer does not supersede: a tick that arrives while a read is outstanding skips
+ * and re-arms, so polling can never cut a user-initiated read short.
+ *
+ * Nothing here writes to the panel: no order is placed, no setup is started and no
+ * approval is touched. */
+async function loadRecentOrders(options) {
+    const container = document.getElementById('recentOrdersContainer');
+    if (!container) return;
+    await gigahostOrderStatusRead(container, options);
+}
+
+/* runGigahostOrderStatusRefresh runs one scheduled refresh. A tick that finds a read
+ * already outstanding skips rather than superseding it, and the next tick is armed
+ * only after this one settles, so scheduled polling never overlaps and never abandons
+ * a read an operator asked for.
+ *
+ * The generation token retires a refresh belonging to a stopped view: it must neither
+ * clear the new view's in-flight flag nor re-arm its own timer. */
 async function runGigahostOrderStatusRefresh() {
     gigahostOrderStatusRefreshTimer = null;
-    const task = gigahostOrderStatusRefreshTask;
     const generation = gigahostOrderStatusRefreshGeneration;
-    if (!task || gigahostOrderStatusRefreshInFlight) return;
+    const task = gigahostOrderStatusRefreshTask;
+    if (!task) return;
+    if (gigahostOrderStatusCurrentRead) {
+        // Skipped, not superseded: the outstanding read keeps its ownership.
+        scheduleGigahostOrderStatusRefresh();
+        return;
+    }
     gigahostOrderStatusRefreshInFlight = true;
     try {
-        await task();
+        // The registered task is the scheduled read; it is told not to supersede, because
+        // polling must never cut a user-initiated read short.
+        await task({supersede: false});
     } catch (_) {
         // The task reports its own failure through gigahostOrderStatusLoadFailed.
     } finally {
-        if (generation === gigahostOrderStatusRefreshGeneration) {
+        if (generation === gigahostOrderStatusRefreshGeneration && gigahostOrderStatusRefreshTask === task) {
             gigahostOrderStatusRefreshInFlight = false;
+        }
+        if (generation === gigahostOrderStatusRefreshGeneration) {
             scheduleGigahostOrderStatusRefresh();
         }
     }
 }
 
-/* startGigahostOrderStatusRefresh arms the view's one refresh timer. Starting
- * again replaces the timer instead of adding a second one, so a second call site
- * cannot create duplicate polling. */
+/* startGigahostOrderStatusRefresh arms the view's one refresh timer. Starting again
+ * replaces the timer instead of adding a second one, so a second call site cannot create
+ * duplicate polling.
+ *
+ * Two different owners live here and they are retired by different things:
+ *
+ *   - the *scheduled run* (this timer's own work, tracked by the in-flight flag). Re-arming
+ *     retires it: the run belongs to the schedule that is being replaced, and its finally
+ *     must not re-arm a timer behind the new one. This is why a restart always gets its own
+ *     first tick.
+ *   - the *loader's read* (gigahostOrderStatusCurrentRead). Re-arming leaves it alone,
+ *     because the manual Refresh control calls the loader and then restarts the timer in
+ *     the same handler; that read must keep ownership and commit its answer. Only stop()
+ *     and page teardown retire a read. */
 function startGigahostOrderStatusRefresh(task) {
     if (typeof task !== 'function') return false;
-    stopGigahostOrderStatusRefresh();
+    gigahostOrderStatusRefreshGeneration += 1;
+    if (gigahostOrderStatusRefreshTimer !== null) {
+        clearTimeout(gigahostOrderStatusRefreshTimer);
+        gigahostOrderStatusRefreshTimer = null;
+    }
     gigahostOrderStatusRefreshTask = task;
+    gigahostOrderStatusRefreshInFlight = false;
     bindGigahostOrderStatusLifecycle();
     scheduleGigahostOrderStatusRefresh();
     return true;
 }
 
-/* stopGigahostOrderStatusRefresh clears the timer and forgets the task. A request
- * already in flight cannot be cancelled from here, but it will not re-arm a timer:
- * the generation it holds is retired, and the task it would reschedule is gone.
+/* stopGigahostOrderStatusRefresh clears the timer and forgets the task, and retires any
+ * read still outstanding so it cannot commit into a view that no longer exists.
  *
- * The in-flight flag is retired with it, so a view stopped and started again gets
- * its first refresh on schedule instead of having that tick swallowed by a request
- * nobody is waiting for any more. */
+ * The generation it holds is retired, so the read will not re-arm a timer either. The
+ * in-flight flag is retired with it, so a view stopped and started again gets its first
+ * refresh on schedule instead of having that tick swallowed by a read nobody waits for. */
 function stopGigahostOrderStatusRefresh() {
     gigahostOrderStatusRefreshGeneration += 1;
     if (gigahostOrderStatusRefreshTimer !== null) {
@@ -347,6 +395,7 @@ function stopGigahostOrderStatusRefresh() {
     }
     gigahostOrderStatusRefreshTask = null;
     gigahostOrderStatusRefreshInFlight = false;
+    gigahostOrderStatusRetireCurrentRead();
     unbindGigahostOrderStatusLifecycle();
 }
 
@@ -358,6 +407,10 @@ function gigahostOrderStatusRefreshState() {
         scheduled: gigahostOrderStatusRefreshTimer !== null,
         inFlight: gigahostOrderStatusRefreshInFlight,
         running: typeof gigahostOrderStatusRefreshTask === 'function',
+        // reading reports that a read currently owns the view, whatever started it. It is
+        // the ownership fact a caller or a test needs; inFlight only describes the timer.
+        reading: gigahostOrderStatusCurrentRead !== null,
+        reads: gigahostOrderStatusReadSequence,
         lastSuccessAt: gigahostOrderStatusLastSuccessAt
     };
 }
@@ -365,9 +418,9 @@ function gigahostOrderStatusRefreshState() {
 /* readGigahostSetupIntents reads the saved setup approvals, which are the only
  * record of a paused install or a trust pause. Returning null means the list could
  * not be read, so the setup axis is reported as unknown rather than as "none". */
-async function readGigahostSetupIntents() {
+async function readGigahostSetupIntents(signal) {
     try {
-        const res = await API.get('/api/admin/hosting/gigahost/setup-intents');
+        const res = await API.get('/api/admin/hosting/gigahost/setup-intents', {signal: signal});
         const intents = (res && res.setup_intents) ? res.setup_intents : [];
         const index = {};
         intents.forEach((intent) => {
@@ -379,24 +432,27 @@ async function readGigahostSetupIntents() {
     }
 }
 
-/* refreshGigahostBackendHealth reads the panel's own backend records, which are the
- * only evidence of verified backend health.
+/* readGigahostBackendIndex reads the panel's own backend records, which are the only
+ * evidence of verified backend health, and returns them keyed by panel server id.
  *
- * A failed read clears the index instead of reusing the last one: an unavailable
- * answer is not evidence that a backend is still healthy, and showing a previous
- * "healthy" for a state nobody could read would be exactly the invented result this
- * view must not present. Health then reads as unknown for that tick. */
-async function refreshGigahostBackendHealth() {
+ * A failed read returns null instead of reusing the last index: an unavailable answer is
+ * not evidence that a backend is still healthy, and showing a previous "healthy" for a
+ * state nobody could read would be exactly the invented result this view must not
+ * present. Health then reads as unknown for that read.
+ *
+ * Returning the index rather than assigning it is what keeps a retired read harmless: the
+ * index is applied by the caller that still owns the view. */
+async function readGigahostBackendIndex(signal) {
     try {
-        const res = await API.get('/api/vpn/backends');
+        const res = await API.get('/api/vpn/backends', {signal: signal});
         const backends = (res && res.backends) ? res.backends : [];
         const index = {};
         backends.forEach((backend) => {
             if (backend && backend.server_id) index[String(backend.server_id)] = backend;
         });
-        gigahostOrderStatusBackendIndex = index;
+        return index;
     } catch (_) {
-        gigahostOrderStatusBackendIndex = null;
+        return null;
     }
 }
 
@@ -414,10 +470,10 @@ function gigahostOrderStatusHealthFor(order) {
  * the step, the last provider diagnostic and the panel server the order registered.
  * A failure is reported as detailOK=false rather than thrown, so one unreadable
  * order does not discard the whole list. */
-async function readGigahostOrderDeploy(orderId) {
+async function readGigahostOrderDeploy(orderId, signal) {
     if (!orderId) return {deploy: null, detailOK: false};
     try {
-        const res = await API.get('/api/admin/hosting/gigahost/orders/' + encodeURIComponent(orderId) + '/status');
+        const res = await API.get('/api/admin/hosting/gigahost/orders/' + encodeURIComponent(orderId) + '/status', {signal: signal});
         const deploy = res && (res.deploy || res);
         return {deploy: deploy || null, detailOK: !!deploy};
     } catch (_) {
@@ -519,17 +575,73 @@ function mergeGigahostOrderDetail(order, deploy) {
  * provider, and it must not advance the last successful check or clear a stale
  * notice. Nothing here writes: no order is placed, no setup is started and no
  * approval is touched. */
-async function loadRecentOrders() {
-    const container = document.getElementById('recentOrdersContainer');
-    if (!container) return;
+/* gigahostOrderStatusRead performs one status read under the view's admission rule and
+ * commits its result only if it is still the authoritative read.
+ *
+ * A read is registered before it awaits anything, so a second caller can see it. When
+ * `supersede` is set (every user-initiated and post-action caller) the outstanding read
+ * is retired and aborted first; the timer calls with `supersede: false` and never gets
+ * here while a read exists, because it skips instead.
+ *
+ * The token check before each write is what makes a retired read harmless: it may still
+ * be resolving in the background, but it cannot touch the DOM, the last-success/stale
+ * state or the backend index once it is no longer current. The backend index is
+ * deliberately returned by the reader rather than written as a side effect, so a retired
+ * read has nothing to overwrite. */
+async function gigahostOrderStatusRead(container, options) {
+    const supersede = !options || options.supersede !== false;
+    if (supersede) gigahostOrderStatusRetireCurrentRead();
 
-    const read = await gigahostOrderStatusReadOnce();
-    if (!read.ok) {
+    const read = {
+        token: gigahostOrderStatusReadSequence += 1,
+        controller: gigahostOrderStatusNewAbortController()
+    };
+    gigahostOrderStatusCurrentRead = read;
+
+    const outcome = await gigahostOrderStatusAwaitRead(read);
+    // Retired while awaiting, or a newer read has taken over: this one writes nothing.
+    if (!gigahostOrderStatusClaimCommit(read, container)) return false;
+    gigahostOrderStatusCommitRead(container, outcome);
+    return true;
+}
+
+/* gigahostOrderStatusAwaitRead runs the requests and never throws: a failed read is an
+ * outcome, because "could not read" is a state the view has to show rather than an error
+ * to propagate into a timer tick. */
+async function gigahostOrderStatusAwaitRead(read) {
+    try {
+        return await gigahostOrderStatusReadOnce(read.controller ? read.controller.signal : undefined);
+    } catch (_) {
+        return {ok: false};
+    }
+}
+
+/* gigahostOrderStatusClaimCommit takes the right to write this read's result, or refuses
+ * it. Ownership is a single comparison and it is checked after the await, which is the only
+ * moment that matters: between requests the owner may have changed.
+ *
+ * The pointer is cleared only when the claim succeeds, so "current" stays meaningful right
+ * up to the write. */
+function gigahostOrderStatusClaimCommit(read, container) {
+    if (!gigahostOrderStatusIsCurrentRead(read) || !container) {
+        if (gigahostOrderStatusCurrentRead === read) gigahostOrderStatusCurrentRead = null;
+        return false;
+    }
+    gigahostOrderStatusCurrentRead = null;
+    return true;
+}
+
+/* gigahostOrderStatusCommitRead applies one claimed read's result to the view. The caller
+ * has already established that this read still owns it. */
+function gigahostOrderStatusCommitRead(container, outcome) {
+    if (!outcome || !outcome.ok) {
         gigahostOrderStatusLoadFailed(container);
         return;
     }
 
-    const {merged, details, setupIndex, observations, checkedAt} = read;
+    const {merged, details, setupIndex, observations, checkedAt, backendIndex} = outcome;
+    gigahostOrderStatusBackendIndex = backendIndex;
+
     const freshness = gigahostOrderStatusFreshness(container, merged, observations, checkedAt);
     if (freshness.providerFailed && merged.length > 0) {
         gigahostOrderStatusProviderFailed(container, freshness.reason);
@@ -542,17 +654,50 @@ async function loadRecentOrders() {
     gigahostOrderStatusRenderList(container, merged, details, setupIndex, observations, checkedAt);
 }
 
-/* gigahostOrderStatusReadOnce performs one tick's reads and reports them as data.
+/* gigahostOrderStatusIsCurrentRead reports whether this read still owns the view. A read
+ * retired by a newer one, by an explicit stop or by page teardown is not current. */
+function gigahostOrderStatusIsCurrentRead(read) {
+    return !!read && gigahostOrderStatusCurrentRead === read && !read.retired;
+}
+
+/* gigahostOrderStatusRetireCurrentRead retires and aborts the outstanding read, if any.
  *
- * Only the order list can fail the tick: it is the read that decides whether anything
- * is known at all. The approval list, the backend records and the per-order detail each
- * carry their own explicit unknown, so a partial failure there cannot become a claim
- * about readiness. A null setupIndex means the approval list was unreadable. */
-async function gigahostOrderStatusReadOnce() {
+ * Retiring is what stops it writing; aborting is what stops it holding a connection for
+ * an answer nobody will use. A caller that cannot abort (an environment without
+ * AbortController) still gets correct behavior: the read resolves and is discarded. */
+function gigahostOrderStatusRetireCurrentRead() {
+    const read = gigahostOrderStatusCurrentRead;
+    if (!read) return;
+    read.retired = true;
+    gigahostOrderStatusCurrentRead = null;
+    if (read.controller && typeof read.controller.abort === 'function') {
+        read.controller.abort();
+    }
+}
+
+/* gigahostOrderStatusNewAbortController returns an abort controller when the environment
+ * provides one, and null otherwise. Node and every supported browser do. */
+function gigahostOrderStatusNewAbortController() {
+    if (typeof AbortController === 'function') return new AbortController();
+    if (typeof window !== 'undefined' && typeof window.AbortController === 'function') return new window.AbortController();
+    return null;
+}
+
+/* gigahostOrderStatusReadOnce performs one read's requests and reports them as data.
+ *
+ * Only the order list can fail the read: it is the request that decides whether
+ * anything is known at all. The approval list, the backend records and the per-order
+ * detail each carry their own explicit unknown, so a partial failure there cannot
+ * become a claim about readiness. A null setupIndex means the approval list was
+ * unreadable; a null backendIndex means the backend records were.
+ *
+ * It writes nothing: the backend index is returned so that only the read that still
+ * owns the view applies it. A retired read therefore has no state to overwrite. */
+async function gigahostOrderStatusReadOnce(signal) {
     let orders;
     let observations;
     try {
-        const res = await API.get('/api/admin/hosting/gigahost/orders');
+        const res = await API.get('/api/admin/hosting/gigahost/orders', {signal: signal});
         orders = (res && res.orders) ? res.orders : [];
         observations = (res && res.provider_observations) ? res.provider_observations : {};
     } catch (_) {
@@ -560,11 +705,19 @@ async function gigahostOrderStatusReadOnce() {
     }
 
     const checkedAt = gigahostOrderStatusNow().toISOString();
-    const setupIndex = await readGigahostSetupIntents();
-    await refreshGigahostBackendHealth();
-    const details = await Promise.all(orders.map((order) => readGigahostOrderDeploy(order && order.order_id)));
+    const setupIndex = await readGigahostSetupIntents(signal);
+    const backendIndex = await readGigahostBackendIndex(signal);
+    const details = await Promise.all(orders.map((order) => readGigahostOrderDeploy(order && order.order_id, signal)));
     const merged = orders.map((order, index) => mergeGigahostOrderDetail(order, (details[index] || {}).deploy));
-    return {ok: true, merged: merged, details: details, setupIndex: setupIndex, observations: observations, checkedAt: checkedAt};
+    return {
+        ok: true,
+        merged: merged,
+        details: details,
+        setupIndex: setupIndex,
+        backendIndex: backendIndex,
+        observations: observations,
+        checkedAt: checkedAt
+    };
 }
 
 /* gigahostOrderStatusRenderList renders the first five orders and keeps any stale
