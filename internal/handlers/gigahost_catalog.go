@@ -70,8 +70,16 @@ func (h *Handlers) GigahostCatalogHandler(w http.ResponseWriter, r *http.Request
 // catalogFetcher adapts one provider client to the cache's complete-read
 // contract. A refresh publishes only when BOTH the plan list and the image
 // catalog were read, which is why it reuses loadSelectablePlans: that function
-// already fails the whole read when either half fails, so a partial or malformed
-// answer can never reach the cache.
+// already fails the whole read when either half fails, so a partial answer can
+// never reach the cache.
+//
+// A malformed HTTP-success response also fails that whole read. The provider's
+// distribution and image parsers reject a body whose documented envelope or
+// required identity is missing, rather than decoding it into an empty list, so
+// the failure reaches the cache as an error and takes the retained-snapshot and
+// backoff path instead of publishing a snapshot with no usable image options.
+// An explicitly empty provider answer is still a successful read; only a broken
+// envelope is rejected.
 //
 // An empty plan list is a complete answer, not a failure: the provider really can
 // publish no hourly plan for an account, and the portal already renders that state
