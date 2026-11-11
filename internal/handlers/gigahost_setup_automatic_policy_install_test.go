@@ -15,6 +15,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -407,9 +408,15 @@ func TestAutomaticJobRefusesHealthyAdmissionWhenThePolicyTurnsOffAfterEnablement
 	if stopped.State == models.SetupStateReady {
 		t.Fatal("a backend that was not admitted under the enabled policy was still reported ready")
 	}
-	if stopped.Step != stepAutomaticSetupDisabled {
-		t.Fatalf("step = %q, want %q (state %q, last error %q)",
-			stopped.Step, stepAutomaticSetupDisabled, stopped.State, stopped.LastError)
+	// The refusal is now decided at the promotion boundary rather than after it, so the
+	// recorded step is the phase that was in flight when authority was withdrawn. What
+	// must hold either way is that the row names the policy as the cause.
+	if !strings.Contains(stopped.LastError, "unattended setup is not currently enabled") {
+		t.Fatalf("the refusal did not name the policy as its cause: step=%q last error=%q",
+			stopped.Step, stopped.LastError)
+	}
+	if stopped.Step == "" {
+		t.Fatal("the refusal recorded no step")
 	}
 	// The completed effects are preserved truthfully: enablement really happened.
 	env.counters.mu.Lock()

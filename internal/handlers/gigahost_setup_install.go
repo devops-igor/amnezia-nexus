@@ -290,7 +290,12 @@ func (h *Handlers) installEnableStep(
 	if err != nil || !ok {
 		return err
 	}
-	if err := h.enableDeployBackend(ctx, server, req.GetEffectiveProtocol()); err != nil {
+	// The job's identity travels with this call so the admission boundary can ask the
+	// automation policy before it promotes. Without it the promotion would happen before
+	// finishInstall's journal refusal, leaving a selectable backend behind a job that never
+	// claims success.
+	enrollCtx := withAutomaticAdmissionIntent(ctx, journal.Intent())
+	if err := h.enableDeployBackend(enrollCtx, server, req.GetEffectiveProtocol()); err != nil {
 		return fmt.Errorf("backend enablement failed: %w", err)
 	}
 	// The enable path reports success only after traffic qualification, so the

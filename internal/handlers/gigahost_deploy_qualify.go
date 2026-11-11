@@ -49,6 +49,9 @@ func (h *Handlers) qualifyProxyBackendTraffic(ctx context.Context, server *model
 		return fmt.Errorf("%s application traffic qualification failed: %w", protocol, err)
 	}
 
+	if err := h.refuseAutomaticAdmissionOrQuarantine(ctx, server.ID); err != nil {
+		return err
+	}
 	if err := h.vpnSvc.PromoteQualifiedTunnel(probeCtx, server.ID, latencyMS); err != nil {
 		// A revoked approval is one of the two reasons promotion is refused, and
 		// the backend must not be left enabled behind a canceled job either way.
@@ -56,6 +59,21 @@ func (h *Handlers) qualifyProxyBackendTraffic(ctx context.Context, server *model
 		return fmt.Errorf("failed to commit healthy status after %s traffic qualification: %w", protocol, err)
 	}
 	return nil
+}
+
+// refuseAutomaticAdmissionOrQuarantine applies the automation-policy gate on the proxy
+// qualification path and quarantines the backend when it refuses.
+//
+// It mirrors the AWG path: the policy is asked after qualification succeeded and before the
+// promotion commit, and a refusal keeps the durable enrollment quarantine so the backend
+// stays out of the pool. Returning nil leaves the caller to promote normally.
+func (h *Handlers) refuseAutomaticAdmissionOrQuarantine(ctx context.Context, serverID int64) error {
+	pause := h.refuseAutomaticAdmission(ctx)
+	if pause == nil {
+		return nil
+	}
+	h.quarantineEnrollment(ctx, serverID)
+	return fmt.Errorf("%s", pause.detail)
 }
 
 // quarantineEnrollment withdraws a backend that failed or was refused admission:
