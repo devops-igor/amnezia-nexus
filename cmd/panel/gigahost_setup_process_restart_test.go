@@ -1,20 +1,15 @@
 package main
 
-// Parent side of the fresh-OS-process application restart proof.
+// Parent side of the fresh-OS-process restart proof.
 //
-// Each test seeds ONE persisted situation in a disposable encrypted database,
-// starts the real application in a genuinely separate process, and asserts on two
-// independent things:
+// Each test seeds ONE persisted situation in a disposable encrypted database, starts
+// the real application in a genuinely separate process, and asserts on the durable row
+// that process left behind. The helper file states which observations production
+// actually writes, and which claims are unavailable without a seam.
 //
-//  1. the durable row the second process left behind, and
-//  2. the shared effects journal, which is how "did it do that work twice?" is
-//     answered by evidence from the child's own run rather than by a counter the
-//     parent happened to hold.
-//
-// The helper file states what a child can and cannot observe without a production
-// seam. In one sentence: resumption, identity continuity, default-off refusal and
-// no-replay are proved here; a healthy install completing in a child is not, and no
-// assertion below claims it.
+// Deliberately absent: a test-side effects journal. The previous version asserted zero
+// "install"/"enable" markers that nothing in production ever appended, so those counts
+// were tautologies. Every assertion below reads state the application owns.
 
 import (
 	"testing"
@@ -24,164 +19,162 @@ import (
 
 // TestPanelProcessRestartResumesSavedWork is the core positive.
 //
-// A job approved before the panel stopped must be picked up by a genuinely
-// different OS process, which records provider-unavailable progress and leaves the
-// job pending - never "ready", because no provider answered.
+// A job approved before the panel stopped must be picked up by a different OS process,
+// which records provider-unavailable progress and leaves the job pending - never
+// "ready", because no provider answered.
 func TestPanelProcessRestartResumesSavedWork(t *testing.T) {
 	env := newRestartEnv(t)
-	// Automatic provenance, which is the unattended case this whole epic is about.
-	seeded := env.seedIntent(restartShape{trustPolicy: models.SetupTrustPolicyFirstContact})
+	seeded := env.seed(seedShape{trustPolicy: models.SetupTrustPolicyFirstContact})
 
 	env.startChild()
 
-	after := env.readIntent()
-	env.requireStillPending(after, seeded, "after a fresh process resumed the job")
-	env.requireIdentityPreserved(after, seeded, "after a fresh process resumed the job")
+	after := env.read()
+	env.requireNotReady(after, "after a fresh process resumed the job")
+	// Pending progress, explicitly distinguished from a healthy installation.
+	if after.State != models.SetupStatePending {
+		t.Fatalf("state = %q, want %q (step %q, last error %q)",
+			after.State, models.SetupStatePending, after.Step, after.LastError)
+	}
+	if after.Attempts <= seeded.Attempts {
+		t.Fatalf("the child did not track the saved approval: attempts stayed at %d", seeded.Attempts)
+	}
+	if after.ReadFailures == 0 {
+		t.Fatal("no provider read failure was recorded, so the child never attempted the read")
+	}
+	if after.Step != "provider_unreadable" {
+		t.Fatalf("step = %q, want the unreadable-provider step %q", after.Step, "provider_unreadable")
+	}
+	env.requireIdentityPreserved(seeded, after, "after a fresh process resumed the job")
 	env.requireSingleIntent("after a fresh process resumed the job")
 
-	// The child really was a separate application process: it recorded its boot and,
-	// because it reached serving, its clean shutdown.
-	if n := effectCount(env.journal, "boot"); n != 1 {
-		t.Fatalf("boot markers = %d, want exactly 1 (one child process)", n)
+	// The child really was one separate application process that bound and stopped.
+	if n := markerCount(env.journal, "boot"); n != 1 {
+		t.Fatalf("boot markers = %d, want exactly 1", n)
 	}
-	if n := effectCount(env.journal, "serving"); n != 1 {
+	if n := markerCount(env.journal, "serving"); n != 1 {
 		t.Fatalf("serving markers = %d, want exactly 1 (the child bound its listener)", n)
 	}
-	if n := effectCount(env.journal, "clean_shutdown"); n != 1 {
-		t.Fatalf("clean shutdown markers = %d, want exactly 1", n)
+	if n := markerCount(env.journal, "clean_shutdown"); n != 1 {
+		t.Fatalf("clean_shutdown markers = %d, want exactly 1", n)
 	}
 }
 
-// TestPanelProcessRestartPreservesPersistedAuthority is the restart-continuity
-// proof across TWO process lifetimes.
-//
-// The second process must resume the same row and must not rewrite any of the
-// identities the acceptance names, nor add a job.
+// TestPanelProcessRestartPreservesPersistedAuthority proves continuity across TWO
+// process lifetimes: the second must resume the same row and rewrite no identity.
 func TestPanelProcessRestartPreservesPersistedAuthority(t *testing.T) {
 	env := newRestartEnv(t)
-	seeded := env.seedIntent(restartShape{trustPolicy: models.SetupTrustPolicyFirstContact})
+	seeded := env.seed(seedShape{trustPolicy: models.SetupTrustPolicyFirstContact})
 
-	// First process lifetime.
 	env.startChild()
-	afterFirst := env.readIntent()
-	env.requireStillPending(afterFirst, seeded, "after the first process")
-	env.requireIdentityPreserved(afterFirst, seeded, "after the first process")
+	afterFirst := env.read()
+	env.requireNotReady(afterFirst, "after the first process")
+	env.requireIdentityPreserved(seeded, afterFirst, "after the first process")
 
-	// A real restart happens long after the backoff the first pass persisted. Move
-	// the saved next-attempt into the past, which is the elapsed-time condition
-	// downtime would have produced anyway; honouring the backoff is deliberate.
 	env.makeWorkDue()
 
-	// Second process lifetime, same database.
 	env.startChild()
-	afterSecond := env.readIntent()
+	afterSecond := env.read()
 
 	if afterSecond.Attempts <= afterFirst.Attempts {
 		t.Fatalf("the second process did not resume the row: attempts stayed at %d", afterFirst.Attempts)
 	}
-	env.requireStillPending(afterSecond, afterFirst, "after the second process")
-	env.requireIdentityPreserved(afterSecond, seeded, "after the second process")
+	env.requireNotReady(afterSecond, "after the second process")
+	env.requireIdentityPreserved(seeded, afterSecond, "after the second process")
 	env.requireSingleIntent("after the second process")
 
-	if n := effectCount(env.journal, "boot"); n != 2 {
+	if n := markerCount(env.journal, "boot"); n != 2 {
 		t.Fatalf("boot markers = %d, want exactly 2 (two separate process lifetimes)", n)
 	}
 }
 
-// TestPanelProcessDoesNotReplayAnUncertainInstall is the no-replay control.
+// TestPanelProcessAutomaticEffectRefusedWhenPolicyOff proves the shipped default-off
+// policy stops an unattended job, and that the refusal happened at that boundary.
 //
-// The row is persisted mid-install with an unverified phase, which is what a panel
-// killed inside an install leaves behind. A fresh process must not install again:
-// the row is not due for the installer, and the automatic gate refuses before any
-// dial. The journal must show no install effect at all.
-func TestPanelProcessDoesNotReplayAnUncertainInstall(t *testing.T) {
-	env := newRestartEnv(t)
-	seeded := env.seedIntent(restartShape{
-		trustPolicy:  models.SetupTrustPolicyFirstContact,
-		state:        "install_paused",
-		installPhase: "installing",
-	})
-	if seeded.InstallGeneration == 0 {
-		t.Fatal("precondition: the seeded row carries no install generation")
-	}
-
-	env.startChild()
-
-	after := env.readIntent()
-	// The interrupted job must not be declared healthy by a process that cannot
-	// have verified it.
-	if after.State == "ready" {
-		t.Fatalf("a row with an unverified install was reported ready (step %q)", after.Step)
-	}
-	// No replay: nothing in this fixture can perform a real install, so this asserts
-	// the absence of the effect the journal would carry. It is a negative control on
-	// a code path (the installer's due-set), not a claim that a real install ran.
-	if n := effectCount(env.journal, "install"); n != 0 {
-		t.Fatalf("a fresh process attempted %d install effects on an unverified row", n)
-	}
-	env.requireIdentityPreserved(after, seeded, "after refusing to replay an uncertain install")
-	env.requireSingleIntent("after refusing to replay an uncertain install")
-}
-
-// TestPanelProcessAutomaticEffectRefusedWhenPolicyOff is the default-off proof.
-//
-// The shipped application never installs an automation policy, so a first_contact
-// job must be refused before any credential is sent or host dialled. This runs in a
-// real child, so it proves the real default rather than a stubbed one.
+// The row is seeded ready_for_setup so it IS in the installer's due set; the gate, not
+// the due set, is what must stop it. Two real observations make the claim: the worker
+// claimed the row (P1), and the pause names the automatic policy boundary (P2).
 func TestPanelProcessAutomaticEffectRefusedWhenPolicyOff(t *testing.T) {
 	env := newRestartEnv(t)
-	// Ready for setup, so the row IS due and the gate is what stops it.
-	seeded := env.seedIntent(restartShape{
+	seeded := env.seed(seedShape{
 		trustPolicy: models.SetupTrustPolicyFirstContact,
-		state:       "ready_for_setup",
+		state:       models.SetupStateReadyForSetup,
 	})
 
 	env.startChild()
 
-	after := env.readIntent()
-	// The job must not have reached ready, and must not have installed or enabled.
-	if after.State == "ready" {
-		t.Fatalf("default-off unattended setup reported a completed job (step %q)", after.Step)
-	}
-	if n := effectCount(env.journal, "install"); n != 0 {
-		t.Fatalf("a disabled automatic job produced %d install effects", n)
-	}
-	if n := effectCount(env.journal, "enable"); n != 0 {
-		t.Fatalf("a disabled automatic job produced %d enable effects", n)
-	}
-	env.requireIdentityPreserved(after, seeded, "after the automatic refusal")
+	after := env.read()
+	env.requireNotReady(after, "after the automatic refusal")
+	// Without a claimed pass, "refused" would be indistinguishable from "never ran".
+	env.requireWorkerPassed(seeded, after, "after the automatic refusal")
+	env.requireAutomaticPolicyRefusal(after, "after the automatic refusal")
+	env.requireIdentityPreserved(seeded, after, "after the automatic refusal")
 	env.requireSingleIntent("after the automatic refusal")
 }
 
-// TestPanelProcessManualJobIsNotGatedByAutomaticPolicy is the manual-mode control.
+// TestPanelProcessManualJobIsNotGatedByAutomaticPolicy is the contrast that keeps the
+// refusal above about automation policy rather than a permanently frozen row.
 //
-// The automatic gate is keyed on first_contact provenance only: a job a person
-// approved must not be refused by an unattended-setup setting. This is the contrast
-// that keeps the refusal above about automation policy rather than about a
-// permanently frozen row.
+// A manual job (HostTrustPolicy == models.SetupTrustPolicyManual, the empty default) is
+// answered nil by automaticJobRefusal. The worker must still claim it (P1), and the
+// pause must NOT be at the automatic policy boundary.
 func TestPanelProcessManualJobIsNotGatedByAutomaticPolicy(t *testing.T) {
 	env := newRestartEnv(t)
-	// Manual provenance: models.SetupTrustPolicyManual is explicitly the empty
-	// string, and only first_contact is treated as unattended.
-	seeded := env.seedIntent(restartShape{
+	seeded := env.seed(seedShape{
 		trustPolicy: models.SetupTrustPolicyManual,
-		state:       "ready_for_setup",
+		state:       models.SetupStateReadyForSetup,
 	})
 	if seeded.HostTrustPolicy == models.SetupTrustPolicyFirstContact {
-		t.Fatal("precondition: the seeded row was treated as automatic")
+		t.Fatal("precondition: the seeded row was treated as unattended")
 	}
 
 	env.startChild()
 
-	after := env.readIntent()
-	// The manual job must not have been turned into a completed install by a process
-	// with no provider, but it must also not have been refused by the automatic gate.
-	if after.State == "ready" {
-		t.Fatalf("a manual job with no reachable provider was reported completed")
+	after := env.read()
+	env.requireNotReady(after, "after the manual pass")
+	// The worker ran either way; that is what makes the step comparison meaningful.
+	env.requireWorkerPassed(seeded, after, "after the manual pass")
+	if after.Step == "automatic_setup_disabled" {
+		t.Fatalf("a manual job was stopped by the unattended-setup policy at step %q "+
+			"(state %q, last error %q)", after.Step, after.State, after.LastError)
 	}
-	if n := effectCount(env.journal, "install"); n != 0 {
-		t.Fatalf("the manual control produced %d install effects it cannot justify", n)
+	env.requireIdentityPreserved(seeded, after, "after the manual pass")
+	env.requireSingleIntent("after the manual pass")
+}
+
+// TestPanelProcessDoesNotReplayAnUncertainInstall is the no-replay control.
+//
+// A row persisted install_paused with an unverified phase is deliberately absent from
+// the installer's due set (intents.go:558-583 selects ready_for_setup and installing
+// only), so a fresh process must not claim it again. The assertion is that the
+// generation did NOT advance - the precise inverse of requireWorkerPassed, and the
+// reason a paused row needs no journal fiction to prove itself.
+func TestPanelProcessDoesNotReplayAnUncertainInstall(t *testing.T) {
+	env := newRestartEnv(t)
+	seeded := env.seed(seedShape{
+		trustPolicy:  models.SetupTrustPolicyFirstContact,
+		state:        models.SetupStateInstallPaused,
+		installPhase: models.SetupPhaseInstalled,
+		generation:   3,
+	})
+	if seeded.State != models.SetupStateInstallPaused {
+		t.Fatalf("precondition: seeded state = %q", seeded.State)
 	}
-	env.requireIdentityPreserved(after, seeded, "after the manual-mode pass")
-	env.requireSingleIntent("after the manual-mode pass")
+
+	env.startChild()
+
+	after := env.read()
+	env.requireNotReady(after, "after refusing to replay an uncertain install")
+	if after.InstallGeneration != seeded.InstallGeneration {
+		t.Fatalf("a paused row was re-claimed and replayed: generation %d -> %d",
+			seeded.InstallGeneration, after.InstallGeneration)
+	}
+	if after.State != models.SetupStateInstallPaused {
+		t.Fatalf("state = %q, want the paused state preserved", after.State)
+	}
+	if after.InstallPhase != seeded.InstallPhase {
+		t.Fatalf("the crash journal was rewritten: phase %q -> %q",
+			seeded.InstallPhase, after.InstallPhase)
+	}
+	env.requireIdentityPreserved(seeded, after, "after refusing to replay an uncertain install")
+	env.requireSingleIntent("after refusing to replay an uncertain install")
 }

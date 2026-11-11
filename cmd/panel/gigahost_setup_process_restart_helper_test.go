@@ -1,63 +1,49 @@
 package main
 
-// Fresh-OS-process application lifecycle proof for durable unattended setup.
+// Fresh-OS-process restart fixture: parent/child plumbing and durable oracles.
 //
-// Why this file exists
-// --------------------
-// gigahost_setup_lifecycle_test.go proves restart at the PERSISTENCE boundary: it
-// calls run() and shuts it down, then calls run() again IN THE SAME OS PROCESS.
-// That cannot exclude process memory as the thing that carried the resumed state,
-// and its own header says so.
+// The existing gigahost_setup_lifecycle_test.go restarts at the persistence boundary
+// only - run() twice in one OS process - so process memory cannot be excluded. Here
+// the real application runs in a genuinely separate OS process (this test binary
+// re-executed, the pattern internal/handlers and internal/config already use) over
+// the same disposable encrypted database.
 //
-// Here the panel is started in a genuinely different OS process - this test binary
-// re-executed with the repository's existing subprocess pattern (see
-// internal/handlers/gigahost_setup_process_test.go and
-// internal/config/secret_key_test.go) - twice, over the same disposable encrypted
-// database. The parent asserts on the durable row and on an effects journal both
-// processes append to, so "did the second process do it again?" is answered by
-// evidence from that process.
+// Which observations are REAL
+// ---------------------------
+// A child running run() has no test hooks, so only state production itself writes may
+// be asserted. Two producers are used, plus the tracker's own row writes:
 //
-// What a child process can observe WITHOUT a production test seam
-// ---------------------------------------------------------------
-// A child running run() has no test hooks, so only naturally reachable effects
-// count. This file relies on four of them, all verified in the source:
+//	P1 install-claim generation. Installer.claim increments InstallGeneration in the
+//	   database before any install work (installer.go:247-276). A generation that
+//	   advanced proves the installer worker ran a real pass over the row - the
+//	   precondition required before any refusal may be claimed.
+//	P2 persisted pause boundary. InstallJournal.Pause writes state=install_paused with
+//	   the step that stopped it (installer.go:374-384). The step string discriminates:
+//	   an automatic policy refusal stops at "automatic_setup_disabled", while a manual
+//	   job is answered nil by automaticJobRefusal and stops elsewhere.
+//	T  tracker row writes. recordReadFailure advances Attempts/ReadFailures and leaves
+//	   the row pending with step "provider_unreadable" (tracker.go:287-291, 347-392).
 //
-//  1. Provider-unavailable progress. With GIGAHOST_API_KEY unset, provider
-//     resolution fails and Tracker.RunOnce takes its resolveErr branch, recording a
-//     read failure and leaving the intent pending (tracker.go:287-291, 375-392).
-//     That is progress a stale memory cannot fake.
-//  2. Default-off automatic refusal. The shipped binary never installs an
-//     automation policy, so h.setupAutomationPolicy is nil and
-//     requireAutomaticSetupEnabled returns ErrAutomaticSetupDisabled; for an
-//     intent whose trust policy is first_contact, prepareInstall refuses BEFORE a
-//     credential is sent or a host dialled (gigahost_setup_install.go:122-125).
-//     This proves the real default is off, using the real default.
-//  3. Identity preservation. Authority, mode, options, credential and pin are
-//     durable columns; a second process must not rewrite them or add a row.
-//  4. No replay of an uncertain install. A paused row is not even due for the
-//     installer (gigahost_setup_intents.go:577-583 selects ready_for_setup and
-//     installing only), and the automatic refusal above fires before any dial, so
-//     a fresh process appends no install effect.
+// There is deliberately no test-side effects journal: an earlier version appended
+// "install"/"enable" markers nothing in production ever wrote, so zero counts proved
+// nothing. Effects are now read from the durable row, which production owns.
 //
-// What this file deliberately does NOT claim
-// -----------------------------------------
-// A HEALTHY installation completing in a child process is not provable from
-// configuration alone: gigahost.NewClient takes no BaseURL override and there is
-// no environment variable for one, so a child holding GIGAHOST_API_KEY would talk
-// to the real provider - which this assignment forbids. Building that would need a
-// product change (a base-URL configuration hook), not a test. So the tests below
-// prove resumption, identity continuity, refusal and no-replay; they do not prove
-// a completed install, and no assertion here says "ready" for that reason.
+// What is NOT proven here
+// -----------------------
+//   - A healthy installation completing in a child: gigahost.NewClient takes no
+//     base-URL override and no environment variable supplies one, so a child holding
+//     GIGAHOST_API_KEY would reach the real provider. Out of scope.
+//   - Child-side credential use: the child never reports it. The parent asserts only
+//     that the credential still decrypts after the child ran.
+//   - Loopback-only binding: HOST is pinned to 127.0.0.1 and Server.Start binds that
+//     address (server.go:199), but a successful connect cannot prove no 0.0.0.0 bind
+//     exists. The claim is limited to "it answered on loopback".
 //
-// Scope: this is application-process composition over a disposable database. It is
-// not VPN traffic, not a real host, not a provider call, and not a whole-deployment
-// acceptance.
+// Scope: application-process composition over a disposable database. Not VPN traffic,
+// not a real host, not a provider call, not whole-deployment acceptance.
 
 import (
-	"bufio"
 	"context"
-	"errors"
-	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -72,113 +58,85 @@ import (
 )
 
 const (
-	// envRestartChild marks this binary as the child and names what it must do.
-	envRestartChild = "PANEL_RESTART_CHILD_MODE"
-	// envRestartPort is the loopback port the child's HTTP server binds.
-	envRestartPort = "PANEL_RESTART_CHILD_PORT"
-	// envRestartJournal is the effects file both processes append to.
-	envRestartJournal = "PANEL_RESTART_CHILD_JOURNAL"
-	// envRestartReady is a marker file the child creates once run() is serving.
-	envRestartReady = "PANEL_RESTART_CHILD_READY"
+	// envChildMode marks this binary as the child process.
+	envChildMode = "PANEL_RESTART_CHILD_MODE"
+	// envChildPort is the loopback port the child's HTTP server binds.
+	envChildPort = "PANEL_RESTART_CHILD_PORT"
+	// envChildJournal records only markers the child itself emits (boot,
+	// clean_shutdown). It carries no effect claims.
+	envChildJournal = "PANEL_RESTART_CHILD_JOURNAL"
 )
 
-// Child modes. Each starts the real application once and stops it.
-const (
-	// modeServe: boot run(), wait until the HTTP listener answers, then shut down
-	// cleanly. Used for both the first and the second lifecycle.
-	modeServe = "serve"
-)
+// childModeServe boots run(), waits for the loopback listener, then shuts down.
+const childModeServe = "serve"
 
-// restartFixtureSecret is a fixed 32-byte test key. It is a fixture value, not a
-// deployment secret, and it never leaves this process except as an environment
-// entry for the child.
-const restartFixtureSecret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+// restartSecret is a fixed 32-byte fixture key. Not a deployment secret.
+const restartSecret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-// restartChildTimeout bounds one child process end to end.
-const restartChildTimeout = 90 * time.Second
+// childTimeout bounds one child process end to end.
+const childTimeout = 90 * time.Second
 
-// TestPanelRestartChildHelper is the child entry point.
-//
-// It returns immediately unless the parent set the mode variable, so it is inert
-// during an ordinary test run. This is the pattern internal/config and
-// internal/handlers already use for their multi-process tests, not a new runtime
-// mode.
+// serveDwell is how long the child stays up after its listener answers. The first
+// supervisor pass runs immediately at startup, so this only needs to exceed one pass;
+// the parent still asserts the persisted outcome rather than trusting the duration.
+const serveDwell = 2 * time.Second
+
+// TestPanelRestartChildHelper is the child entry point. It is inert unless the parent
+// set the mode variable, so an ordinary test run does nothing.
 func TestPanelRestartChildHelper(t *testing.T) {
-	mode := os.Getenv(envRestartChild)
+	mode := os.Getenv(envChildMode)
 	if mode == "" {
 		return
 	}
-	if mode != modeServe {
-		fmt.Fprintf(os.Stderr, "restart child: unknown mode %q\n", mode)
+	if mode != childModeServe {
 		os.Exit(4)
 	}
-	os.Exit(runServeChild())
+	os.Exit(serveChild())
 }
 
-// runServeChild boots the real application, reports readiness, and shuts it down.
+// serveChild boots the real application, reports the listener, and shuts down.
 //
-// Exit codes are the child's out-of-band report:
-//
-//	0  run() completed cleanly after a real HTTP bind
-//	3  the server never became ready, or run() returned an error
-//	4  the child's environment is incomplete
-func runServeChild() int {
-	port := os.Getenv(envRestartPort)
-	journal := os.Getenv(envRestartJournal)
-	readyPath := os.Getenv(envRestartReady)
-	if port == "" || journal == "" || readyPath == "" {
-		fmt.Fprintln(os.Stderr, "restart child: required environment is missing")
-		return 4
-	}
-	// The application refuses to start without a secret; the parent supplies it
-	// through the environment exactly as a deployment does.
-	if strings.TrimSpace(os.Getenv("SECRET_KEY")) == "" {
-		fmt.Fprintln(os.Stderr, "restart child: SECRET_KEY is not set")
+// Exit codes: 0 clean lifecycle, 3 the server never answered or run() failed, 4
+// incomplete environment.
+func serveChild() int {
+	port := os.Getenv(envChildPort)
+	journal := os.Getenv(envChildJournal)
+	if port == "" || journal == "" || strings.TrimSpace(os.Getenv("SECRET_KEY")) == "" {
 		return 4
 	}
 
-	appendEffect(journal, "boot")
-
+	appendMarker(journal, "boot")
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() { errCh <- run(ctx) }()
 
-	// Readiness is observed from OUTSIDE run(): poll the port it binds. Waiting on
-	// run()'s own internals would need a seam; a TCP accept needs none.
-	if !waitLoopbackReady(port, 30*time.Second) {
+	if !waitLoopbackListener(port, 30*time.Second) {
 		cancel()
 		select {
-		case err := <-errCh:
-			fmt.Fprintf(os.Stderr, "restart child: run() returned before serving: %v\n", err)
+		case <-errCh:
 		case <-time.After(15 * time.Second):
-			fmt.Fprintln(os.Stderr, "restart child: run() did not return after cancellation")
 		}
 		return 3
 	}
-	// The application is serving: record that fact for the parent, then allow it a
-	// moment to complete its first supervisor pass (the tracker's initial pass runs
-	// immediately at startup).
-	_ = os.WriteFile(readyPath, []byte("ready\n"), 0o600)
-	appendEffect(journal, "serving")
-	time.Sleep(1500 * time.Millisecond)
+	appendMarker(journal, "serving")
+	time.Sleep(serveDwell)
 
 	cancel()
 	select {
 	case err := <-errCh:
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "restart child: run() returned %v on shutdown\n", err)
 			return 3
 		}
-		appendEffect(journal, "clean_shutdown")
+		appendMarker(journal, "clean_shutdown")
 		return 0
 	case <-time.After(30 * time.Second):
-		fmt.Fprintln(os.Stderr, "restart child: run() did not shut down within 30s")
 		return 3
 	}
 }
 
-// waitLoopbackReady polls a TCP accept on the loopback port run() binds.
-func waitLoopbackReady(port string, limit time.Duration) bool {
+// waitLoopbackListener polls until the port accepts, which is the child's own
+// listener answering. It cannot prove the absence of a wider bind.
+func waitLoopbackListener(port string, limit time.Duration) bool {
 	addr := net.JoinHostPort("127.0.0.1", port)
 	deadline := time.Now().Add(limit)
 	for time.Now().Before(deadline) {
@@ -192,9 +150,8 @@ func waitLoopbackReady(port string, limit time.Duration) bool {
 	return false
 }
 
-// appendEffect appends "kind\n" to the shared journal. Appending is the point: two
-// OS processes record into one file, so the parent can count each process's work.
-func appendEffect(path, kind string) {
+// appendMarker appends one child-emitted lifecycle marker.
+func appendMarker(path, kind string) {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
@@ -203,17 +160,15 @@ func appendEffect(path, kind string) {
 	_, _ = f.WriteString(kind + "\n")
 }
 
-// effectCount counts journal lines of one kind.
-func effectCount(path, kind string) int {
-	f, err := os.Open(path)
+// markerCount counts one child-emitted marker kind.
+func markerCount(path, kind string) int {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0
 	}
-	defer func() { _ = f.Close() }()
 	count := 0
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		if strings.TrimSpace(scanner.Text()) == kind {
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == kind {
 			count++
 		}
 	}
@@ -229,12 +184,8 @@ type restartEnv struct {
 	port    string
 }
 
-// newRestartEnv creates the isolated environment: its own data directory, its own
-// encrypted database, its own journal and its own reserved loopback port.
-//
-// Ports are reserved and released rather than reused across children, and the two
-// children run sequentially - never concurrently - because they share one SQLite
-// file and each binds a listener.
+// newRestartEnv creates an isolated home: its own DATA_DIR, database, journal and
+// reserved loopback port, all inside t.TempDir().
 func newRestartEnv(t *testing.T) *restartEnv {
 	t.Helper()
 	dir := t.TempDir()
@@ -242,13 +193,12 @@ func newRestartEnv(t *testing.T) *restartEnv {
 		t:       t,
 		dataDir: dir,
 		dbPath:  filepath.Join(dir, "panel_restart.db"),
-		journal: filepath.Join(dir, "effects.log"),
-		port:    reserveLoopbackPort(t),
+		journal: filepath.Join(dir, "lifecycle.log"),
+		port:    reservePort(t),
 	}
 }
 
-// reserveLoopbackPort returns a currently unused loopback port.
-func reserveLoopbackPort(t *testing.T) string {
+func reservePort(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -261,80 +211,50 @@ func reserveLoopbackPort(t *testing.T) string {
 	return strconv.Itoa(port)
 }
 
-// startChild runs one real application process and returns its exit code and
-// captured output.
+// startChild runs one real application process, failing the test on a non-zero exit
+// and reporting the child's own output.
 //
-// The child's environment is built explicitly instead of inherited wholesale, so a
-// developer's own DATA_DIR, GIGAHOST_API_KEY or VPN_ENABLED cannot silently change
-// what the child does. VPN_ENABLED is omitted deliberately: VPN is opt-in, and
-// leaving it unset is what keeps the fixture from touching a TUN device.
-func (e *restartEnv) startChild() (exitCode int, stdout, stderr string) {
+// The environment is an explicit allowlist, so a developer's own DATA_DIR,
+// VPN_ENABLED or GIGAHOST_API_KEY cannot change what the child does.
+func (e *restartEnv) startChild() {
 	e.t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), restartChildTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), childTimeout)
 	defer cancel()
 
-	readyPath := filepath.Join(e.dataDir, "ready-"+strconv.FormatInt(time.Now().UnixNano(), 10))
 	cmd := exec.CommandContext(ctx, os.Args[0],
 		"-test.run=^TestPanelRestartChildHelper$",
-		"-test.timeout="+restartChildTimeout.String())
-	cmd.Env = append(childEnvironment(e.dataDir, e.dbPath, e.port, e.journal, readyPath),
-		envRestartChild+"="+modeServe,
-		envRestartPort+"="+e.port,
-		envRestartJournal+"="+e.journal,
-		envRestartReady+"="+readyPath,
-	)
-	var outBuf, errBuf strings.Builder
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-	err := cmd.Run()
-
-	code := 0
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			code = exitErr.ExitCode()
-		} else if ctx.Err() != nil {
-			e.t.Fatalf("child exceeded the %s budget: %v\nstdout:\n%s\nstderr:\n%s",
-				restartChildTimeout, err, outBuf.String(), errBuf.String())
-		} else {
-			e.t.Fatalf("child failed to run: %v", err)
-		}
-	}
-	if code != 0 {
-		e.t.Fatalf("child exited %d\nstdout:\n%s\nstderr:\n%s",
-			code, outBuf.String(), errBuf.String())
-	}
-	return code, outBuf.String(), errBuf.String()
-}
-
-// childEnvironment builds the child's environment from a small explicit allowlist.
-//
-// Only PATH, HOME and TMPDIR are inherited (a Go toolchain and SQLite need nothing
-// more), plus the fixture's own DATA_DIR/DB_PATH/SECRET_KEY/PORT. VPN_ENABLED and
-// GIGAHOST_API_KEY are deliberately absent.
-func childEnvironment(dataDir, dbPath, port, journal, readyPath string) []string {
-	_ = journal
-	_ = readyPath
-	env := []string{
+		"-test.timeout="+childTimeout.String())
+	cmd.Env = append([]string{
+		"HOME=" + e.dataDir,
+		"TMPDIR=" + e.dataDir,
 		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + os.Getenv("HOME"),
-		"TMPDIR=" + os.Getenv("TMPDIR"),
-		"DATA_DIR=" + dataDir,
-		"DB_PATH=" + dbPath,
-		"SECRET_KEY=" + restartFixtureSecret,
-		"PORT=" + port,
+		"DATA_DIR=" + e.dataDir,
+		"DB_PATH=" + e.dbPath,
+		"SECRET_KEY=" + restartSecret,
 		"HOST=127.0.0.1",
+		"PORT=" + e.port,
 		"LOG_LEVEL=WARN",
+	},
+		envChildMode+"="+childModeServe,
+		envChildPort+"="+e.port,
+		envChildJournal+"="+e.journal,
+	)
+	var out, errOut strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &errOut
+	if err := cmd.Run(); err != nil {
+		e.t.Fatalf("child failed (%v)\nstdout:\n%s\nstderr:\n%s", err, out.String(), errOut.String())
 	}
-	// GIGAHOST_API_KEY is intentionally not forwarded: provider resolution must
-	// fail, which is the safe, observable state these tests are built on.
-	return env
+	// A credential value must never reach any log.
+	if strings.Contains(out.String()+errOut.String(), "PRIVATE-KEY-BODY") {
+		e.t.Fatal("a fixture credential body appeared in child output")
+	}
 }
 
-// openDB opens the environment's database with the fixture secret.
-func (e *restartEnv) openDB() *database.DB {
+// open opens the environment database with the fixture secret.
+func (e *restartEnv) open() *database.DB {
 	e.t.Helper()
-	db, err := database.Open(e.dbPath, restartFixtureSecret)
+	db, err := database.Open(e.dbPath, restartSecret)
 	if err != nil {
 		e.t.Fatalf("open fixture database: %v", err)
 	}
@@ -342,187 +262,198 @@ func (e *restartEnv) openDB() *database.DB {
 	return db
 }
 
-// seedIntent records one approval in the requested persisted shape.
-//
-// The row is written with the application's own encrypted credential path, so the
-// child reads real persisted state rather than a hand-built file.
-func (e *restartEnv) seedIntent(shape restartShape) *models.GigahostSetupIntent {
+const (
+	restartOrderID   = "ord_panel_restart"
+	restartPin       = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	restartAssigned  = "198.51.100.77"
+	restartPortValue = "51820"
+	// fixtureKeyBody is synthetic and must never be printed.
+	fixtureKeyBody = "FIXTURE-ONLY-PRIVATE-KEY-BODY-NOT-A-REAL-KEY"
+)
+
+// restartProvider is the provider server id these fixtures claim.
+const restartProvider int64 = 4101
+
+// seedShape describes the persisted situation to create.
+type seedShape struct {
+	// trustPolicy: models.SetupTrustPolicyFirstContact for unattended, "" for manual.
+	trustPolicy string
+	// state overrides pending.
+	state string
+	// installPhase/installDone seed an interrupted install journal.
+	installPhase string
+	installDone  string
+	// generation seeds InstallGeneration (non-zero with a phase).
+	generation int64
+}
+
+// seed writes one order, its encrypted credential and one intent, through the
+// application's own APIs, and returns the row as persisted.
+func (e *restartEnv) seed(shape seedShape) *models.GigahostSetupIntent {
 	e.t.Helper()
-	db := e.openDB()
+	db := e.open()
 	ctx := context.Background()
 	now := time.Now().UTC()
 
 	if err := db.InsertGigahostOrder(ctx, &models.GigahostOrder{
-		OrderID:    restartOrderID,
-		ServerID:   4101,
-		Status:     "ready",
-		AssignedIP: "198.51.100.77",
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		OrderID: restartOrderID, ServerID: restartProvider, Status: "ready",
+		AssignedIP: restartAssigned, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		e.t.Fatalf("seed order: %v", err)
 	}
 	if err := db.SetGigahostOrderCredential(ctx, &models.GigahostOrderCredential{
 		OrderID:    restartOrderID,
-		PrivateKey: "FIXTURE-ONLY-PRIVATE-KEY-BODY-NOT-A-REAL-KEY",
+		PrivateKey: fixtureKeyBody,
 		PublicKey:  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureKeyMaterialForTestsOnly0000",
 	}); err != nil {
 		e.t.Fatalf("seed credential: %v", err)
 	}
 
 	intent := &models.GigahostSetupIntent{
-		OrderID:          restartOrderID,
-		ProviderServerID: 4101,
-		AssignedIP:       "198.51.100.77",
-		Protocol:         models.ProtocolAWG,
-		Port:             "51820",
-		CredentialMode:   models.SetupCredentialManaged,
-		HostFingerprint:  restartFixtureFingerprint,
-		HostTrustPolicy:  shape.trustPolicy,
-		State:            models.SetupStatePending,
-		Step:             "approved",
-		CreatedAt:        now,
-		UpdatedAt:        now,
+		OrderID:           restartOrderID,
+		ProviderServerID:  restartProvider,
+		AssignedIP:        restartAssigned,
+		Protocol:          models.ProtocolAWG,
+		Port:              restartPortValue,
+		CredentialMode:    models.SetupCredentialManaged,
+		HostFingerprint:   restartPin,
+		HostTrustPolicy:   shape.trustPolicy,
+		HostTrustMode:     models.SetupTrustModeConfirmed,
+		State:             models.SetupStatePending,
+		Step:              "approved",
+		CreatedAt:         now,
+		UpdatedAt:         now,
+		InstallPhase:      shape.installPhase,
+		InstallPhaseDone:  shape.installDone,
+		InstallGeneration: shape.generation,
 	}
 	if shape.state != "" {
 		intent.State = shape.state
 		intent.Step = shape.state
 	}
-	if shape.installPhase != "" {
-		intent.InstallPhase = shape.installPhase
-		intent.InstallGeneration = 3
-	}
 	if err := db.CreateGigahostSetupIntent(ctx, intent); err != nil {
 		e.t.Fatalf("seed intent: %v", err)
 	}
-	got, found, err := db.GetGigahostSetupIntent(ctx, restartOrderID)
-	if err != nil || !found {
-		e.t.Fatalf("read seeded intent: found=%v err=%v", found, err)
-	}
-	return got
+	return e.read()
 }
 
-const (
-	// restartOrderID is the single order these proofs use.
-	restartOrderID = "ord_panel_restart"
-	// restartFixtureFingerprint is a syntactically valid canonical SHA256 pin.
-	restartFixtureFingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-)
-
-// restartShape describes the persisted situation to seed.
-type restartShape struct {
-	// trustPolicy selects automatic (first_contact) or manual (anything else)
-	// provenance; it is the switch the policy gate keys on.
-	trustPolicy string
-	// state overrides the initial state (default pending).
-	state string
-	// installPhase seeds an in-flight install journal, which is what an
-	// interrupted attempt leaves behind.
-	installPhase string
-}
-
-// readIntent reloads the row a child left behind.
-func (e *restartEnv) readIntent() *models.GigahostSetupIntent {
+// read reloads the row.
+func (e *restartEnv) read() *models.GigahostSetupIntent {
 	e.t.Helper()
-	db := e.openDB()
-	intent, found, err := db.GetGigahostSetupIntent(context.Background(), restartOrderID)
+	intent, found, err := e.open().GetGigahostSetupIntent(context.Background(), restartOrderID)
 	if err != nil || !found {
-		e.t.Fatalf("re-read intent: found=%v err=%v", found, err)
+		e.t.Fatalf("read intent: found=%v err=%v", found, err)
 	}
 	return intent
 }
 
-// requireStillPending asserts the child made provider-unavailable progress without
-// settling the job. This is the distinction the acceptance demands: pending progress
-// is not a healthy installation.
-func (e *restartEnv) requireStillPending(after, before *models.GigahostSetupIntent, when string) {
+// requireNotReady fails if any lifecycle claimed a completed job.
+func (e *restartEnv) requireNotReady(got *models.GigahostSetupIntent, when string) {
 	e.t.Helper()
-	if after.State != models.SetupStatePending {
-		e.t.Fatalf("%s: state = %q, want %q (step %q, last error %q)",
-			when, after.State, models.SetupStatePending, after.Step, after.LastError)
-	}
-	if after.Attempts <= before.Attempts {
-		e.t.Fatalf("%s: the child process did not track the saved approval (attempts stayed at %d)",
-			when, before.Attempts)
-	}
-	if after.ReadFailures == 0 {
-		e.t.Fatalf("%s: no provider read failure was recorded, so the child did not attempt the read",
-			when)
-	}
-	// A pending row must never present itself as a completed installation.
-	if after.Step == "ready" || after.State == models.SetupStateReady {
-		e.t.Fatalf("%s: a pending job was reported as completed", when)
+	if got.State == models.SetupStateReady {
+		e.t.Fatalf("%s: a completed job was reported (step %q, last error %q)",
+			when, got.Step, got.LastError)
 	}
 }
 
-// requireIdentityPreserved asserts the restart did not rewrite the identities the
-// acceptance names: authority, mode, options, credential and pin.
-func (e *restartEnv) requireIdentityPreserved(after, before *models.GigahostSetupIntent, when string) {
+// requireWorkerPassed asserts the installer worker actually ran a pass, which is the
+// precondition for any refusal claim. P1: production's claim() increments the
+// generation before doing any install work.
+func (e *restartEnv) requireWorkerPassed(before, after *models.GigahostSetupIntent, when string) {
+	e.t.Helper()
+	if after.InstallGeneration <= before.InstallGeneration {
+		e.t.Fatalf("%s: the installer worker never claimed the row (generation stayed at %d), "+
+			"so this case cannot say anything about refusal", when, before.InstallGeneration)
+	}
+}
+
+// requireAutomaticPolicyRefusal asserts the refusal happened at the automatic policy
+// boundary. P2: the paused step names it.
+func (e *restartEnv) requireAutomaticPolicyRefusal(got *models.GigahostSetupIntent, when string) {
+	e.t.Helper()
+	if got.State != models.SetupStateInstallPaused {
+		e.t.Fatalf("%s: state = %q, want %q (step %q, last error %q)",
+			when, got.State, models.SetupStateInstallPaused, got.Step, got.LastError)
+	}
+	if got.Step != "automatic_setup_disabled" {
+		e.t.Fatalf("%s: the pause was at step %q, want the automatic policy boundary %q "+
+			"(last error %q)", when, got.Step, "automatic_setup_disabled", got.LastError)
+	}
+	if !strings.Contains(got.LastError, "not enabled") {
+		e.t.Fatalf("%s: the refusal reason does not name the disabled policy: %q", when, got.LastError)
+	}
+}
+
+// requireIdentityPreserved compares every persisted identity field. It says nothing
+// about the child's internal use of the credential; see the file header.
+func (e *restartEnv) requireIdentityPreserved(before, after *models.GigahostSetupIntent, when string) {
 	e.t.Helper()
 	if after.Protocol != before.Protocol || after.Port != before.Port {
-		e.t.Fatalf("%s: approved options changed: protocol %q->%q port %q->%q",
-			when, before.Protocol, after.Protocol, before.Port, after.Port)
+		e.t.Fatalf("%s: approved options changed: %q/%q -> %q/%q",
+			when, before.Protocol, before.Port, after.Protocol, after.Port)
 	}
 	if after.CredentialMode != before.CredentialMode {
-		e.t.Fatalf("%s: credential mode changed: %q->%q", when, before.CredentialMode, after.CredentialMode)
-	}
-	if after.HostTrustPolicy != before.HostTrustPolicy {
-		e.t.Fatalf("%s: trust policy changed: %q->%q", when, before.HostTrustPolicy, after.HostTrustPolicy)
-	}
-	if after.HostFingerprint != before.HostFingerprint {
-		e.t.Fatalf("%s: the pinned host identity was rewritten: %q -> %q",
-			when, before.HostFingerprint, after.HostFingerprint)
+		e.t.Fatalf("%s: credential mode changed: %q -> %q", when, before.CredentialMode, after.CredentialMode)
 	}
 	if after.ProviderServerID != before.ProviderServerID || after.AssignedIP != before.AssignedIP {
-		e.t.Fatalf("%s: the resource association changed: server %d->%d address %q->%q",
-			when, before.ProviderServerID, after.ProviderServerID, before.AssignedIP, after.AssignedIP)
+		e.t.Fatalf("%s: resource association changed: %d/%q -> %d/%q", when,
+			before.ProviderServerID, before.AssignedIP, after.ProviderServerID, after.AssignedIP)
 	}
-	// The stored credential must still decrypt in a process that never saw it.
-	db := e.openDB()
-	cred, found, err := db.GetGigahostOrderCredential(context.Background(), restartOrderID)
+	// Authority: the full set, not just the policy string.
+	if after.HostTrustPolicy != before.HostTrustPolicy ||
+		after.HostTrustMode != before.HostTrustMode ||
+		after.HostFingerprint != before.HostFingerprint ||
+		after.HostCandidateFingerprint != before.HostCandidateFingerprint ||
+		after.HostTrustOrderID != before.HostTrustOrderID ||
+		after.HostTrustServerID != before.HostTrustServerID ||
+		after.HostTrustAddress != before.HostTrustAddress ||
+		after.HostTrustKeyID != before.HostTrustKeyID ||
+		!after.HostTrustGrantedAt.Equal(before.HostTrustGrantedAt) {
+		e.t.Fatalf("%s: persisted authority changed across the process boundary:\n"+
+			"  before policy=%q mode=%q pin=%q candidate=%q order=%q server=%d addr=%q key=%d granted=%s\n"+
+			"  after  policy=%q mode=%q pin=%q candidate=%q order=%q server=%d addr=%q key=%d granted=%s",
+			when,
+			before.HostTrustPolicy, before.HostTrustMode, before.HostFingerprint,
+			before.HostCandidateFingerprint, before.HostTrustOrderID, before.HostTrustServerID,
+			before.HostTrustAddress, before.HostTrustKeyID, before.HostTrustGrantedAt,
+			after.HostTrustPolicy, after.HostTrustMode, after.HostFingerprint,
+			after.HostCandidateFingerprint, after.HostTrustOrderID, after.HostTrustServerID,
+			after.HostTrustAddress, after.HostTrustKeyID, after.HostTrustGrantedAt)
+	}
+	// The credential must still decrypt after the child ran. Child-side use is not
+	// observable; this is durable continuity only, and is labelled as such.
+	cred, found, err := e.open().GetGigahostOrderCredential(context.Background(), restartOrderID)
 	if err != nil || !found {
-		e.t.Fatalf("%s: the managed credential is no longer readable: found=%v err=%v", when, found, err)
+		e.t.Fatalf("%s: the managed credential is unreadable after the child ran: found=%v err=%v",
+			when, found, err)
 	}
-	if cred.PrivateKey == "" {
-		e.t.Fatalf("%s: the managed credential decrypted to nothing", when)
+	if cred.PrivateKey != fixtureKeyBody {
+		e.t.Fatalf("%s: the stored credential material changed across the process boundary", when)
 	}
 }
 
-// requireSingleIntent asserts the restart did not create a second job.
+// requireSingleIntent asserts no second job was created.
 func (e *restartEnv) requireSingleIntent(when string) {
 	e.t.Helper()
-	db := e.openDB()
-	intents, err := db.ListGigahostSetupIntents(context.Background())
+	intents, err := e.open().ListGigahostSetupIntents(context.Background())
 	if err != nil {
 		e.t.Fatalf("%s: list intents: %v", when, err)
 	}
 	if len(intents) != 1 {
-		e.t.Fatalf("%s: intent count = %d, want exactly 1 (a restart must not add a job)",
-			when, len(intents))
+		e.t.Fatalf("%s: intent count = %d, want exactly 1", when, len(intents))
 	}
 }
 
-// makeWorkDue moves the persisted next-attempt into the past, modelling a panel that
-// was offline longer than the backoff its previous pass scheduled.
-//
-// Honouring the saved backoff is deliberate behaviour, not a bug: a restart must not
-// hammer the provider. This helper only creates the elapsed-time condition a real
-// downtime would have produced anyway - the same reasoning the existing
-// same-process lifecycle fixture uses.
+// makeWorkDue ages the persisted next-attempt so a resumed pass is due, which is what
+// downtime would have produced. Honouring the backoff is deliberate.
 func (e *restartEnv) makeWorkDue() {
 	e.t.Helper()
-	db := e.openDB()
+	db := e.open()
 	ctx := context.Background()
-	intent, found, err := db.GetGigahostSetupIntent(ctx, restartOrderID)
-	if err != nil || !found {
-		e.t.Fatalf("read intent before making work due: found=%v err=%v", found, err)
-	}
+	intent := e.read()
 	intent.NextAttemptAt = time.Now().UTC().Add(-time.Minute)
 	changed, err := db.TransitionGigahostSetupIntent(ctx, intent, []string{models.SetupStatePending})
-	if err != nil {
-		e.t.Fatalf("make saved work due: %v", err)
-	}
-	if !changed {
-		e.t.Fatalf("could not make saved work due: intent is in state %q", intent.State)
+	if err != nil || !changed {
+		e.t.Fatalf("make saved work due: changed=%v err=%v (state %q)", changed, err, intent.State)
 	}
 }
