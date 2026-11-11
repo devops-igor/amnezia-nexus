@@ -18,6 +18,13 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 )
 
+// stubAutomationPolicy is the fixture opt-in source. It is the only way a test can
+// turn unattended setup on, which is the property being proved: without a policy
+// installed, nothing can.
+//
+// It is mutable while a job runs, because the whole point of the current-policy gates
+// is that the answer can change between two effects of one job. A test flips it at the
+// boundary it cares about and then asserts the next effect did not happen.
 type stubAutomationPolicy struct {
 	enabled bool
 	err     error
@@ -38,11 +45,29 @@ func (p *stubAutomationPolicy) callCount() int {
 	return p.calls
 }
 
+// setEnabled flips the answer for every question asked after this point.
+func (p *stubAutomationPolicy) setEnabled(enabled bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.enabled = enabled
+}
+
+// setError makes the source unreadable, which is a refusal and not an answer.
+func (p *stubAutomationPolicy) setError(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.err = err
+}
+
 // stepHostTrustUnavailableLiteral is the step the tracker records when the host
 // answered but the panel may not record its identity. It is spelled here rather than
 // imported because the tracker keeps it unexported; a change to that vocabulary
 // should fail this test, not silently agree with it.
 const stepHostTrustUnavailableLiteral = "host_trust_unavailable"
+
+// stepAutomaticDisabledLiteral is the tracker's name for the same refusal when the cause
+// is the current policy rather than an unreadable host. Spelled for the same reason.
+const stepAutomaticDisabledLiteral = "automatic_setup_disabled"
 
 // automaticOptions is the explicit option set the entry accepts.
 var automaticOptions = AutomaticGigahostSetupOptions{

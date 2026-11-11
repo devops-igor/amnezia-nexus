@@ -78,6 +78,13 @@ func (e *installEnv) seedFirstContactOrder(orderID string, providerServerID int6
 // grantAutomationTrust gives the approval the internal automation authority, using the
 // same single writer the future controller will use. It is never reachable from a
 // request, which is what keeps a client from widening a job's authority.
+//
+// It also turns unattended setup on, because the two are separate facts and a job can
+// only reach an effect when both hold: the binding says which resource the authority was
+// granted for, and the current policy says the panel still permits automatic work. An
+// already-installed fixture policy is reused rather than replaced, so a test that holds
+// that policy can still flip it; tests that need the two facts to differ change the
+// policy afterwards.
 func (e *installEnv) grantAutomationTrust(orderID string, providerServerID int64) {
 	e.t.Helper()
 	ctx := context.Background()
@@ -88,6 +95,19 @@ func (e *installEnv) grantAutomationTrust(orderID string, providerServerID int64
 	if _, changed, err := e.db.SetGigahostSetupAutomationBinding(ctx, binding); err != nil || !changed {
 		e.t.Fatalf("grant automation trust for %s: changed=%v err=%v", orderID, changed, err)
 	}
+	e.ensureAutomaticSetupEnabled()
+}
+
+// ensureAutomaticSetupEnabled turns unattended setup on without discarding a fixture
+// policy a test already holds a pointer to.
+func (e *installEnv) ensureAutomaticSetupEnabled() *stubAutomationPolicy {
+	e.t.Helper()
+	if existing, ok := e.h.setupAutomationPolicy.(*stubAutomationPolicy); ok && existing != nil {
+		existing.setEnabled(true)
+		existing.setError(nil)
+		return existing
+	}
+	return e.enableAutomaticSetup(true)
 }
 
 // TestSetupFirstContactTrustPinsBeforeAuthentication is the primary positive.

@@ -47,10 +47,30 @@ type FirstContactPinner interface {
 // the reason it returns otherwise is recorded for the operator.
 type FirstContactEligibility func(ctx context.Context, intent models.GigahostSetupIntent) (bool, string)
 
+// AutomaticEffectAllowed answers whether the current unattended-setup policy still
+// permits this job to produce an effect.
+//
+// It exists separately from FirstContactEligibility because the two questions have
+// different lifetimes. Ownership is a fact about a resource and cannot change while a
+// job runs; permission is a setting that a person may have turned off since the job was
+// created, so it has to be asked again at the moment of the effect. Nil means this
+// process cannot answer, and the effect is refused: a panel that cannot say whether
+// unattended setup is enabled has not said that it is.
+//
+// It is only consulted for jobs that carry automation provenance. A manual job was
+// approved by a person and is not subject to an unattended-setup setting.
+type AutomaticEffectAllowed func(ctx context.Context, intent models.GigahostSetupIntent) (bool, string)
+
 // stepHostTrustedFirstContact is the recorded step of a job that trusted its own
 // first observation. It is the durable evidence that no person confirmed this
 // identity, which is what the confirmation path refuses to overwrite.
 const stepHostTrustedFirstContact = "host_trusted_first_contact"
+
+// stepAutomaticDisabled names a job that stopped because unattended setup is no
+// longer enabled. It is separate from the trust and reachability steps because the
+// operator's next action is different: nothing is wrong with the host, and the panel
+// deliberately did not act.
+const stepAutomaticDisabled = "automatic_setup_disabled"
 
 // firstContactEligible asks the injected ownership check whether this job may trust
 // its own first observation.
@@ -72,17 +92,65 @@ func (t *Tracker) firstContactEligible(
 	return ok, strings.TrimSpace(reason)
 }
 
+// automaticEffectAllowed asks the current policy whether this job may still produce an
+// effect, defaulting to refusal when nothing is wired.
+//
+// A manual job is answered yes without consulting anything: it was approved by a
+// person, and an unattended-setup setting has no authority over it. The automation
+// provenance is the recorded trust policy alone, because that is the only field a
+// worker or a confirmation cannot rewrite - a job whose identity is already pinned, or
+// whose phase journal is non-empty, is still the automatic job it was created as.
+func (t *Tracker) automaticEffectAllowed(
+	ctx context.Context, intent models.GigahostSetupIntent,
+) (bool, string) {
+	if intent.HostTrustPolicy != models.SetupTrustPolicyFirstContact {
+		return true, ""
+	}
+	if t.effectAllowed == nil {
+		return false, "this panel cannot report whether unattended setup is enabled"
+	}
+	allowed, reason := t.effectAllowed(ctx, intent)
+	return allowed, strings.TrimSpace(reason)
+}
+
+// automaticPinRefusal reports that a job may not pin because unattended setup does not
+// currently permit it.
+//
+// It is a retryable stop rather than a settled pause, and deliberately not a confirmation
+// request. Confirming an identity cannot enable unattended setup, so a confirmation prompt
+// would send an operator down a path that cannot work; and settling the row would strand a
+// job whose policy may simply be turned back on. Keeping it due for a later pass is what
+// lets the same job pin the identity the address presented once the panel permits it
+// again, while nothing is trusted and nothing authenticates in the meantime.
+func automaticPinRefusal(fingerprint, reason string) handoffDecision {
+	observed := fingerprint
+	return handoffDecision{
+		readFailure: true,
+		cause:       readFailure{step: stepAutomaticDisabled, message: reason},
+		candidate:   &observed,
+	}
+}
+
 // pinFirstContactIdentity records the observed identity and reports the decision the
 // pass should settle to.
 //
-// The outcomes are kept distinct because treating any of them as another would
-// either trust an unproven host or hide a real answer:
+// The current policy is asked here, immediately before the pin. It is the last moment
+// before an identity becomes durably trusted, so the answer is taken now rather than
+// inherited from an earlier decision.
+//
+// The outcomes are kept distinct because treating any of them as another would either
+// trust an unproven host or hide a real answer, and because the operator's next action
+// differs between them:
 //
 //   - pinned, or the same identity already pinned: the identity this job will use is
 //     exactly the one the address presented, so the handoff may continue;
-//   - a different identity is already pinned: trust does not move, and the pass
-//     pauses with the same changed-identity diagnosis the manual path gives a
-//     contradictory confirmation;
+//   - a different identity is already pinned: trust does not move, and the pass pauses
+//     with the same changed-identity diagnosis the manual path gives a contradictory
+//     confirmation;
+//   - unattended setup is no longer permitted: nothing is pinned. This one does not
+//     present itself as a confirmation request, because confirming an identity cannot
+//     enable unattended setup - only the setting can. The observed identity stays on the
+//     row so a person can see exactly what was presented when they decide;
 //   - anything else, including a store error: nothing was recorded, so nothing may
 //     be trusted. It is reported as a retryable failure, so the row keeps its place
 //     and the state machine re-evaluates it instead of claiming a decision it did
@@ -94,6 +162,9 @@ func (t *Tracker) pinFirstContactIdentity(
 		return handoffDecision{readFailure: true,
 			cause:     firstContactTrustFailure(fmt.Errorf("no host trust store is configured")),
 			candidate: &fingerprint}
+	}
+	if allowed, reason := t.automaticEffectAllowed(ctx, intent); !allowed {
+		return automaticPinRefusal(fingerprint, reason)
 	}
 	outcome, err := t.pinner.PinGigahostSetupFirstContact(ctx, intent.OrderID, fingerprint)
 	if err != nil {

@@ -119,6 +119,13 @@ func (h *Handlers) prepareInstall(
 	if err != nil {
 		return req, nil, err
 	}
+	// The current policy is asked before the precheck dials the host at all, so a
+	// job whose unattended setup was turned off sends no credential and registers
+	// nothing. It is asked again at each later phase, because a pass can take
+	// minutes and the answer can change while it runs.
+	if pause := h.refuseAutomaticEffect(ctx, intent, boundaryAuthentication); pause != nil {
+		return req, pause, nil
+	}
 	if pause, err := h.recheckInstallTrust(ctx, intent); err != nil || pause != nil {
 		return req, pause, err
 	}
@@ -229,12 +236,24 @@ func decideBoundTrust(bound, confirmed string) *installPause {
 
 // finishInstall performs enablement and admission for a server whose protocol
 // installation is already proven, then records the terminal success.
+//
+// Admission is the last boundary and it is checked separately from enablement on
+// purpose. Enablement is a completed effect by the time it returns - the backend
+// exists and was qualified - and a policy that turned off during it must not undo
+// that. What the panel still controls at this point is whether it records the job as
+// finished, so a refusal here leaves the truthful journal in place: the phases that
+// really completed stay recorded, and the job stops with a reason instead of claiming
+// a success that a disabled policy did not authorize.
 func (h *Handlers) finishInstall(
 	ctx context.Context, req GigahostDeployRequest, server *models.Server,
 	plan installPlan, journal *gigahostsetup.InstallJournal,
 ) error {
 	if err := h.installEnableStep(ctx, req, server, plan, journal); err != nil {
 		return err
+	}
+	if pause := h.refuseAutomaticEffect(ctx, journal.Intent(), boundaryHealthyAdmission); pause != nil {
+		journal.Pause(ctx, pause.step, errors.New(pause.detail))
+		return nil
 	}
 	if err := journal.Admit(ctx, "ready", server.ID); err != nil {
 		return err
@@ -266,7 +285,8 @@ func (h *Handlers) installEnableStep(
 				err: errors.New("a backend tunnel exists but is not admitted")}
 		}
 	}
-	ok, err := journal.BeginPhase(ctx, models.SetupPhaseEnabled, "enabling_backend")
+	ok, err := h.beginInstallPhase(ctx, journal.Intent(), journal,
+		models.SetupPhaseEnabled, "enabling_backend", boundaryBackendEnablement)
 	if err != nil || !ok {
 		return err
 	}
