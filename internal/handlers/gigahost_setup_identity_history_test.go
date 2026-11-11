@@ -120,8 +120,14 @@ func TestSetupFreshOrderChallengeThenConfirmedContinuation(t *testing.T) {
 
 // challengePeer is a real loopback SSH server that records what a client actually
 // did: whether it tried to authenticate and whether it opened a session.
+//
+// conns counts accepted TCP connections, which is the evidence that a client reached this
+// peer at all. Without it a "zero authentications" assertion cannot distinguish "refused at
+// the host key, as required" from "never dialled", and only the first of those is a
+// meaningful refusal.
 type challengePeer struct {
 	listener *net.TCPListener
+	conns    atomic.Int32
 	auths    atomic.Int32
 	sessions atomic.Int32
 }
@@ -153,6 +159,7 @@ func newChallengePeer(t *testing.T, hostSigner gossh.Signer) *challengePeer {
 			if err != nil {
 				return
 			}
+			peer.conns.Add(1)
 			go func() {
 				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 				serverConn, chans, reqs, err := gossh.NewServerConn(conn, cfg)
