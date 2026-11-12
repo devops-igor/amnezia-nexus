@@ -190,7 +190,12 @@ func s4LaunchInOwnedNamespace(testRunPattern string, extraEnv []string) (string,
 	defer func() { _ = os.Remove(recordPath); _ = os.Remove(recordPath + ".claimed") }()
 
 	// #nosec G204 -- os.Args[0] is this test binary; the namespace flags are literals
-	cmd := exec.Command("unshare", "-Urn", "--map-root-user", os.Args[0], "-test.run="+testRunPattern)
+	//
+	// -test.v is required, not cosmetic: the lifecycle caller asserts that its child
+	// printed a per-test "--- PASS" line, and the Go test framework only emits those
+	// when verbose. Without it a child that ran its assertions correctly still reported
+	// no per-test result, and the caller failed on the missing string.
+	cmd := exec.Command("unshare", "-Urn", "--map-root-user", os.Args[0], "-test.v", "-test.run="+testRunPattern)
 	cmd.Env = append(append(os.Environ(), recordEnv...), extraEnv...)
 	out, err := cmd.CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "S4 RESULT:") && !strings.Contains(string(out), "--- ") {
@@ -225,10 +230,47 @@ func runS4QualificationBody() int {
 	return runS4QualificationBodyTo(os.Stdout)
 }
 
-// configurePrivateNamespaceSetup applies the direct-egress settings to the private
-// namespace this process created for itself. It must only ever be called from the
-// re-executed probe (s4ProbeEnv), which by construction owns a throwaway namespace
-// that vanishes with the process; it never runs against a deployment or the host.
+// s4BuildOwnedNamespaceUplink gives a fresh private namespace the host WAN uplink the
+// production constructor requires.
+//
+// NewProductionWANDevice calls checkWANRoute -> DeriveHostWANIP, which needs either a
+// working outbound route or an administratively-up, non-loopback interface carrying a
+// non-loopback IPv4 address. A fresh `unshare -Urn` namespace contains only `lo`, so a
+// child that only configures sysctls is refused with ErrNoDefaultWANRoute. That refusal
+// is correct; the namespace was simply missing the topology a deployment has.
+//
+// The sequence is the one this binary's capture probe already uses, in the same
+// namespace shape, and it passed on the hosted runner. Every command goes through the
+// injectable s4RunCommand boundary, and ownership is proven first, so an unowned process
+// issues no command at all.
+func s4BuildOwnedNamespaceUplink() error {
+	if err := s4RequireOwnedNamespace(); err != nil {
+		return fmt.Errorf("refusing to build an uplink: %w", err)
+	}
+	for _, args := range [][]string{
+		{"link", "set", "lo", "up"},
+		{"link", "add", s4WANIface, "type", "veth", "peer", "name", s4WANPeerIface},
+		{"addr", "add", s4HostWAN + "/24", "dev", s4WANIface},
+		{"link", "set", s4WANIface, "up"},
+		{"link", "set", s4WANPeerIface, "up"},
+		{"route", "add", "default", "dev", s4WANIface},
+	} {
+		if out, err := s4Command("ip", args...); err != nil {
+			return fmt.Errorf("build private namespace uplink: ip %v: %w: %s", args, err, strings.TrimSpace(out))
+		}
+	}
+	return nil
+}
+
+// configurePrivateNamespaceSetup applies the direct-egress kernel settings to the
+// private namespace this process created for itself. It must only ever be called
+// from the re-executed probe (s4ProbeEnv), which by construction owns a throwaway
+// namespace that vanishes with the process; it never runs against a deployment or
+// the host.
+//
+// It deliberately does NOT build an uplink: a caller that needs one builds it
+// explicitly, so a process that only needs these sysctls never has interfaces
+// created underneath it.
 func configurePrivateNamespaceSetup() error {
 	// This is the normal initial-setup write path, and it is the one that must never
 	// run against a host. It proves ownership FIRST, before the first sysctl, so an

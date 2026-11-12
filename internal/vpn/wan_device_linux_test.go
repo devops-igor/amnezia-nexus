@@ -79,6 +79,12 @@ func TestProductionWANDevice_PermissionsAndLifecycle(t *testing.T) {
 	if err := configurePrivateNamespaceSetup(); err != nil {
 		t.Fatalf("configure owned namespace: %v", err)
 	}
+	// The constructor also requires a host WAN address (checkWANRoute ->
+	// DeriveHostWANIP). A fresh namespace has only lo, so the child builds the uplink a
+	// deployment would have before calling it. The constructor itself is unchanged.
+	if err := s4BuildOwnedNamespaceUplink(); err != nil {
+		t.Fatalf("provide the owned namespace's WAN uplink: %v", err)
+	}
 
 	dev, err := NewProductionWANDevice("nexus-wan-test")
 	if err != nil {

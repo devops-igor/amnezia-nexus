@@ -189,6 +189,53 @@ func TestS4OwnedNamespaceGuard(t *testing.T) {
 			t.Fatalf("the live refusal ran commands while refusing: %v", *ran)
 		}
 	})
+
+	// The uplink builder is the newest mutation path, so it must refuse before its first
+	// command exactly like the sysctl writers, and it must issue the documented topology
+	// when it IS admitted.
+	t.Run("uplink build refuses without running a command", func(t *testing.T) {
+		freshProcess(t)
+		clearLaunchEnv(t)
+		withInode(t, launcherNS)
+		ran := instrument(t)
+		if err := s4BuildOwnedNamespaceUplink(); err == nil {
+			t.Fatal("the uplink was built without an owned namespace")
+		}
+		if len(*ran) != 0 {
+			t.Fatalf("the uplink build ran commands while refusing: %v", *ran)
+		}
+	})
+
+	t.Run("uplink build issues the host WAN topology when owned", func(t *testing.T) {
+		freshProcess(t)
+		path, env := recordFor(t, launcherNS)
+		for _, kv := range env {
+			k, v, _ := strings.Cut(kv, "=")
+			t.Setenv(k, v)
+		}
+		_ = path
+		withInode(t, childNS)
+		ran := instrument(t)
+		if err := s4BuildOwnedNamespaceUplink(); err != nil {
+			t.Fatalf("uplink build refused in an owned namespace: %v", err)
+		}
+		got := strings.Join(*ran, "\n")
+		// NewProductionWANDevice only needs an up, non-loopback IPv4 interface, and this
+		// is the same sequence the capture probe uses. Assert the load-bearing steps.
+		for _, want := range []string{
+			"ip link add " + s4WANIface + " type veth peer name " + s4WANPeerIface,
+			"ip addr add " + s4HostWAN + "/24 dev " + s4WANIface,
+			"ip link set " + s4WANIface + " up",
+			"ip route add default dev " + s4WANIface,
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("uplink build did not issue %q; ran:\n%s", want, got)
+			}
+		}
+		if !strings.Contains(got, "ip link set lo up") {
+			t.Fatalf("uplink build did not bring lo up; ran:\n%s", got)
+		}
+	})
 }
 
 // TestS4OwnedNamespaceComposition pins the ACTUAL consumer composition rather than the
@@ -346,5 +393,38 @@ func TestS4OwnedNamespaceCaptureComposition(t *testing.T) {
 	// 2. the in-body check before writing sysctls
 	if err := s4RequireOwnedNamespace(); err != nil {
 		t.Fatalf("capture probe's second (in-body) check was refused: %v", err)
+	}
+}
+
+// TestS4LaunchArgvCarriesVerbose pins the launcher's argv without creating a
+// namespace: a stub `unshare` is placed first on PATH and records the arguments it
+// receives, then exits non-zero so nothing is launched.
+//
+// It exists because the lifecycle caller reads its child's per-test "--- PASS" line,
+// and the Go test framework only prints those under -test.v. Dropping the flag makes a
+// child that ran its assertions correctly report no per-test result, which the caller
+// then treats as a failure.
+func TestS4LaunchArgvCarriesVerbose(t *testing.T) {
+	dir := t.TempDir()
+	argvPath := filepath.Join(dir, "argv")
+	// Refuses instead of launching: no namespace, no child, no kernel state.
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argvPath + "\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "unshare"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write stub unshare: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// The launch fails (the stub refuses); only its argv is under test.
+	_, _ = s4LaunchInOwnedNamespace("^TestExample$", nil)
+
+	raw, err := os.ReadFile(argvPath)
+	if err != nil {
+		t.Fatalf("the launcher did not invoke unshare at all: %v", err)
+	}
+	argv := strings.Fields(string(raw))
+	for _, want := range []string{"-Urn", "--map-root-user", "-test.v", "-test.run=^TestExample$"} {
+		if !strings.Contains(strings.Join(argv, " "), want) {
+			t.Fatalf("launcher argv is missing %q; got %v", want, argv)
+		}
 	}
 }
