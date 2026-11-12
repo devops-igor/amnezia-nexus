@@ -96,7 +96,49 @@ func (hp *HealthProber) acceptCanaryObservation(t *models.BackendTunnel, sequenc
 		hp.canaryFailCounts[t.ServerID]++
 	}
 	hp.canaryResults[t.ServerID] = canaryResult{tunnelID: t.ID, sequence: sequence}
+
+	// Mirror the ACCEPTED verdict into the sanitized transition record, so the
+	// last confirmed inner success and its failure streak are readable without
+	// re-deriving them. This runs inside the same critical section as the
+	// authoritative history write: a rejected (obsolete) observation never
+	// reaches here, so the diagnostic can never claim evidence the decision layer
+	// refused.
+	//
+	// Only the INNER half is written here. The outer half belongs to the probe
+	// path that produced it, and overwriting it with the inner verdict would erase
+	// the outer failure streak an operator needs to see.
+	rec := hp.gateRecordLocked(t)
+	rec.lastAttemptInner = attemptOutcomeFor(success)
+	if success {
+		rec.lastSuccessAt = hp.now()
+		rec.lastSuccessDevice = deviceCreated
+		if !deviceCreated.IsZero() {
+			rec.deviceCreatedAt = deviceCreated
+		}
+		if rec.failureCategory == FailureNone || rec.failureCategory == FailureInner {
+			rec.failureCategory = FailureNone
+			rec.failureCount = 0
+			rec.failureThreshold = hp.cfg.FailureThreshold
+		}
+	} else {
+		// An inner failure is its own category only when it is the streak being
+		// reported; an outer failure streak must not be relabelled by it.
+		if rec.failureCategory != FailureOuter && rec.failureCategory != FailureAttachment {
+			rec.failureCategory = FailureInner
+			rec.failureCount = hp.canaryFailCounts[t.ServerID]
+			rec.failureThreshold = hp.cfg.FailureThreshold
+		}
+	}
 	return nil
+}
+
+// attemptOutcomeFor maps an accepted canary verdict onto the sanitized attempt
+// vocabulary.
+func attemptOutcomeFor(success bool) AttemptOutcome {
+	if success {
+		return OutcomeSuccess
+	}
+	return OutcomeFailure
 }
 
 // ensureCanaryMapsLocked allocates the canary history maps on first write.

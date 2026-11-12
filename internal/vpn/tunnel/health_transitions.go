@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
@@ -153,7 +154,14 @@ func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models
 	}
 	hp.failCounts[snapshot.ServerID]++
 	failures := hp.failCounts[snapshot.ServerID]
+	threshold := hp.cfg.FailureThreshold
 	hp.mu.Unlock()
+
+	// Sanitized evidence for the last attempt: the outer exchange failed and the
+	// inner data path was never reached on this attempt, so it contributes no
+	// inner observation either way.
+	hp.recordProbeAttempt(snapshot, OutcomeFailure, OutcomeNotRun)
+	hp.recordFailureStreak(snapshot, FailureOuter, failures, threshold)
 
 	if err := hp.confirmOuterFailure(ctx, snapshot, failures); err != nil {
 		return 0, err
@@ -185,6 +193,7 @@ func (hp *HealthProber) transitionToHandshakeBlocked(ctx context.Context, snapsh
 			snapshot.StateVersion++
 			snapshot.Status = models.TunnelStatusHandshakeBlocked
 			snapshot.DisableReason = models.DisableReasonNone
+			hp.recordGate(snapshot, GateOuterUnproven, time.Time{})
 			return hp.updateHealthIfCurrent(snapshot, func() {
 				delete(hp.autoDisabled, snapshot.ServerID)
 				hp.successCounts[snapshot.ServerID] = 0
@@ -242,6 +251,7 @@ func (hp *HealthProber) transitionToThresholdDisabled(ctx context.Context, snaps
 			snapshot.StateVersion++
 			snapshot.Status = models.TunnelStatusDisabled
 			snapshot.DisableReason = models.DisableReasonHealth
+			hp.recordGate(snapshot, GateHealthDisable, time.Time{})
 			// Terminal health disable committed: hand the established sessions
 			// pinned to this backend to the data plane owner so it can migrate
 			// them. Runs outside hp.mu/pool.mu and is idempotent.
@@ -382,7 +392,11 @@ func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.
 	// withdraws a backend whose established data path was never shown to be
 	// broken.
 	failures := hp.recordHookFailureLocked(snapshot.ServerID)
+	threshold := hp.cfg.FailureThreshold
 	hp.mu.Unlock()
+
+	hp.recordProbeAttempt(snapshot, OutcomeUnknown, OutcomeFailure)
+	hp.recordFailureStreak(snapshot, FailureAttachment, failures, threshold)
 
 	if failures >= hp.cfg.FailureThreshold {
 		// An attachment failure is evidence that the attach ATTEMPT failed, not

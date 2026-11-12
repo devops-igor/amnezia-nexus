@@ -148,8 +148,19 @@ func (o *Orchestrator) resolveAWGProbeKeys(ctx context.Context, server *models.S
 	if serverPub == "" {
 		serverPub = cached.serverPub
 	}
-	if cached.clientPriv != "" {
+	if cached.clientPriv != "" && probeIdentityStillValid(cached, serverPub) {
+		// The warm entry is only usable while it still describes this backend.
+		// An AWG reinstall or a server key rotation replaces the server identity
+		// and its clientsTable, so a probe peer registered before it no longer
+		// exists on the backend; returning the cached key would sign every later
+		// handshake with a peer the backend never registered, and nothing would
+		// ever clear the entry.
 		return serverPub, cached.clientPriv, cached.psk
+	}
+	if cached.clientPriv != "" {
+		// Established identity is superseded: drop it before resolving, so a
+		// concurrent cycle cannot keep reading the retired one.
+		o.forgetProbeIdentity(server.ID)
 	}
 
 	if o.registry == nil {
@@ -164,6 +175,34 @@ func (o *Orchestrator) resolveAWGProbeKeys(ctx context.Context, server *models.S
 		return serverPub, "", ""
 	}
 	return o.provisionProbeIdentity(ctx, server, hpm, serverPub)
+}
+
+// probeIdentityStillValid reports whether a cached probe identity still belongs to
+// the backend this cycle is talking to.
+//
+// The fence is the SERVER IDENTITY — the server's own public key — because that is
+// what an install, a reinstall and a key rotation all change, and because the
+// probe peer is registered against it. An absent key carries no new information
+// (a partially populated server row must not churn a working identity), so absence
+// preserves the entry; a DIFFERENT key invalidates it.
+func probeIdentityStillValid(cached healthProbeKey, serverPub string) bool {
+	if cached.serverPub == "" {
+		// The cache recorded no server key to compare against; keep the identity
+		// rather than re-registering on every cycle.
+		return true
+	}
+	if serverPub == "" {
+		return true
+	}
+	return cached.serverPub == serverPub
+}
+
+// forgetProbeIdentity drops a cached identity that no longer describes the
+// backend.
+func (o *Orchestrator) forgetProbeIdentity(serverID int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.healthProbeKeys, serverID)
 }
 
 // provisionProbeIdentity resolves the server public key together with the

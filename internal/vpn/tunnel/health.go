@@ -128,9 +128,15 @@ type HealthProber struct {
 	// scheduled for a retired backend cannot clear the quarantine a replacement
 	// established in the same server slot after matcher.
 	pendingEnrollmentGeneration map[int64]int64
-	stopCh                      chan struct{}
-	wg                          sync.WaitGroup
-	running                     bool
+	// gateRecords holds the sanitized decision evidence behind each backend's
+	// current status: the last probe attempt, the failure streak and threshold,
+	// the last confirmed inner success, and the condition currently deciding
+	// eligibility. Fenced by tunnel generation, so a replaced backend's record is
+	// never read as the current verdict.
+	gateRecords map[int64]*gateRecord
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
+	running     bool
 }
 
 // NewHealthProber initializes a new HealthProber instance.
@@ -190,6 +196,7 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 		healthGenerations:           make(map[int64]int64),
 		pendingEnrollment:           make(map[int64]bool),
 		pendingEnrollmentGeneration: make(map[int64]int64),
+		gateRecords:                 make(map[int64]*gateRecord),
 		stopCh:                      make(chan struct{}),
 	}
 	hp.restoreUnboundEnrollments(db)
@@ -629,6 +636,11 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		}
 	}
 
+	// The outer exchange succeeded. Whether the inner data path confirmed is a
+	// separate observation, and for a protocol without an in-tunnel canary it was
+	// never taken - reported as not_run rather than assumed healthy.
+	hp.recordProbeAttempt(&probeTarget, OutcomeSuccess, hp.lastInnerOutcome(&probeTarget))
+
 	// A slow successful outer sample is not evidence that the inner plane was
 	// lost. Degraded status is exactly what makes established sessions
 	// migration-eligible, so an already-blocked backend that still serves
@@ -661,6 +673,11 @@ func (hp *HealthProber) commitActiveProbeSuccess(ctx context.Context, snapshot, 
 	targetStatus := status
 	if isPending {
 		targetStatus = models.TunnelStatusConnecting
+		// Outer success is not admission evidence, so this backend stays out of
+		// rotation on enrollment grounds rather than because its probe failed.
+		hp.recordGate(probeTarget, GateEnrollmentQuarantine, hp.attachedDeviceCreatedAt(probeTarget))
+	} else {
+		hp.recordGate(probeTarget, GateNone, hp.attachedDeviceCreatedAt(probeTarget))
 	}
 	if hp.pool != nil {
 		expectedVersion := probeTarget.StateVersion
