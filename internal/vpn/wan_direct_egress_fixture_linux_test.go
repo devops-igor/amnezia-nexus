@@ -399,6 +399,11 @@ func s4RequireOwnedNamespace() error {
 // network configuration that genuinely works. Nothing here touches the host: these
 // sysctls belong to the throwaway namespace, which disappears with the process.
 func s4AssertLiveIncompatibleConfigRefused() error {
+	// Writing rp_filter is only permissible in a namespace this process owns: anywhere
+	// else the same writes would reconfigure the host that is running the gate.
+	if err := s4RequireOwnedNamespace(); err != nil {
+		return fmt.Errorf("refusing to run the live source-validation refusal: %w", err)
+	}
 	restore, err := s4SetNamespaceRPFilter("2")
 	if err != nil {
 		return fmt.Errorf("prepare live incompatible configuration: %w", err)

@@ -81,6 +81,33 @@ func s4RequiredEnvironment() bool {
 	return os.Getenv("GITHUB_ACTIONS") != "" || os.Getenv("CI") != ""
 }
 
+// TestS4OwnedNamespaceGuard pins the marker that decides whether this process may
+// configure kernel settings. It is pure: it sets environment variables only, so it
+// proves the guard in both directions without creating a namespace or touching a
+// kernel setting.
+func TestS4OwnedNamespaceGuard(t *testing.T) {
+	t.Run("unset refuses", func(t *testing.T) {
+		t.Setenv(s4OwnedNamespaceEnv, "")
+		if err := s4RequireOwnedNamespace(); err == nil {
+			t.Fatal("the guard accepted a process that does not own a namespace")
+		}
+	})
+	t.Run("set accepts", func(t *testing.T) {
+		t.Setenv(s4OwnedNamespaceEnv, "1")
+		if err := s4RequireOwnedNamespace(); err != nil {
+			t.Fatalf("the guard rejected a process that owns its namespace: %v", err)
+		}
+	})
+	t.Run("live refusal refuses outside an owned namespace", func(t *testing.T) {
+		t.Setenv(s4OwnedNamespaceEnv, "")
+		// This must refuse BEFORE writing any sysctl: outside an owned namespace the
+		// writes would reconfigure the host running the gate.
+		if err := s4AssertLiveIncompatibleConfigRefused(); err == nil {
+			t.Fatal("the live refusal wrote sysctls in a process that owns no namespace")
+		}
+	})
+}
+
 // TestS4RequiredEnvironment pins the anti-silent-skip contract: a required CI run
 // must never be able to report success by not executing the gate.
 func TestS4RequiredEnvironment(t *testing.T) {
@@ -247,7 +274,7 @@ func runS4QualificationBodyTo(w io.Writer) int {
 			effective, reported["all_rp_filter"], reported["default_rp_filter"])
 	}
 
-	// --- Phase 1b: the same production constructor REFUSES a live incompatible host
+	// --- Phase 1b: the production constructor REFUSES a live incompatible namespace
 	// This is the live half of the counterexample: in this namespace, which we own,
 	// set the incompatible settings for real, hand the address to the production
 	// validator exactly as startup does, and require it to refuse with the
