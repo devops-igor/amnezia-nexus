@@ -673,12 +673,8 @@ func (hp *HealthProber) commitActiveProbeSuccess(ctx context.Context, snapshot, 
 	targetStatus := status
 	if isPending {
 		targetStatus = models.TunnelStatusConnecting
-		// Outer success is not admission evidence, so this backend stays out of
-		// rotation on enrollment grounds rather than because its probe failed.
-		hp.recordGate(probeTarget, GateEnrollmentQuarantine, hp.attachedDeviceCreatedAt(probeTarget))
-	} else {
-		hp.recordGate(probeTarget, GateNone, hp.attachedDeviceCreatedAt(probeTarget))
 	}
+	var committedVersion int64
 	if hp.pool != nil {
 		expectedVersion := probeTarget.StateVersion
 		if snapshot != nil && snapshot.StateVersion > 0 {
@@ -688,7 +684,19 @@ func (hp *HealthProber) commitActiveProbeSuccess(ctx context.Context, snapshot, 
 			return err
 		}
 		probeTarget.StateVersion = expectedVersion + 1
+		committedVersion = probeTarget.StateVersion
 	}
+	// Record the gate at the version the write just produced, not the one it
+	// started from: the evidence must describe the state a reader will observe.
+	// Recording before the commit made the fresh record look stale by exactly one
+	// version, which is indistinguishable from "the row moved on".
+	gate := GateNone
+	if isPending {
+		// Outer success is not admission evidence, so this backend stays out of
+		// rotation on enrollment grounds rather than because its probe failed.
+		gate = GateEnrollmentQuarantine
+	}
+	hp.recordGateAtVersion(probeTarget, gate, hp.attachedDeviceCreatedAt(probeTarget), committedVersion)
 	if err := hp.checkTunnelAvailable(probeTarget); err != nil {
 		return err
 	}

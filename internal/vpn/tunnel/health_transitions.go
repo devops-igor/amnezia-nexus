@@ -193,7 +193,7 @@ func (hp *HealthProber) transitionToHandshakeBlocked(ctx context.Context, snapsh
 			snapshot.StateVersion++
 			snapshot.Status = models.TunnelStatusHandshakeBlocked
 			snapshot.DisableReason = models.DisableReasonNone
-			hp.recordGate(snapshot, GateOuterUnproven, time.Time{})
+			hp.recordGateAtVersion(snapshot, GateOuterUnproven, time.Time{}, 0)
 			return hp.updateHealthIfCurrent(snapshot, func() {
 				delete(hp.autoDisabled, snapshot.ServerID)
 				hp.successCounts[snapshot.ServerID] = 0
@@ -251,7 +251,7 @@ func (hp *HealthProber) transitionToThresholdDisabled(ctx context.Context, snaps
 			snapshot.StateVersion++
 			snapshot.Status = models.TunnelStatusDisabled
 			snapshot.DisableReason = models.DisableReasonHealth
-			hp.recordGate(snapshot, GateHealthDisable, time.Time{})
+			hp.recordGateAtVersion(snapshot, GateHealthDisable, time.Time{}, 0)
 			// Terminal health disable committed: hand the established sessions
 			// pinned to this backend to the data plane owner so it can migrate
 			// them. Runs outside hp.mu/pool.mu and is idempotent.

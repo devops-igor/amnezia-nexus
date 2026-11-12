@@ -83,6 +83,10 @@ const (
 	// FreshnessPreviousGeneration means the recorded evidence belongs to a
 	// replaced tunnel row.
 	FreshnessPreviousGeneration EvidenceFreshness = "previous_generation"
+	// FreshnessNoDevice means the evidence was bound to a device and none is
+	// attached now, so it cannot describe the current data path. Detach without a
+	// fresh observation must not read as current health.
+	FreshnessNoDevice EvidenceFreshness = "no_device"
 )
 
 // TransitionEvidence is the sanitized record of what the health decision used.
@@ -131,10 +135,28 @@ type TransitionEvidence struct {
 	// never inferred from a status write.
 	LastSuccessAt *time.Time `json:"last_successful_health_at,omitempty"`
 	// SuccessFreshness classifies LastSuccessAt against the cadence-derived
-	// bound and the current device/generation identity.
+	// bound and the CURRENT device/generation identity.
 	SuccessFreshness EvidenceFreshness `json:"success_freshness"`
-	// DeviceCreatedAt identifies the backend device the evidence is bound to.
-	DeviceCreatedAt *time.Time `json:"device_created_at,omitempty"`
+	// DeviceCreatedAt identifies the backend device the recorded evidence is bound
+	// to. CurrentDeviceCreatedAt identifies the device attached NOW; they differ
+	// after a replacement, and a null current stamp means nothing is attached.
+	DeviceCreatedAt        *time.Time `json:"device_created_at,omitempty"`
+	CurrentDeviceCreatedAt *time.Time `json:"current_device_created_at,omitempty"`
+
+	// RecordedStateVersion is the version observed when this record was written;
+	// StateVersion above is the version of the tunnel row this projection was
+	// requested for. They differ when the row changed without another recorded
+	// probe, and the record then describes an OLDER observation.
+	RecordedStateVersion int64 `json:"recorded_state_version,omitempty"`
+	// RecordedEnabled is the administrative intent at recording time, so a change
+	// of intent that has not yet been re-observed is visible instead of being
+	// restated as current.
+	RecordedEnabled bool `json:"recorded_enabled"`
+	// Current is false when the record no longer describes the backend as it is
+	// now (state version or administrative intent moved on). The recorded attempt
+	// history stays readable; the GATE and the freshness must then be read as
+	// describing an earlier observation, not current health.
+	Current bool `json:"current"`
 }
 
 // gateRecord is the mutable per-server record behind TransitionEvidence. It is
@@ -176,13 +198,18 @@ func (hp *HealthProber) lastInnerOutcome(t *models.BackendTunnel) AttemptOutcome
 }
 
 // attachedDeviceCreatedAt reports the creation stamp of the backend device
-// currently attached to t, or the zero time when none is attached. It is the
-// identity the recorded inner evidence is bound to.
+// currently attached to t, or the zero time when none is attached or the device
+// cannot report its stamp. It is the identity the recorded inner evidence is
+// bound to, so an unknown stamp must read as "unknown", never as a match.
 func (hp *HealthProber) attachedDeviceCreatedAt(t *models.BackendTunnel) time.Time {
 	if hp == nil || t == nil {
 		return time.Time{}
 	}
-	return canaryDeviceGeneration(hp.GetDevice(t.ID))
+	dev := hp.GetDevice(t.ID)
+	if dev == nil {
+		return time.Time{}
+	}
+	return canaryDeviceGeneration(dev)
 }
 
 // recordProbeAttempt records one probe attempt's sanitized outcome. outer is the
@@ -234,8 +261,15 @@ func (hp *HealthProber) recordFailureStreak(t *models.BackendTunnel, category Fa
 	rec.failureThreshold = threshold
 }
 
-// recordGate records the condition currently deciding eligibility for t.
-func (hp *HealthProber) recordGate(t *models.BackendTunnel, gate TransitionGate, deviceCreated time.Time) {
+// recordGate records the condition currently deciding eligibility for t, against
+// the version of the tunnel row this observation belongs to.
+//
+// stateVersion is the version the decision was committed at. Passing it
+// explicitly (rather than letting the record copy whatever version the caller's
+// snapshot happens to carry) is what lets a later projection tell "this record
+// describes the state you are looking at" from "the row has moved on since".
+// Zero means the decision did not change the row, so the observed version stands.
+func (hp *HealthProber) recordGateAtVersion(t *models.BackendTunnel, gate TransitionGate, deviceCreated time.Time, stateVersion int64) {
 	if hp == nil || t == nil {
 		return
 	}
@@ -243,6 +277,9 @@ func (hp *HealthProber) recordGate(t *models.BackendTunnel, gate TransitionGate,
 	defer hp.mu.Unlock()
 	rec := hp.gateRecordLocked(t)
 	rec.gate = gate
+	if stateVersion > 0 {
+		rec.stateVersion = stateVersion
+	}
 	if !deviceCreated.IsZero() {
 		rec.deviceCreatedAt = deviceCreated
 	}
@@ -252,47 +289,128 @@ func (hp *HealthProber) recordGate(t *models.BackendTunnel, gate TransitionGate,
 //
 // ok is false when no observation has been recorded for the CURRENT tunnel
 // generation; a caller must then report the gate as unknown rather than reuse a
-// previous backend's record. The device identity in the snapshotted tunnel is
-// used to classify the recorded success, so evidence from a detached or replaced
-// device is reported as such instead of being presented as current health.
+// previous backend's record.
+//
+// The projection is deliberately a SNAPSHOT, not a live re-interpretation. A
+// recorded observation is a fact about the moment it was taken, so this method
+// reads the record under hp.mu and then compares it with the backend as it is
+// now: the tunnel row supplied by the caller (state version, administrative
+// intent) and the device attached at call time. When those moved on, the record
+// still describes the last attempt, but it is reported as NOT current and its
+// success evidence is reclassified against the current device - because a detach
+// or replacement that happened without another probe must never leave the last
+// success looking fresh for a data path that is gone.
 func (hp *HealthProber) TransitionEvidenceFor(t *models.BackendTunnel) (TransitionEvidence, bool) {
 	if hp == nil || t == nil {
 		return TransitionEvidence{}, false
 	}
+
+	// Read the current device BEFORE taking hp.mu: the provider behind GetDevice
+	// consults the data-plane owner, so calling it under this lock would nest
+	// hp.mu -> Service.mu and risk the inversion the state contract warns about.
+	currentDevice := hp.attachedDeviceCreatedAt(t)
+
 	hp.mu.RLock()
-	defer hp.mu.RUnlock()
 	rec, ok := hp.gateRecords[t.ServerID]
 	if !ok || rec == nil || rec.tunnelID != t.ID {
+		hp.mu.RUnlock()
 		return TransitionEvidence{}, false
 	}
+	// Copy every field this projection needs and release the lock before deriving
+	// anything, so no classification runs while hp.mu is held.
+	snap := *rec
+	himself := hp
+	hp.mu.RUnlock()
 
 	ev := TransitionEvidence{
-		Gate:             rec.gate,
-		TunnelID:         rec.tunnelID,
-		StateVersion:     t.StateVersion,
-		Enabled:          t.Enabled,
-		LastAttemptOuter: rec.lastAttemptOuter,
-		LastAttemptInner: rec.lastAttemptInner,
-		FailureCategory:  rec.failureCategory,
-		FailureCount:     rec.failureCount,
-		FailureThreshold: rec.failureThreshold,
-		SuccessFreshness: FreshnessNone,
+		Gate:                   snap.gate,
+		TunnelID:               snap.tunnelID,
+		StateVersion:           t.StateVersion,
+		RecordedStateVersion:   snap.stateVersion,
+		Enabled:                t.Enabled,
+		RecordedEnabled:        snap.enabled,
+		LastAttemptOuter:       snap.lastAttemptOuter,
+		LastAttemptInner:       snap.lastAttemptInner,
+		FailureCategory:        snap.failureCategory,
+		FailureCount:           snap.failureCount,
+		FailureThreshold:       snap.failureThreshold,
+		SuccessFreshness:       FreshnessNone,
+		DeviceCreatedAt:        timePtr(snap.deviceCreatedAt),
+		CurrentDeviceCreatedAt: timePtr(currentDevice),
 	}
 	if ev.Gate == "" {
 		ev.Gate = GateNone
 	}
-	ev.LastAttemptOutcome = attemptOutcome(rec.lastAttemptOuter, rec.lastAttemptInner)
-	ev.LastAttemptAt = timePtr(rec.lastAttemptAt)
-	ev.LastSuccessAt = timePtr(rec.lastSuccessAt)
-	ev.DeviceCreatedAt = timePtr(rec.deviceCreatedAt)
+	ev.LastAttemptOutcome = attemptOutcome(snap.lastAttemptOuter, snap.lastAttemptInner)
+	ev.LastAttemptAt = timePtr(snap.lastAttemptAt)
+	ev.LastSuccessAt = timePtr(snap.lastSuccessAt)
+	ev.Current = snap.stateVersion == t.StateVersion && snap.enabled == t.Enabled
 
-	if !rec.lastSuccessAt.IsZero() {
-		ev.SuccessFreshness = hp.classifyEvidenceLocked(rec, t)
+	// Administrative intent and enrollment state can change WITHOUT another probe,
+	// so a recorded gate may describe a condition that no longer holds (or miss one
+	// that now does). Only the parts that are observable right now are restated;
+	// everything else stays as the recorded observation and is flagged not-current.
+	ev.Gate = himself.currentGateFor(t, &snap, ev.Current)
+
+	if !snap.lastSuccessAt.IsZero() {
+		ev.SuccessFreshness = himself.classifyEvidence(&snap, t, currentDevice)
 	}
 
 	// A record observed for an administratively disabled backend still describes
 	// the last attempt; the gate is reported from the recorded decision.
 	return ev, true
+}
+
+// currentGateFor reconciles a recorded gate with the state observable now.
+//
+// A record that still describes the backend as it is (recordCurrent) is the
+// health prober's own verdict and is reported unchanged — the reconciliation here
+// exists only for the case the round-10 intake found, where the row moved on
+// without another observation.
+//
+// When the record is NOT current, only the two conditions that can change with no
+// probe at all are restated:
+//   - an administrative disable, which is authoritative the moment it is set
+//     (automated health decisions do not apply to it), and
+//   - the END of an enrollment quarantine, because explaining the state by a
+//     condition that is over is exactly the stale explanation this correction is
+//     for.
+//
+// Everything else stays as the recorded observation.
+func (hp *HealthProber) currentGateFor(t *models.BackendTunnel, rec *gateRecord, recordCurrent bool) TransitionGate {
+	recorded := rec.gate
+	if recorded == "" {
+		recorded = GateNone
+	}
+	if !t.Enabled {
+		// Administrative intent is authoritative regardless of record currency.
+		return GateAdministrative
+	}
+	if recordCurrent {
+		return recorded
+	}
+	if recorded == GateAdministrative {
+		// The record predates a re-enable, so it no longer explains anything
+		// current. Report no gate rather than a stale exclusion.
+		return GateNone
+	}
+	if recorded == GateEnrollmentQuarantine && !hp.enrollmentPendingFor(t) {
+		// The quarantine ended and was cleared by a legitimate lifecycle path; the
+		// next probe will record the new gate. Until then, do not keep attributing
+		// the state to enrollment.
+		return GateNone
+	}
+	return recorded
+}
+
+// enrollmentPendingFor reports the pool's current runtime enrollment quarantine
+// for the tunnel. It reads the pool under the pool's own lock and is called with
+// hp.mu released, so it introduces no new lock ordering.
+func (hp *HealthProber) enrollmentPendingFor(t *models.BackendTunnel) bool {
+	if hp.pool == nil {
+		return false
+	}
+	return hp.pool.EnrollmentPending(t.ServerID)
 }
 
 // timePtr returns a pointer to a copy of at, or nil for the zero time, so an
@@ -338,28 +456,46 @@ func attemptOutcome(outer, inner AttemptOutcome) AttemptOutcome {
 	}
 }
 
-// classifyEvidenceLocked reports whether the recorded inner success may still be
-// used, and if not, which fence rejected it. Callers hold hp.mu.
-func (hp *HealthProber) classifyEvidenceLocked(rec *gateRecord, t *models.BackendTunnel) EvidenceFreshness {
+// classifyEvidence reports whether the recorded inner success may still be used,
+// and if not, which fence rejected it.
+//
+// It compares the RECORDED evidence against the device attached NOW, not against
+// another recorded fact. That distinction is the whole point: a detach or a
+// replacement is not accompanied by a new gate record, so a projection that only
+// compared recorded fields would keep calling a vanished device's success "fresh".
+//
+// It is called without hp.mu held (the caller takes a snapshot copy first), so it
+// may read the prober's counters through their own accessor. The only map it
+// touches is canaryFailCounts, read under the prober lock.
+func (hp *HealthProber) classifyEvidence(rec *gateRecord, t *models.BackendTunnel, currentDevice time.Time) EvidenceFreshness {
 	if rec.lastSuccessDevice.IsZero() {
 		// Without a device stamp the evidence cannot be bound to a data path.
 		return FreshnessNone
 	}
-	if !rec.lastSuccessDevice.Equal(rec.deviceCreatedAt) && !rec.deviceCreatedAt.IsZero() {
+	if currentDevice.IsZero() {
+		// The evidence was bound to a device and nothing is attached now.
+		return FreshnessNoDevice
+	}
+	if !rec.lastSuccessDevice.Equal(currentDevice) {
 		return FreshnessPreviousDevice
 	}
 	// A recorded failure since that success withdraws the evidence regardless of
 	// how recent it is: the timestamp only says when the canary last SUCCEEDED,
-	// not whether it has failed since. hp.canaryFailCounts is guarded by this same
-	// lock, so it is read directly rather than through the locking accessor.
-	if hp.canaryFailCounts[t.ServerID] > 0 {
-		return FreshnessStale
-	}
-	age := hp.now().Sub(rec.lastSuccessAt)
-	if age < 0 || age > hp.maxCanaryEvidenceAgeLocked() {
+	// not whether it has failed since.
+	hp.mu.RLock()
+	failures := hp.canaryFailCounts[t.ServerID]
+	hp.mu.RUnlock()
+	if failures > 0 {
 		return FreshnessStale
 	}
 	if !t.Enabled {
+		return FreshnessStale
+	}
+	hp.mu.RLock()
+	age := time.Since(rec.lastSuccessAt)
+	limit := hp.maxCanaryEvidenceAgeLocked()
+	hp.mu.RUnlock()
+	if age < 0 || age > limit {
 		return FreshnessStale
 	}
 	return FreshnessFresh
