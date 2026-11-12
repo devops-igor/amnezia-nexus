@@ -355,7 +355,7 @@ func runS4QualificationBodyTo(w io.Writer) int {
 	// the close) that a wider window would attribute to the proxy route.
 	dropsBeforeProxy := dem.DirectDrops()
 	bytesBeforeProxy := dem.DirectBytes()
-	if err := svc.forwarder.RouteClientToBackend("peer-s4-proxy", buildTestPBRUDPPacket(
+	if err := svc.forwarder.RouteClientToBackend("peer-s4-proxy", s4UDPPacketWithChecksums(
 		netip.MustParseAddr(s4ProxyBackendClientIP), s4ProxyDstIP, 5555, 53, []byte("proxy-probe"))); err != nil {
 		return fail("route UNKNOWN destination packet: %v", err)
 	}
@@ -409,6 +409,57 @@ const (
 // backend stack is given this address so the packet the pumps write into the device
 // is actually delivered to the echo listener; nothing else about the path changes.
 var s4ProxyDstIP = netip.MustParseAddr("8.8.4.4")
+
+// s4UDPPacketWithChecksums builds a UDP/IPv4 packet with BOTH checksums computed.
+//
+// The shared buildTestPBRUDPPacket helper leaves the IPv4 header checksum and the UDP
+// checksum zero, which is fine for the address-parsing assertions it was written for
+// but is not a packet any receiver accepts: a userspace stack validates the header
+// checksum on inbound injection and silently drops a packet without it. The proxy
+// path forwards the client's packet to the backend verbatim, so the fixture must send
+// a well-formed one or the round trip proves nothing.
+func s4UDPPacketWithChecksums(src, dst netip.Addr, srcPort, dstPort uint16, payload []byte) []byte {
+	pkt := buildTestPBRUDPPacket(src, dst, srcPort, dstPort, payload)
+	total := len(pkt)
+
+	// UDP checksum over the pseudo-header plus the segment.
+	var udpSum uint32
+	srcB, dstB := src.As4(), dst.As4()
+	udpSum += uint32(binary.BigEndian.Uint16(srcB[0:2])) + uint32(binary.BigEndian.Uint16(srcB[2:4]))
+	udpSum += uint32(binary.BigEndian.Uint16(dstB[0:2])) + uint32(binary.BigEndian.Uint16(dstB[2:4]))
+	udpSum += uint32(17)         // protocol
+	udpSum += uint32(total - 20) // UDP length
+	for i := 20; i < total; i += 2 {
+		if i+1 < total {
+			udpSum += uint32(binary.BigEndian.Uint16(pkt[i : i+2]))
+		} else {
+			udpSum += uint32(pkt[i]) << 8
+		}
+	}
+	for udpSum>>16 != 0 {
+		udpSum = (udpSum & 0xffff) + (udpSum >> 16)
+	}
+	udpCS := ^uint16(udpSum)
+	if udpCS == 0 {
+		udpCS = 0xffff
+	}
+	binary.BigEndian.PutUint16(pkt[26:28], udpCS)
+
+	// IPv4 header checksum.
+	var hdrSum uint32
+	for i := 0; i < 20; i += 2 {
+		hdrSum += uint32(binary.BigEndian.Uint16(pkt[i : i+2]))
+	}
+	for hdrSum>>16 != 0 {
+		hdrSum = (hdrSum & 0xffff) + (hdrSum >> 16)
+	}
+	hdrCS := ^uint16(hdrSum)
+	if hdrCS == 0 {
+		hdrCS = 0xffff
+	}
+	binary.BigEndian.PutUint16(pkt[10:12], hdrCS)
+	return pkt
+}
 
 // s4BuildBackendEcho creates the proxy backend as a REAL packet device: a netstack
 // TUN with a UDP echo listener, wrapped in the same returnStackDevice the rest of
