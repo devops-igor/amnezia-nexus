@@ -105,6 +105,11 @@ func TestBackendIdentityRotationReconcilesPersistedAndActiveIdentity(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This service owns every backend device the test enables on it, and each
+	// device owns the production return-path reader. Registered after the
+	// fixture's database cleanup so the release runs first, while the store the
+	// administrative disable persists through is still open.
+	t.Cleanup(func() { releaseFixtureVPNService(t, svc) })
 	h.vpnSvc = svc
 
 	if err = svc.EnableBackend(ctx, id); err != nil {
