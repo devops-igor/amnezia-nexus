@@ -51,6 +51,11 @@ func setupDeployTestEnv(t *testing.T) (*Handlers, *chi.Mux, *mockGigahostClient)
 		t.Fatalf("failed to init vpn service: %v", err)
 	}
 	h.vpnSvc = vpnSvc
+	// Same ownership as the install fixture: this service owns the backend
+	// devices these deploy tests enable, and each device owns the production
+	// return-path reader. Registered after the database cleanup so the release
+	// runs while the store is still open.
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})

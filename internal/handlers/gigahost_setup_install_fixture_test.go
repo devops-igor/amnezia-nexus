@@ -97,6 +97,11 @@ func newInstallEnv(t *testing.T, protocols ...string) *installEnv {
 		t.Fatalf("init vpn service: %v", err)
 	}
 	h.vpnSvc = vpnSvc
+	// This service owns every backend device the tests enable on it, and each
+	// device owns the production return-path reader. It is registered after the
+	// database cleanup, so the release runs before the database closes: the
+	// administrative disable persists its state and needs the store open.
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	vpnSvc.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
 		counters.mu.Lock()
 		fail := counters.failNextProbe
