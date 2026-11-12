@@ -454,6 +454,43 @@ func (d *DB) DeleteBackendTunnel(ctx context.Context, id int64) error {
 	return nil
 }
 
+// DeleteBackendTunnelAndReleaseEnrollment removes a backend tunnel record and
+// clears its durable pending-enrollment marker in ONE transaction.
+//
+// The two writes must be atomic because they describe one lifecycle fact: the
+// backend no longer exists. Applying only the row delete left the store
+// quarantining a backend that was gone, so a replacement added later inherited a
+// quarantine nobody owned, and a restart resurrected it from the surviving marker.
+//
+// Mirrors PromoteTunnelAndClearEnrollment: caller-owned context, writeMu
+// serialization, explicit rollback on any failure.
+func (d *DB) DeleteBackendTunnelAndReleaseEnrollment(ctx context.Context, id, serverID int64) error {
+	if d == nil || d.sqlDB == nil {
+		return nil
+	}
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	tx, err := d.sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin backend removal transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	if _, err := tx.ExecContext(ctx, "DELETE FROM backend_tunnels WHERE id = ?", id); err != nil {
+		return fmt.Errorf("failed to delete backend tunnel %d: %w", id, err)
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM settings WHERE key = ?", pendingEnrollmentKey(serverID)); err != nil {
+		return fmt.Errorf("failed to release pending enrollment for server %d: %w", serverID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit backend removal for server %d: %w", serverID, err)
+	}
+	return nil
+}
+
 // GetBackendTunnelByServerID retrieves a backend tunnel by its server_id. Returns nil, nil if not found.
 func (d *DB) GetBackendTunnelByServerID(ctx context.Context, serverID int64) (*models.BackendTunnel, error) {
 	d.mu.RLock()

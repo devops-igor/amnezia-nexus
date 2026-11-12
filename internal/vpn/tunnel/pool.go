@@ -206,46 +206,42 @@ func (p *Pool) ResetEnabledHealthForStartup(ctx context.Context) error {
 }
 
 // RemoveTunnel removes a backend tunnel by server ID.
+//
+// Both enrollment owners are released: the durable marker clears in the SAME
+// transaction as the row delete (a delete without its release would leave the
+// store quarantining a backend that no longer exists), and the runtime owner is
+// notified after p.mu is released, because that callback takes the prober's lock
+// and the documented lock order here is hp.mu -> pool.mu.
 func (p *Pool) RemoveTunnel(ctx context.Context, serverID int64) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	tunnel, ok := p.tunnelsByServerID[serverID]
 	if !ok {
+		p.mu.Unlock()
 		return ErrTunnelNotFound
 	}
 
 	if p.db != nil {
-		if err := p.db.DeleteBackendTunnel(ctx, tunnel.ID); err != nil {
-			return fmt.Errorf("failed to delete backend tunnel from DB: %w", err)
-		}
 		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		_ = p.db.SetBackendPendingEnrollment(writeCtx, serverID, false)
+		dbErr := p.db.DeleteBackendTunnelAndReleaseEnrollment(writeCtx, tunnel.ID, serverID)
+		cancel()
+		if dbErr != nil {
+			// Nothing changed in memory or in either owner, so the caller can
+			// retry a clean removal. A partial removal is never reported as done.
+			p.mu.Unlock()
+			return fmt.Errorf("failed to remove backend tunnel for server %d: %w", serverID, dbErr)
+		}
 	}
 
 	delete(p.tunnelsByServerID, serverID)
 	delete(p.tunnelsByID, tunnel.ID)
 	delete(p.tunnelsByIfName, tunnel.InterfaceName)
+	release := p.enrollmentReleaseHook
+	p.mu.Unlock()
 
-	// The durable marker above is only ONE of the two enrollment owners. Tell the
-	// runtime owner to release too, or a replacement backend re-added in this same
-	// process stays quarantined until a restart. The callback is invoked after the
-	// pool entries are gone and never takes p.mu again (the prober's map is its
-	// own lock), so this adds no nested critical section.
-	p.notifyEnrollmentReleased(ctx, serverID)
-
-	return nil
-}
-
-// notifyEnrollmentReleased reports a removed tunnel to the runtime enrollment
-// owner, if one is registered. Called with p.mu held; the hook must not call back
-// into the pool.
-func (p *Pool) notifyEnrollmentReleased(ctx context.Context, serverID int64) {
-	if p.enrollmentReleaseHook == nil {
-		return
+	if release != nil {
+		release(context.WithoutCancel(ctx), serverID)
 	}
-	p.enrollmentReleaseHook(context.WithoutCancel(ctx), serverID)
+	return nil
 }
 
 // GetTunnel retrieves a tunnel by server ID.

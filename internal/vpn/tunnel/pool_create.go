@@ -275,9 +275,9 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 		}
 		tunnel.ID = id
 		if ctx != nil && ctx.Value(DeployEnrollmentKey) != nil {
-			writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			defer cancel()
-			_ = p.db.SetBackendPendingEnrollment(writeCtx, serverID, true)
+			if err = p.recordDeployQuarantine(ctx, id, serverID); err != nil {
+				return nil, err
+			}
 		}
 	} else {
 		tunnel.ID = serverID
@@ -289,4 +289,21 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 
 	copyTunnel := *tunnel
 	return &copyTunnel, nil
+}
+
+// recordDeployQuarantine persists the durable enrollment marker for a backend that
+// was just created by a deploy-context add, and compensates if that write fails.
+//
+// The row already exists at this point, so a silent marker failure would leave a
+// backend present with no owner marking it unqualified. The compensating row
+// delete keeps the two in step and the error is returned so the caller never sees
+// a successful deploy add it could not quarantine.
+func (p *Pool) recordDeployQuarantine(ctx context.Context, tunnelID, serverID int64) error {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := p.db.SetBackendPendingEnrollment(writeCtx, serverID, true); err != nil {
+		_ = p.db.DeleteBackendTunnel(writeCtx, tunnelID)
+		return fmt.Errorf("failed to record pending enrollment for server %d: %w", serverID, err)
+	}
+	return nil
 }

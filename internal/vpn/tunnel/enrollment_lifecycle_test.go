@@ -12,9 +12,11 @@ package tunnel
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
@@ -23,12 +25,21 @@ type enrollmentLifecycleFixture struct {
 	prober *HealthProber
 	pool   *Pool
 	server int64
+	// dbPath lets a test open an independent handle on the same file so a write
+	// can be failed on one table without touching the others.
+	dbPath string
 }
 
 func newEnrollmentLifecycleFixture(t *testing.T) *enrollmentLifecycleFixture {
 	t.Helper()
 	ctx := context.Background()
-	db := setupTestDB(t)
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "enrollment_lifecycle.db")
+	db, err := database.Open(dbPath, "test-secret-key-1234567890123456")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
 	pool := NewPool(db)
 	sid, err := db.CreateServer(ctx, &models.Server{Name: "enrollment-lifecycle", Host: "192.0.2.231"})
 	if err != nil {
@@ -40,7 +51,7 @@ func newEnrollmentLifecycleFixture(t *testing.T) *enrollmentLifecycleFixture {
 	}
 	_ = tun
 	hp := NewHealthProber(pool, db, DefaultHealthConfig())
-	return &enrollmentLifecycleFixture{prober: hp, pool: pool, server: sid}
+	return &enrollmentLifecycleFixture{prober: hp, pool: pool, server: sid, dbPath: dbPath}
 }
 
 // mustTunnelID returns the current tunnel ID for the fixture's server.
