@@ -42,6 +42,13 @@ type Pool struct {
 	// delete cleared only the database and the replacement backend stayed
 	// quarantined in memory until a process restart.
 	enrollmentReleaseHook func(ctx context.Context, serverID, retiredTunnelID int64)
+	// enrollmentPending is the runtime quarantine of deploy-enrolled tunnel
+	// GENERATIONS, keyed by tunnel id. It changes in the same p.mu critical
+	// section as the durable commit it mirrors (deploy add or re-enrollment sets
+	// it, qualification or removal of that row clears it), so there is no window
+	// in which a committed unqualified backend is unquarantined, and a removal or
+	// late release for one generation cannot touch another's entry.
+	enrollmentPending map[int64]bool
 }
 
 // SetMultiProtocolEnabled configures whether multi-protocol backends are enabled.
@@ -97,6 +104,7 @@ func NewPool(db *database.DB) *Pool {
 		tunnelsByServerID: make(map[int64]*models.BackendTunnel),
 		tunnelsByID:       make(map[int64]*models.BackendTunnel),
 		tunnelsByIfName:   make(map[string]*models.BackendTunnel),
+		enrollmentPending: make(map[int64]bool),
 	}
 }
 
@@ -146,6 +154,12 @@ func (p *Pool) SyncFromDB(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to load backend tunnels from DB: %w", err)
 	}
+	// Durable quarantines bound to a row restore that generation's runtime
+	// quarantine. An unbound (legacy) mark is restored by the prober instead.
+	enrollmentOwners, err := p.db.GetBackendPendingEnrollmentOwners(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to load backend enrollment quarantine from DB: %w", err)
+	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -172,6 +186,9 @@ func (p *Pool) SyncFromDB(ctx context.Context) error {
 		p.tunnelsByServerID[t.ServerID] = &t
 		p.tunnelsByID[t.ID] = &t
 		p.tunnelsByIfName[t.InterfaceName] = &t
+		if enrollmentOwners[t.ServerID] == t.ID {
+			p.setEnrollmentPendingLocked(t.ID)
+		}
 	}
 
 	return nil
@@ -235,6 +252,7 @@ func (p *Pool) RemoveTunnel(ctx context.Context, serverID int64) error {
 	delete(p.tunnelsByServerID, serverID)
 	delete(p.tunnelsByID, tunnel.ID)
 	delete(p.tunnelsByIfName, tunnel.InterfaceName)
+	delete(p.enrollmentPending, tunnel.ID)
 	release := p.enrollmentReleaseHook
 	p.mu.Unlock()
 

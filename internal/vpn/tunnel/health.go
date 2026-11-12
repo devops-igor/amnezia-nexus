@@ -192,19 +192,31 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 		pendingEnrollmentGeneration: make(map[int64]int64),
 		stopCh:                      make(chan struct{}),
 	}
-	if db != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if pendingMap, err := db.GetBackendPendingEnrollments(ctx); err == nil {
-			for sid, isPending := range pendingMap {
-				if isPending {
-					hp.pendingEnrollment[sid] = true
-				}
-			}
-		}
-	}
+	hp.restoreUnboundEnrollments(db)
 	hp.ownPoolEnrollmentLifecycle()
 	return hp
+}
+
+// restoreUnboundEnrollments restores durable enrollment marks that are not bound
+// to a tunnel row (the legacy form, and marks recorded by server-keyed callers).
+// A mark bound to a row belongs to that tunnel generation and is restored by the
+// pool when it loads the row, so a later qualification or removal of that row
+// releases it without this server-keyed copy outliving it.
+func (hp *HealthProber) restoreUnboundEnrollments(db *database.DB) {
+	if db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	owners, err := db.GetBackendPendingEnrollmentOwners(ctx)
+	if err != nil {
+		return
+	}
+	for sid, owner := range owners {
+		if owner == 0 {
+			hp.pendingEnrollment[sid] = true
+		}
+	}
 }
 
 // ownPoolEnrollmentLifecycle registers this prober as the runtime enrollment
@@ -219,12 +231,11 @@ func (hp *HealthProber) ownPoolEnrollmentLifecycle() {
 	})
 }
 
-// releaseRuntimeEnrollment clears the in-memory enrollment marker for a server
-// whose tunnel was just removed. It never writes the durable setting: the pool
-// removal owns that row, and this callback exists so the two owners cannot drift
-// apart. Nil-receiver and lock-order safe: it takes only hp.mu and does no I/O.
-// releaseRuntimeEnrollmentIfGeneration clears the runtime marker only when it was
-// established by the SAME tunnel generation being retired.
+// releaseRuntimeEnrollmentIfGeneration clears the server-keyed caller mark for a
+// server whose tunnel was just removed, only when the mark was established by the
+// SAME tunnel generation being retired (or by no known generation). It never writes
+// the durable setting: the pool removal owns that row. Nil-receiver and lock-order
+// safe: it takes only hp.mu and does no I/O.
 //
 // A release is scheduled from a removal, and the pool lock is not held while it
 // runs, so a replacement can be added and quarantined in that window. Without the
@@ -290,13 +301,22 @@ func (hp *HealthProber) SetPendingEnrollment(serverID int64, pending bool) {
 }
 
 // IsPendingEnrollment reports whether a backend server is currently undergoing initial enrollment qualification.
+//
+// Two owners can quarantine a server: an explicit server-keyed caller mark held
+// here, and the pool's quarantine of the deploy-enrolled tunnel generation now
+// registered for the server. The generation quarantine is committed by the pool
+// together with the row and released only by that row's qualification or removal,
+// so a deploy-created backend is quarantined from the moment it exists, whatever
+// order a caller's own marking or a retired generation's release arrives in.
 func (hp *HealthProber) IsPendingEnrollment(serverID int64) bool {
 	if hp == nil {
 		return false
 	}
 	hp.mu.RLock()
-	defer hp.mu.RUnlock()
-	return hp.pendingEnrollment != nil && hp.pendingEnrollment[serverID]
+	marked := hp.pendingEnrollment[serverID]
+	pool := hp.pool
+	hp.mu.RUnlock()
+	return marked || pool.EnrollmentPending(serverID)
 }
 
 // LatencyThresholdMS returns the configured latency threshold in milliseconds.
@@ -753,9 +773,11 @@ func (hp *HealthProber) checkAndRecordPendingEnrollment(ctx context.Context, ser
 		}
 		hp.pendingEnrollment[serverID] = true
 	}
-	isPending := hp.pendingEnrollment != nil && hp.pendingEnrollment[serverID]
+	isPending := hp.pendingEnrollment[serverID]
 	db := hp.db
+	pool := hp.pool
 	hp.mu.Unlock()
+	isPending = isPending || pool.EnrollmentPending(serverID)
 
 	if isPending && ctx != nil && ctx.Value(DeployEnrollmentKey) != nil && db != nil {
 		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)

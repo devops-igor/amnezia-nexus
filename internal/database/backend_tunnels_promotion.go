@@ -47,8 +47,8 @@ func promoteAndRelease(
 	if rowsAffected == 0 {
 		return false, nil
 	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM settings WHERE key = ?", pendingEnrollmentKey(serverID)); err != nil {
-		return false, fmt.Errorf("failed to release pending enrollment for server %d: %w", serverID, err)
+	if err := releaseOwnedEnrollment(ctx, tx, serverID, id); err != nil {
+		return false, err
 	}
 	return true, nil
 }

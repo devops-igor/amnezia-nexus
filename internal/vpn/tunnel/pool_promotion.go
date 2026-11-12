@@ -84,6 +84,9 @@ func (p *Pool) PromoteTunnelWithEnrollmentRelease(
 	tunnel.StateVersion++
 	now := time.Now().UTC()
 	tunnel.LastHealthCheck = &now
+	// The qualified generation's runtime quarantine is released in the same
+	// critical section as its durable release.
+	delete(p.enrollmentPending, tunnel.ID)
 
 	return nil
 }
