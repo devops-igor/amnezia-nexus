@@ -191,8 +191,15 @@ func (hp *HealthProber) reconcileTunnel(
 		return false
 	}
 
-	latencyMS, ok := hp.probeAndFlapDamp(ctx, tun, threshold)
-	if !ok {
+	latencyMS, ready, outerFailed := hp.probeAndFlapDamp(ctx, tun, threshold)
+	if outerFailed {
+		// A failed outer handshake is not evidence that the established data
+		// path is gone. The inner canary still decides, so a health-disabled
+		// backend whose existing attached device answers fresh matched replies
+		// can return to routing eligibility without waiting for outer success.
+		return hp.recoverThroughInnerCanary(ctx, tun)
+	}
+	if !ready {
 		return false
 	}
 
@@ -208,24 +215,28 @@ func (hp *HealthProber) reconcileTunnel(
 	return hp.finalizeSelfHealRecovery(ctx, tun, tunNow, latencyMS, latencyThreshold)
 }
 
+// probeAndFlapDamp runs the outer handshake probe and the existing consecutive
+// -success damping. outerFailed reports that the probe itself failed, which
+// tells the caller the inner path still has to be consulted; it is distinct from
+// the damping case where the outer path is healthy but has not yet confirmed.
 func (hp *HealthProber) probeAndFlapDamp(
 	ctx context.Context,
 	tun *models.BackendTunnel,
 	threshold int,
-) (int64, bool) {
+) (latencyMS int64, ready bool, outerFailed bool) {
 	latencyMS, err := hp.probeEndpoint(ctx, tun)
 	if err != nil {
 		if hp.updateHealthIfCurrent(tun, func() { hp.successCounts[tun.ServerID] = 0 }) != nil {
-			return 0, false
+			return 0, false, false
 		}
 		slog.Debug("self-healing probe failed", "server_id", tun.ServerID, "error", err)
-		return 0, false
+		return 0, false, true
 	}
 
 	hp.mu.Lock()
 	if hp.checkHealthGenerationLocked(tun) != nil {
 		hp.mu.Unlock()
-		return 0, false
+		return 0, false, false
 	}
 	hp.successCounts[tun.ServerID]++
 	successes := hp.successCounts[tun.ServerID]
@@ -237,9 +248,9 @@ func (hp *HealthProber) probeAndFlapDamp(
 			"consecutive_successes", successes,
 			"threshold", threshold,
 		)
-		return 0, false
+		return 0, false, false
 	}
-	return latencyMS, true
+	return latencyMS, true, false
 }
 
 func (hp *HealthProber) verifyPreHookState(tun *models.BackendTunnel) (*models.BackendTunnel, bool) {
@@ -342,11 +353,86 @@ func (hp *HealthProber) finalizeSelfHealRecovery(
 		newStatus = models.TunnelStatusConnecting
 	}
 
+	return hp.commitSelfHealStatus(ctx, tun, tunNow, newStatus, latencyMS)
+}
+
+// recoverThroughInnerCanary restores routing eligibility for a health-disabled
+// backend whose EXISTING attached device still answers matched in-tunnel
+// replies while the outer handshake keeps failing.
+//
+// The status it establishes is handshake_blocked, never active: the outer
+// handshake did not succeed, so claiming active (or a latency sample derived
+// from a failed handshake) would be a false health report. handshake_blocked is
+// exactly the truthful label for "outer path unproven, inner path fresh".
+//
+// It deliberately reuses the recorded canary evidence oracle instead of
+// inventing a second verdict, which is what makes missing, stale, failed,
+// late and previous-device evidence harmless: the sweep's own observation must
+// be admissible for THIS tunnel generation and THIS attached device. A device
+// replacement, detach, concurrent status write or administrative disable
+// between the probe and the commit invalidates it.
+//
+// The attach hook is NOT run here. The device is already attached and just
+// proved it forwards payload, so re-attaching would replace the very identity
+// whose evidence authorized the recovery and would add remote I/O to a data
+// path that is currently working.
+func (hp *HealthProber) recoverThroughInnerCanary(ctx context.Context, tun *models.BackendTunnel) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	cur, ok := hp.verifyPreHookState(tun)
+	if !ok {
+		return false
+	}
+	// Enrollment quarantine is an independent authority, not a consequence of
+	// canary evidence. Automatic recovery must not release it, and nothing
+	// routable is lost by declining: disabled and connecting are both
+	// non-routable, and only an explicit qualification/promotion transaction
+	// releases the quarantine.
+	if hp.IsPendingEnrollment(cur.ServerID) {
+		return false
+	}
+	// No attached device means no in-tunnel evidence can exist for this backend.
+	if !hp.hasCanaryProber(cur) {
+		return false
+	}
+	if err := hp.probeCanary(ctx, cur); err != nil {
+		// Obsolete evidence (tunnel replaced, version advanced, administrative
+		// disable, cancellation) and genuine inner loss both keep the backend
+		// withdrawn; only a fresh matched reply authorizes recovery.
+		slog.Warn("self-healing inner-path recovery denied: canary did not confirm",
+			"server_id", cur.ServerID,
+			"tunnel_id", cur.ID,
+			"error", err,
+		)
+		return false
+	}
+	// Bind the commit to the device attached NOW, not merely the one that
+	// answered: a swap during the probe must not lend its verdict onward.
+	// canaryDeviceGeneration yields the zero stamp for a replacement the probe
+	// cannot verify, which CanaryAdmissible refuses.
+	if !hp.CanaryAdmissible(cur, canaryDeviceGeneration(hp.GetDevice(cur.ID))) {
+		return false
+	}
+	return hp.commitSelfHealStatus(ctx, tun, cur, models.TunnelStatusHandshakeBlocked, 0)
+}
+
+// commitSelfHealStatus performs the compare-and-swap that ends a self-healing
+// recovery and the matching in-memory bookkeeping. It is shared by the
+// outer-success and inner-canary recovery paths so both commit through one
+// place with the same guards.
+func (hp *HealthProber) commitSelfHealStatus(
+	ctx context.Context,
+	tun *models.BackendTunnel,
+	tunNow *models.BackendTunnel,
+	newStatus string,
+	latencyMS int64,
+) bool {
 	swapped, err := hp.pool.CompareAndSwapTunnelStatusForTunnel(
 		ctx,
 		tun.ServerID,
 		tun.ID,
-		"disabled",
+		models.TunnelStatusDisabled,
 		tunNow.DisableReason,
 		tunNow.StateVersion,
 		newStatus,
