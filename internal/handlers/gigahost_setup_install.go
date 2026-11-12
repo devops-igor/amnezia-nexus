@@ -73,6 +73,13 @@ func (r *SetupInstallRunner) RunInstall(
 	attemptCtx, cancel := context.WithTimeout(ctx, installStepTimeout)
 	defer cancel()
 
+	// A takeover of an automatic job whose admission already committed only records it;
+	// see gigahost_setup_install_recovery.go. It runs before the precheck because the
+	// precheck gates new effects, and a completed admission needs none.
+	if recovered, err := r.h.finalizeRecoveredAdmission(attemptCtx, intent, journal); recovered {
+		return err
+	}
+
 	req, pause, err := r.h.prepareInstall(attemptCtx, intent)
 	if err != nil {
 		journal.Pause(attemptCtx, "install_precheck", err)
