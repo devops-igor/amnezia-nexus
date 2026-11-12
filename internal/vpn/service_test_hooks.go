@@ -3,12 +3,27 @@ package vpn
 import (
 	"context"
 	"errors"
+	"reflect"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
-// SetProbeFunc configures an outer probe and a default successful canary for test fixtures.
+// isRealProbeFunc reports whether fn is one of the production probe implementations
+// rather than an offline test mock closure.
+func isRealProbeFunc(fn tunnel.ProbeFunc) bool {
+	if fn == nil {
+		return false
+	}
+	p := reflect.ValueOf(fn).Pointer()
+	return p == reflect.ValueOf(health.ProbeAWGEndpointRange).Pointer() ||
+		p == reflect.ValueOf(health.ProbeAWGEndpoint).Pointer()
+}
+
+// SetProbeFunc sets the health probe function for testing or customized reachability probing.
+// When an offline mock probe closure is supplied, a default offline canary is installed
+// unless a custom canary probe function has already been set or real probing is requested.
 // Custom canaries are preserved; use SetCanaryProbeFunc(nil) afterward to test real probing.
 // Production constructors must configure HealthProber directly instead.
 func (s *Service) SetProbeFunc(fn tunnel.ProbeFunc) {
@@ -20,7 +35,9 @@ func (s *Service) SetProbeFunc(fn tunnel.ProbeFunc) {
 	if s.prober != nil {
 		s.prober.SetProbeFunc(fn)
 		// Service-level probe setters share s.mu, preserving custom fixture overrides.
-		if s.prober.GetCanaryProbeFunc() == nil {
+		if isRealProbeFunc(fn) {
+			s.prober.SetCanaryProbeFunc(nil)
+		} else if fn != nil && s.prober.GetCanaryProbeFunc() == nil {
 			s.prober.SetCanaryProbeFunc(func(context.Context, *models.BackendTunnel) error {
 				return nil
 			})
@@ -28,16 +45,22 @@ func (s *Service) SetProbeFunc(fn tunnel.ProbeFunc) {
 	}
 }
 
-// SetCanaryProbeFunc sets the canary probe function for testing or customized reachability probing.
-func (s *Service) SetCanaryProbeFunc(fn tunnel.CanaryProbeFunc) {
-	if s == nil {
+// SetProxyProbeFuncsForTest configures the protocol health probe test fixtures.
+func (s *Service) SetProxyProbeFuncsForTest(vless tunnel.VLESSProbeFunc, naive tunnel.NaiveProbeFunc) {
+	if s.prober == nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.prober != nil {
-		s.prober.SetCanaryProbeFunc(fn)
+	s.prober.SetVLESSProbeFunc(vless)
+	s.prober.SetNaiveProbeFunc(naive)
+}
+
+// SetProxyTrafficProbeFuncForTest configures the proxy application-traffic
+// qualification fixture used to verify the enrollment lifecycle.
+func (s *Service) SetProxyTrafficProbeFuncForTest(fn tunnel.ProxyTrafficProbeFunc) {
+	if s.prober == nil {
+		return
 	}
+	s.prober.SetProxyTrafficProbeFunc(fn)
 }
 
 // SetBackendDeviceForTest sets a backend device for testing.

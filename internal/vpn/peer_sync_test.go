@@ -402,23 +402,19 @@ func TestPeerSyncConcurrentRevokeTrafficRekey(t *testing.T) {
 		t.Fatalf("IpcSet test rekey timing: %v", err)
 	}
 
-	// Initial packet admits backend session and establishes route
+	// Initial packet admits backend session and establishes route. Admission
+	// publishes the session first and registers the forwarder route last, so
+	// the readiness condition must require BOTH to agree: accepting "connected"
+	// alone samples the route inside that window and observes "" (the CI
+	// failure). The deadline, the packet reinjection and the post-condition
+	// below are unchanged from the previous oracle.
 	firstPkt := engineUDPPacket(netip.MustParseAddr(peer.assignedIP), netip.MustParseAddr("10.0.0.1"), 1)
 	uc.inject(t, firstPkt)
-	var sess models.VPNSession
-	var ok bool
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if s, found := svc.sessionMgr.GetSessionSnapshotByPeer(peer.publicKey); found && s.Status == "connected" {
-			sess = s
-			ok = true
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	sess, lastRoute, ok := awaitSettledAdmission(svc, peer.publicKey, time.Now().Add(5*time.Second), func() {
 		_ = uc.vt.InjectInbound(firstPkt)
-	}
+	})
 	if !ok {
-		t.Fatal("session not admitted before concurrent test")
+		t.Fatalf("session not admitted before concurrent test: last session %q, last route %q", sess.ID, lastRoute)
 	}
 	if route := svc.forwarder.RouteSessionID(peer.publicKey); route != sess.ID {
 		t.Fatalf("route session mismatch: got %q, want %q", route, sess.ID)

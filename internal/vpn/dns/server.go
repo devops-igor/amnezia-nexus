@@ -283,8 +283,8 @@ func (s *Server) ServeDNSMessage(ctx context.Context, scope any, req *mdns.Msg, 
 	return resp, nil
 }
 
-func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.PacketConn, errCh chan<- error) {
-	defer s.wg.Done()
+func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.PacketConn, errCh chan<- error, producers *sync.WaitGroup) {
+	defer producers.Done()
 	buf := make([]byte, 2048)
 	for {
 		n, raddr, err := udp.ReadFrom(buf)
@@ -381,9 +381,27 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 	}
 }
 
-func (s *Server) serveTCP(ctx context.Context, scope *ScopeHandle, tcp net.Listener, errCh chan<- error) {
-	defer s.wg.Done()
+func (s *Server) serveTCP(ctx context.Context, scope *ScopeHandle, tcp net.Listener, errCh chan<- error, producers *sync.WaitGroup) {
+	defer producers.Done()
 	sem := make(chan struct{}, s.cfg.MaxTCPSessions)
+
+	// owned tracks connections accepted by this invocation so the accept loop
+	// never returns while one of its handlers is still serving.
+	var ownedMu sync.Mutex
+	owned := make(map[net.Conn]struct{})
+	var handlers sync.WaitGroup
+
+	// Accept can fail for reasons other than shutdown/retirement, so handlers
+	// must be unblocked and joined here rather than relying on the caller.
+	defer func() {
+		ownedMu.Lock()
+		for c := range owned {
+			_ = c.Close()
+		}
+		ownedMu.Unlock()
+		handlers.Wait()
+	}()
+
 	for {
 		conn, err := tcp.Accept()
 		if err != nil {
@@ -411,17 +429,24 @@ func (s *Server) serveTCP(ctx context.Context, scope *ScopeHandle, tcp net.Liste
 			return
 		}
 		s.activeConns[conn] = scope
-		s.wg.Add(1)
 		s.mu.Unlock()
+
+		ownedMu.Lock()
+		owned[conn] = struct{}{}
+		ownedMu.Unlock()
+		handlers.Add(1)
 
 		go func(c net.Conn) {
 			defer func() {
 				s.mu.Lock()
 				delete(s.activeConns, c)
 				s.mu.Unlock()
+				ownedMu.Lock()
+				delete(owned, c)
+				ownedMu.Unlock()
 				<-sem
 				_ = c.Close()
-				s.wg.Done()
+				handlers.Done()
 			}()
 			s.handleTCPConn(ctx, scope, c)
 		}(conn)
@@ -429,6 +454,12 @@ func (s *Server) serveTCP(ctx context.Context, scope *ScopeHandle, tcp net.Liste
 }
 
 // Serve attaches UDP and TCP listeners to this server, bounded by scope lifetime.
+//
+// Serve guarantees a producer-ordered teardown: it returns only after its
+// listeners are closed AND every goroutine it started (accept/read loops and
+// their connection handlers) has finished. Callers that own the backing device
+// for these listeners must wait for Serve before closing it, otherwise the
+// device can be closed while a listener teardown is still writing to it.
 func (s *Server) Serve(ctx context.Context, scope *ScopeHandle, udp net.PacketConn, tcp net.Listener) error {
 	s.wg.Add(1)
 	defer s.wg.Done()
@@ -439,12 +470,19 @@ func (s *Server) Serve(ctx context.Context, scope *ScopeHandle, udp net.PacketCo
 	}
 
 	errCh := make(chan error, 2)
+	var producers sync.WaitGroup
 
-	// Unblock and close listeners on server shutdown or context cancellation.
+	// Unblock and close listeners on server shutdown, retirement, or on Serve's
+	// own return (a listener error). Completing before Serve returns is what
+	// orders listener teardown ahead of any device close by the caller.
+	stopCloser := make(chan struct{})
+	closerDone := make(chan struct{})
 	go func() {
+		defer close(closerDone)
 		select {
 		case <-s.closed:
 		case <-ctx.Done():
+		case <-stopCloser:
 		}
 		if scope != nil {
 			s.RetireScope(scope.Scope)
@@ -473,23 +511,31 @@ func (s *Server) Serve(ctx context.Context, scope *ScopeHandle, udp net.PacketCo
 	}()
 
 	if udp != nil {
-		s.wg.Add(1)
-		go s.serveUDP(ctx, scope, udp, errCh)
+		producers.Add(1)
+		go s.serveUDP(ctx, scope, udp, errCh, &producers)
 	}
 
 	if tcp != nil {
-		s.wg.Add(1)
-		go s.serveTCP(ctx, owner, tcp, errCh)
+		producers.Add(1)
+		go s.serveTCP(ctx, owner, tcp, errCh, &producers)
 	}
 
+	var err error
 	select {
 	case <-s.closed:
-		return nil
 	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-errCh:
-		return err
+		err = ctx.Err()
+	case err = <-errCh:
 	}
+
+	// Order: listeners closed (no new work, no in-flight listener teardown),
+	// then producers and their handlers drained. Only then may a caller close
+	// the device the listeners write into.
+	close(stopCloser)
+	<-closerDone
+	producers.Wait()
+
+	return err
 }
 
 // Shutdown initiates clean shutdown of the Server and waits for active requests to drain.

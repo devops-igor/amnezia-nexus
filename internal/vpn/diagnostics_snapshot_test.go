@@ -1,11 +1,9 @@
 package vpn
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net/netip"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -226,62 +224,9 @@ func (*orphanDiagnosticPortal) AddPeer(clientawg.Peer) error { return nil }
 func (p *orphanDiagnosticPortal) RemovePeer(string) error    { p.present = false; return nil }
 
 func TestGetStatusDoesNotInvertPeerReconciliationLockOrder(t *testing.T) {
-	db := setupTestDB(t)
-	svc := newIngressEngineService(t, db)
-	engine, err := svc.NewIngressEngine(t.Context(), "diagnostic-lock-order", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = engine.Stop() })
-	engine.peerSync.portal = &orphanDiagnosticPortal{present: true}
-	entered, release := make(chan struct{}), make(chan struct{})
-	skipRevoke := false
-	engine.peerSync.revokeSession = func(ctx context.Context, key string) error {
-		close(entered)
-		<-release
-		if skipRevoke {
-			return nil
-		} // let defective implementations fail without leaking workers
-		return svc.RevokeUpstreamPeerSession(ctx, key)
-	}
-	svc.ingressEngine, svc.running, engine.running = engine, true, true
-	svc.cfg.PublicEndpoint = "nexus.invalid:51820"
-	reconcileDone, statusDone := make(chan error, 1), make(chan error, 1)
-	go func() { reconcileDone <- engine.peerSync.reconcileNow(t.Context()) }()
-	<-entered // real reconciliation owns peerSynchronizer.mu
-	go func() { _, err := svc.GetStatus(t.Context()); statusDone <- err }()
-	deadline := time.Now().Add(2 * time.Second)
-	parked := false
-	for time.Now().Before(deadline) {
-		stack := make([]byte, 1<<18)
-		n := runtime.Stack(stack, true)
-		// All-goroutine dumps can exceed the initial buffer in the full suite.
-		for n == len(stack) {
-			stack = make([]byte, 2*len(stack))
-			n = runtime.Stack(stack, true)
-		}
-		if bytes.Contains(stack[:n], []byte("(*peerSynchronizer).Status")) {
-			parked = true
-			break
-		}
-		runtime.Gosched()
-	}
-	free := svc.mu.TryLock()
-	if free {
-		svc.mu.Unlock()
-	} else {
-		skipRevoke = true
-	}
-	close(release)
-	for _, done := range []chan error{reconcileDone, statusDone} {
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Error(err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("status/reconcile lock cycle")
-		}
+	parked, complete, free := peerSyncLockOrderRun(t, 0, false, false)
+	if !complete {
+		t.Fatalf("goroutine dump exceeded the %d-byte observation bound: waiter presence unknown", peerSyncDumpMax)
 	}
 	if !parked {
 		t.Fatal("status never parked on the real peer synchronizer")

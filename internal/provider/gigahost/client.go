@@ -9,8 +9,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,7 +20,10 @@ import (
 type Client interface {
 	GetCatalog(ctx context.Context) ([]HourlyPlan, error)
 	GetProducts(ctx context.Context) ([]Product, error)
+	GetOperatingSystems(ctx context.Context) ([]OperatingSystem, error)
 	GetAccount(ctx context.Context) (*AccountInfo, error)
+	ListSSHKeys(ctx context.Context) ([]SSHKeyInfo, error)
+	RegisterSSHKey(ctx context.Context, name, publicKey string) error
 	OrderServer(ctx context.Context, req OrderRequest) (*OrderResponse, error)
 	OrderServerSafe(ctx context.Context, req OrderRequest) (*OrderResponse, error)
 	GetDeployStatus(ctx context.Context, orderID string) (*DeployStatusResponse, error)
@@ -34,6 +37,10 @@ type Config struct {
 	HTTPClient *http.Client
 	Transport  http.RoundTripper
 	Timeout    time.Duration
+	// OnCall, when set, receives one bounded timing record per provider call.
+	// It is opt-in: a nil callback attaches no httptrace client, so the request
+	// path is unchanged. Implementations must not block or panic.
+	OnCall func(CallTiming)
 }
 
 // client implements Client using standard net/http.
@@ -41,6 +48,7 @@ type client struct {
 	baseURL         string
 	apiKey          string
 	httpClient      *http.Client
+	onCall          func(CallTiming)
 	mu              sync.Mutex
 	unknownOrders   map[string]time.Time
 	lastEligibility CatalogEligibility
@@ -50,6 +58,11 @@ type client struct {
 var _ Client = (*client)(nil)
 
 // NewClient initializes and validates a new Gigahost API client.
+//
+// A client built without an injected HTTPClient/Transport owns a transport of
+// its own (see newOwnedTransport): the standard transport settings with
+// connection reuse disabled. Nothing written here ever reaches
+// http.DefaultTransport or a transport the caller supplied.
 func NewClient(cfg Config) (Client, error) {
 	if err := ValidateAPIKey(cfg.APIKey); err != nil {
 		return nil, err
@@ -69,7 +82,7 @@ func NewClient(cfg Config) (Client, error) {
 		}
 		transport := cfg.Transport
 		if transport == nil {
-			transport = http.DefaultTransport
+			transport = newOwnedTransport()
 		}
 		httpClient = &http.Client{
 			Timeout:   timeout,
@@ -83,95 +96,8 @@ func NewClient(cfg Config) (Client, error) {
 		baseURL:       baseURL,
 		apiKey:        cfg.APIKey,
 		httpClient:    httpClient,
+		onCall:        cfg.OnCall,
 		unknownOrders: make(map[string]time.Time),
-	}, nil
-}
-
-// GetProducts queries the raw product catalog from GET /deploy/servers.
-func (c *client) GetProducts(ctx context.Context) ([]Product, error) {
-	var respData []byte
-	err := c.doRequest(ctx, http.MethodGet, "/deploy/servers", nil, &respData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch products: %w", err)
-	}
-
-	products, elig, err := parseProducts(respData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode catalog products: %w", err)
-	}
-	c.mu.Lock()
-	c.lastEligibility = elig
-	c.mu.Unlock()
-	return products, nil
-}
-
-// GetCatalog queries available products and filters those supporting hourly billing.
-func (c *client) GetCatalog(ctx context.Context) ([]HourlyPlan, error) {
-	products, err := c.GetProducts(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var hourlyPlans []HourlyPlan
-	for _, p := range products {
-		for _, price := range p.Prices {
-			if strings.EqualFold(price.BillingPeriod, BillingPeriodHourly) {
-				rate := price.HourlyRate
-				if rate <= 0 && price.Amount > 0 {
-					rate = price.Amount
-				}
-				currency := price.Currency
-				if currency == "" {
-					currency = "NOK"
-				}
-
-				plan := HourlyPlan{
-					ProductID:      p.GetID(),
-					Name:           p.Name,
-					Description:    p.Description,
-					CPUCores:       p.CPUCores,
-					RAMMB:          p.RAMMB,
-					DiskGB:         p.DiskGB,
-					BandwidthTB:    p.BandwidthTB,
-					InStock:        p.InStock,
-					PriceID:        price.ID,
-					Currency:       currency,
-					HourlyRateNOK:  rate,
-					MonthlyCeiling: price.MonthlyCeiling,
-					Regions:        p.Regions,
-					OSList:         p.OSList,
-					Eligibility:    p.Eligibility,
-				}
-				hourlyPlans = append(hourlyPlans, plan)
-			}
-		}
-	}
-
-	return hourlyPlans, nil
-}
-
-// GetCatalogEligibility returns the most recently decoded catalog eligibility.
-func (c *client) GetCatalogEligibility() CatalogEligibility {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.lastEligibility
-}
-
-// GetCatalogResponse returns catalog plans and account eligibility.
-func (c *client) GetCatalogResponse(ctx context.Context) (*CatalogResponse, error) {
-	plans, err := c.GetCatalog(ctx)
-	if err != nil {
-		return nil, err
-	}
-	c.mu.Lock()
-	elig := c.lastEligibility
-	c.mu.Unlock()
-	if !elig.QualifiesArrears && elig.CreditNOK == 0 && len(plans) > 0 {
-		elig = plans[0].Eligibility
-	}
-	return &CatalogResponse{
-		Plans:       plans,
-		Eligibility: elig,
 	}, nil
 }
 
@@ -246,7 +172,50 @@ func (c *client) GetAccount(ctx context.Context) (*AccountInfo, error) {
 	return &acc, nil
 }
 
+// orderBody is the documented POST /deploy/servers request body. Field order is
+// kept identical to OrderRequest's, so a provider-chosen (region-only) order
+// serializes to exactly the bytes it did before dc_id existed.
+type orderBody struct {
+	PID           int     `json:"pid"`
+	PriceID       int     `json:"price_id"`
+	RegionID      int     `json:"region_id,omitempty"`
+	DCID          int     `json:"dc_id,omitempty"`
+	OSID          int     `json:"os_id"`
+	BillingPeriod string  `json:"billing_period"`
+	Quantity      int     `json:"quantity"`
+	SSHKeys       []int64 `json:"ssh_keys,omitempty"`
+}
+
+// wireBody renders the placement-specific request body. A pinned order never
+// carries region_id: the provider takes the region from the datacenter, and
+// sending a combination whose precedence the documentation does not define is
+// avoided rather than guessed. An unpinned order never carries dc_id.
+func (r OrderRequest) wireBody() orderBody {
+	body := orderBody{
+		PID:           r.PID,
+		PriceID:       r.PriceID,
+		RegionID:      r.RegionID,
+		OSID:          r.OSID,
+		BillingPeriod: r.BillingPeriod,
+		Quantity:      r.Quantity,
+		SSHKeys:       r.SSHKeys,
+	}
+	if r.DCID > 0 {
+		body.DCID = r.DCID
+		body.RegionID = 0
+	}
+	return body
+}
+
 // OrderServer dispatches an hourly VPS order via POST /deploy/servers.
+//
+// The body is built explicitly per placement mode, because the two documented
+// shapes are different requests, not one request with an optional extra field:
+//
+//   - pinned (DCID > 0): dc_id is sent and region_id is omitted, per "region_id
+//     is then taken from the datacenter and can be left out";
+//   - provider-chosen (DCID == 0): region_id is sent and dc_id is omitted, which
+//     is byte-identical to the body this client sent before dc_id existed.
 func (c *client) OrderServer(ctx context.Context, req OrderRequest) (*OrderResponse, error) {
 	if !strings.EqualFold(req.BillingPeriod, BillingPeriodHourly) {
 		return nil, fmt.Errorf("%w: got %q", ErrInvalidBillingPeriod, req.BillingPeriod)
@@ -254,12 +223,12 @@ func (c *client) OrderServer(ctx context.Context, req OrderRequest) (*OrderRespo
 	if req.Quantity != 1 {
 		return nil, fmt.Errorf("%w: got %d", ErrInvalidQuantity, req.Quantity)
 	}
-	if req.PID <= 0 || req.PriceID <= 0 || req.RegionID <= 0 || req.OSID <= 0 {
+	if req.PID <= 0 || req.PriceID <= 0 || req.OSID <= 0 || (req.RegionID <= 0 && req.DCID <= 0) {
 		return nil, ErrInvalidOrderParam
 	}
 
 	var rawData []byte
-	err := c.doRequest(ctx, http.MethodPost, "/deploy/servers", req, &rawData)
+	err := c.doRequest(ctx, http.MethodPost, "/deploy/servers", req.wireBody(), &rawData)
 	if err != nil {
 		return nil, err
 	}
@@ -532,6 +501,14 @@ func (c *client) doRequest(ctx context.Context, method, path string, body any, t
 		bodyReader = bytes.NewReader(jsonBytes)
 	}
 
+	// Timing is opt-in: with no sink configured no recorder and no trace are
+	// created, leaving this path byte-for-byte unchanged.
+	var recorder *timingRecorder
+	if c.onCall != nil {
+		recorder = newTimingRecorder(method, path)
+		ctx = httptrace.WithClientTrace(ctx, recorder.clientTrace())
+	}
+
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
 	if err != nil {
 		return fmt.Errorf("failed to create http request: %w", err)
@@ -545,13 +522,22 @@ func (c *client) doRequest(ctx context.Context, method, path string, body any, t
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if recorder != nil {
+			recorder.finish(ctx, c.onCall, 0, err)
+		}
 		return err
 	}
 	defer resp.Body.Close()
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if recorder != nil {
+			recorder.finish(ctx, c.onCall, resp.StatusCode, err)
+		}
 		return fmt.Errorf("failed to read response body: %w", err)
+	}
+	if recorder != nil {
+		recorder.finish(ctx, c.onCall, resp.StatusCode, nil)
 	}
 
 	switch {
@@ -586,175 +572,6 @@ func (c *client) doRequest(ctx context.Context, method, path string, body any, t
 			RawBody:    string(respBytes),
 		}
 	}
-}
-
-type tierProductDTO struct {
-	ProductID      int                `json:"product_id"`
-	ProductName    string             `json:"product_name"`
-	Type           string             `json:"type"`
-	AllowHourly    bool               `json:"allow_hourly"`
-	AllowRecurring bool               `json:"allow_recurring"`
-	PriceID        int                `json:"price_id"`
-	RateHourly     float64            `json:"rate_hourly"`
-	RateMonthly    float64            `json:"rate_monthly"`
-	RegionIDs      []any              `json:"region_ids"`
-	InStock        bool               `json:"in_stock"`
-	VMCores        string             `json:"vm_cores"`
-	VMMemory       string             `json:"vm_memory"`
-	VMStorage      string             `json:"vm_storage"`
-	VMBW           string             `json:"vm_bw"`
-	Eligibility    CatalogEligibility `json:"eligibility,omitempty"`
-	Specs          struct {
-		CPUCores int `json:"cpu_cores"`
-		RAMGB    int `json:"ram_gb"`
-		Disks    []struct {
-			SizeGB int `json:"size_gb"`
-		} `json:"disks"`
-		BW float64 `json:"bw"`
-	} `json:"specs"`
-}
-
-func buildTierProduct(p tierProductDTO, regionMap map[int]Region, currency string, eligibility CatalogEligibility) Product {
-	cores := p.Specs.CPUCores
-	if cores <= 0 && p.VMCores != "" {
-		cores, _ = strconv.Atoi(p.VMCores)
-	}
-	ram := p.Specs.RAMGB * 1024
-	if ram <= 0 && p.VMMemory != "" {
-		v, _ := strconv.Atoi(p.VMMemory)
-		ram = v * 1024
-	}
-	disk := 0
-	for _, d := range p.Specs.Disks {
-		disk += d.SizeGB
-	}
-	if disk <= 0 && p.VMStorage != "" {
-		disk, _ = strconv.Atoi(p.VMStorage)
-	}
-	bw := p.Specs.BW
-	if bw <= 0 && p.VMBW != "" {
-		bw, _ = strconv.ParseFloat(p.VMBW, 64)
-	}
-
-	var regions []Region
-	for _, ridAny := range p.RegionIDs {
-		rid := int(parseInt64Field(ridAny))
-		if reg, ok := regionMap[rid]; ok {
-			regions = append(regions, reg)
-		} else {
-			regions = append(regions, Region{ID: rid, Available: true})
-		}
-	}
-
-	var prices []Price
-	if p.AllowHourly && p.PriceID > 0 && p.InStock {
-		prices = append(prices, Price{
-			ID:             p.PriceID,
-			BillingPeriod:  BillingPeriodHourly,
-			Currency:       currency,
-			HourlyRate:     p.RateHourly,
-			MonthlyCeiling: p.RateMonthly,
-		})
-	}
-
-	if p.Eligibility.QualifiesArrears || p.Eligibility.CreditNOK > 0 {
-		eligibility = p.Eligibility
-	}
-
-	return Product{
-		ID:          p.ProductID,
-		PID:         p.ProductID,
-		Name:        p.ProductName,
-		CPUCores:    cores,
-		RAMMB:       ram,
-		DiskGB:      disk,
-		BandwidthTB: bw,
-		InStock:     p.InStock,
-		Prices:      prices,
-		Regions:     regions,
-		Eligibility: eligibility,
-	}
-}
-
-func parseProducts(data []byte) ([]Product, CatalogEligibility, error) {
-	type docCatalog struct {
-		Meta struct {
-			Status int `json:"status"`
-		} `json:"meta"`
-		Data struct {
-			Tiers []struct {
-				GroupID   int              `json:"group_id"`
-				GroupName string           `json:"group_name"`
-				InStock   bool             `json:"in_stock"`
-				Products  []tierProductDTO `json:"products"`
-			} `json:"tiers"`
-			Regions []struct {
-				RegionID   any    `json:"region_id"`
-				RegionName string `json:"region_name"`
-				Country    string `json:"region_country"`
-			} `json:"regions"`
-			Currency    string             `json:"currency"`
-			Eligibility CatalogEligibility `json:"eligibility"`
-		} `json:"data"`
-		Eligibility CatalogEligibility `json:"eligibility"`
-	}
-
-	var doc docCatalog
-	if err := json.Unmarshal(data, &doc); err == nil && len(doc.Data.Tiers) > 0 {
-		currency := doc.Data.Currency
-		if currency == "" {
-			currency = "NOK"
-		}
-		eligibility := doc.Data.Eligibility
-		if !eligibility.QualifiesArrears && eligibility.CreditNOK == 0 && (doc.Eligibility.QualifiesArrears || doc.Eligibility.CreditNOK > 0) {
-			eligibility = doc.Eligibility
-		}
-		regionMap := make(map[int]Region)
-		for _, r := range doc.Data.Regions {
-			rID := int(parseInt64Field(r.RegionID))
-			regionMap[rID] = Region{
-				ID:        rID,
-				Name:      r.RegionName,
-				Country:   r.Country,
-				Available: true,
-			}
-		}
-
-		var products []Product
-		for _, tier := range doc.Data.Tiers {
-			for _, p := range tier.Products {
-				products = append(products, buildTierProduct(p, regionMap, currency, eligibility))
-			}
-		}
-		if len(products) > 0 {
-			return products, eligibility, nil
-		}
-	}
-
-	var direct []Product
-	if err := json.Unmarshal(data, &direct); err == nil && direct != nil {
-		return direct, CatalogEligibility{}, nil
-	}
-
-	var wrapped struct {
-		Products    []Product          `json:"products"`
-		Data        []Product          `json:"data"`
-		Servers     []Product          `json:"servers"`
-		Eligibility CatalogEligibility `json:"eligibility"`
-	}
-	if err := json.Unmarshal(data, &wrapped); err == nil {
-		if wrapped.Products != nil {
-			return wrapped.Products, wrapped.Eligibility, nil
-		}
-		if wrapped.Data != nil {
-			return wrapped.Data, wrapped.Eligibility, nil
-		}
-		if wrapped.Servers != nil {
-			return wrapped.Servers, wrapped.Eligibility, nil
-		}
-	}
-
-	return nil, CatalogEligibility{}, errors.New("unable to parse products response format")
 }
 
 func parseServersPage(data []byte) ([]ServerInfo, PaginationMeta, error) {

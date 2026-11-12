@@ -239,6 +239,11 @@ func (hp *HealthProber) probeCanary(ctx context.Context, tunnel *models.BackendT
 	fn := hp.probeCanaryFn
 	hp.mu.RUnlock()
 	sequence := hp.beginCanaryObservation()
+	// Bind this observation to the exact backend device that answers it. The
+	// stamp is read BEFORE the probe so a device replaced during the exchange
+	// cannot lend its identity to the older observation. GetDevice releases
+	// hp.mu before consulting the provider, so no lock nests under this one.
+	deviceCreated := canaryDeviceGeneration(hp.GetDevice(tunnel.ID))
 
 	var err error
 	if fn != nil {
@@ -249,7 +254,7 @@ func (hp *HealthProber) probeCanary(ctx context.Context, tunnel *models.BackendT
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if stateErr := hp.acceptCanaryObservation(tunnel, sequence, err == nil); stateErr != nil {
+	if stateErr := hp.acceptCanaryObservation(tunnel, sequence, err == nil, deviceCreated); stateErr != nil {
 		return stateErr
 	}
 	if err == nil && tunnel.ID != 0 {
@@ -266,6 +271,18 @@ func (hp *HealthProber) probeCanary(ctx context.Context, tunnel *models.BackendT
 		}
 	}
 	return err
+}
+
+// canaryDeviceGeneration reads the creation stamp that binds canary evidence to
+// one specific backend device. A device without the optional capability (or
+// with a zero stamp) yields the zero time, which CanaryAdmissible treats as
+// unusable evidence rather than as fresh.
+func canaryDeviceGeneration(dev PacketDevice) time.Time {
+	gen, ok := dev.(DeviceGeneration)
+	if !ok || gen == nil {
+		return time.Time{}
+	}
+	return gen.CreatedAt()
 }
 
 func (hp *HealthProber) recordCanaryFailure(serverID int64) int {
@@ -296,6 +313,14 @@ func (hp *HealthProber) defaultCanaryProbe(ctx context.Context, tunnel *models.B
 	timeout := hp.cfg.Timeout
 	if timeout <= 0 {
 		timeout = 3 * time.Second
+	}
+
+	// Finding F11: a proxy transport cannot satisfy a packet canary at all, so it
+	// is health-checked with a protocol-appropriate authenticated application
+	// exchange over its own egress. AWG keeps the unchanged in-tunnel packet
+	// canary below (ICMP/DNS, dual-tier and quarantine semantics included).
+	if _, isProxy := newProxyPayloadCanary(tunnel, hp.proxyCanaryDestination); isProxy {
+		return probeProxyDeviceCanary(ctx, dev, tunnel, timeout, hp.proxyCanaryDestination)
 	}
 
 	return ProbePacketDevice(ctx, dev, timeout, hp.GetSubnetCIDR())

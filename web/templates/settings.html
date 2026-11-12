@@ -338,13 +338,6 @@
                         placeholder="flux_live_...">
                     <p class="form-hint">{{ _ "gigahost_api_key_hint" }}</p>
                 </div>
-                <div class="form-group">
-                    <label class="form-label" for="gigahost_monthly_budget">{{ _ "gigahost_monthly_budget_label" }}</label>
-                    <input type="number" step="any" min="0" class="form-input" id="gigahost_monthly_budget"
-                        value="{{ get $ghSettings "monthly_budget_nok" "" }}"
-                        placeholder="500">
-                    <p class="form-hint">{{ _ "gigahost_monthly_budget_hint" }}</p>
-                </div>
             </form>
 
             <div class="divider" style="margin: var(--space-md) 0;"></div>
@@ -362,6 +355,10 @@
                 </div>
                 <p class="form-hint" style="margin-bottom: var(--space-md);">{{ _ "deploy_vps_desc" }}</p>
 
+                <!-- Shown when the displayed catalog is a retained snapshot whose
+                     refresh failed, so it never looks current when it is not. -->
+                <div id="deployCatalogStale" role="status" style="display:none; padding: var(--space-sm) var(--space-md); border-radius: var(--radius-sm); background: rgba(245, 158, 11, 0.12); border: 1px solid var(--warning, #f59e0b); color: var(--text-primary); font-size: 0.85rem; margin-bottom: var(--space-md);"></div>
+
                 <div id="deployCatalogLoading" style="display:none; text-align:center; padding:var(--space-md);">
                     <div class="spinner" style="width:20px; height:20px; margin:0 auto;"></div>
                 </div>
@@ -376,11 +373,13 @@
                         <select class="form-select" id="deployRegionSelect"></select>
                     </div>
                     <div class="form-group">
+                        <label class="form-label" for="deployPlacementSelect">{{ _ "deploy_vps_placement_label" }}</label>
+                        <select class="form-select" id="deployPlacementSelect"></select>
+                        <p class="form-hint" id="deployPlacementHint" style="display:none;"></p>
+                    </div>
+                    <div class="form-group">
                         <label class="form-label" for="deployOSSelect">{{ _ "deploy_vps_select_os" }}</label>
-                        <select class="form-select" id="deployOSSelect">
-                            <option value="72">Ubuntu 24.04 LTS (x86_64)</option>
-                            <option value="12">Debian 12 Bookworm (x86_64)</option>
-                        </select>
+                        <select class="form-select" id="deployOSSelect"></select>
                     </div>
                     <button type="button" class="btn btn-primary" id="btnDeployVPS" style="display:flex; align-items:center; justify-content:center; gap:var(--space-sm);">
                         <svg class="icon"><use href="#icon-plus"></use></svg>
@@ -393,6 +392,17 @@
                 <div style="margin-top:var(--space-lg); border-top:1px solid var(--border-color); padding-top:var(--space-md);">
                     <h5 style="margin:0 0 var(--space-sm) 0; font-size:0.9rem; font-weight:600;">{{ _ "deploy_vps_recent_orders" }}</h5>
                     <div id="recentOrdersContainer" style="font-size:0.85rem;">
+                        <span class="text-muted">...</span>
+                    </div>
+                </div>
+
+                <!-- Saved setup approvals. These are durable jobs tracked by the
+                     panel itself, so they are shown even when the ordering browser
+                     is long closed. The original browser is not the source of truth. -->
+                <div style="margin-top:var(--space-lg); border-top:1px solid var(--border-color); padding-top:var(--space-md);">
+                    <h5 style="margin:0 0 var(--space-sm) 0; font-size:0.9rem; font-weight:600;">{{ _ "setup_intents_title" }}</h5>
+                    <p class="form-hint" style="margin-bottom:var(--space-sm);">{{ _ "setup_intents_desc" }}</p>
+                    <div id="setupIntentsContainer" style="font-size:0.85rem;">
                         <span class="text-muted">...</span>
                     </div>
                 </div>
@@ -410,6 +420,12 @@
     </button>
 </div>
 
+<script src="/static/js/gigahost_catalog_status.js"></script>
+<script src="/static/js/gigahost_setup.js"></script>
+<script src="/static/js/gigahost_setup_intents.js"></script>
+<script src="/static/js/gigahost_order_status_model.js"></script>
+<script src="/static/js/gigahost_order_status.js"></script>
+<script src="/static/js/gigahost_placement.js"></script>
 <script>
     document.getElementById('ssl_enabled').addEventListener('change', (e) => {
         document.getElementById('sslFields').style.display = e.target.checked ? 'block' : 'none';
@@ -468,12 +484,10 @@
         };
 
         const ghApiKeyInput = document.getElementById('gigahost_api_key');
-        const ghBudgetInput = document.getElementById('gigahost_monthly_budget');
         let gigahost = undefined;
-        if (ghApiKeyInput || ghBudgetInput) {
+        if (ghApiKeyInput) {
             gigahost = {
-                api_key: ghApiKeyInput ? ghApiKeyInput.value.trim() : '',
-                monthly_budget_nok: ghBudgetInput && ghBudgetInput.value ? parseFloat(ghBudgetInput.value) : 0
+                api_key: ghApiKeyInput.value.trim()
             };
         }
 
@@ -627,8 +641,100 @@
     const btnDeployVPS = document.getElementById('btnDeployVPS');
     const deployPlanSelect = document.getElementById('deployPlanSelect');
     const deployRegionSelect = document.getElementById('deployRegionSelect');
+    const deployPlacementSelect = document.getElementById('deployPlacementSelect');
+    const deployPlacementHint = document.getElementById('deployPlacementHint');
+    const deployOSSelect = document.getElementById('deployOSSelect');
 
     let cachedPlans = [];
+
+    // The rule lives in the module so it cannot drift between rebuilds and choice.
+    const deploymentPlacementIntent = placementNewIntent();
+
+    // Recomputed per call, so a catalog refresh is always the authority.
+    function deployPlacementChoices() {
+        return placementChoices(deployPlanAt(), deployRegionSelect ? deployRegionSelect.value : null);
+    }
+
+    // Explains a refusal or dropped choice; never enables ordering.
+    function showDeployPlacementHint(text) {
+        if (!deployPlacementHint) return;
+        deployPlacementHint.textContent = text || '';
+        deployPlacementHint.style.display = text ? 'block' : 'none';
+    }
+    // Rebuilds from the provider's facts; may only ARM the latch, never release it.
+    function rebuildDeployPlacement(previous) {
+        const choices = deployPlacementChoices();
+        if (!deployPlacementSelect) return {value: '', cleared: false, reason: ''};
+        deployPlacementSelect.innerHTML = '';
+
+        const managed = document.createElement('option');
+        managed.value = choices.managed.value;
+        managed.textContent = choices.managed.label;
+        deployPlacementSelect.appendChild(managed);
+
+        choices.options.forEach(option => {
+            const opt = document.createElement('option');
+            // A refused datacenter still carries a distinct value, so choosing it is
+            // an explicit refusal rather than a silent default.
+            opt.value = option.value;
+            opt.textContent = placementLabel(option);
+            opt.disabled = !option.selectable;
+            deployPlacementSelect.appendChild(opt);
+        });
+
+        const decision = placementSelection(choices, previous);
+        deployPlacementSelect.value = decision.value;
+        deployPlacementSelect.disabled = false;
+        showDeployPlacementHint(decision.cleared ? decision.reason : (choices.note || ''));
+        // Automatic rebuild: this can only arm the outstanding-choice latch.
+        deploymentPlacementIntent.rebind(decision);
+        return decision;
+    }
+
+    // deployPlacementNeedsChoice reports whether a dropped pin still needs a choice.
+    function deployPlacementNeedsChoice() {
+        return deploymentPlacementIntent.needed();
+    }
+
+    // deployPlanAt returns the plan the plan selector currently points at, or
+    // null. The selector's value is the plan index into cachedPlans; an empty
+    // value means the catalog had nothing selectable.
+    function deployPlanAt() {
+        if (!deployPlanSelect || cachedPlans.length === 0) return null;
+        if (deployPlanSelect.value === '') return null;
+        const idx = parseInt(deployPlanSelect.value, 10);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= cachedPlans.length) return null;
+        return cachedPlans[idx];
+    }
+
+    // deployPlanLabel renders the authoritative provider price facts: the hourly
+    // rate, the currency and the monthly ceiling the provider documents. Nothing
+    // is converted or capped.
+    function deployPlanLabel(p) {
+        const parts = [];
+        if (p.cpu_cores) parts.push(p.cpu_cores + ' vCPU');
+        if (p.ram_mb) parts.push(Math.round(p.ram_mb / 1024) + 'GB RAM');
+        if (p.disk_gb) parts.push(p.disk_gb + 'GB NVMe');
+        const currency = p.currency || 'NOK';
+        const price = [];
+        if (p.hourly_rate_nok > 0) price.push(p.hourly_rate_nok + ' ' + currency + '/hr');
+        if (p.monthly_ceiling_nok > 0) price.push('max ' + p.monthly_ceiling_nok + ' ' + currency + '/mo');
+        const spec = parts.join(', ');
+        return p.name + (spec ? ' — ' + spec : '') + (price.length ? ' (' + price.join(', ') + ')' : '');
+    }
+
+    // appendDeployOption adds one disabled-by-default placeholder option, used
+    // when the provider returned nothing selectable. It carries no id, so
+    // nothing can be ordered from it.
+    function appendDeployOption(select, text) {
+        if (!select) return;
+        select.innerHTML = '';
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = text;
+        select.appendChild(opt);
+        select.disabled = true;
+    }
 
     async function loadGigahostCatalog() {
         if (!deployPlanSelect) return;
@@ -636,121 +742,173 @@
         if (loading) loading.style.display = 'block';
         try {
             const res = await API.get('/api/admin/hosting/gigahost/catalog');
+            renderDeployCatalogStale(res);
             cachedPlans = (res && res.plans) ? res.plans : [];
-            deployPlanSelect.innerHTML = '';
             if (cachedPlans.length === 0) {
+                // An empty result destroys the pin, so record the loss first: the
+                // operator's explicit choice must not evaporate into a later
+                // recovery that looks like a fresh managed selection.
+                deploymentPlacementIntent.lost(deployPlacementSelect ? deployPlacementSelect.value : null);
+                appendDeployOption(deployPlanSelect, _('deploy_vps_no_plans'));
+                appendDeployOption(deployRegionSelect, _('deploy_vps_no_plans'));
+                if (deployPlacementSelect) appendDeployOption(deployPlacementSelect, _('deploy_vps_no_plans'));
+                appendDeployOption(deployOSSelect, _('deploy_vps_no_plans'));
+                // Automatic event: an outstanding choice survives it.
+                updateDeployButtonState();
+                return;
+            }
+            deployPlanSelect.innerHTML = '';
+            deployPlanSelect.disabled = false;
+            cachedPlans.forEach((p, idx) => {
                 const opt = document.createElement('option');
-                opt.value = '';
-                opt.textContent = _('no_matching_records');
+                opt.value = idx;
+                opt.textContent = deployPlanLabel(p);
                 deployPlanSelect.appendChild(opt);
-            } else {
-                cachedPlans.forEach((p, idx) => {
-                    const opt = document.createElement('option');
-                    opt.value = idx;
-                    opt.textContent = `${p.name} — ${p.cpu_cores} vCPU, ${Math.round(p.ram_mb/1024)}GB RAM, ${p.disk_gb}GB NVMe (${p.hourly_rate_nok} NOK/hr, max ${p.monthly_ceiling_nok} NOK/mo)`;
-                    deployPlanSelect.appendChild(opt);
-                });
-                updateDeployRegions();
-            }
+            });
+            // Re-examine the CURRENT choices, so a datacenter whose stock vanished
+            // between reads is dropped rather than re-defaulted to region-managed.
+            updateDeploySelections({
+                region: deployRegionSelect ? deployRegionSelect.value : null,
+                os: deployOSSelect ? deployOSSelect.value : null,
+                placement: deployPlacementSelect ? deployPlacementSelect.value : null
+            });
         } catch (err) {
-            if (deployPlanSelect) {
-                deployPlanSelect.innerHTML = '<option value="">' + (err.message || 'Catalog unavailable') + '</option>';
-            }
+            // A failed read destroys the pin and the displayed catalog answer, so
+            // record the loss before the selectors are replaced.
+            deploymentPlacementIntent.lost(deployPlacementSelect ? deployPlacementSelect.value : null);
+            renderDeployCatalogStale(null);
+            cachedPlans = [];
+            const message = _('deploy_vps_catalog_unavailable');
+            appendDeployOption(deployPlanSelect, message);
+            appendDeployOption(deployRegionSelect, message);
+            if (deployPlacementSelect) appendDeployOption(deployPlacementSelect, message);
+            appendDeployOption(deployOSSelect, message);
+            // No pin survives a failed read, but the latch stays armed so the
+            // recovery cannot become an unchosen region-managed purchase.
+            showDeployPlacementHint('');
+            updateDeployButtonState();
         } finally {
             if (loading) loading.style.display = 'none';
         }
     }
 
-    function updateDeployRegions() {
-        if (!deployRegionSelect || cachedPlans.length === 0) return;
-        const planIdx = parseInt(deployPlanSelect.value || '0');
-        const plan = cachedPlans[planIdx] || cachedPlans[0];
-        deployRegionSelect.innerHTML = '';
-        if (plan && plan.regions && plan.regions.length > 0) {
-            plan.regions.forEach(r => {
+    // updateDeploySelections rebuilds the region and image selectors from the
+    // plan the provider actually returned. It keeps a selection only when that
+    // value is still valid for the new plan, so a plan change cannot leave an
+    // incompatible region or image selected. previous holds the values the user
+    // had chosen; pass null to take the provider's first valid choice.
+    function updateDeploySelections(previous) {
+        const plan = deployPlanAt();
+        const keepRegion = previous ? previous.region : null;
+        const keepOS = previous ? previous.os : null;
+
+        if (!plan) {
+            appendDeployOption(deployRegionSelect, _('deploy_vps_no_plans'));
+            if (deployPlacementSelect) appendDeployOption(deployPlacementSelect, _('deploy_vps_no_plans'));
+            appendDeployOption(deployOSSelect, _('deploy_vps_no_plans'));
+            // Automatic rebuild: never clears an outstanding choice.
+            updateDeployButtonState();
+            return;
+        }
+
+        const regions = (plan.regions || []).filter(r => r.available && r.in_stock !== false);
+        if (deployRegionSelect) {
+            deployRegionSelect.innerHTML = '';
+            regions.forEach(r => {
                 const opt = document.createElement('option');
                 opt.value = r.id;
-                opt.textContent = r.name + (r.country ? ` (${r.country})` : '');
+                const label = r.name || String(r.id);
+                opt.textContent = r.country ? (label + ' (' + r.country + ')') : label;
+                if (keepRegion !== null && String(r.id) === String(keepRegion)) opt.selected = true;
                 deployRegionSelect.appendChild(opt);
             });
-        } else {
-            const opt = document.createElement('option');
-            opt.value = '1';
-            opt.textContent = 'Norway (Default)';
-            deployRegionSelect.appendChild(opt);
+            if (regions.length === 0) {
+                appendDeployOption(deployRegionSelect, _('deploy_vps_no_region_stock'));
+            } else {
+                deployRegionSelect.disabled = false;
+            }
         }
+
+        // Rebuild from the new plan and the surviving region, so a pin the new pair
+        // cannot honour is dropped rather than reaching the payload.
+        // The rebuild sets the latch itself when it drops a pin; it never clears it.
+        rebuildDeployPlacement(previous ? previous.placement : null);
+
+        const images = plan.os_options || [];
+        if (deployOSSelect) {
+            deployOSSelect.innerHTML = '';
+            images.forEach(os => {
+                const opt = document.createElement('option');
+                opt.value = os.os_id;
+                opt.textContent = os.os_name || String(os.os_id);
+                if (keepOS !== null && String(os.os_id) === String(keepOS)) opt.selected = true;
+                deployOSSelect.appendChild(opt);
+            });
+            if (images.length === 0) {
+                appendDeployOption(deployOSSelect, _('deploy_vps_no_os'));
+            } else {
+                deployOSSelect.disabled = false;
+            }
+        }
+
+        updateDeployButtonState();
     }
 
-    async function loadRecentOrders() {
-        const container = document.getElementById('recentOrdersContainer');
-        if (!container) return;
-        const renderEmpty = () => {
-            const emptySpan = document.createElement('span');
-            emptySpan.className = 'text-muted';
-            emptySpan.textContent = _('no_matching_records');
-            container.replaceChildren(emptySpan);
-        };
-        try {
-            const res = await API.get('/api/admin/hosting/gigahost/orders');
-            const orders = (res && res.orders) ? res.orders : [];
-            if (orders.length === 0) {
-                renderEmpty();
-                return;
-            }
-            const list = document.createElement('div');
-            list.style.display = 'flex';
-            list.style.flexDirection = 'column';
-            list.style.gap = '6px';
-            orders.slice(0, 5).forEach(o => {
-                const badgeClass = o.status === 'ready' ? 'badge-success' : (o.status === 'failed' ? 'badge-danger' : 'badge-warn');
-                const row = document.createElement('div');
-                row.style.display = 'flex';
-                row.style.justifyContent = 'space-between';
-                row.style.alignItems = 'center';
-                row.style.padding = '4px 0';
-                row.style.borderBottom = '1px solid rgba(255,255,255,0.05)';
-
-                const left = document.createElement('div');
-                const idSpan = document.createElement('span');
-                idSpan.style.fontFamily = 'monospace';
-                idSpan.style.fontWeight = '600';
-                idSpan.textContent = '#' + (o.order_id || '');
-                left.appendChild(idSpan);
-
-                if (o.assigned_ip) {
-                    const ipSpan = document.createElement('span');
-                    ipSpan.style.fontFamily = 'monospace';
-                    ipSpan.style.marginLeft = '6px';
-                    ipSpan.style.color = 'var(--text-secondary)';
-                    ipSpan.textContent = o.assigned_ip;
-                    left.appendChild(ipSpan);
-                }
-
-                const right = document.createElement('div');
-                const badge = document.createElement('span');
-                badge.className = 'badge ' + badgeClass;
-                badge.style.fontSize = '0.75rem';
-                badge.textContent = o.status || '';
-                right.appendChild(badge);
-
-                row.appendChild(left);
-                row.appendChild(right);
-                list.appendChild(row);
-            });
-            container.replaceChildren(list);
-        } catch (_) {
-            renderEmpty();
-        }
+    // updateDeployButtonState disables ordering unless the plan, region and image
+    // selectors all carry a real provider value. A disabled button cannot post a
+    // guessed selection.
+    function updateDeployButtonState() {
+        if (!btnDeployVPS) return;
+        const ready = !!deployPlanAt()
+            && !!deployRegionSelect && deployRegionSelect.value !== ''
+            && !!deployOSSelect && deployOSSelect.value !== ''
+            // A dropped pin blocks ordering until the operator chooses again. The
+            // stored choice is not silently read as region-managed placement.
+            && !deployPlacementNeedsChoice();
+        btnDeployVPS.disabled = !ready;
     }
 
     async function handleDeployVPS() {
-        if (!deployPlanSelect || cachedPlans.length === 0) return;
-        const planIdx = parseInt(deployPlanSelect.value || '0');
-        const plan = cachedPlans[planIdx];
+        const plan = deployPlanAt();
         if (!plan) return;
 
-        const regionID = deployRegionSelect ? parseInt(deployRegionSelect.value || '1') : 1;
-        const osID = parseInt(document.getElementById('deployOSSelect').value || '72');
+        // The payload is built only from values the provider returned. Each
+        // selector is re-read here rather than defaulted, so an empty selector
+        // stops the order instead of posting a guess.
+        const regionID = deployRegionSelect ? parseInt(deployRegionSelect.value, 10) : NaN;
+        const osID = deployOSSelect ? parseInt(deployOSSelect.value, 10) : NaN;
+        if (!Number.isInteger(regionID) || regionID <= 0 || !Number.isInteger(osID) || osID <= 0) {
+            UI.toast(_('deploy_vps_select_required'), 'error');
+            return;
+        }
+
+        // A dropped pin must be re-chosen before anything is bought.
+        if (deployPlacementNeedsChoice()) {
+            UI.toast(_('deploy_vps_placement_choice_cleared'), 'error');
+            return;
+        }
+
+        // The placement half of the payload comes from the module, which returns
+        // null for any choice it cannot send. A null therefore stops the order
+        // instead of falling back to a different location.
+        //
+        // A vanished option reads as '' (which a <select> produces for an unknown
+        // value), and '' means region-managed. That is the silent downgrade this
+        // path forbids, so the value is verified against the option list.
+        const placementValue = placementReadValue(deployPlacementSelect);
+        if (placementValue === null) {
+            UI.toast(_('deploy_vps_placement_choice_cleared'), 'error');
+            return;
+        }
+        const placementField = placementPayloadField(
+            deployPlacementChoices(),
+            placementValue,
+            regionID
+        );
+        if (!placementField) {
+            UI.toast(_('deploy_vps_select_required'), 'error');
+            return;
+        }
 
         const btn = document.getElementById('btnDeployVPS');
         const spinner = document.getElementById('deployVPSSpinner');
@@ -758,31 +916,71 @@
         if (spinner) spinner.classList.remove('hidden');
 
         try {
-            const payload = {
+            // region_id is always sent to the panel: it is the region the operator
+            // saw, the duplicate-guard key and the ledger field. A pin adds dc_id
+            // beside it; the provider client drops region_id on the outbound wire.
+            const payload = Object.assign({
                 pid: plan.product_id,
                 price_id: plan.price_id,
                 region_id: regionID,
                 os_id: osID,
                 hourly_price_nok: plan.hourly_rate_nok
-            };
+            }, placementField);
             const res = await API.post('/api/admin/hosting/gigahost/order', payload);
-            UI.toast(res.message || 'VPS order placed successfully', 'success');
+            UI.toast(res.message || _('deploy_vps_order_placed'), 'success');
             loadRecentOrders();
         } catch (err) {
             UI.toast(err.message || _('error'), 'error');
         } finally {
-            if (btn) btn.disabled = false;
+            updateDeployButtonState();
             if (spinner) spinner.classList.add('hidden');
         }
     }
 
     if (deployPlanSelect) {
-        deployPlanSelect.addEventListener('change', updateDeployRegions);
+        deployPlanSelect.addEventListener('change', () => {
+            // Plan change rebuilds both dependent selectors from the new plan. The
+            // values selected so far are offered back so a choice the new plan
+            // still supports is preserved, and one it does not support is dropped.
+            updateDeploySelections({
+                region: deployRegionSelect ? deployRegionSelect.value : null,
+                os: deployOSSelect ? deployOSSelect.value : null,
+                placement: deployPlacementSelect ? deployPlacementSelect.value : null
+            });
+        });
+    }
+    if (deployRegionSelect) {
+        deployRegionSelect.addEventListener('change', () => {
+            // A region change can invalidate a pin; rebuild so the drop is visible.
+            rebuildDeployPlacement(deployPlacementSelect ? deployPlacementSelect.value : null);
+            updateDeployButtonState();
+        });
+    }
+    if (deployPlacementSelect) {
+        deployPlacementSelect.addEventListener('change', () => {
+            // The only place the latch may be released: the operator acting on the
+            // selector itself. placementHandleChoice owns every part of that rule.
+            const outcome = placementHandleChoice(
+                deploymentPlacementIntent, deployPlacementSelect, deployPlacementChoices());
+            deployPlacementSelect.value = outcome.value;
+            showDeployPlacementHint(outcome.hint);
+            // The outcome reports whether ordering stays blocked; it is applied here
+            // rather than re-derived, so a refusal cannot be lost between the two.
+            deploymentPlacementIntent.apply(outcome.blocked);
+            updateDeployButtonState();
+        });
+    }
+    if (deployOSSelect) {
+        deployOSSelect.addEventListener('change', updateDeployButtonState);
     }
     if (btnRefreshCatalog) {
         btnRefreshCatalog.addEventListener('click', () => {
+            // The manual refresh re-reads the catalog and then the orders, and it
+            // restarts the one refresh timer so the manual read also counts as the
+            // start of the next 30-second interval instead of racing it.
             loadGigahostCatalog();
             loadRecentOrders();
+            startGigahostOrderStatusRefresh(loadRecentOrders);
         });
     }
     if (btnDeployVPS) {
@@ -791,7 +989,12 @@
 
     if (deployPlanSelect) {
         loadGigahostCatalog();
+        // One initial read, then the status view owns the only repeating read. It
+        // is registered once here, and starting it again would replace it rather
+        // than add a second timer.
         loadRecentOrders();
+        startGigahostOrderStatusRefresh(loadRecentOrders);
+        loadSetupIntents();
     }
 </script>
 {{ end }}

@@ -19,10 +19,7 @@ concurrency:
 jobs:
   architecture-health:
     name: Architecture Health Report
-    runs-on: [self-hosted, linux, x64, container-vm]
-    container:
-      image: localhost:5000/nexus-ci-job:latest
-      options: --cpus 4 --memory 6g
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout Code with Full History
@@ -30,9 +27,6 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Trust this job workspace
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Set up Python
         uses: actions/setup-python@v7

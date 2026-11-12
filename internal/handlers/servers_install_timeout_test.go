@@ -47,8 +47,12 @@ func TestInstallProtocolHandler_WriteDeadlineAndContextTimeout(t *testing.T) {
 
 	mockSSH := &testMockSSHClient{
 		cmdFunc: func(ctx context.Context, cmd string) (string, string, int, error) {
+			// Remote-lock release/heartbeat calls have intentionally shorter child
+			// deadlines. Record the request budget, not the last cleanup call.
 			if dl, ok := ctx.Deadline(); ok {
-				capturedDeadline = dl
+				if dl.After(capturedDeadline) {
+					capturedDeadline = dl
+				}
 				deadlineFound = true
 			}
 			if strings.Contains(cmd, "ss -lun") || strings.Contains(cmd, "docker ps") {
@@ -111,8 +115,12 @@ func TestUninstallProtocolHandler_WriteDeadlineAndContextTimeout(t *testing.T) {
 
 	mockSSH := &testMockSSHClient{
 		cmdFunc: func(ctx context.Context, cmd string) (string, string, int, error) {
+			// Remote-lock release/heartbeat calls have intentionally shorter child
+			// deadlines. Record the request budget, not the last cleanup call.
 			if dl, ok := ctx.Deadline(); ok {
-				capturedDeadline = dl
+				if dl.After(capturedDeadline) {
+					capturedDeadline = dl
+				}
 				deadlineFound = true
 			}
 			if strings.Contains(cmd, "ss -lun") || strings.Contains(cmd, "docker ps") {

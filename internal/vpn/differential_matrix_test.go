@@ -415,13 +415,13 @@ func TestDifferential_TwoPeerIsolation(t *testing.T) {
 	destA := netip.MustParseAddr("198.51.100.101")
 	destB := netip.MustParseAddr("198.51.100.102")
 
-	type echoBackend struct {
-		vt     *netstack.Net
-		tunDev *returnStackDevice
-		done   chan struct{}
-	}
-
-	startBackend := func(tunnelID int64, dest netip.Addr, marker byte) *echoBackend {
+	// startBackend attaches one backend device and its return reader, then starts
+	// the test-owned echo producers. Teardown ownership is deliberately singular:
+	// the device close is registered BEFORE returnEchoServers so the helper's
+	// (later, LIFO-first) cleanup stops both echo producers first, while this
+	// reader is still draining. Closing the device while a producer is inside
+	// netstack WriteNotify is a data race and a send-on-closed-channel panic.
+	startBackend := func(tunnelID int64, dest netip.Addr, marker byte) {
 		vt, stack, err := netstack.CreateNetTUN([]netip.Addr{dest}, nil, 1280)
 		if err != nil {
 			t.Fatal(err)
@@ -433,12 +433,12 @@ func TestDifferential_TwoPeerIsolation(t *testing.T) {
 			defer close(done)
 			svc.pumpBackendReturns(tunnelID, 0, adapter)
 		}()
+		t.Cleanup(func() { _ = adapter.Close(); <-done })
 		returnEchoServers(t, stack, dest, marker)
-		return &echoBackend{vt: stack, tunDev: adapter, done: done}
 	}
 
-	b1 := startBackend(backends[0].ID, destA, 0x01)
-	b2 := startBackend(backends[1].ID, destB, 0x02)
+	startBackend(backends[0].ID, destA, 0x01)
+	startBackend(backends[1].ID, destB, 0x02)
 
 	svc.stickyMgr.AssignPeerAffinity(peerA.publicKey, backends[0].ID)
 	svc.stickyMgr.AssignPeerAffinity(peerB.publicKey, backends[1].ID)
@@ -508,12 +508,10 @@ func TestDifferential_TwoPeerIsolation(t *testing.T) {
 		t.Errorf("forwarder drops: queueFull=%d noRoute=%d, want 0", qFull, noRoute)
 	}
 
+	// Device close and return-reader completion are owned by the cleanups
+	// registered in startBackend, so they run after the echo producers stop.
 	clientA.dev.Close()
 	clientB.dev.Close()
-	_ = b1.tunDev.Close()
-	_ = b2.tunDev.Close()
-	<-b1.done
-	<-b2.done
 }
 
 // TestDifferential_NATRoaming verifies that when a client's outer UDP endpoint roams
@@ -1031,13 +1029,14 @@ func TestDifferential_ParameterMatrixAndS4Regression(t *testing.T) {
 				t.Fatalf("DialUDP ref: %v", err)
 			}
 			refEcho, err := refClient.ExchangeUDP(refUDP, payload)
+			refReport := referenceUDPExchangeFailureReport(refClient, refServer, err, refEcho, payload)
 			_ = refUDP.Close()
 			_ = refClient.Close()
 			_ = harness.StopReferenceServer(refServer)
 			harness.AssertPortFree(5 * time.Second)
 
 			if err != nil || !bytes.Equal(refEcho, payload) {
-				t.Fatalf("ref ExchangeUDP failed for %s: got %q, err %v", tc.name, refEcho, err)
+				t.Fatalf("ref ExchangeUDP failed for %s: got %q, err %v%s", tc.name, refEcho, err, refReport)
 			}
 
 			// 2. Subject
@@ -1059,13 +1058,14 @@ func TestDifferential_ParameterMatrixAndS4Regression(t *testing.T) {
 				t.Fatalf("DialUDP sub: %v", err)
 			}
 			subEcho, err := subClient.ExchangeUDP(subUDP, payload)
+			subReport := udpExchangeFailureReport(subClient, subServer, err, subEcho, payload)
 			_ = subUDP.Close()
 			_ = subClient.Close()
 			_ = harness.StopSubjectServer(subServer)
 			harness.AssertPortFree(5 * time.Second)
 
 			if err != nil || !bytes.Equal(subEcho, payload) {
-				t.Fatalf("sub ExchangeUDP failed for %s: got %q, err %v", tc.name, subEcho, err)
+				t.Fatalf("sub ExchangeUDP failed for %s: got %q, err %v%s", tc.name, subEcho, err, subReport)
 			}
 
 			// Parity assertion

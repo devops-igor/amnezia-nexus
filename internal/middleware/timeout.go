@@ -19,7 +19,7 @@ const (
 )
 
 // RequestTimeout returns the configured timeout duration based on the request URL path.
-// - Routes ending in /install receive InstallRequestTimeout (15 minutes).
+// - Routes ending in /install, /deploy, or /setup receive InstallRequestTimeout (15 minutes).
 // - Routes ending in /uninstall receive UninstallRequestTimeout (5 minutes).
 // - All other routes receive defaultTimeout (or DefaultRequestTimeout if defaultTimeout <= 0).
 func RequestTimeout(path string, defaultTimeout time.Duration) time.Duration {
@@ -27,7 +27,7 @@ func RequestTimeout(path string, defaultTimeout time.Duration) time.Duration {
 		defaultTimeout = DefaultRequestTimeout
 	}
 	trimmed := strings.TrimRight(path, "/")
-	if strings.HasSuffix(trimmed, "/install") {
+	if strings.HasSuffix(trimmed, "/install") || strings.HasSuffix(trimmed, "/deploy") || strings.HasSuffix(trimmed, "/setup") {
 		return InstallRequestTimeout
 	}
 	if strings.HasSuffix(trimmed, "/uninstall") {

@@ -213,6 +213,9 @@ func (p *Pool) RemoveTunnel(ctx context.Context, serverID int64) error {
 		if err := p.db.DeleteBackendTunnel(ctx, tunnel.ID); err != nil {
 			return fmt.Errorf("failed to delete backend tunnel from DB: %w", err)
 		}
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = p.db.SetBackendPendingEnrollment(writeCtx, serverID, false)
 	}
 
 	delete(p.tunnelsByServerID, serverID)

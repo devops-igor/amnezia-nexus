@@ -91,6 +91,11 @@ func (m *NaiveManager) getDNSLookup() DNSLookupFunc {
 	return m.dnsLookup
 }
 
+// SSHProvider returns the underlying SSHProvider.
+func (m *NaiveManager) SSHProvider() SSHProvider {
+	return m.sshPool
+}
+
 // NewNaiveManager creates a new NaiveManager instance.
 func NewNaiveManager(pool SSHProvider) *NaiveManager {
 	return &NaiveManager{

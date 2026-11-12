@@ -63,20 +63,25 @@ type Dependencies struct {
 
 // Handlers encapsulates all HTTP route handlers and business logic.
 type Handlers struct {
-	cfg                       *config.Config
-	db                        *database.DB
-	registry                  *manager.Registry
-	sshPool                   SSHPoolProvider
-	awgMgr                    *awg.AWGManager
-	mtproxylMgr               *mtproxyl.MTProxyLManager
-	dnsMgr                    *dns.DNSManager
-	xrayMgr                   *xray.XrayManager
-	naiveMgr                  *naive.NaiveManager
-	vpnSvc                    *vpn.Service
-	upstreamSvc               UpstreamChecker
-	gigahostClient            gigahost.Client
-	gigahostMu                sync.RWMutex
-	budgetMu                  sync.Mutex
+	cfg            *config.Config
+	db             *database.DB
+	registry       *manager.Registry
+	sshPool        SSHPoolProvider
+	awgMgr         *awg.AWGManager
+	mtproxylMgr    *mtproxyl.MTProxyLManager
+	dnsMgr         *dns.DNSManager
+	xrayMgr        *xray.XrayManager
+	naiveMgr       *naive.NaiveManager
+	vpnSvc         *vpn.Service
+	upstreamSvc    UpstreamChecker
+	gigahostClient gigahost.Client
+	gigahostMu     sync.RWMutex
+	// purchaseMu serializes the duplicate-purchase check with the durable intent
+	// row that makes its decision visible, so two concurrent order attempts cannot
+	// both pass the check. It is deliberately released before the provider call:
+	// holding it across network I/O would serialize every Gigahost purchase in the
+	// process. See beginPurchaseWithIntent for the exact boundary.
+	purchaseMu                sync.Mutex
 	updaterSvc                *updater.ReleaseChecker
 	dialTimeout               func(network, address string, timeout time.Duration) (net.Conn, error)
 	setupMu                   sync.Mutex
@@ -85,6 +90,35 @@ type Handlers struct {
 	serverHostMu              sync.Mutex
 	serverHostLocks           map[int64]*sync.Mutex
 	updateServerProtocolsHook func(context.Context, int64, map[string]any) error
+	sshDialerHook             func(context.Context, ssh.Config) (ssh.SSHClient, error)
+	gigahostDeployMu          sync.RWMutex
+	gigahostDeployLocks       map[string]*sync.Mutex
+	// gigahostIntentHook, when set, runs immediately before the durable order
+	// intent is written. It exists so a test can hold an attempt inside the
+	// duplicate-check-to-intent window deterministically instead of racing for
+	// it; it is nil in production and adds one nil check on that path.
+	gigahostIntentHook func()
+	// setupNudge, when set, asks the background setup tracker to run a pass
+	// immediately instead of waiting for its next interval. It is nil in unit
+	// tests and costs one nil check; the interval sweep is what actually
+	// guarantees a pending intent is observed.
+	setupNudge func()
+	// installNudge does the same for the installer that performs the
+	// side-effecting install steps, which is a separate worker with a separate
+	// (never-blindly-repeat) failure policy.
+	installNudge func()
+	// Repeated rejected deploy attempts are suppressed per admin for a short
+	// window; see gigahost_admission.go.
+	admissionOnce  sync.Once
+	admissionState *orderAdmission
+	// Display-side provider catalog cache, one complete snapshot per provider
+	// account; see gigahost_catalog_cache.go. It is consulted only by
+	// GigahostCatalogHandler - never by the purchase path. The cache also owns the
+	// current provider-client generation, so retirement of a replaced client's
+	// retained state is recorded next to that state instead of being inferred from
+	// an entry still being present.
+	catalogCacheOnce  sync.Once
+	catalogCacheState *gigahostCatalogCache
 }
 
 // lockUser serializes credential admission and user disabling; the lock is shared

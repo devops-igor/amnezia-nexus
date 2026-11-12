@@ -29,6 +29,12 @@ func (rd *revokeDispatcher) bind(svc *Service) {
 		return
 	}
 	rd.svc = svc
+	if svc != nil && svc.prober != nil {
+		svc.prober.SetDeviceProvider(svc)
+		if cidr := svc.SubnetCIDR(); cidr != "" {
+			svc.prober.SetSubnetCIDR(cidr)
+		}
+	}
 	close(rd.ready)
 }
 

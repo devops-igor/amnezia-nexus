@@ -2,9 +2,9 @@ package handlers
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -15,50 +15,122 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 )
 
-// GigahostOrderRecord models persistent deployment jobs in gigahost_orders.
-type GigahostOrderRecord struct {
-	ID             int64     `json:"id"`
-	OrderID        string    `json:"order_id"`
-	ServerID       int64     `json:"server_id"`
-	Status         string    `json:"status"` // pending, deploying, ready, failed, unknown
-	PlanID         int       `json:"plan_id"`
-	RegionID       int       `json:"region_id"`
-	HourlyPriceNOK float64   `json:"hourly_price_nok"`
-	AssignedIP     string    `json:"assigned_ip"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
-}
+// GigahostOrderRecord is the persisted ledger row. The type lives in models
+// because it is a persisted entity; the alias keeps the handler-side call sites
+// and JSON contracts unchanged.
+type GigahostOrderRecord = models.GigahostOrder
 
 // OrderServerPayload defines the incoming payload for manual hourly VPS orders.
+// DCID optionally pins one datacenter inside RegionID (see gigahost_placement.go).
 type OrderServerPayload struct {
 	PID            int     `json:"pid"`
 	PriceID        int     `json:"price_id"`
 	RegionID       int     `json:"region_id"`
+	DCID           int     `json:"dc_id,omitempty"`
 	OSID           int     `json:"os_id"`
 	HourlyPriceNOK float64 `json:"hourly_price_nok"`
 }
 
-// SetGigahostClient allows injecting or replacing the Gigahost API client.
-func (h *Handlers) SetGigahostClient(c gigahost.Client) {
-	h.gigahostMu.Lock()
-	defer h.gigahostMu.Unlock()
-	if c != nil {
-		h.gigahostClient = &mockCatalogFallback{Client: c}
-	} else {
-		h.gigahostClient = nil
+// validate rejects a payload the provider cannot be asked to fulfill.
+//
+// region_id is required even for a datacenter pin: the page posts to the panel, so
+// region_id is the region the operator saw, the duplicate guard's key and the ledger
+// field. Only the outbound provider body drops it for a pin
+// (gigahost.OrderRequest.wireBody). The client-supplied hourly rate is not required:
+// the provider catalog is the authoritative price.
+func (p OrderServerPayload) validate() error {
+	if p.PID <= 0 || p.PriceID <= 0 || p.RegionID <= 0 || p.OSID <= 0 {
+		return errors.New("pid, price_id, region_id, os_id must be positive integers")
 	}
+	return nil
+}
+
+// SetGigahostClient allows injecting or replacing the Gigahost API client.
+//
+// A replaced client is a different provider account identity for this handler, so
+// every retained display snapshot is dropped with it, and the catalog generation is
+// advanced in the same step. An in-flight refresh that belongs to the previous
+// client can then neither be joined by the replacement nor publish over it - not
+// even while the replacement's table is still empty.
+func (h *Handlers) SetGigahostClient(c gigahost.Client) {
+	h.advanceGeneration(c)
+}
+
+// gigahostClientResolution is a resolved provider client plus the account
+// identity it acts for.
+//
+// credential is the provider API key the client was built from, and it is empty
+// for an explicitly injected client. It is carried out of resolution because the
+// display cache is scoped per account; nothing that receives it may log, return,
+// store or otherwise expose it.
+//
+// generation is the catalog client epoch this client was resolved under. Client and
+// generation are read under one lock so a request can never act as one client while
+// labeling its work with another client's epoch.
+type gigahostClientResolution struct {
+	client     gigahost.Client
+	credential string
+	generation uint64
 }
 
 // getGigahostClient resolves the client from the injected instance, request header,
 // environment variable, or settings database.
 func (h *Handlers) getGigahostClient(ctx context.Context, r *http.Request) (gigahost.Client, error) {
+	resolved, err := h.resolveGigahostClient(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	return resolved.client, nil
+}
+
+// resolveGigahostClient resolves the provider client together with the account
+// identity it acts for. See gigahostClientResolution.
+func (h *Handlers) resolveGigahostClient(ctx context.Context, r *http.Request) (gigahostClientResolution, error) {
 	h.gigahostMu.RLock()
 	client := h.gigahostClient
+	// Same critical section as the client read: a replacement swaps the client and
+	// the epoch together under the write lock, so this pair is never mixed.
+	generation := h.catalogCache().currentGeneration()
 	h.gigahostMu.RUnlock()
 	if client != nil {
-		return client, nil
+		return gigahostClientResolution{client: client, generation: generation}, nil
 	}
 
+	apiKey := h.gigahostCredential(ctx, r)
+	if apiKey == "" {
+		return gigahostClientResolution{}, errors.New("gigahost api key not configured: set GIGAHOST_API_KEY, gigahost setting, or X-Gigahost-API-Key header")
+	}
+
+	// Build the client with one fixed-key timing record per provider call. The
+	// record carries only closed-set labels, bounded phase offsets and an
+	// outcome class - never a URL, host, id, header, body or error text - so
+	// the operator log can be reduced to an allowlisted artifact.
+	var onCall func(gigahost.CallTiming)
+	if timingEnabled() {
+		onCall = func(t gigahost.CallTiming) {
+			slog.Info(gigahost.CallTimingMarker, gigahost.TimingRecord(t)...)
+		}
+	}
+
+	built, err := gigahost.NewClient(gigahost.Config{
+		APIKey: apiKey,
+		OnCall: onCall,
+	})
+	if err != nil {
+		return gigahostClientResolution{}, err
+	}
+	// The built client belongs to whatever client generation is current now. The
+	// epoch is re-read here because building the client happens outside the lock and
+	// a replacement may have raced it; reading it late keeps client and epoch
+	// coherent, and the caller's own read then carries that paired identity.
+	generation = h.catalogCache().currentGeneration()
+	return gigahostClientResolution{client: built, credential: apiKey, generation: generation}, nil
+}
+
+// gigahostCredential resolves the provider API key from the request header, the
+// environment or the settings database, in that precedence. It returns "" when
+// none is configured.
+func (h *Handlers) gigahostCredential(ctx context.Context, r *http.Request) string {
 	var apiKey string
 	if r != nil {
 		apiKey = r.Header.Get("X-Gigahost-API-Key")
@@ -73,193 +145,79 @@ func (h *Handlers) getGigahostClient(ctx context.Context, r *http.Request) (giga
 		_ = h.db.GetSetting(ctx, "gigahost", &cfg)
 		apiKey = cfg.APIKey
 	}
-
-	if apiKey == "" {
-		return nil, errors.New("gigahost api key not configured: set GIGAHOST_API_KEY, gigahost setting, or X-Gigahost-API-Key header")
-	}
-
-	return gigahost.NewClient(gigahost.Config{
-		APIKey: apiKey,
-	})
+	return apiKey
 }
 
-// ensureGigahostOrdersTable creates the gigahost_orders schema if missing.
+// timingEnabled reports whether provider call timing is switched on.
+//
+// Off by default: the record exists to diagnose a specific stall, and an
+// operator turns it on deliberately for that run. Only the literal "1" enables
+// it, so a stray non-empty value cannot silently start publishing records.
+func timingEnabled() bool {
+	return os.Getenv("GIGAHOST_CALL_TIMING") == "1"
+}
+
+// ensureGigahostOrdersTable creates or upgrades the gigahost_orders schema.
+// The SQL lives in internal/database, which is the only package allowed to
+// issue it.
 func (h *Handlers) ensureGigahostOrdersTable(ctx context.Context) error {
-	if h.db == nil || h.db.SQLDB() == nil {
+	if h.db == nil {
 		return nil
 	}
-
-	queries := []string{
-		`CREATE TABLE IF NOT EXISTS gigahost_orders (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			order_id TEXT NOT NULL,
-			server_id INTEGER DEFAULT 0,
-			status TEXT NOT NULL,
-			plan_id INTEGER NOT NULL,
-			region_id INTEGER NOT NULL,
-			hourly_price_nok REAL NOT NULL DEFAULT 0.0,
-			assigned_ip TEXT DEFAULT '',
-			created_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_gigahost_orders_order_id ON gigahost_orders(order_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_gigahost_orders_status ON gigahost_orders(status)`,
-	}
-	for _, q := range queries {
-		if _, err := h.db.SQLDB().ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("failed to init gigahost_orders schema: %w", err)
-		}
-	}
-	return nil
+	return h.db.EnsureGigahostOrdersSchema(ctx)
 }
 
 // saveGigahostOrder writes a new order record into the database.
 func (h *Handlers) saveGigahostOrder(ctx context.Context, order *GigahostOrderRecord) error {
-	if err := h.ensureGigahostOrdersTable(ctx); err != nil {
-		return err
+	if h.gigahostIntentHook != nil {
+		h.gigahostIntentHook()
 	}
-	if h.db == nil || h.db.SQLDB() == nil {
+	if h.db == nil {
 		return nil
 	}
-
-	q := `INSERT INTO gigahost_orders (order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip, created_at, updated_at)
-	      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	res, err := h.db.SQLDB().ExecContext(ctx, q,
-		order.OrderID,
-		order.ServerID,
-		order.Status,
-		order.PlanID,
-		order.RegionID,
-		order.HourlyPriceNOK,
-		order.AssignedIP,
-		order.CreatedAt.Format(time.RFC3339),
-		order.UpdatedAt.Format(time.RFC3339),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to insert gigahost order: %w", err)
-	}
-	id, err := res.LastInsertId()
-	if err == nil {
-		order.ID = id
-	}
-	return nil
+	return h.db.InsertGigahostOrder(ctx, order)
 }
 
 // updateGigahostOrder updates order_id, server_id, status, and assigned_ip of an order.
 func (h *Handlers) updateGigahostOrder(ctx context.Context, order *GigahostOrderRecord) error {
-	if h.db == nil || h.db.SQLDB() == nil {
+	if h.db == nil {
 		return nil
 	}
-
-	order.UpdatedAt = time.Now().UTC()
-	q := `UPDATE gigahost_orders
-	      SET order_id = ?, server_id = ?, status = ?, assigned_ip = ?, updated_at = ?
-	      WHERE id = ? OR (order_id = ? AND order_id != '')`
-	_, err := h.db.SQLDB().ExecContext(ctx, q,
-		order.OrderID,
-		order.ServerID,
-		order.Status,
-		order.AssignedIP,
-		order.UpdatedAt.Format(time.RFC3339),
-		order.ID,
-		order.OrderID,
-	)
-	return err
+	return h.db.UpdateGigahostOrder(ctx, order)
 }
 
 // getGigahostOrders retrieves all orders from the database ordered by creation date descending.
 func (h *Handlers) getGigahostOrders(ctx context.Context) ([]GigahostOrderRecord, error) {
-	if err := h.ensureGigahostOrdersTable(ctx); err != nil {
-		return nil, err
-	}
-	if h.db == nil || h.db.SQLDB() == nil {
+	if h.db == nil {
 		return []GigahostOrderRecord{}, nil
 	}
-
-	q := `SELECT id, order_id, server_id, status, plan_id, region_id, hourly_price_nok, assigned_ip, created_at, updated_at
-	      FROM gigahost_orders
-	      ORDER BY id DESC`
-	rows, err := h.db.SQLDB().QueryContext(ctx, q)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query gigahost orders: %w", err)
-	}
-	defer rows.Close()
-
-	var list []GigahostOrderRecord
-	for rows.Next() {
-		var o GigahostOrderRecord
-		var createdAtStr, updatedAtStr string
-		var assignedIP sql.NullString
-		if err := rows.Scan(
-			&o.ID,
-			&o.OrderID,
-			&o.ServerID,
-			&o.Status,
-			&o.PlanID,
-			&o.RegionID,
-			&o.HourlyPriceNOK,
-			&assignedIP,
-			&createdAtStr,
-			&updatedAtStr,
-		); err != nil {
-			return nil, err
-		}
-		if assignedIP.Valid {
-			o.AssignedIP = assignedIP.String
-		}
-		o.CreatedAt, _ = time.Parse(time.RFC3339, createdAtStr)
-		o.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAtStr)
-		list = append(list, o)
-	}
-	return list, nil
+	return h.db.ListGigahostOrders(ctx)
 }
 
-// GigahostCatalogHandler handles GET /api/admin/hosting/gigahost/catalog.
-// Retrieves available hourly VPS plans, pricing, regions, and stock status.
-func (h *Handlers) GigahostCatalogHandler(w http.ResponseWriter, r *http.Request) {
-	sess := middleware.GetSession(r.Context())
-	if sess == nil || sess.Role != models.RoleAdmin {
-		h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required")
-		return
-	}
-
-	client, err := h.getGigahostClient(r.Context(), r)
+// loadSelectablePlans reads the provider catalog and its documented image
+// catalog, then attaches to every plan the images that can actually be installed
+// on it. Both reads are required: a plan is never published with a guessed or
+// partial selection set, because an order built from one would be rejected by
+// the provider after the money-moving request.
+func (h *Handlers) loadSelectablePlans(ctx context.Context, client gigahost.Client) ([]gigahost.HourlyPlan, []gigahost.OperatingSystem, error) {
+	plans, err := client.GetCatalog(ctx)
 	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "unconfigured", err.Error())
-		return
+		return nil, nil, err
 	}
-
-	plans, err := client.GetCatalog(r.Context())
+	images, err := client.GetOperatingSystems(ctx)
 	if err != nil {
-		if errors.Is(err, gigahost.ErrUnauthorized) {
-			h.JSONError(w, http.StatusBadGateway, "upstream_auth_failed", "Gigahost API authentication failed")
-			return
-		}
-		if errors.Is(err, gigahost.ErrRateLimited) {
-			h.JSONError(w, http.StatusTooManyRequests, "rate_limited", "Gigahost API rate limit exceeded")
-			return
-		}
-		h.JSONError(w, http.StatusBadGateway, "upstream_error", err.Error())
-		return
+		return nil, nil, fmt.Errorf("failed to read provider operating systems: %w", err)
 	}
-
-	h.JSONOK(w, map[string]any{
-		"plans": plans,
-		"count": len(plans),
-	})
+	for i := range plans {
+		plans[i].OSOptions = plans[i].InstallableImages(images)
+	}
+	return plans, images, nil
 }
 
-func (h *Handlers) verifyAccountEligibility(ctx context.Context, client gigahost.Client) ([]gigahost.HourlyPlan, error) {
-	account, err := client.GetAccount(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("account_check_failed: %w", err)
-	}
-
-	catalogPlans, catErr := client.GetCatalog(ctx)
-	if catErr != nil {
-		return nil, fmt.Errorf("catalog_check_failed: %w", catErr)
-	}
-
+// catalogEligibility derives the eligibility the provider exposes on the
+// catalog itself: the first plan that carries a qualifying fact, else the
+// client's own report. It is the catalog half of gigahost.HasEligibility.
+func catalogEligibility(client gigahost.Client, catalogPlans []gigahost.HourlyPlan) gigahost.CatalogEligibility {
 	var catalogElig gigahost.CatalogEligibility
 	for _, p := range catalogPlans {
 		if p.Eligibility.QualifiesArrears || p.Eligibility.CreditNOK > 0 {
@@ -267,17 +225,53 @@ func (h *Handlers) verifyAccountEligibility(ctx context.Context, client gigahost
 			break
 		}
 	}
-	if !catalogElig.QualifiesArrears && catalogElig.CreditNOK == 0 {
-		if ce, ok := client.(interface {
-			GetCatalogEligibility() gigahost.CatalogEligibility
-		}); ok {
-			catalogElig = ce.GetCatalogEligibility()
-		}
+	if catalogElig.QualifiesArrears || catalogElig.CreditNOK > 0 {
+		return catalogElig
+	}
+	if ce, ok := client.(interface {
+		GetCatalogEligibility() gigahost.CatalogEligibility
+	}); ok {
+		return ce.GetCatalogEligibility()
+	}
+	return catalogElig
+}
+
+// verifyAccountEligibility decides whether the account may order an hourly
+// server, and returns the catalog it fetched.
+//
+// The catalog is fetched first because it is needed for the rest of the order
+// path anyway, and because the provider documents the same eligibility facts on
+// it (qualifies_arrears, credit_nok) that GET /account is consulted for.
+// gigahost.HasEligibility is an OR with no deny branch, so the account can only
+// ever ADD eligibility: when the catalog already qualifies, consulting the
+// account cannot change the decision and is skipped. That removes a provider
+// round-trip which has been observed to stall; it does not fix a general
+// network fault and it does not explain the historical timeout.
+//
+// When the catalog does NOT qualify the account is still consulted, with the
+// same outcomes as before: a failed call is account_check_failed (fail closed,
+// no order) and a reaching call with no credit is ErrInsufficientCredit. No
+// credit guard is removed.
+func (h *Handlers) verifyAccountEligibility(ctx context.Context, client gigahost.Client) ([]gigahost.HourlyPlan, error) {
+	catalogPlans, _, catErr := h.loadSelectablePlans(ctx, client)
+	if catErr != nil {
+		return nil, fmt.Errorf("catalog_check_failed: %w", catErr)
 	}
 
 	catalog := &gigahost.Catalog{
 		Plans:       catalogPlans,
-		Eligibility: catalogElig,
+		Eligibility: catalogEligibility(client, catalogPlans),
+	}
+	// Catalog-only decision: the account is nil here precisely to prove the
+	// skip took effect. HasEligibility(account, catalog) can never be false for
+	// a qualifying catalog, so this is equivalent to consulting the account.
+	if gigahost.HasEligibility(nil, catalog) {
+		return catalogPlans, nil
+	}
+
+	account, accErr := client.GetAccount(ctx)
+	if accErr != nil {
+		return nil, fmt.Errorf("account_check_failed: %w", accErr)
 	}
 	if !gigahost.HasEligibility(account, catalog) {
 		return nil, gigahost.ErrInsufficientCredit
@@ -286,23 +280,82 @@ func (h *Handlers) verifyAccountEligibility(ctx context.Context, client gigahost
 }
 
 func (h *Handlers) handleEligibilityError(w http.ResponseWriter, err error) {
-	if errors.Is(err, gigahost.ErrInsufficientCredit) {
-		h.JSONError(w, http.StatusPaymentRequired, "insufficient_credit", "Gigahost account has insufficient credit or zero balance")
-	} else if strings.HasPrefix(err.Error(), "account_check_failed:") {
-		h.JSONError(w, http.StatusBadGateway, "account_check_failed", fmt.Sprintf("Failed to check account eligibility: %v", err))
-	} else {
-		h.JSONError(w, http.StatusBadGateway, "catalog_check_failed", fmt.Sprintf("Failed to fetch catalog: %v", err))
-	}
+	h.JSONError(w, eligibilityErrorStatus(err), eligibilityErrorCode(err), eligibilityErrorDetail(err))
 }
 
-func (h *Handlers) handleBudgetCheckError(w http.ResponseWriter, err error) {
-	if strings.HasPrefix(err.Error(), "Monthly budget cap exceeded") {
-		h.JSONError(w, http.StatusBadRequest, "budget_exceeded", err.Error())
-	} else if strings.HasPrefix(err.Error(), "invalid_plan:") {
+// eligibilityErrorStatus maps an eligibility failure to its HTTP status, so the
+// admission cooldown can classify it without duplicating the mapping.
+func eligibilityErrorStatus(err error) int {
+	if errors.Is(err, gigahost.ErrInsufficientCredit) {
+		return http.StatusPaymentRequired
+	}
+	return http.StatusBadGateway
+}
+
+// eligibilityErrorCode is the machine-readable error code for the response.
+func eligibilityErrorCode(err error) string {
+	if errors.Is(err, gigahost.ErrInsufficientCredit) {
+		return "insufficient_credit"
+	}
+	if strings.HasPrefix(err.Error(), "account_check_failed:") {
+		return "account_check_failed"
+	}
+	return "catalog_check_failed"
+}
+
+// eligibilityErrorDetail is the human-readable explanation.
+func eligibilityErrorDetail(err error) string {
+	if errors.Is(err, gigahost.ErrInsufficientCredit) {
+		return "Gigahost account has insufficient credit or zero balance"
+	}
+	if strings.HasPrefix(err.Error(), "account_check_failed:") {
+		return fmt.Sprintf("Failed to check account eligibility: %v", err)
+	}
+	return fmt.Sprintf("Failed to fetch catalog: %v", err)
+}
+
+// handleCatalogCheckError maps a catalog/plan validation failure to the
+// handler's HTTP contract. Every branch here is about what the provider
+// catalog says about the requested plan, never about a spending decision.
+func (h *Handlers) handleCatalogCheckError(w http.ResponseWriter, err error) {
+	if strings.HasPrefix(err.Error(), "invalid_plan:") {
 		h.JSONError(w, http.StatusBadRequest, "invalid_plan", strings.TrimPrefix(err.Error(), "invalid_plan: "))
 	} else {
 		h.JSONError(w, http.StatusBadGateway, "catalog_check_failed", err.Error())
 	}
+}
+
+// orderPriceIdentity is the price contract persisted for a new order.
+type orderPriceIdentity struct {
+	priceID       int
+	hourlyNOK     float64
+	monthlyCapNOK float64
+	currency      string
+}
+
+// resolveOrderPriceIdentity picks the catalog row the admin selected and keeps
+// every price fact it carries: the price id (order-time selection key, never
+// returned by the provider afterwards), the monthly cap (the authoritative
+// monthly commitment), the hourly rate and the currency. A field the catalog
+// does not carry stays zero, which the budget reads as "not recorded".
+func resolveOrderPriceIdentity(catalogPlans []gigahost.HourlyPlan, req OrderServerPayload) orderPriceIdentity {
+	id := orderPriceIdentity{priceID: req.PriceID, hourlyNOK: resolveAuthoritativeHourlyRate(catalogPlans, req)}
+	for _, p := range catalogPlans {
+		if p.ProductID != req.PID || (req.PriceID != 0 && p.PriceID != req.PriceID) {
+			continue
+		}
+		if p.PriceID > 0 {
+			id.priceID = p.PriceID
+		}
+		if p.MonthlyCeiling > 0 {
+			id.monthlyCapNOK = p.MonthlyCeiling
+		}
+		if p.Currency != "" {
+			id.currency = p.Currency
+		}
+		return id
+	}
+	return id
 }
 
 func resolveAuthoritativeHourlyRate(catalogPlans []gigahost.HourlyPlan, req OrderServerPayload) float64 {
@@ -331,99 +384,99 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var req OrderServerPayload
-	if err := h.DecodeJSON(r, &req); err != nil {
-		h.JSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	if req.PID <= 0 || req.PriceID <= 0 || req.RegionID <= 0 || req.OSID <= 0 {
-		h.JSONError(w, http.StatusBadRequest, "invalid_params", "pid, price_id, region_id, os_id must be positive integers")
+	req, client, ok := h.orderRequestAndClient(w, r)
+	if !ok {
 		return
 	}
 
-	client, err := h.getGigahostClient(r.Context(), r)
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "unconfigured", err.Error())
+	// Repeated rejected attempts are suppressed here, before any provider read:
+	// an admin who just hit a persistent rejection gains nothing from re-running
+	// the catalog/account/inventory sequence, and the provider is already the
+	// suspect. This is a retry suppression, not a cached decision - nothing about
+	// eligibility or price is remembered.
+	//
+	// The reservation is taken ATOMICALLY with the check, before any provider
+	// I/O, so concurrent requests from one admin cannot all slip through while
+	// the first is blocked on the network. It is released on every terminal path
+	// below; no mutex is held across a provider call.
+	adminID := sess.UserID
+	token, _, _, admitted := h.admitToken(adminID)
+	if !admitted {
+		h.suppressionWriting(w, adminID)
 		return
 	}
 
-	// 1. Account balance and credit pre-check
-	catalogPlans, err := h.verifyAccountEligibility(r.Context(), client)
-	if err != nil {
-		h.handleEligibilityError(w, err)
+	// The reservation must survive a panic: the middleware recovers, but a slot
+	// left set would lock this admin out until restart. releaseToken is
+	// generation-safe - a late call from this attempt cannot clear a later
+	// attempt's ownership - so the deferred net and the explicit releases below
+	// cannot interfere with each other.
+	failureKind := failureProviderError
+	releaseOnAbort := func(kind string) {
+		h.releaseToken(adminID, token, kind)
+	}
+	defer func() { releaseOnAbort(failureKind) }()
+
+	catalogPlans, handled, admissionFailure := h.orderEligibilityAdmission(r.Context(), w, client, req)
+	if handled {
+		releaseOnAbort(admissionFailure)
 		return
 	}
 
-	// 2. Validate selected plan against catalog
-	if err := validateOrderAgainstCatalog(catalogPlans, req); err != nil {
-		h.handleBudgetCheckError(w, err)
+	// 3-4. Serialize the duplicate check together with the durable intent that makes
+	// its decision visible to later attempts. The check and the intent write are ONE
+	// critical section on purpose: releasing the lock between them let a second
+	// request find no durable intent and purchase as well (CI run 42576536602).
+	// The lock is dropped before the provider call, so no network I/O runs under it
+	// and a genuinely different purchase is not blocked behind this one.
+	orderRecord, unlockPurchase, gated := h.beginPurchaseWithIntent(r.Context(), w, client, req, catalogPlans, releaseOnAbort)
+	if !gated {
 		return
 	}
 
-	// 3. Concurrency serialization: lock around budget check, intent creation, and reservation
-	h.budgetMu.Lock()
-	defer h.budgetMu.Unlock()
+	orderResp, orderErr := h.dispatchOrderPurchase(r.Context(), client, req, orderRecord)
+	unlockPurchase()
 
-	// 4. Reconcile unknown purchase state and enforce in-flight duplicate lock
-	unresolved, reconcileErr := h.reconcilePendingUnknownOrders(r.Context(), client, req)
-	if reconcileErr != nil {
-		h.JSONError(w, http.StatusServiceUnavailable, "reconciliation_failed", reconcileErr.Error())
-		return
-	}
-	if unresolved != nil {
-		h.JSON(w, http.StatusAccepted, map[string]any{
-			"status":  "unknown",
-			"message": "Prior purchase order is pending reconciliation; refusing duplicate purchase until resolved",
-			"order":   unresolved,
-		})
-		return
-	}
-
-	// 5. Monthly NOK budget cap enforcement
-	if err := h.checkMonthlyBudget(r.Context(), client, req, catalogPlans); err != nil {
-		h.handleBudgetCheckError(w, err)
-		return
-	}
-
-	// 3. Pre-dispatch durable intent persistence; fail closed if DB cannot record intent
-	now := time.Now().UTC()
-	orderRecord := &GigahostOrderRecord{
-		OrderID:        fmt.Sprintf("intent_%d", now.UnixNano()),
-		Status:         "pending_order",
-		PlanID:         req.PID,
-		RegionID:       req.RegionID,
-		HourlyPriceNOK: resolveAuthoritativeHourlyRate(catalogPlans, req),
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	}
-	if err := h.saveGigahostOrder(r.Context(), orderRecord); err != nil {
-		h.JSONError(w, http.StatusInternalServerError, "db_error",
-			fmt.Sprintf("Failed to persist deployment intent: %v", err))
-		return
-	}
-
-	// 4. Safe order dispatch with hourly billing enforcement
-	orderReq := gigahost.OrderRequest{
-		PID:           req.PID,
-		PriceID:       req.PriceID,
-		RegionID:      req.RegionID,
-		OSID:          req.OSID,
-		BillingPeriod: gigahost.BillingPeriodHourly,
-		Quantity:      1,
-	}
-
-	orderResp, orderErr := client.OrderServerSafe(r.Context(), orderReq)
-
-	// 5. Update record with cancellation-independent context
-	updateCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
-	defer cancel()
-
-	applyOrderResponseToRecord(orderRecord, orderResp, orderErr)
-
-	if updateErr := h.updateGigahostOrder(updateCtx, orderRecord); updateErr != nil {
+	if orderRecord == nil {
 		h.JSONError(w, http.StatusInternalServerError, "db_update_failed",
-			fmt.Sprintf("Order placed (%s) but failed to update record: %v", orderRecord.OrderID, updateErr))
+			"The order was placed but its record could not be updated; the durable intent remains and blocks a retry")
 		return
+	}
+
+	// The purchase cycle is finished; release the reservation on every remaining
+	// outcome (partial, uncertain, failed, or success). A purchase failure arms
+	// the cooldown; a success clears it.
+	failureKind = failureKindFor(0, orderErr)
+	releaseOnAbort(failureKind)
+
+	h.respondToOrderOutcome(w, orderRecord, orderResp, orderErr)
+}
+
+// respondUnresolvedDuplicate refuses a second purchase while a prior attempt's
+// outcome is still unknown, and shows the admin which order blocks them.
+func (h *Handlers) respondUnresolvedDuplicate(w http.ResponseWriter, unresolved *GigahostOrderRecord) {
+	h.JSON(w, http.StatusAccepted, map[string]any{
+		"status":  "unknown",
+		"message": "Prior purchase order is pending reconciliation; refusing duplicate purchase until resolved",
+		"order":   unresolved,
+	})
+}
+
+// respondToOrderOutcome writes the response for a completed purchase attempt.
+//
+// The three interesting outcomes are ordered by how much is known: a partial
+// order has a real id and a known message, an uncertain outcome is explicitly
+// NOT retryable (it is reported as unknown so a second purchase cannot be
+// guessed into existence), and anything else is a plain provider failure. A
+// success whose provider response carries no usable id is treated as uncertain
+// for the same reason.
+func (h *Handlers) respondToOrderOutcome(
+	w http.ResponseWriter, orderRecord *GigahostOrderRecord, orderResp *gigahost.OrderResponse, orderErr error,
+) {
+	unknownBody := map[string]any{
+		"status":  "unknown",
+		"message": "Order request outcome uncertain; marked unknown to prevent accidental duplicate purchases",
+		"order":   orderRecord,
 	}
 
 	if orderErr != nil {
@@ -437,25 +490,20 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 			})
 			return
 		}
+		if writePrePurchaseRefusal(w, orderErr, h) {
+			return
+		}
 		var uncertainErr *gigahost.OrderUncertainError
-		if errors.As(orderErr, &uncertainErr) || (orderResp != nil && (orderResp.Status == gigahost.StatusUnknown || orderResp.OrderID == "")) {
-			h.JSON(w, http.StatusAccepted, map[string]any{
-				"status":  "unknown",
-				"message": "Order request outcome uncertain; marked unknown to prevent accidental duplicate purchases",
-				"order":   orderRecord,
-			})
+		if errors.As(orderErr, &uncertainErr) || orderOutcomeUnknown(orderResp) {
+			h.JSON(w, http.StatusAccepted, unknownBody)
 			return
 		}
 		h.JSONError(w, http.StatusBadGateway, "order_failed", orderErr.Error())
 		return
 	}
 
-	if orderResp != nil && (orderResp.Status == gigahost.StatusUnknown || orderResp.OrderID == "") {
-		h.JSON(w, http.StatusAccepted, map[string]any{
-			"status":  "unknown",
-			"message": "Order request outcome uncertain; marked unknown to prevent accidental duplicate purchases",
-			"order":   orderRecord,
-		})
+	if orderOutcomeUnknown(orderResp) {
+		h.JSON(w, http.StatusAccepted, unknownBody)
 		return
 	}
 
@@ -465,272 +513,248 @@ func (h *Handlers) GigahostOrderHandler(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-func planMonthlySpend(catalog []gigahost.HourlyPlan, pid int, fallbackHourly float64) float64 {
-	var rate float64
-	for _, p := range catalog {
-		if p.ProductID == pid {
-			if p.MonthlyCeiling > 0 {
-				rate = p.MonthlyCeiling
-			} else if p.HourlyRateNOK > 0 {
-				rate = p.HourlyRateNOK * 720
-			}
-			break
-		}
-	}
-	if rate == 0 && fallbackHourly > 0 {
-		rate = fallbackHourly * 720
-	}
-	return rate
+// orderOutcomeUnknown reports whether a provider order response fails to
+// identify what was ordered, which makes the outcome unsafe to retry.
+func orderOutcomeUnknown(resp *gigahost.OrderResponse) bool {
+	return resp == nil || resp.Status == gigahost.StatusUnknown || resp.OrderID == ""
 }
 
-func isServerActiveForBudget(status string) bool {
-	switch strings.ToLower(status) {
-	case gigahost.StatusReady, "active", gigahost.StatusDeploying, gigahost.StatusPending, gigahost.StatusWaiting, gigahost.StatusInstalling:
-		return true
-	default:
-		return false
-	}
-}
-
-func isOrderActiveForBudget(status string) bool {
-	switch strings.ToLower(status) {
-	case gigahost.StatusWaiting, gigahost.StatusDeploying, gigahost.StatusInstalling,
-		gigahost.StatusUnknown, "pending_order", "pending_payment", gigahost.StatusPending,
-		gigahost.StatusReady, "active":
-		return true
-	default:
-		return false
-	}
-}
-
-func requestMonthlySpend(catalog []gigahost.HourlyPlan, req OrderServerPayload) float64 {
-	for _, p := range catalog {
-		if p.ProductID == req.PID && (req.PriceID == 0 || p.PriceID == req.PriceID) {
-			if p.MonthlyCeiling > 0 {
-				return p.MonthlyCeiling
-			} else if p.HourlyRateNOK > 0 {
-				return p.HourlyRateNOK * 720
-			}
-			break
-		}
-	}
-	return 0
-}
-
-func calculateCommittedSpend(catalog []gigahost.HourlyPlan, servers []gigahost.ServerInfo, localOrders []GigahostOrderRecord) (float64, error) {
-	var committed float64
-	accountedOrders := make(map[string]bool)
-	for _, s := range servers {
-		if isServerActiveForBudget(s.Status) {
-			if !s.IsHourlyVPS() {
-				continue
-			}
-			if s.OrderID != "" {
-				accountedOrders[s.OrderID] = true
-			}
-			serverPID := s.PID
-			var localHourly float64
-			for _, o := range localOrders {
-				if (s.OrderID != "" && o.OrderID == s.OrderID) || (s.ID > 0 && o.ServerID == s.ID) {
-					if serverPID == 0 && o.PlanID > 0 {
-						serverPID = o.PlanID
-					}
-					if o.HourlyPriceNOK > 0 {
-						localHourly = o.HourlyPriceNOK
-						break
-					}
-				}
-			}
-			if localHourly == 0 {
-				for _, o := range localOrders {
-					if o.PlanID == serverPID && o.HourlyPriceNOK > 0 {
-						localHourly = o.HourlyPriceNOK
-						break
-					}
-				}
-			}
-			spend := planMonthlySpend(catalog, serverPID, localHourly)
-			if spend <= 0 {
-				return 0, fmt.Errorf("active inventory server %d (plan %d) has unpriced spend and is absent from catalog", s.ID, serverPID)
-			}
-			committed += spend
+// beginPurchaseWithIntent is the atomic duplicate-decision-plus-intent step.
+//
+// Invariant: for one logical purchase, the "no unresolved prior order" decision and
+// the durable intent row that makes that decision visible to later checks are ONE
+// critical section, and the provider purchase cannot begin until that row is
+// committed. Splitting them is a real duplicate-purchase defect: a second request
+// that takes the lock in the gap sees an empty ledger and purchases too (observed
+// in CI run 42576536602 as two provider order calls for five identical requests).
+//
+// The lock is released before the caller dispatches the purchase. Holding it across
+// the provider call would also be correct for duplicate safety, but it would
+// serialize every Gigahost purchase in the process (including genuinely different
+// plans and regions) and put network I/O under a mutex. The returned unlock is
+// idempotent so the caller can call it once, unconditionally, after dispatch.
+//
+// gated=false means the request was already answered (a refusal was written) and
+// the caller must return without purchasing.
+func (h *Handlers) beginPurchaseWithIntent(
+	ctx context.Context,
+	w http.ResponseWriter,
+	client gigahost.Client,
+	req OrderServerPayload,
+	catalogPlans []gigahost.HourlyPlan,
+	releaseOnAbort func(string),
+) (orderRecord *GigahostOrderRecord, unlock func(), gated bool) {
+	h.purchaseMu.Lock()
+	locked := true
+	unlock = func() {
+		if locked {
+			locked = false
+			h.purchaseMu.Unlock()
 		}
 	}
 
-	for _, o := range localOrders {
-		if isOrderActiveForBudget(o.Status) {
-			if o.OrderID != "" && accountedOrders[o.OrderID] {
-				continue
-			}
-			if o.OrderID != "" {
-				accountedOrders[o.OrderID] = true
-			}
-			spend := planMonthlySpend(catalog, o.PlanID, o.HourlyPriceNOK)
-			if spend <= 0 {
-				return 0, fmt.Errorf("active order %s (plan %d) has unpriced spend and is absent from catalog", o.OrderID, o.PlanID)
-			}
-			committed += spend
+	unresolved, reconcileErr := h.reconcilePendingUnknownOrders(ctx, client, req)
+	if reconcileErr != nil {
+		unlock()
+		releaseOnAbort(failureProviderError)
+		h.JSONError(w, http.StatusServiceUnavailable, "reconciliation_failed", reconcileErr.Error())
+		return nil, nil, false
+	}
+	if unresolved != nil {
+		unlock()
+		releaseOnAbort("")
+		h.respondUnresolvedDuplicate(w, unresolved)
+		return nil, nil, false
+	}
+
+	// The intent is written INSIDE the lock, so the duplicate decision above becomes
+	// visible to the next attempt the moment the lock is released.
+	record, ok := h.persistOrderIntent(ctx, req, catalogPlans)
+	if !ok {
+		unlock()
+		releaseOnAbort(failureProviderError)
+		h.JSONError(w, http.StatusInternalServerError, "db_error",
+			"Failed to persist the order intent; no purchase was attempted")
+		return nil, nil, false
+	}
+	return record, unlock, true
+}
+
+// persistOrderIntent writes the durable pre-purchase intent row.
+//
+// It reports ok=false only when the intent could not be written, in which case no
+// purchase may be attempted. The intent is written before the provider call on
+// purpose: the provider does not return the catalog price id on any later read, so
+// an intent that lost the price identity could not be reconciled back to the
+// catalog row that was ordered.
+func (h *Handlers) persistOrderIntent(
+	ctx context.Context, req OrderServerPayload, catalogPlans []gigahost.HourlyPlan,
+) (*GigahostOrderRecord, bool) {
+	now := time.Now().UTC()
+	priceIdentity := resolveOrderPriceIdentity(catalogPlans, req)
+	record := &GigahostOrderRecord{
+		OrderID:        fmt.Sprintf("intent_%d", now.UnixNano()),
+		Status:         "pending_order",
+		PlanID:         req.PID,
+		RegionID:       req.RegionID,
+		HourlyPriceNOK: priceIdentity.hourlyNOK,
+		PriceID:        priceIdentity.priceID,
+		MonthlyCapNOK:  priceIdentity.monthlyCapNOK,
+		Currency:       priceIdentity.currency,
+		// This is the one writer that may claim the row as a panel purchase, because
+		// it is the writer that commits before the provider is asked to sell
+		// anything. Stamping it here and nowhere else is what lets the setup pipeline
+		// tell a row this panel bought from one that appeared some other way,
+		// whatever plan or credential that row happens to carry.
+		PurchaseOrigin:     models.PurchaseOriginPanelPurchase,
+		PurchaseRecordedAt: now,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+	if err := h.saveGigahostOrder(ctx, record); err != nil {
+		return nil, false
+	}
+	return record, true
+}
+
+// dispatchOrderPurchase sends the one authorized hourly order and records the
+// provider answer.
+func (h *Handlers) dispatchOrderPurchase(
+	ctx context.Context, client gigahost.Client, req OrderServerPayload, orderRecord *GigahostOrderRecord,
+) (*gigahost.OrderResponse, error) {
+	// The managed SSH key is registered and proven before the order is sent, and the
+	// failure is reported as a refusal, so a credential problem costs zero purchases.
+	sshKeyIDs, credErr := h.prepareOrderSSHCredential(ctx, client, orderRecord)
+	if credErr != nil {
+		record, _, refusalErr, _ := h.refuseBeforePurchase(ctx, orderRecord, credErr)
+		_ = record
+		return nil, refusalErr
+	}
+
+	orderResp, orderErr := client.OrderServerSafe(ctx, gigahost.OrderRequest{
+		PID:           req.PID,
+		PriceID:       req.PriceID,
+		RegionID:      req.RegionID,
+		DCID:          req.DCID,
+		OSID:          req.OSID,
+		BillingPeriod: gigahost.BillingPeriodHourly,
+		Quantity:      1,
+		SSHKeys:       []int64{sshKeyIDs},
+	})
+
+	// The record update must survive client cancellation: the purchase already
+	// happened, and an unrecorded purchase is the duplicate hazard.
+	updateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	applyOrderResponseToRecord(orderRecord, orderResp, orderErr)
+	_ = h.updateGigahostOrder(updateCtx, orderRecord)
+	return orderResp, orderErr
+}
+
+// orderRequestAndClient decodes and validates the order payload and resolves the
+// provider client. It reports ok=false after writing the refusal, so the caller
+// returns without repeating the error mapping.
+func (h *Handlers) orderRequestAndClient(w http.ResponseWriter, r *http.Request) (OrderServerPayload, gigahost.Client, bool) {
+	var req OrderServerPayload
+	if err := h.DecodeJSON(r, &req); err != nil {
+		h.JSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return req, nil, false
+	}
+	if err := req.validate(); err != nil {
+		h.JSONError(w, http.StatusBadRequest, "invalid_params", err.Error())
+		return req, nil, false
+	}
+	client, err := h.getGigahostClient(r.Context(), r)
+	if err != nil {
+		h.JSONError(w, http.StatusBadRequest, "unconfigured", err.Error())
+		return req, nil, false
+	}
+	return req, client, true
+}
+
+// catalogPlanFor returns the catalog row the request selected, or nil when the
+// provider catalog does not carry that product/price pair.
+func catalogPlanFor(catalog []gigahost.HourlyPlan, req OrderServerPayload) *gigahost.HourlyPlan {
+	for i := range catalog {
+		if catalog[i].ProductID == req.PID && (req.PriceID == 0 || catalog[i].PriceID == req.PriceID) {
+			return &catalog[i]
 		}
 	}
-	return committed, nil
+	return nil
 }
 
 //nolint:misspell // "cancelled" matches documented provider status and test assertions
 const statusCancelled = "cancelled"
 
-func (h *Handlers) reconcileAbsentReadyOrder(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord) {
-	statusResp, err := client.GetDeployStatus(ctx, order.OrderID)
-	if err == nil {
-		if statusResp == nil || statusResp.Status == "" || isTerminalStatus(statusResp.Status) {
-			newStatus := statusCancelled
-			if statusResp != nil && isTerminalStatus(statusResp.Status) {
-				newStatus = statusResp.Status
-			}
-			order.Status = newStatus
-			_ = h.updateGigahostOrder(ctx, order)
-		}
-	} else if errors.Is(err, gigahost.ErrNotFound) {
-		order.Status = statusCancelled
-		_ = h.updateGigahostOrder(ctx, order)
-	}
-}
-
-func (h *Handlers) reconcileBudgetOrders(ctx context.Context, client gigahost.Client, servers []gigahost.ServerInfo, localOrders []GigahostOrderRecord) {
-	for i := range localOrders {
-		order := &localOrders[i]
-		if order.OrderID == "" || strings.HasPrefix(order.OrderID, "unknown_") || strings.HasPrefix(order.OrderID, "intent_") {
-			continue
-		}
-
-		var matchedServer *gigahost.ServerInfo
-		for j := range servers {
-			if servers[j].OrderID != "" && servers[j].OrderID == order.OrderID {
-				matchedServer = &servers[j]
-				break
-			}
-		}
-
-		if matchedServer != nil {
-			if (matchedServer.Status == gigahost.StatusReady || matchedServer.Status == gigahost.StatusFailed || strings.HasPrefix(strings.ToLower(matchedServer.Status), "cancel") || matchedServer.Status == "deleted") && order.Status != matchedServer.Status {
-				order.Status = matchedServer.Status
-				_ = h.updateGigahostOrder(ctx, order)
-			}
-		} else if order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active" {
-			h.reconcileAbsentReadyOrder(ctx, client, order)
-		}
-	}
-}
-
 func validateOrderAgainstCatalog(catalog []gigahost.HourlyPlan, req OrderServerPayload) error {
 	if len(catalog) == 0 {
 		return fmt.Errorf("invalid_plan: no available plans in catalog")
 	}
-	var matchedPlan *gigahost.HourlyPlan
-	for i := range catalog {
-		if catalog[i].ProductID == req.PID && (req.PriceID == 0 || catalog[i].PriceID == req.PriceID) {
-			matchedPlan = &catalog[i]
-			break
-		}
-	}
+	matchedPlan := catalogPlanFor(catalog, req)
 	if matchedPlan == nil {
 		return fmt.Errorf("invalid_plan: plan %d (price %d) not found in provider catalog", req.PID, req.PriceID)
 	}
-	if !matchedPlan.InStock {
+	if !matchedPlan.HasStock() {
 		return fmt.Errorf("invalid_plan: plan %d is out of stock", req.PID)
 	}
-	if len(matchedPlan.Regions) == 0 {
-		return fmt.Errorf("invalid_plan: plan %d has no available regions in catalog", req.PID)
-	}
-	regionValid := false
-	for _, r := range matchedPlan.Regions {
-		if r.ID == req.RegionID && r.Available {
-			regionValid = true
-			break
-		}
-	}
-	if !regionValid {
-		return fmt.Errorf("invalid_plan: region %d is not available for plan %d", req.RegionID, req.PID)
-	}
 
-	planMonthlyRate := requestMonthlySpend(catalog, req)
-	if planMonthlyRate <= 0 {
+	// A plan the provider prices at zero would be ordered without an
+	// authoritative rate, so ordering stays refused. This is a price-integrity
+	// check on the provider catalog entry, not a spending ceiling: nothing
+	// compares the plan against a configured amount any more. It is evaluated on
+	// the plan alone, before the selection checks, so the operator is told the
+	// real reason a plan cannot be ordered at all.
+	if matchedPlan.MonthlyCeiling <= 0 && matchedPlan.HourlyRateNOK <= 0 {
 		return fmt.Errorf("invalid_plan: plan %d has zero or negative price in provider catalog", req.PID)
 	}
-	return nil
-}
 
-func (h *Handlers) checkMonthlyBudget(ctx context.Context, client gigahost.Client, req OrderServerPayload, cachedCatalog ...[]gigahost.HourlyPlan) error {
-	var catalog []gigahost.HourlyPlan
-	if len(cachedCatalog) > 0 && cachedCatalog[0] != nil {
-		catalog = cachedCatalog[0]
-	} else if client != nil {
-		var catErr error
-		catalog, catErr = client.GetCatalog(ctx)
-		if catErr != nil {
-			return fmt.Errorf("failed to check catalog for budget verification: %w", catErr)
-		}
-	}
-
-	if err := validateOrderAgainstCatalog(catalog, req); err != nil {
+	// Placement before the region summary: for a pin the datacenter reason is accurate.
+	if err := validatePlanPlacement(matchedPlan, req); err != nil {
 		return err
 	}
-
-	monthlyBudget, err := h.getMonthlyBudgetNOK(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to verify monthly budget: %w", err)
+	if err := validatePlanRegion(matchedPlan, req); err != nil {
+		return err
 	}
-	if monthlyBudget <= 0 {
-		return nil
-	}
-
-	servers, srvErr := client.GetServers(ctx)
-	if srvErr != nil {
-		return fmt.Errorf("failed to check existing server inventory for budget verification: %w", srvErr)
-	}
-
-	localOrders, ordErr := h.getGigahostOrders(ctx)
-	if ordErr != nil {
-		return fmt.Errorf("failed to check local orders for budget verification: %w", ordErr)
-	}
-
-	h.reconcileBudgetOrders(ctx, client, servers, localOrders)
-
-	committed, err := calculateCommittedSpend(catalog, servers, localOrders)
-	if err != nil {
-		return fmt.Errorf("failed to calculate committed spend: %w", err)
-	}
-
-	planMonthlyRate := requestMonthlySpend(catalog, req)
-	if committed+planMonthlyRate > monthlyBudget {
-		return fmt.Errorf("Monthly budget cap exceeded: requested order exceeds configured budget of %v NOK", monthlyBudget)
+	if err := validatePlanOS(matchedPlan, req); err != nil {
+		return err
 	}
 	return nil
 }
 
-func (h *Handlers) getMonthlyBudgetNOK(ctx context.Context) (float64, error) {
-	if h.db == nil {
-		return 0, nil
+// validatePlanRegion requires the selected region to be one the plan documents
+// and to have capacity right now. A region the catalog reported without a stock
+// fact is accepted (the provider documents dc_stock as optional), but a region
+// the provider marked sold out is refused here rather than by a failed purchase.
+func validatePlanRegion(plan *gigahost.HourlyPlan, req OrderServerPayload) error {
+	if len(plan.Regions) == 0 {
+		return fmt.Errorf("invalid_plan: plan %d has no available regions in catalog", req.PID)
 	}
-	var ghCfg map[string]any
-	if err := h.db.GetSetting(ctx, "gigahost", &ghCfg); err != nil {
-		return 0, fmt.Errorf("read monthly budget: %w", err)
-	}
-	rawVal := ghCfg["monthly_budget_nok"]
-	if rawVal == nil {
-		var directVal any
-		if err := h.db.GetSetting(ctx, "gigahost.monthly_budget_nok", &directVal); err != nil {
-			return 0, fmt.Errorf("read monthly budget: %w", err)
+	for _, r := range plan.Regions {
+		if r.ID != req.RegionID {
+			continue
 		}
-		rawVal = directVal
+		if !r.Sellable() {
+			return fmt.Errorf("invalid_plan: region %d is not available for plan %d", req.RegionID, req.PID)
+		}
+		return nil
 	}
-	if rawVal == nil {
-		return 0, nil
+	return fmt.Errorf("invalid_plan: region %d is not available for plan %d", req.RegionID, req.PID)
+}
+
+// validatePlanOS requires the selected image to be one the provider catalog
+// actually returned for this plan. A stale or tampered os_id therefore fails
+// before any purchase request is built, instead of ordering an image the
+// provider would reject — or silently swapping in a different one.
+func validatePlanOS(plan *gigahost.HourlyPlan, req OrderServerPayload) error {
+	if len(plan.OSOptions) == 0 {
+		return fmt.Errorf("invalid_plan: plan %d has no installable operating systems in provider catalog", req.PID)
 	}
-	val, err := parseBudgetVal(rawVal)
-	if err != nil {
-		return 0, fmt.Errorf("read monthly budget: %w", err)
+	for _, image := range plan.OSOptions {
+		if image.OSID == req.OSID {
+			return nil
+		}
 	}
-	return val, nil
+	return fmt.Errorf("invalid_plan: operating system %d is not available for plan %d", req.OSID, req.PID)
 }
 
 func isPendingOrInFlight(status string) bool {
@@ -823,6 +847,19 @@ func applyOrderResponseToRecord(orderRecord *GigahostOrderRecord, orderResp *gig
 		if orderResp.Status != "" {
 			orderRecord.Status = orderResp.Status
 		}
+		// The provider's own order-time contract outranks the catalog row the
+		// order was placed with: it is what this specific order was billed.
+		// Only a real value replaces the catalog estimate; an absent field
+		// leaves the catalog-derived value in place.
+		if orderResp.MonthlyCap > 0 {
+			orderRecord.MonthlyCapNOK = orderResp.MonthlyCap
+		}
+		if orderResp.RateHourly > 0 {
+			orderRecord.HourlyPriceNOK = orderResp.RateHourly
+		}
+		if orderResp.Currency != "" {
+			orderRecord.Currency = orderResp.Currency
+		}
 	}
 	var partialErr *gigahost.OrderPartialError
 	if errors.As(orderErr, &partialErr) {
@@ -883,9 +920,20 @@ func (h *Handlers) refreshOrderFromServers(servers []gigahost.ServerInfo, order 
 	return false
 }
 
-func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord) bool {
+// refreshOrderFromDeployStatus refreshes one order from the provider's order detail
+// and reports both whether the row changed and what the provider actually answered.
+//
+// The two are different questions: a provider that repeats the status already on the
+// row changed nothing, yet it is still the freshest confirmation the panel has. Only
+// the returned observation may be presented as a provider read.
+//
+// live is the inventory already read for this request, and inventoryKnown says whether that
+// read succeeded. Together they decide one thing - whether a "no such order" answer may be
+// trusted as a cancellation. An inventory that could not be read is not evidence that the
+// order is gone, so it must not be allowed to stand in for absence.
+func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client gigahost.Client, order *GigahostOrderRecord, live []gigahost.ServerInfo, inventoryKnown bool) (bool, GigahostProviderObservation) {
 	if strings.HasPrefix(order.OrderID, "unknown_") || strings.HasPrefix(order.OrderID, "intent_") || order.OrderID == "" {
-		return false
+		return false, GigahostProviderObservation{Outcome: gigahostObservationNotChecked}
 	}
 	statusResp, deployErr := client.GetDeployStatus(ctx, order.OrderID)
 	if deployErr == nil {
@@ -893,10 +941,21 @@ func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client giga
 		if statusResp != nil && statusResp.Status != "" && statusResp.Status != order.Status {
 			order.Status = statusResp.Status
 			updated = true
-		} else if (order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active") && (statusResp == nil || statusResp.Status == "") {
-			order.Status = statusCancelled
-			updated = true
 		}
+		/* An answer that carries no status is not a cancellation.
+		 *
+		 * The provider's decoder accepts an empty body (`{}`, or an empty
+		 * data.servers[] envelope) into a zero response with no error, so "the provider
+		 * answered and there is no such deployment" is indistinguishable here from "the
+		 * provider answered with nothing useful". Treating the absent status as a
+		 * cancellation therefore turned a live, inventory-confirmed ready row into a
+		 * durable terminal one: the row was persisted with the terminal value, and the
+		 * next list read skipped it as terminal, so continued positive inventory could
+		 * never repair it.
+		 *
+		 * Genuine termination still reaches this row by a non-empty provider status (above)
+		 * or by ErrNotFound (below), so nothing is lost by not inventing a terminal state
+		 * from silence. This branch used to claim the opposite; it was wrong. */
 		if statusResp != nil {
 			if ip := statusResp.GetIP(); ip != "" && ip != order.AssignedIP {
 				order.AssignedIP = ip
@@ -907,16 +966,54 @@ func (h *Handlers) refreshOrderFromDeployStatus(ctx context.Context, client giga
 				updated = true
 			}
 		}
-		return updated
-	} else if errors.Is(deployErr, gigahost.ErrNotFound) && (order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active") {
-		order.Status = statusCancelled
-		return true
+		observation := GigahostProviderObservation{Outcome: gigahostObservationUnconfirmed}
+		if statusResp != nil {
+			if status := strings.TrimSpace(statusResp.Status); status != "" {
+				observation = GigahostProviderObservation{Outcome: gigahostObservationConfirmed, Status: status}
+			}
+			observation.Error = statusResp.Error
+		}
+		return updated, observation
 	}
-	return false
+	if errors.Is(deployErr, gigahost.ErrNotFound) && (order.Status == gigahost.StatusReady || strings.ToLower(order.Status) == "active") {
+		/* "No such order" only means cancellation when the inventory could corroborate it.
+		 *
+		 * The inventory read is what distinguishes "the provider no longer has this order"
+		 * from "I could not find out": it either names the order (live, or with the
+		 * provider's own terminal status), or it answered and named nobody. When the
+		 * inventory read FAILED, none of those is true, and the terminal value would be
+		 * sticky here - the next list read skips a terminal row before consulting the
+		 * inventory again, so an ordinary 503 would strand a live order in the terminal state
+		 * forever. Report the gap instead and leave the row live, so the next read can
+		 * repair it. */
+		if !inventoryKnown {
+			return false, GigahostProviderObservation{
+				Outcome: gigahostObservationUnavailable,
+				Error:   "provider inventory could not be read, so a missing deployment record is not evidence of cancellation",
+			}
+		}
+		// Only a cancellation nothing contradicts: live inventory for this order means the
+		// missing detail record is a partial read failure, and the terminal value would be
+		// sticky, so later reads would skip the row and inventory could never repair it.
+		if gigahostProviderServerLive(live, order.OrderID) {
+			return false, GigahostProviderObservation{
+				Outcome: gigahostObservationUnconfirmed,
+				Error:   "provider has no detail record for this order while inventory still lists it",
+			}
+		}
+		order.Status = statusCancelled
+		return true, GigahostProviderObservation{Outcome: gigahostObservationConfirmed, Status: statusCancelled}
+	}
+	return false, GigahostProviderObservation{Outcome: gigahostObservationUnavailable, Error: deployErr.Error()}
 }
 
 // GigahostOrdersHandler handles GET /api/admin/hosting/gigahost/orders.
 // Lists persistent order history and refreshes status for active/pending jobs.
+//
+// Each order carries a provider observation alongside its row: the row is the
+// panel's copy of the last answer and is served whether or not the provider could
+// be reached, so a 200 here does not mean the provider was read. The observation
+// says which it was, per order, without changing the rows themselves.
 func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	sess := middleware.GetSession(r.Context())
 	if sess == nil || sess.Role != models.RoleAdmin {
@@ -930,36 +1027,11 @@ func (h *Handlers) GigahostOrdersHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Refresh all non-terminal orders if client is accessible
-	client, clientErr := h.getGigahostClient(r.Context(), r)
-	if clientErr == nil && len(orders) > 0 {
-		servers, _ := client.GetServers(r.Context())
-		deployQueries := 0
-		const maxDeployQueries = 10
-		for i := range orders {
-			if isTerminalStatus(orders[i].Status) {
-				continue
-			}
-			updated := false
-			if len(servers) > 0 && h.refreshOrderFromServers(servers, &orders[i]) {
-				updated = true
-			}
-			if (isPendingOrInFlight(orders[i].Status) || !updated) && deployQueries < maxDeployQueries {
-				if orders[i].OrderID != "" && !strings.HasPrefix(orders[i].OrderID, "unknown_") && !strings.HasPrefix(orders[i].OrderID, "intent_") {
-					deployQueries++
-					if h.refreshOrderFromDeployStatus(r.Context(), client, &orders[i]) {
-						updated = true
-					}
-				}
-			}
-			if updated {
-				_ = h.updateGigahostOrder(r.Context(), &orders[i])
-			}
-		}
-	}
+	observations := h.gigahostListObservations(r.Context(), r, orders)
 
 	h.JSONOK(w, map[string]any{
-		"orders": orders,
-		"count":  len(orders),
+		"orders":                orders,
+		"count":                 len(orders),
+		"provider_observations": observations,
 	})
 }

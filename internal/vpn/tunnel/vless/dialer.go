@@ -352,6 +352,31 @@ func (d *Dialer) sealRealityHello(hello *utls.PubClientHelloMsg, authKey []byte)
 	return derivedAuthKey, nil
 }
 
+// attributeContextCause attaches the context's own cancellation or deadline cause
+// to an error that lost it.
+//
+// Two independent owners close the socket when the handshake context ends: the
+// AfterFunc installed in handshake, and the TLS library's own interrupter. The
+// stdlib runs both callbacks on separate goroutines in no fixed order, so when
+// the local closer wins, the blocked read returns a plain closed-connection
+// error and the library never replaces it with the context cause. Callers then
+// cannot tell an expired deadline or a canceled parent from a remote failure.
+//
+// The cause is added only after the context has already ended and only when the
+// error does not already carry it, so a handshake that failed for its own
+// reasons while the context was still live is returned unchanged. The original
+// error stays in the chain.
+func attributeContextCause(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	cause := ctx.Err()
+	if cause == nil || errors.Is(err, cause) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", cause, err)
+}
+
 // handshake connects to the endpoint and executes the REALITY TLS handshake using metacubex/utls,
 // sending both X25519MLKEM768 and X25519 key shares for modern_pq, or classical X25519 for legacy backends.
 // Shared by DialContext and probeVLESSReality.
@@ -415,7 +440,7 @@ func (d *Dialer) handshake(ctx context.Context) (net.Conn, time.Duration, error)
 
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		_ = raw.Close()
-		return nil, 0, fmt.Errorf("vless: reality handshake: %w", err)
+		return nil, 0, fmt.Errorf("vless: reality handshake: %w", attributeContextCause(ctx, err))
 	}
 
 	if !verifier.verified {
