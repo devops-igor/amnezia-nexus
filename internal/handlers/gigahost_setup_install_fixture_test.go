@@ -266,7 +266,24 @@ func (e *installEnv) approve(orderID, protocol, port, fingerprint string) *model
 // application wires it, so a pass over a fresh approval exercises the real
 // challenge path (`h.challengeGigahostSetupHostIdentity`) rather than a stub. The
 // install fixture's dialer hook is what that challenge dials.
+//
+// The current-policy gate is the production one too, for the same reason: a fixture
+// that asked a different question would stop proving anything about the shipped path.
+// It reads this environment's own AutomationPolicy, so a test turns unattended setup on
+// with enableAutomaticSetup and off by flipping the same policy.
+//
+// The grantor is the production one as well, because issuing scoped authority is exactly
+// the behaviour under test. The inert-configuration case builds its tracker with
+// grantor nil, which is the deployment that cannot grant at all.
 func (e *installEnv) tracker(now func() time.Time) *gigahostsetup.Tracker {
+	return e.trackerWithGrantor(now, e.h.GrantAutomaticGigahostSetupBinding)
+}
+
+// trackerWithGrantor builds the same tracker with an explicit grant seam, so a test can
+// represent a deployment that cannot grant, or observe the grant attempt.
+func (e *installEnv) trackerWithGrantor(
+	now func() time.Time, grantor gigahostsetup.AutomaticBindingGrantor,
+) *gigahostsetup.Tracker {
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
 	}
@@ -274,13 +291,17 @@ func (e *installEnv) tracker(now func() time.Time) *gigahostsetup.Tracker {
 		Resolve: func(context.Context) (gigahostsetup.ProviderReader, error) {
 			return readOnlyGigahostProvider{client: e.h.gigahostClient}, nil
 		},
-		ChallengeHost: e.h.challengeGigahostSetupHostIdentity,
-		Now:           now,
-		Interval:      time.Minute,
-		FailureBack:   time.Second,
-		MaxBackoff:    time.Minute,
-		Batch:         10,
-		CallTimeout:   5 * time.Second,
+		ChallengeHost:           e.h.challengeGigahostSetupHostIdentity,
+		FirstContactEligible:    e.h.firstContactEligible,
+		AutomaticEffectAllowed:  e.h.automaticEffectPermitted,
+		AutomaticBindingGrantor: grantor,
+		Pinner:                  e.db,
+		Now:                     now,
+		Interval:                time.Minute,
+		FailureBack:             time.Second,
+		MaxBackoff:              time.Minute,
+		Batch:                   10,
+		CallTimeout:             5 * time.Second,
 	})
 }
 

@@ -204,6 +204,10 @@ func TestFirstContactBindingProofAcceptsThePositiveControl(t *testing.T) {
 	recordOrderRow(t, env, orderID, providerServerID, 9, ip, models.PurchaseOriginPanelPurchase)
 	recordManagedCredential(t, env, orderID, 4242)
 	listProviderServer(env, providerServerID, orderID, ip)
+	// The whole predicate includes the current-policy gate, so a job that is meant to
+	// be accepted needs unattended setup enabled - exactly as it would in a deployment
+	// where the job was created in the first place.
+	env.enableAutomaticSetup(true)
 
 	if reason, ok := env.h.firstContactBindingProof(
 		context.Background(),

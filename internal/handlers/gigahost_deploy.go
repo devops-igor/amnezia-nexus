@@ -490,10 +490,39 @@ func (h *Handlers) qualifyBackendTraffic(ctx context.Context, server *models.Ser
 	// F14: promotion decides admission authority inside its own transaction, so a
 	// setup approval revoked during this network work cannot be admitted here. A
 	// refusal quarantines the enrollment instead of leaving it enabled.
+	//
+	// Automatic jobs add one more authority question at this exact point. The policy
+	// that permitted unattended setup can be turned off while qualification is running,
+	// and the journal refusal in finishInstall happens AFTER this promotion - so without
+	// a gate here a backend whose owner lost permission is admitted and left selectable
+	// behind a job that never claims success. The check is deliberately placed after
+	// qualification succeeded and immediately before the commit: that is the last moment
+	// authority can still be withheld without undoing work, and it costs one policy read
+	// per admitted backend rather than one per probe.
+	if pause := h.refuseAutomaticAdmission(ctx); pause != nil {
+		return h.failBackendAdmission(ctx, server.ID, pause.step, errors.New(pause.detail))
+	}
 	if err := h.vpnSvc.PromoteQualifiedTunnel(probeCtx, server.ID, latencyMS); err != nil {
 		return h.failBackendAdmission(ctx, server.ID, "failed to commit active status after canary probe", err)
 	}
 	return nil
+}
+
+// refuseAutomaticAdmission asks the current automation policy whether this backend may be
+// promoted, for an automatic job only.
+//
+// It returns the pause diagnosis when the backend must stay out of the pool, and nil when it
+// may be admitted. A job without automation provenance is answered nil without consulting
+// any policy, so the manual deploy path is untouched.
+func (h *Handlers) refuseAutomaticAdmission(ctx context.Context) *installPause {
+	intent, ok := automaticAdmissionIntent(ctx)
+	if !ok {
+		// No automatic job is being admitted on this path: the manual deploy and the
+		// direct request path carry no intent, and an unattended-setup setting has no
+		// authority over them.
+		return nil
+	}
+	return h.refuseAutomaticEffect(ctx, intent, boundaryHealthyAdmission)
 }
 
 // failBackendAdmission withdraws a backend whose admission did not happen and

@@ -127,6 +127,60 @@ jobs:
       - name: Run Vision Tests (non-race)
         run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
 
+      # The automatic AWG admission pair runs inside the package job above, but a
+      # package-level PASS reports neither which tests ran nor what the pre-rollback
+      # capture observed, so a remote-only AWG stall could not be attributed. This
+      # selects the two existing tests by anchored name and keeps -v so their
+      # privacy-safe observations reach the log. It adds no assertion and changes no
+      # qualification semantics: a failure here still fails the job.
+      - name: Run Automatic AWG Admission Consumers
+        run: |
+          go test -v -race -count=1 -p 2 -parallel 2 -timeout 10m \
+            -run '^(TestAutomaticSetupAdmitsAfterAuthenticAWGTraffic|TestAutomaticSetupRefusesWhenTheAWGPeerNeverAnswers)$' \
+            ./internal/handlers/
+
+      # The automatic Naive admission trio runs inside the package job above, but a
+      # package-level PASS reports neither which tests ran nor whether the payload
+      # actually traversed the proxy. This selects them by anchored name and keeps -v
+      # so each result and its payload counters are individually visible. It adds no
+      # assertion and changes no qualification semantics; a failure here fails the job.
+      #
+      # A SKIP is the one outcome that would prove nothing: the consumer tests skip when
+      # the native binary or the forwardproxy Caddy build is unavailable. Both are
+      # provisioned by the steps above, so verify them first and fail closed here rather
+      # than letting a missing dependency degrade into a silent skip.
+      - name: Verify Automatic Naive Consumer Prerequisites
+        run: |
+          set -euo pipefail
+          # No `|| true` here: a missing binary must fail this step, not be
+          # replaced by a fallback that silently points at nothing.
+          if caddy_bin="$(command -v caddy)"; then
+            :
+          else
+            caddy_bin="$(go env GOPATH)/bin/caddy"
+          fi
+          test -x "$caddy_bin"
+          "$caddy_bin" list-modules | grep -qx 'http.handlers.forward_proxy'
+          # The pinned NaiveProxy release is musl-linked; the loader must resolve a
+          # real DT_NEEDED entry, not merely print a banner.
+          /lib/ld-musl-x86_64.so.1 --list /usr/lib/x86_64-linux-musl/libgcc_s.so.1 >/dev/null
+
+      - name: Run Automatic Naive Admission Consumers
+        run: |
+          set -uo pipefail
+          log="$(mktemp)"
+          go test -v -race -count=1 -p 2 -parallel 2 -timeout 10m \
+            -run '^(TestAutomaticSetupAdmitsAfterAuthenticNaivePayload|TestAutomaticSetupRefusesWhenTheNaivePayloadIsNeverAnswered|TestAutomaticSetupRefusesWhenNaiveAuthenticationIsRejected|TestNaiveConsumerFixturesAreNotHandshakeOnly)$' \
+            ./internal/handlers/ 2>&1 | tee "$log"
+          status="${PIPESTATUS[0]}"
+          # A skip is not evidence. This job provisions both prerequisites above, so a
+          # skip means the proof did not run and this step must not report success.
+          if grep -qE '^--- SKIP: ' "$log"; then
+            echo "::error::a Naive admission consumer was skipped, so no traffic proof was produced"
+            exit 1
+          fi
+          exit "$status"
+
       - name: Upload Test Coverage
         uses: actions/upload-artifact@v7
         if: always()
@@ -157,6 +211,9 @@ jobs:
       # The finalizer suite drives the real lifecycle finalize() path against
       # local stubs (no Docker, SSH, network or provider calls), so the
       # install-failure retention oracle is proven here too, not only locally.
+      # The Naive consumer step contract runs the two new workflow step blocks
+      # with go/caddy/loader stubs, so its skip guard is proven to fire without
+      # a native binary, Caddy build or hosted run.
       - name: Run Offline Diagnostics Privacy Suite
         run: |
           python -m pip install --upgrade pip
@@ -168,7 +225,8 @@ jobs:
             tests/test_e2e_install_failure_finalizer.py \
             tests/test_e2e_log_privacy.py \
             tests/test_naive_decoy_default_contract.py \
-            tests/test_ci_native_dependencies.py
+            tests/test_ci_native_dependencies.py \
+            tests/test_ci_naive_consumer_steps.py
 
   build-matrix:
     name: Cross-Compile Matrix (${{ matrix.target.os }}/${{ matrix.target.arch }})
