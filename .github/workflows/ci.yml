@@ -118,8 +118,18 @@ jobs:
           grep -qa '__umodti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
           grep -qa '__udivti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
 
+      # These four WAN tests fail closed under CI when the runner has no root,
+      # /dev/net/tun or private network namespace, which is correct — they must never
+      # report success by skipping. They cannot run in this unprivileged job, so they
+      # are excluded here and executed for real by the required `wan-qualification` job
+      # below. The exclusion is paired one-to-one with that execution: it removes no
+      # obligation, it moves each obligation to a step that actually runs it.
       - name: Run Tests with Race Detector
-        run: go test -race -cover -count=1 -coverprofile=coverage.out ./...
+        run: |
+          go test -race -cover -count=1 -coverprofile=coverage.out \
+            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath)$' ./...
+          go test -race -count=1 \
+            -skip '^TestLinuxE2E_DirectEgress$' ./internal/vpn/forwarder/
 
       - name: Run Authentic Native Caddy Integration Tests
         run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
@@ -204,3 +214,148 @@ jobs:
           name: panel-${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: bin/panel-${{ matrix.target.os }}-${{ matrix.target.arch }}
           retention-days: 7
+
+  # Required bounded WAN qualification (issue #677).
+  #
+  # The direct-WAN dataplane can only be proven by executing real kernel behaviour:
+  # a production TUN device, AF_PACKET capture, namespace-local forwarding/NAT and
+  # replies that actually arrive. Those tests fail closed under CI when the runner
+  # cannot provide root, /dev/net/tun and a private network namespace, so they cannot
+  # run in the unprivileged `test` job above — and they must not be excluded from it
+  # either, or the required behaviour goes unexercised.
+  #
+  # This job therefore compiles the test binaries unprivileged and uses sudo for the
+  # launch only. Every test here creates and owns its own network namespace, so the
+  # job never reconfigures the runner's host networking: no hostwide sysctl, no
+  # AppArmor change, no privileged container, no self-hosted runner.
+  wan-qualification:
+    name: Required WAN Qualification (isolated namespaces)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      # A disposable /run/netns so `ip netns` operations in the tests cannot touch a
+      # shared mount. It is created by this job and removed by the teardown step.
+      - name: Prepare private /run/netns
+        run: sudo mkdir -p /run/netns
+
+      - name: Compile the VPN WAN test binary
+        run: go test -tags with_utls -c -o "$RUNNER_TEMP/vpn-wan.test" ./internal/vpn
+
+      - name: Run the VPN WAN qualification
+        env:
+          CI: 'true'
+        run: |
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/vpn-wan.log"
+          echo "running: S4 + production lifecycle + capture positive/negative"
+          # sudo resets the environment, so the required markers are passed explicitly.
+          # Compilation happened unprivileged above; only the launch is elevated.
+          sudo env \
+            GITHUB_ACTIONS=true CI=true NEXUS_S4_REQUIRED=1 \
+            "$RUNNER_TEMP/vpn-wan.test" \
+            -test.v -test.timeout=12m \
+            -test.run '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath)$' \
+            > "$LOG" 2>&1
+          rc=$?
+          cat "$LOG"
+          # Exit status alone is not the oracle: a skip or a missing test would look
+          # like success, so the log itself is inspected.
+          if grep -qE '^--- SKIP' "$LOG"; then
+            echo "::error::a required WAN test SKIPPED; a skip is not a pass"
+            exit 1
+          fi
+          if grep -qE '^--- FAIL' "$LOG"; then
+            echo "::error::a required WAN test FAILED"
+            exit 1
+          fi
+          for name in \
+            TestS4ProductionContainerHostWANQualification \
+            TestProductionWANDevice_PermissionsAndLifecycle \
+            TestWANCaptureProductionPath
+          do
+            if ! grep -qE "^--- PASS: $name " "$LOG"; then
+              echo "::error::required test did not report PASS: $name"
+              exit 1
+            fi
+          done
+          if ! grep -q 'S4 RESULT: PASS' "$LOG"; then
+            echo "::error::the S4 verdict line is absent; the direct-WAN path is unproven"
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the qualification process exited $rc"
+            exit 1
+          fi
+
+      - name: Compile the forwarder WAN test binary
+        run: go test -tags with_utls -c -o "$RUNNER_TEMP/fwd-wan.test" ./internal/vpn/forwarder
+
+      - name: Run the forwarder direct-egress qualification
+        env:
+          CI: 'true'
+        run: |
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/fwd-wan.log"
+          echo "running: forwarder direct-egress dispatch/return"
+          sudo env GITHUB_ACTIONS=true CI=true NEXUS_S4_REQUIRED=1 \
+            "$RUNNER_TEMP/fwd-wan.test" \
+            -test.v -test.timeout=10m \
+            -test.run '^TestLinuxE2E_DirectEgress$' \
+            > "$LOG" 2>&1
+          rc=$?
+          cat "$LOG"
+          if grep -qE '^--- SKIP' "$LOG"; then
+            echo "::error::the forwarder WAN gate SKIPPED; a skip is not a pass"
+            exit 1
+          fi
+          if grep -qE '^--- FAIL' "$LOG"; then
+            echo "::error::the forwarder WAN gate FAILED"
+            exit 1
+          fi
+          if ! grep -qE '^--- PASS: TestLinuxE2E_DirectEgress ' "$LOG"; then
+            echo "::error::required test did not report PASS: TestLinuxE2E_DirectEgress"
+            exit 1
+          fi
+          # This gate has no verdict line; a delivered direct reply is its evidence.
+          if ! grep -q 'ECHO:' "$LOG"; then
+            echo "::error::no direct echo reply observed; the return path is unproven"
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the forwarder qualification process exited $rc"
+            exit 1
+          fi
+
+      # Raw logs BEFORE teardown, and on failure too: the evidence is the whole point.
+      - name: Upload WAN qualification logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: wan-qualification-logs
+          path: |
+            ${{ runner.temp }}/vpn-wan.log
+            ${{ runner.temp }}/fwd-wan.log
+          retention-days: 14
+          if-no-files-found: warn
+
+      # Remove only what this job created. The tests clean their own namespaces; this
+      # clears the mountpoint directory we made.
+      - name: Clean up job-owned resources
+        if: always()
+        run: |
+          set +e
+          sudo ip netns list | awk '{print $1}' | grep -E '^(nexus|s4|wan-|nt)' | while read -r ns; do
+            [ -n "$ns" ] && sudo ip netns del "$ns" 2>/dev/null
+          done
+          sudo rm -rf /run/netns
+          rm -f "$RUNNER_TEMP"/vpn-wan.test "$RUNNER_TEMP"/fwd-wan.test
+          echo "cleanup complete"
