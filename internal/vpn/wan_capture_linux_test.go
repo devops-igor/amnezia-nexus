@@ -133,6 +133,9 @@ func TestWANCaptureProductionPath(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			out, err := runProbeInNetNS(mode)
 			if err != nil {
+				if s4RequiredEnvironment() {
+					t.Fatalf("capture probe %s could not create its isolated namespace in a required CI run, so the claimed capture contract is unproven: %v\n%s", mode, err, out)
+				}
 				t.Skipf("skipping: cannot create isolated user+network namespace here: %v", err)
 			}
 			if !strings.Contains(out, "RESULT: PASS") {
@@ -145,7 +148,8 @@ func TestWANCaptureProductionPath(t *testing.T) {
 // runProbeInNetNS re-executes this binary under `unshare -Urn` so the probe owns a
 // private network namespace with the capabilities the production container would
 // have after `cap_add`. Host networking is never modified. A returned error means
-// the namespace could not be created at all, which is a skip, not a failure.
+// the namespace could not be created at all: the caller decides whether that is a
+// required-CI failure or an optional-local skip, via s4RequiredEnvironment.
 func runProbeInNetNS(mode string) (string, error) {
 	// #nosec G204 -- os.Args[0] is the test binary; mode is a fixed literal
 	cmd := exec.Command("unshare", "-Urn", os.Args[0], "-test.run=^$")

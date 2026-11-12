@@ -118,17 +118,8 @@ jobs:
           grep -qa '__umodti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
           grep -qa '__udivti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
 
-      # The direct-WAN Linux E2E and S4 host-WAN qualification tests fail closed:
-      # under CI they call t.Fatalf instead of t.Skipf when the runner cannot give
-      # them root, /dev/net/tun and a private user+network namespace. This job runs
-      # unprivileged on a hosted runner, so they are excluded here rather than
-      # silently skipped. Their own fail-closed contract is unchanged; they belong
-      # in the dedicated privileged WAN qualification step, which is not part of
-      # this integration and remains an open acceptance item.
       - name: Run Tests with Race Detector
-        run: |
-          go test -race -cover -count=1 -coverprofile=coverage.out \
-            -skip '^(TestLinuxE2E_DirectEgress|TestS4ProductionContainerHostWANQualification)$' ./...
+        run: go test -race -cover -count=1 -coverprofile=coverage.out ./...
 
       - name: Run Authentic Native Caddy Integration Tests
         run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...

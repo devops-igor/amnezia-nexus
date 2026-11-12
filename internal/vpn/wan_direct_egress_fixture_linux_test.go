@@ -371,6 +371,79 @@ func s4AssertDocumentedConfigRejected() error {
 	return nil
 }
 
+// s4OwnedNamespaceEnv marks a process that is running inside the private namespace
+// the S4 qualification created for itself. A test that needs to configure kernel
+// settings (rp_filter, accept_local, forwarding) must only do so under this marker,
+// because only that process owns a throwaway network stack; anything else would be
+// mutating the runner's or the operator's host.
+const s4OwnedNamespaceEnv = "NEXUS_S4_OWNED_NAMESPACE"
+
+// s4RequireOwnedNamespace reports nil only when the current process provably owns a
+// private network namespace created for this run.
+func s4RequireOwnedNamespace() error {
+	if os.Getenv(s4OwnedNamespaceEnv) != "1" {
+		return fmt.Errorf("this process does not own a private network namespace (%s is unset); kernel settings here belong to the host", s4OwnedNamespaceEnv)
+	}
+	return nil
+}
+
+// s4AssertLiveIncompatibleConfigRefused is the LIVE half of the counterexample, and
+// it runs inside the private namespace this process owns.
+//
+// It sets rp_filter to the incompatible value on BOTH conf/all and conf/default,
+// calls the production constructor exactly as startup does, and requires:
+//   - the constructor to refuse with ErrHostWANSourceValidation, and
+//   - no tunnel device to have been created (the refusal happens before the TUN).
+//
+// It then restores rp_filter=0 on both scopes so the qualifying path below runs on a
+// network configuration that genuinely works. Nothing here touches the host: these
+// sysctls belong to the throwaway namespace, which disappears with the process.
+func s4AssertLiveIncompatibleConfigRefused() error {
+	restore, err := s4SetNamespaceRPFilter("2")
+	if err != nil {
+		return fmt.Errorf("prepare live incompatible configuration: %w", err)
+	}
+	// Always restore, even when the assertion below fails, so a failure here does
+	// not poison the qualifying phases with a configuration we deliberately broke.
+	defer func() { _ = restore() }()
+
+	dev, constructErr := NewProductionWANDevice(s4WANDeviceName)
+	if constructErr == nil {
+		_ = dev.Close()
+		return fmt.Errorf("the production constructor ACCEPTED a live effective rp_filter=2, which was measured to forward no direct traffic; the fail-closed guard is not effective on real procfs")
+	}
+	if !errors.Is(constructErr, ErrHostWANSourceValidation) {
+		return fmt.Errorf("the production constructor refused the live incompatible configuration with an unexpected error, not the actionable source-validation error: %w", constructErr)
+	}
+	// The refusal must precede device creation: a guard that refuses only after
+	// creating the TUN would still have mutated the link state of the host it runs on.
+	if out, linkErr := s4Command("ip", "link", "show", s4WANDeviceName); linkErr == nil {
+		return fmt.Errorf("the refused configuration still created tunnel device %q (ip link show output: %s)", s4WANDeviceName, strings.TrimSpace(out))
+	}
+	fmt.Printf("S4 red phase (live): production constructor refused a live rp_filter=2 namespace: %v\n", constructErr)
+	return nil
+}
+
+// s4SetNamespaceRPFilter writes one rp_filter value to conf/all and conf/default in
+// the namespace this process owns, and returns a function that puts both scopes back
+// to 0. Writing conf/default is required because a device created later inherits from
+// it, and writing only conf/all cannot loosen an inherited per-device value.
+func s4SetNamespaceRPFilter(value string) (func() error, error) {
+	for _, scope := range []string{"all", "default"} {
+		if out, err := s4Command("sysctl", "-w", "net.ipv4.conf."+scope+".rp_filter="+value); err != nil {
+			return nil, fmt.Errorf("set conf/%s rp_filter=%s: %w: %s", scope, value, err, strings.TrimSpace(out))
+		}
+	}
+	return func() error {
+		for _, scope := range []string{"all", "default"} {
+			if out, err := s4Command("sysctl", "-w", "net.ipv4.conf."+scope+".rp_filter=0"); err != nil {
+				return fmt.Errorf("restore conf/%s rp_filter=0: %w: %s", scope, err, strings.TrimSpace(out))
+			}
+		}
+		return nil
+	}, nil
+}
+
 // s4SourceValidationSettings reports the kernel source-validation inputs and their
 // effective values, reading procfs only. The gate compares these against what a
 // deployment must provide; it never writes them, because a deployed container mounts

@@ -14,47 +14,59 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestProductionWANDevice_PermissionsAndLifecycle(t *testing.T) {
-	if os.Geteuid() != 0 {
-		// Non-root: verify graceful error handling (fails closed with clear error, no panic)
-		dev, err := NewProductionWANDevice("nexus-wan-test")
+// TestProductionWANDevice_UnprivilegedRefusal pins that the production constructor
+// fails closed with a clear, non-panicking error when the process cannot create a
+// TUN device. It asserts behaviour, so it is meaningful in every environment and
+// does not depend on the runner's own kernel settings.
+func TestProductionWANDevice_UnprivilegedRefusal(t *testing.T) {
+	if os.Geteuid() == 0 {
+		// As real root the constructor legitimately proceeds; the failure path this
+		// test pins is only reachable without the privilege.
+		dev, err := NewProductionWANDevice("nexus-wan-unpriv-probe")
 		if err == nil {
 			_ = dev.Close()
-			t.Log("NewProductionWANDevice succeeded in unprivileged test environment")
-			return
+			t.Skip("running as root: the unprivileged refusal path is not reachable here")
 		}
-		t.Logf("NewProductionWANDevice returned expected non-root permission error: %v", err)
+		t.Logf("constructor refused as root for an environment reason: %v", err)
 		return
 	}
+	dev, err := NewProductionWANDevice("nexus-wan-unpriv-probe")
+	if err == nil {
+		_ = dev.Close()
+		t.Fatalf("a non-root process must not obtain a production WAN device")
+	}
+	if dev != nil {
+		t.Fatalf("constructor returned a non-nil device alongside an error: %v", err)
+	}
+	t.Logf("constructor refused a non-root process with: %v", err)
+}
 
-	// Even as root, /dev/net/tun may be absent (e.g. CI containers without kernel TUN).
-	// Skip rather than fail in that case — the test's purpose is to verify the ioctl
-	// lifecycle on a real TUN device, which requires the kernel module.
-	if _, err := os.Stat("/dev/net/tun"); err != nil {
-		t.Skip("/dev/net/tun not available; skipping TUN lifecycle test")
-		return
+// TestProductionWANDevice_PermissionsAndLifecycle verifies the TUN ioctl lifecycle
+// against a real device.
+//
+// It runs INSIDE the private user+network namespace that the S4 qualification owns,
+// so the settings it depends on (rp_filter, accept_local, forwarding) are the ones
+// that namespace configures rather than whatever the runner's host happens to carry.
+// Outside that namespace the test cannot prove the lifecycle, and it says so instead
+// of silently passing on a host that happens to be configured conveniently.
+func TestProductionWANDevice_PermissionsAndLifecycle(t *testing.T) {
+	if err := s4RequireOwnedNamespace(); err != nil {
+		if s4RequiredEnvironment() {
+			t.Fatalf("TUN lifecycle qualification needs its own network namespace and this required run does not have one: %v", err)
+		}
+		t.Skipf("skipping TUN lifecycle assertions outside the owned namespace: %v", err)
 	}
 
 	dev, err := NewProductionWANDevice("nexus-wan-test")
 	if err != nil {
-		if strings.Contains(err.Error(), "accept_local is disabled on both all and") {
-			if isAllAcceptLocalEnabled() {
-				t.Fatalf("unexpected accept_local prerequisite failure when all.accept_local is enabled: %v", err)
-			}
-			t.Skipf("skipping TUN lifecycle assertions: accept_local is disabled on both all and device (read-only procfs in container): %v", err)
-			return
-		}
-		t.Fatalf("NewProductionWANDevice failed: %v", err)
+		t.Fatalf("NewProductionWANDevice failed inside the owned namespace, which provides every prerequisite: %v", err)
 	}
 	defer func() { _ = dev.Close() }()
 
-	// Verify accept_local is effective (either configured on device or enabled host-wide)
+	// Verify accept_local is effective on the device the constructor just created.
 	if alData, alErr := os.ReadFile("/proc/sys/net/ipv4/conf/nexus-wan-test/accept_local"); alErr == nil {
 		if val := strings.TrimSpace(string(alData)); val != "1" {
-			if !isAllAcceptLocalEnabled() {
-				t.Fatalf("expected accept_local=1 on nexus-wan-test or all, got dev=%q, all=%v", val, isAllAcceptLocalEnabled())
-			}
-			t.Logf("accept_local on nexus-wan-test is %q, but all.accept_local is enabled", val)
+			t.Fatalf("expected accept_local=1 on nexus-wan-test inside the owned namespace, got %q", val)
 		}
 	}
 

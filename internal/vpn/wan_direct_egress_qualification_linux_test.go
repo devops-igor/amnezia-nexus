@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
+
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"golang.org/x/sys/unix"
@@ -159,7 +161,10 @@ func init() {
 func runS4QualificationProbe() (string, error) {
 	// #nosec G204 -- os.Args[0] is this test binary; the namespace flags are literals
 	cmd := exec.Command("unshare", "-Urn", "--map-root-user", os.Args[0], "-test.run=^$")
-	cmd.Env = append(os.Environ(), s4ProbeEnv+"=1")
+	// The owned-namespace marker is set by the parent that creates the namespace, so a
+	// test running inside it can prove it owns the kernel settings it configures. It is
+	// set here, not inside the child, because only the parent knows unshare succeeded.
+	cmd.Env = append(os.Environ(), s4ProbeEnv+"=1", s4OwnedNamespaceEnv+"=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "S4 RESULT:") {
 		return string(out), fmt.Errorf("probe could not run (namespace setup): %w", err)
@@ -240,6 +245,20 @@ func runS4QualificationBodyTo(w io.Writer) int {
 	if effective := reported["effective_rp_filter"]; effective != "0" {
 		return fail("qualifying requires rp_filter=0 as the effective value (observed %q from all=%q default=%q); start the container with rp_filter=0 via --sysctl",
 			effective, reported["all_rp_filter"], reported["default_rp_filter"])
+	}
+
+	// --- Phase 1b: the same production constructor REFUSES a live incompatible host
+	// This is the live half of the counterexample: in this namespace, which we own,
+	// set the incompatible settings for real, hand the address to the production
+	// validator exactly as startup does, and require it to refuse with the
+	// actionable error and to create no tunnel device. Then restore a compatible
+	// configuration so the qualifying path below runs against a real one.
+	//
+	// The synthetic-tree case above stays: it holds the documented deployment's
+	// values without mutating the live namespace, and this live case proves the same
+	// guard fires on REAL procfs rather than only on a fixture tree.
+	if err := s4AssertLiveIncompatibleConfigRefused(); err != nil {
+		return fail("%v", err)
 	}
 
 	// Production WAN device: real TUN, real AF_PACKET capture, real iptables.
@@ -330,19 +349,15 @@ func runS4QualificationBodyTo(w io.Writer) int {
 
 	// --- Proxy path still works in the same dispatcher instance ------------------
 	// Proves the direct path did not displace the existing proxy behaviour: an
-	// UNKNOWN destination must reach the backend queue and never the WAN device.
+	// UNKNOWN destination must be proxied and never touch the WAN device.
 	// The counters are sampled around this single packet, because the direct TCP
 	// flow above legitimately continues to produce reply traffic (retransmits and
 	// the close) that a wider window would attribute to the proxy route.
 	dropsBeforeProxy := dem.DirectDrops()
 	bytesBeforeProxy := dem.DirectBytes()
 	if err := svc.forwarder.RouteClientToBackend("peer-s4-proxy", buildTestPBRUDPPacket(
-		netip.MustParseAddr("10.100.0.12"), netip.MustParseAddr("8.8.4.4"), 5555, 53, []byte("proxy-probe"))); err != nil {
+		netip.MustParseAddr(s4ProxyBackendClientIP), s4ProxyDstIP, 5555, 53, []byte("proxy-probe"))); err != nil {
 		return fail("route UNKNOWN destination packet: %v", err)
-	}
-	queued, ok := svc.forwarder.GetBackendPacketChannel(s4ProxyBackendID)
-	if !ok || len(queued) == 0 {
-		return fail("UNKNOWN destination did not reach the proxy backend queue")
 	}
 	if got := dem.DirectDrops(); got != dropsBeforeProxy {
 		return fail("proxied traffic incremented directDrops (%d -> %d)", dropsBeforeProxy, got)
@@ -351,15 +366,136 @@ func runS4QualificationBodyTo(w io.Writer) int {
 		return fail("proxied traffic incremented directBytes (%d -> %d)", bytesBeforeProxy, got)
 	}
 
+	// --- Proxy reply returns through the real backend device and pumps ----------
+	// The backend is a real packet device (netstack) attached with
+	// AttachBackendDevice, so the request travels the production path
+	// backendQueues -> pumpBackendQueue -> device.Write, the backend echoes it, and
+	// the reply comes back through the production reader -> RouteBackendToClient ->
+	// pumpClientQueue -> the owning peer's ReturnPath. An unconsumed channel would
+	// only prove dispatch precedence; this proves the packet actually moves.
+	proxyReply, ok := s4WaitReplyPrefix(replies, "peer-s4-proxy", "ECHO:proxy-probe", 5*time.Second)
+	if !ok {
+		return fail("no proxy request/reply completed through the attached backend device (directDrops %d, directBytes %d); the proxy path did not carry a packet end to end",
+			dem.DirectDrops(), dem.DirectBytes())
+	}
+	// The reply must be addressed back to the owning client, not to another peer.
+	if err := s4AssertProxyReplyAddressed(proxyReply, "10.100.0.12", 5555); err != nil {
+		return fail("proxy reply %v", err)
+	}
+	// Ownership: the proxy reply reached its owner and no other peer saw it.
+	if s4PeerGotReply(replies, "peer-s4-udp") || s4PeerGotReply(replies, "peer-s4-tcp") {
+		return fail("a proxy reply was delivered to a peer that owns no proxied flow")
+	}
+	if got := dem.DirectDrops(); got != dropsBeforeProxy {
+		return fail("the proxy round trip incremented directDrops (%d -> %d)", dropsBeforeProxy, got)
+	}
+	if got := dem.DirectBytes(); got != bytesBeforeProxy {
+		return fail("the proxy round trip incremented directBytes (%d -> %d)", bytesBeforeProxy, got)
+	}
+
 	logf("S4 RESULT: PASS: production WAN device + dispatcher delivered direct UDP and TCP replies from %s:%d to the owning peer with DNAT (directBytes=%d, directDrops=%d)",
 		fixture.peerIP, s4RemotePort, dem.DirectBytes(), dem.DirectDrops())
 	return 0
 }
 
-// s4ProxyBackendID is the backend tunnel id the proxy-path assertion observes.
-const s4ProxyBackendID = int64(301)
+// s4ProxyBackendID identifies the backend tunnel the proxy-path assertions observe;
+// s4ProxyBackendClientIP is the client peer whose traffic must take the proxy path.
+const (
+	s4ProxyBackendID       = int64(301)
+	s4ProxyBackendClientIP = "10.100.0.12"
+)
+
+// s4ProxyDstIP is the UNKNOWN public destination the proxied client targets. The
+// backend stack is given this address so the packet the pumps write into the device
+// is actually delivered to the echo listener; nothing else about the path changes.
+var s4ProxyDstIP = netip.MustParseAddr("8.8.4.4")
+
+// s4BuildBackendEcho creates the proxy backend as a REAL packet device: a netstack
+// TUN with a UDP echo listener, wrapped in the same returnStackDevice the rest of
+// the harness uses. Attaching it with AttachBackendDevice (rather than a bare
+// channel) makes the production pumps move the packet: request out through
+// pumpBackendQueue -> device.Write, echo answered inside the stack, reply in
+// through the production reader -> RouteBackendToClient -> pumpClientQueue.
+//
+// It returns the device and a stop function that closes the listener, joins the
+// echo goroutine and closes the stack, so teardown cannot race the pumps.
+func s4BuildBackendEcho() (forwarder.PacketDevice, func(), error) {
+	vt, stack, err := netstack.CreateNetTUN([]netip.Addr{s4ProxyDstIP}, nil, 1280)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create backend netstack: %w", err)
+	}
+	udpConn, err := stack.ListenUDPAddrPort(netip.AddrPortFrom(s4ProxyDstIP, 53))
+	if err != nil {
+		_ = vt.Close()
+		return nil, nil, fmt.Errorf("listen on backend stack: %w", err)
+	}
+
+	stop := make(chan struct{})
+	var echoWG sync.WaitGroup
+	echoWG.Add(1)
+	go func() {
+		defer echoWG.Done()
+		buf := make([]byte, 2048)
+		for {
+			n, from, readErr := udpConn.ReadFrom(buf)
+			if readErr != nil {
+				return
+			}
+			reply := append([]byte("ECHO:"), buf[:n]...)
+			if _, writeErr := udpConn.WriteTo(reply, from); writeErr != nil {
+				return
+			}
+			select {
+			case <-stop:
+				return
+			default:
+			}
+		}
+	}()
+
+	device := &returnStackDevice{tun: vt}
+	return device, func() {
+		close(stop)
+		_ = udpConn.Close()
+		echoWG.Wait()
+		_ = device.Close()
+	}, nil
+}
+
+// s4ProxyBackendReader pumps the backend device's replies into the production
+// return path, exactly as the service does for a real backend tunnel.
+func s4ProxyBackendReader(fwd *forwarder.Forwarder, dev forwarder.PacketDevice, done chan<- struct{}) {
+	defer close(done)
+	buf := make([]byte, 2048)
+	for {
+		n, readErr := dev.Read(buf)
+		if readErr != nil {
+			return
+		}
+		if n < 20 || buf[0]>>4 != 4 {
+			continue
+		}
+		destIP := netip.AddrFrom4([4]byte{buf[16], buf[17], buf[18], buf[19]}).String()
+		_ = fwd.RouteBackendToClient(s4ProxyBackendID, buf[:n], destIP)
+	}
+}
+
+// s4AssertProxyReplyAddressed checks a proxy reply was translated back to the
+// client that owns the proxied flow.
+func s4AssertProxyReplyAddressed(packet []byte, clientIP string, clientPort uint16) error {
+	if len(packet) < 40 {
+		return fmt.Errorf("too short to carry an IPv4 transport header: %d bytes", len(packet))
+	}
+	dstIP := netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]}).String()
+	dstPort := binary.BigEndian.Uint16(packet[22:24])
+	if dstIP != clientIP || dstPort != clientPort {
+		return fmt.Errorf("expected to be addressed to the owning client %s:%d, got %s:%d", clientIP, clientPort, dstIP, dstPort)
+	}
+	return nil
+}
 
 // s4PeerReplies records per-peer reply deliveries from the dispatcher.
+
 type s4PeerReplies struct {
 	mu     sync.Mutex
 	byPeer map[string][][]byte
@@ -410,14 +546,21 @@ func s4BuildDispatcherService(wanDev forwarder.PacketDevice, fixture *s4Fixture)
 	rc.AttachMatcher(matcher)
 
 	fwd := forwarder.NewForwarder(nil, "10.100.0.0/16", 100)
-	backendQueue := make(chan []byte, 8)
-	fwd.SetBackendQueueForTest(s4ProxyBackendID, backendQueue)
+
+	// The proxy backend is a real packet device, not a bare channel: attach it so
+	// the production pumps move the request to it and its replies come back
+	// through the production return path.
+	backendDev, stopBackend, err := s4BuildBackendEcho()
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("build proxy backend device: %w", err)
+	}
+	fwd.AttachBackendDevice(s4ProxyBackendID, backendDev)
 
 	replies := newS4PeerReplies()
 	for _, peer := range []struct{ peerKey, clientIP string }{
 		{"peer-s4-udp", "10.100.0.10"},
 		{"peer-s4-tcp", "10.100.0.11"},
-		{"peer-s4-proxy", "10.100.0.12"},
+		{"peer-s4-proxy", s4ProxyBackendClientIP},
 	} {
 		peer, clientIP := peer.peerKey, peer.clientIP
 		path := forwarder.NewReturnPath(func(peerKey, assignedIP string, packet []byte) (int, error) {
@@ -427,8 +570,11 @@ func s4BuildDispatcherService(wanDev forwarder.PacketDevice, fixture *s4Fixture)
 		fwd.RegisterSessionWithReturnPath("sess-"+peer, "conn-"+peer, peer, clientIP, s4ProxyBackendID, path)
 		// Direct decisions come from observed client DNS evidence, exactly as in
 		// production; seeding the cache for the fixture peer keeps the flow honest
-		// without inventing a second decision path.
-		rc.Set("sess-"+peer, fixture.peerIP, policy.Direct)
+		// without inventing a second decision path. The proxied peer deliberately
+		// gets NO direct decision, so its packet must take the proxy path.
+		if clientIP != s4ProxyBackendClientIP {
+			rc.Set("sess-"+peer, fixture.peerIP, policy.Direct)
+		}
 	}
 
 	svc := &Service{forwarder: fwd}
@@ -441,14 +587,27 @@ func s4BuildDispatcherService(wanDev forwarder.PacketDevice, fixture *s4Fixture)
 		PolicyMatcher: matcher,
 	}
 	if err := svc.ConfigurePBR(cfg); err != nil {
+		stopBackend()
 		return nil, nil, nil, nil, fmt.Errorf("ConfigurePBR: %w", err)
 	}
 	dem := svc.forwarder.DirectEgress()
 	if dem == nil {
+		stopBackend()
 		return nil, nil, nil, nil, errors.New("ConfigurePBR did not install a DirectEgressManager")
 	}
 	fwd.StartPumps(context.Background())
-	return svc, dem, replies, func() { fwd.StopPumps(); _ = svc.TeardownPBR() }, nil
+
+	// The backend return reader runs as the service does it in production: it
+	// drains the device and hands each reply to RouteBackendToClient.
+	backendDone := make(chan struct{})
+	go s4ProxyBackendReader(fwd, backendDev, backendDone)
+
+	return svc, dem, replies, func() {
+		fwd.StopPumps()
+		_ = svc.TeardownPBR()
+		stopBackend()
+		<-backendDone
+	}, nil
 }
 
 // s4SendClientPacket routes one synthetic client packet through the dispatcher.
