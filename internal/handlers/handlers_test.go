@@ -55,6 +55,13 @@ func setupTestHandlers(t *testing.T) (*Handlers, *database.DB, *config.Config) {
 		IdleTimeout:     5 * time.Minute,
 		KeepAlivePeriod: 30 * time.Second,
 	}, db)
+	// The pool's constructor starts its keep-alive and sweep loops. Registering
+	// the release after the database cleanup means the cleanup stack runs pool
+	// first, then database: the loops are joined while the store they may touch
+	// is still open. Closing it here rather than through Dependencies is
+	// deliberate: a test may swap h.sshPool for a mock, and the pool this
+	// fixture created still owns those loops either way.
+	t.Cleanup(func() { releaseFixtureSSHPool(t, sshPool) })
 
 	vpnSvc, _ := vpn.NewVPNService(db, nil)
 
