@@ -848,17 +848,45 @@ func s4WaitReplyKind(replies *s4PeerReplies, peerKey string, proto uint8, flags 
 }
 
 // s4WaitReplyPrefix waits for a reply whose payload starts with prefix.
+//
+// The payload offset is derived from the packet, not assumed: this waiter is used for
+// both the direct TCP echo (20-byte IPv4 header + 20-byte TCP header) and the proxied
+// UDP echo (20 + 8). A fixed offset of 40 matched the TCP case only, so every UDP reply
+// - which is exactly what the proxy path carries - was invisible to it and reported as
+// a missing reply even though the echo had arrived.
 func s4WaitReplyPrefix(replies *s4PeerReplies, peerKey, prefix string, timeout time.Duration) ([]byte, bool) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		for _, pkt := range replies.packets(peerKey) {
-			if len(pkt) > 40 && strings.HasPrefix(string(pkt[40:]), prefix) {
+			if off, ok := s4PayloadOffset(pkt); ok && len(pkt) > off && strings.HasPrefix(string(pkt[off:]), prefix) {
 				return pkt, true
 			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	return nil, false
+}
+
+// s4PayloadOffset returns where a transport payload begins in an IPv4 packet, using the
+// header's own IHL and, for TCP, its data offset.
+func s4PayloadOffset(pkt []byte) (int, bool) {
+	if len(pkt) < 20 || pkt[0]>>4 != 4 {
+		return 0, false
+	}
+	l4 := int(pkt[0]&0x0f) * 4 // IPv4 header length in bytes
+	if l4 < 20 || len(pkt) < l4 {
+		return 0, false
+	}
+	switch pkt[9] {
+	case 17: // UDP: fixed 8-byte header
+		return l4 + 8, true
+	case 6: // TCP: data offset in 32-bit words
+		if len(pkt) < l4+20 {
+			return 0, false
+		}
+		return l4 + int(pkt[l4+12]>>4)*4, true
+	}
+	return 0, false
 }
 
 // s4PeerGotReply reports whether anything was delivered to a peer.
