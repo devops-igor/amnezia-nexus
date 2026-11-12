@@ -9,9 +9,33 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
+// failureCategory identifies which consecutive-failure streak a decision is
+// based on. Outer handshake failures and data-plane attachment failures are
+// different observations, so a transition may only be completed by the streak
+// that actually produced it.
+type failureCategory int
+
+const (
+	// failureOuter is a failed outer handshake probe.
+	failureOuter failureCategory = iota
+	// failureAttachment is a failed data-plane attachment (active hook) run.
+	failureAttachment
+)
+
+// failureCount returns the consecutive count for one category. Callers hold
+// hp.mu.
+func (hp *HealthProber) failureCount(serverID int64, category failureCategory) int {
+	if category == failureAttachment {
+		return hp.hookFailCounts[serverID]
+	}
+	return hp.failCounts[serverID]
+}
+
 // reconcileThresholdAutoDisable reconciles a missed threshold auto-disable CAS update
-// caused by reverse failure ordering or concurrent state updates.
-func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serverID, expectedTunnelID int64) (bool, error) {
+// caused by reverse failure ordering or concurrent state updates. category selects
+// the streak the caller's threshold decision was based on, so a reconciliation
+// cannot complete a threshold from unrelated failures.
+func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serverID, expectedTunnelID int64, category failureCategory) (bool, error) {
 	if hp.pool == nil {
 		return false, nil
 	}
@@ -28,7 +52,7 @@ func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serve
 		slog.Info("threshold auto-disable CAS missed due to concurrent admin disable", "server_id", serverID)
 		return false, hp.updateHealthIfCurrent(currentTunnel, func() {
 			delete(hp.autoDisabled, serverID)
-			hp.failCounts[serverID] = 0
+			hp.resetFailureCountsLocked(serverID)
 		})
 	}
 
@@ -51,7 +75,7 @@ func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serve
 		hp.mu.Unlock()
 		return false, err
 	}
-	count := hp.failCounts[serverID]
+	count := hp.failureCount(serverID, category)
 	threshold := hp.cfg.FailureThreshold
 	hp.mu.Unlock()
 
@@ -96,7 +120,7 @@ func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serve
 		slog.Info("threshold auto-disable reconciliation CAS missed due to concurrent admin disable", "server_id", serverID)
 		return false, hp.updateHealthIfCurrent(cur, func() {
 			delete(hp.autoDisabled, serverID)
-			hp.failCounts[serverID] = 0
+			hp.resetFailureCountsLocked(serverID)
 		})
 	}
 
@@ -116,7 +140,7 @@ func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serve
 func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models.BackendTunnel, probeErr error) (int64, error) {
 	if hp.isTunnelAdminDisabled(snapshot.ServerID) {
 		hp.mu.Lock()
-		hp.failCounts[snapshot.ServerID] = 0
+		hp.resetFailureCountsLocked(snapshot.ServerID)
 		delete(hp.autoDisabled, snapshot.ServerID)
 		hp.mu.Unlock()
 		slog.Info("probe failed but tunnel was administratively disabled; ignoring failure", "server_id", snapshot.ServerID)
@@ -223,7 +247,7 @@ func (hp *HealthProber) transitionToThresholdDisabled(ctx context.Context, snaps
 			// them. Runs outside hp.mu/pool.mu and is idempotent.
 			return hp.commitThresholdDisable(ctx, snapshot)
 		}
-		reconciled, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID, snapshot.ID)
+		reconciled, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID, snapshot.ID, failureOuter)
 		if recErr != nil {
 			return recErr
 		}
@@ -264,7 +288,7 @@ func (hp *HealthProber) transitionToDegraded(ctx context.Context, snapshot *mode
 			hp.mu.Unlock()
 			if hp.isTunnelAdminDisabled(snapshot.ServerID) {
 				return hp.updateHealthIfCurrent(snapshot, func() {
-					hp.failCounts[snapshot.ServerID] = 0
+					hp.resetFailureCountsLocked(snapshot.ServerID)
 					delete(hp.autoDisabled, snapshot.ServerID)
 				})
 			}
@@ -281,7 +305,7 @@ func (hp *HealthProber) transitionToDegraded(ctx context.Context, snapshot *mode
 func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.BackendTunnel, hookErr error) (int64, error) {
 	if errors.Is(hookErr, ErrTunnelDisabled) || errors.Is(hp.checkTunnelAvailable(snapshot), ErrTunnelDisabled) || hp.isTunnelAdminDisabled(snapshot.ServerID) {
 		hp.mu.Lock()
-		hp.failCounts[snapshot.ServerID] = 0
+		hp.resetFailureCountsLocked(snapshot.ServerID)
 		delete(hp.autoDisabled, snapshot.ServerID)
 		hp.mu.Unlock()
 		slog.Info("data-plane hook failed because tunnel was administratively disabled", "server_id", snapshot.ServerID)
@@ -292,8 +316,12 @@ func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.
 		hp.mu.Unlock()
 		return 0, err
 	}
-	hp.failCounts[snapshot.ServerID]++
-	failures := hp.failCounts[snapshot.ServerID]
+	// Attachment failures advance their own streak. Sharing the outer
+	// handshake counter here would let one unattachable device complete a
+	// threshold built from unrelated outer failures (and vice versa), which
+	// withdraws a backend whose established data path was never shown to be
+	// broken.
+	failures := hp.recordHookFailureLocked(snapshot.ServerID)
 	hp.mu.Unlock()
 
 	if failures >= hp.cfg.FailureThreshold {
@@ -318,14 +346,14 @@ func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.
 					return 0, err
 				}
 			} else {
-				reconciled, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID, snapshot.ID)
+				reconciled, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID, snapshot.ID, failureAttachment)
 				if recErr != nil {
 					return 0, recErr
 				}
 				if !reconciled {
 					hp.mu.Lock()
-					if hp.failCounts[snapshot.ServerID] > 0 {
-						hp.failCounts[snapshot.ServerID]--
+					if hp.hookFailCounts[snapshot.ServerID] > 0 {
+						hp.hookFailCounts[snapshot.ServerID]--
 					}
 					hp.mu.Unlock()
 				}
@@ -360,13 +388,13 @@ func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.
 				"expected_version", snapshot.StateVersion,
 			)
 			hp.mu.Lock()
-			if hp.failCounts[snapshot.ServerID] > 0 {
-				hp.failCounts[snapshot.ServerID]--
+			if hp.hookFailCounts[snapshot.ServerID] > 0 {
+				hp.hookFailCounts[snapshot.ServerID]--
 			}
 			hp.mu.Unlock()
 			if hp.isTunnelAdminDisabled(snapshot.ServerID) {
 				if err := hp.updateHealthIfCurrent(snapshot, func() {
-					hp.failCounts[snapshot.ServerID] = 0
+					hp.resetFailureCountsLocked(snapshot.ServerID)
 					delete(hp.autoDisabled, snapshot.ServerID)
 				}); err != nil {
 					return 0, err

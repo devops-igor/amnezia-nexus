@@ -28,7 +28,7 @@ func (hp *HealthProber) MarkAdminDisabled(serverID int64) {
 	}
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
-	hp.failCounts[serverID] = 0
+	hp.resetFailureCountsLocked(serverID)
 	delete(hp.autoDisabled, serverID)
 	delete(hp.successCounts, serverID)
 	// An administrative disable withdraws admission authority immediately: the
@@ -455,7 +455,7 @@ func (hp *HealthProber) commitSelfHealStatus(
 
 	tun.StateVersion = tunNow.StateVersion + 1
 	if err := hp.updateHealthIfCurrent(tun, func() {
-		hp.failCounts[tun.ServerID] = 0
+		hp.resetFailureCountsLocked(tun.ServerID)
 		delete(hp.autoDisabled, tun.ServerID)
 		delete(hp.successCounts, tun.ServerID)
 	}); err != nil {

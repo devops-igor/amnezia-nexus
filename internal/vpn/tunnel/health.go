@@ -77,9 +77,16 @@ type HealthProber struct {
 	onActiveHook         func(ctx context.Context, tunnel *models.BackendTunnel) error
 	onSelfHealHook       func(ctx context.Context, tunnel *models.BackendTunnel) error
 	failCounts           map[int64]int
-	canaryFailCounts     map[int64]int
-	canarySequence       uint64
-	canaryResults        map[int64]canaryResult
+	// hookFailCounts counts consecutive data-plane ATTACHMENT failures for a
+	// backend, independently of failCounts (outer handshake failures). The two
+	// observations are about different things, so neither may complete the
+	// other's consecutive threshold: one attachment failure after a long outer
+	// outage used to reach FailureThreshold immediately and withdraw a backend
+	// whose established data path had never been shown to be broken.
+	hookFailCounts   map[int64]int
+	canaryFailCounts map[int64]int
+	canarySequence   uint64
+	canaryResults    map[int64]canaryResult
 	// canarySuccesses records the last accepted inner success per server, bound
 	// to the tunnel generation and the backend device that produced it. It is
 	// the evidence a NEW admission onto a handshake-blocked backend needs; the
@@ -171,6 +178,7 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 		probeNaiveFn:      naive.ProbeNaiveProxy,
 		devices:           make(map[int64]PacketDevice),
 		failCounts:        make(map[int64]int),
+		hookFailCounts:    make(map[int64]int),
 		canaryFailCounts:  make(map[int64]int),
 		autoDisabled:      make(map[int64]bool),
 		successCounts:     make(map[int64]int),
@@ -282,7 +290,7 @@ func (hp *HealthProber) ResetFailCount(serverID int64) {
 	}
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
-	hp.failCounts[serverID] = 0
+	hp.resetFailureCountsLocked(serverID)
 	delete(hp.canaryFailCounts, serverID)
 	delete(hp.canaryResults, serverID)
 	delete(hp.canarySuccesses, serverID)
@@ -300,6 +308,38 @@ func (hp *HealthProber) GetFailCount(serverID int64) int {
 	hp.mu.RLock()
 	defer hp.mu.RUnlock()
 	return hp.failCounts[serverID]
+}
+
+// resetFailureCountsLocked clears every consecutive-failure category for a
+// backend. Callers hold hp.mu.
+//
+// Both categories are cleared together on purpose: a successful observation of
+// either kind (a completed outer handshake or a successful attachment) ends the
+// streak for the backend as a whole, and keeping the two in step here means no
+// future reset site can silently leave one category primed to combine with the
+// other later.
+func (hp *HealthProber) resetFailureCountsLocked(serverID int64) {
+	hp.failCounts[serverID] = 0
+	hp.hookFailCounts[serverID] = 0
+}
+
+// recordHookFailureLocked increments the consecutive data-plane attachment
+// failure count and returns it. This is a separate category from
+// failCounts (outer handshake failures), so it can only ever be completed by
+// further attachment failures. Callers hold hp.mu.
+func (hp *HealthProber) recordHookFailureLocked(serverID int64) int {
+	if hp.hookFailCounts == nil {
+		hp.hookFailCounts = make(map[int64]int)
+	}
+	hp.hookFailCounts[serverID]++
+	return hp.hookFailCounts[serverID]
+}
+
+// hookFailures returns the consecutive attachment-failure count for a server.
+func (hp *HealthProber) hookFailures(serverID int64) int {
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	return hp.hookFailCounts[serverID]
 }
 
 // GetCanaryFailCount returns the consecutive data-plane canary failure count for the given server ID.
@@ -328,7 +368,7 @@ func (hp *HealthProber) recordCurrentGenerationLocked(serverID int64) {
 		return
 	}
 	if previous := hp.healthGenerations[serverID]; previous != 0 && previous != current.ID {
-		hp.failCounts[serverID] = 0
+		hp.resetFailureCountsLocked(serverID)
 		delete(hp.autoDisabled, serverID)
 		delete(hp.successCounts, serverID)
 	}
@@ -351,7 +391,7 @@ func (hp *HealthProber) checkHealthGenerationLocked(t *models.BackendTunnel) err
 		}
 	}
 	if previous := hp.healthGenerations[t.ServerID]; previous != 0 && previous != t.ID {
-		hp.failCounts[t.ServerID] = 0
+		hp.resetFailureCountsLocked(t.ServerID)
 		delete(hp.autoDisabled, t.ServerID)
 		delete(hp.successCounts, t.ServerID)
 	}
@@ -556,7 +596,9 @@ func (hp *HealthProber) commitActiveProbeSuccess(ctx context.Context, snapshot, 
 		hp.mu.Unlock()
 		return err
 	}
-	hp.failCounts[probeTarget.ServerID] = 0
+	// A completed outer handshake (and, above, a successful attachment) ends the
+	// failure streak for this backend in every category.
+	hp.resetFailureCountsLocked(probeTarget.ServerID)
 
 	delete(hp.autoDisabled, probeTarget.ServerID)
 	delete(hp.successCounts, probeTarget.ServerID)
