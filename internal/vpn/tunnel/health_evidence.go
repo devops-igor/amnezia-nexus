@@ -234,22 +234,6 @@ func (hp *HealthProber) recordFailureStreak(t *models.BackendTunnel, category Fa
 	rec.failureThreshold = threshold
 }
 
-// recordInnerEvidenceSuccess records that confirmed inner evidence was accepted
-// for t and the device attached at that moment.
-func (hp *HealthProber) recordInnerEvidenceSuccess(t *models.BackendTunnel, deviceCreated time.Time) {
-	if hp == nil || t == nil {
-		return
-	}
-	hp.mu.Lock()
-	defer hp.mu.Unlock()
-	rec := hp.gateRecordLocked(t)
-	rec.lastSuccessAt = hp.now()
-	rec.lastSuccessDevice = deviceCreated
-	if !deviceCreated.IsZero() {
-		rec.deviceCreatedAt = deviceCreated
-	}
-}
-
 // recordGate records the condition currently deciding eligibility for t.
 func (hp *HealthProber) recordGate(t *models.BackendTunnel, gate TransitionGate, deviceCreated time.Time) {
 	if hp == nil || t == nil {
@@ -298,18 +282,9 @@ func (hp *HealthProber) TransitionEvidenceFor(t *models.BackendTunnel) (Transiti
 		ev.Gate = GateNone
 	}
 	ev.LastAttemptOutcome = attemptOutcome(rec.lastAttemptOuter, rec.lastAttemptInner)
-	if !rec.lastAttemptAt.IsZero() {
-		at := rec.lastAttemptAt
-		ev.LastAttemptAt = &at
-	}
-	if !rec.lastSuccessAt.IsZero() {
-		at := rec.lastSuccessAt
-		ev.LastSuccessAt = &at
-	}
-	if !rec.deviceCreatedAt.IsZero() {
-		at := rec.deviceCreatedAt
-		ev.DeviceCreatedAt = &at
-	}
+	ev.LastAttemptAt = timePtr(rec.lastAttemptAt)
+	ev.LastSuccessAt = timePtr(rec.lastSuccessAt)
+	ev.DeviceCreatedAt = timePtr(rec.deviceCreatedAt)
 
 	if !rec.lastSuccessAt.IsZero() {
 		ev.SuccessFreshness = hp.classifyEvidenceLocked(rec, t)
@@ -320,19 +295,45 @@ func (hp *HealthProber) TransitionEvidenceFor(t *models.BackendTunnel) (Transiti
 	return ev, true
 }
 
+// timePtr returns a pointer to a copy of at, or nil for the zero time, so an
+// absent observation serializes as absent instead of as a zero timestamp.
+func timePtr(at time.Time) *time.Time {
+	if at.IsZero() {
+		return nil
+	}
+	cp := at
+	return &cp
+}
+
 // attemptOutcome reduces the two independent observations of one attempt to the
 // single headline outcome a surface can show, without hiding which half failed.
+//
+// The reduction is a table rather than a comparison chain because the four
+// outcomes combine into a small closed set: an attempt succeeds only when its
+// affirmative observation was taken and nothing contradicted it, fails when
+// either half failed, and is otherwise "not established" - which is deliberately
+// distinct from both success and failure.
 func attemptOutcome(outer, inner AttemptOutcome) AttemptOutcome {
-	switch {
-	case outer == OutcomeSuccess && (inner == OutcomeSuccess || inner == OutcomeNotRun):
-		return OutcomeSuccess
-	case outer == OutcomeFailure || inner == OutcomeFailure:
-		return OutcomeFailure
-	case outer == OutcomeNotRun && inner == OutcomeNotRun:
-		return OutcomeNotRun
-	case outer == OutcomeUnknown && inner == OutcomeUnknown:
+	switch outer {
+	case OutcomeSuccess:
+		if inner == OutcomeSuccess || inner == OutcomeNotRun {
+			return OutcomeSuccess
+		}
+		if inner == OutcomeFailure {
+			return OutcomeFailure
+		}
 		return OutcomeUnknown
+	case OutcomeFailure:
+		return OutcomeFailure
+	case OutcomeNotRun:
+		if inner == OutcomeFailure {
+			return OutcomeFailure
+		}
+		return OutcomeNotRun
 	default:
+		if inner == OutcomeFailure {
+			return OutcomeFailure
+		}
 		return OutcomeUnknown
 	}
 }

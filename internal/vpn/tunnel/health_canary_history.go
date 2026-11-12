@@ -97,39 +97,45 @@ func (hp *HealthProber) acceptCanaryObservation(t *models.BackendTunnel, sequenc
 	}
 	hp.canaryResults[t.ServerID] = canaryResult{tunnelID: t.ID, sequence: sequence}
 
-	// Mirror the ACCEPTED verdict into the sanitized transition record, so the
-	// last confirmed inner success and its failure streak are readable without
-	// re-deriving them. This runs inside the same critical section as the
-	// authoritative history write: a rejected (obsolete) observation never
-	// reaches here, so the diagnostic can never claim evidence the decision layer
-	// refused.
-	//
-	// Only the INNER half is written here. The outer half belongs to the probe
-	// path that produced it, and overwriting it with the inner verdict would erase
-	// the outer failure streak an operator needs to see.
+	// Mirror the ACCEPTED verdict into the sanitized transition record. This runs
+	// inside the same critical section as the authoritative history write: a
+	// rejected (obsolete) observation never reaches here, so the diagnostic can
+	// never claim evidence the decision layer refused.
+	hp.mirrorInnerVerdictLocked(t, success, deviceCreated)
+	return nil
+}
+
+// mirrorInnerVerdictLocked records an ACCEPTED inner verdict in the sanitized
+// transition record. Callers hold hp.mu.
+//
+// Only the INNER half is written here. The outer half belongs to the probe path
+// that produced it, and overwriting it with the inner verdict would erase the
+// outer failure streak an operator needs to see. In the same spirit an inner
+// result never relabels an outer or attachment streak: each category is reported
+// as itself.
+func (hp *HealthProber) mirrorInnerVerdictLocked(t *models.BackendTunnel, success bool, deviceCreated time.Time) {
 	rec := hp.gateRecordLocked(t)
 	rec.lastAttemptInner = attemptOutcomeFor(success)
+	streakOwnedByInner := rec.failureCategory == FailureNone || rec.failureCategory == FailureInner
+
 	if success {
 		rec.lastSuccessAt = hp.now()
 		rec.lastSuccessDevice = deviceCreated
 		if !deviceCreated.IsZero() {
 			rec.deviceCreatedAt = deviceCreated
 		}
-		if rec.failureCategory == FailureNone || rec.failureCategory == FailureInner {
+		if streakOwnedByInner {
 			rec.failureCategory = FailureNone
 			rec.failureCount = 0
 			rec.failureThreshold = hp.cfg.FailureThreshold
 		}
-	} else {
-		// An inner failure is its own category only when it is the streak being
-		// reported; an outer failure streak must not be relabelled by it.
-		if rec.failureCategory != FailureOuter && rec.failureCategory != FailureAttachment {
-			rec.failureCategory = FailureInner
-			rec.failureCount = hp.canaryFailCounts[t.ServerID]
-			rec.failureThreshold = hp.cfg.FailureThreshold
-		}
+		return
 	}
-	return nil
+	if streakOwnedByInner {
+		rec.failureCategory = FailureInner
+		rec.failureCount = hp.canaryFailCounts[t.ServerID]
+		rec.failureThreshold = hp.cfg.FailureThreshold
+	}
 }
 
 // attemptOutcomeFor maps an accepted canary verdict onto the sanitized attempt
