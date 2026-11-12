@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -477,10 +478,51 @@ func s4ClaimLaunchRecord(path string) error {
 	return nil
 }
 
+// s4OwnedAdmission is this PROCESS's one-time admission result.
+//
+// Admission and re-checking are different questions and must not share one call:
+//
+//   - admitting a process proves, once, that the launcher's record is this process's
+//     own and that unshare moved it. That is when the single-use record is consumed, so
+//     another process cannot replay it.
+//   - every later check in the SAME process only has to confirm the process is still in
+//     the namespace it was admitted into. Re-reading the record there would fail for the
+//     correct reason the first call consumed it, which made a legitimate
+//     init -> setup -> live-refusal sequence impossible.
+type s4OwnedAdmission struct {
+	mu         sync.Mutex
+	launcherNS string // non-empty once this process has been admitted
+}
+
+var s4Owned = s4OwnedAdmission{}
+
 // s4RequireOwnedNamespace reports nil only when this process provably runs inside the
-// network namespace its own launcher created for it. It performs no writes, so calling
-// it is always safe; it must be called BEFORE any kernel-setting mutation.
+// network namespace its own launcher created for it.
+//
+// It is safe and cheap to call before every kernel-setting mutation: the first call
+// admits the process and consumes the launch record; subsequent calls in the same
+// process re-verify namespace identity without needing the consumed record. A different
+// process, a replayed record, a forged token or the launcher's own namespace is still
+// refused.
 func s4RequireOwnedNamespace() error {
+	own, err := s4NetNSInode()
+	if err != nil {
+		return err
+	}
+
+	s4Owned.mu.Lock()
+	defer s4Owned.mu.Unlock()
+
+	// Already admitted: re-check identity only. No record is needed, and asking for one
+	// would make a legitimate repeated check fail after the first consumed it.
+	if s4Owned.launcherNS != "" {
+		if own == s4Owned.launcherNS {
+			return fmt.Errorf("this process left its private namespace (%s) for the launching one, so it no longer owns it", own)
+		}
+		return nil
+	}
+
+	// First call in this process: perform admission.
 	recordPath := os.Getenv(s4LaunchRecordEnv)
 	token := os.Getenv(s4LaunchTokenEnv)
 	if recordPath == "" || token == "" {
@@ -494,20 +536,27 @@ func s4RequireOwnedNamespace() error {
 	if rec.Token != token {
 		return errors.New("launch record token does not match this process's token; refusing to treat an inherited or forged marker as ownership")
 	}
-	own, err := s4NetNSInode()
-	if err != nil {
-		return err
-	}
 	// The inequality is the proof: unshare moved us into a different namespace than the
 	// one the launcher recorded. An inherited marker in the original namespace matches
 	// the launcher's identity and is refused here.
 	if own == rec.LauncherNetNS {
 		return fmt.Errorf("this process is still in the launching namespace (%s), so it does not own a private network namespace", own)
 	}
+	// Consume the record only now, once the process is actually being admitted, so a
+	// refusal above leaves it available for the legitimate child.
 	if err := s4ClaimLaunchRecord(recordPath); err != nil {
 		return err
 	}
+	s4Owned.launcherNS = rec.LauncherNetNS
 	return nil
+}
+
+// s4ResetOwnedAdmissionForTest clears this process's admission, so a control can model a
+// DIFFERENT process (which has no admission and must present its own record).
+func s4ResetOwnedAdmissionForTest() {
+	s4Owned.mu.Lock()
+	defer s4Owned.mu.Unlock()
+	s4Owned.launcherNS = ""
 }
 
 // s4WriteLaunchRecord is the launcher half: it records its own namespace identity and a
