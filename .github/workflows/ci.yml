@@ -264,6 +264,24 @@ jobs:
             bash -euo pipefail -c '
               mount -t tmpfs tmpfs /run || { echo "isolation: cannot mount private /run" >&2; exit 1; }
               mkdir -p /run/netns
+              # Read-only observation of the boundary the inner launch uses: exec of
+              # this binary inside `unshare -Urn --map-root-user`. A failed run cannot
+              # show why it failed, so record the facts instead of guessing them.
+              # Every path component mode and owner, the mount options, the kernel,
+              # the AppArmor unprivileged-userns policy, and the uid map and capability
+              # set the inner process actually gets. One system binary (/bin/true) is
+              # executed there as a comparison: it is root-owned and so mapped, while
+              # this binary lives on a runner-owned path the real launch below still
+              # attempts. Nothing is written, no privilege is added, and every command
+              # tolerates failure so `-e` cannot abort the launch: the step verdict
+              # stays the test-binary exit status and its output.
+              echo "diag: kernel $(uname -r)" >&2
+              echo "diag: outer uid=$(id -u)" >&2
+              echo "diag: apparmor_restrict_unprivileged_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo unreadable)" >&2
+              stat -Lc "diag: binary mode=%a uid=%u gid=%g" "$RUNNER_TEMP/vpn-wan.test" >&2 || echo "diag: binary stat failed" >&2
+              namei -l "$RUNNER_TEMP/vpn-wan.test" >&2 || echo "diag: binary namei failed" >&2
+              findmnt -no TARGET,OPTIONS -T "$RUNNER_TEMP/vpn-wan.test" >&2 || echo "diag: findmnt reported no mount" >&2
+              unshare -Urn --map-root-user sh -c "id -u; grep ^CapEff /proc/self/status; cat /proc/self/uid_map; /bin/true && echo diag-inner-true-ok || echo diag-inner-true-denied" >&2 || echo "diag-inner: user namespace or sh launch refused" >&2
               exec "$RUNNER_TEMP/vpn-wan.test" \
                 -test.v -test.timeout=12m \
                 -test.run "^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath)$"
