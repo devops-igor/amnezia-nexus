@@ -237,23 +237,33 @@ func decideBoundTrust(bound, confirmed string) *installPause {
 // finishInstall performs enablement and admission for a server whose protocol
 // installation is already proven, then records the terminal success.
 //
-// Admission is the last boundary and it is checked separately from enablement on
-// purpose. Enablement is a completed effect by the time it returns - the backend
-// exists and was qualified - and a policy that turned off during it must not undo
-// that. What the panel still controls at this point is whether it records the job as
-// finished, so a refusal here leaves the truthful journal in place: the phases that
-// really completed stay recorded, and the job stops with a reason instead of claiming
-// a success that a disabled policy did not authorize.
+// Promotion is the terminal authorization boundary. That is a deliberate decision, and
+// it is the one the owner finding required be made explicit rather than left implicit.
+//
+// The automation policy is asked immediately BEFORE the promotion commit - in
+// qualifyBackendTraffic (gigahost_deploy.go) and qualifyProxyBackendTraffic
+// (gigahost_deploy_qualify.go) - and a refusal there quarantines the enrollment, so a
+// backend is never promoted by a policy that had already been withdrawn. That gate is
+// the healthy-admission check the recorded lifecycle decision requires.
+//
+// Asking again here, after the commit, could not withhold anything: the backend is
+// already active and selectable, and undoing it would mean rolling back a completed
+// effect, which the same lifecycle decision forbids. The only thing a second refusal
+// could produce is a durable row that says the job never admitted a backend while the
+// production pool selects it - exactly the inconsistency that was reported. So this
+// function records what actually happened instead of narrating a refusal that did not
+// and could not take place.
+//
+// installEnableStep returns nil only when the phase is genuinely complete: either it was
+// already proven done, or enablement plus traffic qualification succeeded and the phase
+// was journalled. Every other outcome pauses or errors there, so reaching the admission
+// below means the backend really is admitted.
 func (h *Handlers) finishInstall(
 	ctx context.Context, req GigahostDeployRequest, server *models.Server,
 	plan installPlan, journal *gigahostsetup.InstallJournal,
 ) error {
 	if err := h.installEnableStep(ctx, req, server, plan, journal); err != nil {
 		return err
-	}
-	if pause := h.refuseAutomaticEffect(ctx, journal.Intent(), boundaryHealthyAdmission); pause != nil {
-		journal.Pause(ctx, pause.step, errors.New(pause.detail))
-		return nil
 	}
 	if err := journal.Admit(ctx, "ready", server.ID); err != nil {
 		return err
