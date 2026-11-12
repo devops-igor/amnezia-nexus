@@ -127,9 +127,7 @@ jobs:
       - name: Run Tests with Race Detector
         run: |
           go test -race -cover -count=1 -coverprofile=coverage.out \
-            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath)$' ./...
-          go test -race -count=1 \
-            -skip '^TestLinuxE2E_DirectEgress$' ./internal/vpn/forwarder/
+            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress)$' ./...
 
       - name: Run Authentic Native Caddy Integration Tests
         run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
