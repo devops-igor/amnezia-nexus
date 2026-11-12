@@ -41,20 +41,43 @@ func TestProductionWANDevice_UnprivilegedRefusal(t *testing.T) {
 	t.Logf("constructor refused a non-root process with: %v", err)
 }
 
+// s4OwnedNamespaceChildEnv marks a child that the lifecycle test launched into its own
+// namespace, so the child runs the assertions instead of launching again.
+const s4OwnedNamespaceChildEnv = "NEXUS_S4_LIFECYCLE_CHILD"
+
 // TestProductionWANDevice_PermissionsAndLifecycle verifies the TUN ioctl lifecycle
 // against a real device.
 //
-// It runs INSIDE the private user+network namespace that the S4 qualification owns,
-// so the settings it depends on (rp_filter, accept_local, forwarding) are the ones
-// that namespace configures rather than whatever the runner's host happens to carry.
-// Outside that namespace the test cannot prove the lifecycle, and it says so instead
-// of silently passing on a host that happens to be configured conveniently.
+// It cannot do that in the runner's host namespace: NewProductionWANDevice refuses an
+// effective rp_filter it cannot prove is 0, and the host's value belongs to the operator.
+// So the parent re-launches this binary inside a namespace the run owns and lets the
+// child execute the assertions there. A plain `go test` invocation of this test therefore
+// still does the right thing on its own, which is what makes it safe to select from a
+// command line without any external wrapper.
 func TestProductionWANDevice_PermissionsAndLifecycle(t *testing.T) {
-	if err := s4RequireOwnedNamespace(); err != nil {
-		if s4RequiredEnvironment() {
-			t.Fatalf("TUN lifecycle qualification needs its own network namespace and this required run does not have one: %v", err)
+	if os.Getenv(s4OwnedNamespaceChildEnv) != "1" {
+		out, err := s4LaunchInOwnedNamespace("^"+t.Name()+"$", []string{s4OwnedNamespaceChildEnv + "=1"})
+		if err != nil {
+			if s4RequiredEnvironment() {
+				t.Fatalf("the TUN lifecycle qualification could not run inside a run-owned namespace, so it is unproven: %v\n%s", err, out)
+			}
+			t.Skipf("skipping: cannot create an owned namespace here: %v", err)
 		}
-		t.Skipf("skipping TUN lifecycle assertions outside the owned namespace: %v", err)
+		if !strings.Contains(out, "--- PASS") || strings.Contains(out, "--- SKIP") {
+			t.Fatalf("the lifecycle assertions did not run and pass inside the owned namespace:\n%s", out)
+		}
+		t.Logf("lifecycle assertions passed inside the owned namespace:\n%s", out)
+		return
+	}
+
+	// Child body: running in the namespace the parent created for this run.
+	if err := s4RequireOwnedNamespace(); err != nil {
+		t.Fatalf("child was selected without a run-owned namespace: %v", err)
+	}
+	// Initial setup is itself a guarded write path, so the child configures the settings
+	// NewProductionWANDevice requires rather than inheriting whatever the parent had.
+	if err := configurePrivateNamespaceSetup(); err != nil {
+		t.Fatalf("configure owned namespace: %v", err)
 	}
 
 	dev, err := NewProductionWANDevice("nexus-wan-test")

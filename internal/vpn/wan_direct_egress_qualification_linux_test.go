@@ -81,29 +81,152 @@ func s4RequiredEnvironment() bool {
 	return os.Getenv("GITHUB_ACTIONS") != "" || os.Getenv("CI") != ""
 }
 
-// TestS4OwnedNamespaceGuard pins the marker that decides whether this process may
-// configure kernel settings. It is pure: it sets environment variables only, so it
-// proves the guard in both directions without creating a namespace or touching a
-// kernel setting.
+// TestS4OwnedNamespaceGuard pins the identity proof that decides whether this process
+// may configure kernel settings.
+//
+// It is pure and offline: it supplies synthetic namespace identities through
+// s4NetNSInode and a recording command boundary through s4RunCommand, so it proves both
+// directions — refusal and acceptance — and proves that a refused path executed NO
+// command, without creating a namespace or touching a kernel setting.
 func TestS4OwnedNamespaceGuard(t *testing.T) {
-	t.Run("unset refuses", func(t *testing.T) {
-		t.Setenv(s4OwnedNamespaceEnv, "")
+	const (
+		launcherNS = "net:[4026531840]" // the namespace the launcher recorded
+		childNS    = "net:[4026532999]" // a different namespace: unshare moved us
+	)
+
+	// recordFor writes a launch record and returns its path plus a matching env.
+	recordFor := func(t *testing.T, launcherIdentity string) (string, []string) {
+		t.Helper()
+		dir := t.TempDir()
+		path := filepath.Join(dir, "launch.json")
+		token := "tok-" + strings.ReplaceAll(t.Name(), "/", "-")
+		rec := `{"token":"` + token + `","launcher_netns":"` + launcherIdentity + `"}`
+		if err := os.WriteFile(path, []byte(rec), 0o600); err != nil {
+			t.Fatalf("write launch record: %v", err)
+		}
+		return path, []string{s4LaunchRecordEnv + "=" + path, s4LaunchTokenEnv + "=" + token}
+	}
+
+	// instrument records every command a path attempts, so "no command ran" is provable.
+	instrument := func(t *testing.T) *[]string {
+		t.Helper()
+		var ran []string
+		prev := s4RunCommand
+		s4RunCommand = func(name string, args ...string) (string, error) {
+			ran = append(ran, strings.Join(append([]string{name}, args...), " "))
+			return "", nil
+		}
+		t.Cleanup(func() { s4RunCommand = prev })
+		return &ran
+	}
+
+	withInode := func(t *testing.T, identity string) {
+		t.Helper()
+		prev := s4NetNSInode
+		s4NetNSInode = func() (string, error) { return identity, nil }
+		t.Cleanup(func() { s4NetNSInode = prev })
+	}
+
+	clearLaunchEnv := func(t *testing.T) {
+		t.Helper()
+		t.Setenv(s4LaunchRecordEnv, "")
+		t.Setenv(s4LaunchTokenEnv, "")
+	}
+
+	t.Run("no launch environment refuses", func(t *testing.T) {
+		clearLaunchEnv(t)
+		withInode(t, childNS)
+		ran := instrument(t)
 		if err := s4RequireOwnedNamespace(); err == nil {
-			t.Fatal("the guard accepted a process that does not own a namespace")
+			t.Fatal("the guard accepted a process with no launch record")
+		}
+		if len(*ran) != 0 {
+			t.Fatalf("the guard ran commands while refusing: %v", *ran)
 		}
 	})
-	t.Run("set accepts", func(t *testing.T) {
-		t.Setenv(s4OwnedNamespaceEnv, "1")
+
+	t.Run("inherited marker in the launcher namespace refuses", func(t *testing.T) {
+		// The reported defect: the child is in the SAME namespace as the launcher, so an
+		// inherited/forged marker must not authorize writes against that host.
+		path, env := recordFor(t, launcherNS)
+		for _, kv := range env {
+			parts := strings.SplitN(kv, "=", 2)
+			t.Setenv(parts[0], parts[1])
+		}
+		withInode(t, launcherNS)
+		ran := instrument(t)
+		if err := s4RequireOwnedNamespace(); err == nil {
+			t.Fatal("the guard accepted a process still in the launching namespace")
+		}
+		if len(*ran) != 0 {
+			t.Fatalf("the guard ran commands while refusing: %v", *ran)
+		}
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("a refused claim consumed the launch record: %v", statErr)
+		}
+	})
+
+	t.Run("mismatched token refuses", func(t *testing.T) {
+		path, _ := recordFor(t, launcherNS)
+		t.Setenv(s4LaunchRecordEnv, path)
+		t.Setenv(s4LaunchTokenEnv, "different-token")
+		withInode(t, childNS)
+		if err := s4RequireOwnedNamespace(); err == nil {
+			t.Fatal("the guard accepted a record whose token does not match")
+		}
+	})
+
+	t.Run("launcher identity accepted in a child namespace", func(t *testing.T) {
+		path, env := recordFor(t, launcherNS)
+		for _, kv := range env {
+			parts := strings.SplitN(kv, "=", 2)
+			t.Setenv(parts[0], parts[1])
+		}
+		withInode(t, childNS)
 		if err := s4RequireOwnedNamespace(); err != nil {
-			t.Fatalf("the guard rejected a process that owns its namespace: %v", err)
+			t.Fatalf("the guard rejected a genuine child namespace: %v", err)
+		}
+		// Single use: the same record must not authorize a second process.
+		if err := s4RequireOwnedNamespace(); err == nil {
+			t.Fatal("the launch record authorized a second claim")
+		}
+		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+			t.Fatalf("the claimed record should be gone, stat error: %v", statErr)
 		}
 	})
-	t.Run("live refusal refuses outside an owned namespace", func(t *testing.T) {
-		t.Setenv(s4OwnedNamespaceEnv, "")
-		// This must refuse BEFORE writing any sysctl: outside an owned namespace the
-		// writes would reconfigure the host running the gate.
+
+	t.Run("stale record path refuses", func(t *testing.T) {
+		t.Setenv(s4LaunchRecordEnv, filepath.Join(t.TempDir(), "absent.json"))
+		t.Setenv(s4LaunchTokenEnv, "tok")
+		withInode(t, childNS)
+		if err := s4RequireOwnedNamespace(); err == nil {
+			t.Fatal("the guard accepted a missing launch record")
+		}
+	})
+
+	// The two mutation entry points must refuse BEFORE their first write, which is the
+	// property the reported defect was missing.
+	t.Run("initial setup refuses without running a command", func(t *testing.T) {
+		clearLaunchEnv(t)
+		withInode(t, launcherNS)
+		ran := instrument(t)
+		if err := configurePrivateNamespaceSetup(); err == nil {
+			t.Fatal("initial setup configured sysctls without an owned namespace")
+		}
+		if len(*ran) != 0 {
+			t.Fatalf("initial setup ran commands while refusing: %v", *ran)
+		}
+	})
+
+	t.Run("live refusal refuses without running a command", func(t *testing.T) {
+		clearLaunchEnv(t)
+		withInode(t, launcherNS)
+		ran := instrument(t)
 		if err := s4AssertLiveIncompatibleConfigRefused(); err == nil {
-			t.Fatal("the live refusal wrote sysctls in a process that owns no namespace")
+			t.Fatal("the live refusal proceeded without an owned namespace")
+		}
+		if len(*ran) != 0 {
+			t.Fatalf("the live refusal ran commands while refusing: %v", *ran)
 		}
 	})
 }
@@ -174,6 +297,13 @@ func init() {
 	if os.Getenv(s4ProbeEnv) == "" {
 		return
 	}
+	// The probe body is selected by an environment variable, so it can be reached from an
+	// inherited environment. It proves it was launched into a run-owned namespace before
+	// configuring anything, and fails closed without side effects otherwise.
+	if err := s4RequireOwnedNamespace(); err != nil {
+		fmt.Printf("S4 RESULT: FAIL: probe refuses to run without a run-owned namespace: %v\n", err)
+		os.Exit(1)
+	}
 	os.Exit(runS4QualificationBody())
 }
 
@@ -186,17 +316,50 @@ func init() {
 // If the namespace cannot be created, the caller decides whether that is a failure
 // or a skip — in required CI it is a FAILURE, never a silent pass.
 func runS4QualificationProbe() (string, error) {
+	return s4LaunchInOwnedNamespace("^$", []string{s4ProbeEnv + "=1"})
+}
+
+// s4LaunchInOwnedNamespace starts this test binary inside a freshly created private
+// user+network namespace and returns its combined output.
+//
+// It is the only launcher: the S4 body and any selected test both run through it, so
+// every test that needs the fixture's kernel settings gets a namespace it provably owns
+// rather than the runner's host. testRunPattern selects what the child executes (`^$`
+// for none, i.e. only the probe init runs).
+//
+// A launch record proves the child moved: see the ownership-identity note in the fixture
+// file. If `unshare` cannot create the namespace the child never executes, and the error
+// carries that fact so the caller can fail closed.
+func s4LaunchInOwnedNamespace(testRunPattern string, extraEnv []string) (string, error) {
+	recordPath := filepath.Join(os.TempDir(), fmt.Sprintf("nexus-s4-launch-%d-%s.json", os.Getpid(), mustShortToken()))
+	recordEnv, err := s4WriteLaunchRecord(recordPath)
+	if err != nil {
+		return "", fmt.Errorf("prepare launch record: %w", err)
+	}
+	// Always remove the record: a leftover would be a reusable authorization.
+	defer func() { _ = os.Remove(recordPath); _ = os.Remove(recordPath + ".claimed") }()
+
 	// #nosec G204 -- os.Args[0] is this test binary; the namespace flags are literals
-	cmd := exec.Command("unshare", "-Urn", "--map-root-user", os.Args[0], "-test.run=^$")
-	// The owned-namespace marker is set by the parent that creates the namespace, so a
-	// test running inside it can prove it owns the kernel settings it configures. It is
-	// set here, not inside the child, because only the parent knows unshare succeeded.
-	cmd.Env = append(os.Environ(), s4ProbeEnv+"=1", s4OwnedNamespaceEnv+"=1")
+	cmd := exec.Command("unshare", "-Urn", "--map-root-user", os.Args[0], "-test.run="+testRunPattern)
+	cmd.Env = append(append(os.Environ(), recordEnv...), extraEnv...)
 	out, err := cmd.CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "S4 RESULT:") {
+	if err != nil && !strings.Contains(string(out), "S4 RESULT:") && !strings.Contains(string(out), "--- ") {
 		return string(out), fmt.Errorf("probe could not run (namespace setup): %w", err)
 	}
 	return string(out), nil
+}
+
+// mustShortToken returns a short random suffix for a record filename. A collision is
+// resolved by the write failing, not by silently reusing another run's record.
+func mustShortToken() string {
+	token, err := s4NewLaunchToken()
+	if err != nil {
+		return "fallback"
+	}
+	if len(token) > 12 {
+		return token[:12]
+	}
+	return token
 }
 
 // runS4QualificationBody is the qualification run as a re-executed process inside the
@@ -217,6 +380,12 @@ func runS4QualificationBody() int {
 // re-executed probe (s4ProbeEnv), which by construction owns a throwaway namespace
 // that vanishes with the process; it never runs against a deployment or the host.
 func configurePrivateNamespaceSetup() error {
+	// This is the normal initial-setup write path, and it is the one that must never
+	// run against a host. It proves ownership FIRST, before the first sysctl, so an
+	// inherited marker or a forged record cannot turn startup into a host mutation.
+	if err := s4RequireOwnedNamespace(); err != nil {
+		return fmt.Errorf("refusing to configure kernel settings: %w", err)
+	}
 	for _, setting := range []struct{ key, value string }{
 		{"net.ipv4.ip_forward", "1"},
 		{"net.ipv4.conf.all.rp_filter", "0"},

@@ -3,6 +3,9 @@
 package vpn
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -71,6 +74,14 @@ func init() {
 	if role == "" {
 		return
 	}
+	// This entry point is reachable from an inherited environment, so it proves it was
+	// launched into a run-owned namespace before doing anything else. A participant that
+	// cannot prove that must not move links, write sysctls or open listeners: it exits
+	// non-zero without side effects, and the launcher's handshake fails closed.
+	if err := s4RequireOwnedNamespace(); err != nil {
+		fmt.Fprintf(os.Stderr, "RESULT: FAIL: participant refuses to run without a run-owned namespace: %v\n", err)
+		os.Exit(1)
+	}
 	os.Exit(runS4Participant(role))
 }
 
@@ -135,10 +146,22 @@ func (f *s4Fixture) Close() {
 }
 
 // startS4Peer launches the nested namespace and waits for its pid handshake.
+//
+// The peer gets its OWN launch record: the parent here is the S4 child, and the peer
+// must prove it moved into a fresh namespace relative to that parent, exactly as the
+// child proved it moved relative to the launcher. Without this the guarded participant
+// init would (correctly) refuse to run.
 func startS4Peer() (*s4Peer, error) {
+	recordPath := filepath.Join(os.TempDir(), fmt.Sprintf("nexus-s4-peer-%d-%s.json", os.Getpid(), mustShortToken()))
+	recordEnv, err := s4WriteLaunchRecord(recordPath)
+	if err != nil {
+		return nil, fmt.Errorf("prepare peer launch record: %w", err)
+	}
+	defer func() { _ = os.Remove(recordPath); _ = os.Remove(recordPath + ".claimed") }()
+
 	// #nosec G204 -- os.Args[0] is this test binary and "unshare -n" takes no input
 	cmd := exec.Command("unshare", "-n", os.Args[0], "-test.run=^$")
-	cmd.Env = append(os.Environ(), s4QualificationEnv+"="+s4RolePeer)
+	cmd.Env = append(append(os.Environ(), s4QualificationEnv+"="+s4RolePeer), recordEnv...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("peer stdout pipe: %w", err)
@@ -306,6 +329,13 @@ func s4WaitForLink(name string, timeout time.Duration) error {
 
 // s4Command runs a fixed fixture command and returns its combined output.
 func s4Command(name string, args ...string) (string, error) {
+	return s4RunCommand(name, args...)
+}
+
+// s4RunCommand is the injectable command boundary. Production code in this fixture
+// calls s4Command; offline controls replace this variable with a recorder so they can
+// prove that a refused path executed NO command, without running anything.
+var s4RunCommand = func(name string, args ...string) (string, error) {
 	// #nosec G204 -- callers pass literal topology commands from this fixture only
 	cmd := exec.Command(name, args...)
 	out, err := cmd.CombinedOutput()
@@ -371,20 +401,144 @@ func s4AssertDocumentedConfigRejected() error {
 	return nil
 }
 
-// s4OwnedNamespaceEnv marks a process that is running inside the private namespace
-// the S4 qualification created for itself. A test that needs to configure kernel
-// settings (rp_filter, accept_local, forwarding) must only do so under this marker,
-// because only that process owns a throwaway network stack; anything else would be
-// mutating the runner's or the operator's host.
-const s4OwnedNamespaceEnv = "NEXUS_S4_OWNED_NAMESPACE"
+// Namespace ownership identity
+// ---------------------------
+// Configuring kernel settings is only safe inside the private network namespace this
+// run created for itself. An environment variable is not proof of that: any shell can
+// export it, and a marker inherited from the launcher's environment would authorize
+// writes against the host the run is supposed to leave alone.
+//
+// So ownership is bound to a launch record written by the launcher and consumed by the
+// child:
+//
+//   - the launcher writes {token, launcher namespace inode} to a fresh file before it
+//     spawns `unshare`, and passes only the path and token in the environment;
+//   - the child accepts only when the token matches AND its own network-namespace inode
+//     differs from the launcher's recorded inode. That inequality IS the proof that
+//     `unshare` moved the child: an inherited or forged marker in the original
+//     namespace has the same inode and is refused;
+//   - the record is consumed by rename, so a second process cannot reuse it.
+//
+// This is deliberately not cryptographic attestation: it does not stop a determined
+// same-uid attacker who fabricates a record file. It closes the trivial inherited-marker
+// and replay cases and makes accidental host mutation in the original namespace
+// impossible, which is the reported defect.
 
-// s4RequireOwnedNamespace reports nil only when the current process provably owns a
-// private network namespace created for this run.
+const (
+	// s4LaunchRecordEnv names the launch record the launcher wrote for this run.
+	s4LaunchRecordEnv = "NEXUS_S4_LAUNCH_RECORD"
+	// s4LaunchTokenEnv carries the single-use token that record must contain.
+	s4LaunchTokenEnv = "NEXUS_S4_LAUNCH_TOKEN"
+)
+
+// s4LaunchRecord is the launcher's assertion about the namespace it started from.
+type s4LaunchRecord struct {
+	Token          string `json:"token"`
+	LauncherNetNS  string `json:"launcher_netns"`
+	ExpectedDevice string `json:"expected_device,omitempty"`
+}
+
+// s4NetNSInode reports the identity of the network namespace this process is in.
+// /proc/self/ns/net is a magic symlink whose target is "net:[<inode>]", so the inode is
+// read without any privileged call. Tests replace it with synthetic identity inputs.
+var s4NetNSInode = func() (string, error) {
+	target, err := os.Readlink("/proc/self/ns/net")
+	if err != nil {
+		return "", fmt.Errorf("read own network namespace identity: %w", err)
+	}
+	return target, nil
+}
+
+// s4ReadLaunchRecord reads and validates the shape of a launch record.
+func s4ReadLaunchRecord(path string) (s4LaunchRecord, error) {
+	var rec s4LaunchRecord
+	// #nosec G304 -- path comes from this run's own launch environment
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return rec, fmt.Errorf("read launch record: %w", err)
+	}
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return rec, fmt.Errorf("parse launch record: %w", err)
+	}
+	if rec.Token == "" || rec.LauncherNetNS == "" {
+		return rec, errors.New("launch record is missing its token or launcher namespace identity")
+	}
+	return rec, nil
+}
+
+// s4ClaimLaunchRecord consumes the record exactly once. The rename is atomic, so two
+// processes racing on the same record cannot both be authorized.
+func s4ClaimLaunchRecord(path string) error {
+	claimed := path + ".claimed"
+	if err := os.Rename(path, claimed); err != nil {
+		return fmt.Errorf("claim launch record (already used, or not this run's): %w", err)
+	}
+	_ = os.Remove(claimed)
+	return nil
+}
+
+// s4RequireOwnedNamespace reports nil only when this process provably runs inside the
+// network namespace its own launcher created for it. It performs no writes, so calling
+// it is always safe; it must be called BEFORE any kernel-setting mutation.
 func s4RequireOwnedNamespace() error {
-	if os.Getenv(s4OwnedNamespaceEnv) != "1" {
-		return fmt.Errorf("this process does not own a private network namespace (%s is unset); kernel settings here belong to the host", s4OwnedNamespaceEnv)
+	recordPath := os.Getenv(s4LaunchRecordEnv)
+	token := os.Getenv(s4LaunchTokenEnv)
+	if recordPath == "" || token == "" {
+		return fmt.Errorf("this process was not launched by the namespace fixture (%s/%s unset); kernel settings here belong to the host",
+			s4LaunchRecordEnv, s4LaunchTokenEnv)
+	}
+	rec, err := s4ReadLaunchRecord(recordPath)
+	if err != nil {
+		return err
+	}
+	if rec.Token != token {
+		return errors.New("launch record token does not match this process's token; refusing to treat an inherited or forged marker as ownership")
+	}
+	own, err := s4NetNSInode()
+	if err != nil {
+		return err
+	}
+	// The inequality is the proof: unshare moved us into a different namespace than the
+	// one the launcher recorded. An inherited marker in the original namespace matches
+	// the launcher's identity and is refused here.
+	if own == rec.LauncherNetNS {
+		return fmt.Errorf("this process is still in the launching namespace (%s), so it does not own a private network namespace", own)
+	}
+	if err := s4ClaimLaunchRecord(recordPath); err != nil {
+		return err
 	}
 	return nil
+}
+
+// s4WriteLaunchRecord is the launcher half: it records its own namespace identity and a
+// fresh token, then returns the environment additions for the child.
+func s4WriteLaunchRecord(recordPath string) ([]string, error) {
+	own, err := s4NetNSInode()
+	if err != nil {
+		return nil, err
+	}
+	token, err := s4NewLaunchToken()
+	if err != nil {
+		return nil, err
+	}
+	rec := s4LaunchRecord{Token: token, LauncherNetNS: own}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return nil, fmt.Errorf("encode launch record: %w", err)
+	}
+	if err := os.WriteFile(recordPath, data, 0o600); err != nil {
+		return nil, fmt.Errorf("write launch record: %w", err)
+	}
+	return []string{s4LaunchRecordEnv + "=" + recordPath, s4LaunchTokenEnv + "=" + token}, nil
+}
+
+// s4NewLaunchToken returns an unpredictable single-use token.
+func s4NewLaunchToken() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate launch token: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
 }
 
 // s4AssertLiveIncompatibleConfigRefused is the LIVE half of the counterexample, and

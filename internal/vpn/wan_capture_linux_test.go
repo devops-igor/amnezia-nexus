@@ -37,6 +37,13 @@ func init() {
 	if mode == "" {
 		return
 	}
+	// This entry point is reachable from an inherited environment and the probe writes
+	// sysctls, so it proves it was launched into a run-owned namespace before doing
+	// anything. Without that proof it exits non-zero with no side effects.
+	if err := s4RequireOwnedNamespace(); err != nil {
+		fmt.Printf("RESULT: FAIL: capture probe refuses to run without a run-owned namespace: %v\n", err)
+		os.Exit(1)
+	}
 	os.Exit(runWANCaptureProbe(mode))
 }
 
@@ -151,14 +158,7 @@ func TestWANCaptureProductionPath(t *testing.T) {
 // the namespace could not be created at all: the caller decides whether that is a
 // required-CI failure or an optional-local skip, via s4RequiredEnvironment.
 func runProbeInNetNS(mode string) (string, error) {
-	// #nosec G204 -- os.Args[0] is the test binary; mode is a fixed literal
-	cmd := exec.Command("unshare", "-Urn", os.Args[0], "-test.run=^$")
-	cmd.Env = append(os.Environ(), wanCaptureProbeEnv+"="+mode)
-	out, err := cmd.CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "RESULT:") {
-		return string(out), fmt.Errorf("probe could not run (unshare/namespace setup): %w: %s", err, out)
-	}
-	return string(out), nil
+	return s4LaunchInOwnedNamespace("^$", []string{wanCaptureProbeEnv + "=" + mode})
 }
 
 // runWANCaptureProbe is the body of the namespace-isolated probe. It returns a
@@ -282,6 +282,13 @@ func classifyPrerequisiteOutcome(sysctlWritable bool, err error) prerequisiteOut
 // branch can be exercised end-to-end on a host whose netns sysctls are writable.
 // It exists only for that purpose and defaults to the real procfs.
 func applyProbeSysctls() bool {
+	// Same rule as the S4 fixture: writing kernel settings requires proof this process
+	// owns its namespace. A probe that cannot prove it reports "not writable" rather than
+	// mutating whatever host it happens to be on.
+	if err := s4RequireOwnedNamespace(); err != nil {
+		fmt.Printf("sysctl: refusing to write kernel settings: %v\n", err)
+		return false
+	}
 	root := os.Getenv(probeSysctlRootEnv)
 	if root == "" {
 		root = "/proc/sys"
