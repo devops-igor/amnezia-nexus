@@ -1633,6 +1633,11 @@ func TestUpdateServerHostHandler_VPNBackendPropagation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
+	// This service owns every backend device the test enables on it, and each
+	// device owns the production return-path reader. Registered after the
+	// fixture's database cleanup so the release runs first, while the store the
+	// administrative disable persists through is still open.
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
