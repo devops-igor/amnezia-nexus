@@ -216,16 +216,20 @@ jobs:
   # Required bounded WAN qualification (issue #677).
   #
   # The direct-WAN dataplane can only be proven by executing real kernel behaviour:
-  # a production TUN device, AF_PACKET capture, namespace-local forwarding/NAT and
-  # replies that actually arrive. Those tests fail closed under CI when the runner
-  # cannot provide root, /dev/net/tun and a private network namespace, so they cannot
-  # run in the unprivileged `test` job above — and they must not be excluded from it
-  # either, or the required behaviour goes unexercised.
+  # a production TUN device, AF_PACKET capture, namespace-local forwarding and NAT, and
+  # replies that actually arrive. Those tests fail closed under CI when the runner has
+  # no root, /dev/net/tun or private network namespace, so they cannot run in the
+  # unprivileged `test` job above — and they must not be excluded from it either, or the
+  # required behaviour goes unexercised.
   #
-  # This job therefore compiles the test binaries unprivileged and uses sudo for the
-  # launch only. Every test here creates and owns its own network namespace, so the
-  # job never reconfigures the runner's host networking: no hostwide sysctl, no
-  # AppArmor change, no privileged container, no self-hosted runner.
+  # Isolation: the binaries are compiled unprivileged, and each launch is wrapped in an
+  # OUTER `unshare --net --mount --propagation private`. That matters because the tests
+  # create namespaces and TUN devices as soon as they start: without an outer boundary
+  # those calls would act on the runner's own network and mount namespaces. Inside the
+  # wrapper a job-owned tmpfs is mounted over /run, so the named namespaces the
+  # forwarder gate needs live in a private mount and cannot leak to the host. The
+  # namespace and its tmpfs disappear when the process exits, which is also why cleanup
+  # deletes only exact paths this job created and never scans or removes host state.
   wan-qualification:
     name: Required WAN Qualification (isolated namespaces)
     runs-on: ubuntu-latest
@@ -240,11 +244,6 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
-      # A disposable /run/netns so `ip netns` operations in the tests cannot touch a
-      # shared mount. It is created by this job and removed by the teardown step.
-      - name: Prepare private /run/netns
-        run: sudo mkdir -p /run/netns
-
       - name: Compile the VPN WAN test binary
         run: go test -tags with_utls -c -o "$RUNNER_TEMP/vpn-wan.test" ./internal/vpn
 
@@ -254,24 +253,31 @@ jobs:
         run: |
           set -uo pipefail
           LOG="$RUNNER_TEMP/vpn-wan.log"
+          rc=0
           echo "running: S4 + production lifecycle + capture positive/negative"
-          # sudo resets the environment, so the required markers are passed explicitly.
-          # Compilation happened unprivileged above; only the launch is elevated.
-          sudo env \
-            GITHUB_ACTIONS=true CI=true NEXUS_S4_REQUIRED=1 \
-            "$RUNNER_TEMP/vpn-wan.test" \
-            -test.v -test.timeout=12m \
-            -test.run '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath)$' \
-            > "$LOG" 2>&1
-          rc=$?
+          # Outer isolation, then run. sudo resets the environment, so the required
+          # markers are passed explicitly. If unshare or the tmpfs mount refuses, the
+          # test binary is never started and the step exits non-zero.
+          sudo env GITHUB_ACTIONS=true CI=true NEXUS_S4_REQUIRED=1 \
+              RUNNER_TEMP="$RUNNER_TEMP" \
+            unshare --net --mount --propagation private \
+            bash -euo pipefail -c '
+              mount -t tmpfs tmpfs /run || { echo "isolation: cannot mount private /run" >&2; exit 1; }
+              mkdir -p /run/netns
+              exec "$RUNNER_TEMP/vpn-wan.test" \
+                -test.v -test.timeout=12m \
+                -test.run "^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath)$"
+            ' > "$LOG" 2>&1 || rc=$?
           cat "$LOG"
           # Exit status alone is not the oracle: a skip or a missing test would look
-          # like success, so the log itself is inspected.
-          if grep -qE '^--- SKIP' "$LOG"; then
-            echo "::error::a required WAN test SKIPPED; a skip is not a pass"
+          # like success, so the log itself is inspected. Subtest-level skips are
+          # matched too — the capture gate runs positive and negative as subtests, and
+          # a top-level-only check would miss one of them silently skipping.
+          if grep -qE '^[[:space:]]*--- SKIP' "$LOG"; then
+            echo "::error::a required WAN test or subtest SKIPPED; a skip is not a pass"
             exit 1
           fi
-          if grep -qE '^--- FAIL' "$LOG"; then
+          if grep -qE '^[[:space:]]*--- FAIL' "$LOG"; then
             echo "::error::a required WAN test FAILED"
             exit 1
           fi
@@ -282,6 +288,13 @@ jobs:
           do
             if ! grep -qE "^--- PASS: $name " "$LOG"; then
               echo "::error::required test did not report PASS: $name"
+              exit 1
+            fi
+          done
+          # The capture gate's own two obligations must each have run.
+          for sub in TestWANCaptureProductionPath/positive TestWANCaptureProductionPath/negative; do
+            if ! grep -qE "^[[:space:]]*--- PASS: $sub " "$LOG"; then
+              echo "::error::required subtest did not report PASS: $sub"
               exit 1
             fi
           done
@@ -303,23 +316,28 @@ jobs:
         run: |
           set -uo pipefail
           LOG="$RUNNER_TEMP/fwd-wan.log"
+          rc=0
           echo "running: forwarder direct-egress dispatch/return"
           sudo env GITHUB_ACTIONS=true CI=true NEXUS_S4_REQUIRED=1 \
-            "$RUNNER_TEMP/fwd-wan.test" \
-            -test.v -test.timeout=10m \
-            -test.run '^TestLinuxE2E_DirectEgress$' \
-            > "$LOG" 2>&1
-          rc=$?
+              RUNNER_TEMP="$RUNNER_TEMP" \
+            unshare --net --mount --propagation private \
+            bash -euo pipefail -c '
+              mount -t tmpfs tmpfs /run || { echo "isolation: cannot mount private /run" >&2; exit 1; }
+              mkdir -p /run/netns
+              exec "$RUNNER_TEMP/fwd-wan.test" \
+                -test.v -test.timeout=10m \
+                -test.run "^TestLinuxE2E_DirectEgress$"
+            ' > "$LOG" 2>&1 || rc=$?
           cat "$LOG"
-          if grep -qE '^--- SKIP' "$LOG"; then
+          if grep -qE '^[[:space:]]*--- SKIP' "$LOG"; then
             echo "::error::the forwarder WAN gate SKIPPED; a skip is not a pass"
             exit 1
           fi
-          if grep -qE '^--- FAIL' "$LOG"; then
+          if grep -qE '^[[:space:]]*--- FAIL' "$LOG"; then
             echo "::error::the forwarder WAN gate FAILED"
             exit 1
           fi
-          if ! grep -qE '^--- PASS: TestLinuxE2E_DirectEgress ' "$LOG"; then
+          if ! grep -qE "^--- PASS: TestLinuxE2E_DirectEgress " "$LOG"; then
             echo "::error::required test did not report PASS: TestLinuxE2E_DirectEgress"
             exit 1
           fi
@@ -345,15 +363,12 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
-      # Remove only what this job created. The tests clean their own namespaces; this
-      # clears the mountpoint directory we made.
+      # Only exact paths this job created. The outer network namespace, its private
+      # tmpfs and every namespace the forwarder gate made inside it died with the
+      # process, so there is nothing global to scan, delete or unmount here.
       - name: Clean up job-owned resources
         if: always()
         run: |
           set +e
-          sudo ip netns list | awk '{print $1}' | grep -E '^(nexus|s4|wan-|nt)' | while read -r ns; do
-            [ -n "$ns" ] && sudo ip netns del "$ns" 2>/dev/null
-          done
-          sudo rm -rf /run/netns
-          rm -f "$RUNNER_TEMP"/vpn-wan.test "$RUNNER_TEMP"/fwd-wan.test
-          echo "cleanup complete"
+          rm -f "$RUNNER_TEMP/vpn-wan.test" "$RUNNER_TEMP/fwd-wan.test"
+          echo "cleanup complete (namespaces were process-scoped)"
