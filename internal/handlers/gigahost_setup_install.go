@@ -73,6 +73,13 @@ func (r *SetupInstallRunner) RunInstall(
 	attemptCtx, cancel := context.WithTimeout(ctx, installStepTimeout)
 	defer cancel()
 
+	// A takeover of an automatic job whose admission already committed only records it;
+	// see gigahost_setup_install_recovery.go. It runs before the precheck because the
+	// precheck gates new effects, and a completed admission needs none.
+	if recovered, err := r.h.finalizeRecoveredAdmission(attemptCtx, intent, journal); recovered {
+		return err
+	}
+
 	req, pause, err := r.h.prepareInstall(attemptCtx, intent)
 	if err != nil {
 		journal.Pause(attemptCtx, "install_precheck", err)
@@ -118,6 +125,13 @@ func (h *Handlers) prepareInstall(
 	req, err := h.buildInstallRequest(ctx, intent)
 	if err != nil {
 		return req, nil, err
+	}
+	// The current policy is asked before the precheck dials the host at all, so a
+	// job whose unattended setup was turned off sends no credential and registers
+	// nothing. It is asked again at each later phase, because a pass can take
+	// minutes and the answer can change while it runs.
+	if pause := h.refuseAutomaticEffect(ctx, intent, boundaryAuthentication); pause != nil {
+		return req, pause, nil
 	}
 	if pause, err := h.recheckInstallTrust(ctx, intent); err != nil || pause != nil {
 		return req, pause, err
@@ -229,6 +243,28 @@ func decideBoundTrust(bound, confirmed string) *installPause {
 
 // finishInstall performs enablement and admission for a server whose protocol
 // installation is already proven, then records the terminal success.
+//
+// Promotion is the terminal authorization boundary. That is a deliberate decision, and
+// it is the one the owner finding required be made explicit rather than left implicit.
+//
+// The automation policy is asked immediately BEFORE the promotion commit - in
+// qualifyBackendTraffic (gigahost_deploy.go) and qualifyProxyBackendTraffic
+// (gigahost_deploy_qualify.go) - and a refusal there quarantines the enrollment, so a
+// backend is never promoted by a policy that had already been withdrawn. That gate is
+// the healthy-admission check the recorded lifecycle decision requires.
+//
+// Asking again here, after the commit, could not withhold anything: the backend is
+// already active and selectable, and undoing it would mean rolling back a completed
+// effect, which the same lifecycle decision forbids. The only thing a second refusal
+// could produce is a durable row that says the job never admitted a backend while the
+// production pool selects it - exactly the inconsistency that was reported. So this
+// function records what actually happened instead of narrating a refusal that did not
+// and could not take place.
+//
+// installEnableStep returns nil only when the phase is genuinely complete: either it was
+// already proven done, or enablement plus traffic qualification succeeded and the phase
+// was journalled. Every other outcome pauses or errors there, so reaching the admission
+// below means the backend really is admitted.
 func (h *Handlers) finishInstall(
 	ctx context.Context, req GigahostDeployRequest, server *models.Server,
 	plan installPlan, journal *gigahostsetup.InstallJournal,
@@ -266,11 +302,17 @@ func (h *Handlers) installEnableStep(
 				err: errors.New("a backend tunnel exists but is not admitted")}
 		}
 	}
-	ok, err := journal.BeginPhase(ctx, models.SetupPhaseEnabled, "enabling_backend")
+	ok, err := h.beginInstallPhase(ctx, journal.Intent(), journal,
+		models.SetupPhaseEnabled, "enabling_backend", boundaryBackendEnablement)
 	if err != nil || !ok {
 		return err
 	}
-	if err := h.enableDeployBackend(ctx, server, req.GetEffectiveProtocol()); err != nil {
+	// The job's identity travels with this call so the admission boundary can ask the
+	// automation policy before it promotes. Without it the promotion would happen before
+	// finishInstall's journal refusal, leaving a selectable backend behind a job that never
+	// claims success.
+	enrollCtx := withAutomaticAdmissionIntent(ctx, journal.Intent())
+	if err := h.enableDeployBackend(enrollCtx, server, req.GetEffectiveProtocol()); err != nil {
 		return fmt.Errorf("backend enablement failed: %w", err)
 	}
 	// The enable path reports success only after traffic qualification, so the

@@ -88,6 +88,24 @@ func phaseRank(phase string) int {
 // errPhaseUse is returned when the plan asks for an action it cannot express.
 var errPhaseUse = errors.New("install plan has no action for this phase")
 
+// beginInstallPhase asks the current policy and then journals a phase as starting.
+//
+// The policy question comes first and is answered for every phase, because that is
+// the last moment before a remote command: a job whose unattended setup was turned
+// off while this attempt was working must not issue the next one. The journal write
+// is skipped entirely on a refusal, so the row records the disabled step rather than
+// an in-flight phase that never ran.
+func (h *Handlers) beginInstallPhase(
+	ctx context.Context, intent models.GigahostSetupIntent, journal *gigahostsetup.InstallJournal,
+	phase, step, boundary string,
+) (bool, error) {
+	if pause := h.refuseAutomaticEffect(ctx, intent, boundary); pause != nil {
+		journal.Pause(ctx, pause.step, errors.New(pause.detail))
+		return false, nil
+	}
+	return journal.BeginPhase(ctx, phase, step)
+}
+
 // installServer brings the panel server row for this order into existence and
 // proves its protocol installation, without replaying any completed effect.
 func (h *Handlers) installServer(
@@ -157,7 +175,8 @@ func (h *Handlers) registerServerForInstall(
 	if err != nil {
 		return nil, fmt.Errorf("SSH verification failed: %w", err)
 	}
-	if ok, beginErr := journal.BeginPhase(ctx, models.SetupPhaseRegistered, "server_registration"); beginErr != nil || !ok {
+	if ok, beginErr := h.beginInstallPhase(ctx, journal.Intent(), journal,
+		models.SetupPhaseRegistered, "server_registration", boundaryAuthentication); beginErr != nil || !ok {
 		return nil, beginErr
 	}
 	plan.setStep("server_registration")
@@ -219,7 +238,8 @@ func (h *Handlers) installProtocolStep(
 		return errPhaseUse
 	}
 
-	if ok, err := journal.BeginPhase(ctx, models.SetupPhaseInstalled, "installing_protocol"); err != nil || !ok {
+	if ok, err := h.beginInstallPhase(ctx, journal.Intent(), journal,
+		models.SetupPhaseInstalled, "installing_protocol", boundaryProtocolInstall); err != nil || !ok {
 		return err
 	}
 	plan.setStep("installing_protocol")

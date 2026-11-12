@@ -38,13 +38,14 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 )
 
-// firstContactEligible reports whether this job may pin its own first observation,
-// with a bounded reason when it may not.
+// firstContactEligible asks whether this job may pin the identity it observed, and
+// returns the reason when it may not.
 //
-// The order of the checks is deliberate: the cheapest and most local facts come
-// first, so a job that cannot possibly qualify never causes a provider call. Each
-// group of facts is also answered by its own function, so the reason a job was
-// refused names the group the refusal came from instead of one long predicate.
+// It answers ownership only. The current-policy question is answered by the tracker
+// immediately before the pin, because the two questions have different lifetimes and,
+// more practically, because a refusal to act must not be reported as a request for a
+// person to confirm an identity: confirming an identity cannot enable unattended setup,
+// so telling an operator to do that would send them down a path that cannot work.
 func (h *Handlers) firstContactEligible(
 	ctx context.Context, intent models.GigahostSetupIntent,
 ) (bool, string) {

@@ -38,7 +38,10 @@ const (
 // fingerprint and whose ownership check answers with the supplied verdict.
 //
 // The two seams are explicit arguments rather than harness defaults so every test
-// states which half of the decision it is exercising.
+// states which half of the decision it is exercising. The current-policy gate is wired
+// permissive here for the same reason the eligibility seam is: these tests are about the
+// trust mechanics, and each test that cares about the policy passes its own gate in
+// automaticEffectTracker below.
 func (h *harness) firstContactTracker(
 	fingerprint string,
 	eligible func(ctx context.Context, intent models.GigahostSetupIntent) (bool, string),
@@ -50,20 +53,27 @@ func (h *harness) firstContactTracker(
 		ChallengeHost: func(context.Context, models.GigahostSetupIntent) (string, error) {
 			return fingerprint, nil
 		},
-		FirstContactEligible: eligible,
-		Pinner:               h.db,
-		Now:                  h.clock.Now,
-		Interval:             5 * time.Minute,
-		FailureBack:          time.Minute,
-		MaxBackoff:           time.Hour,
-		Batch:                10,
-		CallTimeout:          5 * time.Second,
+		FirstContactEligible:   eligible,
+		Pinner:                 h.db,
+		AutomaticEffectAllowed: allowAllEffects,
+		Now:                    h.clock.Now,
+		Interval:               5 * time.Minute,
+		FailureBack:            time.Minute,
+		MaxBackoff:             time.Hour,
+		Batch:                  10,
+		CallTimeout:            5 * time.Second,
 	})
 }
 
 // allowAllEligibility is the positive ownership answer: the test decides
 // eligibility has already been established and exercises the trust mechanics.
 func allowAllEligibility(context.Context, models.GigahostSetupIntent) (bool, string) {
+	return true, ""
+}
+
+// allowAllEffects is the positive current-policy answer. Tests that exercise the policy
+// pass their own gate instead.
+func allowAllEffects(context.Context, models.GigahostSetupIntent) (bool, string) {
 	return true, ""
 }
 
@@ -502,14 +512,15 @@ func TestFirstContactPinFailureDoesNotTrustTheHost(t *testing.T) {
 		ChallengeHost: func(context.Context, models.GigahostSetupIntent) (string, error) {
 			return firstContactFingerprintA, nil
 		},
-		FirstContactEligible: allowAllEligibility,
-		Pinner:               failingPinner{err: errFirstContactWriteFailed},
-		Now:                  h.clock.Now,
-		Interval:             5 * time.Minute,
-		FailureBack:          time.Minute,
-		MaxBackoff:           time.Hour,
-		Batch:                10,
-		CallTimeout:          5 * time.Second,
+		FirstContactEligible:   allowAllEligibility,
+		Pinner:                 failingPinner{err: errFirstContactWriteFailed},
+		AutomaticEffectAllowed: allowAllEffects,
+		Now:                    h.clock.Now,
+		Interval:               5 * time.Minute,
+		FailureBack:            time.Minute,
+		MaxBackoff:             time.Hour,
+		Batch:                  10,
+		CallTimeout:            5 * time.Second,
 	})
 	h.runOnce(tracker)
 

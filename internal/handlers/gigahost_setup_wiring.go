@@ -50,8 +50,17 @@ func (h *Handlers) NewGigahostSetupTracker() *gigahostsetup.Tracker {
 		// before either is consulted.
 		FirstContactEligible: h.firstContactEligible,
 		Pinner:               h.db,
-		Interval:             gigahostsetup.DefaultInterval,
-		CallTimeout:          30 * time.Second,
+		// The current-policy gate is wired next to the trust halves, for the same
+		// reason: it is a question this package cannot answer for itself, and it
+		// must be asked again at each effect rather than inferred from the row.
+		AutomaticEffectAllowed: h.automaticEffectPermitted,
+		// The grantor is the production path that turns an entry-created job into an
+		// authorized one, from the provider's own association for the order. It is
+		// wired here and nowhere else, so the only way to acquire automatic authority
+		// is through this tracker pass - never from a request.
+		AutomaticBindingGrantor: h.GrantAutomaticGigahostSetupBinding,
+		Interval:                gigahostsetup.DefaultInterval,
+		CallTimeout:             30 * time.Second,
 	})
 }
 
