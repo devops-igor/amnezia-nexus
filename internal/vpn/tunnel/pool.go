@@ -41,7 +41,7 @@ type Pool struct {
 	// durable row; the HealthProber owns the in-memory map. Without this, an admin
 	// delete cleared only the database and the replacement backend stayed
 	// quarantined in memory until a process restart.
-	enrollmentReleaseHook func(ctx context.Context, serverID int64)
+	enrollmentReleaseHook func(ctx context.Context, serverID, retiredTunnelID int64)
 }
 
 // SetMultiProtocolEnabled configures whether multi-protocol backends are enabled.
@@ -239,7 +239,10 @@ func (p *Pool) RemoveTunnel(ctx context.Context, serverID int64) error {
 	p.mu.Unlock()
 
 	if release != nil {
-		release(context.WithoutCancel(ctx), serverID)
+		// retiredTunnelID is passed so the runtime owner can refuse to clear a
+		// quarantine established by a LATER generation: this callback runs after
+		// p.mu is released, and a replacement can be quarantined in that window.
+		release(context.WithoutCancel(ctx), serverID, tunnel.ID)
 	}
 	return nil
 }
@@ -797,7 +800,7 @@ func (p *Pool) SetSetTunnelEnabledHookForTest(fn func(ctx context.Context, serve
 
 // SetEnrollmentReleaseHook registers the runtime enrollment owner so a tunnel
 // removal releases BOTH markers, not just the durable one.
-func (p *Pool) SetEnrollmentReleaseHook(fn func(ctx context.Context, serverID int64)) {
+func (p *Pool) SetEnrollmentReleaseHook(fn func(ctx context.Context, serverID, retiredTunnelID int64)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.enrollmentReleaseHook = fn

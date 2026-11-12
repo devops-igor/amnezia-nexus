@@ -123,9 +123,14 @@ type HealthProber struct {
 	// qualification. While set, handshake-only probe success must not promote
 	// the backend out of connecting.
 	pendingEnrollment map[int64]bool
-	stopCh            chan struct{}
-	wg                sync.WaitGroup
-	running           bool
+	// pendingEnrollmentGeneration records which TUNNEL GENERATION established each
+	// runtime quarantine. A removal identifies its own generation, so a release
+	// scheduled for a retired backend cannot clear the quarantine a replacement
+	// established in the same server slot after matcher.
+	pendingEnrollmentGeneration map[int64]int64
+	stopCh                      chan struct{}
+	wg                          sync.WaitGroup
+	running                     bool
 }
 
 // NewHealthProber initializes a new HealthProber instance.
@@ -170,21 +175,22 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 	}
 
 	hp := &HealthProber{
-		pool:              pool,
-		db:                db,
-		cfg:               cfg,
-		probeFn:           pFn,
-		probeVLESSFn:      vless.ProbeVLESSReality,
-		probeNaiveFn:      naive.ProbeNaiveProxy,
-		devices:           make(map[int64]PacketDevice),
-		failCounts:        make(map[int64]int),
-		hookFailCounts:    make(map[int64]int),
-		canaryFailCounts:  make(map[int64]int),
-		autoDisabled:      make(map[int64]bool),
-		successCounts:     make(map[int64]int),
-		healthGenerations: make(map[int64]int64),
-		pendingEnrollment: make(map[int64]bool),
-		stopCh:            make(chan struct{}),
+		pool:                        pool,
+		db:                          db,
+		cfg:                         cfg,
+		probeFn:                     pFn,
+		probeVLESSFn:                vless.ProbeVLESSReality,
+		probeNaiveFn:                naive.ProbeNaiveProxy,
+		devices:                     make(map[int64]PacketDevice),
+		failCounts:                  make(map[int64]int),
+		hookFailCounts:              make(map[int64]int),
+		canaryFailCounts:            make(map[int64]int),
+		autoDisabled:                make(map[int64]bool),
+		successCounts:               make(map[int64]int),
+		healthGenerations:           make(map[int64]int64),
+		pendingEnrollment:           make(map[int64]bool),
+		pendingEnrollmentGeneration: make(map[int64]int64),
+		stopCh:                      make(chan struct{}),
 	}
 	if db != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -208,8 +214,8 @@ func (hp *HealthProber) ownPoolEnrollmentLifecycle() {
 	if hp == nil || hp.pool == nil {
 		return
 	}
-	hp.pool.SetEnrollmentReleaseHook(func(_ context.Context, serverID int64) {
-		hp.releaseRuntimeEnrollment(serverID)
+	hp.pool.SetEnrollmentReleaseHook(func(_ context.Context, serverID, retiredTunnelID int64) {
+		hp.releaseRuntimeEnrollmentIfGeneration(serverID, retiredTunnelID)
 	})
 }
 
@@ -217,13 +223,33 @@ func (hp *HealthProber) ownPoolEnrollmentLifecycle() {
 // whose tunnel was just removed. It never writes the durable setting: the pool
 // removal owns that row, and this callback exists so the two owners cannot drift
 // apart. Nil-receiver and lock-order safe: it takes only hp.mu and does no I/O.
-func (hp *HealthProber) releaseRuntimeEnrollment(serverID int64) {
+// releaseRuntimeEnrollmentIfGeneration clears the runtime marker only when it was
+// established by the SAME tunnel generation being retired.
+//
+// A release is scheduled from a removal, and the pool lock is not held while it
+// runs, so a replacement can be added and quarantined in that window. Without the
+// generation check the retired release would clear the replacement's gate and the
+// new backend would be admitted without qualification. retiredTunnelID is the
+// identity RemoveTunnel actually deleted; a marker owned by any other generation
+// is left untouched.
+func (hp *HealthProber) releaseRuntimeEnrollmentIfGeneration(serverID, retiredTunnelID int64) {
 	if hp == nil {
 		return
 	}
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
+	if hp.pendingEnrollment == nil || !hp.pendingEnrollment[serverID] {
+		return
+	}
+	// Zero means the marker predates generation tracking (constructed from durable
+	// state at startup): it cannot be attributed to a replacement, so the retired
+	// release still owns it.
+	owner := hp.pendingEnrollmentGeneration[serverID]
+	if owner != 0 && retiredTunnelID != 0 && owner != retiredTunnelID {
+		return
+	}
 	delete(hp.pendingEnrollment, serverID)
+	delete(hp.pendingEnrollmentGeneration, serverID)
 }
 
 // SetPendingEnrollment sets whether a backend server is currently undergoing initial enrollment qualification.
@@ -238,8 +264,20 @@ func (hp *HealthProber) SetPendingEnrollment(serverID int64, pending bool) {
 	}
 	if pending {
 		hp.pendingEnrollment[serverID] = true
+		// Bind the marker to the tunnel generation that now owns this server slot.
+		// Without it a retired removal cannot tell its own marker from a
+		// replacement's and would clear the wrong one.
+		if hp.pool != nil {
+			if cur, err := hp.pool.GetTunnel(serverID); err == nil && cur != nil {
+				if hp.pendingEnrollmentGeneration == nil {
+					hp.pendingEnrollmentGeneration = make(map[int64]int64)
+				}
+				hp.pendingEnrollmentGeneration[serverID] = cur.ID
+			}
+		}
 	} else {
 		delete(hp.pendingEnrollment, serverID)
+		delete(hp.pendingEnrollmentGeneration, serverID)
 	}
 	db := hp.db
 	hp.mu.Unlock()

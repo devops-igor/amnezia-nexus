@@ -302,8 +302,22 @@ func (p *Pool) recordDeployQuarantine(ctx context.Context, tunnelID, serverID in
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := p.db.SetBackendPendingEnrollment(writeCtx, serverID, true); err != nil {
-		_ = p.db.DeleteBackendTunnel(writeCtx, tunnelID)
-		return fmt.Errorf("failed to record pending enrollment for server %d: %w", serverID, err)
+		// Compensate. The cleanup gets its OWN context and its own error handling:
+		// reusing the failed write's context would make the rollback fail for the
+		// same reason the marker write did, and discarding that error would claim a
+		// rollback that may not have happened.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cleanupCancel()
+		delErr := p.db.DeleteBackendTunnel(cleanupCtx, tunnelID)
+		if delErr != nil {
+			// The quarantine AND its compensation both failed, so the backend row
+			// may still exist without a quarantine. Report BOTH errors: the caller
+			// must not receive a plain "marker write failed" and assume the row is
+			// gone, and the retry path needs to know the state is uncertain.
+			return fmt.Errorf("failed to record pending enrollment for server %d (%w) and failed to roll back backend %d (%w): state is unquarantined and cleanup is unverified",
+				serverID, err, tunnelID, delErr)
+		}
+		return fmt.Errorf("failed to record pending enrollment for server %d: %w (backend %d rolled back)", serverID, err, tunnelID)
 	}
 	return nil
 }
