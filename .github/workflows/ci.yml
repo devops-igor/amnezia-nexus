@@ -118,16 +118,22 @@ jobs:
           grep -qa '__umodti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
           grep -qa '__udivti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
 
-      # These four WAN tests fail closed under CI when the runner has no root,
+      # These five privileged tests fail closed under CI when the runner has no root,
       # /dev/net/tun or private network namespace, which is correct — they must never
       # report success by skipping. They cannot run in this unprivileged job, so they
       # are excluded here and executed for real by the required `wan-qualification` job
       # below. The exclusion is paired one-to-one with that execution: it removes no
       # obligation, it moves each obligation to a step that actually runs it.
+      #
+      # TestLinuxE2E_PolicyEnablement (#678) joins that set for the same reason: it needs
+      # root, /dev/net/tun and CAP_NET_RAW to reach the production PBR activation path,
+      # and fails closed in CI rather than degrade into a skip. Its unprivileged siblings
+      # (settings persistence, sync, restart reproducibility, disable bookkeeping) stay in
+      # this run, so the non-privileged half of the policy contract is still enforced here.
       - name: Run Tests with Race Detector
         run: |
           go test -race -cover -count=1 -coverprofile=coverage.out \
-            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress)$' ./...
+            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress|TestLinuxE2E_PolicyEnablement)$' ./...
 
       - name: Run Authentic Native Caddy Integration Tests
         run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
@@ -400,6 +406,66 @@ jobs:
       - name: Compile the forwarder WAN test binary
         run: go test -tags with_utls -c -o "$RUNNER_TEMP/fwd-wan.test" ./internal/vpn/forwarder
 
+      # The policy enablement E2E (#678) is part of the ./internal/vpn package, so its
+      # binary is the same one compiled above; no second compile is needed. It is a
+      # separate step rather than another name in the selection above because its oracle
+      # is different: it reports structured PHASE markers from the re-executed child, so
+      # a package-level PASS would not show which positive transition actually ran.
+      #
+      # Same outer boundary as the other WAN gates: the test creates its own network
+      # namespace with `ip netns add`, which lands in /run/netns, so the private /run
+      # tmpfs is mounted first and the whole namespace tree dies with this step.
+      - name: Run the policy enablement qualification
+        env:
+          CI: 'true'
+        run: |
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/policy-wan.log"
+          rc=0
+          echo "running: #678 production PBR activation, restart restore, disable"
+          sudo env GITHUB_ACTIONS=true CI=true \
+              RUNNER_TEMP="$RUNNER_TEMP" \
+            unshare --net --mount --propagation private \
+            bash -euo pipefail -c '
+              mount -t tmpfs tmpfs /run || { echo "isolation: cannot mount private /run" >&2; exit 1; }
+              mkdir -p /run/netns
+              chmod 0755 /run
+              install -d -m 0755 /run/wan
+              install -m 0755 "$RUNNER_TEMP/vpn-wan.test" /run/wan/vpn-wan.test
+              # The child re-execs os.Args[0] under `ip netns exec`, so the staged copy is
+              # the path that must be traversable and executable from inside the namespace.
+              exec /run/wan/vpn-wan.test \
+                -test.v -test.timeout=12m \
+                -test.run "^TestLinuxE2E_PolicyEnablement$"
+            ' > "$LOG" 2>&1 || rc=$?
+          cat "$LOG"
+          if grep -qE '^[[:space:]]*--- SKIP' "$LOG"; then
+            echo "::error::the policy enablement gate SKIPPED; a skip is not a pass"
+            exit 1
+          fi
+          if grep -qE '^[[:space:]]*--- FAIL' "$LOG"; then
+            echo "::error::the policy enablement gate FAILED"
+            exit 1
+          fi
+          if ! grep -qE "^--- PASS: TestLinuxE2E_PolicyEnablement " "$LOG"; then
+            echo "::error::required test did not report PASS: TestLinuxE2E_PolicyEnablement"
+            exit 1
+          fi
+          # The child reports one marker per positive transition it actually observed.
+          # Requiring all five proves the cycle completed instead of stopping early.
+          for phase in \
+            settings-persisted activation-enabled restart-restored disable-all-proxy negatives-hold
+          do
+            if ! grep -q "PHASE $phase" "$LOG"; then
+              echo "::error::the policy enablement cycle never reported phase: $phase"
+              exit 1
+            fi
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the policy enablement process exited $rc"
+            exit 1
+          fi
+
       - name: Run the forwarder direct-egress qualification
         env:
           CI: 'true'
@@ -450,6 +516,7 @@ jobs:
           path: |
             ${{ runner.temp }}/vpn-wan.log
             ${{ runner.temp }}/fwd-wan.log
+            ${{ runner.temp }}/policy-wan.log
           retention-days: 14
           if-no-files-found: warn
 

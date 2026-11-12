@@ -416,6 +416,15 @@ func (s *Service) StartGaugeReconciler(ctx context.Context) {
 
 // Stop gracefully shuts down the VPN subsystem.
 func (s *Service) Stop() error {
+	// Stop the policy scheduling loop and release the policy data path first and
+	// unconditionally. The loop is detached from any request lifetime (issue #678
+	// F678-01), so shutdown is one of its two termination paths. It must run
+	// before the running guard below: an admin PUT can activate policy routing on
+	// a service whose data plane was never started, and an early return would
+	// leave that fetcher running and the WAN device name owned against a stopped
+	// service. StopPolicyRouting is idempotent when nothing was activated.
+	s.StopPolicyRouting()
+
 	s.mu.Lock()
 	if !s.running {
 		s.mu.Unlock()
