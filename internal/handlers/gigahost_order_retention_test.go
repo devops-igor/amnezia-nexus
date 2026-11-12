@@ -52,11 +52,18 @@ func newHandlersOverDB(t *testing.T, db *database.DB) *Handlers {
 	reg.Register(&mockProtocolManager{protocol: "telemt"})
 	reg.Register(&mockProtocolManager{protocol: "dns"})
 	vpnSvc, _ := vpn.NewVPNService(db, nil)
+	sshPool := ssh.NewSSHClientPool(ssh.PoolConfig{IdleTimeout: time.Minute}, db)
+	// This constructor creates its own pool and VPN service, so it owns their
+	// workers exactly like setupTestHandlers does. The database belongs to the
+	// caller, so only the pool and the service are registered here; the service
+	// release needs the store open, which the caller's own cleanup guarantees.
+	t.Cleanup(func() { releaseFixtureSSHPool(t, sshPool) })
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	return NewHandlers(Dependencies{
 		Config:     cfg,
 		DB:         db,
 		Registry:   reg,
-		SSHPool:    ssh.NewSSHClientPool(ssh.PoolConfig{IdleTimeout: time.Minute}, db),
+		SSHPool:    sshPool,
 		VPNService: vpnSvc,
 	})
 }
