@@ -197,7 +197,33 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 			}
 		}
 	}
+	hp.ownPoolEnrollmentLifecycle()
 	return hp
+}
+
+// ownPoolEnrollmentLifecycle registers this prober as the runtime enrollment
+// owner for its pool, so a tunnel removal releases both markers. Split out of
+// NewHealthProber to keep that constructor's branching from growing.
+func (hp *HealthProber) ownPoolEnrollmentLifecycle() {
+	if hp == nil || hp.pool == nil {
+		return
+	}
+	hp.pool.SetEnrollmentReleaseHook(func(_ context.Context, serverID int64) {
+		hp.releaseRuntimeEnrollment(serverID)
+	})
+}
+
+// releaseRuntimeEnrollment clears the in-memory enrollment marker for a server
+// whose tunnel was just removed. It never writes the durable setting: the pool
+// removal owns that row, and this callback exists so the two owners cannot drift
+// apart. Nil-receiver and lock-order safe: it takes only hp.mu and does no I/O.
+func (hp *HealthProber) releaseRuntimeEnrollment(serverID int64) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	delete(hp.pendingEnrollment, serverID)
 }
 
 // SetPendingEnrollment sets whether a backend server is currently undergoing initial enrollment qualification.

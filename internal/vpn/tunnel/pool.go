@@ -36,6 +36,12 @@ type Pool struct {
 	setTunnelEnabledHook   func(ctx context.Context, serverID int64, enabled bool, disableReason string) error
 	setTunnelPublicKeyHook func(ctx context.Context, tunnelID int64, publicKey string) error
 	generateKeypairFn      func() (string, string, error)
+	// enrollmentReleaseHook lets the owner of the RUNTIME enrollment marker keep
+	// it in step with the durable one when a tunnel is removed. The pool owns the
+	// durable row; the HealthProber owns the in-memory map. Without this, an admin
+	// delete cleared only the database and the replacement backend stayed
+	// quarantined in memory until a process restart.
+	enrollmentReleaseHook func(ctx context.Context, serverID int64)
 }
 
 // SetMultiProtocolEnabled configures whether multi-protocol backends are enabled.
@@ -222,7 +228,24 @@ func (p *Pool) RemoveTunnel(ctx context.Context, serverID int64) error {
 	delete(p.tunnelsByID, tunnel.ID)
 	delete(p.tunnelsByIfName, tunnel.InterfaceName)
 
+	// The durable marker above is only ONE of the two enrollment owners. Tell the
+	// runtime owner to release too, or a replacement backend re-added in this same
+	// process stays quarantined until a restart. The callback is invoked after the
+	// pool entries are gone and never takes p.mu again (the prober's map is its
+	// own lock), so this adds no nested critical section.
+	p.notifyEnrollmentReleased(ctx, serverID)
+
 	return nil
+}
+
+// notifyEnrollmentReleased reports a removed tunnel to the runtime enrollment
+// owner, if one is registered. Called with p.mu held; the hook must not call back
+// into the pool.
+func (p *Pool) notifyEnrollmentReleased(ctx context.Context, serverID int64) {
+	if p.enrollmentReleaseHook == nil {
+		return
+	}
+	p.enrollmentReleaseHook(context.WithoutCancel(ctx), serverID)
 }
 
 // GetTunnel retrieves a tunnel by server ID.
@@ -774,6 +797,14 @@ func (p *Pool) SetSetTunnelEnabledHookForTest(fn func(ctx context.Context, serve
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.setTunnelEnabledHook = fn
+}
+
+// SetEnrollmentReleaseHook registers the runtime enrollment owner so a tunnel
+// removal releases BOTH markers, not just the durable one.
+func (p *Pool) SetEnrollmentReleaseHook(fn func(ctx context.Context, serverID int64)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.enrollmentReleaseHook = fn
 }
 
 // SetTunnelPublicKey updates the public key of a backend tunnel in memory and in the database,
