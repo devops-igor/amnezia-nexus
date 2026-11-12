@@ -237,7 +237,7 @@ type healthProbeIdentity struct {
 // last while one caller signs with the other, so only one may run.
 //
 // Coalesced callers share the first caller's context. That is correct here
-// because every caller in a cycle derives from the same run context - a cancelled
+// because every caller in a cycle derives from the same run context - a canceled
 // cycle must not register a peer - and a resolution is never retried implicitly.
 func (o *Orchestrator) ensureHealthProbeIdentity(ctx context.Context, server *models.Server, hpm AWGHealthProbeManager) (healthProbeIdentity, error) {
 	key := strconv.FormatInt(server.ID, 10)
