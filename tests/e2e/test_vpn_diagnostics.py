@@ -364,11 +364,14 @@ def test_vpn_routes_table_mobile_containment_and_scrolling(
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    # The outer disclosure only auto-expands when health problems appear, so open
-    # it explicitly before clicking the nested routes disclosure. This keeps the
-    # check independent of the dashboard's health state.
+    # Production JS auto-expands both disclosures conditionally: the outer one on
+    # new health problems and the inner one on route pressure. Open each only
+    # when closed so this check stays independent of dashboard health state and
+    # never toggles an already-open disclosure shut.
     _ensure_tech_details_open(page)
-    page.locator("#vpn-fwd-routes-details > summary").click()
+    routes_details = page.locator("#vpn-fwd-routes-details")
+    if not routes_details.evaluate("el => el.open"):
+        page.locator("#vpn-fwd-routes-details > summary").click()
 
     result = page.evaluate("""() => {
             const table = document.getElementById('vpn-fwd-routes-table');
