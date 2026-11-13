@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -23,14 +24,29 @@ import (
 
 type iptablesRunner func(args ...string) error
 
+// iptablesCommand builds the iptables child process the production runner starts.
+//
+// The panel runs as a non-root user and gets CAP_NET_ADMIN from a file capability on
+// its own binary, so its inheritable and ambient capability sets are empty. A child
+// started with a plain exec would therefore have no permitted capability and every
+// rule change would fail with "Permission denied (you must be root)", exit 4. Raising
+// NET_ADMIN as an ambient capability fixes that boundary: Go prepares the capability
+// sets in the forked child before execve, so the panel's own sets are never widened
+// and no other child is affected. NET_RAW is not needed to change rules, so it is
+// deliberately not propagated.
+func iptablesCommand(path string, args ...string) *exec.Cmd {
+	// #nosec G204 -- path comes from exec.LookPath; arguments are constructed internally from validated IPv4 and numeric port ranges
+	cmd := exec.Command(path, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{AmbientCaps: []uintptr{unix.CAP_NET_ADMIN}}
+	return cmd
+}
+
 var defaultIPTablesRunner = func(args ...string) error {
 	path, err := exec.LookPath("iptables")
 	if err != nil {
 		return err
 	}
-	// #nosec G204 -- arguments are constructed internally from validated IPv4 and numeric port ranges
-	cmd := exec.Command(path, args...)
-	return cmd.Run()
+	return iptablesCommand(path, args...).Run()
 }
 
 type linuxWANDevice struct {
