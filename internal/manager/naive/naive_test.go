@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -873,5 +874,26 @@ func TestNaiveManager_InstallFailsFastWhenPinnedImageCannotBePulled(t *testing.T
 	}
 	if pulls != 2 {
 		t.Errorf("expected exactly one retry (2 pulls), got %d", pulls)
+	}
+}
+
+// TestPinnedForwardProxyMetadataMatchesTheImage is the guard for the drift the
+// review caught: the installer stored v2.11.7-naive while the image already
+// carried v2.11.7-naive2, so every fresh install looked one release behind and
+// server_engine_status reported a phantom update. The version must track the
+// commit pinned in the Dockerfile, which this asserts offline.
+func TestPinnedForwardProxyMetadataMatchesTheImage(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "docker", "naive-caddy", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read pinned image Dockerfile: %v", err)
+	}
+	if !strings.Contains(string(raw), NaiveForwardProxyCommit) {
+		t.Fatalf("pinned image no longer builds forwardproxy commit %s; move NaiveForwardProxyVersion with it", NaiveForwardProxyCommit)
+	}
+	if !strings.Contains(string(raw), NaiveForwardProxyVersion) {
+		t.Fatalf("Dockerfile does not mention %s; the stored plugin version would drift from the image", NaiveForwardProxyVersion)
+	}
+	if NaiveForwardProxyVersion == "v2.11.7-naive" {
+		t.Fatalf("plugin_version must not be the pre-naive2 tag")
 	}
 }

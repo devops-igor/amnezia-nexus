@@ -34,6 +34,16 @@ const (
 	NaiveImageDigest = "sha256:ab6937fe85289ff6ddc85f055b088bec43c0bfd2af140eec2f9c41829d8bdc4d"
 	// NaiveImageRef is the exact reference the installer pulls and runs.
 	NaiveImageRef = NaiveImageRepository + "@" + NaiveImageDigest
+	// NaiveForwardProxyCommit is the klzgrad/forwardproxy commit baked into that
+	// image. It is repeated here so a test can check it against the Dockerfile:
+	// moving the image without moving the metadata is what makes a freshly
+	// installed server report an update it does not need.
+	NaiveForwardProxyCommit = "e747854e78743dba85c039b38ed185fb11d93667"
+	// NaiveForwardProxyVersion is the upstream release tag of that commit and is
+	// what the installer stores as plugin_version. server_engine_status compares
+	// it against the latest upstream release to compute UpdateAvailable, so it
+	// must move with NaiveImageDigest, not lag behind it.
+	NaiveForwardProxyVersion = "v2.11.7-naive2"
 )
 
 // Decoy website theme identifiers.

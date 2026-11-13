@@ -435,7 +435,7 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 	}
 
 	caddyVer := determineRunningCaddyVersion(ctx, client)
-	pluginVer := "v2.11.7-naive"
+	pluginVer := NaiveForwardProxyVersion
 
 	// Update server.Protocols in-memory
 	if server.Protocols == nil {
