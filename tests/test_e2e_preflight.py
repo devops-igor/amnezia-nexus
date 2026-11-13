@@ -22,6 +22,8 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e-dev.yml"
 # until it is added deliberately.
 ALLOWED_REASONS = {
     "docker_unavailable",
+    "host_network_unreachable",
+    "dns_failure",
     "image_pull",
     "image_run",
     "module_missing",
@@ -62,10 +64,36 @@ def test_preflight_reasons_are_closed() -> None:
 def test_preflight_is_bounded() -> None:
     """Each external call carries a timeout so the job fails fast, not hangs."""
     text = SCRIPT.read_text(encoding="utf-8")
-    for command in ("docker info", "docker pull", "docker run", "docker manifest inspect"):
-        assert f"timeout" in text
-        assert command in text
-    assert "timeout 90" in text, "the pull must be bounded well inside two minutes"
+    for bounded in (
+        "timeout 15 docker info",
+        "timeout 30 docker manifest inspect",
+        "timeout 60 docker pull",
+        "timeout 20 docker run",
+    ):
+        assert bounded in text, f"missing bound: {bounded}"
+    # A single probe attempt: busybox wget retries by default, which would
+    # silently consume the whole budget and hide which layer failed.
+    assert "-t 1" in text
+
+
+def test_host_egress_is_measured_before_the_container_probe() -> None:
+    """The run must show whether the host or the container is the blocked side."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "host_egress" in text
+    host_at = text.find("host_egress")
+    container_at = text.find("module_probe")
+    assert host_at < container_at, "host egress must be measured before the container probe"
+
+
+def test_container_dns_is_separated_from_reachability() -> None:
+    """A resolver failure and a blocked TCP path must not share one reason."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "nslookup" in text
+    assert "dns_failure" in text
+    assert "module_network_timeout" in text
+    dns_at = text.find("module_dns")
+    probe_at = text.find("module_probe")
+    assert dns_at != -1 and dns_at < probe_at
 
 
 def test_workflow_runs_the_preflight_before_playwright() -> None:
