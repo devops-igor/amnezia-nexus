@@ -106,6 +106,12 @@ jobs:
             exit 1
           fi
 
+      - name: Naive Caddy preflight
+        # Fail in under two minutes with a closed reason when the image the Naive
+        # installer needs cannot be obtained, instead of after four 120s install
+        # timeouts inside the Playwright suite (issue #680 Phase 0).
+        run: ./scripts/preflight_naive_caddy.sh
+
       - name: Run Playwright E2E Lifecycle Suite
         run: |
           python3 -m venv ~/e2e-venv
