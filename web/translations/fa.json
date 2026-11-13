@@ -577,7 +577,7 @@
   "vpn_diag_latency_p95": "تأخیر p95 (میلی‌ثانیه)",
   "vpn_diag_load_skew": "عدم تعادل بار",
   "vpn_diag_device_drops": "بسته‌های حذف‌شده در دستگاه",
-  "vpn_diag_cpu_usage": "مصرف CPU",
+  "vpn_diag_cpu_usage": "مصرف CPU (فرایند پورتال)",
   "vpn_diag_memory": "حافظه هیپ (تخصیص / محدودیت)",
   "vpn_diag_goroutines": "گوروتین‌ها",
   "vpn_diag_gc_pause": "توقف GC p95",

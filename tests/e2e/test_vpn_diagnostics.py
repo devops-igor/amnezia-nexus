@@ -364,7 +364,10 @@ def test_vpn_routes_table_mobile_containment_and_scrolling(
     page.goto(f"{base_url}/vpn")
     page.wait_for_load_state("networkidle")
 
-    # Open the #vpn-fwd-routes-details disclosure accordion using direct child selector
+    # The outer disclosure only auto-expands when health problems appear, so open
+    # it explicitly before clicking the nested routes disclosure. This keeps the
+    # check independent of the dashboard's health state.
+    _ensure_tech_details_open(page)
     page.locator("#vpn-fwd-routes-details > summary").click()
 
     result = page.evaluate("""() => {
