@@ -96,7 +96,55 @@ func (hp *HealthProber) acceptCanaryObservation(t *models.BackendTunnel, sequenc
 		hp.canaryFailCounts[t.ServerID]++
 	}
 	hp.canaryResults[t.ServerID] = canaryResult{tunnelID: t.ID, sequence: sequence}
+
+	// Mirror the ACCEPTED verdict into the sanitized transition record. This runs
+	// inside the same critical section as the authoritative history write: a
+	// rejected (obsolete) observation never reaches here, so the diagnostic can
+	// never claim evidence the decision layer refused.
+	hp.mirrorInnerVerdictLocked(t, success, deviceCreated)
 	return nil
+}
+
+// mirrorInnerVerdictLocked records an ACCEPTED inner verdict in the sanitized
+// transition record. Callers hold hp.mu.
+//
+// Only the INNER half is written here. The outer half belongs to the probe path
+// that produced it, and overwriting it with the inner verdict would erase the
+// outer failure streak an operator needs to see. In the same spirit an inner
+// result never relabels an outer or attachment streak: each category is reported
+// as itself.
+func (hp *HealthProber) mirrorInnerVerdictLocked(t *models.BackendTunnel, success bool, deviceCreated time.Time) {
+	rec := hp.gateRecordLocked(t)
+	rec.lastAttemptInner = attemptOutcomeFor(success)
+	streakOwnedByInner := rec.failureCategory == FailureNone || rec.failureCategory == FailureInner
+
+	if success {
+		rec.lastSuccessAt = hp.now()
+		rec.lastSuccessDevice = deviceCreated
+		if !deviceCreated.IsZero() {
+			rec.deviceCreatedAt = deviceCreated
+		}
+		if streakOwnedByInner {
+			rec.failureCategory = FailureNone
+			rec.failureCount = 0
+			rec.failureThreshold = hp.cfg.FailureThreshold
+		}
+		return
+	}
+	if streakOwnedByInner {
+		rec.failureCategory = FailureInner
+		rec.failureCount = hp.canaryFailCounts[t.ServerID]
+		rec.failureThreshold = hp.cfg.FailureThreshold
+	}
+}
+
+// attemptOutcomeFor maps an accepted canary verdict onto the sanitized attempt
+// vocabulary.
+func attemptOutcomeFor(success bool) AttemptOutcome {
+	if success {
+		return OutcomeSuccess
+	}
+	return OutcomeFailure
 }
 
 // ensureCanaryMapsLocked allocates the canary history maps on first write.
@@ -225,10 +273,21 @@ func (hp *HealthProber) canaryObservationCurrent(t *models.BackendTunnel, sequen
 	return nil
 }
 
-func isObsoleteCanary(err error) bool {
+// ObsoleteCanary reports whether a canary verdict was refused because the backend
+// it was measured against is no longer the backend that owns the server slot: a
+// deleted/re-created row, a replaced identity, a version that moved, an
+// administrative disable, or a canceled exchange.
+//
+// A caller that writes a terminal health effect from a canary verdict must consult
+// this first. Such a verdict is evidence about a generation that no longer exists,
+// so it may not be recorded as the CURRENT backend's health.
+func ObsoleteCanary(err error) bool {
 	return errors.Is(err, ErrTunnelNotFound) || errors.Is(err, ErrStaleStateVersion) ||
 		errors.Is(err, ErrTunnelDisabled) || errors.Is(err, context.Canceled)
 }
+
+// isObsoleteCanary is the package-internal name retained for the existing callers.
+func isObsoleteCanary(err error) bool { return ObsoleteCanary(err) }
 
 // CanaryFailureCount returns shared history only for the current tunnel identity.
 func (hp *HealthProber) CanaryFailureCount(tunnelID int64) int {

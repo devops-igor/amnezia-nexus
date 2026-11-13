@@ -219,7 +219,7 @@ func TestCanaryAdmission_VLESSProxyConsumer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authentic vless qualification: %v", err)
 	}
-	if err := svc.PromoteQualifiedTunnel(ctx, tun.ServerID, latencyMS); err != nil {
+	if err := svc.PromoteQualifiedTunnel(ctx, tun, latencyMS); err != nil {
 		t.Fatalf("promote vless backend: %v", err)
 	}
 	seedProxySession(t, svc, tun, "vless")
@@ -313,7 +313,7 @@ func TestCanaryAdmission_NaiveProxyConsumer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authentic naive qualification: %v", err)
 	}
-	if err := svc.PromoteQualifiedTunnel(ctx, tun.ServerID, latencyMS); err != nil {
+	if err := svc.PromoteQualifiedTunnel(ctx, tun, latencyMS); err != nil {
 		t.Fatalf("promote naive backend: %v", err)
 	}
 	seedProxySession(t, svc, tun, "naive")

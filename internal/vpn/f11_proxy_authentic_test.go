@@ -471,7 +471,7 @@ func TestF11_AuthenticVLESSProxyHealthKeepsQualifiedBackendAvailable(t *testing.
 	if err != nil {
 		t.Fatalf("authentic qualification failed: %v", err)
 	}
-	if err := svc.PromoteQualifiedTunnel(ctx, sid, latencyMS); err != nil {
+	if err := svc.PromoteQualifiedTunnel(ctx, tun, latencyMS); err != nil {
 		t.Fatalf("promote: %v", err)
 	}
 	if svc.prober.GetCanaryProbeFunc() != nil {
@@ -581,7 +581,7 @@ func TestF11_AuthenticNaiveProxyHealthKeepsQualifiedBackendAvailable(t *testing.
 	if err != nil {
 		t.Fatalf("authentic naive qualification failed: %v", err)
 	}
-	if err := svc.PromoteQualifiedTunnel(ctx, sid, latencyMS); err != nil {
+	if err := svc.PromoteQualifiedTunnel(ctx, tun, latencyMS); err != nil {
 		t.Fatalf("promote: %v", err)
 	}
 	if svc.prober.GetCanaryProbeFunc() != nil {

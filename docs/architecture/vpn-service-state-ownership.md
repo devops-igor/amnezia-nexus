@@ -272,6 +272,26 @@ Compound operations spanning memory, database, and dataplane forwarders execute 
    - Every execution of `Start()` increments `diagGeneration` under `diagRatesMu`.
    - All rate trackers, deltas, and rolling history baselines are reset and re-primed into the new generation. Diagnostics snapshots straddling a restart are rejected by generation checks, preventing counter wraparound or negative rates from skewing health scores.
 
+### 4.6 Backend Peer Roles and the Reachability Probe Identity
+
+A backend server holds several distinct portal-side peers. They are not interchangeable: each one is registered for one purpose, and a peer's identity, its PresharedKey policy and its `AllowedIPs` scope must match the role that will use it.
+
+1. **Roles**:
+   - **Portal Data Plane** (`registerBackendPortalPeers`, `internal/vpn/backend_enable.go`): the DATA device identity, derived from the tunnel's `PrivateKey`. Its `AllowedIPs` is the portal client subnet (`getPortalSubnet()`, not a default route), so the backend accepts portal-subnet data traffic and routes replies back to the data device.
+   - **Portal Health Probe** (`registerBackendPortalPeers`): the tunnel health prober's identity, derived from the tunnel's dedicated `ProbePrivateKey`. It carries NO `allowed_ips`, so it is scoped to its own client address. Its only traffic is the prober's handshake/keepalive exchange; a wide `AllowedIPs` would let probe packets shadow the data plane.
+   - **Health Probe** (background orchestrator reachability, `internal/service/orchestrator/reachability.go`): the SERVER reachability identity, used to answer "is this host's AWG service answering at all". It is registered with no `allowed_ips` and no client config, and it never carries data.
+
+2. **Identity ownership and durability**:
+   - The AWG manager generates the probe peer's keypair and stores the private half in the backend's `clientsTable`; that table is the authoritative, durable home of the credential and is what a restarted panel reads. `AddClient` deliberately returns no credential for a probe peer (there is no client config, no `PresharedKey` and no data-plane role), so a caller that needs to sign a handshake reads the identity back from the backend rather than expecting it in the response.
+   - A caller-key registration (a public key supplied by the caller) has no private half at the manager at all. Such a peer is registered verbatim, and the caller's own key is the credential. A caller that waits for this response to hand it a usable identity never gets one — which is why reachability resolution reads the stored probe identity instead.
+   - Re-registering the SAME identity must never erase the stored private key: the registration carries no credential, so an unconditional overwrite destroys the only copy and the next cycle stores a new key at a re-pointed peer. When the identity itself changes, the credential of the old key no longer applies and must not survive.
+
+3. **PSK policy travels with the peer**:
+   - The handshake must derive IKpsk2 with the SAME PresharedKey the backend registered for that peer. Current probe peers are PSK-less, so the probe handshake uses an empty PSK; a peer written by the older server-PSK path keeps deriving with the PSK recorded in its `clientsTable` entry. Server-wide `getPortalSubnet`/server-PSK reads are NOT a substitute for the peer's own recorded state.
+
+4. **Concurrency and cycle boundaries**:
+   - One server must not receive two competing probe registrations in one cycle. Identity resolution is coalesced per server, so overlapping cycles and concurrent consumers converge on one identity and one registration; the resolved decision is cached for the process so steady-state cycles do not touch the backend.
+
 ---
 
 ## 5. Coverage & Gap Analysis
