@@ -183,21 +183,21 @@ def _get_server_by_id(page: Page, server_id: int) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _ensure_protocol_installed(page: Page, server_id: int, proto: str, csrf_token: str) -> bool:
-    """Ensure that the requested protocol is installed on the target server.
+_PROVISION_PROTOCOLS = ("vless", "naive")
+# The install endpoint is synchronous: it returns only after the container is
+# running. This poll is a safety net for the inventory read that follows, not a
+# retry of the install itself.
+_PROVISION_POLL_SECONDS = 30
 
-    Checks if proto is present in server protocol inventory. If absent, provisions
-    the protocol via POST /api/servers/{server_id}/install with standard parameters:
-    - VLESS: port 443, server_name gateway.icloud.com, flow xtls-rprx-vision
-    - NaiveProxy: port 9443, domain proxy.example.com, decoy default
+
+def _install_payload(proto: str) -> Dict[str, Any]:
+    """Return the standard install body for a provisioned protocol.
+
+    VLESS: port 443, server_name gateway.icloud.com, flow xtls-rprx-vision.
+    NaiveProxy: port 9443, domain proxy.example.com, decoy default.
     """
-    server = _get_server_by_id(page, server_id)
-    if server and _is_protocol_installed(server, proto):
-        return True
-
-    payload: Dict[str, Any]
     if proto == "vless":
-        payload = {
+        return {
             "protocol": "vless",
             "port": "443",
             "vless_options": {
@@ -206,8 +206,8 @@ def _ensure_protocol_installed(page: Page, server_id: int, proto: str, csrf_toke
                 "flow": "xtls-rprx-vision",
             },
         }
-    elif proto == "naive":
-        payload = {
+    if proto == "naive":
+        return {
             "protocol": "naive",
             "port": "9443",
             "naive_options": {
@@ -216,39 +216,87 @@ def _ensure_protocol_installed(page: Page, server_id: int, proto: str, csrf_toke
                 "decoy": "default",
             },
         }
-    else:
-        raise ValueError(f"Unsupported protocol for auto-provisioning: {proto}")
+    raise ValueError(f"Unsupported protocol for auto-provisioning: {proto}")
 
-    install_res = api_post(
-        page,
-        f"/api/servers/{server_id}/install",
-        payload,
-        csrf_token,
-        timeout=120_000,
+
+def _provisioning_context(playwright, base_url: str, username: str, password: str):
+    """Open an authenticated APIRequestContext independent of any page.
+
+    A module-scoped fixture cannot depend on the function-scoped `page`, so the
+    provisioning path logs in on its own request context. Cookies (including the
+    HttpOnly csrftoken) live on that context and are read through the API.
+    """
+    ctx = playwright.request.new_context(base_url=base_url)
+    ctx.get("/login")
+    csrf = next((c["value"] for c in ctx.cookies() if c["name"] == "csrftoken"), "")
+    if not csrf:
+        ctx.dispose()
+        pytest.fail("CSRF cookie missing on /login — cannot provision protocols")
+    res = ctx.post(
+        "/api/auth/login",
+        data={"username": username, "password": password, "captcha": None},
+        headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
     )
-    status = install_res.get("status")
-    assert status in (200, 201), (
-        f"Failed to auto-provision {proto} on server {server_id}: "
-        f"status={status}, response={install_res}"
-    )
+    if res.status != 200:
+        body = res.text()[:200]
+        ctx.dispose()
+        pytest.fail(f"Provisioning login returned {res.status}: {body}")
+    return ctx, csrf
 
-    # Validate installed status in server inventory
-    updated = _get_server_by_id(page, server_id)
-    if updated and _is_protocol_installed(updated, proto):
-        return True
 
-    # Allow a short poll window if remote state sync is in-flight
-    for _ in range(5):
-        time.sleep(1)
-        updated = _get_server_by_id(page, server_id)
-        if updated and _is_protocol_installed(updated, proto):
-            return True
+@pytest.fixture(scope="module")
+def provisioned_protocols(
+    playwright, base_url: str, admin_user: str, admin_pass: str
+) -> Dict[str, Any]:
+    """Install the protocols this module needs, once for the whole module.
 
-    if _is_qualification_mode():
-        assert updated and _is_protocol_installed(
-            updated, proto
-        ), f"Protocol {proto} not reported as installed on server {server_id} after install"
-    return True
+    Each test used to POST /api/servers/{id}/install itself, so a single slow or
+    failed install turned into four separate 120s client timeouts that all
+    reported the same generic `install_failed`. This performs one attempt per
+    protocol and then polls the inventory; a failure stops the module with the
+    exact response instead of cascading.
+    """
+    ctx, csrf = _provisioning_context(playwright, base_url, admin_user, admin_pass)
+    try:
+        listed = ctx.get("/api/servers")
+        servers = listed.json() if listed.ok else []
+        servers = servers if isinstance(servers, list) else servers.get("servers", [])
+        if not servers:
+            pytest.skip("no server available to provision")
+        server_id = servers[0]["id"]
+
+        for proto in _PROVISION_PROTOCOLS:
+            if _is_protocol_installed(servers[0], proto):
+                continue
+
+            res = ctx.post(
+                f"/api/servers/{server_id}/install",
+                data=_install_payload(proto),
+                headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
+                timeout=120_000,
+            )
+            body = res.text()[:300]
+            if res.status not in (200, 201):
+                pytest.fail(
+                    f"Failed to provision {proto} on server {server_id}: "
+                    f"status={res.status}, response={body}"
+                )
+
+            deadline = time.time() + _PROVISION_POLL_SECONDS
+            while time.time() < deadline:
+                time.sleep(1)
+                updated = ctx.get(f"/api/servers/{server_id}")
+                if updated.ok and _is_protocol_installed(updated.json(), proto):
+                    break
+            else:
+                pytest.fail(
+                    f"{proto} install returned {res.status} but the server never reported it "
+                    f"installed within {_PROVISION_POLL_SECONDS}s (response={body})"
+                )
+
+        yield {"server_id": server_id}
+    finally:
+        ctx.dispose()
 
 
 def _find_or_create_user(
@@ -341,7 +389,10 @@ def _verify_user_my_page(
 
 @pytest.mark.e2e
 def test_multiprotocol_client_creation_flow(
-    authenticated_page: Page, base_url: str, csrf_token: str
+    authenticated_page: Page,
+    base_url: str,
+    csrf_token: str,
+    provisioned_protocols: Dict[str, Any],
 ) -> None:
     """Verify multi-protocol client connection creation and list rendering.
 
@@ -360,8 +411,6 @@ def test_multiprotocol_client_creation_flow(
     assert server is not None
 
     server_id = server["id"]
-    for proto in ("vless", "naive"):
-        _ensure_protocol_installed(page, server_id, proto, csrf_token)
 
     server = _get_server_by_id(page, server_id) or server
     installed_protos: List[str] = [
@@ -468,7 +517,10 @@ def test_multiprotocol_client_creation_flow(
 
 @pytest.mark.e2e
 def test_multiprotocol_config_display_and_uri_export(
-    authenticated_page: Page, base_url: str, csrf_token: str
+    authenticated_page: Page,
+    base_url: str,
+    csrf_token: str,
+    provisioned_protocols: Dict[str, Any],
 ) -> None:
     """Verify URI export format and clipboard copy feedback.
 
@@ -486,8 +538,6 @@ def test_multiprotocol_config_display_and_uri_export(
     assert server is not None
 
     server_id = server["id"]
-    for proto in ("vless", "naive"):
-        _ensure_protocol_installed(page, server_id, proto, csrf_token)
 
     server = _get_server_by_id(page, server_id) or server
     installed_protos: List[str] = [
@@ -596,7 +646,10 @@ def test_multiprotocol_config_display_and_uri_export(
 
 @pytest.mark.e2e
 def test_multiprotocol_qr_code_modal_interaction(
-    authenticated_page: Page, base_url: str, csrf_token: str
+    authenticated_page: Page,
+    base_url: str,
+    csrf_token: str,
+    provisioned_protocols: Dict[str, Any],
 ) -> None:
     """Verify QR code rendering, tab switching, and clean modal dismissal.
 
@@ -615,8 +668,6 @@ def test_multiprotocol_qr_code_modal_interaction(
     assert server is not None
 
     server_id = server["id"]
-    for proto in ("vless", "naive"):
-        _ensure_protocol_installed(page, server_id, proto, csrf_token)
 
     server = _get_server_by_id(page, server_id) or server
     installed_protos: List[str] = [
@@ -710,7 +761,10 @@ def test_multiprotocol_qr_code_modal_interaction(
 
 @pytest.mark.e2e
 def test_multiprotocol_revocation_and_zero_client_state(
-    authenticated_page: Page, base_url: str, csrf_token: str
+    authenticated_page: Page,
+    base_url: str,
+    csrf_token: str,
+    provisioned_protocols: Dict[str, Any],
 ) -> None:
     """Verify client revocation flow and clean zero-client state transitions.
 
@@ -728,8 +782,6 @@ def test_multiprotocol_revocation_and_zero_client_state(
     assert server is not None
 
     server_id = server["id"]
-    for proto in ("vless", "naive"):
-        _ensure_protocol_installed(page, server_id, proto, csrf_token)
 
     server = _get_server_by_id(page, server_id) or server
     installed_protos: List[str] = [
