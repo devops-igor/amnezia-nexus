@@ -147,7 +147,7 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 			existing.PublicKey = candPubKey
 			existing.PrivateKey = candPrivKey
 			existing.ProbePrivateKey = candProbePrivKey
-			resetTunnelEnrollmentHealth(ctx, existing)
+			p.resetTunnelEnrollmentLocked(ctx, existing)
 			if changed {
 				existing.StateVersion = candStateVersion
 			}
@@ -189,7 +189,7 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 		existing.Endpoint = endpoint
 		existing.Protocol = proto
 		existing.ProtocolParams = bytes.Clone(opts.ProtocolParams)
-		resetTunnelEnrollmentHealth(ctx, existing)
+		p.resetTunnelEnrollmentLocked(ctx, existing)
 		if changed {
 			existing.StateVersion = candStateVersion
 		}
@@ -269,16 +269,11 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 	}
 
 	if p.db != nil {
-		id, err := p.db.CreateBackendTunnel(ctx, tunnel)
+		id, err := p.persistNewTunnel(ctx, tunnel)
 		if err != nil {
-			return nil, fmt.Errorf("failed to persist backend tunnel: %w", err)
+			return nil, err
 		}
 		tunnel.ID = id
-		if ctx != nil && ctx.Value(DeployEnrollmentKey) != nil {
-			writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			defer cancel()
-			_ = p.db.SetBackendPendingEnrollment(writeCtx, serverID, true)
-		}
 	} else {
 		tunnel.ID = serverID
 	}
@@ -286,7 +281,35 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 	p.tunnelsByServerID[serverID] = tunnel
 	p.tunnelsByID[tunnel.ID] = tunnel
 	p.tunnelsByIfName[tunnel.InterfaceName] = tunnel
+	if isDeployEnrollment(ctx) {
+		// A deploy-created backend is its own first enrollment attempt; a
+		// qualification of it may only admit that attempt.
+		p.beginEnrollmentAttemptLocked(tunnel)
+	}
 
 	copyTunnel := *tunnel
 	return &copyTunnel, nil
+}
+
+// persistNewTunnel inserts a new backend row. A deploy-context add is an
+// unqualified enrollment, so its row and its durable quarantine commit in one
+// transaction: a failure leaves neither behind, and there is no compensating
+// delete that could itself fail and leave an unquarantined row for the next
+// startup to admit.
+func (p *Pool) persistNewTunnel(ctx context.Context, tunnel *models.BackendTunnel) (int64, error) {
+	if !isDeployEnrollment(ctx) {
+		id, err := p.db.CreateBackendTunnel(ctx, tunnel)
+		if err != nil {
+			return 0, fmt.Errorf("failed to persist backend tunnel: %w", err)
+		}
+		return id, nil
+	}
+	// Bounded, and still bound to the caller: a canceled deployment creates nothing.
+	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	id, err := p.db.CreateBackendTunnelWithEnrollment(writeCtx, tunnel)
+	if err != nil {
+		return 0, fmt.Errorf("failed to persist quarantined backend tunnel for server %d: %w", tunnel.ServerID, err)
+	}
+	return id, nil
 }

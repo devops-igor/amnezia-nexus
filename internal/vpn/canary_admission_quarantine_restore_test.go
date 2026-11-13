@@ -94,7 +94,7 @@ func TestCanaryAdmission_RestoredQuarantineRefusesNewAdmission(t *testing.T) {
 
 	// The release point is still explicit promotion, and it admits through the
 	// same branch on the same restored prober.
-	if err := e.svc.PromoteQualifiedTunnel(t.Context(), e.blocked.ServerID, 20); err != nil {
+	if err := e.svc.PromoteQualifiedTunnel(t.Context(), e.blocked, 20); err != nil {
 		t.Fatalf("promote qualified backend: %v", err)
 	}
 	if cur := e.sweepFailingOuter(t); cur.Status != models.TunnelStatusHandshakeBlocked {

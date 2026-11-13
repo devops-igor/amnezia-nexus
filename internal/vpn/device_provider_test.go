@@ -552,7 +552,7 @@ func TestVPNService_PromoteQualifiedTunnel(t *testing.T) {
 	}
 
 	// Promote with normal latency (< threshold 500ms)
-	if err := svc.PromoteQualifiedTunnel(ctx, s1, 45); err != nil {
+	if err := svc.PromoteQualifiedTunnel(ctx, tun, 45); err != nil {
 		t.Fatalf("PromoteQualifiedTunnel failed: %v", err)
 	}
 	tunAfter, err := svc.pool.GetTunnel(s1)
@@ -564,7 +564,11 @@ func TestVPNService_PromoteQualifiedTunnel(t *testing.T) {
 	if err := svc.pool.SetTunnelStatus(ctx, s1, models.TunnelStatusConnecting, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.PromoteQualifiedTunnel(ctx, s1, 650); err != nil {
+	degraded, err := svc.pool.GetTunnel(s1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.PromoteQualifiedTunnel(ctx, degraded, 650); err != nil {
 		t.Fatalf("PromoteQualifiedTunnel high latency failed: %v", err)
 	}
 	tunDegraded, err := svc.pool.GetTunnel(s1)
@@ -579,7 +583,11 @@ func TestVPNService_PromoteQualifiedTunnel(t *testing.T) {
 	if err := svc.DisableBackend(ctx, s1); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.PromoteQualifiedTunnel(ctx, s1, 10); err == nil {
+	disabled, err := svc.pool.GetTunnel(s1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.PromoteQualifiedTunnel(ctx, disabled, 10); err == nil {
 		t.Fatal("expected error promoting disabled tunnel")
 	}
 }
