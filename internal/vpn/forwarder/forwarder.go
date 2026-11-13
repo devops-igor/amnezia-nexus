@@ -209,6 +209,15 @@ type Forwarder struct {
 	directBytes  atomic.Int64
 	proxyDrops   atomic.Uint64
 	directDrops  atomic.Uint64
+
+	// detachedBackends records backend tunnels whose egress device has been
+	// detached (or replaced with a nil device) and not yet re-attached. A
+	// proxy-required packet assigned to one of these tunnels is refused and
+	// counted instead of being admitted into a queue that no pump drains; the
+	// marker is independent of backendQueues because session registration and
+	// UpdateSessionBackend re-create queues for arbitrary tunnel IDs.
+	// Guarded by mu.
+	detachedBackends map[int64]struct{}
 }
 
 // DefaultClientQueueSize is the default capacity of each per-client downstream packet channel.
@@ -303,6 +312,7 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		routesByIP:         make(map[string]*sessionRoute),
 		backendQueues:      make(map[int64]chan []byte),
 		backendDevices:     make(map[int64]PacketDevice),
+		detachedBackends:   make(map[int64]struct{}),
 		writesInFlight:     make(map[*sessionRoute]time.Time),
 		backendPumpStops:   make(map[int64]chan struct{}),
 		backendPumpDones:   make(map[int64]chan struct{}),
