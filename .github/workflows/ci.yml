@@ -368,7 +368,7 @@ jobs:
               unshare -Urn --map-root-user sh -c "id -u; grep ^CapEff /proc/self/status; cat /proc/self/uid_map; /bin/true && echo diag-inner-true-ok || echo diag-inner-true-denied" >&2 || echo "diag-inner: user namespace or sh launch refused" >&2
               # TestIPTablesChild_NonRootConsumerGetsNetAdminOnly is selected here for
               # the same reason as the WAN gates: it starts its own user namespace and
-              # reads the executed child's capability sets, which the unprivileged job
+              # reads the capability sets of the executed child, which the unprivileged job
               # is refused. It is excluded there and required here, and it asserts a
               # genuine child PASS — it is never a skip.
               exec /run/wan/vpn-wan.test \
