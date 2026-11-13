@@ -282,7 +282,9 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 	p.tunnelsByID[tunnel.ID] = tunnel
 	p.tunnelsByIfName[tunnel.InterfaceName] = tunnel
 	if isDeployEnrollment(ctx) {
-		p.setEnrollmentPendingLocked(tunnel.ID)
+		// A deploy-created backend is its own first enrollment attempt; a
+		// qualification of it may only admit that attempt.
+		p.beginEnrollmentAttemptLocked(tunnel)
 	}
 
 	copyTunnel := *tunnel

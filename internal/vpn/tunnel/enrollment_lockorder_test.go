@@ -28,7 +28,7 @@ func TestEnrollmentReleaseRunsWithoutPoolLock(t *testing.T) {
 
 	var poolLockHeldDuringRelease atomic.Bool
 	var called atomic.Bool
-	f.pool.SetEnrollmentReleaseHook(func(_ context.Context, serverID, retiredTunnelID int64) {
+	f.pool.SetEnrollmentReleaseHook(func(_ context.Context, serverID, retiredTunnelID int64, _ uint64) {
 		called.Store(true)
 		if !f.pool.mu.TryLock() {
 			poolLockHeldDuringRelease.Store(true)
@@ -36,7 +36,7 @@ func TestEnrollmentReleaseRunsWithoutPoolLock(t *testing.T) {
 		}
 		f.pool.mu.Unlock()
 		// The runtime owner must actually be released by this path.
-		f.prober.releaseRuntimeEnrollmentIfGeneration(serverID, retiredTunnelID)
+		f.prober.releaseRuntimeEnrollmentIfGeneration(serverID, retiredTunnelID, 0)
 	})
 
 	if err := f.pool.RemoveTunnel(context.Background(), f.server); err != nil {

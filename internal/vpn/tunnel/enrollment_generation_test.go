@@ -37,12 +37,12 @@ func TestRetiredReleaseCannotClearReplacementQuarantineAfterUnlock(t *testing.T)
 	entered := make(chan struct{})
 	resume := make(chan struct{})
 	var observedPending bool
-	f.pool.SetEnrollmentReleaseHook(func(ctx context.Context, serverID, retiredTunnelID int64) {
+	f.pool.SetEnrollmentReleaseHook(func(ctx context.Context, serverID, retiredTunnelID int64, retiredAttempt uint64) {
 		close(entered)
 		<-resume
 		// The real runtime owner release, executed late, exactly as the
 		// production callback would.
-		f.prober.releaseRuntimeEnrollmentIfGeneration(serverID, retiredTunnelID)
+		f.prober.releaseRuntimeEnrollmentIfGeneration(serverID, retiredTunnelID, retiredAttempt)
 		observedPending = f.prober.IsPendingEnrollment(serverID)
 	})
 

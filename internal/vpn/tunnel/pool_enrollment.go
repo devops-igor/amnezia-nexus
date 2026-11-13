@@ -33,8 +33,9 @@ func (p *Pool) persistTunnelEnrollment(ctx context.Context, existing *models.Bac
 }
 
 // resetTunnelEnrollmentLocked applies a committed deploy re-enrollment to the
-// in-memory tunnel: health becomes unknown and the generation is quarantined
-// until its own qualification. The caller must hold p.mu.
+// in-memory tunnel: health becomes unknown, a NEW enrollment attempt begins, and
+// that attempt is quarantined until it is qualified on its own. The caller must
+// hold p.mu.
 func (p *Pool) resetTunnelEnrollmentLocked(ctx context.Context, tunnel *models.BackendTunnel) {
 	if !isDeployEnrollment(ctx) {
 		return
@@ -43,6 +44,20 @@ func (p *Pool) resetTunnelEnrollmentLocked(ctx context.Context, tunnel *models.B
 	tunnel.DisableReason = models.DisableReasonNone
 	tunnel.LatencyMS = 0
 	tunnel.LastHealthCheck = nil
+	p.beginEnrollmentAttemptLocked(tunnel)
+}
+
+// beginEnrollmentAttemptLocked starts a new attempt on tunnel and quarantines it.
+// The caller must hold p.mu for writing.
+//
+// The attempt is what tells an in-flight qualification which enrollment it belongs
+// to. Assignment happens in the SAME p.mu critical section as the quarantine and
+// the committed reset, so no observation can straddle the boundary and believe it
+// is looking at the attempt it started in. Values are never reused (monotonic), so
+// an id that comes back can only mean the same attempt, never a later one.
+func (p *Pool) beginEnrollmentAttemptLocked(tunnel *models.BackendTunnel) {
+	p.enrollmentAttemptSeq++
+	tunnel.EnrollmentAttempt = p.enrollmentAttemptSeq
 	p.setEnrollmentPendingLocked(tunnel.ID)
 }
 

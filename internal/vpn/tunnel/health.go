@@ -128,6 +128,11 @@ type HealthProber struct {
 	// scheduled for a retired backend cannot clear the quarantine a replacement
 	// established in the same server slot after matcher.
 	pendingEnrollmentGeneration map[int64]int64
+	// pendingEnrollmentAttempt records WHICH ENROLLMENT of that generation
+	// established the quarantine. A deployment re-enrollment of an unchanged
+	// identity keeps the tunnel id, so generation equality alone cannot tell the
+	// new enrollment's gate from the previous one's; the attempt can.
+	pendingEnrollmentAttempt map[int64]uint64
 	// gateRecords holds the sanitized decision evidence behind each backend's
 	// current status: the last probe attempt, the failure streak and threshold,
 	// the last confirmed inner success, and the condition currently deciding
@@ -196,6 +201,7 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 		healthGenerations:           make(map[int64]int64),
 		pendingEnrollment:           make(map[int64]bool),
 		pendingEnrollmentGeneration: make(map[int64]int64),
+		pendingEnrollmentAttempt:    make(map[int64]uint64),
 		gateRecords:                 make(map[int64]*gateRecord),
 		stopCh:                      make(chan struct{}),
 	}
@@ -233,8 +239,8 @@ func (hp *HealthProber) ownPoolEnrollmentLifecycle() {
 	if hp == nil || hp.pool == nil {
 		return
 	}
-	hp.pool.SetEnrollmentReleaseHook(func(_ context.Context, serverID, retiredTunnelID int64) {
-		hp.releaseRuntimeEnrollmentIfGeneration(serverID, retiredTunnelID)
+	hp.pool.SetEnrollmentReleaseHook(func(_ context.Context, serverID, retiredTunnelID int64, retiredAttempt uint64) {
+		hp.releaseRuntimeEnrollmentIfGeneration(serverID, retiredTunnelID, retiredAttempt)
 	})
 }
 
@@ -250,24 +256,62 @@ func (hp *HealthProber) ownPoolEnrollmentLifecycle() {
 // new backend would be admitted without qualification. retiredTunnelID is the
 // identity RemoveTunnel actually deleted; a marker owned by any other generation
 // is left untouched.
-func (hp *HealthProber) releaseRuntimeEnrollmentIfGeneration(serverID, retiredTunnelID int64) {
+//
+// Generation equality is not sufficient on its own for the same reason it is not
+// in the promotion fence: a deployment re-enrollment of an unchanged identity keeps
+// the tunnel id, so a release from the PREVIOUS enrollment of that row would clear
+// the new enrollment's gate. retiredAttempt (when non-zero) must therefore match
+// too. Callers without an attempt identity pass 0 and keep the original behavior.
+func (hp *HealthProber) releaseRuntimeEnrollmentIfGeneration(serverID, retiredTunnelID int64, retiredAttempt uint64) {
 	if hp == nil {
 		return
 	}
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
+	if !hp.markerOwnedByLocked(serverID, retiredTunnelID, retiredAttempt) {
+		return
+	}
+	hp.clearEnrollmentLocked(serverID)
+}
+
+// markerOwnedByLocked reports whether the caller mark for serverID was established by
+// the given generation and enrollment attempt. The caller must hold hp.mu.
+//
+// A zero half is "unattributed", not "matches": a marker with no recorded owner
+// predates generation tracking (it was rebuilt from durable state at startup), so it
+// cannot be attributed to a replacement and the retiring caller still owns it. A
+// non-zero half must match exactly, which is what stops a release from the PREVIOUS
+// enrollment of an unchanged row clearing the NEW enrollment's gate.
+func (hp *HealthProber) markerOwnedByLocked(serverID, tunnelID int64, attempt uint64) bool {
 	if hp.pendingEnrollment == nil || !hp.pendingEnrollment[serverID] {
+		return false
+	}
+	return ownerMatches(hp.pendingEnrollmentGeneration[serverID], tunnelID) &&
+		ownerMatches(hp.pendingEnrollmentAttempt[serverID], attempt)
+}
+
+// ownerMatches reports whether a recorded owner permits the caller to act. An
+// unattributed owner (0) or an unspecified caller (0) does not contradict the
+// caller; any two non-zero values must be equal. Kept separate so the generation and
+// attempt halves cannot drift apart in what "owned" means.
+func ownerMatches[T comparable](recorded, caller T) bool {
+	var zero T
+	return recorded == zero || caller == zero || recorded == caller
+}
+
+// ReleaseEnrollmentForAttempt releases the caller mark only when the given
+// enrollment attempt owns it, so a qualified attempt's release cannot clear the
+// quarantine of a later enrollment of the same unchanged row.
+func (hp *HealthProber) ReleaseEnrollmentForAttempt(serverID int64, attempt uint64) {
+	if hp == nil || attempt == 0 {
 		return
 	}
-	// Zero means the marker predates generation tracking (constructed from durable
-	// state at startup): it cannot be attributed to a replacement, so the retired
-	// release still owns it.
-	owner := hp.pendingEnrollmentGeneration[serverID]
-	if owner != 0 && retiredTunnelID != 0 && owner != retiredTunnelID {
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	if !hp.markerOwnedByLocked(serverID, 0, attempt) {
 		return
 	}
-	delete(hp.pendingEnrollment, serverID)
-	delete(hp.pendingEnrollmentGeneration, serverID)
+	hp.clearEnrollmentLocked(serverID)
 }
 
 // SetPendingEnrollment sets whether a backend server is currently undergoing initial enrollment qualification.
@@ -301,6 +345,29 @@ func (hp *HealthProber) SetPendingEnrollment(serverID int64, pending bool) {
 	}
 }
 
+// MarkEnrollmentForAttempt quarantines serverID on behalf of a specific enrollment
+// attempt of tunnelID, without touching the durable store.
+//
+// It exists so a caller that has ALREADY validated the attempt it acts on can bind
+// the runtime mark to that attempt instead of re-deriving it from whatever the row
+// holds by then. That re-derivation is exactly how a mark for a retired enrollment
+// ends up labeled with the current one, which then makes the current enrollment's
+// own qualification release look like a release of its own gate.
+func (hp *HealthProber) MarkEnrollmentForAttempt(serverID, tunnelID int64, attempt uint64) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	hp.markEnrollmentLocked(serverID, tunnelID)
+	if attempt != 0 {
+		if hp.pendingEnrollmentAttempt == nil {
+			hp.pendingEnrollmentAttempt = make(map[int64]uint64)
+		}
+		hp.pendingEnrollmentAttempt[serverID] = attempt
+	}
+}
+
 // MarkEnrollmentForGeneration quarantines serverID on behalf of the tunnel
 // generation tunnelID, without touching the durable store.
 //
@@ -320,9 +387,10 @@ func (hp *HealthProber) MarkEnrollmentForGeneration(serverID, tunnelID int64) {
 
 // ReleaseEnrollmentForGeneration releases the caller mark only when this
 // generation owns it, so a qualified backend's release cannot clear a
-// replacement's quarantine.
+// replacement's quarantine. Attempt 0 keeps the original generation-only
+// behavior for callers that have no attempt identity.
 func (hp *HealthProber) ReleaseEnrollmentForGeneration(serverID, tunnelID int64) {
-	hp.releaseRuntimeEnrollmentIfGeneration(serverID, tunnelID)
+	hp.releaseRuntimeEnrollmentIfGeneration(serverID, tunnelID, 0)
 }
 
 // markEnrollmentLocked records the quarantine under hp.mu and binds it to
@@ -339,6 +407,11 @@ func (hp *HealthProber) markEnrollmentLocked(serverID, tunnelID int64) {
 		hp.pendingEnrollmentGeneration = make(map[int64]int64)
 	}
 	hp.pendingEnrollmentGeneration[serverID] = tunnelID
+	// The enrollment attempt is deliberately NOT re-derived from the live row here.
+	// A caller that knows which attempt it acts for says so explicitly
+	// (MarkEnrollmentForAttempt); deriving it would label a retired enrollment's
+	// mark with the current attempt, and that mislabel is what makes a stale
+	// release look authoritative.
 }
 
 // clearEnrollmentLocked drops both halves of the caller mark. The caller must
@@ -346,6 +419,7 @@ func (hp *HealthProber) markEnrollmentLocked(serverID, tunnelID int64) {
 func (hp *HealthProber) clearEnrollmentLocked(serverID int64) {
 	delete(hp.pendingEnrollment, serverID)
 	delete(hp.pendingEnrollmentGeneration, serverID)
+	delete(hp.pendingEnrollmentAttempt, serverID)
 }
 
 // IsPendingEnrollment reports whether a backend server is currently undergoing initial enrollment qualification.

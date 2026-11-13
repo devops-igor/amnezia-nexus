@@ -41,7 +41,7 @@ type Pool struct {
 	// durable row; the HealthProber owns the in-memory map. Without this, an admin
 	// delete cleared only the database and the replacement backend stayed
 	// quarantined in memory until a process restart.
-	enrollmentReleaseHook func(ctx context.Context, serverID, retiredTunnelID int64)
+	enrollmentReleaseHook func(ctx context.Context, serverID, retiredTunnelID int64, retiredAttempt uint64)
 	// enrollmentPending is the runtime quarantine of deploy-enrolled tunnel
 	// GENERATIONS, keyed by tunnel id. It changes in the same p.mu critical
 	// section as the durable commit it mirrors (deploy add or re-enrollment sets
@@ -49,6 +49,11 @@ type Pool struct {
 	// in which a committed unqualified backend is unquarantined, and a removal or
 	// late release for one generation cannot touch another's entry.
 	enrollmentPending map[int64]bool
+	// enrollmentAttemptSeq issues the monotonic enrollment-attempt ids that let a
+	// qualification prove which enrollment of a row it observed. It is guarded by
+	// p.mu and never reused, so an attempt that comes back can only mean the same
+	// attempt. See models.BackendTunnel.EnrollmentAttempt.
+	enrollmentAttemptSeq uint64
 }
 
 // SetMultiProtocolEnabled configures whether multi-protocol backends are enabled.
@@ -260,7 +265,7 @@ func (p *Pool) RemoveTunnel(ctx context.Context, serverID int64) error {
 		// retiredTunnelID is passed so the runtime owner can refuse to clear a
 		// quarantine established by a LATER generation: this callback runs after
 		// p.mu is released, and a replacement can be quarantined in that window.
-		release(context.WithoutCancel(ctx), serverID, tunnel.ID)
+		release(context.WithoutCancel(ctx), serverID, tunnel.ID, tunnel.EnrollmentAttempt)
 	}
 	return nil
 }
@@ -818,7 +823,7 @@ func (p *Pool) SetSetTunnelEnabledHookForTest(fn func(ctx context.Context, serve
 
 // SetEnrollmentReleaseHook registers the runtime enrollment owner so a tunnel
 // removal releases BOTH markers, not just the durable one.
-func (p *Pool) SetEnrollmentReleaseHook(fn func(ctx context.Context, serverID, retiredTunnelID int64)) {
+func (p *Pool) SetEnrollmentReleaseHook(fn func(ctx context.Context, serverID, retiredTunnelID int64, retiredAttempt uint64)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.enrollmentReleaseHook = fn

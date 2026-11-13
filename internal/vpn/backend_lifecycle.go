@@ -54,14 +54,21 @@ func (s *Service) withdrawObservedBackendLocked(ctx context.Context, observed *m
 		}
 		return err
 	}
-	if !models.SameTunnelIdentity(live, observed) {
+	// One predicate for both halves: identity alone cannot see a re-enrollment of
+	// the same row with unchanged credentials, so only the attempt that actually
+	// failed may be withdrawn.
+	if !tunnel.ObservedOwnsLive(live, observed) {
 		return tunnel.ErrTunnelGenerationRetired
 	}
 	// The runtime caller mark is bound to this generation so a retired release
 	// cannot clear a replacement's gate; the durable marker is bound to the row
 	// by the pool, so both owners stay consistent.
 	if s.prober != nil {
-		s.prober.MarkEnrollmentForGeneration(observed.ServerID, observed.ID)
+		if observed.EnrollmentAttempt != 0 {
+			s.prober.MarkEnrollmentForAttempt(observed.ServerID, observed.ID, observed.EnrollmentAttempt)
+		} else {
+			s.prober.MarkEnrollmentForGeneration(observed.ServerID, observed.ID)
+		}
 	}
 	return s.disableBackendLocked(ctx, observed.ServerID)
 }

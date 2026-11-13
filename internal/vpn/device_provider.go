@@ -106,11 +106,16 @@ func (s *Service) PromoteQualifiedTunnel(ctx context.Context, observed *models.B
 	}
 	// The pool released its generation quarantine inside the commit above and
 	// PromoteObservedTunnelWithEnrollmentRelease released the durable marker in
-	// the same transaction (finding F10). Only this generation's caller mark
-	// remains, and it is released by IDENTITY so a replacement that acquired the
-	// server slot in the meantime keeps its own quarantine.
+	// the same transaction (finding F10). Only this OBSERVATION's caller mark
+	// remains. It is released by enrollment attempt when the observation carries
+	// one, so the release cannot clear the gate of a later enrollment of the same
+	// unchanged row; generation identity remains the fence otherwise.
 	if s.prober != nil {
-		s.prober.ReleaseEnrollmentForGeneration(observed.ServerID, observed.ID)
+		if observed.EnrollmentAttempt != 0 {
+			s.prober.ReleaseEnrollmentForAttempt(observed.ServerID, observed.EnrollmentAttempt)
+		} else {
+			s.prober.ReleaseEnrollmentForGeneration(observed.ServerID, observed.ID)
+		}
 	}
 	return nil
 }

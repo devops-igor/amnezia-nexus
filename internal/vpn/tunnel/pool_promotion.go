@@ -34,15 +34,34 @@ func (p *Pool) promotionTargetLocked(serverID, expectedTunnelID, expectedVersion
 	return tunnel, nil
 }
 
-// observedGenerationLocked resolves the backend a qualification observed, and
-// refuses when the server slot is now owned by a different generation.
+// ObservedOwnsLive reports whether an observation still describes the backend that
+// owns the server slot: same row identity AND same enrollment attempt.
 //
-// Identity equality, not the row id alone, is the fence: a deployment re-enrolls
-// an existing row with fresh credentials (same id, different endpoint or
-// protocol parameters), so an id-only check would let a retired observation
-// admit the replacement credentials it never proved. The whole decision runs
-// under p.mu, the lock every generation change and every promotion takes, so
-// the validated generation is the one the commit acts on.
+// The two halves answer one question and must be asked together, so they live in one
+// predicate rather than being repeated per caller:
+//   - SameTunnelIdentity catches a replaced row or rotated endpoint/credentials.
+//   - the attempt catches a deploy re-enrollment of an UNCHANGED identity, which the
+//     identity comparison cannot see and StateVersion cannot distinguish from an
+//     ordinary health write.
+//
+// Both are exact equality on the fact, never a presence test: a live row that carries
+// an attempt while the observation carries none means the row has been enrolled since
+// the observation was taken, which must fail closed. Both zero (a plain,
+// never-enrolled row) compares equal.
+func ObservedOwnsLive(live, observed *models.BackendTunnel) bool {
+	if live == nil || observed == nil {
+		return false
+	}
+	return models.SameTunnelIdentity(live, observed) &&
+		live.EnrollmentAttempt == observed.EnrollmentAttempt
+}
+
+// observedGenerationLocked resolves the backend a qualification observed, and
+// refuses when the server slot is no longer owned by the same observation.
+//
+// The decision is delegated to ObservedOwnsLive so promotion and withdrawal answer
+// one question one way. It runs under p.mu, the lock every generation change and
+// every promotion takes, so the validated generation is the one the commit acts on.
 // The caller must hold p.mu.
 func (p *Pool) observedGenerationLocked(observed *models.BackendTunnel) (*models.BackendTunnel, error) {
 	if observed == nil || observed.ID <= 0 || observed.ServerID <= 0 {
@@ -52,7 +71,7 @@ func (p *Pool) observedGenerationLocked(observed *models.BackendTunnel) (*models
 	if !ok {
 		return nil, ErrTunnelNotFound
 	}
-	if !models.SameTunnelIdentity(live, observed) {
+	if !ObservedOwnsLive(live, observed) {
 		return nil, ErrTunnelGenerationRetired
 	}
 	if !live.Enabled {

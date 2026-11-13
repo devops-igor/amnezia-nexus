@@ -37,14 +37,14 @@ func pauseFirstEnrollmentEvent(t *testing.T, p *Pool) (entered <-chan struct{}, 
 	in := make(chan struct{})
 	gate := make(chan struct{})
 	var first sync.Once
-	p.SetEnrollmentReleaseHook(func(ctx context.Context, serverID, retiredTunnelID int64) {
+	p.SetEnrollmentReleaseHook(func(ctx context.Context, serverID, retiredTunnelID int64, retiredAttempt uint64) {
 		paused := false
 		first.Do(func() { paused = true })
 		if paused {
 			close(in)
 			<-gate
 		}
-		owner(ctx, serverID, retiredTunnelID)
+		owner(ctx, serverID, retiredTunnelID, retiredAttempt)
 	})
 	var once sync.Once
 	release := func() { once.Do(func() { close(gate) }) }
