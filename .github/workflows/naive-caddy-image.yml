@@ -33,6 +33,11 @@ jobs:
   publish:
     name: Build and Publish
     runs-on: ubuntu-latest
+    # A pull request from a fork gets a read-only token, so it could not push to
+    # the registry; skip the job there instead of failing a check it cannot pass.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
