@@ -15,7 +15,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -245,20 +244,35 @@ func setupTestH2ServerOnAddr(t *testing.T, listenAddr, authUser, authPass string
 	if len(onConnect) > 0 && onConnect[0] != nil {
 		connectCb = onConnect[0]
 	}
-	cert, err := generateLeafCert(testCACert, testCAKey, testCamouflageDomain)
-	if err != nil {
-		t.Fatalf("generate leaf cert: %v", err)
-	}
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"h2"},
-	}
+	tlsConfig := testH2TLSConfig(t)
 
 	ln, err := tls.Listen("tcp", listenAddr, tlsConfig)
 	if err != nil {
 		t.Fatalf("listen h2 tls: %v", err)
 	}
+
+	return serveTestH2(t, ln, authUser, authPass, probeResistance, connectCb)
+}
+
+// testH2TLSConfig builds the TLS configuration the H2 test proxy serves with. It
+// is separate from listener creation so a caller that already holds a loopback
+// TCP port can serve on it instead of rebinding the port.
+func testH2TLSConfig(t *testing.T) *tls.Config {
+	t.Helper()
+	cert, err := generateLeafCert(testCACert, testCAKey, testCamouflageDomain)
+	if err != nil {
+		t.Fatalf("generate leaf cert: %v", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h2"},
+	}
+}
+
+// serveTestH2 runs the H2 test proxy handler on an already-bound TLS listener and
+// returns its address plus a cleanup func that stops the server and the listener.
+func serveTestH2(t *testing.T, ln net.Listener, authUser, authPass string, probeResistance bool, connectCb func(authority string)) (string, func()) {
+	t.Helper()
 
 	expectedAuth := basicAuth(authUser, authPass)
 
@@ -455,38 +469,50 @@ func setupTestH3ServerOnAddr(t *testing.T, listenAddr, authUser, authPass string
 	return udpConn.LocalAddr().String(), cleanup
 }
 
+// dualStackPortPairAttempts bounds how many loopback port candidates the
+// dual-protocol fixture will try before giving up with a terminal failure.
+const dualStackPortPairAttempts = 8
+
 func setupDualStackH2H3Server(t *testing.T, authUser, authPass string) (string, *atomic.Bool, func()) {
 	t.Helper()
-	h2Addr, cleanupH2 := setupTestH2Server(t, authUser, authPass, true)
-	_, portStr, err := net.SplitHostPort(h2Addr)
+
+	// The H2 proxy serves on TCP and the H3 relay serves on UDP on the same
+	// port, so the port has to be held for both protocols before either one
+	// serves. Selecting a TCP ephemeral port and then binding UDP on that number
+	// is not a reservation: UDP has its own port space, so the port can already
+	// belong to an unrelated socket.
+	pair, err := acquireLoopbackPortPair("127.0.0.1", dualStackPortPairAttempts, listenLoopbackTCP)
 	if err != nil {
-		cleanupH2()
-		t.Fatalf("split host port: %v", err)
+		t.Fatalf("reserve dual-protocol loopback endpoint: %v", err)
 	}
-	sharedPort, _ := strconv.Atoi(portStr)
+	owned := &fixtureResources{}
+	owned.add(pair.close)
+	// Setup fatals still release every socket already acquired, so a failed
+	// fixture cannot leave a held port behind for later tests in this package.
+	t.Cleanup(owned.release)
+
+	h2Addr, cleanupH2 := serveTestH2(t, tls.NewListener(pair.tcp, testH2TLSConfig(t)),
+		authUser, authPass, true, nil)
+	owned.add(cleanupH2)
 
 	h3Addr, cleanupH3 := setupTestH3Server(t, authUser, authPass, true)
+	owned.add(cleanupH3)
+
 	up, err := net.ResolveUDPAddr("udp", h3Addr)
 	if err != nil {
-		cleanupH2()
-		cleanupH3()
+		owned.release()
 		t.Fatalf("resolve udp: %v", err)
 	}
 
-	relay, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sharedPort})
-	if err != nil {
-		cleanupH2()
-		cleanupH3()
-		t.Fatalf("listen udp relay: %v", err)
-	}
-
+	// pair.udp is already bound on the shared port, so it is the relay itself;
+	// there is no rebind and no window in which the port changes hands.
+	relay := pair.udp
 	upConn, err := net.DialUDP("udp", nil, up)
 	if err != nil {
-		cleanupH2()
-		cleanupH3()
-		_ = relay.Close()
+		owned.release()
 		t.Fatalf("dial udp relay: %v", err)
 	}
+	owned.add(func() { _ = upConn.Close() })
 
 	var drop atomic.Bool
 	var client atomic.Pointer[net.UDPAddr]
@@ -518,14 +544,7 @@ func setupDualStackH2H3Server(t *testing.T, authUser, authPass string) (string, 
 		}
 	}()
 
-	cleanup := func() {
-		_ = relay.Close()
-		_ = upConn.Close()
-		cleanupH3()
-		cleanupH2()
-	}
-
-	return h2Addr, &drop, cleanup
+	return h2Addr, &drop, owned.release
 }
 
 type r2Relay struct {
