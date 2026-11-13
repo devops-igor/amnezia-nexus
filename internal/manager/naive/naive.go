@@ -22,7 +22,18 @@ const (
 	NaiveHTMLDir       = NaiveWWWDir
 	NaiveCaddyfilePath = "/opt/amnezia/caddy/Caddyfile"
 	NaiveDataVolume    = "amnezia-caddy-data"
-	NaiveBaseImage     = "amnezia-caddy:local"
+
+	// NaiveImageRepository is the published multi-arch image that ships Caddy
+	// with the NaiveProxy forward_proxy handler already compiled in. The panel
+	// pulls it instead of compiling Caddy on the target host (issue #680).
+	NaiveImageRepository = "ghcr.io/devops-igor/amnezia-nexus/naive-caddy"
+	// NaiveImageDigest pins one immutable multi-arch index. A digest is
+	// content-addressed, so a registry cannot serve different bytes under it,
+	// and the registry keeps it after later rebuilds: upgrading is a deliberate
+	// commit, not a side effect of merging.
+	NaiveImageDigest = "sha256:c0ab3836fdbb1e938d1965831337124041aba22b57e18ee585bcc5f153f95269"
+	// NaiveImageRef is the exact reference the installer pulls and runs.
+	NaiveImageRef = NaiveImageRepository + "@" + NaiveImageDigest
 )
 
 // Decoy website theme identifiers.
