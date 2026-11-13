@@ -577,7 +577,7 @@
   "vpn_diag_latency_p95": "Latence p95 (ms)",
   "vpn_diag_load_skew": "Déséquilibre de charge",
   "vpn_diag_device_drops": "Pertes du périphérique",
-  "vpn_diag_cpu_usage": "Utilisation du CPU",
+  "vpn_diag_cpu_usage": "Utilisation du CPU (processus du portail)",
   "vpn_diag_memory": "Mémoire du tas (allouée / limite)",
   "vpn_diag_goroutines": "Goroutines",
   "vpn_diag_gc_pause": "Pause GC p95",

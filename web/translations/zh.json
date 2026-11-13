@@ -577,7 +577,7 @@
   "vpn_diag_latency_p95": "延迟 p95 (ms)",
   "vpn_diag_load_skew": "负载偏斜",
   "vpn_diag_device_drops": "设备丢包",
-  "vpn_diag_cpu_usage": "CPU 使用率",
+  "vpn_diag_cpu_usage": "CPU 使用率（面板进程）",
   "vpn_diag_memory": "堆内存（已分配 / 限制）",
   "vpn_diag_goroutines": "Goroutine 数量",
   "vpn_diag_gc_pause": "GC 暂停 p95",
