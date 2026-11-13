@@ -574,9 +574,10 @@ func TestRuntimeVersionDetection_FailedDetectionLeavesVersionEmpty(t *testing.T)
 			t.Errorf("expected caddy_version to be absent/empty on failed runtime detection, got %v", cv)
 		}
 
-		// plugin_version must be strictly v2.11.7-naive
-		if pv, _ := naiveProto["plugin_version"].(string); pv != "v2.11.7-naive" {
-			t.Errorf("expected plugin_version to be 'v2.11.7-naive', got %q", pv)
+		// plugin_version is known from the image pin even when the running
+		// container cannot be probed, and must be the version that image ships.
+		if pv, _ := naiveProto["plugin_version"].(string); pv != naive.NaiveForwardProxyVersion {
+			t.Errorf("expected plugin_version to be %q, got %q", naive.NaiveForwardProxyVersion, pv)
 		}
 	})
 
