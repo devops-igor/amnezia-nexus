@@ -288,15 +288,36 @@ func (m *NaiveManager) resolveExistingClients(ctx context.Context, client ssh.SS
 	return clients, nil
 }
 
-func (m *NaiveManager) buildAndLaunchContainer(ctx context.Context, client ssh.SSHClient) error {
-	dockerfile := RenderCaddyDockerfile()
-	if err := client.UploadSudoFile(ctx, fmt.Sprintf("%s/Dockerfile", NaiveConfigDir), []byte(dockerfile), 0644); err != nil {
-		return fmt.Errorf("failed to upload Caddy Dockerfile: %w", err)
+// pullCaddyImage fetches the pinned image. Pulling by digest makes the reference
+// content-addressed, so the registry cannot serve different bytes under it.
+func pullCaddyImage(ctx context.Context, client ssh.SSHClient) error {
+	cmd := fmt.Sprintf("docker pull %s", ssh.EscapeShellArg(NaiveImageRef))
+	var lastErr error
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		_, errOut, code, err := client.RunSudoCommand(ctx, cmd)
+		if err == nil && code == 0 {
+			return nil
+		}
+		if err != nil {
+			lastErr = fmt.Errorf("failed to pull caddy image %s (code %d): %s: %w", NaiveImageRef, code, errOut, err)
+			continue
+		}
+		lastErr = fmt.Errorf("failed to pull caddy image %s (code %d): %s", NaiveImageRef, code, errOut)
 	}
+	return lastErr
+}
 
-	buildCmd := fmt.Sprintf("docker build -t %s %s", ssh.EscapeShellArg(NaiveBaseImage), ssh.EscapeShellArg(NaiveConfigDir))
-	if _, errOut, code, err := client.RunSudoCommand(ctx, buildCmd); err != nil || code != 0 {
-		return fmt.Errorf("failed to build caddy image (code %d): %s: %w", code, errOut, err)
+// pullAndLaunchContainer fetches the pinned image and starts amnezia-caddy.
+//
+// The image is pulled by digest, so a compromised or mis-tagged registry entry
+// cannot substitute different content: the pull fails instead. One retry covers
+// a transient registry blip without turning a real failure into a slow one.
+func (m *NaiveManager) pullAndLaunchContainer(ctx context.Context, client ssh.SSHClient) error {
+	if err := pullCaddyImage(ctx, client); err != nil {
+		return err
 	}
 
 	_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker volume create %s 2>/dev/null || true", ssh.EscapeShellArg(NaiveDataVolume)))
@@ -320,7 +341,7 @@ func (m *NaiveManager) buildAndLaunchContainer(ctx context.Context, client ssh.S
 		ssh.EscapeShellArg(NaiveConfigDir),
 		ssh.EscapeShellArg(NaiveWWWDir),
 		ssh.EscapeShellArg(NaiveDataVolume),
-		ssh.EscapeShellArg(NaiveBaseImage),
+		ssh.EscapeShellArg(NaiveImageRef),
 	)
 
 	if _, errOut, code, err := client.RunSudoCommand(ctx, runCmd); err != nil || code != 0 {
@@ -409,12 +430,12 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 	}
 
 	// 6. Build and launch amnezia-caddy container
-	if err := m.buildAndLaunchContainer(ctx, client); err != nil {
+	if err := m.pullAndLaunchContainer(ctx, client); err != nil {
 		return err
 	}
 
 	caddyVer := determineRunningCaddyVersion(ctx, client)
-	pluginVer := "v2.11.7-naive"
+	pluginVer := NaiveForwardProxyVersion
 
 	// Update server.Protocols in-memory
 	if server.Protocols == nil {

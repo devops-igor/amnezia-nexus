@@ -115,6 +115,11 @@ def test_install_failure_emits_bounded_artifact(tmp_path: Path, capsys) -> None:
         ),
         ("failed to upload Dockerfile: sftp: permission denied", "dockerfile_upload"),
         ("failed to pull AWG base image img:v1 (code 1): denied, exit status 1", "image_pull"),
+        (
+            "failed to pull caddy image 'ghcr.io/x/naive-caddy@sha256:abc' (code 1): "
+            "manifest unknown",
+            "image_pull",
+        ),
         ("failed to build amnezia-awg2 image (code 1): apk failed, exit status 1", "image_build"),
         ("failed to run container (code 125): port is already allocated", "container_run"),
         ("pool failed to dial server:1:host:22:ubuntu: ssh: handshake failed", "ssh_client"),

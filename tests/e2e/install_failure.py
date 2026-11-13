@@ -67,6 +67,7 @@ _STEP_PREFIXES: Tuple[Tuple[str, str], ...] = (
     ("UDP port ", "udp_port_in_use"),
     ("failed to upload Dockerfile", "dockerfile_upload"),
     ("failed to pull AWG base image", "image_pull"),
+    ("failed to pull caddy image", "image_pull"),
     ("failed to build ", "image_build"),
     ("failed to run container", "container_run"),
 )

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +26,7 @@ type mockNaiveSSHClient struct {
 	sshUser            string
 	denyConfigDownload bool
 	denyConfigStat     bool
+	denyImagePull      bool
 }
 
 func newMockNaiveSSHClient() *mockNaiveSSHClient {
@@ -69,8 +71,11 @@ func (m *mockNaiveSSHClient) RunSudoCommand(ctx context.Context, cmd string) (st
 		}
 		return "", "", 0, nil
 	}
-	if strings.Contains(cmd, "docker build") {
-		return "Successfully built", "", 0, nil
+	if strings.Contains(cmd, "docker pull") {
+		if m.denyImagePull {
+			return "", "pull access denied for pinned image", 1, nil
+		}
+		return "digest: sha256:pinned", "", 0, nil
 	}
 	if strings.Contains(cmd, "docker run") {
 		m.dockerAlive = true
@@ -551,7 +556,7 @@ func TestNaiveConfig_NonDefaultPortRoundTrip(t *testing.T) {
 	}
 }
 
-func TestNaiveManager_DockerBuildAndDirectoryMount(t *testing.T) {
+func TestNaiveManager_PinnedImagePullAndDirectoryMount(t *testing.T) {
 	mockSSH := newMockNaiveSSHClient()
 	pool := &mockNaivePool{client: mockSSH}
 	locks := awg.NewServerLockRegistry()
@@ -576,30 +581,18 @@ func TestNaiveManager_DockerBuildAndDirectoryMount(t *testing.T) {
 		t.Fatalf("Install failed: %v", err)
 	}
 
-	// B4 assertion: Dockerfile must be uploaded with xcaddy builder for klzgrad/forwardproxy
-	dockerfilePath := NaiveConfigDir + "/Dockerfile"
-	dfBytes, ok := mockSSH.files[dockerfilePath]
-	if !ok || len(dfBytes) == 0 {
-		t.Fatalf("Dockerfile was not uploaded to %s", dockerfilePath)
-	}
-	dfContent := string(dfBytes)
-	if !strings.Contains(dfContent, "FROM caddy:builder AS builder") {
-		t.Errorf("Dockerfile missing builder stage:\n%s", dfContent)
-	}
-	if !strings.Contains(dfContent, "c096d6a00cb28e019cc1995b04bdc6a9311d8024") {
-		t.Errorf("Dockerfile missing pinned forwardproxy commit digest:\n%s", dfContent)
-	}
-	if !strings.Contains(dfContent, "FROM caddy:alpine") {
-		t.Errorf("Dockerfile missing alpine runtime stage:\n%s", dfContent)
-	}
-
-	// B4 assertion: docker build command was executed with sudo
-	var buildCmd string
+	// Phase 1 (#680): the installer must never compile Caddy on the target host.
+	// It pulls the pinned digest instead, so a slow target cannot turn an install
+	// into a 14-minute build.
+	var pullCmd string
 	var runCmd string
 	var inspectCmd string
 	for _, cmd := range mockSSH.commands {
 		if strings.Contains(cmd, "docker build") {
-			buildCmd = cmd
+			t.Errorf("installer must not build an image on the host: %q", cmd)
+		}
+		if strings.Contains(cmd, "docker pull") {
+			pullCmd = cmd
 		}
 		if strings.Contains(cmd, "docker run") {
 			runCmd = cmd
@@ -609,11 +602,17 @@ func TestNaiveManager_DockerBuildAndDirectoryMount(t *testing.T) {
 		}
 	}
 
-	if buildCmd == "" || !strings.HasPrefix(buildCmd, "sudo: ") {
-		t.Errorf("expected docker build via RunSudoCommand, got %q", buildCmd)
+	if !strings.Contains(NaiveImageRef, "@sha256:") {
+		t.Fatalf("NaiveImageRef must be digest-pinned, got %q", NaiveImageRef)
 	}
-	if !strings.Contains(buildCmd, "-t 'amnezia-caddy:local'") {
-		t.Errorf("expected docker build tag amnezia-caddy:local, got: %s", buildCmd)
+	if pullCmd == "" || !strings.HasPrefix(pullCmd, "sudo: ") {
+		t.Fatalf("expected docker pull via RunSudoCommand, got %q", pullCmd)
+	}
+	if !strings.Contains(pullCmd, "'"+NaiveImageRef+"'") {
+		t.Errorf("pull must use the pinned reference %q, got: %s", NaiveImageRef, pullCmd)
+	}
+	if _, ok := mockSSH.files[NaiveConfigDir+"/Dockerfile"]; ok {
+		t.Errorf("installer must not upload a Dockerfile any more")
 	}
 
 	// H1 & Hardening assertions: directory mount instead of single file, no resolv.conf, hardening flags
@@ -629,8 +628,8 @@ func TestNaiveManager_DockerBuildAndDirectoryMount(t *testing.T) {
 	if strings.Contains(runCmd, "resolv.conf") {
 		t.Errorf("docker run must NOT mount resolv.conf:\n%s", runCmd)
 	}
-	if !strings.Contains(runCmd, "'amnezia-caddy:local'") {
-		t.Errorf("docker run must use local built image amnezia-caddy:local, got:\n%s", runCmd)
+	if !strings.Contains(runCmd, "'"+NaiveImageRef+"'") {
+		t.Errorf("docker run must use the pinned image %q, got:\n%s", NaiveImageRef, runCmd)
 	}
 	if !strings.Contains(runCmd, "--log-driver none") {
 		t.Errorf("docker run missing --log-driver none flag:\n%s", runCmd)
@@ -833,4 +832,68 @@ func TestNaiveManager_InstallFailsClosedOnMalformedOrUncertainConfig(t *testing.
 			t.Errorf("expected error to mention basic_auth, got: %v", err)
 		}
 	})
+}
+
+// TestNaiveManager_InstallFailsFastWhenPinnedImageCannotBePulled covers the
+// failure mode that replaced the on-host build: if the pinned image cannot be
+// fetched, the install must stop with a labelled error instead of starting a
+// container from a missing image (issue #680 Phase 1).
+func TestNaiveManager_InstallFailsFastWhenPinnedImageCannotBePulled(t *testing.T) {
+	mockSSH := newMockNaiveSSHClient()
+	mockSSH.denyImagePull = true
+
+	pool := &mockNaivePool{client: mockSSH}
+	mgr := NewNaiveManagerWithServerLocks(pool, awg.NewServerLockRegistry())
+	server := &models.Server{ID: 91, Host: "198.51.100.9", SSHPort: 22}
+
+	err := mgr.Install(context.Background(), server, map[string]any{
+		"port": 443,
+		"naive_options": models.NaiveInstallOptions{
+			Port:   "443",
+			Domain: "naive.example.com",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected Install to fail when the pinned image cannot be pulled")
+	}
+	if !strings.Contains(err.Error(), "failed to pull caddy image") {
+		t.Fatalf("expected a labelled pull failure, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), NaiveImageRef) {
+		t.Errorf("expected the error to name the pinned reference %q, got: %v", NaiveImageRef, err)
+	}
+	// One retry is allowed; a run must never follow a failed pull.
+	pulls := 0
+	for _, cmd := range mockSSH.commands {
+		if strings.Contains(cmd, "docker pull") {
+			pulls++
+		}
+		if strings.Contains(cmd, "docker run") {
+			t.Errorf("must not start a container after a failed pull: %q", cmd)
+		}
+	}
+	if pulls != 2 {
+		t.Errorf("expected exactly one retry (2 pulls), got %d", pulls)
+	}
+}
+
+// TestPinnedForwardProxyMetadataMatchesTheImage is the guard for the drift the
+// review caught: the installer stored v2.11.7-naive while the image already
+// carried v2.11.7-naive2, so every fresh install looked one release behind and
+// server_engine_status reported a phantom update. The version must track the
+// commit pinned in the Dockerfile, which this asserts offline.
+func TestPinnedForwardProxyMetadataMatchesTheImage(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "docker", "naive-caddy", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read pinned image Dockerfile: %v", err)
+	}
+	if !strings.Contains(string(raw), NaiveForwardProxyCommit) {
+		t.Fatalf("pinned image no longer builds forwardproxy commit %s; move NaiveForwardProxyVersion with it", NaiveForwardProxyCommit)
+	}
+	if !strings.Contains(string(raw), NaiveForwardProxyVersion) {
+		t.Fatalf("Dockerfile does not mention %s; the stored plugin version would drift from the image", NaiveForwardProxyVersion)
+	}
+	if NaiveForwardProxyVersion == "v2.11.7-naive" {
+		t.Fatalf("plugin_version must not be the pre-naive2 tag")
+	}
 }
