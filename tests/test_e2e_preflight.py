@@ -24,6 +24,7 @@ ALLOWED_REASONS = {
     "docker_unavailable",
     "host_network_unreachable",
     "dns_failure",
+    "probe_timeout",
     "image_pull",
     "image_run",
     "module_missing",
@@ -67,13 +68,29 @@ def test_preflight_is_bounded() -> None:
     for bounded in (
         "timeout 15 docker info",
         "timeout 30 docker manifest inspect",
-        "timeout 60 docker pull",
-        "timeout 20 docker run",
+        "timeout 180 docker pull",
+        "timeout 120 docker run",
     ):
         assert bounded in text, f"missing bound: {bounded}"
     # A single probe attempt: busybox wget retries by default, which would
     # silently consume the whole budget and hide which layer failed.
     assert "-t 1" in text
+
+
+def test_probe_budget_covers_container_start_apart_from_the_probe() -> None:
+    """A slow container start must never be reported as a DNS or network cause.
+
+    The arm64 DEV runner starts a container in 2-29s. A single docker-run budget
+    that also contained the probe reported ``dns_failure`` for what was in fact a
+    startup stall, so startup owns the outer bound and each probe owns an inner
+    one, with ``probe_timeout`` reserved for "never got to run a probe".
+    """
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "timeout 120 docker run" in text, "container start needs its own budget"
+    assert "timeout 10 nslookup" in text, "the resolver probe must be bounded inside the container"
+    assert "timeout 15 wget" in text, "the HTTP probe must be bounded inside the container"
+    assert "probe_timeout" in text, "a stalled start must not masquerade as a cause"
+
 
 
 def test_host_egress_is_measured_before_the_container_probe() -> None:

@@ -23,6 +23,15 @@
 #                    `dns_failure`; a resolved-but-unreachable name is
 #                    `module_network_timeout`. They are not the same problem.
 #
+# Container start is budgeted separately from each probe. On the arm64 DEV
+# runner a single start measures between 2s and 29s, so charging startup to the
+# probe reported `dns_failure` for what was in fact a startup stall;
+# `probe_timeout` now means "never got far enough to run a probe".
+#
+# This verifies inputs, not build duration. The cold xcaddy build on that runner
+# takes about 866s, which no input check can predict -- that is why Phase 1
+# ships a prebuilt image instead of compiling on the target.
+#
 # It deliberately does NOT run the xcaddy build. A build here would warm the
 # Docker layer cache and could make the subsequent install succeed, hiding the
 # very cold-build dependency this preflight exists to surface.
@@ -74,11 +83,11 @@ pass docker_daemon "${started}"
 
 if [ -n "${IMAGE}" ]; then
     started="$(now_ms)"
-    timeout 60 docker pull "${IMAGE}" >/dev/null 2>&1 || fail image_pull image_pull "${started}"
+    timeout 180 docker pull "${IMAGE}" >/dev/null 2>&1 || fail image_pull image_pull "${started}"
     pass image_pull "${started}" " image=${IMAGE}"
 
     started="$(now_ms)"
-    modules="$(timeout 20 docker run --rm "${IMAGE}" caddy list-modules 2>/dev/null)" \
+    modules="$(timeout 120 docker run --rm "${IMAGE}" caddy list-modules 2>/dev/null)" \
         || fail image_run image_run "${started}"
     grep -qx "${MODULE}" <<<"${modules}" || fail image_modules module_missing "${started}"
     pass image_modules "${started}" " source=pinned_image module=${MODULE}"
@@ -102,24 +111,32 @@ else
     pass base_image "${started}" " image=caddy:builder"
 
     started="$(now_ms)"
-    timeout 60 docker pull caddy:builder >/dev/null 2>&1 \
+    timeout 180 docker pull caddy:builder >/dev/null 2>&1 \
         || fail builder_image image_pull "${started}"
     pass builder_image "${started}" " image=caddy:builder"
 
-    # Resolver first: a name that does not resolve is a different defect (and a
-    # different owner) than a name that resolves and is then blocked.
+    # One container start covers both probes. On a slow host a single start can
+    # take tens of seconds, so a separate per-probe docker-run budget would
+    # charge startup to the probe and report a false cause -- which is exactly
+    # what happened on the arm64 DEV runner (2s to 29s start, 20s budget).
+    # The outer bound covers startup; the inner bounds cover the probes.
     started="$(now_ms)"
-    timeout 20 docker run --rm --entrypoint sh caddy:builder \
-        -c "nslookup ${PROBE_HOST_NAME}" >/dev/null 2>&1 \
-        || fail module_dns dns_failure "${started}"
-    pass module_dns "${started}"
-
-    # Single attempt: busybox wget retries by default, which would consume the
-    # whole budget and hide which layer actually failed.
-    started="$(now_ms)"
-    timeout 20 docker run --rm --entrypoint sh caddy:builder \
-        -c "wget -q -t 1 -T 10 -O /dev/null '${PROBE_URL}'" >/dev/null 2>&1 \
-        || fail module_probe module_network_timeout "${started}"
+    probe_out="$(timeout 120 docker run --rm --entrypoint sh caddy:builder -c "
+        if timeout 10 nslookup ${PROBE_HOST_NAME} >/dev/null 2>&1; then echo dns_ok; else echo dns_fail; fi
+        if timeout 15 wget -q -t 1 -T 10 -O /dev/null '${PROBE_URL}'; then echo http_ok; else echo http_fail; fi
+    " 2>/dev/null)"
+    probe_rc=$?
+    # No token at all means the container never got far enough to run a probe;
+    # that is a slow or broken start, not a DNS or connectivity verdict.
+    if [ "${probe_rc}" -ne 0 ] && [ -z "${probe_out}" ]; then
+        fail probe_container probe_timeout "${started}"
+    fi
+    case "${probe_out}" in
+    *dns_fail*) fail module_dns dns_failure "${started}" ;;
+    esac
+    case "${probe_out}" in
+    *http_fail*) fail module_probe module_network_timeout "${started}" ;;
+    esac
     pass module_probe "${started}" " source=source_build"
 fi
 
