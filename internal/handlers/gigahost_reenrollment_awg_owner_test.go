@@ -3,20 +3,31 @@ package handlers
 // Owner finding 5, exact sequence (issue #794 group B).
 //
 // The retained audit probe and the committed same-row control both move the backend
-// through UpdateServerHostHandler. Finding 5 describes a different, also real
-// sequence: the SAME backend row is RE-ENROLLED (deploy enrollment B) with a changed
-// identity, which resets health to connecting, establishes a NEW quarantine boundary
-// and advances the state version. An AWG canary verdict belonging to the previous
-// enrollment must then be inert for B's status, reason, version, enabled state and
-// enrollment, in runtime AND in SQLite.
+// through UpdateServerHostHandler alone — a production administrative mutation that
+// changes the endpoint WITHOUT being a deploy enrollment, so it never produces the new
+// enrollment attempt finding 5 is about.
 //
-// This file closes that distinction instead of letting the host-update control stand
-// in for it. Subject: real deployment handler, Service, Pool and SQLite. The provider,
-// SSH transport and the network verdicts are the standard fixtures.
+// Finding 5's own sequence is both facts at once: the SAME backend row is RE-ENROLLED
+// (deploy enrollment B) and that enrollment has a CHANGED identity, which resets health
+// to connecting, establishes a NEW quarantine boundary and advances the state version. An
+// AWG canary verdict belonging to the previous enrollment must then be inert for B's
+// status, reason, state version, enabled state and enrollment, in runtime AND in SQLite.
+//
+// The changed identity is produced by combining the two production paths: the operator's
+// host correction changes the endpoint, and the deploy re-enrollment is the real producer
+// of the new attempt. Neither pool rows nor markers are hand-seeded here.
+//
+// Every precondition is a FAILING assertion rather than a comment. An earlier version of
+// this file described a "different endpoint" in prose while the bare re-enrollment
+// actually kept the identity identical, so the case proved finding 4's unchanged-identity
+// shape instead of this one.
+//
+// Subject: real deployment handler, host-update handler, Service, Pool and SQLite. The
+// provider, SSH transport and the network verdicts are the standard fixtures.
 //
 // Consumers used are the ones production actually has: the tunnel snapshot read, the
-// durable marker read, and loadbalancer.FilterHealthy — the same eligibility consumer
-// the deploy tests use. No getter is added purely for this test.
+// durable row/marker reads, and loadbalancer.FilterHealthy — the same eligibility
+// consumer the deploy tests use. No getter is added purely for this test.
 
 import (
 	"context"
@@ -62,25 +73,33 @@ func requireBackendQuarantined(t *testing.T, h *Handlers, serverID int64, when s
 	}
 }
 
-// reenrollSameRowDuringCanary re-enrolls the observed backend as deploy attempt B on
-// the SAME row with a CHANGED identity, verifies B is genuinely quarantined, then
-// returns the canary verdict for the previous observation.
-func reenrollSameRowDuringCanary(
+// sameRowChangedIdentityReenrollmentDuringCanary produces finding 5's sequence inside the
+// live qualification window and returns the ACTUAL durable snapshot captured before the
+// obsolete verdict is released.
+//
+// Required preconditions, each fatal: same row id, CHANGED identity, a new enrollment
+// attempt, B connecting+enabled, and B genuinely quarantined and unroutable.
+func sameRowChangedIdentityReenrollmentDuringCanary(
 	t *testing.T, h *Handlers, verdict error,
-) (serverID *int64, before *models.BackendTunnel) {
+) (serverID *int64, runtimeBefore, durableBefore *models.BackendTunnel) {
 	t.Helper()
 	serverID = new(int64)
-	before = new(models.BackendTunnel)
+	runtimeBefore = new(models.BackendTunnel)
+	durableBefore = new(models.BackendTunnel)
 	ctx := context.Background()
+
 	h.vpnSvc.SetCanaryProbeFunc(func(_ context.Context, observed *models.BackendTunnel) error {
 		*serverID = observed.ServerID
 		if observed.EnrollmentAttempt == 0 {
-			t.Fatalf("fixture: the observation carries no enrollment attempt (id=%d status=%s)", observed.ID, observed.Status)
+			t.Fatalf("fixture: the observation carries no enrollment attempt (id=%d status=%s)",
+				observed.ID, observed.Status)
 		}
 
-		// A deploy re-enrollment of the same row with a different endpoint. The
-		// deploy-enrollment context is what makes this enrollment B rather than an
-		// ordinary re-enable.
+		// (a) Production-supported identity mutation: the operator's host correction,
+		//     which rewrites the endpoint on the SAME row without enrolling it.
+		updateServerHostThroughHandler(t, h, observed.ServerID, "198.51.100.99")
+
+		// (b) The real deploy-enrollment producer: same row, new attempt, health reset.
 		if err := h.vpnSvc.EnableBackendWithConfig(
 			context.WithValue(ctx, tunnel.DeployEnrollmentKey, true),
 			observed.ServerID,
@@ -92,26 +111,63 @@ func reenrollSameRowDuringCanary(
 		if err != nil || b == nil {
 			t.Fatalf("read attempt B: %v", err)
 		}
+
+		// Precondition 1: SAME row.
 		if b.ID != observed.ID {
-			t.Fatalf("fixture: row id changed %d -> %d; this sequence re-enrolls the SAME row",
+			t.Fatalf("fixture: row id changed %d -> %d; finding5 re-enrolls the SAME row",
 				observed.ID, b.ID)
 		}
-		if b.Status != models.TunnelStatusConnecting || !b.Enabled {
-			t.Fatalf("fixture: B is not connecting+enabled: status=%q enabled=%v", b.Status, b.Enabled)
+		// Precondition 2: CHANGED identity. This is exactly the gap the previous version
+		// left as prose; without it the case would be finding4's shape, not finding5's.
+		if models.SameTunnelIdentity(observed, b) {
+			t.Fatalf("fixture: identity did not change (endpoint %q -> %q); the case would be "+
+				"finding4's unchanged-identity shape, not finding5's",
+				observed.Endpoint, b.Endpoint)
 		}
+		// Precondition 3: a genuinely NEW enrollment attempt.
 		if b.EnrollmentAttempt == observed.EnrollmentAttempt {
 			t.Fatalf("fixture: re-enrollment did not start a new attempt (still %d)", b.EnrollmentAttempt)
 		}
-		// B must be a REAL quarantine boundary BEFORE the obsolete verdict is released.
+		// Precondition 4: B is a real, unqualified, administratively enabled boundary.
+		if b.Status != models.TunnelStatusConnecting || !b.Enabled {
+			t.Fatalf("fixture: B is not connecting+enabled: status=%q enabled=%v", b.Status, b.Enabled)
+		}
+		// Precondition 5: quarantine and ineligibility are REAL before the verdict.
 		requireBackendQuarantined(t, h, observed.ServerID, "before releasing the obsolete verdict")
-		*before = *b
+
+		// Capture the ACTUAL persisted snapshot, so the after-comparison enforces durable
+		// state instead of re-deriving expectations from runtime.
+		row, err := h.db.GetBackendTunnelByServerID(ctx, observed.ServerID)
+		if err != nil || row == nil {
+			t.Fatalf("read durable B before releasing the verdict: %v", err)
+		}
+		if row.ID != b.ID {
+			t.Fatalf("fixture: durable row id %d != runtime %d", row.ID, b.ID)
+		}
+		if row.Status != models.TunnelStatusConnecting || !row.Enabled {
+			t.Fatalf("fixture: durable B is not connecting+enabled: status=%q enabled=%v",
+				row.Status, row.Enabled)
+		}
+		if row.StateVersion != b.StateVersion {
+			t.Fatalf("fixture: durable version %d != runtime %d", row.StateVersion, b.StateVersion)
+		}
+		pending, err := h.db.GetBackendPendingEnrollments(ctx)
+		if err != nil {
+			t.Fatalf("read durable enrollment before the verdict: %v", err)
+		}
+		if !pending[observed.ServerID] {
+			t.Fatal("fixture: B is not durably quarantined before the verdict")
+		}
+		*runtimeBefore = *b
+		*durableBefore = *row
 		return verdict
 	})
-	return serverID, before
+	return serverID, runtimeBefore, durableBefore
 }
 
-// TestSameRowDeployReenrollmentSurvivesObsoleteAWGCanaryFailure is the finding5 exact
-// sequence: an obsolete AWG canary failure must not touch the re-enrolled B.
+// TestSameRowDeployReenrollmentSurvivesObsoleteAWGCanaryFailure is finding 5's exact
+// sequence: an obsolete AWG canary failure must not touch the re-enrolled B, in runtime
+// or in SQLite.
 func TestSameRowDeployReenrollmentSurvivesObsoleteAWGCanaryFailure(t *testing.T) {
 	h, _, provider := setupDeployTestEnv(t)
 	provider.getDeployStatusFn = func(context.Context, string) (*gigahost.DeployStatusResponse, error) {
@@ -122,15 +178,15 @@ func TestSameRowDeployReenrollmentSurvivesObsoleteAWGCanaryFailure(t *testing.T)
 	h.vpnSvc.SetProbeFunc(func(context.Context, string, string, string, string, string, any, any, int, int, time.Duration) (time.Duration, error) {
 		return 5 * time.Millisecond, nil
 	})
-	serverID, before := reenrollSameRowDuringCanary(t, h,
+	serverID, runtimeBefore, durableBefore := sameRowChangedIdentityReenrollmentDuringCanary(t, h,
 		errors.New("old AWG inner canary timed out"))
 
 	_, err := h.DeployGigahostOrder(context.Background(), GigahostDeployRequest{
 		OrderID: "ord_test_1001", SSHPassword: "ValidSSHPass123!",
 		ServerName: "same-row-reenroll-failure", Protocol: "awg", Port: "51820", WaitReady: true,
 	})
-	if before == nil || before.ID == 0 {
-		t.Fatalf("fixture: the re-enrollment was never established (deploy err=%v)", err)
+	if durableBefore == nil || durableBefore.ID == 0 {
+		t.Fatalf("fixture: the changed-identity re-enrollment was never established (deploy err=%v)", err)
 	}
 	if err == nil {
 		t.Fatal("an obsolete failed qualification reported a ready deployment")
@@ -145,21 +201,46 @@ func TestSameRowDeployReenrollmentSurvivesObsoleteAWGCanaryFailure(t *testing.T)
 	if getErr != nil || row == nil {
 		t.Fatalf("read durable B: %v", getErr)
 	}
-	if live.ID != before.ID {
-		t.Fatalf("the row changed: got %d, want %d", live.ID, before.ID)
+
+	// Runtime: same row, same generation, same enrollment attempt. Compared against the
+	// RUNTIME snapshot, because the attempt is deliberately runtime-only and the durable
+	// row has no attempt to compare with.
+	if runtimeBefore == nil || runtimeBefore.ID == 0 {
+		t.Fatal("fixture: no runtime snapshot was captured before the verdict")
 	}
-	// Exact before/after equality on every field the obsolete writer could move.
-	if live.Status != before.Status || live.DisableReason != before.DisableReason ||
-		live.StateVersion != before.StateVersion || live.Enabled != before.Enabled ||
-		live.EnrollmentAttempt != before.EnrollmentAttempt {
-		t.Fatalf("obsolete AWG failure drifted B: status=%q reason=%q v=%d enabled=%v attempt=%d; want %q/%q/%d/%v/%d",
-			live.Status, live.DisableReason, live.StateVersion, live.Enabled, live.EnrollmentAttempt,
-			before.Status, before.DisableReason, before.StateVersion, before.Enabled, before.EnrollmentAttempt)
+	if live.ID != runtimeBefore.ID {
+		t.Fatalf("the row changed: got %d, want %d", live.ID, runtimeBefore.ID)
 	}
-	if row.Status != before.Status || row.DisableReason != before.DisableReason || !row.Enabled {
-		t.Fatalf("obsolete AWG failure persisted on B: status=%q reason=%q enabled=%v",
-			row.Status, row.DisableReason, row.Enabled)
+	if live.EnrollmentAttempt != runtimeBefore.EnrollmentAttempt {
+		t.Fatalf("the enrolled attempt changed: got %d, want %d",
+			live.EnrollmentAttempt, runtimeBefore.EnrollmentAttempt)
 	}
+	if live.Status != runtimeBefore.Status || live.DisableReason != runtimeBefore.DisableReason ||
+		live.StateVersion != runtimeBefore.StateVersion || live.Enabled != runtimeBefore.Enabled {
+		t.Fatalf("obsolete AWG failure drifted runtime B: status=%q reason=%q v=%d enabled=%v; want %q/%q/%d/%v",
+			live.Status, live.DisableReason, live.StateVersion, live.Enabled,
+			runtimeBefore.Status, runtimeBefore.DisableReason, runtimeBefore.StateVersion, runtimeBefore.Enabled)
+	}
+
+	// SQLite: the persisted snapshot captured before the verdict, including the version.
+	if row.ID != durableBefore.ID {
+		t.Fatalf("durable row id changed: got %d, want %d", row.ID, durableBefore.ID)
+	}
+	if row.Status != durableBefore.Status {
+		t.Fatalf("obsolete AWG failure persisted status=%q on B, want %q", row.Status, durableBefore.Status)
+	}
+	if row.DisableReason != durableBefore.DisableReason {
+		t.Fatalf("obsolete AWG failure persisted reason=%q on B, want %q",
+			row.DisableReason, durableBefore.DisableReason)
+	}
+	if row.Enabled != durableBefore.Enabled {
+		t.Fatalf("obsolete AWG failure persisted enabled=%v on B, want %v", row.Enabled, durableBefore.Enabled)
+	}
+	if row.StateVersion != durableBefore.StateVersion {
+		t.Fatalf("obsolete AWG failure persisted state_version=%d on B, want %d unchanged",
+			row.StateVersion, durableBefore.StateVersion)
+	}
+
 	// Enrollment and eligibility unchanged: B is still quarantined, still unroutable.
 	requireBackendQuarantined(t, h, *serverID, "after the obsolete verdict")
 }
