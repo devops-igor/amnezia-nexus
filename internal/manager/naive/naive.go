@@ -31,7 +31,7 @@ const (
 	// content-addressed, so a registry cannot serve different bytes under it,
 	// and the registry keeps it after later rebuilds: upgrading is a deliberate
 	// commit, not a side effect of merging.
-	NaiveImageDigest = "sha256:c0ab3836fdbb1e938d1965831337124041aba22b57e18ee585bcc5f153f95269"
+	NaiveImageDigest = "sha256:ab6937fe85289ff6ddc85f055b088bec43c0bfd2af140eec2f9c41829d8bdc4d"
 	// NaiveImageRef is the exact reference the installer pulls and runs.
 	NaiveImageRef = NaiveImageRepository + "@" + NaiveImageDigest
 )
