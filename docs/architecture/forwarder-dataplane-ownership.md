@@ -21,8 +21,9 @@ The `Forwarder` struct owns global routing tables, backend queues, synchronizati
 | `routesByPeer` | `map[string]*sessionRoute` | Primary route index keyed by peer public key (`peerKey`) | `Forwarder.mu.Lock` (write), `Forwarder.mu.RLock` (read) | Modified on session registration, unregistration, and retirement |
 | `routesByIP` | `map[string]*sessionRoute` | Reverse route index keyed by client VIP (`assignedIP`) | `Forwarder.mu.Lock` (write), `Forwarder.mu.RLock` (read) | Modified on session registration, unregistration, and retirement |
 | `backendTraffic` | `map[int64]*trafficCounters` | Per-backend tunnel cumulative traffic and rate monitoring | `Forwarder.mu.Lock` (map access), per-counter `trafficCounters.mu` | Entries created in `ensureBackendTrafficLocked`, cleared in `DetachBackendDevice` |
-| `backendQueues` | `map[int64]chan []byte` | Egress packet queues toward backend tunnels | `Forwarder.mu.Lock` (map access), Go channel synchronization | Created on route registration or backend attachment; preserved across `DetachBackendDevice` |
+| `backendQueues` | `map[int64]chan []byte` | Egress packet queues toward backend tunnels | `Forwarder.mu.Lock` (map access), Go channel synchronization | Created on route registration or backend attachment; preserved across `DetachBackendDevice`, which drains (and counts) the packets that were admitted on the policy-routed path and can no longer be delivered |
 | `backendDevices` | `map[int64]PacketDevice` | Attached backend network interfaces / TUN devices | `Forwarder.mu.Lock` (map access) | Attached in `AttachBackendDevice`, removed in `DetachBackendDevice` |
+| `detachedBackends` | `map[int64]struct{}` | Backend tunnels whose egress device is detached (or nil) — the availability state of a policy-routed proxy egress | `Forwarder.mu.Lock` (map access) | Set in `DetachBackendDevice` and by `AttachBackendDevice(id, nil)`; cleared by a real attach. Independent of `backendQueues`, which route registration and `UpdateSessionBackend` re-create for any tunnel ID |
 | `backendPumpStops` | `map[int64]chan struct{}` | Per-backend pump termination signaling channels | `Forwarder.mu.Lock` (map access) | Created in `AttachBackendDevice`/`StartPumps`, closed on detach or stop |
 | `backendPumpDones` | `map[int64]chan struct{}` | Per-backend pump exit completion notification channels | `Forwarder.mu.Lock` (map access) | Created alongside `backendPumpStops`, closed on pump goroutine exit |
 | `bufSize` | `int` | Configured queue capacity for client route packet channels | `Forwarder.mu.Lock` (write), `Forwarder.mu.RLock` (read) | Set at construction; updated via `ReconfigureClientQueueConfig` when idle |
@@ -65,6 +66,41 @@ The `Forwarder` struct owns global routing tables, backend queues, synchronizati
 | `pumpsWg` | `sync.WaitGroup` | Tracks active pump worker goroutines | `sync.WaitGroup` methods | Incremented on pump spawn; decremented on pump termination |
 | `peerRegs` | `map[string]uint64` | Monotonic registration counter per peer key for diagnostics | `Forwarder.mu.Lock` (write), `Forwarder.mu.RLock` (read) | Incremented in `registerSessionLocked` |
 | `stopTimeout` | `time.Duration` | Timeout for route retirement write completion during `Stop` | `Forwarder.mu.Lock` (write), `Forwarder.mu.RLock` (read) | Default 5s; overridden via `SetStopTimeoutForTest` |
+
+---
+
+### 2.1.1 Proxy Egress Availability and Backend Queue Semantics
+
+A backend tunnel's egress device can disappear at any time (`DisableBackend`, a failed
+health disable, or an explicit detach). Availability is explicit state, never inferred
+from the presence of a queue:
+
+- `detachedBackends` is the authority. `DetachBackendDevice` marks the tunnel and
+  `AttachBackendDevice` clears the mark only when it installs a real device; an attach
+  with a nil device marks it detached. The mark survives `backendQueues` re-creation by
+  session registration or `UpdateSessionBackend`, which happens for any tunnel ID.
+- On the policy-routed proxy path (`sendToProxyBackend`), the availability check and the
+  non-blocking enqueue execute inside one `Forwarder.mu.RLock()` hold. `DetachBackendDevice`
+  marks and drains under the write lock, so a detach cannot interleave between the check
+  and the send and leave a packet in a queue no pump drains.
+- A proxy-required packet the proxy path refuses is dropped and counted — `ErrBackendNotFound`
+  plus `proxyDrops`/`clientDropsNoBackend`/`clientDropsTotal` — with no admitted-byte
+  increment and no DIRECT fallback. DIRECT is never a fallback decision for a
+  proxy-required destination.
+- `DetachBackendDevice` drains the preserved queue while holding `Forwarder.mu` and counts
+  those packets as proxy drops. They were admitted for a backend that is gone: they can
+  never be delivered, and re-attaching a different device must not receive a stale packet.
+  The drain is bounded by the occupancy observed under the lock because the legacy sender
+  does not hold `Forwarder.mu` across its enqueue. It runs only when policy routing is
+  enabled, so the legacy buffer-across-detach behavior is unchanged.
+- The asynchronous writer books a proxy drop when `dev.Write` fails on the policy-routed
+  path instead of discarding the error. Admission accounting stays at enqueue time (§3.1
+  step 5), so a writer failure is admitted bytes *plus* one counted proxy drop; refusal
+  before the enqueue never inflates admitted bytes.
+- Queue-full and device-internal loss keep their existing owners:
+  `clientDropsQueueFull`/`clientDropsTotal` for a saturated backend queue, and the backend
+  device's own drop telemetry for what the device refuses after delivery to it. Neither is
+  reclassified as a proxy drop.
 
 ---
 
@@ -230,6 +266,7 @@ The `sessionRoute` struct encapsulates per-peer state, downstream packet queues,
 5. **Backend Enqueue**: A non-blocking send submits `pktCopy` to `backendQueue`:
    - *Success*: Increments `totalRxBytes`, `totalRxPackets`, route/backend traffic counters, and accountant Rx.
    - *Queue Full*: Increments `clientDropsQueueFull` and returns `ErrQueueFull`. `pktCopy` becomes immediately unreachable and is garbage collected.
+   - *Policy-routed path (`sendToProxyBackend`)*: The same admission applies, but the availability re-check on `detachedBackends` and the non-blocking send share one `Forwarder.mu.RLock()` hold. A proxy-required packet whose backend has no live device is counted (`proxyDrops`, `clientDropsNoBackend`, `clientDropsTotal`), returns `ErrBackendNotFound`, and never re-enters the DIRECT decision path (§2.1.1).
 6. **Backend Transmission**: `pumpBackendQueue` dequeues `pktCopy`, passes it to `dev.Write(pktCopy)`, and releases the slice reference.
 
 ---
