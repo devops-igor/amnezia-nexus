@@ -454,6 +454,8 @@ type ProblemRouteItem struct {
 
 // RuntimeResources contains process and runtime health counters.
 type RuntimeResources struct {
+	// CPUPercent is the portal process CPU utilization as a percentage of total
+	// host CPU capacity. It is derived from process rusage, not host-wide load.
 	CPUPercent           float64 `json:"cpu_percent"`
 	MemoryAllocBytes     uint64  `json:"memory_alloc_bytes"`
 	MemorySysBytes       uint64  `json:"memory_sys_bytes"`

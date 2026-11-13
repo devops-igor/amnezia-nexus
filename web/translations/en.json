@@ -577,7 +577,7 @@
   "vpn_diag_latency_p95": "Latency p95 (ms)",
   "vpn_diag_load_skew": "Load Skew",
   "vpn_diag_device_drops": "Device Drops",
-  "vpn_diag_cpu_usage": "CPU Usage",
+  "vpn_diag_cpu_usage": "CPU Usage (portal process)",
   "vpn_diag_memory": "Heap memory (allocated / limit)",
   "vpn_diag_goroutines": "Goroutines",
   "vpn_diag_gc_pause": "GC Pause p95",
