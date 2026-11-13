@@ -423,40 +423,61 @@ func findExistingClient(clients []AWGClient, clientPubKey, clientName string) (i
 	return -1, ""
 }
 
+// contentPaddingDefault is the content-padding range the portal writes for a
+// client that has none recorded.
+const contentPaddingDefault = "16-64"
+
+// backfillClientTimingDefaults fills any missing AWG timing parameter on an
+// existing entry and then restores the required ordering. Entries written by older
+// portals can carry a partial set, and amneziawg rejects a peer whose timing
+// parameters are out of order, so a re-registration repairs rather than preserves
+// an invalid combination.
+func backfillClientTimingDefaults(ud *AWGClientUserData) {
+	if ud.RekeyAfterTime == nil {
+		ud.RekeyAfterTime = GenerateRekeyAfterTime()
+	}
+	if ud.RekeyTimeout == nil {
+		ud.RekeyTimeout = GenerateRekeyTimeout()
+	}
+	if ud.RejectAfterTime == nil {
+		ud.RejectAfterTime = GenerateRejectAfterTime()
+	}
+	if ud.KeepaliveTimeout == nil {
+		ud.KeepaliveTimeout = GenerateKeepaliveTimeout()
+	}
+	if ud.MaxHandshakeAttempts == nil {
+		ud.MaxHandshakeAttempts = GenerateMaxHandshakeAttempts()
+	}
+	if ud.PersistentKeepalive == nil {
+		ud.PersistentKeepalive = GeneratePersistentKeepalive()
+	}
+	EnforceTimingOrdering(ud.RekeyTimeout, ud.RekeyAfterTime, ud.RejectAfterTime)
+}
+
 // upsertClientEntry updates the clientsTable entry at existingIdx in place
 // (keeping IP and identity fields), or appends a new entry when idx < 0.
+//
+// A stored client private key is never replaced by an empty one for the SAME
+// identity: a caller-key registration (probe peers) supplies only a public key,
+// and the portal still owns the credential recorded for that peer. When the
+// registration moves the entry to a DIFFERENT public key, the stored credential
+// belonged to the old key and cannot sign for the new peer, so it is replaced
+// with whatever the new registration recorded (empty for a caller-key peer).
 func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clientName, clientPrivKey, psk, clientIP, mimicry string, contentPadding bool) []AWGClient {
 	if existingIdx >= 0 {
+		identityChanged := clients[existingIdx].ClientID != clientPubKey
 		clients[existingIdx].ClientID = clientPubKey
 		clients[existingIdx].UserData.ClientName = clientName
-		clients[existingIdx].UserData.ClientPrivateKey = clientPrivKey
+		if identityChanged || clientPrivKey != "" {
+			clients[existingIdx].UserData.ClientPrivateKey = clientPrivKey
+		}
 		clients[existingIdx].UserData.PSK = psk
 		clients[existingIdx].UserData.Enabled = true
 		clients[existingIdx].UserData.ClientIP = clientIP
 
-		ud := &clients[existingIdx].UserData
-		if ud.RekeyAfterTime == nil {
-			ud.RekeyAfterTime = GenerateRekeyAfterTime()
-		}
-		if ud.RekeyTimeout == nil {
-			ud.RekeyTimeout = GenerateRekeyTimeout()
-		}
-		if ud.RejectAfterTime == nil {
-			ud.RejectAfterTime = GenerateRejectAfterTime()
-		}
-		if ud.KeepaliveTimeout == nil {
-			ud.KeepaliveTimeout = GenerateKeepaliveTimeout()
-		}
-		if ud.MaxHandshakeAttempts == nil {
-			ud.MaxHandshakeAttempts = GenerateMaxHandshakeAttempts()
-		}
-		if ud.PersistentKeepalive == nil {
-			ud.PersistentKeepalive = GeneratePersistentKeepalive()
-		}
-		EnforceTimingOrdering(ud.RekeyTimeout, ud.RekeyAfterTime, ud.RejectAfterTime)
-
+		backfillClientTimingDefaults(&clients[existingIdx].UserData)
 		if contentPadding && clients[existingIdx].UserData.ContentPaddingAddition == nil {
-			val := "16-64"
+			val := contentPaddingDefault
 			clients[existingIdx].UserData.ContentPaddingAddition = &val
 		}
 
@@ -466,7 +487,7 @@ func upsertClientEntry(clients []AWGClient, existingIdx int, clientPubKey, clien
 	rat, rt, rej, kt, mha, pk := GenerateClientTimingParams()
 	var cpAdd *string
 	if contentPadding {
-		val := "16-64"
+		val := contentPaddingDefault
 		cpAdd = &val
 	}
 

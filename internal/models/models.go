@@ -344,6 +344,19 @@ type BackendTunnel struct {
 	CreatedAt         time.Time       `json:"created_at" db:"created_at"`
 	Protocol          string          `json:"protocol" db:"protocol"`
 	ProtocolParams    json.RawMessage `json:"-" db:"protocol_params"`
+	// EnrollmentAttempt identifies one enrollment of this backend row. A deployment
+	// re-enrollment of an unchanged identity produces a NEW attempt on the SAME id
+	// with the same endpoint and credentials, so it is invisible to every identity
+	// and state-version comparison: the row, the keys and the protocol are all
+	// identical, and StateVersion also moves for ordinary health writes.
+	//
+	// It is deliberately runtime-only. The attempt exists to tell an in-flight
+	// observation which enrollment it belongs to, and no observation survives a
+	// process restart, so a reloaded row starts a fresh attempt rather than
+	// resurrecting a stale one. Zero means "no attempt recorded" (legacy rows and
+	// non-deploy paths), which callers must treat as unfenced/unknown, not as a
+	// match.
+	EnrollmentAttempt uint64 `json:"-" db:"-"`
 }
 
 func NormalizeTunnelProtocol(proto string) string {

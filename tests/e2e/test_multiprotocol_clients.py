@@ -94,12 +94,14 @@ def validate_naive_uri(
 ) -> Dict[str, Any]:
     """Validate a NaiveProxy client URI format and basic-auth credentials.
 
-    Expected format:
-    https://<username>:<password>@<domain>[:<port>]#<name>
+    Expected format (BuildNaiveURI, adopted in #694):
+    naive+https://<username>:<password>@<domain>[:<port>]#<name>
     """
-    assert uri.startswith("https://"), f"URI must start with https://, got: {uri[:30]}"
+    assert uri.startswith(
+        "naive+https://"
+    ), f"URI must start with naive+https://, got: {uri[:30]}"
     parsed = urlparse(uri)
-    assert parsed.scheme == "https", f"Expected scheme 'https', got '{parsed.scheme}'"
+    assert parsed.scheme == "naive+https", f"Expected scheme 'naive+https', got '{parsed.scheme}'"
 
     # Basic auth credential validation
     assert parsed.username, "NaiveProxy URI must include basic-auth username"
@@ -885,7 +887,7 @@ def test_vless_uri_validation_oracle() -> None:
 def test_naive_uri_validation_oracle() -> None:
     """Oracle test: verify validate_naive_uri against valid and invalid formats."""
     # Valid NaiveProxy URI with basic auth and fragment
-    valid_uri = "https://alice:secret-pass_123@proxy.example.com:8443#NaiveWorker"
+    valid_uri = "naive+https://alice:secret-pass_123@proxy.example.com:8443#NaiveWorker"
     res = validate_naive_uri(valid_uri, expected_name="NaiveWorker")
     assert res["username"] == "alice"
     assert res["password"] == "secret-pass_123"
@@ -893,34 +895,37 @@ def test_naive_uri_validation_oracle() -> None:
     assert res["port"] == 8443
 
     # Valid default 443 port without explicit port component
-    valid_default_port = "https://bob:hunter2@proxy.example.com#DefaultPort"
+    valid_default_port = "naive+https://bob:hunter2@proxy.example.com#DefaultPort"
     res2 = validate_naive_uri(valid_default_port, expected_name="DefaultPort")
     assert res2["port"] == 443
 
     # Valid NaiveProxy URI with fixture port 9443
-    valid_fixture_port = "https://alice:secret-pass_123@proxy.example.com:9443#NaiveWorker"
+    valid_fixture_port = "naive+https://alice:secret-pass_123@proxy.example.com:9443#NaiveWorker"
     res_9443 = validate_naive_uri(valid_fixture_port, expected_name="NaiveWorker")
     assert res_9443["port"] == 9443
 
     # Valid NaiveProxy URI where fragment is the reconstructed username (H2 contract)
-    reconstructed_naive = "https://alice:secret-pass_123@proxy.example.com:8443#alice"
+    reconstructed_naive = "naive+https://alice:secret-pass_123@proxy.example.com:8443#alice"
     res_recon = validate_naive_uri(reconstructed_naive, expected_name="NaiveWorker")
     assert res_recon["username"] == "alice"
 
     # Reject mismatched fragment when neither expected_name nor username matches
     with pytest.raises(AssertionError, match="Expected fragment in"):
         validate_naive_uri(
-            "https://alice:secret-pass_123@proxy.example.com:8443#charlie",
+            "naive+https://alice:secret-pass_123@proxy.example.com:8443#charlie",
             expected_name="NaiveWorker",
         )
 
-    # Reject non-https scheme
-    with pytest.raises(AssertionError, match="URI must start with https://"):
+    # Reject a missing NaiveProxy scheme. A bare https:// URI was the pre-#694
+    # shape; accepting it here would let a scheme regression pass unnoticed.
+    with pytest.raises(AssertionError, match=r"URI must start with naive\+https://"):
+        validate_naive_uri("https://bob:hunter2@proxy.example.com#DefaultPort")
+    with pytest.raises(AssertionError, match=r"URI must start with naive\+https://"):
         validate_naive_uri("http://bob:hunter2@proxy.example.com#DefaultPort")
 
     # Reject missing password / basic auth
     with pytest.raises(AssertionError, match="basic-auth password"):
-        validate_naive_uri("https://bob@proxy.example.com#MissingPass")
+        validate_naive_uri("naive+https://bob@proxy.example.com#MissingPass")
 
 
 def test_ensure_protocol_provisioning_and_qualification_oracle() -> None:

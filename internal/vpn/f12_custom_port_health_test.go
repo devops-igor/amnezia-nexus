@@ -262,7 +262,7 @@ func TestF12_NaiveCustomPortBackendStaysSelectable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("qualification through the real exchange failed: %v", err)
 	}
-	if err := svc.PromoteQualifiedTunnel(ctx, sid, latencyMS); err != nil {
+	if err := svc.PromoteQualifiedTunnel(ctx, tun, latencyMS); err != nil {
 		t.Fatalf("promote: %v", err)
 	}
 	if svc.prober.GetCanaryProbeFunc() != nil {
@@ -489,7 +489,7 @@ func TestF12_AuthenticNaiveCustomPortKeepsQualifiedBackendAvailable(t *testing.T
 	if err != nil {
 		t.Fatalf("authentic custom-port qualification failed: %v", err)
 	}
-	if err := svc.PromoteQualifiedTunnel(ctx, sid, latencyMS); err != nil {
+	if err := svc.PromoteQualifiedTunnel(ctx, tun, latencyMS); err != nil {
 		t.Fatalf("promote: %v", err)
 	}
 	if svc.prober.GetCanaryProbeFunc() != nil {

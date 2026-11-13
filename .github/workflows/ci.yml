@@ -61,7 +61,9 @@ jobs:
   test:
     name: Automated Test Suite
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The race/coverage handler package can exceed Go's default 10m per-package
+    # timeout while the entire job still has capacity. Keep both limits bounded.
+    timeout-minutes: 25
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
@@ -126,7 +128,7 @@ jobs:
       # obligation, it moves each obligation to a step that actually runs it.
       - name: Run Tests with Race Detector
         run: |
-          go test -race -cover -count=1 -coverprofile=coverage.out \
+          go test -race -cover -count=1 -timeout=15m -coverprofile=coverage.out \
             -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress)$' ./...
 
       - name: Run Authentic Native Caddy Integration Tests

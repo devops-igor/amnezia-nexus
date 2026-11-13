@@ -17,7 +17,11 @@ func TestPromoteQualifiedTunnelFailurePreservesEnrollment(t *testing.T) {
 	if err := svc.DisableBackend(ctx, sid); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.PromoteQualifiedTunnel(ctx, sid, 1); err == nil {
+	disabled, err := svc.pool.GetTunnel(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.PromoteQualifiedTunnel(ctx, disabled, 1); err == nil {
 		t.Fatal("disabled tunnel was promoted")
 	}
 	pending, err := db.GetBackendPendingEnrollments(ctx)

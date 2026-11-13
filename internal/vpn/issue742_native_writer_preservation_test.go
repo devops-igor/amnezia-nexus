@@ -39,16 +39,23 @@ type issue742JointFixture struct {
 }
 
 // issue742Device is a BackendDevice whose canary verdict is shared with the test.
+//
+// created is a STABLE stamp: the production contract for BackendDevice.CreatedAt
+// is a device identity that binds recorded canary evidence to one device
+// (health_canary.go / DeviceGeneration), so a fixture that returned time.Now()
+// on every call would make its own recorded evidence unusable and could never
+// model preservation at all.
 type issue742Device struct {
-	inner *issue742NativeVerdict
+	inner   *issue742NativeVerdict
+	created time.Time
 }
 
 func (d *issue742Device) Read([]byte) (int, error)     { return 0, nil }
 func (d *issue742Device) Write(p []byte) (int, error)  { return len(p), nil }
 func (d *issue742Device) Close() error                 { return nil }
 func (d *issue742Device) IsClosed() bool               { return false }
-func (d *issue742Device) CreatedAt() time.Time         { return time.Now() }
-func (d *issue742Device) LastHandshakeTime() time.Time { return time.Now() }
+func (d *issue742Device) CreatedAt() time.Time         { return d.created }
+func (d *issue742Device) LastHandshakeTime() time.Time { return d.created }
 func (d *issue742Device) DroppedPackets() uint64       { return 0 }
 func (d *issue742Device) ProbeCanary(ctx context.Context, _ time.Duration) error {
 	return d.inner.ProbeCanary(ctx, 0)
@@ -66,7 +73,7 @@ func newIssue742JointFixture(t *testing.T, startStatus string, schedulerRTT time
 	t.Helper()
 	base := &issue732CanaryDevice{}
 	f := newIssue732SweepFixture(t, startStatus, schedulerRTT, base, base)
-	dev := &issue742Device{inner: inner}
+	dev := &issue742Device{inner: inner, created: time.Now()}
 	f.svc.SetBackendDeviceForTest(f.source.ID, dev)
 	f.inner = dev
 	return &issue742JointFixture{sweep: f, native: inner}

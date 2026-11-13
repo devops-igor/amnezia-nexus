@@ -559,12 +559,20 @@ func (m *testBackendDevice) CreatedAt() time.Time {
 	if !m.createdAt.IsZero() {
 		return m.createdAt
 	}
+	// The double is often built with only the fields a given test needs, so a nil
+	// embedded device is legitimate here. Its stamp is then simply unknown.
+	if m.AWGClientDevice == nil {
+		return time.Time{}
+	}
 	return m.AWGClientDevice.CreatedAt()
 }
 
 func (m *testBackendDevice) LastHandshakeTime() time.Time {
 	if m.lastHandshakeFn != nil {
 		return m.lastHandshakeFn()
+	}
+	if m.AWGClientDevice == nil {
+		return time.Time{}
 	}
 	return m.AWGClientDevice.LastHandshakeTime()
 }

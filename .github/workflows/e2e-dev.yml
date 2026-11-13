@@ -24,6 +24,12 @@ jobs:
     name: DEV Server E2E Verification
     runs-on: [ self-hosted, linux, arm64, dev ]
     timeout-minutes: 90
+    env:
+      # internal/vpn does not compile without this tag (tags_guard.go enforces
+      # it deliberately), and the qualification stages run `go test ./internal/vpn`.
+      # ci.yml sets the same flag workflow-wide; this workflow never did, which
+      # stayed hidden only because the stages were skipped while the lifecycle failed.
+      GOFLAGS: -tags=with_utls
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
@@ -105,6 +111,19 @@ jobs:
             echo "Error: GIGAHOST_CALL_TIMING is not enabled inside container" >&2
             exit 1
           fi
+
+      - name: Naive Caddy preflight
+        # Verify the exact image the installer will pull, including that it still
+        # advertises forward_proxy. This also pre-pulls it, so the install inside
+        # the suite is a cache hit instead of a cold pull in the 120s budget.
+        run: |
+          IMAGE="$(sed -n 's/.*NaiveImageRepository *= *"\([^"]*\)".*/\1/p' internal/manager/naive/naive.go)"
+          DIGEST="$(sed -n 's/.*NaiveImageDigest *= *"\([^"]*\)".*/\1/p' internal/manager/naive/naive.go)"
+          if [ -z "$IMAGE" ] || [ -z "$DIGEST" ]; then
+            echo "Error: could not read the pinned Naive image reference from naive.go" >&2
+            exit 1
+          fi
+          NAIVE_CADDY_IMAGE="${IMAGE}@${DIGEST}" ./scripts/preflight_naive_caddy.sh
 
       - name: Run Playwright E2E Lifecycle Suite
         run: |

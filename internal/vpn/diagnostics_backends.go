@@ -163,6 +163,15 @@ func backendTelemetryItem(
 		LoadSharePct:        loadShare,
 	}
 
+	// Attach the sanitized decision evidence for THIS tunnel generation. Absent
+	// evidence stays nil rather than becoming a zero-valued record that reads like
+	// "observed, nothing wrong".
+	if inputs.prober != nil {
+		if ev, ok := inputs.prober.TransitionEvidenceFor(tun); ok {
+			item.Transition = &ev
+		}
+	}
+
 	return item, loadShare, eligible && tun.LatencyMS > 0
 }
 

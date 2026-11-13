@@ -205,7 +205,7 @@ func TestCanaryAdmission_PromotionIsTheReleasePoint(t *testing.T) {
 
 	// The legitimate release: the production promotion transaction commits the
 	// qualification verdict and removes the durable marker together.
-	if err := e.svc.PromoteQualifiedTunnel(t.Context(), e.blocked.ServerID, 20); err != nil {
+	if err := e.svc.PromoteQualifiedTunnel(t.Context(), e.blocked, 20); err != nil {
 		t.Fatalf("promote qualified backend: %v", err)
 	}
 	e.requireEnrollmentState(t, false)
