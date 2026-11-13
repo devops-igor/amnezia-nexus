@@ -134,7 +134,15 @@ def test_failing_lifecycle_retains_category_and_preserves_nonzero_result(
     assert payload["source"] == "protocol-install-failure-log"
     assert payload["occurrences"] == 1
     assert payload["failures"] == [
-        {"server_id": 1, "protocol": "awg", "port": 51820, "step": "image_build", "exit_code": 1}
+        {
+            "server_id": 1,
+            "protocol": "awg",
+            "port": 51820,
+            "step": "image_build",
+            "reason": "other",
+            "exit_code": 1,
+            "duration_ms": -1,
+        }
     ]
 
     # 3. The whole artifact set still passes the existing pre-upload gate.
