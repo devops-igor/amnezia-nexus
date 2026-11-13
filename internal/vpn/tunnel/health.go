@@ -277,25 +277,19 @@ func (hp *HealthProber) SetPendingEnrollment(serverID int64, pending bool) {
 		return
 	}
 	hp.mu.Lock()
-	if hp.pendingEnrollment == nil {
-		hp.pendingEnrollment = make(map[int64]bool)
-	}
 	if pending {
-		hp.pendingEnrollment[serverID] = true
 		// Bind the marker to the tunnel generation that now owns this server slot.
 		// Without it a retired removal cannot tell its own marker from a
 		// replacement's and would clear the wrong one.
+		var owner int64
 		if hp.pool != nil {
 			if cur, err := hp.pool.GetTunnel(serverID); err == nil && cur != nil {
-				if hp.pendingEnrollmentGeneration == nil {
-					hp.pendingEnrollmentGeneration = make(map[int64]int64)
-				}
-				hp.pendingEnrollmentGeneration[serverID] = cur.ID
+				owner = cur.ID
 			}
 		}
+		hp.markEnrollmentLocked(serverID, owner)
 	} else {
-		delete(hp.pendingEnrollment, serverID)
-		delete(hp.pendingEnrollmentGeneration, serverID)
+		hp.clearEnrollmentLocked(serverID)
 	}
 	db := hp.db
 	hp.mu.Unlock()
@@ -305,6 +299,53 @@ func (hp *HealthProber) SetPendingEnrollment(serverID int64, pending bool) {
 		defer cancel()
 		_ = db.SetBackendPendingEnrollment(ctx, serverID, pending)
 	}
+}
+
+// MarkEnrollmentForGeneration quarantines serverID on behalf of the tunnel
+// generation tunnelID, without touching the durable store.
+//
+// It exists so a caller that has ALREADY validated the generation it acts on can
+// express that ownership exactly, instead of re-deriving it from whatever the
+// slot holds by the time the mark is written. Passing tunnelID <= 0 leaves the
+// recorded generation untouched, so an unknown owner stays unknown rather than
+// being silently attributed to the current row.
+func (hp *HealthProber) MarkEnrollmentForGeneration(serverID, tunnelID int64) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	hp.markEnrollmentLocked(serverID, tunnelID)
+}
+
+// ReleaseEnrollmentForGeneration releases the caller mark only when this
+// generation owns it, so a qualified backend's release cannot clear a
+// replacement's quarantine.
+func (hp *HealthProber) ReleaseEnrollmentForGeneration(serverID, tunnelID int64) {
+	hp.releaseRuntimeEnrollmentIfGeneration(serverID, tunnelID)
+}
+
+// markEnrollmentLocked records the quarantine under hp.mu and binds it to
+// tunnelID when one is known. The caller must hold hp.mu.
+func (hp *HealthProber) markEnrollmentLocked(serverID, tunnelID int64) {
+	if hp.pendingEnrollment == nil {
+		hp.pendingEnrollment = make(map[int64]bool)
+	}
+	hp.pendingEnrollment[serverID] = true
+	if tunnelID <= 0 {
+		return
+	}
+	if hp.pendingEnrollmentGeneration == nil {
+		hp.pendingEnrollmentGeneration = make(map[int64]int64)
+	}
+	hp.pendingEnrollmentGeneration[serverID] = tunnelID
+}
+
+// clearEnrollmentLocked drops both halves of the caller mark. The caller must
+// hold hp.mu.
+func (hp *HealthProber) clearEnrollmentLocked(serverID int64) {
+	delete(hp.pendingEnrollment, serverID)
+	delete(hp.pendingEnrollmentGeneration, serverID)
 }
 
 // IsPendingEnrollment reports whether a backend server is currently undergoing initial enrollment qualification.

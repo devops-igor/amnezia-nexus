@@ -29,6 +29,43 @@ func (s *Service) DisableBackend(ctx context.Context, serverID int64) error {
 	return s.disableBackendLocked(ctx, serverID)
 }
 
+// withdrawObservedBackendLocked withdraws the backend generation an observation
+// was made against, and refuses to act when that generation no longer owns the
+// server slot. The caller must hold s.mu (write).
+//
+// A qualification failure is only authoritative for the backend it observed. The
+// operator's delete/re-create re-enrolls the SAME server slot with a fresh tunnel
+// row (and, for a deployment re-enrolment, a fresh identity on the same row), so
+// acting on the slot by ID alone disables and quarantines credentials this
+// observation never proved. models.SameTunnelIdentity is the identity fence here
+// for the same reason it guards finishEnableBackend: the slot is a routing
+// address, the tunnel row's identity is the backend.
+//
+// A retired generation is inert — ErrTunnelGenerationRetired and no mutation.
+// An already-removed slot is also inert: there is nothing left to withdraw.
+func (s *Service) withdrawObservedBackendLocked(ctx context.Context, observed *models.BackendTunnel) error {
+	if s.pool == nil {
+		return errors.New("tunnel pool not initialized")
+	}
+	live, err := s.pool.GetTunnel(observed.ServerID)
+	if err != nil {
+		if errors.Is(err, tunnel.ErrTunnelNotFound) {
+			return nil
+		}
+		return err
+	}
+	if !models.SameTunnelIdentity(live, observed) {
+		return tunnel.ErrTunnelGenerationRetired
+	}
+	// The runtime caller mark is bound to this generation so a retired release
+	// cannot clear a replacement's gate; the durable marker is bound to the row
+	// by the pool, so both owners stay consistent.
+	if s.prober != nil {
+		s.prober.MarkEnrollmentForGeneration(observed.ServerID, observed.ID)
+	}
+	return s.disableBackendLocked(ctx, observed.ServerID)
+}
+
 // disableBackendLocked applies DisableBackend semantics; the caller must hold
 // s.mu (write). It disables the tunnel, detaches and closes the backend's
 // forwarder device, and fails over active sessions (sticky affinities, DB

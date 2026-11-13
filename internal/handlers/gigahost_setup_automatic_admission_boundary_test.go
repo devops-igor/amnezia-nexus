@@ -474,11 +474,15 @@ func seedQualifiedBackend(
 		t.Fatalf("enable unrelated backend: %v", err)
 	}
 
-	if err := env.h.vpnSvc.PromoteQualifiedTunnel(ctx, server.ID, 10); err != nil {
+	tun, err := env.h.vpnSvc.GetTunnel(server.ID)
+	if err != nil || tun == nil {
+		t.Fatalf("read unrelated tunnel: err=%v", err)
+	}
+	if err := env.h.vpnSvc.PromoteQualifiedTunnel(ctx, tun, 10); err != nil {
 		t.Fatalf("promote unrelated backend: %v", err)
 	}
 
-	tun, err := env.h.vpnSvc.GetTunnel(server.ID)
+	tun, err = env.h.vpnSvc.GetTunnel(server.ID)
 	if err != nil || tun == nil {
 		t.Fatalf("read unrelated tunnel: err=%v", err)
 	}

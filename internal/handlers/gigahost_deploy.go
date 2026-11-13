@@ -225,9 +225,14 @@ func (h *Handlers) failDeployStatus(
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancel()
 	_ = h.updateDeployOrderStatus(persistCtx, orderID, DeployStatusFailed, step, diagErr, providerServerID, nexusServerID, assignedIP)
-	if nexusServerID > 0 && h.vpnSvc != nil {
-		_ = h.vpnSvc.DisableBackend(persistCtx, nexusServerID)
-	}
+	// Deliberately NO server-keyed backend disable here.
+	//
+	// Every admission-bearing step already withdraws the backend generation it
+	// OBSERVED (failBackendAdmission / quarantineEnrollment), and that withdrawal
+	// is the only one entitled to act. A disable keyed by server ID alone would,
+	// at this point, hit whatever owns the slot now — which is how an obsolete
+	// deployment failure administratively disabled and detached the replacement
+	// an operator had just created.
 	return &GigahostDeployStatus{
 		OrderID:          orderID,
 		ProviderServerID: providerServerID,
@@ -434,28 +439,46 @@ func (h *Handlers) enableDeployBackend(
 		// previously had no terminal finalizer, so a proxy was reported ready
 		// while still durably quarantined. Qualify with a real authenticated
 		// application exchange before reporting ready.
-		return h.qualifyProxyBackendTraffic(ctx, server, normProto)
+		return h.captureEnabledDeployBackend(server, func(observed *models.BackendTunnel) error {
+			return h.qualifyProxyBackendTraffic(ctx, server, observed, normProto)
+		})
 	}
 
-	if h.vpnSvc != nil {
-		h.vpnSvc.SetPendingEnrollment(server.ID, true)
-	}
-	enrollCtx := context.WithValue(ctx, tunnel.DeployEnrollmentKey, true)
+	h.vpnSvc.SetPendingEnrollment(server.ID, true)
 	opts := []tunnel.BackendTunnelOptions{
 		{
 			Protocol: normProto,
 		},
 	}
-	if err := h.vpnSvc.EnableBackendWithConfig(enrollCtx, server.ID, opts...); err != nil {
-		if h.vpnSvc != nil {
-			h.vpnSvc.SetPendingEnrollment(server.ID, false)
-		}
+	if err := h.vpnSvc.EnableBackendWithConfig(ctx, server.ID, opts...); err != nil {
+		h.vpnSvc.SetPendingEnrollment(server.ID, false)
 		return err
 	}
-	return h.qualifyBackendTraffic(ctx, server, protocol)
+	return h.captureEnabledDeployBackend(server, func(*models.BackendTunnel) error {
+		return h.qualifyBackendTraffic(ctx, server)
+	})
 }
 
-func (h *Handlers) qualifyBackendTraffic(ctx context.Context, server *models.Server, protocol string) error {
+// qualifyEnabledDeployBackend captures the backend generation this enablement just
+// created and hands it to the protocol's finalizer.
+//
+// The capture is the point of the function: the finalizer decides admission and
+// withdrawal for the generation that was OBSERVED, and reading the tunnel here —
+// immediately after the enable that produced it, before any network work — is the
+// only place that owner is unambiguous. A later lookup would describe whatever owns
+// the server slot by then, which is exactly the owner confusion this guards.
+func (h *Handlers) captureEnabledDeployBackend(
+	server *models.Server,
+	finalize func(observed *models.BackendTunnel) error,
+) error {
+	observed, err := h.vpnSvc.GetTunnel(server.ID)
+	if err != nil || observed == nil {
+		return fmt.Errorf("backend tunnel not found for server %d", server.ID)
+	}
+	return finalize(observed)
+}
+
+func (h *Handlers) qualifyBackendTraffic(ctx context.Context, server *models.Server) error {
 	if h.vpnSvc == nil {
 		return nil
 	}
@@ -469,41 +492,54 @@ func (h *Handlers) qualifyBackendTraffic(ctx context.Context, server *models.Ser
 
 	latencyMS, err := h.vpnSvc.ProbeTunnel(probeCtx, tun)
 	if err != nil {
-		return h.failBackendAdmission(ctx, server.ID, "backend traffic qualification probe failed", err)
+		return h.failBackendAdmission(ctx, tun, "backend traffic qualification probe failed", err)
 	}
 
 	// Finding F8: Outer handshake is necessary but not sufficient.
 	// Verify real data-plane payload forwarding before declaring the backend ready.
-	current, err := h.reReadQualifiedTunnel(ctx, server.ID)
+	current, err := h.reReadQualifiedTunnel(ctx, tun)
 	if err != nil {
-		return h.failBackendAdmission(ctx, server.ID, "backend tunnel disappeared after qualification probe", err)
+		return h.failBackendAdmission(ctx, tun, "backend tunnel disappeared after qualification probe", err)
 	}
 	if err := h.vpnSvc.ProbeCanary(probeCtx, current); err != nil {
-		h.vpnSvc.SetPendingEnrollment(server.ID, false)
-		_ = h.vpnSvc.SetTunnelStatus(ctx, server.ID, models.TunnelStatusDisabled, 0)
-		return h.failBackendAdmission(ctx, server.ID, "data-plane payload verification failed", err)
+		// A canary verdict belongs to the generation it was run against: record the
+		// runtime health-disable on that tunnel, then withdraw the same generation.
+		// Neither may touch a replacement that took the slot meanwhile.
+		_ = h.vpnSvc.SetTunnelStatusWithVersion(ctx, current.ServerID, current.ID, 0, models.TunnelStatusDisabled, 0)
+		return h.failBackendAdmission(ctx, current, "data-plane payload verification failed", err)
 	}
 
-	// Outer handshake and inner canary payload verification have both succeeded.
-	// Promote the quarantined connecting backend tunnel to active.
-	//
-	// F14: promotion decides admission authority inside its own transaction, so a
-	// setup approval revoked during this network work cannot be admitted here. A
-	// refusal quarantines the enrollment instead of leaving it enabled.
-	//
-	// Automatic jobs add one more authority question at this exact point. The policy
-	// that permitted unattended setup can be turned off while qualification is running,
-	// and the journal refusal in finishInstall happens AFTER this promotion - so without
-	// a gate here a backend whose owner lost permission is admitted and left selectable
-	// behind a job that never claims success. The check is deliberately placed after
-	// qualification succeeded and immediately before the commit: that is the last moment
-	// authority can still be withheld without undoing work, and it costs one policy read
-	// per admitted backend rather than one per probe.
+	return h.admitQualifiedBackend(ctx, probeCtx, current, latencyMS)
+}
+
+// admitQualifiedBackend commits admission for a backend whose outer handshake AND
+// inner canary payload verification both succeeded, and owns the refusal handling.
+//
+// F14: promotion decides admission authority inside its own transaction, so a setup
+// approval revoked during the network work cannot be admitted here. A refusal
+// quarantines the enrollment instead of leaving it enabled.
+//
+// Automatic jobs add one more authority question at this exact point. The policy
+// that permitted unattended setup can be turned off while qualification is running,
+// and the journal refusal in finishInstall happens AFTER this promotion - so without
+// a gate here a backend whose owner lost permission is admitted and left selectable
+// behind a job that never claims success. The check is deliberately placed after
+// qualification succeeded and immediately before the commit: that is the last moment
+// authority can still be withheld without undoing work, and it costs one policy read
+// per admitted backend rather than one per probe.
+func (h *Handlers) admitQualifiedBackend(
+	ctx, probeCtx context.Context,
+	observed *models.BackendTunnel,
+	latencyMS int64,
+) error {
 	if pause := h.refuseAutomaticAdmission(ctx); pause != nil {
-		return h.failBackendAdmission(ctx, server.ID, pause.step, errors.New(pause.detail))
+		return h.failBackendAdmission(ctx, observed, pause.step, errors.New(pause.detail))
 	}
-	if err := h.vpnSvc.PromoteQualifiedTunnel(probeCtx, server.ID, latencyMS); err != nil {
-		return h.failBackendAdmission(ctx, server.ID, "failed to commit active status after canary probe", err)
+	if err := h.vpnSvc.PromoteQualifiedTunnel(probeCtx, observed, latencyMS); err != nil {
+		if errors.Is(err, tunnel.ErrTunnelGenerationRetired) {
+			return h.failBackendAdmission(ctx, observed, "qualified backend was replaced during qualification", err)
+		}
+		return h.failBackendAdmission(ctx, observed, "failed to commit active status after canary probe", err)
 	}
 	return nil
 }
@@ -530,9 +566,11 @@ func (h *Handlers) refuseAutomaticAdmission(ctx context.Context) *installPause {
 // same safe state instead of each repeating the cleanup.
 //
 // The withdrawal keeps the durable enrollment quarantine: the backend is enrolled
-// but not qualified, which is exactly what prevents it from being selectable.
-func (h *Handlers) failBackendAdmission(ctx context.Context, serverID int64, reason string, cause error) error {
-	h.quarantineEnrollment(ctx, serverID)
+// but not qualified, which is exactly what prevents it from being selectable. It
+// applies only to the generation the qualification OBSERVED, so a backend that was
+// replaced while this ran is left to its own qualification.
+func (h *Handlers) failBackendAdmission(ctx context.Context, observed *models.BackendTunnel, reason string, cause error) error {
+	h.quarantineEnrollment(ctx, observed)
 	return fmt.Errorf("%s: %w", reason, cause)
 }
 
@@ -541,13 +579,21 @@ func (h *Handlers) failBackendAdmission(ctx context.Context, serverID int64, rea
 // ProbeTunnel commits through a version-fenced write, so the snapshot taken before
 // it is stale, and Service.ProbeCanary rejects a stale StateVersion. Re-reading is
 // therefore part of qualifying the inner canary, not an optional refresh.
-func (h *Handlers) reReadQualifiedTunnel(ctx context.Context, serverID int64) (*models.BackendTunnel, error) {
-	current, err := h.vpnSvc.GetTunnel(serverID)
+//
+// The re-read is fenced on the OBSERVED generation: if the row was deleted or its
+// identity re-enrolled during the outer probe, this observation no longer describes
+// the backend, and the canary must not be run against the replacement's
+// credentials.
+func (h *Handlers) reReadQualifiedTunnel(ctx context.Context, observed *models.BackendTunnel) (*models.BackendTunnel, error) {
+	current, err := h.vpnSvc.GetTunnel(observed.ServerID)
 	if err != nil {
 		return nil, err
 	}
 	if current == nil {
-		return nil, fmt.Errorf("backend tunnel not found for server %d", serverID)
+		return nil, fmt.Errorf("backend tunnel not found for server %d", observed.ServerID)
+	}
+	if !models.SameTunnelIdentity(current, observed) {
+		return nil, fmt.Errorf("%w: tunnel %d was replaced during qualification", tunnel.ErrTunnelGenerationRetired, observed.ID)
 	}
 	return current, nil
 }
@@ -661,9 +707,11 @@ func (h *Handlers) installAndEnableDeploy(
 	// 5. Backend Enablement
 	_ = h.updateDeployOrderStatus(ctx, req.OrderID, DeployStatusEnablingBackend, DeployStatusEnablingBackend, "", providerServerID, nexusServerID, assignedIP)
 	if err := h.enableDeployBackend(ctx, server, protocol); err != nil {
-		if nexusServerID > 0 && h.vpnSvc != nil {
-			_ = h.vpnSvc.DisableBackend(ctx, nexusServerID)
-		}
+		// The enablement path already withdrew the backend generation it observed
+		// (durable + runtime quarantine, administrative disable, device detach).
+		// A second disable keyed only by server ID would withdraw whatever owns
+		// the slot NOW, including a replacement the operator created while this
+		// deployment was in flight, so it is deliberately not repeated here.
 		return h.failDeployStatus(ctx, req.OrderID, DeployStatusEnablingBackend, fmt.Errorf("backend enablement failed: %w", err), providerServerID, nexusServerID, assignedIP, protocol, port)
 	}
 

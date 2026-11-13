@@ -115,7 +115,7 @@ func TestServiceDeployReplacementQuarantinedUntilOwnQualification(t *testing.T) 
 	if err != nil || cur.ID != replacement.ID {
 		t.Fatalf("restart changed the replacement: %+v err=%v", cur, err)
 	}
-	if err := svc.PromoteQualifiedTunnel(ctx, sid, 20); err != nil {
+	if err := svc.PromoteQualifiedTunnel(ctx, cur, 20); err != nil {
 		t.Fatalf("qualify replacement: %v", err)
 	}
 	pending, err = db.GetBackendPendingEnrollments(ctx)

@@ -234,7 +234,7 @@ func TestEvidenceCurrent_EndedQuarantineStopsExplainingConnecting(t *testing.T) 
 	}
 
 	// The quarantine ends (qualification) without another probe.
-	if err := e.svc.PromoteQualifiedTunnel(t.Context(), e.blocked.ServerID, 5); err != nil {
+	if err := e.svc.PromoteQualifiedTunnel(t.Context(), e.blocked, 5); err != nil {
 		t.Fatalf("qualify: %v", err)
 	}
 	if e.svc.prober.IsPendingEnrollment(e.blocked.ServerID) {
