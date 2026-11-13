@@ -430,10 +430,8 @@ func runS4QualificationBodyTo(w io.Writer) int {
 		return fail("TCP echo DNAT: %v", err)
 	}
 
-	// --- Ownership: a reply is delivered only to the peer that owns the flow -----
-	if s4PeerGotReply(replies, "peer-s4-other") {
-		return fail("a direct reply was delivered to a peer that owns no flow")
-	}
+	// (Ownership is observed once, after the proxy round trip below, so a copy
+	// delivered late in either direction is still seen.)
 
 	// --- Proxy path still works in the same dispatcher instance ------------------
 	// Proves the direct path did not displace the existing proxy behaviour: an
@@ -470,9 +468,34 @@ func runS4QualificationBodyTo(w io.Writer) int {
 	if err := s4AssertProxyReplyAddressed(proxyReply, "10.100.0.12", 5555); err != nil {
 		return fail("proxy reply %v", err)
 	}
-	// Ownership: the proxy reply reached its owner and no other peer saw it.
-	if s4PeerGotReply(replies, "peer-s4-udp") || s4PeerGotReply(replies, "peer-s4-tcp") {
-		return fail("a proxy reply was delivered to a peer that owns no proxied flow")
+	// --- Ownership: each reply reaches only the peer that owns its flow ----------
+	// The observation is by reply identity, not by "did this peer ever receive a
+	// packet". Both direct peers own real flows and legitimately keep receiving
+	// their own replies (a direct TCP flow retransmits and closes), so presence
+	// alone is true on every run and cannot separate a leak from that traffic. It
+	// is also not a count window: the scan covers everything each peer's return
+	// path recorded, so a copy delivered after any intermediate sample is still
+	// seen and no counter reset is involved.
+	//
+	// All four replies the gate already required are observed once, here, so a
+	// copy delivered late in either direction is not missed. A destination that
+	// belongs to no registered peer is an error rather than a silent pass.
+	for _, observed := range []struct {
+		description string
+		reply       []byte
+	}{
+		{"direct UDP reply", udpReply},
+		{"direct TCP SYN-ACK", synAck},
+		{"direct TCP echo", tcpEcho},
+		{"proxy reply", proxyReply},
+	} {
+		violations, violErr := s4OwnershipViolations(replies, observed.reply)
+		if violErr != nil {
+			return fail("ownership observation for the %s: %v", observed.description, violErr)
+		}
+		if len(violations) > 0 {
+			return fail("the %s reached %v, which does not own that flow", observed.description, violations)
+		}
 	}
 	if got := dem.DirectDrops(); got != dropsBeforeProxy {
 		return fail("the proxy round trip incremented directDrops (%d -> %d)", dropsBeforeProxy, got)
@@ -634,6 +657,11 @@ func s4AssertProxyReplyAddressed(packet []byte, clientIP string, clientPort uint
 }
 
 // s4PeerReplies records per-peer reply deliveries from the dispatcher.
+//
+// It is an append-only history, deliberately: the ownership observation compares
+// each required reply with what every peer's return path actually received, so a
+// copy that arrives after any intermediate sample is still visible and no counter
+// reset is needed to keep the observation honest.
 
 type s4PeerReplies struct {
 	mu     sync.Mutex
@@ -696,23 +724,15 @@ func s4BuildDispatcherService(wanDev forwarder.PacketDevice, fixture *s4Fixture)
 	fwd.AttachBackendDevice(s4ProxyBackendID, backendDev)
 
 	replies := newS4PeerReplies()
-	for _, peer := range []struct{ peerKey, clientIP string }{
-		{"peer-s4-udp", "10.100.0.10"},
-		{"peer-s4-tcp", "10.100.0.11"},
-		{"peer-s4-proxy", s4ProxyBackendClientIP},
-	} {
-		peer, clientIP := peer.peerKey, peer.clientIP
-		path := forwarder.NewReturnPath(func(peerKey, assignedIP string, packet []byte) (int, error) {
-			replies.add(peerKey, packet)
-			return len(packet), nil
-		})
-		fwd.RegisterSessionWithReturnPath("sess-"+peer, "conn-"+peer, peer, clientIP, s4ProxyBackendID, path)
+	for _, peer := range s4PeerRegistrations {
+		path := forwarder.NewReturnPath(s4ReplySink(replies))
+		fwd.RegisterSessionWithReturnPath("sess-"+peer.peerKey, "conn-"+peer.peerKey, peer.peerKey, peer.clientIP, s4ProxyBackendID, path)
 		// Direct decisions come from observed client DNS evidence, exactly as in
 		// production; seeding the cache for the fixture peer keeps the flow honest
 		// without inventing a second decision path. The proxied peer deliberately
 		// gets NO direct decision, so its packet must take the proxy path.
-		if clientIP != s4ProxyBackendClientIP {
-			rc.Set("sess-"+peer, fixture.peerIP, policy.Direct)
+		if peer.clientIP != s4ProxyBackendClientIP {
+			rc.Set("sess-"+peer.peerKey, fixture.peerIP, policy.Direct)
 		}
 	}
 
@@ -889,7 +909,13 @@ func s4PayloadOffset(pkt []byte) (int, bool) {
 	return 0, false
 }
 
-// s4PeerGotReply reports whether anything was delivered to a peer.
+// s4PeerGotReply reports whether anything was ever delivered to a peer.
+//
+// It is the presence predicate the ownership assertions used to rely on, retained
+// only as the regression control's contrast: on any run that reaches the ownership
+// assertion it is TRUE for the direct peers, because they own real flows and keep
+// receiving their own replies. Presence therefore cannot separate a leak from
+// legitimate traffic; use s4OwnershipViolations to judge a delivery.
 func s4PeerGotReply(replies *s4PeerReplies, peerKey string) bool {
 	return len(replies.packets(peerKey)) > 0
 }
