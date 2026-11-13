@@ -24,6 +24,12 @@ jobs:
     name: DEV Server E2E Verification
     runs-on: [ self-hosted, linux, arm64, dev ]
     timeout-minutes: 90
+    env:
+      # internal/vpn does not compile without this tag (tags_guard.go enforces
+      # it deliberately), and the qualification stages run `go test ./internal/vpn`.
+      # ci.yml sets the same flag workflow-wide; this workflow never did, which
+      # stayed hidden only because the stages were skipped while the lifecycle failed.
+      GOFLAGS: -tags=with_utls
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
