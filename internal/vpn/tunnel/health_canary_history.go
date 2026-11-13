@@ -273,10 +273,21 @@ func (hp *HealthProber) canaryObservationCurrent(t *models.BackendTunnel, sequen
 	return nil
 }
 
-func isObsoleteCanary(err error) bool {
+// ObsoleteCanary reports whether a canary verdict was refused because the backend
+// it was measured against is no longer the backend that owns the server slot: a
+// deleted/re-created row, a replaced identity, a version that moved, an
+// administrative disable, or a canceled exchange.
+//
+// A caller that writes a terminal health effect from a canary verdict must consult
+// this first. Such a verdict is evidence about a generation that no longer exists,
+// so it may not be recorded as the CURRENT backend's health.
+func ObsoleteCanary(err error) bool {
 	return errors.Is(err, ErrTunnelNotFound) || errors.Is(err, ErrStaleStateVersion) ||
 		errors.Is(err, ErrTunnelDisabled) || errors.Is(err, context.Canceled)
 }
+
+// isObsoleteCanary is the package-internal name retained for the existing callers.
+func isObsoleteCanary(err error) bool { return ObsoleteCanary(err) }
 
 // CanaryFailureCount returns shared history only for the current tunnel identity.
 func (hp *HealthProber) CanaryFailureCount(tunnelID int64) int {

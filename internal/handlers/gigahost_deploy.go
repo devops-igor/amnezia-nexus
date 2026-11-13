@@ -502,14 +502,35 @@ func (h *Handlers) qualifyBackendTraffic(ctx context.Context, server *models.Ser
 		return h.failBackendAdmission(ctx, tun, "backend tunnel disappeared after qualification probe", err)
 	}
 	if err := h.vpnSvc.ProbeCanary(probeCtx, current); err != nil {
-		// A canary verdict belongs to the generation it was run against: record the
-		// runtime health-disable on that tunnel, then withdraw the same generation.
-		// Neither may touch a replacement that took the slot meanwhile.
-		_ = h.vpnSvc.SetTunnelStatusWithVersion(ctx, current.ServerID, current.ID, 0, models.TunnelStatusDisabled, 0)
-		return h.failBackendAdmission(ctx, current, "data-plane payload verification failed", err)
+		return h.failCanaryAdmission(ctx, current, err)
 	}
 
 	return h.admitQualifiedBackend(ctx, probeCtx, current, latencyMS)
+}
+
+// failCanaryAdmission handles an inner-canary error for the observed backend.
+//
+// The prober already decides whether a verdict still describes the backend that owns
+// the slot. A verdict it REFUSED (deleted/re-created row, endpoint or credential
+// change, moved state version, administrative disable, canceled exchange) is inert:
+// writing disabled/health here would record a FALSE current health state for an
+// identity no qualification measured, and the guarded withdrawal would then correctly
+// refuse to touch that identity, so nothing could undo the false record.
+//
+// A genuine payload failure of the backend that still owns its slot keeps the
+// established semantics: the health-disable is recorded on that tunnel and the
+// withdrawal withdraws the same generation. The version it actually observed is passed
+// rather than 0, so even this write is fenced against a concurrent state move.
+func (h *Handlers) failCanaryAdmission(
+	ctx context.Context,
+	observed *models.BackendTunnel,
+	canaryErr error,
+) error {
+	if tunnel.ObsoleteCanary(canaryErr) {
+		return h.failBackendAdmission(ctx, observed, "backend traffic qualification became obsolete", canaryErr)
+	}
+	_ = h.vpnSvc.SetTunnelStatusWithVersion(ctx, observed.ServerID, observed.ID, observed.StateVersion, models.TunnelStatusDisabled, 0)
+	return h.failBackendAdmission(ctx, observed, "data-plane payload verification failed", canaryErr)
 }
 
 // admitQualifiedBackend commits admission for a backend whose outer handshake AND
