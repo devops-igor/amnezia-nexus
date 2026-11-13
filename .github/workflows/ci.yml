@@ -120,16 +120,20 @@ jobs:
           grep -qa '__umodti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
           grep -qa '__udivti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
 
-      # These four WAN tests fail closed under CI when the runner has no root,
-      # /dev/net/tun or private network namespace, which is correct — they must never
-      # report success by skipping. They cannot run in this unprivileged job, so they
-      # are excluded here and executed for real by the required `wan-qualification` job
-      # below. The exclusion is paired one-to-one with that execution: it removes no
-      # obligation, it moves each obligation to a step that actually runs it.
+      # These five tests need a real host boundary the runner job cannot provide: root,
+      # /dev/net/tun, a private network namespace, or a writable user-namespace uid_map.
+      # They fail closed under CI in exactly that situation, which is correct — they must
+      # never report success by skipping. They cannot run in this unprivileged job, so
+      # they are excluded here and executed for real by the required `wan-qualification`
+      # job below. The exclusion is paired one-to-one with that execution: it removes no
+      # obligation, it moves each obligation to a step that actually runs it. The
+      # iptables child capability proof is one of them because it reads the capability
+      # sets of a child it starts inside its own user namespace, which ordinary runners
+      # refuse; its two namespace-free controls are NOT excluded and keep running here.
       - name: Run Tests with Race Detector
         run: |
           go test -race -cover -count=1 -timeout=15m -coverprofile=coverage.out \
-            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress)$' ./...
+            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$' ./...
 
       - name: Run Authentic Native Caddy Integration Tests
         run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
@@ -290,6 +294,12 @@ jobs:
   # forwarder gate needs live in a private mount and cannot leak to the host. The
   # namespace and its tmpfs disappear when the process exits, which is also why cleanup
   # deletes only exact paths this job created and never scans or removes host state.
+  #
+  # The iptables child capability proof runs in this job for the same class of reason:
+  # it starts its own user namespace and reads the capability sets of the child it
+  # executed, which ordinary unprivileged runners refuse. It is excluded from the
+  # unprivileged `test` job by that job's -skip list and required here by name, so the
+  # exclusion moves the obligation instead of dropping it.
   wan-qualification:
     name: Required WAN Qualification (isolated namespaces)
     runs-on: ubuntu-latest
@@ -314,7 +324,7 @@ jobs:
           set -uo pipefail
           LOG="$RUNNER_TEMP/vpn-wan.log"
           rc=0
-          echo "running: S4 + production lifecycle + capture positive/negative"
+          echo "running: S4 + production lifecycle + capture positive/negative + iptables child capability"
           # Outer isolation, then run. sudo resets the environment, so the required
           # markers are passed explicitly. If unshare or the tmpfs mount refuses, the
           # test binary is never started and the step exits non-zero.
@@ -356,9 +366,14 @@ jobs:
               namei -l /run/wan/vpn-wan.test >&2 || echo "diag: binary namei failed" >&2
               findmnt -no TARGET,OPTIONS -T /run/wan/vpn-wan.test >&2 || echo "diag: findmnt reported no mount" >&2
               unshare -Urn --map-root-user sh -c "id -u; grep ^CapEff /proc/self/status; cat /proc/self/uid_map; /bin/true && echo diag-inner-true-ok || echo diag-inner-true-denied" >&2 || echo "diag-inner: user namespace or sh launch refused" >&2
+              # TestIPTablesChild_NonRootConsumerGetsNetAdminOnly is selected here for
+              # the same reason as the WAN gates: it starts its own user namespace and
+              # reads the executed child's capability sets, which the unprivileged job
+              # is refused. It is excluded there and required here, and it asserts a
+              # genuine child PASS — it is never a skip.
               exec /run/wan/vpn-wan.test \
                 -test.v -test.timeout=12m \
-                -test.run "^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath)$"
+                -test.run "^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$"
             ' > "$LOG" 2>&1 || rc=$?
           cat "$LOG"
           # Exit status alone is not the oracle: a skip or a missing test would look
@@ -373,10 +388,14 @@ jobs:
             echo "::error::a required WAN test FAILED"
             exit 1
           fi
+          # Every selected test must report its own PASS. The iptables child capability
+          # proof is listed by name, so deleting it from the selection, from this list,
+          # or letting it skip cannot leave this step green.
           for name in \
             TestS4ProductionContainerHostWANQualification \
             TestProductionWANDevice_PermissionsAndLifecycle \
-            TestWANCaptureProductionPath
+            TestWANCaptureProductionPath \
+            TestIPTablesChild_NonRootConsumerGetsNetAdminOnly
           do
             if ! grep -qE "^--- PASS: $name " "$LOG"; then
               echo "::error::required test did not report PASS: $name"
