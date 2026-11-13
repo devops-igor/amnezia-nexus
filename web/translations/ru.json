@@ -577,7 +577,7 @@
   "vpn_diag_latency_p95": "Задержка p95 (мс)",
   "vpn_diag_load_skew": "Дисбаланс нагрузки",
   "vpn_diag_device_drops": "Потери устройства",
-  "vpn_diag_cpu_usage": "Загрузка CPU",
+  "vpn_diag_cpu_usage": "Загрузка CPU (процесс панели)",
   "vpn_diag_memory": "Память кучи (выделено / лимит)",
   "vpn_diag_goroutines": "Горутины",
   "vpn_diag_gc_pause": "Пауза GC p95",
