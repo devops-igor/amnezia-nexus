@@ -19,7 +19,9 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -225,12 +227,13 @@ func TestFixtureVPNServiceReleasesBackendDeviceAtTeardown(t *testing.T) {
 // enableControlBackend builds a service the way the handler fixtures do — a
 // never-Started service over a real database — and enables one real backend on
 // it, so the control has a device and a return-path reader to observe.
-func enableControlBackend(t *testing.T) (*vpn.Service, vpn.BackendDevice) {
+func buildControlBackend(t *testing.T) (*vpn.Service, *database.DB, vpn.BackendDevice) {
 	t.Helper()
 	db, err := database.Open(t.TempDir()+"/teardown_control.db", testSecretKey)
 	if err != nil {
 		t.Fatalf("open the control database: %v", err)
 	}
+	t.Cleanup(func() { _ = db.Close() })
 	svc, err := vpn.NewVPNService(db, nil)
 	if err != nil {
 		t.Fatalf("build the service the way the fixture does (nil VPN config): %v", err)
@@ -259,12 +262,18 @@ func enableControlBackend(t *testing.T) (*vpn.Service, vpn.BackendDevice) {
 	if dev == nil {
 		t.Fatal("the enabled backend owns no device, so this control would prove nothing")
 	}
-	// The control must not leak what it demonstrates. Closing the device first is
-	// what ends the reader, and it needs no database.
+	return svc, db, dev
+}
+
+// enableControlBackend is buildControlBackend plus its own release, so a
+// control that is not demonstrating a leak does not become one.
+func enableControlBackend(t *testing.T) (*vpn.Service, vpn.BackendDevice) {
+	t.Helper()
+	svc, _, dev := buildControlBackend(t)
+	// Closing the device first is what ends the reader, and it needs no database.
 	t.Cleanup(func() {
 		_ = dev.Close()
 		_ = svc.Stop()
-		_ = db.Close()
 	})
 	return svc, dev
 }
@@ -321,5 +330,159 @@ func TestFixtureRepeatedCyclesOwnNoWorkersAfterEachRelease(t *testing.T) {
 		}
 		waitFixtureOwnedWorkers(t, fixtureSSHKeepAliveFrame, pool, 0, fmt.Sprintf("keep-alive loop left behind by cycle %d", cycle))
 		waitFixtureOwnedWorkers(t, fixtureSSHSweepFrame, pool, 0, fmt.Sprintf("sweep loop left behind by cycle %d", cycle))
+	}
+}
+
+// fixtureBackendDeviceFrameRE captures the receiver pointer of the production
+// encryption goroutine each open backend device runs. The frame prints the
+// receiver followed by the goroutine's other arguments, so the capture stops at
+// the receiver rather than expecting a closing paren right after it.
+var fixtureBackendDeviceFrameRE = regexp.MustCompile(`device\.\(\*Device\)\.RoutineEncryption\((0x[0-9a-f]+)`)
+
+// fixtureLiveBackendDeviceIDs returns the identity of every backend device that
+// still runs its production encryption goroutine. The goroutine's frame prints
+// the device receiver, so the identity is a device object — not a count of the
+// process's goroutines, which any unrelated test could change.
+func fixtureLiveBackendDeviceIDs(t *testing.T) map[string]struct{} {
+	t.Helper()
+	ids := make(map[string]struct{})
+	for _, m := range fixtureBackendDeviceFrameRE.FindAllStringSubmatch(fixtureGoroutineDump(t), -1) {
+		ids[m[1]] = struct{}{}
+	}
+	return ids
+}
+
+// fixtureBackendDeviceSurplus lists the devices that were not open when the
+// baseline was taken, so a device left behind by the code under test is named
+// even when the baseline already held devices from earlier tests.
+func fixtureBackendDeviceSurplus(t *testing.T, baseline map[string]struct{}) []string {
+	t.Helper()
+	var surplus []string
+	for id := range fixtureLiveBackendDeviceIDs(t) {
+		if _, ok := baseline[id]; !ok {
+			surplus = append(surplus, id)
+		}
+	}
+	sort.Strings(surplus)
+	return surplus
+}
+
+// waitFixtureBackendDeviceSurplus polls until the surplus reaches the wanted
+// state and returns what it last observed. The transition is the evidence: a
+// single sample cannot tell a release that just happened from one that never
+// will, and a leak control needs the opposite direction.
+func waitFixtureBackendDeviceSurplus(t *testing.T, baseline map[string]struct{}, wantSurplus bool) []string {
+	t.Helper()
+	deadline := time.Now().Add(fixtureReleaseTimeout)
+	for {
+		surplus := fixtureBackendDeviceSurplus(t, baseline)
+		if (len(surplus) > 0) == wantSurplus || time.Now().After(deadline) {
+			return surplus
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestDirectConsumerFixturesReleaseTheirBackendDevice drives the two handler
+// tests that build their own VPN service and enable a backend on it, and
+// requires each one's device to be gone after that test's own cleanup has run.
+// Both used to register no release, so the device and its return-path reader
+// outlived them for the rest of the binary.
+func TestDirectConsumerFixturesReleaseTheirBackendDevice(t *testing.T) {
+	consumers := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{"update server host", TestUpdateServerHostHandler_VPNBackendPropagation},
+		{"backend identity rotation", TestBackendIdentityRotationReconcilesPersistedAndActiveIdentity},
+	}
+	for _, consumer := range consumers {
+		// Sampled before the subtest so the assertion is about the device this
+		// consumer opened, not about devices other tests left behind.
+		baseline := fixtureLiveBackendDeviceIDs(t)
+		t.Run(consumer.name, consumer.run)
+		// Reported, not fatal: one leaking consumer must not hide the verdict on
+		// the other, and each name is a separate acceptance item.
+		if surplus := waitFixtureBackendDeviceSurplus(t, baseline, false); len(surplus) > 0 {
+			t.Errorf("%s left backend device(s) %v open after its own cleanup", consumer.name, surplus)
+		}
+	}
+}
+
+// assertFixturePersistedAdminDisable checks that the backend row the fixture
+// released carries a persisted administrative disable, which only an open store
+// can have recorded.
+func assertFixturePersistedAdminDisable(t *testing.T, persisted models.BackendTunnel) {
+	t.Helper()
+	if persisted.Enabled {
+		t.Fatal("the release left the backend administratively enabled, so it cannot have persisted a disable")
+	}
+	if persisted.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("persisted disable reason = %q, want %q", persisted.DisableReason, models.DisableReasonAdmin)
+	}
+}
+
+// TestFixtureReleaseRunsBeforeTheDatabaseCloses proves the ordering the consumer
+// registration relies on. A release registered after the database cleanup runs
+// first (last in, first out), and the administrative disable it persists can
+// only land through an open store — so a persisted disable is evidence the
+// release ran while the database was still open, not after it closed.
+func TestFixtureReleaseRunsBeforeTheDatabaseCloses(t *testing.T) {
+	var (
+		persisted models.BackendTunnel
+		readErr   error
+		dev       vpn.BackendDevice
+	)
+	t.Run("the fixture enables and releases one backend", func(t *testing.T) {
+		var (
+			svc *vpn.Service
+			db  *database.DB
+		)
+		svc, db, dev = buildControlBackend(t)
+		if dev.IsClosed() {
+			t.Fatal("the device is already closed while the fixture still uses the backend")
+		}
+		// Registered before the release, so last-in-first-out runs it after the
+		// release and while the store is open.
+		t.Cleanup(func() {
+			rows, err := db.GetBackendTunnels(context.Background())
+			readErr = err
+			if err == nil && len(rows) == 1 {
+				persisted = rows[0]
+			}
+		})
+		t.Cleanup(func() { releaseFixtureVPNService(t, svc) })
+	})
+	if dev == nil {
+		t.Fatal("the fixture never enabled a backend")
+	}
+	if readErr != nil {
+		t.Fatalf("reading the persisted backend state after the fixture released it: %v", readErr)
+	}
+	assertFixturePersistedAdminDisable(t, persisted)
+	if !dev.IsClosed() {
+		t.Fatalf("the fixture left the device of backend tunnel %d open after its release", persisted.ID)
+	}
+}
+
+// TestMissingFixtureCleanupFailsTheReleaseOracle is the negative control for the
+// regression above: a fixture that builds the same backend and registers no
+// release must be reported as still owning its device. If the observation ever
+// stopped seeing an unreleased device, the regression would pass without proving
+// anything — so this control is what makes it able to fail.
+func TestMissingFixtureCleanupFailsTheReleaseOracle(t *testing.T) {
+	baseline := fixtureLiveBackendDeviceIDs(t)
+	var dev vpn.BackendDevice
+	t.Run("a fixture without a release", func(t *testing.T) {
+		// Deliberately no release registered: that is the defect under control.
+		_, _, dev = buildControlBackend(t)
+	})
+	if dev == nil {
+		t.Fatal("the control never produced a device")
+	}
+	// The control must not leak what it demonstrates.
+	t.Cleanup(func() { _ = dev.Close() })
+	if surplus := waitFixtureBackendDeviceSurplus(t, baseline, true); len(surplus) == 0 {
+		t.Fatal("the release observation did not see the unreleased device, so it cannot prove a release")
 	}
 }

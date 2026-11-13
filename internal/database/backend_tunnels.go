@@ -157,11 +157,37 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
+	args, err := d.prepareBackendTunnelInsert(t)
+	if err != nil {
+		return 0, err
+	}
+	res, err := d.sqlDB.ExecContext(ctx, insertBackendTunnelSQL, args...)
+	if err != nil {
+		return 0, fmt.Errorf("failed to insert backend tunnel: %w", err)
+	}
+
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	t.ID = id
+	return id, nil
+}
+
+const insertBackendTunnelSQL = `INSERT INTO backend_tunnels (
+		server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
+		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at,
+		protocol, protocol_params
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+// prepareBackendTunnelInsert applies the insert defaults to t and returns the
+// encrypted column values for insertBackendTunnelSQL.
+func (d *DB) prepareBackendTunnelInsert(t *models.BackendTunnel) ([]any, error) {
 	encPrivKey := t.PrivateKey
 	if encPrivKey != "" && !security.LooksLikeFernetToken(encPrivKey) {
 		ep, err := security.EncryptCredential(encPrivKey, d.secretKey)
 		if err != nil {
-			return 0, fmt.Errorf("failed to encrypt backend tunnel private key: %w", err)
+			return nil, fmt.Errorf("failed to encrypt backend tunnel private key: %w", err)
 		}
 		encPrivKey = ep
 	}
@@ -170,7 +196,7 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 	if encProbeKey != "" && !security.LooksLikeFernetToken(encProbeKey) {
 		ep, err := security.EncryptCredential(encProbeKey, d.secretKey)
 		if err != nil {
-			return 0, fmt.Errorf("failed to encrypt backend tunnel probe private key: %w", err)
+			return nil, fmt.Errorf("failed to encrypt backend tunnel probe private key: %w", err)
 		}
 		encProbeKey = ep
 	}
@@ -183,7 +209,7 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 	if encProtoParams != "" && !security.LooksLikeFernetToken(encProtoParams) {
 		ep, err := security.EncryptCredential(encProtoParams, d.secretKey)
 		if err != nil {
-			return 0, fmt.Errorf("failed to encrypt backend tunnel protocol params: %w", err)
+			return nil, fmt.Errorf("failed to encrypt backend tunnel protocol params: %w", err)
 		}
 		encProtoParams = ep
 	}
@@ -206,13 +232,7 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 		t.StateVersion = 1
 	}
 
-	query := `INSERT INTO backend_tunnels (
-		server_id, interface_name, public_key, private_key, probe_private_key, endpoint,
-		enabled, status, disable_reason, state_version, last_health_check, latency_ms, active_connections, created_at,
-		protocol, protocol_params
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-
-	res, err := d.sqlDB.ExecContext(ctx, query,
+	return []any{
 		t.ServerID,
 		t.InterfaceName,
 		t.PublicKey,
@@ -229,18 +249,7 @@ func (d *DB) CreateBackendTunnel(ctx context.Context, t *models.BackendTunnel) (
 		createdAtStr,
 		t.Protocol,
 		encProtoParams,
-	)
-
-	if err != nil {
-		return 0, fmt.Errorf("failed to insert backend tunnel: %w", err)
-	}
-
-	id, err := res.LastInsertId()
-	if err != nil {
-		return 0, err
-	}
-	t.ID = id
-	return id, nil
+	}, nil
 }
 
 // prepareBackendTunnelUpdateValue transforms and encrypts column update values.
@@ -450,6 +459,45 @@ func (d *DB) DeleteBackendTunnel(ctx context.Context, id int64) error {
 	_, err := d.sqlDB.ExecContext(ctx, "DELETE FROM backend_tunnels WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("failed to delete backend tunnel %d: %w", id, err)
+	}
+	return nil
+}
+
+// DeleteBackendTunnelAndReleaseEnrollment removes a backend tunnel record and
+// clears its durable pending-enrollment marker in ONE transaction.
+//
+// The two writes must be atomic because they describe one lifecycle fact: the
+// backend no longer exists. Applying only the row delete left the store
+// quarantining a backend that was gone, so a replacement added later inherited a
+// quarantine nobody owned, and a restart resurrected it from the surviving marker.
+//
+// Mirrors PromoteTunnelAndClearEnrollment: caller-owned context, writeMu
+// serialization, explicit rollback on any failure.
+func (d *DB) DeleteBackendTunnelAndReleaseEnrollment(ctx context.Context, id, serverID int64) error {
+	if d == nil || d.sqlDB == nil {
+		return nil
+	}
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	tx, err := d.sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin backend removal transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	if _, err := tx.ExecContext(ctx, "DELETE FROM backend_tunnels WHERE id = ?", id); err != nil {
+		return fmt.Errorf("failed to delete backend tunnel %d: %w", id, err)
+	}
+	// Only the removed row's own (or an unbound) quarantine is released: a mark
+	// bound to another row belongs to a replacement generation.
+	if err := releaseOwnedEnrollment(ctx, tx, serverID, id); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit backend removal for server %d: %w", serverID, err)
 	}
 	return nil
 }

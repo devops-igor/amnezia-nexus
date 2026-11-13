@@ -152,3 +152,66 @@ func TestProxyDeploymentFailedQualificationKeepsQuarantine(t *testing.T) {
 		})
 	}
 }
+
+// TestProxyReplacementAfterFailedDeploymentDoesNotInheritQuarantine pins the
+// reinstall/replacement boundary (group B): when a backend is replaced on the
+// same server, the failure of the FIRST deployment must not quarantine the
+// replacement, while a genuinely unqualified replacement stays gated.
+func TestProxyReplacementAfterFailedDeploymentDoesNotInheritQuarantine(t *testing.T) {
+	h, router, _ := setupDeployTestEnv(t)
+	h.vpnSvc.SetProxyTrafficProbeFuncForTest(
+		func(context.Context, *models.BackendTunnel) (int64, error) {
+			return 0, fmt.Errorf("first deployment application exchange unavailable")
+		},
+	)
+
+	req := httptest.NewRequest("POST", "/api/admin/hosting/gigahost/orders/proxy-replace/setup",
+		strings.NewReader(fmt.Sprintf(`{"ssh_password":"fixture-only","protocol":%q,"tls_domain":"proxy.example.com"}`, models.ProtocolVLESS)))
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{UserID: "admin", Role: models.RoleAdmin}))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+	if response.Code == http.StatusOK {
+		t.Fatalf("failed first deployment reported ready: %s", response.Body.String())
+	}
+
+	backends, err := h.vpnSvc.GetBackends(context.Background())
+	if err != nil || len(backends) != 1 {
+		t.Fatalf("backends=%d err=%v", len(backends), err)
+	}
+	serverID := backends[0].ServerID
+	t.Cleanup(func() { _ = h.vpnSvc.DisableBackend(context.Background(), serverID) })
+
+	pending, err := h.db.GetBackendPendingEnrollments(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pending[serverID] {
+		t.Fatal("failed deployment released its own durable quarantine")
+	}
+
+	// Replace the backend on the same server: the retired tunnel's quarantine must
+	// not survive into the replacement.
+	if err := h.vpnSvc.DeleteBackend(context.Background(), serverID); err != nil {
+		t.Fatalf("delete backend: %v", err)
+	}
+	if err := h.vpnSvc.EnableBackend(context.Background(), serverID); err != nil {
+		t.Fatalf("re-enable replacement: %v", err)
+	}
+	after, err := h.db.GetBackendPendingEnrollments(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after[serverID] {
+		t.Fatal("the replacement inherited the retired deployment's durable quarantine")
+	}
+	// The runtime owner must agree with the durable one: a stale in-memory marker
+	// would keep the replacement non-routable until a process restart even though
+	// the store is clean.
+	cur, err := h.vpnSvc.GetTunnel(serverID)
+	if err != nil || cur == nil {
+		t.Fatalf("read replacement tunnel: %v", err)
+	}
+	if !cur.Enabled {
+		t.Fatal("replacement is not administratively enabled")
+	}
+}

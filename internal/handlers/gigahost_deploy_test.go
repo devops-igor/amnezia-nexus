@@ -958,3 +958,64 @@ func TestGigahostDeploy_DefaultSSHDialer(t *testing.T) {
 		t.Error("expected dialDeploySSH with invalid port to fail, got nil")
 	}
 }
+
+// TestGigahostDeploy_AWGReinstallReleasesRetiredQuarantine covers the AWG
+// reinstall/current-consumer path: a backend is deployed, deleted, then deployed
+// again on the same server. The retired deployment's enrollment quarantine must
+// not survive into the replacement, and the replacement must be able to complete
+// its own qualification.
+func TestGigahostDeploy_AWGReinstallReleasesRetiredQuarantine(t *testing.T) {
+	h, _, _ := setupDeployTestEnv(t)
+	ctx := context.Background()
+
+	req := GigahostDeployRequest{
+		OrderID:     "ord_test_awg_reinstall",
+		SSHPassword: "ValidSSHPass123!",
+		ServerName:  "Gigahost-AWG-Reinstall",
+		Protocol:    "awg",
+		Port:        "51820",
+		WaitReady:   true,
+	}
+	first, err := h.DeployGigahostOrder(ctx, req)
+	if err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	serverID := first.ServerID
+
+	// Mark the first backend as mid-enrollment, as a deploy that has not yet
+	// qualified would be, then retire it.
+	h.vpnSvc.SetPendingEnrollment(serverID, true)
+	if err := h.vpnSvc.DeleteBackend(ctx, serverID); err != nil {
+		t.Fatalf("delete backend: %v", err)
+	}
+
+	// The retired deployment's quarantine must be gone from the store.
+	pending, err := h.db.GetBackendPendingEnrollments(ctx)
+	if err != nil {
+		t.Fatalf("read pending enrollments: %v", err)
+	}
+	if pending[serverID] {
+		t.Fatal("the deleted backend's durable enrollment quarantine survived the removal")
+	}
+
+	// Reinstall on the same server through the current consumer path.
+	if err := h.vpnSvc.EnableBackend(ctx, serverID); err != nil {
+		t.Fatalf("re-enable after reinstall: %v", err)
+	}
+	tun, err := h.vpnSvc.GetTunnel(serverID)
+	if err != nil || tun == nil {
+		t.Fatalf("replacement tunnel missing after reinstall: %v", err)
+	}
+	if !tun.Enabled {
+		t.Fatal("replacement backend is not administratively enabled")
+	}
+	// The replacement starts its own lifecycle; it must not inherit a quarantine
+	// it never earned.
+	pending, err = h.db.GetBackendPendingEnrollments(ctx)
+	if err != nil {
+		t.Fatalf("read pending enrollments: %v", err)
+	}
+	if pending[serverID] {
+		t.Fatal("the reinstalled backend inherited the retired deployment's quarantine")
+	}
+}

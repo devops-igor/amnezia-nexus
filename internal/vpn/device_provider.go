@@ -85,19 +85,37 @@ func (s *Service) CanaryFailureCount(tunnelID int64) int {
 
 // PromoteQualifiedTunnel promotes a connecting backend tunnel to active (or degraded if latency is high)
 // after both outer handshake and inner canary probe have succeeded.
-func (s *Service) PromoteQualifiedTunnel(ctx context.Context, serverID int64, latencyMS int64) error {
+//
+// The promotion is scoped to the generation the qualification actually OBSERVED,
+// not to the server slot: an observation that returns after the operator deleted
+// or re-enrolled that backend must not admit whatever owns the slot now. The
+// pool decides that under its own lock, at the same commit that writes the
+// status, so there is no check-to-commit window and no retry that could adopt a
+// replacement. A retired observation yields ErrTunnelGenerationRetired and
+// changes nothing.
+func (s *Service) PromoteQualifiedTunnel(ctx context.Context, observed *models.BackendTunnel, latencyMS int64) error {
 	if s == nil || s.pool == nil {
 		return errors.New("vpn service or pool not initialized")
 	}
+	if observed == nil {
+		return tunnel.ErrTunnelGenerationRetired
+	}
 	targetStatus := s.targetStatusForLatency(latencyMS)
-	if err := s.commitPromoteWithRetry(ctx, serverID, targetStatus, latencyMS); err != nil {
+	if err := s.pool.PromoteObservedTunnelWithEnrollmentRelease(ctx, observed, targetStatus, latencyMS); err != nil {
 		return err
 	}
-	// commitPromoteWithRetry releases the durable marker atomically with the
-	// status commit (finding F10). Only the in-memory prober map still needs
-	// clearing, and only after the durable release actually succeeded.
+	// The pool released its generation quarantine inside the commit above and
+	// PromoteObservedTunnelWithEnrollmentRelease released the durable marker in
+	// the same transaction (finding F10). Only this OBSERVATION's caller mark
+	// remains. It is released by enrollment attempt when the observation carries
+	// one, so the release cannot clear the gate of a later enrollment of the same
+	// unchanged row; generation identity remains the fence otherwise.
 	if s.prober != nil {
-		s.prober.SetPendingEnrollment(serverID, false)
+		if observed.EnrollmentAttempt != 0 {
+			s.prober.ReleaseEnrollmentForAttempt(observed.ServerID, observed.EnrollmentAttempt)
+		} else {
+			s.prober.ReleaseEnrollmentForGeneration(observed.ServerID, observed.ID)
+		}
 	}
 	return nil
 }
@@ -113,34 +131,30 @@ func (s *Service) targetStatusForLatency(latencyMS int64) string {
 	return models.TunnelStatusActive
 }
 
-func (s *Service) commitPromoteWithRetry(ctx context.Context, serverID int64, targetStatus string, latencyMS int64) error {
-	for attempts := 0; attempts < 3; attempts++ {
-		tun, err := s.pool.GetTunnel(serverID)
-		if err != nil || tun == nil {
-			return fmt.Errorf("backend tunnel not found for server %d", serverID)
-		}
-		if !tun.Enabled {
-			return errors.New("cannot promote disabled tunnel")
-		}
-		// Finding F10: the qualification verdict and the durable enrollment
-		// release commit in one transaction, so no crash can leave a qualified
-		// backend still marked unqualified.
-		//
-		// F14: that transaction also decides admission authority. A withdrawn
-		// setup approval is a refusal, not a stale version, so it must not be
-		// retried into a fresh promotion attempt.
-		err = s.pool.PromoteTunnelWithEnrollmentRelease(ctx, serverID, tun.ID, tun.StateVersion, targetStatus, latencyMS)
-		if err == nil {
-			return nil
-		}
-		if errors.Is(err, tunnel.ErrSetupApprovalRevoked) {
-			return err
-		}
-		if !errors.Is(err, tunnel.ErrStaleStateVersion) {
-			return err
-		}
+// WithdrawObservedEnrollment withdraws the backend generation a qualification
+// observed when that qualification FAILED or was refused, and treats a retired
+// observation as inert.
+//
+// Identity, mark and disable are decided in ONE Service.mu critical section —
+// the same write lock EnableBackendWithConfig, DeleteBackend and the credential
+// rotation take while they replace the slot's identity and administrative state.
+// That matters twice: the generation validated is the generation withdrawn, and
+// an obsolete timeout can neither disable nor quarantine a replacement the
+// operator has since created. The withdrawal itself is the pre-existing
+// semantics (durable and runtime quarantine kept, backend administratively
+// disabled, forwarder device detached), reached through the same locked helper
+// DisableBackend uses, so no new lock scope or new lock ordering is introduced.
+func (s *Service) WithdrawObservedEnrollment(ctx context.Context, observed *models.BackendTunnel) error {
+	if s == nil || s.pool == nil {
+		return errors.New("vpn service or pool not initialized")
 	}
-	return tunnel.ErrStaleStateVersion
+	if observed == nil {
+		return tunnel.ErrTunnelGenerationRetired
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.withdrawObservedBackendLocked(ctx, observed)
 }
 
 // SetPendingEnrollment sets whether a backend server is undergoing initial enrollment qualification.

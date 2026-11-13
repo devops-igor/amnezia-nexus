@@ -36,6 +36,24 @@ type Pool struct {
 	setTunnelEnabledHook   func(ctx context.Context, serverID int64, enabled bool, disableReason string) error
 	setTunnelPublicKeyHook func(ctx context.Context, tunnelID int64, publicKey string) error
 	generateKeypairFn      func() (string, string, error)
+	// enrollmentReleaseHook lets the owner of the RUNTIME enrollment marker keep
+	// it in step with the durable one when a tunnel is removed. The pool owns the
+	// durable row; the HealthProber owns the in-memory map. Without this, an admin
+	// delete cleared only the database and the replacement backend stayed
+	// quarantined in memory until a process restart.
+	enrollmentReleaseHook func(ctx context.Context, serverID, retiredTunnelID int64, retiredAttempt uint64)
+	// enrollmentPending is the runtime quarantine of deploy-enrolled tunnel
+	// GENERATIONS, keyed by tunnel id. It changes in the same p.mu critical
+	// section as the durable commit it mirrors (deploy add or re-enrollment sets
+	// it, qualification or removal of that row clears it), so there is no window
+	// in which a committed unqualified backend is unquarantined, and a removal or
+	// late release for one generation cannot touch another's entry.
+	enrollmentPending map[int64]bool
+	// enrollmentAttemptSeq issues the monotonic enrollment-attempt ids that let a
+	// qualification prove which enrollment of a row it observed. It is guarded by
+	// p.mu and never reused, so an attempt that comes back can only mean the same
+	// attempt. See models.BackendTunnel.EnrollmentAttempt.
+	enrollmentAttemptSeq uint64
 }
 
 // SetMultiProtocolEnabled configures whether multi-protocol backends are enabled.
@@ -91,6 +109,7 @@ func NewPool(db *database.DB) *Pool {
 		tunnelsByServerID: make(map[int64]*models.BackendTunnel),
 		tunnelsByID:       make(map[int64]*models.BackendTunnel),
 		tunnelsByIfName:   make(map[string]*models.BackendTunnel),
+		enrollmentPending: make(map[int64]bool),
 	}
 }
 
@@ -140,6 +159,12 @@ func (p *Pool) SyncFromDB(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to load backend tunnels from DB: %w", err)
 	}
+	// Durable quarantines bound to a row restore that generation's runtime
+	// quarantine. An unbound (legacy) mark is restored by the prober instead.
+	enrollmentOwners, err := p.db.GetBackendPendingEnrollmentOwners(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to load backend enrollment quarantine from DB: %w", err)
+	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -166,6 +191,9 @@ func (p *Pool) SyncFromDB(ctx context.Context) error {
 		p.tunnelsByServerID[t.ServerID] = &t
 		p.tunnelsByID[t.ID] = &t
 		p.tunnelsByIfName[t.InterfaceName] = &t
+		if enrollmentOwners[t.ServerID] == t.ID {
+			p.setEnrollmentPendingLocked(t.ID)
+		}
 	}
 
 	return nil
@@ -200,28 +228,45 @@ func (p *Pool) ResetEnabledHealthForStartup(ctx context.Context) error {
 }
 
 // RemoveTunnel removes a backend tunnel by server ID.
+//
+// Both enrollment owners are released: the durable marker clears in the SAME
+// transaction as the row delete (a delete without its release would leave the
+// store quarantining a backend that no longer exists), and the runtime owner is
+// notified after p.mu is released, because that callback takes the prober's lock
+// and the documented lock order here is hp.mu -> pool.mu.
 func (p *Pool) RemoveTunnel(ctx context.Context, serverID int64) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	tunnel, ok := p.tunnelsByServerID[serverID]
 	if !ok {
+		p.mu.Unlock()
 		return ErrTunnelNotFound
 	}
 
 	if p.db != nil {
-		if err := p.db.DeleteBackendTunnel(ctx, tunnel.ID); err != nil {
-			return fmt.Errorf("failed to delete backend tunnel from DB: %w", err)
-		}
 		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		_ = p.db.SetBackendPendingEnrollment(writeCtx, serverID, false)
+		dbErr := p.db.DeleteBackendTunnelAndReleaseEnrollment(writeCtx, tunnel.ID, serverID)
+		cancel()
+		if dbErr != nil {
+			// Nothing changed in memory or in either owner, so the caller can
+			// retry a clean removal. A partial removal is never reported as done.
+			p.mu.Unlock()
+			return fmt.Errorf("failed to remove backend tunnel for server %d: %w", serverID, dbErr)
+		}
 	}
 
 	delete(p.tunnelsByServerID, serverID)
 	delete(p.tunnelsByID, tunnel.ID)
 	delete(p.tunnelsByIfName, tunnel.InterfaceName)
+	delete(p.enrollmentPending, tunnel.ID)
+	release := p.enrollmentReleaseHook
+	p.mu.Unlock()
 
+	if release != nil {
+		// retiredTunnelID is passed so the runtime owner can refuse to clear a
+		// quarantine established by a LATER generation: this callback runs after
+		// p.mu is released, and a replacement can be quarantined in that window.
+		release(context.WithoutCancel(ctx), serverID, tunnel.ID, tunnel.EnrollmentAttempt)
+	}
 	return nil
 }
 
@@ -774,6 +819,14 @@ func (p *Pool) SetSetTunnelEnabledHookForTest(fn func(ctx context.Context, serve
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.setTunnelEnabledHook = fn
+}
+
+// SetEnrollmentReleaseHook registers the runtime enrollment owner so a tunnel
+// removal releases BOTH markers, not just the durable one.
+func (p *Pool) SetEnrollmentReleaseHook(fn func(ctx context.Context, serverID, retiredTunnelID int64, retiredAttempt uint64)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.enrollmentReleaseHook = fn
 }
 
 // SetTunnelPublicKey updates the public key of a backend tunnel in memory and in the database,
