@@ -10,8 +10,12 @@
 #   * both base images are pinned by version, so a rebuild of the same commit
 #     yields the same Caddy release;
 #   * the forwardproxy replace target is pinned by commit. `caddyserver/
-#     forwardproxy` has no `caddy2` branch, so the maintainted klzgrad fork is
-#     the only valid target.
+#     forwardproxy` has no `caddy2` branch, so the maintained klzgrad fork is
+#     the only valid target. The commit below is the fork's `v2.11.7-naive2`
+#     tag (the `naive` branch head), which lets authenticated tunnels idle for
+#     up to 24h instead of being torn down by the HTTP idle timeout. It builds
+#     against stock Caddy 2.11.9: the API it calls is upstream there, so the
+#     fork's own Caddy patch is not needed.
 #
 # Cross-compilation: the builder stage runs on the build platform and targets
 # $TARGETARCH, so the arm64 image does not require QEMU emulation of the Go
@@ -20,7 +24,7 @@ FROM --platform=$BUILDPLATFORM caddy:2.11.9-builder AS builder
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     xcaddy build \
-    --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024
+    --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@e747854e78743dba85c039b38ed185fb11d93667
 
 FROM caddy:2.11.9-alpine
 
