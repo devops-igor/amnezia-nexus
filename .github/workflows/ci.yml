@@ -237,6 +237,7 @@ jobs:
             tests/test_e2e_call_timing_privacy.py \
             tests/test_e2e_timing_wiring.py \
             tests/test_ci_offline_discovery.py \
+            tests/test_onboard_credentials.py \
             tests/test_naive_decoy_default_contract.py \
             tests/test_ci_native_dependencies.py \
             tests/test_ci_naive_consumer_steps.py
