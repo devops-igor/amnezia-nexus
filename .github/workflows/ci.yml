@@ -282,6 +282,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install pytest==8.3.4
+          # The harness builds with GOPROXY=off so the proof cannot depend on the
+          # network, which means the module cache must be populated first. Do not
+          # rely on setup-go restoring a warm cache: a cold runner or a changed
+          # cache key would fail here instead of proving anything.
+          go mod download
           TIMING_COLLECTOR_REQUIRE_GO=1 python -m pytest -p no:cacheprovider \
             tests/test_e2e_call_timing_subprocess.py
 
