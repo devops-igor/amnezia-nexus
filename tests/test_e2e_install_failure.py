@@ -122,6 +122,26 @@ def test_install_failure_emits_bounded_artifact(tmp_path: Path, capsys) -> None:
         ),
         ("failed to build amnezia-awg2 image (code 1): apk failed, exit status 1", "image_build"),
         ("failed to run container (code 125): port is already allocated", "container_run"),
+        # Xray/VLESS install path: without these the collector can only say
+        # step=other, which is what made the REALITY-probe failure take a manual
+        # reproduction to identify.
+        ("failed to pull xray image img@sha256:x (code 1): denied", "image_pull"),
+        ("failed to run xray container (code 125): port is already allocated", "container_run"),
+        (
+            "xray container failed REALITY handshake readiness probe: dial tcp: i/o timeout",
+            "readiness_probe",
+        ),
+        (
+            "xray container failed VLESS traffic readiness probe: EOF",
+            "readiness_probe",
+        ),
+        (
+            "xray container readiness check failed (attempt 1, state: false true, logs: )",
+            "container_not_running",
+        ),
+        ("failed to derive public key from existing reality private key: bad key", "reality_key"),
+        ("failed to parse existing xray config /opt/amnezia/xray/config.json: EOF", "config_parse"),
+        ("failed to read existing xray config /opt/amnezia/xray/config.json (cat code 1", "config_read"),
         ("pool failed to dial server:1:host:22:ubuntu: ssh: handshake failed", "ssh_client"),
         ("ssh pool is not configured", "ssh_client"),
         ("something else entirely", "other"),

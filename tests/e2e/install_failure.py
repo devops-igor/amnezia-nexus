@@ -68,6 +68,22 @@ _STEP_PREFIXES: Tuple[Tuple[str, str], ...] = (
     ("failed to upload Dockerfile", "dockerfile_upload"),
     ("failed to pull AWG base image", "image_pull"),
     ("failed to pull caddy image", "image_pull"),
+    # Xray/VLESS install path. Without these the collector can only report
+    # step=other, which is why the REALITY-probe failure needed a manual
+    # reproduction on the host to identify.
+    ("failed to pull xray image", "image_pull"),
+    ("failed to derive public key", "reality_key"),
+    ("failed to parse existing xray config", "config_parse"),
+    ("failed to read existing xray config", "config_read"),
+    ("failed to check existence of xray config", "config_stat"),
+    ("failed to stop existing xray container", "container_stop"),
+    ("failed to inspect container", "container_inspect"),
+    ("xray container failed to inspect on readiness check", "container_inspect"),
+    ("xray container readiness check failed", "container_not_running"),
+    ("xray container failed REALITY handshake readiness probe", "readiness_probe"),
+    ("xray container failed VLESS traffic readiness probe", "readiness_probe"),
+    ("xray container failed REALITY handshake fallback", "readiness_probe"),
+    ("failed to run xray container", "container_run"),
     ("failed to build ", "image_build"),
     ("failed to run container", "container_run"),
 )
