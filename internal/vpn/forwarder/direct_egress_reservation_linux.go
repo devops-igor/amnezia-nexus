@@ -17,8 +17,11 @@ const (
 )
 
 // rejectAllFilter drops every datagram the kernel delivers to the reservation
-// socket, so an owned tuple can never accumulate a receive queue.
-var rejectAllFilter = []unix.SockFilter{{Code: unix.BPF_RET | unix.BPF_K, K: 0}}
+// socket, so an owned tuple can never accumulate a receive queue. It is a single
+// unconditional-return instruction. The array form keeps its length a
+// compile-time constant, so the program header below carries an exact constant
+// rather than a narrowing conversion of a runtime slice length.
+var rejectAllFilter = [...]unix.SockFilter{{Code: unix.BPF_RET | unix.BPF_K, K: 0}}
 
 // reserveHostPort takes exclusive kernel ownership of the host tuple
 // (wildcard address, port) for the IP protocol and returns the socket that holds
