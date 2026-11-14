@@ -184,7 +184,7 @@ func TestDirectEgressReservationCapRecoversAtDefaultBound(t *testing.T) {
 	}
 
 	time.Sleep(3 * cooldown)
-	recoveryPort := uint16(53 + defaultMaxHostReservations + 1) // #nosec G115 -- fixed small bound
+	recoveryPort := uint16(53 + defaultMaxHostReservations + 1)
 	if err := h.dispatchUDP(reservationFillPort, recoveryPort, "recovered"); err != nil {
 		t.Fatalf("DIRECT admission did not recover at the default bound: %v", err)
 	}
