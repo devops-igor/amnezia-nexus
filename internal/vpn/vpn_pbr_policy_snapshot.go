@@ -63,7 +63,7 @@ func ensureInitialSnapshot(ctx context.Context, syncer *policy.Syncer, store pol
 	syncRes, syncErr := syncer.SyncOnce(syncCtx)
 	cancelSync()
 
-	if err := settleInitialSync(ctx, store, matcher, baseline, syncRes, syncErr); err != nil {
+	if err := settleInitialSync(ctx, store, matcher, syncer.ConfigHash(), baseline, syncRes, syncErr); err != nil {
 		return err
 	}
 
@@ -80,10 +80,16 @@ func ensureInitialSnapshot(ctx context.Context, syncer *policy.Syncer, store pol
 // It is a separate step because "interpret the first sync" is a coherent decision
 // with its own contract, and keeping it separate leaves the activation ordering in
 // ensureInitialSnapshot readable as prime → sync → settle → require rules.
+//
+// configHash is the selected configuration's hash. It is what makes the fallback
+// source-faithful (#678 F678-05): a durable generation that belongs to a
+// *different* source configuration must never be published as this one's rules,
+// however usable it looks, because the selected list has then never loaded.
 func settleInitialSync(
 	ctx context.Context,
 	store policy.Store,
 	matcher *policy.Matcher,
+	configHash string,
 	baseline policy.BaselineStatus,
 	syncRes policy.SyncResult,
 	syncErr error,
@@ -96,8 +102,15 @@ func settleInitialSync(
 		// contract, so activation proceeds on the preserved policy.
 		slog.Warn("Policy sync failed at startup; activated last-known-good policy instead", "err", syncErr)
 		return nil
+	case syncErr != nil && baseline == policy.BaselineForeign:
+		// The only stored generation describes a different source configuration.
+		// Publishing it would authorize traffic with rules the operator did not
+		// select and that may protect different destinations entirely, so this
+		// refuses even though the old bytes stay on disk for recovery.
+		slog.Warn("Policy sync failed at startup and the stored generation belongs to a different source configuration; refusing activation", "err", syncErr)
+		return fmt.Errorf("%w: initial sync of the selected configuration failed (%v) and the stored last-known-good generation belongs to a different source configuration, so it is not valid rules for this one", ErrPolicyActivationNoRules, syncErr)
 	case syncErr != nil:
-		if loadErr := loadLastKnownGood(ctx, store, matcher); loadErr != nil {
+		if loadErr := loadLastKnownGood(ctx, store, matcher, configHash); loadErr != nil {
 			return fmt.Errorf("%w: initial sync failed (%v) and no usable last-known-good policy was found: %w",
 				ErrPolicyActivationNoRules, syncErr, loadErr)
 		}
@@ -110,13 +123,21 @@ func settleInitialSync(
 }
 
 // loadLastKnownGood publishes the durable last-known-good generation, if any.
-func loadLastKnownGood(ctx context.Context, store policy.Store, matcher *policy.Matcher) error {
+//
+// wantConfigHash is the selected configuration's hash. A generation recorded for a
+// different configuration is refused instead of published (#678 F678-05): the same
+// guard PrimeBaseline applies must hold on this fallback path, otherwise a failed
+// first sync of a new source could still authorize traffic with unrelated rules.
+func loadLastKnownGood(ctx context.Context, store policy.Store, matcher *policy.Matcher, wantConfigHash string) error {
 	gen, err := store.Load(ctx)
 	if err != nil {
 		return err
 	}
 	if gen == nil {
 		return errors.New("no last-known-good policy generation stored")
+	}
+	if wantConfigHash != "" && gen.ConfigHash != wantConfigHash {
+		return errors.New("stored last-known-good generation belongs to a different source configuration")
 	}
 	snap, err := policy.GenerationToSnapshot(gen)
 	if err != nil {

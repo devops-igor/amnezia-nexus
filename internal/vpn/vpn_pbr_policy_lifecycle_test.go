@@ -186,7 +186,7 @@ func TestLoadLastKnownGoodPublishesStoredGeneration(t *testing.T) {
 	}
 	store := &memoryStore{committed: gen}
 
-	if err := loadLastKnownGood(context.Background(), store, matcher); err != nil {
+	if err := loadLastKnownGood(context.Background(), store, matcher, "seed"); err != nil {
 		t.Fatalf("loadLastKnownGood rejected a usable generation: %v", err)
 	}
 	snap := matcher.Current()
@@ -226,7 +226,7 @@ func TestLoadLastKnownGoodRejectsUnusableStores(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			matcher := policy.NewMatcher()
-			if err := loadLastKnownGood(context.Background(), tc.store, matcher); err == nil {
+			if err := loadLastKnownGood(context.Background(), tc.store, matcher, ""); err == nil {
 				t.Fatal("loadLastKnownGood accepted an unusable store")
 			}
 			if matcher.Current() != nil {
@@ -250,7 +250,7 @@ func TestPolicyStatusSnapshotReportsSyncerAndMatcherState(t *testing.T) {
 		Domains:       map[string]uint8{"example.com": 2},
 		CIDRs:         []string{"198.51.100.0/24"},
 	}
-	if err := loadLastKnownGood(context.Background(), &memoryStore{committed: gen}, matcher); err != nil {
+	if err := loadLastKnownGood(context.Background(), &memoryStore{committed: gen}, matcher, ""); err != nil {
 		t.Fatalf("seed matcher: %v", err)
 	}
 	policyRuntimeMu.Lock()
@@ -509,23 +509,25 @@ func TestPolicyRouteCacheSizeReportsConfiguredCache(t *testing.T) {
 // refuse one that holds nothing, so activation cannot proceed on an empty policy.
 func TestEnsureInitialSnapshotRequiresRules(t *testing.T) {
 	// A syncer that cannot publish (unroutable source) plus a store holding a
-	// usable generation: the last-known-good fallback must supply the rules.
-	usable := policy.NewMatcher()
-	gen := &policy.Generation{
-		SchemaVersion: policy.SchemaVersion,
-		GenerationID:  "gen-ensure-1",
-		Version:       1,
-		Domains:       map[string]uint8{"example.com": 2},
-	}
-	if err := loadLastKnownGood(context.Background(), &memoryStore{committed: gen}, usable); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
+	// usable generation for *this* configuration: the last-known-good fallback must
+	// supply the rules.
 	settings := policy.DefaultSettings()
 	settings.Preset = policy.PresetCustom
 	settings.CustomURLs = []string{"https://unreachable.example.invalid/x.lst"}
 	cfg, err := settings.SyncConfig()
 	if err != nil {
 		t.Fatalf("SyncConfig: %v", err)
+	}
+	usable := policy.NewMatcher()
+	gen := &policy.Generation{
+		SchemaVersion: policy.SchemaVersion,
+		GenerationID:  "gen-ensure-1",
+		Version:       1,
+		ConfigHash:    policyConfigHashFor(t, settings),
+		Domains:       map[string]uint8{"example.com": 2},
+	}
+	if err := loadLastKnownGood(context.Background(), &memoryStore{committed: gen}, usable, gen.ConfigHash); err != nil {
+		t.Fatalf("seed: %v", err)
 	}
 	syncer, err := policy.NewSyncer(usable, nil, &memoryStore{committed: gen}, cfg)
 	if err != nil {

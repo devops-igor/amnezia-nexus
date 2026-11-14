@@ -40,6 +40,14 @@ var (
 	policyRuntimeMu sync.RWMutex
 	policyRuntimes  = make(map[*Service]*policyRuntime)
 
+	// policyWriteOwners holds each service's write-ownership boundary (#678
+	// F678-04). It is keyed by service rather than stored in policyRuntime because
+	// it must outlive a single runtime: a replacement syncer is created *before*
+	// it is registered, and it has to take ownership from the runtime it replaces.
+	// Retiring deletes the entry, so a later activation starts from a fresh
+	// boundary while every retired syncer keeps its already-refused old one.
+	policyWriteOwners = make(map[*Service]*policy.WriteOwner)
+
 	// policyActivationMu serializes activation against disable for the same
 	// process. A repeated enabled update must observe a stable runtime (reuse the
 	// live data path or create the first one), and a concurrent disable must not
@@ -126,10 +134,11 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 		return s.updateLivePolicyRouting(ctx, live.matcher, store, cfg, settings, presetID)
 	}
 	matcher := policy.NewMatcher()
-	syncer, err := policy.NewSyncer(matcher, nil, store, cfg)
+	syncer, err := newPolicySyncer(matcher, store, cfg)
 	if err != nil {
 		return fmt.Errorf("policy syncer: %w", err)
 	}
+	syncer.AttachOwnership(s.policyWriteOwner())
 
 	// Obtain a snapshot BEFORE the data path can accept traffic. A failure here is
 	// not fatal to the panel: PBR stays disabled and the operator sees the reason,
@@ -186,10 +195,15 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 // A refused update therefore leaves the previous working configuration intact and
 // in effect, which is what the admin PUT's rollback expects.
 func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.Matcher, store policy.Store, cfg policy.SyncConfig, settings policy.Settings, presetID string) error {
-	syncer, err := policy.NewSyncer(matcher, nil, store, cfg)
+	syncer, err := newPolicySyncer(matcher, store, cfg)
 	if err != nil {
 		return fmt.Errorf("policy syncer: %w", err)
 	}
+	// The replacement takes write ownership by publishing its own generation (see
+	// policy.WriteOwner): until that succeeds this runtime keeps the boundary, so a
+	// refused update leaves the incumbent writing and serving unchanged. After it
+	// succeeds, the incumbent's still-running syncs are refused at their commit.
+	syncer.AttachOwnership(s.policyWriteOwner())
 	syncCtx, cancelSync := context.WithTimeout(ctx, policyActivationTimeout)
 	syncRes, syncErr := syncer.SyncOnce(syncCtx)
 	cancelSync()
@@ -206,6 +220,50 @@ func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.M
 	// update leaves the previous loop running on the previous rules.
 	s.startPolicyLoop(ctx, syncer, matcher, settings, presetID)
 	return nil
+}
+
+// newPolicySyncer builds the syncer one activation/replacement uses.
+//
+// The fetcher is injected only through policyFetcherForTest, which production
+// leaves nil: a nil fetcher makes policy.NewSyncer build the hardened production
+// fetcher from the configured limits, exactly as before.
+func newPolicySyncer(matcher *policy.Matcher, store policy.Store, cfg policy.SyncConfig) (*policy.Syncer, error) {
+	var fetcher *policy.Fetcher
+	if policyFetcherForTest != nil {
+		fetcher = policyFetcherForTest(cfg.FetchLimits)
+	}
+	return policy.NewSyncer(matcher, fetcher, store, cfg)
+}
+
+// policyWriteOwner returns this service's write-ownership boundary, creating it
+// on first use.
+func (s *Service) policyWriteOwner() *policy.WriteOwner {
+	policyRuntimeMu.Lock()
+	defer policyRuntimeMu.Unlock()
+	owner := policyWriteOwners[s]
+	if owner == nil {
+		owner = policy.NewWriteOwner()
+		policyWriteOwners[s] = owner
+	}
+	return owner
+}
+
+// retirePolicyWriteOwner permanently refuses writes from every syncer bound to
+// this service's current boundary, and drops the entry so the next activation
+// starts from a fresh one.
+//
+// A retired syncer keeps its own (now refusing) boundary, which is what makes a
+// manual sync that outlives an explicit disable unable to commit afterwards.
+func (s *Service) retirePolicyWriteOwner() {
+	policyRuntimeMu.Lock()
+	owner := policyWriteOwners[s]
+	delete(policyWriteOwners, s)
+	policyRuntimeMu.Unlock()
+	if owner != nil {
+		// Blocks until any in-flight commit-and-publish section finishes, so once
+		// this returns no further write can land for the retired runtime.
+		owner.Retire()
+	}
 }
 
 // startPolicyLoop registers the live runtime and hands the syncer its scheduling
@@ -275,6 +333,12 @@ func (s *Service) StopPolicyRouting() {
 	defer policyActivationMu.Unlock()
 
 	runtime := s.stopPolicyLoop()
+	// Refuse further writes from the runtime being torn down before the data path
+	// disappears (#678 F678-04): a manual sync that is still in flight when the
+	// admin disables policy routing must not commit or publish afterwards. This is
+	// unconditional because a syncer from a failed or already-replaced activation
+	// may still be able to write even though no runtime is registered.
+	s.retirePolicyWriteOwner()
 	if runtime == nil {
 		return
 	}

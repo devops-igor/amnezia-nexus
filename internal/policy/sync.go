@@ -90,6 +90,12 @@ type Syncer struct {
 	store   Store
 	cfg     SyncConfig
 
+	// owner/ticket bind this syncer to its service's write-ownership boundary
+	// (see sync_ownership.go). Both are set once, before the syncer runs, and
+	// never mutated afterwards.
+	owner  *WriteOwner
+	ticket uint64
+
 	statusMu sync.RWMutex
 	status   Status
 
@@ -140,6 +146,32 @@ func NewSyncer(m *Matcher, fetcher *Fetcher, store Store, cfg SyncConfig) (*Sync
 // BaselineStatus, BaselineAbsent, BaselinePrimed, BaselineForeign and
 // PrimeBaseline live in baseline.go: the last-known-good baseline a syncer
 // establishes before evaluating its first candidate replacement.
+
+// AttachOwnership binds this syncer to its service's write-ownership boundary and
+// issues its ticket. It must be called before the syncer performs any update: the
+// ticket is what makes a superseded runtime's commit and publication refusable
+// (see sync_ownership.go).
+//
+// An unattached syncer keeps working with no boundary, which is what unit tests
+// and store-only helpers rely on.
+func (s *Syncer) AttachOwnership(owner *WriteOwner) {
+	if s == nil || owner == nil {
+		return
+	}
+	s.owner = owner
+	s.ticket = owner.Ticket()
+}
+
+// ConfigHash returns the source-configuration hash this syncer commits and
+// compares against durable generations. Callers that must decide whether a stored
+// generation belongs to *this* configuration read it here instead of restating the
+// hash format.
+func (s *Syncer) ConfigHash() string {
+	if s == nil {
+		return ""
+	}
+	return s.computeConfigHash()
+}
 
 // Run executes the single-owner update and scheduling loop until ctx is canceled.
 func (s *Syncer) Run(ctx context.Context) error {
@@ -397,13 +429,8 @@ func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
 		CIDRCount:     len(candidateCIDRs),
 	}
 
-	// Commit candidate generation to durable store before publication
-	if err := s.store.Commit(ctx, candidateGen); err != nil {
-		s.recordFailure(err, statsMap, startTime)
-		return SyncResult{SourceStats: statsMap, Duration: time.Since(startTime)},
-			fmt.Errorf("durable commit of policy generation failed: %w", err)
-	}
-
+	// Compile before entering the ownership boundary: a compile failure is not a
+	// write, so it must not be able to retire the incumbent writer.
 	candidateSnap, err := CompileSnapshot(newVersion, genID, sourceParsedList)
 	if err != nil {
 		s.recordFailure(err, statsMap, startTime)
@@ -411,25 +438,43 @@ func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
 			fmt.Errorf("failed compiling policy snapshot: %w", err)
 	}
 
-	// Atomically publish new snapshot
-	s.matcher.Publish(candidateSnap)
+	// Durable commit and live publication are one ownership-bound section
+	// (#678 F678-04). A sync that is still in flight when a replacement has
+	// already been accepted must not commit its old generation or publish it into
+	// the shared matcher: that would leave settings and status naming the new
+	// source while both the durable and the live policy were the old one. The
+	// boundary is evaluated here, at the write, not before the fetch.
+	write := func() error {
+		// Commit candidate generation to durable store before publication
+		if err := s.store.Commit(ctx, candidateGen); err != nil {
+			return fmt.Errorf("durable commit of policy generation failed: %w", err)
+		}
 
-	s.cachedGen = candidateGen
-	s.cachedSources = newCachedSources
+		// Atomically publish new snapshot
+		s.matcher.Publish(candidateSnap)
 
-	s.statusMu.Lock()
-	s.status = Status{
-		Ready:        true,
-		Version:      newVersion,
-		GenerationID: genID,
-		LastSyncTime: startTime,
-		LastSuccess:  startTime,
-		LastError:    "",
-		DomainCount:  candidateSnap.DomainCount(),
-		CIDRCount:    candidateSnap.CIDRCount(),
-		SourceStats:  statsMap,
+		s.cachedGen = candidateGen
+		s.cachedSources = newCachedSources
+
+		s.statusMu.Lock()
+		s.status = Status{
+			Ready:        true,
+			Version:      newVersion,
+			GenerationID: genID,
+			LastSyncTime: startTime,
+			LastSuccess:  startTime,
+			LastError:    "",
+			DomainCount:  candidateSnap.DomainCount(),
+			CIDRCount:    candidateSnap.CIDRCount(),
+			SourceStats:  statsMap,
+		}
+		s.statusMu.Unlock()
+		return nil
 	}
-	s.statusMu.Unlock()
+	if err := s.owner.Write(s.ticket, write); err != nil {
+		s.recordFailure(err, statsMap, startTime)
+		return SyncResult{SourceStats: statsMap, Duration: time.Since(startTime)}, err
+	}
 
 	return SyncResult{
 		Version:      newVersion,

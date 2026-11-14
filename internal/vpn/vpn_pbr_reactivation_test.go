@@ -137,9 +137,13 @@ func withNameOwnedWANDevice(t *testing.T, reg *nameRegistry) {
 }
 
 // seededStore is a policy.Store preloaded with a usable last-known-good
-// generation, so a first activation can publish real rules without any network
-// fetch. That keeps the test offline while still exercising the true activation
-// path.
+// generation for the configuration these tests activate, so a first activation can
+// publish real rules without any network fetch. That keeps the test offline while
+// still exercising the true activation path.
+//
+// The generation carries the configuration hash a syncer computes for
+// repeatedEnableSettings, because a stored generation without it is *foreign* to
+// the selected configuration and must not be used as its baseline (#678 F678-05).
 func seededStore(t *testing.T) policy.Store {
 	t.Helper()
 	m := &memoryStore{}
@@ -147,11 +151,28 @@ func seededStore(t *testing.T) policy.Store {
 		SchemaVersion: 1,
 		GenerationID:  "gen-seed",
 		Version:       1,
+		ConfigHash:    policyConfigHashFor(t, repeatedEnableSettings(t)),
 		Domains:       map[string]uint8{"example.com": 1},
 	}
 	gen.ContentHash = policy.ComputeContentHash(gen.Domains, gen.CIDRs)
 	m.committed = gen
 	return m
+}
+
+// policyConfigHashFor returns the configuration hash a syncer commits for these
+// settings, so a seeded fixture records the same configuration identity production
+// does instead of restating the hash format.
+func policyConfigHashFor(t *testing.T, settings policy.Settings) string {
+	t.Helper()
+	cfg, err := settings.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	syncer, err := policy.NewSyncer(policy.NewMatcher(), nil, &memoryStore{}, cfg)
+	if err != nil {
+		t.Fatalf("NewSyncer: %v", err)
+	}
+	return syncer.ConfigHash()
 }
 
 // repeatedEnableSettings returns valid settings representing what an operator
