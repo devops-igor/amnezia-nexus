@@ -68,6 +68,22 @@ _STEP_PREFIXES: Tuple[Tuple[str, str], ...] = (
     ("failed to upload Dockerfile", "dockerfile_upload"),
     ("failed to pull AWG base image", "image_pull"),
     ("failed to pull caddy image", "image_pull"),
+    # Xray/VLESS install path. Without these the collector can only report
+    # step=other, which is why the REALITY-probe failure needed a manual
+    # reproduction on the host to identify.
+    ("failed to pull xray image", "image_pull"),
+    ("failed to derive public key", "reality_key"),
+    ("failed to parse existing xray config", "config_parse"),
+    ("failed to read existing xray config", "config_read"),
+    ("failed to check existence of xray config", "config_stat"),
+    ("failed to stop existing xray container", "container_stop"),
+    ("failed to inspect container", "container_inspect"),
+    ("xray container failed to inspect on readiness check", "container_inspect"),
+    ("xray container readiness check failed", "container_not_running"),
+    ("xray container failed REALITY handshake readiness probe", "readiness_probe"),
+    ("xray container failed VLESS traffic readiness probe", "readiness_probe"),
+    ("xray container failed REALITY handshake fallback", "readiness_probe"),
+    ("failed to run xray container", "container_run"),
     ("failed to build ", "image_build"),
     ("failed to run container", "container_run"),
 )
@@ -83,11 +99,18 @@ STEPS = frozenset({step for _, step in _STEP_PREFIXES}) | {"ssh_client", "other"
 
 # Steps whose text is the producer's own subprocess output, so a cause inside it
 # can be sourced. Every other step's ``err`` is our wrapper only.
-_REASON_STEPS = frozenset({"dockerfile_upload", "image_pull", "image_build", "container_run"})
+_REASON_STEPS = frozenset(
+    {"dockerfile_upload", "image_pull", "image_build", "container_run", "readiness_probe"}
+)
 # Ordered allowlisted substrings; the first match wins so a specific external
 # cause outranks the cancellation it provokes. Matching is on the lowercased
 # value, and only a label leaves — never the matched text.
 _REASON_MARKERS: Tuple[Tuple[str, str], ...] = (
+    # A REALITY probe failure is either a verification defect or an expired
+    # probe budget; they need different owners, so they get different labels.
+    # Our own error text precedes the container logs in the message, so the
+    # first match is always the probe's own cause.
+    ("reality verification failed", "reality_verify"),
     ("no space left on device", "disk_full"),
     ("toomanyrequests", "registry_rate_limit"),
     ("too many requests", "registry_rate_limit"),
@@ -156,12 +179,18 @@ def classify_reason(err: str) -> str:
     and only allowlisted substrings of that text are matched. Anything else —
     a wrapper-only error, a reworded message, or hostile text — collapses to
     ``other`` instead of being labelled with a guessed cause.
+
+    The readiness errors append the container's own logs after the probe error
+    (``... probe: <cause> (logs: <container output>)``). Only the part before
+    that marker is classified: a cause-shaped string inside the container logs
+    is not the cause the producer reported, and letting it win would label a
+    timeout as a verification defect.
     """
     if classify_step(err) not in _REASON_STEPS:
         return "other"
-    lowered = err.lower()
+    haystack = err.split(" (logs: ", 1)[0].lower()
     for marker, reason in _REASON_MARKERS:
-        if marker in lowered:
+        if marker in haystack:
             return reason
     return "other"
 
