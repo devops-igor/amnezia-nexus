@@ -28,9 +28,18 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_panel_reads_the_documented_timing_variable():
-    """The Go side must gate on the same variable the workflow sets."""
-    assert "GIGAHOST_CALL_TIMING" in PANEL_HANDLER.read_text(encoding="utf-8")
-    assert "GIGAHOST_CALL_TIMING" in TIMING_GO.read_text(encoding="utf-8") or True
+    """The Go side must gate the sink on the same variable the workflow sets.
+
+    Reading the variable is not enough: it has to actually attach the timing
+    sink, otherwise the collector can only ever find nothing and a missing
+    report stays indistinguishable from a fast provider.
+    """
+    handler = PANEL_HANDLER.read_text(encoding="utf-8")
+    assert "GIGAHOST_CALL_TIMING" in handler
+    assert "timingEnabled()" in handler, "the flag must be read through one gate"
+    assert "gigahost.CallTimingMarker" in handler, (
+        "the gate must attach the sink that emits the collector's marker"
+    )
 
 
 def test_dev_workflow_passes_the_flag_into_the_container():
