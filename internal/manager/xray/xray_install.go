@@ -514,22 +514,10 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 		// inside a bounded window instead of failing the install. Every other
 		// error is returned immediately -- retrying a configuration defect only
 		// delays the failure and blurs the cause.
-		startupDeadline := time.Now().Add(probeStartupBudget)
-		var probeErr error
-		for {
-			attemptCtx, attemptCancel := context.WithTimeout(ctx, probeTimeout)
-			_, probeErr = activeProbeFn(attemptCtx, endpoint, probeParams, probeTimeout)
-			attemptCancel()
-
-			if probeErr == nil || !isListenerNotReady(probeErr) || !time.Now().Before(startupDeadline) {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(probeRetryInterval):
-			}
-		}
+		probeErr := probeWithStartupRetry(
+			ctx, activeProbeFn, endpoint, probeParams,
+			probeTimeout, probeStartupBudget, probeRetryInterval,
+		)
 
 		if probeErr != nil {
 			if probeMode == "VLESS traffic" && isExternalDestinationError(probeErr) {
@@ -553,6 +541,36 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 	}
 
 	return nil
+}
+
+// probeWithStartupRetry runs the readiness probe until it succeeds, fails for a
+// reason other than a listener that has not bound yet, or the startup window
+// expires. Each attempt gets a fresh probe budget: reusing an expired context
+// would make every retry fail instantly.
+func probeWithStartupRetry(
+	ctx context.Context,
+	probe VLESSProbeFunc,
+	endpoint string,
+	params models.VLESSRealityParams,
+	timeout time.Duration,
+	budget time.Duration,
+	interval time.Duration,
+) error {
+	deadline := time.Now().Add(budget)
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		_, err := probe(attemptCtx, endpoint, params, timeout)
+		cancel()
+
+		if err == nil || !isListenerNotReady(err) || !time.Now().Before(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
 }
 
 // isListenerNotReady reports whether the probe failed because the server has not
