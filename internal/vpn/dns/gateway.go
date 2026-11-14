@@ -20,6 +20,11 @@ type ReplyWriter interface {
 	WritePacket(scope policy.Scope, packet []byte) error
 }
 
+// RouteObserver records DNS response observations into an active route cache.
+type RouteObserver interface {
+	ObserveDNSResponse(sessionID string, req, resp *mdns.Msg) error
+}
+
 // ScopeHandle represents an active authenticated DNS session capability.
 type ScopeHandle struct {
 	Scope        policy.Scope
@@ -79,7 +84,8 @@ type Retirement struct {
 
 // GatewayConfig configures the Gateway transport adapter.
 type GatewayConfig struct {
-	Gateway netip.AddrPort
+	Gateway       netip.AddrPort
+	RouteObserver RouteObserver
 }
 
 type gatewayTCPTransport struct {
@@ -132,11 +138,24 @@ func NewGateway(cfg GatewayConfig, server *Server) (*Gateway, error) {
 	if server == nil {
 		return nil, errors.New("server cannot be nil")
 	}
+	if cfg.RouteObserver != nil {
+		server.SetObserver(cfg.RouteObserver)
+	}
 	return &Gateway{
 		cfg:        cfg,
 		server:     server,
 		transports: make(map[policy.Scope]*gatewayTCPTransport),
 	}, nil
+}
+
+// SetObserver updates the active route observer.
+func (g *Gateway) SetObserver(obs RouteObserver) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.cfg.RouteObserver = obs
+	if g.server != nil {
+		g.server.SetObserver(obs)
+	}
 }
 
 func (g *Gateway) getOrCreateTransport(scope *ScopeHandle) (*gatewayTCPTransport, error) {
@@ -269,7 +288,7 @@ func (g *Gateway) handleUDP(scope *ScopeHandle, ipv4Packet []byte, ihl int, dstI
 		replyPkt := buildIPv4UDPPacket(dstIP, 53, srcIP, srcPort, respBytes)
 		if replyPkt != nil {
 			if err := scope.ReplyWriter.WritePacket(scope.Scope, replyPkt); err == nil {
-				g.server.ObserveResponse(reqMsg, respMsg, scope.SessionCache, recvTime)
+				g.server.ObserveResponseWithSessionID(reqMsg, respMsg, scope.SessionCache, scope.Scope.SessionID, recvTime)
 			}
 		}
 	}
@@ -332,6 +351,36 @@ func (g *Gateway) TrySubmit(scope *ScopeHandle, ipv4Packet []byte) (handled bool
 	default:
 		return false, nil
 	}
+}
+
+// RetireScope releases the per-scope limiter bookkeeping immediately instead of
+// waiting for the scope-context watcher. It is memory-only and never blocks, so
+// a session-lifecycle owner may call it from a lock-protected retirement path;
+// the scope's transport is still torn down by the watcher that owns it once the
+// scope context is canceled.
+func (g *Gateway) RetireScope(scope policy.Scope) {
+	if g == nil || g.server == nil {
+		return
+	}
+	g.server.RetireScope(scope)
+}
+
+// ActiveTransports returns the number of live per-scope gateway TCP transports.
+func (g *Gateway) ActiveTransports() int {
+	if g == nil {
+		return 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.transports)
+}
+
+// ActiveSessionLimiters returns the number of live per-scope limiter entries.
+func (g *Gateway) ActiveSessionLimiters() int {
+	if g == nil || g.server == nil {
+		return 0
+	}
+	return g.server.ActiveSessionLimiters()
 }
 
 // BeginRetire permanently retires scope handle, cancels query contexts, and invalidates session cache.

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"log"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
 var (
@@ -41,12 +44,37 @@ type PacketDevice interface {
 	Close() error
 }
 
+// RouteCache queries routing decisions for client sessions.
+type RouteCache interface {
+	Lookup(sessionID string, ip netip.Addr) policy.Decision
+}
+
+// SessionScopeRetirer is an optional RouteCache capability. A cache that
+// implements it keeps per-session scope state which MUST be released when the
+// authenticated session's route retires; otherwise the scope outlives its
+// session and permanently consumes the cache's bounded session capacity.
+//
+// The forwarder invokes it from the write section that removes the route, so a
+// consumer that fences its allocation on route liveness can never re-admit a
+// released scope. Implementations must stay memory-only and must not call back
+// into the forwarder: the forwarder lock sits above the cache lock in the lock
+// order.
+type SessionScopeRetirer interface {
+	RetireSessionScope(sessionID string)
+}
+
+// DNSHandler processes DNS packets addressed to the designated gateway DNS IPv4 address.
+type DNSHandler interface {
+	HandleDNSPacket(sessionID, peerKey, assignedIP string, path *ReturnPath, packet []byte) (bool, error)
+}
+
 type sessionRoute struct {
 	sessionID       string
 	connectionID    string
 	peerKey         string
 	assignedIP      string
 	backendTunnelID int64
+	generation      uint64
 	returnPath      *ReturnPath // immutable owner for this route generation; nil means legacy
 	clientQueue     chan []byte
 	queueReady      chan struct{} // coalesced notification; dequeue holds aggregateQueueMu
@@ -181,6 +209,29 @@ type Forwarder struct {
 	// sessionRoute.sessionID, never inferred from this counter.
 	peerRegs    map[string]uint64 // peerKey -> registrations seen
 	stopTimeout time.Duration
+
+	// Policy-based routing and direct egress:
+	pbrEnabled    atomic.Bool
+	directEgress  *DirectEgressManager
+	routeCache    RouteCache
+	policyMatcher *policy.Matcher
+	gatewayDNSIP  netip.Addr
+	dnsHandler    DNSHandler
+
+	// Policy routing accounting metrics:
+	proxiedBytes atomic.Int64
+	directBytes  atomic.Int64
+	proxyDrops   atomic.Uint64
+	directDrops  atomic.Uint64
+
+	// detachedBackends records backend tunnels whose egress device has been
+	// detached (or replaced with a nil device) and not yet re-attached. A
+	// proxy-required packet assigned to one of these tunnels is refused and
+	// counted instead of being admitted into a queue that no pump drains; the
+	// marker is independent of backendQueues because session registration and
+	// UpdateSessionBackend re-create queues for arbitrary tunnel IDs.
+	// Guarded by mu.
+	detachedBackends map[int64]struct{}
 }
 
 // DefaultClientQueueSize is the default capacity of each per-client downstream packet channel.
@@ -275,6 +326,7 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		routesByIP:         make(map[string]*sessionRoute),
 		backendQueues:      make(map[int64]chan []byte),
 		backendDevices:     make(map[int64]PacketDevice),
+		detachedBackends:   make(map[int64]struct{}),
 		writesInFlight:     make(map[*sessionRoute]time.Time),
 		backendPumpStops:   make(map[int64]chan struct{}),
 		backendPumpDones:   make(map[int64]chan struct{}),
@@ -327,6 +379,16 @@ func (f *Forwarder) InPortalSubnet(ip string) bool {
 		return false
 	}
 	return f.portalSubnet.Contains(parsed)
+}
+
+// PumpsRunning reports whether forwarder pumps are active.
+func (f *Forwarder) PumpsRunning() bool {
+	if f == nil {
+		return false
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.pumpsRunning
 }
 
 func (f *Forwarder) stopPumpsSignalOnly() {
@@ -472,4 +534,117 @@ func (f *Forwarder) IsRunning() bool {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.running
+}
+
+// SetPBREnabled toggles policy-based routing. When disabled (default),
+// all client traffic uses the assigned proxy backend.
+func (f *Forwarder) SetPBREnabled(enabled bool) {
+	f.pbrEnabled.Store(enabled)
+}
+
+// PBREnabled reports whether policy-based routing is active.
+func (f *Forwarder) PBREnabled() bool {
+	return f.pbrEnabled.Load()
+}
+
+// SetDirectEgress configures the DirectEgressManager for WAN egress.
+func (f *Forwarder) SetDirectEgress(dem *DirectEgressManager) {
+	f.mu.Lock()
+	f.directEgress = dem
+	if dem != nil {
+		dem.fwd = f
+	}
+	f.mu.Unlock()
+}
+
+// DirectEgress returns the configured DirectEgressManager.
+func (f *Forwarder) DirectEgress() *DirectEgressManager {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.directEgress
+}
+
+// SetRouteCache configures the client route evidence lookup source.
+func (f *Forwarder) SetRouteCache(rc RouteCache) {
+	f.mu.Lock()
+	f.routeCache = rc
+	f.mu.Unlock()
+}
+
+// RouteCache returns the configured route decision source.
+func (f *Forwarder) RouteCache() RouteCache {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.routeCache
+}
+
+// SetPolicyMatcher configures the policy snapshot matcher.
+func (f *Forwarder) SetPolicyMatcher(m *policy.Matcher) {
+	f.mu.Lock()
+	f.policyMatcher = m
+	f.mu.Unlock()
+}
+
+// PolicyMatcher returns the configured policy matcher.
+func (f *Forwarder) PolicyMatcher() *policy.Matcher {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.policyMatcher
+}
+
+// SetGatewayDNSIP configures the designated gateway DNS IPv4 address.
+func (f *Forwarder) SetGatewayDNSIP(ip netip.Addr) {
+	f.mu.Lock()
+	f.gatewayDNSIP = ip
+	dem := f.directEgress
+	f.mu.Unlock()
+	if dem != nil {
+		dem.SetGatewayDNSIP(ip)
+	}
+}
+
+// GatewayDNSIP returns the designated gateway DNS IPv4 address.
+func (f *Forwarder) GatewayDNSIP() netip.Addr {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.gatewayDNSIP
+}
+
+// SetDNSHandler installs an ingress DNS handler for packets addressed to GatewayDNSIP:53.
+func (f *Forwarder) SetDNSHandler(h DNSHandler) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dnsHandler = h
+}
+
+// DNSHandler returns the installed ingress DNS handler.
+func (f *Forwarder) DNSHandler() DNSHandler {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.dnsHandler
+}
+
+// ProxiedBytes returns the total bytes forwarded to proxy backends under PBR.
+func (f *Forwarder) ProxiedBytes() int64 {
+	return f.proxiedBytes.Load()
+}
+
+// DirectBytes returns the total bytes forwarded to direct WAN under PBR.
+func (f *Forwarder) DirectBytes() int64 {
+	return f.directBytes.Load()
+}
+
+// ProxyDrops returns the total proxy-required drops (e.g. backend unavailable).
+func (f *Forwarder) ProxyDrops() uint64 {
+	return f.proxyDrops.Load()
+}
+
+// DirectDrops returns the total direct WAN drops (e.g. prohibited destinations or egress failures).
+func (f *Forwarder) DirectDrops() uint64 {
+	return f.directDrops.Load()
+}
+
+// DispatchMetrics returns a snapshot of policy routing traffic and drop counters.
+func (f *Forwarder) DispatchMetrics() (proxiedBytes, directBytes int64, proxyDrops, directDrops uint64) {
+	return f.proxiedBytes.Load(), f.directBytes.Load(), f.proxyDrops.Load(), f.directDrops.Load()
 }

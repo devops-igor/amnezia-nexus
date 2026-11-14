@@ -146,6 +146,16 @@ func (c *trafficCounters) record(n int64, rx bool) {
 	}
 }
 
+// AddTx records n bytes transmitted.
+func (c *trafficCounters) AddTx(n int64) {
+	c.record(n, false)
+}
+
+// AddRx records n bytes received.
+func (c *trafficCounters) AddRx(n int64) {
+	c.record(n, true)
+}
+
 func (c *trafficCounters) snapshot(now time.Time) TrafficSnapshot {
 	if c == nil {
 		return TrafficSnapshot{}

@@ -51,6 +51,7 @@ type Server struct {
 	cfg         ServerConfig
 	resolver    Resolver
 	policy      PolicySource
+	observer    RouteObserver
 	globalSem   chan struct{}
 	sessionMu   sync.Mutex
 	sessionSems map[policy.Scope]chan struct{}
@@ -61,6 +62,13 @@ type Server struct {
 	mu          sync.Mutex
 	closing     bool
 	activeConns map[net.Conn]*ScopeHandle
+}
+
+// SetObserver sets the active route observer.
+func (s *Server) SetObserver(obs RouteObserver) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.observer = obs
 }
 
 // NewServer creates a new Server.
@@ -123,12 +131,29 @@ func toScope(v any) policy.Scope {
 
 // ObserveResponse evaluates and records route observations into the session cache.
 func (s *Server) ObserveResponse(req, resp *mdns.Msg, session *policy.SessionCache, recvTime time.Time) {
-	if resp == nil || resp.Truncated || resp.Rcode != mdns.RcodeSuccess || session == nil || s.policy == nil {
+	s.ObserveResponseWithSessionID(req, resp, session, "", recvTime)
+}
+
+// ObserveResponseWithSessionID records route observations into the session cache and active route observer.
+func (s *Server) ObserveResponseWithSessionID(req, resp *mdns.Msg, session *policy.SessionCache, sessionID string, recvTime time.Time) {
+	if resp == nil || resp.Truncated || resp.Rcode != mdns.RcodeSuccess || s.policy == nil {
 		return
 	}
 	snapshot := s.policy.Current()
-	if snapshot != nil {
+	if snapshot != nil && session != nil {
 		_, _ = ObserveResponse(req, resp, snapshot, session, recvTime, s.cfg.MaxTTL)
+	}
+	if sessionID == "" && session != nil {
+		sessionID = session.Scope().SessionID
+	}
+	s.mu.Lock()
+	obs := s.observer
+	s.mu.Unlock()
+	// A retired scope must not be re-observed by session ID: the observer would
+	// allocate a fresh session cache for a session that already released it.
+	// Skipping keeps a delayed/in-flight response from resurrecting the scope.
+	if obs != nil && sessionID != "" && (session == nil || !session.Retired()) {
+		_ = obs.ObserveDNSResponse(sessionID, req, resp)
 	}
 }
 
@@ -291,8 +316,8 @@ func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.Packe
 		resp, err := s.ServeDNSMessage(ctx, scopeVal, req, false)
 		if err == nil && resp != nil {
 			if out, err := resp.Pack(); err == nil {
-				if _, err := udp.WriteTo(out, raddr); err == nil && sc != nil {
-					s.ObserveResponse(req, resp, sc, recvTime)
+				if _, err := udp.WriteTo(out, raddr); err == nil && (sc != nil || s.observer != nil) {
+					s.ObserveResponseWithSessionID(req, resp, sc, scopeVal.SessionID, recvTime)
 				}
 			}
 		}
@@ -349,8 +374,12 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 		if _, err := c.Write(out); err != nil {
 			return
 		}
-		if sc != nil && (scope == nil || !scope.IsRetired()) {
-			s.ObserveResponse(req, resp, sc, recvTime)
+		if (sc != nil || s.observer != nil) && (scope == nil || !scope.IsRetired()) {
+			sID := ""
+			if scope != nil {
+				sID = scope.Scope.SessionID
+			}
+			s.ObserveResponseWithSessionID(req, resp, sc, sID, recvTime)
 		}
 	}
 }

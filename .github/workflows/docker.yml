@@ -61,6 +61,115 @@ jobs:
           vuln-type: 'os,library'
           severity: 'CRITICAL'
 
+  production-smoke:
+    name: Production Image Capability Smoke
+    needs: container-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Build production image
+        run: docker build -t amnezia-nexus:smoke .
+
+      - name: Assert image ships both file capabilities and captures WAN traffic
+        run: |
+          set -o pipefail
+          # getcap is not in the runtime image (libcap is removed after setcap), so
+          # assert the file capability set through the binary's own report: as a
+          # non-root process, capabilities reach it only from `setcap`, and the
+          # probe exits 0 only when both the TUN device and the AF_PACKET capture
+          # socket work. This mirrors the README deployment block (cap_add, TUN
+          # device, kernel settings) and relies on the image ENTRYPOINT to forward
+          # the flag to the panel binary.
+          docker run --rm \
+            --cap-add NET_ADMIN --cap-add NET_RAW \
+            --device /dev/net/tun:/dev/net/tun \
+            --sysctl net.ipv4.ip_forward=1 \
+            --sysctl net.ipv4.conf.all.rp_filter=2 \
+            --sysctl net.ipv4.conf.all.accept_local=1 \
+            amnezia-nexus:smoke --check-wan-capabilities | tee probe.txt
+          # pipefail propagates the container's non-zero status above; these greps
+          # additionally pin the positive assertions the probe must have produced.
+          grep -q 'CAP_NET_ADMIN' probe.txt
+          grep -q 'CAP_NET_RAW' probe.txt
+          grep -qE '^OK[[:space:]]+AF_PACKET' probe.txt
+          if grep -q '^FAIL' probe.txt; then
+            echo 'capability probe reported a failure for the documented deployment'
+            exit 1
+          fi
+
+      - name: Assert the container refuses to run when NET_ADMIN is withheld
+        run: |
+          # Reproduces the reported BLOCKER from the deployment side. Docker's
+          # default capability set has NET_RAW but not NET_ADMIN, and the kernel
+          # refuses to execve a capability-dumb binary whose file capabilities it
+          # cannot grant, so the container must fail rather than start PBR with a
+          # capture path that cannot work.
+          #
+          # --entrypoint is passed explicitly so this assertion tests the
+          # capability behaviour rather than Docker's CMD/ENTRYPOINT resolution.
+          set +e
+          out=$(docker run --rm \
+            --entrypoint /app/panel \
+            --cap-drop ALL --cap-add NET_RAW \
+            --device /dev/net/tun:/dev/net/tun \
+            amnezia-nexus:smoke --version 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -ne 0 || { echo 'expected non-zero exit when NET_ADMIN is withheld'; exit 1; }
+          printf '%s' "$out" | grep -qi 'operation not permitted'
+
+      - name: Assert the image entrypoint forwards flags to the panel
+        run: |
+          # Regression guard for run 42137087161: with only CMD ["/app/panel"],
+          # `docker run <image> --version` replaced CMD and exec'd the flag itself
+          # ("executable file not found in $PATH", exit 127). The image's own
+          # ENTRYPOINT must forward the flag, so --entrypoint is NOT overridden here.
+          set +e
+          out=$(docker run --rm \
+            --cap-drop ALL --cap-add NET_RAW \
+            amnezia-nexus:smoke --version 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          printf '%s' "$out" | grep -qi 'executable file not found' && {
+            echo 'entrypoint did not forward the flag to the panel binary'
+            exit 1
+          }
+          if [ "$rc" -eq 127 ]; then
+            echo 'runtime failed to exec the entrypoint (exit 127)'
+            exit 1
+          fi
+
+      - name: Assert the image fails closed when NET_RAW is withheld but NET_ADMIN granted
+        run: |
+          # The capability set the pre-fix image documented. NET_RAW must not be
+          # optional: the panel has to report the missing capability instead of
+          # silently routing everything through the proxy.
+          #
+          # Note: the binary carries both file capabilities, and the kernel refuses
+          # execve when a file capability is absent from the bounding set, so this
+          # case may fail at exec before the probe runs. Both outcomes are
+          # fail-closed and are accepted as such.
+          set +e
+          out=$(docker run --rm \
+            --entrypoint /app/panel \
+            --cap-drop ALL --cap-add NET_ADMIN \
+            --device /dev/net/tun:/dev/net/tun \
+            --sysctl net.ipv4.ip_forward=1 \
+            --sysctl net.ipv4.conf.all.rp_filter=2 \
+            --sysctl net.ipv4.conf.all.accept_local=1 \
+            amnezia-nexus:smoke --check-wan-capabilities 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -ne 0 || { echo 'expected non-zero exit without CAP_NET_RAW'; exit 1; }
+          if ! printf '%s' "$out" | grep -q 'CAP_NET_RAW'; then
+            printf '%s' "$out" | grep -qi 'operation not permitted'
+          fi
+
   build-and-push:
     name: Build & Push Multi-Arch Image
     needs: container-scan

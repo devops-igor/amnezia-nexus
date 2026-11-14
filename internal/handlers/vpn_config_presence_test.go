@@ -24,8 +24,9 @@ type flagFixture struct {
 	router http.Handler
 	h      *Handlers
 	db     *database.DB
-	// flags reads the currently effective (random_trailers, disable_cookies).
-	flags func(t *testing.T) (bool, bool)
+	// flags reads the currently effective (random_trailers, disable_cookies,
+	// pbr_enabled) state from the same source the deployment would use.
+	flags func(t *testing.T) (bool, bool, bool)
 }
 
 func newFlagFixture(t *testing.T, withSvc bool) flagFixture {
@@ -36,7 +37,7 @@ func newFlagFixture(t *testing.T, withSvc bool) flagFixture {
 	}
 	f := flagFixture{router: setupFullVPNRouter(h), h: h, db: db}
 	if withSvc {
-		f.flags = func(t *testing.T) (bool, bool) {
+		f.flags = func(t *testing.T) (bool, bool, bool) {
 			t.Helper()
 			req := httptest.NewRequest(http.MethodGet, "/api/vpn/config", nil)
 			w := httptest.NewRecorder()
@@ -48,17 +49,17 @@ func newFlagFixture(t *testing.T, withSvc bool) flagFixture {
 			if err := json.Unmarshal(w.Body.Bytes(), &cfg); err != nil {
 				t.Fatalf("GET response is not valid VPNConfig JSON: %v", err)
 			}
-			return cfg.RandomTrailers, cfg.DisableCookies
+			return cfg.RandomTrailers, cfg.DisableCookies, cfg.PBREnabled
 		}
 		return f
 	}
-	f.flags = func(t *testing.T) (bool, bool) {
+	f.flags = func(t *testing.T) (bool, bool, bool) {
 		t.Helper()
 		cfg, err := db.GetVPNConfig(context.Background())
 		if err != nil || cfg == nil {
 			t.Fatalf("db.GetVPNConfig: %v", err)
 		}
-		return cfg.RandomTrailers, cfg.DisableCookies
+		return cfg.RandomTrailers, cfg.DisableCookies, cfg.PBREnabled
 	}
 	return f
 }
@@ -78,7 +79,7 @@ func (f flagFixture) putOK(t *testing.T, body string) {
 	}
 }
 
-// setFlags puts the two protocol booleans into a known state through the real
+// setFlags puts the protocol booleans into a known state through the real
 // handler, so no subtest ever bypasses the code path under test.
 func (f flagFixture) setFlags(t *testing.T, trailers, cookies bool) {
 	t.Helper()
@@ -92,9 +93,24 @@ func (f flagFixture) setFlags(t *testing.T, trailers, cookies bool) {
 	f.putOK(t, string(body))
 }
 
+// setPBR puts pbr_enabled into a known state through the real handler.
+func (f flagFixture) setPBR(t *testing.T, enabled bool) {
+	t.Helper()
+	f.putOK(t, `{"pbr_enabled": `+map[bool]string{true: "true", false: "false"}[enabled]+`}`)
+}
+
+// assertPBR asserts the durably stored pbr_enabled value, reloaded from the same
+// source the handler persisted to.
+func (f flagFixture) assertPBR(t *testing.T, want bool) {
+	t.Helper()
+	if _, _, got := f.flags(t); got != want {
+		t.Errorf("pbr_enabled = %v, want %v", got, want)
+	}
+}
+
 func (f flagFixture) assertFlags(t *testing.T, wantTrailers, wantCookies bool) {
 	t.Helper()
-	gotTrailers, gotCookies := f.flags(t)
+	gotTrailers, gotCookies, _ := f.flags(t)
 	if gotTrailers != wantTrailers {
 		t.Errorf("random_trailers = %v, want %v", gotTrailers, wantTrailers)
 	}
@@ -173,6 +189,49 @@ func TestVPNUpdateConfigHandler_PresenceSemantics(t *testing.T) {
 
 				f.putOK(t, `{}`)
 				f.assertFlags(t, true, true)
+			})
+
+			// PBR presence semantics (#677 stabilization S2). The durable VPN
+			// config must not lose an enabled policy flag just because an
+			// unrelated settings update omitted it.
+			t.Run("pbr omitted preserves stored value", func(t *testing.T) {
+				f := newFlagFixture(t, withSvc)
+				f.setPBR(t, true)
+				f.assertPBR(t, true)
+
+				f.putOK(t, `{"health_threshold_ms": 750}`)
+				f.assertPBR(t, true)
+
+				f.putOK(t, `{"algorithm":"least_conn"}`)
+				f.assertPBR(t, true)
+
+				f.putOK(t, `{}`)
+				f.assertPBR(t, true)
+			})
+
+			t.Run("pbr explicit false is applied", func(t *testing.T) {
+				f := newFlagFixture(t, withSvc)
+				f.setPBR(t, true)
+				f.putOK(t, `{"pbr_enabled": false}`)
+				f.assertPBR(t, false)
+			})
+
+			t.Run("pbr explicit true is applied", func(t *testing.T) {
+				f := newFlagFixture(t, withSvc)
+				f.setPBR(t, false)
+				f.putOK(t, `{"pbr_enabled": true}`)
+				f.assertPBR(t, true)
+			})
+
+			t.Run("pbr unrelated update leaves other flags intact", func(t *testing.T) {
+				f := newFlagFixture(t, withSvc)
+				f.setFlags(t, true, false)
+				f.setPBR(t, true)
+
+				f.putOK(t, `{"pbr_enabled": false}`)
+				// Toggling PBR must not disturb the protocol flags.
+				f.assertFlags(t, true, false)
+				f.assertPBR(t, false)
 			})
 
 			t.Run("presence is matched case-insensitively", func(t *testing.T) {
