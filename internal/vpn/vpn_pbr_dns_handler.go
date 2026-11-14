@@ -155,8 +155,19 @@ func (h *pbrDNSHandler) sessionRuntime(job dnsJob, sc *policy.SessionCache) *dns
 		return nil
 	}
 	if rt := h.sessions[job.sessionID]; rt != nil {
-		rt.writer.setTarget(job)
-		return rt
+		if !rt.handle.IsRetired() {
+			rt.writer.setTarget(job)
+			return rt
+		}
+		// The runtime retired itself while its session kept its route: a reply
+		// that could not be written to the client retires the scope handle, but
+		// the authenticated session and its route stay live. Canceled authority
+		// is never re-armed, so drop the entry and build a fresh runtime below
+		// from the live-fenced scope. A genuinely retired or replaced session
+		// never reaches this branch, because sessionScope already returned nil
+		// for it, and the fresh scope carries its own evidence.
+		delete(h.sessions, job.sessionID)
+		h.gw.RetireScope(rt.handle.Scope)
 	}
 	writer := &pbrReplyWriter{}
 	writer.setTarget(job)
