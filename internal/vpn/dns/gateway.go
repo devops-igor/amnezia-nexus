@@ -353,6 +353,36 @@ func (g *Gateway) TrySubmit(scope *ScopeHandle, ipv4Packet []byte) (handled bool
 	}
 }
 
+// RetireScope releases the per-scope limiter bookkeeping immediately instead of
+// waiting for the scope-context watcher. It is memory-only and never blocks, so
+// a session-lifecycle owner may call it from a lock-protected retirement path;
+// the scope's transport is still torn down by the watcher that owns it once the
+// scope context is canceled.
+func (g *Gateway) RetireScope(scope policy.Scope) {
+	if g == nil || g.server == nil {
+		return
+	}
+	g.server.RetireScope(scope)
+}
+
+// ActiveTransports returns the number of live per-scope gateway TCP transports.
+func (g *Gateway) ActiveTransports() int {
+	if g == nil {
+		return 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.transports)
+}
+
+// ActiveSessionLimiters returns the number of live per-scope limiter entries.
+func (g *Gateway) ActiveSessionLimiters() int {
+	if g == nil || g.server == nil {
+		return 0
+	}
+	return g.server.ActiveSessionLimiters()
+}
+
 // BeginRetire permanently retires scope handle, cancels query contexts, and invalidates session cache.
 // Synchronous, memory-only, and idempotent.
 func (g *Gateway) BeginRetire(scope *ScopeHandle) Retirement {
