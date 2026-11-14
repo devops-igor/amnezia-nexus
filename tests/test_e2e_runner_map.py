@@ -17,6 +17,10 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+# One definition of "runs the harness" for both guards: a mention is not an
+# invocation, and this helper resolves the command word before deciding.
+from tests.test_ci_offline_discovery import invokes_script
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 E2E_DIR = REPO_ROOT / "tests" / "e2e"
 MAP_FILE = E2E_DIR / "runner_map.toml"
@@ -109,8 +113,9 @@ def test_hosted_panel_job_runs_exactly_the_declared_paths() -> None:
         "the hosted job and runner_map.toml select different suites: "
         f"job={sorted(selection)} map={sorted(runner['paths'])}"
     )
-    assert "./scripts/run_e2e.sh" in block, (
-        "the hosted job must reuse the shared panel harness, not a private copy"
+    assert invokes_script(block), (
+        "the hosted job must execute the shared panel harness, not merely mention "
+        "it; a name in an echo runs nothing"
     )
 
 
@@ -172,3 +177,9 @@ def test_hosted_job_is_labelled_as_panel_only() -> None:
         "the hosted browser job must be labelled as panel-only so it cannot be "
         "mistaken for live DEV/dataplane qualification"
     )
+
+
+def test_harness_invocation_check_rejects_a_mention() -> None:
+    """The guard above must not accept a job that only prints the script name."""
+    assert not invokes_script("      - run: echo ./scripts/run_e2e.sh\n")
+    assert invokes_script("      - run: ./scripts/run_e2e.sh\n")

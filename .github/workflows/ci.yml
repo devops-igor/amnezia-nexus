@@ -321,6 +321,7 @@ jobs:
             tests/test_e2e_provisioning.py \
             tests/test_e2e_prerequisites.py \
             tests/test_e2e_skip_audit.py \
+            tests/test_e2e_skip_policy.py \
             tests/test_e2e_preflight.py \
             tests/test_e2e_call_timing_privacy.py \
             tests/test_e2e_timing_wiring.py \
@@ -644,10 +645,11 @@ jobs:
       - name: Run panel-only browser contracts
         env:
           E2E_PATHS: tests/e2e/test_auth.py tests/e2e/test_settings.py
-          # One skip is expected and named: the rate-limit case is skipped while
-          # E2E_TESTING is on, then rerun by run_e2e.sh against a server started
-          # without the flag. Anything beyond that fails instead of skipping.
-          MAX_EXPECTED_SKIPS: '1'
+          # The one expected skip, named by identity rather than counted: the
+          # rate-limit case is skipped while E2E_TESTING is on, and run_e2e.sh
+          # then reruns it against a server started without the flag and requires
+          # it to pass. Any other skip fails, and so does collecting nothing.
+          E2E_ALLOWED_SKIPS: test_login_rate_limiting
         run: ./scripts/run_e2e.sh
 
       - name: Upload failure artifacts

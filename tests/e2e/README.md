@@ -32,7 +32,7 @@ python3 -m pytest tests/e2e/ -m e2e -v
 
 ```bash
 E2E_PATHS="tests/e2e/test_auth.py tests/e2e/test_settings.py" \
-MAX_EXPECTED_SKIPS=1 \
+E2E_ALLOWED_SKIPS=test_login_rate_limiting \
 ./scripts/run_e2e.sh
 ```
 
@@ -138,7 +138,7 @@ The machine-readable version is [`runner_map.toml`](runner_map.toml), and [`test
 
 To move a suite, change `runner_map.toml` and the runner it names — in that order, or the guard fails. Do not list a suite in two runners.
 
-The hosted panel job reuses [`scripts/run_e2e.sh`](../../scripts/run_e2e.sh) with `E2E_PATHS` naming the files it is responsible for, and `MAX_EXPECTED_SKIPS` set to the number of skips it expects. A skip beyond that budget fails the job instead of passing quietly.
+The hosted panel job reuses [`scripts/run_e2e.sh`](../../scripts/run_e2e.sh) with `E2E_PATHS` naming the files it is responsible for. Skips are declared by identity, not counted: `E2E_ALLOWED_SKIPS` lists the tests that may skip, and anything else fails the job. A run that collects no tests also fails, because a job that selects nothing is green without proving anything.
 
 ---
 
