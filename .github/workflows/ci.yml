@@ -234,9 +234,44 @@ jobs:
             tests/test_e2e_prerequisites.py \
             tests/test_e2e_skip_audit.py \
             tests/test_e2e_preflight.py \
+            tests/test_e2e_call_timing_privacy.py \
+            tests/test_e2e_timing_wiring.py \
+            tests/test_ci_offline_discovery.py \
+            tests/test_onboard_credentials.py \
             tests/test_naive_decoy_default_contract.py \
             tests/test_ci_native_dependencies.py \
             tests/test_ci_naive_consumer_steps.py
+
+  # The subprocess proof builds and runs the real Go panel, so it needs a
+  # toolchain and cannot live in the python-only privacy gate above. It is a
+  # separate job for the same reason it exists: a collector that finds nothing
+  # is indistinguishable from a provider that was fast, so the only real-output
+  # proof must fail rather than skip when Go is missing.
+  diagnostics-timing-collector:
+    name: Offline Timing Collector Proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Run the real-binary collector proof
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest==8.3.4
+          TIMING_COLLECTOR_REQUIRE_GO=1 python -m pytest -p no:cacheprovider \
+            tests/test_e2e_call_timing_subprocess.py
 
   build-matrix:
     name: Cross-Compile Matrix (${{ matrix.target.os }}/${{ matrix.target.arch }})
