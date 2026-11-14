@@ -49,6 +49,20 @@ type RouteCache interface {
 	Lookup(sessionID string, ip netip.Addr) policy.Decision
 }
 
+// SessionScopeRetirer is an optional RouteCache capability. A cache that
+// implements it keeps per-session scope state which MUST be released when the
+// authenticated session's route retires; otherwise the scope outlives its
+// session and permanently consumes the cache's bounded session capacity.
+//
+// The forwarder invokes it from the write section that removes the route, so a
+// consumer that fences its allocation on route liveness can never re-admit a
+// released scope. Implementations must stay memory-only and must not call back
+// into the forwarder: the forwarder lock sits above the cache lock in the lock
+// order.
+type SessionScopeRetirer interface {
+	RetireSessionScope(sessionID string)
+}
+
 // DNSHandler processes DNS packets addressed to the designated gateway DNS IPv4 address.
 type DNSHandler interface {
 	HandleDNSPacket(sessionID, peerKey, assignedIP string, path *ReturnPath, packet []byte) (bool, error)
@@ -209,6 +223,15 @@ type Forwarder struct {
 	directBytes  atomic.Int64
 	proxyDrops   atomic.Uint64
 	directDrops  atomic.Uint64
+
+	// detachedBackends records backend tunnels whose egress device has been
+	// detached (or replaced with a nil device) and not yet re-attached. A
+	// proxy-required packet assigned to one of these tunnels is refused and
+	// counted instead of being admitted into a queue that no pump drains; the
+	// marker is independent of backendQueues because session registration and
+	// UpdateSessionBackend re-create queues for arbitrary tunnel IDs.
+	// Guarded by mu.
+	detachedBackends map[int64]struct{}
 }
 
 // DefaultClientQueueSize is the default capacity of each per-client downstream packet channel.
@@ -303,6 +326,7 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		routesByIP:         make(map[string]*sessionRoute),
 		backendQueues:      make(map[int64]chan []byte),
 		backendDevices:     make(map[int64]PacketDevice),
+		detachedBackends:   make(map[int64]struct{}),
 		writesInFlight:     make(map[*sessionRoute]time.Time),
 		backendPumpStops:   make(map[int64]chan struct{}),
 		backendPumpDones:   make(map[int64]chan struct{}),

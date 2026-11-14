@@ -574,9 +574,10 @@ func TestRuntimeVersionDetection_FailedDetectionLeavesVersionEmpty(t *testing.T)
 			t.Errorf("expected caddy_version to be absent/empty on failed runtime detection, got %v", cv)
 		}
 
-		// plugin_version must be strictly v2.11.7-naive
-		if pv, _ := naiveProto["plugin_version"].(string); pv != "v2.11.7-naive" {
-			t.Errorf("expected plugin_version to be 'v2.11.7-naive', got %q", pv)
+		// plugin_version is known from the image pin even when the running
+		// container cannot be probed, and must be the version that image ships.
+		if pv, _ := naiveProto["plugin_version"].(string); pv != naive.NaiveForwardProxyVersion {
+			t.Errorf("expected plugin_version to be %q, got %q", naive.NaiveForwardProxyVersion, pv)
 		}
 	})
 
@@ -708,8 +709,8 @@ func TestNaiveManager_Install_E2E_PersistenceToAdminAPI(t *testing.T) {
 	if meta["caddy_version"] != "2.8.4" {
 		t.Errorf("expected caddy_version = '2.8.4', got %v", meta["caddy_version"])
 	}
-	if meta["plugin_version"] != "v2.11.7-naive" {
-		t.Errorf("expected plugin_version = 'v2.11.7-naive', got %v", meta["plugin_version"])
+	if meta["plugin_version"] != naive.NaiveForwardProxyVersion {
+		t.Errorf("expected plugin_version = %q, got %v", naive.NaiveForwardProxyVersion, meta["plugin_version"])
 	}
 
 	// 3. Persist protocol metadata to real SQLite database
@@ -783,14 +784,16 @@ func TestNaiveManager_Install_E2E_PersistenceToAdminAPI(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected %q in EngineStatus, got %+v", models.ProtocolNaive, found.EngineStatus)
 	}
-	if naiveStatus["installed_version"] != "v2.11.7-naive" {
-		t.Errorf("expected naive installed_version = 'v2.11.7-naive', got %v", naiveStatus["installed_version"])
+	if naiveStatus["installed_version"] != naive.NaiveForwardProxyVersion {
+		t.Errorf("expected naive installed_version = %q, got %v", naive.NaiveForwardProxyVersion, naiveStatus["installed_version"])
 	}
 	if naiveStatus["latest_version"] != "v2.11.7-naive2" {
 		t.Errorf("expected naive latest_version = 'v2.11.7-naive2', got %v", naiveStatus["latest_version"])
 	}
-	if upd, _ := naiveStatus["update_available"].(bool); !upd {
-		t.Errorf("expected naive update_available = true, got %v", upd)
+	// A fresh install must not advertise an upgrade against the release it was
+	// built from: that was the reported bug when plugin_version lagged the image.
+	if upd, _ := naiveStatus["update_available"].(bool); upd {
+		t.Errorf("expected naive update_available = false for a current install, got %v", upd)
 	}
 }
 

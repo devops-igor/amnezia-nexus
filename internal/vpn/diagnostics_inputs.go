@@ -25,6 +25,7 @@ type diagnosticsInputs struct {
 	ingressEngine             *IngressEngine
 	sessionMgr                *session.SessionManager
 	pool                      *tunnel.Pool
+	prober                    *tunnel.HealthProber
 	rollingHistory            *RollingHistory
 	backendDevices            map[int64]BackendDevice
 	retiredBackendDeviceDrops backendDeviceDropStats
@@ -61,7 +62,7 @@ func (s *Service) diagnosticsInputsLocked() diagnosticsInputs {
 		generation: s.currentDiagGeneration(),
 		sessions:   sessions, tunnels: tunnels,
 		forwarder: s.forwarder, ingressEngine: s.ingressEngine,
-		sessionMgr: s.sessionMgr, pool: s.pool, rollingHistory: s.rollingHistory,
+		sessionMgr: s.sessionMgr, pool: s.pool, prober: s.prober, rollingHistory: s.rollingHistory,
 		backendDevices:            devices,
 		retiredBackendDeviceDrops: s.retiredBackendDeviceDrops,
 		retiredIngressLosses:      s.retiredIngressLosses,

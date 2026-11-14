@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
 // Health status states for forwarder and dataplane.
@@ -383,6 +384,16 @@ type BackendTelemetryItem struct {
 	DeviceDrops         uint64  `json:"device_drops"`
 	LastHandshakeAgeSec int64   `json:"last_handshake_age_sec"`
 	LoadSharePct        float64 `json:"load_share_pct"`
+	// Transition is the sanitized decision evidence behind HealthState: which
+	// gate currently decides eligibility, the last probe attempt and its outer /
+	// inner halves, the failure streak and threshold, and the last CONFIRMED
+	// successful inner evidence with its freshness.
+	//
+	// It is nil when no observation was recorded for this tunnel generation, and
+	// it is never inferred from last_health_check: that timestamp advances on
+	// every status write, including unsuccessful ones, so it cannot stand in for
+	// a successful probe.
+	Transition *tunnel.TransitionEvidence `json:"transition,omitempty"`
 }
 
 // BackendsDiagnostics provides an aggregate summary and itemized backend list.
@@ -443,6 +454,8 @@ type ProblemRouteItem struct {
 
 // RuntimeResources contains process and runtime health counters.
 type RuntimeResources struct {
+	// CPUPercent is the portal process CPU utilization as a percentage of total
+	// host CPU capacity. It is derived from process rusage, not host-wide load.
 	CPUPercent           float64 `json:"cpu_percent"`
 	MemoryAllocBytes     uint64  `json:"memory_alloc_bytes"`
 	MemorySysBytes       uint64  `json:"memory_sys_bytes"`

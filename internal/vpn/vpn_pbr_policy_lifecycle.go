@@ -142,14 +142,18 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 	// Hand initPBR the compiled matcher so it installs exactly this snapshot
 	// instead of compiling from an empty source list.
 	//
-	// Every other PBRConfig field is left at its zero value deliberately, including
-	// HostWANIP and GatewayDNSIP. A non-nil PBRConfig suppresses initPBR's
-	// derivation of those values, so supplying our own zero-valued struct would
-	// leave HostWANIP unset and make ValidatePBRPrerequisites fail with
-	// ErrPBRMissingHostWAN on every activation. initPBR must therefore be allowed
-	// to derive the WAN address and gateway itself; only the matcher is ours.
+	// The host WAN address is derived here rather than left to initPBR: that
+	// function only derives it when no configuration is registered, and this path
+	// must register one to hand over the matcher. Deriving explicitly keeps the
+	// production derivation (no hardcoded or test address) and fails closed with
+	// the same classified error when this host has no usable uplink.
+	hostWAN, err := DeriveHostWANIP()
+	if err != nil {
+		return fmt.Errorf("activate policy routing: %w", err)
+	}
 	s.SetPBRConfig(PBRConfig{
 		Enabled:       true,
+		HostWANIP:     hostWAN,
 		PolicyMatcher: matcher,
 	})
 

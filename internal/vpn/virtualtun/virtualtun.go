@@ -53,9 +53,25 @@
 // drained packet increments DroppedPackets and the shutdown bucket. After
 // Close returns, queue depths are permanently zero and every method rejects
 // with an error wrapping ErrClosed. Close is idempotent and never closes the
-// packet channels, so a sender can never panic on a closed channel. Blocked
-// Read and ReceiveOutbound calls are unblocked and return an error wrapping
-// ErrClosed. BatchSize is constant for the lifetime of the device.
+// packet channels, so a packet sender can never panic on a closed channel.
+// Blocked Read and ReceiveOutbound calls are unblocked and return an error
+// wrapping ErrClosed. BatchSize is constant for the lifetime of the device.
+//
+// # Event lifecycle
+//
+// The event channel IS closed by Close, because tun.Device requires it: a
+// consumer ranging over Events (the upstream engine's TUN event reader) exits
+// only when that channel closes. Events and packets therefore have different
+// shutdown semantics on purpose — packet channels stay open so that a racing
+// packet sender can never panic, while the event channel closes so that the
+// range loop terminates. SendEvent is fenced by the same lifecycle lock, so it
+// can never send on the closed channel: an event accepted before the
+// linearization point stays buffered and a closed channel still delivers it
+// (FIFO) before reporting closure, and an event submitted after it is dropped.
+// Close does not wait for the event consumer: upstream calls the TUN Close
+// while holding its state lock, which the event reader may itself be waiting
+// for, so joining it there would deadlock. Termination is asserted from the
+// outside by the device tests.
 package virtualtun
 
 import (
@@ -111,7 +127,11 @@ var (
 type VirtualTUN struct {
 	inPackets  chan []byte
 	outPackets chan []byte
-	events     chan tun.Event
+	// events carries tun events to the engine. Unlike the packet channels it
+	// IS closed by Close: its only consumer ranges over it and can exit no
+	// other way, and tun.Device requires Close to close the event channel.
+	// SendEvent holds closeMu's read lock, so a send can never race the close.
+	events chan tun.Event
 	// closed is the shutdown wakeup channel: closed exactly once by
 	// Close while holding closeMu, it unblocks readers and receivers.
 	// Submissions must not test it directly; they consult t.isClosed()
@@ -801,9 +821,20 @@ func (t *VirtualTUN) RecordDropN(n uint64) {
 }
 
 // SendEvent delivers ev to the channel returned by Events. The send never
-// blocks; an event beyond the small event buffer is dropped rather than
-// stalling the caller.
+// blocks; an event beyond the small event buffer — or any event submitted after
+// Close — is dropped rather than stalling the caller.
+//
+// The send holds the lifecycle read lock, so it is atomic with respect to
+// Close's write-locked transition: an event either lands in the channel before
+// the close (and is still delivered from the buffer, in order, before the
+// consumer observes closure) or observes the closed state and is dropped. A
+// send can therefore never panic on the closed event channel.
 func (t *VirtualTUN) SendEvent(ev tun.Event) {
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+	if t.isClosed() {
+		return
+	}
 	select {
 	case t.events <- ev:
 	default:
@@ -820,17 +851,27 @@ func (t *VirtualTUN) Name() (string, error) { return t.name, nil }
 func (t *VirtualTUN) Events() <-chan tun.Event { return t.events }
 
 // Close implements tun.Device. It is idempotent and never closes the packet
-// channels, so concurrent senders cannot panic on a closed channel.
+// channels, so concurrent packet senders cannot panic on a closed channel. It
+// DOES close the event channel, as tun.Device requires, so that a consumer
+// ranging over Events terminates; the send side is fenced by closeMu, so no
+// sender can be caught by that close.
 //
 // Linearization: Close acquires the lifecycle write lock, marks the device
 // closed, closes the wakeup channel (unblocking blocked Read and
-// ReceiveOutbound calls, which then fail with ErrClosed), and — with no
-// concurrent senders possible — drains both queues nonblockingly, counting
-// every drained packet as a shutdown drop (DropsShutdown and DroppedPackets).
-// The lock acquisition is the linearization point: any submission racing
-// with Close either enqueued before it (its packet is drained and accounted)
-// or observes the closed state and fails with ErrClosed. Once Close returns,
-// both queue depths are zero and remain zero.
+// ReceiveOutbound calls, which then fail with ErrClosed), closes the event
+// channel, and — with no concurrent senders possible — drains both queues
+// nonblockingly, counting every drained packet as a shutdown drop
+// (DropsShutdown and DroppedPackets). The lock acquisition is the
+// linearization point: any submission racing with Close either enqueued before
+// it (its packet is drained and accounted, its event stays buffered) or
+// observes the closed state and fails with ErrClosed. Once Close returns, both
+// queue depths are zero and remain zero.
+//
+// Close deliberately does not wait for the event consumer to exit. Upstream
+// calls tun.Close from device.Close while holding the device state lock, and
+// the event reader can be blocked entering device.Down(), which takes that
+// same lock: joining here would deadlock. The channel close is the supported
+// termination signal, and the reader's exit is asserted from the tests.
 func (t *VirtualTUN) Close() error {
 	t.once.Do(func() {
 		t.closeMu.Lock()
@@ -838,6 +879,10 @@ func (t *VirtualTUN) Close() error {
 
 		t.closedFlag = true
 		close(t.closed)
+		// Close the event stream under the same lock that fences
+		// SendEvent. Events accepted before this point stay buffered
+		// and are delivered before the consumer sees closure.
+		close(t.events)
 
 		// All submitters are excluded by the write lock, so this
 		// drain sees a quiesced pair of queues: every packet pulled

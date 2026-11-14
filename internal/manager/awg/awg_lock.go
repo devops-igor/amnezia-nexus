@@ -124,6 +124,60 @@ func remoteLockResourcePath(resource string) string {
 	return remoteLockPath(resource)
 }
 
+// lockObjectReclaimBranchShell returns the shell statements that run after a failed
+// mkdir on pathExpr. It deliberately falls through to the caller's existing
+// directory-handling branch: nothing here loops or breaks, so the acquisition timeout
+// budget still applies. The text is passed to fmt.Sprintf as an argument, so it may
+// contain bare '%' characters without escaping.
+//
+// A symbolic link is never followed and never removed, so it fails closed instead of
+// being treated as an empty lock. A stale plain regular file (age >= ttl) is reclaimed
+// through the same rename -> re-verify -> remove protocol as stale directory recovery:
+// type, inode and age are re-checked after the rename, and the displaced object is put
+// back when the canonical path is unexpectedly free again, so a live owner or a
+// concurrent successor is never displaced. Age alone is not ownership proof, so any
+// other object type, and any replacement detected during reclaim, fails closed with a
+// bounded error rather than being silently removed.
+func lockObjectReclaimBranchShell(pathExpr, label string, ttl int) string {
+	pathVar := strings.Trim(pathExpr, `"`)
+	refuseAcquire := func(what string) string {
+		return `echo "unsafe ` + what + ` at remote ` + label + ` ` + pathVar +
+			`; refusing to acquire" >&2; exit 1; `
+	}
+	// os_ren is the object after the rename; it is only removed once type, inode and
+	// age all still match, and it is put back rather than deleted if the canonical
+	// path was reoccupied by a successor in the meantime.
+	return `if [ -L ` + pathExpr + ` ]; then ` + refuseAcquire("symbolic link") +
+		`fi; if [ ! -d ` + pathExpr + ` ] && [ -e ` + pathExpr + ` ]; then ` +
+		`if [ ! -f ` + pathExpr + ` ]; then ` + refuseAcquire("object") + `fi; ` +
+		`os_now=$(date +%s); ` +
+		`os_mt=$(stat -c %Y ` + pathExpr + ` 2>/dev/null || stat -f %m ` + pathExpr + ` 2>/dev/null); ` +
+		`case "$os_mt" in ''|*[!0-9]*) os_mt="$os_now" ;; esac; ` +
+		fmt.Sprintf(`if [ $((os_now - os_mt)) -ge %d ]; then `, ttl) +
+		`os_ino=$(stat -c %i ` + pathExpr + ` 2>/dev/null || stat -f %i ` + pathExpr + ` 2>/dev/null); ` +
+		`os_ren=` + pathExpr + `.objstale.$os_now.$$; ` +
+		`if [ -n "$os_ino" ] && mv ` + pathExpr + ` "$os_ren" 2>/dev/null; then ` +
+		`os_ren_ino=$(stat -c %i "$os_ren" 2>/dev/null || stat -f %i "$os_ren" 2>/dev/null); ` +
+		`os_ren_now=$(date +%s); ` +
+		`os_ren_mt=$(stat -c %Y "$os_ren" 2>/dev/null || stat -f %m "$os_ren" 2>/dev/null); ` +
+		`case "$os_ren_mt" in ''|*[!0-9]*) os_ren_mt="$os_ren_now" ;; esac; ` +
+		// Ownership-bearing directory at the staging name: either we moved a live successor
+		// that appeared between inspection and mv, or the staging name was replaced. These
+		// states are indistinguishable by type alone, so the owner record decides: a holder
+		// of this protocol keeps its owner fresh, while a dead/planted object does not.
+		// Restore only a fresh-owned directory and never remove it; anything else refuses.
+		`if [ -f "$os_ren" ] && [ ! -L "$os_ren" ] && [ "$os_ren_ino" = "$os_ino" ] && ` +
+		fmt.Sprintf(`[ $((os_ren_now - os_ren_mt)) -ge %d ]; then rm -f "$os_ren"; `, ttl) +
+		`elif [ ! -d "$os_ren" ] || [ -L "$os_ren" ] || [ ! -e "$os_ren" ]; then ` +
+		`echo "concurrent replacement at remote ` + label + ` ` + pathVar + `; refusing to reclaim" >&2; exit 1; ` +
+		`else os_ren_own=$(cat "$os_ren/owner" 2>/dev/null); set -- $os_ren_own; os_ren_own_ts="$2"; ` +
+		`case "$os_ren_own_ts" in ''|*[!0-9]*) os_ren_own_ts="$os_ren_now" ;; esac; ` +
+		fmt.Sprintf(`if [ $((os_ren_now - os_ren_own_ts)) -ge %d ] || [ -e `, ttl) + pathExpr + ` ] || [ -L ` + pathExpr + ` ]; then ` +
+		`echo "concurrent replacement at remote ` + label + ` ` + pathVar + `; refusing to reclaim" >&2; exit 1; fi; ` +
+		`mv "$os_ren" ` + pathExpr + ` 2>/dev/null; fi; ` +
+		`fi; fi; fi; `
+}
+
 func remoteLockAcquireCmd(resource any, token string) string {
 	lockDir := remoteLockPath(resource)
 	escapedLockDir := ssh.EscapeShellArg(lockDir)
@@ -133,9 +187,11 @@ func remoteLockAcquireCmd(resource any, token string) string {
 	// Acquisition gate mutex ($flock_path.gate) with generation-safe TTL recovery (15 seconds) prevents live lock displacement and third-party acquisition during stale recovery.
 	// Mentions flock for cross-process synchronization compatibility.
 	return fmt.Sprintf(
-		`flock_path=%s; gate_path="$flock_path.gate"; timeout=30; start=$(date +%%s); while true; do if ! mkdir "$gate_path" 2>/dev/null; then if [ -d "$gate_path" ]; then g_now=$(date +%%s); g_mtime=$(stat -c %%Y "$gate_path" 2>/dev/null || stat -f %%m "$gate_path" 2>/dev/null); case "$g_mtime" in ''|*[!0-9]*) g_mtime="$g_now" ;; esac; g_info=$(cat "$gate_path/owner" 2>/dev/null); set -- $g_info; g_tok="$1"; g_ts="$2"; case "$g_ts" in *[!0-9]*) g_ts="" ;; esac; if [ $((g_now - g_mtime)) -ge 15 ] && { [ -z "$g_ts" ] || [ $((g_now - g_ts)) -ge 15 ]; }; then g_ren_dir="$gate_path.stale.$g_now.$$"; if mv "$gate_path" "$g_ren_dir" 2>/dev/null; then g_ren_now=$(date +%%s); g_ren_mtime=$(stat -c %%Y "$g_ren_dir" 2>/dev/null || stat -f %%m "$g_ren_dir" 2>/dev/null); case "$g_ren_mtime" in ''|*[!0-9]*) g_ren_mtime="$g_ren_now" ;; esac; g_ren_info=$(cat "$g_ren_dir/owner" 2>/dev/null); set -- $g_ren_info; g_ren_tok="$1"; g_ren_ts="$2"; case "$g_ren_ts" in *[!0-9]*) g_ren_ts="" ;; esac; if [ "$g_ren_tok" = "$g_tok" ] && [ $((g_ren_now - g_ren_mtime)) -ge 15 ] && { [ -z "$g_ts" ] || [ "$g_ren_ts" = "$g_ts" ]; } && { [ -z "$g_ren_ts" ] || [ $((g_ren_now - g_ren_ts)) -ge 15 ]; }; then rm -rf "$g_ren_dir"; else if [ ! -d "$gate_path" ]; then mv "$g_ren_dir" "$gate_path" 2>/dev/null; else rm -rf "$g_ren_dir"; fi; fi; fi; fi; fi; now=$(date +%%s); if [ $((now - start)) -ge $timeout ]; then echo "timed out waiting for remote lock on $flock_path" >&2; exit 1; fi; sleep 0.05 2>/dev/null || sleep 0.1 2>/dev/null || sleep 1; continue; fi; g_acq_ts=$(date +%%s); echo %s "$g_acq_ts" > "$gate_path/owner" 2>/dev/null; if mkdir "$flock_path" 2>/dev/null; then rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; break; fi; if [ -d "$flock_path" ]; then now=$(date +%%s); mtime=$(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null); case "$mtime" in ''|*[!0-9]*) mtime="$now" ;; esac; if [ $((now - mtime)) -ge 60 ]; then stale_info=$(cat "$flock_path/owner" 2>/dev/null); set -- $stale_info; stale_token="$1"; stale_ts="$2"; if [ -n "$stale_token" ]; then cur_now=$(date +%%s); cur_mtime=$(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null); case "$cur_mtime" in ''|*[!0-9]*) cur_mtime="$cur_now" ;; esac; if [ $((cur_now - cur_mtime)) -ge 60 ] && { [ -z "$stale_ts" ] || [ $((cur_now - stale_ts)) -ge 60 ]; }; then if mv "$flock_path" "$flock_path.stale.$now.$$" 2>/dev/null; then ren_now=$(date +%%s); ren_mtime=$(stat -c %%Y "$flock_path.stale.$now.$$" 2>/dev/null || stat -f %%m "$flock_path.stale.$now.$$" 2>/dev/null); case "$ren_mtime" in ''|*[!0-9]*) ren_mtime="$ren_now" ;; esac; ren_info=$(cat "$flock_path.stale.$now.$$/owner" 2>/dev/null); set -- $ren_info; ren_token="$1"; ren_ts="$2"; if [ "$ren_token" = "$stale_token" ] && [ $((ren_now - ren_mtime)) -ge 60 ] && { [ -z "$stale_ts" ] || [ "$ren_ts" = "$stale_ts" ]; } && { [ -z "$ren_ts" ] || [ $((ren_now - ren_ts)) -ge 60 ]; }; then rm -rf "$flock_path.stale.$now.$$"; if mkdir "$flock_path" 2>/dev/null; then rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; break; fi; else if [ ! -d "$flock_path" ]; then mv "$flock_path.stale.$now.$$" "$flock_path" 2>/dev/null; else rm -rf "$flock_path.stale.$now.$$"; fi; fi; fi; fi; elif [ ! -s "$flock_path/owner" ] || [ -z "$stale_token" ]; then cur_now=$(date +%%s); cur_mtime=$(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null); case "$cur_mtime" in ''|*[!0-9]*) cur_mtime="$cur_now" ;; esac; if [ $((cur_now - cur_mtime)) -ge 60 ]; then if mv "$flock_path" "$flock_path.ownerless.$now.$$" 2>/dev/null; then ren_now=$(date +%%s); ren_mtime=$(stat -c %%Y "$flock_path.ownerless.$now.$$" 2>/dev/null || stat -f %%m "$flock_path.ownerless.$now.$$" 2>/dev/null); case "$ren_mtime" in ''|*[!0-9]*) ren_mtime="$ren_now" ;; esac; ren_info=$(cat "$flock_path.ownerless.$now.$$/owner" 2>/dev/null); set -- $ren_info; ren_token="$1"; if { [ ! -s "$flock_path.ownerless.$now.$$/owner" ] || [ -z "$ren_token" ]; } && [ $((ren_now - ren_mtime)) -ge 60 ]; then rm -rf "$flock_path.ownerless.$now.$$"; if mkdir "$flock_path" 2>/dev/null; then rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; break; fi; else if [ ! -d "$flock_path" ]; then mv "$flock_path.ownerless.$now.$$" "$flock_path" 2>/dev/null; else rm -rf "$flock_path.ownerless.$now.$$"; fi; fi; fi; fi; fi; fi; fi; rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; now=$(date +%%s); if [ $((now - start)) -ge $timeout ]; then echo "timed out waiting for remote lock on $flock_path" >&2; exit 1; fi; sleep 0.05 2>/dev/null || sleep 0.1 2>/dev/null || sleep 1; done; acq_now=$(date +%%s); echo %s "$acq_now" > "$flock_path/owner"`,
+		`flock_path=%s; gate_path="$flock_path.gate"; timeout=30; start=$(date +%%s); while true; do if ! mkdir "$gate_path" 2>/dev/null; then %s if [ -d "$gate_path" ]; then g_now=$(date +%%s); g_mtime=$(stat -c %%Y "$gate_path" 2>/dev/null || stat -f %%m "$gate_path" 2>/dev/null); case "$g_mtime" in ''|*[!0-9]*) g_mtime="$g_now" ;; esac; g_info=$(cat "$gate_path/owner" 2>/dev/null); set -- $g_info; g_tok="$1"; g_ts="$2"; case "$g_ts" in *[!0-9]*) g_ts="" ;; esac; if [ $((g_now - g_mtime)) -ge 15 ] && { [ -z "$g_ts" ] || [ $((g_now - g_ts)) -ge 15 ]; }; then g_ren_dir="$gate_path.stale.$g_now.$$"; if mv "$gate_path" "$g_ren_dir" 2>/dev/null; then g_ren_now=$(date +%%s); g_ren_mtime=$(stat -c %%Y "$g_ren_dir" 2>/dev/null || stat -f %%m "$g_ren_dir" 2>/dev/null); case "$g_ren_mtime" in ''|*[!0-9]*) g_ren_mtime="$g_ren_now" ;; esac; g_ren_info=$(cat "$g_ren_dir/owner" 2>/dev/null); set -- $g_ren_info; g_ren_tok="$1"; g_ren_ts="$2"; case "$g_ren_ts" in *[!0-9]*) g_ren_ts="" ;; esac; if [ "$g_ren_tok" = "$g_tok" ] && [ $((g_ren_now - g_ren_mtime)) -ge 15 ] && { [ -z "$g_ts" ] || [ "$g_ren_ts" = "$g_ts" ]; } && { [ -z "$g_ren_ts" ] || [ $((g_ren_now - g_ren_ts)) -ge 15 ]; }; then rm -rf "$g_ren_dir"; else if [ ! -d "$gate_path" ]; then mv "$g_ren_dir" "$gate_path" 2>/dev/null; else rm -rf "$g_ren_dir"; fi; fi; fi; fi; fi; now=$(date +%%s); if [ $((now - start)) -ge $timeout ]; then echo "timed out waiting for remote lock on $flock_path" >&2; exit 1; fi; sleep 0.05 2>/dev/null || sleep 0.1 2>/dev/null || sleep 1; continue; fi; g_acq_ts=$(date +%%s); echo %s "$g_acq_ts" > "$gate_path/owner" 2>/dev/null; if mkdir "$flock_path" 2>/dev/null; then rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; break; fi; %s if [ -d "$flock_path" ]; then now=$(date +%%s); mtime=$(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null); case "$mtime" in ''|*[!0-9]*) mtime="$now" ;; esac; if [ $((now - mtime)) -ge 60 ]; then stale_info=$(cat "$flock_path/owner" 2>/dev/null); set -- $stale_info; stale_token="$1"; stale_ts="$2"; if [ -n "$stale_token" ]; then cur_now=$(date +%%s); cur_mtime=$(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null); case "$cur_mtime" in ''|*[!0-9]*) cur_mtime="$cur_now" ;; esac; if [ $((cur_now - cur_mtime)) -ge 60 ] && { [ -z "$stale_ts" ] || [ $((cur_now - stale_ts)) -ge 60 ]; }; then if mv "$flock_path" "$flock_path.stale.$now.$$" 2>/dev/null; then ren_now=$(date +%%s); ren_mtime=$(stat -c %%Y "$flock_path.stale.$now.$$" 2>/dev/null || stat -f %%m "$flock_path.stale.$now.$$" 2>/dev/null); case "$ren_mtime" in ''|*[!0-9]*) ren_mtime="$ren_now" ;; esac; ren_info=$(cat "$flock_path.stale.$now.$$/owner" 2>/dev/null); set -- $ren_info; ren_token="$1"; ren_ts="$2"; if [ "$ren_token" = "$stale_token" ] && [ $((ren_now - ren_mtime)) -ge 60 ] && { [ -z "$stale_ts" ] || [ "$ren_ts" = "$stale_ts" ]; } && { [ -z "$ren_ts" ] || [ $((ren_now - ren_ts)) -ge 60 ]; }; then rm -rf "$flock_path.stale.$now.$$"; if mkdir "$flock_path" 2>/dev/null; then rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; break; fi; else if [ ! -d "$flock_path" ]; then mv "$flock_path.stale.$now.$$" "$flock_path" 2>/dev/null; else rm -rf "$flock_path.stale.$now.$$"; fi; fi; fi; fi; elif [ ! -s "$flock_path/owner" ] || [ -z "$stale_token" ]; then cur_now=$(date +%%s); cur_mtime=$(stat -c %%Y "$flock_path" 2>/dev/null || stat -f %%m "$flock_path" 2>/dev/null); case "$cur_mtime" in ''|*[!0-9]*) cur_mtime="$cur_now" ;; esac; if [ $((cur_now - cur_mtime)) -ge 60 ]; then if mv "$flock_path" "$flock_path.ownerless.$now.$$" 2>/dev/null; then ren_now=$(date +%%s); ren_mtime=$(stat -c %%Y "$flock_path.ownerless.$now.$$" 2>/dev/null || stat -f %%m "$flock_path.ownerless.$now.$$" 2>/dev/null); case "$ren_mtime" in ''|*[!0-9]*) ren_mtime="$ren_now" ;; esac; ren_info=$(cat "$flock_path.ownerless.$now.$$/owner" 2>/dev/null); set -- $ren_info; ren_token="$1"; if { [ ! -s "$flock_path.ownerless.$now.$$/owner" ] || [ -z "$ren_token" ]; } && [ $((ren_now - ren_mtime)) -ge 60 ]; then rm -rf "$flock_path.ownerless.$now.$$"; if mkdir "$flock_path" 2>/dev/null; then rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; break; fi; else if [ ! -d "$flock_path" ]; then mv "$flock_path.ownerless.$now.$$" "$flock_path" 2>/dev/null; else rm -rf "$flock_path.ownerless.$now.$$"; fi; fi; fi; fi; fi; fi; fi; rmdir "$gate_path" 2>/dev/null || rm -rf "$gate_path" 2>/dev/null; now=$(date +%%s); if [ $((now - start)) -ge $timeout ]; then echo "timed out waiting for remote lock on $flock_path" >&2; exit 1; fi; sleep 0.05 2>/dev/null || sleep 0.1 2>/dev/null || sleep 1; done; acq_now=$(date +%%s); echo %s "$acq_now" > "$flock_path/owner"`,
 		escapedLockDir,
+		lockObjectReclaimBranchShell(`"$gate_path"`, "lock gate", 15),
 		escapedTok,
+		lockObjectReclaimBranchShell(`"$flock_path"`, "lock path", 60),
 		escapedTok,
 	)
 }
@@ -157,7 +213,7 @@ func remoteLockHeartbeatCmd(resource any, token string) string {
 	lockDir := remoteLockPath(resource)
 	escapedTok := ssh.EscapeShellArg(token)
 	return fmt.Sprintf(
-		`cur_owner=$(cat %s/owner 2>/dev/null); if [ -d %s ] && [ -n %s ] && { [ "$cur_owner" = %s ] || [ "${cur_owner%%%% *}" = %s ]; }; then touch -m %s; fi`,
+		`cur_owner=$(cat %s/owner 2>/dev/null); if [ -d %s ] && [ -n %s ] && { [ "$cur_owner" = %s ] || [ "${cur_owner%%%% *}" = %s ]; }; then touch -m -c %s; fi`,
 		ssh.EscapeShellArg(lockDir),
 		ssh.EscapeShellArg(lockDir),
 		escapedTok,

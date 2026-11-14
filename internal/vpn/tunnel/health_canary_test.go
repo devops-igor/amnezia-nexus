@@ -833,3 +833,69 @@ func TestHealthProber_DualTier_RecoveryToActive(t *testing.T) {
 		t.Errorf("expected failCount 0, got %d", hp.GetFailCount(sID))
 	}
 }
+func TestHealthProber_CanaryProbe_CustomFunc(t *testing.T) {
+	hp := NewHealthProber(nil, nil, DefaultHealthConfig())
+	tunnel := &models.BackendTunnel{ID: 10, ServerID: 1}
+	called := false
+	hp.SetCanaryProbeFunc(func(ctx context.Context, t *models.BackendTunnel) error {
+		called = true
+		return nil
+	})
+	if err := hp.ProbeCanary(context.Background(), tunnel); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("expected custom canary probe function to be invoked")
+	}
+}
+func TestHealthProber_CanaryManagement(t *testing.T) {
+	hp := NewHealthProber(nil, nil, DefaultHealthConfig())
+	if hp.GetCanaryProbeFunc() != nil {
+		t.Fatal("expected nil canary probe func initially")
+	}
+	if hp.GetSubnetCIDR() != "10.100.0.0/16" {
+		t.Fatalf("expected default subnet, got %s", hp.GetSubnetCIDR())
+	}
+	hp.SetSubnetCIDR("10.200.0.0/16")
+	if hp.GetSubnetCIDR() != "10.200.0.0/16" {
+		t.Fatalf("expected 10.200.0.0/16, got %s", hp.GetSubnetCIDR())
+	}
+
+	dev := &mockPacketDevice{}
+	hp.RegisterDevice(101, dev)
+	if hp.GetDevice(101) != dev {
+		t.Fatal("expected registered device")
+	}
+	hp.UnregisterDevice(101)
+	if hp.GetDevice(101) != nil {
+		t.Fatal("expected nil device after unregister")
+	}
+
+	hp.SetDeviceProvider(func(id int64) PacketDevice {
+		if id == 202 {
+			return dev
+		}
+		return nil
+	})
+	if hp.GetDevice(202) != dev {
+		t.Fatal("expected device from provider")
+	}
+
+	tun := &models.BackendTunnel{ID: 202, ServerID: 2}
+	calledCustom := false
+	hp.SetCanaryProbeFunc(func(ctx context.Context, t *models.BackendTunnel) error {
+		calledCustom = true
+		return nil
+	})
+	if hp.GetCanaryProbeFunc() == nil {
+		t.Fatal("expected non-nil canary probe func")
+	}
+	// ProbeCanaryWithDevice was retired upstream; the same custom-canary override is
+	// exercised through ProbeCanary, which resolves the device itself.
+	if err := hp.ProbeCanary(context.Background(), tun); err != nil {
+		t.Fatal(err)
+	}
+	if !calledCustom {
+		t.Fatal("expected custom probe canary with device to be called")
+	}
+}

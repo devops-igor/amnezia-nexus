@@ -172,7 +172,7 @@ func TestThresholdReconcile_RejectsReplacedTunnel(t *testing.T) {
 	prober.failCounts[serverID] = prober.cfg.FailureThreshold
 	prober.mu.Unlock()
 
-	reconciled, err := prober.reconcileThresholdAutoDisable(ctx, serverID, old.ID)
+	reconciled, err := prober.reconcileThresholdAutoDisable(ctx, serverID, old.ID, failureOuter)
 	if reconciled || !errors.Is(err, ErrTunnelNotFound) {
 		t.Fatalf("stale reconciliation: reconciled=%v err=%v, want false, ErrTunnelNotFound", reconciled, err)
 	}

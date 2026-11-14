@@ -4,6 +4,7 @@ import pytest
 from playwright.sync_api import Page
 
 from tests.e2e.conftest import api_get, api_post, assert_response_shape
+from tests.e2e.prerequisites import require
 
 
 def _get_users(page: Page) -> list:
@@ -92,8 +93,7 @@ def test_edit_user(authenticated_page: Page, base_url: str, csrf_token: str) -> 
         csrf_token,
     )
 
-    if add_result["status"] != 200:
-        pytest.skip("Could not create test user for edit test")
+    require(add_result["status"] == 200, "Could not create test user for edit test")
 
     # Find our test user in the users list
     users = _get_users(page)
@@ -103,8 +103,7 @@ def test_edit_user(authenticated_page: Page, base_url: str, csrf_token: str) -> 
             test_user = u
             break
 
-    if not test_user:
-        pytest.skip("Test user not found for edit test")
+    require(test_user, "Test user not found for edit test")
 
     user_id = test_user["id"]
 
@@ -141,8 +140,7 @@ def test_toggle_user(authenticated_page: Page, base_url: str, csrf_token: str) -
         csrf_token,
     )
 
-    if add_result["status"] != 200:
-        pytest.skip("Could not create test user for toggle test")
+    require(add_result["status"] == 200, "Could not create test user for toggle test")
 
     users = _get_users(page)
     test_user = None
@@ -151,8 +149,7 @@ def test_toggle_user(authenticated_page: Page, base_url: str, csrf_token: str) -
             test_user = u
             break
 
-    if not test_user:
-        pytest.skip("Test user not found for toggle test")
+    require(test_user, "Test user not found for toggle test")
 
     user_id = test_user["id"]
 
@@ -176,8 +173,7 @@ def test_add_user_connection(authenticated_page: Page, base_url: str, csrf_token
         servers_result if isinstance(servers_result, list) else servers_result.get("servers", [])
     )
 
-    if not servers:
-        pytest.skip("No servers available for user connection test")
+    require(servers, "No servers available for user connection test")
 
     # Create a test user
     add_result = api_post(
@@ -192,8 +188,7 @@ def test_add_user_connection(authenticated_page: Page, base_url: str, csrf_token
         csrf_token,
     )
 
-    if add_result["status"] != 200:
-        pytest.skip("Could not create test user for connection test")
+    require(add_result["status"] == 200, "Could not create test user for connection test")
 
     users = _get_users(page)
     test_user = None
@@ -202,8 +197,7 @@ def test_add_user_connection(authenticated_page: Page, base_url: str, csrf_token
             test_user = u
             break
 
-    if not test_user:
-        pytest.skip("Test user not found")
+    require(test_user, "Test user not found")
 
     user_id = test_user["id"]
     server_id = servers[0]["id"]
@@ -244,8 +238,7 @@ def test_delete_user(authenticated_page: Page, base_url: str, csrf_token: str) -
         csrf_token,
     )
 
-    if add_result["status"] != 200:
-        pytest.skip("Could not create test user for delete test")
+    require(add_result["status"] == 200, "Could not create test user for delete test")
 
     users = _get_users(page)
     test_user = None
@@ -254,8 +247,7 @@ def test_delete_user(authenticated_page: Page, base_url: str, csrf_token: str) -
             test_user = u
             break
 
-    if not test_user:
-        pytest.skip("Test user not found for delete test")
+    require(test_user, "Test user not found for delete test")
 
     user_id = test_user["id"]
 

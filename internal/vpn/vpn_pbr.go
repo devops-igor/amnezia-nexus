@@ -2,14 +2,12 @@ package vpn
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
@@ -170,7 +168,7 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 				_ = closer.Close()
 			}
 		}
-		s.forwarder.SetDNSHandler(newPBRDNSHandler(cfg.DNSGateway, cfg.RouteCache))
+		s.forwarder.SetDNSHandler(newPBRDNSHandler(cfg.DNSGateway, cfg.RouteCache, s.forwarder.HasLiveSession))
 	}
 
 	servicePBRConfigsMu.Lock()
@@ -188,150 +186,6 @@ func (s *Service) DNSGateway() *gatewaydns.Gateway {
 		return pbrCfg.DNSGateway
 	}
 	return nil
-}
-
-type dnsJob struct {
-	sessionID  string
-	peerKey    string
-	assignedIP string
-	path       *forwarder.ReturnPath
-	packet     []byte
-}
-
-type pbrDNSHandler struct {
-	gw      *gatewaydns.Gateway
-	rc      forwarder.RouteCache
-	queue   chan dnsJob
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	closed  atomic.Bool
-	dropped atomic.Uint64
-}
-
-const (
-	defaultDNSWorkerCount = 8
-	defaultDNSQueueCap    = 256
-)
-
-func newPBRDNSHandler(gw *gatewaydns.Gateway, rc forwarder.RouteCache) *pbrDNSHandler {
-	ctx, cancel := context.WithCancel(context.Background())
-	h := &pbrDNSHandler{
-		gw:     gw,
-		rc:     rc,
-		queue:  make(chan dnsJob, defaultDNSQueueCap),
-		ctx:    ctx,
-		cancel: cancel,
-	}
-	h.wg.Add(defaultDNSWorkerCount)
-	for i := 0; i < defaultDNSWorkerCount; i++ {
-		go h.worker()
-	}
-	return h
-}
-
-func (h *pbrDNSHandler) Close() error {
-	if h == nil {
-		return nil
-	}
-	if h.closed.CompareAndSwap(false, true) {
-		h.cancel()
-		h.wg.Wait()
-	}
-	return nil
-}
-
-func (h *pbrDNSHandler) worker() {
-	defer h.wg.Done()
-	for {
-		select {
-		case <-h.ctx.Done():
-			return
-		case job, ok := <-h.queue:
-			if !ok {
-				return
-			}
-			h.processJob(job)
-		}
-	}
-}
-
-func (h *pbrDNSHandler) processJob(job dnsJob) {
-	if h.gw == nil {
-		return
-	}
-	writer := &pbrReplyWriter{
-		path:       job.path,
-		peerKey:    job.peerKey,
-		assignedIP: job.assignedIP,
-	}
-	var sc *policy.SessionCache
-	if opener, ok := h.rc.(interface {
-		Open(policy.Scope) (*policy.SessionCache, error)
-	}); ok {
-		sc, _ = opener.Open(policy.Scope{SessionID: job.sessionID, OwnershipEpoch: 1})
-	}
-	scope := gatewaydns.NewScopeHandle(
-		h.ctx,
-		policy.Scope{SessionID: job.sessionID, OwnershipEpoch: 1},
-		sc,
-		writer,
-	)
-	_, _ = h.gw.TrySubmit(scope, job.packet)
-}
-
-func (h *pbrDNSHandler) HandleDNSPacket(sessionID, peerKey, assignedIP string, path *forwarder.ReturnPath, packet []byte) (bool, error) {
-	if h == nil || h.gw == nil || h.closed.Load() {
-		return false, nil
-	}
-	if len(packet) < 20 {
-		return false, nil
-	}
-	ihl := int(packet[0]&0x0f) * 4
-	if len(packet) < ihl+8 {
-		return false, nil
-	}
-	proto := packet[9]
-	if proto != 17 && proto != 6 {
-		return false, nil
-	}
-	dstPort := binary.BigEndian.Uint16(packet[ihl+2 : ihl+4])
-	if dstPort != 53 {
-		return false, nil
-	}
-
-	pktCopy := make([]byte, len(packet))
-	copy(pktCopy, packet)
-
-	job := dnsJob{
-		sessionID:  sessionID,
-		peerKey:    peerKey,
-		assignedIP: assignedIP,
-		path:       path,
-		packet:     pktCopy,
-	}
-
-	select {
-	case h.queue <- job:
-		return true, nil
-	default:
-		h.dropped.Add(1)
-		return true, nil
-	}
-}
-
-type pbrReplyWriter struct {
-	path       *forwarder.ReturnPath
-	peerKey    string
-	assignedIP string
-}
-
-func (w *pbrReplyWriter) WritePacket(_ policy.Scope, packet []byte) error {
-	if w.path == nil {
-		return forwarder.ErrReturnPathClosed
-	}
-	_, err := w.path.Write(w.peerKey, w.assignedIP, packet)
-	return err
 }
 
 // PBREnabled reports whether policy-based routing is active on the service.
@@ -376,6 +230,12 @@ type MemoryRouteCache struct {
 	rc      *policy.RouteCache
 	matcher *policy.Matcher
 	gen     string
+	// runtime is the intercepted-DNS authority whose per-session state is
+	// retired together with the session's cache scope. The cache retains no
+	// DNS state of its own; it is the session-scope authority every
+	// route-removal path already retires through, so releasing a scope also
+	// releases the work that scope authorized.
+	runtime *pbrDNSHandler
 }
 
 // NewMemoryRouteCache creates an in-memory RouteCache backed by authentic policy.RouteCache.
@@ -416,6 +276,10 @@ func (c *MemoryRouteCache) PolicyMatcher() *policy.Matcher {
 }
 
 // Lookup queries the routing decision for a destination IP in the session scope.
+//
+// The read never allocates a scope: a session without retained evidence answers
+// Unknown, which is the same answer an empty scope would give, but without
+// permanently consuming capacity for a session that may already be retired.
 func (c *MemoryRouteCache) Lookup(sessionID string, ip netip.Addr) policy.Decision {
 	if c == nil || sessionID == "" || !ip.IsValid() || !ip.Is4() {
 		return policy.Unknown
@@ -428,10 +292,10 @@ func (c *MemoryRouteCache) Lookup(sessionID string, ip netip.Addr) policy.Decisi
 		}
 	}
 	gen := c.gen
-	sc, err := c.rc.Open(policy.Scope{SessionID: sessionID, OwnershipEpoch: 1})
+	sc := c.rc.Get(policy.Scope{SessionID: sessionID, OwnershipEpoch: 1})
 	c.mu.Unlock()
 
-	if err != nil || sc == nil {
+	if sc == nil {
 		return policy.Unknown
 	}
 	return sc.Lookup(ip, gen, time.Now())
@@ -500,6 +364,93 @@ func (c *MemoryRouteCache) Open(scope policy.Scope) (*policy.SessionCache, error
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.rc.Open(scope)
+}
+
+// SessionScope returns the scope that sessionID already owns, without creating
+// one. A nil result means the session retains no evidence: it has never observed
+// DNS, or its scope was released when its route retired.
+func (c *MemoryRouteCache) SessionScope(sessionID string) *policy.SessionCache {
+	if c == nil || sessionID == "" {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.rc.Get(policy.Scope{SessionID: sessionID, OwnershipEpoch: 1})
+}
+
+// SessionScopeForLiveSession returns the session scope, creating it only while
+// live reports the authenticated session as still owning a route.
+//
+// Delayed work (a queued DNS job, an in-flight observation) may run after its
+// session retired, and retirement deletes the entry — so "no entry" cannot by
+// itself distinguish a session that never observed anything from one whose scope
+// was released. Allocation is therefore fenced by the session lifecycle, whose
+// route table is the authoritative retirement record: the predicate is consulted
+// without holding the cache lock (the cache never acquires the owner lock under
+// its own lock) and re-checked after allocation, so a retirement that
+// interleaves with the creation invalidates the new scope instead of leaving a
+// released scope behind.
+func (c *MemoryRouteCache) SessionScopeForLiveSession(sessionID string, live func(sessionID string) bool) *policy.SessionCache {
+	if c == nil || sessionID == "" {
+		return nil
+	}
+	if sc := c.SessionScope(sessionID); sc != nil {
+		return sc
+	}
+	if live != nil && !live(sessionID) {
+		return nil
+	}
+	sc, err := c.Open(policy.Scope{SessionID: sessionID, OwnershipEpoch: 1})
+	if err != nil || sc == nil {
+		return nil
+	}
+	if live != nil && !live(sessionID) {
+		sc.Invalidate()
+		return nil
+	}
+	return sc
+}
+
+// RetireSessionScope releases the cache scope owned by a retired authenticated
+// session so its capacity returns to the bounded cache. It is idempotent and
+// records no tombstone: a released scope is simply absent, and re-admission of
+// the same session creates a fresh one.
+//
+// The released scope is the session's whole authority, not only its retained
+// evidence: the intercepted-DNS runtime attached to this cache is retired in the
+// same call, so a query that is still resolving cannot outlive the session that
+// authorized it. The runtime is retired outside the cache lock because retiring
+// a handle invalidates this cache.
+func (c *MemoryRouteCache) RetireSessionScope(sessionID string) {
+	if sc := c.SessionScope(sessionID); sc != nil {
+		sc.Invalidate()
+	}
+	if runtime := c.sessionRuntime(); runtime != nil {
+		runtime.RetireSessionRuntime(sessionID)
+	}
+}
+
+// setSessionRuntime attaches the intercepted-DNS runtime authority that must be
+// retired with each released session scope.
+func (c *MemoryRouteCache) setSessionRuntime(h *pbrDNSHandler) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.runtime = h
+}
+
+// clearSessionRuntime detaches h, leaving a newer handler's attachment intact.
+func (c *MemoryRouteCache) clearSessionRuntime(h *pbrDNSHandler) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.runtime == h {
+		c.runtime = nil
+	}
+}
+
+func (c *MemoryRouteCache) sessionRuntime() *pbrDNSHandler {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.runtime
 }
 
 // RouteCache returns the underlying authentic policy.RouteCache.
@@ -670,13 +621,8 @@ func (s *Service) initPBR(ctx context.Context) error {
 	}
 	cfg.Enabled = true
 
-	// 1. Host WAN IP: derive from the routing table when the caller supplied no
-	// explicit address. This must not depend on whether a PBRConfig was registered:
-	// callers that pre-seed configuration (a compiled policy matcher from saved
-	// settings, or a test supplying only WANDevice/PolicySources) legitimately leave
-	// HostWANIP at its zero value and rely on derivation. Gating on `pbrCfg == nil`
-	// made every such activation fail with ErrPBRMissingHostWAN.
-	if !cfg.HostWANIP.IsValid() {
+	// 1. Host WAN IP: derive if not set (in default production startup)
+	if !cfg.HostWANIP.IsValid() && pbrCfg == nil {
 		derived, err := DeriveHostWANIP()
 		if err != nil {
 			return fmt.Errorf("derive host wan ip: %w", err)

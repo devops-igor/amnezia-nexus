@@ -37,6 +37,13 @@ func init() {
 	if mode == "" {
 		return
 	}
+	// This entry point is reachable from an inherited environment and the probe writes
+	// sysctls, so it proves it was launched into a run-owned namespace before doing
+	// anything. Without that proof it exits non-zero with no side effects.
+	if err := s4RequireOwnedNamespace(); err != nil {
+		fmt.Printf("RESULT: FAIL: capture probe refuses to run without a run-owned namespace: %v\n", err)
+		os.Exit(1)
+	}
 	os.Exit(runWANCaptureProbe(mode))
 }
 
@@ -133,6 +140,9 @@ func TestWANCaptureProductionPath(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			out, err := runProbeInNetNS(mode)
 			if err != nil {
+				if s4RequiredEnvironment() {
+					t.Fatalf("capture probe %s could not create its isolated namespace in a required CI run, so the claimed capture contract is unproven: %v\n%s", mode, err, out)
+				}
 				t.Skipf("skipping: cannot create isolated user+network namespace here: %v", err)
 			}
 			if !strings.Contains(out, "RESULT: PASS") {
@@ -145,16 +155,10 @@ func TestWANCaptureProductionPath(t *testing.T) {
 // runProbeInNetNS re-executes this binary under `unshare -Urn` so the probe owns a
 // private network namespace with the capabilities the production container would
 // have after `cap_add`. Host networking is never modified. A returned error means
-// the namespace could not be created at all, which is a skip, not a failure.
+// the namespace could not be created at all: the caller decides whether that is a
+// required-CI failure or an optional-local skip, via s4RequiredEnvironment.
 func runProbeInNetNS(mode string) (string, error) {
-	// #nosec G204 -- os.Args[0] is the test binary; mode is a fixed literal
-	cmd := exec.Command("unshare", "-Urn", os.Args[0], "-test.run=^$")
-	cmd.Env = append(os.Environ(), wanCaptureProbeEnv+"="+mode)
-	out, err := cmd.CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "RESULT:") {
-		return string(out), fmt.Errorf("probe could not run (unshare/namespace setup): %w: %s", err, out)
-	}
-	return string(out), nil
+	return s4LaunchInOwnedNamespace("^$", []string{wanCaptureProbeEnv + "=" + mode})
 }
 
 // runWANCaptureProbe is the body of the namespace-isolated probe. It returns a
@@ -278,13 +282,28 @@ func classifyPrerequisiteOutcome(sysctlWritable bool, err error) prerequisiteOut
 // branch can be exercised end-to-end on a host whose netns sysctls are writable.
 // It exists only for that purpose and defaults to the real procfs.
 func applyProbeSysctls() bool {
+	// Same rule as the S4 fixture: writing kernel settings requires proof this process
+	// owns its namespace. A probe that cannot prove it reports "not writable" rather than
+	// mutating whatever host it happens to be on.
+	if err := s4RequireOwnedNamespace(); err != nil {
+		fmt.Printf("sysctl: refusing to write kernel settings: %v\n", err)
+		return false
+	}
 	root := os.Getenv(probeSysctlRootEnv)
 	if root == "" {
 		root = "/proc/sys"
 	}
 	settings := []struct{ rel, value string }{
 		{"net/ipv4/ip_forward", "1"},
-		{"net/ipv4/conf/all/rp_filter", "2"},
+		// rp_filter must be 0 for the direct-egress source-validation prerequisite
+		// (see wan_source_validation.go): loose mode 2 was measured to drop the
+		// locally sourced SNAT packet, so a probe that configured 2 was asking
+		// ValidateKernelPrerequisites to pass a configuration that cannot forward.
+		{"net/ipv4/conf/all/rp_filter", "0"},
+		// conf/default decides the per-device value a newly created interface
+		// inherits, and rp_filter is the max of conf/all and the device. Configuring
+		// only conf/all would leave the effective value at the inherited default.
+		{"net/ipv4/conf/default/rp_filter", "0"},
 		{"net/ipv4/conf/all/accept_local", "1"},
 	}
 	for _, setting := range settings {

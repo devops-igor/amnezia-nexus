@@ -628,47 +628,35 @@ func TestStartPolicyLoopRegistersAndStops(t *testing.T) {
 	}
 }
 
-// Regression: a pre-seeded PBRConfig lacking HostWANIP must still have the WAN
-// address derived by initPBR.
+// The host WAN address the activation hands to initPBR must be the production
+// derivation, not a hardcoded or test address.
 //
-// The original derivation was gated on `pbrCfg == nil`, so any caller that
-// registered configuration first (notably StartPolicyRouting handing over a
-// compiled matcher, and tests supplying only WANDevice/PolicySources) left
-// HostWANIP unset and failed every activation with ErrPBRMissingHostWAN. That made
-// the positive enablement path unreachable by construction, not merely unavailable
-// in a sandbox.
-//
-// This asserts the observable contract: initPBR either derives a usable address and
-// proceeds past the WAN-IP prerequisite, or fails for a *later* reason. It must
-// never fail with ErrPBRMissingHostWAN when a config is registered and no address
-// was supplied.
-func TestInitPBRDerivesHostWANIPForPreseededConfig(t *testing.T) {
+// initPBR derives HostWANIP only when no configuration is registered; this path
+// must register one to hand over the compiled matcher, so activation derives the
+// address itself. Previously that made activation fail every time with
+// ErrPBRMissingHostWAN, which left the positive enablement path unreachable by
+// construction.
+func TestStartPolicyRoutingRegistersDerivedHostWANIP(t *testing.T) {
+	reg := newNameRegistry()
+	withNameOwnedWANDevice(t, reg)
 	svc := serviceForActivation(t)
+	t.Cleanup(svc.StopPolicyRouting)
 
-	matcher := policy.NewMatcher()
-	src := policy.NewMemorySource("seed", policy.ParsedRules{
-		CIDRs: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
-	})
-	snap, err := policy.CompileSnapshot(1, "gen-seed", []policy.SourceParsedRules{src.ToSourceParsedRules()})
-	if err != nil {
-		t.Fatalf("compile snapshot: %v", err)
+	settings := repeatedEnableSettings(t)
+	if err := svc.StartPolicyRouting(context.Background(), settings, auditedLKGStore(t, settings), string(settings.Preset)); err != nil {
+		t.Fatalf("activation failed: %v", err)
 	}
-	matcher.Publish(snap)
 
-	// Exactly what StartPolicyRouting registers: a matcher, no WAN address.
-	svc.SetPBRConfig(PBRConfig{Enabled: true, PolicyMatcher: matcher})
-	t.Cleanup(func() { svc.clearPBRConfig() })
-
-	err = svc.initPBR(context.Background())
-	if err == nil {
-		// This host satisfies every WAN prerequisite; activation is legal.
-		t.Cleanup(func() { _ = svc.TeardownPBR() })
-		return
+	cfg := svc.getPBRConfig()
+	if cfg == nil {
+		t.Fatal("successful activation registered no PBR configuration")
 	}
-	if errors.Is(err, ErrPBRMissingHostWAN) {
-		t.Fatalf("initPBR failed to derive HostWANIP for a pre-seeded config: %v", err)
+	if !cfg.HostWANIP.IsValid() || !cfg.HostWANIP.Is4() || cfg.HostWANIP.IsLoopback() || cfg.HostWANIP.IsUnspecified() {
+		t.Fatalf("activation registered an unusable host WAN IP: %v", cfg.HostWANIP)
 	}
-	// Any other failure is a genuine environment/host gate, which is what we want to
-	// observe rather than mask.
-	t.Logf("initPBR progressed past WAN-IP derivation and stopped at a later gate: %v", err)
+	// Same derivation production uses for the same purpose: if this host can
+	// derive an address, activation must have registered exactly that one.
+	if want, err := DeriveHostWANIP(); err == nil && cfg.HostWANIP != want {
+		t.Fatalf("registered host WAN IP = %v, want the production derivation %v", cfg.HostWANIP, want)
+	}
 }

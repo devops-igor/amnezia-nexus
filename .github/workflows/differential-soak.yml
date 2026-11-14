@@ -24,36 +24,18 @@ on:
     # Run full unaccelerated soak weekly on Sunday at 02:00 UTC
     - cron: '0 2 * * 0'
 
-permissions:
-  contents: read
-
 concurrency:
   group: differential-soak-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  GOFLAGS: -tags=with_utls
-
-defaults:
-  run:
-    shell: bash
-
 jobs:
   differential-qualification:
     name: Differential Qualification (${{ github.event.inputs.suite || 'scheduled-soak-full' }})
-    runs-on: [self-hosted, linux, x64, container-vm]
-    container:
-      image: localhost:5000/nexus-ci-job:latest
-      options: --cpus 4 --memory 6g
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Trust this job workspace
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Set up Go
         uses: actions/setup-go@v7

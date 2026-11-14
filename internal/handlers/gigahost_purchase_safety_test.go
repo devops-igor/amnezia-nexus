@@ -26,6 +26,7 @@ func TestGigahostPurchaseSafety_HTTP402PreservesOrderIDAndBlocksDuplicate(t *tes
 		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
 			return &gigahost.AccountInfo{Balance: 200.0, Currency: "NOK"}, nil
 		},
+		getCatalogFn: fixtureCatalogFn,
 		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 			posts.Add(1)
 			return nil, &gigahost.OrderPartialError{
@@ -104,6 +105,7 @@ func TestGigahostPurchaseSafety_ConcurrentOrdersSerialized(t *testing.T) {
 		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
 			return &gigahost.AccountInfo{Balance: 500.0, Currency: "NOK"}, nil
 		},
+		getCatalogFn: fixtureCatalogFn,
 		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
 			n := posts.Add(1)
 			// Simulate order dispatch latency
@@ -170,14 +172,8 @@ func TestGigahostPurchaseSafety_ConcurrentOrdersSerialized(t *testing.T) {
 	}
 }
 
-func TestGigahostPurchaseSafety_BudgetAuthoritativeCatalogValidation(t *testing.T) {
-	h, db, _ := setupTestHandlers(t)
-	ctx := context.Background()
-
-	// Set monthly budget of 100 NOK
-	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 100.0}); err != nil {
-		t.Fatal(err)
-	}
+func TestGigahostPurchaseSafety_AuthoritativeCatalogValidation(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
 
 	h.SetGigahostClient(&mockGigahostClient{
 		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
@@ -208,19 +204,23 @@ func TestGigahostPurchaseSafety_BudgetAuthoritativeCatalogValidation(t *testing.
 		},
 	})
 
-	t.Run("forged client price zero cannot bypass catalog monthly ceiling", func(t *testing.T) {
-		// Client attempts to bypass budget by sending hourly_price_nok = 0
+	t.Run("client-supplied hourly price does not override the catalog", func(t *testing.T) {
+		// A forged zero client rate must not become the recorded order price.
 		body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0}`
 		req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
 		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
 		w := httptest.NewRecorder()
 		h.GigahostOrderHandler(w, req)
 
-		if w.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400 Bad Request on budget exceed, got %d (body: %s)", w.Code, w.Body.String())
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
 		}
-		if !strings.Contains(w.Body.String(), "Monthly budget cap exceeded") {
-			t.Errorf("expected budget cap exceeded error, got: %s", w.Body.String())
+		orders, err := h.getGigahostOrders(context.Background())
+		if err != nil || len(orders) != 1 {
+			t.Fatalf("orders = %+v, err = %v", orders, err)
+		}
+		if orders[0].HourlyPriceNOK != 0.25 || orders[0].PriceID != 555 {
+			t.Errorf("recorded price = %v/%v, want the catalog contract 0.25/555", orders[0].HourlyPriceNOK, orders[0].PriceID)
 		}
 	})
 
@@ -268,95 +268,6 @@ func TestGigahostPurchaseSafety_BudgetAuthoritativeCatalogValidation(t *testing.
 			t.Errorf("expected invalid_plan error code, got: %s", w.Body.String())
 		}
 	})
-}
-
-func TestGigahostPurchaseSafety_ConcurrentBudgetReservationsSerialized(t *testing.T) {
-	h, db, _ := setupTestHandlers(t)
-	ctx := context.Background()
-
-	// Budget is 150 NOK.
-	// Plan A costs 80 NOK.
-	// Plan B costs 90 NOK.
-	// Both together (80 + 90 = 170 NOK) exceed the budget.
-	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 150.0}); err != nil {
-		t.Fatal(err)
-	}
-
-	var posts atomic.Int32
-	h.SetGigahostClient(&mockGigahostClient{
-		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
-			return &gigahost.AccountInfo{Balance: 500.0, Currency: "NOK"}, nil
-		},
-		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
-			return []gigahost.HourlyPlan{
-				{
-					ProductID:      101,
-					PriceID:        555,
-					HourlyRateNOK:  0.111,
-					MonthlyCeiling: 80.0,
-					InStock:        true,
-					Regions:        []gigahost.Region{{ID: 1, Available: true}},
-				},
-				{
-					ProductID:      102,
-					PriceID:        666,
-					HourlyRateNOK:  0.125,
-					MonthlyCeiling: 90.0,
-					InStock:        true,
-					Regions:        []gigahost.Region{{ID: 2, Available: true}},
-				},
-			}, nil
-		},
-		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
-			posts.Add(1)
-			time.Sleep(20 * time.Millisecond)
-			return &gigahost.OrderResponse{
-				OrderID: fmt.Sprintf("ord_%d", req.PID),
-				Status:  gigahost.StatusPending,
-				Message: "Deploying VPS",
-			}, nil
-		},
-		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
-			return []gigahost.ServerInfo{}, nil
-		},
-	})
-
-	var wg sync.WaitGroup
-	var codeA, codeB int
-
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0.111}`
-		req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
-		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
-		w := httptest.NewRecorder()
-		h.GigahostOrderHandler(w, req)
-		codeA = w.Code
-	}()
-
-	go func() {
-		defer wg.Done()
-		body := `{"pid":102,"price_id":666,"region_id":2,"os_id":12,"hourly_price_nok":0.125}`
-		req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
-		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
-		w := httptest.NewRecorder()
-		h.GigahostOrderHandler(w, req)
-		codeB = w.Code
-	}()
-
-	wg.Wait()
-
-	// One order must succeed (200 OK) and one must be rejected for exceeding monthly budget (400 Bad Request)
-	if (codeA == http.StatusOK && codeB == http.StatusBadRequest) || (codeA == http.StatusBadRequest && codeB == http.StatusOK) {
-		// Exactly as expected: serialized reservations prevented simultaneous budget bypass
-	} else {
-		t.Fatalf("expected one 200 OK and one 400 Bad Request, got codeA=%d codeB=%d", codeA, codeB)
-	}
-
-	if posts.Load() != 1 {
-		t.Errorf("expected exactly 1 provider order dispatched, got %d", posts.Load())
-	}
 }
 
 func TestGigahostPurchaseSafety_OrdersRefreshSingleInventoryFetch(t *testing.T) {
@@ -519,14 +430,9 @@ func TestGigahostPurchaseSafety_DocumentedEligibleAccountAllowsOrder(t *testing.
 	})
 }
 
-func TestGigahostPurchaseSafety_OutOfStockExistingPlanPreservesSpend(t *testing.T) {
-	h, db, _ := setupTestHandlers(t)
+func TestGigahostPurchaseSafety_OutOfStockPlanDoesNotTouchExistingHistory(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
 	ctx := context.Background()
-
-	// Set monthly budget of 100 NOK
-	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 100.0}); err != nil {
-		t.Fatal(err)
-	}
 
 	// Existing order: ready server with stored rate 0.14375 NOK/hr (~103.5 NOK/mo)
 	now := time.Now().UTC()
@@ -578,21 +484,26 @@ func TestGigahostPurchaseSafety_OutOfStockExistingPlanPreservesSpend(t *testing.
 		},
 	})
 
-	// Placing order for Plan 102 should be rejected because existing 10001 reservation + 90 NOK > 100 NOK budget
-	body := `{"pid":102,"price_id":556,"region_id":1,"os_id":12,"hourly_price_nok":0.125}`
+	// Plan 101 is no longer orderable, but its history must survive: the order
+	// is refused and the existing row is not rewritten or deleted.
+	body := `{"pid":101,"price_id":555,"region_id":1,"os_id":12,"hourly_price_nok":0.14375}`
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(body))
 	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
 	w := httptest.NewRecorder()
 	h.GigahostOrderHandler(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected HTTP 400 Bad Request, got %d (body: %s)", w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), "Monthly budget cap exceeded") {
-		t.Errorf("expected budget cap exceeded error, got: %s", w.Body.String())
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "invalid_plan") {
+		t.Fatalf("expected 400 invalid_plan, got %d (body: %s)", w.Code, w.Body.String())
 	}
 	if posts.Load() != 0 {
-		t.Errorf("expected 0 provider posts when budget exceeded, got %d", posts.Load())
+		t.Errorf("expected 0 provider posts for an unavailable plan, got %d", posts.Load())
+	}
+	orders, err := h.getGigahostOrders(ctx)
+	if err != nil || len(orders) != 1 {
+		t.Fatalf("orders = %+v, err = %v", orders, err)
+	}
+	if orders[0].OrderID != "10001" || orders[0].HourlyPriceNOK != 0.14375 || orders[0].Status != gigahost.StatusReady {
+		t.Errorf("existing history changed: %+v", orders[0])
 	}
 }
 
@@ -785,14 +696,9 @@ func TestGigahostPurchaseSafety_OrderListingPreservesInFlightAndBlocksDuplicateR
 	}
 }
 
-func TestGigahostPurchaseSafety_OmittedClientRatePersistsCatalogPriceAndPreservesOutOfStockSpend(t *testing.T) {
-	h, db, _ := setupTestHandlers(t)
+func TestGigahostPurchaseSafety_OmittedClientRatePersistsCatalogPrice(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
 	ctx := context.Background()
-
-	// Set monthly budget of 150 NOK (Plan 101 is ~103.5 NOK, Plan 102 is 90 NOK)
-	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 150.0}); err != nil {
-		t.Fatal(err)
-	}
 
 	var posts atomic.Int32
 	catalogStockPlan101 := true
@@ -849,59 +755,18 @@ func TestGigahostPurchaseSafety_OmittedClientRatePersistsCatalogPriceAndPreserve
 		t.Fatalf("expected stored HourlyPriceNOK 0.14375 from catalog, got %v (err: %v)", orders, err)
 	}
 
-	// 2. Plan 101 goes out of stock (removed from catalog)
+	// 2. Plan 101 leaves the catalog: the recorded order-time price must still
+	//    be the one stored, not a re-derivation or a zero.
 	catalogStockPlan101 = false
 
-	// Attempting to place an order for Plan 102 (90 NOK/mo) must be rejected because
-	// existing Plan 101 spend (0.14375 * 720 = 103.5 NOK) already commits the 150 NOK budget (103.5 + 90 > 150).
-	w2 := postOrder(`{"pid":102,"price_id":556,"region_id":1,"os_id":12}`)
-	if w2.Code != http.StatusBadRequest || !strings.Contains(w2.Body.String(), "Monthly budget cap exceeded") {
-		t.Fatalf("expected HTTP 400 budget exceeded, got %d (body: %s)", w2.Code, w2.Body.String())
+	orders, err = h.getGigahostOrders(ctx)
+	if err != nil || len(orders) != 1 {
+		t.Fatalf("orders = %+v, err = %v", orders, err)
+	}
+	if orders[0].PriceID != 555 || orders[0].MonthlyCapNOK != 103.5 {
+		t.Errorf("price identity = %+v, want the catalog contract 555/103.5", orders[0])
 	}
 	if posts.Load() != 1 {
-		t.Errorf("expected no additional order posted when budget exceeded, got %d", posts.Load())
-	}
-}
-
-func TestGigahostPurchaseSafety_UnpricedActiveInventoryServerFailsClosed(t *testing.T) {
-	h, db, _ := setupTestHandlers(t)
-	ctx := context.Background()
-
-	if err := db.SetSetting(ctx, "gigahost", map[string]any{"monthly_budget_nok": 100.0}); err != nil {
-		t.Fatal(err)
-	}
-
-	var posts atomic.Int32
-	h.SetGigahostClient(&mockGigahostClient{
-		getAccountFn: func(ctx context.Context) (*gigahost.AccountInfo, error) {
-			return &gigahost.AccountInfo{Balance: 500.0, Currency: "NOK"}, nil
-		},
-		getCatalogFn: func(ctx context.Context) ([]gigahost.HourlyPlan, error) {
-			return []gigahost.HourlyPlan{{
-				ProductID: 102, PriceID: 556, HourlyRateNOK: 0.125, MonthlyCeiling: 90.0, InStock: true,
-				Regions: []gigahost.Region{{ID: 1, Available: true}},
-			}}, nil
-		},
-		getServersFn: func(ctx context.Context) ([]gigahost.ServerInfo, error) {
-			// Active server with PID 999 which is absent from catalog and local orders
-			return []gigahost.ServerInfo{{ID: 3500, OrderID: "unpriced_srv_1", PID: 999, Status: "active"}}, nil
-		},
-		orderServerSafeFn: func(ctx context.Context, req gigahost.OrderRequest) (*gigahost.OrderResponse, error) {
-			posts.Add(1)
-			return &gigahost.OrderResponse{OrderID: "10002", Status: gigahost.StatusPending}, nil
-		},
-	})
-
-	req := httptest.NewRequest(http.MethodPost, "/api/admin/hosting/gigahost/order", strings.NewReader(`{"pid":102,"price_id":556,"region_id":1,"os_id":12}`))
-	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{Role: models.RoleAdmin}))
-	w := httptest.NewRecorder()
-	h.GigahostOrderHandler(w, req)
-
-	// Fails closed with 502 Bad Gateway / catalog_check_failed
-	if w.Code != http.StatusBadGateway || !strings.Contains(w.Body.String(), "catalog_check_failed") {
-		t.Fatalf("expected HTTP 502 catalog_check_failed, got %d (body: %s)", w.Code, w.Body.String())
-	}
-	if posts.Load() != 0 {
-		t.Errorf("expected 0 order posts when spend cannot be calculated, got %d", posts.Load())
+		t.Errorf("expected exactly 1 purchase, got %d", posts.Load())
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel/streambridge"
 )
 
@@ -31,6 +32,21 @@ var (
 	_ BackendDevice = (*ProxyBackendDevice)(nil)
 	_ BackendDevice = (*streambridge.Device)(nil)
 )
+
+// ProxyEgress exposes the stream egress this device splices client flows onto, so
+// in-tunnel health can perform a protocol-appropriate authenticated exchange
+// through the live backend instead of a packet canary these transports cannot
+// carry (finding F11). It satisfies tunnel.ProxyStreamDevice.
+func (p *ProxyBackendDevice) ProxyEgress() tunnel.ProxyStreamDialer {
+	if p == nil || p.Device == nil {
+		return nil
+	}
+	egress := p.Device.StreamDialer()
+	if egress == nil {
+		return nil
+	}
+	return egress
+}
 
 // Close gracefully closes both the stream bridge device and the dialer connection pool (if provided).
 func (p *ProxyBackendDevice) Close() error {

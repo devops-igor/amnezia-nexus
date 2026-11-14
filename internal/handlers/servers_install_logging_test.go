@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -64,9 +66,18 @@ func TestInstallProtocolHandler_FailureLogged(t *testing.T) {
 	if !strings.Contains(logs, "protocol install failed") {
 		t.Fatalf("expected slog output to contain 'protocol install failed', got:\n%s", logs)
 	}
-	for _, want := range []string{"server_id", "protocol", "port", "err"} {
+	for _, want := range []string{"server_id", "protocol", "port", "err", "duration_ms"} {
 		if !strings.Contains(logs, want) {
 			t.Errorf("expected install-failure log to include %q, got:\n%s", want, logs)
 		}
+	}
+	// The duration must be a real bounded integer so the offline collector can
+	// separate a slow attempt from a fast failure (issue #680 Phase 0).
+	duration := regexp.MustCompile(`duration_ms=(\d+)`).FindStringSubmatch(logs)
+	if duration == nil {
+		t.Fatalf("expected a numeric duration_ms in the install-failure log, got:\n%s", logs)
+	}
+	if ms, err := strconv.Atoi(duration[1]); err != nil || ms < 0 {
+		t.Errorf("expected duration_ms to be a non-negative integer, got %q", duration[1])
 	}
 }

@@ -1048,9 +1048,10 @@ func TestConcurrentHookFailure_SubThresholdDoesNotOverwriteDisabledState(t *test
 		t.Fatal("expected server to be auto-disabled after Probe B")
 	}
 
-	// 3. Hook A fails sub-threshold (e.g. fail count 2 < 3) and executes handleHookFailure with stale snapshot
+	// 3. Hook A fails sub-threshold (e.g. attachment fail count 2 < 3) and
+	// executes handleHookFailure with stale snapshot
 	prober.mu.Lock()
-	prober.failCounts[s1ID] = 1
+	prober.hookFailCounts[s1ID] = 1
 	prober.mu.Unlock()
 
 	_, err = prober.handleHookFailure(ctx, hookASnapshot, errors.New("hook readiness failure"))
@@ -1263,9 +1264,9 @@ func TestConcurrentHookFailure_ReverseOrder_SubThresholdWinsThenThresholdReconci
 	}
 	initialVersion := initialTunnel.StateVersion
 
-	// Initial state: failCounts = 1
+	// Initial state: attachment failure count = 1
 	prober.mu.Lock()
-	prober.failCounts[s1ID] = 1
+	prober.hookFailCounts[s1ID] = 1
 	prober.mu.Unlock()
 
 	// 1. Both Hook A and Hook B capture snapshots at version V
@@ -1303,12 +1304,13 @@ func TestConcurrentHookFailure_ReverseOrder_SubThresholdWinsThenThresholdReconci
 		t.Fatalf("expected ErrStaleStateVersion for stale hook B, got %v", err)
 	}
 
-	// Assert failCounts is still 2 (hook B did not contaminate or increment counters)
+	// Assert the attachment failure count is still 2 (hook B did not contaminate
+	// or increment counters)
 	prober.mu.Lock()
-	fcBeforeC := prober.failCounts[s1ID]
+	fcBeforeC := prober.hookFailCounts[s1ID]
 	prober.mu.Unlock()
 	if fcBeforeC != 2 {
-		t.Fatalf("expected failCounts to remain 2 after stale hook B, got %d", fcBeforeC)
+		t.Fatalf("expected attachment fail count to remain 2 after stale hook B, got %d", fcBeforeC)
 	}
 
 	// 4. Hook C fails targeting current version V+1 (reaching threshold, fail count: 2 -> 3 >= 3)
@@ -1343,12 +1345,17 @@ func TestConcurrentHookFailure_ReverseOrder_SubThresholdWinsThenThresholdReconci
 		t.Fatalf("expected server %d to be auto-disabled after reconciliation", s1ID)
 	}
 
-	// failCounts[serverID] >= 3
+	// failCounts[serverID] >= 3 for the attachment-failure streak that hook C
+	// completed, and no outer failure recorded by these probes.
 	prober.mu.Lock()
-	fc := prober.failCounts[s1ID]
+	fc := prober.hookFailCounts[s1ID]
+	outer := prober.failCounts[s1ID]
 	prober.mu.Unlock()
 	if fc < 3 {
-		t.Fatalf("expected failCounts >= 3, got %d", fc)
+		t.Fatalf("expected attachment failCount >= 3, got %d", fc)
+	}
+	if outer != 0 {
+		t.Fatalf("attachment failures leaked into the outer handshake counter: outer failCount = %d, want 0", outer)
 	}
 
 	// SelfHealSweep detects the tunnel and successfully restores it
@@ -1475,7 +1482,7 @@ func TestThresholdReconcile_ConcurrentSuccessAborts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reconciled, err := prober.reconcileThresholdAutoDisable(ctx, s1ID, current.ID)
+	reconciled, err := prober.reconcileThresholdAutoDisable(ctx, s1ID, current.ID, failureOuter)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1537,7 +1544,7 @@ func TestThresholdReconcile_AdminDisableDuringReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reconciled, err := prober.reconcileThresholdAutoDisable(ctx, s1ID, current.ID)
+	reconciled, err := prober.reconcileThresholdAutoDisable(ctx, s1ID, current.ID, failureOuter)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

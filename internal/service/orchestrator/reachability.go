@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"golang.org/x/sync/errgroup"
@@ -20,7 +19,6 @@ import (
 // AWGHealthProbeManager defines interface for AWG health probe client provisioning.
 type AWGHealthProbeManager interface {
 	GetServerPublicKey(ctx context.Context, server *models.Server) (string, error)
-	GetServerPSK(ctx context.Context, server *models.Server) (string, error)
 	GetClients(ctx context.Context, server *models.Server) ([]map[string]any, error)
 	AddClient(ctx context.Context, server *models.Server, clientParams map[string]any) (map[string]any, error)
 }
@@ -142,181 +140,230 @@ func extractAWGPort(awgInfo map[string]any) int {
 
 func (o *Orchestrator) resolveAWGProbeKeys(ctx context.Context, server *models.Server, awgInfo map[string]any) (string, string, string) {
 	serverPub, _ := awgInfo["public_key"].(string)
-	psk, _ := awgInfo["psk"].(string)
 
 	o.mu.RLock()
 	cached := o.healthProbeKeys[server.ID]
 	o.mu.RUnlock()
 
-	clientPriv := cached.clientPriv
 	if serverPub == "" {
 		serverPub = cached.serverPub
 	}
-	if psk == "" {
-		psk = cached.psk
+	if cached.clientPriv != "" && probeIdentityStillValid(cached, serverPub) {
+		// The warm entry is only usable while it still describes this backend.
+		// An AWG reinstall or a server key rotation replaces the server identity
+		// and its clientsTable, so a probe peer registered before it no longer
+		// exists on the backend; returning the cached key would sign every later
+		// handshake with a peer the backend never registered, and nothing would
+		// ever clear the entry.
+		return serverPub, cached.clientPriv, cached.psk
+	}
+	if cached.clientPriv != "" {
+		// Established identity is superseded: drop it before resolving, so a
+		// concurrent cycle cannot keep reading the retired one.
+		o.forgetProbeIdentity(server.ID)
 	}
 
-	if (serverPub == "" || clientPriv == "") && o.registry != nil {
-		if mgr, ok := o.registry.Get("awg"); ok {
-			if hpm, isHealthProbeMgr := mgr.(AWGHealthProbeManager); isHealthProbeMgr {
-				serverPub, clientPriv, psk = o.provisionMissingProbeKeys(ctx, server, hpm, serverPub, clientPriv, psk)
-			}
-		}
+	if o.registry == nil {
+		return serverPub, "", ""
 	}
-
-	return serverPub, clientPriv, psk
+	mgr, ok := o.registry.Get("awg")
+	if !ok {
+		return serverPub, "", ""
+	}
+	hpm, isHealthProbeMgr := mgr.(AWGHealthProbeManager)
+	if !isHealthProbeMgr {
+		return serverPub, "", ""
+	}
+	return o.provisionProbeIdentity(ctx, server, hpm, serverPub)
 }
 
-func (o *Orchestrator) provisionMissingProbeKeys(ctx context.Context, server *models.Server, hpm AWGHealthProbeManager, serverPub, clientPriv, psk string) (string, string, string) {
+// probeIdentityStillValid reports whether a cached probe identity still belongs to
+// the backend this cycle is talking to.
+//
+// The fence is the SERVER IDENTITY — the server's own public key — because that is
+// what an install, a reinstall and a key rotation all change, and because the
+// probe peer is registered against it. An absent key carries no new information
+// (a partially populated server row must not churn a working identity), so absence
+// preserves the entry; a DIFFERENT key invalidates it.
+func probeIdentityStillValid(cached healthProbeKey, serverPub string) bool {
+	if cached.serverPub == "" {
+		// The cache recorded no server key to compare against; keep the identity
+		// rather than re-registering on every cycle.
+		return true
+	}
+	if serverPub == "" {
+		return true
+	}
+	return cached.serverPub == serverPub
+}
+
+// forgetProbeIdentity drops a cached identity that no longer describes the
+// backend.
+func (o *Orchestrator) forgetProbeIdentity(serverID int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.healthProbeKeys, serverID)
+}
+
+// provisionProbeIdentity resolves the server public key together with the
+// identity the reachability prober signs with, and caches that decision so
+// repeated cycles do not re-register or re-read the backend.
+//
+// Identity, PSK policy and server key travel as one unit because they all describe
+// the same peer:
+//
+//   - identity: the private key the probe handshake signs with. The AWG manager
+//     owns it: the probe peer's keypair is generated and stored backend-side in
+//     the clientsTable, which is the only place it survives a panel restart.
+//   - psk: the handshake must derive IKpsk2 with the SAME PSK the backend
+//     registered for this peer. Current registrations are PSK-less; a peer written
+//     by the older server-PSK path keeps deriving with the PSK recorded for it.
+//   - serverPub: the server's own public key, required by the handshake.
+func (o *Orchestrator) provisionProbeIdentity(ctx context.Context, server *models.Server, hpm AWGHealthProbeManager, serverPub string) (string, string, string) {
 	if serverPub == "" {
 		if pub, err := hpm.GetServerPublicKey(ctx, server); err == nil && pub != "" {
 			serverPub = pub
 		}
 	}
-	if psk == "" {
-		if p, err := hpm.GetServerPSK(ctx, server); err == nil && p != "" {
-			psk = p
-		}
+
+	identity, err := o.ensureHealthProbeIdentity(ctx, server, hpm)
+	if err != nil {
+		// No usable identity means the Noise handshake cannot be attributed to a
+		// registered peer. Report it once and let the caller fall back instead of
+		// signing with a key the backend does not know.
+		slog.Warn("reachability probe identity unavailable; outer AWG handshake not attempted",
+			"server_id", server.ID, "err", err)
 	}
-	if clientPriv == "" {
-		clientPriv = o.resolveOrCreateHealthProbeClient(ctx, server, hpm)
+	if identity.clientPriv == "" {
+		o.cacheProbeKeys(server.ID, "", serverPub, "")
+		return serverPub, "", ""
 	}
 
-	if serverPub != "" || clientPriv != "" || psk != "" {
-		o.mu.Lock()
-		o.healthProbeKeys[server.ID] = healthProbeKey{
-			clientPriv: clientPriv,
-			serverPub:  serverPub,
-			psk:        psk,
-		}
-		o.mu.Unlock()
-	}
-
-	return serverPub, clientPriv, psk
+	o.cacheProbeKeys(server.ID, identity.clientPriv, serverPub, identity.psk)
+	return serverPub, identity.clientPriv, identity.psk
 }
 
-func (o *Orchestrator) resolveOrCreateHealthProbeClient(ctx context.Context, server *models.Server, hpm AWGHealthProbeManager) string {
-	if clients, err := hpm.GetClients(ctx, server); err == nil {
-		for _, cl := range clients {
-			if uData, ok := cl["userData"].(map[string]any); ok && uData != nil {
-				cName, _ := uData["clientName"].(string)
-				if strings.EqualFold(strings.TrimSpace(cName), "health probe") {
-					if priv, _ := uData["clientPrivateKey"].(string); priv != "" {
-						return priv
-					}
-				}
-			}
-		}
+// cacheProbeKeys stores the resolved probe identity for the server, so repeated
+// cycles do not re-read the backend. The cache is written once per resolution and
+// never partially.
+func (o *Orchestrator) cacheProbeKeys(serverID int64, clientPriv, serverPub, psk string) {
+	if clientPriv == "" && serverPub == "" && psk == "" {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.healthProbeKeys == nil {
+		o.healthProbeKeys = make(map[int64]healthProbeKey)
+	}
+	o.healthProbeKeys[serverID] = healthProbeKey{
+		clientPriv: clientPriv,
+		serverPub:  serverPub,
+		psk:        psk,
+	}
+}
+
+// healthProbeIdentity is the resolved reachability-probe peer identity for one
+// server: the private key to sign with, and the PresharedKey the backend
+// registered for that peer.
+type healthProbeIdentity struct {
+	clientPriv string
+	psk        string
+}
+
+// ensureHealthProbeIdentity resolves the probe identity for a server at most once
+// per in-flight batch. Concurrent callers share one resolution: two independent
+// registrations would leave the backend holding whichever identity was written
+// last while one caller signs with the other, so only one may run.
+//
+// Coalesced callers share the first caller's context. That is correct here
+// because every caller in a cycle derives from the same run context - a canceled
+// cycle must not register a peer - and a resolution is never retried implicitly.
+func (o *Orchestrator) ensureHealthProbeIdentity(ctx context.Context, server *models.Server, hpm AWGHealthProbeManager) (healthProbeIdentity, error) {
+	key := strconv.FormatInt(server.ID, 10)
+	res, err, _ := o.probeIdentityGroup.Do(key, func() (any, error) {
+		return o.resolveOrCreateHealthProbeClient(ctx, server, hpm)
+	})
+	if err != nil {
+		return healthProbeIdentity{}, err
+	}
+	identity, ok := res.(healthProbeIdentity)
+	if !ok {
+		return healthProbeIdentity{}, errors.New("health-probe identity resolution returned an unexpected result")
+	}
+	return identity, nil
+}
+
+// resolveOrCreateHealthProbeClient resolves the reachability probe peer's identity
+// on the backend, registering the peer only when the backend holds no credential
+// for it.
+//
+// Credential ownership is the manager's: a probe registration generates the
+// keypair, records the private half in the backend's clientsTable and returns no
+// credential (the peer is PSK-less and has no client config). The clientsTable is
+// therefore the authoritative, durable home of that key, and the prober reads it
+// back — including immediately after registering, so the very first cycle after an
+// install or a reinstall can sign a handshake instead of waiting a whole probe
+// interval for the next scheduled read. Later cycles, and a new panel process after
+// a restart, recover the same key from that table rather than minting a new one, so
+// the registered peer identity stays stable.
+func (o *Orchestrator) resolveOrCreateHealthProbeClient(ctx context.Context, server *models.Server, hpm AWGHealthProbeManager) (healthProbeIdentity, error) {
+	if stored, ok, err := o.storedHealthProbeIdentity(ctx, server, hpm); err != nil {
+		return healthProbeIdentity{}, err
+	} else if ok {
+		return stored, nil
 	}
 
-	// R2: probe peer registration is done with the public key derived from the
-	// private key the prober actually signs with (same identity as the tunnel
-	// prober / EnableBackend's caller-key path), NOT name-only. The name-only
-	// AddClient fallback previously registered a peer whose PresharedKey
-	// semantics diverged from the PSK-less prober identity.
-	// Derive candidate privs in priority order: the cached probe key for this
-	// server, then a freshly generated one.
-	candidates := make([]string, 0, 2)
-	o.mu.RLock()
-	cachedPriv := o.healthProbeKeys[server.ID].clientPriv
-	o.mu.RUnlock()
-	if cachedPriv != "" {
-		candidates = append(candidates, cachedPriv)
-	}
-	if fresh, _, err := awg.GenerateWGKeypair(); err == nil && fresh != "" {
-		candidates = append(candidates, fresh)
-	} else {
-		slog.Warn("failed to generate health-probe private key; falling back to name-only AddClient", "server_id", server.ID, "err", err)
-	}
-
-	for _, clientPriv := range candidates {
-		if priv := o.provisionHealthProbeClientWithPublicKey(ctx, server, hpm, clientPriv); priv != "" {
-			return priv
-		}
-	}
-
-	slog.Info("Health Probe client not found on server; provisioning name-only as last resort...", "server_id", server.ID)
-	added, err := hpm.AddClient(ctx, server, map[string]any{
+	// No credential is stored for the probe peer: register it. Registration is
+	// idempotent on the peer name, so an unreadable-but-present peer is refreshed
+	// rather than duplicated.
+	if _, addErr := hpm.AddClient(ctx, server, map[string]any{
 		"name":       "Health Probe",
 		"clientName": "Health Probe",
-	})
-	if err == nil && added != nil {
-		if confStr, ok := added["config"].(string); ok {
-			if priv := extractPrivateKeyFromConfig(confStr); priv != "" {
-				return priv
-			}
-		}
-		if uData, ok := added["userData"].(map[string]any); ok && uData != nil {
-			if priv, ok := uData["clientPrivateKey"].(string); ok {
-				return priv
-			}
-		}
+	}); addErr != nil {
+		return healthProbeIdentity{}, fmt.Errorf("failed to provision the health-probe peer: %w", addErr)
 	}
 
-	return ""
+	stored, ok, err := o.storedHealthProbeIdentity(ctx, server, hpm)
+	if err != nil {
+		return healthProbeIdentity{}, err
+	}
+	if !ok {
+		return healthProbeIdentity{}, errors.New("health-probe peer registration stored no usable credential")
+	}
+	return stored, nil
 }
 
-// provisionHealthProbeClientWithPublicKey provisions a "Health Probe" client passing the
-// public key derived from the known private key so the AWG manager lands on the
-// caller-key (PSK-less) registration path instead of the server-PSK path. This keeps
-// the reachability prober and the tunnel prober on one PSK-less peer identity.
-func (o *Orchestrator) provisionHealthProbeClientWithPublicKey(ctx context.Context, server *models.Server, hpm AWGHealthProbeManager, clientPriv string) string {
-	pub, err := health.ComputePublicKeyFromPrivate(clientPriv)
-	if err != nil || pub == "" {
-		slog.Warn("failed to derive health-probe public key from private key; falling back to name-only AddClient",
-			"server_id", server.ID, "err", err)
-		added, err := hpm.AddClient(ctx, server, map[string]any{
-			"name":       "Health Probe",
-			"clientName": "Health Probe",
-		})
-		if err == nil && added != nil {
-			if confStr, ok := added["config"].(string); ok {
-				if priv := extractPrivateKeyFromConfig(confStr); priv != "" {
-					return priv
-				}
-			}
-			if uData, ok := added["userData"].(map[string]any); ok && uData != nil {
-				if priv, ok := uData["clientPrivateKey"].(string); ok {
-					return priv
-				}
-			}
-		}
-		return ""
+// storedHealthProbeIdentity reads the probe peer's credential from the backend.
+func (o *Orchestrator) storedHealthProbeIdentity(ctx context.Context, server *models.Server, hpm AWGHealthProbeManager) (healthProbeIdentity, bool, error) {
+	clients, err := hpm.GetClients(ctx, server)
+	if err != nil {
+		return healthProbeIdentity{}, false, fmt.Errorf("failed to read backend clients for the health-probe identity: %w", err)
 	}
-
-	added, err := hpm.AddClient(ctx, server, map[string]any{
-		"name":              "Health Probe",
-		"clientName":        "Health Probe",
-		"public_key":        pub,
-		"client_public_key": pub,
-	})
-	if err != nil || added == nil {
-		return ""
-	}
-	if confStr, ok := added["config"].(string); ok {
-		if priv := extractPrivateKeyFromConfig(confStr); priv != "" {
-			return priv
-		}
-	}
-	if uData, ok := added["userData"].(map[string]any); ok && uData != nil {
-		if priv, ok := uData["clientPrivateKey"].(string); ok {
-			return priv
-		}
-	}
-	return ""
+	identity, ok := storedHealthProbeKey(clients)
+	return identity, ok, nil
 }
 
-func extractPrivateKeyFromConfig(confStr string) string {
-	for _, line := range strings.Split(confStr, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "PrivateKey") {
-			parts := strings.SplitN(trimmed, "=", 2)
-			if len(parts) == 2 {
-				return strings.TrimSpace(parts[1])
-			}
+// storedHealthProbeKey returns the identity the backend still stores for the
+// reachability probe peer, including the PresharedKey that peer was registered
+// with. ok is false when the peer holds no caller-owned credential.
+func storedHealthProbeKey(clients []map[string]any) (healthProbeIdentity, bool) {
+	for _, cl := range clients {
+		uData, ok := cl["userData"].(map[string]any)
+		if !ok || uData == nil {
+			continue
 		}
+		cName, _ := uData["clientName"].(string)
+		if !strings.EqualFold(strings.TrimSpace(cName), "health probe") {
+			continue
+		}
+		priv, _ := uData["clientPrivateKey"].(string)
+		if priv == "" {
+			continue
+		}
+		psk, _ := uData["psk"].(string)
+		return healthProbeIdentity{clientPriv: priv, psk: psk}, true
 	}
-	return ""
+	return healthProbeIdentity{}, false
 }
 
 func (o *Orchestrator) dataPlaneI1Protocol(ctx context.Context) string {

@@ -270,6 +270,7 @@ type containerLaunchOptions struct {
 	shortID          string
 	flow             string
 	clients          []XrayClient
+	skipProbe        bool
 }
 
 func (m *XrayManager) pullImage(ctx context.Context, client ssh.SSHClient, image string) error {
@@ -426,6 +427,11 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 	const (
 		readinessAttempts = 3
 		readinessInterval = 50 * time.Millisecond
+		// How long a refused connection is retried while xray finishes binding
+		// its port, and how often. Bounded on purpose: a listener that never
+		// comes up still fails the install.
+		probeStartupBudget = 10 * time.Second
+		probeRetryInterval = 250 * time.Millisecond
 	)
 
 	for attempt := 1; attempt <= readinessAttempts; attempt++ {
@@ -481,7 +487,7 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 		probeMode = "REALITY handshake"
 	}
 
-	if activeProbeFn != nil && opts.server != nil && opts.portPrimary > 0 {
+	if !opts.skipProbe && activeProbeFn != nil && opts.server != nil && opts.portPrimary > 0 {
 		probeUUID := ""
 		probeFlow := opts.flow
 		if hasClients {
@@ -502,10 +508,18 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 		}
 		endpoint := net.JoinHostPort(strings.Trim(strings.TrimSpace(opts.server.Host), "[]"), strconv.Itoa(opts.portPrimary))
 		const probeTimeout = 5 * time.Second
-		probeCtx, probeCancel := context.WithTimeout(ctx, probeTimeout)
-		defer probeCancel()
 
-		if _, probeErr := activeProbeFn(probeCtx, endpoint, probeParams, probeTimeout); probeErr != nil {
+		// A container reports "running" before xray has bound its port, so a
+		// refused connection is a startup race rather than a defect: retry it
+		// inside a bounded window instead of failing the install. Every other
+		// error is returned immediately -- retrying a configuration defect only
+		// delays the failure and blurs the cause.
+		probeErr := probeWithStartupRetry(
+			ctx, activeProbeFn, endpoint, probeParams,
+			probeTimeout, probeStartupBudget, probeRetryInterval,
+		)
+
+		if probeErr != nil {
 			if probeMode == "VLESS traffic" && isExternalDestinationError(probeErr) {
 				// Third-party TLS alert, protocol, or destination reachability error:
 				// verify container directly via REALITY handshake to avoid false rollback.
@@ -527,6 +541,52 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 	}
 
 	return nil
+}
+
+// probeWithStartupRetry runs the readiness probe until it succeeds, fails for a
+// reason other than a listener that has not bound yet, or the startup window
+// expires. Each attempt gets a fresh probe budget: reusing an expired context
+// would make every retry fail instantly.
+func probeWithStartupRetry(
+	ctx context.Context,
+	probe VLESSProbeFunc,
+	endpoint string,
+	params models.VLESSRealityParams,
+	timeout time.Duration,
+	budget time.Duration,
+	interval time.Duration,
+) error {
+	deadline := time.Now().Add(budget)
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		_, err := probe(attemptCtx, endpoint, params, timeout)
+		cancel()
+
+		if err == nil || !isListenerNotReady(err) || !time.Now().Before(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
+// isListenerNotReady reports whether the probe failed because the server has not
+// bound its port yet. The container reports "running" before xray opens its
+// listener, so this exact failure is a startup race, not a defect.
+//
+// It must match only the endpoint dial ("vless: dial: dial tcp <endpoint>"), not
+// a refused destination dialed *through* the tunnel: retrying the latter would
+// hide a real destination problem behind a startup delay.
+func isListenerNotReady(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "vless: dial: dial tcp") &&
+		strings.Contains(msg, "connection refused")
 }
 
 func isExternalDestinationError(err error) bool {
@@ -797,9 +857,11 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	defer unlock()
 
 	// 1. Check Docker is installed
-	out, _, code, _ := client.RunCommand(ctx, "docker --version")
-	if code != 0 || !strings.Contains(strings.ToLower(out), "docker") {
-		return errors.New("docker is not installed on the remote server")
+	if b, ok := params["docker_bootstrapped"].(bool); !ok || !b {
+		out, _, code, _ := client.RunCommand(ctx, "docker --version")
+		if code != 0 || !strings.Contains(strings.ToLower(out), "docker") {
+			return errors.New("docker is not installed on the remote server")
+		}
 	}
 
 	// 2. Parse installation options and resolve engine profile
@@ -859,6 +921,7 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 	}
 
 	// 7. Launch amnezia-xray container with resolved profile image and verify readiness before deleting backup
+	skipProbe, _ := params["skip_probe"].(bool)
 	launchOpts := containerLaunchOptions{
 		image:            profile.Image,
 		engineProfile:    string(profile.Name),
@@ -870,6 +933,7 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 		shortID:          shortID,
 		flow:             flow,
 		clients:          clients,
+		skipProbe:        skipProbe,
 	}
 	if err := m.launchContainer(ctx, client, launchOpts); err != nil {
 		return err

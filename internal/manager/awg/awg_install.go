@@ -34,7 +34,7 @@ systemctl start docker; docker --version
 	return nil
 }
 
-func prepareHostAndContainers(ctx context.Context, client ssh.SSHClient) error {
+func prepareHostAndContainers(ctx context.Context, client ssh.SSHClient, opts ...bool) error {
 	prepScript := `
 mkdir -p /opt/amnezia/amnezia-awg2 /opt/amnezia/awg
 if ! docker network ls | grep -q amnezia-dns-net; then
@@ -45,9 +45,15 @@ fi
 		return fmt.Errorf("failed to prepare host: %w", err)
 	}
 
-	for _, name := range AWGContainerNames {
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s 2>/dev/null || true", ssh.EscapeShellArg(name)))
-		_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(name)))
+	preserveContainers := false
+	if len(opts) > 0 {
+		preserveContainers = opts[0]
+	}
+	if !preserveContainers {
+		for _, name := range AWGContainerNames {
+			_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker stop %s 2>/dev/null || true", ssh.EscapeShellArg(name)))
+			_, _, _, _ = client.RunSudoCommand(ctx, fmt.Sprintf("docker rm -fv %s 2>/dev/null || true", ssh.EscapeShellArg(name)))
+		}
 	}
 	return nil
 }
@@ -71,11 +77,9 @@ func (m *AWGManager) buildAndRunAWGContainer(ctx context.Context, client ssh.SSH
 	if !IsValidContainerName(cName) {
 		cName = "amnezia-awg2"
 	}
-	// Preflight: fail fast when the UDP port is already bound (host socket or
-	// existing docker port binding) instead of discovering it at `docker run`
-	// time after a slow pull+build cycle (Issue #225). Best-effort: a port
-	// could still bind between check and run — `docker run` remains the final
-	// authority.
+	// Preservation/recovery is decided before provisioning, under the remote
+	// installation lock. A container appearing here is a conflict, not permission
+	// to initialize its identity or replace its peers.
 	if err := checkUDPPortAvailable(ctx, client, port); err != nil {
 		return err
 	}
@@ -214,7 +218,7 @@ func udpPortBound(ssOut, port string) bool {
 	return false
 }
 
-func (m *AWGManager) initializeServerKeysAndConfig(ctx context.Context, client ssh.SSHClient, port string, awgParams *AWGParams) error {
+func (m *AWGManager) initializeServerKeysAndConfig(ctx context.Context, client ssh.SSHClient, port string, awgParams *AWGParams, opts ...any) error {
 	cName := m.resolveContainerName(ctx, client)
 	if !IsValidContainerName(cName) {
 		cName = m.containerName()
@@ -223,10 +227,34 @@ func (m *AWGManager) initializeServerKeysAndConfig(ctx context.Context, client s
 		cName = "amnezia-awg2"
 	}
 
-	serverPrivKey, serverPubKey, err := GenerateWGKeypair()
-	if err != nil {
-		return fmt.Errorf("failed to generate server keypair: %w", err)
+	var extraParams map[string]any
+	var server *models.Server
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case map[string]any:
+			extraParams = v
+		case *models.Server:
+			server = v
+		}
 	}
+
+	var serverPrivKey, serverPubKey string
+	if extraParams != nil {
+		if p, ok := extraParams["server_private_key"].(string); ok && strings.TrimSpace(p) != "" {
+			serverPrivKey = strings.TrimSpace(p)
+			if pub, err := derivePublicKeyFromPrivate(serverPrivKey); err == nil {
+				serverPubKey = pub
+			}
+		}
+	}
+	if serverPrivKey == "" {
+		var err error
+		serverPrivKey, serverPubKey, err = GenerateWGKeypair()
+		if err != nil {
+			return fmt.Errorf("failed to generate server keypair: %w", err)
+		}
+	}
+	populateAWGServerProtocols(server, serverPubKey, port, awgParams)
 	serverPSK, err := GeneratePSK()
 	if err != nil {
 		return fmt.Errorf("failed to generate server psk: %w", err)
@@ -247,7 +275,13 @@ echo "%s" > %s
 			"container", cName, "exit_code", code, "stderr", strings.TrimSpace(errOut), "error", err)
 	}
 
-	serverConfig := RenderServerConfig(serverPrivKey, AWGDefaults["subnet_ip"], AWGDefaults["subnet_cidr"], port, awgParams.MTU, awgParams, nil)
+	var peers []AWGPeer
+	if extraParams != nil {
+		if p, ok := extraParams["peers"].([]AWGPeer); ok {
+			peers = p
+		}
+	}
+	serverConfig := RenderServerConfig(serverPrivKey, AWGDefaults["subnet_ip"], AWGDefaults["subnet_cidr"], port, awgParams.MTU, awgParams, peers)
 	if err := client.UploadSudoFile(ctx, "/tmp/_amnz_awg0.conf", []byte(serverConfig), 0600); err != nil {
 		return err
 	}
@@ -297,19 +331,81 @@ iptables -C INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null || iptabl
 	return nil
 }
 
+func populateAWGServerProtocols(server *models.Server, serverPubKey, port string, awgParams *AWGParams) {
+	if server == nil {
+		return
+	}
+	if server.Protocols == nil {
+		server.Protocols = make(map[string]any)
+	}
+	awgMeta, _ := server.Protocols["awg"].(map[string]any)
+	if awgMeta == nil {
+		awgMeta = make(map[string]any)
+	}
+	awgMeta["public_key"] = serverPubKey
+	if port != "" {
+		awgMeta["port"] = port
+	}
+	if awgParams != nil {
+		pMap := awgParams.ToMap()
+		paramsAny := make(map[string]any, len(pMap)+16)
+		for k, v := range pMap {
+			paramsAny[k] = v
+		}
+		paramsAny["Jc"] = awgParams.JunkPacketCount
+		paramsAny["Jmin"] = awgParams.JunkPacketMinSize
+		paramsAny["Jmax"] = awgParams.JunkPacketMaxSize
+		paramsAny["S1"] = awgParams.InitPacketJunkSize
+		paramsAny["S2"] = awgParams.ResponsePacketJunkSize
+		paramsAny["H1"] = awgParams.InitPacketMagicHeader
+		paramsAny["H2"] = awgParams.ResponsePacketMagicHeader
+		paramsAny["H3"] = awgParams.UnderloadPacketMagicHeader
+		paramsAny["H4"] = awgParams.TransportPacketMagicHeader
+		if awgParams.HeaderProtectionKey != "" {
+			paramsAny["HeaderProtectionKey"] = awgParams.HeaderProtectionKey
+			paramsAny["header_protection_key"] = awgParams.HeaderProtectionKey
+		}
+		awgMeta["awg_params"] = paramsAny
+		awgMeta["params"] = paramsAny
+		for k, v := range paramsAny {
+			awgMeta[k] = v
+		}
+	}
+	server.Protocols["awg"] = awgMeta
+}
+
 func initializeServerKeysAndConfig(ctx context.Context, client ssh.SSHClient, port string, awgParams *AWGParams) error {
 	return (&AWGManager{}).initializeServerKeysAndConfig(ctx, client, port, awgParams)
 }
 
 // Install deploys Docker (if missing), builds the AWG container, configures parameters, and starts the service.
 func (m *AWGManager) Install(ctx context.Context, server *models.Server, params map[string]any) error {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
 	client, err := m.getSSHClient(ctx, server)
 	if err != nil {
 		return err
 	}
 
+	if err := ensureDockerInstalled(ctx, client); err != nil {
+		return err
+	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	installHook := m.installHook
+	m.mu.Unlock()
+	unlock, err := m.acquireRemoteServerLock(ctx, client, server.ID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	preserveContainers := preserveAWGInstallation(params)
+	if preserveContainers {
+		recovered, err := m.recoverAWGInstallation(ctx, client, server)
+		if err != nil || recovered {
+			return err
+		}
+	}
 
 	port := AWGDefaults["port"]
 	if p, ok := params["port"]; ok && fmt.Sprint(p) != "" {
@@ -350,20 +446,17 @@ func (m *AWGManager) Install(ctx context.Context, server *models.Server, params 
 		awgParams.I4 = cpsPackets["i4"]
 		awgParams.I5 = cpsPackets["i5"]
 	}
-	if m.installHook != nil {
-		m.installHook(awgParams)
+	if installHook != nil {
+		installHook(awgParams)
 	}
 
-	if err := ensureDockerInstalled(ctx, client); err != nil {
-		return err
-	}
-	if err := prepareHostAndContainers(ctx, client); err != nil {
+	if err := prepareHostAndContainers(ctx, client, preserveContainers); err != nil {
 		return err
 	}
 	if err := m.buildAndRunAWGContainer(ctx, client, port); err != nil {
 		return err
 	}
-	return m.initializeServerKeysAndConfig(ctx, client, port, awgParams)
+	return m.initializeServerKeysAndConfig(ctx, client, port, awgParams, params, server)
 }
 
 // Uninstall stops and removes all AWG containers and clean up directories.

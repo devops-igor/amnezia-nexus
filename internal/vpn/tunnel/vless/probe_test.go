@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -36,30 +37,63 @@ func TestProbeVLESSReality_Success(t *testing.T) {
 }
 
 func TestProbeVLESSReality_DestDelayTracking(t *testing.T) {
+	// Both fixtures are used from their first connection, so the initial cold
+	// handshake stays covered on each side.
+	const (
+		destDelay   = 60 * time.Millisecond
+		sampleCount = 5
+		// minDeltaMS only has to separate a measured delay from a constant; the
+		// absolute floor below carries the "delay is really measured" guarantee.
+		minDeltaMS = 20
+	)
+
 	// Baseline fixture with 0 delay
 	fastFixture := setupTestServer(t, "", 0)
 	defer fastFixture.ServerClose()
 
-	ctx := context.Background()
-	fastLatency, err := ProbeVLESSReality(ctx, fastFixture.Endpoint, fastFixture.Params, 3*time.Second)
-	if err != nil {
-		t.Fatalf("fast probe failed: %v", err)
-	}
-
 	// Delayed fixture with 60ms artificial delay on decoy server
-	const delay = 60 * time.Millisecond
-	delayedFixture := setupTestServer(t, "", delay)
+	delayedFixture := setupTestServer(t, "", destDelay)
 	defer delayedFixture.ServerClose()
 
-	delayedLatency, err := ProbeVLESSReality(ctx, delayedFixture.Endpoint, delayedFixture.Params, 3*time.Second)
-	if err != nil {
-		t.Fatalf("delayed probe failed: %v", err)
+	// Interleave the probes so one burst of scheduler or CPU contention lands on
+	// both sides instead of inflating a single sample against the other.
+	ctx := context.Background()
+	fastSamples := make([]int64, 0, sampleCount)
+	delayedSamples := make([]int64, 0, sampleCount)
+	for i := 0; i < sampleCount; i++ {
+		fastLatency, err := ProbeVLESSReality(ctx, fastFixture.Endpoint, fastFixture.Params, 3*time.Second)
+		if err != nil {
+			t.Fatalf("fast probe (sample %d) failed: %v", i, err)
+		}
+		delayedLatency, err := ProbeVLESSReality(ctx, delayedFixture.Endpoint, delayedFixture.Params, 3*time.Second)
+		if err != nil {
+			t.Fatalf("delayed probe (sample %d) failed: %v", i, err)
+		}
+		fastSamples = append(fastSamples, fastLatency)
+		delayedSamples = append(delayedSamples, delayedLatency)
 	}
 
-	// Verify that latency reflects the dest delay and is not a constant
-	if delayedLatency < fastLatency+40 {
-		t.Fatalf("dest delay not tracked: fast=%d ms, delayed=%d ms (expected >= %d ms)",
-			fastLatency, delayedLatency, fastLatency+40)
+	// Best sample per side: added latency is non-negative, so the minimum is the
+	// closest estimate of the fixture's own cost and independent noise cannot
+	// raise it.
+	fastLatency, delayedLatency := slices.Min(fastSamples), slices.Min(delayedSamples)
+	t.Logf("dest delay samples: fast=%v delayed=%v (first pair is each fixture's initial handshake)",
+		fastSamples, delayedSamples)
+
+	// The decoy sleeps for the full delay inside the measured region and
+	// time.Sleep never returns early, so an honest sample cannot truncate below
+	// destDelay. This floor does not depend on what the fast side measured.
+	if floorMS := destDelay.Milliseconds(); delayedLatency < floorMS {
+		t.Fatalf("dest delay missing from the measured latency: fastest delayed sample %d ms (expected >= %d ms)",
+			delayedLatency, floorMS)
+	}
+
+	// The floor alone cannot separate a real measurement from a constant one,
+	// since a probe that always reports >= destDelay satisfies it. The best
+	// delayed sample must still cost more than the best fast one.
+	if delayedLatency-fastLatency < minDeltaMS {
+		t.Fatalf("dest delay not tracked: fastest fast=%d ms, fastest delayed=%d ms (want delta >= %d ms; samples fast=%v delayed=%v)",
+			fastLatency, delayedLatency, minDeltaMS, fastSamples, delayedSamples)
 	}
 }
 

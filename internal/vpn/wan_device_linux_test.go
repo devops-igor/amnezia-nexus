@@ -14,47 +14,88 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestProductionWANDevice_PermissionsAndLifecycle(t *testing.T) {
-	if os.Geteuid() != 0 {
-		// Non-root: verify graceful error handling (fails closed with clear error, no panic)
-		dev, err := NewProductionWANDevice("nexus-wan-test")
+// TestProductionWANDevice_UnprivilegedRefusal pins that the production constructor
+// fails closed with a clear, non-panicking error when the process cannot create a
+// TUN device. It asserts behaviour, so it is meaningful in every environment and
+// does not depend on the runner's own kernel settings.
+func TestProductionWANDevice_UnprivilegedRefusal(t *testing.T) {
+	if os.Geteuid() == 0 {
+		// As real root the constructor legitimately proceeds; the failure path this
+		// test pins is only reachable without the privilege.
+		dev, err := NewProductionWANDevice("nexus-wan-unpriv-probe")
 		if err == nil {
 			_ = dev.Close()
-			t.Log("NewProductionWANDevice succeeded in unprivileged test environment")
-			return
+			t.Skip("running as root: the unprivileged refusal path is not reachable here")
 		}
-		t.Logf("NewProductionWANDevice returned expected non-root permission error: %v", err)
+		t.Logf("constructor refused as root for an environment reason: %v", err)
+		return
+	}
+	dev, err := NewProductionWANDevice("nexus-wan-unpriv-probe")
+	if err == nil {
+		_ = dev.Close()
+		t.Fatalf("a non-root process must not obtain a production WAN device")
+	}
+	if dev != nil {
+		t.Fatalf("constructor returned a non-nil device alongside an error: %v", err)
+	}
+	t.Logf("constructor refused a non-root process with: %v", err)
+}
+
+// s4OwnedNamespaceChildEnv marks a child that the lifecycle test launched into its own
+// namespace, so the child runs the assertions instead of launching again.
+const s4OwnedNamespaceChildEnv = "NEXUS_S4_LIFECYCLE_CHILD"
+
+// TestProductionWANDevice_PermissionsAndLifecycle verifies the TUN ioctl lifecycle
+// against a real device.
+//
+// It cannot do that in the runner's host namespace: NewProductionWANDevice refuses an
+// effective rp_filter it cannot prove is 0, and the host's value belongs to the operator.
+// So the parent re-launches this binary inside a namespace the run owns and lets the
+// child execute the assertions there. A plain `go test` invocation of this test therefore
+// still does the right thing on its own, which is what makes it safe to select from a
+// command line without any external wrapper.
+func TestProductionWANDevice_PermissionsAndLifecycle(t *testing.T) {
+	if os.Getenv(s4OwnedNamespaceChildEnv) != "1" {
+		out, err := s4LaunchInOwnedNamespace("^"+t.Name()+"$", []string{s4OwnedNamespaceChildEnv + "=1"})
+		if err != nil {
+			if s4RequiredEnvironment() {
+				t.Fatalf("the TUN lifecycle qualification could not run inside a run-owned namespace, so it is unproven: %v\n%s", err, out)
+			}
+			t.Skipf("skipping: cannot create an owned namespace here: %v", err)
+		}
+		if !strings.Contains(out, "--- PASS") || strings.Contains(out, "--- SKIP") {
+			t.Fatalf("the lifecycle assertions did not run and pass inside the owned namespace:\n%s", out)
+		}
+		t.Logf("lifecycle assertions passed inside the owned namespace:\n%s", out)
 		return
 	}
 
-	// Even as root, /dev/net/tun may be absent (e.g. CI containers without kernel TUN).
-	// Skip rather than fail in that case — the test's purpose is to verify the ioctl
-	// lifecycle on a real TUN device, which requires the kernel module.
-	if _, err := os.Stat("/dev/net/tun"); err != nil {
-		t.Skip("/dev/net/tun not available; skipping TUN lifecycle test")
-		return
+	// Child body: running in the namespace the parent created for this run.
+	if err := s4RequireOwnedNamespace(); err != nil {
+		t.Fatalf("child was selected without a run-owned namespace: %v", err)
+	}
+	// Initial setup is itself a guarded write path, so the child configures the settings
+	// NewProductionWANDevice requires rather than inheriting whatever the parent had.
+	if err := configurePrivateNamespaceSetup(); err != nil {
+		t.Fatalf("configure owned namespace: %v", err)
+	}
+	// The constructor also requires a host WAN address (checkWANRoute ->
+	// DeriveHostWANIP). A fresh namespace has only lo, so the child builds the uplink a
+	// deployment would have before calling it. The constructor itself is unchanged.
+	if err := s4BuildOwnedNamespaceUplink(); err != nil {
+		t.Fatalf("provide the owned namespace's WAN uplink: %v", err)
 	}
 
 	dev, err := NewProductionWANDevice("nexus-wan-test")
 	if err != nil {
-		if strings.Contains(err.Error(), "accept_local is disabled on both all and") {
-			if isAllAcceptLocalEnabled() {
-				t.Fatalf("unexpected accept_local prerequisite failure when all.accept_local is enabled: %v", err)
-			}
-			t.Skipf("skipping TUN lifecycle assertions: accept_local is disabled on both all and device (read-only procfs in container): %v", err)
-			return
-		}
-		t.Fatalf("NewProductionWANDevice failed: %v", err)
+		t.Fatalf("NewProductionWANDevice failed inside the owned namespace, which provides every prerequisite: %v", err)
 	}
 	defer func() { _ = dev.Close() }()
 
-	// Verify accept_local is effective (either configured on device or enabled host-wide)
+	// Verify accept_local is effective on the device the constructor just created.
 	if alData, alErr := os.ReadFile("/proc/sys/net/ipv4/conf/nexus-wan-test/accept_local"); alErr == nil {
 		if val := strings.TrimSpace(string(alData)); val != "1" {
-			if !isAllAcceptLocalEnabled() {
-				t.Fatalf("expected accept_local=1 on nexus-wan-test or all, got dev=%q, all=%v", val, isAllAcceptLocalEnabled())
-			}
-			t.Logf("accept_local on nexus-wan-test is %q, but all.accept_local is enabled", val)
+			t.Fatalf("expected accept_local=1 on nexus-wan-test inside the owned namespace, got %q", val)
 		}
 	}
 

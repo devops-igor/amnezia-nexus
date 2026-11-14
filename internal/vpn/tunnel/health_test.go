@@ -367,10 +367,10 @@ func TestHealthProber_OnActiveHookFailure_EscalatesToDisabled(t *testing.T) {
 		t.Errorf("expected rtt=0 on hook failure, got %d", rtt)
 	}
 	prober.mu.RLock()
-	fc1 := prober.failCounts[sID]
+	fc1 := prober.hookFailures(sID)
 	prober.mu.RUnlock()
 	if fc1 != 1 {
-		t.Fatalf("expected failCounts=1 after first failure, got %d", fc1)
+		t.Fatalf("expected attachment failCount=1 after first failure, got %d", fc1)
 	}
 	st1, _ := pool.GetTunnel(sID)
 	if st1.Status != "degraded" {
@@ -383,10 +383,10 @@ func TestHealthProber_OnActiveHookFailure_EscalatesToDisabled(t *testing.T) {
 		t.Fatal("expected ProbeTunnel to fail on second hook failure")
 	}
 	prober.mu.RLock()
-	fc2 := prober.failCounts[sID]
+	fc2 := prober.hookFailures(sID)
 	prober.mu.RUnlock()
 	if fc2 != 2 {
-		t.Fatalf("expected failCounts=2 after second failure, got %d", fc2)
+		t.Fatalf("expected attachment failCount=2 after second failure, got %d", fc2)
 	}
 	st2, _ := pool.GetTunnel(sID)
 	if st2.Status != "degraded" {
@@ -399,10 +399,10 @@ func TestHealthProber_OnActiveHookFailure_EscalatesToDisabled(t *testing.T) {
 		t.Fatal("expected ProbeTunnel to fail on third hook failure")
 	}
 	prober.mu.RLock()
-	fc3 := prober.failCounts[sID]
+	fc3 := prober.hookFailures(sID)
 	prober.mu.RUnlock()
 	if fc3 != 3 {
-		t.Fatalf("expected failCounts=3 after third failure, got %d", fc3)
+		t.Fatalf("expected attachment failCount=3 after third failure, got %d", fc3)
 	}
 	st3, _ := pool.GetTunnel(sID)
 	if st3.Status != "disabled" {
@@ -425,10 +425,10 @@ func TestHealthProber_OnActiveHookFailure_EscalatesToDisabled(t *testing.T) {
 		t.Errorf("expected rtt=15 on success, got %d", rtt)
 	}
 	prober.mu.RLock()
-	fcRec := prober.failCounts[sID]
+	fcRec := prober.hookFailures(sID)
 	prober.mu.RUnlock()
 	if fcRec != 0 {
-		t.Errorf("expected failCounts reset to 0 after recovery, got %d", fcRec)
+		t.Errorf("expected attachment fail count reset to 0 after recovery, got %d", fcRec)
 	}
 	stRec, _ := pool.GetTunnel(sID)
 	if stRec.Status != "active" {

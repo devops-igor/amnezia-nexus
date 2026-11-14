@@ -340,6 +340,9 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 		if string(retPkt[28:]) != "ECHO:ping-udp" {
 			t.Fatalf("expected payload ECHO:ping-udp, got %q", string(retPkt[28:]))
 		}
+		// Report the delivered reply only after every retPkt assertion above passed;
+		// the qualification job requires this observed payload in the success output.
+		t.Logf("direct UDP reply observed: %s:%d -> %s:%d payload %q", retSrcIP, retSrcPort, retDstIP, retDstPort, string(retPkt[28:]))
 	})
 
 	// Subtest 2: Real TCP direct egress with authentic Linux kernel TCP handshake and echo
@@ -385,11 +388,13 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 		// Wait for live echo reply from TCP echo server
 		deadline := time.Now().Add(3 * time.Second)
 		var echoFound bool
+		var echoPayload string
 		for time.Now().Before(deadline) {
 			for _, p := range capPath.getPackets() {
 				if len(p) >= 40 && p[9] == 6 {
 					payload := string(p[40:])
 					if payload == "ECHO:ping-tcp" {
+						echoPayload = payload
 						echoFound = true
 						break
 					}
@@ -403,6 +408,9 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 		if !echoFound {
 			t.Fatalf("did not receive ECHO:ping-tcp reply from live TCP server")
 		}
+		// Report only the payload the loop above actually matched, after the
+		// echoFound assertion; the qualification job requires it in success output.
+		t.Logf("direct TCP echo reply observed: %q to %s:%d", echoPayload, clientIP, clientPort)
 	})
 
 	// Subtest 3: Dual routing — Proxy routing alongside direct routing

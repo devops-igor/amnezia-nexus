@@ -4,6 +4,7 @@ import pytest
 from playwright.sync_api import Page
 
 from tests.e2e.conftest import api_get, api_post, assert_response_shape
+from tests.e2e.prerequisites import require
 
 
 def _find_or_create_user(page: Page, csrf_token: str, username: str = "e2e_share_user") -> dict:
@@ -28,8 +29,7 @@ def _find_or_create_user(page: Page, csrf_token: str, username: str = "e2e_share
         csrf_token,
     )
 
-    if add_result["status"] != 200:
-        pytest.skip("Could not create user for share test")
+    require(add_result["status"] == 200, "Could not create user for share test")
 
     # Re-fetch to get full user record
     users_result2 = api_get(page, "/api/users/?size=100")
@@ -39,7 +39,7 @@ def _find_or_create_user(page: Page, csrf_token: str, username: str = "e2e_share
         if u.get("username") == username:
             return u
 
-    pytest.skip("Test user not found after creation")
+    require(False, "Test user not found after creation")
     return {}  # unreachable
 
 
@@ -93,12 +93,10 @@ def test_access_share_link(authenticated_page: Page, base_url: str, csrf_token: 
         csrf_token,
     )
 
-    if share_result["status"] != 200:
-        pytest.skip("Could not enable sharing")
+    require(share_result["status"] == 200, "Could not enable sharing")
 
     share_token = share_result["body"].get("share_token")
-    if not share_token:
-        pytest.skip("No share token returned")
+    require(bool(share_token), "No share token returned")
 
     # Navigate to the share link
     page.goto(f"{base_url}/share/{share_token}")
@@ -132,8 +130,7 @@ def test_download_config_from_share(
         servers_result if isinstance(servers_result, list) else servers_result.get("servers", [])
     )
 
-    if not servers:
-        pytest.skip("No servers available for share config test")
+    require(servers, "No servers available for share config test")
 
     # Create a test user with share enabled
     target_user = _find_or_create_user(page, csrf_token, "e2e_share_dl_user")
@@ -149,9 +146,10 @@ def test_download_config_from_share(
 
     if share_result["status"] != 200:
         api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
-        pytest.skip("Could not enable sharing")
+        require(False, "Could not enable sharing")
 
     share_token = share_result["body"].get("share_token")
+    require(bool(share_token), "No share token returned")
 
     # Authenticate on share page via Playwright's request API (bypasses CSP)
     auth_result = page.request.post(

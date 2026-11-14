@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"net"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -90,21 +89,36 @@ type GatewayConfig struct {
 }
 
 type gatewayTCPTransport struct {
-	scope    policy.Scope
-	vt       tun.Device
-	listener net.Listener
-	mu       sync.Mutex
-	closed   atomic.Bool
+	scope     policy.Scope
+	vt        tun.Device
+	mu        sync.Mutex
+	closed    atomic.Bool
+	cancel    context.CancelFunc
+	serveDone chan struct{}
 }
 
+// Close tears the transport down in producer order: the Serve loop is stopped
+// and joined first, and only then is the netstack device closed.
+//
+// Serve closes the listener itself (listener teardown emits packets through the
+// device) and joins the goroutines it started, so closing the device before
+// Serve returns would race its packet channel with a live notification send.
+// The transport mutex additionally serializes the close against any TrySubmit
+// packet injection that is still writing into the device.
 func (tr *gatewayTCPTransport) Close() {
-	if tr.closed.CompareAndSwap(false, true) {
-		if tr.listener != nil {
-			_ = tr.listener.Close()
-		}
-		if tr.vt != nil {
-			_ = tr.vt.Close()
-		}
+	if !tr.closed.CompareAndSwap(false, true) {
+		return
+	}
+	if tr.cancel != nil {
+		tr.cancel()
+	}
+	if tr.serveDone != nil {
+		<-tr.serveDone
+	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.vt != nil {
+		_ = tr.vt.Close()
 	}
 }
 
@@ -167,10 +181,15 @@ func (g *Gateway) getOrCreateTransport(scope *ScopeHandle) (*gatewayTCPTransport
 		return nil, err
 	}
 
+	// The transport owns its Serve lifetime so Close can join it before
+	// tearing down the device the listener writes into.
+	serveCtx, serveCancel := context.WithCancel(scope.ctx)
+
 	tr := &gatewayTCPTransport{
-		scope:    scope.Scope,
-		vt:       vt,
-		listener: tcpL,
+		scope:     scope.Scope,
+		vt:        vt,
+		cancel:    serveCancel,
+		serveDone: make(chan struct{}),
 	}
 	g.transports[scope.Scope] = tr
 
@@ -197,9 +216,13 @@ func (g *Gateway) getOrCreateTransport(scope *ScopeHandle) (*gatewayTCPTransport
 		}
 	}()
 
-	// Serve TCP DNS queries over this listener bounded by scope context.
+	// Serve TCP DNS queries over this listener bounded by the transport context.
+	// Closing the transport joins this goroutine, so the listener teardown it
+	// performs (which emits packets through the device) cannot overlap the
+	// device close.
 	go func() {
-		_ = g.server.Serve(scope.ctx, scope, nil, tcpL)
+		defer close(tr.serveDone)
+		_ = g.server.Serve(serveCtx, scope, nil, tcpL)
 	}()
 
 	// Clean up transport when scope context is done.
@@ -315,6 +338,12 @@ func (g *Gateway) TrySubmit(scope *ScopeHandle, ipv4Packet []byte) (handled bool
 			return true, nil
 		}
 		tr.mu.Lock()
+		if tr.closed.Load() {
+			// Transport teardown already started; the device must not be
+			// touched after its close.
+			tr.mu.Unlock()
+			return true, nil
+		}
 		_, _ = tr.vt.Write([][]byte{ipv4Packet}, 0)
 		tr.mu.Unlock()
 		return true, nil
@@ -322,6 +351,36 @@ func (g *Gateway) TrySubmit(scope *ScopeHandle, ipv4Packet []byte) (handled bool
 	default:
 		return false, nil
 	}
+}
+
+// RetireScope releases the per-scope limiter bookkeeping immediately instead of
+// waiting for the scope-context watcher. It is memory-only and never blocks, so
+// a session-lifecycle owner may call it from a lock-protected retirement path;
+// the scope's transport is still torn down by the watcher that owns it once the
+// scope context is canceled.
+func (g *Gateway) RetireScope(scope policy.Scope) {
+	if g == nil || g.server == nil {
+		return
+	}
+	g.server.RetireScope(scope)
+}
+
+// ActiveTransports returns the number of live per-scope gateway TCP transports.
+func (g *Gateway) ActiveTransports() int {
+	if g == nil {
+		return 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.transports)
+}
+
+// ActiveSessionLimiters returns the number of live per-scope limiter entries.
+func (g *Gateway) ActiveSessionLimiters() int {
+	if g == nil || g.server == nil {
+		return 0
+	}
+	return g.server.ActiveSessionLimiters()
 }
 
 // BeginRetire permanently retires scope handle, cancels query contexts, and invalidates session cache.

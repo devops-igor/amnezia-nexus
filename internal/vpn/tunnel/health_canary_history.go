@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
@@ -13,6 +14,44 @@ type canaryResult struct {
 	tunnelID int64
 	sequence uint64
 }
+
+// canarySuccess is the recorded inner data-plane success that authorizes a NEW
+// admission onto an otherwise handshake-blocked backend (issue #731). Owned by
+// HealthProber.mu.
+//
+// It exists because the status label is not evidence: handshake_blocked is
+// written both when the inner canary SUCCEEDED under a failed outer handshake
+// and when it FAILED below the confirmation threshold while sessions exist. A
+// separate record also distinguishes "fresh success" from "never probed",
+// "stale success" and "failed since".
+//
+// deviceCreated binds the evidence to the exact backend device that answered
+// it, so a credential replacement, a detach/re-attach on the same tunnel ID, or
+// any other device swap cannot inherit an earlier device's verdict. tunnelID
+// binds it to the tunnel generation, because a server can be replaced by a new
+// tunnel row with a new ID.
+type canarySuccess struct {
+	tunnelID      int64
+	deviceCreated time.Time
+	at            time.Time
+}
+
+// DeviceGeneration is implemented by backend devices that can report their
+// creation stamp. It is an optional capability in the same composition style as
+// CanaryDevice, CanaryResponseDemuxer and ProxyStreamDevice: every production
+// backend device already exposes CreatedAt, so no device has to change.
+//
+// A device that cannot report a stamp cannot bind canary evidence to itself, so
+// admission treats its evidence as unusable and fails closed.
+type DeviceGeneration interface {
+	CreatedAt() time.Time
+}
+
+// canaryCadenceJitterCeiling is the maximum factor jitterDuration applies to the
+// configured probe interval (internal/vpn/tunnel/health_loop.go). Kept as a
+// named constant so the freshness bound below is visibly derived from the
+// existing cadence instead of introducing a product timer.
+const canaryCadenceJitterCeiling = 1.2
 
 func (hp *HealthProber) beginCanaryObservation() uint64 {
 	hp.mu.Lock()
@@ -25,7 +64,7 @@ func (hp *HealthProber) beginCanaryObservation() uint64 {
 // then pool.mu, held together across validation and mutation, never across I/O
 // or notification. Health-disabled tunnels may collect self-healing proof;
 // administratively disabled, replaced and superseded snapshots may not.
-func (hp *HealthProber) acceptCanaryObservation(t *models.BackendTunnel, sequence uint64, success bool) error {
+func (hp *HealthProber) acceptCanaryObservation(t *models.BackendTunnel, sequence uint64, success bool, deviceCreated time.Time) error {
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
 	if hp.pool != nil {
@@ -39,20 +78,167 @@ func (hp *HealthProber) acceptCanaryObservation(t *models.BackendTunnel, sequenc
 	if sequence <= previous.sequence {
 		return ErrStaleStateVersion
 	}
+	hp.ensureCanaryMapsLocked()
+	if success || previous.tunnelID != t.ID {
+		hp.canaryFailCounts[t.ServerID] = 0
+	}
+	if success {
+		hp.canarySuccesses[t.ServerID] = canarySuccess{
+			tunnelID:      t.ID,
+			deviceCreated: deviceCreated,
+			at:            hp.now(),
+		}
+	} else {
+		// Any accepted failure — including a single transient one below the
+		// confirmation threshold — withdraws the admission authority without
+		// touching the status label or established routes.
+		delete(hp.canarySuccesses, t.ServerID)
+		hp.canaryFailCounts[t.ServerID]++
+	}
+	hp.canaryResults[t.ServerID] = canaryResult{tunnelID: t.ID, sequence: sequence}
+
+	// Mirror the ACCEPTED verdict into the sanitized transition record. This runs
+	// inside the same critical section as the authoritative history write: a
+	// rejected (obsolete) observation never reaches here, so the diagnostic can
+	// never claim evidence the decision layer refused.
+	hp.mirrorInnerVerdictLocked(t, success, deviceCreated)
+	return nil
+}
+
+// mirrorInnerVerdictLocked records an ACCEPTED inner verdict in the sanitized
+// transition record. Callers hold hp.mu.
+//
+// Only the INNER half is written here. The outer half belongs to the probe path
+// that produced it, and overwriting it with the inner verdict would erase the
+// outer failure streak an operator needs to see. In the same spirit an inner
+// result never relabels an outer or attachment streak: each category is reported
+// as itself.
+func (hp *HealthProber) mirrorInnerVerdictLocked(t *models.BackendTunnel, success bool, deviceCreated time.Time) {
+	rec := hp.gateRecordLocked(t)
+	rec.lastAttemptInner = attemptOutcomeFor(success)
+	streakOwnedByInner := rec.failureCategory == FailureNone || rec.failureCategory == FailureInner
+
+	if success {
+		rec.lastSuccessAt = hp.now()
+		rec.lastSuccessDevice = deviceCreated
+		if !deviceCreated.IsZero() {
+			rec.deviceCreatedAt = deviceCreated
+		}
+		if streakOwnedByInner {
+			rec.failureCategory = FailureNone
+			rec.failureCount = 0
+			rec.failureThreshold = hp.cfg.FailureThreshold
+		}
+		return
+	}
+	if streakOwnedByInner {
+		rec.failureCategory = FailureInner
+		rec.failureCount = hp.canaryFailCounts[t.ServerID]
+		rec.failureThreshold = hp.cfg.FailureThreshold
+	}
+}
+
+// attemptOutcomeFor maps an accepted canary verdict onto the sanitized attempt
+// vocabulary.
+func attemptOutcomeFor(success bool) AttemptOutcome {
+	if success {
+		return OutcomeSuccess
+	}
+	return OutcomeFailure
+}
+
+// ensureCanaryMapsLocked allocates the canary history maps on first write.
+// Callers hold hp.mu.
+func (hp *HealthProber) ensureCanaryMapsLocked() {
 	if hp.canaryResults == nil {
 		hp.canaryResults = make(map[int64]canaryResult)
 	}
 	if hp.canaryFailCounts == nil {
 		hp.canaryFailCounts = make(map[int64]int)
 	}
-	if success || previous.tunnelID != t.ID {
-		hp.canaryFailCounts[t.ServerID] = 0
+	if hp.canarySuccesses == nil {
+		hp.canarySuccesses = make(map[int64]canarySuccess)
 	}
-	if !success {
-		hp.canaryFailCounts[t.ServerID]++
+}
+
+// CanaryAdmissible reports whether recorded inner data-plane evidence authorizes
+// a NEW admission onto t. It is a pure in-memory read: no I/O, no callbacks, no
+// pool lock, so it is safe on the admission path while Service.mu is held
+// (established order: Service.mu then prober mu; see Service.SetCanaryProbeFunc).
+//
+// The decision needs all of: the current generation to be enabled, a recorded
+// success for THIS tunnel ID, no failure since that success, the evidence to
+// come from the exact backend device still attached (deviceCreated), and the
+// evidence to be no older than the bound derived from the configured probe
+// cadence. A negative age (clock stepped backwards) is refused rather than
+// treated as fresh.
+//
+// It deliberately says nothing about status: admission keeps the
+// handshake_blocked label and only decides candidate eligibility.
+func (hp *HealthProber) CanaryAdmissible(t *models.BackendTunnel, deviceCreated time.Time) bool {
+	if hp == nil || t == nil || !t.Enabled || deviceCreated.IsZero() {
+		return false
 	}
-	hp.canaryResults[t.ServerID] = canaryResult{tunnelID: t.ID, sequence: sequence}
-	return nil
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	rec, ok := hp.canarySuccesses[t.ServerID]
+	if !ok || !rec.matches(t.ID, deviceCreated) {
+		return false
+	}
+	if hp.canaryFailCounts[t.ServerID] != 0 {
+		return false
+	}
+	return hp.evidenceFreshLocked(rec)
+}
+
+// matches reports whether this record belongs to the given tunnel generation and
+// the given backend device.
+func (r canarySuccess) matches(tunnelID int64, deviceCreated time.Time) bool {
+	return r.tunnelID == tunnelID && r.deviceCreated.Equal(deviceCreated)
+}
+
+// evidenceFreshLocked reports whether the record is within the derived freshness
+// bound. A negative age means the clock moved backwards, which is not freshness.
+// Callers hold hp.mu.
+func (hp *HealthProber) evidenceFreshLocked(rec canarySuccess) bool {
+	age := hp.now().Sub(rec.at)
+	return age >= 0 && age <= hp.maxCanaryEvidenceAgeLocked()
+}
+
+// maxCanaryEvidenceAgeLocked derives the freshness bound from the existing
+// health cadence: one jittered probe interval (a blocked backend is probed on
+// every sweep) plus one probe timeout. Healthy values therefore survive exactly
+// one missed sweep period; nothing here is an independent product timer.
+func (hp *HealthProber) maxCanaryEvidenceAgeLocked() time.Duration {
+	interval := hp.cfg.Interval
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	timeout := hp.cfg.Timeout
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	return time.Duration(float64(interval)*canaryCadenceJitterCeiling) + timeout
+}
+
+// now returns the prober's time source. Callers hold hp.mu.
+func (hp *HealthProber) now() time.Time {
+	if hp.nowFn != nil {
+		return hp.nowFn()
+	}
+	return time.Now()
+}
+
+// SetNowFuncForTest injects the prober's time source so freshness is decided
+// deterministically. Nil restores the wall clock. Test-only; production never
+// calls it.
+func (hp *HealthProber) SetNowFuncForTest(fn func() time.Time) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	hp.nowFn = fn
 }
 
 // checkCanaryGenerationLocked requires both hp.mu and pool.mu. Reused after
@@ -87,10 +273,21 @@ func (hp *HealthProber) canaryObservationCurrent(t *models.BackendTunnel, sequen
 	return nil
 }
 
-func isObsoleteCanary(err error) bool {
+// ObsoleteCanary reports whether a canary verdict was refused because the backend
+// it was measured against is no longer the backend that owns the server slot: a
+// deleted/re-created row, a replaced identity, a version that moved, an
+// administrative disable, or a canceled exchange.
+//
+// A caller that writes a terminal health effect from a canary verdict must consult
+// this first. Such a verdict is evidence about a generation that no longer exists,
+// so it may not be recorded as the CURRENT backend's health.
+func ObsoleteCanary(err error) bool {
 	return errors.Is(err, ErrTunnelNotFound) || errors.Is(err, ErrStaleStateVersion) ||
 		errors.Is(err, ErrTunnelDisabled) || errors.Is(err, context.Canceled)
 }
+
+// isObsoleteCanary is the package-internal name retained for the existing callers.
+func isObsoleteCanary(err error) bool { return ObsoleteCanary(err) }
 
 // CanaryFailureCount returns shared history only for the current tunnel identity.
 func (hp *HealthProber) CanaryFailureCount(tunnelID int64) int {

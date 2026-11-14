@@ -77,11 +77,26 @@ type HealthProber struct {
 	onActiveHook         func(ctx context.Context, tunnel *models.BackendTunnel) error
 	onSelfHealHook       func(ctx context.Context, tunnel *models.BackendTunnel) error
 	failCounts           map[int64]int
-	canaryFailCounts     map[int64]int
-	canarySequence       uint64
-	canaryResults        map[int64]canaryResult
-	autoDisabled         map[int64]bool
-	successCounts        map[int64]int
+	// hookFailCounts counts consecutive data-plane ATTACHMENT failures for a
+	// backend, independently of failCounts (outer handshake failures). The two
+	// observations are about different things, so neither may complete the
+	// other's consecutive threshold: one attachment failure after a long outer
+	// outage used to reach FailureThreshold immediately and withdraw a backend
+	// whose established data path had never been shown to be broken.
+	hookFailCounts   map[int64]int
+	canaryFailCounts map[int64]int
+	canarySequence   uint64
+	canaryResults    map[int64]canaryResult
+	// canarySuccesses records the last accepted inner success per server, bound
+	// to the tunnel generation and the backend device that produced it. It is
+	// the evidence a NEW admission onto a handshake-blocked backend needs; the
+	// status label is not.
+	canarySuccesses map[int64]canarySuccess
+	// nowFn is the injectable time source for evidence freshness. Nil means the
+	// wall clock. Swapped only by SetNowFuncForTest before a fixture reads it.
+	nowFn         func() time.Time
+	autoDisabled  map[int64]bool
+	successCounts map[int64]int
 	// Counter maps use server IDs for the public diagnostics API. This fence
 	// records which tunnel generation owns each server's counters.
 	healthGenerations    map[int64]int64
@@ -96,9 +111,37 @@ type HealthProber struct {
 	// complete when it was first attempted (F16). Invoked by the bounded
 	// self-healing sweep, never by the probe hot path.
 	selfHealFailoverRetrier func(ctx context.Context) int
-	stopCh                  chan struct{}
-	wg                      sync.WaitGroup
-	running                 bool
+	// proxyTrafficProbeFn performs the protocol-appropriate authenticated
+	// application exchange required before a proxy backend is admitted
+	// (finding F10). Nil falls back to the real VLESS/Naive traffic probes.
+	proxyTrafficProbeFn ProxyTrafficProbeFunc
+	// proxyCanaryDestination overrides the proxy payload canary destination for
+	// local fixtures only (SetProxyCanaryDestinationForTest). Empty in production,
+	// where the destination comes from the tunnel's own protocol parameters.
+	proxyCanaryDestination string
+	// pendingEnrollment marks backends still inside initial enrollment
+	// qualification. While set, handshake-only probe success must not promote
+	// the backend out of connecting.
+	pendingEnrollment map[int64]bool
+	// pendingEnrollmentGeneration records which TUNNEL GENERATION established each
+	// runtime quarantine. A removal identifies its own generation, so a release
+	// scheduled for a retired backend cannot clear the quarantine a replacement
+	// established in the same server slot after matcher.
+	pendingEnrollmentGeneration map[int64]int64
+	// pendingEnrollmentAttempt records WHICH ENROLLMENT of that generation
+	// established the quarantine. A deployment re-enrollment of an unchanged
+	// identity keeps the tunnel id, so generation equality alone cannot tell the
+	// new enrollment's gate from the previous one's; the attempt can.
+	pendingEnrollmentAttempt map[int64]uint64
+	// gateRecords holds the sanitized decision evidence behind each backend's
+	// current status: the last probe attempt, the failure streak and threshold,
+	// the last confirmed inner success, and the condition currently deciding
+	// eligibility. Fenced by tunnel generation, so a replaced backend's record is
+	// never read as the current verdict.
+	gateRecords map[int64]*gateRecord
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
+	running     bool
 }
 
 // NewHealthProber initializes a new HealthProber instance.
@@ -142,21 +185,273 @@ func NewHealthProber(pool *Pool, db *database.DB, cfg HealthConfig, probeFn ...P
 		pFn = probeFn[0]
 	}
 
-	return &HealthProber{
-		pool:              pool,
-		db:                db,
-		cfg:               cfg,
-		probeFn:           pFn,
-		probeVLESSFn:      vless.ProbeVLESSReality,
-		probeNaiveFn:      naive.ProbeNaiveProxy,
-		devices:           make(map[int64]PacketDevice),
-		failCounts:        make(map[int64]int),
-		canaryFailCounts:  make(map[int64]int),
-		autoDisabled:      make(map[int64]bool),
-		successCounts:     make(map[int64]int),
-		healthGenerations: make(map[int64]int64),
-		stopCh:            make(chan struct{}),
+	hp := &HealthProber{
+		pool:                        pool,
+		db:                          db,
+		cfg:                         cfg,
+		probeFn:                     pFn,
+		probeVLESSFn:                vless.ProbeVLESSReality,
+		probeNaiveFn:                naive.ProbeNaiveProxy,
+		devices:                     make(map[int64]PacketDevice),
+		failCounts:                  make(map[int64]int),
+		hookFailCounts:              make(map[int64]int),
+		canaryFailCounts:            make(map[int64]int),
+		autoDisabled:                make(map[int64]bool),
+		successCounts:               make(map[int64]int),
+		healthGenerations:           make(map[int64]int64),
+		pendingEnrollment:           make(map[int64]bool),
+		pendingEnrollmentGeneration: make(map[int64]int64),
+		pendingEnrollmentAttempt:    make(map[int64]uint64),
+		gateRecords:                 make(map[int64]*gateRecord),
+		stopCh:                      make(chan struct{}),
 	}
+	hp.restoreUnboundEnrollments(db)
+	hp.ownPoolEnrollmentLifecycle()
+	return hp
+}
+
+// restoreUnboundEnrollments restores durable enrollment marks that are not bound
+// to a tunnel row (the legacy form, and marks recorded by server-keyed callers).
+// A mark bound to a row belongs to that tunnel generation and is restored by the
+// pool when it loads the row, so a later qualification or removal of that row
+// releases it without this server-keyed copy outliving it.
+func (hp *HealthProber) restoreUnboundEnrollments(db *database.DB) {
+	if db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	owners, err := db.GetBackendPendingEnrollmentOwners(ctx)
+	if err != nil {
+		return
+	}
+	for sid, owner := range owners {
+		if owner == 0 {
+			hp.pendingEnrollment[sid] = true
+		}
+	}
+}
+
+// ownPoolEnrollmentLifecycle registers this prober as the runtime enrollment
+// owner for its pool, so a tunnel removal releases both markers. Split out of
+// NewHealthProber to keep that constructor's branching from growing.
+func (hp *HealthProber) ownPoolEnrollmentLifecycle() {
+	if hp == nil || hp.pool == nil {
+		return
+	}
+	hp.pool.SetEnrollmentReleaseHook(func(_ context.Context, serverID, retiredTunnelID int64, retiredAttempt uint64) {
+		hp.releaseRuntimeEnrollmentIfGeneration(serverID, retiredTunnelID, retiredAttempt)
+	})
+}
+
+// releaseRuntimeEnrollmentIfGeneration clears the server-keyed caller mark for a
+// server whose tunnel was just removed, only when the mark was established by the
+// SAME tunnel generation being retired (or by no known generation). It never writes
+// the durable setting: the pool removal owns that row. Nil-receiver and lock-order
+// safe: it takes only hp.mu and does no I/O.
+//
+// A release is scheduled from a removal, and the pool lock is not held while it
+// runs, so a replacement can be added and quarantined in that window. Without the
+// generation check the retired release would clear the replacement's gate and the
+// new backend would be admitted without qualification. retiredTunnelID is the
+// identity RemoveTunnel actually deleted; a marker owned by any other generation
+// is left untouched.
+//
+// Generation equality is not sufficient on its own for the same reason it is not
+// in the promotion fence: a deployment re-enrollment of an unchanged identity keeps
+// the tunnel id, so a release from the PREVIOUS enrollment of that row would clear
+// the new enrollment's gate. retiredAttempt (when non-zero) must therefore match
+// too. Callers without an attempt identity pass 0 and keep the original behavior.
+func (hp *HealthProber) releaseRuntimeEnrollmentIfGeneration(serverID, retiredTunnelID int64, retiredAttempt uint64) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	if !hp.markerOwnedByLocked(serverID, retiredTunnelID, retiredAttempt) {
+		return
+	}
+	hp.clearEnrollmentLocked(serverID)
+}
+
+// markerOwnedByLocked reports whether the caller mark for serverID was established by
+// the given generation and enrollment attempt. The caller must hold hp.mu.
+//
+// A zero half is "unattributed", not "matches": a marker with no recorded owner
+// predates generation tracking (it was rebuilt from durable state at startup), so it
+// cannot be attributed to a replacement and the retiring caller still owns it. A
+// non-zero half must match exactly, which is what stops a release from the PREVIOUS
+// enrollment of an unchanged row clearing the NEW enrollment's gate.
+func (hp *HealthProber) markerOwnedByLocked(serverID, tunnelID int64, attempt uint64) bool {
+	if hp.pendingEnrollment == nil || !hp.pendingEnrollment[serverID] {
+		return false
+	}
+	return ownerMatches(hp.pendingEnrollmentGeneration[serverID], tunnelID) &&
+		ownerMatches(hp.pendingEnrollmentAttempt[serverID], attempt)
+}
+
+// ownerMatches reports whether a recorded owner permits the caller to act. An
+// unattributed owner (0) or an unspecified caller (0) does not contradict the
+// caller; any two non-zero values must be equal. Kept separate so the generation and
+// attempt halves cannot drift apart in what "owned" means.
+func ownerMatches[T comparable](recorded, caller T) bool {
+	var zero T
+	return recorded == zero || caller == zero || recorded == caller
+}
+
+// ReleaseEnrollmentForAttempt releases the caller mark only when the given
+// enrollment attempt owns it, so a qualified attempt's release cannot clear the
+// quarantine of a later enrollment of the same unchanged row.
+func (hp *HealthProber) ReleaseEnrollmentForAttempt(serverID int64, attempt uint64) {
+	if hp == nil || attempt == 0 {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	if !hp.markerOwnedByLocked(serverID, 0, attempt) {
+		return
+	}
+	hp.clearEnrollmentLocked(serverID)
+}
+
+// SetPendingEnrollment sets whether a backend server is currently undergoing initial enrollment qualification.
+// While guarded, outer handshake-only probes will not commit active status, keeping the backend quarantined as connecting.
+func (hp *HealthProber) SetPendingEnrollment(serverID int64, pending bool) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	if pending {
+		// Bind the marker to the tunnel generation that now owns this server slot.
+		// Without it a retired removal cannot tell its own marker from a
+		// replacement's and would clear the wrong one.
+		var owner int64
+		if hp.pool != nil {
+			if cur, err := hp.pool.GetTunnel(serverID); err == nil && cur != nil {
+				owner = cur.ID
+			}
+		}
+		hp.markEnrollmentLocked(serverID, owner)
+	} else {
+		hp.clearEnrollmentLocked(serverID)
+	}
+	db := hp.db
+	hp.mu.Unlock()
+
+	if db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = db.SetBackendPendingEnrollment(ctx, serverID, pending)
+	}
+}
+
+// MarkEnrollmentForAttempt quarantines serverID on behalf of a specific enrollment
+// attempt of tunnelID, without touching the durable store.
+//
+// It exists so a caller that has ALREADY validated the attempt it acts on can bind
+// the runtime mark to that attempt instead of re-deriving it from whatever the row
+// holds by then. That re-derivation is exactly how a mark for a retired enrollment
+// ends up labeled with the current one, which then makes the current enrollment's
+// own qualification release look like a release of its own gate.
+func (hp *HealthProber) MarkEnrollmentForAttempt(serverID, tunnelID int64, attempt uint64) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	hp.markEnrollmentLocked(serverID, tunnelID)
+	if attempt != 0 {
+		if hp.pendingEnrollmentAttempt == nil {
+			hp.pendingEnrollmentAttempt = make(map[int64]uint64)
+		}
+		hp.pendingEnrollmentAttempt[serverID] = attempt
+	}
+}
+
+// MarkEnrollmentForGeneration quarantines serverID on behalf of the tunnel
+// generation tunnelID, without touching the durable store.
+//
+// It exists so a caller that has ALREADY validated the generation it acts on can
+// express that ownership exactly, instead of re-deriving it from whatever the
+// slot holds by the time the mark is written. Passing tunnelID <= 0 leaves the
+// recorded generation untouched, so an unknown owner stays unknown rather than
+// being silently attributed to the current row.
+func (hp *HealthProber) MarkEnrollmentForGeneration(serverID, tunnelID int64) {
+	if hp == nil {
+		return
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	hp.markEnrollmentLocked(serverID, tunnelID)
+}
+
+// ReleaseEnrollmentForGeneration releases the caller mark only when this
+// generation owns it, so a qualified backend's release cannot clear a
+// replacement's quarantine. Attempt 0 keeps the original generation-only
+// behavior for callers that have no attempt identity.
+func (hp *HealthProber) ReleaseEnrollmentForGeneration(serverID, tunnelID int64) {
+	hp.releaseRuntimeEnrollmentIfGeneration(serverID, tunnelID, 0)
+}
+
+// markEnrollmentLocked records the quarantine under hp.mu and binds it to
+// tunnelID when one is known. The caller must hold hp.mu.
+func (hp *HealthProber) markEnrollmentLocked(serverID, tunnelID int64) {
+	if hp.pendingEnrollment == nil {
+		hp.pendingEnrollment = make(map[int64]bool)
+	}
+	hp.pendingEnrollment[serverID] = true
+	if tunnelID <= 0 {
+		return
+	}
+	if hp.pendingEnrollmentGeneration == nil {
+		hp.pendingEnrollmentGeneration = make(map[int64]int64)
+	}
+	hp.pendingEnrollmentGeneration[serverID] = tunnelID
+	// The enrollment attempt is deliberately NOT re-derived from the live row here.
+	// A caller that knows which attempt it acts for says so explicitly
+	// (MarkEnrollmentForAttempt); deriving it would label a retired enrollment's
+	// mark with the current attempt, and that mislabel is what makes a stale
+	// release look authoritative.
+}
+
+// clearEnrollmentLocked drops both halves of the caller mark. The caller must
+// hold hp.mu.
+func (hp *HealthProber) clearEnrollmentLocked(serverID int64) {
+	delete(hp.pendingEnrollment, serverID)
+	delete(hp.pendingEnrollmentGeneration, serverID)
+	delete(hp.pendingEnrollmentAttempt, serverID)
+}
+
+// IsPendingEnrollment reports whether a backend server is currently undergoing initial enrollment qualification.
+//
+// Two owners can quarantine a server: an explicit server-keyed caller mark held
+// here, and the pool's quarantine of the deploy-enrolled tunnel generation now
+// registered for the server. The generation quarantine is committed by the pool
+// together with the row and released only by that row's qualification or removal,
+// so a deploy-created backend is quarantined from the moment it exists, whatever
+// order a caller's own marking or a retired generation's release arrives in.
+func (hp *HealthProber) IsPendingEnrollment(serverID int64) bool {
+	if hp == nil {
+		return false
+	}
+	hp.mu.RLock()
+	marked := hp.pendingEnrollment[serverID]
+	pool := hp.pool
+	hp.mu.RUnlock()
+	return marked || pool.EnrollmentPending(serverID)
+}
+
+// LatencyThresholdMS returns the configured latency threshold in milliseconds.
+func (hp *HealthProber) LatencyThresholdMS() int64 {
+	if hp == nil {
+		return 500
+	}
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	if hp.cfg.LatencyThresholdMS <= 0 {
+		return 500
+	}
+	return hp.cfg.LatencyThresholdMS
 }
 
 // SetMultiProtocolEnabled configures whether the prober inspects proxy tunnels.
@@ -201,9 +496,10 @@ func (hp *HealthProber) ResetFailCount(serverID int64) {
 	}
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
-	hp.failCounts[serverID] = 0
+	hp.resetFailureCountsLocked(serverID)
 	delete(hp.canaryFailCounts, serverID)
 	delete(hp.canaryResults, serverID)
+	delete(hp.canarySuccesses, serverID)
 	delete(hp.autoDisabled, serverID)
 	delete(hp.successCounts, serverID)
 	hp.recordCurrentGenerationLocked(serverID)
@@ -218,6 +514,38 @@ func (hp *HealthProber) GetFailCount(serverID int64) int {
 	hp.mu.RLock()
 	defer hp.mu.RUnlock()
 	return hp.failCounts[serverID]
+}
+
+// resetFailureCountsLocked clears every consecutive-failure category for a
+// backend. Callers hold hp.mu.
+//
+// Both categories are cleared together on purpose: a successful observation of
+// either kind (a completed outer handshake or a successful attachment) ends the
+// streak for the backend as a whole, and keeping the two in step here means no
+// future reset site can silently leave one category primed to combine with the
+// other later.
+func (hp *HealthProber) resetFailureCountsLocked(serverID int64) {
+	hp.failCounts[serverID] = 0
+	hp.hookFailCounts[serverID] = 0
+}
+
+// recordHookFailureLocked increments the consecutive data-plane attachment
+// failure count and returns it. This is a separate category from
+// failCounts (outer handshake failures), so it can only ever be completed by
+// further attachment failures. Callers hold hp.mu.
+func (hp *HealthProber) recordHookFailureLocked(serverID int64) int {
+	if hp.hookFailCounts == nil {
+		hp.hookFailCounts = make(map[int64]int)
+	}
+	hp.hookFailCounts[serverID]++
+	return hp.hookFailCounts[serverID]
+}
+
+// hookFailures returns the consecutive attachment-failure count for a server.
+func (hp *HealthProber) hookFailures(serverID int64) int {
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	return hp.hookFailCounts[serverID]
 }
 
 // GetCanaryFailCount returns the consecutive data-plane canary failure count for the given server ID.
@@ -246,7 +574,7 @@ func (hp *HealthProber) recordCurrentGenerationLocked(serverID int64) {
 		return
 	}
 	if previous := hp.healthGenerations[serverID]; previous != 0 && previous != current.ID {
-		hp.failCounts[serverID] = 0
+		hp.resetFailureCountsLocked(serverID)
 		delete(hp.autoDisabled, serverID)
 		delete(hp.successCounts, serverID)
 	}
@@ -269,7 +597,7 @@ func (hp *HealthProber) checkHealthGenerationLocked(t *models.BackendTunnel) err
 		}
 	}
 	if previous := hp.healthGenerations[t.ServerID]; previous != 0 && previous != t.ID {
-		hp.failCounts[t.ServerID] = 0
+		hp.resetFailureCountsLocked(t.ServerID)
 		delete(hp.autoDisabled, t.ServerID)
 		delete(hp.successCounts, t.ServerID)
 	}
@@ -402,6 +730,10 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 	if latencyMS > hp.cfg.LatencyThresholdMS {
 		status = "degraded"
 	}
+	isPending := hp.checkAndRecordPendingEnrollment(ctx, probeTarget.ServerID)
+	if isPending {
+		status = models.TunnelStatusConnecting
+	}
 
 	if status == "active" {
 		if err := hp.runActiveHookIfActive(ctx, snapshot, &probeTarget, status); err != nil {
@@ -419,6 +751,20 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 		}
 	}
 
+	// The outer exchange succeeded. Whether the inner data path confirmed is a
+	// separate observation, and for a protocol without an in-tunnel canary it was
+	// never taken - reported as not_run rather than assumed healthy.
+	hp.recordProbeAttempt(&probeTarget, OutcomeSuccess, hp.lastInnerOutcome(&probeTarget))
+
+	// A slow successful outer sample is not evidence that the inner plane was
+	// lost. Degraded status is exactly what makes established sessions
+	// migration-eligible, so an already-blocked backend that still serves
+	// sessions keeps its preservation status and only refreshes the latency
+	// diagnostic. Inner loss still reaches degraded above through the
+	// threshold path in verifyActiveEligibility, and fast recovery is unaffected
+	// because it computes "active", not "degraded".
+	status = hp.preservedProbeStatus(snapshot, &probeTarget, isBlocked, status)
+
 	// Re-check status before final status write
 	if err := hp.checkTunnelAvailable(&probeTarget); err != nil {
 		return 0, err
@@ -435,16 +781,37 @@ func (hp *HealthProber) ProbeTunnel(ctx context.Context, tunnel *models.BackendT
 }
 
 func (hp *HealthProber) commitActiveProbeSuccess(ctx context.Context, snapshot, probeTarget *models.BackendTunnel, status string, latencyMS int64) error {
+	// A backend still inside initial enrollment qualification must stay
+	// connecting even when the outer probe succeeded: handshake-only evidence is
+	// not admission evidence (finding F10).
+	isPending := hp.checkAndRecordPendingEnrollment(ctx, probeTarget.ServerID)
+	targetStatus := status
+	if isPending {
+		targetStatus = models.TunnelStatusConnecting
+	}
+	var committedVersion int64
 	if hp.pool != nil {
 		expectedVersion := probeTarget.StateVersion
 		if snapshot != nil && snapshot.StateVersion > 0 {
 			expectedVersion = snapshot.StateVersion
 		}
-		if err := hp.pool.SetTunnelStatusIfCurrentWithVersion(ctx, probeTarget.ServerID, probeTarget.ID, expectedVersion, status, latencyMS); err != nil {
+		if err := hp.pool.SetTunnelStatusIfCurrentWithVersion(ctx, probeTarget.ServerID, probeTarget.ID, expectedVersion, targetStatus, latencyMS); err != nil {
 			return err
 		}
 		probeTarget.StateVersion = expectedVersion + 1
+		committedVersion = probeTarget.StateVersion
 	}
+	// Record the gate at the version the write just produced, not the one it
+	// started from: the evidence must describe the state a reader will observe.
+	// Recording before the commit made the fresh record look stale by exactly one
+	// version, which is indistinguishable from "the row moved on".
+	gate := GateNone
+	if isPending {
+		// Outer success is not admission evidence, so this backend stays out of
+		// rotation on enrollment grounds rather than because its probe failed.
+		gate = GateEnrollmentQuarantine
+	}
+	hp.recordGateAtVersion(probeTarget, gate, hp.attachedDeviceCreatedAt(probeTarget), committedVersion)
 	if err := hp.checkTunnelAvailable(probeTarget); err != nil {
 		return err
 	}
@@ -453,7 +820,9 @@ func (hp *HealthProber) commitActiveProbeSuccess(ctx context.Context, snapshot, 
 		hp.mu.Unlock()
 		return err
 	}
-	hp.failCounts[probeTarget.ServerID] = 0
+	// A completed outer handshake (and, above, a successful attachment) ends the
+	// failure streak for this backend in every category.
+	hp.resetFailureCountsLocked(probeTarget.ServerID)
 
 	delete(hp.autoDisabled, probeTarget.ServerID)
 	delete(hp.successCounts, probeTarget.ServerID)
@@ -476,14 +845,7 @@ func (hp *HealthProber) verifyActiveEligibility(ctx context.Context, snapshot, p
 			if failures >= hp.cfg.FailureThreshold {
 				return false, hp.transitionToThresholdDisabled(ctx, snapshot)
 			}
-			hasActiveSessions := (snapshot != nil && snapshot.ActiveConnections > 0) ||
-				(probeTarget != nil && probeTarget.ActiveConnections > 0)
-			if hp.pool != nil {
-				if cur, err := hp.pool.GetTunnel(probeTarget.ServerID); err == nil && cur != nil && cur.ActiveConnections > 0 {
-					hasActiveSessions = true
-				}
-			}
-			if hasActiveSessions {
+			if hp.hasEstablishedSessions(snapshot, probeTarget) {
 				return false, hp.transitionToHandshakeBlocked(ctx, snapshot)
 			}
 			return false, hp.transitionToDegraded(ctx, snapshot)
@@ -498,6 +860,37 @@ func (hp *HealthProber) verifyActiveEligibility(ctx context.Context, snapshot, p
 	return true, nil
 }
 
+// hasEstablishedSessions reports whether a backend currently serves live
+// sessions, consulting the probe snapshots first and the pool when available.
+// Established sessions are the resource that blocked-backend preservation
+// protects, so every decision on this path asks the same question.
+func (hp *HealthProber) hasEstablishedSessions(snapshot, probeTarget *models.BackendTunnel) bool {
+	if snapshot != nil && snapshot.ActiveConnections > 0 {
+		return true
+	}
+	if probeTarget != nil && probeTarget.ActiveConnections > 0 {
+		return true
+	}
+	if hp.pool == nil || probeTarget == nil {
+		return false
+	}
+	cur, err := hp.pool.GetTunnel(probeTarget.ServerID)
+	return err == nil && cur != nil && cur.ActiveConnections > 0
+}
+
+// preservedProbeStatus keeps the blocked-backend preservation status when a slow
+// outer success carries no inner-loss evidence. It returns the final status the
+// caller should commit.
+func (hp *HealthProber) preservedProbeStatus(snapshot, probeTarget *models.BackendTunnel, isBlocked bool, status string) string {
+	if !isBlocked || status != models.TunnelStatusDegraded {
+		return status
+	}
+	if !hp.hasEstablishedSessions(snapshot, probeTarget) {
+		return status
+	}
+	return models.TunnelStatusHandshakeBlocked
+}
+
 func (hp *HealthProber) runActiveHookIfActive(ctx context.Context, snapshot, probeTarget *models.BackendTunnel, status string) error {
 	if status != "active" {
 		return nil
@@ -510,6 +903,28 @@ func (hp *HealthProber) runActiveHookIfActive(ctx context.Context, snapshot, pro
 	}
 	_, err := hp.executeActiveHook(ctx, snapshot, probeTarget)
 	return err
+}
+
+func (hp *HealthProber) checkAndRecordPendingEnrollment(ctx context.Context, serverID int64) bool {
+	hp.mu.Lock()
+	if ctx != nil && ctx.Value(DeployEnrollmentKey) != nil {
+		if hp.pendingEnrollment == nil {
+			hp.pendingEnrollment = make(map[int64]bool)
+		}
+		hp.pendingEnrollment[serverID] = true
+	}
+	isPending := hp.pendingEnrollment[serverID]
+	db := hp.db
+	pool := hp.pool
+	hp.mu.Unlock()
+	isPending = isPending || pool.EnrollmentPending(serverID)
+
+	if isPending && ctx != nil && ctx.Value(DeployEnrollmentKey) != nil && db != nil {
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = db.SetBackendPendingEnrollment(writeCtx, serverID, true)
+	}
+	return isPending
 }
 
 func (hp *HealthProber) executeActiveHook(ctx context.Context, snapshot, tunnel *models.BackendTunnel) (int64, error) {
@@ -545,378 +960,4 @@ func (hp *HealthProber) executeActiveHook(ctx context.Context, snapshot, tunnel 
 		}
 	}
 	return 0, nil
-}
-
-// reconcileThresholdAutoDisable reconciles a missed threshold auto-disable CAS update
-// caused by reverse failure ordering or concurrent state updates.
-func (hp *HealthProber) reconcileThresholdAutoDisable(ctx context.Context, serverID, expectedTunnelID int64) (bool, error) {
-	if hp.pool == nil {
-		return false, nil
-	}
-
-	currentTunnel, err := hp.pool.GetTunnel(serverID)
-	if err != nil {
-		return false, err
-	}
-	if currentTunnel == nil || currentTunnel.ID != expectedTunnelID {
-		return false, ErrTunnelNotFound
-	}
-
-	if !currentTunnel.Enabled {
-		slog.Info("threshold auto-disable CAS missed due to concurrent admin disable", "server_id", serverID)
-		return false, hp.updateHealthIfCurrent(currentTunnel, func() {
-			delete(hp.autoDisabled, serverID)
-			hp.failCounts[serverID] = 0
-		})
-	}
-
-	if currentTunnel.Status == models.TunnelStatusHandshakeBlocked {
-		return true, nil
-	}
-
-	if currentTunnel.Status == models.TunnelStatusDisabled && currentTunnel.DisableReason == models.DisableReasonHealth {
-		if err := hp.updateHealthIfCurrent(currentTunnel, func() {
-			hp.autoDisabled[serverID] = true
-			hp.successCounts[serverID] = 0
-		}); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-
-	hp.mu.Lock()
-	if err := hp.checkHealthGenerationLocked(currentTunnel); err != nil {
-		hp.mu.Unlock()
-		return false, err
-	}
-	count := hp.failCounts[serverID]
-	threshold := hp.cfg.FailureThreshold
-	hp.mu.Unlock()
-
-	if count < threshold {
-		return false, nil
-	}
-
-	swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
-		ctx,
-		serverID,
-		expectedTunnelID,
-		currentTunnel.Status,
-		currentTunnel.DisableReason,
-		currentTunnel.StateVersion,
-		models.TunnelStatusDisabled,
-		models.DisableReasonHealth,
-		0,
-	)
-	if casErr != nil {
-		return false, casErr
-	}
-	if swapped {
-		currentTunnel.StateVersion++
-		// This reconciliation IS the terminal health-disable commit for a
-		// sibling probe whose own CAS missed, so it owns the failover
-		// notification. The "already disabled/health" branch below does not:
-		// whoever committed that transition already notified.
-		if err := hp.commitThresholdDisable(ctx, currentTunnel); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-
-	cur, err := hp.pool.GetTunnel(serverID)
-	if err != nil {
-		return false, err
-	}
-	if cur == nil || cur.ID != expectedTunnelID {
-		return false, ErrTunnelNotFound
-	}
-	if !cur.Enabled {
-		slog.Info("threshold auto-disable reconciliation CAS missed due to concurrent admin disable", "server_id", serverID)
-		return false, hp.updateHealthIfCurrent(cur, func() {
-			delete(hp.autoDisabled, serverID)
-			hp.failCounts[serverID] = 0
-		})
-	}
-
-	if cur.Status == models.TunnelStatusDisabled && cur.DisableReason == models.DisableReasonHealth {
-		if err := hp.updateHealthIfCurrent(cur, func() {
-			hp.autoDisabled[serverID] = true
-			hp.successCounts[serverID] = 0
-		}); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-
-	return false, nil
-}
-
-func (hp *HealthProber) handleProbeFailure(ctx context.Context, snapshot *models.BackendTunnel, probeErr error) (int64, error) {
-	if hp.isTunnelAdminDisabled(snapshot.ServerID) {
-		hp.mu.Lock()
-		hp.failCounts[snapshot.ServerID] = 0
-		delete(hp.autoDisabled, snapshot.ServerID)
-		hp.mu.Unlock()
-		slog.Info("probe failed but tunnel was administratively disabled; ignoring failure", "server_id", snapshot.ServerID)
-		return 0, probeErr
-	}
-	hp.mu.Lock()
-	if err := hp.checkHealthGenerationLocked(snapshot); err != nil {
-		hp.mu.Unlock()
-		return 0, err
-	}
-	hp.failCounts[snapshot.ServerID]++
-	failures := hp.failCounts[snapshot.ServerID]
-	hp.mu.Unlock()
-
-	if err := hp.confirmOuterFailure(ctx, snapshot, failures); err != nil {
-		return 0, err
-	}
-	if err := hp.checkTunnelAvailable(snapshot); errors.Is(err, ErrTunnelNotFound) {
-		return 0, err
-	}
-
-	return 0, probeErr
-}
-
-func (hp *HealthProber) transitionToHandshakeBlocked(ctx context.Context, snapshot *models.BackendTunnel) error {
-	if hp.pool != nil {
-		swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
-			ctx,
-			snapshot.ServerID,
-			snapshot.ID,
-			snapshot.Status,
-			snapshot.DisableReason,
-			snapshot.StateVersion,
-			models.TunnelStatusHandshakeBlocked,
-			models.DisableReasonNone,
-			0,
-		)
-		if casErr != nil {
-			return casErr
-		}
-		if swapped {
-			snapshot.StateVersion++
-			snapshot.Status = models.TunnelStatusHandshakeBlocked
-			snapshot.DisableReason = models.DisableReasonNone
-			return hp.updateHealthIfCurrent(snapshot, func() {
-				delete(hp.autoDisabled, snapshot.ServerID)
-				hp.successCounts[snapshot.ServerID] = 0
-			})
-		}
-		cur, err := hp.pool.GetTunnel(snapshot.ServerID)
-		if err == nil && cur != nil && cur.Status == models.TunnelStatusHandshakeBlocked {
-			snapshot.StateVersion = cur.StateVersion
-			snapshot.Status = cur.Status
-			snapshot.DisableReason = cur.DisableReason
-		}
-		return nil
-	}
-	snapshot.Status = models.TunnelStatusHandshakeBlocked
-	snapshot.DisableReason = models.DisableReasonNone
-	return hp.updateHealthIfCurrent(snapshot, func() {
-		delete(hp.autoDisabled, snapshot.ServerID)
-		hp.successCounts[snapshot.ServerID] = 0
-	})
-}
-
-// commitThresholdDisable records the consecutive-failure bookkeeping for a
-// committed health auto-disable and, only when that write is accepted for the
-// current tunnel generation, reports the disable to the data plane owner so it
-// can migrate the sessions still pinned to the backend. A rejected write means
-// a newer generation owns this backend, so there is nothing to report.
-func (hp *HealthProber) commitThresholdDisable(ctx context.Context, snapshot *models.BackendTunnel) error {
-	if err := hp.updateHealthIfCurrent(snapshot, func() {
-		hp.autoDisabled[snapshot.ServerID] = true
-		hp.successCounts[snapshot.ServerID] = 0
-	}); err != nil {
-		return err
-	}
-	hp.notifyHealthDisabled(ctx, snapshot.ServerID, snapshot.ID)
-	return nil
-}
-
-func (hp *HealthProber) transitionToThresholdDisabled(ctx context.Context, snapshot *models.BackendTunnel) error {
-	if hp.pool != nil {
-		swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
-			ctx,
-			snapshot.ServerID,
-			snapshot.ID,
-			snapshot.Status,
-			snapshot.DisableReason,
-			snapshot.StateVersion,
-			models.TunnelStatusDisabled,
-			models.DisableReasonHealth,
-			0,
-		)
-		if casErr != nil {
-			return casErr
-		}
-		if swapped {
-			snapshot.StateVersion++
-			snapshot.Status = models.TunnelStatusDisabled
-			snapshot.DisableReason = models.DisableReasonHealth
-			// Terminal health disable committed: hand the established sessions
-			// pinned to this backend to the data plane owner so it can migrate
-			// them. Runs outside hp.mu/pool.mu and is idempotent.
-			return hp.commitThresholdDisable(ctx, snapshot)
-		}
-		reconciled, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID, snapshot.ID)
-		if recErr != nil {
-			return recErr
-		}
-		if !reconciled {
-			hp.mu.Lock()
-			if hp.failCounts[snapshot.ServerID] > 0 {
-				hp.failCounts[snapshot.ServerID]--
-			}
-			hp.mu.Unlock()
-		}
-		return nil
-	}
-	snapshot.Status = models.TunnelStatusDisabled
-	snapshot.DisableReason = models.DisableReasonHealth
-	return hp.updateHealthIfCurrent(snapshot, func() {
-		hp.autoDisabled[snapshot.ServerID] = true
-		hp.successCounts[snapshot.ServerID] = 0
-	})
-}
-
-func (hp *HealthProber) transitionToDegraded(ctx context.Context, snapshot *models.BackendTunnel) error {
-	if snapshot.Status == "degraded" {
-		return nil
-	}
-	if hp.pool != nil {
-		swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
-			ctx, snapshot.ServerID, snapshot.ID, snapshot.Status, snapshot.DisableReason, snapshot.StateVersion, "degraded", snapshot.DisableReason, 0)
-		if casErr != nil {
-			return casErr
-		}
-		if !swapped {
-			slog.Debug("probe degraded CAS missed due to concurrent tunnel update",
-				"server_id", snapshot.ServerID, "expected_status", snapshot.Status, "expected_version", snapshot.StateVersion)
-			hp.mu.Lock()
-			if hp.failCounts[snapshot.ServerID] > 0 {
-				hp.failCounts[snapshot.ServerID]--
-			}
-			hp.mu.Unlock()
-			if hp.isTunnelAdminDisabled(snapshot.ServerID) {
-				return hp.updateHealthIfCurrent(snapshot, func() {
-					hp.failCounts[snapshot.ServerID] = 0
-					delete(hp.autoDisabled, snapshot.ServerID)
-				})
-			}
-			return nil
-		}
-		snapshot.StateVersion++
-	}
-	snapshot.Status = "degraded"
-	return hp.updateHealthIfCurrent(snapshot, func() {
-		hp.successCounts[snapshot.ServerID] = 0
-	})
-}
-
-func (hp *HealthProber) handleHookFailure(ctx context.Context, snapshot *models.BackendTunnel, hookErr error) (int64, error) {
-	if errors.Is(hookErr, ErrTunnelDisabled) || errors.Is(hp.checkTunnelAvailable(snapshot), ErrTunnelDisabled) || hp.isTunnelAdminDisabled(snapshot.ServerID) {
-		hp.mu.Lock()
-		hp.failCounts[snapshot.ServerID] = 0
-		delete(hp.autoDisabled, snapshot.ServerID)
-		hp.mu.Unlock()
-		slog.Info("data-plane hook failed because tunnel was administratively disabled", "server_id", snapshot.ServerID)
-		return 0, ErrTunnelDisabled
-	}
-	hp.mu.Lock()
-	if err := hp.checkHealthGenerationLocked(snapshot); err != nil {
-		hp.mu.Unlock()
-		return 0, err
-	}
-	hp.failCounts[snapshot.ServerID]++
-	failures := hp.failCounts[snapshot.ServerID]
-	hp.mu.Unlock()
-
-	if failures >= hp.cfg.FailureThreshold {
-		if hp.pool != nil {
-			swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
-				ctx,
-				snapshot.ServerID,
-				snapshot.ID,
-				snapshot.Status,
-				snapshot.DisableReason,
-				snapshot.StateVersion,
-				"disabled",
-				models.DisableReasonHealth,
-				0,
-			)
-			if casErr != nil {
-				return 0, casErr
-			}
-			if swapped {
-				snapshot.StateVersion++
-				if err := hp.commitThresholdDisable(ctx, snapshot); err != nil {
-					return 0, err
-				}
-			} else {
-				reconciled, recErr := hp.reconcileThresholdAutoDisable(ctx, snapshot.ServerID, snapshot.ID)
-				if recErr != nil {
-					return 0, recErr
-				}
-				if !reconciled {
-					hp.mu.Lock()
-					if hp.failCounts[snapshot.ServerID] > 0 {
-						hp.failCounts[snapshot.ServerID]--
-					}
-					hp.mu.Unlock()
-				}
-			}
-		} else {
-			if err := hp.updateHealthIfCurrent(snapshot, func() {
-				hp.autoDisabled[snapshot.ServerID] = true
-				hp.successCounts[snapshot.ServerID] = 0
-			}); err != nil {
-				return 0, err
-			}
-		}
-	} else if hp.pool != nil {
-		swapped, casErr := hp.pool.CompareAndSwapTunnelStatusForTunnel(
-			ctx,
-			snapshot.ServerID,
-			snapshot.ID,
-			snapshot.Status,
-			snapshot.DisableReason,
-			snapshot.StateVersion,
-			"degraded",
-			snapshot.DisableReason,
-			0,
-		)
-		if casErr != nil {
-			return 0, casErr
-		}
-		if !swapped {
-			slog.Debug("hook failure degraded CAS missed due to concurrent tunnel update",
-				"server_id", snapshot.ServerID,
-				"expected_status", snapshot.Status,
-				"expected_version", snapshot.StateVersion,
-			)
-			hp.mu.Lock()
-			if hp.failCounts[snapshot.ServerID] > 0 {
-				hp.failCounts[snapshot.ServerID]--
-			}
-			hp.mu.Unlock()
-			if hp.isTunnelAdminDisabled(snapshot.ServerID) {
-				if err := hp.updateHealthIfCurrent(snapshot, func() {
-					hp.failCounts[snapshot.ServerID] = 0
-					delete(hp.autoDisabled, snapshot.ServerID)
-				}); err != nil {
-					return 0, err
-				}
-			}
-		} else {
-			snapshot.StateVersion++
-		}
-	}
-	if err := hp.checkTunnelAvailable(snapshot); errors.Is(err, ErrTunnelNotFound) {
-		return 0, err
-	}
-
-	return 0, fmt.Errorf("data-plane readiness check failed: %w", hookErr)
 }

@@ -25,6 +25,7 @@ from tests.e2e.conftest import (
     api_get,
     api_post,
 )
+from tests.e2e.prerequisites import require
 
 logger = logging.getLogger(__name__)
 
@@ -235,8 +236,7 @@ def test_vless_reality_install_modal_ui(
     page = authenticated_page
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
-    if not servers:
-        pytest.skip("No servers available to test VLESS installation modal")
+    require(servers, "No servers available to test VLESS installation modal")
 
     server_id = servers[0]["id"]
     page.goto(f"{base_url}/server/{server_id}")
@@ -364,8 +364,7 @@ def test_reality_sni_scanner_ui_flow(
     page = authenticated_page
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
-    if not servers:
-        pytest.skip("No servers available to test REALITY SNI scanner UI")
+    require(servers, "No servers available to test REALITY SNI scanner UI")
 
     server_id = servers[0]["id"]
     page.goto(f"{base_url}/server/{server_id}")
@@ -470,8 +469,7 @@ def test_naiveproxy_install_modal_ui_flow(
     page = authenticated_page
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
-    if not servers:
-        pytest.skip("No servers available to test NaiveProxy installation modal")
+    require(servers, "No servers available to test NaiveProxy installation modal")
 
     server_id = servers[0]["id"]
     page.goto(f"{base_url}/server/{server_id}")
@@ -507,10 +505,10 @@ def test_naiveproxy_install_modal_ui_flow(
     port_input.fill("8443")
     expect(port_input).to_have_value("8443")
 
-    # Verify decoy selection
+    # Verify decoy selection defaults to the shipped template's selected option
     decoy_select = modal.locator("#installNaiveDecoy")
     expect(decoy_select).to_be_visible()
-    expect(decoy_select).to_have_value("default")
+    expect(decoy_select).to_have_value("minecraft")
 
     captured_install: Dict[str, Any] = {}
 
@@ -554,7 +552,7 @@ def test_naiveproxy_install_modal_ui_flow(
         assert str(captured_install.get("port")) == "8443"
         naive_opts = captured_install.get("naive_options", {})
         assert naive_opts.get("domain") == "proxy.example.com"
-        assert naive_opts.get("decoy_template") == "default"
+        assert naive_opts.get("decoy_template") == "minecraft"
 
         # Complete installation via Done button
         done_div = modal.locator("#installDone")
@@ -581,8 +579,7 @@ def test_protocol_uninstall_modal_ui_flow(
     page = authenticated_page
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
-    if not servers:
-        pytest.skip("No servers available to test protocol uninstallation")
+    require(servers, "No servers available to test protocol uninstallation")
 
     server_id = servers[0]["id"]
     page.goto(f"{base_url}/server/{server_id}")

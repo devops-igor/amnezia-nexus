@@ -361,6 +361,11 @@ type SubjectServer struct {
 	adapter      *returnStackDevice
 	closed       bool
 	mu           sync.Mutex
+
+	echoWG     sync.WaitGroup // echo goroutines; a netstack WriteNotify send runs inside their writes
+	acceptDone chan struct{}
+	connMu     sync.Mutex
+	conns      []net.Conn
 }
 
 // HarnessClient is an upstream AWG client device attached to netstack.
@@ -584,13 +589,22 @@ func (h *DifferentialHarness) StartSubjectServer() (*SubjectServer, error) {
 }
 
 func (s *SubjectServer) startEchoWorkers() {
+	s.acceptDone = make(chan struct{})
+	s.echoWG.Add(2)
 	go func() {
+		defer s.echoWG.Done()
+		defer close(s.acceptDone)
 		for {
 			c, err := s.tcpListener.Accept()
 			if err != nil {
 				return
 			}
+			s.connMu.Lock()
+			s.conns = append(s.conns, c)
+			s.connMu.Unlock()
+			s.echoWG.Add(1)
 			go func(conn net.Conn) {
+				defer s.echoWG.Done()
 				defer conn.Close()
 				_, _ = io.Copy(conn, conn)
 			}(c)
@@ -598,6 +612,7 @@ func (s *SubjectServer) startEchoWorkers() {
 	}()
 
 	go func() {
+		defer s.echoWG.Done()
 		buf := make([]byte, 4096)
 		for {
 			n, remote, err := s.udpConn.ReadFrom(buf)
@@ -608,6 +623,34 @@ func (s *SubjectServer) startEchoWorkers() {
 			_, _ = s.udpConn.WriteTo(pkt, remote)
 		}
 	}()
+}
+
+// stopEchoWorkers closes the echo listeners and every accepted conn, then joins all echo
+// goroutines, so no write into the backend netstack is still in flight when its TUN channel
+// is closed. The backend return reader must keep draining while this joins: an echo producer
+// blocked in netstack WriteNotify only completes once that reader takes the packet.
+func (s *SubjectServer) stopEchoWorkers() []error {
+	var errs []error
+	if s.tcpListener != nil {
+		if err := s.tcpListener.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if s.udpConn != nil {
+		if err := s.udpConn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if s.acceptDone != nil {
+		<-s.acceptDone // no further conns can be accepted after this
+	}
+	s.connMu.Lock()
+	for _, c := range s.conns {
+		_ = c.Close()
+	}
+	s.connMu.Unlock()
+	s.echoWG.Wait()
+	return errs
 }
 
 // Close stops the subject Nexus engine and backend pumps.
@@ -626,15 +669,10 @@ func (s *SubjectServer) Close() error {
 		}
 	}
 	s.svc.forwarder.StopPumps()
+	errs = append(errs, s.stopEchoWorkers()...)
 	if s.adapter != nil {
 		_ = s.adapter.Close()
 		<-s.backendDone
-	}
-	if s.tcpListener != nil {
-		_ = s.tcpListener.Close()
-	}
-	if s.udpConn != nil {
-		_ = s.udpConn.Close()
 	}
 	return errors.Join(errs...)
 }

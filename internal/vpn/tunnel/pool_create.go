@@ -17,6 +17,12 @@ type BackendTunnelOptions struct {
 	ProtocolParams json.RawMessage
 }
 
+type deployEnrollmentContextKey struct{}
+
+// DeployEnrollmentKey is used in context to signal that initial enrollment
+// should start in non-eligible connecting status until traffic is qualified.
+var DeployEnrollmentKey = deployEnrollmentContextKey{}
+
 // AddTunnel establishes or registers an in-process AWG backend tunnel for a server.
 // Optional options allow specifying protocol and protocol parameters.
 func (p *Pool) AddTunnel(ctx context.Context, serverID int64, endpoint, serverPubKey string, opts ...BackendTunnelOptions) (*models.BackendTunnel, error) {
@@ -112,7 +118,7 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 				ProbePrivateKey: candProbePrivKey,
 				Protocol:        models.ProtocolAWG,
 			}
-			changed := !models.SameTunnelIdentity(existing, &cand)
+			changed := !models.SameTunnelIdentity(existing, &cand) || (ctx != nil && ctx.Value(DeployEnrollmentKey) != nil)
 
 			candStateVersion := existing.StateVersion
 			if changed {
@@ -132,7 +138,7 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 				if changed {
 					updates["state_version"] = candStateVersion
 				}
-				if err := p.db.UpdateBackendTunnel(ctx, existing.ID, updates); err != nil {
+				if err := p.persistTunnelEnrollment(ctx, existing, updates); err != nil {
 					return nil, fmt.Errorf("failed to persist backend tunnel updates: %w", err)
 				}
 			}
@@ -141,6 +147,7 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 			existing.PublicKey = candPubKey
 			existing.PrivateKey = candPrivKey
 			existing.ProbePrivateKey = candProbePrivKey
+			p.resetTunnelEnrollmentLocked(ctx, existing)
 			if changed {
 				existing.StateVersion = candStateVersion
 			}
@@ -155,7 +162,7 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 			Protocol:       proto,
 			ProtocolParams: bytes.Clone(opts.ProtocolParams),
 		}
-		changed := !models.SameTunnelIdentity(existing, &cand)
+		changed := !models.SameTunnelIdentity(existing, &cand) || (ctx != nil && ctx.Value(DeployEnrollmentKey) != nil)
 
 		candStateVersion := existing.StateVersion
 		if changed {
@@ -174,7 +181,7 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 			if changed {
 				updates["state_version"] = candStateVersion
 			}
-			if err := p.db.UpdateBackendTunnel(ctx, existing.ID, updates); err != nil {
+			if err := p.persistTunnelEnrollment(ctx, existing, updates); err != nil {
 				return nil, fmt.Errorf("failed to persist backend tunnel updates: %w", err)
 			}
 		}
@@ -182,6 +189,7 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 		existing.Endpoint = endpoint
 		existing.Protocol = proto
 		existing.ProtocolParams = bytes.Clone(opts.ProtocolParams)
+		p.resetTunnelEnrollmentLocked(ctx, existing)
 		if changed {
 			existing.StateVersion = candStateVersion
 		}
@@ -217,6 +225,12 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 		_ = probePrivPub
 
 		ifName := fmt.Sprintf("awg-be-%d", serverID)
+		initStatus := models.TunnelStatusActive
+		initLatency := int64(10)
+		if ctx != nil && (ctx.Value(DeployEnrollmentKey) != nil || opts.Protocol != "") {
+			initStatus = models.TunnelStatusConnecting
+			initLatency = 0
+		}
 		tunnel = &models.BackendTunnel{
 			ServerID:          serverID,
 			InterfaceName:     ifName,
@@ -225,11 +239,11 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 			ProbePrivateKey:   probePrivKey,
 			Endpoint:          endpoint,
 			Enabled:           true,
-			Status:            models.TunnelStatusActive,
+			Status:            initStatus,
 			DisableReason:     models.DisableReasonNone,
 			StateVersion:      1,
-			LastHealthCheck:   &now,
-			LatencyMS:         10,
+			LastHealthCheck:   nil,
+			LatencyMS:         initLatency,
 			ActiveConnections: 0,
 			CreatedAt:         now,
 			Protocol:          models.ProtocolAWG,
@@ -255,9 +269,9 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 	}
 
 	if p.db != nil {
-		id, err := p.db.CreateBackendTunnel(ctx, tunnel)
+		id, err := p.persistNewTunnel(ctx, tunnel)
 		if err != nil {
-			return nil, fmt.Errorf("failed to persist backend tunnel: %w", err)
+			return nil, err
 		}
 		tunnel.ID = id
 	} else {
@@ -267,7 +281,35 @@ func (p *Pool) AddTunnelWithConfig(ctx context.Context, serverID int64, endpoint
 	p.tunnelsByServerID[serverID] = tunnel
 	p.tunnelsByID[tunnel.ID] = tunnel
 	p.tunnelsByIfName[tunnel.InterfaceName] = tunnel
+	if isDeployEnrollment(ctx) {
+		// A deploy-created backend is its own first enrollment attempt; a
+		// qualification of it may only admit that attempt.
+		p.beginEnrollmentAttemptLocked(tunnel)
+	}
 
 	copyTunnel := *tunnel
 	return &copyTunnel, nil
+}
+
+// persistNewTunnel inserts a new backend row. A deploy-context add is an
+// unqualified enrollment, so its row and its durable quarantine commit in one
+// transaction: a failure leaves neither behind, and there is no compensating
+// delete that could itself fail and leave an unquarantined row for the next
+// startup to admit.
+func (p *Pool) persistNewTunnel(ctx context.Context, tunnel *models.BackendTunnel) (int64, error) {
+	if !isDeployEnrollment(ctx) {
+		id, err := p.db.CreateBackendTunnel(ctx, tunnel)
+		if err != nil {
+			return 0, fmt.Errorf("failed to persist backend tunnel: %w", err)
+		}
+		return id, nil
+	}
+	// Bounded, and still bound to the caller: a canceled deployment creates nothing.
+	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	id, err := p.db.CreateBackendTunnelWithEnrollment(writeCtx, tunnel)
+	if err != nil {
+		return 0, fmt.Errorf("failed to persist quarantined backend tunnel for server %d: %w", tunnel.ServerID, err)
+	}
+	return id, nil
 }

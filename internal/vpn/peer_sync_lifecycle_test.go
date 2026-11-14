@@ -584,7 +584,8 @@ func TestPeerSyncQueuedNotificationsAllDrain(t *testing.T) {
 //
 // It is driven through the same helpers the worker itself calls — not a
 // replica of the logic — because the interleaving has no seam a scheduler can
-// be made to land on deterministically.
+// be made to land on deterministically. The live pass is served by the REAL
+// restarted worker, the token's sole claimant.
 func TestPeerSyncRetiredGenerationCannotClobberLiveAccounting(t *testing.T) {
 	ctx := t.Context()
 	withSyncTestBounds(t)
@@ -596,6 +597,12 @@ func TestPeerSyncRetiredGenerationCannotClobberLiveAccounting(t *testing.T) {
 	}
 	gate := newGatedPortalDevice(2)
 	ps.setPortalDeviceForTest(gate)
+	// Release the parked passes before t.Cleanup teardown, so a failed
+	// assertion cannot strand them.
+	var releaseOnce [2]sync.Once
+	release := func(i int) { releaseOnce[i].Do(func() { close(gate.releases[i]) }) }
+	defer release(1)
+	defer release(0)
 
 	// Generation 1 takes a token and parks inside its pass.
 	ps.enqueuePeerReconcile()
@@ -616,7 +623,7 @@ func TestPeerSyncRetiredGenerationCannotClobberLiveAccounting(t *testing.T) {
 		t.Fatalf("stop settled the queued count to %d, want 0", got)
 	}
 
-	// A retired token is refused and must not decrement the settled count.
+	// A retired token is refused, without decrementing the settled count.
 	if ps.beginNotifyPass(retiredGen) {
 		t.Fatal("a retired generation claimed a token after its stop settled the queue")
 	}
@@ -635,29 +642,39 @@ func TestPeerSyncRetiredGenerationCannotClobberLiveAccounting(t *testing.T) {
 	if liveGen == retiredGen {
 		t.Fatal("restart reused the retired generation number")
 	}
-	if !ps.beginNotifyPass(liveGen) {
-		t.Fatal("the live generation could not claim its own token")
+	// The REAL live worker is the sole claimant of the accepted token: the
+	// fixture never claims it too. It raises the marker and settles the count
+	// in one lcMu section, so a settled count proves the claim, without a sleep.
+	for got, deadline := ps.pending.Load(), time.Now().Add(syncTestBound); got != 0; got = ps.pending.Load() {
+		if got < 0 {
+			t.Fatalf("queued count underflowed to %d: claimed twice", got)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("live worker never claimed the token: queued=%d", got)
+		}
+		runtime.Gosched()
 	}
-	if !ps.running.Load() {
-		t.Fatal("running marker not set for the live generation's pass")
+	ps.lcMu.Lock()
+	livePassRuns := ps.running.Load() && ps.runOwner == liveGen
+	ps.lcMu.Unlock()
+	if !livePassRuns {
+		t.Fatal("the live generation does not own the running marker for its own pass")
 	}
-
-	// The retired worker finishes its pass now. It must not clear the live
-	// generation's marker.
+	// The retired generation finishes now, while its successor owns the marker.
 	ps.endNotifyPass(retiredGen, 0, nil)
 	if !ps.running.Load() {
 		t.Fatal("retired generation cleared the live generation's running marker: quiesce would report a false convergence")
 	}
-	// The live generation's own completion does clear it.
-	ps.endNotifyPass(liveGen, 0, nil)
+	release(0)
+	waitGateEntered(t, gate, 2)
+	release(1)
+	waitQuiesced(t, ps)
 	if ps.running.Load() {
 		t.Fatal("live generation could not clear its own running marker")
 	}
-
-	// Unwedge both parked passes so the workers can exit.
-	close(gate.releases[0])
-	close(gate.releases[1])
-	waitQuiesced(t, ps)
+	if got := ps.pending.Load(); got != 0 {
+		t.Fatalf("queued count after the live pass = %d, want 0", got)
+	}
 }
 
 // TestPeerSyncRestartKeepsGenerationAccountingSeparate is the end-to-end

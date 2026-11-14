@@ -6,6 +6,7 @@ import pytest
 from playwright.sync_api import Page, Request, expect
 
 from tests.e2e.conftest import api_get, api_post, assert_response_shape
+from tests.e2e.prerequisites import require
 
 
 @pytest.mark.e2e
@@ -34,8 +35,7 @@ def test_server_detail_page(authenticated_page: Page, base_url: str) -> None:
 
     servers = result if isinstance(result, list) else result.get("servers", [])
 
-    if not servers:
-        pytest.skip("No servers available to test detail page")
+    require(servers, "No servers available to test detail page")
 
     # Validate server list response shape
     for item in servers:
@@ -61,8 +61,7 @@ def test_server_check(authenticated_page: Page, base_url: str, csrf_token: str) 
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
 
-    if not servers:
-        pytest.skip("No servers available to test check")
+    require(servers, "No servers available to test check")
 
     server_id = servers[0]["id"]
     check_result = api_post(page, f"/api/servers/{server_id}/check", {}, csrf_token)
@@ -88,8 +87,7 @@ def test_server_install(authenticated_page: Page, base_url: str, csrf_token: str
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
 
-    if not servers:
-        pytest.skip("No servers available to test install")
+    require(servers, "No servers available to test install")
 
     server_id = servers[0]["id"]
     install_result = api_post(page, f"/api/servers/{server_id}/install", {}, csrf_token)
@@ -106,8 +104,7 @@ def test_server_stats(authenticated_page: Page, base_url: str, csrf_token: str) 
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
 
-    if not servers:
-        pytest.skip("No servers available to test stats")
+    require(servers, "No servers available to test stats")
 
     server_id = servers[0]["id"]
     stats_result = api_post(page, f"/api/servers/{server_id}/stats", {}, csrf_token)
@@ -151,8 +148,7 @@ def test_server_reboot(authenticated_page: Page, base_url: str, csrf_token: str)
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
 
-    if not servers:
-        pytest.skip("No servers available to test reboot")
+    require(servers, "No servers available to test reboot")
 
     server_id = servers[0]["id"]
     reboot_result = api_post(page, f"/api/servers/{server_id}/reboot", {}, csrf_token)
@@ -170,8 +166,7 @@ def test_server_edit_host_ui_validation(authenticated_page: Page, base_url: str)
 
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
-    if not servers:
-        pytest.skip("No servers available to test edit host")
+    require(servers, "No servers available to test edit host")
 
     server_id = servers[0]["id"]
     card = page.locator(f"#server-{server_id}")
@@ -224,8 +219,7 @@ def test_server_edit_host_ui_lifecycle(
 
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
-    if not servers:
-        pytest.skip("No servers available to test edit host lifecycle")
+    require(servers, "No servers available to test edit host lifecycle")
 
     first_server = servers[0]
     server_id = first_server["id"]

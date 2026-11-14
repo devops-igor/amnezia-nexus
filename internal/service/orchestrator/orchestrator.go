@@ -14,6 +14,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/userops"
+	"golang.org/x/sync/singleflight"
 )
 
 // ProtocolResolver resolves a ProtocolManager by protocol name.
@@ -76,6 +77,11 @@ type Orchestrator struct {
 	probeFailCounts   map[int64]int
 	probeFailVersions map[int64]int64
 	canaryFailCounts  map[int64]int
+
+	// probeIdentityGroup coalesces concurrent health-probe identity resolutions
+	// per server so one backend never receives two competing registrations in the
+	// same cycle. It is independent of mu and never held across mu.
+	probeIdentityGroup singleflight.Group
 
 	running     bool
 	cancel      context.CancelFunc

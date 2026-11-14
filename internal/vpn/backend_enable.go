@@ -455,6 +455,10 @@ func (s *Service) finishEnableBackend(
 	if err := pool.SetTunnelEnabled(ctx, serverID, true, models.DisableReasonNone); err != nil {
 		return fmt.Errorf("failed to persist administrative backend enable: %w", err)
 	}
+	// The enrollment committed administratively AND was admitted to the pool:
+	// this attempt now owns the server's runtime caller mark, so its own
+	// qualification can release it.
+	s.adoptCommittedEnrollmentAttempt(ctx, currTun)
 	if legacyAdminOnlyState {
 		// Legacy rows encoded administrative disable in runtime status. Once
 		// enabled is authoritative, that old status has no trustworthy health

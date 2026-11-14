@@ -80,7 +80,14 @@ func (d *DB) CountServers(ctx context.Context) (int, error) {
 func (d *DB) CreateServer(ctx context.Context, s *models.Server) (int64, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
+	return d.insertServer(ctx, d.sqlDB, s)
+}
 
+type serverInserter interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func (d *DB) insertServer(ctx context.Context, db serverInserter, s *models.Server) (int64, error) {
 	encPass := s.SSHPass
 	encKey := s.SSHKey
 	if s.SSHPass != "" && !security.LooksLikeFernetToken(s.SSHPass) {
@@ -114,12 +121,12 @@ func (d *DB) CreateServer(ctx context.Context, s *models.Server) (int64, error) 
 
 	var res sql.Result
 	if s.ID > 0 {
-		res, err = d.sqlDB.ExecContext(ctx,
+		res, err = db.ExecContext(ctx,
 			"INSERT INTO servers (id, name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			s.ID, s.Name, s.Host, s.SSHUser, s.SSHPort, encPass, encKey, string(protoBytes), createdAtStr,
 		)
 	} else {
-		res, err = d.sqlDB.ExecContext(ctx,
+		res, err = db.ExecContext(ctx,
 			"INSERT INTO servers (name, host, ssh_user, ssh_port, ssh_pass, ssh_key, protocols, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 			s.Name, s.Host, s.SSHUser, s.SSHPort, encPass, encKey, string(protoBytes), createdAtStr,
 		)
@@ -312,6 +319,9 @@ func (d *DB) DeleteServer(ctx context.Context, id int64) (bool, error) {
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM backend_tunnels WHERE server_id = ?", id); err != nil {
 		slog.Warn("failed to delete backend_tunnels for server", "server_id", id, "error", err)
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM settings WHERE key = ?", fmt.Sprintf("backend_pending_enrollment:%d", id)); err != nil {
+		slog.Warn("failed to delete pending enrollment setting for server", "server_id", id, "error", err)
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM awg_ip_allocations WHERE server_id = ?", id); err != nil {
 		slog.Warn("failed to delete awg_ip_allocations for server", "server_id", id, "error", err)

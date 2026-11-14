@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"errors"
 	"net/netip"
 	"time"
 )
@@ -77,6 +78,10 @@ func (m *DirectEgressManager) isPortQuarantinedLocked(port uint16, now time.Time
 	if now.Sub(rel) >= m.portCooldown {
 		delete(m.quarantinedPorts, port)
 		delete(m.portOwners, port)
+		// Quarantine ownership ends with the cooldown: nothing can be routing a
+		// reply to the port any more, so the kernel tuple is released for the
+		// host to use again.
+		m.releaseHostPortLocked(port)
 		return false
 	}
 	return true
@@ -102,9 +107,14 @@ func (m *DirectEgressManager) releasePortLocked(port uint16, proto uint8, remote
 	}
 	delete(m.usedPorts, port)
 	if m.portCooldown > 0 {
+		// Delayed replies for the retired flow stay attributable to this manager
+		// while the port is quarantined, so kernel ownership is held for exactly
+		// the same window and a host socket can never inherit the tuple in
+		// between.
 		m.quarantinedPorts[port] = now
 	} else {
 		delete(m.portOwners, port)
+		m.releaseHostPortLocked(port)
 	}
 	bKey := remoteBindingKey{protocol: proto, natPort: port, remoteIP: remoteIP, remotePort: remotePort}
 	if b := m.remoteBindings[bKey]; b != nil && b.active {
@@ -147,11 +157,17 @@ func (m *DirectEgressManager) canBindRemoteLocked(port uint16, peerKey string, p
 	if !exists {
 		return !tableFull
 	}
-	if b.peerKey == peerKey {
-		return true
-	}
+	// A binding that was retired for this exact tuple keeps the port for its
+	// quarantine window and must refuse every rebinder. The check has to come
+	// before the same-peer shortcut: a replacement session of the same peer is
+	// a different authenticated session, so rebinding its tuple would relabel
+	// the retired flow's in-flight replies with the new session instead of
+	// refusing them. When no other safe port exists the flow fails closed.
 	if m.isBindingQuarantinedLocked(b, proto, now) {
 		return false
+	}
+	if b.peerKey == peerKey {
+		return true
 	}
 	delete(m.remoteBindings, bKey)
 	return true
@@ -161,6 +177,17 @@ func (m *DirectEgressManager) allocatePortLocked(peerKey string, proto uint8, re
 	totalPorts := int(m.cfg.MaxPort - m.cfg.MinPort + 1)
 	now := time.Now()
 	m.pruneOldestBindingsLocked(now)
+
+	// Every held reservation keeps its kernel tuple for the whole binding
+	// lifetime, including the port-cooldown window after the flow retires, so a
+	// cap reached by flows that already expired can only be relieved by the
+	// ordinary sweep. Nothing else in this path runs after a reservation
+	// refusal, so reclaim here before deciding the cap is exhausted: retire
+	// expired flows and release the tuples whose quarantine window has elapsed.
+	// An all-live cap reclaims nothing and stays refused by the checks below.
+	if m.atReservationCapLocked() {
+		m.sweepLocked(now)
+	}
 
 	maxB := m.maxBindings
 	if maxB <= 0 {
@@ -173,6 +200,17 @@ func (m *DirectEgressManager) allocatePortLocked(peerKey string, proto uint8, re
 			port := m.advanceNextPortLocked()
 			if m.isPortAvailableLocked(port, peerKey, now) {
 				if m.canBindRemoteLocked(port, peerKey, proto, remoteIP, remotePort, tableFull, now) {
+					if err := m.reserveHostPortLocked(proto, port); err != nil {
+						if errors.Is(err, errHostTupleInUse) {
+							// Another local socket owns this exact host tuple. It is
+							// not ours to take over: try the next candidate.
+							continue
+						}
+						// Ownership could not be established (resource or platform
+						// failure). Refuse direct egress rather than fall back to
+						// an unverified mapping.
+						return 0, err
+					}
 					m.usedPorts[port] = true
 					m.portOwners[port] = peerKey
 					m.portEpoch[port]++
@@ -192,6 +230,15 @@ func (m *DirectEgressManager) allocatePortLocked(peerKey string, proto uint8, re
 		port := m.advanceNextPortLocked()
 		if !m.usedPorts[port] {
 			if m.canBindRemoteLocked(port, peerKey, proto, remoteIP, remotePort, tableFull, now) {
+				// A quarantined port still holds its kernel reservation, so reuse
+				// keeps the tuple exclusively ours; a released port is re-acquired
+				// here under the same ownership rule as the primary path.
+				if err := m.reserveHostPortLocked(proto, port); err != nil {
+					if errors.Is(err, errHostTupleInUse) {
+						continue
+					}
+					return 0, err
+				}
 				delete(m.quarantinedPorts, port)
 				m.usedPorts[port] = true
 				m.portOwners[port] = peerKey
@@ -273,6 +320,24 @@ func (m *DirectEgressManager) sweepLocked(now time.Time) {
 		}
 	}
 	m.sweepRemoteBindingsLocked(now)
+	m.sweepQuarantinedPortsLocked(now)
+}
+
+// sweepQuarantinedPortsLocked releases kernel ownership of ports whose
+// quarantine window has elapsed, so an idle manager never keeps host tuples
+// reserved longer than its own delayed-reply protection requires.
+func (m *DirectEgressManager) sweepQuarantinedPortsLocked(now time.Time) {
+	if m.portCooldown <= 0 || len(m.quarantinedPorts) == 0 {
+		return
+	}
+	for port, releasedAt := range m.quarantinedPorts {
+		if now.Sub(releasedAt) < m.portCooldown {
+			continue
+		}
+		delete(m.quarantinedPorts, port)
+		delete(m.portOwners, port)
+		m.releaseHostPortLocked(port)
+	}
 }
 
 // PurgePeer purges all active flows and NAT state belonging to peerKey.
@@ -327,4 +392,5 @@ func (m *DirectEgressManager) PurgeAll() {
 	clear(m.quarantinedPorts)
 	clear(m.remoteBindings)
 	clear(m.portOwners)
+	m.releaseAllHostPortsLocked()
 }

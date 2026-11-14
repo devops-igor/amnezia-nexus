@@ -906,7 +906,13 @@ func TestPBRDNSHandler_R8H1_AsyncDrainUnblocked(t *testing.T) {
 	rc := NewMemoryRouteCache()
 	matcher := policy.NewMatcher()
 	gw := initDefaultDNSGateway(gwIP, matcher, rc)
-	h := newPBRDNSHandler(gw, rc)
+	// The handler allocates session scopes only for sessions that still own a
+	// route, so the fixture registers the session like the ingress path does.
+	fwd := forwarder.NewForwarder(nil, "10.100.0.0/16", 8)
+	fwd.SetRouteCache(rc)
+	fwd.RegisterSession("sess-async", "conn-1", "peer-1", "10.100.0.2", 1)
+	defer fwd.BeginUnregisterSession("peer-1", "sess-async").Wait()
+	h := newPBRDNSHandler(gw, rc, fwd.HasLiveSession)
 	defer func() { _ = h.Close() }()
 
 	retPath := forwarder.NewReturnPath(func(pk, ip string, packet []byte) (int, error) {

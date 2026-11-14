@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,20 +34,43 @@ import (
 
 const e2eCamouflageDomain = "camouflage.e2e.example.com"
 
+// e2eFlushWriter streams the upstream response into the handler's ResponseWriter
+// and flushes each chunk.
+//
+// Ownership: the handler copies into it from a goroutine while ServeHTTP still owns
+// w, and http2 flushes and pools that response state in handlerDone *after*
+// ServeHTTP returns. Close is therefore the fence that ends the copier's ownership:
+// it waits for an in-flight Write to finish and rejects later ones, so the handler
+// cannot return while a flush is still touching the ResponseWriter's buffer.
+// http.ResponseWriter is not an io.Closer, so without this fence the copier would
+// outlive the handler and race handlerDone.
 type e2eFlushWriter struct {
-	w io.Writer
-	f http.Flusher
+	mu     sync.Mutex
+	w      io.Writer
+	f      http.Flusher
+	closed bool
 }
 
-func (fw *e2eFlushWriter) Write(p []byte) (n int, err error) {
-	n, err = fw.w.Write(p)
+func (fw *e2eFlushWriter) Write(p []byte) (int, error) {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if fw.closed {
+		return 0, net.ErrClosed
+	}
+	n, err := fw.w.Write(p)
 	if fw.f != nil {
 		fw.f.Flush()
 	}
-	return
+	return n, err
 }
 
 func (fw *e2eFlushWriter) Close() error {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if fw.closed {
+		return nil
+	}
+	fw.closed = true
 	if c, ok := fw.w.(io.Closer); ok {
 		return c.Close()
 	}

@@ -458,6 +458,19 @@ func TestRebalanceDivergenceWithoutSessionMigrator(t *testing.T) {
 	svc.forwarder.RegisterSession(aliceSess.ID, "conn-alice", peerKeyAlice, assignedIPAlice, tun1.ID)
 	svc.pool.IncrementConnections(tun1.ID)
 
+	// GetActiveVPNSessions orders by connected_at DESC and the drain walks that
+	// slice from the front, so the rebalancer moves the NEWEST excess sessions.
+	// Seeding order alone cannot express that: connected_at is written at
+	// RFC3339 second resolution, so rows created within the same second are a
+	// tie and their relative order is arbitrary. Give the session this test
+	// asserts on an explicit, strictly newer connected_at so it is
+	// deterministically among the two drained rows, exactly as
+	// TestOrchestratorRebalanceEndToEndWithVPNService does.
+	newerTime := time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339)
+	if _, err := db.SQLDB().ExecContext(ctx, "UPDATE vpn_sessions SET connected_at = ? WHERE id = ?", newerTime, aliceSess.ID); err != nil {
+		t.Fatalf("failed to set alice connected_at: %v", err)
+	}
+
 	// Seed 8 additional sessions on tun1
 	for i := 2; i <= 9; i++ {
 		peerKey := "peer-div-" + string(rune('0'+i))

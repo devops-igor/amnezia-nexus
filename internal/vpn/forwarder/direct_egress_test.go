@@ -497,8 +497,15 @@ func TestDirectEgress_LookupExpirationAndBidirectionalRefresh(t *testing.T) {
 	// Wait for pkt2 to expire
 	time.Sleep(80 * time.Millisecond)
 	// We had minPort 50000, maxPort 50001 (2 ports total). Allocate both.
+	// A retired (port, remote) tuple stays quarantined for its delayed-reply
+	// window and refuses every rebinder, the same peer included, so each
+	// reclaiming flow targets its own remote endpoint: rebinding a just-retired
+	// tuple is refused by design (TestDirectEgressRetiredBindingQuarantine*).
+	remoteB := netip.MustParseAddr("8.8.4.4")
+	remoteC := netip.MustParseAddr("9.9.9.9")
+	remoteD := netip.MustParseAddr("1.0.0.1")
 	p1 := buildTestIPv4UDPPacket(clientIP, targetIP, 20001, 53, []byte("p1"))
-	p2 := buildTestIPv4UDPPacket(clientIP, targetIP, 20002, 53, []byte("p2"))
+	p2 := buildTestIPv4UDPPacket(clientIP, remoteB, 20002, 53, []byte("p2"))
 	if err := dem.RouteUDPDirect(peerKey, p1, capPath.path); err != nil {
 		t.Fatalf("alloc p1 failed: %v", err)
 	}
@@ -507,7 +514,7 @@ func TestDirectEgress_LookupExpirationAndBidirectionalRefresh(t *testing.T) {
 	}
 
 	// Immediate 3rd allocation should fail with ErrNATPortExhaustion
-	p3 := buildTestIPv4UDPPacket(clientIP, targetIP, 20003, 53, []byte("p3"))
+	p3 := buildTestIPv4UDPPacket(clientIP, remoteC, 20003, 53, []byte("p3"))
 	if err := dem.RouteUDPDirect(peerKey, p3, capPath.path); err != ErrNATPortExhaustion && err != ErrFlowTableFull {
 		t.Fatalf("expected exhaustion error, got: %v", err)
 	}
@@ -521,12 +528,12 @@ func TestDirectEgress_LookupExpirationAndBidirectionalRefresh(t *testing.T) {
 	}
 
 	// 4. MaxFlows strict enforcement
-	p4 := buildTestIPv4UDPPacket(clientIP, targetIP, 20004, 53, []byte("p4"))
+	p4 := buildTestIPv4UDPPacket(clientIP, remoteD, 20004, 53, []byte("p4"))
 	if err := dem.RouteUDPDirect(peerKey, p4, capPath.path); err != nil {
 		t.Fatalf("alloc p4 failed: %v", err)
 	}
 	// MaxFlows is 2, p3 and p4 are active. 5th flow should hit capacity
-	p5 := buildTestIPv4UDPPacket(clientIP, targetIP, 20005, 53, []byte("p5"))
+	p5 := buildTestIPv4UDPPacket(clientIP, remoteD, 20005, 53, []byte("p5"))
 	if err := dem.RouteUDPDirect(peerKey, p5, capPath.path); err != ErrFlowTableFull && err != ErrNATPortExhaustion {
 		t.Fatalf("expected ErrFlowTableFull or exhaustion when capacity reached, got: %v", err)
 	}

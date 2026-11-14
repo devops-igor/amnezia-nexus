@@ -129,6 +129,45 @@ func GenerateTestEd25519Key() (string, error) {
 	return buf.String(), nil
 }
 
+// ManagedKeyComment is appended to managed public keys so an operator reading
+// the provider account can tell which key material the panel generated.
+const ManagedKeyComment = "nexus-managed"
+
+// GenerateManagedEd25519Key creates the Ed25519 key pair used for a
+// panel-managed deployment.
+//
+// It returns the private key as PKCS8 PEM (the encoding ParsePrivateKey already
+// reads, so the existing SSH manager needs no new parser) and the public key as
+// a single authorized_keys line ready for provider registration. The private
+// material never leaves the caller: persistence encrypts it with the same
+// credential encryption the server table uses.
+func GenerateManagedEd25519Key() (privateKeyPEM, authorizedKey string, err error) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", fmt.Errorf("generate managed ed25519 key: %w", err)
+	}
+	signer, err := gossh.NewSignerFromKey(priv)
+	if err != nil {
+		return "", "", fmt.Errorf("derive managed ed25519 signer: %w", err)
+	}
+
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return "", "", fmt.Errorf("marshal managed ed25519 key: %w", err)
+	}
+	block := &pem.Block{Type: "PRIVATE KEY", Bytes: der}
+	var buf bytes.Buffer
+	if err := pem.Encode(&buf, block); err != nil {
+		return "", "", fmt.Errorf("encode managed ed25519 key: %w", err)
+	}
+
+	publicLine := strings.TrimSpace(string(gossh.MarshalAuthorizedKey(signer.PublicKey())))
+	if publicLine == "" {
+		return "", "", errors.New("derive managed ed25519 public key: empty authorized key line")
+	}
+	return buf.String(), publicLine + " " + ManagedKeyComment, nil
+}
+
 // GenerateTestECDSAKey generates an in-memory PEM-encoded ECDSA P-256 private key for testing.
 func GenerateTestECDSAKey() (string, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

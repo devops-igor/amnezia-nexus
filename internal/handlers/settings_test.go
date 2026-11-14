@@ -360,7 +360,7 @@ func TestSaveSettingsHandler_GigahostRBAC(t *testing.T) {
 	supportKey := "flux_live_support_hacker_key_9999999999999999999999999999999999999"
 
 	// Admin initially configures Gigahost setting
-	if err := db.SetSetting(ctx, "gigahost", map[string]any{"api_key": adminKey, "monthly_budget_nok": 500}); err != nil {
+	if err := db.SetSetting(ctx, "gigahost", map[string]any{"api_key": adminKey}); err != nil {
 		t.Fatal(err)
 	}
 

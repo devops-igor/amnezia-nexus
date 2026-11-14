@@ -713,8 +713,12 @@ func (h *Handlers) InstallProtocolHandler(w http.ResponseWriter, r *http.Request
 
 	params := buildInstallParams(&req, portExplicit)
 
+	installStarted := time.Now()
 	if err := protoMgr.Install(ctx, server, params); err != nil {
-		slog.Error("protocol install failed", "server_id", serverID, "protocol", req.Protocol, "port", req.Port, "err", err)
+		// duration_ms lets the offline diagnostics collector tell a slow attempt
+		// that outlived the client from a fast, hard failure (issue #680).
+		slog.Error("protocol install failed", "server_id", serverID, "protocol", req.Protocol, "port", req.Port,
+			"duration_ms", time.Since(installStarted).Milliseconds(), "err", err)
 		if errors.Is(err, naive.ErrDNSValidation) || strings.Contains(err.Error(), "pre-flight DNS validation failed") {
 			h.JSONError(w, http.StatusBadRequest, "dns_validation_failed", err.Error())
 			return

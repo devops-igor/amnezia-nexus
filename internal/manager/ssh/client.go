@@ -172,10 +172,12 @@ func (c *Client) Connect(ctx context.Context) error {
 		return fmt.Errorf("failed to connect to %s: %w", addr, err)
 	}
 
-	sshConn, chans, reqs, err := gossh.NewClientConn(conn, addr, sshConfig)
+	// The handshake, not just the dial, is bounded and cancellable: the
+	// transport exchange happens on this socket and would otherwise wait for a
+	// silent peer indefinitely. handshake takes ownership of conn.
+	sshConn, chans, reqs, err := handshake(ctx, conn, addr, sshConfig, c.cfg.Timeout)
 	if err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("ssh handshake failed with %s: %w", addr, err)
+		return err
 	}
 
 	if c.sftpClient != nil {

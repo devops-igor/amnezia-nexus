@@ -3,6 +3,7 @@ package forwarder
 import (
 	"encoding/binary"
 	"errors"
+	"io"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -100,6 +101,10 @@ type DirectEgressConfig struct {
 	UDPQuarantine     time.Duration
 	MaxBindings       int
 	MaxRemoteBindings int
+	// MaxHostReservations bounds how many direct-NAT tuples may be held
+	// exclusively in the kernel at once (one socket each). Zero selects the
+	// default bound; the port pool size caps it further.
+	MaxHostReservations int
 }
 
 const (
@@ -137,6 +142,10 @@ type DirectEgressManager struct {
 	remoteBindings   map[remoteBindingKey]*remoteBindingEntry
 	portOwners       map[uint16]string
 	maxBindings      int
+	// reservations holds exclusive kernel ownership of every direct-NAT port for
+	// the whole binding lifetime, including the post-release quarantine window.
+	reservations    map[uint16]io.Closer
+	maxReservations int
 }
 
 // DirectDrops returns the total number of packets dropped by direct egress.
@@ -192,6 +201,11 @@ func NewDirectEgressManager(cfg DirectEgressConfig, fwd *Forwarder) *DirectEgres
 		remoteBindings:   make(map[remoteBindingKey]*remoteBindingEntry),
 		portOwners:       make(map[uint16]string),
 		gwDNSIP:          cfg.GatewayDNSIP,
+		reservations:     make(map[uint16]io.Closer),
+		maxReservations: clampMaxReservations(
+			cfg.MaxHostReservations,
+			int(cfg.MaxPort-cfg.MinPort)+1,
+		),
 	}
 
 	if cfg.WANDevice != nil {
@@ -816,6 +830,9 @@ func (m *DirectEgressManager) Close() error {
 	m.stopCh = nil
 	dev := m.wanDevice
 	m.wanDevice = nil
+	// A closed manager can never route another reply, so every host tuple it owns
+	// is returned to the host now instead of waiting for a sweep that will not run.
+	m.releaseAllHostPortsLocked()
 	m.mu.Unlock()
 
 	if oldStopCh != nil {

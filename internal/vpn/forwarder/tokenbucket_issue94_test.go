@@ -8,6 +8,7 @@ package forwarder
 // introduced by this file — it documents and locks the existing semantics.
 
 import (
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -178,14 +179,26 @@ func TestTokenBucketCustomCapacity(t *testing.T) {
 // TestTokenBucketConcurrentAllow exercises Allow from many goroutines
 // sharing one bucket (the per-peer wiring: concurrent pumps consume the
 // same tbDown/tbUp). The mutex must keep the total consumed bytes within
-// capacity + refill; run under -race via the standard suite.
+// capacity plus the refill the bucket can legally accrue for as long as the
+// run lasts; run under -race via the standard suite.
 func TestTokenBucketConcurrentAllow(t *testing.T) {
-	const capacity = 100_000
-	const chunk = 13
-	tb := NewTokenBucket(capacity, capacity)
+	const (
+		capacity = 100_000 // bytes of burst budget
+		chunk    = 13      // bytes per Allow call
+		// A 1 B/s sustained rate keeps legal refill sub-byte for any
+		// realistic run, so the bound below stays tight enough to catch
+		// unsafe over-admission while still being exact if the run is slow.
+		// Refill behavior keeps its coverage in the sequential tests.
+		refillBps      = 1
+		workers        = 50
+		callsPerWorker = 200
+	)
 
-	const workers = 50
-	const callsPerWorker = 200
+	// start precedes construction so elapsed over-covers the bucket's whole
+	// lifetime: no Allow can observe more than refillBps*elapsed of refill.
+	start := time.Now()
+	tb := NewTokenBucket(refillBps, capacity)
+
 	var (
 		wg      sync.WaitGroup
 		mu      sync.Mutex
@@ -207,19 +220,22 @@ func TestTokenBucketConcurrentAllow(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	elapsed := time.Since(start)
 
-	// Total consumption can never exceed the initial capacity plus whatever
-	// refilled during the (short) run. The test runs in well under a second
-	// at capacity B/s... but the test would be flaky if it relied on time;
-	// instead the run takes microseconds, so bound by capacity plus a small
-	// scheduling-tolerant refill allowance (50 ms worth).
-	const refillAllowance = int64(50) * capacity / 1000 // 50 ms of refill
-	if allowed > capacity+refillAllowance {
-		t.Errorf("concurrent Allow over-consumed: %d bytes > capacity %d + refill allowance %d",
-			allowed, capacity, refillAllowance)
+	// The bucket starts full, so a correct limiter admits at most capacity
+	// plus refillBps*elapsed, whatever the goroutine schedule. Ceil keeps
+	// that bound valid without assuming anything about how fast the run is.
+	refill := int64(math.Ceil(elapsed.Seconds() * refillBps))
+	if allowed > capacity+refill {
+		t.Errorf("concurrent Allow over-consumed: %d bytes > capacity %d + refill %d over %v",
+			allowed, capacity, refill, elapsed)
 	}
-	if allowed == 0 {
-		t.Errorf("no consumption recorded — concurrency test exercised nothing")
+	// workers * callsPerWorker * chunk = 130000 B are offered, so a correct
+	// limiter must drain the bucket to within one chunk of capacity: this
+	// keeps the check non-vacuous and catches an over-restrictive limiter.
+	if allowed < capacity-chunk {
+		t.Errorf("concurrent Allow under-consumed: %d bytes admitted, want at least %d",
+			allowed, capacity-chunk)
 	}
 }
 

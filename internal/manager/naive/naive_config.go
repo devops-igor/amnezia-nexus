@@ -342,12 +342,3 @@ func BuildNaiveURI(domain string, port int, user, pass, name string) (string, er
 func DefaultDecoyHTML() string {
 	return string(GetDecoyHTML(DecoyThemeDefault))
 }
-
-// RenderCaddyDockerfile returns the multi-stage Dockerfile for Caddy with forwardproxy.
-func RenderCaddyDockerfile() string {
-	return `FROM caddy:builder AS builder
-    RUN xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024
-    FROM caddy:alpine
-    COPY --from=builder /usr/bin/caddy /usr/bin/caddy
-    `
-}

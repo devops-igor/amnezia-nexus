@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	_ "embed"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -121,6 +122,32 @@ type DB struct {
 	reachabilityCache  map[int64]models.ReachabilityStatus
 	peerListener       peerListenerSlot
 	peerRevokeListener peerRevokeSlot
+}
+
+// OpenReadOnly opens an existing SQLite database without initializing or
+// migrating its schema, for inspection tools that must not change the file.
+//
+// It does not create the database, does not run DDL, and does not set pragmas
+// that write. Callers that need to write use Open.
+func OpenReadOnly(dbPath string) (*DB, error) {
+	if dbPath == ":memory:" || strings.Contains(dbPath, "mode=memory") {
+		return nil, errors.New("read-only open requires a file database")
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, fmt.Errorf("database not found: %w", err)
+	}
+	dsn := fmt.Sprintf("%s?_pragma=query_only(ON)&_pragma=busy_timeout(5000)", dbPath)
+	sqlDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
+	return &DB{
+		dbPath:            dbPath,
+		sqlDB:             sqlDB,
+		reachabilityCache: make(map[int64]models.ReachabilityStatus),
+	}, nil
 }
 
 // Open opens a connection to the SQLite database with WAL mode, busy timeout, and foreign keys enabled.
