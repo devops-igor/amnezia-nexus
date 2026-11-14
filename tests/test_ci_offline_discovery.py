@@ -20,12 +20,7 @@ WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 
 # Suites deliberately not wired to a workflow. An entry here is a recorded gap,
 # not a permission: each one must name the issue that tracks closing it.
-EXCUSED = {
-    "test_onboard_credentials.py": (
-        "imports tests.e2e.test_onboard, which imports Playwright, so it cannot run "
-        "in the python-only offline gate; refactor tracked in #762"
-    ),
-}
+EXCUSED: dict[str, str] = {}
 
 
 def _tracked(paths: list[str]) -> set[str] | None:
