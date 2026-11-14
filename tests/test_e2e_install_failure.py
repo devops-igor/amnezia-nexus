@@ -115,8 +115,33 @@ def test_install_failure_emits_bounded_artifact(tmp_path: Path, capsys) -> None:
         ),
         ("failed to upload Dockerfile: sftp: permission denied", "dockerfile_upload"),
         ("failed to pull AWG base image img:v1 (code 1): denied, exit status 1", "image_pull"),
+        (
+            "failed to pull caddy image 'ghcr.io/x/naive-caddy@sha256:abc' (code 1): "
+            "manifest unknown",
+            "image_pull",
+        ),
         ("failed to build amnezia-awg2 image (code 1): apk failed, exit status 1", "image_build"),
         ("failed to run container (code 125): port is already allocated", "container_run"),
+        # Xray/VLESS install path: without these the collector can only say
+        # step=other, which is what made the REALITY-probe failure take a manual
+        # reproduction to identify.
+        ("failed to pull xray image img@sha256:x (code 1): denied", "image_pull"),
+        ("failed to run xray container (code 125): port is already allocated", "container_run"),
+        (
+            "xray container failed REALITY handshake readiness probe: dial tcp: i/o timeout",
+            "readiness_probe",
+        ),
+        (
+            "xray container failed VLESS traffic readiness probe: EOF",
+            "readiness_probe",
+        ),
+        (
+            "xray container readiness check failed (attempt 1, state: false true, logs: )",
+            "container_not_running",
+        ),
+        ("failed to derive public key from existing reality private key: bad key", "reality_key"),
+        ("failed to parse existing xray config /opt/amnezia/xray/config.json: EOF", "config_parse"),
+        ("failed to read existing xray config /opt/amnezia/xray/config.json (cat code 1", "config_read"),
         ("pool failed to dial server:1:host:22:ubuntu: ssh: handshake failed", "ssh_client"),
         ("ssh pool is not configured", "ssh_client"),
         ("something else entirely", "other"),
@@ -220,12 +245,46 @@ def test_protocol_aliases_normalise_to_the_canonical_name() -> None:
             "failed to build caddy image (code 1): a failure nobody has seen before",
             "other",
         ),
+        # The readiness probe has two very different causes: only one is a
+        # verification defect, the other is the probe budget expiring.
+        (
+            "xray container failed REALITY handshake readiness probe: "
+            "vless: reality verification failed (logs: )",
+            "reality_verify",
+        ),
+        (
+            "xray container failed REALITY handshake readiness probe: "
+            "context deadline exceeded (logs: )",
+            "caller_cancel",
+        ),
     ],
 )
 def test_reason_classification_is_closed(err: str, reason: str) -> None:
     """A producer subprocess cause maps to one allowlisted reason, else "other"."""
     assert install_failure.classify_reason(err) == reason
     assert reason in install_failure.REASONS
+
+
+def test_readiness_reason_ignores_appended_container_logs() -> None:
+    """The probe's own error wins; a cause-shaped string in the logs must not.
+
+    The Xray manager appends `docker logs` output after the probe error. If the
+    classifier searched the whole string, a timeout whose container logs happen
+    to mention a verification failure would be reported as a verification
+    defect -- the wrong owner and the wrong fix.
+    """
+    timeout_with_misleading_logs = (
+        "xray container failed REALITY handshake readiness probe: context deadline exceeded "
+        "(logs: vless: reality verification failed)"
+    )
+    assert install_failure.classify_step(timeout_with_misleading_logs) == "readiness_probe"
+    assert install_failure.classify_reason(timeout_with_misleading_logs) == "caller_cancel"
+
+    verification_with_timeout_logs = (
+        "xray container failed REALITY handshake readiness probe: "
+        "vless: reality verification failed (logs: dial tcp: i/o timeout)"
+    )
+    assert install_failure.classify_reason(verification_with_timeout_logs) == "reality_verify"
 
 
 def test_reason_is_not_guessed_outside_a_subprocess_step() -> None:

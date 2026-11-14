@@ -20,6 +20,14 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e.conftest import _do_login, api_get, api_post
+from tests.e2e.provisioning import (
+    POLL_SECONDS,
+    PROTOCOLS,
+    install_payload,
+    json_or_none,
+    server_by_id,
+    servers_from_inventory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,12 +102,14 @@ def validate_naive_uri(
 ) -> Dict[str, Any]:
     """Validate a NaiveProxy client URI format and basic-auth credentials.
 
-    Expected format:
-    https://<username>:<password>@<domain>[:<port>]#<name>
+    Expected format (BuildNaiveURI, adopted in #694):
+    naive+https://<username>:<password>@<domain>[:<port>]#<name>
     """
-    assert uri.startswith("https://"), f"URI must start with https://, got: {uri[:30]}"
+    assert uri.startswith(
+        "naive+https://"
+    ), f"URI must start with naive+https://, got: {uri[:30]}"
     parsed = urlparse(uri)
-    assert parsed.scheme == "https", f"Expected scheme 'https', got '{parsed.scheme}'"
+    assert parsed.scheme == "naive+https", f"Expected scheme 'naive+https', got '{parsed.scheme}'"
 
     # Basic auth credential validation
     assert parsed.username, "NaiveProxy URI must include basic-auth username"
@@ -181,72 +191,84 @@ def _get_server_by_id(page: Page, server_id: int) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _ensure_protocol_installed(page: Page, server_id: int, proto: str, csrf_token: str) -> bool:
-    """Ensure that the requested protocol is installed on the target server.
+def _provisioning_context(playwright, base_url: str, username: str, password: str):
+    """Open an authenticated APIRequestContext independent of any page.
 
-    Checks if proto is present in server protocol inventory. If absent, provisions
-    the protocol via POST /api/servers/{server_id}/install with standard parameters:
-    - VLESS: port 443, server_name gateway.icloud.com, flow xtls-rprx-vision
-    - NaiveProxy: port 9443, domain proxy.example.com, decoy default
+    A module-scoped fixture cannot depend on the function-scoped `page`, so the
+    provisioning path logs in on its own request context. Cookies (including the
+    HttpOnly csrftoken) live on that context and are read through the API.
     """
-    server = _get_server_by_id(page, server_id)
-    if server and _is_protocol_installed(server, proto):
-        return True
-
-    payload: Dict[str, Any]
-    if proto == "vless":
-        payload = {
-            "protocol": "vless",
-            "port": "443",
-            "vless_options": {
-                "server_name": "gateway.icloud.com",
-                "port": "443",
-                "flow": "xtls-rprx-vision",
-            },
-        }
-    elif proto == "naive":
-        payload = {
-            "protocol": "naive",
-            "port": "9443",
-            "naive_options": {
-                "domain": "proxy.example.com",
-                "port": "9443",
-                "decoy": "default",
-            },
-        }
-    else:
-        raise ValueError(f"Unsupported protocol for auto-provisioning: {proto}")
-
-    install_res = api_post(
-        page,
-        f"/api/servers/{server_id}/install",
-        payload,
-        csrf_token,
-        timeout=120_000,
+    ctx = playwright.request.new_context(base_url=base_url)
+    ctx.get("/login")
+    csrf = next((c["value"] for c in ctx.cookies() if c["name"] == "csrftoken"), "")
+    if not csrf:
+        ctx.dispose()
+        pytest.fail("CSRF cookie missing on /login — cannot provision protocols")
+    res = ctx.post(
+        "/api/auth/login",
+        data={"username": username, "password": password, "captcha": None},
+        headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
     )
-    status = install_res.get("status")
-    assert status in (200, 201), (
-        f"Failed to auto-provision {proto} on server {server_id}: "
-        f"status={status}, response={install_res}"
-    )
+    if res.status != 200:
+        body = res.text()[:200]
+        ctx.dispose()
+        pytest.fail(f"Provisioning login returned {res.status}: {body}")
+    return ctx, csrf
 
-    # Validate installed status in server inventory
-    updated = _get_server_by_id(page, server_id)
-    if updated and _is_protocol_installed(updated, proto):
-        return True
 
-    # Allow a short poll window if remote state sync is in-flight
-    for _ in range(5):
-        time.sleep(1)
-        updated = _get_server_by_id(page, server_id)
-        if updated and _is_protocol_installed(updated, proto):
-            return True
+@pytest.fixture(scope="module")
+def provisioned_protocols(
+    playwright, base_url: str, admin_user: str, admin_pass: str
+) -> Dict[str, Any]:
+    """Install the protocols this module needs, once for the whole module.
 
-    if _is_qualification_mode():
-        assert updated and _is_protocol_installed(
-            updated, proto
-        ), f"Protocol {proto} not reported as installed on server {server_id} after install"
-    return True
+    Each test used to POST /api/servers/{id}/install itself, so a single slow or
+    failed install turned into four separate 120s client timeouts that all
+    reported the same generic `install_failed`. This performs one attempt per
+    protocol and then polls the inventory; a failure stops the module with the
+    exact response instead of cascading.
+    """
+    ctx, csrf = _provisioning_context(playwright, base_url, admin_user, admin_pass)
+    try:
+        listed = ctx.get("/api/servers")
+        servers = servers_from_inventory(
+            listed.ok, listed.status, json_or_none(listed), _is_qualification_mode()
+        )
+        server_id = servers[0]["id"]
+
+        for proto in PROTOCOLS:
+            if _is_protocol_installed(servers[0], proto):
+                continue
+
+            res = ctx.post(
+                f"/api/servers/{server_id}/install",
+                data=install_payload(proto),
+                headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
+                timeout=120_000,
+            )
+            body = res.text()[:300]
+            if res.status not in (200, 201):
+                pytest.fail(
+                    f"Failed to provision {proto} on server {server_id}: "
+                    f"status={res.status}, response={body}"
+                )
+
+            deadline = time.time() + POLL_SECONDS
+            while time.time() < deadline:
+                time.sleep(1)
+                listed = ctx.get("/api/servers")
+                current = server_by_id(json_or_none(listed), server_id)
+                if current and _is_protocol_installed(current, proto):
+                    break
+            else:
+                pytest.fail(
+                    f"{proto} install returned {res.status} but the server never reported it "
+                    f"installed within {POLL_SECONDS}s (response={body})"
+                )
+
+        yield {"server_id": server_id}
+    finally:
+        ctx.dispose()
 
 
 def _find_or_create_user(
@@ -339,7 +361,10 @@ def _verify_user_my_page(
 
 @pytest.mark.e2e
 def test_multiprotocol_client_creation_flow(
-    authenticated_page: Page, base_url: str, csrf_token: str
+    authenticated_page: Page,
+    base_url: str,
+    csrf_token: str,
+    provisioned_protocols: Dict[str, Any],
 ) -> None:
     """Verify multi-protocol client connection creation and list rendering.
 
@@ -358,8 +383,6 @@ def test_multiprotocol_client_creation_flow(
     assert server is not None
 
     server_id = server["id"]
-    for proto in ("vless", "naive"):
-        _ensure_protocol_installed(page, server_id, proto, csrf_token)
 
     server = _get_server_by_id(page, server_id) or server
     installed_protos: List[str] = [
@@ -466,7 +489,10 @@ def test_multiprotocol_client_creation_flow(
 
 @pytest.mark.e2e
 def test_multiprotocol_config_display_and_uri_export(
-    authenticated_page: Page, base_url: str, csrf_token: str
+    authenticated_page: Page,
+    base_url: str,
+    csrf_token: str,
+    provisioned_protocols: Dict[str, Any],
 ) -> None:
     """Verify URI export format and clipboard copy feedback.
 
@@ -484,8 +510,6 @@ def test_multiprotocol_config_display_and_uri_export(
     assert server is not None
 
     server_id = server["id"]
-    for proto in ("vless", "naive"):
-        _ensure_protocol_installed(page, server_id, proto, csrf_token)
 
     server = _get_server_by_id(page, server_id) or server
     installed_protos: List[str] = [
@@ -594,7 +618,10 @@ def test_multiprotocol_config_display_and_uri_export(
 
 @pytest.mark.e2e
 def test_multiprotocol_qr_code_modal_interaction(
-    authenticated_page: Page, base_url: str, csrf_token: str
+    authenticated_page: Page,
+    base_url: str,
+    csrf_token: str,
+    provisioned_protocols: Dict[str, Any],
 ) -> None:
     """Verify QR code rendering, tab switching, and clean modal dismissal.
 
@@ -613,8 +640,6 @@ def test_multiprotocol_qr_code_modal_interaction(
     assert server is not None
 
     server_id = server["id"]
-    for proto in ("vless", "naive"):
-        _ensure_protocol_installed(page, server_id, proto, csrf_token)
 
     server = _get_server_by_id(page, server_id) or server
     installed_protos: List[str] = [
@@ -708,7 +733,10 @@ def test_multiprotocol_qr_code_modal_interaction(
 
 @pytest.mark.e2e
 def test_multiprotocol_revocation_and_zero_client_state(
-    authenticated_page: Page, base_url: str, csrf_token: str
+    authenticated_page: Page,
+    base_url: str,
+    csrf_token: str,
+    provisioned_protocols: Dict[str, Any],
 ) -> None:
     """Verify client revocation flow and clean zero-client state transitions.
 
@@ -726,8 +754,6 @@ def test_multiprotocol_revocation_and_zero_client_state(
     assert server is not None
 
     server_id = server["id"]
-    for proto in ("vless", "naive"):
-        _ensure_protocol_installed(page, server_id, proto, csrf_token)
 
     server = _get_server_by_id(page, server_id) or server
     installed_protos: List[str] = [
@@ -885,7 +911,7 @@ def test_vless_uri_validation_oracle() -> None:
 def test_naive_uri_validation_oracle() -> None:
     """Oracle test: verify validate_naive_uri against valid and invalid formats."""
     # Valid NaiveProxy URI with basic auth and fragment
-    valid_uri = "https://alice:secret-pass_123@proxy.example.com:8443#NaiveWorker"
+    valid_uri = "naive+https://alice:secret-pass_123@proxy.example.com:8443#NaiveWorker"
     res = validate_naive_uri(valid_uri, expected_name="NaiveWorker")
     assert res["username"] == "alice"
     assert res["password"] == "secret-pass_123"
@@ -893,34 +919,37 @@ def test_naive_uri_validation_oracle() -> None:
     assert res["port"] == 8443
 
     # Valid default 443 port without explicit port component
-    valid_default_port = "https://bob:hunter2@proxy.example.com#DefaultPort"
+    valid_default_port = "naive+https://bob:hunter2@proxy.example.com#DefaultPort"
     res2 = validate_naive_uri(valid_default_port, expected_name="DefaultPort")
     assert res2["port"] == 443
 
     # Valid NaiveProxy URI with fixture port 9443
-    valid_fixture_port = "https://alice:secret-pass_123@proxy.example.com:9443#NaiveWorker"
+    valid_fixture_port = "naive+https://alice:secret-pass_123@proxy.example.com:9443#NaiveWorker"
     res_9443 = validate_naive_uri(valid_fixture_port, expected_name="NaiveWorker")
     assert res_9443["port"] == 9443
 
     # Valid NaiveProxy URI where fragment is the reconstructed username (H2 contract)
-    reconstructed_naive = "https://alice:secret-pass_123@proxy.example.com:8443#alice"
+    reconstructed_naive = "naive+https://alice:secret-pass_123@proxy.example.com:8443#alice"
     res_recon = validate_naive_uri(reconstructed_naive, expected_name="NaiveWorker")
     assert res_recon["username"] == "alice"
 
     # Reject mismatched fragment when neither expected_name nor username matches
     with pytest.raises(AssertionError, match="Expected fragment in"):
         validate_naive_uri(
-            "https://alice:secret-pass_123@proxy.example.com:8443#charlie",
+            "naive+https://alice:secret-pass_123@proxy.example.com:8443#charlie",
             expected_name="NaiveWorker",
         )
 
-    # Reject non-https scheme
-    with pytest.raises(AssertionError, match="URI must start with https://"):
+    # Reject a missing NaiveProxy scheme. A bare https:// URI was the pre-#694
+    # shape; accepting it here would let a scheme regression pass unnoticed.
+    with pytest.raises(AssertionError, match=r"URI must start with naive\+https://"):
+        validate_naive_uri("https://bob:hunter2@proxy.example.com#DefaultPort")
+    with pytest.raises(AssertionError, match=r"URI must start with naive\+https://"):
         validate_naive_uri("http://bob:hunter2@proxy.example.com#DefaultPort")
 
     # Reject missing password / basic auth
     with pytest.raises(AssertionError, match="basic-auth password"):
-        validate_naive_uri("https://bob@proxy.example.com#MissingPass")
+        validate_naive_uri("naive+https://bob@proxy.example.com#MissingPass")
 
 
 def test_ensure_protocol_provisioning_and_qualification_oracle() -> None:
