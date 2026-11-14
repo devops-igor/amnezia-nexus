@@ -111,6 +111,7 @@ _REASON_MARKERS: Tuple[Tuple[str, str], ...] = (
     # Our own error text precedes the container logs in the message, so the
     # first match is always the probe's own cause.
     ("reality verification failed", "reality_verify"),
+    ("connection refused", "connection_refused"),
     ("no space left on device", "disk_full"),
     ("toomanyrequests", "registry_rate_limit"),
     ("too many requests", "registry_rate_limit"),

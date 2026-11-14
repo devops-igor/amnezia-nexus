@@ -427,6 +427,11 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 	const (
 		readinessAttempts = 3
 		readinessInterval = 50 * time.Millisecond
+		// How long a refused connection is retried while xray finishes binding
+		// its port, and how often. Bounded on purpose: a listener that never
+		// comes up still fails the install.
+		probeStartupBudget = 10 * time.Second
+		probeRetryInterval = 250 * time.Millisecond
 	)
 
 	for attempt := 1; attempt <= readinessAttempts; attempt++ {
@@ -503,10 +508,30 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 		}
 		endpoint := net.JoinHostPort(strings.Trim(strings.TrimSpace(opts.server.Host), "[]"), strconv.Itoa(opts.portPrimary))
 		const probeTimeout = 5 * time.Second
-		probeCtx, probeCancel := context.WithTimeout(ctx, probeTimeout)
-		defer probeCancel()
 
-		if _, probeErr := activeProbeFn(probeCtx, endpoint, probeParams, probeTimeout); probeErr != nil {
+		// A container reports "running" before xray has bound its port, so a
+		// refused connection is a startup race rather than a defect: retry it
+		// inside a bounded window instead of failing the install. Every other
+		// error is returned immediately -- retrying a configuration defect only
+		// delays the failure and blurs the cause.
+		startupDeadline := time.Now().Add(probeStartupBudget)
+		var probeErr error
+		for {
+			attemptCtx, attemptCancel := context.WithTimeout(ctx, probeTimeout)
+			_, probeErr = activeProbeFn(attemptCtx, endpoint, probeParams, probeTimeout)
+			attemptCancel()
+
+			if probeErr == nil || !isListenerNotReady(probeErr) || !time.Now().Before(startupDeadline) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(probeRetryInterval):
+			}
+		}
+
+		if probeErr != nil {
 			if probeMode == "VLESS traffic" && isExternalDestinationError(probeErr) {
 				// Third-party TLS alert, protocol, or destination reachability error:
 				// verify container directly via REALITY handshake to avoid false rollback.
@@ -528,6 +553,22 @@ func (m *XrayManager) verifyContainerReadiness(ctx context.Context, client ssh.S
 	}
 
 	return nil
+}
+
+// isListenerNotReady reports whether the probe failed because the server has not
+// bound its port yet. The container reports "running" before xray opens its
+// listener, so this exact failure is a startup race, not a defect.
+//
+// It must match only the endpoint dial ("vless: dial: dial tcp <endpoint>"), not
+// a refused destination dialed *through* the tunnel: retrying the latter would
+// hide a real destination problem behind a startup delay.
+func isListenerNotReady(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "vless: dial: dial tcp") &&
+		strings.Contains(msg, "connection refused")
 }
 
 func isExternalDestinationError(err error) bool {
