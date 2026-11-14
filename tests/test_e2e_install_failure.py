@@ -257,6 +257,11 @@ def test_protocol_aliases_normalise_to_the_canonical_name() -> None:
             "context deadline exceeded (logs: )",
             "caller_cancel",
         ),
+        (
+            "xray container failed REALITY handshake readiness probe: "
+            "vless: dial: dial tcp 172.17.0.1:443: connect: connection refused (logs: )",
+            "connection_refused",
+        ),
     ],
 )
 def test_reason_classification_is_closed(err: str, reason: str) -> None:
