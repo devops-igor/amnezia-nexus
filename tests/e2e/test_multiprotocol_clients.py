@@ -244,6 +244,19 @@ def _provisioning_context(playwright, base_url: str, username: str, password: st
     return ctx, csrf
 
 
+def _server_by_id(payload: Any, server_id: int) -> Optional[Dict[str, Any]]:
+    """Return one server from a list response, or None.
+
+    The API only exposes the collection (GET /api/servers); there is no
+    single-server route, so the poll must select from the list.
+    """
+    servers = payload if isinstance(payload, list) else payload.get("servers", [])
+    for server in servers:
+        if server.get("id") == server_id:
+            return server
+    return None
+
+
 @pytest.fixture(scope="module")
 def provisioned_protocols(
     playwright, base_url: str, admin_user: str, admin_pass: str
@@ -285,8 +298,9 @@ def provisioned_protocols(
             deadline = time.time() + _PROVISION_POLL_SECONDS
             while time.time() < deadline:
                 time.sleep(1)
-                updated = ctx.get(f"/api/servers/{server_id}")
-                if updated.ok and _is_protocol_installed(updated.json(), proto):
+                listed = ctx.get("/api/servers")
+                current = _server_by_id(listed.json() if listed.ok else {}, server_id)
+                if current and _is_protocol_installed(current, proto):
                     break
             else:
                 pytest.fail(
