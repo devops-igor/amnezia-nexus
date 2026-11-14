@@ -94,9 +94,10 @@ func newGatedPolicyServer(gate *policyGate, lists map[string][]string) *httptest
 			http.Error(w, "no such list", http.StatusNotFound)
 			return
 		}
-		if gate.admit(r.URL.Path) {
-			// The caller released this request after the replacement was accepted.
-		}
+		// admit blocks this request until the test releases the gate, which is what
+		// keeps the retired source's response in flight; the list is served once the
+		// replacement has been accepted.
+		gate.admit(r.URL.Path)
 		w.Header().Set("Content-Type", "text/plain")
 		for _, domain := range list {
 			fmt.Fprintln(w, domain)
