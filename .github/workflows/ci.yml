@@ -59,11 +59,13 @@ jobs:
         run: govulncheck ./...
 
   test:
-    name: Automated Test Suite
+    name: Go Race Shard ${{ matrix.shard }}/3
     runs-on: ubuntu-latest
-    # The race/coverage handler package can exceed Go's default 10m per-package
-    # timeout while the entire job still has capacity. Keep both limits bounded.
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
@@ -133,15 +135,22 @@ jobs:
       # TestLinuxE2E_PolicyEnablement (#678) is excluded for the same reason: it needs
       # root, /dev/net/tun and CAP_NET_RAW, and it is executed by name in the
       # wan-qualification job below, so the exclusion removes no obligation.
-      - name: Run Tests with Race Detector
+
+      - name: Run Tests with Race Detector (shard ${{ matrix.shard }})
         run: |
-          go test -race -cover -count=1 -timeout=15m -coverprofile=coverage.out \
-            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress|TestLinuxE2E_PolicyEnablement|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$' ./...
+          packages="$(python3 scripts/ci_go_shards.py --shard ${{ matrix.shard }} --shards 3)"
+          echo "shard ${{ matrix.shard }} package count: $(echo "$packages" | wc -w)"
+          go test -race -cover -count=1 -timeout=15m \
+            -coverprofile="coverage-shard-${{ matrix.shard }}.out" \
+            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress|TestLinuxE2E_PolicyEnablement|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$' \
+            $packages
 
       - name: Run Authentic Native Caddy Integration Tests
+        if: matrix.shard == 3
         run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
 
       - name: Run Vision Tests (non-race)
+        if: matrix.shard == 3
         run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
 
       # The automatic AWG admission pair runs inside the package job above, but a
@@ -151,6 +160,7 @@ jobs:
       # privacy-safe observations reach the log. It adds no assertion and changes no
       # qualification semantics: a failure here still fails the job.
       - name: Run Automatic AWG Admission Consumers
+        if: matrix.shard == 3
         run: |
           go test -v -race -count=1 -p 2 -parallel 2 -timeout 10m \
             -run '^(TestAutomaticSetupAdmitsAfterAuthenticAWGTraffic|TestAutomaticSetupRefusesWhenTheAWGPeerNeverAnswers)$' \
@@ -167,6 +177,7 @@ jobs:
       # provisioned by the steps above, so verify them first and fail closed here rather
       # than letting a missing dependency degrade into a silent skip.
       - name: Verify Automatic Naive Consumer Prerequisites
+        if: matrix.shard == 3
         run: |
           set -euo pipefail
           # No `|| true` here: a missing binary must fail this step, not be
@@ -183,6 +194,7 @@ jobs:
           /lib/ld-musl-x86_64.so.1 --list /usr/lib/x86_64-linux-musl/libgcc_s.so.1 >/dev/null
 
       - name: Run Automatic Naive Admission Consumers
+        if: matrix.shard == 3
         run: |
           set -uo pipefail
           log="$(mktemp)"
@@ -197,6 +209,70 @@ jobs:
             exit 1
           fi
           exit "$status"
+
+      - name: Upload Shard Coverage
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: coverage-shard-${{ matrix.shard }}.out
+          if-no-files-found: error
+          retention-days: 14
+
+  # Aggregate job: keeps the required check NAME "Automated Test Suite" and fails
+  # when any shard failed, so branch protection still gates the whole race suite.
+  # The gates that must not be sharded stay here.
+  test-aggregate:
+    name: Automated Test Suite
+    needs: [test]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fail when a test shard failed
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "::error::a Go race shard failed; see the shard jobs for details"
+            exit 1
+          fi
+
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Verify the shard assignment and coverage merge
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest==8.3.4
+          python -m pytest -p no:cacheprovider \
+            tests/test_ci_go_shards.py \
+            tests/test_ci_coverprofile_merge.py
+
+      - name: Download Shard Coverage
+        uses: actions/download-artifact@v7
+        with:
+          pattern: coverage-shard-*
+          path: coverage-shards
+
+      - name: Merge Shard Coverage
+        run: |
+          # Every shard profile is named explicitly. A wildcard would still match
+          # when one artifact is missing and would publish incomplete coverage as
+          # if it were complete; the merger fails on a missing path instead.
+          python3 scripts/merge_coverprofiles.py coverage.out \
+            coverage-shards/coverage-shard-1/coverage-shard-1.out \
+            coverage-shards/coverage-shard-2/coverage-shard-2.out \
+            coverage-shards/coverage-shard-3/coverage-shard-3.out
 
       - name: Upload Test Coverage
         uses: actions/upload-artifact@v7
@@ -249,9 +325,49 @@ jobs:
             tests/test_e2e_prerequisites.py \
             tests/test_e2e_skip_audit.py \
             tests/test_e2e_preflight.py \
+            tests/test_e2e_call_timing_privacy.py \
+            tests/test_e2e_timing_wiring.py \
+            tests/test_ci_offline_discovery.py \
+            tests/test_onboard_credentials.py \
             tests/test_naive_decoy_default_contract.py \
             tests/test_ci_native_dependencies.py \
             tests/test_ci_naive_consumer_steps.py
+
+  # The subprocess proof builds and runs the real Go panel, so it needs a
+  # toolchain and cannot live in the python-only privacy gate above. It is a
+  # separate job for the same reason it exists: a collector that finds nothing
+  # is indistinguishable from a provider that was fast, so the only real-output
+  # proof must fail rather than skip when Go is missing.
+  diagnostics-timing-collector:
+    name: Offline Timing Collector Proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Run the real-binary collector proof
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest==8.3.4
+          # The harness builds with GOPROXY=off so the proof cannot depend on the
+          # network, which means the module cache must be populated first. Do not
+          # rely on setup-go restoring a warm cache: a cold runner or a changed
+          # cache key would fail here instead of proving anything.
+          go mod download
+          TIMING_COLLECTOR_REQUIRE_GO=1 python -m pytest -p no:cacheprovider \
+            tests/test_e2e_call_timing_subprocess.py
 
   build-matrix:
     name: Cross-Compile Matrix (${{ matrix.target.os }}/${{ matrix.target.arch }})
