@@ -58,12 +58,14 @@ jobs:
       - name: Run govulncheck Vulnerability Scanner
         run: govulncheck ./...
 
-  test:
-    name: Automated Test Suite
+  test-shard:
+    name: Go Race Shard ${{ matrix.shard }}/3
     runs-on: ubuntu-latest
-    # The race/coverage handler package can exceed Go's default 10m per-package
-    # timeout while the entire job still has capacity. Keep both limits bounded.
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
@@ -120,8 +122,116 @@ jobs:
           grep -qa '__umodti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
           grep -qa '__udivti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
 
-      - name: Run Tests with Race Detector
-        run: go test -race -cover -count=1 -timeout=15m -coverprofile=coverage.out ./...
+      - name: Run Tests with Race Detector (shard ${{ matrix.shard }})
+        run: |
+          packages="$(python3 scripts/ci_go_shards.py --shard ${{ matrix.shard }} --shards 3)"
+          echo "shard ${{ matrix.shard }} package count: $(echo "$packages" | wc -w)"
+          go test -race -cover -count=1 -timeout=15m \
+            -coverprofile="coverage-shard-${{ matrix.shard }}.out" $packages
+
+      - name: Upload Shard Coverage
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: coverage-shard-${{ matrix.shard }}.out
+          retention-days: 14
+
+  # Aggregate job: it keeps the required check name "Automated Test Suite" and
+  # fails when any shard failed, so branch protection still gates on the whole
+  # race suite. It also runs the gates that must not be sharded: the non-race
+  # Vision suite and the native Caddy/admission consumers.
+  test:
+    name: Automated Test Suite
+    needs: [test-shard]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Fail when a test shard failed
+        run: |
+          if [ "${{ needs.test-shard.result }}" != "success" ]; then
+            echo "::error::a Go race shard failed; see the shard jobs for details"
+            exit 1
+          fi
+
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Set up Node.js for JSDOM Integration Tests
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Verify the shard assignment and coverage merge
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest==8.3.4
+          python -m pytest -p no:cacheprovider \
+            tests/test_ci_go_shards.py \
+            tests/test_ci_coverprofile_merge.py
+
+      - name: Install Pinned jsdom
+        run: |
+          npm install -g jsdom@29.1.1
+          echo "NODE_PATH=$(npm root -g)" >> "$GITHUB_ENV"
+
+      - name: Build Caddy with forwardproxy for Naive Smoke Tests
+        run: |
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
+          xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$(go env GOPATH)/bin/caddy"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # The musl loader comes from the same digest-pinned Alpine image as libgcc,
+      # so this step no longer depends on any Ubuntu package mirror. Alpine's
+      # loader resolves libc.so from itself and libgcc_s.so.1 through
+      # /etc/ld-musl-x86_64.path, which is the layout the pinned NaiveProxy
+      # release asset declares (interpreter /lib/ld-musl-x86_64.so.1,
+      # NEEDED libgcc_s.so.1 + libc.so). Every step below fails closed; a bad
+      # copy must fail here rather than turn the native tests into skips.
+      - name: Install musl loader and libgcc for Native NaiveProxy Tests
+        run: |
+          set -euo pipefail
+          ALPINE="alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
+          staging="$(mktemp -d)"
+          trap 'rm -rf "$staging"' EXIT
+          docker run --rm -v "$staging:/out" "$ALPINE" sh -euc \
+            'apk add --no-cache libgcc && cp -L /lib/ld-musl-x86_64.so.1 /usr/lib/libgcc_s.so.1 /out/'
+          test -s "$staging/ld-musl-x86_64.so.1"
+          test -s "$staging/libgcc_s.so.1"
+          sudo install -D -m 0755 "$staging/ld-musl-x86_64.so.1" /lib/ld-musl-x86_64.so.1
+          sudo install -D -m 0644 "$staging/libgcc_s.so.1" /usr/lib/x86_64-linux-musl/libgcc_s.so.1
+          printf '/lib\n/usr/lib/x86_64-linux-musl\n' | sudo tee /etc/ld-musl-x86_64.path >/dev/null
+          # Usability proof. The loader exits 1 and prints its banner even when
+          # nothing loads, so grepping that banner proves nothing; --list must
+          # actually execute the loader and parse the installed libgcc as a
+          # dynamic object with resolvable dependencies.
+          /lib/ld-musl-x86_64.so.1 --list /usr/lib/x86_64-linux-musl/libgcc_s.so.1 >/dev/null
+          # NaiveProxy needs these 128-bit helpers; a wrong or truncated libgcc
+          # fails relocation at native-test time, so assert them up front.
+          grep -qa '__umodti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
+          grep -qa '__udivti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
+      - name: Download Shard Coverage
+        uses: actions/download-artifact@v7
+        with:
+          pattern: coverage-shard-*
+          path: coverage-shards
+
+      - name: Merge Shard Coverage
+        run: |
+          python3 scripts/merge_coverprofiles.py coverage.out \
+            coverage-shards/*/coverage-shard-*.out
 
       - name: Run Authentic Native Caddy Integration Tests
         run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
@@ -129,7 +239,7 @@ jobs:
       - name: Run Vision Tests (non-race)
         run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
 
-      # The automatic AWG admission pair runs inside the package job above, but a
+      # The automatic AWG admission pair runs inside the race shards above, but a
       # package-level PASS reports neither which tests ran nor what the pre-rollback
       # capture observed, so a remote-only AWG stall could not be attributed. This
       # selects the two existing tests by anchored name and keeps -v so their
@@ -141,7 +251,7 @@ jobs:
             -run '^(TestAutomaticSetupAdmitsAfterAuthenticAWGTraffic|TestAutomaticSetupRefusesWhenTheAWGPeerNeverAnswers)$' \
             ./internal/handlers/
 
-      # The automatic Naive admission trio runs inside the package job above, but a
+      # The automatic Naive admission trio runs inside the race shards above, but a
       # package-level PASS reports neither which tests ran nor whether the payload
       # actually traversed the proxy. This selects them by anchored name and keeps -v
       # so each result and its payload counters are individually visible. It adds no
