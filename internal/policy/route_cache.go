@@ -196,12 +196,54 @@ func (c *RouteCache) Open(scope Scope) (*SessionCache, error) {
 	return s, nil
 }
 
+// Get returns the session cache already owned by scope without creating one.
+//
+// Lifecycle-bound callers must use this accessor instead of Open: a missing
+// scope means the session currently owns no route evidence, either because it
+// has not observed anything yet or because its scope was released when the
+// session retired. Creating on read is not observable to the caller (an empty
+// scope answers Unknown anyway) but permanently consumes one of the bounded
+// MaxSessions slots that no retirement event will ever release.
+func (c *RouteCache) Get(scope Scope) *SessionCache {
+	if scope.SessionID == "" {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sessions[scope]
+}
+
+// SessionCount returns the number of admitted session scopes.
+//
+// Invalidate removes a released scope from this count, so the value stays
+// bounded by MaxSessions across churn and never accumulates retired
+// identities.
+func (c *RouteCache) SessionCount() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.sessions)
+}
+
 // Scope returns the authentication scope for this session cache.
 func (s *SessionCache) Scope() Scope {
 	if s == nil {
 		return Scope{}
 	}
 	return s.scope
+}
+
+// Retired reports whether this session cache was invalidated. A retired cache
+// refuses observations and answers Unknown, so callers that record work on
+// behalf of a session must check this before their delayed result is applied.
+func (s *SessionCache) Retired() bool {
+	if s == nil {
+		return true
+	}
+	v := s.view.Load()
+	return v == nil || v.retired
 }
 
 // Lookup queries the route decision for destination IPv4 under the active policy generation.
@@ -458,6 +500,10 @@ func (s *SessionCache) Observe(policyGeneration string, batch []Observation, now
 
 // Invalidate permanently retires this session cache, publishing an empty retired view.
 // Synchronous, memory-only, and idempotent.
+//
+// The map entry is removed only while it still points at this cache: a stale
+// invalidation (for example one that raced a re-admission of the same session)
+// must not delete the replacement scope that now owns the key.
 func (s *SessionCache) Invalidate() {
 	c := s.cache
 	c.mu.Lock()
@@ -476,7 +522,9 @@ func (s *SessionCache) Invalidate() {
 	if oldV != nil {
 		c.totalEntries -= len(oldV.entries)
 	}
-	delete(c.sessions, s.scope)
+	if current, ok := c.sessions[s.scope]; ok && current == s {
+		delete(c.sessions, s.scope)
+	}
 }
 
 // Sweep prunes expired entries from active sessions and cleans up expired quarantine deadlines.

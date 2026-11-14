@@ -133,6 +133,13 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 		if f.directEgress != nil {
 			f.directEgress.PurgePeer(peerKey)
 		}
+		// A replacement session owns a fresh scope. Release the replaced
+		// session's cache scope, but never the one being re-registered: a
+		// rekey replaces the route of the SAME authenticated session, whose
+		// route evidence must survive.
+		if old.sessionID != sessionID {
+			f.retireSessionScope(old.sessionID)
+		}
 	}
 	// Keep the registration count for diagnostics. Route retirement itself
 	// uses the session ID, because rekeys replace routes without a matching
@@ -236,8 +243,47 @@ func (f *Forwarder) beginUnregisterSession(peerKey, sessionID string) (retiremen
 		if f.directEgress != nil {
 			f.directEgress.PurgePeer(peerKey)
 		}
+		// The authenticated session is gone: release the session-scoped route
+		// cache evidence together with its route instead of leaving it to
+		// consume bounded cache capacity for the rest of the process lifetime.
+		f.retireSessionScope(route.sessionID)
 	}
 	return retirement
+}
+
+// retireSessionScope releases the route cache scope owned by a retired session.
+//
+// Caller must hold f.mu (write): the route removal and the scope release then
+// happen in one critical section, so a liveness-fenced allocator cannot observe
+// "route gone, scope still admitted" and re-create the released scope.
+func (f *Forwarder) retireSessionScope(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	if retirer, ok := f.routeCache.(SessionScopeRetirer); ok {
+		retirer.RetireSessionScope(sessionID)
+	}
+}
+
+// HasLiveSession reports whether a registered, non-retired route still belongs
+// to sessionID. It is the liveness oracle for session-scoped cache allocation:
+// a scope may only be created while the authenticated route that owns it is
+// still registered.
+//
+// The scan is bounded by the active-route limit and is used when a session has
+// no scope yet, not on every packet.
+func (f *Forwarder) HasLiveSession(sessionID string) bool {
+	if f == nil || sessionID == "" {
+		return false
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for _, route := range f.routesByPeer {
+		if route != nil && !route.retired.Load() && route.sessionID == sessionID {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateSessionBackend updates the assigned backend tunnel for a session (e.g. during failover).
@@ -279,6 +325,7 @@ func (f *Forwarder) retireRoutesMatchingLocked(predicate func(*sessionRoute) boo
 		if f.directEgress != nil {
 			f.directEgress.PurgePeer(route.peerKey)
 		}
+		f.retireSessionScope(route.sessionID)
 	}
 	return retirements
 }

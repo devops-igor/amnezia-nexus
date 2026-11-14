@@ -49,6 +49,20 @@ type RouteCache interface {
 	Lookup(sessionID string, ip netip.Addr) policy.Decision
 }
 
+// SessionScopeRetirer is an optional RouteCache capability. A cache that
+// implements it keeps per-session scope state which MUST be released when the
+// authenticated session's route retires; otherwise the scope outlives its
+// session and permanently consumes the cache's bounded session capacity.
+//
+// The forwarder invokes it from the write section that removes the route, so a
+// consumer that fences its allocation on route liveness can never re-admit a
+// released scope. Implementations must stay memory-only and must not call back
+// into the forwarder: the forwarder lock sits above the cache lock in the lock
+// order.
+type SessionScopeRetirer interface {
+	RetireSessionScope(sessionID string)
+}
+
 // DNSHandler processes DNS packets addressed to the designated gateway DNS IPv4 address.
 type DNSHandler interface {
 	HandleDNSPacket(sessionID, peerKey, assignedIP string, path *ReturnPath, packet []byte) (bool, error)

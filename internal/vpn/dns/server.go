@@ -149,7 +149,10 @@ func (s *Server) ObserveResponseWithSessionID(req, resp *mdns.Msg, session *poli
 	s.mu.Lock()
 	obs := s.observer
 	s.mu.Unlock()
-	if obs != nil && sessionID != "" {
+	// A retired scope must not be re-observed by session ID: the observer would
+	// allocate a fresh session cache for a session that already released it.
+	// Skipping keeps a delayed/in-flight response from resurrecting the scope.
+	if obs != nil && sessionID != "" && (session == nil || !session.Retired()) {
 		_ = obs.ObserveDNSResponse(sessionID, req, resp)
 	}
 }
