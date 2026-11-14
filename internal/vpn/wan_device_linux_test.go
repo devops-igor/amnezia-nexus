@@ -1,0 +1,892 @@
+//go:build linux
+
+package vpn
+
+import (
+	"encoding/binary"
+	"errors"
+	"net/netip"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+
+	"golang.org/x/sys/unix"
+)
+
+// TestProductionWANDevice_UnprivilegedRefusal pins that the production constructor
+// fails closed with a clear, non-panicking error when the process cannot create a
+// TUN device. It asserts behaviour, so it is meaningful in every environment and
+// does not depend on the runner's own kernel settings.
+func TestProductionWANDevice_UnprivilegedRefusal(t *testing.T) {
+	if os.Geteuid() == 0 {
+		// As real root the constructor legitimately proceeds; the failure path this
+		// test pins is only reachable without the privilege.
+		dev, err := NewProductionWANDevice("nexus-wan-unpriv-probe")
+		if err == nil {
+			_ = dev.Close()
+			t.Skip("running as root: the unprivileged refusal path is not reachable here")
+		}
+		t.Logf("constructor refused as root for an environment reason: %v", err)
+		return
+	}
+	dev, err := NewProductionWANDevice("nexus-wan-unpriv-probe")
+	if err == nil {
+		_ = dev.Close()
+		t.Fatalf("a non-root process must not obtain a production WAN device")
+	}
+	if dev != nil {
+		t.Fatalf("constructor returned a non-nil device alongside an error: %v", err)
+	}
+	t.Logf("constructor refused a non-root process with: %v", err)
+}
+
+// s4OwnedNamespaceChildEnv marks a child that the lifecycle test launched into its own
+// namespace, so the child runs the assertions instead of launching again.
+const s4OwnedNamespaceChildEnv = "NEXUS_S4_LIFECYCLE_CHILD"
+
+// TestProductionWANDevice_PermissionsAndLifecycle verifies the TUN ioctl lifecycle
+// against a real device.
+//
+// It cannot do that in the runner's host namespace: NewProductionWANDevice refuses an
+// effective rp_filter it cannot prove is 0, and the host's value belongs to the operator.
+// So the parent re-launches this binary inside a namespace the run owns and lets the
+// child execute the assertions there. A plain `go test` invocation of this test therefore
+// still does the right thing on its own, which is what makes it safe to select from a
+// command line without any external wrapper.
+func TestProductionWANDevice_PermissionsAndLifecycle(t *testing.T) {
+	if os.Getenv(s4OwnedNamespaceChildEnv) != "1" {
+		out, err := s4LaunchInOwnedNamespace("^"+t.Name()+"$", []string{s4OwnedNamespaceChildEnv + "=1"})
+		if err != nil {
+			if s4RequiredEnvironment() {
+				t.Fatalf("the TUN lifecycle qualification could not run inside a run-owned namespace, so it is unproven: %v\n%s", err, out)
+			}
+			t.Skipf("skipping: cannot create an owned namespace here: %v", err)
+		}
+		if !strings.Contains(out, "--- PASS") || strings.Contains(out, "--- SKIP") {
+			t.Fatalf("the lifecycle assertions did not run and pass inside the owned namespace:\n%s", out)
+		}
+		t.Logf("lifecycle assertions passed inside the owned namespace:\n%s", out)
+		return
+	}
+
+	// Child body: running in the namespace the parent created for this run.
+	if err := s4RequireOwnedNamespace(); err != nil {
+		t.Fatalf("child was selected without a run-owned namespace: %v", err)
+	}
+	// Initial setup is itself a guarded write path, so the child configures the settings
+	// NewProductionWANDevice requires rather than inheriting whatever the parent had.
+	if err := configurePrivateNamespaceSetup(); err != nil {
+		t.Fatalf("configure owned namespace: %v", err)
+	}
+	// The constructor also requires a host WAN address (checkWANRoute ->
+	// DeriveHostWANIP). A fresh namespace has only lo, so the child builds the uplink a
+	// deployment would have before calling it. The constructor itself is unchanged.
+	if err := s4BuildOwnedNamespaceUplink(); err != nil {
+		t.Fatalf("provide the owned namespace's WAN uplink: %v", err)
+	}
+
+	dev, err := NewProductionWANDevice("nexus-wan-test")
+	if err != nil {
+		t.Fatalf("NewProductionWANDevice failed inside the owned namespace, which provides every prerequisite: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+
+	// Verify accept_local is effective on the device the constructor just created.
+	if alData, alErr := os.ReadFile("/proc/sys/net/ipv4/conf/nexus-wan-test/accept_local"); alErr == nil {
+		if val := strings.TrimSpace(string(alData)); val != "1" {
+			t.Fatalf("expected accept_local=1 on nexus-wan-test inside the owned namespace, got %q", val)
+		}
+	}
+
+	// Verify device is writable (UP state allows writes without EIO)
+	pkt := []byte{
+		0x45, 0x00, 0x00, 0x14,
+		0x00, 0x01, 0x00, 0x00,
+		0x40, 0x00, 0x00, 0x00,
+		0x7f, 0x00, 0x00, 0x01,
+		0x7f, 0x00, 0x00, 0x01,
+	}
+	n, err := dev.Write(pkt)
+	if err != nil {
+		t.Fatalf("write to UP TUN device failed: %v", err)
+	}
+	if n != len(pkt) {
+		t.Fatalf("expected write %d bytes, got %d", len(pkt), n)
+	}
+}
+
+func TestLinuxWANDevice_ReturnPacketCaptureAndFiltering(t *testing.T) {
+	// Create datagram socket pair for raw socket simulation (preserves packet boundaries)
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		t.Fatalf("create datagram socketpair: %v", err)
+	}
+	rawR := os.NewFile(uintptr(fds[0]), "raw-r")
+	rawW := os.NewFile(uintptr(fds[1]), "raw-w")
+	defer func() { _ = rawR.Close(); _ = rawW.Close() }()
+
+	tunR, tunW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create tun pipe: %v", err)
+	}
+	defer func() { _ = tunR.Close(); _ = tunW.Close() }()
+
+	hostWAN := netip.MustParseAddr("203.0.113.1")
+	remoteServer := netip.MustParseAddr("1.1.1.1")
+
+	dev := newLinuxWANDeviceWithFiles(tunW, rawR, "test-wan", 40000, 65000, hostWAN)
+	defer func() { _ = dev.Close() }()
+
+	// 1. Write an invalid packet into rawW (should be skipped by Read)
+	invalidPkt := []byte{0x00, 0x01, 0x02, 0x03}
+	if _, err := rawW.Write(invalidPkt); err != nil {
+		t.Fatalf("write invalid packet: %v", err)
+	}
+
+	// 2. Write a packet to non-NAT port 80 (should be skipped by Read)
+	nonNATPortPkt := buildTestPBRTCPPacket(remoteServer, hostWAN, 80, 80, []byte("http-reply"))
+	if _, err := rawW.Write(nonNATPortPkt); err != nil {
+		t.Fatalf("write non-NAT port packet: %v", err)
+	}
+
+	// 3. Write a packet to wrong destination IP (should be skipped by Read)
+	wrongIPPkt := buildTestPBRTCPPacket(remoteServer, netip.MustParseAddr("192.168.1.1"), 80, 40001, []byte("wrong-ip"))
+	if _, err := rawW.Write(wrongIPPkt); err != nil {
+		t.Fatalf("write wrong IP packet: %v", err)
+	}
+
+	// 4. Write a valid TCP return packet to NAT port 40001 (MUST be delivered by Read)
+	validTCPReturn := buildTestPBRTCPPacket(remoteServer, hostWAN, 80, 40001, []byte("tcp-reply-data"))
+	if _, err := rawW.Write(validTCPReturn); err != nil {
+		t.Fatalf("write valid TCP return packet: %v", err)
+	}
+
+	buf := make([]byte, 65535)
+	n, err := dev.Read(buf)
+	if err != nil {
+		t.Fatalf("Read valid TCP return packet failed: %v", err)
+	}
+	if n != len(validTCPReturn) {
+		t.Fatalf("expected Read %d bytes, got %d", len(validTCPReturn), n)
+	}
+	// Verify dst port is 40001
+	ihl := int(buf[0]&0x0f) * 4
+	gotDstPort := binary.BigEndian.Uint16(buf[ihl+2 : ihl+4])
+	if gotDstPort != 40001 {
+		t.Fatalf("expected destination port 40001, got %d", gotDstPort)
+	}
+
+	// 5. Write a valid UDP return packet to NAT port 50005 (MUST be delivered by Read)
+	validUDPReturn := buildTestPBRUDPPacket(remoteServer, hostWAN, 53, 50005, []byte("udp-reply-data"))
+	if _, err := rawW.Write(validUDPReturn); err != nil {
+		t.Fatalf("write valid UDP return packet: %v", err)
+	}
+	n, err = dev.Read(buf)
+	if err != nil {
+		t.Fatalf("Read valid UDP return packet failed: %v", err)
+	}
+	if n != len(validUDPReturn) {
+		t.Fatalf("expected Read %d bytes, got %d", len(validUDPReturn), n)
+	}
+	ihl = int(buf[0]&0x0f) * 4
+	gotDstPort = binary.BigEndian.Uint16(buf[ihl+2 : ihl+4])
+	if gotDstPort != 50005 {
+		t.Fatalf("expected destination port 50005, got %d", gotDstPort)
+	}
+
+	// 6. Test Write to device
+	outPkt := []byte{0x45, 0x00, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01}
+	wn, err := dev.Write(outPkt)
+	if err != nil {
+		t.Fatalf("Write to device failed: %v", err)
+	}
+	if wn != len(outPkt) {
+		t.Fatalf("expected Write %d bytes, got %d", len(outPkt), wn)
+	}
+
+	// 7. Test Close
+	if err := dev.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+}
+
+func TestLinuxWANDevice_R8B2_ResetSuppressionRuleLifecycle(t *testing.T) {
+	tunR, tunW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create pipe: %v", err)
+	}
+	defer func() { _ = tunR.Close(); _ = tunW.Close() }()
+
+	var mu sync.Mutex
+	var executedCommands [][]string
+	mockRunner := func(args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		cp := make([]string, len(args))
+		copy(cp, args)
+		executedCommands = append(executedCommands, cp)
+		if len(args) > 0 && args[0] == "-C" {
+			// Rule does not exist yet -> trigger install
+			return errors.New("rule does not exist")
+		}
+		return nil
+	}
+
+	dev := newLinuxWANDeviceWithFiles(tunW, nil, "test-wan", 40000, 65000, netip.Addr{})
+	dev.iptablesRunner = mockRunner
+
+	// 1. Initial SetHostWANIP installs socket RETURN and DROP rules for both TCP and UDP
+	ip1 := netip.MustParseAddr("203.0.113.10")
+	if err := dev.SetHostWANIP(ip1); err != nil {
+		t.Fatalf("SetHostWANIP failed: %v", err)
+	}
+	if !dev.iptablesInstalled {
+		t.Fatalf("expected iptablesInstalled to be true after successful installation")
+	}
+
+	mu.Lock()
+	cmds := make([][]string, len(executedCommands))
+	copy(cmds, executedCommands)
+	mu.Unlock()
+
+	hasTCPReturn := false
+	hasUDPReturn := false
+	hasTCPDrop := false
+	hasUDPDrop := false
+	hasInputJump := false
+	for _, cmd := range cmds {
+		joined := strings.Join(cmd, " ")
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j RETURN") {
+			hasTCPReturn = true
+		}
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p udp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j RETURN") {
+			hasUDPReturn = true
+		}
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.10 -j DROP") {
+			hasTCPDrop = true
+		}
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p udp --dport 40000:65000 -d 203.0.113.10 -j DROP") {
+			hasUDPDrop = true
+		}
+		if strings.Contains(joined, "-I INPUT 1 -j NEXUS_WAN_RESET") {
+			hasInputJump = true
+		}
+	}
+	if !hasTCPReturn || !hasUDPReturn {
+		t.Fatalf("expected NEXUS_WAN_RESET socket RETURN rules for tcp and udp, got: %v", cmds)
+	}
+	if !hasTCPDrop || !hasUDPDrop {
+		t.Fatalf("expected NEXUS_WAN_RESET DROP rules for tcp and udp, got: %v", cmds)
+	}
+	if !hasInputJump {
+		t.Fatalf("expected -I INPUT 1 -j NEXUS_WAN_RESET jump rule, got: %v", cmds)
+	}
+
+	// 2. Calling SetHostWANIP with the same IP is idempotent
+	mu.Lock()
+	countBefore := len(executedCommands)
+	mu.Unlock()
+	if err := dev.SetHostWANIP(ip1); err != nil {
+		t.Fatalf("idempotent SetHostWANIP failed: %v", err)
+	}
+	mu.Lock()
+	countAfter := len(executedCommands)
+	mu.Unlock()
+	if countAfter != countBefore {
+		t.Fatalf("expected idempotent SetHostWANIP to not re-run iptables, ran %d additional commands", countAfter-countBefore)
+	}
+
+	// 3. Changing HostWANIP tears down old rules and installs new ones
+	ip2 := netip.MustParseAddr("203.0.113.20")
+	if err := dev.SetHostWANIP(ip2); err != nil {
+		t.Fatalf("SetHostWANIP with new IP failed: %v", err)
+	}
+
+	mu.Lock()
+	cmdsAfterChange := make([][]string, len(executedCommands))
+	copy(cmdsAfterChange, executedCommands)
+	mu.Unlock()
+
+	hasOldTCPReturnDel := false
+	hasOldTCPDropDel := false
+	hasNewTCPReturnIns := false
+	hasNewTCPDropIns := false
+	for _, cmd := range cmdsAfterChange[countBefore:] {
+		joined := strings.Join(cmd, " ")
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.10 -m socket --nowildcard -j RETURN") {
+			hasOldTCPReturnDel = true
+		}
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.10 -j DROP") {
+			hasOldTCPDropDel = true
+		}
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j RETURN") {
+			hasNewTCPReturnIns = true
+		}
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
+			hasNewTCPDropIns = true
+		}
+	}
+	if !hasOldTCPReturnDel || !hasOldTCPDropDel || !hasNewTCPReturnIns || !hasNewTCPDropIns {
+		t.Fatalf("expected old TCP rules deleted and new TCP rules inserted on IP change, got: %v", cmdsAfterChange[countBefore:])
+	}
+
+	// 4. Close cleans up all active rules
+	if err := dev.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	mu.Lock()
+	finalCmds := make([][]string, len(executedCommands))
+	copy(finalCmds, executedCommands)
+	mu.Unlock()
+
+	hasFinalTCPReturnDel := false
+	hasFinalTCPDropDel := false
+	hasFinalUDPReturnDel := false
+	hasFinalUDPDropDel := false
+	hasFinalJumpDel := false
+	for _, cmd := range finalCmds {
+		joined := strings.Join(cmd, " ")
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j RETURN") {
+			hasFinalTCPReturnDel = true
+		}
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
+			hasFinalTCPDropDel = true
+		}
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p udp --dport 40000:65000 -d 203.0.113.20 -m socket --nowildcard -j RETURN") {
+			hasFinalUDPReturnDel = true
+		}
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p udp --dport 40000:65000 -d 203.0.113.20 -j DROP") {
+			hasFinalUDPDropDel = true
+		}
+		if strings.Contains(joined, "-D INPUT -j NEXUS_WAN_RESET") {
+			hasFinalJumpDel = true
+		}
+	}
+	if !hasFinalTCPReturnDel || !hasFinalTCPDropDel || !hasFinalUDPReturnDel || !hasFinalUDPDropDel || !hasFinalJumpDel {
+		t.Fatalf("expected Close to delete all active rules and jump for %s, got: %v", ip2, finalCmds)
+	}
+}
+
+func TestLinuxWANDevice_R9H1_FailClosedAndRetry(t *testing.T) {
+	tunR, tunW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create pipe: %v", err)
+	}
+	defer func() { _ = tunR.Close(); _ = tunW.Close() }()
+
+	var mu sync.Mutex
+	calls := 0
+	failRunner := true
+	runner := func(args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if failRunner {
+			return errors.New("iptables: permission denied")
+		}
+		if len(args) > 0 && args[0] == "-C" {
+			return errors.New("absent")
+		}
+		return nil
+	}
+
+	dev := newLinuxWANDeviceWithFiles(tunW, nil, "test-wan", 40000, 65000, netip.Addr{})
+	dev.iptablesRunner = runner
+	defer func() { _ = dev.Close() }()
+
+	ip := netip.MustParseAddr("203.0.113.30")
+
+	// 1. Installation failure returns error and leaves iptablesInstalled = false
+	err = dev.SetHostWANIP(ip)
+	if err == nil {
+		t.Fatalf("expected error from failed iptables runner, got nil")
+	}
+	if dev.iptablesInstalled {
+		t.Fatalf("expected iptablesInstalled to remain false on failure")
+	}
+
+	mu.Lock()
+	initialCalls := calls
+	mu.Unlock()
+	if initialCalls == 0 {
+		t.Fatalf("expected runner to be called")
+	}
+
+	// 2. Calling SetHostWANIP with the same IP RETRIES instead of early-exiting
+	err = dev.SetHostWANIP(ip)
+	if err == nil {
+		t.Fatalf("expected second attempt to fail while runner fails")
+	}
+	mu.Lock()
+	secondCalls := calls
+	mu.Unlock()
+	if secondCalls <= initialCalls {
+		t.Fatalf("expected same-IP call to retry runner, got calls before=%d after=%d", initialCalls, secondCalls)
+	}
+
+	// 3. When iptables runner recovers, retry succeeds and marks iptablesInstalled = true
+	mu.Lock()
+	failRunner = false
+	mu.Unlock()
+
+	err = dev.SetHostWANIP(ip)
+	if err != nil {
+		t.Fatalf("expected recovered runner to succeed, got: %v", err)
+	}
+	if !dev.iptablesInstalled {
+		t.Fatalf("expected iptablesInstalled to be true after recovered attempt")
+	}
+}
+
+func TestLinuxWANDevice_R9H1_RollbackOnPartialFailure(t *testing.T) {
+	tunR, tunW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create pipe: %v", err)
+	}
+	defer func() { _ = tunR.Close(); _ = tunW.Close() }()
+
+	var mu sync.Mutex
+	var executedCommands [][]string
+	runner := func(args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		cp := make([]string, len(args))
+		copy(cp, args)
+		executedCommands = append(executedCommands, cp)
+
+		if len(args) > 0 && args[0] == "-C" {
+			return errors.New("absent")
+		}
+		// Simulate failure on UDP socket accept rule
+		joined := strings.Join(args, " ")
+		if strings.Contains(joined, "-A NEXUS_WAN_RESET -p udp") && strings.Contains(joined, "-m socket") {
+			return errors.New("iptables: kernel module not available for udp socket match")
+		}
+		return nil
+	}
+
+	dev := newLinuxWANDeviceWithFiles(tunW, nil, "test-wan", 40000, 65000, netip.Addr{})
+	dev.iptablesRunner = runner
+	defer func() { _ = dev.Close() }()
+
+	ip := netip.MustParseAddr("203.0.113.40")
+	err = dev.SetHostWANIP(ip)
+	if err == nil {
+		t.Fatalf("expected error on partial failure, got nil")
+	}
+	if dev.iptablesInstalled {
+		t.Fatalf("expected iptablesInstalled to remain false on partial failure")
+	}
+
+	// Verify rollback deleted the rules that were installed before the failure
+	mu.Lock()
+	cmds := make([][]string, len(executedCommands))
+	copy(cmds, executedCommands)
+	mu.Unlock()
+
+	hasRollbackTCPDrop := false
+	hasRollbackTCPReturn := false
+	for _, cmd := range cmds {
+		joined := strings.Join(cmd, " ")
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.40 -j DROP") {
+			hasRollbackTCPDrop = true
+		}
+		if strings.Contains(joined, "-D NEXUS_WAN_RESET -p tcp --dport 40000:65000 -d 203.0.113.40 -m socket --nowildcard -j RETURN") {
+			hasRollbackTCPReturn = true
+		}
+	}
+	if !hasRollbackTCPDrop || !hasRollbackTCPReturn {
+		t.Fatalf("expected rollback to delete installed TCP drop and return rules, executed commands: %v", cmds)
+	}
+}
+
+func TestLinuxWANDevice_R9B1_AuditProbeExcludesHostTraffic(t *testing.T) {
+	tunR, tunW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create pipe: %v", err)
+	}
+	defer func() { _ = tunR.Close(); _ = tunW.Close() }()
+
+	var rules []string
+	runner := func(args ...string) error {
+		if len(args) > 0 && args[0] == "-C" {
+			return errors.New("absent")
+		}
+		if len(args) > 0 && (args[0] == "-I" || args[0] == "-A") {
+			rules = append(rules, strings.Join(args, " "))
+		}
+		return nil
+	}
+
+	dev := newLinuxWANDeviceWithFiles(tunW, nil, "audit", 40000, 65000, netip.Addr{})
+	dev.iptablesRunner = runner
+	defer func() { _ = dev.Close() }()
+
+	ip := netip.MustParseAddr("203.0.113.10")
+	if err := dev.SetHostWANIP(ip); err != nil {
+		t.Fatalf("SetHostWANIP failed: %v", err)
+	}
+
+	// Ordinary established host HTTPS/DNS return to local ephemeral port 50000.
+	// Verify no unconditional DROP rule exists in INPUT.
+	for _, rule := range rules {
+		if strings.Contains(rule, "INPUT") && strings.Contains(rule, "--dport 40000:65000 -d 203.0.113.10 -j DROP") {
+			t.Errorf("unconditional DROP rule found in INPUT: %s", rule)
+		}
+	}
+
+	// Verify that socket-match rules are emitted in NEXUS_WAN_RESET with RETURN target (R11-B1)
+	hasSocketMatch := false
+	for _, rule := range rules {
+		if strings.Contains(rule, "NEXUS_WAN_RESET") && strings.Contains(rule, "-m socket --nowildcard -j RETURN") {
+			hasSocketMatch = true
+		}
+	}
+	if !hasSocketMatch {
+		t.Fatalf("expected socket match RETURN rule in NEXUS_WAN_RESET: %v", rules)
+	}
+}
+
+func TestLinuxWANDevice_R10B1_INPUTSeededEstablishedAccept_NoSocketDropsAndHostSurvives(t *testing.T) {
+	tunR, tunW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create pipe: %v", err)
+	}
+	defer func() { _ = tunR.Close(); _ = tunW.Close() }()
+
+	// Seed INPUT chain with a conventional firewall established ACCEPT rule:
+	// -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+	type iptablesRule struct {
+		args []string
+	}
+	var mu sync.Mutex
+	chains := map[string][]iptablesRule{
+		"INPUT": {
+			{args: []string{"-A", "INPUT", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"}},
+		},
+	}
+
+	runner := func(args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(args) == 0 {
+			return nil
+		}
+		switch args[0] {
+		case "-N":
+			chain := args[1]
+			if _, exists := chains[chain]; exists {
+				return errors.New("chain already exists")
+			}
+			chains[chain] = []iptablesRule{}
+			return nil
+		case "-F":
+			chain := args[1]
+			chains[chain] = []iptablesRule{}
+			return nil
+		case "-X":
+			chain := args[1]
+			delete(chains, chain)
+			return nil
+		case "-C":
+			chain := args[1]
+			rules := chains[chain]
+			target := strings.Join(args[2:], " ")
+			for _, r := range rules {
+				if strings.Join(r.args[2:], " ") == target {
+					return nil
+				}
+			}
+			return errors.New("rule does not exist")
+		case "-I":
+			chain := args[1]
+			ruleArgs := args[2:]
+			pos := 0
+			if len(ruleArgs) > 0 && ruleArgs[0] == "1" {
+				ruleArgs = ruleArgs[1:]
+			}
+			newRule := iptablesRule{args: append([]string{"-A", chain}, ruleArgs...)}
+			if pos >= len(chains[chain]) {
+				chains[chain] = append(chains[chain], newRule)
+			} else {
+				chains[chain] = append(chains[chain][:pos+1], chains[chain][pos:]...)
+				chains[chain][pos] = newRule
+			}
+			return nil
+		case "-A":
+			chain := args[1]
+			chains[chain] = append(chains[chain], iptablesRule{args: args})
+			return nil
+		case "-D":
+			chain := args[1]
+			target := strings.Join(args[2:], " ")
+			rules := chains[chain]
+			for i, r := range rules {
+				if strings.Join(r.args[2:], " ") == target {
+					chains[chain] = append(rules[:i], rules[i+1:]...)
+					return nil
+				}
+			}
+			return nil
+		}
+		return nil
+	}
+
+	dev := newLinuxWANDeviceWithFiles(tunW, nil, "wan-r10b1", 40000, 65000, netip.Addr{})
+	dev.iptablesRunner = runner
+	defer func() { _ = dev.Close() }()
+
+	hostIP := netip.MustParseAddr("203.0.113.50")
+	if err := dev.SetHostWANIP(hostIP); err != nil {
+		t.Fatalf("SetHostWANIP failed: %v", err)
+	}
+
+	// Packet evaluation model simulating netfilter traversal across INPUT and NEXUS_WAN_RESET:
+	evalPacket := func(proto string, dport uint16, dst netip.Addr, hasSocket bool, ctstate string) string {
+		mu.Lock()
+		defer mu.Unlock()
+
+		var evalChain func(chainName string) (decision string, returned bool)
+		evalChain = func(chainName string) (decision string, returned bool) {
+			rules := chains[chainName]
+			for _, r := range rules {
+				cmd := strings.Join(r.args, " ")
+				if strings.Contains(cmd, "-j NEXUS_WAN_RESET") {
+					dec, ret := evalChain("NEXUS_WAN_RESET")
+					if !ret {
+						return dec, false
+					}
+					continue
+				}
+				if strings.Contains(cmd, "-m conntrack --ctstate RELATED,ESTABLISHED") && strings.Contains(cmd, "-j ACCEPT") {
+					if ctstate == "ESTABLISHED" || ctstate == "RELATED" {
+						return "ACCEPT", false
+					}
+				}
+				ruleMatchesPortRange := strings.Contains(cmd, "--dport 40000:65000")
+				portMatches := ruleMatchesPortRange && (dport >= 40000 && dport <= 65000)
+				ipMatches := strings.Contains(cmd, "-d "+hostIP.String()) && dst == hostIP
+				protoMatches := strings.Contains(cmd, "-p "+proto)
+
+				if portMatches && ipMatches && protoMatches {
+					if strings.Contains(cmd, "-m socket --nowildcard") && strings.Contains(cmd, "-j RETURN") {
+						if hasSocket {
+							return "RETURN", true
+						}
+					} else if strings.Contains(cmd, "-j DROP") {
+						return "DROP", false
+					}
+				}
+			}
+			return "NONE", true
+		}
+
+		dec, _ := evalChain("INPUT")
+		return dec
+	}
+
+	// 1. Direct return packet for direct NAT egress:
+	// Conntrack sees it as ESTABLISHED (because outbound SYN was tracked),
+	// but there is NO local host socket (hasSocket = false).
+	// Before R10-B1 fix (DROP appended after established ACCEPT), this returned "ACCEPT" -> kernel RST.
+	// With R10-B1 fix (NEXUS_WAN_RESET at position 1), this MUST hit DROP!
+	decisionNoSocket := evalPacket("tcp", 50000, hostIP, false, "ESTABLISHED")
+	if decisionNoSocket != "DROP" {
+		t.Fatalf("expected direct no-socket return packet to hit DROP, got: %s", decisionNoSocket)
+	}
+
+	// 2. Host socket return packet (e.g. host curl / DNS resolver on host):
+	// Conntrack ESTABLISHED, local host socket exists (hasSocket = true).
+	// Returns from NEXUS_WAN_RESET to INPUT and hits established ACCEPT!
+	decisionHostSocket := evalPacket("tcp", 50000, hostIP, true, "ESTABLISHED")
+	if decisionHostSocket != "ACCEPT" {
+		t.Fatalf("expected host socket return packet to hit ACCEPT, got: %s", decisionHostSocket)
+	}
+
+	// 3. Unrelated host traffic (e.g. port 22 SSH):
+	// Traverses NEXUS_WAN_RESET without matching, falls through to INPUT's established rule, hits ACCEPT.
+	decisionUnrelated := evalPacket("tcp", 22, hostIP, false, "ESTABLISHED")
+	if decisionUnrelated != "ACCEPT" {
+		t.Fatalf("expected unrelated established traffic to hit INPUT ACCEPT, got: %s", decisionUnrelated)
+	}
+}
+
+func TestLinuxWANDevice_R11B1_SocketReturnAllowsHostFirewallPolicy(t *testing.T) {
+	tunR, tunW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create pipe: %v", err)
+	}
+	defer func() { _ = tunR.Close(); _ = tunW.Close() }()
+
+	// Seed INPUT chain with:
+	// 1. Host firewall rule dropping traffic from a blocked IP (e.g. 198.51.100.99):
+	//    -A INPUT -s 198.51.100.99 -j DROP
+	// 2. Host firewall rule accepting established connections:
+	//    -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+	type iptablesRule struct {
+		args []string
+	}
+	var mu sync.Mutex
+	chains := map[string][]iptablesRule{
+		"INPUT": {
+			{args: []string{"-A", "INPUT", "-s", "198.51.100.99", "-j", "DROP"}},
+			{args: []string{"-A", "INPUT", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"}},
+		},
+	}
+
+	runner := func(args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(args) == 0 {
+			return nil
+		}
+		switch args[0] {
+		case "-N":
+			chain := args[1]
+			if _, exists := chains[chain]; exists {
+				return errors.New("chain already exists")
+			}
+			chains[chain] = []iptablesRule{}
+			return nil
+		case "-F":
+			chain := args[1]
+			chains[chain] = []iptablesRule{}
+			return nil
+		case "-X":
+			chain := args[1]
+			delete(chains, chain)
+			return nil
+		case "-C":
+			chain := args[1]
+			rules := chains[chain]
+			target := strings.Join(args[2:], " ")
+			for _, r := range rules {
+				if strings.Join(r.args[2:], " ") == target {
+					return nil
+				}
+			}
+			return errors.New("rule does not exist")
+		case "-I":
+			chain := args[1]
+			ruleArgs := args[2:]
+			pos := 0
+			if len(ruleArgs) > 0 && ruleArgs[0] == "1" {
+				ruleArgs = ruleArgs[1:]
+			}
+			newRule := iptablesRule{args: append([]string{"-A", chain}, ruleArgs...)}
+			if pos >= len(chains[chain]) {
+				chains[chain] = append(chains[chain], newRule)
+			} else {
+				chains[chain] = append(chains[chain][:pos+1], chains[chain][pos:]...)
+				chains[chain][pos] = newRule
+			}
+			return nil
+		case "-A":
+			chain := args[1]
+			chains[chain] = append(chains[chain], iptablesRule{args: args})
+			return nil
+		case "-D":
+			chain := args[1]
+			target := strings.Join(args[2:], " ")
+			rules := chains[chain]
+			for i, r := range rules {
+				if strings.Join(r.args[2:], " ") == target {
+					chains[chain] = append(rules[:i], rules[i+1:]...)
+					return nil
+				}
+			}
+			return nil
+		}
+		return nil
+	}
+
+	dev := newLinuxWANDeviceWithFiles(tunW, nil, "wan-r11b1", 40000, 65000, netip.Addr{})
+	dev.iptablesRunner = runner
+	defer func() { _ = dev.Close() }()
+
+	hostIP := netip.MustParseAddr("203.0.113.60")
+	if err := dev.SetHostWANIP(hostIP); err != nil {
+		t.Fatalf("SetHostWANIP failed: %v", err)
+	}
+
+	evalPacket := func(proto string, dport uint16, dst netip.Addr, srcIP string, hasSocket bool, ctstate string) string {
+		mu.Lock()
+		defer mu.Unlock()
+
+		var evalChain func(chainName string) (decision string, returned bool)
+		evalChain = func(chainName string) (decision string, returned bool) {
+			rules := chains[chainName]
+			for _, r := range rules {
+				cmd := strings.Join(r.args, " ")
+				if strings.Contains(cmd, "-j NEXUS_WAN_RESET") {
+					dec, ret := evalChain("NEXUS_WAN_RESET")
+					if !ret {
+						return dec, false
+					}
+					continue
+				}
+				if strings.Contains(cmd, "-s 198.51.100.99") && strings.Contains(cmd, "-j DROP") {
+					if srcIP == "198.51.100.99" {
+						return "DROP", false
+					}
+				}
+				if strings.Contains(cmd, "-m conntrack --ctstate RELATED,ESTABLISHED") && strings.Contains(cmd, "-j ACCEPT") {
+					if ctstate == "ESTABLISHED" || ctstate == "RELATED" {
+						return "ACCEPT", false
+					}
+				}
+				ruleMatchesPortRange := strings.Contains(cmd, "--dport 40000:65000")
+				portMatches := ruleMatchesPortRange && (dport >= 40000 && dport <= 65000)
+				ipMatches := strings.Contains(cmd, "-d "+hostIP.String()) && dst == hostIP
+				protoMatches := strings.Contains(cmd, "-p "+proto)
+
+				if portMatches && ipMatches && protoMatches {
+					if strings.Contains(cmd, "-m socket --nowildcard") && strings.Contains(cmd, "-j RETURN") {
+						if hasSocket {
+							return "RETURN", true
+						}
+					} else if strings.Contains(cmd, "-j DROP") {
+						return "DROP", false
+					}
+				}
+			}
+			return "NONE", true
+		}
+
+		dec, _ := evalChain("INPUT")
+		return dec
+	}
+
+	// 1. Direct return packet for direct NAT egress:
+	// No socket -> dropped in NEXUS_WAN_RESET before reaching INPUT rules.
+	decNoSocket := evalPacket("tcp", 50000, hostIP, "1.1.1.1", false, "ESTABLISHED")
+	if decNoSocket != "DROP" {
+		t.Fatalf("expected direct no-socket packet to hit DROP, got: %s", decNoSocket)
+	}
+
+	// 2. Host socket packet from blocked IP:
+	// Matches socket in NEXUS_WAN_RESET -> returns to INPUT.
+	// In INPUT, hits -s 198.51.100.99 -j DROP.
+	// With the R11-B1 fix (RETURN instead of ACCEPT), host firewall policy is preserved!
+	decBlockedHost := evalPacket("tcp", 50000, hostIP, "198.51.100.99", true, "ESTABLISHED")
+	if decBlockedHost != "DROP" {
+		t.Fatalf("expected host socket packet from blocked IP to hit DROP in INPUT, got: %s", decBlockedHost)
+	}
+
+	// 3. Host socket packet from allowed IP:
+	// Matches socket in NEXUS_WAN_RESET -> returns to INPUT.
+	// Passes blocked-IP check, hits established ACCEPT in INPUT.
+	decAllowedHost := evalPacket("tcp", 50000, hostIP, "1.1.1.1", true, "ESTABLISHED")
+	if decAllowedHost != "ACCEPT" {
+		t.Fatalf("expected host socket packet from allowed IP to hit ACCEPT in INPUT, got: %s", decAllowedHost)
+	}
+
+	// 4. Unrelated traffic:
+	// Falls through NEXUS_WAN_RESET, hits established ACCEPT in INPUT.
+	decUnrelated := evalPacket("tcp", 22, hostIP, "1.1.1.1", false, "ESTABLISHED")
+	if decUnrelated != "ACCEPT" {
+		t.Fatalf("expected unrelated traffic to hit ACCEPT in INPUT, got: %s", decUnrelated)
+	}
+}

@@ -120,8 +120,20 @@ jobs:
           grep -qa '__umodti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
           grep -qa '__udivti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
 
+      # These five tests need a real host boundary the runner job cannot provide: root,
+      # /dev/net/tun, a private network namespace, or a writable user-namespace uid_map.
+      # They fail closed under CI in exactly that situation, which is correct — they must
+      # never report success by skipping. They cannot run in this unprivileged job, so
+      # they are excluded here and executed for real by the required `wan-qualification`
+      # job below. The exclusion is paired one-to-one with that execution: it removes no
+      # obligation, it moves each obligation to a step that actually runs it. The
+      # iptables child capability proof is one of them because it reads the capability
+      # sets of a child it starts inside its own user namespace, which ordinary runners
+      # refuse; its two namespace-free controls are NOT excluded and keep running here.
       - name: Run Tests with Race Detector
-        run: go test -race -cover -count=1 -timeout=15m -coverprofile=coverage.out ./...
+        run: |
+          go test -race -cover -count=1 -timeout=15m -coverprofile=coverage.out \
+            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$' ./...
 
       - name: Run Authentic Native Caddy Integration Tests
         run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
@@ -272,3 +284,210 @@ jobs:
           name: panel-${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: bin/panel-${{ matrix.target.os }}-${{ matrix.target.arch }}
           retention-days: 7
+
+  # Required bounded WAN qualification (issue #677).
+  #
+  # The direct-WAN dataplane can only be proven by executing real kernel behaviour:
+  # a production TUN device, AF_PACKET capture, namespace-local forwarding and NAT, and
+  # replies that actually arrive. Those tests fail closed under CI when the runner has
+  # no root, /dev/net/tun or private network namespace, so they cannot run in the
+  # unprivileged `test` job above — and they must not be excluded from it either, or the
+  # required behaviour goes unexercised.
+  #
+  # Isolation: the binaries are compiled unprivileged, and each launch is wrapped in an
+  # OUTER `unshare --net --mount --propagation private`. That matters because the tests
+  # create namespaces and TUN devices as soon as they start: without an outer boundary
+  # those calls would act on the runner's own network and mount namespaces. Inside the
+  # wrapper a job-owned tmpfs is mounted over /run, so the named namespaces the
+  # forwarder gate needs live in a private mount and cannot leak to the host. The
+  # namespace and its tmpfs disappear when the process exits, which is also why cleanup
+  # deletes only exact paths this job created and never scans or removes host state.
+  #
+  # The iptables child capability proof runs in this job for the same class of reason:
+  # it starts its own user namespace and reads the capability sets of the child it
+  # executed, which ordinary unprivileged runners refuse. It is excluded from the
+  # unprivileged `test` job by that job's -skip list and required here by name, so the
+  # exclusion moves the obligation instead of dropping it.
+  wan-qualification:
+    name: Required WAN Qualification (isolated namespaces)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Compile the VPN WAN test binary
+        run: go test -tags with_utls -c -o "$RUNNER_TEMP/vpn-wan.test" ./internal/vpn
+
+      - name: Run the VPN WAN qualification
+        env:
+          CI: 'true'
+        run: |
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/vpn-wan.log"
+          rc=0
+          echo "running: S4 + production lifecycle + capture positive/negative + iptables child capability"
+          # Outer isolation, then run. sudo resets the environment, so the required
+          # markers are passed explicitly. If unshare or the tmpfs mount refuses, the
+          # test binary is never started and the step exits non-zero.
+          sudo env GITHUB_ACTIONS=true CI=true NEXUS_S4_REQUIRED=1 \
+              RUNNER_TEMP="$RUNNER_TEMP" \
+            unshare --net --mount --propagation private \
+            bash -euo pipefail -c '
+              mount -t tmpfs tmpfs /run || { echo "isolation: cannot mount private /run" >&2; exit 1; }
+              mkdir -p /run/netns
+              # The tests re-exec this binary under `unshare -Urn --map-root-user`, whose
+              # id map holds uid 0 only. Run from the runner-owned temp path, that inner
+              # root cannot traverse the runner home directory and the exec is refused.
+              # Stage the binary inside the private tmpfs instead: every ancestor here is
+              # root-owned and world-searchable, and this copy is owned by the outer root,
+              # so inner uid 0 both traverses and maps it. The staged copy lives in a
+              # mount that dies with this namespace, so nothing is added to clean up.
+              # The tmpfs root mode follows the mounting umask, so set it explicitly
+              # rather than depending on a permissive umask at the runner.
+              # A failed staging exits non-zero before the launch, keeping the step
+              # fail-closed.
+              chmod 0755 /run
+              install -d -m 0755 /run/wan
+              install -m 0755 "$RUNNER_TEMP/vpn-wan.test" /run/wan/vpn-wan.test
+              # Read-only observation of the boundary the inner launch uses: exec of
+              # this binary inside `unshare -Urn --map-root-user`. A failed run cannot
+              # show why it failed, so record the facts instead of guessing them.
+              # Every path component mode and owner, the mount options, the kernel,
+              # the AppArmor unprivileged-userns policy, and the uid map and capability
+              # set the inner process actually gets. One system binary (/bin/true) is
+              # executed there as a comparison: it is root-owned and so mapped, while
+              # the staged binary is the one the real launch below attempts. Nothing is
+              # written outside the private tmpfs, no privilege is added, and every
+              # command tolerates failure so `-e` cannot abort the launch: the step
+              # verdict stays the test-binary exit status and its output.
+              echo "diag: kernel $(uname -r)" >&2
+              echo "diag: outer uid=$(id -u)" >&2
+              echo "diag: apparmor_restrict_unprivileged_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo unreadable)" >&2
+              stat -Lc "diag: binary mode=%a uid=%u gid=%g" /run/wan/vpn-wan.test >&2 || echo "diag: binary stat failed" >&2
+              namei -l /run/wan/vpn-wan.test >&2 || echo "diag: binary namei failed" >&2
+              findmnt -no TARGET,OPTIONS -T /run/wan/vpn-wan.test >&2 || echo "diag: findmnt reported no mount" >&2
+              unshare -Urn --map-root-user sh -c "id -u; grep ^CapEff /proc/self/status; cat /proc/self/uid_map; /bin/true && echo diag-inner-true-ok || echo diag-inner-true-denied" >&2 || echo "diag-inner: user namespace or sh launch refused" >&2
+              # TestIPTablesChild_NonRootConsumerGetsNetAdminOnly is selected here for
+              # the same reason as the WAN gates: it starts its own user namespace and
+              # reads the capability sets of the executed child, which the unprivileged job
+              # is refused. It is excluded there and required here, and it asserts a
+              # genuine child PASS — it is never a skip.
+              exec /run/wan/vpn-wan.test \
+                -test.v -test.timeout=12m \
+                -test.run "^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$"
+            ' > "$LOG" 2>&1 || rc=$?
+          cat "$LOG"
+          # Exit status alone is not the oracle: a skip or a missing test would look
+          # like success, so the log itself is inspected. Subtest-level skips are
+          # matched too — the capture gate runs positive and negative as subtests, and
+          # a top-level-only check would miss one of them silently skipping.
+          if grep -qE '^[[:space:]]*--- SKIP' "$LOG"; then
+            echo "::error::a required WAN test or subtest SKIPPED; a skip is not a pass"
+            exit 1
+          fi
+          if grep -qE '^[[:space:]]*--- FAIL' "$LOG"; then
+            echo "::error::a required WAN test FAILED"
+            exit 1
+          fi
+          # Every selected test must report its own PASS. The iptables child capability
+          # proof is listed by name, so deleting it from the selection, from this list,
+          # or letting it skip cannot leave this step green.
+          for name in \
+            TestS4ProductionContainerHostWANQualification \
+            TestProductionWANDevice_PermissionsAndLifecycle \
+            TestWANCaptureProductionPath \
+            TestIPTablesChild_NonRootConsumerGetsNetAdminOnly
+          do
+            if ! grep -qE "^--- PASS: $name " "$LOG"; then
+              echo "::error::required test did not report PASS: $name"
+              exit 1
+            fi
+          done
+          # The capture gate's own two obligations must each have run.
+          for sub in TestWANCaptureProductionPath/positive TestWANCaptureProductionPath/negative; do
+            if ! grep -qE "^[[:space:]]*--- PASS: $sub " "$LOG"; then
+              echo "::error::required subtest did not report PASS: $sub"
+              exit 1
+            fi
+          done
+          if ! grep -q 'S4 RESULT: PASS' "$LOG"; then
+            echo "::error::the S4 verdict line is absent; the direct-WAN path is unproven"
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the qualification process exited $rc"
+            exit 1
+          fi
+
+      - name: Compile the forwarder WAN test binary
+        run: go test -tags with_utls -c -o "$RUNNER_TEMP/fwd-wan.test" ./internal/vpn/forwarder
+
+      - name: Run the forwarder direct-egress qualification
+        env:
+          CI: 'true'
+        run: |
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/fwd-wan.log"
+          rc=0
+          echo "running: forwarder direct-egress dispatch/return"
+          sudo env GITHUB_ACTIONS=true CI=true NEXUS_S4_REQUIRED=1 \
+              RUNNER_TEMP="$RUNNER_TEMP" \
+            unshare --net --mount --propagation private \
+            bash -euo pipefail -c '
+              mount -t tmpfs tmpfs /run || { echo "isolation: cannot mount private /run" >&2; exit 1; }
+              mkdir -p /run/netns
+              exec "$RUNNER_TEMP/fwd-wan.test" \
+                -test.v -test.timeout=10m \
+                -test.run "^TestLinuxE2E_DirectEgress$"
+            ' > "$LOG" 2>&1 || rc=$?
+          cat "$LOG"
+          if grep -qE '^[[:space:]]*--- SKIP' "$LOG"; then
+            echo "::error::the forwarder WAN gate SKIPPED; a skip is not a pass"
+            exit 1
+          fi
+          if grep -qE '^[[:space:]]*--- FAIL' "$LOG"; then
+            echo "::error::the forwarder WAN gate FAILED"
+            exit 1
+          fi
+          if ! grep -qE "^--- PASS: TestLinuxE2E_DirectEgress " "$LOG"; then
+            echo "::error::required test did not report PASS: TestLinuxE2E_DirectEgress"
+            exit 1
+          fi
+          # This gate has no verdict line; a delivered direct reply is its evidence.
+          if ! grep -q 'ECHO:' "$LOG"; then
+            echo "::error::no direct echo reply observed; the return path is unproven"
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the forwarder qualification process exited $rc"
+            exit 1
+          fi
+
+      # Raw logs BEFORE teardown, and on failure too: the evidence is the whole point.
+      - name: Upload WAN qualification logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: wan-qualification-logs
+          path: |
+            ${{ runner.temp }}/vpn-wan.log
+            ${{ runner.temp }}/fwd-wan.log
+          retention-days: 14
+          if-no-files-found: warn
+
+      # Only exact paths this job created. The outer network namespace, its private
+      # tmpfs and every namespace the forwarder gate made inside it died with the
+      # process, so there is nothing global to scan, delete or unmount here.
+      - name: Clean up job-owned resources
+        if: always()
+        run: |
+          set +e
+          rm -f "$RUNNER_TEMP/vpn-wan.test" "$RUNNER_TEMP/fwd-wan.test"
+          echo "cleanup complete (namespaces were process-scoped)"

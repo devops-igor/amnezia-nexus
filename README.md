@@ -101,6 +101,18 @@ services:
       - "51820:51820/udp"     # VPN port
     volumes:
       - panel-data:/app/data
+    # The panel runs as a non-root user and carries file capabilities, so these
+    # capabilities must also be in the container's bounding set. Without them the
+    # container cannot even start the binary ("exec: Operation not permitted").
+    cap_add:
+      - NET_ADMIN              # TUN device, iptables rules, kernel settings
+      - NET_RAW                # capture direct-WAN return traffic
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: 1
+      net.ipv4.conf.all.rp_filter: 2
+      net.ipv4.conf.all.accept_local: 1
     environment:
       - PORT=5000
       - DATA_DIR=/app/data
@@ -117,6 +129,12 @@ services:
 
 volumes:
   panel-data:
+```
+
+`NET_ADMIN` alone is not enough: opening the raw packet socket that captures direct-WAN reply traffic requires `NET_RAW`, and the panel reports a missing capability instead of silently routing everything through the proxy. Check a running deployment with:
+
+```bash
+docker compose exec amnezia-panel /app/panel --check-wan-capabilities
 ```
 
 ### 2. Start Nexus
@@ -157,21 +175,49 @@ net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 
 # Loose reverse path filtering (prevents the kernel from dropping return packets on asymmetric paths)
+# NOTE: direct WAN egress (PBR) additionally requires 0 on the WAN interfaces — see
+# "Direct WAN egress (PBR) reverse-path filtering" below. Leaving 2 here is correct
+# for the proxy path, which is why the daemon cannot assume either value.
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
+
+# Accept locally sourced packets after source NAT for direct WAN egress
+net.ipv4.conf.all.accept_local = 1
 EOF
 
 sudo sysctl --system
 ```
 
-Check the setting:
+Check the settings:
 
 ```bash
 sysctl net.ipv4.ip_forward
 # Should return: net.ipv4.ip_forward = 1
+sysctl net.ipv4.conf.all.accept_local
+# Should return: net.ipv4.conf.all.accept_local = 1
 ```
 
-The `rp_filter = 2` setting allows loose reverse-path filtering. Strict filtering can drop legitimate VPN traffic if the return route uses a different interface.
+The `rp_filter = 2` setting allows loose reverse-path filtering. Strict filtering can drop legitimate VPN traffic if the return route uses a different interface. `accept_local = 1` lets the kernel accept the source-NATed packets direct egress injects back into the host stack.
+
+### 1a. Load the TUN module and confirm the device node
+
+Direct WAN egress creates a TUN interface, so the `tun` kernel module must be loaded and `/dev/net/tun` must exist inside the container:
+
+```bash
+sudo modprobe tun
+ls -l /dev/net/tun
+# Should return: crw-rw-rw- 1 root root 10, 200 ... /dev/net/tun
+```
+
+If the node is missing, create it:
+
+```bash
+sudo mkdir -p /dev/net
+sudo mknod /dev/net/tun c 10 200
+sudo chmod 600 /dev/net/tun
+```
+
+The compose example above passes the device through with `devices:`. A deployment that mounts `/dev/net` instead must keep the node writable by the container's `appuser` (uid 1000).
 
 ### 2. Configure the firewall
 
@@ -213,6 +259,44 @@ sudo iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE
 # Save rules so they survive a reboot
 sudo apt-get install -y iptables-persistent && sudo netfilter-persistent save
 ```
+
+#### Direct WAN egress (PBR) reverse-path filtering
+
+Direct WAN egress injects already source-NATed packets into the WAN tunnel device,
+so they re-enter the stack addressed to a remote host with a **local** source
+address. The kernel's source validation treats that as a martian and drops it
+before forwarding, so no direct traffic ever leaves the host and replies never
+return.
+
+Both filtering modes are wrong for this packet: strict (1) tests the reverse path
+against the ingress interface, and loose (2) only requires the source to be
+reachable via *any* interface — which a local address always is. The effective
+value is `max(conf/all, conf/<device>)` (see
+`Documentation/networking/ip-sysctl.rst`), so clearing only `conf/all` leaves the
+inherited per-device value in force, and a newly created interface takes its value
+from `conf/default`.
+
+Set the filter to `0` for the devices direct egress uses when you enable PBR:
+
+```bash
+# Host WAN interface and the WAN tunnel device direct egress writes into
+WAN_IFACE=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
+sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+sudo sysctl -w net.ipv4.conf.default.rp_filter=0
+sudo sysctl -w "net.ipv4.conf.${WAN_IFACE}.rp_filter=0"
+sudo sysctl -w net.ipv4.conf.nexus-wan0.rp_filter=0
+```
+
+The daemon **refuses to start** direct egress when the effective value is not `0`,
+naming the setting to change, rather than starting a data plane that silently
+forwards nothing. It does not change these settings for you. `accept_local` is
+still required and is configured by the daemon itself (host-wide, and per-device
+when it creates the tunnel).
+
+This is asserted by the S4 qualification gate
+(`internal/vpn/wan_direct_egress_qualification_linux_test.go`) and by
+`wan_source_validation_linux_test.go`, which pins the red/green boundary over the
+production validator.
 
 ### 3. Install Docker
 
