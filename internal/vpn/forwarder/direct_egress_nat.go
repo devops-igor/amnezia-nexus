@@ -178,6 +178,17 @@ func (m *DirectEgressManager) allocatePortLocked(peerKey string, proto uint8, re
 	now := time.Now()
 	m.pruneOldestBindingsLocked(now)
 
+	// Every held reservation keeps its kernel tuple for the whole binding
+	// lifetime, including the port-cooldown window after the flow retires, so a
+	// cap reached by flows that already expired can only be relieved by the
+	// ordinary sweep. Nothing else in this path runs after a reservation
+	// refusal, so reclaim here before deciding the cap is exhausted: retire
+	// expired flows and release the tuples whose quarantine window has elapsed.
+	// An all-live cap reclaims nothing and stays refused by the checks below.
+	if m.atReservationCapLocked() {
+		m.sweepLocked(now)
+	}
+
 	maxB := m.maxBindings
 	if maxB <= 0 {
 		maxB = defaultMaxRemoteBindings

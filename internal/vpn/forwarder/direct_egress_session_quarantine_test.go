@@ -39,6 +39,13 @@ type sessionQuarantineHarness struct {
 }
 
 func newSessionQuarantineHarness(t *testing.T, minPort, maxPort uint16) *sessionQuarantineHarness {
+	return newDirectEgressHarness(t, DirectEgressConfig{MinPort: minPort, MaxPort: maxPort})
+}
+
+// newDirectEgressHarness builds the same authentic dispatcher fixture with an
+// explicit manager configuration, so other direct-egress regressions can drive a
+// configured bound instead of this file's NAT pool.
+func newDirectEgressHarness(t *testing.T, cfg DirectEgressConfig) *sessionQuarantineHarness {
 	t.Helper()
 	h := &sessionQuarantineHarness{
 		t:       t,
@@ -49,13 +56,10 @@ func newSessionQuarantineHarness(t *testing.T, minPort, maxPort uint16) *session
 		sinks:   make(map[string]*testCaptureReturnPath),
 	}
 	h.wanDev = newMockPacketDev()
+	cfg.HostWANIP = h.hostWAN
+	cfg.WANDevice = h.wanDev
 	h.fwd = NewForwarder(nil, "10.100.0.0/16", 8)
-	h.dem = NewDirectEgressManager(DirectEgressConfig{
-		HostWANIP: h.hostWAN,
-		WANDevice: h.wanDev,
-		MinPort:   minPort,
-		MaxPort:   maxPort,
-	}, h.fwd)
+	h.dem = NewDirectEgressManager(cfg, h.fwd)
 	h.fwd.SetDirectEgress(h.dem)
 	h.fwd.SetPBREnabled(true)
 	h.cache = newTestRouteCache()

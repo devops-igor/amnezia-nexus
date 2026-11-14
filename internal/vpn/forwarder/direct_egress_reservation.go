@@ -26,6 +26,13 @@ const (
 	defaultMaxHostReservations = 4096
 )
 
+// atReservationCapLocked reports whether the exclusive-ownership bound is fully
+// held. Admission and the allocation path's reclamation decision both use this
+// one calculation, so they can never disagree about what "full" means.
+func (m *DirectEgressManager) atReservationCapLocked() bool {
+	return m.maxReservations > 0 && len(m.reservations) >= m.maxReservations
+}
+
 // reserveHostPortLocked makes the direct-NAT port exclusively ours in the kernel
 // for the whole binding lifetime. Callers hold m.mu.
 //
@@ -34,7 +41,7 @@ func (m *DirectEgressManager) reserveHostPortLocked(proto uint8, port uint16) er
 	if m.reservations[port] != nil {
 		return nil
 	}
-	if limit := m.maxReservations; limit > 0 && len(m.reservations) >= limit {
+	if m.atReservationCapLocked() {
 		return fmt.Errorf("%w: %d reservations held", ErrHostTupleOwnershipUnavailable, len(m.reservations))
 	}
 	reservation, err := reserveHostPort(proto, port)
