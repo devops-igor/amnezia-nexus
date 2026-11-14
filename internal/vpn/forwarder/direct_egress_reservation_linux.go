@@ -57,7 +57,7 @@ func reserveHostPort(proto uint8, port uint16) (io.Closer, error) {
 		return nil, fmt.Errorf("%w: port %d: create socket: %w", ErrHostTupleOwnershipUnavailable, port, err)
 	}
 
-	// Filtering is defence in depth for the UDP duplicate path only; the kernel
+	// Filtering is defense in depth for the UDP duplicate path only; the kernel
 	// refuses a filter on an unprivileged TCP socket (EPERM), so a failure is not
 	// treated as a reservation failure.
 	prog := unix.SockFprog{Len: uint16(len(rejectAllFilter)), Filter: &rejectAllFilter[0]}
