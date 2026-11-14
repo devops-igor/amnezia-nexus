@@ -213,6 +213,7 @@ jobs:
         with:
           name: coverage-shard-${{ matrix.shard }}
           path: coverage-shard-${{ matrix.shard }}.out
+          if-no-files-found: error
           retention-days: 14
 
   # Aggregate job: keeps the required check NAME "Automated Test Suite" and fails
@@ -262,8 +263,13 @@ jobs:
 
       - name: Merge Shard Coverage
         run: |
+          # Every shard profile is named explicitly. A wildcard would still match
+          # when one artifact is missing and would publish incomplete coverage as
+          # if it were complete; the merger fails on a missing path instead.
           python3 scripts/merge_coverprofiles.py coverage.out \
-            coverage-shards/*/coverage-shard-*.out
+            coverage-shards/coverage-shard-1/coverage-shard-1.out \
+            coverage-shards/coverage-shard-2/coverage-shard-2.out \
+            coverage-shards/coverage-shard-3/coverage-shard-3.out
 
       - name: Upload Test Coverage
         uses: actions/upload-artifact@v7

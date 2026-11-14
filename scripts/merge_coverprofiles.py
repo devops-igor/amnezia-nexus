@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
-Block = Tuple[str, int, int, int]  # file, start column, end column, statement count
+Block = Tuple[str, str, str, int]  # file, start position, end position, statement count
 
 
 def parse_profile(path: Path) -> Tuple[str, Dict[Block, int]]:
@@ -36,7 +36,9 @@ def parse_profile(path: Path) -> Tuple[str, Dict[Block, int]]:
         location, statements, count = line.rsplit(" ", 2)
         file_part, span = location.rsplit(":", 1)
         start, end = span.split(",")
-        key: Block = (file_part, int(start.split(".")[0]), int(end.split(".")[0]), int(statements))
+        # Positions keep their columns: two blocks on the same line are distinct
+        # regions, and collapsing them would merge coverage of different code.
+        key: Block = (file_part, start, end, int(statements))
         blocks[key] = max(blocks.get(key, 0), int(count))
     if not mode:
         raise ValueError(f"{path}: missing coverage mode header")
@@ -56,7 +58,7 @@ def merge(paths: Iterable[Path]) -> str:
 
     lines = [f"mode: {mode}"]
     for (file_part, start, end, statements), count in sorted(merged.items()):
-        lines.append(f"{file_part}:{start}.0,{end}.0 {statements} {count}")
+        lines.append(f"{file_part}:{start},{end} {statements} {count}")
     return "\n".join(lines) + "\n"
 
 
