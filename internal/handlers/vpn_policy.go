@@ -195,6 +195,40 @@ func customURLsOrEmpty(urls []string) []string {
 	return urls
 }
 
+// policySettingsMutation is the settings-mutation boundary: at most one complete
+// settings change (read the previous record, persist, activate or disable,
+// compensate) runs at a time.
+//
+// The finding it closes (#678 P2-A): PutPolicyHandler used to read, save and then
+// activate with no serialization of its own. policyActivationMu is taken *inside*
+// StartPolicyRouting/StopPolicyRouting, i.e. after the durable write, so two
+// interleaved requests could commit in one order and activate in the other — A
+// saves enabled, B saves disabled, B stops the runtime, A starts it — leaving the
+// database disabled while the matcher routed as enabled, with both requests
+// answering 200.
+//
+// Why this cannot deadlock: the boundary is strictly above the runtime locks. The
+// order is always settingsMutation → policyActivationMu → policyRuntimeMu, and no
+// code that holds policyActivationMu or policyRuntimeMu ever calls back into a
+// handler, so the reverse order does not exist. The handler acquires the boundary
+// exactly once and never re-enters it: activation and disable are called from
+// within it and take only their own lock. Waits are bounded by the caller's
+// context (the shipped request deadline), so a canceled waiter cannot pin the
+// holder, and the holder's own work is bounded by policyActivationTimeout.
+var policySettingsMutation = make(chan struct{}, 1)
+
+// acquirePolicySettingsMutation takes the settings-mutation boundary or reports
+// that the caller's request ended while another change was in flight. The returned
+// function releases it and is safe to call once.
+func acquirePolicySettingsMutation(ctx context.Context) (func(), error) {
+	select {
+	case policySettingsMutation <- struct{}{}:
+		return func() { <-policySettingsMutation }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // PutPolicyHandler serves PUT /api/vpn/policy.
 func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
 	incoming, ok := h.decodePolicyPut(w, r)
@@ -203,6 +237,19 @@ func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+
+	// Serialize the whole mutation (read → persist → activate/disable →
+	// compensation) so the durable value and the runtime decision always belong to
+	// the same request. Decoding and validation stay outside the boundary: they
+	// neither read nor write the stored record.
+	unlock, lockErr := acquirePolicySettingsMutation(ctx)
+	if lockErr != nil {
+		// The caller went away while another change was in flight. Nothing was
+		// read, written or activated on its behalf.
+		return
+	}
+	defer unlock()
+
 	previous, prevErr := h.loadPolicyRecord(ctx)
 	if prevErr != nil {
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to load current policy settings")

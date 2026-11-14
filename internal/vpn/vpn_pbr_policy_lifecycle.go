@@ -48,6 +48,13 @@ var (
 	// boundary while every retired syncer keeps its already-refused old one.
 	policyWriteOwners = make(map[*Service]*policy.WriteOwner)
 
+	// policyActivationFailures records why policy routing is not active for a
+	// service whose activation was refused before a runtime existed (startup). It
+	// is reported through PolicyStatusSnapshot so an operator can see the reason
+	// instead of a panel that simply never turned policy routing on (#678 P2-B).
+	// It is cleared as soon as activation succeeds or policy routing is disabled.
+	policyActivationFailures = make(map[*Service]string)
+
 	// policyActivationMu serializes activation against disable for the same
 	// process. A repeated enabled update must observe a stable runtime (reuse the
 	// live data path or create the first one), and a concurrent disable must not
@@ -115,6 +122,11 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 	if store == nil {
 		return errors.New("vpn: policy activation requires a durable policy store")
 	}
+	if hook := policyActivationHookForTest; hook != nil {
+		// Test seam: runs inside the caller's settings mutation, before any activation
+		// work, so a test can hold one mutation while another is attempted.
+		hook()
+	}
 
 	policyActivationMu.Lock()
 	defer policyActivationMu.Unlock()
@@ -175,6 +187,7 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 	}
 
 	s.startPolicyLoop(ctx, syncer, matcher, settings, presetID)
+	s.clearPolicyActivationFailure()
 	return nil
 }
 
@@ -339,6 +352,8 @@ func (s *Service) StopPolicyRouting() {
 	// unconditional because a syncer from a failed or already-replaced activation
 	// may still be able to write even though no runtime is registered.
 	s.retirePolicyWriteOwner()
+	// An explicit disable is the operator's decision, not a failure to report.
+	s.clearPolicyActivationFailure()
 	if runtime == nil {
 		return
 	}
@@ -439,6 +454,36 @@ func (s *Service) PolicyRouteCacheSize() (entries, sessions int) {
 	return rc.EntryCount(), rc.SessionCount()
 }
 
+// ReportPolicyActivationFailure records why policy routing could not be activated
+// so the status surface can explain it. It is used when activation was refused
+// before a runtime existed, where the syncer's own status cannot carry the reason.
+//
+// It never changes the persisted settings: the operator's stored intent is what
+// they must be able to repair through the API.
+func (s *Service) ReportPolicyActivationFailure(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	policyRuntimeMu.Lock()
+	policyActivationFailures[s] = err.Error()
+	policyRuntimeMu.Unlock()
+	slog.Error("Policy routing is not active", "err", err)
+}
+
+// clearPolicyActivationFailure drops a recorded activation failure.
+func (s *Service) clearPolicyActivationFailure() {
+	policyRuntimeMu.Lock()
+	delete(policyActivationFailures, s)
+	policyRuntimeMu.Unlock()
+}
+
+// policyActivationFailure returns the recorded activation failure, if any.
+func (s *Service) policyActivationFailure() string {
+	policyRuntimeMu.RLock()
+	defer policyRuntimeMu.RUnlock()
+	return policyActivationFailures[s]
+}
+
 // PolicyStatusSnapshot reports the current policy subsystem state including the
 // persisted configuration and the live syncer's last outcome.
 func (s *Service) PolicyStatusSnapshot() PolicyStatus {
@@ -453,6 +498,14 @@ func (s *Service) PolicyStatusSnapshot() PolicyStatus {
 	// published (e.g. activated straight from last-known-good).
 	if !status.Ready && runtime != nil {
 		applyMatcherStatus(&status, runtime.matcher)
+	}
+
+	// A refused activation that happened before any runtime existed (panel start)
+	// has no syncer to carry the reason, so report the recorded one here. The state
+	// stays "disabled": policy routing is off and the reason is exactly why.
+	if failure := s.policyActivationFailure(); failure != "" && runtime == nil {
+		status.LastError = failure
+		status.SyncState = "error"
 	}
 	return status
 }
