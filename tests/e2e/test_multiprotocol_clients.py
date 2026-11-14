@@ -20,6 +20,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e.conftest import _do_login, api_get, api_post
+from tests.e2e.prerequisites import is_qualification_mode, require
 from tests.e2e.provisioning import (
     POLL_SECONDS,
     PROTOCOLS,
@@ -170,15 +171,7 @@ def _is_protocol_installed(server: Dict[str, Any], protocol: str) -> bool:
 
 def _is_qualification_mode() -> bool:
     """Return whether running in strict qualification / E2E test mode."""
-    return os.environ.get("E2E_TESTING", "").strip().lower() in (
-        "true",
-        "1",
-        "yes",
-    ) or os.environ.get("E2E_REQUIRE_DATAPLANE", "").strip().lower() in (
-        "true",
-        "1",
-        "yes",
-    )
+    return is_qualification_mode()
 
 
 def _get_server_by_id(page: Page, server_id: int) -> Optional[Dict[str, Any]]:
@@ -376,10 +369,7 @@ def test_multiprotocol_client_creation_flow(
     """
     page = authenticated_page
     server = _get_target_server(page)
-    if not server:
-        if _is_qualification_mode():
-            pytest.fail("No servers available for multi-protocol client test in qualification mode")
-        pytest.skip("No servers available for multi-protocol client test")
+    require(server is not None, "No servers available for multi-protocol client test")
     assert server is not None
 
     server_id = server["id"]
@@ -503,10 +493,7 @@ def test_multiprotocol_config_display_and_uri_export(
     """
     page = authenticated_page
     server = _get_target_server(page)
-    if not server:
-        if _is_qualification_mode():
-            pytest.fail("No servers available for URI export test in qualification mode")
-        pytest.skip("No servers available for URI export test")
+    require(server is not None, "No servers available for URI export test")
     assert server is not None
 
     server_id = server["id"]
@@ -633,10 +620,7 @@ def test_multiprotocol_qr_code_modal_interaction(
     """
     page = authenticated_page
     server = _get_target_server(page)
-    if not server:
-        if _is_qualification_mode():
-            pytest.fail("No servers available for QR code modal test in qualification mode")
-        pytest.skip("No servers available for QR code modal test")
+    require(server is not None, "No servers available for QR code modal test")
     assert server is not None
 
     server_id = server["id"]
@@ -747,10 +731,7 @@ def test_multiprotocol_revocation_and_zero_client_state(
     """
     page = authenticated_page
     server = _get_target_server(page)
-    if not server:
-        if _is_qualification_mode():
-            pytest.fail("No servers available for revocation test in qualification mode")
-        pytest.skip("No servers available for revocation test")
+    require(server is not None, "No servers available for revocation test")
     assert server is not None
 
     server_id = server["id"]

@@ -228,6 +228,10 @@ jobs:
       # The Naive consumer step contract runs the two new workflow step blocks
       # with go/caddy/loader stubs, so its skip guard is proven to fire without
       # a native binary, Caddy build or hosted run.
+      # The provisioning, prerequisite and skip-audit suites encode decisions
+      # that silently weaken a qualification gate when they regress, and the
+      # preflight suite encodes the DEV image contract. They are offline by
+      # design, so they are enforced here rather than only on the DEV runner.
       - name: Run Offline Diagnostics Privacy Suite
         run: |
           python -m pip install --upgrade pip
@@ -238,6 +242,10 @@ jobs:
             tests/test_e2e_install_failure.py \
             tests/test_e2e_install_failure_finalizer.py \
             tests/test_e2e_log_privacy.py \
+            tests/test_e2e_provisioning.py \
+            tests/test_e2e_prerequisites.py \
+            tests/test_e2e_skip_audit.py \
+            tests/test_e2e_preflight.py \
             tests/test_naive_decoy_default_contract.py \
             tests/test_ci_native_dependencies.py \
             tests/test_ci_naive_consumer_steps.py
