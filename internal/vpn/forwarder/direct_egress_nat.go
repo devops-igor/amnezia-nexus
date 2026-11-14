@@ -157,11 +157,17 @@ func (m *DirectEgressManager) canBindRemoteLocked(port uint16, peerKey string, p
 	if !exists {
 		return !tableFull
 	}
-	if b.peerKey == peerKey {
-		return true
-	}
+	// A binding that was retired for this exact tuple keeps the port for its
+	// quarantine window and must refuse every rebinder. The check has to come
+	// before the same-peer shortcut: a replacement session of the same peer is
+	// a different authenticated session, so rebinding its tuple would relabel
+	// the retired flow's in-flight replies with the new session instead of
+	// refusing them. When no other safe port exists the flow fails closed.
 	if m.isBindingQuarantinedLocked(b, proto, now) {
 		return false
+	}
+	if b.peerKey == peerKey {
+		return true
 	}
 	delete(m.remoteBindings, bKey)
 	return true
