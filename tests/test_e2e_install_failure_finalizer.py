@@ -87,6 +87,7 @@ def run_lifecycle(
         bindir / "pytest",
         f"""\
         #!/bin/sh
+        echo "$@" >> "{tmp_path / 'pytest-invocations.log'}"
         for arg in "$@"; do
           case "$arg" in
             *test_setup.py) echo "stage1=pass"; exit {stage1_rc} ;;
@@ -185,3 +186,37 @@ def test_failure_evidence_absent_when_docker_logs_fails(tmp_path: Path) -> None:
     assert "unavailable; no diagnostics collected" in result.stdout + result.stderr
     assert not (tmp_path / "e2e-diagnostics" / "install-failure.json").exists()
     assert not list(tmp_path.glob("panel-operator-*.log"))
+
+
+def test_stage_two_failure_stops_before_dependent_stages(tmp_path: Path) -> None:
+    """A failed shared prerequisite ends the run instead of cascading.
+
+    Stage 2 is where the server is onboarded and AWG installed. If it fails,
+    every later suite would repeat the same install POST and report the same
+    cause under a different test name, which is how a single setup failure turns
+    into a list of "product" failures (#764).
+    """
+    result = run_lifecycle(tmp_path, FAILURE_LOG, stage2_passes=False)
+
+    invocations = (tmp_path / "pytest-invocations.log").read_text(encoding="utf-8")
+
+    # The prerequisite stages did run, in order, and the failure was reported once.
+    assert "test_setup.py" in invocations
+    assert "test_onboard.py" in invocations
+    output = result.stdout + result.stderr
+    assert output.count("ERROR: Stage 2 FAILED") == 1
+
+    # No dependent suite ran after it.
+    for dependent in (
+        "test_users.py",
+        "test_servers.py",
+        "test_connections.py",
+        "test_multiprotocol_clients.py",
+        "test_traffic.py",
+    ):
+        assert dependent not in invocations, (
+            f"{dependent} ran after the shared prerequisite failed; "
+            "its failures would duplicate the setup cause"
+        )
+    # The report still says what did not run, rather than staying silent about it.
+    assert "Stage 3: Full Functional E2E Suite  : SKIPPED" in output
