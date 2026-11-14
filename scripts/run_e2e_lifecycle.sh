@@ -225,9 +225,12 @@ echo ""
 echo "=================================================================="
 echo "  Stage 3: Full Functional E2E Test Suite"
 echo "=================================================================="
-if pytest "$REPO_ROOT/tests/e2e/test_auth.py" \
-          "$REPO_ROOT/tests/e2e/test_settings.py" \
-          "$REPO_ROOT/tests/e2e/test_users.py" \
+# test_auth.py and test_settings.py are deliberately absent: they need only the
+# panel binary and a browser, so they run on a GitHub-hosted runner on every PR
+# (.github/workflows/ci.yml, job e2e-hosted) instead of consuming this single
+# self-hosted DEV runner. tests/e2e/runner_map.toml records the split and
+# tests/test_e2e_runner_map.py fails if the two disagree.
+if pytest "$REPO_ROOT/tests/e2e/test_users.py" \
           "$REPO_ROOT/tests/e2e/test_connections.py" \
           "$REPO_ROOT/tests/e2e/test_my_connections.py" \
           "$REPO_ROOT/tests/e2e/test_multiprotocol_clients.py" \

@@ -101,9 +101,21 @@ fi
 echo "==> Server is healthy!"
 
 # 5. Run Playwright E2E suite
-echo "==> Running Playwright E2E tests..."
+#
+# E2E_PATHS selects what this invocation is responsible for, space separated and
+# relative to the repository root. The default is the whole directory. It exists
+# because a caller cannot narrow the selection with extra arguments: the
+# directory argument is already present, so passing a file inside it collects
+# that file twice instead of replacing it.
+E2E_PATHS="${E2E_PATHS:-tests/e2e/}"
+E2E_TARGETS=()
+for path in $E2E_PATHS; do
+    E2E_TARGETS+=("$REPO_ROOT/$path")
+done
+
+echo "==> Running Playwright E2E tests: ${E2E_PATHS}"
 E2E_LOG="$TMP_DIR/e2e_pytest.log"
-pytest "$REPO_ROOT/tests/e2e/" -m e2e -v -rs "$@" 2>&1 | tee "$E2E_LOG"
+pytest "${E2E_TARGETS[@]}" -m e2e -v -rs "$@" 2>&1 | tee "$E2E_LOG"
 
 # Verify skip count does not exceed expected threshold (baseline: 5 skips)
 MAX_EXPECTED_SKIPS="${MAX_EXPECTED_SKIPS:-5}"

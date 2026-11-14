@@ -328,7 +328,8 @@ jobs:
             tests/test_onboard_credentials.py \
             tests/test_naive_decoy_default_contract.py \
             tests/test_ci_native_dependencies.py \
-            tests/test_ci_naive_consumer_steps.py
+            tests/test_ci_naive_consumer_steps.py \
+            tests/test_e2e_runner_map.py
 
   # The subprocess proof builds and runs the real Go panel, so it needs a
   # toolchain and cannot live in the python-only privacy gate above. It is a
@@ -607,3 +608,55 @@ jobs:
           set +e
           rm -f "$RUNNER_TEMP/vpn-wan.test" "$RUNNER_TEMP/fwd-wan.test"
           echo "cleanup complete (namespaces were process-scoped)"
+
+  # Panel-only browser contracts. These need the panel binary and a browser, but
+  # no deployment, SSH, protocol installation or dataplane, so they must not
+  # occupy the single self-hosted DEV runner. The live lifecycle suites stay in
+  # e2e-dev.yml; tests/e2e/runner_map.toml records which runner owns which file,
+  # and tests/test_e2e_runner_map.py fails if the two ever disagree.
+  e2e-hosted:
+    name: Hosted Browser E2E (panel-only, no DEV)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # No Playwright on the jobs that only need Python or Go: the browser and
+      # its system libraries are installed here and nowhere else.
+      - name: Install test prerequisites
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r tests/e2e/requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run panel-only browser contracts
+        env:
+          E2E_PATHS: tests/e2e/test_auth.py tests/e2e/test_settings.py
+          # One skip is expected and named: the rate-limit case is skipped while
+          # E2E_TESTING is on, then rerun by run_e2e.sh against a server started
+          # without the flag. Anything beyond that fails instead of skipping.
+          MAX_EXPECTED_SKIPS: '1'
+        run: ./scripts/run_e2e.sh
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-hosted-failure-artifacts
+          path: |
+            tests/e2e/screenshots/
+            test-artifacts/e2e-diagnostics/
+          retention-days: 14
+          if-no-files-found: warn

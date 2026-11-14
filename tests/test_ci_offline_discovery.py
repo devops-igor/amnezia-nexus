@@ -40,6 +40,11 @@ _COMMAND_WRAPPERS = frozenset({"sudo", "command", "exec", "env"})
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # A YAML step key ("run:" or "- run:") precedes the shell command.
 _RUN_KEY_RE = re.compile(r"^\s*(?:-\s*)?run:\s*")
+# The panel harness selects suites through E2E_PATHS and forwards them to pytest.
+# That is a real selection, but only where the workflow also invokes the harness,
+# so the value is read only from text that names the script.
+_HARNESS_RE = re.compile(r"scripts/run_e2e\.sh")
+_E2E_PATHS_RE = re.compile(r"^\s*E2E_PATHS:\s*(.+)$", re.MULTILINE)
 
 
 def _logical_lines(text: str) -> list[str]:
@@ -110,6 +115,22 @@ def selections_from_text(text: str) -> set[str]:
     return found
 
 
+def harness_selections_from_text(text: str) -> set[str]:
+    """Return suites a workflow hands to the shared harness via E2E_PATHS.
+
+    An E2E_PATHS value on its own is a mention: it selects nothing unless the
+    same workflow runs ``scripts/run_e2e.sh``, which is what forwards it to
+    pytest. Both facts are in the text, so neither has to be trusted.
+    """
+    if not _HARNESS_RE.search(text):
+        return set()
+    return {
+        path
+        for match in _E2E_PATHS_RE.finditer(text)
+        for path in _TEST_PATH_RE.findall(match.group(1))
+    }
+
+
 def _tracked(paths: list[str]) -> set[str] | None:
     """Return git-tracked paths, or None when git is unavailable."""
     result = subprocess.run(
@@ -127,8 +148,11 @@ def _selected_patterns() -> set[str]:
     scripts/run_e2e_lifecycle.sh rather than in the workflow.
     """
     patterns: set[str] = set()
-    sources = sorted(WORKFLOWS.glob("*.yml")) + sorted(SCRIPTS.glob("*.sh"))
-    for source in sources:
+    for workflow in sorted(WORKFLOWS.glob("*.yml")):
+        text = workflow.read_text(encoding="utf-8")
+        patterns |= selections_from_text(text)
+        patterns |= harness_selections_from_text(text)
+    for source in sorted(SCRIPTS.glob("*.sh")):
         patterns |= selections_from_text(source.read_text(encoding="utf-8"))
     return patterns
 
@@ -233,4 +257,16 @@ def test_same_basename_in_two_directories_is_not_aliased() -> None:
 def test_globs_are_preserved() -> None:
     assert selections_from_text("python -m pytest tests/test_arch*.py\n") == {
         "tests/test_arch*.py"
+    }
+
+
+def test_harness_env_selection_counts_only_when_the_harness_runs() -> None:
+    """E2E_PATHS is a selection only where run_e2e.sh consumes it."""
+    selection = "E2E_PATHS: tests/e2e/test_auth.py tests/e2e/test_settings.py\n"
+    assert harness_selections_from_text(selection) == set()
+
+    with_harness = selection + "run: ./scripts/run_e2e.sh\n"
+    assert harness_selections_from_text(with_harness) == {
+        "tests/e2e/test_auth.py",
+        "tests/e2e/test_settings.py",
     }
