@@ -179,12 +179,18 @@ def classify_reason(err: str) -> str:
     and only allowlisted substrings of that text are matched. Anything else —
     a wrapper-only error, a reworded message, or hostile text — collapses to
     ``other`` instead of being labelled with a guessed cause.
+
+    The readiness errors append the container's own logs after the probe error
+    (``... probe: <cause> (logs: <container output>)``). Only the part before
+    that marker is classified: a cause-shaped string inside the container logs
+    is not the cause the producer reported, and letting it win would label a
+    timeout as a verification defect.
     """
     if classify_step(err) not in _REASON_STEPS:
         return "other"
-    lowered = err.lower()
+    haystack = err.split(" (logs: ", 1)[0].lower()
     for marker, reason in _REASON_MARKERS:
-        if marker in lowered:
+        if marker in haystack:
             return reason
     return "other"
 

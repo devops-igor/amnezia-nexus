@@ -265,6 +265,28 @@ def test_reason_classification_is_closed(err: str, reason: str) -> None:
     assert reason in install_failure.REASONS
 
 
+def test_readiness_reason_ignores_appended_container_logs() -> None:
+    """The probe's own error wins; a cause-shaped string in the logs must not.
+
+    The Xray manager appends `docker logs` output after the probe error. If the
+    classifier searched the whole string, a timeout whose container logs happen
+    to mention a verification failure would be reported as a verification
+    defect -- the wrong owner and the wrong fix.
+    """
+    timeout_with_misleading_logs = (
+        "xray container failed REALITY handshake readiness probe: context deadline exceeded "
+        "(logs: vless: reality verification failed)"
+    )
+    assert install_failure.classify_step(timeout_with_misleading_logs) == "readiness_probe"
+    assert install_failure.classify_reason(timeout_with_misleading_logs) == "caller_cancel"
+
+    verification_with_timeout_logs = (
+        "xray container failed REALITY handshake readiness probe: "
+        "vless: reality verification failed (logs: dial tcp: i/o timeout)"
+    )
+    assert install_failure.classify_reason(verification_with_timeout_logs) == "reality_verify"
+
+
 def test_reason_is_not_guessed_outside_a_subprocess_step() -> None:
     """Text that merely looks like a cause is not labelled outside build/pull/run."""
     err = "failed to acquire remote server lock on resource x (exit code 1): i/o timeout"

@@ -20,6 +20,14 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e.conftest import _do_login, api_get, api_post
+from tests.e2e.provisioning import (
+    POLL_SECONDS,
+    PROTOCOLS,
+    install_payload,
+    json_or_none,
+    server_by_id,
+    servers_from_inventory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -183,42 +191,6 @@ def _get_server_by_id(page: Page, server_id: int) -> Optional[Dict[str, Any]]:
     return None
 
 
-_PROVISION_PROTOCOLS = ("vless", "naive")
-# The install endpoint is synchronous: it returns only after the container is
-# running. This poll is a safety net for the inventory read that follows, not a
-# retry of the install itself.
-_PROVISION_POLL_SECONDS = 30
-
-
-def _install_payload(proto: str) -> Dict[str, Any]:
-    """Return the standard install body for a provisioned protocol.
-
-    VLESS: port 443, server_name gateway.icloud.com, flow xtls-rprx-vision.
-    NaiveProxy: port 9443, domain proxy.example.com, decoy default.
-    """
-    if proto == "vless":
-        return {
-            "protocol": "vless",
-            "port": "443",
-            "vless_options": {
-                "server_name": "gateway.icloud.com",
-                "port": "443",
-                "flow": "xtls-rprx-vision",
-            },
-        }
-    if proto == "naive":
-        return {
-            "protocol": "naive",
-            "port": "9443",
-            "naive_options": {
-                "domain": "proxy.example.com",
-                "port": "9443",
-                "decoy": "default",
-            },
-        }
-    raise ValueError(f"Unsupported protocol for auto-provisioning: {proto}")
-
-
 def _provisioning_context(playwright, base_url: str, username: str, password: str):
     """Open an authenticated APIRequestContext independent of any page.
 
@@ -244,19 +216,6 @@ def _provisioning_context(playwright, base_url: str, username: str, password: st
     return ctx, csrf
 
 
-def _server_by_id(payload: Any, server_id: int) -> Optional[Dict[str, Any]]:
-    """Return one server from a list response, or None.
-
-    The API only exposes the collection (GET /api/servers); there is no
-    single-server route, so the poll must select from the list.
-    """
-    servers = payload if isinstance(payload, list) else payload.get("servers", [])
-    for server in servers:
-        if server.get("id") == server_id:
-            return server
-    return None
-
-
 @pytest.fixture(scope="module")
 def provisioned_protocols(
     playwright, base_url: str, admin_user: str, admin_pass: str
@@ -272,19 +231,18 @@ def provisioned_protocols(
     ctx, csrf = _provisioning_context(playwright, base_url, admin_user, admin_pass)
     try:
         listed = ctx.get("/api/servers")
-        servers = listed.json() if listed.ok else []
-        servers = servers if isinstance(servers, list) else servers.get("servers", [])
-        if not servers:
-            pytest.skip("no server available to provision")
+        servers = servers_from_inventory(
+            listed.ok, listed.status, json_or_none(listed), _is_qualification_mode()
+        )
         server_id = servers[0]["id"]
 
-        for proto in _PROVISION_PROTOCOLS:
+        for proto in PROTOCOLS:
             if _is_protocol_installed(servers[0], proto):
                 continue
 
             res = ctx.post(
                 f"/api/servers/{server_id}/install",
-                data=_install_payload(proto),
+                data=install_payload(proto),
                 headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
                 timeout=120_000,
             )
@@ -295,17 +253,17 @@ def provisioned_protocols(
                     f"status={res.status}, response={body}"
                 )
 
-            deadline = time.time() + _PROVISION_POLL_SECONDS
+            deadline = time.time() + POLL_SECONDS
             while time.time() < deadline:
                 time.sleep(1)
                 listed = ctx.get("/api/servers")
-                current = _server_by_id(listed.json() if listed.ok else {}, server_id)
+                current = server_by_id(json_or_none(listed), server_id)
                 if current and _is_protocol_installed(current, proto):
                     break
             else:
                 pytest.fail(
                     f"{proto} install returned {res.status} but the server never reported it "
-                    f"installed within {_PROVISION_POLL_SECONDS}s (response={body})"
+                    f"installed within {POLL_SECONDS}s (response={body})"
                 )
 
         yield {"server_id": server_id}
