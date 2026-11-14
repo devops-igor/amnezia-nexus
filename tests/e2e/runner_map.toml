@@ -1,0 +1,65 @@
+# Test-to-runner map for the Playwright suites.
+#
+# Every tests/e2e/test_*.py file belongs to exactly one runner. The split is by
+# real dependency, not by filename: a suite goes to a hosted runner only when a
+# local fixture faithfully exercises the same contract, and stays on the DEV
+# runner when it needs a deployment, SSH, protocol installation or the dataplane.
+#
+# tests/test_e2e_runner_map.py enforces this file against reality: every file on
+# disk is listed once, every declared runner actually selects its paths, and the
+# hosted selection never contains a live-only dependency.
+
+[[runner]]
+name = "hosted-panel"
+label = "Hosted Browser E2E (panel-only, no DEV)"
+workflow = ".github/workflows/ci.yml"
+job = "e2e-hosted"
+paths = [
+  "tests/e2e/test_auth.py",
+  "tests/e2e/test_settings.py",
+]
+rationale = """
+Login, session, CSRF, captcha, settings and backup contracts are served by the
+panel binary itself. scripts/run_e2e.sh starts that binary on a temporary SQLite
+database and runs these files against it, so the hosted run is the same contract
+rather than a weaker one. It runs on every pull request; the DEV run it replaces
+only ran after merge.
+"""
+
+[[runner]]
+name = "hosted-css"
+label = "CSS Differential"
+workflow = ".github/workflows/css-differential.yml"
+job = "css-differential"
+paths = [
+  "tests/e2e/test_css_differential.py",
+]
+rationale = """
+Renders pages from a local fixture and compares computed styles. No deployment
+or dataplane involvement.
+"""
+
+[[runner]]
+name = "dev-lifecycle"
+label = "DEV Server E2E Verification"
+workflow = ".github/workflows/e2e-dev.yml"
+script = "scripts/run_e2e_lifecycle.sh"
+paths = [
+  "tests/e2e/test_setup.py",
+  "tests/e2e/test_onboard.py",
+  "tests/e2e/test_users.py",
+  "tests/e2e/test_connections.py",
+  "tests/e2e/test_my_connections.py",
+  "tests/e2e/test_multiprotocol_clients.py",
+  "tests/e2e/test_share.py",
+  "tests/e2e/test_servers.py",
+  "tests/e2e/test_vpn_diagnostics.py",
+  "tests/e2e/test_traffic.py",
+  "tests/e2e/test_multiprotocol_server.py",
+]
+rationale = """
+These need the real deployment on the self-hosted ARM64 DEV runner: clean-slate
+provisioning, server onboarding, SSH, protocol installation, client creation,
+packet traversal or failover. A local fixture cannot prove any of it, so they
+stay live and fail closed when a prerequisite is missing.
+"""
