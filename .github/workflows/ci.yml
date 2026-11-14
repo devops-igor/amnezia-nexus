@@ -142,6 +142,71 @@ jobs:
             -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$' \
             $packages
 
+      - name: Run Authentic Native Caddy Integration Tests
+        if: matrix.shard == 3
+        run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
+
+      - name: Run Vision Tests (non-race)
+        if: matrix.shard == 3
+        run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
+
+      # The automatic AWG admission pair runs inside the package job above, but a
+      # package-level PASS reports neither which tests ran nor what the pre-rollback
+      # capture observed, so a remote-only AWG stall could not be attributed. This
+      # selects the two existing tests by anchored name and keeps -v so their
+      # privacy-safe observations reach the log. It adds no assertion and changes no
+      # qualification semantics: a failure here still fails the job.
+      - name: Run Automatic AWG Admission Consumers
+        if: matrix.shard == 3
+        run: |
+          go test -v -race -count=1 -p 2 -parallel 2 -timeout 10m \
+            -run '^(TestAutomaticSetupAdmitsAfterAuthenticAWGTraffic|TestAutomaticSetupRefusesWhenTheAWGPeerNeverAnswers)$' \
+            ./internal/handlers/
+
+      # The automatic Naive admission trio runs inside the package job above, but a
+      # package-level PASS reports neither which tests ran nor whether the payload
+      # actually traversed the proxy. This selects them by anchored name and keeps -v
+      # so each result and its payload counters are individually visible. It adds no
+      # assertion and changes no qualification semantics; a failure here fails the job.
+      #
+      # A SKIP is the one outcome that would prove nothing: the consumer tests skip when
+      # the native binary or the forwardproxy Caddy build is unavailable. Both are
+      # provisioned by the steps above, so verify them first and fail closed here rather
+      # than letting a missing dependency degrade into a silent skip.
+      - name: Verify Automatic Naive Consumer Prerequisites
+        if: matrix.shard == 3
+        run: |
+          set -euo pipefail
+          # No `|| true` here: a missing binary must fail this step, not be
+          # replaced by a fallback that silently points at nothing.
+          if caddy_bin="$(command -v caddy)"; then
+            :
+          else
+            caddy_bin="$(go env GOPATH)/bin/caddy"
+          fi
+          test -x "$caddy_bin"
+          "$caddy_bin" list-modules | grep -qx 'http.handlers.forward_proxy'
+          # The pinned NaiveProxy release is musl-linked; the loader must resolve a
+          # real DT_NEEDED entry, not merely print a banner.
+          /lib/ld-musl-x86_64.so.1 --list /usr/lib/x86_64-linux-musl/libgcc_s.so.1 >/dev/null
+
+      - name: Run Automatic Naive Admission Consumers
+        if: matrix.shard == 3
+        run: |
+          set -uo pipefail
+          log="$(mktemp)"
+          go test -v -race -count=1 -p 2 -parallel 2 -timeout 10m \
+            -run '^(TestAutomaticSetupAdmitsAfterAuthenticNaivePayload|TestAutomaticSetupRefusesWhenTheNaivePayloadIsNeverAnswered|TestAutomaticSetupRefusesWhenNaiveAuthenticationIsRejected|TestNaiveConsumerFixturesAreNotHandshakeOnly)$' \
+            ./internal/handlers/ 2>&1 | tee "$log"
+          status="${PIPESTATUS[0]}"
+          # A skip is not evidence. This job provisions both prerequisites above, so a
+          # skip means the proof did not run and this step must not report success.
+          if grep -qE '^--- SKIP: ' "$log"; then
+            echo "::error::a Naive admission consumer was skipped, so no traffic proof was produced"
+            exit 1
+          fi
+          exit "$status"
+
       - name: Upload Shard Coverage
         uses: actions/upload-artifact@v7
         if: always()
@@ -158,7 +223,7 @@ jobs:
     needs: [test]
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
     steps:
       - name: Fail when a test shard failed
         run: |
@@ -175,63 +240,6 @@ jobs:
         with:
           go-version-file: 'go.mod'
           cache: true
-
-      - name: Set up Node.js for JSDOM Integration Tests
-        uses: actions/setup-node@v7
-        with:
-          node-version: '20'
-
-      - name: Install Pinned jsdom
-        run: |
-          npm install -g jsdom@29.1.1
-          echo "NODE_PATH=$(npm root -g)" >> "$GITHUB_ENV"
-
-      - name: Build Caddy with forwardproxy for Naive Smoke Tests
-        run: |
-          go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
-          xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$(go env GOPATH)/bin/caddy"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-      # The musl loader comes from the same digest-pinned Alpine image as libgcc,
-      # so this step no longer depends on any Ubuntu package mirror. Alpine's
-      # loader resolves libc.so from itself and libgcc_s.so.1 through
-      # /etc/ld-musl-x86_64.path, which is the layout the pinned NaiveProxy
-      # release asset declares (interpreter /lib/ld-musl-x86_64.so.1,
-      # NEEDED libgcc_s.so.1 + libc.so). Every step below fails closed; a bad
-      # copy must fail here rather than turn the native tests into skips.
-      - name: Install musl loader and libgcc for Native NaiveProxy Tests
-        run: |
-          set -euo pipefail
-          ALPINE="alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
-          staging="$(mktemp -d)"
-          trap 'rm -rf "$staging"' EXIT
-          docker run --rm -v "$staging:/out" "$ALPINE" sh -euc \
-            'apk add --no-cache libgcc && cp -L /lib/ld-musl-x86_64.so.1 /usr/lib/libgcc_s.so.1 /out/'
-          test -s "$staging/ld-musl-x86_64.so.1"
-          test -s "$staging/libgcc_s.so.1"
-          sudo install -D -m 0755 "$staging/ld-musl-x86_64.so.1" /lib/ld-musl-x86_64.so.1
-          sudo install -D -m 0644 "$staging/libgcc_s.so.1" /usr/lib/x86_64-linux-musl/libgcc_s.so.1
-          printf '/lib\n/usr/lib/x86_64-linux-musl\n' | sudo tee /etc/ld-musl-x86_64.path >/dev/null
-          # Usability proof. The loader exits 1 and prints its banner even when
-          # nothing loads, so grepping that banner proves nothing; --list must
-          # actually execute the loader and parse the installed libgcc as a
-          # dynamic object with resolvable dependencies.
-          /lib/ld-musl-x86_64.so.1 --list /usr/lib/x86_64-linux-musl/libgcc_s.so.1 >/dev/null
-          # NaiveProxy needs these 128-bit helpers; a wrong or truncated libgcc
-          # fails relocation at native-test time, so assert them up front.
-          grep -qa '__umodti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
-          grep -qa '__udivti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
-
-      # These five tests need a real host boundary the runner job cannot provide: root,
-      # /dev/net/tun, a private network namespace, or a writable user-namespace uid_map.
-      # They fail closed under CI in exactly that situation, which is correct — they must
-      # never report success by skipping. They cannot run in this unprivileged job, so
-      # they are excluded here and executed for real by the required `wan-qualification`
-      # job below. The exclusion is paired one-to-one with that execution: it removes no
-      # obligation, it moves each obligation to a step that actually runs it. The
-      # iptables child capability proof is one of them because it reads the capability
-      # sets of a child it starts inside its own user namespace, which ordinary runners
-      # refuse; its two namespace-free controls are NOT excluded and keep running here.
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -256,66 +264,6 @@ jobs:
         run: |
           python3 scripts/merge_coverprofiles.py coverage.out \
             coverage-shards/*/coverage-shard-*.out
-
-      - name: Run Authentic Native Caddy Integration Tests
-        run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
-
-      - name: Run Vision Tests (non-race)
-        run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
-
-      # The automatic AWG admission pair runs inside the package job above, but a
-      # package-level PASS reports neither which tests ran nor what the pre-rollback
-      # capture observed, so a remote-only AWG stall could not be attributed. This
-      # selects the two existing tests by anchored name and keeps -v so their
-      # privacy-safe observations reach the log. It adds no assertion and changes no
-      # qualification semantics: a failure here still fails the job.
-      - name: Run Automatic AWG Admission Consumers
-        run: |
-          go test -v -race -count=1 -p 2 -parallel 2 -timeout 10m \
-            -run '^(TestAutomaticSetupAdmitsAfterAuthenticAWGTraffic|TestAutomaticSetupRefusesWhenTheAWGPeerNeverAnswers)$' \
-            ./internal/handlers/
-
-      # The automatic Naive admission trio runs inside the package job above, but a
-      # package-level PASS reports neither which tests ran nor whether the payload
-      # actually traversed the proxy. This selects them by anchored name and keeps -v
-      # so each result and its payload counters are individually visible. It adds no
-      # assertion and changes no qualification semantics; a failure here fails the job.
-      #
-      # A SKIP is the one outcome that would prove nothing: the consumer tests skip when
-      # the native binary or the forwardproxy Caddy build is unavailable. Both are
-      # provisioned by the steps above, so verify them first and fail closed here rather
-      # than letting a missing dependency degrade into a silent skip.
-      - name: Verify Automatic Naive Consumer Prerequisites
-        run: |
-          set -euo pipefail
-          # No `|| true` here: a missing binary must fail this step, not be
-          # replaced by a fallback that silently points at nothing.
-          if caddy_bin="$(command -v caddy)"; then
-            :
-          else
-            caddy_bin="$(go env GOPATH)/bin/caddy"
-          fi
-          test -x "$caddy_bin"
-          "$caddy_bin" list-modules | grep -qx 'http.handlers.forward_proxy'
-          # The pinned NaiveProxy release is musl-linked; the loader must resolve a
-          # real DT_NEEDED entry, not merely print a banner.
-          /lib/ld-musl-x86_64.so.1 --list /usr/lib/x86_64-linux-musl/libgcc_s.so.1 >/dev/null
-
-      - name: Run Automatic Naive Admission Consumers
-        run: |
-          set -uo pipefail
-          log="$(mktemp)"
-          go test -v -race -count=1 -p 2 -parallel 2 -timeout 10m \
-            -run '^(TestAutomaticSetupAdmitsAfterAuthenticNaivePayload|TestAutomaticSetupRefusesWhenTheNaivePayloadIsNeverAnswered|TestAutomaticSetupRefusesWhenNaiveAuthenticationIsRejected|TestNaiveConsumerFixturesAreNotHandshakeOnly)$' \
-            ./internal/handlers/ 2>&1 | tee "$log"
-          status="${PIPESTATUS[0]}"
-          # A skip is not evidence. This job provisions both prerequisites above, so a
-          # skip means the proof did not run and this step must not report success.
-          if grep -qE '^--- SKIP: ' "$log"; then
-            echo "::error::a Naive admission consumer was skipped, so no traffic proof was produced"
-            exit 1
-          fi
-          exit "$status"
 
       - name: Upload Test Coverage
         uses: actions/upload-artifact@v7
