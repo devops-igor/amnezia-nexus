@@ -1,14 +1,18 @@
 """E2E tests for automated clean-slate server onboarding and AWG installation."""
 
+from __future__ import annotations
+
 import logging
 import os
 import time
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
 import pytest
-from playwright.sync_api import Page
 
-from tests.e2e.conftest import api_post
+from tests.e2e.api import api_post
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from playwright.sync_api import Page
 
 logger = logging.getLogger(__name__)
 
