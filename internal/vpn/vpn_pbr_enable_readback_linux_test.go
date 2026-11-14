@@ -70,13 +70,23 @@ type policyE2EPrerequisite struct {
 	value string
 }
 
-// policyE2EPrerequisites lists what ValidateKernelPrerequisites requires of the
-// namespace this fixture prepares. rp_filter uses loose mode (2) because the
-// guard rejects only strict mode (1).
+// policyE2EPrerequisites lists what the production guard requires of the namespace
+// this fixture prepares.
+//
+// rp_filter must be 0 on conf/all AND conf/default. The guard evaluates the device
+// that will be created against conf/default, takes the effective value as
+// max(conf/all, device), and rejects 1 (strict) and 2 (loose) alike: a source-NATed
+// packet carrying a local address is a martian either way. Configuring only conf/all
+// leaves a new interface inheriting the namespace default (2 on the CI runner's
+// provisioning), which is exactly the failure this list produced.
+//
+// accept_local is OR-combined (conf/all || device), so conf/all=1 already covers the
+// device that does not exist yet.
 func policyE2EPrerequisites() []policyE2EPrerequisite {
 	return []policyE2EPrerequisite{
 		{rel: "net/ipv4/ip_forward", value: "1"},
-		{rel: "net/ipv4/conf/all/rp_filter", value: "2"},
+		{rel: "net/ipv4/conf/all/rp_filter", value: "0"},
+		{rel: "net/ipv4/conf/default/rp_filter", value: "0"},
 		{rel: "net/ipv4/conf/all/accept_local", value: "1"},
 	}
 }

@@ -32,10 +32,17 @@ import (
 // framework, runner, image or workflow.
 //
 // Why a namespace: ValidateKernelPrerequisites reads per-netns procfs keys
-// (net.ipv4.ip_forward, conf/all/rp_filter, conf/all/accept_local). Creating a
-// private namespace and configuring *that* namespace lets the real prerequisite
-// checks pass legitimately, instead of loosening them or injecting fake success.
-// No host sysctl is touched.
+// (net.ipv4.ip_forward, conf/all and conf/default rp_filter, conf/all accept_local).
+// Creating a private namespace and configuring *that* namespace lets the real
+// prerequisite checks pass legitimately, instead of loosening them or injecting fake
+// success. No host sysctl is touched.
+//
+// Why an ownership record: writing kernel settings is only safe in a namespace this
+// run provably left the launcher's namespace for. The parent therefore writes the
+// repository's existing S4-style launch record (single-use token + launcher network
+// namespace identity) and the child refuses to write anything without presenting it
+// and showing a different namespace identity — the same approved mechanism the S4
+// gate uses, not an environment-variable claim.
 //
 // Why the child also isolates a mount namespace: the CI job container mounts
 // `/proc` read-write but `/proc/sys` as a separate read-only mount (measured as
@@ -132,8 +139,23 @@ func TestLinuxE2E_PolicyEnablement(t *testing.T) {
 	// namespace's own values. The child also isolates its mount namespace and
 	// prepares the prerequisites there, because it is the process whose view the
 	// production guard reads; see the file comment.
+	//
+	// The child may only write kernel settings once it has proven it really left
+	// this namespace, so the launcher half of the repository's existing S4
+	// ownership fixture writes a single-use launch record (token + this process's
+	// network-namespace identity) and passes only its path and token through the
+	// environment. A child that never moved, an inherited marker, a forged token
+	// or a replayed record is refused instead of mutating whatever namespace it
+	// happens to be in.
+	recordPath := filepath.Join(os.TempDir(), fmt.Sprintf("nexus-policy-e2e-%d-%d.json", os.Getpid(), time.Now().UnixNano()))
+	recordEnv, err := s4WriteLaunchRecord(recordPath)
+	if err != nil {
+		t.Fatalf("prepare the policy enablement launch record: %v", err)
+	}
+	defer func() { _ = os.Remove(recordPath); _ = os.Remove(recordPath + ".claimed") }()
+
 	cmd := exec.Command("ip", "netns", "exec", ns, os.Args[0], "-test.run=TestLinuxE2E_PolicyEnablementChild", "-test.v")
-	cmd.Env = append(os.Environ(), envPolicyE2EChild+"=1", envPolicyE2ENetns+"="+ns)
+	cmd.Env = append(append(os.Environ(), envPolicyE2EChild+"=1", envPolicyE2ENetns+"="+ns), recordEnv...)
 	out, err := cmd.CombinedOutput()
 	t.Logf("child output:\n%s", out)
 	if err != nil {
@@ -210,6 +232,15 @@ func runPolicyEnablementChildInPrivateProcfs() int {
 	// activation and therefore the one whose procfs view the guard reads. A step
 	// that does not take effect fails here, naming the class, instead of surfacing
 	// later as a product prerequisite failure.
+	//
+	// Writing kernel settings requires proof that this process really left the
+	// launching namespace, exactly as the S4 fixture requires. The launcher wrote a
+	// single-use record; any process that did not move, or that merely inherited the
+	// marker, is refused here rather than configuring whatever namespace it is in.
+	if err := s4RequireOwnedNamespace(); err != nil {
+		fmt.Fprintf(os.Stderr, "READBACK preparation-context %s\n", reportPolicyE2EContext())
+		return fail("namespace ownership not proven, so no kernel setting was written: %v", err)
+	}
 	if err := applyPolicyE2EPrerequisites(policyE2ESysctlRoot); err != nil {
 		fmt.Fprintf(os.Stderr, "READBACK preparation-context %s\n", reportPolicyE2EContext())
 		return fail("test environment cannot provide its own prerequisites: %v; "+
