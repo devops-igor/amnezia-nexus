@@ -51,6 +51,9 @@ const (
 // be used: unreadable, corrupt, wrong schema, or self-inconsistent. Callers must
 // treat that as explicit rather than as "no baseline", because silently syncing
 // over an unreadable good generation is how the last recoverable copy is lost.
+// A publication refused by the write-ownership boundary (this runtime was
+// superseded or retired while the generation was being prepared) is reported the
+// same way: the preparation succeeded but must not reach the live policy.
 func (s *Syncer) PrimeBaseline(ctx context.Context) (BaselineStatus, error) {
 	if s.store == nil {
 		return BaselineAbsent, nil
@@ -75,15 +78,32 @@ func (s *Syncer) PrimeBaseline(ctx context.Context) (BaselineStatus, error) {
 	if snap.DomainCount() == 0 && snap.CIDRCount() == 0 {
 		return BaselineAbsent, fmt.Errorf("stored policy generation contains no rules")
 	}
-	s.matcher.Publish(snap)
-	s.cachedGen = gen
-	s.statusMu.Lock()
-	s.status.Ready = true
-	s.status.Version = gen.Version
-	s.status.GenerationID = gen.GenerationID
-	s.status.LastSuccess = gen.CreatedAt
-	s.status.DomainCount = snap.DomainCount()
-	s.status.CIDRCount = snap.CIDRCount()
-	s.statusMu.Unlock()
+	// Everything above is read-only preparation (load, hash, compile) and may run
+	// outside the boundary. Publishing the baseline and advertising it in the status
+	// are a policy write, so they go through the same ownership decision as
+	// executeUpdate's commit and publication (#678 F678-06).
+	//
+	// Run primes the baseline asynchronously, after activation already published the
+	// same generation. A Run whose runtime has since been replaced must not republish
+	// its old rules over the accepted one — the delivered snapshot would then disagree
+	// with the durable store, the runtime status and the registered preset — and must
+	// not advertise that generation in the status either. A canceled scheduler or an
+	// early cancellation check cannot recall work that already read the generation;
+	// only the final publication can be refused, which is what this fence does.
+	if writeErr := s.owner.Write(s.ticket, func() error {
+		s.matcher.Publish(snap)
+		s.cachedGen = gen
+		s.statusMu.Lock()
+		s.status.Ready = true
+		s.status.Version = gen.Version
+		s.status.GenerationID = gen.GenerationID
+		s.status.LastSuccess = gen.CreatedAt
+		s.status.DomainCount = snap.DomainCount()
+		s.status.CIDRCount = snap.CIDRCount()
+		s.statusMu.Unlock()
+		return nil
+	}); writeErr != nil {
+		return BaselineAbsent, fmt.Errorf("baseline publication refused: %w", writeErr)
+	}
 	return BaselinePrimed, nil
 }
