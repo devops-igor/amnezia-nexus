@@ -144,30 +144,47 @@ func (h *pbrDNSHandler) processJob(job dnsJob) {
 // sessionRuntime returns the DNS runtime authority of the job's session,
 // creating it on that session's first intercepted query.
 //
+// A cached runtime is reusable authority only while it still owns the cache
+// scope that this session's route resolves to right now. Every query's reply
+// evidence is written into the handle's captured SessionCache and read back
+// through the session's current scope, so a handle paired with any other
+// instance answers queries correctly while recording nothing: the live session
+// then answers DNS but stays UNKNOWN and keeps proxying new flows.
+//
+// Retirement publishes its retired flag and cancels the handle context before
+// it invalidates the cache, under a different mutex, so a scope this worker
+// prefetched can still be valid at publication time and be invalidated
+// immediately afterwards by the old handle. Identity is therefore established on
+// every admission, not checked once: superseded authority is replaced by
+// authority built from the live-fenced scope, which re-pairs the session with
+// the scope its route now owns.
+//
 // Creation is published under h.mu and re-fenced against the cache scope's
 // retirement inside the same critical section: a retirement that interleaved
 // with the liveness fence above either already invalidated the scope (so no
-// runtime is created) or deletes the runtime this call published.
+// runtime is created) or deletes the runtime this call published. The
+// superseded runtime is retired after h.mu is released, in the same order every
+// other retirement path uses, so no cache lock is taken under the handler lock.
 func (h *pbrDNSHandler) sessionRuntime(job dnsJob, sc *policy.SessionCache) *dnsSessionRuntime {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.closed.Load() || sc.Retired() {
+		h.mu.Unlock()
 		return nil
 	}
+	var superseded *dnsSessionRuntime
 	if rt := h.sessions[job.sessionID]; rt != nil {
-		if !rt.handle.IsRetired() {
+		if !rt.handle.IsRetired() && rt.handle.SessionCache == sc {
 			rt.writer.setTarget(job)
+			h.mu.Unlock()
 			return rt
 		}
-		// The runtime retired itself while its session kept its route: a reply
-		// that could not be written to the client retires the scope handle, but
-		// the authenticated session and its route stay live. Canceled authority
-		// is never re-armed, so drop the entry and build a fresh runtime below
-		// from the live-fenced scope. A genuinely retired or replaced session
-		// never reaches this branch, because sessionScope already returned nil
-		// for it, and the fresh scope carries its own evidence.
-		delete(h.sessions, job.sessionID)
-		h.gw.RetireScope(rt.handle.Scope)
+		// The runtime retired itself while its session kept its route, or it
+		// captures a scope this session no longer owns. Canceled authority is
+		// never re-armed, and a superseded scope can never record evidence
+		// again, so both are replaced below. A genuinely retired or replaced
+		// session never reaches this branch, because sessionScope already
+		// returned nil for it.
+		superseded = rt
 	}
 	writer := &pbrReplyWriter{}
 	writer.setTarget(job)
@@ -180,6 +197,11 @@ func (h *pbrDNSHandler) sessionRuntime(job dnsJob, sc *policy.SessionCache) *dns
 	writer.handle.Store(handle)
 	rt := &dnsSessionRuntime{handle: handle, writer: writer}
 	h.sessions[job.sessionID] = rt
+	h.mu.Unlock()
+	// Release the superseded authority outside the handler lock: retiring it
+	// also cancels its context, so a discarded handle cannot leave a gateway
+	// transport bound to a context that nobody cancels.
+	h.retireRuntime(superseded)
 	return rt
 }
 
