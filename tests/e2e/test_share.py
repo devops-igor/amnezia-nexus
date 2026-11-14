@@ -149,6 +149,7 @@ def test_download_config_from_share(
         require(False, "Could not enable sharing")
 
     share_token = share_result["body"].get("share_token")
+    require(bool(share_token), "No share token returned")
 
     # Authenticate on share page via Playwright's request API (bypasses CSP)
     auth_result = page.request.post(
