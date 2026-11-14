@@ -25,6 +25,7 @@ from tests.e2e.conftest import (
     api_get,
     api_post,
 )
+from tests.e2e.prerequisites import require
 
 logger = logging.getLogger(__name__)
 
@@ -235,8 +236,7 @@ def test_vless_reality_install_modal_ui(
     page = authenticated_page
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
-    if not servers:
-        pytest.skip("No servers available to test VLESS installation modal")
+    require(servers, "No servers available to test VLESS installation modal")
 
     server_id = servers[0]["id"]
     page.goto(f"{base_url}/server/{server_id}")
@@ -364,8 +364,7 @@ def test_reality_sni_scanner_ui_flow(
     page = authenticated_page
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
-    if not servers:
-        pytest.skip("No servers available to test REALITY SNI scanner UI")
+    require(servers, "No servers available to test REALITY SNI scanner UI")
 
     server_id = servers[0]["id"]
     page.goto(f"{base_url}/server/{server_id}")
@@ -470,8 +469,7 @@ def test_naiveproxy_install_modal_ui_flow(
     page = authenticated_page
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
-    if not servers:
-        pytest.skip("No servers available to test NaiveProxy installation modal")
+    require(servers, "No servers available to test NaiveProxy installation modal")
 
     server_id = servers[0]["id"]
     page.goto(f"{base_url}/server/{server_id}")
@@ -581,8 +579,7 @@ def test_protocol_uninstall_modal_ui_flow(
     page = authenticated_page
     result = api_get(page, "/api/servers")
     servers = result if isinstance(result, list) else result.get("servers", [])
-    if not servers:
-        pytest.skip("No servers available to test protocol uninstallation")
+    require(servers, "No servers available to test protocol uninstallation")
 
     server_id = servers[0]["id"]
     page.goto(f"{base_url}/server/{server_id}")
