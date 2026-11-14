@@ -245,6 +245,18 @@ def test_protocol_aliases_normalise_to_the_canonical_name() -> None:
             "failed to build caddy image (code 1): a failure nobody has seen before",
             "other",
         ),
+        # The readiness probe has two very different causes: only one is a
+        # verification defect, the other is the probe budget expiring.
+        (
+            "xray container failed REALITY handshake readiness probe: "
+            "vless: reality verification failed (logs: )",
+            "reality_verify",
+        ),
+        (
+            "xray container failed REALITY handshake readiness probe: "
+            "context deadline exceeded (logs: )",
+            "caller_cancel",
+        ),
     ],
 )
 def test_reason_classification_is_closed(err: str, reason: str) -> None:

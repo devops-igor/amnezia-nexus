@@ -99,11 +99,18 @@ STEPS = frozenset({step for _, step in _STEP_PREFIXES}) | {"ssh_client", "other"
 
 # Steps whose text is the producer's own subprocess output, so a cause inside it
 # can be sourced. Every other step's ``err`` is our wrapper only.
-_REASON_STEPS = frozenset({"dockerfile_upload", "image_pull", "image_build", "container_run"})
+_REASON_STEPS = frozenset(
+    {"dockerfile_upload", "image_pull", "image_build", "container_run", "readiness_probe"}
+)
 # Ordered allowlisted substrings; the first match wins so a specific external
 # cause outranks the cancellation it provokes. Matching is on the lowercased
 # value, and only a label leaves — never the matched text.
 _REASON_MARKERS: Tuple[Tuple[str, str], ...] = (
+    # A REALITY probe failure is either a verification defect or an expired
+    # probe budget; they need different owners, so they get different labels.
+    # Our own error text precedes the container logs in the message, so the
+    # first match is always the probe's own cause.
+    ("reality verification failed", "reality_verify"),
     ("no space left on device", "disk_full"),
     ("toomanyrequests", "registry_rate_limit"),
     ("too many requests", "registry_rate_limit"),
