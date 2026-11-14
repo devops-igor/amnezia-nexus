@@ -86,11 +86,59 @@ jobs:
           npm install -g jsdom@29.1.1
           echo "NODE_PATH=$(npm root -g)" >> "$GITHUB_ENV"
 
-      - name: Build Caddy with forwardproxy for Naive Smoke Tests
+      # The naive fixtures need a Caddy binary with forward_proxy, and the product
+      # already ships exactly that: ghcr.io/.../naive-caddy, referenced by digest
+      # from internal/manager/naive/naive.go. CI extracts that binary instead of
+      # compiling a second one with a second forwardproxy pin, so the fixtures
+      # exercise the artifact the panel installs and the 59-82s build disappears.
+      #
+      # The reference is read from the Go source rather than repeated here: one
+      # pin, one artifact, and a bump cannot update one without the other. The
+      # pull is a few seconds of layer download, not a compile.
+      - name: Provide the shipped Caddy binary for Naive fixtures
         run: |
-          go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
-          xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$(go env GOPATH)/bin/caddy"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          SOURCE="internal/manager/naive/naive.go"
+          REPO="$(sed -n 's/.*NaiveImageRepository *= *"\([^"]*\)".*/\1/p' "$SOURCE")"
+          DIGEST="$(sed -n 's/.*NaiveImageDigest *= *"\([^"]*\)".*/\1/p' "$SOURCE")"
+          # The forwardproxy commit the panel reports as the installed plugin
+          # version. The binary has to agree with it, not just with the digest.
+          FORWARDPROXY="$(sed -n 's/.*NaiveForwardProxyCommit *= *"\([^"]*\)".*/\1/p' "$SOURCE")"
+          if [ -z "$REPO" ] || [ -z "$DIGEST" ] || [ -z "$FORWARDPROXY" ]; then
+            echo "::error::could not read the pinned naive-caddy reference from $SOURCE"
+            exit 1
+          fi
+          REF="${REPO}@${DIGEST}"
+
+          mkdir -p "$RUNNER_TEMP/caddy"
+          docker pull "$REF"
+          container="$(docker create "$REF")"
+          trap 'docker rm "$container" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container:/usr/bin/caddy" "$RUNNER_TEMP/caddy/caddy"
+          chmod +x "$RUNNER_TEMP/caddy/caddy"
+
+          # Fail closed: the fixtures need this module, and a binary that cannot
+          # list it is not the artifact the panel installs.
+          "$RUNNER_TEMP/caddy/caddy" list-modules | grep -qx "http.handlers.forward_proxy"
+
+          # The module name alone does not say which forwardproxy revision is
+          # inside. The binary records it, and the panel reports
+          # NaiveForwardProxyCommit as the installed plugin version, so a binary
+          # carrying a different revision would make a fresh install claim an
+          # update it does not need. Go pseudo-versions carry the 12-character
+          # commit prefix, so that is what is compared.
+          BUILD_INFO="$(go version -m "$RUNNER_TEMP/caddy/caddy")"
+          SHORT="${FORWARDPROXY:0:12}"
+          if ! printf '%s\n' "$BUILD_INFO" | awk -v want="$SHORT" '
+                $1 == "=>" && $2 == "github.com/klzgrad/forwardproxy" && index($3, want) { found = 1 }
+                END { exit found ? 0 : 1 }
+              '; then
+            echo "::error::the binary does not record forwardproxy ${FORWARDPROXY} as its replacement" >&2
+            printf '%s\n' "$BUILD_INFO" | awk '$1 == "=>" || /forwardproxy/' >&2
+            exit 1
+          fi
+          echo "==> Using shipped Caddy: $("$RUNNER_TEMP/caddy/caddy" version), forwardproxy ${SHORT} from ${REF}"
+          echo "$RUNNER_TEMP/caddy" >> "$GITHUB_PATH"
 
       # The musl loader comes from the same digest-pinned Alpine image as libgcc,
       # so this step no longer depends on any Ubuntu package mirror. Alpine's
@@ -333,6 +381,7 @@ jobs:
             tests/test_onboard_credentials.py \
             tests/test_naive_decoy_default_contract.py \
             tests/test_ci_native_dependencies.py \
+            tests/test_ci_shipped_caddy.py \
             tests/test_ci_naive_consumer_steps.py \
             tests/test_e2e_runner_map.py
 
