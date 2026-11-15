@@ -56,6 +56,25 @@ Task-based lookup (package, governing contract, validation) is in [Where do I st
 
 Run the gate list in [CONTRIBUTING.md](CONTRIBUTING.md#testing) before review, including `python3 scripts/architecture_health.py --check --nonblocking`.
 
+## Skills
+
+Load `pragmatic-disciplined-engineering` once before Go or frontend
+implementation. Load the task-matching language or workflow skill at the
+**start of the phase**, not after the work:
+
+- Go tests: `golang-testing` (plus `golang-stretchr-testify` when testify is used).
+- Goroutines, locks, channels or lifecycle: `golang-concurrency`.
+- Debugging: `golang-troubleshooting` and `systematic-debugging`.
+- CI failures and verification claims: `ci-failure-diagnostics-v14` and `verification-output-discipline`.
+- Review: `adversarial-code-review` and `pre-merge-verification`.
+- PR lifecycle and review comments: `github-pr-workflow` and `github-code-review`.
+- Planning: `writing-plans-v2` (or `writing-plans` when that format is requested).
+
+Do not load the whole catalog; the agent profile carries the full routing table.
+State in the report which skills were used and which were not. If a skill is
+absent or cannot be loaded, record the exact gap instead of proceeding as if the
+method was followed.
+
 ## Hard limits
 
 - Size rule SG1 applies to every file type: warning at 500 lines, review ceiling at 1,000. A PR must not cross or grow past the ceiling without a stated per-PR justification.
