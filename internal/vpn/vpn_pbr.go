@@ -541,8 +541,9 @@ func initDefaultDNSGateway(gwDNS netip.Addr, matcher *policy.Matcher, rc forward
 		obs = ro
 	}
 	gw, err := gatewaydns.NewGateway(gatewaydns.GatewayConfig{
-		Gateway:       netip.AddrPortFrom(gwDNS, 53),
-		RouteObserver: obs,
+		Gateway:                  netip.AddrPortFrom(gwDNS, 53),
+		RouteObserver:            obs,
+		InterceptAllDestinations: true,
 	}, dnsSrv)
 	if err != nil {
 		return nil

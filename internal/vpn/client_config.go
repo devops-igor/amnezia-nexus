@@ -300,6 +300,38 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 	return s.renderClientConfigForConnection(ctx, db, cfg, portalPub, user, awgConn, false)
 }
 
+// clientConfigDNSServers returns the DNS resolvers a generated client
+// configuration must push.
+//
+// While policy routing is active the policy resolver is the only resolver that
+// can turn a client's own answers into routing evidence, so clients are steered
+// to the tunnel gateway address. The gateway resolver is pushed only when the
+// policy routing runtime and its gateway both exist: a configuration must never
+// point a client at a resolver that is not running. With policy routing
+// inactive the existing external resolvers are kept unchanged.
+//
+// A configuration downloaded while policy routing was active keeps the gateway
+// address after deactivation; those queries then follow the ordinary tunnel
+// path and are not answered by the policy resolver. Policy routing must be
+// re-enabled, or the configuration re-downloaded, for steering to resume.
+func (s *Service) clientConfigDNSServers() (string, string) {
+	dns1 := awg.AWGDefaults["dns1"]
+	dns2 := awg.AWGDefaults["dns2"]
+
+	if s == nil || !s.PBREnabled() {
+		return dns1, dns2
+	}
+	pbrCfg := s.getPBRConfig()
+	if pbrCfg == nil || pbrCfg.DNSGateway == nil {
+		return dns1, dns2
+	}
+	gw := pbrCfg.GatewayDNSIP
+	if !gw.IsValid() || !gw.Is4() || gw.IsUnspecified() || gw.IsLoopback() {
+		return dns1, dns2
+	}
+	return gw.String(), gw.String()
+}
+
 func (s *Service) renderClientConfigForConnection(
 	ctx context.Context,
 	db *database.DB,
@@ -383,14 +415,15 @@ func (s *Service) renderClientConfigForConnection(
 
 	clientMTU := resolveClientMTU(awgConn, awgParams)
 
+	dns1, dns2 := s.clientConfigDNSServers()
 	configStr := awg.RenderClientConfig(
 		p.clientPriv,
 		assignedIP,
 		portalPub,
 		"", // psk
 		endpointStr,
-		awg.AWGDefaults["dns1"],
-		awg.AWGDefaults["dns2"],
+		dns1,
+		dns2,
 		clientMTU,
 		awgParams,
 		ud,

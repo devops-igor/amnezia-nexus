@@ -113,8 +113,13 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 		return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
 	}
 
-	// Ingress DNS interception: if addressed to gateway DNS on port 53, submit to DNS handler.
-	if dnsHandler != nil && gwDNS.IsValid() && dstIP == gwDNS && parsed.DstPort == 53 {
+	// Ingress DNS interception: while policy routing is active every plain
+	// DNS packet on UDP or TCP port 53 is submitted to the policy resolver,
+	// whatever its destination, so the client's own answers become routing
+	// evidence. The gateway rewrites the reply to appear from the queried
+	// address, so an unmodified client accepts it. Prohibited destinations
+	// keep the drop decided above; this never becomes an egress path.
+	if dnsHandler != nil && parsed.DstPort == 53 {
 		handled, err := dnsHandler.HandleDNSPacket(sID, peerKey, route.assignedIP, route.returnPath, packet)
 		if handled {
 			return err

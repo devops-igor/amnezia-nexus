@@ -86,6 +86,14 @@ type Retirement struct {
 type GatewayConfig struct {
 	Gateway       netip.AddrPort
 	RouteObserver RouteObserver
+	// InterceptAllDestinations makes the gateway answer plain DNS for any
+	// permitted IPv4 destination on port 53, not only queries addressed to
+	// Gateway. It is enabled only for the policy resolver of an active
+	// policy-routing session: UDP replies are built from the queried address,
+	// and TCP queries are translated onto the gateway address and their
+	// replies translated back. While policy routing is inactive the gateway
+	// is not installed, and this flag must stay false.
+	InterceptAllDestinations bool
 }
 
 type gatewayTCPTransport struct {
@@ -95,6 +103,7 @@ type gatewayTCPTransport struct {
 	closed    atomic.Bool
 	cancel    context.CancelFunc
 	serveDone chan struct{}
+	nat       dnsTCPNAT
 }
 
 // Close tears the transport down in producer order: the Serve loop is stopped
@@ -206,6 +215,11 @@ func (g *Gateway) getOrCreateTransport(scope *ScopeHandle) (*gatewayTCPTransport
 			if n > 0 && sizes[0] > 0 {
 				pkt := make([]byte, sizes[0])
 				copy(pkt, buf[0][:sizes[0]])
+				rewritten, ok := tr.nat.inbound(pkt, g.cfg.Gateway.Addr(), time.Now())
+				if !ok {
+					continue
+				}
+				pkt = rewritten
 				if !scope.IsRetired() && scope.ReplyWriter != nil {
 					if err := scope.ReplyWriter.WritePacket(scope.Scope, pkt); err != nil {
 						scope.Retire()
@@ -314,9 +328,15 @@ func (g *Gateway) TrySubmit(scope *ScopeHandle, ipv4Packet []byte) (handled bool
 		return false, nil
 	}
 
-	// Verify destination IP matches gateway IP.
+	// Verify the destination. Queries addressed to the gateway are always
+	// handled. Any other destination is handled only while policy routing is
+	// active, which is exactly when this gateway is installed as the policy
+	// resolver; its reply is then rewritten to appear from the queried
+	// address. With policy routing inactive the flag is false and port-53
+	// traffic keeps its previous routing.
 	dstIP := netip.AddrFrom4([4]byte{ipv4Packet[16], ipv4Packet[17], ipv4Packet[18], ipv4Packet[19]})
-	if dstIP != g.cfg.Gateway.Addr() {
+	foreignDestination := dstIP != g.cfg.Gateway.Addr()
+	if foreignDestination && !g.cfg.InterceptAllDestinations {
 		return false, nil
 	}
 
@@ -337,6 +357,16 @@ func (g *Gateway) TrySubmit(scope *ScopeHandle, ipv4Packet []byte) (handled bool
 		if err != nil {
 			return true, nil
 		}
+		pkt := ipv4Packet
+		if foreignDestination {
+			rewritten, ok := tr.nat.outbound(ipv4Packet, ihl, g.cfg.Gateway.Addr(), time.Now())
+			if !ok {
+				// A packet that cannot be translated is dropped rather than
+				// delivered to the wrong destination.
+				return true, nil
+			}
+			pkt = rewritten
+		}
 		tr.mu.Lock()
 		if tr.closed.Load() {
 			// Transport teardown already started; the device must not be
@@ -344,7 +374,7 @@ func (g *Gateway) TrySubmit(scope *ScopeHandle, ipv4Packet []byte) (handled bool
 			tr.mu.Unlock()
 			return true, nil
 		}
-		_, _ = tr.vt.Write([][]byte{ipv4Packet}, 0)
+		_, _ = tr.vt.Write([][]byte{pkt}, 0)
 		tr.mu.Unlock()
 		return true, nil
 
