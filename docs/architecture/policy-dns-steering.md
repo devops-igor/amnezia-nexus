@@ -104,8 +104,11 @@ translation (`internal/vpn/dns/gateway_nat.go`):
 Translations are per session, bounded to 256 entries, and discarded after 60
 seconds of idleness; a new translation for the same client flow replaces the
 old one. Fragmented TCP packets cannot be translated safely and are dropped.
-The gateway address response and a translated response are therefore
-indistinguishable to the client, and an unmodified DNS client accepts both.
+A flow that later targets the gateway address itself clears any translation it
+recorded for an earlier foreign resolver, so a reply is only ever rewritten to
+the address the client actually queried. The gateway address response and a
+translated response are therefore indistinguishable to the client, and an
+unmodified DNS client accepts both.
 
 ### Observations
 

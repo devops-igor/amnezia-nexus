@@ -366,6 +366,10 @@ func (g *Gateway) TrySubmit(scope *ScopeHandle, ipv4Packet []byte) (handled bool
 				return true, nil
 			}
 			pkt = rewritten
+		} else {
+			// A flow that targets the gateway must not inherit a translation
+			// recorded for an earlier intercepted foreign resolver.
+			tr.nat.forgetFlow(ipv4Packet, ihl)
 		}
 		tr.mu.Lock()
 		if tr.closed.Load() {

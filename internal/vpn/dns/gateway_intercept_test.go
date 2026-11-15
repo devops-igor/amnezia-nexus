@@ -387,6 +387,103 @@ func TestGateway_Interception_MalformedPacketsProduceNoEvidence(t *testing.T) {
 	}
 }
 
+// TestGateway_InactiveGatewayDoesNotIntercept is the gateway-level half of the
+// inactive negative control: the gateway that exists while policy routing is
+// inactive is built without InterceptAllDestinations, so it must refuse a
+// foreign destination on both transports while still answering its own address.
+func TestGateway_InactiveGatewayDoesNotIntercept(t *testing.T) {
+	gwIP := netip.MustParseAddr("10.8.0.1")
+	clientIP := netip.MustParseAddr("10.8.0.2")
+	foreignResolver := netip.MustParseAddr("8.8.8.8")
+
+	snap := compileTestSnapshot(t, "", "198.51.200.0/24")
+	addr := netip.AddrPortFrom(gwIP, 53)
+	srv, err := NewServer(ServerConfig{Gateway: addr}, foreignDNSResolver(t, 300, map[string]string{}), &staticPolicySource{snapshot: snap})
+	if err != nil {
+		t.Fatalf("failed to create DNS server: %v", err)
+	}
+	gw, err := NewGateway(GatewayConfig{Gateway: addr}, srv)
+	if err != nil {
+		t.Fatalf("failed to create gateway: %v", err)
+	}
+	t.Cleanup(func() { _ = gw.Close() })
+
+	_, sess := setupTestSession(t, snap.Generation())
+	writer := &mockReplyWriter{}
+	scope := NewScopeHandle(context.Background(), policy.Scope{SessionID: "sess-observe", OwnershipEpoch: 1}, sess, writer)
+	defer gw.BeginRetire(scope)
+
+	req := new(mdns.Msg)
+	req.SetQuestion("matched.example.", mdns.TypeA)
+	req.Id = 7000
+	payload, err := req.Pack()
+	if err != nil {
+		t.Fatalf("failed to pack query: %v", err)
+	}
+
+	if handled, err := gw.TrySubmit(scope, buildIPv4UDPPacket(clientIP, 40000, foreignResolver, 53, payload)); handled || err != nil {
+		t.Fatalf("inactive gateway handled a foreign UDP query: handled=%v err=%v", handled, err)
+	}
+	if handled, err := gw.TrySubmit(scope, buildIPv4TCPPacket(clientIP, 40001, foreignResolver, 53, false)); handled || err != nil {
+		t.Fatalf("inactive gateway handled a foreign TCP query: handled=%v err=%v", handled, err)
+	}
+	if got := len(writer.getPackets()); got != 0 {
+		t.Fatalf("inactive gateway answered %d foreign queries", got)
+	}
+	if got := gw.ActiveTransports(); got != 0 {
+		t.Fatalf("inactive gateway opened %d foreign TCP transports", got)
+	}
+
+	// The gateway's own address keeps its previous behaviour.
+	handled, err := gw.TrySubmit(scope, buildIPv4UDPPacket(clientIP, 40002, gwIP, 53, payload))
+	if !handled || err != nil {
+		t.Fatalf("inactive gateway stopped answering its own address: handled=%v err=%v", handled, err)
+	}
+	if got := len(writer.getPackets()); got != 1 {
+		t.Fatalf("expected one reply to the gateway-addressed query, got %d", got)
+	}
+}
+
+// TestDNSTCPNAT_GatewayFlowForgetsForeignTranslation proves a client flow that
+// switches back to the gateway address drops the translation recorded for its
+// earlier foreign resolver, so its reply can never be rewritten to an address
+// the client is no longer talking to.
+func TestDNSTCPNAT_GatewayFlowForgetsForeignTranslation(t *testing.T) {
+	gwIP := netip.MustParseAddr("10.8.0.1")
+	clientIP := netip.MustParseAddr("10.8.0.2")
+	foreignResolver := netip.MustParseAddr("9.9.9.9")
+
+	snap := compileTestSnapshot(t, "", "198.51.200.0/24")
+	gw := newInterceptGateway(t, snap, foreignDNSResolver(t, 300, map[string]string{}), gwIP)
+
+	_, sess := setupTestSession(t, snap.Generation())
+	writer := &mockReplyWriter{}
+	scope := NewScopeHandle(context.Background(), policy.Scope{SessionID: "sess-observe", OwnershipEpoch: 1}, sess, writer)
+	defer gw.BeginRetire(scope)
+
+	const clientPort = 40010
+	if handled, err := gw.TrySubmit(scope, buildIPv4TCPPacket(clientIP, clientPort, foreignResolver, 53, false)); !handled || err != nil {
+		t.Fatalf("foreign TCP query was not intercepted: handled=%v err=%v", handled, err)
+	}
+	gw.mu.Lock()
+	tr := gw.transports[scope.Scope]
+	gw.mu.Unlock()
+	if tr == nil {
+		t.Fatal("interception did not create a TCP transport")
+	}
+	key := netip.AddrPortFrom(clientIP, clientPort)
+	if _, ok := tr.nat.lookup(key, time.Now()); !ok {
+		t.Fatal("expected the foreign flow to record a translation")
+	}
+
+	if handled, err := gw.TrySubmit(scope, buildIPv4TCPPacket(clientIP, clientPort, gwIP, 53, false)); !handled || err != nil {
+		t.Fatalf("gateway TCP query was not handled: handled=%v err=%v", handled, err)
+	}
+	if dest, ok := tr.nat.lookup(key, time.Now()); ok {
+		t.Fatalf("gateway-directed flow kept a stale translation to %s", dest)
+	}
+}
+
 // buildIPv4TCPPacket builds a minimal IPv4 TCP packet. When truncated is true
 // the packet stops in the middle of the TCP header; when fragmented is true a
 // more-fragments flag is set so the packet cannot be translated safely.

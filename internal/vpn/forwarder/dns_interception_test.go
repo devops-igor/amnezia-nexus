@@ -51,6 +51,36 @@ func TestDNSInterception_InactivePolicyIsNotIntercepted(t *testing.T) {
 	}
 }
 
+// TestDNSInterception_ProhibitedDestinationIsNotIntercepted proves interception
+// never turns a prohibited destination into an answer: the existing drop runs
+// before the DNS handler, so a private address on port 53 is still refused and
+// never reaches the resolver or the backend.
+func TestDNSInterception_ProhibitedDestinationIsNotIntercepted(t *testing.T) {
+	fwd, _, _, _ := setupForwarderWithPBR(t)
+
+	backendID := int64(303)
+	fwd.AttachBackendDevice(backendID, newMockPacketDev())
+
+	handler := &recordingDNSHandler{}
+	fwd.SetDNSHandler(handler)
+
+	peerKey := "peer-dns-prohibited"
+	clientIP := "10.100.0.27"
+	path := newTestCaptureReturnPath()
+	fwd.RegisterSessionWithReturnPath("s-dns-prohibited", "c-dns-prohibited", peerKey, clientIP, backendID, path.path)
+
+	pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), netip.MustParseAddr("192.168.50.1"), 43000, 53, []byte("dns-query"))
+	if err := fwd.RouteClientToBackend(peerKey, pkt); err == nil {
+		t.Fatal("prohibited destination on port 53 was accepted")
+	}
+	if got := handler.calls.Load(); got != 0 {
+		t.Fatalf("prohibited destination was intercepted %d times", got)
+	}
+	if got := len(fwd.backendQueues[backendID]); got != 0 {
+		t.Fatalf("prohibited destination was queued toward the backend %d times", got)
+	}
+}
+
 // TestDNSInterception_ActivePolicyInterceptsPort53Only proves that while policy
 // routing is active every plain DNS packet is submitted to the policy resolver
 // whatever its destination, while other ports keep their ordinary routing.

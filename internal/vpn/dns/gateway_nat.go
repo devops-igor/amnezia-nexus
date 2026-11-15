@@ -134,6 +134,18 @@ func (n *dnsTCPNAT) forget(key netip.AddrPort) {
 	n.mu.Unlock()
 }
 
+// forgetFlow drops any translation recorded for the client flow that produced
+// packet. A flow that now targets the gateway itself must not inherit a
+// translation recorded while it targeted a foreign resolver, or its reply would
+// be rewritten to an address the client is no longer talking to. Malformed
+// packets simply have no translation to forget.
+func (n *dnsTCPNAT) forgetFlow(packet []byte, ihl int) {
+	if ihl < 20 || len(packet) < ihl+4 {
+		return
+	}
+	n.forget(netip.AddrPortFrom(ipv4Addr(packet, 12), binary.BigEndian.Uint16(packet[ihl:ihl+2])))
+}
+
 // evictLocked removes expired translations first and the oldest remaining one
 // when the session is still at capacity. The caller holds n.mu.
 func (n *dnsTCPNAT) evictLocked(now time.Time) {
