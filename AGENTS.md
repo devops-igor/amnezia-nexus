@@ -32,10 +32,11 @@ Task-based lookup (package, governing contract, validation) is in [Where do I st
 | Dataplane and packet forwarding | `internal/vpn/forwarder/` |
 | Database records or migrations | `internal/database/` |
 | Page behavior and UI | `web/templates/`, `web/static/js/` |
+| Browser/E2E tests and which runner owns them | `tests/e2e/runner_map.toml` |
 
 ## Documents
 
-- [CONTRIBUTING.md](CONTRIBUTING.md): workflow, local setup, quality gates, and the single Refactor PR Review Checklist.
+- [CONTRIBUTING.md](CONTRIBUTING.md): setup, workflow, testing and pull-request conventions.
 - [Module ownership conventions](docs/architecture/module-ownership-conventions.md): package ownership, dependency direction, file-versus-package guidance, lock contracts, sizing rule SG1.
 - Subsystem contracts (these win for their subsystem):
   - [VPN service state ownership](docs/architecture/vpn-service-state-ownership.md)
@@ -47,13 +48,13 @@ Task-based lookup (package, governing contract, validation) is in [Where do I st
 
 | Command | Purpose |
 |---------|---------|
-| `make check` | format, vet, lint, security, race tests |
+| `make check` | format check, vet, lint, security, race tests |
 | `make test` | `go test -v ./...` |
 | `make test-race` | `go test -race -v ./...` |
 | `make lint` | `golangci-lint run ./...` |
 | `make security` | `gosec` and `govulncheck` |
 
-Run the full gate list in [CONTRIBUTING.md](CONTRIBUTING.md#quality-gates) before review, including `python3 scripts/architecture_health.py --check --nonblocking`.
+Run the gate list in [CONTRIBUTING.md](CONTRIBUTING.md#testing) before review, including `python3 scripts/architecture_health.py --check --nonblocking`.
 
 ## Hard limits
 

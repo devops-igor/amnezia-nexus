@@ -261,16 +261,16 @@ Known exceptions: some templates still contain inline `<script>` blocks and inli
 7. **Stay in scope and in the authorized branch.** No pushes, merges, or history rewrites unless the task explicitly authorizes them. Stage files by explicit path.
 8. **No leaks.** Do not commit local filesystem paths, internal hostnames, RFC 1918 addresses taken from real deployments, tokens, or tool/bot identities. Use documentation-range addresses (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) in examples.
 
-## 9. Refactor PR Review Checklist
+## 9. Refactor review criteria
 
-The single authoritative checklist is in [`CONTRIBUTING.md`](../../CONTRIBUTING.md#refactor-pr-review-checklist). Copy it from there into the PR description for any refactor, file split, or package extraction. It is not duplicated here, so it cannot drift.
-
-The safeguards it enforces:
+Reviewers apply these criteria to any refactor, file split, or package extraction.
+They are criteria, not a form to copy into a PR description; the author reports
+what ran and what did not (rule 6 of the hierarchy).
 
 - **SG1 sizing.** One rule for all file types (section 4.3). Exceptions and upward baseline changes need a per-PR rationale; no blanket exemptions.
 - **Structure and fidelity.** Same-package split by default; layering holds; moved code is identical; mechanical moves and behavior changes ship separately; no test deleted or weakened.
-- **Verification layers.** Compile, vet, format, lint, security, race tests, architecture health, frontend/i18n tests, and E2E where routing or backend state changed. Report what ran and what did not (rule 6 of the hierarchy).
-- **Leak and secret scan.** A human or automated review for local paths, hostnames, private IPs, tokens, and credentials. The checklist's regex is a supplemental heuristic (not exhaustive) and does not replace that review.
+- **Verification layers.** Compile, vet, format, lint, security, race tests, architecture health, frontend/i18n tests, and E2E where routing or backend state changed. Automated checks enforce what can be enforced reliably; the reviewer checks what they cannot.
+- **Leak and secret scan.** A human or automated review for local paths, hostnames, private IPs, tokens, and credentials. A regex is a supplemental heuristic (not exhaustive) and does not replace that review.
 
 ## 10. Maintaining This Document
 
