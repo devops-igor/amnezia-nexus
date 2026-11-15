@@ -622,6 +622,16 @@ func (hp *HealthProber) Config() HealthConfig {
 	return hp.cfg
 }
 
+// SetTimeoutForTest shortens the probe wait for fixtures that assert the state
+// machine rather than the production timeout. Production never calls it; the
+// default, its validation and the probe path are unchanged, so the same timing
+// and concurrency semantics are covered with a smaller wait.
+func (hp *HealthProber) SetTimeoutForTest(timeout time.Duration) {
+	hp.mu.Lock()
+	hp.cfg.Timeout = timeout
+	hp.mu.Unlock()
+}
+
 // probeEndpoint dispatches the probe according to the backend tunnel's protocol.
 func (hp *HealthProber) probeEndpoint(ctx context.Context, tunnel *models.BackendTunnel) (int64, error) {
 	if tunnel == nil {

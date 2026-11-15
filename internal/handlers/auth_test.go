@@ -24,8 +24,10 @@ func TestAuthHandlers(t *testing.T) {
 	h, db, cfg := setupTestHandlers(t)
 	ctx := context.Background()
 
-	// Seed an admin and regular user
-	adminPassHash, _ := security.HashPassword("AdminPass123!")
+	// Seed an admin and regular user. The hashes are precomputed at the
+	// production cost 12; this test authenticates against them, it does not
+	// exercise hash generation (internal/security does).
+	adminPassHash := fixturePasswordHash(t, "AdminPass123!")
 	adminUser := &models.User{
 		ID:           "admin-1",
 		Username:     "admin",
@@ -36,7 +38,7 @@ func TestAuthHandlers(t *testing.T) {
 	}
 	_, _ = db.CreateUser(ctx, adminUser)
 
-	userPassHash, _ := security.HashPassword("UserPass123!")
+	userPassHash := fixturePasswordHash(t, "UserPass123!")
 	normalUser := &models.User{
 		ID:           "user-1",
 		Username:     "regularuser",
@@ -445,7 +447,7 @@ func TestDisabledUser_SessionRejected(t *testing.T) {
 		middleware.SetUserLookup(nil)
 	})
 
-	userPassHash, _ := security.HashPassword("TestPass123!")
+	userPassHash := fixturePasswordHash(t, "TestPass123!")
 	testUser := &models.User{
 		ID:           "test-revoke-user-1",
 		Username:     "revokeuser",
@@ -607,7 +609,7 @@ func TestSessionVersionRevocation_PasswordChange(t *testing.T) {
 		middleware.SetUserLookup(nil)
 	})
 
-	passHash, _ := security.HashPassword("CurrentPass123!")
+	passHash := fixturePasswordHash(t, "CurrentPass123!")
 	user := &models.User{
 		ID:           "test-pw-user-1",
 		Username:     "pwuser",
@@ -753,7 +755,7 @@ func TestSessionVersionRevocation_LogoutAll(t *testing.T) {
 		middleware.SetUserLookup(nil)
 	})
 
-	passHash, _ := security.HashPassword("Pass123!Safe")
+	passHash := fixturePasswordHash(t, "Pass123!Safe")
 	user := &models.User{
 		ID:           "test-logoutall-user",
 		Username:     "logoutalluser",
