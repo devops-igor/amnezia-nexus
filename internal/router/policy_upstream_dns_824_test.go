@@ -1,0 +1,227 @@
+package router
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/devops-igor/amnezia-nexus/internal/policy"
+)
+
+// These tests cover the #824 slice-1 API contract: the upstream list travels
+// through the existing policy settings endpoints, an invalid entry is refused
+// with a specific error and nothing is persisted, and the stored list survives a
+// restart.
+
+// TestPolicyUpstreamDNSRoundTripSurvivesRestart saves a list through the API and
+// reads it back from a fresh router over the same database.
+func TestPolicyUpstreamDNSRoundTripSurvivesRestart(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	seedPolicySessions(t, db)
+	r := NewRouter(cfg, db, nil)
+
+	saved := policy.DefaultSettings()
+	saved.Preset = policy.PresetGeoblock
+	saved.UpstreamDNS = []policy.Upstream{
+		{Address: "94.140.14.14", Port: 53, Transport: policy.TransportPlain},
+		{Address: "2001:4860:4860::8888", Port: 53},
+		{Address: "dns.example.com", Port: 5353},
+	}
+	body, err := json.Marshal(saved)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	wSave := httptest.NewRecorder()
+	r.ServeHTTP(wSave, adminRequest(t, http.MethodPut, "/api/vpn/policy", body))
+	if wSave.Code != http.StatusOK {
+		t.Fatalf("PUT = %d, want 200; body=%s", wSave.Code, wSave.Body.String())
+	}
+
+	// The durable row carries the list.
+	var stored policy.Settings
+	if err := db.GetSetting(context.Background(), policy.SettingsKey, &stored); err != nil {
+		t.Fatalf("read stored settings: %v", err)
+	}
+	if len(stored.UpstreamDNS) != len(saved.UpstreamDNS) {
+		t.Fatalf("stored upstreams = %v, want %v", stored.UpstreamDNS, saved.UpstreamDNS)
+	}
+	for i := range saved.UpstreamDNS {
+		if stored.UpstreamDNS[i] != saved.UpstreamDNS[i] {
+			t.Fatalf("stored upstream %d = %+v, want %+v", i, stored.UpstreamDNS[i], saved.UpstreamDNS[i])
+		}
+	}
+
+	// "Restart": a new router over the same database, as a process restart gives.
+	r2 := NewRouter(cfg, db, nil)
+	wGet := httptest.NewRecorder()
+	r2.ServeHTTP(wGet, adminRequest(t, http.MethodGet, "/api/vpn/policy", nil))
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("GET after restart = %d, want 200", wGet.Code)
+	}
+	out := decodeJSON(t, wGet)
+	rawUpstreams, ok := out["upstream_dns"].([]any)
+	if !ok {
+		t.Fatalf("GET after restart has no upstream_dns array: %s", wGet.Body.String())
+	}
+	if len(rawUpstreams) != len(saved.UpstreamDNS) {
+		t.Fatalf("upstream_dns after restart = %v, want %d entries", rawUpstreams, len(saved.UpstreamDNS))
+	}
+	for i, raw := range rawUpstreams {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("upstream_dns[%d] = %v, want an object", i, raw)
+		}
+		if address, _ := entry["address"].(string); address != saved.UpstreamDNS[i].Address {
+			t.Fatalf("upstream_dns[%d].address = %v, want %q", i, entry["address"], saved.UpstreamDNS[i].Address)
+		}
+		if port, _ := entry["port"].(float64); int(port) != saved.UpstreamDNS[i].Port {
+			t.Fatalf("upstream_dns[%d].port = %v, want %d", i, entry["port"], saved.UpstreamDNS[i].Port)
+		}
+	}
+}
+
+// TestPolicyUpstreamDNSRejectedEntriesAreNotPersisted walks every rejection rule
+// through the API and checks the stored record is untouched.
+func TestPolicyUpstreamDNSRejectedEntriesAreNotPersisted(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	seedPolicySessions(t, db)
+	r := NewRouter(cfg, db, nil)
+
+	// Store a known-good record with one upstream first.
+	good := policy.DefaultSettings()
+	good.Preset = policy.PresetGeoblock
+	good.UpstreamDNS = []policy.Upstream{{Address: "9.9.9.9", Port: 53}}
+	goodBody, err := json.Marshal(good)
+	if err != nil {
+		t.Fatalf("marshal good settings: %v", err)
+	}
+	wGood := httptest.NewRecorder()
+	r.ServeHTTP(wGood, adminRequest(t, http.MethodPut, "/api/vpn/policy", goodBody))
+	if wGood.Code != http.StatusOK {
+		t.Fatalf("PUT valid settings = %d, want 200; body=%s", wGood.Code, wGood.Body.String())
+	}
+
+	invalid := []struct {
+		name       string
+		upstreams  []policy.Upstream
+		wantSubstr string
+	}{
+		{
+			name:       "loopback",
+			upstreams:  []policy.Upstream{{Address: "127.0.0.1", Port: 53}},
+			wantSubstr: "loopback",
+		},
+		{
+			name:       "multicast",
+			upstreams:  []policy.Upstream{{Address: "224.0.0.1", Port: 53}},
+			wantSubstr: "multicast",
+		},
+		{
+			name:       "unspecified",
+			upstreams:  []policy.Upstream{{Address: "0.0.0.0", Port: 53}},
+			wantSubstr: "unspecified",
+		},
+		{
+			name:       "malformed address",
+			upstreams:  []policy.Upstream{{Address: "300.1.1.1", Port: 53}},
+			wantSubstr: "not a valid IP literal",
+		},
+		{
+			name:       "malformed hostname",
+			upstreams:  []policy.Upstream{{Address: "bad host.example.com", Port: 53}},
+			wantSubstr: "not a valid hostname",
+		},
+		{
+			name:       "missing port",
+			upstreams:  []policy.Upstream{{Address: "9.9.9.9"}},
+			wantSubstr: "explicit port",
+		},
+		{
+			name: "too many entries",
+			upstreams: []policy.Upstream{
+				{Address: "9.9.9.9", Port: 53},
+				{Address: "8.8.8.8", Port: 53},
+				{Address: "1.1.1.1", Port: 53},
+				{Address: "8.8.4.4", Port: 53},
+			},
+			wantSubstr: "exceed the maximum",
+		},
+		{
+			name:       "unknown transport",
+			upstreams:  []policy.Upstream{{Address: "9.9.9.9", Port: 53, Transport: "tls"}},
+			wantSubstr: "unknown transport",
+		},
+		{
+			name:       "encrypted transport not implemented",
+			upstreams:  []policy.Upstream{{Address: "9.9.9.9", Port: 853, Transport: policy.TransportDoT}},
+			wantSubstr: "not supported",
+		},
+	}
+
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]any{
+				"enabled":               false,
+				"preset":                string(policy.PresetGeoblock),
+				"sync_interval_seconds": good.SyncInterval,
+				"upstream_dns":          tc.upstreams,
+			})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, adminRequest(t, http.MethodPut, "/api/vpn/policy", body))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("PUT invalid upstreams (%s) = %d, want 400; body=%s", tc.name, w.Code, w.Body.String())
+			}
+			out := decodeJSON(t, w)
+			detail, _ := out["detail"].(string)
+			if detail == "" {
+				detail = w.Body.String()
+			}
+			if !strings.Contains(detail, tc.wantSubstr) {
+				t.Fatalf("rejection detail %q does not mention %q", detail, tc.wantSubstr)
+			}
+
+			// Nothing was persisted: the good list is still the stored one.
+			var stored policy.Settings
+			if err := db.GetSetting(context.Background(), policy.SettingsKey, &stored); err != nil {
+				t.Fatalf("read stored settings: %v", err)
+			}
+			if len(stored.UpstreamDNS) != 1 || stored.UpstreamDNS[0] != good.UpstreamDNS[0] {
+				t.Fatalf("rejected request changed the stored upstreams: %+v", stored.UpstreamDNS)
+			}
+		})
+	}
+}
+
+// TestPolicyUpstreamDNSDefaultsWhenFieldAbsent keeps an existing record working:
+// a stored record without the field reports an empty array and the effective
+// default pair, not a broken resolver.
+func TestPolicyUpstreamDNSDefaultsWhenFieldAbsent(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	seedPolicySessions(t, db)
+	r := NewRouter(cfg, db, nil)
+
+	legacy := `{"enabled":false,"preset":"geoblock","custom_urls":[],"sync_interval_seconds":3600}`
+	if err := db.SetSetting(context.Background(), policy.SettingsKey, json.RawMessage(legacy)); err != nil {
+		t.Fatalf("store legacy record: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, adminRequest(t, http.MethodGet, "/api/vpn/policy", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	out := decodeJSON(t, w)
+	rawUpstreams, ok := out["upstream_dns"].([]any)
+	if !ok {
+		t.Fatalf("GET has no upstream_dns array: %s", w.Body.String())
+	}
+	if len(rawUpstreams) != 0 {
+		t.Fatalf("legacy record reported %d upstreams, want an empty list", len(rawUpstreams))
+	}
+}

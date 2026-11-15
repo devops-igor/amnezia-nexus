@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
@@ -119,18 +120,13 @@ func (h *Handlers) savePolicySettings(ctx context.Context, settings policy.Setti
 // policySettingsEqual reports whether two records describe the same
 // configuration. Settings contains a slice, so == is unavailable.
 func policySettingsEqual(a, b policy.Settings) bool {
-	if a.Enabled != b.Enabled || a.Preset != b.Preset || a.SyncInterval != b.SyncInterval {
-		return false
-	}
-	if len(a.CustomURLs) != len(b.CustomURLs) {
-		return false
-	}
-	for i := range a.CustomURLs {
-		if a.CustomURLs[i] != b.CustomURLs[i] {
-			return false
-		}
-	}
-	return true
+	// The upstream list is part of the record: a compensating write must not
+	// mistake a record whose only change was the resolver list for its own.
+	return a.Enabled == b.Enabled &&
+		a.Preset == b.Preset &&
+		a.SyncInterval == b.SyncInterval &&
+		slices.Equal(a.CustomURLs, b.CustomURLs) &&
+		slices.Equal(a.UpstreamDNS, b.UpstreamDNS)
 }
 
 // restorePolicySettings compensates a committed settings write whose activation
@@ -178,6 +174,7 @@ func (h *Handlers) GetPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		"preset":                string(settings.Preset),
 		"custom_urls":           customURLsOrEmpty(settings.CustomURLs),
 		"sync_interval_seconds": settings.SyncInterval,
+		"upstream_dns":          upstreamDNSOrEmpty(settings.UpstreamDNS),
 	}
 	if h.vpnSvc != nil {
 		response["status"] = h.vpnSvc.PolicyStatusSnapshot()
@@ -193,6 +190,16 @@ func customURLsOrEmpty(urls []string) []string {
 		return []string{}
 	}
 	return urls
+}
+
+// upstreamDNSOrEmpty reports an empty JSON array rather than null for a record
+// that uses the effective default upstream list. An empty array therefore reads
+// as "no explicit list", which is exactly what the setting means.
+func upstreamDNSOrEmpty(list []policy.Upstream) []policy.Upstream {
+	if list == nil {
+		return []policy.Upstream{}
+	}
+	return list
 }
 
 // policySettingsMutation is the settings-mutation boundary: at most one complete
@@ -276,6 +283,7 @@ func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
 	h.audit(r, "policy.settings_save", map[string]any{
 		"result": "ok", "enabled": incoming.Enabled, "preset": string(incoming.Preset),
 		"custom_url_count": len(incoming.CustomURLs), "sync_interval_seconds": incoming.SyncInterval,
+		"upstream_dns_count": len(incoming.UpstreamDNS),
 	})
 	h.JSON(w, http.StatusOK, h.policyPutResponse(incoming))
 }
@@ -361,6 +369,7 @@ func (h *Handlers) policyPutResponse(saved policy.Settings) map[string]any {
 		"preset":                string(saved.Preset),
 		"custom_urls":           customURLsOrEmpty(saved.CustomURLs),
 		"sync_interval_seconds": saved.SyncInterval,
+		"upstream_dns":          upstreamDNSOrEmpty(saved.UpstreamDNS),
 	}
 	if h.vpnSvc != nil {
 		response["policy_status"] = h.vpnSvc.PolicyStatusSnapshot()

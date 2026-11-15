@@ -271,26 +271,50 @@ func TestPolicyDNSContinuity_ServesIssuedGatewayProfileAfterDisable(t *testing.T
 
 // TestDefaultPolicyUpstreamsMatchClientDNS pins the policy resolver's upstream
 // pair so a blocked provider cannot silently return, and keeps it identical to
-// the addresses generated client configurations push.
+// the addresses generated client configurations push by deriving both from the
+// one definition.
 func TestDefaultPolicyUpstreamsMatchClientDNS(t *testing.T) {
-	upstreams := defaultPolicyUpstreams()
-	want := []netip.AddrPort{
-		netip.MustParseAddrPort("94.140.14.14:53"),
-		netip.MustParseAddrPort("94.140.15.15:53"),
+	upstreams := policy.DefaultUpstreams()
+	want := []struct {
+		address string
+		port    int
+	}{
+		{"94.140.14.14", policy.DefaultUpstreamPort},
+		{"94.140.15.15", policy.DefaultUpstreamPort},
 	}
 	if len(upstreams) != len(want) {
-		t.Fatalf("default policy upstreams = %v, want %v", upstreams, want)
+		t.Fatalf("default policy upstreams = %v, want %d entries", upstreams, len(want))
 	}
 	for i := range want {
-		if upstreams[i] != want[i] {
-			t.Fatalf("default policy upstream %d = %s, want %s", i, upstreams[i], want[i])
+		if upstreams[i].Address != want[i].address || upstreams[i].Port != want[i].port {
+			t.Fatalf("default policy upstream %d = %s, want %s:%d", i, upstreams[i], want[i].address, want[i].port)
+		}
+		if transport := upstreams[i].EffectiveTransport(); transport != policy.TransportPlain {
+			t.Fatalf("default policy upstream %d transport = %q, want %q", i, transport, policy.TransportPlain)
 		}
 	}
-	if got, wantAddr := upstreams[0].Addr().String(), awg.AWGDefaults["dns1"]; got != wantAddr {
-		t.Fatalf("primary upstream %s does not match the client configuration resolver %s", got, wantAddr)
+
+	// The resolver fallback must be the same list, so a stored record that
+	// carries no upstream configuration keeps resolving through it.
+	effective := policy.DefaultSettings().EffectiveUpstreams()
+	if len(effective) != len(upstreams) {
+		t.Fatalf("effective default upstreams = %v, want %v", effective, upstreams)
 	}
-	if got, wantAddr := upstreams[1].Addr().String(), awg.AWGDefaults["dns2"]; got != wantAddr {
-		t.Fatalf("alternate upstream %s does not match the client configuration resolver %s", got, wantAddr)
+	for i := range upstreams {
+		if effective[i] != upstreams[i] {
+			t.Fatalf("effective default upstream %d = %s, want %s", i, effective[i], upstreams[i])
+		}
+	}
+
+	// The rendered pair must come from that same definition: this is the drift
+	// the single source exists to prevent.
+	dns1, dns2 := defaultClientDNSServers()
+	if dns1 != want[0].address || dns2 != want[1].address {
+		t.Fatalf("client configuration DNS pair = (%q, %q), want (%q, %q)", dns1, dns2, want[0].address, want[1].address)
+	}
+	// A service with policy routing inactive pushes exactly that pair.
+	if got1, got2 := (&Service{}).clientConfigDNSServers(); got1 != dns1 || got2 != dns2 {
+		t.Fatalf("inactive client configuration DNS = (%q, %q), want (%q, %q)", got1, got2, dns1, dns2)
 	}
 }
 

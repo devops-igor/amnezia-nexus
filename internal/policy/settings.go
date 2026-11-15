@@ -63,10 +63,20 @@ type Settings struct {
 	CustomURLs []string `json:"custom_urls"`
 	// SyncInterval is the refresh period in seconds.
 	SyncInterval int64 `json:"sync_interval_seconds"`
+	// UpstreamDNS is the operator-configured upstream resolver list. It is
+	// empty by default, which means "use the effective defaults" rather than
+	// "no resolver": an existing record written before this field existed
+	// therefore keeps resolving exactly as it did.
+	//
+	// The list is validated by Validate before it is persisted (see
+	// upstream.go), and the policy resolver and the DNS servers a generated
+	// client configuration pushes both derive from it.
+	UpstreamDNS []Upstream `json:"upstream_dns,omitempty"`
 }
 
 // DefaultSettings returns the fresh-install configuration: policy routing
-// disabled, no preset selected, no custom URLs, default refresh interval.
+// disabled, no preset selected, no custom URLs, default refresh interval and
+// the default upstream resolvers (represented by the empty list).
 func DefaultSettings() Settings {
 	return Settings{
 		Enabled:      false,
@@ -92,6 +102,10 @@ func (s Settings) Normalize() Settings {
 		out.CustomURLs = make([]string, len(s.CustomURLs))
 		copy(out.CustomURLs, s.CustomURLs)
 	}
+	if s.UpstreamDNS != nil {
+		out.UpstreamDNS = make([]Upstream, len(s.UpstreamDNS))
+		copy(out.UpstreamDNS, s.UpstreamDNS)
+	}
 	return out
 }
 
@@ -112,12 +126,13 @@ func (s Settings) Interval() time.Duration {
 // Settings contains a slice and is therefore not comparable with ==, which is
 // why this exists rather than a comparison at each call site.
 func (s Settings) IsZero() bool {
-	return s.Preset == "" && !s.Enabled && s.SyncInterval == 0 && len(s.CustomURLs) == 0
+	return s.Preset == "" && !s.Enabled && s.SyncInterval == 0 && len(s.CustomURLs) == 0 && len(s.UpstreamDNS) == 0
 }
 
 // Validate reports whether the configuration may be persisted. A nil result
-// means the record is internally coherent and every URL is fetchable under the
-// same SSRF rules the fetcher enforces.
+// means the record is internally coherent, every URL is fetchable under the
+// same SSRF rules the fetcher enforces, and every upstream entry is a usable
+// resolver the plain transport may dial.
 //
 // Validate intentionally does not consult live runtime state: whether enablement
 // is currently possible depends on a published snapshot and direct egress, which
@@ -132,7 +147,10 @@ func (s Settings) Validate() error {
 		}
 		return fmt.Errorf("unknown policy preset %q", s.Preset)
 	}
-	return s.validateSourceSelection()
+	if err := s.validateSourceSelection(); err != nil {
+		return err
+	}
+	return s.validateUpstreams()
 }
 
 func (s Settings) validateInterval() error {

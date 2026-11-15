@@ -39,6 +39,14 @@ type PBRConfig struct {
 	PolicyMatcher *policy.Matcher
 	PolicySources []policy.SourceParsedRules
 	DNSGateway    *gatewaydns.Gateway
+	// UpstreamDNS is the validated upstream list the policy resolver dials.
+	// Empty means the effective defaults (policy.DefaultUpstreams()).
+	UpstreamDNS []policy.Upstream
+	// DNSResolver is the resolver installed with DNSGateway. It is kept here so
+	// the policy status can report the last upstream outcome, and so a live
+	// settings change can swap the upstream list without rebuilding the data
+	// path.
+	DNSResolver *gatewaydns.UpstreamResolver
 }
 
 // ValidatePBRPrerequisites checks that all required direct egress components are present
@@ -130,7 +138,7 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 	// was active keep naming the gateway, so the gateway-address-only
 	// continuity responder is installed before the classifier is turned off.
 	if !cfg.Enabled {
-		s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(cfg.GatewayDNSIP))
+		s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(cfg.GatewayDNSIP), cfg.UpstreamDNS)
 		s.forwarder.SetPBREnabled(false)
 		if dem := s.forwarder.DirectEgress(); dem != nil {
 			_ = dem.Close()
@@ -143,7 +151,7 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 	if err := ValidatePBRPrerequisites(cfg); err != nil {
 		// A refused activation is a transition to disabled: keep issued
 		// gateway profiles served rather than stranding them.
-		s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(cfg.GatewayDNSIP))
+		s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(cfg.GatewayDNSIP), cfg.UpstreamDNS)
 		s.forwarder.SetPBREnabled(false)
 		return fmt.Errorf("pbr prerequisites: %w", err)
 	}
@@ -540,11 +548,12 @@ func (s *Service) deriveGatewayDNSIPLocked() netip.Addr {
 	return netip.MustParseAddr("10.100.0.1")
 }
 
-func initDefaultDNSGateway(gwDNS netip.Addr, matcher *policy.Matcher, rc forwarder.RouteCache) *gatewaydns.Gateway {
-	resolver, err := gatewaydns.NewUpstreamResolver(gatewaydns.ResolverConfig{
-		Upstreams: defaultPolicyUpstreams(),
-	})
-	if err != nil {
+// initDNSGateway builds the policy DNS gateway over an upstream resolver that
+// was already constructed from the configured upstream list. The resolver is
+// passed in rather than rebuilt here so the gateway, the status surface and the
+// live settings path all share one resolver instance.
+func initDNSGateway(gwDNS netip.Addr, matcher *policy.Matcher, rc forwarder.RouteCache, resolver gatewaydns.Resolver) *gatewaydns.Gateway {
+	if resolver == nil {
 		return nil
 	}
 	dnsSrv, err := gatewaydns.NewServer(gatewaydns.ServerConfig{
@@ -566,6 +575,24 @@ func initDefaultDNSGateway(gwDNS netip.Addr, matcher *policy.Matcher, rc forward
 		return nil
 	}
 	return gw
+}
+
+// newPolicyUpstreamResolver builds the upstream resolver from the configured
+// list, falling back to the effective defaults when no list is configured.
+// A list that cannot be dialed safely is returned as an error rather than
+// silently leaving the resolver unset: policy routing without a working
+// resolver produces no evidence at all, which is the failure this configuration
+// exists to remove.
+func newPolicyUpstreamResolver(configured []policy.Upstream) (*gatewaydns.UpstreamResolver, error) {
+	upstreams := configured
+	if len(upstreams) == 0 {
+		upstreams = policy.DefaultUpstreams()
+	}
+	resolver, err := gatewaydns.NewUpstreamResolver(gatewaydns.ResolverConfig{Upstreams: upstreams})
+	if err != nil {
+		return nil, fmt.Errorf("upstream dns configuration: %w", err)
+	}
+	return resolver, nil
 }
 
 // newProductionWANDevice is the substitution point for the production WAN device
@@ -672,9 +699,20 @@ func (s *Service) initPBR(ctx context.Context) error {
 		mem.AttachMatcher(cfg.PolicyMatcher)
 	}
 
-	// 5b. DNS Gateway: instantiate DNS gateway if not provided and connect RouteCache observer
+	// 5b. DNS Gateway: instantiate DNS gateway if not provided and connect RouteCache observer.
+	// The resolver is built from the configured upstream list (the persisted
+	// policy settings, when this activation came from them) so a blocked
+	// provider is a settings change rather than a code change.
 	if cfg.DNSGateway == nil && cfg.GatewayDNSIP.IsValid() {
-		cfg.DNSGateway = initDefaultDNSGateway(cfg.GatewayDNSIP, cfg.PolicyMatcher, cfg.RouteCache)
+		resolver, err := newPolicyUpstreamResolver(cfg.UpstreamDNS)
+		if err != nil {
+			if cfg.WANDevice != nil {
+				_ = cfg.WANDevice.Close()
+			}
+			return err
+		}
+		cfg.DNSResolver = resolver
+		cfg.DNSGateway = initDNSGateway(cfg.GatewayDNSIP, cfg.PolicyMatcher, cfg.RouteCache, resolver)
 	}
 
 	// 6. Configure PBR on Service (fails closed if prerequisite validation fails)
@@ -710,10 +748,12 @@ func (s *Service) TeardownPBR() error {
 	// unchanged; only the gateway-address-only DNS responder persists, and
 	// installing it replaces and closes the active policy resolver.
 	addr := netip.Addr{}
+	var upstreams []policy.Upstream
 	if pbrCfg != nil {
 		addr = pbrCfg.GatewayDNSIP
+		upstreams = pbrCfg.UpstreamDNS
 	}
-	s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(addr))
+	s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(addr), upstreams)
 	s.forwarder.SetPBREnabled(false)
 	if dem := s.forwarder.DirectEgress(); dem != nil {
 		_ = dem.Close()

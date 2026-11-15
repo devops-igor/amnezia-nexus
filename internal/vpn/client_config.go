@@ -13,6 +13,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/cps"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/ipam"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
@@ -308,7 +309,7 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 // to the tunnel gateway address. The gateway resolver is pushed only when the
 // policy routing runtime and its gateway both exist: a configuration must never
 // point a client at a resolver that is not running. With policy routing
-// inactive the existing external resolvers are kept unchanged.
+// inactive the external resolvers are kept unchanged.
 //
 // A configuration downloaded while policy routing was active keeps the gateway
 // address after deactivation. A gateway-address-only continuity responder keeps
@@ -316,8 +317,7 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 // the continuity responder records no routing evidence, so its answers can never
 // grant a direct path.
 func (s *Service) clientConfigDNSServers() (string, string) {
-	dns1 := awg.AWGDefaults["dns1"]
-	dns2 := awg.AWGDefaults["dns2"]
+	dns1, dns2 := defaultClientDNSServers()
 
 	if s == nil || !s.PBREnabled() {
 		return dns1, dns2
@@ -331,6 +331,33 @@ func (s *Service) clientConfigDNSServers() (string, string) {
 		return dns1, dns2
 	}
 	return gw.String(), gw.String()
+}
+
+// defaultClientDNSServers renders the external resolver pair a configuration
+// pushes when the policy gateway is not the answer path.
+//
+// It derives from policy.DefaultUpstreams(), the same definition the policy
+// resolver falls back to, so the rendered pair and the resolver cannot drift
+// apart. Only plain-transport entries are rendered: a future DoT or DoH default
+// must never appear as a plain DNS directive, which would be a silent
+// downgrade for the client.
+func defaultClientDNSServers() (string, string) {
+	first, second := "", ""
+	for _, upstream := range policy.DefaultUpstreams() {
+		if upstream.EffectiveTransport() != policy.TransportPlain {
+			continue
+		}
+		switch {
+		case first == "":
+			first = upstream.Address
+		case second == "":
+			second = upstream.Address
+		}
+	}
+	if second == "" {
+		second = first
+	}
+	return first, second
 }
 
 func (s *Service) renderClientConfigForConnection(

@@ -85,6 +85,19 @@ type PolicyStatus struct {
 	LastSuccess  string `json:"last_success,omitempty"`
 	SyncState    string `json:"sync_state"`
 	LastError    string `json:"last_error,omitempty"`
+
+	// Upstream DNS health (issue #824). Without these an operator cannot tell a
+	// blocked upstream provider, which produces no evidence at all, from a policy
+	// that simply has not matched anything yet.
+	//
+	// LastUpstream is the upstream that served the most recent accepted answer.
+	// LastUpstreamFailure and LastUpstreamFailureKind describe the most recent
+	// failed attempt and are cleared by a later successful exchange. All three
+	// are empty while policy routing is not running or no exchange has happened.
+	// They carry resolver addresses only: no queried names and no client data.
+	LastUpstream            string `json:"last_upstream,omitempty"`
+	LastUpstreamFailure     string `json:"last_upstream_failure,omitempty"`
+	LastUpstreamFailureKind string `json:"last_upstream_failure_kind,omitempty"`
 }
 
 // policyRuntime holds the live policy objects for a started service.
@@ -176,6 +189,7 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 		Enabled:       true,
 		HostWANIP:     hostWAN,
 		PolicyMatcher: matcher,
+		UpstreamDNS:   settings.EffectiveUpstreams(),
 	})
 
 	if err := s.initPBR(ctx); err != nil {
@@ -229,9 +243,33 @@ func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.M
 	if !syncRes.Published {
 		return fmt.Errorf("%w: policy update sync did not publish a snapshot", ErrPolicyActivationNoRules)
 	}
+	// The upstream list is not part of the compiled snapshot, so it is applied to
+	// the live resolver instead of rebuilding the data path. It is applied only
+	// after the sync succeeded: a refused update must leave the previous working
+	// configuration, upstreams included, exactly as it was.
+	if err := s.applyLiveUpstreams(settings); err != nil {
+		return err
+	}
 	// Only after the content is published does the schedule change, so a refused
 	// update leaves the previous loop running on the previous rules.
 	s.startPolicyLoop(ctx, syncer, matcher, settings, presetID)
+	return nil
+}
+
+// applyLiveUpstreams swaps the upstream list of the resolver that is currently
+// installed with the policy DNS gateway. It is a no-op when policy routing is
+// not live, and a rejected list leaves the installed list in effect.
+func (s *Service) applyLiveUpstreams(settings policy.Settings) error {
+	if s == nil {
+		return nil
+	}
+	cfg := s.getPBRConfig()
+	if cfg == nil || cfg.DNSResolver == nil {
+		return nil
+	}
+	if err := cfg.DNSResolver.SetUpstreams(settings.EffectiveUpstreams()); err != nil {
+		return fmt.Errorf("policy update: upstream dns configuration rejected: %w", err)
+	}
 	return nil
 }
 
@@ -507,7 +545,22 @@ func (s *Service) PolicyStatusSnapshot() PolicyStatus {
 		status.LastError = failure
 		status.SyncState = "error"
 	}
+
+	applyUpstreamStatus(&status, s.getPBRConfig())
 	return status
+}
+
+// applyUpstreamStatus copies the upstream health of the resolver the policy
+// gateway actually dials, so a blocked provider surfaces as a failure kind
+// instead of presenting as "no evidence".
+func applyUpstreamStatus(status *PolicyStatus, pbrCfg *PBRConfig) {
+	if pbrCfg == nil || pbrCfg.DNSResolver == nil {
+		return
+	}
+	live := pbrCfg.DNSResolver.Status()
+	status.LastUpstream = live.LastUpstream
+	status.LastUpstreamFailure = live.LastFailure
+	status.LastUpstreamFailureKind = string(live.LastFailureKind)
 }
 
 // applySyncerStatus copies the live syncer's counters and sync outcome into status.
