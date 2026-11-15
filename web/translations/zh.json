@@ -842,6 +842,7 @@
   "policy_status_title": "策略状态",
   "policy_status_enabled": "已启用",
   "policy_status_disabled": "已停用",
+  "policy_status_unknown": "未知",
   "policy_status_preset": "当前预设",
   "policy_status_last_success": "最近成功同步",
   "policy_status_last_error": "最近同步错误",
@@ -867,5 +868,6 @@
   "policy_sync_state_pending": "等待中",
   "policy_sync_state_synced": "已同步",
   "policy_load_failed": "无法加载策略设置",
+  "policy_not_ready": "在已保存的设置加载完成前，保存功能保持禁用。",
   "policy_rule_count_value": "{domains} 个域名 / {cidrs} 个前缀"
 }

@@ -842,6 +842,7 @@
   "policy_status_title": "Policy status",
   "policy_status_enabled": "Enabled",
   "policy_status_disabled": "Disabled",
+  "policy_status_unknown": "Unknown",
   "policy_status_preset": "Active preset",
   "policy_status_last_success": "Last successful sync",
   "policy_status_last_error": "Latest sync error",
@@ -867,5 +868,6 @@
   "policy_sync_state_pending": "Pending",
   "policy_sync_state_synced": "Synced",
   "policy_load_failed": "Could not load policy settings",
+  "policy_not_ready": "Saving stays disabled until the saved settings load.",
   "policy_rule_count_value": "{domains} domains / {cidrs} prefixes"
 }

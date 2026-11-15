@@ -419,6 +419,163 @@ assert.equal(syncCalls, 1, 'two sync requests must not become two POSTs');
 `)
 }
 
+// TestPolicyRoutingControllerSaveBlockedUntilRecordLoads is the F679-01
+// regression. With the stored record still unread the form holds markup defaults
+// (switch off, interval blank), so a save would persist `enabled:false` and
+// `sync_interval_seconds:0` over an existing enabled policy. Nothing may reach the
+// server before the read succeeds, and the release of that read may not be undone.
+func TestPolicyRoutingControllerSaveBlockedUntilRecordLoads(t *testing.T) {
+	runPolicyControllerScenario(t, `
+let releaseInitial = null;
+const initialGate = new Promise(resolve => { releaseInitial = resolve; });
+// The stored record is enabled and carries a non-default refresh interval.
+let stored = {enabled: true, preset: 'geoblock', custom_urls: [], sync_interval_seconds: 7200,
+  status: {enabled: true, preset: 'geoblock', sync_state: 'synced', domain_count: 9, cidr_count: 1,
+           last_success: '2026-11-15T00:00:00Z', last_error: ''}};
+responder = async (url, opts) => {
+  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
+  if (opts.method === 'PUT') {
+    const body = typeof opts.body === 'string' ? JSON.parse(opts.body) : opts.body;
+    stored = Object.assign({}, body,
+      {status: {enabled: body.enabled, preset: body.preset, sync_state: 'disabled'}});
+    return Object.assign({}, stored, {status: 'ok', policy_status: stored.status});
+  }
+  // The first read is held: the record has not reached the form yet.
+  const held = JSON.parse(JSON.stringify(stored));
+  await initialGate;
+  return held;
+};
+`, `
+assert.equal(toggle(), false, 'the switch must not claim anything before the record loads');
+assert.equal(w.document.getElementById('policySaveBtn').disabled, true,
+  'Save must be inert until the stored record has been read');
+assert.equal(w.document.getElementById('policyRoutingForm').getAttribute('data-policy-ready'), 'false',
+  'the section must advertise that it is not ready');
+
+// The operator picks a preset and clicks the real control.
+w.document.getElementById('policy_preset_geoblock').checked = true;
+w.document.getElementById('policySaveBtn').click();
+await settle();
+assert.equal(requestsTo('/api/vpn/policy', 'PUT').length, 0,
+  'a save before the record loads must not reach the server at all');
+assert.equal(stored.enabled, true, 'the stored enabled policy must survive the attempt');
+assert.equal(stored.sync_interval_seconds, 7200, 'the stored interval must survive the attempt');
+
+// The gate is not just a disabled attribute: a direct call is refused as well.
+assert.equal(await w.savePolicySettings(), null,
+  'the controller must refuse to save before it is ready');
+await settle();
+assert.equal(requestsTo('/api/vpn/policy', 'PUT').length, 0, 'no request may escape the gate');
+assert.ok(alertText().text.indexOf('policy_not_ready') !== -1,
+  'the refusal must say that saving waits for the load, got: ' + alertText().text);
+
+// Releasing the read loads the stored record and opens the gate.
+releaseInitial();
+await settle();
+assert.equal(toggle(), true, 'the loaded record is the stored enabled one');
+assert.equal(selectedPreset(), 'geoblock');
+assert.equal(badge().enabled, 'true', 'the runtime snapshot arrived with the record');
+assert.equal(w.document.getElementById('policySaveBtn').disabled, false);
+assert.equal(w.document.getElementById('policyRoutingForm').getAttribute('data-policy-ready'), 'true');
+
+// Ordinary post-load control: the accepted save still works, and it carries the
+// loaded non-default interval instead of resetting it.
+w.document.getElementById('policySaveBtn').click();
+await settle();
+const puts = requestsTo('/api/vpn/policy', 'PUT');
+assert.equal(puts.length, 1, 'one post-load save is exactly one PUT');
+assert.equal(puts[0].body.enabled, true);
+assert.equal(puts[0].body.preset, 'geoblock');
+assert.equal(puts[0].body.sync_interval_seconds, 7200,
+  'the loaded non-default interval must be preserved, not reset to 0');
+assert.equal(alertText().state, 'success');
+`)
+}
+
+// TestPolicyRoutingControllerFailedRecoveryKeepsRuntimeState is the F679-02
+// regression. Storage keeps `enabled:true` when activation failed at startup, so
+// persisted intent is not evidence that the runtime is on: a failed recovery read
+// must keep the last runtime observation and its diagnostic.
+func TestPolicyRoutingControllerFailedRecoveryKeepsRuntimeState(t *testing.T) {
+	runPolicyControllerScenario(t, `
+let offline = false;
+const stored = () => ({enabled: true, preset: 'geoblock', custom_urls: [],
+  sync_interval_seconds: 7200,
+  status: {enabled: false, preset: 'geoblock', sync_state: 'error', domain_count: 0, cidr_count: 0,
+           last_success: '', last_error: 'activation failed: list source unavailable'}});
+responder = async (url) => {
+  if (offline) throw new TypeError('Failed to fetch');
+  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
+  return stored();
+};
+`, `
+assert.equal(toggle(), true, 'stored intent stays enabled through the failed activation');
+assert.equal(badge().enabled, 'false', 'the badge follows the runtime, not the stored intent');
+assert.equal(text('policyLastError'), 'activation failed: list source unavailable');
+
+// The panel becomes unreachable: the save and its recovery read both fail.
+offline = true;
+await w.savePolicySettings();
+await settle();
+assert.equal(alertText().state, 'error', 'the failed save is still reported');
+assert.equal(badge().enabled, 'false',
+  'a failed recovery read must not synthesize Enabled from stored intent');
+assert.equal(text('policyLastError'), 'activation failed: list source unavailable',
+  'the known activation diagnostic must survive the failed read');
+assert.equal(toggle(), true, 'the form is restored to the last accepted record');
+
+// A successful reload is still the authority for both facts.
+offline = false;
+await w.loadPolicySettings();
+await settle();
+assert.equal(badge().enabled, 'false');
+assert.equal(text('policySyncState'), 'sync:error');
+
+// Ordinary control: a fresh observation that reports an active runtime.
+responder = async (url) => {
+  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
+  return {enabled: true, preset: 'geoblock', custom_urls: [], sync_interval_seconds: 7200,
+          status: {enabled: true, preset: 'geoblock', sync_state: 'synced', domain_count: 5,
+                   cidr_count: 0, last_success: '2026-11-15T02:00:00Z', last_error: ''}};
+};
+await w.loadPolicySettings();
+await settle();
+assert.equal(badge().enabled, 'true', 'a fresh snapshot still drives the badge');
+assert.equal(text('policyLastError'), 'policy_none');
+`)
+}
+
+// TestPolicyRoutingControllerRuntimeSnapshotShapeIsStrict pins the response-shape
+// rule: GET carries the runtime as `status`, a successful PUT as `policy_status`,
+// and a PUT's `status:"ok"` is a result code that must never be read as a runtime
+// observation.
+func TestPolicyRoutingControllerRuntimeSnapshotShapeIsStrict(t *testing.T) {
+	runPolicyControllerScenario(t, `
+responder = async (url, opts) => {
+  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
+  if (opts.method === 'PUT') {
+    // Management-only deployment: the record saves, but there is no runtime to
+    // observe, so the only status field in the answer is the result code.
+    return {status: 'ok', enabled: true, preset: 'geoblock', custom_urls: [],
+            sync_interval_seconds: 7200};
+  }
+  return {enabled: false, preset: 'geoblock', custom_urls: [], sync_interval_seconds: 7200};
+};
+`, `
+assert.equal(badge().enabled, 'unknown',
+  'without a runtime snapshot the badge must not repeat the stored intent');
+assert.equal(badge().text, 'policy_status_unknown');
+
+w.document.getElementById('policy_enabled').checked = true;
+await w.savePolicySettings();
+await settle();
+assert.equal(alertText().state, 'success');
+assert.equal(toggle(), true, 'the accepted record is applied to the form');
+assert.equal(badge().enabled, 'unknown',
+  'the PUT result code "ok" must not be promoted to a runtime snapshot');
+`)
+}
+
 // TestPolicyRoutingModuleElementIDs guards the wiring between the module and the
 // template: every id the controller looks up must exist in the rendered section.
 func TestPolicyRoutingModuleElementIDs(t *testing.T) {

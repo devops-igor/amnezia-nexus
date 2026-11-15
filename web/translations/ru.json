@@ -842,6 +842,7 @@
   "policy_status_title": "Состояние политики",
   "policy_status_enabled": "Включено",
   "policy_status_disabled": "Отключено",
+  "policy_status_unknown": "Неизвестно",
   "policy_status_preset": "Активный набор",
   "policy_status_last_success": "Последняя успешная синхронизация",
   "policy_status_last_error": "Последняя ошибка синхронизации",
@@ -867,5 +868,6 @@
   "policy_sync_state_pending": "Ожидает синхронизации",
   "policy_sync_state_synced": "Синхронизировано",
   "policy_load_failed": "Не удалось загрузить настройки политики",
+  "policy_not_ready": "Сохранение остаётся недоступным, пока не загрузятся сохранённые настройки.",
   "policy_rule_count_value": "доменов: {domains}, префиксов: {cidrs}"
 }

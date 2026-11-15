@@ -842,6 +842,7 @@
   "policy_status_title": "وضعیت سیاست",
   "policy_status_enabled": "فعال",
   "policy_status_disabled": "غیرفعال",
+  "policy_status_unknown": "نامشخص",
   "policy_status_preset": "پیش‌تنظیم فعال",
   "policy_status_last_success": "آخرین همگام‌سازی موفق",
   "policy_status_last_error": "آخرین خطای همگام‌سازی",
@@ -867,5 +868,6 @@
   "policy_sync_state_pending": "در انتظار",
   "policy_sync_state_synced": "همگام‌سازی شد",
   "policy_load_failed": "بارگذاری تنظیمات سیاست ممکن نشد",
+  "policy_not_ready": "ذخیره‌سازی تا بارگذاری تنظیمات ذخیره‌شده غیرفعال می‌ماند.",
   "policy_rule_count_value": "{domains} دامنه / {cidrs} پیشوند"
 }

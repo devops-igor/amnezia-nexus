@@ -7,12 +7,17 @@
  * guesses the resulting state:
  *
  *   - the form is populated from GET /api/vpn/policy, not from the markup;
+ *   - nothing is persisted until that read has succeeded: before it the controls
+ *     still hold markup defaults (switch off, interval blank), so a save would
+ *     write values the operator never chose over a stored configuration;
  *   - a save sends the operator's intent and then adopts whatever the server
  *     answered with;
  *   - a refusal is shown verbatim and the form is reloaded from the saved
  *     record, so a rejected "enabled" can never stay visible as enabled;
  *   - the status block and counters are read from the server's own snapshot and
- *     are never derived from local counters.
+ *     are never derived from local counters. In particular the enabled badge only
+ *     ever mirrors a runtime observation: the stored record is intent, and the two
+ *     deliberately differ while a startup activation failure is being recovered.
  *
  * URLs are intentionally not validated here. The server applies the same SSRF
  * and HTTPS rules the fetcher enforces, and a client-side copy of that policy
@@ -37,6 +42,18 @@
     // The control that owns the busy state, so focus can be given back: browsers
     // drop focus from a control the moment it is disabled.
     var busyFocus = null;
+    // The newest runtime snapshot a server response actually carried. It is never
+    // rebuilt from the stored record: persisted intent and the live runtime are
+    // different facts, and a failed read must not turn one into the other.
+    var lastRuntimeSnapshot = null;
+    // Mutating controls stay inert until the stored record has been read. Before
+    // that the form still holds markup defaults, and a save built from them would
+    // overwrite a configuration nobody chose to change.
+    var policyReady = false;
+    // Ordering guard: a read applies only while no mutation was accepted after it
+    // was issued, so a slow earlier GET cannot overwrite a newer accepted result.
+    var requestSeq = 0;
+    var lastAcceptedMutation = 0;
 
     function policyText(key) {
         if (typeof root._ === 'function') {
@@ -81,6 +98,28 @@
             }
         }
         return err.message ? String(err.message) : String(err);
+    }
+
+    // policyRuntimeSnapshot extracts a runtime observation from a server response.
+    // GET returns it as `status`; a successful PUT and a sync return it as
+    // `policy_status`. A PUT also returns `status: "ok"`, which is a result code and
+    // never a runtime observation, so anything that is not an object carrying a
+    // boolean `enabled` is rejected rather than read as one.
+    function policyRuntimeSnapshot(payload) {
+        if (!payload || typeof payload !== 'object') {
+            return null;
+        }
+        var candidate = payload.policy_status || payload.status;
+        if (!candidate || typeof candidate !== 'object' || typeof candidate.enabled !== 'boolean') {
+            return null;
+        }
+        return candidate;
+    }
+
+    // policyReadApplies reports whether a read issued as `seq` may still be shown.
+    // Any mutation accepted after it started owns the form from then on.
+    function policyReadApplies(seq) {
+        return seq > lastAcceptedMutation;
     }
 
     function policyFormatBytes(raw) {
@@ -213,7 +252,8 @@
             if (busy && root.document && root.document.activeElement === button) {
                 busyFocus = button;
             }
-            button.disabled = !!busy;
+            // A save also stays disabled until the stored record has been read.
+            button.disabled = !!busy || (role === 'save' && !policyReady);
             button.setAttribute('aria-busy', busy ? 'true' : 'false');
             // Disabling a focused control moves focus to the document body, so a
             // keyboard operator would lose their place for the whole request.
@@ -233,6 +273,20 @@
         }
         if (label && role === 'sync') {
             label.textContent = busy ? policyText('policy_sync_running') : policyText('policy_sync_btn');
+        }
+    }
+
+    // setPolicyReady opens or closes the mutation gate and keeps the Save control
+    // in step with it. Only a successful read of the stored record opens it.
+    function setPolicyReady(ready) {
+        policyReady = !!ready;
+        var saveBtn = policyElement('policySaveBtn');
+        if (saveBtn) {
+            saveBtn.disabled = !policyReady || inFlight.save;
+        }
+        var form = policyElement('policyRoutingForm');
+        if (form) {
+            form.setAttribute('data-policy-ready', policyReady ? 'true' : 'false');
         }
     }
 
@@ -292,16 +346,29 @@
     }
 
     function renderPolicyStatus(record, status) {
-        var snapshot = status || null;
-        var runtimeEnabled = snapshot && typeof snapshot.enabled === 'boolean'
-            ? snapshot.enabled
-            : !!(record && record.enabled);
+        var snapshot = policyRuntimeSnapshot({ status: status });
+        if (snapshot) {
+            // The newest real observation is also what a failed recovery read keeps.
+            lastRuntimeSnapshot = snapshot;
+        }
+
+        // Runtime enabled mirrors one server observation or nothing at all. It is
+        // never derived from `record.enabled`: storage keeps `enabled:true` through
+        // a failed startup activation while the runtime is inactive, so intent is
+        // not evidence about the running policy.
+        var runtimeEnabled = snapshot ? snapshot.enabled : null;
 
         var badge = policyElement('policyStatusBadge');
         if (badge) {
-            badge.className = runtimeEnabled ? 'badge badge-success' : 'badge badge-secondary';
-            badge.textContent = policyText(runtimeEnabled ? 'policy_status_enabled' : 'policy_status_disabled');
-            badge.setAttribute('data-enabled', runtimeEnabled ? 'true' : 'false');
+            if (runtimeEnabled === null) {
+                badge.className = 'badge badge-secondary';
+                badge.textContent = policyText('policy_status_unknown');
+                badge.setAttribute('data-enabled', 'unknown');
+            } else {
+                badge.className = runtimeEnabled ? 'badge badge-success' : 'badge badge-secondary';
+                badge.textContent = policyText(runtimeEnabled ? 'policy_status_enabled' : 'policy_status_disabled');
+                badge.setAttribute('data-enabled', runtimeEnabled ? 'true' : 'false');
+            }
         }
 
         var preset = (snapshot && snapshot.preset) || (record && record.preset) || '';
@@ -363,13 +430,16 @@
     // invents a state: the previous rendering is left untouched and the caller
     // decides whether the failure is worth reporting.
     async function refreshPolicyStatus() {
+        var seq = ++requestSeq;
         var policy = null;
         try {
             policy = await policyRequest(POLICY_ENDPOINT, { method: 'GET' });
         } catch (err) {
             return { ok: false, error: err };
         }
-        renderPolicyStatus(policy, policy && policy.status);
+        if (policyReadApplies(seq)) {
+            renderPolicyStatus(policy, policyRuntimeSnapshot(policy));
+        }
 
         var stats = null;
         try {
@@ -383,10 +453,19 @@
         return { ok: true, record: policy };
     }
 
+    // loadPolicySettings reads the stored record, applies it and opens the mutation
+    // gate. It is the only opener: an unread record is not a default record.
     async function loadPolicySettings() {
+        var seq = ++requestSeq;
         var policy = await policyRequest(POLICY_ENDPOINT, { method: 'GET' });
+        if (!policyReadApplies(seq)) {
+            // A mutation accepted after this read started owns the form; replaying
+            // the older record here would undo it.
+            return policy;
+        }
         applyPolicyRecord(policy);
-        renderPolicyStatus(policy, policy && policy.status);
+        renderPolicyStatus(policy, policyRuntimeSnapshot(policy));
+        setPolicyReady(true);
         try {
             var stats = await policyRequest(STATS_ENDPOINT, { method: 'GET' });
             renderPolicyCounters(stats);
@@ -410,17 +489,28 @@
     }
 
     async function savePolicySettings() {
+        if (!policyReady) {
+            // Nothing may be persisted before the stored record has been read: the
+            // controls still hold markup defaults, so this payload would carry
+            // values the operator never chose over an existing configuration.
+            setPolicyAlert('error', policyText('policy_not_ready'));
+            return null;
+        }
         if (inFlight.save) {
             return null;
         }
         inFlight.save = true;
+        var seq = ++requestSeq;
         var payload = policySavePayload();
         setPolicyBusy('save', true);
         setPolicyAlert('', '');
         try {
             var saved = await policyRequest(POLICY_ENDPOINT, { method: 'PUT', body: payload });
+            // The accepted write owns the form from now on: a read issued before it
+            // must not replace it when it lands later.
+            lastAcceptedMutation = seq;
             applyPolicyRecord(saved);
-            renderPolicyStatus(saved, saved && saved.policy_status);
+            renderPolicyStatus(saved, policyRuntimeSnapshot(saved));
             try {
                 var stats = await policyRequest(STATS_ENDPOINT, { method: 'GET' });
                 renderPolicyCounters(stats);
@@ -438,15 +528,16 @@
                 refusal += '.';
             }
             setPolicyAlert('error', refusal + ' ' + policyText('policy_save_refused'));
-            // Reload the accepted record. If that fails too, the snapshot from the
-            // last successful read is restored, so the refused intent is cleared
-            // either way.
+            // Re-read the accepted record. If that fails too, the last accepted
+            // record and the last runtime observation are restored: a failed read
+            // must not clear the badge, the counts or the activation diagnostic, and
+            // it must never turn stored intent into a runtime "enabled".
             try {
                 await loadPolicySettings();
             } catch (reloadErr) {
                 if (lastServerRecord) {
                     applyPolicyRecord(lastServerRecord);
-                    renderPolicyStatus(lastServerRecord, null);
+                    renderPolicyStatus(lastServerRecord, lastRuntimeSnapshot);
                 }
             }
             return null;
@@ -461,11 +552,15 @@
             return null;
         }
         inFlight.sync = true;
+        var seq = ++requestSeq;
         setPolicyBusy('sync', true);
         setPolicyAlert('', '');
         try {
             var result = await policyRequest(SYNC_ENDPOINT, { method: 'POST' });
-            renderPolicyStatus(lastServerRecord, result && result.policy_status);
+            // A completed sync publishes a new snapshot, so it is a newer
+            // observation than any read still in flight.
+            lastAcceptedMutation = seq;
+            renderPolicyStatus(lastServerRecord, policyRuntimeSnapshot(result));
             try {
                 var stats = await policyRequest(STATS_ENDPOINT, { method: 'GET' });
                 renderPolicyCounters(stats);
@@ -503,6 +598,10 @@
         }
         initialized = true;
 
+        // The gate starts closed and is opened only by a successful read, so the
+        // markup defaults can never be submitted while the record is unknown.
+        setPolicyReady(false);
+
         form.addEventListener('submit', function (event) {
             event.preventDefault();
             savePolicySettings();
@@ -535,7 +634,11 @@
         updatePolicyPresetHighlight();
 
         loadPolicySettings().catch(function (err) {
-            setPolicyAlert('error', policyText('policy_load_failed') + ': ' + policyErrorDetail(err));
+            // A failed initial read leaves the section read-only and says why: with
+            // the stored record unknown there is nothing safe to submit.
+            setPolicyReady(false);
+            setPolicyAlert('error', policyText('policy_load_failed') + ': '
+                + policyErrorDetail(err) + ' ' + policyText('policy_not_ready'));
         });
         return true;
     }

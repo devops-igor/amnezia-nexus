@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -138,6 +139,19 @@ func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
 		}
 	})
 
+	t.Run("SaveShipsInertUntilTheRecordLoads", func(t *testing.T) {
+		// The button is inert in the markup as well as in the controller, so the
+		// form's default values cannot be persisted before the stored record has been
+		// read, even in the window between parse and DOMContentLoaded.
+		tag := regexp.MustCompile(`<button[^>]*id="policySaveBtn"[^>]*>`).FindString(adminBody)
+		if tag == "" {
+			t.Fatal("admin settings page has no #policySaveBtn")
+		}
+		if !strings.Contains(tag, " disabled") {
+			t.Errorf("the Save button must ship disabled, got %q", tag)
+		}
+	})
+
 	t.Run("AccessibleControlsAndLiveRegion", func(t *testing.T) {
 		// The master toggle is a native checkbox exposed as a switch (the fallback
 		// the switch pattern prescribes where the switch attribute is unsupported),
@@ -212,9 +226,9 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 	// translator, so it cannot notice a key missing from a dictionary; pin them
 	// here with the template's own keys.
 	for _, key := range []string{
-		"policy_load_failed", "policy_saved", "policy_save_failed", "policy_save_refused",
-		"policy_sync_ok", "policy_sync_failed", "policy_sync_running", "policy_never",
-		"policy_none", "policy_rule_count_value",
+		"policy_load_failed", "policy_not_ready", "policy_saved", "policy_save_failed",
+		"policy_save_refused", "policy_sync_ok", "policy_sync_failed", "policy_sync_running",
+		"policy_never", "policy_none", "policy_rule_count_value", "policy_status_unknown",
 		"policy_sync_state_disabled", "policy_sync_state_error",
 		"policy_sync_state_pending", "policy_sync_state_synced",
 	} {
