@@ -438,7 +438,12 @@ func policyExplainEvidence(evidence *policy.Evidence, now time.Time) *PolicyExpl
 		State:            string(evidence.State),
 		Generation:       evidence.Generation,
 		ExpiresInSeconds: int64(evidence.Remaining(now) / time.Second),
-		Source:           policyExplainEvidenceSource,
+	}
+	// Only a stored entry has an observation behind it. An absent, quarantined or
+	// retired state means the cache holds nothing, so claiming the observation
+	// source there would imply evidence that does not exist.
+	if evidence.State == policy.EvidenceFresh || evidence.State == policy.EvidenceExpired {
+		state.Source = policyExplainEvidenceSource
 	}
 	if evidence.Decision == policy.Direct || evidence.Decision == policy.Proxy {
 		state.Decision = evidence.Decision.String()

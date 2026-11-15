@@ -204,6 +204,15 @@ func TestExplainPolicySummarisesSeveralAddresses(t *testing.T) {
 	if out.Addresses[1].Evidence == nil || out.Addresses[1].Evidence.State != string(policy.EvidenceFresh) {
 		t.Fatalf("second verdict evidence = %+v, want fresh", out.Addresses[1].Evidence)
 	}
+	if out.Addresses[1].Evidence.Source != policyExplainEvidenceSource {
+		t.Errorf("fresh evidence source = %q, want %q",
+			out.Addresses[1].Evidence.Source, policyExplainEvidenceSource)
+	}
+	// The first address matched a CIDR rule, so it has no evidence at all; nothing
+	// may claim an observation source for it.
+	if out.Addresses[0].Evidence != nil {
+		t.Errorf("first verdict carries evidence %+v, want none", out.Addresses[0].Evidence)
+	}
 }
 
 func TestExplainPolicyUnresolvableName(t *testing.T) {
