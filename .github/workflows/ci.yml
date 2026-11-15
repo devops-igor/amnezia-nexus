@@ -184,14 +184,87 @@ jobs:
       # root, /dev/net/tun and CAP_NET_RAW, and it is executed by name in the
       # wan-qualification job below, so the exclusion removes no obligation.
 
+      # The JSON stream is the durable evidence behind the timing summary; the
+      # step status still comes from `go test`. Without pipefail the pipeline
+      # would report tee's success and a failing suite would look green.
+      #
+      # Runner facts are captured before the run because they cannot be
+      # reconstructed afterwards, and a duration without the machine, toolchain
+      # and cache state it was measured on cannot be compared with another run.
+      # That is how the 328-493s spread in #800 was mistaken for a code change.
       - name: Run Tests with Race Detector (shard ${{ matrix.shard }})
         run: |
+          set -euo pipefail
           packages="$(python3 scripts/ci_go_shards.py --shard ${{ matrix.shard }} --shards 3)"
           echo "shard ${{ matrix.shard }} package count: $(echo "$packages" | wc -w)"
+
+          facts="$RUNNER_TEMP/go-test-facts-shard-${{ matrix.shard }}.txt"
+          cache="$(go env GOCACHE)"
+          cache_state=missing
+          if [ -d "$cache" ]; then
+            if [ -n "$(ls -A "$cache" 2>/dev/null)" ]; then
+              cache_state=populated
+            else
+              cache_state=empty
+            fi
+          fi
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "shard=${{ matrix.shard }}"
+            echo "runner_image=${ImageOS:-unknown}-${ImageVersion:-unknown}"
+            echo "cpus=$(nproc)"
+            echo "go_version=$(go version)"
+            echo "gomaxprocs_env=${GOMAXPROCS:-unset}"
+            echo "package_parallel=default (go test -p defaults to GOMAXPROCS)"
+            echo "test_parallel=default (go test -parallel defaults to GOMAXPROCS)"
+            echo "gocache=$cache"
+            echo "gocache_state=$cache_state"
+            echo "gocache_size_kb=$(du -sk "$cache" 2>/dev/null | cut -f1)"
+          } > "$facts"
+
+          json="$RUNNER_TEMP/go-test-shard-${{ matrix.shard }}.json"
+          started="$(date +%s%N)"
+          set +e
           go test -race -cover -count=1 -timeout=15m \
             -coverprofile="coverage-shard-${{ matrix.shard }}.out" \
             -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress|TestLinuxE2E_PolicyEnablement|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$' \
-            $packages
+            -json \
+            $packages 2>&1 | tee "$json"
+          status="${PIPESTATUS[0]}"
+          set -e
+          finished="$(date +%s%N)"
+          echo "wall_ms=$(( (finished - started) / 1000000 ))" >> "$facts"
+          echo "shard ${{ matrix.shard }} wall time: $(( (finished - started) / 1000000 )) ms (go test exit $status)"
+          exit "$status"
+
+      # Runs even when the race step failed: a timeout or a failing test is
+      # exactly when the ranking is needed. The script exits non-zero when it
+      # collected no test result, so a broken selection cannot produce a clean
+      # empty table.
+      - name: Rank Go test timings (shard ${{ matrix.shard }})
+        if: always()
+        run: |
+          set -euo pipefail
+          summary="$RUNNER_TEMP/go-test-summary-shard-${{ matrix.shard }}.md"
+          python3 scripts/rank_go_test_times.py \
+            --runner-facts "$RUNNER_TEMP/go-test-facts-shard-${{ matrix.shard }}.txt" \
+            "$RUNNER_TEMP/go-test-shard-${{ matrix.shard }}.json" | tee "$summary"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+      # Raw JSON and the summary are retained on failure too. The package
+      # timeout (15m) fires before the job timeout (25m), so `go test` exits and
+      # these steps still run with partial evidence.
+      - name: Upload Go test timing evidence (shard ${{ matrix.shard }})
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-test-timings-shard-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/go-test-shard-${{ matrix.shard }}.json
+            ${{ runner.temp }}/go-test-summary-shard-${{ matrix.shard }}.md
+            ${{ runner.temp }}/go-test-facts-shard-${{ matrix.shard }}.txt
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Run Authentic Native Caddy Integration Tests
         if: matrix.shard == 3
@@ -286,6 +359,39 @@ jobs:
 
       - name: Checkout Code
         uses: actions/checkout@v7
+        if: always()
+
+      # Timing evidence is downloaded and ranked before coverage, and runs even
+      # when the first step failed, because a failed shard is exactly the case
+      # the report exists to explain.
+      - name: Download Go test timing evidence
+        uses: actions/download-artifact@v7
+        if: always()
+        with:
+          pattern: go-test-timings-shard-*
+          path: go-test-timings
+
+      - name: Rank combined Go test timings
+        if: always()
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(go-test-timings/*/go-test-shard-*.json)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no shard timing JSON was downloaded; the measurement did not run"
+            exit 1
+          fi
+          python3 scripts/rank_go_test_times.py "${files[@]}" | tee go-test-timings-summary.md
+          cat go-test-timings-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload combined Go test timing summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-test-timings-combined
+          path: go-test-timings-summary.md
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -298,12 +404,13 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Verify the shard assignment and coverage merge
+      - name: Verify the shard assignment, timing report and coverage merge
         run: |
           python -m pip install --upgrade pip
           python -m pip install pytest==8.3.4
           python -m pytest -p no:cacheprovider \
             tests/test_ci_go_shards.py \
+            tests/test_rank_go_test_times.py \
             tests/test_ci_coverprofile_merge.py
 
       - name: Download Shard Coverage
