@@ -71,7 +71,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -226,45 +225,21 @@ https://127.0.0.1:%d {
 	// #nosec G204 -- the binary is resolved from PATH/GOPATH and the config from
 	// t.TempDir(); no test-controlled string reaches the shell.
 	caddyCmd := exec.CommandContext(caddyCtx, caddyBin, "run", "--config", caddyfilePath, "--adapter", "caddyfile")
-	if err := caddyCmd.Start(); err != nil {
+	caddy, err := startReaped(caddyCmd)
+	if err != nil {
 		caddyCancel()
 		t.Fatalf("start caddy: %v", err)
 	}
 
-	// Wait must run exactly once: the readiness failure path and the fixture's
-	// cleanup both need it, and a second call returns "Wait was already called".
-	var waitOnce sync.Once
-	waitCaddy := func() error {
-		var err error
-		waitOnce.Do(func() { err = caddyCmd.Wait() })
-		return err
-	}
-
-	// Readiness is a bounded wait, not a fixed 4-second one. Caddy has no
-	// bounded startup time: under a loaded runner it can take longer than 4s to
-	// bind, which made this fixture fail on main with "did not become ready"
-	// while the process was healthy. The wait is also process-aware now: if
-	// caddy exits, that is the failure and its error is reported immediately
-	// instead of being hidden behind a timeout.
+	// Readiness is a bounded wait, not a fixed 4-second one: caddy has no bounded
+	// startup time, and under a loaded runner it can take longer than 4s to bind.
+	// The wait is also process-aware, through the reaper above: a zombie still
+	// accepts signal 0, so probing liveness that way cannot tell "running" from
+	// "exited" and an instantly-dead caddy would sit here until the deadline.
 	endpoint := net.JoinHostPort("127.0.0.1", strconv.Itoa(proxyPort))
-	deadline := time.Now().Add(30 * time.Second)
-	ready := false
-	for time.Now().Before(deadline) {
-		conn, dialErr := net.DialTimeout("tcp", endpoint, 100*time.Millisecond)
-		if dialErr == nil {
-			_ = conn.Close()
-			ready = true
-			break
-		}
-		if err := caddyCmd.Process.Signal(syscall.Signal(0)); err != nil {
-			caddyCancel()
-			t.Fatalf("caddy exited before it became ready on %s: %v", endpoint, waitCaddy())
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if !ready {
+	if err := waitForReady(endpoint, caddy, 30*time.Second); err != nil {
 		caddyCancel()
-		t.Fatalf("caddy did not become ready on %s within 30s: %v", endpoint, waitCaddy())
+		t.Fatalf("caddy never became ready on %s: %v", endpoint, err)
 	}
 
 	site := &naiveConsumerSite{
@@ -288,7 +263,7 @@ https://127.0.0.1:%d {
 	site.stop = func() {
 		once.Do(func() {
 			caddyCancel()
-			_ = waitCaddy()
+			_ = caddy.wait()
 			close(stopOrigin)
 			_ = originLn.Close()
 			originWg.Wait()
@@ -757,4 +732,140 @@ func (f *naiveConsumerFixture) countEnrollments(t *testing.T) int {
 		}
 	}
 	return count
+}
+
+// reapedProcess is a started subprocess whose exit is collected exactly once, by
+// a goroutine that calls Wait immediately.
+//
+// This matters for readiness: an exited child stays a zombie until Wait is
+// called, and a zombie still accepts signal 0. Probing liveness with a signal
+// therefore reports "alive" for a process that has already exited, so the wait
+// would run to its deadline instead of reporting the real failure.
+type reapedProcess struct {
+	cmd  *exec.Cmd
+	done chan struct{}
+	err  error
+}
+
+func startReaped(cmd *exec.Cmd) (*reapedProcess, error) {
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	p := &reapedProcess{cmd: cmd, done: make(chan struct{})}
+	go func() {
+		p.err = cmd.Wait()
+		close(p.done)
+	}()
+	return p, nil
+}
+
+// exited reports whether the process has been reaped. It never blocks.
+func (p *reapedProcess) exited() bool {
+	select {
+	case <-p.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// wait blocks until the process has been reaped and returns its error.
+func (p *reapedProcess) wait() error {
+	<-p.done
+	return p.err
+}
+
+// waitForReady waits until endpoint accepts a connection.
+//
+// It returns nil as soon as the port answers, the process error if the process
+// exited first, and a timeout error if neither happened within timeout. The
+// process check is deliberately not a signal probe: see reapedProcess.
+func waitForReady(endpoint string, p *reapedProcess, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, dialErr := net.DialTimeout("tcp", endpoint, 100*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+			return nil
+		}
+		if p.exited() {
+			return fmt.Errorf("process exited before it became ready on %s: %w", endpoint, p.wait())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("process did not become ready on %s within %s", endpoint, timeout)
+}
+
+// TestNaiveConsumerReadyDetectsImmediateExit is the regression test for the
+// zombie case: a process that exits nonzero before binding must be reported
+// immediately, not after the full deadline.
+func TestNaiveConsumerReadyDetectsImmediateExit(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "exit 3")
+	p, err := startReaped(cmd)
+	if err != nil {
+		t.Fatalf("start reaped process: %v", err)
+	}
+
+	started := time.Now()
+	err = waitForReady("127.0.0.1:1", p, 30*time.Second)
+	elapsed := time.Since(started)
+
+	if err == nil {
+		t.Fatal("an exited process must not be reported as ready")
+	}
+	if !strings.Contains(err.Error(), "exit status 3") {
+		t.Fatalf("the process error must be reported, got: %v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("the exit was detected after %s; a zombie must not wait for the deadline", elapsed)
+	}
+	// The process must be reaped, not left a zombie: that is what makes the
+	// detection reliable rather than a race with the OS.
+	if p.cmd.ProcessState == nil {
+		t.Fatal("the process must be reaped before its exit is reported")
+	}
+}
+
+func TestNaiveConsumerReadyWaitsForABoundPort(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	p, err := startReaped(exec.Command("sleep", "30"))
+	if err != nil {
+		t.Fatalf("start reaped process: %v", err)
+	}
+	defer func() {
+		if p.cmd.Process != nil {
+			_ = p.cmd.Process.Kill()
+		}
+		_ = p.wait()
+	}()
+
+	if err := waitForReady(ln.Addr().String(), p, 5*time.Second); err != nil {
+		t.Fatalf("a bound port must be reported ready: %v", err)
+	}
+}
+
+func TestNaiveConsumerReadyTimesOutWhenNothingHappens(t *testing.T) {
+	p, err := startReaped(exec.Command("sleep", "30"))
+	if err != nil {
+		t.Fatalf("start reaped process: %v", err)
+	}
+	defer func() {
+		if p.cmd.Process != nil {
+			_ = p.cmd.Process.Kill()
+		}
+		_ = p.wait()
+	}()
+
+	err = waitForReady("127.0.0.1:1", p, 300*time.Millisecond)
+	if err == nil {
+		t.Fatal("nothing listening must not be reported as ready")
+	}
+	if !strings.Contains(err.Error(), "within") {
+		t.Fatalf("expected a timeout error, got: %v", err)
+	}
 }
