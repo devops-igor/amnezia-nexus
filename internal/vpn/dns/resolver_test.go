@@ -9,7 +9,19 @@ import (
 	"testing"
 
 	mdns "github.com/miekg/dns"
+
+	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
+
+// upstreamOf renders a fixture listener address as a plain-transport upstream
+// entry, which is the shape the resolver now takes.
+func upstreamOf(addr netip.AddrPort) policy.Upstream {
+	return policy.Upstream{
+		Address:   addr.Addr().String(),
+		Port:      int(addr.Port()),
+		Transport: policy.TransportPlain,
+	}
+}
 
 type mockDNSServer struct {
 	serverUDP *mdns.Server
@@ -62,11 +74,11 @@ func TestResolver_ConfigValidation(t *testing.T) {
 
 	// More than 3 upstreams
 	_, err = NewUpstreamResolver(ResolverConfig{
-		Upstreams: []netip.AddrPort{
-			netip.MustParseAddrPort("1.1.1.1:53"),
-			netip.MustParseAddrPort("8.8.8.8:53"),
-			netip.MustParseAddrPort("9.9.9.9:53"),
-			netip.MustParseAddrPort("8.8.4.4:53"),
+		Upstreams: []policy.Upstream{
+			{Address: "1.1.1.1", Port: 53},
+			{Address: "8.8.8.8", Port: 53},
+			{Address: "9.9.9.9", Port: 53},
+			{Address: "8.8.4.4", Port: 53},
 		},
 	})
 	if err != ErrTooManyUpstreams {
@@ -75,7 +87,7 @@ func TestResolver_ConfigValidation(t *testing.T) {
 
 	// Loopback rejected when not allowed
 	_, err = NewUpstreamResolver(ResolverConfig{
-		Upstreams: []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:53")},
+		Upstreams: []policy.Upstream{{Address: "127.0.0.1", Port: 53}},
 	})
 	if err == nil {
 		t.Errorf("expected error for loopback upstream")
@@ -83,14 +95,14 @@ func TestResolver_ConfigValidation(t *testing.T) {
 
 	// Loopback allowed when configured
 	r, err := NewUpstreamResolver(ResolverConfig{
-		Upstreams:             []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:53")},
+		Upstreams:             []policy.Upstream{{Address: "127.0.0.1", Port: 53}},
 		AllowLoopbackUpstream: true,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if r.cfg.QueryTimeout != defaultQueryTimeout || r.cfg.AttemptTimeout != defaultAttemptTimeout {
-		t.Errorf("expected default timeouts, got query=%v attempt=%v", r.cfg.QueryTimeout, r.cfg.AttemptTimeout)
+	if r.queryTimeout != defaultQueryTimeout || r.attemptTimeout != defaultAttemptTimeout {
+		t.Errorf("expected default timeouts, got query=%v attempt=%v", r.queryTimeout, r.attemptTimeout)
 	}
 }
 
@@ -107,7 +119,7 @@ func TestResolver_SuccessfulExchange(t *testing.T) {
 
 	server := startMockServer(t, handler)
 	r, err := NewUpstreamResolver(ResolverConfig{
-		Upstreams:             []netip.AddrPort{server.udpAddr},
+		Upstreams:             []policy.Upstream{upstreamOf(server.udpAddr)},
 		AllowLoopbackUpstream: true,
 	})
 	if err != nil {
@@ -179,7 +191,7 @@ func TestResolver_TCPFallbackOnTruncated(t *testing.T) {
 	})
 
 	r, err := NewUpstreamResolver(ResolverConfig{
-		Upstreams:             []netip.AddrPort{targetAddr},
+		Upstreams:             []policy.Upstream{upstreamOf(targetAddr)},
 		AllowLoopbackUpstream: true,
 	})
 	if err != nil {
@@ -230,7 +242,7 @@ func TestResolver_AlternateUpstreamRetry(t *testing.T) {
 	altServer := startMockServer(t, altHandler)
 
 	r, err := NewUpstreamResolver(ResolverConfig{
-		Upstreams:             []netip.AddrPort{primaryServer.udpAddr, altServer.udpAddr},
+		Upstreams:             []policy.Upstream{upstreamOf(primaryServer.udpAddr), upstreamOf(altServer.udpAddr)},
 		AllowLoopbackUpstream: true,
 	})
 	if err != nil {
@@ -274,7 +286,7 @@ func TestResolver_NXDOMAINTerminal(t *testing.T) {
 	altServer := startMockServer(t, altHandler)
 
 	r, err := NewUpstreamResolver(ResolverConfig{
-		Upstreams:             []netip.AddrPort{primaryServer.udpAddr, altServer.udpAddr},
+		Upstreams:             []policy.Upstream{upstreamOf(primaryServer.udpAddr), upstreamOf(altServer.udpAddr)},
 		AllowLoopbackUpstream: true,
 	})
 	if err != nil {

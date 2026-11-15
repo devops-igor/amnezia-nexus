@@ -27,15 +27,15 @@ import (
 // legacy external defaults; continuity only serves profiles that already name
 // the gateway.
 
-// defaultPolicyUpstreams returns the plain-DNS upstreams used by the policy
-// resolver and by the continuity responder, in failover order. The pair matches
-// the addresses client configurations push, so an active profile and a
-// continuity profile resolve through the same provider.
-func defaultPolicyUpstreams() []netip.AddrPort {
-	return []netip.AddrPort{
-		netip.MustParseAddrPort("94.140.14.14:53"),
-		netip.MustParseAddrPort("94.140.15.15:53"),
-	}
+// defaultPolicyUpstreams returns the plain-DNS upstreams used by the continuity
+// responder, in failover order.
+//
+// The list is the same effective default the policy resolver falls back to
+// (policy.DefaultUpstreams), and the addresses a generated client configuration
+// pushes derive from that one definition, so the two cannot disagree about which
+// provider a profile resolves through.
+func defaultPolicyUpstreams() []policy.Upstream {
+	return policy.DefaultUpstreams()
 }
 
 // newDNSContinuityResolver builds the upstream resolver of the continuity
@@ -50,7 +50,11 @@ var newDNSContinuityResolver = func(cfg gatewaydns.ResolverConfig) (gatewaydns.R
 type dnsContinuityService struct {
 	gateway *gatewaydns.Gateway
 	addr    netip.Addr
-	handler *dnsContinuityHandler
+	// upstreams is the effective upstream list the responder's resolver dials,
+	// kept so a later install with a different list rebuilds instead of reusing
+	// a gateway that resolves through the old provider.
+	upstreams []policy.Upstream
+	handler   *dnsContinuityHandler
 }
 
 func (c *dnsContinuityService) close() {
@@ -70,11 +74,14 @@ func (c *dnsContinuityService) close() {
 // newContinuityDNSGateway builds a gateway-address-only responder. It is
 // constructed without a policy source and without a route observer, so answers
 // can never be classified into routing evidence.
-func newContinuityDNSGateway(addr netip.Addr) *gatewaydns.Gateway {
+//
+// upstreams is the operator's configured list when policy routing has one; an
+// empty list falls back to the same effective default the policy resolver uses.
+func newContinuityDNSGateway(addr netip.Addr, upstreams []policy.Upstream) *gatewaydns.Gateway {
 	if !validGatewayDNSAddr(addr) {
 		return nil
 	}
-	resolver, err := newDNSContinuityResolver(gatewaydns.ResolverConfig{Upstreams: defaultPolicyUpstreams()})
+	resolver, err := newDNSContinuityResolver(gatewaydns.ResolverConfig{Upstreams: effectiveContinuityUpstreams(upstreams)})
 	if err != nil || resolver == nil {
 		return nil
 	}
@@ -353,39 +360,106 @@ func (h *dnsContinuityHandler) retireRuntime(rt *dnsSessionRuntime) {
 	rt.handle.Retire()
 }
 
+// effectiveContinuityUpstreams returns the list the continuity responder dials:
+// the configured one when there is one, otherwise the effective default pair.
+func effectiveContinuityUpstreams(configured []policy.Upstream) []policy.Upstream {
+	if len(configured) > 0 {
+		return configured
+	}
+	return defaultPolicyUpstreams()
+}
+
+// sameUpstreams reports whether two upstream lists dial the same endpoints.
+func sameUpstreams(a, b []policy.Upstream) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // installDNSContinuity installs the gateway-address-only responder that serves
-// configurations issued while policy routing was active. Idempotent.
+// configurations issued while policy routing was active. Idempotent, and it
+// never replaces an already accepted upstream list with the defaults: it passes
+// the service's owned list, so a startup install after a configured list was
+// applied (or after one was installed earlier) keeps that list.
+//
+// Ownership rule: while policy routing is active the policy handler owns the DNS
+// path. It answers gateway-addressed queries and also intercepts external port
+// 53, and only it can turn an answer into routing evidence. This install
+// therefore DEFERS to it instead of replacing it; taking the path away here would
+// leave the service reporting policy routing enabled while producing no evidence
+// after a restart. The explicit disable transitions (TeardownPBR, and
+// ConfigurePBR's disabled/refused branches) install the responder themselves, in
+// their own order, so a live disable still serves issued profiles.
 func (s *Service) installDNSContinuity() {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.installDNSContinuityLocked(s.deriveGatewayDNSIPLocked())
+	if s.forwarder != nil && s.forwarder.PBREnabled() {
+		return
+	}
+	s.installDNSContinuityLocked(s.deriveGatewayDNSIPLocked(), s.dnsUpstreams)
 }
 
 // installDNSContinuityLocked installs the continuity responder and makes it the
 // forwarder's DNS handler, closing the handler it replaces. The caller holds
-// s.mu. A responder already serving the same address keeps its handler, so a
-// repeated disable cannot drop queries in flight.
-func (s *Service) installDNSContinuityLocked(addr netip.Addr) {
-	if s == nil || s.forwarder == nil || !validGatewayDNSAddr(addr) {
+// s.mu. A responder already serving the same address through the same upstream
+// list keeps its handler, so a repeated disable cannot drop queries in flight.
+func (s *Service) installDNSContinuityLocked(addr netip.Addr, upstreams []policy.Upstream) {
+	if s == nil {
 		return
 	}
-	continuity := s.dnsContinuity
-	if continuity == nil || continuity.addr != addr {
-		if continuity != nil {
-			continuity.close()
-		}
-		gw := newContinuityDNSGateway(addr)
-		if gw == nil {
-			s.dnsContinuity = nil
-			return
-		}
-		continuity = &dnsContinuityService{gateway: gw, addr: addr}
-		s.dnsContinuity = continuity
+	effective := effectiveContinuityUpstreams(upstreams)
+	// Everything that installs the responder publishes the list it installed as
+	// the owned current one, so a later install or teardown cannot revert to a
+	// list the operator already replaced. It is recorded before the address and
+	// forwarder guards: the accepted list is the configuration, and a consumer
+	// that cannot be built must not make the next rebuild fall back to defaults.
+	s.dnsUpstreams = effective
+	if s.forwarder == nil || !validGatewayDNSAddr(addr) {
+		return
 	}
-	s.forwarder.SetGatewayDNSIP(addr)
+	continuity := s.ensureContinuityGatewayLocked(addr, effective)
+	if continuity == nil {
+		return
+	}
+	s.attachContinuityHandlerLocked(continuity)
+}
+
+// ensureContinuityGatewayLocked returns the responder that serves addr through
+// upstreams, rebuilding it only when the installed one no longer matches. A
+// responder that cannot be built clears the installed one rather than leaving a
+// gateway that would answer through a list the operator has replaced.
+func (s *Service) ensureContinuityGatewayLocked(addr netip.Addr, upstreams []policy.Upstream) *dnsContinuityService {
+	continuity := s.dnsContinuity
+	if continuity != nil && continuity.addr == addr && sameUpstreams(continuity.upstreams, upstreams) {
+		return continuity
+	}
+	if continuity != nil {
+		continuity.close()
+	}
+	gw := newContinuityDNSGateway(addr, upstreams)
+	if gw == nil {
+		s.dnsContinuity = nil
+		return nil
+	}
+	continuity = &dnsContinuityService{gateway: gw, addr: addr, upstreams: upstreams}
+	s.dnsContinuity = continuity
+	return continuity
+}
+
+// attachContinuityHandlerLocked makes the responder the forwarder's DNS handler,
+// closing the handler it replaces. An already-installed handler is kept, so a
+// repeated install cannot drop queries in flight.
+func (s *Service) attachContinuityHandlerLocked(continuity *dnsContinuityService) {
+	s.forwarder.SetGatewayDNSIP(continuity.addr)
 	if installed, ok := s.forwarder.DNSHandler().(*dnsContinuityHandler); ok && installed == continuity.handler {
 		return
 	}
