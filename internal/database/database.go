@@ -129,20 +129,31 @@ type DB struct {
 //
 // These values define a production startup budget, not a test bound: cmd/panel
 // and cmd/server both open the database through Open, which runs InitSchema
-// before serving. A fresh connection can block on a lock held by another
-// process (a second instance, a checkpoint, or WAL index recovery), so the
-// budget is expressed in units of the driver's per-statement busy timeout
-// instead of an unrelated wall-clock constant.
+// before serving. A fresh connection can block on a lock held by another process
+// (a second instance, a checkpoint, or WAL index recovery), so the budget is
+// expressed in multiples of the busy timeout rather than as an unrelated
+// wall-clock constant.
 //
-// One blocked statement waits at most sqliteBusyTimeout inside the driver's busy
-// handler (the driver ignores the context deadline while it is in that loop, so
-// busy_timeout - not the context - is the real per-statement bound). An attempt
-// therefore gets schemaInitAttemptTimeout so that several contended statements
-// fit, and a lock-wait expiry is retried schemaInitMaxAttempts times with no
-// sleep: the wait already happens inside the driver, and retrying immediately
-// re-enters it. Total startup wait is bounded by
-// schemaInitMaxAttempts * schemaInitAttemptTimeout (60s); beyond that
-// initialization fails closed.
+// Measured behavior of the pinned driver (modernc.org/sqlite v1.62.0):
+//
+//   - A statement that is already executing honors context cancellation: a
+//     300 ms context interrupts a multi-second query after 301 ms.
+//   - Connection setup does not. The DSN pragmas (busy_timeout, journal_mode,
+//     foreign_keys, synchronous) are applied on context.Background(), so the
+//     first statement on a connection that still has to be established waits in
+//     the busy handler for a full busy timeout and then surfaces SQLITE_BUSY; no
+//     context can shorten that wait. That is the wait a startup timeout actually
+//     expires on, and the repeated ~5 s attempts the schema-init tests observe.
+//
+// One attempt therefore gets schemaInitAttemptTimeout, which leaves room for
+// more than one of those uncancellable windows plus the statements themselves,
+// and a lock-wait expiry is retried schemaInitMaxAttempts times with no sleep:
+// the wait already happens inside the driver, and retrying immediately re-enters
+// it. With a lock that never clears, each attempt ends when its own busy window
+// expires, so the policy exhausts in about
+// sqliteBusyTimeout * schemaInitMaxAttempts (~15 s, measured), not after the
+// summed attempt deadlines: schemaInitAttemptTimeout is a per-attempt upper
+// bound, and the 60 s sum is neither a wall-clock guarantee nor a minimum.
 const (
 	sqliteBusyTimeout        = 5 * time.Second
 	schemaInitAttemptTimeout = 4 * sqliteBusyTimeout
@@ -313,15 +324,20 @@ func New(dbPath string, secretKeys ...string) (*DB, error) {
 // Initialization runs with the production lock-wait policy (see
 // defaultSchemaInitPolicy): a lock held by another process is waited for and
 // retried within a bounded, documented budget instead of aborting startup after
-// a single busy-timeout window. Callers that need a different budget use
+// a single busy-timeout window. That window is not cancellable - it is the DSN
+// pragma application during connection setup - which is why the policy is
+// expressed in multiples of it and why one attempt's deadline is an upper bound
+// rather than the expected wait. Callers that need a different budget use
 // openWithPolicy.
 //
 // Failure is fail-closed in the sense that matters for callers: the error names
 // the statement that was waiting, and Open closes the handle instead of
 // returning a half-initialized database. Initialization is not one transaction
-// (migrations issue their own statements), but every step is idempotent, so the
-// next Open resumes the remaining work; the duplicate-allocation reconciliation
-// keeps its existing per-statement semantics.
+// (migrations issue their own statements and commit per migration), but every
+// step is idempotent, so the next Open resumes the remaining work; each
+// data-rewriting migration commits its rewrite and its completion flag together,
+// so a flag never claims work that was rolled back. The duplicate-allocation
+// reconciliation keeps its existing per-statement semantics.
 func (d *DB) InitSchema(ctx context.Context) error {
 	return d.initSchemaWithPolicy(ctx, defaultSchemaInitPolicy)
 }

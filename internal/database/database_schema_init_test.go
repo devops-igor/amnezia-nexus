@@ -73,8 +73,9 @@ func seedDatabaseFile(t *testing.T, path string) {
 //
 // It proves: a lock held longer than busy_timeout is waited out and retried
 // instead of aborting startup, and initialization completes afterwards.
-// It does not prove: how long a lock may be held in production (that is the
-// documented 60 second total budget), nor that the DEV runner's exact lock
+// It does not prove: how long a lock may be held in production (a lock that never
+// clears exhausts the policy in about 15 s: three attempts, each ending at its
+// own ~5 s connection-setup busy window), nor that the DEV runner's exact lock
 // source is reproduced - the test uses a real SQLite exclusive lock, not a
 // synthetic sleep.
 func TestOpenWaitsForExclusiveLockPastBusyTimeout(t *testing.T) {
@@ -141,7 +142,7 @@ func TestOpenWaitsForExclusiveLockPastBusyTimeout(t *testing.T) {
 // handle, and leaves nothing half-initialized behind (the next Open, after the
 // lock is gone, initializes the database completely).
 //
-// It proves: fail-closed behaviour and the diagnosable error for a lock that
+// It proves: fail-closed behavior and the diagnosable error for a lock that
 // never clears. It does not prove: that a mid-sequence failure can never leave
 // partially migrated state - initialization is a sequence of idempotent
 // statements, not one transaction, so recovery is by resuming.
