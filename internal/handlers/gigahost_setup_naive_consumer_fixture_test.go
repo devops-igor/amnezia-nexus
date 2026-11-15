@@ -71,6 +71,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -230,21 +231,40 @@ https://127.0.0.1:%d {
 		t.Fatalf("start caddy: %v", err)
 	}
 
+	// Wait must run exactly once: the readiness failure path and the fixture's
+	// cleanup both need it, and a second call returns "Wait was already called".
+	var waitOnce sync.Once
+	waitCaddy := func() error {
+		var err error
+		waitOnce.Do(func() { err = caddyCmd.Wait() })
+		return err
+	}
+
+	// Readiness is a bounded wait, not a fixed 4-second one. Caddy has no
+	// bounded startup time: under a loaded runner it can take longer than 4s to
+	// bind, which made this fixture fail on main with "did not become ready"
+	// while the process was healthy. The wait is also process-aware now: if
+	// caddy exits, that is the failure and its error is reported immediately
+	// instead of being hidden behind a timeout.
 	endpoint := net.JoinHostPort("127.0.0.1", strconv.Itoa(proxyPort))
+	deadline := time.Now().Add(30 * time.Second)
 	ready := false
-	for i := 0; i < 80; i++ {
-		time.Sleep(50 * time.Millisecond)
+	for time.Now().Before(deadline) {
 		conn, dialErr := net.DialTimeout("tcp", endpoint, 100*time.Millisecond)
 		if dialErr == nil {
 			_ = conn.Close()
 			ready = true
 			break
 		}
+		if err := caddyCmd.Process.Signal(syscall.Signal(0)); err != nil {
+			caddyCancel()
+			t.Fatalf("caddy exited before it became ready on %s: %v", endpoint, waitCaddy())
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	if !ready {
 		caddyCancel()
-		_ = caddyCmd.Wait()
-		t.Fatalf("caddy did not become ready on %s", endpoint)
+		t.Fatalf("caddy did not become ready on %s within 30s: %v", endpoint, waitCaddy())
 	}
 
 	site := &naiveConsumerSite{
@@ -268,7 +288,7 @@ https://127.0.0.1:%d {
 	site.stop = func() {
 		once.Do(func() {
 			caddyCancel()
-			_ = caddyCmd.Wait()
+			_ = waitCaddy()
 			close(stopOrigin)
 			_ = originLn.Close()
 			originWg.Wait()
