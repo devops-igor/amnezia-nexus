@@ -64,7 +64,7 @@ func TestVPNSessionsHandler(t *testing.T) {
 		vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint string, serverPubKey string, clientPrivKey string, psk string, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 			return 20 * time.Millisecond, nil
 		})
-		t.Cleanup(func() { _ = vpnSvc.Stop() })
+		t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 		h.vpnSvc = vpnSvc
 
 		// Backend registered the way production persists it: a server row

@@ -27,7 +27,7 @@ func TestDeleteServerHandler_WithActiveVPNBackend(t *testing.T) {
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
-	t.Cleanup(func() { _ = vpnSvc.Stop() })
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	h.vpnSvc = vpnSvc
 
 	srv := &models.Server{
@@ -154,7 +154,7 @@ func TestDeleteServerHandler_WithoutVPNBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
-	t.Cleanup(func() { _ = vpnSvc.Stop() })
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	h.vpnSvc = vpnSvc
 
 	srv := &models.Server{
@@ -234,7 +234,7 @@ func TestDeleteServerHandler_BackendTeardownError_FailsClosed(t *testing.T) {
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
-	t.Cleanup(func() { _ = vpnSvc.Stop() })
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	h.vpnSvc = vpnSvc
 
 	srv := &models.Server{
@@ -316,7 +316,7 @@ func TestDeleteServerHandler_WithActiveVPNBackend_DrainsAndMigratesSessions(t *t
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
-	t.Cleanup(func() { _ = vpnSvc.Stop() })
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	h.vpnSvc = vpnSvc
 
 	// Server 1
@@ -456,7 +456,7 @@ func TestDeleteServerHandler_ConcurrentEnableBackend_CannotResurrectZombieTunnel
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
-	t.Cleanup(func() { _ = vpnSvc.Stop() })
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	h.vpnSvc = vpnSvc
 
 	srv := &models.Server{
@@ -597,7 +597,7 @@ func TestDeleteServerHandler_SelfHealing_CannotResurrectDeletedServer(t *testing
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
-	t.Cleanup(func() { _ = vpnSvc.Stop() })
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	h.vpnSvc = vpnSvc
 
 	srv := &models.Server{
@@ -673,7 +673,7 @@ func TestDeleteServerHandler_BackupRestoreSameID_CanEnableBackend(t *testing.T) 
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
-	t.Cleanup(func() { _ = vpnSvc.Stop() })
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	h.vpnSvc = vpnSvc
 
 	srv := &models.Server{
@@ -791,7 +791,7 @@ func TestDeleteServerHandler_ConcurrentEnableBackend_ServerGenerationChanged_Rej
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
-	t.Cleanup(func() { _ = vpnSvc.Stop() })
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	h.vpnSvc = vpnSvc
 
 	// 1. Create server ID N (Gen A) with host and AWG protocol.
