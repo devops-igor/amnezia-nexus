@@ -767,6 +767,12 @@ func TestLegacyBcryptPasswordEdgeCases(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			// The cases only call the pure password helpers: no shared state,
+			// ports, environment or database. Running them concurrently keeps
+			// every assertion and the production cost-12 parameter while
+			// removing the serial bcrypt wall time.
+			t.Parallel()
+
 			// 1. Verify Go HashPassword roundtrip
 			hash, err := security.HashPassword(tc.password)
 			if err != nil {

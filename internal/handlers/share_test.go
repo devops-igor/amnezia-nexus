@@ -13,7 +13,6 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"github.com/devops-igor/amnezia-nexus/internal/security"
 )
 
 func TestShareHandlers(t *testing.T) {
@@ -22,7 +21,7 @@ func TestShareHandlers(t *testing.T) {
 
 	token := "valid-share-token"
 	sharePass := "ShareSecret123!"
-	sharePassHash, _ := security.HashPassword(sharePass)
+	sharePassHash := fixturePasswordHash(t, sharePass)
 
 	user := &models.User{
 		ID:                "share-user-1",
