@@ -60,9 +60,11 @@ The continuity responder is deliberately not a second policy resolver:
 - It is constructed without a policy source and without a route observer, so its
   answers create no routing observation and can never grant `Direct`. An issued
   profile keeps resolving while disabled and stays fail-closed for routing.
-- It resolves through the same upstream pair as the policy resolver (AdGuard
-  `94.140.14.14` then `94.140.15.15`), so an issued profile does not change
-  provider when the feature is disabled.
+- It resolves through the effective default upstream pair
+  (`policy.DefaultUpstreams()`: AdGuard `94.140.14.14` then `94.140.15.15`), the
+  same one definition the resolver and the rendered client configuration derive
+  from, so an issued profile does not change provider when the feature is
+  disabled and the two cannot drift apart.
 
 A transient failure to deliver one reply can retire the resolver authority of a
 session. For a session that is still live, the next query replaces that retired
@@ -74,7 +76,130 @@ Newly generated configurations while policy routing is inactive keep the legacy
 external defaults, as before. Steering never rewrites a file a client already
 holds.
 
-## 3. Plain-DNS interception
+## 3. Upstream resolver configuration
+
+The policy resolver's upstream list is operator configuration, stored in the
+existing policy settings record under `upstream_dns` (issue #824). It is not a
+new table, endpoint or service.
+
+```json
+{
+  "enabled": true,
+  "preset": "geoblock",
+  "sync_interval_seconds": 3600,
+  "upstream_dns": [
+    {"address": "94.140.14.14", "port": 53},
+    {"address": "2001:4860:4860::8888", "port": 53},
+    {"address": "dns.example.com", "port": 5353, "transport": "plain"}
+  ]
+}
+```
+
+Rules (`policy.Upstream.Validate`, applied by `policy.Settings.Validate`):
+
+| Rule | Rejection |
+| :--- | :--- |
+| at most three entries | the list exceeds the maximum |
+| explicit port 1-65535 | a missing port or one outside the range |
+| IPv4 literal, IPv6 literal or hostname | malformed literal or hostname (lengths, labels, characters) |
+| never loopback, multicast or unspecified | the address falls in that class (`localhost` included) |
+| no duplicate entry | the same transport and host:port appears twice |
+| a known transport | an unknown transport name, or a transport this build does not implement |
+
+Validation is pure and runs before persistence, so a rejected request returns a
+specific error and writes nothing; the previously stored record stays in effect.
+An absent or empty list means "use the effective defaults", which is what keeps a
+record written before this field existed working unchanged.
+
+The transport field is part of the contract from the start. Only `plain` (UDP
+with TCP fallback on truncation) is implemented; `dot` and `doh` are rejected
+with a specific error instead of being accepted and carried in clear text. An
+entry never silently downgrades, and the resolver refuses a non-plain entry at
+construction and at exchange time as well, so the rule holds even for a caller
+that bypasses settings validation.
+
+### One current list for every consumer
+
+`Service.dnsUpstreams` (guarded by `Service.mu`) is the single owned list of
+accepted upstreams. It is written only by the two paths that can accept one:
+activation (`ConfigurePBR`, from the resolver that was actually installed) and
+an accepted live change or disable (`ApplyEffectiveUpstreams`). Every consumer
+reads it:
+
+| Consumer | When it reads the list |
+| :--- | :--- |
+| policy resolver | installed at activation, swapped in place on an accepted change |
+| continuity responder | rebuilt at teardown, at every install, and on an accepted change while policy routing is off |
+| disabled startup | `startPersistedPolicyRouting` applies the persisted list even though the record is disabled |
+
+A teardown therefore cannot rebuild the responder from the list the activation
+started with: a list the operator replaced is never observable again, and a
+disabled restart re-applies the saved list instead of falling back to the
+defaults.
+
+### Who owns the DNS path
+
+Exactly one handler owns the forwarder's DNS path at a time:
+
+| State | Installed handler | Installed by |
+| :--- | :--- | :--- |
+| policy routing active | policy resolver (`pbrDNSHandler`), with the matcher and the route observer | `ConfigurePBR` |
+| policy routing inactive | continuity responder, no matcher and no observer | `TeardownPBR`, `ConfigurePBR`'s disabled/refused branches, and the disabled-startup install |
+
+The idempotent install that runs at service start
+(`installDNSContinuity`) defers while policy routing is active: a restart with an
+enabled record activates policy routing before the data plane starts, and
+replacing that handler would leave the status reporting policy routing enabled
+while DNS produced no routing evidence. Disable transitions install the
+responder explicitly, in their own order, so an issued gateway-DNS profile still
+resolves after policy routing is turned off and a repeated install still keeps
+its handler (no query in flight is dropped).
+
+### Saves that omit the field
+
+The existing policy form posts only `enabled`, `preset`, `custom_urls` and
+`sync_interval_seconds`. An omitted `upstream_dns` therefore preserves the
+stored list; an explicitly empty list (`"upstream_dns": []`) is the deliberate
+reset to the effective defaults. The merge happens inside the serialized
+settings mutation and the effective record is validated before it is written, so
+a rejected merge writes nothing.
+
+### Single source of truth
+
+`policy.DefaultUpstreams()` is the one definition of the default pair. Both
+consumers derive from it:
+
+- the resolver's effective list (`policy.Settings.EffectiveUpstreams()`, which
+  `initPBR` and a live settings update install on the running resolver);
+- the `DNS =` pair a generated client configuration pushes when the policy
+  gateway is not the answer path (`defaultClientDNSServers` in
+  `internal/vpn/client_config.go`).
+
+### Preserved budgets
+
+The configured list changes which provider is dialled, not how. The overall
+query deadline, the per-attempt deadline, the single alternate retry, TCP
+fallback on truncation and SERVFAIL failover are unchanged. A transport failure
+is an error, never a valid empty answer, and the server maps it to SERVFAIL for
+the client.
+
+### Status
+
+`vpn.PolicyStatus` gains three fields, reported through the existing policy
+status response (no new endpoint):
+
+| Field | Meaning |
+| :--- | :--- |
+| `last_upstream` | the upstream that served the most recent accepted answer |
+| `last_upstream_failure` | the upstream of the most recent failed attempt |
+| `last_upstream_failure_kind` | `timeout`, `network`, `servfail`, `invalid_response`, and later `tls_handshake`, `certificate`, `http_status` |
+
+A successful exchange clears the failure fields, so a working provider is never
+reported as failing. A blocked provider now surfaces as a failure kind instead of
+presenting as "no evidence yet". The fields carry resolver addresses only: no
+queried names and no client data.
+
+## 4. Plain-DNS interception
 
 Interception of arbitrary port-53 destinations exists only while policy routing
 is active. `Forwarder.SetPBREnabled` selects between the legacy and the
@@ -167,7 +292,7 @@ expires at the minimum answer TTL capped by the server's maximum TTL. Evidence
 is written into the authenticated session's cache scope, so it is bounded by
 the session lifetime and never visible to another session.
 
-## 4. Limitations
+## 5. Limitations
 
 - **Encrypted DNS is out of scope.** DNS over HTTPS (443) and DNS over TLS
   (853) are not detected, intercepted or decrypted. Those destinations produce
@@ -180,5 +305,15 @@ the session lifetime and never visible to another session.
 - **Continuity answers are not evidence.** While policy routing is inactive the
   gateway-address responder answers DNS but records no observation, so issued
   profiles resolve and continue to proxy until policy routing is enabled again.
+- **Encrypted upstream transports are not implemented yet.** The persisted
+  configuration already selects a transport per entry, and an entry configured
+  for DoT or DoH is rejected rather than carried in plaintext. Until those
+  transports land, policy routing resolves over plain DNS to the configured
+  list.
+- **Operator-configured upstreams drive the resolver only.** A generated client
+  configuration keeps naming the gateway while policy routing is active and the
+  effective default pair while it is inactive; it is never pointed at an
+  operator-supplied upstream, which may be reachable from the host but not from
+  the client's own egress.
 - **Prohibited destinations are not intercepted.** The existing
   prohibited-destination drop runs before interception and is not weakened.

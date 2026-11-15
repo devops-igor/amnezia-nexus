@@ -905,7 +905,11 @@ func TestPBRDNSHandler_R8H1_AsyncDrainUnblocked(t *testing.T) {
 	gwIP := netip.MustParseAddr("10.100.0.1")
 	rc := NewMemoryRouteCache()
 	matcher := policy.NewMatcher()
-	gw := initDefaultDNSGateway(gwIP, matcher, rc)
+	resolver, err := newPolicyUpstreamResolver(nil)
+	if err != nil {
+		t.Fatalf("build upstream resolver: %v", err)
+	}
+	gw := initDNSGateway(gwIP, matcher, rc, resolver)
 	// The handler allocates session scopes only for sessions that still own a
 	// route, so the fixture registers the session like the ingress path does.
 	fwd := forwarder.NewForwarder(nil, "10.100.0.0/16", 8)
