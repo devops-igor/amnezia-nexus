@@ -862,6 +862,10 @@
   "policy_sync_ok": "策略同步已完成",
   "policy_sync_failed": "策略同步失败",
   "policy_sync_running": "正在同步…",
+  "policy_sync_state_disabled": "已禁用",
+  "policy_sync_state_error": "失败",
+  "policy_sync_state_pending": "等待中",
+  "policy_sync_state_synced": "已同步",
   "policy_load_failed": "无法加载策略设置",
   "policy_rule_count_value": "{domains} 个域名 / {cidrs} 个前缀"
 }

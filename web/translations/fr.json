@@ -862,6 +862,10 @@
   "policy_sync_ok": "Synchronisation de la politique terminée",
   "policy_sync_failed": "Échec de la synchronisation de la politique",
   "policy_sync_running": "Synchronisation…",
+  "policy_sync_state_disabled": "Désactivé",
+  "policy_sync_state_error": "Échec",
+  "policy_sync_state_pending": "En attente",
+  "policy_sync_state_synced": "Synchronisé",
   "policy_load_failed": "Impossible de charger les paramètres de politique",
   "policy_rule_count_value": "{domains} domaines / {cidrs} préfixes"
 }

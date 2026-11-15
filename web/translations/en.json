@@ -862,6 +862,10 @@
   "policy_sync_ok": "Policy sync completed",
   "policy_sync_failed": "Policy sync failed",
   "policy_sync_running": "Syncing…",
+  "policy_sync_state_disabled": "Disabled",
+  "policy_sync_state_error": "Failed",
+  "policy_sync_state_pending": "Pending",
+  "policy_sync_state_synced": "Synced",
   "policy_load_failed": "Could not load policy settings",
   "policy_rule_count_value": "{domains} domains / {cidrs} prefixes"
 }

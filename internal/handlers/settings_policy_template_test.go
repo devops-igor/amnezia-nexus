@@ -138,6 +138,33 @@ func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
 		}
 	})
 
+	t.Run("AccessibleControlsAndLiveRegion", func(t *testing.T) {
+		// The master toggle is a native checkbox exposed as a switch (the fallback
+		// the switch pattern prescribes where the switch attribute is unsupported),
+		// its operational notice is programmatically associated, the preset rows are
+		// one labelled group, and every result is announced through a live region.
+		for _, token := range []string{
+			`role="switch"`,
+			`aria-describedby="policyDirectEgressNotice"`,
+			`id="policyDirectEgressNotice"`,
+			`<fieldset `,
+			`<legend `,
+			`role="status"`,
+			`aria-live="polite"`,
+		} {
+			if !strings.Contains(adminBody, token) {
+				t.Errorf("admin settings page is missing %q", token)
+			}
+		}
+		// A <button> accepts phrasing content only, so its spinner must not be a
+		// flow-level element.
+		for _, id := range []string{"policySaveSpinner", "policySyncSpinner"} {
+			if !strings.Contains(adminBody, `<span class="spinner hidden" id="`+id+`"`) {
+				t.Errorf("#%s must be a span inside the button, not a div", id)
+			}
+		}
+	})
+
 	t.Run("NoInlineScriptOrHandlerInSection", func(t *testing.T) {
 		partial, err := web.TemplatesFS.ReadFile("templates/settings_policy.html")
 		if err != nil {
@@ -179,6 +206,19 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 	}
 	if len(keys) < 20 {
 		t.Fatalf("found only %d policy translation keys in the partial; the extraction is wrong", len(keys))
+	}
+
+	// Keys the controller resolves at run time. The JSDOM harness stubs the
+	// translator, so it cannot notice a key missing from a dictionary; pin them
+	// here with the template's own keys.
+	for _, key := range []string{
+		"policy_load_failed", "policy_saved", "policy_save_failed", "policy_save_refused",
+		"policy_sync_ok", "policy_sync_failed", "policy_sync_running", "policy_never",
+		"policy_none", "policy_rule_count_value",
+		"policy_sync_state_disabled", "policy_sync_state_error",
+		"policy_sync_state_pending", "policy_sync_state_synced",
+	} {
+		keys[key] = true
 	}
 
 	locales := []string{"en.json", "ru.json", "fr.json", "fa.json", "zh.json"}

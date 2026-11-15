@@ -71,10 +71,15 @@ func policyControllerHarness(t *testing.T, prelude, scenario string) string {
 const dom = new JSDOM('<div id="policyFixtureHost"></div>', {runScripts:'outside-only'});
 const w = dom.window;
 // Every translation key resolves to itself, so an assertion can name the exact
-// key a branch chose instead of depending on English wording. The one exception
-// is the rule-count template: its substituted values are part of the contract,
-// so the harness supplies the placeholders the dictionary defines.
-w._ = key => key === 'policy_rule_count_value' ? '{domains} domains / {cidrs} prefixes' : key;
+// key a branch chose instead of depending on English wording. Two exceptions are
+// keys whose resolution is the contract under test: the rule-count template (its
+// substituted values) and the runtime sync-state tokens (a token must be looked
+// up in the dictionary, not printed raw).
+w._ = key => {
+  if (key === 'policy_rule_count_value') return '{domains} domains / {cidrs} prefixes';
+  if (key.indexOf('policy_sync_state_') === 0) return 'sync:' + key.slice('policy_sync_state_'.length);
+  return key;
+};
 
 // calls records every request the controller made. The responder decides the
 // answer per URL, which is what lets a case hold a failure and its recovery.
@@ -143,7 +148,7 @@ func runPolicyControllerScenario(t *testing.T, prelude, scenario string) {
 func policyRecordScript(enabled bool, preset string) string {
 	return fmt.Sprintf(`
 const record = () => ({enabled: %t, preset: '%s', custom_urls: [], sync_interval_seconds: 21600,
-  status: {enabled: %t, preset: '%s', domain_count: 1234, cidr_count: 56, sync_state: 'ok',
+  status: {enabled: %t, preset: '%s', domain_count: 1234, cidr_count: 56, sync_state: 'synced',
            last_success: '2026-11-14T10:00:00Z', last_error: ''}});
 const stats = () => ({proxy_bytes: 2048, direct_bytes: 1048576, proxy_drops: 3, direct_drops: 0});
 responder = async (url, opts) => {
@@ -163,7 +168,8 @@ assert.equal(text('policyActivePreset'), 'policy_preset_geoblock');
 assert.match(text('policyLastSuccess'), /\d{4}|\d{1,2}:\d{2}/, 'the last success must be a timestamp, not "never"');
 assert.equal(text('policyLastError'), 'policy_none');
 assert.equal(text('policyRuleCount'), '1234 domains / 56 prefixes');
-assert.equal(text('policySyncState'), 'ok');
+assert.equal(text('policySyncState'), 'sync:synced',
+  'the runtime sync-state token must be looked up in the dictionary, not printed raw');
 assert.equal(text('policyProxyBytes'), '2.00 KiB');
 assert.equal(text('policyDirectBytes'), '1.00 MiB');
 assert.equal(text('policyProxyDrops'), '3');
@@ -184,11 +190,11 @@ responder = async (url, opts) => {
     return {status: 'ok', enabled: true, preset: 'russia_inside', custom_urls: [],
             sync_interval_seconds: 21600,
             policy_status: {enabled: true, preset: 'russia_inside', domain_count: 7, cidr_count: 0,
-                            sync_state: 'ok', last_success: '2026-11-15T00:00:00Z', last_error: ''}};
+                            sync_state: 'synced', last_success: '2026-11-15T00:00:00Z', last_error: ''}};
   }
   if (url.endsWith('/api/vpn/policy')) return {enabled: false, preset: '', custom_urls: [],
     sync_interval_seconds: 21600,
-    status: {enabled: false, preset: '', domain_count: 0, cidr_count: 0, sync_state: 'idle'}};
+    status: {enabled: false, preset: '', domain_count: 0, cidr_count: 0, sync_state: 'disabled'}};
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
 };
 w.document.getElementById('policy_preset_russia_inside').checked = true;
@@ -242,6 +248,8 @@ assert.ok(alert.text.indexOf('direct egress is unavailable') !== -1,
   'the backend refusal must be surfaced verbatim, got: ' + alert.text);
 assert.ok(alert.text.indexOf('policy_save_refused') !== -1,
   'the banner must state that the form was reloaded from the saved configuration');
+assert.ok(alert.text.indexOf('unavailable. policy_save_refused') !== -1,
+  'the server detail and the refusal must read as separate sentences, got: ' + alert.text);
 assert.equal(toggle(), false, 'a refused enablement must not remain visible as enabled');
 assert.equal(badge().enabled, 'false', 'the badge must follow the server, not the refused intent');
 assert.equal(text('policyLastError'), 'direct egress is unavailable',
@@ -311,12 +319,12 @@ responder = async (url, opts) => {
   if (url.endsWith('/api/vpn/policy/sync')) {
     return {status: 'ok', published: true, version: 2, generation_id: 'gen-2',
             policy_status: {enabled: true, preset: 'russia_inside', domain_count: 10, cidr_count: 4,
-                            sync_state: 'ok', last_success: '2026-11-15T01:00:00Z', last_error: ''}};
+                            sync_state: 'synced', last_success: '2026-11-15T01:00:00Z', last_error: ''}};
   }
   if (url.endsWith('/stats')) return {proxy_bytes: 4096, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (url.endsWith('/api/vpn/policy')) return {enabled: true, preset: 'russia_inside', custom_urls: [],
     sync_interval_seconds: 21600, status: {enabled: true, preset: 'russia_inside', domain_count: 10,
-    cidr_count: 4, sync_state: 'ok', last_success: '2026-11-15T01:00:00Z', last_error: ''}};
+    cidr_count: 4, sync_state: 'synced', last_success: '2026-11-15T01:00:00Z', last_error: ''}};
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
 };
 w.document.getElementById('policySyncBtn').click();
@@ -348,7 +356,7 @@ responder = async (url, opts) => {
   }
   if (url.endsWith('/api/vpn/policy')) {
     return {enabled: false, preset: 'custom', custom_urls: ['https://lists.example.com/a.lst'],
-            sync_interval_seconds: 21600, status: {enabled: false, sync_state: 'idle'}};
+            sync_interval_seconds: 21600, status: {enabled: false, sync_state: 'disabled'}};
   }
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
 };
@@ -365,6 +373,49 @@ assert.ok(alertText().text.indexOf('scheme must be https') !== -1,
 // The reload returns the stored record, so a rejected entry is not shown as saved.
 assert.equal(w.document.getElementById('policy_custom_urls').value,
   'https://lists.example.com/a.lst', 'the textarea is reloaded from the saved record');
+`)
+}
+
+// TestPolicyRoutingControllerSingleFlight covers the guard that keeps one save
+// and one sync in flight. Disabling the button is not enough on its own: pressing
+// Enter in the form reaches the submit handler while the button is already done.
+func TestPolicyRoutingControllerSingleFlight(t *testing.T) {
+	runPolicyControllerScenario(t, policyRecordScript(false, "geoblock"), `
+let putCalls = 0;
+let syncCalls = 0;
+const accepted = () => ({status: 'ok', enabled: true, preset: 'geoblock', custom_urls: [],
+  sync_interval_seconds: 21600,
+  policy_status: {enabled: true, preset: 'geoblock', domain_count: 1, cidr_count: 0,
+                  sync_state: 'synced', last_success: '2026-11-15T00:00:00Z', last_error: ''}});
+responder = async (url, opts) => {
+  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
+  if (url.endsWith('/api/vpn/policy/sync')) {
+    syncCalls++;
+    await new Promise(resolve => setTimeout(resolve, 10));
+    return {status: 'ok', published: true,
+            policy_status: {enabled: true, preset: 'geoblock', sync_state: 'synced'}};
+  }
+  if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
+    putCalls++;
+    await new Promise(resolve => setTimeout(resolve, 10));
+    return accepted();
+  }
+  throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
+};
+
+const firstSave = w.savePolicySettings();
+assert.equal(await w.savePolicySettings(), null, 'a save while one is in flight must be ignored');
+await firstSave;
+await settle();
+assert.equal(putCalls, 1, 'two submits must not become two PUTs');
+assert.equal(w.document.getElementById('policySaveBtn').getAttribute('aria-busy'), 'false',
+  'the busy announcement must be cleared when the request ends');
+
+const firstSync = w.syncPolicy();
+assert.equal(await w.syncPolicy(), null, 'a sync while one is in flight must be ignored');
+await firstSync;
+await settle();
+assert.equal(syncCalls, 1, 'two sync requests must not become two POSTs');
 `)
 }
 

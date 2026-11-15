@@ -30,6 +30,13 @@
     // when a refused save cannot be followed by a successful reload.
     var lastServerRecord = null;
     var initialized = false;
+    // One save and one sync at a time. The Save button is disabled while its
+    // request runs, but pressing Enter in the form reaches the submit handler
+    // anyway, so the guard cannot live in the button alone.
+    var inFlight = { save: false, sync: false };
+    // The control that owns the busy state, so focus can be given back: browsers
+    // drop focus from a control the moment it is disabled.
+    var busyFocus = null;
 
     function policyText(key) {
         if (typeof root._ === 'function') {
@@ -54,7 +61,10 @@
             err.status = 0;
             throw err;
         }
-        return root.API.request(url, options);
+        // This section renders every failure inline, so the shared client must not
+        // raise its global toast for the same answer: two error surfaces make a
+        // screen reader announce the same refusal twice.
+        return root.API.request(url, Object.assign({ silent: true }, options));
     }
 
     // policyErrorDetail prefers the server's own wording. api.js already resolves
@@ -107,7 +117,12 @@
         if (isNaN(parsed.getTime())) {
             return String(raw);
         }
-        return parsed.toLocaleString();
+        // Format in the page's language so a Russian portal does not fall back to
+        // the browser's own locale for the same timestamp.
+        var lang = root.document && root.document.documentElement
+            ? root.document.documentElement.lang
+            : '';
+        return parsed.toLocaleString(lang || undefined);
     }
 
     function policyPresetLabel(preset) {
@@ -115,6 +130,18 @@
             return policyText('policy_none');
         }
         return policyText('policy_preset_' + preset);
+    }
+
+    // policySyncStateLabel translates the runtime's own sync_state token. The set
+    // is closed (disabled/synced/pending/error); an unknown token is shown as
+    // received rather than replaced by a guess.
+    function policySyncStateLabel(state) {
+        if (!state) {
+            return policyText('policy_none');
+        }
+        var key = 'policy_sync_state_' + state;
+        var label = policyText(key);
+        return label === key ? state : label;
     }
 
     function policySelectedPreset() {
@@ -159,15 +186,20 @@
             banner.setAttribute('data-state', '');
             return;
         }
+        // Theme tokens, not literals: --success-bg/--danger-bg already carry the
+        // light and dark variants. The message keeps the primary text colour
+        // because --danger is tuned for dark surfaces and measures 3.2:1 on the
+        // light theme's card, under the 4.5:1 minimum for this text size. The
+        // state is still carried by the tint, the border and the wording rather
+        // than by colour alone.
         if (kind === 'success') {
-            banner.style.background = 'rgba(16, 185, 129, 0.12)';
-            banner.style.border = '1px solid rgba(16, 185, 129, 0.3)';
-            banner.style.color = 'var(--success)';
+            banner.style.background = 'var(--success-bg)';
+            banner.style.border = '1px solid var(--success-border)';
         } else {
-            banner.style.background = 'rgba(239, 68, 68, 0.1)';
-            banner.style.border = '1px solid rgba(239, 68, 68, 0.25)';
-            banner.style.color = 'var(--danger)';
+            banner.style.background = 'var(--danger-bg)';
+            banner.style.border = '1px solid var(--danger-border)';
         }
+        banner.style.color = 'var(--text-primary)';
         banner.setAttribute('data-state', kind);
         banner.textContent = message;
         banner.style.display = 'block';
@@ -178,7 +210,19 @@
         var spinner = policyElement(role === 'sync' ? 'policySyncSpinner' : 'policySaveSpinner');
         var label = policyElement(role === 'sync' ? 'policySyncBtnText' : 'policySaveBtnText');
         if (button) {
+            if (busy && root.document && root.document.activeElement === button) {
+                busyFocus = button;
+            }
             button.disabled = !!busy;
+            button.setAttribute('aria-busy', busy ? 'true' : 'false');
+            // Disabling a focused control moves focus to the document body, so a
+            // keyboard operator would lose their place for the whole request.
+            if (!busy) {
+                if (busyFocus === button && root.document && root.document.activeElement === root.document.body) {
+                    button.focus();
+                }
+                busyFocus = null;
+            }
         }
         if (spinner) {
             if (busy) {
@@ -273,7 +317,7 @@
 
         var syncStateEl = policyElement('policySyncState');
         if (syncStateEl) {
-            syncStateEl.textContent = snapshot && snapshot.sync_state ? snapshot.sync_state : policyText('policy_none');
+            syncStateEl.textContent = policySyncStateLabel(snapshot && snapshot.sync_state);
         }
 
         var ruleCountEl = policyElement('policyRuleCount');
@@ -366,6 +410,10 @@
     }
 
     async function savePolicySettings() {
+        if (inFlight.save) {
+            return null;
+        }
+        inFlight.save = true;
         var payload = policySavePayload();
         setPolicyBusy('save', true);
         setPolicyAlert('', '');
@@ -383,8 +431,13 @@
             return saved;
         } catch (err) {
             var detail = policyErrorDetail(err);
-            setPolicyAlert('error', [policyText('policy_save_failed') + ': ' + detail,
-                policyText('policy_save_refused')].join(' '));
+            var refusal = policyText('policy_save_failed') + ': ' + detail;
+            // Two sentences in one banner: the server's detail does not always end
+            // with a stop, and without one the refusal reads as a run-on sentence.
+            if (!/[.!?…]$/.test(detail)) {
+                refusal += '.';
+            }
+            setPolicyAlert('error', refusal + ' ' + policyText('policy_save_refused'));
             // Reload the accepted record. If that fails too, the snapshot from the
             // last successful read is restored, so the refused intent is cleared
             // either way.
@@ -398,11 +451,16 @@
             }
             return null;
         } finally {
+            inFlight.save = false;
             setPolicyBusy('save', false);
         }
     }
 
     async function syncPolicy() {
+        if (inFlight.sync) {
+            return null;
+        }
+        inFlight.sync = true;
         setPolicyBusy('sync', true);
         setPolicyAlert('', '');
         try {
@@ -427,6 +485,7 @@
             }
             return null;
         } finally {
+            inFlight.sync = false;
             setPolicyBusy('sync', false);
         }
     }

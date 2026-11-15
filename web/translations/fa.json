@@ -862,6 +862,10 @@
   "policy_sync_ok": "همگام‌سازی سیاست کامل شد",
   "policy_sync_failed": "همگام‌سازی سیاست ناموفق بود",
   "policy_sync_running": "در حال همگام‌سازی…",
+  "policy_sync_state_disabled": "غیرفعال",
+  "policy_sync_state_error": "ناموفق",
+  "policy_sync_state_pending": "در انتظار",
+  "policy_sync_state_synced": "همگام‌سازی شد",
   "policy_load_failed": "بارگذاری تنظیمات سیاست ممکن نشد",
   "policy_rule_count_value": "{domains} دامنه / {cidrs} پیشوند"
 }

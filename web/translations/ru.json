@@ -862,6 +862,10 @@
   "policy_sync_ok": "Синхронизация политики завершена",
   "policy_sync_failed": "Синхронизация политики не удалась",
   "policy_sync_running": "Синхронизация…",
+  "policy_sync_state_disabled": "Отключено",
+  "policy_sync_state_error": "Ошибка",
+  "policy_sync_state_pending": "Ожидает синхронизации",
+  "policy_sync_state_synced": "Синхронизировано",
   "policy_load_failed": "Не удалось загрузить настройки политики",
   "policy_rule_count_value": "доменов: {domains}, префиксов: {cidrs}"
 }

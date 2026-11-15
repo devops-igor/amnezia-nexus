@@ -9,22 +9,22 @@
         <span id="policyStatusBadge" class="badge badge-secondary" style="font-size: 0.72rem;">{{ _ "policy_status_disabled" }}</span>
     </div>
 
-    <div id="policyAlert" role="alert" aria-live="polite" style="display: none; padding: var(--space-sm) var(--space-md); border-radius: var(--radius-sm); margin-bottom: var(--space-md); font-size: 0.85rem;"></div>
+    <div id="policyAlert" role="status" aria-live="polite" aria-atomic="true" style="display: none; padding: var(--space-sm) var(--space-md); border-radius: var(--radius-sm); margin-bottom: var(--space-md); font-size: 0.85rem;"></div>
 
     <form id="policyRoutingForm">
         <div class="form-group">
             <label class="switch-container">
                 <span class="switch">
-                    <input type="checkbox" id="policy_enabled">
+                    <input type="checkbox" id="policy_enabled" name="policy_enabled" role="switch" aria-describedby="policyDirectEgressNotice">
                     <span class="switch-slider"></span>
                 </span>
                 <span class="switch-label-text">{{ _ "policy_enable_label" }}</span>
             </label>
-            <p class="form-hint">{{ _ "policy_direct_egress_notice" }}</p>
+            <p class="form-hint" id="policyDirectEgressNotice">{{ _ "policy_direct_egress_notice" }}</p>
         </div>
 
-        <div class="form-group">
-            <span class="form-label">{{ _ "policy_preset_label" }}</span>
+        <fieldset class="form-group" style="border: 0; padding: 0; margin-inline: 0; min-width: 0;">
+            <legend class="form-label" style="padding: 0;">{{ _ "policy_preset_label" }}</legend>
             <label data-policy-preset="russia_inside" style="display: flex; gap: var(--space-sm); align-items: flex-start; padding: var(--space-sm); border: 1px solid var(--border-color); border-radius: var(--radius-sm); margin-bottom: var(--space-xs);">
                 <input type="radio" name="policy_preset" value="russia_inside" id="policy_preset_russia_inside">
                 <span>
@@ -61,26 +61,26 @@
                 </span>
             </label>
             <p class="form-hint">{{ _ "policy_preset_unavailable_note" }}</p>
-        </div>
+        </fieldset>
 
         <div class="form-group" id="policyCustomUrlsGroup" style="display: none;">
             <label class="form-label" for="policy_custom_urls">{{ _ "policy_custom_urls_label" }}</label>
-            <textarea class="form-input font-mono" id="policy_custom_urls" rows="3" placeholder="{{ _ "policy_custom_urls_placeholder" }}"></textarea>
+            <textarea class="form-input font-mono" id="policy_custom_urls" name="policy_custom_urls" rows="3" spellcheck="false" autocapitalize="none" placeholder="{{ _ "policy_custom_urls_placeholder" }}"></textarea>
         </div>
 
         <p class="form-hint">{{ _ "policy_semantics_notice" }}</p>
         <p class="form-hint">{{ _ "policy_limits_notice" }}</p>
 
-        <div style="display: flex; gap: var(--space-sm); margin-top: var(--space-md);">
+        <div style="display: flex; flex-wrap: wrap; gap: var(--space-sm); margin-top: var(--space-md);">
             <button type="submit" class="btn btn-primary" id="policySaveBtn" style="display: flex; align-items: center; gap: var(--space-sm);">
                 <svg class="icon"><use href="#icon-check"></use></svg>
                 <span id="policySaveBtnText">{{ _ "policy_save_btn" }}</span>
-                <div class="spinner hidden" id="policySaveSpinner"></div>
+                <span class="spinner hidden" id="policySaveSpinner" aria-hidden="true"></span>
             </button>
             <button type="button" class="btn btn-secondary" id="policySyncBtn" style="display: flex; align-items: center; gap: var(--space-sm);">
                 <svg class="icon"><use href="#icon-refresh"></use></svg>
                 <span id="policySyncBtnText">{{ _ "policy_sync_btn" }}</span>
-                <div class="spinner hidden" id="policySyncSpinner"></div>
+                <span class="spinner hidden" id="policySyncSpinner" aria-hidden="true"></span>
             </button>
         </div>
     </form>
