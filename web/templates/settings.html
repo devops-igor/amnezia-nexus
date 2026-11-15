@@ -1,5 +1,4 @@
 {{ define "title_extra" }} — {{ _ "nav_settings" }}{{ end }}
-
 {{ define "content" }}
 <div class="section-title">
     <span class="icon"><svg class="icon"><use href="#icon-settings"></use></svg></span>
@@ -411,6 +410,7 @@
         {{ end }}
     </div>
 </div>
+{{ template "settings_policy" . }}
 
 <div style="margin-top: var(--space-xl); display: flex; justify-content: flex-end;">
     <button class="btn btn-primary btn-lg" onclick="saveSettings()" id="saveBtn" style="display:flex; align-items:center; gap:var(--space-sm);">

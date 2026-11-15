@@ -188,6 +188,10 @@ type Service struct {
 	portalPrivKey        string
 	awgProvider          AWGStatusProvider
 	ingressEngine        *IngressEngine
+	// dnsContinuity is the gateway-address-only DNS responder that serves
+	// configurations issued while policy routing was active and survives its
+	// disablement. Guarded by mu.
+	dnsContinuity *dnsContinuityService
 	// backendDevices holds the per-backend UDP devices created by EnableBackend.
 	backendDevices         map[int64]BackendDevice
 	backendDeviceEndpoints map[int64]string

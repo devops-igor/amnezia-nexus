@@ -151,10 +151,18 @@ func RenderClientConfig(clientPrivKey string, clientIP string, serverPubKey stri
 		params = &AWGParams{}
 	}
 
+	// A single resolver renders as one DNS entry. The policy resolver is
+	// pushed as one address while policy routing is active, and duplicate
+	// entries would only add noise. Distinct resolvers keep their order.
+	dnsServers := dns1
+	if dns2 != dns1 {
+		dnsServers = dns1 + ", " + dns2
+	}
+
 	lines := []string{
 		"[Interface]",
 		fmt.Sprintf("Address = %s/32", clientIP),
-		fmt.Sprintf("DNS = %s, %s", dns1, dns2),
+		fmt.Sprintf("DNS = %s", dnsServers),
 		fmt.Sprintf("PrivateKey = %s", clientPrivKey),
 		fmt.Sprintf("MTU = %s", mtu),
 	}
