@@ -1,5 +1,17 @@
 {{ define "settings_policy" }}
 {{ if is_admin .current_user }}
+<style>
+    /* The shared --text-muted token measures 2.95:1 in the dark theme and 2.56:1
+       in the light one against a card, under the 4.5:1 minimum for body text
+       (WCAG 1.4.3). This section carries the safety text an operator has to read
+       before enabling split egress, so its hints and value labels use the
+       secondary token here. Scoped to this card: the rest of the portal keeps its
+       current rendering. */
+    #policyRoutingCard .form-hint,
+    #policyRoutingCard .info-card-label {
+        color: var(--text-secondary);
+    }
+</style>
 <div class="card settings-section-card" id="policyRoutingCard" style="margin-top: var(--space-lg);">
     <div class="settings-card-header" style="display: flex; align-items: center; justify-content: space-between;">
         <div style="display: flex; align-items: center; gap: var(--space-sm);">
