@@ -204,7 +204,7 @@ func (s *Service) continuityUpstreamsLocked(cfg PBRConfig) []policy.Upstream {
 // installPBRDNSHandlerLocked makes the policy resolver the forwarder's DNS
 // handler, replacing and closing the handler it supersedes. A configuration
 // without a gateway has no resolver to install, which is the pre-existing
-// fail-open behaviour for that impossible case. The caller holds s.mu.
+// fail-open behavior for that impossible case. The caller holds s.mu.
 func (s *Service) installPBRDNSHandlerLocked(cfg PBRConfig) {
 	if cfg.DNSGateway == nil {
 		return
