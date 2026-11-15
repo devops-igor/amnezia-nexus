@@ -170,7 +170,7 @@ jobs:
           grep -qa '__umodti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
           grep -qa '__udivti3' /usr/lib/x86_64-linux-musl/libgcc_s.so.1
 
-      # These five tests need a real host boundary the runner job cannot provide: root,
+      # These tests need a real host boundary the runner job cannot provide: root,
       # /dev/net/tun, a private network namespace, or a writable user-namespace uid_map.
       # They fail closed under CI in exactly that situation, which is correct — they must
       # never report success by skipping. They cannot run in this unprivileged job, so
@@ -183,6 +183,10 @@ jobs:
       # TestLinuxE2E_PolicyEnablement (#678) is excluded for the same reason: it needs
       # root, /dev/net/tun and CAP_NET_RAW, and it is executed by name in the
       # wan-qualification job below, so the exclusion removes no obligation.
+      # TestLinuxE2E_HTTP2OnlyEgress (#833) follows the same rule for the same reasons
+      # (root, /dev/net/tun, a private network namespace): it is executed by name in the
+      # forwarder direct-egress step of that job, which requires each of its five cases
+      # to PASS, so excluding it here moves no obligation.
 
       - name: Run Tests with Race Detector (shard ${{ matrix.shard }})
         run: |
@@ -190,7 +194,7 @@ jobs:
           echo "shard ${{ matrix.shard }} package count: $(echo "$packages" | wc -w)"
           go test -race -cover -count=1 -timeout=15m \
             -coverprofile="coverage-shard-${{ matrix.shard }}.out" \
-            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress|TestLinuxE2E_PolicyEnablement|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$' \
+            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress|TestLinuxE2E_PolicyEnablement|TestLinuxE2E_HTTP2OnlyEgress|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$' \
             $packages
 
       - name: Run Authentic Native Caddy Integration Tests
