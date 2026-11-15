@@ -120,6 +120,11 @@ type dnsContinuityHandler struct {
 
 	mu       sync.Mutex
 	sessions map[string]*dnsContinuitySession
+	// nextEpoch stamps every authority with a distinct scope identity. A
+	// replacement therefore owns a transport key of its own, so it can never
+	// inherit the retired authority's transport before that transport is
+	// closed. Guarded by mu.
+	nextEpoch uint64
 }
 
 type dnsContinuitySession struct {
@@ -232,7 +237,7 @@ func (h *dnsContinuityHandler) processJob(job dnsJob) {
 		h.retireSession(job.sessionID)
 		return
 	}
-	rt := h.runtime(job)
+	rt, superseded := h.runtime(job)
 	if rt == nil {
 		return
 	}
@@ -240,9 +245,17 @@ func (h *dnsContinuityHandler) processJob(job dnsJob) {
 	// answer for a session that no longer owns a route.
 	if h.sessionLive != nil && !h.sessionLive(job.sessionID) {
 		h.retireSession(job.sessionID)
+		for _, old := range superseded {
+			h.retireRuntime(old)
+		}
 		return
 	}
 	_, _ = h.gw.TrySubmit(rt.handle, job.packet)
+	// Retire replaced authority after the new authority has the packet, so a
+	// recovery never waits behind the old transport's teardown before serving.
+	for _, old := range superseded {
+		h.retireRuntime(old)
+	}
 }
 
 // authorityUsable reports whether a cached continuity authority can still answer
@@ -254,44 +267,51 @@ func authorityUsable(handle *gatewaydns.ScopeHandle) bool {
 }
 
 // runtime returns the reply authority of one session, creating it on first use
-// and replacing one the gateway retired while the session stayed live. The scope
-// handle carries no session cache, so the responder cannot record routing
-// evidence even though it shares the gateway transport.
-func (h *dnsContinuityHandler) runtime(job dnsJob) *dnsSessionRuntime {
+// and replacing one the gateway retired while the session stayed live. Any
+// authority it replaced is returned for the caller to retire after the new one
+// has the packet. The scope handle carries no session cache, so the responder
+// cannot record routing evidence even though it shares the gateway transport.
+func (h *dnsContinuityHandler) runtime(job dnsJob) (*dnsSessionRuntime, []*dnsSessionRuntime) {
 	now := time.Now()
+	var superseded []*dnsSessionRuntime
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.closed.Load() {
-		return nil
+		h.mu.Unlock()
+		return nil, nil
 	}
 	if sess := h.sessions[job.sessionID]; sess != nil {
 		if authorityUsable(sess.runtime.handle) {
 			sess.lastUsed = now
 			sess.runtime.writer.setTarget(job)
-			return sess.runtime
+			h.mu.Unlock()
+			return sess.runtime, nil
 		}
 		// The gateway retired this authority while the session remained live.
-		// Retire it synchronously so its canceled transport cannot be reused by
-		// the replacement (the transport is keyed by the session scope), then
-		// publish fresh authority for the same session.
-		h.retireRuntime(sess.runtime)
+		// Drop it and publish fresh authority with a new scope epoch, so the
+		// replacement can never inherit the retired authority's transport.
+		superseded = append(superseded, sess.runtime)
 		delete(h.sessions, job.sessionID)
 	} else if len(h.sessions) >= dnsContinuityMaxSessions {
-		h.evictOldestLocked()
+		if evicted := h.evictOldestLocked(); evicted != nil {
+			superseded = append(superseded, evicted)
+		}
 	}
+	h.nextEpoch++
 	writer := &pbrReplyWriter{}
 	writer.setTarget(job)
-	handle := gatewaydns.NewScopeHandle(h.ctx, policy.Scope{SessionID: job.sessionID, OwnershipEpoch: 1}, nil, writer)
+	handle := gatewaydns.NewScopeHandle(h.ctx, policy.Scope{SessionID: job.sessionID, OwnershipEpoch: h.nextEpoch}, nil, writer)
 	writer.handle.Store(handle)
 	rt := &dnsSessionRuntime{handle: handle, writer: writer}
 	h.sessions[job.sessionID] = &dnsContinuitySession{runtime: rt, lastUsed: now}
-	return rt
+	h.mu.Unlock()
+	return rt, superseded
 }
 
-// evictOldestLocked drops the least recently used session authority so the map
-// stays bounded. The caller holds h.mu, and no live session is evicted before a
+// evictOldestLocked removes and returns the least recently used session
+// authority so the map stays bounded. The caller holds h.mu and retires the
+// returned authority after releasing it. No live session is evicted before a
 // longer-idle one.
-func (h *dnsContinuityHandler) evictOldestLocked() {
+func (h *dnsContinuityHandler) evictOldestLocked() *dnsSessionRuntime {
 	var oldestID string
 	var oldestAt time.Time
 	for sessionID, sess := range h.sessions {
@@ -300,14 +320,11 @@ func (h *dnsContinuityHandler) evictOldestLocked() {
 		}
 	}
 	if oldestID == "" {
-		return
+		return nil
 	}
 	sess := h.sessions[oldestID]
 	delete(h.sessions, oldestID)
-	// Retiring cancels the scope context, so the gateway transport owned by it
-	// is torn down by its watcher; doing it under h.mu keeps only memory-only
-	// bookkeeping here. Retirement is idempotent.
-	h.retireRuntime(sess.runtime)
+	return sess.runtime
 }
 
 func (h *dnsContinuityHandler) retireSession(sessionID string) {

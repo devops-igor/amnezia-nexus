@@ -64,6 +64,12 @@ The continuity responder is deliberately not a second policy resolver:
   `94.140.14.14` then `94.140.15.15`), so an issued profile does not change
   provider when the feature is disabled.
 
+A transient failure to deliver one reply can retire the resolver authority of a
+session. For a session that is still live, the next query replaces that retired
+authority with fresh authority and closes the retired transport; a session that
+has actually retired is never revived. Recovery therefore does not depend on a
+reconnect or a new configuration download.
+
 Newly generated configurations while policy routing is inactive keep the legacy
 external defaults, as before. Steering never rewrites a file a client already
 holds.

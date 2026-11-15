@@ -408,9 +408,7 @@ func TestContinuityDNSRecoversAfterTransientTCPReturnFailure(t *testing.T) {
 				_, _ = conn.Write(body)
 
 				waitForCondition(t, "one real TCP return-path failure", func() bool { return injected.Load() == 1 })
-				waitForCondition(t, "the retired authority's transport to close", func() bool {
-					return handler.gw.ActiveTransports() == 0
-				})
+				waitForCondition(t, "the cached authority to be retired", func() bool { return oldHandle.IsRetired() })
 				t.Logf("injected=%d, authenticated route live=%v, cached authority retired=%v",
 					injected.Load(), fwd.HasLiveSession(sessionID), oldHandle.IsRetired())
 			}
@@ -453,7 +451,6 @@ func TestContinuityDNSRecoversAfterTransientTCPReturnFailure(t *testing.T) {
 
 			handler.mu.Lock()
 			current := handler.sessions[sessionID]
-			authorities := len(handler.sessions)
 			handler.mu.Unlock()
 			if current == nil {
 				t.Fatal("recovered live session lost its continuity authority")
@@ -464,6 +461,18 @@ func TestContinuityDNSRecoversAfterTransientTCPReturnFailure(t *testing.T) {
 			if inject && current.runtime.handle == oldHandle {
 				t.Fatal("recovery reused the retired authority instead of building fresh authority")
 			}
+			// Replacement retires the old authority and its transport; allow the
+			// bounded teardown to finish without making the reply assertions
+			// depend on it.
+			waitForConditionWithin(t, 15*time.Second, "replaced authority cleanup", func() bool {
+				handler.mu.Lock()
+				authorities := len(handler.sessions)
+				handler.mu.Unlock()
+				return authorities == 1 && handler.gw.ActiveTransports() <= 1 && handler.gw.ActiveSessionLimiters() <= 1
+			})
+			handler.mu.Lock()
+			authorities := len(handler.sessions)
+			handler.mu.Unlock()
 			if authorities != 1 {
 				t.Fatalf("live session owns %d continuity authorities, want 1", authorities)
 			}
@@ -549,4 +558,18 @@ func mustPackQuery(t *testing.T, name string, id uint16) []byte {
 		t.Fatalf("pack query: %v", err)
 	}
 	return body
+}
+
+// waitForConditionWithin polls cond until it holds or the budget passes. It is
+// used only for state a background owner advances (transport teardown); the
+// decisive reply assertions above do not depend on it.
+func waitForConditionWithin(t *testing.T, budget time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %s waiting for %s", budget, what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
