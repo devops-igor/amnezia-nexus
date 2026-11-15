@@ -17,13 +17,19 @@ job = "e2e-hosted"
 paths = [
   "tests/e2e/test_auth.py",
   "tests/e2e/test_settings.py",
+  "tests/e2e/test_policy_routing_ui.py",
 ]
 rationale = """
-Login, session, CSRF, captcha, settings and backup contracts are served by the
-panel binary itself. scripts/run_e2e.sh starts that binary on a temporary SQLite
-database and runs these files against it, so the hosted run is the same contract
-rather than a weaker one. It runs on every pull request; the DEV run it replaces
-only ran after merge.
+Login, session, CSRF, captcha, settings, backup and the admin policy routing
+section are served by the panel binary itself. scripts/run_e2e.sh starts that
+binary on a temporary SQLite database and runs these files against it, so the
+hosted run is the same contract rather than a weaker one. It runs on every pull
+request; the DEV run it replaces only ran after merge.
+
+The policy routing suite belongs here for the same reason: the section, its
+controller and /api/vpn/policy are all panel-side. The panel-only deployment has
+no dataplane, which is exactly what makes its refusals (failed sync, rejected
+enablement) real server answers instead of simulated ones.
 """
 
 [[runner]]
