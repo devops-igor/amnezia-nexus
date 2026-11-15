@@ -39,8 +39,10 @@ fmt:
 # checking, and a file that needs formatting has to fail rather than be fixed
 # silently. Use `make fmt` to apply the change.
 fmt-check:
-	@files="$$(git ls-files -z '*.go' | xargs -0 --no-run-if-empty gofmt -l)"; \
-		if [ -n "$$files" ]; then echo "gofmt required:"; echo "$$files"; exit 1; fi
+	@out="$$(git ls-files -z '*.go' | xargs -0 --no-run-if-empty gofmt -l 2>&1)"; \
+		status=$$?; \
+		if [ $$status -ne 0 ]; then echo "gofmt failed (exit $$status):"; echo "$$out"; exit 1; fi; \
+		if [ -n "$$out" ]; then echo "gofmt required:"; echo "$$out"; exit 1; fi
 
 vet:
 	go vet -tags with_utls ./...
