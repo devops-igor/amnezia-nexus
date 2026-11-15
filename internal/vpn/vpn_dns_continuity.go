@@ -236,12 +236,27 @@ func (h *dnsContinuityHandler) processJob(job dnsJob) {
 	if rt == nil {
 		return
 	}
+	// A session may have retired while its authority was being replaced. Never
+	// answer for a session that no longer owns a route.
+	if h.sessionLive != nil && !h.sessionLive(job.sessionID) {
+		h.retireSession(job.sessionID)
+		return
+	}
 	_, _ = h.gw.TrySubmit(rt.handle, job.packet)
 }
 
-// runtime returns the reply authority of one session, creating it on first use.
-// The scope handle carries no session cache, so the responder cannot record
-// routing evidence even though it shares the gateway transport.
+// authorityUsable reports whether a cached continuity authority can still answer
+// for its session: it has not been retired and its context is not canceled.
+// The gateway retires the handle when a reply cannot be delivered (for example
+// one recoverable return-queue failure) while the session itself stays live.
+func authorityUsable(handle *gatewaydns.ScopeHandle) bool {
+	return handle != nil && !handle.IsRetired() && handle.Context().Err() == nil
+}
+
+// runtime returns the reply authority of one session, creating it on first use
+// and replacing one the gateway retired while the session stayed live. The scope
+// handle carries no session cache, so the responder cannot record routing
+// evidence even though it shares the gateway transport.
 func (h *dnsContinuityHandler) runtime(job dnsJob) *dnsSessionRuntime {
 	now := time.Now()
 	h.mu.Lock()
@@ -250,11 +265,18 @@ func (h *dnsContinuityHandler) runtime(job dnsJob) *dnsSessionRuntime {
 		return nil
 	}
 	if sess := h.sessions[job.sessionID]; sess != nil {
-		sess.lastUsed = now
-		sess.runtime.writer.setTarget(job)
-		return sess.runtime
-	}
-	if len(h.sessions) >= dnsContinuityMaxSessions {
+		if authorityUsable(sess.runtime.handle) {
+			sess.lastUsed = now
+			sess.runtime.writer.setTarget(job)
+			return sess.runtime
+		}
+		// The gateway retired this authority while the session remained live.
+		// Retire it synchronously so its canceled transport cannot be reused by
+		// the replacement (the transport is keyed by the session scope), then
+		// publish fresh authority for the same session.
+		h.retireRuntime(sess.runtime)
+		delete(h.sessions, job.sessionID)
+	} else if len(h.sessions) >= dnsContinuityMaxSessions {
 		h.evictOldestLocked()
 	}
 	writer := &pbrReplyWriter{}
@@ -304,10 +326,14 @@ func (h *dnsContinuityHandler) retireRuntime(rt *dnsSessionRuntime) {
 	if rt == nil {
 		return
 	}
-	rt.handle.Retire()
 	if h.gw != nil {
-		h.gw.RetireScope(rt.handle.Scope)
+		// BeginRetire is synchronous: it retires the handle, releases the
+		// server scope and closes the gateway transport owned by that scope, so
+		// no canceled authority or transport outlives its replacement.
+		h.gw.BeginRetire(rt.handle)
+		return
 	}
+	rt.handle.Retire()
 }
 
 // installDNSContinuity installs the gateway-address-only responder that serves

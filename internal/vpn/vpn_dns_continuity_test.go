@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
 	mdns "github.com/miekg/dns"
 )
 
@@ -290,4 +292,261 @@ func TestDefaultPolicyUpstreamsMatchClientDNS(t *testing.T) {
 	if got, wantAddr := upstreams[1].Addr().String(), awg.AWGDefaults["dns2"]; got != wantAddr {
 		t.Fatalf("alternate upstream %s does not match the client configuration resolver %s", got, wantAddr)
 	}
+}
+
+// TestContinuityDNSRecoversAfterTransientTCPReturnFailure is the F817-03
+// regression: one recoverable return-queue failure on a TCP DNS reply retires
+// the gateway's cached authority. The session stays live, so the continuity
+// responder must replace the retired authority instead of reusing it, and later
+// UDP and TCP queries to the retained gateway address must be answered. The
+// healthy control runs the identical assertions without the injected failure.
+// No routing evidence may be produced across either sequence.
+func TestContinuityDNSRecoversAfterTransientTCPReturnFailure(t *testing.T) {
+	for _, inject := range []bool{false, true} {
+		name := "healthy-control"
+		if inject {
+			name = "one-transient-queue-full"
+		}
+		t.Run(name, func(t *testing.T) {
+			gateway := netip.MustParseAddr("10.100.0.1")
+			clientIP := netip.MustParseAddr("10.100.0.2")
+			answerIP := netip.MustParseAddr("93.184.216.36")
+			const (
+				backendID int64 = 9019
+				peerKey         = "continuity-recovery-peer"
+				sessionID       = "continuity-recovery-session"
+			)
+
+			oldResolver := newDNSContinuityResolver
+			newDNSContinuityResolver = func(gatewaydns.ResolverConfig) (gatewaydns.Resolver, error) {
+				return &mockPBRResolver{exchange: func(_ context.Context, req *mdns.Msg) (*mdns.Msg, error) {
+					resp := new(mdns.Msg)
+					resp.SetReply(req)
+					resp.Answer = append(resp.Answer, &mdns.A{
+						Hdr: mdns.RR_Header{Name: req.Question[0].Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+						A:   net.IP(answerIP.AsSlice()),
+					})
+					return resp, nil
+				}}, nil
+			}
+			defer func() { newDNSContinuityResolver = oldResolver }()
+
+			fwd := forwarder.NewForwarder(nil, "10.100.0.0/16", 64)
+			fwd.AttachBackendDevice(backendID, &mockPBRDevice{})
+			client, clientPath := newContinuityClient(t, fwd, peerKey, clientIP)
+			defer client.close()
+
+			// The session's return path injects at most one production-equivalent
+			// queue-full failure on a TCP DNS reply, then behaves normally. UDP
+			// replies are counted so a dropped continuity answer is observable.
+			var failNext atomic.Bool
+			var injected, udpReplies atomic.Int64
+			path := forwarder.NewReturnPath(func(pk, ip string, p []byte) (int, error) {
+				if len(p) >= 40 && p[9] == 6 && binary.BigEndian.Uint16(p[20:22]) == 53 && failNext.CompareAndSwap(true, false) {
+					injected.Add(1)
+					return 0, virtualtun.ErrQueueFull
+				}
+				if len(p) >= 28 && p[9] == 17 {
+					udpReplies.Add(1)
+				}
+				return clientPath.Write(pk, ip, p)
+			})
+			fwd.RegisterSessionWithReturnPath(sessionID, "continuity-recovery-connection", peerKey, clientIP.String(), backendID, path)
+
+			svc := &Service{forwarder: fwd}
+			defer svc.closeDNSContinuity()
+			cfg := newSteeringPBRConfig(t, gateway)
+			if err := svc.ConfigurePBR(cfg); err != nil {
+				t.Fatalf("ConfigurePBR failed: %v", err)
+			}
+			issued, _ := svc.clientConfigDNSServers()
+			if err := svc.TeardownPBR(); err != nil {
+				t.Fatalf("TeardownPBR failed: %v", err)
+			}
+			issuedAddr := netip.AddrPortFrom(netip.MustParseAddr(issued), 53)
+			handler, ok := fwd.DNSHandler().(*dnsContinuityHandler)
+			if !ok {
+				t.Fatal("continuity handler is not installed after disable")
+			}
+
+			// Positive control: one complete TCP DNS exchange through continuity.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			conn, err := client.stack.DialContextTCPAddrPort(ctx, issuedAddr)
+			cancel()
+			if err != nil {
+				t.Fatalf("continuity TCP dial: %v", err)
+			}
+			defer conn.Close()
+			if reply := continuityTCPQueryOnConn(t, conn, "initial.example.", 810); len(reply.Answer) != 1 {
+				t.Fatalf("initial continuity TCP query carried %d answers, want 1", len(reply.Answer))
+			}
+
+			handler.mu.Lock()
+			cached := handler.sessions[sessionID]
+			var oldHandle *gatewaydns.ScopeHandle
+			if cached != nil {
+				oldHandle = cached.runtime.handle
+			}
+			handler.mu.Unlock()
+			if oldHandle == nil {
+				t.Fatal("continuity responder cached no authority for the live session")
+			}
+
+			if inject {
+				failNext.Store(true)
+				req := new(mdns.Msg)
+				req.SetQuestion("queue-failure.example.", mdns.TypeA)
+				req.Id = 811
+				body, err := req.Pack()
+				if err != nil {
+					t.Fatalf("pack query: %v", err)
+				}
+				var lenBuf [2]byte
+				binary.BigEndian.PutUint16(lenBuf[:], uint16(len(body)))
+				_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				_, _ = conn.Write(lenBuf[:])
+				_, _ = conn.Write(body)
+
+				waitForCondition(t, "one real TCP return-path failure", func() bool { return injected.Load() == 1 })
+				waitForCondition(t, "the retired authority's transport to close", func() bool {
+					return handler.gw.ActiveTransports() == 0
+				})
+				t.Logf("injected=%d, authenticated route live=%v, cached authority retired=%v",
+					injected.Load(), fwd.HasLiveSession(sessionID), oldHandle.IsRetired())
+			}
+			if !fwd.HasLiveSession(sessionID) {
+				t.Fatal("transient return failure retired the authenticated session")
+			}
+
+			// Congestion has cleared: ordinary UDP gateway DNS on the same session.
+			before := udpReplies.Load()
+			for i := 0; i < 3; i++ {
+				req := new(mdns.Msg)
+				req.SetQuestion("after-congestion.example.", mdns.TypeA)
+				req.Id = uint16(900 + i)
+				payload, err := req.Pack()
+				if err != nil {
+					t.Fatalf("pack UDP query: %v", err)
+				}
+				packet := buildTestPBRUDPPacket(clientIP, gateway, uint16(45100+i), 53, payload)
+				if err := fwd.RouteClientToBackend(peerKey, packet); err != nil {
+					t.Fatalf("route UDP query: %v", err)
+				}
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for udpReplies.Load()-before < 3 && time.Now().Before(deadline) {
+				time.Sleep(2 * time.Millisecond)
+			}
+			if got := udpReplies.Load() - before; got != 3 {
+				handler.mu.Lock()
+				current := handler.sessions[sessionID]
+				handler.mu.Unlock()
+				same := current != nil && current.runtime.handle == oldHandle
+				t.Fatalf("after congestion cleared, later UDP gateway DNS delivered %d/3 replies; same retired handle=%v, route still live=%v",
+					got, same, fwd.HasLiveSession(sessionID))
+			}
+
+			// ... and fresh TCP DNS is usable again.
+			if reply := continuityTCPQuery(t, client.stack, issuedAddr, "recovered-tcp.example.", 950); len(reply.Answer) != 1 {
+				t.Fatalf("later TCP DNS carried %d answers, want 1", len(reply.Answer))
+			}
+
+			handler.mu.Lock()
+			current := handler.sessions[sessionID]
+			authorities := len(handler.sessions)
+			handler.mu.Unlock()
+			if current == nil {
+				t.Fatal("recovered live session lost its continuity authority")
+			}
+			if current.runtime.handle.IsRetired() {
+				t.Fatal("recovered live session still holds a retired authority")
+			}
+			if inject && current.runtime.handle == oldHandle {
+				t.Fatal("recovery reused the retired authority instead of building fresh authority")
+			}
+			if authorities != 1 {
+				t.Fatalf("live session owns %d continuity authorities, want 1", authorities)
+			}
+			if n := handler.gw.ActiveTransports(); n > 1 {
+				t.Fatalf("live session owns %d gateway transports, want at most 1", n)
+			}
+			if n := handler.gw.ActiveSessionLimiters(); n > 1 {
+				t.Fatalf("live session owns %d limiter scopes, want at most 1", n)
+			}
+
+			// Companion assertion: no routing evidence or route-cache entry was
+			// created across the whole sequence.
+			if got := cfg.RouteCache.Lookup(sessionID, answerIP); got != policy.Unknown {
+				t.Fatalf("continuity answers produced routing evidence: decision = %v, want Unknown", got)
+			}
+
+			// A genuinely dead session must still retire, never be revived.
+			fwd.BeginUnregisterSession(peerKey, sessionID).Wait()
+			if fwd.HasLiveSession(sessionID) {
+				t.Fatal("session still live after unregister")
+			}
+			repliesBefore := udpReplies.Load()
+			if handled, _ := handler.HandleDNSPacket(sessionID, peerKey, clientIP.String(), path, buildTestPBRUDPPacket(clientIP, gateway, 45999, 53, mustPackQuery(t, "dead-session.example.", 960))); !handled {
+				t.Fatal("dead-session query was not admitted for retirement")
+			}
+			time.Sleep(150 * time.Millisecond)
+			if got := udpReplies.Load(); got != repliesBefore {
+				t.Fatalf("retired session received %d replies", got-repliesBefore)
+			}
+			handler.mu.Lock()
+			remaining := len(handler.sessions)
+			handler.mu.Unlock()
+			if remaining != 0 {
+				t.Fatalf("retired session left %d continuity authorities behind", remaining)
+			}
+		})
+	}
+}
+
+// continuityTCPQueryOnConn performs one length-prefixed DNS exchange on an
+// existing TCP connection.
+func continuityTCPQueryOnConn(t *testing.T, conn net.Conn, name string, id uint16) *mdns.Msg {
+	t.Helper()
+	req := new(mdns.Msg)
+	req.SetQuestion(name, mdns.TypeA)
+	req.Id = id
+	body, err := req.Pack()
+	if err != nil {
+		t.Fatalf("pack TCP query: %v", err)
+	}
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(body)))
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(lenBuf[:]); err != nil {
+		t.Fatalf("write TCP length: %v", err)
+	}
+	if _, err := conn.Write(body); err != nil {
+		t.Fatalf("write TCP query: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		t.Fatalf("read TCP reply length: %v", err)
+	}
+	respBuf := make([]byte, binary.BigEndian.Uint16(lenBuf[:]))
+	if _, err := io.ReadFull(conn, respBuf); err != nil {
+		t.Fatalf("read TCP reply payload: %v", err)
+	}
+	resp := new(mdns.Msg)
+	if err := resp.Unpack(respBuf); err != nil {
+		t.Fatalf("unpack TCP reply: %v", err)
+	}
+	return resp
+}
+
+// mustPackQuery packs a DNS A query or fails the test.
+func mustPackQuery(t *testing.T, name string, id uint16) []byte {
+	t.Helper()
+	req := new(mdns.Msg)
+	req.SetQuestion(name, mdns.TypeA)
+	req.Id = id
+	body, err := req.Pack()
+	if err != nil {
+		t.Fatalf("pack query: %v", err)
+	}
+	return body
 }
