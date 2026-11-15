@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,10 +25,11 @@ import (
 // framed answer) traverses the real gateway, the session's return path and the
 // real reply writer instead of a mock.
 type dnsRecoveryClient struct {
-	vt   tun.Device
-	tnet *netstack.Net
-	stop chan struct{}
-	done chan struct{}
+	vt        tun.Device
+	tnet      *netstack.Net
+	stop      chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func newDNSRecoveryClient(t *testing.T, handler *pbrDNSHandler, sessionID, peerKey, assignedIP string, path *forwarder.ReturnPath) *dnsRecoveryClient {
@@ -62,13 +64,14 @@ func newDNSRecoveryClient(t *testing.T, handler *pbrDNSHandler, sessionID, peerK
 	return c
 }
 
+// Close stops the client and closes its device exactly once: the pinned
+// netstack's Close closes channels unconditionally, so a second close would
+// panic rather than be a no-op.
 func (c *dnsRecoveryClient) Close() {
-	select {
-	case <-c.stop:
-	default:
+	c.closeOnce.Do(func() {
 		close(c.stop)
-	}
-	_ = c.vt.Close()
+		_ = c.vt.Close()
+	})
 	select {
 	case <-c.done:
 	case <-time.After(5 * time.Second):
@@ -242,10 +245,51 @@ func dnsRecoveryReplyProtocol(pkt []byte) byte {
 // under: the gateway server's listeners, accept loops and connection handlers,
 // the per-transport netstack readers and per-scope limiter watchers, and the
 // queued workers of the intercepted and continuity handlers.
+//
+// The handler constructors are listed too, because a queued worker that has been
+// created but not yet scheduled prints no frame of its own to attribute; its
+// creation site is then the only ownership evidence, and taking it keeps the
+// count independent of when the runtime first runs the goroutine.
 var dnsOwnedGoroutinePrefixes = []string{
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/dns.",
 	"github.com/devops-igor/amnezia-nexus/internal/vpn.(*pbrDNSHandler).",
 	"github.com/devops-igor/amnezia-nexus/internal/vpn.(*dnsContinuityHandler).",
+	"github.com/devops-igor/amnezia-nexus/internal/vpn.newPBRDNSHandler",
+	"github.com/devops-igor/amnezia-nexus/internal/vpn.newDNSContinuityHandler",
+}
+
+// dnsOwnsStack reports whether one goroutine dump block belongs to the DNS
+// runtime.
+//
+// A frame line is matched with its symbol intact, including the receiver and
+// the argument list: the handler prefixes above contain "(*pbrDNSHandler)." and
+// "(*dnsContinuityHandler).", so truncating a symbol at its first parenthesis
+// would remove exactly the receiver the match depends on. The runtime's
+// "created by " marker is removed before matching, so a goroutine that is only
+// attributable through its creator (its own frames belonging to a dependency)
+// is counted as owned as well.
+func dnsOwnsStack(stack string) bool {
+	for _, line := range strings.Split(stack, "\n") {
+		line = strings.TrimPrefix(strings.TrimSpace(line), "created by ")
+		for _, prefix := range dnsOwnedGoroutinePrefixes {
+			if strings.HasPrefix(line, prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// dnsGoroutineStacks returns one dump block per goroutine.
+func dnsGoroutineStacks() []string {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return strings.Split(string(buf[:n]), "\n\n")
+		}
+		buf = make([]byte, 2*len(buf))
+	}
 }
 
 // dnsOwnedGoroutines counts the goroutines the DNS runtime owns, attributed by
@@ -258,39 +302,130 @@ var dnsOwnedGoroutinePrefixes = []string{
 // live transport comparable, so anything above the first one is a retirement
 // that failed to release what it replaced.
 func dnsOwnedGoroutines() int {
-	buf := make([]byte, 1<<20)
-	for {
-		n := runtime.Stack(buf, true)
-		if n < len(buf) {
-			buf = buf[:n]
-			break
-		}
-		buf = make([]byte, 2*len(buf))
-	}
+	return dnsOwnedGoroutinesMatching("")
+}
+
+// dnsOwnedGoroutinesMatching counts owned goroutines whose block contains want,
+// or every owned goroutine when want is empty.
+func dnsOwnedGoroutinesMatching(want string) int {
 	owned := 0
-	for _, stack := range strings.Split(string(buf), "\n\n") {
-		if dnsOwnsStack(stack) {
-			owned++
+	for _, stack := range dnsGoroutineStacks() {
+		if !dnsOwnsStack(stack) {
+			continue
 		}
+		if want != "" && !strings.Contains(stack, want) {
+			continue
+		}
+		owned++
 	}
 	return owned
 }
 
-func dnsOwnsStack(stack string) bool {
-	for _, line := range strings.Split(stack, "\n") {
-		// Drop arguments and file:line so only the symbol remains; "created by"
-		// lines keep their prefix, which is what the ownership check needs.
-		line = strings.TrimSpace(line)
-		if i := strings.Index(line, "("); i > 0 {
-			line = line[:i]
-		}
-		for _, prefix := range dnsOwnedGoroutinePrefixes {
-			if strings.HasPrefix(line, prefix) {
-				return true
+// dnsOwnedConnectionHandlers counts the DNS server's accepted-connection
+// handlers. The recovery oracle compares steady states, so a baseline must not
+// be sampled while one of the fixture's own TCP connections is still being
+// served: that handler occupies a slot a leaked transport goroutine could
+// otherwise hide in.
+func dnsOwnedConnectionHandlers() int {
+	return dnsOwnedGoroutinesMatching("(*Server).handleTCPConn")
+}
+
+// TestDNSOwnedGoroutineAttribution pins the symbol forms the oracle must and
+// must not attribute. Every case is a goroutine dump block in the runtime's own
+// format: frame lines carry the symbol with its receiver and arguments followed
+// by the file:line, and a creation line carries the "created by " marker and an
+// " in goroutine N" suffix.
+func TestDNSOwnedGoroutineAttribution(t *testing.T) {
+	const (
+		// Frame of the gateway's accepted-connection handler (the form
+		// runtime.Stack prints at dns/server.go:327).
+		gatewayFrame = "goroutine 103 [chan receive]:\n" +
+			"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet.(*TCPConn).Read(0xc0001e59c0, {0xc0000f0000, 0x2, 0x2}, 0x0, {0x0, 0x0})\n" +
+			"\t/go/pkg/mod/gvisor.dev/gvisor@v0.0.0-20250610212827-59e91d9b9902/pkg/tcpip/adapters/gonet/gonet.go:399 +0x40d\n" +
+			"github.com/devops-igor/amnezia-nexus/internal/vpn/dns.(*Server).handleTCPConn(0xc00023e800, 0xc00013e050, {0x22ce5f0, 0xc0001e59c0})\n" +
+			"\t/internal/vpn/dns/server.go:335 +0x2b1\n" +
+			"created by github.com/devops-igor/amnezia-nexus/internal/vpn/dns.(*Server).serveTCP in goroutine 195\n"
+		// Frame of an intercepted-DNS handler method: the receiver symbol is the
+		// only part that distinguishes it from any other package-level function.
+		handlerFrame = "goroutine 210 [select]:\n" +
+			"github.com/devops-igor/amnezia-nexus/internal/vpn.(*pbrDNSHandler).retireRuntime(0xc0000d4000, 0xc0001b2000)\n" +
+			"\t/internal/vpn/vpn_pbr_dns_handler.go:234 +0x95\n" +
+			"created by github.com/devops-igor/amnezia-nexus/internal/vpn.(*pbrDNSHandler).sessionRuntime in goroutine 195\n"
+		// A goroutine that is attributable only through its creator: its own
+		// frame belongs to the pinned netstack, and the creation line carries the
+		// runtime's "created by " marker and " in goroutine N" suffix.
+		creatorOnly = "goroutine 196 [chan receive]:\n" +
+			"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack.(*netTun).Read(0xc0000fe050, {0xc0002f4018, 0x1, 0x1}, {0xc000018168, 0x1, 0x1}, 0x0)\n" +
+			"\t/go/pkg/mod/github.com/amnezia-vpn/amneziawg-go/v3@v3.1.20260828/tun/netstack/tun.go:124 +0x71\n" +
+			"created by github.com/devops-igor/amnezia-nexus/internal/vpn/dns.(*Gateway).getOrCreateTransport in goroutine 195\n"
+		// Near misses that must stay outside the owned set: the fixture's own
+		// client goroutine (same package, different symbol) and the file:line
+		// frames, whose paths contain the package directory.
+		fixtureClient = "goroutine 34 [chan receive]:\n" +
+			"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack.(*netTun).Read(0xc0001e51d0, {0xc000126000, 0x1, 0x1}, {0xc00012a008, 0x1, 0x1}, 0x0)\n" +
+			"\t/go/pkg/mod/github.com/amnezia-vpn/amneziawg-go/v3@v3.1.20260828/tun/netstack/tun.go:124 +0x71\n" +
+			"github.com/devops-igor/amnezia-nexus/internal/vpn.newDNSRecoveryClient.func1()\n" +
+			"\t/internal/vpn/vpn_pbr_dns_recovery_test.go:50 +0x25c\n" +
+			"created by github.com/devops-igor/amnezia-nexus/internal/vpn.newDNSRecoveryClient in goroutine 8\n"
+	)
+
+	for _, tc := range []struct {
+		name  string
+		block string
+		want  bool
+	}{
+		{"gateway server frame", gatewayFrame, true},
+		{"intercepted handler method frame", handlerFrame, true},
+		{"creator-only attribution", creatorOnly, true},
+		{"fixture client is not owned", fixtureClient, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dnsOwnsStack(tc.block); got != tc.want {
+				t.Fatalf("dnsOwnsStack() = %v want %v for\n%s", got, tc.want, tc.block)
 			}
-		}
+		})
 	}
-	return false
+}
+
+// blockedHandlerTask parks in a pbrDNSHandler method until it is released, so
+// the attribution oracle can be driven with a handler-owned goroutine. Test
+// only: no production path starts this task.
+func (h *pbrDNSHandler) blockedHandlerTask(entered chan<- struct{}, release <-chan struct{}) {
+	if h == nil {
+		return
+	}
+	entered <- struct{}{}
+	<-release
+}
+
+// TestDNSOwnedGoroutinesRejectHandlerOwnedLeak is the deterministic
+// handler-owned leak regression: a goroutine parked inside an intercepted-DNS
+// handler method must be counted by the same oracle the recovery test bounds, so
+// a leaked retirement task cannot pass as an unchanged steady state.
+func TestDNSOwnedGoroutinesRejectHandlerOwnedLeak(t *testing.T) {
+	handler := newPBRDNSHandler(nil, nil, nil)
+	defer func() { _ = handler.Close() }()
+
+	baseline := dnsOwnedGoroutines()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.blockedHandlerTask(entered, release)
+	}()
+	<-entered
+	withLeak := dnsOwnedGoroutines()
+	close(release)
+	<-done
+	after := dnsOwnedGoroutines()
+
+	if withLeak != baseline+1 {
+		t.Fatalf("handler-owned goroutine counted %d owned goroutines, want %d", withLeak, baseline+1)
+	}
+	if after != baseline {
+		t.Fatalf("released handler-owned goroutine left %d owned goroutines, want %d", after, baseline)
+	}
 }
 
 // TestDNSRuntimeRecovery_TransientTCPReturnFailureKeepsLiveSession exercises the
@@ -427,21 +562,31 @@ func TestDNSRuntimeRecovery_RepeatedTransientFailuresStayBounded(t *testing.T) {
 
 	udpPacket := dnsRuntimeTestPacket(t, 17)
 	const cycles = 3
-	// baseline is measured once the session owns its first live transport, not
-	// before it: a transport legitimately costs goroutines (its netstack's
-	// scheduler, its reader, the gateway Serve tree and its limiter watcher), so
-	// a process total from a transport-less state can never be an upper bound
-	// for a state that owns one. Comparing two identical steady states makes
-	// every goroutine above the baseline a retirement that leaked what it
-	// replaced.
-	var baseline int
+	// The baseline and the final measurement are the same shape: a session that
+	// owns no gateway transport and no accepted connection. Two facts make that
+	// the only comparable shape.
+	//
+	// First, a live transport legitimately costs goroutines: with one live
+	// transport this oracle counts 8 queued workers plus 6 transport goroutines
+	// (netstack reader, Serve, Serve's closer, the accept loop, the per-scope
+	// limiter watcher and the scope watcher), so 14 against 8 with no transport,
+	// and the process total is 49 against 27 at GOMAXPROCS=16. A settled state
+	// after a recovery still owns a replacement transport, so retirement is
+	// witnessed as the absence of the retired authority's goroutines, not as a
+	// return to the pre-transport total.
+	//
+	// Second, an accepted connection costs one more handler goroutine. Sampling
+	// the baseline through an open connection would leave exactly one spare slot
+	// of the size a leaked transport reader needs, which is how a single leaked
+	// device close could fit inside an unchanged baseline. The final measurement
+	// therefore retires the session's authority first, so both measurements hold
+	// no connection and no transport, and anything still owned is a retirement
+	// that failed to release what it replaced.
+	baseline := dnsOwnedGoroutines()
 	for i := 0; i < cycles; i++ {
 		conn, closeConn := f.dial(t, client)
 		if resp := dnsRecoveryQuery(t, conn, uint16(5000+i), 5*time.Second); len(resp.Answer) != 1 {
 			t.Fatalf("cycle %d: TCP DNS answer carries %d records want 1", i, len(resp.Answer))
-		}
-		if i == 0 {
-			baseline = dnsOwnedGoroutines()
 		}
 		// The next reply fails once, retiring this transport.
 		f.failNext.Store(true)
@@ -482,6 +627,16 @@ func TestDNSRuntimeRecovery_RepeatedTransientFailuresStayBounded(t *testing.T) {
 	if n := f.gw.ActiveSessionLimiters(); n > 1 {
 		t.Fatalf("%d limiter scopes accumulated across %d recoveries", n, cycles)
 	}
+	// Quiesce the fixture's client first, then retire the session's authority, so
+	// the final measurement is the baseline's shape and no new packet enters the
+	// gateway stack while the last transport is torn down. The deferred teardown
+	// below repeats both steps harmlessly.
+	client.Close()
+	f.fwd.BeginUnregisterSession(f.peerKey, f.sessionID).Wait()
+	waitForCondition(t, "the session's DNS runtime, transport and limiter to retire", func() bool {
+		return f.handler.ActiveSessionRuntimes() == 0 && f.gw.ActiveTransports() == 0 &&
+			f.gw.ActiveSessionLimiters() == 0 && dnsOwnedConnectionHandlers() == 0
+	})
 	waitForCondition(t, "recovery cycles to leave no extra DNS-owned goroutines", func() bool {
 		return dnsOwnedGoroutines() <= baseline
 	})
