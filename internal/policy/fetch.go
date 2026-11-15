@@ -315,3 +315,34 @@ func (f *Fetcher) Fetch(ctx context.Context, reqURL string, ifNoneMatch, ifModif
 		Body:         bodyBytes,
 	}, nil
 }
+
+// SetFixtureTLSTrust installs a fixture-scoped transport seam on a Fetcher whose
+// fields are otherwise unexported.
+//
+// It exists so behavioral tests can drive the real hardened fetch pipeline (URL
+// validation, redirect limits, size and content-type guards, parsing) against a
+// local TLS listener whose certificate is not publicly trusted and whose address
+// the SSRF gate would not accept. It does NOT weaken production behavior: the
+// production constructor leaves these fields nil, and callers must pass an
+// explicitly-scoped TLS config, name resolver and dialler.
+//
+// A nil tlsCfg keeps the current configuration, so a caller cannot accidentally
+// disable verification for a fetcher that already had it configured.
+func (f *Fetcher) SetFixtureTLSTrust(
+	tlsCfg *tls.Config,
+	lookupIP func(ctx context.Context, host string) ([]netip.Addr, error),
+	dialTCP func(ctx context.Context, network, addr string) (net.Conn, error),
+) {
+	if f == nil {
+		return
+	}
+	if tlsCfg != nil {
+		f.tlsConfig = tlsCfg
+	}
+	if lookupIP != nil {
+		f.lookupIP = lookupIP
+	}
+	if dialTCP != nil {
+		f.dialTCP = dialTCP
+	}
+}

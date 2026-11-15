@@ -7,6 +7,8 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/policy"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/tunnel"
 )
 
@@ -228,4 +230,47 @@ func (s *Service) SetTunnelEndpointHookForTest(fn func(ctx context.Context, tunn
 		return
 	}
 	s.pool.SetSetTunnelEndpointHookForTest(fn)
+}
+
+// policyActivationHookForTest, when set, runs at the very start of
+// StartPolicyRouting, before any activation work. Tests in other packages install
+// it to hold one settings mutation inside its activation while a second mutation is
+// attempted, which is the schedule the settings-mutation boundary has to serialize.
+// Production leaves it nil.
+var policyActivationHookForTest func()
+
+// SetPolicyActivationHookForTest installs the activation-entry hook and returns a
+// function that restores the previous value. Test-only.
+func SetPolicyActivationHookForTest(fn func()) func() {
+	previous := policyActivationHookForTest
+	policyActivationHookForTest = fn
+	return func() { policyActivationHookForTest = previous }
+}
+
+// SetWANDeviceFactoryForTest substitutes the production WAN device constructor and
+// returns a function that restores the production one. Tests in other packages that
+// drive the real policy settings path install a mock packet device so activation can
+// proceed without a TUN capability. Test-only.
+func SetWANDeviceFactoryForTest(fn func(name string) (forwarder.PacketDevice, error)) func() {
+	previous := newProductionWANDevice
+	if fn != nil {
+		newProductionWANDevice = fn
+	}
+	return func() { newProductionWANDevice = previous }
+}
+
+// policyFetcherForTest lets tests drive the real fetch pipeline against a local
+// TLS fixture instead of a public CA. Production leaves it nil, so
+// newPolicySyncer passes a nil fetcher and policy.NewSyncer builds the hardened
+// production one from the configured limits.
+var policyFetcherForTest func(limits policy.FetchLimits) *policy.Fetcher
+
+// SetPolicySyncerForTest registers a policy syncer as the service's live policy
+// runtime, so handlers exercising the sync endpoint can drive the
+// already-running branch without a real fetch. It is test-only and exists because
+// the policy runtime registry is package-private.
+func (s *Service) SetPolicySyncerForTest(syncer *policy.Syncer, presetID string) {
+	policyRuntimeMu.Lock()
+	defer policyRuntimeMu.Unlock()
+	policyRuntimes[s] = &policyRuntime{syncer: syncer, presetID: presetID}
 }

@@ -28,6 +28,16 @@ python3 -m pytest tests/e2e/ -m e2e -v
 
 > **Note:** Set `ADMIN_PASSWORD` in your shell environment before running. Never hardcode credentials in commands or scripts.
 
+### Run the panel-only slice exactly as the hosted job does
+
+```bash
+E2E_PATHS="tests/e2e/test_auth.py tests/e2e/test_settings.py" \
+E2E_ALLOWED_SKIPS=test_login_rate_limiting \
+./scripts/run_e2e.sh
+```
+
+This builds the panel, seeds a temporary SQLite database, starts it on `127.0.0.1:8000`, runs the selected files, then reruns the rate-limit case against a server started without `E2E_TESTING`. No DEV server, SSH or dataplane is involved.
+
 ### Run a single test file
 
 ```bash
@@ -111,6 +121,24 @@ The diagnostics module uses the existing lifecycle fixture for read-only dashboa
 | `test_traffic.py` | 2 | Pre-flight docker check, live data plane verification (handshake, ping, egress NAT, revocation toggle) |
 
 **Total: 60 test functions across 11 lifecycle suites (4 in Stage 1, 4 in Stage 2, 52 in Stage 3). Parameterized cases increase the collected count; skips depend on fixture availability.**
+
+---
+
+## Which runner owns which suite
+
+The DEV runner is a single self-hosted machine. A suite belongs on it only when it needs the real deployment: clean-slate provisioning, SSH, protocol installation, client creation, packet traversal or failover. Everything else runs on a GitHub-hosted runner, where it gates pull requests instead of consuming that machine.
+
+| Runner | Check | Suites |
+| --- | --- | --- |
+| Hosted, panel-only | `Hosted Browser E2E (panel-only, no DEV)` in `ci.yml` | `test_auth.py`, `test_settings.py` |
+| Hosted, static fixture | `CSS Differential` in `css-differential.yml` | `test_css_differential.py` |
+| Live DEV, ARM64 | `DEV Server E2E Verification` in `e2e-dev.yml` | `test_setup.py`, `test_onboard.py`, `test_users.py`, `test_connections.py`, `test_my_connections.py`, `test_multiprotocol_clients.py`, `test_share.py`, `test_servers.py`, `test_vpn_diagnostics.py`, `test_traffic.py`, `test_multiprotocol_server.py` |
+
+The machine-readable version is [`runner_map.toml`](runner_map.toml), and [`tests/test_e2e_runner_map.py`](../../tests/test_e2e_runner_map.py) enforces it: every suite must be assigned exactly once, each runner must actually select the paths it claims, the DEV script may not also run a hosted suite, and a hosted suite may not acquire a live-only dependency (`E2E_SERVER_HOST`, `E2E_REQUIRE_DATAPLANE`, the provisioning or install-failure helpers).
+
+To move a suite, change `runner_map.toml` and the runner it names — in that order, or the guard fails. Do not list a suite in two runners.
+
+The hosted panel job reuses [`scripts/run_e2e.sh`](../../scripts/run_e2e.sh) with `E2E_PATHS` naming the files it is responsible for. Skips are declared by identity, not counted: `E2E_ALLOWED_SKIPS` lists the tests that may skip, and anything else fails the job. A run that collects no tests also fails, because a job that selects nothing is green without proving anything.
 
 ---
 

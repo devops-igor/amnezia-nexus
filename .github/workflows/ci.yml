@@ -86,11 +86,59 @@ jobs:
           npm install -g jsdom@29.1.1
           echo "NODE_PATH=$(npm root -g)" >> "$GITHUB_ENV"
 
-      - name: Build Caddy with forwardproxy for Naive Smoke Tests
+      # The naive fixtures need a Caddy binary with forward_proxy, and the product
+      # already ships exactly that: ghcr.io/.../naive-caddy, referenced by digest
+      # from internal/manager/naive/naive.go. CI extracts that binary instead of
+      # compiling a second one with a second forwardproxy pin, so the fixtures
+      # exercise the artifact the panel installs and the 59-82s build disappears.
+      #
+      # The reference is read from the Go source rather than repeated here: one
+      # pin, one artifact, and a bump cannot update one without the other. The
+      # pull is a few seconds of layer download, not a compile.
+      - name: Provide the shipped Caddy binary for Naive fixtures
         run: |
-          go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
-          xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@c096d6a00cb28e019cc1995b04bdc6a9311d8024 --output "$(go env GOPATH)/bin/caddy"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          SOURCE="internal/manager/naive/naive.go"
+          REPO="$(sed -n 's/.*NaiveImageRepository *= *"\([^"]*\)".*/\1/p' "$SOURCE")"
+          DIGEST="$(sed -n 's/.*NaiveImageDigest *= *"\([^"]*\)".*/\1/p' "$SOURCE")"
+          # The forwardproxy commit the panel reports as the installed plugin
+          # version. The binary has to agree with it, not just with the digest.
+          FORWARDPROXY="$(sed -n 's/.*NaiveForwardProxyCommit *= *"\([^"]*\)".*/\1/p' "$SOURCE")"
+          if [ -z "$REPO" ] || [ -z "$DIGEST" ] || [ -z "$FORWARDPROXY" ]; then
+            echo "::error::could not read the pinned naive-caddy reference from $SOURCE"
+            exit 1
+          fi
+          REF="${REPO}@${DIGEST}"
+
+          mkdir -p "$RUNNER_TEMP/caddy"
+          docker pull "$REF"
+          container="$(docker create "$REF")"
+          trap 'docker rm "$container" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container:/usr/bin/caddy" "$RUNNER_TEMP/caddy/caddy"
+          chmod +x "$RUNNER_TEMP/caddy/caddy"
+
+          # Fail closed: the fixtures need this module, and a binary that cannot
+          # list it is not the artifact the panel installs.
+          "$RUNNER_TEMP/caddy/caddy" list-modules | grep -qx "http.handlers.forward_proxy"
+
+          # The module name alone does not say which forwardproxy revision is
+          # inside. The binary records it, and the panel reports
+          # NaiveForwardProxyCommit as the installed plugin version, so a binary
+          # carrying a different revision would make a fresh install claim an
+          # update it does not need. Go pseudo-versions carry the 12-character
+          # commit prefix, so that is what is compared.
+          BUILD_INFO="$(go version -m "$RUNNER_TEMP/caddy/caddy")"
+          SHORT="${FORWARDPROXY:0:12}"
+          if ! printf '%s\n' "$BUILD_INFO" | awk -v want="$SHORT" '
+                $1 == "=>" && $2 == "github.com/klzgrad/forwardproxy" && index($3, want) { found = 1 }
+                END { exit found ? 0 : 1 }
+              '; then
+            echo "::error::the binary does not record forwardproxy ${FORWARDPROXY} as its replacement" >&2
+            printf '%s\n' "$BUILD_INFO" | awk '$1 == "=>" || /forwardproxy/' >&2
+            exit 1
+          fi
+          echo "==> Using shipped Caddy: $("$RUNNER_TEMP/caddy/caddy" version), forwardproxy ${SHORT} from ${REF}"
+          echo "$RUNNER_TEMP/caddy" >> "$GITHUB_PATH"
 
       # The musl loader comes from the same digest-pinned Alpine image as libgcc,
       # so this step no longer depends on any Ubuntu package mirror. Alpine's
@@ -132,6 +180,9 @@ jobs:
       # iptables child capability proof is one of them because it reads the capability
       # sets of a child it starts inside its own user namespace, which ordinary runners
       # refuse; its two namespace-free controls are NOT excluded and keep running here.
+      # TestLinuxE2E_PolicyEnablement (#678) is excluded for the same reason: it needs
+      # root, /dev/net/tun and CAP_NET_RAW, and it is executed by name in the
+      # wan-qualification job below, so the exclusion removes no obligation.
 
       - name: Run Tests with Race Detector (shard ${{ matrix.shard }})
         run: |
@@ -139,7 +190,7 @@ jobs:
           echo "shard ${{ matrix.shard }} package count: $(echo "$packages" | wc -w)"
           go test -race -cover -count=1 -timeout=15m \
             -coverprofile="coverage-shard-${{ matrix.shard }}.out" \
-            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$' \
+            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress|TestLinuxE2E_PolicyEnablement|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$' \
             $packages
 
       - name: Run Authentic Native Caddy Integration Tests
@@ -321,6 +372,8 @@ jobs:
             tests/test_e2e_provisioning.py \
             tests/test_e2e_prerequisites.py \
             tests/test_e2e_skip_audit.py \
+            tests/test_e2e_skip_policy.py \
+            tests/test_e2e_dev_exclusivity.py \
             tests/test_e2e_preflight.py \
             tests/test_e2e_call_timing_privacy.py \
             tests/test_e2e_timing_wiring.py \
@@ -328,7 +381,9 @@ jobs:
             tests/test_onboard_credentials.py \
             tests/test_naive_decoy_default_contract.py \
             tests/test_ci_native_dependencies.py \
-            tests/test_ci_naive_consumer_steps.py
+            tests/test_ci_shipped_caddy.py \
+            tests/test_ci_naive_consumer_steps.py \
+            tests/test_e2e_runner_map.py
 
   # The subprocess proof builds and runs the real Go panel, so it needs a
   # toolchain and cannot live in the python-only privacy gate above. It is a
@@ -497,7 +552,7 @@ jobs:
               # genuine child PASS — it is never a skip.
               exec /run/wan/vpn-wan.test \
                 -test.v -test.timeout=12m \
-                -test.run "^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$"
+                -test.run "^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_PolicyEnablement|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$"
             ' > "$LOG" 2>&1 || rc=$?
           cat "$LOG"
           # Exit status alone is not the oracle: a skip or a missing test would look
@@ -519,6 +574,7 @@ jobs:
             TestS4ProductionContainerHostWANQualification \
             TestProductionWANDevice_PermissionsAndLifecycle \
             TestWANCaptureProductionPath \
+            TestLinuxE2E_PolicyEnablement \
             TestIPTablesChild_NonRootConsumerGetsNetAdminOnly
           do
             if ! grep -qE "^--- PASS: $name " "$LOG"; then
@@ -533,6 +589,12 @@ jobs:
               exit 1
             fi
           done
+          # The #678 policy gate reports structured phases; require the disable phase so
+          # a PASS line without the administrative lifecycle cannot satisfy this step.
+          if ! grep -q 'PHASE disable-all-proxy' "$LOG"; then
+            echo "::error::the policy enablement phases are absent; the admin lifecycle is unproven"
+            exit 1
+          fi
           if ! grep -q 'S4 RESULT: PASS' "$LOG"; then
             echo "::error::the S4 verdict line is absent; the direct-WAN path is unproven"
             exit 1
@@ -607,3 +669,56 @@ jobs:
           set +e
           rm -f "$RUNNER_TEMP/vpn-wan.test" "$RUNNER_TEMP/fwd-wan.test"
           echo "cleanup complete (namespaces were process-scoped)"
+
+  # Panel-only browser contracts. These need the panel binary and a browser, but
+  # no deployment, SSH, protocol installation or dataplane, so they must not
+  # occupy the single self-hosted DEV runner. The live lifecycle suites stay in
+  # e2e-dev.yml; tests/e2e/runner_map.toml records which runner owns which file,
+  # and tests/test_e2e_runner_map.py fails if the two ever disagree.
+  e2e-hosted:
+    name: Hosted Browser E2E (panel-only, no DEV)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # No Playwright on the jobs that only need Python or Go: the browser and
+      # its system libraries are installed here and nowhere else.
+      - name: Install test prerequisites
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r tests/e2e/requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run panel-only browser contracts
+        env:
+          E2E_PATHS: tests/e2e/test_auth.py tests/e2e/test_settings.py
+          # The one expected skip, named by identity rather than counted: the
+          # rate-limit case is skipped while E2E_TESTING is on, and run_e2e.sh
+          # then reruns it against a server started without the flag and requires
+          # it to pass. Any other skip fails, and so does collecting nothing.
+          E2E_ALLOWED_SKIPS: test_login_rate_limiting
+        run: ./scripts/run_e2e.sh
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-hosted-failure-artifacts
+          path: |
+            tests/e2e/screenshots/
+            test-artifacts/e2e-diagnostics/
+          retention-days: 14
+          if-no-files-found: warn

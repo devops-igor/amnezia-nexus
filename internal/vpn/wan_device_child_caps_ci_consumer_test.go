@@ -481,9 +481,10 @@ func TestIPTablesChildCapabilityProofWANStepRejectsTheRetiredQuoting(t *testing.
 
 // TestIPTablesChildCapabilityProofWANStepRejectsUnprovenVerdicts requires the step to
 // fail when the staged binary does not prove what the step demands: a nonzero process
-// status, a skipped required test, a skipped required subtest, or a required test that
-// reports no verdict at all. Without this, the launch could be repaired and a missing
-// or skipped proof would still leave the required job green.
+// status, a skipped required test, a skipped required subtest, a required test that
+// reports no verdict at all, or a log with every verdict but without the policy
+// enablement phases the step now requires. Without this, the launch could be repaired
+// and a missing or skipped proof would still leave the required job green.
 func TestIPTablesChildCapabilityProofWANStepRejectsUnprovenVerdicts(t *testing.T) {
 	block := childCapsJobLines(t, childCapsWorkflowLines(t), "wan-qualification")
 	script := childCapsStepScript(t, block, childCapsWANStep)
@@ -495,6 +496,10 @@ func TestIPTablesChildCapabilityProofWANStepRejectsUnprovenVerdicts(t *testing.T
 		marker string
 	}{
 		{"fail", "::error::the qualification process exited 1"},
+		// A PASS log without the policy enablement phases is the exact shape a
+		// registered-but-not-executed policy gate produces, and it must fail closed
+		// with the phase error rather than fall through to the exit-status check.
+		{"omit-phase", "::error::the policy enablement phases are absent"},
 		{"skip", "::error::a required WAN test or subtest SKIPPED"},
 		{"omit-child", "::error::required test did not report PASS: " + childCapsPositiveTest},
 		{"skip-subtest", "::error::required subtest did not report PASS: TestWANCaptureProductionPath/positive"},
@@ -613,6 +618,16 @@ while read -r name; do
   echo "=== RUN   $name"
   echo "--- PASS: $name (1.00s)"
 done < "$FI_DIR/verdict-names.txt"
+# A genuine complete pass of the ./internal/vpn selection includes the policy
+# enablement child's phase markers; the step requires the disable phase, so a
+# stand-in that never emits them does not represent a complete pass.
+if [ "$mode" != omit-phase ]; then
+  echo "PHASE settings-persisted"
+  echo "PHASE activation-enabled"
+  echo "PHASE restart-restored"
+  echo "PHASE disable-all-proxy"
+  echo "PHASE negatives-hold"
+fi
 echo "S4 RESULT: PASS"
 if [ "$mode" = fail ]; then exit 1; fi
 exit 0

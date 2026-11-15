@@ -40,6 +40,12 @@ _COMMAND_WRAPPERS = frozenset({"sudo", "command", "exec", "env"})
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # A YAML step key ("run:" or "- run:") precedes the shell command.
 _RUN_KEY_RE = re.compile(r"^\s*(?:-\s*)?run:\s*")
+# The panel harness selects suites through E2E_PATHS and forwards them to pytest.
+# That is a real selection, but only where the same job executes the harness, so
+# the value is read only from text whose command segment runs the script.
+_E2E_PATHS_RE = re.compile(r"^\s*E2E_PATHS:\s*(.+)$", re.MULTILINE)
+# A top-level job key, used to keep E2E_PATHS and its invocation in one job.
+_JOB_KEY_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$", re.MULTILINE)
 
 
 def _logical_lines(text: str) -> list[str]:
@@ -59,6 +65,39 @@ def _logical_lines(text: str) -> list[str]:
     return lines
 
 
+def _command_tokens(segment: str) -> list[str]:
+    """Return tokens from the command word onward.
+
+    Control-flow words, variable assignments, wrappers and leading flags are
+    consumed first, so ``sudo -E FOO=1 python3 -m pytest`` resolves to
+    ``python3``. An unreadable segment yields no tokens, which the callers treat
+    as "not an invocation" — the safe direction.
+    """
+    try:
+        tokens = shlex.split(segment, comments=False)
+    except ValueError:
+        return []
+
+    index = 0
+    while index < len(tokens) and tokens[index] in _COMMAND_PREFIXES:
+        index += 1
+    while index < len(tokens) and (
+        tokens[index] in _COMMAND_WRAPPERS
+        or _ASSIGNMENT_RE.match(tokens[index])
+        or tokens[index].startswith("-")
+    ):
+        index += 1
+    return tokens[index:]
+
+
+def _segments(text: str):
+    """Yield the command segments of a text, with run keys and continuations handled."""
+    for line in _logical_lines(text):
+        # A workflow step writes `run: pytest ...`; the key is not the command.
+        line = _RUN_KEY_RE.sub("", line, count=1)
+        yield from _SEGMENT_RE.split(line)
+
+
 def _invokes_pytest(segment: str) -> bool:
     """Return whether this command segment actually runs pytest.
 
@@ -70,28 +109,37 @@ def _invokes_pytest(segment: str) -> bool:
     safe direction: an unparsed real invocation shows up as an unwired suite and
     fails the guard, whereas a parsed mention would hide one.
     """
-    try:
-        tokens = shlex.split(segment, comments=False)
-    except ValueError:
+    tokens = _command_tokens(segment)
+    if not tokens:
         return False
+    if tokens[0] == "pytest":
+        return True
+    return tokens[0] in ("python", "python3") and tokens[1:3] == ["-m", "pytest"]
 
-    index = 0
-    while index < len(tokens) and tokens[index] in _COMMAND_PREFIXES:
-        index += 1
-    while index < len(tokens) and (
-        tokens[index] in _COMMAND_WRAPPERS
-        or _ASSIGNMENT_RE.match(tokens[index])
-        or tokens[index].startswith("-")
-    ):
-        index += 1
 
-    if index >= len(tokens):
+def _runs_script(segment: str, script: str) -> bool:
+    """Return whether this command segment executes ``script``.
+
+    Executes, not mentions: ``echo ./scripts/run_e2e.sh`` runs echo. A shell
+    wrapper is accepted (``bash -e ./scripts/run_e2e.sh``) because it still runs
+    the script, and its own exit status is the segment's.
+    """
+    tokens = _command_tokens(segment)
+    if not tokens:
         return False
-    if tokens[index] == "pytest":
+    if tokens[0].endswith(script):
         return True
-    if tokens[index] in ("python", "python3") and tokens[index + 1 : index + 3] == ["-m", "pytest"]:
-        return True
+    if tokens[0] in ("bash", "sh"):
+        for token in tokens[1:]:
+            if token.startswith("-"):
+                continue
+            return token.endswith(script)
     return False
+
+
+def invokes_script(text: str, script: str = "scripts/run_e2e.sh") -> bool:
+    """Return whether this text executes ``script`` anywhere."""
+    return any(_runs_script(segment, script) for segment in _segments(text))
 
 
 def selections_from_text(text: str) -> set[str]:
@@ -101,12 +149,42 @@ def selections_from_text(text: str) -> set[str]:
     echo, a comment, an artifact upload or prose is not a selection.
     """
     found: set[str] = set()
-    for line in _logical_lines(text):
-        # A workflow step writes `run: pytest ...`; the key is not the command.
-        line = _RUN_KEY_RE.sub("", line, count=1)
-        for segment in _SEGMENT_RE.split(line):
-            if _invokes_pytest(segment):
-                found.update(_TEST_PATH_RE.findall(segment))
+    for segment in _segments(text):
+        if _invokes_pytest(segment):
+            found.update(_TEST_PATH_RE.findall(segment))
+    return found
+
+
+def _job_blocks(text: str) -> list[str]:
+    """Split a workflow into its top-level job blocks.
+
+    E2E_PATHS is job-scoped, so the harness invocation that gives it meaning has
+    to be in the same job; otherwise a mention in one job would cover a
+    selection declared in another.
+    """
+    matches = list(_JOB_KEY_RE.finditer(text))
+    if not matches:
+        return [text]
+    blocks = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        blocks.append(text[match.start() : end])
+    return blocks
+
+
+def harness_selections_from_text(text: str) -> set[str]:
+    """Return suites a workflow hands to the shared harness via E2E_PATHS.
+
+    An E2E_PATHS value on its own is a mention: it selects nothing unless the
+    same job actually runs ``scripts/run_e2e.sh``, which is what forwards it to
+    pytest. Both facts are read from the text, so neither has to be trusted.
+    """
+    found: set[str] = set()
+    for block in _job_blocks(text):
+        if not invokes_script(block):
+            continue
+        for match in _E2E_PATHS_RE.finditer(block):
+            found.update(_TEST_PATH_RE.findall(match.group(1)))
     return found
 
 
@@ -127,8 +205,11 @@ def _selected_patterns() -> set[str]:
     scripts/run_e2e_lifecycle.sh rather than in the workflow.
     """
     patterns: set[str] = set()
-    sources = sorted(WORKFLOWS.glob("*.yml")) + sorted(SCRIPTS.glob("*.sh"))
-    for source in sources:
+    for workflow in sorted(WORKFLOWS.glob("*.yml")):
+        text = workflow.read_text(encoding="utf-8")
+        patterns |= selections_from_text(text)
+        patterns |= harness_selections_from_text(text)
+    for source in sorted(SCRIPTS.glob("*.sh")):
         patterns |= selections_from_text(source.read_text(encoding="utf-8"))
     return patterns
 
@@ -234,3 +315,39 @@ def test_globs_are_preserved() -> None:
     assert selections_from_text("python -m pytest tests/test_arch*.py\n") == {
         "tests/test_arch*.py"
     }
+
+
+def test_harness_env_selection_counts_only_when_the_harness_runs() -> None:
+    """E2E_PATHS is a selection only where run_e2e.sh consumes it."""
+    selection = "E2E_PATHS: tests/e2e/test_auth.py tests/e2e/test_settings.py\n"
+    assert harness_selections_from_text(selection) == set()
+
+    with_harness = selection + "run: ./scripts/run_e2e.sh\n"
+    assert harness_selections_from_text(with_harness) == {
+        "tests/e2e/test_auth.py",
+        "tests/e2e/test_settings.py",
+    }
+
+
+def test_a_mention_of_the_harness_is_not_an_invocation() -> None:
+    """`echo ./scripts/run_e2e.sh` names the harness but runs echo."""
+    assert not invokes_script("run: echo ./scripts/run_e2e.sh\n")
+    assert not invokes_script("run: true && echo scripts/run_e2e.sh\n")
+    assert invokes_script("run: ./scripts/run_e2e.sh\n")
+    assert invokes_script("run: bash -e scripts/run_e2e.sh\n")
+
+
+def test_harness_env_selection_requires_an_invocation_in_the_same_job() -> None:
+    """E2E_PATHS in one job is not covered by a harness mention in another."""
+    mentioned = """\
+jobs:
+  e2e-hosted:
+    steps:
+      - run: |
+          E2E_PATHS: tests/e2e/test_auth.py
+      - run: echo ./scripts/run_e2e.sh
+"""
+    assert harness_selections_from_text(mentioned) == set()
+
+    executed = mentioned.replace("echo ./scripts/run_e2e.sh", "./scripts/run_e2e.sh")
+    assert harness_selections_from_text(executed) == {"tests/e2e/test_auth.py"}

@@ -101,30 +101,46 @@ fi
 echo "==> Server is healthy!"
 
 # 5. Run Playwright E2E suite
-echo "==> Running Playwright E2E tests..."
+#
+# E2E_PATHS selects what this invocation is responsible for, space separated and
+# relative to the repository root. The default is the whole directory. It exists
+# because a caller cannot narrow the selection with extra arguments: the
+# directory argument is already present, so passing a file inside it collects
+# that file twice instead of replacing it.
+E2E_PATHS="${E2E_PATHS:-tests/e2e/}"
+E2E_TARGETS=()
+for path in $E2E_PATHS; do
+    E2E_TARGETS+=("$REPO_ROOT/$path")
+done
+
+selection_includes_test_auth() {
+    local target
+    for target in "${E2E_TARGETS[@]}"; do
+        case "$target" in
+            */tests/e2e/|*/tests/e2e/test_auth.py) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+echo "==> Running Playwright E2E tests: ${E2E_PATHS}"
 E2E_LOG="$TMP_DIR/e2e_pytest.log"
-pytest "$REPO_ROOT/tests/e2e/" -m e2e -v -rs "$@" 2>&1 | tee "$E2E_LOG"
+E2E_JUNIT="$TMP_DIR/e2e_junit.xml"
+pytest "${E2E_TARGETS[@]}" -m e2e -v -rs --junitxml="$E2E_JUNIT" "$@" 2>&1 | tee "$E2E_LOG"
 
-# Verify skip count does not exceed expected threshold (baseline: 5 skips)
-MAX_EXPECTED_SKIPS="${MAX_EXPECTED_SKIPS:-5}"
-python3 -c "
-import re, sys
+# A skip is a declared outcome, not a silent pass. E2E_ALLOWED_SKIPS names the
+# tests that may skip; an undeclared skip fails, and so does collecting nothing.
+# Counting skips alone would accept any one skip, including a real regression
+# hiding behind a missing prerequisite.
+echo "==> Verifying skips against the declared policy..."
+python3 "$SCRIPT_DIR/check_e2e_skips.py" \
+    --junit "$E2E_JUNIT" \
+    --allowed "${E2E_ALLOWED_SKIPS:-}"
 
-with open('$E2E_LOG', 'r') as f:
-    text = f.read()
-
-match = re.search(r'(\d+)\s+skipped', text)
-skips = int(match.group(1)) if match else 0
-max_skips = int('$MAX_EXPECTED_SKIPS')
-
-print(f'==> E2E Skip Count Check: {skips} skipped tests detected (maximum allowed: {max_skips})')
-if skips > max_skips:
-    print(f'ERROR: Number of skipped tests ({skips}) exceeds allowed baseline ({max_skips})', file=sys.stderr)
-    sys.exit(1)
-"
-
-# 6. If running default suite, also verify rate limiting on dedicated server instance
-if [ "$#" -eq 0 ]; then
+# 6. Also verify rate limiting against a server started without E2E_TESTING.
+# Only when the selection includes test_auth.py: the default directory does, a
+# narrower hosted selection may not.
+if [ "$#" -eq 0 ] && selection_includes_test_auth; then
     echo "==> Verifying login rate-limiting test against rate-limited server..."
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
@@ -137,7 +153,15 @@ if [ "$#" -eq 0 ]; then
         exit 1
     fi
 
-    pytest "$REPO_ROOT/tests/e2e/test_auth.py::test_login_rate_limiting" -m e2e -v -rs
+    RERUN_JUNIT="$TMP_DIR/e2e_rate_limit_junit.xml"
+    pytest "$REPO_ROOT/tests/e2e/test_auth.py::test_login_rate_limiting" \
+        -m e2e -v -rs --junitxml="$RERUN_JUNIT"
+
+    # The rerun exists to prove the test runs; a skip here means the flag was
+    # still on and nothing was verified.
+    python3 "$SCRIPT_DIR/check_e2e_skips.py" \
+        --junit "$RERUN_JUNIT" \
+        --require-passed test_login_rate_limiting
 fi
 
 echo "==> All E2E verification successfully completed!"
