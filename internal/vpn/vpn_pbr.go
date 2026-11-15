@@ -126,8 +126,11 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 		return errors.New("vpn: forwarder unavailable")
 	}
 
-	// Default to disabled
+	// Default to disabled. Configurations already issued while policy routing
+	// was active keep naming the gateway, so the gateway-address-only
+	// continuity responder is installed before the classifier is turned off.
 	if !cfg.Enabled {
+		s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(cfg.GatewayDNSIP))
 		s.forwarder.SetPBREnabled(false)
 		if dem := s.forwarder.DirectEgress(); dem != nil {
 			_ = dem.Close()
@@ -138,6 +141,9 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 
 	// Validate prerequisites before enabling PBR
 	if err := ValidatePBRPrerequisites(cfg); err != nil {
+		// A refused activation is a transition to disabled: keep issued
+		// gateway profiles served rather than stranding them.
+		s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(cfg.GatewayDNSIP))
 		s.forwarder.SetPBREnabled(false)
 		return fmt.Errorf("pbr prerequisites: %w", err)
 	}
@@ -503,15 +509,30 @@ func (s *Service) ObserveDNSObservation(sessionID string, ip netip.Addr, decisio
 
 func (s *Service) deriveDefaultGatewayDNSIP() netip.Addr {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.deriveGatewayDNSIPLocked()
+}
+
+// pbrGatewayDNSAddrLocked returns the gateway DNS address issued configurations
+// name: the configured address when valid, otherwise the subnet gateway. The
+// caller holds s.mu.
+func (s *Service) pbrGatewayDNSAddrLocked(configured netip.Addr) netip.Addr {
+	if validGatewayDNSAddr(configured) {
+		return configured
+	}
+	return s.deriveGatewayDNSIPLocked()
+}
+
+// deriveGatewayDNSIPLocked derives the gateway DNS address from the service
+// subnet. The caller holds s.mu for reading or writing.
+func (s *Service) deriveGatewayDNSIPLocked() netip.Addr {
 	subnet := ""
-	if s.cfg != nil {
+	if s != nil && s.cfg != nil {
 		subnet = s.cfg.SubnetCIDR
 	}
-	s.mu.RUnlock()
 	if subnet != "" {
-		if prefix, err := netip.ParsePrefix(subnet); err == nil {
-			addr := prefix.Addr()
-			b := addr.As4()
+		if prefix, err := netip.ParsePrefix(subnet); err == nil && prefix.Addr().Is4() {
+			b := prefix.Addr().As4()
 			b[3] = 1
 			return netip.AddrFrom4(b)
 		}
@@ -520,12 +541,8 @@ func (s *Service) deriveDefaultGatewayDNSIP() netip.Addr {
 }
 
 func initDefaultDNSGateway(gwDNS netip.Addr, matcher *policy.Matcher, rc forwarder.RouteCache) *gatewaydns.Gateway {
-	upstreams := []netip.AddrPort{
-		netip.MustParseAddrPort("1.1.1.1:53"),
-		netip.MustParseAddrPort("8.8.8.8:53"),
-	}
 	resolver, err := gatewaydns.NewUpstreamResolver(gatewaydns.ResolverConfig{
-		Upstreams: upstreams,
+		Upstreams: defaultPolicyUpstreams(),
 	})
 	if err != nil {
 		return nil
@@ -541,8 +558,9 @@ func initDefaultDNSGateway(gwDNS netip.Addr, matcher *policy.Matcher, rc forward
 		obs = ro
 	}
 	gw, err := gatewaydns.NewGateway(gatewaydns.GatewayConfig{
-		Gateway:       netip.AddrPortFrom(gwDNS, 53),
-		RouteObserver: obs,
+		Gateway:                  netip.AddrPortFrom(gwDNS, 53),
+		RouteObserver:            obs,
+		InterceptAllDestinations: true,
 	}, dnsSrv)
 	if err != nil {
 		return nil
@@ -687,12 +705,15 @@ func (s *Service) TeardownPBR() error {
 	if s.forwarder == nil {
 		return nil
 	}
-	if oldH := s.forwarder.DNSHandler(); oldH != nil {
-		if closer, ok := oldH.(io.Closer); ok {
-			_ = closer.Close()
-		}
+	// Configurations issued while policy routing was active keep the gateway as
+	// their only resolver. Teardown of the classifier and direct egress is
+	// unchanged; only the gateway-address-only DNS responder persists, and
+	// installing it replaces and closes the active policy resolver.
+	addr := netip.Addr{}
+	if pbrCfg != nil {
+		addr = pbrCfg.GatewayDNSIP
 	}
-	s.forwarder.SetDNSHandler(nil)
+	s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(addr))
 	s.forwarder.SetPBREnabled(false)
 	if dem := s.forwarder.DirectEgress(); dem != nil {
 		_ = dem.Close()
