@@ -90,9 +90,11 @@ type GatewayConfig struct {
 	// permitted IPv4 destination on port 53, not only queries addressed to
 	// Gateway. It is enabled only for the policy resolver of an active
 	// policy-routing session: UDP replies are built from the queried address,
-	// and TCP queries are translated onto the gateway address and their
-	// replies translated back. While policy routing is inactive the gateway
-	// is not installed, and this flag must stay false.
+	// and every TCP connection is translated onto its own internal connection
+	// so replies are rewritten back to the exact client/resolver tuple that
+	// queried. While the gateway-address-only continuity service serves issued
+	// configurations after policy routing is disabled, this flag stays false
+	// and only queries addressed to Gateway are answered.
 	InterceptAllDestinations bool
 }
 
@@ -215,7 +217,7 @@ func (g *Gateway) getOrCreateTransport(scope *ScopeHandle) (*gatewayTCPTransport
 			if n > 0 && sizes[0] > 0 {
 				pkt := make([]byte, sizes[0])
 				copy(pkt, buf[0][:sizes[0]])
-				rewritten, ok := tr.nat.inbound(pkt, g.cfg.Gateway.Addr(), time.Now())
+				rewritten, ok := tr.nat.inbound(pkt, g.cfg.Gateway, time.Now())
 				if !ok {
 					continue
 				}
@@ -357,19 +359,11 @@ func (g *Gateway) TrySubmit(scope *ScopeHandle, ipv4Packet []byte) (handled bool
 		if err != nil {
 			return true, nil
 		}
-		pkt := ipv4Packet
-		if foreignDestination {
-			rewritten, ok := tr.nat.outbound(ipv4Packet, ihl, g.cfg.Gateway.Addr(), time.Now())
-			if !ok {
-				// A packet that cannot be translated is dropped rather than
-				// delivered to the wrong destination.
-				return true, nil
-			}
-			pkt = rewritten
-		} else {
-			// A flow that targets the gateway must not inherit a translation
-			// recorded for an earlier intercepted foreign resolver.
-			tr.nat.forgetFlow(ipv4Packet, ihl)
+		pkt, ok := tr.nat.outbound(ipv4Packet, ihl, g.cfg.Gateway, time.Now())
+		if !ok {
+			// A packet that cannot be translated is dropped rather than
+			// delivered to the wrong destination.
+			return true, nil
 		}
 		tr.mu.Lock()
 		if tr.closed.Load() {

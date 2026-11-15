@@ -7,18 +7,27 @@ import (
 	"time"
 )
 
-// Intercepted TCP DNS needs an address translation that UDP does not: the
-// gateway's netstack only terminates connections addressed to the gateway
-// address, so a query to a foreign resolver must be rewritten to the gateway on
-// the way in and rewritten back to the queried resolver on the way out. The
-// translation is keyed by the client flow's source address and retained only
-// while that flow is alive, bounded by dnsTCPNATMaxEntries per session.
+// Intercepted TCP DNS needs more than an address rewrite: the gateway's
+// netstack terminates connections on the gateway address and identifies a
+// connection by both endpoints. Two original client connections may legally
+// share the client address and port while addressing different resolvers, so a
+// destination-only rewrite would collapse them onto one internal connection and
+// one reply would appear from the wrong resolver.
+//
+// Every intercepted TCP DNS connection therefore receives its own internal
+// source port from a small bounded range. The netstack sees a distinct
+// connection for every original client/resolver tuple, and a reply is
+// reverse-mapped from the internal port back to exactly the tuple that produced
+// it. The table is per session, capped by dnsTCPNATMaxEntries and expired by
+// dnsTCPNATIdleTimeout; a live connection is never overwritten by another
+// connection's translation.
 
 const (
 	// dnsTCPNATMaxEntries bounds the per-session TCP DNS translations that
-	// interception retains. One entry is one client TCP flow; a client that
-	// opens more concurrent connections ages the oldest entries out instead
-	// of growing the session's state without bound.
+	// interception retains. One entry is one original client/resolver
+	// connection; a client that opens more concurrent connections ages the
+	// oldest entries out instead of growing the session's state without
+	// bound.
 	dnsTCPNATMaxEntries = 256
 
 	// dnsTCPNATIdleTimeout is how long an idle translation is retained. TCP
@@ -26,25 +35,48 @@ const (
 	// the next translation that needs room and ignored on lookup, so a stale
 	// translation can never rewrite an unrelated later reply.
 	dnsTCPNATIdleTimeout = 60 * time.Second
+
+	// dnsTCPNATTranslatedPortBase is the first internal source port allocated
+	// for an intercepted TCP DNS connection.
+	dnsTCPNATTranslatedPortBase = 20000
+
+	// dnsTCPNATTranslatedPortSpan is the size of the internal port range. It
+	// must equal dnsTCPNATMaxEntries: a distinct internal connection identity
+	// for every live translation needs one unique port per entry.
+	dnsTCPNATTranslatedPortSpan = dnsTCPNATMaxEntries
 )
 
-type dnsTCPNAT struct {
-	mu      sync.Mutex
-	entries map[netip.AddrPort]*dnsTCPNATTranslation
+// dnsTCPNATKey is the original connection tuple a translation stands for. The
+// resolver is part of the key because the same client endpoint may address
+// several resolvers at the same time.
+type dnsTCPNATKey struct {
+	client   netip.AddrPort
+	resolver netip.AddrPort
 }
 
 type dnsTCPNATTranslation struct {
-	destination netip.AddrPort
-	lastSeen    time.Time
+	key      dnsTCPNATKey
+	lastSeen time.Time
 }
 
-// outbound records the flow's real destination and rewrites the packet so the
-// gateway netstack terminates it on the gateway address. It returns the packet
-// unchanged (and forgets any translation) when the flow already targets the
-// gateway, and reports false for a packet that cannot be safely rewritten
-// (fragmented or malformed), which the caller must drop rather than forward to
-// the wrong destination.
-func (n *dnsTCPNAT) outbound(packet []byte, ihl int, gateway netip.Addr, now time.Time) ([]byte, bool) {
+type dnsTCPNAT struct {
+	mu sync.Mutex
+	// byInternal maps the internal source port the netstack sees to the
+	// original tuple it represents.
+	byInternal map[uint16]*dnsTCPNATTranslation
+	// byOriginal maps an original tuple to its internal port, so every packet
+	// of one connection reuses the same internal identity.
+	byOriginal map[dnsTCPNATKey]uint16
+	// nextPort rotates the allocation cursor so freed ports are reused fairly.
+	nextPort int
+}
+
+// outbound rewrites an intercepted TCP DNS packet so the gateway netstack
+// terminates it on the gateway address with a connection identity unique to the
+// original client/resolver tuple. It reports false for a packet that cannot be
+// translated safely (fragmented or malformed), which the caller must drop rather
+// than deliver to the wrong destination.
+func (n *dnsTCPNAT) outbound(packet []byte, ihl int, gateway netip.AddrPort, now time.Time) ([]byte, bool) {
 	if ihl < 20 || len(packet) < ihl+20 {
 		return nil, false
 	}
@@ -52,28 +84,24 @@ func (n *dnsTCPNAT) outbound(packet []byte, ihl int, gateway netip.Addr, now tim
 	if !ok || fragmentedIPv4(packet) {
 		return nil, false
 	}
-	srcIP := ipv4Addr(packet, 12)
-	dstIP := ipv4Addr(packet, 16)
-	srcPort := binary.BigEndian.Uint16(packet[ihl : ihl+2])
-	key := netip.AddrPortFrom(srcIP, srcPort)
-
-	if dstIP == gateway {
-		n.forget(key)
-		return packet, true
+	key := dnsTCPNATKey{
+		client:   netip.AddrPortFrom(ipv4Addr(packet, 12), binary.BigEndian.Uint16(packet[ihl:ihl+2])),
+		resolver: netip.AddrPortFrom(ipv4Addr(packet, 16), binary.BigEndian.Uint16(packet[ihl+2:ihl+4])),
 	}
-	rewritten, ok := rewriteIPv4Endpoints(packet, ihl, totalLen, srcIP, gateway)
+	internalPort, ok := n.internalPort(key, now)
 	if !ok {
 		return nil, false
 	}
-	n.remember(key, netip.AddrPortFrom(dstIP, 53), now)
-	return rewritten, true
+	return rewriteTCPEndpoints(packet, ihl, totalLen,
+		key.client.Addr(), internalPort,
+		gateway.Addr(), gateway.Port())
 }
 
-// inbound rewrites the source of a reply emitted by the gateway netstack back
-// to the address the client originally queried. A packet that is not a TCP
-// reply from the gateway, or that has no live translation, is returned
+// inbound rewrites a reply emitted by the gateway netstack back to the exact
+// client/resolver tuple its internal connection represents. A packet that is not
+// a TCP reply from the gateway, or whose translation expired, is returned
 // unchanged; a translation that cannot be applied drops the packet.
-func (n *dnsTCPNAT) inbound(packet []byte, gateway netip.Addr, now time.Time) ([]byte, bool) {
+func (n *dnsTCPNAT) inbound(packet []byte, gateway netip.AddrPort, now time.Time) ([]byte, bool) {
 	if len(packet) < 20 || packet[0]>>4 != 4 {
 		return packet, true
 	}
@@ -82,88 +110,117 @@ func (n *dnsTCPNAT) inbound(packet []byte, gateway netip.Addr, now time.Time) ([
 	if !ok || packet[9] != 6 || fragmentedIPv4(packet) {
 		return packet, true
 	}
-	if ipv4Addr(packet, 12) != gateway {
-		return packet, true
-	}
-	if binary.BigEndian.Uint16(packet[ihl:ihl+2]) != 53 {
+	if ipv4Addr(packet, 12) != gateway.Addr() || binary.BigEndian.Uint16(packet[ihl:ihl+2]) != gateway.Port() {
 		return packet, true
 	}
 
-	clientKey := netip.AddrPortFrom(ipv4Addr(packet, 16), binary.BigEndian.Uint16(packet[ihl+2:ihl+4]))
-	destination, ok := n.lookup(clientKey, now)
+	internalPort := binary.BigEndian.Uint16(packet[ihl+2 : ihl+4])
+	key, ok := n.original(internalPort, now)
 	if !ok {
 		return packet, true
 	}
-	rewritten, ok := rewriteIPv4Endpoints(packet, ihl, totalLen, destination.Addr(), clientKey.Addr())
-	if !ok {
-		return nil, false
-	}
-	return rewritten, true
+	return rewriteTCPEndpoints(packet, ihl, totalLen,
+		key.resolver.Addr(), key.resolver.Port(),
+		key.client.Addr(), key.client.Port())
 }
 
-func (n *dnsTCPNAT) remember(key, destination netip.AddrPort, now time.Time) {
+// internalPort returns the internal port reserved for an original tuple,
+// allocating one when the tuple is new. A live sibling translation is never
+// overwritten: when the table is at capacity the oldest entry is evicted first
+// and the caller keeps every live tuple distinct up to that bound.
+func (n *dnsTCPNAT) internalPort(key dnsTCPNATKey, now time.Time) (uint16, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.entries == nil {
-		n.entries = make(map[netip.AddrPort]*dnsTCPNATTranslation, 8)
+	if n.byInternal == nil {
+		n.byInternal = make(map[uint16]*dnsTCPNATTranslation, 8)
+		n.byOriginal = make(map[dnsTCPNATKey]uint16, 8)
 	}
-	if _, exists := n.entries[key]; !exists && len(n.entries) >= dnsTCPNATMaxEntries {
+	if port, ok := n.byOriginal[key]; ok {
+		if entry := n.byInternal[port]; entry != nil && now.Sub(entry.lastSeen) <= dnsTCPNATIdleTimeout {
+			entry.lastSeen = now
+			return port, true
+		}
+		n.dropLocked(port)
+	}
+	if len(n.byInternal) >= dnsTCPNATMaxEntries {
 		n.evictLocked(now)
 	}
-	n.entries[key] = &dnsTCPNATTranslation{destination: destination, lastSeen: now}
+	port, ok := n.allocateLocked()
+	if !ok {
+		return 0, false
+	}
+	n.byInternal[port] = &dnsTCPNATTranslation{key: key, lastSeen: now}
+	n.byOriginal[key] = port
+	return port, true
 }
 
-func (n *dnsTCPNAT) lookup(key netip.AddrPort, now time.Time) (netip.AddrPort, bool) {
+// original resolves an internal port back to its original tuple.
+func (n *dnsTCPNAT) original(port uint16, now time.Time) (dnsTCPNATKey, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	entry := n.entries[key]
+	entry := n.byInternal[port]
 	if entry == nil {
-		return netip.AddrPort{}, false
+		return dnsTCPNATKey{}, false
 	}
 	if now.Sub(entry.lastSeen) > dnsTCPNATIdleTimeout {
-		delete(n.entries, key)
-		return netip.AddrPort{}, false
+		n.dropLocked(port)
+		return dnsTCPNATKey{}, false
 	}
 	entry.lastSeen = now
-	return entry.destination, true
+	return entry.key, true
 }
 
-func (n *dnsTCPNAT) forget(key netip.AddrPort) {
-	n.mu.Lock()
-	delete(n.entries, key)
-	n.mu.Unlock()
+// allocateLocked reserves a port that no live translation uses. The caller holds
+// n.mu and has ensured the table has room.
+func (n *dnsTCPNAT) allocateLocked() (uint16, bool) {
+	for i := 0; i < dnsTCPNATTranslatedPortSpan; i++ {
+		port := uint16(dnsTCPNATTranslatedPortBase + (n.nextPort+i)%dnsTCPNATTranslatedPortSpan)
+		if _, used := n.byInternal[port]; !used {
+			n.nextPort = (n.nextPort + i + 1) % dnsTCPNATTranslatedPortSpan
+			return port, true
+		}
+	}
+	return 0, false
 }
 
-// forgetFlow drops any translation recorded for the client flow that produced
-// packet. A flow that now targets the gateway itself must not inherit a
-// translation recorded while it targeted a foreign resolver, or its reply would
-// be rewritten to an address the client is no longer talking to. Malformed
-// packets simply have no translation to forget.
-func (n *dnsTCPNAT) forgetFlow(packet []byte, ihl int) {
-	if ihl < 20 || len(packet) < ihl+4 {
+// dropLocked removes one translation and its reverse entry. The caller holds
+// n.mu.
+func (n *dnsTCPNAT) dropLocked(port uint16) {
+	entry := n.byInternal[port]
+	if entry == nil {
 		return
 	}
-	n.forget(netip.AddrPortFrom(ipv4Addr(packet, 12), binary.BigEndian.Uint16(packet[ihl:ihl+2])))
+	if current, ok := n.byOriginal[entry.key]; ok && current == port {
+		delete(n.byOriginal, entry.key)
+	}
+	delete(n.byInternal, port)
 }
 
 // evictLocked removes expired translations first and the oldest remaining one
 // when the session is still at capacity. The caller holds n.mu.
 func (n *dnsTCPNAT) evictLocked(now time.Time) {
-	var oldestKey netip.AddrPort
+	var oldestPort uint16
 	var oldestAt time.Time
-	for key, entry := range n.entries {
+	for port, entry := range n.byInternal {
 		if now.Sub(entry.lastSeen) > dnsTCPNATIdleTimeout {
-			delete(n.entries, key)
+			n.dropLocked(port)
 			continue
 		}
 		if oldestAt.IsZero() || entry.lastSeen.Before(oldestAt) {
-			oldestKey = key
+			oldestPort = port
 			oldestAt = entry.lastSeen
 		}
 	}
-	if len(n.entries) >= dnsTCPNATMaxEntries && !oldestAt.IsZero() {
-		delete(n.entries, oldestKey)
+	if len(n.byInternal) >= dnsTCPNATMaxEntries && !oldestAt.IsZero() {
+		n.dropLocked(oldestPort)
 	}
+}
+
+// size reports the number of retained translations, for bounded-state tests.
+func (n *dnsTCPNAT) size() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return len(n.byInternal)
 }
 
 func ipv4TotalLength(packet []byte, ihl int) (int, bool) {
@@ -189,10 +246,10 @@ func ipv4Addr(packet []byte, offset int) netip.Addr {
 	return netip.AddrFrom4([4]byte{packet[offset], packet[offset+1], packet[offset+2], packet[offset+3]})
 }
 
-// rewriteIPv4Endpoints writes the new source and destination addresses into a
-// copy of the packet and recomputes the IPv4 and TCP checksums over the new
-// pseudo-header. Trailing bytes beyond the IP total length are preserved.
-func rewriteIPv4Endpoints(packet []byte, ihl, totalLen int, src, dst netip.Addr) ([]byte, bool) {
+// rewriteTCPEndpoints writes new addresses and ports into a copy of the packet
+// and recomputes the IPv4 and TCP checksums over the new pseudo-header. Trailing
+// bytes beyond the IP total length are preserved.
+func rewriteTCPEndpoints(packet []byte, ihl, totalLen int, src netip.Addr, srcPort uint16, dst netip.Addr, dstPort uint16) ([]byte, bool) {
 	if totalLen < ihl+20 || totalLen > len(packet) {
 		return nil, false
 	}
@@ -206,6 +263,8 @@ func rewriteIPv4Endpoints(packet []byte, ihl, totalLen int, src, dst netip.Addr)
 	dstBytes := dst.As4()
 	copy(out[12:16], srcBytes[:])
 	copy(out[16:20], dstBytes[:])
+	binary.BigEndian.PutUint16(out[ihl:ihl+2], srcPort)
+	binary.BigEndian.PutUint16(out[ihl+2:ihl+4], dstPort)
 
 	out[10], out[11] = 0, 0
 	binary.BigEndian.PutUint16(out[10:12], calculateChecksum(out[:ihl]))

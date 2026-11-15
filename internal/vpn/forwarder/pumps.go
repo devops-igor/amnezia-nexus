@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"context"
+	"encoding/binary"
 	"net"
 	"net/netip"
 	"time"
@@ -52,10 +53,51 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 	}
 
 	if !f.pbrEnabled.Load() {
+		// Configurations issued while policy routing was active name the
+		// gateway address as their only resolver. A gateway-address-only
+		// responder keeps serving them after disablement, while external
+		// port 53 keeps its previous routing.
+		if handled, err := f.handleLegacyGatewayDNS(route, peerKey, packet); handled {
+			return err
+		}
 		return f.routeClientLegacy(route, packet, pktLen)
 	}
 
 	return f.routeClientPBR(route, peerKey, packet, pktLen)
+}
+
+// handleLegacyGatewayDNS submits a gateway-addressed port-53 packet to the
+// installed DNS handler while policy routing is inactive. Only the designated
+// gateway address is matched, so external port-53 traffic keeps its previous
+// routing; anything else falls through to the legacy path unchanged. The check
+// is deliberately cheap because this is the default path for every client
+// packet when policy routing is off; the handler and the gateway perform the
+// full validation of an admitted packet.
+func (f *Forwarder) handleLegacyGatewayDNS(route *sessionRoute, peerKey string, packet []byte) (bool, error) {
+	f.mu.RLock()
+	handler := f.dnsHandler
+	gwDNS := f.gatewayDNSIP
+	f.mu.RUnlock()
+	if handler == nil || !gwDNS.IsValid() {
+		return false, nil
+	}
+	if len(packet) < 20 || (packet[0]>>4) != 4 {
+		return false, nil
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	if len(packet) < ihl+4 {
+		return false, nil
+	}
+	if proto := packet[9]; proto != 6 && proto != 17 {
+		return false, nil
+	}
+	if binary.BigEndian.Uint16(packet[ihl+2:ihl+4]) != 53 {
+		return false, nil
+	}
+	if netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]}) != gwDNS {
+		return false, nil
+	}
+	return handler.HandleDNSPacket(route.sessionID, peerKey, route.assignedIP, route.returnPath, packet)
 }
 
 func (f *Forwarder) routeClientLegacy(route *sessionRoute, packet []byte, pktLen int64) error {

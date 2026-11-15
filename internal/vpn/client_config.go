@@ -311,9 +311,10 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 // inactive the existing external resolvers are kept unchanged.
 //
 // A configuration downloaded while policy routing was active keeps the gateway
-// address after deactivation; those queries then follow the ordinary tunnel
-// path and are not answered by the policy resolver. Policy routing must be
-// re-enabled, or the configuration re-downloaded, for steering to resume.
+// address after deactivation. A gateway-address-only continuity responder keeps
+// answering that address over UDP and TCP, so the issued profile stays usable;
+// the continuity responder records no routing evidence, so its answers can never
+// grant a direct path.
 func (s *Service) clientConfigDNSServers() (string, string) {
 	dns1 := awg.AWGDefaults["dns1"]
 	dns2 := awg.AWGDefaults["dns2"]

@@ -81,6 +81,57 @@ func TestDNSInterception_ProhibitedDestinationIsNotIntercepted(t *testing.T) {
 	}
 }
 
+// TestDNSInterception_LegacyServesGatewayDNSOnly proves the continuity contract
+// at the forwarder boundary: while policy routing is inactive the installed
+// responder is consulted only for the designated gateway address on port 53.
+// External port 53 keeps its legacy path and never reaches the responder.
+func TestDNSInterception_LegacyServesGatewayDNSOnly(t *testing.T) {
+	fwd := NewForwarder(nil, "10.100.0.0/16", 100)
+	fwd.SetPBREnabled(false)
+	gateway := netip.MustParseAddr("10.100.0.1")
+	fwd.SetGatewayDNSIP(gateway)
+
+	backendID := int64(304)
+	fwd.AttachBackendDevice(backendID, newMockPacketDev())
+
+	handler := &recordingDNSHandler{}
+	fwd.SetDNSHandler(handler)
+
+	peerKey := "peer-dns-legacy"
+	clientIP := "10.100.0.28"
+	path := newTestCaptureReturnPath()
+	fwd.RegisterSessionWithReturnPath("s-dns-legacy", "c-dns-legacy", peerKey, clientIP, backendID, path.path)
+
+	cases := []struct {
+		name          string
+		dst           netip.Addr
+		dstPort       uint16
+		wantIntercept bool
+	}{
+		{"gateway resolver", gateway, 53, true},
+		{"external resolver", netip.MustParseAddr("8.8.8.8"), 53, false},
+		{"gateway non-dns port", gateway, 443, false},
+	}
+
+	for i, tc := range cases {
+		queuedBefore := len(fwd.backendQueues[backendID])
+		callsBefore := handler.calls.Load()
+		pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), tc.dst, uint16(44000+i), tc.dstPort, []byte("payload"))
+		if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
+			t.Fatalf("%s: route failed: %v", tc.name, err)
+		}
+		intercepted := handler.calls.Load() == callsBefore+1
+		if intercepted != tc.wantIntercept {
+			t.Fatalf("%s: intercepted=%v, want %v", tc.name, intercepted, tc.wantIntercept)
+		}
+		if queued := len(fwd.backendQueues[backendID]) - queuedBefore; intercepted && queued != 0 {
+			t.Fatalf("%s: intercepted packet was also queued toward the backend", tc.name)
+		} else if !intercepted && queued != 1 {
+			t.Fatalf("%s: non-intercepted packet was not queued toward the backend", tc.name)
+		}
+	}
+}
+
 // TestDNSInterception_ActivePolicyInterceptsPort53Only proves that while policy
 // routing is active every plain DNS packet is submitted to the policy resolver
 // whatever its destination, while other ports keep their ordinary routing.

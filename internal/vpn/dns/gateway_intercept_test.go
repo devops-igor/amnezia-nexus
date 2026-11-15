@@ -444,43 +444,64 @@ func TestGateway_InactiveGatewayDoesNotIntercept(t *testing.T) {
 	}
 }
 
-// TestDNSTCPNAT_GatewayFlowForgetsForeignTranslation proves a client flow that
-// switches back to the gateway address drops the translation recorded for its
-// earlier foreign resolver, so its reply can never be rewritten to an address
-// the client is no longer talking to.
-func TestDNSTCPNAT_GatewayFlowForgetsForeignTranslation(t *testing.T) {
-	gwIP := netip.MustParseAddr("10.8.0.1")
-	clientIP := netip.MustParseAddr("10.8.0.2")
-	foreignResolver := netip.MustParseAddr("9.9.9.9")
-
-	snap := compileTestSnapshot(t, "", "198.51.200.0/24")
-	gw := newInterceptGateway(t, snap, foreignDNSResolver(t, 300, map[string]string{}), gwIP)
-
-	_, sess := setupTestSession(t, snap.Generation())
-	writer := &mockReplyWriter{}
-	scope := NewScopeHandle(context.Background(), policy.Scope{SessionID: "sess-observe", OwnershipEpoch: 1}, sess, writer)
-	defer gw.BeginRetire(scope)
-
+// TestDNSTCPNAT_DistinctResolversKeepDistinctConnections proves two original
+// TCP connections that share the client endpoint but address different
+// resolvers receive different internal connection identities, keep their own
+// reverse mapping, and include a gateway-addressed sibling: no translation
+// overwrites or clears another live one.
+func TestDNSTCPNAT_DistinctResolversKeepDistinctConnections(t *testing.T) {
+	client := netip.MustParseAddr("10.8.0.2")
+	gateway := netip.AddrPortFrom(netip.MustParseAddr("10.8.0.1"), 53)
+	first := netip.MustParseAddr("8.8.8.8")
+	second := netip.MustParseAddr("9.9.9.9")
 	const clientPort = 40010
-	if handled, err := gw.TrySubmit(scope, buildIPv4TCPPacket(clientIP, clientPort, foreignResolver, 53, false)); !handled || err != nil {
-		t.Fatalf("foreign TCP query was not intercepted: handled=%v err=%v", handled, err)
+	now := time.Now()
+	var nat dnsTCPNAT
+
+	originals := []netip.Addr{first, second, gateway.Addr()}
+	translated := make([]netip.AddrPort, 0, len(originals))
+	for _, resolver := range originals {
+		out, ok := nat.outbound(buildIPv4TCPPacket(client, clientPort, resolver, 53, false), 20, gateway, now)
+		if !ok {
+			t.Fatalf("outbound translation to %s failed", resolver)
+		}
+		internal := netip.AddrPortFrom(ipv4Addr(out, 12), binary.BigEndian.Uint16(out[20:22]))
+		translated = append(translated, internal)
+		if got := netip.AddrPortFrom(ipv4Addr(out, 16), binary.BigEndian.Uint16(out[22:24])); got != gateway {
+			t.Fatalf("translated destination = %s, want %s", got, gateway)
+		}
 	}
-	gw.mu.Lock()
-	tr := gw.transports[scope.Scope]
-	gw.mu.Unlock()
-	if tr == nil {
-		t.Fatal("interception did not create a TCP transport")
-	}
-	key := netip.AddrPortFrom(clientIP, clientPort)
-	if _, ok := tr.nat.lookup(key, time.Now()); !ok {
-		t.Fatal("expected the foreign flow to record a translation")
+	for i := range translated {
+		for j := i + 1; j < len(translated); j++ {
+			if translated[i] == translated[j] {
+				t.Fatalf("original connections to %s and %s collapsed onto internal tuple %s",
+					originals[i], originals[j], translated[i])
+			}
+		}
 	}
 
-	if handled, err := gw.TrySubmit(scope, buildIPv4TCPPacket(clientIP, clientPort, gwIP, 53, false)); !handled || err != nil {
-		t.Fatalf("gateway TCP query was not handled: handled=%v err=%v", handled, err)
+	// Every reply must return to the exact original client/resolver tuple.
+	for i, resolver := range originals {
+		reply := buildIPv4TCPPacket(gateway.Addr(), gateway.Port(), translated[i].Addr(), translated[i].Port(), false)
+		back, ok := nat.inbound(reply, gateway, now)
+		if !ok {
+			t.Fatalf("inbound translation for %s was dropped", resolver)
+		}
+		if got := netip.AddrPortFrom(ipv4Addr(back, 12), binary.BigEndian.Uint16(back[20:22])); got != netip.AddrPortFrom(resolver, 53) {
+			t.Fatalf("reply source = %s, want queried resolver %s:53", got, resolver)
+		}
+		if got := netip.AddrPortFrom(ipv4Addr(back, 16), binary.BigEndian.Uint16(back[22:24])); got != netip.AddrPortFrom(client, clientPort) {
+			t.Fatalf("reply destination = %s, want original client endpoint %s:%d", got, client, clientPort)
+		}
 	}
-	if dest, ok := tr.nat.lookup(key, time.Now()); ok {
-		t.Fatalf("gateway-directed flow kept a stale translation to %s", dest)
+
+	// Another packet of the same original connection reuses its identity.
+	again, ok := nat.outbound(buildIPv4TCPPacket(client, clientPort, first, 53, false), 20, gateway, now)
+	if !ok {
+		t.Fatal("retransmission translation failed")
+	}
+	if got := binary.BigEndian.Uint16(again[20:22]); got != translated[0].Port() {
+		t.Fatalf("retransmission used internal port %d, want %d", got, translated[0].Port())
 	}
 }
 
@@ -524,21 +545,30 @@ func buildIPv4TCPPacket(srcIP netip.Addr, srcPort uint16, dstIP netip.Addr, dstP
 // bounded and that stale entries are discarded.
 func TestDNSTCPNAT_BoundsTranslations(t *testing.T) {
 	now := time.Now()
+	client := netip.MustParseAddr("10.8.0.2")
 	var nat dnsTCPNAT
 	for i := 0; i < dnsTCPNATMaxEntries+50; i++ {
-		key := netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, 8, 0, 2}), uint16(1024+i))
-		nat.remember(key, netip.AddrPortFrom(netip.MustParseAddr("8.8.8.8"), 53), now)
+		key := dnsTCPNATKey{
+			client:   netip.AddrPortFrom(client, uint16(1024+i)),
+			resolver: netip.AddrPortFrom(netip.MustParseAddr("8.8.8.8"), 53),
+		}
+		if _, ok := nat.internalPort(key, now); !ok {
+			t.Fatalf("translation %d could not be allocated", i)
+		}
 	}
-	nat.mu.Lock()
-	size := len(nat.entries)
-	nat.mu.Unlock()
-	if size > dnsTCPNATMaxEntries {
+	if size := nat.size(); size > dnsTCPNATMaxEntries {
 		t.Fatalf("translation table grew past its bound: %d", size)
 	}
 
-	expiredKey := netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, 8, 0, 3}), 5555)
-	nat.remember(expiredKey, netip.AddrPortFrom(netip.MustParseAddr("1.1.1.1"), 53), now)
-	if _, ok := nat.lookup(expiredKey, now.Add(2*dnsTCPNATIdleTimeout)); ok {
+	expired := dnsTCPNATKey{
+		client:   netip.AddrPortFrom(netip.MustParseAddr("10.8.0.3"), 5555),
+		resolver: netip.AddrPortFrom(netip.MustParseAddr("1.1.1.1"), 53),
+	}
+	port, ok := nat.internalPort(expired, now)
+	if !ok {
+		t.Fatal("expired-case translation could not be allocated")
+	}
+	if _, ok := nat.original(port, now.Add(2*dnsTCPNATIdleTimeout)); ok {
 		t.Fatal("expected an idle translation to expire")
 	}
 }

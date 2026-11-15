@@ -43,24 +43,41 @@ configuration is never pointed at a resolver that is not running.
 Distinct resolvers keep their existing order and formatting, so inactive
 configurations are byte-identical to the previous output.
 
-### Already-downloaded configurations
+### Issued configurations after disablement
 
 A configuration downloaded while policy routing was active keeps the gateway
-address after policy routing is disabled. Those clients continue to send plain
-DNS to the tunnel gateway, but the policy resolver is not installed while
-policy routing is inactive, so the queries follow the ordinary tunnel path
-toward the backend and are answered there only if the backend serves DNS on the
-tunnel gateway address. In practice the client must re-download its
-configuration (or policy routing must be re-enabled) for DNS to be answered by
-the policy resolver again. Steering only affects newly generated
-configurations; it never rewrites a file a client already holds.
+address after policy routing is disabled, and that address keeps answering. The
+gateway-address-only continuity responder
+(`internal/vpn/vpn_dns_continuity.go`) serves it over UDP and TCP for as long as
+the panel runs, independent of the policy classifier. `TeardownPBR`, a refused
+activation, and service start with policy routing disabled all install it as the
+forwarder's DNS handler.
+
+The continuity responder is deliberately not a second policy resolver:
+
+- It answers only queries addressed to the gateway DNS address. External port 53
+  is not intercepted while policy routing is inactive.
+- It is constructed without a policy source and without a route observer, so its
+  answers create no routing observation and can never grant `Direct`. An issued
+  profile keeps resolving while disabled and stays fail-closed for routing.
+- It resolves through the same upstream pair as the policy resolver (AdGuard
+  `94.140.14.14` then `94.140.15.15`), so an issued profile does not change
+  provider when the feature is disabled.
+
+Newly generated configurations while policy routing is inactive keep the legacy
+external defaults, as before. Steering never rewrites a file a client already
+holds.
 
 ## 3. Plain-DNS interception
 
-Interception exists only while policy routing is active. `Forwarder.SetPBREnabled`
-selects between the legacy and the policy-routed path; the DNS handler is
-installed by `ConfigurePBR` and removed by `TeardownPBR`. With policy routing
-inactive, port-53 traffic keeps its previous routing and no handler exists.
+Interception of arbitrary port-53 destinations exists only while policy routing
+is active. `Forwarder.SetPBREnabled` selects between the legacy and the
+policy-routed path. `ConfigurePBR` installs the all-destination policy handler;
+`TeardownPBR` replaces it with the gateway-address-only continuity responder
+described above, which does not intercept external port 53 and records no
+evidence. With policy routing inactive the legacy path consults that responder
+only for the designated gateway address on port 53; every other packet keeps its
+previous routing.
 
 ### Where a packet is matched
 
@@ -76,10 +93,18 @@ destination address, **after** the prohibited-destination guard has run:
 3. Non-TCP/UDP protocols still take the proxy fallback.
 4. Port 53 on either TCP or UDP is submitted to the policy resolver.
 
+While policy routing is inactive, `Forwarder.routeClientToBackend` admits one
+narrow class to the continuity responder through `handleLegacyGatewayDNS`: an
+IPv4 UDP or TCP packet that the strict ingress parser accepts and that is
+addressed to the designated gateway address on port 53. Anything else —
+including every external port-53 destination — continues down the unchanged
+legacy route.
+
 `gatewaydns.Gateway.TrySubmit` then handles the packet. Queries addressed to
 the gateway are unchanged. A foreign destination is handled only when the
 gateway was built with `InterceptAllDestinations`, which production enables
-exactly for the policy resolver installed while policy routing is active.
+exactly for the policy resolver installed while policy routing is active; the
+continuity responder is built without it.
 
 ### UDP replies
 
@@ -90,25 +115,28 @@ translation state is needed.
 
 ### TCP replies
 
-The gateway's netstack transport only terminates connections addressed to the
-gateway. For a foreign TCP destination the gateway applies an address
-translation (`internal/vpn/dns/gateway_nat.go`):
+The gateway's netstack terminates TCP connections on the gateway address and
+identifies each connection by its local and remote endpoints. Two client
+connections may legally share the client address and port while addressing
+different resolvers, so a destination-only rewrite would collapse them onto one
+internal connection. Every intercepted TCP DNS connection therefore receives its
+own internal source port from a small bounded range
+(`internal/vpn/dns/gateway_nat.go`):
 
-- **Outbound** (client to netstack): the destination address is rewritten to
-  the gateway address and the IPv4 and TCP checksums are recomputed. The
-  translation is recorded against the client flow's source address and port.
-- **Inbound** (netstack to client): a reply whose source is the gateway
-  address and port 53 is rewritten back to the address the client originally
-  queried, with both checksums recomputed.
+- **Outbound** (client to netstack): the original client/resolver tuple is keyed,
+  an internal port is allocated when the tuple is new, and the packet is
+  rewritten to `client:internal-port -> gateway:53` with the IPv4 and TCP
+  checksums recomputed.
+- **Inbound** (netstack to client): the internal port identifies the exact
+  original tuple and the reply is rewritten back to
+  `resolver:53 -> client:original-port`, with both checksums recomputed.
 
-Translations are per session, bounded to 256 entries, and discarded after 60
-seconds of idleness; a new translation for the same client flow replaces the
-old one. Fragmented TCP packets cannot be translated safely and are dropped.
-A flow that later targets the gateway address itself clears any translation it
-recorded for an earlier foreign resolver, so a reply is only ever rewritten to
-the address the client actually queried. The gateway address response and a
-translated response are therefore indistinguishable to the client, and an
-unmodified DNS client accepts both.
+A later packet of the same connection reuses its internal identity. Entries are
+per session, capped at 256, discarded after 60 seconds of idleness, and evicted
+oldest-first only when the cap is reached; another connection's mapping never
+overwrites or clears a live sibling translation. Fragmented or malformed packets
+are dropped rather than translated. Replies therefore always appear from the
+resolver the client queried, and an unmodified DNS client accepts them.
 
 ### Observations
 
@@ -131,5 +159,8 @@ the session lifetime and never visible to another session.
   observed.
 - **TTL-zero answers produce no evidence** for unmatched destinations, the
   existing conservative rule; matched destinations still record `Proxy`.
+- **Continuity answers are not evidence.** While policy routing is inactive the
+  gateway-address responder answers DNS but records no observation, so issued
+  profiles resolve and continue to proxy until policy routing is enabled again.
 - **Prohibited destinations are not intercepted.** The existing
   prohibited-destination drop runs before interception and is not weakened.

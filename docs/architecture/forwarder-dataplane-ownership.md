@@ -109,11 +109,14 @@ from the presence of a queue:
 While policy routing is active, one class of client-to-backend traffic has no
 egress decision of its own: plain DNS is submitted to the policy resolver so the
 client's own answers become routing evidence. That decision is made in the
-forwarder and at exactly one point, `routeClientPBR` (`pumps.go`); no ingress
-listener, route or device owner intercepts port 53. `SetPBREnabled` selects this
-path over the legacy route, so interception exists only while policy routing is
-enabled: `ConfigurePBR` installs the handler, `TeardownPBR` removes it, and
-neither leaves an interception owner behind.
+forwarder: `routeClientPBR` (`pumps.go`) submits arbitrary port-53 destinations,
+and `handleLegacyGatewayDNS` submits only the designated gateway address while
+the legacy route is selected. No ingress listener, route or device owner
+intercepts port 53. `SetPBREnabled` selects the policy path over the legacy
+route, so interception of arbitrary destinations exists only while policy
+routing is enabled: `ConfigurePBR` installs the all-destination handler, and
+`TeardownPBR` replaces it with a gateway-address-only continuity handler that
+never intercepts external port 53 and records no evidence.
 
 - **Ordering.** IPv4 port 53 is submitted after the prohibited-destination check
   (`ValidateDirectDestination`) and after the non-TCP/UDP proxy fallback, and
@@ -122,15 +125,23 @@ neither leaves an interception owner behind.
   one into an answer or an egress path. A packet the handler inspects but does
   not handle continues through the unchanged decision steps; a handled packet
   returns before any of them.
+- **Inactive path.** With policy routing disabled, `handleLegacyGatewayDNS`
+  admits only IPv4 UDP/TCP packets addressed to the designated gateway address
+  on port 53 to the installed continuity handler, and only after the strict
+  ingress parser accepts the packet. Every other packet, including all external
+  port-53 traffic, keeps the unchanged legacy route.
 - **UDP replies.** The reply is built from the queried address and port 53, so an
   unmodified client accepts the answer as coming from the resolver it chose. UDP
   interception retains no per-flow state.
-- **TCP replies.** A foreign TCP DNS flow is translated onto the gateway address
-  on the way in and back to the queried resolver on the way out, with both
+- **TCP replies.** Every intercepted TCP DNS connection is translated onto its
+  own internal connection: the original client/resolver tuple is reverse-mapped
+  to a unique internal source port in a bounded range, so two connections that
+  share the client endpoint but address different resolvers stay distinct inside
+  the netstack. Replies are rewritten back to the exact original tuple, with both
   checksums recomputed. The translation is per-session bounded state
-  (`gateway_nat.go` in `internal/vpn/dns/`): one entry per client flow, capped at
-  256 entries and discarded after 60 seconds of idleness, so a session cannot grow
-  it without bound and a stale translation cannot rewrite a later reply.
+  (`gateway_nat.go` in `internal/vpn/dns/`): one entry per original connection,
+  capped at 256 entries and discarded after 60 seconds of idleness, so a session
+  cannot grow it without bound and a live sibling is never overwritten.
 - **Resolver reuse.** The forwarder only snapshots the handler reference under
   `Forwarder.mu` and submits the packet; classification and route-cache
   observation stay in the gateway resolver and are unchanged. The forwarder adds
