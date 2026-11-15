@@ -191,6 +191,8 @@ func TestBackendIdentityRotation_UnchangedKeyNoOp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This service owns the backend device and its return-path reader.
+	t.Cleanup(func() { releaseFixtureVPNService(t, svc) })
 	h.vpnSvc = svc
 
 	if err = svc.EnableBackend(ctx, id); err != nil {
@@ -244,14 +246,32 @@ func TestBackendIdentityRotation_DisabledBackend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This service owns the backend device and its return-path reader.
+	t.Cleanup(func() { releaseFixtureVPNService(t, svc) })
 	h.vpnSvc = svc
 
-	// Start enabled then administratively disable it
+	// Start enabled then administratively disable it. Capture the device the
+	// disable must close: DisableBackend deletes it from the service's map, so
+	// looking it up afterwards returns nil whether or not it was closed.
 	if err = svc.EnableBackend(ctx, id); err != nil {
 		t.Fatal(err)
 	}
+	enabledTun, err := svc.GetTunnel(id)
+	if err != nil || enabledTun == nil {
+		t.Fatalf("GetTunnel after enable: %v", err)
+	}
+	dev := svc.GetBackendDeviceForTest(enabledTun.ID)
+	if dev == nil {
+		t.Fatal("the enabled backend owns no device, so the closure assertion would prove nothing")
+	}
+	if dev.IsClosed() {
+		t.Fatal("the backend device is already closed before the administrative disable")
+	}
 	if err = svc.DisableBackend(ctx, id); err != nil {
 		t.Fatal(err)
+	}
+	if !dev.IsClosed() {
+		t.Fatalf("administrative disable left backend device %d open", enabledTun.ID)
 	}
 
 	r := setupFullServerRouter(h)
@@ -312,6 +332,8 @@ func TestBackendIdentityRotation_ReconciliationFailureRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This service owns the backend device and its return-path reader.
+	t.Cleanup(func() { releaseFixtureVPNService(t, svc) })
 	h.vpnSvc = svc
 
 	if err = svc.EnableBackend(ctx, id); err != nil {
@@ -389,6 +411,8 @@ func TestBackendIdentityRotation_VPNRollbackFailureKeepsNewIdentityAndQuarantine
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This service owns the backend device and its return-path reader.
+	t.Cleanup(func() { releaseFixtureVPNService(t, svc) })
 	h.vpnSvc = svc
 	if err = svc.EnableBackend(ctx, id); err != nil {
 		t.Fatal(err)
@@ -480,6 +504,8 @@ func TestBackendIdentityRotation_DBCompensationFailureKeepsNewIdentityQuarantine
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This service owns the backend device and its return-path reader.
+	t.Cleanup(func() { releaseFixtureVPNService(t, svc) })
 	h.vpnSvc = svc
 	if err = svc.EnableBackend(ctx, id); err != nil {
 		t.Fatal(err)

@@ -194,11 +194,11 @@ jobs:
             $packages
 
       - name: Run Authentic Native Caddy Integration Tests
-        if: matrix.shard == 3
+        if: always() && matrix.shard == 3
         run: go test -v -race -tags with_utls -run TestCaddyIntegration ./internal/vpn/tunnel/naive/...
 
       - name: Run Vision Tests (non-race)
-        if: matrix.shard == 3
+        if: always() && matrix.shard == 3
         run: go test -tags with_utls -run Vision ./internal/vpn/tunnel/vless/...
 
       # The automatic AWG admission pair runs inside the package job above, but a
@@ -208,7 +208,7 @@ jobs:
       # privacy-safe observations reach the log. It adds no assertion and changes no
       # qualification semantics: a failure here still fails the job.
       - name: Run Automatic AWG Admission Consumers
-        if: matrix.shard == 3
+        if: always() && matrix.shard == 3
         run: |
           go test -v -race -count=1 -p 2 -parallel 2 -timeout 10m \
             -run '^(TestAutomaticSetupAdmitsAfterAuthenticAWGTraffic|TestAutomaticSetupRefusesWhenTheAWGPeerNeverAnswers)$' \
@@ -225,7 +225,7 @@ jobs:
       # provisioned by the steps above, so verify them first and fail closed here rather
       # than letting a missing dependency degrade into a silent skip.
       - name: Verify Automatic Naive Consumer Prerequisites
-        if: matrix.shard == 3
+        if: always() && matrix.shard == 3
         run: |
           set -euo pipefail
           # No `|| true` here: a missing binary must fail this step, not be
@@ -242,7 +242,7 @@ jobs:
           /lib/ld-musl-x86_64.so.1 --list /usr/lib/x86_64-linux-musl/libgcc_s.so.1 >/dev/null
 
       - name: Run Automatic Naive Admission Consumers
-        if: matrix.shard == 3
+        if: always() && matrix.shard == 3
         run: |
           set -uo pipefail
           log="$(mktemp)"

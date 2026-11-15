@@ -83,10 +83,7 @@ func TestCaptchaE2ETargetMatchesDisplayedChallenge(t *testing.T) {
 
 func TestCaptchaVerificationAndLoginTicket(t *testing.T) {
 	h, db, cfg := setupTestHandlers(t)
-	hash, err := security.HashPassword("AdminPass123!")
-	if err != nil {
-		t.Fatal(err)
-	}
+	hash := fixturePasswordHash(t, "AdminPass123!")
 	if _, err := db.CreateUser(context.Background(), &models.User{
 		ID: "captcha-admin", Username: "admin", PasswordHash: hash,
 		Role: models.RoleAdmin, Enabled: true,

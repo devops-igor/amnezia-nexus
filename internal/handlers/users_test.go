@@ -840,10 +840,7 @@ func TestUpdateUserHandler_AdminPasswordReset_BumpsSessionVersion(t *testing.T) 
 	})
 
 	// 1. Seed admin and target users
-	adminPassHash, err := security.HashPassword("AdminPass123!")
-	if err != nil {
-		t.Fatalf("failed to hash admin password: %v", err)
-	}
+	adminPassHash := fixturePasswordHash(t, "AdminPass123!")
 	adminUser := &models.User{
 		ID:             "admin-test-id",
 		Username:       "admin_user",
@@ -857,10 +854,7 @@ func TestUpdateUserHandler_AdminPasswordReset_BumpsSessionVersion(t *testing.T) 
 		t.Fatalf("failed to create admin: %v", err)
 	}
 
-	targetPassHash, err := security.HashPassword("TargetPass123!")
-	if err != nil {
-		t.Fatalf("failed to hash target password: %v", err)
-	}
+	targetPassHash := fixturePasswordHash(t, "TargetPass123!")
 	targetUser := &models.User{
 		ID:             "target-test-id",
 		Username:       "target_user",
