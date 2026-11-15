@@ -63,7 +63,15 @@ func setupTestHandlers(t *testing.T) (*Handlers, *database.DB, *config.Config) {
 	// fixture created still owns those loops either way.
 	t.Cleanup(func() { releaseFixtureSSHPool(t, sshPool) })
 
-	vpnSvc, _ := vpn.NewVPNService(db, nil)
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("failed to create test VPN service: %v", err)
+	}
+	// The fixture's own service may carry enabled backends and their
+	// return-path readers. Registering its release after the database and SSH
+	// cleanups means devices are released first, while the store the
+	// administrative disable persists through is still open.
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 
 	reg := manager.NewRegistry()
 	reg.Register(&mockProtocolManager{protocol: "awg"})

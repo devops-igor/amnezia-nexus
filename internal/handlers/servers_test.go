@@ -1797,6 +1797,8 @@ func TestUpdateServerHostHandler_VPNFailureRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
+	// This service owns the backend device and its return-path reader.
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
@@ -1867,6 +1869,8 @@ func TestUpdateServerHostHandler_CanceledContextRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
+	// This service owns the backend device and its return-path reader.
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
@@ -2021,6 +2025,8 @@ func TestUpdateServerHostHandler_VPNRollbackFailure_PreventsSplitState(t *testin
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
+	// This service owns the backend device and its return-path reader.
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
@@ -2161,6 +2167,8 @@ func TestUpdateServerHostHandler_UnchangedHost_IdempotentNoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVPNService failed: %v", err)
 	}
+	// This service owns the backend device and its return-path reader.
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})

@@ -73,6 +73,17 @@ func TestRenderClientConfig(t *testing.T) {
 	}
 }
 
+func TestRenderClientConfig_SingleResolverRendersOnce(t *testing.T) {
+	conf := RenderClientConfig("clientPrivKey", "10.8.1.2", "serverPubKey", "", "1.2.3.4:55424", "10.8.1.1", "10.8.1.1", "1280", &AWGParams{}, nil)
+
+	if !strings.Contains(conf, "DNS = 10.8.1.1\n") {
+		t.Fatalf("expected a single DNS directive for one resolver, got:\n%s", conf)
+	}
+	if strings.Contains(conf, "DNS = 10.8.1.1, 10.8.1.1") {
+		t.Fatalf("duplicate resolver rendered twice:\n%s", conf)
+	}
+}
+
 func TestRenderClientConfig_AWG3_Compliance(t *testing.T) {
 	rat := DegenerateTimingRange(125)
 	rt := DegenerateTimingRange(5)
