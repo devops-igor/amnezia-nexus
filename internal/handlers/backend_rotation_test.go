@@ -250,12 +250,28 @@ func TestBackendIdentityRotation_DisabledBackend(t *testing.T) {
 	t.Cleanup(func() { releaseFixtureVPNService(t, svc) })
 	h.vpnSvc = svc
 
-	// Start enabled then administratively disable it
+	// Start enabled then administratively disable it. Capture the device the
+	// disable must close: DisableBackend deletes it from the service's map, so
+	// looking it up afterwards returns nil whether or not it was closed.
 	if err = svc.EnableBackend(ctx, id); err != nil {
 		t.Fatal(err)
 	}
+	enabledTun, err := svc.GetTunnel(id)
+	if err != nil || enabledTun == nil {
+		t.Fatalf("GetTunnel after enable: %v", err)
+	}
+	dev := svc.GetBackendDeviceForTest(enabledTun.ID)
+	if dev == nil {
+		t.Fatal("the enabled backend owns no device, so the closure assertion would prove nothing")
+	}
+	if dev.IsClosed() {
+		t.Fatal("the backend device is already closed before the administrative disable")
+	}
 	if err = svc.DisableBackend(ctx, id); err != nil {
 		t.Fatal(err)
+	}
+	if !dev.IsClosed() {
+		t.Fatalf("administrative disable left backend device %d open", enabledTun.ID)
 	}
 
 	r := setupFullServerRouter(h)
@@ -285,12 +301,6 @@ func TestBackendIdentityRotation_DisabledBackend(t *testing.T) {
 	}
 	if tun.Enabled {
 		t.Errorf("disabled backend was unexpectedly re-enabled during key rotation")
-	}
-	// The intentional disable is the release path for this test: assert the
-	// device is gone here rather than relying on the cleanup to hide a device
-	// the disable should have closed.
-	if dev := svc.GetBackendDeviceForTest(tun.ID); dev != nil && !dev.IsClosed() {
-		t.Fatalf("administrative disable left backend device %d open", tun.ID)
 	}
 }
 
