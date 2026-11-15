@@ -381,6 +381,7 @@ jobs:
             tests/test_onboard_credentials.py \
             tests/test_naive_decoy_default_contract.py \
             tests/test_ci_native_dependencies.py \
+            tests/test_makefile_gates.py \
             tests/test_ci_shipped_caddy.py \
             tests/test_ci_naive_consumer_steps.py \
             tests/test_e2e_runner_map.py
