@@ -160,6 +160,11 @@ func newCanaryAdmissionEnv(t *testing.T, mutate ...func(*models.VPNConfig)) *can
 	db := setupTestDB(t)
 	muts := append([]func(*models.VPNConfig){fullAmneziaWGOpts()}, mutate...)
 	svc := newIngressEngineService(t, db, muts...)
+	// These refusals assert state transitions, not the production 3 s probe
+	// budget: every dead-canary sweep would otherwise wait it out, which is why
+	// this fixture took 73 s. The real canary path stays in force (no probe
+	// override); only the wait is shortened.
+	svc.prober.SetTimeoutForTest(500 * time.Millisecond)
 	existing, existingSaved := newEnginePeer(t, svc, db, "canary-existing")
 	fresh, freshSaved := newEnginePeer(t, svc, db, "canary-fresh")
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
