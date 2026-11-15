@@ -662,6 +662,9 @@ func TestRotationRemoteDelayDoesNotBlockUnrelatedIngressAdmission(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This test owns the service and any device the rotation/admission path
+	// attaches; release it before the fixture's database cleanup runs.
+	t.Cleanup(func() { releaseFixtureVPNService(t, svc) })
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	mgr := &verifiedRotationManager{mockProtocolManager: &mockProtocolManager{
@@ -743,6 +746,9 @@ func TestRotationPendingAdministrativeDisableKeepsBackendDetached(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This test owns the service and any device the rotation/admission path
+	// attaches; release it before the fixture's database cleanup runs.
+	t.Cleanup(func() { releaseFixtureVPNService(t, svc) })
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	mgr := &verifiedRotationManager{mockProtocolManager: &mockProtocolManager{
