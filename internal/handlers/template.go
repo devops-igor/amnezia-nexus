@@ -111,6 +111,14 @@ func (te *TemplateEngine) ReloadTemplates() error {
 		"vpn.html",
 	}
 
+	// layoutPartials are template files that only define a section included by a
+	// layout page (for example settings_policy.html, rendered by settings.html).
+	// They are parsed with every layout page because a page resolves its includes
+	// at execution time, and a define that no page uses costs nothing.
+	layoutPartials := []string{
+		"settings_policy.html",
+	}
+
 	fresh := make(map[string]*template.Template)
 
 	baseTmpl, err := template.New("base.html").Funcs(fm).ParseFS(templatesFS, "base.html")
@@ -128,7 +136,11 @@ func (te *TemplateEngine) ReloadTemplates() error {
 	}
 
 	for _, name := range layoutPages {
-		tmpl, err := template.New("base.html").Funcs(fm).ParseFS(templatesFS, "base.html", name)
+		files := make([]string, 0, len(layoutPartials)+2)
+		files = append(files, "base.html")
+		files = append(files, layoutPartials...)
+		files = append(files, name)
+		tmpl, err := template.New("base.html").Funcs(fm).ParseFS(templatesFS, files...)
 		if err != nil {
 			return fmt.Errorf("failed to parse layout template %s: %w", name, err)
 		}
