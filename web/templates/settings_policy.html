@@ -97,6 +97,15 @@
         </div>
     </form>
 
+    <div class="form-group" style="margin-top: var(--space-md);">
+        <label class="form-label" for="policy_explain_value">{{ _ "policy_explain_label" }}</label>
+        <div style="display: flex; gap: var(--space-sm);">
+            <input class="form-input" id="policy_explain_value" name="policy_explain_value" type="text" spellcheck="false" autocapitalize="none" autocomplete="off" placeholder="{{ _ "policy_explain_placeholder" }}">
+            <button type="button" class="btn btn-secondary" id="policyExplainBtn">{{ _ "policy_explain_btn" }}</button>
+        </div>
+        <p class="form-hint" id="policyExplainResult" role="status" aria-live="polite">{{ _ "policy_explain_hint" }}</p>
+    </div>
+
     <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_status_title" }}</div>
 
     <div class="info-card-grid">

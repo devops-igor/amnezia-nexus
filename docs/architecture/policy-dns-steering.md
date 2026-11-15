@@ -292,7 +292,71 @@ expires at the minimum answer TTL capped by the server's maximum TTL. Evidence
 is written into the authenticated session's cache scope, so it is bounded by
 the session lifetime and never visible to another session.
 
-## 5. Limitations
+## 5. Explaining a decision (dry run)
+
+`POST /api/vpn/policy/explain` answers the ordinary operational question "would
+this destination go direct or through the proxy, and why?" for one name or
+address, without sending client traffic. It is admin-only and carries the same
+CSRF requirement as the other policy endpoints because it is mounted in the same
+`/api/vpn/policy` group.
+
+### Request and answer
+
+The body carries `domain`, or `ip`/`ips` (at most eight addresses), and an
+optional `session_id`. Supplying addresses skips the lookup entirely, so a
+destination can be evaluated with no DNS traffic at all. The answer reports:
+
+| Field | Meaning |
+| :--- | :--- |
+| `decision` | `DIRECT`, `PROXY`, `DROP` or `UNKNOWN` |
+| `reason` | one machine-readable cause: `policy_disabled`, `prohibited_destination`, `domain_rule`, `cname_rule`, `cidr_rule`, `shared_ip_conflict`, `fresh_evidence_direct`, `expired_evidence`, `evicted_evidence`, `stale_evidence_generation`, `no_trusted_evidence`, `no_usable_address`, `name_unresolved`, `no_policy_snapshot` |
+| `rule` | the matching rule: its base name, its shape (`apex`, `apex_and_subdomains`, `subdomains`), the name that matched (the queried name or a CNAME target) and the lists that supplied it |
+| `prefix` | the most specific matching CIDR prefix and its lists |
+| `addresses` | one verdict per evaluated address, with its own decision, cause, prefix and evidence |
+| `evidence` | the session evidence the verdict rests on: state, decision, generation and remaining TTL |
+| `resolution` | how the name was resolved: `configured_resolver`, `caller_supplied`, `not_attempted` or `unavailable`, the upstreams dialled, the deadline, the CNAME chain and the answer, or the resolver's error |
+| `limitations` | the caveats that apply, as tokens |
+
+The check order is the order the data path applies: prohibited destination
+(`DROP`), domain rule, CIDR rule, fresh evidence, and then the safe default
+`PROXY`. Because the answer is an expectation and not a packet, a name that
+resolves to several addresses is summarised twice over: every address is
+reported on its own, and the headline is the unanimous verdict when they agree
+(`summary: "unanimous"`) or the most restrictive one when they disagree
+(`summary: "most_restrictive"`, ordered `DROP` > `PROXY` > `UNKNOWN` > `DIRECT`),
+so a name is never reported as safer than its worst address.
+
+### Read-only by construction
+
+The endpoint never publishes a matcher, writes a route-cache entry, records an
+observation, syncs a list, refreshes anything or moves a counter:
+
+- the route cache is read through `RouteCache.Get`/`SessionScope`, which never
+  create a scope, and through `SessionCache.Inspect`, which loads the current
+  view once and reads one entry without publishing a view, pruning an expired
+  entry or extending a deadline;
+- evidence is written only by `gatewaydns.ObserveResponse` through the DNS
+  handler, which this path never calls: the ad-hoc answer is classified locally
+  and discarded, so it is explicitly excluded from the evidence path;
+- interception exists only on the packet path, and no packet, flow or counter
+  path is entered;
+- the lookup is bounded by an explicit timeout (2 s by default, 5 s for the whole
+  request) and is an ordinary query sent out to the configured upstreams.
+
+A test asserts the entry count, the session count and the stored evidence are
+identical before and after an explanation, and that an address which only matched
+a CIDR rule gained no evidence.
+
+### Attribution
+
+A compiled snapshot records which sources supplied each rule, packed into spare
+bits of the per-rule byte, so naming the list costs no second index. A snapshot
+compiled from a durable last-known-good generation stores merged rules only: the
+rule and its shape are still reported, the source list is empty rather than
+invented. The same holds when a snapshot has more sources than the encoding
+holds.
+
+## 6. Limitations
 
 - **Encrypted DNS is out of scope.** DNS over HTTPS (443) and DNS over TLS
   (853) are not detected, intercepted or decrypted. Those destinations produce

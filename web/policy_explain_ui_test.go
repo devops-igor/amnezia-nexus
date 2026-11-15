@@ -1,0 +1,128 @@
+package web
+
+// Behavioural JSDOM coverage for the read-only decision dry run inside the
+// policy section (issue #825). The shipped controller is evaluated as-is against
+// the shipped template, and the API double records the payload, so the tests
+// describe what the browser sends and renders rather than what the source says.
+
+import (
+	"testing"
+)
+
+// explainResponderScript installs an answer for the explain endpoint in front of
+// the default policy responder, and stubs the three keys the readout resolves.
+const explainResponderScript = `
+w._ = key => {
+  if (key === 'policy_explain_result') return '{value} :: {decision} :: {reason}';
+  if (key === 'policy_explain_decision_proxy') return 'DECISION-PROXY';
+  if (key === 'policy_explain_decision_direct') return 'DECISION-DIRECT';
+  if (key === 'policy_explain_reason_domain_rule') return 'REASON-DOMAIN-RULE';
+  if (key === 'policy_explain_reason_fresh_evidence_direct') return 'REASON-FRESH-DIRECT';
+  if (key === 'policy_explain_needs_value') return 'NEEDS-VALUE';
+  return key;
+};
+responder = ((base) => async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/explain')) {
+    const body = opts.body || {};
+    if (body.domain === 'fail.example') {
+      const err = new Error('domain: domain contains illegal characters or scheme');
+      err.status = 400;
+      err.data = {error: 'validation_failed', detail: 'domain: domain contains illegal characters or scheme'};
+      throw err;
+    }
+    if (body.ip) {
+      return {input: {value: body.ip, kind: 'address'}, decision: 'PROXY',
+              reason: 'domain_rule', read_only: true};
+    }
+    return {input: {value: body.domain, kind: 'domain', normalized: 'www.example'},
+            decision: 'PROXY', reason: 'domain_rule', read_only: true};
+  }
+  return base(url, opts);
+})(responder);
+`
+
+func TestPolicyRoutingControllerExplainsDestination(t *testing.T) {
+	runPolicyControllerScenario(t, policyRecordScript(false, "geoblock")+explainResponderScript, `
+const field = w.document.getElementById('policy_explain_value');
+field.value = '  WWW.Example  ';
+w.document.getElementById('policyExplainBtn').click();
+await settle();
+
+const posts = requestsTo('/api/vpn/policy/explain', 'POST');
+assert.equal(posts.length, 1, 'the button must issue exactly one explanation request');
+assert.equal(posts[0].body.domain, 'WWW.Example',
+  'the typed value is sent for the server to normalise, not pre-normalised here');
+assert.equal(text('policyExplainResult'), 'www.example :: DECISION-PROXY :: REASON-DOMAIN-RULE',
+  'the readout must show the normalised value, the decision and the cause');
+assert.equal(w.document.getElementById('policyExplainResult').getAttribute('data-state'), 'proxy',
+  'the readout carries the decision as a state token');
+assert.equal(requestsTo('/api/vpn/policy', 'PUT').length, 0,
+  'explaining must never save settings');
+`)
+}
+
+// TestPolicyRoutingControllerExplainSendsAnAddressAsAnAddress pins the payload
+// classification: an IPv4 literal goes as ip, everything else as domain. The
+// server still validates it.
+func TestPolicyRoutingControllerExplainSendsAnAddressAsAnAddress(t *testing.T) {
+	runPolicyControllerScenario(t, policyRecordScript(false, "geoblock")+explainResponderScript, `
+const field = w.document.getElementById('policy_explain_value');
+field.value = '198.51.200.9';
+w.document.getElementById('policyExplainBtn').click();
+await settle();
+
+const posts = requestsTo('/api/vpn/policy/explain', 'POST');
+assert.equal(posts.length, 1);
+assert.equal(posts[0].body.ip, '198.51.200.9', 'an address must be sent as ip');
+assert.equal(posts[0].body.domain, undefined, 'an address must not be sent as a domain');
+`)
+}
+
+// TestPolicyRoutingControllerExplainRequiresInput proves an empty field sends
+// nothing and says why, instead of issuing a request the server would reject.
+func TestPolicyRoutingControllerExplainRequiresInput(t *testing.T) {
+	runPolicyControllerScenario(t, policyRecordScript(false, "geoblock")+explainResponderScript, `
+w.document.getElementById('policy_explain_value').value = '   ';
+w.document.getElementById('policyExplainBtn').click();
+await settle();
+
+assert.equal(requestsTo('/api/vpn/policy/explain', 'POST').length, 0,
+  'an empty field must not reach the server');
+assert.equal(text('policyExplainResult'), 'NEEDS-VALUE',
+  'the readout must ask for a destination');
+`)
+}
+
+// TestPolicyRoutingControllerExplainReportsRefusal keeps the server's own
+// wording: the readout is the operator's only feedback for a rejected name.
+func TestPolicyRoutingControllerExplainReportsRefusal(t *testing.T) {
+	runPolicyControllerScenario(t, policyRecordScript(false, "geoblock")+explainResponderScript, `
+const field = w.document.getElementById('policy_explain_value');
+field.value = 'fail.example';
+w.document.getElementById('policyExplainBtn').click();
+await settle();
+
+const readout = w.document.getElementById('policyExplainResult');
+assert.equal(readout.getAttribute('data-state'), 'error', 'a refusal must be marked as an error');
+assert.match(readout.textContent, /illegal characters/,
+  'the server detail must be shown, not replaced by a generic message');
+assert.equal(requestsTo('/api/vpn/policy', 'PUT').length, 0, 'a refusal must not save anything');
+`)
+}
+
+// TestPolicyRoutingControllerExplainOnEnter runs the same explanation from the
+// field, and proves Enter does not submit the settings form.
+func TestPolicyRoutingControllerExplainOnEnter(t *testing.T) {
+	runPolicyControllerScenario(t, policyRecordScript(false, "geoblock")+explainResponderScript, `
+const field = w.document.getElementById('policy_explain_value');
+field.value = 'www.example';
+field.dispatchEvent(new w.KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
+await settle();
+
+assert.equal(requestsTo('/api/vpn/policy/explain', 'POST').length, 1,
+  'Enter in the field must explain the destination');
+assert.equal(requestsTo('/api/vpn/policy', 'PUT').length, 0,
+  'Enter in the dry-run field must not submit the settings form');
+assert.equal(text('policyExplainResult'), 'www.example :: DECISION-PROXY :: REASON-DOMAIN-RULE');
+`)
+}

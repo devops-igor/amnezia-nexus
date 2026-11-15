@@ -30,6 +30,9 @@
     var POLICY_ENDPOINT = '/api/vpn/policy';
     var SYNC_ENDPOINT = '/api/vpn/policy/sync';
     var STATS_ENDPOINT = '/api/vpn/policy/stats';
+    // Read-only dry run of issue #825: explains one destination without sending
+    // traffic, so it is a POST (it carries a destination) that mutates nothing.
+    var EXPLAIN_ENDPOINT = '/api/vpn/policy/explain';
 
     // Last record the server returned. It is the fallback used to restore the form
     // when a refused save cannot be followed by a successful reload.
@@ -585,6 +588,111 @@
         }
     }
 
+    // One explanation at a time. The button is disabled while it runs, but Enter
+    // in the field reaches the same function, so the guard cannot live in the
+    // button alone.
+    var explainInFlight = false;
+
+    // policyExplainDecisionLabel translates the server's decision token. The set
+    // is closed (DIRECT, PROXY, DROP, UNKNOWN); an unknown token is shown as
+    // received rather than replaced by a guess.
+    function policyExplainDecisionLabel(decision) {
+        if (!decision) {
+            return policyText('policy_none');
+        }
+        var key = 'policy_explain_decision_' + String(decision).toLowerCase();
+        var label = policyText(key);
+        return label === key ? String(decision) : label;
+    }
+
+    // policyExplainReasonLabel translates the machine-readable cause. The server
+    // is the authority on which causes exist; a token without a translation is
+    // displayed verbatim, so a new cause degrades to a readable answer instead of
+    // an empty line.
+    function policyExplainReasonLabel(reason) {
+        if (!reason) {
+            return policyText('policy_none');
+        }
+        var key = 'policy_explain_reason_' + String(reason);
+        var label = policyText(key);
+        return label === key ? String(reason) : label;
+    }
+
+    // policyExplainPayload classifies what the operator typed. It is a routing
+    // hint only: the server still validates the value and rejects anything
+    // malformed, so this never becomes a second validator.
+    function policyExplainPayload(value) {
+        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(value)) {
+            return { ip: value };
+        }
+        return { domain: value };
+    }
+
+    // setPolicyExplainResult writes the single result line. An empty message
+    // restores the shipped hint, so a recovered request clears a stale error.
+    function setPolicyExplainResult(message, state) {
+        var el = policyElement('policyExplainResult');
+        if (!el) {
+            return;
+        }
+        el.textContent = message || policyText('policy_explain_hint');
+        el.setAttribute('data-state', state || '');
+    }
+
+    // explainPolicyDestination asks the server to explain one destination and
+    // renders the decision with its cause. It changes no settings and reloads
+    // nothing: the answer is a read.
+    async function explainPolicyDestination() {
+        if (explainInFlight) {
+            return null;
+        }
+        var input = policyElement('policy_explain_value');
+        var value = input && typeof input.value === 'string' ? input.value.trim() : '';
+        if (!value) {
+            setPolicyExplainResult(policyText('policy_explain_needs_value'), 'error');
+            return null;
+        }
+        explainInFlight = true;
+        var button = policyElement('policyExplainBtn');
+        if (button) {
+            button.disabled = true;
+            button.setAttribute('aria-busy', 'true');
+        }
+        setPolicyExplainResult(policyText('policy_explain_running'), '');
+        try {
+            var answer = await policyRequest(EXPLAIN_ENDPOINT, {
+                method: 'POST',
+                body: policyExplainPayload(value)
+            });
+            var normalized = answer && answer.input && answer.input.normalized
+                ? answer.input.normalized
+                : value;
+            var result = policyText('policy_explain_result')
+                .replace('{value}', normalized)
+                .replace('{decision}', policyExplainDecisionLabel(answer && answer.decision))
+                .replace('{reason}', policyExplainReasonLabel(answer && answer.reason));
+            var state = 'proxy';
+            if (answer && answer.decision === 'DIRECT') {
+                state = 'direct';
+            } else if (answer && answer.decision === 'UNKNOWN') {
+                state = 'unknown';
+            } else if (answer && answer.decision === 'DROP') {
+                state = 'drop';
+            }
+            setPolicyExplainResult(result, state);
+            return answer;
+        } catch (err) {
+            setPolicyExplainResult(policyText('policy_explain_failed') + ': ' + policyErrorDetail(err), 'error');
+            return null;
+        } finally {
+            explainInFlight = false;
+            if (button) {
+                button.disabled = false;
+                button.setAttribute('aria-busy', 'false');
+            }
+        }
+    }
+
     // initPolicyRouting wires the section once. It returns false when the section
     // is absent (a non-admin render, or a page that does not include it), which is
     // what keeps the controller inert everywhere else.
@@ -623,6 +731,25 @@
             });
         }
 
+        // The dry run lives outside the settings form, so Enter here cannot submit
+        // settings; it runs the explanation instead.
+        var explainBtn = policyElement('policyExplainBtn');
+        if (explainBtn) {
+            explainBtn.addEventListener('click', function (event) {
+                event.preventDefault();
+                explainPolicyDestination();
+            });
+        }
+        var explainInput = policyElement('policy_explain_value');
+        if (explainInput) {
+            explainInput.addEventListener('keydown', function (event) {
+                if (event.key === 'Enter') {
+                    event.preventDefault();
+                    explainPolicyDestination();
+                }
+            });
+        }
+
         policyPresetInputs().forEach(function (input) {
             input.addEventListener('change', function () {
                 updatePolicyCustomGroup();
@@ -647,6 +774,7 @@
     root.savePolicySettings = savePolicySettings;
     root.syncPolicy = syncPolicy;
     root.loadPolicySettings = loadPolicySettings;
+    root.explainPolicyDestination = explainPolicyDestination;
 
     if (root.document) {
         if (root.document.readyState === 'loading') {
