@@ -79,3 +79,34 @@ def test_workflow_runs_the_shard_assignment() -> None:
         "hand-written list that can drift from go list"
     )
     assert f"--shards {SHARD_COUNT}" in text
+
+
+def test_shard_gate_steps_run_even_when_the_race_step_fails() -> None:
+    """A shard-3 race failure must not suppress the independent gates (#804).
+
+    The native Caddy, Vision, AWG and Naive gates run as steps after the race
+    step in shard 3. Without ``always()`` a database (or any shard-3) race
+    failure skips them, so the run cannot show whether those obligations still
+    hold. The step status still comes from the race step: ``always()`` only
+    removes the suppression, it does not make a failed shard pass.
+    """
+    text = CI_WORKFLOW.read_text(encoding="utf-8")
+    gates = (
+        "Run Authentic Native Caddy Integration Tests",
+        "Run Vision Tests (non-race)",
+        "Run Automatic AWG Admission Consumers",
+        "Verify Automatic Naive Consumer Prerequisites",
+        "Run Automatic Naive Admission Consumers",
+    )
+    for name in gates:
+        marker = f"- name: {name}"
+        start = text.find(marker)
+        assert start != -1, f"gate step not found: {name}"
+        end = text.find("\n      - name:", start + len(marker))
+        block = text[start : end if end != -1 else len(text)]
+        assert "if: always() && matrix.shard == 3" in block, (
+            f"{name} must run with always() so a race failure cannot suppress it"
+        )
+    assert "if: matrix.shard == 3" not in text, (
+        "a shard-3 step still has the bare condition and would be skipped on failure"
+    )
