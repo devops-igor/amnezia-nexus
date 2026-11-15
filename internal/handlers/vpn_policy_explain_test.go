@@ -165,7 +165,7 @@ func TestExplainPolicyHandlerLeavesCountersAndCacheUntouched(t *testing.T) {
 	}
 }
 
-// TestExplainPolicyHandlerWithoutDataPlane pins the 503 behaviour shared with
+// TestExplainPolicyHandlerWithoutDataPlane pins the 503 behavior shared with
 // the sync endpoint when this deployment has no VPN service.
 func TestExplainPolicyHandlerWithoutDataPlane(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)

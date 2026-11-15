@@ -15,7 +15,7 @@ import (
 //
 // The endpoint carries no authorization logic of its own: it is mounted inside
 // the existing /api/vpn/policy group. These tests therefore assert what the
-// shared middlewares do, and compare the refusal against a neighbouring policy
+// shared middlewares do, and compare the refusal against a neighboring policy
 // endpoint so "same refusal" is a measured fact rather than a claim.
 
 func explainRequestBody(t *testing.T) []byte {
@@ -28,7 +28,7 @@ func explainRequestBody(t *testing.T) []byte {
 }
 
 // TestPolicyExplainRefusesNonAdminsLikeItsNeighbours checks that a non-admin
-// receives the identical answer from the dry run and from the neighbouring
+// receives the identical answer from the dry run and from the neighboring
 // policy endpoints: same status, same error code, same message.
 func TestPolicyExplainRefusesNonAdminsLikeItsNeighbours(t *testing.T) {
 	db, cfg := setupTestRouterDB(t)
@@ -68,7 +68,7 @@ func TestPolicyExplainRefusesNonAdminsLikeItsNeighbours(t *testing.T) {
 	}
 }
 
-// TestPolicyExplainRequiresAuthentication mirrors the neighbouring endpoints: an
+// TestPolicyExplainRequiresAuthentication mirrors the neighboring endpoints: an
 // anonymous caller gets 401, not 403 and not an answer.
 func TestPolicyExplainRequiresAuthentication(t *testing.T) {
 	db, cfg := setupTestRouterDB(t)

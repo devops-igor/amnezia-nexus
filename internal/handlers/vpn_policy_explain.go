@@ -19,7 +19,7 @@ import (
 // Authorization and CSRF are deliberately not re-implemented here. The route is
 // mounted inside the same /api/vpn/policy group as GET/PUT/sync/stats, so it
 // inherits middleware.RequireAdmin and the router-wide CSRF middleware exactly
-// as they are: a non-admin gets the same 403 the neighbouring endpoints return,
+// as they are: a non-admin gets the same 403 the neighboring endpoints return,
 // and an unauthenticated caller the same 401.
 //
 // Read-only is structural, not a promise: this handler only reads a request body

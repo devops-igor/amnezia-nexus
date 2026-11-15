@@ -312,6 +312,7 @@ destination can be evaluated with no DNS traffic at all. The answer reports:
 | `reason` | one machine-readable cause: `policy_disabled`, `prohibited_destination`, `domain_rule`, `cname_rule`, `cidr_rule`, `shared_ip_conflict`, `fresh_evidence_direct`, `expired_evidence`, `evicted_evidence`, `stale_evidence_generation`, `no_trusted_evidence`, `no_usable_address`, `name_unresolved`, `no_policy_snapshot` |
 | `rule` | the matching rule: its base name, its shape (`apex`, `apex_and_subdomains`, `subdomains`), the name that matched (the queried name or a CNAME target) and the lists that supplied it |
 | `prefix` | the most specific matching CIDR prefix and its lists |
+| `source_kind` | on both of the above: `preset` for a built-in list, `custom` for operator URLs, `mixed` when sources disagree, empty when a merged snapshot cannot attribute the rule |
 | `addresses` | one verdict per evaluated address, with its own decision, cause, prefix and evidence |
 | `evidence` | the session evidence the verdict rests on: state, decision, generation and remaining TTL |
 | `resolution` | how the name was resolved: `configured_resolver`, `caller_supplied`, `not_attempted` or `unavailable`, the upstreams dialled, the deadline, the CNAME chain and the answer, or the resolver's error |

@@ -287,6 +287,68 @@ func TestExplainPolicyCallerAddressesSkipResolution(t *testing.T) {
 	if len(out.Limitations) == 0 {
 		t.Fatal("an address-only answer must state its limitations")
 	}
+	if out.Prefix == nil || out.Prefix.SourceKind != "preset" {
+		t.Fatalf("prefix = %+v, want the preset source kind named", out.Prefix)
+	}
+}
+
+// TestPolicyExplainSourceKind pins the preset/custom classification an operator
+// reads alongside a matched rule.
+func TestPolicyExplainSourceKind(t *testing.T) {
+	cases := []struct {
+		sources []string
+		want    string
+	}{
+		{nil, ""},
+		{[]string{"geoblock"}, "preset"},
+		{[]string{"antifilter_ipv4"}, "preset"},
+		{[]string{"custom-1"}, "custom"},
+		{[]string{"custom-1", "custom-2"}, "custom"},
+		{[]string{"geoblock", "custom-1"}, "mixed"},
+	}
+	for _, tc := range cases {
+		if got := policyExplainSourceKind(tc.sources); got != tc.want {
+			t.Errorf("policyExplainSourceKind(%v) = %q, want %q", tc.sources, got, tc.want)
+		}
+	}
+}
+
+// TestPolicyExplainSessionLimitations distinguishes "no session was asked about"
+// from "the selected session holds no cached evidence": the two mean different
+// things to an operator debugging a missing direct path.
+func TestPolicyExplainSessionLimitations(t *testing.T) {
+	snap, _, scope, _, now := explainTestSnapshot(t)
+	hasLimitation := func(limits []string, want string) bool {
+		for _, limit := range limits {
+			if limit == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	withoutSession, err := explainPolicy(context.Background(), policyExplainDeps{
+		Enabled: true, Snapshot: snap, SessionScope: scope, Now: now,
+	}, PolicyExplainRequest{Value: "198.51.200.9", Addresses: []netip.Addr{netip.MustParseAddr("198.51.200.9")}})
+	if err != nil {
+		t.Fatalf("explain without a session: %v", err)
+	}
+	if !hasLimitation(withoutSession.Limitations, PolicyLimitNoSession) {
+		t.Errorf("limitations = %v, want %q", withoutSession.Limitations, PolicyLimitNoSession)
+	}
+
+	withUnknownSession, err := explainPolicy(context.Background(), policyExplainDeps{
+		Enabled: true, Snapshot: snap, SessionScope: nil, Now: now,
+	}, PolicyExplainRequest{
+		Value: "198.51.200.9", Addresses: []netip.Addr{netip.MustParseAddr("198.51.200.9")},
+		SessionID: "session-without-scope",
+	})
+	if err != nil {
+		t.Fatalf("explain with an unscoped session: %v", err)
+	}
+	if !hasLimitation(withUnknownSession.Limitations, PolicyLimitNoSessionData) {
+		t.Errorf("limitations = %v, want %q", withUnknownSession.Limitations, PolicyLimitNoSessionData)
+	}
 }
 
 func TestExplainPolicyDisabledSkipsEverything(t *testing.T) {

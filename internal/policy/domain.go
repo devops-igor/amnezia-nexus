@@ -19,7 +19,7 @@ const (
 	// domainMatchMask isolates the bits that decide a match. CompileSnapshot
 	// packs the sources that supplied a rule into the remaining bits of the same
 	// byte (see snapshot.go), so every matcher reads only these bits and its
-	// behaviour is unchanged byte for byte.
+	// behavior is unchanged byte for byte.
 	domainMatchMask domainFlags = domainExact | domainInclusiveSuffix | domainDescendants
 
 	// maxSnapshotSources bounds the compiled provenance encoding: one bit per

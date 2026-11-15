@@ -70,6 +70,7 @@ const (
 	PolicyLimitEncryptedDNS    = "encrypted_dns_not_observed"
 	PolicyLimitAdHocResolution = "ad_hoc_resolution_is_not_evidence"
 	PolicyLimitNoSession       = "evidence_requires_a_selected_session"
+	PolicyLimitNoSessionData   = "session_has_no_cached_evidence"
 	PolicyLimitNoName          = "domain_rules_require_a_name"
 	PolicyLimitIPv6            = "ipv6_not_supported"
 )
@@ -335,10 +336,14 @@ func policyExplainEvidenceReader(deps policyExplainDeps) func(netip.Addr) *polic
 // policyExplainLimitations lists the caveats that apply to this answer.
 func policyExplainLimitations(req PolicyExplainRequest, deps policyExplainDeps) []string {
 	limits := []string{PolicyLimitEncryptedDNS, PolicyLimitAdHocResolution, PolicyLimitIPv6}
-	if req.SessionID == "" {
+	switch {
+	case req.SessionID == "":
 		limits = append(limits, PolicyLimitNoSession)
-	} else if deps.SessionScope == nil {
-		limits = append(limits, PolicyLimitNoSession)
+	case deps.SessionScope == nil:
+		// The session was selected but owns no cache scope: it has not observed
+		// DNS yet, or its scope was released when its route retired. That is
+		// different from "no session was asked about", so it says so.
+		limits = append(limits, PolicyLimitNoSessionData)
 	}
 	if req.Name == "" {
 		limits = append(limits, PolicyLimitNoName)
@@ -385,6 +390,7 @@ func policyExplainRule(verdict policy.DestinationExplanation) *PolicyExplainRule
 		Base:        verdict.Rule.Base,
 		Shape:       string(verdict.Rule.Shape),
 		Sources:     policyExplainSources(verdict.Rule.Sources),
+		SourceKind:  policyExplainSourceKind(verdict.Rule.Sources),
 		MatchedName: verdict.RuleName,
 	}
 }
@@ -393,7 +399,35 @@ func policyExplainPrefix(match *policy.CIDRRuleMatch) *PolicyExplainPrefix {
 	if match == nil {
 		return nil
 	}
-	return &PolicyExplainPrefix{Prefix: match.Prefix.String(), Sources: policyExplainSources(match.Sources)}
+	return &PolicyExplainPrefix{
+		Prefix:     match.Prefix.String(),
+		Sources:    policyExplainSources(match.Sources),
+		SourceKind: policyExplainSourceKind(match.Sources),
+	}
+}
+
+// policyExplainSourceKind classifies the lists that supplied a rule: a built-in
+// preset, operator-supplied custom lists, or a mixture (which a snapshot merges
+// only when several sources supply the same rule). An unknown identifier is
+// reported as a custom list, because a preset identifier is a closed catalog.
+func policyExplainSourceKind(sources []string) string {
+	if len(sources) == 0 {
+		return ""
+	}
+	custom := 0
+	for _, id := range sources {
+		if strings.HasPrefix(id, "custom-") {
+			custom++
+		}
+	}
+	switch {
+	case custom == len(sources):
+		return "custom"
+	case custom == 0:
+		return "preset"
+	default:
+		return "mixed"
+	}
 }
 
 func policyExplainEvidence(evidence *policy.Evidence, now time.Time) *PolicyExplainEvidence {

@@ -1,7 +1,7 @@
 package vpn
 
 // This file holds the wire shape of the read-only policy dry run (issue #825):
-// the answer the admin endpoint returns and the tokens inside it. The behaviour
+// the answer the admin endpoint returns and the tokens inside it. The behavior
 // lives in vpn_pbr_policy_explain.go; keeping the shape separate keeps each file
 // inside the repository's size budget.
 
@@ -27,13 +27,15 @@ type PolicyExplainRule struct {
 	Base        string   `json:"base"`
 	Shape       string   `json:"shape"`
 	Sources     []string `json:"sources"`
+	SourceKind  string   `json:"source_kind,omitempty"`
 	MatchedName string   `json:"matched_name,omitempty"`
 }
 
 // PolicyExplainPrefix names the CIDR prefix that caused a proxy decision.
 type PolicyExplainPrefix struct {
-	Prefix  string   `json:"prefix"`
-	Sources []string `json:"sources"`
+	Prefix     string   `json:"prefix"`
+	Sources    []string `json:"sources"`
+	SourceKind string   `json:"source_kind,omitempty"`
 }
 
 // PolicyExplainEvidence is the session evidence a verdict rests on.
