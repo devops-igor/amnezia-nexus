@@ -22,6 +22,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/naive"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/xray"
+	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/router"
 	"github.com/devops-igor/amnezia-nexus/internal/service"
 	"github.com/devops-igor/amnezia-nexus/internal/service/orchestrator"
@@ -130,6 +131,70 @@ func startVPNDataPlane(ctx context.Context, vpnSvc *vpn.Service, cfg *config.Con
 	return true, true, nil
 }
 
+// loadPolicySettings reads the persisted policy routing record. An absent row
+// yields the disabled default, which keeps existing and fresh installs on the
+// old all-proxy route.
+func loadPolicySettings(ctx context.Context, db *database.DB) (policy.Settings, error) {
+	settings := policy.DefaultSettings()
+	if db == nil {
+		return settings, nil
+	}
+	var stored policy.Settings
+	if err := db.GetSetting(ctx, policy.SettingsKey, &stored); err != nil {
+		return settings, err
+	}
+	// An absent row leaves the target untouched. A row that says nothing at all
+	// is the same fresh-install state, so both yield the disabled default.
+	if stored.IsZero() {
+		return settings, nil
+	}
+	return stored.Normalize(), nil
+}
+
+// startPersistedPolicyRouting activates policy routing from the persisted record
+// before the data plane accepts traffic (#678).
+//
+// The persisted record is authoritative and activation fails closed through the
+// VPN prerequisite guards: a missing policy snapshot or an unavailable direct
+// egress path leaves PBR disabled with a logged reason instead of routing traffic
+// unproxied. A disabled record is the default for existing and fresh installs and
+// does nothing here.
+//
+// A refused activation is deliberately **not** a startup failure (#678 P2-B): the
+// panel must start so the operator can reach the API and repair the configuration.
+// PBR stays disabled (the pre-existing all-proxy behavior), the persisted record is
+// left exactly as stored, and the reason is reported through the policy status so
+// it is diagnosable from the management plane.
+func startPersistedPolicyRouting(ctx context.Context, db *database.DB, vpnSvc *vpn.Service, cfg *config.Config) error {
+	policySettings, err := loadPolicySettings(ctx, db)
+	if err != nil {
+		// Policy routing is an optional feature and its configuration read is not
+		// worth failing panel start over. Failing closed here means leaving PBR
+		// disabled, which is exactly the existing all-proxy behavior, so nothing
+		// is routed more permissively than before the read was attempted.
+		slog.Warn("Could not load policy routing settings; policy routing stays disabled", "err", err)
+		return nil
+	}
+	if !policySettings.Enabled || !cfg.VPNEnabled {
+		return nil
+	}
+
+	policyStore := policy.NewFileStore(filepath.Join(cfg.DataDir, "policy"))
+	if startErr := vpnSvc.StartPolicyRouting(ctx, policySettings, policyStore, string(policySettings.Preset)); startErr != nil {
+		// Fail closed on the data plane, not on the management plane: never start
+		// serving with PBR reported as on but not actually activated, but keep the
+		// panel reachable. Nothing here rewrites the stored record; the operator's
+		// intent stays available to repair through the API.
+		vpnSvc.ReportPolicyActivationFailure(fmt.Errorf("persisted policy routing could not be activated: %w", startErr))
+		slog.Error("Policy routing could not be activated from persisted settings; the panel starts with policy routing disabled",
+			"preset", string(policySettings.Preset), "err", startErr)
+		return nil
+	}
+	slog.Info("Policy routing activated from persisted settings",
+		"preset", string(policySettings.Preset), "interval_seconds", policySettings.SyncInterval)
+	return nil
+}
+
 func run(ctx context.Context) error {
 	// 1. Load configuration
 	cfg, err := config.Load()
@@ -220,6 +285,17 @@ func run(ctx context.Context) error {
 	vpnSvc.SetAWGStatusProvider(awgMgr)
 	reconciler.SetVPNService(vpnSvc)
 	userOps.SetVPNService(vpnSvc)
+
+	// 8b. Start persisted policy routing (#678) before the data plane accepts
+	// traffic.
+	//
+	// A refused activation is reported through the policy status by the helper and
+	// deliberately does not stop the panel (#678 P2-B): the API is how the operator
+	// repairs the configuration. Any other error returned here is logged for the
+	// same reason rather than taking the management plane down.
+	if err := startPersistedPolicyRouting(ctx, db, vpnSvc, cfg); err != nil {
+		slog.Error("Policy routing startup check failed; the panel continues with policy routing disabled", "err", err)
+	}
 
 	vpnStarted, poolSynced, err := startVPNDataPlane(ctx, vpnSvc, cfg)
 	if err != nil {

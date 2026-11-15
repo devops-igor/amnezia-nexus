@@ -132,6 +132,9 @@ jobs:
       # iptables child capability proof is one of them because it reads the capability
       # sets of a child it starts inside its own user namespace, which ordinary runners
       # refuse; its two namespace-free controls are NOT excluded and keep running here.
+      # TestLinuxE2E_PolicyEnablement (#678) is excluded for the same reason: it needs
+      # root, /dev/net/tun and CAP_NET_RAW, and it is executed by name in the
+      # wan-qualification job below, so the exclusion removes no obligation.
 
       - name: Run Tests with Race Detector (shard ${{ matrix.shard }})
         run: |
@@ -139,7 +142,7 @@ jobs:
           echo "shard ${{ matrix.shard }} package count: $(echo "$packages" | wc -w)"
           go test -race -cover -count=1 -timeout=15m \
             -coverprofile="coverage-shard-${{ matrix.shard }}.out" \
-            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$' \
+            -skip '^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_DirectEgress|TestLinuxE2E_PolicyEnablement|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$' \
             $packages
 
       - name: Run Authentic Native Caddy Integration Tests
@@ -500,7 +503,7 @@ jobs:
               # genuine child PASS — it is never a skip.
               exec /run/wan/vpn-wan.test \
                 -test.v -test.timeout=12m \
-                -test.run "^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$"
+                -test.run "^(TestS4ProductionContainerHostWANQualification|TestProductionWANDevice_PermissionsAndLifecycle|TestWANCaptureProductionPath|TestLinuxE2E_PolicyEnablement|TestIPTablesChild_NonRootConsumerGetsNetAdminOnly)$"
             ' > "$LOG" 2>&1 || rc=$?
           cat "$LOG"
           # Exit status alone is not the oracle: a skip or a missing test would look
@@ -522,6 +525,7 @@ jobs:
             TestS4ProductionContainerHostWANQualification \
             TestProductionWANDevice_PermissionsAndLifecycle \
             TestWANCaptureProductionPath \
+            TestLinuxE2E_PolicyEnablement \
             TestIPTablesChild_NonRootConsumerGetsNetAdminOnly
           do
             if ! grep -qE "^--- PASS: $name " "$LOG"; then
@@ -536,6 +540,12 @@ jobs:
               exit 1
             fi
           done
+          # The #678 policy gate reports structured phases; require the disable phase so
+          # a PASS line without the administrative lifecycle cannot satisfy this step.
+          if ! grep -q 'PHASE disable-all-proxy' "$LOG"; then
+            echo "::error::the policy enablement phases are absent; the admin lifecycle is unproven"
+            exit 1
+          fi
           if ! grep -q 'S4 RESULT: PASS' "$LOG"; then
             echo "::error::the S4 verdict line is absent; the direct-WAN path is unproven"
             exit 1
