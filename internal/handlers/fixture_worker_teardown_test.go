@@ -224,6 +224,57 @@ func TestFixtureVPNServiceReleasesBackendDeviceAtTeardown(t *testing.T) {
 	waitFixtureOwnedWorkers(t, fixtureReturnReaderFrame, svc, 0, "return-path reader after fixture teardown")
 }
 
+// TestSharedHandlerFixtureReleasesItsOwnVPNServiceAtTeardown proves the
+// fixture-level release: a backend enabled on the service setupTestHandlers
+// created is gone after that test's cleanup, not only when a consumer
+// remembered to release a replacement service.
+func TestSharedHandlerFixtureReleasesItsOwnVPNServiceAtTeardown(t *testing.T) {
+	var (
+		dev   vpn.BackendDevice
+		tunID int64
+	)
+	t.Run("the shared fixture enables a backend", func(t *testing.T) {
+		h, db, _ := setupTestHandlers(t)
+		if h.vpnSvc == nil {
+			t.Fatal("setupTestHandlers no longer creates a VPN service, so this control would prove nothing")
+		}
+		ctx := context.Background()
+		serverID, err := db.CreateServer(ctx, &models.Server{
+			Name: "shared-fixture-backend", Host: "198.51.100.103", SSHPort: 22,
+			SSHUser: "root", SSHPass: "fixture-only",
+			Protocols: map[string]any{"awg": map[string]any{
+				"installed":  true,
+				"port":       51820,
+				"public_key": fixtureBackendAWGPublicKey,
+			}},
+			CreatedAt: time.Now(),
+		})
+		if err != nil {
+			t.Fatalf("create the backend server row: %v", err)
+		}
+		if err := h.vpnSvc.EnableBackend(ctx, serverID); err != nil {
+			t.Fatalf("enable a backend on the fixture service: %v", err)
+		}
+		tun, err := h.vpnSvc.GetTunnel(serverID)
+		if err != nil || tun == nil {
+			t.Fatalf("no backend tunnel after enable: %v", err)
+		}
+		tunID, dev = tun.ID, h.vpnSvc.GetBackendDeviceForTest(tun.ID)
+		if dev == nil {
+			t.Fatal("the enabled backend owns no device, so this control would prove nothing")
+		}
+		if dev.IsClosed() {
+			t.Fatal("the backend device is already closed while the test still uses it")
+		}
+	})
+	if dev == nil {
+		t.Fatal("the fixture never produced an enabled backend")
+	}
+	if !dev.IsClosed() {
+		t.Fatalf("the shared fixture left the device of backend tunnel %d open after teardown", tunID)
+	}
+}
+
 // enableControlBackend builds a service the way the handler fixtures do — a
 // never-Started service over a real database — and enables one real backend on
 // it, so the control has a device and a return-path reader to observe.
@@ -395,6 +446,14 @@ func TestDirectConsumerFixturesReleaseTheirBackendDevice(t *testing.T) {
 	}{
 		{"update server host", TestUpdateServerHostHandler_VPNBackendPropagation},
 		{"backend identity rotation", TestBackendIdentityRotationReconcilesPersistedAndActiveIdentity},
+		{"backend rotation unchanged key", TestBackendIdentityRotation_UnchangedKeyNoOp},
+		{"backend rotation reconciliation failure", TestBackendIdentityRotation_ReconciliationFailureRollback},
+		{"backend rotation vpn rollback failure", TestBackendIdentityRotation_VPNRollbackFailureKeepsNewIdentityAndQuarantines},
+		{"backend rotation db compensation failure", TestBackendIdentityRotation_DBCompensationFailureKeepsNewIdentityQuarantined},
+		{"update server host vpn failure", TestUpdateServerHostHandler_VPNFailureRollback},
+		{"update server host canceled context", TestUpdateServerHostHandler_CanceledContextRollback},
+		{"update server host vpn rollback failure", TestUpdateServerHostHandler_VPNRollbackFailure_PreventsSplitState},
+		{"update server host unchanged", TestUpdateServerHostHandler_UnchangedHost_IdempotentNoOp},
 	}
 	for _, consumer := range consumers {
 		// Sampled before the subtest so the assertion is about the device this
