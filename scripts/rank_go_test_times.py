@@ -184,8 +184,12 @@ def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> List[str]:
 def render(report: Report, top: int) -> str:
     lines: List[str] = ["# Go test timing report", ""]
 
-    top_tests = sorted(report.top_level_tests(), key=lambda item: (-item.elapsed, item.package, item.test))
-    subtests = sorted(report.subtests(), key=lambda item: (-item.elapsed, item.package, item.test))
+    top_tests = sorted(
+        report.top_level_tests(), key=lambda item: (-item.elapsed, item.package, item.test)
+    )
+    subtests = sorted(
+        report.subtests(), key=lambda item: (-item.elapsed, item.package, item.test)
+    )
     test_counts = report.counts(top_tests)
     sub_counts = report.counts(subtests)
     package_counts = report.package_counts()
@@ -200,15 +204,23 @@ def render(report: Report, top: int) -> str:
         f"- subtests: {len(subtests)} "
         f"(pass {sub_counts['pass']} / fail {sub_counts['fail']} / skip {sub_counts['skip']})",
         f"- packages: {len(report.packages)} "
-        f"(pass {package_counts['pass']} / fail {package_counts['fail']} / skip {package_counts['skip']})",
+        f"(pass {package_counts['pass']} / fail {package_counts['fail']}"
+        f" / skip {package_counts['skip']})",
         f"- incomplete tests (started, no terminal result): {len(incomplete)}",
         f"- non-JSON lines: {len(report.non_json_lines)}",
         "",
     ]
 
     if incomplete:
-        lines += ["Incomplete tests are the signature of a timeout or a panic; they were started but never reported a result:", ""]
-        lines += [f"- `{package.removeprefix(MODULE_PREFIX)}` `{test}`" for package, test in incomplete[:top]]
+        lines += [
+            "Incomplete tests are the signature of a timeout or a panic; they were"
+            " started but never reported a result:",
+            "",
+        ]
+        lines += [
+            f"- `{package.removeprefix(MODULE_PREFIX)}` `{test}`"
+            for package, test in incomplete[:top]
+        ]
         lines.append("")
 
     lines += ["## Slowest top-level tests", ""]
@@ -249,7 +261,13 @@ def render(report: Report, top: int) -> str:
     lines += ["## Slowest subtests", ""]
     if subtests:
         rows = [
-            [str(index), f"`{item.test}`", f"`{item.short_package()}`", _seconds(item.elapsed), item.action]
+            [
+                str(index),
+                f"`{item.test}`",
+                f"`{item.short_package()}`",
+                _seconds(item.elapsed),
+                item.action,
+            ]
             for index, item in enumerate(subtests[:top], start=1)
         ]
         lines += _table(["#", "Subtest", "Package", "Elapsed s", "Result"], rows)
@@ -278,9 +296,14 @@ def render(report: Report, top: int) -> str:
                     result.action,
                 ]
             )
-        lines += _table(["Package", "Elapsed s", "Top-level tests", "Failures", "Skips", "Result"], rows)
+        lines += _table(
+            ["Package", "Elapsed s", "Top-level tests", "Failures", "Skips", "Result"], rows
+        )
     else:
-        lines.append("_No package result was collected; a build failure or timeout leaves no package total._")
+        lines.append(
+            "_No package result was collected; a build failure or timeout leaves"
+            " no package total._"
+        )
     lines.append("")
 
     if report.runner_facts:
@@ -300,7 +323,10 @@ def render(report: Report, top: int) -> str:
             " overlaps, so a negative value is expected when `-p` > 1)"
         )
     else:
-        lines.append("_No `wall_ms` runner fact was supplied, so compile/setup time is not separated from test-binary time._")
+        lines.append(
+            "_No `wall_ms` runner fact was supplied, so compile/setup time is not"
+            " separated from test-binary time._"
+        )
     lines.append("")
 
     if report.non_json_lines:
@@ -325,7 +351,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Rank Go test runtimes from go test -json output")
     parser.add_argument("files", nargs="+", type=Path, help="one or more go test -json files")
     parser.add_argument("--top", type=int, default=DEFAULT_TOP, help="rows per table (default: 20)")
-    parser.add_argument("--runner-facts", type=Path, help="key=value file with runner and wall-clock facts")
+    parser.add_argument(
+        "--runner-facts", type=Path, help="key=value file with runner and wall-clock facts"
+    )
     args = parser.parse_args(argv)
 
     if args.top < 1:

@@ -34,7 +34,12 @@ def _load():
     return module
 
 
-def _event(action: str, package: str = f"{MODULE}/pkg", test: str | None = None, elapsed: float | None = None) -> dict:
+def _event(
+    action: str,
+    package: str = f"{MODULE}/pkg",
+    test: str | None = None,
+    elapsed: float | None = None,
+) -> dict:
     event = {"Time": "2026-11-15T00:00:00Z", "Action": action, "Package": package}
     if test is not None:
         event["Test"] = test
@@ -92,7 +97,9 @@ def test_parent_and_subtest_durations_are_not_summed(tmp_path: Path) -> None:
     report = _report([path])
 
     assert len(report.top_level_tests()) == 1
-    assert report.top_level_tests()[0].elapsed == 10.0, "the parent must not absorb its subtests a second time"
+    assert report.top_level_tests()[0].elapsed == 10.0, (
+        "the parent must not absorb its subtests a second time"
+    )
     assert report.top_level_tests()[0].elapsed != 20.0
 
 
@@ -215,7 +222,7 @@ def test_pass_fail_skip_counts_are_separate_for_tests_and_subtests(tmp_path: Pat
     assert report.package_counts() == {"pass": 0, "fail": 1, "skip": 0}
 
 
-def test_a_repeated_result_is_counted_once_and_keeps_the_slowest_observation(tmp_path: Path) -> None:
+def test_a_repeated_result_counts_once_and_keeps_the_slowest(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         [
@@ -256,10 +263,17 @@ def test_runner_facts_and_wall_time_separate_setup_from_test_binary_time(tmp_pat
 
 
 def test_multiple_shard_files_are_aggregated(tmp_path: Path) -> None:
-    one = _write(tmp_path, [_event("pass", test="TestA", elapsed=1.0), _event("pass", elapsed=1.1)], "one.json")
+    one = _write(
+        tmp_path,
+        [_event("pass", test="TestA", elapsed=1.0), _event("pass", elapsed=1.1)],
+        "one.json",
+    )
     two = _write(
         tmp_path,
-        [_event("pass", package=f"{MODULE}/other", test="TestB", elapsed=5.0), _event("pass", package=f"{MODULE}/other", elapsed=5.2)],
+        [
+            _event("pass", package=f"{MODULE}/other", test="TestB", elapsed=5.0),
+            _event("pass", package=f"{MODULE}/other", elapsed=5.2),
+        ],
         "two.json",
     )
 
