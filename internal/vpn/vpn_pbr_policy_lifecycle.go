@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
+	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
 )
 
 // This file owns the production policy-source lifecycle for issue #678: turning
@@ -85,6 +87,19 @@ type PolicyStatus struct {
 	LastSuccess  string `json:"last_success,omitempty"`
 	SyncState    string `json:"sync_state"`
 	LastError    string `json:"last_error,omitempty"`
+
+	// Upstream DNS health (issue #824). Without these an operator cannot tell a
+	// blocked upstream provider, which produces no evidence at all, from a policy
+	// that simply has not matched anything yet.
+	//
+	// LastUpstream is the upstream that served the most recent accepted answer.
+	// LastUpstreamFailure and LastUpstreamFailureKind describe the most recent
+	// failed attempt and are cleared by a later successful exchange. All three
+	// are empty while policy routing is not running or no exchange has happened.
+	// They carry resolver addresses only: no queried names and no client data.
+	LastUpstream            string `json:"last_upstream,omitempty"`
+	LastUpstreamFailure     string `json:"last_upstream_failure,omitempty"`
+	LastUpstreamFailureKind string `json:"last_upstream_failure_kind,omitempty"`
 }
 
 // policyRuntime holds the live policy objects for a started service.
@@ -176,6 +191,7 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 		Enabled:       true,
 		HostWANIP:     hostWAN,
 		PolicyMatcher: matcher,
+		UpstreamDNS:   settings.EffectiveUpstreams(),
 	})
 
 	if err := s.initPBR(ctx); err != nil {
@@ -229,10 +245,90 @@ func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.M
 	if !syncRes.Published {
 		return fmt.Errorf("%w: policy update sync did not publish a snapshot", ErrPolicyActivationNoRules)
 	}
+	// The upstream list is not part of the compiled snapshot, so it is applied to
+	// the live resolver instead of rebuilding the data path. It is applied only
+	// after the sync succeeded: a refused update must leave the previous working
+	// configuration, upstreams included, exactly as it was.
+	if err := s.applyLiveUpstreams(settings); err != nil {
+		return err
+	}
 	// Only after the content is published does the schedule change, so a refused
 	// update leaves the previous loop running on the previous rules.
 	s.startPolicyLoop(ctx, syncer, matcher, settings, presetID)
 	return nil
+}
+
+// applyLiveUpstreams applies an accepted settings change to the DNS consumers of
+// this service. It is a no-op when nothing consumes DNS yet, and a rejected list
+// leaves the installed list in effect.
+func (s *Service) applyLiveUpstreams(settings policy.Settings) error {
+	if s == nil {
+		return nil
+	}
+	return s.ApplyEffectiveUpstreams(settings.EffectiveUpstreams())
+}
+
+// ApplyEffectiveUpstreams publishes an accepted upstream list to whichever DNS
+// consumer owns answers right now and records it as the service's current
+// effective list.
+//
+// The list is validated before anything is published, and the owned field is
+// written in the same critical section as the consumer update, so teardown, a
+// later continuity install and a disabled restart all read the list the operator
+// most recently had accepted - never the value captured at activation.
+func (s *Service) ApplyEffectiveUpstreams(upstreams []policy.Upstream) error {
+	if s == nil {
+		return nil
+	}
+	effective := policy.DefaultUpstreams()
+	if len(upstreams) > 0 {
+		effective = make([]policy.Upstream, len(upstreams))
+		copy(effective, upstreams)
+	}
+	if err := gatewaydns.ValidateUpstreams(effective, false); err != nil {
+		return fmt.Errorf("policy update: upstream dns configuration rejected: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// The list is validated above, so it is the accepted configuration: recording
+	// it first means a consumer that cannot be rebuilt never hides it from the
+	// next rebuild.
+	s.dnsUpstreams = effective
+
+	pbrCfg, err := s.applyToLiveResolverLocked(effective)
+	if err != nil {
+		return err
+	}
+	if s.forwarder == nil || s.forwarder.PBREnabled() {
+		// Either there is no data path to serve, or the policy resolver is the
+		// answer path. The continuity responder is rebuilt from the owned list
+		// when the data path is torn down.
+		return nil
+	}
+	addr := netip.Addr{}
+	if pbrCfg != nil {
+		addr = pbrCfg.GatewayDNSIP
+	}
+	s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(addr), effective)
+	return nil
+}
+
+// applyToLiveResolverLocked publishes upstreams to the resolver registered with
+// the policy gateway and keeps the registered activation metadata in step with
+// it. It returns the configuration it updated (nil when none is registered) so
+// the caller can reuse its gateway address. The caller holds s.mu.
+func (s *Service) applyToLiveResolverLocked(upstreams []policy.Upstream) (*PBRConfig, error) {
+	pbrCfg := s.getPBRConfig()
+	if pbrCfg == nil || pbrCfg.DNSResolver == nil {
+		return pbrCfg, nil
+	}
+	if err := pbrCfg.DNSResolver.SetUpstreams(upstreams); err != nil {
+		return nil, fmt.Errorf("policy update: upstream dns configuration rejected: %w", err)
+	}
+	s.publishPBRUpstreamsLocked(upstreams)
+	return pbrCfg, nil
 }
 
 // newPolicySyncer builds the syncer one activation/replacement uses.
@@ -507,7 +603,22 @@ func (s *Service) PolicyStatusSnapshot() PolicyStatus {
 		status.LastError = failure
 		status.SyncState = "error"
 	}
+
+	applyUpstreamStatus(&status, s.getPBRConfig())
 	return status
+}
+
+// applyUpstreamStatus copies the upstream health of the resolver the policy
+// gateway actually dials, so a blocked provider surfaces as a failure kind
+// instead of presenting as "no evidence".
+func applyUpstreamStatus(status *PolicyStatus, pbrCfg *PBRConfig) {
+	if pbrCfg == nil || pbrCfg.DNSResolver == nil {
+		return
+	}
+	live := pbrCfg.DNSResolver.Status()
+	status.LastUpstream = live.LastUpstream
+	status.LastUpstreamFailure = live.LastFailure
+	status.LastUpstreamFailureKind = string(live.LastFailureKind)
 }
 
 // applySyncerStatus copies the live syncer's counters and sync outcome into status.
