@@ -139,11 +139,16 @@ func releaseFixtureVPNService(t *testing.T, svc *vpn.Service) {
 // releaseFixtureBackend releases one backend's device and then verifies it,
 // rather than assuming the release happened. A device still open here keeps its
 // return-path reader alive for the rest of the test binary.
+//
+// The device is captured before the disable: DisableBackend deletes it from the
+// service's map, so a lookup afterwards returns nil whether the device was
+// closed or merely dropped while still open, and the check would be vacuous.
 func releaseFixtureBackend(t *testing.T, svc *vpn.Service, tun *models.BackendTunnel) {
 	t.Helper()
 	if tun == nil {
 		return
 	}
+	dev := svc.GetBackendDeviceForTest(tun.ID)
 	if err := svc.DisableBackend(context.Background(), tun.ServerID); err != nil {
 		// The disable persists the administrative state before it releases the
 		// device, so a test that already closed the database fails here. The
@@ -151,7 +156,6 @@ func releaseFixtureBackend(t *testing.T, svc *vpn.Service, tun *models.BackendTu
 		// that ends the reader.
 		t.Logf("disabling fixture backend %d for release: %v", tun.ServerID, err)
 	}
-	dev := svc.GetBackendDeviceForTest(tun.ID)
 	if dev == nil {
 		return
 	}
