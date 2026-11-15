@@ -15,12 +15,21 @@ import (
 // one reply would appear from the wrong resolver.
 //
 // Every intercepted TCP DNS connection therefore receives its own internal
-// source port from a small bounded range. The netstack sees a distinct
-// connection for every original client/resolver tuple, and a reply is
-// reverse-mapped from the internal port back to exactly the tuple that produced
-// it. The table is per session, capped by dnsTCPNATMaxEntries and expired by
-// dnsTCPNATIdleTimeout; a live connection is never overwritten by another
-// connection's translation.
+// source port. The netstack sees a distinct connection for every original
+// client/resolver tuple, and a reply is reverse-mapped from the internal port
+// back to exactly the tuple that produced it.
+//
+// A translation is a mapping, not the connection itself: dropping one does not
+// terminate the TCP connection the gateway netstack still holds, and that
+// connection may emit a reply on its port at any later time, however long the
+// translation has been gone. An internal port is therefore issued once per
+// session and never returned: consumption is monotonic, and a retired
+// translation's port stays permanently unassigned, so a delayed reply finds no
+// translation and is dropped instead of being rewritten to whichever tuple
+// happened to receive the port next. The table is per session, capped by
+// dnsTCPNATMaxEntries and expired by dnsTCPNATIdleTimeout; when the session has
+// issued every identity it owns, a new connection is refused and its packets
+// are dropped rather than given a port an older connection could still use.
 
 const (
 	// dnsTCPNATMaxEntries bounds the per-session TCP DNS translations that
@@ -32,18 +41,21 @@ const (
 
 	// dnsTCPNATIdleTimeout is how long an idle translation is retained. TCP
 	// DNS connections are short-lived; an entry older than this is evicted on
-	// the next translation that needs room and ignored on lookup, so a stale
-	// translation can never rewrite an unrelated later reply.
+	// the next translation that needs room and ignored on lookup, so an idle
+	// translation cannot rewrite an unrelated later reply.
 	dnsTCPNATIdleTimeout = 60 * time.Second
 
-	// dnsTCPNATTranslatedPortBase is the first internal source port allocated
-	// for an intercepted TCP DNS connection.
+	// dnsTCPNATTranslatedPortBase is the first internal source port issued for
+	// an intercepted TCP DNS connection.
 	dnsTCPNATTranslatedPortBase = 20000
 
-	// dnsTCPNATTranslatedPortSpan is the size of the internal port range. It
-	// must equal dnsTCPNATMaxEntries: a distinct internal connection identity
-	// for every live translation needs one unique port per entry.
-	dnsTCPNATTranslatedPortSpan = dnsTCPNATMaxEntries
+	// dnsTCPNATTranslatedPortSpan is the number of internal identities a
+	// session may issue, covering the rest of the port range from
+	// dnsTCPNATTranslatedPortBase. It is deliberately far larger than
+	// dnsTCPNATMaxEntries: because an identity is never reused, the span is the
+	// session's total budget of intercepted TCP DNS connections, not its
+	// concurrency bound. Running out is a clean refusal, never a reuse.
+	dnsTCPNATTranslatedPortSpan = 1<<16 - dnsTCPNATTranslatedPortBase
 )
 
 // dnsTCPNATKey is the original connection tuple a translation stands for. The
@@ -67,8 +79,12 @@ type dnsTCPNAT struct {
 	// byOriginal maps an original tuple to its internal port, so every packet
 	// of one connection reuses the same internal identity.
 	byOriginal map[dnsTCPNATKey]uint16
-	// nextPort rotates the allocation cursor so freed ports are reused fairly.
-	nextPort int
+	// nextIdentity is the monotonic identity cursor: each allocation consumes
+	// the next never-issued internal port. A port is never returned to the
+	// pool, because a retired translation cannot terminate the netstack
+	// connection that held it, and that connection may emit a reply on its port
+	// at any later time.
+	nextIdentity int
 }
 
 // outbound rewrites an intercepted TCP DNS packet so the gateway netstack
@@ -99,15 +115,14 @@ func (n *dnsTCPNAT) outbound(packet []byte, ihl int, gateway netip.AddrPort, now
 
 // inbound rewrites a reply emitted by the gateway netstack back to the exact
 // client/resolver tuple its internal connection represents. A packet that is not
-// a TCP reply from the gateway, or whose translation expired, is returned
-// unchanged; a translation that cannot be applied drops the packet.
+// a TCP reply from the gateway is returned unchanged. A TCP reply from the
+// gateway whose internal port holds no live translation is dropped: the netstack
+// may still emit it for a connection whose translation was retired or expired,
+// and the packet carries nothing but that internal port, so delivering it
+// unchanged could hand it to an unrelated client socket.
 func (n *dnsTCPNAT) inbound(packet []byte, gateway netip.AddrPort, now time.Time) ([]byte, bool) {
-	if len(packet) < 20 || packet[0]>>4 != 4 {
-		return packet, true
-	}
-	ihl := int(packet[0]&0x0f) * 4
-	totalLen, ok := ipv4TotalLength(packet, ihl)
-	if !ok || packet[9] != 6 || fragmentedIPv4(packet) {
+	ihl, totalLen, ok := ipv4TCPReply(packet)
+	if !ok {
 		return packet, true
 	}
 	if ipv4Addr(packet, 12) != gateway.Addr() || binary.BigEndian.Uint16(packet[ihl:ihl+2]) != gateway.Port() {
@@ -117,17 +132,35 @@ func (n *dnsTCPNAT) inbound(packet []byte, gateway netip.AddrPort, now time.Time
 	internalPort := binary.BigEndian.Uint16(packet[ihl+2 : ihl+4])
 	key, ok := n.original(internalPort, now)
 	if !ok {
-		return packet, true
+		// No live translation owns this port. It was retired, expired, or never
+		// issued, and the connection that held it may still emit; fail closed
+		// rather than deliver a packet nobody can be proven to own.
+		return nil, false
 	}
 	return rewriteTCPEndpoints(packet, ihl, totalLen,
 		key.resolver.Addr(), key.resolver.Port(),
 		key.client.Addr(), key.client.Port())
 }
 
+// ipv4TCPReply validates that packet is a complete, unfragmented IPv4 TCP
+// segment and returns its IP header length and total length.
+func ipv4TCPReply(packet []byte) (ihl, totalLen int, ok bool) {
+	if len(packet) < 20 || packet[0]>>4 != 4 {
+		return 0, 0, false
+	}
+	ihl = int(packet[0]&0x0f) * 4
+	totalLen, ok = ipv4TotalLength(packet, ihl)
+	if !ok || packet[9] != 6 || fragmentedIPv4(packet) {
+		return 0, 0, false
+	}
+	return ihl, totalLen, true
+}
+
 // internalPort returns the internal port reserved for an original tuple,
 // allocating one when the tuple is new. A live sibling translation is never
-// overwritten: when the table is at capacity the oldest entry is evicted first
-// and the caller keeps every live tuple distinct up to that bound.
+// overwritten: when the table is at capacity the oldest entry is retired first.
+// The identity is claimed before any entry is retired, so an exhausted identity
+// space refuses the packet without disturbing the table.
 func (n *dnsTCPNAT) internalPort(key dnsTCPNATKey, now time.Time) (uint16, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -142,12 +175,12 @@ func (n *dnsTCPNAT) internalPort(key dnsTCPNATKey, now time.Time) (uint16, bool)
 		}
 		n.dropLocked(port)
 	}
-	if len(n.byInternal) >= dnsTCPNATMaxEntries {
-		n.evictLocked(now)
-	}
 	port, ok := n.allocateLocked()
 	if !ok {
 		return 0, false
+	}
+	if len(n.byInternal) >= dnsTCPNATMaxEntries {
+		n.evictLocked(now)
 	}
 	n.byInternal[port] = &dnsTCPNATTranslation{key: key, lastSeen: now}
 	n.byOriginal[key] = port
@@ -170,21 +203,29 @@ func (n *dnsTCPNAT) original(port uint16, now time.Time) (dnsTCPNATKey, bool) {
 	return entry.key, true
 }
 
-// allocateLocked reserves a port that no live translation uses. The caller holds
-// n.mu and has ensured the table has room.
+// allocateLocked consumes the next never-issued internal port. The caller holds
+// n.mu. Identities are issued monotonically and never reused: a retired
+// translation cannot terminate the netstack connection that held its port, so
+// that connection may still emit a reply on it. Skipping the port forever is
+// what stops such a reply from being rewritten to whichever tuple received the
+// port next. Exhaustion is a clean refusal; the caller drops the packet.
 func (n *dnsTCPNAT) allocateLocked() (uint16, bool) {
-	for i := 0; i < dnsTCPNATTranslatedPortSpan; i++ {
-		port := uint16(dnsTCPNATTranslatedPortBase + (n.nextPort+i)%dnsTCPNATTranslatedPortSpan)
-		if _, used := n.byInternal[port]; !used {
-			n.nextPort = (n.nextPort + i + 1) % dnsTCPNATTranslatedPortSpan
-			return port, true
+	for n.nextIdentity < dnsTCPNATTranslatedPortSpan {
+		// #nosec G115 -- nextIdentity is bounded by the span, so the sum stays
+		// within the uint16 port range.
+		port := uint16(dnsTCPNATTranslatedPortBase + n.nextIdentity)
+		n.nextIdentity++
+		if _, used := n.byInternal[port]; used {
+			continue
 		}
+		return port, true
 	}
 	return 0, false
 }
 
-// dropLocked removes one translation and its reverse entry. The caller holds
-// n.mu.
+// dropLocked removes one translation and its reverse entry. The port is not
+// returned to the allocation pool, so no later connection can inherit it. The
+// caller holds n.mu.
 func (n *dnsTCPNAT) dropLocked(port uint16) {
 	entry := n.byInternal[port]
 	if entry == nil {
@@ -197,7 +238,10 @@ func (n *dnsTCPNAT) dropLocked(port uint16) {
 }
 
 // evictLocked removes expired translations first and the oldest remaining one
-// when the session is still at capacity. The caller holds n.mu.
+// when the session is still at capacity. Retiring a translation frees its table
+// slot but not its identity: the port stays permanently unassigned so the
+// retired connection's late replies cannot reach the tuple that takes the slot.
+// The caller holds n.mu.
 func (n *dnsTCPNAT) evictLocked(now time.Time) {
 	var oldestPort uint16
 	var oldestAt time.Time

@@ -140,9 +140,21 @@ own internal source port from a small bounded range
 A later packet of the same connection reuses its internal identity. Entries are
 per session, capped at 256, discarded after 60 seconds of idleness, and evicted
 oldest-first only when the cap is reached; another connection's mapping never
-overwrites or clears a live sibling translation. Fragmented or malformed packets
-are dropped rather than translated. Replies therefore always appear from the
-resolver the client queried, and an unmodified DNS client accepts them.
+overwrites or clears a live sibling translation.
+
+A translation is only a mapping. Removing one does not terminate the TCP
+connection the netstack still holds, and that connection can emit a reply on its
+port at any later time, however long the translation has been gone. An internal
+port is therefore issued once per session and never returned to the pool, so no
+later tuple can inherit a port that an older connection may still use. A reply
+whose internal port holds no live translation is dropped rather than delivered
+unchanged, because the packet carries nothing that could prove which tuple owns
+it. When a session has issued all of its identities (the ports from 20000 to
+65535, 45536 in total), a new intercepted TCP connection is refused and its
+packets are dropped instead of being translated onto an identity that might
+collide; the table still holds at most 256 translations. Fragmented or malformed
+packets are dropped rather than translated. Replies therefore always appear from
+the resolver the client queried, and an unmodified DNS client accepts them.
 
 ### Observations
 
