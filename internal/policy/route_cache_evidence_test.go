@@ -89,6 +89,13 @@ func TestSessionCacheInspectStates(t *testing.T) {
 			t.Fatalf("evidence = %+v, want retired", got)
 		}
 	})
+
+	t.Run("scope without a published view", func(t *testing.T) {
+		empty := &SessionCache{}
+		if got := empty.Inspect(fresh, gen, now); got.State != EvidenceRetired {
+			t.Fatalf("evidence = %+v, want retired", got)
+		}
+	})
 }
 
 // TestSessionCacheInspectQuarantined covers the eviction state: capacity

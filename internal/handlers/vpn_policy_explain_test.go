@@ -92,6 +92,34 @@ func TestExplainPolicyHandlerAcceptsAddresses(t *testing.T) {
 	}
 }
 
+// TestParsePolicyExplainAddresses pins the address-list rules on the pure
+// parser: deduplication keeps the request's work proportional to the number of
+// distinct destinations, and each rejection names its reason.
+func TestParsePolicyExplainAddresses(t *testing.T) {
+	addrs, msg := parsePolicyExplainAddresses("198.51.200.9", []string{"198.51.200.9", "198.51.200.10"})
+	if msg != "" {
+		t.Fatalf("unexpected rejection: %s", msg)
+	}
+	if len(addrs) != 2 || addrs[0].String() != "198.51.200.9" || addrs[1].String() != "198.51.200.10" {
+		t.Fatalf("addresses = %v, want the two distinct addresses in input order", addrs)
+	}
+
+	if addrs, msg := parsePolicyExplainAddresses("", nil); len(addrs) != 0 || msg != "" {
+		t.Fatalf("empty input = %v/%q, want no addresses and no rejection", addrs, msg)
+	}
+	if _, msg := parsePolicyExplainAddresses("2001:db8::1", nil); !strings.Contains(msg, "IPv4 only") {
+		t.Fatalf("IPv6 rejection = %q, want an IPv4-only reason", msg)
+	}
+	if _, msg := parsePolicyExplainAddresses("nope", nil); !strings.Contains(msg, "not a valid address") {
+		t.Fatalf("malformed rejection = %q", msg)
+	}
+	nine := []string{"198.51.200.1", "198.51.200.2", "198.51.200.3", "198.51.200.4",
+		"198.51.200.5", "198.51.200.6", "198.51.200.7", "198.51.200.8", "198.51.200.9"}
+	if _, msg := parsePolicyExplainAddresses("", nine); !strings.Contains(msg, "at most 8 addresses") {
+		t.Fatalf("excess rejection = %q", msg)
+	}
+}
+
 // TestExplainPolicyHandlerRejectsInvalidInput pins that every rejection names
 // the offending field instead of collapsing into one generic message.
 func TestExplainPolicyHandlerRejectsInvalidInput(t *testing.T) {
@@ -114,6 +142,7 @@ func TestExplainPolicyHandlerRejectsInvalidInput(t *testing.T) {
 		{"malformed address", `{"ip":"not-an-address"}`, "is not a valid address"},
 		{"too many addresses", `{"ips":["198.51.200.1","198.51.200.2","198.51.200.3","198.51.200.4","198.51.200.5","198.51.200.6","198.51.200.7","198.51.200.8","198.51.200.9"]}`, "at most 8 addresses"},
 		{"overlong session", `{"domain":"www.example","session_id":"` + strings.Repeat("s", 130) + `"}`, "session_id"},
+		{"oversized body", `{"domain":"` + strings.Repeat("a", policyExplainMaxBodyBytes) + `.example"}`, "too large"},
 	}
 
 	for _, tc := range cases {

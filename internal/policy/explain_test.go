@@ -352,6 +352,30 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 		}
 	})
 
+	t.Run("retired session evidence is treated as no evidence", func(t *testing.T) {
+		f := newExplainFixture(t)
+		f.observe(t, plainAddr, "DIRECT", time.Minute)
+		other, err := f.cache.Open(Scope{SessionID: "session-2", OwnershipEpoch: 1})
+		if err != nil {
+			t.Fatalf("open second scope: %v", err)
+		}
+		other.Invalidate()
+		got := ExplainDestination(ExplainDestinationInput{
+			Enabled:   true,
+			Snapshot:  f.snap,
+			Addresses: []netip.Addr{netip.MustParseAddr(plainAddr)},
+			Resolved:  true,
+			EvidenceFor: func(addr netip.Addr) *Evidence {
+				ev := other.Inspect(addr, f.gen, f.now)
+				return &ev
+			},
+			Prohibited: noProhibited,
+		})
+		if got.Decision != ActionProxy || got.Reason != CauseNoEvidence {
+			t.Fatalf("retired = %s/%s, want PROXY/%s", got.Decision, got.Reason, CauseNoEvidence)
+		}
+	})
+
 	t.Run("no evidence at all is the safe proxy default", func(t *testing.T) {
 		f := newExplainFixture(t)
 		got := f.explain(ExplainDestinationInput{

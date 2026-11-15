@@ -51,11 +51,6 @@ type Evidence struct {
 	Generation string
 }
 
-// Valid reports whether the evidence carries anything actionable.
-func (e Evidence) Valid() bool {
-	return e.State != ""
-}
-
 // Remaining returns how long the stored deadline still has to run at now. A
 // non-positive result means the evidence has expired.
 func (e Evidence) Remaining(now time.Time) time.Duration {
@@ -78,17 +73,8 @@ func (s *SessionCache) Inspect(ip netip.Addr, policyGeneration string, now time.
 		return Evidence{State: EvidenceRetired}
 	}
 	v := s.view.Load()
-	if v == nil {
-		return Evidence{State: EvidenceRetired}
-	}
-	if v.retired {
-		return Evidence{State: EvidenceRetired, Generation: v.policyGeneration}
-	}
-	if v.policyGeneration == "" || v.policyGeneration != policyGeneration {
-		return Evidence{State: EvidenceStaleGeneration, Generation: v.policyGeneration}
-	}
-	if !v.unknownUntil.IsZero() && now.Before(v.unknownUntil) {
-		return Evidence{State: EvidenceQuarantined, ExpiresAt: v.unknownUntil, Generation: v.policyGeneration}
+	if state, decided := viewEvidenceState(v, policyGeneration, now); decided {
+		return state
 	}
 	if !ip.IsValid() || !ip.Is4() {
 		return Evidence{State: EvidenceAbsent, Generation: v.policyGeneration}
@@ -103,6 +89,26 @@ func (s *SessionCache) Inspect(ip netip.Addr, policyGeneration string, now time.
 		ExpiresAt:  entry.expiresAt,
 		Generation: v.policyGeneration,
 	}
+}
+
+// viewEvidenceState reports a state that is decided by the view alone: retired or
+// replaced authority, a stale policy generation, or an active capacity
+// quarantine. The second result is false when the view is usable for a per-address
+// lookup, which is what keeps Inspect's own body about one entry.
+func viewEvidenceState(v *routeView, policyGeneration string, now time.Time) (Evidence, bool) {
+	if v == nil {
+		return Evidence{State: EvidenceRetired}, true
+	}
+	if v.retired {
+		return Evidence{State: EvidenceRetired, Generation: v.policyGeneration}, true
+	}
+	if v.policyGeneration == "" || v.policyGeneration != policyGeneration {
+		return Evidence{State: EvidenceStaleGeneration, Generation: v.policyGeneration}, true
+	}
+	if !v.unknownUntil.IsZero() && now.Before(v.unknownUntil) {
+		return Evidence{State: EvidenceQuarantined, ExpiresAt: v.unknownUntil, Generation: v.policyGeneration}, true
+	}
+	return Evidence{}, false
 }
 
 // evidenceState classifies a stored entry against now with the same boundary

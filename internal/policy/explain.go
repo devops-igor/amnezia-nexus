@@ -272,36 +272,42 @@ func explainAddress(in ExplainDestinationInput, addr netip.Addr, rule *DomainRul
 		return v
 	}
 
-	var evidence *Evidence
-	if in.EvidenceFor != nil {
-		evidence = in.EvidenceFor(addr)
-	}
-	if evidence == nil {
+	if in.EvidenceFor == nil {
 		v.Decision, v.Reason = ActionProxy, CauseNoEvidence
 		return v
 	}
+	evidence := in.EvidenceFor(addr)
+	v.Decision, v.Reason = evidenceVerdict(evidence)
 	v.Evidence = evidence
+	return v
+}
 
+// evidenceVerdict maps the state of a session's evidence to the action the data
+// path takes and the cause to report. It is the only place the evidence states
+// become decisions, so the mapping cannot drift between the headline and the
+// per-address verdicts.
+func evidenceVerdict(evidence *Evidence) (Action, Cause) {
+	if evidence == nil {
+		return ActionProxy, CauseNoEvidence
+	}
 	switch evidence.State {
 	case EvidenceFresh:
 		if evidence.Decision == Direct {
-			v.Decision, v.Reason = ActionDirect, CauseFreshEvidenceDirect
-			return v
+			return ActionDirect, CauseFreshEvidenceDirect
 		}
 		// A fresh PROXY observation with no matching rule means another name that
 		// resolves to this shared address is proxy-required, and PROXY wins in the
 		// cache.
-		v.Decision, v.Reason = ActionProxy, CauseSharedIPConflict
+		return ActionProxy, CauseSharedIPConflict
 	case EvidenceExpired:
-		v.Decision, v.Reason = ActionProxy, CauseExpiredEvidence
+		return ActionProxy, CauseExpiredEvidence
 	case EvidenceQuarantined:
-		v.Decision, v.Reason = ActionProxy, CauseEvictedEvidence
+		return ActionProxy, CauseEvictedEvidence
 	case EvidenceStaleGeneration:
-		v.Decision, v.Reason = ActionProxy, CauseStaleEvidence
+		return ActionProxy, CauseStaleEvidence
 	default:
-		v.Decision, v.Reason = ActionProxy, CauseNoEvidence
+		return ActionProxy, CauseNoEvidence
 	}
-	return v
 }
 
 // summariseActions reduces the per-address verdicts to one headline decision.

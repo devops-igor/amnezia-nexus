@@ -79,69 +79,91 @@ func (h *Handlers) ExplainPolicyHandler(w http.ResponseWriter, r *http.Request) 
 // response itself and reports whether the caller may proceed.
 //
 // Every rejection is specific, because the operator is debugging a policy and a
-// generic "invalid input" would hide which field was wrong.
+// generic "invalid input" would hide which field was wrong. The body-limit rules
+// and the semantic validation are separate steps so each one stays readable.
 func (h *Handlers) decodePolicyExplain(w http.ResponseWriter, r *http.Request) (vpn.PolicyExplainRequest, bool) {
+	raw, ok := h.readPolicyExplainBody(w, r)
+	if !ok {
+		return vpn.PolicyExplainRequest{}, false
+	}
 	var body policyExplainRequest
-	if r == nil || r.Body == nil {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Request body is empty")
-		return vpn.PolicyExplainRequest{}, false
-	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, policyExplainMaxBodyBytes+1))
-	if err != nil {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
-		return vpn.PolicyExplainRequest{}, false
-	}
-	defer func() { _ = r.Body.Close() }()
-	if len(raw) == 0 {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Request body is empty")
-		return vpn.PolicyExplainRequest{}, false
-	}
-	if len(raw) > policyExplainMaxBodyBytes {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Request body is too large")
-		return vpn.PolicyExplainRequest{}, false
-	}
 	if err := json.Unmarshal(raw, &body); err != nil {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
 		return vpn.PolicyExplainRequest{}, false
 	}
 
+	out, rejection := buildPolicyExplainRequest(body)
+	if rejection != "" {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", rejection)
+		return vpn.PolicyExplainRequest{}, false
+	}
+	return out, true
+}
+
+// readPolicyExplainBody applies the body limits and reports a specific reason.
+func (h *Handlers) readPolicyExplainBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	if r == nil || r.Body == nil {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Request body is empty")
+		return nil, false
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, policyExplainMaxBodyBytes+1))
+	if err != nil {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
+		return nil, false
+	}
+	defer func() { _ = r.Body.Close() }()
+	switch {
+	case len(raw) == 0:
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Request body is empty")
+		return nil, false
+	case len(raw) > policyExplainMaxBodyBytes:
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Request body is too large")
+		return nil, false
+	}
+	return raw, true
+}
+
+// buildPolicyExplainRequest turns a decoded body into a validated request, or
+// returns the operator-facing rejection. It is pure so each rule can be read
+// and tested on its own.
+func buildPolicyExplainRequest(body policyExplainRequest) (vpn.PolicyExplainRequest, string) {
 	out := vpn.PolicyExplainRequest{SessionID: strings.TrimSpace(body.SessionID)}
 	if len(out.SessionID) > policyExplainMaxSessionID {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", "session_id is longer than 128 characters")
-		return vpn.PolicyExplainRequest{}, false
+		return vpn.PolicyExplainRequest{}, "session_id is longer than 128 characters"
 	}
 
 	rawName := strings.TrimSpace(body.Domain)
 	if rawName != "" {
 		normalized, normErr := policy.NormalizeDomain(rawName)
 		if normErr != nil {
-			h.JSONError(w, http.StatusBadRequest, "validation_failed", "domain: "+normErr.Error())
-			return vpn.PolicyExplainRequest{}, false
+			return vpn.PolicyExplainRequest{}, "domain: " + normErr.Error()
 		}
 		out.Name = normalized
 	}
 
 	addresses, addrErr := parsePolicyExplainAddresses(body.IP, body.IPs)
 	if addrErr != "" {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed", addrErr)
-		return vpn.PolicyExplainRequest{}, false
+		return vpn.PolicyExplainRequest{}, addrErr
 	}
-
 	if out.Name == "" && len(addresses) == 0 {
-		h.JSONError(w, http.StatusBadRequest, "validation_failed",
-			"a domain name or at least one address is required")
-		return vpn.PolicyExplainRequest{}, false
+		return vpn.PolicyExplainRequest{}, "a domain name or at least one address is required"
 	}
 
 	out.Addresses = addresses
-	out.Value = rawName
-	if out.Value == "" {
-		out.Value = strings.Join(body.IPs, ", ")
-		if out.Value == "" {
-			out.Value = strings.TrimSpace(body.IP)
-		}
+	out.Value = policyExplainInputValue(rawName, body.IP, body.IPs)
+	return out, ""
+}
+
+// policyExplainInputValue echoes what the operator typed, preferring the name
+// they entered and falling back to their address input.
+func policyExplainInputValue(rawName, single string, list []string) string {
+	if rawName != "" {
+		return rawName
 	}
-	return out, true
+	if joined := strings.Join(list, ", "); joined != "" {
+		return joined
+	}
+	return strings.TrimSpace(single)
 }
 
 // parsePolicyExplainAddresses parses ip and ips into distinct IPv4 addresses.

@@ -360,6 +360,61 @@ func TestPolicyExplainSessionLimitations(t *testing.T) {
 	}
 }
 
+// TestExplainPolicyReadsTheLiveServiceWiring drives the exported entry point: it
+// reads the registered matcher and route cache, and answers with the disabled
+// route when the data path is not active. It exists so the wiring itself, not
+// only the compose step, is exercised.
+func TestExplainPolicyReadsTheLiveServiceWiring(t *testing.T) {
+	snap, _, scope, gen, now := explainTestSnapshot(t)
+	if err := scope.Observe(gen, []policy.Observation{{
+		IP:        netip.MustParseAddr("198.51.201.50"),
+		Decision:  policy.Direct,
+		ExpiresAt: now.Add(time.Minute),
+	}}, now); err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+
+	matcher := policy.NewMatcher()
+	matcher.Publish(snap)
+	mem := NewMemoryRouteCache()
+	if _, err := mem.Open(policy.Scope{SessionID: "session-1", OwnershipEpoch: 1}); err != nil {
+		t.Fatalf("open memory scope: %v", err)
+	}
+
+	svc := &Service{}
+	svc.SetPBRConfig(PBRConfig{PolicyMatcher: matcher, RouteCache: mem})
+	policyRuntimeMu.Lock()
+	policyRuntimes[svc] = &policyRuntime{matcher: matcher}
+	policyRuntimeMu.Unlock()
+	t.Cleanup(func() {
+		policyRuntimeMu.Lock()
+		delete(policyRuntimes, svc)
+		policyRuntimeMu.Unlock()
+		delete(servicePBRConfigs, svc)
+	})
+
+	out, err := svc.ExplainPolicy(context.Background(), PolicyExplainRequest{
+		Value: "198.51.201.50", Addresses: []netip.Addr{netip.MustParseAddr("198.51.201.50")},
+		SessionID: "session-1",
+	})
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	// This service has no active data path, so the legacy proxy route is the
+	// truthful answer even though a matcher and a cache are registered.
+	if out.Decision != string(policy.ActionProxy) || out.Reason != string(policy.CausePolicyDisabled) {
+		t.Fatalf("decision = %s/%s, want PROXY/%s", out.Decision, out.Reason, policy.CausePolicyDisabled)
+	}
+	if out.Policy.GenerationID != "gen-11" {
+		t.Errorf("policy generation = %q, want the published snapshot's", out.Policy.GenerationID)
+	}
+
+	var nilService *Service
+	if _, err := nilService.ExplainPolicy(context.Background(), PolicyExplainRequest{Name: "www.example"}); err == nil {
+		t.Fatal("a nil service must refuse to explain")
+	}
+}
+
 func TestExplainPolicyDisabledSkipsEverything(t *testing.T) {
 	snap, cache, _, _, now := explainTestSnapshot(t)
 	resolver := &fakeExplainResolver{err: errors.New("must not be called")}
