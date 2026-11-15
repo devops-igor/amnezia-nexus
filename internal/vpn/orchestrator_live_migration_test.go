@@ -3,12 +3,12 @@ package vpn
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/orchestrator"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/loadbalancer"
 )
 
 // TestOrchestrator_LiveSessionMigratorDoesNotMigrateToDisabledTarget pins the
@@ -19,12 +19,15 @@ import (
 // its session row is never in the SessionManager or the forwarder. This test
 // builds a real live session on the source backend, wires vpn.Service as both
 // the status updater and the SessionMigrator, and runs the same stale-probe
-// sequence. It then calls MigrateSession directly with the disabled target to
-// prove the live guard rejects it before touching any state.
+// sequence. Both the outer and inner source probes fail, so the orchestrator
+// actually degrades the source and reaches its migration loop; the disabled
+// target must remain ineligible. It then calls MigrateSession directly with the
+// disabled target to prove the live guard rejects it before touching any state.
 func TestOrchestrator_LiveSessionMigratorDoesNotMigrateToDisabledTarget(t *testing.T) {
 	ctx := context.Background()
 	db := setupTestDB(t)
 	svc, sourceID, targetID, userID, peerKey := setupTestVPNService(t, db)
+	t.Cleanup(func() { releaseLiveMigrationFixture(t, svc, peerKey) })
 	if err := svc.pool.SyncFromDB(ctx); err != nil {
 		t.Fatalf("SyncFromDB: %v", err)
 	}
@@ -36,6 +39,17 @@ func TestOrchestrator_LiveSessionMigratorDoesNotMigrateToDisabledTarget(t *testi
 	if err != nil {
 		t.Fatalf("target tunnel: %v", err)
 	}
+
+	// setupTestVPNService installs a success-only canary. That would classify a
+	// failed outer probe as handshake_blocked and keep the source out of the
+	// migration loop. Make the source's inner probe fail too so the source is
+	// genuinely degraded; the target stays healthy for the stale-probe window.
+	svc.SetCanaryProbeFunc(func(_ context.Context, tun *models.BackendTunnel) error {
+		if tun.ServerID == source.ServerID {
+			return errors.New("source inner canary failed")
+		}
+		return nil
+	})
 
 	const (
 		assignedIP   = "10.100.0.15"
@@ -151,6 +165,13 @@ func requireLiveSessionOn(
 	if err != nil {
 		t.Fatalf("target tunnel: %v", err)
 	}
+	if targetLive.Enabled || targetLive.DisableReason != models.DisableReasonAdmin {
+		t.Fatalf("target is not administratively disabled: enabled=%t reason=%q",
+			targetLive.Enabled, targetLive.DisableReason)
+	}
+	if !strings.EqualFold(sourceLive.Status, models.TunnelStatusDegraded) {
+		t.Fatalf("source status = %q, want %q", sourceLive.Status, models.TunnelStatusDegraded)
+	}
 	if sourceLive.ActiveConnections != 1 {
 		t.Fatalf("source ActiveConnections = %d, want 1", sourceLive.ActiveConnections)
 	}
@@ -158,14 +179,34 @@ func requireLiveSessionOn(
 		t.Fatalf("target ActiveConnections = %d, want 0", targetLive.ActiveConnections)
 	}
 
-	selected, _, err := svc.stickyMgr.GetOrAssignBackend(ctx, &loadbalancer.RoutingRequest{
-		PeerPublicKey:    peerKey,
-		AvailableTunnels: []*models.BackendTunnel{targetLive, sourceLive},
-	})
+	// Read the existing affinity rather than GetOrAssignBackend, which would
+	// create or refresh it and contaminate the state being verified.
+	affinity, ok := svc.stickyMgr.GetPeerAffinity(peerKey)
+	if !ok || affinity != sourceID {
+		t.Fatalf("sticky affinity = %d ok=%v, want source %d", affinity, ok, sourceID)
+	}
+}
+
+// releaseLiveMigrationFixture releases every backend device the health-check
+// cycle attached and stops the forwarder route before the fixture's database
+// cleanup runs. releaseFixtureVPNService lives in the handlers package; this is
+// the equivalent for an internal/vpn fixture.
+func releaseLiveMigrationFixture(t *testing.T, svc *Service, peerKey string) {
+	t.Helper()
+	ctx := context.Background()
+	svc.forwarder.UnregisterSession(peerKey)
+	backends, err := svc.GetBackends(ctx)
 	if err != nil {
-		t.Fatalf("sticky affinity lookup: %v", err)
+		t.Logf("listing fixture backends for release: %v", err)
 	}
-	if selected.ID != sourceID {
-		t.Fatalf("sticky affinity selected %d, want source %d", selected.ID, sourceID)
+	for _, tun := range backends {
+		if err := svc.DisableBackend(ctx, tun.ServerID); err != nil {
+			t.Logf("disabling fixture backend %d for release: %v", tun.ServerID, err)
+		}
+		if dev := svc.GetBackendDeviceForTest(tun.ID); dev != nil && !dev.IsClosed() {
+			t.Errorf("fixture backend %d still owns an open device after release", tun.ID)
+			_ = dev.Close()
+		}
 	}
+	_ = svc.Stop()
 }
