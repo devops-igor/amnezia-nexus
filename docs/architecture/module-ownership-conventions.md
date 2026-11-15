@@ -236,6 +236,7 @@ Existing code still makes database calls under `Service.mu`; `vpn-service-state-
 2. Schema changes go through migrations and need a migration test, including upgrade from the previous schema.
 3. Keep entities in `models`; do not define persistence-only structs in `handlers`.
 4. Secrets (keys, tokens, password hashes) never appear in logs, error strings, templates, or test fixtures.
+5. Schema initialization is production startup behaviour, not a test-only bound. `database.Open` (used by `cmd/panel`, `cmd/server`, and tests alike) runs `InitSchema` before anything serves, so its lock-wait policy applies to real startups: one statement waits at most the 5 s SQLite `busy_timeout`, an attempt gets 20 s, and a lock-wait expiry is retried immediately up to 3 times, giving a bounded total wait of 60 s before initialization fails closed with an error that names the blocked statement. Keep that budget expressed in multiples of the busy timeout (the driver's real per-statement bound) rather than an unrelated wall-clock constant, retry only lock/busy expiries, and never widen it by retrying schema, constraint or I/O errors.
 
 ## 7. Frontend Module Standards
 

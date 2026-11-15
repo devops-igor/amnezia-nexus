@@ -16,18 +16,13 @@ type legacyActiveAllocRow struct {
 	ip string
 }
 
-func (d *DB) reconcileLegacyDuplicateActiveAllocationsLocked(ctx context.Context) error {
-	var tableExists int
-	err := d.sqlDB.QueryRowContext(ctx, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='awg_ip_allocations'").Scan(&tableExists)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("failed to check if awg_ip_allocations table exists: %w", err)
-	}
+// Statements executed by the legacy duplicate-allocation reconciliation. They
+// are named constants so a lock-wait failure can report the exact statement that
+// was blocked instead of only the surrounding step.
+const (
+	awgAllocTableProbeSQL = "SELECT 1 FROM sqlite_master WHERE type='table' AND name='awg_ip_allocations'"
 
-	// a) Safely delete identical duplicate active rows (same server_id, client_id, and ip)
-	_, err = d.sqlDB.ExecContext(ctx, `
+	awgAllocDeleteDuplicatesSQL = `
 		DELETE FROM awg_ip_allocations
 		WHERE status = 'allocated'
 		  AND id NOT IN (
@@ -36,9 +31,37 @@ func (d *DB) reconcileLegacyDuplicateActiveAllocationsLocked(ctx context.Context
 		      WHERE status = 'allocated'
 		      GROUP BY server_id, client_id, ip
 		  )
-	`)
+	`
+
+	awgAllocDivergentGroupsSQL = `
+		SELECT server_id, client_id
+		FROM awg_ip_allocations
+		WHERE status = 'allocated'
+		GROUP BY server_id, client_id
+		HAVING COUNT(*) > 1
+	`
+
+	awgAllocActiveGroupSQL = "SELECT id, ip FROM awg_ip_allocations WHERE server_id = ? AND client_id = ? AND status = 'allocated' ORDER BY id ASC"
+
+	awgAllocSupersedeSQL = "UPDATE awg_ip_allocations SET status = 'superseded', updated_at = ? WHERE id = ?"
+
+	awgAllocUniqueIndexSQL = "CREATE UNIQUE INDEX IF NOT EXISTS uq_awg_ip_allocations_server_client_active ON awg_ip_allocations(server_id, client_id) WHERE status = 'allocated'"
+)
+
+func (d *DB) reconcileLegacyDuplicateActiveAllocationsLocked(ctx context.Context) error {
+	var tableExists int
+	err := d.sqlDB.QueryRowContext(ctx, awgAllocTableProbeSQL).Scan(&tableExists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
-		return fmt.Errorf("failed to delete identical duplicate active allocations: %w", err)
+		return schemaInitStep{"failed to check if awg_ip_allocations table exists", awgAllocTableProbeSQL}.wrap(err)
+	}
+
+	// a) Safely delete identical duplicate active rows (same server_id, client_id, and ip)
+	_, err = d.sqlDB.ExecContext(ctx, awgAllocDeleteDuplicatesSQL)
+	if err != nil {
+		return schemaInitStep{"failed to delete identical duplicate active allocations", awgAllocDeleteDuplicatesSQL}.wrap(err)
 	}
 
 	// b) For divergent active allocations (same server_id, client_id, but different IPs)
@@ -47,15 +70,9 @@ func (d *DB) reconcileLegacyDuplicateActiveAllocationsLocked(ctx context.Context
 		clientID string
 	}
 
-	groupRows, err := d.sqlDB.QueryContext(ctx, `
-		SELECT server_id, client_id
-		FROM awg_ip_allocations
-		WHERE status = 'allocated'
-		GROUP BY server_id, client_id
-		HAVING COUNT(*) > 1
-	`)
+	groupRows, err := d.sqlDB.QueryContext(ctx, awgAllocDivergentGroupsSQL)
 	if err != nil {
-		return fmt.Errorf("failed to query divergent active allocation groups: %w", err)
+		return schemaInitStep{"failed to query divergent active allocation groups", awgAllocDivergentGroupsSQL}.wrap(err)
 	}
 
 	var groups []dupGroup
@@ -100,35 +117,33 @@ func (d *DB) reconcileLegacyDuplicateActiveAllocationsLocked(ctx context.Context
 				if a.id == retainID {
 					continue
 				}
-				_, err = d.sqlDB.ExecContext(ctx,
-					"UPDATE awg_ip_allocations SET status = 'superseded', updated_at = ? WHERE id = ?",
-					now, a.id,
-				)
+				_, err = d.sqlDB.ExecContext(ctx, awgAllocSupersedeSQL, now, a.id)
 				if err != nil {
-					return fmt.Errorf("failed to mark divergent allocation %d as superseded: %w", a.id, err)
+					return schemaInitStep{
+						fmt.Sprintf("failed to mark divergent allocation %d as superseded", a.id),
+						awgAllocSupersedeSQL,
+					}.wrap(err)
 				}
 			}
 		}
 	}
 
 	// c) Then create the unique partial index
-	_, err = d.sqlDB.ExecContext(ctx,
-		"CREATE UNIQUE INDEX IF NOT EXISTS uq_awg_ip_allocations_server_client_active ON awg_ip_allocations(server_id, client_id) WHERE status = 'allocated'",
-	)
+	_, err = d.sqlDB.ExecContext(ctx, awgAllocUniqueIndexSQL)
 	if err != nil {
-		return fmt.Errorf("failed to create uq_awg_ip_allocations_server_client_active index: %w", err)
+		return schemaInitStep{"failed to create uq_awg_ip_allocations_server_client_active index", awgAllocUniqueIndexSQL}.wrap(err)
 	}
 
 	return nil
 }
 
 func (d *DB) fetchActiveAllocationsForGroupLocked(ctx context.Context, serverID int64, clientID string) ([]legacyActiveAllocRow, error) {
-	rows, err := d.sqlDB.QueryContext(ctx,
-		"SELECT id, ip FROM awg_ip_allocations WHERE server_id = ? AND client_id = ? AND status = 'allocated' ORDER BY id ASC",
-		serverID, clientID,
-	)
+	rows, err := d.sqlDB.QueryContext(ctx, awgAllocActiveGroupSQL, serverID, clientID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch active allocations for group (%d, %s): %w", serverID, clientID, err)
+		return nil, schemaInitStep{
+			fmt.Sprintf("failed to fetch active allocations for group (%d, %s)", serverID, clientID),
+			awgAllocActiveGroupSQL,
+		}.wrap(err)
 	}
 	defer rows.Close()
 
