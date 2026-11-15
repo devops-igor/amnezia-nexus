@@ -263,6 +263,17 @@ func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A save that omits the upstream list keeps the stored one; the merge happens
+	// inside this mutation boundary so the record cannot change between the read
+	// and the write. The effective record is validated before it is persisted.
+	merged, mergeErr := mergeStoredUpstreams(incoming, previous)
+	if mergeErr != nil {
+		h.audit(r, "policy.settings_save", map[string]any{"result": "rejected", "reason": mergeErr.Error()})
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", mergeErr.Error())
+		return
+	}
+	incoming = merged
+
 	// Persist first so a restart reproduces the operator's intent, then activate.
 	// Activation failure compensates the committed write.
 	//
@@ -361,6 +372,29 @@ func (h *Handlers) decodePolicyPut(w http.ResponseWriter, r *http.Request) (poli
 	return incoming, true
 }
 
+// mergeStoredUpstreams preserves the stored upstream list for a save that omits
+// the field, while an explicitly empty list stays a deliberate reset.
+//
+// The existing policy form sends only enabled, preset, custom_urls and
+// sync_interval_seconds, so an absent field would otherwise decode to nil and
+// erase an API-configured resolver list on an ordinary settings save. An absent
+// field and an explicit null both decode to nil and both mean "keep what is
+// stored"; only a non-nil slice replaces the record. The merged record is
+// validated before it can be written.
+func mergeStoredUpstreams(incoming policy.Settings, previous previousPolicyRecord) (policy.Settings, error) {
+	if incoming.UpstreamDNS != nil {
+		return incoming, nil
+	}
+	merged := incoming
+	if previous.present {
+		merged.UpstreamDNS = previous.settings.UpstreamDNS
+	}
+	if err := merged.Validate(); err != nil {
+		return policy.Settings{}, err
+	}
+	return merged, nil
+}
+
 // policyPutResponse renders the saved record plus live status.
 func (h *Handlers) policyPutResponse(saved policy.Settings) map[string]any {
 	response := map[string]any{
@@ -394,6 +428,12 @@ func (h *Handlers) applyPolicySettings(ctx context.Context, settings policy.Sett
 	}
 
 	if !settings.Enabled {
+		// An accepted disable still owns the resolver that issued gateway-DNS
+		// profiles use, so its list is published before the data path is torn
+		// down; teardown then builds the continuity responder from that list.
+		if err := h.vpnSvc.ApplyEffectiveUpstreams(settings.EffectiveUpstreams()); err != nil {
+			return fmt.Errorf("apply upstream dns configuration: %w", err)
+		}
 		h.vpnSvc.StopPolicyRouting()
 		return nil
 	}

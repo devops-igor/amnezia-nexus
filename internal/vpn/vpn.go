@@ -16,6 +16,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg/health"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/auth"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/identity"
@@ -192,6 +193,13 @@ type Service struct {
 	// configurations issued while policy routing was active and survives its
 	// disablement. Guarded by mu.
 	dnsContinuity *dnsContinuityService
+	// dnsUpstreams is THE current effective upstream list every DNS consumer
+	// reads: the live policy resolver sets it on activation and on an accepted
+	// live change, and teardown, continuity installs and disabled-startup
+	// recovery rebuild from it. It is never derived from activation metadata, so
+	// a list the operator replaced cannot come back. Guarded by mu; always a
+	// private copy.
+	dnsUpstreams []policy.Upstream
 	// backendDevices holds the per-backend UDP devices created by EnableBackend.
 	backendDevices         map[int64]BackendDevice
 	backendDeviceEndpoints map[int64]string

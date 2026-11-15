@@ -225,3 +225,80 @@ func TestPolicyUpstreamDNSDefaultsWhenFieldAbsent(t *testing.T) {
 		t.Fatalf("legacy record reported %d upstreams, want an empty list", len(rawUpstreams))
 	}
 }
+
+// TestPolicyUpstreamDNSSurvivesFormSaveWithoutField is F824-02: the existing
+// policy form posts only enabled, preset, custom_urls and sync_interval_seconds.
+// Such a save must keep the stored upstream list instead of erasing it.
+func TestPolicyUpstreamDNSSurvivesFormSaveWithoutField(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	seedPolicySessions(t, db)
+	r := NewRouter(cfg, db, nil)
+
+	chosen := policy.DefaultSettings()
+	chosen.Preset = policy.PresetGeoblock
+	chosen.UpstreamDNS = []policy.Upstream{{Address: "9.9.9.9", Port: 53}}
+	seed, err := json.Marshal(chosen)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	wSeed := httptest.NewRecorder()
+	r.ServeHTTP(wSeed, adminRequest(t, http.MethodPut, "/api/vpn/policy", seed))
+	if wSeed.Code != http.StatusOK {
+		t.Fatalf("seed PUT = %d, want 200; body=%s", wSeed.Code, wSeed.Body.String())
+	}
+
+	// The exact payload shape the current policy form sends: no upstream_dns.
+	form := []byte(`{"enabled":false,"preset":"geoblock","custom_urls":[],"sync_interval_seconds":7200}`)
+	wForm := httptest.NewRecorder()
+	r.ServeHTTP(wForm, adminRequest(t, http.MethodPut, "/api/vpn/policy", form))
+	if wForm.Code != http.StatusOK {
+		t.Fatalf("form PUT = %d, want 200; body=%s", wForm.Code, wForm.Body.String())
+	}
+
+	var stored policy.Settings
+	if err := db.GetSetting(context.Background(), policy.SettingsKey, &stored); err != nil {
+		t.Fatalf("reload the stored record: %v", err)
+	}
+	if len(stored.UpstreamDNS) != 1 || stored.UpstreamDNS[0].Address != "9.9.9.9" {
+		t.Fatalf("an ordinary form save erased the custom upstreams: stored %v (effective %v), want [9.9.9.9:53]",
+			stored.UpstreamDNS, stored.EffectiveUpstreams())
+	}
+	if stored.SyncInterval != 7200 {
+		t.Fatalf("the form save did not apply its own fields: sync_interval_seconds = %d, want 7200", stored.SyncInterval)
+	}
+}
+
+// The positive control for the compatibility rule: an explicit empty list is a
+// deliberate reset to the effective defaults, not an omission.
+func TestPolicyUpstreamDNSExplicitEmptyListResetsDefaults(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	seedPolicySessions(t, db)
+	r := NewRouter(cfg, db, nil)
+
+	chosen := policy.DefaultSettings()
+	chosen.Preset = policy.PresetGeoblock
+	chosen.UpstreamDNS = []policy.Upstream{{Address: "9.9.9.9", Port: 53}}
+	if err := db.SetSetting(context.Background(), policy.SettingsKey, chosen); err != nil {
+		t.Fatalf("seed the stored record: %v", err)
+	}
+
+	reset := []byte(`{"enabled":false,"preset":"geoblock","sync_interval_seconds":3600,"upstream_dns":[]}`)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, adminRequest(t, http.MethodPut, "/api/vpn/policy", reset))
+	if w.Code != http.StatusOK {
+		t.Fatalf("reset PUT = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	var stored policy.Settings
+	if err := db.GetSetting(context.Background(), policy.SettingsKey, &stored); err != nil {
+		t.Fatalf("reload the stored record: %v", err)
+	}
+	if len(stored.UpstreamDNS) != 0 {
+		t.Fatalf("an explicit empty list did not reset the record: %+v", stored.UpstreamDNS)
+	}
+	defaults := policy.DefaultUpstreams()
+	effective := stored.EffectiveUpstreams()
+	if len(effective) != len(defaults) || effective[0] != defaults[0] {
+		t.Fatalf("effective upstreams after an explicit reset = %v, want the default pair %v", effective, defaults)
+	}
+}

@@ -118,6 +118,34 @@ entry never silently downgrades, and the resolver refuses a non-plain entry at
 construction and at exchange time as well, so the rule holds even for a caller
 that bypasses settings validation.
 
+### One current list for every consumer
+
+`Service.dnsUpstreams` (guarded by `Service.mu`) is the single owned list of
+accepted upstreams. It is written only by the two paths that can accept one:
+activation (`ConfigurePBR`, from the resolver that was actually installed) and
+an accepted live change or disable (`ApplyEffectiveUpstreams`). Every consumer
+reads it:
+
+| Consumer | When it reads the list |
+| :--- | :--- |
+| policy resolver | installed at activation, swapped in place on an accepted change |
+| continuity responder | rebuilt at teardown, at every install, and on an accepted change while policy routing is off |
+| disabled startup | `startPersistedPolicyRouting` applies the persisted list even though the record is disabled |
+
+A teardown therefore cannot rebuild the responder from the list the activation
+started with: a list the operator replaced is never observable again, and a
+disabled restart re-applies the saved list instead of falling back to the
+defaults.
+
+### Saves that omit the field
+
+The existing policy form posts only `enabled`, `preset`, `custom_urls` and
+`sync_interval_seconds`. An omitted `upstream_dns` therefore preserves the
+stored list; an explicitly empty list (`"upstream_dns": []`) is the deliberate
+reset to the effective defaults. The merge happens inside the serialized
+settings mutation and the effective record is validated before it is written, so
+a rejected merge writes nothing.
+
 ### Single source of truth
 
 `policy.DefaultUpstreams()` is the one definition of the default pair. Both

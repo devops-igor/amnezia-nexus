@@ -131,10 +131,10 @@ func NewUpstreamResolver(cfg ResolverConfig) (*UpstreamResolver, error) {
 	return res, nil
 }
 
-// SetUpstreams replaces the upstream list. The candidate list is validated as a
-// whole before it is published, so a rejected change leaves the previous
-// working list in effect and never yields a resolver with no upstream.
-func (r *UpstreamResolver) SetUpstreams(upstreams []policy.Upstream) error {
+// ValidateUpstreams reports whether a list may be installed. It is the single
+// admission rule the resolver constructor, the setter and the service lifecycle
+// apply, so a list accepted in one place is accepted everywhere.
+func ValidateUpstreams(upstreams []policy.Upstream, allowLoopback bool) error {
 	if len(upstreams) == 0 {
 		return ErrNoUpstreams
 	}
@@ -142,9 +142,19 @@ func (r *UpstreamResolver) SetUpstreams(upstreams []policy.Upstream) error {
 		return ErrTooManyUpstreams
 	}
 	for _, upstream := range upstreams {
-		if err := validateUpstreamEntry(upstream, r.allowLoopback); err != nil {
+		if err := validateUpstreamEntry(upstream, allowLoopback); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// SetUpstreams replaces the upstream list. The candidate list is validated as a
+// whole before it is published, so a rejected change leaves the previous
+// working list in effect and never yields a resolver with no upstream.
+func (r *UpstreamResolver) SetUpstreams(upstreams []policy.Upstream) error {
+	if err := ValidateUpstreams(upstreams, r.allowLoopback); err != nil {
+		return err
 	}
 	published := make([]policy.Upstream, len(upstreams))
 	copy(published, upstreams)

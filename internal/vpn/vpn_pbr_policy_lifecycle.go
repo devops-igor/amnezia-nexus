@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
+	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
 )
 
 // This file owns the production policy-source lifecycle for issue #678: turning
@@ -256,21 +258,77 @@ func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.M
 	return nil
 }
 
-// applyLiveUpstreams swaps the upstream list of the resolver that is currently
-// installed with the policy DNS gateway. It is a no-op when policy routing is
-// not live, and a rejected list leaves the installed list in effect.
+// applyLiveUpstreams applies an accepted settings change to the DNS consumers of
+// this service. It is a no-op when nothing consumes DNS yet, and a rejected list
+// leaves the installed list in effect.
 func (s *Service) applyLiveUpstreams(settings policy.Settings) error {
 	if s == nil {
 		return nil
 	}
-	cfg := s.getPBRConfig()
-	if cfg == nil || cfg.DNSResolver == nil {
+	return s.ApplyEffectiveUpstreams(settings.EffectiveUpstreams())
+}
+
+// ApplyEffectiveUpstreams publishes an accepted upstream list to whichever DNS
+// consumer owns answers right now and records it as the service's current
+// effective list.
+//
+// The list is validated before anything is published, and the owned field is
+// written in the same critical section as the consumer update, so teardown, a
+// later continuity install and a disabled restart all read the list the operator
+// most recently had accepted - never the value captured at activation.
+func (s *Service) ApplyEffectiveUpstreams(upstreams []policy.Upstream) error {
+	if s == nil {
 		return nil
 	}
-	if err := cfg.DNSResolver.SetUpstreams(settings.EffectiveUpstreams()); err != nil {
+	effective := policy.DefaultUpstreams()
+	if len(upstreams) > 0 {
+		effective = make([]policy.Upstream, len(upstreams))
+		copy(effective, upstreams)
+	}
+	if err := gatewaydns.ValidateUpstreams(effective, false); err != nil {
 		return fmt.Errorf("policy update: upstream dns configuration rejected: %w", err)
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// The list is validated above, so it is the accepted configuration: recording
+	// it first means a consumer that cannot be rebuilt never hides it from the
+	// next rebuild.
+	s.dnsUpstreams = effective
+
+	pbrCfg, err := s.applyToLiveResolverLocked(effective)
+	if err != nil {
+		return err
+	}
+	if s.forwarder == nil || s.forwarder.PBREnabled() {
+		// Either there is no data path to serve, or the policy resolver is the
+		// answer path. The continuity responder is rebuilt from the owned list
+		// when the data path is torn down.
+		return nil
+	}
+	addr := netip.Addr{}
+	if pbrCfg != nil {
+		addr = pbrCfg.GatewayDNSIP
+	}
+	s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(addr), effective)
 	return nil
+}
+
+// applyToLiveResolverLocked publishes upstreams to the resolver registered with
+// the policy gateway and keeps the registered activation metadata in step with
+// it. It returns the configuration it updated (nil when none is registered) so
+// the caller can reuse its gateway address. The caller holds s.mu.
+func (s *Service) applyToLiveResolverLocked(upstreams []policy.Upstream) (*PBRConfig, error) {
+	pbrCfg := s.getPBRConfig()
+	if pbrCfg == nil || pbrCfg.DNSResolver == nil {
+		return pbrCfg, nil
+	}
+	if err := pbrCfg.DNSResolver.SetUpstreams(upstreams); err != nil {
+		return nil, fmt.Errorf("policy update: upstream dns configuration rejected: %w", err)
+	}
+	s.publishPBRUpstreamsLocked(upstreams)
+	return pbrCfg, nil
 }
 
 // newPolicySyncer builds the syncer one activation/replacement uses.

@@ -138,7 +138,7 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 	// was active keep naming the gateway, so the gateway-address-only
 	// continuity responder is installed before the classifier is turned off.
 	if !cfg.Enabled {
-		s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(cfg.GatewayDNSIP), cfg.UpstreamDNS)
+		s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(cfg.GatewayDNSIP), s.continuityUpstreamsLocked(cfg))
 		s.forwarder.SetPBREnabled(false)
 		if dem := s.forwarder.DirectEgress(); dem != nil {
 			_ = dem.Close()
@@ -151,7 +151,7 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 	if err := ValidatePBRPrerequisites(cfg); err != nil {
 		// A refused activation is a transition to disabled: keep issued
 		// gateway profiles served rather than stranding them.
-		s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(cfg.GatewayDNSIP), cfg.UpstreamDNS)
+		s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(cfg.GatewayDNSIP), s.continuityUpstreamsLocked(cfg))
 		s.forwarder.SetPBREnabled(false)
 		return fmt.Errorf("pbr prerequisites: %w", err)
 	}
@@ -173,24 +173,87 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 		s.forwarder.SetGatewayDNSIP(cfg.GatewayDNSIP)
 	}
 
-	if cfg.DNSGateway != nil {
-		if obs, ok := cfg.RouteCache.(gatewaydns.RouteObserver); ok {
-			cfg.DNSGateway.SetObserver(obs)
-		}
-		if oldH := s.forwarder.DNSHandler(); oldH != nil {
-			if closer, ok := oldH.(io.Closer); ok {
-				_ = closer.Close()
-			}
-		}
-		s.forwarder.SetDNSHandler(newPBRDNSHandler(cfg.DNSGateway, cfg.RouteCache, s.forwarder.HasLiveSession))
-	}
+	s.installPBRDNSHandlerLocked(cfg)
 
 	servicePBRConfigsMu.Lock()
 	servicePBRConfigs[s] = &cfg
 	servicePBRConfigsMu.Unlock()
 
+	// The resolver installed above is the authority for what is dialed, so the
+	// owned list is taken from it rather than from the activation input: every
+	// later consumer (live change, teardown, continuity) reads this one field.
+	if cfg.DNSResolver != nil {
+		s.dnsUpstreams = cfg.DNSResolver.Upstreams()
+	}
+
 	s.forwarder.SetPBREnabled(true)
 	return nil
+}
+
+// continuityUpstreamsLocked picks the upstream list for a continuity install
+// driven by a configuration: the configuration's own list when it carries one,
+// otherwise the list the service already owns. A disable that carries no list
+// therefore cannot reset an accepted one to the defaults. The caller holds s.mu.
+func (s *Service) continuityUpstreamsLocked(cfg PBRConfig) []policy.Upstream {
+	if len(cfg.UpstreamDNS) > 0 {
+		return cfg.UpstreamDNS
+	}
+	return s.dnsUpstreams
+}
+
+// installPBRDNSHandlerLocked makes the policy resolver the forwarder's DNS
+// handler, replacing and closing the handler it supersedes. A configuration
+// without a gateway has no resolver to install, which is the pre-existing
+// fail-open behaviour for that impossible case. The caller holds s.mu.
+func (s *Service) installPBRDNSHandlerLocked(cfg PBRConfig) {
+	if cfg.DNSGateway == nil {
+		return
+	}
+	if obs, ok := cfg.RouteCache.(gatewaydns.RouteObserver); ok {
+		cfg.DNSGateway.SetObserver(obs)
+	}
+	if oldH := s.forwarder.DNSHandler(); oldH != nil {
+		if closer, ok := oldH.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
+	s.forwarder.SetDNSHandler(newPBRDNSHandler(cfg.DNSGateway, cfg.RouteCache, s.forwarder.HasLiveSession))
+}
+
+// publishPBRUpstreamsLocked records upstreams as the registered activation input
+// and on the service, replacing the previous value rather than mutating it, so a
+// concurrent reader of either sees one coherent list and never the value the
+// activation started with. The caller holds s.mu.
+func (s *Service) publishPBRUpstreamsLocked(upstreams []policy.Upstream) {
+	s.dnsUpstreams = upstreams
+	servicePBRConfigsMu.Lock()
+	defer servicePBRConfigsMu.Unlock()
+	cfg := servicePBRConfigs[s]
+	if cfg == nil {
+		return
+	}
+	next := *cfg
+	next.UpstreamDNS = upstreams
+	servicePBRConfigs[s] = &next
+}
+
+// EffectiveDNSUpstreams returns the effective upstream list this service has
+// accepted for its DNS consumers (the policy resolver while policy routing is
+// active, the continuity responder otherwise). An empty result means nothing has
+// been accepted yet, which the consumers treat as the effective defaults. The
+// slice is a copy.
+func (s *Service) EffectiveDNSUpstreams() []policy.Upstream {
+	if s == nil {
+		return policy.DefaultUpstreams()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.dnsUpstreams) == 0 {
+		return policy.DefaultUpstreams()
+	}
+	out := make([]policy.Upstream, len(s.dnsUpstreams))
+	copy(out, s.dnsUpstreams)
+	return out
 }
 
 // DNSGateway returns the DNS gateway configured on the service, if any.
@@ -748,12 +811,12 @@ func (s *Service) TeardownPBR() error {
 	// unchanged; only the gateway-address-only DNS responder persists, and
 	// installing it replaces and closes the active policy resolver.
 	addr := netip.Addr{}
-	var upstreams []policy.Upstream
 	if pbrCfg != nil {
 		addr = pbrCfg.GatewayDNSIP
-		upstreams = pbrCfg.UpstreamDNS
 	}
-	s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(addr), upstreams)
+	// Read the owned current list, never the activation input: an accepted live
+	// change must reach the responder that keeps issued profiles answering.
+	s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(addr), s.dnsUpstreams)
 	s.forwarder.SetPBREnabled(false)
 	if dem := s.forwarder.DirectEgress(); dem != nil {
 		_ = dem.Close()

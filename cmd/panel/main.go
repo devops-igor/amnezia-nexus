@@ -176,6 +176,15 @@ func startPersistedPolicyRouting(ctx context.Context, db *database.DB, vpnSvc *v
 		return nil
 	}
 	if !policySettings.Enabled || !cfg.VPNEnabled {
+		// Policy routing stays off, but a client configuration issued while it was
+		// active still names the gateway, so its responder must dial the list the
+		// operator saved instead of the built-in defaults. Without a data plane
+		// there is no responder to configure.
+		if cfg.VPNEnabled {
+			if applyErr := vpnSvc.ApplyEffectiveUpstreams(policySettings.EffectiveUpstreams()); applyErr != nil {
+				slog.Warn("Could not apply the persisted upstream DNS list; the continuity responder keeps its previous list", "err", applyErr)
+			}
+		}
 		return nil
 	}
 

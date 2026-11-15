@@ -383,14 +383,17 @@ func sameUpstreams(a, b []policy.Upstream) bool {
 }
 
 // installDNSContinuity installs the gateway-address-only responder that serves
-// configurations issued while policy routing was active. Idempotent.
+// configurations issued while policy routing was active. Idempotent, and it
+// never replaces an already accepted upstream list with the defaults: it passes
+// the service's owned list, so a startup install after a configured list was
+// applied (or after one was installed earlier) keeps that list.
 func (s *Service) installDNSContinuity() {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.installDNSContinuityLocked(s.deriveGatewayDNSIPLocked(), nil)
+	s.installDNSContinuityLocked(s.deriveGatewayDNSIPLocked(), s.dnsUpstreams)
 }
 
 // installDNSContinuityLocked installs the continuity responder and makes it the
@@ -398,10 +401,20 @@ func (s *Service) installDNSContinuity() {
 // s.mu. A responder already serving the same address through the same upstream
 // list keeps its handler, so a repeated disable cannot drop queries in flight.
 func (s *Service) installDNSContinuityLocked(addr netip.Addr, upstreams []policy.Upstream) {
-	if s == nil || s.forwarder == nil || !validGatewayDNSAddr(addr) {
+	if s == nil {
 		return
 	}
-	continuity := s.ensureContinuityGatewayLocked(addr, effectiveContinuityUpstreams(upstreams))
+	effective := effectiveContinuityUpstreams(upstreams)
+	// Everything that installs the responder publishes the list it installed as
+	// the owned current one, so a later install or teardown cannot revert to a
+	// list the operator already replaced. It is recorded before the address and
+	// forwarder guards: the accepted list is the configuration, and a consumer
+	// that cannot be built must not make the next rebuild fall back to defaults.
+	s.dnsUpstreams = effective
+	if s.forwarder == nil || !validGatewayDNSAddr(addr) {
+		return
+	}
+	continuity := s.ensureContinuityGatewayLocked(addr, effective)
 	if continuity == nil {
 		return
 	}
