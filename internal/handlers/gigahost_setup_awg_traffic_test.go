@@ -100,10 +100,15 @@ func TestProductionAWGQualificationFailsWhenThePeerDoesNotAnswer(t *testing.T) {
 func TestAWGPeerRejectsAMismatchedObfuscationDialect(t *testing.T) {
 	peer := startAuthenticAWGPeer(t, true)
 
-	// jc=1 on the client, jc=0 on the peer: the initiation is dropped before it is parsed.
+	// h1=99 on the client, h1=1 on the peer: the peer dispatches on the
+	// initiation header type, so it cannot recognize the initiation at all.
+	// Varying jc instead (the previous fixture) only changes how many decoy
+	// packets precede the initiation; it does not affect whether the peer
+	// parses the initiation, so the handshake could still complete (observed
+	// 1/20 under -race).
 	mismatched := map[string]any{
-		"jc": 1, "jmin": 0, "jmax": 0, "s1": 0, "s2": 0, "s3": 0, "s4": 0,
-		"h1": 1, "h2": 2, "h3": 3, "h4": 4,
+		"jc": 0, "jmin": 0, "jmax": 0, "s1": 0, "s2": 0, "s3": 0, "s4": 0,
+		"h1": 99, "h2": 2, "h3": 3, "h4": 4,
 	}
 	dev, err := tunnel.NewAWGClientDevice("awg-mismatch", peer.endpoint,
 		peer.clientPrivateKey, peer.serverPublicKey, 1280, mismatched)
