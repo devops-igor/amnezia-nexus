@@ -371,3 +371,54 @@ func TestResolver_EnvelopeMismatchFailsOver(t *testing.T) {
 		t.Fatalf("Exchange() = (%v, %v), want an error and no answer", resp, err)
 	}
 }
+
+// TestResolver_TerminalServfailIsReportedAsFailure is HIGH-03: a SERVFAIL from
+// the last configured upstream is still returned to the client unchanged, but the
+// status must report it as a servfail failure instead of clearing the failure
+// state. A later success clears it.
+func TestResolver_TerminalServfailIsReportedAsFailure(t *testing.T) {
+	var hits atomic.Int32
+	servfail := startMockServer(t, servfailHandler(&hits))
+	good := startMockServer(t, answerHandler(t, "203.0.113.60"))
+
+	r, err := NewUpstreamResolver(ResolverConfig{
+		Upstreams:             []policy.Upstream{upstreamOf(servfail.udpAddr)},
+		AllowLoopbackUpstream: true,
+	})
+	if err != nil {
+		t.Fatalf("build resolver: %v", err)
+	}
+
+	resp, err := r.Exchange(context.Background(), testQuery("servfail-status.example."))
+	if err != nil {
+		t.Fatalf("Exchange() = %v, want the terminal SERVFAIL response", err)
+	}
+	if resp.Rcode != mdns.RcodeServerFailure {
+		t.Fatalf("rcode = %v, want SERVFAIL", resp.Rcode)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("upstream hits = %d, want 1 (no failover on a single upstream)", hits.Load())
+	}
+
+	status := r.Status()
+	if status.LastFailureKind != FailureServfail {
+		t.Fatalf("failure kind = %q, want %q after a terminal SERVFAIL", status.LastFailureKind, FailureServfail)
+	}
+	if status.LastFailure != servfail.udpAddr.String() {
+		t.Fatalf("failing upstream = %q, want %q", status.LastFailure, servfail.udpAddr.String())
+	}
+
+	if err := r.SetUpstreams([]policy.Upstream{upstreamOf(good.udpAddr)}); err != nil {
+		t.Fatalf("SetUpstreams: %v", err)
+	}
+	if _, err := r.Exchange(context.Background(), testQuery("recovered.example.")); err != nil {
+		t.Fatalf("Exchange after recovery failed: %v", err)
+	}
+	status = r.Status()
+	if status.LastFailure != "" || status.LastFailureKind != "" {
+		t.Fatalf("a successful exchange did not clear the terminal SERVFAIL: %+v", status)
+	}
+	if status.LastUpstream != good.udpAddr.String() {
+		t.Fatalf("last upstream = %q, want %q", status.LastUpstream, good.udpAddr.String())
+	}
+}

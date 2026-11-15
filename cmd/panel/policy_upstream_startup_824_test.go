@@ -69,3 +69,42 @@ func TestDisabledStartupWithoutListKeepsDefaults(t *testing.T) {
 		t.Fatalf("pre-field record yielded %v, want the default pair", got)
 	}
 }
+
+// TestRefusedActivationStartupAppliesPersistedUpstreams is HIGH-02: when the
+// persisted activation is refused, no resolver is installed, but issued
+// gateway-DNS profiles still need the operator's saved list rather than the
+// defaults. Policy routing must stay disabled and the failure must still be
+// reported.
+func TestRefusedActivationStartupAppliesPersistedUpstreams(t *testing.T) {
+	db, cfg, settings := newPolicyStartupFixture(t)
+	settings.UpstreamDNS = []policy.Upstream{{Address: "9.9.9.9", Port: 53}}
+	if err := db.SetSetting(context.Background(), policy.SettingsKey, settings); err != nil {
+		t.Fatalf("persist the enabled record with upstreams: %v", err)
+	}
+
+	vpnSvc, err := vpn.NewVPNService(db, nil)
+	if err != nil {
+		t.Fatalf("NewVPNService: %v", err)
+	}
+	t.Cleanup(func() { vpnSvc.StopPolicyRouting() })
+	t.Cleanup(func() { _ = vpnSvc.Stop() })
+
+	// No last-known-good generation and an unreachable source: activation is
+	// refused by the existing guards.
+	if err := startPersistedPolicyRouting(context.Background(), db, vpnSvc, cfg); err != nil {
+		t.Fatalf("startup returned an error for a refused activation: %v", err)
+	}
+	if vpnSvc.PBREnabled() {
+		t.Fatal("policy routing reports enabled although activation was refused")
+	}
+	if got := vpnSvc.EffectiveDNSUpstreams(); len(got) != 1 || got[0].Address != "9.9.9.9" {
+		t.Fatalf("refused activation left the responder on %v, want the persisted list [9.9.9.9:53]", got)
+	}
+	status := vpnSvc.PolicyStatusSnapshot()
+	if status.Enabled {
+		t.Fatalf("status reports policy routing enabled after a refused activation: %+v", status)
+	}
+	if status.LastError == "" {
+		t.Fatal("status no longer reports the activation failure")
+	}
+}

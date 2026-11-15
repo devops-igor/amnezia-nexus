@@ -137,6 +137,24 @@ started with: a list the operator replaced is never observable again, and a
 disabled restart re-applies the saved list instead of falling back to the
 defaults.
 
+### Who owns the DNS path
+
+Exactly one handler owns the forwarder's DNS path at a time:
+
+| State | Installed handler | Installed by |
+| :--- | :--- | :--- |
+| policy routing active | policy resolver (`pbrDNSHandler`), with the matcher and the route observer | `ConfigurePBR` |
+| policy routing inactive | continuity responder, no matcher and no observer | `TeardownPBR`, `ConfigurePBR`'s disabled/refused branches, and the disabled-startup install |
+
+The idempotent install that runs at service start
+(`installDNSContinuity`) defers while policy routing is active: a restart with an
+enabled record activates policy routing before the data plane starts, and
+replacing that handler would leave the status reporting policy routing enabled
+while DNS produced no routing evidence. Disable transitions install the
+responder explicitly, in their own order, so an issued gateway-DNS profile still
+resolves after policy routing is turned off and a repeated install still keeps
+its handler (no query in flight is dropped).
+
 ### Saves that omit the field
 
 The existing policy form posts only `enabled`, `preset`, `custom_urls` and

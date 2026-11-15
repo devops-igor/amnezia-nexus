@@ -253,11 +253,17 @@ func (r *UpstreamResolver) runAttempts(queryCtx, callerCtx context.Context, req 
 			continue
 		}
 
-		// A SERVFAIL is worth one alternate; with none left it is the answer.
-		if resp.Rcode == mdns.RcodeServerFailure && i < len(attempts)-1 {
-			lastErr = fmt.Errorf("%w: servfail from %v", ErrExchangeFailed, upstream.String())
+		// A SERVFAIL is an upstream failure whether or not an alternate remains.
+		// With an alternate it fails over; on the last attempt the same response
+		// is returned to the client, but the status must not report a working
+		// provider for a query it could not answer.
+		if resp.Rcode == mdns.RcodeServerFailure {
 			r.recordFailure(callerCtx, upstream, FailureServfail)
-			continue
+			if i < len(attempts)-1 {
+				lastErr = fmt.Errorf("%w: servfail from %v", ErrExchangeFailed, upstream.String())
+				continue
+			}
+			return resp, nil
 		}
 
 		r.recordSuccess(upstream)

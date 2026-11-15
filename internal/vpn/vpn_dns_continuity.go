@@ -387,12 +387,24 @@ func sameUpstreams(a, b []policy.Upstream) bool {
 // never replaces an already accepted upstream list with the defaults: it passes
 // the service's owned list, so a startup install after a configured list was
 // applied (or after one was installed earlier) keeps that list.
+//
+// Ownership rule: while policy routing is active the policy handler owns the DNS
+// path. It answers gateway-addressed queries and also intercepts external port
+// 53, and only it can turn an answer into routing evidence. This install
+// therefore DEFERS to it instead of replacing it; taking the path away here would
+// leave the service reporting policy routing enabled while producing no evidence
+// after a restart. The explicit disable transitions (TeardownPBR, and
+// ConfigurePBR's disabled/refused branches) install the responder themselves, in
+// their own order, so a live disable still serves issued profiles.
 func (s *Service) installDNSContinuity() {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.forwarder != nil && s.forwarder.PBREnabled() {
+		return
+	}
 	s.installDNSContinuityLocked(s.deriveGatewayDNSIPLocked(), s.dnsUpstreams)
 }
 

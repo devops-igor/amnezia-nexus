@@ -104,3 +104,77 @@ func TestApplyEffectiveUpstreamsReachesDisabledContinuity(t *testing.T) {
 		t.Fatalf("accepted list not recorded on the service: got %v want %v", got, custom)
 	}
 }
+
+// TestEnabledStartupKeepsPolicyDNSHandler is HIGH-01: after a persisted-policy
+// activation, the service-start continuity install must not take the DNS path
+// away from the active policy handler, or routing evidence stops while the status
+// still reports policy routing enabled.
+func TestEnabledStartupKeepsPolicyDNSHandler(t *testing.T) {
+	gate := newPolicyGate()
+	server := newGatedPolicyServer(gate, map[string][]string{"/policy.lst": domainList("startup", 20)})
+	defer server.Close()
+	previousFetcher := policyFetcherForTest
+	policyFetcherForTest = func(limits policy.FetchLimits) *policy.Fetcher {
+		return fixtureFetcherFor(t, server, policy.SyncConfig{FetchLimits: limits})
+	}
+	t.Cleanup(func() { policyFetcherForTest = previousFetcher })
+	withNameOwnedWANDevice(t, newNameRegistry())
+
+	svc := serviceForActivation(t)
+	t.Cleanup(svc.closeDNSContinuity)
+	t.Cleanup(svc.StopPolicyRouting)
+
+	settings := policySettingsForURL(t, "https://lists.example/policy.lst")
+	settings.UpstreamDNS = []policy.Upstream{{Address: "9.9.9.9", Port: 53}}
+	store := policy.NewFileStore(t.TempDir())
+	if err := svc.StartPolicyRouting(context.Background(), settings, store, string(settings.Preset)); err != nil {
+		t.Fatalf("activate from persisted settings: %v", err)
+	}
+	if !svc.PBREnabled() {
+		t.Fatal("fixture did not enable policy routing")
+	}
+	before, ok := svc.forwarder.DNSHandler().(*pbrDNSHandler)
+	if !ok {
+		t.Fatalf("activation installed %T, want the policy DNS handler", svc.forwarder.DNSHandler())
+	}
+
+	// This is the call Service.Start makes for configurations issued while policy
+	// routing was active.
+	svc.installDNSContinuity()
+
+	after, ok := svc.forwarder.DNSHandler().(*pbrDNSHandler)
+	if !ok {
+		t.Fatalf("startup install replaced the policy DNS handler with %T: routing evidence would stop", svc.forwarder.DNSHandler())
+	}
+	if after != before {
+		t.Fatal("startup install rebuilt the policy DNS handler instead of leaving the active one in place")
+	}
+	pbrCfg := svc.getPBRConfig()
+	if pbrCfg == nil || after.gw != pbrCfg.DNSGateway {
+		t.Fatalf("installed handler is bound to %p, want the policy gateway %p", after.gw, pbrCfg.DNSGateway)
+	}
+	if after.rc == nil {
+		t.Fatal("installed handler has no route cache, so it cannot produce routing evidence")
+	}
+}
+
+// TestDisabledStartupInstallsContinuityHandlerWithSavedList is the disabled half
+// of HIGH-01: with policy routing off, the startup install must still install the
+// continuity responder, and it must dial the saved list.
+func TestDisabledStartupInstallsContinuityHandlerWithSavedList(t *testing.T) {
+	svc := serviceForActivation(t)
+	t.Cleanup(svc.closeDNSContinuity)
+
+	custom := []policy.Upstream{{Address: "9.9.9.9", Port: 53}}
+	if err := svc.ApplyEffectiveUpstreams(custom); err != nil {
+		t.Fatalf("apply the saved list: %v", err)
+	}
+	svc.installDNSContinuity()
+
+	if _, ok := svc.forwarder.DNSHandler().(*dnsContinuityHandler); !ok {
+		t.Fatalf("disabled startup installed %T, want the continuity responder", svc.forwarder.DNSHandler())
+	}
+	if svc.dnsContinuity == nil || !sameUpstreams(svc.dnsContinuity.upstreams, custom) {
+		t.Fatalf("continuity responder dials %v, want the saved list %v", svc.dnsContinuity, custom)
+	}
+}
