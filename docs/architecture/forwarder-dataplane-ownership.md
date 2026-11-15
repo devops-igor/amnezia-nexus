@@ -104,6 +104,49 @@ from the presence of a queue:
 
 ---
 
+### 2.1.2 Port-53 Interception Ownership (Policy Resolver Submission)
+
+While policy routing is active, one class of client-to-backend traffic has no
+egress decision of its own: plain DNS is submitted to the policy resolver so the
+client's own answers become routing evidence. That decision is made in the
+forwarder and at exactly one point, `routeClientPBR` (`pumps.go`); no ingress
+listener, route or device owner intercepts port 53. `SetPBREnabled` selects this
+path over the legacy route, so interception exists only while policy routing is
+enabled: `ConfigurePBR` installs the handler, `TeardownPBR` removes it, and
+neither leaves an interception owner behind.
+
+- **Ordering.** IPv4 port 53 is submitted after the prohibited-destination check
+  (`ValidateDirectDestination`) and after the non-TCP/UDP proxy fallback, and
+  before the policy `Proxy`/`DIRECT` decision. A sticky-flow match still wins
+  first, and a prohibited destination stays a drop: interception never converts
+  one into an answer or an egress path. A packet the handler inspects but does
+  not handle continues through the unchanged decision steps; a handled packet
+  returns before any of them.
+- **UDP replies.** The reply is built from the queried address and port 53, so an
+  unmodified client accepts the answer as coming from the resolver it chose. UDP
+  interception retains no per-flow state.
+- **TCP replies.** A foreign TCP DNS flow is translated onto the gateway address
+  on the way in and back to the queried resolver on the way out, with both
+  checksums recomputed. The translation is per-session bounded state
+  (`gateway_nat.go` in `internal/vpn/dns/`): one entry per client flow, capped at
+  256 entries and discarded after 60 seconds of idleness, so a session cannot grow
+  it without bound and a stale translation cannot rewrite a later reply.
+- **Resolver reuse.** The forwarder only snapshots the handler reference under
+  `Forwarder.mu` and submits the packet; classification and route-cache
+  observation stay in the gateway resolver and are unchanged. The forwarder adds
+  no DNS state, answer or evidence of its own, and books neither admission nor a
+  drop for a submitted packet — refusing or discarding one is the handler's
+  decision and is counted there. An intercepted packet counts as neither direct
+  nor proxy throughput.
+
+Per-session DNS authority (scope handle, reply writer, TCP transport) belongs to
+the handler installed via `SetDNSHandler` and is retired with the session's route;
+it is not forwarder state. Substitution, reply construction, translation and the
+observation contract are specified in
+[Policy DNS Steering & Plain-DNS Interception](policy-dns-steering.md).
+
+---
+
 ### 2.2 sessionRoute Struct Field Inventory
 
 The `sessionRoute` struct encapsulates per-peer state, downstream packet queues, rate limiters, and write retirement synchronization.
