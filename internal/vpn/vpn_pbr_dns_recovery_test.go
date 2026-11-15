@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/netip"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -237,6 +238,61 @@ func dnsRecoveryReplyProtocol(pkt []byte) byte {
 	return pkt[9]
 }
 
+// dnsOwnedGoroutinePrefixes lists the code our DNS runtime runs its goroutines
+// under: the gateway server's listeners, accept loops and connection handlers,
+// the per-transport netstack readers and per-scope limiter watchers, and the
+// queued workers of the intercepted and continuity handlers.
+var dnsOwnedGoroutinePrefixes = []string{
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/dns.",
+	"github.com/devops-igor/amnezia-nexus/internal/vpn.(*pbrDNSHandler).",
+	"github.com/devops-igor/amnezia-nexus/internal/vpn.(*dnsContinuityHandler).",
+}
+
+// dnsOwnedGoroutines counts the goroutines the DNS runtime owns, attributed by
+// the code each goroutine runs or was created by.
+//
+// It deliberately does not use runtime.NumGoroutine: a live session legitimately
+// raises the process total, because one gateway transport owns a whole netstack
+// whose internal scheduler goroutines are not attributable to any frame of this
+// repository. Counting only our own goroutines makes two steady states with one
+// live transport comparable, so anything above the first one is a retirement
+// that failed to release what it replaced.
+func dnsOwnedGoroutines() int {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	owned := 0
+	for _, stack := range strings.Split(string(buf), "\n\n") {
+		if dnsOwnsStack(stack) {
+			owned++
+		}
+	}
+	return owned
+}
+
+func dnsOwnsStack(stack string) bool {
+	for _, line := range strings.Split(stack, "\n") {
+		// Drop arguments and file:line so only the symbol remains; "created by"
+		// lines keep their prefix, which is what the ownership check needs.
+		line = strings.TrimSpace(line)
+		if i := strings.Index(line, "("); i > 0 {
+			line = line[:i]
+		}
+		for _, prefix := range dnsOwnedGoroutinePrefixes {
+			if strings.HasPrefix(line, prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // TestDNSRuntimeRecovery_TransientTCPReturnFailureKeepsLiveSession exercises the
 // real handler/gateway/netstack TCP return path, injects exactly one recoverable
 // virtualtun.ErrQueueFull, and then requires later UDP and TCP gateway DNS to be
@@ -269,6 +325,13 @@ func TestDNSRuntimeRecovery_TransientTCPReturnFailureKeepsLiveSession(t *testing
 			}
 
 			if failFirst {
+				// Witness the teardown of the transport this failure must retire.
+				// The live transport count cannot witness it: every intercepted
+				// authority is stamped with the same scope key, so the recovered
+				// session's next packet recreates a transport under that key and
+				// the count is one again whether or not the old transport was
+				// closed. The monotonic teardown count is the decisive witness.
+				closedBefore := f.gw.ClosedTransports()
 				// Arm one transient output failure, then ask again on the same
 				// connection: the reply cannot be queued this one time.
 				f.failNext.Store(true)
@@ -289,7 +352,7 @@ func TestDNSRuntimeRecovery_TransientTCPReturnFailureKeepsLiveSession(t *testing
 					return f.injected.Load() == 1
 				})
 				waitForCondition(t, "the failed reply to tear down its transport", func() bool {
-					return f.gw.ActiveTransports() == 0
+					return f.gw.ClosedTransports() > closedBefore
 				})
 				closeConn1()
 				if !f.fwd.HasLiveSession(f.sessionID) {
@@ -352,7 +415,8 @@ func TestDNSRuntimeRecovery_TransientTCPReturnFailureKeepsLiveSession(t *testing
 // TestDNSRuntimeRecovery_RepeatedTransientFailuresStayBounded repeats the
 // failure/recovery cycle: each transient output failure may cost one transport,
 // but the live session must keep answering and its runtime, limiter and
-// transport state must stay at the active-session bound.
+// transport state must stay at the active-session bound, and no goroutine the
+// DNS runtime owns may survive a retirement.
 func TestDNSRuntimeRecovery_RepeatedTransientFailuresStayBounded(t *testing.T) {
 	f := newDNSRecoveryFixture(t)
 	defer func() { _ = f.handler.Close() }()
@@ -361,13 +425,23 @@ func TestDNSRuntimeRecovery_RepeatedTransientFailuresStayBounded(t *testing.T) {
 	client := f.start(t)
 	defer client.Close()
 
-	before := runtime.NumGoroutine()
 	udpPacket := dnsRuntimeTestPacket(t, 17)
 	const cycles = 3
+	// baseline is measured once the session owns its first live transport, not
+	// before it: a transport legitimately costs goroutines (its netstack's
+	// scheduler, its reader, the gateway Serve tree and its limiter watcher), so
+	// a process total from a transport-less state can never be an upper bound
+	// for a state that owns one. Comparing two identical steady states makes
+	// every goroutine above the baseline a retirement that leaked what it
+	// replaced.
+	var baseline int
 	for i := 0; i < cycles; i++ {
 		conn, closeConn := f.dial(t, client)
 		if resp := dnsRecoveryQuery(t, conn, uint16(5000+i), 5*time.Second); len(resp.Answer) != 1 {
 			t.Fatalf("cycle %d: TCP DNS answer carries %d records want 1", i, len(resp.Answer))
+		}
+		if i == 0 {
+			baseline = dnsOwnedGoroutines()
 		}
 		// The next reply fails once, retiring this transport.
 		f.failNext.Store(true)
@@ -408,8 +482,8 @@ func TestDNSRuntimeRecovery_RepeatedTransientFailuresStayBounded(t *testing.T) {
 	if n := f.gw.ActiveSessionLimiters(); n > 1 {
 		t.Fatalf("%d limiter scopes accumulated across %d recoveries", n, cycles)
 	}
-	waitForCondition(t, "recovery cycles to leave no extra goroutines", func() bool {
-		return runtime.NumGoroutine() <= before+8
+	waitForCondition(t, "recovery cycles to leave no extra DNS-owned goroutines", func() bool {
+		return dnsOwnedGoroutines() <= baseline
 	})
 }
 
