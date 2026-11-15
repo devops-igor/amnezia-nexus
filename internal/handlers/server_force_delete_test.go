@@ -335,7 +335,7 @@ func TestDeleteServerHandler_ForceDelete_WithFailingVPNBackend(t *testing.T) {
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
-	t.Cleanup(func() { _ = vpnSvc.Stop() })
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	h.vpnSvc = vpnSvc
 
 	sID, err := db.CreateServer(ctx, &models.Server{
@@ -406,7 +406,7 @@ func TestDeleteServerHandler_ForceDelete_UnreachableRemoteWithActiveVPNBackend_S
 	vpnSvc.SetProbeFunc(func(ctx context.Context, endpoint, serverPubKey, clientPrivKey, psk, hpKey string, h1, h2 any, s1, s2 int, timeout time.Duration) (time.Duration, error) {
 		return 10 * time.Millisecond, nil
 	})
-	t.Cleanup(func() { _ = vpnSvc.Stop() })
+	t.Cleanup(func() { releaseFixtureVPNService(t, vpnSvc) })
 	h.vpnSvc = vpnSvc
 
 	h.registry.Register(&mockProtocolManager{

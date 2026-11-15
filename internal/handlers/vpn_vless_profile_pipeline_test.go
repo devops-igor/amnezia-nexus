@@ -35,6 +35,9 @@ func setupVLESSPipelineTestRouter(t *testing.T) (*chi.Mux, *Handlers, map[string
 	if err != nil {
 		t.Fatalf("NewVPNService: %v", err)
 	}
+	// This shared fixture enables real VLESS backend devices; release them with
+	// the service before the fixture's database cleanup runs.
+	t.Cleanup(func() { releaseFixtureVPNService(t, svc) })
 	h.vpnSvc = svc
 
 	priv, _, err := xray.GenerateRealityKeypair()
@@ -330,5 +333,45 @@ func TestProfileSwitch_KeepsBackendParamsConsistent(t *testing.T) {
 	}
 	if !containsGroup(groups2, 29) {
 		t.Fatalf("switched legacy ClientHello missing X25519: %v", groups2)
+	}
+}
+
+// TestVLESSPipelineFixtureReleasesItsBackendDevice proves the shared fixture's
+// release: a VLESS backend enabled through setupVLESSPipelineTestRouter owns a
+// proxy device, and that device is closed after the subtest's cleanup.
+func TestVLESSPipelineFixtureReleasesItsBackendDevice(t *testing.T) {
+	var (
+		dev   vpn.BackendDevice
+		tunID int64
+	)
+	t.Run("the fixture enables a VLESS backend", func(t *testing.T) {
+		ctx := context.Background()
+		router, h, _ := setupVLESSPipelineTestRouter(t)
+		id, err := h.db.CreateServer(ctx, &models.Server{
+			Name: "vless-release-fixture", Host: "127.0.0.1", SSHPort: 22,
+			Protocols: map[string]any{},
+		})
+		if err != nil {
+			t.Fatalf("CreateServer: %v", err)
+		}
+		postJSON(t, router, fmt.Sprintf("/api/servers/%d/install", id), `{"protocol":"vless","port":"443","engine_profile":"modern_pq"}`)
+		postJSON(t, router, fmt.Sprintf("/api/vpn/backends/%d/enable", id), "")
+		backend, err := h.db.GetBackendTunnelByServerID(ctx, id)
+		if err != nil || backend == nil {
+			t.Fatalf("GetBackendTunnelByServerID: %v", err)
+		}
+		tunID, dev = backend.ID, h.vpnSvc.GetBackendDeviceForTest(backend.ID)
+		if dev == nil {
+			t.Fatal("the enabled VLESS backend owns no device, so this control would prove nothing")
+		}
+		if dev.IsClosed() {
+			t.Fatal("the backend device is already closed while the test still uses it")
+		}
+	})
+	if dev == nil {
+		t.Fatal("the fixture never produced an enabled VLESS backend")
+	}
+	if !dev.IsClosed() {
+		t.Fatalf("the VLESS pipeline fixture left backend device %d open after teardown", tunID)
 	}
 }

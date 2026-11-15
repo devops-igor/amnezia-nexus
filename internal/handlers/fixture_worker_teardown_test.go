@@ -458,6 +458,11 @@ func TestDirectConsumerFixturesReleaseTheirBackendDevice(t *testing.T) {
 		{"update server host canceled context", TestUpdateServerHostHandler_CanceledContextRollback},
 		{"update server host vpn rollback failure", TestUpdateServerHostHandler_VPNRollbackFailure_PreventsSplitState},
 		{"update server host unchanged", TestUpdateServerHostHandler_UnchangedHost_IdempotentNoOp},
+		{"delete backend teardown error", TestDeleteServerHandler_BackendTeardownError_FailsClosed},
+		{"delete active backend drains", TestDeleteServerHandler_WithActiveVPNBackend_DrainsAndMigratesSessions},
+		{"delete backup restore", TestDeleteServerHandler_BackupRestoreSameID_CanEnableBackend},
+		{"delete concurrent generation", TestDeleteServerHandler_ConcurrentEnableBackend_ServerGenerationChanged_RejectsOldEnable},
+		{"force delete failing backend", TestDeleteServerHandler_ForceDelete_WithFailingVPNBackend},
 	}
 	for _, consumer := range consumers {
 		// Sampled before the subtest so the assertion is about the device this
