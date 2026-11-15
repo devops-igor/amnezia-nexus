@@ -32,6 +32,7 @@ Task-based lookup (package, governing contract, validation) is in [Where do I st
 | Dataplane and packet forwarding | `internal/vpn/forwarder/` |
 | Database records or migrations | `internal/database/` |
 | Page behavior and UI | `web/templates/`, `web/static/js/` |
+| Browser/E2E tests and which runner owns them | `tests/e2e/runner_map.toml` |
 
 ## Documents
 

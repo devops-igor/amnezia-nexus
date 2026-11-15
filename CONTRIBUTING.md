@@ -118,7 +118,9 @@ Then run the tests for the packages you touched with the race detector, for exam
 go test -race ./internal/vpn/... ./internal/handlers/...
 ```
 
-The full `go test -race ./...` takes several minutes and also runs in CI. Frontend tests need Node.js and `jsdom`; with `CI=true` a missing jsdom fails instead of skipping. Python tooling tests: `python3 -m pytest tests/test_architecture_health*.py`.
+The full `go test -race ./...` takes several minutes; CI runs it as three shards assigned by measured weight (`scripts/ci_go_shards.py`), and the required check `Automated Test Suite` fails if any shard fails, is skipped or does not run. Frontend tests need Node.js and `jsdom`; with `CI=true` a missing jsdom fails instead of skipping. Python tooling tests: `python3 -m pytest tests/test_architecture_health*.py`.
+
+Browser suites are split by dependency: `test_auth.py` and `test_settings.py` run on a hosted runner for every pull request, the rest run on the DEV server. `tests/e2e/runner_map.toml` records which runner owns each suite and `tests/test_e2e_runner_map.py` enforces it.
 
 ## Refactor PR Review Checklist
 
