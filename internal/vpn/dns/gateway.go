@@ -106,6 +106,11 @@ type gatewayTCPTransport struct {
 	cancel    context.CancelFunc
 	serveDone chan struct{}
 	nat       dnsTCPNAT
+	// teardowns is the gateway's monotonic count of completed transport
+	// closes. A scope key can be reused by a replacement authority, so the
+	// live transport map cannot tell "this transport was closed" from "a
+	// replacement owns the key again"; this counter can.
+	teardowns *atomic.Uint64
 }
 
 // Close tears the transport down in producer order: the Serve loop is stopped
@@ -131,6 +136,9 @@ func (tr *gatewayTCPTransport) Close() {
 	if tr.vt != nil {
 		_ = tr.vt.Close()
 	}
+	if tr.teardowns != nil {
+		tr.teardowns.Add(1)
+	}
 }
 
 // Gateway intercepts and processes DNS queries addressed to the gateway on port 53.
@@ -139,6 +147,10 @@ type Gateway struct {
 	server     *Server
 	mu         sync.Mutex
 	transports map[policy.Scope]*gatewayTCPTransport
+	// closedTransports counts completed transport teardowns. It only grows, so
+	// a caller can observe that the transport a retirement replaced was really
+	// closed even after a replacement transport owns the same scope key.
+	closedTransports atomic.Uint64
 }
 
 // NewGateway constructs a new Gateway transport adapter.
@@ -201,6 +213,7 @@ func (g *Gateway) getOrCreateTransport(scope *ScopeHandle) (*gatewayTCPTransport
 		vt:        vt,
 		cancel:    serveCancel,
 		serveDone: make(chan struct{}),
+		teardowns: &g.closedTransports,
 	}
 	g.transports[scope.Scope] = tr
 
@@ -401,6 +414,17 @@ func (g *Gateway) ActiveTransports() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return len(g.transports)
+}
+
+// ClosedTransports returns how many gateway TCP transports have completed their
+// teardown. The count only grows, so a caller can verify that a retirement
+// closed the transport it replaced even when the recovered session's next
+// packet already owns a replacement transport under the same scope key.
+func (g *Gateway) ClosedTransports() uint64 {
+	if g == nil {
+		return 0
+	}
+	return g.closedTransports.Load()
 }
 
 // ActiveSessionLimiters returns the number of live per-scope limiter entries.
