@@ -113,6 +113,18 @@ def _bounded_int(value: Any, low: int, high: int) -> Optional[int]:
     return number if low <= number <= high else None
 
 
+def _is_allowlisted(value: Any, allowed: frozenset) -> bool:
+    """True only when ``value`` is text and a member of the closed set.
+
+    Untrusted JSON can carry a list or an object where the schema expects a
+    string. Hashing such a value inside ``in`` raises TypeError, which aborted
+    validation instead of rejecting the artifact -- and an aborted validation
+    left the evidence directory in place for the workflow's ``if: always()``
+    upload. Type-checking first keeps the decision total and fail-closed.
+    """
+    return isinstance(value, str) and value in allowed
+
+
 def _is_bool(value: Any) -> bool:
     return isinstance(value, bool)
 
@@ -964,22 +976,18 @@ def gate(directory: Path) -> int:
         except Exception:
             problems = ["unreadable JSON"]
         else:
-            is_payload = isinstance(payload, dict) and ("events" in payload or "test" in payload)
-            is_probe = isinstance(payload, dict) and "observations" in payload
-            is_timing = isinstance(payload, dict) and "calls" in payload
-            is_install_failure = isinstance(payload, dict) and "failures" in payload
-            if is_payload:
-                problems = validate_payload(payload)
-            elif is_probe:
-                problems = validate_probe_report(payload)
-            elif is_timing:
-                problems = validate_timing_report(payload)
-            elif is_install_failure:
-                from tests.e2e.install_failure import validate_install_failure_report
-
-                problems = validate_install_failure_report(payload)
-            else:
-                problems = validate_versions(payload)
+            try:
+                problems = _validate_artifact(payload)
+            except Exception:
+                # Validators decide on untrusted JSON. If one raises instead of
+                # returning a verdict, the artifact's privacy contract is
+                # unproven, so it is withheld exactly like a rejected one. This
+                # must never fall through: an escaping exception skips
+                # _withhold, and the workflow's `if: always()` upload would then
+                # publish the very evidence the gate exists to stop.
+                # The exception text is deliberately not printed: it can quote
+                # the untrusted value that raised.
+                problems = ["validator raised on an unanticipated value"]
         if problems:
             rejected += 1
     if rejected:
@@ -988,6 +996,35 @@ def gate(directory: Path) -> int:
         return 1
     print(f"E2E diagnostics: files={len(files)} rejected=0")
     return 0
+
+
+def _validate_artifact(payload: Any) -> List[str]:
+    """Dispatch one decoded artifact to its closed-schema validator.
+
+    The dispatch is keyed on the artifact's own top-level shape. An artifact
+    that matches no known shape falls through to the version validator, which
+    rejects any key set it does not recognise.
+    """
+    is_payload = isinstance(payload, dict) and ("events" in payload or "test" in payload)
+    is_probe = isinstance(payload, dict) and "observations" in payload
+    is_timing = isinstance(payload, dict) and "calls" in payload
+    is_install_failure = isinstance(payload, dict) and "failures" in payload
+    is_add_client_failure = isinstance(payload, dict) and "add_client_failures" in payload
+    if is_payload:
+        return validate_payload(payload)
+    if is_probe:
+        return validate_probe_report(payload)
+    if is_timing:
+        return validate_timing_report(payload)
+    if is_install_failure:
+        from tests.e2e.install_failure import validate_install_failure_report
+
+        return validate_install_failure_report(payload)
+    if is_add_client_failure:
+        from tests.e2e.add_client_failure import validate_add_client_failure_report
+
+        return validate_add_client_failure_report(payload)
+    return validate_versions(payload)
 
 
 def _withhold(directory: Path) -> bool:
@@ -1022,14 +1059,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--install-failure-log",
         help="operator log file to reduce to closed-schema protocol install failures",
     )
+    parser.add_argument(
+        "--add-client-failure-log",
+        help="operator log file to reduce to closed-schema client-creation failures",
+    )
     args = parser.parse_args(argv)
     directory = Path(args.validate_dir)
+    from tests.e2e.add_client_failure import collect_add_client_failure_log
     from tests.e2e.install_failure import collect_install_failure_log
 
     for flag, collect in (
         ("probe_log", collect_probe_log),
         ("call_timing_log", collect_timing_log),
         ("install_failure_log", collect_install_failure_log),
+        ("add_client_failure_log", collect_add_client_failure_log),
     ):
         log_arg = getattr(args, flag)
         if not log_arg:

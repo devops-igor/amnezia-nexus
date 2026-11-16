@@ -91,12 +91,15 @@ func TestSyncer_FullLifecycleAndLKGRecovery(t *testing.T) {
 		runErrCh <- syncer.Run(ctx)
 	}()
 
-	// Wait for initial sync
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the update Run performs before it services any request, instead of
+	// sampling after a fixed delay. See awaitInitialUpdate: the update's duration
+	// is bounded only by the fetch timeout and the durable commit, so no delay
+	// expresses "the initial sync has finished".
+	awaitInitialUpdate(t, syncer, runErrCh)
 
 	snap := matcher.Current()
 	if snap == nil {
-		t.Fatal("expected active snapshot after initial sync, got nil")
+		t.Fatalf("expected active snapshot after initial sync, got nil (status: %+v)", syncer.Status())
 	}
 	if snap.Version() != 1 {
 		t.Errorf("snap.Version = %d, want 1", snap.Version())
@@ -174,6 +177,37 @@ func TestSyncer_FullLifecycleAndLKGRecovery(t *testing.T) {
 	}
 	if !recoveredSnap.MatchIPv4(netip.MustParseAddr("198.51.100.5")) {
 		t.Error("expected recovered snapshot to match 198.51.100.5")
+	}
+}
+
+// awaitInitialUpdate blocks until Run has finished the update it performs before
+// entering its scheduling loop.
+//
+// Run calls that update directly and only afterwards starts servicing requests,
+// so a request/response round trip through the loop is a happens-after edge for
+// it: when this returns, the initial update has either published its snapshot or
+// failed, and the caller's assertions describe what it published. A fixed delay
+// cannot express that condition, because the update's duration is bounded only
+// by the fetch timeout and the durable commit.
+//
+// The probe request carries an already-canceled context, so the loop's update for
+// it fails during the fetch and cannot publish over the snapshot under test.
+func awaitInitialUpdate(t *testing.T, syncer *Syncer, runErrCh <-chan error) {
+	t.Helper()
+
+	probeCtx, probeCancel := context.WithCancel(context.Background())
+	probeCancel()
+
+	respCh := make(chan syncResponse, 1)
+	syncer.syncReqCh <- syncRequest{ctx: probeCtx, respChan: respCh}
+
+	select {
+	case resp := <-respCh:
+		if resp.err == nil {
+			t.Fatal("initial-sync probe request unexpectedly published a snapshot")
+		}
+	case runErr := <-runErrCh:
+		t.Fatalf("Run returned before servicing the initial-sync probe: %v", runErr)
 	}
 }
 
