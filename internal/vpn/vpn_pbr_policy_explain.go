@@ -62,7 +62,8 @@ const (
 	DefaultPolicyExplainResolveTimeout = 2 * time.Second
 	// policyExplainAnswerMaxTTL is the TTL ceiling handed to the observation
 	// path's classifier. Classification uses it only as the starting minimum TTL;
-	// this endpoint publishes remaining evidence TTL from the cache, never this.
+	// this endpoint publishes remaining evidence TTL and elapsed age from the
+	// cache, never this.
 	policyExplainAnswerMaxTTL = time.Hour
 
 	// Resolution methods reported to the operator.
@@ -93,10 +94,11 @@ const (
 	PolicyLimitNoSessionData   = "session_has_no_cached_evidence"
 	PolicyLimitNoName          = "domain_rules_require_a_name"
 	PolicyLimitIPv6            = "ipv6_not_supported"
-	// PolicyLimitNoEvidenceAge states why the answer carries a remaining TTL but
-	// no age: the route cache stores the decision and its deadline only, so the
-	// observation instant (and therefore elapsed age) is not reconstructible
-	// (review note LOW-01).
+	// PolicyLimitNoEvidenceAge is added only when fresh evidence in the answer was
+	// stored without an observation instant, so its age cannot be stated. It
+	// states the limitation once for the whole answer; each affected evidence
+	// object carries the same cause in age_unavailable_reason. Age is never
+	// derived from the deadline.
 	PolicyLimitNoEvidenceAge = "evidence_age_not_recorded"
 )
 
@@ -226,6 +228,7 @@ func explainPolicy(ctx context.Context, deps policyExplainDeps, req PolicyExplai
 		Prohibited:  forwarder.IsProhibitedIPv4Destination,
 	})
 	policyExplainApply(&out, verdict, evaluatedAt)
+	policyExplainAgeLimitation(&out)
 	return out, nil
 }
 
@@ -328,12 +331,6 @@ func policyExplainLimitations(req PolicyExplainRequest, deps policyExplainDeps) 
 	}
 	if req.Name == "" {
 		limits = append(limits, PolicyLimitNoName)
-	}
-	if req.SessionID != "" && deps.SessionScope != nil {
-		// Evidence may be reported for this session, and only its remaining TTL can
-		// be stated: the cache keeps the decision and the deadline, not the instant
-		// it was observed.
-		limits = append(limits, PolicyLimitNoEvidenceAge)
 	}
 	return limits
 }
@@ -441,6 +438,7 @@ func policyExplainEvidence(evidence *policy.Evidence, now time.Time) *PolicyExpl
 		Generation:       evidence.Generation,
 		ExpiresInSeconds: int64(evidence.Remaining(now) / time.Second),
 	}
+	policyExplainAge(&state, evidence, now)
 	// Only a stored entry has an observation behind it. An absent, quarantined or
 	// retired state means the cache holds nothing, so claiming the observation
 	// source there would imply evidence that does not exist.
@@ -451,6 +449,35 @@ func policyExplainEvidence(evidence *policy.Evidence, now time.Time) *PolicyExpl
 		state.Decision = evidence.Decision.String()
 	}
 	return &state
+}
+
+// policyExplainAge states the elapsed age of fresh evidence, or why none can be
+// stated. The age comes from the instant the observation was recorded and is
+// never computed from the deadline or the TTL, so remaining lifetime cannot be
+// presented as age.
+func policyExplainAge(state *PolicyExplainEvidence, evidence *policy.Evidence, now time.Time) {
+	age, reason := evidence.Age(now)
+	if reason != policy.AgeReported {
+		state.AgeUnavailableReason = string(reason)
+		return
+	}
+	seconds := int64(age / time.Second)
+	state.AgeSeconds = &seconds
+}
+
+// policyExplainAgeLimitation adds the answer-level caveat when any reported
+// evidence is fresh but carries no recorded observation instant.
+func policyExplainAgeLimitation(out *PolicyExplanation) {
+	unrecorded := func(e *PolicyExplainEvidence) bool {
+		return e != nil && e.AgeUnavailableReason == string(policy.AgeInstantNotRecorded)
+	}
+	found := unrecorded(out.Evidence)
+	for _, a := range out.Addresses {
+		found = found || unrecorded(a.Evidence)
+	}
+	if found {
+		out.Limitations = append(out.Limitations, PolicyLimitNoEvidenceAge)
+	}
 }
 
 // policyExplainSources reports a rule's sources, or an empty array so the JSON

@@ -366,47 +366,6 @@ func TestPolicyExplainSessionLimitations(t *testing.T) {
 	}
 }
 
-// TestPolicyExplainStatesWhyOnlyTTLIsReported covers review note LOW-01: the
-// cache keeps a decision and a deadline, not the observation instant, so the
-// answer states that elapsed age is not reconstructible instead of implying the
-// remaining TTL is an age.
-func TestPolicyExplainStatesWhyOnlyTTLIsReported(t *testing.T) {
-	snap, _, scope, _, now := explainTestSnapshot(t)
-
-	withSession, err := explainPolicy(context.Background(), policyExplainDeps{
-		Enabled: true, Snapshot: snap, SessionScope: scope, Clock: fixedClock(now),
-	}, PolicyExplainRequest{
-		Value: "198.51.200.9", Addresses: []netip.Addr{netip.MustParseAddr("198.51.200.9")},
-		SessionID: "session-1",
-	})
-	if err != nil {
-		t.Fatalf("explain with a session: %v", err)
-	}
-	found := false
-	for _, limit := range withSession.Limitations {
-		if limit == PolicyLimitNoEvidenceAge {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("limitations = %v, want %q", withSession.Limitations, PolicyLimitNoEvidenceAge)
-	}
-
-	withoutSession, err := explainPolicy(context.Background(), policyExplainDeps{
-		Enabled: true, Snapshot: snap, SessionScope: scope, Clock: fixedClock(now),
-	}, PolicyExplainRequest{
-		Value: "198.51.200.9", Addresses: []netip.Addr{netip.MustParseAddr("198.51.200.9")},
-	})
-	if err != nil {
-		t.Fatalf("explain without a session: %v", err)
-	}
-	for _, limit := range withoutSession.Limitations {
-		if limit == PolicyLimitNoEvidenceAge {
-			t.Fatalf("limitations = %v, want no age caveat without a session", withoutSession.Limitations)
-		}
-	}
-}
-
 // TestExplainPolicyReadsTheLiveServiceWiring drives the exported entry point: it
 // reads the registered matcher and route cache, and answers with the disabled
 // route when the data path is not active. It exists so the wiring itself, not

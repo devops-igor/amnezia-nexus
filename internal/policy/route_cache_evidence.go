@@ -49,6 +49,48 @@ type Evidence struct {
 	Decision   Decision
 	ExpiresAt  time.Time
 	Generation string
+	// ObservedAt is the instant the stored observation was made, as recorded when
+	// it was written. It is zero when the entry carries no recorded instant, and
+	// for every state that has no stored entry.
+	ObservedAt time.Time
+}
+
+// AgeReason names why an evidence age cannot be reported. The empty value means
+// an age is available. The tokens are part of the explain response.
+type AgeReason string
+
+const (
+	// AgeReported means Age returned a measured value.
+	AgeReported AgeReason = ""
+	// AgeNoEvidence means the session holds nothing for the address.
+	AgeNoEvidence AgeReason = "no_evidence"
+	// AgeNotFresh means the stored evidence is no longer usable (expired,
+	// quarantined, from a previous generation or retired), so an age would
+	// describe evidence the data path ignores.
+	AgeNotFresh AgeReason = "evidence_not_fresh"
+	// AgeInstantNotRecorded means fresh evidence is stored but was written
+	// without an observation instant. The age is not derived from the deadline.
+	AgeInstantNotRecorded AgeReason = "observation_instant_not_recorded"
+)
+
+// Age returns how long ago the fresh evidence was observed, measured from the
+// recorded observation instant to now. It is never computed from the deadline or
+// from a TTL: a stored deadline says how long evidence may be used, and the
+// cache does not know the TTL it was granted. When no age can be stated the
+// reason says why and the duration is zero.
+//
+// A recorded instant later than now (a response stamped after the evaluation
+// instant was sampled) is reported as zero rather than a negative age.
+func (e Evidence) Age(now time.Time) (time.Duration, AgeReason) {
+	switch {
+	case e.State == EvidenceAbsent:
+		return 0, AgeNoEvidence
+	case e.State != EvidenceFresh:
+		return 0, AgeNotFresh
+	case e.ObservedAt.IsZero():
+		return 0, AgeInstantNotRecorded
+	}
+	return max(now.Sub(e.ObservedAt), 0), AgeReported
 }
 
 // Remaining returns how long the stored deadline still has to run at now. A
@@ -88,6 +130,7 @@ func (s *SessionCache) Inspect(ip netip.Addr, policyGeneration string, now time.
 		Decision:   entry.decision,
 		ExpiresAt:  entry.expiresAt,
 		Generation: v.policyGeneration,
+		ObservedAt: entry.observedAt,
 	}
 }
 

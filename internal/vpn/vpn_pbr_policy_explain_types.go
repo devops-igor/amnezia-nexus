@@ -64,12 +64,25 @@ type PolicyExplainProspective struct {
 }
 
 // PolicyExplainEvidence is the session evidence a verdict rests on.
+//
+// ExpiresInSeconds is the REMAINING lifetime (deadline minus the evaluation
+// instant) and is negative once the evidence expired. AgeSeconds is the ELAPSED
+// time since the observation was recorded. They are different quantities and
+// neither is derived from the other.
 type PolicyExplainEvidence struct {
 	State            string `json:"state"`
 	Decision         string `json:"decision,omitempty"`
 	Generation       string `json:"generation,omitempty"`
 	ExpiresInSeconds int64  `json:"expires_in_seconds"`
-	Source           string `json:"source"`
+	// AgeSeconds is whole seconds from the recorded observation instant to the
+	// evaluation instant. It is a pointer so a just-observed entry reports 0,
+	// distinct from "no age" (nil, omitted); it is present only for fresh evidence
+	// whose observation instant was recorded.
+	AgeSeconds *int64 `json:"age_seconds,omitempty"`
+	// AgeUnavailableReason says why AgeSeconds is absent. It is empty exactly
+	// when AgeSeconds is present.
+	AgeUnavailableReason string `json:"age_unavailable_reason,omitempty"`
+	Source               string `json:"source"`
 }
 
 // PolicyExplainAddress is one address's current-action verdict.
