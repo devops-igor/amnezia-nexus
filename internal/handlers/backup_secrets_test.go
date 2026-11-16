@@ -51,6 +51,27 @@ func TestRedactBackupSettings(t *testing.T) {
 			},
 		},
 		{
+			name: "production VPN credential names are removed, public key kept",
+			in: map[string]any{
+				"server_private_key":    "portal-key",
+				"header_protection_key": "hp-key",
+				"server_public_key":     "public-key",
+			},
+			expected: map[string]any{
+				"server_public_key": "public-key",
+			},
+		},
+		{
+			name: "suffix matching catches future credential names",
+			in: map[string]any{
+				"client_secret":       "s",
+				"refresh_token":       "t",
+				"share_password_hash": "h",
+				"token_ttl":           60,
+			},
+			expected: map[string]any{"token_ttl": 60},
+		},
+		{
 			name:     "non-map value passes through",
 			in:       "plain-setting",
 			expected: "plain-setting",
@@ -156,6 +177,29 @@ func TestIsBlankBackupValue(t *testing.T) {
 	for _, tt := range tests {
 		if got := isBlankBackupValue(tt.value); got != tt.blank {
 			t.Errorf("isBlankBackupValue(%#v) = %v, want %v", tt.value, got, tt.blank)
+		}
+	}
+}
+
+func TestIsBackupSecretField(t *testing.T) {
+	secret := []string{
+		"key_text", "private_key", "server_private_key", "header_protection_key",
+		"api_key", "gigahost.api_key", "bot_token", "token", "share_token",
+		"password", "password_hash", "share_password_hash", "secret",
+		"client_secret", "refresh_token", "Client_Secret",
+	}
+	for _, key := range secret {
+		if !isBackupSecretField(key) {
+			t.Errorf("isBackupSecretField(%q) = false, want true", key)
+		}
+	}
+	notSecret := []string{
+		"server_public_key", "cert_text", "key_path", "token_ttl", "enabled",
+		"listen_port", "chat_id", "title", "",
+	}
+	for _, key := range notSecret {
+		if isBackupSecretField(key) {
+			t.Errorf("isBackupSecretField(%q) = true, want false", key)
 		}
 	}
 }

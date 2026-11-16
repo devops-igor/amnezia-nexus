@@ -279,7 +279,10 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 	for i, c := range conns {
 		clientID := c.ClientID
 		connName := c.Name
-		if models.NormalizeProtocol(c.Protocol) == models.ProtocolVLESS && !h.GetSession(r).IsAdmin() {
+		if models.NormalizeProtocol(c.Protocol) == models.ProtocolVLESS {
+			// The VLESS UUID is the client's authentication credential, not a mere
+			// identifier, so it is redacted for every role. The display name is
+			// replaced when it embeds the UUID (safeVLESSDisplayName).
 			clientID = ""
 			connName = safeVLESSDisplayName(connName, c.ClientID)
 		}
@@ -493,7 +496,31 @@ func (h *Handlers) mergeBackupSettingSecrets(ctx context.Context, key string, in
 	if err := h.db.GetSetting(ctx, key, &existing); err != nil {
 		return nil, false
 	}
+	if key == "ssl" {
+		return mergeSSLIdentity(incoming, existing)
+	}
 	return mergePreservingSecrets(incoming, existing), true
+}
+
+// mergeSSLIdentity keeps the TLS identity coherent.
+//
+// A credential-free export carries a certificate but no private key. Applying
+// that certificate over the live key would leave a mismatched pair, which
+// tls.X509KeyPair rejects at the next listener start. Unless the backup supplies
+// both halves, the live pair is kept whole — or, with no live pair to keep,
+// nothing is written.
+func mergeSSLIdentity(incoming, existing any) (any, bool) {
+	inMap, ok := incoming.(map[string]any)
+	if !ok {
+		return incoming, true
+	}
+	if strVal(inMap["key_text"]) != "" && strVal(inMap["cert_text"]) != "" {
+		return inMap, true
+	}
+	if exMap, ok := existing.(map[string]any); ok && len(exMap) > 0 {
+		return exMap, true
+	}
+	return nil, false
 }
 
 func (h *Handlers) restoreBackupServers(ctx context.Context, servers []map[string]any) (int, map[int64]int64) {

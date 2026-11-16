@@ -14,20 +14,35 @@ import "strings"
 // older panel cannot silently misread a payload written by a newer one.
 const BackupFormatVersion = 2
 
-// backupSecretLeafNames are the settings field names that can carry a
+// backupSecretFieldNames are the settings field names that can carry a
 // credential. Matching is by exact leaf name — dotted legacy keys such as
-// "gigahost.api_key" are reduced to their last segment — so a future setting
-// cannot leak merely by being added.
-var backupSecretLeafNames = map[string]bool{
-	"key_text":      true, // ssl.key_text: TLS private key
-	"private_key":   true,
-	"api_key":       true, // gigahost.api_key
-	"bot_token":     true, // telegram.bot_token
-	"token":         true, // telegram.token and other bearer tokens
-	"share_token":   true,
-	"password":      true,
-	"password_hash": true,
-	"secret":        true,
+// "gigahost.api_key" are reduced to their last segment.
+var backupSecretFieldNames = map[string]bool{
+	"key_text":              true, // ssl.key_text: TLS private key
+	"private_key":           true, // generic request/legacy shape
+	"server_private_key":    true, // vpn_config: portal Curve25519 private key
+	"header_protection_key": true, // vpn_config: AWG header-protection secret
+	"api_key":               true, // gigahost.api_key
+	"bot_token":             true, // telegram.bot_token
+	"token":                 true, // telegram.token and other bearer tokens
+	"share_token":           true,
+	"password":              true,
+	"password_hash":         true,
+	"secret":                true,
+}
+
+// backupSecretSuffixes catch future field names built from the same vocabulary
+// (for example server_private_key). Exact names alone drifted from production
+// once already: the scrub knew "private_key" while the persisted portal field is
+// "server_private_key". A suffix keeps a new *_private_key or *_api_key secret
+// from leaking by being added after this list was written.
+var backupSecretSuffixes = []string{
+	"_private_key",
+	"_api_key",
+	"_secret",
+	"_token",
+	"_password",
+	"_password_hash",
 }
 
 // isBackupSecretField reports whether a settings field name carries a credential.
@@ -36,7 +51,15 @@ func isBackupSecretField(key string) bool {
 	if i := strings.LastIndex(leaf, "."); i >= 0 {
 		leaf = leaf[i+1:]
 	}
-	return backupSecretLeafNames[leaf]
+	if backupSecretFieldNames[leaf] {
+		return true
+	}
+	for _, suffix := range backupSecretSuffixes {
+		if strings.HasSuffix(leaf, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // redactBackupSettings returns a deep copy of a settings value with every

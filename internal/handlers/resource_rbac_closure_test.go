@@ -398,12 +398,10 @@ func TestResourceRBACClosureBackup(t *testing.T) {
 			for _, conn := range backup.UserConnections {
 				switch conn["protocol"] {
 				case models.ProtocolVLESS:
-					want := ""
-					if role == models.RoleAdmin {
-						want = "vless-secret"
-					}
-					if conn["client_id"] != want {
-						t.Errorf("VLESS client_id = %v, want %q", conn["client_id"], want)
+					// A VLESS UUID authenticates the connection, so no role —
+					// including admin — receives it in a credential-free export.
+					if conn["client_id"] != "" {
+						t.Errorf("VLESS client_id = %v, want redacted for %s", conn["client_id"], role)
 					}
 				case models.ProtocolAWG:
 					if conn["client_id"] != "awg-secret" {
@@ -483,6 +481,9 @@ func TestResourceRBACClosureAssignedVLESSNameRedaction(t *testing.T) {
 		path      string
 		sess      *models.SessionData
 		adminSess *models.SessionData
+		// adminHidesCredential marks a response that must not expose the
+		// credential even to an administrator (the credential-free backup).
+		adminHidesCredential bool
 	}{
 		{
 			name: "server connections", router: serverRouter,
@@ -506,6 +507,8 @@ func TestResourceRBACClosureAssignedVLESSNameRedaction(t *testing.T) {
 		{
 			name: "backup", router: setupFullSettingsRouter(h), path: "/api/settings/backup/download",
 			sess: resourceRBACSession(models.RoleSupport), adminSess: resourceRBACSession(models.RoleAdmin),
+			// A credential-free export redacts the VLESS UUID for admin too.
+			adminHidesCredential: true,
 		},
 	}
 	for _, tc := range tests {
@@ -520,7 +523,7 @@ func TestResourceRBACClosureAssignedVLESSNameRedaction(t *testing.T) {
 					name           string
 					sess           *models.SessionData
 					wantCredential bool
-				}{name: "admin", sess: tc.adminSess, wantCredential: true})
+				}{name: "admin", sess: tc.adminSess, wantCredential: !tc.adminHidesCredential})
 			}
 			for _, check := range checks {
 				w := resourceRBACRequest(t, tc.router, http.MethodGet, tc.path, check.sess, nil)

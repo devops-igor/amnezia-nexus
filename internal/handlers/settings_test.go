@@ -3,10 +3,19 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -466,6 +475,29 @@ func TestDownloadBackupHandler_RedactsCredentials(t *testing.T) {
 		t.Fatalf("seed gigahost setting: %v", err)
 	}
 
+	// The fixture's VPN service already persisted a portal identity. Add the AWG
+	// header-protection secret, then prove both leave the export: the portal
+	// private key is encrypted at rest, which does not make it a non-credential.
+	const headerKey = "CANARY-HEADER-PROTECTION-KEY"
+	vpnCfg, err := db.GetVPNConfig(ctx)
+	if err != nil {
+		t.Fatalf("read vpn_config: %v", err)
+	}
+	vpnCfg.ServerPrivateKey = "" // keep the stored portal identity unchanged
+	vpnCfg.HeaderProtectionKey = headerKey
+	if err := db.SetSetting(ctx, "vpn_config", vpnCfg); err != nil {
+		t.Fatalf("seed vpn_config: %v", err)
+	}
+	allSettings, err := db.GetAllSettings(ctx)
+	if err != nil {
+		t.Fatalf("read stored settings: %v", err)
+	}
+	storedVPN, _ := allSettings["vpn_config"].(map[string]any)
+	encryptedPortalKey, _ := storedVPN["server_private_key"].(string)
+	if encryptedPortalKey == "" {
+		t.Fatal("expected a stored portal private key to prove it is omitted")
+	}
+
 	token := shareToken
 	u := &models.User{
 		ID:           "redact-user",
@@ -481,7 +513,22 @@ func TestDownloadBackupHandler_RedactsCredentials(t *testing.T) {
 		t.Fatalf("seed user: %v", err)
 	}
 
+	// A VLESS UUID authenticates the connection; it must not be exported for any
+	// role, and a display name that embeds it must be replaced.
+	const vlessUUID = "11111111-2222-3333-4444-555555555555"
+	if _, err := db.CreateConnection(ctx, &models.UserConnection{
+		ID: "vless-backup-conn", UserID: u.ID, ServerID: 1, Protocol: "vless",
+		ClientID: vlessUUID, Name: "phone-" + vlessUUID, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("seed vless connection: %v", err)
+	}
+
+	// Exercise the administrator download: the old code exported VLESS UUIDs for
+	// admins, so an unauthenticated request would not prove the fix.
 	req := httptest.NewRequest(http.MethodGet, "/api/settings/backup/download", nil)
+	req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+		UserID: "backup-admin", Role: models.RoleAdmin,
+	}))
 	w := httptest.NewRecorder()
 	setupFullSettingsRouter(h).ServeHTTP(w, req)
 
@@ -496,10 +543,16 @@ func TestDownloadBackupHandler_RedactsCredentials(t *testing.T) {
 	}
 
 	body := w.Body.String()
-	for _, secret := range []string{sslKey, botToken, tgToken, apiKey, shareToken} {
+	for _, secret := range []string{
+		sslKey, botToken, tgToken, apiKey, shareToken,
+		headerKey, encryptedPortalKey, vlessUUID,
+	} {
 		if strings.Contains(body, secret) {
 			t.Errorf("backup response leaked credential %q", secret)
 		}
+	}
+	if strings.Contains(body, "phone-"+vlessUUID) {
+		t.Error("backup response leaked a VLESS display name derived from the UUID")
 	}
 	// Non-secret data must survive the scrub.
 	for _, wanted := range []string{publicCert, "redactuser", "basic", "4242"} {
@@ -529,6 +582,26 @@ func TestDownloadBackupHandler_RedactsCredentials(t *testing.T) {
 	for _, key := range []string{"bot_token", "token"} {
 		if _, present := tg[key]; present {
 			t.Errorf("settings.telegram.%s must be absent", key)
+		}
+	}
+	vpn, _ := payload.Settings["vpn_config"].(map[string]any)
+	for _, key := range []string{"server_private_key", "header_protection_key"} {
+		if _, present := vpn[key]; present {
+			t.Errorf("settings.vpn_config.%s must be absent", key)
+		}
+	}
+	if vpn["server_public_key"] != storedVPN["server_public_key"] {
+		t.Errorf("settings.vpn_config.server_public_key = %#v, want the public key retained", vpn["server_public_key"])
+	}
+	for _, cm := range payload.UserConnections {
+		if cm["id"] != "vless-backup-conn" {
+			continue
+		}
+		if cid, _ := cm["client_id"].(string); cid != "" {
+			t.Errorf("VLESS client_id must be absent, got %q", cid)
+		}
+		if name, _ := cm["name"].(string); strings.Contains(name, vlessUUID) {
+			t.Errorf("VLESS display name must not embed the UUID, got %q", name)
 		}
 	}
 	for _, um := range payload.Users {
@@ -581,8 +654,10 @@ func TestRestoreBackupSettings_PreservesRedactedSecrets(t *testing.T) {
 	if ssl["key_text"] != liveKey {
 		t.Errorf("restore blanked the live TLS key: key_text = %#v", ssl["key_text"])
 	}
-	if ssl["cert_text"] != "NEW-CERT" {
-		t.Errorf("restore did not apply the new certificate: cert_text = %#v", ssl["cert_text"])
+	// A certificate-only backup must not replace the live certificate either:
+	// the TLS identity is only valid as a matched key/certificate pair.
+	if ssl["cert_text"] != "OLD-CERT" {
+		t.Errorf("certificate-only restore replaced the live certificate: cert_text = %#v", ssl["cert_text"])
 	}
 
 	var tg map[string]any
@@ -688,5 +763,146 @@ func TestRestoreBackupSettings_SkipsUnreadableSettings(t *testing.T) {
 	})
 	if restored != 0 {
 		t.Fatalf("restored = %d, want 0 when the live value is unreadable", restored)
+	}
+}
+
+// TestRestoreBackupSettings_KeepsTLSIdentityCoherent uses real key pairs: a
+// certificate from the backup applied over the live private key would produce a
+// pair that tls.X509KeyPair rejects at the next listener start.
+func TestRestoreBackupSettings_KeepsTLSIdentityCoherent(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+
+	certA, keyA := testTLSPair(t, "panel-a.example")
+	certB, keyB := testTLSPair(t, "panel-b.example")
+	if err := db.SetSetting(ctx, "ssl", models.SSLSettings{KeyText: keyA, CertText: certA}); err != nil {
+		t.Fatalf("seed ssl: %v", err)
+	}
+
+	restore := func(settings map[string]any) {
+		t.Helper()
+		backup := models.BackupData{FormatVersion: BackupFormatVersion, Settings: settings}
+		body, _ := json.Marshal(backup)
+		req := httptest.NewRequest(http.MethodPost, "/api/settings/backup/restore", bytes.NewReader(body))
+		req = req.WithContext(middleware.WithSession(req.Context(), &models.SessionData{
+			UserID: "restore-admin", Role: models.RoleAdmin,
+		}))
+		w := httptest.NewRecorder()
+		setupFullSettingsRouter(h).ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("restore status = %d (body: %s)", w.Code, w.Body.String())
+		}
+	}
+	readSSL := func() (string, string) {
+		t.Helper()
+		var ssl map[string]any
+		if err := db.GetSetting(ctx, "ssl", &ssl); err != nil {
+			t.Fatalf("read ssl: %v", err)
+		}
+		return strVal(ssl["key_text"]), strVal(ssl["cert_text"])
+	}
+
+	// A credential-free export carries only the certificate. The live pair wins.
+	restore(map[string]any{"ssl": map[string]any{"cert_text": certB}})
+	key, cert := readSSL()
+	if key != keyA || cert != certA {
+		t.Fatalf("certificate-only restore changed the TLS identity")
+	}
+	if _, err := tls.X509KeyPair([]byte(cert), []byte(key)); err != nil {
+		t.Fatalf("live TLS identity is not a valid pair: %v", err)
+	}
+
+	// A legacy backup carries both halves; the coherent pair is applied together.
+	restore(map[string]any{"ssl": map[string]any{"key_text": keyB, "cert_text": certB}})
+	key, cert = readSSL()
+	if key != keyB || cert != certB {
+		t.Fatalf("legacy restore did not apply the coherent pair")
+	}
+	if _, err := tls.X509KeyPair([]byte(cert), []byte(key)); err != nil {
+		t.Fatalf("restored TLS identity is not a valid pair: %v", err)
+	}
+}
+
+func testTLSPair(t *testing.T, commonName string) (certPEM, keyPEM string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: commonName},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+		string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
+}
+
+func TestMergeSSLIdentity(t *testing.T) {
+	live := map[string]any{"key_text": "live-key", "cert_text": "live-cert"}
+	both := map[string]any{"key_text": "new-key", "cert_text": "new-cert"}
+
+	tests := []struct {
+		name     string
+		incoming any
+		existing any
+		expected any
+		ok       bool
+	}{
+		{
+			name:     "both halves applied together",
+			incoming: both,
+			existing: live,
+			expected: both,
+			ok:       true,
+		},
+		{
+			name:     "certificate only keeps the live pair",
+			incoming: map[string]any{"cert_text": "new-cert"},
+			existing: live,
+			expected: live,
+			ok:       true,
+		},
+		{
+			name:     "private key only keeps the live pair",
+			incoming: map[string]any{"key_text": "new-key"},
+			existing: live,
+			expected: live,
+			ok:       true,
+		},
+		{
+			name:     "certificate only with no live pair is skipped",
+			incoming: map[string]any{"cert_text": "new-cert"},
+			existing: nil,
+			expected: nil,
+			ok:       false,
+		},
+		{
+			name:     "non-map incoming passes through",
+			incoming: "raw",
+			existing: live,
+			expected: "raw",
+			ok:       true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := mergeSSLIdentity(tt.incoming, tt.existing)
+			if tt.ok != ok {
+				t.Fatalf("ok = %v, want %v", ok, tt.ok)
+			}
+			if !reflect.DeepEqual(got, tt.expected) {
+				t.Fatalf("mergeSSLIdentity() = %#v, want %#v", got, tt.expected)
+			}
+		})
 	}
 }

@@ -8,11 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
-- Backup export no longer carries panel credentials: the JSON download previously set `X-Backup-Credentials-Excluded: true` while including the decrypted TLS private key, Telegram bot tokens, the Gigahost API key, and every user's share bearer token. Secrets are now omitted recursively, and `users[].share_token` is absent for every role (#343).
+- Backup export no longer carries panel or authentication credentials: the JSON download previously set `X-Backup-Credentials-Excluded: true` while including the decrypted TLS private key, the portal VPN private key (`server_private_key`, encrypted at rest but still a credential), the AWG header-protection key, Telegram bot tokens, the Gigahost API key, every user's share bearer token, and — for administrators — VLESS authentication UUIDs and names derived from them. Secrets are now omitted recursively, including future `*_private_key` / `*_api_key` / `*_secret` / `*_token` / `*_password` fields (#343).
 
 ### Changed
 - Backup payload gains `format_version` (`0`/absent = legacy export that may contain decrypted secrets, `2` = credential-free). Restore rejects a newer format with `400 unsupported_backup_format`, overlays settings on the live values so a redacted backup cannot blank the TLS key or bot token, and writes a tokenless share disabled instead of half-enabled.
-- Migration: a legacy backup restores unchanged on a version-2 panel. A version-2 backup must not be restored on a pre-#343 panel — that panel ignores `format_version` and would write the settings map without its secrets. Regenerate the export before downgrading. Connection identifiers remain in the payload because they are connection identity, not portal credentials (#343).
+- Restore keeps the TLS identity coherent: a backup that does not supply **both** the certificate and its private key leaves the live pair untouched, because a certificate from the backup over the live key is a mismatched pair that `tls.X509KeyPair` rejects at the next listener start.
+- Migration: a legacy backup restores unchanged on a version-2 panel. A version-2 backup must not be restored on a pre-#343 panel — that panel ignores `format_version` and would write the settings map without its secrets. Regenerate the export before downgrading. AWG and other connection identifiers remain in the payload: they are connection identity. VLESS UUIDs are authentication credentials and are redacted for every role, so restored VLESS connections have no usable client identity until they are re-provisioned; the secret-bearing recovery format that would carry them is tracked by epic #341 (#343).
 
 ## [2.5.0] - Eclipse - 2026-10-24
 
