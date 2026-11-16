@@ -621,6 +621,10 @@ type ConnectionLimits struct {
 
 // BackupData represents the complete database dump for backup / restore / data.json migration.
 type BackupData struct {
+	// FormatVersion is the payload contract. Absent/0 is the legacy export that
+	// could carry decrypted panel secrets; 2 is the credential-free export
+	// (issue #343). Restore rejects a value newer than the panel supports.
+	FormatVersion         int              `json:"format_version,omitempty"`
 	Servers               []map[string]any `json:"servers"`
 	Users                 []map[string]any `json:"users"`
 	UserConnections       []map[string]any `json:"user_connections"`
