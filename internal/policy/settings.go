@@ -87,8 +87,9 @@ func DefaultSettings() Settings {
 }
 
 // Normalize fills in a valid default refresh interval when the field is absent
-// (zero) and returns a copy with an owned CustomURLs slice so a caller cannot
-// mutate shared state through the returned value.
+// (zero), applies each upstream entry's transport default port, and returns a
+// copy with an owned CustomURLs and UpstreamDNS slice so a caller cannot mutate
+// shared state through the returned value.
 //
 // Normalize deliberately does NOT invent a preset. Selecting a source is an
 // operator action, and a synthesized default would be the "dummy policy" the
@@ -104,7 +105,9 @@ func (s Settings) Normalize() Settings {
 	}
 	if s.UpstreamDNS != nil {
 		out.UpstreamDNS = make([]Upstream, len(s.UpstreamDNS))
-		copy(out.UpstreamDNS, s.UpstreamDNS)
+		for i, upstream := range s.UpstreamDNS {
+			out.UpstreamDNS[i] = upstream.WithDefaultPort()
+		}
 	}
 	return out
 }
@@ -132,7 +135,7 @@ func (s Settings) IsZero() bool {
 // Validate reports whether the configuration may be persisted. A nil result
 // means the record is internally coherent, every URL is fetchable under the
 // same SSRF rules the fetcher enforces, and every upstream entry is a usable
-// resolver the plain transport may dial.
+// resolver whose selected transport may dial it.
 //
 // Validate intentionally does not consult live runtime state: whether enablement
 // is currently possible depends on a published snapshot and direct egress, which
