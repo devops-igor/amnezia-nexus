@@ -659,3 +659,34 @@ func TestRestoreBackupUsers_TokenlessShareIsDisabled(t *testing.T) {
 			legacy.ShareEnabled, legacy.ShareToken)
 	}
 }
+
+// TestMergeBackupSettingSecrets_FailsClosedWhenLiveValueUnreadable covers the
+// fail-closed half of the restore merge: if the live value cannot be read, the
+// caller must skip the write rather than replace a secret with a redaction
+// artifact. Without the guard the function would report "ok" and the caller
+// would overwrite the stored TLS key with a map that has none.
+func TestMergeBackupSettingSecrets_FailsClosedWhenLiveValueUnreadable(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	incoming := map[string]any{"cert_text": "NEW-CERT"}
+	if _, ok := h.mergeBackupSettingSecrets(context.Background(), "ssl", incoming); ok {
+		t.Fatal("unreadable live value must refuse the write, not replace it blind")
+	}
+}
+
+func TestRestoreBackupSettings_SkipsUnreadableSettings(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	restored := h.restoreBackupSettings(context.Background(), map[string]any{
+		"ssl": map[string]any{"cert_text": "NEW-CERT"},
+	})
+	if restored != 0 {
+		t.Fatalf("restored = %d, want 0 when the live value is unreadable", restored)
+	}
+}

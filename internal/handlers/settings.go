@@ -457,7 +457,14 @@ func (h *Handlers) restoreBackupSettings(ctx context.Context, settings map[strin
 		if !allowedSettingsKeys[k] {
 			continue
 		}
-		if err := h.db.SetSetting(ctx, k, h.mergeBackupSettingSecrets(ctx, k, v)); err == nil {
+		merged, ok := h.mergeBackupSettingSecrets(ctx, k, v)
+		if !ok {
+			// Could not read the live value. Writing blind could blank a
+			// credential the backup redacted, so this setting is skipped and
+			// the restore reports one fewer applied setting.
+			continue
+		}
+		if err := h.db.SetSetting(ctx, k, merged); err == nil {
 			restored++
 		}
 	}
@@ -469,16 +476,18 @@ func (h *Handlers) restoreBackupSettings(ctx context.Context, settings map[strin
 //
 // A credential-free export (#343) carries no ssl.key_text or bot token. Without
 // this, restoring it would overwrite the stored TLS key with a map that has
-// none, turning a metadata restore into an outage.
-func (h *Handlers) mergeBackupSettingSecrets(ctx context.Context, key string, incoming any) any {
+// none, turning a metadata restore into an outage. The second return value is
+// false when the live value cannot be read: the caller must then skip the write
+// rather than replace a secret with a redaction artifact.
+func (h *Handlers) mergeBackupSettingSecrets(ctx context.Context, key string, incoming any) (any, bool) {
 	if _, ok := incoming.(map[string]any); !ok {
-		return incoming
+		return incoming, true
 	}
 	var existing any
 	if err := h.db.GetSetting(ctx, key, &existing); err != nil {
-		return incoming
+		return nil, false
 	}
-	return mergePreservingSecrets(incoming, existing)
+	return mergePreservingSecrets(incoming, existing), true
 }
 
 func (h *Handlers) restoreBackupServers(ctx context.Context, servers []map[string]any) (int, map[int64]int64) {
