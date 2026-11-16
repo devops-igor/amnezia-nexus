@@ -187,6 +187,8 @@ func TestIsBackupSecretField(t *testing.T) {
 		"api_key", "gigahost.api_key", "bot_token", "token", "share_token",
 		"password", "password_hash", "share_password_hash", "secret",
 		"client_secret", "refresh_token", "Client_Secret",
+		"HeaderProtectionKey", "hpkey", "headerprotectionkey",
+		"awg_params.HeaderProtectionKey",
 	}
 	for _, key := range secret {
 		if !isBackupSecretField(key) {
@@ -195,7 +197,7 @@ func TestIsBackupSecretField(t *testing.T) {
 	}
 	notSecret := []string{
 		"server_public_key", "cert_text", "key_path", "token_ttl", "enabled",
-		"listen_port", "chat_id", "title", "",
+		"listen_port", "chat_id", "title", "Jc", "S1", "public_key", "port", "",
 	}
 	for _, key := range notSecret {
 		if isBackupSecretField(key) {

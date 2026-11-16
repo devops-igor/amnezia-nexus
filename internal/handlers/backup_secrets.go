@@ -21,7 +21,9 @@ var backupSecretFieldNames = map[string]bool{
 	"key_text":              true, // ssl.key_text: TLS private key
 	"private_key":           true, // generic request/legacy shape
 	"server_private_key":    true, // vpn_config: portal Curve25519 private key
-	"header_protection_key": true, // vpn_config: AWG header-protection secret
+	"header_protection_key": true, // vpn_config + AWG backend metadata
+	"headerprotectionkey":   true, // AWG metadata alias (HeaderProtectionKey)
+	"hpkey":                 true, // AWG metadata alias
 	"api_key":               true, // gigahost.api_key
 	"bot_token":             true, // telegram.bot_token
 	"token":                 true, // telegram.token and other bearer tokens

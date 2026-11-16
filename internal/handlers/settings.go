@@ -242,12 +242,15 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 	serverMaps := make([]map[string]any, len(servers))
 	for i, s := range servers {
 		serverMaps[i] = map[string]any{
-			"id":         s.ID,
-			"name":       s.Name,
-			"host":       s.Host,
-			"ssh_user":   s.SSHUser,
-			"ssh_port":   s.SSHPort,
-			"protocols":  s.Protocols,
+			"id":       s.ID,
+			"name":     s.Name,
+			"host":     s.Host,
+			"ssh_user": s.SSHUser,
+			"ssh_port": s.SSHPort,
+			// AWG 3.1 provisioning stores the backend header-protection key in
+			// this metadata under several aliases and nested shapes. The same
+			// recursive scrub applies here as to settings (#343 review).
+			"protocols":  redactBackupSettings(s.Protocols),
 			"created_at": s.CreatedAt,
 		}
 	}

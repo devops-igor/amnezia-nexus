@@ -513,6 +513,39 @@ func TestDownloadBackupHandler_RedactsCredentials(t *testing.T) {
 		t.Fatalf("seed user: %v", err)
 	}
 
+	// A persisted AWG 3.1 backend stores the header-protection key in server
+	// protocol metadata under several aliases and nested shapes. The export must
+	// not carry any of them, while public parameters stay.
+	const (
+		hpCamel = "CANARY-AWG-HPKEY-CAMEL"
+		hpSnake = "CANARY-AWG-HPKEY-SNAKE"
+		hpShort = "CANARY-AWG-HPKEY-SHORT"
+	)
+	awgMeta := map[string]any{
+		"installed":             true,
+		"port":                  "51820",
+		"public_key":            "PUBLIC-BACKEND-KEY",
+		"Jc":                    4,
+		"HeaderProtectionKey":   hpCamel,
+		"header_protection_key": hpSnake,
+		"hpkey":                 hpShort,
+		"awg_params": map[string]any{
+			"headerprotectionkey": hpCamel,
+			"Jc":                  4,
+		},
+		"params": map[string]any{"header_protection_key": hpSnake},
+	}
+	if _, err := db.CreateServer(ctx, &models.Server{
+		Name:      "awg31-backup",
+		Host:      "10.0.0.99",
+		SSHUser:   "root",
+		SSHPort:   22,
+		Protocols: map[string]any{"awg": awgMeta},
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("seed awg backend: %v", err)
+	}
+
 	// A VLESS UUID authenticates the connection; it must not be exported for any
 	// role, and a display name that embeds it must be replaced.
 	const vlessUUID = "11111111-2222-3333-4444-555555555555"
@@ -546,6 +579,7 @@ func TestDownloadBackupHandler_RedactsCredentials(t *testing.T) {
 	for _, secret := range []string{
 		sslKey, botToken, tgToken, apiKey, shareToken,
 		headerKey, encryptedPortalKey, vlessUUID,
+		hpCamel, hpSnake, hpShort,
 	} {
 		if strings.Contains(body, secret) {
 			t.Errorf("backup response leaked credential %q", secret)
@@ -593,6 +627,36 @@ func TestDownloadBackupHandler_RedactsCredentials(t *testing.T) {
 	if vpn["server_public_key"] != storedVPN["server_public_key"] {
 		t.Errorf("settings.vpn_config.server_public_key = %#v, want the public key retained", vpn["server_public_key"])
 	}
+	// Server protocol metadata: the backend header-protection aliases are gone,
+	// the public key and obfuscation parameters survive.
+	foundAWG := false
+	for _, sm := range payload.Servers {
+		if sm["name"] != "awg31-backup" {
+			continue
+		}
+		foundAWG = true
+		protocols, _ := sm["protocols"].(map[string]any)
+		awg, _ := protocols["awg"].(map[string]any)
+		for _, key := range []string{"HeaderProtectionKey", "header_protection_key", "hpkey"} {
+			if _, present := awg[key]; present {
+				t.Errorf("server protocols.%s must be absent", key)
+			}
+		}
+		params, _ := awg["awg_params"].(map[string]any)
+		if _, present := params["headerprotectionkey"]; present {
+			t.Error("server protocols.awg.awg_params.headerprotectionkey must be absent")
+		}
+		if awg["public_key"] != "PUBLIC-BACKEND-KEY" {
+			t.Errorf("public backend key must be retained, got %#v", awg["public_key"])
+		}
+		if awg["Jc"] != float64(4) {
+			t.Errorf("obfuscation parameter Jc must be retained, got %#v", awg["Jc"])
+		}
+	}
+	if !foundAWG {
+		t.Fatal("seeded AWG backend missing from the export")
+	}
+
 	for _, cm := range payload.UserConnections {
 		if cm["id"] != "vless-backup-conn" {
 			continue
