@@ -314,10 +314,51 @@ destination can be evaluated with no DNS traffic at all. The answer reports:
 | `rule` (inside `prospective`) | the matched rule: its base name, its shape (`apex`, `apex_and_subdomains`, `subdomains`) and the lists that contributed the base entry (`contributors`, with `source_kind` `preset`/`custom`/`mixed`) |
 | `prefix` | the most specific matching CIDR prefix and the lists that supplied exactly that prefix |
 | `addresses` | one current-action verdict per evaluated address, with its own decision, cause, prefix and evidence |
-| `evidence` | the session evidence the decisive verdict rests on: state, decision, generation and remaining TTL. Elapsed age is not reported: the cache stores the decision and its deadline, not the instant it was observed, so the reason is stated in `limitations` (`evidence_age_not_recorded`) |
+| `evidence` | the session evidence the decisive verdict rests on: `state`, `decision`, `generation`, `expires_in_seconds` and the elapsed age (`age_seconds` or `age_unavailable_reason`), described below |
 | `evaluated_at` | the instant the evidence was evaluated at, sampled *after* the optional blocking lookup |
 | `resolution` | how the name was resolved: `configured_resolver`, `caller_supplied`, `not_attempted` or `unavailable`, the upstreams dialled, the deadline, the CNAME chain and the answer, or the resolver's error |
 | `limitations` | the caveats that apply, as tokens |
+
+### Evidence age
+
+`expires_in_seconds` and `age_seconds` are different quantities. Neither is
+computed from the other.
+
+- `expires_in_seconds` is the remaining lifetime: the stored deadline minus
+  `evaluated_at`. It is negative once the evidence has expired. Its meaning is
+  unchanged.
+- `age_seconds` is the elapsed time, in whole seconds, from the instant the
+  observation was recorded to `evaluated_at`. The route cache stores that
+  instant with each entry: the receive time of the DNS response on the gateway
+  path, and the time of the call on the in-memory cache's own observe path. It is never derived from the deadline or from a TTL: the cache
+  does not know the TTL an answer carried, and two entries can have the same
+  remaining lifetime and different ages.
+- An entry holds one observation. When a later observation replaces or extends
+  it, the entry takes that observation's instant together with its decision and
+  deadline. When the earlier observation is kept (a repeat that expires sooner,
+  or a DIRECT answer that must not displace PROXY), its instant is kept too.
+
+`age_seconds` is present only for fresh evidence with a recorded instant, and a
+just-observed entry reports `0`. In every other case it is omitted and
+`age_unavailable_reason` names the cause:
+
+| `age_unavailable_reason` | Meaning |
+| :--- | :--- |
+| `no_evidence` | the session holds nothing for this address |
+| `evidence_not_fresh` | the evidence is expired, quarantined, from an earlier policy generation or retired. The data path ignores it, so an age would describe evidence that does not apply |
+| `observation_instant_not_recorded` | fresh evidence is stored without an observation instant. The answer also carries the `evidence_age_not_recorded` limitation |
+
+No `evidence` object, and so no age, is returned when no session is selected,
+when the selected session owns no cache scope, or when policy routing is
+disabled. `limitations` already says which of those applies
+(`evidence_requires_a_selected_session`, `session_has_no_cached_evidence`).
+
+Records written without an instant are never given one. The route cache is
+in memory only and is rebuilt on restart, so within a running panel every entry
+is written by code that records the instant and the
+`observation_instant_not_recorded` case is a guard for a record that lacks one.
+Such a record reports no age rather than zero, a TTL-derived number or the time
+of the explain request.
 
 The current action follows the packet path exactly, because the packet path
 never looks at a name: prohibited destination (`DROP`), snapshot CIDR
