@@ -284,6 +284,54 @@ func TestPolicyUpstreamDoTSavedWithDefaultPort(t *testing.T) {
 	}
 }
 
+// TestPolicyUpstreamDoHSavedWithDefaultPort is the DoH API contract: the entry is
+// accepted, its transport and pin survive the round trip, and the default port
+// is written out explicitly rather than left implicit in the record.
+func TestPolicyUpstreamDoHSavedWithDefaultPort(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	seedPolicySessions(t, db)
+	r := NewRouter(cfg, db, nil)
+
+	pin := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("*", 32)))
+	body, err := json.Marshal(map[string]any{
+		"enabled":               false,
+		"preset":                string(policy.PresetGeoblock),
+		"sync_interval_seconds": 3600,
+		"upstream_dns": []map[string]any{
+			{"address": "dns.example.com", "transport": "doh", "spki_pin": pin},
+			{"address": "94.140.14.14", "port": 8443, "transport": "doh"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, adminRequest(t, http.MethodPut, "/api/vpn/policy", body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT DoH settings = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	var stored policy.Settings
+	if err := db.GetSetting(context.Background(), policy.SettingsKey, &stored); err != nil {
+		t.Fatalf("read stored settings: %v", err)
+	}
+	want := []policy.Upstream{
+		{Address: "dns.example.com", Port: policy.DefaultDoHPort, Transport: policy.TransportDoH, SPKIPin: pin},
+		{Address: "94.140.14.14", Port: 8443, Transport: policy.TransportDoH},
+	}
+	if len(stored.UpstreamDNS) != len(want) {
+		t.Fatalf("stored upstreams = %v, want %v", stored.UpstreamDNS, want)
+	}
+	for i := range want {
+		if stored.UpstreamDNS[i] != want[i] {
+			t.Fatalf("stored upstream %d = %+v, want %+v", i, stored.UpstreamDNS[i], want[i])
+		}
+	}
+	if err := stored.Validate(); err != nil {
+		t.Fatalf("stored DoH record does not validate: %v", err)
+	}
+}
+
 // TestPolicyUpstreamDNSDefaultsWhenFieldAbsent keeps an existing record working:
 // a stored record without the field reports an empty array and the effective
 // default pair, not a broken resolver.
