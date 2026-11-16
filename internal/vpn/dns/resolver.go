@@ -41,9 +41,18 @@ const (
 	// FailurePinMismatch means the DoT peer's chain verified but the leaf
 	// certificate's SPKI digest did not match the configured pin.
 	FailurePinMismatch FailureKind = "pin_mismatch"
-	// FailureHTTPStatus belongs to the DoH transport, which this build does not
-	// implement. It stays in the contract so the status shape is stable.
+	// FailureHTTPStatus means a DoH peer answered with a non-2xx status that is
+	// not a redirect.
 	FailureHTTPStatus FailureKind = "http_status"
+	// FailureRedirect means a DoH peer answered with a 3xx status. The redirect
+	// is never followed, so it is reported on its own instead of as a status.
+	FailureRedirect FailureKind = "redirect"
+	// FailureContentType means a DoH peer answered 2xx with a content type other
+	// than application/dns-message.
+	FailureContentType FailureKind = "content_type"
+	// FailureResponseTooLarge means a DoH response body exceeded the 65535-byte
+	// bound, the largest possible DNS message.
+	FailureResponseTooLarge FailureKind = "response_too_large"
 )
 
 // ResolverStatus is the operator-facing view of the last upstream outcome.
@@ -93,13 +102,14 @@ type ResolverConfig struct {
 	// fixtures need. The persisted configuration never allows them.
 	AllowLoopbackUpstream bool
 
-	// tlsRootCAs replaces the trust store the DoT transport verifies against. A
-	// nil value - every production caller - means the system store. It exists so
-	// a test can trust a local fixture CA and never reach the internet.
+	// tlsRootCAs replaces the trust store the encrypted transports (DoT and DoH)
+	// verify against. A nil value - every production caller - means the system
+	// store. It exists so a test can trust a local fixture CA and never reach the
+	// internet.
 	tlsRootCAs *x509.CertPool
-	// dotDial opens the TCP connection a DoT exchange wraps in TLS. A nil value
-	// dials the configured address. It exists so a test can point a hostname
-	// entry at a local listener without a name-resolution fixture.
+	// dotDial opens the TCP connection a DoT or DoH exchange wraps in TLS. A nil
+	// value dials the configured address. It exists so a test can point a
+	// hostname entry at a local listener without a name-resolution fixture.
 	dotDial func(ctx context.Context, address string) (net.Conn, error)
 }
 
@@ -225,7 +235,7 @@ func (r *UpstreamResolver) Status() ResolverStatus {
 // transport this build does not implement or cannot dial at all.
 func validateUpstreamEntry(upstream policy.Upstream, allowLoopback bool) error {
 	switch upstream.EffectiveTransport() {
-	case policy.TransportPlain, policy.TransportDoT:
+	case policy.TransportPlain, policy.TransportDoT, policy.TransportDoH:
 	default:
 		return fmt.Errorf("%w: %s selects transport %q", ErrUnsupportedTransport, upstream.String(), upstream.EffectiveTransport())
 	}
@@ -406,7 +416,7 @@ func classifyAttemptError(err error) FailureKind {
 // attemptExchange dispatches one attempt to the transport its entry selects.
 //
 // The dispatch is the single place a transport is chosen, and it has no
-// cross-transport fallback: an entry configured for DoT can never reach
+// cross-transport fallback: an entry configured for DoT or DoH can never reach
 // exchangePlain, not even after a handshake or certificate failure. Failover
 // happens between entries (runAttempts), each of which keeps its own transport.
 func (r *UpstreamResolver) attemptExchange(ctx context.Context, req *mdns.Msg, upstream policy.Upstream) (*mdns.Msg, error) {
@@ -415,6 +425,8 @@ func (r *UpstreamResolver) attemptExchange(ctx context.Context, req *mdns.Msg, u
 		return r.exchangePlain(ctx, req, upstream)
 	case policy.TransportDoT:
 		return r.exchangeDoT(ctx, req, upstream)
+	case policy.TransportDoH:
+		return r.exchangeDoH(ctx, req, upstream)
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedTransport, upstream.String())
 	}

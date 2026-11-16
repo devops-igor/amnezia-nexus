@@ -21,11 +21,15 @@ import (
 //     before the record is written, so a stored entry always states the port it
 //     dials and can never look like it targets one transport while it actually
 //     targets another.
-//   - The plain and DoT transports are implemented. An entry configured for DoH
-//     is REJECTED here rather than accepted and quietly carried in plaintext: a
-//     silent downgrade would be worse than an unimplemented option. The
-//     transport field itself is part of the persisted contract, so the last
-//     encrypted transport slots in without a schema change.
+//   - Every transport the contract names is implemented: plain DNS, DoT and DoH.
+//     An entry never changes transport at dial time. A transport value this
+//     package does not know is rejected here rather than accepted and quietly
+//     carried in another transport, because a silent downgrade would be worse
+//     than an unimplemented option.
+//   - A DoH entry is addressed like every other entry (address, port,
+//     transport). The resolver always requests https://<address>:<port>/dns-query,
+//     the well-known RFC 8484 path, so there is no scheme or path to configure and
+//     no way to express a plaintext HTTP endpoint.
 //   - The default pair lives in exactly one place (DefaultUpstreams). The
 //     resolver's fallback and the DNS servers a generated client configuration
 //     pushes both derive from it, so the two cannot drift apart again.
@@ -44,8 +48,9 @@ const (
 	// the system trust store, chain and name verification, and an optional SPKI
 	// pin; it never carries the query in plaintext.
 	TransportDoT UpstreamTransport = "dot"
-	// TransportDoH is DNS over HTTPS. Not implemented in this build, so it is
-	// rejected rather than approximated.
+	// TransportDoH is DNS over HTTPS (RFC 8484), carried over HTTP/2 with the
+	// system trust store, chain and name verification, and an optional SPKI pin.
+	// It never carries the query in plaintext and never follows a redirect.
 	TransportDoH UpstreamTransport = "doh"
 )
 
@@ -57,6 +62,8 @@ const (
 	DefaultUpstreamPort = 53
 	// DefaultDoTPort is the port a DoT entry uses when it states none.
 	DefaultDoTPort = 853
+	// DefaultDoHPort is the port a DoH entry uses when it states none.
+	DefaultDoHPort = 443
 	// maxUpstreamHostLen is the maximum length of a DNS name in presentation form.
 	maxUpstreamHostLen = 253
 	// maxUpstreamLabelLen is the maximum length of one DNS name label.
@@ -68,11 +75,6 @@ const (
 // seam distinguish "loopback" from "genuinely unusable".
 var ErrUpstreamLoopback = errors.New("upstream is loopback")
 
-// ErrUpstreamTransportUnsupported marks a transport this build deliberately
-// refuses. Accepting it would mean silently carrying the query in another
-// transport, which is exactly the downgrade the contract forbids.
-var ErrUpstreamTransportUnsupported = errors.New("upstream transport is not supported in this build")
-
 // Upstream is one persisted recursive-resolver entry.
 //
 // Address is an IPv4 literal, an IPv6 literal or a hostname. A hostname is
@@ -81,16 +83,17 @@ var ErrUpstreamTransportUnsupported = errors.New("upstream transport is not supp
 type Upstream struct {
 	// Address is the IPv4/IPv6 literal or hostname of the resolver.
 	Address string `json:"address"`
-	// Port is explicit for plain DNS and defaults to DefaultDoTPort for DoT.
+	// Port is explicit for plain DNS. DoT defaults to DefaultDoTPort and DoH to
+	// DefaultDoHPort when it is left unset.
 	Port int `json:"port"`
 	// Transport is the empty string (plain) or one of the UpstreamTransport
 	// values.
 	Transport UpstreamTransport `json:"transport,omitempty"`
-	// SPKIPin is the optional public-key pin for DoT: the SHA-256 digest of the
-	// leaf certificate's SubjectPublicKeyInfo, encoded as standard base64
+	// SPKIPin is the optional public-key pin for DoT and DoH: the SHA-256 digest
+	// of the leaf certificate's SubjectPublicKeyInfo, encoded as standard base64
 	// (RFC 4648 section 4, with padding, no line breaks). Empty means no pin.
 	// An empty field keeps a slice-1 record valid, and the plain transport never
-	// reads it because a pin is only meaningful for an encrypted transport.
+	// reads it, so a pin on a plain entry is rejected instead of ignored.
 	SPKIPin string `json:"spki_pin,omitempty"`
 }
 
@@ -110,10 +113,20 @@ func (u Upstream) EffectivePort() int {
 	if u.Port != 0 {
 		return u.Port
 	}
-	if u.EffectiveTransport() == TransportDoT {
+	return u.EffectiveTransport().defaultPort()
+}
+
+// defaultPort is the well-known port a transport uses when an entry states
+// none, or 0 for a transport that has no default and so requires an explicit one.
+func (t UpstreamTransport) defaultPort() int {
+	switch t {
+	case TransportDoT:
 		return DefaultDoTPort
+	case TransportDoH:
+		return DefaultDoHPort
+	default:
+		return 0
 	}
-	return 0
 }
 
 // WithDefaultPort returns the entry with its transport default applied when the
@@ -158,14 +171,17 @@ func (u Upstream) String() string {
 // Validate reports whether one entry may be persisted or dialed. Errors are
 // specific so the admin API can tell an operator exactly which rule failed.
 func (u Upstream) Validate() error {
+	transport := u.EffectiveTransport()
+	if transport == TransportDoH {
+		if err := u.validateDoHAddress(); err != nil {
+			return err
+		}
+	}
 	if err := u.validateAddress(); err != nil {
 		return err
 	}
-	transport := u.EffectiveTransport()
 	switch transport {
-	case TransportPlain, TransportDoT:
-	case TransportDoH:
-		return fmt.Errorf("upstream %q selects transport %q: %w", u.Address, u.Transport, ErrUpstreamTransportUnsupported)
+	case TransportPlain, TransportDoT, TransportDoH:
 	default:
 		return fmt.Errorf("upstream %q has unknown transport %q", u.Address, u.Transport)
 	}
@@ -175,11 +191,23 @@ func (u Upstream) Validate() error {
 	return u.validateSPKIPin(transport)
 }
 
+// validateDoHAddress rejects an address that is a URL rather than a host. A DoH
+// entry is an address and a port, and the resolver always requests
+// https://<address>:<port>/dns-query over TLS, so a scheme, path or query in the
+// address could only be dropped silently or change where the query goes; both
+// are refused with a message that says what to configure instead.
+func (u Upstream) validateDoHAddress() error {
+	if strings.ContainsAny(u.Address, "/?#@") {
+		return fmt.Errorf("upstream %q is not a bare host: a doh entry is an address and a port, and the resolver requests https://<address>:<port>/dns-query itself", u.Address)
+	}
+	return nil
+}
+
 // validatePort enforces an explicit port for plain DNS and the transport default
-// for DoT.
+// for DoT and DoH.
 func (u Upstream) validatePort(transport UpstreamTransport) error {
 	if u.Port == 0 {
-		if transport == TransportDoT {
+		if transport.defaultPort() != 0 {
 			return nil
 		}
 		return fmt.Errorf("upstream %q requires an explicit port", u.Address)
@@ -191,13 +219,14 @@ func (u Upstream) validatePort(transport UpstreamTransport) error {
 }
 
 // validateSPKIPin rejects a pin the resolver could not verify, and a pin on a
-// transport that never presents a certificate.
+// transport that never presents a certificate. DoT and DoH both verify the leaf
+// key, so both honor it.
 func (u Upstream) validateSPKIPin(transport UpstreamTransport) error {
 	if u.SPKIPin == "" {
 		return nil
 	}
-	if transport != TransportDoT {
-		return fmt.Errorf("upstream %q sets an SPKI pin but selects transport %q; a pin is only honored by DNS over TLS", u.Address, transport)
+	if transport == TransportPlain {
+		return fmt.Errorf("upstream %q sets an SPKI pin but selects transport %q; a pin is only honored by the encrypted transports dot and doh", u.Address, transport)
 	}
 	if _, err := u.SPKIPinDigest(); err != nil {
 		return fmt.Errorf("upstream %q: %v", u.Address, err)

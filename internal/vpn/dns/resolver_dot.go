@@ -34,7 +34,8 @@ import (
 
 // dotFailure is an attempt error that carries the operator-facing failure kind.
 // The resolver's status reports the kind, so a certificate rejection, a pin
-// mismatch and a broken handshake stay distinguishable from a timeout.
+// mismatch and a broken handshake stay distinguishable from a timeout. Both
+// encrypted transports return it; the name predates DoH.
 type dotFailure struct {
 	kind FailureKind
 	err  error
@@ -78,7 +79,7 @@ func (r *UpstreamResolver) exchangeDoT(ctx context.Context, req *mdns.Msg, upstr
 		return nil, &dotFailure{kind: FailureCertificate, err: fmt.Errorf("upstream %s: unusable SPKI pin: %w", upstream.String(), err)}
 	}
 
-	conn, state, err := r.dialDoT(attemptCtx, upstream)
+	conn, state, err := r.dialTLS(attemptCtx, upstream, nil)
 	if err != nil {
 		return nil, classifyDoTFailure(attemptCtx, err)
 	}
@@ -106,9 +107,12 @@ func (r *UpstreamResolver) exchangeDoT(ctx context.Context, req *mdns.Msg, upstr
 	return resp, nil
 }
 
-// dialDoT opens the TCP connection and completes the TLS handshake within ctx,
-// returning the verified connection and its state.
-func (r *UpstreamResolver) dialDoT(ctx context.Context, upstream policy.Upstream) (*tls.Conn, tls.ConnectionState, error) {
+// dialTLS opens the TCP connection and completes the TLS handshake within ctx,
+// returning the verified connection and its state. It is the one handshake body
+// both encrypted transports share: DoT offers no ALPN protocol (nextProtos nil)
+// and DoH offers HTTP/2 only, so the chain, name and trust-store rules cannot
+// differ between them.
+func (r *UpstreamResolver) dialTLS(ctx context.Context, upstream policy.Upstream, nextProtos []string) (*tls.Conn, tls.ConnectionState, error) {
 	rawConn, err := r.dotDial(ctx, upstream.HostPort())
 	if err != nil {
 		return nil, tls.ConnectionState{}, err
@@ -117,6 +121,7 @@ func (r *UpstreamResolver) dialDoT(ctx context.Context, upstream policy.Upstream
 		MinVersion: tls.VersionTLS12,
 		ServerName: dotServerName(upstream),
 		RootCAs:    r.tlsRootCAs,
+		NextProtos: nextProtos,
 	})
 	stopAfter := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	err = conn.HandshakeContext(ctx)
