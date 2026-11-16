@@ -38,7 +38,18 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
-          cache: true
+          # No setup-go cache on this runner. It is persistent, so ~/go/pkg/mod
+          # and ~/.cache/go-build already survive between runs. The action's
+          # archive stores module paths relative to the workspace
+          # (../../../../go/pkg/mod/...), so restoring it extracts onto those
+          # existing read-only files: about 60,000 tar "File exists" errors, a
+          # ~975 MB download and ~4 minutes of extraction that restores
+          # nothing, and the step still reports success. The post step then
+          # spends ~4.5 minutes building an archive whose key already exists
+          # and cannot be reserved. With the cache off the go commands below
+          # use the local caches and fetch any missing module on demand, so a
+          # wiped runner is slower rather than broken.
+          cache: false
 
       - name: Ensure Toolchain in PATH
         run: |
