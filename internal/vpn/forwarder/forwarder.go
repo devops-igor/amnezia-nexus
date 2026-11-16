@@ -139,6 +139,14 @@ type Forwarder struct {
 	dropsPacketTooLarge atomic.Uint64 // return packets dropped because they exceed the queued payload bound
 	dropsTotal          atomic.Uint64 // return-path drops counted so far
 
+	// Oversized return rejections are attributed to the producer that refused
+	// them; see recordOversizedReturn in oversized_returns.go for the single
+	// booking site. Each tally holds only a count and the largest refused
+	// payload size in bytes — never a payload, address, peer, session or
+	// per-flow entry — so attribution costs two fixed numbers per producer.
+	oversizedBackendReturns oversizedReturnTally // replies arriving from a backend tunnel
+	oversizedDirectReturns  oversizedReturnTally // replies arriving from direct WAN egress
+
 	clientDropsQueueFull   atomic.Uint64 // client packets dropped: backend queue full
 	clientDropsRateLimited atomic.Uint64 // client packets dropped: upstream token bucket exhausted
 	clientDropsNoBackend   atomic.Uint64 // client packets dropped: backend queue not registered/found

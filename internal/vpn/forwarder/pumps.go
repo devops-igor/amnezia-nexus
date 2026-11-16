@@ -403,8 +403,7 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 
 	pktLen := int64(len(packet))
 	if len(packet) > MaxClientQueuePacketBytes {
-		f.dropsPacketTooLarge.Add(1)
-		f.dropsTotal.Add(1)
+		f.recordOversizedReturn(&f.oversizedBackendReturns, len(packet))
 		return ErrPacketTooLarge
 	}
 	if tbDown != nil && !tbDown.Allow(pktLen) {
