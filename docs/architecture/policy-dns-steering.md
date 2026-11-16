@@ -433,7 +433,24 @@ observation, syncs a list, refreshes anything or moves a counter:
   both CNAME and A records, an unnormalizable intermediate or a truncated reply —
   are reported as unusable instead of being explained from. A parity table drives
   the explainer, the classifier and `ObserveResponse` over the same crafted
-  answers and requires all three to agree.
+  answers and requires all three to agree;
+- the classification carries two address sets as separate named fields, because
+  they answer different questions. `ResolvedAddresses` is every terminal IPv4
+  address the answer carries, and it is what the explainer evaluates.
+  `EvidenceAddresses` is the subset that passes the fetch-IP policy, and it is
+  the only set `ObserveResponse` turns into evidence. A name resolving to
+  `10.0.0.5` is therefore explained as `DROP` with `prohibited_destination`, the
+  decision the dispatcher gives that destination, while the production evidence
+  filter is unchanged and records nothing for it. In a mixed answer every resolved
+  address is evaluated and the headline is the most restrictive outcome;
+- the traversed names are kept for every valid answer, including one with no
+  terminal A record, so a submitted name that matches a rule still reports its
+  prospective classification beside the UNKNOWN current action.
+
+A test drives one DNS answer through the production observation path and the
+real forwarder dispatcher and requires the explainer to agree with the action the
+dispatcher takes for each resolved address, for a prohibited address alone, a mixed
+public and prohibited answer and a fresh DIRECT destination.
 
 A test asserts the entry count, the session count, the stored evidence and the
 dispatcher counters are identical before and after an explanation, and that an
