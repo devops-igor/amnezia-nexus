@@ -204,6 +204,15 @@ func GenerationToSnapshot(gen *Generation) (*Snapshot, error) {
 
 	idx := newIPv4Index(prefixes)
 
+	// A durable generation stores merged rules only, so it carries no per-rule
+	// source attribution. The prefixes are still retained individually: an
+	// explanation can then name the prefix that matched and state honestly that
+	// the source is unknown for a last-known-good snapshot.
+	cidrRules := make([]cidrRule, len(prefixes))
+	for i := range prefixes {
+		cidrRules[i] = cidrRule{prefix: prefixes[i]}
+	}
+
 	sourceIDs := make([]string, 0, len(gen.SourcesMeta))
 	for id := range gen.SourcesMeta {
 		sourceIDs = append(sourceIDs, id)
@@ -219,5 +228,6 @@ func GenerationToSnapshot(gen *Generation) (*Snapshot, error) {
 		sourceIDs:    sourceIDs,
 		domains:      domains,
 		ipv4:         idx,
+		cidrRules:    cidrRules,
 	}, nil
 }

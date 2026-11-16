@@ -20,6 +20,19 @@ type Snapshot struct {
 	sourceIDs    []string
 	domains      map[string]domainFlags
 	ipv4         ipv4Index
+	// cidrRules keeps every distinct prefix with the sources that supplied it.
+	// The merged ipv4Index answers "does this address match"; it cannot answer
+	// "which prefix, from which source" because it merges adjacent ranges. This
+	// list is what a dry run reads (snapshot_explain.go). It costs one prefix
+	// plus one provenance byte per distinct prefix and changes no match result.
+	cidrRules []cidrRule
+}
+
+// cidrRule is one compiled IPv4 prefix with the provenance bits of the sources
+// that supplied it, in the same encoding domain entries use.
+type cidrRule struct {
+	prefix  netip.Prefix
+	sources domainFlags
 }
 
 // Version returns the sequential version number of this snapshot.
@@ -153,42 +166,66 @@ func (m MemorySource) ToSourceParsedRules() SourceParsedRules {
 }
 
 // CompileSnapshot creates a new immutable Snapshot from source parsed rules.
+//
+// Provenance: each rule records which sources supplied it, packed into the bits
+// of domainFlags above domainMatchMask, so an explanation can name the rule AND
+// the list it came from without a second per-rule index in memory. The packed
+// bits are invisible to the matchers, which read only domainMatchMask; matching
+// therefore behaves exactly as before.
 func CompileSnapshot(version uint64, generationID string, sources []SourceParsedRules) (*Snapshot, error) {
 	if len(sources) == 0 {
 		return nil, errors.New("cannot compile snapshot with zero sources")
 	}
 
 	mergedDomains := make(map[string]domainFlags)
-	var allCIDRs []netip.Prefix
-	seenCIDRs := make(map[netip.Prefix]struct{})
+	cidrRules := make([]cidrRule, 0, len(sources))
+	cidrIndex := make(map[netip.Prefix]int)
 	sourceIDs := make([]string, 0, len(sources))
 
-	for _, src := range sources {
+	for i, src := range sources {
 		sourceIDs = append(sourceIDs, src.SourceID)
+		provenance := provenanceBit(i, len(sources))
 		for base, flags := range src.Rules.Domains {
-			mergedDomains[base] |= flags
+			mergedDomains[base] |= (flags & domainMatchMask) | provenance
 		}
 		for _, prefix := range src.Rules.CIDRs {
 			canon := prefix.Masked()
-			if _, exists := seenCIDRs[canon]; !exists {
-				seenCIDRs[canon] = struct{}{}
-				allCIDRs = append(allCIDRs, canon)
+			if at, exists := cidrIndex[canon]; exists {
+				cidrRules[at].sources |= provenance
+				continue
 			}
+			cidrIndex[canon] = len(cidrRules)
+			cidrRules = append(cidrRules, cidrRule{prefix: canon, sources: provenance})
 		}
 	}
 
-	idx := newIPv4Index(allCIDRs)
+	prefixes := make([]netip.Prefix, len(cidrRules))
+	for i := range cidrRules {
+		prefixes[i] = cidrRules[i].prefix
+	}
 
 	return &Snapshot{
 		version:      version,
 		generationID: generationID,
 		createdAt:    time.Now().UTC(),
 		domainCount:  len(mergedDomains),
-		cidrCount:    len(allCIDRs),
+		cidrCount:    len(cidrRules),
 		sourceIDs:    sourceIDs,
 		domains:      mergedDomains,
-		ipv4:         idx,
+		ipv4:         newIPv4Index(prefixes),
+		cidrRules:    cidrRules,
 	}, nil
+}
+
+// provenanceBit returns the provenance bit for the source at index i, or zero
+// when the snapshot has more sources than the encoding holds. Recording nothing
+// for such a snapshot is the honest answer: an explanation then names the rule
+// without naming a source, instead of naming a partial or wrong set.
+func provenanceBit(i, total int) domainFlags {
+	if total > maxSnapshotSources || i < 0 || i >= maxSnapshotSources {
+		return 0
+	}
+	return domainFlags(1<<uint(i)) << domainSourceShift
 }
 
 // Matcher provides lock-free, concurrent-safe access to the current active policy Snapshot.

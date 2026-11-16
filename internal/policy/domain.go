@@ -15,6 +15,23 @@ const (
 	domainExact           domainFlags = 1 << 0
 	domainInclusiveSuffix domainFlags = 1 << 1
 	domainDescendants     domainFlags = 1 << 2
+
+	// domainMatchMask isolates the bits that decide a match. CompileSnapshot
+	// packs the sources that supplied a rule into the remaining bits of the same
+	// byte (see snapshot.go), so every matcher reads only these bits and its
+	// behavior is unchanged byte for byte.
+	domainMatchMask domainFlags = domainExact | domainInclusiveSuffix | domainDescendants
+
+	// maxSnapshotSources bounds the compiled provenance encoding: one bit per
+	// source, packed above the matching bits. The Syncer accepts at most four
+	// sources (MaxCustomURLs), which is exactly what these bits hold. A snapshot
+	// compiled from more sources records no provenance at all rather than a
+	// wrong one.
+	maxSnapshotSources = 4
+	// domainSourceShift is the position of the first provenance bit.
+	domainSourceShift = 4
+	// domainSourceMask covers every provenance bit.
+	domainSourceMask domainFlags = 0xf0
 )
 
 // DomainMode defines how bare domain entries in a list are interpreted.
