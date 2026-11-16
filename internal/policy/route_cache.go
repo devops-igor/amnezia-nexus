@@ -86,6 +86,11 @@ var (
 type routeEntry struct {
 	decision  Decision
 	expiresAt time.Time
+	// observedAt is the instant the observation that supplies decision and
+	// expiresAt was made. It is recorded, never derived from the deadline: a TTL
+	// says how long evidence may be used, not when it was seen. The zero value
+	// means no instant was recorded.
+	observedAt time.Time
 }
 
 type routeView struct {
@@ -322,6 +327,19 @@ func foldBatch(batch []Observation) map[[4]byte]Observation {
 	return folded
 }
 
+// laterEntry resolves two observations that agree on the decision: the one with
+// the later deadline is kept together with its own observation instant, so a
+// stored record always describes a single observation. A tie goes to the newer
+// observation.
+func laterEntry(existing routeEntry, obs Observation, observedAt time.Time) routeEntry {
+	if obs.ExpiresAt.Before(existing.expiresAt) {
+		return existing
+	}
+	return routeEntry{decision: obs.Decision, expiresAt: obs.ExpiresAt, observedAt: observedAt}
+}
+
+// mergeConflictResolution folds the batch into newEntries. observedAt is the
+// instant of this batch and is stored on every entry the batch supplies.
 func mergeConflictResolution(newEntries map[[4]byte]routeEntry, folded map[[4]byte]Observation, now time.Time) bool {
 	hasIncomingProxy := false
 	for k, obs := range folded {
@@ -334,33 +352,23 @@ func mergeConflictResolution(newEntries map[[4]byte]routeEntry, folded map[[4]by
 				// Zero-TTL Proxy observation without prior entry: safe fallback (UNKNOWN).
 				continue
 			}
-			newEntries[k] = routeEntry{decision: obs.Decision, expiresAt: obs.ExpiresAt}
+			newEntries[k] = routeEntry{decision: obs.Decision, expiresAt: obs.ExpiresAt, observedAt: now}
 			continue
 		}
-		if existing.decision == Direct && obs.Decision == Direct {
-			newEntries[k] = routeEntry{
-				decision:  Direct,
-				expiresAt: maxTime(existing.expiresAt, obs.ExpiresAt),
-			}
-		} else if existing.decision == Direct && obs.Decision == Proxy {
+		switch {
+		case existing.decision == obs.Decision:
+			newEntries[k] = laterEntry(existing, obs, now)
+		case obs.Decision == Proxy:
 			// PROXY discards old DIRECT evidence.
 			if !obs.ExpiresAt.After(now) {
 				// Zero-TTL Proxy: immediately revoke/suppress active DIRECT entry.
 				delete(newEntries, k)
 			} else {
-				newEntries[k] = routeEntry{
-					decision:  Proxy,
-					expiresAt: obs.ExpiresAt,
-				}
-			}
-		} else if existing.decision == Proxy && obs.Decision == Direct {
-			// Keep existing PROXY and its deadline; ignore DIRECT.
-		} else if existing.decision == Proxy && obs.Decision == Proxy {
-			newEntries[k] = routeEntry{
-				decision:  Proxy,
-				expiresAt: maxTime(existing.expiresAt, obs.ExpiresAt),
+				newEntries[k] = routeEntry{decision: Proxy, expiresAt: obs.ExpiresAt, observedAt: now}
 			}
 		}
+		// An incoming DIRECT never displaces a stored PROXY: the existing entry and
+		// its deadline stay.
 	}
 	return hasIncomingProxy
 }
@@ -426,6 +434,9 @@ func (s *SessionCache) checkCapacityAndEvict(currentView *routeView, newEntries 
 }
 
 // Observe records a validated batch of route observations for this session.
+// now is the instant the batch was observed (for the DNS path, the instant the
+// response was received); it is stored on every entry the batch writes so the
+// elapsed age of evidence can be reported later. A zero now records no instant.
 // Validates IP addresses (native public IPv4 only), deadlines, and policy generation.
 // Implements PROXY-wins conflict resolution and capacity overflow quarantine.
 func (s *SessionCache) Observe(policyGeneration string, batch []Observation, now time.Time) error {
@@ -575,11 +586,4 @@ func (c *RouteCache) Sweep(now time.Time) {
 			})
 		}
 	}
-}
-
-func maxTime(a, b time.Time) time.Time {
-	if a.After(b) {
-		return a
-	}
-	return b
 }

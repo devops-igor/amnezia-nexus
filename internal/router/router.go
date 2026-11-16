@@ -318,6 +318,9 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			r.Put("/", h.PutPolicyHandler)
 			r.Post("/sync", h.SyncPolicyHandler)
 			r.Get("/stats", h.GetPolicyStatsHandler)
+			// Read-only decision dry run (#825). Same group, so the same
+			// RequireAdmin and CSRF middleware apply; it changes no state.
+			r.Post("/explain", h.ExplainPolicyHandler)
 		})
 	})
 
