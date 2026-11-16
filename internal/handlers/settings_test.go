@@ -812,6 +812,16 @@ func TestRestoreBackupSettings_KeepsTLSIdentityCoherent(t *testing.T) {
 		t.Fatalf("live TLS identity is not a valid pair: %v", err)
 	}
 
+	// A mismatched pair from a corrupt backup is refused, not applied.
+	restore(map[string]any{"ssl": map[string]any{"key_text": keyA, "cert_text": certB}})
+	key, cert = readSSL()
+	if key != keyA || cert != certA {
+		t.Fatalf("mismatched backup pair replaced the live identity")
+	}
+	if _, err := tls.X509KeyPair([]byte(cert), []byte(key)); err != nil {
+		t.Fatalf("live TLS identity is not a valid pair: %v", err)
+	}
+
 	// A legacy backup carries both halves; the coherent pair is applied together.
 	restore(map[string]any{"ssl": map[string]any{"key_text": keyB, "cert_text": certB}})
 	key, cert = readSSL()
@@ -849,7 +859,8 @@ func testTLSPair(t *testing.T, commonName string) (certPEM, keyPEM string) {
 
 func TestMergeSSLIdentity(t *testing.T) {
 	live := map[string]any{"key_text": "live-key", "cert_text": "live-cert"}
-	both := map[string]any{"key_text": "new-key", "cert_text": "new-cert"}
+	certNew, keyNew := testTLSPair(t, "panel-new.example")
+	both := map[string]any{"key_text": keyNew, "cert_text": certNew}
 
 	tests := []struct {
 		name     string
@@ -875,6 +886,13 @@ func TestMergeSSLIdentity(t *testing.T) {
 		{
 			name:     "private key only keeps the live pair",
 			incoming: map[string]any{"key_text": "new-key"},
+			existing: live,
+			expected: live,
+			ok:       true,
+		},
+		{
+			name:     "both halves that do not form a valid pair keep the live pair",
+			incoming: map[string]any{"key_text": "not-a-key", "cert_text": "not-a-cert"},
 			existing: live,
 			expected: live,
 			ok:       true,

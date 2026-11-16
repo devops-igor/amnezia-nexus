@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -506,16 +507,20 @@ func (h *Handlers) mergeBackupSettingSecrets(ctx context.Context, key string, in
 //
 // A credential-free export carries a certificate but no private key. Applying
 // that certificate over the live key would leave a mismatched pair, which
-// tls.X509KeyPair rejects at the next listener start. Unless the backup supplies
-// both halves, the live pair is kept whole — or, with no live pair to keep,
-// nothing is written.
+// tls.X509KeyPair rejects at the next listener start. The identity is therefore
+// applied only when the backup supplies both halves AND they form a valid pair;
+// otherwise the live pair is kept whole — or, with no live pair to keep, nothing
+// is written.
 func mergeSSLIdentity(incoming, existing any) (any, bool) {
 	inMap, ok := incoming.(map[string]any)
 	if !ok {
 		return incoming, true
 	}
-	if strVal(inMap["key_text"]) != "" && strVal(inMap["cert_text"]) != "" {
-		return inMap, true
+	keyText, certText := strVal(inMap["key_text"]), strVal(inMap["cert_text"])
+	if keyText != "" && certText != "" {
+		if _, err := tls.X509KeyPair([]byte(certText), []byte(keyText)); err == nil {
+			return inMap, true
+		}
 	}
 	if exMap, ok := existing.(map[string]any); ok && len(exMap) > 0 {
 		return exMap, true
