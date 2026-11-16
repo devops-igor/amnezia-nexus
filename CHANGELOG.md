@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Backup export no longer carries panel credentials: the JSON download previously set `X-Backup-Credentials-Excluded: true` while including the decrypted TLS private key, Telegram bot tokens, the Gigahost API key, and every user's share bearer token. Secrets are now omitted recursively, and `users[].share_token` is absent for every role (#343).
+
+### Changed
+- Backup payload gains `format_version` (`0`/absent = legacy export that may contain decrypted secrets, `2` = credential-free). Restore rejects a newer format with `400 unsupported_backup_format`, overlays settings on the live values so a redacted backup cannot blank the TLS key or bot token, and writes a tokenless share disabled instead of half-enabled.
+- Migration: a legacy backup restores unchanged on a version-2 panel. A version-2 backup must not be restored on a pre-#343 panel — that panel ignores `format_version` and would write the settings map without its secrets. Regenerate the export before downgrading. Connection identifiers remain in the payload because they are connection identity, not portal credentials (#343).
+
 ## [2.5.0] - Eclipse - 2026-10-24
 
 Feature and maintenance release adding direct QR code PNG image download in connection modals, offline server connection guards, automated architectural health tracking, and completed modularization across VPN services and WireGuard managers.

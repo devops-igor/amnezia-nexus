@@ -224,7 +224,13 @@ func (h *Handlers) SaveSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	h.JSON(w, http.StatusOK, map[string]any{"status": "success"})
 }
 
-// DownloadBackupHandler exports complete panel database state as a JSON backup.
+// DownloadBackupHandler exports panel metadata as a credential-free JSON backup.
+//
+// The payload contract is versioned by BackupData.FormatVersion: 0/absent is the
+// legacy export that could carry decrypted secrets, 2 omits every panel
+// credential (issue #343). Migration path: a legacy backup restores unchanged on
+// this panel; a version-2 backup must not be restored on a pre-#343 panel, which
+// ignores the field and would write the settings map without its secrets.
 func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
