@@ -284,13 +284,32 @@ func TestApplyLiveUpstreamsSwapsInstalledResolver(t *testing.T) {
 		t.Fatalf("live resolver upstreams = %v, want the default pair %v", got, defaults)
 	}
 
-	// A rejected list must leave the installed one in effect.
-	rejected := policy.DefaultSettings()
-	rejected.UpstreamDNS = []policy.Upstream{{Address: "94.140.14.14", Port: 853, Transport: policy.TransportDoT}}
-	if err := svc.applyLiveUpstreams(rejected); err == nil {
-		t.Fatal("applyLiveUpstreams accepted an unimplemented transport")
+	// A DoT list is an accepted configuration and takes effect live, without
+	// rebuilding the resolver or the data path.
+	dot := policy.DefaultSettings()
+	dot.UpstreamDNS = []policy.Upstream{
+		{Address: "94.140.14.14", Transport: policy.TransportDoT},
+		{Address: "dns.example.com", Port: 853, Transport: policy.TransportDoT},
 	}
-	if got := resolver.Upstreams(); len(got) != len(defaults) || got[0] != defaults[0] {
+	if err := svc.applyLiveUpstreams(dot); err != nil {
+		t.Fatalf("applyLiveUpstreams(dot): %v", err)
+	}
+	got = resolver.Upstreams()
+	if len(got) != 2 || got[0].Transport != policy.TransportDoT || got[1].Address != "dns.example.com" {
+		t.Fatalf("live resolver upstreams = %v, want the configured DoT list", got)
+	}
+	if got[0].Port != policy.DefaultDoTPort {
+		t.Fatalf("live DoT upstream port = %d, want the effective default %d", got[0].Port, policy.DefaultDoTPort)
+	}
+
+	// A transport this build does not implement is refused, and the accepted
+	// list stays in effect.
+	rejected := policy.DefaultSettings()
+	rejected.UpstreamDNS = []policy.Upstream{{Address: "dns.example.com", Port: 443, Transport: policy.TransportDoH}}
+	if err := svc.applyLiveUpstreams(rejected); err == nil {
+		t.Fatal("applyLiveUpstreams accepted a transport this build does not implement")
+	}
+	if got := resolver.Upstreams(); len(got) != 2 || got[0].Transport != policy.TransportDoT {
 		t.Fatalf("a rejected update changed the installed list: %v", got)
 	}
 }
