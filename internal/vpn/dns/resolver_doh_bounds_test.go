@@ -3,8 +3,10 @@ package gatewaydns
 import (
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
@@ -46,15 +48,26 @@ func TestResolver_DoHRedirectNotFollowed(t *testing.T) {
 
 // TestResolver_DoHOversizedBody proves a body past the 65535-byte bound is a
 // failure of its own and never a truncated answer. The three cases cover the
-// declared-length check, an undeclared (chunked) stream, and the exact boundary,
-// which must still be accepted by the size rule and then fail only as a message.
+// declared-length check (decided from the header, before any body is read), an
+// undeclared stream cut off at the bound, and the exact boundary, which the size
+// rule accepts so the body fails only as a message.
 func TestResolver_DoHOversizedBody(t *testing.T) {
 	oversize := strings.Repeat("a", maxDoHResponseBytes+1)
 
 	t.Run("declared length over the bound", func(t *testing.T) {
-		resolver, entry, _ := dohFailureResolver(t, func(w http.ResponseWriter, _ *http.Request) {
+		// The header alone must be enough: the handler declares the length and then
+		// sends only a few bytes, so a client that trusted the declaration less than
+		// it should would sit waiting for the rest instead of failing at once.
+		resolver, entry, _ := dohFailureResolver(t, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", dohMediaType)
-			_, _ = w.Write([]byte(oversize))
+			w.Header().Set("Content-Length", strconv.Itoa(len(oversize)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("x"))
+			w.(http.Flusher).Flush()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(dohStallCeiling):
+			}
 		})
 		assertDoHFailure(t, resolver, entry, FailureResponseTooLarge)
 	})
