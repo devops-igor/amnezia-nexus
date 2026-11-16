@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
+	"os/exec"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -207,14 +209,23 @@ func TestResolver_DoTNoPlaintextDowngradeAllChannels(t *testing.T) {
 	}
 }
 
+// dohProxyChildEnv marks the re-executed test process that performs the exchange.
+const dohProxyChildEnv = "DOH_PROXY_PROBE_CHILD"
+
 // TestResolver_DoHIgnoresProxyEnvironment proves the transport is pinned: a
-// proxy named in the environment is never contacted, because the HTTP transport
-// has no proxy function. The proxy is a real listener that counts connections.
+// proxy named in the environment is never contacted. The proxy is a real
+// listener that counts connections.
 //
-// The entry is a hostname, not a loopback literal, on purpose: net/http's
-// ProxyFromEnvironment never proxies loopback targets, so a loopback entry would
-// pass even if proxy support were switched on and the test would prove nothing.
+// The exchange runs in a re-executed child process on purpose. net/http reads
+// the proxy environment once per process and caches it, so in a shared test
+// binary an earlier test would already have fixed the (empty) answer and this
+// test would pass even with proxy support switched on. A fresh process reads the
+// environment for the first time.
 func TestResolver_DoHIgnoresProxyEnvironment(t *testing.T) {
+	if os.Getenv(dohProxyChildEnv) != "" {
+		runDoHProxyChild(t)
+		return
+	}
 	proxy, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen proxy: %v", err)
@@ -231,15 +242,27 @@ func TestResolver_DoHIgnoresProxyEnvironment(t *testing.T) {
 		}
 	}()
 	t.Cleanup(func() { _ = proxy.Close() })
-	for _, name := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"} {
-		t.Setenv(name, "http://"+proxy.Addr().String())
-	}
-	t.Setenv("NO_PROXY", "")
-	t.Setenv("no_proxy", "")
 
+	cmd := exec.Command(os.Args[0], "-test.run=^TestResolver_DoHIgnoresProxyEnvironment$", "-test.count=1")
+	cmd.Env = append(os.Environ(), dohProxyChildEnv+"=1", "NO_PROXY=", "no_proxy=")
+	for _, name := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"} {
+		cmd.Env = append(cmd.Env, name+"=http://"+proxy.Addr().String())
+	}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("child exchange with a proxy in the environment failed: %v\n%s", err, output)
+	}
+	if got := proxied.Load(); got != 0 {
+		t.Fatalf("the proxy named in the environment received %d connection(s)", got)
+	}
+}
+
+// runDoHProxyChild performs one DoH exchange against a hostname entry. The
+// entry is a hostname, not a loopback literal, because ProxyFromEnvironment
+// never proxies loopback targets and a loopback entry would prove nothing.
+func runDoHProxyChild(t *testing.T) {
 	ca := newDoTTestCA(t)
-	var certificate tls.Certificate
-	certificate, _ = ca.issue(t, dotLeafOptions{dnsNames: []string{"resolver.test"}})
+	certificate, _ := ca.issue(t, dotLeafOptions{dnsNames: []string{"resolver.test"}})
 	server := startDoHTestServer(t, certificate, true, dohAnswerHandler(t, "203.0.113.117"))
 	entry := policy.Upstream{Address: "resolver.test", Port: int(server.addr.Port()), Transport: policy.TransportDoH}
 	resolver := mustLoopbackResolver(t, ResolverConfig{
@@ -252,9 +275,6 @@ func TestResolver_DoHIgnoresProxyEnvironment(t *testing.T) {
 	})
 	if _, err := resolver.Exchange(context.Background(), testQuery("proxy.example.")); err != nil {
 		t.Fatalf("Exchange failed with a proxy in the environment: %v", err)
-	}
-	if got := proxied.Load(); got != 0 {
-		t.Fatalf("the proxy named in the environment received %d connection(s)", got)
 	}
 	if got := len(server.requests()); got != 1 {
 		t.Fatalf("server saw %d requests, want 1 direct request", got)
