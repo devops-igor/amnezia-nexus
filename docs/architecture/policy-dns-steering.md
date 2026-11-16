@@ -308,24 +308,31 @@ destination can be evaluated with no DNS traffic at all. The answer reports:
 
 | Field | Meaning |
 | :--- | :--- |
-| `decision` | `DIRECT`, `PROXY`, `DROP` or `UNKNOWN` |
-| `reason` | one machine-readable cause: `policy_disabled`, `prohibited_destination`, `domain_rule`, `cname_rule`, `cidr_rule`, `shared_ip_conflict`, `fresh_evidence_direct`, `expired_evidence`, `evicted_evidence`, `stale_evidence_generation`, `no_trusted_evidence`, `no_usable_address`, `name_unresolved`, `no_policy_snapshot` |
-| `rule` | the matching rule: its base name, its shape (`apex`, `apex_and_subdomains`, `subdomains`), the name that matched (the queried name or a CNAME target) and the lists that supplied it |
-| `prefix` | the most specific matching CIDR prefix and its lists |
-| `source_kind` | on both of the above: `preset` for a built-in list, `custom` for operator URLs, `mixed` when sources disagree, empty when a merged snapshot cannot attribute the rule |
-| `addresses` | one verdict per evaluated address, with its own decision, cause, prefix and evidence |
-| `evidence` | the session evidence the verdict rests on: state, decision, generation and remaining TTL |
+| `decision` | the CURRENT action for the evaluated addresses: `DIRECT`, `PROXY`, `DROP` or `UNKNOWN` |
+| `reason` | one machine-readable cause of that action: `policy_disabled`, `prohibited_destination`, `cidr_rule`, `cached_proxy_evidence`, `fresh_evidence_direct`, `expired_evidence`, `evicted_evidence`, `stale_evidence_generation`, `no_trusted_evidence`, `no_usable_address`, `name_unresolved`, `no_policy_snapshot` |
+| `prospective` | the rule classification of the submitted name, reported separately: `matched`, `decision` (`PROXY`), `reason` (`domain_rule` or `cname_rule`), `matched_name`, `requires_observed_answer` and the `rule` |
+| `rule` (inside `prospective`) | the matched rule: its base name, its shape (`apex`, `apex_and_subdomains`, `subdomains`) and the lists that contributed the base entry (`contributors`, with `source_kind` `preset`/`custom`/`mixed`) |
+| `prefix` | the most specific matching CIDR prefix and the lists that supplied exactly that prefix |
+| `addresses` | one current-action verdict per evaluated address, with its own decision, cause, prefix and evidence |
+| `evidence` | the session evidence the decisive verdict rests on: state, decision, generation and remaining TTL |
+| `evaluated_at` | the instant the evidence was evaluated at, sampled *after* the optional blocking lookup |
 | `resolution` | how the name was resolved: `configured_resolver`, `caller_supplied`, `not_attempted` or `unavailable`, the upstreams dialled, the deadline, the CNAME chain and the answer, or the resolver's error |
 | `limitations` | the caveats that apply, as tokens |
 
-The check order is the order the data path applies: prohibited destination
-(`DROP`), domain rule, CIDR rule, fresh evidence, and then the safe default
-`PROXY`. Because the answer is an expectation and not a packet, a name that
-resolves to several addresses is summarised twice over: every address is
-reported on its own, and the headline is the unanimous verdict when they agree
-(`summary: "unanimous"`) or the most restrictive one when they disagree
-(`summary: "most_restrictive"`, ordered `DROP` > `PROXY` > `UNKNOWN` > `DIRECT`),
-so a name is never reported as safer than its worst address.
+The current action follows the packet path exactly, because the packet path
+never looks at a name: prohibited destination (`DROP`), snapshot CIDR
+(`PROXY`), the session's cached `PROXY` decision (`PROXY`), its cached `DIRECT`
+decision (`DIRECT`), then the safe default `PROXY`. A matched domain rule is a
+real policy fact but not a route: it is reported under `prospective`, which
+becomes the destination's action only once the client's own answer for that
+name is observed. A name that resolves to several addresses is summarised twice
+over: every address is reported on its own, and the headline is the unanimous
+verdict when they agree (`summary: "unanimous"`) or the most restrictive one when
+they disagree (`summary: "most_restrictive"`, ordered `DROP` > `PROXY` >
+`UNKNOWN` > `DIRECT`), so a name is never reported as safer than its worst
+address. With no evaluable address there is no action: the answer is `UNKNOWN`
+with `name_unresolved` or `no_usable_address`, and a matching rule is still
+reported as prospective.
 
 ### Read-only by construction
 
@@ -342,20 +349,35 @@ observation, syncs a list, refreshes anything or moves a counter:
 - interception exists only on the packet path, and no packet, flow or counter
   path is entered;
 - the lookup is bounded by an explicit timeout (2 s by default, 5 s for the whole
-  request) and is an ordinary query sent out to the configured upstreams.
+  request) and is an ordinary query sent out to the configured upstreams. That
+  query does leave the panel: a name submitted without addresses is resolved
+  through the configured resolver, and the answer reports `resolution.method` so
+  the operator can see it. Client traffic, routing evidence and dataplane
+  counters stay untouched.
 
-A test asserts the entry count, the session count and the stored evidence are
-identical before and after an explanation, and that an address which only matched
-a CIDR rule gained no evidence.
+A test asserts the entry count, the session count, the stored evidence and the
+dispatcher counters are identical before and after an explanation, and that an
+address which only matched a CIDR rule gained no evidence. A second test drives
+the real forwarder and asserts that the explained action equals what
+`RouteClientToBackend` actually does for the same fresh flow.
 
 ### Attribution
 
-A compiled snapshot records which sources supplied each rule, packed into spare
-bits of the per-rule byte, so naming the list costs no second index. A snapshot
-compiled from a durable last-known-good generation stores merged rules only: the
-rule and its shape are still reported, the source list is empty rather than
-invented. The same holds when a snapshot has more sources than the encoding
-holds.
+A compiled snapshot records which sources contributed each rule, packed into
+spare bits of the per-rule byte, so naming the list costs no second index.
+Domain provenance is recorded per BASE ENTRY, and a base entry merges the shapes
+its sources supplied: a list that supplies only `*.shared.example` also appears
+in the contributors of a queried `shared.example` apex, which it cannot match.
+The field is therefore named `contributors` and documented as a base-entry
+contributor list, not a proven supplier of the matched shape; splitting it per
+shape would need a second per-rule index, which this change deliberately does
+not add. CIDR provenance is exact, because a source either supplied that prefix
+or did not.
+
+A snapshot compiled from a durable last-known-good generation stores merged
+rules only: the rule and its shape are still reported, the contributor list is
+empty rather than invented. The same holds when a snapshot has more sources than
+the encoding holds.
 
 ## 6. Limitations
 

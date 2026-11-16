@@ -873,7 +873,7 @@
   "policy_explain_label": "Объяснить маршрутизацию",
   "policy_explain_placeholder": "домен или IPv4-адрес",
   "policy_explain_btn": "Объяснить",
-  "policy_explain_hint": "Только чтение: трафик не отправляется, данные маршрутизации не записываются.",
+  "policy_explain_hint": "Только чтение для клиентов: клиентский или прикладной трафик не отправляется, данные маршрутизации не записываются. Поиск имени выполняется через настроенный резолвер.",
   "policy_explain_running": "Объясняем…",
   "policy_explain_needs_value": "Сначала введите доменное имя или адрес.",
   "policy_explain_failed": "Не удалось объяснить решение",
@@ -888,12 +888,12 @@
   "policy_explain_reason_domain_rule": "правило прокси совпадает с этим именем",
   "policy_explain_reason_cname_rule": "правило прокси совпадает с именем в цепочке CNAME",
   "policy_explain_reason_cidr_rule": "правило прокси совпадает с этим диапазоном адресов",
-  "policy_explain_reason_shared_ip_conflict": "адрес используется именем, которому нужен прокси",
   "policy_explain_reason_fresh_evidence_direct": "недавнее DNS-наблюдение сессии разрешает прямой путь",
   "policy_explain_reason_expired_evidence": "DNS-подтверждение сессии для этого адреса истекло",
   "policy_explain_reason_evicted_evidence": "DNS-подтверждение сессии вытеснено из-за переполнения кеша",
   "policy_explain_reason_stale_evidence_generation": "DNS-подтверждение сессии относится к предыдущей версии правил",
   "policy_explain_reason_no_trusted_evidence": "доверенного DNS-подтверждения сессии нет, поэтому используется прокси",
   "policy_explain_reason_no_usable_address": "имя не разрешилось ни в один пригодный IPv4-адрес",
-  "policy_explain_reason_name_unresolved": "имя не удалось разрешить"
+  "policy_explain_reason_name_unresolved": "имя не удалось разрешить",
+  "policy_explain_reason_cached_proxy_evidence": "в кеше маршрутов сессии для этого адреса уже сохранено решение «через прокси»"
 }

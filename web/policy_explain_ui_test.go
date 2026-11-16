@@ -16,7 +16,7 @@ w._ = key => {
   if (key === 'policy_explain_result') return '{value} :: {decision} :: {reason}';
   if (key === 'policy_explain_decision_proxy') return 'DECISION-PROXY';
   if (key === 'policy_explain_decision_direct') return 'DECISION-DIRECT';
-  if (key === 'policy_explain_reason_domain_rule') return 'REASON-DOMAIN-RULE';
+  if (key === 'policy_explain_reason_no_trusted_evidence') return 'REASON-NO-EVIDENCE';
   if (key === 'policy_explain_reason_fresh_evidence_direct') return 'REASON-FRESH-DIRECT';
   if (key === 'policy_explain_needs_value') return 'NEEDS-VALUE';
   return key;
@@ -30,12 +30,18 @@ responder = ((base) => async (url, opts) => {
       err.data = {error: 'validation_failed', detail: 'domain: domain contains illegal characters or scheme'};
       throw err;
     }
+    // The current action is the safe default; the rule match is reported as a
+    // separate prospective classification, exactly as the repaired API does.
+    const prospective = {matched: true, decision: 'PROXY', reason: 'domain_rule',
+      rule: {base: 'www.example', shape: 'apex_and_subdomains', contributors: ['geoblock']},
+      matched_name: 'www.example', requires_observed_answer: true};
     if (body.ip) {
       return {input: {value: body.ip, kind: 'address'}, decision: 'PROXY',
-              reason: 'domain_rule', read_only: true};
+              reason: 'no_trusted_evidence', prospective: prospective, read_only: true};
     }
     return {input: {value: body.domain, kind: 'domain', normalized: 'www.example'},
-            decision: 'PROXY', reason: 'domain_rule', read_only: true};
+            decision: 'PROXY', reason: 'no_trusted_evidence', prospective: prospective,
+            read_only: true};
   }
   return base(url, opts);
 })(responder);
@@ -52,7 +58,7 @@ const posts = requestsTo('/api/vpn/policy/explain', 'POST');
 assert.equal(posts.length, 1, 'the button must issue exactly one explanation request');
 assert.equal(posts[0].body.domain, 'WWW.Example',
   'the typed value is sent for the server to normalise, not pre-normalised here');
-assert.equal(text('policyExplainResult'), 'www.example :: DECISION-PROXY :: REASON-DOMAIN-RULE',
+assert.equal(text('policyExplainResult'), 'www.example :: DECISION-PROXY :: REASON-NO-EVIDENCE',
   'the readout must show the normalised value, the decision and the cause');
 assert.equal(w.document.getElementById('policyExplainResult').getAttribute('data-state'), 'proxy',
   'the readout carries the decision as a state token');
@@ -123,6 +129,6 @@ assert.equal(requestsTo('/api/vpn/policy/explain', 'POST').length, 1,
   'Enter in the field must explain the destination');
 assert.equal(requestsTo('/api/vpn/policy', 'PUT').length, 0,
   'Enter in the dry-run field must not submit the settings form');
-assert.equal(text('policyExplainResult'), 'www.example :: DECISION-PROXY :: REASON-DOMAIN-RULE');
+assert.equal(text('policyExplainResult'), 'www.example :: DECISION-PROXY :: REASON-NO-EVIDENCE');
 `)
 }

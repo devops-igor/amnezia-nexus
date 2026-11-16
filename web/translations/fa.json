@@ -873,7 +873,7 @@
   "policy_explain_label": "توضیح مسیر یک مقصد",
   "policy_explain_placeholder": "دامنه یا نشانی IPv4",
   "policy_explain_btn": "توضیح بده",
-  "policy_explain_hint": "فقط خواندنی: هیچ ترافیکی ارسال نمی‌شود و هیچ شاهدی برای مسیریابی ثبت نمی‌شود.",
+  "policy_explain_hint": "برای کارخواهان فقط خواندنی: هیچ ترافیک کارخواه یا برنامه ارسال نمی‌شود و هیچ شاهدی برای مسیریابی ثبت نمی‌شود. جست‌وجوی نام از طریق resolver پیکربندی‌شده انجام می‌شود.",
   "policy_explain_running": "در حال بررسی…",
   "policy_explain_needs_value": "ابتدا یک نام دامنه یا نشانی وارد کنید.",
   "policy_explain_failed": "توضیح این تصمیم ممکن نشد",
@@ -888,12 +888,12 @@
   "policy_explain_reason_domain_rule": "یک قاعده پروکسی با این نام مطابقت دارد",
   "policy_explain_reason_cname_rule": "یک قاعده پروکسی با نامی در زنجیره CNAME مطابقت دارد",
   "policy_explain_reason_cidr_rule": "یک قاعده پروکسی با این محدوده نشانی مطابقت دارد",
-  "policy_explain_reason_shared_ip_conflict": "این نشانی با نامی که به پروکسی نیاز دارد مشترک است",
   "policy_explain_reason_fresh_evidence_direct": "مشاهده DNS تازه این نشست مسیر مستقیم را مجاز می‌کند",
   "policy_explain_reason_expired_evidence": "شاهد DNS این نشست برای این نشانی منقضی شده است",
   "policy_explain_reason_evicted_evidence": "شاهد DNS این نشست به دلیل پر شدن حافظه حذف شده است",
   "policy_explain_reason_stale_evidence_generation": "شاهد DNS این نشست به نسخه پیشین قواعد تعلق دارد",
   "policy_explain_reason_no_trusted_evidence": "شاهد DNS قابل اعتمادی برای این نشست نیست، بنابراین پروکسی استفاده می‌شود",
   "policy_explain_reason_no_usable_address": "نام به هیچ نشانی IPv4 قابل استفاده‌ای تبدیل نشد",
-  "policy_explain_reason_name_unresolved": "این نام قابل تشخیص نبود"
+  "policy_explain_reason_name_unresolved": "این نام قابل تشخیص نبود",
+  "policy_explain_reason_cached_proxy_evidence": "حافظه مسیر این نشست از قبل برای این نشانی تصمیم پروکسی دارد"
 }

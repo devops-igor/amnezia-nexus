@@ -41,7 +41,19 @@ import (
 //
 // The one thing it does beyond reading is the bounded ad-hoc lookup, which is
 // explicitly excluded from the evidence path and bounded by
-// DefaultPolicyExplainResolveTimeout (or the caller's shorter deadline).
+// DefaultPolicyExplainResolveTimeout (or the caller's shorter deadline). That
+// lookup does send an ordinary DNS query to the configured upstreams when a name
+// is submitted without addresses, so this is not a zero-network operation: the
+// client traffic, routing evidence and counters stay untouched, while the query
+// itself leaves the panel. The answer reports its method so the operator can see
+// that.
+//
+// Two facts are reported separately and must not be read as one: the CURRENT
+// ACTION for the evaluated addresses (prohibited/CIDR/cache precedence, exactly
+// what the packet path does) and the PROSPECTIVE rule classification of the
+// submitted name (a rule match, which becomes the destination's route only once
+// the client's own answer for that name is observed). A dry-run name never acts
+// as an observation. See policy.ExplainDestination for the packet-path ordering.
 
 const (
 	// DefaultPolicyExplainResolveTimeout bounds the ad-hoc name lookup. It is
@@ -102,7 +114,18 @@ type policyExplainDeps struct {
 	SessionScope *policy.SessionCache
 	Resolver     gatewaydns.Resolver
 	Upstreams    []policy.Upstream
-	Now          time.Time
+	// Clock is the evaluation clock. It is sampled ONCE per answer, after the
+	// blocking lookup, and that one instant is used both for reading the session
+	// evidence and for serializing its remaining TTL. nil means time.Now.
+	Clock func() time.Time
+}
+
+// policyExplainNow samples the evaluation clock.
+func policyExplainNow(deps policyExplainDeps) time.Time {
+	if deps.Clock != nil {
+		return deps.Clock()
+	}
+	return time.Now()
 }
 
 // ExplainPolicy explains the routing decision for one destination.
@@ -110,7 +133,7 @@ func (s *Service) ExplainPolicy(ctx context.Context, req PolicyExplainRequest) (
 	if s == nil {
 		return PolicyExplanation{}, errors.New("vpn: policy explain requires a service")
 	}
-	deps := policyExplainDeps{Enabled: s.PBREnabled(), Now: time.Now()}
+	deps := policyExplainDeps{Enabled: s.PBREnabled(), Clock: time.Now}
 	if matcher := s.PolicyMatcher(); matcher != nil {
 		deps.Snapshot = matcher.Current()
 	}
@@ -161,11 +184,22 @@ func explainPolicy(ctx context.Context, deps policyExplainDeps, req PolicyExplai
 		out.Decision = string(policy.ActionProxy)
 		out.Reason = string(policy.CausePolicyDisabled)
 		out.Summary = string(policy.SummaryNone)
+		// Nothing was looked up and no evidence was read, so the evaluation
+		// instant is the moment of the answer itself.
+		out.EvaluatedAt = policyExplainNow(deps).UTC().Format(time.RFC3339)
 		return out, nil
 	}
 
 	names, addresses, resolution := policyExplainTargets(ctx, deps, req)
 	out.Resolution = resolution
+
+	// Sample the evaluation clock AFTER the blocking lookup and use this single
+	// instant for both the evidence read and the TTL we serialize. The packet
+	// path looks evidence up at the current time, so evaluating with a clock
+	// sampled before a slow resolution would report an already-expired direct
+	// authorization as fresh (F825-02). The lookup deadline itself is unchanged.
+	evaluatedAt := policyExplainNow(deps)
+	out.EvaluatedAt = evaluatedAt.UTC().Format(time.RFC3339)
 
 	verdict := policy.ExplainDestination(policy.ExplainDestinationInput{
 		Enabled:     true,
@@ -173,10 +207,10 @@ func explainPolicy(ctx context.Context, deps policyExplainDeps, req PolicyExplai
 		Names:       names,
 		Addresses:   addresses,
 		Resolved:    resolution.Error == "" || len(req.Addresses) > 0,
-		EvidenceFor: policyExplainEvidenceReader(deps),
+		EvidenceFor: policyExplainEvidenceReader(deps, evaluatedAt),
 		Prohibited:  forwarder.IsProhibitedIPv4Destination,
 	})
-	policyExplainApply(&out, verdict, deps)
+	policyExplainApply(&out, verdict, evaluatedAt)
 	return out, nil
 }
 
@@ -319,7 +353,7 @@ func policyExplainARecords(resp *mdns.Msg, terminal string) []netip.Addr {
 // policyExplainEvidenceReader returns the evidence lookup for the selected
 // session, or nil when no session (or no cache scope) is available. The reader
 // only ever calls Inspect.
-func policyExplainEvidenceReader(deps policyExplainDeps) func(netip.Addr) *policy.Evidence {
+func policyExplainEvidenceReader(deps policyExplainDeps, evaluatedAt time.Time) func(netip.Addr) *policy.Evidence {
 	if deps.SessionScope == nil {
 		return nil
 	}
@@ -328,7 +362,7 @@ func policyExplainEvidenceReader(deps policyExplainDeps) func(netip.Addr) *polic
 		generation = deps.Snapshot.Generation()
 	}
 	return func(addr netip.Addr) *policy.Evidence {
-		evidence := deps.SessionScope.Inspect(addr, generation, deps.Now)
+		evidence := deps.SessionScope.Inspect(addr, generation, evaluatedAt)
 		return &evidence
 	}
 }
@@ -364,34 +398,49 @@ func policyExplainState(deps policyExplainDeps) PolicyExplainState {
 }
 
 // policyExplainApply copies a verdict into the wire shape.
-func policyExplainApply(out *PolicyExplanation, verdict policy.DestinationExplanation, deps policyExplainDeps) {
+func policyExplainApply(out *PolicyExplanation, verdict policy.DestinationExplanation, evaluatedAt time.Time) {
 	out.Decision = string(verdict.Decision)
 	out.Reason = string(verdict.Reason)
 	out.Summary = string(verdict.Summary)
-	out.Rule = policyExplainRule(verdict)
+	out.Prospective = policyExplainProspective(verdict.Prospective)
 	out.Prefix = policyExplainPrefix(verdict.Prefix)
-	out.Evidence = policyExplainEvidence(verdict.Evidence, deps.Now)
+	out.Evidence = policyExplainEvidence(verdict.Evidence, evaluatedAt)
 	for _, v := range verdict.Addresses {
 		out.Addresses = append(out.Addresses, PolicyExplainAddress{
 			Address:  v.Address.String(),
 			Decision: string(v.Decision),
 			Reason:   string(v.Reason),
 			Prefix:   policyExplainPrefix(v.Prefix),
-			Evidence: policyExplainEvidence(v.Evidence, deps.Now),
+			Evidence: policyExplainEvidence(v.Evidence, evaluatedAt),
 		})
 	}
 }
 
-func policyExplainRule(verdict policy.DestinationExplanation) *PolicyExplainRule {
-	if verdict.Rule == nil {
+// policyExplainProspective copies the rule classification into the wire shape.
+// It is returned as its own object so a caller cannot read the classification as
+// the current action.
+func policyExplainProspective(prospective *policy.ProspectiveRule) *PolicyExplainProspective {
+	out := &PolicyExplainProspective{Matched: prospective != nil}
+	if prospective == nil {
+		return out
+	}
+	out.Decision = string(prospective.Decision)
+	out.Reason = string(prospective.Basis)
+	out.Rule = policyExplainRuleMatch(prospective.Rule)
+	out.MatchedName = prospective.MatchedName
+	out.RequiresObservedAnswer = true
+	return out
+}
+
+func policyExplainRuleMatch(match *policy.DomainRuleMatch) *PolicyExplainRule {
+	if match == nil {
 		return nil
 	}
 	return &PolicyExplainRule{
-		Base:        verdict.Rule.Base,
-		Shape:       string(verdict.Rule.Shape),
-		Sources:     policyExplainSources(verdict.Rule.Sources),
-		SourceKind:  policyExplainSourceKind(verdict.Rule.Sources),
-		MatchedName: verdict.RuleName,
+		Base:         match.Base,
+		Shape:        string(match.Shape),
+		Contributors: policyExplainSources(match.Contributors),
+		SourceKind:   policyExplainSourceKind(match.Contributors),
 	}
 }
 

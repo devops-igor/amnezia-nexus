@@ -45,6 +45,12 @@ func (f *fakeExplainResolver) callCount() int {
 	return f.calls
 }
 
+// fixedClock is the deterministic evaluation clock for these tests. Every answer
+// samples it once, after the optional lookup.
+func fixedClock(at time.Time) func() time.Time {
+	return func() time.Time { return at }
+}
+
 // explainAnswer builds a response for name, following the given CNAME targets
 // and ending in the given A records.
 func explainAnswer(t *testing.T, name string, cnames, addrs []string) *mdns.Msg {
@@ -120,7 +126,7 @@ func TestExplainPolicyResolvesThroughTheConfiguredResolver(t *testing.T) {
 		SessionScope: scope,
 		Resolver:     resolver,
 		Upstreams:    []policy.Upstream{{Address: "1.1.1.1", Port: 53}},
-		Now:          now,
+		Clock:        fixedClock(now),
 	}, PolicyExplainRequest{Value: "www.example", Name: "www.example"})
 	if err != nil {
 		t.Fatalf("explain: %v", err)
@@ -180,7 +186,7 @@ func TestExplainPolicySummarisesSeveralAddresses(t *testing.T) {
 		Snapshot:     snap,
 		SessionScope: scope,
 		Resolver:     resolver,
-		Now:          now,
+		Clock:        fixedClock(now),
 	}, PolicyExplainRequest{Value: "split.example", Name: "split.example"})
 	if err != nil {
 		t.Fatalf("explain: %v", err)
@@ -221,7 +227,7 @@ func TestExplainPolicyUnresolvableName(t *testing.T) {
 	t.Run("resolver failure", func(t *testing.T) {
 		resolver := &fakeExplainResolver{err: errors.New("upstream DNS exchange failed")}
 		out, err := explainPolicy(context.Background(), policyExplainDeps{
-			Enabled: true, Snapshot: snap, SessionScope: scope, Resolver: resolver, Now: now,
+			Enabled: true, Snapshot: snap, SessionScope: scope, Resolver: resolver, Clock: fixedClock(now),
 		}, PolicyExplainRequest{Value: "missing.example", Name: "missing.example"})
 		if err != nil {
 			t.Fatalf("explain: %v", err)
@@ -240,7 +246,7 @@ func TestExplainPolicyUnresolvableName(t *testing.T) {
 	t.Run("answer without an address", func(t *testing.T) {
 		resolver := &fakeExplainResolver{resp: explainAnswer(t, "empty.example", nil, nil)}
 		out, err := explainPolicy(context.Background(), policyExplainDeps{
-			Enabled: true, Snapshot: snap, SessionScope: scope, Resolver: resolver, Now: now,
+			Enabled: true, Snapshot: snap, SessionScope: scope, Resolver: resolver, Clock: fixedClock(now),
 		}, PolicyExplainRequest{Value: "empty.example", Name: "empty.example"})
 		if err != nil {
 			t.Fatalf("explain: %v", err)
@@ -255,7 +261,7 @@ func TestExplainPolicyUnresolvableName(t *testing.T) {
 
 	t.Run("no resolver installed", func(t *testing.T) {
 		out, err := explainPolicy(context.Background(), policyExplainDeps{
-			Enabled: true, Snapshot: snap, SessionScope: scope, Now: now,
+			Enabled: true, Snapshot: snap, SessionScope: scope, Clock: fixedClock(now),
 		}, PolicyExplainRequest{Value: "missing.example", Name: "missing.example"})
 		if err != nil {
 			t.Fatalf("explain: %v", err)
@@ -273,7 +279,7 @@ func TestExplainPolicyCallerAddressesSkipResolution(t *testing.T) {
 	resolver := &fakeExplainResolver{err: errors.New("must not be called")}
 
 	out, err := explainPolicy(context.Background(), policyExplainDeps{
-		Enabled: true, Snapshot: snap, SessionScope: scope, Resolver: resolver, Now: now,
+		Enabled: true, Snapshot: snap, SessionScope: scope, Resolver: resolver, Clock: fixedClock(now),
 	}, PolicyExplainRequest{
 		Value:     "198.51.200.9",
 		Addresses: []netip.Addr{netip.MustParseAddr("198.51.200.9")},
@@ -337,7 +343,7 @@ func TestPolicyExplainSessionLimitations(t *testing.T) {
 	}
 
 	withoutSession, err := explainPolicy(context.Background(), policyExplainDeps{
-		Enabled: true, Snapshot: snap, SessionScope: scope, Now: now,
+		Enabled: true, Snapshot: snap, SessionScope: scope, Clock: fixedClock(now),
 	}, PolicyExplainRequest{Value: "198.51.200.9", Addresses: []netip.Addr{netip.MustParseAddr("198.51.200.9")}})
 	if err != nil {
 		t.Fatalf("explain without a session: %v", err)
@@ -347,7 +353,7 @@ func TestPolicyExplainSessionLimitations(t *testing.T) {
 	}
 
 	withUnknownSession, err := explainPolicy(context.Background(), policyExplainDeps{
-		Enabled: true, Snapshot: snap, SessionScope: nil, Now: now,
+		Enabled: true, Snapshot: snap, SessionScope: nil, Clock: fixedClock(now),
 	}, PolicyExplainRequest{
 		Value: "198.51.200.9", Addresses: []netip.Addr{netip.MustParseAddr("198.51.200.9")},
 		SessionID: "session-without-scope",
@@ -420,7 +426,7 @@ func TestExplainPolicyDisabledSkipsEverything(t *testing.T) {
 	resolver := &fakeExplainResolver{err: errors.New("must not be called")}
 
 	out, err := explainPolicy(context.Background(), policyExplainDeps{
-		Enabled: false, Snapshot: snap, Resolver: resolver, Now: now,
+		Enabled: false, Snapshot: snap, Resolver: resolver, Clock: fixedClock(now),
 	}, PolicyExplainRequest{Value: "www.example", Name: "www.example"})
 	if err != nil {
 		t.Fatalf("explain: %v", err)
@@ -463,7 +469,7 @@ func TestExplainPolicyLeavesRouteCacheUntouched(t *testing.T) {
 	resolver := &fakeExplainResolver{resp: explainAnswer(t, "both.example", nil,
 		[]string{"198.51.201.40", "198.51.200.9"})}
 	if _, err := explainPolicy(context.Background(), policyExplainDeps{
-		Enabled: true, Snapshot: snap, SessionScope: scope, Resolver: resolver, Now: now,
+		Enabled: true, Snapshot: snap, SessionScope: scope, Resolver: resolver, Clock: fixedClock(now),
 	}, PolicyExplainRequest{Value: "both.example", Name: "both.example", SessionID: "session-1"}); err != nil {
 		t.Fatalf("explain: %v", err)
 	}
@@ -480,4 +486,135 @@ func TestExplainPolicyLeavesRouteCacheUntouched(t *testing.T) {
 	if got := scope.Inspect(netip.MustParseAddr("198.51.200.9"), gen, now); got != unobservedBefore || got.State != policy.EvidenceAbsent {
 		t.Errorf("the explanation recorded evidence for the CIDR address: %+v", got)
 	}
+}
+
+// TestExplainPolicySeparatesProspectiveRuleFromCurrentAction pins the repair for
+// F825-01 at the compose level: a listed name is reported as a prospective rule
+// classification, while the current action follows the session's cached
+// evidence. The dispatcher-level oracle lives in
+// internal/vpn/forwarder/explain_parity_825_test.go.
+func TestExplainPolicySeparatesProspectiveRuleFromCurrentAction(t *testing.T) {
+	snap, _, scope, gen, now := explainTestSnapshot(t)
+	ip := netip.MustParseAddr("198.51.201.60")
+	if err := scope.Observe(gen, []policy.Observation{{
+		IP:        ip,
+		Decision:  policy.Direct,
+		ExpiresAt: now.Add(2 * time.Minute),
+	}}, now); err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+	resolver := &fakeExplainResolver{resp: explainAnswer(t, "blocked.example", nil, []string{ip.String()})}
+
+	out, err := explainPolicy(context.Background(), policyExplainDeps{
+		Enabled: true, Snapshot: snap, SessionScope: scope, Resolver: resolver, Clock: fixedClock(now),
+	}, PolicyExplainRequest{Value: "blocked.example", Name: "blocked.example", SessionID: "session-1"})
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	if out.Decision != string(policy.ActionDirect) || out.Reason != string(policy.CauseFreshEvidenceDirect) {
+		t.Fatalf("action = %s/%s, want DIRECT/%s from the cached evidence",
+			out.Decision, out.Reason, policy.CauseFreshEvidenceDirect)
+	}
+	if out.Prospective == nil || !out.Prospective.Matched {
+		t.Fatalf("prospective = %+v, want the matched rule reported", out.Prospective)
+	}
+	if out.Prospective.Decision != string(policy.ActionProxy) ||
+		out.Prospective.Reason != string(policy.CauseDomainRule) {
+		t.Fatalf("prospective = %s/%s, want PROXY/domain_rule",
+			out.Prospective.Decision, out.Prospective.Reason)
+	}
+	if out.Prospective.Rule == nil || out.Prospective.Rule.Base != "blocked.example" {
+		t.Fatalf("prospective rule = %+v, want the blocked.example base", out.Prospective.Rule)
+	}
+	if !out.Prospective.RequiresObservedAnswer {
+		t.Error("a prospective classification must state that an observed answer is required")
+	}
+	if out.Prospective.Rule.SourceKind != "preset" {
+		t.Errorf("source kind = %q, want preset", out.Prospective.Rule.SourceKind)
+	}
+}
+
+// explainAdvancingResolver advances a shared clock while it answers, which is
+// what a real lookup does to the passage of time. Nothing about the DNS answer
+// is faked beyond the exchange itself.
+type explainAdvancingResolver struct {
+	reply   *mdns.Msg
+	advance time.Duration
+	elapse  func(time.Duration)
+}
+
+func (r *explainAdvancingResolver) Exchange(_ context.Context, _ *mdns.Msg) (*mdns.Msg, error) {
+	r.elapse(r.advance)
+	return r.reply, nil
+}
+
+// TestExplainPolicyEvaluatesEvidenceAfterResolution is the F825-02 regression:
+// the evaluation time is sampled after the blocking lookup, so evidence that
+// expires during the lookup is reported exactly as the packet path would see it
+// now — expired, and not DIRECT. The control proves a still-valid entry stays
+// DIRECT after the same wait.
+func TestExplainPolicyEvaluatesEvidenceAfterResolution(t *testing.T) {
+	const wait = 1100 * time.Millisecond
+
+	run := func(t *testing.T, ttl time.Duration) (PolicyExplanation, *policy.SessionCache, string, netip.Addr, time.Time) {
+		t.Helper()
+		snap, _, scope, gen, start := explainTestSnapshot(t)
+		ip := netip.MustParseAddr("198.51.201.50")
+		if err := scope.Observe(gen, []policy.Observation{{
+			IP: ip, Decision: policy.Direct, ExpiresAt: start.Add(ttl),
+		}}, start); err != nil {
+			t.Fatalf("seed evidence: %v", err)
+		}
+		now := start
+		resolver := &explainAdvancingResolver{
+			reply:   explainAnswer(t, "unlisted.example", nil, []string{ip.String()}),
+			advance: wait,
+			elapse:  func(d time.Duration) { now = now.Add(d) },
+		}
+		out, err := explainPolicy(context.Background(), policyExplainDeps{
+			Enabled: true, Snapshot: snap, SessionScope: scope, Resolver: resolver,
+			Clock: func() time.Time { return now },
+		}, PolicyExplainRequest{Name: "unlisted.example", Value: "unlisted.example", SessionID: "session-1"})
+		if err != nil {
+			t.Fatalf("explain: %v", err)
+		}
+		return out, scope, gen, ip, now
+	}
+
+	t.Run("evidence that expires during the lookup is not fresh", func(t *testing.T) {
+		out, scope, gen, ip, evaluatedAt := run(t, time.Second)
+
+		// The real packet path asks the cache at the current time; that is the
+		// behaviour the answer must agree with.
+		if current := scope.Lookup(ip, gen, evaluatedAt); current != policy.Unknown {
+			t.Fatalf("fixture did not cross the deadline: current Lookup = %s", current)
+		}
+		if out.Decision != string(policy.ActionProxy) || out.Reason != string(policy.CauseExpiredEvidence) {
+			t.Fatalf("action = %s/%s, want PROXY/%s after the deadline",
+				out.Decision, out.Reason, policy.CauseExpiredEvidence)
+		}
+		if out.Evidence == nil || out.Evidence.State != string(policy.EvidenceExpired) {
+			t.Fatalf("evidence = %+v, want expired", out.Evidence)
+		}
+		if out.Evidence.ExpiresInSeconds > 0 {
+			t.Fatalf("expires_in_seconds = %d, want no positive TTL for expired evidence",
+				out.Evidence.ExpiresInSeconds)
+		}
+		if want := evaluatedAt.UTC().Format(time.RFC3339); out.EvaluatedAt != want {
+			t.Errorf("evaluated_at = %q, want the post-lookup instant %q", out.EvaluatedAt, want)
+		}
+	})
+
+	t.Run("valid evidence stays fresh after the same wait", func(t *testing.T) {
+		out, _, _, _, _ := run(t, time.Hour)
+		if out.Decision != string(policy.ActionDirect) || out.Reason != string(policy.CauseFreshEvidenceDirect) {
+			t.Fatalf("action = %s/%s, want DIRECT/%s", out.Decision, out.Reason, policy.CauseFreshEvidenceDirect)
+		}
+		if out.Evidence == nil || out.Evidence.State != string(policy.EvidenceFresh) {
+			t.Fatalf("evidence = %+v, want fresh", out.Evidence)
+		}
+		if out.Evidence.ExpiresInSeconds <= 0 {
+			t.Fatalf("expires_in_seconds = %d, want a positive remaining TTL", out.Evidence.ExpiresInSeconds)
+		}
+	})
 }

@@ -6,15 +6,26 @@ import (
 	"time"
 )
 
-// Decision-table coverage for issue #825's explanation, driven through the real
-// Snapshot, the real RouteCache and a real SessionCache seeded by Observe. No
-// DNS interception is involved anywhere: evidence is written directly, exactly
-// as the cache API allows, so a failure here is a failure of the explanation and
-// not of the observation path.
+// Decision-table coverage for issue #825, driven through the real Snapshot, the
+// real RouteCache and a real SessionCache seeded by Observe. No DNS interception
+// is involved anywhere: evidence is written directly, exactly as the cache API
+// allows, so a failure here is a failure of the explanation.
 //
-// Fixture addresses use 198.51.200.0/24, the non-denied block the route-cache
-// tests already seed with (ValidateFetchIP rejects the RFC 5737 blocks), and
-// 192.0.2.10 for the prohibited case.
+// The table covers two independent questions, because the feature answers two:
+//
+//   - the CURRENT ACTION, which must follow the packet path
+//     (prohibited → CIDR → cached PROXY → cached DIRECT → safe-default PROXY).
+//     A domain rule never participates: the packet path does not evaluate names.
+//   - the PROSPECTIVE rule classification of the submitted name, reported
+//     alongside and never allowed to change the action. The counterexample that
+//     forced this split is the "listed name over fresh DIRECT evidence" case:
+//     the previous model answered PROXY/domain_rule while the real dispatcher
+//     sent the packet direct.
+//
+// Fixture addresses use 198.51.201.0/24 for evaluated evidence (outside every
+// fixture prefix) and 198.51.200.0/24 for CIDR rules — the non-denied block the
+// route-cache tests already seed with, because ValidateFetchIP rejects the RFC
+// 5737 documentation blocks. 192.0.2.10 is the prohibited case.
 
 // explainFixture is one compiled policy plus one seeded session cache.
 type explainFixture struct {
@@ -81,7 +92,7 @@ func decisionOf(name string) Decision {
 	return Proxy
 }
 
-// explain runs the explanation for the fixture's session.
+// explain runs the explanation for the fixture's session at the fixture's time.
 func (f *explainFixture) explain(in ExplainDestinationInput) DestinationExplanation {
 	in.Enabled = true
 	in.Snapshot = f.snap
@@ -112,17 +123,19 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 		if got.Summary != SummaryNone {
 			t.Errorf("summary = %s, want %s", got.Summary, SummaryNone)
 		}
+		if got.Prospective != nil {
+			t.Error("disabled policy must not classify rules it would not apply")
+		}
 	})
 
 	t.Run("prohibited destination drops before any rule is considered", func(t *testing.T) {
 		f := newExplainFixture(t)
 		prohibited := netip.MustParseAddr("192.0.2.10")
 		got := f.explain(ExplainDestinationInput{
-			Names:       []string{"a.blocked.example"},
-			Addresses:   []netip.Addr{prohibited},
-			Resolved:    true,
-			Prohibited:  func(a netip.Addr) bool { return a == prohibited },
-			EvidenceFor: nil,
+			Names:      []string{"a.blocked.example"},
+			Addresses:  []netip.Addr{prohibited},
+			Resolved:   true,
+			Prohibited: func(a netip.Addr) bool { return a == prohibited },
 		})
 		if got.Decision != ActionDrop || got.Reason != CauseProhibitedDestination {
 			t.Fatalf("prohibited = %s/%s, want DROP/%s", got.Decision, got.Reason, CauseProhibitedDestination)
@@ -132,7 +145,7 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 		}
 	})
 
-	t.Run("exact apex rule", func(t *testing.T) {
+	t.Run("exact apex rule is prospective, not the current action", func(t *testing.T) {
 		f := newExplainFixture(t)
 		got := f.explain(ExplainDestinationInput{
 			Names:      []string{"apex.example"},
@@ -140,10 +153,15 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 			Resolved:   true,
 			Prohibited: noProhibited,
 		})
-		assertRule(t, got, ActionProxy, CauseDomainRule, "apex.example", DomainRuleApex, []string{"geoblock"})
+		assertProspective(t, got, "apex.example", DomainRuleApex, CauseDomainRule, []string{"geoblock"})
+		// No session evidence, so the current action is the safe default — not an
+		// invented PROXY caused by the submitted name.
+		if got.Decision != ActionProxy || got.Reason != CauseNoEvidence {
+			t.Fatalf("action = %s/%s, want PROXY/%s", got.Decision, got.Reason, CauseNoEvidence)
+		}
 	})
 
-	t.Run("inclusive suffix rule on a subdomain", func(t *testing.T) {
+	t.Run("inclusive suffix rule on a subdomain is prospective", func(t *testing.T) {
 		f := newExplainFixture(t)
 		got := f.explain(ExplainDestinationInput{
 			Names:      []string{"deep.a.blocked.example"},
@@ -151,7 +169,7 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 			Resolved:   true,
 			Prohibited: noProhibited,
 		})
-		assertRule(t, got, ActionProxy, CauseDomainRule, "blocked.example", DomainRuleApexAndSubdomains, []string{"geoblock"})
+		assertProspective(t, got, "blocked.example", DomainRuleApexAndSubdomains, CauseDomainRule, []string{"geoblock"})
 	})
 
 	t.Run("descendants rule matches below the apex only", func(t *testing.T) {
@@ -162,14 +180,14 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 			Resolved:   true,
 			Prohibited: noProhibited,
 		})
-		assertRule(t, got, ActionProxy, CauseDomainRule, "wild.example", DomainRuleSubdomains, []string{"geoblock"})
+		assertProspective(t, got, "wild.example", DomainRuleSubdomains, CauseDomainRule, []string{"geoblock"})
 
 		if f.snap.MatchDomain("wild.example") {
 			t.Error("a descendants-only rule must not match the apex")
 		}
 	})
 
-	t.Run("CNAME target rule", func(t *testing.T) {
+	t.Run("CNAME target rule is prospective", func(t *testing.T) {
 		f := newExplainFixture(t)
 		got := f.explain(ExplainDestinationInput{
 			Names:      []string{"edge.cdn.example", "a.blocked.example"},
@@ -177,9 +195,9 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 			Resolved:   true,
 			Prohibited: noProhibited,
 		})
-		assertRule(t, got, ActionProxy, CauseCNAMERule, "blocked.example", DomainRuleApexAndSubdomains, []string{"geoblock"})
-		if got.RuleName != "a.blocked.example" {
-			t.Errorf("rule name = %q, want the CNAME target", got.RuleName)
+		assertProspective(t, got, "blocked.example", DomainRuleApexAndSubdomains, CauseCNAMERule, []string{"geoblock"})
+		if got.Prospective.MatchedName != "a.blocked.example" {
+			t.Errorf("matched name = %q, want the CNAME target", got.Prospective.MatchedName)
 		}
 	})
 
@@ -200,6 +218,9 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 		if len(got.Prefix.Sources) != 1 || got.Prefix.Sources[0] != "custom-1" {
 			t.Fatalf("prefix sources = %v, want [custom-1]", got.Prefix.Sources)
 		}
+		if got.Prospective != nil {
+			t.Errorf("prospective = %+v, want none for an unlisted name", got.Prospective)
+		}
 	})
 
 	t.Run("most specific CIDR prefix wins", func(t *testing.T) {
@@ -211,6 +232,50 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 		})
 		if got.Prefix == nil || got.Prefix.Prefix.String() != "198.51.200.128/25" {
 			t.Fatalf("prefix = %+v, want the narrowest containing prefix 198.51.200.128/25", got.Prefix)
+		}
+	})
+
+	// The counterexample from the review: a listed name sharing an address the
+	// session already routes directly. The rule is real, the current action is
+	// DIRECT, and the two facts must not be conflated.
+	t.Run("a listed name does not override fresh DIRECT evidence", func(t *testing.T) {
+		f := newExplainFixture(t)
+		f.observe(t, plainAddr, "DIRECT", 2*time.Minute)
+		got := f.explain(ExplainDestinationInput{
+			Names:      []string{"blocked.example"},
+			Addresses:  []netip.Addr{netip.MustParseAddr(plainAddr)},
+			Resolved:   true,
+			Prohibited: noProhibited,
+		})
+		if got.Decision != ActionDirect || got.Reason != CauseFreshEvidenceDirect {
+			t.Fatalf("action = %s/%s, want DIRECT/%s", got.Decision, got.Reason, CauseFreshEvidenceDirect)
+		}
+		assertProspective(t, got, "blocked.example", DomainRuleApexAndSubdomains, CauseDomainRule, []string{"geoblock"})
+		if got.Evidence == nil || got.Evidence.State != EvidenceFresh || got.Evidence.Decision != Direct {
+			t.Fatalf("evidence = %+v, want the fresh Direct entry", got.Evidence)
+		}
+	})
+
+	t.Run("cached proxy evidence", func(t *testing.T) {
+		f := newExplainFixture(t)
+		// A proxy-required name that resolved to this address leaves a PROXY entry,
+		// which the cache keeps over DIRECT. The entry records no name, so the
+		// answer names the evidence, not a proven conflict.
+		f.observe(t, proxyAddr, "PROXY", 60*time.Second)
+		got := f.explain(ExplainDestinationInput{
+			Names:      []string{"unlisted.example"},
+			Addresses:  []netip.Addr{netip.MustParseAddr(proxyAddr)},
+			Resolved:   true,
+			Prohibited: noProhibited,
+		})
+		if got.Decision != ActionProxy || got.Reason != CauseCachedProxyEvidence {
+			t.Fatalf("cached proxy = %s/%s, want PROXY/%s", got.Decision, got.Reason, CauseCachedProxyEvidence)
+		}
+		if got.Evidence == nil || got.Evidence.Decision != Proxy {
+			t.Fatalf("evidence = %+v, want the proxy observation", got.Evidence)
+		}
+		if got.Prospective != nil {
+			t.Errorf("prospective = %+v, want none: the name matches no rule", got.Prospective)
 		}
 	})
 
@@ -226,30 +291,8 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 		if got.Decision != ActionDirect || got.Reason != CauseFreshEvidenceDirect {
 			t.Fatalf("evidence = %s/%s, want DIRECT/%s", got.Decision, got.Reason, CauseFreshEvidenceDirect)
 		}
-		if got.Evidence == nil || got.Evidence.State != EvidenceFresh || got.Evidence.Decision != Direct {
-			t.Fatalf("evidence = %+v, want fresh Direct", got.Evidence)
-		}
 		if remaining := got.Evidence.Remaining(f.now); remaining != 120*time.Second {
 			t.Fatalf("remaining TTL = %v, want 120s", remaining)
-		}
-	})
-
-	t.Run("fresh proxy evidence is a shared-IP conflict", func(t *testing.T) {
-		f := newExplainFixture(t)
-		// Another name that resolves to the same address is proxy-required, so the
-		// cache holds PROXY for it and PROXY wins over any direct evidence.
-		f.observe(t, proxyAddr, "PROXY", 60*time.Second)
-		got := f.explain(ExplainDestinationInput{
-			Names:      []string{"unlisted.example"},
-			Addresses:  []netip.Addr{netip.MustParseAddr(proxyAddr)},
-			Resolved:   true,
-			Prohibited: noProhibited,
-		})
-		if got.Decision != ActionProxy || got.Reason != CauseSharedIPConflict {
-			t.Fatalf("shared ip = %s/%s, want PROXY/%s", got.Decision, got.Reason, CauseSharedIPConflict)
-		}
-		if got.Evidence == nil || got.Evidence.Decision != Proxy {
-			t.Fatalf("evidence = %+v, want the proxy observation", got.Evidence)
 		}
 	})
 
@@ -408,19 +451,20 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 		}
 	})
 
-	t.Run("unresolved name with a rule keeps the rule verdict", func(t *testing.T) {
+	t.Run("an unresolved name has no current action even when a rule matches", func(t *testing.T) {
 		f := newExplainFixture(t)
 		got := f.explain(ExplainDestinationInput{
 			Names:      []string{"blocked.example"},
 			Resolved:   false,
 			Prohibited: noProhibited,
 		})
-		if got.Decision != ActionProxy || got.Reason != CauseDomainRule || got.Summary != SummaryRuleOnly {
-			t.Fatalf("unresolved with rule = %s/%s/%s", got.Decision, got.Reason, got.Summary)
+		if got.Decision != ActionUnknown || got.Reason != CauseNameUnresolved || got.Summary != SummaryNone {
+			t.Fatalf("unresolved = %s/%s/%s, want UNKNOWN/%s", got.Decision, got.Reason, got.Summary, CauseNameUnresolved)
 		}
+		assertProspective(t, got, "blocked.example", DomainRuleApexAndSubdomains, CauseDomainRule, []string{"geoblock"})
 	})
 
-	t.Run("unresolved name without a rule is unknown, not invented", func(t *testing.T) {
+	t.Run("an unresolved name without a rule is unknown, not invented", func(t *testing.T) {
 		f := newExplainFixture(t)
 		got := f.explain(ExplainDestinationInput{
 			Names:      []string{"nothing.example"},
@@ -429,6 +473,9 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 		})
 		if got.Decision != ActionUnknown || got.Reason != CauseNameUnresolved {
 			t.Fatalf("unresolved = %s/%s, want UNKNOWN/%s", got.Decision, got.Reason, CauseNameUnresolved)
+		}
+		if got.Prospective != nil {
+			t.Errorf("prospective = %+v, want none", got.Prospective)
 		}
 	})
 
@@ -444,12 +491,12 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 		}
 	})
 
-	t.Run("several agreeing addresses are unanimous", func(t *testing.T) {
+	t.Run("several agreeing addresses are unanimous even with a matching rule", func(t *testing.T) {
 		f := newExplainFixture(t)
 		f.observe(t, "198.51.201.50", "DIRECT", time.Minute)
 		f.observe(t, "198.51.201.51", "DIRECT", time.Minute)
 		got := f.explain(ExplainDestinationInput{
-			Names: []string{"multi.example"},
+			Names: []string{"blocked.example"},
 			Addresses: []netip.Addr{
 				netip.MustParseAddr("198.51.201.50"),
 				netip.MustParseAddr("198.51.201.51"),
@@ -460,9 +507,7 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 		if got.Decision != ActionDirect || got.Summary != SummaryUnanimous {
 			t.Fatalf("unanimous = %s/%s, want DIRECT/%s", got.Decision, got.Summary, SummaryUnanimous)
 		}
-		if len(got.Addresses) != 2 {
-			t.Fatalf("address verdicts = %d, want 2", len(got.Addresses))
-		}
+		assertProspective(t, got, "blocked.example", DomainRuleApexAndSubdomains, CauseDomainRule, []string{"geoblock"})
 	})
 
 	t.Run("several disagreeing addresses take the most restrictive", func(t *testing.T) {
@@ -488,7 +533,7 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 		}
 	})
 
-	t.Run("a name rule applies to every address of the name", func(t *testing.T) {
+	t.Run("a matching rule does not change the action of any address", func(t *testing.T) {
 		f := newExplainFixture(t)
 		got := f.explain(ExplainDestinationInput{
 			Names: []string{"blocked.example"},
@@ -502,30 +547,40 @@ func TestExplainDestinationDecisionTable(t *testing.T) {
 		if got.Decision != ActionProxy || got.Summary != SummaryUnanimous {
 			t.Fatalf("rule across addresses = %s/%s", got.Decision, got.Summary)
 		}
+		for i := range got.Addresses {
+			if got.Addresses[i].Reason != CauseNoEvidence {
+				t.Fatalf("address %d reason = %s, want the safe default, not the prospective rule",
+					i, got.Addresses[i].Reason)
+			}
+		}
 	})
 }
 
-// assertRule checks the headline and the named rule that produced it.
-func assertRule(t *testing.T, got DestinationExplanation, decision Action, cause Cause, base string, shape DomainRuleShape, sources []string) {
+// assertProspective checks the prospective classification without asserting
+// anything about the current action, which the caller checks separately.
+func assertProspective(t *testing.T, got DestinationExplanation, base string, shape DomainRuleShape, basis Cause, contributors []string) {
 	t.Helper()
-	if got.Decision != decision || got.Reason != cause {
-		t.Fatalf("decision = %s/%s, want %s/%s", got.Decision, got.Reason, decision, cause)
+	if got.Prospective == nil || got.Prospective.Rule == nil {
+		t.Fatalf("explanation carries no prospective rule: %+v", got.Prospective)
 	}
-	if got.Rule == nil {
-		t.Fatal("explanation carries no rule")
+	if got.Prospective.Decision != ActionProxy {
+		t.Errorf("prospective decision = %s, want PROXY", got.Prospective.Decision)
 	}
-	if got.Rule.Base != base {
-		t.Errorf("rule base = %q, want %q", got.Rule.Base, base)
+	if got.Prospective.Basis != basis {
+		t.Errorf("prospective basis = %s, want %s", got.Prospective.Basis, basis)
 	}
-	if got.Rule.Shape != shape {
-		t.Errorf("rule shape = %q, want %q", got.Rule.Shape, shape)
+	if got.Prospective.Rule.Base != base {
+		t.Errorf("rule base = %q, want %q", got.Prospective.Rule.Base, base)
 	}
-	if len(got.Rule.Sources) != len(sources) {
-		t.Fatalf("rule sources = %v, want %v", got.Rule.Sources, sources)
+	if got.Prospective.Rule.Shape != shape {
+		t.Errorf("rule shape = %q, want %q", got.Prospective.Rule.Shape, shape)
 	}
-	for i := range sources {
-		if got.Rule.Sources[i] != sources[i] {
-			t.Fatalf("rule sources = %v, want %v", got.Rule.Sources, sources)
+	if len(got.Prospective.Rule.Contributors) != len(contributors) {
+		t.Fatalf("rule contributors = %v, want %v", got.Prospective.Rule.Contributors, contributors)
+	}
+	for i := range contributors {
+		if got.Prospective.Rule.Contributors[i] != contributors[i] {
+			t.Fatalf("rule contributors = %v, want %v", got.Prospective.Rule.Contributors, contributors)
 		}
 	}
 }
@@ -535,10 +590,9 @@ func assertRule(t *testing.T, got DestinationExplanation, decision Action, cause
 // are identical before and after a full explanation, and no evidence appears for
 // an address that only a CIDR rule matched.
 //
-// The policy package owns no traffic counters. The forwarder counters that the
-// data path increments are asserted unchanged by the vpn-level test
-// (TestExplainPolicyLeavesCountersAndCacheUntouched), because policy cannot
-// import the forwarder.
+// The policy package owns no traffic counters. The forwarder counters are
+// asserted unchanged by the parity test in internal/vpn/forwarder, which drives
+// the real dispatcher.
 func TestExplainDestinationIsReadOnly(t *testing.T) {
 	f := newExplainFixture(t)
 	f.observe(t, "198.51.201.80", "DIRECT", time.Minute)
@@ -550,7 +604,7 @@ func TestExplainDestinationIsReadOnly(t *testing.T) {
 	beforeUnexplained := f.scope.Inspect(unexplained, f.gen, f.now)
 
 	if got := f.explain(ExplainDestinationInput{
-		Names:      []string{"plain.example"},
+		Names:      []string{"blocked.example"},
 		Addresses:  []netip.Addr{netip.MustParseAddr("198.51.201.80"), unexplained},
 		Resolved:   true,
 		Prohibited: noProhibited,

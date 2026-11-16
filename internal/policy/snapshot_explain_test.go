@@ -33,7 +33,7 @@ func TestSnapshotExplainDomainProvenance(t *testing.T) {
 		if match.Shape != DomainRuleApexAndSubdomains {
 			t.Errorf("shape = %q, want %q for exact+inclusive flags", match.Shape, DomainRuleApexAndSubdomains)
 		}
-		assertSources(t, match.Sources, "geoblock", "custom-1")
+		assertSources(t, match.Contributors, "geoblock", "custom-1")
 	})
 
 	t.Run("a single source is named for a rule only it supplies", func(t *testing.T) {
@@ -44,7 +44,7 @@ func TestSnapshotExplainDomainProvenance(t *testing.T) {
 		if match.Base != "only-b.example" || match.Shape != DomainRuleApex {
 			t.Fatalf("match = %+v, want only-b.example/apex", match)
 		}
-		assertSources(t, match.Sources, "custom-1")
+		assertSources(t, match.Contributors, "custom-1")
 	})
 
 	t.Run("an exact rule does not match a subdomain", func(t *testing.T) {
@@ -82,8 +82,8 @@ func TestSnapshotExplainWithoutAttribution(t *testing.T) {
 	}
 	// More sources than the provenance encoding holds: the rule and its shape
 	// are still reported, the source list is honestly empty rather than wrong.
-	if len(match.Sources) != 0 {
-		t.Fatalf("sources = %v, want none beyond the provenance budget", match.Sources)
+	if len(match.Contributors) != 0 {
+		t.Fatalf("contributors = %v, want none beyond the provenance budget", match.Contributors)
 	}
 	if !snap.MatchDomain("demo.example") {
 		t.Error("a snapshot with more than four sources must still match")
@@ -208,8 +208,8 @@ func TestGenerationSnapshotExplainsPrefixesWithoutSources(t *testing.T) {
 	if !ok || match.Base != "blocked.example" {
 		t.Fatalf("domain match = %+v, ok=%v", match, ok)
 	}
-	if len(match.Sources) != 0 {
-		t.Errorf("sources = %v, want none for a merged generation", match.Sources)
+	if len(match.Contributors) != 0 {
+		t.Errorf("contributors = %v, want none for a merged generation", match.Contributors)
 	}
 	prefix, ok := snap.ExplainIPv4(netip.MustParseAddr("198.51.200.5"))
 	if !ok || prefix.Prefix.String() != "198.51.200.0/24" {
@@ -220,6 +220,44 @@ func TestGenerationSnapshotExplainsPrefixesWithoutSources(t *testing.T) {
 	}
 	if !snap.MatchIPv4(netip.MustParseAddr("198.51.200.5")) {
 		t.Error("a generation snapshot must still match its prefixes")
+	}
+}
+
+// TestSnapshotExplainDomainContributorsAreBaseEntries pins the documented
+// precision limit of attribution (review note N825-01): provenance is recorded
+// per BASE ENTRY, so a list that supplies only a different shape of the same
+// base is still reported as a contributor. Routing is unaffected; the answer
+// says "contributors", not "suppliers of the matched shape".
+func TestSnapshotExplainDomainContributorsAreBaseEntries(t *testing.T) {
+	snap, err := CompileSnapshot(5, "gen-5", []SourceParsedRules{
+		{SourceID: "custom-1", Rules: ParsedRules{Domains: map[string]domainFlags{
+			"shared.example": domainDescendants, // "*.shared.example": never matches the apex
+		}}},
+		{SourceID: "custom-2", Rules: ParsedRules{Domains: map[string]domainFlags{
+			"shared.example": domainInclusiveSuffix, // the shape that matches
+		}}},
+	})
+	if err != nil {
+		t.Fatalf("compile snapshot: %v", err)
+	}
+
+	apex, ok := snap.ExplainDomain("shared.example")
+	if !ok {
+		t.Fatal("the apex should match the inclusive-suffix entry")
+	}
+	if apex.Shape != DomainRuleApexAndSubdomains {
+		t.Fatalf("shape = %q, want %q", apex.Shape, DomainRuleApexAndSubdomains)
+	}
+	// Both lists contributed to this base entry, although only custom-2 can match
+	// an apex. This is the documented base-entry semantics.
+	assertSources(t, apex.Contributors, "custom-1", "custom-2")
+
+	sub, ok := snap.ExplainDomain("sub.shared.example")
+	if !ok {
+		t.Fatal("a subdomain should match")
+	}
+	if sub.Shape != DomainRuleApexAndSubdomains {
+		t.Fatalf("subdomain shape = %q, want %q", sub.Shape, DomainRuleApexAndSubdomains)
 	}
 }
 

@@ -4,25 +4,39 @@ import (
 	"net/netip"
 )
 
-// This file composes the decision a packet would take for one destination and
-// names its cause (issue #825). It is pure: every input is passed in, nothing is
-// recorded, and no cache, matcher or resolver is touched.
+// This file composes what the data path does with one destination and names the
+// cause (issue #825). It is pure: every input is passed in, nothing is recorded,
+// and no cache, matcher or resolver is touched.
 //
-// The order of the checks is the order the data path applies them in
-// (Forwarder.routeClientPBR):
+// Two different questions are answered, and they must not be confused:
 //
-//	1. policy routing disabled        → the legacy route, PROXY for everything
-//	2. prohibited destination         → DROP
-//	3. proxy-required domain rule     → PROXY (the rule, and the list, named)
-//	4. proxy-required CIDR            → PROXY (the prefix, and the list, named)
-//	5. fresh Direct evidence          → DIRECT
-//	6. fresh Proxy evidence           → PROXY (another name shares this address)
-//	7. expired / quarantined / stale  → PROXY, and which of the three it is
-//	8. no trusted observation at all   → PROXY (the safe default, never DIRECT)
+//  1. The CURRENT ACTION for the evaluated addresses. This has to follow the
+//     packet path exactly (Forwarder.routeClientPBR), which has no name check at
+//     all: after the prohibited-destination guard it tests the snapshot CIDR and
+//     the session's cached PROXY decision, then the session's cached DIRECT
+//     decision, and finally falls back to PROXY.
+//
+//    	prohibited destination        → DROP
+//    	proxy-required CIDR           → PROXY (the prefix, and its lists)
+//    	fresh cached PROXY evidence   → PROXY (the cache keeps PROXY over DIRECT)
+//    	fresh cached DIRECT evidence  → DIRECT
+//    	expired / quarantined / stale → PROXY, and which of the three it is
+//    	no trusted observation        → PROXY (the safe default, never DIRECT)
+//
+//  2. The PROSPECTIVE rule classification for the submitted name (and its CNAME
+//     chain). A matched domain rule is a real fact about the policy, but it is
+//     NOT the current route: the data path only ever sees the address, and the
+//     rule becomes that address's route after the client's own answer for the
+//     name is observed under the current policy. A dry run that treats the
+//     submitted name as such an observation reports the opposite of the real
+//     eligibility for a listed name sharing an address the session already
+//     routes direct. The classification is therefore returned separately and
+//     labeled prospective; it never decides the current action.
 //
 // A name that cannot be resolved is never given an invented verdict: with no
-// rule it is UNKNOWN with CauseNameUnresolved, and with a rule it is PROXY with
-// that rule as the cause, because the rule does not depend on the answer.
+// address there is no destination to route, so the answer is UNKNOWN with
+// CauseNameUnresolved even when a rule matches, and the rule is still reported
+// as the prospective classification.
 
 // Action is what production does with a packet for a destination.
 type Action string
@@ -38,9 +52,9 @@ const (
 	ActionUnknown Action = "UNKNOWN"
 )
 
-// Cause is the machine-readable reason a decision was reached. It is the field
-// an operator acts on: each value names one specific cause, never a generic
-// verdict.
+// Cause is the machine-readable reason a current action was reached, or the
+// basis of a prospective rule classification. Each value names one specific
+// cause, never a generic verdict.
 type Cause string
 
 const (
@@ -53,37 +67,41 @@ const (
 	// CauseProhibitedDestination: the address is loopback, private, link-local,
 	// CGNAT, multicast, reserved or a test range, so the data path drops it.
 	CauseProhibitedDestination Cause = "prohibited_destination"
-	// CauseDomainRule: the queried name matches a proxy-required domain rule.
+	// CauseDomainRule is the basis of a prospective classification: the submitted
+	// name matches a proxy-required domain rule. It is not a current action.
 	CauseDomainRule Cause = "domain_rule"
-	// CauseCNAMERule: the queried name itself matches nothing, but a name in its
-	// CNAME chain matches a proxy-required domain rule.
+	// CauseCNAMERule is the basis of a prospective classification: a name in the
+	// submitted name's CNAME chain matches a proxy-required domain rule.
 	CauseCNAMERule Cause = "cname_rule"
 	// CauseCIDRRule: an address matches a proxy-required CIDR prefix.
 	CauseCIDRRule Cause = "cidr_rule"
-	// CauseSharedIPConflict: no rule matches, but the session holds a fresh PROXY
-	// observation for the address, which the cache keeps over DIRECT because
-	// PROXY wins. Another name sharing this address is proxy-required.
-	CauseSharedIPConflict Cause = "shared_ip_conflict"
-	// CauseFreshEvidenceDirect: no rule matches and fresh, trusted DNS evidence
-	// from the session says the destination is not policy-routed.
+	// CauseCachedProxyEvidence: the session's cache holds a fresh PROXY decision
+	// for the address, and the cache keeps PROXY over DIRECT. The cache stores a
+	// decision and a deadline only, so this states what the entry is, not which
+	// name produced it.
+	CauseCachedProxyEvidence Cause = "cached_proxy_evidence"
+	// CauseFreshEvidenceDirect: fresh, trusted DNS evidence from the session says
+	// the destination is not policy-routed.
 	CauseFreshEvidenceDirect Cause = "fresh_evidence_direct"
 	// CauseExpiredEvidence: the session holds evidence for the address but its
 	// deadline has passed, so it no longer authorizes the direct path.
 	CauseExpiredEvidence Cause = "expired_evidence"
 	// CauseEvictedEvidence: the session's cache overflowed and was quarantined,
-	// which dropped its entries. This is the only eviction the cache performs.
+	// which dropped its entries. This is the only eviction that leaves a
+	// quarantine marker; an ordinary entry evicted for capacity is reported as
+	// absent, which is what the cache retains.
 	CauseEvictedEvidence Cause = "evicted_evidence"
 	// CauseStaleEvidence: the session's evidence belongs to a previous policy
 	// generation and was discarded when the policy was refreshed.
 	CauseStaleEvidence Cause = "stale_evidence_generation"
-	// CauseNoEvidence: the session holds no trusted observation for the address,
-	// which is the safe default: PROXY, never DIRECT.
+	// CauseNoEvidence: the session holds no trusted observation for the address
+	// (or no session was selected): the safe default, PROXY, never DIRECT.
 	CauseNoEvidence Cause = "no_trusted_evidence"
 	// CauseNoUsableAddress: the name resolved, but to no address this path can
 	// evaluate (no A record, or only addresses that are not usable IPv4).
 	CauseNoUsableAddress Cause = "no_usable_address"
-	// CauseNameUnresolved: the name could not be resolved, and no rule matches
-	// it, so there is no truthful verdict to give.
+	// CauseNameUnresolved: the name could not be resolved, so there is no
+	// destination to route and no truthful current action to give.
 	CauseNameUnresolved Cause = "name_unresolved"
 )
 
@@ -91,17 +109,14 @@ const (
 type Summary string
 
 const (
-	// SummaryNone means there was nothing to aggregate (disabled policy, or an
-	// unresolved name with no rule).
+	// SummaryNone means there was nothing to aggregate (disabled policy, or no
+	// evaluable address).
 	SummaryNone Summary = "none"
-	// SummarySingle means zero or one address was evaluated, so the headline is
+	// SummarySingle means exactly one address was evaluated, so the headline is
 	// that verdict.
 	SummarySingle Summary = "single"
 	// SummaryUnanimous means every evaluated address reached the same verdict.
 	SummaryUnanimous Summary = "unanimous"
-	// SummaryRuleOnly means a rule matched the name without any address being
-	// evaluated, because the name did not resolve.
-	SummaryRuleOnly Summary = "rule_only"
 	// SummaryMostRestrictive means the addresses disagreed and the headline is
 	// the most restrictive verdict among them (DROP > PROXY > UNKNOWN > DIRECT),
 	// so the answer never looks safer than the worst address.
@@ -125,6 +140,23 @@ func actionSeverity(a Action) int {
 	}
 }
 
+// ProspectiveRule is the rule classification for the submitted name and its
+// CNAME chain. It is deliberately a separate object from the current action:
+// production never evaluates a name while forwarding a packet, so this
+// classification only becomes the destination's route once the client's own
+// answer for the name is observed under the current policy.
+type ProspectiveRule struct {
+	// Decision is the action this name would take when observed: PROXY.
+	Decision Action
+	// Basis says whether the queried name or a CNAME target matched.
+	Basis Cause
+	// Rule is the matched rule, its shape and the lists that contributed it.
+	Rule *DomainRuleMatch
+	// MatchedName is the name in the traversal that matched: the queried name
+	// itself, or a CNAME target.
+	MatchedName string
+}
+
 // AddressExplanation is the verdict for one destination address.
 type AddressExplanation struct {
 	Address  netip.Addr
@@ -139,14 +171,13 @@ type AddressExplanation struct {
 
 // DestinationExplanation is the explanation for one destination.
 type DestinationExplanation struct {
+	// Decision and Reason describe the CURRENT action for the evaluated
+	// addresses, following the packet path's precedence.
 	Decision Action
 	Reason   Cause
-	// Rule is the domain rule that decided the whole name, when one did. It is
-	// set for CauseDomainRule and CauseCNAMERule.
-	Rule *DomainRuleMatch
-	// RuleName is the name in the traversal that matched the rule: the queried
-	// name itself, or a CNAME target for CauseCNAMERule.
-	RuleName string
+	// Prospective is the rule classification of the submitted names. nil when no
+	// rule matched. It never participates in Decision.
+	Prospective *ProspectiveRule
 	// Addresses carries one verdict per evaluated address, in input order.
 	Addresses []AddressExplanation
 	// Summary names how Addresses produced Decision.
@@ -167,7 +198,8 @@ type ExplainDestinationInput struct {
 	// Snapshot is the live policy snapshot. nil is treated as "no rules".
 	Snapshot *Snapshot
 	// Names are canonical names in the order production traverses them: the
-	// queried name first, then each CNAME target.
+	// queried name first, then each CNAME target. They are used only for the
+	// prospective classification.
 	Names []string
 	// Addresses are the addresses to evaluate: the caller's own addresses, or
 	// the terminal A records of the resolution.
@@ -185,7 +217,8 @@ type ExplainDestinationInput struct {
 	Prohibited func(netip.Addr) bool
 }
 
-// ExplainDestination composes the decision and its cause for one destination.
+// ExplainDestination composes the current action for the evaluated addresses and
+// the prospective rule classification for the submitted names.
 func ExplainDestination(in ExplainDestinationInput) DestinationExplanation {
 	if !in.Enabled {
 		return DestinationExplanation{Decision: ActionProxy, Reason: CausePolicyDisabled, Summary: SummaryNone}
@@ -196,31 +229,26 @@ func ExplainDestination(in ExplainDestinationInput) DestinationExplanation {
 		return DestinationExplanation{Decision: ActionProxy, Reason: CauseNoPolicySnapshot, Summary: SummaryNone}
 	}
 
-	rule, ruleName, ruleCause := explainDomainRule(in.Snapshot, in.Names)
-
-	if len(in.Addresses) == 0 {
-		switch {
-		case rule != nil:
-			// A rule does not depend on the answer, so it is a truthful verdict
-			// even when the name does not resolve.
-			return DestinationExplanation{
-				Decision: ActionProxy, Reason: ruleCause, Rule: rule, RuleName: ruleName, Summary: SummaryRuleOnly,
-			}
-		case !in.Resolved:
-			return DestinationExplanation{Decision: ActionUnknown, Reason: CauseNameUnresolved, Summary: SummaryNone}
-		default:
-			return DestinationExplanation{Decision: ActionUnknown, Reason: CauseNoUsableAddress, Summary: SummaryNone}
-		}
-	}
-
 	out := DestinationExplanation{
-		Rule:      rule,
-		RuleName:  ruleName,
-		Addresses: make([]AddressExplanation, 0, len(in.Addresses)),
+		Prospective: prospectiveRule(in.Snapshot, in.Names),
+		Addresses:   make([]AddressExplanation, 0, len(in.Addresses)),
 	}
 	for _, addr := range in.Addresses {
-		out.Addresses = append(out.Addresses, explainAddress(in, addr, rule, ruleCause))
+		out.Addresses = append(out.Addresses, explainAddress(in, addr))
 	}
+	if len(out.Addresses) == 0 {
+		// No destination means no current action. The prospective classification,
+		// when there is one, still describes what this name would do once it
+		// resolves and is observed.
+		out.Decision, out.Summary = ActionUnknown, SummaryNone
+		if in.Resolved {
+			out.Reason = CauseNoUsableAddress
+		} else {
+			out.Reason = CauseNameUnresolved
+		}
+		return out
+	}
+
 	out.Decision, out.Summary = summariseActions(out.Addresses)
 	out.Reason = explainDecisiveReason(out)
 	// The prefix and evidence shown at the top level belong to the address that
@@ -236,35 +264,41 @@ func ExplainDestination(in ExplainDestinationInput) DestinationExplanation {
 	return out
 }
 
-// explainDomainRule returns the first rule match in traversal order: the queried
-// name is preferred, then each CNAME target. That is also what production's
-// observation code decides — it marks the answer proxy-required when any
-// traversed name matches — but naming the first match keeps the answer specific.
-func explainDomainRule(snap *Snapshot, names []string) (*DomainRuleMatch, string, Cause) {
+// prospectiveRule classifies the submitted names against the snapshot without
+// touching the current action. The queried name is preferred over a CNAME
+// target, which keeps the answer specific; production marks the whole answer
+// proxy-required when any traversed name matches.
+func prospectiveRule(snap *Snapshot, names []string) *ProspectiveRule {
 	if snap == nil {
-		return nil, "", ""
+		return nil
 	}
 	for i, name := range names {
-		if match, ok := snap.ExplainCanonicalDomain(name); ok {
-			if i == 0 {
-				return &match, name, CauseDomainRule
-			}
-			return &match, name, CauseCNAMERule
+		match, ok := snap.ExplainCanonicalDomain(name)
+		if !ok {
+			continue
+		}
+		basis := CauseDomainRule
+		if i > 0 {
+			basis = CauseCNAMERule
+		}
+		return &ProspectiveRule{
+			Decision:    ActionProxy,
+			Basis:       basis,
+			Rule:        &match,
+			MatchedName: name,
 		}
 	}
-	return nil, "", ""
+	return nil
 }
 
-// explainAddress is one address's verdict, in the order the data path applies.
-func explainAddress(in ExplainDestinationInput, addr netip.Addr, rule *DomainRuleMatch, ruleCause Cause) AddressExplanation {
+// explainAddress is one address's current action, in the order the data path
+// applies. It deliberately does not look at domain names: the packet path never
+// does.
+func explainAddress(in ExplainDestinationInput, addr netip.Addr) AddressExplanation {
 	v := AddressExplanation{Address: addr}
 
 	if in.Prohibited != nil && in.Prohibited(addr) {
 		v.Decision, v.Reason = ActionDrop, CauseProhibitedDestination
-		return v
-	}
-	if rule != nil {
-		v.Decision, v.Reason = ActionProxy, ruleCause
 		return v
 	}
 	if match, ok := in.Snapshot.ExplainIPv4(addr); ok {
@@ -295,10 +329,10 @@ func evidenceVerdict(evidence *Evidence) (Action, Cause) {
 		if evidence.Decision == Direct {
 			return ActionDirect, CauseFreshEvidenceDirect
 		}
-		// A fresh PROXY observation with no matching rule means another name that
-		// resolves to this shared address is proxy-required, and PROXY wins in the
-		// cache.
-		return ActionProxy, CauseSharedIPConflict
+		// The cache keeps PROXY over DIRECT, so a fresh PROXY entry means this
+		// address is proxy-required for the session. The entry does not record
+		// which name produced it.
+		return ActionProxy, CauseCachedProxyEvidence
 	case EvidenceExpired:
 		return ActionProxy, CauseExpiredEvidence
 	case EvidenceQuarantined:

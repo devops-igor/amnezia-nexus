@@ -243,7 +243,7 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 		"policy_explain_reason_policy_disabled", "policy_explain_reason_no_policy_snapshot",
 		"policy_explain_reason_prohibited_destination", "policy_explain_reason_domain_rule",
 		"policy_explain_reason_cname_rule", "policy_explain_reason_cidr_rule",
-		"policy_explain_reason_shared_ip_conflict", "policy_explain_reason_fresh_evidence_direct",
+		"policy_explain_reason_cached_proxy_evidence", "policy_explain_reason_fresh_evidence_direct",
 		"policy_explain_reason_expired_evidence", "policy_explain_reason_evicted_evidence",
 		"policy_explain_reason_stale_evidence_generation", "policy_explain_reason_no_trusted_evidence",
 		"policy_explain_reason_no_usable_address", "policy_explain_reason_name_unresolved",

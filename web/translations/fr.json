@@ -873,7 +873,7 @@
   "policy_explain_label": "Expliquer une destination",
   "policy_explain_placeholder": "domaine ou adresse IPv4",
   "policy_explain_btn": "Expliquer",
-  "policy_explain_hint": "Lecture seule : aucun trafic n'est envoyé et aucune preuve de routage n'est enregistrée.",
+  "policy_explain_hint": "Lecture seule pour les clients : aucun trafic client ou applicatif n'est envoyé et aucune preuve de routage n'est enregistrée. La résolution d'un nom passe par le résolveur configuré.",
   "policy_explain_running": "Analyse en cours…",
   "policy_explain_needs_value": "Saisissez d'abord un nom de domaine ou une adresse.",
   "policy_explain_failed": "Impossible d'expliquer la décision",
@@ -888,12 +888,12 @@
   "policy_explain_reason_domain_rule": "une règle de proxy correspond à ce nom",
   "policy_explain_reason_cname_rule": "une règle de proxy correspond à un nom de la chaîne CNAME",
   "policy_explain_reason_cidr_rule": "une règle de proxy correspond à cette plage d'adresses",
-  "policy_explain_reason_shared_ip_conflict": "cette adresse est partagée avec un nom qui exige le proxy",
   "policy_explain_reason_fresh_evidence_direct": "une observation DNS récente de cette session autorise le chemin direct",
   "policy_explain_reason_expired_evidence": "la preuve DNS de la session pour cette adresse a expiré",
   "policy_explain_reason_evicted_evidence": "la preuve DNS de la session a été évincée par un dépassement de cache",
   "policy_explain_reason_stale_evidence_generation": "la preuve DNS de la session appartient à une version précédente des règles",
   "policy_explain_reason_no_trusted_evidence": "aucune preuve DNS fiable pour cette session, le proxy est utilisé",
   "policy_explain_reason_no_usable_address": "le nom n'a donné aucune adresse IPv4 utilisable",
-  "policy_explain_reason_name_unresolved": "le nom n'a pas pu être résolu"
+  "policy_explain_reason_name_unresolved": "le nom n'a pas pu être résolu",
+  "policy_explain_reason_cached_proxy_evidence": "le cache de routes de la session contient déjà une décision « proxy » pour cette adresse"
 }

@@ -873,7 +873,7 @@
   "policy_explain_label": "解释目标路由",
   "policy_explain_placeholder": "域名或 IPv4 地址",
   "policy_explain_btn": "解释",
-  "policy_explain_hint": "只读：不会发送流量，也不会记录路由证据。",
+  "policy_explain_hint": "对客户端只读：不会发送客户端或应用流量，也不会记录路由证据。名称解析会通过已配置的解析器进行。",
   "policy_explain_running": "正在分析…",
   "policy_explain_needs_value": "请先输入域名或地址。",
   "policy_explain_failed": "无法解释该决策",
@@ -888,12 +888,12 @@
   "policy_explain_reason_domain_rule": "有代理规则匹配此域名",
   "policy_explain_reason_cname_rule": "有代理规则匹配 CNAME 链中的域名",
   "policy_explain_reason_cidr_rule": "有代理规则匹配该地址范围",
-  "policy_explain_reason_shared_ip_conflict": "该地址与需要代理的域名共用",
   "policy_explain_reason_fresh_evidence_direct": "此会话有较新的 DNS 观测，允许直连",
   "policy_explain_reason_expired_evidence": "此会话对该地址的 DNS 证据已过期",
   "policy_explain_reason_evicted_evidence": "此会话的 DNS 证据因缓存溢出被清除",
   "policy_explain_reason_stale_evidence_generation": "此会话的 DNS 证据属于较早的策略版本",
   "policy_explain_reason_no_trusted_evidence": "此会话没有可信的 DNS 证据，因此使用代理",
   "policy_explain_reason_no_usable_address": "该域名没有解析出可用的 IPv4 地址",
-  "policy_explain_reason_name_unresolved": "该域名无法解析"
+  "policy_explain_reason_name_unresolved": "该域名无法解析",
+  "policy_explain_reason_cached_proxy_evidence": "此会话的路由缓存已为该地址记录了走代理的决定"
 }

@@ -29,22 +29,32 @@ const (
 	DomainRuleSubdomains DomainRuleShape = "subdomains"
 )
 
-// DomainRuleMatch is the rule that caused a proxy decision.
+// DomainRuleMatch is a matched domain rule.
 //
 // Base is the canonical rule entry ("example.com") rather than the queried
-// name, so an operator can find the line in the list that supplied it. Sources
-// names the lists that supplied the rule; it is empty when the snapshot was
+// name, so an operator can find the line in the list that supplied it.
+//
+// Contributors names the lists that contributed to that BASE ENTRY. A base
+// entry's flags are merged across sources, so a contributor may supply only a
+// shape this name does not use: with "*.shared.example" from one list and a
+// bare "shared.example" from another, explaining the apex reports both lists
+// even though only the second can match an apex. It is a base-entry
+// contributor list, not a proven supplier of the matched shape; the snapshot
+// keeps one provenance mask per base entry and cannot distinguish shapes
+// without a second per-rule index. Contributors is empty when the snapshot was
 // compiled from a durable last-known-good generation, which stores merged rules
 // without per-rule attribution, or when the snapshot was compiled from more
 // sources than the provenance encoding holds.
 type DomainRuleMatch struct {
-	Base    string          `json:"base"`
-	Shape   DomainRuleShape `json:"shape"`
-	Sources []string        `json:"sources"`
+	Base         string          `json:"base"`
+	Shape        DomainRuleShape `json:"shape"`
+	Contributors []string        `json:"contributors"`
 }
 
 // CIDRRuleMatch is the most specific prefix of the snapshot that contains an
-// address, with the sources that supplied it.
+// address, with the sources that supplied that exact prefix. Unlike a merged
+// domain base entry, a prefix's provenance is exact: each source either
+// contains that prefix or does not.
 type CIDRRuleMatch struct {
 	Prefix  netip.Prefix `json:"prefix"`
 	Sources []string     `json:"sources"`
@@ -67,7 +77,7 @@ func (s *Snapshot) ExplainCanonicalDomain(name string) (DomainRuleMatch, bool) {
 	for {
 		if f, ok := s.domains[q]; ok {
 			if shape, matched := domainRuleShape(f, orig); matched {
-				return DomainRuleMatch{Base: q, Shape: shape, Sources: s.sourcesForMask(f)}, true
+				return DomainRuleMatch{Base: q, Shape: shape, Contributors: s.sourcesForMask(f)}, true
 			}
 		}
 		i := strings.IndexByte(q, '.')
