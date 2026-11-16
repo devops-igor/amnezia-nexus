@@ -895,5 +895,7 @@
   "policy_explain_reason_no_trusted_evidence": "доверенного DNS-подтверждения сессии нет, поэтому используется прокси",
   "policy_explain_reason_no_usable_address": "имя не разрешилось ни в один пригодный IPv4-адрес",
   "policy_explain_reason_name_unresolved": "имя не удалось разрешить",
-  "policy_explain_reason_cached_proxy_evidence": "в кеше маршрутов сессии для этого адреса уже сохранено решение «через прокси»"
+  "policy_explain_reason_cached_proxy_evidence": "в кеше маршрутов сессии для этого адреса уже сохранено решение «через прокси»",
+  "policy_explain_prospective_rule": "предварительно: совпадает правило {rule} ({shape}), источник: {source} — применяется после того, как будет получен собственный DNS-ответ клиента",
+  "policy_explain_current_prefix": "совпавший диапазон адресов: {prefix}, источник: {source}"
 }

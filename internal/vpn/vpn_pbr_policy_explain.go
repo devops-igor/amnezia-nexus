@@ -60,8 +60,10 @@ const (
 	// shorter than the policy resolver's 4s query budget because this lookup is
 	// an operator convenience, not a client answer.
 	DefaultPolicyExplainResolveTimeout = 2 * time.Second
-	// policyExplainMaxCNAMEHops matches the observation path's traversal bound.
-	policyExplainMaxCNAMEHops = 16
+	// policyExplainAnswerMaxTTL is the TTL ceiling handed to the observation
+	// path's classifier. Classification uses it only as the starting minimum TTL;
+	// this endpoint publishes remaining evidence TTL from the cache, never this.
+	policyExplainAnswerMaxTTL = time.Hour
 
 	// Resolution methods reported to the operator.
 	policyExplainMethodConfiguredResolver = "configured_resolver"
@@ -73,6 +75,12 @@ const (
 	// production the only writer is gatewaydns.ObserveResponse, fed by
 	// intercepted plain DNS, so the value says exactly that.
 	policyExplainEvidenceSource = "intercepted_plain_dns"
+
+	// policyExplainIgnoredAnswerPrefix introduces the resolution error shown when
+	// the observation path would discard the whole answer. It is a named value so
+	// the parity test can distinguish "answer rejected" from "answer valid but
+	// carried no usable address" without matching an arbitrary sentence.
+	policyExplainIgnoredAnswerPrefix = "the observation path would ignore this answer"
 )
 
 // Limitations an answer always or conditionally carries. They are tokens, not
@@ -85,6 +93,11 @@ const (
 	PolicyLimitNoSessionData   = "session_has_no_cached_evidence"
 	PolicyLimitNoName          = "domain_rules_require_a_name"
 	PolicyLimitIPv6            = "ipv6_not_supported"
+	// PolicyLimitNoEvidenceAge states why the answer carries a remaining TTL but
+	// no age: the route cache stores the decision and its deadline only, so the
+	// observation instant (and therefore elapsed age) is not reconstructible
+	// (review note LOW-01).
+	PolicyLimitNoEvidenceAge = "evidence_age_not_recorded"
 )
 
 // PolicyExplainRequest is one validated dry-run request.
@@ -112,8 +125,10 @@ type policyExplainDeps struct {
 	Enabled      bool
 	Snapshot     *policy.Snapshot
 	SessionScope *policy.SessionCache
-	Resolver     gatewaydns.Resolver
-	Upstreams    []policy.Upstream
+	// Resolver is the read-only exchange entry point: same budgets and failover as
+	// the live resolver, without its health-status write.
+	Resolver  gatewaydns.ReadOnlyResolver
+	Upstreams []policy.Upstream
 	// Clock is the evaluation clock. It is sampled ONCE per answer, after the
 	// blocking lookup, and that one instant is used both for reading the session
 	// evidence and for serializing its remaining TTL. nil means time.Now.
@@ -256,98 +271,30 @@ func resolvePolicyExplainName(ctx context.Context, deps policyExplainDeps, req P
 	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	resp, err := deps.Resolver.Exchange(lookupCtx, query)
+	// ExchangeReadOnly runs the production exchange with the production budgets
+	// and failover, and deliberately does not publish the outcome to the live
+	// resolver's health status (review finding HIGH-01): a dry run must not clear
+	// or invent an operator-visible upstream failure.
+	resp, err := deps.Resolver.ExchangeReadOnly(lookupCtx, query)
 	if err != nil {
 		res.Error = err.Error()
 		return []string{req.Name}, nil, res
 	}
 
-	names, addresses, note := classifyPolicyExplainAnswer(resp, req.Name)
-	res.Names = names
-	res.Addresses = policyExplainAddrStrings(addresses)
-	res.Note = note
-	if len(addresses) == 0 && res.Error == "" {
+	// The answer is classified by the observation path's own code (review finding
+	// HIGH-03). A second traversal here would let this endpoint explain a
+	// destination from an answer that can never become trusted evidence.
+	answer := gatewaydns.ClassifyAnswer(query, resp, policyExplainAnswerMaxTTL)
+	if !answer.Valid {
+		res.Error = policyExplainIgnoredAnswerPrefix + ": " + answer.Reason
+		return []string{req.Name}, nil, res
+	}
+	res.Names = answer.Names
+	res.Addresses = policyExplainAddrStrings(answer.Addresses)
+	if len(answer.Addresses) == 0 {
 		res.Error = "the answer contains no usable IPv4 address"
 	}
-	return names, addresses, res
-}
-
-// classifyPolicyExplainAnswer walks the CNAME chain the way the observation path
-// does and returns the traversed names plus the terminal A records.
-//
-// A name that cannot be normalized is dropped from the rule evaluation: the
-// observation path discards the whole answer in that case, so matching a
-// canonical part of a chain it would have ignored would over-report a rule.
-func classifyPolicyExplainAnswer(resp *mdns.Msg, queried string) ([]string, []netip.Addr, string) {
-	if resp == nil {
-		return nil, nil, ""
-	}
-	current := mdns.Fqdn(queried)
-	names := make([]string, 0, 4)
-	visited := make(map[string]struct{}, policyExplainMaxCNAMEHops)
-	note := ""
-	for hop := 0; hop < policyExplainMaxCNAMEHops; hop++ {
-		key := strings.ToLower(current)
-		if _, seen := visited[key]; seen {
-			break
-		}
-		visited[key] = struct{}{}
-		if canon, err := policy.NormalizeDomain(key); err == nil {
-			names = append(names, canon)
-		} else if note == "" {
-			note = "a name in the answer does not normalize, so it cannot match a rule"
-		}
-		next := policyExplainCNAMETarget(resp, current)
-		if next == "" {
-			break
-		}
-		current = next
-	}
-	return names, policyExplainARecords(resp, current), note
-}
-
-// policyExplainCNAMETarget returns the single CNAME target of name, or "".
-func policyExplainCNAMETarget(resp *mdns.Msg, name string) string {
-	target := ""
-	for _, rr := range resp.Answer {
-		cname, ok := rr.(*mdns.CNAME)
-		if !ok || !strings.EqualFold(cname.Hdr.Name, name) {
-			continue
-		}
-		if target != "" && !strings.EqualFold(target, cname.Target) {
-			// Ambiguous chain: production refuses it, so stop here and let the
-			// caller see no further names.
-			return ""
-		}
-		target = cname.Target
-	}
-	return target
-}
-
-// policyExplainARecords returns the deduplicated IPv4 A records of terminal.
-func policyExplainARecords(resp *mdns.Msg, terminal string) []netip.Addr {
-	out := make([]netip.Addr, 0, 4)
-	seen := make(map[netip.Addr]struct{}, 4)
-	for _, rr := range resp.Answer {
-		rec, ok := rr.(*mdns.A)
-		if !ok || !strings.EqualFold(rec.Hdr.Name, terminal) {
-			continue
-		}
-		addr, ok := netip.AddrFromSlice(rec.A)
-		if !ok {
-			continue
-		}
-		addr = addr.Unmap()
-		if !addr.IsValid() || !addr.Is4() {
-			continue
-		}
-		if _, dup := seen[addr]; dup {
-			continue
-		}
-		seen[addr] = struct{}{}
-		out = append(out, addr)
-	}
-	return out
+	return answer.Names, answer.Addresses, res
 }
 
 // policyExplainEvidenceReader returns the evidence lookup for the selected
@@ -381,6 +328,12 @@ func policyExplainLimitations(req PolicyExplainRequest, deps policyExplainDeps) 
 	}
 	if req.Name == "" {
 		limits = append(limits, PolicyLimitNoName)
+	}
+	if req.SessionID != "" && deps.SessionScope != nil {
+		// Evidence may be reported for this session, and only its remaining TTL can
+		// be stated: the cache keeps the decision and the deadline, not the instant
+		// it was observed.
+		limits = append(limits, PolicyLimitNoEvidenceAge)
 	}
 	return limits
 }

@@ -314,7 +314,7 @@ destination can be evaluated with no DNS traffic at all. The answer reports:
 | `rule` (inside `prospective`) | the matched rule: its base name, its shape (`apex`, `apex_and_subdomains`, `subdomains`) and the lists that contributed the base entry (`contributors`, with `source_kind` `preset`/`custom`/`mixed`) |
 | `prefix` | the most specific matching CIDR prefix and the lists that supplied exactly that prefix |
 | `addresses` | one current-action verdict per evaluated address, with its own decision, cause, prefix and evidence |
-| `evidence` | the session evidence the decisive verdict rests on: state, decision, generation and remaining TTL |
+| `evidence` | the session evidence the decisive verdict rests on: state, decision, generation and remaining TTL. Elapsed age is not reported: the cache stores the decision and its deadline, not the instant it was observed, so the reason is stated in `limitations` (`evidence_age_not_recorded`) |
 | `evaluated_at` | the instant the evidence was evaluated at, sampled *after* the optional blocking lookup |
 | `resolution` | how the name was resolved: `configured_resolver`, `caller_supplied`, `not_attempted` or `unavailable`, the upstreams dialled, the deadline, the CNAME chain and the answer, or the resolver's error |
 | `limitations` | the caveats that apply, as tokens |
@@ -353,13 +353,39 @@ observation, syncs a list, refreshes anything or moves a counter:
   query does leave the panel: a name submitted without addresses is resolved
   through the configured resolver, and the answer reports `resolution.method` so
   the operator can see it. Client traffic, routing evidence and dataplane
-  counters stay untouched.
+  counters stay untouched;
+- the lookup uses the resolver's read-only exchange entry point
+  (`UpstreamResolver.ExchangeReadOnly`), which runs the identical budget,
+  failover and TCP-fallback path but does not publish the attempt to the live
+  resolver's health status. Without that, one dry run could clear a recorded
+  upstream failure or invent one, changing the operator-facing status that #824
+  reports. A test drives a real resolver: after a genuine recorded failure, a
+  successful dry run leaves the status untouched and a failing dry run adds
+  nothing;
+- the DNS answer is classified by the observation path's own
+  `gatewaydns.ClassifyAnswer`, not by a second traversal. Answers the observation
+  path would discard — a CNAME cycle, ambiguous CNAMEs for one name, a name with
+  both CNAME and A records, an unnormalizable intermediate or a truncated reply —
+  are reported as unusable instead of being explained from. A parity table drives
+  the explainer, the classifier and `ObserveResponse` over the same crafted
+  answers and requires all three to agree.
 
 A test asserts the entry count, the session count, the stored evidence and the
 dispatcher counters are identical before and after an explanation, and that an
 address which only matched a CIDR rule gained no evidence. A second test drives
 the real forwarder and asserts that the explained action equals what
-`RouteClientToBackend` actually does for the same fresh flow.
+`RouteClientToBackend` actually does for the same fresh flow. A third asserts the
+live resolver's status is unchanged by a dry run.
+
+### What the policy section shows
+
+The section's one line shows the current action and its cause for what the
+operator typed. A second line beneath it shows the rule that matched, with its
+shape and the lists that contributed the base entry, or the CIDR range that
+decided the action with its source. The rule line is labelled prospective and
+says that it applies only after the client's own DNS answer is observed; the
+current-action line is never derived from a submitted name. No match renders no
+line rather than an empty one.
 
 ### Attribution
 

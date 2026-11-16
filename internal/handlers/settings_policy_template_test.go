@@ -63,6 +63,7 @@ var policySectionIDs = []string{
 	"policy_explain_value",
 	"policyExplainBtn",
 	"policyExplainResult",
+	"policyExplainDetail",
 }
 
 // renderSettingsPage renders /settings for the supplied role through the real
@@ -238,6 +239,7 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 		// resolves at run time and every cause the server can return.
 		"policy_explain_running", "policy_explain_needs_value", "policy_explain_failed",
 		"policy_explain_result",
+		"policy_explain_prospective_rule", "policy_explain_current_prefix",
 		"policy_explain_decision_direct", "policy_explain_decision_proxy",
 		"policy_explain_decision_drop", "policy_explain_decision_unknown",
 		"policy_explain_reason_policy_disabled", "policy_explain_reason_no_policy_snapshot",

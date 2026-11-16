@@ -639,6 +639,46 @@
         el.setAttribute('data-state', state || '');
     }
 
+    // policyExplainSource renders the lists behind a match, or the "none" token
+    // when a merged snapshot could not attribute it.
+    function policyExplainSource(source) {
+        if (Array.isArray(source) && source.length > 0) {
+            return source.join(', ');
+        }
+        return policyText('policy_none');
+    }
+
+    // setPolicyExplainDetail shows the rule or prefix behind the answer, naming
+    // its source. The rule match is prospective and is labelled as such: the
+    // packet path never looks at a name, so a rule only becomes this
+    // destination's route after the client's own answer is observed.
+    function setPolicyExplainDetail(answer) {
+        var el = policyElement('policyExplainDetail');
+        if (!el) {
+            return;
+        }
+        var parts = [];
+        var prospective = answer && answer.prospective;
+        if (prospective && prospective.matched && prospective.rule) {
+            parts.push(policyText('policy_explain_prospective_rule')
+                .replace('{rule}', prospective.rule.base || '')
+                .replace('{shape}', prospective.rule.shape || '')
+                .replace('{source}', policyExplainSource(prospective.rule.contributors)));
+        }
+        if (answer && answer.prefix) {
+            parts.push(policyText('policy_explain_current_prefix')
+                .replace('{prefix}', answer.prefix.prefix || '')
+                .replace('{source}', policyExplainSource(answer.prefix.sources)));
+        }
+        if (parts.length === 0) {
+            el.textContent = '';
+            el.hidden = true;
+            return;
+        }
+        el.textContent = parts.join(' · ');
+        el.hidden = false;
+    }
+
     // explainPolicyDestination asks the server to explain one destination and
     // renders the decision with its cause. It changes no settings and reloads
     // nothing: the answer is a read.
@@ -659,6 +699,7 @@
             button.setAttribute('aria-busy', 'true');
         }
         setPolicyExplainResult(policyText('policy_explain_running'), '');
+        setPolicyExplainDetail(null);
         try {
             var answer = await policyRequest(EXPLAIN_ENDPOINT, {
                 method: 'POST',
@@ -680,8 +721,10 @@
                 state = 'drop';
             }
             setPolicyExplainResult(result, state);
+            setPolicyExplainDetail(answer);
             return answer;
         } catch (err) {
+            setPolicyExplainDetail(null);
             setPolicyExplainResult(policyText('policy_explain_failed') + ': ' + policyErrorDetail(err), 'error');
             return null;
         } finally {

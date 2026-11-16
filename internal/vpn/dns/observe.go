@@ -14,6 +14,32 @@ const (
 	maxRRsParsed = 256
 )
 
+// AnswerClassification is the observation path's interpretation of one DNS
+// answer: the names it traverses, the terminal IPv4 records that could become
+// evidence, and the minimum TTL. It is the single classification both the
+// observation path and the read-only policy explanation use (issue #825, review
+// finding HIGH-03): a second traversal would let the explanation accept answers
+// the observation path rejects, so a destination could be explained from an
+// answer that never becomes trusted evidence.
+type AnswerClassification struct {
+	// Valid reports whether the observation path would use this answer at all.
+	// An answer that is not valid produces no evidence, whatever its records say.
+	Valid bool
+	// Reason names why an answer is unusable, for diagnostics. Empty when Valid.
+	Reason string
+	// Names are the canonical names the answer traverses, in order: the queried
+	// name first, then each CNAME target.
+	Names []string
+	// Terminal is the last name in the chain; its A records are the answer.
+	Terminal string
+	// Addresses are the terminal A records that pass the evidence filter (native
+	// public IPv4 only), deduplicated in answer order. Empty is a valid outcome:
+	// the answer simply carries no usable address.
+	Addresses []netip.Addr
+	// MinTTL is the smallest TTL seen along the chain and its terminal records.
+	MinTTL uint32
+}
+
 func validateEnvelope(req *mdns.Msg, resp *mdns.Msg) (mdns.Question, bool) {
 	if req == nil || resp == nil || len(req.Question) == 0 {
 		return mdns.Question{}, false
@@ -100,6 +126,80 @@ func findTerminalARecords(resp *mdns.Msg, terminalName string, currentMinTTL uin
 	return records, minTTL
 }
 
+// ClassifyAnswer applies the observation path's envelope validation, CNAME
+// traversal and terminal-address filter to one query/answer pair.
+//
+// maxTTL supplies the TTL ceiling used when the answer itself carries none; it
+// affects MinTTL only, never validity.
+//
+// The classification is read-only: it allocates its own slices and never touches
+// a session cache, so a caller can use it for a diagnostic without publishing
+// evidence. Names that do not normalize invalidate the answer, exactly as the
+// observation path does, because it discards such an answer instead of recording
+// evidence from part of it.
+func ClassifyAnswer(req *mdns.Msg, resp *mdns.Msg, maxTTL time.Duration) AnswerClassification {
+	q, ok := validateEnvelope(req, resp)
+	if !ok {
+		return AnswerClassification{Reason: "invalid DNS answer envelope"}
+	}
+
+	initialTTL := uint32(maxTTL.Seconds())
+	if initialTTL == 0 {
+		initialTTL = 3600
+	}
+
+	traversedNames, terminalName, minTTL, ok := traverseCNAME(resp, q.Name, initialTTL)
+	if !ok {
+		return AnswerClassification{Reason: "CNAME chain rejected (cycle, ambiguity or hop limit)"}
+	}
+
+	terminalARecords, minTTL := findTerminalARecords(resp, terminalName, minTTL)
+	if len(terminalARecords) == 0 {
+		// A valid answer without a terminal A record: the observation path records
+		// nothing, and the name simply has no usable address.
+		return AnswerClassification{Valid: true, Terminal: terminalName, MinTTL: minTTL}
+	}
+
+	names := make([]string, 0, len(traversedNames))
+	for _, name := range traversedNames {
+		canon, err := policy.NormalizeDomain(name)
+		if err != nil {
+			return AnswerClassification{Reason: "a traversed name does not normalize"}
+		}
+		names = append(names, canon)
+	}
+
+	return AnswerClassification{
+		Valid:     true,
+		Names:     names,
+		Terminal:  terminalName,
+		Addresses: evidenceAddresses(terminalARecords),
+		MinTTL:    minTTL,
+	}
+}
+
+// evidenceAddresses filters terminal records exactly as the observation path
+// does: native IPv4 that passes the SSRF/public-address policy, deduplicated.
+func evidenceAddresses(records []*mdns.A) []netip.Addr {
+	out := make([]netip.Addr, 0, len(records))
+	seen := make(map[netip.Addr]struct{}, len(records))
+	for _, aRec := range records {
+		ip, ok := netip.AddrFromSlice(aRec.A)
+		if !ok || !ip.IsValid() || !ip.Is4() {
+			continue
+		}
+		if err := policy.ValidateFetchIP(ip); err != nil {
+			continue
+		}
+		if _, dup := seen[ip]; dup {
+			continue
+		}
+		seen[ip] = struct{}{}
+		out = append(out, ip)
+	}
+	return out
+}
+
 func evaluateDomainRules(traversedNames []string, snapshot *policy.Snapshot) (bool, bool) {
 	requiresProxy := false
 	for _, name := range traversedNames {
@@ -115,7 +215,7 @@ func evaluateDomainRules(traversedNames []string, snapshot *policy.Snapshot) (bo
 }
 
 func buildObservations(
-	records []*mdns.A,
+	addresses []netip.Addr,
 	requiresProxy bool,
 	snapshot *policy.Snapshot,
 	minTTL uint32,
@@ -129,15 +229,7 @@ func buildObservations(
 	expiresAt := recvTime.Add(effectiveTTL)
 
 	var observations []policy.Observation
-	for _, aRec := range records {
-		ip, ok := netip.AddrFromSlice(aRec.A)
-		if !ok || !ip.IsValid() || !ip.Is4() {
-			continue
-		}
-		if err := policy.ValidateFetchIP(ip); err != nil {
-			continue
-		}
-
+	for _, ip := range addresses {
 		decision := policy.Direct
 		if requiresProxy || snapshot.MatchIPv4(ip) {
 			decision = policy.Proxy
@@ -168,32 +260,17 @@ func ObserveResponse(
 		return nil, nil
 	}
 
-	q, ok := validateEnvelope(req, resp)
+	answer := ClassifyAnswer(req, resp, maxTTL)
+	if !answer.Valid || len(answer.Addresses) == 0 {
+		return nil, nil
+	}
+
+	requiresProxy, ok := evaluateDomainRules(answer.Names, snapshot)
 	if !ok {
 		return nil, nil
 	}
 
-	initialTTL := uint32(maxTTL.Seconds())
-	if initialTTL == 0 {
-		initialTTL = 3600
-	}
-
-	traversedNames, terminalName, minTTL, ok := traverseCNAME(resp, q.Name, initialTTL)
-	if !ok {
-		return nil, nil
-	}
-
-	terminalARecords, minTTL := findTerminalARecords(resp, terminalName, minTTL)
-	if len(terminalARecords) == 0 {
-		return nil, nil
-	}
-
-	requiresProxy, ok := evaluateDomainRules(traversedNames, snapshot)
-	if !ok {
-		return nil, nil
-	}
-
-	observations := buildObservations(terminalARecords, requiresProxy, snapshot, minTTL, maxTTL, recvTime)
+	observations := buildObservations(answer.Addresses, requiresProxy, snapshot, answer.MinTTL, maxTTL, recvTime)
 	if len(observations) == 0 {
 		return nil, nil
 	}

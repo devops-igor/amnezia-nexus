@@ -895,5 +895,7 @@
   "policy_explain_reason_no_trusted_evidence": "شاهد DNS قابل اعتمادی برای این نشست نیست، بنابراین پروکسی استفاده می‌شود",
   "policy_explain_reason_no_usable_address": "نام به هیچ نشانی IPv4 قابل استفاده‌ای تبدیل نشد",
   "policy_explain_reason_name_unresolved": "این نام قابل تشخیص نبود",
-  "policy_explain_reason_cached_proxy_evidence": "حافظه مسیر این نشست از قبل برای این نشانی تصمیم پروکسی دارد"
+  "policy_explain_reason_cached_proxy_evidence": "حافظه مسیر این نشست از قبل برای این نشانی تصمیم پروکسی دارد",
+  "policy_explain_prospective_rule": "آینده‌نگر: قاعده {rule} مطابقت دارد ({shape})، منبع: {source} — پس از دریافت پاسخ DNS خود کارخواه اعمال می‌شود",
+  "policy_explain_current_prefix": "محدوده نشانی مطابق: {prefix}، منبع: {source}"
 }

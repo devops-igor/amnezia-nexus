@@ -895,5 +895,7 @@
   "policy_explain_reason_no_trusted_evidence": "aucune preuve DNS fiable pour cette session, le proxy est utilisé",
   "policy_explain_reason_no_usable_address": "le nom n'a donné aucune adresse IPv4 utilisable",
   "policy_explain_reason_name_unresolved": "le nom n'a pas pu être résolu",
-  "policy_explain_reason_cached_proxy_evidence": "le cache de routes de la session contient déjà une décision « proxy » pour cette adresse"
+  "policy_explain_reason_cached_proxy_evidence": "le cache de routes de la session contient déjà une décision « proxy » pour cette adresse",
+  "policy_explain_prospective_rule": "prospectif : la règle {rule} correspond ({shape}), source : {source} — s'applique après la réponse DNS propre au client",
+  "policy_explain_current_prefix": "plage d'adresses correspondante : {prefix}, source : {source}"
 }

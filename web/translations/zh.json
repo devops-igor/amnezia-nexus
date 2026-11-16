@@ -895,5 +895,7 @@
   "policy_explain_reason_no_trusted_evidence": "此会话没有可信的 DNS 证据，因此使用代理",
   "policy_explain_reason_no_usable_address": "该域名没有解析出可用的 IPv4 地址",
   "policy_explain_reason_name_unresolved": "该域名无法解析",
-  "policy_explain_reason_cached_proxy_evidence": "此会话的路由缓存已为该地址记录了走代理的决定"
+  "policy_explain_reason_cached_proxy_evidence": "此会话的路由缓存已为该地址记录了走代理的决定",
+  "policy_explain_prospective_rule": "预期：规则 {rule} 匹配（{shape}），来源：{source} —— 在收到该客户端自己的 DNS 应答后才生效",
+  "policy_explain_current_prefix": "匹配的地址范围：{prefix}，来源：{source}"
 }
