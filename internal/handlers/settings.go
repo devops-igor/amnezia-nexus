@@ -247,10 +247,6 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 
 	userMaps := make([]map[string]any, len(users))
 	for i, u := range users {
-		shareToken := u.ShareToken
-		if sess := h.GetSession(r); sess != nil && sess.Role == models.RoleSupport && u.ID != sess.UserID {
-			shareToken = nil
-		}
 		userMaps[i] = map[string]any{
 			"id":                     u.ID,
 			"username":               u.Username,
@@ -268,7 +264,6 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 			"monthly_tx":             u.MonthlyTx,
 			"traffic_reset_strategy": u.TrafficResetStrategy,
 			"share_enabled":          u.ShareEnabled,
-			"share_token":            shareToken,
 			"created_at":             u.CreatedAt,
 			"awg_mimicry":            u.AWGMimicry,
 		}
@@ -299,21 +294,13 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 
 	settingsMap, _ := h.db.GetAllSettings(ctx)
 	if settingsMap != nil {
-		// Scrub provider credentials and bearer API keys from backup to prevent disclosure
-		if gMap, ok := settingsMap["gigahost"].(map[string]any); ok {
-			cleanGigahost := make(map[string]any)
-			for k, v := range gMap {
-				if k != "api_key" {
-					cleanGigahost[k] = v
-				}
-			}
-			if len(cleanGigahost) == 0 {
-				delete(settingsMap, "gigahost")
-			} else {
-				settingsMap["gigahost"] = cleanGigahost
-			}
+		// GetAllSettings returns decrypted credentials (ssl.key_text, provider and
+		// bot tokens). The export is a credential-free metadata artifact (#343),
+		// so every credential-bearing field is removed rather than masked, and the
+		// marker below is then a true statement.
+		if redacted, ok := redactBackupSettings(settingsMap).(map[string]any); ok {
+			settingsMap = redacted
 		}
-		delete(settingsMap, "gigahost.api_key")
 	}
 
 	// Export SSH host-key fingerprints (TOFU) and leaderboard snapshots for parity
@@ -349,6 +336,7 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	backup := models.BackupData{
+		FormatVersion:         BackupFormatVersion,
 		Servers:               serverMaps,
 		Users:                 userMaps,
 		UserConnections:       connMaps,
@@ -358,8 +346,11 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 		Settings:              settingsMap,
 	}
 
-	// Marker matching the Python reference: credentials are intentionally excluded.
+	// A credential-free export (#343): panel secrets are absent, so this marker
+	// is now a true statement. Connection identifiers are still exported because
+	// they are connection identity, not portal credentials.
 	w.Header().Set("X-Backup-Credentials-Excluded", "true")
+	w.Header().Set("X-Backup-Format-Version", strconv.Itoa(BackupFormatVersion))
 
 	backupBytes, err := json.MarshalIndent(backup, "", "  ")
 	if err != nil {
@@ -407,6 +398,11 @@ func (h *Handlers) RestoreBackupHandler(w http.ResponseWriter, r *http.Request) 
 	var backup models.BackupData
 	if err := json.Unmarshal(bodyBytes, &backup); err != nil {
 		h.JSONError(w, http.StatusBadRequest, "invalid_json", "Invalid JSON format")
+		return
+	}
+	if backup.FormatVersion > BackupFormatVersion {
+		h.JSONError(w, http.StatusBadRequest, "unsupported_backup_format",
+			"Backup format is newer than this panel supports")
 		return
 	}
 
@@ -461,11 +457,28 @@ func (h *Handlers) restoreBackupSettings(ctx context.Context, settings map[strin
 		if !allowedSettingsKeys[k] {
 			continue
 		}
-		if err := h.db.SetSetting(ctx, k, v); err == nil {
+		if err := h.db.SetSetting(ctx, k, h.mergeBackupSettingSecrets(ctx, k, v)); err == nil {
 			restored++
 		}
 	}
 	return restored
+}
+
+// mergeBackupSettingSecrets overlays an incoming settings map on the live value,
+// preserving every credential the backup omitted or blanked.
+//
+// A credential-free export (#343) carries no ssl.key_text or bot token. Without
+// this, restoring it would overwrite the stored TLS key with a map that has
+// none, turning a metadata restore into an outage.
+func (h *Handlers) mergeBackupSettingSecrets(ctx context.Context, key string, incoming any) any {
+	if _, ok := incoming.(map[string]any); !ok {
+		return incoming
+	}
+	var existing any
+	if err := h.db.GetSetting(ctx, key, &existing); err != nil {
+		return incoming
+	}
+	return mergePreservingSecrets(incoming, existing)
 }
 
 func (h *Handlers) restoreBackupServers(ctx context.Context, servers []map[string]any) (int, map[int64]int64) {
@@ -612,6 +625,11 @@ func (h *Handlers) userFromBackupMap(uMap map[string]any) *models.User {
 	}
 	if shareToken := strVal(uMap["share_token"]); shareToken != "" {
 		u.ShareToken = &shareToken
+	} else if u.ShareEnabled {
+		// A credential-free export carries no share token. Restoring it must not
+		// leave a half-enabled share whose old link still resolves, so the share
+		// is written disabled and the owner re-enables it deliberately.
+		u.ShareEnabled = false
 	}
 	if created := strVal(uMap["created_at"]); created != "" {
 		if t, err := time.Parse(time.RFC3339, created); err == nil {
