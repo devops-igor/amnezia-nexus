@@ -1,6 +1,8 @@
 package policy
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -37,8 +39,15 @@ func TestUpstreamValidateRejections(t *testing.T) {
 		{"hostname label too long", Upstream{Address: strings.Repeat("a", 64) + ".example.com", Port: 53}, "longer than"},
 		{"hostname too long", Upstream{Address: strings.Repeat("abcdefgh.", 32) + "com", Port: 53}, "longer than"},
 		{"unknown transport", Upstream{Address: "94.140.14.14", Port: 53, Transport: "tls"}, "unknown transport"},
-		{"dot not implemented", Upstream{Address: "94.140.14.14", Port: 853, Transport: TransportDoT}, "not supported"},
-		{"doh not implemented", Upstream{Address: "dns.example.com", Port: 443, Transport: TransportDoH}, "not supported"},
+		{"doh not supported", Upstream{Address: "dns.example.com", Port: 443, Transport: TransportDoH}, "not supported in this build"},
+		{"doh without port", Upstream{Address: "dns.example.com", Transport: TransportDoH}, "not supported in this build"},
+		{"dot negative port", Upstream{Address: "94.140.14.14", Port: -1, Transport: TransportDoT}, "outside the valid range"},
+		{"dot port above range", Upstream{Address: "94.140.14.14", Port: 65536, Transport: TransportDoT}, "outside the valid range"},
+		{"dot loopback", Upstream{Address: "127.0.0.1", Transport: TransportDoT}, "loopback"},
+		{"dot multicast", Upstream{Address: "224.0.0.1", Port: 853, Transport: TransportDoT}, "multicast"},
+		{"pin on plain transport", Upstream{Address: "94.140.14.14", Port: 53, SPKIPin: testSPKIPin()}, "only honored by DNS over TLS"},
+		{"pin not base64", Upstream{Address: "94.140.14.14", Transport: TransportDoT, SPKIPin: "not base64!"}, "not valid standard base64"},
+		{"pin too short", Upstream{Address: "94.140.14.14", Transport: TransportDoT, SPKIPin: "c2hvcnQ="}, "want a 32-byte SHA-256 digest"},
 	}
 
 	for _, tc := range tests {
@@ -63,11 +72,94 @@ func TestUpstreamValidateAccepts(t *testing.T) {
 		{Address: "dns.example.com.", Port: 53},
 		{Address: "DNS.Example.COM", Port: 5353},
 		{Address: "resolver.internal", Port: 53},
+		// DoT entries: explicit port, transport default port, hostname and IP
+		// literal, with and without a pin.
+		{Address: "94.140.14.14", Port: 853, Transport: TransportDoT},
+		{Address: "dns.example.com", Transport: TransportDoT},
+		{Address: "dns.example.com.", Transport: TransportDoT, SPKIPin: testSPKIPin()},
+		{Address: "2001:4860:4860::8888", Transport: TransportDoT},
+		{Address: "dns.example.com", Port: 8853, Transport: TransportDoT},
 	}
 	for _, upstream := range upstreams {
 		if err := upstream.Validate(); err != nil {
 			t.Fatalf("Validate(%+v) = %v, want nil", upstream, err)
 		}
+	}
+}
+
+// testSPKIPin is a syntactically valid pin: standard base64 of a 32-byte
+// SHA-256 digest. Validation checks only the encoding and length, so the value
+// itself is irrelevant here.
+func testSPKIPin() string {
+	digest := sha256.Sum256([]byte("upstream-pin-fixture"))
+	return base64.StdEncoding.EncodeToString(digest[:])
+}
+
+// TestUpstreamDoTDefaultPort covers the one port default the contract allows:
+// 853 when a DoT entry states no port, applied before the record is written,
+// while plain DNS still requires an explicit one.
+func TestUpstreamDoTDefaultPort(t *testing.T) {
+	entry := Upstream{Address: "dns.example.com", Transport: TransportDoT}
+	if err := entry.Validate(); err != nil {
+		t.Fatalf("Validate(DoT without port) = %v, want nil", err)
+	}
+	if got := entry.EffectivePort(); got != DefaultDoTPort {
+		t.Fatalf("EffectivePort() = %d, want %d", got, DefaultDoTPort)
+	}
+	if got := entry.HostPort(); got != "dns.example.com:853" {
+		t.Fatalf("HostPort() = %q, want %q", got, "dns.example.com:853")
+	}
+	if got := entry.String(); got != "dot://dns.example.com:853" {
+		t.Fatalf("String() = %q, want %q", got, "dot://dns.example.com:853")
+	}
+
+	// The persisted record states the port it dials.
+	normalized := Settings{UpstreamDNS: []Upstream{entry}}.Normalize()
+	if got := normalized.UpstreamDNS[0].Port; got != DefaultDoTPort {
+		t.Fatalf("Normalize() port = %d, want the DoT default %d", got, DefaultDoTPort)
+	}
+
+	// An explicit port is honored, and plain DNS still has no port default.
+	if got := (Upstream{Address: "dns.example.com", Port: 8853, Transport: TransportDoT}).HostPort(); got != "dns.example.com:8853" {
+		t.Fatalf("explicit DoT HostPort() = %q, want %q", got, "dns.example.com:8853")
+	}
+	if err := (Upstream{Address: "dns.example.com"}).Validate(); err == nil || !strings.Contains(err.Error(), "explicit port") {
+		t.Fatalf("Validate(plain without port) = %v, want an explicit-port error", err)
+	}
+}
+
+// TestUpstreamSPKIPin covers the pin's persisted shape and its decoding, which
+// the resolver relies on to verify the leaf key.
+func TestUpstreamSPKIPin(t *testing.T) {
+	pin := testSPKIPin()
+	entry := Upstream{Address: "94.140.14.14", Transport: TransportDoT, SPKIPin: pin}
+	digest, err := entry.SPKIPinDigest()
+	if err != nil {
+		t.Fatalf("SPKIPinDigest() = %v, want nil", err)
+	}
+	if len(digest) != sha256.Size {
+		t.Fatalf("SPKIPinDigest() length = %d, want %d", len(digest), sha256.Size)
+	}
+
+	// The pin survives the persisted representation.
+	raw, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"spki_pin"`) {
+		t.Fatalf("marshalled entry %s has no spki_pin field", raw)
+	}
+	var reloaded Upstream
+	if err := json.Unmarshal(raw, &reloaded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if reloaded != entry {
+		t.Fatalf("reloaded entry = %+v, want %+v", reloaded, entry)
+	}
+
+	// No pin stays no pin, so a slice-1 record needs no migration.
+	if got, err := (Upstream{Address: "94.140.14.14", Transport: TransportDoT}).SPKIPinDigest(); err != nil || got != nil {
+		t.Fatalf("SPKIPinDigest() without a pin = (%v, %v), want (nil, nil)", got, err)
 	}
 }
 
@@ -122,6 +214,14 @@ func TestSettingsEffectiveUpstreams(t *testing.T) {
 	got[0].Address = "203.0.113.1"
 	if settings.UpstreamDNS[0].Address != "9.9.9.9" {
 		t.Fatalf("EffectiveUpstreams() aliased the stored record: %+v", settings.UpstreamDNS)
+	}
+
+	// A DoT entry that states no port reaches the consumer with its effective
+	// port, so nothing downstream has to invent the transport default.
+	withDot := Settings{UpstreamDNS: []Upstream{{Address: "dns.example.com", Transport: TransportDoT}}}
+	effective := withDot.EffectiveUpstreams()
+	if len(effective) != 1 || effective[0].Port != DefaultDoTPort {
+		t.Fatalf("EffectiveUpstreams() for a DoT entry = %v, want port %d", effective, DefaultDoTPort)
 	}
 }
 
@@ -182,6 +282,49 @@ func TestSettingsValidateUpstreamList(t *testing.T) {
 		}
 		if err := s.Validate(); err != nil {
 			t.Fatalf("Validate() = %v, want nil", err)
+		}
+	})
+
+	t.Run("three dot entries accepted including a pin", func(t *testing.T) {
+		s := validSettingsBase()
+		s.UpstreamDNS = []Upstream{
+			{Address: "94.140.14.14", Port: 853, Transport: TransportDoT},
+			{Address: "dns.example.com", Transport: TransportDoT, SPKIPin: testSPKIPin()},
+			{Address: "2001:4860:4860::8888", Port: 853, Transport: TransportDoT},
+		}
+		if err := s.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil", err)
+		}
+	})
+
+	t.Run("mixed transports accepted and one alternate survives", func(t *testing.T) {
+		s := validSettingsBase()
+		s.UpstreamDNS = []Upstream{
+			{Address: "94.140.14.14", Transport: TransportDoT},
+			{Address: "94.140.15.15", Port: 53},
+		}
+		if err := s.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil", err)
+		}
+	})
+
+	t.Run("same address on plain and dot is not a duplicate", func(t *testing.T) {
+		s := validSettingsBase()
+		s.UpstreamDNS = []Upstream{
+			{Address: "94.140.14.14", Port: 53},
+			{Address: "94.140.14.14", Port: 853, Transport: TransportDoT},
+		}
+		if err := s.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil", err)
+		}
+	})
+
+	t.Run("doh entry rejected with a specific error", func(t *testing.T) {
+		s := validSettingsBase()
+		s.UpstreamDNS = []Upstream{{Address: "dns.example.com", Port: 443, Transport: TransportDoH}}
+		err := s.Validate()
+		if err == nil || !strings.Contains(err.Error(), "not supported in this build") {
+			t.Fatalf("Validate() = %v, want a not-supported error for doh", err)
 		}
 	})
 
