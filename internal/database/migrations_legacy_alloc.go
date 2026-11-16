@@ -11,6 +11,13 @@ import (
 	"time"
 )
 
+// legacyDupGroup is one (server_id, client_id) pair with more than one active
+// allocation.
+type legacyDupGroup struct {
+	serverID int64
+	clientID string
+}
+
 type legacyActiveAllocRow struct {
 	id int64
 	ip string
@@ -43,6 +50,10 @@ const (
 
 	awgAllocActiveGroupSQL = "SELECT id, ip FROM awg_ip_allocations WHERE server_id = ? AND client_id = ? AND status = 'allocated' ORDER BY id ASC"
 
+	awgUserConnectionsProbeSQL = "SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_connections'"
+
+	awgUserConnectionsParamsSQL = "SELECT client_params FROM user_connections WHERE server_id = ? AND (client_id = ? OR id = ?)"
+
 	awgAllocSupersedeSQL = "UPDATE awg_ip_allocations SET status = 'superseded', updated_at = ? WHERE id = ?"
 
 	awgAllocUniqueIndexSQL = "CREATE UNIQUE INDEX IF NOT EXISTS uq_awg_ip_allocations_server_client_active ON awg_ip_allocations(server_id, client_id) WHERE status = 'allocated'"
@@ -65,19 +76,14 @@ func (d *DB) reconcileLegacyDuplicateActiveAllocationsLocked(ctx context.Context
 	}
 
 	// b) For divergent active allocations (same server_id, client_id, but different IPs)
-	type dupGroup struct {
-		serverID int64
-		clientID string
-	}
-
 	groupRows, err := d.sqlDB.QueryContext(ctx, awgAllocDivergentGroupsSQL)
 	if err != nil {
 		return schemaInitStep{"failed to query divergent active allocation groups", awgAllocDivergentGroupsSQL}.wrap(err)
 	}
 
-	var groups []dupGroup
+	var groups []legacyDupGroup
 	for groupRows.Next() {
-		var g dupGroup
+		var g legacyDupGroup
 		if err := groupRows.Scan(&g.serverID, &g.clientID); err != nil {
 			_ = groupRows.Close()
 			return fmt.Errorf("failed to scan divergent allocation group: %w", err)
@@ -91,39 +97,15 @@ func (d *DB) reconcileLegacyDuplicateActiveAllocationsLocked(ctx context.Context
 	_ = groupRows.Close()
 
 	if len(groups) > 0 {
-		var ucExists int
-		err = d.sqlDB.QueryRowContext(ctx, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_connections'").Scan(&ucExists)
-		hasUserConnections := (err == nil)
+		hasUserConnections, err := d.userConnectionsTableExistsLocked(ctx)
+		if err != nil {
+			return err
+		}
 
 		now := time.Now().UTC().Format(time.RFC3339)
 		for _, g := range groups {
-			allocs, err := d.fetchActiveAllocationsForGroupLocked(ctx, g.serverID, g.clientID)
-			if err != nil {
+			if err := d.supersedeDivergentAllocationsLocked(ctx, g, hasUserConnections, now); err != nil {
 				return err
-			}
-			if len(allocs) <= 1 {
-				continue
-			}
-
-			var retainID int64 = -1
-			if hasUserConnections {
-				retainID = d.findMatchingAllocIDFromUserConnectionsLocked(ctx, g.serverID, g.clientID, allocs)
-			}
-			if retainID == -1 {
-				retainID = allocs[0].id
-			}
-
-			for _, a := range allocs {
-				if a.id == retainID {
-					continue
-				}
-				_, err = d.sqlDB.ExecContext(ctx, awgAllocSupersedeSQL, now, a.id)
-				if err != nil {
-					return schemaInitStep{
-						fmt.Sprintf("failed to mark divergent allocation %d as superseded", a.id),
-						awgAllocSupersedeSQL,
-					}.wrap(err)
-				}
 			}
 		}
 	}
@@ -134,6 +116,45 @@ func (d *DB) reconcileLegacyDuplicateActiveAllocationsLocked(ctx context.Context
 		return schemaInitStep{"failed to create uq_awg_ip_allocations_server_client_active index", awgAllocUniqueIndexSQL}.wrap(err)
 	}
 
+	return nil
+}
+
+// supersedeDivergentAllocationsLocked retains one active allocation of the group
+// and marks the others superseded. Documented fallback: with no connection
+// record naming one of the allocations (no table, or no matching row), the
+// earliest allocation is retained. A failed read is not that answer and is
+// returned before anything is superseded.
+func (d *DB) supersedeDivergentAllocationsLocked(ctx context.Context, g legacyDupGroup, hasUserConnections bool, now string) error {
+	allocs, err := d.fetchActiveAllocationsForGroupLocked(ctx, g.serverID, g.clientID)
+	if err != nil {
+		return err
+	}
+	if len(allocs) <= 1 {
+		return nil
+	}
+
+	retainID := allocs[0].id
+	if hasUserConnections {
+		matchID, found, err := d.findMatchingAllocIDFromUserConnectionsLocked(ctx, g.serverID, g.clientID, allocs)
+		if err != nil {
+			return err
+		}
+		if found {
+			retainID = matchID
+		}
+	}
+
+	for _, a := range allocs {
+		if a.id == retainID {
+			continue
+		}
+		if _, err := d.sqlDB.ExecContext(ctx, awgAllocSupersedeSQL, now, a.id); err != nil {
+			return schemaInitStep{
+				fmt.Sprintf("failed to mark divergent allocation %d as superseded", a.id),
+				awgAllocSupersedeSQL,
+			}.wrap(err)
+		}
+	}
 	return nil
 }
 
@@ -158,43 +179,83 @@ func (d *DB) fetchActiveAllocationsForGroupLocked(ctx context.Context, serverID 
 	return allocs, rows.Err()
 }
 
-func (d *DB) findMatchingAllocIDFromUserConnectionsLocked(ctx context.Context, serverID int64, clientID string, allocs []legacyActiveAllocRow) int64 {
-	rows, err := d.sqlDB.QueryContext(ctx,
-		"SELECT client_params FROM user_connections WHERE server_id = ? AND (client_id = ? OR id = ?)",
-		serverID, clientID, clientID,
-	)
+// userConnectionsTableExistsLocked reports whether user_connections exists.
+// Only an affirmative "no such table" answer (no row from sqlite_master) is
+// absence; a failed probe is an error and is returned, because treating it as
+// absence would skip the connection records and select the fallback allocation.
+func (d *DB) userConnectionsTableExistsLocked(ctx context.Context) (bool, error) {
+	var one int
+	err := d.sqlDB.QueryRowContext(ctx, awgUserConnectionsProbeSQL).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
-		return -1
+		return false, schemaInitStep{"failed to check if user_connections table exists", awgUserConnectionsProbeSQL}.wrap(err)
+	}
+	return true, nil
+}
+
+// findMatchingAllocIDFromUserConnectionsLocked looks for the active allocation
+// that a connection record of this (server, client) pair names. The three
+// outcomes are distinct: a read failure returns a non-nil error; a completed
+// read that names no allocation returns found == false; a match returns its id
+// with found == true. Callers apply the documented fallback only for found ==
+// false, so a failed read can never select an allocation by accident.
+//
+// A row whose client_params is NULL, empty or not a JSON object was read
+// successfully and carries no usable evidence, so it is skipped.
+func (d *DB) findMatchingAllocIDFromUserConnectionsLocked(ctx context.Context, serverID int64, clientID string, allocs []legacyActiveAllocRow) (id int64, found bool, err error) {
+	step := schemaInitStep{
+		fmt.Sprintf("failed to read connection records for group (%d, %s)", serverID, clientID),
+		awgUserConnectionsParamsSQL,
+	}
+	rows, err := d.sqlDB.QueryContext(ctx, awgUserConnectionsParamsSQL, serverID, clientID, clientID)
+	if err != nil {
+		return 0, false, step.wrap(err)
 	}
 	defer rows.Close()
 
 	var candidateIPs []string
 	for rows.Next() {
 		var raw sql.NullString
-		if err := rows.Scan(&raw); err != nil || !raw.Valid || strings.TrimSpace(raw.String) == "" {
-			continue
+		if err := rows.Scan(&raw); err != nil {
+			return 0, false, step.wrap(err)
 		}
-		var params map[string]any
-		if err := json.Unmarshal([]byte(raw.String), &params); err != nil {
-			continue
-		}
-		if ip := extractIPFromClientParams(params["assigned_ip"]); ip != "" {
-			candidateIPs = append(candidateIPs, ip)
-		}
-		if ip := extractIPFromClientParams(params["Address"]); ip != "" {
-			candidateIPs = append(candidateIPs, ip)
-		}
+		candidateIPs = append(candidateIPs, candidateIPsFromClientParams(raw)...)
+	}
+	// rows.Err distinguishes a result set that ended from one that was cut
+	// short; only the former may be treated as the complete evidence.
+	if err := rows.Err(); err != nil {
+		return 0, false, step.wrap(err)
 	}
 
 	for _, cand := range candidateIPs {
 		for _, a := range allocs {
 			if matchAllocationIP(a.ip, cand) {
-				return a.id
+				return a.id, true, nil
 			}
 		}
 	}
+	return 0, false, nil
+}
 
-	return -1
+// candidateIPsFromClientParams extracts the addresses a connection record
+// claims. Unusable content yields none; it is not a read failure.
+func candidateIPsFromClientParams(raw sql.NullString) []string {
+	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return nil
+	}
+	var params map[string]any
+	if err := json.Unmarshal([]byte(raw.String), &params); err != nil {
+		return nil
+	}
+	var ips []string
+	for _, key := range []string{"assigned_ip", "Address"} {
+		if ip := extractIPFromClientParams(params[key]); ip != "" {
+			ips = append(ips, ip)
+		}
+	}
+	return ips
 }
 
 func extractIPFromClientParams(val any) string {
