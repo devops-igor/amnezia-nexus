@@ -39,13 +39,24 @@ func TestUpstreamValidateRejections(t *testing.T) {
 		{"hostname label too long", Upstream{Address: strings.Repeat("a", 64) + ".example.com", Port: 53}, "longer than"},
 		{"hostname too long", Upstream{Address: strings.Repeat("abcdefgh.", 32) + "com", Port: 53}, "longer than"},
 		{"unknown transport", Upstream{Address: "94.140.14.14", Port: 53, Transport: "tls"}, "unknown transport"},
-		{"doh not supported", Upstream{Address: "dns.example.com", Port: 443, Transport: TransportDoH}, "not supported in this build"},
-		{"doh without port", Upstream{Address: "dns.example.com", Transport: TransportDoH}, "not supported in this build"},
+		{"doh url with scheme", Upstream{Address: "https://dns.example.com", Port: 443, Transport: TransportDoH}, "not a bare host"},
+		{"doh url with path", Upstream{Address: "dns.example.com/dns-query", Port: 443, Transport: TransportDoH}, "not a bare host"},
+		{"doh url with query", Upstream{Address: "dns.example.com?dns=x", Transport: TransportDoH}, "not a bare host"},
+		{"doh url with userinfo", Upstream{Address: "user@dns.example.com", Transport: TransportDoH}, "not a bare host"},
+		{"doh plaintext url", Upstream{Address: "http://dns.example.com", Port: 80, Transport: TransportDoH}, "not a bare host"},
+		{"doh negative port", Upstream{Address: "dns.example.com", Port: -1, Transport: TransportDoH}, "outside the valid range"},
+		{"doh port above range", Upstream{Address: "dns.example.com", Port: 65536, Transport: TransportDoH}, "outside the valid range"},
+		{"doh loopback", Upstream{Address: "127.0.0.1", Transport: TransportDoH}, "loopback"},
+		{"doh loopback hostname", Upstream{Address: "localhost", Transport: TransportDoH}, "loopback"},
+		{"doh multicast", Upstream{Address: "224.0.0.1", Transport: TransportDoH}, "multicast"},
+		{"doh unspecified", Upstream{Address: "0.0.0.0", Transport: TransportDoH}, "unspecified"},
+		{"doh malformed pin", Upstream{Address: "dns.example.com", Transport: TransportDoH, SPKIPin: "not base64!"}, "not valid standard base64"},
+		{"doh short pin", Upstream{Address: "dns.example.com", Transport: TransportDoH, SPKIPin: "c2hvcnQ="}, "want a 32-byte SHA-256 digest"},
 		{"dot negative port", Upstream{Address: "94.140.14.14", Port: -1, Transport: TransportDoT}, "outside the valid range"},
 		{"dot port above range", Upstream{Address: "94.140.14.14", Port: 65536, Transport: TransportDoT}, "outside the valid range"},
 		{"dot loopback", Upstream{Address: "127.0.0.1", Transport: TransportDoT}, "loopback"},
 		{"dot multicast", Upstream{Address: "224.0.0.1", Port: 853, Transport: TransportDoT}, "multicast"},
-		{"pin on plain transport", Upstream{Address: "94.140.14.14", Port: 53, SPKIPin: testSPKIPin()}, "only honored by DNS over TLS"},
+		{"pin on plain transport", Upstream{Address: "94.140.14.14", Port: 53, SPKIPin: testSPKIPin()}, "only honored by the encrypted transports"},
 		{"pin not base64", Upstream{Address: "94.140.14.14", Transport: TransportDoT, SPKIPin: "not base64!"}, "not valid standard base64"},
 		{"pin too short", Upstream{Address: "94.140.14.14", Transport: TransportDoT, SPKIPin: "c2hvcnQ="}, "want a 32-byte SHA-256 digest"},
 	}
@@ -319,12 +330,34 @@ func TestSettingsValidateUpstreamList(t *testing.T) {
 		}
 	})
 
-	t.Run("doh entry rejected with a specific error", func(t *testing.T) {
+	t.Run("doh entry is accepted next to the other transports", func(t *testing.T) {
 		s := validSettingsBase()
-		s.UpstreamDNS = []Upstream{{Address: "dns.example.com", Port: 443, Transport: TransportDoH}}
+		s.UpstreamDNS = []Upstream{
+			{Address: "dns.adguard-dns.com", Port: 443, Transport: TransportDoH},
+			{Address: "dns.adguard-dns.com", Port: 853, Transport: TransportDoT},
+			{Address: "94.140.14.14", Port: 53},
+		}
+		if err := s.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil", err)
+		}
+	})
+
+	t.Run("doh accepts hostname, trailing dot, ipv4 and ipv6 literals", func(t *testing.T) {
+		for _, address := range []string{"dns.example.com", "dns.example.com.", "94.140.14.14", "2a10:50c0::ad1:ff"} {
+			s := validSettingsBase()
+			s.UpstreamDNS = []Upstream{{Address: address, Transport: TransportDoH}}
+			if err := s.Validate(); err != nil {
+				t.Fatalf("Validate(doh %q) = %v, want nil", address, err)
+			}
+		}
+	})
+
+	t.Run("doh url in the address is refused and names the fix", func(t *testing.T) {
+		s := validSettingsBase()
+		s.UpstreamDNS = []Upstream{{Address: "https://dns.example.com/dns-query", Transport: TransportDoH}}
 		err := s.Validate()
-		if err == nil || !strings.Contains(err.Error(), "not supported in this build") {
-			t.Fatalf("Validate() = %v, want a not-supported error for doh", err)
+		if err == nil || !strings.Contains(err.Error(), "not a bare host") || !strings.Contains(err.Error(), "entry 1 rejected") {
+			t.Fatalf("Validate() = %v, want a specific bare-host error for entry 1", err)
 		}
 	})
 
@@ -397,5 +430,28 @@ func TestLegacySettingsRecordKeepsEffectiveDefault(t *testing.T) {
 		if effective[i] != defaults[i] {
 			t.Fatalf("legacy record effective upstream %d = %+v, want %+v", i, effective[i], defaults[i])
 		}
+	}
+}
+
+// TestUpstreamDoHDefaultPort covers the DoH port default and the pin contract:
+// 443 when a DoH entry states no port, applied before the record is written, an
+// explicit port honored, and a pin accepted because DoH verifies the leaf key.
+func TestUpstreamDoHDefaultPort(t *testing.T) {
+	entry := Upstream{Address: "dns.example.com", Transport: TransportDoH, SPKIPin: testSPKIPin()}
+	if err := entry.Validate(); err != nil {
+		t.Fatalf("Validate(DoH without port, with pin) = %v, want nil", err)
+	}
+	if got := entry.EffectivePort(); got != DefaultDoHPort {
+		t.Fatalf("EffectivePort() = %d, want %d", got, DefaultDoHPort)
+	}
+	if got := entry.String(); got != "doh://dns.example.com:443" {
+		t.Fatalf("String() = %q, want %q", got, "doh://dns.example.com:443")
+	}
+	normalized := Settings{UpstreamDNS: []Upstream{entry}}.Normalize()
+	if got := normalized.UpstreamDNS[0].Port; got != DefaultDoHPort {
+		t.Fatalf("Normalize() port = %d, want the DoH default %d", got, DefaultDoHPort)
+	}
+	if got := (Upstream{Address: "dns.example.com", Port: 8443, Transport: TransportDoH}).HostPort(); got != "dns.example.com:8443" {
+		t.Fatalf("explicit DoH HostPort() = %q, want %q", got, "dns.example.com:8443")
 	}
 }

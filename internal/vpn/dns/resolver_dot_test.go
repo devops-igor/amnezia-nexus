@@ -406,8 +406,8 @@ func TestResolver_SetUpstreamsSwapsDoTList(t *testing.T) {
 	}
 
 	// A refused update keeps the accepted list, including its transport.
-	if err := resolver.SetUpstreams([]policy.Upstream{{Address: "dns.example.com", Port: 443, Transport: policy.TransportDoH}}); !errors.Is(err, ErrUnsupportedTransport) {
-		t.Fatalf("SetUpstreams(DoH) = %v, want ErrUnsupportedTransport", err)
+	if err := resolver.SetUpstreams([]policy.Upstream{{Address: "dns.example.com", Port: 443, Transport: "quic"}}); !errors.Is(err, ErrUnsupportedTransport) {
+		t.Fatalf("SetUpstreams(quic) = %v, want ErrUnsupportedTransport", err)
 	}
 	upstreams := resolver.Upstreams()
 	if len(upstreams) != 1 || upstreams[0] != secondEntry {

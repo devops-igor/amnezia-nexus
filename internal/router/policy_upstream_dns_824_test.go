@@ -156,14 +156,19 @@ func TestPolicyUpstreamDNSRejectedEntriesAreNotPersisted(t *testing.T) {
 			wantSubstr: "unknown transport",
 		},
 		{
-			name:       "encrypted transport not implemented",
-			upstreams:  []policy.Upstream{{Address: "9.9.9.9", Port: 443, Transport: policy.TransportDoH}},
-			wantSubstr: "not supported in this build",
+			name:       "doh url instead of a host",
+			upstreams:  []policy.Upstream{{Address: "https://dns.example.com/dns-query", Port: 443, Transport: policy.TransportDoH}},
+			wantSubstr: "not a bare host",
+		},
+		{
+			name:       "doh loopback",
+			upstreams:  []policy.Upstream{{Address: "127.0.0.1", Port: 443, Transport: policy.TransportDoH}},
+			wantSubstr: "loopback",
 		},
 		{
 			name:       "pin on a plaintext entry",
 			upstreams:  []policy.Upstream{{Address: "9.9.9.9", Port: 53, SPKIPin: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}},
-			wantSubstr: "only honored by DNS over TLS",
+			wantSubstr: "only honored by the encrypted transports",
 		},
 		{
 			name:       "malformed pin",

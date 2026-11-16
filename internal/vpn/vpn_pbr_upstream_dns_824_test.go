@@ -302,10 +302,23 @@ func TestApplyLiveUpstreamsSwapsInstalledResolver(t *testing.T) {
 		t.Fatalf("live DoT upstream port = %d, want the effective default %d", got[0].Port, policy.DefaultDoTPort)
 	}
 
-	// A transport this build does not implement is refused, and the accepted
-	// list stays in effect.
+	// A DoH list is accepted and takes effect live as well.
+	doh := policy.DefaultSettings()
+	doh.UpstreamDNS = []policy.Upstream{{Address: "dns.example.com", Transport: policy.TransportDoH}}
+	if err := svc.applyLiveUpstreams(doh); err != nil {
+		t.Fatalf("applyLiveUpstreams(doh): %v", err)
+	}
+	if got = resolver.Upstreams(); len(got) != 1 || got[0].Transport != policy.TransportDoH || got[0].Port != policy.DefaultDoHPort {
+		t.Fatalf("live resolver upstreams = %v, want the DoH entry with its default port", got)
+	}
+
+	// Re-install the DoT list, then prove a transport this build does not know is
+	// refused and the accepted list stays in effect.
+	if err := svc.applyLiveUpstreams(dot); err != nil {
+		t.Fatalf("applyLiveUpstreams(dot) again: %v", err)
+	}
 	rejected := policy.DefaultSettings()
-	rejected.UpstreamDNS = []policy.Upstream{{Address: "dns.example.com", Port: 443, Transport: policy.TransportDoH}}
+	rejected.UpstreamDNS = []policy.Upstream{{Address: "dns.example.com", Port: 443, Transport: "quic"}}
 	if err := svc.applyLiveUpstreams(rejected); err == nil {
 		t.Fatal("applyLiveUpstreams accepted a transport this build does not implement")
 	}
