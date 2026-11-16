@@ -3,6 +3,7 @@ package gatewaydns
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"net"
 	"net/http"
 	"testing"
@@ -261,5 +262,21 @@ func TestDoHURLForAcceptedEndpointForms(t *testing.T) {
 				t.Fatalf("dohURL() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestDoHTransportFailsClosed asserts the structure the DoH transport relies on
+// for its no-plaintext guarantee, directly: it has no proxy function, and its
+// plaintext dial hook refuses to connect. An https URL never reaches that hook,
+// so only a direct call proves it would fail closed if a request ever lost TLS.
+func TestDoHTransportFailsClosed(t *testing.T) {
+	resolver := mustLoopbackResolver(t, ResolverConfig{Upstreams: []policy.Upstream{{Address: "dns.example.com", Transport: policy.TransportDoH}}})
+	transport := resolver.dohTransport(context.Background(), policy.Upstream{Address: "dns.example.com", Transport: policy.TransportDoH}, nil)
+	if transport.Proxy != nil {
+		t.Fatal("the DoH transport has a proxy function; the environment could redirect the query")
+	}
+	conn, err := transport.DialContext(context.Background(), "tcp", "dns.example.com:80")
+	if conn != nil || !errors.Is(err, errDoHPlaintextForbidden) {
+		t.Fatalf("DialContext() = (%v, %v), want no connection and errDoHPlaintextForbidden", conn, err)
 	}
 }
