@@ -223,11 +223,11 @@ func TestResolver_ServfailWithoutAlternateIsATerminalAnswer(t *testing.T) {
 	}
 }
 
-// TestResolver_RejectsNonPlainTransport is the no-downgrade shape for the
-// encrypted transports: an entry configured for DoT or DoH is refused, so the
-// plain path can never be used for it.
-func TestResolver_RejectsNonPlainTransport(t *testing.T) {
-	for _, transport := range []policy.UpstreamTransport{policy.TransportDoT, policy.TransportDoH} {
+// TestResolver_RejectsUnsupportedTransport keeps the DoH shape of the
+// no-downgrade rule: an entry configured for a transport this build does not
+// implement is refused, so no other transport can be used for it.
+func TestResolver_RejectsUnsupportedTransport(t *testing.T) {
+	for _, transport := range []policy.UpstreamTransport{policy.TransportDoH, "quic"} {
 		t.Run(string(transport), func(t *testing.T) {
 			_, err := NewUpstreamResolver(ResolverConfig{
 				Upstreams: []policy.Upstream{{Address: "94.140.14.14", Port: 53, Transport: transport}},

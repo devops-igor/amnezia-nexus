@@ -2,6 +2,7 @@ package gatewaydns
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -30,12 +31,19 @@ const (
 	FailureServfail FailureKind = "servfail"
 	// FailureInvalidResponse means the reply did not match the query envelope.
 	FailureInvalidResponse FailureKind = "invalid_response"
-	// The remaining kinds belong to the encrypted transports. They are part of
-	// the status contract from the start so an operator-facing consumer never
-	// has to change shape when those transports land.
+	// FailureTLSHandshake means the TLS handshake with a DoT upstream failed for
+	// a reason other than certificate verification: a refused connection, a peer
+	// that does not speak TLS, or a protocol-level handshake error.
 	FailureTLSHandshake FailureKind = "tls_handshake"
-	FailureCertificate  FailureKind = "certificate"
-	FailureHTTPStatus   FailureKind = "http_status"
+	// FailureCertificate means the DoT peer's certificate chain or name did not
+	// verify against the configured trust store.
+	FailureCertificate FailureKind = "certificate"
+	// FailurePinMismatch means the DoT peer's chain verified but the leaf
+	// certificate's SPKI digest did not match the configured pin.
+	FailurePinMismatch FailureKind = "pin_mismatch"
+	// FailureHTTPStatus belongs to the DoH transport, which this build does not
+	// implement. It stays in the contract so the status shape is stable.
+	FailureHTTPStatus FailureKind = "http_status"
 )
 
 // ResolverStatus is the operator-facing view of the last upstream outcome.
@@ -84,6 +92,15 @@ type ResolverConfig struct {
 	// AllowLoopbackUpstream admits loopback entries, which the resolver test
 	// fixtures need. The persisted configuration never allows them.
 	AllowLoopbackUpstream bool
+
+	// tlsRootCAs replaces the trust store the DoT transport verifies against. A
+	// nil value - every production caller - means the system store. It exists so
+	// a test can trust a local fixture CA and never reach the internet.
+	tlsRootCAs *x509.CertPool
+	// dotDial opens the TCP connection a DoT exchange wraps in TLS. A nil value
+	// dials the configured address. It exists so a test can point a hostname
+	// entry at a local listener without a name-resolution fixture.
+	dotDial func(ctx context.Context, address string) (net.Conn, error)
 }
 
 const (
@@ -101,9 +118,9 @@ var (
 	// unspecified, multicast, or loopback where loopback is not allowed.
 	ErrInvalidUpstream = errors.New("invalid upstream resolver address")
 	// ErrUnsupportedTransport indicates an entry selects a transport this build
-	// does not implement. It is never served by the plain transport, because a
+	// does not implement. It is never served by another transport, because a
 	// silent downgrade would send the query in clear text.
-	ErrUnsupportedTransport = errors.New("upstream transport not implemented")
+	ErrUnsupportedTransport = errors.New("upstream transport is not supported in this build")
 	// ErrInvalidRequest indicates a nil or empty DNS request.
 	ErrInvalidRequest = errors.New("invalid DNS request")
 	// ErrExchangeFailed indicates all upstream attempts failed within the query budget.
@@ -115,6 +132,8 @@ type UpstreamResolver struct {
 	queryTimeout   time.Duration
 	attemptTimeout time.Duration
 	allowLoopback  bool
+	tlsRootCAs     *x509.CertPool
+	dotDial        func(ctx context.Context, address string) (net.Conn, error)
 
 	// upstreams holds the current list for concurrent readers. A live
 	// configuration change swaps it atomically, so an exchange in flight always
@@ -129,6 +148,11 @@ type UpstreamResolver struct {
 func NewUpstreamResolver(cfg ResolverConfig) (*UpstreamResolver, error) {
 	res := &UpstreamResolver{
 		allowLoopback: cfg.AllowLoopbackUpstream,
+		tlsRootCAs:    cfg.tlsRootCAs,
+		dotDial:       cfg.dotDial,
+	}
+	if res.dotDial == nil {
+		res.dotDial = dialDoTDefault
 	}
 	if cfg.QueryTimeout > 0 {
 		res.queryTimeout = cfg.QueryTimeout
@@ -197,11 +221,13 @@ func (r *UpstreamResolver) Status() ResolverStatus {
 
 // validateUpstreamEntry re-checks one entry at the point of use. The persisted
 // configuration is already validated, and this repeat is the trust-boundary
-// check: a programmatic caller can never install an entry the plain transport
-// would dial in clear text or cannot dial at all.
+// check: a programmatic caller can never install an entry that selects a
+// transport this build does not implement or cannot dial at all.
 func validateUpstreamEntry(upstream policy.Upstream, allowLoopback bool) error {
-	if transport := upstream.EffectiveTransport(); transport != policy.TransportPlain {
-		return fmt.Errorf("%w: %s selects transport %q (plaintext is never used for it)", ErrUnsupportedTransport, upstream.String(), transport)
+	switch upstream.EffectiveTransport() {
+	case policy.TransportPlain, policy.TransportDoT:
+	default:
+		return fmt.Errorf("%w: %s selects transport %q", ErrUnsupportedTransport, upstream.String(), upstream.EffectiveTransport())
 	}
 	if err := upstream.Validate(); err != nil {
 		if allowLoopback && errors.Is(err, policy.ErrUpstreamLoopback) {
@@ -370,29 +396,44 @@ func classifyAttemptError(err error) FailureKind {
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return FailureTimeout
 	}
+	var dotErr *dotFailure
+	if errors.As(err, &dotErr) {
+		return dotErr.kind
+	}
 	return FailureNetwork
 }
 
+// attemptExchange dispatches one attempt to the transport its entry selects.
+//
+// The dispatch is the single place a transport is chosen, and it has no
+// cross-transport fallback: an entry configured for DoT can never reach
+// exchangePlain, not even after a handshake or certificate failure. Failover
+// happens between entries (runAttempts), each of which keeps its own transport.
 func (r *UpstreamResolver) attemptExchange(ctx context.Context, req *mdns.Msg, upstream policy.Upstream) (*mdns.Msg, error) {
-	// The transport dispatch lives here so an entry configured for an encrypted
-	// transport can never be served by the plain path, even if a future caller
-	// bypasses SetUpstreams' validation.
 	switch upstream.EffectiveTransport() {
 	case policy.TransportPlain:
 		return r.exchangePlain(ctx, req, upstream)
+	case policy.TransportDoT:
+		return r.exchangeDoT(ctx, req, upstream)
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedTransport, upstream.String())
 	}
 }
 
-func (r *UpstreamResolver) exchangePlain(ctx context.Context, req *mdns.Msg, upstream policy.Upstream) (*mdns.Msg, error) {
-	attemptDeadline := r.attemptTimeout
+// attemptBudget bounds one attempt by the configured per-attempt timeout and by
+// whatever remains of the overall query deadline, whichever is shorter.
+func (r *UpstreamResolver) attemptBudget(ctx context.Context) time.Duration {
+	budget := r.attemptTimeout
 	if d, ok := ctx.Deadline(); ok {
-		remaining := time.Until(d)
-		if remaining < attemptDeadline {
-			attemptDeadline = remaining
+		if remaining := time.Until(d); remaining < budget {
+			budget = remaining
 		}
 	}
+	return budget
+}
+
+func (r *UpstreamResolver) exchangePlain(ctx context.Context, req *mdns.Msg, upstream policy.Upstream) (*mdns.Msg, error) {
+	attemptDeadline := r.attemptBudget(ctx)
 	if attemptDeadline <= 0 {
 		return nil, context.DeadlineExceeded
 	}
@@ -429,13 +470,7 @@ func (r *UpstreamResolver) exchangePlain(ctx context.Context, req *mdns.Msg, ups
 }
 
 func (r *UpstreamResolver) exchangeTCP(ctx context.Context, outReq *mdns.Msg, target string) (*mdns.Msg, error) {
-	attemptDeadline := r.attemptTimeout
-	if d, ok := ctx.Deadline(); ok {
-		remaining := time.Until(d)
-		if remaining < attemptDeadline {
-			attemptDeadline = remaining
-		}
-	}
+	attemptDeadline := r.attemptBudget(ctx)
 	if attemptDeadline <= 0 {
 		return nil, context.DeadlineExceeded
 	}

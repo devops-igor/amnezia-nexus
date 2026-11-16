@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -156,8 +157,18 @@ func TestPolicyUpstreamDNSRejectedEntriesAreNotPersisted(t *testing.T) {
 		},
 		{
 			name:       "encrypted transport not implemented",
-			upstreams:  []policy.Upstream{{Address: "9.9.9.9", Port: 853, Transport: policy.TransportDoT}},
-			wantSubstr: "not supported",
+			upstreams:  []policy.Upstream{{Address: "9.9.9.9", Port: 443, Transport: policy.TransportDoH}},
+			wantSubstr: "not supported in this build",
+		},
+		{
+			name:       "pin on a plaintext entry",
+			upstreams:  []policy.Upstream{{Address: "9.9.9.9", Port: 53, SPKIPin: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}},
+			wantSubstr: "only honored by DNS over TLS",
+		},
+		{
+			name:       "malformed pin",
+			upstreams:  []policy.Upstream{{Address: "9.9.9.9", Transport: policy.TransportDoT, SPKIPin: "not a pin"}},
+			wantSubstr: "not valid standard base64",
 		},
 	}
 
@@ -195,6 +206,76 @@ func TestPolicyUpstreamDNSRejectedEntriesAreNotPersisted(t *testing.T) {
 				t.Fatalf("rejected request changed the stored upstreams: %+v", stored.UpstreamDNS)
 			}
 		})
+	}
+}
+
+// TestPolicyUpstreamDoTSavedWithDefaultPort is the DoT API contract: the entry
+// is accepted, its transport and pin survive the round trip, and the default
+// port is written out explicitly rather than left implicit in the record.
+func TestPolicyUpstreamDoTSavedWithDefaultPort(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	seedPolicySessions(t, db)
+	r := NewRouter(cfg, db, nil)
+
+	pin := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("*", 32)))
+	body, err := json.Marshal(map[string]any{
+		"enabled":               false,
+		"preset":                string(policy.PresetGeoblock),
+		"sync_interval_seconds": 3600,
+		"upstream_dns": []map[string]any{
+			{"address": "94.140.14.14", "transport": "dot", "spki_pin": pin},
+			{"address": "94.140.15.15", "port": 8853, "transport": "dot"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, adminRequest(t, http.MethodPut, "/api/vpn/policy", body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT DoT settings = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	var stored policy.Settings
+	if err := db.GetSetting(context.Background(), policy.SettingsKey, &stored); err != nil {
+		t.Fatalf("read stored settings: %v", err)
+	}
+	want := []policy.Upstream{
+		{Address: "94.140.14.14", Port: policy.DefaultDoTPort, Transport: policy.TransportDoT, SPKIPin: pin},
+		{Address: "94.140.15.15", Port: 8853, Transport: policy.TransportDoT},
+	}
+	if len(stored.UpstreamDNS) != len(want) {
+		t.Fatalf("stored upstreams = %v, want %v", stored.UpstreamDNS, want)
+	}
+	for i := range want {
+		if stored.UpstreamDNS[i] != want[i] {
+			t.Fatalf("stored upstream %d = %+v, want %+v", i, stored.UpstreamDNS[i], want[i])
+		}
+	}
+	if err := stored.Validate(); err != nil {
+		t.Fatalf("stored DoT record does not validate: %v", err)
+	}
+
+	// The read path reports the same explicit list.
+	wGet := httptest.NewRecorder()
+	r.ServeHTTP(wGet, adminRequest(t, http.MethodGet, "/api/vpn/policy", nil))
+	out := decodeJSON(t, wGet)
+	rawUpstreams, ok := out["upstream_dns"].([]any)
+	if !ok || len(rawUpstreams) != len(want) {
+		t.Fatalf("GET upstream_dns = %v, want %d entries", out["upstream_dns"], len(want))
+	}
+	entry, ok := rawUpstreams[0].(map[string]any)
+	if !ok {
+		t.Fatalf("GET upstream_dns[0] = %v, want an object", rawUpstreams[0])
+	}
+	if transport, _ := entry["transport"].(string); transport != string(policy.TransportDoT) {
+		t.Fatalf("GET upstream_dns[0].transport = %v, want %q", entry["transport"], policy.TransportDoT)
+	}
+	if port, _ := entry["port"].(float64); int(port) != policy.DefaultDoTPort {
+		t.Fatalf("GET upstream_dns[0].port = %v, want %d", entry["port"], policy.DefaultDoTPort)
+	}
+	if gotPin, _ := entry["spki_pin"].(string); gotPin != pin {
+		t.Fatalf("GET upstream_dns[0].spki_pin = %v, want %q", entry["spki_pin"], pin)
 	}
 }
 

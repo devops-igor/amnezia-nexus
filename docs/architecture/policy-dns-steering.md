@@ -90,7 +90,7 @@ new table, endpoint or service.
   "upstream_dns": [
     {"address": "94.140.14.14", "port": 53},
     {"address": "2001:4860:4860::8888", "port": 53},
-    {"address": "dns.example.com", "port": 5353, "transport": "plain"}
+    {"address": "dns.example.com", "port": 853, "transport": "dot", "spki_pin": "ddJh1F65OO52y6H1L2TUCzCELTOlWg2Os3GV1RCi2iY="}
   ]
 }
 ```
@@ -100,23 +100,47 @@ Rules (`policy.Upstream.Validate`, applied by `policy.Settings.Validate`):
 | Rule | Rejection |
 | :--- | :--- |
 | at most three entries | the list exceeds the maximum |
-| explicit port 1-65535 | a missing port or one outside the range |
+| explicit port 1-65535, except the DoT default | a missing port on a plain entry, or one outside the range |
 | IPv4 literal, IPv6 literal or hostname | malformed literal or hostname (lengths, labels, characters) |
 | never loopback, multicast or unspecified | the address falls in that class (`localhost` included) |
 | no duplicate entry | the same transport and host:port appears twice |
-| a known transport | an unknown transport name, or a transport this build does not implement |
+| a known, implemented transport | an unknown transport name, or a transport this build does not implement |
+| an SPKI pin only on DoT, standard base64 of a 32-byte digest | a pin on a plaintext entry, or one that does not decode to a digest |
 
 Validation is pure and runs before persistence, so a rejected request returns a
 specific error and writes nothing; the previously stored record stays in effect.
 An absent or empty list means "use the effective defaults", which is what keeps a
 record written before this field existed working unchanged.
 
-The transport field is part of the contract from the start. Only `plain` (UDP
-with TCP fallback on truncation) is implemented; `dot` and `doh` are rejected
-with a specific error instead of being accepted and carried in clear text. An
-entry never silently downgrades, and the resolver refuses a non-plain entry at
-construction and at exchange time as well, so the rule holds even for a caller
-that bypasses settings validation.
+The transport field is part of the contract from the start. `plain` (UDP with TCP
+fallback on truncation) and `dot` (DNS over TLS, RFC 7858) are implemented; `doh`
+is rejected with a specific "not supported in this build" error instead of being
+accepted and carried in another transport. An entry never silently downgrades,
+and the resolver refuses an unimplemented transport at construction and at
+exchange time as well, so the rule holds even for a caller that bypasses settings
+validation.
+
+### DNS over TLS
+
+A `dot` entry is dialled as TLS to its own address and port (853 when the entry
+states none, which normalization also writes into the record). The certificate
+chain is verified against the system trust store, and the name that is verified
+is the entry's address: a hostname entry sends SNI and is checked as a DNS name,
+an IP-literal entry is checked against an IP SAN (and sends no SNI, as RFC 6066
+requires). Verification is never skipped.
+
+`spki_pin` is optional and pins the leaf key rather than the chain: standard
+base64 (RFC 4648 section 4, with padding) of the SHA-256 digest of the leaf
+certificate's `SubjectPublicKeyInfo`. A configured pin that does not match the
+presented leaf fails the exchange even when the chain is valid, which keeps a
+resolver reachable for the operator's key rather than for any key the trusted CA
+issues.
+
+The handshake and the exchange share the existing per-attempt budget, so a peer
+that accepts TCP and stalls is reported as a timeout rather than consuming the
+whole query deadline. A DoT entry sends no plaintext DNS: the transport dispatch
+has no cross-transport fallback, failure moves only to the next configured entry,
+and each entry keeps its own transport.
 
 ### One current list for every consumer
 
@@ -192,7 +216,7 @@ status response (no new endpoint):
 | :--- | :--- |
 | `last_upstream` | the upstream that served the most recent accepted answer |
 | `last_upstream_failure` | the upstream of the most recent failed attempt |
-| `last_upstream_failure_kind` | `timeout`, `network`, `servfail`, `invalid_response`, and later `tls_handshake`, `certificate`, `http_status` |
+| `last_upstream_failure_kind` | `timeout`, `network`, `servfail`, `invalid_response`, `tls_handshake`, `certificate`, `pin_mismatch` (`http_status` is reserved for the DoH transport) |
 
 A successful exchange clears the failure fields, so a working provider is never
 reported as failing. A blocked provider now surfaces as a failure kind instead of
