@@ -2,10 +2,14 @@ package gatewaydns
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -278,5 +282,42 @@ func TestDoHTransportFailsClosed(t *testing.T) {
 	conn, err := transport.DialContext(context.Background(), "tcp", "dns.example.com:80")
 	if conn != nil || !errors.Is(err, errDoHPlaintextForbidden) {
 		t.Fatalf("DialContext() = (%v, %v), want no connection and errDoHPlaintextForbidden", conn, err)
+	}
+}
+
+// TestResolver_DoHRefusesPeerWithoutALPN covers the guard behind the HTTP/2
+// requirement. A server that completes the handshake without offering any ALPN
+// protocol is not rejected by TLS itself, so only the resolver's own check stops
+// it. The server counts the application bytes it receives: a refusal must come
+// before any request is written.
+func TestResolver_DoHRefusesPeerWithoutALPN(t *testing.T) {
+	ca := newDoTTestCA(t)
+	certificate, _ := ca.issue(t, dotLeafOptions{ips: []net.IP{net.ParseIP("127.0.0.1")}})
+	listener, err := tls.Listen("tcp4", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	var received atomic.Int64
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				n, _ := io.Copy(io.Discard, conn)
+				received.Add(n)
+			}()
+		}
+	}()
+	t.Cleanup(func() { _ = listener.Close() })
+
+	entry := dohEntryOf(netip.MustParseAddrPort(listener.Addr().String()), "")
+	resolver := mustLoopbackResolver(t, ResolverConfig{Upstreams: []policy.Upstream{entry}, tlsRootCAs: ca.trustPool(), AttemptTimeout: time.Second})
+	assertDoHFailure(t, resolver, entry, FailureTLSHandshake)
+	time.Sleep(downgradeSettle)
+	if got := received.Load(); got != 0 {
+		t.Fatalf("a peer without HTTP/2 received %d application byte(s); the refusal must precede the request", got)
 	}
 }
