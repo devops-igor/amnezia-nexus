@@ -143,7 +143,52 @@ jobs:
           pip install --quiet -r tests/e2e/requirements.txt
           python -m pytest tests/test_vpn_diagnostics_oracle.py -p no:cacheprovider
           python -m pytest tests/test_e2e_diagnostics_privacy.py -p no:cacheprovider
-          playwright install --with-deps chromium
+
+          # `--with-deps` shells out to apt-get, and this host also runs
+          # apt-daily / unattended-upgrades. When either holds the dpkg frontend
+          # lock, apt exits 100 and the whole step dies before any test runs
+          # (issue #850: "Could not get lock /var/lib/dpkg/lock-frontend. It is
+          # held by process <pid> (apt)"). Split the two phases and wait that
+          # contention out for a bounded time, then install the browser itself.
+          # This needs no change to the host's apt configuration. A lock that
+          # never clears still fails the step, naming the holder and the wait,
+          # so the suite can never run without its browser.
+          PLAYWRIGHT_LOCK_WAIT_SECONDS=300
+          PLAYWRIGHT_LOCK_POLL_SECONDS=10
+          PLAYWRIGHT_DEPS_LOG="$(mktemp playwright-install-deps.XXXXXX)"
+          PLAYWRIGHT_DEPS_DEADLINE=$((SECONDS + PLAYWRIGHT_LOCK_WAIT_SECONDS))
+          PLAYWRIGHT_DEPS_ATTEMPT=0
+          while true; do
+            PLAYWRIGHT_DEPS_ATTEMPT=$((PLAYWRIGHT_DEPS_ATTEMPT + 1))
+            if playwright install-deps chromium >"$PLAYWRIGHT_DEPS_LOG" 2>&1; then
+              cat "$PLAYWRIGHT_DEPS_LOG"
+              echo "Playwright browser dependencies ready (attempt ${PLAYWRIGHT_DEPS_ATTEMPT})."
+              break
+            else
+              PLAYWRIGHT_DEPS_STATUS=$?
+              cat "$PLAYWRIGHT_DEPS_LOG"
+              if ! grep -qiE 'could not get lock|unable to acquire the dpkg frontend lock|unable to lock directory' "$PLAYWRIGHT_DEPS_LOG"; then
+                echo "Error: playwright install-deps failed for a reason other than dpkg lock contention (exit ${PLAYWRIGHT_DEPS_STATUS}); not retrying." >&2
+                exit "${PLAYWRIGHT_DEPS_STATUS}"
+              fi
+              PLAYWRIGHT_DEPS_REMAINING=$((PLAYWRIGHT_DEPS_DEADLINE - SECONDS))
+              if [ "$PLAYWRIGHT_DEPS_REMAINING" -le 0 ]; then
+                echo "Error: the dpkg lock was still held after ${PLAYWRIGHT_LOCK_WAIT_SECONDS}s and ${PLAYWRIGHT_DEPS_ATTEMPT} attempts; browser dependencies were NOT installed and the E2E suite will not run." >&2
+                echo "Lock holders reported by fuser (no output means they could not be read):" >&2
+                PLAYWRIGHT_LOCK_HOLDERS="$(timeout 10 sudo -n fuser -v /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock 2>&1 || true)"
+                echo "${PLAYWRIGHT_LOCK_HOLDERS:-(none reported)}" >&2
+                exit 1
+              fi
+              if [ "$PLAYWRIGHT_DEPS_REMAINING" -lt "$PLAYWRIGHT_LOCK_POLL_SECONDS" ]; then
+                PLAYWRIGHT_DEPS_SLEEP="$PLAYWRIGHT_DEPS_REMAINING"
+              else
+                PLAYWRIGHT_DEPS_SLEEP="$PLAYWRIGHT_LOCK_POLL_SECONDS"
+              fi
+              echo "dpkg lock contention on attempt ${PLAYWRIGHT_DEPS_ATTEMPT}; retrying in ${PLAYWRIGHT_DEPS_SLEEP}s (${PLAYWRIGHT_DEPS_REMAINING}s of the ${PLAYWRIGHT_LOCK_WAIT_SECONDS}s budget left)."
+              sleep "$PLAYWRIGHT_DEPS_SLEEP"
+            fi
+          done
+          playwright install chromium
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           if [ ! -f ~/.ssh/id_ed25519 ]; then
