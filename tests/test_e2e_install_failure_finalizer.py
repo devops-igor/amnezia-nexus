@@ -67,7 +67,11 @@ def _write_stub(path: Path, body: str) -> None:
 
 
 def run_lifecycle(
-    tmp_path: Path, log_text: str, stage2_passes: bool, docker_logs_ok: bool = True
+    tmp_path: Path,
+    log_text: str,
+    stage2_passes: bool,
+    docker_logs_ok: bool = True,
+    python_fails: bool = False,
 ) -> subprocess.CompletedProcess:
     """Execute the real lifecycle script against stubbed external binaries."""
     bindir = tmp_path / "bin"
@@ -106,6 +110,11 @@ def run_lifecycle(
     _write_stub(bindir / "curl", "#!/bin/sh\nexit 0\n")
 
     diagnostics_dir = tmp_path / "e2e-diagnostics"
+    if python_fails:
+        # The validator never runs, so it can never withhold: only the caller can.
+        _write_stub(bindir / "python3", "#!/bin/sh\nexit 1\n")
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        (diagnostics_dir / "unvalidated.json").write_text("{}", encoding="utf-8")
     env = {
         **os.environ,
         "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
@@ -210,6 +219,23 @@ def test_failure_evidence_absent_when_docker_logs_fails(tmp_path: Path) -> None:
     assert not (tmp_path / "e2e-diagnostics" / "install-failure.json").exists()
     assert not (tmp_path / "e2e-diagnostics" / "add-client-failure.json").exists()
     assert not list(tmp_path.glob("panel-operator-*.log"))
+
+
+def test_validator_unavailable_withholds_evidence(tmp_path: Path) -> None:
+    """If the validator cannot run at all, the caller must still withhold.
+
+    The upload step runs with ``if: always()``, so a directory left behind by a
+    crashed validator would be published unvalidated. The validator owns
+    withholding on rejection and on an exception inside a validator; a process
+    that never starts is the caller's responsibility.
+    """
+    result = run_lifecycle(tmp_path, FAILURE_LOG, stage2_passes=False, python_fails=True)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "evidence withheld" in result.stdout + result.stderr
+    assert not (tmp_path / "e2e-diagnostics").exists(), (
+        "an unvalidated evidence directory must never survive to the upload step"
+    )
 
 
 def test_stage_two_failure_stops_before_dependent_stages(tmp_path: Path) -> None:

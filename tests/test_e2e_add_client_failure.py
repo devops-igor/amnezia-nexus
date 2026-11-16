@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -357,3 +358,81 @@ def test_gate_withholds_a_tampered_report(tmp_path: Path) -> None:
 
     assert diagnostics.main(["--validate-dir", str(directory)]) == 1
     assert not directory.exists()
+
+
+@pytest.mark.parametrize(
+    "bad_step",
+    [["clients_table_save"], {"name": "clients_table_save"}, 7, None, True],
+)
+def test_malformed_nested_step_withholds_instead_of_raising(
+    tmp_path: Path, bad_step: Any
+) -> None:
+    """An unhashable field is rejected, not allowed to abort validation.
+
+    ``failure.get("step") not in STEPS`` hashed untrusted JSON. A list or object
+    raised TypeError, validation died before withholding, and the workflow's
+    ``if: always()`` upload published the directory unvalidated. The gate must
+    fail closed for any value the schema does not expect.
+    """
+    directory = tmp_path / "e2e-diagnostics"
+    directory.mkdir()
+    payload = _report()
+    payload["add_client_failures"][0]["step"] = bad_step
+    (directory / "add-client-failure.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    assert diagnostics.main(["--validate-dir", str(directory)]) == 1
+    assert not directory.exists(), "an unusable artifact must never survive the gate"
+
+
+def test_validator_exception_withholds_the_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A validator that raises is treated as a rejection, never as a pass."""
+
+    def boom(_payload: Any) -> list:
+        raise RuntimeError("validator defect")
+
+    monkeypatch.setattr(diagnostics, "_validate_artifact", boom)
+
+    directory = tmp_path / "e2e-diagnostics"
+    directory.mkdir()
+    (directory / "add-client-failure.json").write_text(
+        json.dumps(_report()), encoding="utf-8"
+    )
+
+    assert diagnostics.main(["--validate-dir", str(directory)]) == 1
+    assert not directory.exists()
+
+
+def test_allowlist_check_is_total_for_unhashable_values() -> None:
+    """Membership is decided for every JSON type, without raising."""
+    allowed = frozenset({"awg", "naive"})
+    assert diagnostics._is_allowlisted("awg", allowed)
+    for value in (["awg"], {"awg": 1}, 7, None, True, ""):
+        assert not diagnostics._is_allowlisted(value, allowed)
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [["clients_table_save"], {"name": "clients_table_save"}, 7, None, True],
+)
+def test_validator_rejects_unhashable_fields_without_raising(
+    bad_value: Any,
+) -> None:
+    """The validator itself returns a verdict for any JSON type.
+
+    Asserting the outcome through ``gate()`` is not enough: ``gate()`` now
+    catches exceptions, so it would withhold even if the membership test still
+    raised. This oracle fails precisely when the type guard is removed.
+    """
+    payload = _report()
+    payload["add_client_failures"][0]["step"] = bad_value
+    assert add_client_failure.validate_add_client_failure_report(payload) == [
+        "client-creation failure step not allowlisted"
+    ]
+
+    payload = _report()
+    payload["add_client_failures"][0]["protocol"] = bad_value
+    assert add_client_failure.validate_add_client_failure_report(payload) == [
+        "client-creation failure protocol not allowlisted"
+    ]

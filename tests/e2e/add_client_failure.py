@@ -33,11 +33,12 @@ from tests.e2e.diagnostics import (
     SCHEMA_VERSION,
     _LOGFMT_RE,
     _bounded_int,
+    _is_allowlisted,
     _scan_for_forbidden,
     _unquote_logfmt,
     _write_checked,
 )
-from tests.e2e.install_failure import PROTOCOL_ALIASES
+from tests.e2e.install_failure import PROTOCOL_ALIASES, PROTOCOLS
 
 # The exact message both client-creation handlers log before they mask the error
 # for the client. Matched as a bare substring, like the sibling collectors, so
@@ -197,9 +198,9 @@ def validate_add_client_failure_report(payload: Any) -> List[str]:
             continue
         if _bounded_int(failure.get("server_id"), 0, MAX_SERVER_ID) is None:
             problems.append("client-creation failure server_id not bounded")
-        if failure.get("protocol") not in PROTOCOL_ALIASES.values():
+        if not _is_allowlisted(failure.get("protocol"), PROTOCOLS):
             problems.append("client-creation failure protocol not allowlisted")
-        if failure.get("step") not in STEPS:
+        if not _is_allowlisted(failure.get("step"), STEPS):
             problems.append("client-creation failure step not allowlisted")
         if _bounded_int(failure.get("occurrences"), 1, MAX_ADD_CLIENT_OCCURRENCES) is None:
             problems.append("client-creation failure occurrences not bounded")

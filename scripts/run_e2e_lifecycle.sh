@@ -129,6 +129,12 @@ finalize() {
         echo "ERROR: E2E diagnostics failed validation; evidence withheld." >&2
         validate_status=1
         OVERALL_STATUS=1
+        # The validator withholds on rejection and on an exception inside a
+        # validator. If it could not run at all (import error, crash before the
+        # gate), it never got to withhold, and the workflow's `if: always()`
+        # upload would still publish the directory. Withholding is the caller's
+        # contract too, so enforce it here as well.
+        rm -rf "$E2E_DIAGNOSTICS_DIR"
     fi
     # The raw log never leaves the host: it is deleted as soon as the bounded
     # facts are extracted, so no full operator log can be uploaded by accident.

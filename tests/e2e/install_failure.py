@@ -35,6 +35,7 @@ from tests.e2e.diagnostics import (
     SCHEMA_VERSION,
     _LOGFMT_RE,
     _bounded_int,
+    _is_allowlisted,
     _scan_for_forbidden,
     _unquote_logfmt,
     _write_checked,
@@ -312,13 +313,13 @@ def validate_install_failure_report(payload: Any) -> List[str]:
             continue
         if _bounded_int(failure.get("server_id"), 0, 10**6) is None:
             problems.append("install failure server_id not bounded")
-        if failure.get("protocol") not in PROTOCOLS:
+        if not _is_allowlisted(failure.get("protocol"), PROTOCOLS):
             problems.append("install failure protocol not allowlisted")
         if _bounded_int(failure.get("port"), _NOT_STATED, 65535) is None:
             problems.append("install failure port not bounded")
-        if failure.get("step") not in STEPS:
+        if not _is_allowlisted(failure.get("step"), STEPS):
             problems.append("install failure step not allowlisted")
-        if failure.get("reason") not in REASONS:
+        if not _is_allowlisted(failure.get("reason"), REASONS):
             problems.append("install failure reason not allowlisted")
         if _bounded_int(failure.get("exit_code"), _NOT_STATED, 10**6) is None:
             problems.append("install failure exit_code not bounded")
