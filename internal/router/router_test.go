@@ -307,6 +307,7 @@ func TestRouterEndpointDispatch(t *testing.T) {
 		{http.MethodGet, "/api/system/upstream-status", adminSession, nil, http.StatusOK},
 		{http.MethodGet, "/api/users", adminSession, nil, http.StatusOK},
 		{http.MethodGet, "/api/vpn/status", adminSession, nil, http.StatusOK},
+		{http.MethodGet, "/api/vpn/status", nil, nil, http.StatusUnauthorized},
 		{http.MethodGet, "/api/vpn/metrics", adminSession, nil, http.StatusOK},
 		{http.MethodGet, "/api/vpn/metrics", nil, nil, http.StatusUnauthorized},
 		{http.MethodGet, "/api/vpn/sessions", adminSession, nil, http.StatusOK},

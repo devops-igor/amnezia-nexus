@@ -110,9 +110,11 @@ func (inputs diagnosticsInputs) collectDropCategories() DropCategoryBreakdown {
 	// refusal, which own their own reasons above.
 	deviceDrops := inputs.collectBackendDeviceDropStats()
 	var returnQueueFull, returnOversized uint64
+	var oversizedReturns forwarder.OversizedReturnAttribution
 	if inputs.forwarder != nil {
 		returnQueueFull = inputs.forwarder.DropsQueueFull()
 		returnOversized = inputs.forwarder.DropsPacketTooLarge()
+		oversizedReturns = inputs.forwarder.OversizedReturnStats()
 	}
 	fwdClientNoBackend += routerNoBackend
 
@@ -186,6 +188,11 @@ func (inputs diagnosticsInputs) collectDropCategories() DropCategoryBreakdown {
 		ReturnTotalDrops:        returnTotal,
 		ReturnQueueFull:         returnQueueFull,
 		ReturnPacketTooLarge:    returnOversized,
+
+		ReturnPacketTooLargeBackend:         oversizedReturns.BackendCount,
+		ReturnPacketTooLargeDirect:          oversizedReturns.DirectCount,
+		ReturnPacketTooLargeBackendMaxBytes: oversizedReturns.BackendMaxBytes,
+		ReturnPacketTooLargeDirectMaxBytes:  oversizedReturns.DirectMaxBytes,
 
 		ReturnBackendDeviceQueueFull: deviceDrops.ReturnQueueFull,
 		ReturnBackendDeviceShutdown:  deviceDrops.ReturnShutdown,
