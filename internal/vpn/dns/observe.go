@@ -15,12 +15,21 @@ const (
 )
 
 // AnswerClassification is the observation path's interpretation of one DNS
-// answer: the names it traverses, the terminal IPv4 records that could become
-// evidence, and the minimum TTL. It is the single classification both the
-// observation path and the read-only policy explanation use (issue #825, review
-// finding HIGH-03): a second traversal would let the explanation accept answers
-// the observation path rejects, so a destination could be explained from an
-// answer that never becomes trusted evidence.
+// answer: the names it traverses, the terminal IPv4 records it carries, which of
+// those may become evidence, and the minimum TTL. It is the single
+// classification both the observation path and the read-only policy explanation
+// use (issue #825, review finding HIGH-03): a second traversal would let the
+// explanation accept answers the observation path rejects.
+//
+// The classification answers two different questions with two named address
+// sets, and they must never be merged (issue #825, owner review HIGH-01):
+//
+//   - ResolvedAddresses is "where would this name's traffic go": every terminal
+//     address the answer carries. A destination the data path drops is still a
+//     destination an operator needs evaluated.
+//   - EvidenceAddresses is "what may become trusted DIRECT/PROXY evidence": the
+//     subset that passes the fetch-IP policy. Only the observation path consumes
+//     it; it is deliberately narrower than ResolvedAddresses.
 type AnswerClassification struct {
 	// Valid reports whether the observation path would use this answer at all.
 	// An answer that is not valid produces no evidence, whatever its records say.
@@ -28,14 +37,20 @@ type AnswerClassification struct {
 	// Reason names why an answer is unusable, for diagnostics. Empty when Valid.
 	Reason string
 	// Names are the canonical names the answer traverses, in order: the queried
-	// name first, then each CNAME target.
+	// name first, then each CNAME target. They are set for every valid answer,
+	// including one with no terminal A record, so the submitted name stays
+	// available for rule matching.
 	Names []string
 	// Terminal is the last name in the chain; its A records are the answer.
 	Terminal string
-	// Addresses are the terminal A records that pass the evidence filter (native
-	// public IPv4 only), deduplicated in answer order. Empty is a valid outcome:
-	// the answer simply carries no usable address.
-	Addresses []netip.Addr
+	// ResolvedAddresses are all terminal native-IPv4 A records, deduplicated in
+	// answer order, whether or not they could become evidence. Empty means the
+	// answer carries no terminal address at all.
+	ResolvedAddresses []netip.Addr
+	// EvidenceAddresses are the ResolvedAddresses that pass the evidence filter
+	// (native public IPv4 only), in the same order. It is always a subset of
+	// ResolvedAddresses; an empty set is a valid outcome.
+	EvidenceAddresses []netip.Addr
 	// MinTTL is the smallest TTL seen along the chain and its terminal records.
 	MinTTL uint32
 }
@@ -154,12 +169,10 @@ func ClassifyAnswer(req *mdns.Msg, resp *mdns.Msg, maxTTL time.Duration) AnswerC
 	}
 
 	terminalARecords, minTTL := findTerminalARecords(resp, terminalName, minTTL)
-	if len(terminalARecords) == 0 {
-		// A valid answer without a terminal A record: the observation path records
-		// nothing, and the name simply has no usable address.
-		return AnswerClassification{Valid: true, Terminal: terminalName, MinTTL: minTTL}
-	}
 
+	// Names are normalized for every valid answer, not only one with addresses: a
+	// name that matches a rule must stay matchable when the answer carries no A
+	// record, and an unnormalizable name invalidates the answer either way.
 	names := make([]string, 0, len(traversedNames))
 	for _, name := range traversedNames {
 		canon, err := policy.NormalizeDomain(name)
@@ -169,18 +182,20 @@ func ClassifyAnswer(req *mdns.Msg, resp *mdns.Msg, maxTTL time.Duration) AnswerC
 		names = append(names, canon)
 	}
 
+	resolved := resolvedAddresses(terminalARecords)
 	return AnswerClassification{
-		Valid:     true,
-		Names:     names,
-		Terminal:  terminalName,
-		Addresses: evidenceAddresses(terminalARecords),
-		MinTTL:    minTTL,
+		Valid:             true,
+		Names:             names,
+		Terminal:          terminalName,
+		ResolvedAddresses: resolved,
+		EvidenceAddresses: evidenceAddresses(resolved),
+		MinTTL:            minTTL,
 	}
 }
 
-// evidenceAddresses filters terminal records exactly as the observation path
-// does: native IPv4 that passes the SSRF/public-address policy, deduplicated.
-func evidenceAddresses(records []*mdns.A) []netip.Addr {
+// resolvedAddresses lists every terminal native-IPv4 address, deduplicated in
+// answer order, with no policy filter: it is the set an operator evaluates.
+func resolvedAddresses(records []*mdns.A) []netip.Addr {
 	out := make([]netip.Addr, 0, len(records))
 	seen := make(map[netip.Addr]struct{}, len(records))
 	for _, aRec := range records {
@@ -188,13 +203,25 @@ func evidenceAddresses(records []*mdns.A) []netip.Addr {
 		if !ok || !ip.IsValid() || !ip.Is4() {
 			continue
 		}
-		if err := policy.ValidateFetchIP(ip); err != nil {
-			continue
-		}
 		if _, dup := seen[ip]; dup {
 			continue
 		}
 		seen[ip] = struct{}{}
+		out = append(out, ip)
+	}
+	return out
+}
+
+// evidenceAddresses keeps the resolved addresses the observation path may turn
+// into evidence: those that pass the SSRF/public-address policy. This filter is
+// the production evidence boundary; it must not be widened to serve a
+// diagnostic.
+func evidenceAddresses(resolved []netip.Addr) []netip.Addr {
+	out := make([]netip.Addr, 0, len(resolved))
+	for _, ip := range resolved {
+		if err := policy.ValidateFetchIP(ip); err != nil {
+			continue
+		}
 		out = append(out, ip)
 	}
 	return out
@@ -261,7 +288,9 @@ func ObserveResponse(
 	}
 
 	answer := ClassifyAnswer(req, resp, maxTTL)
-	if !answer.Valid || len(answer.Addresses) == 0 {
+	// Production consumes only the evidence-eligible set. The resolved set also
+	// holds addresses the data path drops, which must never become evidence.
+	if !answer.Valid || len(answer.EvidenceAddresses) == 0 {
 		return nil, nil
 	}
 
@@ -270,7 +299,7 @@ func ObserveResponse(
 		return nil, nil
 	}
 
-	observations := buildObservations(answer.Addresses, requiresProxy, snapshot, answer.MinTTL, maxTTL, recvTime)
+	observations := buildObservations(answer.EvidenceAddresses, requiresProxy, snapshot, answer.MinTTL, maxTTL, recvTime)
 	if len(observations) == 0 {
 		return nil, nil
 	}

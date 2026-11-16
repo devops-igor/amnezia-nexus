@@ -172,10 +172,13 @@ func TestExplainClassificationMatchesObservationPath(t *testing.T) {
 	}
 
 	cases := []struct {
-		name    string
-		resp    *mdns.Msg
-		wantOK  bool
-		wantIPs []string
+		name   string
+		resp   *mdns.Msg
+		wantOK bool
+		// wantIPs are the resolved destinations the explainer must evaluate;
+		// wantEvidence is the narrower set production may record as evidence.
+		wantIPs      []string
+		wantEvidence []string
 	}{
 		{
 			name: "clean chain",
@@ -184,8 +187,9 @@ func TestExplainClassificationMatchesObservationPath(t *testing.T) {
 				aRecord("edge.cdn.example.", "198.51.201.10", 300),
 				aRecord("edge.cdn.example.", "198.51.201.11", 120),
 			),
-			wantOK:  true,
-			wantIPs: []string{"198.51.201.10", "198.51.201.11"},
+			wantOK:       true,
+			wantIPs:      []string{"198.51.201.10", "198.51.201.11"},
+			wantEvidence: []string{"198.51.201.10", "198.51.201.11"},
 		},
 		{
 			name: "CNAME cycle",
@@ -244,9 +248,11 @@ func TestExplainClassificationMatchesObservationPath(t *testing.T) {
 			wantOK: true,
 		},
 		{
-			name:   "private address is filtered out of evidence",
-			resp:   answerOf(aRecord(queried, "10.0.0.5", 300)),
-			wantOK: true,
+			name: "private address is evaluated but never evidence",
+			resp: answerOf(aRecord(queried, "10.0.0.5", 300)),
+			// The explainer still evaluates the destination production drops.
+			wantOK:  true,
+			wantIPs: []string{"10.0.0.5"},
 		},
 	}
 
@@ -301,11 +307,14 @@ func TestExplainClassificationMatchesObservationPath(t *testing.T) {
 				t.Fatalf("explainer accepted=%v but production classification accepted=%v (%s)",
 					explainedOK, classified.Valid, classified.Reason)
 			}
-			// Evidence is produced exactly when the answer is valid and carries a
-			// usable address.
-			if gotEvidence := len(observations) > 0; gotEvidence != (tc.wantOK && len(tc.wantIPs) > 0) {
+			// Evidence is produced exactly when the evidence-eligible set is not
+			// empty, never merely because the answer resolved to an address.
+			if gotEvidence := len(observations) > 0; gotEvidence != (len(tc.wantEvidence) > 0) {
 				t.Fatalf("production evidence = %v, want %v (observations %d)",
-					gotEvidence, tc.wantOK && len(tc.wantIPs) > 0, len(observations))
+					gotEvidence, len(tc.wantEvidence) > 0, len(observations))
+			}
+			if got := addrStrings(classified.EvidenceAddresses); !sameStrings(got, tc.wantEvidence) {
+				t.Fatalf("evidence-eligible addresses = %v, want %v", got, tc.wantEvidence)
 			}
 
 			if got := out.Resolution.Addresses; !sameStrings(got, tc.wantIPs) {
@@ -316,9 +325,9 @@ func TestExplainClassificationMatchesObservationPath(t *testing.T) {
 					t.Fatalf("explained names = %v, production names = %v",
 						explainedNames(out), classified.Names)
 				}
-				if !sameStrings(out.Resolution.Addresses, addrStrings(classified.Addresses)) {
-					t.Fatalf("explained addresses = %v, production addresses = %v",
-						out.Resolution.Addresses, addrStrings(classified.Addresses))
+				if !sameStrings(out.Resolution.Addresses, addrStrings(classified.ResolvedAddresses)) {
+					t.Fatalf("explained addresses = %v, resolved addresses = %v",
+						out.Resolution.Addresses, addrStrings(classified.ResolvedAddresses))
 				}
 			}
 		})

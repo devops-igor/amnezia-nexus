@@ -292,12 +292,19 @@ func resolvePolicyExplainName(ctx context.Context, deps policyExplainDeps, req P
 		res.Error = policyExplainIgnoredAnswerPrefix + ": " + answer.Reason
 		return []string{req.Name}, nil, res
 	}
+	// The explainer evaluates every destination the answer resolves to, not the
+	// subset eligible to become evidence (owner review HIGH-01): an address the
+	// data path drops, such as 10.0.0.5, is exactly what an operator needs to see
+	// reported with the decision production would give it. Production's evidence
+	// set (answer.EvidenceAddresses) is deliberately not used here.
 	res.Names = answer.Names
-	res.Addresses = policyExplainAddrStrings(answer.Addresses)
-	if len(answer.Addresses) == 0 {
+	res.Addresses = policyExplainAddrStrings(answer.ResolvedAddresses)
+	if len(answer.ResolvedAddresses) == 0 {
+		// The names are still returned: an answer without an address does not
+		// erase the submitted name, so a rule match stays reportable.
 		res.Error = "the answer contains no usable IPv4 address"
 	}
-	return answer.Names, answer.Addresses, res
+	return answer.Names, answer.ResolvedAddresses, res
 }
 
 // policyExplainEvidenceReader returns the evidence lookup for the selected
