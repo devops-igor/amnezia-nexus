@@ -17,6 +17,8 @@ w._ = key => {
   if (key === 'policy_explain_decision_proxy') return 'DECISION-PROXY';
   if (key === 'policy_explain_decision_direct') return 'DECISION-DIRECT';
   if (key === 'policy_explain_reason_no_trusted_evidence') return 'REASON-NO-EVIDENCE';
+  if (key === 'policy_explain_reason_no_trusted_evidence_no_session') return 'REASON-NO-EVIDENCE-PROSPECTIVE';
+  if (key === 'policy_explain_no_session_context') return 'NO-SESSION-CONTEXT';
   if (key === 'policy_explain_reason_fresh_evidence_direct') return 'REASON-FRESH-DIRECT';
   if (key === 'policy_explain_reason_cidr_rule') return 'REASON-CIDR';
   if (key === 'policy_explain_prospective_rule') return 'PROSPECTIVE[{rule}|{shape}|{source}]';
@@ -69,7 +71,7 @@ const posts = requestsTo('/api/vpn/policy/explain', 'POST');
 assert.equal(posts.length, 1, 'the button must issue exactly one explanation request');
 assert.equal(posts[0].body.domain, 'WWW.Example',
   'the typed value is sent for the server to normalise, not pre-normalised here');
-assert.equal(text('policyExplainResult'), 'www.example :: DECISION-PROXY :: REASON-NO-EVIDENCE',
+assert.equal(text('policyExplainResult'), 'www.example :: DECISION-PROXY :: REASON-NO-EVIDENCE-PROSPECTIVE',
   'the readout must show the normalised value, the decision and the cause');
 assert.equal(w.document.getElementById('policyExplainResult').getAttribute('data-state'), 'proxy',
   'the readout carries the decision as a state token');
@@ -140,7 +142,7 @@ assert.equal(requestsTo('/api/vpn/policy/explain', 'POST').length, 1,
   'Enter in the field must explain the destination');
 assert.equal(requestsTo('/api/vpn/policy', 'PUT').length, 0,
   'Enter in the dry-run field must not submit the settings form');
-assert.equal(text('policyExplainResult'), 'www.example :: DECISION-PROXY :: REASON-NO-EVIDENCE');
+assert.equal(text('policyExplainResult'), 'www.example :: DECISION-PROXY :: REASON-NO-EVIDENCE-PROSPECTIVE');
 `)
 }
 
@@ -158,7 +160,7 @@ const detail = w.document.getElementById('policyExplainDetail');
 assert.equal(detail.hidden, false, 'a matched rule must be shown');
 assert.equal(detail.textContent, 'PROSPECTIVE[www.example|apex_and_subdomains|geoblock]',
   'the rule, its shape and the contributing list must be rendered');
-assert.equal(text('policyExplainResult'), 'www.example :: DECISION-PROXY :: REASON-NO-EVIDENCE',
+assert.equal(text('policyExplainResult'), 'www.example :: DECISION-PROXY :: REASON-NO-EVIDENCE-PROSPECTIVE',
   'the current action keeps its own line, separate from the prospective rule');
 `)
 }
@@ -192,5 +194,81 @@ await settle();
 const detail = w.document.getElementById('policyExplainDetail');
 assert.equal(detail.hidden, true, 'no match must render no detail');
 assert.equal(detail.textContent, '', 'no match must not leave stale text');
+`)
+}
+
+// TestPolicyRoutingControllerExplainStatesNoSessionWasInspected is the context
+// regression: the shipped form sends only the destination, so the answer is the
+// policy's own classification with its safe fallback and carries no client
+// evidence. The module must say that in its own line, ahead of the verdict, and
+// must not reuse the session-scoped wording for a session it never read.
+func TestPolicyRoutingControllerExplainStatesNoSessionWasInspected(t *testing.T) {
+	runPolicyControllerScenario(t, policyRecordScript(false, "geoblock")+explainResponderScript, `
+const context = w.document.getElementById('policyExplainContext');
+assert.ok(context, 'the answer must have its own place to state what was not inspected');
+assert.equal(context.hidden, true, 'the section ships without a claim about evidence');
+
+const field = w.document.getElementById('policy_explain_value');
+
+// A refused request must not leave a claim about evidence on screen: the clear
+// path is exercised before the successful one.
+field.value = 'fail.example';
+w.document.getElementById('policyExplainBtn').click();
+await settle();
+assert.equal(context.hidden, true,
+  'a failed request must not state anything about inspected evidence');
+
+field.value = 'www.example';
+w.document.getElementById('policyExplainBtn').click();
+await settle();
+
+const posts = requestsTo('/api/vpn/policy/explain', 'POST');
+assert.equal(posts[posts.length - 1].body.session_id, undefined,
+  'the premise: this form selects no session, so none can be inspected');
+
+assert.equal(context.hidden, false,
+  'an answer computed without a session must say no client evidence was inspected');
+assert.equal(context.textContent, 'NO-SESSION-CONTEXT');
+
+const result = w.document.getElementById('policyExplainResult');
+assert.ok(context.compareDocumentPosition(result) & 4,
+  'the limitation must precede the verdict, not sit under it as a footnote');
+assert.equal(text('policyExplainResult'), 'www.example :: DECISION-PROXY :: REASON-NO-EVIDENCE-PROSPECTIVE',
+  'without a session the cause must not claim that a session was inspected');
+assert.equal(result.getAttribute('data-state'), 'proxy',
+  'a fail-closed answer must never be rendered as a direct route');
+assert.equal(requestsTo('/api/vpn/policy', 'PUT').length, 0,
+  'explaining must still never save settings');
+`)
+}
+
+// TestPolicyRoutingControllerExplainKeepsSessionWordingWhenASessionIsSelected
+// is the counterweight: when the answer names the session it read, that
+// session's evidence really was inspected, so the session-scoped cause stays
+// and no limitation line is shown. Asserted first, so this control also runs
+// against a revision that has no context line yet.
+func TestPolicyRoutingControllerExplainKeepsSessionWordingWhenASessionIsSelected(t *testing.T) {
+	runPolicyControllerScenario(t, policyRecordScript(false, "geoblock")+explainResponderScript, `
+responder = ((base) => async (url, opts) => {
+  const answer = await base(url, opts);
+  if (url.endsWith('/api/vpn/policy/explain')) {
+    answer.input = Object.assign({}, answer.input, {session: 'session-1'});
+  }
+  return answer;
+})(responder);
+
+const field = w.document.getElementById('policy_explain_value');
+field.value = 'www.example';
+w.document.getElementById('policyExplainBtn').click();
+await settle();
+
+assert.equal(text('policyExplainResult'), 'www.example :: DECISION-PROXY :: REASON-NO-EVIDENCE',
+  'a selected session keeps the session-scoped cause; it must not be replaced wholesale');
+
+const context = w.document.getElementById('policyExplainContext');
+assert.ok(context, 'the section must carry the no-session limitation line');
+assert.equal(context.hidden, true,
+  'a session-backed answer must not claim that no evidence was inspected');
+assert.equal(context.textContent, '', 'a hidden line must not keep stale text');
 `)
 }

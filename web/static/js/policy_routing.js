@@ -605,15 +605,28 @@
         return label === key ? String(decision) : label;
     }
 
+    // policyExplainSelectsSession reports whether the answer read a session's
+    // evidence. The API echoes the selected session id, and an empty one means
+    // no client evidence was consulted at all, so a sentence that speaks about
+    // "this session" would describe an inspection that never happened.
+    function policyExplainSelectsSession(answer) {
+        return !!(answer && answer.input && answer.input.session);
+    }
+
     // policyExplainReasonLabel translates the machine-readable cause. The server
     // is the authority on which causes exist; a token without a translation is
     // displayed verbatim, so a new cause degrades to a readable answer instead of
-    // an empty line.
-    function policyExplainReasonLabel(reason) {
+    // an empty line. Only the session-scoped wording of no_trusted_evidence has
+    // a variant: that cause is also what an answer reaches when no session was
+    // selected, and then the evidence was not inspected rather than absent.
+    function policyExplainReasonLabel(reason, hasSession) {
         if (!reason) {
             return policyText('policy_none');
         }
         var key = 'policy_explain_reason_' + String(reason);
+        if (String(reason) === 'no_trusted_evidence' && !hasSession) {
+            key = 'policy_explain_reason_no_trusted_evidence_no_session';
+        }
         var label = policyText(key);
         return label === key ? String(reason) : label;
     }
@@ -679,6 +692,27 @@
         el.hidden = false;
     }
 
+    // setPolicyExplainContext states what the answer did not inspect. With no
+    // selected session the module read no client evidence, so the result is the
+    // policy's own classification and its safe fallback for that destination,
+    // never a measured route for a user's connection. With a session selected
+    // the session-scoped sentences are already accurate, so this line stays
+    // hidden instead of repeating them. A missing answer clears it, which is
+    // what both the running state and a failed request need.
+    function setPolicyExplainContext(answer) {
+        var el = policyElement('policyExplainContext');
+        if (!el) {
+            return;
+        }
+        if (!answer || policyExplainSelectsSession(answer)) {
+            el.textContent = '';
+            el.hidden = true;
+            return;
+        }
+        el.textContent = policyText('policy_explain_no_session_context');
+        el.hidden = false;
+    }
+
     // explainPolicyDestination asks the server to explain one destination and
     // renders the decision with its cause. It changes no settings and reloads
     // nothing: the answer is a read.
@@ -700,6 +734,7 @@
         }
         setPolicyExplainResult(policyText('policy_explain_running'), '');
         setPolicyExplainDetail(null);
+        setPolicyExplainContext(null);
         try {
             var answer = await policyRequest(EXPLAIN_ENDPOINT, {
                 method: 'POST',
@@ -708,10 +743,11 @@
             var normalized = answer && answer.input && answer.input.normalized
                 ? answer.input.normalized
                 : value;
+            var hasSession = policyExplainSelectsSession(answer);
             var result = policyText('policy_explain_result')
                 .replace('{value}', normalized)
                 .replace('{decision}', policyExplainDecisionLabel(answer && answer.decision))
-                .replace('{reason}', policyExplainReasonLabel(answer && answer.reason));
+                .replace('{reason}', policyExplainReasonLabel(answer && answer.reason, hasSession));
             var state = 'proxy';
             if (answer && answer.decision === 'DIRECT') {
                 state = 'direct';
@@ -722,9 +758,11 @@
             }
             setPolicyExplainResult(result, state);
             setPolicyExplainDetail(answer);
+            setPolicyExplainContext(answer);
             return answer;
         } catch (err) {
             setPolicyExplainDetail(null);
+            setPolicyExplainContext(null);
             setPolicyExplainResult(policyText('policy_explain_failed') + ': ' + policyErrorDetail(err), 'error');
             return null;
         } finally {
