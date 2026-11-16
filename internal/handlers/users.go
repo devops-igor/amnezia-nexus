@@ -811,6 +811,8 @@ func (h *Handlers) AddUserConnectionHandler(w http.ResponseWriter, r *http.Reque
 
 		res, err := protoMgr.AddClient(ctx, server, params)
 		if err != nil {
+			slog.Error("failed to add client",
+				"server_id", req.ServerID, "protocol", req.Protocol, "error", err)
 			h.JSONError(w, http.StatusInternalServerError, "add_client_failed", "Failed to add client")
 			return
 		}

@@ -114,12 +114,14 @@ finalize() {
             --probe-log "$probe_tmp"
             --call-timing-log "$probe_tmp"
             --install-failure-log "$probe_tmp"
+            --add-client-failure-log "$probe_tmp"
         )
     elif [ -n "${E2E_PANEL_LOG_PATH:-}" ]; then
         probe_args=(
             --probe-log "$E2E_PANEL_LOG_PATH"
             --call-timing-log "$E2E_PANEL_LOG_PATH"
             --install-failure-log "$E2E_PANEL_LOG_PATH"
+            --add-client-failure-log "$E2E_PANEL_LOG_PATH"
         )
     fi
     if ! (cd "$REPO_ROOT" && python3 -m tests.e2e.diagnostics \
@@ -127,6 +129,12 @@ finalize() {
         echo "ERROR: E2E diagnostics failed validation; evidence withheld." >&2
         validate_status=1
         OVERALL_STATUS=1
+        # The validator withholds on rejection and on an exception inside a
+        # validator. If it could not run at all (import error, crash before the
+        # gate), it never got to withhold, and the workflow's `if: always()`
+        # upload would still publish the directory. Withholding is the caller's
+        # contract too, so enforce it here as well.
+        rm -rf "$E2E_DIAGNOSTICS_DIR"
     fi
     # The raw log never leaves the host: it is deleted as soon as the bounded
     # facts are extracted, so no full operator log can be uploaded by accident.

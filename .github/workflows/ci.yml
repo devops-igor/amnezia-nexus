@@ -369,6 +369,7 @@ jobs:
           python -m pip install pytest==8.3.4
           python -m pytest -p no:cacheprovider \
             tests/test_e2e_diagnostics_privacy.py \
+            tests/test_e2e_add_client_failure.py \
             tests/test_e2e_probe_visibility.py \
             tests/test_e2e_install_failure.py \
             tests/test_e2e_install_failure_finalizer.py \

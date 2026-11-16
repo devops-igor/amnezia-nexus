@@ -603,6 +603,45 @@ def test_gate_keeps_a_valid_install_failure_artifact(tmp_path: Path, capsys) -> 
     assert (directory / "install-failure.json").is_file()
 
 
+@pytest.mark.parametrize("field", ["protocol", "step", "reason"])
+def test_unhashable_field_withholds_instead_of_raising(tmp_path: Path, field: str) -> None:
+    """An unhashable closed-set field is rejected, not allowed to abort validation.
+
+    The same defect as the client-creation collector: ``value not in FROZENSET``
+    hashes untrusted JSON, and a list raised TypeError before the gate could
+    withhold the directory. Both validators must decide, never raise.
+    """
+    directory = tmp_path / "e2e-diagnostics"
+    directory.mkdir()
+    payload = {
+        "schema_version": diagnostics.SCHEMA_VERSION,
+        "source": "protocol-install-failure-log",
+        "occurrences": 1,
+        "failures": [
+            {
+                "server_id": 1,
+                "protocol": "awg",
+                "port": 51820,
+                "step": "lock_acquire",
+                "reason": "other",
+                "exit_code": -1,
+                "duration_ms": -1,
+            }
+        ],
+    }
+    payload["failures"][0][field] = ["not", "a", "string"]
+    (directory / "install-failure.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    assert diagnostics.main(["--validate-dir", str(directory)]) == 1
+    assert not directory.exists(), "an unusable artifact must never survive the gate"
+
+    # The outcome above is produced by the gate's exception path too, so assert
+    # the validator's own verdict: this fails precisely if the type guard goes.
+    assert install_failure.validate_install_failure_report(payload) == [
+        f"install failure {field} not allowlisted"
+    ]
+
+
 # ── Wiring: the lifecycle finalizer must actually collect this ───────
 
 
