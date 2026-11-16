@@ -206,6 +206,9 @@ func TestExplainPolicyAgeIsAbsentWithTheReasonWhenNotFresh(t *testing.T) {
 		if out.Evidence != nil || out.Addresses[0].Evidence != nil {
 			t.Fatalf("evidence = %+v, want none without a session scope", out.Evidence)
 		}
+		if hasLimit(out.Limitations, PolicyLimitNoEvidenceAge) {
+			t.Errorf("limitations = %v, want no age caveat when no evidence is read", out.Limitations)
+		}
 	})
 	t.Run("disabled policy reads no evidence", func(t *testing.T) {
 		out := explainAddressAge(t, policyExplainDeps{
@@ -213,6 +216,9 @@ func TestExplainPolicyAgeIsAbsentWithTheReasonWhenNotFresh(t *testing.T) {
 		}, "198.51.201.70")
 		if out.Evidence != nil {
 			t.Fatalf("evidence = %+v, want none when policy routing is disabled", out.Evidence)
+		}
+		if hasLimit(out.Limitations, PolicyLimitNoEvidenceAge) {
+			t.Errorf("limitations = %v, want no age caveat when no evidence is read", out.Limitations)
 		}
 	})
 }
