@@ -968,6 +968,9 @@ def gate(directory: Path) -> int:
             is_probe = isinstance(payload, dict) and "observations" in payload
             is_timing = isinstance(payload, dict) and "calls" in payload
             is_install_failure = isinstance(payload, dict) and "failures" in payload
+            is_add_client_failure = (
+                isinstance(payload, dict) and "add_client_failures" in payload
+            )
             if is_payload:
                 problems = validate_payload(payload)
             elif is_probe:
@@ -978,6 +981,12 @@ def gate(directory: Path) -> int:
                 from tests.e2e.install_failure import validate_install_failure_report
 
                 problems = validate_install_failure_report(payload)
+            elif is_add_client_failure:
+                from tests.e2e.add_client_failure import (
+                    validate_add_client_failure_report,
+                )
+
+                problems = validate_add_client_failure_report(payload)
             else:
                 problems = validate_versions(payload)
         if problems:
@@ -1022,14 +1031,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--install-failure-log",
         help="operator log file to reduce to closed-schema protocol install failures",
     )
+    parser.add_argument(
+        "--add-client-failure-log",
+        help="operator log file to reduce to closed-schema client-creation failures",
+    )
     args = parser.parse_args(argv)
     directory = Path(args.validate_dir)
+    from tests.e2e.add_client_failure import collect_add_client_failure_log
     from tests.e2e.install_failure import collect_install_failure_log
 
     for flag, collect in (
         ("probe_log", collect_probe_log),
         ("call_timing_log", collect_timing_log),
         ("install_failure_log", collect_install_failure_log),
+        ("add_client_failure_log", collect_add_client_failure_log),
     ):
         log_arg = getattr(args, flag)
         if not log_arg:

@@ -133,7 +133,9 @@ _REASON_MARKERS: Tuple[Tuple[str, str], ...] = (
 REASONS = frozenset({reason for _, reason in _REASON_MARKERS}) | {"other"}
 # Closed set of protocol names accepted by GetProtocolManager (models.ValidProtocols
 # plus models.ProtocolAliases). An install can never reach this log line otherwise.
-_PROTOCOLS = {
+# Exported because the client-creation collector classifies the same protocol
+# field and must not restate this table.
+PROTOCOL_ALIASES = {
     "awg": "awg",
     "telemt": "telemt",
     "dns": "dns",
@@ -145,7 +147,7 @@ _PROTOCOLS = {
     "vless_reality": "vless",
     "naiveproxy": "naive",
 }
-PROTOCOLS = frozenset(_PROTOCOLS.values())
+PROTOCOLS = frozenset(PROTOCOL_ALIASES.values())
 # A remote command's exit status appears as "(code N)" or "(exit code N)".
 _EXIT_CODE_RE = re.compile(r"\((?:exit )?code (\d{1,6})\)")
 _NOT_STATED = -1
@@ -247,7 +249,7 @@ def parse_install_failure_log(text: str) -> Optional[Dict[str, Any]]:
         server_id = _bounded_int(fields.get("server_id"), 0, 10**6)
         if server_id is None or not re.fullmatch(r"\d{1,9}", fields.get("server_id", "")):
             continue
-        protocol = _PROTOCOLS.get(fields.get("protocol", ""))
+        protocol = PROTOCOL_ALIASES.get(fields.get("protocol", ""))
         port = _port(fields)
         duration = _duration(fields)
         if protocol is None or port is None or duration is None:

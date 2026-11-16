@@ -40,6 +40,12 @@ FAILURE_LOG = "\n".join(
         "server_id=1 protocol=awg port=51820 "
         'err="failed to build amnezia-awg2 image (code 1): '
         f'pull {SECRET_TOKEN} from {PRIVATE_HOST} denied: {REMOTE_STDERR}"',
+        # Issue #744: the user-connection path now logs the AddClient cause, and
+        # this proves the real finalizer retains it alongside the install facts.
+        'time=2026-11-14T09:15:55.000+00:00 level=ERROR msg="failed to add client" '
+        "server_id=1 protocol=awg "
+        'error="failed to save clients table: '
+        f'{SECRET_TOKEN} {PRIVATE_HOST}"',
         'time=2026-11-10T04:05:56.000+00:00 level=INFO msg="shutting down"',
         "",
     ]
@@ -157,8 +163,23 @@ def test_failing_lifecycle_retains_category_and_preserves_nonzero_result(
     assert gate.returncode == 0, gate.stdout + gate.stderr
     assert artifact.is_file()
 
-    # 4. Hostile material never reached the console or the artifact.
-    sinks = result.stdout + result.stderr + artifact.read_text(encoding="utf-8")
+    # 3b. The client-creation cause (#744) survived the same teardown.
+    add_client_artifact = tmp_path / "e2e-diagnostics" / "add-client-failure.json"
+    assert add_client_artifact.is_file(), result.stdout + result.stderr
+    add_client_payload = json.loads(add_client_artifact.read_text(encoding="utf-8"))
+    assert add_client_payload["source"] == "client-creation-failure-log"
+    assert add_client_payload["occurrences"] == 1
+    assert add_client_payload["add_client_failures"] == [
+        {"server_id": 1, "protocol": "awg", "step": "clients_table_save", "occurrences": 1}
+    ]
+
+    # 4. Hostile material never reached the console or either artifact.
+    sinks = (
+        result.stdout
+        + result.stderr
+        + artifact.read_text(encoding="utf-8")
+        + add_client_artifact.read_text(encoding="utf-8")
+    )
     for marker in (SECRET_TOKEN, PRIVATE_HOST, REMOTE_STDERR):
         assert marker not in sinks, f"leaked {marker!r}"
 
@@ -173,7 +194,9 @@ def test_clean_lifecycle_publishes_no_failure_evidence(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert "ALL STAGES PASSED" in result.stdout
     assert not (tmp_path / "e2e-diagnostics" / "install-failure.json").exists()
+    assert not (tmp_path / "e2e-diagnostics" / "add-client-failure.json").exists()
     assert "0 failed-install line(s)" in result.stdout + result.stderr
+    assert "0 failed-request line(s)" in result.stdout + result.stderr
 
 
 def test_failure_evidence_absent_when_docker_logs_fails(tmp_path: Path) -> None:
@@ -185,6 +208,7 @@ def test_failure_evidence_absent_when_docker_logs_fails(tmp_path: Path) -> None:
     # ...but nothing claims a cause it could not read.
     assert "unavailable; no diagnostics collected" in result.stdout + result.stderr
     assert not (tmp_path / "e2e-diagnostics" / "install-failure.json").exists()
+    assert not (tmp_path / "e2e-diagnostics" / "add-client-failure.json").exists()
     assert not list(tmp_path.glob("panel-operator-*.log"))
 
 

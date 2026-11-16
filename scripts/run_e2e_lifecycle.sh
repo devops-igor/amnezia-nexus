@@ -114,12 +114,14 @@ finalize() {
             --probe-log "$probe_tmp"
             --call-timing-log "$probe_tmp"
             --install-failure-log "$probe_tmp"
+            --add-client-failure-log "$probe_tmp"
         )
     elif [ -n "${E2E_PANEL_LOG_PATH:-}" ]; then
         probe_args=(
             --probe-log "$E2E_PANEL_LOG_PATH"
             --call-timing-log "$E2E_PANEL_LOG_PATH"
             --install-failure-log "$E2E_PANEL_LOG_PATH"
+            --add-client-failure-log "$E2E_PANEL_LOG_PATH"
         )
     fi
     if ! (cd "$REPO_ROOT" && python3 -m tests.e2e.diagnostics \
