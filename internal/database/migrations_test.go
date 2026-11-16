@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -21,13 +20,21 @@ import (
 // migrations write, so no production code carries a test seam: the injected
 // error travels through the same ExecContext call the migration uses. Each
 // injector returns a function that removes the trigger again.
+//
+// A trigger must be scoped to the statement of exactly one migration, otherwise
+// the fault lands in whichever migration writes that table first and the test
+// for a later migration never exercises its own writer. SQLite's `UPDATE OF
+// <columns>` matches the column list of the UPDATE statement, which separates the
+// credentials rewrite (`ssh_pass, ssh_key`) from the protocols rewrite
+// (`protocols`) on the same servers table.
 
-// injectServerWriteFailure makes every UPDATE of servers with the given id fail.
-func injectServerWriteFailure(t *testing.T, db *DB, id int64) (remove func()) {
+// injectServerColumnWriteFailure aborts UPDATE statements on servers whose column
+// list includes any of the named columns, i.e. the statement of one migration.
+func injectServerColumnWriteFailure(t *testing.T, db *DB, columns, message string) (remove func()) {
 	t.Helper()
 
-	stmt := "CREATE TRIGGER inject_servers_write BEFORE UPDATE ON servers WHEN NEW.id = " +
-		strconv.FormatInt(id, 10) + " BEGIN SELECT RAISE(ABORT, 'injected server write failure'); END"
+	stmt := "CREATE TRIGGER inject_servers_write BEFORE UPDATE OF " + columns + " ON servers " +
+		"BEGIN SELECT RAISE(ABORT, '" + message + "'); END"
 	if _, err := db.SQLDB().ExecContext(context.Background(), stmt); err != nil {
 		t.Fatalf("failed to install server write fault: %v", err)
 	}
@@ -153,19 +160,32 @@ func TestInjectedWriteFailuresReachMigrationStatements(t *testing.T) {
 	seedLegacyPlaintextState(t, db)
 	ctx := context.Background()
 
-	removeServers := injectServerWriteFailure(t, db, 2)
+	removeCreds := injectServerColumnWriteFailure(t, db, "ssh_pass, ssh_key", "injected credentials write failure")
 	_, err = db.SQLDB().ExecContext(ctx, "UPDATE servers SET ssh_pass = ?, ssh_key = ? WHERE id = ?", "x", "y", 2)
-	if err == nil || !strings.Contains(err.Error(), "injected server write failure") {
-		removeServers()
-		t.Fatalf("the server write fault did not reach the statement: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "injected credentials write failure") {
+		removeCreds()
+		t.Fatalf("the credentials write fault did not reach the credential statement: %v", err)
 	}
-	// Negative control: the same statement for another row still succeeds, so the
-	// fault is scoped to the row the migration writes and is not a blanket error.
-	if _, err := db.SQLDB().ExecContext(ctx, "UPDATE servers SET ssh_pass = ?, ssh_key = ? WHERE id = ?", "x", "y", 1); err != nil {
-		removeServers()
-		t.Fatalf("the server write fault also blocked an unrelated row: %v", err)
+	// The credentials fault must not touch the protocols statement: otherwise it
+	// would abort the xray migration first and that regression would never reach
+	// its own writer.
+	if _, err := db.SQLDB().ExecContext(ctx, "UPDATE servers SET protocols = ? WHERE id = ?", `{"xray":{"port":443}}`, 1); err != nil {
+		removeCreds()
+		t.Fatalf("the credentials write fault also blocked the protocols statement: %v", err)
 	}
-	removeServers()
+	removeCreds()
+
+	removeProtocols := injectServerColumnWriteFailure(t, db, "protocols", "injected protocols write failure")
+	_, err = db.SQLDB().ExecContext(ctx, "UPDATE servers SET protocols = ? WHERE id = ?", `{"xray":{"port":443}}`, 1)
+	if err == nil || !strings.Contains(err.Error(), "injected protocols write failure") {
+		removeProtocols()
+		t.Fatalf("the protocols write fault did not reach the protocols statement: %v", err)
+	}
+	if _, err := db.SQLDB().ExecContext(ctx, "UPDATE servers SET ssh_pass = ?, ssh_key = ? WHERE id = ?", "x", "y", 2); err != nil {
+		removeProtocols()
+		t.Fatalf("the protocols write fault also blocked the credential statement: %v", err)
+	}
+	removeProtocols()
 
 	removeFlag := injectFlagWriteFailure(t, db, "credentials_encrypted")
 	_, err = db.SQLDB().ExecContext(ctx,
@@ -181,7 +201,13 @@ func TestInjectedWriteFailuresReachMigrationStatements(t *testing.T) {
 		"INSERT INTO settings (key, value) VALUES ('ssl', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", `{"enabled":false}`)
 	if err == nil || !strings.Contains(err.Error(), "injected ssl write failure") {
 		removeSSL()
-		t.Fatalf("the ssl write fault did not reach the statement: %v", err)
+		t.Fatalf("the ssl write fault did not reach the ssl statement: %v", err)
+	}
+	// A different settings key is not the ssl migration's statement.
+	if _, err := db.SQLDB().ExecContext(ctx,
+		"INSERT INTO settings (key, value) VALUES ('appearance', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", `{"title":"x"}`); err != nil {
+		removeSSL()
+		t.Fatalf("the ssl write fault also blocked another settings statement: %v", err)
 	}
 	removeSSL()
 }
@@ -200,16 +226,18 @@ func TestCredentialMigrationIsAtomicWithItsCompletionFlag(t *testing.T) {
 
 	seedLegacyPlaintextState(t, db)
 
-	// 1. The rewrite fails for the second server.
-	remove := injectServerWriteFailure(t, db, 2)
+	// 1. The credential rewrite itself fails (fault scoped to the ssh_pass/ssh_key
+	//    statement, so it cannot land in the protocols migration instead).
+	remove := injectServerColumnWriteFailure(t, db, "ssh_pass, ssh_key", "injected credentials write failure")
 	err = db.InitSchema(ctx)
 	if err == nil {
 		remove()
 		t.Fatal("InitSchema succeeded although the credential rewrite was aborted")
 	}
-	if !strings.Contains(err.Error(), "injected server write failure") {
+	if !strings.Contains(err.Error(), "failed to store encrypted credentials for server") ||
+		!strings.Contains(err.Error(), "injected credentials write failure") {
 		remove()
-		t.Fatalf("InitSchema failed for an unrelated reason: %v", err)
+		t.Fatalf("InitSchema failed outside the credential rewrite: %v", err)
 	}
 	remove()
 
@@ -307,15 +335,20 @@ func TestXrayKeyMigrationIsAtomicWithItsCompletionFlag(t *testing.T) {
 		t.Fatalf("failed to seed malformed protocols row: %v", err)
 	}
 
-	remove := injectServerWriteFailure(t, db, 2)
+	// The fault is scoped to the xray migration's own statement
+	// (UPDATE servers SET protocols = ...), so the credentials migration - which
+	// runs earlier and writes a different column list - completes and the abort
+	// lands inside the xray rewrite. The error must name that write.
+	remove := injectServerColumnWriteFailure(t, db, "protocols", "injected protocols write failure")
 	err = db.InitSchema(ctx)
 	if err == nil {
 		remove()
 		t.Fatal("InitSchema succeeded although the protocols rewrite was aborted")
 	}
-	if !strings.Contains(err.Error(), "injected server write failure") {
+	if !strings.Contains(err.Error(), "failed to store cleaned protocols for server") ||
+		!strings.Contains(err.Error(), "injected protocols write failure") {
 		remove()
-		t.Fatalf("InitSchema failed for an unrelated reason: %v", err)
+		t.Fatalf("InitSchema failed outside the xray protocols rewrite: %v", err)
 	}
 	remove()
 
@@ -362,15 +395,18 @@ func TestSSLKeyMigrationIsAtomicWithItsCompletionFlag(t *testing.T) {
 
 	seedLegacyPlaintextState(t, db)
 
+	// The fault is scoped to the ssl settings statement, so the abort lands in the
+	// ssl migration's own write and the error must name it.
 	remove := injectSSLSettingWriteFailure(t, db)
 	err = db.InitSchema(ctx)
 	if err == nil {
 		remove()
 		t.Fatal("InitSchema succeeded although the ssl rewrite was aborted")
 	}
-	if !strings.Contains(err.Error(), "injected ssl write failure") {
+	if !strings.Contains(err.Error(), "failed to store encrypted ssl settings") ||
+		!strings.Contains(err.Error(), "injected ssl write failure") {
 		remove()
-		t.Fatalf("InitSchema failed for an unrelated reason: %v", err)
+		t.Fatalf("InitSchema failed outside the ssl rewrite: %v", err)
 	}
 	remove()
 
@@ -423,16 +459,18 @@ func TestSchemaInitRetriesAfterPartiallyAppliedMigrationSequence(t *testing.T) {
 	seedLegacyPlaintextState(t, db)
 
 	// The ssl migration runs after the credential and xray migrations, so this
-	// fault interrupts initialization partway through the sequence.
+	// fault (scoped to the ssl settings statement) interrupts initialization
+	// partway through the sequence, in that migration's own write.
 	remove := injectSSLSettingWriteFailure(t, db)
 	err = db.InitSchema(ctx)
 	if err == nil {
 		remove()
 		t.Fatal("InitSchema succeeded although the ssl rewrite was aborted")
 	}
-	if !strings.Contains(err.Error(), "injected ssl write failure") {
+	if !strings.Contains(err.Error(), "failed to store encrypted ssl settings") ||
+		!strings.Contains(err.Error(), "injected ssl write failure") {
 		remove()
-		t.Fatalf("InitSchema failed for an unrelated reason: %v", err)
+		t.Fatalf("InitSchema failed outside the ssl rewrite: %v", err)
 	}
 	remove()
 
