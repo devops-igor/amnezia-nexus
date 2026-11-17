@@ -194,24 +194,29 @@ func replyRCode(t *testing.T, reply []byte) int {
 	return msg.Rcode
 }
 
-// matchReply finds the captured reply that answers exactly this plan: addressed to the
-// client the query was sent for, to the client port it came from, carrying its DNS id
-// and its question. Any other reply already captured by the fixture - another client's
-// answer, a refusal for another port - is not it.
+// replyAnswersPlan reports whether one captured packet is the reply to this plan: it is
+// addressed to the client the query was sent for, to the client port it came from, and
+// it carries the query's DNS id and question.
+func (f *clientDiagFixture) replyAnswersPlan(plan dnsQueryPlan, reply []byte) bool {
+	dstIP, dstPort, payload, ok := capturedUDP(reply)
+	if !ok || dstIP != f.destination(plan) || dstPort != plan.srcPort {
+		return false
+	}
+	msg := new(mdns.Msg)
+	if err := msg.Unpack(payload); err != nil || msg.Id != plan.id || len(msg.Question) != 1 {
+		return false
+	}
+	return msg.Question[0].Name == mdns.Fqdn(plan.name) && msg.Question[0].Qtype == plan.qtype
+}
+
+// matchReply finds the captured reply that answers exactly this plan. Any other reply
+// already captured by the fixture - another client's answer, a refusal for another port -
+// is not it.
 func (f *clientDiagFixture) matchReply(plan dnsQueryPlan) ([]byte, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	wantIP := f.destination(plan)
 	for _, reply := range f.replies {
-		dstIP, dstPort, payload, ok := capturedUDP(reply)
-		if !ok || dstIP != wantIP || dstPort != plan.srcPort {
-			continue
-		}
-		msg := new(mdns.Msg)
-		if err := msg.Unpack(payload); err != nil || msg.Id != plan.id || len(msg.Question) != 1 {
-			continue
-		}
-		if msg.Question[0].Name != mdns.Fqdn(plan.name) || msg.Question[0].Qtype != plan.qtype {
+		if !f.replyAnswersPlan(plan, reply) {
 			continue
 		}
 		out := make([]byte, len(reply))
