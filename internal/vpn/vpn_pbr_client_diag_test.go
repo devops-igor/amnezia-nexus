@@ -486,7 +486,7 @@ func TestClientDiagnosisReportsTheProducersOwnRecords(t *testing.T) {
 	// answer's caveats.
 	for _, want := range []string{
 		ClientDiagnosisLimitApplication,
-		ClientDiagnosisLimitProxyReturn,
+		ClientDiagnosisLimitReturnTupleAssociation,
 	} {
 		if !clientDiagHas(answer.Coverage.NotCovered, want) {
 			t.Errorf("coverage.not_covered is missing %q: %v", want, answer.Coverage.NotCovered)

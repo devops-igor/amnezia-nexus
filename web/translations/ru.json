@@ -1117,5 +1117,6 @@
   "policy_client_failure_packet_too_large": "пакет слишком велик",
   "policy_client_failure_return_path_closed": "путь возврата закрыт",
   "policy_client_failure_client_write_failed": "ошибка записи клиенту",
-  "policy_client_failure_client_short_write": "клиенту записан неполный пакет"
+  "policy_client_failure_client_short_write": "клиенту записан неполный пакет",
+  "policy_client_return_authority_current_tuple_association": "совпадение с потоком, которому сейчас принадлежит кортеж"
 }

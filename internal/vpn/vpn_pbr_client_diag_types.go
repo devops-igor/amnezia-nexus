@@ -64,14 +64,19 @@ const (
 	ClientDiagnosisLimitFlowOutcomes         = "flow_outcomes_not_recorded"
 	ClientDiagnosisLimitApplication          = "application_success_not_observable"
 	ClientDiagnosisLimitProxyReturn          = "proxy_return_not_measured"
-	ClientDiagnosisLimitEvidenceScope        = "route_cache_evidence_only"
-	ClientDiagnosisLimitSessionEnd           = "session_end_not_distinguishable"
-	ClientDiagnosisLimitDrops                = "drop_records_not_retained"
-	ClientDiagnosisLimitIPv6                 = "ipv6_not_supported"
-	ClientDiagnosisLimitEncryptedDNS         = "encrypted_dns_not_observed"
-	ClientDiagnosisLimitSingleSnapshot       = "not_an_atomic_cross_subsystem_snapshot"
-	ClientDiagnosisLimitSelectionChanged     = "selection_changed_during_read"
-	ClientDiagnosisLimitFlowScanPartial      = "flow_scan_window_partial"
+	// ClientDiagnosisLimitReturnTupleAssociation states the authority behind a return
+	// claim: a reply is associated with the flow that currently owns the tuple. A late
+	// reply from a replaced incarnation on the same tuple is not distinguishable from a
+	// current one by routing state alone.
+	ClientDiagnosisLimitReturnTupleAssociation = "return_current_tuple_association"
+	ClientDiagnosisLimitEvidenceScope          = "route_cache_evidence_only"
+	ClientDiagnosisLimitSessionEnd             = "session_end_not_distinguishable"
+	ClientDiagnosisLimitDrops                  = "drop_records_not_retained"
+	ClientDiagnosisLimitIPv6                   = "ipv6_not_supported"
+	ClientDiagnosisLimitEncryptedDNS           = "encrypted_dns_not_observed"
+	ClientDiagnosisLimitSingleSnapshot         = "not_an_atomic_cross_subsystem_snapshot"
+	ClientDiagnosisLimitSelectionChanged       = "selection_changed_during_read"
+	ClientDiagnosisLimitFlowScanPartial        = "flow_scan_window_partial"
 	// DNS observation coverage gaps. They are facts about this build's
 	// observation boundary, reported rather than implied by silence.
 	ClientDiagnosisLimitDNSCoverage      = "dns_coverage_partial"
@@ -380,6 +385,9 @@ type ClientDiagnosisFlowReturn struct {
 	LastAt   string `json:"last_at,omitempty"`
 	// PROXY direction: arrival, queue admission and client handoff are distinct
 	// observations, so "admitted" is never rendered as "delivered".
+	// Authority names what the match proves. Today it is the current tuple owner; it is
+	// not proof of which remote incarnation sent the reply.
+	Authority string `json:"authority,omitempty"`
 	Matched   uint64 `json:"matched,omitempty"`
 	Admitted  uint64 `json:"admitted,omitempty"`
 	Dropped   uint64 `json:"dropped,omitempty"`

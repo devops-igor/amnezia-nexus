@@ -1117,5 +1117,6 @@
   "policy_client_failure_packet_too_large": "بسته بیش از حد بزرگ",
   "policy_client_failure_return_path_closed": "مسیر بازگشت بسته است",
   "policy_client_failure_client_write_failed": "خطای نوشتن برای کلاینت",
-  "policy_client_failure_client_short_write": "قاب ناقص برای کلاینت"
+  "policy_client_failure_client_short_write": "قاب ناقص برای کلاینت",
+  "policy_client_return_authority_current_tuple_association": "منطبق با جریانی که اکنون مالک این تاپل است"
 }

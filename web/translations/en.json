@@ -1117,5 +1117,6 @@
   "policy_client_failure_packet_too_large": "packet too large",
   "policy_client_failure_return_path_closed": "return path closed",
   "policy_client_failure_client_write_failed": "client write failed",
-  "policy_client_failure_client_short_write": "client short write"
+  "policy_client_failure_client_short_write": "client short write",
+  "policy_client_return_authority_current_tuple_association": "matched by the flow that owns this tuple now"
 }

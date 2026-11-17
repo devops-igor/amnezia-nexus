@@ -37,7 +37,7 @@ func clientDiagnosisTime(t time.Time) string {
 func clientDiagnosisNotCovered() []string {
 	return []string{
 		ClientDiagnosisLimitApplication,
-		ClientDiagnosisLimitProxyReturn,
+		ClientDiagnosisLimitReturnTupleAssociation,
 		ClientDiagnosisLimitIPv6,
 		ClientDiagnosisLimitEncryptedDNS,
 	}
@@ -521,6 +521,7 @@ func clientDiagnosisFlowReturn(flow forwarder.SessionFlow) ClientDiagnosisFlowRe
 		}
 		return ClientDiagnosisFlowReturn{
 			Evidence:  "observed",
+			Authority: "current_tuple_association",
 			Matched:   flow.ReturnMatched,
 			Admitted:  flow.ReturnAdmitted,
 			Dropped:   flow.ReturnDropped,

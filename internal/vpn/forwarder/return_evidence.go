@@ -19,13 +19,14 @@ import (
 // Return failure tokens. Each names a place the reply actually stopped, so an operator
 // can tell a full client queue from a closed engine writer.
 const (
-	FlowReturnQueueFull   = "client_queue_full"
-	FlowReturnRateLimited = "client_rate_limited"
-	FlowReturnOversized   = "packet_too_large"
-	FlowReturnPathClosed  = "return_path_closed"
-	FlowReturnWriteFailed = "client_write_failed"
-	FlowReturnShortWrite  = "client_short_write"
-	FlowReturnNotFound    = "no_recorded_flow"
+	FlowReturnQueueFull     = "client_queue_full"
+	FlowReturnRateLimited   = "client_rate_limited"
+	FlowReturnOversized     = "packet_too_large"
+	FlowReturnPathClosed    = "return_path_closed"
+	FlowReturnWriteFailed   = "client_write_failed"
+	FlowReturnShortWrite    = "client_short_write"
+	FlowReturnNotFound      = "no_recorded_flow"
+	FlowReturnRouteReplaced = "route_replaced_during_handoff"
 )
 
 // returnFlowKey reverses a reply packet into the FlowKey of the flow that sent it.
@@ -46,8 +47,34 @@ func returnFlowKey(peerKey string, packet []byte, clientIP netip.Addr) (FlowKey,
 	if protocol != 6 && protocol != 17 {
 		return FlowKey{}, false
 	}
-	if len(packet) < header+4 {
+	// Bytes after the declared total are not part of this datagram. A packet whose
+	// declared length stops before the ports carries no tuple, even when the slice
+	// continues with bytes that look like ports.
+	if total < header+4 || len(packet) < header+4 {
 		return FlowKey{}, false
+	}
+	// A non-initial fragment has no transport header of its own: its ports live in the
+	// first fragment, so this packet cannot name a flow.
+	if binary.BigEndian.Uint16(packet[6:8])&0x1fff != 0 {
+		return FlowKey{}, false
+	}
+	// The transport header must be complete enough to be the protocol it claims.
+	switch protocol {
+	case 6:
+		if total-header < 20 {
+			return FlowKey{}, false
+		}
+		if dataOffset := int(packet[header+12]>>4) * 4; dataOffset < 20 || header+dataOffset > total {
+			return FlowKey{}, false
+		}
+	case 17:
+		if total-header < 8 {
+			return FlowKey{}, false
+		}
+		udpLength := int(binary.BigEndian.Uint16(packet[header+4 : header+6]))
+		if udpLength < 8 || header+udpLength > total {
+			return FlowKey{}, false
+		}
 	}
 	remoteIP := [4]byte{packet[12], packet[13], packet[14], packet[15]}
 	destination := [4]byte{packet[16], packet[17], packet[18], packet[19]}

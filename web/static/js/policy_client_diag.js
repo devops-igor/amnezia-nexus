@@ -413,6 +413,11 @@
                 if (flow.return.failure) {
                     chain = chain + ' (' + clientTokenLabel('failure', flow.return.failure) + ')';
                 }
+                // The claim beside the numbers: this is the flow that owns the tuple now,
+                // which is not proof of which remote incarnation answered.
+                if (flow.return.authority) {
+                    chain = chain + ' · ' + clientTokenLabel('return_authority', flow.return.authority);
+                }
                 outcome = outcome + ' · ' + chain;
             }
             // Admission and the backend device write are different facts: a proxy

@@ -498,6 +498,14 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		clientIP = netip.Addr{}
 	}
 	returnEvidence, returnMatched := f.proxyReturnEvidence(route, packet, clientIP)
+	// Arrival is recorded BEFORE the size, rate and queue decisions, so the counters
+	// conserve: every matched reply is either admitted or dropped, and the observed label
+	// describes what was actually measured rather than what survived the filters.
+	if returnMatched {
+		returnEvidence.recordReturnMatch()
+	} else {
+		f.proxyReturnsUnmatched.Add(1)
+	}
 
 	pktLen := int64(len(packet))
 	if len(packet) > MaxClientQueuePacketBytes {
@@ -524,12 +532,8 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		f.dropsNoRoute.Add(1)
 		f.dropsTotal.Add(1)
 		f.classifyReturnReject(ReturnRejectedUnrouted)
+		returnEvidence.recordReturnRefused(FlowReturnRouteReplaced)
 		return ErrSessionNotRegistered
-	}
-	if returnMatched {
-		returnEvidence.recordReturnMatch()
-	} else {
-		f.proxyReturnsUnmatched.Add(1)
 	}
 	clientQueue := route.clientQueue
 	f.aggregateQueueMu.Lock()
@@ -841,6 +845,10 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 		currentRoute, current := f.routesByPeer[route.peerKey]
 		if !current || currentRoute != route || route.stopped {
 			f.mu.RUnlock()
+			// The route was replaced or stopped before the handoff. The reply never
+			// reaches a client, and the flow that admitted it records where it stopped
+			// instead of looking queued forever.
+			pkt.evidenceOrNil().recordReturnRefused(FlowReturnRouteReplaced)
 			continue
 		}
 		var dev packetWriter
