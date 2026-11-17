@@ -29,7 +29,7 @@ from tests.e2e.conftest import api_get, api_post
 logger = logging.getLogger(__name__)
 
 # Pinned multiarch AmneziaWG client container image matching internal/manager/awg/awg.go
-PRIMARY_CLIENT_IMAGE = "devopsigor/amneziawg:v3.1.20260828-1"
+PRIMARY_CLIENT_IMAGE = "devopsigor/amneziawg:v3.1.20261116-1"
 FALLBACK_CLIENT_IMAGE = "devopsigor/amneziawg:ci-test"
 GATEWAY_IP = "10.8.1.1"
 

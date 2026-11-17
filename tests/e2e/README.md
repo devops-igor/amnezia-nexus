@@ -265,7 +265,7 @@ While control-plane E2E suites exercise web interfaces, REST APIs, database stat
 
 ### Required Capabilities & Docker Isolation
 To ensure test hermeticity without polluting host routing tables or requiring root privileges on the test runner:
-- The test suite launches an ephemeral client container using the pinned multiarch image `devopsigor/amneziawg:v3.1.20260828-1` (matching `internal/manager/awg/awg.go`, with fallback to `devopsigor/amneziawg:ci-test`).
+- The test suite launches an ephemeral client container using the pinned multiarch image `devopsigor/amneziawg:v3.1.20261116-1` (matching `internal/manager/awg/awg.go`, with fallback to `devopsigor/amneziawg:ci-test`).
 - Requires local Docker daemon access (`docker info`).
 - The client container runs without `--privileged`, using minimal capabilities: `--cap-add NET_ADMIN --sysctl net.ipv4.conf.all.src_valid_mark=1 --device /dev/net/tun:/dev/net/tun` to provide a dedicated, isolated network namespace (`ip netns`).
 - A dummy `/usr/local/bin/sysctl` script is installed inside the container so `awg-quick`'s check passes against the container's read-only `/proc` without requiring host privileges.

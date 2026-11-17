@@ -18,7 +18,7 @@ import (
 //
 // Why the gate must be armed at construction time: the upstream engine starts
 // its TUN reader goroutine inside device.NewDevice (amneziawg-go
-// v3.1.20260828 device/device.go:374) and device.Down() only closes the bind
+// v3.1.20261116 device/device.go:374) and device.Down() only closes the bind
 // and stops the peers (downLocked, device/device.go:236-248), so no upstream
 // API can stop it. That reader then sits parked inside VirtualTUN.Read,
 // already past the gate at the top of Read. Arming the gate after the fact
