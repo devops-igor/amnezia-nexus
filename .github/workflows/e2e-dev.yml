@@ -246,10 +246,10 @@ jobs:
           if ! awg --version >/dev/null 2>&1; then
             echo "Installing functional awg CLI tool and musl runtime..."
             if [ ! -f /lib/ld-musl-aarch64.so.1 ]; then
-              sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20260828-1 /lib/ld-musl-aarch64.so.1 | sudo tee /lib/ld-musl-aarch64.so.1 >/dev/null
+              sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20261116-1 /lib/ld-musl-aarch64.so.1 | sudo tee /lib/ld-musl-aarch64.so.1 >/dev/null
               sudo chmod 755 /lib/ld-musl-aarch64.so.1
             fi
-            sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20260828-1 /usr/local/bin/awg | sudo tee /usr/local/bin/awg >/dev/null
+            sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20261116-1 /usr/local/bin/awg | sudo tee /usr/local/bin/awg >/dev/null
             sudo chmod 755 /usr/local/bin/awg
           fi
           echo "Toolchain status:"

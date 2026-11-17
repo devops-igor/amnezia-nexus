@@ -59,9 +59,9 @@ fi
 }
 
 // awgBaseImage pins the AmneziaWG userspace base image used to build AWG
-// backends. devopsigor/amneziawg:v3.1.20260828-1 is a versioned multiarch
+// backends. devopsigor/amneziawg:v3.1.20261116-1 is a versioned multiarch
 // (amd64+arm64) tag from the amneziawg-docker repo, built from the
-// AmneziaWG v3.1.20260828 source (devopsigor publishing). Multiarch is
+// AmneziaWG v3.1.20261116 source (devopsigor publishing). Multiarch is
 // required because backends install on both amd64 and arm64 hosts — the
 // upstream amneziavpn/amneziawg-go image publishes amd64 only, which broke
 // ARM64 installs (Issue #225). The versioned tag is chosen over :latest
@@ -70,7 +70,7 @@ fi
 // installs must pin a pinned, versioned release. The explicit pull
 // before build ensures the tag exists on the host instead of failing
 // mid-build with a stale local cache.
-const awgBaseImage = "devopsigor/amneziawg:v3.1.20260828-1"
+const awgBaseImage = "devopsigor/amneziawg:v3.1.20261116-1"
 
 func (m *AWGManager) buildAndRunAWGContainer(ctx context.Context, client ssh.SSHClient, port string) error {
 	cName := m.containerName()
