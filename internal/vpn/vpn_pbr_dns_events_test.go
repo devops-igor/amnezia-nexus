@@ -186,8 +186,12 @@ func TestClientDiagnosisExposesTerminalEvents(t *testing.T) {
 	if answer.DNS.EventCoverage.Written != 2 {
 		t.Errorf("written = %d, want both queries", answer.DNS.EventCoverage.Written)
 	}
-	if len(answer.DNS.EventCoverage.NotRecorded) == 0 {
-		t.Error("event coverage must state its gaps")
+	// The query history records the transport, the receipt instant, failed answers and
+	// non-A queries, so it has no per-store gap list to state; the panel's coverage block
+	// carries the facts no store retains at all.
+	if len(answer.DNS.EventCoverage.NotRecorded) != 0 {
+		t.Errorf("event coverage claims gaps the query history records: %v",
+			answer.DNS.EventCoverage.NotRecorded)
 	}
 }
 
