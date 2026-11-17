@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
@@ -28,23 +29,33 @@ import (
 
 // issue863Upstream is a loopback UDP DNS upstream whose latency and stall are
 // controlled by the test, so a "healthy upstream" is a real network exchange.
+// When release is set, a query blocks on it while stall is nil or true.
 type issue863Upstream struct {
 	addr    netip.AddrPort
 	queries atomic.Int64
 	release <-chan struct{}
+	stall   *atomic.Bool
 	latency time.Duration
 }
 
 func issue863StartUpstream(t *testing.T, latency time.Duration, release <-chan struct{}) *issue863Upstream {
 	t.Helper()
+	return issue863StartUpstreamWithStall(t, latency, release, nil)
+}
+
+// issue863StartUpstreamWithStall starts an upstream that only blocks on release
+// while stall is true, so a test can measure a healthy exchange first and hold
+// later ones afterwards.
+func issue863StartUpstreamWithStall(t *testing.T, latency time.Duration, release <-chan struct{}, stall *atomic.Bool) *issue863Upstream {
+	t.Helper()
 	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen upstream: %v", err)
 	}
-	up := &issue863Upstream{latency: latency, release: release}
+	up := &issue863Upstream{latency: latency, release: release, stall: stall}
 	srv := &mdns.Server{PacketConn: conn, Handler: mdns.HandlerFunc(func(w mdns.ResponseWriter, req *mdns.Msg) {
 		up.queries.Add(1)
-		if up.release != nil {
+		if up.release != nil && (up.stall == nil || up.stall.Load()) {
 			<-up.release
 		}
 		if up.latency > 0 {
@@ -166,6 +177,15 @@ type issue863Env struct {
 
 func issue863NewEnv(t *testing.T, up *issue863Upstream) *issue863Env {
 	t.Helper()
+	return issue863NewEnvWithServerConfig(t, up, nil)
+}
+
+// issue863NewEnvWithServerConfig builds the same production env, optionally with
+// an explicit DNS server configuration so a test can exercise custom positive
+// admission budgets through the real gateway and status path. A nil config uses
+// the production constructor exactly as the service does.
+func issue863NewEnvWithServerConfig(t *testing.T, up *issue863Upstream, serverCfg *gatewaydns.ServerConfig) *issue863Env {
+	t.Helper()
 	gwDNS := netip.MustParseAddr("10.100.0.1")
 	rules, _, err := policy.Parse(context.Background(), strings.NewReader("speedtest.net\n"),
 		policy.Source{ID: "issue863", Format: policy.FormatDomains, BareDomainMode: policy.DomainModeInclusiveSuffix},
@@ -184,11 +204,16 @@ func issue863NewEnv(t *testing.T, up *issue863Upstream) *issue863Env {
 	resolver, err := gatewaydns.NewUpstreamResolver(gatewaydns.ResolverConfig{
 		Upstreams:             []policy.Upstream{{Address: up.addr.Addr().String(), Port: int(up.addr.Port()), Transport: policy.TransportPlain}},
 		AllowLoopbackUpstream: true,
+		// A held upstream must stay held while a test measures admission, and these
+		// fixtures bound every wait themselves; the production attempt deadline
+		// would otherwise turn a deliberate stall into a timeout mid-measurement.
+		AttemptTimeout: 30 * time.Second,
+		QueryTimeout:   45 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("build upstream resolver: %v", err)
 	}
-	gw := initDNSGateway(gwDNS, matcher, rc, resolver)
+	gw := issue863BuildGateway(t, gwDNS, matcher, rc, resolver, serverCfg)
 	if gw == nil {
 		t.Fatal("initDNSGateway returned nil")
 	}
@@ -209,6 +234,37 @@ func issue863NewEnv(t *testing.T, up *issue863Upstream) *issue863Env {
 	}
 	t.Cleanup(func() { _ = svc.TeardownPBR() })
 	return &issue863Env{t: t, fwd: fwd, rc: rc, gw: gw, up: up, svc: svc}
+}
+
+// issue863BuildGateway returns the production gateway. When the test supplies a
+// server configuration it builds the same production transport over a server
+// with explicit budgets — real server, real gateway transport, the same route
+// observer and the same interception rule as the production constructor — so a
+// test never swaps in a different implementation.
+func issue863BuildGateway(t *testing.T, gwDNS netip.Addr, matcher *policy.Matcher, rc *MemoryRouteCache, resolver gatewaydns.Resolver, serverCfg *gatewaydns.ServerConfig) *gatewaydns.Gateway {
+	t.Helper()
+	if serverCfg == nil {
+		return initDNSGateway(gwDNS, matcher, rc, resolver)
+	}
+	cfg := *serverCfg
+	cfg.Gateway = netip.AddrPortFrom(gwDNS, 53)
+	srv, err := gatewaydns.NewServer(cfg, resolver, matcher)
+	if err != nil {
+		t.Fatalf("build dns server with explicit budget: %v", err)
+	}
+	var obs gatewaydns.RouteObserver
+	if rc != nil {
+		obs = rc
+	}
+	gw, err := gatewaydns.NewGateway(gatewaydns.GatewayConfig{
+		Gateway:                  netip.AddrPortFrom(gwDNS, 53),
+		RouteObserver:            obs,
+		InterceptAllDestinations: true,
+	}, srv)
+	if err != nil {
+		t.Fatalf("build dns gateway with explicit budget: %v", err)
+	}
+	return gw
 }
 
 func (e *issue863Env) addSession(idx int) (sid, peer string, ip netip.Addr, client *issue863Client, path *forwarder.ReturnPath) {
@@ -645,4 +701,390 @@ func TestIssue863_AdmissionBudgetCoversProducerConcurrency(t *testing.T) {
 		t.Fatalf("per-session DNS budget %d must stay below the server-wide budget %d",
 			gatewaydns.DefaultMaxInflightPerSession, gatewaydns.DefaultMaxInflight)
 	}
+}
+
+// TestIssue863_MixedTCPAndUDPProducers is the regression for the reported mixed
+// transport case: one live TCP query holds a session slot while eight UDP queries
+// arrive from the same authenticated session. A TCP transport is a second
+// producer of concurrent queries, so the derived session budget covers it plus
+// the whole UDP worker pool and every one of those queries reaches the healthy
+// upstream with no panel-origin SERVFAIL.
+func TestIssue863_MixedTCPAndUDPProducers(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer func() { releaseOnce.Do(func() { close(release) }) }()
+	up := issue863StartUpstream(t, 0, release)
+	env := issue863NewEnv(t, up)
+
+	const sid, peer, ip = "issue863-mixed", "issue863-mixed-peer", "10.100.0.91"
+	capture := newIssue863Client()
+	dev, stack, err := netstack.CreateNetTUN([]netip.Addr{netip.MustParseAddr(ip)}, nil, 1500)
+	if err != nil {
+		t.Fatalf("create client netstack: %v", err)
+	}
+	path := forwarder.NewReturnPath(func(_, _ string, packet []byte) (int, error) {
+		capture.write("", "", packet)
+		if len(packet) > 20 && packet[9] == 6 {
+			if _, err := dev.Write([][]byte{append([]byte(nil), packet...)}, 0); err != nil {
+				return 0, err
+			}
+		}
+		return len(packet), nil
+	})
+	env.fwd.RegisterSessionWithReturnPath(sid, "issue863-mixed-conn", peer, ip, 1, path)
+	t.Cleanup(func() { env.fwd.BeginUnregisterSession(peer, sid).Wait() })
+
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		buffers := [][]byte{make([]byte, 1500)}
+		sizes := make([]int, 1)
+		for {
+			n, err := dev.Read(buffers, sizes, 0)
+			if err != nil {
+				return
+			}
+			if n > 0 {
+				_ = env.fwd.RouteClientToBackend(peer, append([]byte(nil), buffers[0][:sizes[0]]...))
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		_ = env.gw.Close()
+		_ = dev.Close()
+		select {
+		case <-pumpDone:
+		case <-time.After(2 * time.Second):
+			t.Error("client pump did not stop")
+		}
+	})
+
+	dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	tcpConn, err := stack.DialContextTCPAddrPort(dialCtx, netip.MustParseAddrPort("10.100.0.1:53"))
+	if err != nil {
+		t.Fatalf("dial gateway TCP: %v", err)
+	}
+	defer func() { _ = tcpConn.Close() }()
+	_ = tcpConn.SetDeadline(time.Now().Add(20 * time.Second))
+	dnsConn := &mdns.Conn{Conn: tcpConn}
+
+	tcpQuery := new(mdns.Msg)
+	tcpQuery.SetQuestion("issue863-mixed-tcp.example.test.", mdns.TypeHTTPS)
+	if err := dnsConn.WriteMsg(tcpQuery); err != nil {
+		t.Fatalf("write TCP query: %v", err)
+	}
+
+	// The TCP query must be inside its upstream exchange (holding a session slot)
+	// before the UDP burst arrives, so the case is the reported one and not a race.
+	deadline := time.Now().Add(10 * time.Second)
+	for up.queries.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := up.queries.Load(); got != 1 {
+		t.Fatalf("TCP query did not reach the healthy upstream (queries=%d)", got)
+	}
+
+	udpIDs := make([]uint16, 0, defaultDNSWorkerCount)
+	for i := 0; i < defaultDNSWorkerCount; i++ {
+		id := uint16(7100 + i)
+		udpIDs = append(udpIDs, id)
+		env.sendQuery(peer, netip.MustParseAddr(ip), id, fmt.Sprintf("issue863-mixed-udp%d.example.test.", i), mdns.TypeA)
+	}
+
+	wantQueries := int64(1 + defaultDNSWorkerCount)
+	for up.queries.Load() < wantQueries && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := up.queries.Load(); got != wantQueries {
+		t.Fatalf("mixed burst reached the upstream with %d queries want %d; refusals=%+v",
+			got, wantQueries, env.gw.AdmissionRejections())
+	}
+	if got := env.gw.AdmissionRejections(); got != (gatewaydns.AdmissionRejections{}) {
+		t.Fatalf("supported mixed-transport burst was refused by the panel: %+v", got)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+
+	tcpResp, err := dnsConn.ReadMsg()
+	if err != nil {
+		t.Fatalf("read TCP response: %v", err)
+	}
+	if tcpResp.Rcode != mdns.RcodeSuccess {
+		t.Fatalf("TCP query rcode=%d want success", tcpResp.Rcode)
+	}
+	noerror, servfail, noReply := capture.summary(udpIDs, 15*time.Second)
+	if noerror != len(udpIDs) || servfail != 0 || noReply != 0 {
+		t.Fatalf("mixed burst: UDP noerror=%d servfail=%d no_reply=%d want %d/0/0",
+			noerror, servfail, noReply, len(udpIDs))
+	}
+
+	// Sequential positive control on exactly the same TCP connection.
+	tcpQuery.SetQuestion("issue863-mixed-control.example.test.", mdns.TypeAAAA)
+	if err := dnsConn.WriteMsg(tcpQuery); err != nil {
+		t.Fatalf("write TCP control: %v", err)
+	}
+	control, err := dnsConn.ReadMsg()
+	if err != nil {
+		t.Fatalf("read TCP control: %v", err)
+	}
+	if control.Rcode != mdns.RcodeSuccess {
+		t.Fatalf("TCP control rcode=%d want success", control.Rcode)
+	}
+
+	// The production installation path (initDNSGateway plus the intercepted-DNS
+	// handler) must have left a budget covering both producer bounds.
+	if got, want := env.gw.SessionBudget(), defaultDNSWorkerCount+env.gw.TCPSessionBudget(); got != want {
+		t.Fatalf("installed session budget %d does not cover the producer bounds %d", got, want)
+	}
+}
+
+// TestIssue863_SessionBudgetCoversEveryDeclaredProducer measures the derived
+// budget on the server itself: the declared UDP producer count plus the server's
+// own TCP connection bound are admitted for one scope, the next query is refused
+// with the per-session cause, the derivation is clamped to the global bound, and
+// a caller-configured budget is never raised.
+func TestIssue863_SessionBudgetCoversEveryDeclaredProducer(t *testing.T) {
+	block := make(chan struct{})
+	reached := make(chan struct{}, 32)
+	resolver := &mockPBRResolver{exchange: func(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error) {
+		reached <- struct{}{}
+		select {
+		case <-block:
+			resp := new(mdns.Msg)
+			resp.SetReply(req)
+			return resp, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}}
+	newServer := func(cfg gatewaydns.ServerConfig) *gatewaydns.Server {
+		t.Helper()
+		cfg.Gateway = netip.MustParseAddrPort("10.100.0.1:53")
+		srv, err := gatewaydns.NewServer(cfg, resolver, nil)
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		return srv
+	}
+
+	const udpProducers, tcpSessions = 6, 3
+	srv := newServer(gatewaydns.ServerConfig{MaxTCPSessions: tcpSessions})
+	srv.DeclareUDPProducers(udpProducers)
+	want := udpProducers + tcpSessions
+	if got := srv.SessionBudget(); got != want {
+		t.Fatalf("derived session budget = %d want %d (declared producers + TCP bound)", got, want)
+	}
+	if got := srv.TCPSessionBudget(); got != tcpSessions {
+		t.Fatalf("TCP session bound = %d want %d", got, tcpSessions)
+	}
+	// A declaration below the unconfigured default never lowers the budget: the
+	// default is the floor, so a small producer set keeps the historical bound.
+	floor := newServer(gatewaydns.ServerConfig{MaxTCPSessions: 1})
+	floor.DeclareUDPProducers(2)
+	if got := floor.SessionBudget(); got != gatewaydns.DefaultMaxInflightPerSession {
+		t.Fatalf("session budget = %d fell below the unconfigured default %d", got, gatewaydns.DefaultMaxInflightPerSession)
+	}
+
+	query := new(mdns.Msg)
+	query.SetQuestion("issue863-budget.example.test.", mdns.TypeA)
+	scope := policy.Scope{SessionID: "issue863-budget", OwnershipEpoch: 1}
+	var wg sync.WaitGroup
+	for i := 0; i < want; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := srv.ServeDNSMessage(context.Background(), scope, query, false); err != nil {
+				t.Errorf("admitted query failed: %v", err)
+			}
+		}()
+	}
+	for i := 0; i < want; i++ {
+		select {
+		case <-reached:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %d of %d concurrent queries were admitted", i, want)
+		}
+	}
+	resp, err := srv.ServeDNSMessage(context.Background(), scope, query, false)
+	if err != nil || resp == nil || resp.Rcode != mdns.RcodeServerFailure {
+		t.Fatalf("over-budget query: resp=%v err=%v want explicit SERVFAIL", resp, err)
+	}
+	if got := srv.AdmissionRejections(); got.PerSession != 1 || got.Global != 0 {
+		t.Fatalf("over-budget refusal attribution = %+v want per_session=1 global=0", got)
+	}
+	close(block)
+	wg.Wait()
+
+	// A caller-configured budget stays exactly as configured, so a deployment that
+	// deliberately bounds a session keeps that bound.
+	custom := newServer(gatewaydns.ServerConfig{MaxInflightPerSession: 2, MaxTCPSessions: tcpSessions})
+	custom.DeclareUDPProducers(8)
+	if got := custom.SessionBudget(); got != 2 {
+		t.Fatalf("configured per-session budget was raised to %d", got)
+	}
+
+	// The derivation is clamped to the global budget, so a session is never
+	// refused by its own budget before the server-wide budget refuses it.
+	clamped := newServer(gatewaydns.ServerConfig{MaxInflight: 6, MaxTCPSessions: 4})
+	clamped.DeclareUDPProducers(4)
+	if got := clamped.SessionBudget(); got != 6 {
+		t.Fatalf("derived session budget = %d not clamped to the global budget 6", got)
+	}
+}
+
+// TestIssue863_PolicyStatusReportsPanelOutcomes requires the panel-side counters
+// to reach the operator-facing policy status: a queue drop the panel caused must
+// be visible there while the upstream health fields stay upstream-only.
+func TestIssue863_PolicyStatusReportsPanelOutcomes(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer func() { releaseOnce.Do(func() { close(release) }) }()
+	var stall atomic.Bool
+	up := issue863StartUpstreamWithStall(t, 0, release, &stall)
+	env := issue863NewEnv(t, up)
+	_, peer, ip, client, _ := env.addSession(1)
+
+	env.sendQuery(peer, ip, 8000, "issue863-status-warm.example.test.", mdns.TypeA)
+	if noerror, servfail, noReply := client.summary([]uint16{8000}, 10*time.Second); noerror != 1 || servfail != 0 || noReply != 0 {
+		t.Fatalf("warm control: noerror=%d servfail=%d no_reply=%d", noerror, servfail, noReply)
+	}
+	healthy := env.svc.PolicyStatusSnapshot()
+	if healthy.LastUpstream == "" || healthy.LastUpstreamFailure != "" {
+		t.Fatalf("healthy upstream status precondition not met: %+v", healthy)
+	}
+	if healthy.DNSQueriesEnqueued != 1 || healthy.DNSQueriesDroppedQueueFull != 0 {
+		t.Fatalf("healthy status accounting = %+v", healthy)
+	}
+
+	// Hold every worker, then overflow the bounded queue.
+	stall.Store(true)
+	for i := 0; i < defaultDNSWorkerCount; i++ {
+		env.sendQuery(peer, ip, uint16(8100+i), fmt.Sprintf("issue863-status-prime%d.example.test.", i), mdns.TypeA)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for up.queries.Load() < int64(1+defaultDNSWorkerCount) && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := up.queries.Load(); got != int64(1+defaultDNSWorkerCount) {
+		t.Fatalf("workers were not held at the upstream: queries=%d", got)
+	}
+	for i := 0; i < defaultDNSQueueCap+defaultDNSWorkerCount+16; i++ {
+		env.sendQuery(peer, ip, uint16(9000+i), fmt.Sprintf("issue863-status-full%d.example.test.", i), mdns.TypeA)
+	}
+
+	saturated := env.svc.PolicyStatusSnapshot()
+	if saturated.DNSQueriesDroppedQueueFull == 0 {
+		t.Fatalf("queue saturation is invisible in the operator status: %+v (private accounting=%+v)",
+			saturated, env.handler().QueryAccounting())
+	}
+	if saturated.DNSQueriesEnqueued != env.handler().QueryAccounting().Enqueued {
+		t.Fatalf("operator status enqueued=%d disagrees with the live handler", saturated.DNSQueriesEnqueued)
+	}
+	if saturated.LastUpstream != healthy.LastUpstream || saturated.LastUpstreamFailure != "" {
+		t.Fatalf("panel saturation altered upstream health fields: before=%+v after=%+v", healthy, saturated)
+	}
+	releaseOnce.Do(func() { close(release) })
+}
+
+// TestIssue863_PolicyStatusReportsRefusalCauses requires both panel-origin
+// refusal causes to be visible through the same status path, with custom positive
+// budgets still enforced, and the counts to restart with the data path instead of
+// presenting stale numbers.
+//
+// The two causes are isolated in their own data paths on purpose: with both a
+// per-session and a server-wide limit close to the number of queries, which limit
+// refuses a given query depends on arrival order, and a test that asserted one
+// fixed split there would be flaky rather than wrong.
+func TestIssue863_PolicyStatusReportsRefusalCauses(t *testing.T) {
+	t.Run("per-session", func(t *testing.T) {
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		defer func() { releaseOnce.Do(func() { close(release) }) }()
+		up := issue863StartUpstream(t, 0, release)
+		env := issue863NewEnvWithServerConfig(t, up, &gatewaydns.ServerConfig{
+			MaxInflight:           16,
+			MaxInflightPerSession: 2,
+		})
+
+		// Session A exceeds its own configured budget while the server keeps global
+		// room, so exactly one of its queries is refused by the per-session cause.
+		_, peer, ip, client, _ := env.addSession(1)
+		for i := 0; i < 3; i++ {
+			env.sendQuery(peer, ip, uint16(9200+i), fmt.Sprintf("issue863-refuse-a%d.example.test.", i), mdns.TypeA)
+		}
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			if got := env.svc.PolicyStatusSnapshot().DNSRefusalsPerSession; got == 1 {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		status := env.svc.PolicyStatusSnapshot()
+		if status.DNSRefusalsPerSession != 1 || status.DNSRefusalsGlobal != 0 {
+			t.Fatalf("operator status refusal attribution = %+v want per_session=1 global=0", status)
+		}
+		// The admitted queries are still inside the held exchange; the refusal was
+		// written before any upstream attempt.
+		releaseOnce.Do(func() { close(release) })
+		if noerror, servfail, noReply := client.summary([]uint16{9200, 9201, 9202}, 10*time.Second); noerror != 2 || servfail != 1 || noReply != 0 {
+			t.Fatalf("session over its own budget: noerror=%d servfail=%d no_reply=%d want 2/1/0", noerror, servfail, noReply)
+		}
+	})
+
+	t.Run("global", func(t *testing.T) {
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		defer func() { releaseOnce.Do(func() { close(release) }) }()
+		up := issue863StartUpstream(t, 0, release)
+		env := issue863NewEnvWithServerConfig(t, up, &gatewaydns.ServerConfig{
+			MaxInflight:           2,
+			MaxInflightPerSession: 4,
+		})
+
+		// One session takes the whole server budget and a second session, with its
+		// own budget free, meets the server-wide limit. Which of the three queries
+		// loses depends on arrival order; the cause does not.
+		_, peerA, ipA, _, _ := env.addSession(1)
+		for i := 0; i < 2; i++ {
+			env.sendQuery(peerA, ipA, uint16(9300+i), fmt.Sprintf("issue863-refuse-g%d.example.test.", i), mdns.TypeA)
+		}
+		_, peerB, ipB, _, _ := env.addSession(2)
+		env.sendQuery(peerB, ipB, 9400, "issue863-refuse-second-client.example.test.", mdns.TypeA)
+
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			if got := env.svc.PolicyStatusSnapshot().DNSRefusalsGlobal; got == 1 {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		status := env.svc.PolicyStatusSnapshot()
+		if status.DNSRefusalsGlobal != 1 || status.DNSRefusalsPerSession != 0 {
+			t.Fatalf("operator status refusal attribution = %+v want global=1 per_session=0", status)
+		}
+		releaseOnce.Do(func() { close(release) })
+		if got := up.queries.Load(); got != 2 {
+			t.Fatalf("admitted queries reaching the upstream = %d want 2 (the server's whole budget)", got)
+		}
+
+		// The counts belong to the live data path: replacing it reports the new
+		// path's zeros rather than leaving the operator with stale numbers. A
+		// disable installs the continuity responder, which accepts this fixture's
+		// loopback upstream only through the package's existing resolver
+		// substitution point; a real deployment's upstreams are never loopback.
+		originalContinuityResolver := newDNSContinuityResolver
+		newDNSContinuityResolver = func(cfg gatewaydns.ResolverConfig) (gatewaydns.Resolver, error) {
+			cfg.AllowLoopbackUpstream = true
+			return gatewaydns.NewUpstreamResolver(cfg)
+		}
+		defer func() { newDNSContinuityResolver = originalContinuityResolver }()
+		if err := env.svc.TeardownPBR(); err != nil {
+			t.Fatalf("TeardownPBR: %v", err)
+		}
+		reset := env.svc.PolicyStatusSnapshot()
+		if reset.DNSRefusalsPerSession != 0 || reset.DNSRefusalsGlobal != 0 || reset.DNSQueriesEnqueued != 0 {
+			t.Fatalf("panel accounting did not restart with the data path: %+v", reset)
+		}
+	})
 }

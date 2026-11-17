@@ -74,6 +74,15 @@ func newPBRDNSHandler(gw *gatewaydns.Gateway, rc forwarder.RouteCache, sessionLi
 		cancel:      cancel,
 		sessions:    make(map[string]*dnsSessionRuntime),
 	}
+	// Each worker blocks in one intercepted query until it completes, so the pool
+	// size is this path's UDP producer bound. Declaring it lets the gateway size
+	// its per-session admission budget from every producer a session can present
+	// — this pool plus the gateway's own TCP connections — instead of from a
+	// guess that refuses supported mixed-transport bursts. The declaration is made
+	// while installing the path, before any job is submitted.
+	if gw != nil {
+		gw.DeclareUDPProducers(defaultDNSWorkerCount)
+	}
 	// The route cache is the session-scope authority that every route-removal
 	// path already retires through, so attach this handler's runtime to it: a
 	// released session scope then releases the DNS work that scope authorized.
@@ -364,6 +373,13 @@ type DNSQueryAccounting struct {
 	// RetiredBeforeAnswer counts queued queries whose session retired before
 	// the job ran. No scope is recreated for them.
 	RetiredBeforeAnswer uint64
+}
+
+// dnsQueryAccountant is implemented by DNS handlers that keep panel-side query
+// accounting, which the policy status reads through a single seam rather than
+// through a second copy of the counters.
+type dnsQueryAccountant interface {
+	QueryAccounting() DNSQueryAccounting
 }
 
 // QueryAccounting returns this handler's panel-side query accounting. The counts

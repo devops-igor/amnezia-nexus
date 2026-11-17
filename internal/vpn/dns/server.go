@@ -37,20 +37,22 @@ const (
 	// DefaultMaxInflight bounds how many queries this server resolves at once
 	// across every session.
 	DefaultMaxInflight = 64
-	// DefaultMaxInflightPerSession bounds how many queries one session may have
-	// in flight at once.
+	// DefaultMaxInflightPerSession is the per-session admission budget of a server
+	// whose caller declares no producer count and configures no budget.
 	//
-	// It is sized to the concurrency a session's producer can actually present,
-	// not to a guess about client pacing. The intercepted-DNS handler submits one
-	// query per worker, so its worker count is the number of a session's queries
-	// that can be in flight simultaneously; a budget below that admits work the
+	// The budget exists so one session cannot own the server, not to model client
+	// pacing, and it must cover every producer that can present work for the same
+	// session at the same time. A budget below that producer bound admits work the
 	// bounded ingress queue already accepted and then answers it with a
-	// panel-origin SERVFAIL. That refusal never reaches an upstream, so it is
-	// indistinguishable from an upstream failure at the client and makes an
-	// ordinary browser burst (A, AAAA and HTTPS per name) fail beyond the first
-	// few names. The budget stays far below DefaultMaxInflight so one session can
-	// never own the server, and a refusal above it stays bounded and is counted
-	// by cause (see AdmissionRejections).
+	// panel-origin SERVFAIL that never reaches an upstream: indistinguishable from
+	// an upstream failure at the client, and enough to break an ordinary browser
+	// burst (A, AAAA and HTTPS per name). The intercepted-DNS caller therefore
+	// declares its UDP producer count (DeclareUDPProducers), and the effective
+	// budget becomes that declaration plus this server's own TCP connection bound
+	// (MaxTCPSessions), clamped to DefaultMaxInflight; see sessionBudgetLocked. A
+	// caller that configures MaxInflightPerSession explicitly keeps exactly that
+	// value. Refusals above the effective budget stay bounded and are counted by
+	// cause (see AdmissionRejections).
 	DefaultMaxInflightPerSession = 8
 	defaultMaxTCPSessions        = 32
 	defaultMaxTTL                = 3600 * time.Second
@@ -102,6 +104,13 @@ type Server struct {
 	rejectedPerSession atomic.Uint64
 	rejectedGlobal     atomic.Uint64
 
+	// udpProducers is the producer count the calling UDP submission path declared,
+	// and perSessionExplicit records whether the caller configured the per-session
+	// budget itself. Both are guarded by sessionMu so a declaration and the
+	// creation of a scope's budget are ordered against each other.
+	udpProducers       int
+	perSessionExplicit bool
+
 	mu          sync.Mutex
 	closing     bool
 	activeConns map[net.Conn]*ScopeHandle
@@ -114,15 +123,11 @@ func (s *Server) SetObserver(obs RouteObserver) {
 	s.observer = obs
 }
 
-// NewServer creates a new Server.
-func NewServer(cfg ServerConfig, resolver Resolver, rules PolicySource) (*Server, error) {
-	if !cfg.Gateway.IsValid() || !cfg.Gateway.Addr().Is4() || cfg.Gateway.Port() != 53 {
-		return nil, errors.New("gateway must have valid IPv4 and port 53")
-	}
-	if resolver == nil {
-		return nil, errors.New("resolver cannot be nil")
-	}
-
+// applyServerDefaults fills the configuration a Server needs when the caller
+// leaves fields unset. It reports whether the caller configured the per-session
+// budget itself, because only an unconfigured budget follows the declared
+// producer bound.
+func applyServerDefaults(cfg *ServerConfig) (perSessionExplicit bool) {
 	if cfg.QueryTimeout <= 0 {
 		cfg.QueryTimeout = defaultQueryTimeout
 	}
@@ -132,24 +137,39 @@ func NewServer(cfg ServerConfig, resolver Resolver, rules PolicySource) (*Server
 	if cfg.MaxTTL <= 0 {
 		cfg.MaxTTL = defaultMaxTTL
 	}
+	perSessionExplicit = cfg.MaxInflightPerSession > 0
 	if cfg.MaxInflight <= 0 {
 		cfg.MaxInflight = DefaultMaxInflight
 	}
-	if cfg.MaxInflightPerSession <= 0 {
+	if !perSessionExplicit {
 		cfg.MaxInflightPerSession = DefaultMaxInflightPerSession
 	}
 	if cfg.MaxTCPSessions <= 0 {
 		cfg.MaxTCPSessions = defaultMaxTCPSessions
 	}
+	return perSessionExplicit
+}
+
+// NewServer creates a new Server.
+func NewServer(cfg ServerConfig, resolver Resolver, rules PolicySource) (*Server, error) {
+	if !cfg.Gateway.IsValid() || !cfg.Gateway.Addr().Is4() || cfg.Gateway.Port() != 53 {
+		return nil, errors.New("gateway must have valid IPv4 and port 53")
+	}
+	if resolver == nil {
+		return nil, errors.New("resolver cannot be nil")
+	}
+
+	perSessionExplicit := applyServerDefaults(&cfg)
 
 	return &Server{
-		cfg:         cfg,
-		resolver:    resolver,
-		policy:      rules,
-		globalSem:   make(chan struct{}, cfg.MaxInflight),
-		sessionSems: make(map[policy.Scope]chan struct{}),
-		closed:      make(chan struct{}),
-		activeConns: make(map[net.Conn]*ScopeHandle),
+		cfg:                cfg,
+		resolver:           resolver,
+		policy:             rules,
+		globalSem:          make(chan struct{}, cfg.MaxInflight),
+		sessionSems:        make(map[policy.Scope]chan struct{}),
+		closed:             make(chan struct{}),
+		activeConns:        make(map[net.Conn]*ScopeHandle),
+		perSessionExplicit: perSessionExplicit,
 	}, nil
 }
 
@@ -215,6 +235,73 @@ func validateQuery(req *mdns.Msg) *mdns.Msg {
 	return nil
 }
 
+// DeclareUDPProducers records how many goroutines the caller's UDP submission
+// path can have inside ServeDNSMessage at the same time. Each of them blocks in
+// one query until it completes, so together with this server's TCP connection
+// bound they are the maximum concurrency one session can legitimately present.
+//
+// The declaration only raises the budget of an unconfigured per-session limit and
+// only ever raises it: a caller's explicit MaxInflightPerSession is never
+// overridden, and a later, smaller declaration cannot shrink a live budget. It
+// must be made while the calling path is being installed, before its first
+// submission, because a scope's budget is fixed when that scope first queries.
+// The producer that owns the submission path is the only caller, so a missing
+// declaration cannot silently narrow the budget below its own concurrency.
+func (s *Server) DeclareUDPProducers(producers int) {
+	if s == nil || producers <= 0 {
+		return
+	}
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	if producers > s.udpProducers {
+		s.udpProducers = producers
+	}
+}
+
+// sessionBudgetLocked returns the per-session admission budget: the caller's
+// configured value when there is one, otherwise the declared UDP producer count
+// plus this server's own TCP connection bound. The result never falls below the
+// unconfigured default and is clamped to the global budget.
+//
+// The clamp matters: a session that reaches the global budget cannot be refused
+// by its own budget first, so a genuine refusal is always the server-wide cause
+// and never a panel-side artifact of a smaller number. Callers must hold
+// sessionMu.
+func (s *Server) sessionBudgetLocked() int {
+	if s.perSessionExplicit {
+		return s.cfg.MaxInflightPerSession
+	}
+	budget := s.cfg.MaxInflightPerSession
+	if producers := s.udpProducers + s.cfg.MaxTCPSessions; producers > budget {
+		budget = producers
+	}
+	if budget > s.cfg.MaxInflight {
+		budget = s.cfg.MaxInflight
+	}
+	return budget
+}
+
+// SessionBudget returns the effective per-session admission budget. It exists so
+// a consumer can assert the budget covers the producer bounds it was told about
+// instead of trusting a constant.
+func (s *Server) SessionBudget() int {
+	if s == nil {
+		return 0
+	}
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	return s.sessionBudgetLocked()
+}
+
+// TCPSessionBudget returns the connection bound this server admits for one
+// session's TCP transport, which is one producer of concurrent queries.
+func (s *Server) TCPSessionBudget() int {
+	if s == nil {
+		return 0
+	}
+	return s.cfg.MaxTCPSessions
+}
+
 // sessionSemaphore returns the concurrency budget of one authenticated session,
 // creating it — together with its retirement watcher — on first use. Callers
 // must not hold sessionMu.
@@ -225,7 +312,7 @@ func (s *Server) sessionSemaphore(ctx context.Context, scope policy.Scope) chan 
 		s.sessionMu.Unlock()
 		return sem
 	}
-	sem = make(chan struct{}, s.cfg.MaxInflightPerSession)
+	sem = make(chan struct{}, s.sessionBudgetLocked())
 	s.sessionSems[scope] = sem
 	if ctx != nil && ctx.Done() != nil {
 		go func(sc policy.Scope, ch chan struct{}, done <-chan struct{}) {
