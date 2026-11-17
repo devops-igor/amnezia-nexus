@@ -435,6 +435,17 @@ func (g *Gateway) ActiveSessionLimiters() int {
 	return g.server.ActiveSessionLimiters()
 }
 
+// AdmissionRejections returns this gateway's panel-side DNS refusal counters
+// (see Server.AdmissionRejections). A refused query never reached an upstream,
+// so these counts are the only attribution available for it: they must be read
+// alongside resolver status, never inferred from it.
+func (g *Gateway) AdmissionRejections() AdmissionRejections {
+	if g == nil || g.server == nil {
+		return AdmissionRejections{}
+	}
+	return g.server.AdmissionRejections()
+}
+
 // BeginRetire permanently retires scope handle, cancels query contexts, and invalidates session cache.
 // Synchronous, memory-only, and idempotent.
 func (g *Gateway) BeginRetire(scope *ScopeHandle) Retirement {
