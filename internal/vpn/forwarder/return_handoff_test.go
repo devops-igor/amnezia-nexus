@@ -208,11 +208,14 @@ func proxyReturnFixtureWithPath(t *testing.T, path *ReturnPath) (*Forwarder, *te
 	t.Helper()
 	fwd := NewForwarder(nil, "10.100.0.0/16", 8)
 	fwd.SetPBREnabled(true)
-	fwd.SetDirectEgress(NewDirectEgressManager(DirectEgressConfig{
+	dem := NewDirectEgressManager(DirectEgressConfig{
 		HostWANIP:    netip.MustParseAddr("203.0.113.1"),
 		GatewayDNSIP: netip.MustParseAddr("10.100.0.1"),
 		WANDevice:    newMockPacketDev(),
-	}, fwd))
+	}, fwd)
+	fwd.SetDirectEgress(dem)
+	// The manager owns a WAN reader; retire it with the test that created it.
+	t.Cleanup(func() { _ = dem.Close() })
 	fwd.SetRouteCache(newTestRouteCache())
 	capPath := newTestCaptureReturnPath()
 	fwd.RegisterSessionWithReturnPath("sess-return", "conn-1", "peer-return", "10.100.0.7", 31, path)
@@ -283,11 +286,14 @@ func proxyReturnRateLimitedFixture(t *testing.T, limitDownBps int64) (*Forwarder
 	t.Helper()
 	fwd := NewForwarder(nil, "10.100.0.0/16", 8)
 	fwd.SetPBREnabled(true)
-	fwd.SetDirectEgress(NewDirectEgressManager(DirectEgressConfig{
+	dem := NewDirectEgressManager(DirectEgressConfig{
 		HostWANIP:    netip.MustParseAddr("203.0.113.1"),
 		GatewayDNSIP: netip.MustParseAddr("10.100.0.1"),
 		WANDevice:    newMockPacketDev(),
-	}, fwd))
+	}, fwd)
+	fwd.SetDirectEgress(dem)
+	// The manager owns a WAN reader; retire it with the test that created it.
+	t.Cleanup(func() { _ = dem.Close() })
 	fwd.SetRouteCache(newTestRouteCache())
 	fwd.BeginRegisterSessionWithLimit("sess-rate", "conn-1", "peer-rate", "10.100.0.7", 31, limitDownBps, 0).Wait()
 	return fwd, "peer-rate", "sess-rate"

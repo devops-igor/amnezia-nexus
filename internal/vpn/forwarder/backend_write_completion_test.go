@@ -89,6 +89,9 @@ func proxyQueueFixture(t *testing.T, dev PacketDevice) (*Forwarder, *testRouteCa
 		WANDevice:    newMockPacketDev(),
 	}, fwd)
 	fwd.SetDirectEgress(dem)
+	// The manager owns a WAN reader; the test that created it retires it, including
+	// when an assertion fails before the case reaches its own teardown.
+	t.Cleanup(func() { _ = dem.Close() })
 	rc := newTestRouteCache()
 	fwd.SetRouteCache(rc)
 	capPath := newTestCaptureReturnPath()
@@ -183,7 +186,12 @@ func TestBackendWriteFailureAndShortWriteAreDistinct(t *testing.T) {
 			}
 			deadline := time.Now().Add(2 * time.Second)
 			for time.Now().Before(deadline) {
-				if flowEvidenceFor(t, fwd, sessionID, "9.9.9.9", 8443).BackendWriteFailed == 1 {
+				// The failure count and its reason are independent atomics, so one
+				// snapshot can show the count before the reason is published. Wait for
+				// the settled pair the assertions below describe, not for the count
+				// alone.
+				settled := flowEvidenceFor(t, fwd, sessionID, "9.9.9.9", 8443)
+				if settled.BackendWriteFailed == 1 && settled.BackendWriteFailure != "" {
 					break
 				}
 				time.Sleep(2 * time.Millisecond)

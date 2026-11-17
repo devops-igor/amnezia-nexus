@@ -56,6 +56,8 @@ func newFlowEvidenceFixture(t *testing.T, queueSize int) *flowEvidenceFixture {
 		WANDevice:    fix.wan,
 	}, fix.fwd)
 	fix.fwd.SetDirectEgress(fix.dem)
+	// The manager owns a WAN reader; retire it with the test that created it.
+	t.Cleanup(func() { _ = fix.dem.Close() })
 	fix.fwd.SetGatewayDNSIP(netip.MustParseAddr("10.100.0.1"))
 	fix.fwd.SetRouteCache(fix.rc)
 	fix.publishSnapshot(t, nil)
@@ -253,7 +255,7 @@ func TestFlowEvidenceRecordsRefusedDispatch(t *testing.T) {
 		fix := newFlowEvidenceFixture(t, 8)
 		dst := "93.184.216.36"
 		fix.rc.Set(fix.session, netip.MustParseAddr(dst), policy.Direct)
-		fix.dem.AttachWANDevice(&failingFlowDev{})
+		fix.dem.AttachWANDevice(newFailingFlowDev())
 		if err := fix.fwd.RouteClientToBackend(fix.peerKey,
 			buildTestIPv4TCPPacket(netip.MustParseAddr(fix.client), netip.MustParseAddr(dst), 41000, 443, 0x02, nil)); err == nil {
 			t.Fatal("a failed WAN write was reported as a successful dispatch")
@@ -550,6 +552,7 @@ func TestFlowEvidenceBoundsAreTheFlowTable(t *testing.T) {
 		MaxFlows:     2,
 	}, fwd)
 	fwd.SetDirectEgress(dem)
+	t.Cleanup(func() { _ = dem.Close() })
 	fwd.RegisterSessionWithReturnPath(fix.session, "conn-1", fix.peerKey, fix.client, fix.backendID, nil)
 	for i := 0; i < 2; i++ {
 		if err := dem.RecordFlow(fix.peerKey, fix.session, 1, buildTestIPv4TCPPacket(
@@ -567,9 +570,12 @@ func TestFlowEvidenceBoundsAreTheFlowTable(t *testing.T) {
 	}
 }
 
-// failingFlowDev fails every write, so a dispatch failure can be observed.
-type failingFlowDev struct{}
+// failingFlowDev fails every write, so a dispatch failure can be observed. Its read
+// half parks like a TUN read, so the manager that replaces it does not spin.
+type failingFlowDev struct{ *wanReadGate }
 
-func (d *failingFlowDev) Read(_ []byte) (int, error)  { return 0, nil }
+func newFailingFlowDev() *failingFlowDev {
+	return &failingFlowDev{wanReadGate: newWANReadGate()}
+}
+
 func (d *failingFlowDev) Write(_ []byte) (int, error) { return 0, errors.New("wan write failed") }
-func (d *failingFlowDev) Close() error                { return nil }

@@ -23,6 +23,9 @@ func refuseFixture(t *testing.T, cfg DirectEgressConfig) (*Forwarder, *testRoute
 	cfg.HostWANIP = netip.MustParseAddr("203.0.113.1")
 	cfg.GatewayDNSIP = netip.MustParseAddr("10.100.0.1")
 	fwd.SetDirectEgress(NewDirectEgressManager(cfg, fwd))
+	dem := fwd.DirectEgress()
+	// The manager owns a WAN reader; retire it with the test that created it.
+	t.Cleanup(func() { _ = dem.Close() })
 	cache := newTestRouteCache()
 	fwd.SetRouteCache(cache)
 	fwd.RegisterSessionWithReturnPath("sess-refuse", "conn-1", "peer-refuse", "10.100.0.7", 31, newTestCaptureReturnPath().path)

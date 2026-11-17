@@ -28,6 +28,8 @@ func newSessionEvidenceFixture(t testing.TB, maxFlows int) (*Forwarder, *DirectE
 		MaxFlows:     maxFlows,
 	}, fwd)
 	fwd.SetDirectEgress(dem)
+	// The manager owns a WAN reader; retire it with the owning test or benchmark.
+	t.Cleanup(func() { _ = dem.Close() })
 	return fwd, dem, wan
 }
 

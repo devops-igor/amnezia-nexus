@@ -4,12 +4,48 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
+// wanReadGate is the read half of a test WAN device. A real TUN read blocks until the
+// device is closed, so a parked reader costs no CPU. A test device that returns
+// (0, nil) at once instead makes readWANLoop spin for as long as the manager lives,
+// which starves the Go scheduler and the timing assertions of unrelated tests in the
+// same process.
+type wanReadGate struct {
+	closed chan struct{}
+	once   sync.Once
+	reads  atomic.Int64
+}
+
+func newWANReadGate() *wanReadGate {
+	return &wanReadGate{closed: make(chan struct{})}
+}
+
+// Read parks until Close. The call count is the observable evidence that the owning
+// manager reached the device and then stopped calling it.
+func (g *wanReadGate) Read(_ []byte) (int, error) {
+	g.reads.Add(1)
+	<-g.closed
+	return 0, os.ErrClosed
+}
+
+// Close unblocks every parked Read and is safe to call more than once.
+func (g *wanReadGate) Close() error {
+	g.once.Do(func() { close(g.closed) })
+	return nil
+}
+
+func (g *wanReadGate) readCount() int64 {
+	return g.reads.Load()
+}
+
 type mockPacketDev struct {
+	*wanReadGate
 	mu       sync.Mutex
 	pkts     [][]byte
 	notifyCh chan struct{}
@@ -17,12 +53,14 @@ type mockPacketDev struct {
 
 func newMockPacketDev() *mockPacketDev {
 	return &mockPacketDev{
-		notifyCh: make(chan struct{}, 100),
+		wanReadGate: newWANReadGate(),
+		notifyCh:    make(chan struct{}, 100),
 	}
 }
 
-func (m *mockPacketDev) Read(p []byte) (int, error) {
-	return 0, nil
+// Read parks the manager's WAN reader until the device is closed.
+func (m *mockPacketDev) Read(_ []byte) (int, error) {
+	return m.wanReadGate.Read(nil)
 }
 
 func (m *mockPacketDev) Write(p []byte) (int, error) {
@@ -38,8 +76,9 @@ func (m *mockPacketDev) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// Close unblocks a parked WAN reader and is idempotent, like closing a TUN device.
 func (m *mockPacketDev) Close() error {
-	return nil
+	return m.wanReadGate.Close()
 }
 
 func (m *mockPacketDev) getPackets() [][]byte {
