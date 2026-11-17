@@ -856,7 +856,7 @@ func TestDifferential_NaturalRekey(t *testing.T) {
 
 // TestDifferential_ParameterMatrixAndS4Regression executes table-driven parameter boundary cases
 // and explicitly verifies S4 padding handling on the first transport packet against the pinned
-// upstream amneziawg-go v3.1.20260828 artifact.
+// upstream amneziawg-go v3.1.20261116 artifact.
 func TestDifferential_ParameterMatrixAndS4Regression(t *testing.T) {
 	testCases := []struct {
 		name                   string
