@@ -47,6 +47,7 @@ type pbrDNSHandler struct {
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
 	closed      atomic.Bool
+	accepted    atomic.Uint64
 	dropped     atomic.Uint64
 	retired     atomic.Uint64
 
@@ -72,6 +73,15 @@ func newPBRDNSHandler(gw *gatewaydns.Gateway, rc forwarder.RouteCache, sessionLi
 		ctx:         ctx,
 		cancel:      cancel,
 		sessions:    make(map[string]*dnsSessionRuntime),
+	}
+	// Each worker blocks in one intercepted query until it completes, so the pool
+	// size is this path's UDP producer bound. Declaring it lets the gateway size
+	// its per-session admission budget from every producer a session can present
+	// — this pool plus the gateway's own TCP connections — instead of from a
+	// guess that refuses supported mixed-transport bursts. The declaration is made
+	// while installing the path, before any job is submitted.
+	if gw != nil {
+		gw.DeclareUDPProducers(defaultDNSWorkerCount)
 	}
 	// The route cache is the session-scope authority that every route-removal
 	// path already retires through, so attach this handler's runtime to it: a
@@ -289,43 +299,99 @@ func (h *pbrDNSHandler) sessionScope(sessionID string) *policy.SessionCache {
 	return nil
 }
 
-func (h *pbrDNSHandler) HandleDNSPacket(sessionID, peerKey, assignedIP string, path *forwarder.ReturnPath, packet []byte) (bool, error) {
-	if h == nil || h.gw == nil || h.closed.Load() {
-		return false, nil
-	}
+// buildDNSJob copies an intercepted port-53 packet into a queued job. It reports
+// false for a packet this handler does not own and copies nothing in that case,
+// so the ingress path pays for a copy only once the packet is accepted work.
+func buildDNSJob(sessionID, peerKey, assignedIP string, path *forwarder.ReturnPath, packet []byte) (dnsJob, bool) {
 	if len(packet) < 20 {
-		return false, nil
+		return dnsJob{}, false
 	}
 	ihl := int(packet[0]&0x0f) * 4
 	if len(packet) < ihl+8 {
-		return false, nil
+		return dnsJob{}, false
 	}
-	proto := packet[9]
-	if proto != 17 && proto != 6 {
-		return false, nil
+	switch packet[9] {
+	case 17, 6: // UDP, TCP
+	default:
+		return dnsJob{}, false
 	}
-	dstPort := binary.BigEndian.Uint16(packet[ihl+2 : ihl+4])
-	if dstPort != 53 {
-		return false, nil
+	if binary.BigEndian.Uint16(packet[ihl+2:ihl+4]) != 53 {
+		return dnsJob{}, false
 	}
-
-	pktCopy := make([]byte, len(packet))
-	copy(pktCopy, packet)
-
-	job := dnsJob{
+	return dnsJob{
 		sessionID:  sessionID,
 		peerKey:    peerKey,
 		assignedIP: assignedIP,
 		path:       path,
-		packet:     pktCopy,
+		packet:     append([]byte(nil), packet...),
+	}, true
+}
+
+func (h *pbrDNSHandler) HandleDNSPacket(sessionID, peerKey, assignedIP string, path *forwarder.ReturnPath, packet []byte) (bool, error) {
+	if h == nil || h.gw == nil || h.closed.Load() {
+		return false, nil
+	}
+	job, ok := buildDNSJob(sessionID, peerKey, assignedIP, path, packet)
+	if !ok {
+		return false, nil
 	}
 
 	select {
 	case h.queue <- job:
+		h.accepted.Add(1)
 		return true, nil
 	default:
+		// Genuine saturation of the bounded worker queue. The packet stays
+		// consumed (it is never re-routed to an upstream the panel did not
+		// authorize) and is deliberately not answered from this ingress path:
+		// writing a reply here would put response I/O in the client's ingress
+		// pump. The outcome is bounded and attributed instead — the client's
+		// resolver retries, and the drop is counted separately from every
+		// upstream outcome so it can never be read as upstream health.
 		h.dropped.Add(1)
 		return true, nil
+	}
+}
+
+// DNSQueryAccounting attributes intercepted queries by the outcome the panel
+// itself decided, so a panel-side loss can never be mistaken for upstream
+// health or for a completed client transaction.
+//
+// These are panel-side event counts, not client traffic totals. A query counted
+// in DroppedQueueFull or RetiredBeforeAnswer received no reply at all: the
+// client's resolver retries or times out, and the panel delivered nothing for
+// it. A query counted in Enqueued may additionally be refused later by the DNS
+// server's own admission limits (Gateway.AdmissionRejections), which are a
+// different cause and a different counter.
+type DNSQueryAccounting struct {
+	// Enqueued counts queries admitted to the bounded worker queue. A queued
+	// query may still end up RetiredBeforeAnswer, so this is not a delivery
+	// count.
+	Enqueued uint64
+	// DroppedQueueFull counts queries discarded because that queue was full.
+	DroppedQueueFull uint64
+	// RetiredBeforeAnswer counts queued queries whose session retired before
+	// the job ran. No scope is recreated for them.
+	RetiredBeforeAnswer uint64
+}
+
+// dnsQueryAccountant is implemented by DNS handlers that keep panel-side query
+// accounting, which the policy status reads through a single seam rather than
+// through a second copy of the counters.
+type dnsQueryAccountant interface {
+	QueryAccounting() DNSQueryAccounting
+}
+
+// QueryAccounting returns this handler's panel-side query accounting. The counts
+// only grow and are read without taking the handler lock.
+func (h *pbrDNSHandler) QueryAccounting() DNSQueryAccounting {
+	if h == nil {
+		return DNSQueryAccounting{}
+	}
+	return DNSQueryAccounting{
+		Enqueued:            h.accepted.Load(),
+		DroppedQueueFull:    h.dropped.Load(),
+		RetiredBeforeAnswer: h.retired.Load(),
 	}
 }
 
