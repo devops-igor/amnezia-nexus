@@ -100,6 +100,31 @@ type PolicyStatus struct {
 	LastUpstream            string `json:"last_upstream,omitempty"`
 	LastUpstreamFailure     string `json:"last_upstream_failure,omitempty"`
 	LastUpstreamFailureKind string `json:"last_upstream_failure_kind,omitempty"`
+
+	// Panel-side intercepted-DNS outcomes of the live policy data path.
+	//
+	// These answer a question the upstream fields above cannot: whether the panel
+	// itself refused or lost a query. They are separate from upstream health and
+	// from any delivered-traffic total:
+	//
+	//   - a query counted as dropped or retired was answered by nobody (the
+	//     client retries or times out), and a refused query never reached an
+	//     upstream, so a clean upstream status is not evidence that clients were
+	//     served;
+	//   - DNSQueriesEnqueued counts queries admitted to the bounded worker queue,
+	//     not delivered answers;
+	//   - the counts belong to the live data path and restart at zero when it is
+	//     reinstalled or policy routing restarts, so a snapshot is not a lifetime
+	//     total and a decrease is a reset, never a corrected history;
+	//   - each field is read at snapshot time, so the counters are not a strict
+	//     partition of one another and must not be summed as a client total.
+	//
+	// They carry no queried names and no client data, only event counts.
+	DNSQueriesEnqueued         uint64 `json:"dns_queries_enqueued"`
+	DNSQueriesDroppedQueueFull uint64 `json:"dns_queries_dropped_queue_full"`
+	DNSQueriesRetired          uint64 `json:"dns_queries_retired"`
+	DNSRefusalsPerSession      uint64 `json:"dns_refusals_per_session"`
+	DNSRefusalsGlobal          uint64 `json:"dns_refusals_global"`
 }
 
 // policyRuntime holds the live policy objects for a started service.
@@ -620,7 +645,48 @@ func (s *Service) PolicyStatusSnapshot() PolicyStatus {
 	}
 
 	applyUpstreamStatus(&status, s.getPBRConfig())
+	applyDNSPanelStatus(&status, s)
 	return status
+}
+
+// applyDNSPanelStatus copies the panel-side intercepted-DNS accounting of the
+// live data path into status, so a refusal or queue drop the panel caused is
+// visible to an operator even while the upstream is healthy.
+//
+// The two producers are read from the objects that own them: the policy
+// gateway's server refuses queries that never reached an upstream, and the
+// forwarder's intercepted-DNS handler owns the bounded queue that drops them.
+// Both restart with the data path, so an absent data path reads as zeros.
+func applyDNSPanelStatus(status *PolicyStatus, s *Service) {
+	if pbrCfg := s.getPBRConfig(); pbrCfg != nil && pbrCfg.DNSGateway != nil {
+		refusals := pbrCfg.DNSGateway.AdmissionRejections()
+		status.DNSRefusalsPerSession = refusals.PerSession
+		status.DNSRefusalsGlobal = refusals.Global
+	}
+	accounting, ok := s.dnsQueryAccounting()
+	if !ok {
+		return
+	}
+	status.DNSQueriesEnqueued = accounting.Enqueued
+	status.DNSQueriesDroppedQueueFull = accounting.DroppedQueueFull
+	status.DNSQueriesRetired = accounting.RetiredBeforeAnswer
+}
+
+// dnsQueryAccounting returns the installed DNS handler's panel-side accounting.
+// The forwarder installs exactly one handler, so this reads the live producer's
+// own counters instead of keeping a second copy that could disagree with them.
+func (s *Service) dnsQueryAccounting() (DNSQueryAccounting, bool) {
+	s.mu.RLock()
+	fwd := s.forwarder
+	s.mu.RUnlock()
+	if fwd == nil {
+		return DNSQueryAccounting{}, false
+	}
+	accountant, ok := fwd.DNSHandler().(dnsQueryAccountant)
+	if !ok || accountant == nil {
+		return DNSQueryAccounting{}, false
+	}
+	return accountant.QueryAccounting(), true
 }
 
 // applyUpstreamStatus copies the upstream health of the resolver the policy
