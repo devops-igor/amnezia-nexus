@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -719,19 +718,26 @@ func TestPerRouteWriteTelemetrySeparatesDifferentConsumers(t *testing.T) {
 	}
 }
 
+// phaseSignal carries the instant the DEVICE performed a phase, not the instant the test
+// observed the buffered signal. Those differ when a burst is drained later, and using the
+// observation instant would mislabel an old completion as a recent one.
+type phaseSignal struct {
+	at time.Time
+}
+
 type pacedQueueDevice struct {
 	permits chan struct{}
-	started chan struct{}
-	written chan struct{}
+	started chan phaseSignal
+	written chan phaseSignal
 }
 
 func (d *pacedQueueDevice) Read([]byte) (int, error) { return 0, nil }
 func (d *pacedQueueDevice) Close() error             { return nil }
 func (d *pacedQueueDevice) Write(packet []byte) (int, error) {
-	d.started <- struct{}{}
+	d.started <- phaseSignal{at: time.Now()}
 	<-d.permits
 	time.Sleep(100 * time.Microsecond)
-	d.written <- struct{}{}
+	d.written <- phaseSignal{at: time.Now()}
 	return len(packet), nil
 }
 
@@ -740,8 +746,8 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 	f := NewForwarder(nil, "10.100.0.0/16", capacity)
 	dev := &pacedQueueDevice{
 		permits: make(chan struct{}, capacity+1),
-		started: make(chan struct{}, capacity+1),
-		written: make(chan struct{}, capacity+1),
+		started: make(chan phaseSignal, capacity+1),
+		written: make(chan phaseSignal, capacity+1),
 	}
 	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
 	f.RegisterSessionWithReturnPath("session", "connection", "peer", "10.100.0.10", 1, path)
@@ -754,92 +760,23 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 		packet = append(packet, pad...)
 		binary.BigEndian.PutUint16(packet[2:4], 1420)
 	}
-	// Bounded per-test event recorder. It exists so a failure names the event index and the
-	// phase that was late instead of only "15/16": the CI failure this case produced could not
-	// be attributed, and a bare retry would have produced the same message again.
-	//
-	// It is a RING, not the first N events: a stall happens late, so keeping the earliest
-	// history would describe the wrong window. It holds timestamps only, never payloads, and its
-	// size is fixed, so a long stall cannot grow it.
-	//
-	// Enqueue, start and completion are three different facts and are recorded as three
-	// timestamps. The pump's write path signals `started` when it enters Write and `written`
-	// when it returns, so a single recorder fed by both would label a start as a completion.
-	const stallRing = 64
-	type stallEvent struct {
-		seq      int
-		enqueued time.Time
-		started  time.Time
-		written  time.Time
-	}
-	var (
-		ring      [stallRing]stallEvent
-		ringBase  int
-		ringCount int
-		nextSeq   int
-		startSeq  int
-		writeSeq  int
-	)
-	push := func(ev stallEvent) {
-		if ringCount < stallRing {
-			ring[(ringBase+ringCount)%stallRing] = ev
-			ringCount++
-			return
-		}
-		ring[ringBase] = ev
-		ringBase = (ringBase + 1) % stallRing
-	}
-	slotOf := func(seq int) int {
-		if seq < ringBase || seq >= ringBase+ringCount {
-			return -1
-		}
-		return (seq - ringBase) % stallRing
-	}
-	recordEnqueue := func() {
-		push(stallEvent{seq: nextSeq, enqueued: time.Now()})
-		nextSeq++
-	}
-	recordStarted := func() {
-		if slot := slotOf(startSeq); slot >= 0 {
-			ring[slot].started = time.Now()
-		}
-		startSeq++
-	}
-	recordWritten := func() {
-		if slot := slotOf(writeSeq); slot >= 0 {
-			ring[slot].written = time.Now()
-		}
-		writeSeq++
-	}
-	stallReport := func(stalledAt, wanted int) string {
-		var b strings.Builder
-		fmt.Fprintf(&b, "stall_at=%d/%d enqueued=%d started=%d written=%d ring_from=%d..%d",
-			stalledAt, wanted, nextSeq, startSeq, writeSeq, ringBase, ringBase+ringCount-1)
-		if slot := slotOf(stalledAt); slot >= 0 {
-			ev := ring[slot]
-			fmt.Fprintf(&b, " stalled_event{seq=%d enqueued=+%s started=%s written=%s}",
-				ev.seq, ev.enqueued.Sub(ring[ringBase].enqueued).Round(time.Microsecond),
-				phaseLatency(ev.enqueued, ev.started), phaseLatency(ev.enqueued, ev.written))
-		}
-		for i := 0; i < ringCount; i++ {
-			ev := ring[(ringBase+i)%stallRing]
-			fmt.Fprintf(&b, " | seq=%d enqueued=+%s started=%s written=%s",
-				ev.seq, ev.enqueued.Sub(ring[ringBase].enqueued).Round(time.Microsecond),
-				phaseLatency(ev.enqueued, ev.started), phaseLatency(ev.enqueued, ev.written))
-		}
-		return b.String()
-	}
+	// Bounded per-test event recorder, shared with its own unit tests. Enqueue, start and
+	// completion are three separate facts and are recorded through three separate calls, each
+	// fed by the fixture's own phase signal: the device signals `started` when it enters Write
+	// and `written` when it returns, so one callback could not tell them apart.
+	recorder := newPhaseRecorder(64)
 
-	wait := func(ch <-chan struct{}, count int, onEvent func()) {
+	wait := func(ch <-chan phaseSignal, count int, phase func(time.Time)) {
 		t.Helper()
 		timeout := time.NewTimer(3 * time.Second)
 		defer timeout.Stop()
 		for i := 0; i < count; i++ {
 			select {
-			case <-ch:
-				onEvent()
+			case signal := <-ch:
+				phase(signal.at)
 			case <-timeout.C:
-				t.Fatalf("device stalled after %d/%d events (%s)", i, count, stallReport(writeSeq, count))
+				_, _, written := recorder.Counts()
+				t.Fatalf("device stalled after %d/%d events (%s)", i, count, recorder.Report(written))
 			}
 		}
 	}
@@ -848,8 +785,10 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 		if err := f.RouteBackendToClient(1, packet, "10.100.0.10"); err != nil {
 			t.Fatalf("unexpected overflow during healthy traffic: %v", err)
 		}
-		recordEnqueue()
+		recorder.Enqueue(time.Now())
 	}
+	recordStarted := func(now time.Time) { recorder.Started(now) }
+	recordWritten := func(now time.Time) { recorder.Written(now) }
 	release := func(count int) {
 		for i := 0; i < count; i++ {
 			dev.permits <- struct{}{}
@@ -902,12 +841,4 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 	if errors, total, max := f.DeviceWriteStats(); errors != 0 || total <= 0 || max <= 0 {
 		t.Fatalf("write metrics: errors=%d total=%s max=%s", errors, total, max)
 	}
-}
-
-// phaseLatency renders the gap between an event's enqueue and one of its later phases.
-func phaseLatency(from, to time.Time) string {
-	if to.IsZero() || from.IsZero() {
-		return "not_reached"
-	}
-	return to.Sub(from).Round(time.Microsecond).String()
 }
