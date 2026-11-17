@@ -746,6 +746,18 @@ func (h *DifferentialHarness) SetClientRekeyTimeout(seconds int) {
 
 // NewClient constructs an upstream AWG client device using the exact frozen client config.
 func (h *DifferentialHarness) NewClient() (*HarnessClient, error) {
+	return h.newClient(deviceUp)
+}
+
+// deviceUp is the ordinary client device startup step.
+func deviceUp(dev *device.Device) error {
+	return dev.Up()
+}
+
+// newClient builds the client device and runs its startup step. start is a
+// dependency so a test can fail the exact startup operation after the device and
+// its TUN exist, without depending on host socket behaviour.
+func (h *DifferentialHarness) newClient(start func(*device.Device) error) (*HarnessClient, error) {
 	assignedAddr := netip.MustParseAddr(h.clientPeer.AllowedIP.Addr().String())
 	vt, stack, err := netstack.CreateNetTUN([]netip.Addr{assignedAddr}, nil, 1280)
 	if err != nil {
@@ -759,7 +771,7 @@ func (h *DifferentialHarness) NewClient() (*HarnessClient, error) {
 		dev.Close()
 		return nil, fmt.Errorf("client uapi: %w", err)
 	}
-	if err := dev.Up(); err != nil {
+	if err := start(dev); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("client up: %w", err)
 	}

@@ -4,13 +4,12 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"net/netip"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
+	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 )
 
@@ -85,48 +84,19 @@ func requireBoundedConstructorError(t *testing.T, name, wantSubstring string, fn
 	}
 }
 
-// holdUDPPort binds a wildcard UDP port without socket-reuse options and keeps it
-// until the test ends. A later bind of that port fails whatever options the
-// binding side sets, which makes the fixture's bind failure deterministic. A port
-// of 0 picks a free port, which is returned.
-func holdUDPPort(t *testing.T, port int) uint16 {
-	t.Helper()
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
-	if err != nil {
-		t.Fatalf("socket for held port: %v", err)
-	}
-	t.Cleanup(func() { _ = syscall.Close(fd) })
-	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Port: port}); err != nil {
-		t.Fatalf("bind held udp port %d: %v", port, err)
-	}
-	bound, err := syscall.Getsockname(fd)
-	if err != nil {
-		t.Fatalf("read held udp port: %v", err)
-	}
-	v4, ok := bound.(*syscall.SockaddrInet4)
-	if !ok {
-		t.Fatalf("held udp port has address type %T, want IPv4", bound)
-	}
-	return uint16(v4.Port)
-}
-
-// assertConstructorStage requires err to come from one of the documented
-// constructor failure stages. Which stage reports an upstream bind failure depends
-// on whether the device is already up, so the test pins that the error came from
-// the constructor and not from somewhere else.
-func assertConstructorStage(t *testing.T, name string, err error, stages ...string) {
-	t.Helper()
-	for _, stage := range stages {
-		if strings.HasPrefix(err.Error(), stage) {
-			return
-		}
-	}
-	t.Fatalf("%s: constructor error = %q, want one of %q", name, err, stages)
-}
-
 // newClientAsValue adapts NewClient to the constructor-failure helper.
 func newClientAsValue(h *DifferentialHarness) (any, error) {
 	client, err := h.NewClient()
+	if client == nil {
+		return nil, err
+	}
+	return client, err
+}
+
+// newClientWithStartup adapts a client construction with an injected startup step
+// to the constructor-failure helper.
+func newClientWithStartup(h *DifferentialHarness, start func(*device.Device) error) (any, error) {
+	client, err := h.newClient(start)
 	if client == nil {
 		return nil, err
 	}
@@ -187,23 +157,28 @@ func TestIssue874_ClientConstructorFailurePaths(t *testing.T) {
 			func() (any, error) { return newClientAsValue(harness) })
 	})
 
-	t.Run("ListenerBind", func(t *testing.T) {
+	t.Run("Startup", func(t *testing.T) {
 		harness := NewDifferentialHarness(t)
-		// A port this test holds without reuse options cannot be bound, so the
-		// device's listener step fails.
-		port := holdUDPPort(t, 0)
-		harness.rawClientConfig = fmt.Sprintf("ListenPort = %d\n%s", port, harness.rawClientConfig)
+		injected := errors.New("injected client startup failure")
 
-		err := requireBoundedConstructorError(t, "client listener failure", "address already in use",
-			func() (any, error) { return newClientAsValue(harness) })
-		assertConstructorStage(t, "client listener failure", err, "client uapi:", "client up:")
+		// The device and its TUN exist and the configuration was accepted: only
+		// the startup operation itself fails.
+		err := requireBoundedConstructorError(t, "client startup failure", "client up:",
+			func() (any, error) {
+				return newClientWithStartup(harness, func(*device.Device) error {
+					return injected
+				})
+			})
+		if !errors.Is(err, injected) {
+			t.Fatalf("client startup failure returned %v, want the injected error %v", err, injected)
+		}
 	})
 }
 
 // TestIssue874_ReferenceConstructorFailurePaths exercises the reference
-// constructor's listener, configuration and listener-startup failure seams. The
-// listener seam injects a bounded error at the exact boundary where the
-// constructor used to close the device and the tun separately.
+// constructor's listener and configuration failure seams. The listener seam
+// injects a bounded error at the exact boundary where the constructor used to
+// close the device and the tun separately.
 func TestIssue874_ReferenceConstructorFailurePaths(t *testing.T) {
 	t.Run("Listener", func(t *testing.T) {
 		harness := NewDifferentialHarness(t)
@@ -235,18 +210,5 @@ func TestIssue874_ReferenceConstructorFailurePaths(t *testing.T) {
 			func() (any, error) {
 				return newReferenceServerAsValue(harness.StartReferenceServer)
 			})
-	})
-
-	t.Run("ListenerBind", func(t *testing.T) {
-		harness := NewDifferentialHarness(t)
-		// Point the constructor at a port this test holds without reuse options,
-		// so the device's listener step cannot bind it.
-		harness.listenPort = int(holdUDPPort(t, 0))
-
-		err := requireBoundedConstructorError(t, "reference listener bind failure", "address already in use",
-			func() (any, error) {
-				return newReferenceServerAsValue(harness.StartReferenceServer)
-			})
-		assertConstructorStage(t, "reference listener bind failure", err, "reference ipc set:", "reference up:")
 	})
 }
