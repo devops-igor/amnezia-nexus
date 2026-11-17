@@ -39,7 +39,14 @@ func (h *DifferentialHarness) StartReferenceServer() (*ReferenceServer, error) {
 		return nil, fmt.Errorf("reference tun: %w", err)
 	}
 
-	dev := device.NewDevice(vt, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, "ref-server"))
+	// The upstream TUN reader starts inside NewDevice, so hold its first read
+	// until the transport configuration below is applied.
+	tunGate := newFirstReadGate(vt)
+	dev := device.NewDevice(tunGate, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, "ref-server"))
+	if err := tunGate.WaitFirstRead(firstReadStartTimeout); err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("reference tun reader start: %w", err)
+	}
 
 	tcpListener, err := stack.ListenTCPAddrPort(netip.AddrPortFrom(h.destinationIP, h.echoPort))
 	if err != nil {
@@ -58,7 +65,7 @@ func (h *DifferentialHarness) StartReferenceServer() (*ReferenceServer, error) {
 
 	ref := &ReferenceServer{
 		dev:         dev,
-		tun:         vt,
+		tun:         tunGate,
 		stack:       stack,
 		tcpListener: tcpListener,
 		udpConn:     udpConn,
@@ -76,6 +83,7 @@ func (h *DifferentialHarness) StartReferenceServer() (*ReferenceServer, error) {
 		_ = ref.Close()
 		return nil, fmt.Errorf("reference up: %w", err)
 	}
+	tunGate.MarkConfigured()
 
 	return ref, nil
 }
