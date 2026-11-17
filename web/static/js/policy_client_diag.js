@@ -275,6 +275,38 @@
         return null;
     }
 
+    // selectedIncarnation is the exact incarnation the picker currently accepts: the
+    // session id and the route generation the list carries for it. An absent generation is
+    // its own value, so a refresh that loses it is a change of authority rather than an
+    // unchanged selection. A refresh that removes the session or moves it to another
+    // generation therefore invalidates whatever the panel shows or has pending; an
+    // unchanged incarnation leaves a valid result alone.
+    function selectedIncarnation() {
+        var client = selectedOption();
+        if (!client) {
+            return {sessionID: '', generation: 0};
+        }
+        return {sessionID: client.session_id, generation: client.route_generation || 0};
+    }
+
+    function sameIncarnation(a, b) {
+        return a.sessionID === b.sessionID && a.generation === b.generation;
+    }
+
+    // invalidateIfSelectionMoved drops a pending diagnosis and the rendered answer when the
+    // refreshed list no longer accepts the incarnation they belong to. It bumps the request
+    // sequence, so an answer already in flight is refused when it arrives instead of being
+    // rendered under the new selection.
+    function invalidateIfSelectionMoved(before) {
+        if (sameIncarnation(before, selectedIncarnation())) {
+            return;
+        }
+        sequence++;
+        clearClientResult();
+        setClientStatus('');
+        applyDiagnoseAvailability();
+    }
+
     function clientOptionLabel(client) {
         var parts = [];
         if (client.assigned_ip) {
@@ -337,6 +369,9 @@
         if (inFlight.list) {
             return Promise.resolve(null);
         }
+        // The incarnation the panel is showing before this refresh. Both outcomes below
+        // compare it with what the picker accepts afterwards.
+        var before = selectedIncarnation();
         setClientBusy('list', true);
         setClientStatus(clientText('policy_client_loading'));
         return clientRequest(CLIENTS_ENDPOINT, {method: 'GET'}).then(function (answer) {
@@ -344,6 +379,7 @@
             lastClients = (answer && answer.clients) || [];
             policyRoutingEnabled = !!(answer && answer.policy_routing_enabled);
             renderClientPicker(lastClients);
+            invalidateIfSelectionMoved(before);
             setClientStatus('');
             if (!policyRoutingEnabled) {
                 setClientAlert('policy-off', clientText('policy_client_policy_off'));
@@ -359,6 +395,7 @@
             lastClients = [];
             policyRoutingEnabled = false;
             renderClientPicker([]);
+            invalidateIfSelectionMoved(before);
             setClientStatus('');
             setClientAlert('error', clientFailureText(err));
             return null;
@@ -838,6 +875,7 @@
         }
 
         var sentSession = client.session_id;
+        var sentGeneration = client.route_generation || 0;
         var body = {session_id: sentSession};
         if (client.route_generation) {
             body.route_generation = client.route_generation;
@@ -849,17 +887,27 @@
         clearClientResult();
 
         return clientRequest(DIAG_ENDPOINT, {method: 'POST', body: body}).then(function (answer) {
+            // The busy flag is released for every outcome: one request at a time, and a
+            // stale answer must not leave a legitimate diagnosis permanently busy.
             setClientBusy('diagnose', false);
-            setClientStatus('');
             if (requestId !== sequence) {
-                // A newer request has been issued; this answer belongs to a
-                // selection the operator already left.
+                // A newer request or a refresh that moved the selection; this answer
+                // belongs to an incarnation the panel no longer shows.
                 return null;
             }
-            var echoed = answer && answer.selection && answer.selection.session_id;
-            if (echoed !== sentSession) {
+            setClientStatus('');
+            var selection = (answer && answer.selection) || {};
+            if (selection.session_id !== sentSession ||
+                (selection.route_generation || 0) !== sentGeneration) {
                 // The answer is about another incarnation (or carries none), so
                 // rendering it would attribute one client's records to another.
+                setClientAlert('stale', clientText('policy_client_stale_answer'));
+                return null;
+            }
+            if (!sameIncarnation(selectedIncarnation(), {sessionID: sentSession, generation: sentGeneration})) {
+                // The picker moved to another generation of the same session while this
+                // request travelled: the answer describes the incarnation it asked about,
+                // not the one now selected.
                 setClientAlert('stale', clientText('policy_client_stale_answer'));
                 return null;
             }
