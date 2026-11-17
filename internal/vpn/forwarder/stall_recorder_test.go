@@ -307,16 +307,21 @@ type pacedQueueDevice struct {
 	permits chan struct{}
 	started chan phaseSignal
 	written chan phaseSignal
-	rec     *phaseRecorder // nil: phases are acknowledged but not recorded
+	// published wakes a wait that a buffered acknowledgement changed. It carries no phase:
+	// a recorder count shows the producer's own record, not that the acknowledgement that
+	// follows it has been sent.
+	published chan struct{}
+	rec       *phaseRecorder // nil: phases are acknowledged but not recorded
 }
 
 func newPacedQueueDevice(buffer int, rec *phaseRecorder) *pacedQueueDevice {
 	rec.AttachProducer()
 	return &pacedQueueDevice{
-		permits: make(chan struct{}, buffer),
-		started: make(chan phaseSignal, buffer),
-		written: make(chan phaseSignal, buffer),
-		rec:     rec,
+		permits:   make(chan struct{}, buffer),
+		started:   make(chan phaseSignal, buffer),
+		written:   make(chan phaseSignal, buffer),
+		published: make(chan struct{}, 1),
+		rec:       rec,
 	}
 }
 
@@ -332,7 +337,45 @@ func (d *pacedQueueDevice) Write(packet []byte) (int, error) {
 	at = time.Now()
 	d.rec.Written(seq, at)
 	d.written <- phaseSignal{at: at}
+	d.signalPublished()
 	return len(packet), nil
+}
+
+// signalPublished wakes a wait for a buffered acknowledgement. One pending wake-up is enough,
+// so the send never blocks and a test that is not waiting cannot stall the producer.
+func (d *pacedQueueDevice) signalPublished() {
+	select {
+	case d.published <- struct{}{}:
+	default:
+	}
+}
+
+// waitAcknowledged blocks until the producer's own record shows n completed writes and the
+// device has buffered the acknowledgement of each. Those are two publications, in this order:
+// Written is complete under the recorder's mutex before the acknowledgement is sent, so a wait
+// on the count alone can return while the acknowledgement is still unsent. Both facts share
+// the fixture's existing 3s budget, so one deadline covers the whole wait and an
+// acknowledgement that never arrives fails inside it rather than adding a second budget.
+// Only channel lengths are read, so no acknowledgement is consumed before the assertions that
+// count them, and none of them is evidence that a phase happened.
+func (d *pacedQueueDevice) waitAcknowledged(t *testing.T, n int) {
+	t.Helper()
+	timeout := time.NewTimer(3 * time.Second)
+	defer timeout.Stop()
+	for {
+		started, written := len(d.started), len(d.written)
+		if d.rec.Counts().Written >= n && started >= n && written >= n {
+			return
+		}
+		select {
+		case <-d.rec.changed:
+		case <-d.published:
+		case <-timeout.C:
+			t.Fatalf("device never published %d completed writes with their acknowledgements: "+
+				"started=%d written=%d buffered (%s)",
+				n, started, written, d.rec.Report(d.rec.HeadOfLine()))
+		}
+	}
 }
 
 // recorderFixture is the real forwarder path the recorder is used on: one route, one client
@@ -437,7 +480,10 @@ func TestPhaseRecorderActualDeviceCompletesBeforeObserver(t *testing.T) {
 	x := newRecorderFixture(t, 32, 64)
 	x.permit(1)
 	x.enqueue(1)
-	x.rec.waitFor(t, "one completed write", func(c phaseCounts) bool { return c.Written == 1 })
+	// The producer records the completed write and then acknowledges it. The assertion below
+	// counts the acknowledgement, so the wait covers both publications: a completed record
+	// alone does not mean the acknowledgement has been sent.
+	x.dev.waitAcknowledged(t, 1)
 
 	if len(x.dev.started) != 1 || len(x.dev.written) != 1 {
 		t.Fatalf("acknowledgements: started=%d written=%d, want 1 buffered each",
