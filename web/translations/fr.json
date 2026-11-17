@@ -877,7 +877,7 @@
   "policy_explain_running": "Analyse en cours…",
   "policy_explain_needs_value": "Saisissez d'abord un nom de domaine ou une adresse.",
   "policy_explain_failed": "Impossible d'expliquer la décision",
-  "policy_explain_no_session_context": "Aucune session VPN sélectionnée : aucune preuve client n'a été inspectée. Ceci est l'évaluation de la politique pour cette destination et son repli sûr, pas une route mesurée pour la connexion d'un utilisateur.",
+  "policy_explain_result_no_context": "{value} → route indéterminée : aucune session client sélectionnée, donc aucune preuve client n'a été inspectée.",
   "policy_explain_result": "{value} → {decision} : {reason}",
   "policy_explain_decision_direct": "en direct",
   "policy_explain_decision_proxy": "via le proxy",
@@ -899,5 +899,6 @@
   "policy_explain_reason_name_unresolved": "le nom n'a pas pu être résolu",
   "policy_explain_reason_cached_proxy_evidence": "le cache de routes de la session contient déjà une décision « proxy » pour cette adresse",
   "policy_explain_prospective_rule": "prospectif : la règle {rule} correspond ({shape}), source : {source} — s'applique après la réponse DNS propre au client",
+  "policy_explain_policy_evaluation_label": "Évaluation de la politique — pas la route mesurée de ce client :",
   "policy_explain_current_prefix": "plage d'adresses correspondante : {prefix}, source : {source}"
 }

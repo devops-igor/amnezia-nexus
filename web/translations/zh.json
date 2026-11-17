@@ -877,7 +877,7 @@
   "policy_explain_running": "正在分析…",
   "policy_explain_needs_value": "请先输入域名或地址。",
   "policy_explain_failed": "无法解释该决策",
-  "policy_explain_no_session_context": "未选择 VPN 会话：未检查任何客户端证据。这是策略对该目标的评估及其安全默认值，而不是任何用户连接的实际测量路由。",
+  "policy_explain_result_no_context": "{value} → 无法确定路由：未选择客户端会话，因此未检查任何客户端证据。",
   "policy_explain_result": "{value} → {decision}：{reason}",
   "policy_explain_decision_direct": "直连",
   "policy_explain_decision_proxy": "走代理",
@@ -899,5 +899,6 @@
   "policy_explain_reason_name_unresolved": "该域名无法解析",
   "policy_explain_reason_cached_proxy_evidence": "此会话的路由缓存已为该地址记录了走代理的决定",
   "policy_explain_prospective_rule": "预期：规则 {rule} 匹配（{shape}），来源：{source} —— 在收到该客户端自己的 DNS 应答后才生效",
+  "policy_explain_policy_evaluation_label": "策略评估——不是该客户端的实测路由：",
   "policy_explain_current_prefix": "匹配的地址范围：{prefix}，来源：{source}"
 }

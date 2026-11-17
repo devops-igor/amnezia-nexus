@@ -877,7 +877,7 @@
   "policy_explain_running": "در حال بررسی…",
   "policy_explain_needs_value": "ابتدا یک نام دامنه یا نشانی وارد کنید.",
   "policy_explain_failed": "توضیح این تصمیم ممکن نشد",
-  "policy_explain_no_session_context": "هیچ نشست VPN انتخاب نشده است: هیچ شاهد کارخواهی بررسی نشد. این ارزیابی سیاست برای این مقصد و مقدار پیش‌فرض ایمن آن است، نه مسیر اندازه‌گیری‌شده برای اتصال هیچ کاربری.",
+  "policy_explain_result_no_context": "{value} ← مسیر تعیین نشد: نشست کارخواه انتخاب نشده است، بنابراین هیچ شاهد کارخواهی بررسی نشد.",
   "policy_explain_result": "{value} ← {decision}: {reason}",
   "policy_explain_decision_direct": "مستقیم",
   "policy_explain_decision_proxy": "از طریق پروکسی",
@@ -899,5 +899,6 @@
   "policy_explain_reason_name_unresolved": "این نام قابل تشخیص نبود",
   "policy_explain_reason_cached_proxy_evidence": "حافظه مسیر این نشست از قبل برای این نشانی تصمیم پروکسی دارد",
   "policy_explain_prospective_rule": "آینده‌نگر: قاعده {rule} مطابقت دارد ({shape})، منبع: {source} — پس از دریافت پاسخ DNS خود کارخواه اعمال می‌شود",
+  "policy_explain_policy_evaluation_label": "ارزیابی سیاست — نه مسیر اندازه‌گیری‌شده این کارخواه:",
   "policy_explain_current_prefix": "محدوده نشانی مطابق: {prefix}، منبع: {source}"
 }

@@ -877,7 +877,7 @@
   "policy_explain_running": "Объясняем…",
   "policy_explain_needs_value": "Сначала введите доменное имя или адрес.",
   "policy_explain_failed": "Не удалось объяснить решение",
-  "policy_explain_no_session_context": "Сессия VPN не выбрана: данные клиента не проверялись. Это оценка политики для этого назначения и её безопасное значение по умолчанию, а не измеренный маршрут какого-либо пользовательского подключения.",
+  "policy_explain_result_no_context": "{value} → маршрут не определён: сессия не выбрана, поэтому данные клиента не проверялись.",
   "policy_explain_result": "{value} → {decision}: {reason}",
   "policy_explain_decision_direct": "напрямую",
   "policy_explain_decision_proxy": "через прокси",
@@ -899,5 +899,6 @@
   "policy_explain_reason_name_unresolved": "имя не удалось разрешить",
   "policy_explain_reason_cached_proxy_evidence": "в кеше маршрутов сессии для этого адреса уже сохранено решение «через прокси»",
   "policy_explain_prospective_rule": "предварительно: совпадает правило {rule} ({shape}), источник: {source} — применяется после того, как будет получен собственный DNS-ответ клиента",
+  "policy_explain_policy_evaluation_label": "Оценка политики — не измеренный маршрут этого клиента:",
   "policy_explain_current_prefix": "совпавший диапазон адресов: {prefix}, источник: {source}"
 }

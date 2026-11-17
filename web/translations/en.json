@@ -877,7 +877,7 @@
   "policy_explain_running": "Explaining…",
   "policy_explain_needs_value": "Type a domain name or an address first.",
   "policy_explain_failed": "Could not explain the decision",
-  "policy_explain_no_session_context": "No VPN session selected: no client evidence was inspected. This is the policy's evaluation of this destination and its safe fallback, not a measured route for any user's connection.",
+  "policy_explain_result_no_context": "{value} → route not determined: no client session selected, so no client evidence was inspected.",
   "policy_explain_result": "{value} → {decision}: {reason}",
   "policy_explain_decision_direct": "direct",
   "policy_explain_decision_proxy": "through the proxy",
@@ -899,5 +899,6 @@
   "policy_explain_reason_name_unresolved": "the name could not be resolved",
   "policy_explain_reason_cached_proxy_evidence": "the session's route cache already holds a proxy decision for this address",
   "policy_explain_prospective_rule": "prospective: {rule} matches ({shape}), source: {source} — applies after this client's own DNS answer is observed",
+  "policy_explain_policy_evaluation_label": "Policy evaluation — not this client's measured route:",
   "policy_explain_current_prefix": "matched address range: {prefix}, source: {source}"
 }
