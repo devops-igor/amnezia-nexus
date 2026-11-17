@@ -767,14 +767,31 @@ func (m *DirectEgressManager) lookupAndRefreshNATReply(proto uint8, natPort uint
 	}
 
 	now := time.Now()
-	entry.lastSeen = now
-	if flow, ok := m.flows[entry.flowKey]; ok {
-		flow.lastSeen = now
-		if isClose {
-			flow.closeSeen = true
-		}
+
+	// The flow lifetime is a property of the mapping, not of the direction the
+	// packet happened to travel. A reply is a peer packet like any other, so it
+	// cannot extend a flow that has already exceeded its configured idle
+	// timeout: the client path retires such a flow on its next packet, and
+	// honoring the reply here would let the far end revive a mapping this
+	// manager has stopped refreshing, so which side spoke first would decide
+	// the path. Retire it under the ordinary retirement rules and refuse the
+	// payload. Retirement keeps the tuple attributable through quarantine, so
+	// any later reply for the same port is still refused.
+	flow, hasFlow := m.flows[entry.flowKey]
+	if !hasFlow || flow.natPort != natPort {
+		// This entry outlived the flow that owned it. Nothing can deliver it
+		// legitimately, and no live flow may be disturbed here.
+		return natEntry{}, ErrStaleSessionReply
 	}
+	if m.isFlowExpiredLocked(flow, proto, now) {
+		m.retireFlowLocked(entry.flowKey, flow, proto, now)
+		return natEntry{}, ErrStaleSessionReply
+	}
+
+	entry.lastSeen = now
+	flow.lastSeen = now
 	if isClose {
+		flow.closeSeen = true
 		entry.closeSeen = true
 	}
 	return *entry, nil
