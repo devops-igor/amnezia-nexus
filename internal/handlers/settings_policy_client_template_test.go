@@ -60,6 +60,9 @@ var clientDiagSectionIDs = []string{
 	"policyClientDNSFoot",
 	"policyClientDNSCoverage",
 	"policyClientDNSGaps",
+	"policyClientEventRows",
+	"policyClientEventFoot",
+	"policyClientEventCoverage",
 	"policyClientLimitations",
 }
 
@@ -253,6 +256,11 @@ var clientDiagTokenValues = map[string][]string{
 		"wan_write_failed", "backend_queue_full", "backend_detached",
 		"backend_unavailable", "direct_egress_unavailable", "return_path_closed",
 	},
+	"dns_event": {
+		"answered", "no_answer", "nxdomain", "admission_refused", "upstream_error",
+		"invalid_query", "truncated", "delivery_failed",
+	},
+	"upstream": {"timeout", "refused", "error"},
 	"limit": {
 		"dns_names_not_retained", "dns_questions_not_retained",
 		"flow_decision_time_not_recorded", "flow_decision_reason_not_recorded",

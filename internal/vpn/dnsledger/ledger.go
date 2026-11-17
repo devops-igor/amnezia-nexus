@@ -117,7 +117,9 @@ type Record struct {
 // Stats is the collector's own accounting. It is read once per diagnosis and
 // never changed by the read.
 type Stats struct {
-	StartedAt        time.Time
+	StartedAt time.Time
+	// Events is the terminal-query accounting, separate from the answer budget.
+	Events           EventStats
 	Written          int64
 	Collapsed        int64
 	EvictedSession   int64
@@ -156,6 +158,11 @@ func (l *Ledger) Limits() Limits {
 type sessionLog struct {
 	records []Record
 	bytes   int
+	// events are the terminal query events of this session (R9). They share the
+	// session's lifetime but not its answer budget: an answer-heavy session cannot
+	// starve the query history of the same client.
+	events     []Event
+	eventBytes int
 }
 
 // Ledger is the bounded in-memory DNS record store.
@@ -167,15 +174,21 @@ type Ledger struct {
 	total    int
 	bytes    int
 	stats    Stats
+	// event store accounting, kept separate from the answer budget.
+	eventSeq   uint64
+	eventTotal int
+	eventBytes int
 }
 
 // New returns an empty ledger. The start instant is the ledger's own, not the
 // process's: a diagnosis that reports a window must report when this store began.
 func New() *Ledger {
-	return &Ledger{
+	ledger := &Ledger{
 		started:  time.Now(),
 		sessions: make(map[string]*sessionLog),
 	}
+	ledger.stats.Events = EventStats{}
+	return ledger
 }
 
 // Record stores one observed answer. It returns false when the record could not
@@ -407,6 +420,8 @@ func (l *Ledger) RetireSession(sessionID string) {
 	}
 	l.bytes -= session.bytes
 	l.total -= len(session.records)
+	l.eventBytes -= session.eventBytes
+	l.eventTotal -= len(session.events)
 	delete(l.sessions, sessionID)
 }
 

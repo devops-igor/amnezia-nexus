@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,16 +49,19 @@ var (
 
 // Server coordinates DNS query execution, rate/inflight bounding, response shaping, and policy observation.
 type Server struct {
-	cfg         ServerConfig
-	resolver    Resolver
-	policy      PolicySource
-	observer    RouteObserver
-	globalSem   chan struct{}
-	sessionMu   sync.Mutex
-	sessionSems map[policy.Scope]chan struct{}
-	closeOnce   sync.Once
-	closed      chan struct{}
-	wg          sync.WaitGroup
+	cfg      ServerConfig
+	resolver Resolver
+	policy   PolicySource
+	observer RouteObserver
+	// eventObserver receives one terminal event per client query. It is optional
+	// and never on the trust path: recording an event cannot create evidence.
+	eventObserver QueryEventObserver
+	globalSem     chan struct{}
+	sessionMu     sync.Mutex
+	sessionSems   map[policy.Scope]chan struct{}
+	closeOnce     sync.Once
+	closed        chan struct{}
+	wg            sync.WaitGroup
 
 	mu          sync.Mutex
 	closing     bool
@@ -69,6 +73,119 @@ func (s *Server) SetObserver(obs RouteObserver) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.observer = obs
+	// A route observer that also understands terminal query events receives them
+	// through the same installation, so a caller cannot wire one without the
+	// other and end up with answers recorded but failures invisible.
+	if events, ok := obs.(QueryEventObserver); ok {
+		s.eventObserver = events
+	} else if obs == nil {
+		s.eventObserver = nil
+	}
+}
+
+// emitQueryEvent reports one terminal query to the installed observer, if any.
+//
+// It runs after the delivery attempt and outside every lock; it performs no I/O and
+// allocates only the event value. A server without an observer records nothing,
+// which is why this cannot be a correctness dependency.
+func (s *Server) emitQueryEvent(scope *ScopeHandle, req, resp *mdns.Msg, outcome QueryOutcome, transport string, truncated, delivered bool, recvTime, answeredAt time.Time) {
+	if s == nil {
+		return
+	}
+	observer := s.QueryEventObserver()
+	if observer == nil {
+		return
+	}
+	event, ok := buildQueryEvent(scope, req, resp, outcome, transport, truncated, delivered, recvTime, answeredAt)
+	if !ok {
+		return
+	}
+	observer.ObserveDNSQueryEvent(event)
+}
+
+// buildQueryEvent assembles one terminal event, or reports that the query carries
+// nothing to record.
+func buildQueryEvent(scope *ScopeHandle, req, resp *mdns.Msg, outcome QueryOutcome, transport string, truncated, delivered bool, recvTime, answeredAt time.Time) (QueryEvent, bool) {
+	if req == nil || len(req.Question) == 0 {
+		return QueryEvent{}, false
+	}
+	event := QueryEvent{
+		Transport:     transport,
+		Name:          canonicalEventName(req.Question[0].Name),
+		QType:         req.Question[0].Qtype,
+		Kind:          outcome.Kind,
+		UpstreamError: outcome.UpstreamError,
+		Truncated:     truncated,
+		Delivered:     delivered,
+		ReceivedAt:    recvTime,
+		AnsweredAt:    answeredAt,
+	}
+	if scope != nil {
+		event.SessionID = scope.Scope.SessionID
+	}
+	if resp != nil {
+		event.RCode = resp.Rcode
+	}
+	// A response that was produced but not handed to the client is a different
+	// fact from one the consumer received, so the kind says so.
+	if !delivered && event.Kind != QueryEventAdmissionRefused && event.Kind != QueryEventInvalidQuery {
+		event.Kind = QueryEventDeliveryFailed
+	}
+	return event, true
+}
+
+// rejectBeforeResolution answers the queries this server refuses without asking an
+// upstream: a closed server, a cancelled context, an unparseable request and an
+// unsupported query. It reports whether it produced the answer.
+func (s *Server) rejectBeforeResolution(ctx context.Context, req *mdns.Msg) (*mdns.Msg, QueryOutcome, error, bool) {
+	select {
+	case <-s.closed:
+		return nil, QueryOutcome{}, ErrServerClosed, true
+	case <-ctx.Done():
+		return nil, QueryOutcome{}, ctx.Err(), true
+	default:
+	}
+	if req == nil || len(req.Question) == 0 {
+		return nil, QueryOutcome{}, ErrInvalidRequest, true
+	}
+	if errResp := validateQuery(req); errResp != nil {
+		return errResp, QueryOutcome{Kind: QueryEventInvalidQuery}, nil, true
+	}
+	return nil, QueryOutcome{}, nil, false
+}
+
+// exchangeUpstream performs the upstream exchange and reports a failure as the
+// SERVFAIL the client receives, with the exchange's own class. It is separate so the
+// decision reads as one admission, one exchange and one shaping step.
+func (s *Server) exchangeUpstream(ctx context.Context, req *mdns.Msg) (*mdns.Msg, QueryOutcome, bool) {
+	outcome := QueryOutcome{Kind: QueryEventAnswered}
+	resp, err := s.resolver.Exchange(ctx, req)
+	if err != nil || resp == nil {
+		resp = new(mdns.Msg)
+		resp.SetRcode(req, mdns.RcodeServerFailure)
+		outcome.Kind = QueryEventUpstreamError
+		outcome.UpstreamError = classifyUpstreamError(err)
+		return resp, outcome, true
+	}
+	outcome.Kind = queryEventKind(resp)
+	return resp, outcome, false
+}
+
+// canonicalEventName lowercases and unbounds a stored query name, bounded to the
+// DNS name limit so one hostile query cannot inflate a record.
+func canonicalEventName(name string) string {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	if len(name) > 253 {
+		name = name[:253]
+	}
+	return name
+}
+
+// QueryEventObserver returns the installed terminal-event observer, if any.
+func (s *Server) QueryEventObserver() QueryEventObserver {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.eventObserver
 }
 
 // NewServer creates a new Server.
@@ -243,36 +360,35 @@ func truncateUDP(req, resp *mdns.Msg) {
 // ServeDNSMessage processes a single DNS request, applying inflight limits, upstream resolution,
 // and response shaping.
 func (s *Server) ServeDNSMessage(ctx context.Context, scope any, req *mdns.Msg, isTCP bool) (*mdns.Msg, error) {
-	select {
-	case <-s.closed:
-		return nil, ErrServerClosed
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
+	resp, _, err := s.serveDNSMessageOutcome(ctx, scope, req, isTCP)
+	return resp, err
+}
 
-	if req == nil || len(req.Question) == 0 {
-		return nil, ErrInvalidRequest
+// serveDNSMessageOutcome is ServeDNSMessage plus what actually happened: whether the
+// query was refused before an upstream, whether the exchange failed and how, and
+// whether the reply was shaped. The terminal-event observer needs those facts, and
+// the trust path must not learn them: it keeps calling ServeDNSMessage.
+func (s *Server) serveDNSMessageOutcome(ctx context.Context, scope any, req *mdns.Msg, isTCP bool) (*mdns.Msg, QueryOutcome, error) {
+	if resp, outcome, err, handled := s.rejectBeforeResolution(ctx, req); handled {
+		// The refusal keeps its original error, so ServeDNSMessage's contract is
+		// unchanged for every caller.
+		return resp, outcome, err
 	}
-
-	if errResp := validateQuery(req); errResp != nil {
-		return errResp, nil
-	}
+	outcome := QueryOutcome{Kind: QueryEventAnswered}
 
 	scopeVal := toScope(scope)
 	release, ok := s.acquireInflight(ctx, scopeVal)
 	if !ok {
 		resp := new(mdns.Msg)
 		resp.SetRcode(req, mdns.RcodeServerFailure)
-		return resp, nil
+		outcome.Kind = QueryEventAdmissionRefused
+		return resp, outcome, nil
 	}
 	defer release()
 
-	resp, err := s.resolver.Exchange(ctx, req)
-	if err != nil || resp == nil {
-		resp = new(mdns.Msg)
-		resp.SetRcode(req, mdns.RcodeServerFailure)
-		return resp, nil
+	resp, outcome, failed := s.exchangeUpstream(ctx, req)
+	if failed {
+		return resp, outcome, nil
 	}
 
 	// Shape response: clear AD flag and preserve client ID.
@@ -281,9 +397,14 @@ func (s *Server) ServeDNSMessage(ctx context.Context, scope any, req *mdns.Msg, 
 
 	if !isTCP {
 		truncateUDP(req, resp)
+		if resp.Truncated && outcome.Kind == QueryEventAnswered {
+			// The client received a cut answer and must retry over TCP; saying so is
+			// the point of the event.
+			outcome.Kind = QueryEventTruncated
+		}
 	}
 
-	return resp, nil
+	return resp, outcome, nil
 }
 
 func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.PacketConn, errCh chan<- error, producers *sync.WaitGroup) {
@@ -313,13 +434,18 @@ func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.Packe
 		}
 
 		recvTime := time.Now()
-		resp, err := s.ServeDNSMessage(ctx, scopeVal, req, false)
+		resp, outcome, err := s.serveDNSMessageOutcome(ctx, scopeVal, req, false)
 		if err == nil && resp != nil {
+			delivered := false
 			if out, err := resp.Pack(); err == nil {
-				if _, err := udp.WriteTo(out, raddr); err == nil && (sc != nil || s.observer != nil) {
-					s.ObserveResponseWithSessionID(req, resp, sc, scopeVal.SessionID, recvTime)
+				if _, writeErr := udp.WriteTo(out, raddr); writeErr == nil {
+					delivered = true
+					if sc != nil || s.observer != nil {
+						s.ObserveResponseWithSessionID(req, resp, sc, scopeVal.SessionID, recvTime)
+					}
 				}
 			}
+			s.emitQueryEvent(scope, req, resp, outcome, "udp", resp.Truncated, delivered, recvTime, time.Now())
 		}
 	}
 }
@@ -357,7 +483,7 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 		}
 
 		recvTime := time.Now()
-		resp, err := s.ServeDNSMessage(ctx, scopeVal, req, true)
+		resp, outcome, err := s.serveDNSMessageOutcome(ctx, scopeVal, req, true)
 		if err != nil || resp == nil {
 			return
 		}
@@ -368,10 +494,16 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 		// #nosec G115 -- out length is validated <= 65535 above
 		binary.BigEndian.PutUint16(lenBuf[:], uint16(len(out)))
 		_ = c.SetWriteDeadline(time.Now().Add(readTimeout))
-		if _, err := c.Write(lenBuf[:]); err != nil {
-			return
+		delivered := false
+		// The length prefix and the body are one response on the wire; the event is
+		// only "delivered" when both writes succeeded.
+		if _, err := c.Write(lenBuf[:]); err == nil {
+			if _, err := c.Write(out); err == nil {
+				delivered = true
+			}
 		}
-		if _, err := c.Write(out); err != nil {
+		s.emitQueryEvent(scope, req, resp, outcome, "tcp", resp.Truncated, delivered, recvTime, time.Now())
+		if !delivered {
 			return
 		}
 		if (sc != nil || s.observer != nil) && (scope == nil || !scope.IsRetired()) {

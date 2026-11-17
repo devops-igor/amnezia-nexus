@@ -513,6 +513,37 @@ func (c *MemoryRouteCache) recordDNSObservation(sessionID string, observed gatew
 	}, observed.RecvTime)
 }
 
+// ObserveDNSQueryEvent stores one terminal client DNS query (issue #861, R9): a
+// refused admission, a failed upstream exchange, NXDOMAIN, a truncated reply, a
+// non-A type, or a reply the client never received.
+//
+// It is diagnostic history only. It writes no route evidence, so a failed or
+// truncated answer cannot become trusted because it was recorded here, and it runs
+// after the delivery attempt, outside every lock.
+func (c *MemoryRouteCache) ObserveDNSQueryEvent(event gatewaydns.QueryEvent) {
+	ledger := c.DNSLedger()
+	if ledger == nil || event.SessionID == "" {
+		return
+	}
+	generation, generationKnown := c.observedIncarnation(event.SessionID)
+	ledger.RecordEvent(dnsledger.InputEvent{
+		SessionID:            event.SessionID,
+		RouteGeneration:      generation,
+		RouteGenerationKnown: generationKnown,
+		Transport:            event.Transport,
+		Name:                 event.Name,
+		QType:                event.QType,
+		RCode:                event.RCode,
+		Kind:                 event.Kind,
+		UpstreamError:        event.UpstreamError,
+		Truncated:            event.Truncated,
+		Delivered:            event.Delivered,
+		ReceivedAt:           event.ReceivedAt,
+		AnsweredAt:           event.AnsweredAt,
+		PolicyGeneration:     answerSnapshotGeneration(c),
+	}, event.ReceivedAt)
+}
+
 // observedIncarnation reports the route generation registered for the session at
 // observation time. It never substitutes the current generation for an unknown
 // one: a DNS answer can arrive while the session owns no route, and inventing a

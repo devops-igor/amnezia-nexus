@@ -90,6 +90,13 @@ func clientDiagnosisEmptyDNS() ClientDiagnosisDNS {
 		Records:          []ClientDiagnosisDNSRecord{},
 		RecordsAvailable: false,
 		RecordCoverage:   clientDiagnosisEmptyRecordCoverage(false),
+		EventsAvailable:  false,
+		Events:           []ClientDiagnosisDNSQueryEvent{},
+		EventCoverage: ClientDiagnosisDNSQueryEventCoverage{
+			StartedAt:   "",
+			Limits:      ClientDiagnosisEventLimits{EventsPerSession: dnsledger.MaxEventsPerSession, EventsTotal: dnsledger.MaxEventsTotal, MaxAgeSeconds: int64(dnsledger.MaxRecordAge / time.Second)},
+			NotRecorded: clientDiagnosisDNSRecordGaps(),
+		},
 	}
 }
 
@@ -154,6 +161,7 @@ type clientDiagnosisReads struct {
 	flowsAvailable bool
 	dnsRecords     dnsledger.SessionSnapshot
 	dnsRecordsRead bool
+	dnsEvents      dnsledger.EventSnapshot
 }
 
 // clientDiagnosisApplyRecords fills the record sections from the copies the read
@@ -163,6 +171,7 @@ func clientDiagnosisApplyRecords(out *ClientDiagnosisResponse, reads clientDiagn
 	out.DNS = clientDiagnosisDNSFromEntries(reads.entries, reads.generation, now)
 	if reads.dnsRecordsRead {
 		clientDiagnosisApplyDNSRecords(&out.DNS, reads.dnsRecords, now)
+		clientDiagnosisApplyDNSEvents(&out.DNS, reads.dnsEvents, now)
 	}
 	if !reads.flowsAvailable {
 		return
@@ -178,6 +187,62 @@ func clientDiagnosisApplyRecords(out *ClientDiagnosisResponse, reads clientDiagn
 		// absolute count.
 		out.Limitations = append(out.Limitations, ClientDiagnosisLimitFlowScanPartial)
 	}
+}
+
+// clientDiagnosisApplyDNSEvents fills the terminal-query history.
+func clientDiagnosisApplyDNSEvents(section *ClientDiagnosisDNS, snapshot dnsledger.EventSnapshot, now time.Time) {
+	section.EventsAvailable = true
+	section.EventsTotal = snapshot.Total
+	section.EventsTruncated = snapshot.Truncated
+	section.Events = make([]ClientDiagnosisDNSQueryEvent, 0, len(snapshot.Events))
+	for _, event := range snapshot.Events {
+		section.Events = append(section.Events, clientDiagnosisDNSEvent(event))
+	}
+	section.EventCoverage = ClientDiagnosisDNSQueryEventCoverage{
+		StartedAt:         clientDiagnosisTime(snapshot.Stats.StartedAt),
+		EventsStored:      snapshot.Stats.Events,
+		EstimatedBytes:    snapshot.Stats.Bytes,
+		Written:           snapshot.Stats.Written,
+		Collapsed:         snapshot.Stats.Collapsed,
+		EvictedPerSession: snapshot.Stats.EvictedSession,
+		EvictedGlobal:     snapshot.Stats.EvictedGlobal,
+		AgedOut:           snapshot.Stats.AgedOut,
+		RejectedNoRoom:    snapshot.Stats.RejectedNoRoom,
+		Limits: ClientDiagnosisEventLimits{
+			EventsPerSession: snapshot.Limits.EventsPerSession,
+			EventsTotal:      snapshot.Limits.EventsTotal,
+			MaxAgeSeconds:    snapshot.Limits.MaxAgeSeconds,
+		},
+		NotRecorded: clientDiagnosisDNSRecordGaps(),
+	}
+	_ = now
+}
+
+// clientDiagnosisDNSEvent renders one stored terminal query.
+func clientDiagnosisDNSEvent(event dnsledger.Event) ClientDiagnosisDNSQueryEvent {
+	out := ClientDiagnosisDNSQueryEvent{
+		Seq:              event.Seq,
+		Name:             event.Name,
+		QType:            clientDiagnosisQType(event.QType),
+		RCode:            clientDiagnosisRCode(event.RCode),
+		Kind:             event.Kind,
+		Transport:        event.Transport,
+		Delivered:        event.Delivered,
+		Truncated:        event.Truncated,
+		UpstreamError:    event.UpstreamError,
+		ReceivedAt:       clientDiagnosisTime(event.ReceivedAt),
+		AnsweredAt:       clientDiagnosisTime(event.AnsweredAt),
+		IncarnationKnown: event.RouteGenerationKnown,
+		PolicyGeneration: event.PolicyGeneration,
+		Count:            event.Count,
+		FirstSeen:        clientDiagnosisTime(event.FirstSeen),
+		LastSeen:         clientDiagnosisTime(event.LastSeen),
+	}
+	if event.RouteGenerationKnown {
+		generation := event.RouteGeneration
+		out.RouteGeneration = &generation
+	}
+	return out
 }
 
 // clientDiagnosisApplyDNSRecords fills the observed-answer history.

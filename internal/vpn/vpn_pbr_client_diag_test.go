@@ -95,6 +95,12 @@ func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 			return resp, nil
 		}
 		q := req.Question[0]
+		if q.Qtype != mdns.TypeA {
+			// A real authority does not answer a non-A question with A records. The
+			// fixture must not either, or a no-answer response would look like an
+			// answered one.
+			return resp, nil
+		}
 		switch q.Name {
 		case "plain.example.":
 			resp.Answer = append(resp.Answer, &mdns.A{
@@ -113,6 +119,22 @@ func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 				Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
 				A:   f.example.AsSlice(),
 			})
+		case "nx.example.":
+			// A terminal NXDOMAIN: an error response, distinct from a no-answer one.
+			resp.Rcode = mdns.RcodeNameError
+		case "fail.example.":
+			// A failed upstream exchange, which the server turns into SERVFAIL.
+			return nil, context.DeadlineExceeded
+		case "big.example.":
+			// Enough records to exceed the client's UDP size, so the server shapes a
+			// truncated reply.
+			for i := 0; i < 40; i++ {
+				ip := netip.AddrFrom4([4]byte{93, 184, 217, byte(i + 1)})
+				resp.Answer = append(resp.Answer, &mdns.A{
+					Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+					A:   ip.AsSlice(),
+				})
+			}
 		case "short.example.":
 			// A one-second answer, for the "evidence expired before the decision"
 			// control.

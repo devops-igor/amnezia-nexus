@@ -302,7 +302,7 @@ func (g *Gateway) handleUDP(scope *ScopeHandle, ipv4Packet []byte, ihl int, dstI
 	}
 
 	recvTime := time.Now()
-	respMsg, err := g.server.ServeDNSMessage(scope.ctx, scope.Scope, reqMsg, false)
+	respMsg, outcome, err := g.server.serveDNSMessageOutcome(scope.ctx, scope.Scope, reqMsg, false)
 	if err != nil || respMsg == nil {
 		return true, nil
 	}
@@ -312,15 +312,20 @@ func (g *Gateway) handleUDP(scope *ScopeHandle, ipv4Packet []byte, ihl int, dstI
 		return true, nil
 	}
 
+	delivered := false
 	// Enqueue reply back to authenticated client if scope remains active.
 	if !scope.IsRetired() && scope.ReplyWriter != nil {
 		replyPkt := buildIPv4UDPPacket(dstIP, 53, srcIP, srcPort, respBytes)
 		if replyPkt != nil {
 			if err := scope.ReplyWriter.WritePacket(scope.Scope, replyPkt); err == nil {
+				delivered = true
 				g.server.ObserveResponseWithSessionID(reqMsg, respMsg, scope.SessionCache, scope.Scope.SessionID, recvTime)
 			}
 		}
 	}
+	// One terminal event per query, after the delivery attempt. It is diagnostic
+	// history: the answer record above is the only thing that creates evidence.
+	g.server.emitQueryEvent(scope, reqMsg, respMsg, outcome, "udp", respMsg.Truncated, delivered, recvTime, time.Now())
 	return true, nil
 }
 

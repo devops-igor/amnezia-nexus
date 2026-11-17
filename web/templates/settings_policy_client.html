@@ -116,6 +116,27 @@
         <p class="form-hint" id="policyClientDNSCoverage"></p>
         <ul class="form-hint" id="policyClientDNSGaps" style="margin: 0; padding-inline-start: var(--space-lg);"></ul>
 
+        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_dns_events_label" }}</div>
+        <p class="form-hint">{{ _ "policy_client_dns_events_hint" }}</p>
+        <div class="table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th scope="col">{{ _ "policy_client_column_name" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_type" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_result" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_transport" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_received" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_answered" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_delivered" }}</th>
+                    </tr>
+                </thead>
+                <tbody id="policyClientEventRows"></tbody>
+            </table>
+        </div>
+        <p class="form-hint" id="policyClientEventFoot" hidden></p>
+        <p class="form-hint" id="policyClientEventCoverage"></p>
+
         <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_limits_label" }}</div>
         <ul class="form-hint" id="policyClientLimitations" style="margin: 0; padding-inline-start: var(--space-lg);"></ul>
 

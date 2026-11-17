@@ -178,6 +178,16 @@
                 rows.removeChild(rows.firstChild);
             }
         }
+        rows = clientElement('policyClientEventRows');
+        if (rows) {
+            while (rows.firstChild) {
+                rows.removeChild(rows.firstChild);
+            }
+        }
+        var eventCoverage = clientElement('policyClientEventCoverage');
+        if (eventCoverage) {
+            eventCoverage.textContent = '';
+        }
         var gaps = clientElement('policyClientDNSGaps');
         if (gaps) {
             while (gaps.firstChild) {
@@ -461,6 +471,46 @@
         }
     }
 
+    // renderDNSEvents renders the terminal client queries: including the ones that
+    // produced no usable answer, which is why the table exists next to the answers.
+    function renderDNSEvents(events) {
+        var body = clientElement('policyClientEventRows');
+        if (!body) {
+            return;
+        }
+        (events || []).forEach(function (event) {
+            var row = root.document.createElement('tr');
+            appendCell(row, event.name);
+            appendCell(row, event.qtype);
+            var result = clientTokenLabel('dns_event', event.kind);
+            if (event.upstream_error) {
+                result = result + ' (' + clientTokenLabel('upstream', event.upstream_error) + ')';
+            }
+            appendCell(row, result);
+            appendCell(row, String(event.transport || '').toUpperCase());
+            appendCell(row, event.received_at);
+            appendCell(row, event.answered_at);
+            appendCell(row, event.delivered ? clientText('policy_client_delivered_yes') : clientText('policy_client_delivered_no'));
+            body.appendChild(row);
+        });
+    }
+
+    function renderEventCoverage(coverage) {
+        var el = clientElement('policyClientEventCoverage');
+        if (!el) {
+            return;
+        }
+        if (!coverage) {
+            el.textContent = '';
+            return;
+        }
+        el.textContent = clientText('policy_client_dns_events_coverage')
+            .replace('{stored}', String(coverage.events_stored || 0))
+            .replace('{collapsed}', String(coverage.collapsed || 0))
+            .replace('{evicted}', String((coverage.evicted_per_session || 0) + (coverage.evicted_global || 0)))
+            .replace('{aged}', String(coverage.aged_out || 0));
+    }
+
     function renderLimitations(limitations) {
         var list = clientElement('policyClientLimitations');
         if (!list) {
@@ -507,6 +557,8 @@
         renderEvidence(dns.entries || []);
         renderDNSRecords(dns.records || []);
         renderDNSCoverage(dns.record_coverage);
+        renderDNSEvents(dns.events || []);
+        renderEventCoverage(dns.event_coverage);
         renderFlows(flows.entries || []);
         renderLimitations((answer && answer.limitations) || []);
 
@@ -527,6 +579,16 @@
                 .replace('{total}', String(dns.records_total || 0));
         }
         renderFoot('policyClientDNSFoot', dnsFoot);
+
+        var eventFoot = '';
+        if (!(dns.events || []).length) {
+            eventFoot = dns.events_available ? clientText('policy_client_dns_events_empty') : clientText('policy_client_dns_events_not_recorded');
+        } else if (dns.events_truncated) {
+            eventFoot = clientText('policy_client_dns_events_truncated')
+                .replace('{shown}', String((dns.events || []).length))
+                .replace('{total}', String(dns.events_total || 0));
+        }
+        renderFoot('policyClientEventFoot', eventFoot);
 
         var flowFoot = '';
         if (!(flows.entries || []).length) {

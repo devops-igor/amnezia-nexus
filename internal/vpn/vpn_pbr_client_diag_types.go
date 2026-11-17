@@ -105,6 +105,9 @@ type ClientDiagnosisRequest struct {
 	// DNSRecordLimit bounds the observed-answer history page. Zero uses the
 	// collector's per-session default.
 	DNSRecordLimit int
+	// DNSEventLimit bounds the terminal-query history page. Zero uses the
+	// collector's per-session default.
+	DNSEventLimit int
 }
 
 // ClientDiagnosisTarget is one selectable session incarnation.
@@ -260,6 +263,53 @@ type ClientDiagnosisDNSRecordCoverage struct {
 	NotRecorded []string `json:"not_recorded"`
 }
 
+// ClientDiagnosisDNSQueryEvent is one terminal client DNS query: an answer, a
+// no-answer response, an error, a refusal, a truncated reply or a reply the client
+// never received. It is diagnostic history and is never route evidence.
+type ClientDiagnosisDNSQueryEvent struct {
+	Seq           uint64 `json:"seq"`
+	Name          string `json:"name"`
+	QType         string `json:"qtype"`
+	RCode         string `json:"rcode"`
+	Kind          string `json:"kind"`
+	Transport     string `json:"transport"`
+	Delivered     bool   `json:"delivered"`
+	Truncated     bool   `json:"truncated"`
+	UpstreamError string `json:"upstream_error,omitempty"`
+	ReceivedAt    string `json:"received_at"`
+	AnsweredAt    string `json:"answered_at"`
+	// RouteGeneration is the registered incarnation when the query arrived, when it
+	// could be established.
+	RouteGeneration  *uint64 `json:"route_generation,omitempty"`
+	IncarnationKnown bool    `json:"route_generation_established"`
+	PolicyGeneration string  `json:"policy_generation,omitempty"`
+	Count            int     `json:"count"`
+	FirstSeen        string  `json:"first_seen"`
+	LastSeen         string  `json:"last_seen"`
+}
+
+// ClientDiagnosisDNSQueryEventCoverage reports the terminal-event store's counters.
+type ClientDiagnosisDNSQueryEventCoverage struct {
+	StartedAt         string                     `json:"started_at"`
+	EventsStored      int                        `json:"events_stored"`
+	EstimatedBytes    int                        `json:"estimated_bytes"`
+	Written           int64                      `json:"written"`
+	Collapsed         int64                      `json:"collapsed"`
+	EvictedPerSession int64                      `json:"evicted_per_session"`
+	EvictedGlobal     int64                      `json:"evicted_global"`
+	AgedOut           int64                      `json:"aged_out"`
+	RejectedNoRoom    int64                      `json:"rejected_no_room"`
+	Limits            ClientDiagnosisEventLimits `json:"limits"`
+	NotRecorded       []string                   `json:"not_recorded"`
+}
+
+// ClientDiagnosisEventLimits states the event store's bounds in force.
+type ClientDiagnosisEventLimits struct {
+	EventsPerSession int   `json:"events_per_session"`
+	EventsTotal      int   `json:"events_total"`
+	MaxAgeSeconds    int64 `json:"max_age_seconds"`
+}
+
 // ClientDiagnosisDNS is the DNS section: the retained address evidence (what the
 // route cache holds right now) and the observed-answer history (what the router
 // actually saw).
@@ -282,6 +332,14 @@ type ClientDiagnosisDNS struct {
 	RecordsTotal     int                              `json:"records_total"`
 	RecordsTruncated bool                             `json:"records_truncated"`
 	RecordCoverage   ClientDiagnosisDNSRecordCoverage `json:"record_coverage"`
+	// Events are the terminal client queries, newest first. They are a separate
+	// store from the answers: a query that produced no usable answer still appears
+	// here.
+	EventsAvailable bool                                 `json:"events_available"`
+	Events          []ClientDiagnosisDNSQueryEvent       `json:"events"`
+	EventsTotal     int                                  `json:"events_total"`
+	EventsTruncated bool                                 `json:"events_truncated"`
+	EventCoverage   ClientDiagnosisDNSQueryEventCoverage `json:"event_coverage"`
 }
 
 // ClientDiagnosisFlowDispatch is what the dispatch path did with the flow's

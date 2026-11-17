@@ -157,6 +157,7 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 	out.Selection.PolicyGeneration = generation
 	flows, flowsAvailable := clientDiagnosisSnapshotFlows(fwd, sessionID, selection.RouteGeneration, now, req.FlowLimit)
 	dnsRecords, dnsRecordsRead := s.clientDiagnosisDNSRecords(sessionID, req.DNSRecordLimit)
+	dnsEvents := s.clientDiagnosisDNSEvents(sessionID, req.DNSEventLimit)
 	if err := ctx.Err(); err != nil {
 		return ClientDiagnosisResponse{}, err
 	}
@@ -178,6 +179,7 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 		flowsAvailable: flowsAvailable,
 		dnsRecords:     dnsRecords,
 		dnsRecordsRead: dnsRecordsRead,
+		dnsEvents:      dnsEvents,
 	}, now)
 	if dnsRecordsRead {
 		// The observation boundary this build records at cannot see failure
@@ -417,6 +419,21 @@ func (s *Service) clientDiagnosisDNSRecords(sessionID string, limit int) (dnsled
 		return dnsledger.SessionSnapshot{Records: []dnsledger.Record{}}, false
 	}
 	return ledger.Snapshot(sessionID, limit), true
+}
+
+// clientDiagnosisDNSEvents reads the session's terminal-query history. A service
+// without a collector answers an empty snapshot; the response reports
+// events_available=false so the panel can say "not recorded".
+func (s *Service) clientDiagnosisDNSEvents(sessionID string, limit int) dnsledger.EventSnapshot {
+	mem := s.clientDiagnosisRouteCache()
+	if mem == nil {
+		return dnsledger.EventSnapshot{Events: []dnsledger.Event{}}
+	}
+	ledger := mem.DNSLedger()
+	if ledger == nil {
+		return dnsledger.EventSnapshot{Events: []dnsledger.Event{}}
+	}
+	return ledger.SnapshotEvents(sessionID, limit)
 }
 
 // clientDiagnosisSnapshotFlows reads the selected incarnation's flow records and

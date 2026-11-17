@@ -82,6 +82,12 @@ w._ = key => {
   if (key === 'policy_client_dns_truncated') return 'DNS-TRUNC {shown}/{total}';
   if (key === 'policy_client_outcome_fmt') return 'OUTCOME {ok}/{failed} · return {return} {packets}';
   if (key === 'policy_client_counters_live_note') return 'COUNTERS-LIVE';
+  if (key === 'policy_client_dns_events_coverage') return 'EVENTS-COVERAGE {stored}/{collapsed}/{evicted}/{aged}';
+  if (key === 'policy_client_dns_events_truncated') return 'EVENTS-TRUNC {shown}/{total}';
+  if (key === 'policy_client_delivered_yes') return 'DELIVERED';
+  if (key === 'policy_client_delivered_no') return 'NOT-DELIVERED';
+  if (key.indexOf('policy_client_dns_event_') === 0) return 'EVENT:' + key.slice('policy_client_dns_event_'.length);
+  if (key.indexOf('policy_client_upstream_') === 0) return 'UPSTREAM:' + key.slice('policy_client_upstream_'.length);
   // Token families resolve to a sentinel, so an assertion can prove the token
   // was looked up in the dictionary instead of being printed raw.
   if (key.indexOf('policy_client_state_') === 0) return 'STATE:' + key.slice('policy_client_state_'.length);
@@ -510,6 +516,79 @@ assert.equal(unrecorded[3], 'not_recorded · REASON:not_recorded',
   'a flow without decision metadata says so instead of showing an empty instants cell');
 assert.equal(unrecorded[5], 'OUTCOME 4/0 · return RETURN_EVIDENCE:observed 2',
   'an observed return is distinguished from an unmeasured one');
+`)
+}
+
+// TestPolicyClientDiagRendersTerminalQueryEvents covers the terminal-query table:
+// an answered query, a no-answer query, an NXDOMAIN, an upstream timeout and a
+// truncated reply are each rendered with their own result, transport, instants and
+// delivery, and the section states that a recorded query is not route evidence.
+func TestPolicyClientDiagRendersTerminalQueryEvents(t *testing.T) {
+	runClientDiagScenario(t, clientTargetsScript+`
+responder = ((base) => async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
+  const answer = await base(url, opts);
+  answer.dns.events_available = true;
+  answer.dns.events_total = 5;
+  answer.dns.events_truncated = false;
+  answer.dns.events = [
+    {seq: 5, name: 'big.example', qtype: 'A', rcode: 'NOERROR', kind: 'truncated',
+     transport: 'udp', delivered: true, truncated: true,
+     received_at: '2026-11-17T09:10:05Z', answered_at: '2026-11-17T09:10:05Z', count: 1,
+     first_seen: '2026-11-17T09:10:05Z', last_seen: '2026-11-17T09:10:05Z'},
+    {seq: 4, name: 'fail.example', qtype: 'A', rcode: 'SERVFAIL', kind: 'upstream_error',
+     upstream_error: 'timeout', transport: 'udp', delivered: true, truncated: false,
+     received_at: '2026-11-17T09:10:04Z', answered_at: '2026-11-17T09:10:04Z', count: 1,
+     first_seen: '2026-11-17T09:10:04Z', last_seen: '2026-11-17T09:10:04Z'},
+    {seq: 3, name: 'nx.example', qtype: 'A', rcode: 'NXDOMAIN', kind: 'nxdomain',
+     transport: 'udp', delivered: true, truncated: false,
+     received_at: '2026-11-17T09:10:03Z', answered_at: '2026-11-17T09:10:03Z', count: 1,
+     first_seen: '2026-11-17T09:10:03Z', last_seen: '2026-11-17T09:10:03Z'},
+    {seq: 2, name: 'plain.example', qtype: 'AAAA', rcode: 'NOERROR', kind: 'no_answer',
+     transport: 'udp', delivered: true, truncated: false,
+     received_at: '2026-11-17T09:10:02Z', answered_at: '2026-11-17T09:10:02Z', count: 1,
+     first_seen: '2026-11-17T09:10:02Z', last_seen: '2026-11-17T09:10:02Z'},
+    {seq: 1, name: 'plain.example', qtype: 'A', rcode: 'NOERROR', kind: 'answered',
+     transport: 'udp', delivered: false, truncated: false,
+     received_at: '2026-11-17T09:10:01Z', answered_at: '2026-11-17T09:10:01Z', count: 1,
+     first_seen: '2026-11-17T09:10:01Z', last_seen: '2026-11-17T09:10:01Z'}
+  ];
+  answer.dns.event_coverage = {started_at: '2026-11-17T09:00:00Z', events_stored: 5,
+    estimated_bytes: 640, written: 7, collapsed: 1, evicted_per_session: 0, evicted_global: 1,
+    aged_out: 0, rejected_no_room: 0,
+    limits: {events_per_session: 128, events_total: 4096, max_age_seconds: 1800},
+    not_recorded: ['dns_transport_not_recorded']};
+  return answer;
+})(responder);
+`, `
+selectClient('sess-a');
+await w.diagnoseSelectedClient();
+await settle();
+
+assert.equal(rowCount('policyClientEventRows'), 5, 'every terminal query is rendered');
+
+const truncated = rowCells('policyClientEventRows', 0);
+assert.equal(truncated[0], 'big.example');
+assert.equal(truncated[2], 'EVENT:truncated', 'a truncated reply says so');
+assert.equal(truncated[3], 'UDP', 'the client transport is shown');
+assert.equal(truncated[6], 'DELIVERED', 'the reply reached the client');
+
+const failed = rowCells('policyClientEventRows', 1);
+assert.equal(failed[2], 'EVENT:upstream_error (UPSTREAM:timeout)',
+  'the failed exchange states its class, not a guess');
+
+const nxdomain = rowCells('policyClientEventRows', 2);
+assert.equal(nxdomain[2], 'EVENT:nxdomain', 'an NXDOMAIN is a distinct terminal result');
+
+const noAnswer = rowCells('policyClientEventRows', 3);
+assert.equal(noAnswer[2], 'EVENT:no_answer', 'a no-answer response is not an error');
+
+const undelivered = rowCells('policyClientEventRows', 4);
+assert.equal(undelivered[6], 'NOT-DELIVERED',
+  'a response the consumer never received is not reported as delivered');
+
+assert.equal(text('policyClientEventCoverage'), 'EVENTS-COVERAGE 5/1/1/0',
+  'the event store coverage is stated');
 `)
 }
 
