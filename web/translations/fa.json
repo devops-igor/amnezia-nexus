@@ -1131,5 +1131,6 @@
   "policy_client_drop_reason_prohibited_destination": "مقصد ممنوع",
   "policy_client_drop_reason_invalid_client_packet": "بسته نامعتبر کلاینت",
   "policy_client_drop_reason_nat_port_exhaustion": "اتمام پورت NAT",
-  "policy_client_drop_reason_direct_egress_unavailable": "خروج مستقیم در دسترس نیست"
+  "policy_client_drop_reason_direct_egress_unavailable": "خروج مستقیم در دسترس نیست",
+  "policy_client_drop_coverage": "این نسل: {session_keys} کلید · نگهداری {stored} · ادغام {merged} · حذف {evicted} · منقضی {pruned} · دفتر {keys}/{key_limit} کلید · پنجره {age}ثانیه (پاک‌سازی در نوشتن بعدی، پنهان از خواندن بر اساس سن)"
 }

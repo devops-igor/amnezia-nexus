@@ -79,7 +79,10 @@ type DropCoverage struct {
 	Merged    uint64
 	Evicted   uint64
 	Pruned    uint64
-	Keys      int
+	// Keys is the ledger-wide key count and SessionKeys the selected session's, so a
+	// client-scoped page never presents other clients' retention as its own.
+	Keys        int
+	SessionKeys int
 }
 
 // DropSnapshot is one bounded, pure read of a session's refusals.
@@ -87,6 +90,7 @@ type DropSnapshot struct {
 	Entries      []DropRecord
 	Total        int
 	Truncated    bool
+	Generation   uint64
 	Keys         int
 	SessionLimit int
 	GlobalLimit  int
@@ -169,7 +173,9 @@ func (l *dropLedger) Record(sessionID string, generation uint64, reason string, 
 }
 
 // pruneLocked drops records that aged out. It runs on write only: a read must not mutate
-// the store, and the age bound is a retention rule, not a read-time filter.
+// the store. Retention is therefore physical-until-the-next-write, and a read is
+// age-filtered, so a record can still occupy memory past the window while being invisible
+// to every reader. This is a bound, not an erasure guarantee at the exact instant.
 func (l *dropLedger) pruneLocked(now time.Time) {
 	if l.maxAge <= 0 {
 		return
@@ -220,14 +226,14 @@ func (l *dropLedger) sessionKeysLocked(sessionID string) int {
 //
 // It is a pure read: no pruning, no recency update, no cross-session data. A session whose
 // records were retired reports an empty snapshot, never another session's evidence.
-func (l *dropLedger) SessionSnapshot(sessionID string, limit int, now time.Time) DropSnapshot {
+func (l *dropLedger) SessionSnapshot(sessionID string, generation uint64, limit int, now time.Time) DropSnapshot {
 	if limit <= 0 {
 		limit = DropSnapshotDefaultLimit
 	}
 	if limit > DropSnapshotMaxLimit {
 		limit = DropSnapshotMaxLimit
 	}
-	out := DropSnapshot{SessionLimit: DropSessionKeyMax, GlobalLimit: DropGlobalKeyMax}
+	out := DropSnapshot{SessionLimit: DropSessionKeyMax, GlobalLimit: DropGlobalKeyMax, Generation: generation}
 	if l == nil || sessionID == "" {
 		return out
 	}
@@ -238,9 +244,15 @@ func (l *dropLedger) SessionSnapshot(sessionID string, limit int, now time.Time)
 
 	l.mu.Lock()
 	out.Coverage = l.cov
+	out.Coverage.Keys = l.keys
 	out.Keys = l.keys
 	for key, rec := range l.byKey {
 		if key.SessionID != sessionID {
+			continue
+		}
+		// Only the selected incarnation's refusals are current. A row from a replaced
+		// generation is not returned as this client's present evidence.
+		if generation != 0 && key.Generation != generation {
 			continue
 		}
 		// An aged record is reported as absent rather than as fresh evidence, and the read
@@ -249,6 +261,7 @@ func (l *dropLedger) SessionSnapshot(sessionID string, limit int, now time.Time)
 			continue
 		}
 		out.Total++
+		out.Coverage.SessionKeys++
 		out.Entries = append(out.Entries, *rec)
 	}
 	l.mu.Unlock()

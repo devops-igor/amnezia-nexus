@@ -1131,5 +1131,6 @@
   "policy_client_drop_reason_prohibited_destination": "prohibited destination",
   "policy_client_drop_reason_invalid_client_packet": "malformed client packet",
   "policy_client_drop_reason_nat_port_exhaustion": "NAT port exhaustion",
-  "policy_client_drop_reason_direct_egress_unavailable": "direct egress unavailable"
+  "policy_client_drop_reason_direct_egress_unavailable": "direct egress unavailable",
+  "policy_client_drop_coverage": "This generation: {session_keys} keys · retained {stored} · merged {merged} · evicted {evicted} · aged out {pruned} · ledger {keys}/{key_limit} keys · window {age}s (pruned on the next write, hidden from reads by age)"
 }

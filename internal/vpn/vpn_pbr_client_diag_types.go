@@ -492,12 +492,16 @@ type ClientDiagnosisDrops struct {
 
 // ClientDiagnosisDropCoverage reports the retention state of the pre-flow drop ledger.
 type ClientDiagnosisDropCoverage struct {
-	StartedAt       string `json:"started_at,omitempty"`
-	Stored          uint64 `json:"stored"`
-	Merged          uint64 `json:"merged"`
-	Evicted         uint64 `json:"evicted"`
-	Pruned          uint64 `json:"pruned"`
+	StartedAt string `json:"started_at,omitempty"`
+	Stored    uint64 `json:"stored"`
+	Merged    uint64 `json:"merged"`
+	Evicted   uint64 `json:"evicted"`
+	Pruned    uint64 `json:"pruned"`
+	// Keys is ledger-wide and SessionKeys belongs to the selected incarnation, so a
+	// client-scoped page never reports other clients' retention as its own.
 	Keys            int    `json:"keys"`
+	SessionKeys     int    `json:"session_keys"`
+	Generation      uint64 `json:"generation"`
 	KeyLimit        int    `json:"key_limit"`
 	AgeLimitSeconds int    `json:"age_limit_seconds"`
 }

@@ -136,7 +136,7 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 		f.directDrops.Add(1)
 		// The packet is refused before a flow exists. Its destination and ports are not
 		// trusted, so the record carries the length only and states that it has no tuple.
-		f.clientDrops.Record(sID, route.generation, DropReasonInvalidPacket, 0, netip.Addr{}, 0, false, pktLen, time.Now())
+		f.recordClientDrop(peerKey, route, DropReasonInvalidPacket, 0, netip.Addr{}, 0, false, pktLen)
 		return err
 	}
 	dstIP := parsed.DstIP
@@ -152,8 +152,8 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 		f.directDrops.Add(1)
 		// The destination is prohibited, so no flow is created. The packet IS a well-formed
 		// client packet, so its protocol and destination are recorded as observed facts.
-		f.clientDrops.Record(sID, route.generation, DropReasonProhibitedDestination,
-			parsed.Protocol, dstIP, parsed.DstPort, true, pktLen, time.Now())
+		f.recordClientDrop(peerKey, route, DropReasonProhibitedDestination,
+			parsed.Protocol, dstIP, parsed.DstPort, true, pktLen)
 		return err
 	}
 

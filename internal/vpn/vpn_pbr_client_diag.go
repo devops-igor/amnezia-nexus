@@ -121,20 +121,12 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 	// is computed against it, so two fields can never disagree about "now".
 	now := time.Now()
 
-	// The retained pre-flow refusals of THIS session, read through the bounded ledger's
-	// pure read. A session that was retired reads as empty; nothing here can see another
-	// client's drops.
-	var dropSnapshot forwarder.DropSnapshot
-	if fwd != nil {
-		dropSnapshot = fwd.ClientDropSnapshot(sessionID, 0)
-	}
-
 	out := ClientDiagnosisResponse{
 		Selection:   ClientDiagnosisSelection{SessionID: sessionID},
 		Coverage:    clientDiagnosisCoverage(fwd, now),
 		DNS:         clientDiagnosisEmptyDNS(),
 		Flows:       clientDiagnosisEmptyFlows(),
-		Drops:       clientDiagnosisDropsSection(dropSnapshot),
+		Drops:       ClientDiagnosisDrops{Available: false, State: ClientDiagnosisTokenNotRecorded, Entries: []ClientDiagnosisDrop{}},
 		Limitations: clientDiagnosisLimitations(),
 		EvaluatedAt: clientDiagnosisTime(now),
 		ReadOnly:    true,
@@ -165,6 +157,12 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 	entries, generation := s.clientDiagnosisEntries(sessionID, now, req.EvidenceLimit)
 	out.Selection.PolicyGeneration = generation
 	flows, flowsAvailable := clientDiagnosisSnapshotFlows(fwd, sessionID, selection.RouteGeneration, now, req.FlowLimit)
+	// The selected generation's refusals only: a row from a replaced incarnation is not this
+	// client's current evidence, and the read is still a pure ledger read.
+	var dropSnapshot forwarder.DropSnapshot
+	if fwd != nil {
+		dropSnapshot = fwd.ClientDropSnapshot(sessionID, selection.RouteGeneration, 0)
+	}
 	dnsRecords, dnsRecordsRead := s.clientDiagnosisDNSRecords(sessionID, req.DNSRecordLimit)
 	dnsEvents := s.clientDiagnosisDNSEvents(sessionID, req.DNSEventLimit)
 	if err := ctx.Err(); err != nil {
@@ -177,9 +175,11 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 	// rather than presented as one client's session.
 	if !clientDiagnosisStillSelected(fwd, sessionID, selection.RouteGeneration) {
 		out.Selection.State = ClientDiagnosisStateInconsistent
+		out.Drops = ClientDiagnosisDrops{Available: false, State: ClientDiagnosisStateInconsistent, Entries: []ClientDiagnosisDrop{}}
 		out.Limitations = append(out.Limitations, ClientDiagnosisLimitSelectionChanged)
 		return out, nil
 	}
+	out.Drops = clientDiagnosisDropsSection(dropSnapshot)
 
 	clientDiagnosisApplyRecords(&out, clientDiagnosisReads{
 		entries:        entries,

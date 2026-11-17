@@ -87,14 +87,14 @@ func TestClientDiagnosisDropCountsAggregateAndStayPerClient(t *testing.T) {
 	}
 
 	// Another session reads as empty rather than seeing this client's refusals.
-	other := f.fwd.ClientDropSnapshot("some-other-session", 0)
+	other := f.fwd.ClientDropSnapshot("some-other-session", 1, 0)
 	if other.Total != 0 {
 		t.Errorf("a different session read %d of this client's refusals", other.Total)
 	}
 
 	// Retirement removes them: a read after the session ends cannot resurrect evidence.
 	f.fwd.UnregisterSession(f.peerKey)
-	if after := f.fwd.ClientDropSnapshot(sessionID, 0); after.Total != 0 {
+	if after := f.fwd.ClientDropSnapshot(sessionID, 1, 0); after.Total != 0 {
 		t.Errorf("retired session still reports %d refusals", after.Total)
 	}
 }

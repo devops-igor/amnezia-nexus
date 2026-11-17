@@ -1131,5 +1131,6 @@
   "policy_client_drop_reason_prohibited_destination": "запрещённое назначение",
   "policy_client_drop_reason_invalid_client_packet": "некорректный пакет клиента",
   "policy_client_drop_reason_nat_port_exhaustion": "исчерпание портов NAT",
-  "policy_client_drop_reason_direct_egress_unavailable": "прямой выход недоступен"
+  "policy_client_drop_reason_direct_egress_unavailable": "прямой выход недоступен",
+  "policy_client_drop_coverage": "Это поколение: ключей {session_keys} · хранится {stored} · объединено {merged} · вытеснено {evicted} · устарело {pruned} · в журнале {keys}/{key_limit} ключей · окно {age}с (очистка при следующей записи, чтение скрывает по возрасту)"
 }

@@ -1131,5 +1131,6 @@
   "policy_client_drop_reason_prohibited_destination": "禁止的目标",
   "policy_client_drop_reason_invalid_client_packet": "客户端数据包格式错误",
   "policy_client_drop_reason_nat_port_exhaustion": "NAT 端口耗尽",
-  "policy_client_drop_reason_direct_egress_unavailable": "直连出口不可用"
+  "policy_client_drop_reason_direct_egress_unavailable": "直连出口不可用",
+  "policy_client_drop_coverage": "本代：{session_keys} 个键 · 保留 {stored} · 合并 {merged} · 逐出 {evicted} · 过期 {pruned} · 台账 {keys}/{key_limit} 个键 · 窗口 {age}秒（下次写入时清理，读取按时间隐藏）"
 }

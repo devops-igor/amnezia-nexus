@@ -28,6 +28,8 @@ func clientDiagnosisDropsSection(snap forwarder.DropSnapshot) ClientDiagnosisDro
 			Evicted:         snap.Coverage.Evicted,
 			Pruned:          snap.Coverage.Pruned,
 			Keys:            snap.Coverage.Keys,
+			SessionKeys:     snap.Coverage.SessionKeys,
+			Generation:      snap.Generation,
 			KeyLimit:        snap.SessionLimit,
 			AgeLimitSeconds: int(forwarder.DropMaxAge.Seconds()),
 		},

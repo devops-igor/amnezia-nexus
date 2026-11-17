@@ -83,7 +83,7 @@ w._ = key => {
   if (key === 'policy_client_outcome_fmt') return 'OUTCOME {ok}/{failed} · return {return} {packets}';
   if (key === 'policy_client_counters_live_note') return 'COUNTERS-LIVE';
   if (key === 'policy_client_drop_truncated') return 'DROP-TRUNC {shown}/{total}';
-  if (key === 'policy_client_drop_coverage') return 'DROPCOV {stored}/{merged}/{evicted}/{pruned} {keys}/{key_limit} {age}';
+  if (key === 'policy_client_drop_coverage') return 'DROPCOV {stored}/{merged}/{evicted}/{pruned} session {session_keys} ledger {keys}/{key_limit} {age}';
   if (key === 'policy_client_drop_no_tuple') return 'NO-TUPLE';
   if (key === 'policy_client_drop_empty') return 'DROP-EMPTY';
   if (key === 'policy_client_drop_not_recorded') return 'DROP-NOT-RECORDED';
@@ -474,8 +474,8 @@ assert.equal(rowCells('policyClientDropRows', 1)[1], 'NO-TUPLE',
 assert.equal(rowCells('policyClientDropRows', 1)[2], 'NO-TUPLE');
 assert.equal(rowCells('policyClientDropRows', 2)[0], 'REASON:nat-exhaustion');
 assert.equal(text('policyClientDropFoot'), 'DROP-TRUNC 3/3');
-assert.equal(text('policyClientDropCoverage'), 'DROPCOV 2/5/0/1 3/64 600',
-  'retention and loss are stated beside the rows');
+assert.equal(text('policyClientDropCoverage'), 'DROPCOV 2/5/0/1 session 3 ledger 3/64 600',
+  'retention and loss are stated beside the rows, with the session separated from the ledger');
 `)
 }
 
@@ -498,8 +498,8 @@ responder = ((base) => async (url, opts) => {
       {reason: 'nat_port_exhaustion', has_tuple: true, destination_ip: '9.9.9.9',
        destination_port: 443, protocol: 'tcp', count: 2, bytes: 120,
        first_seen: '2026-11-17T09:02:00Z', last_seen: '2026-11-17T09:06:00Z'}],
-    coverage: {stored: 2, merged: 5, evicted: 0, pruned: 1, keys: 3, key_limit: 64,
-               age_limit_seconds: 600}};
+    coverage: {stored: 2, merged: 5, evicted: 0, pruned: 1, session_keys: 3, keys: 3,
+               key_limit: 64, age_limit_seconds: 600}};
   answer.flows.entries = [
     {protocol: 'tcp', destination_ip: '93.184.216.34', destination_port: 443, choice: 'PROXY',
      route_generation: 3, last_seen_age_seconds: 5, expired: false, close_seen: false,

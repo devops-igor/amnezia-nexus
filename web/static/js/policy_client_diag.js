@@ -608,6 +608,7 @@
             .replace('{merged}', String(coverage.merged || 0))
             .replace('{evicted}', String(coverage.evicted || 0))
             .replace('{pruned}', String(coverage.pruned || 0))
+            .replace('{session_keys}', String(coverage.session_keys || 0))
             .replace('{keys}', String(coverage.keys || 0))
             .replace('{key_limit}', String(coverage.key_limit || 0))
             .replace('{age}', String(coverage.age_limit_seconds || 0));

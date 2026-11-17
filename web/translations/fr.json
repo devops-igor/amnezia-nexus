@@ -1131,5 +1131,6 @@
   "policy_client_drop_reason_prohibited_destination": "destination interdite",
   "policy_client_drop_reason_invalid_client_packet": "paquet client malformé",
   "policy_client_drop_reason_nat_port_exhaustion": "épuisement des ports NAT",
-  "policy_client_drop_reason_direct_egress_unavailable": "sortie directe indisponible"
+  "policy_client_drop_reason_direct_egress_unavailable": "sortie directe indisponible",
+  "policy_client_drop_coverage": "Cette génération : {session_keys} clés · conservés {stored} · fusionnés {merged} · évincés {evicted} · expirés {pruned} · journal {keys}/{key_limit} clés · fenêtre {age}s (élagué à la prochaine écriture, masqué à la lecture par l’âge)"
 }
