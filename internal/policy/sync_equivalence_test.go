@@ -271,6 +271,20 @@ func TestSyncer_UnchangedRefreshRetainsGeneration(t *testing.T) {
 		t.Errorf("identical-200 refresh rewrote the durable generation identity: %q -> %q",
 			firstGen.GenerationID, afterFull.GenerationID)
 	}
+
+	// Cycle 4: a real change after two retained cycles must advance the sequence
+	// from the retained version, so retention cannot poison the version numbering.
+	fixture.serve("/rules.lst", "listed.example.com\n*.wild.example.com\n198.51.100.0/24\n203.0.113.0/24\n", `"v3"`)
+	fourth, err := syncer.SyncOnce(ctx)
+	if err != nil {
+		t.Fatalf("change after retained cycles: %v", err)
+	}
+	if fourth.Version != first.Version+1 {
+		t.Errorf("change after retained cycles published version %d, want %d", fourth.Version, first.Version+1)
+	}
+	if fourth.GenerationID == first.GenerationID {
+		t.Error("change after retained cycles reused the retained generation identifier")
+	}
 }
 
 // TestSyncer_DeclarationOrderAndDuplicatesAreEquivalent keeps canonical equality
