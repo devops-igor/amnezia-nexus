@@ -1128,5 +1128,6 @@
   "policy_client_filter_label": "目标筛选",
   "policy_client_filter_hint": "按目标地址、端口或名称缩小本会话已读取的行。不会读取新状态，也不会发送查询。",
   "policy_client_filter_count": "{shown}/{total} 行匹配“{term}”",
-  "policy_client_filter_none": "没有已记录行匹配“{term}”。"
+  "policy_client_filter_none": "没有已记录行匹配“{term}”。",
+  "policy_client_corr_dns_names_not_retained": "保留的地址证据不含名称；名称来自应答历史"
 }

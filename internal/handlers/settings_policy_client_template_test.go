@@ -165,7 +165,13 @@ func TestPolicyClientSectionTranslationKeysInEveryLocale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read policy_client_diag.js: %v", err)
 	}
-	source := string(partial) + string(module)
+	// The destination filter is a shipped asset of the same section: its literal keys are
+	// part of the contract too, so they are extracted with the controller's.
+	filterModule, err := web.StaticFS.ReadFile("static/js/policy_client_diag_filter.js")
+	if err != nil {
+		t.Fatalf("read policy_client_diag_filter.js: %v", err)
+	}
+	source := string(partial) + string(module) + string(filterModule)
 
 	// Template keys arrive as {{ _ "policy_client_x" }}; controller keys as
 	// 'policy_client_x'. Both are literal in the shipped source.

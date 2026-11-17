@@ -1128,5 +1128,6 @@
   "policy_client_filter_label": "پالایه مقصد",
   "policy_client_filter_hint": "ردیف‌هایی را که برای این نشست خوانده شده‌اند بر پایه نشانی، درگاه یا نام مقصد محدود می‌کند. حالت تازه‌ای نمی‌خواند و پرسشی نمی‌فرستد.",
   "policy_client_filter_count": "{shown} از {total} ردیف با «{term}» همخوانی دارد",
-  "policy_client_filter_none": "هیچ ردیف ثبت‌شده‌ای با «{term}» همخوانی ندارد."
+  "policy_client_filter_none": "هیچ ردیف ثبت‌شده‌ای با «{term}» همخوانی ندارد.",
+  "policy_client_corr_dns_names_not_retained": "شاهد آدرسِ نگه‌داشته‌شده نامی ندارد؛ نام‌ها از تاریخچه پاسخ‌ها می‌آیند"
 }

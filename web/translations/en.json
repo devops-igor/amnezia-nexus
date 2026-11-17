@@ -1128,5 +1128,6 @@
   "policy_client_filter_label": "Destination filter",
   "policy_client_filter_hint": "Narrows the rows already read for this session by destination address, port or name. It reads no new state and sends no query.",
   "policy_client_filter_count": "{shown} of {total} rows match \"{term}\"",
-  "policy_client_filter_none": "No recorded row matches \"{term}\"."
+  "policy_client_filter_none": "No recorded row matches \"{term}\".",
+  "policy_client_corr_dns_names_not_retained": "the retained address evidence carries no name; names come from the answer history"
 }
