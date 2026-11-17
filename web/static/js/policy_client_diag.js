@@ -39,7 +39,21 @@
     // filter narrows these rows locally: switching sessions or issuing a new diagnosis
     // replaces it, so a filter can never show another incarnation's rows.
     var lastAnswer = null;
-    var destinationFilter = '';
+
+    // destinationFilter is the shipped destination-filter module. Its absence (an older
+    // asset) degrades to "no filter" rather than to an error.
+    function destinationFilter() {
+        return root.clientDiagDestinationFilter || null;
+    }
+
+    // destinationRows applies the filter module's predicate for one row family.
+    function destinationRows(kind, list) {
+        var filter = destinationFilter();
+        if (!filter) {
+            return list;
+        }
+        return filter[kind](list);
+    }
     var inFlight = {list: false, diagnose: false};
     // The last list the server returned, so the picker can be rebuilt without
     // re-reading it.
@@ -166,7 +180,10 @@
         if (filter) {
             filter.value = '';
         }
-        destinationFilter = '';
+        var filterModule = destinationFilter();
+        if (filterModule) {
+            filterModule.set('');
+        }
         renderFilterFoot(0, 0);
         var result = clientElement('policyClientResult');
         if (result) {
@@ -663,94 +680,13 @@
         });
     }
 
-    // filterTerm is the operator's destination filter, normalised for comparison.
-    function filterTerm() {
-        return String(destinationFilter || '').trim().toLowerCase();
-    }
-
-    // matchesDestination reports whether any of a row's OWN destination facts contains
-    // the term. Nothing is added to a row to make it match, and a row without a
-    // destination simply has nothing to compare.
-    function matchesDestination(facts) {
-        var term = filterTerm();
-        if (!term) {
-            return true;
-        }
-        for (var i = 0; i < facts.length; i++) {
-            if (facts[i] && String(facts[i]).toLowerCase().indexOf(term) >= 0) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    function filterRows(rows, factsOf) {
-        if (!filterTerm()) {
-            return rows;
-        }
-        return rows.filter(function (row) {
-            return matchesDestination(factsOf(row));
-        });
-    }
-
-    function filterEvidence(entries) {
-        return filterRows(entries || [], function (entry) {
-            return [entry.address];
-        });
-    }
-
-    function filterRecords(records) {
-        return filterRows(records || [], function (record) {
-            var addresses = (record.addresses || []).map(function (entry) {
-                return entry.address;
-            });
-            return [record.name, (record.aliases || []).join(' '), addresses.join(' ')];
-        });
-    }
-
-    function filterEvents(events) {
-        return filterRows(events || [], function (event) {
-            return [event.name];
-        });
-    }
-
-    function filterFlows(entries) {
-        return filterRows(entries || [], function (flow) {
-            return [flow.destination_ip, String(flow.destination_port == null ? '' : flow.destination_port),
-                (flow.names || []).join(' ')];
-        });
-    }
-
-    function filterDrops(entries) {
-        return filterRows(entries || [], function (drop) {
-            return drop.has_tuple
-                ? [drop.destination_ip, String(drop.destination_port == null ? '' : drop.destination_port)]
-                : [];
-        });
-    }
-
     // renderFilterFoot states the applied filter and how many recorded rows it leaves.
-    // An empty table under a filter is not the same fact as an empty history, and this
-    // line is what separates them.
+    // The filter module owns the wording; this call site owns the counts.
     function renderFilterFoot(shown, total) {
-        var el = clientElement('policyClientFilterFoot');
-        if (!el) {
-            return;
+        var filter = destinationFilter();
+        if (filter) {
+            filter.foot(shown, total);
         }
-        var term = filterTerm();
-        if (!term) {
-            el.textContent = '';
-            el.hidden = true;
-            return;
-        }
-        var text = shown > 0
-            ? clientText('policy_client_filter_count')
-                .replace('{shown}', String(shown))
-                .replace('{total}', String(total))
-                .replace('{term}', term)
-            : clientText('policy_client_filter_none').replace('{term}', term);
-        el.textContent = text;
-        el.hidden = false;
     }
 
     function renderLimitations(limitations) {
@@ -812,11 +748,11 @@
         var flowsAll = flows.entries || [];
         var dropView = (answer && answer.drops) || {};
         var dropsAll = dropView.entries || [];
-        var evidence = filterEvidence(evidenceAll);
-        var records = filterRecords(recordsAll);
-        var events = filterEvents(eventsAll);
-        var flowEntries = filterFlows(flowsAll);
-        var dropEntries = filterDrops(dropsAll);
+        var evidence = destinationRows('evidence', evidenceAll);
+        var records = destinationRows('records', recordsAll);
+        var events = destinationRows('events', eventsAll);
+        var flowEntries = destinationRows('flows', flowsAll);
+        var dropEntries = destinationRows('drops', dropsAll);
 
         renderEvidence(evidence);
         renderDNSRecords(records);
@@ -986,7 +922,10 @@
         var destination = clientElement('policyClientDestinationFilter');
         if (destination) {
             destination.addEventListener('input', function () {
-                destinationFilter = destination.value;
+                var filter = destinationFilter();
+                if (filter) {
+                    filter.set(destination.value);
+                }
                 applyDestinationFilter();
             });
         }

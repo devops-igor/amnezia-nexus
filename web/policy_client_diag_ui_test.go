@@ -58,6 +58,16 @@ func clientDiagHarness(t *testing.T, prelude, scenario string) string {
 	if err != nil {
 		t.Fatalf("read per-client controller: %v", err)
 	}
+	filterModule, err := StaticFS.ReadFile("static/js/policy_client_diag_filter.js")
+	if err != nil {
+		t.Fatalf("read per-client destination filter: %v", err)
+	}
+	// The filter is a second shipped asset: it is evaluated first, exactly as the
+	// template loads it.
+	encodedFilter, err := json.Marshal(string(filterModule))
+	if err != nil {
+		t.Fatalf("encode destination filter: %v", err)
+	}
 	encodedModule, err := json.Marshal(string(module))
 	if err != nil {
 		t.Fatalf("encode module: %v", err)
@@ -154,6 +164,7 @@ const selectClient = (id) => {
 // Evaluate the module before the section exists: the entry point must be inert.
 (async () => {
 w.eval(%s);
+w.eval(%s);
 assert.equal(w.initPolicyClientDiagnosis(), false, 'init must be inert without the section');
 assert.equal(card(), null, 'the fixture must not have a card yet');
 
@@ -169,7 +180,7 @@ await settle();
 console.log('CLIENT_DIAG_SCENARIO_OK');
 dom.window.close();
 })().catch(err => { console.error(err); process.exit(1); });
-`, string(encodedModule), string(encodedSection), prelude, scenario)
+`, string(encodedFilter), string(encodedModule), string(encodedSection), prelude, scenario)
 }
 
 func runClientDiagScenario(t *testing.T, prelude, scenario string) {
@@ -674,14 +685,21 @@ assert.equal(text('policyClientEventCoverage'), 'EVENTS-COVERAGE 5/1/1/0',
 // the template: every id the controller looks up must exist in the rendered
 // section.
 func TestPolicyClientDiagModuleElementIDs(t *testing.T) {
-	module, err := StaticFS.ReadFile("static/js/policy_client_diag.js")
-	if err != nil {
-		t.Fatalf("read per-client controller: %v", err)
-	}
 	section := clientDiagSectionHTMLForTest(t)
 
-	lookup := regexp.MustCompile(`clientElement\('([A-Za-z0-9_]+)'\)`)
-	matches := lookup.FindAllStringSubmatch(string(module), -1)
+	// Both shipped assets of the section are scanned: the controller and the destination
+	// filter module it delegates to.
+	source := ""
+	for _, asset := range []string{"static/js/policy_client_diag.js", "static/js/policy_client_diag_filter.js"} {
+		module, err := StaticFS.ReadFile(asset)
+		if err != nil {
+			t.Fatalf("read %s: %v", asset, err)
+		}
+		source = source + string(module)
+	}
+
+	lookup := regexp.MustCompile(`(?:clientElement|document.getElementById)\('([A-Za-z0-9_]+)'\)`)
+	matches := lookup.FindAllStringSubmatch(source, -1)
 	if len(matches) < 8 {
 		t.Fatalf("found only %d element lookups in the controller; the extraction is wrong", len(matches))
 	}

@@ -124,9 +124,11 @@ func TestSettingsTemplatePolicyClientSection(t *testing.T) {
 				t.Errorf("per-client section must not contain %q", forbidden)
 			}
 		}
-		// Exactly one script tag: the external controller asset.
-		if got := strings.Count(source, "<script"); got != 1 {
-			t.Errorf("per-client section has %d script tags, want exactly 1 external asset", got)
+		// Every script tag is an external asset carrying its own source; the section ships
+		// the controller and the destination filter it delegates to, and no inline body.
+		got := strings.Count(source, "<script")
+		if want := strings.Count(source, "<script src=\"/static/js/"); got != want || want == 0 {
+			t.Errorf("per-client section has %d script tags but %d external assets; every tag must load a shipped asset", got, want)
 		}
 	})
 
