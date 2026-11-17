@@ -217,6 +217,31 @@ func TestSettingsPageRendersUpstreamEditor(t *testing.T) {
 		t.Errorf("admin settings page loads the upstream controller %d times, want exactly 1", got)
 	}
 
+	// The save-effects notice is rendered on the real page and states what the
+	// received save path actually does: a failed download rolls the record back,
+	// an upstream-only save keeps the published generation and the evidence
+	// clients already have, and a save that changes rules rebuilds that evidence.
+	raw, err := web.TranslationsFS.ReadFile("translations/en.json")
+	if err != nil {
+		t.Fatalf("read en.json: %v", err)
+	}
+	var dict map[string]string
+	if err := json.Unmarshal(raw, &dict); err != nil {
+		t.Fatalf("parse en.json: %v", err)
+	}
+	notice := dict["policy_upstream_enabled_save_notice"]
+	if !strings.Contains(adminBody, notice) {
+		t.Errorf("admin settings page does not render the save-effects notice")
+	}
+	for _, claim := range []string{"rolled back", "published policy generation", "rebuilds that evidence"} {
+		if !strings.Contains(notice, claim) {
+			t.Errorf("the save-effects notice lost the %q claim: %q", claim, notice)
+		}
+	}
+	if strings.Contains(notice, "always") || strings.Contains(notice, "atomic") {
+		t.Errorf("the save-effects notice overclaims: %q", notice)
+	}
+
 	supportBody := renderSettingsPage(t, models.RoleSupport)
 	for _, forbidden := range []string{
 		`id="policyUpstreamCard"`,

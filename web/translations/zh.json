@@ -878,7 +878,7 @@
   "policy_upstream_mixed_warning": "加密条目之后的明文条目：当加密解析器失败时，查询会继续以明文发送。",
   "policy_upstream_client_config_notice": "已生成的客户端配置保留各自的 DNS 服务器。此列表只决定策略路由开启时网关自身向哪些解析器发起查询。",
   "policy_upstream_not_queried_note": "不会被查询：解析器只按顺序查询前两项。此项已保存并保留。",
-  "policy_upstream_enabled_save_notice": "保存会重新下载所有列表来源，可能因其失败并随后回滚，同时清除客户端路由证据，直到这些流量重新解析完成。",
+  "policy_upstream_enabled_save_notice": "保存会重新下载所有列表来源，可能因其失败，此时会回滚。仅修改解析器不会改变路由规则，因此已发布的策略代次和客户端已建立的路由证据都会保留；若保存改变了规则，这些证据会重新生成。",
   "policy_upstream_activation_save_notice": "策略路由已保存为启用，但未运行。保存将尝试启动它，这会下载列表并安装数据通路。",
   "policy_upstream_needs_source": "请先选择并保存策略列表来源，然后再保存解析器列表。",
   "policy_upstream_col_address": "地址",

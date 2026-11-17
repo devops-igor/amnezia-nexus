@@ -878,7 +878,7 @@
   "policy_upstream_mixed_warning": "Une entrée en clair après une entrée chiffrée : si le résolveur chiffré échoue, les requêtes continuent en clair.",
   "policy_upstream_client_config_notice": "Les configurations clientes générées conservent leurs propres serveurs DNS. Cette liste détermine uniquement les résolveurs interrogés par la passerelle lorsque le routage est activé.",
   "policy_upstream_not_queried_note": "Non interrogée : le résolveur n'interroge que les deux premières entrées, dans cet ordre. Cette entrée est conservée.",
-  "policy_upstream_enabled_save_notice": "L'enregistrement retélécharge toutes les sources de listes, peut échouer à cause d'elles puis être annulé, et efface les preuves de routage des clients jusqu'à ce que ces flux soient résolus à nouveau.",
+  "policy_upstream_enabled_save_notice": "L'enregistrement retélécharge toutes les sources de listes et peut échouer à cause d'elles, auquel cas il est annulé. Une modification qui ne touche que les résolveurs laisse les règles de routage inchangées : la génération de politique publiée et les preuves de routage déjà établies sont conservées ; un enregistrement qui change les règles les reconstruit.",
   "policy_upstream_activation_save_notice": "Le routage est enregistré comme activé mais ne fonctionne pas. L'enregistrement tentera de le démarrer, ce qui télécharge la liste et installe le chemin de données.",
   "policy_upstream_needs_source": "Choisissez et enregistrez d'abord une source de liste de politique, puis enregistrez une liste de résolveurs.",
   "policy_upstream_col_address": "Adresse",

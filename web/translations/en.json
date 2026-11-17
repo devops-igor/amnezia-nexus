@@ -878,7 +878,7 @@
   "policy_upstream_mixed_warning": "A plain entry after an encrypted one: when the encrypted resolver fails, queries continue in plaintext.",
   "policy_upstream_client_config_notice": "Generated client configurations keep their own DNS servers. This list only decides which resolvers the gateway dials while policy routing is on.",
   "policy_upstream_not_queried_note": "Not queried: the resolver asks only the first two entries in this order. This entry is stored and kept.",
-  "policy_upstream_enabled_save_notice": "Saving re-downloads every list source, can fail because of them and is then rolled back, and clears client routing evidence until those flows resolve again.",
+  "policy_upstream_enabled_save_notice": "Saving re-downloads every list source and can fail because of them, in which case it is rolled back. An upstream-only change leaves the routing rules as they are, so the published policy generation and the routing evidence clients already have are kept; a save that changes rules rebuilds that evidence.",
   "policy_upstream_activation_save_notice": "Policy routing is stored as enabled but is not running. Saving tries to start it, which downloads the list and installs the data path.",
   "policy_upstream_needs_source": "Choose and save a policy list source before saving a resolver list.",
   "policy_upstream_col_address": "Address",
