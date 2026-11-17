@@ -140,7 +140,7 @@ func (s *Server) SetObserver(obs RouteObserver) {
 // It runs after the delivery attempt and outside every lock; it performs no I/O and
 // allocates only the event value. A server without an observer records nothing,
 // which is why this cannot be a correctness dependency.
-func (s *Server) emitQueryEvent(scope *ScopeHandle, req, resp *mdns.Msg, outcome QueryOutcome, transport string, truncated, delivered bool, recvTime, answeredAt time.Time, routeGeneration uint64, incarnationKnown bool) {
+func (s *Server) emitQueryEvent(scope *ScopeHandle, req, resp *mdns.Msg, outcome QueryOutcome, transport string, truncated, delivered bool, recvTime, answeredAt time.Time, receipt QueryReceipt) {
 	if s == nil {
 		return
 	}
@@ -152,8 +152,8 @@ func (s *Server) emitQueryEvent(scope *ScopeHandle, req, resp *mdns.Msg, outcome
 	if ok {
 		// The incarnation the query arrived under, captured at receipt. It is set
 		// from the binder rather than resolved now, because "now" may be a successor.
-		event.RouteGeneration = routeGeneration
-		event.IncarnationKnown = incarnationKnown
+		event.RouteGeneration = receipt.Generation
+		event.IncarnationKnown = receipt.Known
 	}
 	if !ok {
 		return
@@ -316,12 +316,18 @@ func toScope(v any) policy.Scope {
 }
 
 // ObserveResponse evaluates and records route observations into the session cache.
+//
+// It carries no receipt authority: an observer that attributes history by lifetime
+// records nothing from this entrypoint rather than resolving a current generation for a
+// query whose receipt is unknown. Evidence-only callers keep using it.
 func (s *Server) ObserveResponse(req, resp *mdns.Msg, session *policy.SessionCache, recvTime time.Time) {
-	s.ObserveResponseWithSessionID(req, resp, session, "", recvTime)
+	s.ObserveResponseWithSessionID(req, resp, session, "", QueryReceipt{}, recvTime)
 }
 
 // ObserveResponseWithSessionID records route observations into the session cache and active route observer.
-func (s *Server) ObserveResponseWithSessionID(req, resp *mdns.Msg, session *policy.SessionCache, sessionID string, recvTime time.Time) {
+// The receipt is the lifetime the query was received under and travels to the observer, so
+// a delayed observation is attributed to it and never to a later owner of the session id.
+func (s *Server) ObserveResponseWithSessionID(req, resp *mdns.Msg, session *policy.SessionCache, sessionID string, receipt QueryReceipt, recvTime time.Time) {
 	if resp == nil || resp.Truncated || resp.Rcode != mdns.RcodeSuccess || s.policy == nil {
 		return
 	}
@@ -339,7 +345,7 @@ func (s *Server) ObserveResponseWithSessionID(req, resp *mdns.Msg, session *poli
 	// allocate a fresh session cache for a session that already released it.
 	// Skipping keeps a delayed/in-flight response from resurrecting the scope.
 	if obs != nil && sessionID != "" && (session == nil || !session.Retired()) {
-		_ = obs.ObserveDNSResponse(sessionID, req, resp)
+		_ = obs.ObserveDNSResponse(sessionID, receipt, req, resp)
 	}
 }
 
@@ -607,7 +613,7 @@ func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.Packe
 		}
 
 		recvTime := time.Now()
-		receiptGeneration, receiptKnown := s.bindQueryIncarnation(s.QueryEventObserver(), scopeVal.SessionID)
+		receipt := s.queryReceipt(s.QueryEventObserver(), scopeVal.SessionID)
 		resp, outcome, err := s.serveDNSMessageOutcome(ctx, scopeVal, req, false)
 		if err == nil && resp != nil {
 			delivered := false
@@ -615,11 +621,11 @@ func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.Packe
 				if _, writeErr := udp.WriteTo(out, raddr); writeErr == nil {
 					delivered = true
 					if sc != nil || s.observer != nil {
-						s.ObserveResponseWithSessionID(req, resp, sc, scopeVal.SessionID, recvTime)
+						s.ObserveResponseWithSessionID(req, resp, sc, scopeVal.SessionID, receipt, recvTime)
 					}
 				}
 			}
-			s.emitQueryEvent(scope, req, resp, outcome, "udp", resp.Truncated, delivered, recvTime, time.Now(), receiptGeneration, receiptKnown)
+			s.emitQueryEvent(scope, req, resp, outcome, "udp", resp.Truncated, delivered, recvTime, time.Now(), receipt)
 		}
 	}
 }
@@ -657,7 +663,7 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 		}
 
 		recvTime := time.Now()
-		receiptGeneration, receiptKnown := s.bindQueryIncarnation(s.QueryEventObserver(), scopeVal.SessionID)
+		receipt := s.queryReceipt(s.QueryEventObserver(), scopeVal.SessionID)
 		resp, outcome, err := s.serveDNSMessageOutcome(ctx, scopeVal, req, true)
 		if err != nil || resp == nil {
 			return
@@ -677,7 +683,7 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 				delivered = true
 			}
 		}
-		s.emitQueryEvent(scope, req, resp, outcome, "tcp", resp.Truncated, delivered, recvTime, time.Now(), receiptGeneration, receiptKnown)
+		s.emitQueryEvent(scope, req, resp, outcome, "tcp", resp.Truncated, delivered, recvTime, time.Now(), receipt)
 		if !delivered {
 			return
 		}
@@ -686,7 +692,7 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 			if scope != nil {
 				sID = scope.Scope.SessionID
 			}
-			s.ObserveResponseWithSessionID(req, resp, sc, sID, recvTime)
+			s.ObserveResponseWithSessionID(req, resp, sc, sID, receipt, recvTime)
 		}
 	}
 }

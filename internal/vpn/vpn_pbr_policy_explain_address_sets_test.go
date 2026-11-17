@@ -82,7 +82,7 @@ func (f *addressSetsFixture) observe(t *testing.T, name string, resp *mdns.Msg) 
 	t.Helper()
 	query := new(mdns.Msg)
 	query.SetQuestion(mdns.Fqdn(name), mdns.TypeA)
-	if err := f.cache.ObserveDNSResponse(addressSetsSession, query, resp); err != nil {
+	if err := f.cache.ObserveDNSResponseEvidence(addressSetsSession, query, resp); err != nil {
 		t.Fatalf("production observation: %v", err)
 	}
 }

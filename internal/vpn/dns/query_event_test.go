@@ -27,7 +27,7 @@ type recordingEventObserver struct {
 	seen   int
 }
 
-func (o *recordingEventObserver) ObserveDNSResponse(string, *mdns.Msg, *mdns.Msg) error {
+func (o *recordingEventObserver) ObserveDNSResponse(string, QueryReceipt, *mdns.Msg, *mdns.Msg) error {
 	o.seen++
 	return nil
 }
@@ -115,7 +115,7 @@ func TestEmitQueryEventWithoutAnObserverIsInert(t *testing.T) {
 	if server.QueryEventObserver() != nil {
 		t.Fatal("a fresh server has an event observer")
 	}
-	server.emitQueryEvent(scopeWithSession("s"), queryFor("plain.example", mdns.TypeA), new(mdns.Msg), QueryOutcome{Kind: QueryEventAnswered}, "udp", false, true, time.Now(), time.Now(), 7, true)
+	server.emitQueryEvent(scopeWithSession("s"), queryFor("plain.example", mdns.TypeA), new(mdns.Msg), QueryOutcome{Kind: QueryEventAnswered}, "udp", false, true, time.Now(), time.Now(), QueryReceipt{Generation: 7, Known: true})
 	// Nothing to assert beyond not panicking: the absence of an observer is the
 	// contract, and it is checked above.
 }
@@ -127,7 +127,7 @@ func TestSetObserverInstallsBothChannels(t *testing.T) {
 	if server.QueryEventObserver() == nil {
 		t.Fatal("installing the route observer did not install the event observer")
 	}
-	server.emitQueryEvent(nil, queryFor("plain.example", mdns.TypeA), new(mdns.Msg), QueryOutcome{Kind: QueryEventAnswered}, "tcp", false, true, time.Now(), time.Now(), 0, false)
+	server.emitQueryEvent(nil, queryFor("plain.example", mdns.TypeA), new(mdns.Msg), QueryOutcome{Kind: QueryEventAnswered}, "tcp", false, true, time.Now(), time.Now(), QueryReceipt{})
 	if len(observer.events) != 1 {
 		t.Fatalf("events = %d, want the one emitted query", len(observer.events))
 	}

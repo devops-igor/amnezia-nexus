@@ -106,7 +106,7 @@ func TestSessionScopeRetirement_SequentialChurnBeyondCapacity(t *testing.T) {
 		if !fwd.HasLiveSession(sid) {
 			t.Fatalf("session %d: registered route is not reported live", i)
 		}
-		if err := cache.ObserveDNSResponse(sid, req, resp); err != nil {
+		if err := cache.ObserveDNSResponseEvidence(sid, req, resp); err != nil {
 			t.Fatalf("session %d: observation failed: %v", i, err)
 		}
 		if got := cache.Lookup(sid, ip); got != policy.Direct {
@@ -124,7 +124,7 @@ func TestSessionScopeRetirement_SequentialChurnBeyondCapacity(t *testing.T) {
 	sid := "sess-churn-next"
 	fwd.RegisterSession(sid, "conn-1", "peer-1", "10.100.0.2", 1)
 	defer func() { fwd.BeginUnregisterSession("peer-1", sid).Wait() }()
-	if err := cache.ObserveDNSResponse(sid, req, resp); err != nil {
+	if err := cache.ObserveDNSResponseEvidence(sid, req, resp); err != nil {
 		t.Fatalf("after %d sequentially retired sessions the next trusted observation failed: %v", churn, err)
 	}
 	if got := cache.Lookup(sid, ip); got != policy.Direct {
@@ -145,7 +145,7 @@ func TestSessionScopeRetirement_LateDNSWorkCannotResurrectScope(t *testing.T) {
 	const peer = "peer-late"
 	retiredID := "sess-late-retired"
 	fwd.RegisterSession(retiredID, "conn-1", peer, "10.100.0.2", 1)
-	if err := cache.ObserveDNSResponse(retiredID, req, resp); err != nil {
+	if err := cache.ObserveDNSResponseEvidence(retiredID, req, resp); err != nil {
 		t.Fatalf("observation before retirement: %v", err)
 	}
 	fwd.BeginUnregisterSession(peer, retiredID).Wait()
@@ -248,7 +248,7 @@ func TestSessionScopeRetirement_ReplacementPreservesNewSessionScope(t *testing.T
 	oldID, newID := "sess-replace-old", "sess-replace-new"
 
 	fwd.RegisterSession(oldID, "conn-1", peer, "10.100.0.2", 1)
-	if err := cache.ObserveDNSResponse(oldID, req, resp); err != nil {
+	if err := cache.ObserveDNSResponseEvidence(oldID, req, resp); err != nil {
 		t.Fatalf("old session observation: %v", err)
 	}
 	if got := cache.Lookup(oldID, ip); got != policy.Direct {
@@ -263,7 +263,7 @@ func TestSessionScopeRetirement_ReplacementPreservesNewSessionScope(t *testing.T
 	if got := cache.Lookup(oldID, ip); got != policy.Unknown {
 		t.Fatalf("replaced session kept evidence: got %v want UNKNOWN", got)
 	}
-	if err := cache.ObserveDNSResponse(newID, req, resp); err != nil {
+	if err := cache.ObserveDNSResponseEvidence(newID, req, resp); err != nil {
 		t.Fatalf("replacement session observation: %v", err)
 	}
 	if got := cache.Lookup(newID, ip); got != policy.Direct {
@@ -310,7 +310,7 @@ func TestSessionScopeRetirement_BulkRetirementReleasesScopes(t *testing.T) {
 	owned := []string{"sess-bulk-a", "sess-bulk-b", "sess-bulk-c"}
 	for i, sid := range owned {
 		fwd.RegisterSessionWithReturnPath(sid, fmt.Sprintf("conn-%d", i), fmt.Sprintf("peer-%d", i), "10.100.0.2", 1, path)
-		if err := cache.ObserveDNSResponse(sid, req, resp); err != nil {
+		if err := cache.ObserveDNSResponseEvidence(sid, req, resp); err != nil {
 			t.Fatalf("session %s observation: %v", sid, err)
 		}
 		if got := cache.Lookup(sid, ip); got != policy.Direct {
@@ -341,7 +341,7 @@ func TestSessionScopeRetirement_BulkRetirementReleasesScopes(t *testing.T) {
 	unmanaged := []string{"sess-all-a", "sess-all-b"}
 	for i, sid := range unmanaged {
 		fwd.RegisterSession(sid, fmt.Sprintf("conn-%d", i), fmt.Sprintf("peer-all-%d", i), "10.100.0.2", 1)
-		if err := cache.ObserveDNSResponse(sid, req, resp); err != nil {
+		if err := cache.ObserveDNSResponseEvidence(sid, req, resp); err != nil {
 			t.Fatalf("session %s observation: %v", sid, err)
 		}
 	}

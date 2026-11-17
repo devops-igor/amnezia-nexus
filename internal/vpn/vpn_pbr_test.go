@@ -404,7 +404,7 @@ func TestMemoryRouteCache_ObserveDNSResponse_ProxyMatching(t *testing.T) {
 		A:   proxyIP.AsSlice(),
 	})
 
-	if err := rc.ObserveDNSResponse(sessionID, req, resp); err != nil {
+	if err := rc.ObserveDNSResponseEvidence(sessionID, req, resp); err != nil {
 		t.Fatalf("ObserveDNSResponse failed: %v", err)
 	}
 
@@ -700,7 +700,7 @@ func TestMemoryRouteCache_R8B1_SharedIP_ProxyWins(t *testing.T) {
 			A:   sharedIP.AsSlice(),
 		})
 
-		if err := rc.ObserveDNSResponse(sessionID, reqDirect, respDirect); err != nil {
+		if err := rc.ObserveDNSResponseEvidence(sessionID, reqDirect, respDirect); err != nil {
 			t.Fatalf("ObserveDNSResponse Direct failed: %v", err)
 		}
 		if d := rc.Lookup(sessionID, sharedIP); d != policy.Direct {
@@ -716,7 +716,7 @@ func TestMemoryRouteCache_R8B1_SharedIP_ProxyWins(t *testing.T) {
 			A:   sharedIP.AsSlice(),
 		})
 
-		if err := rc.ObserveDNSResponse(sessionID, reqProxy, respProxy); err != nil {
+		if err := rc.ObserveDNSResponseEvidence(sessionID, reqProxy, respProxy); err != nil {
 			t.Fatalf("ObserveDNSResponse Proxy failed: %v", err)
 		}
 		if d := rc.Lookup(sessionID, sharedIP); d != policy.Proxy {
@@ -738,7 +738,7 @@ func TestMemoryRouteCache_R8B1_SharedIP_ProxyWins(t *testing.T) {
 			A:   sharedIP.AsSlice(),
 		})
 
-		if err := rc.ObserveDNSResponse(sessionID, reqProxy, respProxy); err != nil {
+		if err := rc.ObserveDNSResponseEvidence(sessionID, reqProxy, respProxy); err != nil {
 			t.Fatalf("ObserveDNSResponse Proxy failed: %v", err)
 		}
 		if d := rc.Lookup(sessionID, sharedIP); d != policy.Proxy {
@@ -754,7 +754,7 @@ func TestMemoryRouteCache_R8B1_SharedIP_ProxyWins(t *testing.T) {
 			A:   sharedIP.AsSlice(),
 		})
 
-		if err := rc.ObserveDNSResponse(sessionID, reqDirect, respDirect); err != nil {
+		if err := rc.ObserveDNSResponseEvidence(sessionID, reqDirect, respDirect); err != nil {
 			t.Fatalf("ObserveDNSResponse Direct failed: %v", err)
 		}
 		if d := rc.Lookup(sessionID, sharedIP); d != policy.Proxy {
@@ -793,7 +793,7 @@ func TestMemoryRouteCache_R8B1_CNAME_ProtectedDomainProxy(t *testing.T) {
 		A:   targetIP.AsSlice(),
 	})
 
-	if err := rc.ObserveDNSResponse(sessionID, req, resp); err != nil {
+	if err := rc.ObserveDNSResponseEvidence(sessionID, req, resp); err != nil {
 		t.Fatalf("ObserveDNSResponse failed: %v", err)
 	}
 
@@ -817,7 +817,7 @@ func TestMemoryRouteCache_R8B1_TTLExpiry_And_ZeroTTL(t *testing.T) {
 			A:   testIP.AsSlice(),
 		})
 
-		if err := rc.ObserveDNSResponse(sessionID, req, resp); err != nil {
+		if err := rc.ObserveDNSResponseEvidence(sessionID, req, resp); err != nil {
 			t.Fatalf("ObserveDNSResponse: %v", err)
 		}
 		if d := rc.Lookup(sessionID, testIP); d != policy.Unknown {
@@ -846,7 +846,7 @@ func TestMemoryRouteCache_R8B1_TTLExpiry_And_ZeroTTL(t *testing.T) {
 			Hdr: mdns.RR_Header{Name: "normal.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
 			A:   testIP.AsSlice(),
 		})
-		_ = rc.ObserveDNSResponse(sessionID, reqDirect, respDirect)
+		_ = rc.ObserveDNSResponseEvidence(sessionID, reqDirect, respDirect)
 		if d := rc.Lookup(sessionID, testIP); d != policy.Direct {
 			t.Fatalf("expected Direct, got %v", d)
 		}
@@ -859,7 +859,7 @@ func TestMemoryRouteCache_R8B1_TTLExpiry_And_ZeroTTL(t *testing.T) {
 			Hdr: mdns.RR_Header{Name: "blocked-zero.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 0},
 			A:   testIP.AsSlice(),
 		})
-		_ = rc.ObserveDNSResponse(sessionID, reqProxy, respProxy)
+		_ = rc.ObserveDNSResponseEvidence(sessionID, reqProxy, respProxy)
 		if d := rc.Lookup(sessionID, testIP); d != policy.Unknown {
 			t.Fatalf("expected zero-TTL Proxy to revoke Direct to Unknown, got %v", d)
 		}
@@ -886,7 +886,7 @@ func TestMemoryRouteCache_R8B1_PolicyGenerationInvalidation(t *testing.T) {
 		A:   testIP.AsSlice(),
 	})
 
-	if err := rc.ObserveDNSResponse(sessionID, req, resp); err != nil {
+	if err := rc.ObserveDNSResponseEvidence(sessionID, req, resp); err != nil {
 		t.Fatalf("ObserveDNSResponse: %v", err)
 	}
 	if d := rc.Lookup(sessionID, testIP); d != policy.Direct {

@@ -21,8 +21,13 @@ type ReplyWriter interface {
 }
 
 // RouteObserver records DNS response observations into an active route cache.
+//
+// The receipt is the lifetime the query was received under. An observer must attribute
+// the observation to that receipt: it must not substitute the generation that is
+// registered when the write finally runs, and it must record nothing for a receipt that
+// carries no lifetime authority.
 type RouteObserver interface {
-	ObserveDNSResponse(sessionID string, req, resp *mdns.Msg) error
+	ObserveDNSResponse(sessionID string, receipt QueryReceipt, req, resp *mdns.Msg) error
 }
 
 // ScopeHandle represents an active authenticated DNS session capability.
@@ -304,7 +309,7 @@ func (g *Gateway) handleUDP(scope *ScopeHandle, ipv4Packet []byte, ihl int, dstI
 	recvTime := time.Now()
 	// Bound at receipt, before the exchange: a rekey during the lookup must not move
 	// the record to the successor.
-	receiptGeneration, receiptKnown := g.server.bindQueryIncarnation(g.server.QueryEventObserver(), scope.Scope.SessionID)
+	receipt := g.server.queryReceipt(g.server.QueryEventObserver(), scope.Scope.SessionID)
 	respMsg, outcome, err := g.server.serveDNSMessageOutcome(scope.ctx, scope.Scope, reqMsg, false)
 	if err != nil || respMsg == nil {
 		return true, nil
@@ -322,13 +327,13 @@ func (g *Gateway) handleUDP(scope *ScopeHandle, ipv4Packet []byte, ihl int, dstI
 		if replyPkt != nil {
 			if err := scope.ReplyWriter.WritePacket(scope.Scope, replyPkt); err == nil {
 				delivered = true
-				g.server.ObserveResponseWithSessionID(reqMsg, respMsg, scope.SessionCache, scope.Scope.SessionID, recvTime)
+				g.server.ObserveResponseWithSessionID(reqMsg, respMsg, scope.SessionCache, scope.Scope.SessionID, receipt, recvTime)
 			}
 		}
 	}
 	// One terminal event per query, after the delivery attempt. It is diagnostic
 	// history: the answer record above is the only thing that creates evidence.
-	g.server.emitQueryEvent(scope, reqMsg, respMsg, outcome, "udp", respMsg.Truncated, delivered, recvTime, time.Now(), receiptGeneration, receiptKnown)
+	g.server.emitQueryEvent(scope, reqMsg, respMsg, outcome, "udp", respMsg.Truncated, delivered, recvTime, time.Now(), receipt)
 	return true, nil
 }
 

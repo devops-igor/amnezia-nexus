@@ -112,6 +112,25 @@ type QueryReceiptBinder interface {
 	BindQueryIncarnation(sessionID string) (generation uint64, known bool)
 }
 
+// QueryReceipt is the session lifetime a query was received under, captured once at
+// receipt and carried by everything that query later produces: its terminal event and its
+// answer observation. A delayed handler therefore attributes its result to the lifetime
+// that received the query, not to one that reused the session id in the meantime.
+//
+// Known is false when no incarnation was established at receipt. Such a receipt carries
+// no lifetime authority, and a consumer must not replace it with the generation that
+// happens to be registered when the delayed write runs.
+type QueryReceipt struct {
+	Generation uint64
+	Known      bool
+}
+
+// queryReceipt resolves the receipt authority for one query, once, before the exchange.
+func (s *Server) queryReceipt(observer QueryEventObserver, sessionID string) QueryReceipt {
+	generation, known := s.bindQueryIncarnation(observer, sessionID)
+	return QueryReceipt{Generation: generation, Known: known}
+}
+
 // bindQueryIncarnation asks the installed observer for the receipt incarnation, or
 // reports that it cannot be established. It is a no-op without a binder.
 func (s *Server) bindQueryIncarnation(observer QueryEventObserver, sessionID string) (uint64, bool) {

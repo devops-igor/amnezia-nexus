@@ -1,11 +1,15 @@
 package vpn
 
 import (
+	"context"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
 
 	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/session"
 	mdns "github.com/miekg/dns"
 )
 
@@ -50,13 +54,13 @@ func takePause(armed *bool, mu *sync.Mutex) bool {
 	return true
 }
 
-func (o *pausingObserver) ObserveDNSResponse(sessionID string, req, resp *mdns.Msg) error {
+func (o *pausingObserver) ObserveDNSResponse(sessionID string, receipt gatewaydns.QueryReceipt, req, resp *mdns.Msg) error {
 	if takePause(&o.pauseAnswer, &o.mu) {
 		close(o.answerEntered)
 		<-o.answerRelease
 		defer close(o.answerDone)
 	}
-	return o.MemoryRouteCache.ObserveDNSResponse(sessionID, req, resp)
+	return o.MemoryRouteCache.ObserveDNSResponse(sessionID, receipt, req, resp)
 }
 
 func (o *pausingObserver) ObserveDNSQueryEvent(event gatewaydns.QueryEvent) {
@@ -285,4 +289,204 @@ func TestDNSHistoryCountsAreBoundedOnTheOtherOrdering(t *testing.T) {
 	}
 	f.fwd.UnregisterSession(f.peerKey)
 	requireNoHistory(t, f, sessionID)
+}
+
+// TestDNSAnswerCannotBeCreditedToAReAdmittedLifetime is the answer-side counterpart of the
+// re-admission control: the answer observer now carries the receipt the query was received
+// under, so a delayed answer from an ended lifetime is refused even though the session id
+// is live again, and the successor's own answer is recorded normally.
+func TestDNSAnswerCannotBeCreditedToAReAdmittedLifetime(t *testing.T) {
+	f := newClientDiagFixture(t)
+	sessionID := f.sessionID(t)
+	observer := &pausingObserver{
+		MemoryRouteCache: f.routeCache,
+		pauseAnswer:      true,
+		answerEntered:    make(chan struct{}),
+		answerRelease:    make(chan struct{}),
+		answerDone:       make(chan struct{}),
+	}
+	release := releaseOnce(t, observer.answerRelease)
+	f.svc.DNSGateway().SetObserver(observer)
+
+	stale, err := f.dispatchQuery(dnsQueryPlan{name: "plain.example", qtype: mdns.TypeA, srcPort: 57901, id: 0x7b01})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	waitOrFail(t, observer.answerEntered, "the stale answer writer entering")
+	if _, ok := f.awaitReply(stale, time.Second); !ok {
+		t.Fatal("the client reply was not delivered")
+	}
+
+	// The client disconnects; the session id is re-admitted with a new generation.
+	f.fwd.UnregisterSession(f.peerKey)
+	requireNoHistory(t, f, sessionID)
+	f.fwd.RegisterSessionWithReturnPath(sessionID, "conn-2", f.peerKey, f.clientIP.String(), 11, f.returnPath)
+	reAdmitted := f.generation(t)
+	if reAdmitted <= stale.generation {
+		t.Fatalf("re-admission generation %d is not later than the retired receipt %d", reAdmitted, stale.generation)
+	}
+
+	// The re-admitted lifetime serves its own query, which records its own answer while
+	// the stale writer is still held.
+	if _, err := f.query(dnsQueryPlan{name: "proxy.example", qtype: mdns.TypeA, srcPort: 57902, id: 0x7b02}); err != nil {
+		t.Fatalf("the re-admitted session's query: %v", err)
+	}
+
+	release()
+	waitOrFail(t, observer.answerDone, "the stale answer writer finishing")
+
+	answers := f.routeCache.DNSLedger().Snapshot(sessionID, 0)
+	if answers.Total != 1 {
+		t.Fatalf("answer rows after the stale writer resumed = %d, want only the successor's own: %+v",
+			answers.Total, answers.Records)
+	}
+	record := answers.Records[0]
+	if record.Name != "proxy.example" {
+		t.Fatalf("the recorded answer is %q, want the successor's own query", record.Name)
+	}
+	if !record.RouteGenerationKnown || record.RouteGeneration != reAdmitted {
+		t.Errorf("successor answer generation = %d/%v, want %d", record.RouteGeneration, record.RouteGenerationKnown, reAdmitted)
+	}
+}
+
+// TestDNSAnswerKeepsItsReceiptGenerationAcrossARekey proves the answer row is labeled with
+// the lifetime the query was received under: the writer is held across a same-session
+// rekey, and the row still states the receipt generation, not the one that is registered
+// when the write finally runs.
+func TestDNSAnswerKeepsItsReceiptGenerationAcrossARekey(t *testing.T) {
+	f := newClientDiagFixture(t)
+	sessionID := f.sessionID(t)
+	observer := &pausingObserver{
+		MemoryRouteCache: f.routeCache,
+		pauseAnswer:      true,
+		answerEntered:    make(chan struct{}),
+		answerRelease:    make(chan struct{}),
+		answerDone:       make(chan struct{}),
+	}
+	release := releaseOnce(t, observer.answerRelease)
+	f.svc.DNSGateway().SetObserver(observer)
+
+	watch, err := f.dispatchQuery(dnsQueryPlan{name: "plain.example", qtype: mdns.TypeA, srcPort: 57903, id: 0x7c01})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	waitOrFail(t, observer.answerEntered, "the answer writer entering")
+	if _, ok := f.awaitReply(watch, time.Second); !ok {
+		t.Fatal("the client reply was not delivered")
+	}
+	receiptGeneration := watch.generation
+
+	// Same session id, new route generation: a rekey, not a retirement.
+	f.fwd.RegisterSessionWithReturnPath(sessionID, "conn-2", f.peerKey, f.clientIP.String(), 11, f.returnPath)
+	rekeyed := f.generation(t)
+	if rekeyed == receiptGeneration {
+		t.Fatalf("the rekey did not advance the generation (%d)", rekeyed)
+	}
+
+	release()
+	waitOrFail(t, observer.answerDone, "the answer writer finishing")
+
+	answers := f.routeCache.DNSLedger().Snapshot(sessionID, 0)
+	if answers.Total != 1 {
+		t.Fatalf("answer rows = %d, want the one delivered answer", answers.Total)
+	}
+	record := answers.Records[0]
+	if !record.RouteGenerationKnown {
+		t.Fatal("the answer row lost its incarnation")
+	}
+	if record.RouteGeneration != receiptGeneration {
+		t.Errorf("answer row generation = %d, want the receipt generation %d (the rekey registered %d)",
+			record.RouteGeneration, receiptGeneration, rekeyed)
+	}
+}
+
+// TestDNSTCPAnswerKeepsItsReceiptGeneration proves the same receipt authority on the real
+// TCP transport: a client query over the production gateway, its answer writer held across
+// a same-session rekey, and the recorded row labeled with the receipt generation.
+func TestDNSTCPAnswerKeepsItsReceiptGeneration(t *testing.T) {
+	upstream := issue863StartUpstream(t, 0, nil)
+	env := issue863NewEnv(t, upstream)
+	t.Cleanup(func() { _ = env.gw.Close() })
+
+	const peer, connID = "r40-tcp-peer", "r40-tcp-conn"
+	clientIP := netip.MustParseAddr("10.100.0.94")
+	mgr := session.NewSessionManager(nil, nil)
+	sess, err := mgr.CreateSession(context.Background(), "user-r40", peer, clientIP.String(), 1, "tcp-client")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	env.svc.sessionMgr = mgr
+	sessionID := sess.ID
+
+	stack, _ := issue863ClientNetstack(t, env.fwd, sessionID, connID, peer, clientIP)
+	dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := stack.DialContextTCPAddrPort(dialCtx, netip.MustParseAddrPort("10.100.0.1:53"))
+	if err != nil {
+		t.Fatalf("dial gateway TCP: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	observer := &pausingObserver{
+		MemoryRouteCache: env.rc,
+		pauseAnswer:      true,
+		answerEntered:    make(chan struct{}),
+		answerRelease:    make(chan struct{}),
+		answerDone:       make(chan struct{}),
+	}
+	release := releaseOnce(t, observer.answerRelease)
+	env.gw.SetObserver(observer)
+
+	receiptGeneration, known := env.fwd.SessionRouteGeneration(sessionID)
+	if !known {
+		t.Fatal("the admitted session owns no route generation")
+	}
+
+	const queryName = "r40-tcp.example.test"
+	query := new(mdns.Msg)
+	query.SetQuestion(mdns.Fqdn(queryName), mdns.TypeA)
+	query.Id = 0x72b1
+	dnsConn := &mdns.Conn{Conn: conn}
+	if err := dnsConn.WriteMsg(query); err != nil {
+		t.Fatalf("write TCP query: %v", err)
+	}
+	reply, err := dnsConn.ReadMsg()
+	if err != nil {
+		t.Fatalf("read TCP reply: %v", err)
+	}
+	if reply.Rcode != mdns.RcodeSuccess || len(reply.Answer) == 0 {
+		t.Fatalf("TCP reply = rcode %d with %d answers, want a NOERROR answer", reply.Rcode, len(reply.Answer))
+	}
+
+	// The reply is delivered; the answer writer is held. Rekey while it is held.
+	waitOrFail(t, observer.answerEntered, "the TCP answer writer entering")
+	noop := forwarder.NewReturnPath(func(_, _ string, packet []byte) (int, error) { return len(packet), nil })
+	env.fwd.RegisterSessionWithReturnPath(sessionID, "conn-2", peer, clientIP.String(), 1, noop)
+	rekeyed, knownAfter := env.fwd.SessionRouteGeneration(sessionID)
+	if !knownAfter || rekeyed <= receiptGeneration {
+		t.Fatalf("rekey generation = %d/%v, want later than the receipt generation %d",
+			rekeyed, knownAfter, receiptGeneration)
+	}
+	release()
+	waitOrFail(t, observer.answerDone, "the TCP answer writer finishing")
+
+	answers := env.rc.DNSLedger().Snapshot(sessionID, 0)
+	var recorded bool
+	for _, record := range answers.Records {
+		if record.Name != queryName {
+			continue
+		}
+		recorded = true
+		if !record.RouteGenerationKnown {
+			t.Fatal("the TCP answer row lost its incarnation")
+		}
+		if record.RouteGeneration != receiptGeneration {
+			t.Errorf("TCP answer row generation = %d, want the receipt generation %d (the rekey registered %d)",
+				record.RouteGeneration, receiptGeneration, rekeyed)
+		}
+	}
+	if !recorded {
+		t.Fatalf("no TCP answer row recorded for %q; rows=%+v", queryName, answers.Records)
+	}
 }

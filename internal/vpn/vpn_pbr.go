@@ -436,7 +436,25 @@ func (c *MemoryRouteCache) Observe(sessionID string, ip netip.Addr, d policy.Dec
 
 // ObserveDNSResponse evaluates a DNS query and response pair against the policy matcher
 // and feeds client-scoped route evidence directly into the route cache (Direct or Proxy).
-func (c *MemoryRouteCache) ObserveDNSResponse(sessionID string, req, resp *mdns.Msg) error {
+//
+// The receipt is the session lifetime the query was received under. The observation is
+// recorded as history under that receipt, never under the generation registered when this
+// write finally runs: a delayed answer must not be credited to a session id's successor.
+func (c *MemoryRouteCache) ObserveDNSResponse(sessionID string, receipt gatewaydns.QueryReceipt, req, resp *mdns.Msg) error {
+	return c.observeDNSResponse(sessionID, &receipt, req, resp)
+}
+
+// ObserveDNSResponseEvidence evaluates the same answer for route evidence and records no
+// history at all. It exists for callers that have no query receipt — an entrypoint
+// without lifetime authority must not be able to stamp history with a generation it did
+// not receive, so this one writes none rather than guessing one.
+func (c *MemoryRouteCache) ObserveDNSResponseEvidence(sessionID string, req, resp *mdns.Msg) error {
+	return c.observeDNSResponse(sessionID, nil, req, resp)
+}
+
+// observeDNSResponse writes the route evidence for one answer and, when a receipt is
+// present, its history row under that receipt.
+func (c *MemoryRouteCache) observeDNSResponse(sessionID string, receipt *gatewaydns.QueryReceipt, req, resp *mdns.Msg) error {
 	if c == nil || req == nil || resp == nil || sessionID == "" {
 		return nil
 	}
@@ -467,7 +485,9 @@ func (c *MemoryRouteCache) ObserveDNSResponse(sessionID string, req, resp *mdns.
 	// The record is written whether or not the cache accepted the evidence: an
 	// answer the observation path rejected is exactly what an administrator needs
 	// to see, and it is stored with that verdict rather than as trusted evidence.
-	c.recordDNSObservation(sessionID, observed)
+	if receipt != nil {
+		c.recordDNSObservation(sessionID, *receipt, observed)
+	}
 	return err
 }
 
@@ -479,7 +499,7 @@ const DNSTransportNotRecorded = "not_recorded"
 // recordDNSObservation stores one observed answer in the bounded DNS ledger,
 // bound to the session and to the route generation registered for it at the time
 // of the observation.
-func (c *MemoryRouteCache) recordDNSObservation(sessionID string, observed gatewaydns.ObservedAnswer) {
+func (c *MemoryRouteCache) recordDNSObservation(sessionID string, receipt gatewaydns.QueryReceipt, observed gatewaydns.ObservedAnswer) {
 	if c.DNSLedger() == nil || sessionID == "" {
 		return
 	}
@@ -502,16 +522,19 @@ func (c *MemoryRouteCache) recordDNSObservation(sessionID string, observed gatew
 			Decision: observation.Decision.String(),
 		})
 	}
-	generation, generationKnown := c.observedIncarnation(sessionID)
+	// The row is labeled with the lifetime the query was received under, and the same
+	// receipt decides admission below. Resolving a generation here instead would label a
+	// delayed answer with whatever owns the session id now.
+	generation, generationKnown := receipt.Generation, receipt.Known
 	policyGeneration := answerSnapshotGeneration(c)
 	c.dnsRecordsMu.Lock()
 	defer c.dnsRecordsMu.Unlock()
 	// The answer record is written after the reply was delivered, so — like the terminal
-	// event — it can run after the session retired. It is admitted only while this
-	// session's history lifetime is open, in the same critical section as the append, so
-	// retirement cannot interleave between the decision and the write. The incarnation is
-	// resolved above, at write time, so this fence cannot tell two lifetimes of one
-	// session id apart; that limit is stated in the handover.
+	// event — it can run after the session retired, or after the session id was
+	// re-admitted. It is admitted only while the lifetime this query was received under is
+	// open, in the same critical section as the append, so retirement cannot interleave
+	// between the decision and the write and a receipt from an ended lifetime is refused
+	// even though the session id exists again.
 	if !c.historyWriteAllowedLocked(sessionID, generation, generationKnown) {
 		return
 	}
@@ -765,7 +788,10 @@ func (c *MemoryRouteCache) SetPolicyGeneration(generation string) {
 	c.rc.SetPolicyGeneration(generation)
 }
 
-// ObserveDNSResponse records client DNS observations into the active route cache used by the forwarder.
+// ObserveDNSResponse records client DNS observations into the active route cache used by
+// the forwarder. It carries no query receipt, so it writes route evidence only and no
+// history: history is written by the DNS observer with the receipt the query arrived
+// under.
 func (s *Service) ObserveDNSResponse(sessionID string, req, resp *mdns.Msg) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -777,7 +803,7 @@ func (s *Service) ObserveDNSResponse(sessionID string, req, resp *mdns.Msg) erro
 		return nil
 	}
 	if mem, ok := rc.(*MemoryRouteCache); ok {
-		return mem.ObserveDNSResponse(sessionID, req, resp)
+		return mem.ObserveDNSResponseEvidence(sessionID, req, resp)
 	}
 	return nil
 }
