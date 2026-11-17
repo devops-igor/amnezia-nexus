@@ -24,16 +24,19 @@ import (
 // FileStore, matcher and ownership boundary are production code.
 
 // gatedBaselineStore wraps a real store and holds exactly one Load call in flight,
-// after the underlying read has returned.
+// after the underlying read has returned. It also counts accepted commits, which is
+// the only boundary at which an immediate refresh is observable now that a refresh
+// of unchanged rules keeps its generation identifier.
 type gatedBaselineStore struct {
 	inner   policy.Store
 	holdAt  int
 	held    chan struct{}
 	release chan struct{}
 
-	mu    sync.Mutex
-	loads int
-	once  sync.Once
+	mu      sync.Mutex
+	loads   int
+	commits int
+	once    sync.Once
 }
 
 func newGatedBaselineStore(inner policy.Store, holdAt int) *gatedBaselineStore {
@@ -59,7 +62,20 @@ func (g *gatedBaselineStore) Load(ctx context.Context) (*policy.Generation, erro
 }
 
 func (g *gatedBaselineStore) Commit(ctx context.Context, gen *policy.Generation) error {
-	return g.inner.Commit(ctx, gen)
+	if err := g.inner.Commit(ctx, gen); err != nil {
+		return err
+	}
+	g.mu.Lock()
+	g.commits++
+	g.mu.Unlock()
+	return nil
+}
+
+// CommitCount reports how many durable commits this store has accepted.
+func (g *gatedBaselineStore) CommitCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.commits
 }
 
 // releaseHeld lets the frozen baseline preparation continue.
@@ -118,28 +134,35 @@ func TestSupersededRunBaselineCannotRepublishOldRules(t *testing.T) {
 
 	// The operator saves source B while A's baseline preparation is frozen. B is
 	// published, takes write ownership and A's loop is cancelled.
+	//
+	// The commit count is sampled *before* the replacement starts, because the
+	// refresh it spawns may have committed before this test can look again.
+	commitsBeforeB := store.CommitCount()
 	if err := svc.StartPolicyRouting(context.Background(), settingsB, store, string(settingsB.Preset)); err != nil {
 		t.Fatalf("replacement with source B failed: %v", err)
 	}
-	// Wait for B's immediate refresh to be *published*, not merely fetched: the
-	// durable generation must differ from the one B's update committed, and the
-	// matcher must already carry that newer generation. Releasing the old baseline
-	// before this point would let B's own refresh mask a stale republication and make
-	// the regression pass for the wrong reason.
-	firstB, err := store.Load(context.Background())
-	if err != nil || firstB == nil {
-		t.Fatalf("reload B's committed generation: %v", err)
-	}
+	// Wait for B's immediate refresh to have committed and be live. A refresh whose
+	// effective rules are unchanged keeps the generation identifier and refreshes
+	// only its source metadata, so that identifier is no longer a completion signal;
+	// the durable commit is. The replacement commits once (its synchronous update),
+	// and the refresh Run performs immediately afterwards commits once more whether
+	// it publishes a new generation or retains the incumbent one — and A contributes
+	// nothing here, because its Run is still frozen at the baseline load. Releasing
+	// the old baseline before this point would let B's own refresh mask a stale
+	// republication and make the regression pass for the wrong reason.
+	const replacementCommits = 2
+	refreshedAt := commitsBeforeB + replacementCommits
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		gen, loadErr := store.Load(context.Background())
 		snap := svc.PolicyMatcher().Current()
 		if loadErr == nil && gen != nil && snap != nil &&
-			gen.GenerationID != firstB.GenerationID && snap.Generation() == gen.GenerationID {
+			store.CommitCount() >= refreshedAt && snap.Generation() == gen.GenerationID {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("B's immediate refresh never published (requests=%d, durable=%v)", gate.count(pathB), gen != nil)
+			t.Fatalf("B's immediate refresh never committed (requests=%d, commits=%d, want at least %d, durable=%v)",
+				gate.count(pathB), store.CommitCount(), refreshedAt, gen != nil)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

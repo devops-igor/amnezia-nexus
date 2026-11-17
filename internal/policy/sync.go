@@ -409,8 +409,13 @@ func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
 		return SyncResult{SourceStats: statsMap, Duration: time.Since(startTime)}, err
 	}
 
-	newVersion := s.nextVersion()
-	genID := fmt.Sprintf("gen-%d-%d", newVersion, startTime.UnixNano())
+	// A content-equivalent refresh keeps the published generation (equivalence.go):
+	// route evidence is keyed on the generation identifier, so advancing it for
+	// rules the client already had would discard evidence the client cannot
+	// restore without resolving again. The retained generation still goes through
+	// the same durable commit and atomic publication below, which is what refreshes
+	// its source fetch/health metadata.
+	newVersion, genID, createdAt := s.candidateIdentity(startTime, candidateDomains, candidateCIDRs, sourceParsedList)
 	sourcesMeta := make(map[string]SourceMeta, len(newCachedSources))
 	for id, item := range newCachedSources {
 		sourcesMeta[id] = item.meta
@@ -420,7 +425,7 @@ func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
 		SchemaVersion: SchemaVersion,
 		GenerationID:  genID,
 		Version:       newVersion,
-		CreatedAt:     startTime,
+		CreatedAt:     createdAt,
 		ConfigHash:    s.computeConfigHash(),
 		SourcesMeta:   sourcesMeta,
 		Domains:       candidateDomains,
