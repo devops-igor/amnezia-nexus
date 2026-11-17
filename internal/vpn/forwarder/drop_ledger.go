@@ -29,8 +29,12 @@ import (
 const (
 	DropReasonProhibitedDestination = "prohibited_destination"
 	DropReasonInvalidPacket         = "invalid_client_packet"
-	DropReasonNATPortExhaustion     = "nat_port_exhaustion"
-	DropReasonEgressUnavailable     = "direct_egress_unavailable"
+	// The three refusals below happen while the packet path is trying to install flow state.
+	// They are refusals of the packet (it is not forwarded), so they belong in this ledger
+	// even though the reason is about the table or the WAN rather than the destination.
+	DropReasonNATPortExhaustion = "nat_port_exhaustion"
+	DropReasonEgressUnavailable = "direct_egress_unavailable"
+	DropReasonFlowTableFull     = "flow_table_full"
 )
 
 // Drop ledger bounds.

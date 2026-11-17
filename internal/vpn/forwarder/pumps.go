@@ -264,11 +264,17 @@ func (f *Forwarder) routeDirectDecision(directEgress *DirectEgressManager, route
 	if directEgress != nil {
 		if err := directEgress.RecordFlowDecision(peerKey, sID, route.generation, packet, EgressChoiceDirect, decision); err != nil {
 			f.directDrops.Add(1)
+			// The decision could not be installed, so no flow record exists to explain this
+			// client's packet. The refusal is recorded against the live route.
+			f.recordDirectRefusal(peerKey, route, packet, pktLen, err)
 			return err
 		}
 		return f.sendToDirectEgress(directEgress, route, peerKey, packet, pktLen, sID, cID)
 	}
 	f.directDrops.Add(1)
+	// No direct-egress manager at all: the packet is refused before any flow exists, which
+	// is exactly the case a global counter cannot attribute to this client.
+	f.recordDirectRefusal(peerKey, route, packet, pktLen, ErrDirectEgressUnavailable)
 	return ErrDirectEgressUnavailable
 }
 
@@ -306,6 +312,7 @@ func (f *Forwarder) sendToDirectEgress(directEgress *DirectEgressManager, route 
 	err := directEgress.RouteDirect(peerKey, route.assignedIP, sID, route.generation, packet, route.returnPath)
 	if err != nil {
 		f.directDrops.Add(1)
+		f.recordDirectRefusal(peerKey, route, packet, pktLen, err)
 		return err
 	}
 

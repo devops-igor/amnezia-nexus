@@ -1129,5 +1129,6 @@
   "policy_client_drop_reason_prohibited_destination": "prohibited destination",
   "policy_client_drop_reason_invalid_client_packet": "malformed client packet",
   "policy_client_drop_reason_nat_port_exhaustion": "NAT port exhaustion",
-  "policy_client_drop_reason_direct_egress_unavailable": "direct egress unavailable"
+  "policy_client_drop_reason_direct_egress_unavailable": "direct egress unavailable",
+  "policy_client_drop_reason_flow_table_full": "flow table full"
 }

@@ -90,6 +90,8 @@ w._ = key => {
   if (key === 'policy_client_drop_reason_prohibited_destination') return 'REASON:prohibited';
   if (key === 'policy_client_drop_reason_invalid_client_packet') return 'REASON:invalid';
   if (key === 'policy_client_drop_reason_nat_port_exhaustion') return 'REASON:nat-exhaustion';
+  if (key === 'policy_client_drop_reason_flow_table_full') return 'REASON:table-full';
+  if (key === 'policy_client_drop_reason_direct_egress_unavailable') return 'REASON:no-egress';
   if (key === 'policy_client_backend_write_fmt') return 'DEVICE {ok}/{failed}';
   if (key === 'policy_client_return_authority_current_tuple_association') return 'RETURN_AUTHORITY:current_tuple_association';
   if (key === 'policy_client_return_chain_fmt')
@@ -447,7 +449,7 @@ responder = async (url, opts) => {
             total: 600, truncated: true, entries: [
       {protocol: 'udp', destination_ip: '1.1.1.1', destination_port: 53, choice: 'PROXY',
        last_seen_age_seconds: 5, expired: false, close_seen: false}]},
-    drops: {available: true, state: 'observed', total: 3, truncated: true,
+    drops: {available: true, state: 'observed', total: 4, truncated: true,
       entries: [
         {reason: 'prohibited_destination', has_tuple: true, destination_ip: '169.254.169.254',
          destination_port: 80, protocol: 'tcp', count: 4, bytes: 240,
@@ -456,8 +458,11 @@ responder = async (url, opts) => {
          first_seen: '2026-11-17T09:01:00Z', last_seen: '2026-11-17T09:01:00Z'},
         {reason: 'nat_port_exhaustion', has_tuple: true, destination_ip: '9.9.9.9',
          destination_port: 443, protocol: 'tcp', count: 2, bytes: 120,
-         first_seen: '2026-11-17T09:02:00Z', last_seen: '2026-11-17T09:06:00Z'}],
-      coverage: {stored: 2, merged: 5, evicted: 0, pruned: 1, session_keys: 3, keys: 3,
+         first_seen: '2026-11-17T09:02:00Z', last_seen: '2026-11-17T09:06:00Z'},
+        {reason: 'flow_table_full', has_tuple: true, destination_ip: '93.184.216.21',
+         destination_port: 443, protocol: 'tcp', count: 1, bytes: 60,
+         first_seen: '2026-11-17T09:07:00Z', last_seen: '2026-11-17T09:07:00Z'}],
+      coverage: {stored: 3, merged: 5, evicted: 0, pruned: 1, session_keys: 4, keys: 4,
                  key_limit: 64, age_limit_seconds: 600}},
     limitations: ['flow_scan_window_partial'], evaluated_at: '2026-11-17T09:10:00Z', read_only: true};
 };
@@ -484,8 +489,10 @@ assert.equal(rowCells('policyClientDropRows', 1)[1], 'NO-TUPLE',
   'a malformed packet must not show a destination it never carried');
 assert.equal(rowCells('policyClientDropRows', 1)[2], 'NO-TUPLE');
 assert.equal(rowCells('policyClientDropRows', 2)[0], 'REASON:nat-exhaustion');
-assert.equal(text('policyClientDropFoot'), 'DROP-TRUNC 3/3');
-assert.equal(text('policyClientDropCoverage'), 'DROPCOV 2/5/0/1 session 3 ledger 3/64 600',
+assert.equal(rowCells('policyClientDropRows', 3)[0], 'REASON:table-full',
+  'a flow-table refusal is rendered from the same producer token family');
+assert.equal(text('policyClientDropFoot'), 'DROP-TRUNC 4/4');
+assert.equal(text('policyClientDropCoverage'), 'DROPCOV 3/5/0/1 session 4 ledger 4/64 600',
   'retention and loss are stated beside the rows, with the session separated from the ledger');
 `)
 }
@@ -508,7 +515,10 @@ responder = ((base) => async (url, opts) => {
        first_seen: '2026-11-17T09:01:00Z', last_seen: '2026-11-17T09:01:00Z'},
       {reason: 'nat_port_exhaustion', has_tuple: true, destination_ip: '9.9.9.9',
        destination_port: 443, protocol: 'tcp', count: 2, bytes: 120,
-       first_seen: '2026-11-17T09:02:00Z', last_seen: '2026-11-17T09:06:00Z'}],
+       first_seen: '2026-11-17T09:02:00Z', last_seen: '2026-11-17T09:06:00Z'},
+      {reason: 'flow_table_full', has_tuple: true, destination_ip: '93.184.216.21',
+       destination_port: 443, protocol: 'tcp', count: 1, bytes: 60,
+       first_seen: '2026-11-17T09:07:00Z', last_seen: '2026-11-17T09:07:00Z'}],
     coverage: {stored: 2, merged: 5, evicted: 0, pruned: 1, session_keys: 3, keys: 3,
                key_limit: 64, age_limit_seconds: 600}};
   answer.flows.entries = [
