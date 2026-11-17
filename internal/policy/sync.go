@@ -421,17 +421,25 @@ func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
 		sourcesMeta[id] = item.meta
 	}
 
+	// The attribution digest is what a later cycle compares when this syncer is
+	// gone (provenance.go). It is recorded on the retained and the published path
+	// alike: a retained cycle then also writes the digest a generation committed
+	// before the field existed was missing, so the one-cycle legacy gap closes
+	// with the first successful refresh.
+	attributionHash, _ := attributionDigest(sourceParsedList)
+
 	candidateGen := &Generation{
-		SchemaVersion: SchemaVersion,
-		GenerationID:  genID,
-		Version:       newVersion,
-		CreatedAt:     createdAt,
-		ConfigHash:    s.computeConfigHash(),
-		SourcesMeta:   sourcesMeta,
-		Domains:       candidateDomains,
-		CIDRs:         candidateCIDRs,
-		DomainCount:   len(candidateDomains),
-		CIDRCount:     len(candidateCIDRs),
+		SchemaVersion:   SchemaVersion,
+		GenerationID:    genID,
+		Version:         newVersion,
+		CreatedAt:       createdAt,
+		ConfigHash:      s.computeConfigHash(),
+		AttributionHash: attributionHash,
+		SourcesMeta:     sourcesMeta,
+		Domains:         candidateDomains,
+		CIDRs:           candidateCIDRs,
+		DomainCount:     len(candidateDomains),
+		CIDRCount:       len(candidateCIDRs),
 	}
 
 	// Compile before entering the ownership boundary: a compile failure is not a

@@ -32,17 +32,24 @@ type SourceMeta struct {
 
 // Generation contains the complete durable representation of a published policy rule set.
 type Generation struct {
-	SchemaVersion int                   `json:"schema_version"`
-	GenerationID  string                `json:"generation_id"`
-	Version       uint64                `json:"version"`
-	CreatedAt     time.Time             `json:"created_at"`
-	ConfigHash    string                `json:"config_hash"`
-	SourcesMeta   map[string]SourceMeta `json:"sources_meta"`
-	Domains       map[string]uint8      `json:"domains"`
-	CIDRs         []string              `json:"cidrs"`
-	DomainCount   int                   `json:"domain_count"`
-	CIDRCount     int                   `json:"cidr_count"`
-	ContentHash   string                `json:"content_hash"`
+	SchemaVersion int       `json:"schema_version"`
+	GenerationID  string    `json:"generation_id"`
+	Version       uint64    `json:"version"`
+	CreatedAt     time.Time `json:"created_at"`
+	ConfigHash    string    `json:"config_hash"`
+	// AttributionHash is the canonical digest of the per-source rule sets this
+	// generation was compiled from (see provenance.go). It is what lets a refresh
+	// that knows only durable state tell a content-equivalent cycle from one that
+	// moved a rule between lists. Generations written before this field existed
+	// leave it empty, and such a generation is compared the older way rather than
+	// being treated as a change (equivalence.go).
+	AttributionHash string                `json:"attribution_hash,omitempty"`
+	SourcesMeta     map[string]SourceMeta `json:"sources_meta"`
+	Domains         map[string]uint8      `json:"domains"`
+	CIDRs           []string              `json:"cidrs"`
+	DomainCount     int                   `json:"domain_count"`
+	CIDRCount       int                   `json:"cidr_count"`
+	ContentHash     string                `json:"content_hash"`
 }
 
 // ComputeContentHash computes a deterministic SHA-256 digest over normalized rules.
