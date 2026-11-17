@@ -565,3 +565,32 @@ AllowedIPs = 10.66.66.200/32
 		}
 	})
 }
+
+// TestSaveServerConfig_RejectsInvertedJunkSizesBeforeRemoteWrite pins that the
+// front-door validator runs before any remote command. The pinned upstream
+// engine (amneziawg-go v3.1.20261116) refuses jmin > jmax at UAPI commit, so an
+// accepted write would only fail later at awg-quick up inside the container.
+func TestSaveServerConfig_RejectsInvertedJunkSizesBeforeRemoteWrite(t *testing.T) {
+	ctx := context.Background()
+	client := newMockAWGSSHClient()
+
+	remoteCommands := 0
+	client.sudoCmdHandler = func(cmd string) (string, string, int, error) {
+		remoteCommands++
+		return "OK", "", 0, nil
+	}
+
+	mgr := NewAWGManager(&mockAWGSSHProvider{client: client})
+	conf := "[Interface]\nPrivateKey = test\nJc = 3\nJmin = 400\nJmax = 30\n"
+
+	err := mgr.saveServerConfig(ctx, client, conf)
+	if err == nil {
+		t.Fatal("expected saveServerConfig to reject inverted junk sizes, got nil")
+	}
+	if !strings.Contains(err.Error(), "junk_packet_min_size") {
+		t.Errorf("expected error to name junk_packet_min_size, got: %v", err)
+	}
+	if remoteCommands != 0 {
+		t.Errorf("expected rejection before any remote command, got %d command(s)", remoteCommands)
+	}
+}

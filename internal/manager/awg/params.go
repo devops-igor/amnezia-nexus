@@ -1249,9 +1249,9 @@ func validateMTU(params map[string]string) error {
 }
 
 // ValidateAWGParams ensures all AWG parameters are numeric strings within safe ranges to prevent command injection
-// and validates AmneziaWG packet length collisions (s2 != s1+56 && s1 != s2+56).
+// and validates junk-size ordering (jmin <= jmax) and packet length collisions (s2 != s1+56 && s1 != s2+56).
 func ValidateAWGParams(params map[string]string) error {
-	if err := validateNumericBounds(params); err != nil {
+	if err := validateAWGParamRanges(params); err != nil {
 		return err
 	}
 	if err := validateS1S2Collision(params); err != nil {
