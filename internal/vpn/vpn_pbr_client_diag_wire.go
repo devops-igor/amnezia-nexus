@@ -467,10 +467,13 @@ func clientDiagnosisFlow(flow forwarder.SessionFlow, records []dnsledger.Record,
 
 	out.Dispatch = clientDiagnosisFlowDispatch(flow)
 	out.Forward = ClientDiagnosisFlowForward{
-		Packets: flow.ForwardPackets,
-		Bytes:   flow.ForwardBytes,
-		Failed:  flow.ForwardFailed,
-		Failure: flow.ForwardFailure,
+		Packets:             flow.ForwardPackets,
+		Bytes:               flow.ForwardBytes,
+		Failed:              flow.ForwardFailed,
+		Failure:             flow.ForwardFailure,
+		BackendWrites:       flow.BackendWrites,
+		BackendWriteFailed:  flow.BackendWriteFailed,
+		BackendWriteFailure: flow.BackendWriteFailure,
 	}
 	out.Return = clientDiagnosisFlowReturn(flow)
 

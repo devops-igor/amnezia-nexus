@@ -242,7 +242,7 @@ func TestRetireAllRoutes_DrainsQueuesAndJoinsWrites(t *testing.T) {
 
 func TestRetireRoutesByReturnPath_SelectiveRetirement(t *testing.T) {
 	f := NewForwarder(nil, "10.100.0.0/16", 10)
-	beChan := make(chan []byte, 10)
+	beChan := make(chan BackendPacket, 10)
 	f.backendQueues[1] = beChan
 
 	upReceived := make(chan []byte, 10)

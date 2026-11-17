@@ -287,7 +287,8 @@ func TestRouteClientToBackend(t *testing.T) {
 			t.Fatal("missing backend channel")
 		}
 		select {
-		case received := <-ch:
+		case receivedWork := <-ch:
+			received := receivedWork.Bytes()
 			if !bytes.Equal(received, pkt) {
 				t.Fatalf("received packet %v, want %v", received, pkt)
 			}
@@ -373,7 +374,7 @@ func TestRouteClientToBackend(t *testing.T) {
 		f.AttachBackendDevice(1, nil)
 
 		// Replace backend queue with capacity 1
-		ch := make(chan []byte, 1)
+		ch := make(chan BackendPacket, 1)
 		f.SetBackendQueueForTest(1, ch)
 
 		peer := "peer-qfull"
@@ -454,7 +455,8 @@ func TestRouteClientToBackendWithReturnPath(t *testing.T) {
 
 		ch, _ := f.GetBackendPacketChannel(1)
 		select {
-		case received := <-ch:
+		case receivedWork := <-ch:
+			received := receivedWork.Bytes()
 			if !bytes.Equal(received, pkt) {
 				t.Fatalf("received %v, want %v", received, pkt)
 			}

@@ -217,7 +217,7 @@ func TestFlowEvidenceRecordsRefusedDispatch(t *testing.T) {
 		// An unbuffered backend queue refuses every enqueue, which is the real
 		// queue-full branch of the proxy dispatch.
 		fix.fwd.mu.Lock()
-		fix.fwd.backendQueues[fix.backendID] = make(chan []byte)
+		fix.fwd.backendQueues[fix.backendID] = make(chan BackendPacket)
 		fix.fwd.mu.Unlock()
 		if err := fix.fwd.RouteClientToBackend(fix.peerKey,
 			buildTestIPv4TCPPacket(netip.MustParseAddr(fix.client), netip.MustParseAddr(dst), 41001, 443, 0x02, nil)); !errors.Is(err, ErrQueueFull) {

@@ -92,6 +92,12 @@ type SessionFlow struct {
 	ForwardPackets uint64
 	ForwardBytes   uint64
 	ForwardFailed  uint64
+	// BackendWrites is how many proxy packets the backend DEVICE accepted in full;
+	// BackendWriteFailed is how many it refused or cut short. They are observed by
+	// the writer, through the flow identity captured at enqueue.
+	BackendWrites       uint64
+	BackendWriteFailed  uint64
+	BackendWriteFailure string
 	// ForwardFailure names the last refusal, empty when none happened.
 	ForwardFailure string
 
@@ -216,28 +222,31 @@ func (m *DirectEgressManager) SnapshotSessionFlows(sessionID string, generation 
 		}
 		evidence := snapshotFlowEvidence(entry.evidence)
 		page.add(SessionFlow{
-			Protocol:         key.Protocol,
-			SrcPort:          key.SrcPort,
-			DstIP:            netip.AddrFrom4(key.DstIP),
-			DstPort:          key.DstPort,
-			Choice:           entry.choice,
-			Generation:       entry.generation,
-			LastSeen:         entry.lastSeen,
-			Expired:          m.isFlowExpiredLocked(entry, key.Protocol, now),
-			CloseSeen:        entry.closeSeen,
-			DecidedAt:        evidence.decidedAt,
-			DecisionReason:   evidence.reason,
-			PolicyGeneration: evidence.policyGeneration,
-			BackendTunnelID:  evidence.backendTunnelID,
-			ForwardPackets:   evidence.forwardPackets,
-			ForwardBytes:     evidence.forwardBytes,
-			ForwardFailed:    evidence.forwardFailed,
-			ForwardFailure:   evidence.forwardFailure,
-			ReturnPackets:    evidence.returnPackets,
-			ReturnBytes:      evidence.returnBytes,
-			ReturnFirst:      evidence.returnFirst,
-			ReturnLast:       evidence.returnLast,
-			ReturnObserved:   evidence.returnPackets > 0,
+			Protocol:            key.Protocol,
+			SrcPort:             key.SrcPort,
+			DstIP:               netip.AddrFrom4(key.DstIP),
+			DstPort:             key.DstPort,
+			Choice:              entry.choice,
+			Generation:          entry.generation,
+			LastSeen:            entry.lastSeen,
+			Expired:             m.isFlowExpiredLocked(entry, key.Protocol, now),
+			CloseSeen:           entry.closeSeen,
+			DecidedAt:           evidence.decidedAt,
+			DecisionReason:      evidence.reason,
+			PolicyGeneration:    evidence.policyGeneration,
+			BackendTunnelID:     evidence.backendTunnelID,
+			ForwardPackets:      evidence.forwardPackets,
+			ForwardBytes:        evidence.forwardBytes,
+			ForwardFailed:       evidence.forwardFailed,
+			ForwardFailure:      evidence.forwardFailure,
+			BackendWrites:       evidence.backendWrites,
+			BackendWriteFailed:  evidence.backendWriteFailed,
+			BackendWriteFailure: evidence.backendWriteFailure,
+			ReturnPackets:       evidence.returnPackets,
+			ReturnBytes:         evidence.returnBytes,
+			ReturnFirst:         evidence.returnFirst,
+			ReturnLast:          evidence.returnLast,
+			ReturnObserved:      evidence.returnPackets > 0,
 			// PROXY return is not attributed at this checkpoint; a DIRECT flow
 			// states what the reply path observed, and nothing states payload
 			// success.

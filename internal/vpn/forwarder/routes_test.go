@@ -170,8 +170,8 @@ func TestForwarder_ClientDropStats(t *testing.T) {
 
 	// 3. Drop because backend queue full
 	// Replace backend 1 queue with capacity 1 channel and fill it
-	ch := make(chan []byte, 1)
-	ch <- []byte{0}
+	ch := make(chan BackendPacket, 1)
+	ch <- newBackendPacket([]byte{0}, nil, "", 0)
 	f.SetBackendQueueForTest(1, ch)
 
 	f.RegisterSession("s3", "c3", "p3", "10.100.0.4", 1)

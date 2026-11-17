@@ -1107,5 +1107,8 @@
   "policy_client_dns_event_delivery_failed": "应答未送达",
   "policy_client_upstream_timeout": "超时",
   "policy_client_upstream_refused": "拒绝",
-  "policy_client_upstream_error": "错误"
+  "policy_client_upstream_error": "错误",
+  "policy_client_backend_write_fmt": "设备已写入 {ok} / 失败 {failed}",
+  "policy_client_failure_backend_write_failed": "设备写入失败",
+  "policy_client_failure_short_write": "设备写入不完整帧"
 }

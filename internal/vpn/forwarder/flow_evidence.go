@@ -73,6 +73,12 @@ const (
 	FlowFailureQueueFull          = "backend_queue_full"
 	FlowFailureFlowTableFull      = "flow_table_full"
 	FlowFailureSessionNotCurrent  = "session_not_current"
+
+	// Backend write outcomes. A full write is a completion; a refusal and a short
+	// write are distinct failures, because a cut write is not a refusal.
+	FlowBackendWriteCompleted = "backend_write_completed"
+	FlowBackendWriteFailed    = "backend_write_failed"
+	FlowBackendWriteShort     = "short_write"
 )
 
 // flowStats is the evidence block of one flow entry. Immutable fields are written
@@ -97,6 +103,15 @@ type flowStats struct {
 	// forwardFailure holds the last refusal token, nil when none happened. The
 	// token is stored by pointer so no integer id (and no conversion) is needed.
 	forwardFailure atomic.Pointer[string]
+
+	// backendWrites counts packets the backend device actually accepted in full.
+	// It is the completion half of the proxy path: queue admission is recorded
+	// separately and never implies a completed write.
+	backendWrites atomic.Uint64
+	// backendWriteFailed counts writes the device refused or cut short, and
+	// backendWriteFailure names the last one.
+	backendWriteFailed  atomic.Uint64
+	backendWriteFailure atomic.Pointer[string]
 
 	returnPackets atomic.Uint64
 	returnBytes   atomic.Uint64
@@ -149,6 +164,39 @@ func (s *flowStats) recordForward(bytes int64, err error, failure string) {
 	if bytes > 0 {
 		s.forwardBytes.Add(uint64(bytes))
 	}
+}
+
+// recordBackendWrite notes the outcome of one backend device write on the flow that
+// ADMITTED the packet. The evidence pointer travels with the queued work, so a write
+// that happens after a rekey, a retirement or a tuple reuse credits the incarnation
+// that enqueued the packet and never the current owner of the same tuple.
+func (s *flowStats) recordBackendWrite(written, total int, err error) {
+	if s == nil {
+		return
+	}
+	switch {
+	case err != nil:
+		s.backendWriteFailed.Add(1)
+		token := FlowBackendWriteFailed
+		s.backendWriteFailure.Store(&token)
+	case written < total:
+		s.backendWriteFailed.Add(1)
+		token := FlowBackendWriteShort
+		s.backendWriteFailure.Store(&token)
+	default:
+		s.backendWrites.Add(1)
+	}
+}
+
+// writeFailureToken reads the last backend write failure token, empty when none.
+func writeFailureToken(stats *flowStats) string {
+	if stats == nil {
+		return ""
+	}
+	if token := stats.backendWriteFailure.Load(); token != nil {
+		return *token
+	}
+	return ""
 }
 
 // recordReturn notes one reply that passed every ownership check and was handed
@@ -251,6 +299,26 @@ func recordDirectForward(stats *flowStats, bytes int64, err error) {
 	stats.recordForward(bytes, err, failure)
 }
 
+// dispatchEvidence returns the evidence block of the flow that owns this packet on
+// the given incarnation, or nil when the tuple belongs to someone else. It is the
+// read-only half of RecordProxyDispatch and applies the same guard.
+func (m *DirectEgressManager) dispatchEvidence(peerKey, sessionID string, generation uint64, packet []byte) *flowStats {
+	if m == nil {
+		return nil
+	}
+	key, err := flowKeyForPacket(peerKey, packet)
+	if err != nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	entry := m.flows[key]
+	if entry == nil || !dispatchBelongsToIncarnation(entry, sessionID, generation) {
+		return nil
+	}
+	return entry.evidence
+}
+
 // flowKeyForPacket builds the flow key for one IPv4 TCP/UDP packet. It is the
 // same key RecordFlow and LookupFlow build; a packet that cannot be keyed is not
 // attributable and reports an error instead of a zero key.
@@ -298,18 +366,21 @@ func FlowEvidenceMaxFlowTableBytes() int { return flowEvidenceRefBytes * 65536 }
 
 // sessionFlowEvidence is the read-only copy of one flow's evidence.
 type sessionFlowEvidence struct {
-	decidedAt        time.Time
-	policyGeneration string
-	reason           EgressReason
-	backendTunnelID  int64
-	forwardPackets   uint64
-	forwardBytes     uint64
-	forwardFailed    uint64
-	forwardFailure   string
-	returnPackets    uint64
-	returnBytes      uint64
-	returnFirst      time.Time
-	returnLast       time.Time
+	decidedAt           time.Time
+	policyGeneration    string
+	reason              EgressReason
+	backendTunnelID     int64
+	forwardPackets      uint64
+	forwardBytes        uint64
+	forwardFailed       uint64
+	forwardFailure      string
+	backendWrites       uint64
+	backendWriteFailed  uint64
+	backendWriteFailure string
+	returnPackets       uint64
+	returnBytes         uint64
+	returnFirst         time.Time
+	returnLast          time.Time
 }
 
 // forwardFailureToken reads the last refusal token of a flow, empty when none.
@@ -331,16 +402,19 @@ func snapshotFlowEvidence(stats *flowStats) sessionFlowEvidence {
 		return sessionFlowEvidence{}
 	}
 	out := sessionFlowEvidence{
-		decidedAt:        stats.decidedAt,
-		policyGeneration: stats.policyGeneration,
-		reason:           stats.reason,
-		backendTunnelID:  stats.backendTunnelID,
-		forwardPackets:   stats.forwardPackets.Load(),
-		forwardBytes:     stats.forwardBytes.Load(),
-		forwardFailed:    stats.forwardFailed.Load(),
-		forwardFailure:   forwardFailureToken(stats),
-		returnPackets:    stats.returnPackets.Load(),
-		returnBytes:      stats.returnBytes.Load(),
+		decidedAt:           stats.decidedAt,
+		policyGeneration:    stats.policyGeneration,
+		reason:              stats.reason,
+		backendTunnelID:     stats.backendTunnelID,
+		forwardPackets:      stats.forwardPackets.Load(),
+		forwardBytes:        stats.forwardBytes.Load(),
+		forwardFailed:       stats.forwardFailed.Load(),
+		forwardFailure:      forwardFailureToken(stats),
+		backendWrites:       stats.backendWrites.Load(),
+		backendWriteFailed:  stats.backendWriteFailed.Load(),
+		backendWriteFailure: writeFailureToken(stats),
+		returnPackets:       stats.returnPackets.Load(),
+		returnBytes:         stats.returnBytes.Load(),
 	}
 	if ns := stats.returnFirstNS.Load(); ns != 0 {
 		out.returnFirst = time.Unix(0, ns).UTC()

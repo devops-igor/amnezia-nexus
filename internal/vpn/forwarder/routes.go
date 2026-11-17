@@ -89,7 +89,7 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 
 	// Ensure backend queue exists
 	if _, ok := f.backendQueues[backendTunnelID]; !ok {
-		f.backendQueues[backendTunnelID] = make(chan []byte, f.backendBufSize)
+		f.backendQueues[backendTunnelID] = make(chan BackendPacket, f.backendBufSize)
 		f.ensureBackendTrafficLocked(backendTunnelID)
 	}
 
@@ -297,7 +297,7 @@ func (f *Forwarder) UpdateSessionBackend(peerKey string, newBackendTunnelID int6
 	}
 
 	if _, ok := f.backendQueues[newBackendTunnelID]; !ok {
-		f.backendQueues[newBackendTunnelID] = make(chan []byte, f.backendBufSize)
+		f.backendQueues[newBackendTunnelID] = make(chan BackendPacket, f.backendBufSize)
 		f.ensureBackendTrafficLocked(newBackendTunnelID)
 	}
 

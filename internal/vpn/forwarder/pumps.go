@@ -3,6 +3,7 @@ package forwarder
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"net/netip"
 	"time"
@@ -318,7 +319,7 @@ func (f *Forwarder) sendToDirectEgress(directEgress *DirectEgressManager, route 
 // availability instead of whatever the route points at by then.
 type proxyBackend struct {
 	tunnelID int64
-	queue    chan []byte
+	queue    chan BackendPacket
 }
 
 // sendToProxyBackend enqueues one proxy-required packet toward the route's
@@ -331,8 +332,13 @@ type proxyBackend struct {
 // hand to a live backend is dropped and counted (issue #677 "drop and count");
 // it is never re-decided as DIRECT.
 func (f *Forwarder) sendToProxyBackend(backend proxyBackend, route *sessionRoute, backendTraffic *trafficCounters, sID, cID string, packet []byte, pktLen int64) error {
+	// ONE evidence lookup for this packet, taken before the enqueue: the same
+	// pointer is credited with the admission outcome here and travels with the
+	// queued work so the device write credits the same incarnation.
+	stats := f.proxyDispatchEvidence(route, packet)
+
 	if backend.queue == nil {
-		f.recordProxyDispatchOutcome(route, packet, false, FlowFailureBackendUnavailable)
+		stats.recordForward(0, errProxyBackendUnavailable, FlowFailureBackendUnavailable)
 		return f.dropProxyPacket()
 	}
 
@@ -342,44 +348,29 @@ func (f *Forwarder) sendToProxyBackend(backend proxyBackend, route *sessionRoute
 	f.mu.RLock()
 	if _, detached := f.detachedBackends[backend.tunnelID]; detached {
 		f.mu.RUnlock()
-		f.recordProxyDispatchOutcome(route, packet, false, FlowFailureBackendDetached)
+		stats.recordForward(0, errProxyBackendDetached, FlowFailureBackendDetached)
 		return f.dropProxyPacket()
 	}
 	select {
-	case backend.queue <- pktCopy:
+	case backend.queue <- newBackendPacket(pktCopy, stats, sID, route.generation):
 		f.mu.RUnlock()
 		f.recordProxyAdmission(route, backendTraffic, sID, cID, pktLen)
-		f.recordProxyDispatchOutcome(route, packet, true, "")
+		stats.recordForward(0, nil, "")
 		return nil
 	default:
 		f.mu.RUnlock()
 		f.clientDropsQueueFull.Add(1)
 		f.clientDropsTotal.Add(1)
-		f.recordProxyDispatchOutcome(route, packet, false, FlowFailureQueueFull)
+		stats.recordForward(0, errProxyQueueFull, FlowFailureQueueFull)
 		return ErrQueueFull
 	}
 }
 
-// recordProxyDispatchOutcome notes the proxy dispatch outcome on the flow the
-// decision already recorded (issue #861). A flow retired in between is simply not
-// attributed: the packet's fate is still counted globally, and inventing an
-// attribution here would credit a dead incarnation.
-func (f *Forwarder) recordProxyDispatchOutcome(route *sessionRoute, packet []byte, accepted bool, failure string) {
-	if f == nil || f.directEgress == nil || route == nil {
-		return
-	}
-	f.mu.RLock()
-	dem := f.directEgress
-	peerKey := route.peerKey
-	f.mu.RUnlock()
-	if dem == nil || peerKey == "" {
-		return
-	}
-	// The outcome is bound to the route that dispatched the packet, so a queued
-	// packet from an older incarnation can never credit a successor that reused
-	// the same tuple.
-	dem.RecordProxyDispatch(peerKey, route.sessionID, route.generation, packet, accepted, failure)
-}
+var (
+	errProxyBackendUnavailable = errors.New("proxy backend unavailable")
+	errProxyBackendDetached    = errors.New("proxy backend detached")
+	errProxyQueueFull          = errors.New("proxy backend queue full")
+)
 
 // dropProxyPacket counts a proxy-required packet the proxy path refused and
 // returns the fail-closed error the caller propagates.
@@ -390,10 +381,10 @@ func (f *Forwarder) dropProxyPacket() error {
 	return ErrBackendNotFound
 }
 
-// recordProxyAdmission books a proxy packet that actually entered the backend
-// queue. Admission is recorded at enqueue time (see the dataplane ownership
-// contract, client-to-backend traversal), so a later writer failure is reported
-// as a drop without retroactively un-booking these counters.
+// recordProxyAdmission books a proxy packet that actually entered the backend queue.
+// Admission is recorded at enqueue time (see the dataplane ownership contract,
+// client-to-backend traversal), so a later writer failure is reported as a drop
+// without retroactively un-booking these counters.
 func (f *Forwarder) recordProxyAdmission(route *sessionRoute, backendTraffic *trafficCounters, sID, cID string, pktLen int64) {
 	f.totalRxBytes.Add(pktLen)
 	f.totalRxPackets.Add(1)
@@ -407,12 +398,34 @@ func (f *Forwarder) recordProxyAdmission(route *sessionRoute, backendTraffic *tr
 	}
 }
 
-func (f *Forwarder) sendToBackendQueue(beQueue chan []byte, route *sessionRoute, backendTraffic *trafficCounters, sID, cID string, packet []byte, pktLen int64) error {
+// proxyDispatchEvidence returns the evidence block of the flow that admitted this
+// packet, or nil when no flow is attributable. It applies the same incarnation
+// guard the dispatch outcome used: a packet arriving on a route whose session or
+// generation no longer owns the tuple is not credited to whoever owns it now.
+func (f *Forwarder) proxyDispatchEvidence(route *sessionRoute, packet []byte) *flowStats {
+	if f == nil || f.directEgress == nil || route == nil {
+		return nil
+	}
+	f.mu.RLock()
+	dem := f.directEgress
+	peerKey := route.peerKey
+	sessionID := route.sessionID
+	generation := route.generation
+	f.mu.RUnlock()
+	if dem == nil || peerKey == "" {
+		return nil
+	}
+	return dem.dispatchEvidence(peerKey, sessionID, generation, packet)
+}
+
+func (f *Forwarder) sendToBackendQueue(beQueue chan BackendPacket, route *sessionRoute, backendTraffic *trafficCounters, sID, cID string, packet []byte, pktLen int64) error {
 	pktCopy := make([]byte, len(packet))
 	copy(pktCopy, packet)
 
+	// The legacy (non-policy) path records no flow, so the queued work carries no
+	// owner. A nil owner is the honest value: nothing is credited later.
 	select {
-	case beQueue <- pktCopy:
+	case beQueue <- newBackendPacket(pktCopy, nil, sID, 0):
 		f.totalRxBytes.Add(pktLen)
 		f.totalRxPackets.Add(1)
 		route.traffic.record(pktLen, true)
@@ -556,7 +569,7 @@ func (f *Forwarder) AttachBackendDevice(backendTunnelID int64, dev PacketDevice)
 	defer f.mu.Unlock()
 
 	if _, ok := f.backendQueues[backendTunnelID]; !ok {
-		f.backendQueues[backendTunnelID] = make(chan []byte, f.backendBufSize)
+		f.backendQueues[backendTunnelID] = make(chan BackendPacket, f.backendBufSize)
 		f.ensureBackendTrafficLocked(backendTunnelID)
 	}
 	if dev != nil {
@@ -703,7 +716,7 @@ func (f *Forwarder) StopPumps() {
 	f.pumpsWg.Wait()
 }
 
-func (f *Forwarder) pumpBackendQueue(globalStopCh <-chan struct{}, perPumpStopCh <-chan struct{}, doneCh chan struct{}, backendTunnelID int64, queue chan []byte, dev PacketDevice) {
+func (f *Forwarder) pumpBackendQueue(globalStopCh <-chan struct{}, perPumpStopCh <-chan struct{}, doneCh chan struct{}, backendTunnelID int64, queue chan BackendPacket, dev PacketDevice) {
 	defer f.pumpsWg.Done()
 	if doneCh != nil {
 		defer close(doneCh)
@@ -714,14 +727,14 @@ func (f *Forwarder) pumpBackendQueue(globalStopCh <-chan struct{}, perPumpStopCh
 			return
 		case <-perPumpStopCh:
 			return
-		case pkt, ok := <-queue:
+		case work, ok := <-queue:
 			if !ok {
 				return
 			}
 			if pumpStopped(globalStopCh, perPumpStopCh) {
 				return
 			}
-			f.writeBackendPacket(dev, pkt)
+			f.writeBackendPacket(dev, work)
 		}
 	}
 }
@@ -747,14 +760,22 @@ func pumpStopped(globalStopCh, perPumpStopCh <-chan struct{}) bool {
 // throughput because admission is booked at enqueue time (see
 // recordProxyAdmission); the legacy path keeps its existing silent-error
 // behavior.
-func (f *Forwarder) writeBackendPacket(dev PacketDevice, pkt []byte) {
+func (f *Forwarder) writeBackendPacket(dev PacketDevice, work BackendPacket) {
 	if dev == nil {
+		// No device means the packet was never written: no completion and no failure
+		// is recorded, because inventing either would misstate what happened.
 		return
 	}
-	if _, err := dev.Write(pkt); err != nil && f.pbrEnabled.Load() {
+	packet := work.Bytes()
+	n, err := dev.Write(packet)
+	if err != nil && f.pbrEnabled.Load() {
 		f.proxyDrops.Add(1)
 		f.clientDropsTotal.Add(1)
 	}
+	// The admitting flow learns what the DEVICE did, through the ownership captured
+	// at enqueue. Admitted bytes stay booked: completion is additional observation,
+	// not a correction of throughput.
+	work.owner.recordBackendWrite(n, len(packet), err)
 }
 
 func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute) {

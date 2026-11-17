@@ -319,8 +319,8 @@ func TestDropCategoryBreakdown_SingleOwnerAccounting(t *testing.T) {
 	t.Run("ClientBackendQueueFull", func(t *testing.T) {
 		svc, fwd, _, _, _ := newSingleOwnerFixture(t)
 		fwd.RegisterSession("s5", "c5", "p5", "10.100.0.5", 5)
-		ch := make(chan []byte, 1)
-		ch <- []byte{0}
+		ch := make(chan forwarder.BackendPacket, 1)
+		ch <- forwarder.NewBackendPacketForTest([]byte{0})
 		fwd.SetBackendQueueForTest(5, ch)
 		pkt := buildTestIPv4Packet(net.ParseIP("10.100.0.5"), net.ParseIP("1.1.1.1"), 40)
 		err := fwd.RouteClientToBackend("p5", pkt)

@@ -193,7 +193,7 @@ func buildQueryEvent(scope *ScopeHandle, req, resp *mdns.Msg, outcome QueryOutco
 }
 
 // rejectBeforeResolution answers the queries this server refuses without asking an
-// upstream: a closed server, a cancelled context, an unparseable request and an
+// upstream: a closed server, a canceled context, an unparseable request and an
 // unsupported query. It reports whether it produced the answer.
 func (s *Server) rejectBeforeResolution(ctx context.Context, req *mdns.Msg) (*mdns.Msg, QueryOutcome, error, bool) {
 	select {

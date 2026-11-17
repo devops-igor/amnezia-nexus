@@ -401,6 +401,20 @@
             if (flow.forward && flow.forward.failure) {
                 outcome = outcome + ' · ' + clientTokenLabel('failure', flow.forward.failure);
             }
+            // Admission and the backend device write are different facts: a proxy
+            // flow states both, so "queued" is never read as "delivered".
+            // Only stated when a device outcome exists: "0 written / 0 failed" on a
+            // packet that has not reached the writer yet would read as a measurement.
+            if (flow.choice === 'PROXY' && flow.forward &&
+                ((flow.forward.backend_writes || 0) + (flow.forward.backend_write_failed || 0)) > 0) {
+                var written = clientText('policy_client_backend_write_fmt')
+                    .replace('{ok}', String(flow.forward.backend_writes || 0))
+                    .replace('{failed}', String(flow.forward.backend_write_failed || 0));
+                if (flow.forward.backend_write_failure) {
+                    written = written + ' (' + clientTokenLabel('failure', flow.forward.backend_write_failure) + ')';
+                }
+                outcome = outcome + ' · ' + written;
+            }
             appendCell(row, outcome);
 
             appendCell(row, formatSeconds(flow.last_seen_age_seconds));

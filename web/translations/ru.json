@@ -1107,5 +1107,8 @@
   "policy_client_dns_event_delivery_failed": "ответ не доставлен",
   "policy_client_upstream_timeout": "таймаут",
   "policy_client_upstream_refused": "отказ",
-  "policy_client_upstream_error": "ошибка"
+  "policy_client_upstream_error": "ошибка",
+  "policy_client_backend_write_fmt": "устройство: {ok} записано / {failed} с ошибкой",
+  "policy_client_failure_backend_write_failed": "ошибка записи на устройство",
+  "policy_client_failure_short_write": "устройство записало неполный пакет"
 }

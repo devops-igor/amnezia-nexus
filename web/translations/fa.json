@@ -1107,5 +1107,8 @@
   "policy_client_dns_event_delivery_failed": "پاسخ تحویل نشد",
   "policy_client_upstream_timeout": "پایان مهلت",
   "policy_client_upstream_refused": "رد",
-  "policy_client_upstream_error": "خطا"
+  "policy_client_upstream_error": "خطا",
+  "policy_client_backend_write_fmt": "دستگاه: {ok} نوشته‌شده / {failed} ناموفق",
+  "policy_client_failure_backend_write_failed": "خطای نوشتن روی دستگاه",
+  "policy_client_failure_short_write": "دستگاه قاب ناقص نوشت"
 }

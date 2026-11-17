@@ -359,6 +359,12 @@ type ClientDiagnosisFlowForward struct {
 	Bytes   uint64 `json:"bytes"`
 	Failed  uint64 `json:"failed"`
 	Failure string `json:"failure,omitempty"`
+	// BackendWrites counts the proxy packets the backend DEVICE accepted in full,
+	// and BackendWriteFailed those it refused or cut short. Queue admission is
+	// recorded separately in Packets, so "admitted" and "written" stay distinct.
+	BackendWrites       uint64 `json:"backend_writes"`
+	BackendWriteFailed  uint64 `json:"backend_write_failed"`
+	BackendWriteFailure string `json:"backend_write_failure,omitempty"`
 }
 
 // ClientDiagnosisFlowReturn is the return direction. DIRECT flows state what the

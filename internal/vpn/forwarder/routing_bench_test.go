@@ -62,7 +62,7 @@ func syntheticPacket(size int, srcIP string) []byte {
 
 // drainChannelNonBlocking empties ch to keep sends non-blocking; a queue
 // that stays near-empty measures routing cost, not backpressure.
-func drainChannel(ch <-chan []byte) {
+func drainChannel[T any](ch <-chan T) {
 	for {
 		select {
 		case <-ch:

@@ -57,7 +57,8 @@ func TestRebindHijackBlocked(t *testing.T) {
 
 	// A's packet must be dropped: nothing arrives on the backend queue.
 	select {
-	case pkt := <-beChan:
+	case pktWork := <-beChan:
+		pkt := pktWork.Bytes()
 		t.Fatalf("spoofed packet was forwarded to the backend: %v", pkt)
 	default:
 	}

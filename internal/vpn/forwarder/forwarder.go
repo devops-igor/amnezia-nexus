@@ -116,10 +116,10 @@ type Forwarder struct {
 	routesByPeer     map[string]*sessionRoute // peerKey -> route
 	routesByIP       map[string]*sessionRoute // assignedIP -> route
 	backendTraffic   map[int64]*trafficCounters
-	backendQueues    map[int64]chan []byte   // backendTunnelID -> queue
-	backendDevices   map[int64]PacketDevice  // backendTunnelID -> device
-	backendPumpStops map[int64]chan struct{} // backendTunnelID -> pump stop channel
-	backendPumpDones map[int64]chan struct{} // backendTunnelID -> pump done channel
+	backendQueues    map[int64]chan BackendPacket // backendTunnelID -> queue
+	backendDevices   map[int64]PacketDevice       // backendTunnelID -> device
+	backendPumpStops map[int64]chan struct{}      // backendTunnelID -> pump stop channel
+	backendPumpDones map[int64]chan struct{}      // backendTunnelID -> pump done channel
 	bufSize          int
 	backendBufSize   int
 	maxActiveRoutes  int
@@ -332,7 +332,7 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		portalSubnet:       portalSubnet,
 		routesByPeer:       make(map[string]*sessionRoute),
 		routesByIP:         make(map[string]*sessionRoute),
-		backendQueues:      make(map[int64]chan []byte),
+		backendQueues:      make(map[int64]chan BackendPacket),
 		backendDevices:     make(map[int64]PacketDevice),
 		detachedBackends:   make(map[int64]struct{}),
 		writesInFlight:     make(map[*sessionRoute]time.Time),
@@ -369,7 +369,11 @@ func (f *Forwarder) GetClientPacketChannel(peerKey string) (<-chan []byte, bool)
 }
 
 // GetBackendPacketChannel returns the packet channel for a backend tunnel.
-func (f *Forwarder) GetBackendPacketChannel(backendTunnelID int64) (<-chan []byte, bool) {
+//
+// Each element carries its bytes AND the flow identity captured at admission, so a
+// caller that only observes packets uses Bytes(). The channel's capacity, ordering and
+// drain behavior are unchanged.
+func (f *Forwarder) GetBackendPacketChannel(backendTunnelID int64) (<-chan BackendPacket, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	ch, ok := f.backendQueues[backendTunnelID]
@@ -482,7 +486,7 @@ func (f *Forwarder) SetStopTimeoutForTest(d time.Duration) {
 }
 
 // SetBackendQueueForTest sets or deletes a backend queue for testing drop behavior.
-func (f *Forwarder) SetBackendQueueForTest(backendTunnelID int64, ch chan []byte) {
+func (f *Forwarder) SetBackendQueueForTest(backendTunnelID int64, ch chan BackendPacket) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if ch == nil {

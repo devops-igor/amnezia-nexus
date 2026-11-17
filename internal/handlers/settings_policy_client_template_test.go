@@ -255,6 +255,7 @@ var clientDiagTokenValues = map[string][]string{
 	"failure": {
 		"wan_write_failed", "backend_queue_full", "backend_detached",
 		"backend_unavailable", "direct_egress_unavailable", "return_path_closed",
+		"backend_write_failed", "short_write",
 	},
 	"dns_event": {
 		"answered", "no_answer", "nxdomain", "admission_refused", "upstream_error",

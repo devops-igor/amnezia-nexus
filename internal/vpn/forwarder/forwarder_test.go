@@ -92,7 +92,8 @@ func TestForwarderBasicRouting(t *testing.T) {
 	}
 
 	select {
-	case receivedPkt := <-beChan:
+	case receivedPktWork := <-beChan:
+		receivedPkt := receivedPktWork.Bytes()
 		if string(receivedPkt) != string(pktOut) {
 			t.Errorf("received packet mismatch: %s", string(receivedPkt))
 		}
@@ -154,7 +155,8 @@ func TestForwarderEdgeCasesAndLifecycle(t *testing.T) {
 		t.Fatalf("RouteClientToBackend after failover failed: %v", err)
 	}
 	select {
-	case p := <-newBEChan:
+	case pWork := <-newBEChan:
+		p := pWork.Bytes()
 		if string(p) != string(pktFailover) {
 			t.Errorf("mismatch failover packet: %s", string(p))
 		}
