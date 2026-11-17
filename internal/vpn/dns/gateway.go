@@ -302,6 +302,9 @@ func (g *Gateway) handleUDP(scope *ScopeHandle, ipv4Packet []byte, ihl int, dstI
 	}
 
 	recvTime := time.Now()
+	// Bound at receipt, before the exchange: a rekey during the lookup must not move
+	// the record to the successor.
+	receiptGeneration, receiptKnown := g.server.bindQueryIncarnation(g.server.QueryEventObserver(), scope.Scope.SessionID)
 	respMsg, outcome, err := g.server.serveDNSMessageOutcome(scope.ctx, scope.Scope, reqMsg, false)
 	if err != nil || respMsg == nil {
 		return true, nil
@@ -325,7 +328,7 @@ func (g *Gateway) handleUDP(scope *ScopeHandle, ipv4Packet []byte, ihl int, dstI
 	}
 	// One terminal event per query, after the delivery attempt. It is diagnostic
 	// history: the answer record above is the only thing that creates evidence.
-	g.server.emitQueryEvent(scope, reqMsg, respMsg, outcome, "udp", respMsg.Truncated, delivered, recvTime, time.Now())
+	g.server.emitQueryEvent(scope, reqMsg, respMsg, outcome, "udp", respMsg.Truncated, delivered, recvTime, time.Now(), receiptGeneration, receiptKnown)
 	return true, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
@@ -224,6 +225,207 @@ func TestClientDiagnosisRecordsTruncatedQuery(t *testing.T) {
 	if got := ledger.Snapshot(sessionID, 0).Total; got != 0 {
 		t.Errorf("answer records = %d, want none from a truncated reply", got)
 	}
+}
+
+// TestClientDiagnosisBindsTheReceiptIncarnation is the retired-callback control: a
+// query arrives under one incarnation, the session is replaced while the upstream
+// lookup is still running, and the terminal event must carry the incarnation that
+// RECEIVED the query — never the successor's.
+func TestClientDiagnosisBindsTheReceiptIncarnation(t *testing.T) {
+	f := newClientDiagFixture(t)
+	sessionID := f.sessionID(t)
+	receiptGeneration := f.generation(t)
+	ledger := f.svc.clientDiagnosisRouteCache().DNSLedger()
+
+	// The query starts and blocks inside the upstream exchange.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.queryIP(t, "slow.example", 56401)
+	}()
+	select {
+	case <-f.slowEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the query never reached the upstream exchange")
+	}
+
+	// The session is replaced while the lookup is in flight: same session id, a new
+	// route generation, exactly what a rekey does.
+	f.fwd.RegisterSessionWithReturnPath(sessionID, "conn-1", f.peerKey, f.clientIP.String(), 11, f.returnPath)
+	successorGeneration := f.generation(t)
+	if successorGeneration == receiptGeneration {
+		t.Fatal("the replacement did not advance the incarnation")
+	}
+
+	close(f.slowRelease)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the query did not complete after the release")
+	}
+
+	events := ledger.SnapshotEvents(sessionID, 0).Events
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want the one query", len(events))
+	}
+	event := events[0]
+	if !event.RouteGenerationKnown {
+		t.Fatal("the event lost its incarnation")
+	}
+	if event.RouteGeneration != receiptGeneration {
+		t.Errorf("event incarnation = %d, want the receipt incarnation %d (the successor is %d)",
+			event.RouteGeneration, receiptGeneration, successorGeneration)
+	}
+}
+
+// TestClientDiagnosisSameIncarnationCallbackStaysAttributed is the legitimate
+// positive beside the retired-callback control: with no replacement, the event
+// carries the same incarnation the session still reports.
+func TestClientDiagnosisSameIncarnationCallbackStaysAttributed(t *testing.T) {
+	f := newClientDiagFixture(t)
+	f.queryIP(t, "plain.example", 56402)
+
+	sessionID := f.sessionID(t)
+	current := f.generation(t)
+	events := f.svc.clientDiagnosisRouteCache().DNSLedger().SnapshotEvents(sessionID, 0).Events
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	if !events[0].RouteGenerationKnown || events[0].RouteGeneration != current {
+		t.Errorf("event incarnation = %d/%v, want the current %d", events[0].RouteGeneration, events[0].RouteGenerationKnown, current)
+	}
+}
+
+// TestClientDiagnosisRecordsHTTPSAnswer pins the non-A answer semantics: an HTTPS
+// (SVCB) answer is an ANSWERED query with no A trust, and the kind measures "did the
+// response carry answer records", not "did it carry records of the queried type".
+func TestClientDiagnosisRecordsHTTPSAnswer(t *testing.T) {
+	f := newClientDiagFixture(t)
+	f.queryType(t, "https.example", mdns.TypeHTTPS, 56501)
+
+	sessionID := f.sessionID(t)
+	ledger := f.svc.clientDiagnosisRouteCache().DNSLedger()
+	events := ledger.SnapshotEvents(sessionID, 0).Events
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want the one query", len(events))
+	}
+	event := events[0]
+	if event.QType != mdns.TypeHTTPS {
+		t.Errorf("qtype = %d, want HTTPS (%d)", event.QType, mdns.TypeHTTPS)
+	}
+	if event.Kind != gatewaydns.QueryEventAnswered {
+		t.Errorf("kind = %q, want answered: the response carried an SVCB record", event.Kind)
+	}
+	if event.RCode != mdns.RcodeSuccess {
+		t.Errorf("rcode = %d, want NOERROR", event.RCode)
+	}
+
+	// No A trust: an SVCB answer produced no route evidence and no answer record.
+	if got := f.routeCache.SessionScope(sessionID).Count(); got != 0 {
+		t.Errorf("evidence entries = %d, want none from an HTTPS answer", got)
+	}
+	// The answer HISTORY records the query as seen, with no addresses because the
+	// observation path rejected it; route evidence stays empty.
+	records := ledger.Snapshot(sessionID, 0)
+	if records.Total != 1 {
+		t.Fatalf("answer records = %d, want the one query recorded as seen", records.Total)
+	}
+	if len(records.Records[0].Addresses) != 0 {
+		t.Errorf("record addresses = %+v, want none from an SVCB answer", records.Records[0].Addresses)
+	}
+	if records.Records[0].ClassificationValid {
+		t.Error("an SVCB answer was recorded as a valid A classification")
+	}
+}
+
+// TestClientDiagnosisRecordsAdmissionRefusal induces a GENUINE refusal through the
+// real limiter: one in-flight query holds the only per-session slot, the next is
+// refused before any upstream attempt, receives SERVFAIL, is attributed as a refusal
+// (not an upstream failure), creates no trust, and the session recovers.
+func TestClientDiagnosisRecordsAdmissionRefusal(t *testing.T) {
+	f := newClientDiagFixtureWithInflight(t, 1)
+	sessionID := f.sessionID(t)
+	ledger := f.svc.clientDiagnosisRouteCache().DNSLedger()
+
+	// The first query blocks inside the upstream exchange and holds the slot.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.queryIP(t, "slow.example", 56601)
+	}()
+	select {
+	case <-f.slowEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the blocking query never reached the upstream exchange")
+	}
+
+	// The second query must be refused by the limiter, before any upstream attempt.
+	refusedPacket := buildTestPBRUDPPacket(f.clientIP, f.gwDNS, 56602, 53, packEventQuery(t, "plain.example", mdns.TypeA))
+	if err := f.fwd.RouteClientToBackend(f.peerKey, refusedPacket); err != nil {
+		t.Fatalf("refused query dispatch: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if events := ledger.SnapshotEvents(sessionID, 0).Events; len(events) >= 1 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	events := ledger.SnapshotEvents(sessionID, 0).Events
+	var refused *dnsledger.Event
+	for i := range events {
+		if events[i].Kind == gatewaydns.QueryEventAdmissionRefused {
+			refused = &events[i]
+		}
+	}
+	if refused == nil {
+		t.Fatalf("no admission_refused event in %+v", events)
+	}
+	if refused.RCode != mdns.RcodeServerFailure {
+		t.Errorf("rcode = %d, want SERVFAIL as the client received it", refused.RCode)
+	}
+	if refused.UpstreamError != "" {
+		t.Errorf("upstream class = %q, want none: the query never reached an upstream", refused.UpstreamError)
+	}
+	if refused.Name != "plain.example" {
+		t.Errorf("refused query name = %q, want the refused query", refused.Name)
+	}
+	if got := f.routeCache.SessionScope(sessionID).Count(); got != 0 {
+		t.Errorf("evidence entries = %d, want none from a refused query", got)
+	}
+
+	// Recovery: once the blocking query finishes, the same session is served.
+	close(f.slowRelease)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the blocking query did not complete")
+	}
+	f.queryIP(t, "plain.example", 56603)
+	var answered *dnsledger.Event
+	for _, event := range ledger.SnapshotEvents(sessionID, 0).Events {
+		candidate := event
+		if candidate.Kind == gatewaydns.QueryEventAnswered && candidate.QType == mdns.TypeA {
+			answered = &candidate
+		}
+	}
+	if answered == nil {
+		t.Error("the session did not recover: no answered event after the refusal")
+	}
+}
+
+// packEventQuery packs one query into UDP payload bytes for the refusal control.
+func packEventQuery(t *testing.T, name string, qtype uint16) []byte {
+	t.Helper()
+	req := new(mdns.Msg)
+	req.SetQuestion(mdns.Fqdn(name), qtype)
+	req.Id = 0x7777
+	raw, err := req.Pack()
+	if err != nil {
+		t.Fatalf("pack query: %v", err)
+	}
+	return raw
 }
 
 // TestClientDiagnosisTerminalEventsLeaveWithTheSession proves the event history is

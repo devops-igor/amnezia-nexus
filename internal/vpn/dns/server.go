@@ -140,7 +140,7 @@ func (s *Server) SetObserver(obs RouteObserver) {
 // It runs after the delivery attempt and outside every lock; it performs no I/O and
 // allocates only the event value. A server without an observer records nothing,
 // which is why this cannot be a correctness dependency.
-func (s *Server) emitQueryEvent(scope *ScopeHandle, req, resp *mdns.Msg, outcome QueryOutcome, transport string, truncated, delivered bool, recvTime, answeredAt time.Time) {
+func (s *Server) emitQueryEvent(scope *ScopeHandle, req, resp *mdns.Msg, outcome QueryOutcome, transport string, truncated, delivered bool, recvTime, answeredAt time.Time, routeGeneration uint64, incarnationKnown bool) {
 	if s == nil {
 		return
 	}
@@ -149,6 +149,12 @@ func (s *Server) emitQueryEvent(scope *ScopeHandle, req, resp *mdns.Msg, outcome
 		return
 	}
 	event, ok := buildQueryEvent(scope, req, resp, outcome, transport, truncated, delivered, recvTime, answeredAt)
+	if ok {
+		// The incarnation the query arrived under, captured at receipt. It is set
+		// from the binder rather than resolved now, because "now" may be a successor.
+		event.RouteGeneration = routeGeneration
+		event.IncarnationKnown = incarnationKnown
+	}
 	if !ok {
 		return
 	}
@@ -601,6 +607,7 @@ func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.Packe
 		}
 
 		recvTime := time.Now()
+		receiptGeneration, receiptKnown := s.bindQueryIncarnation(s.QueryEventObserver(), scopeVal.SessionID)
 		resp, outcome, err := s.serveDNSMessageOutcome(ctx, scopeVal, req, false)
 		if err == nil && resp != nil {
 			delivered := false
@@ -612,7 +619,7 @@ func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.Packe
 					}
 				}
 			}
-			s.emitQueryEvent(scope, req, resp, outcome, "udp", resp.Truncated, delivered, recvTime, time.Now())
+			s.emitQueryEvent(scope, req, resp, outcome, "udp", resp.Truncated, delivered, recvTime, time.Now(), receiptGeneration, receiptKnown)
 		}
 	}
 }
@@ -650,6 +657,7 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 		}
 
 		recvTime := time.Now()
+		receiptGeneration, receiptKnown := s.bindQueryIncarnation(s.QueryEventObserver(), scopeVal.SessionID)
 		resp, outcome, err := s.serveDNSMessageOutcome(ctx, scopeVal, req, true)
 		if err != nil || resp == nil {
 			return
@@ -669,7 +677,7 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 				delivered = true
 			}
 		}
-		s.emitQueryEvent(scope, req, resp, outcome, "tcp", resp.Truncated, delivered, recvTime, time.Now())
+		s.emitQueryEvent(scope, req, resp, outcome, "tcp", resp.Truncated, delivered, recvTime, time.Now(), receiptGeneration, receiptKnown)
 		if !delivered {
 			return
 		}

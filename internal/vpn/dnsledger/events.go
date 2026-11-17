@@ -26,6 +26,16 @@ const (
 	MaxEventsTotal = 4096
 	// eventOverheadBytes is the estimated fixed cost of one stored event.
 	eventOverheadBytes = 96
+	// MaxEventBytesTotal bounds the estimated bytes the event store may hold. It is
+	// deliberately reachable: 4096 events with 253-byte names are about 1.5 MB, so a
+	// budget above that would be a fence that never closes. At 1 MiB the byte budget
+	// is the binding fence for long names, and the count caps bind first for short
+	// ones.
+	MaxEventBytesTotal = 1 << 20
+	// MaxEventNameBytes bounds one stored query name. The DNS wire limit is 253
+	// octets; a caller that hands over a longer string is cut here rather than
+	// trusted.
+	MaxEventNameBytes = 253
 )
 
 // InputEvent is what the DNS server hands to the store: one terminal query.
@@ -88,6 +98,8 @@ type EventLimits struct {
 	EventsPerSession int
 	EventsTotal      int
 	MaxAgeSeconds    int64
+	BytesTotal       int
+	MaxNameBytes     int
 }
 
 // EventLimits returns the event bounds this ledger enforces.
@@ -96,6 +108,8 @@ func (l *Ledger) EventLimits() EventLimits {
 		EventsPerSession: MaxEventsPerSession,
 		EventsTotal:      MaxEventsTotal,
 		MaxAgeSeconds:    int64(MaxRecordAge / time.Second),
+		BytesTotal:       MaxEventBytesTotal,
+		MaxNameBytes:     MaxEventNameBytes,
 	}
 }
 
@@ -114,6 +128,9 @@ func (l *Ledger) RecordEvent(in InputEvent, now time.Time) bool {
 	}
 	if in.AnsweredAt.IsZero() {
 		in.AnsweredAt = in.ReceivedAt
+	}
+	if len(in.Name) > MaxEventNameBytes {
+		in.Name = in.Name[:MaxEventNameBytes]
 	}
 
 	built := Event{
@@ -156,8 +173,9 @@ func (l *Ledger) RecordEvent(in InputEvent, now time.Time) bool {
 		l.dropOldestEventLocked(in.SessionID, session)
 		l.stats.Events.EvictedSession++
 	}
-	for l.eventTotal >= MaxEventsTotal {
+	for l.eventTotal >= MaxEventsTotal || l.eventBytes+size > MaxEventBytesTotal {
 		if !l.dropOldestEventGlobalLocked() {
+			// Nothing left to evict and the record still does not fit.
 			l.stats.Events.RejectedNoRoom++
 			return false
 		}

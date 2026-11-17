@@ -85,12 +85,44 @@ type QueryEvent struct {
 	Delivered     bool
 	ReceivedAt    time.Time
 	AnsweredAt    time.Time
+	// RouteGeneration is the incarnation registered when the QUERY ARRIVED, not
+	// when the event was emitted. A successor that reused the session id must never
+	// inherit the record.
+	RouteGeneration uint64
+	// IncarnationKnown reports whether that incarnation could be established.
+	IncarnationKnown bool
+	// PolicyGeneration is the published generation at receipt.
+	PolicyGeneration string
 }
 
 // QueryEventObserver records terminal query events. It is optional: a server
 // without one records nothing, and the trust path does not depend on it.
 type QueryEventObserver interface {
 	ObserveDNSQueryEvent(event QueryEvent)
+}
+
+// QueryReceiptBinder stamps the incarnation a query arrived under, AT RECEIPT.
+//
+// A terminal event is emitted after the reply has been produced and written, which
+// can be long after the query arrived. Resolving the incarnation at emit time would
+// credit whatever session owns the id by then — a successor that reused it — so the
+// lookup happens once at receipt and travels with the event. Implementations must be
+// read-only and must not allocate a scope.
+type QueryReceiptBinder interface {
+	BindQueryIncarnation(sessionID string) (generation uint64, known bool)
+}
+
+// bindQueryIncarnation asks the installed observer for the receipt incarnation, or
+// reports that it cannot be established. It is a no-op without a binder.
+func (s *Server) bindQueryIncarnation(observer QueryEventObserver, sessionID string) (uint64, bool) {
+	if observer == nil || sessionID == "" {
+		return 0, false
+	}
+	binder, ok := observer.(QueryReceiptBinder)
+	if !ok {
+		return 0, false
+	}
+	return binder.BindQueryIncarnation(sessionID)
 }
 
 // classifyUpstreamError names the class of a failed upstream exchange without
@@ -117,6 +149,12 @@ func isTimeout(err error) bool {
 
 // queryEventKind classifies a response the server produced, before the transport
 // handler knows whether it was delivered.
+//
+// It measures ONE thing: whether the answer section is empty. It does not compare
+// the records' type to the question, and it must not pretend to: an HTTPS query
+// answered with an SVCB record is `answered`, a query whose answer section is empty
+// is `no_answer`, and neither statement says anything about A evidence. Whether a
+// response may become route evidence is the classifier's decision, not this one's.
 func queryEventKind(resp *mdns.Msg) string {
 	if resp == nil {
 		return QueryEventUpstreamError

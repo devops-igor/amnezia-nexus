@@ -520,16 +520,23 @@ func (c *MemoryRouteCache) recordDNSObservation(sessionID string, observed gatew
 // It is diagnostic history only. It writes no route evidence, so a failed or
 // truncated answer cannot become trusted because it was recorded here, and it runs
 // after the delivery attempt, outside every lock.
+// BindQueryIncarnation reports the route generation registered for a session when a
+// query arrives. It is the receipt-time half of the terminal-event contract: the
+// event is emitted after the reply, and resolving the incarnation then could credit
+// a successor that reused the session id.
+func (c *MemoryRouteCache) BindQueryIncarnation(sessionID string) (uint64, bool) {
+	return c.observedIncarnation(sessionID)
+}
+
 func (c *MemoryRouteCache) ObserveDNSQueryEvent(event gatewaydns.QueryEvent) {
 	ledger := c.DNSLedger()
 	if ledger == nil || event.SessionID == "" {
 		return
 	}
-	generation, generationKnown := c.observedIncarnation(event.SessionID)
 	ledger.RecordEvent(dnsledger.InputEvent{
 		SessionID:            event.SessionID,
-		RouteGeneration:      generation,
-		RouteGenerationKnown: generationKnown,
+		RouteGeneration:      event.RouteGeneration,
+		RouteGenerationKnown: event.IncarnationKnown,
 		Transport:            event.Transport,
 		Name:                 event.Name,
 		QType:                event.QType,

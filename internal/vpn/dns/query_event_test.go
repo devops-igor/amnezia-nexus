@@ -115,7 +115,7 @@ func TestEmitQueryEventWithoutAnObserverIsInert(t *testing.T) {
 	if server.QueryEventObserver() != nil {
 		t.Fatal("a fresh server has an event observer")
 	}
-	server.emitQueryEvent(scopeWithSession("s"), queryFor("plain.example", mdns.TypeA), new(mdns.Msg), QueryOutcome{Kind: QueryEventAnswered}, "udp", false, true, time.Now(), time.Now())
+	server.emitQueryEvent(scopeWithSession("s"), queryFor("plain.example", mdns.TypeA), new(mdns.Msg), QueryOutcome{Kind: QueryEventAnswered}, "udp", false, true, time.Now(), time.Now(), 7, true)
 	// Nothing to assert beyond not panicking: the absence of an observer is the
 	// contract, and it is checked above.
 }
@@ -127,12 +127,15 @@ func TestSetObserverInstallsBothChannels(t *testing.T) {
 	if server.QueryEventObserver() == nil {
 		t.Fatal("installing the route observer did not install the event observer")
 	}
-	server.emitQueryEvent(nil, queryFor("plain.example", mdns.TypeA), new(mdns.Msg), QueryOutcome{Kind: QueryEventAnswered}, "tcp", false, true, time.Now(), time.Now())
+	server.emitQueryEvent(nil, queryFor("plain.example", mdns.TypeA), new(mdns.Msg), QueryOutcome{Kind: QueryEventAnswered}, "tcp", false, true, time.Now(), time.Now(), 0, false)
 	if len(observer.events) != 1 {
 		t.Fatalf("events = %d, want the one emitted query", len(observer.events))
 	}
 	if observer.events[0].Transport != "tcp" || observer.events[0].SessionID != "" {
 		t.Errorf("event = %+v, want tcp with no session", observer.events[0])
+	}
+	if observer.events[0].IncarnationKnown {
+		t.Error("an unknown receipt incarnation was reported as known")
 	}
 
 	// Clearing the observer clears both channels.

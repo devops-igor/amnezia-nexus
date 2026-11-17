@@ -42,6 +42,10 @@ type clientDiagFixture struct {
 	// returnPath is the client return path the route was registered with, kept so
 	// a rekey case can register the same incarnation again.
 	returnPath *forwarder.ReturnPath
+	// slowEntered / slowRelease drive the blocking query used to interleave a
+	// session replacement with an in-flight lookup.
+	slowEntered chan struct{}
+	slowRelease chan struct{}
 
 	mu       sync.Mutex
 	replies  [][]byte
@@ -56,6 +60,13 @@ type clientDiagFixture struct {
 // device and a client return path, the intercepted DNS gateway with a loopback
 // style mock upstream, and a real session registry.
 func newClientDiagFixture(t *testing.T) *clientDiagFixture {
+	t.Helper()
+	return newClientDiagFixtureWithInflight(t, 0)
+}
+
+// newClientDiagFixtureWithInflight builds the same real chain with an explicit
+// per-session admission budget, which is how a genuine refusal is induced.
+func newClientDiagFixtureWithInflight(t *testing.T, maxInflightPerSession int) *clientDiagFixture {
 	t.Helper()
 	ctx := context.Background()
 
@@ -95,6 +106,15 @@ func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 			return resp, nil
 		}
 		q := req.Question[0]
+		if q.Qtype == mdns.TypeHTTPS && q.Name == "https.example." {
+			// An HTTPS (SVCB) answer: records of the QUERIED type, no A record.
+			resp.Answer = append(resp.Answer, &mdns.SVCB{
+				Hdr:      mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeHTTPS, Class: mdns.ClassINET, Ttl: 300},
+				Priority: 1,
+				Target:   ".",
+			})
+			return resp, nil
+		}
 		if q.Qtype != mdns.TypeA {
 			// A real authority does not answer a non-A question with A records. The
 			// fixture must not either, or a no-answer response would look like an
@@ -122,6 +142,27 @@ func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 		case "nx.example.":
 			// A terminal NXDOMAIN: an error response, distinct from a no-answer one.
 			resp.Rcode = mdns.RcodeNameError
+		case "https.example.":
+			// An HTTPS (SVCB) answer: the reply carries records, but of the queried
+			// type, not an A record. It must never become A route evidence.
+			resp.Answer = append(resp.Answer, &mdns.SVCB{
+				Hdr:      mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeHTTPS, Class: mdns.ClassINET, Ttl: 300},
+				Priority: 1,
+				Target:   ".",
+			})
+		case "slow.example.":
+			// Blocks until the test releases it, so a rekey can land between the
+			// query's receipt and the terminal event.
+			if f.slowEntered != nil {
+				f.slowEntered <- struct{}{}
+			}
+			if f.slowRelease != nil {
+				<-f.slowRelease
+			}
+			resp.Answer = append(resp.Answer, &mdns.A{
+				Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+				A:   f.example.AsSlice(),
+			})
 		case "fail.example.":
 			// A failed upstream exchange, which the server turns into SERVFAIL.
 			return nil, context.DeadlineExceeded
@@ -158,7 +199,8 @@ func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 		return resp, nil
 	}}
 	server, err := gatewaydns.NewServer(gatewaydns.ServerConfig{
-		Gateway: netip.AddrPortFrom(f.gwDNS, 53),
+		Gateway:               netip.AddrPortFrom(f.gwDNS, 53),
+		MaxInflightPerSession: maxInflightPerSession,
 	}, resolver, matcher)
 	if err != nil {
 		t.Fatalf("dns NewServer: %v", err)
@@ -189,6 +231,8 @@ func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 	}
 	fwd.RegisterSessionWithReturnPath(sess.ID, "conn-1", f.peerKey, f.clientIP.String(), 11, returnPath)
 	f.returnPath = returnPath
+	f.slowEntered = make(chan struct{}, 1)
+	f.slowRelease = make(chan struct{})
 
 	f.fwd = fwd
 	f.routeCache = routeCache
