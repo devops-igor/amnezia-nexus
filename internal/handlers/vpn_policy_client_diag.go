@@ -22,11 +22,18 @@ import (
 // GET /api/vpn/sessions, which admins and support share: browsing metadata stays
 // admin-only.
 //
-// Read-only is structural, not a promise: this file reads a request body and
-// calls two Service methods that only copy already-retained state. See
-// internal/vpn/vpn_pbr_client_diag.go for the per-store argument (no scope
-// allocation, no lastSeen refresh, no flow retirement, no observation, no
-// resolver).
+// Read-only is structural for the diagnostic datastores, not a promise that the
+// request has no side effect at all: this file reads a request body, calls two Service
+// methods that only copy already-retained state, and then writes exactly one access
+// audit line (see clientDiagnosisAuditDetails). See
+// internal/vpn/vpn_pbr_client_diag.go for the per-store argument (no scope allocation,
+// no lastSeen refresh, no flow retirement, no observation, no resolver).
+//
+// The audit line is the access record the design requires: an operator reading a
+// client's retained DNS and flow evidence is itself an event, named by actor and by
+// the selected session. It deliberately carries no name, address, port, payload or
+// request/response body, so reading the audit log cannot reconstruct what the client
+// browsed.
 
 const (
 	// clientDiagnosisMaxBodyBytes bounds the request body. The accepted body is
@@ -39,6 +46,21 @@ const (
 	// so the deadline exists to stop a wedged caller, not to divide a budget.
 	clientDiagnosisTimeout = 5 * time.Second
 )
+
+// clientDiagnosisAuditEvent names the access event one accepted diagnosis read writes.
+const clientDiagnosisAuditEvent = "policy.client_diagnosis_read"
+
+// clientDiagnosisAuditDetails is the bounded outcome summary attached to that event: the
+// selected identity, the verdict and counts. It is the ONLY place this handler builds audit
+// details, so no browsing metadata can be added by accident.
+func (h *Handlers) clientDiagnosisAuditDetails(answer vpn.ClientDiagnosisResponse) map[string]any {
+	return map[string]any{
+		"session_id":      answer.Selection.SessionID,
+		"selection_state": answer.Selection.State,
+		"flow_count":      len(answer.Flows.Entries),
+		"drop_count":      len(answer.Drops.Entries),
+	}
+}
 
 // clientDiagnosisBody is the accepted request body.
 type clientDiagnosisBody struct {
@@ -86,6 +108,18 @@ func (h *Handlers) ClientDiagnosisHandler(w http.ResponseWriter, r *http.Request
 		h.JSONError(w, http.StatusInternalServerError, "internal_error", "Failed to read the client diagnosis")
 		return
 	}
+
+	// Exactly one access event per ACCEPTED diagnosis read. Semantics, stated once:
+	//   - a successful answer records the actor, the selected session identity and a
+	//     bounded outcome summary;
+	//   - a busy, malformed or invalid request records nothing, because no retained
+	//     evidence was read;
+	//   - an unauthenticated, unauthorized or CSRF-refused request never reaches this
+	//     handler at all; the neighboring middleware owns those refusals and their own
+	//     logging.
+	// Nothing here is browsing metadata: no DNS name, answer, address, port, payload or
+	// body is passed.
+	h.audit(r, clientDiagnosisAuditEvent, h.clientDiagnosisAuditDetails(answer))
 	h.JSON(w, http.StatusOK, answer)
 }
 
