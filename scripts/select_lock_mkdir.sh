@@ -66,12 +66,16 @@ package_label() {
     printf '%s' "${pkg:-package-unknown}"
 }
 
-# exclusive_create_ok is the decisive capability: the first plain mkdir must succeed and
-# the second must fail. A banner that claims GNU coreutils proves nothing about this.
+# exclusive_create_ok is the decisive capability, and it proves its two halves separately:
+# the first plain mkdir must report success and leave a directory behind, and the second must
+# be refused. Proving them apart matters, because an implementation that never creates
+# anything also fails the second call and must not be mistaken for a correct one.
 exclusive_create_ok() {
     local bin="$1" probe status=0
     probe="$(mktemp -d)"
     if ! "$bin" "$probe/once" >/dev/null 2>&1; then
+        status=1
+    elif [ ! -d "$probe/once" ]; then
         status=1
     elif "$bin" "$probe/once" >/dev/null 2>&1; then
         status=1
@@ -101,7 +105,7 @@ contention_create_ok() {
                 success=$((success + 1))
             fi
         done
-        if [ "$success" -ne 1 ]; then
+        if [ "$success" -ne 1 ] || [ ! -d "$probe/round-$round" ]; then
             status=1
             break
         fi
@@ -169,13 +173,20 @@ candidates() {
     printf '%s\n' /usr/bin/mkdir /bin/mkdir
 }
 
-# install_shim creates a directory holding exactly one entry, a `mkdir` symlink to the
-# selected implementation, and prints that directory.
+# install_shim creates a fresh directory holding exactly one entry, a `mkdir` symlink to the
+# selected implementation, and prints that directory. The directory is unique per invocation:
+# a predictable path that is deleted and re-created would let one run remove another run's
+# shim, and would delete a path it does not own.
 install_shim() {
     local bin="$1" base="${2:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}" shim count
-    shim="${base}/lock-mkdir-shim"
-    rm -rf "$shim"
-    mkdir -p "$shim"
+    if [ ! -d "$base" ]; then
+        echo "::error::cannot create the mkdir shim: ${base} is not a directory"
+        return 1
+    fi
+    if ! shim="$(mktemp -d "${base%/}/lock-mkdir-shim.XXXXXXXX")"; then
+        echo "::error::could not create a unique mkdir shim directory under ${base}"
+        return 1
+    fi
     ln -s "$bin" "$shim/mkdir"
     count="$(find "$shim" -mindepth 1 -maxdepth 1 | wc -l)"
     if [ "$count" -ne 1 ]; then
@@ -185,24 +196,42 @@ install_shim() {
     printf '%s\n' "$shim"
 }
 
-# assert_wiring proves the selection reaches a real subprocess. The Go lock tests invoke
-# the generated shell as `bash -c <script>`, so a bash subprocess resolving `mkdir` to the
-# shim, and rejecting an existing directory there, is the same lookup they perform.
+# assert_wiring proves the selection reaches a real subprocess. The Go lock tests invoke the
+# generated shell as `bash -c <script>`, so a bash subprocess is the same lookup they perform.
+#
+# The two halves are asserted separately, and that separation is the point: testing only that
+# the second call does not succeed accepts an implementation that cannot create anything,
+# because its first call fails, the compound short-circuits, and the check reads that as
+# exclusivity.
 assert_wiring() {
     local shim="$1" resolved probe
-    resolved="$(PATH="$shim:$PATH" bash -c 'command -v mkdir')"
+    if ! resolved="$(PATH="$shim:$PATH" bash -c 'command -v mkdir')"; then
+        echo "::error::a subprocess could not resolve mkdir at all"
+        return 1
+    fi
     if [ "$resolved" != "$shim/mkdir" ]; then
         echo "::error::a subprocess resolves mkdir to ${resolved}, not ${shim}/mkdir"
         return 1
     fi
+
     probe="$(mktemp -d)"
-    if PATH="$shim:$PATH" bash -c "mkdir '$probe/once' >/dev/null 2>&1 && mkdir '$probe/once' >/dev/null 2>&1"; then
+    if ! PATH="$shim:$PATH" bash -c "mkdir '$probe/once'"; then
+        rm -rf "$probe"
+        echo "::error::the selected mkdir could not create a directory in a subprocess"
+        return 1
+    fi
+    if [ ! -d "$probe/once" ]; then
+        rm -rf "$probe"
+        echo "::error::the selected mkdir reported success in a subprocess but created nothing"
+        return 1
+    fi
+    if PATH="$shim:$PATH" bash -c "mkdir '$probe/once' 2>/dev/null"; then
         rm -rf "$probe"
         echo "::error::the selected mkdir reports success for a directory that already exists"
         return 1
     fi
     rm -rf "$probe"
-    log "subprocess wiring: bash -c resolves mkdir=${resolved} and rejects an existing directory"
+    log "subprocess wiring: bash -c resolves mkdir=${resolved}, creates on the first call and refuses the second"
 }
 
 emit_provenance() {
@@ -253,13 +282,16 @@ self_test() {
 
     log "self-test: offline controls for the mkdir qualification gate"
 
-    # Control 1: the gate accepts a real GNU mkdir when the host has one.
+    # Control 1: the gate accepts a real GNU mkdir. This positive control must actually run:
+    # a self-test that reports success while its positive is unavailable would claim coverage
+    # it does not have.
     local -a cands
     mapfile -t cands < <(candidates)
     if accepted="$(select_from "${cands[@]}" 2>/dev/null)"; then
         log "control accepted-real: PASS (${accepted}, $(version_line "$accepted"))"
     else
-        log "control accepted-real: SKIP (no qualified mkdir on this host)"
+        echo "::error::the self-test positive control could not run: no qualified mkdir is available on this host"
+        rc=1
     fi
 
     # Control 2: a candidate that is not present must be refused.
@@ -354,6 +386,34 @@ FAKE
         rc=1
     else
         log "control fail-closed-report: PASS"
+    fi
+
+    # Control 9: an implementation that never creates anything must be refused by the
+    # capability gate. It fails the second call too, so "the second call was refused" on its
+    # own would have accepted it.
+    cat >"${fake_dir}/never-mkdir" <<FAKE
+#!/bin/sh
+case "\${1:-}" in
+--version) echo 'mkdir (${GNU_MARKER}) 9.9' ;;
+*) exit 1 ;;
+esac
+FAKE
+    chmod +x "${fake_dir}/never-mkdir"
+    if select_from "${fake_dir}/never-mkdir" >/dev/null 2>&1; then
+        echo "::error::the gate accepted an implementation that never creates a directory"
+        rc=1
+    else
+        log "control refused-never-creates: PASS"
+    fi
+
+    # Control 10: the wiring check must refuse it as well. A shim can be pointed at any
+    # binary, so this is the case a "second call failed" test cannot see.
+    shim="$(install_shim "${fake_dir}/never-mkdir" "$fake_dir")"
+    if assert_wiring "$shim" >/dev/null 2>&1; then
+        echo "::error::the wiring check passed for an implementation that never creates a directory"
+        rc=1
+    else
+        log "control wiring-catches-never-creates: PASS"
     fi
 
     if [ "$rc" -ne 0 ]; then

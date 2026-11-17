@@ -100,18 +100,34 @@ jobs:
       # actually resolves it. The lock tests start their shell with `bash -c`, which is the
       # lookup exercised below; asserting this only in the setup step would not see the
       # job-level PATH that the tests inherit.
+      #
+      # The first creation and the later refusal are asserted apart. Combining them into one
+      # `mkdir A && mkdir A` test would accept an implementation that cannot create anything
+      # at all: the first call fails, the chain short-circuits, and the failure reads as the
+      # refusal it is supposed to prove.
       - name: Verify the lock tests inherit the selected mkdir
         run: |
           set -euo pipefail
           shim="${LOCK_MKDIR_SHIM_DIR:?the mkdir selection did not export its shim directory}"
-          resolved="$(bash -c 'command -v mkdir')"
+          if ! resolved="$(bash -c 'command -v mkdir')"; then
+            echo "::error::a subprocess could not resolve mkdir at all"
+            exit 1
+          fi
           if [ "$resolved" != "${shim}/mkdir" ]; then
             echo "::error::the lock tests would resolve mkdir to ${resolved}, not ${shim}/mkdir"
             exit 1
           fi
           probe="$(mktemp -d)"
           trap 'rm -rf "$probe"' EXIT
-          if bash -c "mkdir '$probe/once' >/dev/null 2>&1 && mkdir '$probe/once' >/dev/null 2>&1"; then
+          if ! bash -c "mkdir '$probe/once'"; then
+            echo "::error::the inherited mkdir could not create a directory"
+            exit 1
+          fi
+          if [ ! -d "$probe/once" ]; then
+            echo "::error::the inherited mkdir reported success but created nothing"
+            exit 1
+          fi
+          if bash -c "mkdir '$probe/once' 2>/dev/null"; then
             echo "::error::the inherited mkdir reports success for a directory that already exists"
             exit 1
           fi
