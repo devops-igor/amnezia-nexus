@@ -40,8 +40,11 @@ type dohSeenRequest struct {
 type dohTestServer struct {
 	addr      netip.AddrPort
 	plaintext *atomic.Int32
-	mu        sync.Mutex
-	seen      []dohSeenRequest
+	// pair is the TCP/UDP port pair this server owns, so the plaintext oracle can
+	// use its UDP half on the same port number the HTTPS listener serves.
+	pair *loopbackPortPair
+	mu   sync.Mutex
+	seen []dohSeenRequest
 }
 
 // requests returns a copy of everything the server has seen so far.
@@ -111,8 +114,16 @@ func startDoHTestServer(t *testing.T, certificate tls.Certificate, http2 bool, h
 		fixture.mu.Unlock()
 		handler(w, r)
 	}))
-	fixture.addr = netip.MustParseAddrPort(server.Listener.Addr().String())
-	server.Listener = &sniffListener{Listener: server.Listener, plaintext: fixture.plaintext}
+	// The fixture needs the same number on UDP for its plaintext oracle, so the
+	// HTTPS listener takes the port pair's TCP half instead of the ephemeral
+	// listener httptest bound for itself.
+	pair := newLoopbackPortPair(t)
+	fixture.pair = pair
+	fixture.addr = pair.addr()
+	if server.Listener != nil {
+		_ = server.Listener.Close()
+	}
+	server.Listener = &sniffListener{Listener: pair.tcp, plaintext: fixture.plaintext}
 	server.EnableHTTP2 = http2
 	server.TLS = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
 	server.Config.ErrorLog = log.New(io.Discard, "", 0)
