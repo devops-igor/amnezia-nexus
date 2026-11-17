@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"net"
-	"net/netip"
 	"testing"
 	"time"
 
@@ -287,19 +286,17 @@ func TestResolver_DoTNoPlaintextDowngrade(t *testing.T) {
 	serverCA := newDoTTestCA(t)
 	certificate, _ := serverCA.issue(t, dotLeafOptions{ips: []net.IP{net.ParseIP("127.0.0.1")}})
 
-	listener, err := tls.Listen("tcp4", "127.0.0.1:0", &tls.Config{
+	pair := newLoopbackPortPair(t)
+	addr := pair.addr()
+	listener := tls.NewListener(pair.tcp, &tls.Config{
 		Certificates: []tls.Certificate{certificate},
 		MinVersion:   tls.VersionTLS12,
 	})
-	if err != nil {
-		t.Fatalf("listen DoT: %v", err)
-	}
-	addr := netip.MustParseAddrPort(listener.Addr().String())
 	server := &mdns.Server{Listener: listener, Handler: answerHandler(t, "203.0.113.79")}
 	go func() { _ = server.ActivateAndServe() }()
 	t.Cleanup(func() { _ = server.Shutdown() })
 
-	plaintextHits := startPlaintextResponder(t, addr, "203.0.113.80")
+	plaintextHits := startPlaintextResponder(t, pair.udp, "203.0.113.80")
 
 	entry := dotEntryOf(addr, "")
 	resolver := mustLoopbackResolver(t, ResolverConfig{
@@ -328,7 +325,8 @@ func TestResolver_DoTNoPlaintextDowngrade(t *testing.T) {
 // or to an explicitly plain one, and never sends its own query in plaintext.
 func TestResolver_DoTFailoverKeepsTransports(t *testing.T) {
 	ca := newDoTTestCA(t)
-	broken := startBrokenTLSListener(t)
+	pair := newLoopbackPortPair(t)
+	broken := startBrokenTLSListenerOn(t, pair.tcp)
 
 	t.Run("encrypted alternate answers", func(t *testing.T) {
 		certificate, _ := ca.issue(t, dotLeafOptions{ips: []net.IP{net.ParseIP("127.0.0.1")}})
@@ -351,7 +349,7 @@ func TestResolver_DoTFailoverKeepsTransports(t *testing.T) {
 	})
 
 	t.Run("explicitly plain alternate answers and the dot entry stays plaintext-free", func(t *testing.T) {
-		plaintextHits := startPlaintextResponder(t, broken, "203.0.113.82")
+		plaintextHits := startPlaintextResponder(t, pair.udp, "203.0.113.82")
 		plainAlternate := startMockServer(t, answerHandler(t, "203.0.113.83"))
 
 		resolver := mustLoopbackResolver(t, ResolverConfig{

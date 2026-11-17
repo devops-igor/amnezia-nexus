@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/netip"
 	"os"
 	"os/exec"
 	"sync/atomic"
@@ -53,21 +52,18 @@ type downgradeScenario struct {
 
 // startSniffedDoTServer serves DoT behind a listener that counts connections
 // whose first byte is not a TLS record.
-func startSniffedDoTServer(t *testing.T, certificate tls.Certificate) (netip.AddrPort, *atomic.Int32) {
+func startSniffedDoTServer(t *testing.T, certificate tls.Certificate) (*loopbackPortPair, *atomic.Int32) {
 	t.Helper()
-	raw, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen DoT: %v", err)
-	}
+	pair := newLoopbackPortPair(t)
 	plain := &atomic.Int32{}
-	listener := tls.NewListener(&sniffListener{Listener: raw, plaintext: plain}, &tls.Config{
+	listener := tls.NewListener(&sniffListener{Listener: pair.tcp, plaintext: plain}, &tls.Config{
 		Certificates: []tls.Certificate{certificate},
 		MinVersion:   tls.VersionTLS12,
 	})
 	server := &mdns.Server{Listener: listener, Handler: answerHandler(t, "203.0.113.110")}
 	go func() { _ = server.ActivateAndServe() }()
 	t.Cleanup(func() { _ = server.Shutdown() })
-	return netip.MustParseAddrPort(raw.Addr().String()), plain
+	return pair, plain
 }
 
 // startPlainHTTPTarget is an http:// server that answers any request with a
@@ -135,7 +131,7 @@ func TestResolver_DoHNoPlaintextDowngrade(t *testing.T) {
 	// responder to the same port number, the way the DoT oracle always has.
 	start := func(t *testing.T, cert tls.Certificate, h2 bool, handler http.HandlerFunc) (*dohTestServer, *atomic.Int32) {
 		server := startDoHTestServer(t, cert, h2, handler)
-		return server, startPlaintextResponder(t, server.addr, "203.0.113.112")
+		return server, startPlaintextResponder(t, server.pair.udp, "203.0.113.112")
 	}
 
 	scenarios := []struct {
@@ -199,10 +195,10 @@ func TestResolver_DoTNoPlaintextDowngradeAllChannels(t *testing.T) {
 	}
 	for _, scenario := range scenarios {
 		t.Run(scenario.name, func(t *testing.T) {
-			addr, tcpPlain := startSniffedDoTServer(t, certificate)
-			udp := startPlaintextResponder(t, addr, "203.0.113.116")
+			pair, tcpPlain := startSniffedDoTServer(t, certificate)
+			udp := startPlaintextResponder(t, pair.udp, "203.0.113.116")
 			assertNoPlaintextAfterFailure(t, downgradeScenario{
-				entry: dotEntryOf(addr, ""), roots: scenario.trust(), want: scenario.want,
+				entry: dotEntryOf(pair.addr(), ""), roots: scenario.trust(), want: scenario.want,
 				attempt: 2 * time.Second, udpHits: udp, tcpPlain: tcpPlain,
 			})
 		})
