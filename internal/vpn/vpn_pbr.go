@@ -326,6 +326,15 @@ type MemoryRouteCache struct {
 	// session retirement. Guarded by dnsRecordsMu, never by mu.
 	dnsRecordsMu sync.RWMutex
 	dnsRecords   *dnsledger.Ledger
+	// historyLifetimes names the sessions whose DNS history lifetime is open and, for
+	// each, the earliest receipt generation that lifetime admitted (zero when the first
+	// receipt carried no incarnation). A lifetime opens at query receipt for a live
+	// session and closes in RetireSessionScope, in the same critical section that erases
+	// the rows, so a publication from a query whose session already retired cannot
+	// recreate it. A closed lifetime leaves no entry, so the registry is bounded by the
+	// sessions that currently own history, and a receipt of a re-admitted session opens
+	// a fresh lifetime with its own generation.
+	historyLifetimes map[string]uint64
 	// incarnation resolves which registered route generation owns a session at
 	// observation time, so a record can state its incarnation instead of
 	// guessing one. nil means "not established", never "the current one".
@@ -343,10 +352,11 @@ func NewMemoryRouteCache() *MemoryRouteCache {
 		m.Publish(snap)
 	}
 	return &MemoryRouteCache{
-		rc:         rc,
-		matcher:    m,
-		gen:        initialGen,
-		dnsRecords: dnsledger.New(),
+		rc:               rc,
+		matcher:          m,
+		gen:              initialGen,
+		dnsRecords:       dnsledger.New(),
+		historyLifetimes: make(map[string]uint64),
 	}
 }
 
@@ -470,8 +480,7 @@ const DNSTransportNotRecorded = "not_recorded"
 // bound to the session and to the route generation registered for it at the time
 // of the observation.
 func (c *MemoryRouteCache) recordDNSObservation(sessionID string, observed gatewaydns.ObservedAnswer) {
-	ledger := c.DNSLedger()
-	if ledger == nil || sessionID == "" {
+	if c.DNSLedger() == nil || sessionID == "" {
 		return
 	}
 	answer := observed.Classification
@@ -494,7 +503,19 @@ func (c *MemoryRouteCache) recordDNSObservation(sessionID string, observed gatew
 		})
 	}
 	generation, generationKnown := c.observedIncarnation(sessionID)
-	ledger.Record(dnsledger.Input{
+	policyGeneration := answerSnapshotGeneration(c)
+	c.dnsRecordsMu.Lock()
+	defer c.dnsRecordsMu.Unlock()
+	// The answer record is written after the reply was delivered, so — like the terminal
+	// event — it can run after the session retired. It is admitted only while this
+	// session's history lifetime is open, in the same critical section as the append, so
+	// retirement cannot interleave between the decision and the write. The incarnation is
+	// resolved above, at write time, so this fence cannot tell two lifetimes of one
+	// session id apart; that limit is stated in the handover.
+	if !c.historyWriteAllowedLocked(sessionID, generation, generationKnown) {
+		return
+	}
+	c.dnsRecords.Record(dnsledger.Input{
 		SessionID:            sessionID,
 		RouteGeneration:      generation,
 		RouteGenerationKnown: generationKnown,
@@ -504,7 +525,7 @@ func (c *MemoryRouteCache) recordDNSObservation(sessionID string, observed gatew
 		RCode:                observed.RCode,
 		ObservedAt:           observed.RecvTime,
 		ExpiresAt:            observed.ExpiresAt,
-		PolicyGeneration:     answerSnapshotGeneration(c),
+		PolicyGeneration:     policyGeneration,
 		ClassificationValid:  answer.Valid,
 		ClassificationReason: answer.Reason,
 		Addresses:            addresses,
@@ -524,16 +545,111 @@ func (c *MemoryRouteCache) recordDNSObservation(sessionID string, observed gatew
 // query arrives. It is the receipt-time half of the terminal-event contract: the
 // event is emitted after the reply, and resolving the incarnation then could credit
 // a successor that reused the session id.
+//
+// It is also where a session's DNS history lifetime opens. The receipt is the last
+// moment the session is known to be live for this query, and the publication that
+// follows it may run after the client disconnected, so the lifetime it belongs to has
+// to be recorded here rather than inferred at publication time.
 func (c *MemoryRouteCache) BindQueryIncarnation(sessionID string) (uint64, bool) {
-	return c.observedIncarnation(sessionID)
+	generation, known := c.observedIncarnation(sessionID)
+	c.openHistoryLifetime(sessionID, generation, known)
+	return generation, known
+}
+
+// historyWriteAllowedLocked reports whether a history row may be appended for a receipt
+// of this session. The caller holds dnsRecordsMu for writing, which is the same lock
+// RetireSessionScope takes to close the lifetime and erase the rows, so the decision and
+// the append are one critical section: retirement either already closed the lifetime
+// (the row is dropped) or runs after the append (the append is erased).
+//
+// A carried receipt generation older than the lifetime's first generation belongs to an
+// earlier lifetime of the same session id, which is what a re-admitted session is, so it
+// is refused instead of being credited to the new history.
+func (c *MemoryRouteCache) historyWriteAllowedLocked(sessionID string, receiptGeneration uint64, receiptKnown bool) bool {
+	if c == nil || c.dnsRecords == nil || sessionID == "" {
+		return false
+	}
+	start, open := c.historyLifetimes[sessionID]
+	if !open {
+		return false
+	}
+	if receiptKnown && start != 0 && receiptGeneration < start {
+		return false
+	}
+	return true
+}
+
+// openHistoryLifetime records the lifetime a freshly received query belongs to, once per
+// lifetime. It is admitted only while the session still owns a route, and the admission
+// is re-fenced after the registration, so a retirement that interleaved with it removes
+// the entry it reopened instead of leaving history writable for a session that is gone.
+// Neither check runs under dnsRecordsMu: the route table takes the forwarder lock, which
+// sits above this cache's locks.
+func (c *MemoryRouteCache) openHistoryLifetime(sessionID string, receiptGeneration uint64, receiptKnown bool) {
+	if c == nil || sessionID == "" || !receiptKnown {
+		return
+	}
+	if c.registerHistoryLifetime(sessionID, receiptGeneration) {
+		// The lifetime is already open: a later receipt cannot raise its first generation,
+		// or a same-lifetime rekey would be refused as if it came from an older one.
+		return
+	}
+	// Re-fence the registration: a retirement that interleaved with it has already closed
+	// this lifetime, and reopening it must not leave history writable for a session that
+	// is gone.
+	if current, stillKnown := c.observedIncarnation(sessionID); stillKnown && current >= receiptGeneration {
+		return
+	}
+	c.dnsRecordsMu.Lock()
+	if start, still := c.historyLifetimes[sessionID]; still && start == receiptGeneration {
+		c.closeHistoryLifetimeLocked(sessionID)
+	}
+	c.dnsRecordsMu.Unlock()
+}
+
+// registerHistoryLifetime records the session's history lifetime if it has none and
+// reports whether one was already open. The caller holds no history lock.
+func (c *MemoryRouteCache) registerHistoryLifetime(sessionID string, receiptGeneration uint64) bool {
+	c.dnsRecordsMu.Lock()
+	defer c.dnsRecordsMu.Unlock()
+	if c.historyLifetimes == nil {
+		c.historyLifetimes = make(map[string]uint64)
+	}
+	if _, open := c.historyLifetimes[sessionID]; open {
+		return true
+	}
+	c.historyLifetimes[sessionID] = receiptGeneration
+	return false
+}
+
+// closeHistoryLifetimeLocked closes the session's history lifetime and erases the rows it
+// owned, as one step: a writer that appends under the same lock either ran before this
+// and is erased here, or runs after it and finds the lifetime closed. The caller holds
+// dnsRecordsMu for writing.
+func (c *MemoryRouteCache) closeHistoryLifetimeLocked(sessionID string) {
+	delete(c.historyLifetimes, sessionID)
+	if c.dnsRecords != nil {
+		c.dnsRecords.RetireSession(sessionID)
+	}
 }
 
 func (c *MemoryRouteCache) ObserveDNSQueryEvent(event gatewaydns.QueryEvent) {
-	ledger := c.DNSLedger()
-	if ledger == nil || event.SessionID == "" {
+	if c == nil || event.SessionID == "" {
 		return
 	}
-	ledger.RecordEvent(dnsledger.InputEvent{
+	// Read before the history lock: the matcher has its own lock, and the history lock is
+	// never held while acquiring another component's lock.
+	policyGeneration := answerSnapshotGeneration(c)
+	c.dnsRecordsMu.Lock()
+	defer c.dnsRecordsMu.Unlock()
+	// The terminal event is the last write of a query whose reply was already delivered,
+	// so it can run after the session retired. The lifetime the query was received under
+	// is the authority here: once it is closed, this row is dropped rather than
+	// recreating history for a session that no longer exists.
+	if !c.historyWriteAllowedLocked(event.SessionID, event.RouteGeneration, event.IncarnationKnown) {
+		return
+	}
+	c.dnsRecords.RecordEvent(dnsledger.InputEvent{
 		SessionID:            event.SessionID,
 		RouteGeneration:      event.RouteGeneration,
 		RouteGenerationKnown: event.IncarnationKnown,
@@ -547,7 +663,7 @@ func (c *MemoryRouteCache) ObserveDNSQueryEvent(event gatewaydns.QueryEvent) {
 		Delivered:            event.Delivered,
 		ReceivedAt:           event.ReceivedAt,
 		AnsweredAt:           event.AnsweredAt,
-		PolicyGeneration:     answerSnapshotGeneration(c),
+		PolicyGeneration:     policyGeneration,
 	}, event.ReceivedAt)
 }
 
@@ -675,11 +791,14 @@ func (c *MemoryRouteCache) RetireSessionScope(sessionID string) {
 	if sc := c.SessionScope(sessionID); sc != nil {
 		sc.Invalidate()
 	}
-	// The observation history is released in the same call as the scope: a
-	// retired session leaves no browsing record behind.
-	if ledger := c.DNSLedger(); ledger != nil {
-		ledger.RetireSession(sessionID)
-	}
+	// The observation history is released in the same critical section that closes the
+	// session's history lifetime. A publication still in flight therefore either finds
+	// the lifetime already closed and drops its row, or appended before this point and is
+	// erased here; either ordering leaves no history behind. A closed lifetime keeps no
+	// entry, so this records no tombstone and re-admission opens a fresh lifetime.
+	c.dnsRecordsMu.Lock()
+	c.closeHistoryLifetimeLocked(sessionID)
+	c.dnsRecordsMu.Unlock()
 	if runtime := c.sessionRuntime(); runtime != nil {
 		runtime.RetireSessionRuntime(sessionID)
 	}
