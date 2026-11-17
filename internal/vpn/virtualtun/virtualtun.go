@@ -85,6 +85,17 @@ import (
 )
 
 const (
+	// DefaultMTU is the plaintext MTU of the client-facing VPN dataplane: the
+	// largest IPv4 packet the portal client device accepts for injection, and
+	// therefore the largest packet any return path may deliver.
+	//
+	// It has two consumers that must never disagree, so it exists once:
+	//   - the ingress engine configures the portal VirtualTUN with it;
+	//   - the direct WAN return path splits an oversized reply into pieces no
+	//     longer than it, because a single piece above the MTU is refused by
+	//     the device exactly like the frame it came from would be.
+	DefaultMTU = 1420
+
 	// DefaultInboundCapacity is the default buffer capacity for inbound
 	// packets (2048), sized to absorb bursty upload traffic without drops
 	// (issue #160). tunnel.DefaultVirtualTUNInboundCapacity re-exports it.

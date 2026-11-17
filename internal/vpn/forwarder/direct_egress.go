@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
 )
 
 var (
@@ -798,23 +800,67 @@ func (m *DirectEgressManager) HandleWANReply(packet []byte) error {
 		return ErrReturnPathClosed
 	}
 
+	// A reply larger than the client's plaintext MTU cannot be delivered whole:
+	// the client device refuses it, so before segmentation the whole frame was
+	// discarded and the remote endpoint retransmitted into the same wall. Such a
+	// frame is split into client-MTU-sized TCP pieces here, ahead of queue
+	// admission, so each piece is admitted and delivered on its own.
+	//
+	// Placement is deliberate. Every frame, NAT, session and ownership check above
+	// ran on the frame that actually arrived, so splitting can never admit a reply
+	// those checks would refuse, and a frame whose shape cannot be split safely
+	// falls through to the pre-existing path and outcome below.
+	if proto == 6 && len(packet) > virtualtun.DefaultMTU {
+		segments, segErr := segmentWANReplyTCP(packet, virtualtun.DefaultMTU)
+		if segErr == nil && len(segments) > 1 {
+			return m.deliverSegmentedWANReply(ihl, entry, segments)
+		}
+	}
+
 	pktLen := int64(len(packet))
 	reply := applyDNAT(packet, ihl, proto, entry.clientIP, entry.clientPort)
-
-	if m.fwd != nil {
-		if err := m.fwd.DeliverDirectWANReply(entry.peerKey, entry.sessionID, entry.generation, entry.returnPath, reply); err != nil {
-			m.directDrops.Add(1)
-			return err
-		}
-	} else {
-		if err := entry.returnPath.WritePacket(entry.peerKey, entry.clientIP.String(), reply); err != nil {
-			m.directDrops.Add(1)
-			return err
-		}
+	if err := m.deliverDirectReply(entry, reply); err != nil {
+		m.directDrops.Add(1)
+		return err
 	}
 
 	m.directBytes.Add(pktLen)
 	return nil
+}
+
+// deliverSegmentedWANReply delivers the pieces of one oversized reply. Each piece
+// is DNATed and admitted on its own, so the route/session/generation, queue and
+// rate-limit checks see exactly the packets the client will receive.
+func (m *DirectEgressManager) deliverSegmentedWANReply(ihl int, entry natEntry, segments [][]byte) error {
+	var firstErr error
+	var delivered int64
+	for _, segment := range segments {
+		reply := applyDNAT(segment, ihl, 6, entry.clientIP, entry.clientPort)
+		if err := m.deliverDirectReply(entry, reply); err != nil {
+			// The refused piece is counted once here and once by the forwarder's
+			// own reason counter at the rejection site. The frame it came from is
+			// not counted again, so no packet is counted twice. Delivery continues
+			// because the remaining pieces belong to a byte stream the client can
+			// still acknowledge, and dropping them would widen one loss into many.
+			m.directDrops.Add(1)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		delivered += int64(len(reply))
+	}
+	// Bytes are counted as delivered, never as the parent frame plus its pieces.
+	m.directBytes.Add(delivered)
+	return firstErr
+}
+
+// deliverDirectReply hands one already-DNATed reply to the peer that owns it.
+func (m *DirectEgressManager) deliverDirectReply(entry natEntry, reply []byte) error {
+	if m.fwd != nil {
+		return m.fwd.DeliverDirectWANReply(entry.peerKey, entry.sessionID, entry.generation, entry.returnPath, reply)
+	}
+	return entry.returnPath.WritePacket(entry.peerKey, entry.clientIP.String(), reply)
 }
 
 // Close terminates direct egress background routines and closes resources.

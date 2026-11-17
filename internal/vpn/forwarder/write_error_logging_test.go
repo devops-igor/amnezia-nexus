@@ -73,6 +73,11 @@ func TestPumpClientQueueLogsWriteErrors(t *testing.T) {
 	defer log.SetOutput(os.Stderr)
 
 	pkt := ipv4Packet([4]byte{10, 100, 0, 3})
+	// The throttle's unit is a wall-clock second (production stores
+	// writeErrLogUntil = now+1s after each emitted line), so every bound below is
+	// derived from the burst's measured duration rather than from a fixed total
+	// that would silently assume a fast, unloaded runner.
+	burstStart := time.Now()
 	const n = 5
 	// The 8-slot client queue plus a possibly-lagging pump means ErrQueueFull
 	// drops are expected and BY DESIGN under a tight burst; keep sending until
@@ -105,12 +110,12 @@ func TestPumpClientQueueLogsWriteErrors(t *testing.T) {
 		t.Fatalf("write-error log must identify the peer, got: %q", logs)
 	}
 
-	// Throttle: a tight burst must produce a bounded number of lines
-	// (~1/sec), not one per packet. Keep feeding until 60 more writes were
-	// attempted (queue-full drops are by-design under bursts); allow up to
-	// 5 lines for a loaded runner where Phase 1's initial emission plus
-	// crossing up to 3 second-boundaries under CPU scheduling allows up to
-	// 4-5 lines for 65 packets.
+	// Throttle: a tight burst must produce a bounded number of lines (~1/sec),
+	// not one per packet. The bound follows the measured burst duration because
+	// that is the throttle's own unit: one line per distinct wall-clock second.
+	// A burst that a loaded or race-instrumented runner stretches across more
+	// seconds legitimately emits one more line per second it touched, and a fixed
+	// total would fail such a run while the throttle was working correctly.
 	for i := 0; i < 300 && dev.writeCount() < n+60; i++ {
 		_ = f.RouteBackendToClient(1, pkt, "10.100.0.3")
 		time.Sleep(2 * time.Millisecond)
@@ -120,7 +125,17 @@ func TestPumpClientQueueLogsWriteErrors(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	time.Sleep(200 * time.Millisecond)
-	if got := strings.Count(buf.String(), "return-path device write error"); got > 5 {
-		t.Fatalf("write-error logging not throttled: %d lines for %d packets", got, n+60)
+
+	elapsed := time.Since(burstStart)
+	got := strings.Count(buf.String(), "return-path device write error")
+	// A burst spanning E seconds can touch at most floor(E)+2 distinct one-second
+	// buckets: the bucket it started in, one per whole second thereafter, and the
+	// bucket it ended in when the end falls just past a boundary.
+	allowed := int(elapsed.Seconds()) + 2
+	t.Logf("write-error throttle: %d line(s) for %d attempted writes in %.2fs (one line per second allows at most %d)",
+		got, n+60, elapsed.Seconds(), allowed)
+	if got > allowed {
+		t.Fatalf("write-error logging not throttled: %d lines for %d packets in %.2fs; one line per second allows at most %d",
+			got, n+60, elapsed.Seconds(), allowed)
 	}
 }
