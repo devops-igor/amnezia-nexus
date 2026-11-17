@@ -231,6 +231,9 @@ func (l *Ledger) Record(in Input, now time.Time) bool {
 		l.stats.RejectedNoRoom++
 		return false
 	}
+	// Global eviction may have deleted this session's bucket when its last row was the
+	// victim, so the append below must go to the bucket the map can reach.
+	session = l.attachSessionLocked(in.SessionID, session)
 
 	session.records = append(session.records, built)
 	session.bytes += size
@@ -318,6 +321,21 @@ func sameObservation(a, b Record) bool {
 		return false
 	}
 	return sameAddresses(a.Addresses, b.Addresses)
+}
+
+// attachSessionLocked returns the authoritative bucket for a session, reattaching the
+// writer's bucket when eviction removed it. Eviction deletes a bucket only once it holds
+// nothing, so the detached bucket and the reattached one are the same empty bucket; the
+// point is that the row appended next is stored where every reader looks for it. Without
+// this, a write that evicted the incoming session's own last row would append to a
+// detached bucket: the row would be unreachable while the global counters still counted
+// it, and retirement could never refund it.
+func (l *Ledger) attachSessionLocked(sessionID string, session *sessionLog) *sessionLog {
+	if current := l.sessions[sessionID]; current != nil {
+		return current
+	}
+	l.sessions[sessionID] = session
+	return session
 }
 
 // pruneLocked removes aged records and keeps the counters in step.

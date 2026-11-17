@@ -181,6 +181,9 @@ func (l *Ledger) RecordEvent(in InputEvent, now time.Time) bool {
 		}
 		l.stats.Events.EvictedGlobal++
 	}
+	// Global eviction may have deleted this session's bucket when its last row was the
+	// victim, so the append below must go to the bucket the map can reach.
+	session = l.attachSessionLocked(in.SessionID, session)
 
 	session.events = append(session.events, built)
 	session.eventBytes += size
