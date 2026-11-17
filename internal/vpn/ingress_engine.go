@@ -121,7 +121,7 @@ func (s *Service) NewIngressEngine(ctx context.Context, tunName string, peers []
 
 	// The portal device's plaintext boundary: same MTU the listener uses,
 	// bounded queues from the virtualtun defaults.
-	cfg, err := clientawg.LoadConfig(ctx, db, virtualtun.Config{Name: tunName, MTU: 1420}, nil)
+	cfg, err := clientawg.LoadConfig(ctx, db, virtualtun.Config{Name: tunName, MTU: virtualtun.DefaultMTU}, nil)
 	if err != nil {
 		return nil, fmt.Errorf("ingress engine: load portal configuration: %w", err)
 	}
