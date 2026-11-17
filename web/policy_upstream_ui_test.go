@@ -34,73 +34,24 @@ import (
 	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
 )
 
-// upstreamTranslationFixture is the one definition of the English strings this
-// section needs. The keysets of the five shipped dictionaries are owned by the
-// deferred integration step; until then the fixture is the only place the module's
-// wording exists, and both the template and the controller are checked against it
-// so a key this section uses cannot be invented in only one of them.
-var upstreamTranslationFixture = map[string]string{
-	"policy_upstream_title":                      "Encrypted upstream DNS",
-	"policy_upstream_intro":                      "Choose which resolvers the gateway itself dials. This does not change the DNS servers written into generated client configurations.",
-	"policy_upstream_limit_note":                 "The resolver asks only the first two entries in this order. Up to three entries can be stored: the third is kept, shown, and not queried.",
-	"policy_upstream_defaults_notice":            "Built-in defaults (plain DNS, not encrypted)",
-	"policy_upstream_plain_warning":              "A plain DNS entry sends every query unencrypted to that resolver.",
-	"policy_upstream_mixed_warning":              "A plain entry after an encrypted one: when the encrypted resolver fails, queries continue in plaintext.",
-	"policy_upstream_client_config_notice":       "Generated client configurations keep their own DNS servers. This list only decides which resolvers the gateway dials while policy routing is on.",
-	"policy_upstream_not_queried_note":           "Not queried: the resolver asks only the first two entries in this order. This entry is stored and kept.",
-	"policy_upstream_enabled_save_notice":        "Saving re-downloads every list source, can fail because of them and is then rolled back, and clears client routing evidence until those flows resolve again.",
-	"policy_upstream_activation_save_notice":     "Policy routing is stored as enabled but is not running. Saving tries to start it, which downloads the list and installs the data path.",
-	"policy_upstream_needs_source":               "Choose and save a policy list source before saving a resolver list.",
-	"policy_upstream_col_address":                "Address",
-	"policy_upstream_col_port":                   "Port",
-	"policy_upstream_col_transport":              "Transport",
-	"policy_upstream_col_pin":                    "SPKI pin (optional)",
-	"policy_upstream_transport_plain":            "Plain DNS",
-	"policy_upstream_transport_dot":              "DNS over TLS",
-	"policy_upstream_transport_doh":              "DNS over HTTPS",
-	"policy_upstream_pin_hint":                   "Base64 SHA-256 of the resolver certificate's public key. Encrypted transports only.",
-	"policy_upstream_port_default_hint":          "Default 853 / 443",
-	"policy_upstream_add_btn":                    "Add resolver",
-	"policy_upstream_remove_btn":                 "Remove",
-	"policy_upstream_up_btn":                     "Move up",
-	"policy_upstream_down_btn":                   "Move down",
-	"policy_upstream_defaults_btn":               "Use built-in defaults",
-	"policy_upstream_save_btn":                   "Save resolvers",
-	"policy_upstream_saving":                     "Saving…",
-	"policy_upstream_reload_btn":                 "Reload",
-	"policy_upstream_saved":                      "Resolver list saved.",
-	"policy_upstream_save_failed":                "The resolver list was not saved",
-	"policy_upstream_save_refused":               "The editor was reloaded from the stored configuration.",
-	"policy_upstream_load_failed":                "Could not read the stored resolver list",
-	"policy_upstream_not_ready":                  "Saving waits for the stored resolver list to load.",
-	"policy_upstream_conflict":                   "Another change replaced the resolver list. The newer list is shown; save again to apply your edit.",
-	"policy_upstream_echo_mismatch":              "The server stored a different resolver list than the one sent",
-	"policy_upstream_state_inconsistent":         "Stored and running policy may disagree",
-	"policy_upstream_port_required":              "Plain DNS needs an explicit port.",
-	"policy_upstream_port_invalid":               "The port must be a whole number from 1 to 65535.",
-	"policy_upstream_address_required":           "An address is required.",
-	"policy_upstream_address_invalid_doh":        "A DNS over HTTPS entry is a host and a port; the resolver requests /dns-query itself.",
-	"policy_upstream_duplicate":                  "This resolver is already in the list.",
-	"policy_upstream_too_many":                   "A resolver list holds at most three entries.",
-	"policy_upstream_row_label":                  "Resolver {n}",
-	"policy_upstream_health_title":               "Resolver health (last observation)",
-	"policy_upstream_health_none":                "This deployment does not report resolver health.",
-	"policy_upstream_health_off":                 "No resolver health is available while policy routing is off.",
-	"policy_upstream_health_waiting":             "No resolver contact has been observed yet.",
-	"policy_upstream_health_last":                "Last resolver contacted: {upstream}",
-	"policy_upstream_health_not_in_list":         "Last resolver contacted: {upstream} (not in the current list; historical observation)",
-	"policy_upstream_health_failure":             "Last failure: {kind}.",
-	"policy_upstream_failure_timeout":            "timeout, no answer within the deadline",
-	"policy_upstream_failure_network":            "network error at the transport level",
-	"policy_upstream_failure_servfail":           "the resolver answered SERVFAIL",
-	"policy_upstream_failure_invalid_response":   "the reply did not match the query",
-	"policy_upstream_failure_tls_handshake":      "the TLS handshake failed",
-	"policy_upstream_failure_certificate":        "the certificate did not verify",
-	"policy_upstream_failure_pin_mismatch":       "the pinned public key did not match",
-	"policy_upstream_failure_http_status":        "an unexpected HTTP status",
-	"policy_upstream_failure_redirect":           "a redirect was not followed",
-	"policy_upstream_failure_content_type":       "an unexpected content type",
-	"policy_upstream_failure_response_too_large": "the response exceeded 65535 bytes",
+// upstreamTranslations loads the shipped English dictionary through the embedded
+// filesystem, i.e. the wording the page actually resolves. The module tests must not
+// carry a private copy of it: a key that is missing from the real dictionary has to
+// fail here, not in production.
+func upstreamTranslations(t *testing.T) map[string]string {
+	t.Helper()
+	raw, err := TranslationsFS.ReadFile("translations/en.json")
+	if err != nil {
+		t.Fatalf("read en.json: %v", err)
+	}
+	var dict map[string]string
+	if err := json.Unmarshal(raw, &dict); err != nil {
+		t.Fatalf("parse en.json: %v", err)
+	}
+	if len(dict) < 100 {
+		t.Fatalf("en.json parsed to %d keys; the extraction is wrong", len(dict))
+	}
+	return dict
 }
 
 // upstreamFailureKindTokens is the resolver's closed failure-kind set, as the
@@ -118,9 +69,10 @@ var upstreamFailureKindTokens = []string{
 // producing an empty label.
 func upstreamSectionHTMLForTest(t *testing.T) string {
 	t.Helper()
+	translations := upstreamTranslations(t)
 	funcs := template.FuncMap{
 		"_": func(key string) string {
-			if value, ok := upstreamTranslationFixture[key]; ok {
+			if value, ok := translations[key]; ok && strings.TrimSpace(value) != "" {
 				return value
 			}
 			return "MISSING:" + key
@@ -170,7 +122,7 @@ func upstreamHarness(t *testing.T, prelude, scenario string) string {
 	if err != nil {
 		t.Fatalf("encode section: %v", err)
 	}
-	dict, err := json.Marshal(upstreamTranslationFixture)
+	dict, err := json.Marshal(upstreamTranslations(t))
 	if err != nil {
 		t.Fatalf("encode translations: %v", err)
 	}
@@ -268,10 +220,11 @@ func runUpstreamScenario(t *testing.T, prelude, scenario string) string {
 	return string(out)
 }
 
-// TestPolicyUpstreamSectionUsesFixtureKeysOnly pins the two consumers of the
-// wording: every template key and every runtime key the controller can resolve
-// must exist in the fixture that the integration step will ship.
-func TestPolicyUpstreamSectionUsesFixtureKeysOnly(t *testing.T) {
+// TestPolicyUpstreamSectionUsesShippedDictionaryKeys pins the two consumers of the
+// wording: every template key and every runtime key the controller can resolve must
+// exist in the shipped English dictionary.
+func TestPolicyUpstreamSectionUsesShippedDictionaryKeys(t *testing.T) {
+	dict := upstreamTranslations(t)
 	partial, err := TemplatesFS.ReadFile("templates/settings_policy_upstream.html")
 	if err != nil {
 		t.Fatalf("read settings_policy_upstream.html: %v", err)
@@ -288,8 +241,8 @@ func TestPolicyUpstreamSectionUsesFixtureKeysOnly(t *testing.T) {
 			t.Errorf("the section uses key %q outside its own namespace", key)
 			continue
 		}
-		if strings.TrimSpace(upstreamTranslationFixture[key]) == "" {
-			t.Errorf("translation fixture does not define %q used by the section template", key)
+		if strings.TrimSpace(dict[key]) == "" {
+			t.Errorf("en.json does not define %q used by the section template", key)
 		}
 	}
 
@@ -313,14 +266,14 @@ func TestPolicyUpstreamSectionUsesFixtureKeysOnly(t *testing.T) {
 				continue
 			}
 			for _, kind := range upstreamFailureKindTokens {
-				if strings.TrimSpace(upstreamTranslationFixture[key+kind]) == "" {
-					t.Errorf("translation fixture does not define %q for failure kind %q", key+kind, kind)
+				if strings.TrimSpace(dict[key+kind]) == "" {
+					t.Errorf("en.json does not define %q for failure kind %q", key+kind, kind)
 				}
 			}
 			continue
 		}
-		if strings.TrimSpace(upstreamTranslationFixture[key]) == "" {
-			t.Errorf("translation fixture does not define %q used by the controller", key)
+		if strings.TrimSpace(dict[key]) == "" {
+			t.Errorf("en.json does not define %q used by the controller", key)
 		}
 	}
 	if len(seen) < 15 {

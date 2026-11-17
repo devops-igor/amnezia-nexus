@@ -24,6 +24,7 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/json"
 	"html/template"
 	"regexp"
 	"strings"
@@ -193,24 +194,134 @@ func TestSettingsPolicyUpstreamTemplate(t *testing.T) {
 	})
 }
 
-// TestSettingsPageDoesNotYetRenderUpstreamEditor states the deferral instead of
-// leaving it implicit: the shipped settings page is produced by a loader that does
-// not parse the new partial and a layout that does not include the section, so the
-// page integration is NOT tested by this checkpoint.
-//
-// This test is the trigger for the integration step: when the include, the loader
-// registration and the dictionaries land, it must be replaced by page-level
-// assertions (admin render contains the card and resolves every key, support render
-// contains neither) rather than deleted.
-func TestSettingsPageDoesNotYetRenderUpstreamEditor(t *testing.T) {
-	body := renderSettingsPage(t, models.RoleAdmin)
-	if !strings.Contains(body, `id="policyRoutingCard"`) {
-		t.Fatal("the shipped settings page no longer renders the policy section; the fixture is wrong")
+// TestSettingsPageRendersUpstreamEditor is the shipped-page assertion that replaces
+// the deliberate not-yet-wired check from the module checkpoint: the real settings
+// page handler now renders the card and loads the controller for an administrator,
+// and a support operator receives neither.
+func TestSettingsPageRendersUpstreamEditor(t *testing.T) {
+	adminBody := renderSettingsPage(t, models.RoleAdmin)
+	for _, token := range []string{
+		`id="policyRoutingCard"`,
+		`id="policyUpstreamCard"`,
+		`id="policyUpstreamForm"`,
+		`data-upstream-ready="false"`,
+		`id="policyUpstreamRowTemplate"`,
+		`id="policyUpstreamSaveBtn"`,
+		`src="/static/js/policy_upstream.js"`,
+	} {
+		if !strings.Contains(adminBody, token) {
+			t.Errorf("admin settings page is missing %q", token)
+		}
 	}
-	if strings.Contains(body, `id="policyUpstreamCard"`) {
-		t.Error("the shipped settings page already renders the upstream editor; replace this test with the page-level integration assertions")
+	if got := strings.Count(adminBody, `src="/static/js/policy_upstream.js"`); got != 1 {
+		t.Errorf("admin settings page loads the upstream controller %d times, want exactly 1", got)
 	}
-	if strings.Contains(body, `/static/js/policy_upstream.js`) {
-		t.Error("the shipped settings page already loads the upstream controller; replace this test with the page-level integration assertions")
+
+	supportBody := renderSettingsPage(t, models.RoleSupport)
+	for _, forbidden := range []string{
+		`id="policyUpstreamCard"`,
+		`id="policyUpstreamForm"`,
+		`/static/js/policy_upstream.js`,
+	} {
+		if strings.Contains(supportBody, forbidden) {
+			t.Errorf("support operator's settings page contains %q", forbidden)
+		}
+	}
+}
+
+// upstreamFailureKinds is the resolver's closed failure-kind set, as the backend
+// defines it. The controller resolves each token through the dictionary.
+var upstreamFailureKinds = []string{
+	"timeout", "network", "servfail", "invalid_response", "tls_handshake",
+	"certificate", "pin_mismatch", "http_status", "redirect", "content_type",
+	"response_too_large",
+}
+
+// TestUpstreamSectionTranslationKeysInEveryLocale pins every key the section needs
+// against the five shipped dictionaries, read through the real embedded files. It
+// covers the template's keys and the controller's runtime keys, so a key cannot be
+// added to one consumer and forgotten in the dictionaries.
+func TestUpstreamSectionTranslationKeysInEveryLocale(t *testing.T) {
+	partial, err := web.TemplatesFS.ReadFile("templates/settings_policy_upstream.html")
+	if err != nil {
+		t.Fatalf("read settings_policy_upstream.html: %v", err)
+	}
+	keys := map[string]bool{}
+	for _, chunk := range strings.Split(string(partial), `{{ _ "`)[1:] {
+		key := chunk
+		if idx := strings.Index(key, `"`); idx >= 0 {
+			key = key[:idx]
+		}
+		if !strings.HasPrefix(key, "policy_upstream_") {
+			t.Errorf("the section uses key %q outside its own namespace", key)
+			continue
+		}
+		keys[key] = true
+	}
+	if len(keys) < 20 {
+		t.Fatalf("found only %d upstream translation keys in the partial; the extraction is wrong", len(keys))
+	}
+
+	module, err := web.StaticFS.ReadFile("static/js/policy_upstream.js")
+	if err != nil {
+		t.Fatalf("read upstream controller: %v", err)
+	}
+	lookup := regexp.MustCompile(`'policy_upstream_[a-z0-9_]*'`)
+	runtimeKeys := map[string]bool{}
+	for _, match := range lookup.FindAllString(string(module), -1) {
+		key := strings.Trim(match, "'")
+		if strings.HasSuffix(key, "_") {
+			if key != "policy_upstream_failure_" {
+				t.Errorf("controller builds keys with the unhandled prefix %q", key)
+				continue
+			}
+			for _, kind := range upstreamFailureKinds {
+				runtimeKeys[key+kind] = true
+			}
+			continue
+		}
+		runtimeKeys[key] = true
+	}
+	if len(runtimeKeys) < 15 {
+		t.Fatalf("found only %d controller keys; the extraction is wrong", len(runtimeKeys))
+	}
+	for key := range runtimeKeys {
+		keys[key] = true
+	}
+
+	locales := []string{"en.json", "ru.json", "fr.json", "fa.json", "zh.json"}
+	dicts := make(map[string]map[string]string, len(locales))
+	for _, locale := range locales {
+		raw, err := web.TranslationsFS.ReadFile("translations/" + locale)
+		if err != nil {
+			t.Fatalf("read %s: %v", locale, err)
+		}
+		var dict map[string]string
+		if err := json.Unmarshal(raw, &dict); err != nil {
+			t.Fatalf("parse %s: %v", locale, err)
+		}
+		dicts[locale] = dict
+	}
+	for _, locale := range locales {
+		for key := range keys {
+			value, ok := dicts[locale][key]
+			if !ok {
+				t.Errorf("%s is missing key %q used by the upstream section", locale, key)
+				continue
+			}
+			if strings.TrimSpace(value) == "" {
+				t.Errorf("%s has an empty value for %q", locale, key)
+			}
+		}
+	}
+
+	// The dictionaries must carry real translations, not the English text copied
+	// across: the three non-Latin locales are the ones a copy-paste would show up in.
+	for _, key := range []string{"policy_upstream_title", "policy_upstream_not_queried_note", "policy_upstream_too_many"} {
+		for _, locale := range []string{"ru.json", "fa.json", "zh.json"} {
+			if dicts[locale][key] == dicts["en.json"][key] {
+				t.Errorf("%s key %q is the English text copied across, not a translation", locale, key)
+			}
+		}
 	}
 }
