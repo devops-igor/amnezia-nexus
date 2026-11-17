@@ -49,7 +49,12 @@ func TestClientDiagnosisReportsBackendWriteFailure(t *testing.T) {
 			t.Fatalf("ClientDiagnosis: %v", err)
 		}
 		flow = findFlowEvidence(t, answer.Flows.Entries, "8.8.4.4", 443)
-		if flow.Forward.BackendWriteFailed > 0 {
+		// The failure count and its reason are independent atomics: the producer
+		// increments the count and only then stores the token, so one snapshot can
+		// report the count with the token still empty. Wait for the settled pair the
+		// assertions below describe, not for the count alone, or a reschedule between
+		// the two publications fails this control with an empty token.
+		if flow.Forward.BackendWriteFailed > 0 && flow.Forward.BackendWriteFailure != "" {
 			break
 		}
 		time.Sleep(2 * time.Millisecond)
