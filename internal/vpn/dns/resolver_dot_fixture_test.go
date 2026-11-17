@@ -136,13 +136,17 @@ func randomSerial(t *testing.T) *big.Int {
 type dotTestServer struct {
 	addr    netip.AddrPort
 	sniSeen chan string
+	// pair is the TCP/UDP port pair this server owns, so a caller that needs a
+	// plaintext oracle on the same number can use its UDP half.
+	pair *loopbackPortPair
 }
 
 // startDoTTestServer serves DNS over TLS with the given certificate.
 func startDoTTestServer(t *testing.T, certificate tls.Certificate, handler mdns.Handler) *dotTestServer {
 	t.Helper()
 	sniSeen := make(chan string, 8)
-	listener, err := tls.Listen("tcp4", "127.0.0.1:0", &tls.Config{
+	pair := newLoopbackPortPair(t)
+	listener := tls.NewListener(pair.tcp, &tls.Config{
 		Certificates: []tls.Certificate{certificate},
 		MinVersion:   tls.VersionTLS12,
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
@@ -153,13 +157,10 @@ func startDoTTestServer(t *testing.T, certificate tls.Certificate, handler mdns.
 			return nil, nil
 		},
 	})
-	if err != nil {
-		t.Fatalf("listen DoT: %v", err)
-	}
 	server := &mdns.Server{Listener: listener, Handler: handler}
 	go func() { _ = server.ActivateAndServe() }()
 	t.Cleanup(func() { _ = server.Shutdown() })
-	return &dotTestServer{addr: netip.MustParseAddrPort(listener.Addr().String()), sniSeen: sniSeen}
+	return &dotTestServer{addr: pair.addr(), sniSeen: sniSeen, pair: pair}
 }
 
 // startBrokenTLSListener accepts TCP and answers with bytes that are not a TLS
@@ -170,6 +171,14 @@ func startBrokenTLSListener(t *testing.T) netip.AddrPort {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	return startBrokenTLSListenerOn(t, listener)
+}
+
+// startBrokenTLSListenerOn serves the non-TLS peer on an already-reserved
+// listener, so a scenario that also needs the same number for plaintext UDP can
+// own one port pair instead of binding the number twice.
+func startBrokenTLSListenerOn(t *testing.T, listener net.Listener) netip.AddrPort {
+	t.Helper()
 	t.Cleanup(func() { _ = listener.Close() })
 	go func() {
 		for {
@@ -216,15 +225,13 @@ func startStalledTLSListener(t *testing.T) netip.AddrPort {
 	return netip.MustParseAddrPort(listener.Addr().String())
 }
 
-// startPlaintextResponder answers plaintext UDP DNS on addr and counts every
-// query it receives: it is the oracle for "did a DoT entry leak a plaintext
-// query?".
-func startPlaintextResponder(t *testing.T, addr netip.AddrPort, answerIP string) *atomic.Int32 {
+// startPlaintextResponder answers plaintext UDP DNS on conn and counts every query
+// it receives: it is the oracle for "did an encrypted entry leak a plaintext
+// query?". conn is the UDP half of the fixture's port pair, already held on the
+// same number the encrypted listener uses, so no second bind of that number can
+// fail in setup.
+func startPlaintextResponder(t *testing.T, conn net.PacketConn, answerIP string) *atomic.Int32 {
 	t.Helper()
-	conn, err := net.ListenPacket("udp4", addr.String())
-	if err != nil {
-		t.Fatalf("listen plaintext UDP on %s: %v", addr, err)
-	}
 	hits := &atomic.Int32{}
 	answer := answerHandler(t, answerIP)
 	server := &mdns.Server{PacketConn: conn, Handler: mdns.HandlerFunc(func(w mdns.ResponseWriter, req *mdns.Msg) {
