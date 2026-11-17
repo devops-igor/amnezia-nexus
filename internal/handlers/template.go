@@ -117,6 +117,7 @@ func (te *TemplateEngine) ReloadTemplates() error {
 	// at execution time, and a define that no page uses costs nothing.
 	layoutPartials := []string{
 		"settings_policy.html",
+		"settings_notifications.html",
 	}
 
 	fresh := make(map[string]*template.Template)

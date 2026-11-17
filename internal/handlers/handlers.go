@@ -27,6 +27,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/xray"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/notifications"
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 	"github.com/devops-igor/amnezia-nexus/internal/service/upstream"
 	"github.com/devops-igor/amnezia-nexus/internal/service/userops"
@@ -46,36 +47,38 @@ type UpstreamChecker interface {
 
 // Dependencies holds all runtime dependencies required by the HTTP handlers.
 type Dependencies struct {
-	Config          *config.Config
-	DB              *database.DB
-	Registry        *manager.Registry
-	SSHPool         SSHPoolProvider
-	AWGManager      *awg.AWGManager
-	MTProxyLManager *mtproxyl.MTProxyLManager
-	DNSManager      *dns.DNSManager
-	XrayManager     *xray.XrayManager
-	NaiveManager    *naive.NaiveManager
-	VPNService      *vpn.Service
-	UpstreamService UpstreamChecker
-	GigahostClient  gigahost.Client
-	UpdaterService  *updater.ReleaseChecker
+	Config              *config.Config
+	DB                  *database.DB
+	Registry            *manager.Registry
+	SSHPool             SSHPoolProvider
+	AWGManager          *awg.AWGManager
+	MTProxyLManager     *mtproxyl.MTProxyLManager
+	DNSManager          *dns.DNSManager
+	XrayManager         *xray.XrayManager
+	NaiveManager        *naive.NaiveManager
+	VPNService          *vpn.Service
+	UpstreamService     UpstreamChecker
+	GigahostClient      gigahost.Client
+	UpdaterService      *updater.ReleaseChecker
+	NotificationService *notifications.Service
 }
 
 // Handlers encapsulates all HTTP route handlers and business logic.
 type Handlers struct {
-	cfg            *config.Config
-	db             *database.DB
-	registry       *manager.Registry
-	sshPool        SSHPoolProvider
-	awgMgr         *awg.AWGManager
-	mtproxylMgr    *mtproxyl.MTProxyLManager
-	dnsMgr         *dns.DNSManager
-	xrayMgr        *xray.XrayManager
-	naiveMgr       *naive.NaiveManager
-	vpnSvc         *vpn.Service
-	upstreamSvc    UpstreamChecker
-	gigahostClient gigahost.Client
-	gigahostMu     sync.RWMutex
+	cfg             *config.Config
+	db              *database.DB
+	registry        *manager.Registry
+	sshPool         SSHPoolProvider
+	awgMgr          *awg.AWGManager
+	mtproxylMgr     *mtproxyl.MTProxyLManager
+	dnsMgr          *dns.DNSManager
+	xrayMgr         *xray.XrayManager
+	naiveMgr        *naive.NaiveManager
+	vpnSvc          *vpn.Service
+	upstreamSvc     UpstreamChecker
+	notificationSvc *notifications.Service
+	gigahostClient  gigahost.Client
+	gigahostMu      sync.RWMutex
 	// purchaseMu serializes the duplicate-purchase check with the durable intent
 	// row that makes its decision visible, so two concurrent order attempts cannot
 	// both pass the check. It is deliberately released before the provider call:
@@ -160,19 +163,24 @@ func (h *Handlers) lockServerHost(serverID int64) func() {
 // NewHandlers creates a new Handlers instance with provided dependencies.
 func NewHandlers(deps Dependencies) *Handlers {
 	h := &Handlers{
-		cfg:            deps.Config,
-		db:             deps.DB,
-		registry:       deps.Registry,
-		sshPool:        deps.SSHPool,
-		awgMgr:         deps.AWGManager,
-		mtproxylMgr:    deps.MTProxyLManager,
-		dnsMgr:         deps.DNSManager,
-		xrayMgr:        deps.XrayManager,
-		naiveMgr:       deps.NaiveManager,
-		vpnSvc:         deps.VPNService,
-		upstreamSvc:    deps.UpstreamService,
-		gigahostClient: deps.GigahostClient,
-		updaterSvc:     deps.UpdaterService,
+		cfg:             deps.Config,
+		db:              deps.DB,
+		registry:        deps.Registry,
+		sshPool:         deps.SSHPool,
+		awgMgr:          deps.AWGManager,
+		mtproxylMgr:     deps.MTProxyLManager,
+		dnsMgr:          deps.DNSManager,
+		xrayMgr:         deps.XrayManager,
+		naiveMgr:        deps.NaiveManager,
+		vpnSvc:          deps.VPNService,
+		upstreamSvc:     deps.UpstreamService,
+		notificationSvc: deps.NotificationService,
+		gigahostClient:  deps.GigahostClient,
+		updaterSvc:      deps.UpdaterService,
+	}
+
+	if h.notificationSvc == nil && h.db != nil {
+		h.notificationSvc = notifications.NewService(h.db, notifications.Options{})
 	}
 
 	if h.updaterSvc == nil {
@@ -206,6 +214,12 @@ func NewHandlers(deps Dependencies) *Handlers {
 	}
 
 	return h
+}
+
+// NotificationService returns the shared notification engine. The panel
+// supervisor runs the same instance as a background dispatcher.
+func (h *Handlers) NotificationService() *notifications.Service {
+	return h.notificationSvc
 }
 
 // UpstreamService returns the upstream service checker.

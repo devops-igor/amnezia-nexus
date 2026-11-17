@@ -94,7 +94,7 @@
                 </div>
             </form>
         </div>
-
+        {{ template "settings_notifications" . }}
         <!-- BLOCK 4: SSL / HTTPS -->
         <div class="card settings-section-card">
             <div class="settings-card-header">
@@ -420,6 +420,7 @@
     </button>
 </div>
 
+<script src="/static/js/notifications_settings.js?v={{ .app_version }}"></script>
 <script src="/static/js/gigahost_catalog_status.js"></script>
 <script src="/static/js/gigahost_setup.js"></script>
 <script src="/static/js/gigahost_setup_intents.js"></script>

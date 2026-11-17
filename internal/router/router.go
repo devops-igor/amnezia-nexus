@@ -310,6 +310,16 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			r.Post("/orders/{order_id}/setup-host-confirmation", h.GigahostSetupConfirmHostHandler)
 		})
 
+		// Portal notification settings and history (epic #785 phase 1).
+		// Admin-only for every verb: a support role must not read the
+		// destination/history or trigger an outbound test.
+		r.Route("/api/notifications", func(r chi.Router) {
+			r.Get("/settings", h.GetNotificationSettingsHandler)
+			r.Post("/settings", h.SaveNotificationSettingsHandler)
+			r.Post("/test", h.TestNotificationHandler)
+			r.Get("/history", h.GetNotificationHistoryHandler)
+		})
+
 		// Policy routing settings and status (#678). Admin-only for every
 		// verb including the reads: roles without admin must not be able to
 		// read or mutate policy configuration.

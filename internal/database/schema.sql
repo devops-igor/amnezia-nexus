@@ -177,7 +177,57 @@ CREATE TABLE IF NOT EXISTS peer_lifecycle (
     UNIQUE(server_id, protocol, client_id)
 );
 
+-- Portal notification events and durable delivery outbox (epic #785 phase 1).
+-- Events are producer facts; deliveries are independent retry state so a
+-- restart can resume an unfinished attempt without duplicating the event.
+CREATE TABLE IF NOT EXISTS notification_events (
+    id TEXT PRIMARY KEY,
+    event_key TEXT NOT NULL UNIQUE,
+    incident_id TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    entity_type TEXT NOT NULL DEFAULT '',
+    entity_id TEXT NOT NULL DEFAULT '',
+    transition TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '',
+    recovery INTEGER NOT NULL DEFAULT 0,
+    occurred_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 6,
+    next_attempt_at TEXT NOT NULL,
+    last_error TEXT NOT NULL DEFAULT '',
+    last_http_status INTEGER NOT NULL DEFAULT 0,
+    force INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    delivered_at TEXT,
+    FOREIGN KEY (event_id) REFERENCES notification_events(id) ON DELETE CASCADE
+);
+
+-- Durable producer observation state. Transition detection must survive a
+-- restart, and a missing in-memory cache is not evidence of an outage.
+CREATE TABLE IF NOT EXISTS notification_producer_state (
+    producer TEXT NOT NULL,
+    entity_key TEXT NOT NULL,
+    state TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (producer, entity_key)
+);
+
 -- Indexes
+CREATE INDEX IF NOT EXISTS idx_notification_events_occurred ON notification_events(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_notification_events_incident ON notification_events(incident_id, event_type);
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_due ON notification_deliveries(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_user_connections_user_id ON user_connections(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_connections_server_id ON user_connections(server_id);
 CREATE INDEX IF NOT EXISTS idx_user_connections_client_id ON user_connections(client_id);

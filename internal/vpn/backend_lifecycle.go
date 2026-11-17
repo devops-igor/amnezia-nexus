@@ -162,6 +162,23 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 		if len(migrations) > 0 && s.sessionMgr != nil {
 			s.sessionMgr.BumpLifecycleVersion()
 		}
+		// Report only outcomes that moved or stranded sessions. A manual
+		// disable with no pinned sessions is routine and must stay quiet.
+		if failover != nil && (len(failover.Migrations) > 0 || len(failover.Skipped) > 0) {
+			decision := "success"
+			if len(failover.Skipped) > 0 {
+				decision = "partial"
+			}
+			s.notifyFailoverOutcome(models.FailoverOutcome{
+				SourceTunnelID: tunnel.ID,
+				SourceServerID: tunnel.ServerID,
+				Protocol:       tunnel.Protocol,
+				Decision:       decision,
+				Migrated:       len(failover.Migrations),
+				Stranded:       len(failover.Skipped),
+				Manual:         true,
+			})
+		}
 	}
 
 	return nil
