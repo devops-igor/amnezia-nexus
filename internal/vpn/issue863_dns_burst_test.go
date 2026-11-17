@@ -280,16 +280,23 @@ func (e *issue863Env) addSession(idx int) (sid, peer string, ip netip.Addr, clie
 
 func (e *issue863Env) sendQuery(peer string, ip netip.Addr, id uint16, name string, qtype uint16) {
 	e.t.Helper()
+	issue863SendUDPQuery(e.t, e.fwd, peer, ip, id, name, qtype)
+}
+
+// issue863SendUDPQuery injects one client UDP DNS query for the gateway address
+// through the production forwarder entry point.
+func issue863SendUDPQuery(t *testing.T, fwd *forwarder.Forwarder, peer string, ip netip.Addr, id uint16, name string, qtype uint16) {
+	t.Helper()
 	query := new(mdns.Msg)
 	query.SetQuestion(name, qtype)
 	query.Id = id
 	body, err := query.Pack()
 	if err != nil {
-		e.t.Fatalf("pack query %s: %v", name, err)
+		t.Fatalf("pack query %s: %v", name, err)
 	}
 	packet := buildTestPBRUDPPacket(ip, netip.MustParseAddr("10.100.0.1"), 40000+id, 53, body)
-	if err := e.fwd.RouteClientToBackend(peer, packet); err != nil {
-		e.t.Fatalf("RouteClientToBackend(%s): %v", name, err)
+	if err := fwd.RouteClientToBackend(peer, packet); err != nil {
+		t.Fatalf("RouteClientToBackend(%s): %v", name, err)
 	}
 }
 
@@ -1087,4 +1094,163 @@ func TestIssue863_PolicyStatusReportsRefusalCauses(t *testing.T) {
 			t.Fatalf("panel accounting did not restart with the data path: %+v", reset)
 		}
 	})
+}
+
+// TestIssue863_ContinuityMixedTCPAndUDPProducers drives the continuity responder
+// that serves issued profiles while policy routing is off. Its producer set is the
+// same shape as the intercepted path's: four plain-UDP workers plus up to
+// MaxTCPSessions TCP connections, one query in flight per connection. A session
+// that presents the whole UDP pool while many TCP queries are inside their
+// upstream exchange must still be admitted, so the same producer-bound rule has to
+// reach this gateway too; otherwise the panel refuses a supported burst with a
+// SERVFAIL that never reached the upstream.
+func TestIssue863_ContinuityMixedTCPAndUDPProducers(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer func() { releaseOnce.Do(func() { close(release) }) }()
+	up := issue863StartUpstream(t, 0, release)
+
+	gwDNS := netip.MustParseAddr("10.100.0.1")
+	fwd := forwarder.NewForwarder(nil, "10.100.0.0/16", 256)
+	fwd.AttachBackendDevice(1, &mockPBRDevice{})
+	svc := &Service{forwarder: fwd}
+	upstreams := []policy.Upstream{{
+		Address:   up.addr.Addr().String(),
+		Port:      int(up.addr.Port()),
+		Transport: policy.TransportPlain,
+	}}
+
+	// The continuity responder dials the operator's upstream list; this fixture
+	// reaches a loopback upstream through the package's existing resolver seam.
+	originalResolver := newDNSContinuityResolver
+	newDNSContinuityResolver = func(cfg gatewaydns.ResolverConfig) (gatewaydns.Resolver, error) {
+		cfg.AllowLoopbackUpstream = true
+		return gatewaydns.NewUpstreamResolver(cfg)
+	}
+	defer func() { newDNSContinuityResolver = originalResolver }()
+	svc.mu.Lock()
+	svc.installDNSContinuityLocked(gwDNS, upstreams)
+	svc.mu.Unlock()
+	handler, ok := fwd.DNSHandler().(*dnsContinuityHandler)
+	if !ok || handler == nil {
+		t.Fatalf("continuity responder was not installed: %T", fwd.DNSHandler())
+	}
+	t.Cleanup(func() { _ = handler.Close() })
+
+	// One client device, so the TCP half is a real DNS-over-TCP exchange rather
+	// than a call into the server.
+	const sid, peer, ip = "issue863-continuity", "issue863-continuity-peer", "10.100.0.92"
+	capture := newIssue863Client()
+	dev, stack, err := netstack.CreateNetTUN([]netip.Addr{netip.MustParseAddr(ip)}, nil, 1500)
+	if err != nil {
+		t.Fatalf("create client netstack: %v", err)
+	}
+	path := forwarder.NewReturnPath(func(_, _ string, packet []byte) (int, error) {
+		capture.write("", "", packet)
+		if len(packet) > 20 && packet[9] == 6 {
+			if _, err := dev.Write([][]byte{append([]byte(nil), packet...)}, 0); err != nil {
+				return 0, err
+			}
+		}
+		return len(packet), nil
+	})
+	fwd.RegisterSessionWithReturnPath(sid, "issue863-continuity-conn", peer, ip, 1, path)
+	t.Cleanup(func() { fwd.BeginUnregisterSession(peer, sid).Wait() })
+
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		buffers := [][]byte{make([]byte, 1500)}
+		sizes := make([]int, 1)
+		for {
+			n, err := dev.Read(buffers, sizes, 0)
+			if err != nil {
+				return
+			}
+			if n > 0 {
+				_ = fwd.RouteClientToBackend(peer, append([]byte(nil), buffers[0][:sizes[0]]...))
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		_ = dev.Close()
+		select {
+		case <-pumpDone:
+		case <-time.After(2 * time.Second):
+			t.Error("client pump did not stop")
+		}
+	})
+
+	// Fill the TCP connection bound with queries held inside the upstream
+	// exchange: one in flight per connection, as a client issuing TCP retries or
+	// large-answer lookups does.
+	const tcpQueries = 30
+	tcpConns := make([]*mdns.Conn, 0, tcpQueries)
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelDial()
+	for i := 0; i < tcpQueries; i++ {
+		conn, err := stack.DialContextTCPAddrPort(dialCtx, netip.MustParseAddrPort("10.100.0.1:53"))
+		if err != nil {
+			t.Fatalf("dial continuity TCP %d: %v", i, err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(90 * time.Second))
+		dnsConn := &mdns.Conn{Conn: conn}
+		query := new(mdns.Msg)
+		query.SetQuestion(fmt.Sprintf("issue863-continuity-tcp%d.example.test.", i), mdns.TypeA)
+		if err := dnsConn.WriteMsg(query); err != nil {
+			t.Fatalf("write continuity TCP query %d: %v", i, err)
+		}
+		tcpConns = append(tcpConns, dnsConn)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for up.queries.Load() < int64(tcpQueries) && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := up.queries.Load(); got != int64(tcpQueries) {
+		t.Fatalf("TCP queries inside the upstream exchange = %d want %d", got, tcpQueries)
+	}
+
+	// The responder's whole plain-UDP pool now has work for the same session.
+	udpIDs := make([]uint16, 0, dnsContinuityWorkerCount)
+	for i := 0; i < dnsContinuityWorkerCount; i++ {
+		id := uint16(7500 + i)
+		udpIDs = append(udpIDs, id)
+		issue863SendUDPQuery(t, fwd, peer, netip.MustParseAddr(ip), id,
+			fmt.Sprintf("issue863-continuity-udp%d.example.test.", i), mdns.TypeA)
+	}
+
+	// Every supported producer must be admitted: the TCP connections plus the
+	// whole UDP worker pool reach the healthy upstream, with no panel refusal.
+	wantQueries := int64(tcpQueries + dnsContinuityWorkerCount)
+	settle := time.Now().Add(5 * time.Second)
+	for up.queries.Load() < wantQueries && time.Now().Before(settle) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := up.queries.Load(); got != wantQueries {
+		t.Fatalf("continuity mixed burst reached the upstream with %d queries want %d; refusals=%+v",
+			got, wantQueries, handler.gw.AdmissionRejections())
+	}
+	if got := handler.gw.AdmissionRejections(); got != (gatewaydns.AdmissionRejections{}) {
+		t.Fatalf("continuity responder refused a supported mixed burst: %+v", got)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+
+	// The TCP half is a legitimate positive control: every held exchange answers.
+	for i, dnsConn := range tcpConns {
+		resp, err := dnsConn.ReadMsg()
+		if err != nil {
+			t.Fatalf("read continuity TCP response %d: %v", i, err)
+		}
+		if resp.Rcode != mdns.RcodeSuccess {
+			t.Fatalf("continuity TCP response %d rcode=%d want success", i, resp.Rcode)
+		}
+		_ = dnsConn.Close()
+	}
+	noerror, servfail, noReply := capture.summary(udpIDs, 15*time.Second)
+	if noerror != len(udpIDs) || servfail != 0 || noReply != 0 {
+		t.Fatalf("continuity UDP burst: noerror=%d servfail=%d no_reply=%d want %d/0/0",
+			noerror, servfail, noReply, len(udpIDs))
+	}
 }
