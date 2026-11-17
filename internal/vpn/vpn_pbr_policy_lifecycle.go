@@ -258,6 +258,21 @@ func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.M
 	// refused update leaves the incumbent writing and serving unchanged. After it
 	// succeeds, the incumbent's still-running syncs are refused at their commit.
 	syncer.AttachOwnership(s.policyWriteOwner())
+	// A save usually changes settings the policy snapshot does not carry — the
+	// upstream resolver list, the refresh interval — so its effective rules are
+	// unchanged and the cycle must keep the published generation, which is what the
+	// forwarder's route caches key client DNS evidence on (#864). Adopting the
+	// durable generation is a read: it publishes nothing and commits nothing, so the
+	// boundary above is untouched and a save whose fetch is refused below leaves the
+	// incumbent runtime still owning its writes. A different source configuration is
+	// reported as BaselineForeign and adopted not at all, and the cycle then
+	// publishes the fetched content.
+	if _, adoptErr := syncer.AdoptBaseline(ctx); adoptErr != nil {
+		// An unreadable durable generation must not block a settings change: the cycle
+		// below either publishes freshly fetched content or reports its own failure,
+		// and the incumbent runtime keeps serving in the meantime.
+		slog.Warn("Policy update could not adopt the stored generation as its baseline", "err", adoptErr)
+	}
 	syncCtx, cancelSync := context.WithTimeout(ctx, policyActivationTimeout)
 	syncRes, syncErr := syncer.SyncOnce(syncCtx)
 	cancelSync()

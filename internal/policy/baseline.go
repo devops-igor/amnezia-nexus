@@ -40,6 +40,45 @@ const (
 	BaselineForeign
 )
 
+// AdoptBaseline records the durable last-known-good generation as this syncer's
+// comparison baseline without publishing it.
+//
+// A live-policy replacement (#864) builds a new syncer for an operator save whose
+// effective rules may be unchanged: the upstream resolver list and the refresh
+// interval are settings the snapshot does not carry, so the save is content
+// equivalent even though it is a real change to the runtime. The new syncer has no
+// record of what is already published, and without one every such save would mint a
+// new generation — which is what the forwarder's route caches key a client's DNS
+// evidence on, so the evidence would be discarded and new flows would fall back to
+// the fail-closed PROXY path.
+//
+// Adoption is a read: it never publishes and never commits, so it cannot take write
+// ownership from the runtime the save is replacing, and a save whose fetch is then
+// refused leaves the incumbent runtime still able to publish. Whether a cycle keeps
+// the adopted identity is decided where it always was — by the config-hash,
+// content and attribution comparison in executeUpdate — so a source change, a rule
+// change or an unreadable store all publish.
+func (s *Syncer) AdoptBaseline(ctx context.Context) (BaselineStatus, error) {
+	if s.store == nil {
+		return BaselineAbsent, nil
+	}
+	gen, err := s.store.Load(ctx)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return BaselineAbsent, nil
+		}
+		return BaselineAbsent, fmt.Errorf("stored policy generation is unreadable: %w", err)
+	}
+	if gen == nil {
+		return BaselineAbsent, nil
+	}
+	if gen.ConfigHash != s.computeConfigHash() {
+		return BaselineForeign, nil
+	}
+	s.cachedGen = gen
+	return BaselinePrimed, nil
+}
+
 // PrimeBaseline publishes the durable last-known-good generation into the
 // matcher and adopts it as the comparison baseline, but only when it matches the
 // configured sources.
