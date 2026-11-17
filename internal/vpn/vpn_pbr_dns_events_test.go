@@ -238,10 +238,11 @@ func TestClientDiagnosisBindsTheReceiptIncarnation(t *testing.T) {
 	ledger := f.svc.clientDiagnosisRouteCache().DNSLedger()
 
 	// The query starts and blocks inside the upstream exchange.
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
-		f.queryIP(t, "slow.example", 56401)
+		// A worker goroutine reports its own outcome; it must never fail the test.
+		_, err := f.query(dnsQueryPlan{name: "slow.example", qtype: mdns.TypeA, srcPort: 56401, id: 0x1234})
+		done <- err
 	}()
 	select {
 	case <-f.slowEntered:
@@ -257,9 +258,12 @@ func TestClientDiagnosisBindsTheReceiptIncarnation(t *testing.T) {
 		t.Fatal("the replacement did not advance the incarnation")
 	}
 
-	close(f.slowRelease)
+	f.releaseSlow()
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the query did not complete after the release: %v", err)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("the query did not complete after the release")
 	}
@@ -348,10 +352,11 @@ func TestClientDiagnosisRecordsAdmissionRefusal(t *testing.T) {
 	ledger := f.svc.clientDiagnosisRouteCache().DNSLedger()
 
 	// The first query blocks inside the upstream exchange and holds the slot.
-	done := make(chan struct{})
+	slowDone := make(chan error, 1)
 	go func() {
-		defer close(done)
-		f.queryIP(t, "slow.example", 56601)
+		// A worker goroutine reports its own outcome; it must never fail the test.
+		_, err := f.query(dnsQueryPlan{name: "slow.example", qtype: mdns.TypeA, srcPort: 56601, id: 0x1234})
+		slowDone <- err
 	}()
 	select {
 	case <-f.slowEntered:
@@ -360,27 +365,27 @@ func TestClientDiagnosisRecordsAdmissionRefusal(t *testing.T) {
 	}
 
 	// The second query must be refused by the limiter, before any upstream attempt.
-	refusedPacket := buildTestPBRUDPPacket(f.clientIP, f.gwDNS, 56602, 53, packEventQuery(t, "plain.example", mdns.TypeA))
-	if err := f.fwd.RouteClientToBackend(f.peerKey, refusedPacket); err != nil {
+	// Its reply is matched by its own client port, DNS id and question: the blocking
+	// query's earlier reply cannot stand in for it.
+	refusedPlan := dnsQueryPlan{name: "plain.example", qtype: mdns.TypeA, srcPort: 56602, id: 0x7777}
+	refusedWatch, err := f.dispatchQuery(refusedPlan)
+	if err != nil {
 		t.Fatalf("refused query dispatch: %v", err)
 	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if events := ledger.SnapshotEvents(sessionID, 0).Events; len(events) >= 1 {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
+	refusedReply, ok := f.awaitReply(refusedWatch, clientDiagQueryBudget)
+	if !ok {
+		t.Fatalf("no reply delivered to the refused query on client port %d", refusedPlan.srcPort)
 	}
-	events := ledger.SnapshotEvents(sessionID, 0).Events
-	var refused *dnsledger.Event
-	for i := range events {
-		if events[i].Kind == gatewaydns.QueryEventAdmissionRefused {
-			refused = &events[i]
-		}
+	if rcode := replyRCode(t, refusedReply); rcode != mdns.RcodeServerFailure {
+		t.Fatalf("refused reply rcode = %d, want SERVFAIL as the client received it", rcode)
 	}
-	if refused == nil {
-		t.Fatalf("no admission_refused event in %+v", events)
+	refused, ok := f.awaitEvent(refusedWatch, clientDiagQueryBudget, gatewaydns.QueryEventAdmissionRefused)
+	if !ok {
+		t.Fatalf("no admission_refused event published for the refused query; events=%+v",
+			ledger.SnapshotEvents(sessionID, 0).Events)
+	}
+	if refused.Name != "plain.example" || refused.QType != mdns.TypeA {
+		t.Errorf("refused event = %q/%d, want the refused query", refused.Name, refused.QType)
 	}
 	if refused.RCode != mdns.RcodeServerFailure {
 		t.Errorf("rcode = %d, want SERVFAIL as the client received it", refused.RCode)
@@ -388,44 +393,111 @@ func TestClientDiagnosisRecordsAdmissionRefusal(t *testing.T) {
 	if refused.UpstreamError != "" {
 		t.Errorf("upstream class = %q, want none: the query never reached an upstream", refused.UpstreamError)
 	}
-	if refused.Name != "plain.example" {
-		t.Errorf("refused query name = %q, want the refused query", refused.Name)
-	}
 	if got := f.routeCache.SessionScope(sessionID).Count(); got != 0 {
 		t.Errorf("evidence entries = %d, want none from a refused query", got)
 	}
 
-	// Recovery: once the blocking query finishes, the same session is served.
-	close(f.slowRelease)
+	// The refusal's SERVFAIL is already captured. It cannot release the wait for the
+	// blocking query's own reply: it is addressed to another client port and carries
+	// another DNS id and question. This is the count-increment defect pinned shut.
+	if reply, ok := f.awaitReply(&queryWatch{plan: dnsQueryPlan{name: "slow.example", qtype: mdns.TypeA, srcPort: 56601, id: 0x1234}}, 100*time.Millisecond); ok {
+		t.Fatalf("the refusal reply released the wait for the blocking query's reply (%d bytes)", len(reply))
+	}
+
+	// Recovery: once the blocking query finishes, the same session is served. Its
+	// publication is awaited separately, so the delivered reply alone cannot be read as
+	// a recovery event.
+	f.releaseSlow()
 	select {
-	case <-done:
+	case err := <-slowDone:
+		if err != nil {
+			t.Fatalf("the blocking query did not complete: %v", err)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("the blocking query did not complete")
 	}
-	f.queryIP(t, "plain.example", 56603)
-	var answered *dnsledger.Event
-	for _, event := range ledger.SnapshotEvents(sessionID, 0).Events {
-		candidate := event
-		if candidate.Kind == gatewaydns.QueryEventAnswered && candidate.QType == mdns.TypeA {
-			answered = &candidate
-		}
+
+	recoveryPlan := dnsQueryPlan{name: "plain.example", qtype: mdns.TypeA, srcPort: 56603, id: 0x1234}
+	recoveryWatch, err := f.dispatchQuery(recoveryPlan)
+	if err != nil {
+		t.Fatalf("recovery query dispatch: %v", err)
 	}
-	if answered == nil {
+	recoveryReply, ok := f.awaitReply(recoveryWatch, clientDiagQueryBudget)
+	if !ok {
+		t.Fatalf("no reply delivered to the recovery query on client port %d", recoveryPlan.srcPort)
+	}
+	if rcode := replyRCode(t, recoveryReply); rcode != mdns.RcodeSuccess {
+		t.Fatalf("recovery reply rcode = %d, want NOERROR", rcode)
+	}
+	answered, ok := f.awaitEvent(recoveryWatch, clientDiagQueryBudget, gatewaydns.QueryEventAnswered)
+	if !ok {
 		t.Error("the session did not recover: no answered event after the refusal")
+		return
+	}
+	if answered.Name != "plain.example" || answered.QType != mdns.TypeA || answered.RCode != mdns.RcodeSuccess {
+		t.Errorf("recovery event = %q/%d rcode %d, want the recovered plain.example A answer",
+			answered.Name, answered.QType, answered.RCode)
+	}
+	if !answered.Delivered {
+		t.Error("the recovery answer was published without delivery")
+	}
+	if !answered.RouteGenerationKnown || answered.RouteGeneration != recoveryWatch.generation {
+		t.Errorf("recovery event incarnation = %d/%v, want the receiving incarnation %d",
+			answered.RouteGeneration, answered.RouteGenerationKnown, recoveryWatch.generation)
+	}
+	// A collapsed repeat keeps its original sequence number and moves its last-seen
+	// instant, so recency of the publication - not the sequence number - is what says
+	// this event is later than the refusal.
+	if !answered.LastSeen.After(refused.AnsweredAt) {
+		t.Errorf("recovery event last seen %v is not after the refusal at %v: not a later publication",
+			answered.LastSeen, refused.AnsweredAt)
 	}
 }
 
-// packEventQuery packs one query into UDP payload bytes for the refusal control.
-func packEventQuery(t *testing.T, name string, qtype uint16) []byte {
-	t.Helper()
-	req := new(mdns.Msg)
-	req.SetQuestion(mdns.Fqdn(name), qtype)
-	req.Id = 0x7777
-	raw, err := req.Pack()
-	if err != nil {
-		t.Fatalf("pack query: %v", err)
+// TestClientDiagnosisQueryWaitsRequireTheQuerysOwnIdentity is the control for both
+// waits: a reply already captured by the fixture does not stand in for a query with a
+// different client port, DNS id, type or question, and an event already in the ledger
+// does not stand in for a query that has not published anything yet.
+func TestClientDiagnosisQueryWaitsRequireTheQuerysOwnIdentity(t *testing.T) {
+	f := newClientDiagFixture(t)
+	owner := dnsQueryPlan{name: "plain.example", qtype: mdns.TypeA, srcPort: 56701, id: 0x1234}
+	f.queryIP(t, owner.name, owner.srcPort)
+
+	for _, tc := range []struct {
+		reason string
+		plan   dnsQueryPlan
+	}{
+		{"another client port", dnsQueryPlan{name: "plain.example", qtype: mdns.TypeA, srcPort: 56702, id: 0x1234}},
+		{"another DNS id", dnsQueryPlan{name: "plain.example", qtype: mdns.TypeA, srcPort: 56701, id: 0x1235}},
+		{"another type", dnsQueryPlan{name: "plain.example", qtype: mdns.TypeAAAA, srcPort: 56701, id: 0x1234}},
+		{"another question", dnsQueryPlan{name: "other.example", qtype: mdns.TypeA, srcPort: 56701, id: 0x1234}},
+	} {
+		if reply, ok := f.awaitReply(&queryWatch{plan: tc.plan}, 100*time.Millisecond); ok {
+			t.Errorf("%s: an unrelated reply satisfied the wait (%d bytes)", tc.reason, len(reply))
+		}
 	}
-	return raw
+
+	reply, ok := f.awaitReply(&queryWatch{plan: owner}, 100*time.Millisecond)
+	if !ok {
+		t.Fatal("the query's own reply did not satisfy its wait")
+	}
+	if rcode := replyRCode(t, reply); rcode != mdns.RcodeSuccess {
+		t.Errorf("own reply rcode = %d, want NOERROR", rcode)
+	}
+
+	// The event for that query is real and published. A watch that starts after it was
+	// published must not adopt it: the history it captured already contains it.
+	states := f.fwd.SessionRouteStates()
+	late := &queryWatch{
+		plan:       owner,
+		sessionID:  states[0].SessionID,
+		generation: states[0].Generation,
+		startedAt:  time.Now(),
+		counts:     f.eventCounts(states[0].SessionID),
+	}
+	if event, ok := f.awaitEvent(late, 100*time.Millisecond, gatewaydns.QueryEventAnswered); ok {
+		t.Fatalf("an event published before the query was sent satisfied the wait: %+v", event)
+	}
 }
 
 // TestClientDiagnosisTerminalEventsLeaveWithTheSession proves the event history is

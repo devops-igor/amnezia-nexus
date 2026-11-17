@@ -43,9 +43,11 @@ type clientDiagFixture struct {
 	// a rekey case can register the same incarnation again.
 	returnPath *forwarder.ReturnPath
 	// slowEntered / slowRelease drive the blocking query used to interleave a
-	// session replacement with an in-flight lookup.
+	// session replacement with an in-flight lookup. slowOnce makes the release
+	// idempotent so every exit path can unblock it.
 	slowEntered chan struct{}
 	slowRelease chan struct{}
+	slowOnce    sync.Once
 
 	mu       sync.Mutex
 	replies  [][]byte
@@ -249,71 +251,12 @@ func newClientDiagFixtureWithInflight(t *testing.T, maxInflightPerSession int) *
 		t.Fatalf("ConfigurePBR: %v", err)
 	}
 	t.Cleanup(func() { _ = f.svc.TeardownPBR() })
+	// Registered after the teardown cleanup, so it runs first: an early assertion
+	// failure must release the slow upstream exchange before the fixture tears the
+	// resolver and the direct egress down.
+	t.Cleanup(f.releaseSlow)
 	f.dem = fwd.DirectEgress()
 	return f
-}
-
-// queryIP is one client DNS query through the intercepted path.
-func (f *clientDiagFixture) queryIP(t *testing.T, name string, srcPort uint16) {
-	t.Helper()
-	req := new(mdns.Msg)
-	req.SetQuestion(mdns.Fqdn(name), mdns.TypeA)
-	req.Id = 0x1234
-	raw, err := req.Pack()
-	if err != nil {
-		t.Fatalf("pack query: %v", err)
-	}
-	f.mu.Lock()
-	before := len(f.replies)
-	f.mu.Unlock()
-	pkt := buildTestPBRUDPPacket(f.clientIP, f.gwDNS, srcPort, 53, raw)
-	if err := f.fwd.RouteClientToBackend(f.peerKey, pkt); err != nil {
-		t.Fatalf("RouteClientToBackend(dns): %v", err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		f.mu.Lock()
-		n := len(f.replies)
-		f.mu.Unlock()
-		// Wait for THIS query's reply: a previous answer already in the fixture
-		// would otherwise let the observation be read before it landed.
-		if n > before {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	t.Fatalf("no DNS reply delivered for %s", name)
-}
-
-// queryType is one client DNS query of an arbitrary type through the
-// intercepted path, which is how a non-A query reaches the observer.
-func (f *clientDiagFixture) queryType(t *testing.T, name string, qtype uint16, srcPort uint16) {
-	t.Helper()
-	req := new(mdns.Msg)
-	req.SetQuestion(mdns.Fqdn(name), qtype)
-	req.Id = 0x4321
-	raw, err := req.Pack()
-	if err != nil {
-		t.Fatalf("pack query: %v", err)
-	}
-	f.mu.Lock()
-	before := len(f.replies)
-	f.mu.Unlock()
-	pkt := buildTestPBRUDPPacket(f.clientIP, f.gwDNS, srcPort, 53, raw)
-	if err := f.fwd.RouteClientToBackend(f.peerKey, pkt); err != nil {
-		t.Fatalf("RouteClientToBackend(%s/%d): %v", name, qtype, err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		f.mu.Lock()
-		n := len(f.replies)
-		f.mu.Unlock()
-		if n > before {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	t.Fatalf("no DNS reply delivered for %s/%d", name, qtype)
 }
 
 // sendTCP is one client TCP packet through the real routing decision.
