@@ -3,6 +3,7 @@ package forwarder
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 )
 
 // ErrWANReplyNotSegmentable reports an inbound WAN reply that is larger than the
@@ -19,10 +20,20 @@ const (
 	tcpFlagRST = 0x04
 	tcpFlagPSH = 0x08
 	tcpFlagURG = 0x20
+	tcpFlagCWR = 0x80
 )
 
 // tcpMinHeaderBytes is the smallest TCP header, with no options.
 const tcpMinHeaderBytes = 20
+
+// TCP option kinds and the timestamp option's fixed length. Only these are part
+// of the supported contract documented on planWANReplySegment.
+const (
+	tcpOptEOL       = 0
+	tcpOptNOP       = 1
+	tcpOptTimestamp = 8
+	tcpTimestampLen = 10
+)
 
 // maxWANReplySegments bounds the pieces one received frame can produce. An IPv4
 // packet carries at most 65515 payload bytes, and a client-MTU-sized piece always
@@ -72,6 +83,16 @@ type wanSegmentPlan struct {
 //     wrong piece.
 //   - A client MTU that can carry the received header, since no piece can be
 //     smaller than that header.
+//   - A TCP option area drawn from the supported contract only: NOP, EOL
+//     followed by zero padding, and Timestamp. Anyone replicating a received
+//     options area onto several pieces is asserting that every option still
+//     means the same thing on each piece, and that is only true for options that
+//     describe the connection or the sender's clock rather than this segment.
+//     MSS and window scale exist only on a SYN, SACK blocks describe received
+//     ranges, MD5 covers this segment's exact bytes, and MPTCP is a different
+//     transport; all of them are refused instead of being cloned into pieces
+//     where their meaning would be wrong. The reserved bits of the header must
+//     also be zero, as the segment is about to be rebuilt from this header.
 func planWANReplySegment(packet []byte, maxLen int) (wanSegmentPlan, error) {
 	var plan wanSegmentPlan
 	if maxLen <= 0 {
@@ -104,6 +125,14 @@ func planWANReplySegment(packet []byte, maxLen int) (wanSegmentPlan, error) {
 	if plan.flags&(tcpFlagSYN|tcpFlagRST|tcpFlagURG) != 0 {
 		return plan, ErrWANReplyNotSegmentable
 	}
+	// RFC 9293 leaves these four header bits reserved; a segment that sets them
+	// is not a shape this normalizer may rebuild.
+	if packet[ihl+12]&0x0f != 0 {
+		return plan, fmt.Errorf("%w: reserved TCP header bits are set", ErrWANReplyNotSegmentable)
+	}
+	if err := validateWANTCPOptions(packet[ihl+20 : ihl+dataOffset]); err != nil {
+		return plan, err
+	}
 	plan.headerLen = ihl + dataOffset
 	plan.payloadLen = plan.totalLen - plan.headerLen
 	plan.maxPayload = maxLen - plan.headerLen
@@ -117,6 +146,46 @@ func planWANReplySegment(packet []byte, maxLen int) (wanSegmentPlan, error) {
 	return plan, nil
 }
 
+// validateWANTCPOptions applies the supported option contract to one received
+// option area (the bytes between the fixed header and the payload).
+//
+// The contract is deliberately narrow: NOP, a single EOL whose remaining bytes
+// are zero padding, and the Timestamp option. Each is legal on a data-bearing
+// segment and means the same thing on every piece produced from it, so cloning
+// them is a faithful description. Every other kind is refused, including shapes
+// such as MD5 whose value covers the exact segment bytes and would therefore be
+// wrong on every piece after the first.
+func validateWANTCPOptions(options []byte) error {
+	for i := 0; i < len(options); {
+		switch options[i] {
+		case tcpOptEOL:
+			// Everything after EOL is padding and must be zero.
+			for _, b := range options[i+1:] {
+				if b != 0 {
+					return fmt.Errorf("%w: non-zero bytes after the end-of-options marker", ErrWANReplyNotSegmentable)
+				}
+			}
+			return nil
+		case tcpOptNOP:
+			i++
+		case tcpOptTimestamp:
+			if i+2 > len(options) {
+				return fmt.Errorf("%w: truncated timestamp option", ErrWANReplyNotSegmentable)
+			}
+			if options[i+1] != tcpTimestampLen {
+				return fmt.Errorf("%w: timestamp option length %d, want %d", ErrWANReplyNotSegmentable, options[i+1], tcpTimestampLen)
+			}
+			if i+tcpTimestampLen > len(options) {
+				return fmt.Errorf("%w: timestamp option overruns the header", ErrWANReplyNotSegmentable)
+			}
+			i += tcpTimestampLen
+		default:
+			return fmt.Errorf("%w: unsupported TCP option kind %d", ErrWANReplyNotSegmentable, options[i])
+		}
+	}
+	return nil
+}
+
 // segmentWANReplyTCP splits one inbound IPv4/TCP packet into packets no longer
 // than maxLen bytes, and returns a single unchanged packet when it already fits.
 //
@@ -127,9 +196,10 @@ func planWANReplySegment(packet []byte, maxLen int) (wanSegmentPlan, error) {
 //     advances by the payload already emitted, so the remote endpoint's byte
 //     stream is preserved exactly.
 //   - FIN and PSH move to the last piece, because both describe the end of the
-//     byte run the remote endpoint sent; ACK, ECE and CWR are replicated because
-//     they describe the connection's current acknowledgment and congestion state
-//     rather than a position in the stream.
+//     byte run the remote endpoint sent; ACK and ECE are replicated because they
+//     describe the connection's current acknowledgment and ECN state. CWR is not
+//     replicated: it marks the first data segment after the sender reduced its
+//     congestion window, so only the first generated piece carries it.
 //   - The IPv4 identification field advances by one per piece, as a segmenting
 //     device does; DF and the fragment fields are otherwise preserved.
 //   - Every produced packet carries freshly computed IPv4 and TCP checksums over
@@ -168,9 +238,19 @@ func segmentWANReplyTCP(packet []byte, maxLen int) ([][]byte, error) {
 		binary.BigEndian.PutUint16(seg[2:4], uint16(len(seg)))                // #nosec G115 -- len(seg) <= maxLen <= MaxClientQueuePacketBytes.
 		binary.BigEndian.PutUint16(seg[4:6], plan.ipID+uint16(len(segments))) // #nosec G115 -- len(segments) < maxWANReplySegments.
 		binary.BigEndian.PutUint32(seg[20+4:20+8], plan.seq+uint32(offset))   // #nosec G115 -- offset <= 65535.
-		if end < plan.payloadLen {
-			seg[20+13] = plan.flags &^ (tcpFlagFIN | tcpFlagPSH)
+		// CWR is a single-segment signal: the sender sets it on the first new data
+		// segment after it reduced its congestion window (RFC 3168 section 6.1.2),
+		// so only the first generated piece carries it. ECE describes the
+		// connection's current ECN state and is replicated. FIN and PSH describe
+		// the end of the run and belong to the last piece.
+		segFlags := plan.flags
+		if offset > 0 {
+			segFlags &^= tcpFlagCWR
 		}
+		if end < plan.payloadLen {
+			segFlags &^= tcpFlagFIN | tcpFlagPSH
+		}
+		seg[20+13] = segFlags
 		binary.BigEndian.PutUint16(seg[10:12], 0)
 		binary.BigEndian.PutUint16(seg[10:12], computeIPv4Checksum(seg[:20]))
 		binary.BigEndian.PutUint16(seg[20+16:20+18], 0)

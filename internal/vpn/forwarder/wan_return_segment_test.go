@@ -122,7 +122,7 @@ func TestSegmentWANReplyTCPSplitsIntoClientMTUPieces(t *testing.T) {
 		{name: "plain_header", seq: 1, flags: 0x18, ipID: 4242, ipFlag: 0x4000},
 		{name: "sequence_wrap", seq: 0xFFFFFF00, flags: 0x18, ipID: 4242, ipFlag: 0x4000},
 		{name: "fin_and_push", seq: 900, flags: 0x19, ipID: 1, ipFlag: 0x4000},
-		{name: "congestion_flags_replicated", seq: 900, flags: 0xD8 /* CWR|ECE|PSH|ACK */, ipID: 65530, ipFlag: 0x4000},
+		{name: "congestion_flags_cwr_first_piece_only", seq: 900, flags: 0xD8 /* CWR|ECE|PSH|ACK */, ipID: 65530, ipFlag: 0x4000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			data := segmentTestPayload(payload)
@@ -170,6 +170,9 @@ func TestSegmentWANReplyTCPSplitsIntoClientMTUPieces(t *testing.T) {
 				}
 				last := i == len(segments)-1
 				wantFlags := tc.flags
+				if i > 0 {
+					wantFlags &^= tcpFlagCWR
+				}
 				if !last {
 					wantFlags &^= tcpFlagFIN | tcpFlagPSH
 				}
