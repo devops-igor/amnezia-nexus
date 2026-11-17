@@ -415,19 +415,7 @@ func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
 	// restore without resolving again. The retained generation still goes through
 	// the same durable commit and atomic publication below, which is what refreshes
 	// its source fetch/health metadata.
-	retain := s.retainableGeneration()
-	if !s.equivalentTo(retain, candidateDomains, candidateCIDRs, sourceParsedList) {
-		retain = nil
-	}
-
-	newVersion := s.nextVersion()
-	genID := fmt.Sprintf("gen-%d-%d", newVersion, startTime.UnixNano())
-	createdAt := startTime
-	if retain != nil {
-		newVersion = retain.Version
-		genID = retain.GenerationID
-		createdAt = retain.CreatedAt
-	}
+	newVersion, genID, createdAt := s.candidateIdentity(startTime, candidateDomains, candidateCIDRs, sourceParsedList)
 	sourcesMeta := make(map[string]SourceMeta, len(newCachedSources))
 	for id, item := range newCachedSources {
 		sourcesMeta[id] = item.meta

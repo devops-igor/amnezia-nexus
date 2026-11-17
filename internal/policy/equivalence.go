@@ -1,6 +1,10 @@
 package policy
 
-import "net/netip"
+import (
+	"fmt"
+	"net/netip"
+	"time"
+)
 
 // This file owns the question a refresh cycle has to answer before it publishes:
 // "does this candidate change the effective policy?".
@@ -29,6 +33,21 @@ import "net/netip"
 //     positional (CompileSnapshot packs one bit per source), so the same rule
 //     supplied by a different list changes the attribution an explanation
 //     reports; that is a real change and publishes.
+
+// candidateIdentity returns the version, generation identifier and creation
+// instant the current cycle must publish under.
+//
+// A content-equivalent refresh reuses the incumbent identity, so the generation
+// the forwarder's route cache keys client evidence on does not move; everything
+// else about the cycle (durable commit, atomic publication, status) is unchanged.
+func (s *Syncer) candidateIdentity(startTime time.Time, domains map[string]uint8, cidrs []string, perSource []SourceParsedRules) (uint64, string, time.Time) {
+	retain := s.retainableGeneration()
+	if s.equivalentTo(retain, domains, cidrs, perSource) {
+		return retain.Version, retain.GenerationID, retain.CreatedAt
+	}
+	version := s.nextVersion()
+	return version, fmt.Sprintf("gen-%d-%d", version, startTime.UnixNano()), startTime
+}
 
 // retainableGeneration returns the generation a content-equivalent refresh may
 // keep, or nil when this syncer cannot vouch for one.
