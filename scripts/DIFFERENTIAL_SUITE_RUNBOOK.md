@@ -2,7 +2,7 @@
 
 **Tracking Issue:** [#392](https://github.com/devops-igor/amnezia-nexus/issues/392)  
 **Parent Epic:** [#384](https://github.com/devops-igor/amnezia-nexus/issues/384)  
-**Target Engine:** Upstream Client-Facing AmneziaWG Engine (`amneziawg-go v3.1.20260828`)  
+**Target Engine:** Upstream Client-Facing AmneziaWG Engine (`amneziawg-go v3.1.20261116`)  
 
 ---
 
@@ -297,7 +297,7 @@ The evidence aggregator verifies that all qualification requirements are strictl
 
 ### Assertions Enforced by Aggregator:
 1. **Required Files**: Checks presence of all public JSON manifests.
-2. **Pinned Dependency**: Validates upstream engine dependency is pinned to `golang.zx2c4.com/amneziawg v3.1.20260828`.
+2. **Pinned Dependency**: Validates upstream engine dependency is pinned to `github.com/amnezia-vpn/amneziawg-go/v3 v3.1.20261116`.
 3. **Commit Identity**: Confirms git commit matches expected commit SHA (`--expected-commit`).
 4. **Lifecycle & Matrix Results**: Verifies `status == "PASS"` across all fault shims and backend migrations.
 5. **Soak Duration & Closure Eligibility**:

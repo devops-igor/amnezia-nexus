@@ -185,9 +185,9 @@ non_netstack = load_json("non_netstack_qualification.json") if require_non_netst
 env = manifest.get("environment", {})
 if env.get("upstream_awg_module") != "github.com/amnezia-vpn/amneziawg-go/v3":
     fail(f"Upstream AWG module mismatch: {env.get('upstream_awg_module')}")
-if env.get("upstream_awg_version") != "v3.1.20260828":
+if env.get("upstream_awg_version") != "v3.1.20261116":
     fail(f"Upstream AWG version mismatch: {env.get('upstream_awg_version')}")
-info("Dependency pinning verified: github.com/amnezia-vpn/amneziawg-go/v3@v3.1.20260828")
+info("Dependency pinning verified: github.com/amnezia-vpn/amneziawg-go/v3@v3.1.20261116")
 
 # 3. Client configuration freezing hash and commit verification
 frozen_cfg = manifest.get("frozen_client_configuration", {})

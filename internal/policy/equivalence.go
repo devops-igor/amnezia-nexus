@@ -28,11 +28,13 @@ import (
 //     flags, and IPv4 prefixes as a canonical set, so declaration order,
 //     duplicate declarations and map iteration order can neither fake a change
 //     nor hide one;
-//   - when the syncer still holds the per-source rules the live generation was
-//     compiled from, each source's own rules are compared too. Provenance is
-//     positional (CompileSnapshot packs one bit per source), so the same rule
-//     supplied by a different list changes the attribution an explanation
-//     reports; that is a real change and publishes.
+//   - each source's own rules are compared too, so a rule that is supplied by a
+//     different list is a change even when the merged rule set is identical.
+//     Provenance is positional (CompileSnapshot packs one bit per source), so
+//     the same rule from another list changes the attribution an explanation
+//     reports. The comparison reads the durable per-source digest recorded with
+//     the generation (provenance.go), which is what keeps it answerable after a
+//     restart or after a save adopted the durable generation.
 
 // candidateIdentity returns the version, generation identifier and creation
 // instant the current cycle must publish under.
@@ -67,8 +69,9 @@ func (s *Syncer) retainableGeneration() *Generation {
 }
 
 // equivalentTo reports whether the candidate aggregated rules are the effective
-// content of gen. Attribution is compared only while the syncer still holds the
-// per-source rules of the live generation; see sameSourceAttribution.
+// content of gen, attribution included. Attribution is compared through the
+// durable digest when the generation has one, and through the syncer's own
+// previous cycle otherwise; see sameSourceAttribution.
 func (s *Syncer) equivalentTo(gen *Generation, domains map[string]uint8, cidrs []string, perSource []SourceParsedRules) bool {
 	if gen == nil {
 		return false
@@ -79,21 +82,42 @@ func (s *Syncer) equivalentTo(gen *Generation, domains map[string]uint8, cidrs [
 	if !equalStringSet(gen.CIDRs, cidrs) {
 		return false
 	}
-	return s.sameSourceAttribution(perSource)
+	return s.sameSourceAttribution(gen, perSource)
 }
 
 // sameSourceAttribution reports whether every configured source still supplies
 // exactly the rules the live generation was compiled from.
 //
-// It answers true when the syncer has no in-memory record of the per-source
-// rules — the first refresh after a restart, where the baseline is primed from
-// durable state and only merged rules are known. Attribution cannot be compared
-// then, and an unchanged merged policy is not a change: publishing would only
-// re-derive attribution the durable generation never recorded.
-func (s *Syncer) sameSourceAttribution(perSource []SourceParsedRules) bool {
-	if len(perSource) != len(s.cfg.Sources) || len(s.cachedSources) != len(s.cfg.Sources) {
+// The syncer's own record of its last cycle is the most direct answer, and it is
+// what this decision always used while a syncer is alive. Once the syncer is
+// gone — the first refresh after a restart, or the cycle a save's replacement
+// syncer runs after adopting the last-known-good policy — only the durable
+// generation is left. The attribution digest recorded with it (provenance.go) is
+// what keeps the question answerable then: routing is identical in that case, but
+// which list an explanation names is not, and that is a real change.
+//
+// A generation written before the digest existed has neither, and attribution
+// genuinely cannot be compared against it. Answering true there is the honest
+// answer: an unchanged merged policy is not a change, and publishing would
+// re-derive attribution the durable generation never recorded. The next
+// successful cycle records the digest, so that gap is one cycle and never
+// recurring: from then on attribution-only moves publish.
+func (s *Syncer) sameSourceAttribution(gen *Generation, perSource []SourceParsedRules) bool {
+	if len(perSource) != len(s.cfg.Sources) {
 		return true
 	}
+	if len(s.cachedSources) == len(s.cfg.Sources) {
+		return s.sameCachedSourceAttribution(perSource)
+	}
+	if candidate, ok := attributionDigest(perSource); ok && gen.AttributionHash != "" {
+		return gen.AttributionHash == candidate
+	}
+	return true
+}
+
+// sameCachedSourceAttribution compares the candidate per-source rules with the
+// per-source rules of this syncer's own last cycle.
+func (s *Syncer) sameCachedSourceAttribution(perSource []SourceParsedRules) bool {
 	for _, item := range perSource {
 		previous, ok := s.cachedSources[item.SourceID]
 		if !ok {

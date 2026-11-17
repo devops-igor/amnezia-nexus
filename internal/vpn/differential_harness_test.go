@@ -37,7 +37,7 @@ import (
 // Pinned dependency constants for Issue #392 qualification.
 const (
 	ExpectedUpstreamAWGModule  = "github.com/amnezia-vpn/amneziawg-go/v3"
-	ExpectedUpstreamAWGVersion = "v3.1.20260828"
+	ExpectedUpstreamAWGVersion = "v3.1.20261116"
 )
 
 // EnvironmentManifest pins and reports the exact runtime and dependency environment.
