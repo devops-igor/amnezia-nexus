@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"fmt"
 	"net/netip"
 	"testing"
 	"time"
@@ -28,7 +29,8 @@ func membershipIdentities(m *DirectEgressManager, sessionID string, generation u
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make(map[FlowKey]struct{})
-	for _, key := range m.membershipKeysLocked(sessionID, generation) {
+	keys, _, _ := m.membershipKeysLocked(sessionID, generation)
+	for _, key := range keys {
 		if entry, ok := m.flows[key]; ok && sessionFlowMatches(entry, sessionID, generation) {
 			out[key] = struct{}{}
 		}
@@ -150,87 +152,141 @@ func TestFlowMembershipRekeyMovesTheKey(t *testing.T) {
 	}
 }
 
-// TestFlowMembershipSelectsOnlyTheRequestedClient is the retrieval control: other clients'
-// flows, including enough to exhaust the old global visit cap, must not consume this
-// client's allowance nor change its answer.
-func TestFlowMembershipSelectsOnlyTheRequestedClient(t *testing.T) {
+// TestFlowMembershipIsSessionLocal is the retrieval control: a session-scoped read visits
+// only that session's buckets, whatever the table holds, and never another client's.
+func TestFlowMembershipIsSessionLocal(t *testing.T) {
 	fwd, _, peer, sessionID := proxyReturnFixture(t, 8)
 	fwd.StopPumps()
 	dem := fwd.DirectEgress()
-	now := time.Now()
 
-	// A small selected client.
-	selected := []string{"93.184.216.10", "93.184.216.11", "93.184.216.12"}
-	for i, dst := range selected {
-		if err := fwd.RouteClientToBackend(peer, flowClientPacket("10.100.0.7", dst, uint16(48200+i), 443)); err != nil {
-			t.Fatalf("selected dispatch %s: %v", dst, err)
-		}
-	}
-	want := membershipIdentities(dem, sessionID, 0)
-	if len(want) != len(selected) {
-		t.Fatalf("selected membership = %d keys, want %d", len(want), len(selected))
-	}
-
-	before := dem.SnapshotSessionFlows(sessionID, 0, now, 0)
-	dem.mu.RLock()
-	selectedBuckets := len(dem.members)
-	dem.mu.RUnlock()
-
-	// Now fill the table with other clients' flows, well past the old global visit cap.
+	// The selected session, two incarnations.
 	dem.mu.Lock()
-	for i := range SessionFlowScanRecords + 512 {
-		ip := netip.AddrFrom4([4]byte{10, 99, byte(i / 256), byte(i % 256)})
-		key := FlowKey{
-			PeerKey:  "other-peer",
-			Protocol: 6,
-			SrcIP:    ip.As4(),
-			DstIP:    [4]byte{198, 51, 100, byte(i % 254)},
-			SrcPort:  uint16(1024 + i%50000), // #nosec G115 -- bounded by the loop.
-			DstPort:  443,
-		}
-		dem.storeFlowLocked(FlowKey{
-			PeerKey:  key.PeerKey,
-			Protocol: key.Protocol,
-			SrcIP:    key.SrcIP,
-			DstIP:    key.DstIP,
-			SrcPort:  key.SrcPort,
-			DstPort:  443,
-		}, &flowEntry{choice: EgressChoiceProxy, lastSeen: now, peerKey: "other-peer", sessionID: "other-session", generation: 9})
+	for i := range 2 {
+		key := FlowKey{PeerKey: peer, Protocol: 6, SrcIP: [4]byte{10, 100, 0, 7}, DstIP: [4]byte{93, 184, 216, byte(i + 1)}, SrcPort: uint16(48200 + i), DstPort: 443}
+		dem.storeFlowLocked(key, &flowEntry{choice: EgressChoiceProxy, lastSeen: time.Now(), peerKey: peer, sessionID: sessionID, generation: 7})
 	}
 	dem.mu.Unlock()
-	assertMembershipExact(t, dem, "after filling the table with other clients")
+	assertMembershipExact(t, dem, "with the selected session's two incarnations")
 
-	after := dem.SnapshotSessionFlows(sessionID, 0, now, 0)
-	if len(after.Flows) != len(before.Flows) {
-		t.Errorf("selected rows = %d after the table filled, want the same %d", len(after.Flows), len(before.Flows))
+	dem.mu.RLock()
+	_, bucketsBefore, totalBefore := dem.membershipKeysLocked(sessionID, 7)
+	dem.mu.RUnlock()
+	if bucketsBefore != 1 || totalBefore != 2 {
+		t.Fatalf("exact generation visited %d buckets for %d keys, want 1 and 2", bucketsBefore, totalBefore)
 	}
-	if after.Scanned != len(want) || !after.ScanComplete {
-		t.Errorf("scanned = %d complete=%v, want this client's %d keys visited completely",
-			after.Scanned, after.ScanComplete, len(want))
-	}
-	if after.Total != len(want) {
-		t.Errorf("total = %d, want this client's %d", after.Total, len(want))
-	}
-	// The identities must be exactly the authoritative membership, programmatically.
-	returned := make(map[string]struct{}, len(after.Flows))
-	for _, flow := range after.Flows {
-		returned[flow.DstIP.String()] = struct{}{}
-	}
-	for key := range want {
-		dst := netip.AddrFrom4(key.DstIP).String()
-		if _, ok := returned[dst]; !ok {
-			t.Errorf("indexed read omitted %s", dst)
+
+	// Many other clients, each with its own incarnation and several flows.
+	dem.mu.Lock()
+	for other := range 200 {
+		otherSession := fmt.Sprintf("other-session-%d", other)
+		for i := range 4 {
+			key := FlowKey{
+				PeerKey:  fmt.Sprintf("other-peer-%d", other),
+				Protocol: 6,
+				SrcIP:    [4]byte{10, 98, byte(other % 256), byte(i + 1)},
+				DstIP:    [4]byte{198, 51, 100, byte((other + i) % 254)},
+				SrcPort:  uint16(1024 + i),
+				DstPort:  443,
+			}
+			dem.storeFlowLocked(key, &flowEntry{
+				choice: EgressChoiceProxy, lastSeen: time.Now(),
+				peerKey: key.PeerKey, sessionID: otherSession,
+				generation: uint64(other + 1),
+			})
 		}
-		delete(returned, dst)
 	}
-	if len(returned) != 0 {
-		t.Errorf("indexed read returned identities outside the selection: %v", returned)
+	dem.mu.Unlock()
+	assertMembershipExact(t, dem, "after two hundred other clients filled the index")
+
+	dem.mu.RLock()
+	keys, bucketsAll, totalAll := dem.membershipKeysLocked(sessionID, 0)
+	_, bucketsExact, totalExact := dem.membershipKeysLocked(sessionID, 7)
+	otherKeys, otherBuckets, otherTotal := dem.membershipKeysLocked("other-session-137", 0)
+	dem.mu.RUnlock()
+
+	if bucketsAll != 1 || totalAll != 2 {
+		t.Errorf("all-incarnations read visited %d buckets for %d keys, want 1 and 2: an unrelated bucket was touched",
+			bucketsAll, totalAll)
+	}
+	if bucketsExact != 1 || totalExact != 2 {
+		t.Errorf("exact-generation read visited %d buckets for %d keys, want 1 and 2", bucketsExact, totalExact)
+	}
+	for _, key := range keys {
+		if key.PeerKey != peer {
+			t.Errorf("selected read returned a foreign key: %+v", key)
+		}
+	}
+	if otherBuckets != 1 || otherTotal != 4 || len(otherKeys) != 4 {
+		t.Errorf("other client read = %d buckets, %d keys, %d returned; want 1/4/4", otherBuckets, otherTotal, len(otherKeys))
+	}
+
+	// The consumer sees the same locality and an exact total.
+	list := dem.SnapshotSessionFlows(sessionID, 0, time.Now(), 0)
+	if list.Total != 2 || !list.ScanComplete || len(list.Flows) != 2 {
+		t.Errorf("snapshot = total %d complete %v rows %d, want 2/true/2", list.Total, list.ScanComplete, len(list.Flows))
+	}
+}
+
+// TestFlowMembershipTotalIsExactUnderAPageBound proves Total describes the selection, not
+// the page, and that a page never inflates or deflates it.
+func TestFlowMembershipTotalIsExactUnderAPageBound(t *testing.T) {
+	fwd, _, peer, sessionID := proxyReturnFixture(t, 8)
+	fwd.StopPumps()
+	dem := fwd.DirectEgress()
+
+	dem.mu.Lock()
+	for i := range 25 {
+		key := FlowKey{PeerKey: peer, Protocol: 6, SrcIP: [4]byte{10, 100, 0, 7}, DstIP: [4]byte{93, 184, 216, byte(i + 1)}, SrcPort: uint16(49000 + i), DstPort: 443}
+		dem.storeFlowLocked(key, &flowEntry{choice: EgressChoiceProxy, lastSeen: time.Now(), peerKey: peer, sessionID: sessionID, generation: 11})
+	}
+	dem.mu.Unlock()
+
+	now := time.Now()
+	page := dem.SnapshotSessionFlows(sessionID, 0, now, 5)
+	if page.Total != 25 {
+		t.Errorf("total = %d, want the selection's exact 25", page.Total)
+	}
+	if len(page.Flows) != 5 || !page.Truncated {
+		t.Errorf("page = %d rows truncated %v, want 5 and truncated", len(page.Flows), page.Truncated)
+	}
+	if page.Scanned != 25 || !page.ScanComplete {
+		t.Errorf("scanned = %d complete %v, want the whole selection visited", page.Scanned, page.ScanComplete)
+	}
+
+	full := dem.SnapshotSessionFlows(sessionID, 0, now, SessionFlowSnapshotMaxLimit)
+	if full.Total != 25 || len(full.Flows) != 25 || full.Truncated {
+		t.Errorf("full read = total %d rows %d truncated %v, want 25/25/false", full.Total, len(full.Flows), full.Truncated)
+	}
+}
+
+// TestFlowMembershipLeavesNoSessionBucketAfterRemoval proves the per-session set follows the
+// mutation paths: no bucket and no session entry survives its last flow.
+func TestFlowMembershipLeavesNoSessionBucketAfterRemoval(t *testing.T) {
+	fwd, _, peer, sessionID := proxyReturnFixture(t, 8)
+	fwd.StopPumps()
+	dem := fwd.DirectEgress()
+
+	if err := fwd.RouteClientToBackend(peer, flowClientPacket("10.100.0.7", "5.5.5.5", 49400, 443)); err != nil {
+		t.Fatalf("dispatch: %v", err)
 	}
 	dem.mu.RLock()
-	afterBuckets := len(dem.members)
+	incarnations := len(dem.sessionBuckets[sessionID])
 	dem.mu.RUnlock()
-	if afterBuckets != selectedBuckets+1 {
-		t.Errorf("buckets = %d, want one more than the %d before (the other client)", afterBuckets, selectedBuckets)
+	if incarnations != 1 {
+		t.Fatalf("session buckets = %d, want 1 after the insert", incarnations)
+	}
+
+	dem.PurgePeer(peer)
+	assertMembershipExact(t, dem, "after purging the peer")
+	dem.mu.RLock()
+	_, sessionEntry := dem.sessionBuckets[sessionID]
+	buckets := len(dem.members)
+	dem.mu.RUnlock()
+	if sessionEntry {
+		t.Error("the session still has an incarnation set after its last flow was removed")
+	}
+	if buckets != 0 {
+		t.Errorf("buckets = %d after the purge, want 0", buckets)
 	}
 }
 

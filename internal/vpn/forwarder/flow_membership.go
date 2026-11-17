@@ -83,6 +83,12 @@ func (m *DirectEgressManager) addMembershipLocked(key FlowKey, entry *flowEntry)
 	if bucket == nil {
 		bucket = &flowMemberBucket{keys: make(map[FlowKey]struct{})}
 		m.members[bucketKey] = bucket
+		incarnations := m.sessionBuckets[bucketKey.sessionID]
+		if incarnations == nil {
+			incarnations = make(map[uint64]*flowMemberBucket)
+			m.sessionBuckets[bucketKey.sessionID] = incarnations
+		}
+		incarnations[bucketKey.generation] = bucket
 	}
 	bucket.keys[key] = struct{}{}
 }
@@ -97,40 +103,54 @@ func (m *DirectEgressManager) dropMembershipLocked(key FlowKey, entry *flowEntry
 	if len(bucket.keys) == 0 {
 		// An empty bucket would be an orphan: nothing left to read, but memory still held.
 		delete(m.members, bucketKey)
+		if incarnations := m.sessionBuckets[bucketKey.sessionID]; incarnations != nil {
+			delete(incarnations, bucketKey.generation)
+			if len(incarnations) == 0 {
+				// Same for a session whose last incarnation is gone.
+				delete(m.sessionBuckets, bucketKey.sessionID)
+			}
+		}
 	}
 }
 
-// membershipKeysLocked returns the flow keys of one selection. A zero generation means
-// "every incarnation of this session", which is the documented meaning of the request's
-// generation field elsewhere in the diagnosis API.
+// membershipKeysLocked returns the flow keys of one selection, how many buckets it had to
+// visit, and the selection's exact key count.
 //
-// The returned slice is the caller's; it holds keys only.
-func (m *DirectEgressManager) membershipKeysLocked(sessionID string, generation uint64) []FlowKey {
+// A zero generation means "every incarnation of this session", which is the documented
+// meaning of the request's generation field elsewhere in the diagnosis API. Either way the
+// work is session-local: the per-session bucket set is consulted, so another client's
+// incarnations are never iterated, whatever the table holds.
+//
+// total is the selection's own size, computed while collecting, so a caller can report an
+// exact total even when its visit is capped. The returned slice is the caller's and holds
+// keys only.
+func (m *DirectEgressManager) membershipKeysLocked(sessionID string, generation uint64) (keys []FlowKey, buckets int, total int) {
 	if m == nil || sessionID == "" {
-		return nil
+		return nil, 0, 0
+	}
+	incarnations := m.sessionBuckets[sessionID]
+	if len(incarnations) == 0 {
+		return nil, 0, 0
 	}
 	if generation != 0 {
-		bucket := m.members[flowMemberKey{sessionID: sessionID, generation: generation}]
+		bucket := incarnations[generation]
 		if bucket == nil {
-			return nil
+			return nil, 1, 0
 		}
 		out := make([]FlowKey, 0, len(bucket.keys))
 		for key := range bucket.keys {
 			out = append(out, key)
 		}
-		return out
+		return out, 1, len(out)
 	}
 	var out []FlowKey
-	for bucketKey, bucket := range m.members {
-		if bucketKey.sessionID != sessionID {
-			continue
-		}
-		out = append(out, make([]FlowKey, 0, len(bucket.keys))...)
+	for _, bucket := range incarnations {
+		buckets++
 		for key := range bucket.keys {
 			out = append(out, key)
 		}
 	}
-	return out
+	return out, buckets, len(out)
 }
 
 // membershipInvariantLocked reports the membership defects the helpers above must prevent.
@@ -157,6 +177,28 @@ func (m *DirectEgressManager) membershipInvariantLocked() (dangling, missing, du
 		}
 	}
 	for _, count := range inBucket {
+		if count > 1 {
+			duplicates++
+		}
+	}
+	// The per-session bucket set must reach every bucket exactly once, or a session-local
+	// read would silently skip an incarnation.
+	reachable := make(map[*flowMemberBucket]int, len(m.members))
+	for _, incarnations := range m.sessionBuckets {
+		for _, bucket := range incarnations {
+			reachable[bucket]++
+		}
+	}
+	for bucketKey, bucket := range m.members {
+		if reachable[bucket] != 1 {
+			missing++
+			continue
+		}
+		if m.sessionBuckets[bucketKey.sessionID][bucketKey.generation] != bucket {
+			missing++
+		}
+	}
+	for _, count := range reachable {
 		if count > 1 {
 			duplicates++
 		}

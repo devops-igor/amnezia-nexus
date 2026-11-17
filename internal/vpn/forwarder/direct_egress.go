@@ -134,7 +134,10 @@ type DirectEgressManager struct {
 	// members is the secondary (session, generation) -> flow key index. It stores keys
 	// only, so its memory is proportional to the flow table, and every mutation of
 	// flows goes through the helpers in flow_membership.go under this same lock.
-	members          map[flowMemberKey]*flowMemberBucket
+	members map[flowMemberKey]*flowMemberBucket
+	// sessionBuckets maps a session to its incarnations, so a session-scoped read never
+	// iterates another client's buckets.
+	sessionBuckets   map[string]map[uint64]*flowMemberBucket
 	inboundNAT       map[inboundKey]*natEntry
 	usedPorts        map[uint16]bool
 	nextPort         uint16
@@ -202,6 +205,7 @@ func NewDirectEgressManager(cfg DirectEgressConfig, fwd *Forwarder) *DirectEgres
 		wanDevice:        cfg.WANDevice,
 		flows:            make(map[FlowKey]*flowEntry),
 		members:          make(map[flowMemberKey]*flowMemberBucket),
+		sessionBuckets:   make(map[string]map[uint64]*flowMemberBucket),
 		inboundNAT:       make(map[inboundKey]*natEntry),
 		usedPorts:        make(map[uint16]bool),
 		nextPort:         cfg.MinPort,
