@@ -336,7 +336,10 @@ func (l *Ledger) pruneLocked(now time.Time) {
 			kept = append(kept, record)
 		}
 		session.records = kept
-		if len(session.records) == 0 {
+		// A session is removed only when it holds NOTHING. Answer pruning must not
+		// take the terminal-query history with it: a query can legitimately leave an
+		// event without an answer record (a failure, a refusal, a non-A answer).
+		if len(session.records) == 0 && len(session.events) == 0 {
 			delete(l.sessions, sessionID)
 		}
 	}
@@ -354,7 +357,7 @@ func (l *Ledger) dropOldestLocked(sessionID string, session *sessionLog) {
 	session.bytes -= size
 	l.bytes -= size
 	l.total--
-	if len(session.records) == 0 {
+	if len(session.records) == 0 && len(session.events) == 0 {
 		delete(l.sessions, sessionID)
 	}
 }
@@ -386,7 +389,7 @@ func (l *Ledger) dropOldestGlobalLocked() bool {
 	oldest.bytes -= size
 	l.bytes -= size
 	l.total--
-	if len(oldest.records) == 0 {
+	if len(oldest.records) == 0 && len(oldest.events) == 0 {
 		delete(l.sessions, oldestSessionID)
 	}
 	return true
