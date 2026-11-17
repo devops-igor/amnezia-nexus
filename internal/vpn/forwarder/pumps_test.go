@@ -484,7 +484,8 @@ func TestRouteBackendToClient(t *testing.T) {
 			t.Fatal("missing client packet channel")
 		}
 		select {
-		case received := <-ch:
+		case receivedWork := <-ch:
+			received := receivedWork.Bytes()
 			if !bytes.Equal(received, pkt) {
 				t.Fatalf("received %v, want %v", received, pkt)
 			}

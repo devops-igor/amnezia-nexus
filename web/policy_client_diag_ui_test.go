@@ -83,6 +83,8 @@ w._ = key => {
   if (key === 'policy_client_outcome_fmt') return 'OUTCOME {ok}/{failed} · return {return} {packets}';
   if (key === 'policy_client_counters_live_note') return 'COUNTERS-LIVE';
   if (key === 'policy_client_backend_write_fmt') return 'DEVICE {ok}/{failed}';
+  if (key === 'policy_client_return_chain_fmt')
+    return 'RET returned {matched}/{admitted}/{delivered}/{failed}';
   if (key === 'policy_client_dns_events_coverage') return 'EVENTS-COVERAGE {stored}/{collapsed}/{evicted}/{aged}';
   if (key === 'policy_client_dns_events_truncated') return 'EVENTS-TRUNC {shown}/{total}';
   if (key === 'policy_client_delivered_yes') return 'DELIVERED';
@@ -481,7 +483,8 @@ responder = ((base) => async (url, opts) => {
      dispatch: {state: 'queued_to_backend'},
      forward: {packets: 3, bytes: 0, failed: 0, backend_writes: 2, backend_write_failed: 1,
                backend_write_failure: 'backend_write_failed'},
-     return: {evidence: 'not_measured', packets: 0, bytes: 0},
+     return: {evidence: 'observed', matched: 4, admitted: 3, delivered: 2, failed: 1,
+              failure: 'client_queue_full'},
      names: [], names_match: 'none', names_reason: 'no_retained_answer', names_considered: 0,
      name_candidates: []},
     {protocol: 'tcp', destination_ip: '1.1.1.1', destination_port: 80, choice: 'DIRECT',
@@ -514,8 +517,9 @@ const none = rowCells('policyClientFlowRows', 1);
 assert.equal(none[4], 'NAME_MATCH:none: CORR:no_retained_answer',
   'no candidate is stated with its reason');
 assert.equal(none[5],
-  'OUTCOME 3/0 · return RETURN_EVIDENCE:not_measured 0 · DEVICE 2/1 (FAILURE:backend_write_failed)',
-  'a proxy flow states queue admission and the backend device write separately');
+  'OUTCOME 3/0 · return RETURN_EVIDENCE:observed 0 · RET returned 4/3/2/1 (FAILURE:client_queue_full)'
+    + ' · DEVICE 2/1 (FAILURE:backend_write_failed)',
+  'a proxy flow states queue admission, the device write and the return chain separately');
 
 const unrecorded = rowCells('policyClientFlowRows', 2);
 assert.equal(unrecorded[3], 'not_recorded · REASON:not_recorded',

@@ -1110,5 +1110,12 @@
   "policy_client_upstream_error": "ошибка",
   "policy_client_backend_write_fmt": "устройство: {ok} записано / {failed} с ошибкой",
   "policy_client_failure_backend_write_failed": "ошибка записи на устройство",
-  "policy_client_failure_short_write": "устройство записало неполный пакет"
+  "policy_client_failure_short_write": "устройство записало неполный пакет",
+  "policy_client_return_chain_fmt": "ответ: совпало {matched} · в очереди {admitted} · доставлено {delivered} · с ошибкой {failed}",
+  "policy_client_failure_client_queue_full": "очередь клиента заполнена",
+  "policy_client_failure_client_rate_limited": "ограничение скорости клиента",
+  "policy_client_failure_packet_too_large": "пакет слишком велик",
+  "policy_client_failure_return_path_closed": "путь возврата закрыт",
+  "policy_client_failure_client_write_failed": "ошибка записи клиенту",
+  "policy_client_failure_client_short_write": "клиенту записан неполный пакет"
 }

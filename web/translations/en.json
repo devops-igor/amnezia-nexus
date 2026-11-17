@@ -1110,5 +1110,12 @@
   "policy_client_upstream_error": "error",
   "policy_client_backend_write_fmt": "device {ok} written / {failed} failed",
   "policy_client_failure_backend_write_failed": "device write failed",
-  "policy_client_failure_short_write": "device wrote a short frame"
+  "policy_client_failure_short_write": "device wrote a short frame",
+  "policy_client_return_chain_fmt": "return matched {matched} · queued {admitted} · delivered {delivered} · failed {failed}",
+  "policy_client_failure_client_queue_full": "client queue full",
+  "policy_client_failure_client_rate_limited": "client rate limited",
+  "policy_client_failure_packet_too_large": "packet too large",
+  "policy_client_failure_return_path_closed": "return path closed",
+  "policy_client_failure_client_write_failed": "client write failed",
+  "policy_client_failure_client_short_write": "client short write"
 }

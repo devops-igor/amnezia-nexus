@@ -1110,5 +1110,12 @@
   "policy_client_upstream_error": "خطا",
   "policy_client_backend_write_fmt": "دستگاه: {ok} نوشته‌شده / {failed} ناموفق",
   "policy_client_failure_backend_write_failed": "خطای نوشتن روی دستگاه",
-  "policy_client_failure_short_write": "دستگاه قاب ناقص نوشت"
+  "policy_client_failure_short_write": "دستگاه قاب ناقص نوشت",
+  "policy_client_return_chain_fmt": "بازگشت: منطبق {matched} · در صف {admitted} · تحویل {delivered} · ناموفق {failed}",
+  "policy_client_failure_client_queue_full": "صف کلاینت پر است",
+  "policy_client_failure_client_rate_limited": "محدودیت نرخ کلاینت",
+  "policy_client_failure_packet_too_large": "بسته بیش از حد بزرگ",
+  "policy_client_failure_return_path_closed": "مسیر بازگشت بسته است",
+  "policy_client_failure_client_write_failed": "خطای نوشتن برای کلاینت",
+  "policy_client_failure_client_short_write": "قاب ناقص برای کلاینت"
 }

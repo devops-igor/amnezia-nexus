@@ -142,7 +142,7 @@ func TestSessionRouteStopChannelNeverClosedQueue(t *testing.T) {
 	// Sending to the abandoned queue after teardown must be safe (fill or
 	// drop, never panic). If teardown had closed the channel this panics.
 	select {
-	case route.clientQueue <- []byte{1}:
+	case route.clientQueue <- ClientPacket{packet: []byte{1}}:
 	default:
 	}
 }

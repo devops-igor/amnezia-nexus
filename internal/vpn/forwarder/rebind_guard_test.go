@@ -73,7 +73,8 @@ func TestRebindHijackBlocked(t *testing.T) {
 		t.Fatalf("return route to victim's IP broken by hijack attempt: %v", err)
 	}
 	select {
-	case pkt := <-clientB:
+	case pktWork := <-clientB:
+		pkt := pktWork.Bytes()
 		if string(pkt) != "return-to-b" {
 			t.Fatalf("victim received wrong packet: %q", pkt)
 		}
@@ -136,7 +137,8 @@ func TestMismatchedSourceIPRejectedWithoutMutation(t *testing.T) {
 		t.Fatalf("RouteBackendToClient for initial IP: %v", err)
 	}
 	select {
-	case pkt := <-clientChan:
+	case pktWork := <-clientChan:
+		pkt := pktWork.Bytes()
 		if string(pkt) != "initial" {
 			t.Fatalf("payload mismatch: %q", pkt)
 		}

@@ -401,6 +401,20 @@
             if (flow.forward && flow.forward.failure) {
                 outcome = outcome + ' · ' + clientTokenLabel('failure', flow.forward.failure);
             }
+            // PROXY return: arrival, queue admission and the client handoff are three
+            // different observations. They are rendered as a chain so "admitted" is never
+            // read as "delivered", and a refusal states where the reply stopped.
+            if (flow.choice === 'PROXY' && flow.return && flow.return.evidence === 'observed') {
+                var chain = clientText('policy_client_return_chain_fmt')
+                    .replace('{matched}', String(flow.return.matched || 0))
+                    .replace('{admitted}', String(flow.return.admitted || 0))
+                    .replace('{delivered}', String(flow.return.delivered || 0))
+                    .replace('{failed}', String(flow.return.failed || 0));
+                if (flow.return.failure) {
+                    chain = chain + ' (' + clientTokenLabel('failure', flow.return.failure) + ')';
+                }
+                outcome = outcome + ' · ' + chain;
+            }
             // Admission and the backend device write are different facts: a proxy
             // flow states both, so "queued" is never read as "delivered".
             // Only stated when a device outcome exists: "0 written / 0 failed" on a

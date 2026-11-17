@@ -315,7 +315,8 @@ func TestVPNReturnTrafficSurvivabilityAfterRebalance(t *testing.T) {
 	}
 
 	select {
-	case delivered := <-clientCh:
+	case deliveredWork := <-clientCh:
+		delivered := deliveredWork.Bytes()
 		if !bytes.Equal(delivered, returnPkt) {
 			t.Errorf("delivered packet mismatch, got %v, want %v", delivered, returnPkt)
 		}
@@ -429,7 +430,8 @@ func TestOrchestratorRebalanceEndToEndWithVPNService(t *testing.T) {
 		t.Fatalf("RouteBackendToClient failed: %v", err)
 	}
 	select {
-	case rec := <-clientCh:
+	case recWork := <-clientCh:
+		rec := recWork.Bytes()
 		if !bytes.Equal(rec, pktReturn) {
 			t.Errorf("return packet mismatch")
 		}

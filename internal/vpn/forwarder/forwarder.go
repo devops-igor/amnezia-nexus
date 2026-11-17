@@ -76,7 +76,7 @@ type sessionRoute struct {
 	backendTunnelID int64
 	generation      uint64
 	returnPath      *ReturnPath // immutable owner for this route generation; nil means legacy
-	clientQueue     chan []byte
+	clientQueue     chan ClientPacket
 	queueReady      chan struct{} // coalesced notification; dequeue holds aggregateQueueMu
 	queueHighWater  atomic.Uint64
 	queueFullDrops  atomic.Uint64
@@ -150,7 +150,10 @@ type Forwarder struct {
 	clientDropsQueueFull   atomic.Uint64 // client packets dropped: backend queue full
 	clientDropsRateLimited atomic.Uint64 // client packets dropped: upstream token bucket exhausted
 	clientDropsNoBackend   atomic.Uint64 // client packets dropped: backend queue not registered/found
-	clientDropsTotal       atomic.Uint64 // monotonic total of client->backend drops in forwarder
+	// proxyReturnsUnmatched counts backend replies that reversed to no recorded flow
+	// or to another incarnation. They are counted, never credited to a guessed flow.
+	proxyReturnsUnmatched atomic.Uint64
+	clientDropsTotal      atomic.Uint64 // monotonic total of client->backend drops in forwarder
 	// spoofedRebinds counts client→backend packets whose claimed inner
 	// source IP failed the rebind ownership guard (issue #89): outside the
 	// portal subnet or already assigned to another route. Such packets are
@@ -358,7 +361,7 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 // Consumers must use this channel only as an observation/compatibility handle;
 // direct receives bypass queue accounting. Production consumers should leave
 // draining to StartPumps so occupancy and high-water metrics remain meaningful.
-func (f *Forwarder) GetClientPacketChannel(peerKey string) (<-chan []byte, bool) {
+func (f *Forwarder) GetClientPacketChannel(peerKey string) (<-chan ClientPacket, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	route, ok := f.routesByPeer[peerKey]

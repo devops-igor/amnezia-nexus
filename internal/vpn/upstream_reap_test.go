@@ -388,7 +388,8 @@ func TestUpstreamReapDoesNotRetireRecreatedSessionRoute(t *testing.T) {
 			t.Fatalf("iter %d: client packet channel missing", i)
 		}
 		select {
-		case got := <-clientQueue:
+		case gotWork := <-clientQueue:
+			got := gotWork.Bytes()
 			if !bytes.Equal(got, ret) {
 				t.Fatalf("iter %d: client queue delivered a different packet", i)
 			}

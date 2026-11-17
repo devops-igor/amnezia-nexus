@@ -747,7 +747,7 @@ func TestPolicyDispatch_R2H1_DirectWANReplyWriteFenceAndQueueBounding(t *testing
 
 	// 1. Fill clientQueue to capacity -> HandleWANReply must reject with ErrQueueFull
 	for len(route.clientQueue) < cap(route.clientQueue) {
-		route.clientQueue <- pkt
+		route.clientQueue <- ClientPacket{packet: pkt}
 	}
 
 	hostWAN := dem.cfg.HostWANIP

@@ -559,7 +559,7 @@ func TestRetiredRouteRejectsWriteSelectedBeforeRetirement(t *testing.T) {
 			// was suspended immediately before writeClientPacket admission.
 			go func() {
 				<-resume
-				f.writeClientPacket(oldRoute, dev, []byte("stale"))
+				f.writeClientPacket(oldRoute, dev, []byte("stale"), nil)
 				close(done)
 			}()
 			if replace {
@@ -577,7 +577,7 @@ func TestRetiredRouteRejectsWriteSelectedBeforeRetirement(t *testing.T) {
 				t.Fatal("retired generation admitted a stale write")
 			}
 			if replace {
-				f.writeClientPacket(f.routesByPeer["peer"], dev, []byte("current"))
+				f.writeClientPacket(f.routesByPeer["peer"], dev, []byte("current"), nil)
 				if dev.writeCount() != 1 {
 					t.Fatal("replacement generation cannot write")
 				}
@@ -693,7 +693,7 @@ func TestPerRouteWriteTelemetrySeparatesDifferentConsumers(t *testing.T) {
 	done := make(chan struct{})
 	defer func() { blocked.release(); <-done }()
 	go func() {
-		f.writeClientPacket(f.routesByPeer["peer-b"], blocked, []byte("blocked-b"))
+		f.writeClientPacket(f.routesByPeer["peer-b"], blocked, []byte("blocked-b"), nil)
 		close(done)
 	}()
 	select {
@@ -711,7 +711,7 @@ func TestPerRouteWriteTelemetrySeparatesDifferentConsumers(t *testing.T) {
 	}
 	blocked.release()
 	<-done
-	f.writeClientPacket(f.routesByPeer["peer-a"], failed, []byte("failed-a"))
+	f.writeClientPacket(f.routesByPeer["peer-a"], failed, []byte("failed-a"), nil)
 	stats = f.AllRouteQueueStats()
 	if stats["peer-a"].WriteErrors != 1 || stats["peer-b"].WriteErrors != 0 || stats["peer-b"].WriteStalls != 1 || stats["peer-b"].WritesInFlight != 0 {
 		t.Fatalf("completed writes attributed incorrectly: %+v", stats)

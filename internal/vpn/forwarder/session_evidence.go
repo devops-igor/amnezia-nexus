@@ -104,12 +104,22 @@ type SessionFlow struct {
 	// Return is what the DIRECT reply path actually delivered for this flow.
 	// PROXYReturnMeasured is false for every flow: the proxy return direction is
 	// not attributable at this checkpoint and the caller must say so.
-	ReturnPackets       uint64
-	ReturnBytes         uint64
-	ReturnFirst         time.Time
-	ReturnLast          time.Time
-	ReturnObserved      bool
+	ReturnPackets  uint64
+	ReturnBytes    uint64
+	ReturnFirst    time.Time
+	ReturnLast     time.Time
+	ReturnObserved bool
+	// PROXY return direction. Matched is arrival of a reply that reversed to this flow
+	// with the same session and route generation; Admitted is the client-queue enqueue;
+	// Delivered is the client writer accepting the whole packet. A flow with no matched
+	// reply reports PROXYReturnMeasured=false, which is "not measured", not "none".
 	PROXYReturnMeasured bool
+	ReturnMatched       uint64
+	ReturnAdmitted      uint64
+	ReturnDropped       uint64
+	ReturnDelivered     uint64
+	ReturnFailed        uint64
+	ReturnFailure       string
 }
 
 // SessionFlowList is a bounded, ordered page of one session's live flows.
@@ -244,13 +254,20 @@ func (m *DirectEgressManager) SnapshotSessionFlows(sessionID string, generation 
 			BackendWriteFailure: evidence.backendWriteFailure,
 			ReturnPackets:       evidence.returnPackets,
 			ReturnBytes:         evidence.returnBytes,
+			ReturnMatched:       evidence.returnMatched,
+			ReturnAdmitted:      evidence.returnAdmitted,
+			ReturnDropped:       evidence.returnDropped,
+			ReturnDelivered:     evidence.returnDelivered,
+			ReturnFailed:        evidence.returnFailed,
+			ReturnFailure:       evidence.returnToken,
 			ReturnFirst:         evidence.returnFirst,
 			ReturnLast:          evidence.returnLast,
 			ReturnObserved:      evidence.returnPackets > 0,
-			// PROXY return is not attributed at this checkpoint; a DIRECT flow
-			// states what the reply path observed, and nothing states payload
-			// success.
-			PROXYReturnMeasured: false,
+			// A flow that was never matched by a reply has no PROXY return
+			// measurement at all; the counters above are the measured facts. Nothing
+			// here states payload or application success.
+			PROXYReturnMeasured: evidence.returnMatched+evidence.returnAdmitted+evidence.returnDropped+
+				evidence.returnDelivered+evidence.returnFailed > 0,
 		})
 	}
 	total := len(m.flows)

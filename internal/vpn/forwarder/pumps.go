@@ -489,17 +489,33 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 	backendTraffic := f.backendTraffic[backendTunnelID]
 	f.mu.RUnlock()
 
+	// Reverse the reply into the admitting flow BEFORE any refusal, so a reply that is
+	// dropped for size or rate still says where it stopped instead of vanishing. A reply
+	// that reverses to no flow, or to another incarnation, stays unattributed: it is
+	// counted as such and never credited to a flow it cannot be shown to belong to.
+	clientIP, err := netip.ParseAddr(destIP)
+	if err != nil {
+		clientIP = netip.Addr{}
+	}
+	returnEvidence, returnMatched := f.proxyReturnEvidence(route, packet, clientIP)
+
 	pktLen := int64(len(packet))
 	if len(packet) > MaxClientQueuePacketBytes {
 		f.recordOversizedReturn(&f.oversizedBackendReturns, len(packet))
+		returnEvidence.recordReturnRefused(FlowReturnOversized)
 		return ErrPacketTooLarge
 	}
 	if tbDown != nil && !tbDown.Allow(pktLen) {
+		returnEvidence.recordReturnRefused(FlowReturnRateLimited)
 		return ErrRateLimitExceeded
 	}
 
 	pktCopy := make([]byte, len(packet))
 	copy(pktCopy, packet)
+	// The matched flow travels with the packet. The writer runs asynchronously and the
+	// flow can be retired or replaced in between, so the identity is fixed here and never
+	// re-resolved later.
+	queued := ClientPacket{packet: pktCopy, evidence: returnEvidence}
 
 	f.mu.RLock()
 	currentRoute, current := f.routesByIP[destIP]
@@ -510,11 +526,16 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		f.classifyReturnReject(ReturnRejectedUnrouted)
 		return ErrSessionNotRegistered
 	}
+	if returnMatched {
+		returnEvidence.recordReturnMatch()
+	} else {
+		f.proxyReturnsUnmatched.Add(1)
+	}
 	clientQueue := route.clientQueue
 	f.aggregateQueueMu.Lock()
 	f.reconcileBeforeQueueMutationLocked(route)
 	select {
-	case clientQueue <- pktCopy:
+	case clientQueue <- queued:
 		f.reconcileQueueOccupancyLocked(route)
 		routeOccupancy := uint64(len(clientQueue))
 		for current := route.queueHighWater.Load(); routeOccupancy > current; {
@@ -536,6 +557,7 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		}
 		f.aggregateQueueMu.Unlock()
 		f.mu.RUnlock()
+		returnEvidence.recordReturnAdmitted()
 		f.totalTxBytes.Add(pktLen)
 		f.totalTxPackets.Add(1)
 		route.traffic.record(pktLen, false)
@@ -553,6 +575,7 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		route.queueFullDrops.Add(1)
 		f.dropsQueueFull.Add(1)
 		f.dropsTotal.Add(1)
+		returnEvidence.recordReturnRefused(FlowReturnQueueFull)
 		return ErrQueueFull
 	}
 }
@@ -787,7 +810,7 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 	routeStopCh := route.stopCh
 
 	for {
-		var pkt []byte
+		var pkt ClientPacket
 		select {
 		case <-stopCh:
 			return
@@ -825,8 +848,12 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 			dev = routeWriter{path: route.returnPath, peerKey: route.peerKey, assignedIP: route.assignedIP}
 		}
 		f.mu.RUnlock()
-		if dev != nil {
-			f.writeClientPacket(route, dev, pkt)
+		if dev == nil {
+			// No engine writer for this route: the reply cannot be handed off, and the
+			// matched flow records the refusal instead of looking delivered.
+			pkt.evidenceOrNil().recordReturnRefused(FlowReturnPathClosed)
+			continue
 		}
+		f.writeClientPacket(route, dev, pkt.packet, pkt.evidenceOrNil())
 	}
 }

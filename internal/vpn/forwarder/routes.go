@@ -109,7 +109,7 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 		peerKey:         peerKey,
 		assignedIP:      assignedIP,
 		backendTunnelID: backendTunnelID,
-		clientQueue:     make(chan []byte, f.bufSize),
+		clientQueue:     make(chan ClientPacket, f.bufSize),
 		queueReady:      make(chan struct{}, 1),
 		stopCh:          make(chan struct{}),
 		limitDownBps:    limitDownBps,

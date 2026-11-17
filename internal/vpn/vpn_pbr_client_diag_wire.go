@@ -511,11 +511,23 @@ func clientDiagnosisFlowDispatch(flow forwarder.SessionFlow) ClientDiagnosisFlow
 	}
 }
 
-// clientDiagnosisFlowReturn states the return evidence. PROXY return is not
-// measured at this checkpoint and says so instead of appearing as "no traffic".
+// clientDiagnosisFlowReturn states the return evidence. A PROXY flow whose reply was
+// never matched says not_measured; one that was matched states arrival, queue admission
+// and handoff as separate counters, so none of them can be read as the next.
 func clientDiagnosisFlowReturn(flow forwarder.SessionFlow) ClientDiagnosisFlowReturn {
 	if flow.Choice == forwarder.EgressChoiceProxy {
-		return ClientDiagnosisFlowReturn{Evidence: "not_measured"}
+		if !flow.PROXYReturnMeasured {
+			return ClientDiagnosisFlowReturn{Evidence: "not_measured"}
+		}
+		return ClientDiagnosisFlowReturn{
+			Evidence:  "observed",
+			Matched:   flow.ReturnMatched,
+			Admitted:  flow.ReturnAdmitted,
+			Dropped:   flow.ReturnDropped,
+			Delivered: flow.ReturnDelivered,
+			Failed:    flow.ReturnFailed,
+			Failure:   flow.ReturnFailure,
+		}
 	}
 	out := ClientDiagnosisFlowReturn{
 		Evidence: "not_observed",

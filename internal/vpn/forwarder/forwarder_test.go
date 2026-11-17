@@ -108,7 +108,8 @@ func TestForwarderBasicRouting(t *testing.T) {
 	}
 
 	select {
-	case receivedPkt := <-clientChan:
+	case receivedWork := <-clientChan:
+		receivedPkt := receivedWork.Bytes()
 		if string(receivedPkt) != string(pktIn) {
 			t.Errorf("received packet mismatch: %s", string(receivedPkt))
 		}

@@ -1110,5 +1110,12 @@
   "policy_client_upstream_error": "erreur",
   "policy_client_backend_write_fmt": "périphérique : {ok} écrits / {failed} en échec",
   "policy_client_failure_backend_write_failed": "échec d’écriture sur le périphérique",
-  "policy_client_failure_short_write": "le périphérique a écrit une trame partielle"
+  "policy_client_failure_short_write": "le périphérique a écrit une trame partielle",
+  "policy_client_return_chain_fmt": "retour : apparié {matched} · en file {admitted} · remis {delivered} · en échec {failed}",
+  "policy_client_failure_client_queue_full": "file client pleine",
+  "policy_client_failure_client_rate_limited": "débit client limité",
+  "policy_client_failure_packet_too_large": "paquet trop volumineux",
+  "policy_client_failure_return_path_closed": "chemin de retour fermé",
+  "policy_client_failure_client_write_failed": "échec d’écriture client",
+  "policy_client_failure_client_short_write": "trame client partielle"
 }

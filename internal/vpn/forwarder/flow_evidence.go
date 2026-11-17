@@ -117,6 +117,17 @@ type flowStats struct {
 	returnBytes   atomic.Uint64
 	returnFirstNS atomic.Int64
 	returnLastNS  atomic.Int64
+
+	// PROXY return arrival and handoff. A matched reply is one whose tuple reversed to
+	// this flow and whose session and route generation still agreed; admission is the
+	// client-queue enqueue; delivered is the client writer accepting the whole packet.
+	// They are separate counters because "matched" and "delivered" fail differently.
+	returnMatched   atomic.Uint64
+	returnAdmitted  atomic.Uint64
+	returnDropped   atomic.Uint64
+	returnDelivered atomic.Uint64
+	returnFailed    atomic.Uint64
+	returnToken     atomic.Pointer[string]
 }
 
 // newFlowStats builds the evidence block for a decision. A decision taken through
@@ -194,6 +205,72 @@ func writeFailureToken(stats *flowStats) string {
 		return ""
 	}
 	if token := stats.backendWriteFailure.Load(); token != nil {
+		return *token
+	}
+	return ""
+}
+
+// recordReturnMatch notes one backend reply that reversed to this flow and whose owner
+// still agreed. It is arrival evidence, not delivery.
+func (s *flowStats) recordReturnMatch() {
+	if s == nil {
+		return
+	}
+	s.returnMatched.Add(1)
+}
+
+// recordReturnAdmitted notes that the reply entered the bounded client queue.
+func (s *flowStats) recordReturnAdmitted() {
+	if s == nil {
+		return
+	}
+	s.returnAdmitted.Add(1)
+}
+
+// recordReturnRefused notes where the reply stopped before the client writer: the queue,
+// the rate limiter, the size cap or the return path itself.
+func (s *flowStats) recordReturnRefused(token string) {
+	if s == nil {
+		return
+	}
+	s.returnDropped.Add(1)
+	s.setReturnToken(token)
+}
+
+// recordReturnDelivered notes the client writer's actual outcome for a matched reply.
+func (s *flowStats) recordReturnDelivered(written, total int, err error) {
+	if s == nil {
+		return
+	}
+	switch {
+	case err != nil:
+		s.returnFailed.Add(1)
+		s.setReturnToken(FlowReturnWriteFailed)
+	case written < total:
+		s.returnFailed.Add(1)
+		s.setReturnToken(FlowReturnShortWrite)
+	default:
+		s.returnDelivered.Add(1)
+	}
+}
+
+// setReturnToken keeps the first refusal visible: a later successful write must not erase
+// the reason an earlier reply of the same flow never reached the client.
+func (s *flowStats) setReturnToken(token string) {
+	if token == "" {
+		return
+	}
+	if s.returnToken.Load() == nil {
+		s.returnToken.CompareAndSwap(nil, &token)
+	}
+}
+
+// returnTokenFor reads the recorded return failure token, empty when none.
+func returnTokenFor(stats *flowStats) string {
+	if stats == nil {
+		return ""
+	}
+	if token := stats.returnToken.Load(); token != nil {
 		return *token
 	}
 	return ""
@@ -381,6 +458,12 @@ type sessionFlowEvidence struct {
 	returnBytes         uint64
 	returnFirst         time.Time
 	returnLast          time.Time
+	returnMatched       uint64
+	returnAdmitted      uint64
+	returnDropped       uint64
+	returnDelivered     uint64
+	returnFailed        uint64
+	returnToken         string
 }
 
 // forwardFailureToken reads the last refusal token of a flow, empty when none.
@@ -415,6 +498,12 @@ func snapshotFlowEvidence(stats *flowStats) sessionFlowEvidence {
 		backendWriteFailure: writeFailureToken(stats),
 		returnPackets:       stats.returnPackets.Load(),
 		returnBytes:         stats.returnBytes.Load(),
+		returnMatched:       stats.returnMatched.Load(),
+		returnAdmitted:      stats.returnAdmitted.Load(),
+		returnDropped:       stats.returnDropped.Load(),
+		returnDelivered:     stats.returnDelivered.Load(),
+		returnFailed:        stats.returnFailed.Load(),
+		returnToken:         returnTokenFor(stats),
 	}
 	if ns := stats.returnFirstNS.Load(); ns != 0 {
 		out.returnFirst = time.Unix(0, ns).UTC()

@@ -368,14 +368,24 @@ type ClientDiagnosisFlowForward struct {
 }
 
 // ClientDiagnosisFlowReturn is the return direction. DIRECT flows state what the
-// reply path admitted; PROXY flows state that it is not measured, which is a fact
-// about this build and not an absence of traffic.
+// reply path admitted. PROXY flows state the observed chain separately: a reply that
+// reversed to this flow, the client-queue admission, and the client writer's actual
+// handoff. None of them is application success, and a flow that was never matched says
+// not_measured rather than appearing as "no traffic".
 type ClientDiagnosisFlowReturn struct {
 	Evidence string `json:"evidence"`
 	Packets  uint64 `json:"packets"`
 	Bytes    uint64 `json:"bytes"`
 	FirstAt  string `json:"first_at,omitempty"`
 	LastAt   string `json:"last_at,omitempty"`
+	// PROXY direction: arrival, queue admission and client handoff are distinct
+	// observations, so "admitted" is never rendered as "delivered".
+	Matched   uint64 `json:"matched,omitempty"`
+	Admitted  uint64 `json:"admitted,omitempty"`
+	Dropped   uint64 `json:"dropped,omitempty"`
+	Delivered uint64 `json:"delivered,omitempty"`
+	Failed    uint64 `json:"failed,omitempty"`
+	Failure   string `json:"failure,omitempty"`
 }
 
 // ClientDiagnosisFlowNameCandidate is one retained answer that named the flow's
