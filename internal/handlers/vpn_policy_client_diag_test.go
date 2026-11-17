@@ -111,13 +111,34 @@ func TestClientDiagnosisHandlerPolicyDisabledOnADataPathlessService(t *testing.T
 		}
 	}
 
-	coverage, ok := dns["record_coverage"].(map[string]any)
+	recordCoverage, ok := dns["record_coverage"].(map[string]any)
 	if !ok {
 		t.Fatalf("dns.record_coverage missing: %s", w.Body.String())
 	}
-	gaps, ok := coverage["not_recorded"].([]any)
-	if !ok || len(gaps) == 0 {
-		t.Errorf("record coverage gaps = %v, want the observation gaps of this build", coverage["not_recorded"])
+	// The per-store gap list is an array and it is empty. The facts that used to be listed
+	// here — a failed answer, a non-answer query, the transport, the query receipt instant —
+	// are recorded by the query history of the same panel, so claiming them as gaps of this
+	// store would be a claim the answer cannot keep.
+	if gaps, ok := recordCoverage["not_recorded"].([]any); !ok {
+		t.Errorf("record coverage not_recorded is %T, want an array", recordCoverage["not_recorded"])
+	} else if len(gaps) != 0 {
+		t.Errorf("record coverage claims gaps the query history records: %v", gaps)
+	}
+	// The unavailable half is stated explicitly, not only by an empty list.
+	if state, _ := dns["state"].(string); state != "not_recorded" {
+		t.Errorf("dns.state = %v, want the explicit not_recorded token", dns["state"])
+	}
+	// The global coverage still discloses what this build genuinely cannot state, so an
+	// empty history is never read as "this client asked nothing".
+	globalCoverage, ok := out["coverage"].(map[string]any)
+	if !ok {
+		t.Fatalf("coverage section missing: %s", w.Body.String())
+	}
+	if notCovered, ok := globalCoverage["not_covered"].([]any); !ok || len(notCovered) == 0 {
+		t.Errorf("coverage.not_covered = %v, want the facts no store retains", globalCoverage["not_covered"])
+	}
+	if notRecorded, ok := globalCoverage["not_recorded"].([]any); !ok || len(notRecorded) == 0 {
+		t.Errorf("coverage.not_recorded = %v, want the remaining not-recorded fact", globalCoverage["not_recorded"])
 	}
 	if evaluated, _ := out["evaluated_at"].(string); evaluated == "" {
 		t.Error("evaluated_at must be present")
