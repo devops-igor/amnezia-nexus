@@ -32,8 +32,42 @@ type ReferenceServer struct {
 	conns      []net.Conn
 }
 
+// referenceListeners holds the echo listeners the reference server serves from.
+type referenceListeners struct {
+	tcp net.Listener
+	udp net.PacketConn
+}
+
+// referenceListenerOpener opens the echo listeners on the reference netstack.
+// StartReferenceServer uses openStackReferenceListeners; a test substitutes a
+// failing opener to exercise the constructor's listener failure path.
+type referenceListenerOpener func(stack *netstack.Net, addr netip.AddrPort) (referenceListeners, error)
+
+// openStackReferenceListeners opens the TCP and UDP echo listeners. It closes the
+// TCP listener if the UDP one fails, so a partial open leaves nothing behind.
+func openStackReferenceListeners(stack *netstack.Net, addr netip.AddrPort) (referenceListeners, error) {
+	tcpListener, err := stack.ListenTCPAddrPort(addr)
+	if err != nil {
+		return referenceListeners{}, fmt.Errorf("reference tcp listener: %w", err)
+	}
+	udpConn, err := stack.ListenUDPAddrPort(addr)
+	if err != nil {
+		_ = tcpListener.Close()
+		return referenceListeners{}, fmt.Errorf("reference udp listener: %w", err)
+	}
+	return referenceListeners{tcp: tcpListener, udp: udpConn}, nil
+}
+
 // StartReferenceServer initializes the standalone reference AWG device and netstack echo server.
 func (h *DifferentialHarness) StartReferenceServer() (*ReferenceServer, error) {
+	return h.startReferenceServer(openStackReferenceListeners)
+}
+
+// startReferenceServer builds the reference server. The server owns its device,
+// its tun and its listeners as soon as the device exists, so every later failure
+// closes that one owner; closing the device already closes the tun the device
+// reads from.
+func (h *DifferentialHarness) startReferenceServer(openListeners referenceListenerOpener) (*ReferenceServer, error) {
 	vt, stack, err := netstack.CreateNetTUN([]netip.Addr{h.destinationIP}, nil, 1280)
 	if err != nil {
 		return nil, fmt.Errorf("reference tun: %w", err)
@@ -43,48 +77,37 @@ func (h *DifferentialHarness) StartReferenceServer() (*ReferenceServer, error) {
 	// until the transport configuration below is applied.
 	tunGate := newFirstReadGate(vt)
 	dev := device.NewDevice(tunGate, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, "ref-server"))
+	ref := &ReferenceServer{dev: dev, tun: tunGate, stack: stack, port: h.listenPort}
+	started := false
+	defer func() {
+		if !started {
+			_ = ref.Close()
+		}
+	}()
+
 	if err := tunGate.WaitFirstRead(firstReadStartTimeout); err != nil {
-		dev.Close()
 		return nil, fmt.Errorf("reference tun reader start: %w", err)
 	}
 
-	tcpListener, err := stack.ListenTCPAddrPort(netip.AddrPortFrom(h.destinationIP, h.echoPort))
+	listeners, err := openListeners(stack, netip.AddrPortFrom(h.destinationIP, h.echoPort))
 	if err != nil {
-		dev.Close()
-		_ = vt.Close()
-		return nil, fmt.Errorf("reference tcp listener: %w", err)
+		return nil, err
 	}
-
-	udpConn, err := stack.ListenUDPAddrPort(netip.AddrPortFrom(h.destinationIP, h.echoPort))
-	if err != nil {
-		_ = tcpListener.Close()
-		dev.Close()
-		_ = vt.Close()
-		return nil, fmt.Errorf("reference udp listener: %w", err)
-	}
-
-	ref := &ReferenceServer{
-		dev:         dev,
-		tun:         tunGate,
-		stack:       stack,
-		tcpListener: tcpListener,
-		udpConn:     udpConn,
-		port:        h.listenPort,
-	}
+	ref.tcpListener = listeners.tcp
+	ref.udpConn = listeners.udp
 
 	ref.startEchoWorkers()
 
 	ipc := h.buildReferenceServerIPC()
 	if err := dev.IpcSet(ipc); err != nil {
-		_ = ref.Close()
 		return nil, fmt.Errorf("reference ipc set: %w", err)
 	}
 	if err := dev.Up(); err != nil {
-		_ = ref.Close()
 		return nil, fmt.Errorf("reference up: %w", err)
 	}
 	tunGate.MarkConfigured()
 
+	started = true
 	return ref, nil
 }
 

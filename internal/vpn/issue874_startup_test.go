@@ -3,9 +3,12 @@ package vpn
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -518,4 +521,163 @@ func verifyGateShutdownBeforeConfiguration(t *testing.T) {
 	if obs[0].delivered {
 		t.Fatal("held read consumed a packet during close")
 	}
+}
+
+// requireBoundedConstructorError runs a fixture constructor and requires it to
+// return a classified error, without panicking, within the shutdown bound. A
+// constructor that panics or never returns fails the test: the second is what a
+// reader stranded in a held read looks like, because device shutdown joins that
+// goroutine.
+func requireBoundedConstructorError(t *testing.T, name, wantSubstring string, fn func() (any, error)) error {
+	t.Helper()
+
+	type result struct {
+		value  any
+		err    error
+		panics any
+	}
+	done := make(chan result, 1)
+	go func() {
+		var out result
+		defer func() {
+			out.panics = recover()
+			done <- out
+		}()
+		out.value, out.err = fn()
+	}()
+
+	select {
+	case out := <-done:
+		if out.panics != nil {
+			t.Fatalf("%s: constructor panicked instead of returning an error: %v", name, out.panics)
+		}
+		if out.value != nil {
+			t.Fatalf("%s: constructor returned a live value alongside its failure: %T", name, out.value)
+		}
+		if out.err == nil {
+			t.Fatalf("%s: constructor reported no error", name)
+		}
+		if !strings.Contains(out.err.Error(), wantSubstring) {
+			t.Fatalf("%s: constructor error = %q, want it to contain %q", name, out.err, wantSubstring)
+		}
+		return out.err
+	case <-time.After(firstReadShutdownTimeout):
+		t.Fatalf("%s: constructor did not return within %s; device shutdown is stranded on a held read", name, firstReadShutdownTimeout)
+		return nil
+	}
+}
+
+// occupyWildcardUDPPort keeps a wildcard UDP port bound until the test ends, so a
+// device that tries to listen there fails its startup. A port of 0 picks a free
+// port, which is returned.
+func occupyWildcardUDPPort(t *testing.T, port int) uint16 {
+	t.Helper()
+	held, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
+	if err != nil {
+		t.Fatalf("occupy udp port %d: %v", port, err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+	return uint16(held.LocalAddr().(*net.UDPAddr).Port)
+}
+
+// newClientAsValue adapts NewClient to the constructor-failure helper.
+func newClientAsValue(h *DifferentialHarness) (any, error) {
+	client, err := h.NewClient()
+	if client == nil {
+		return nil, err
+	}
+	return client, err
+}
+
+// newReferenceServerAsValue adapts a reference constructor call to the
+// constructor-failure helper.
+func newReferenceServerAsValue(start func() (*ReferenceServer, error)) (any, error) {
+	server, err := start()
+	if server == nil {
+		return nil, err
+	}
+	return server, err
+}
+
+// TestIssue874_ClientConstructorFailurePaths exercises the client constructor's
+// configuration and listener-startup failure seams. Both must return their
+// classified error without panicking, and the device shutdown they perform must
+// release the gated reader instead of stranding it.
+func TestIssue874_ClientConstructorFailurePaths(t *testing.T) {
+	t.Run("Configuration", func(t *testing.T) {
+		harness := NewDifferentialHarness(t)
+		// Leading device-level key, before any peer key: an out-of-range listen
+		// port is rejected while the first read is still held.
+		harness.rawClientConfig = "ListenPort = 999999\n" + harness.rawClientConfig
+
+		requireBoundedConstructorError(t, "client configuration failure", "client uapi:",
+			func() (any, error) { return newClientAsValue(harness) })
+	})
+
+	t.Run("ListenerBind", func(t *testing.T) {
+		harness := NewDifferentialHarness(t)
+		// The pinned device opens its listener as soon as the port is
+		// configured, so a port that is already bound fails the constructor.
+		port := occupyWildcardUDPPort(t, 0)
+		harness.rawClientConfig = fmt.Sprintf("ListenPort = %d\n%s", port, harness.rawClientConfig)
+
+		err := requireBoundedConstructorError(t, "client listener failure", "client uapi:",
+			func() (any, error) { return newClientAsValue(harness) })
+		if !strings.Contains(err.Error(), "address already in use") {
+			t.Fatalf("client listener failure returned %q, want a bind conflict", err)
+		}
+	})
+}
+
+// TestIssue874_ReferenceConstructorFailurePaths exercises the reference
+// constructor's listener, configuration and listener-startup failure seams. The
+// listener seam injects a bounded error at the exact boundary where the
+// constructor used to close the device and the tun separately.
+func TestIssue874_ReferenceConstructorFailurePaths(t *testing.T) {
+	t.Run("Listener", func(t *testing.T) {
+		harness := NewDifferentialHarness(t)
+		injected := errors.New("injected reference listener failure")
+
+		err := requireBoundedConstructorError(t, "reference listener failure", injected.Error(),
+			func() (any, error) {
+				return newReferenceServerAsValue(func() (*ReferenceServer, error) {
+					return harness.startReferenceServer(func(*netstack.Net, netip.AddrPort) (referenceListeners, error) {
+						return referenceListeners{}, injected
+					})
+				})
+			})
+		if !errors.Is(err, injected) {
+			t.Fatalf("reference listener failure returned %v, want the opener error %v", err, injected)
+		}
+	})
+
+	t.Run("Configuration", func(t *testing.T) {
+		harness := NewDifferentialHarness(t)
+		// A server private key that decodes to the wrong length is rejected by
+		// IpcSet on the reference device.
+		shortKey := base64.StdEncoding.EncodeToString([]byte("abcd"))
+		harness.svc.mu.Lock()
+		harness.svc.cfg.ServerPrivateKey = shortKey
+		harness.svc.mu.Unlock()
+
+		requireBoundedConstructorError(t, "reference configuration failure", "reference ipc set:",
+			func() (any, error) {
+				return newReferenceServerAsValue(harness.StartReferenceServer)
+			})
+	})
+
+	t.Run("ListenerBind", func(t *testing.T) {
+		harness := NewDifferentialHarness(t)
+		// The reference device listens on the harness port, so holding that port
+		// makes its listener step fail.
+		occupyWildcardUDPPort(t, harness.listenPort)
+
+		err := requireBoundedConstructorError(t, "reference listener bind failure", "reference ipc set:",
+			func() (any, error) {
+				return newReferenceServerAsValue(harness.StartReferenceServer)
+			})
+		if !strings.Contains(err.Error(), "address already in use") {
+			t.Fatalf("reference listener bind failure returned %q, want a bind conflict", err)
+		}
+	})
 }

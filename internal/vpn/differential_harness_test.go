@@ -762,13 +762,12 @@ func (h *DifferentialHarness) NewClient() (*HarnessClient, error) {
 	}
 	uapi := configToUAPI(h.t.(*testing.T), h.rawClientConfig)
 	if err := dev.IpcSet(uapi); err != nil {
+		// Closing the device closes the tun it reads from.
 		dev.Close()
-		_ = vt.Close()
 		return nil, fmt.Errorf("client uapi: %w", err)
 	}
 	if err := dev.Up(); err != nil {
 		dev.Close()
-		_ = vt.Close()
 		return nil, fmt.Errorf("client up: %w", err)
 	}
 	tunGate.MarkConfigured()
