@@ -76,6 +76,64 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
+      # The lock tests rest on one property of mkdir: a plain `mkdir DIR` must fail when
+      # DIR already exists. The generated acquire script takes its critical-section branch
+      # from that exit status for both the canonical lock directory and the acquisition
+      # gate, so an implementation that reports success on an existing directory admits two
+      # holders at once. That is the observed double acquire, and the job log could not say
+      # which mkdir ran.
+      #
+      # This qualifies a verified implementation for this job only: a single-entry PATH shim
+      # holding `mkdir` and nothing else, so no other command can be shadowed, with the
+      # resolved and the selected implementation recorded in the log. It fails closed when no
+      # implementation satisfies the contract, because skipping the lock tests or running
+      # them against an unverified primitive would both report success without proving the
+      # lock. Nothing is installed, no host alternative changes and the runner label is
+      # unchanged. This qualifies the hosted runner only: the lock protocol on remote hosts
+      # is a separate open concern and is not qualified by this selection.
+      - name: Select a verified exclusive-create mkdir for the lock tests
+        run: |
+          set -euo pipefail
+          scripts/select_lock_mkdir.sh
+
+      # The shim above is exported for later steps, so prove here that a later subprocess
+      # actually resolves it. The lock tests start their shell with `bash -c`, which is the
+      # lookup exercised below; asserting this only in the setup step would not see the
+      # job-level PATH that the tests inherit.
+      #
+      # The first creation and the later refusal are asserted apart. Combining them into one
+      # `mkdir A && mkdir A` test would accept an implementation that cannot create anything
+      # at all: the first call fails, the chain short-circuits, and the failure reads as the
+      # refusal it is supposed to prove.
+      - name: Verify the lock tests inherit the selected mkdir
+        run: |
+          set -euo pipefail
+          shim="${LOCK_MKDIR_SHIM_DIR:?the mkdir selection did not export its shim directory}"
+          if ! resolved="$(bash -c 'command -v mkdir')"; then
+            echo "::error::a subprocess could not resolve mkdir at all"
+            exit 1
+          fi
+          if [ "$resolved" != "${shim}/mkdir" ]; then
+            echo "::error::the lock tests would resolve mkdir to ${resolved}, not ${shim}/mkdir"
+            exit 1
+          fi
+          probe="$(mktemp -d)"
+          trap 'rm -rf "$probe"' EXIT
+          if ! bash -c "mkdir '$probe/once'"; then
+            echo "::error::the inherited mkdir could not create a directory"
+            exit 1
+          fi
+          if [ ! -d "$probe/once" ]; then
+            echo "::error::the inherited mkdir reported success but created nothing"
+            exit 1
+          fi
+          if bash -c "mkdir '$probe/once' 2>/dev/null"; then
+            echo "::error::the inherited mkdir reports success for a directory that already exists"
+            exit 1
+          fi
+          printf 'lock tests inherit mkdir=%s (%s)\n' "$resolved" "$(bash -c 'mkdir --version 2>&1 | head -n 1')"
+          printf 'lock mkdir selection scope: %s\n' "${LOCK_MKDIR_SCOPE:-unknown}"
+
       - name: Set up Node.js for JSDOM Integration Tests
         uses: actions/setup-node@v7
         with:

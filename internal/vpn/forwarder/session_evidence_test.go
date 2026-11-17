@@ -132,8 +132,29 @@ func TestSnapshotSessionFlowsFiltersBySessionAndGeneration(t *testing.T) {
 	if flow.Generation != genA {
 		t.Errorf("generation = %d, want %d", flow.Generation, genA)
 	}
-	if list.Scanned < 2 {
-		t.Errorf("scanned = %d, want every visited record counted", list.Scanned)
+	// Scanned is this selection's own visit count through the session index, not a count of
+	// table records walked: sess-a owns exactly one flow, so exactly one record is visited
+	// even though the table holds sess-b's as well.
+	if list.Scanned != 1 {
+		t.Errorf("scanned = %d, want the selection's own single record", list.Scanned)
+	}
+	if !list.ScanComplete {
+		t.Error("a one-record selection must report its visit as complete")
+	}
+
+	// The isolation property that used to be implicit in a global scan count: adding more
+	// records for another client must not change this client's visit or total.
+	for i := range 8 {
+		port := uint16(41000 + i)
+		if err := dem.RecordFlow("peer-b", "sess-b", fwd.PeerRegistration("peer-b"),
+			clientPacket("10.100.0.6", port, "1.1.1.1", 53), EgressChoiceDirect); err != nil {
+			t.Fatalf("RecordFlow sess-b %d: %v", i, err)
+		}
+	}
+	after := dem.SnapshotSessionFlows("sess-a", genA, time.Now(), 0)
+	if after.Scanned != list.Scanned || after.Total != list.Total || len(after.Flows) != len(list.Flows) {
+		t.Errorf("another client's records changed this selection: scanned %d->%d total %d->%d rows %d->%d",
+			list.Scanned, after.Scanned, list.Total, after.Total, len(list.Flows), len(after.Flows))
 	}
 
 	// Another session's records are never returned for this selection.

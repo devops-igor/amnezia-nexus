@@ -54,19 +54,20 @@ func TestSnapshotSessionFlowsWorksAtCapacity(t *testing.T) {
 	fwd, dem, _ := newSessionEvidenceFixture(t, defaultMaxFlows)
 	sessionID, generation := fillFlowTableAtCapacity(t, fwd, dem, defaultMaxFlows)
 
-	// The read visits at most SessionFlowScanRecords records, so at the
-	// supported table size the answer is explicitly a windowed one instead of a
-	// sweep that holds the dataplane lock for the whole table.
+	// The visit is capped at SessionFlowScanRecords as a safety bound, while the total comes
+	// from the selection's own membership and stays exact. The answer is therefore "this
+	// client owns defaultMaxFlows flows, of which this page shows SessionFlowSnapshotMaxLimit
+	// and this visit examined SessionFlowScanRecords" - not a windowed total.
 	list := dem.SnapshotSessionFlows(sessionID, generation, time.Now(), SessionFlowSnapshotMaxLimit)
 	if list.ScanComplete {
-		t.Errorf("scan_complete = true for a %d-record table read with a %d-record window",
+		t.Errorf("scan_complete = true for a %d-record selection visited with a %d-record window",
 			defaultMaxFlows, SessionFlowScanRecords)
 	}
 	if list.Scanned != SessionFlowScanRecords {
-		t.Errorf("scanned = %d, want the window bound %d", list.Scanned, SessionFlowScanRecords)
+		t.Errorf("scanned = %d, want the visit bound %d", list.Scanned, SessionFlowScanRecords)
 	}
-	if list.Total != SessionFlowScanRecords {
-		t.Errorf("total = %d, want the matches inside the visited window", list.Total)
+	if list.Total != defaultMaxFlows {
+		t.Errorf("total = %d, want the selection's complete %d, not the visited window", list.Total, defaultMaxFlows)
 	}
 	if !list.Truncated || len(list.Flows) != SessionFlowSnapshotMaxLimit {
 		t.Fatalf("page = %d truncated=%v, want %d truncated", len(list.Flows), list.Truncated, SessionFlowSnapshotMaxLimit)
