@@ -118,6 +118,7 @@ func (te *TemplateEngine) ReloadTemplates() error {
 	layoutPartials := []string{
 		"settings_policy.html",
 		"settings_policy_client.html",
+		"settings_policy_upstream.html",
 	}
 
 	fresh := make(map[string]*template.Template)
