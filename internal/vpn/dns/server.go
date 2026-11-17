@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
@@ -33,8 +34,26 @@ type ServerConfig struct {
 }
 
 const (
-	defaultMaxInflight           = 64
-	defaultMaxInflightPerSession = 4
+	// DefaultMaxInflight bounds how many queries this server resolves at once
+	// across every session.
+	DefaultMaxInflight = 64
+	// DefaultMaxInflightPerSession is the per-session admission budget of a server
+	// whose caller declares no producer count and configures no budget.
+	//
+	// The budget exists so one session cannot own the server, not to model client
+	// pacing, and it must cover every producer that can present work for the same
+	// session at the same time. A budget below that producer bound admits work the
+	// bounded ingress queue already accepted and then answers it with a
+	// panel-origin SERVFAIL that never reaches an upstream: indistinguishable from
+	// an upstream failure at the client, and enough to break an ordinary browser
+	// burst (A, AAAA and HTTPS per name). The intercepted-DNS caller therefore
+	// declares its UDP producer count (DeclareUDPProducers), and the effective
+	// budget becomes that declaration plus this server's own TCP connection bound
+	// (MaxTCPSessions), clamped to DefaultMaxInflight; see sessionBudgetLocked. A
+	// caller that configures MaxInflightPerSession explicitly keeps exactly that
+	// value. Refusals above the effective budget stay bounded and are counted by
+	// cause (see AdmissionRejections).
+	DefaultMaxInflightPerSession = 8
 	defaultMaxTCPSessions        = 32
 	defaultMaxTTL                = 3600 * time.Second
 )
@@ -44,6 +63,29 @@ var (
 	ErrServerClosed = errors.New("dns server is closed")
 	// ErrInflightExceeded indicates the query was rejected due to inflight limits.
 	ErrInflightExceeded = errors.New("inflight query limit exceeded")
+)
+
+// AdmissionRejections attributes the queries a Server refused before contacting
+// any upstream, by the concurrency limit that refused them.
+//
+// These are panel-side outcomes, not resolver health: a refused query never
+// reaches an upstream, so an empty ResolverStatus alongside these counts is not
+// a contradiction and must never be read as "the upstream failed" or, worse, as
+// "the client was answered". The counts only grow and are read without a lock.
+type AdmissionRejections struct {
+	// PerSession counts refusals caused by the querying session's own budget.
+	PerSession uint64
+	// Global counts refusals caused by the server-wide budget.
+	Global uint64
+}
+
+// admissionOutcome reports which concurrency limit decided a query's admission.
+type admissionOutcome int
+
+const (
+	admitted admissionOutcome = iota
+	refusedPerSession
+	refusedGlobal
 )
 
 // Server coordinates DNS query execution, rate/inflight bounding, response shaping, and policy observation.
@@ -59,6 +101,16 @@ type Server struct {
 	closed      chan struct{}
 	wg          sync.WaitGroup
 
+	rejectedPerSession atomic.Uint64
+	rejectedGlobal     atomic.Uint64
+
+	// udpProducers is the producer count the calling UDP submission path declared,
+	// and perSessionExplicit records whether the caller configured the per-session
+	// budget itself. Both are guarded by sessionMu so a declaration and the
+	// creation of a scope's budget are ordered against each other.
+	udpProducers       int
+	perSessionExplicit bool
+
 	mu          sync.Mutex
 	closing     bool
 	activeConns map[net.Conn]*ScopeHandle
@@ -71,15 +123,11 @@ func (s *Server) SetObserver(obs RouteObserver) {
 	s.observer = obs
 }
 
-// NewServer creates a new Server.
-func NewServer(cfg ServerConfig, resolver Resolver, rules PolicySource) (*Server, error) {
-	if !cfg.Gateway.IsValid() || !cfg.Gateway.Addr().Is4() || cfg.Gateway.Port() != 53 {
-		return nil, errors.New("gateway must have valid IPv4 and port 53")
-	}
-	if resolver == nil {
-		return nil, errors.New("resolver cannot be nil")
-	}
-
+// applyServerDefaults fills the configuration a Server needs when the caller
+// leaves fields unset. It reports whether the caller configured the per-session
+// budget itself, because only an unconfigured budget follows the declared
+// producer bound.
+func applyServerDefaults(cfg *ServerConfig) (perSessionExplicit bool) {
 	if cfg.QueryTimeout <= 0 {
 		cfg.QueryTimeout = defaultQueryTimeout
 	}
@@ -89,24 +137,39 @@ func NewServer(cfg ServerConfig, resolver Resolver, rules PolicySource) (*Server
 	if cfg.MaxTTL <= 0 {
 		cfg.MaxTTL = defaultMaxTTL
 	}
+	perSessionExplicit = cfg.MaxInflightPerSession > 0
 	if cfg.MaxInflight <= 0 {
-		cfg.MaxInflight = defaultMaxInflight
+		cfg.MaxInflight = DefaultMaxInflight
 	}
-	if cfg.MaxInflightPerSession <= 0 {
-		cfg.MaxInflightPerSession = defaultMaxInflightPerSession
+	if !perSessionExplicit {
+		cfg.MaxInflightPerSession = DefaultMaxInflightPerSession
 	}
 	if cfg.MaxTCPSessions <= 0 {
 		cfg.MaxTCPSessions = defaultMaxTCPSessions
 	}
+	return perSessionExplicit
+}
+
+// NewServer creates a new Server.
+func NewServer(cfg ServerConfig, resolver Resolver, rules PolicySource) (*Server, error) {
+	if !cfg.Gateway.IsValid() || !cfg.Gateway.Addr().Is4() || cfg.Gateway.Port() != 53 {
+		return nil, errors.New("gateway must have valid IPv4 and port 53")
+	}
+	if resolver == nil {
+		return nil, errors.New("resolver cannot be nil")
+	}
+
+	perSessionExplicit := applyServerDefaults(&cfg)
 
 	return &Server{
-		cfg:         cfg,
-		resolver:    resolver,
-		policy:      rules,
-		globalSem:   make(chan struct{}, cfg.MaxInflight),
-		sessionSems: make(map[policy.Scope]chan struct{}),
-		closed:      make(chan struct{}),
-		activeConns: make(map[net.Conn]*ScopeHandle),
+		cfg:                cfg,
+		resolver:           resolver,
+		policy:             rules,
+		globalSem:          make(chan struct{}, cfg.MaxInflight),
+		sessionSems:        make(map[policy.Scope]chan struct{}),
+		closed:             make(chan struct{}),
+		activeConns:        make(map[net.Conn]*ScopeHandle),
+		perSessionExplicit: perSessionExplicit,
 	}, nil
 }
 
@@ -172,41 +235,122 @@ func validateQuery(req *mdns.Msg) *mdns.Msg {
 	return nil
 }
 
-func (s *Server) acquireInflight(ctx context.Context, scope policy.Scope) (func(), bool) {
+// DeclareUDPProducers records how many goroutines the caller's UDP submission
+// path can have inside ServeDNSMessage at the same time. Each of them blocks in
+// one query until it completes, so together with this server's TCP connection
+// bound they are the maximum concurrency one session can legitimately present.
+//
+// The declaration only raises the budget of an unconfigured per-session limit and
+// only ever raises it: a caller's explicit MaxInflightPerSession is never
+// overridden, and a later, smaller declaration cannot shrink a live budget. It
+// must be made while the calling path is being installed, before its first
+// submission, because a scope's budget is fixed when that scope first queries.
+// The producer that owns the submission path is the only caller, so a missing
+// declaration cannot silently narrow the budget below its own concurrency.
+func (s *Server) DeclareUDPProducers(producers int) {
+	if s == nil || producers <= 0 {
+		return
+	}
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	if producers > s.udpProducers {
+		s.udpProducers = producers
+	}
+}
+
+// sessionBudgetLocked returns the per-session admission budget: the caller's
+// configured value when there is one, otherwise the declared UDP producer count
+// plus this server's own TCP connection bound. The result never falls below the
+// unconfigured default and is clamped to the global budget.
+//
+// The clamp matters: a session that reaches the global budget cannot be refused
+// by its own budget first, so a genuine refusal is always the server-wide cause
+// and never a panel-side artifact of a smaller number. Callers must hold
+// sessionMu.
+func (s *Server) sessionBudgetLocked() int {
+	if s.perSessionExplicit {
+		return s.cfg.MaxInflightPerSession
+	}
+	budget := s.cfg.MaxInflightPerSession
+	if producers := s.udpProducers + s.cfg.MaxTCPSessions; producers > budget {
+		budget = producers
+	}
+	if budget > s.cfg.MaxInflight {
+		budget = s.cfg.MaxInflight
+	}
+	return budget
+}
+
+// SessionBudget returns the effective per-session admission budget. It exists so
+// a consumer can assert the budget covers the producer bounds it was told about
+// instead of trusting a constant.
+func (s *Server) SessionBudget() int {
+	if s == nil {
+		return 0
+	}
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	return s.sessionBudgetLocked()
+}
+
+// TCPSessionBudget returns the connection bound this server admits for one
+// session's TCP transport, which is one producer of concurrent queries.
+func (s *Server) TCPSessionBudget() int {
+	if s == nil {
+		return 0
+	}
+	return s.cfg.MaxTCPSessions
+}
+
+// sessionSemaphore returns the concurrency budget of one authenticated session,
+// creating it — together with its retirement watcher — on first use. Callers
+// must not hold sessionMu.
+func (s *Server) sessionSemaphore(ctx context.Context, scope policy.Scope) chan struct{} {
+	s.sessionMu.Lock()
+	sem, ok := s.sessionSems[scope]
+	if ok {
+		s.sessionMu.Unlock()
+		return sem
+	}
+	sem = make(chan struct{}, s.sessionBudgetLocked())
+	s.sessionSems[scope] = sem
+	if ctx != nil && ctx.Done() != nil {
+		go func(sc policy.Scope, ch chan struct{}, done <-chan struct{}) {
+			select {
+			case <-done:
+			case <-s.closed:
+			}
+			s.sessionMu.Lock()
+			if s.sessionSems[sc] == ch {
+				delete(s.sessionSems, sc)
+			}
+			s.sessionMu.Unlock()
+		}(scope, sem, ctx.Done())
+	}
+	s.sessionMu.Unlock()
+	return sem
+}
+
+// acquireInflight admits one query under the session budget and then under the
+// server-wide budget. Admission never blocks and never waits: a caller that
+// cannot be admitted is refused immediately and reports which limit refused it,
+// so the bounded inbound queue — not this limiter — absorbs a burst.
+func (s *Server) acquireInflight(ctx context.Context, scope policy.Scope) (func(), admissionOutcome) {
 	if scope.SessionID == "" {
 		select {
 		case s.globalSem <- struct{}{}:
-			return func() { <-s.globalSem }, true
+			return func() { <-s.globalSem }, admitted
 		default:
-			return nil, false
+			return nil, refusedGlobal
 		}
 	}
 
-	s.sessionMu.Lock()
-	sem, ok := s.sessionSems[scope]
-	if !ok {
-		sem = make(chan struct{}, s.cfg.MaxInflightPerSession)
-		s.sessionSems[scope] = sem
-		if ctx != nil && ctx.Done() != nil {
-			go func(sc policy.Scope, ch chan struct{}, done <-chan struct{}) {
-				select {
-				case <-done:
-				case <-s.closed:
-				}
-				s.sessionMu.Lock()
-				if s.sessionSems[sc] == ch {
-					delete(s.sessionSems, sc)
-				}
-				s.sessionMu.Unlock()
-			}(scope, sem, ctx.Done())
-		}
-	}
-	s.sessionMu.Unlock()
+	sem := s.sessionSemaphore(ctx, scope)
 
 	select {
 	case sem <- struct{}{}:
 	default:
-		return nil, false
+		return nil, refusedPerSession
 	}
 
 	select {
@@ -214,10 +358,10 @@ func (s *Server) acquireInflight(ctx context.Context, scope policy.Scope) (func(
 		return func() {
 			<-s.globalSem
 			<-sem
-		}, true
+		}, admitted
 	default:
 		<-sem
-		return nil, false
+		return nil, refusedGlobal
 	}
 }
 
@@ -240,6 +384,33 @@ func truncateUDP(req, resp *mdns.Msg) {
 	}
 }
 
+// refuseAdmission answers an admission refusal without contacting an upstream
+// and attributes it to the limit that refused it, so a panel-origin SERVFAIL is
+// never indistinguishable from an upstream failure.
+func (s *Server) refuseAdmission(req *mdns.Msg, outcome admissionOutcome) *mdns.Msg {
+	switch outcome {
+	case refusedPerSession:
+		s.rejectedPerSession.Add(1)
+	case refusedGlobal:
+		s.rejectedGlobal.Add(1)
+	}
+	resp := new(mdns.Msg)
+	resp.SetRcode(req, mdns.RcodeServerFailure)
+	return resp
+}
+
+// shapeClientResponse rewrites an upstream answer for the client that asked: the
+// client's message id, the AD flag the panel cannot vouch for, and UDP
+// truncation to the size the client advertised.
+func shapeClientResponse(req, resp *mdns.Msg, isTCP bool) *mdns.Msg {
+	resp.Id = req.Id
+	resp.AuthenticatedData = false
+	if !isTCP {
+		truncateUDP(req, resp)
+	}
+	return resp
+}
+
 // ServeDNSMessage processes a single DNS request, applying inflight limits, upstream resolution,
 // and response shaping.
 func (s *Server) ServeDNSMessage(ctx context.Context, scope any, req *mdns.Msg, isTCP bool) (*mdns.Msg, error) {
@@ -260,11 +431,11 @@ func (s *Server) ServeDNSMessage(ctx context.Context, scope any, req *mdns.Msg, 
 	}
 
 	scopeVal := toScope(scope)
-	release, ok := s.acquireInflight(ctx, scopeVal)
-	if !ok {
-		resp := new(mdns.Msg)
-		resp.SetRcode(req, mdns.RcodeServerFailure)
-		return resp, nil
+	release, outcome := s.acquireInflight(ctx, scopeVal)
+	if outcome != admitted {
+		// The refusal is answered here, without an upstream attempt, so it is
+		// counted by cause rather than left to look like an upstream SERVFAIL.
+		return s.refuseAdmission(req, outcome), nil
 	}
 	defer release()
 
@@ -275,15 +446,9 @@ func (s *Server) ServeDNSMessage(ctx context.Context, scope any, req *mdns.Msg, 
 		return resp, nil
 	}
 
-	// Shape response: clear AD flag and preserve client ID.
-	resp.Id = req.Id
-	resp.AuthenticatedData = false
-
-	if !isTCP {
-		truncateUDP(req, resp)
-	}
-
-	return resp, nil
+	// Shape response: clear AD flag, preserve the client id and truncate UDP to
+	// the size the client advertised.
+	return shapeClientResponse(req, resp, isTCP), nil
 }
 
 func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.PacketConn, errCh chan<- error, producers *sync.WaitGroup) {
@@ -586,4 +751,14 @@ func (s *Server) ActiveSessionLimiters() int {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 	return len(s.sessionSems)
+}
+
+// AdmissionRejections returns the queries this server refused without an
+// upstream attempt, split by the limit that refused them. The counts only grow,
+// so a caller can attribute a refusal without polling resolver health.
+func (s *Server) AdmissionRejections() AdmissionRejections {
+	return AdmissionRejections{
+		PerSession: s.rejectedPerSession.Load(),
+		Global:     s.rejectedGlobal.Load(),
+	}
 }

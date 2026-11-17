@@ -435,6 +435,49 @@ func (g *Gateway) ActiveSessionLimiters() int {
 	return g.server.ActiveSessionLimiters()
 }
 
+// AdmissionRejections returns this gateway's panel-side DNS refusal counters
+// (see Server.AdmissionRejections). A refused query never reached an upstream,
+// so these counts are the only attribution available for it: they must be read
+// alongside resolver status, never inferred from it.
+func (g *Gateway) AdmissionRejections() AdmissionRejections {
+	if g == nil || g.server == nil {
+		return AdmissionRejections{}
+	}
+	return g.server.AdmissionRejections()
+}
+
+// DeclareUDPProducers states how many goroutines this gateway's caller keeps
+// inside UDP query handling at the same time (see Server.DeclareUDPProducers).
+// The caller that owns the UDP submission path is responsible for declaring it
+// while installing that path: a gateway cannot infer the concurrency of the
+// queue or worker pool that feeds it, and a budget sized from a guess is what
+// made a healthy mixed-transport burst fail.
+func (g *Gateway) DeclareUDPProducers(producers int) {
+	if g == nil || g.server == nil {
+		return
+	}
+	g.server.DeclareUDPProducers(producers)
+}
+
+// SessionBudget returns the effective per-session admission budget of this
+// gateway's server, so a consumer can assert it covers the declared producers
+// plus the TCP connection bound instead of trusting a constant.
+func (g *Gateway) SessionBudget() int {
+	if g == nil || g.server == nil {
+		return 0
+	}
+	return g.server.SessionBudget()
+}
+
+// TCPSessionBudget returns the per-session TCP connection bound, which is the
+// second producer of concurrent queries a session can hold.
+func (g *Gateway) TCPSessionBudget() int {
+	if g == nil || g.server == nil {
+		return 0
+	}
+	return g.server.TCPSessionBudget()
+}
+
 // BeginRetire permanently retires scope handle, cancels query contexts, and invalidates session cache.
 // Synchronous, memory-only, and idempotent.
 func (g *Gateway) BeginRetire(scope *ScopeHandle) Retirement {

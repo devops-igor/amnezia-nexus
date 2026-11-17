@@ -141,6 +141,16 @@ type dnsContinuitySession struct {
 
 func newDNSContinuityHandler(gw *gatewaydns.Gateway, sessionLive func(sessionID string) bool) *dnsContinuityHandler {
 	ctx, cancel := context.WithCancel(context.Background())
+	// The fixed worker set is this responder's UDP producer bound, exactly as the
+	// intercepted-DNS pool is the policy path's: each worker blocks in one query
+	// until it completes. Declaring it lets the gateway derive its per-session
+	// admission budget from the whole producer set — these workers plus the TCP
+	// connection bound — instead of from the TCP half alone, which would refuse a
+	// supported mixed-transport burst with a SERVFAIL that never reaches an
+	// upstream. The declaration happens before this handler can admit any query.
+	if gw != nil {
+		gw.DeclareUDPProducers(dnsContinuityWorkerCount)
+	}
 	return &dnsContinuityHandler{
 		gw:          gw,
 		sessionLive: sessionLive,
