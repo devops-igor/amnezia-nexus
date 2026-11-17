@@ -172,6 +172,22 @@
                 rows.removeChild(rows.firstChild);
             }
         }
+        rows = clientElement('policyClientDNSRows');
+        if (rows) {
+            while (rows.firstChild) {
+                rows.removeChild(rows.firstChild);
+            }
+        }
+        var gaps = clientElement('policyClientDNSGaps');
+        if (gaps) {
+            while (gaps.firstChild) {
+                gaps.removeChild(gaps.firstChild);
+            }
+        }
+        var coverage = clientElement('policyClientDNSCoverage');
+        if (coverage) {
+            coverage.textContent = '';
+        }
         var limits = clientElement('policyClientLimitations');
         if (limits) {
             while (limits.firstChild) {
@@ -184,7 +200,7 @@
                 el.textContent = '-';
             }
         });
-        ['policyClientEvidenceFoot', 'policyClientFlowFoot'].forEach(function (id) {
+        ['policyClientEvidenceFoot', 'policyClientFlowFoot', 'policyClientDNSFoot'].forEach(function (id) {
             var el = clientElement(id);
             if (el) {
                 el.hidden = true;
@@ -365,6 +381,57 @@
         return clientText('policy_client_seconds').replace('{seconds}', String(Math.max(0, Math.floor(seconds))));
     }
 
+    // renderDNSRecords renders the observed answers. The name, its validated
+    // aliases and the addresses with their decisions are the record's own facts;
+    // nothing here re-derives a decision or a name.
+    function renderDNSRecords(records) {
+        var body = clientElement('policyClientDNSRows');
+        if (!body) {
+            return;
+        }
+        records.forEach(function (record) {
+            var row = root.document.createElement('tr');
+            var name = record.name || '';
+            if (record.aliases && record.aliases.length) {
+                name = name + ' → ' + record.aliases.join(' → ');
+            }
+            appendCell(row, name);
+            appendCell(row, record.qtype);
+            var addresses = (record.addresses || []).map(function (entry) {
+                return entry.address + ' (' + clientTokenLabel('decision', entry.decision) + ')';
+            }).join(', ');
+            appendCell(row, addresses);
+            appendCell(row, record.observed_at);
+            appendCell(row, record.expires_at);
+            appendCell(row, String(record.count || 1));
+            appendCell(row, clientTokenLabel('state', record.state));
+            body.appendChild(row);
+        });
+    }
+
+    function renderDNSCoverage(coverage) {
+        var el = clientElement('policyClientDNSCoverage');
+        if (el) {
+            if (!coverage) {
+                el.textContent = '';
+            } else {
+                el.textContent = clientText('policy_client_dns_coverage')
+                    .replace('{stored}', String(coverage.records_stored || 0))
+                    .replace('{collapsed}', String(coverage.collapsed || 0))
+                    .replace('{evicted}', String((coverage.evicted_per_session || 0) + (coverage.evicted_global || 0)))
+                    .replace('{aged}', String(coverage.aged_out || 0));
+            }
+        }
+        var gaps = clientElement('policyClientDNSGaps');
+        if (gaps && coverage && coverage.not_recorded) {
+            coverage.not_recorded.forEach(function (token) {
+                var item = root.document.createElement('li');
+                item.textContent = clientTokenLabel('limit', token);
+                gaps.appendChild(item);
+            });
+        }
+    }
+
     function renderLimitations(limitations) {
         var list = clientElement('policyClientLimitations');
         if (!list) {
@@ -409,6 +476,8 @@
         }
 
         renderEvidence(dns.entries || []);
+        renderDNSRecords(dns.records || []);
+        renderDNSCoverage(dns.record_coverage);
         renderFlows(flows.entries || []);
         renderLimitations((answer && answer.limitations) || []);
 
@@ -419,6 +488,16 @@
             evidenceFoot = clientText('policy_client_truncated').replace('{shown}', String((dns.entries || []).length)).replace('{total}', String(dns.total || 0));
         }
         renderFoot('policyClientEvidenceFoot', evidenceFoot);
+
+        var dnsFoot = '';
+        if (!(dns.records || []).length) {
+            dnsFoot = dns.records_available ? clientText('policy_client_dns_empty') : clientText('policy_client_dns_not_recorded');
+        } else if (dns.records_truncated) {
+            dnsFoot = clientText('policy_client_dns_truncated')
+                .replace('{shown}', String((dns.records || []).length))
+                .replace('{total}', String(dns.records_total || 0));
+        }
+        renderFoot('policyClientDNSFoot', dnsFoot);
 
         var flowFoot = '';
         if (!(flows.entries || []).length) {

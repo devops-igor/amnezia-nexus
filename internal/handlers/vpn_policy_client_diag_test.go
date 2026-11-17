@@ -84,6 +84,28 @@ func TestClientDiagnosisHandlerPolicyDisabledOnADataPathlessService(t *testing.T
 	if limitations, ok := out["limitations"].([]any); !ok || len(limitations) == 0 {
 		t.Errorf("limitations = %v, want a non-empty list", out["limitations"])
 	}
+	// The DNS section carries both halves of the answer with final shapes: the
+	// retained evidence and the observed-answer history.
+	dns, ok := out["dns"].(map[string]any)
+	if !ok {
+		t.Fatalf("dns section missing: %s", w.Body.String())
+	}
+	for _, key := range []string{"entries", "records"} {
+		if _, ok := dns[key].([]any); !ok {
+			t.Errorf("dns.%s is %T, want an array", key, dns[key])
+		}
+	}
+	if available, _ := dns["records_available"].(bool); available {
+		t.Error("a service without a policy runtime cannot report an available DNS collector")
+	}
+	coverage, ok := dns["record_coverage"].(map[string]any)
+	if !ok {
+		t.Fatalf("dns.record_coverage missing: %s", w.Body.String())
+	}
+	gaps, ok := coverage["not_recorded"].([]any)
+	if !ok || len(gaps) == 0 {
+		t.Errorf("record coverage gaps = %v, want the observation gaps of this build", coverage["not_recorded"])
+	}
 	if evaluated, _ := out["evaluated_at"].(string); evaluated == "" {
 		t.Error("evaluated_at must be present")
 	}

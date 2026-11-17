@@ -56,6 +56,10 @@ var clientDiagSectionIDs = []string{
 	"policyClientEvidenceFoot",
 	"policyClientFlowRows",
 	"policyClientFlowFoot",
+	"policyClientDNSRows",
+	"policyClientDNSFoot",
+	"policyClientDNSCoverage",
+	"policyClientDNSGaps",
 	"policyClientLimitations",
 }
 
@@ -230,6 +234,8 @@ var clientDiagTokenValues = map[string][]string{
 	"state": {
 		"live", "route_generation_replaced", "route_absent", "unknown_session",
 		"policy_disabled", "identity_unavailable", "inconsistent",
+		// Record states of one stored DNS answer.
+		"active", "expired",
 	},
 	"decision": {"direct", "proxy", "unknown"},
 	"protocol": {"tcp", "udp"},
@@ -242,5 +248,9 @@ var clientDiagTokenValues = map[string][]string{
 		"ipv6_not_supported", "encrypted_dns_not_observed",
 		"not_an_atomic_cross_subsystem_snapshot", "selection_changed_during_read",
 		"session_registry_unavailable", "flow_scan_window_partial",
+		// DNS observation coverage gaps.
+		"dns_coverage_partial", "dns_transport_not_recorded",
+		"dns_failures_not_recorded", "non_a_queries_not_recorded",
+		"query_receive_time_not_recorded", "records_without_route_generation",
 	},
 }

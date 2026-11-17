@@ -125,6 +125,30 @@ func (f *Forwarder) SessionRouteStates() []SessionRoute {
 	return out
 }
 
+// SessionRouteGeneration reports the route generation registered for a session,
+// or false when the session owns no route. It is read-only and takes the same
+// read lock as the other listings; a caller that must not invent an incarnation
+// uses it to decide whether one is established.
+func (f *Forwarder) SessionRouteGeneration(sessionID string) (uint64, bool) {
+	if f == nil || sessionID == "" {
+		return 0, false
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	generation := uint64(0)
+	found := false
+	for _, route := range f.routesByPeer {
+		if route == nil || route.sessionID != sessionID {
+			continue
+		}
+		if !found || route.generation > generation {
+			generation = route.generation
+			found = true
+		}
+	}
+	return generation, found
+}
+
 // SnapshotSessionFlows copies the flows owned by sessionID and, when generation
 // is non-zero, by that route generation, newest activity first, at most limit
 // records.

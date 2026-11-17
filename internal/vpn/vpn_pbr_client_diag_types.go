@@ -72,7 +72,15 @@ const (
 	ClientDiagnosisLimitSingleSnapshot       = "not_an_atomic_cross_subsystem_snapshot"
 	ClientDiagnosisLimitSelectionChanged     = "selection_changed_during_read"
 	ClientDiagnosisLimitFlowScanPartial      = "flow_scan_window_partial"
-	ClientDiagnosisLimitIdentitySource       = "session_registry_unavailable"
+	// DNS observation coverage gaps. They are facts about this build's
+	// observation boundary, reported rather than implied by silence.
+	ClientDiagnosisLimitDNSCoverage      = "dns_coverage_partial"
+	ClientDiagnosisLimitDNSTransport     = "dns_transport_not_recorded"
+	ClientDiagnosisLimitDNSFailures      = "dns_failures_not_recorded"
+	ClientDiagnosisLimitDNSNonAQueries   = "non_a_queries_not_recorded"
+	ClientDiagnosisLimitDNSReceiveTime   = "query_receive_time_not_recorded"
+	ClientDiagnosisLimitDNSNoIncarnation = "records_without_route_generation"
+	ClientDiagnosisLimitIdentitySource   = "session_registry_unavailable"
 )
 
 // ClientDiagnosisRequest is one validated diagnosis request.
@@ -90,6 +98,9 @@ type ClientDiagnosisRequest struct {
 	FlowLimit int
 	// EvidenceLimit bounds the retained-evidence page. Zero uses the default.
 	EvidenceLimit int
+	// DNSRecordLimit bounds the observed-answer history page. Zero uses the
+	// collector's per-session default.
+	DNSRecordLimit int
 }
 
 // ClientDiagnosisTarget is one selectable session incarnation.
@@ -177,7 +188,77 @@ type ClientDiagnosisEntry struct {
 	NamesMatch string   `json:"names_match"`
 }
 
-// ClientDiagnosisDNS is the retained address-evidence section.
+// ClientDiagnosisDNSAddress is one address an observed answer wrote into the
+// route cache, with the decision it wrote.
+type ClientDiagnosisDNSAddress struct {
+	Address  string `json:"address"`
+	Decision string `json:"decision"`
+}
+
+// ClientDiagnosisDNSRecord is one client DNS answer the router actually observed.
+//
+// It is history, not the active route cache: the record survives its evidence
+// expiring and is dropped only by age, capacity or session retirement. Fields this
+// build's observation boundary cannot see are present with explicit tokens
+// (transport, received_at) instead of being guessed.
+type ClientDiagnosisDNSRecord struct {
+	Seq                  uint64                      `json:"seq"`
+	Name                 string                      `json:"name"`
+	QType                string                      `json:"qtype"`
+	RCode                string                      `json:"rcode"`
+	Aliases              []string                    `json:"aliases"`
+	Addresses            []ClientDiagnosisDNSAddress `json:"addresses"`
+	ResolvedAddresses    int                         `json:"resolved_addresses"`
+	ObservedAt           string                      `json:"observed_at"`
+	ReceivedAt           string                      `json:"received_at"`
+	Transport            string                      `json:"transport"`
+	ExpiresAt            string                      `json:"expires_at"`
+	ExpiresInSeconds     int64                       `json:"expires_in_seconds"`
+	State                string                      `json:"state"`
+	PolicyGeneration     string                      `json:"policy_generation,omitempty"`
+	RouteGeneration      *uint64                     `json:"route_generation,omitempty"`
+	IncarnationKnown     bool                        `json:"route_generation_established"`
+	Classification       string                      `json:"classification"`
+	ClassificationReason string                      `json:"classification_reason,omitempty"`
+	CacheWrite           string                      `json:"cache_write"`
+	Count                int                         `json:"count"`
+	FirstSeen            string                      `json:"first_seen"`
+	LastSeen             string                      `json:"last_seen"`
+}
+
+// ClientDiagnosisRecordLimits states the collector's bounds in force.
+type ClientDiagnosisRecordLimits struct {
+	RecordsPerSession  int   `json:"records_per_session"`
+	RecordsTotal       int   `json:"records_total"`
+	MaxAgeSeconds      int64 `json:"max_age_seconds"`
+	BytesTotal         int   `json:"bytes_total"`
+	NamesPerRecord     int   `json:"names_per_record"`
+	AddressesPerRecord int   `json:"addresses_per_record"`
+}
+
+// ClientDiagnosisDNSRecordCoverage reports what the collector holds and what it
+// could not observe.
+type ClientDiagnosisDNSRecordCoverage struct {
+	StartedAt          string                      `json:"started_at"`
+	RecordsStored      int                         `json:"records_stored"`
+	EstimatedBytes     int                         `json:"estimated_bytes"`
+	Sessions           int                         `json:"sessions"`
+	Written            int64                       `json:"written"`
+	Collapsed          int64                       `json:"collapsed"`
+	EvictedPerSession  int64                       `json:"evicted_per_session"`
+	EvictedGlobal      int64                       `json:"evicted_global"`
+	AgedOut            int64                       `json:"aged_out"`
+	RejectedNoRoom     int64                       `json:"rejected_no_room"`
+	WithoutIncarnation int64                       `json:"without_route_generation"`
+	Limits             ClientDiagnosisRecordLimits `json:"limits"`
+	// NotRecorded lists the observation gaps of this build, so a missing query
+	// type or failure is stated instead of read as "nothing happened".
+	NotRecorded []string `json:"not_recorded"`
+}
+
+// ClientDiagnosisDNS is the DNS section: the retained address evidence (what the
+// route cache holds right now) and the observed-answer history (what the router
+// actually saw).
 type ClientDiagnosisDNS struct {
 	Available bool `json:"available"`
 	// State is the view state: fresh, absent, quarantined, stale_generation or
@@ -190,6 +271,13 @@ type ClientDiagnosisDNS struct {
 	Entries   []ClientDiagnosisEntry    `json:"entries"`
 	Total     int                       `json:"total"`
 	Truncated bool                      `json:"truncated"`
+	// Records are the observed answers, newest first. RecordsAvailable reports
+	// whether a collector was consulted at all.
+	RecordsAvailable bool                             `json:"records_available"`
+	Records          []ClientDiagnosisDNSRecord       `json:"records"`
+	RecordsTotal     int                              `json:"records_total"`
+	RecordsTruncated bool                             `json:"records_truncated"`
+	RecordCoverage   ClientDiagnosisDNSRecordCoverage `json:"record_coverage"`
 }
 
 // ClientDiagnosisFlow is one live flow record.

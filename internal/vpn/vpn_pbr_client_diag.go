@@ -8,6 +8,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/session"
 )
@@ -155,6 +156,7 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 	entries, generation := s.clientDiagnosisEntries(sessionID, now, req.EvidenceLimit)
 	out.Selection.PolicyGeneration = generation
 	flows, flowsAvailable := clientDiagnosisSnapshotFlows(fwd, sessionID, selection.RouteGeneration, now, req.FlowLimit)
+	dnsRecords, dnsRecordsRead := s.clientDiagnosisDNSRecords(sessionID, req.DNSRecordLimit)
 	if err := ctx.Err(); err != nil {
 		return ClientDiagnosisResponse{}, err
 	}
@@ -169,7 +171,20 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 		return out, nil
 	}
 
-	clientDiagnosisApplyRecords(&out, entries, generation, flows, flowsAvailable, now)
+	clientDiagnosisApplyRecords(&out, clientDiagnosisReads{
+		entries:        entries,
+		generation:     generation,
+		flows:          flows,
+		flowsAvailable: flowsAvailable,
+		dnsRecords:     dnsRecords,
+		dnsRecordsRead: dnsRecordsRead,
+	}, now)
+	if dnsRecordsRead {
+		// The observation boundary this build records at cannot see failure
+		// answers, non-A queries, the transport or the query receipt time. Say so
+		// once, so an empty history is never read as "this client asked nothing".
+		out.Limitations = append(out.Limitations, ClientDiagnosisLimitDNSCoverage)
+	}
 	return out, nil
 }
 
@@ -387,6 +402,21 @@ func clientDiagnosisStillSelected(fwd *forwarder.Forwarder, sessionID string, ge
 		}
 	}
 	return false
+}
+
+// clientDiagnosisDNSRecords reads the session's observed-answer history from the
+// bounded collector. It reports whether a collector was consulted at all: a
+// service without one must say "not recorded", not "nothing was observed".
+func (s *Service) clientDiagnosisDNSRecords(sessionID string, limit int) (dnsledger.SessionSnapshot, bool) {
+	mem := s.clientDiagnosisRouteCache()
+	if mem == nil {
+		return dnsledger.SessionSnapshot{Records: []dnsledger.Record{}}, false
+	}
+	ledger := mem.DNSLedger()
+	if ledger == nil {
+		return dnsledger.SessionSnapshot{Records: []dnsledger.Record{}}, false
+	}
+	return ledger.Snapshot(sessionID, limit), true
 }
 
 // clientDiagnosisSnapshotFlows reads the selected incarnation's flow records and

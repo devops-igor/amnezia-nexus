@@ -39,6 +39,9 @@ type clientDiagFixture struct {
 	sessions   *session.SessionManager
 	wan        *mockPBRDevice
 	backend    *mockPBRDevice
+	// returnPath is the client return path the route was registered with, kept so
+	// a rekey case can register the same incarnation again.
+	returnPath *forwarder.ReturnPath
 
 	mu       sync.Mutex
 	replies  [][]byte
@@ -103,6 +106,18 @@ func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 				Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
 				A:   f.proxyIP.AsSlice(),
 			})
+		case "alias.example.":
+			// A validated alias chain: the queried name is a CNAME to the name
+			// that carries the address.
+			resp.Answer = append(resp.Answer,
+				&mdns.CNAME{
+					Hdr:    mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeCNAME, Class: mdns.ClassINET, Ttl: 300},
+					Target: "plain.example.",
+				},
+				&mdns.A{
+					Hdr: mdns.RR_Header{Name: "plain.example.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+					A:   f.example.AsSlice(),
+				})
 		}
 		return resp, nil
 	}}
@@ -137,6 +152,7 @@ func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	fwd.RegisterSessionWithReturnPath(sess.ID, "conn-1", f.peerKey, f.clientIP.String(), 11, returnPath)
+	f.returnPath = returnPath
 
 	f.fwd = fwd
 	f.routeCache = routeCache
@@ -187,6 +203,37 @@ func (f *clientDiagFixture) queryIP(t *testing.T, name string, srcPort uint16) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatalf("no DNS reply delivered for %s", name)
+}
+
+// queryType is one client DNS query of an arbitrary type through the
+// intercepted path, which is how a non-A query reaches the observer.
+func (f *clientDiagFixture) queryType(t *testing.T, name string, qtype uint16, srcPort uint16) {
+	t.Helper()
+	req := new(mdns.Msg)
+	req.SetQuestion(mdns.Fqdn(name), qtype)
+	req.Id = 0x4321
+	raw, err := req.Pack()
+	if err != nil {
+		t.Fatalf("pack query: %v", err)
+	}
+	f.mu.Lock()
+	before := len(f.replies)
+	f.mu.Unlock()
+	pkt := buildTestPBRUDPPacket(f.clientIP, f.gwDNS, srcPort, 53, raw)
+	if err := f.fwd.RouteClientToBackend(f.peerKey, pkt); err != nil {
+		t.Fatalf("RouteClientToBackend(%s/%d): %v", name, qtype, err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		n := len(f.replies)
+		f.mu.Unlock()
+		if n > before {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("no DNS reply delivered for %s/%d", name, qtype)
 }
 
 // sendTCP is one client TCP packet through the real routing decision.

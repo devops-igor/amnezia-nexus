@@ -12,6 +12,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	mdns "github.com/miekg/dns"
 )
@@ -158,6 +159,12 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 
 	if mem, ok := cfg.RouteCache.(*MemoryRouteCache); ok {
 		mem.AttachMatcher(cfg.PolicyMatcher)
+		// Bind each stored DNS observation to the route generation registered for
+		// its session at observation time.
+		fwd := s.forwarder
+		mem.SetIncarnationSource(func(sessionID string) (uint64, bool) {
+			return fwd.SessionRouteGeneration(sessionID)
+		})
 	}
 
 	dem := forwarder.NewDirectEgressManager(forwarder.DirectEgressConfig{
@@ -313,6 +320,16 @@ type MemoryRouteCache struct {
 	// route-removal path already retires through, so releasing a scope also
 	// releases the work that scope authorized.
 	runtime *pbrDNSHandler
+	// dnsRecords is the bounded in-memory record of the answers this observer
+	// actually wrote (issue #861). It is not the route cache: an entry here
+	// survives the evidence expiring and is dropped only by age, capacity or
+	// session retirement. Guarded by dnsRecordsMu, never by mu.
+	dnsRecordsMu sync.RWMutex
+	dnsRecords   *dnsledger.Ledger
+	// incarnation resolves which registered route generation owns a session at
+	// observation time, so a record can state its incarnation instead of
+	// guessing one. nil means "not established", never "the current one".
+	incarnation func(sessionID string) (uint64, bool)
 }
 
 // NewMemoryRouteCache creates an in-memory RouteCache backed by authentic policy.RouteCache.
@@ -326,9 +343,10 @@ func NewMemoryRouteCache() *MemoryRouteCache {
 		m.Publish(snap)
 	}
 	return &MemoryRouteCache{
-		rc:      rc,
-		matcher: m,
-		gen:     initialGen,
+		rc:         rc,
+		matcher:    m,
+		gen:        initialGen,
+		dnsRecords: dnsledger.New(),
 	}
 }
 
@@ -432,8 +450,125 @@ func (c *MemoryRouteCache) ObserveDNSResponse(sessionID string, req, resp *mdns.
 	if snap == nil {
 		return nil
 	}
-	_, err = gatewaydns.ObserveResponse(req, resp, snap, sc, time.Now(), 3600*time.Second)
+	// One instant for both the evidence deadline and the stored observation, so a
+	// record cannot claim a different time than the decision it describes.
+	observedAt := time.Now()
+	observed, err := gatewaydns.ObserveResponseResult(req, resp, snap, sc, observedAt, 3600*time.Second)
+	// The record is written whether or not the cache accepted the evidence: an
+	// answer the observation path rejected is exactly what an administrator needs
+	// to see, and it is stored with that verdict rather than as trusted evidence.
+	c.recordDNSObservation(sessionID, observed)
 	return err
+}
+
+// DNSTransportNotRecorded is the token an answer carries where the transport
+// would go. The observer boundary this build records at does not see it; only the
+// DNS server, which this slice does not modify, does.
+const DNSTransportNotRecorded = "not_recorded"
+
+// recordDNSObservation stores one observed answer in the bounded DNS ledger,
+// bound to the session and to the route generation registered for it at the time
+// of the observation.
+func (c *MemoryRouteCache) recordDNSObservation(sessionID string, observed gatewaydns.ObservedAnswer) {
+	ledger := c.DNSLedger()
+	if ledger == nil || sessionID == "" {
+		return
+	}
+	answer := observed.Classification
+	name := dnsledger.CanonicalName(observed.QName)
+	aliases := []string{}
+	if len(answer.Names) > 0 {
+		name = dnsledger.CanonicalName(answer.Names[0])
+		for _, alias := range answer.Names[1:] {
+			aliases = append(aliases, dnsledger.CanonicalName(alias))
+		}
+	}
+	if name == "" {
+		return
+	}
+	addresses := make([]dnsledger.AddressDecision, 0, len(observed.Observations))
+	for _, observation := range observed.Observations {
+		addresses = append(addresses, dnsledger.AddressDecision{
+			Address:  observation.IP,
+			Decision: observation.Decision.String(),
+		})
+	}
+	generation, generationKnown := c.observedIncarnation(sessionID)
+	ledger.Record(dnsledger.Input{
+		SessionID:            sessionID,
+		RouteGeneration:      generation,
+		RouteGenerationKnown: generationKnown,
+		Name:                 name,
+		Aliases:              aliases,
+		QType:                observed.QType,
+		RCode:                observed.RCode,
+		ObservedAt:           observed.RecvTime,
+		ExpiresAt:            observed.ExpiresAt,
+		PolicyGeneration:     answerSnapshotGeneration(c),
+		ClassificationValid:  answer.Valid,
+		ClassificationReason: answer.Reason,
+		Addresses:            addresses,
+		ResolvedAddressCount: len(answer.ResolvedAddresses),
+		CacheVerdict:         cacheVerdictToken(observed.CacheErr),
+	}, observed.RecvTime)
+}
+
+// observedIncarnation reports the route generation registered for the session at
+// observation time. It never substitutes the current generation for an unknown
+// one: a DNS answer can arrive while the session owns no route, and inventing a
+// mapping would attribute one incarnation's query to another's.
+func (c *MemoryRouteCache) observedIncarnation(sessionID string) (uint64, bool) {
+	c.mu.RLock()
+	resolver := c.incarnation
+	c.mu.RUnlock()
+	if resolver == nil {
+		return 0, false
+	}
+	return resolver(sessionID)
+}
+
+// answerSnapshotGeneration reports the policy generation the answer was evaluated
+// against, so a record can state it.
+func answerSnapshotGeneration(c *MemoryRouteCache) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.gen
+}
+
+// cacheVerdictToken names the route cache's answer to an evidence write.
+func cacheVerdictToken(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, policy.ErrSessionRetired):
+		return "session_retired"
+	case errors.Is(err, policy.ErrGenerationMismatch):
+		return "generation_mismatch"
+	case errors.Is(err, policy.ErrCapacityExceeded):
+		return "quarantined"
+	default:
+		return "error"
+	}
+}
+
+// DNSLedger returns the bounded DNS observation store, or nil when this cache has
+// none. It is the only reader the per-client diagnosis uses.
+func (c *MemoryRouteCache) DNSLedger() *dnsledger.Ledger {
+	if c == nil {
+		return nil
+	}
+	c.dnsRecordsMu.RLock()
+	defer c.dnsRecordsMu.RUnlock()
+	return c.dnsRecords
+}
+
+// SetIncarnationSource installs the route authority that binds a DNS observation
+// to the incarnation that produced it. The resolver is read-only and must not
+// call back into the cache: the forwarder lock sits above the cache lock.
+func (c *MemoryRouteCache) SetIncarnationSource(resolve func(sessionID string) (uint64, bool)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.incarnation = resolve
 }
 
 // Open opens or retrieves the session cache for the given scope.
@@ -501,6 +636,11 @@ func (c *MemoryRouteCache) SessionScopeForLiveSession(sessionID string, live fun
 func (c *MemoryRouteCache) RetireSessionScope(sessionID string) {
 	if sc := c.SessionScope(sessionID); sc != nil {
 		sc.Invalidate()
+	}
+	// The observation history is released in the same call as the scope: a
+	// retired session leaves no browsing record behind.
+	if ledger := c.DNSLedger(); ledger != nil {
+		ledger.RetireSession(sessionID)
 	}
 	if runtime := c.sessionRuntime(); runtime != nil {
 		runtime.RetireSessionRuntime(sessionID)

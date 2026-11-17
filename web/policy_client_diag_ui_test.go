@@ -78,6 +78,8 @@ w._ = key => {
   if (key === 'policy_client_flow_count') return 'FLOWS {shown}/{total}';
   if (key === 'policy_client_partial_scan') return 'PARTIAL {scanned}';
   if (key === 'policy_client_seconds') return '{seconds}s';
+  if (key === 'policy_client_dns_coverage') return 'DNS-COVERAGE {stored}/{collapsed}/{evicted}/{aged}';
+  if (key === 'policy_client_dns_truncated') return 'DNS-TRUNC {shown}/{total}';
   // Token families resolve to a sentinel, so an assertion can prove the token
   // was looked up in the dictionary instead of being printed raw.
   if (key.indexOf('policy_client_state_') === 0) return 'STATE:' + key.slice('policy_client_state_'.length);

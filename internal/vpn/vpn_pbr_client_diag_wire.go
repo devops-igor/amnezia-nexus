@@ -4,7 +4,10 @@ import (
 	"strconv"
 	"time"
 
+	mdns "github.com/miekg/dns"
+
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
@@ -77,10 +80,57 @@ func clientDiagnosisCoverage(fwd *forwarder.Forwarder, now time.Time) ClientDiag
 // evidence".
 func clientDiagnosisEmptyDNS() ClientDiagnosisDNS {
 	return ClientDiagnosisDNS{
-		Available: false,
-		State:     ClientDiagnosisTokenNotRecorded,
-		Names:     ClientDiagnosisNamesMatch{Match: ClientDiagnosisNamesNotRecorded, Reason: ClientDiagnosisLimitNamesNotRecorded},
-		Entries:   []ClientDiagnosisEntry{},
+		Available:        false,
+		State:            ClientDiagnosisTokenNotRecorded,
+		Names:            ClientDiagnosisNamesMatch{Match: ClientDiagnosisNamesNotRecorded, Reason: ClientDiagnosisLimitNamesNotRecorded},
+		Entries:          []ClientDiagnosisEntry{},
+		Records:          []ClientDiagnosisDNSRecord{},
+		RecordsAvailable: false,
+		RecordCoverage:   clientDiagnosisEmptyRecordCoverage(false),
+	}
+}
+
+// clientDiagnosisEmptyRecordCoverage is the coverage block of a section that was
+// not read. Every list stays present so the panel never has to guess a shape.
+func clientDiagnosisEmptyRecordCoverage(available bool) ClientDiagnosisDNSRecordCoverage {
+	coverage := ClientDiagnosisDNSRecordCoverage{
+		Limits: clientDiagnosisRecordLimits(dnsledger.Limits{
+			RecordsPerSession:  dnsledger.MaxRecordsPerSession,
+			RecordsTotal:       dnsledger.MaxRecordsTotal,
+			MaxAgeSeconds:      int64(dnsledger.MaxRecordAge / time.Second),
+			BytesTotal:         dnsledger.MaxBytesTotal,
+			NamesPerRecord:     dnsledger.MaxNamesPerRecord,
+			AddressesPerRecord: dnsledger.MaxAddressesPerRecord,
+		}),
+		NotRecorded: clientDiagnosisDNSRecordGaps(),
+	}
+	if !available {
+		coverage.StartedAt = ""
+	}
+	return coverage
+}
+
+// clientDiagnosisDNSRecordGaps lists what the observation boundary this build
+// records at cannot see. They are reported, never implied by silence: an
+// administrator must not read "no record" as "no query".
+func clientDiagnosisDNSRecordGaps() []string {
+	return []string{
+		ClientDiagnosisLimitDNSTransport,
+		ClientDiagnosisLimitDNSFailures,
+		ClientDiagnosisLimitDNSNonAQueries,
+		ClientDiagnosisLimitDNSReceiveTime,
+	}
+}
+
+// clientDiagnosisRecordLimits renders the collector's bounds.
+func clientDiagnosisRecordLimits(limits dnsledger.Limits) ClientDiagnosisRecordLimits {
+	return ClientDiagnosisRecordLimits{
+		RecordsPerSession:  limits.RecordsPerSession,
+		RecordsTotal:       limits.RecordsTotal,
+		MaxAgeSeconds:      limits.MaxAgeSeconds,
+		BytesTotal:         limits.BytesTotal,
+		NamesPerRecord:     limits.NamesPerRecord,
+		AddressesPerRecord: limits.AddressesPerRecord,
 	}
 }
 
@@ -93,16 +143,28 @@ func clientDiagnosisEmptyFlows() ClientDiagnosisFlows {
 	}
 }
 
-// clientDiagnosisApplyRecords fills the two record sections from the copies the
-// read path took. A policy-active forwarder without a direct-egress manager
-// leaves the flow section at its not_recorded default: nothing was read, and
-// claiming a store this answer never consulted would be a false statement.
-func clientDiagnosisApplyRecords(out *ClientDiagnosisResponse, entries policy.SessionEntryList, generation string, flows forwarder.SessionFlowList, flowsAvailable bool, now time.Time) {
-	out.DNS = clientDiagnosisDNSFromEntries(entries, generation, now)
-	if !flowsAvailable {
+// clientDiagnosisReads is everything the read path copied for one answer.
+type clientDiagnosisReads struct {
+	entries        policy.SessionEntryList
+	generation     string
+	flows          forwarder.SessionFlowList
+	flowsAvailable bool
+	dnsRecords     dnsledger.SessionSnapshot
+	dnsRecordsRead bool
+}
+
+// clientDiagnosisApplyRecords fills the record sections from the copies the read
+// path took. A store that was not consulted keeps its not_recorded default:
+// claiming one this answer never read would be a false statement.
+func clientDiagnosisApplyRecords(out *ClientDiagnosisResponse, reads clientDiagnosisReads, now time.Time) {
+	out.DNS = clientDiagnosisDNSFromEntries(reads.entries, reads.generation, now)
+	if reads.dnsRecordsRead {
+		clientDiagnosisApplyDNSRecords(&out.DNS, reads.dnsRecords, now)
+	}
+	if !reads.flowsAvailable {
 		return
 	}
-	out.Flows = clientDiagnosisFlowsFromSnapshot(flows, now)
+	out.Flows = clientDiagnosisFlowsFromSnapshot(reads.flows, now)
 	if !out.Flows.ScanComplete {
 		// The flow listing visits a bounded window of the table, so the record
 		// count is a lower bound. Saying so keeps "total" from being read as an
@@ -111,16 +173,121 @@ func clientDiagnosisApplyRecords(out *ClientDiagnosisResponse, entries policy.Se
 	}
 }
 
+// clientDiagnosisApplyDNSRecords fills the observed-answer history.
+func clientDiagnosisApplyDNSRecords(section *ClientDiagnosisDNS, snapshot dnsledger.SessionSnapshot, now time.Time) {
+	section.RecordsAvailable = true
+	section.RecordsTotal = snapshot.Total
+	section.RecordsTruncated = snapshot.Truncated
+	section.Records = make([]ClientDiagnosisDNSRecord, 0, len(snapshot.Records))
+	for _, record := range snapshot.Records {
+		section.Records = append(section.Records, clientDiagnosisDNSRecord(record, now))
+	}
+	section.RecordCoverage = ClientDiagnosisDNSRecordCoverage{
+		StartedAt:          clientDiagnosisTime(snapshot.Stats.StartedAt),
+		RecordsStored:      snapshot.Stats.Records,
+		EstimatedBytes:     snapshot.Stats.Bytes,
+		Sessions:           snapshot.Stats.Sessions,
+		Written:            snapshot.Stats.Written,
+		Collapsed:          snapshot.Stats.Collapsed,
+		EvictedPerSession:  snapshot.Stats.EvictedSession,
+		EvictedGlobal:      snapshot.Stats.EvictedGlobal,
+		AgedOut:            snapshot.Stats.AgedOut,
+		RejectedNoRoom:     snapshot.Stats.RejectedNoRoom,
+		WithoutIncarnation: snapshot.Stats.WithoutIncarnate,
+		Limits:             clientDiagnosisRecordLimits(snapshot.Limits),
+		NotRecorded:        clientDiagnosisDNSRecordGaps(),
+	}
+}
+
+// clientDiagnosisDNSRecord renders one stored observation. The state is computed
+// at the sampled instant and the stored record is not touched: an expired record
+// stays in the history and is labeled expired.
+func clientDiagnosisDNSRecord(record dnsledger.Record, now time.Time) ClientDiagnosisDNSRecord {
+	out := ClientDiagnosisDNSRecord{
+		Seq:                  record.Seq,
+		Name:                 record.Name,
+		QType:                clientDiagnosisQType(record.QType),
+		RCode:                clientDiagnosisRCode(record.RCode),
+		Aliases:              []string{},
+		Addresses:            make([]ClientDiagnosisDNSAddress, 0, len(record.Addresses)),
+		ResolvedAddresses:    record.ResolvedAddressCount,
+		ObservedAt:           clientDiagnosisTime(record.ObservedAt),
+		ReceivedAt:           ClientDiagnosisTokenNotRecorded,
+		Transport:            ClientDiagnosisTokenNotRecorded,
+		ExpiresAt:            clientDiagnosisTime(record.ExpiresAt),
+		State:                clientDiagnosisRecordState(record.ExpiresAt, now),
+		PolicyGeneration:     record.PolicyGeneration,
+		IncarnationKnown:     record.RouteGenerationKnown,
+		Classification:       "invalid",
+		ClassificationReason: record.ClassificationReason,
+		CacheWrite:           record.CacheVerdict,
+		Count:                record.Count,
+		FirstSeen:            clientDiagnosisTime(record.FirstSeen),
+		LastSeen:             clientDiagnosisTime(record.LastSeen),
+	}
+	if record.ClassificationValid {
+		out.Classification = "valid"
+		out.ClassificationReason = ""
+	}
+	if record.RouteGenerationKnown {
+		generation := record.RouteGeneration
+		out.RouteGeneration = &generation
+	}
+	if len(record.Aliases) > 0 {
+		out.Aliases = append(out.Aliases, record.Aliases...)
+	}
+	for _, address := range record.Addresses {
+		out.Addresses = append(out.Addresses, ClientDiagnosisDNSAddress{
+			Address:  address.Address.String(),
+			Decision: address.Decision,
+		})
+	}
+	if !record.ExpiresAt.IsZero() {
+		out.ExpiresInSeconds = int64(record.ExpiresAt.Sub(now) / time.Second)
+	}
+	return out
+}
+
+// clientDiagnosisRecordState labels a stored record at the sampled instant.
+func clientDiagnosisRecordState(expiresAt, now time.Time) string {
+	if expiresAt.IsZero() {
+		return ClientDiagnosisTokenNotRecorded
+	}
+	if expiresAt.After(now) {
+		return "active"
+	}
+	return "expired"
+}
+
+// clientDiagnosisQType renders a query type. Only A reaches this boundary today,
+// and an unknown value is reported numerically rather than guessed.
+func clientDiagnosisQType(qtype uint16) string {
+	if name, ok := mdns.TypeToString[qtype]; ok {
+		return name
+	}
+	return "TYPE" + strconv.Itoa(int(qtype))
+}
+
+// clientDiagnosisRCode renders a response code.
+func clientDiagnosisRCode(rcode int) string {
+	if name, ok := mdns.RcodeToString[rcode]; ok {
+		return name
+	}
+	return "RCODE" + strconv.Itoa(rcode)
+}
+
 // clientDiagnosisDNSFromEntries renders the retained address evidence.
 func clientDiagnosisDNSFromEntries(list policy.SessionEntryList, generation string, now time.Time) ClientDiagnosisDNS {
 	out := ClientDiagnosisDNS{
-		Available:  true,
-		State:      string(list.State),
-		Generation: list.Generation,
-		Names:      ClientDiagnosisNamesMatch{Match: ClientDiagnosisNamesNotRecorded, Reason: ClientDiagnosisLimitNamesNotRecorded},
-		Entries:    make([]ClientDiagnosisEntry, 0, len(list.Entries)),
-		Total:      list.Total,
-		Truncated:  list.Truncated,
+		Available:      true,
+		State:          string(list.State),
+		Generation:     list.Generation,
+		Names:          ClientDiagnosisNamesMatch{Match: ClientDiagnosisNamesNotRecorded, Reason: ClientDiagnosisLimitNamesNotRecorded},
+		Entries:        make([]ClientDiagnosisEntry, 0, len(list.Entries)),
+		Total:          list.Total,
+		Truncated:      list.Truncated,
+		Records:        []ClientDiagnosisDNSRecord{},
+		RecordCoverage: clientDiagnosisEmptyRecordCoverage(false),
 	}
 	if generation != "" && out.Generation == "" {
 		out.Generation = generation

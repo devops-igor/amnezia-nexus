@@ -77,6 +77,37 @@ func TestSessionRouteStatesReportsTheRegisteredGenerations(t *testing.T) {
 	}
 }
 
+// TestSessionRouteGenerationReportsOnlyRegisteredRoutes pins the read-only
+// incarnation lookup the DNS recorder uses: it reports the registered generation
+// for an exact session and nothing for an unknown or empty one.
+func TestSessionRouteGenerationReportsOnlyRegisteredRoutes(t *testing.T) {
+	fwd := NewForwarder(nil, "10.100.0.0/16", 16)
+	fwd.RegisterSession("sess-a", "conn-a", "peer-a", "10.100.0.5", 11)
+	first := fwd.PeerRegistration("peer-a")
+
+	generation, ok := fwd.SessionRouteGeneration("sess-a")
+	if !ok || generation != first {
+		t.Fatalf("generation = %d/%v, want the registered %d", generation, ok, first)
+	}
+	if _, ok := fwd.SessionRouteGeneration("sess-unknown"); ok {
+		t.Error("an unregistered session reported a generation")
+	}
+	if _, ok := fwd.SessionRouteGeneration(""); ok {
+		t.Error("an empty session id reported a generation")
+	}
+	var nilForwarder *Forwarder
+	if _, ok := nilForwarder.SessionRouteGeneration("sess-a"); ok {
+		t.Error("a nil forwarder reported a generation")
+	}
+
+	// A rekey of the same session moves the incarnation.
+	fwd.RegisterSession("sess-a", "conn-a", "peer-a", "10.100.0.5", 11)
+	second, ok := fwd.SessionRouteGeneration("sess-a")
+	if !ok || second <= first {
+		t.Errorf("generation after rekey = %d/%v, want greater than %d", second, ok, first)
+	}
+}
+
 func TestSnapshotSessionFlowsFiltersBySessionAndGeneration(t *testing.T) {
 	fwd, dem, _ := newSessionEvidenceFixture(t, 64)
 	fwd.RegisterSession("sess-a", "conn-a", "peer-a", "10.100.0.5", 11)
