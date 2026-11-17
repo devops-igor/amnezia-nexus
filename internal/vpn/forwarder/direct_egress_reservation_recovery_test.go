@@ -37,6 +37,17 @@ func (h *sessionQuarantineHarness) reservationFillState() (total, expired int) {
 	return len(h.dem.flows), expired
 }
 
+// keepRecoveryFlowAlive gives the recovery-phase flow a lifetime that does not
+// race the fixture's own bookkeeping. The millisecond timeout above exists only
+// to age the fill flows quickly, and asserting delivery of the recovered flow's
+// reply must measure the reply path, not how long the harness needs to copy its
+// captured packets. Every ageing assertion has already run when this is called.
+func (h *sessionQuarantineHarness) keepRecoveryFlowAlive() {
+	h.dem.mu.Lock()
+	h.dem.cfg.UDPTimeout = 2 * time.Second
+	h.dem.mu.Unlock()
+}
+
 // fillReservationCap admits count DIRECT flows through the dispatcher and returns
 // the NAT port each one used, in admission order.
 func (h *sessionQuarantineHarness) fillReservationCap(count int) []uint16 {
@@ -134,6 +145,7 @@ func TestDirectEgressReservationCapRecoversAfterExpiry(t *testing.T) {
 	// Once the ordinary cooldown elapses, one new DIRECT flow is admitted through
 	// the dispatcher and works end to end, with no test-only reclamation step.
 	time.Sleep(3 * cooldown)
+	h.keepRecoveryFlowAlive()
 	if err := h.dispatchUDP(reservationFillPort, uint16(53+reservationCap+1), "recovered"); err != nil {
 		t.Fatalf("DIRECT admission did not recover after the ordinary cooldown: %v", err)
 	}
@@ -184,6 +196,7 @@ func TestDirectEgressReservationCapRecoversAtDefaultBound(t *testing.T) {
 	}
 
 	time.Sleep(3 * cooldown)
+	h.keepRecoveryFlowAlive()
 	recoveryPort := uint16(53 + defaultMaxHostReservations + 1)
 	if err := h.dispatchUDP(reservationFillPort, recoveryPort, "recovered"); err != nil {
 		t.Fatalf("DIRECT admission did not recover at the default bound: %v", err)
