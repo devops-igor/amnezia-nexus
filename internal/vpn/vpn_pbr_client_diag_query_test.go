@@ -41,9 +41,11 @@ type queryWatch struct {
 	plan       dnsQueryPlan
 	sessionID  string
 	generation uint64
-	startedAt  time.Time
-	counts     map[uint64]int
-	reply      []byte
+	// eventName is the name the ledger stores for this query.
+	eventName string
+	startedAt time.Time
+	counts    map[uint64]int
+	reply     []byte
 }
 
 // releaseSlow unblocks the blocking upstream exchange exactly once. It is registered
@@ -66,6 +68,20 @@ func (f *clientDiagFixture) eventCounts(sessionID string) map[uint64]int {
 	return counts
 }
 
+// newQueryWatch records the identity and the terminal-history baseline a query must be
+// matched against. startedAt is the dispatch instant for a real query; a control that
+// starts later records that later instant.
+func newQueryWatch(plan dnsQueryPlan, sessionID string, generation uint64, counts map[uint64]int) *queryWatch {
+	return &queryWatch{
+		plan:       plan,
+		sessionID:  sessionID,
+		generation: generation,
+		eventName:  eventIdentityOf(plan.name),
+		startedAt:  time.Now(),
+		counts:     counts,
+	}
+}
+
 // dispatchQuery sends one query through the intercepted path and returns its watch.
 // It does not wait: the caller decides which completion it needs, and a worker
 // goroutine can use it without touching a *testing.T.
@@ -81,13 +97,8 @@ func (f *clientDiagFixture) dispatchQuery(plan dnsQueryPlan) (*queryWatch, error
 	if len(states) != 1 {
 		return nil, fmt.Errorf("route states = %d, want 1", len(states))
 	}
-	watch := &queryWatch{
-		plan:       plan,
-		sessionID:  states[0].SessionID,
-		generation: states[0].Generation,
-		startedAt:  time.Now(),
-		counts:     f.eventCounts(states[0].SessionID),
-	}
+	watch := newQueryWatch(plan, states[0].SessionID, states[0].Generation,
+		f.eventCounts(states[0].SessionID))
 	pkt := buildTestPBRUDPPacket(f.clientIP, f.gwDNS, plan.srcPort, 53, raw)
 	if err := f.fwd.RouteClientToBackend(f.peerKey, pkt); err != nil {
 		return nil, fmt.Errorf("RouteClientToBackend(%s/%d): %w", plan.name, plan.qtype, err)
@@ -164,33 +175,48 @@ func (f *clientDiagFixture) awaitReply(watch *queryWatch, budget time.Duration) 
 	}
 }
 
-// matchEvent finds the terminal event this query published: same session, same receipt
-// generation, same name and type, of the requested kind when one is given, and newer
-// than the history the watch captured. An event that was already in the ledger - even
-// an answered one for the same name and type - is not this query's publication.
+// eventIdentityOf renders the name the ledger stores for a query, so a watch can match
+// it without re-normalising on every snapshot.
+func eventIdentityOf(name string) string {
+	return strings.ToLower(strings.TrimSuffix(mdns.Fqdn(name), "."))
+}
+
+// carriesWatchIdentity reports whether an event was recorded for the same session
+// incarnation, name, type and (when given) kind as the watched query.
+func carriesWatchIdentity(watch *queryWatch, event dnsledger.Event, kind string) bool {
+	if event.Name != watch.eventName || event.QType != watch.plan.qtype {
+		return false
+	}
+	if !event.RouteGenerationKnown || event.RouteGeneration != watch.generation {
+		return false
+	}
+	return kind == "" || event.Kind == kind
+}
+
+// publishedForQuery reports whether a ledger event is a publication OF this query:
+// written after it was dispatched, either as a new sequence number or as a collapse
+// that raised the count of an existing one.
+func publishedForQuery(watch *queryWatch, event dnsledger.Event) bool {
+	if event.LastSeen.Before(watch.startedAt) {
+		return false
+	}
+	previous, existed := watch.counts[event.Seq]
+	return !existed || event.Count > previous
+}
+
+// matchEvent finds the terminal event this query published: the watched identity, of
+// the requested kind when one is given, and newer than the history the watch captured.
+// An event that was already in the ledger - even an answered one for the same name and
+// type - is not this query's publication.
 func (f *clientDiagFixture) matchEvent(watch *queryWatch, kind string) (dnsledger.Event, bool) {
 	ledger := f.svc.clientDiagnosisRouteCache().DNSLedger()
 	if ledger == nil {
 		return dnsledger.Event{}, false
 	}
-	wantName := strings.ToLower(strings.TrimSuffix(mdns.Fqdn(watch.plan.name), "."))
 	for _, event := range ledger.SnapshotEvents(watch.sessionID, 0).Events {
-		if event.Name != wantName || event.QType != watch.plan.qtype {
-			continue
+		if carriesWatchIdentity(watch, event, kind) && publishedForQuery(watch, event) {
+			return event, true
 		}
-		if !event.RouteGenerationKnown || event.RouteGeneration != watch.generation {
-			continue
-		}
-		if kind != "" && event.Kind != kind {
-			continue
-		}
-		if event.LastSeen.Before(watch.startedAt) {
-			continue
-		}
-		if previous, existed := watch.counts[event.Seq]; existed && event.Count <= previous {
-			continue
-		}
-		return event, true
 	}
 	return dnsledger.Event{}, false
 }

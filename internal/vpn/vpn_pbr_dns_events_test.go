@@ -488,13 +488,8 @@ func TestClientDiagnosisQueryWaitsRequireTheQuerysOwnIdentity(t *testing.T) {
 	// The event for that query is real and published. A watch that starts after it was
 	// published must not adopt it: the history it captured already contains it.
 	states := f.fwd.SessionRouteStates()
-	late := &queryWatch{
-		plan:       owner,
-		sessionID:  states[0].SessionID,
-		generation: states[0].Generation,
-		startedAt:  time.Now(),
-		counts:     f.eventCounts(states[0].SessionID),
-	}
+	late := newQueryWatch(owner, states[0].SessionID, states[0].Generation,
+		f.eventCounts(states[0].SessionID))
 	if event, ok := f.awaitEvent(late, 100*time.Millisecond, gatewaydns.QueryEventAnswered); ok {
 		t.Fatalf("an event published before the query was sent satisfied the wait: %+v", event)
 	}
