@@ -226,6 +226,10 @@ type Service struct {
 	// across the per-backend read loops: all accesses are atomic, so the
 	// worst case is one log line per second in aggregate.
 	dropLogUntil atomic.Int64
+	// clientDiagBusy admits one per-client diagnosis snapshot at a time
+	// (issue #861): the flow half visits the direct-egress table under the lock
+	// the packet path takes per lookup, so concurrent reads would multiply it.
+	clientDiagBusy atomic.Bool
 
 	lastReconcileTime                      time.Time
 	lastReconcileByTunnel                  map[int64]time.Time
