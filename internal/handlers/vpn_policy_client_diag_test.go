@@ -98,6 +98,19 @@ func TestClientDiagnosisHandlerPolicyDisabledOnADataPathlessService(t *testing.T
 	if available, _ := dns["records_available"].(bool); available {
 		t.Error("a service without a policy runtime cannot report an available DNS collector")
 	}
+	flows, ok := out["flows"].(map[string]any)
+	if !ok {
+		t.Fatalf("flows section missing: %s", w.Body.String())
+	}
+	if _, ok := flows["entries"].([]any); !ok {
+		t.Errorf("flows.entries is %T, want an array", flows["entries"])
+	}
+	for _, key := range []string{"scanned", "scan_complete", "total", "truncated"} {
+		if _, ok := flows[key]; !ok {
+			t.Errorf("flows is missing %q", key)
+		}
+	}
+
 	coverage, ok := dns["record_coverage"].(map[string]any)
 	if !ok {
 		t.Fatalf("dns.record_coverage missing: %s", w.Body.String())

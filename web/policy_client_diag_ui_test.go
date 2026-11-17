@@ -80,12 +80,19 @@ w._ = key => {
   if (key === 'policy_client_seconds') return '{seconds}s';
   if (key === 'policy_client_dns_coverage') return 'DNS-COVERAGE {stored}/{collapsed}/{evicted}/{aged}';
   if (key === 'policy_client_dns_truncated') return 'DNS-TRUNC {shown}/{total}';
+  if (key === 'policy_client_outcome_fmt') return 'OUTCOME {ok}/{failed} · return {return} {packets}';
+  if (key === 'policy_client_counters_live_note') return 'COUNTERS-LIVE';
   // Token families resolve to a sentinel, so an assertion can prove the token
   // was looked up in the dictionary instead of being printed raw.
   if (key.indexOf('policy_client_state_') === 0) return 'STATE:' + key.slice('policy_client_state_'.length);
   if (key.indexOf('policy_client_decision_') === 0) return 'DECISION:' + key.slice('policy_client_decision_'.length);
   if (key.indexOf('policy_client_protocol_') === 0) return 'PROTO:' + key.slice('policy_client_protocol_'.length);
   if (key.indexOf('policy_client_limit_') === 0) return 'LIMIT:' + key.slice('policy_client_limit_'.length);
+  if (key.indexOf('policy_client_reason_') === 0) return 'REASON:' + key.slice('policy_client_reason_'.length);
+  if (key.indexOf('policy_client_name_match_') === 0) return 'NAME_MATCH:' + key.slice('policy_client_name_match_'.length);
+  if (key.indexOf('policy_client_return_evidence_') === 0) return 'RETURN_EVIDENCE:' + key.slice('policy_client_return_evidence_'.length);
+  if (key.indexOf('policy_client_corr_') === 0) return 'CORR:' + key.slice('policy_client_corr_'.length);
+  if (key.indexOf('policy_client_failure_') === 0) return 'FAILURE:' + key.slice('policy_client_failure_'.length);
   return key;
 };
 
@@ -181,8 +188,15 @@ const diagnosis = (session, generation) => ({
           entries: [{protocol: 'tcp', client_src_port: 40002, destination_ip: '93.184.216.34',
                      destination_port: 443, choice: 'DIRECT', route_generation: generation,
                      last_seen: '2026-11-17T09:09:59Z', last_seen_age_seconds: 42,
-                     expired: false, close_seen: false, decision_time: 'not_recorded',
-                     decision_reason: 'not_recorded', names: [], names_match: 'not_recorded'}]},
+                     expired: false, close_seen: false,
+                     decision_time: '2026-11-17T09:09:58Z', decision_reason: 'evidence_direct',
+                     policy_generation: 'gen-1',
+                     dispatch: {state: 'written_to_wan'}, forward: {packets: 1, bytes: 60, failed: 0},
+                     return: {evidence: 'not_observed', packets: 0, bytes: 0},
+                     names: ['plain.example'], names_match: 'unique', names_considered: 1,
+                     name_candidates: [{name: 'plain.example', dns_seq: 1,
+                                        observed_at: '2026-11-17T09:09:30Z',
+                                        expires_at: '2026-11-17T09:14:30Z'}]}]},
   drops: {available: false, state: 'not_recorded', total: 0, truncated: false, entries: []},
   limitations: ['dns_names_not_retained', 'flow_decision_reason_not_recorded'],
   evaluated_at: '2026-11-17T09:10:00Z', read_only: true
@@ -241,7 +255,11 @@ assert.deepEqual(rowCells('policyClientEvidenceRows', 0),
 
 assert.equal(rowCount('policyClientFlowRows'), 1, 'one live flow is rendered');
 assert.deepEqual(rowCells('policyClientFlowRows', 0),
-  ['PROTO:tcp', '93.184.216.34:443', 'DECISION:direct', '42s', 'active']);
+  ['PROTO:tcp', '93.184.216.34:443', 'DECISION:direct',
+   '2026-11-17T09:09:58Z · REASON:evidence_direct · gen-1',
+   'NAME_MATCH:unique: plain.example',
+   'OUTCOME 1/0 · return RETURN_EVIDENCE:not_observed 0',
+   '42s', 'active']);
 
 const limits = Array.from(w.document.getElementById('policyClientLimitations').children).map(li => li.textContent);
 assert.deepEqual(limits, ['LIMIT:dns_names_not_retained',
@@ -423,9 +441,75 @@ assert.equal(w.document.getElementById('policyClientEvidenceFoot').hidden, false
   'a truncated evidence page must say so');
 assert.equal(text('policyClientEvidenceFoot'), 'TRUNC 1/9');
 assert.equal(w.document.getElementById('policyClientFlowFoot').hidden, false);
-assert.equal(text('policyClientFlowFoot'), 'FLOWS 1/600 PARTIAL 16384',
-  'the flow count must be presented as a windowed count');
+assert.equal(text('policyClientFlowFoot'), 'FLOWS 1/600 PARTIAL 16384 COUNTERS-LIVE',
+  'the flow count must be presented as a windowed count, with the live-sample caveat');
 assert.equal(rowCells('policyClientFlowRows', 0)[0], 'PROTO:udp');
+`)
+}
+
+// TestPolicyClientDiagFlowStateVariety pins the visible rendering of the states a
+// recorded flow can be in: several candidate names, no candidate with a stated
+// reason, a refused dispatch, an unmeasured return and a flow recorded without
+// decision metadata. Each cell is asserted, so a wrong or invented value fails.
+func TestPolicyClientDiagFlowStateVariety(t *testing.T) {
+	runClientDiagScenario(t, clientTargetsScript+`
+responder = ((base) => async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
+  const answer = await base(url, opts);
+  answer.flows.entries = [
+    {protocol: 'tcp', destination_ip: '93.184.216.34', destination_port: 443, choice: 'PROXY',
+     route_generation: 3, last_seen_age_seconds: 5, expired: false, close_seen: false,
+     decision_time: '2026-11-17T09:09:58Z', decision_reason: 'proxy_cidr_rule',
+     policy_generation: 'gen-1', backend_tunnel_id: 77,
+     dispatch: {state: 'failed', reason: 'backend_queue_full'},
+     forward: {packets: 0, bytes: 0, failed: 2, failure: 'backend_queue_full'},
+     return: {evidence: 'not_measured', packets: 0, bytes: 0},
+     names: ['plain.example', 'shared.example'], names_match: 'ambiguous', names_considered: 2,
+     name_candidates: []},
+    {protocol: 'udp', destination_ip: '8.8.8.8', destination_port: 53, choice: 'PROXY',
+     route_generation: 3, last_seen_age_seconds: 9, expired: false, close_seen: false,
+     decision_time: '2026-11-17T09:09:57Z', decision_reason: 'no_trusted_evidence',
+     policy_generation: 'gen-1',
+     dispatch: {state: 'queued_to_backend'}, forward: {packets: 3, bytes: 0, failed: 0},
+     return: {evidence: 'not_measured', packets: 0, bytes: 0},
+     names: [], names_match: 'none', names_reason: 'no_retained_answer', names_considered: 0,
+     name_candidates: []},
+    {protocol: 'tcp', destination_ip: '1.1.1.1', destination_port: 80, choice: 'DIRECT',
+     route_generation: 3, last_seen_age_seconds: 12, expired: false, close_seen: false,
+     decision_time: 'not_recorded', decision_reason: 'not_recorded',
+     policy_generation: 'not_recorded',
+     dispatch: {state: 'written_to_wan'}, forward: {packets: 4, bytes: 400, failed: 0},
+     return: {evidence: 'observed', packets: 2, bytes: 200,
+              first_at: '2026-11-17T09:10:00Z', last_at: '2026-11-17T09:10:01Z'},
+     names: [], names_match: 'not_recorded', names_considered: 0, name_candidates: []}
+  ];
+  return answer;
+})(responder);
+`, `
+selectClient('sess-a');
+await w.diagnoseSelectedClient();
+await settle();
+assert.equal(rowCount('policyClientFlowRows'), 3, 'all three states are rendered');
+
+const ambiguous = rowCells('policyClientFlowRows', 0);
+assert.equal(ambiguous[2], 'DECISION:proxy', 'the recorded route is rendered');
+assert.equal(ambiguous[3], '2026-11-17T09:09:58Z · REASON:proxy_cidr_rule · gen-1',
+  'the decision instant, reason and generation are rendered together');
+assert.equal(ambiguous[4], 'NAME_MATCH:ambiguous: plain.example, shared.example',
+  'several candidate names are shown as several, never collapsed to one');
+assert.equal(ambiguous[5], 'OUTCOME 0/2 · return RETURN_EVIDENCE:not_measured 0 · FAILURE:backend_queue_full',
+  'a refused dispatch and an unmeasured return are both visible');
+
+const none = rowCells('policyClientFlowRows', 1);
+assert.equal(none[4], 'NAME_MATCH:none: CORR:no_retained_answer',
+  'no candidate is stated with its reason');
+assert.equal(none[5], 'OUTCOME 3/0 · return RETURN_EVIDENCE:not_measured 0');
+
+const unrecorded = rowCells('policyClientFlowRows', 2);
+assert.equal(unrecorded[3], 'not_recorded · REASON:not_recorded',
+  'a flow without decision metadata says so instead of showing an empty instants cell');
+assert.equal(unrecorded[5], 'OUTCOME 4/0 · return RETURN_EVIDENCE:observed 2',
+  'an observed return is distinguished from an unmeasured one');
 `)
 }
 

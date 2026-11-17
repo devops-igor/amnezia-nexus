@@ -106,6 +106,20 @@ func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 				Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
 				A:   f.proxyIP.AsSlice(),
 			})
+		case "shared.example.":
+			// A second name for the same address: the cache merges by address, so
+			// one flow can have several candidate names.
+			resp.Answer = append(resp.Answer, &mdns.A{
+				Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
+				A:   f.example.AsSlice(),
+			})
+		case "short.example.":
+			// A one-second answer, for the "evidence expired before the decision"
+			// control.
+			resp.Answer = append(resp.Answer, &mdns.A{
+				Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 1},
+				A:   netip.MustParseAddr("93.184.216.77").AsSlice(),
+			})
 		case "alias.example.":
 			// A validated alias chain: the queried name is a CNAME to the name
 			// that carries the address.
@@ -369,11 +383,22 @@ func TestClientDiagnosisReportsTheProducersOwnRecords(t *testing.T) {
 		if flow.RouteGeneration != generation {
 			t.Errorf("flow generation = %d, want the selected %d", flow.RouteGeneration, generation)
 		}
-		if flow.DecisionTime != ClientDiagnosisTokenNotRecorded || flow.DecisionReason != ClientDiagnosisTokenNotRecorded {
-			t.Errorf("flow decision time/reason = %q/%q, want not_recorded", flow.DecisionTime, flow.DecisionReason)
+		// Slice 3b turned these from explicit unknowns into recorded facts. The
+		// requirement did not weaken: each must carry the fact its producer wrote,
+		// and a value that is absent still has to say so.
+		if flow.DecisionTime == "" {
+			t.Errorf("flow decision time is empty; it must be an instant or the not_recorded token")
 		}
-		if flow.NamesMatch != ClientDiagnosisNamesNotRecorded {
-			t.Errorf("flow names match = %q, want not_recorded", flow.NamesMatch)
+		if flow.DecisionReason == "" {
+			t.Errorf("flow decision reason is empty; it must be a branch token or the not_recorded token")
+		}
+		if flow.PolicyGeneration == "" {
+			t.Errorf("flow policy generation is empty; it must be a generation or the not_recorded token")
+		}
+		switch flow.NamesMatch {
+		case FlowCorrelationUnique, FlowCorrelationAmbiguous, FlowCorrelationNone, FlowCorrelationNotRecorded:
+		default:
+			t.Errorf("flow names match = %q, want one of the documented correlation classes", flow.NamesMatch)
 		}
 	}
 

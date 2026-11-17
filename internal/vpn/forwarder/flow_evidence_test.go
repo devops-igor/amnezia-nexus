@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
@@ -67,8 +68,15 @@ func newFlowEvidenceFixture(t *testing.T, queueSize int) *flowEvidenceFixture {
 // attaches it to the forwarder.
 func (f *flowEvidenceFixture) publishSnapshot(t *testing.T, cidrs []netip.Prefix) {
 	t.Helper()
+	f.publishSnapshotGeneration(t, "gen-flow", cidrs)
+}
+
+// publishSnapshotGeneration publishes under an explicit generation, which is what
+// makes "the recorded generation did not move" observable.
+func (f *flowEvidenceFixture) publishSnapshotGeneration(t *testing.T, generation string, cidrs []netip.Prefix) {
+	t.Helper()
 	rules := policy.ParsedRules{CIDRs: cidrs}
-	snapshot, err := policy.CompileSnapshot(1, "gen-flow", []policy.SourceParsedRules{
+	snapshot, err := policy.CompileSnapshot(1, generation, []policy.SourceParsedRules{
 		{SourceID: "flow-rules", Rules: rules},
 	})
 	if err != nil {
@@ -88,7 +96,14 @@ func (f *flowEvidenceFixture) send(t *testing.T, dst string, dstPort uint16) {
 
 func (f *flowEvidenceFixture) snapshot(t *testing.T) SessionFlowList {
 	t.Helper()
-	return f.dem.SnapshotSessionFlows(f.session, 0, time.Now(), 0)
+	return f.snapshotFor(t, f.session)
+}
+
+// snapshotFor reads one session's flows, which is what a diagnosis for that exact
+// session does.
+func (f *flowEvidenceFixture) snapshotFor(t *testing.T, sessionID string) SessionFlowList {
+	t.Helper()
+	return f.dem.SnapshotSessionFlows(sessionID, 0, time.Now(), 0)
 }
 
 func (f *flowEvidenceFixture) onlyFlow(t *testing.T) SessionFlow {
@@ -319,9 +334,10 @@ func TestFlowEvidenceKeepsTheOriginalDecisionAcrossPolicyChanges(t *testing.T) {
 	fix.send(t, dst, 443)
 	original := fix.onlyFlow(t)
 
-	// Publish a policy that puts the same destination range on the proxy and drop
-	// the session's DIRECT evidence: a new flow would now be PROXY.
-	fix.publishSnapshot(t, []netip.Prefix{netip.MustParsePrefix("93.184.216.0/24")})
+	// Publish a NEW generation that puts the same destination range on the proxy: a
+	// new flow would now be PROXY, and a record that re-read the policy at read
+	// time would report the new generation instead of the deciding one.
+	fix.publishSnapshotGeneration(t, "gen-flow-2", []netip.Prefix{netip.MustParsePrefix("93.184.216.0/24")})
 	fix.send(t, dst, 443)
 
 	sticky := fix.onlyFlow(t)
@@ -335,7 +351,11 @@ func TestFlowEvidenceKeepsTheOriginalDecisionAcrossPolicyChanges(t *testing.T) {
 		t.Errorf("decided_at moved from %v to %v: the decision instant belongs to the decision", original.DecidedAt, sticky.DecidedAt)
 	}
 	if sticky.PolicyGeneration != original.PolicyGeneration {
-		t.Errorf("policy generation moved from %q to %q", original.PolicyGeneration, sticky.PolicyGeneration)
+		t.Errorf("policy generation moved from %q to %q: the flow must keep the generation that decided it",
+			original.PolicyGeneration, sticky.PolicyGeneration)
+	}
+	if sticky.PolicyGeneration != "gen-flow" {
+		t.Errorf("policy generation = %q, want the deciding generation gen-flow (the current one is gen-flow-2)", sticky.PolicyGeneration)
 	}
 	if sticky.ForwardPackets != 2 {
 		t.Errorf("forward packets = %d, want both packets dispatched on the same flow", sticky.ForwardPackets)
@@ -416,6 +436,72 @@ func TestFlowEvidenceRefusesAttributionForASupersededRoute(t *testing.T) {
 	}
 }
 
+// TestFlowEvidenceDispatchCreditsOnlyTheDispatchingIncarnation is the deterministic
+// replacement control for proxy dispatch accounting: a queued outcome carries the
+// session and generation that dispatched it, so a late outcome from a retired
+// incarnation must not credit the successor that reused the same tuple.
+func TestFlowEvidenceDispatchCreditsOnlyTheDispatchingIncarnation(t *testing.T) {
+	fix := newFlowEvidenceFixture(t, 8)
+	dst := "1.1.1.1"
+	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(fix.client), netip.MustParseAddr(dst), 41000, 443, 0x02, nil)
+	firstSession := fix.session
+	firstGeneration := fix.generationOf(t)
+
+	if err := fix.fwd.RouteClientToBackend(fix.peerKey, pkt); err != nil {
+		t.Fatalf("first dispatch: %v", err)
+	}
+	first := fix.onlyFlow(t)
+	if first.ForwardPackets != 1 {
+		t.Fatalf("first flow forward packets = %d, want 1", first.ForwardPackets)
+	}
+
+	// The session ends and the same peer is re-admitted: same peer key and tuple,
+	// new session and route generation.
+	fix.dem.PurgePeer(fix.peerKey)
+	fix.dem.RecordProxyDispatch(fix.peerKey, firstSession, firstGeneration, pkt, false, FlowFailureQueueFull)
+	if got := fix.snapshot(t); got.Total != 0 {
+		t.Fatalf("flows after purge = %d, want none", got.Total)
+	}
+
+	fix.fwd.RegisterSessionWithReturnPath("sess-successor", "conn-2", fix.peerKey, fix.client, fix.backendID, fix.returnPath.path)
+	if err := fix.fwd.RouteClientToBackend(fix.peerKey, pkt); err != nil {
+		t.Fatalf("successor dispatch: %v", err)
+	}
+	successor := fix.snapshotFor(t, "sess-successor")
+	if successor.Total != 1 {
+		t.Fatalf("successor flows = %d, want 1", successor.Total)
+	}
+	if successor.Flows[0].ForwardPackets != 1 || successor.Flows[0].ForwardFailed != 0 {
+		t.Fatalf("successor evidence before the late outcome = %d/%d, want 1/0",
+			successor.Flows[0].ForwardPackets, successor.Flows[0].ForwardFailed)
+	}
+
+	// The late outcome of the retired incarnation: refused by the incarnation
+	// check, so the successor's record is untouched.
+	fix.dem.RecordProxyDispatch(fix.peerKey, firstSession, firstGeneration, pkt, false, FlowFailureQueueFull)
+	if got := fix.snapshotFor(t, "sess-successor").Flows[0]; got.ForwardFailed != 0 || got.ForwardFailure != "" {
+		t.Errorf("a retired incarnation's outcome credited the successor: failed=%d token=%q", got.ForwardFailed, got.ForwardFailure)
+	}
+
+	// The successor's own outcome is credited.
+	fix.dem.RecordProxyDispatch(fix.peerKey, "sess-successor", fix.generationOf(t), pkt, false, FlowFailureQueueFull)
+	if got := fix.snapshotFor(t, "sess-successor").Flows[0]; got.ForwardFailed != 1 || got.ForwardFailure != FlowFailureQueueFull {
+		t.Errorf("the successor's own refusal was not credited: failed=%d token=%q", got.ForwardFailed, got.ForwardFailure)
+	}
+}
+
+// generationOf reports the route generation currently registered for the fixture's
+// peer.
+func (f *flowEvidenceFixture) generationOf(t *testing.T) uint64 {
+	t.Helper()
+	f.fwd.mu.RLock()
+	defer f.fwd.mu.RUnlock()
+	if route := f.fwd.routesByPeer[f.peerKey]; route != nil {
+		return route.generation
+	}
+	return 0
+}
+
 // TestFlowEvidenceSnapshotIsPure proves the read neither refreshes a flow nor
 // moves its evidence.
 func TestFlowEvidenceSnapshotIsPure(t *testing.T) {
@@ -445,9 +531,15 @@ func TestFlowEvidenceSnapshotIsPure(t *testing.T) {
 // second store, so the existing table capacity is the cap and the worst-case size
 // is a stated constant.
 func TestFlowEvidenceBoundsAreTheFlowTable(t *testing.T) {
-	if FlowEvidenceMaxFlowTableBytes != FlowEvidenceBytesPerFlow*65536 {
-		t.Fatalf("metadata bound = %d, want per-flow %d x table 65536", FlowEvidenceMaxFlowTableBytes, FlowEvidenceBytesPerFlow)
+	perFlow := FlowEvidenceBytesPerFlow()
+	if perFlow < int(unsafe.Sizeof(flowStats{})) {
+		t.Fatalf("per-flow footprint = %d, want at least the measured struct size %d", perFlow, unsafe.Sizeof(flowStats{}))
 	}
+	if FlowEvidenceMaxFlowTableBytes() != perFlow*65536 {
+		t.Fatalf("metadata bound = %d, want per-flow %d x table 65536", FlowEvidenceMaxFlowTableBytes(), perFlow)
+	}
+	t.Logf("measured evidence footprint: %d bytes per flow, %d bytes at the 65536-flow cap",
+		perFlow, FlowEvidenceMaxFlowTableBytes())
 	// A table-full refusal leaves no record rather than an unbounded one.
 	fwd := NewForwarder(nil, "10.100.0.0/16", 8)
 	fix := newFlowEvidenceFixture(t, 8)

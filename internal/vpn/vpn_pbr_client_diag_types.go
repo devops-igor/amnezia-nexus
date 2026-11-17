@@ -80,7 +80,11 @@ const (
 	ClientDiagnosisLimitDNSNonAQueries   = "non_a_queries_not_recorded"
 	ClientDiagnosisLimitDNSReceiveTime   = "query_receive_time_not_recorded"
 	ClientDiagnosisLimitDNSNoIncarnation = "records_without_route_generation"
-	ClientDiagnosisLimitIdentitySource   = "session_registry_unavailable"
+	// Flow outcome gaps and the counter-sampling caveat.
+	ClientDiagnosisLimitFlowBackendWrite    = "proxy_backend_write_not_attributed"
+	ClientDiagnosisLimitFlowNonTCP          = "non_tcp_udp_flows_not_recorded"
+	ClientDiagnosisLimitFlowCountersSampled = "flow_counters_are_live_samples"
+	ClientDiagnosisLimitIdentitySource      = "session_registry_unavailable"
 )
 
 // ClientDiagnosisRequest is one validated diagnosis request.
@@ -280,6 +284,45 @@ type ClientDiagnosisDNS struct {
 	RecordCoverage   ClientDiagnosisDNSRecordCoverage `json:"record_coverage"`
 }
 
+// ClientDiagnosisFlowDispatch is what the dispatch path did with the flow's
+// packets. Queue acceptance, a device write and a reply admission are separate
+// facts and are never merged into one "sent".
+type ClientDiagnosisFlowDispatch struct {
+	// State is queued_to_backend | written_to_wan | failed | not_recorded.
+	State  string `json:"state"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// ClientDiagnosisFlowForward counts dispatches by outcome. The values are read
+// live at the sampled instant: they are not a conservation-checked total and can
+// be behind the packet path by the packets in flight during the read.
+type ClientDiagnosisFlowForward struct {
+	Packets uint64 `json:"packets"`
+	Bytes   uint64 `json:"bytes"`
+	Failed  uint64 `json:"failed"`
+	Failure string `json:"failure,omitempty"`
+}
+
+// ClientDiagnosisFlowReturn is the return direction. DIRECT flows state what the
+// reply path admitted; PROXY flows state that it is not measured, which is a fact
+// about this build and not an absence of traffic.
+type ClientDiagnosisFlowReturn struct {
+	Evidence string `json:"evidence"`
+	Packets  uint64 `json:"packets"`
+	Bytes    uint64 `json:"bytes"`
+	FirstAt  string `json:"first_at,omitempty"`
+	LastAt   string `json:"last_at,omitempty"`
+}
+
+// ClientDiagnosisFlowNameCandidate is one retained answer that named the flow's
+// destination at the instant the flow was decided.
+type ClientDiagnosisFlowNameCandidate struct {
+	Name       string `json:"name"`
+	Seq        uint64 `json:"dns_seq"`
+	ObservedAt string `json:"observed_at"`
+	ExpiresAt  string `json:"expires_at"`
+}
+
 // ClientDiagnosisFlow is one live flow record.
 type ClientDiagnosisFlow struct {
 	Protocol        string `json:"protocol"`
@@ -297,12 +340,27 @@ type ClientDiagnosisFlow struct {
 	// instant. The record is reported as found and is not retired by this read.
 	Expired   bool `json:"expired"`
 	CloseSeen bool `json:"close_seen"`
-	// DecisionTime, DecisionReason and Names keep the later shape while stating
-	// that this slice does not have them.
-	DecisionTime   string   `json:"decision_time"`
-	DecisionReason string   `json:"decision_reason"`
-	Names          []string `json:"names"`
-	NamesMatch     string   `json:"names_match"`
+
+	// The decision that created the flow, recorded by the branch that took it.
+	// "not_recorded" means the flow was installed by a path that carries no
+	// metadata; it is never reconstructed from last_seen or from today's policy.
+	DecisionTime     string `json:"decision_time"`
+	DecisionReason   string `json:"decision_reason"`
+	PolicyGeneration string `json:"policy_generation"`
+	BackendTunnelID  *int64 `json:"backend_tunnel_id,omitempty"`
+
+	Dispatch ClientDiagnosisFlowDispatch `json:"dispatch"`
+	Forward  ClientDiagnosisFlowForward  `json:"forward"`
+	Return   ClientDiagnosisFlowReturn   `json:"return"`
+
+	// Names is the correlated-name verdict for this destination. A matching
+	// address alone is not a unique domain, so ambiguous and none are first-class
+	// outcomes.
+	Names           []string                           `json:"names"`
+	NamesMatch      string                             `json:"names_match"`
+	NamesReason     string                             `json:"names_reason,omitempty"`
+	NamesConsidered int                                `json:"names_considered"`
+	NameCandidates  []ClientDiagnosisFlowNameCandidate `json:"name_candidates"`
 }
 
 // ClientDiagnosisFlows is the live-flow section.

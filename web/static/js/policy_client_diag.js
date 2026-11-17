@@ -354,6 +354,10 @@
         });
     }
 
+    // renderFlows renders the recorded decisions and outcomes. Every cell states
+    // what the server sent: a branch token, a correlation class, or an explicit
+    // "not recorded"/"not measured". Nothing here derives a cause, a name or a
+    // success.
     function renderFlows(entries) {
         var body = clientElement('policyClientFlowRows');
         if (!body) {
@@ -364,6 +368,31 @@
             appendCell(row, clientTokenLabel('protocol', flow.protocol));
             appendCell(row, flow.destination_ip + ':' + String(flow.destination_port));
             appendCell(row, clientTokenLabel('decision', flow.choice));
+
+            var decision = flow.decision_time + ' · ' + clientTokenLabel('reason', flow.decision_reason);
+            if (flow.policy_generation && flow.policy_generation !== 'not_recorded') {
+                decision = decision + ' · ' + flow.policy_generation;
+            }
+            appendCell(row, decision);
+
+            var names = clientTokenLabel('name_match', flow.names_match);
+            if (flow.names && flow.names.length) {
+                names = names + ': ' + flow.names.join(', ');
+            } else if (flow.names_reason) {
+                names = names + ': ' + clientTokenLabel('corr', flow.names_reason);
+            }
+            appendCell(row, names);
+
+            var outcome = clientText('policy_client_outcome_fmt')
+                .replace('{ok}', String((flow.forward && flow.forward.packets) || 0))
+                .replace('{failed}', String((flow.forward && flow.forward.failed) || 0))
+                .replace('{return}', clientTokenLabel('return_evidence', (flow.return && flow.return.evidence) || 'not_recorded'))
+                .replace('{packets}', String((flow.return && flow.return.packets) || 0));
+            if (flow.forward && flow.forward.failure) {
+                outcome = outcome + ' · ' + clientTokenLabel('failure', flow.forward.failure);
+            }
+            appendCell(row, outcome);
+
             appendCell(row, formatSeconds(flow.last_seen_age_seconds));
             var state = flow.expired ? 'expired' : 'active';
             if (flow.close_seen) {
@@ -507,6 +536,9 @@
             if (!flows.scan_complete) {
                 flowFoot = flowFoot + ' ' + clientText('policy_client_partial_scan').replace('{scanned}', String(flows.scanned || 0));
             }
+        }
+        if ((flows.entries || []).length) {
+            flowFoot = flowFoot + ' ' + clientText('policy_client_counters_live_note');
         }
         renderFoot('policyClientFlowFoot', flowFoot);
 

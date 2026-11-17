@@ -168,14 +168,16 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 		}
 	}
 
-	// The generation the decision is taken against, read once at the deciding
-	// packet. It is a fact about this branch, not about the policy as it stands
-	// when an administrator later reads the flow.
-	policyGeneration := policyGenerationOf(policyMatcher)
+	// The decision's policy snapshot is read ONCE, and the same immutable snapshot
+	// supplies both the rule match and the generation recorded on the flow. A
+	// publish between two separate reads would let the record claim a generation
+	// that did not make the decision.
+	policySnapshot := currentPolicySnapshot(policyMatcher)
+	policyGeneration := policyGenerationOf(policySnapshot)
 	backendTunnel := backend.tunnelID
 
 	// Step 2 — PROXY: Policy snapshot CIDR or route cache Proxy match (including shared-IP conflict).
-	if matched, reason := f.matchesProxyPolicy(dstIP, sID, policyMatcher, routeCache); matched {
+	if matched, reason := f.matchesProxyPolicy(dstIP, sID, policySnapshot, routeCache); matched {
 		if directEgress != nil {
 			_ = directEgress.RecordFlowDecision(peerKey, sID, route.generation, packet, EgressChoiceProxy, FlowDecision{
 				Reason:           reason,
@@ -208,16 +210,23 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
 }
 
-// policyGenerationOf reports the published generation a decision is taken
-// against, or "" when no snapshot is published.
-func policyGenerationOf(matcher *policy.Matcher) string {
+// currentPolicySnapshot reads the published snapshot once. Everything a decision
+// records about "the policy" comes from the snapshot this returns, never from a
+// second read that a concurrent publish could move.
+func currentPolicySnapshot(matcher *policy.Matcher) *policy.Snapshot {
 	if matcher == nil {
+		return nil
+	}
+	return matcher.Current()
+}
+
+// policyGenerationOf reports the generation of the snapshot the decision was
+// taken against, or "" when no snapshot is published.
+func policyGenerationOf(snapshot *policy.Snapshot) string {
+	if snapshot == nil {
 		return ""
 	}
-	if snap := matcher.Current(); snap != nil {
-		return snap.Generation()
-	}
-	return ""
+	return snapshot.Generation()
 }
 
 func (f *Forwarder) handleStickyFlow(directEgress *DirectEgressManager, route *sessionRoute, peerKey string, packet []byte, pktLen int64, backend proxyBackend, backendTraffic *trafficCounters, sID, cID string) (bool, error) {
@@ -259,11 +268,13 @@ func (f *Forwarder) routeDirectDecision(directEgress *DirectEgressManager, route
 // proxy, and WHICH branch matched. The caller records the branch as the flow's
 // decision reason (issue #861), so the reason is the branch that actually ran
 // rather than a second evaluation of the same rules.
-func (f *Forwarder) matchesProxyPolicy(dstIP netip.Addr, sID string, policyMatcher *policy.Matcher, routeCache RouteCache) (bool, EgressReason) {
-	if policyMatcher != nil {
-		if snap := policyMatcher.Current(); snap != nil && snap.MatchIPv4(dstIP) {
-			return true, EgressReasonProxyCIDRRule
-		}
+//
+// It takes the published snapshot rather than the matcher on purpose: the caller
+// takes one snapshot at the decision and uses it for both this match and the
+// generation it records, so the two can never disagree.
+func (f *Forwarder) matchesProxyPolicy(dstIP netip.Addr, sID string, snapshot *policy.Snapshot, routeCache RouteCache) (bool, EgressReason) {
+	if snapshot != nil && snapshot.MatchIPv4(dstIP) {
+		return true, EgressReasonProxyCIDRRule
 	}
 	if routeCache != nil && routeCache.Lookup(sID, dstIP) == policy.Proxy {
 		return true, EgressReasonProxyCachedEvidence
@@ -364,7 +375,10 @@ func (f *Forwarder) recordProxyDispatchOutcome(route *sessionRoute, packet []byt
 	if dem == nil || peerKey == "" {
 		return
 	}
-	dem.RecordProxyDispatch(peerKey, packet, accepted, failure)
+	// The outcome is bound to the route that dispatched the packet, so a queued
+	// packet from an older incarnation can never credit a successor that reused
+	// the same tuple.
+	dem.RecordProxyDispatch(peerKey, route.sessionID, route.generation, packet, accepted, failure)
 }
 
 // dropProxyPacket counts a proxy-required packet the proxy path refused and

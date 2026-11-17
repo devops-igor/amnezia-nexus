@@ -53,6 +53,9 @@ func clientDiagnosisLimitations() []string {
 		ClientDiagnosisLimitFlowOutcomes,
 		ClientDiagnosisLimitDrops,
 		ClientDiagnosisLimitSingleSnapshot,
+		ClientDiagnosisLimitFlowCountersSampled,
+		ClientDiagnosisLimitFlowBackendWrite,
+		ClientDiagnosisLimitFlowNonTCP,
 	}
 }
 
@@ -67,10 +70,10 @@ func clientDiagnosisCoverage(fwd *forwarder.Forwarder, now time.Time) ClientDiag
 		NotRecorded: []string{
 			ClientDiagnosisLimitNamesNotRecorded,
 			ClientDiagnosisLimitQuestionsNotRecorded,
-			ClientDiagnosisLimitDecisionTimeUnknown,
-			ClientDiagnosisLimitDecisionReason,
 			ClientDiagnosisLimitFlowOutcomes,
 			ClientDiagnosisLimitDrops,
+			ClientDiagnosisLimitFlowBackendWrite,
+			ClientDiagnosisLimitFlowNonTCP,
 		},
 	}
 }
@@ -164,7 +167,11 @@ func clientDiagnosisApplyRecords(out *ClientDiagnosisResponse, reads clientDiagn
 	if !reads.flowsAvailable {
 		return
 	}
-	out.Flows = clientDiagnosisFlowsFromSnapshot(reads.flows, now)
+	var flowRecords []dnsledger.Record
+	if reads.dnsRecordsRead {
+		flowRecords = reads.dnsRecords.Records
+	}
+	out.Flows = clientDiagnosisFlowsFromSnapshot(reads.flows, flowRecords, reads.dnsRecordsRead, now)
 	if !out.Flows.ScanComplete {
 		// The flow listing visits a bounded window of the table, so the record
 		// count is a lower bound. Saying so keeps "total" from being read as an
@@ -335,8 +342,9 @@ func clientDiagnosisEntryAge(entry policy.SessionEntry, now time.Time) (*int64, 
 	return &seconds, ""
 }
 
-// clientDiagnosisFlowsFromSnapshot renders the live-flow section.
-func clientDiagnosisFlowsFromSnapshot(list forwarder.SessionFlowList, now time.Time) ClientDiagnosisFlows {
+// clientDiagnosisFlowsFromSnapshot renders the live-flow section, correlating each
+// destination with the session's retained DNS answers.
+func clientDiagnosisFlowsFromSnapshot(list forwarder.SessionFlowList, records []dnsledger.Record, recordsRead bool, now time.Time) ClientDiagnosisFlows {
 	out := ClientDiagnosisFlows{
 		Available:    true,
 		State:        clientDiagnosisTokenRecorded,
@@ -347,7 +355,7 @@ func clientDiagnosisFlowsFromSnapshot(list forwarder.SessionFlowList, now time.T
 		Entries:      make([]ClientDiagnosisFlow, 0, len(list.Flows)),
 	}
 	for _, flow := range list.Flows {
-		out.Entries = append(out.Entries, clientDiagnosisFlow(flow, now))
+		out.Entries = append(out.Entries, clientDiagnosisFlow(flow, records, recordsRead, now))
 	}
 	return out
 }
@@ -355,7 +363,7 @@ func clientDiagnosisFlowsFromSnapshot(list forwarder.SessionFlowList, now time.T
 // clientDiagnosisFlow renders one flow record. DecisionTime, DecisionReason and
 // the name match are stated as unknown rather than derived from lastSeen or
 // from the current policy.
-func clientDiagnosisFlow(flow forwarder.SessionFlow, now time.Time) ClientDiagnosisFlow {
+func clientDiagnosisFlow(flow forwarder.SessionFlow, records []dnsledger.Record, recordsRead bool, now time.Time) ClientDiagnosisFlow {
 	out := ClientDiagnosisFlow{
 		Protocol:        clientDiagnosisProtocol(flow.Protocol),
 		ClientSrcPort:   flow.SrcPort,
@@ -366,13 +374,90 @@ func clientDiagnosisFlow(flow forwarder.SessionFlow, now time.Time) ClientDiagno
 		LastSeen:        clientDiagnosisTime(flow.LastSeen),
 		Expired:         flow.Expired,
 		CloseSeen:       flow.CloseSeen,
-		DecisionTime:    ClientDiagnosisTokenNotRecorded,
-		DecisionReason:  ClientDiagnosisTokenNotRecorded,
 		Names:           []string{},
-		NamesMatch:      ClientDiagnosisNamesNotRecorded,
+		NameCandidates:  []ClientDiagnosisFlowNameCandidate{},
 	}
 	if !flow.LastSeen.IsZero() {
 		out.LastSeenAgeSeconds = int64(max(now.Sub(flow.LastSeen), 0) / time.Second)
+	}
+
+	// The decision the branch recorded. A zero instant or an empty reason is
+	// stated as not recorded rather than filled in from the current policy.
+	out.DecisionTime = ClientDiagnosisTokenNotRecorded
+	if !flow.DecidedAt.IsZero() {
+		out.DecisionTime = clientDiagnosisTime(flow.DecidedAt)
+	}
+	out.DecisionReason = ClientDiagnosisTokenNotRecorded
+	if flow.DecisionReason != "" {
+		out.DecisionReason = string(flow.DecisionReason)
+	}
+	out.PolicyGeneration = ClientDiagnosisTokenNotRecorded
+	if flow.PolicyGeneration != "" {
+		out.PolicyGeneration = flow.PolicyGeneration
+	}
+	if flow.Choice == forwarder.EgressChoiceProxy && flow.BackendTunnelID != 0 {
+		backend := flow.BackendTunnelID
+		out.BackendTunnelID = &backend
+	}
+
+	out.Dispatch = clientDiagnosisFlowDispatch(flow)
+	out.Forward = ClientDiagnosisFlowForward{
+		Packets: flow.ForwardPackets,
+		Bytes:   flow.ForwardBytes,
+		Failed:  flow.ForwardFailed,
+		Failure: flow.ForwardFailure,
+	}
+	out.Return = clientDiagnosisFlowReturn(flow)
+
+	correlation := correlateFlowDestination(flow, records, recordsRead)
+	out.NamesMatch = correlation.Match
+	out.NamesReason = correlation.Reason
+	out.NamesConsidered = correlation.Considered
+	for _, candidate := range correlation.Names {
+		out.Names = append(out.Names, candidate.Name)
+		out.NameCandidates = append(out.NameCandidates, ClientDiagnosisFlowNameCandidate{
+			Name:       candidate.Name,
+			Seq:        candidate.Seq,
+			ObservedAt: clientDiagnosisTime(candidate.ObservedAt),
+			ExpiresAt:  clientDiagnosisTime(candidate.ExpiresAt),
+		})
+	}
+	return out
+}
+
+// clientDiagnosisFlowDispatch states what the dispatch path did with the flow's
+// packets. Queue acceptance and a device write are different outcomes and are
+// reported as such; a flow with no dispatch outcome yet says so.
+func clientDiagnosisFlowDispatch(flow forwarder.SessionFlow) ClientDiagnosisFlowDispatch {
+	switch {
+	case flow.ForwardFailed > 0:
+		// A refusal is the most recent measured outcome; the counts stay separate
+		// so an earlier accepted dispatch is not hidden by it.
+		return ClientDiagnosisFlowDispatch{State: "failed", Reason: flow.ForwardFailure}
+	case flow.ForwardPackets > 0 && flow.Choice == forwarder.EgressChoiceDirect:
+		return ClientDiagnosisFlowDispatch{State: "written_to_wan"}
+	case flow.ForwardPackets > 0:
+		return ClientDiagnosisFlowDispatch{State: "queued_to_backend"}
+	default:
+		return ClientDiagnosisFlowDispatch{State: ClientDiagnosisTokenNotRecorded}
+	}
+}
+
+// clientDiagnosisFlowReturn states the return evidence. PROXY return is not
+// measured at this checkpoint and says so instead of appearing as "no traffic".
+func clientDiagnosisFlowReturn(flow forwarder.SessionFlow) ClientDiagnosisFlowReturn {
+	if flow.Choice == forwarder.EgressChoiceProxy {
+		return ClientDiagnosisFlowReturn{Evidence: "not_measured"}
+	}
+	out := ClientDiagnosisFlowReturn{
+		Evidence: "not_observed",
+		Packets:  flow.ReturnPackets,
+		Bytes:    flow.ReturnBytes,
+		FirstAt:  clientDiagnosisTime(flow.ReturnFirst),
+		LastAt:   clientDiagnosisTime(flow.ReturnLast),
+	}
+	if flow.ReturnObserved {
+		out.Evidence = "observed"
 	}
 	return out
 }

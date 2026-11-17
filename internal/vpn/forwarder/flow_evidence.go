@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 // This file is the per-flow evidence of issue #861, slice 3a: what the packet
@@ -191,7 +192,7 @@ func (m *DirectEgressManager) RecordFlowDecision(peerKey, sessionID string, gene
 // It is called only from the proxy dispatch site, which already knows the flow was
 // recorded, so a miss means the flow was retired in between and the outcome is
 // simply not attributed (the packet's fate is still counted globally).
-func (m *DirectEgressManager) RecordProxyDispatch(peerKey string, packet []byte, accepted bool, failure string) {
+func (m *DirectEgressManager) RecordProxyDispatch(peerKey, sessionID string, generation uint64, packet []byte, accepted bool, failure string) {
 	if m == nil {
 		return
 	}
@@ -202,7 +203,7 @@ func (m *DirectEgressManager) RecordProxyDispatch(peerKey string, packet []byte,
 	m.mu.RLock()
 	entry := m.flows[key]
 	var stats *flowStats
-	if entry != nil {
+	if entry != nil && dispatchBelongsToIncarnation(entry, sessionID, generation) {
 		stats = entry.evidence
 	}
 	m.mu.RUnlock()
@@ -214,6 +215,24 @@ func (m *DirectEgressManager) RecordProxyDispatch(peerKey string, packet []byte,
 		return
 	}
 	stats.recordForward(0, errors.New("proxy dispatch refused"), failure)
+}
+
+// dispatchBelongsToIncarnation reports whether the flow entry found by tuple is
+// the incarnation that dispatched the packet. A tuple is reusable: the peer key and
+// the 5-tuple alone would let a queued packet from a retired session credit the
+// successor that now owns the same tuple, so the session and the route generation
+// have to match as well.
+func dispatchBelongsToIncarnation(entry *flowEntry, sessionID string, generation uint64) bool {
+	if entry == nil {
+		return false
+	}
+	if sessionID != "" && entry.sessionID != sessionID {
+		return false
+	}
+	if generation != 0 && entry.generation != generation {
+		return false
+	}
+	return true
 }
 
 // recordDirectForward notes the DIRECT dispatch outcome on the entry the caller
@@ -261,15 +280,21 @@ func flowKeyForPacket(peerKey string, packet []byte) (FlowKey, error) {
 // not key (anything but TCP and UDP).
 var ErrUnsupportedFlowProtocol = errors.New("forwarder: unsupported protocol for flow evidence")
 
-// FlowEvidenceBytesPerFlow is the estimated metadata footprint one flow entry
-// carries: the immutable decision fields plus the counters. It is used to state
-// the worst-case size of a full flow table instead of claiming "small".
-const FlowEvidenceBytesPerFlow = 96
+// flowEvidenceRefBytes is what one flow actually carries: the measured size of the
+// evidence struct plus the pointer that reaches it from the flow entry. It is
+// derived, not estimated by eye: the struct holds two time instants, a string and
+// a reason string, five atomic counters and an atomic token pointer, which a
+// by-hand "96 bytes" guess under-counted.
+var flowEvidenceRefBytes = int(unsafe.Sizeof(flowStats{})) + int(unsafe.Sizeof((*flowStats)(nil)))
+
+// FlowEvidenceBytesPerFlow is the measured metadata footprint one flow entry
+// carries.
+func FlowEvidenceBytesPerFlow() int { return flowEvidenceRefBytes }
 
 // FlowEvidenceMaxFlowTableBytes is the worst-case metadata size at the supported
 // flow-table capacity. The table bound is the metadata bound: there is no second
 // store and no retention after a flow retires.
-const FlowEvidenceMaxFlowTableBytes = FlowEvidenceBytesPerFlow * 65536
+func FlowEvidenceMaxFlowTableBytes() int { return flowEvidenceRefBytes * 65536 }
 
 // sessionFlowEvidence is the read-only copy of one flow's evidence.
 type sessionFlowEvidence struct {

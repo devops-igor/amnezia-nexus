@@ -239,6 +239,20 @@ var clientDiagTokenValues = map[string][]string{
 	},
 	"decision": {"direct", "proxy", "unknown"},
 	"protocol": {"tcp", "udp"},
+	"reason": {
+		"sticky_flow", "evidence_direct", "proxy_cidr_rule", "proxy_cached_evidence",
+		"no_trusted_evidence", "not_recorded",
+	},
+	"name_match":      {"unique", "ambiguous", "none", "not_recorded"},
+	"return_evidence": {"observed", "not_observed", "not_measured", "not_recorded"},
+	"corr": {
+		"answer_after_decision", "expired_before_decision", "no_retained_answer",
+		"decision_time_not_recorded", "dns_records_not_recorded",
+	},
+	"failure": {
+		"wan_write_failed", "backend_queue_full", "backend_detached",
+		"backend_unavailable", "direct_egress_unavailable", "return_path_closed",
+	},
 	"limit": {
 		"dns_names_not_retained", "dns_questions_not_retained",
 		"flow_decision_time_not_recorded", "flow_decision_reason_not_recorded",

@@ -38,10 +38,15 @@ const (
 	// records than one response should carry, so the page is capped and the
 	// caller reports the truncation instead of receiving an unbounded answer.
 	SessionFlowSnapshotMaxLimit = 512
-	// SessionFlowScanRecords bounds how many flow records one snapshot visits.
-	// It is the real cost boundary of this read: at the supported 65536-entry
-	// table it visits a quarter of the table and reports scan_complete=false,
-	// rather than taking the dataplane lock for a full sweep.
+	// SessionFlowScanRecords bounds how many flow records one snapshot VISITS.
+	// This — not the page size — is the work bound: flows are keyed by 5-tuple, so
+	// a per-session listing filters the table, and at the supported 65536-entry
+	// table this visits a quarter of it and reports scan_complete=false with the
+	// real count. Measured hold of the direct-egress read lock at that bound:
+	// 2.22 ms worst case (every visited record owned by the session) and 0.50 ms
+	// when 64 sessions share the table, 144 KB per page. A per-session index is the
+	// structural fix; until it exists this bound is the honest one, and the page
+	// limit below only bounds the RESPONSE size.
 	SessionFlowScanRecords = 16384
 )
 
@@ -177,6 +182,11 @@ func (f *Forwarder) SessionRouteGeneration(sessionID string) (uint64, bool) {
 // SnapshotSessionFlows copies the flows owned by sessionID and, when generation
 // is non-zero, by that route generation, newest activity first, at most limit
 // records.
+//
+// The limit bounds the ANSWER, not the work: the scan visits up to
+// SessionFlowScanRecords table entries and reports how many it visited and whether
+// that covered the table (Scanned, ScanComplete). Callers must present a page as a
+// page and the scan as the cost.
 //
 // A flow is owned by exactly one session and one generation; a record whose
 // generation differs belongs to a previous incarnation and is never returned for
