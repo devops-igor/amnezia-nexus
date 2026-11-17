@@ -646,7 +646,13 @@ func initDNSGateway(gwDNS netip.Addr, matcher *policy.Matcher, rc forwarder.Rout
 // silently leaving the resolver unset: policy routing without a working
 // resolver produces no evidence at all, which is the failure this configuration
 // exists to remove.
-func newPolicyUpstreamResolver(configured []policy.Upstream) (*gatewaydns.UpstreamResolver, error) {
+//
+// It is a package-level variable so a test can substitute a constructor for the
+// same reason newDNSContinuityResolver is one: the production resolver validates
+// loopback upstreams away, and an encrypted local fixture can only be reached
+// through a wrapper that calls NewUpstreamResolver on the configuration this
+// function actually receives. Production always runs the value below.
+var newPolicyUpstreamResolver = func(configured []policy.Upstream) (*gatewaydns.UpstreamResolver, error) {
 	upstreams := configured
 	if len(upstreams) == 0 {
 		upstreams = policy.DefaultUpstreams()
