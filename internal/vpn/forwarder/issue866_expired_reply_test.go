@@ -4,6 +4,7 @@ package forwarder
 
 import (
 	"bytes"
+	"fmt"
 	"net/netip"
 	"testing"
 	"time"
@@ -319,14 +320,37 @@ func TestIssue866ActiveTrafficStableAfterDNSEvidenceExpiry(t *testing.T) {
 	// The DNS answer that justified DIRECT lapses; the flow must not care.
 	h.cache.Set("session-one", h.remote, policy.Unknown)
 
+	// Failure-only diagnostics: the state this case depends on is recorded around each real
+	// dispatch and reply, and printed only if the case fails. Nothing here changes a flow, a
+	// budget or an assertion; the samples are read through the flow table's own lock.
+	var issue866Samples []string
+	recordIssue866 := func(phase string) {
+		state := issue866FlowStateOf(h, 17, issue866ClientPort, issue866RemotePort)
+		issue866Samples = append(issue866Samples, fmt.Sprintf(
+			"phase=%s at=%s flow_present=%v nat_port=%d stored_age=%s",
+			phase, time.Now().Format("15:04:05.000000"), state.Present, state.NATPort,
+			time.Since(state.LastSeen).Round(time.Microsecond)))
+	}
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		for _, sample := range issue866Samples {
+			t.Log(sample)
+		}
+	})
+
 	for i := 0; i < 2; i++ {
 		time.Sleep(flowTimeout / 4)
+		recordIssue866(fmt.Sprintf("before_dispatch_%d", i))
 		if err := h.dispatchUDP(issue866ClientPort, issue866RemotePort, "no-evidence-query"); err != nil {
 			t.Fatalf("client packet on the established flow failed: %v", err)
 		}
+		recordIssue866(fmt.Sprintf("after_dispatch_%d", i))
 		if got := h.lastNATPort(); got != natPort {
 			t.Fatalf("live flow changed NAT port after evidence expiry: %d, want %d", got, natPort)
 		}
+		recordIssue866(fmt.Sprintf("before_reply_%d", i))
 		h.requireDelivered(sink, natPort, issue866RemotePort, "no-evidence-reply", "reply on the established flow")
 	}
 

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -753,6 +754,52 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 		packet = append(packet, pad...)
 		binary.BigEndian.PutUint16(packet[2:4], 1420)
 	}
+	// Bounded per-test event recorder. It exists so a failure names the event index and the gap
+	// that was late instead of only "15/16": the CI failure this case produced could not be
+	// attributed, and a bare retry would have produced the same message again. The recorder holds
+	// timestamps only, never payloads, and is capped so a long stall cannot grow it.
+	const recordedEvents = 64
+	type stallEvent struct {
+		enqueued time.Time
+		written  time.Time
+	}
+	stallLog := make([]stallEvent, 0, recordedEvents)
+	recordEnqueue := func() {
+		if len(stallLog) >= recordedEvents {
+			return
+		}
+		stallLog = append(stallLog, stallEvent{enqueued: time.Now()})
+	}
+	recordWritten := func() {
+		for i := range stallLog {
+			if stallLog[i].written.IsZero() {
+				stallLog[i].written = time.Now()
+				return
+			}
+		}
+	}
+	stallReport := func(waited, want int) string {
+		var b strings.Builder
+		fmt.Fprintf(&b, "recorded=%d", len(stallLog))
+		_ = waited
+		limit := len(stallLog)
+		for i := 0; i < limit; i++ {
+			_ = i
+			ev := stallLog[i]
+			written := "not_written"
+			if !ev.written.IsZero() {
+				written = ev.written.Sub(ev.enqueued).Round(time.Microsecond).String()
+			}
+			// Only the tail is interesting: the events around the stall.
+			if i < limit-8 {
+				continue
+			}
+			fmt.Fprintf(&b, " | event %d enqueued_offset=%s write_latency=%s",
+				i, ev.enqueued.Sub(stallLog[0].enqueued).Round(time.Microsecond), written)
+		}
+		return b.String()
+	}
+
 	wait := func(ch <-chan struct{}, count int) {
 		t.Helper()
 		timeout := time.NewTimer(3 * time.Second)
@@ -760,8 +807,9 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 		for i := 0; i < count; i++ {
 			select {
 			case <-ch:
+				recordWritten()
 			case <-timeout.C:
-				t.Fatalf("device stalled after %d/%d events", i, count)
+				t.Fatalf("device stalled after %d/%d events (%s)", i, count, stallReport(i, count))
 			}
 		}
 	}
@@ -770,6 +818,7 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 		if err := f.RouteBackendToClient(1, packet, "10.100.0.10"); err != nil {
 			t.Fatalf("unexpected overflow during healthy traffic: %v", err)
 		}
+		recordEnqueue()
 	}
 	release := func(count int) {
 		for i := 0; i < count; i++ {

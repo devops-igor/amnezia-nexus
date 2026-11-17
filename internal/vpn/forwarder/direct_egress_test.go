@@ -480,15 +480,41 @@ func TestDirectEgress_LookupExpirationAndBidirectionalRefresh(t *testing.T) {
 	}
 	natPort := binary.BigEndian.Uint16(wanPkts[0][20:22])
 
-	// Sleep 40ms, send reply to refresh lastSeen
-	time.Sleep(40 * time.Millisecond)
+	// Put the flow at a known logical age inside the 60ms lifetime instead of sleeping 40ms of
+	// real time inside that budget: a sleep that overshoots by 20ms made the reply look stale,
+	// which is a property of the test's wall clock, not of the product.
+	refreshKey := flowKeyForTest(t, peerKey, pkt2)
+	positionFlowAge(t, dem, refreshKey, 40*time.Millisecond)
+	before := sampleFlowAge(dem, refreshKey)
+	if !before.Present {
+		t.Fatal("the flow disappeared before the reply")
+	}
+	if before.Age < 30*time.Millisecond || before.Age > 60*time.Millisecond {
+		t.Fatalf("positioned age = %s, want a logical age inside the 60ms lifetime", before.Age)
+	}
+
+	// Send the reply that must refresh lastSeen.
 	reply := buildTestIPv4UDPPacket(targetIP, hostWAN, 53, natPort, []byte("reply-refresh"))
 	if err := dem.HandleWANReply(reply); err != nil {
 		t.Fatalf("HandleWANReply failed: %v", err)
 	}
 
-	// Sleep another 40ms (total elapsed since outbound = 80ms > 60ms timeout, but only 40ms since reply)
-	time.Sleep(40 * time.Millisecond)
+	// The refresh is asserted through the consumer that performs it: the stored age must have
+	// collapsed, measured before and after the real reply rather than by a helper that could
+	// supply the refresh itself.
+	after := sampleFlowAge(dem, refreshKey)
+	if !after.Present {
+		t.Fatal("the reply retired the flow it should have refreshed")
+	}
+	if !after.LastSeen.After(before.LastSeen) {
+		t.Fatalf("lastSeen did not advance: before=%s after=%s", before.LastSeen, after.LastSeen)
+	}
+	if after.Age > 10*time.Millisecond {
+		t.Fatalf("age after the reply = %s, want a refreshed flow rather than the positioned %s", after.Age, before.Age)
+	}
+
+	// And it is still inside its lifetime a logical 40ms after the refresh, with no real sleep.
+	positionFlowAge(t, dem, refreshKey, 40*time.Millisecond)
 	if choice, found := dem.LookupFlow(peerKey, pkt2); !found || choice != EgressChoiceDirect {
 		t.Fatalf("expected flow to remain active due to WAN reply refresh, got %v, %v", choice, found)
 	}
