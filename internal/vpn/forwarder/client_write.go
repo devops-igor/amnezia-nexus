@@ -323,8 +323,7 @@ func (f *Forwarder) DeliverDirectWANReply(peerKey, sessionID string, generation 
 
 	pktLen := int64(len(packet))
 	if pktLen > MaxClientQueuePacketBytes {
-		f.dropsPacketTooLarge.Add(1)
-		f.dropsTotal.Add(1)
+		f.recordOversizedReturn(&f.oversizedDirectReturns, len(packet))
 		return ErrPacketTooLarge
 	}
 

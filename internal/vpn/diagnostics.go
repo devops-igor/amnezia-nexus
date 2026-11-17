@@ -180,6 +180,22 @@ type DropCategoryBreakdown struct {
 	ReturnInjectionTUNDrops uint64 `json:"return_injection_tun_drops"`
 	ReturnQueueFull         uint64 `json:"return_queue_full"`
 	ReturnPacketTooLarge    uint64 `json:"return_packet_too_large"`
+	// ReturnPacketTooLargeBackend and ReturnPacketTooLargeDirect PARTITION
+	// ReturnPacketTooLarge by the producer that refused the reply:
+	// "backend" is a reply arriving from a backend tunnel on the proxy return
+	// path, "direct" is a reply arriving from direct WAN egress. They are a
+	// split of the same loss, never additional loss: they are deliberately
+	// absent from ReturnTotalDrops, TotalDrops and ReasonRates, so summing the
+	// two gives the aggregate and no rejected packet is counted twice.
+	ReturnPacketTooLargeBackend uint64 `json:"return_packet_too_large_backend"`
+	ReturnPacketTooLargeDirect  uint64 `json:"return_packet_too_large_direct"`
+	// ReturnPacketTooLargeBackendMaxBytes and ReturnPacketTooLargeDirectMaxBytes
+	// are the largest rejected reply size each producer observed, in bytes,
+	// since the counters were reset. They are bounded numbers, not a record of
+	// the packets: no payload, address, peer or session identifier is retained.
+	// A size with a zero count is meaningless; read them as a pair.
+	ReturnPacketTooLargeBackendMaxBytes uint64 `json:"return_packet_too_large_backend_max_bytes"`
+	ReturnPacketTooLargeDirectMaxBytes  uint64 `json:"return_packet_too_large_direct_max_bytes"`
 	// ReturnBackendDeviceQueueFull and ReturnBackendDeviceShutdown are the
 	// return-direction half of the backend-device breakdown: outbound
 	// VirtualTUN loss on a backend device, i.e. backend -> Nexus return

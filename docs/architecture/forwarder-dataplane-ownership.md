@@ -36,7 +36,9 @@ The `Forwarder` struct owns global routing tables, backend queues, synchronizati
 | `totalTxPackets` | `atomic.Uint64` | Cumulative lifetime throughput packets backend to client | `sync/atomic` operations | Not reset on `Start()`; incremented on successful client enqueue |
 | `dropsQueueFull` | `atomic.Uint64` | Return packets dropped due to full client route queue | `sync/atomic` operations | Reset on `Start()`; incremented in `RouteBackendToClient` |
 | `dropsNoRoute` | `atomic.Uint64` | Return packets dropped due to unmapped VIP or backend mismatch | `sync/atomic` operations | Reset on `Start()`; incremented in `RouteBackendToClient` |
-| `dropsPacketTooLarge` | `atomic.Uint64` | Return packets dropped exceeding `MaxClientQueuePacketBytes` | `sync/atomic` operations | Reset on `Start()`; incremented in `RouteBackendToClient` |
+| `dropsPacketTooLarge` | `atomic.Uint64` | Return packets dropped exceeding `MaxClientQueuePacketBytes` | `sync/atomic` operations | Reset on `Start()`; incremented only by `recordOversizedReturn` (both return producers) |
+| `oversizedBackendReturns` | `oversizedReturnTally` | Oversized rejections of replies arriving from a backend tunnel, with the largest refused payload size in bytes | `sync/atomic` operations | Reset on `Start()`; incremented with `dropsPacketTooLarge` from `RouteBackendToClient` |
+| `oversizedDirectReturns` | `oversizedReturnTally` | Oversized rejections of replies arriving from direct WAN egress, with the largest refused payload size in bytes | `sync/atomic` operations | Reset on `Start()`; incremented with `dropsPacketTooLarge` from `DeliverDirectWANReply` |
 | `dropsTotal` | `atomic.Uint64` | Monotonic total of all return-path packet drops | `sync/atomic` operations | Reset on `Start()`; incremented on every return drop event |
 | `clientDropsQueueFull` | `atomic.Uint64` | Client packets dropped due to full backend queue | `sync/atomic` operations | Reset on `Start()`; incremented in `RouteClientToBackend` |
 | `clientDropsRateLimited`| `atomic.Uint64` | Client packets dropped due to upstream token bucket exhaustion | `sync/atomic` operations | Reset on `Start()`; incremented in `RouteClientToBackend` |
@@ -104,7 +106,36 @@ from the presence of a queue:
 
 ---
 
-### 2.1.2 Port-53 Interception Ownership (Policy Resolver Submission)
+### 2.1.2 Oversized Return Attribution (`oversizedBackendReturns`, `oversizedDirectReturns`)
+
+Two producers can refuse a return reply for exceeding
+`MaxClientQueuePacketBytes`: the proxy/backend return path
+(`RouteBackendToClient`) and the direct WAN return path
+(`DeliverDirectWANReply`). Both book through one helper,
+`recordOversizedReturn`, which advances the aggregate `dropsPacketTooLarge` and
+`dropsTotal` and exactly one producer tally. The aggregate therefore equals the
+sum of the two tallies by construction, and neither producer can drift from it
+by editing a call site.
+
+- **Bounded metadata.** Each tally is a count plus the largest refused payload
+  size in bytes since the last reset. No payload, address, peer key, session
+  identifier or per-flow entry is stored or logged: attribution costs two
+  fixed-width numbers per producer no matter how much traffic is dropped.
+- **Descriptive, not diagnostic.** A zero count means that producer refused
+  nothing; a maximum size says only that some reply exceeded the queue bound.
+  Neither number identifies a flow, a cause (aggregation, offload or a
+  mis-sized sender) or a throughput effect, and neither may be read as
+  recovery or as a verdict on the original impairment.
+- **Published as a partition.** `DropCategoryBreakdown` exposes the split as
+  `return_packet_too_large_backend` / `return_packet_too_large_direct` with
+  their `_max_bytes` companions. They are excluded from `return_total_drops`,
+  `total_drops` and the loss-reason rate map, because they are a split of
+  `return_packet_too_large`, not additional loss.
+- **Lifecycle.** Reset together with the other drop counters in
+  `resetDropCounters`, i.e. on every `Start()`. A post-restart window never
+  reports a pre-restart maximum.
+
+### 2.1.3 Port-53 Interception Ownership (Policy Resolver Submission)
 
 While policy routing is active, one class of client-to-backend traffic has no
 egress decision of its own: plain DNS is submitted to the policy resolver so the
