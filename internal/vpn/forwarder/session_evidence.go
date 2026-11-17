@@ -199,10 +199,12 @@ func (f *Forwarder) SessionRouteGeneration(sessionID string) (uint64, bool) {
 // is non-zero, by that route generation, newest activity first, at most limit
 // records.
 //
-// The limit bounds the ANSWER, not the work: the scan visits up to
-// SessionFlowScanRecords table entries and reports how many it visited and whether
-// that covered the table (Scanned, ScanComplete). Callers must present a page as a
-// page and the scan as the cost.
+// The limit bounds the ANSWER. The visit is the selected membership only, through the
+// (session, generation) index maintained under the flow table's own lock, so another
+// client's flows cannot consume this client's allowance; Scanned is that selection's visit
+// count and ScanComplete says whether the visit reached all of it. The visit is capped at
+// SessionFlowScanRecords as a safety bound, not as a substitute for selecting the right
+// rows: a client that owns the whole table legitimately costs the whole table.
 //
 // A flow is owned by exactly one session and one generation; a record whose
 // generation differs belongs to a previous incarnation and is never returned for
@@ -221,15 +223,19 @@ func (m *DirectEgressManager) SnapshotSessionFlows(sessionID string, generation 
 
 	page := &sessionFlowPage{limit: limit}
 	m.mu.RLock()
+	// Only this selection's membership is visited. Another client's flows cannot consume
+	// this client's allowance, and the visit count below is this client's own work.
+	keys := m.membershipKeysLocked(sessionID, generation)
 	scanned := 0
-	for key, entry := range m.flows {
+	for _, key := range keys {
 		if scanned >= SessionFlowScanRecords {
 			break
 		}
-		scanned++
-		if !sessionFlowMatches(entry, sessionID, generation) {
+		entry, ok := m.flows[key]
+		if !ok || !sessionFlowMatches(entry, sessionID, generation) {
 			continue
 		}
+		scanned++
 		evidence := snapshotFlowEvidence(entry.evidence)
 		page.add(SessionFlow{
 			Protocol:            key.Protocol,
@@ -270,15 +276,17 @@ func (m *DirectEgressManager) SnapshotSessionFlows(sessionID string, generation 
 				evidence.returnDelivered+evidence.returnFailed > 0,
 		})
 	}
-	total := len(m.flows)
 	m.mu.RUnlock()
 
+	// Total and completeness describe THIS selection: the number of keys the selected
+	// membership holds, and whether the visit reached all of them. It is a finite bound,
+	// not a constant-time claim: a client that owns the whole table costs the whole table.
 	list := SessionFlowList{
 		Flows:        page.sorted(),
 		Total:        page.matched,
 		Truncated:    page.matched > len(page.heap),
 		Scanned:      scanned,
-		ScanComplete: scanned >= total,
+		ScanComplete: scanned >= len(keys),
 	}
 	return list
 }

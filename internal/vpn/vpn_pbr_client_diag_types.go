@@ -452,7 +452,7 @@ type ClientDiagnosisFlows struct {
 	// Scanned is how many flow records the filtered scan visited, so the cost of
 	// the answer is visible instead of promised.
 	Scanned int `json:"scanned"`
-	// ScanComplete reports that every flow record was visited, so Total is the
+	// ScanComplete reports that every flow record of THIS selection was visited, so Total is the
 	// session's real count at the sampled instant.
 	ScanComplete bool `json:"scan_complete"`
 	// Total counts the records that matched INSIDE the visited window: it is a

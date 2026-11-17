@@ -492,8 +492,14 @@ func TestClientDiagnosisReportsTheProducersOwnRecords(t *testing.T) {
 			t.Errorf("coverage.not_covered is missing %q: %v", want, answer.Coverage.NotCovered)
 		}
 	}
-	if answer.Drops.Available || answer.Drops.State != ClientDiagnosisTokenNotRecorded {
-		t.Errorf("drops = %+v, want an explicit not_recorded section", answer.Drops)
+	// The pre-flow refusal ledger is a real section now: a client with no refusal in the
+	// retention window reads as available-but-empty, with its bounds stated, rather than as
+	// an unrecorded section.
+	if !answer.Drops.Available || answer.Drops.State != "none_retained" || len(answer.Drops.Entries) != 0 {
+		t.Errorf("drops = %+v, want available with no retained refusals", answer.Drops)
+	}
+	if answer.Drops.Coverage.KeyLimit == 0 || answer.Drops.Coverage.AgeLimitSeconds == 0 {
+		t.Errorf("drops coverage does not state its bounds: %+v", answer.Drops.Coverage)
 	}
 
 	// The wire shape is what the browser receives: no field may be dropped.

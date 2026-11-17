@@ -447,7 +447,18 @@ responder = async (url, opts) => {
             total: 600, truncated: true, entries: [
       {protocol: 'udp', destination_ip: '1.1.1.1', destination_port: 53, choice: 'PROXY',
        last_seen_age_seconds: 5, expired: false, close_seen: false}]},
-    drops: {available: false, state: 'not_recorded', entries: []},
+    drops: {available: true, state: 'observed', total: 3, truncated: true,
+      entries: [
+        {reason: 'prohibited_destination', has_tuple: true, destination_ip: '169.254.169.254',
+         destination_port: 80, protocol: 'tcp', count: 4, bytes: 240,
+         first_seen: '2026-11-17T09:00:00Z', last_seen: '2026-11-17T09:05:00Z'},
+        {reason: 'invalid_client_packet', has_tuple: false, count: 1, bytes: 3,
+         first_seen: '2026-11-17T09:01:00Z', last_seen: '2026-11-17T09:01:00Z'},
+        {reason: 'nat_port_exhaustion', has_tuple: true, destination_ip: '9.9.9.9',
+         destination_port: 443, protocol: 'tcp', count: 2, bytes: 120,
+         first_seen: '2026-11-17T09:02:00Z', last_seen: '2026-11-17T09:06:00Z'}],
+      coverage: {stored: 2, merged: 5, evicted: 0, pruned: 1, session_keys: 3, keys: 3,
+                 key_limit: 64, age_limit_seconds: 600}},
     limitations: ['flow_scan_window_partial'], evaluated_at: '2026-11-17T09:10:00Z', read_only: true};
 };
 `, `

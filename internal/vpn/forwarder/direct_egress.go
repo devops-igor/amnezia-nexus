@@ -126,11 +126,15 @@ const (
 // DirectEgressManager manages direct host WAN forwarding, SNAT, response demultiplexing,
 // and 5-tuple flow stickiness.
 type DirectEgressManager struct {
-	mu               sync.RWMutex
-	cfg              DirectEgressConfig
-	fwd              *Forwarder
-	wanDevice        PacketDevice
-	flows            map[FlowKey]*flowEntry
+	mu        sync.RWMutex
+	cfg       DirectEgressConfig
+	fwd       *Forwarder
+	wanDevice PacketDevice
+	flows     map[FlowKey]*flowEntry
+	// members is the secondary (session, generation) -> flow key index. It stores keys
+	// only, so its memory is proportional to the flow table, and every mutation of
+	// flows goes through the helpers in flow_membership.go under this same lock.
+	members          map[flowMemberKey]*flowMemberBucket
 	inboundNAT       map[inboundKey]*natEntry
 	usedPorts        map[uint16]bool
 	nextPort         uint16
@@ -197,6 +201,7 @@ func NewDirectEgressManager(cfg DirectEgressConfig, fwd *Forwarder) *DirectEgres
 		fwd:              fwd,
 		wanDevice:        cfg.WANDevice,
 		flows:            make(map[FlowKey]*flowEntry),
+		members:          make(map[flowMemberKey]*flowMemberBucket),
 		inboundNAT:       make(map[inboundKey]*natEntry),
 		usedPorts:        make(map[uint16]bool),
 		nextPort:         cfg.MinPort,
@@ -508,7 +513,7 @@ func (m *DirectEgressManager) recordFlowKeyed(key FlowKey, sessionID string, gen
 	if decision != nil {
 		entry.evidence = newFlowStats(*decision, now)
 	}
-	m.flows[key] = entry
+	m.storeFlowLocked(key, entry)
 	return nil
 }
 
@@ -647,7 +652,9 @@ func (m *DirectEgressManager) ensureDirectNATLocked(
 		var err error
 		natPort, err = m.allocatePortLocked(peerKey, proto, netip.AddrFrom4(dstIP), dstPort)
 		if err != nil {
-			delete(m.flows, flowKey)
+			// The entry created above is removed together with its membership, so the
+			// index cannot keep a key for a flow the caller never received.
+			m.removeFlowLocked(flowKey)
 			return 0, nil, err
 		}
 		if flow == nil {
@@ -659,13 +666,14 @@ func (m *DirectEgressManager) ensureDirectNATLocked(
 				sessionID:  sessionID,
 				generation: generation,
 			}
-			m.flows[flowKey] = flow
+			m.storeFlowLocked(flowKey, flow)
 		} else {
 			flow.natPort = natPort
 			flow.choice = EgressChoiceDirect
 			flow.lastSeen = now
-			flow.sessionID = sessionID
-			flow.generation = generation
+			// The tuple is the same but the incarnation may not be: the membership moves
+			// with the entry instead of leaving the key in the previous bucket.
+			m.rebindFlowLocked(flowKey, flow, sessionID, generation)
 		}
 
 		inKey := inboundKey{protocol: proto, natPort: natPort}
