@@ -65,6 +65,12 @@ type flowEntry struct {
 	sessionID  string
 	generation uint64
 	closeSeen  bool
+	// evidence is the decision and outcome record of this flow (issue #861). It
+	// is allocated once per flow entry and its counters are atomics, so the
+	// dispatch and return paths update it without taking the manager lock again.
+	// A nil block means the entry was created by a path that carried no decision
+	// metadata; the snapshot reports that as not recorded.
+	evidence *flowStats
 }
 
 type inboundKey struct {
@@ -441,7 +447,14 @@ func (m *DirectEgressManager) RecordFlow(peerKey string, args ...any) error {
 		SrcPort:  binary.BigEndian.Uint16(packet[ihl : ihl+2]),
 		DstPort:  binary.BigEndian.Uint16(packet[ihl+2 : ihl+4]),
 	}
+	return m.recordFlowKeyed(key, sessionID, generation, choice, nil)
+}
 
+// recordFlowKeyed installs or refreshes one flow entry. The decision metadata is
+// optional: the legacy RecordFlow path passes nil and the entry then carries no
+// decision record, which the snapshot reports as not recorded.
+func (m *DirectEgressManager) recordFlowKeyed(key FlowKey, sessionID string, generation uint64, choice EgressChoice, decision *FlowDecision) error {
+	peerKey := key.PeerKey
 	if m.fwd != nil {
 		m.fwd.mu.RLock()
 		defer m.fwd.mu.RUnlock()
@@ -464,28 +477,38 @@ func (m *DirectEgressManager) RecordFlow(peerKey string, args ...any) error {
 		activeSID = sessionID
 	}
 
+	now := time.Now()
 	if entry, ok := m.flows[key]; ok {
 		entry.choice = choice
-		entry.lastSeen = time.Now()
+		entry.lastSeen = now
 		entry.generation = activeGen
 		entry.sessionID = activeSID
+		// A re-record is a new decision for the same tuple: the evidence block is
+		// replaced, never merged, so the record cannot mix two decisions.
+		if decision != nil {
+			entry.evidence = newFlowStats(*decision, now)
+		}
 		return nil
 	}
 
 	if len(m.flows) >= m.cfg.MaxFlows {
-		m.sweepLocked(time.Now())
+		m.sweepLocked(now)
 		if len(m.flows) >= m.cfg.MaxFlows {
 			return ErrFlowTableFull
 		}
 	}
 
-	m.flows[key] = &flowEntry{
+	entry := &flowEntry{
 		choice:     choice,
-		lastSeen:   time.Now(),
+		lastSeen:   now,
 		peerKey:    peerKey,
 		sessionID:  activeSID,
 		generation: activeGen,
 	}
+	if decision != nil {
+		entry.evidence = newFlowStats(*decision, now)
+	}
+	m.flows[key] = entry
 	return nil
 }
 
@@ -712,6 +735,7 @@ func (m *DirectEgressManager) routeDirectProtocol(peerKey, assignedIP, sessionID
 		flow.closeSeen = true
 	}
 
+	stats := flow.evidence
 	wanDev := m.wanDevice
 	hostWAN := m.cfg.HostWANIP
 	m.mu.Unlock()
@@ -721,15 +745,20 @@ func (m *DirectEgressManager) routeDirectProtocol(peerKey, assignedIP, sessionID
 
 	if wanDev == nil {
 		m.directDrops.Add(1)
+		recordDirectForward(stats, 0, ErrDirectEgressUnavailable)
 		return ErrDirectEgressUnavailable
 	}
 
 	out := applySNAT(packet, ihl, proto, hostWAN, dstIP, natPort)
 	if _, err := wanDev.Write(out); err != nil {
 		m.directDrops.Add(1)
+		recordDirectForward(stats, 0, err)
 		return err
 	}
 	m.directBytes.Add(int64(len(out)))
+	// The outcome is recorded through the pointer captured under the lock, after
+	// the write, so no lock is taken on the dispatch path.
+	recordDirectForward(stats, int64(len(out)), nil)
 	return nil
 }
 
@@ -737,7 +766,7 @@ func (m *DirectEgressManager) validateWANReplyHeader(packet []byte) (ihl int, pr
 	return ValidateWANReplyIPv4(packet, m.cfg.HostWANIP)
 }
 
-func (m *DirectEgressManager) lookupAndRefreshNATReply(proto uint8, natPort uint16, srcIP netip.Addr, srcPort uint16, isClose bool) (natEntry, error) {
+func (m *DirectEgressManager) lookupAndRefreshNATReply(proto uint8, natPort uint16, srcIP netip.Addr, srcPort uint16, isClose bool) (natEntry, *flowStats, error) {
 	inKey := inboundKey{protocol: proto, natPort: natPort}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -747,22 +776,22 @@ func (m *DirectEgressManager) lookupAndRefreshNATReply(proto uint8, natPort uint
 	entry, ok := m.inboundNAT[inKey]
 	if !ok {
 		if _, exists := m.remoteBindings[bKey]; exists {
-			return natEntry{}, ErrStaleSessionReply
+			return natEntry{}, nil, ErrStaleSessionReply
 		}
-		return natEntry{}, errors.New("no nat entry for reply")
+		return natEntry{}, nil, errors.New("no nat entry for reply")
 	}
 	if srcIP != entry.remoteIP || srcPort != entry.remotePort {
 		if _, exists := m.remoteBindings[bKey]; exists {
-			return natEntry{}, ErrStaleSessionReply
+			return natEntry{}, nil, ErrStaleSessionReply
 		}
-		return natEntry{}, errors.New("remote endpoint does not match nat entry")
+		return natEntry{}, nil, errors.New("remote endpoint does not match nat entry")
 	}
 	if entry.epoch != m.portEpoch[natPort] {
-		return natEntry{}, ErrStaleSessionReply
+		return natEntry{}, nil, ErrStaleSessionReply
 	}
 	if b, exists := m.remoteBindings[bKey]; exists {
 		if !b.active || b.peerKey != entry.peerKey || b.sessionID != entry.sessionID || b.epoch != entry.epoch {
-			return natEntry{}, ErrStaleSessionReply
+			return natEntry{}, nil, ErrStaleSessionReply
 		}
 	}
 
@@ -781,11 +810,11 @@ func (m *DirectEgressManager) lookupAndRefreshNATReply(proto uint8, natPort uint
 	if !hasFlow || flow.natPort != natPort {
 		// This entry outlived the flow that owned it. Nothing can deliver it
 		// legitimately, and no live flow may be disturbed here.
-		return natEntry{}, ErrStaleSessionReply
+		return natEntry{}, nil, ErrStaleSessionReply
 	}
 	if m.isFlowExpiredLocked(flow, proto, now) {
 		m.retireFlowLocked(entry.flowKey, flow, proto, now)
-		return natEntry{}, ErrStaleSessionReply
+		return natEntry{}, nil, ErrStaleSessionReply
 	}
 
 	entry.lastSeen = now
@@ -794,7 +823,7 @@ func (m *DirectEgressManager) lookupAndRefreshNATReply(proto uint8, natPort uint
 		flow.closeSeen = true
 		entry.closeSeen = true
 	}
-	return *entry, nil
+	return *entry, flow.evidence, nil
 }
 
 // HandleWANReply demultiplexes an inbound response packet from the WAN and forwards it to the client.
@@ -806,7 +835,7 @@ func (m *DirectEgressManager) HandleWANReply(packet []byte) error {
 	}
 
 	isClose := proto == 6 && len(packet) >= ihl+14 && (packet[ihl+13]&(0x01|0x04) != 0)
-	entry, err := m.lookupAndRefreshNATReply(proto, natPort, srcIP, srcPort, isClose)
+	entry, stats, err := m.lookupAndRefreshNATReply(proto, natPort, srcIP, srcPort, isClose)
 	if err != nil {
 		m.directDrops.Add(1)
 		return err
@@ -830,7 +859,7 @@ func (m *DirectEgressManager) HandleWANReply(packet []byte) error {
 	if proto == 6 && len(packet) > virtualtun.DefaultMTU {
 		segments, segErr := segmentWANReplyTCP(packet, virtualtun.DefaultMTU)
 		if segErr == nil && len(segments) > 1 {
-			return m.deliverSegmentedWANReply(ihl, entry, segments)
+			return m.deliverSegmentedWANReply(ihl, entry, stats, segments)
 		}
 	}
 
@@ -842,13 +871,16 @@ func (m *DirectEgressManager) HandleWANReply(packet []byte) error {
 	}
 
 	m.directBytes.Add(pktLen)
+	// The reply passed every ownership check and reached the client path: that is
+	// the only fact this direction can state, and it is stated per flow.
+	stats.recordReturn(pktLen, time.Now())
 	return nil
 }
 
 // deliverSegmentedWANReply delivers the pieces of one oversized reply. Each piece
 // is DNATed and admitted on its own, so the route/session/generation, queue and
 // rate-limit checks see exactly the packets the client will receive.
-func (m *DirectEgressManager) deliverSegmentedWANReply(ihl int, entry natEntry, segments [][]byte) error {
+func (m *DirectEgressManager) deliverSegmentedWANReply(ihl int, entry natEntry, stats *flowStats, segments [][]byte) error {
 	var firstErr error
 	var delivered int64
 	for _, segment := range segments {
@@ -869,6 +901,11 @@ func (m *DirectEgressManager) deliverSegmentedWANReply(ihl int, entry natEntry, 
 	}
 	// Bytes are counted as delivered, never as the parent frame plus its pieces.
 	m.directBytes.Add(delivered)
+	if delivered > 0 {
+		// The frame's pieces reached the client path; the per-flow record counts
+		// one return for the frame, not one per piece.
+		stats.recordReturn(delivered, time.Now())
+	}
 	return firstErr
 }
 

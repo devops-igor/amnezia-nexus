@@ -168,24 +168,56 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 		}
 	}
 
+	// The generation the decision is taken against, read once at the deciding
+	// packet. It is a fact about this branch, not about the policy as it stands
+	// when an administrator later reads the flow.
+	policyGeneration := policyGenerationOf(policyMatcher)
+	backendTunnel := backend.tunnelID
+
 	// Step 2 — PROXY: Policy snapshot CIDR or route cache Proxy match (including shared-IP conflict).
-	if f.matchesProxyPolicy(dstIP, sID, policyMatcher, routeCache) {
+	if matched, reason := f.matchesProxyPolicy(dstIP, sID, policyMatcher, routeCache); matched {
 		if directEgress != nil {
-			_ = directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceProxy)
+			_ = directEgress.RecordFlowDecision(peerKey, sID, route.generation, packet, EgressChoiceProxy, FlowDecision{
+				Reason:           reason,
+				PolicyGeneration: policyGeneration,
+				DecidedAt:        time.Now(),
+				BackendTunnelID:  backendTunnel,
+			})
 		}
 		return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
 	}
 
 	// Step 3 — DIRECT: Client-scoped DNS evidence observed public destination without proxy match.
 	if routeCache != nil && routeCache.Lookup(sID, dstIP) == policy.Direct {
-		return f.routeDirectDecision(directEgress, route, peerKey, packet, pktLen, backend, backendTraffic, sID, cID)
+		return f.routeDirectDecision(directEgress, route, peerKey, packet, pktLen, backend, backendTraffic, sID, cID, FlowDecision{
+			Reason:           EgressReasonEvidenceDirect,
+			PolicyGeneration: policyGeneration,
+			DecidedAt:        time.Now(),
+		})
 	}
 
 	// Step 4 — PROXY (Safe Default): Missing, expired, or evicted DNS evidence (policy.Unknown).
 	if directEgress != nil {
-		_ = directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceProxy)
+		_ = directEgress.RecordFlowDecision(peerKey, sID, route.generation, packet, EgressChoiceProxy, FlowDecision{
+			Reason:           EgressReasonNoTrustedEvidence,
+			PolicyGeneration: policyGeneration,
+			DecidedAt:        time.Now(),
+			BackendTunnelID:  backendTunnel,
+		})
 	}
 	return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
+}
+
+// policyGenerationOf reports the published generation a decision is taken
+// against, or "" when no snapshot is published.
+func policyGenerationOf(matcher *policy.Matcher) string {
+	if matcher == nil {
+		return ""
+	}
+	if snap := matcher.Current(); snap != nil {
+		return snap.Generation()
+	}
+	return ""
 }
 
 func (f *Forwarder) handleStickyFlow(directEgress *DirectEgressManager, route *sessionRoute, peerKey string, packet []byte, pktLen int64, backend proxyBackend, backendTraffic *trafficCounters, sID, cID string) (bool, error) {
@@ -205,12 +237,15 @@ func (f *Forwarder) handleStickyFlow(directEgress *DirectEgressManager, route *s
 	return true, f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
 }
 
-func (f *Forwarder) routeDirectDecision(directEgress *DirectEgressManager, route *sessionRoute, peerKey string, packet []byte, pktLen int64, backend proxyBackend, backendTraffic *trafficCounters, sID, cID string) error {
+func (f *Forwarder) routeDirectDecision(directEgress *DirectEgressManager, route *sessionRoute, peerKey string, packet []byte, pktLen int64, backend proxyBackend, backendTraffic *trafficCounters, sID, cID string, decision FlowDecision) error {
 	if route.retired.Load() || (route.generation != 0 && f.PeerRegistration(peerKey) != route.generation) {
+		// The route this evidence belonged to is gone. The packet still has to go
+		// somewhere, so it takes the proxy path, but no DIRECT flow record is
+		// installed for it: there is no live incarnation to attribute it to.
 		return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
 	}
 	if directEgress != nil {
-		if err := directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceDirect); err != nil {
+		if err := directEgress.RecordFlowDecision(peerKey, sID, route.generation, packet, EgressChoiceDirect, decision); err != nil {
 			f.directDrops.Add(1)
 			return err
 		}
@@ -220,16 +255,20 @@ func (f *Forwarder) routeDirectDecision(directEgress *DirectEgressManager, route
 	return ErrDirectEgressUnavailable
 }
 
-func (f *Forwarder) matchesProxyPolicy(dstIP netip.Addr, sID string, policyMatcher *policy.Matcher, routeCache RouteCache) bool {
+// matchesProxyPolicy reports whether the policy puts this destination on the
+// proxy, and WHICH branch matched. The caller records the branch as the flow's
+// decision reason (issue #861), so the reason is the branch that actually ran
+// rather than a second evaluation of the same rules.
+func (f *Forwarder) matchesProxyPolicy(dstIP netip.Addr, sID string, policyMatcher *policy.Matcher, routeCache RouteCache) (bool, EgressReason) {
 	if policyMatcher != nil {
 		if snap := policyMatcher.Current(); snap != nil && snap.MatchIPv4(dstIP) {
-			return true
+			return true, EgressReasonProxyCIDRRule
 		}
 	}
 	if routeCache != nil && routeCache.Lookup(sID, dstIP) == policy.Proxy {
-		return true
+		return true, EgressReasonProxyCachedEvidence
 	}
-	return false
+	return false, ""
 }
 
 func (f *Forwarder) sendToDirectEgress(directEgress *DirectEgressManager, route *sessionRoute, peerKey string, packet []byte, pktLen int64, sID, cID string) error {
@@ -282,6 +321,7 @@ type proxyBackend struct {
 // it is never re-decided as DIRECT.
 func (f *Forwarder) sendToProxyBackend(backend proxyBackend, route *sessionRoute, backendTraffic *trafficCounters, sID, cID string, packet []byte, pktLen int64) error {
 	if backend.queue == nil {
+		f.recordProxyDispatchOutcome(route, packet, false, FlowFailureBackendUnavailable)
 		return f.dropProxyPacket()
 	}
 
@@ -291,19 +331,40 @@ func (f *Forwarder) sendToProxyBackend(backend proxyBackend, route *sessionRoute
 	f.mu.RLock()
 	if _, detached := f.detachedBackends[backend.tunnelID]; detached {
 		f.mu.RUnlock()
+		f.recordProxyDispatchOutcome(route, packet, false, FlowFailureBackendDetached)
 		return f.dropProxyPacket()
 	}
 	select {
 	case backend.queue <- pktCopy:
 		f.mu.RUnlock()
 		f.recordProxyAdmission(route, backendTraffic, sID, cID, pktLen)
+		f.recordProxyDispatchOutcome(route, packet, true, "")
 		return nil
 	default:
 		f.mu.RUnlock()
 		f.clientDropsQueueFull.Add(1)
 		f.clientDropsTotal.Add(1)
+		f.recordProxyDispatchOutcome(route, packet, false, FlowFailureQueueFull)
 		return ErrQueueFull
 	}
+}
+
+// recordProxyDispatchOutcome notes the proxy dispatch outcome on the flow the
+// decision already recorded (issue #861). A flow retired in between is simply not
+// attributed: the packet's fate is still counted globally, and inventing an
+// attribution here would credit a dead incarnation.
+func (f *Forwarder) recordProxyDispatchOutcome(route *sessionRoute, packet []byte, accepted bool, failure string) {
+	if f == nil || f.directEgress == nil || route == nil {
+		return
+	}
+	f.mu.RLock()
+	dem := f.directEgress
+	peerKey := route.peerKey
+	f.mu.RUnlock()
+	if dem == nil || peerKey == "" {
+		return
+	}
+	dem.RecordProxyDispatch(peerKey, packet, accepted, failure)
 }
 
 // dropProxyPacket counts a proxy-required packet the proxy path refused and

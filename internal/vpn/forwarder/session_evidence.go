@@ -74,6 +74,31 @@ type SessionFlow struct {
 	// CloseSeen reports that a FIN or RST was already observed for the flow, so
 	// its remaining idle allowance is the short close window.
 	CloseSeen bool
+
+	// The evidence block of issue #861. A zero value in DecidedAt, Reason or
+	// PolicyGeneration means the flow was recorded by a path that carried no
+	// decision metadata: it is reported as not recorded, never reconstructed.
+	DecidedAt        time.Time
+	DecisionReason   EgressReason
+	PolicyGeneration string
+	BackendTunnelID  int64
+
+	// Forward is what the dispatch path actually did with this flow's packets.
+	ForwardPackets uint64
+	ForwardBytes   uint64
+	ForwardFailed  uint64
+	// ForwardFailure names the last refusal, empty when none happened.
+	ForwardFailure string
+
+	// Return is what the DIRECT reply path actually delivered for this flow.
+	// PROXYReturnMeasured is false for every flow: the proxy return direction is
+	// not attributable at this checkpoint and the caller must say so.
+	ReturnPackets       uint64
+	ReturnBytes         uint64
+	ReturnFirst         time.Time
+	ReturnLast          time.Time
+	ReturnObserved      bool
+	PROXYReturnMeasured bool
 }
 
 // SessionFlowList is a bounded, ordered page of one session's live flows.
@@ -179,16 +204,34 @@ func (m *DirectEgressManager) SnapshotSessionFlows(sessionID string, generation 
 		if !sessionFlowMatches(entry, sessionID, generation) {
 			continue
 		}
+		evidence := snapshotFlowEvidence(entry.evidence)
 		page.add(SessionFlow{
-			Protocol:   key.Protocol,
-			SrcPort:    key.SrcPort,
-			DstIP:      netip.AddrFrom4(key.DstIP),
-			DstPort:    key.DstPort,
-			Choice:     entry.choice,
-			Generation: entry.generation,
-			LastSeen:   entry.lastSeen,
-			Expired:    m.isFlowExpiredLocked(entry, key.Protocol, now),
-			CloseSeen:  entry.closeSeen,
+			Protocol:         key.Protocol,
+			SrcPort:          key.SrcPort,
+			DstIP:            netip.AddrFrom4(key.DstIP),
+			DstPort:          key.DstPort,
+			Choice:           entry.choice,
+			Generation:       entry.generation,
+			LastSeen:         entry.lastSeen,
+			Expired:          m.isFlowExpiredLocked(entry, key.Protocol, now),
+			CloseSeen:        entry.closeSeen,
+			DecidedAt:        evidence.decidedAt,
+			DecisionReason:   evidence.reason,
+			PolicyGeneration: evidence.policyGeneration,
+			BackendTunnelID:  evidence.backendTunnelID,
+			ForwardPackets:   evidence.forwardPackets,
+			ForwardBytes:     evidence.forwardBytes,
+			ForwardFailed:    evidence.forwardFailed,
+			ForwardFailure:   evidence.forwardFailure,
+			ReturnPackets:    evidence.returnPackets,
+			ReturnBytes:      evidence.returnBytes,
+			ReturnFirst:      evidence.returnFirst,
+			ReturnLast:       evidence.returnLast,
+			ReturnObserved:   evidence.returnPackets > 0,
+			// PROXY return is not attributed at this checkpoint; a DIRECT flow
+			// states what the reply path observed, and nothing states payload
+			// success.
+			PROXYReturnMeasured: false,
 		})
 	}
 	total := len(m.flows)
