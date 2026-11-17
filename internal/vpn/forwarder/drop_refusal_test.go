@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
@@ -120,8 +121,9 @@ func TestRefusalSinkEgressUnavailable(t *testing.T) {
 	}
 }
 
-// TestRefusalSinkIsFencedAfterRetirement proves the new producers respect the same
-// publication fence: a refusal that resumes after the session ended stores nothing.
+// TestRefusalSinkIsFencedAfterRetirement is a unit control of the publication fence for the
+// new producers: the resumed call is made directly, so this does NOT stand in for the
+// real-hook pause control, which is run as an overlay against the dispatch path.
 func TestRefusalSinkIsFencedAfterRetirement(t *testing.T) {
 	fwd, cache, peer, sessionID := refuseFixture(t, DirectEgressConfig{WANDevice: newMockPacketDev()})
 	route := fwd.routesByPeer[peer]
@@ -137,8 +139,76 @@ func TestRefusalSinkIsFencedAfterRetirement(t *testing.T) {
 
 	fwd.UnregisterSession(peer)
 	// The paused producer resumes with the route it captured.
-	fwd.recordDirectRefusal(peer, route, flowClientPacket("10.100.0.7", "93.184.216.50", 50005, 443), 60, ErrDirectEgressUnavailable)
+	fwd.recordDirectRefusal(peer, route, flowClientPacket("10.100.0.7", "93.184.216.50", 50005, 443), 60, ErrDirectEgressUnavailable, refusalBeforeDispatch)
 	if snap := fwd.ClientDropSnapshot(sessionID, 0, 0); snap.Total != 0 {
 		t.Errorf("a retired session's refusal was published: total=%d", snap.Total)
+	}
+}
+
+// TestPostEntryWANFailureIsNotDuplicatedInTheLedger is the reported duplicate control: a write
+// that fails after the flow entry exists belongs to that flow's evidence, and the per-client
+// ledger must not report the same refusal a second time.
+func TestPostEntryWANFailureIsNotDuplicatedInTheLedger(t *testing.T) {
+	// No WAN device: the entry is installed, then the write step refuses.
+	fwd, cache, peer, sessionID := refuseFixture(t, DirectEgressConfig{WANDevice: nil})
+	directDecision(cache, sessionID, "93.184.216.60")
+
+	err := fwd.RouteClientToBackend(peer, flowClientPacket("10.100.0.7", "93.184.216.60", 50010, 443))
+	if !errors.Is(err, ErrDirectEgressUnavailable) {
+		t.Fatalf("dispatch = %v, want ErrDirectEgressUnavailable", err)
+	}
+
+	// The flow owns the outcome: it exists and its evidence records the failure.
+	list := fwd.DirectEgress().SnapshotSessionFlows(sessionID, 0, time.Now(), 0)
+	if list.Total != 1 {
+		t.Fatalf("flows = %d, want the entry that recorded the failure", list.Total)
+	}
+	flow := list.Flows[0]
+	if flow.ForwardFailed != 1 || flow.ForwardFailure != FlowFailureEgressUnavailable {
+		t.Errorf("flow evidence = failed %d (%q), want 1 with %q",
+			flow.ForwardFailed, flow.ForwardFailure, FlowFailureEgressUnavailable)
+	}
+
+	// And the ledger stays empty: one refusal, one owner.
+	if snap := fwd.ClientDropSnapshot(sessionID, 0, 0); snap.Total != 0 {
+		t.Errorf("the same refusal was also published as a drop: %d rows (reason %q)",
+			snap.Total, snap.Entries[0].Key.Reason)
+	}
+}
+
+// TestRefusalSinkRecoversAfterCapacityIsReleased proves the refusal is not sticky: once the
+// capacity is free the same client's next packet installs a flow, while the earlier refusal
+// remains recorded history.
+func TestRefusalSinkRecoversAfterCapacityIsReleased(t *testing.T) {
+	fwd, cache, peer, sessionID := refuseFixture(t, DirectEgressConfig{
+		WANDevice: newMockPacketDev(),
+		MaxFlows:  1,
+	})
+	directDecision(cache, sessionID, "93.184.216.70")
+	directDecision(cache, sessionID, "93.184.216.71")
+
+	if err := fwd.RouteClientToBackend(peer, flowClientPacket("10.100.0.7", "93.184.216.70", 50011, 443)); err != nil {
+		t.Fatalf("first direct packet: %v", err)
+	}
+	if err := fwd.RouteClientToBackend(peer, flowClientPacket("10.100.0.7", "93.184.216.71", 50012, 443)); err == nil {
+		t.Fatal("the cap did not refuse; the recovery control needs the refusal")
+	}
+	if snap := fwd.ClientDropSnapshot(sessionID, 0, 0); snap.Total != 1 {
+		t.Fatalf("refusals = %d, want 1 before recovery", snap.Total)
+	}
+
+	// Release the capacity the way production does: the flow ages out of the table.
+	fwd.DirectEgress().PurgePeer(peer)
+	if err := fwd.RouteClientToBackend(peer, flowClientPacket("10.100.0.7", "93.184.216.71", 50012, 443)); err != nil {
+		t.Fatalf("retry after capacity was released: %v", err)
+	}
+
+	list := fwd.DirectEgress().SnapshotSessionFlows(sessionID, 0, time.Now(), 0)
+	if list.Total != 1 {
+		t.Errorf("flows after recovery = %d, want the recovered flow", list.Total)
+	}
+	// The refusal stays as recorded history; it is not silently rewritten.
+	if snap := fwd.ClientDropSnapshot(sessionID, 0, 0); snap.Total != 1 {
+		t.Errorf("refusals after recovery = %d, want the earlier one retained", snap.Total)
 	}
 }
