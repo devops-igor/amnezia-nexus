@@ -166,7 +166,11 @@ type FailoverOutcome struct {
 	Decision       string // success, partial, no_target
 	Migrated       int
 	Stranded       int
-	Manual         bool
+	// StateVersion identifies the source tunnel transition this outcome
+	// belongs to. Retries of the same transition share it; a later incident has
+	// a newer version and is therefore not suppressed.
+	StateVersion int64
+	Manual       bool
 }
 
 // NotificationSettings is the administrator-owned delivery policy. The

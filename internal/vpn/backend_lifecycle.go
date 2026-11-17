@@ -176,6 +176,7 @@ func (s *Service) disableBackendLocked(ctx context.Context, serverID int64) erro
 				Decision:       decision,
 				Migrated:       len(failover.Migrations),
 				Stranded:       len(failover.Skipped),
+				StateVersion:   tunnel.StateVersion,
 				Manual:         true,
 			})
 		}

@@ -114,7 +114,7 @@ func (p *FailoverProducer) publish(ctx context.Context, outcome models.FailoverO
 	if p.db == nil || p.notifier == nil {
 		return errors.New("failover producer is not configured")
 	}
-	state := fmt.Sprintf("%s:%d:%d", outcome.Decision, outcome.Migrated, outcome.Stranded)
+	state := fmt.Sprintf("%s:%d:%d:%d", outcome.Decision, outcome.Migrated, outcome.Stranded, outcome.StateVersion)
 	previous, changed, err := p.db.AdvanceNotificationProducerState(ctx, "failover", fmt.Sprintf("%d", outcome.SourceTunnelID), state)
 	if err != nil {
 		return err

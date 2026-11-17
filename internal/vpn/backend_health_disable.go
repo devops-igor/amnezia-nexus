@@ -93,6 +93,7 @@ func (s *Service) BackendHealthDisabled(ctx context.Context, disabled *models.Ba
 				Protocol:       live.Protocol,
 				Decision:       "no_target",
 				Stranded:       len(sessions),
+				StateVersion:   live.StateVersion,
 			})
 		}
 		return nil
@@ -117,6 +118,7 @@ func (s *Service) BackendHealthDisabled(ctx context.Context, disabled *models.Ba
 		Decision:       decision,
 		Migrated:       migrated,
 		Stranded:       len(sessions) - migrated,
+		StateVersion:   live.StateVersion,
 	})
 	return nil
 }

@@ -62,6 +62,24 @@ func TestFailoverProducerRecordsTruthfulOutcomes(t *testing.T) {
 	if observerTestEvent(t, notifier, "failover.succeeded").Event.Silent {
 		t.Fatal("automatic failover success must be a real informational delivery")
 	}
+
+	// The same counts on a later tunnel transition (new state version) are a
+	// distinct incident and must not be suppressed by the earlier one.
+	if err := producer.publish(ctx, models.FailoverOutcome{
+		SourceTunnelID: 7, Decision: "success", Migrated: 2, StateVersion: 4,
+	}); err != nil {
+		t.Fatalf("publish later success: %v", err)
+	}
+	history, _ = db.ListNotificationHistory(ctx, 20)
+	var successCount int
+	for _, item := range history {
+		if item.Event.Type == "failover.succeeded" {
+			successCount++
+		}
+	}
+	if successCount != 2 {
+		t.Fatalf("success events = %d, want 2 distinct transitions", successCount)
+	}
 }
 
 func TestFailoverProducerManualSuccessIsHistoryOnly(t *testing.T) {
