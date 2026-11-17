@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -467,6 +469,68 @@ func TestSyncer_RestartWithUnchangedRulesRetainsGeneration(t *testing.T) {
 	}
 	if !restarted.Current().MatchDomain("listed.example.com") {
 		t.Error("retained post-restart snapshot lost a fetched rule")
+	}
+}
+
+// failingCommitStore wraps the real durable store so a cycle's commit can be made
+// to fail, which is how a full disk or an unwritable cache directory behaves.
+type failingCommitStore struct {
+	inner *FileStore
+	fail  atomic.Bool
+}
+
+func (s *failingCommitStore) Load(ctx context.Context) (*Generation, error) {
+	return s.inner.Load(ctx)
+}
+
+func (s *failingCommitStore) Commit(ctx context.Context, gen *Generation) error {
+	if s.fail.Load() {
+		return errors.New("policy cache is not writable")
+	}
+	return s.inner.Commit(ctx, gen)
+}
+
+// TestSyncer_RetainedRefreshKeepsPolicyWhenCommitFails pins the failure half of
+// the retained path: a content-equivalent refresh still has to write its source
+// metadata, so a failed commit must be reported and must leave the incumbent
+// generation live and durable rather than reporting a refresh that did not land.
+func TestSyncer_RetainedRefreshKeepsPolicyWhenCommitFails(t *testing.T) {
+	fixture := newRefreshFixture(t, "/rules.lst")
+	fixture.serve("/rules.lst", "listed.example.com\n198.51.100.0/24\n", `"v1"`)
+
+	store := &failingCommitStore{inner: NewFileStore(t.TempDir())}
+	matcher := NewMatcher()
+	syncer := newRefreshSyncer(t, matcher, fixture.fetcher(), store, refreshConfig("/rules.lst"))
+	ctx := context.Background()
+
+	first, err := syncer.SyncOnce(ctx)
+	if err != nil || !first.Published {
+		t.Fatalf("initial sync: published=%v err=%v", first.Published, err)
+	}
+
+	store.fail.Store(true)
+	second, err := syncer.SyncOnce(ctx)
+	if err == nil {
+		t.Fatal("a refresh whose durable commit failed reported success")
+	}
+	if second.Published {
+		t.Error("a refresh whose durable commit failed reported that the live policy was established by it")
+	}
+	if got := matcher.Current().Generation(); got != first.GenerationID {
+		t.Errorf("live snapshot generation = %q, want the retained %q", got, first.GenerationID)
+	}
+	if !matcher.Current().MatchDomain("listed.example.com") {
+		t.Error("failed refresh left the live snapshot without the fetched rules")
+	}
+	durable, loadErr := store.Load(ctx)
+	if loadErr != nil || durable == nil {
+		t.Fatalf("load durable generation after a failed commit: gen=%v err=%v", durable, loadErr)
+	}
+	if durable.GenerationID != first.GenerationID {
+		t.Errorf("durable generation = %q, want the retained %q", durable.GenerationID, first.GenerationID)
+	}
+	if status := syncer.Status(); status.LastError == "" {
+		t.Error("status did not report the failed refresh")
 	}
 }
 
