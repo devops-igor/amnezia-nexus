@@ -84,7 +84,7 @@ func TestSettingsPolicyUpstreamTemplate(t *testing.T) {
 			`data-upstream-action="up"`,
 			`data-upstream-action="down"`,
 			`data-upstream-action="remove"`,
-			`data-upstream-role="standby"`,
+			`data-upstream-role="not-queried"`,
 		} {
 			if !strings.Contains(adminBody, token) {
 				t.Errorf("admin render is missing %q", token)

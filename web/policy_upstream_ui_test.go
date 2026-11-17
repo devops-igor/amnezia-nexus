@@ -42,12 +42,12 @@ import (
 var upstreamTranslationFixture = map[string]string{
 	"policy_upstream_title":                      "Encrypted upstream DNS",
 	"policy_upstream_intro":                      "Choose which resolvers the gateway itself dials. This does not change the DNS servers written into generated client configurations.",
-	"policy_upstream_limit_note":                 "The gateway dials at most the first two resolvers, so two entries can be added here. A third stored entry is kept and labelled standby instead of being dropped.",
+	"policy_upstream_limit_note":                 "The resolver asks only the first two entries in this order. Up to three entries can be stored: the third is kept, shown, and not queried.",
 	"policy_upstream_defaults_notice":            "Built-in defaults (plain DNS, not encrypted)",
 	"policy_upstream_plain_warning":              "A plain DNS entry sends every query unencrypted to that resolver.",
 	"policy_upstream_mixed_warning":              "A plain entry after an encrypted one: when the encrypted resolver fails, queries continue in plaintext.",
 	"policy_upstream_client_config_notice":       "Generated client configurations keep their own DNS servers. This list only decides which resolvers the gateway dials while policy routing is on.",
-	"policy_upstream_standby_note":               "Standby: stored, but not contacted while two earlier entries are configured.",
+	"policy_upstream_not_queried_note":           "Not queried: the resolver asks only the first two entries in this order. This entry is stored and kept.",
 	"policy_upstream_enabled_save_notice":        "Saving re-downloads every list source, can fail because of them and is then rolled back, and clears client routing evidence until those flows resolve again.",
 	"policy_upstream_activation_save_notice":     "Policy routing is stored as enabled but is not running. Saving tries to start it, which downloads the list and installs the data path.",
 	"policy_upstream_needs_source":               "Choose and save a policy list source before saving a resolver list.",
@@ -81,6 +81,7 @@ var upstreamTranslationFixture = map[string]string{
 	"policy_upstream_address_required":           "An address is required.",
 	"policy_upstream_address_invalid_doh":        "A DNS over HTTPS entry is a host and a port; the resolver requests /dns-query itself.",
 	"policy_upstream_duplicate":                  "This resolver is already in the list.",
+	"policy_upstream_too_many":                   "A resolver list holds at most three entries.",
 	"policy_upstream_row_label":                  "Resolver {n}",
 	"policy_upstream_health_title":               "Resolver health (last observation)",
 	"policy_upstream_health_none":                "This deployment does not report resolver health.",
@@ -354,19 +355,19 @@ assert.ok(alertState().text.indexOf(DICT.policy_upstream_not_ready) !== -1,
 releaseInitial();
 await settle();
 assert.equal(formReady(), 'true');
-assert.equal(rowNodes().length, 3, 'every stored entry is rendered, including the standby one');
+assert.equal(rowNodes().length, 3, 'every stored entry is rendered, including the one that is not queried');
 assert.deepEqual(rows()[0], {address: '9.9.9.9', port: '53', transport: 'plain', pin: ''});
 assert.deepEqual(rows()[1], {address: 'dns.example.com', port: '853', transport: 'dot', pin: PIN},
   'the stored pin and port are shown as stored');
 assert.deepEqual(rows()[2], {address: 'dns.example.net', port: '443', transport: 'doh', pin: ''});
 assert.equal(visible('policyUpstreamDefaultsNotice'), false,
   'a configured list must not claim the built-in defaults');
-const standby = rowNodes()[2].querySelector('[data-upstream-role="standby"]');
-assert.equal(standby.classList.contains('hidden'), false,
-  'the third entry is stored but never dialed, so it is labelled standby');
-assert.equal(rowNodes()[0].querySelector('[data-upstream-role="standby"]').classList.contains('hidden'), true);
+const notQueried = rowNodes()[2].querySelector('[data-upstream-role="not-queried"]');
+assert.equal(notQueried.classList.contains('hidden'), false,
+  'the third entry is stored but never queried, and that is stated plainly');
+assert.equal(rowNodes()[1].querySelector('[data-upstream-role="not-queried"]').classList.contains('hidden'), true);
 assert.equal(w.document.getElementById('policyUpstreamAddBtn').disabled, true,
-  'adding is capped at the two entries the resolver contacts');
+  'three stored entries are the API maximum, so adding stops here');
 assert.equal(saveBtn().disabled, false, 'a read record with a preset opens the write gate');
 `)
 }
@@ -635,9 +636,9 @@ assert.equal(alertState().state, 'success');
 }
 
 // TestPolicyUpstreamEditorOrderingAndWarnings covers the list-shaped rules: row
-// order and pins are preserved, the standby row is labelled rather than dropped,
-// adding is capped at what the resolver dials, and a plain entry after an
-// encrypted one is warned about.
+// order and pins are preserved, the third stored row is labelled as not queried
+// rather than dropped or called a backup, adding stops at the API's three stored
+// entries, and a plain entry after an encrypted one is warned about.
 func TestPolicyUpstreamEditorOrderingAndWarnings(t *testing.T) {
 	runUpstreamScenario(t, `
 const stored = () => record([
@@ -651,47 +652,123 @@ assert.equal(visible('policyUpstreamPlainWarning'), true, 'a plain entry must be
 assert.equal(visible('policyUpstreamMixedWarning'), true,
   'a plain entry after an encrypted one must be warned about');
 assert.equal(rows()[1].transport, 'plain');
-assert.equal(rowNodes()[1].querySelector('[data-upstream-role="standby"]').classList.contains('hidden'), true,
-  'the second entry is dialed, so it is not standby');
+assert.equal(rowNodes()[1].querySelector('[data-upstream-role="not-queried"]').classList.contains('hidden'), true,
+  'the second entry is queried, so it carries no not-queried label');
+
+assert.equal(w.document.getElementById('policyUpstreamAddBtn').disabled, true,
+  'three stored entries are the API maximum');
 
 clickRow(1, 'remove');
 assert.equal(rowNodes().length, 2);
 assert.equal(visible('policyUpstreamPlainWarning'), false);
 assert.equal(visible('policyUpstreamMixedWarning'), false);
-assert.equal(w.document.getElementById('policyUpstreamAddBtn').disabled, true,
-  'two rows are the add cap');
+assert.equal(w.document.getElementById('policyUpstreamAddBtn').disabled, false,
+  'below the API maximum another entry can still be added');
 
 clickRow(0, 'down');
 assert.deepEqual(rows().map(r => r.transport), ['doh', 'dot'], 'the order is the operator list order');
 assert.equal(rows()[0].pin, '', 'an unencrypted entry keeps no pin');
 assert.equal(rows()[1].pin, PIN, 'the encrypted entry keeps its pin through a move');
 
-clickRow(1, 'remove');
-assert.equal(w.document.getElementById('policyUpstreamAddBtn').disabled, false);
 assert.equal(await w.PolicyUpstreamEditor.addRow(), true);
-assert.equal(rowNodes().length, 2);
-assert.equal(rows()[1].transport, 'plain', 'a new row starts on the plain transport');
+assert.equal(rowNodes().length, 3);
+assert.equal(rows()[2].transport, 'plain', 'a new row starts on the plain transport');
 assert.equal(visible('policyUpstreamPlainWarning'), true);
 assert.equal(visible('policyUpstreamMixedWarning'), true);
-assert.equal(rows()[1].pin, '');
+assert.equal(rows()[2].pin, '');
 
-setField(1, 'transport', 'doh');
-setField(1, 'address', 'dns.example.net');
+setField(2, 'transport', 'doh');
+setField(2, 'address', 'dns.example.net');
 assert.ok([...w.document.querySelectorAll('[data-upstream-role="error"]')]
   .some(el => el.textContent === DICT.policy_upstream_duplicate),
   'a duplicate entry must be refused before it is sent');
 assert.equal(saveBtn().disabled, true, 'a client-side error keeps Save inert');
 
-setField(1, 'address', '');
+setField(2, 'address', '');
 assert.ok([...w.document.querySelectorAll('[data-upstream-role="error"]')]
   .some(el => el.textContent === DICT.policy_upstream_address_required));
-setField(1, 'address', 'dns.example.org');
-setField(1, 'transport', 'plain');
-setField(1, 'port', '');
+setField(2, 'address', 'dns.example.org');
+setField(2, 'transport', 'plain');
+setField(2, 'port', '');
 assert.ok([...w.document.querySelectorAll('[data-upstream-role="error"]')]
   .some(el => el.textContent === DICT.policy_upstream_port_required));
-setField(1, 'port', '53');
+setField(2, 'port', '53');
 assert.equal(saveBtn().disabled, false);
+`)
+}
+
+// TestPolicyUpstreamEditorAdmitsAllThreeStoredEntries is the cap regression. The
+// API stores three entries (policy.MaxUpstreams) while the resolver queries only
+// the first two, so the editor must be able to create, edit and reorder all three
+// and must label the third exactly as "not queried". On the previous revision the
+// add path stopped at two, which made a valid third entry impossible to author.
+func TestPolicyUpstreamEditorAdmitsAllThreeStoredEntries(t *testing.T) {
+	runUpstreamScenario(t, `
+let current = [];
+responder = async (url, opts) => {
+  if (opts.method === 'PUT') {
+    const body = typeof opts.body === 'string' ? JSON.parse(opts.body) : opts.body;
+    current = body.upstream_dns.map(entry => Object.assign(
+      {port: entry.transport === 'dot' ? 853 : (entry.transport === 'doh' ? 443 : entry.port)}, entry));
+    return Object.assign({status: 'ok'}, record(current, {enabled: body.enabled, preset: body.preset}));
+  }
+  return record(current, {preset: 'geoblock'});
+};
+`, `
+// Build the three entries the API accepts, from an empty list.
+assert.equal(await w.PolicyUpstreamEditor.addRow(), true);
+setField(0, 'address', 'dns.example.com');
+setField(0, 'transport', 'dot');
+setField(0, 'pin', PIN);
+assert.equal(await w.PolicyUpstreamEditor.addRow(), true,
+  'a second entry is admitted');
+setField(1, 'address', '9.9.9.9');
+setField(1, 'port', '53');
+assert.equal(await w.PolicyUpstreamEditor.addRow(), true,
+  'a third stored entry is admitted: the API maximum is three');
+setField(2, 'address', 'dns.example.net');
+setField(2, 'transport', 'doh');
+assert.equal(rowNodes().length, 3);
+assert.equal(saveBtn().disabled, false, 'three valid entries are saveable');
+
+// A fourth entry is refused before it can be sent, on the API's own bound.
+assert.equal(w.document.getElementById('policyUpstreamAddBtn').disabled, true);
+assert.equal(await w.PolicyUpstreamEditor.addRow(), false,
+  'a fourth entry must not be creatable');
+assert.equal(rowNodes().length, 3);
+
+// The third row is labelled exactly as stored-but-not-queried.
+const limitNote = rowNodes()[2].querySelector('[data-upstream-role="not-queried"]');
+assert.equal(limitNote.classList.contains('hidden'), false);
+assert.equal(limitNote.textContent, DICT.policy_upstream_not_queried_note);
+assert.equal(rowNodes()[1].querySelector('[data-upstream-role="not-queried"]').classList.contains('hidden'), true,
+  'the second entry is queried, so it carries no label');
+
+// Reordering keeps every entry, its position and its pin.
+setField(2, 'address', 'dns3.example.org');
+clickRow(2, 'up');
+clickRow(1, 'up');
+assert.deepEqual(rows().map(r => r.transport), ['doh', 'dot', 'plain']);
+assert.deepEqual(rows().map(r => r.pin), ['', PIN, '']);
+
+await w.PolicyUpstreamEditor.save();
+await settle();
+const puts = requestsTo('PUT');
+assert.equal(puts.length, 1);
+assert.deepEqual(puts[0].body.upstream_dns, [
+  {address: 'dns3.example.org', transport: 'doh'},
+  {address: 'dns.example.com', transport: 'dot', spki_pin: PIN},
+  {address: '9.9.9.9', transport: 'plain', port: 53}
+], 'all three entries are sent, in order, with the pin intact');
+
+// The stored record round-trips: the third pin and the order survive a reload.
+await w.PolicyUpstreamEditor.reload();
+await settle();
+assert.equal(rowNodes().length, 3);
+assert.deepEqual(rows().map(r => r.transport), ['doh', 'dot', 'plain']);
+assert.equal(rows()[1].pin, PIN, 'the stored encrypted entry keeps its pin');
+assert.equal(rows()[0].address, 'dns3.example.org');
+assert.equal(rows()[2].address, '9.9.9.9');
 `)
 }
 

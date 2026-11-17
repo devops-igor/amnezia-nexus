@@ -376,3 +376,50 @@ func TestEditorPutRequiresCSRF(t *testing.T) {
 		t.Errorf("a CSRF-less request changed the stored upstreams: %v", stored.UpstreamDNS)
 	}
 }
+
+// TestEditorFourthUpstreamIsRefused pins the API bound the editor mirrors. The
+// stored list holds at most three entries (policy.MaxUpstreams) while the
+// resolver queries only the first two, so the editor admits all three and a
+// fourth is refused by the server with the stored record left alone.
+func TestEditorFourthUpstreamIsRefused(t *testing.T) {
+	db, cfg := setupTestRouterDB(t)
+	seedPolicySessions(t, db)
+	r := NewRouter(cfg, db, nil)
+
+	seed := policy.DefaultSettings()
+	seed.Preset = policy.PresetGeoblock
+	seed.UpstreamDNS = []policy.Upstream{{Address: "9.9.9.9", Port: 53}}
+	if err := db.SetSetting(context.Background(), policy.SettingsKey, seed); err != nil {
+		t.Fatalf("seed the stored record: %v", err)
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"enabled":               false,
+		"preset":                string(policy.PresetGeoblock),
+		"custom_urls":           []string{},
+		"sync_interval_seconds": 21600,
+		"upstream_dns": []map[string]any{
+			{"address": "dns.example.com", "transport": "dot"},
+			{"address": "dns.example.net", "transport": "doh"},
+			{"address": "8.8.8.8", "transport": "plain", "port": 53},
+			{"address": "1.1.1.1", "transport": "plain", "port": 53},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, adminRequest(t, http.MethodPut, "/api/vpn/policy", body))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("PUT with four upstreams = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	out := decodeJSON(t, w)
+	if detail, _ := out["detail"].(string); !strings.Contains(detail, "exceed the maximum") {
+		t.Errorf("refusal detail = %q, want the maximum-entries rule", detail)
+	}
+
+	stored := readStoredPolicy(t, db)
+	if len(stored.UpstreamDNS) != 1 || stored.UpstreamDNS[0].Address != "9.9.9.9" {
+		t.Errorf("a refused save changed the stored upstreams: %v", stored.UpstreamDNS)
+	}
+}

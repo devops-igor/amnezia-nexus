@@ -34,11 +34,13 @@
     'use strict';
 
     var ENDPOINT = '/api/vpn/policy';
-    // The resolver contacts the first two entries. MaxUpstreams (3) allows one
-    // more to be stored, so adding stops at two while a third entry that is
-    // already stored is rendered and labelled instead of being dropped.
-    var ADD_CAP = 2;
-    var STANDBY_FROM = 2;
+    // The API stores up to three entries (policy.MaxUpstreams), and this editor
+    // must be able to create, edit and reorder all three. The resolver, however,
+    // queries only the first two in order, so the third is stored and shown but
+    // is not contacted: the label says exactly that and never implies a standby
+    // or failover capability the resolver does not have.
+    var STORED_MAX = 3;
+    var QUERIED_MAX = 2;
     var TRANSPORT_DEFAULT_PORTS = { dot: 853, doh: 443 };
     // Closed set of failure kinds the resolver can report. A token outside it is
     // displayed verbatim rather than replaced by a guess.
@@ -341,9 +343,9 @@
             if (label) {
                 label.textContent = fill('policy_upstream_row_label', '{n}', String(index + 1));
             }
-            var standby = node.querySelector('[data-upstream-role="standby"]');
-            if (standby) {
-                standby.classList.toggle('hidden', index < STANDBY_FROM);
+            var notQueried = node.querySelector('[data-upstream-role="not-queried"]');
+            if (notQueried) {
+                notQueried.classList.toggle('hidden', index < QUERIED_MAX);
             }
         });
     }
@@ -389,14 +391,14 @@
 
     function paintGates(rows, errors) {
         var blocked = !ready || inFlight;
-        var invalid = errors.some(function (key) { return !!key; });
+        var invalid = errors.some(function (key) { return !!key; }) || rows.length > STORED_MAX;
         var form = element('policyUpstreamForm');
         if (form) {
             form.setAttribute('data-upstream-ready', ready ? 'true' : 'false');
         }
         var addBtn = element('policyUpstreamAddBtn');
         if (addBtn) {
-            addBtn.disabled = blocked || rows.length >= ADD_CAP;
+            addBtn.disabled = blocked || rows.length >= STORED_MAX;
         }
         var defaultsBtn = element('policyUpstreamDefaultsBtn');
         if (defaultsBtn) {
@@ -704,6 +706,10 @@
             return null;
         }
         var rows = readRows();
+        if (rows.length > STORED_MAX) {
+            setAlert('error', text('policy_upstream_too_many'));
+            return null;
+        }
         var firstError = rowErrors(rows).filter(Boolean)[0];
         if (firstError) {
             setAlert('error', text(firstError));
@@ -795,7 +801,7 @@
         if (!ready || inFlight) {
             return false;
         }
-        if (readRows().length >= ADD_CAP) {
+        if (readRows().length >= STORED_MAX) {
             return false;
         }
         if (!createRow({ address: '', port: '', transport: 'plain', pin: '' })) {
