@@ -36,14 +36,15 @@ responder = async (url, opts) => {
          expires_at: '2026-11-17T09:14:40Z', expires_in_seconds: 280,
          state: 'active', classification: 'valid', cache_write: 'ok',
          count: 3, first_seen: '2026-11-17T09:09:40Z', last_seen: '2026-11-17T09:09:55Z',
-         route_generation: 4, route_generation_established: true},
+         route_generation: 4, route_generation_established: true,
+         policy_generation: 'gen-1'},
         {seq: 6, name: 'typed.example', qtype: 'AAAA', rcode: 'NOERROR', aliases: [],
          addresses: [], resolved_addresses: 0, observed_at: '2026-11-17T09:09:30Z',
          received_at: 'not_recorded', transport: 'not_recorded', expires_at: '',
          expires_in_seconds: 0, state: 'not_recorded', classification: 'invalid',
          classification_reason: 'invalid DNS answer envelope', cache_write: 'ok',
          count: 1, first_seen: '2026-11-17T09:09:30Z', last_seen: '2026-11-17T09:09:30Z',
-         route_generation_established: false}
+         route_generation_established: false, policy_generation: 'gen-1'}
       ],
       record_coverage: {
         started_at: '2026-11-17T09:00:00Z', records_stored: 2, estimated_bytes: 512,
@@ -51,14 +52,13 @@ responder = async (url, opts) => {
         aged_out: 4, rejected_no_room: 0, without_route_generation: 1,
         limits: {records_per_session: 128, records_total: 4096, max_age_seconds: 1800,
                  bytes_total: 4194304, names_per_record: 8, addresses_per_record: 16},
-        not_recorded: ['dns_transport_not_recorded', 'dns_failures_not_recorded',
-                       'non_a_queries_not_recorded', 'query_receive_time_not_recorded']
+        not_recorded: []
       }
     },
     flows: {available: true, state: 'recorded', scanned: 1, scan_complete: true, total: 0,
             truncated: false, entries: []},
     drops: {available: false, state: 'not_recorded', entries: []},
-    limitations: ['dns_coverage_partial'], evaluated_at: '2026-11-17T09:10:00Z', read_only: true
+    limitations: ['not_an_atomic_cross_subsystem_snapshot'], evaluated_at: '2026-11-17T09:10:00Z', read_only: true
   };
 };
 `
@@ -81,26 +81,24 @@ assert.equal(aliasRow[2], '93.184.216.34 (DECISION:direct)',
 assert.equal(aliasRow[3], '2026-11-17T09:09:40Z', 'the observation instant is rendered');
 assert.equal(aliasRow[4], '2026-11-17T09:14:40Z', 'the evidence deadline is rendered');
 assert.equal(aliasRow[5], '3', 'the collapsed repeat count is rendered');
-assert.equal(aliasRow[6], 'STATE:active', 'the record state is translated from its token');
+assert.equal(aliasRow[6], 'gen-1', 'the policy generation the answer was evaluated under is rendered');
+assert.equal(aliasRow[7], 'STATE:active', 'the record state is translated from its token');
 
 // A rejected answer keeps its row and states that nothing was evaluated.
 const typedRow = rowCells('policyClientDNSRows', 1);
 assert.equal(typedRow[0], 'typed.example');
 assert.equal(typedRow[1], 'AAAA');
 assert.equal(typedRow[2], '-', 'a rejected answer has no address to show');
-assert.equal(typedRow[6], 'STATE:not_recorded');
+assert.equal(typedRow[6], 'gen-1', 'a rejected answer still states its policy generation');
+assert.equal(typedRow[7], 'STATE:not_recorded');
 
-// Coverage and gaps are stated, so the table is never read as complete.
+// Coverage is stated, and the answer table no longer claims gaps that the query
+// history beside it records.
 assert.equal(text('policyClientDNSCoverage'),
   'DNS-COVERAGE 2/3/3/4',
   'the collector coverage line reports stored, collapsed, evicted and aged counts');
 const gaps = Array.from(w.document.getElementById('policyClientDNSGaps').children).map(li => li.textContent);
-assert.deepEqual(gaps, [
-  'LIMIT:dns_transport_not_recorded',
-  'LIMIT:dns_failures_not_recorded',
-  'LIMIT:non_a_queries_not_recorded',
-  'LIMIT:query_receive_time_not_recorded'
-], 'every gap of this observation boundary is listed');
+assert.deepEqual(gaps, [], 'the answer section claims no gap the query history records');
 assert.equal(w.document.getElementById('policyClientDNSFoot').hidden, true,
   'a complete page needs no truncation note');
 `)

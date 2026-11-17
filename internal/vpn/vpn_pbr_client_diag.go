@@ -190,12 +190,6 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 		dnsRecordsRead: dnsRecordsRead,
 		dnsEvents:      dnsEvents,
 	}, now)
-	if dnsRecordsRead {
-		// The observation boundary this build records at cannot see failure
-		// answers, non-A queries, the transport or the query receipt time. Say so
-		// once, so an empty history is never read as "this client asked nothing".
-		out.Limitations = append(out.Limitations, ClientDiagnosisLimitDNSCoverage)
-	}
 	return out, nil
 }
 

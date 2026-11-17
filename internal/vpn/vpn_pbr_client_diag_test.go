@@ -411,17 +411,30 @@ func TestClientDiagnosisReportsTheProducersOwnRecords(t *testing.T) {
 		}
 	}
 
-	// Every stated unknown is stated: an answer that guesses would fail one of
-	// these.
+	// Every stated unknown is stated, and nothing the tables now record is claimed as
+	// unrecorded: a limitation beside a recorded row would contradict it.
 	for _, want := range []string{
-		ClientDiagnosisLimitNamesNotRecorded,
-		ClientDiagnosisLimitDecisionTimeUnknown,
-		ClientDiagnosisLimitDecisionReason,
-		ClientDiagnosisLimitFlowOutcomes,
 		ClientDiagnosisLimitSingleSnapshot,
+		ClientDiagnosisLimitFlowCountersSampled,
+		ClientDiagnosisLimitFlowEvidenceInstall,
 	} {
 		if !clientDiagHas(answer.Limitations, want) {
 			t.Errorf("limitations are missing %q: %v", want, answer.Limitations)
+		}
+	}
+	for _, stale := range []string{
+		"dns_names_not_retained",
+		"dns_questions_not_retained",
+		"flow_decision_time_not_recorded",
+		"flow_decision_reason_not_recorded",
+		"flow_outcomes_not_recorded",
+		"drop_records_not_retained",
+		"proxy_backend_write_not_attributed",
+		"non_tcp_udp_flows_not_recorded",
+	} {
+		if clientDiagHas(answer.Limitations, stale) {
+			t.Errorf("limitations still claim %q although the answer records it: %v",
+				stale, answer.Limitations)
 		}
 	}
 	// Application success and PROXY return are facts no router-side store can

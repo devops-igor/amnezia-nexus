@@ -95,6 +95,9 @@ w._ = key => {
     return 'LIMIT:flow-evidence-install';
   if (key === 'policy_client_drop_reason_direct_egress_unavailable') return 'REASON:no-egress';
   if (key === 'policy_client_backend_write_fmt') return 'DEVICE {ok}/{failed}';
+  if (key === 'policy_client_backend_fmt') return 'BACKEND {backend}';
+  if (key === 'policy_client_filter_count') return 'FILTER {shown}/{total} "{term}"';
+  if (key === 'policy_client_filter_none') return 'NO MATCH "{term}"';
   if (key === 'policy_client_return_authority_current_tuple_association') return 'RETURN_AUTHORITY:current_tuple_association';
   if (key === 'policy_client_return_chain_fmt')
     return 'RET returned {matched}/{admitted}/{delivered}/{failed}';
@@ -570,8 +573,8 @@ assert.equal(rowCount('policyClientFlowRows'), 3, 'all three states are rendered
 
 const ambiguous = rowCells('policyClientFlowRows', 0);
 assert.equal(ambiguous[2], 'DECISION:proxy', 'the recorded route is rendered');
-assert.equal(ambiguous[3], '2026-11-17T09:09:58Z · REASON:proxy_cidr_rule · gen-1',
-  'the decision instant, reason and generation are rendered together');
+assert.equal(ambiguous[3], '2026-11-17T09:09:58Z · REASON:proxy_cidr_rule · gen-1 · BACKEND 77',
+  'the decision instant, reason, generation and selected backend are rendered together');
 assert.equal(ambiguous[4], 'NAME_MATCH:ambiguous: plain.example, shared.example',
   'several candidate names are shown as several, never collapsed to one');
 assert.equal(ambiguous[5], 'OUTCOME 0/2 · return RETURN_EVIDENCE:not_measured 0 · FAILURE:backend_queue_full',

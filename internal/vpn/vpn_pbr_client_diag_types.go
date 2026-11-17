@@ -51,17 +51,17 @@ const (
 	// ClientDiagnosisNamesNotRecorded is the names-match token for this slice:
 	// the route cache is keyed by address, so no name is retained anywhere.
 	ClientDiagnosisNamesNotRecorded = "not_recorded"
+	// ClientDiagnosisNamesReasonNotRetained is the reason token of the retained
+	// address-evidence names block: that evidence is keyed by address, so the block
+	// states no name. It is not a panel limitation — names are recorded by the DNS
+	// answer and query history beside it.
+	ClientDiagnosisNamesReasonNotRetained = "dns_names_not_retained"
 )
 
 // Limitation tokens an answer carries. They are fixed identifiers so the UI can
 // translate them and a test can name the exact caveat rather than matching
 // prose.
 const (
-	ClientDiagnosisLimitNamesNotRecorded     = "dns_names_not_retained"
-	ClientDiagnosisLimitQuestionsNotRecorded = "dns_questions_not_retained"
-	ClientDiagnosisLimitDecisionTimeUnknown  = "flow_decision_time_not_recorded"
-	ClientDiagnosisLimitDecisionReason       = "flow_decision_reason_not_recorded"
-	ClientDiagnosisLimitFlowOutcomes         = "flow_outcomes_not_recorded"
 	// ClientDiagnosisLimitFlowEvidenceInstall states the one case where a forwarded packet can
 	// be missing from the flow list: its decision record could not be installed (the table was
 	// full), so no flow evidence exists for it. The packet was still forwarded, so it is NOT a
@@ -76,23 +76,13 @@ const (
 	ClientDiagnosisLimitReturnTupleAssociation = "return_current_tuple_association"
 	ClientDiagnosisLimitEvidenceScope          = "route_cache_evidence_only"
 	ClientDiagnosisLimitSessionEnd             = "session_end_not_distinguishable"
-	ClientDiagnosisLimitDrops                  = "drop_records_not_retained"
 	ClientDiagnosisLimitIPv6                   = "ipv6_not_supported"
 	ClientDiagnosisLimitEncryptedDNS           = "encrypted_dns_not_observed"
 	ClientDiagnosisLimitSingleSnapshot         = "not_an_atomic_cross_subsystem_snapshot"
 	ClientDiagnosisLimitSelectionChanged       = "selection_changed_during_read"
 	ClientDiagnosisLimitFlowScanPartial        = "flow_scan_window_partial"
-	// DNS observation coverage gaps. They are facts about this build's
-	// observation boundary, reported rather than implied by silence.
-	ClientDiagnosisLimitDNSCoverage      = "dns_coverage_partial"
-	ClientDiagnosisLimitDNSTransport     = "dns_transport_not_recorded"
-	ClientDiagnosisLimitDNSFailures      = "dns_failures_not_recorded"
-	ClientDiagnosisLimitDNSNonAQueries   = "non_a_queries_not_recorded"
-	ClientDiagnosisLimitDNSReceiveTime   = "query_receive_time_not_recorded"
-	ClientDiagnosisLimitDNSNoIncarnation = "records_without_route_generation"
-	// Flow outcome gaps and the counter-sampling caveat.
-	ClientDiagnosisLimitFlowBackendWrite    = "proxy_backend_write_not_attributed"
-	ClientDiagnosisLimitFlowNonTCP          = "non_tcp_udp_flows_not_recorded"
+	ClientDiagnosisLimitDNSNoIncarnation       = "records_without_route_generation"
+	// The counter-sampling caveat: the counters are read live, not as a settled total.
 	ClientDiagnosisLimitFlowCountersSampled = "flow_counters_are_live_samples"
 	ClientDiagnosisLimitIdentitySource      = "session_registry_unavailable"
 )

@@ -43,20 +43,17 @@ func clientDiagnosisNotCovered() []string {
 	}
 }
 
-// clientDiagnosisLimitations lists what this slice's own stores cannot state.
+// clientDiagnosisLimitations lists what this build's own stores still cannot state.
+//
+// It is deliberately short. A fact the panel now records — a flow's decision time and
+// reason, its forwarding and backend-write outcomes, a per-client drop, a name or a
+// query's transport — is not a limitation, and a token claiming otherwise would
+// contradict the row beside it.
 func clientDiagnosisLimitations() []string {
 	return []string{
-		ClientDiagnosisLimitNamesNotRecorded,
-		ClientDiagnosisLimitQuestionsNotRecorded,
-		ClientDiagnosisLimitDecisionTimeUnknown,
-		ClientDiagnosisLimitDecisionReason,
-		ClientDiagnosisLimitFlowOutcomes,
 		ClientDiagnosisLimitFlowEvidenceInstall,
-		ClientDiagnosisLimitDrops,
 		ClientDiagnosisLimitSingleSnapshot,
 		ClientDiagnosisLimitFlowCountersSampled,
-		ClientDiagnosisLimitFlowBackendWrite,
-		ClientDiagnosisLimitFlowNonTCP,
 	}
 }
 
@@ -69,13 +66,7 @@ func clientDiagnosisCoverage(fwd *forwarder.Forwarder, now time.Time) ClientDiag
 		EvidenceSource:       clientDiagnosisEvidenceSource,
 		NotCovered:           clientDiagnosisNotCovered(),
 		NotRecorded: []string{
-			ClientDiagnosisLimitNamesNotRecorded,
-			ClientDiagnosisLimitQuestionsNotRecorded,
-			ClientDiagnosisLimitFlowOutcomes,
 			ClientDiagnosisLimitFlowEvidenceInstall,
-			ClientDiagnosisLimitDrops,
-			ClientDiagnosisLimitFlowBackendWrite,
-			ClientDiagnosisLimitFlowNonTCP,
 		},
 	}
 }
@@ -87,7 +78,7 @@ func clientDiagnosisEmptyDNS() ClientDiagnosisDNS {
 	return ClientDiagnosisDNS{
 		Available:        false,
 		State:            ClientDiagnosisTokenNotRecorded,
-		Names:            ClientDiagnosisNamesMatch{Match: ClientDiagnosisNamesNotRecorded, Reason: ClientDiagnosisLimitNamesNotRecorded},
+		Names:            ClientDiagnosisNamesMatch{Match: ClientDiagnosisNamesNotRecorded, Reason: ClientDiagnosisNamesReasonNotRetained},
 		Entries:          []ClientDiagnosisEntry{},
 		Records:          []ClientDiagnosisDNSRecord{},
 		RecordsAvailable: false,
@@ -122,16 +113,14 @@ func clientDiagnosisEmptyRecordCoverage(available bool) ClientDiagnosisDNSRecord
 	return coverage
 }
 
-// clientDiagnosisDNSRecordGaps lists what the observation boundary this build
-// records at cannot see. They are reported, never implied by silence: an
-// administrator must not read "no record" as "no query".
+// clientDiagnosisDNSRecordGaps lists what the answer store itself cannot see.
+//
+// It is empty: the facts that used to be listed here — a failed answer, a non-answer
+// query, the transport and the query's receipt instant — are recorded by the terminal
+// query store and shown in the queries table of the same panel. Keeping them here would
+// claim, next to rows that state them, that this build does not record them.
 func clientDiagnosisDNSRecordGaps() []string {
-	return []string{
-		ClientDiagnosisLimitDNSTransport,
-		ClientDiagnosisLimitDNSFailures,
-		ClientDiagnosisLimitDNSNonAQueries,
-		ClientDiagnosisLimitDNSReceiveTime,
-	}
+	return []string{}
 }
 
 // clientDiagnosisRecordLimits renders the collector's bounds.
@@ -356,7 +345,7 @@ func clientDiagnosisDNSFromEntries(list policy.SessionEntryList, generation stri
 		Available:      true,
 		State:          string(list.State),
 		Generation:     list.Generation,
-		Names:          ClientDiagnosisNamesMatch{Match: ClientDiagnosisNamesNotRecorded, Reason: ClientDiagnosisLimitNamesNotRecorded},
+		Names:          ClientDiagnosisNamesMatch{Match: ClientDiagnosisNamesNotRecorded, Reason: ClientDiagnosisNamesReasonNotRetained},
 		Entries:        make([]ClientDiagnosisEntry, 0, len(list.Entries)),
 		Total:          list.Total,
 		Truncated:      list.Truncated,

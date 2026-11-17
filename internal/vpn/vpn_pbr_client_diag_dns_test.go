@@ -120,20 +120,24 @@ func TestClientDiagnosisReportsObservedDNSAnswers(t *testing.T) {
 		t.Errorf("proxy answer addresses = %+v, want the PROXY decision", proxied.Addresses)
 	}
 
-	// The section states the gaps of this observation boundary instead of
-	// implying completeness.
-	for _, want := range []string{
-		ClientDiagnosisLimitDNSTransport,
-		ClientDiagnosisLimitDNSFailures,
-		ClientDiagnosisLimitDNSNonAQueries,
-		ClientDiagnosisLimitDNSReceiveTime,
-	} {
-		if !clientDiagHas(answer.DNS.RecordCoverage.NotRecorded, want) {
-			t.Errorf("record coverage is missing %q: %v", want, answer.DNS.RecordCoverage.NotRecorded)
-		}
+	// What used to be listed as missing from the answer store — a failed answer, a
+	// non-answer query, the transport, the query's receipt instant — is recorded by the
+	// terminal query store and shown beside it, so neither list may claim otherwise.
+	if len(answer.DNS.RecordCoverage.NotRecorded) != 0 {
+		t.Errorf("answer coverage claims gaps the query history now records: %v",
+			answer.DNS.RecordCoverage.NotRecorded)
 	}
-	if !clientDiagHas(answer.Limitations, ClientDiagnosisLimitDNSCoverage) {
-		t.Errorf("answer limitations must state that DNS coverage is partial: %v", answer.Limitations)
+	for _, stale := range []string{
+		"dns_coverage_partial",
+		"dns_failures_not_recorded",
+		"non_a_queries_not_recorded",
+		"dns_transport_not_recorded",
+		"query_receive_time_not_recorded",
+	} {
+		if clientDiagHas(answer.Limitations, stale) {
+			t.Errorf("limitations still claim %q although the query history records it: %v",
+				stale, answer.Limitations)
+		}
 	}
 	if answer.DNS.RecordCoverage.Limits.RecordsPerSession == 0 || answer.DNS.RecordCoverage.Limits.MaxAgeSeconds == 0 {
 		t.Errorf("record limits = %+v, want the bounds in force", answer.DNS.RecordCoverage.Limits)
@@ -459,8 +463,10 @@ func TestClientDiagnosisWithoutACollectorSaysNotRecorded(t *testing.T) {
 	if len(answer.DNS.Records) != 0 {
 		t.Errorf("records = %d, want none", len(answer.DNS.Records))
 	}
-	if !clientDiagHas(answer.DNS.RecordCoverage.NotRecorded, ClientDiagnosisLimitDNSFailures) {
-		t.Errorf("an unread collector must still state its gaps: %v", answer.DNS.RecordCoverage.NotRecorded)
+	// The unread state is stated by the availability flag, and the section claims no
+	// per-store gap it cannot see.
+	if len(answer.DNS.RecordCoverage.NotRecorded) != 0 {
+		t.Errorf("an unread collector claimed gaps: %v", answer.DNS.RecordCoverage.NotRecorded)
 	}
 }
 

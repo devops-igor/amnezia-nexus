@@ -55,6 +55,13 @@
             </div>
         </div>
 
+        <div class="form-group">
+            <label class="form-label" for="policyClientDestinationFilter">{{ _ "policy_client_filter_label" }}</label>
+            <input class="form-input" type="search" id="policyClientDestinationFilter" autocomplete="off" aria-describedby="policyClientFilterHint">
+            <p class="form-hint" id="policyClientFilterHint">{{ _ "policy_client_filter_hint" }}</p>
+        </div>
+        <p class="form-hint" id="policyClientFilterFoot" hidden></p>
+
         <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_evidence_label" }}</div>
         <p class="form-hint">{{ _ "policy_client_evidence_hint" }}</p>
         <div class="table-container">
@@ -106,6 +113,7 @@
                         <th scope="col">{{ _ "policy_client_column_observed" }}</th>
                         <th scope="col">{{ _ "policy_client_column_expires" }}</th>
                         <th scope="col">{{ _ "policy_client_column_count" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_policy_generation" }}</th>
                         <th scope="col">{{ _ "policy_client_column_state" }}</th>
                     </tr>
                 </thead>
@@ -138,6 +146,9 @@
         <p class="form-hint" id="policyClientEventCoverage"></p>
 
         <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_limits_label" }}</div>
+        <p class="form-hint">{{ _ "policy_client_not_covered_label" }}</p>
+        <ul class="form-hint" id="policyClientNotCovered" style="margin: 0; padding-inline-start: var(--space-lg);"></ul>
+        <p class="form-hint">{{ _ "policy_client_limitations_label" }}</p>
         <ul class="form-hint" id="policyClientLimitations" style="margin: 0; padding-inline-start: var(--space-lg);"></ul>
 
         <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_drops_label" }}</div>

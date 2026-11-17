@@ -35,6 +35,11 @@
     // rendering in reverse order.
     var sequence = 0;
     var lastRendered = 0;
+    // lastAnswer is the answer the operator is currently looking at. The destination
+    // filter narrows these rows locally: switching sessions or issuing a new diagnosis
+    // replaces it, so a filter can never show another incarnation's rows.
+    var lastAnswer = null;
+    var destinationFilter = '';
     var inFlight = {list: false, diagnose: false};
     // The last list the server returned, so the picker can be rebuilt without
     // re-reading it.
@@ -156,6 +161,13 @@
     }
 
     function clearClientResult() {
+        lastAnswer = null;
+        var filter = clientElement('policyClientDestinationFilter');
+        if (filter) {
+            filter.value = '';
+        }
+        destinationFilter = '';
+        renderFilterFoot(0, 0);
         var result = clientElement('policyClientResult');
         if (result) {
             result.hidden = true;
@@ -393,6 +405,12 @@
             if (flow.policy_generation && flow.policy_generation !== 'not_recorded') {
                 decision = decision + ' · ' + flow.policy_generation;
             }
+            // The backend the branch selected, when the recorded decision carries one.
+            // It is the producer's own value, not a lookup of the current configuration.
+            if (flow.backend_tunnel_id != null) {
+                decision = decision + ' · ' + clientText('policy_client_backend_fmt')
+                    .replace('{backend}', String(flow.backend_tunnel_id));
+            }
             appendCell(row, decision);
 
             var names = clientTokenLabel('name_match', flow.names_match);
@@ -486,6 +504,8 @@
             appendCell(row, record.observed_at);
             appendCell(row, record.expires_at);
             appendCell(row, String(record.count || 1));
+            // The policy generation the answer was evaluated against, as recorded.
+            appendCell(row, record.policy_generation);
             appendCell(row, clientTokenLabel('state', record.state));
             body.appendChild(row);
         });
@@ -505,6 +525,7 @@
             }
         }
         var gaps = clientElement('policyClientDNSGaps');
+        clearChildren('policyClientDNSGaps');
         if (gaps && coverage && coverage.not_recorded) {
             coverage.not_recorded.forEach(function (token) {
                 var item = root.document.createElement('li');
@@ -614,6 +635,124 @@
             .replace('{age}', String(coverage.age_limit_seconds || 0));
     }
 
+    // clearChildren empties one list or table body. Every renderer that appends runs
+    // after it, so re-rendering the same answer (the destination filter does exactly
+    // that) cannot duplicate a row.
+    function clearChildren(id) {
+        var el = clientElement(id);
+        if (!el) {
+            return;
+        }
+        while (el.firstChild) {
+            el.removeChild(el.firstChild);
+        }
+    }
+
+    // renderNotCovered lists what no retained store holds. It is the coverage block's own
+    // list, kept apart from the limitations of the recorded rows.
+    function renderNotCovered(tokens) {
+        var list = clientElement('policyClientNotCovered');
+        if (!list) {
+            return;
+        }
+        clearChildren('policyClientNotCovered');
+        (tokens || []).forEach(function (token) {
+            var item = root.document.createElement('li');
+            item.textContent = clientTokenLabel('limit', token);
+            list.appendChild(item);
+        });
+    }
+
+    // filterTerm is the operator's destination filter, normalised for comparison.
+    function filterTerm() {
+        return String(destinationFilter || '').trim().toLowerCase();
+    }
+
+    // matchesDestination reports whether any of a row's OWN destination facts contains
+    // the term. Nothing is added to a row to make it match, and a row without a
+    // destination simply has nothing to compare.
+    function matchesDestination(facts) {
+        var term = filterTerm();
+        if (!term) {
+            return true;
+        }
+        for (var i = 0; i < facts.length; i++) {
+            if (facts[i] && String(facts[i]).toLowerCase().indexOf(term) >= 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function filterRows(rows, factsOf) {
+        if (!filterTerm()) {
+            return rows;
+        }
+        return rows.filter(function (row) {
+            return matchesDestination(factsOf(row));
+        });
+    }
+
+    function filterEvidence(entries) {
+        return filterRows(entries || [], function (entry) {
+            return [entry.address];
+        });
+    }
+
+    function filterRecords(records) {
+        return filterRows(records || [], function (record) {
+            var addresses = (record.addresses || []).map(function (entry) {
+                return entry.address;
+            });
+            return [record.name, (record.aliases || []).join(' '), addresses.join(' ')];
+        });
+    }
+
+    function filterEvents(events) {
+        return filterRows(events || [], function (event) {
+            return [event.name];
+        });
+    }
+
+    function filterFlows(entries) {
+        return filterRows(entries || [], function (flow) {
+            return [flow.destination_ip, String(flow.destination_port == null ? '' : flow.destination_port),
+                (flow.names || []).join(' ')];
+        });
+    }
+
+    function filterDrops(entries) {
+        return filterRows(entries || [], function (drop) {
+            return drop.has_tuple
+                ? [drop.destination_ip, String(drop.destination_port == null ? '' : drop.destination_port)]
+                : [];
+        });
+    }
+
+    // renderFilterFoot states the applied filter and how many recorded rows it leaves.
+    // An empty table under a filter is not the same fact as an empty history, and this
+    // line is what separates them.
+    function renderFilterFoot(shown, total) {
+        var el = clientElement('policyClientFilterFoot');
+        if (!el) {
+            return;
+        }
+        var term = filterTerm();
+        if (!term) {
+            el.textContent = '';
+            el.hidden = true;
+            return;
+        }
+        var text = shown > 0
+            ? clientText('policy_client_filter_count')
+                .replace('{shown}', String(shown))
+                .replace('{total}', String(total))
+                .replace('{term}', term)
+            : clientText('policy_client_filter_none').replace('{term}', term);
+        el.textContent = text;
+        el.hidden = false;
+    }
+
     function renderLimitations(limitations) {
         var list = clientElement('policyClientLimitations');
         if (!list) {
@@ -657,14 +796,49 @@
             evaluated.textContent = (answer && answer.evaluated_at) || '-';
         }
 
-        renderEvidence(dns.entries || []);
-        renderDNSRecords(dns.records || []);
+        lastAnswer = answer;
+        // The destination filter re-renders this same answer, so every appending
+        // renderer starts from an empty body and the panels never accumulate rows.
+        clearChildren('policyClientEvidenceRows');
+        clearChildren('policyClientFlowRows');
+        clearChildren('policyClientDNSRows');
+        clearChildren('policyClientEventRows');
+        clearChildren('policyClientDropRows');
+        clearChildren('policyClientLimitations');
+
+        var evidenceAll = dns.entries || [];
+        var recordsAll = dns.records || [];
+        var eventsAll = dns.events || [];
+        var flowsAll = flows.entries || [];
+        var dropView = (answer && answer.drops) || {};
+        var dropsAll = dropView.entries || [];
+        var evidence = filterEvidence(evidenceAll);
+        var records = filterRecords(recordsAll);
+        var events = filterEvents(eventsAll);
+        var flowEntries = filterFlows(flowsAll);
+        var dropEntries = filterDrops(dropsAll);
+
+        renderEvidence(evidence);
+        renderDNSRecords(records);
         renderDNSCoverage(dns.record_coverage);
-        renderDNSEvents(dns.events || []);
+        renderDNSEvents(events);
         renderEventCoverage(dns.event_coverage);
-        renderFlows(flows.entries || []);
-        renderDrops((answer && answer.drops) || {});
+        renderFlows(flowEntries);
+        renderDrops({
+            state: dropView.state,
+            truncated: dropView.truncated,
+            total: dropView.total,
+            entries: dropEntries,
+            coverage: dropView.coverage
+        });
         renderLimitations((answer && answer.limitations) || []);
+        renderNotCovered((answer && answer.coverage && answer.coverage.not_covered) || []);
+        // Recorded rows the filter leaves, against all recorded rows. The section foots
+        // above keep describing what was recorded, so an empty table under a filter is
+        // never read as an empty history.
+        renderFilterFoot(
+            evidence.length + records.length + events.length + flowEntries.length + dropEntries.length,
+            evidenceAll.length + recordsAll.length + eventsAll.length + flowsAll.length + dropsAll.length);
 
         var evidenceFoot = '';
         if (!(dns.entries || []).length) {
@@ -768,6 +942,16 @@
         });
     }
 
+    // applyDestinationFilter re-renders the answer already on screen with the current
+    // filter text. It reads no new state and sends no request: the filter is applied to
+    // the rows this panel already holds for the selected session.
+    function applyDestinationFilter() {
+        if (!lastAnswer) {
+            return;
+        }
+        renderClientDiagnosis(lastAnswer);
+    }
+
     function initPolicyClientDiagnosis() {
         var card = clientElement('policyClientCard');
         if (!card || initialized) {
@@ -797,6 +981,13 @@
         if (diagnose) {
             diagnose.addEventListener('click', function () {
                 diagnoseSelectedClient();
+            });
+        }
+        var destination = clientElement('policyClientDestinationFilter');
+        if (destination) {
+            destination.addEventListener('input', function () {
+                destinationFilter = destination.value;
+                applyDestinationFilter();
             });
         }
 

@@ -261,9 +261,12 @@ func TestClientDiagnosisFlowEvidenceIsNotWrittenByReads(t *testing.T) {
 	if !clientDiagHas(first.Limitations, ClientDiagnosisLimitFlowCountersSampled) {
 		t.Errorf("limitations must state that the flow counters are live samples: %v", first.Limitations)
 	}
-	for _, want := range []string{ClientDiagnosisLimitFlowBackendWrite, ClientDiagnosisLimitFlowNonTCP} {
-		if !clientDiagHas(first.Limitations, want) {
-			t.Errorf("limitations are missing the producer gap %q: %v", want, first.Limitations)
+	// Both producer gaps this used to list — the backend write and non-TCP flows — are
+	// recorded per flow and shown in the table, so neither may be claimed as missing.
+	for _, stale := range []string{"proxy_backend_write_not_attributed", "non_tcp_udp_flows_not_recorded"} {
+		if clientDiagHas(first.Limitations, stale) {
+			t.Errorf("limitations still claim %q although the flow table records it: %v",
+				stale, first.Limitations)
 		}
 	}
 }

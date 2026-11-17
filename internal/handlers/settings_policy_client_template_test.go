@@ -45,6 +45,9 @@ var clientDiagSectionIDs = []string{
 	"policyClientSelectHint",
 	"policyClientDiagnoseBtn",
 	"policyClientDiagnoseText",
+	"policyClientDestinationFilter",
+	"policyClientFilterHint",
+	"policyClientFilterFoot",
 	"policyClientDiagnoseSpinner",
 	"policyClientStatus",
 	"policyClientResult",
@@ -63,6 +66,7 @@ var clientDiagSectionIDs = []string{
 	"policyClientEventRows",
 	"policyClientEventFoot",
 	"policyClientEventCoverage",
+	"policyClientNotCovered",
 	"policyClientLimitations",
 }
 
@@ -250,7 +254,7 @@ var clientDiagTokenValues = map[string][]string{
 	"return_evidence": {"observed", "not_observed", "not_measured", "not_recorded"},
 	"corr": {
 		"answer_after_decision", "expired_before_decision", "no_retained_answer",
-		"decision_time_not_recorded", "dns_records_not_recorded",
+		"decision_time_not_recorded", "dns_records_not_recorded", "dns_names_not_retained",
 	},
 	"failure": {
 		"wan_write_failed", "backend_queue_full", "backend_detached",
@@ -265,18 +269,13 @@ var clientDiagTokenValues = map[string][]string{
 	},
 	"upstream": {"timeout", "refused", "error"},
 	"limit": {
-		"dns_names_not_retained", "dns_questions_not_retained",
-		"flow_decision_time_not_recorded", "flow_decision_reason_not_recorded",
-		"flow_outcomes_not_recorded", "flow_evidence_install_failure_not_recorded",
+		"flow_evidence_install_failure_not_recorded",
 		"application_success_not_observable",
 		"proxy_return_not_measured", "route_cache_evidence_only",
-		"session_end_not_distinguishable", "drop_records_not_retained",
+		"session_end_not_distinguishable",
 		"ipv6_not_supported", "encrypted_dns_not_observed",
 		"not_an_atomic_cross_subsystem_snapshot", "selection_changed_during_read",
 		"session_registry_unavailable", "flow_scan_window_partial",
-		// DNS observation coverage gaps.
-		"dns_coverage_partial", "dns_transport_not_recorded",
-		"dns_failures_not_recorded", "non_a_queries_not_recorded",
-		"query_receive_time_not_recorded", "records_without_route_generation",
+		"records_without_route_generation",
 	},
 }
