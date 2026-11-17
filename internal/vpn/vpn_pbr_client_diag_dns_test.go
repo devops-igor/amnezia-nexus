@@ -233,22 +233,61 @@ func TestClientDiagnosisRecordsRejectedAndRepeatedQueries(t *testing.T) {
 }
 
 // TestClientDiagnosisDNSRecordsAreIsolatedAndRetired proves one client's history
-// never appears for another, and that retirement removes it.
+// never appears for another, and that retirement removes it. The second client's OWN
+// history is asserted first: without that positive, the absence below would also hold if
+// that client's query had never reached the collector at all.
 func TestClientDiagnosisDNSRecordsAreIsolatedAndRetired(t *testing.T) {
 	f := newClientDiagFixture(t)
-	f.queryIP(t, "plain.example", 54301)
+	const primaryPort = uint16(54301)
+	f.queryIP(t, "plain.example", primaryPort)
 	firstSession := f.sessionID(t)
 
-	// A second client with its own query.
-	otherIP := "10.100.0.11"
+	// A second client with its own session, its own route and its own return path.
+	otherIP := netip.MustParseAddr("10.100.0.11")
 	otherPeer := "peer-client-diag-dns"
-	otherSession, err := f.sessions.CreateSession(context.Background(), "user-2", otherPeer, otherIP, 11, "tablet")
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
+	otherSession, otherGeneration := f.registerSecondClient(t, "user-2", otherPeer, otherIP, "tablet")
+	otherPlan := dnsQueryPlan{
+		name: "proxy.example", qtype: mdns.TypeA, srcPort: 54302, id: 0x5555,
+		clientIP: otherIP, peerKey: otherPeer,
 	}
-	f.fwd.RegisterSession(otherSession.ID, "conn-2", otherPeer, otherIP, 11)
-	f.mustQueryAs(t, otherIP, otherPeer, "proxy.example", 54302)
 
+	// The first client's reply is already captured. It carries this question, port and
+	// DNS id, so only the client address can tell the two clients apart: a wait for the
+	// second client must not adopt it before the second query is even sent.
+	wrongClient := dnsQueryPlan{
+		name: "plain.example", qtype: mdns.TypeA, srcPort: primaryPort, id: 0x1234,
+		clientIP: otherIP,
+	}
+	if reply, ok := f.awaitReply(newQueryWatch(wrongClient, otherSession, otherGeneration, nil), 100*time.Millisecond); ok {
+		t.Fatalf("the first client's reply satisfied the second client's wait (%d bytes)", len(reply))
+	}
+
+	// The second client's query is followed to its own reply AND its own terminal
+	// publication; nothing about the first client's already captured reply stands in.
+	if _, err := f.query(otherPlan); err != nil {
+		t.Fatalf("the second client's query did not settle on its own publications: %v", err)
+	}
+
+	// Positive: the second client's history really contains its own query.
+	otherAnswer, err := f.svc.ClientDiagnosis(context.Background(), ClientDiagnosisRequest{SessionID: otherSession})
+	if err != nil {
+		t.Fatalf("ClientDiagnosis for the second client: %v", err)
+	}
+	otherHasQuery := false
+	for _, record := range otherAnswer.DNS.Records {
+		if record.Name == "proxy.example" && record.QType == "A" {
+			otherHasQuery = true
+		}
+		if record.Name == "plain.example" {
+			t.Errorf("the second client's history contains the first client's query: %+v", record)
+		}
+	}
+	if !otherHasQuery {
+		t.Fatalf("the second client's own history does not contain its query: %+v", otherAnswer.DNS.Records)
+	}
+
+	// Negative, and only now that the other client's record is known to exist: the first
+	// client's history does not contain it.
 	answer, err := f.svc.ClientDiagnosis(context.Background(), ClientDiagnosisRequest{SessionID: firstSession})
 	if err != nil {
 		t.Fatalf("ClientDiagnosis: %v", err)
@@ -260,6 +299,31 @@ func TestClientDiagnosisDNSRecordsAreIsolatedAndRetired(t *testing.T) {
 	}
 	if len(answer.DNS.Records) != 1 {
 		t.Errorf("records = %d, want only this client's query", len(answer.DNS.Records))
+	}
+
+	// Ownership: retiring the second client releases its record, and the first client's
+	// record does not move with it.
+	f.fwd.UnregisterSession(otherPeer)
+	retiredOther, err := f.svc.ClientDiagnosis(context.Background(), ClientDiagnosisRequest{SessionID: otherSession})
+	if err != nil {
+		t.Fatalf("ClientDiagnosis for the second client after retirement: %v", err)
+	}
+	if retiredOther.Selection.State == ClientDiagnosisStateLive {
+		t.Fatalf("a retired second client was reported live")
+	}
+	if len(retiredOther.DNS.Records) != 0 {
+		t.Errorf("retired second client returned %d records, want none", len(retiredOther.DNS.Records))
+	}
+	if snapshot, ok := f.svc.clientDiagnosisDNSRecords(otherSession, 0); ok && snapshot.Total != 0 {
+		t.Errorf("the collector still holds %d records for the retired second client", snapshot.Total)
+	}
+	stillOwned, err := f.svc.ClientDiagnosis(context.Background(), ClientDiagnosisRequest{SessionID: firstSession})
+	if err != nil {
+		t.Fatalf("ClientDiagnosis for the first client after the other client's retirement: %v", err)
+	}
+	if len(stillOwned.DNS.Records) != 1 {
+		t.Errorf("the first client's record left with another client's retirement: %d records",
+			len(stillOwned.DNS.Records))
 	}
 
 	// Retirement releases the record with the session's scope.
@@ -423,31 +487,4 @@ func TestClientDiagnosisDNSRecordBoundsAreReported(t *testing.T) {
 	if answer.DNS.Records[0].Name != "proxy.example" {
 		t.Errorf("page starts with %q, want the newest answer", answer.DNS.Records[0].Name)
 	}
-}
-
-// mustQueryAs sends one query for a second client through the real routing path.
-func (f *clientDiagFixture) mustQueryAs(t *testing.T, clientIP, peerKey, name string, srcPort uint16) {
-	t.Helper()
-	req := new(mdns.Msg)
-	req.SetQuestion(mdns.Fqdn(name), mdns.TypeA)
-	req.Id = 0x5555
-	raw, err := req.Pack()
-	if err != nil {
-		t.Fatalf("pack query: %v", err)
-	}
-	pkt := buildTestPBRUDPPacket(netip.MustParseAddr(clientIP), f.gwDNS, srcPort, 53, raw)
-	if err := f.fwd.RouteClientToBackend(peerKey, pkt); err != nil {
-		t.Fatalf("RouteClientToBackend(%s as %s): %v", name, peerKey, err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		f.mu.Lock()
-		n := len(f.replies)
-		f.mu.Unlock()
-		if n > 0 {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	t.Fatalf("no DNS reply delivered for %s as %s", name, peerKey)
 }

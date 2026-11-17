@@ -1,13 +1,16 @@
 package vpn
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	mdns "github.com/miekg/dns"
 )
 
@@ -26,12 +29,69 @@ import (
 const clientDiagQueryBudget = 2 * time.Second
 
 // dnsQueryPlan is one client DNS query and the identity that makes a captured reply
-// belong to it: the client port it is sent from and the DNS id it carries.
+// belong to it: the client it is sent for, the client port it is sent from and the DNS
+// id it carries. clientIP and peerKey default to the fixture's own client, which is what
+// a single-client case uses.
 type dnsQueryPlan struct {
-	name    string
-	qtype   uint16
-	srcPort uint16
-	id      uint16
+	name     string
+	qtype    uint16
+	srcPort  uint16
+	id       uint16
+	clientIP netip.Addr
+	peerKey  string
+}
+
+// destination returns the client address a reply to this plan must be addressed to.
+func (f *clientDiagFixture) destination(plan dnsQueryPlan) netip.Addr {
+	if plan.clientIP.IsValid() {
+		return plan.clientIP
+	}
+	return f.clientIP
+}
+
+// sourcePeer returns the registered peer key this plan routes through.
+func (f *clientDiagFixture) sourcePeer(plan dnsQueryPlan) string {
+	if plan.peerKey != "" {
+		return plan.peerKey
+	}
+	return f.peerKey
+}
+
+// routeFor returns the route state of the client a plan belongs to. The assigned client
+// address is the identity, so a second client cannot borrow the first one's route.
+func (f *clientDiagFixture) routeFor(plan dnsQueryPlan) (sessionID string, generation uint64, err error) {
+	want := f.destination(plan)
+	for _, state := range f.fwd.SessionRouteStates() {
+		if state.AssignedIP == want.String() {
+			return state.SessionID, state.Generation, nil
+		}
+	}
+	return "", 0, fmt.Errorf("no route state for client %s", want)
+}
+
+// registerSecondClient registers one more client with its own session and a real return
+// path that captures into the fixture's reply log, so its reply can be followed by
+// identity and its answer is actually delivered and recorded.
+func (f *clientDiagFixture) registerSecondClient(t *testing.T, userID, peerKey string, clientIP netip.Addr, name string) (sessionID string, generation uint64) {
+	t.Helper()
+	sess, err := f.sessions.CreateSession(context.Background(), userID, peerKey, clientIP.String(), 11, name)
+	if err != nil {
+		t.Fatalf("CreateSession(%s): %v", peerKey, err)
+	}
+	path := forwarder.NewReturnPath(func(_, _ string, packet []byte) (int, error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		cp := make([]byte, len(packet))
+		copy(cp, packet)
+		f.replies = append(f.replies, cp)
+		return len(packet), nil
+	})
+	f.fwd.RegisterSessionWithReturnPath(sess.ID, "conn-"+userID, peerKey, clientIP.String(), 11, path)
+	sessionID, generation, err = f.routeFor(dnsQueryPlan{clientIP: clientIP})
+	if err != nil {
+		t.Fatalf("second client route: %v", err)
+	}
+	return sessionID, generation
 }
 
 // queryWatch ties a dispatched query to the incarnation that received it and to the
@@ -93,37 +153,37 @@ func (f *clientDiagFixture) dispatchQuery(plan dnsQueryPlan) (*queryWatch, error
 	if err != nil {
 		return nil, fmt.Errorf("pack query %s/%d: %w", plan.name, plan.qtype, err)
 	}
-	states := f.fwd.SessionRouteStates()
-	if len(states) != 1 {
-		return nil, fmt.Errorf("route states = %d, want 1", len(states))
+	sessionID, generation, err := f.routeFor(plan)
+	if err != nil {
+		return nil, err
 	}
-	watch := newQueryWatch(plan, states[0].SessionID, states[0].Generation,
-		f.eventCounts(states[0].SessionID))
-	pkt := buildTestPBRUDPPacket(f.clientIP, f.gwDNS, plan.srcPort, 53, raw)
-	if err := f.fwd.RouteClientToBackend(f.peerKey, pkt); err != nil {
+	watch := newQueryWatch(plan, sessionID, generation, f.eventCounts(sessionID))
+	pkt := buildTestPBRUDPPacket(f.destination(plan), f.gwDNS, plan.srcPort, 53, raw)
+	if err := f.fwd.RouteClientToBackend(f.sourcePeer(plan), pkt); err != nil {
 		return nil, fmt.Errorf("RouteClientToBackend(%s/%d): %w", plan.name, plan.qtype, err)
 	}
 	return watch, nil
 }
 
-// capturedUDP returns the destination port and DNS payload of one captured IPv4/UDP
-// reply packet.
-func capturedUDP(pkt []byte) (dstPort uint16, payload []byte, ok bool) {
+// capturedUDP returns the destination address, destination port and DNS payload of one
+// captured IPv4/UDP reply packet.
+func capturedUDP(pkt []byte) (dstIP netip.Addr, dstPort uint16, payload []byte, ok bool) {
 	if len(pkt) < 28 || pkt[0]>>4 != 4 || pkt[9] != 17 {
-		return 0, nil, false
+		return netip.Addr{}, 0, nil, false
 	}
 	ihl := int(pkt[0]&0x0f) * 4
 	total := int(binary.BigEndian.Uint16(pkt[2:4]))
 	if ihl < 20 || total > len(pkt) || ihl+8 > total {
-		return 0, nil, false
+		return netip.Addr{}, 0, nil, false
 	}
-	return binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4]), pkt[ihl+8 : total], true
+	return netip.AddrFrom4([4]byte{pkt[16], pkt[17], pkt[18], pkt[19]}),
+		binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4]), pkt[ihl+8 : total], true
 }
 
 // replyRCode returns the DNS response code one captured reply carries.
 func replyRCode(t *testing.T, reply []byte) int {
 	t.Helper()
-	_, payload, ok := capturedUDP(reply)
+	_, _, payload, ok := capturedUDP(reply)
 	if !ok {
 		t.Fatalf("captured reply is not an IPv4/UDP packet")
 	}
@@ -135,15 +195,16 @@ func replyRCode(t *testing.T, reply []byte) int {
 }
 
 // matchReply finds the captured reply that answers exactly this plan: addressed to the
-// client port the query came from, carrying its DNS id and its question. Any other
-// reply already captured by the fixture - an earlier answer, a refusal for another
-// port - is not it.
+// client the query was sent for, to the client port it came from, carrying its DNS id
+// and its question. Any other reply already captured by the fixture - another client's
+// answer, a refusal for another port - is not it.
 func (f *clientDiagFixture) matchReply(plan dnsQueryPlan) ([]byte, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	wantIP := f.destination(plan)
 	for _, reply := range f.replies {
-		dstPort, payload, ok := capturedUDP(reply)
-		if !ok || dstPort != plan.srcPort {
+		dstIP, dstPort, payload, ok := capturedUDP(reply)
+		if !ok || dstIP != wantIP || dstPort != plan.srcPort {
 			continue
 		}
 		msg := new(mdns.Msg)
