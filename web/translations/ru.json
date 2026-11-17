@@ -1130,5 +1130,6 @@
   "policy_client_drop_reason_invalid_client_packet": "некорректный пакет клиента",
   "policy_client_drop_reason_nat_port_exhaustion": "исчерпание портов NAT",
   "policy_client_drop_reason_direct_egress_unavailable": "прямой выход недоступен",
-  "policy_client_drop_reason_flow_table_full": "таблица потоков заполнена"
+  "policy_client_drop_reason_flow_table_full": "таблица потоков заполнена",
+  "policy_client_limit_flow_evidence_install_failure_not_recorded": "Поток, запись решения которого не удалось установить, отсутствует в этом списке; пакет был переслан, поэтому это не отбрасывание."
 }

@@ -91,6 +91,8 @@ w._ = key => {
   if (key === 'policy_client_drop_reason_invalid_client_packet') return 'REASON:invalid';
   if (key === 'policy_client_drop_reason_nat_port_exhaustion') return 'REASON:nat-exhaustion';
   if (key === 'policy_client_drop_reason_flow_table_full') return 'REASON:table-full';
+  if (key === 'policy_client_limit_flow_evidence_install_failure_not_recorded')
+    return 'LIMIT:flow-evidence-install';
   if (key === 'policy_client_drop_reason_direct_egress_unavailable') return 'REASON:no-egress';
   if (key === 'policy_client_backend_write_fmt') return 'DEVICE {ok}/{failed}';
   if (key === 'policy_client_return_authority_current_tuple_association') return 'RETURN_AUTHORITY:current_tuple_association';
@@ -464,7 +466,8 @@ responder = async (url, opts) => {
          first_seen: '2026-11-17T09:07:00Z', last_seen: '2026-11-17T09:07:00Z'}],
       coverage: {stored: 3, merged: 5, evicted: 0, pruned: 1, session_keys: 4, keys: 4,
                  key_limit: 64, age_limit_seconds: 600}},
-    limitations: ['flow_scan_window_partial'], evaluated_at: '2026-11-17T09:10:00Z', read_only: true};
+    limitations: ['flow_scan_window_partial', 'flow_evidence_install_failure_not_recorded'],
+    evaluated_at: '2026-11-17T09:10:00Z', read_only: true};
 };
 `, `
 selectClient('sess-a');
@@ -489,6 +492,10 @@ assert.equal(rowCells('policyClientDropRows', 1)[1], 'NO-TUPLE',
   'a malformed packet must not show a destination it never carried');
 assert.equal(rowCells('policyClientDropRows', 1)[2], 'NO-TUPLE');
 assert.equal(rowCells('policyClientDropRows', 2)[0], 'REASON:nat-exhaustion');
+assert.ok(Array.from(w.document.getElementById('policyClientLimitations').children)
+  .map(li => li.textContent)
+  .includes('LIMIT:flow-evidence-install'),
+  'a forwarded flow without an installed decision record is stated as a limitation, not as a drop');
 assert.equal(rowCells('policyClientDropRows', 3)[0], 'REASON:table-full',
   'a flow-table refusal is rendered from the same producer token family');
 assert.equal(text('policyClientDropFoot'), 'DROP-TRUNC 4/4');

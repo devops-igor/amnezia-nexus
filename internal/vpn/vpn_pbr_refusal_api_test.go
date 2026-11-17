@@ -157,3 +157,38 @@ func TestClientDiagnosisDoesNotDuplicatePostEntryWANFailure(t *testing.T) {
 			flow.Forward.Failed, flow.Forward.Failure, forwarder.FlowFailureEgressUnavailable)
 	}
 }
+
+// TestClientDiagnosisStatesForwardedFlowWithoutEvidence proves the truthful coverage of a
+// forwarded packet whose decision record could not be installed: it is absent from the flow
+// list, it is NOT a drop, and the answer says so.
+func TestClientDiagnosisStatesForwardedFlowWithoutEvidence(t *testing.T) {
+	f := newClientDiagFixture(t)
+	tightDirectEgress(t, f, forwarder.DirectEgressConfig{WANDevice: &mockPBRDevice{}, MaxFlows: 1})
+	f.fwd.AttachBackendDevice(11, &mockPBRDevice{})
+	directRouteFor(t, f, "93.184.216.86")
+
+	// One DIRECT flow occupies the only slot.
+	if err := f.fwd.RouteClientToBackend(f.peerKey, buildTestPBRTCPPacket(f.clientIP, netip.MustParseAddr("93.184.216.86"), 52100, 443, nil)); err != nil {
+		t.Fatalf("first direct packet: %v", err)
+	}
+	// A PROXY-destined packet (no DNS evidence) cannot install its record, but is forwarded.
+	if err := f.fwd.RouteClientToBackend(f.peerKey, buildTestPBRTCPPacket(f.clientIP, netip.MustParseAddr("93.184.216.87"), 52101, 443, nil)); err != nil {
+		t.Fatalf("a forwarded PROXY packet must not report an error: %v", err)
+	}
+
+	answer := diagnosisFor(t, f)
+	if answer.Drops.Total != 0 {
+		t.Errorf("drops = %d, want 0: a forwarded packet is not a drop", answer.Drops.Total)
+	}
+	for _, flow := range answer.Flows.Entries {
+		if flow.DestinationIP == "93.184.216.87" {
+			t.Error("a flow without an installed decision record appeared in the list")
+		}
+	}
+	if !clientDiagHas(answer.Limitations, ClientDiagnosisLimitFlowEvidenceInstall) {
+		t.Errorf("the answer does not state the evidence-install gap: %v", answer.Limitations)
+	}
+	if !clientDiagHas(answer.Coverage.NotRecorded, ClientDiagnosisLimitFlowEvidenceInstall) {
+		t.Errorf("the coverage block does not state the evidence-install gap: %v", answer.Coverage.NotRecorded)
+	}
+}

@@ -62,8 +62,13 @@ const (
 	ClientDiagnosisLimitDecisionTimeUnknown  = "flow_decision_time_not_recorded"
 	ClientDiagnosisLimitDecisionReason       = "flow_decision_reason_not_recorded"
 	ClientDiagnosisLimitFlowOutcomes         = "flow_outcomes_not_recorded"
-	ClientDiagnosisLimitApplication          = "application_success_not_observable"
-	ClientDiagnosisLimitProxyReturn          = "proxy_return_not_measured"
+	// ClientDiagnosisLimitFlowEvidenceInstall states the one case where a forwarded packet can
+	// be missing from the flow list: its decision record could not be installed (the table was
+	// full), so no flow evidence exists for it. The packet was still forwarded, so it is NOT a
+	// drop and never appears in the drop section.
+	ClientDiagnosisLimitFlowEvidenceInstall = "flow_evidence_install_failure_not_recorded"
+	ClientDiagnosisLimitApplication         = "application_success_not_observable"
+	ClientDiagnosisLimitProxyReturn         = "proxy_return_not_measured"
 	// ClientDiagnosisLimitReturnTupleAssociation states the authority behind a return
 	// claim: a reply is associated with the flow that currently owns the tuple. A late
 	// reply from a replaced incarnation on the same tuple is not distinguishable from a

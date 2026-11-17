@@ -1130,5 +1130,6 @@
   "policy_client_drop_reason_invalid_client_packet": "malformed client packet",
   "policy_client_drop_reason_nat_port_exhaustion": "NAT port exhaustion",
   "policy_client_drop_reason_direct_egress_unavailable": "direct egress unavailable",
-  "policy_client_drop_reason_flow_table_full": "flow table full"
+  "policy_client_drop_reason_flow_table_full": "flow table full",
+  "policy_client_limit_flow_evidence_install_failure_not_recorded": "A forwarded flow whose decision record could not be installed is absent from this list; it was forwarded, so it is not a drop."
 }

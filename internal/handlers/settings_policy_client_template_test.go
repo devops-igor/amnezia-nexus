@@ -267,7 +267,8 @@ var clientDiagTokenValues = map[string][]string{
 	"limit": {
 		"dns_names_not_retained", "dns_questions_not_retained",
 		"flow_decision_time_not_recorded", "flow_decision_reason_not_recorded",
-		"flow_outcomes_not_recorded", "application_success_not_observable",
+		"flow_outcomes_not_recorded", "flow_evidence_install_failure_not_recorded",
+		"application_success_not_observable",
 		"proxy_return_not_measured", "route_cache_evidence_only",
 		"session_end_not_distinguishable", "drop_records_not_retained",
 		"ipv6_not_supported", "encrypted_dns_not_observed",
