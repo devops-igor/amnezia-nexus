@@ -12,16 +12,26 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
-const failoverOutcomeBuffer = 256
+const (
+	failoverOutcomeBuffer    = 256
+	defaultFailoverRetries   = 5
+	failoverRetryShutdownCap = 2 * time.Second
+)
 
 // FailoverProducer accepts non-blocking failover outcomes from the VPN data
 // plane and publishes them from its own worker. The data-plane caller may hold
 // its service lock, so this type never performs I/O on the caller's goroutine.
+type transitionPublisher interface {
+	PublishTransition(ctx context.Context, transitions []database.NotificationTransition, event models.NotificationEvent) (PublishResult, error)
+}
+
 type FailoverProducer struct {
-	db       notificationStateStore
-	notifier *Service
-	outcomes chan models.FailoverOutcome
-	logger   *slog.Logger
+	db          notificationStateStore
+	notifier    transitionPublisher
+	outcomes    chan models.FailoverOutcome
+	maxAttempts int
+	backoff     func(attempt int) time.Duration
+	logger      *slog.Logger
 
 	mu      sync.Mutex
 	cancel  context.CancelFunc
@@ -29,14 +39,47 @@ type FailoverProducer struct {
 	running bool
 }
 
-// NewFailoverProducer builds the Phase 5 producer.
-func NewFailoverProducer(db notificationStateStore, notifier *Service) *FailoverProducer {
-	return &FailoverProducer{
-		db:       db,
-		notifier: notifier,
-		outcomes: make(chan models.FailoverOutcome, failoverOutcomeBuffer),
-		logger:   slog.Default().With("component", "notification-failover-producer"),
+// FailoverProducerOption configures retry policy, primarily for deterministic
+// tests.
+type FailoverProducerOption func(*FailoverProducer)
+
+// WithFailoverRetry bounds transient persistence retries and their backoff.
+func WithFailoverRetry(maxAttempts int, backoff func(int) time.Duration) FailoverProducerOption {
+	return func(p *FailoverProducer) {
+		if maxAttempts > 0 {
+			p.maxAttempts = maxAttempts
+		}
+		if backoff != nil {
+			p.backoff = backoff
+		}
 	}
+}
+
+// NewFailoverProducer builds the Phase 5 producer.
+func NewFailoverProducer(db notificationStateStore, notifier transitionPublisher, opts ...FailoverProducerOption) *FailoverProducer {
+	producer := &FailoverProducer{
+		db:          db,
+		notifier:    notifier,
+		outcomes:    make(chan models.FailoverOutcome, failoverOutcomeBuffer),
+		maxAttempts: defaultFailoverRetries,
+		backoff:     defaultFailoverRetryBackoff,
+		logger:      slog.Default().With("component", "notification-failover-producer"),
+	}
+	for _, opt := range opts {
+		opt(producer)
+	}
+	return producer
+}
+
+func defaultFailoverRetryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := time.Second << uint(attempt-1)
+	if delay > 30*time.Second {
+		delay = 30 * time.Second
+	}
+	return delay
 }
 
 // NotifyFailoverOutcome implements the VPN service's notifier interface. It is
@@ -77,15 +120,81 @@ func (p *FailoverProducer) Start(ctx context.Context) error {
 		p.mu.Unlock()
 	}()
 
+	queue := make([]failoverWork, 0, 16)
 	for {
-		select {
-		case <-runCtx.Done():
-			return nil
-		case outcome := <-p.outcomes:
-			if err := p.publish(runCtx, outcome); err != nil && runCtx.Err() == nil {
-				p.logger.Warn("Could not publish failover outcome", "tunnel_id", outcome.SourceTunnelID, "err", err)
+		if len(queue) == 0 {
+			select {
+			case <-runCtx.Done():
+				p.drainOnShutdown(queue)
+				return nil
+			case outcome := <-p.outcomes:
+				queue = append(queue, failoverWork{outcome: outcome})
 			}
 		}
+		work := &queue[0]
+		done, delay := p.processWork(runCtx, work)
+		if done {
+			queue = queue[1:]
+			continue
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-runCtx.Done():
+			timer.Stop()
+			p.drainOnShutdown(queue)
+			return nil
+		case <-timer.C:
+		}
+	}
+}
+
+type failoverWork struct {
+	outcome  models.FailoverOutcome
+	attempts int
+}
+
+func (p *FailoverProducer) processWork(ctx context.Context, work *failoverWork) (done bool, delay time.Duration) {
+	err := p.publish(ctx, work.outcome)
+	if err == nil {
+		return true, 0
+	}
+	work.attempts++
+	if work.attempts >= p.maxAttempts {
+		p.logger.Error("Failover notification dropped after bounded retries",
+			"tunnel_id", work.outcome.SourceTunnelID, "decision", work.outcome.Decision,
+			"attempts", work.attempts, "err", err)
+		return true, 0
+	}
+	return false, p.backoff(work.attempts)
+}
+
+// drainOnShutdown makes one bounded attempt for queued outcomes after the worker
+// stops accepting new work. Anything still failing is logged as lost: these are
+// in-memory observations and are not durable across a process restart.
+func (p *FailoverProducer) drainOnShutdown(queue []failoverWork) {
+	for {
+		select {
+		case outcome := <-p.outcomes:
+			queue = append(queue, failoverWork{outcome: outcome})
+			continue
+		default:
+		}
+		break
+	}
+	if len(queue) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), failoverRetryShutdownCap)
+	defer cancel()
+	lost := 0
+	for _, work := range queue {
+		if err := p.publish(ctx, work.outcome); err != nil {
+			lost++
+		}
+	}
+	if lost > 0 {
+		p.logger.Error("Failover notifications lost at shutdown",
+			"lost", lost, "queued", len(queue), "reason", "database unavailable or deadline exceeded")
 	}
 }
 

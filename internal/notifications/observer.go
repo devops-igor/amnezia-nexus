@@ -501,16 +501,180 @@ func (o *Observer) observeBackends(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		state := classifyBackendState(tunnel)
-		err := o.publishObservedState(ctx, "backend_health", fmt.Sprintf("%d", tunnel.ID), state, false,
-			func(previous string) (models.NotificationEvent, bool) {
-				return backendTransitionEvent(tunnel, previous, state, o.now())
-			})
-		if err != nil {
+		if err := o.observeBackend(ctx, tunnel); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+const backendIncidentCleared = "none"
+const backendIncidentProducer = "backend_health_incident"
+
+type backendObservation struct {
+	tunnel             models.BackendTunnel
+	entityKey          string
+	latest             string
+	latestGeneration   int64
+	latestFound        bool
+	incident           string
+	incidentGeneration int64
+	incidentFound      bool
+	state              string
+}
+
+func (o *Observer) observeBackend(ctx context.Context, tunnel models.BackendTunnel) error {
+	observation, err := o.readBackendObservation(ctx, tunnel)
+	if err != nil {
+		return err
+	}
+	switch {
+	case !tunnel.Enabled || observation.state == "admin_disabled":
+		return o.observeAdminDisabledBackend(ctx, observation)
+	case observation.state == models.TunnelStatusActive:
+		return o.observeActiveBackend(ctx, observation)
+	case isBackendIncidentState(observation.state):
+		return o.observeIncidentBackend(ctx, observation)
+	default:
+		return o.observeIntermediateBackend(ctx, observation)
+	}
+}
+
+func (o *Observer) readBackendObservation(ctx context.Context, tunnel models.BackendTunnel) (backendObservation, error) {
+	entityKey := fmt.Sprintf("%d", tunnel.ID)
+	latest, latestGeneration, latestFound, err := o.db.ReadNotificationProducerState(ctx, "backend_health", entityKey)
+	if err != nil {
+		return backendObservation{}, err
+	}
+	incident, incidentGeneration, incidentFound, err := o.db.ReadNotificationProducerState(ctx, backendIncidentProducer, entityKey)
+	if err != nil {
+		return backendObservation{}, err
+	}
+	if !incidentFound && isBackendIncidentState(latest) {
+		incident, incidentGeneration, incidentFound = latest, latestGeneration, true
+	}
+	return backendObservation{
+		tunnel:             tunnel,
+		entityKey:          entityKey,
+		latest:             latest,
+		latestGeneration:   latestGeneration,
+		latestFound:        latestFound,
+		incident:           incident,
+		incidentGeneration: incidentGeneration,
+		incidentFound:      incidentFound,
+		state:              classifyBackendState(tunnel),
+	}, nil
+}
+
+func (o *Observer) observeAdminDisabledBackend(ctx context.Context, observation backendObservation) error {
+	return o.persistBackendObservation(ctx, observation, backendIncidentCleared)
+}
+
+func (o *Observer) observeActiveBackend(ctx context.Context, observation backendObservation) error {
+	if !observation.incidentFound || observation.incident == "" || observation.incident == backendIncidentCleared {
+		return o.persistBackendObservation(ctx, observation, "")
+	}
+	event, ok := backendTransitionEvent(observation.tunnel, observation.incident, observation.state, o.now())
+	if !ok {
+		return o.persistBackendObservation(ctx, observation, backendIncidentCleared)
+	}
+	return o.publishBackendTransition(ctx, observation, backendIncidentCleared, event)
+}
+
+func (o *Observer) observeIncidentBackend(ctx context.Context, observation backendObservation) error {
+	if observation.incidentFound && observation.incident == observation.state {
+		return o.persistBackendObservation(ctx, observation, observation.incident)
+	}
+	previous := observation.latest
+	if observation.incidentFound {
+		previous = observation.incident
+	}
+	event, ok := backendTransitionEvent(observation.tunnel, previous, observation.state, o.now())
+	if !ok {
+		return o.persistBackendObservation(ctx, observation, observation.state)
+	}
+	return o.publishBackendTransition(ctx, observation, observation.state, event)
+}
+
+func (o *Observer) observeIntermediateBackend(ctx context.Context, observation backendObservation) error {
+	// connecting/unknown: keep the unresolved incident separate from the latest
+	// observed state so a later active transition is still a recovery.
+	return o.persistBackendObservation(ctx, observation, observation.incident)
+}
+
+func isBackendIncidentState(state string) bool {
+	return state == models.TunnelStatusHandshakeBlocked ||
+		state == "disabled:health" ||
+		state == models.TunnelStatusDegraded
+}
+
+// persistBackendObservation advances the latest state and, when targetIncident
+// differs from the stored incident, the incident marker as well. No event is
+// recorded; this is a baseline, an intermediate state or an administrative
+// invalidation.
+func (o *Observer) persistBackendObservation(ctx context.Context, observation backendObservation, targetIncident string) error {
+	transitions := backendTransitions(observation, targetIncident)
+	if len(transitions) == 0 {
+		return nil
+	}
+	return o.db.AdvanceNotificationTransitions(ctx, transitions)
+}
+
+func (o *Observer) publishBackendTransition(ctx context.Context, observation backendObservation, targetIncident string, event models.NotificationEvent) error {
+	transitions := backendTransitions(observation, targetIncident)
+	if len(transitions) == 0 {
+		return nil
+	}
+	event.EventKey = TransitionEventKey("backend_health", observation.entityKey, nextGeneration(observation.latestGeneration, observation.latestFound), observation.state)
+	_, err := o.notifier.PublishTransition(ctx, transitions, event)
+	if errors.Is(err, database.ErrNotificationTransitionStale) {
+		return nil
+	}
+	return err
+}
+
+func backendTransitions(observation backendObservation, targetIncident string) []database.NotificationTransition {
+	transitions := make([]database.NotificationTransition, 0, 2)
+	if !observation.latestFound || observation.latest != observation.state {
+		transitions = append(transitions, database.NotificationTransition{
+			Producer:           "backend_health",
+			EntityKey:          observation.entityKey,
+			PreviousState:      previousIfFound(observation.latest, observation.latestFound),
+			ExpectedGeneration: generationIfFound(observation.latestGeneration, observation.latestFound),
+			State:              observation.state,
+		})
+	}
+	if targetIncident != "" && (!observation.incidentFound || observation.incident != targetIncident) {
+		transitions = append(transitions, database.NotificationTransition{
+			Producer:           backendIncidentProducer,
+			EntityKey:          observation.entityKey,
+			PreviousState:      previousIfFound(observation.incident, observation.incidentFound),
+			ExpectedGeneration: generationIfFound(observation.incidentGeneration, observation.incidentFound),
+			State:              targetIncident,
+		})
+	}
+	return transitions
+}
+
+func previousIfFound(state string, found bool) string {
+	if !found {
+		return ""
+	}
+	return state
+}
+
+func generationIfFound(generation int64, found bool) int64 {
+	if !found {
+		return 0
+	}
+	return generation
+}
+
+func nextGeneration(generation int64, found bool) int64 {
+	if !found {
+		return 1
+	}
+	return generation + 1
 }
 
 func classifyBackendState(tunnel models.BackendTunnel) string {
@@ -623,9 +787,10 @@ func (o *Observer) observeProtocolCapacity(ctx context.Context) error {
 			continue
 		}
 		seen[protocol] = true
-		if unknown[protocol] {
-			// Startup/health state is not yet authoritative. A persisted
-			// "available" must not turn into a false outage while probes settle.
+		if !eligible[protocol] && unknown[protocol] {
+			// No confirmed active backend and some evidence is still settling:
+			// defer the outage decision. A confirmed active backend outranks
+			// another backend's connecting state.
 			continue
 		}
 		if err := o.observeProtocol(ctx, protocol, eligible[protocol]); err != nil {

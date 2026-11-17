@@ -2,8 +2,14 @@ package notifications
 
 import (
 	"context"
+	"database/sql"
+	"path/filepath"
 	"testing"
+	"time"
 
+	_ "modernc.org/sqlite"
+
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
@@ -94,5 +100,132 @@ func TestFailoverProducerManualSuccessIsHistoryOnly(t *testing.T) {
 	item := observerTestEvent(t, notifier, "failover.succeeded")
 	if item.Delivery.Status != models.NotificationDeliverySuppressed || item.Delivery.LastError != "history_only" {
 		t.Fatalf("manual success delivery = %#v, want history_only", item.Delivery)
+	}
+}
+
+type triggerDroppingPublisher struct {
+	inner   *Service
+	raw     *sql.DB
+	dropped bool
+}
+
+func (p *triggerDroppingPublisher) PublishTransition(ctx context.Context, transitions []database.NotificationTransition, event models.NotificationEvent) (PublishResult, error) {
+	result, err := p.inner.PublishTransition(ctx, transitions, event)
+	if err != nil && !p.dropped {
+		if _, dropErr := p.raw.Exec(`DROP TRIGGER fail_failover_event`); dropErr != nil {
+			return result, dropErr
+		}
+		p.dropped = true
+	}
+	return result, err
+}
+
+func TestFailoverProducerRetriesTransientDatabaseFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "failover-retry.db")
+	db, err := database.Open(path, notificationTestSecret)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw connection: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	if _, err := raw.Exec(`PRAGMA busy_timeout=5000`); err != nil {
+		t.Fatalf("set busy timeout: %v", err)
+	}
+	if _, err := raw.Exec(`
+		CREATE TRIGGER fail_failover_event
+		BEFORE INSERT ON notification_events
+		WHEN NEW.event_type = 'failover.no_target'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected failover event failure');
+		END;`); err != nil {
+		t.Fatalf("install failure trigger: %v", err)
+	}
+
+	notifier := NewService(db, Options{})
+	publisher := &triggerDroppingPublisher{inner: notifier, raw: raw}
+	producer := NewFailoverProducer(db, publisher,
+		WithFailoverRetry(5, func(int) time.Duration { return 10 * time.Millisecond }))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- producer.Start(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("producer did not stop")
+		}
+	})
+
+	producer.NotifyFailoverOutcome(models.FailoverOutcome{
+		SourceTunnelID: 42,
+		SourceServerID: 3,
+		Protocol:       models.ProtocolAWG,
+		Decision:       "no_target",
+	})
+
+	deadline := time.Now().Add(3 * time.Second)
+	var history []models.NotificationHistoryItem
+	for time.Now().Before(deadline) {
+		history, err = db.ListNotificationHistory(ctx, 20)
+		if err != nil {
+			t.Fatalf("history: %v", err)
+		}
+		if len(history) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(history) != 1 || history[0].Event.Type != "failover.no_target" {
+		t.Fatalf("history = %#v, want one recovered failover event", history)
+	}
+	if !publisher.dropped {
+		t.Fatal("test did not exercise the injected SQLite insert failure")
+	}
+}
+
+func TestDefaultFailoverRetryBackoffIsBounded(t *testing.T) {
+	if got := defaultFailoverRetryBackoff(1); got != time.Second {
+		t.Fatalf("backoff(1) = %v", got)
+	}
+	if got := defaultFailoverRetryBackoff(3); got != 4*time.Second {
+		t.Fatalf("backoff(3) = %v", got)
+	}
+	if got := defaultFailoverRetryBackoff(30); got != 30*time.Second {
+		t.Fatalf("backoff(30) = %v, want capped", got)
+	}
+	if got := defaultFailoverRetryBackoff(0); got != time.Second {
+		t.Fatalf("backoff(0) = %v", got)
+	}
+}
+
+func TestFailoverProducerDrainsQueuedOutcomeOnShutdown(t *testing.T) {
+	db := openNotificationDB(t)
+	notifier := NewService(db, Options{})
+	producer := NewFailoverProducer(db, notifier)
+	producer.outcomes <- models.FailoverOutcome{
+		SourceTunnelID: 77, Decision: "partial", Migrated: 1, Stranded: 1, StateVersion: 1,
+	}
+	producer.drainOnShutdown([]failoverWork{{
+		outcome: models.FailoverOutcome{
+			SourceTunnelID: 76, Decision: "no_target", StateVersion: 1,
+		},
+	}})
+
+	history, err := db.ListNotificationHistory(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	types := map[string]int{}
+	for _, item := range history {
+		types[item.Event.Type]++
+	}
+	if types["failover.no_target"] != 1 || types["failover.partial"] != 1 {
+		t.Fatalf("drained events = %#v, want both queued outcomes", types)
 	}
 }

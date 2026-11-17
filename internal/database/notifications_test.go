@@ -459,6 +459,46 @@ func TestNotificationProducerStateGenerationMigration(t *testing.T) {
 	}
 }
 
+func TestAdvanceNotificationTransitionsIsAtomic(t *testing.T) {
+	db := openNotificationTestDB(t)
+	ctx := context.Background()
+
+	if _, _, err := db.AdvanceNotificationProducerState(ctx, "p1", "e1", "a"); err != nil {
+		t.Fatalf("seed p1: %v", err)
+	}
+	_, generation, _, err := db.ReadNotificationProducerState(ctx, "p1", "e1")
+	if err != nil {
+		t.Fatalf("read p1: %v", err)
+	}
+	if err := db.AdvanceNotificationTransitions(ctx, []NotificationTransition{
+		{Producer: "p1", EntityKey: "e1", PreviousState: "a", ExpectedGeneration: generation, State: "b"},
+		{Producer: "p2", EntityKey: "e2", State: "x"},
+	}); err != nil {
+		t.Fatalf("advance both: %v", err)
+	}
+	for _, tc := range []struct{ producer, entity, state string }{
+		{"p1", "e1", "b"}, {"p2", "e2", "x"},
+	} {
+		state, _, found, err := db.ReadNotificationProducerState(ctx, tc.producer, tc.entity)
+		if err != nil || !found || state != tc.state {
+			t.Fatalf("%s/%s = %q found=%v err=%v, want %q", tc.producer, tc.entity, state, found, err, tc.state)
+		}
+	}
+
+	// A stale member rolls back the whole batch.
+	err = db.AdvanceNotificationTransitions(ctx, []NotificationTransition{
+		{Producer: "p2", EntityKey: "e2", PreviousState: "x", ExpectedGeneration: 4, State: "y"},
+		{Producer: "p1", EntityKey: "e1", PreviousState: "b", ExpectedGeneration: generation + 1, State: "c"},
+	})
+	if !errors.Is(err, ErrNotificationTransitionStale) {
+		t.Fatalf("stale batch error = %v", err)
+	}
+	state, _, _, _ := db.ReadNotificationProducerState(ctx, "p1", "e1")
+	if state != "b" {
+		t.Fatalf("stale batch partially advanced p1 to %q", state)
+	}
+}
+
 func TestNotificationSettingsTokenIsEncryptedAtRest(t *testing.T) {
 	db := openNotificationTestDB(t)
 	ctx := context.Background()

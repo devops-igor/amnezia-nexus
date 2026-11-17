@@ -26,6 +26,10 @@ Owning package: `internal/notifications`. Persistence: `internal/database`
 - A newly created order or setup job may be announced even if its first observed
   state is already terminal; historical rows present at panel start are baselined
   instead of replaying old incidents.
+- Backend incident identity is separate from the latest observed state, so an
+  intermediate `connecting` observation cannot erase a pending recovery.
+- A confirmed active backend outranks a sibling protocol backend that is still
+  connecting when deciding protocol capacity.
 - The application token is encrypted at rest and masked on every API read. It is
   sent only as the `X-Gotify-Key` header, never in the URL or an event payload.
 - Destinations require HTTPS except a loopback test receiver. Redirects are
@@ -48,7 +52,9 @@ background inventory exists; the notifier does not invent one.
 
 Phase 5 automatic standby replacement events depend on #704, which is not
 implemented. The producer wires the existing failover result and leaves
-replacement outcomes to that subsystem when it lands.
+replacement outcomes to that subsystem when it lands. Failover outcomes are
+retried in memory with bounded backoff; they are not durable across a restart,
+and shutdown logs any outcome still undelivered.
 
 ## Dispatcher
 

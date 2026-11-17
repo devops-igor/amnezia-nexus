@@ -2,6 +2,7 @@ package notifications
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -493,6 +494,111 @@ func TestObserverProtocolCapacityIgnoresStartupConnecting(t *testing.T) {
 	history, _ = db.ListNotificationHistory(ctx, 50)
 	if len(history) != 0 {
 		t.Fatalf("settling back to active produced %d notifications", len(history))
+	}
+}
+
+func TestObserverProtocolCapacityActiveOutranksConnecting(t *testing.T) {
+	db := openNotificationDB(t)
+	notifier := NewService(db, Options{})
+	observer := NewObserver(db, notifier, ObserverOptions{Now: time.Now})
+	ctx := context.Background()
+
+	serverID, _ := db.CreateServer(ctx, &models.Server{Name: "capacity-host", Host: "198.51.100.42"})
+	tunnelA, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID: serverID, InterfaceName: "awg4", Protocol: models.ProtocolAWG,
+		PublicKey: "pub-a", PrivateKey: "priv-a", Endpoint: "198.51.100.42:51820",
+		Enabled: true, Status: models.TunnelStatusActive,
+	})
+	tunnelB, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID: serverID, InterfaceName: "awg5", Protocol: models.ProtocolAWG,
+		PublicKey: "pub-b", PrivateKey: "priv-b", Endpoint: "198.51.100.42:51821",
+		Enabled: true, Status: models.TunnelStatusActive,
+	})
+	userID, err := db.CreateUser(ctx, &models.User{Username: "capacity-user", Role: models.RoleUser, Enabled: true})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if _, err := db.CreateConnection(ctx, &models.UserConnection{
+		UserID: userID, ServerID: serverID, Protocol: models.ProtocolAWG, ClientID: "capacity-client",
+	}); err != nil {
+		t.Fatalf("create connection: %v", err)
+	}
+	if err := observer.ObserveOnce(ctx); err != nil {
+		t.Fatalf("baseline: %v", err)
+	}
+	for _, tunnelID := range []int64{tunnelA, tunnelB} {
+		ok, err := db.CompareAndSwapTunnelStatus(ctx, tunnelID, models.TunnelStatusActive, "", 1, models.TunnelStatusHandshakeBlocked, "", 0)
+		if err != nil || !ok {
+			t.Fatalf("block tunnel %d: ok=%v err=%v", tunnelID, ok, err)
+		}
+	}
+	if err := observer.ObserveOnce(ctx); err != nil {
+		t.Fatalf("unavailable observe: %v", err)
+	}
+	observerTestEvent(t, notifier, "protocol.capacity_unavailable")
+
+	// One confirmed active backend plus one still connecting must be a recovery,
+	// not a deferred unknown state.
+	if _, err := db.CompareAndSwapTunnelStatus(ctx, tunnelA, models.TunnelStatusHandshakeBlocked, "", 2, models.TunnelStatusActive, "", 0); err != nil {
+		t.Fatalf("restore active: %v", err)
+	}
+	if _, err := db.CompareAndSwapTunnelStatus(ctx, tunnelB, models.TunnelStatusHandshakeBlocked, "", 2, models.TunnelStatusConnecting, "", 0); err != nil {
+		t.Fatalf("set connecting: %v", err)
+	}
+	if err := observer.ObserveOnce(ctx); err != nil {
+		t.Fatalf("recovery observe: %v", err)
+	}
+	recovery := observerTestEvent(t, notifier, "protocol.capacity_restored")
+	if !recovery.Event.Recovery {
+		t.Fatal("capacity restoration was not marked as recovery")
+	}
+}
+
+func TestObserverBackendRecoveryThroughConnecting(t *testing.T) {
+	db := openNotificationDB(t)
+	notifier := NewService(db, Options{})
+	observer := NewObserver(db, notifier, ObserverOptions{Now: time.Now})
+	ctx := context.Background()
+
+	serverID, _ := db.CreateServer(ctx, &models.Server{Name: "backend-host", Host: "198.51.100.43"})
+	tunnelID, _ := db.CreateBackendTunnel(ctx, &models.BackendTunnel{
+		ServerID: serverID, InterfaceName: "awg6", Protocol: models.ProtocolAWG,
+		PublicKey: "pub", PrivateKey: "priv", Endpoint: "198.51.100.43:51820",
+		Enabled: true, Status: models.TunnelStatusActive,
+	})
+	if err := observer.ObserveOnce(ctx); err != nil {
+		t.Fatalf("baseline: %v", err)
+	}
+	swap := func(expected, next string, version int64) {
+		t.Helper()
+		ok, err := db.CompareAndSwapTunnelStatus(ctx, tunnelID, expected, "", version, next, "", 0)
+		if err != nil || !ok {
+			t.Fatalf("swap %s->%s version %d: ok=%v err=%v", expected, next, version, ok, err)
+		}
+	}
+
+	swap(models.TunnelStatusActive, models.TunnelStatusHandshakeBlocked, 1)
+	if err := observer.ObserveOnce(ctx); err != nil {
+		t.Fatalf("blocked observe: %v", err)
+	}
+	observerTestEvent(t, notifier, "backend.handshake_blocked")
+
+	// The intermediate connecting state must not erase the unresolved incident.
+	swap(models.TunnelStatusHandshakeBlocked, models.TunnelStatusConnecting, 2)
+	if err := observer.ObserveOnce(ctx); err != nil {
+		t.Fatalf("connecting observe: %v", err)
+	}
+	swap(models.TunnelStatusConnecting, models.TunnelStatusActive, 3)
+	if err := observer.ObserveOnce(ctx); err != nil {
+		t.Fatalf("recovery observe: %v", err)
+	}
+	recovery := observerTestEvent(t, notifier, "backend.recovered")
+	if !recovery.Event.Recovery {
+		t.Fatal("backend recovery was not marked as recovery")
+	}
+	incident, _, found, err := db.ReadNotificationProducerState(ctx, backendIncidentProducer, fmt.Sprintf("%d", tunnelID))
+	if err != nil || !found || incident != backendIncidentCleared {
+		t.Fatalf("incident state = %q found=%v err=%v, want cleared", incident, found, err)
 	}
 }
 

@@ -543,6 +543,32 @@ func advanceNotificationProducerState(ctx context.Context, tx *sql.Tx, transitio
 	return nil
 }
 
+// AdvanceNotificationTransitions applies multiple producer state changes in one
+// transaction without creating an event. It is the baseline/intermediate path.
+func (d *DB) AdvanceNotificationTransitions(ctx context.Context, transitions []NotificationTransition) error {
+	if len(transitions) == 0 {
+		return nil
+	}
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	now := time.Now().UTC()
+	tx, err := d.sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin notification state advance: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, transition := range transitions {
+		if err := applyNotificationTransition(ctx, tx, transition, now); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit notification state advance: %w", err)
+	}
+	return nil
+}
+
 // AdvanceNotificationProducerState records the latest observed state for one
 // producer entity and reports the previous state. It is used for a baseline or a
 // non-notifiable state; notifiable changes use CommitNotificationTransition so
