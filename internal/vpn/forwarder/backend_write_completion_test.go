@@ -22,11 +22,19 @@ type blockingDevice struct {
 	mu      sync.Mutex
 	entered chan struct{}
 	release chan struct{}
+	once    sync.Once
 	writes  int
 }
 
 func newBlockingDevice() *blockingDevice {
 	return &blockingDevice{entered: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+// releaseWrites is idempotent and is registered as cleanup by every fixture that uses
+// this device. A t.Fatal before the test releases the writer would otherwise leave the
+// pump blocked inside Write, and the pump join in StopPumps would wait forever.
+func (d *blockingDevice) releaseWrites() {
+	d.once.Do(func() { close(d.release) })
 }
 
 func (d *blockingDevice) Read(_ []byte) (int, error) { return 0, nil }
@@ -87,6 +95,12 @@ func proxyQueueFixture(t *testing.T, dev PacketDevice) (*Forwarder, *testRouteCa
 	fwd.RegisterSessionWithReturnPath("sess-backend", "conn-1", "peer-backend", "10.100.0.7", 31, capPath.path)
 	fwd.StartPumps(t.Context())
 	t.Cleanup(fwd.StopPumps)
+	// Cleanups run last-registered-first, so the release MUST be registered after the
+	// pump join: otherwise an early t.Fatal leaves the pump blocked inside Write and the
+	// join waits forever. The watchdog test below pins this ordering.
+	if blocker, ok := dev.(interface{ releaseWrites() }); ok {
+		t.Cleanup(blocker.releaseWrites)
+	}
 	return fwd, rc, "peer-backend", "sess-backend"
 }
 
@@ -132,7 +146,7 @@ func TestBackendWriteCompletionIsSeparateFromAdmission(t *testing.T) {
 			held.BackendWrites, held.BackendWriteFailed)
 	}
 
-	close(dev.release)
+	dev.releaseWrites()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if flowEvidenceFor(t, fwd, sessionID, "8.8.4.4", 443).BackendWrites == 1 {
@@ -195,6 +209,7 @@ type blockedWriteDevice struct {
 	entered   chan struct{}
 	release   chan struct{}
 	failFirst bool
+	once      sync.Once
 
 	mu    sync.Mutex
 	wrote int
@@ -223,6 +238,12 @@ func (d *blockedWriteDevice) Write(p []byte) (int, error) {
 }
 
 func (d *blockedWriteDevice) Close() error { return nil }
+
+// releaseWrites is idempotent and registered as cleanup at fixture construction, so an
+// early failure can never leave the pump blocked inside Write.
+func (d *blockedWriteDevice) releaseWrites() {
+	d.once.Do(func() { close(d.release) })
+}
 
 // TestBackendWriteDelayedOutcomeAcrossReplacement is the real delayed-ownership control:
 // the device write that belongs to the admitting flow is still BLOCKED when the session
@@ -273,7 +294,7 @@ func TestBackendWriteDelayedOutcomeAcrossReplacement(t *testing.T) {
 			}
 
 			// Release the blocked write: the retired incarnation's outcome lands now.
-			close(dev.release)
+			dev.releaseWrites()
 
 			successorSession := "sess-backend-2"
 			if tc.replacement == "rekey" {
@@ -304,6 +325,37 @@ func TestBackendWriteDelayedOutcomeAcrossReplacement(t *testing.T) {
 				t.Errorf("successor admissions = %d, want only its own packet", got.ForwardPackets)
 			}
 		})
+	}
+}
+
+// TestBlockedWriterFixtureCleanupIsBounded proves the fixture's own teardown, not a
+// process-wide escape hatch: a test that ends while the device write is still blocked
+// must still release it, so the pump join cannot wait forever. The inner subtest
+// deliberately never releases; the outer test bounds how long that may take.
+func TestBlockedWriterFixtureCleanupIsBounded(t *testing.T) {
+	done := make(chan bool, 1)
+	go func() {
+		done <- t.Run("blocked_without_release", func(t *testing.T) {
+			dev := newBlockedWriteDevice(false)
+			fwd, _, peer, _ := proxyQueueFixture(t, dev)
+			if err := fwd.RouteClientToBackend(peer, proxyPacket("77.77.77.77", 443)); err != nil {
+				t.Fatalf("dispatch: %v", err)
+			}
+			select {
+			case <-dev.entered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("the pump never reached the device write")
+			}
+			// No manual release on purpose: the fixture cleanup owns it.
+		})
+	}()
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("the blocked-writer subtest failed")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the fixture did not release a blocked writer before the pump join: teardown ordering is broken")
 	}
 }
 
