@@ -105,17 +105,34 @@ func returnFlowKey(peerKey string, packet []byte, clientIP netip.Addr) (FlowKey,
 // sender. The answer states this authority (current_tuple_association) rather than
 // claiming the reply cannot be a predecessor's.
 //
-// The flow table read is the existing locked lookup; the caller is outside the forwarder
-// lock, which is the documented Forwarder -> DirectEgress order.
+// The manager this reply is observed against is captured ONCE under the forwarder's
+// own lock, and only the captured pointer is used. SetDirectEgress replaces or clears
+// that pointer under the write lock whenever an administrator disables or reconfigures
+// policy routing, while backend readers keep serving replies; a second unsynchronized
+// read could name a pointer that is gone by the time it is used, which is both a data
+// race and a nil dereference.
+//
+// Capturing it does not widen the lock: the forwarder lock is released before the
+// manager's own read lock is taken, so this keeps the documented
+// Forwarder -> DirectEgress order and no I/O ever runs under either lock.
+//
+// A manager that has been closed but is still attached is read safely. Close freezes
+// the flow table without clearing it, so this lookup stays a truthful, frozen record of
+// what that manager admitted instead of turning a supported disable into a crash or an
+// invented attribution.
 func (f *Forwarder) proxyReturnEvidence(route *sessionRoute, packet []byte, clientIP netip.Addr) (*flowStats, bool) {
-	if f.directEgress == nil || route == nil {
+	if route == nil {
+		return nil, false
+	}
+	dem := f.DirectEgress()
+	if dem == nil {
 		return nil, false
 	}
 	key, ok := returnFlowKey(route.peerKey, packet, clientIP)
 	if !ok {
 		return nil, false
 	}
-	entry := f.directEgress.flowEntryForReturn(key)
+	entry := dem.flowEntryForReturn(key)
 	if entry == nil || entry.evidence == nil {
 		return nil, false
 	}

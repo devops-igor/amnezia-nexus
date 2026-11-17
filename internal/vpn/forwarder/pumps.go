@@ -416,8 +416,13 @@ func (f *Forwarder) recordProxyAdmission(route *sessionRoute, backendTraffic *tr
 // packet, or nil when no flow is attributable. It applies the same incarnation
 // guard the dispatch outcome used: a packet arriving on a route whose session or
 // generation no longer owns the tuple is not credited to whoever owns it now.
+// The manager pointer, the peer key and the incarnation are captured in ONE forwarder
+// read critical section: SetDirectEgress replaces the pointer under the write lock while
+// administrator-driven disable/reconfiguration runs, so an unsynchronized read before
+// this snapshot would race with that writer. The lock is released before the manager's
+// own read lock is taken, which keeps the documented Forwarder -> DirectEgress order.
 func (f *Forwarder) proxyDispatchEvidence(route *sessionRoute, packet []byte) *flowStats {
-	if f == nil || f.directEgress == nil || route == nil {
+	if f == nil || route == nil {
 		return nil
 	}
 	f.mu.RLock()
