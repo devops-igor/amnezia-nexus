@@ -647,7 +647,11 @@ func (h *Handlers) dispatchOrderPurchase(
 	updateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	applyOrderResponseToRecord(orderRecord, orderResp, orderErr)
-	_ = h.updateGigahostOrder(updateCtx, orderRecord)
+	if updateErr := h.updateGigahostOrder(updateCtx, orderRecord); updateErr != nil {
+		slog.Warn("Could not record Gigahost order result", "order_id", orderRecord.OrderID, "err", updateErr)
+	} else {
+		h.publishOrderAccepted(updateCtx, orderRecord)
+	}
 	return orderResp, orderErr
 }
 
@@ -881,6 +885,45 @@ func applyOrderResponseToRecord(orderRecord *GigahostOrderRecord, orderResp *gig
 	}
 	if orderRecord.Status == "pending_order" {
 		orderRecord.Status = gigahost.StatusPending
+	}
+}
+
+// publishOrderAccepted records the provider's confirmed acceptance at the
+// durable order boundary. The stable event key makes a repeated response one
+// history entry, and the event is informational: acceptance is not provider
+// readiness, backend health or a completed setup.
+func (h *Handlers) publishOrderAccepted(ctx context.Context, order *GigahostOrderRecord) {
+	if h.notificationSvc == nil || !confirmedOrderAccepted(order) {
+		return
+	}
+	_, err := h.notificationSvc.Publish(ctx, models.NotificationEvent{
+		EventKey:   "order.accepted:" + order.OrderID,
+		IncidentID: "order:" + order.OrderID,
+		Category:   models.NotificationCategoryProvisioning,
+		Severity:   models.NotificationSeverityInfo,
+		Type:       "order.accepted",
+		EntityType: "order",
+		EntityID:   order.OrderID,
+		Transition: "accepted",
+		Summary:    "Gigahost order accepted",
+		Detail:     "The provider confirmed the VPS order. Provider acceptance is not backend health or a completed setup.",
+		Evidence:   "provider order response recorded in the order ledger",
+		OccurredAt: time.Now(),
+	})
+	if err != nil {
+		slog.Warn("Could not record Gigahost order acceptance notification", "order_id", order.OrderID, "err", err)
+	}
+}
+
+func confirmedOrderAccepted(order *GigahostOrderRecord) bool {
+	if order == nil || strings.TrimSpace(order.OrderID) == "" || strings.HasPrefix(order.OrderID, "intent_") {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(order.Status)) {
+	case "", "pending_order", "failed", "unknown", statusCancelled, "canceled", "deleted", "terminated":
+		return false
+	default:
+		return true
 	}
 }
 

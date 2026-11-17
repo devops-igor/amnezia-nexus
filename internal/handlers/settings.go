@@ -458,6 +458,7 @@ var allowedSettingsKeys = map[string]bool{
 	"sync":           true,
 	"captcha":        true,
 	"telegram":       true,
+	"notifications":  true,
 	"ssl":            true,
 	"limits":         true,
 	"vpn_config":     true,

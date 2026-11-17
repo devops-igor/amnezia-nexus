@@ -57,6 +57,18 @@ func (d *DB) GetSetting(ctx context.Context, key string, target any) error {
 			}
 			return json.Unmarshal(b, target)
 		}
+	} else if key == "notifications" {
+		var ntMap map[string]any
+		if err := json.Unmarshal([]byte(val.String), &ntMap); err == nil {
+			if token, ok := ntMap["app_token"].(string); ok && token != "" {
+				ntMap["app_token"] = security.DecryptCredentialSafe(token, d.secretKey)
+			}
+			b, err := json.Marshal(ntMap)
+			if err != nil {
+				return err
+			}
+			return json.Unmarshal(b, target)
+		}
 	}
 
 	return json.Unmarshal([]byte(val.String), target)
@@ -161,6 +173,12 @@ func (d *DB) SetSetting(ctx context.Context, key string, value any) error {
 		if prepErr != nil {
 			return prepErr
 		}
+	} else if key == "notifications" {
+		var prepErr error
+		valToStore, prepErr = d.prepareNotificationsSettingForStore(value)
+		if prepErr != nil {
+			return prepErr
+		}
 	}
 
 	b, err := json.Marshal(valToStore)
@@ -204,6 +222,12 @@ func (d *DB) SetSettingsBulk(ctx context.Context, settings map[string]any) error
 		} else if key == "gigahost" {
 			var prepErr error
 			valToStore, prepErr = d.prepareGigahostSettingForStore(value)
+			if prepErr != nil {
+				return prepErr
+			}
+		} else if key == "notifications" {
+			var prepErr error
+			valToStore, prepErr = d.prepareNotificationsSettingForStore(value)
 			if prepErr != nil {
 				return prepErr
 			}
@@ -381,6 +405,33 @@ func (d *DB) prepareSSLSettingForStore(value any) any {
 	default:
 		return value
 	}
+}
+
+// prepareNotificationsSettingForStore encrypts the Gotify application token at
+// rest. Settings reads decrypt it only for the dispatcher and the masked admin
+// API; the settings page never receives the plaintext.
+func (d *DB) prepareNotificationsSettingForStore(value any) (any, error) {
+	if value == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("marshal notifications setting: %w", err)
+	}
+	var ntMap map[string]any
+	if err := json.Unmarshal(b, &ntMap); err != nil {
+		return nil, fmt.Errorf("unmarshal notifications setting: %w", err)
+	}
+	token, _ := ntMap["app_token"].(string)
+	if token == "" || security.LooksLikeFernetToken(token) {
+		return ntMap, nil
+	}
+	encrypted, err := security.EncryptCredential(token, d.secretKey)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt notifications app token: %w", err)
+	}
+	ntMap["app_token"] = encrypted
+	return ntMap, nil
 }
 
 func (d *DB) prepareGigahostSettingForStore(value any) (any, error) {

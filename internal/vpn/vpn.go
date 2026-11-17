@@ -170,25 +170,29 @@ type BackendDevice interface {
 type Service struct {
 	retiredIngressLosses ingressLossTotals // guarded by mu
 	mu                   sync.RWMutex
-	assignmentMu         sync.Mutex // serialize durable lease creation and restart migration
-	db                   *database.DB
-	cfg                  *models.VPNConfig
-	sessionMgr           *session.SessionManager
-	ipam                 *ipam.IPAM
-	auth                 *auth.DBAuthenticator
-	pool                 *tunnel.Pool
-	prober               *tunnel.HealthProber
-	reconnectMgr         *tunnel.ReconnectManager
-	balancer             loadbalancer.LoadBalancer
-	stickyMgr            *loadbalancer.StickySessionManager
-	forwarder            *forwarder.Forwarder
-	accountant           *forwarder.TrafficAccountant
-	running              bool
-	startedAt            time.Time // baseline timestamp for cumulative metrics; guarded by mu
-	portalPubKey         string
-	portalPrivKey        string
-	awgProvider          AWGStatusProvider
-	ingressEngine        *IngressEngine
+	// notifyMu guards only the optional notification callback, so a failover
+	// path that already holds mu can still read it without an I/O lock cycle.
+	notifyMu         sync.RWMutex
+	failoverNotifier FailoverOutcomeNotifier
+	assignmentMu     sync.Mutex // serialize durable lease creation and restart migration
+	db               *database.DB
+	cfg              *models.VPNConfig
+	sessionMgr       *session.SessionManager
+	ipam             *ipam.IPAM
+	auth             *auth.DBAuthenticator
+	pool             *tunnel.Pool
+	prober           *tunnel.HealthProber
+	reconnectMgr     *tunnel.ReconnectManager
+	balancer         loadbalancer.LoadBalancer
+	stickyMgr        *loadbalancer.StickySessionManager
+	forwarder        *forwarder.Forwarder
+	accountant       *forwarder.TrafficAccountant
+	running          bool
+	startedAt        time.Time // baseline timestamp for cumulative metrics; guarded by mu
+	portalPubKey     string
+	portalPrivKey    string
+	awgProvider      AWGStatusProvider
+	ingressEngine    *IngressEngine
 	// dnsContinuity is the gateway-address-only DNS responder that serves
 	// configurations issued while policy routing was active and survives its
 	// disablement. Guarded by mu.

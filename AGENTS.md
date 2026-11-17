@@ -43,6 +43,7 @@ Task-based lookup (package, governing contract, validation) is in [Where do I st
   - [Forwarder dataplane ownership](docs/architecture/forwarder-dataplane-ownership.md)
   - [Frontend JavaScript contracts](docs/architecture/frontend-javascript-contracts.md)
   - [CSS contracts](docs/architecture/css-contracts.md)
+  - [Notification engine and Gotify delivery](docs/architecture/notifications.md)
 
 ## Commands
 

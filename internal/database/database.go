@@ -27,6 +27,7 @@ var DefaultSettings = map[string]string{
 	"appearance":     `{"title":"Amnezia","logo":"🛡","subtitle":"Web Panel","language":"en"}`,
 	"captcha":        `{"enabled":false}`,
 	"telegram":       `{}`,
+	"notifications":  `{"enabled":false,"url":"","app_token":"","min_severity":"info","categories":{"server_health":true,"backend_health":true,"provisioning":true,"updates":true,"failover":true},"cooldown_seconds":60,"max_attempts":6}`,
 	"ssl":            `{"enabled":false,"domain":"","cert_path":"","key_path":"","cert_text":"","key_text":"","panel_port":5000}`,
 	"limits":         `{"max_connections_per_user":10,"connection_rate_limit_count":5,"connection_rate_limit_window":60}`,
 	"vpn_config":     `{"algorithm":"least_conn","weights":{},"health_threshold_ms":2000,"listen_port":51820,"subnet_cidr":"10.100.0.0/16","max_total_peers":1000,"max_peers_per_backend":200}`,

@@ -22,6 +22,7 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/manager/naive"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/xray"
+	"github.com/devops-igor/amnezia-nexus/internal/notifications"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/router"
 	"github.com/devops-igor/amnezia-nexus/internal/service"
@@ -301,6 +302,12 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to init VPN service: %w", err)
 	}
+	// The notification engine is created before the data plane starts so the
+	// first failover outcome has a non-blocking sink. Delivery itself runs as a
+	// supervised worker later.
+	notificationSvc := notifications.NewService(db, notifications.Options{})
+	failoverProducer := notifications.NewFailoverProducer(db, notificationSvc)
+	vpnSvc.SetFailoverOutcomeNotifier(failoverProducer)
 	vpnSvc.SetAWGStatusProvider(awgMgr)
 	reconciler.SetVPNService(vpnSvc)
 	userOps.SetVPNService(vpnSvc)
@@ -340,21 +347,30 @@ func run(ctx context.Context) error {
 	// It is built from the same Handlers instance the router serves, so the
 	// approval path and the tracker share one provider resolution and one tracker.
 	hDeps := handlers.Dependencies{
-		Config:          cfg,
-		DB:              db,
-		Registry:        reg,
-		SSHPool:         sshPool,
-		AWGManager:      awgMgr,
-		MTProxyLManager: mtproxylMgr,
-		DNSManager:      dnsMgr,
-		XrayManager:     xrayMgr,
-		NaiveManager:    naiveMgr,
-		VPNService:      vpnSvc,
+		Config:              cfg,
+		DB:                  db,
+		Registry:            reg,
+		SSHPool:             sshPool,
+		AWGManager:          awgMgr,
+		MTProxyLManager:     mtproxylMgr,
+		DNSManager:          dnsMgr,
+		XrayManager:         xrayMgr,
+		NaiveManager:        naiveMgr,
+		VPNService:          vpnSvc,
+		NotificationService: notificationSvc,
 	}
 	// NewRouterWithOptions does not perform the AWG status-provider wiring that
 	// NewRouterWithDeps does, so it is applied here explicitly.
 	router.EnsureAWGStatusProvider(hDeps)
 	hSet := handlers.NewHandlers(hDeps)
+	// The dispatcher is supervised, so a browser closing cannot stop delivery
+	// and a panel restart resumes unfinished attempts from the durable outbox.
+	sup.RegisterService(notificationSvc)
+	sup.RegisterService(failoverProducer)
+	sup.RegisterService(notifications.NewObserver(db, notificationSvc, notifications.ObserverOptions{}))
+	// The update producer consumes the same authoritative checker the API
+	// serves. Its cache/ETag policy is not duplicated here.
+	sup.RegisterService(notifications.NewUpdateObserver(db, notificationSvc, hSet.UpstreamService(), notifications.UpdateObserverOptions{}))
 	registerGigahostSetupWorkers(sup, hSet)
 
 	supErrCh := make(chan error, 1)

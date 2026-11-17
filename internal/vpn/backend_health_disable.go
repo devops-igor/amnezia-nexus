@@ -73,6 +73,12 @@ func (s *Service) BackendHealthDisabled(ctx context.Context, disabled *models.Ba
 		return nil
 	}
 
+	sessions, err := s.healthDisableSessions(opCtx, live.ID)
+	if err != nil {
+		// Could not enumerate: the debt must survive so a later sweep retries.
+		s.recordHealthFailoverDebt(live)
+		return fmt.Errorf("list established sessions on health-disabled backend %d: %w", live.ID, err)
+	}
 	targets := s.healthDisableTargets(live)
 	if len(targets) == 0 {
 		// F16: no alternative right now. The sessions stay pinned (correct for
@@ -80,13 +86,17 @@ func (s *Service) BackendHealthDisabled(ctx context.Context, disabled *models.Ba
 		// bounded worker retries once an alternative becomes eligible.
 		log.Printf("[vpn] backend %d (tunnel %d) disabled by health probing; no healthy alternative, deferring its established sessions to the retry worker", live.ServerID, live.ID)
 		s.recordHealthFailoverDebt(live)
+		if len(sessions) > 0 {
+			s.notifyFailoverOutcome(models.FailoverOutcome{
+				SourceTunnelID: live.ID,
+				SourceServerID: live.ServerID,
+				Protocol:       live.Protocol,
+				Decision:       "no_target",
+				Stranded:       len(sessions),
+				StateVersion:   live.StateVersion,
+			})
+		}
 		return nil
-	}
-	sessions, err := s.healthDisableSessions(opCtx, live.ID)
-	if err != nil {
-		// Could not enumerate: the debt must survive so a later sweep retries.
-		s.recordHealthFailoverDebt(live)
-		return fmt.Errorf("list established sessions on health-disabled backend %d: %w", live.ID, err)
 	}
 	if len(sessions) == 0 {
 		// Nothing is pinned any more: the obligation is genuinely complete.
@@ -95,8 +105,21 @@ func (s *Service) BackendHealthDisabled(ctx context.Context, disabled *models.Ba
 	}
 	log.Printf("[vpn] backend %d (tunnel %d) disabled by health probing; migrating %d established session(s)",
 		live.ServerID, live.ID, len(sessions))
-	s.migrateSessionsToHealthy(opCtx, live, sessions, targets)
+	migrated := s.migrateSessionsToHealthy(opCtx, live, sessions, targets)
 	s.settleHealthFailoverDebtAfterMigration(opCtx, live)
+	decision := "success"
+	if migrated < len(sessions) {
+		decision = "partial"
+	}
+	s.notifyFailoverOutcome(models.FailoverOutcome{
+		SourceTunnelID: live.ID,
+		SourceServerID: live.ServerID,
+		Protocol:       live.Protocol,
+		Decision:       decision,
+		Migrated:       migrated,
+		Stranded:       len(sessions) - migrated,
+		StateVersion:   live.StateVersion,
+	})
 	return nil
 }
 
@@ -153,9 +176,9 @@ func (s *Service) healthDisabledBackend(disabled *models.BackendTunnel) (*models
 
 // migrateSessionsToHealthy moves each session onto a healthy target, spreading
 // the assignments round-robin over the least-loaded candidates.
-func (s *Service) migrateSessionsToHealthy(ctx context.Context, source *models.BackendTunnel, sessions []models.VPNSession, targets []*models.BackendTunnel) {
+func (s *Service) migrateSessionsToHealthy(ctx context.Context, source *models.BackendTunnel, sessions []models.VPNSession, targets []*models.BackendTunnel) int {
 	if source == nil || len(targets) == 0 {
-		return
+		return 0
 	}
 	migrated := 0
 	for i, sess := range sessions {
@@ -176,6 +199,7 @@ func (s *Service) migrateSessionsToHealthy(ctx context.Context, source *models.B
 		log.Printf("[vpn] health-disable failover: migrated %d/%d session(s) off backend %d",
 			migrated, len(sessions), source.ID)
 	}
+	return migrated
 }
 
 // healthDisableTargets returns the still-eligible active tunnels of the same

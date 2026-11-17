@@ -1,0 +1,92 @@
+{{ define "settings_notifications" }}
+        {{ if is_admin .current_user }}
+        <!-- BLOCK 3b: Portal Notifications (epic #785 phase 1) -->
+        <div class="card settings-section-card" id="notificationsCard">
+            <div class="settings-card-header">
+                <svg class="icon"><use href="#icon-send"></use></svg>
+                <h3 class="card-title">{{ _ "notifications_title" }}</h3>
+            </div>
+            <form id="notificationSettingsForm">
+                <div class="form-group">
+                    <label class="switch-container">
+                        <span class="switch">
+                            <input type="checkbox" id="notifications_enabled">
+                            <span class="switch-slider"></span>
+                        </span>
+                        <span class="switch-label-text">{{ _ "notifications_enable" }}</span>
+                    </label>
+                    <p class="form-hint">{{ _ "notifications_disabled_hint" }}</p>
+                </div>
+                <div id="notificationFields" style="margin-top: var(--space-md);">
+                    <div class="form-group">
+                        <label class="form-label" for="notifications_url">{{ _ "notifications_url_label" }}</label>
+                        <input type="url" class="form-input" id="notifications_url" autocomplete="off" placeholder="https://gotify.example.com">
+                        <p class="form-hint">{{ _ "notifications_url_hint" }}</p>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="notifications_token">{{ _ "notifications_token_label" }}</label>
+                        <input type="password" class="form-input" id="notifications_token" autocomplete="new-password">
+                        <p class="form-hint">{{ _ "notifications_token_hint" }}</p>
+                    </div>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: var(--space-md);">
+                        <div class="form-group">
+                            <label class="form-label" for="notifications_min_severity">{{ _ "notifications_min_severity_label" }}</label>
+                            <select class="form-input" id="notifications_min_severity">
+                                <option value="info">{{ _ "notifications_severity_info" }}</option>
+                                <option value="warning">{{ _ "notifications_severity_warning" }}</option>
+                                <option value="critical">{{ _ "notifications_severity_critical" }}</option>
+                            </select>
+                            <p class="form-hint">{{ _ "notifications_min_severity_hint" }}</p>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="notifications_cooldown">{{ _ "notifications_cooldown_label" }}</label>
+                            <input type="number" class="form-input" id="notifications_cooldown" min="0" max="86400" step="1">
+                            <p class="form-hint">{{ _ "notifications_cooldown_hint" }}</p>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <span class="form-label">{{ _ "notifications_categories_label" }}</span>
+                        <label class="switch-container" style="margin-top: var(--space-sm);">
+                            <span class="switch"><input type="checkbox" class="notification-category" data-category="server_health"><span class="switch-slider"></span></span>
+                            <span class="switch-label-text">{{ _ "notifications_category_server_health" }}</span>
+                        </label>
+                        <label class="switch-container" style="margin-top: var(--space-sm);">
+                            <span class="switch"><input type="checkbox" class="notification-category" data-category="backend_health"><span class="switch-slider"></span></span>
+                            <span class="switch-label-text">{{ _ "notifications_category_backend_health" }}</span>
+                        </label>
+                        <label class="switch-container" style="margin-top: var(--space-sm);">
+                            <span class="switch"><input type="checkbox" class="notification-category" data-category="provisioning"><span class="switch-slider"></span></span>
+                            <span class="switch-label-text">{{ _ "notifications_category_provisioning" }}</span>
+                        </label>
+                        <label class="switch-container" style="margin-top: var(--space-sm);">
+                            <span class="switch"><input type="checkbox" class="notification-category" data-category="updates"><span class="switch-slider"></span></span>
+                            <span class="switch-label-text">{{ _ "notifications_category_updates" }}</span>
+                        </label>
+                        <label class="switch-container" style="margin-top: var(--space-sm);">
+                            <span class="switch"><input type="checkbox" class="notification-category" data-category="failover"><span class="switch-slider"></span></span>
+                            <span class="switch-label-text">{{ _ "notifications_category_failover" }}</span>
+                        </label>
+                    </div>
+                </div>
+            </form>
+            <div style="display:flex; gap:var(--space-sm); flex-wrap:wrap; margin-top:var(--space-md);">
+                <button type="button" class="btn btn-primary" id="notificationSaveBtn" disabled>
+                    <span id="notificationSaveBtnText">{{ _ "save_changes" }}</span>
+                    <div class="spinner hidden" id="notificationSaveSpinner" style="width:14px;height:14px;"></div>
+                </button>
+                <button type="button" class="btn btn-secondary" id="notificationTestBtn" disabled>
+                    <span id="notificationTestBtnText">{{ _ "notifications_test" }}</span>
+                    <div class="spinner hidden" id="notificationTestSpinner" style="width:14px;height:14px;"></div>
+                </button>
+            </div>
+            <p class="form-hint" id="notificationTestResult" style="margin-top:var(--space-sm);"></p>
+            <div style="margin-top:var(--space-lg); border-top:1px solid var(--border-color); padding-top:var(--space-md);">
+                <h5 style="margin:0 0 var(--space-sm) 0; font-size:0.9rem; font-weight:600;">{{ _ "notifications_history_title" }}</h5>
+                <p class="form-hint" style="margin-bottom:var(--space-sm);">{{ _ "notifications_history_hint" }}</p>
+                <div id="notificationHistory" style="font-size:0.85rem;">
+                    <span class="text-muted">{{ _ "loading" }}</span>
+                </div>
+            </div>
+        </div>
+        {{ end }}
+{{ end }}

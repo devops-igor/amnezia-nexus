@@ -55,7 +55,46 @@ func (d *DB) runMigrationsLocked(ctx context.Context) error {
 	if err := d.migrateGigahostSetupIntents(ctx); err != nil {
 		return err
 	}
+	if err := d.migrateNotificationProducerStateGeneration(ctx); err != nil {
+		return err
+	}
 	return d.migratePeerLifecycle(ctx)
+}
+
+// migrateNotificationProducerStateGeneration adds the transition generation used
+// to build a stable event key. Existing rows start at generation 0 and advance on
+// their next observed change.
+func (d *DB) migrateNotificationProducerStateGeneration(ctx context.Context) error {
+	rows, err := d.sqlDB.QueryContext(ctx, "PRAGMA table_info(notification_producer_state)")
+	if err != nil {
+		return fmt.Errorf("inspect notification producer state schema: %w", err)
+	}
+	defer rows.Close()
+
+	hasGeneration := false
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == "generation" {
+			hasGeneration = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if hasGeneration {
+		return nil
+	}
+	if _, err := d.sqlDB.ExecContext(ctx,
+		`ALTER TABLE notification_producer_state ADD COLUMN generation INTEGER NOT NULL DEFAULT 0`,
+	); err != nil {
+		return fmt.Errorf("add notification producer generation: %w", err)
+	}
+	return nil
 }
 
 func (d *DB) migratePeerLifecycle(ctx context.Context) error {
