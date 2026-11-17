@@ -1112,16 +1112,6 @@ func assertNoOtherContenderAcquired(t *testing.T, winnerIdx int, numContenders i
 	}
 }
 
-func releaseAndAwaitContenderDone(t *testing.T, idx int, contenderReleaseSignal, contenderDone []chan struct{}) {
-	t.Helper()
-	contenderReleaseSignal[idx] <- struct{}{}
-	select {
-	case <-contenderDone[idx]:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("timed out waiting for contender %d to release lock", idx+1)
-	}
-}
-
 func TestRemoteLock_ContenderSerializedBehindGateMutex_DuringStaleReclamation(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available on this environment")

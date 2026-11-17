@@ -1,37 +1,48 @@
 package awg
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 )
 
-// This file is the stale-lock exclusion oracle. It replaces a channel-and-sleep
-// oracle with one whose exclusion evidence comes from the lock protocol itself:
+// This file is the stale-lock exclusion oracle. Its exclusion evidence comes from the
+// lock protocol itself rather than from a Go channel notification:
 //
-//   - every acquire subprocess appends counted attempt lines and one acquisition
-//     line to a single journal, so the ownership sample and the release ordering
-//     come from the real shell rather than from a Go channel notification;
-//   - the legitimate winner is parked by its own acquire shell immediately after it
-//     writes the ownership record, so the exclusion assertions run while the lock is
-//     provably held instead of during a fixed sleep;
+//   - every acquire subprocess appends counted retry lines and one acquisition line to
+//     a single journal, so the ownership sample comes from the real shell;
+//   - the holder is parked by its own acquire shell immediately after it writes the
+//     ownership record, so the exclusion assertions run while the lock is provably held
+//     instead of during a fixed sleep;
 //   - every other participant must demonstrate a counted number of real acquisition
-//     attempts against that held lock before the exclusion assertion is accepted (a
-//     counted evidence floor, not a timing budget);
-//   - the winner's Go notification is only released afterwards, so a channel event
-//     can never stand in for continuous lock ownership.
+//     attempts against that held lock before the exclusion assertion is accepted;
+//   - the holder's Go notification is only released afterwards, so a channel event can
+//     never stand in for continuous ownership.
 //
-// The production lock source is not modified. The generated acquire and release
-// commands are preserved byte for byte apart from the lock root, which is redirected
-// into this test's own scratch directory; that restriction is checked structurally
-// rather than asserted in prose.
+// Release is observed as a lifecycle, not as a single instant. A release subprocess
+// records when it begins releasing (while it still owns the lock) and when the removal
+// call returned. The real removal therefore falls somewhere inside that interval, and a
+// successor acquisition observed inside it is reported as unresolved rather than as
+// either legal or overlapping. Only an acquisition observed before the predecessor's
+// release began is an overlap, because at that point the predecessor had not started
+// removing anything. Journal order alone cannot resolve the interval; that limit is
+// stated rather than assumed away.
+//
+// The production lock source is not modified. The generated acquire and release commands
+// are preserved byte for byte apart from the lock root, which is redirected into this
+// test's own scratch directory; that restriction is checked structurally rather than
+// asserted in prose.
 
 const (
 	// issue872EventGateWait records one real retry pass while another token held the gate.
@@ -42,8 +53,11 @@ const (
 	// where the lock is its own. The owner field is what the owner file said at that
 	// instant, which is a sample, not a continuous claim.
 	issue872EventAcquire = "ACQ"
-	// issue872EventRelease records that a token's release subprocess ran.
-	issue872EventRelease = "REL"
+	// issue872EventReleaseBegin records that a token's release subprocess entered its
+	// removal branch. The lock is still present at this point.
+	issue872EventReleaseBegin = "RELBEGIN"
+	// issue872EventReleaseDone records that the removal call for this token returned.
+	issue872EventReleaseDone = "RELDONE"
 
 	// issue872RequiredAttempts is the number of journaled retry passes every participant
 	// must demonstrably perform against a held resource before the exclusion assertion
@@ -57,6 +71,10 @@ const (
 	// protocol branch runs.
 	issue872AwaitBound = 5 * time.Second
 
+	// issue872JoinBound bounds the wait for participant goroutines and their
+	// subprocesses to exit after cancellation.
+	issue872JoinBound = 10 * time.Second
+
 	// issue872PollInterval is the readiness poll interval for journal observations.
 	issue872PollInterval = 5 * time.Millisecond
 
@@ -65,10 +83,14 @@ const (
 	issue872GateRetryAnchor = "sleep 0.05 2>/dev/null || sleep 0.1 2>/dev/null || sleep 1; continue;"
 	// issue872LockRetryAnchor is the tail of the lock-contended branch.
 	issue872LockRetryAnchor = "sleep 0.05 2>/dev/null || sleep 0.1 2>/dev/null || sleep 1; done"
+	// issue872ReleaseBeginAnchor is the release command's removal branch entry.
+	issue872ReleaseBeginAnchor = "; then rm -rf "
+	// issue872ReleaseDoneAnchor is the statement that ends the removal branch.
+	issue872ReleaseDoneAnchor = "2>/dev/null; fi"
 )
 
-// issue872JournalEvent is one parsed journal line: a counted attempt or a completed
-// acquisition/release observed inside a real subprocess.
+// issue872JournalEvent is one parsed journal line: a counted attempt or one observation
+// of the acquire/release lifecycle made inside a real subprocess.
 type issue872JournalEvent struct {
 	kind  string
 	token string
@@ -102,8 +124,19 @@ type issue872Oracle struct {
 	gatePark     string
 	gateResume   string
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	// releaseDoneDelay, when set, is inserted between the real removal call and its
+	// release-complete observation. It exists so a control can force the logging lag
+	// that the single-marker oracle mistook for an overlap.
+	releaseDoneDelay time.Duration
+
+	ctx        context.Context
+	cancel     context.CancelFunc
+	cancelOnce sync.Once
+
+	wg      sync.WaitGroup
+	live    atomic.Int32
+	pids    []atomic.Int64
+	started []bool
 
 	participants []issue872Participant
 	tokens       []string
@@ -122,9 +155,8 @@ func newIssue872Oracle(t *testing.T, resName string) *issue872Oracle {
 	lockPath := filepath.Join(scratch, filepath.Base(prodLockPath))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 
-	return &issue872Oracle{
+	o := &issue872Oracle{
 		t:            t,
 		resName:      resName,
 		scratch:      scratch,
@@ -137,6 +169,66 @@ func newIssue872Oracle(t *testing.T, resName string) *issue872Oracle {
 		ctx:          ctx,
 		cancel:       cancel,
 	}
+
+	// Registered after t.TempDir so it runs before the scratch directory is removed.
+	t.Cleanup(func() {
+		if err := o.joinParticipants(); err != nil {
+			t.Errorf("lock oracle cleanup: %v", err)
+		}
+	})
+
+	return o
+}
+
+// joinParticipants cancels the oracle and waits for every participant goroutine and its
+// live subprocess to exit. It reports a failure to join instead of treating a leaked
+// goroutine as harmless because its process will eventually exit on its own.
+func (o *issue872Oracle) joinParticipants() error {
+	o.cancelOnce.Do(o.cancel)
+
+	joined := make(chan struct{})
+	go func() {
+		o.wg.Wait()
+		close(joined)
+	}()
+
+	select {
+	case <-joined:
+	case <-time.After(issue872JoinBound):
+		return fmt.Errorf("%d participant goroutine(s) still running %v after cancellation", o.live.Load(), issue872JoinBound)
+	}
+
+	return o.assertNoLeftoverProcesses()
+}
+
+// assertNoLeftoverProcesses proves by identity that no subprocess of this oracle is still
+// running. Identity comes from the unique scratch path this test owns, which appears in
+// the command line of every shell it starts, rather than from a process id that could
+// have been reused after the child was reaped.
+func (o *issue872Oracle) assertNoLeftoverProcesses() error {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		// No procfs to inspect; the join above still proves the goroutines exited.
+		return nil
+	}
+
+	var leftovers []string
+	for _, entry := range entries {
+		if _, convErr := strconv.Atoi(entry.Name()); convErr != nil {
+			continue
+		}
+		raw, readErr := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if readErr != nil {
+			continue
+		}
+		if strings.Contains(string(raw), o.scratch) {
+			leftovers = append(leftovers, fmt.Sprintf("pid %s: %s", entry.Name(), strings.ReplaceAll(string(raw), "\x00", " ")))
+		}
+	}
+	if len(leftovers) > 0 {
+		return fmt.Errorf("subprocesses of this oracle are still running after join: %s", strings.Join(leftovers, "; "))
+	}
+	return nil
 }
 
 // redirectLockRoot rewrites the production lock root of one generated command to this
@@ -200,6 +292,29 @@ func (o *issue872Oracle) instrumentAcquire(t *testing.T, cmd, token, parkPath, r
 	return cmd + "; " + acquireRecord + "; " + park
 }
 
+// instrumentRelease brackets the real removal call with a release-begin and a
+// release-complete observation, so the removal instant is confined to a known interval
+// instead of being inferred from a marker that trails the whole release.
+func (o *issue872Oracle) instrumentRelease(t *testing.T, cmd, token string) string {
+	t.Helper()
+
+	if got := strings.Count(cmd, issue872ReleaseBeginAnchor); got != 1 {
+		t.Fatalf("expected exactly 1 release-start anchor in the generated release command, found %d:\n%s", got, cmd)
+	}
+	begin := issue872JournalRecord(issue872EventReleaseBegin, token, o.journalPath, o.lockPath)
+	cmd = strings.Replace(cmd, issue872ReleaseBeginAnchor, "; then "+begin+"; rm -rf ", 1)
+
+	if got := strings.Count(cmd, issue872ReleaseDoneAnchor); got != 1 {
+		t.Fatalf("expected exactly 1 release-complete anchor in the generated release command, found %d:\n%s", got, cmd)
+	}
+	lag := ""
+	if o.releaseDoneDelay > 0 {
+		lag = fmt.Sprintf("sleep %.3f; ", o.releaseDoneDelay.Seconds())
+	}
+	done := issue872JournalRecord(issue872EventReleaseDone, token, o.journalPath, o.lockPath)
+	return strings.Replace(cmd, issue872ReleaseDoneAnchor, "2>/dev/null; "+lag+done+"; fi", 1)
+}
+
 // injectGateBarrier parks an acquire command inside the gate critical section, right
 // after it writes the gate owner record and before it inspects the stale lock.
 func (o *issue872Oracle) injectGateBarrier(t *testing.T, cmd, token string) string {
@@ -229,8 +344,7 @@ func (o *issue872Oracle) addParticipant(t *testing.T, token string, gateBarrier 
 	}
 	acquireCmd = o.instrumentAcquire(t, acquireCmd, token, parkPath, resumePath)
 
-	releaseCmd := o.redirectLockRoot(t, remoteLockReleaseCmd(o.resName, token)) + "; " +
-		issue872JournalRecord(issue872EventRelease, token, o.journalPath, o.lockPath)
+	releaseCmd := o.instrumentRelease(t, o.redirectLockRoot(t, remoteLockReleaseCmd(o.resName, token)), token)
 
 	o.participants = append(o.participants, issue872Participant{
 		token:      token,
@@ -256,6 +370,8 @@ func (o *issue872Oracle) finalize(t *testing.T) {
 	o.done = make([]chan struct{}, n)
 	o.errs = make([]chan error, n)
 	o.completed = make([]bool, n)
+	o.pids = make([]atomic.Int64, n)
+	o.started = make([]bool, n)
 	for i, p := range o.participants {
 		o.acquired[i] = p.acquired
 		o.releaseSig[i] = p.releaseSig
@@ -264,47 +380,307 @@ func (o *issue872Oracle) finalize(t *testing.T) {
 	}
 }
 
-// start runs one participant's acquire subprocess, then its release subprocess once
-// the oracle signals it.
+// start runs one participant's acquire subprocess, then its release subprocess once the
+// oracle signals it. Both waits observe cancellation, and the goroutine is tracked so
+// the fixture can join it before cleanup.
 func (o *issue872Oracle) start(t *testing.T, idx int) {
 	t.Helper()
 
+	if o.started[idx] {
+		t.Fatalf("participant %q was already started", o.tokens[idx])
+	}
+	o.started[idx] = true
+
 	p := o.participants[idx]
+	o.wg.Add(1)
+	o.live.Add(1)
 	go func() {
-		out, err := exec.CommandContext(o.ctx, "bash", "-c", p.acquireCmd).CombinedOutput()
-		if err != nil {
-			p.errs <- fmt.Errorf("acquire failed: %w (out: %s)", err, strings.TrimSpace(string(out)))
-			return
+		defer o.wg.Done()
+		defer o.live.Add(-1)
+		if err := o.runParticipant(idx, p); err != nil {
+			select {
+			case p.errs <- err:
+			default:
+			}
 		}
-		p.acquired <- struct{}{}
-		<-p.releaseSig
-		relOut, relErr := exec.CommandContext(o.ctx, "bash", "-c", p.releaseCmd).CombinedOutput()
-		if relErr != nil {
-			p.errs <- fmt.Errorf("release failed: %w (out: %s)", relErr, strings.TrimSpace(string(relOut)))
-		}
-		p.done <- struct{}{}
 	}()
 }
 
-// events parses the journal. A missing journal is an empty journal; a journal that
-// cannot be read surfaces through the diagnostics of whichever wait expires.
-func (o *issue872Oracle) events() []issue872JournalEvent {
-	raw, err := os.ReadFile(o.journalPath)
+// runParticipant drives one participant's lifecycle and returns the first failure. It is
+// the only place that waits on the participant's own signals, and every wait can be
+// abandoned on cancellation so the goroutine cannot outlive the fixture.
+func (o *issue872Oracle) runParticipant(idx int, p issue872Participant) error {
+	out, err := o.runShell(idx, p, p.acquireCmd, "acquire")
 	if err != nil {
-		return nil
+		return err
+	}
+	_ = out
+
+	select {
+	case p.acquired <- struct{}{}:
+	case <-o.ctx.Done():
+		return fmt.Errorf("cancelled after acquiring: %w", o.ctx.Err())
 	}
 
-	var events []issue872JournalEvent
-	for _, line := range strings.Split(string(raw), "\n") {
-		parts := strings.SplitN(strings.TrimSpace(line), " ", 4)
-		if len(parts) < 4 {
-			continue
+	select {
+	case <-p.releaseSig:
+	case <-o.ctx.Done():
+		return fmt.Errorf("cancelled before release: %w", o.ctx.Err())
+	}
+
+	if _, err := o.runShell(idx, p, p.releaseCmd, "release"); err != nil {
+		select {
+		case p.errs <- err:
+		default:
 		}
-		events = append(events, issue872JournalEvent{
-			kind:  parts[0],
-			token: parts[2],
-			owner: strings.TrimPrefix(parts[3], "owner="),
-		})
+	}
+
+	select {
+	case p.done <- struct{}{}:
+	case <-o.ctx.Done():
+		return fmt.Errorf("cancelled before completion: %w", o.ctx.Err())
+	}
+	return nil
+}
+
+// runShell executes one generated shell command for a participant, recording its
+// process id before it runs so the fixture can prove that exact process exited.
+func (o *issue872Oracle) runShell(idx int, p issue872Participant, command, phase string) (string, error) {
+	cmd := exec.CommandContext(o.ctx, "bash", "-c", command)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("%s start failed: %w", phase, err)
+	}
+	o.pids[idx].Store(int64(cmd.Process.Pid))
+
+	if err := cmd.Wait(); err != nil {
+		return buf.String(), fmt.Errorf("%s failed: %w (out: %s)", phase, err, strings.TrimSpace(buf.String()))
+	}
+	return buf.String(), nil
+}
+
+// issue872ParseJournalLine parses one journal line. Anything that does not have the
+// exact shape this oracle relies on is an error: silently dropping a line would let the
+// exclusion evidence be weaker than it claims.
+func issue872ParseJournalLine(line string) (issue872JournalEvent, error) {
+	parts := strings.SplitN(line, " ", 4)
+	if len(parts) != 4 {
+		return issue872JournalEvent{}, fmt.Errorf("expected 4 fields, got %d in %q", len(parts), line)
+	}
+	if parts[0] == "" || parts[2] == "" {
+		return issue872JournalEvent{}, fmt.Errorf("missing event kind or token in %q", line)
+	}
+	if !strings.HasPrefix(parts[3], "owner=") {
+		return issue872JournalEvent{}, fmt.Errorf("missing owner observation in %q", line)
+	}
+	return issue872JournalEvent{
+		kind:  parts[0],
+		token: parts[2],
+		owner: strings.TrimPrefix(parts[3], "owner="),
+	}, nil
+}
+
+// issue872ParseJournal parses a whole journal. It also returns an unterminated trailing
+// fragment separately, because a live journal may be read between writes while a final
+// read must not silently lose a truncated tail.
+func issue872ParseJournal(raw string) ([]issue872JournalEvent, string, error) {
+	if raw == "" {
+		return nil, "", nil
+	}
+
+	lines := strings.Split(raw, "\n")
+	tail := ""
+	if last := len(lines) - 1; lines[last] == "" {
+		// The journal ends with a newline, which is its completed shape.
+		lines = lines[:last]
+	} else {
+		// The final line has not been terminated yet, so it is an in-progress write.
+		tail = lines[last]
+		lines = lines[:last]
+	}
+
+	events := make([]issue872JournalEvent, 0, len(lines))
+	for i, line := range lines {
+		if line == "" {
+			return nil, tail, fmt.Errorf("line %d is empty", i+1)
+		}
+		ev, err := issue872ParseJournalLine(line)
+		if err != nil {
+			return nil, tail, fmt.Errorf("line %d: %w", i+1, err)
+		}
+		events = append(events, ev)
+	}
+	return events, tail, nil
+}
+
+// issue872OwnerToken returns the token field of an owner-file sample.
+func issue872OwnerToken(sample string) string {
+	fields := strings.Fields(sample)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+// issue872AcqClass is how one acquisition relates to its predecessor's release.
+type issue872AcqClass string
+
+const (
+	// issue872AcqFirst is the first acquisition in the journal.
+	issue872AcqFirst issue872AcqClass = "first"
+	// issue872AcqReleased follows a predecessor whose removal call had already returned.
+	issue872AcqReleased issue872AcqClass = "predecessor-released"
+	// issue872AcqInFlight falls inside the predecessor's release interval, so the
+	// journal cannot say whether the removal call had already taken effect. It is
+	// reported as unresolved, never as legal and never as overlap.
+	issue872AcqInFlight issue872AcqClass = "release-in-flight"
+	// issue872AcqOverlap precedes the predecessor's release entirely.
+	issue872AcqOverlap issue872AcqClass = "overlap"
+)
+
+// issue872Acquisition is one classified acquisition.
+type issue872Acquisition struct {
+	token    string
+	owner    string
+	previous string
+	class    issue872AcqClass
+}
+
+// issue872Classification is the whole-journal verdict.
+type issue872Classification struct {
+	acquisitions []issue872Acquisition
+	inFlight     int
+	outstanding  string
+}
+
+// issue872ClassifyJournal classifies every acquisition against the release lifecycle of
+// its predecessor. It rejects journal data whose shape it cannot interpret, because the
+// exclusion verdict depends on that data.
+//
+// Release state is tracked per token, not globally: a successor can take the lock while a
+// predecessor's removal call is still in flight, and the predecessor's release-complete
+// record then legitimately arrives afterwards.
+func issue872ClassifyJournal(events []issue872JournalEvent) (issue872Classification, error) {
+	var out issue872Classification
+
+	acquired := map[string]bool{}
+	begun := map[string]bool{}
+	latest := ""
+	everAcquired := false
+
+	for i, ev := range events {
+		switch ev.kind {
+		case issue872EventGateWait, issue872EventLockTry:
+			continue
+
+		case issue872EventAcquire:
+			if issue872OwnerToken(ev.owner) != ev.token {
+				return out, fmt.Errorf("line %d: acquisition by %q sampled owner %q at that instant", i+1, ev.token, ev.owner)
+			}
+			if acquired[ev.token] {
+				return out, fmt.Errorf("line %d: %q acquired again while an earlier acquisition of its own is outstanding", i+1, ev.token)
+			}
+
+			var class issue872AcqClass
+			switch {
+			case latest == "" && !everAcquired:
+				class = issue872AcqFirst
+			case latest == "":
+				class = issue872AcqReleased
+			case begun[latest]:
+				class = issue872AcqInFlight
+				out.inFlight++
+			default:
+				class = issue872AcqOverlap
+			}
+
+			out.acquisitions = append(out.acquisitions, issue872Acquisition{
+				token:    ev.token,
+				owner:    ev.owner,
+				previous: latest,
+				class:    class,
+			})
+			acquired[ev.token] = true
+			begun[ev.token] = false
+			latest = ev.token
+			everAcquired = true
+
+		case issue872EventReleaseBegin:
+			if !acquired[ev.token] {
+				return out, fmt.Errorf("line %d: release began for %q without an outstanding acquisition", i+1, ev.token)
+			}
+			if issue872OwnerToken(ev.owner) != ev.token {
+				return out, fmt.Errorf("line %d: release began for %q but the owner file named %q", i+1, ev.token, ev.owner)
+			}
+			begun[ev.token] = true
+
+		case issue872EventReleaseDone:
+			if !acquired[ev.token] || !begun[ev.token] {
+				return out, fmt.Errorf("line %d: release completed for %q without a matching release-begin", i+1, ev.token)
+			}
+			acquired[ev.token] = false
+			begun[ev.token] = false
+			if latest == ev.token {
+				latest = ""
+			}
+
+		default:
+			return out, fmt.Errorf("line %d: unknown journal event kind %q", i+1, ev.kind)
+		}
+	}
+
+	out.outstanding = latest
+	return out, nil
+}
+
+// issue872LegacyOverlapRule reproduces the superseded single-marker rule: an acquisition
+// observed before the previous holder's final release record was reported as overlap.
+// It exists only to show what the earlier oracle would have concluded about the same
+// journal, and it is the rule that turned a delayed release record into a false positive.
+func issue872LegacyOverlapRule(events []issue872JournalEvent) (successor, predecessor string, flagged bool) {
+	heldBy := ""
+	for _, ev := range events {
+		switch ev.kind {
+		case issue872EventAcquire:
+			if heldBy != "" {
+				return ev.token, heldBy, true
+			}
+			heldBy = ev.token
+		case issue872EventReleaseDone:
+			if heldBy == ev.token {
+				heldBy = ""
+			}
+		}
+	}
+	return "", "", false
+}
+
+// readJournal returns the parsed journal without failing the test, so diagnostics can
+// report malformed data instead of dying while trying to describe it.
+func (o *issue872Oracle) readJournal() ([]issue872JournalEvent, string, error) {
+	raw, err := os.ReadFile(o.journalPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, "", nil
+		}
+		return nil, "", err
+	}
+	return issue872ParseJournal(string(raw))
+}
+
+// events returns the parsed journal, failing the test when the evidence is unusable.
+func (o *issue872Oracle) events() []issue872JournalEvent {
+	o.t.Helper()
+
+	events, tail, err := o.readJournal()
+	if err != nil {
+		o.t.Fatalf("lock journal is not usable as exclusion evidence: %v\n%s", err, o.diagnostics())
+	}
+	if tail != "" {
+		o.t.Fatalf("lock journal ends with an unterminated fragment %q\n%s", tail, o.diagnostics())
 	}
 	return events
 }
@@ -332,12 +708,68 @@ func (o *issue872Oracle) journalText() string {
 	return strings.TrimSpace(string(raw))
 }
 
-// diagnostics reports the journal and the current owner file. The owner reading is
-// explicitly a sample taken now, not at event time, and each journal line carries the
-// sample that was taken at that event.
-func (o *issue872Oracle) diagnostics() string {
-	journal := o.journalText()
+// contentionSummary reports what each participant was actually observed doing, plus the
+// artefacts a contention failure turns on. It reads state directly and never fails.
+func (o *issue872Oracle) contentionSummary() string {
+	var b strings.Builder
+	events, tail, err := o.readJournal()
+	if err != nil {
+		fmt.Fprintf(&b, "journal unusable: %v\n", err)
+	}
+	if tail != "" {
+		fmt.Fprintf(&b, "journal has an unterminated trailing fragment: %q\n", tail)
+	}
 
+	counts := map[string]map[string]int{}
+	for _, ev := range events {
+		if counts[ev.token] == nil {
+			counts[ev.token] = map[string]int{}
+		}
+		counts[ev.token][ev.kind]++
+	}
+	kinds := []string{issue872EventAcquire, issue872EventReleaseBegin, issue872EventReleaseDone, issue872EventLockTry, issue872EventGateWait}
+	for _, token := range o.tokens {
+		fmt.Fprintf(&b, "  participant %q:", token)
+		for _, kind := range kinds {
+			fmt.Fprintf(&b, " %s=%d", kind, counts[token][kind])
+		}
+		b.WriteString("\n")
+	}
+
+	if class, classErr := issue872ClassifyJournal(events); classErr == nil {
+		fmt.Fprintf(&b, "  classification: acquisitions=%d release-in-flight=%d outstanding=%q\n",
+			len(class.acquisitions), class.inFlight, class.outstanding)
+	} else {
+		fmt.Fprintf(&b, "  classification: unusable (%v)\n", classErr)
+	}
+	if successor, predecessor, flagged := issue872LegacyOverlapRule(events); flagged {
+		fmt.Fprintf(&b, "  superseded single-marker rule would have reported overlap: %q after %q\n", successor, predecessor)
+	}
+
+	for _, probe := range []struct{ label, path string }{
+		{"lock dir", o.lockPath},
+		{"gate dir", o.gatePath},
+		{"lock owner file", filepath.Join(o.lockPath, "owner")},
+	} {
+		info, statErr := os.Stat(probe.path)
+		switch {
+		case statErr == nil:
+			fmt.Fprintf(&b, "  %s: present mtime=%s\n", probe.label, info.ModTime().UTC().Format(time.RFC3339Nano))
+		case os.IsNotExist(statErr):
+			fmt.Fprintf(&b, "  %s: absent\n", probe.label)
+		default:
+			fmt.Fprintf(&b, "  %s: stat failed: %v\n", probe.label, statErr)
+		}
+	}
+	fmt.Fprintf(&b, "  wall clock now: %s (unix %d)\n", time.Now().UTC().Format(time.RFC3339Nano), time.Now().Unix())
+
+	return b.String()
+}
+
+// diagnostics reports the journal, the per-participant contention summary and the
+// current owner file. The owner reading here is explicitly a sample taken now, not at
+// event time, and each journal line carries the sample that was taken at that event.
+func (o *issue872Oracle) diagnostics() string {
 	owner := "absent"
 	switch raw, err := os.ReadFile(filepath.Join(o.lockPath, "owner")); {
 	case err == nil:
@@ -346,8 +778,8 @@ func (o *issue872Oracle) diagnostics() string {
 		owner = fmt.Sprintf("<unreadable: %v>", err)
 	}
 
-	return fmt.Sprintf("lock journal (%s):\n%s\nowner file sampled now, not at event time: %q",
-		o.journalPath, journal, owner)
+	return fmt.Sprintf("lock journal (%s):\n%s\ncontention summary:\n%sowner file sampled now, not at event time: %q",
+		o.journalPath, o.journalText(), o.contentionSummary(), owner)
 }
 
 // await polls cond until it holds, failing with the full journal on a participant
@@ -376,8 +808,8 @@ func (o *issue872Oracle) await(what string, cond func() bool) {
 	}
 }
 
-// assertNoParticipantError surfaces a release failure that the legacy contender
-// helper cannot report.
+// assertNoParticipantError surfaces a release failure that the legacy contender helper
+// cannot report.
 func (o *issue872Oracle) assertNoParticipantError() {
 	o.t.Helper()
 
@@ -485,6 +917,27 @@ func (o *issue872Oracle) awaitOthersAttempting(holderIdx int) {
 		})
 }
 
+// signalAndAwaitRelease asks one participant to release and waits, with a bound, for its
+// release subprocess to finish. Cancellation abandons the wait instead of blocking it.
+func (o *issue872Oracle) signalAndAwaitRelease(t *testing.T, idx int) {
+	t.Helper()
+
+	p := o.participants[idx]
+	select {
+	case p.releaseSig <- struct{}{}:
+	case <-o.ctx.Done():
+		t.Fatalf("oracle cancelled before releasing %q: %v", p.token, o.ctx.Err())
+	}
+
+	select {
+	case <-p.done:
+	case <-time.After(issue872AwaitBound):
+		t.Fatalf("timed out after %v waiting for %q to release the lock\n%s", issue872AwaitBound, p.token, o.diagnostics())
+	case <-o.ctx.Done():
+		t.Fatalf("oracle cancelled while waiting for %q to release: %v", p.token, o.ctx.Err())
+	}
+}
+
 // releaseHolder unblocks the parked shell, confirms that the delayed Go notification
 // comes from the participant the journal named, and then drives the real release.
 func (o *issue872Oracle) releaseHolder(holderIdx int) {
@@ -500,7 +953,7 @@ func (o *issue872Oracle) releaseHolder(holderIdx int) {
 			o.tokens[holderIdx], o.tokens[notified], o.diagnostics())
 	}
 
-	releaseAndAwaitContenderDone(o.t, holderIdx, o.releaseSig, o.done)
+	o.signalAndAwaitRelease(o.t, holderIdx)
 	o.completed[holderIdx] = true
 	o.assertNoParticipantError()
 }
@@ -508,12 +961,13 @@ func (o *issue872Oracle) releaseHolder(holderIdx int) {
 // acquireRound drives one serialized round: elect the holder from the journal, confirm
 // its parked shell owns the lock, require real attempts from everyone else, assert
 // exclusion, and only then release.
-func (o *issue872Oracle) acquireRound(t *testing.T, step int) {
+func (o *issue872Oracle) acquireRound(t *testing.T, step, requireFirstHolder int) {
 	t.Helper()
 
 	holderIdx := o.awaitNextHolder()
-	if step == 0 && holderIdx != 0 {
-		t.Fatalf("expected the stale reclaimer to win the first round, got %q\n%s", o.tokens[holderIdx], o.diagnostics())
+	if step == 0 && requireFirstHolder >= 0 && holderIdx != requireFirstHolder {
+		t.Fatalf("expected %q to win the first round, got %q\n%s",
+			o.tokens[requireFirstHolder], o.tokens[holderIdx], o.diagnostics())
 	}
 
 	o.awaitHolderParked(holderIdx)
@@ -529,50 +983,57 @@ func (o *issue872Oracle) acquireRound(t *testing.T, step int) {
 	o.releaseHolder(holderIdx)
 }
 
-// assertJournalSerialized checks the whole timeline: at most one holder at a time, each
-// acquisition owned the record it exited on, and nothing is left held.
-func (o *issue872Oracle) assertJournalSerialized(t *testing.T) {
+// assertReleaseOrdering classifies the whole timeline. An acquisition that precedes its
+// predecessor's release-begin is an overlap and fails. An acquisition inside the
+// predecessor's release interval is unresolved by journal order, so it is counted and
+// reported rather than being claimed as exclusion.
+func (o *issue872Oracle) assertReleaseOrdering(t *testing.T) {
 	t.Helper()
 
-	holder := ""
-	for _, ev := range o.events() {
-		switch ev.kind {
-		case issue872EventAcquire:
-			if !strings.Contains(ev.owner, ev.token) {
-				t.Fatalf("acquire by %q sampled owner file %q at acquisition time: it exited on a lock it did not own\n%s",
-					ev.token, ev.owner, o.diagnostics())
-			}
-			if holder != "" {
-				t.Fatalf("overlapping ownership in the journal: %q acquired while %q had not released\n%s",
-					ev.token, holder, o.diagnostics())
-			}
-			holder = ev.token
-		case issue872EventRelease:
-			if holder == ev.token {
-				holder = ""
-			}
-		}
+	events := o.events()
+	class, err := issue872ClassifyJournal(events)
+	if err != nil {
+		t.Fatalf("lock journal is not usable as exclusion evidence: %v\n%s", err, o.diagnostics())
 	}
-	if holder != "" {
-		t.Fatalf("journal ends with %q still holding the lock\n%s", holder, o.diagnostics())
+
+	for _, acq := range class.acquisitions {
+		if acq.class != issue872AcqOverlap {
+			continue
+		}
+		t.Fatalf("MUTUAL EXCLUSION BROKEN: %q acquired while %q held the lock and had not begun releasing (owner sampled at that instant: %q)\n%s",
+			acq.token, acq.previous, acq.owner, o.diagnostics())
+	}
+
+	if class.outstanding != "" {
+		t.Fatalf("lock journal ends with %q still holding the lock\n%s", class.outstanding, o.diagnostics())
+	}
+
+	for _, acq := range class.acquisitions {
+		t.Logf("acquisition class: %q after %q -> %s (owner sampled at that instant: %q)",
+			acq.token, acq.previous, acq.class, acq.owner)
+	}
+	if class.inFlight > 0 {
+		t.Logf("unresolved: %d acquisition(s) fall inside a predecessor's release interval, so the journal cannot say whether the removal call had already taken effect; they are reported, not counted as exclusion proof", class.inFlight)
 	}
 }
 
 func (o *issue872Oracle) assertEventTotals(t *testing.T, want int) {
 	t.Helper()
 
-	acquired, released := 0, 0
+	acquired, begun, completedReleases := 0, 0, 0
 	for _, ev := range o.events() {
 		switch ev.kind {
 		case issue872EventAcquire:
 			acquired++
-		case issue872EventRelease:
-			released++
+		case issue872EventReleaseBegin:
+			begun++
+		case issue872EventReleaseDone:
+			completedReleases++
 		}
 	}
-	if acquired != want || released != want {
-		t.Fatalf("expected %d acquisitions and %d releases in the journal, observed %d and %d\n%s",
-			want, want, acquired, released, o.diagnostics())
+	if acquired != want || begun != want || completedReleases != want {
+		t.Fatalf("expected %d acquisitions, %d release-begin and %d release-complete observations, observed %d, %d and %d\n%s",
+			want, want, want, acquired, begun, completedReleases, o.diagnostics())
 	}
 }
 
@@ -645,11 +1106,11 @@ func TestRemoteLock_StaleReclaimerPausedInGate_AllContendersWaitOnGate(t *testin
 	// 5. Four serialized rounds: the reclaimer, then each contender in the order the
 	//    protocol itself serializes them.
 	for step := 0; step < len(o.tokens); step++ {
-		o.acquireRound(t, step)
+		o.acquireRound(t, step, 0)
 	}
 
 	// 6. Whole-timeline invariants.
-	o.assertJournalSerialized(t)
+	o.assertReleaseOrdering(t)
 	o.assertEventTotals(t, len(o.tokens))
 	t.Logf("lock protocol journal (owner= is the owner file sampled inside the subprocess at that event):\n%s", o.journalText())
 
