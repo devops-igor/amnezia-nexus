@@ -95,11 +95,17 @@ func returnFlowKey(peerKey string, packet []byte, clientIP netip.Addr) (FlowKey,
 	}, true
 }
 
-// proxyReturnEvidence matches a backend reply to the flow that admitted the request.
+// proxyReturnEvidence matches a backend reply to the flow that owns the tuple NOW.
 //
-// The match requires the same peer (the route's), the same session and the same route
-// generation, so a reply can never be credited to a successor that reused the tuple. The
-// flow table read is the existing locked lookup; the caller is outside the forwarder
+// This is an association, not proof of which remote incarnation sent the reply: a late
+// reply from a replaced incarnation that reused the same backend, address and ports is
+// indistinguishable from a current one by routing state. The generation comparison makes
+// the association fail closed when the entry it finds belongs to another generation, but
+// with a same-tuple replacement the entry IS the current one, so it does not identify the
+// sender. The answer states this authority (current_tuple_association) rather than
+// claiming the reply cannot be a predecessor's.
+//
+// The flow table read is the existing locked lookup; the caller is outside the forwarder
 // lock, which is the documented Forwarder -> DirectEgress order.
 func (f *Forwarder) proxyReturnEvidence(route *sessionRoute, packet []byte, clientIP netip.Addr) (*flowStats, bool) {
 	if f.directEgress == nil || route == nil {

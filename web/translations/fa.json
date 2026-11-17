@@ -1118,5 +1118,18 @@
   "policy_client_failure_return_path_closed": "مسیر بازگشت بسته است",
   "policy_client_failure_client_write_failed": "خطای نوشتن برای کلاینت",
   "policy_client_failure_client_short_write": "قاب ناقص برای کلاینت",
-  "policy_client_return_authority_current_tuple_association": "منطبق با جریانی که اکنون مالک این تاپل است"
+  "policy_client_return_authority_current_tuple_association": "منطبق با جریانی که اکنون مالک این تاپل است",
+  "policy_client_drops_label": "پیش از ایجاد جریان رد شد",
+  "policy_client_drops_hint": "بسته‌های این کلاینت که پیش از ثبت جریان رد شده‌اند. شمارنده‌های کلی آن‌ها را به کلاینت نسبت نمی‌دهند؛ این سطرها نسبت می‌دهند.",
+  "policy_client_column_drop_reason": "دلیل",
+  "policy_client_column_drop_count": "بسته‌ها",
+  "policy_client_drop_no_tuple": "مقصد ثبت نشده",
+  "policy_client_drop_empty": "در بازه نگهداری هیچ ردی برای این کلاینت نیست.",
+  "policy_client_drop_not_recorded": "این نسخه ردهای پیش از جریان را ثبت نمی‌کند.",
+  "policy_client_drop_truncated": "نمایش {shown} از {total} رد ثبت‌شده.",
+  "policy_client_drop_coverage": "نگهداری {stored} · ادغام {merged} · حذف {evicted} · منقضی {pruned} · کلیدها {keys}/{key_limit} · پنجره {age}ثانیه",
+  "policy_client_drop_reason_prohibited_destination": "مقصد ممنوع",
+  "policy_client_drop_reason_invalid_client_packet": "بسته نامعتبر کلاینت",
+  "policy_client_drop_reason_nat_port_exhaustion": "اتمام پورت NAT",
+  "policy_client_drop_reason_direct_egress_unavailable": "خروج مستقیم در دسترس نیست"
 }

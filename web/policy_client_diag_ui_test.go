@@ -82,6 +82,14 @@ w._ = key => {
   if (key === 'policy_client_dns_truncated') return 'DNS-TRUNC {shown}/{total}';
   if (key === 'policy_client_outcome_fmt') return 'OUTCOME {ok}/{failed} · return {return} {packets}';
   if (key === 'policy_client_counters_live_note') return 'COUNTERS-LIVE';
+  if (key === 'policy_client_drop_truncated') return 'DROP-TRUNC {shown}/{total}';
+  if (key === 'policy_client_drop_coverage') return 'DROPCOV {stored}/{merged}/{evicted}/{pruned} {keys}/{key_limit} {age}';
+  if (key === 'policy_client_drop_no_tuple') return 'NO-TUPLE';
+  if (key === 'policy_client_drop_empty') return 'DROP-EMPTY';
+  if (key === 'policy_client_drop_not_recorded') return 'DROP-NOT-RECORDED';
+  if (key === 'policy_client_drop_reason_prohibited_destination') return 'REASON:prohibited';
+  if (key === 'policy_client_drop_reason_invalid_client_packet') return 'REASON:invalid';
+  if (key === 'policy_client_drop_reason_nat_port_exhaustion') return 'REASON:nat-exhaustion';
   if (key === 'policy_client_backend_write_fmt') return 'DEVICE {ok}/{failed}';
   if (key === 'policy_client_return_authority_current_tuple_association') return 'RETURN_AUTHORITY:current_tuple_association';
   if (key === 'policy_client_return_chain_fmt')
@@ -454,6 +462,20 @@ assert.equal(w.document.getElementById('policyClientFlowFoot').hidden, false);
 assert.equal(text('policyClientFlowFoot'), 'FLOWS 1/600 PARTIAL 16384 COUNTERS-LIVE',
   'the flow count must be presented as a windowed count, with the live-sample caveat');
 assert.equal(rowCells('policyClientFlowRows', 0)[0], 'PROTO:udp');
+// Pre-flow refusals: a real row per reason, an explicit "no tuple" instead of an
+// invented destination, the truncation note and the retention coverage.
+assert.equal(rowCells('policyClientDropRows', 0)[0], 'REASON:prohibited',
+  'the refused reason is rendered from the producer token');
+assert.equal(rowCells('policyClientDropRows', 0)[1], '169.254.169.254:80',
+  'a well-formed refused packet keeps its destination');
+assert.equal(rowCells('policyClientDropRows', 0)[3], '4');
+assert.equal(rowCells('policyClientDropRows', 1)[1], 'NO-TUPLE',
+  'a malformed packet must not show a destination it never carried');
+assert.equal(rowCells('policyClientDropRows', 1)[2], 'NO-TUPLE');
+assert.equal(rowCells('policyClientDropRows', 2)[0], 'REASON:nat-exhaustion');
+assert.equal(text('policyClientDropFoot'), 'DROP-TRUNC 3/3');
+assert.equal(text('policyClientDropCoverage'), 'DROPCOV 2/5/0/1 3/64 600',
+  'retention and loss are stated beside the rows');
 `)
 }
 
@@ -466,6 +488,18 @@ func TestPolicyClientDiagFlowStateVariety(t *testing.T) {
 responder = ((base) => async (url, opts) => {
   if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
   const answer = await base(url, opts);
+  answer.drops = {available: true, state: 'observed', total: 3, truncated: true,
+    entries: [
+      {reason: 'prohibited_destination', has_tuple: true, destination_ip: '169.254.169.254',
+       destination_port: 80, protocol: 'tcp', count: 4, bytes: 240,
+       first_seen: '2026-11-17T09:00:00Z', last_seen: '2026-11-17T09:05:00Z'},
+      {reason: 'invalid_client_packet', has_tuple: false, count: 1, bytes: 3,
+       first_seen: '2026-11-17T09:01:00Z', last_seen: '2026-11-17T09:01:00Z'},
+      {reason: 'nat_port_exhaustion', has_tuple: true, destination_ip: '9.9.9.9',
+       destination_port: 443, protocol: 'tcp', count: 2, bytes: 120,
+       first_seen: '2026-11-17T09:02:00Z', last_seen: '2026-11-17T09:06:00Z'}],
+    coverage: {stored: 2, merged: 5, evicted: 0, pruned: 1, keys: 3, key_limit: 64,
+               age_limit_seconds: 600}};
   answer.flows.entries = [
     {protocol: 'tcp', destination_ip: '93.184.216.34', destination_port: 443, choice: 'PROXY',
      route_generation: 3, last_seen_age_seconds: 5, expired: false, close_seen: false,

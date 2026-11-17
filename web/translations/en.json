@@ -1118,5 +1118,18 @@
   "policy_client_failure_return_path_closed": "return path closed",
   "policy_client_failure_client_write_failed": "client write failed",
   "policy_client_failure_client_short_write": "client short write",
-  "policy_client_return_authority_current_tuple_association": "matched by the flow that owns this tuple now"
+  "policy_client_return_authority_current_tuple_association": "matched by the flow that owns this tuple now",
+  "policy_client_drops_label": "Refused before a flow existed",
+  "policy_client_drops_hint": "Packets this client sent that were refused before any flow record existed. Global counters cannot attribute these to a client; these rows can.",
+  "policy_client_column_drop_reason": "Reason",
+  "policy_client_column_drop_count": "Packets",
+  "policy_client_drop_no_tuple": "no destination recorded",
+  "policy_client_drop_empty": "No refusal retained for this client in the retention window.",
+  "policy_client_drop_not_recorded": "This build did not record pre-flow refusals.",
+  "policy_client_drop_truncated": "Showing {shown} of {total} retained refusals.",
+  "policy_client_drop_coverage": "Retained {stored} · merged {merged} · evicted {evicted} · aged out {pruned} · {keys}/{key_limit} keys · window {age}s",
+  "policy_client_drop_reason_prohibited_destination": "prohibited destination",
+  "policy_client_drop_reason_invalid_client_packet": "malformed client packet",
+  "policy_client_drop_reason_nat_port_exhaustion": "NAT port exhaustion",
+  "policy_client_drop_reason_direct_egress_unavailable": "direct egress unavailable"
 }

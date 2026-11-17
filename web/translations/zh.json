@@ -1118,5 +1118,18 @@
   "policy_client_failure_return_path_closed": "返回路径已关闭",
   "policy_client_failure_client_write_failed": "客户端写入失败",
   "policy_client_failure_client_short_write": "客户端写入不完整帧",
-  "policy_client_return_authority_current_tuple_association": "与当前拥有该元组的流匹配"
+  "policy_client_return_authority_current_tuple_association": "与当前拥有该元组的流匹配",
+  "policy_client_drops_label": "在流创建前被拒绝",
+  "policy_client_drops_hint": "该客户端在任何流记录存在之前被拒绝的数据包。全局计数器无法将其归因到客户端；这些行可以。",
+  "policy_client_column_drop_reason": "原因",
+  "policy_client_column_drop_count": "数据包",
+  "policy_client_drop_no_tuple": "未记录目标",
+  "policy_client_drop_empty": "在保留窗口内没有为该客户端保留拒绝记录。",
+  "policy_client_drop_not_recorded": "此构建未记录流创建前的拒绝。",
+  "policy_client_drop_truncated": "显示 {shown}/{total} 条保留的拒绝记录。",
+  "policy_client_drop_coverage": "保留 {stored} · 合并 {merged} · 逐出 {evicted} · 过期 {pruned} · 键 {keys}/{key_limit} · 窗口 {age}秒",
+  "policy_client_drop_reason_prohibited_destination": "禁止的目标",
+  "policy_client_drop_reason_invalid_client_packet": "客户端数据包格式错误",
+  "policy_client_drop_reason_nat_port_exhaustion": "NAT 端口耗尽",
+  "policy_client_drop_reason_direct_egress_unavailable": "直连出口不可用"
 }

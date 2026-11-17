@@ -240,6 +240,9 @@ func (f *Forwarder) beginUnregisterSession(peerKey, sessionID string) (retiremen
 		f.stopRoutePumpLocked(route)
 		f.drainRouteQueueLocked(route)
 		f.changeQueueCapacityLocked(-cap(route.clientQueue))
+		// The session's pre-flow refusals end with the session, so a later read cannot
+		// resurrect evidence for a client that is gone.
+		f.clientDrops.ForgetSession(route.sessionID)
 		if f.directEgress != nil {
 			f.directEgress.PurgePeer(peerKey)
 		}
@@ -322,6 +325,7 @@ func (f *Forwarder) retireRoutesMatchingLocked(predicate func(*sessionRoute) boo
 		f.stopRoutePumpLocked(route)
 		f.drainRouteQueueLocked(route)
 		f.changeQueueCapacityLocked(-cap(route.clientQueue))
+		f.clientDrops.ForgetSession(route.sessionID)
 		if f.directEgress != nil {
 			f.directEgress.PurgePeer(route.peerKey)
 		}

@@ -120,12 +120,21 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 	// One instant for the whole answer: every age and remaining lifetime below
 	// is computed against it, so two fields can never disagree about "now".
 	now := time.Now()
+
+	// The retained pre-flow refusals of THIS session, read through the bounded ledger's
+	// pure read. A session that was retired reads as empty; nothing here can see another
+	// client's drops.
+	var dropSnapshot forwarder.DropSnapshot
+	if fwd != nil {
+		dropSnapshot = fwd.ClientDropSnapshot(sessionID, 0)
+	}
+
 	out := ClientDiagnosisResponse{
 		Selection:   ClientDiagnosisSelection{SessionID: sessionID},
 		Coverage:    clientDiagnosisCoverage(fwd, now),
 		DNS:         clientDiagnosisEmptyDNS(),
 		Flows:       clientDiagnosisEmptyFlows(),
-		Drops:       ClientDiagnosisDrops{Available: false, State: ClientDiagnosisTokenNotRecorded, Entries: []ClientDiagnosisDrop{}},
+		Drops:       clientDiagnosisDropsSection(dropSnapshot),
 		Limitations: clientDiagnosisLimitations(),
 		EvaluatedAt: clientDiagnosisTime(now),
 		ReadOnly:    true,

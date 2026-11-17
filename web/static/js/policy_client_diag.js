@@ -188,6 +188,16 @@
         if (eventCoverage) {
             eventCoverage.textContent = '';
         }
+        rows = clientElement('policyClientDropRows');
+        if (rows) {
+            while (rows.firstChild) {
+                rows.removeChild(rows.firstChild);
+            }
+        }
+        var dropCoverage = clientElement('policyClientDropCoverage');
+        if (dropCoverage) {
+            dropCoverage.textContent = '';
+        }
         var gaps = clientElement('policyClientDNSGaps');
         if (gaps) {
             while (gaps.firstChild) {
@@ -544,6 +554,65 @@
             .replace('{aged}', String(coverage.aged_out || 0));
     }
 
+    function renderDrops(drops) {
+        var body = clientElement('policyClientDropRows');
+        if (!body) {
+            return;
+        }
+        while (body.firstChild) {
+            body.removeChild(body.firstChild);
+        }
+        (drops.entries || []).forEach(function (drop) {
+            var row = document.createElement('tr');
+            appendCell(row, clientTokenLabel('drop_reason', drop.reason));
+            // A refusal that carried no tuple says so: an empty address is never shown as
+            // a destination the packet did not have.
+            appendCell(row, drop.has_tuple
+                ? drop.destination_ip + (drop.destination_port ? ':' + drop.destination_port : '')
+                : clientText('policy_client_drop_no_tuple'));
+            appendCell(row, drop.has_tuple
+                ? clientTokenLabel('protocol', drop.protocol)
+                : clientText('policy_client_drop_no_tuple'));
+            appendCell(row, String(drop.count || 0));
+            appendCell(row, drop.last_seen || '');
+            body.appendChild(row);
+        });
+
+        var foot = '';
+        if (!(drops.entries || []).length) {
+            foot = drops.state === 'observed'
+                ? clientText('policy_client_drop_empty')
+                : clientText('policy_client_drop_not_recorded');
+        } else if (drops.truncated) {
+            foot = clientText('policy_client_drop_truncated')
+                .replace('{shown}', String((drops.entries || []).length))
+                .replace('{total}', String(drops.total || 0));
+        }
+        renderFoot('policyClientDropFoot', foot);
+        renderDropCoverage(drops.coverage);
+    }
+
+    // The coverage line states retention and loss, so an empty page is not read as "this
+    // client was never refused".
+    function renderDropCoverage(coverage) {
+        var el = clientElement('policyClientDropCoverage');
+        if (!el) {
+            return;
+        }
+        if (!coverage) {
+            el.textContent = '';
+            return;
+        }
+        el.textContent = clientText('policy_client_drop_coverage')
+            .replace('{stored}', String(coverage.stored || 0))
+            .replace('{merged}', String(coverage.merged || 0))
+            .replace('{evicted}', String(coverage.evicted || 0))
+            .replace('{pruned}', String(coverage.pruned || 0))
+            .replace('{keys}', String(coverage.keys || 0))
+            .replace('{key_limit}', String(coverage.key_limit || 0))
+            .replace('{age}', String(coverage.age_limit_seconds || 0));
+    }
+
     function renderLimitations(limitations) {
         var list = clientElement('policyClientLimitations');
         if (!list) {
@@ -593,6 +662,7 @@
         renderDNSEvents(dns.events || []);
         renderEventCoverage(dns.event_coverage);
         renderFlows(flows.entries || []);
+        renderDrops((answer && answer.drops) || {});
         renderLimitations((answer && answer.limitations) || []);
 
         var evidenceFoot = '';

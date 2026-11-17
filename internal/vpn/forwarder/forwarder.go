@@ -153,7 +153,10 @@ type Forwarder struct {
 	// proxyReturnsUnmatched counts backend replies that reversed to no recorded flow
 	// or to another incarnation. They are counted, never credited to a guessed flow.
 	proxyReturnsUnmatched atomic.Uint64
-	clientDropsTotal      atomic.Uint64 // monotonic total of client->backend drops in forwarder
+	// clientDrops retains the bounded per-client refusals that happen BEFORE a flow
+	// exists, so the per-client answer can explain them (issue #861).
+	clientDrops      *dropLedger
+	clientDropsTotal atomic.Uint64 // monotonic total of client->backend drops in forwarder
 	// spoofedRebinds counts client→backend packets whose claimed inner
 	// source IP failed the rebind ownership guard (issue #89): outside the
 	// portal subnet or already assigned to another route. Such packets are
@@ -332,6 +335,7 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 	}
 	fwd := &Forwarder{
 		accountant:         accountant,
+		clientDrops:        newDropLedger(nil),
 		portalSubnet:       portalSubnet,
 		routesByPeer:       make(map[string]*sessionRoute),
 		routesByIP:         make(map[string]*sessionRoute),

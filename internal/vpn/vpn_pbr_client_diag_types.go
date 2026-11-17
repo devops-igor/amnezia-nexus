@@ -464,21 +464,42 @@ type ClientDiagnosisFlows struct {
 
 // ClientDiagnosisDrop is one aggregated drop record. Slice 1 retains none.
 type ClientDiagnosisDrop struct {
-	DestinationIP   string `json:"destination_ip"`
-	DestinationPort uint16 `json:"destination_port"`
+	// DestinationIP and DestinationPort are present only when the refused packet carried
+	// them. HasTuple is false for a packet too malformed to trust, so an empty address is
+	// never read as a destination of 0.0.0.0.
+	DestinationIP   string `json:"destination_ip,omitempty"`
+	DestinationPort uint16 `json:"destination_port,omitempty"`
+	HasTuple        bool   `json:"has_tuple"`
+	Protocol        string `json:"protocol,omitempty"`
 	Reason          string `json:"reason"`
 	Count           int64  `json:"count"`
+	Bytes           uint64 `json:"bytes"`
 	FirstSeen       string `json:"first_seen,omitempty"`
 	LastSeen        string `json:"last_seen,omitempty"`
 }
 
 // ClientDiagnosisDrops is the drop section.
 type ClientDiagnosisDrops struct {
-	Available bool                  `json:"available"`
-	State     string                `json:"state"`
-	Total     int                   `json:"total"`
-	Truncated bool                  `json:"truncated"`
-	Entries   []ClientDiagnosisDrop `json:"entries"`
+	Available bool   `json:"available"`
+	State     string `json:"state"`
+	Total     int    `json:"total"`
+	Truncated bool   `json:"truncated"`
+	// Coverage states what the bounded ledger holds and what it lost, so an empty page is
+	// never read as "this client was never refused".
+	Coverage ClientDiagnosisDropCoverage `json:"coverage"`
+	Entries  []ClientDiagnosisDrop       `json:"entries"`
+}
+
+// ClientDiagnosisDropCoverage reports the retention state of the pre-flow drop ledger.
+type ClientDiagnosisDropCoverage struct {
+	StartedAt       string `json:"started_at,omitempty"`
+	Stored          uint64 `json:"stored"`
+	Merged          uint64 `json:"merged"`
+	Evicted         uint64 `json:"evicted"`
+	Pruned          uint64 `json:"pruned"`
+	Keys            int    `json:"keys"`
+	KeyLimit        int    `json:"key_limit"`
+	AgeLimitSeconds int    `json:"age_limit_seconds"`
 }
 
 // ClientDiagnosisResponse is the operator-facing answer.

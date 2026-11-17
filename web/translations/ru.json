@@ -1118,5 +1118,18 @@
   "policy_client_failure_return_path_closed": "путь возврата закрыт",
   "policy_client_failure_client_write_failed": "ошибка записи клиенту",
   "policy_client_failure_client_short_write": "клиенту записан неполный пакет",
-  "policy_client_return_authority_current_tuple_association": "совпадение с потоком, которому сейчас принадлежит кортеж"
+  "policy_client_return_authority_current_tuple_association": "совпадение с потоком, которому сейчас принадлежит кортеж",
+  "policy_client_drops_label": "Отклонено до появления потока",
+  "policy_client_drops_hint": "Пакеты этого клиента, отклонённые до создания записи потока. Глобальные счётчики не относят их к клиенту; эти строки относят.",
+  "policy_client_column_drop_reason": "Причина",
+  "policy_client_column_drop_count": "Пакетов",
+  "policy_client_drop_no_tuple": "назначение не записано",
+  "policy_client_drop_empty": "За период хранения отказов этого клиента нет.",
+  "policy_client_drop_not_recorded": "Эта сборка не записывает отказы до потока.",
+  "policy_client_drop_truncated": "Показано {shown} из {total} сохранённых отказов.",
+  "policy_client_drop_coverage": "Хранится {stored} · объединено {merged} · вытеснено {evicted} · устарело {pruned} · ключей {keys}/{key_limit} · окно {age}с",
+  "policy_client_drop_reason_prohibited_destination": "запрещённое назначение",
+  "policy_client_drop_reason_invalid_client_packet": "некорректный пакет клиента",
+  "policy_client_drop_reason_nat_port_exhaustion": "исчерпание портов NAT",
+  "policy_client_drop_reason_direct_egress_unavailable": "прямой выход недоступен"
 }

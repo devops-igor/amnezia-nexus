@@ -1118,5 +1118,18 @@
   "policy_client_failure_return_path_closed": "chemin de retour fermé",
   "policy_client_failure_client_write_failed": "échec d’écriture client",
   "policy_client_failure_client_short_write": "trame client partielle",
-  "policy_client_return_authority_current_tuple_association": "associé au flux qui possède ce tuple maintenant"
+  "policy_client_return_authority_current_tuple_association": "associé au flux qui possède ce tuple maintenant",
+  "policy_client_drops_label": "Refusé avant qu'un flux existe",
+  "policy_client_drops_hint": "Paquets de ce client refusés avant tout enregistrement de flux. Les compteurs globaux ne permettent pas de les attribuer à un client ; ces lignes le font.",
+  "policy_client_column_drop_reason": "Motif",
+  "policy_client_column_drop_count": "Paquets",
+  "policy_client_drop_no_tuple": "aucune destination enregistrée",
+  "policy_client_drop_empty": "Aucun refus conservé pour ce client dans la fenêtre de rétention.",
+  "policy_client_drop_not_recorded": "Cette version n’enregistre pas les refus avant flux.",
+  "policy_client_drop_truncated": "Affichage de {shown} refus conservés sur {total}.",
+  "policy_client_drop_coverage": "Conservés {stored} · fusionnés {merged} · évincés {evicted} · expirés {pruned} · clés {keys}/{key_limit} · fenêtre {age}s",
+  "policy_client_drop_reason_prohibited_destination": "destination interdite",
+  "policy_client_drop_reason_invalid_client_packet": "paquet client malformé",
+  "policy_client_drop_reason_nat_port_exhaustion": "épuisement des ports NAT",
+  "policy_client_drop_reason_direct_egress_unavailable": "sortie directe indisponible"
 }

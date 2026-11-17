@@ -210,6 +210,12 @@ func writeFailureToken(stats *flowStats) string {
 	return ""
 }
 
+// Counter reads are weak: the return, forward and backend-write counters are independent
+// atomics, so one snapshot can show an arrival without its admission, or an admission
+// without its handoff, while the reply is still in flight. Conservation
+// (matched == admitted + dropped, admitted == delivered + failed) therefore holds for
+// settled work only, and a caller that needs it must state that it waited.
+//
 // recordReturnMatch notes one backend reply that reversed to this flow and whose owner
 // still agreed. It is arrival evidence, not delivery.
 func (s *flowStats) recordReturnMatch() {

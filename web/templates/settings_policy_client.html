@@ -140,7 +140,24 @@
         <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_limits_label" }}</div>
         <ul class="form-hint" id="policyClientLimitations" style="margin: 0; padding-inline-start: var(--space-lg);"></ul>
 
-        <p class="form-hint">{{ _ "policy_client_drops_not_recorded" }}</p>
+        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_drops_label" }}</div>
+        <p class="form-hint">{{ _ "policy_client_drops_hint" }}</p>
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th scope="col">{{ _ "policy_client_column_drop_reason" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_destination" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_transport" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_drop_count" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_last_seen" }}</th>
+                    </tr>
+                </thead>
+                <tbody id="policyClientDropRows"></tbody>
+            </table>
+        </div>
+        <p class="form-hint" id="policyClientDropFoot" hidden></p>
+        <p class="form-hint" id="policyClientDropCoverage"></p>
         <p class="form-hint"><strong>{{ _ "policy_client_application_label" }}</strong> {{ _ "policy_client_application_not_observable" }}</p>
     </div>
 </div>
