@@ -188,82 +188,123 @@ func TestBackendWriteFailureAndShortWriteAreDistinct(t *testing.T) {
 	}
 }
 
-// TestBackendWriteCreditsTheAdmittingIncarnation is the wrong-incarnation control:
-// a write outcome belongs to the flow that admitted the packet. A same-peer
-// replacement purges the admitting flow, so the late outcome must be credited to
-// nobody — never to the successor that now owns the same tuple.
-func TestBackendWriteCreditsTheAdmittingIncarnation(t *testing.T) {
-	dev := &firstWriteFailsDevice{}
-	fwd, _, peer, firstSession := proxyQueueFixture(t, dev)
+// blockedWriteDevice blocks its FIRST write until released and then either fails it
+// or completes it; later writes complete immediately. It is what makes a write that is
+// still in flight across a caller-visible replacement observable.
+type blockedWriteDevice struct {
+	entered   chan struct{}
+	release   chan struct{}
+	failFirst bool
 
-	if err := fwd.RouteClientToBackend(peer, proxyPacket("1.1.1.1", 80)); err != nil {
-		t.Fatalf("first dispatch: %v", err)
-	}
-	// Wait for the first (failing) write, then replace the session on the same peer.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && dev.sawWrites() < 1 {
-		time.Sleep(2 * time.Millisecond)
-	}
-	if dev.sawWrites() < 1 {
-		t.Fatal("the first write never happened")
-	}
-	fwd.RegisterSessionWithReturnPath("sess-backend-2", "conn-2", peer, "10.100.0.7", 31, newTestCaptureReturnPath().path)
-
-	// The admitting flow was purged with its peer: its evidence is gone, which is why
-	// the outcome cannot be inherited.
-	if list := fwd.DirectEgress().SnapshotSessionFlows(firstSession, 0, time.Now(), 0); len(list.Flows) != 0 {
-		t.Fatalf("admitting session still holds %d flows after replacement, want 0", len(list.Flows))
-	}
-
-	// The successor's own packet gets its own outcome, and only its own.
-	if err := fwd.RouteClientToBackend(peer, proxyPacket("1.1.1.1", 80)); err != nil {
-		t.Fatalf("successor dispatch: %v", err)
-	}
-	deadline = time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if flowEvidenceFor(t, fwd, "sess-backend-2", "1.1.1.1", 80).BackendWrites == 1 {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	successor := flowEvidenceFor(t, fwd, "sess-backend-2", "1.1.1.1", 80)
-	if successor.BackendWriteFailed != 0 {
-		t.Errorf("successor failure count = %d, want 0: the retired incarnation's failure was credited to it",
-			successor.BackendWriteFailed)
-	}
-	if successor.BackendWrites != 1 {
-		t.Errorf("successor writes = %d, want exactly its own one", successor.BackendWrites)
-	}
-	if successor.ForwardPackets != 1 {
-		t.Errorf("successor admissions = %d, want only its own packet", successor.ForwardPackets)
-	}
-}
-
-// firstWriteFailsDevice fails the first write and completes later ones, so a retired
-// incarnation's failure can be distinguished from a successor's success.
-type firstWriteFailsDevice struct {
 	mu    sync.Mutex
 	wrote int
 }
 
-func (d *firstWriteFailsDevice) Read(_ []byte) (int, error) { return 0, nil }
+func newBlockedWriteDevice(failFirst bool) *blockedWriteDevice {
+	return &blockedWriteDevice{entered: make(chan struct{}, 1), release: make(chan struct{}), failFirst: failFirst}
+}
 
-func (d *firstWriteFailsDevice) Write(p []byte) (int, error) {
+func (d *blockedWriteDevice) Read(_ []byte) (int, error) { return 0, nil }
+
+func (d *blockedWriteDevice) Write(p []byte) (int, error) {
+	select {
+	case d.entered <- struct{}{}:
+	default:
+	}
+	<-d.release
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.wrote++
-	if d.wrote == 1 {
+	first := d.wrote == 1
+	d.mu.Unlock()
+	if first && d.failFirst {
 		return 0, errors.New("first write refused")
 	}
 	return len(p), nil
 }
 
-func (d *firstWriteFailsDevice) Close() error { return nil }
+func (d *blockedWriteDevice) Close() error { return nil }
 
-func (d *firstWriteFailsDevice) sawWrites() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.wrote
+// TestBackendWriteDelayedOutcomeAcrossReplacement is the real delayed-ownership control:
+// the device write that belongs to the admitting flow is still BLOCKED when the session
+// is replaced (new session, or a same-session rekey), and only then completes or fails.
+// The successor's own work is queued behind it.
+//
+// The assertion is on the successor: its counters must show exactly its own write and
+// none of the retired incarnation's outcome. Resolving the owner at write time instead of
+// carrying it from admission would credit the successor and fail here.
+func TestBackendWriteDelayedOutcomeAcrossReplacement(t *testing.T) {
+	cases := []struct {
+		name        string
+		failFirst   bool
+		replacement string
+	}{
+		{"DelayedSuccessNewSession", false, "new_session"},
+		{"DelayedFailureNewSession", true, "new_session"},
+		{"DelayedSuccessRekey", false, "rekey"},
+		{"DelayedFailureRekey", true, "rekey"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dev := newBlockedWriteDevice(tc.failFirst)
+			fwd, _, peer, firstSession := proxyQueueFixture(t, dev)
+			const dst, port = "44.44.44.44", uint16(443)
+
+			if err := fwd.RouteClientToBackend(peer, proxyPacket(dst, port)); err != nil {
+				t.Fatalf("first dispatch: %v", err)
+			}
+			select {
+			case <-dev.entered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("the pump never reached the first device write")
+			}
+
+			// The write is blocked, so the admitting flow is still visible. Replace the
+			// incarnation NOW, while that write is genuinely in flight.
+			switch tc.replacement {
+			case "new_session":
+				fwd.RegisterSessionWithReturnPath("sess-backend-2", "conn-2", peer, "10.100.0.7", 31, newTestCaptureReturnPath().path)
+			case "rekey":
+				fwd.RegisterSessionWithReturnPath(firstSession, "conn-1", peer, "10.100.0.7", 31, newTestCaptureReturnPath().path)
+			}
+
+			// The successor's own packet is admitted behind the blocked write.
+			if err := fwd.RouteClientToBackend(peer, proxyPacket(dst, port)); err != nil {
+				t.Fatalf("successor dispatch: %v", err)
+			}
+
+			// Release the blocked write: the retired incarnation's outcome lands now.
+			close(dev.release)
+
+			successorSession := "sess-backend-2"
+			if tc.replacement == "rekey" {
+				successorSession = firstSession
+			}
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) {
+				list := fwd.DirectEgress().SnapshotSessionFlows(successorSession, 0, time.Now(), 0)
+				if len(list.Flows) == 1 && list.Flows[0].BackendWrites > 0 {
+					break
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+
+			list := fwd.DirectEgress().SnapshotSessionFlows(successorSession, 0, time.Now(), 0)
+			if len(list.Flows) != 1 {
+				t.Fatalf("successor flows = %d, want exactly its own", len(list.Flows))
+			}
+			got := list.Flows[0]
+			if got.BackendWrites != 1 {
+				t.Errorf("successor completions = %d, want exactly its own one", got.BackendWrites)
+			}
+			if got.BackendWriteFailed != 0 {
+				t.Errorf("successor failures = %d (%q), want 0: the retired incarnation's outcome was credited to it",
+					got.BackendWriteFailed, got.BackendWriteFailure)
+			}
+			if got.ForwardPackets != 1 {
+				t.Errorf("successor admissions = %d, want only its own packet", got.ForwardPackets)
+			}
+		})
+	}
 }
 
 // TestBackendWriteAfterDetachAttributesNothing proves drained pending work does not
