@@ -752,14 +752,7 @@ func (h *DifferentialHarness) NewClient() (*HarnessClient, error) {
 		return nil, fmt.Errorf("client tun: %w", err)
 	}
 
-	// The upstream TUN reader starts inside NewDevice, so hold its first read
-	// until the transport configuration below is applied.
-	tunGate := newFirstReadGate(vt)
-	dev := device.NewDevice(tunGate, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, "client"))
-	if err := tunGate.WaitFirstRead(firstReadStartTimeout); err != nil {
-		dev.Close()
-		return nil, fmt.Errorf("client tun reader start: %w", err)
-	}
+	dev := device.NewDevice(vt, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, "client"))
 	uapi := configToUAPI(h.t.(*testing.T), h.rawClientConfig)
 	if err := dev.IpcSet(uapi); err != nil {
 		// Closing the device closes the tun it reads from.
@@ -770,11 +763,10 @@ func (h *DifferentialHarness) NewClient() (*HarnessClient, error) {
 		dev.Close()
 		return nil, fmt.Errorf("client up: %w", err)
 	}
-	tunGate.MarkConfigured()
 
 	return &HarnessClient{
 		dev:         dev,
-		tun:         tunGate,
+		tun:         vt,
 		stack:       stack,
 		assignedIP:  assignedAddr,
 		destination: h.destinationIP,
