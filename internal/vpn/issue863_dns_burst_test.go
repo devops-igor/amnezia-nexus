@@ -710,6 +710,55 @@ func TestIssue863_AdmissionBudgetCoversProducerConcurrency(t *testing.T) {
 	}
 }
 
+// issue863ClientNetstack gives a test a real client device for one registered
+// session: UDP replies are captured, TCP frames are handed back to the client
+// stack, and packets the client sends travel through the production forwarder.
+// Cleanup unregisters the session, closes the device and joins the pump.
+func issue863ClientNetstack(t *testing.T, fwd *forwarder.Forwarder, sid, connID, peer string, ip netip.Addr) (*netstack.Net, *issue863Client) {
+	t.Helper()
+	capture := newIssue863Client()
+	dev, stack, err := netstack.CreateNetTUN([]netip.Addr{ip}, nil, 1500)
+	if err != nil {
+		t.Fatalf("create client netstack: %v", err)
+	}
+	path := forwarder.NewReturnPath(func(_, _ string, packet []byte) (int, error) {
+		capture.write("", "", packet)
+		if len(packet) > 20 && packet[9] == 6 {
+			if _, err := dev.Write([][]byte{append([]byte(nil), packet...)}, 0); err != nil {
+				return 0, err
+			}
+		}
+		return len(packet), nil
+	})
+	fwd.RegisterSessionWithReturnPath(sid, connID, peer, ip.String(), 1, path)
+	t.Cleanup(func() { fwd.BeginUnregisterSession(peer, sid).Wait() })
+
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		buffers := [][]byte{make([]byte, 1500)}
+		sizes := make([]int, 1)
+		for {
+			n, err := dev.Read(buffers, sizes, 0)
+			if err != nil {
+				return
+			}
+			if n > 0 {
+				_ = fwd.RouteClientToBackend(peer, append([]byte(nil), buffers[0][:sizes[0]]...))
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		_ = dev.Close()
+		select {
+		case <-pumpDone:
+		case <-time.After(2 * time.Second):
+			t.Error("client pump did not stop")
+		}
+	})
+	return stack, capture
+}
+
 // TestIssue863_MixedTCPAndUDPProducers is the regression for the reported mixed
 // transport case: one live TCP query holds a session slot while eight UDP queries
 // arrive from the same authenticated session. A TCP transport is a second
@@ -724,47 +773,8 @@ func TestIssue863_MixedTCPAndUDPProducers(t *testing.T) {
 	env := issue863NewEnv(t, up)
 
 	const sid, peer, ip = "issue863-mixed", "issue863-mixed-peer", "10.100.0.91"
-	capture := newIssue863Client()
-	dev, stack, err := netstack.CreateNetTUN([]netip.Addr{netip.MustParseAddr(ip)}, nil, 1500)
-	if err != nil {
-		t.Fatalf("create client netstack: %v", err)
-	}
-	path := forwarder.NewReturnPath(func(_, _ string, packet []byte) (int, error) {
-		capture.write("", "", packet)
-		if len(packet) > 20 && packet[9] == 6 {
-			if _, err := dev.Write([][]byte{append([]byte(nil), packet...)}, 0); err != nil {
-				return 0, err
-			}
-		}
-		return len(packet), nil
-	})
-	env.fwd.RegisterSessionWithReturnPath(sid, "issue863-mixed-conn", peer, ip, 1, path)
-	t.Cleanup(func() { env.fwd.BeginUnregisterSession(peer, sid).Wait() })
-
-	pumpDone := make(chan struct{})
-	go func() {
-		defer close(pumpDone)
-		buffers := [][]byte{make([]byte, 1500)}
-		sizes := make([]int, 1)
-		for {
-			n, err := dev.Read(buffers, sizes, 0)
-			if err != nil {
-				return
-			}
-			if n > 0 {
-				_ = env.fwd.RouteClientToBackend(peer, append([]byte(nil), buffers[0][:sizes[0]]...))
-			}
-		}
-	}()
-	t.Cleanup(func() {
-		_ = env.gw.Close()
-		_ = dev.Close()
-		select {
-		case <-pumpDone:
-		case <-time.After(2 * time.Second):
-			t.Error("client pump did not stop")
-		}
-	})
+	stack, capture := issue863ClientNetstack(t, env.fwd, sid, "issue863-mixed-conn", peer, netip.MustParseAddr(ip))
+	t.Cleanup(func() { _ = env.gw.Close() })
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1140,46 +1150,7 @@ func TestIssue863_ContinuityMixedTCPAndUDPProducers(t *testing.T) {
 	// One client device, so the TCP half is a real DNS-over-TCP exchange rather
 	// than a call into the server.
 	const sid, peer, ip = "issue863-continuity", "issue863-continuity-peer", "10.100.0.92"
-	capture := newIssue863Client()
-	dev, stack, err := netstack.CreateNetTUN([]netip.Addr{netip.MustParseAddr(ip)}, nil, 1500)
-	if err != nil {
-		t.Fatalf("create client netstack: %v", err)
-	}
-	path := forwarder.NewReturnPath(func(_, _ string, packet []byte) (int, error) {
-		capture.write("", "", packet)
-		if len(packet) > 20 && packet[9] == 6 {
-			if _, err := dev.Write([][]byte{append([]byte(nil), packet...)}, 0); err != nil {
-				return 0, err
-			}
-		}
-		return len(packet), nil
-	})
-	fwd.RegisterSessionWithReturnPath(sid, "issue863-continuity-conn", peer, ip, 1, path)
-	t.Cleanup(func() { fwd.BeginUnregisterSession(peer, sid).Wait() })
-
-	pumpDone := make(chan struct{})
-	go func() {
-		defer close(pumpDone)
-		buffers := [][]byte{make([]byte, 1500)}
-		sizes := make([]int, 1)
-		for {
-			n, err := dev.Read(buffers, sizes, 0)
-			if err != nil {
-				return
-			}
-			if n > 0 {
-				_ = fwd.RouteClientToBackend(peer, append([]byte(nil), buffers[0][:sizes[0]]...))
-			}
-		}
-	}()
-	t.Cleanup(func() {
-		_ = dev.Close()
-		select {
-		case <-pumpDone:
-		case <-time.After(2 * time.Second):
-			t.Error("client pump did not stop")
-		}
-	})
+	stack, capture := issue863ClientNetstack(t, fwd, sid, "issue863-continuity-conn", peer, netip.MustParseAddr(ip))
 
 	// Fill the TCP connection bound with queries held inside the upstream
 	// exchange: one in flight per connection, as a client issuing TCP retries or
