@@ -231,7 +231,7 @@ func TestRouterHappyPathThroughRealForwarder(t *testing.T) {
 	if !ok {
 		t.Fatal("backend queue missing after first packet")
 	}
-	got := <-beQueue
+	got := (<-beQueue).Bytes()
 	if string(got) != string(pkt) {
 		t.Fatalf("backend received % x, want % x", got, pkt)
 	}
@@ -449,7 +449,7 @@ func TestRouterRejectsImpossibleTotalLength(t *testing.T) {
 	}
 	select {
 	case got := <-beQueue:
-		t.Fatalf("malformed packet reached the backend queue: % x", got)
+		t.Fatalf("malformed packet reached the backend queue: % x", got.Bytes())
 	default:
 	}
 }

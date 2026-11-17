@@ -15,7 +15,7 @@ type countingRouteObserver struct {
 	calls int
 }
 
-func (o *countingRouteObserver) ObserveDNSResponse(string, *mdns.Msg, *mdns.Msg) error {
+func (o *countingRouteObserver) ObserveDNSResponse(string, QueryReceipt, *mdns.Msg, *mdns.Msg) error {
 	o.calls++
 	return nil
 }
@@ -60,13 +60,13 @@ func TestObserveResponse_SkipsObserverForRetiredScope(t *testing.T) {
 	resp := new(mdns.Msg)
 	resp.SetReply(req)
 
-	srv.ObserveResponseWithSessionID(req, resp, session, scope.SessionID, time.Now())
+	srv.ObserveResponseWithSessionID(req, resp, session, scope.SessionID, QueryReceipt{Generation: 1, Known: true}, time.Now())
 	if observer.calls != 1 {
 		t.Fatalf("live scope: observer calls = %d want 1", observer.calls)
 	}
 
 	session.Invalidate()
-	srv.ObserveResponseWithSessionID(req, resp, session, scope.SessionID, time.Now())
+	srv.ObserveResponseWithSessionID(req, resp, session, scope.SessionID, QueryReceipt{Generation: 1, Known: true}, time.Now())
 	if observer.calls != 1 {
 		t.Fatalf("retired scope: observer recorded the response (%d calls)", observer.calls)
 	}

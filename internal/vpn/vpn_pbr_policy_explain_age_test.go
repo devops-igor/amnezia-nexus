@@ -93,7 +93,7 @@ func TestExplainPolicyEvidenceAgeFollowsTheRealClock(t *testing.T) {
 	resp := explainAnswer(t, "unlisted.example", nil, []string{"198.51.201.61"})
 
 	before := time.Now()
-	if err := mem.ObserveDNSResponse("session-1", ageQuery("unlisted.example"), resp); err != nil {
+	if err := mem.ObserveDNSResponseEvidence("session-1", ageQuery("unlisted.example"), resp); err != nil {
 		t.Fatalf("observe: %v", err)
 	}
 	after := time.Now()

@@ -129,7 +129,7 @@ func (m *DirectEgressManager) retireFlowLocked(key FlowKey, entry *flowEntry, pr
 		m.releasePortLocked(entry.natPort, proto, remoteIP, key.DstPort, now)
 		delete(m.inboundNAT, inboundKey{protocol: proto, natPort: entry.natPort})
 	}
-	delete(m.flows, key)
+	m.removeFlowLocked(key)
 }
 
 func (m *DirectEgressManager) advanceNextPortLocked() uint16 {

@@ -27,6 +27,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"net"
 	"net/netip"
 	"strings"
@@ -300,14 +301,14 @@ func startEngine(t *testing.T, svc *Service, name string, peers []clientawg.Peer
 
 // awaitEngineBackendPacket drains the backend queue until a byte-exact copy
 // of want surfaces, failing at the deadline.
-func awaitEngineBackendPacket(t *testing.T, queue <-chan []byte, want []byte) {
+func awaitEngineBackendPacket(t *testing.T, queue <-chan forwarder.BackendPacket, want []byte) {
 	t.Helper()
 	deadline := time.NewTimer(engineHandshakeTimeout)
 	defer deadline.Stop()
 	for {
 		select {
-		case pkt := <-queue:
-			if bytes.Equal(pkt, want) {
+		case work := <-queue:
+			if bytes.Equal(work.Bytes(), want) {
 				return
 			}
 		case <-deadline.C:

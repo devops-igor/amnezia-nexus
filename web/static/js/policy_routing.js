@@ -605,15 +605,57 @@
         return label === key ? String(decision) : label;
     }
 
+    // policyExplainHasClientContext reports whether the answer can support any
+    // statement about this client's route. The service echoes the session whose
+    // evidence it read, and an empty echo means no client evidence was consulted
+    // at all. An answer that still lists the no-session limitation contradicts
+    // its own echo, so it is treated the same way: without client context the
+    // module may report the policy evaluation but must not name a route.
+    function policyExplainHasClientContext(answer) {
+        if (!answer || !answer.input || !answer.input.session) {
+            return false;
+        }
+        return !policyExplainListsLimitation(answer, 'evidence_requires_a_selected_session');
+    }
+
+    // policyExplainListsLimitation reports whether the answer carries one
+    // limitation token. limitations is part of the answer contract; an answer
+    // from a server that does not send it simply lists nothing.
+    function policyExplainListsLimitation(answer, token) {
+        return Array.isArray(answer && answer.limitations)
+            && answer.limitations.indexOf(token) !== -1;
+    }
+
+    // policyExplainDecisionState maps the server's decision to the readout state
+    // token. It is only meaningful when client context was inspected: without it
+    // no decision is reported as a route.
+    function policyExplainDecisionState(decision) {
+        switch (String(decision || '').toUpperCase()) {
+        case 'DIRECT':
+            return 'direct';
+        case 'PROXY':
+            return 'proxy';
+        case 'DROP':
+            return 'drop';
+        default:
+            return 'unknown';
+        }
+    }
+
     // policyExplainReasonLabel translates the machine-readable cause. The server
     // is the authority on which causes exist; a token without a translation is
     // displayed verbatim, so a new cause degrades to a readable answer instead of
-    // an empty line.
-    function policyExplainReasonLabel(reason) {
+    // an empty line. Only the session-scoped wording of no_trusted_evidence has
+    // a variant: that cause is also what an answer reaches when no session was
+    // selected, and then the evidence was not inspected rather than absent.
+    function policyExplainReasonLabel(reason, hasContext) {
         if (!reason) {
             return policyText('policy_none');
         }
         var key = 'policy_explain_reason_' + String(reason);
+        if (String(reason) === 'no_trusted_evidence' && !hasContext) {
+            key = 'policy_explain_reason_no_trusted_evidence_no_session';
+        }
         var label = policyText(key);
         return label === key ? String(reason) : label;
     }
@@ -648,11 +690,13 @@
         return policyText('policy_none');
     }
 
-    // setPolicyExplainDetail shows the rule or prefix behind the answer, naming
-    // its source. The rule match is prospective and is labelled as such: the
-    // packet path never looks at a name, so a rule only becomes this
-    // destination's route after the client's own answer is observed.
-    function setPolicyExplainDetail(answer) {
+    // setPolicyExplainDetail shows what the policy itself did, naming its source.
+    // The rule match is prospective and is labelled as such: the packet path
+    // never looks at a name, so a rule only becomes a destination's route after
+    // the client's own answer is observed. Without client context the whole line
+    // is introduced as a policy evaluation and carries the cause, because none of
+    // it is a measurement of this client's connection.
+    function setPolicyExplainDetail(answer, hasContext) {
         var el = policyElement('policyExplainDetail');
         if (!el) {
             return;
@@ -670,12 +714,21 @@
                 .replace('{prefix}', answer.prefix.prefix || '')
                 .replace('{source}', policyExplainSource(answer.prefix.sources)));
         }
+        if (!hasContext && answer && answer.reason) {
+            parts.unshift(policyExplainReasonLabel(answer.reason, false));
+        }
         if (parts.length === 0) {
             el.textContent = '';
             el.hidden = true;
             return;
         }
-        el.textContent = parts.join(' · ');
+        if (hasContext) {
+            el.textContent = parts.join(' · ');
+        } else {
+            // The label introduces the whole line, so the first part follows it as
+            // prose; the remaining parts stay separated.
+            el.textContent = policyText('policy_explain_policy_evaluation_label') + ' ' + parts.join(' · ');
+        }
         el.hidden = false;
     }
 
@@ -699,7 +752,7 @@
             button.setAttribute('aria-busy', 'true');
         }
         setPolicyExplainResult(policyText('policy_explain_running'), '');
-        setPolicyExplainDetail(null);
+        setPolicyExplainDetail(null, false);
         try {
             var answer = await policyRequest(EXPLAIN_ENDPOINT, {
                 method: 'POST',
@@ -708,23 +761,28 @@
             var normalized = answer && answer.input && answer.input.normalized
                 ? answer.input.normalized
                 : value;
-            var result = policyText('policy_explain_result')
-                .replace('{value}', normalized)
-                .replace('{decision}', policyExplainDecisionLabel(answer && answer.decision))
-                .replace('{reason}', policyExplainReasonLabel(answer && answer.reason));
-            var state = 'proxy';
-            if (answer && answer.decision === 'DIRECT') {
-                state = 'direct';
-            } else if (answer && answer.decision === 'UNKNOWN') {
-                state = 'unknown';
-            } else if (answer && answer.decision === 'DROP') {
-                state = 'drop';
+            var hasContext = policyExplainHasClientContext(answer);
+            var result;
+            var state;
+            if (hasContext) {
+                result = policyText('policy_explain_result')
+                    .replace('{value}', normalized)
+                    .replace('{decision}', policyExplainDecisionLabel(answer && answer.decision))
+                    .replace('{reason}', policyExplainReasonLabel(answer && answer.reason, true));
+                state = policyExplainDecisionState(answer && answer.decision);
+            } else {
+                // No client evidence was read, so no route may be named: the
+                // headline says the route is not determined and the policy
+                // evaluation is rendered separately below.
+                result = policyText('policy_explain_result_no_context')
+                    .replace('{value}', normalized);
+                state = 'no-context';
             }
             setPolicyExplainResult(result, state);
-            setPolicyExplainDetail(answer);
+            setPolicyExplainDetail(answer, hasContext);
             return answer;
         } catch (err) {
-            setPolicyExplainDetail(null);
+            setPolicyExplainDetail(null, false);
             setPolicyExplainResult(policyText('policy_explain_failed') + ': ' + policyErrorDetail(err), 'error');
             return null;
         } finally {

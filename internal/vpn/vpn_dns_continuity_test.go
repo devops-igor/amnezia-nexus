@@ -248,7 +248,8 @@ func TestPolicyDNSContinuity_ServesIssuedGatewayProfileAfterDisable(t *testing.T
 		t.Fatal("fixture backend queue absent")
 	}
 	select {
-	case pkt := <-backend:
+	case pktWork := <-backend:
+		pkt := pktWork.Bytes()
 		if got := netip.AddrFrom4([4]byte{pkt[16], pkt[17], pkt[18], pkt[19]}); got != external.Addr() {
 			t.Fatalf("backend packet destination = %s, want the external resolver %s", got, external.Addr())
 		}

@@ -457,7 +457,8 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 
 		// Attached proxy consumer: read from backend queue and route return packet via authentic RouteBackendToClient
 		select {
-		case proxyPkt := <-beQueue:
+		case proxyPktWork := <-beQueue:
+			proxyPkt := proxyPktWork.Bytes()
 			if len(proxyPkt) < 28 || string(proxyPkt[28:]) != "to-proxy" {
 				t.Fatalf("unexpected proxy payload: %q", string(proxyPkt))
 			}

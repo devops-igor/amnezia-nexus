@@ -1,0 +1,178 @@
+{{ define "settings_policy_client" }}
+{{ if is_admin .current_user }}
+<div class="card settings-section-card" id="policyClientCard" style="margin-top: var(--space-lg);">
+    <div class="settings-card-header" style="display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm);">
+        <div style="display: flex; align-items: center; gap: var(--space-sm);">
+            <svg class="icon"><use href="#icon-users"></use></svg>
+            <h3 class="card-title">{{ _ "policy_client_title" }}</h3>
+        </div>
+        <button type="button" class="btn btn-secondary" id="policyClientRefreshBtn" style="display: flex; align-items: center; gap: var(--space-sm);">
+            <svg class="icon"><use href="#icon-refresh"></use></svg>
+            <span id="policyClientRefreshText">{{ _ "policy_client_refresh_btn" }}</span>
+            <span class="spinner hidden" id="policyClientRefreshSpinner" aria-hidden="true"></span>
+        </button>
+    </div>
+
+    <p class="form-hint">{{ _ "policy_client_hint" }}</p>
+
+    <div id="policyClientAlert" role="status" aria-live="polite" aria-atomic="true" style="display: none; padding: var(--space-sm) var(--space-md); border-radius: var(--radius-sm); margin-bottom: var(--space-md); font-size: 0.85rem;"></div>
+
+    <div class="form-group">
+        <label class="form-label" for="policyClientSelect">{{ _ "policy_client_select_label" }}</label>
+        <select class="form-input" id="policyClientSelect" aria-describedby="policyClientSelectHint">
+            <option value="">{{ _ "policy_client_select_placeholder" }}</option>
+        </select>
+        <p class="form-hint" id="policyClientSelectHint">{{ _ "policy_client_select_hint" }}</p>
+    </div>
+
+    <div style="display: flex; flex-wrap: wrap; gap: var(--space-sm); align-items: center;">
+        <button type="button" class="btn btn-primary" id="policyClientDiagnoseBtn" disabled style="display: flex; align-items: center; gap: var(--space-sm);">
+            <svg class="icon"><use href="#icon-search"></use></svg>
+            <span id="policyClientDiagnoseText">{{ _ "policy_client_diagnose_btn" }}</span>
+            <span class="spinner hidden" id="policyClientDiagnoseSpinner" aria-hidden="true"></span>
+        </button>
+        <span class="form-hint" id="policyClientStatus" role="status" aria-live="polite"></span>
+    </div>
+
+    <div id="policyClientResult" hidden>
+        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_selection_label" }}</div>
+        <div class="info-card-grid">
+            <div class="info-card-item">
+                <span class="info-card-label">{{ _ "policy_client_field_session" }}</span>
+                <span class="info-card-value font-mono" id="policyClientSessionValue">-</span>
+            </div>
+            <div class="info-card-item">
+                <span class="info-card-label">{{ _ "policy_client_field_state" }}</span>
+                <span class="info-card-value" id="policyClientStateValue">-</span>
+            </div>
+            <div class="info-card-item">
+                <span class="info-card-label">{{ _ "policy_client_field_generation" }}</span>
+                <span class="info-card-value font-mono" id="policyClientGenerationValue">-</span>
+            </div>
+            <div class="info-card-item">
+                <span class="info-card-label">{{ _ "policy_client_field_evaluated" }}</span>
+                <span class="info-card-value font-mono" id="policyClientEvaluatedValue">-</span>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label class="form-label" for="policyClientDestinationFilter">{{ _ "policy_client_filter_label" }}</label>
+            <input class="form-input" type="search" id="policyClientDestinationFilter" autocomplete="off" aria-describedby="policyClientFilterHint">
+            <p class="form-hint" id="policyClientFilterHint">{{ _ "policy_client_filter_hint" }}</p>
+        </div>
+        <p class="form-hint" id="policyClientFilterFoot" hidden></p>
+
+        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_evidence_label" }}</div>
+        <p class="form-hint">{{ _ "policy_client_evidence_hint" }}</p>
+        <div class="table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th scope="col">{{ _ "policy_client_column_address" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_decision" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_observed" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_expires" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_state" }}</th>
+                    </tr>
+                </thead>
+                <tbody id="policyClientEvidenceRows"></tbody>
+            </table>
+        </div>
+        <p class="form-hint" id="policyClientEvidenceFoot" hidden></p>
+
+        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_flows_label" }}</div>
+        <p class="form-hint">{{ _ "policy_client_flows_hint" }}</p>
+        <div class="table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th scope="col">{{ _ "policy_client_column_protocol" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_destination" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_choice" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_decision" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_names" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_outcome" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_last_seen" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_state" }}</th>
+                    </tr>
+                </thead>
+                <tbody id="policyClientFlowRows"></tbody>
+            </table>
+        </div>
+        <p class="form-hint" id="policyClientFlowFoot" hidden></p>
+
+        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_dns_label" }}</div>
+        <p class="form-hint">{{ _ "policy_client_dns_hint" }}</p>
+        <div class="table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th scope="col">{{ _ "policy_client_column_name" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_type" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_addresses" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_observed" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_expires" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_count" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_policy_generation" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_state" }}</th>
+                    </tr>
+                </thead>
+                <tbody id="policyClientDNSRows"></tbody>
+            </table>
+        </div>
+        <p class="form-hint" id="policyClientDNSFoot" hidden></p>
+        <p class="form-hint" id="policyClientDNSCoverage"></p>
+        <ul class="form-hint" id="policyClientDNSGaps" style="margin: 0; padding-inline-start: var(--space-lg);"></ul>
+
+        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_dns_events_label" }}</div>
+        <p class="form-hint">{{ _ "policy_client_dns_events_hint" }}</p>
+        <div class="table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th scope="col">{{ _ "policy_client_column_name" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_type" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_result" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_transport" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_received" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_answered" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_delivered" }}</th>
+                    </tr>
+                </thead>
+                <tbody id="policyClientEventRows"></tbody>
+            </table>
+        </div>
+        <p class="form-hint" id="policyClientEventFoot" hidden></p>
+        <p class="form-hint" id="policyClientEventCoverage"></p>
+
+        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_limits_label" }}</div>
+        <p class="form-hint">{{ _ "policy_client_not_covered_label" }}</p>
+        <ul class="form-hint" id="policyClientNotCovered" style="margin: 0; padding-inline-start: var(--space-lg);"></ul>
+        <p class="form-hint">{{ _ "policy_client_limitations_label" }}</p>
+        <ul class="form-hint" id="policyClientLimitations" style="margin: 0; padding-inline-start: var(--space-lg);"></ul>
+
+        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_drops_label" }}</div>
+        <p class="form-hint">{{ _ "policy_client_drops_hint" }}</p>
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th scope="col">{{ _ "policy_client_column_drop_reason" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_destination" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_transport" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_drop_count" }}</th>
+                        <th scope="col">{{ _ "policy_client_column_last_seen" }}</th>
+                    </tr>
+                </thead>
+                <tbody id="policyClientDropRows"></tbody>
+            </table>
+        </div>
+        <p class="form-hint" id="policyClientDropFoot" hidden></p>
+        <p class="form-hint" id="policyClientDropCoverage"></p>
+        <p class="form-hint"><strong>{{ _ "policy_client_application_label" }}</strong> {{ _ "policy_client_application_not_observable" }}</p>
+    </div>
+</div>
+<script src="/static/js/policy_client_diag_filter.js"></script>
+<script src="/static/js/policy_client_diag.js"></script>
+{{ end }}
+{{ end }}

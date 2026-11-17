@@ -1,7 +1,6 @@
 package forwarder
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -559,7 +558,7 @@ func TestRetiredRouteRejectsWriteSelectedBeforeRetirement(t *testing.T) {
 			// was suspended immediately before writeClientPacket admission.
 			go func() {
 				<-resume
-				f.writeClientPacket(oldRoute, dev, []byte("stale"))
+				f.writeClientPacket(oldRoute, dev, []byte("stale"), nil)
 				close(done)
 			}()
 			if replace {
@@ -577,7 +576,7 @@ func TestRetiredRouteRejectsWriteSelectedBeforeRetirement(t *testing.T) {
 				t.Fatal("retired generation admitted a stale write")
 			}
 			if replace {
-				f.writeClientPacket(f.routesByPeer["peer"], dev, []byte("current"))
+				f.writeClientPacket(f.routesByPeer["peer"], dev, []byte("current"), nil)
 				if dev.writeCount() != 1 {
 					t.Fatal("replacement generation cannot write")
 				}
@@ -693,7 +692,7 @@ func TestPerRouteWriteTelemetrySeparatesDifferentConsumers(t *testing.T) {
 	done := make(chan struct{})
 	defer func() { blocked.release(); <-done }()
 	go func() {
-		f.writeClientPacket(f.routesByPeer["peer-b"], blocked, []byte("blocked-b"))
+		f.writeClientPacket(f.routesByPeer["peer-b"], blocked, []byte("blocked-b"), nil)
 		close(done)
 	}()
 	select {
@@ -711,71 +710,50 @@ func TestPerRouteWriteTelemetrySeparatesDifferentConsumers(t *testing.T) {
 	}
 	blocked.release()
 	<-done
-	f.writeClientPacket(f.routesByPeer["peer-a"], failed, []byte("failed-a"))
+	f.writeClientPacket(f.routesByPeer["peer-a"], failed, []byte("failed-a"), nil)
 	stats = f.AllRouteQueueStats()
 	if stats["peer-a"].WriteErrors != 1 || stats["peer-b"].WriteErrors != 0 || stats["peer-b"].WriteStalls != 1 || stats["peer-b"].WritesInFlight != 0 {
 		t.Fatalf("completed writes attributed incorrectly: %+v", stats)
 	}
 }
 
-type pacedQueueDevice struct {
-	permits chan struct{}
-	started chan struct{}
-	written chan struct{}
-}
-
-func (d *pacedQueueDevice) Read([]byte) (int, error) { return 0, nil }
-func (d *pacedQueueDevice) Close() error             { return nil }
-func (d *pacedQueueDevice) Write(packet []byte) (int, error) {
-	d.started <- struct{}{}
-	<-d.permits
-	time.Sleep(100 * time.Microsecond)
-	d.written <- struct{}{}
-	return len(packet), nil
-}
-
 func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 	const capacity = 32
-	f := NewForwarder(nil, "10.100.0.0/16", capacity)
-	dev := &pacedQueueDevice{
-		permits: make(chan struct{}, capacity+1),
-		started: make(chan struct{}, capacity+1),
-		written: make(chan struct{}, capacity+1),
-	}
-	path := NewReturnPath(func(_, _ string, p []byte) (int, error) { return dev.Write(p) })
-	f.RegisterSessionWithReturnPath("session", "connection", "peer", "10.100.0.10", 1, path)
-	f.StartPumps(t.Context())
-	defer f.StopPumps()
-	defer close(dev.permits)
-	packet := returnPacket("10.100.0.10")
-	if len(packet) < 1420 {
-		pad := make([]byte, 1420-len(packet))
-		packet = append(packet, pad...)
-		binary.BigEndian.PutUint16(packet[2:4], 1420)
-	}
-	wait := func(ch <-chan struct{}, count int) {
+	// One route and one pump behind the paced device, with a bounded recorder shared with its
+	// own tests in stall_recorder_test.go. The device records its write phases as they happen;
+	// draining the acknowledgement channels below only counts observations. Cleanup releases
+	// held writes and drains acknowledgements before joining the pump, also on a failure.
+	x := newRecorderFixture(t, capacity, 64)
+	f, dev, recorder, packet := x.f, x.dev, x.rec, x.packet
+
+	wait := func(ch <-chan phaseSignal, count int, observe func()) {
 		t.Helper()
 		timeout := time.NewTimer(3 * time.Second)
 		defer timeout.Stop()
 		for i := 0; i < count; i++ {
 			select {
 			case <-ch:
+				observe()
 			case <-timeout.C:
-				t.Fatalf("device stalled after %d/%d events", i, count)
+				t.Fatalf("device stalled after %d/%d events (%s)", i, count, recorder.Report(recorder.HeadOfLine()))
 			}
 		}
 	}
 	enqueue := func() {
 		t.Helper()
+		// Admission is recorded before the packet is handed over, so the device can never
+		// start a write whose admission the recorder has not seen.
+		recorder.Enqueue(time.Now())
 		if err := f.RouteBackendToClient(1, packet, "10.100.0.10"); err != nil {
 			t.Fatalf("unexpected overflow during healthy traffic: %v", err)
 		}
 	}
+	observeStarted := recorder.ObserveStarted
 	release := func(count int) {
 		for i := 0; i < count; i++ {
 			dev.permits <- struct{}{}
 		}
-		wait(dev.written, count)
+		wait(dev.written, count, recorder.ObserveWritten)
 	}
 	var accepted, drops int64
 	for cycle := 0; cycle < 3; cycle++ {
@@ -788,11 +766,11 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 				accepted++
 			}
 			release(capacity / 2)
-			wait(dev.started, capacity/2)
+			wait(dev.started, capacity/2, observeStarted)
 		}
 		enqueue()
 		accepted++
-		wait(dev.started, 1)
+		wait(dev.started, 1, observeStarted)
 		for i := 0; i < capacity; i++ {
 			enqueue()
 			accepted++
@@ -808,12 +786,16 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 			t.Fatalf("stall metrics: %+v, drops=%d", stats, drops)
 		}
 		release(capacity + 1)
-		wait(dev.started, capacity)
+		wait(dev.started, capacity, observeStarted)
 		if occupancy, _, peak := f.AggregateQueueStats(); occupancy != 0 || peak != capacity {
 			t.Fatalf("recovery occupancy=%d peak=%d", occupancy, peak)
 		}
 	}
 	f.StopPumps() // all write metrics must be published before inspecting them
+	// Every accepted packet was admitted, written and attributed to its own sequence number.
+	if c := recorder.Counts(); c.Enqueued != int(accepted) || c.Written != int(accepted) || c.Unattributed != 0 {
+		t.Fatalf("recorder lost attribution: %+v, accepted=%d (%s)", c, accepted, recorder.Report(recorder.HeadOfLine()))
+	}
 	if _, tx, _ := f.GetStats(); tx != accepted*int64(len(packet)) {
 		t.Fatalf("accepted byte accounting=%d, want %d", tx, accepted*int64(len(packet)))
 	}

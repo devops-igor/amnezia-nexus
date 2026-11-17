@@ -89,7 +89,7 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 
 	// Ensure backend queue exists
 	if _, ok := f.backendQueues[backendTunnelID]; !ok {
-		f.backendQueues[backendTunnelID] = make(chan []byte, f.backendBufSize)
+		f.backendQueues[backendTunnelID] = make(chan BackendPacket, f.backendBufSize)
 		f.ensureBackendTrafficLocked(backendTunnelID)
 	}
 
@@ -109,7 +109,7 @@ func (f *Forwarder) registerSessionLocked(sessionID, connectionID, peerKey, assi
 		peerKey:         peerKey,
 		assignedIP:      assignedIP,
 		backendTunnelID: backendTunnelID,
-		clientQueue:     make(chan []byte, f.bufSize),
+		clientQueue:     make(chan ClientPacket, f.bufSize),
 		queueReady:      make(chan struct{}, 1),
 		stopCh:          make(chan struct{}),
 		limitDownBps:    limitDownBps,
@@ -240,6 +240,9 @@ func (f *Forwarder) beginUnregisterSession(peerKey, sessionID string) (retiremen
 		f.stopRoutePumpLocked(route)
 		f.drainRouteQueueLocked(route)
 		f.changeQueueCapacityLocked(-cap(route.clientQueue))
+		// The session's pre-flow refusals end with the session, so a later read cannot
+		// resurrect evidence for a client that is gone.
+		f.clientDrops.ForgetSession(route.sessionID)
 		if f.directEgress != nil {
 			f.directEgress.PurgePeer(peerKey)
 		}
@@ -297,7 +300,7 @@ func (f *Forwarder) UpdateSessionBackend(peerKey string, newBackendTunnelID int6
 	}
 
 	if _, ok := f.backendQueues[newBackendTunnelID]; !ok {
-		f.backendQueues[newBackendTunnelID] = make(chan []byte, f.backendBufSize)
+		f.backendQueues[newBackendTunnelID] = make(chan BackendPacket, f.backendBufSize)
 		f.ensureBackendTrafficLocked(newBackendTunnelID)
 	}
 
@@ -322,6 +325,7 @@ func (f *Forwarder) retireRoutesMatchingLocked(predicate func(*sessionRoute) boo
 		f.stopRoutePumpLocked(route)
 		f.drainRouteQueueLocked(route)
 		f.changeQueueCapacityLocked(-cap(route.clientQueue))
+		f.clientDrops.ForgetSession(route.sessionID)
 		if f.directEgress != nil {
 			f.directEgress.PurgePeer(route.peerKey)
 		}

@@ -249,6 +249,12 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 		"policy_explain_reason_expired_evidence", "policy_explain_reason_evicted_evidence",
 		"policy_explain_reason_stale_evidence_generation", "policy_explain_reason_no_trusted_evidence",
 		"policy_explain_reason_no_usable_address", "policy_explain_reason_name_unresolved",
+		// The no-client-context result line, the label that separates policy
+		// evaluation from a measured route, and the cause variant selected when
+		// no session was read.
+		"policy_explain_result_no_context",
+		"policy_explain_policy_evaluation_label",
+		"policy_explain_reason_no_trusted_evidence_no_session",
 	} {
 		keys[key] = true
 	}

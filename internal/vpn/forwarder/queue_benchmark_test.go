@@ -62,7 +62,7 @@ func BenchmarkBackendToClientManyRoutes(b *testing.B) {
 		b.Run(fmt.Sprintf("routes=%d", routes), func(b *testing.B) {
 			f := NewForwarder(nil, "10.100.0.0/16", 32)
 			ips := make([]string, routes)
-			queues := make([]<-chan []byte, routes)
+			queues := make([]<-chan ClientPacket, routes)
 			for i := range routes {
 				peer := fmt.Sprintf("peer-%d", i)
 				ips[i] = fmt.Sprintf("10.100.%d.%d", i/254, i%254+1)
