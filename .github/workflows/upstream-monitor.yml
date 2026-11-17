@@ -166,9 +166,9 @@ jobs:
           m_tools = re.search(r'PinnedAWGToolsVersion\s*=\s*"([^"]+)"', svc_code)
           m_img = re.search(r'PinnedAWGBaseImage\s*=\s*"([^"]+)"', svc_code)
 
-          pinned_go = m_go.group(1) if m_go else "v3.1.20260828"
+          pinned_go = m_go.group(1) if m_go else "v3.1.20261116"
           pinned_tools = m_tools.group(1) if m_tools else "v3.1.20260812"
-          pinned_base_image = m_img.group(1) if m_img else "devopsigor/amneziawg:v3.1.20260828-1"
+          pinned_base_image = m_img.group(1) if m_img else "devopsigor/amneziawg:v3.1.20261116-1"
           pinned_base_tag = pinned_base_image.split(":")[-1] if ":" in pinned_base_image else pinned_base_image
 
           go_mod_version = None

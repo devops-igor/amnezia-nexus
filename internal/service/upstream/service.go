@@ -15,9 +15,9 @@ import (
 
 // Pinned upstream component versions and container base image.
 const (
-	PinnedAWGGoVersion    = "v3.1.20260828"
+	PinnedAWGGoVersion    = "v3.1.20261116"
 	PinnedAWGToolsVersion = "v3.1.20260812"
-	PinnedAWGBaseImage    = "devopsigor/amneziawg:v3.1.20260828-1"
+	PinnedAWGBaseImage    = "devopsigor/amneziawg:v3.1.20261116-1"
 
 	DefaultDockerRepo    = "devopsigor/amneziawg"
 	DefaultDockerBaseURL = "https://hub.docker.com/v2"
