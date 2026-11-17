@@ -220,6 +220,7 @@ CREATE TABLE IF NOT EXISTS notification_producer_state (
     producer TEXT NOT NULL,
     entity_key TEXT NOT NULL,
     state TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (producer, entity_key)
 );

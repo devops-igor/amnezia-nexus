@@ -26,11 +26,12 @@ type ObserverOptions struct {
 // reachability comes from the existing probe cache and backend health comes from
 // the persisted backend tunnel rows.
 type Observer struct {
-	db       *database.DB
-	notifier *Service
-	interval time.Duration
-	now      func() time.Time
-	logger   *slog.Logger
+	db        *database.DB
+	notifier  *Service
+	interval  time.Duration
+	now       func() time.Time
+	startedAt time.Time
+	logger    *slog.Logger
 
 	mu      sync.Mutex
 	cancel  context.CancelFunc
@@ -49,11 +50,12 @@ func NewObserver(db *database.DB, notifier *Service, opts ObserverOptions) *Obse
 		now = time.Now
 	}
 	return &Observer{
-		db:       db,
-		notifier: notifier,
-		interval: interval,
-		now:      now,
-		logger:   slog.Default().With("component", "notification-observer"),
+		db:        db,
+		notifier:  notifier,
+		interval:  interval,
+		now:       now,
+		startedAt: now(),
+		logger:    slog.Default().With("component", "notification-observer"),
 	}
 }
 
@@ -137,6 +139,63 @@ func (o *Observer) ObserveOnce(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// publishObservedState reads the durable producer state and either records a
+// baseline or commits the state change together with its event. firstObservation
+// allows a newly created entity (not a historical row after restart) to announce
+// an already-terminal state.
+func (o *Observer) publishObservedState(
+	ctx context.Context,
+	producer, entityKey, state string,
+	firstObservation bool,
+	build func(previous string) (models.NotificationEvent, bool),
+) error {
+	previous, generation, found, err := o.db.ReadNotificationProducerState(ctx, producer, entityKey)
+	if err != nil {
+		return err
+	}
+	if !found {
+		if !firstObservation {
+			return o.recordStateBaseline(ctx, producer, entityKey, state)
+		}
+		event, ok := build("")
+		if !ok {
+			return o.recordStateBaseline(ctx, producer, entityKey, state)
+		}
+		event.EventKey = TransitionEventKey(producer, entityKey, 1, state)
+		_, err = o.notifier.PublishTransition(ctx, []database.NotificationTransition{{
+			Producer: producer, EntityKey: entityKey, State: state,
+		}}, event)
+		if errors.Is(err, database.ErrNotificationTransitionStale) {
+			return nil
+		}
+		return err
+	}
+	if previous == state {
+		return nil
+	}
+	event, ok := build(previous)
+	if !ok {
+		return o.recordStateBaseline(ctx, producer, entityKey, state)
+	}
+	event.EventKey = TransitionEventKey(producer, entityKey, generation+1, state)
+	_, err = o.notifier.PublishTransition(ctx, []database.NotificationTransition{{
+		Producer:           producer,
+		EntityKey:          entityKey,
+		PreviousState:      previous,
+		ExpectedGeneration: generation,
+		State:              state,
+	}}, event)
+	if errors.Is(err, database.ErrNotificationTransitionStale) {
+		return nil
+	}
+	return err
+}
+
+func (o *Observer) recordStateBaseline(ctx context.Context, producer, entityKey, state string) error {
+	_, _, err := o.db.AdvanceNotificationProducerState(ctx, producer, entityKey, state)
+	return err
+}
+
 func (o *Observer) observeProvisioning(ctx context.Context) error {
 	var errs []error
 	if err := o.observeOrders(ctx); err != nil {
@@ -153,18 +212,22 @@ func (o *Observer) observeOrders(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fetch gigahost orders for notifications: %w", err)
 	}
+	cutoff, err := o.provisioningBaseline(ctx)
+	if err != nil {
+		return err
+	}
 	for _, order := range orders {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := o.observeOrder(ctx, order); err != nil {
+		if err := o.observeOrder(ctx, order, cutoff); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (o *Observer) observeOrder(ctx context.Context, order models.GigahostOrder) error {
+func (o *Observer) observeOrder(ctx context.Context, order models.GigahostOrder, cutoff time.Time) error {
 	if strings.TrimSpace(order.OrderID) == "" {
 		return nil
 	}
@@ -172,19 +235,31 @@ func (o *Observer) observeOrder(ctx context.Context, order models.GigahostOrder)
 	if state == "" {
 		return nil
 	}
-	previous, changed, err := o.db.AdvanceNotificationProducerState(ctx, "gigahost_order", order.OrderID, state)
+	return o.publishObservedState(ctx, "gigahost_order", order.OrderID, state, !order.CreatedAt.IsZero() && !order.CreatedAt.Before(cutoff),
+		func(previous string) (models.NotificationEvent, bool) {
+			return orderTransitionEvent(order, previous, state, o.now())
+		})
+}
+
+// provisioningBaseline is the durable cutoff between historical ledger rows and
+// orders/jobs created while notifications were active. It survives a restart, so
+// a failed event insert can still be announced on the next pass instead of being
+// reclassified as history.
+func (o *Observer) provisioningBaseline(ctx context.Context) (time.Time, error) {
+	state, _, found, err := o.db.ReadNotificationProducerState(ctx, "observer_meta", "provisioning_baseline")
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
-	if !changed || previous == "" || previous == state {
-		return nil
+	if found {
+		if parsed, parseErr := time.Parse(time.RFC3339Nano, state); parseErr == nil {
+			return parsed.UTC(), nil
+		}
 	}
-	event, ok := orderTransitionEvent(order, previous, state, o.now())
-	if !ok {
-		return nil
+	cutoff := o.startedAt.UTC()
+	if _, _, err := o.db.AdvanceNotificationProducerState(ctx, "observer_meta", "provisioning_baseline", cutoff.Format(time.RFC3339Nano)); err != nil {
+		return time.Time{}, err
 	}
-	_, err = o.notifier.Publish(ctx, event)
-	return err
+	return cutoff, nil
 }
 
 func (o *Observer) observeSetupIntents(ctx context.Context) error {
@@ -192,35 +267,30 @@ func (o *Observer) observeSetupIntents(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fetch gigahost setup intents for notifications: %w", err)
 	}
+	cutoff, err := o.provisioningBaseline(ctx)
+	if err != nil {
+		return err
+	}
 	for _, intent := range intents {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := o.observeSetupIntent(ctx, intent); err != nil {
+		if err := o.observeSetupIntent(ctx, intent, cutoff); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (o *Observer) observeSetupIntent(ctx context.Context, intent models.GigahostSetupIntent) error {
+func (o *Observer) observeSetupIntent(ctx context.Context, intent models.GigahostSetupIntent, cutoff time.Time) error {
 	if strings.TrimSpace(intent.OrderID) == "" {
 		return nil
 	}
 	state := setupObservationState(intent)
-	previous, changed, err := o.db.AdvanceNotificationProducerState(ctx, "gigahost_setup", intent.OrderID, state)
-	if err != nil {
-		return err
-	}
-	if !changed || previous == "" || previous == state {
-		return nil
-	}
-	event, ok := setupTransitionEvent(intent, previous, state, o.now())
-	if !ok {
-		return nil
-	}
-	_, err = o.notifier.Publish(ctx, event)
-	return err
+	return o.publishObservedState(ctx, "gigahost_setup", intent.OrderID, state, !intent.CreatedAt.IsZero() && !intent.CreatedAt.Before(cutoff),
+		func(previous string) (models.NotificationEvent, bool) {
+			return setupTransitionEvent(intent, previous, state, o.now())
+		})
 }
 
 func orderTransitionEvent(order models.GigahostOrder, previous, state string, now time.Time) (models.NotificationEvent, bool) {
@@ -385,20 +455,10 @@ func (o *Observer) observeServer(ctx context.Context, server models.Server) erro
 		// outage. Wait for an authoritative probe result.
 		return nil
 	}
-	state := string(status)
-	previous, changed, err := o.db.AdvanceNotificationProducerState(ctx, "server_reachability", fmt.Sprintf("%d", server.ID), state)
-	if err != nil {
-		return err
-	}
-	if !changed || previous == "" || previous == state {
-		return nil
-	}
-	event, ok := serverTransitionEvent(server, previous, status, o.now())
-	if !ok {
-		return nil
-	}
-	_, err = o.notifier.Publish(ctx, event)
-	return err
+	return o.publishObservedState(ctx, "server_reachability", fmt.Sprintf("%d", server.ID), string(status), false,
+		func(previous string) (models.NotificationEvent, bool) {
+			return serverTransitionEvent(server, previous, status, o.now())
+		})
 }
 
 func serverTransitionEvent(server models.Server, previous string, status models.ReachabilityStatus, now time.Time) (models.NotificationEvent, bool) {
@@ -442,18 +502,11 @@ func (o *Observer) observeBackends(ctx context.Context) error {
 			return ctx.Err()
 		}
 		state := classifyBackendState(tunnel)
-		previous, changed, err := o.db.AdvanceNotificationProducerState(ctx, "backend_health", fmt.Sprintf("%d", tunnel.ID), state)
+		err := o.publishObservedState(ctx, "backend_health", fmt.Sprintf("%d", tunnel.ID), state, false,
+			func(previous string) (models.NotificationEvent, bool) {
+				return backendTransitionEvent(tunnel, previous, state, o.now())
+			})
 		if err != nil {
-			return err
-		}
-		if !changed || previous == "" {
-			continue
-		}
-		event, ok := backendTransitionEvent(tunnel, previous, state, o.now())
-		if !ok {
-			continue
-		}
-		if _, err := o.notifier.Publish(ctx, event); err != nil {
 			return err
 		}
 	}
@@ -565,9 +618,6 @@ func (o *Observer) observeProtocolCapacity(ctx context.Context) error {
 	}
 	seen := make(map[string]bool, len(activeProtocols))
 	for _, raw := range activeProtocols {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
 		protocol := models.NormalizeProtocol(raw)
 		if seen[protocol] {
 			continue
@@ -590,19 +640,10 @@ func (o *Observer) observeProtocol(ctx context.Context, protocol string, hasElig
 	if hasEligible {
 		state = "available"
 	}
-	previous, changed, err := o.db.AdvanceNotificationProducerState(ctx, "protocol_capacity", protocol, state)
-	if err != nil {
-		return err
-	}
-	if !changed || previous == "" || previous == state {
-		return nil
-	}
-	event, ok := protocolCapacityEvent(protocol, previous, state, o.now())
-	if !ok {
-		return nil
-	}
-	_, err = o.notifier.Publish(ctx, event)
-	return err
+	return o.publishObservedState(ctx, "protocol_capacity", protocol, state, false,
+		func(previous string) (models.NotificationEvent, bool) {
+			return protocolCapacityEvent(protocol, previous, state, o.now())
+		})
 }
 
 func (o *Observer) protocolEligibility(ctx context.Context) (eligible map[string]bool, unknown map[string]bool, err error) {

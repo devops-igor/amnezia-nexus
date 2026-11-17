@@ -178,6 +178,49 @@ func deliveryDecision(settings models.NotificationSettings, event models.Notific
 	}
 }
 
+// PublishTransition commits the producer state change and its event in one
+// database transaction. A failed event insert rolls the state change back, so the
+// observer retries the same transition instead of losing it. The caller must set
+// EventKey to TransitionEventKey for the generation it observed.
+func (s *Service) PublishTransition(ctx context.Context, transitions []database.NotificationTransition, event models.NotificationEvent) (PublishResult, error) {
+	if s.db == nil {
+		return PublishResult{}, errors.New("notification store is not configured")
+	}
+	now := s.now()
+	event.Normalize(now)
+	if event.ID == "" {
+		event.ID = uuid.NewString()
+	}
+	if err := validatePublishEvent(event); err != nil {
+		return PublishResult{}, err
+	}
+	settings, err := s.LoadSettings(ctx)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	force := event.Category == models.NotificationCategoryNotificationTest
+	status, reason := deliveryDecision(settings, event, force)
+	inserted, err := s.db.CommitNotificationTransition(ctx, transitions, database.NotificationEnqueue{
+		Event:          event,
+		Status:         status,
+		SuppressReason: reason,
+		MaxAttempts:    settings.MaxAttempts,
+		Force:          force,
+		Cooldown:       time.Duration(settings.CooldownSeconds) * time.Second,
+		Capacity:       s.outboxCapacity,
+	})
+	if err != nil {
+		return PublishResult{}, err
+	}
+	return PublishResult{EventID: event.ID, Status: status, Inserted: inserted}, nil
+}
+
+// TransitionEventKey is stable for one producer generation+state, so a retry
+// after a failed or ambiguously committed transaction inserts at most one event.
+func TransitionEventKey(producer, entityKey string, generation int64, state string) string {
+	return fmt.Sprintf("%s:%s:%d:%s", producer, entityKey, generation, state)
+}
+
 // LoadSettings reads the persisted policy. An absent row is the disabled
 // default, never an enabled destination.
 func (s *Service) LoadSettings(ctx context.Context) (models.NotificationSettings, error) {

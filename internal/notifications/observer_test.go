@@ -333,6 +333,88 @@ func TestObserverProvisioningTransitions(t *testing.T) {
 	}
 }
 
+func TestObserverAnnouncesNewOrderFirstObservedTerminal(t *testing.T) {
+	db := openNotificationDB(t)
+	notifier := NewService(db, Options{})
+	observer := NewObserver(db, notifier, ObserverOptions{Now: time.Now})
+	ctx := context.Background()
+
+	insertOrder := func(orderID, status string, createdAt time.Time) {
+		t.Helper()
+		if err := db.InsertGigahostOrder(ctx, &models.GigahostOrder{
+			OrderID: orderID, Status: status, CreatedAt: createdAt, UpdatedAt: createdAt,
+		}); err != nil {
+			t.Fatalf("insert order %s: %v", orderID, err)
+		}
+	}
+	insertOrder("historical-failed", "failed", observer.startedAt.Add(-time.Hour))
+	insertOrder("historical-unknown", "unknown", observer.startedAt.Add(-2*time.Hour))
+	insertOrder("new-failed", "failed", observer.startedAt.Add(time.Second))
+	insertOrder("new-unknown", "unknown", observer.startedAt.Add(2*time.Second))
+
+	if err := observer.ObserveOnce(ctx); err != nil {
+		t.Fatalf("observe: %v", err)
+	}
+	history, err := db.ListNotificationHistory(ctx, 50)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	var failed, unknown []string
+	for _, item := range history {
+		switch item.Event.Type {
+		case "order.failed":
+			failed = append(failed, item.Event.EntityID)
+		case "order.outcome_unknown":
+			unknown = append(unknown, item.Event.EntityID)
+		}
+	}
+	if len(failed) != 1 || failed[0] != "new-failed" {
+		t.Fatalf("order.failed events = %v, want exactly new-failed", failed)
+	}
+	if len(unknown) != 1 || unknown[0] != "new-unknown" {
+		t.Fatalf("order.outcome_unknown events = %v, want exactly new-unknown", unknown)
+	}
+
+	// A restart baselines historical rows instead of replaying their incidents,
+	// but a newly created order after the durable baseline is still announced.
+	insertOrder("post-restart-failed", "failed", observer.startedAt.Add(3*time.Second))
+	restarted := NewObserver(db, notifier, ObserverOptions{Now: time.Now})
+	if err := restarted.ObserveOnce(ctx); err != nil {
+		t.Fatalf("restart observe: %v", err)
+	}
+	afterRestart, _ := db.ListNotificationHistory(ctx, 50)
+	if len(afterRestart) != len(history)+1 {
+		t.Fatalf("restart events = %d, want one new post-baseline order", len(afterRestart))
+	}
+	var postRestartFailed int
+	for _, item := range afterRestart {
+		if item.Event.Type == "order.failed" && item.Event.EntityID == "post-restart-failed" {
+			postRestartFailed++
+		}
+	}
+	if postRestartFailed != 1 {
+		t.Fatalf("post-restart failed order events = %d, want 1", postRestartFailed)
+	}
+
+	// A fresh panel seeing only a historical failed order stays quiet.
+	freshDB := openNotificationDB(t)
+	freshNotifier := NewService(freshDB, Options{})
+	freshObserver := NewObserver(freshDB, freshNotifier, ObserverOptions{Now: time.Now})
+	if err := freshDB.InsertGigahostOrder(ctx, &models.GigahostOrder{
+		OrderID: "pre-existing", Status: "failed",
+		CreatedAt: freshObserver.startedAt.Add(-time.Hour),
+		UpdatedAt: freshObserver.startedAt.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("insert pre-existing order: %v", err)
+	}
+	if err := freshObserver.ObserveOnce(ctx); err != nil {
+		t.Fatalf("fresh observe: %v", err)
+	}
+	if events, _ := freshDB.ListNotificationHistory(ctx, 10); len(events) != 0 {
+		t.Fatalf("historical failed order replayed %d events", len(events))
+	}
+}
+
 func TestObserverHostMismatchIsCritical(t *testing.T) {
 	db := openNotificationDB(t)
 	notifier := NewService(db, Options{})

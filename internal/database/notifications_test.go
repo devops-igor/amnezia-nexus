@@ -2,6 +2,8 @@ package database
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -151,6 +153,75 @@ func TestInsertNotificationEventDropsWhenOutboxIsSaturated(t *testing.T) {
 	}
 	if delivery.LastError != "queue_full" {
 		t.Fatalf("drop reason = %q, want queue_full", delivery.LastError)
+	}
+}
+
+func TestCommitNotificationTransitionRollsBackStateWhenEventInsertFails(t *testing.T) {
+	db := openNotificationTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if _, changed, err := db.AdvanceNotificationProducerState(ctx, "server_reachability", "7", "online"); err != nil || !changed {
+		t.Fatalf("baseline state changed=%v err=%v", changed, err)
+	}
+	state, generation, found, err := db.ReadNotificationProducerState(ctx, "server_reachability", "7")
+	if err != nil || !found || state != "online" {
+		t.Fatalf("baseline = state:%q gen:%d found:%v err:%v", state, generation, found, err)
+	}
+
+	if _, err := db.sqlDB.ExecContext(ctx, `
+		CREATE TRIGGER fail_notification_event
+		BEFORE INSERT ON notification_events
+		WHEN NEW.summary = 'injected-failure'
+		BEGIN SELECT RAISE(ABORT, 'injected event failure'); END`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	event := notificationTestEvent("evt-atomic", now)
+	event.Summary = "injected-failure"
+	transition := []NotificationTransition{{
+		Producer:           "server_reachability",
+		EntityKey:          "7",
+		PreviousState:      "online",
+		ExpectedGeneration: generation,
+		State:              "offline",
+	}}
+	if _, err := db.CommitNotificationTransition(ctx, transition, NotificationEnqueue{Event: event, MaxAttempts: 3}); err == nil {
+		t.Fatal("event insert failure was reported as success")
+	}
+
+	state, afterFailureGeneration, found, err := db.ReadNotificationProducerState(ctx, "server_reachability", "7")
+	if err != nil || !found {
+		t.Fatalf("read after failure found=%v err=%v", found, err)
+	}
+	if state != "online" || afterFailureGeneration != generation {
+		t.Fatalf("state advanced despite failed event insert: state=%q gen=%d, want online/%d", state, afterFailureGeneration, generation)
+	}
+	if history, _ := db.ListNotificationHistory(ctx, 10); len(history) != 0 {
+		t.Fatalf("failed transaction left %d history rows", len(history))
+	}
+
+	if _, err := db.sqlDB.ExecContext(ctx, `DROP TRIGGER fail_notification_event`); err != nil {
+		t.Fatalf("drop failure trigger: %v", err)
+	}
+	inserted, err := db.CommitNotificationTransition(ctx, transition, NotificationEnqueue{Event: event, MaxAttempts: 3})
+	if err != nil || !inserted {
+		t.Fatalf("retry inserted=%v err=%v", inserted, err)
+	}
+	history, err := db.ListNotificationHistory(ctx, 10)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(history) != 1 || history[0].Event.ID != event.ID {
+		t.Fatalf("history = %#v, want exactly the recovered event", history)
+	}
+
+	// Replaying the committed transition is stale, not a second event.
+	if _, err := db.CommitNotificationTransition(ctx, transition, NotificationEnqueue{Event: event, MaxAttempts: 3}); !errors.Is(err, ErrNotificationTransitionStale) {
+		t.Fatalf("replay error = %v, want ErrNotificationTransitionStale", err)
+	}
+	history, _ = db.ListNotificationHistory(ctx, 10)
+	if len(history) != 1 {
+		t.Fatalf("replay produced %d events, want 1", len(history))
 	}
 }
 
@@ -345,6 +416,46 @@ func TestGetActiveProtocols(t *testing.T) {
 	}
 	if len(protocols) != 2 {
 		t.Fatalf("protocols = %v, want two distinct", protocols)
+	}
+}
+
+func TestNotificationProducerStateGenerationMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-producer.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if _, err := raw.Exec(`
+		CREATE TABLE notification_producer_state (
+			producer TEXT NOT NULL,
+			entity_key TEXT NOT NULL,
+			state TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (producer, entity_key)
+		);
+		INSERT INTO notification_producer_state (producer, entity_key, state, updated_at)
+		VALUES ('server_reachability', '7', 'online', '2026-11-18T00:00:00Z');`); err != nil {
+		t.Fatalf("seed legacy table: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	db, err := Open(path, testSecretKey)
+	if err != nil {
+		t.Fatalf("open migrated: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	state, generation, found, err := db.ReadNotificationProducerState(context.Background(), "server_reachability", "7")
+	if err != nil || !found || state != "online" || generation != 0 {
+		t.Fatalf("migrated row = state:%q gen:%d found:%v err:%v", state, generation, found, err)
+	}
+	if _, _, err := db.AdvanceNotificationProducerState(context.Background(), "server_reachability", "7", "offline"); err != nil {
+		t.Fatalf("advance migrated row: %v", err)
+	}
+	_, generation, _, _ = db.ReadNotificationProducerState(context.Background(), "server_reachability", "7")
+	if generation != 1 {
+		t.Fatalf("generation after advance = %d, want 1", generation)
 	}
 }
 

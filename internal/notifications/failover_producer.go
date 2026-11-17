@@ -8,8 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
 
@@ -115,25 +114,49 @@ func (p *FailoverProducer) publish(ctx context.Context, outcome models.FailoverO
 		return errors.New("failover producer is not configured")
 	}
 	state := fmt.Sprintf("%s:%d:%d:%d", outcome.Decision, outcome.Migrated, outcome.Stranded, outcome.StateVersion)
-	previous, changed, err := p.db.AdvanceNotificationProducerState(ctx, "failover", fmt.Sprintf("%d", outcome.SourceTunnelID), state)
-	if err != nil {
-		return err
+	entityKey := fmt.Sprintf("%d", outcome.SourceTunnelID)
+	for attempt := 0; attempt < 2; attempt++ {
+		done, err := p.tryPublishFailover(ctx, outcome, state, entityKey)
+		if done {
+			return err
+		}
 	}
-	if !changed || previous == state {
-		return nil
-	}
+	return errors.New("failover transition remained stale after retry")
+}
 
+func (p *FailoverProducer) tryPublishFailover(ctx context.Context, outcome models.FailoverOutcome, state, entityKey string) (bool, error) {
+	previous, generation, found, err := p.db.ReadNotificationProducerState(ctx, "failover", entityKey)
+	if err != nil {
+		return true, err
+	}
+	if found && previous == state {
+		return true, nil
+	}
 	event, ok := failoverEvent(outcome, state, time.Now())
 	if !ok {
-		return nil
+		return true, nil
 	}
-	_, err = p.notifier.Publish(ctx, event)
-	return err
+	if !found {
+		previous = ""
+		generation = 0
+	}
+	event.EventKey = TransitionEventKey("failover", entityKey, generation+1, state)
+	_, err = p.notifier.PublishTransition(ctx, []database.NotificationTransition{{
+		Producer:           "failover",
+		EntityKey:          entityKey,
+		PreviousState:      previous,
+		ExpectedGeneration: generation,
+		State:              state,
+	}}, event)
+	if errors.Is(err, database.ErrNotificationTransitionStale) {
+		return false, nil
+	}
+	return true, err
 }
 
 func failoverEvent(outcome models.FailoverOutcome, state string, now time.Time) (models.NotificationEvent, bool) {
 	event := models.NotificationEvent{
-		EventKey:   fmt.Sprintf("failover:%d:%s:%s", outcome.SourceTunnelID, state, uuid.NewString()),
+		EventKey:   fmt.Sprintf("failover:%d:%s", outcome.SourceTunnelID, state),
 		IncidentID: fmt.Sprintf("backend:%d", outcome.SourceTunnelID),
 		Category:   models.NotificationCategoryFailover,
 		EntityType: "backend",

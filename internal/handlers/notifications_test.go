@@ -288,6 +288,56 @@ func TestTestNotificationWithoutDestinationIsRefused(t *testing.T) {
 	}
 }
 
+func TestConfirmedOrderAcceptedClassification(t *testing.T) {
+	tests := []struct {
+		name  string
+		order *models.GigahostOrder
+		want  bool
+	}{
+		{name: "waiting", order: &models.GigahostOrder{OrderID: "ord_1", Status: "waiting"}, want: true},
+		{name: "deploying", order: &models.GigahostOrder{OrderID: "ord_2", Status: "deploying"}, want: true},
+		{name: "ready", order: &models.GigahostOrder{OrderID: "ord_3", Status: "ready"}, want: true},
+		{name: "intent row", order: &models.GigahostOrder{OrderID: "intent_123", Status: "waiting"}, want: false},
+		{name: "unknown", order: &models.GigahostOrder{OrderID: "ord_4", Status: "unknown"}, want: false},
+		{name: "failed", order: &models.GigahostOrder{OrderID: "ord_5", Status: "failed"}, want: false},
+		{name: "pending order", order: &models.GigahostOrder{OrderID: "ord_6", Status: "pending_order"}, want: false},
+		{name: "empty id", order: &models.GigahostOrder{Status: "waiting"}, want: false},
+		{name: "nil", order: nil, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := confirmedOrderAccepted(tc.order); got != tc.want {
+				t.Fatalf("confirmedOrderAccepted = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPublishOrderAcceptedIsIdempotent(t *testing.T) {
+	h, db, _ := setupTestHandlers(t)
+	ctx := context.Background()
+	order := &models.GigahostOrder{OrderID: "ord_accepted", Status: "waiting", CreatedAt: time.Now().UTC()}
+	h.publishOrderAccepted(ctx, order)
+	h.publishOrderAccepted(ctx, order)
+
+	history, err := db.ListNotificationHistory(ctx, 20)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	var accepted int
+	for _, item := range history {
+		if item.Event.Type == "order.accepted" {
+			accepted++
+			if item.Event.EntityID != order.OrderID {
+				t.Fatalf("accepted event entity = %q", item.Event.EntityID)
+			}
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("order.accepted events = %d, want exactly 1", accepted)
+	}
+}
+
 func TestNotificationSettingsPersistAcrossReopen(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "reopen.db")

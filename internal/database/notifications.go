@@ -413,8 +413,140 @@ func (d *DB) ListNotificationHistory(ctx context.Context, limit int) ([]models.N
 	return out, nil
 }
 
+// NotificationTransition is one producer state change that must commit together
+// with its event. ExpectedGeneration is the generation the caller observed before
+// building the event key; a mismatch means another writer already advanced the
+// state, so this transition is stale and must be retried on the next poll.
+type NotificationTransition struct {
+	Producer           string
+	EntityKey          string
+	PreviousState      string
+	ExpectedGeneration int64
+	State              string
+}
+
+// ErrNotificationTransitionStale means the producer state changed after the
+// caller read it. Nothing was written: the caller retries from a fresh read.
+var ErrNotificationTransitionStale = errors.New("notification producer transition is stale")
+
+// ReadNotificationProducerState returns the durable observation state and its
+// transition generation. found=false means no baseline has ever been recorded.
+func (d *DB) ReadNotificationProducerState(ctx context.Context, producer, entityKey string) (state string, generation int64, found bool, err error) {
+	err = d.sqlDB.QueryRowContext(ctx, `
+		SELECT state, generation FROM notification_producer_state
+		WHERE producer = ? AND entity_key = ?`, producer, entityKey,
+	).Scan(&state, &generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, false, nil
+	}
+	if err != nil {
+		return "", 0, false, fmt.Errorf("read notification producer state: %w", err)
+	}
+	return state, generation, true, nil
+}
+
+// CommitNotificationTransition atomically advances every producer transition and
+// inserts the event plus delivery. A failed event insert rolls the state update
+// back, so the next observation retries the same transition instead of losing it.
+func (d *DB) CommitNotificationTransition(ctx context.Context, transitions []NotificationTransition, req NotificationEnqueue) (bool, error) {
+	if len(transitions) == 0 {
+		return false, errors.New("notification transition requires at least one state change")
+	}
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	now := time.Now().UTC()
+	event := req.Event
+	event.Normalize(now)
+
+	tx, err := d.sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin notification transition: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	for _, transition := range transitions {
+		if err := applyNotificationTransition(ctx, tx, transition, now); err != nil {
+			return false, err
+		}
+	}
+	inserted, err := insertTransitionEvent(ctx, tx, req, event, now)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit notification transition: %w", err)
+	}
+	return inserted, nil
+}
+
+func insertTransitionEvent(ctx context.Context, tx *sql.Tx, req NotificationEnqueue, event models.NotificationEvent, now time.Time) (bool, error) {
+	inserted, err := insertNotificationEventRow(ctx, tx, event, now)
+	if err != nil || !inserted {
+		return inserted, err
+	}
+	status, reason, err := notificationDeliveryDecision(ctx, tx, req, event)
+	if err != nil {
+		return false, err
+	}
+	if err := insertNotificationDeliveryRow(ctx, tx, req, event.ID, status, reason, now); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func applyNotificationTransition(ctx context.Context, tx *sql.Tx, transition NotificationTransition, now time.Time) error {
+	if transition.PreviousState == "" {
+		return insertNotificationProducerState(ctx, tx, transition, now)
+	}
+	return advanceNotificationProducerState(ctx, tx, transition, now)
+}
+
+func insertNotificationProducerState(ctx context.Context, tx *sql.Tx, transition NotificationTransition, now time.Time) error {
+	res, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO notification_producer_state
+			(producer, entity_key, state, generation, updated_at)
+		VALUES (?, ?, ?, 1, ?)`,
+		transition.Producer, transition.EntityKey, transition.State, formatNotificationTime(now),
+	)
+	if err != nil {
+		return fmt.Errorf("insert notification producer state: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count notification producer state insert: %w", err)
+	}
+	if rows != 1 {
+		return ErrNotificationTransitionStale
+	}
+	return nil
+}
+
+func advanceNotificationProducerState(ctx context.Context, tx *sql.Tx, transition NotificationTransition, now time.Time) error {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE notification_producer_state
+		SET state = ?, generation = generation + 1, updated_at = ?
+		WHERE producer = ? AND entity_key = ? AND state = ? AND generation = ?`,
+		transition.State, formatNotificationTime(now), transition.Producer, transition.EntityKey,
+		transition.PreviousState, transition.ExpectedGeneration,
+	)
+	if err != nil {
+		return fmt.Errorf("advance notification producer state: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count notification producer state update: %w", err)
+	}
+	if rows != 1 {
+		return ErrNotificationTransitionStale
+	}
+	return nil
+}
+
 // AdvanceNotificationProducerState records the latest observed state for one
-// producer entity and reports the previous state. The first observation returns
+// producer entity and reports the previous state. It is used for a baseline or a
+// non-notifiable state; notifiable changes use CommitNotificationTransition so
+// the state cannot advance without its event. The first observation returns
 // previous="" changed=true: it establishes a baseline and must not be announced
 // as a transition, because there is no earlier authoritative state to compare.
 func (d *DB) AdvanceNotificationProducerState(ctx context.Context, producer, entityKey, state string) (previous string, changed bool, err error) {
@@ -440,9 +572,10 @@ func (d *DB) AdvanceNotificationProducerState(ctx context.Context, producer, ent
 
 	now := formatNotificationTime(time.Now().UTC())
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO notification_producer_state (producer, entity_key, state, updated_at)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT(producer, entity_key) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`,
+		INSERT INTO notification_producer_state (producer, entity_key, state, generation, updated_at)
+		VALUES (?, ?, ?, 1, ?)
+		ON CONFLICT(producer, entity_key) DO UPDATE
+		SET state = excluded.state, generation = notification_producer_state.generation + 1, updated_at = excluded.updated_at`,
 		producer, entityKey, state, now,
 	); err != nil {
 		return "", false, fmt.Errorf("write producer state: %w", err)

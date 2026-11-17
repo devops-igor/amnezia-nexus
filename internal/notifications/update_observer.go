@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/service/upstream"
 )
@@ -66,7 +67,8 @@ func NewUpdateObserver(db notificationStateStore, notifier *Service, checker Upd
 }
 
 type notificationStateStore interface {
-	AdvanceNotificationProducerState(ctx context.Context, producer, entityKey, state string) (string, bool, error)
+	ReadNotificationProducerState(ctx context.Context, producer, entityKey string) (string, int64, bool, error)
+	CommitNotificationTransition(ctx context.Context, transitions []database.NotificationTransition, req database.NotificationEnqueue) (bool, error)
 }
 
 // Name implements service.BackgroundService.
@@ -149,35 +151,76 @@ func (o *UpdateObserver) ObserveOnce(ctx context.Context) error {
 	if len(changed) == 0 {
 		return nil
 	}
-	sort.Slice(changed, func(i, j int) bool { return changed[i].Name < changed[j].Name })
+	return o.publishChanges(ctx, changed)
+}
+
+func (o *UpdateObserver) publishChanges(ctx context.Context, changed []updateChange) error {
+	sort.Slice(changed, func(i, j int) bool { return changed[i].component.Name < changed[j].component.Name })
 	now := o.now()
-	event := modelsNotificationEventForUpdates(changed, now)
-	if _, err := o.notifier.Publish(ctx, event); err != nil {
+	components := make([]upstream.ComponentStatus, len(changed))
+	transitions := make([]database.NotificationTransition, len(changed))
+	for i, change := range changed {
+		components[i] = change.component
+		transitions[i] = database.NotificationTransition{
+			Producer:           "software_update",
+			EntityKey:          change.component.Name,
+			PreviousState:      change.previous,
+			ExpectedGeneration: change.generation,
+			State:              change.component.LatestVersion,
+		}
+	}
+	event := modelsNotificationEventForUpdates(components, now)
+	event.EventKey = TransitionEventKey("software_update", changed[0].component.Name, changed[0].generation+1, changed[0].component.LatestVersion)
+	if _, err := o.notifier.PublishTransition(ctx, transitions, event); err != nil {
+		if errors.Is(err, database.ErrNotificationTransitionStale) {
+			// Another pass advanced one component; the next scheduled check
+			// observes the same remaining releases and retries atomically.
+			return nil
+		}
 		return err
 	}
 	return nil
 }
 
-func (o *UpdateObserver) collectUpdatedComponents(ctx context.Context, status *upstream.UpstreamStatus) ([]upstream.ComponentStatus, error) {
-	var changed []upstream.ComponentStatus
+type updateChange struct {
+	component  upstream.ComponentStatus
+	previous   string
+	generation int64
+}
+
+func (o *UpdateObserver) collectUpdatedComponents(ctx context.Context, status *upstream.UpstreamStatus) ([]updateChange, error) {
+	var changed []updateChange
 	for _, component := range status.Components {
-		if component.Error != "" || !component.UpdateAvailable {
-			continue
-		}
-		if strings.TrimSpace(component.LatestVersion) == "" || strings.TrimSpace(component.PinnedVersion) == "" {
-			continue
-		}
-		previous, isNew, err := o.db.AdvanceNotificationProducerState(
-			ctx, "software_update", component.Name, component.LatestVersion,
-		)
+		change, ok, err := o.updateChange(ctx, component)
 		if err != nil {
 			return nil, err
 		}
-		if isNew && previous != component.LatestVersion {
-			changed = append(changed, component)
+		if ok {
+			changed = append(changed, change)
 		}
 	}
 	return changed, nil
+}
+
+func (o *UpdateObserver) updateChange(ctx context.Context, component upstream.ComponentStatus) (updateChange, bool, error) {
+	if component.Error != "" || !component.UpdateAvailable {
+		return updateChange{}, false, nil
+	}
+	if strings.TrimSpace(component.LatestVersion) == "" || strings.TrimSpace(component.PinnedVersion) == "" {
+		return updateChange{}, false, nil
+	}
+	state, generation, found, err := o.db.ReadNotificationProducerState(ctx, "software_update", component.Name)
+	if err != nil {
+		return updateChange{}, false, err
+	}
+	if found && state == component.LatestVersion {
+		return updateChange{}, false, nil
+	}
+	previous := ""
+	if found {
+		previous = state
+	}
+	return updateChange{component: component, previous: previous, generation: generation}, true, nil
 }
 
 func modelsNotificationEventForUpdates(changed []upstream.ComponentStatus, now time.Time) (event models.NotificationEvent) {
@@ -202,7 +245,7 @@ func modelsNotificationEventForUpdates(changed []upstream.ComponentStatus, now t
 		summary = fmt.Sprintf("Update available for %s", changed[0].Name)
 	}
 	return models.NotificationEvent{
-		EventKey:   fmt.Sprintf("software_update:%s:%s:%d", strings.Join(names, ","), strings.Join(componentVersions(changed), ","), now.UTC().UnixNano()),
+		EventKey:   "software_update:" + strings.Join(names, ",") + ":" + strings.Join(componentVersions(changed), ","),
 		IncidentID: "software_updates:" + strings.Join(names, ","),
 		Category:   models.NotificationCategoryUpdates,
 		Severity:   models.NotificationSeverityInfo,
