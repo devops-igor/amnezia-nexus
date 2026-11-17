@@ -57,6 +57,8 @@ func setupForwarderWithPBR(t *testing.T) (*Forwarder, *DirectEgressManager, *moc
 		WANDevice:    wanDev,
 	}, fwd)
 	fwd.SetDirectEgress(dem)
+	// The manager owns a WAN reader; retire it with the test that created it.
+	t.Cleanup(func() { _ = dem.Close() })
 	fwd.SetGatewayDNSIP(gwDNS)
 
 	rc := newTestRouteCache()
@@ -478,19 +480,16 @@ func TestPolicyDispatch_AccountingMetrics(t *testing.T) {
 }
 
 type failingMockPacketDev struct {
+	*wanReadGate
 	err error
 }
 
-func (f *failingMockPacketDev) Read(p []byte) (int, error) {
-	return 0, nil
+func newFailingMockPacketDev(err error) *failingMockPacketDev {
+	return &failingMockPacketDev{wanReadGate: newWANReadGate(), err: err}
 }
 
 func (f *failingMockPacketDev) Write(p []byte) (int, error) {
 	return 0, f.err
-}
-
-func (f *failingMockPacketDev) Close() error {
-	return nil
 }
 
 func TestPolicyDispatch_WANReplyDownstreamAdmission(t *testing.T) {
@@ -508,6 +507,7 @@ func TestPolicyDispatch_WANReplyDownstreamAdmission(t *testing.T) {
 		WANDevice:    wanDev,
 	}, fwd)
 	fwd.SetDirectEgress(dem)
+	t.Cleanup(func() { _ = dem.Close() })
 
 	rc := newTestRouteCache()
 	fwd.SetRouteCache(rc)
@@ -642,7 +642,7 @@ func TestPolicyDispatch_DirectTransmissionErrorAccounting(t *testing.T) {
 	fwd := NewForwarder(accountant, "10.100.0.0/16", 100)
 	fwd.SetPBREnabled(true)
 
-	wanDev := &failingMockPacketDev{err: errors.New("wan cable disconnected")}
+	wanDev := newFailingMockPacketDev(errors.New("wan cable disconnected"))
 	hostWAN := netip.MustParseAddr("203.0.113.1")
 	gwDNS := netip.MustParseAddr("10.100.0.1")
 
@@ -652,6 +652,7 @@ func TestPolicyDispatch_DirectTransmissionErrorAccounting(t *testing.T) {
 		WANDevice:    wanDev,
 	}, fwd)
 	fwd.SetDirectEgress(dem)
+	t.Cleanup(func() { _ = dem.Close() })
 
 	rc := newTestRouteCache()
 	fwd.SetRouteCache(rc)
@@ -747,7 +748,7 @@ func TestPolicyDispatch_R2H1_DirectWANReplyWriteFenceAndQueueBounding(t *testing
 
 	// 1. Fill clientQueue to capacity -> HandleWANReply must reject with ErrQueueFull
 	for len(route.clientQueue) < cap(route.clientQueue) {
-		route.clientQueue <- pkt
+		route.clientQueue <- ClientPacket{packet: pkt}
 	}
 
 	hostWAN := dem.cfg.HostWANIP

@@ -331,6 +331,13 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			// Read-only decision dry run (#825). Same group, so the same
 			// RequireAdmin and CSRF middleware apply; it changes no state.
 			r.Post("/explain", h.ExplainPolicyHandler)
+			// Read-only per-client retained state (#861): the session
+			// incarnations an administrator can select, and the evidence the
+			// data plane already holds for one of them. Same group, so client
+			// browsing metadata is admin-only, unlike the admin-or-support
+			// session list.
+			r.Get("/clients", h.ClientDiagnosisClientsHandler)
+			r.Post("/client-diagnosis", h.ClientDiagnosisHandler)
 		})
 	})
 

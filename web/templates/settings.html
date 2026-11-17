@@ -411,7 +411,8 @@
     </div>
 </div>
 {{ template "settings_policy" . }}
-
+{{ template "settings_policy_upstream" . }}
+{{ template "settings_policy_client" . }}
 <div style="margin-top: var(--space-xl); display: flex; justify-content: flex-end;">
     <button class="btn btn-primary btn-lg" onclick="saveSettings()" id="saveBtn" style="display:flex; align-items:center; gap:var(--space-sm);">
         <svg class="icon"><use href="#icon-check"></use></svg>

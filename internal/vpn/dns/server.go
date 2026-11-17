@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -90,16 +91,19 @@ const (
 
 // Server coordinates DNS query execution, rate/inflight bounding, response shaping, and policy observation.
 type Server struct {
-	cfg         ServerConfig
-	resolver    Resolver
-	policy      PolicySource
-	observer    RouteObserver
-	globalSem   chan struct{}
-	sessionMu   sync.Mutex
-	sessionSems map[policy.Scope]chan struct{}
-	closeOnce   sync.Once
-	closed      chan struct{}
-	wg          sync.WaitGroup
+	cfg      ServerConfig
+	resolver Resolver
+	policy   PolicySource
+	observer RouteObserver
+	// eventObserver receives one terminal event per client query. It is optional
+	// and never on the trust path: recording an event cannot create evidence.
+	eventObserver QueryEventObserver
+	globalSem     chan struct{}
+	sessionMu     sync.Mutex
+	sessionSems   map[policy.Scope]chan struct{}
+	closeOnce     sync.Once
+	closed        chan struct{}
+	wg            sync.WaitGroup
 
 	rejectedPerSession atomic.Uint64
 	rejectedGlobal     atomic.Uint64
@@ -121,6 +125,125 @@ func (s *Server) SetObserver(obs RouteObserver) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.observer = obs
+	// A route observer that also understands terminal query events receives them
+	// through the same installation, so a caller cannot wire one without the
+	// other and end up with answers recorded but failures invisible.
+	if events, ok := obs.(QueryEventObserver); ok {
+		s.eventObserver = events
+	} else if obs == nil {
+		s.eventObserver = nil
+	}
+}
+
+// emitQueryEvent reports one terminal query to the installed observer, if any.
+//
+// It runs after the delivery attempt and outside every lock; it performs no I/O and
+// allocates only the event value. A server without an observer records nothing,
+// which is why this cannot be a correctness dependency.
+func (s *Server) emitQueryEvent(scope *ScopeHandle, req, resp *mdns.Msg, outcome QueryOutcome, transport string, truncated, delivered bool, recvTime, answeredAt time.Time, receipt QueryReceipt) {
+	if s == nil {
+		return
+	}
+	observer := s.QueryEventObserver()
+	if observer == nil {
+		return
+	}
+	event, ok := buildQueryEvent(scope, req, resp, outcome, transport, truncated, delivered, recvTime, answeredAt)
+	if ok {
+		// The incarnation the query arrived under, captured at receipt. It is set
+		// from the binder rather than resolved now, because "now" may be a successor.
+		event.RouteGeneration = receipt.Generation
+		event.IncarnationKnown = receipt.Known
+	}
+	if !ok {
+		return
+	}
+	observer.ObserveDNSQueryEvent(event)
+}
+
+// buildQueryEvent assembles one terminal event, or reports that the query carries
+// nothing to record.
+func buildQueryEvent(scope *ScopeHandle, req, resp *mdns.Msg, outcome QueryOutcome, transport string, truncated, delivered bool, recvTime, answeredAt time.Time) (QueryEvent, bool) {
+	if req == nil || len(req.Question) == 0 {
+		return QueryEvent{}, false
+	}
+	event := QueryEvent{
+		Transport:     transport,
+		Name:          canonicalEventName(req.Question[0].Name),
+		QType:         req.Question[0].Qtype,
+		Kind:          outcome.Kind,
+		UpstreamError: outcome.UpstreamError,
+		Truncated:     truncated,
+		Delivered:     delivered,
+		ReceivedAt:    recvTime,
+		AnsweredAt:    answeredAt,
+	}
+	if scope != nil {
+		event.SessionID = scope.Scope.SessionID
+	}
+	if resp != nil {
+		event.RCode = resp.Rcode
+	}
+	// A response that was produced but not handed to the client is a different
+	// fact from one the consumer received, so the kind says so.
+	if !delivered && event.Kind != QueryEventAdmissionRefused && event.Kind != QueryEventInvalidQuery {
+		event.Kind = QueryEventDeliveryFailed
+	}
+	return event, true
+}
+
+// rejectBeforeResolution answers the queries this server refuses without asking an
+// upstream: a closed server, a canceled context, an unparseable request and an
+// unsupported query. It reports whether it produced the answer.
+func (s *Server) rejectBeforeResolution(ctx context.Context, req *mdns.Msg) (*mdns.Msg, QueryOutcome, error, bool) {
+	select {
+	case <-s.closed:
+		return nil, QueryOutcome{}, ErrServerClosed, true
+	case <-ctx.Done():
+		return nil, QueryOutcome{}, ctx.Err(), true
+	default:
+	}
+	if req == nil || len(req.Question) == 0 {
+		return nil, QueryOutcome{}, ErrInvalidRequest, true
+	}
+	if errResp := validateQuery(req); errResp != nil {
+		return errResp, QueryOutcome{Kind: QueryEventInvalidQuery}, nil, true
+	}
+	return nil, QueryOutcome{}, nil, false
+}
+
+// exchangeUpstream performs the upstream exchange and reports a failure as the
+// SERVFAIL the client receives, with the exchange's own class. It is separate so the
+// decision reads as one admission, one exchange and one shaping step.
+func (s *Server) exchangeUpstream(ctx context.Context, req *mdns.Msg) (*mdns.Msg, QueryOutcome, bool) {
+	outcome := QueryOutcome{Kind: QueryEventAnswered}
+	resp, err := s.resolver.Exchange(ctx, req)
+	if err != nil || resp == nil {
+		resp = new(mdns.Msg)
+		resp.SetRcode(req, mdns.RcodeServerFailure)
+		outcome.Kind = QueryEventUpstreamError
+		outcome.UpstreamError = classifyUpstreamError(err)
+		return resp, outcome, true
+	}
+	outcome.Kind = queryEventKind(resp)
+	return resp, outcome, false
+}
+
+// canonicalEventName lowercases and unbounds a stored query name, bounded to the
+// DNS name limit so one hostile query cannot inflate a record.
+func canonicalEventName(name string) string {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	if len(name) > 253 {
+		name = name[:253]
+	}
+	return name
+}
+
+// QueryEventObserver returns the installed terminal-event observer, if any.
+func (s *Server) QueryEventObserver() QueryEventObserver {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.eventObserver
 }
 
 // applyServerDefaults fills the configuration a Server needs when the caller
@@ -193,12 +316,18 @@ func toScope(v any) policy.Scope {
 }
 
 // ObserveResponse evaluates and records route observations into the session cache.
+//
+// It carries no receipt authority: an observer that attributes history by lifetime
+// records nothing from this entrypoint rather than resolving a current generation for a
+// query whose receipt is unknown. Evidence-only callers keep using it.
 func (s *Server) ObserveResponse(req, resp *mdns.Msg, session *policy.SessionCache, recvTime time.Time) {
-	s.ObserveResponseWithSessionID(req, resp, session, "", recvTime)
+	s.ObserveResponseWithSessionID(req, resp, session, "", QueryReceipt{}, recvTime)
 }
 
 // ObserveResponseWithSessionID records route observations into the session cache and active route observer.
-func (s *Server) ObserveResponseWithSessionID(req, resp *mdns.Msg, session *policy.SessionCache, sessionID string, recvTime time.Time) {
+// The receipt is the lifetime the query was received under and travels to the observer, so
+// a delayed observation is attributed to it and never to a later owner of the session id.
+func (s *Server) ObserveResponseWithSessionID(req, resp *mdns.Msg, session *policy.SessionCache, sessionID string, receipt QueryReceipt, recvTime time.Time) {
 	if resp == nil || resp.Truncated || resp.Rcode != mdns.RcodeSuccess || s.policy == nil {
 		return
 	}
@@ -216,7 +345,7 @@ func (s *Server) ObserveResponseWithSessionID(req, resp *mdns.Msg, session *poli
 	// allocate a fresh session cache for a session that already released it.
 	// Skipping keeps a delayed/in-flight response from resurrecting the scope.
 	if obs != nil && sessionID != "" && (session == nil || !session.Retired()) {
-		_ = obs.ObserveDNSResponse(sessionID, req, resp)
+		_ = obs.ObserveDNSResponse(sessionID, receipt, req, resp)
 	}
 }
 
@@ -414,41 +543,47 @@ func shapeClientResponse(req, resp *mdns.Msg, isTCP bool) *mdns.Msg {
 // ServeDNSMessage processes a single DNS request, applying inflight limits, upstream resolution,
 // and response shaping.
 func (s *Server) ServeDNSMessage(ctx context.Context, scope any, req *mdns.Msg, isTCP bool) (*mdns.Msg, error) {
-	select {
-	case <-s.closed:
-		return nil, ErrServerClosed
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
+	resp, _, err := s.serveDNSMessageOutcome(ctx, scope, req, isTCP)
+	return resp, err
+}
 
-	if req == nil || len(req.Question) == 0 {
-		return nil, ErrInvalidRequest
+// serveDNSMessageOutcome is ServeDNSMessage plus what actually happened: whether the
+// query was refused before an upstream, whether the exchange failed and how, and
+// whether the reply was shaped. The terminal-event observer needs those facts, and
+// the trust path must not learn them: it keeps calling ServeDNSMessage.
+func (s *Server) serveDNSMessageOutcome(ctx context.Context, scope any, req *mdns.Msg, isTCP bool) (*mdns.Msg, QueryOutcome, error) {
+	if resp, outcome, err, handled := s.rejectBeforeResolution(ctx, req); handled {
+		// The refusal keeps its original error, so ServeDNSMessage's contract is
+		// unchanged for every caller.
+		return resp, outcome, err
 	}
-
-	if errResp := validateQuery(req); errResp != nil {
-		return errResp, nil
-	}
+	outcome := QueryOutcome{Kind: QueryEventAnswered}
 
 	scopeVal := toScope(scope)
-	release, outcome := s.acquireInflight(ctx, scopeVal)
-	if outcome != admitted {
-		// The refusal is answered here, without an upstream attempt, so it is
-		// counted by cause rather than left to look like an upstream SERVFAIL.
-		return s.refuseAdmission(req, outcome), nil
+	release, admission := s.acquireInflight(ctx, scopeVal)
+	if admission != admitted {
+		// The refusal is answered here, without an upstream attempt, so it is counted
+		// by cause rather than left to look like an upstream SERVFAIL. The terminal
+		// event carries that same fact: refused before resolution, not failed upstream.
+		outcome.Kind = QueryEventAdmissionRefused
+		return s.refuseAdmission(req, admission), outcome, nil
 	}
 	defer release()
 
-	resp, err := s.resolver.Exchange(ctx, req)
-	if err != nil || resp == nil {
-		resp = new(mdns.Msg)
-		resp.SetRcode(req, mdns.RcodeServerFailure)
-		return resp, nil
+	resp, outcome, failed := s.exchangeUpstream(ctx, req)
+	if failed {
+		return resp, outcome, nil
 	}
 
-	// Shape response: clear AD flag, preserve the client id and truncate UDP to
-	// the size the client advertised.
-	return shapeClientResponse(req, resp, isTCP), nil
+	// Shape response with the shared helper: client id, AD flag and the UDP
+	// truncation the client's advertised size requires.
+	shaped := shapeClientResponse(req, resp, isTCP)
+	if shaped.Truncated && outcome.Kind == QueryEventAnswered {
+		// The client received a cut answer and must retry over TCP; saying so is the
+		// point of the event.
+		outcome.Kind = QueryEventTruncated
+	}
+	return shaped, outcome, nil
 }
 
 func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.PacketConn, errCh chan<- error, producers *sync.WaitGroup) {
@@ -478,13 +613,19 @@ func (s *Server) serveUDP(ctx context.Context, scope *ScopeHandle, udp net.Packe
 		}
 
 		recvTime := time.Now()
-		resp, err := s.ServeDNSMessage(ctx, scopeVal, req, false)
+		receipt := s.queryReceipt(s.QueryEventObserver(), scopeVal.SessionID)
+		resp, outcome, err := s.serveDNSMessageOutcome(ctx, scopeVal, req, false)
 		if err == nil && resp != nil {
+			delivered := false
 			if out, err := resp.Pack(); err == nil {
-				if _, err := udp.WriteTo(out, raddr); err == nil && (sc != nil || s.observer != nil) {
-					s.ObserveResponseWithSessionID(req, resp, sc, scopeVal.SessionID, recvTime)
+				if _, writeErr := udp.WriteTo(out, raddr); writeErr == nil {
+					delivered = true
+					if sc != nil || s.observer != nil {
+						s.ObserveResponseWithSessionID(req, resp, sc, scopeVal.SessionID, receipt, recvTime)
+					}
 				}
 			}
+			s.emitQueryEvent(scope, req, resp, outcome, "udp", resp.Truncated, delivered, recvTime, time.Now(), receipt)
 		}
 	}
 }
@@ -522,7 +663,8 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 		}
 
 		recvTime := time.Now()
-		resp, err := s.ServeDNSMessage(ctx, scopeVal, req, true)
+		receipt := s.queryReceipt(s.QueryEventObserver(), scopeVal.SessionID)
+		resp, outcome, err := s.serveDNSMessageOutcome(ctx, scopeVal, req, true)
 		if err != nil || resp == nil {
 			return
 		}
@@ -533,10 +675,16 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 		// #nosec G115 -- out length is validated <= 65535 above
 		binary.BigEndian.PutUint16(lenBuf[:], uint16(len(out)))
 		_ = c.SetWriteDeadline(time.Now().Add(readTimeout))
-		if _, err := c.Write(lenBuf[:]); err != nil {
-			return
+		delivered := false
+		// The length prefix and the body are one response on the wire; the event is
+		// only "delivered" when both writes succeeded.
+		if _, err := c.Write(lenBuf[:]); err == nil {
+			if _, err := c.Write(out); err == nil {
+				delivered = true
+			}
 		}
-		if _, err := c.Write(out); err != nil {
+		s.emitQueryEvent(scope, req, resp, outcome, "tcp", resp.Truncated, delivered, recvTime, time.Now(), receipt)
+		if !delivered {
 			return
 		}
 		if (sc != nil || s.observer != nil) && (scope == nil || !scope.IsRetired()) {
@@ -544,7 +692,7 @@ func (s *Server) handleTCPConn(ctx context.Context, scope *ScopeHandle, c net.Co
 			if scope != nil {
 				sID = scope.Scope.SessionID
 			}
-			s.ObserveResponseWithSessionID(req, resp, sc, sID, recvTime)
+			s.ObserveResponseWithSessionID(req, resp, sc, sID, receipt, recvTime)
 		}
 	}
 }

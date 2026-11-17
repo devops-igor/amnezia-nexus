@@ -76,7 +76,8 @@ func TestVPNRebalanceLiveMigration(t *testing.T) {
 		t.Fatalf("RouteClientToBackend before migration failed: %v", err)
 	}
 	select {
-	case received := <-q1:
+	case receivedWork := <-q1:
+		received := receivedWork.Bytes()
 		if !bytes.Equal(received, pkt1) {
 			t.Errorf("packet mismatch on backend 1 queue")
 		}
@@ -102,7 +103,8 @@ func TestVPNRebalanceLiveMigration(t *testing.T) {
 
 	// Verify Backend 2 queue received pkt2
 	select {
-	case received := <-q2:
+	case receivedWork := <-q2:
+		received := receivedWork.Bytes()
 		if !bytes.Equal(received, pkt2) {
 			t.Errorf("packet mismatch on backend 2 queue")
 		}
@@ -112,7 +114,8 @@ func TestVPNRebalanceLiveMigration(t *testing.T) {
 
 	// Verify Backend 1 queue has no unexpected packets
 	select {
-	case unexpected := <-q1:
+	case unexpectedWork := <-q1:
+		unexpected := unexpectedWork.Bytes()
 		t.Fatalf("unexpected packet received on old backend 1 queue: %v", unexpected)
 	default:
 	}
@@ -223,7 +226,8 @@ func TestVPNRebalanceRollbackOnDBFailure(t *testing.T) {
 	}
 
 	select {
-	case received := <-q1:
+	case receivedWorkTemp := <-q1:
+		received := receivedWorkTemp.Bytes()
 		if !bytes.Equal(received, pkt) {
 			t.Errorf("packet mismatch on backend 1 queue after rollback")
 		}
@@ -232,7 +236,8 @@ func TestVPNRebalanceRollbackOnDBFailure(t *testing.T) {
 	}
 
 	select {
-	case unexpected := <-q2:
+	case unexpectedWork := <-q2:
+		unexpected := unexpectedWork.Bytes()
 		t.Fatalf("unexpected packet received on backend 2 queue after rollback: %v", unexpected)
 	default:
 	}
@@ -310,7 +315,8 @@ func TestVPNReturnTrafficSurvivabilityAfterRebalance(t *testing.T) {
 	}
 
 	select {
-	case delivered := <-clientCh:
+	case deliveredWork := <-clientCh:
+		delivered := deliveredWork.Bytes()
 		if !bytes.Equal(delivered, returnPkt) {
 			t.Errorf("delivered packet mismatch, got %v, want %v", delivered, returnPkt)
 		}
@@ -405,7 +411,8 @@ func TestOrchestratorRebalanceEndToEndWithVPNService(t *testing.T) {
 		t.Fatalf("RouteClientToBackend after orchestrator rebalance failed: %v", err)
 	}
 	select {
-	case rec := <-q2:
+	case recWorkTemp := <-q2:
+		rec := recWorkTemp.Bytes()
 		if !bytes.Equal(rec, pktOut) {
 			t.Errorf("packet mismatch on backend 2 queue")
 		}
@@ -423,7 +430,8 @@ func TestOrchestratorRebalanceEndToEndWithVPNService(t *testing.T) {
 		t.Fatalf("RouteBackendToClient failed: %v", err)
 	}
 	select {
-	case rec := <-clientCh:
+	case recWork := <-clientCh:
+		rec := recWork.Bytes()
 		if !bytes.Equal(rec, pktReturn) {
 			t.Errorf("return packet mismatch")
 		}
@@ -670,7 +678,8 @@ func TestVPNRebalanceTargetTunnelDisabledOrInactive(t *testing.T) {
 		t.Fatalf("RouteClientToBackend failed: %v", err)
 	}
 	select {
-	case rec := <-q1:
+	case recWorkTemp := <-q1:
+		rec := recWorkTemp.Bytes()
 		if !bytes.Equal(rec, pkt) {
 			t.Errorf("packet mismatch on backend 1 queue")
 		}
@@ -768,7 +777,8 @@ func TestVPNRebalanceCheckToCommitRace_TargetBecomesInactive(t *testing.T) {
 		t.Fatalf("RouteClientToBackend failed: %v", err)
 	}
 	select {
-	case rec := <-q1:
+	case recWorkTemp := <-q1:
+		rec := recWorkTemp.Bytes()
 		if !bytes.Equal(rec, pkt) {
 			t.Errorf("packet mismatch on backend 1 queue")
 		}
@@ -867,7 +877,8 @@ func TestVPNRebalanceCheckToCommitRace_CompensatingDBRollbackSurvivesCanceledCon
 		t.Fatalf("RouteClientToBackend failed: %v", err)
 	}
 	select {
-	case rec := <-q1:
+	case recWorkTemp := <-q1:
+		rec := recWorkTemp.Bytes()
 		if !bytes.Equal(rec, pkt) {
 			t.Errorf("packet mismatch on backend 1 queue")
 		}

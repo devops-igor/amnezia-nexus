@@ -12,6 +12,7 @@ import (
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	mdns "github.com/miekg/dns"
 )
@@ -158,6 +159,12 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 
 	if mem, ok := cfg.RouteCache.(*MemoryRouteCache); ok {
 		mem.AttachMatcher(cfg.PolicyMatcher)
+		// Bind each stored DNS observation to the route generation registered for
+		// its session at observation time.
+		fwd := s.forwarder
+		mem.SetIncarnationSource(func(sessionID string) (uint64, bool) {
+			return fwd.SessionRouteGeneration(sessionID)
+		})
 	}
 
 	dem := forwarder.NewDirectEgressManager(forwarder.DirectEgressConfig{
@@ -313,6 +320,25 @@ type MemoryRouteCache struct {
 	// route-removal path already retires through, so releasing a scope also
 	// releases the work that scope authorized.
 	runtime *pbrDNSHandler
+	// dnsRecords is the bounded in-memory record of the answers this observer
+	// actually wrote (issue #861). It is not the route cache: an entry here
+	// survives the evidence expiring and is dropped only by age, capacity or
+	// session retirement. Guarded by dnsRecordsMu, never by mu.
+	dnsRecordsMu sync.RWMutex
+	dnsRecords   *dnsledger.Ledger
+	// historyLifetimes names the sessions whose DNS history lifetime is open and, for
+	// each, the earliest receipt generation that lifetime admitted (zero when the first
+	// receipt carried no incarnation). A lifetime opens at query receipt for a live
+	// session and closes in RetireSessionScope, in the same critical section that erases
+	// the rows, so a publication from a query whose session already retired cannot
+	// recreate it. A closed lifetime leaves no entry, so the registry is bounded by the
+	// sessions that currently own history, and a receipt of a re-admitted session opens
+	// a fresh lifetime with its own generation.
+	historyLifetimes map[string]uint64
+	// incarnation resolves which registered route generation owns a session at
+	// observation time, so a record can state its incarnation instead of
+	// guessing one. nil means "not established", never "the current one".
+	incarnation func(sessionID string) (uint64, bool)
 }
 
 // NewMemoryRouteCache creates an in-memory RouteCache backed by authentic policy.RouteCache.
@@ -326,9 +352,11 @@ func NewMemoryRouteCache() *MemoryRouteCache {
 		m.Publish(snap)
 	}
 	return &MemoryRouteCache{
-		rc:      rc,
-		matcher: m,
-		gen:     initialGen,
+		rc:               rc,
+		matcher:          m,
+		gen:              initialGen,
+		dnsRecords:       dnsledger.New(),
+		historyLifetimes: make(map[string]uint64),
 	}
 }
 
@@ -408,7 +436,25 @@ func (c *MemoryRouteCache) Observe(sessionID string, ip netip.Addr, d policy.Dec
 
 // ObserveDNSResponse evaluates a DNS query and response pair against the policy matcher
 // and feeds client-scoped route evidence directly into the route cache (Direct or Proxy).
-func (c *MemoryRouteCache) ObserveDNSResponse(sessionID string, req, resp *mdns.Msg) error {
+//
+// The receipt is the session lifetime the query was received under. The observation is
+// recorded as history under that receipt, never under the generation registered when this
+// write finally runs: a delayed answer must not be credited to a session id's successor.
+func (c *MemoryRouteCache) ObserveDNSResponse(sessionID string, receipt gatewaydns.QueryReceipt, req, resp *mdns.Msg) error {
+	return c.observeDNSResponse(sessionID, &receipt, req, resp)
+}
+
+// ObserveDNSResponseEvidence evaluates the same answer for route evidence and records no
+// history at all. It exists for callers that have no query receipt — an entrypoint
+// without lifetime authority must not be able to stamp history with a generation it did
+// not receive, so this one writes none rather than guessing one.
+func (c *MemoryRouteCache) ObserveDNSResponseEvidence(sessionID string, req, resp *mdns.Msg) error {
+	return c.observeDNSResponse(sessionID, nil, req, resp)
+}
+
+// observeDNSResponse writes the route evidence for one answer and, when a receipt is
+// present, its history row under that receipt.
+func (c *MemoryRouteCache) observeDNSResponse(sessionID string, receipt *gatewaydns.QueryReceipt, req, resp *mdns.Msg) error {
 	if c == nil || req == nil || resp == nil || sessionID == "" {
 		return nil
 	}
@@ -432,8 +478,197 @@ func (c *MemoryRouteCache) ObserveDNSResponse(sessionID string, req, resp *mdns.
 	if snap == nil {
 		return nil
 	}
-	_, err = gatewaydns.ObserveResponse(req, resp, snap, sc, time.Now(), 3600*time.Second)
+	// One instant for both the evidence deadline and the stored observation, so a
+	// record cannot claim a different time than the decision it describes.
+	observedAt := time.Now()
+	observed, err := gatewaydns.ObserveResponseResult(req, resp, snap, sc, observedAt, 3600*time.Second)
+	// The record is written whether or not the cache accepted the evidence: an
+	// answer the observation path rejected is exactly what an administrator needs
+	// to see, and it is stored with that verdict rather than as trusted evidence.
+	if receipt != nil {
+		c.recordDNSObservation(sessionID, *receipt, observed)
+	}
 	return err
+}
+
+// DNSTransportNotRecorded is the token an answer carries where the transport
+// would go. The observer boundary this build records at does not see it; only the
+// DNS server, which this slice does not modify, does.
+const DNSTransportNotRecorded = "not_recorded"
+
+// recordDNSObservation stores one observed answer in the bounded DNS ledger,
+// bound to the session and to the route generation registered for it at the time
+// of the observation.
+func (c *MemoryRouteCache) recordDNSObservation(sessionID string, receipt gatewaydns.QueryReceipt, observed gatewaydns.ObservedAnswer) {
+	if c.DNSLedger() == nil || sessionID == "" {
+		return
+	}
+	answer := observed.Classification
+	name := dnsledger.CanonicalName(observed.QName)
+	aliases := []string{}
+	if len(answer.Names) > 0 {
+		name = dnsledger.CanonicalName(answer.Names[0])
+		for _, alias := range answer.Names[1:] {
+			aliases = append(aliases, dnsledger.CanonicalName(alias))
+		}
+	}
+	if name == "" {
+		return
+	}
+	addresses := make([]dnsledger.AddressDecision, 0, len(observed.Observations))
+	for _, observation := range observed.Observations {
+		addresses = append(addresses, dnsledger.AddressDecision{
+			Address:  observation.IP,
+			Decision: observation.Decision.String(),
+		})
+	}
+	// The row is labeled with the lifetime the query was received under, and the same
+	// receipt decides admission below. Resolving a generation here instead would label a
+	// delayed answer with whatever owns the session id now.
+	generation, generationKnown := receipt.Generation, receipt.Known
+	policyGeneration := answerSnapshotGeneration(c)
+	c.dnsRecordsMu.Lock()
+	defer c.dnsRecordsMu.Unlock()
+	// The answer record is written after the reply was delivered, so — like the terminal
+	// event — it can run after the session retired, or after the session id was
+	// re-admitted. It is admitted only while the lifetime this query was received under is
+	// open, in the same critical section as the append, so retirement cannot interleave
+	// between the decision and the write and a receipt from an ended lifetime is refused
+	// even though the session id exists again.
+	if !c.historyWriteAllowedLocked(sessionID, generation, generationKnown) {
+		return
+	}
+	c.dnsRecords.Record(dnsledger.Input{
+		SessionID:            sessionID,
+		RouteGeneration:      generation,
+		RouteGenerationKnown: generationKnown,
+		Name:                 name,
+		Aliases:              aliases,
+		QType:                observed.QType,
+		RCode:                observed.RCode,
+		ObservedAt:           observed.RecvTime,
+		ExpiresAt:            observed.ExpiresAt,
+		PolicyGeneration:     policyGeneration,
+		ClassificationValid:  answer.Valid,
+		ClassificationReason: answer.Reason,
+		Addresses:            addresses,
+		ResolvedAddressCount: len(answer.ResolvedAddresses),
+		CacheVerdict:         cacheVerdictToken(observed.CacheErr),
+	}, observed.RecvTime)
+}
+
+// ObserveDNSQueryEvent stores one terminal client DNS query (issue #861, R9): a
+// refused admission, a failed upstream exchange, NXDOMAIN, a truncated reply, a
+// non-A type, or a reply the client never received.
+//
+// It is diagnostic history only. It writes no route evidence, so a failed or
+// truncated answer cannot become trusted because it was recorded here, and it runs
+// after the delivery attempt, outside every lock.
+// BindQueryIncarnation reports the route generation registered for a session when a
+// query arrives. It is the receipt-time half of the terminal-event contract: the
+// event is emitted after the reply, and resolving the incarnation then could credit
+// a successor that reused the session id.
+//
+// It is also where a session's DNS history lifetime opens. The receipt is the last
+// moment the session is known to be live for this query, and the publication that
+// follows it may run after the client disconnected, so the lifetime it belongs to has
+// to be recorded here rather than inferred at publication time.
+func (c *MemoryRouteCache) BindQueryIncarnation(sessionID string) (uint64, bool) {
+	generation, known := c.observedIncarnation(sessionID)
+	c.openHistoryLifetime(sessionID, generation, known)
+	return generation, known
+}
+
+func (c *MemoryRouteCache) ObserveDNSQueryEvent(event gatewaydns.QueryEvent) {
+	if c == nil || event.SessionID == "" {
+		return
+	}
+	// Read before the history lock: the matcher has its own lock, and the history lock is
+	// never held while acquiring another component's lock.
+	policyGeneration := answerSnapshotGeneration(c)
+	c.dnsRecordsMu.Lock()
+	defer c.dnsRecordsMu.Unlock()
+	// The terminal event is the last write of a query whose reply was already delivered,
+	// so it can run after the session retired. The lifetime the query was received under
+	// is the authority here: once it is closed, this row is dropped rather than
+	// recreating history for a session that no longer exists.
+	if !c.historyWriteAllowedLocked(event.SessionID, event.RouteGeneration, event.IncarnationKnown) {
+		return
+	}
+	c.dnsRecords.RecordEvent(dnsledger.InputEvent{
+		SessionID:            event.SessionID,
+		RouteGeneration:      event.RouteGeneration,
+		RouteGenerationKnown: event.IncarnationKnown,
+		Transport:            event.Transport,
+		Name:                 event.Name,
+		QType:                event.QType,
+		RCode:                event.RCode,
+		Kind:                 event.Kind,
+		UpstreamError:        event.UpstreamError,
+		Truncated:            event.Truncated,
+		Delivered:            event.Delivered,
+		ReceivedAt:           event.ReceivedAt,
+		AnsweredAt:           event.AnsweredAt,
+		PolicyGeneration:     policyGeneration,
+	}, event.ReceivedAt)
+}
+
+// observedIncarnation reports the route generation registered for the session at
+// observation time. It never substitutes the current generation for an unknown
+// one: a DNS answer can arrive while the session owns no route, and inventing a
+// mapping would attribute one incarnation's query to another's.
+func (c *MemoryRouteCache) observedIncarnation(sessionID string) (uint64, bool) {
+	c.mu.RLock()
+	resolver := c.incarnation
+	c.mu.RUnlock()
+	if resolver == nil {
+		return 0, false
+	}
+	return resolver(sessionID)
+}
+
+// answerSnapshotGeneration reports the policy generation the answer was evaluated
+// against, so a record can state it.
+func answerSnapshotGeneration(c *MemoryRouteCache) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.gen
+}
+
+// cacheVerdictToken names the route cache's answer to an evidence write.
+func cacheVerdictToken(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, policy.ErrSessionRetired):
+		return "session_retired"
+	case errors.Is(err, policy.ErrGenerationMismatch):
+		return "generation_mismatch"
+	case errors.Is(err, policy.ErrCapacityExceeded):
+		return "quarantined"
+	default:
+		return "error"
+	}
+}
+
+// DNSLedger returns the bounded DNS observation store, or nil when this cache has
+// none. It is the only reader the per-client diagnosis uses.
+func (c *MemoryRouteCache) DNSLedger() *dnsledger.Ledger {
+	if c == nil {
+		return nil
+	}
+	c.dnsRecordsMu.RLock()
+	defer c.dnsRecordsMu.RUnlock()
+	return c.dnsRecords
+}
+
+// SetIncarnationSource installs the route authority that binds a DNS observation
+// to the incarnation that produced it. The resolver is read-only and must not
+// call back into the cache: the forwarder lock sits above the cache lock.
+func (c *MemoryRouteCache) SetIncarnationSource(resolve func(sessionID string) (uint64, bool)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.incarnation = resolve
 }
 
 // Open opens or retrieves the session cache for the given scope.
@@ -502,6 +737,14 @@ func (c *MemoryRouteCache) RetireSessionScope(sessionID string) {
 	if sc := c.SessionScope(sessionID); sc != nil {
 		sc.Invalidate()
 	}
+	// The observation history is released in the same critical section that closes the
+	// session's history lifetime. A publication still in flight therefore either finds
+	// the lifetime already closed and drops its row, or appended before this point and is
+	// erased here; either ordering leaves no history behind. A closed lifetime keeps no
+	// entry, so this records no tombstone and re-admission opens a fresh lifetime.
+	c.dnsRecordsMu.Lock()
+	c.closeHistoryLifetimeLocked(sessionID)
+	c.dnsRecordsMu.Unlock()
 	if runtime := c.sessionRuntime(); runtime != nil {
 		runtime.RetireSessionRuntime(sessionID)
 	}
@@ -545,7 +788,10 @@ func (c *MemoryRouteCache) SetPolicyGeneration(generation string) {
 	c.rc.SetPolicyGeneration(generation)
 }
 
-// ObserveDNSResponse records client DNS observations into the active route cache used by the forwarder.
+// ObserveDNSResponse records client DNS observations into the active route cache used by
+// the forwarder. It carries no query receipt, so it writes route evidence only and no
+// history: history is written by the DNS observer with the receipt the query arrived
+// under.
 func (s *Service) ObserveDNSResponse(sessionID string, req, resp *mdns.Msg) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -557,7 +803,7 @@ func (s *Service) ObserveDNSResponse(sessionID string, req, resp *mdns.Msg) erro
 		return nil
 	}
 	if mem, ok := rc.(*MemoryRouteCache); ok {
-		return mem.ObserveDNSResponse(sessionID, req, resp)
+		return mem.ObserveDNSResponseEvidence(sessionID, req, resp)
 	}
 	return nil
 }
@@ -646,7 +892,13 @@ func initDNSGateway(gwDNS netip.Addr, matcher *policy.Matcher, rc forwarder.Rout
 // silently leaving the resolver unset: policy routing without a working
 // resolver produces no evidence at all, which is the failure this configuration
 // exists to remove.
-func newPolicyUpstreamResolver(configured []policy.Upstream) (*gatewaydns.UpstreamResolver, error) {
+//
+// It is a package-level variable so a test can substitute a constructor for the
+// same reason newDNSContinuityResolver is one: the production resolver validates
+// loopback upstreams away, and an encrypted local fixture can only be reached
+// through a wrapper that calls NewUpstreamResolver on the configuration this
+// function actually receives. Production always runs the value below.
+var newPolicyUpstreamResolver = func(configured []policy.Upstream) (*gatewaydns.UpstreamResolver, error) {
 	upstreams := configured
 	if len(upstreams) == 0 {
 		upstreams = policy.DefaultUpstreams()

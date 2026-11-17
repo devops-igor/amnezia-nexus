@@ -480,15 +480,37 @@ func TestDirectEgress_LookupExpirationAndBidirectionalRefresh(t *testing.T) {
 	}
 	natPort := binary.BigEndian.Uint16(wanPkts[0][20:22])
 
-	// Sleep 40ms, send reply to refresh lastSeen
-	time.Sleep(40 * time.Millisecond)
+	// Put the flow at a known logical age inside the 60ms lifetime instead of sleeping 40ms of
+	// real time inside that budget, where a delay of more than 20ms would make the reply look
+	// stale for reasons outside the product.
+	refreshKey := flowKeyForTest(t, peerKey, pkt2)
+	positionFlowAge(t, dem, refreshKey, 40*time.Millisecond)
+	before := sampleFlowAge(dem, refreshKey)
+	if !before.Present {
+		t.Fatal("the flow disappeared before the reply")
+	}
+	if before.Age < 30*time.Millisecond || before.Age > 60*time.Millisecond {
+		t.Fatalf("positioned age = %s, want a logical age inside the 60ms lifetime", before.Age)
+	}
+
+	// Send the reply that must refresh lastSeen.
 	reply := buildTestIPv4UDPPacket(targetIP, hostWAN, 53, natPort, []byte("reply-refresh"))
 	if err := dem.HandleWANReply(reply); err != nil {
 		t.Fatalf("HandleWANReply failed: %v", err)
 	}
 
-	// Sleep another 40ms (total elapsed since outbound = 80ms > 60ms timeout, but only 40ms since reply)
-	time.Sleep(40 * time.Millisecond)
+	// The refresh is proved by the real reply alone: the stored instant read after
+	// HandleWANReply must be later than the positioned one. Nothing in the test writes
+	// lastSeen after the reply, and no wall-clock threshold is asserted on the gap.
+	after := sampleFlowAge(dem, refreshKey)
+	if !after.Present {
+		t.Fatal("the reply retired the flow it should have refreshed")
+	}
+	if !after.LastSeen.After(before.LastSeen) {
+		t.Fatalf("lastSeen did not advance: before=%s after=%s", before.LastSeen, after.LastSeen)
+	}
+
+	// The refreshed flow is still served.
 	if choice, found := dem.LookupFlow(peerKey, pkt2); !found || choice != EgressChoiceDirect {
 		t.Fatalf("expected flow to remain active due to WAN reply refresh, got %v, %v", choice, found)
 	}

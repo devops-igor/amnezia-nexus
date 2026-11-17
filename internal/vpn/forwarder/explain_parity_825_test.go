@@ -79,8 +79,7 @@ func newExplainParityFixture(t *testing.T) *explainParityFixture {
 		t.Fatalf("open scope: %v", err)
 	}
 
-	fwd, dem, wan, _ := setupForwarderWithPBR(t)
-	t.Cleanup(func() { _ = dem.Close() })
+	fwd, _, wan, _ := setupForwarderWithPBR(t)
 	matcher := policy.NewMatcher()
 	matcher.Publish(snap)
 	fwd.SetPolicyMatcher(matcher)

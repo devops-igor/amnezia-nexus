@@ -151,7 +151,8 @@ func TestPBR_ICMPProxiedPreservesConnectivity(t *testing.T) {
 		t.Fatalf("expected ICMP packet to route to proxy backend, got err: %v", err)
 	}
 	select {
-	case pkt := <-beQueue:
+	case pktWork := <-beQueue:
+		pkt := pktWork.Bytes()
 		if len(pkt) < 20 || pkt[9] != 1 {
 			t.Fatalf("expected ICMP packet on backend queue, got proto %d", pkt[9])
 		}

@@ -3,6 +3,7 @@ package forwarder
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"net/netip"
 	"time"
@@ -133,6 +134,9 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	parsed, err := ParseAndValidateClientIPv4(packet, route.assignedIP)
 	if err != nil {
 		f.directDrops.Add(1)
+		// The packet is refused before a flow exists. Its destination and ports are not
+		// trusted, so the record carries the length only and states that it has no tuple.
+		f.recordClientDrop(peerKey, route, DropReasonInvalidPacket, 0, netip.Addr{}, 0, false, pktLen)
 		return err
 	}
 	dstIP := parsed.DstIP
@@ -146,6 +150,10 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	// Explicit exception: traffic to designated gateway DNS on port 53 strictly.
 	if err := ValidateDirectDestination(dstIP, parsed.DstPort, gwDNS); err != nil {
 		f.directDrops.Add(1)
+		// The destination is prohibited, so no flow is created. The packet IS a well-formed
+		// client packet, so its protocol and destination are recorded as observed facts.
+		f.recordClientDrop(peerKey, route, DropReasonProhibitedDestination,
+			parsed.Protocol, dstIP, parsed.DstPort, true, pktLen)
 		return err
 	}
 
@@ -168,24 +176,65 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 		}
 	}
 
+	// The decision's policy snapshot is read ONCE, and the same immutable snapshot
+	// supplies both the rule match and the generation recorded on the flow. A
+	// publish between two separate reads would let the record claim a generation
+	// that did not make the decision.
+	policySnapshot := currentPolicySnapshot(policyMatcher)
+	policyGeneration := policyGenerationOf(policySnapshot)
+	backendTunnel := backend.tunnelID
+
 	// Step 2 — PROXY: Policy snapshot CIDR or route cache Proxy match (including shared-IP conflict).
-	if f.matchesProxyPolicy(dstIP, sID, policyMatcher, routeCache) {
+	if matched, reason := f.matchesProxyPolicy(dstIP, sID, policySnapshot, routeCache); matched {
 		if directEgress != nil {
-			_ = directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceProxy)
+			_ = directEgress.RecordFlowDecision(peerKey, sID, route.generation, packet, EgressChoiceProxy, FlowDecision{
+				Reason:           reason,
+				PolicyGeneration: policyGeneration,
+				DecidedAt:        time.Now(),
+				BackendTunnelID:  backendTunnel,
+			})
 		}
 		return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
 	}
 
 	// Step 3 — DIRECT: Client-scoped DNS evidence observed public destination without proxy match.
 	if routeCache != nil && routeCache.Lookup(sID, dstIP) == policy.Direct {
-		return f.routeDirectDecision(directEgress, route, peerKey, packet, pktLen, backend, backendTraffic, sID, cID)
+		return f.routeDirectDecision(directEgress, route, peerKey, packet, pktLen, backend, backendTraffic, sID, cID, FlowDecision{
+			Reason:           EgressReasonEvidenceDirect,
+			PolicyGeneration: policyGeneration,
+			DecidedAt:        time.Now(),
+		})
 	}
 
 	// Step 4 — PROXY (Safe Default): Missing, expired, or evicted DNS evidence (policy.Unknown).
 	if directEgress != nil {
-		_ = directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceProxy)
+		_ = directEgress.RecordFlowDecision(peerKey, sID, route.generation, packet, EgressChoiceProxy, FlowDecision{
+			Reason:           EgressReasonNoTrustedEvidence,
+			PolicyGeneration: policyGeneration,
+			DecidedAt:        time.Now(),
+			BackendTunnelID:  backendTunnel,
+		})
 	}
 	return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
+}
+
+// currentPolicySnapshot reads the published snapshot once. Everything a decision
+// records about "the policy" comes from the snapshot this returns, never from a
+// second read that a concurrent publish could move.
+func currentPolicySnapshot(matcher *policy.Matcher) *policy.Snapshot {
+	if matcher == nil {
+		return nil
+	}
+	return matcher.Current()
+}
+
+// policyGenerationOf reports the generation of the snapshot the decision was
+// taken against, or "" when no snapshot is published.
+func policyGenerationOf(snapshot *policy.Snapshot) string {
+	if snapshot == nil {
+		return ""
+	}
+	return snapshot.Generation()
 }
 
 func (f *Forwarder) handleStickyFlow(directEgress *DirectEgressManager, route *sessionRoute, peerKey string, packet []byte, pktLen int64, backend proxyBackend, backendTraffic *trafficCounters, sID, cID string) (bool, error) {
@@ -205,31 +254,46 @@ func (f *Forwarder) handleStickyFlow(directEgress *DirectEgressManager, route *s
 	return true, f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
 }
 
-func (f *Forwarder) routeDirectDecision(directEgress *DirectEgressManager, route *sessionRoute, peerKey string, packet []byte, pktLen int64, backend proxyBackend, backendTraffic *trafficCounters, sID, cID string) error {
+func (f *Forwarder) routeDirectDecision(directEgress *DirectEgressManager, route *sessionRoute, peerKey string, packet []byte, pktLen int64, backend proxyBackend, backendTraffic *trafficCounters, sID, cID string, decision FlowDecision) error {
 	if route.retired.Load() || (route.generation != 0 && f.PeerRegistration(peerKey) != route.generation) {
+		// The route this evidence belonged to is gone. The packet still has to go
+		// somewhere, so it takes the proxy path, but no DIRECT flow record is
+		// installed for it: there is no live incarnation to attribute it to.
 		return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
 	}
 	if directEgress != nil {
-		if err := directEgress.RecordFlow(peerKey, sID, route.generation, packet, EgressChoiceDirect); err != nil {
+		if err := directEgress.RecordFlowDecision(peerKey, sID, route.generation, packet, EgressChoiceDirect, decision); err != nil {
 			f.directDrops.Add(1)
+			// The decision could not be installed, so no flow record exists to explain this
+			// client's packet. The refusal is recorded against the live route.
+			f.recordDirectRefusal(peerKey, route, packet, pktLen, err, refusalAtDecisionInstall)
 			return err
 		}
 		return f.sendToDirectEgress(directEgress, route, peerKey, packet, pktLen, sID, cID)
 	}
 	f.directDrops.Add(1)
+	// No direct-egress manager at all: the packet is refused before any flow exists, which
+	// is exactly the case a global counter cannot attribute to this client.
+	f.recordDirectRefusal(peerKey, route, packet, pktLen, ErrDirectEgressUnavailable, refusalBeforeDispatch)
 	return ErrDirectEgressUnavailable
 }
 
-func (f *Forwarder) matchesProxyPolicy(dstIP netip.Addr, sID string, policyMatcher *policy.Matcher, routeCache RouteCache) bool {
-	if policyMatcher != nil {
-		if snap := policyMatcher.Current(); snap != nil && snap.MatchIPv4(dstIP) {
-			return true
-		}
+// matchesProxyPolicy reports whether the policy puts this destination on the
+// proxy, and WHICH branch matched. The caller records the branch as the flow's
+// decision reason (issue #861), so the reason is the branch that actually ran
+// rather than a second evaluation of the same rules.
+//
+// It takes the published snapshot rather than the matcher on purpose: the caller
+// takes one snapshot at the decision and uses it for both this match and the
+// generation it records, so the two can never disagree.
+func (f *Forwarder) matchesProxyPolicy(dstIP netip.Addr, sID string, snapshot *policy.Snapshot, routeCache RouteCache) (bool, EgressReason) {
+	if snapshot != nil && snapshot.MatchIPv4(dstIP) {
+		return true, EgressReasonProxyCIDRRule
 	}
 	if routeCache != nil && routeCache.Lookup(sID, dstIP) == policy.Proxy {
-		return true
+		return true, EgressReasonProxyCachedEvidence
 	}
-	return false
+	return false, ""
 }
 
 func (f *Forwarder) sendToDirectEgress(directEgress *DirectEgressManager, route *sessionRoute, peerKey string, packet []byte, pktLen int64, sID, cID string) error {
@@ -248,6 +312,7 @@ func (f *Forwarder) sendToDirectEgress(directEgress *DirectEgressManager, route 
 	err := directEgress.RouteDirect(peerKey, route.assignedIP, sID, route.generation, packet, route.returnPath)
 	if err != nil {
 		f.directDrops.Add(1)
+		f.recordDirectRefusal(peerKey, route, packet, pktLen, err, refusalAtDispatch)
 		return err
 	}
 
@@ -268,7 +333,7 @@ func (f *Forwarder) sendToDirectEgress(directEgress *DirectEgressManager, route 
 // availability instead of whatever the route points at by then.
 type proxyBackend struct {
 	tunnelID int64
-	queue    chan []byte
+	queue    chan BackendPacket
 }
 
 // sendToProxyBackend enqueues one proxy-required packet toward the route's
@@ -281,7 +346,13 @@ type proxyBackend struct {
 // hand to a live backend is dropped and counted (issue #677 "drop and count");
 // it is never re-decided as DIRECT.
 func (f *Forwarder) sendToProxyBackend(backend proxyBackend, route *sessionRoute, backendTraffic *trafficCounters, sID, cID string, packet []byte, pktLen int64) error {
+	// ONE evidence lookup for this packet, taken before the enqueue: the same
+	// pointer is credited with the admission outcome here and travels with the
+	// queued work so the device write credits the same incarnation.
+	stats := f.proxyDispatchEvidence(route, packet)
+
 	if backend.queue == nil {
+		stats.recordForward(0, errProxyBackendUnavailable, FlowFailureBackendUnavailable)
 		return f.dropProxyPacket()
 	}
 
@@ -291,20 +362,29 @@ func (f *Forwarder) sendToProxyBackend(backend proxyBackend, route *sessionRoute
 	f.mu.RLock()
 	if _, detached := f.detachedBackends[backend.tunnelID]; detached {
 		f.mu.RUnlock()
+		stats.recordForward(0, errProxyBackendDetached, FlowFailureBackendDetached)
 		return f.dropProxyPacket()
 	}
 	select {
-	case backend.queue <- pktCopy:
+	case backend.queue <- newBackendPacket(pktCopy, stats, sID, route.generation):
 		f.mu.RUnlock()
 		f.recordProxyAdmission(route, backendTraffic, sID, cID, pktLen)
+		stats.recordForward(0, nil, "")
 		return nil
 	default:
 		f.mu.RUnlock()
 		f.clientDropsQueueFull.Add(1)
 		f.clientDropsTotal.Add(1)
+		stats.recordForward(0, errProxyQueueFull, FlowFailureQueueFull)
 		return ErrQueueFull
 	}
 }
+
+var (
+	errProxyBackendUnavailable = errors.New("proxy backend unavailable")
+	errProxyBackendDetached    = errors.New("proxy backend detached")
+	errProxyQueueFull          = errors.New("proxy backend queue full")
+)
 
 // dropProxyPacket counts a proxy-required packet the proxy path refused and
 // returns the fail-closed error the caller propagates.
@@ -315,10 +395,10 @@ func (f *Forwarder) dropProxyPacket() error {
 	return ErrBackendNotFound
 }
 
-// recordProxyAdmission books a proxy packet that actually entered the backend
-// queue. Admission is recorded at enqueue time (see the dataplane ownership
-// contract, client-to-backend traversal), so a later writer failure is reported
-// as a drop without retroactively un-booking these counters.
+// recordProxyAdmission books a proxy packet that actually entered the backend queue.
+// Admission is recorded at enqueue time (see the dataplane ownership contract,
+// client-to-backend traversal), so a later writer failure is reported as a drop
+// without retroactively un-booking these counters.
 func (f *Forwarder) recordProxyAdmission(route *sessionRoute, backendTraffic *trafficCounters, sID, cID string, pktLen int64) {
 	f.totalRxBytes.Add(pktLen)
 	f.totalRxPackets.Add(1)
@@ -332,12 +412,39 @@ func (f *Forwarder) recordProxyAdmission(route *sessionRoute, backendTraffic *tr
 	}
 }
 
-func (f *Forwarder) sendToBackendQueue(beQueue chan []byte, route *sessionRoute, backendTraffic *trafficCounters, sID, cID string, packet []byte, pktLen int64) error {
+// proxyDispatchEvidence returns the evidence block of the flow that admitted this
+// packet, or nil when no flow is attributable. It applies the same incarnation
+// guard the dispatch outcome used: a packet arriving on a route whose session or
+// generation no longer owns the tuple is not credited to whoever owns it now.
+// The manager pointer, the peer key and the incarnation are captured in ONE forwarder
+// read critical section: SetDirectEgress replaces the pointer under the write lock while
+// administrator-driven disable/reconfiguration runs, so an unsynchronized read before
+// this snapshot would race with that writer. The lock is released before the manager's
+// own read lock is taken, which keeps the documented Forwarder -> DirectEgress order.
+func (f *Forwarder) proxyDispatchEvidence(route *sessionRoute, packet []byte) *flowStats {
+	if f == nil || route == nil {
+		return nil
+	}
+	f.mu.RLock()
+	dem := f.directEgress
+	peerKey := route.peerKey
+	sessionID := route.sessionID
+	generation := route.generation
+	f.mu.RUnlock()
+	if dem == nil || peerKey == "" {
+		return nil
+	}
+	return dem.dispatchEvidence(peerKey, sessionID, generation, packet)
+}
+
+func (f *Forwarder) sendToBackendQueue(beQueue chan BackendPacket, route *sessionRoute, backendTraffic *trafficCounters, sID, cID string, packet []byte, pktLen int64) error {
 	pktCopy := make([]byte, len(packet))
 	copy(pktCopy, packet)
 
+	// The legacy (non-policy) path records no flow, so the queued work carries no
+	// owner. A nil owner is the honest value: nothing is credited later.
 	select {
-	case beQueue <- pktCopy:
+	case beQueue <- newBackendPacket(pktCopy, nil, sID, 0):
 		f.totalRxBytes.Add(pktLen)
 		f.totalRxPackets.Add(1)
 		route.traffic.record(pktLen, true)
@@ -401,17 +508,41 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 	backendTraffic := f.backendTraffic[backendTunnelID]
 	f.mu.RUnlock()
 
+	// Reverse the reply into the admitting flow BEFORE any refusal, so a reply that is
+	// dropped for size or rate still says where it stopped instead of vanishing. A reply
+	// that reverses to no flow, or to another incarnation, stays unattributed: it is
+	// counted as such and never credited to a flow it cannot be shown to belong to.
+	clientIP, err := netip.ParseAddr(destIP)
+	if err != nil {
+		clientIP = netip.Addr{}
+	}
+	returnEvidence, returnMatched := f.proxyReturnEvidence(route, packet, clientIP)
+	// Arrival is recorded BEFORE the size, rate and queue decisions, so the counters
+	// conserve: every matched reply is either admitted or dropped, and the observed label
+	// describes what was actually measured rather than what survived the filters.
+	if returnMatched {
+		returnEvidence.recordReturnMatch()
+	} else {
+		f.proxyReturnsUnmatched.Add(1)
+	}
+
 	pktLen := int64(len(packet))
 	if len(packet) > MaxClientQueuePacketBytes {
 		f.recordOversizedReturn(&f.oversizedBackendReturns, len(packet))
+		returnEvidence.recordReturnRefused(FlowReturnOversized)
 		return ErrPacketTooLarge
 	}
 	if tbDown != nil && !tbDown.Allow(pktLen) {
+		returnEvidence.recordReturnRefused(FlowReturnRateLimited)
 		return ErrRateLimitExceeded
 	}
 
 	pktCopy := make([]byte, len(packet))
 	copy(pktCopy, packet)
+	// The matched flow travels with the packet. The writer runs asynchronously and the
+	// flow can be retired or replaced in between, so the identity is fixed here and never
+	// re-resolved later.
+	queued := ClientPacket{packet: pktCopy, evidence: returnEvidence}
 
 	f.mu.RLock()
 	currentRoute, current := f.routesByIP[destIP]
@@ -420,13 +551,14 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		f.dropsNoRoute.Add(1)
 		f.dropsTotal.Add(1)
 		f.classifyReturnReject(ReturnRejectedUnrouted)
+		returnEvidence.recordReturnRefused(FlowReturnRouteReplaced)
 		return ErrSessionNotRegistered
 	}
 	clientQueue := route.clientQueue
 	f.aggregateQueueMu.Lock()
 	f.reconcileBeforeQueueMutationLocked(route)
 	select {
-	case clientQueue <- pktCopy:
+	case clientQueue <- queued:
 		f.reconcileQueueOccupancyLocked(route)
 		routeOccupancy := uint64(len(clientQueue))
 		for current := route.queueHighWater.Load(); routeOccupancy > current; {
@@ -448,6 +580,7 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		}
 		f.aggregateQueueMu.Unlock()
 		f.mu.RUnlock()
+		returnEvidence.recordReturnAdmitted()
 		f.totalTxBytes.Add(pktLen)
 		f.totalTxPackets.Add(1)
 		route.traffic.record(pktLen, false)
@@ -465,6 +598,7 @@ func (f *Forwarder) RouteBackendToClient(backendTunnelID int64, packet []byte, d
 		route.queueFullDrops.Add(1)
 		f.dropsQueueFull.Add(1)
 		f.dropsTotal.Add(1)
+		returnEvidence.recordReturnRefused(FlowReturnQueueFull)
 		return ErrQueueFull
 	}
 }
@@ -481,7 +615,7 @@ func (f *Forwarder) AttachBackendDevice(backendTunnelID int64, dev PacketDevice)
 	defer f.mu.Unlock()
 
 	if _, ok := f.backendQueues[backendTunnelID]; !ok {
-		f.backendQueues[backendTunnelID] = make(chan []byte, f.backendBufSize)
+		f.backendQueues[backendTunnelID] = make(chan BackendPacket, f.backendBufSize)
 		f.ensureBackendTrafficLocked(backendTunnelID)
 	}
 	if dev != nil {
@@ -628,7 +762,7 @@ func (f *Forwarder) StopPumps() {
 	f.pumpsWg.Wait()
 }
 
-func (f *Forwarder) pumpBackendQueue(globalStopCh <-chan struct{}, perPumpStopCh <-chan struct{}, doneCh chan struct{}, backendTunnelID int64, queue chan []byte, dev PacketDevice) {
+func (f *Forwarder) pumpBackendQueue(globalStopCh <-chan struct{}, perPumpStopCh <-chan struct{}, doneCh chan struct{}, backendTunnelID int64, queue chan BackendPacket, dev PacketDevice) {
 	defer f.pumpsWg.Done()
 	if doneCh != nil {
 		defer close(doneCh)
@@ -639,14 +773,14 @@ func (f *Forwarder) pumpBackendQueue(globalStopCh <-chan struct{}, perPumpStopCh
 			return
 		case <-perPumpStopCh:
 			return
-		case pkt, ok := <-queue:
+		case work, ok := <-queue:
 			if !ok {
 				return
 			}
 			if pumpStopped(globalStopCh, perPumpStopCh) {
 				return
 			}
-			f.writeBackendPacket(dev, pkt)
+			f.writeBackendPacket(dev, work)
 		}
 	}
 }
@@ -672,14 +806,22 @@ func pumpStopped(globalStopCh, perPumpStopCh <-chan struct{}) bool {
 // throughput because admission is booked at enqueue time (see
 // recordProxyAdmission); the legacy path keeps its existing silent-error
 // behavior.
-func (f *Forwarder) writeBackendPacket(dev PacketDevice, pkt []byte) {
+func (f *Forwarder) writeBackendPacket(dev PacketDevice, work BackendPacket) {
 	if dev == nil {
+		// No device means the packet was never written: no completion and no failure
+		// is recorded, because inventing either would misstate what happened.
 		return
 	}
-	if _, err := dev.Write(pkt); err != nil && f.pbrEnabled.Load() {
+	packet := work.Bytes()
+	n, err := dev.Write(packet)
+	if err != nil && f.pbrEnabled.Load() {
 		f.proxyDrops.Add(1)
 		f.clientDropsTotal.Add(1)
 	}
+	// The admitting flow learns what the DEVICE did, through the ownership captured
+	// at enqueue. Admitted bytes stay booked: completion is additional observation,
+	// not a correction of throughput.
+	work.owner.recordBackendWrite(n, len(packet), err)
 }
 
 func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute) {
@@ -691,7 +833,7 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 	routeStopCh := route.stopCh
 
 	for {
-		var pkt []byte
+		var pkt ClientPacket
 		select {
 		case <-stopCh:
 			return
@@ -722,6 +864,10 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 		currentRoute, current := f.routesByPeer[route.peerKey]
 		if !current || currentRoute != route || route.stopped {
 			f.mu.RUnlock()
+			// The route was replaced or stopped before the handoff. The reply never
+			// reaches a client, and the flow that admitted it records where it stopped
+			// instead of looking queued forever.
+			pkt.evidenceOrNil().recordReturnRefused(FlowReturnRouteReplaced)
 			continue
 		}
 		var dev packetWriter
@@ -729,8 +875,12 @@ func (f *Forwarder) pumpClientQueue(stopCh <-chan struct{}, route *sessionRoute)
 			dev = routeWriter{path: route.returnPath, peerKey: route.peerKey, assignedIP: route.assignedIP}
 		}
 		f.mu.RUnlock()
-		if dev != nil {
-			f.writeClientPacket(route, dev, pkt)
+		if dev == nil {
+			// No engine writer for this route: the reply cannot be handed off, and the
+			// matched flow records the refusal instead of looking delivered.
+			pkt.evidenceOrNil().recordReturnRefused(FlowReturnPathClosed)
+			continue
 		}
+		f.writeClientPacket(route, dev, pkt.packet, pkt.evidenceOrNil())
 	}
 }

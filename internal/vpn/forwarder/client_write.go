@@ -213,10 +213,13 @@ func (route *sessionRoute) waitForWriteContext(ctx context.Context) error {
 // that selected a device before retirement but reaches admission afterward is
 // rejected. If retirement races an admitted write, retirement waits outside
 // f.mu; once it returns, this generation can no longer call dev.Write.
-func (f *Forwarder) writeClientPacket(route *sessionRoute, dev packetWriter, packet []byte) {
+func (f *Forwarder) writeClientPacket(route *sessionRoute, dev packetWriter, packet []byte, evidence *flowStats) {
 	route.writeMu.Lock()
 	defer route.writeMu.Unlock()
 	if route.retired.Load() {
+		// The route was retired between admission and the write: the reply never reaches
+		// the client, and the matched flow records where it stopped.
+		evidence.recordReturnRefused(FlowReturnPathClosed)
 		return
 	}
 	started := time.Now()
@@ -226,7 +229,7 @@ func (f *Forwarder) writeClientPacket(route *sessionRoute, dev packetWriter, pac
 	f.writesInFlight[route] = started
 	f.writeMetricsMu.Unlock()
 
-	_, err := dev.Write(packet)
+	written, err := dev.Write(packet)
 	duration := time.Since(started)
 	f.writeMetricsMu.Lock()
 	delete(f.writesInFlight, route)
@@ -258,6 +261,9 @@ func (f *Forwarder) writeClientPacket(route *sessionRoute, dev packetWriter, pac
 				route.peerKey, route.sessionID, err)
 		}
 	}
+	// The client writer's own result: a completed handoff, a refusal or a cut frame. This
+	// is the last observation the reply produces, and it is not application success.
+	evidence.recordReturnDelivered(written, len(packet), err)
 }
 
 // routeQueueStatsLocked attributes queue loss and write stalls to the same

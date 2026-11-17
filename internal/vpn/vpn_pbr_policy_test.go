@@ -69,7 +69,7 @@ func TestPBR_ProtectedDomainNeverDirect(t *testing.T) {
 		Hdr: mdns.RR_Header{Name: "blocked.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
 		A:   blockedIP.AsSlice(),
 	})
-	if err := memRC.ObserveDNSResponse(sessionID, reqBlocked, respBlocked); err != nil {
+	if err := memRC.ObserveDNSResponseEvidence(sessionID, reqBlocked, respBlocked); err != nil {
 		t.Fatalf("ObserveDNSResponse blocked.com failed: %v", err)
 	}
 
@@ -87,7 +87,7 @@ func TestPBR_ProtectedDomainNeverDirect(t *testing.T) {
 		Hdr: mdns.RR_Header{Name: "example.com.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
 		A:   unlistedIP.AsSlice(),
 	})
-	memRC.ObserveDNSResponse(sessionID, reqUnlisted, respUnlisted)
+	memRC.ObserveDNSResponseEvidence(sessionID, reqUnlisted, respUnlisted)
 
 	// Decision for unlisted public domain is DIRECT
 	if d := memRC.Lookup(sessionID, unlistedIP); d != policy.Direct {

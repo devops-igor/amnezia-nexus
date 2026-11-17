@@ -30,8 +30,8 @@ func TestWriteDurationPrometheusHistogramRealCompletions(t *testing.T) {
 		f := NewForwarder(nil, "")
 		f.RegisterSession("s", "c", "peer", "192.0.2.1", 1)
 		route := f.routesByPeer["peer"]
-		f.writeClientPacket(route, expandedTimedWriter{delay: 110 * time.Microsecond}, []byte{1})
-		f.writeClientPacket(route, expandedTimedWriter{delay: 2 * time.Millisecond, failed: true}, []byte{1})
+		f.writeClientPacket(route, expandedTimedWriter{delay: 110 * time.Microsecond}, []byte{1}, nil)
+		f.writeClientPacket(route, expandedTimedWriter{delay: 2 * time.Millisecond, failed: true}, []byte{1}, nil)
 		exporter, ok := any(f).(interface{ WriteDurationMetrics(io.Writer) error })
 		if !ok {
 			t.Fatal("forwarder has no Prometheus write-duration exporter")

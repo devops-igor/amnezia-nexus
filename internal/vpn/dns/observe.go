@@ -273,6 +273,97 @@ func buildObservations(
 	return observations
 }
 
+// ObservedAnswer is what the observation path actually did with one answer: the
+// classifier's verdict, the evidence it wrote, and the query and answer envelope
+// as received.
+//
+// It exists so a caller can report the observation without re-running the
+// classifier (issue #861): a second traversal would let a diagnostic accept an
+// answer the observation path rejected, or invent eligibility rules the data
+// path does not have. Only ObserveResponseResult produces it.
+type ObservedAnswer struct {
+	// Classification is the classifier's verdict, including Names (the queried
+	// name followed by the validated CNAME chain) and the two address sets.
+	Classification AnswerClassification
+	// Observations are the evidence actually written into the session cache.
+	// Empty when nothing was written, whether because the answer was rejected or
+	// because it carried no evidence-eligible address.
+	Observations []policy.Observation
+	// ExpiresAt is the deadline the written observations carry. Zero when none
+	// were written.
+	ExpiresAt time.Time
+	// CacheErr is the session cache's verdict on the write: nil when it accepted
+	// (or when nothing was written), non-nil when it refused (quarantined,
+	// retired, generation mismatch).
+	CacheErr error
+	// QName is the queried name as the request carried it, QType its type and
+	// RCode the answer's response code. They describe the exchange even when the
+	// classifier rejected it.
+	QName string
+	QType uint16
+	RCode int
+	// RecvTime is the instant the caller says the query was received. It is the
+	// same instant the evidence deadline is computed from.
+	RecvTime time.Time
+}
+
+// observedAnswerEnvelope records what the exchange itself was, independent of
+// whether the observation path could evaluate it: the query and the response
+// code are facts about the packet, not about the policy.
+func observedAnswerEnvelope(req *mdns.Msg, resp *mdns.Msg, recvTime time.Time) ObservedAnswer {
+	result := ObservedAnswer{RecvTime: recvTime}
+	if req != nil && len(req.Question) > 0 {
+		result.QName = req.Question[0].Name
+		result.QType = req.Question[0].Qtype
+	}
+	if resp != nil {
+		result.RCode = resp.Rcode
+	}
+	return result
+}
+
+// ObserveResponseResult evaluates one completed answer and reports exactly what it
+// did. It performs the whole observation once: envelope validation, CNAME
+// traversal, rule evaluation and the evidence write. ObserveResponse delegates
+// here, so the two cannot drift.
+func ObserveResponseResult(
+	req *mdns.Msg,
+	resp *mdns.Msg,
+	snapshot *policy.Snapshot,
+	session *policy.SessionCache,
+	recvTime time.Time,
+	maxTTL time.Duration,
+) (ObservedAnswer, error) {
+	result := observedAnswerEnvelope(req, resp, recvTime)
+	if session == nil || snapshot == nil {
+		return result, nil
+	}
+
+	answer := ClassifyAnswer(req, resp, maxTTL)
+	result.Classification = answer
+	// Production consumes only the evidence-eligible set. The resolved set also
+	// holds addresses the data path drops, which must never become evidence.
+	if !answer.Valid || len(answer.EvidenceAddresses) == 0 {
+		return result, nil
+	}
+
+	requiresProxy, ok := evaluateDomainRules(answer.Names, snapshot)
+	if !ok {
+		return result, nil
+	}
+
+	observations := buildObservations(answer.EvidenceAddresses, requiresProxy, snapshot, answer.MinTTL, maxTTL, recvTime)
+	if len(observations) == 0 {
+		return result, nil
+	}
+
+	err := session.Observe(snapshot.Generation(), observations, recvTime)
+	result.Observations = observations
+	result.ExpiresAt = observations[0].ExpiresAt
+	result.CacheErr = err
+	return result, err
+}
+
 // ObserveResponse evaluates a completed DNS response against the active policy snapshot
 // and publishes client-scoped route evidence into the session cache.
 func ObserveResponse(
@@ -283,27 +374,6 @@ func ObserveResponse(
 	recvTime time.Time,
 	maxTTL time.Duration,
 ) ([]policy.Observation, error) {
-	if session == nil || snapshot == nil {
-		return nil, nil
-	}
-
-	answer := ClassifyAnswer(req, resp, maxTTL)
-	// Production consumes only the evidence-eligible set. The resolved set also
-	// holds addresses the data path drops, which must never become evidence.
-	if !answer.Valid || len(answer.EvidenceAddresses) == 0 {
-		return nil, nil
-	}
-
-	requiresProxy, ok := evaluateDomainRules(answer.Names, snapshot)
-	if !ok {
-		return nil, nil
-	}
-
-	observations := buildObservations(answer.EvidenceAddresses, requiresProxy, snapshot, answer.MinTTL, maxTTL, recvTime)
-	if len(observations) == 0 {
-		return nil, nil
-	}
-
-	err := session.Observe(snapshot.Generation(), observations, recvTime)
-	return observations, err
+	result, err := ObserveResponseResult(req, resp, snapshot, session, recvTime, maxTTL)
+	return result.Observations, err
 }

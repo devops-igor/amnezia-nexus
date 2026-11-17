@@ -200,7 +200,8 @@ func TestRollbackMigration(t *testing.T) {
 			t.Fatalf("RouteClientToBackend failed: %v", err)
 		}
 		select {
-		case received := <-q1:
+		case receivedWork := <-q1:
+			received := receivedWork.Bytes()
 			if !bytes.Equal(received, pkt) {
 				t.Fatalf("packet mismatch on backend 1 queue after rollback")
 			}
@@ -417,7 +418,8 @@ func TestMigrateSession(t *testing.T) {
 			t.Fatalf("RouteClientToBackend failed: %v", err)
 		}
 		select {
-		case received := <-q2:
+		case receivedWork := <-q2:
+			received := receivedWork.Bytes()
 			if !bytes.Equal(received, pkt) {
 				t.Fatalf("packet mismatch on backend 2 queue")
 			}
@@ -531,7 +533,8 @@ func TestMigrateSession(t *testing.T) {
 			t.Fatalf("RouteClientToBackend failed: %v", err)
 		}
 		select {
-		case received := <-q1:
+		case receivedWorkTemp := <-q1:
+			received := receivedWorkTemp.Bytes()
 			if !bytes.Equal(received, pkt) {
 				t.Fatalf("packet mismatch on backend 1 queue after rollback")
 			}

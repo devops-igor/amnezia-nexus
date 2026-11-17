@@ -76,7 +76,7 @@ type sessionRoute struct {
 	backendTunnelID int64
 	generation      uint64
 	returnPath      *ReturnPath // immutable owner for this route generation; nil means legacy
-	clientQueue     chan []byte
+	clientQueue     chan ClientPacket
 	queueReady      chan struct{} // coalesced notification; dequeue holds aggregateQueueMu
 	queueHighWater  atomic.Uint64
 	queueFullDrops  atomic.Uint64
@@ -116,10 +116,10 @@ type Forwarder struct {
 	routesByPeer     map[string]*sessionRoute // peerKey -> route
 	routesByIP       map[string]*sessionRoute // assignedIP -> route
 	backendTraffic   map[int64]*trafficCounters
-	backendQueues    map[int64]chan []byte   // backendTunnelID -> queue
-	backendDevices   map[int64]PacketDevice  // backendTunnelID -> device
-	backendPumpStops map[int64]chan struct{} // backendTunnelID -> pump stop channel
-	backendPumpDones map[int64]chan struct{} // backendTunnelID -> pump done channel
+	backendQueues    map[int64]chan BackendPacket // backendTunnelID -> queue
+	backendDevices   map[int64]PacketDevice       // backendTunnelID -> device
+	backendPumpStops map[int64]chan struct{}      // backendTunnelID -> pump stop channel
+	backendPumpDones map[int64]chan struct{}      // backendTunnelID -> pump done channel
 	bufSize          int
 	backendBufSize   int
 	maxActiveRoutes  int
@@ -150,7 +150,13 @@ type Forwarder struct {
 	clientDropsQueueFull   atomic.Uint64 // client packets dropped: backend queue full
 	clientDropsRateLimited atomic.Uint64 // client packets dropped: upstream token bucket exhausted
 	clientDropsNoBackend   atomic.Uint64 // client packets dropped: backend queue not registered/found
-	clientDropsTotal       atomic.Uint64 // monotonic total of client->backend drops in forwarder
+	// proxyReturnsUnmatched counts backend replies that reversed to no recorded flow
+	// or to another incarnation. They are counted, never credited to a guessed flow.
+	proxyReturnsUnmatched atomic.Uint64
+	// clientDrops retains the bounded per-client refusals that happen BEFORE a flow
+	// exists, so the per-client answer can explain them (issue #861).
+	clientDrops      *dropLedger
+	clientDropsTotal atomic.Uint64 // monotonic total of client->backend drops in forwarder
 	// spoofedRebinds counts client→backend packets whose claimed inner
 	// source IP failed the rebind ownership guard (issue #89): outside the
 	// portal subnet or already assigned to another route. Such packets are
@@ -329,10 +335,11 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 	}
 	fwd := &Forwarder{
 		accountant:         accountant,
+		clientDrops:        newDropLedger(nil),
 		portalSubnet:       portalSubnet,
 		routesByPeer:       make(map[string]*sessionRoute),
 		routesByIP:         make(map[string]*sessionRoute),
-		backendQueues:      make(map[int64]chan []byte),
+		backendQueues:      make(map[int64]chan BackendPacket),
 		backendDevices:     make(map[int64]PacketDevice),
 		detachedBackends:   make(map[int64]struct{}),
 		writesInFlight:     make(map[*sessionRoute]time.Time),
@@ -358,7 +365,7 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 // Consumers must use this channel only as an observation/compatibility handle;
 // direct receives bypass queue accounting. Production consumers should leave
 // draining to StartPumps so occupancy and high-water metrics remain meaningful.
-func (f *Forwarder) GetClientPacketChannel(peerKey string) (<-chan []byte, bool) {
+func (f *Forwarder) GetClientPacketChannel(peerKey string) (<-chan ClientPacket, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	route, ok := f.routesByPeer[peerKey]
@@ -369,7 +376,11 @@ func (f *Forwarder) GetClientPacketChannel(peerKey string) (<-chan []byte, bool)
 }
 
 // GetBackendPacketChannel returns the packet channel for a backend tunnel.
-func (f *Forwarder) GetBackendPacketChannel(backendTunnelID int64) (<-chan []byte, bool) {
+//
+// Each element carries its bytes AND the flow identity captured at admission, so a
+// caller that only observes packets uses Bytes(). The channel's capacity, ordering and
+// drain behavior are unchanged.
+func (f *Forwarder) GetBackendPacketChannel(backendTunnelID int64) (<-chan BackendPacket, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	ch, ok := f.backendQueues[backendTunnelID]
@@ -482,7 +493,7 @@ func (f *Forwarder) SetStopTimeoutForTest(d time.Duration) {
 }
 
 // SetBackendQueueForTest sets or deletes a backend queue for testing drop behavior.
-func (f *Forwarder) SetBackendQueueForTest(backendTunnelID int64, ch chan []byte) {
+func (f *Forwarder) SetBackendQueueForTest(backendTunnelID int64, ch chan BackendPacket) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if ch == nil {
