@@ -754,62 +754,92 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 		packet = append(packet, pad...)
 		binary.BigEndian.PutUint16(packet[2:4], 1420)
 	}
-	// Bounded per-test event recorder. It exists so a failure names the event index and the gap
-	// that was late instead of only "15/16": the CI failure this case produced could not be
-	// attributed, and a bare retry would have produced the same message again. The recorder holds
-	// timestamps only, never payloads, and is capped so a long stall cannot grow it.
-	const recordedEvents = 64
+	// Bounded per-test event recorder. It exists so a failure names the event index and the
+	// phase that was late instead of only "15/16": the CI failure this case produced could not
+	// be attributed, and a bare retry would have produced the same message again.
+	//
+	// It is a RING, not the first N events: a stall happens late, so keeping the earliest
+	// history would describe the wrong window. It holds timestamps only, never payloads, and its
+	// size is fixed, so a long stall cannot grow it.
+	//
+	// Enqueue, start and completion are three different facts and are recorded as three
+	// timestamps. The pump's write path signals `started` when it enters Write and `written`
+	// when it returns, so a single recorder fed by both would label a start as a completion.
+	const stallRing = 64
 	type stallEvent struct {
+		seq      int
 		enqueued time.Time
+		started  time.Time
 		written  time.Time
 	}
-	stallLog := make([]stallEvent, 0, recordedEvents)
-	recordEnqueue := func() {
-		if len(stallLog) >= recordedEvents {
+	var (
+		ring      [stallRing]stallEvent
+		ringBase  int
+		ringCount int
+		nextSeq   int
+		startSeq  int
+		writeSeq  int
+	)
+	push := func(ev stallEvent) {
+		if ringCount < stallRing {
+			ring[(ringBase+ringCount)%stallRing] = ev
+			ringCount++
 			return
 		}
-		stallLog = append(stallLog, stallEvent{enqueued: time.Now()})
+		ring[ringBase] = ev
+		ringBase = (ringBase + 1) % stallRing
+	}
+	slotOf := func(seq int) int {
+		if seq < ringBase || seq >= ringBase+ringCount {
+			return -1
+		}
+		return (seq - ringBase) % stallRing
+	}
+	recordEnqueue := func() {
+		push(stallEvent{seq: nextSeq, enqueued: time.Now()})
+		nextSeq++
+	}
+	recordStarted := func() {
+		if slot := slotOf(startSeq); slot >= 0 {
+			ring[slot].started = time.Now()
+		}
+		startSeq++
 	}
 	recordWritten := func() {
-		for i := range stallLog {
-			if stallLog[i].written.IsZero() {
-				stallLog[i].written = time.Now()
-				return
-			}
+		if slot := slotOf(writeSeq); slot >= 0 {
+			ring[slot].written = time.Now()
 		}
+		writeSeq++
 	}
-	stallReport := func(waited, want int) string {
+	stallReport := func(stalledAt, wanted int) string {
 		var b strings.Builder
-		fmt.Fprintf(&b, "recorded=%d", len(stallLog))
-		_ = waited
-		limit := len(stallLog)
-		for i := 0; i < limit; i++ {
-			_ = i
-			ev := stallLog[i]
-			written := "not_written"
-			if !ev.written.IsZero() {
-				written = ev.written.Sub(ev.enqueued).Round(time.Microsecond).String()
-			}
-			// Only the tail is interesting: the events around the stall.
-			if i < limit-8 {
-				continue
-			}
-			fmt.Fprintf(&b, " | event %d enqueued_offset=%s write_latency=%s",
-				i, ev.enqueued.Sub(stallLog[0].enqueued).Round(time.Microsecond), written)
+		fmt.Fprintf(&b, "stall_at=%d/%d enqueued=%d started=%d written=%d ring_from=%d..%d",
+			stalledAt, wanted, nextSeq, startSeq, writeSeq, ringBase, ringBase+ringCount-1)
+		if slot := slotOf(stalledAt); slot >= 0 {
+			ev := ring[slot]
+			fmt.Fprintf(&b, " stalled_event{seq=%d enqueued=+%s started=%s written=%s}",
+				ev.seq, ev.enqueued.Sub(ring[ringBase].enqueued).Round(time.Microsecond),
+				phaseLatency(ev.enqueued, ev.started), phaseLatency(ev.enqueued, ev.written))
+		}
+		for i := 0; i < ringCount; i++ {
+			ev := ring[(ringBase+i)%stallRing]
+			fmt.Fprintf(&b, " | seq=%d enqueued=+%s started=%s written=%s",
+				ev.seq, ev.enqueued.Sub(ring[ringBase].enqueued).Round(time.Microsecond),
+				phaseLatency(ev.enqueued, ev.started), phaseLatency(ev.enqueued, ev.written))
 		}
 		return b.String()
 	}
 
-	wait := func(ch <-chan struct{}, count int) {
+	wait := func(ch <-chan struct{}, count int, onEvent func()) {
 		t.Helper()
 		timeout := time.NewTimer(3 * time.Second)
 		defer timeout.Stop()
 		for i := 0; i < count; i++ {
 			select {
 			case <-ch:
-				recordWritten()
+				onEvent()
 			case <-timeout.C:
-				t.Fatalf("device stalled after %d/%d events (%s)", i, count, stallReport(i, count))
+				t.Fatalf("device stalled after %d/%d events (%s)", i, count, stallReport(writeSeq, count))
 			}
 		}
 	}
@@ -824,7 +854,7 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 		for i := 0; i < count; i++ {
 			dev.permits <- struct{}{}
 		}
-		wait(dev.written, count)
+		wait(dev.written, count, recordWritten)
 	}
 	var accepted, drops int64
 	for cycle := 0; cycle < 3; cycle++ {
@@ -837,11 +867,11 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 				accepted++
 			}
 			release(capacity / 2)
-			wait(dev.started, capacity/2)
+			wait(dev.started, capacity/2, recordStarted)
 		}
 		enqueue()
 		accepted++
-		wait(dev.started, 1)
+		wait(dev.started, 1, recordStarted)
 		for i := 0; i < capacity; i++ {
 			enqueue()
 			accepted++
@@ -857,7 +887,7 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 			t.Fatalf("stall metrics: %+v, drops=%d", stats, drops)
 		}
 		release(capacity + 1)
-		wait(dev.started, capacity)
+		wait(dev.started, capacity, recordStarted)
 		if occupancy, _, peak := f.AggregateQueueStats(); occupancy != 0 || peak != capacity {
 			t.Fatalf("recovery occupancy=%d peak=%d", occupancy, peak)
 		}
@@ -872,4 +902,12 @@ func TestSustainedClientTrafficWithRepeatedStalls(t *testing.T) {
 	if errors, total, max := f.DeviceWriteStats(); errors != 0 || total <= 0 || max <= 0 {
 		t.Fatalf("write metrics: errors=%d total=%s max=%s", errors, total, max)
 	}
+}
+
+// phaseLatency renders the gap between an event's enqueue and one of its later phases.
+func phaseLatency(from, to time.Time) string {
+	if to.IsZero() || from.IsZero() {
+		return "not_reached"
+	}
+	return to.Sub(from).Round(time.Microsecond).String()
 }

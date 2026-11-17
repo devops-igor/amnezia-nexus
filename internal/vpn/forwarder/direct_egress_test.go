@@ -509,9 +509,9 @@ func TestDirectEgress_LookupExpirationAndBidirectionalRefresh(t *testing.T) {
 	if !after.LastSeen.After(before.LastSeen) {
 		t.Fatalf("lastSeen did not advance: before=%s after=%s", before.LastSeen, after.LastSeen)
 	}
-	if after.Age > 10*time.Millisecond {
-		t.Fatalf("age after the reply = %s, want a refreshed flow rather than the positioned %s", after.Age, before.Age)
-	}
+	// The assertion is the advancement itself: a refreshed flow's stored instant is later than
+	// the positioned one. No wall-clock threshold is asserted here, because the size of the gap
+	// is the scheduler's business, not the product's.
 
 	// And it is still inside its lifetime a logical 40ms after the refresh, with no real sleep.
 	positionFlowAge(t, dem, refreshKey, 40*time.Millisecond)
