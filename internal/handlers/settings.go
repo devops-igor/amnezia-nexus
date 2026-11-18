@@ -33,22 +33,12 @@ func (h *Handlers) GetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	_ = h.db.GetSetting(ctx, "limits", &limitsCfg)
 	_ = h.db.GetSetting(ctx, "gigahost", &gigahostCfg)
 
-	// Strip sensitive private keys & certificate text from API response
+	// Strip sensitive private keys & certificate text from API response. The
+	// page handler applies the same policy through maskSettingsSecrets.
 	sslCfg.KeyText = ""
 	sslCfg.CertText = ""
-
-	// Mask telegram bot tokens if present
-	if bt, ok := telegramCfg["bot_token"].(string); ok && bt != "" {
-		telegramCfg["bot_token"] = "********"
-	}
-	if tok, ok := telegramCfg["token"].(string); ok && tok != "" {
-		telegramCfg["token"] = "********"
-	}
-
-	// Mask gigahost API key if present
-	if key, ok := gigahostCfg["api_key"].(string); ok && key != "" {
-		gigahostCfg["api_key"] = "********"
-	}
+	maskTelegramSecrets(telegramCfg)
+	maskGigahostSecrets(gigahostCfg)
 	stripObsoleteGigahostKeys(gigahostCfg)
 
 	h.JSON(w, http.StatusOK, map[string]any{
@@ -59,6 +49,54 @@ func (h *Handlers) GetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		"limits":     limitsCfg,
 		"gigahost":   gigahostCfg,
 	})
+}
+
+// settingsSecretMask is the sentinel every read path renders in place of a
+// stored credential. The save path treats it, like an empty value, as "keep the
+// stored secret" (see preserveSecretsOnSave).
+const settingsSecretMask = "********"
+
+// maskTelegramSecrets replaces a stored Telegram bot token with the sentinel.
+func maskTelegramSecrets(cfg map[string]any) {
+	for _, key := range []string{"bot_token", "token"} {
+		if v, ok := cfg[key].(string); ok && v != "" {
+			cfg[key] = settingsSecretMask
+		}
+	}
+}
+
+// maskGigahostSecrets replaces a stored Gigahost API key with the sentinel.
+func maskGigahostSecrets(cfg map[string]any) {
+	if v, ok := cfg["api_key"].(string); ok && v != "" {
+		cfg["api_key"] = settingsSecretMask
+	}
+}
+
+// clearSSLSecrets blanks stored certificate and private key text. These fields
+// are write-only: an empty value on save keeps the stored material.
+func clearSSLSecrets(cfg map[string]any) {
+	for _, key := range []string{"key_text", "cert_text"} {
+		if _, ok := cfg[key]; ok {
+			cfg[key] = ""
+		}
+	}
+}
+
+// maskSettingsSecrets applies the read-side secret policy to the decoded
+// settings map that backs the rendered Settings page. It mirrors what
+// GetSettingsHandler returns for the same sections, so the page cannot render a
+// value the API refuses to return. Sections that are absent or not objects are
+// left alone.
+func maskSettingsSecrets(all map[string]any) {
+	if cfg, ok := all["telegram"].(map[string]any); ok {
+		maskTelegramSecrets(cfg)
+	}
+	if cfg, ok := all["gigahost"].(map[string]any); ok {
+		maskGigahostSecrets(cfg)
+	}
+	if cfg, ok := all["ssl"].(map[string]any); ok {
+		clearSSLSecrets(cfg)
+	}
 }
 
 // obsoleteGigahostKeys are setting fields the panel no longer reads or writes.
