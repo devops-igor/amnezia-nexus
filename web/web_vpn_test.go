@@ -750,7 +750,9 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 		t.Errorf("vpn.html missing #vpnTableContainer")
 	}
 
-	// 3. Assert stylesheet cache-busting (?v=1.1.0) and cascade order across all shell and auth templates
+	// 3. Assert stylesheet cache-busting (the release version, so a corrected
+	// stylesheet is fetched instead of served from a day-old cache entry) and
+	// cascade order across all shell and auth templates
 	templatesToCheck := []string{"base.html", "login.html", "change_password.html", "setup.html"}
 	for _, tmpl := range templatesToCheck {
 		tmplData, err := fs.ReadFile(templatesFS, tmpl)
@@ -760,7 +762,7 @@ func TestIssue109VPNTableFullWidth(t *testing.T) {
 		tmplStr := string(tmplData)
 		cleanTmplStr := stripHTMLComments(tmplStr)
 		for _, name := range canonicalStylesheetOrder {
-			expectedLink := `href="/static/css/` + name + `.css?v=1.1.0"`
+			expectedLink := `href="/static/css/` + name + `.css?v=` + assetVersionAction + `"`
 			if !strings.Contains(cleanTmplStr, expectedLink) {
 				t.Errorf("%s missing stylesheet link %s", tmpl, expectedLink)
 			}

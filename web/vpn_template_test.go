@@ -49,6 +49,11 @@ func getVPNFuncMap() template.FuncMap {
 	}
 }
 
+// vpnTestAppVersion stands in for config.AppVersion, which this package cannot
+// import. The shell reads it for the cache-busting query, so the render must
+// supply one, and the mutation tests below must look for the same value.
+const vpnTestAppVersion = "9.9.9-test"
+
 func renderBaseAndVPNTemplate(t *testing.T) string {
 	t.Helper()
 
@@ -68,6 +73,7 @@ func renderBaseAndVPNTemplate(t *testing.T) string {
 		"active_page":       "vpn",
 		"csrf_token":        "csrf-test-token",
 		"translations_json": "{}",
+		"app_version":       vpnTestAppVersion,
 		"current_user":      map[string]any{"Username": "admin", "Role": "admin"},
 		"site_settings": map[string]any{
 			"Title":    "Amnezia",
@@ -530,7 +536,7 @@ func TestRenderedVPNTemplateRejectPreBootstrapMutants(t *testing.T) {
 
 	t.Run("CoreScriptOrderSwapped", func(t *testing.T) {
 		s1 := `<script src="/static/js/qrcode.min.js"></script>`
-		s2 := `<script src="/static/js/api.js?v=2.5.0"></script>`
+		s2 := `<script src="/static/js/api.js?v=` + vpnTestAppVersion + `"></script>`
 		mutated := strings.Replace(rendered, s1, "__PLACEHOLDER__", 1)
 		mutated = strings.Replace(mutated, s2, s1, 1)
 		mutated = strings.Replace(mutated, "__PLACEHOLDER__", s2, 1)

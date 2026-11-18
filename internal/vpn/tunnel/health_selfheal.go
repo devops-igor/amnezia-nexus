@@ -109,13 +109,18 @@ func (hp *HealthProber) SelfHealSweep(ctx context.Context) int {
 	}
 
 	hp.mu.RLock()
-	if hp.cfg.DisableSelfHealing {
-		hp.mu.RUnlock()
-		return 0
-	}
+	disabled := hp.cfg.DisableSelfHealing
 	threshold := hp.cfg.SelfHealingThreshold
 	latencyThreshold := hp.cfg.LatencyThresholdMS
 	hp.mu.RUnlock()
+
+	if disabled {
+		// The operator disabled recovery, not the obligation to settle an
+		// unfinished automatic failover. Run only the retry; no target is
+		// collected and no tunnel is probed or re-enabled.
+		hp.retryPendingFailovers(ctx)
+		return 0
+	}
 
 	targets := hp.collectSelfHealTargets()
 	if len(targets) == 0 {

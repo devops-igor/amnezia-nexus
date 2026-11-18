@@ -1572,3 +1572,47 @@ func TestThresholdReconcile_AdminDisableDuringReconcile(t *testing.T) {
 		t.Fatalf("expected enabled=false, active health, admin reason; got enabled=%v status=%s reason=%s", cur.Enabled, cur.Status, cur.DisableReason)
 	}
 }
+
+func TestSelfHealSweepRetriesPendingFailoversWhenDisabled(t *testing.T) {
+	db := setupTestDB(t)
+	pool := NewPool(db)
+	cfg := HealthConfig{
+		Interval:             50 * time.Millisecond,
+		Timeout:              time.Second,
+		LatencyThresholdMS:   200,
+		FailureThreshold:     2,
+		SelfHealingThreshold: 1,
+		DisableSelfHealing:   true,
+	}
+	prober := NewHealthProber(pool, db, cfg)
+
+	var calls atomic.Int32
+	prober.mu.Lock()
+	prober.selfHealFailoverRetrier = func(context.Context) int {
+		calls.Add(1)
+		return 9
+	}
+	prober.mu.Unlock()
+
+	if got := prober.SelfHealSweep(context.Background()); got != 0 {
+		t.Fatalf("disabled sweep reconnected = %d, want 0", got)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("pending-failover retries = %d, want 1 while self-healing is disabled", calls.Load())
+	}
+	prober.mu.RLock()
+	disabled := prober.cfg.DisableSelfHealing
+	prober.mu.RUnlock()
+	if !disabled {
+		t.Fatal("sweep implicitly enabled self-healing")
+	}
+
+	// Control: the enabled sweep still settles pending failovers.
+	prober.SetSelfHealingEnabled(true)
+	if got := prober.SelfHealSweep(context.Background()); got != 0 {
+		t.Fatalf("enabled sweep reconnected = %d, want 0 with no targets", got)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("pending-failover retries = %d, want 2 after the enabled sweep", calls.Load())
+	}
+}
