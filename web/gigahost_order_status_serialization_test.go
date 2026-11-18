@@ -49,11 +49,7 @@ func gigahostSerializationHarness(t *testing.T, mode, scenario string) string {
 	if err != nil {
 		t.Fatalf("read the setup intents module: %v", err)
 	}
-	templateBytes, err := TemplatesFS.ReadFile("templates/settings.html")
-	if err != nil {
-		t.Fatalf("read the settings template: %v", err)
-	}
-	template := string(templateBytes)
+	template := settingsPageScript(t)
 	start := strings.Index(template, "    if (btnRefreshCatalog) {")
 	end := strings.Index(template, "    if (btnDeployVPS)")
 	if start < 0 || end <= start {
