@@ -166,10 +166,6 @@ func pageOrderPayload(t *testing.T, placementValue string) string {
 	t.Helper()
 	node := gigahostOrderStatusNode(t)
 
-	template, err := web.TemplatesFS.ReadFile("templates/settings.html")
-	if err != nil {
-		t.Fatalf("read settings template: %v", err)
-	}
 	module, err := web.StaticFS.ReadFile("static/js/gigahost_placement.js")
 	if err != nil {
 		t.Fatalf("read placement module: %v", err)
@@ -180,10 +176,11 @@ func pageOrderPayload(t *testing.T, placementValue string) string {
 	if err != nil {
 		t.Fatalf("read catalog status module: %v", err)
 	}
-	pageJS, err := pageScriptForTest(string(template))
+	pageScript, err := web.StaticFS.ReadFile("static/js/settings.js")
 	if err != nil {
-		t.Fatalf("extract the page script: %v", err)
+		t.Fatalf("read the settings page script: %v", err)
 	}
+	pageJS := string(pageScript)
 
 	pageEncoded, _ := json.Marshal(pageJS)
 	moduleEncoded, _ := json.Marshal(string(module))
@@ -290,38 +287,6 @@ w.eval(%s);   // the page script
 	}
 	line := strings.SplitN(text[idx+len(marker):], "\n", 2)[0]
 	return strings.TrimSpace(line)
-}
-
-// pageScriptForTest returns the last inline <script> body of a template.
-func pageScriptForTest(html string) (string, error) {
-	const open, closeTag = "<script", "</script>"
-	var last string
-	for offset := 0; ; {
-		start := strings.Index(html[offset:], open)
-		if start < 0 {
-			break
-		}
-		start += offset
-		tagEnd := strings.Index(html[start:], ">")
-		if tagEnd < 0 {
-			break
-		}
-		tagEnd += start
-		bodyStart := tagEnd + 1
-		end := strings.Index(html[bodyStart:], closeTag)
-		if end < 0 {
-			break
-		}
-		end += bodyStart
-		if !strings.Contains(html[start:tagEnd], "src=") {
-			last = html[bodyStart:end]
-		}
-		offset = end + len(closeTag)
-	}
-	if strings.TrimSpace(last) == "" {
-		return "", fmt.Errorf("no inline script block with content found")
-	}
-	return last, nil
 }
 
 // pageElementIDsForTest returns the element ids a page script binds.

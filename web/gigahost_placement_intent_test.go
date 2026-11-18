@@ -32,14 +32,7 @@ import (
 func TestGigahostPlacementIntentStaysBlockedUntilDeliberateChoice(t *testing.T) {
 	node := requireJSDOM(t)
 
-	template, err := TemplatesFS.ReadFile("templates/settings.html")
-	if err != nil {
-		t.Fatalf("read settings template: %v", err)
-	}
-	pageJS, err := lastInlineScript(string(template))
-	if err != nil {
-		t.Fatalf("extract the page script: %v", err)
-	}
+	pageJS := settingsPageScript(t)
 	moduleJS, err := StaticFS.ReadFile("static/js/gigahost_placement.js")
 	if err != nil {
 		t.Fatalf("read placement module: %v", err)

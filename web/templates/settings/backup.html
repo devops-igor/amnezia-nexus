@@ -1,0 +1,36 @@
+{{- define "settings_backup" -}}
+<!-- BLOCK 6: Backup & Restore -->
+        <div class="card settings-section-card">
+            <div class="settings-card-header">
+                <svg class="icon"><use href="#icon-database"></use></svg>
+                <h3 class="card-title">{{ _ "backup_title" }}</h3>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: var(--space-md);">
+                <div style="display: flex; gap: var(--space-sm);">
+                    <a href="/api/settings/backup/download" class="btn btn-secondary"
+                        style="flex:1; text-decoration:none; display:flex; align-items:center; justify-content:center; gap:var(--space-sm);">
+                        <svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download_backup" }}
+                    </a>
+                </div>
+                {{ if is_admin .current_user }}
+                <div style="border-top: 1px solid var(--border-color); padding-top: var(--space-md);">
+                    <div style="display: flex; flex-direction: column; gap: var(--space-sm);">
+                        <input type="file" id="backupFile" accept=".json" style="display: none;"
+                            onchange="handleRestore(event)">
+                        <button type="button" class="btn btn-secondary"
+                            onclick="document.getElementById('backupFile').click()" id="restoreBtn"
+                            style="display:flex; align-items:center; justify-content:center; gap:var(--space-sm);">
+                            <svg class="icon"><use href="#icon-upload"></use></svg> <span id="restoreBtnText">{{ _ "restore_backup" }}</span>
+                            <div class="spinner hidden" id="restoreSpinner" style="width:14px; height:14px;"></div>
+                        </button>
+                    </div>
+                </div>
+                {{ end }}
+            </div>
+            {{ if is_admin .current_user }}
+            <p class="form-hint" style="margin-top: var(--space-sm);">
+                {{ _ "restore_confirm" }}
+            </p>
+            {{ end }}
+        </div>
+{{- end }}

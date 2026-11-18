@@ -1,0 +1,32 @@
+{{- define "settings_telegram" -}}
+<!-- BLOCK 3: Telegram Bot Notifications -->
+        <div class="card settings-section-card">
+            <div class="settings-card-header">
+                <svg class="icon"><use href="#icon-send"></use></svg>
+                <h3 class="card-title">{{ _ "telegram_bot_title" }}</h3>
+            </div>
+            <form id="telegramForm">
+                {{ $tgSettings := get .settings "telegram" }}
+                <div class="form-group">
+                    <label class="switch-container">
+                        <span class="switch">
+                            <input type="checkbox" id="telegram_enabled" {{ if get $tgSettings "enabled" }}checked{{ end }}>
+                            <span class="switch-slider"></span>
+                        </span>
+                        <span class="switch-label-text">{{ _ "telegram_bot_enable" }}</span>
+                    </label>
+                </div>
+                <div id="telegramFields" style="{{ if not (get $tgSettings "enabled") }}display:none;{{ end }} margin-top: var(--space-md);">
+                    <div class="form-group">
+                        <label class="form-label" for="telegram_bot_token">{{ _ "telegram_bot_token_label" }}</label>
+                        <input type="password" class="form-input" id="telegram_bot_token" value="{{ get $tgSettings "bot_token" "" }}" placeholder="123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="telegram_chat_id">{{ _ "telegram_chat_id_label" }}</label>
+                        <input type="text" class="form-input" id="telegram_chat_id" value="{{ get $tgSettings "chat_id" "" }}" placeholder="-1001234567890">
+                    </div>
+                    <p class="form-hint">{{ _ "telegram_bot_hint" }}</p>
+                </div>
+            </form>
+        </div>
+{{- end }}
