@@ -182,18 +182,29 @@ func TestSaveSettings_NullSectionIsLeftAlone(t *testing.T) {
 }
 
 // TestSaveSettings_MalformedSectionWritesNothing: a section of the wrong shape is
-// a validation error and no other section in the request is stored.
+// a validation error, whichever section it is, and no other section in the
+// request is stored.
 func TestSaveSettings_MalformedSectionWritesNothing(t *testing.T) {
-	h, _, _ := setupTestHandlers(t)
-	seedSettingsForPage(t, h)
-	before := readStoredSettings(t, h)
+	good := `"appearance":{"title":"Should Not Land","logo":"","subtitle":"","language":"en"}`
+	for _, section := range []string{"appearance", "captcha", "telegram", "ssl", "limits", "gigahost"} {
+		t.Run(section, func(t *testing.T) {
+			h, _, _ := setupTestHandlers(t)
+			seedSettingsForPage(t, h)
+			before := readStoredSettings(t, h)
 
-	w := postSettingsSave(t, h, `{"appearance":{"title":"Should Not Land","logo":"","subtitle":"","language":"en"},"captcha":"yes"}`)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("a malformed section = %d, want 400", w.Code)
-	}
-	if got := readStoredSettings(t, h).appearance; got != before.appearance {
-		t.Errorf("a rejected request still wrote appearance: %+v", got)
+			body := `{` + good + `,"` + section + `":"not an object"}`
+			if section == "appearance" {
+				body = `{"appearance":"not an object","captcha":{"enabled":true}}`
+			}
+			w := postSettingsSave(t, h, body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("a malformed %s section = %d, want 400: %s", section, w.Code, w.Body.String())
+			}
+			after := readStoredSettings(t, h)
+			if after.appearance != before.appearance || after.captcha != before.captcha {
+				t.Errorf("a rejected request still wrote: appearance %+v captcha %+v", after.appearance, after.captcha)
+			}
+		})
 	}
 }
 
