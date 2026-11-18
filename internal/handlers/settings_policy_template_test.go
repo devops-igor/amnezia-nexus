@@ -28,6 +28,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/devops-igor/amnezia-nexus/internal/config"
 	"github.com/devops-igor/amnezia-nexus/internal/middleware"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/web"
@@ -139,15 +140,29 @@ func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
 		}
 	})
 
+	t.Run("ControllerURLIsCacheBusted", func(t *testing.T) {
+		// /static/* is served with a 24-hour max-age. The controller must carry a
+		// version query, or a browser keeps the pre-update script and silently
+		// omits the newer form fields from the save payload.
+		versioned := fmt.Sprintf(`src="/static/js/policy_routing.js?v=%s"`, config.AppVersion)
+		if !strings.Contains(adminBody, versioned) {
+			t.Errorf("admin settings page does not load the versioned policy controller %q", versioned)
+		}
+		if strings.Contains(adminBody, `src="/static/js/policy_routing.js"`) {
+			t.Error("admin settings page loads the unversioned policy controller; a cached script can omit new fields")
+		}
+	})
+
 	t.Run("ControllerLoadedOnlyForAdmins", func(t *testing.T) {
-		if !strings.Contains(adminBody, `src="/static/js/policy_routing.js"`) {
-			t.Error("admin settings page does not load the policy controller")
+		versioned := fmt.Sprintf(`src="/static/js/policy_routing.js?v=%s"`, config.AppVersion)
+		if !strings.Contains(adminBody, versioned) {
+			t.Errorf("admin settings page does not load the policy controller %q", versioned)
 		}
 		supportBody := renderSettingsPage(t, models.RoleSupport)
 		if strings.Contains(supportBody, `id="policyRoutingCard"`) {
 			t.Error("support operator received the admin-only policy section")
 		}
-		if strings.Contains(supportBody, `src="/static/js/policy_routing.js"`) {
+		if strings.Contains(supportBody, `src="/static/js/policy_routing.js"`) || strings.Contains(supportBody, versioned) {
 			t.Error("support operator's page loads the policy controller")
 		}
 	})
