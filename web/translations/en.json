@@ -1149,5 +1149,6 @@
   "policy_excluded_domains_placeholder": "internal.api.example.com\n*.corp.example",
   "policy_excluded_domains_hint": "Domains that must never enter the PROXY set. One bare domain or *. entry per line; blank lines and comments are ignored. Excluding a subdomain also removes a broader parent rule, so the whole parent stays direct. IPv4/CIDR entries are not accepted here.",
   "deploy_vps_refresh_catalog": "Refresh catalog and recent deployments",
-  "upstream_releases_link": "Release tags"
+  "upstream_releases_link": "Release tags",
+  "policy_client_tried_names_fmt": "tried {names}"
 }

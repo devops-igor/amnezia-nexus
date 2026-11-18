@@ -470,6 +470,17 @@
             var names = clientTokenLabel('name_match', flow.names_match);
             if (flow.names && flow.names.length) {
                 names = names + ': ' + flow.names.join(', ');
+            } else if (flow.name_attempts && flow.name_attempts.length) {
+                // A failed query has no answer to attribute to this IP. These are
+                // names the client tried near the decision, never "the flow's name".
+                var tried = flow.name_attempts.map(function (attempt) {
+                    var label = attempt.name + ' (' + clientTokenLabel('dns_event', attempt.kind);
+                    if (attempt.qtype) {
+                        label = label + ', ' + attempt.qtype;
+                    }
+                    return label + ')';
+                }).join(', ');
+                names = names + ': ' + clientText('policy_client_tried_names_fmt').replace('{names}', tried);
             } else if (flow.names_reason) {
                 names = names + ': ' + clientTokenLabel('corr', flow.names_reason);
             }
