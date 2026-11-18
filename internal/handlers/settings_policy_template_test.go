@@ -62,6 +62,7 @@ var policySectionIDs = []string{
 	"policyProxyDrops",
 	"policyDirectDrops",
 	"policy_local_entries",
+	"policy_excluded_domains",
 	"policySourceStats",
 }
 

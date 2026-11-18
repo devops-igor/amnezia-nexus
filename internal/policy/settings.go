@@ -67,6 +67,10 @@ type Settings struct {
 	// LocalEntries holds operator-supplied domain/CIDR rules merged on top of the
 	// selected external source. It is additive and works with every preset.
 	LocalEntries []string `json:"local_entries,omitempty"`
+	// ExcludedDomains holds operator-supplied domains that must never enter the
+	// PROXY set. It is applied with the built-in never-proxy guard and works
+	// with every preset.
+	ExcludedDomains []string `json:"excluded_domains,omitempty"`
 	// SyncInterval is the refresh period in seconds.
 	SyncInterval int64 `json:"sync_interval_seconds"`
 	// UpstreamDNS is the operator-configured upstream resolver list. It is
@@ -113,6 +117,10 @@ func (s Settings) Normalize() Settings {
 		out.LocalEntries = make([]string, len(s.LocalEntries))
 		copy(out.LocalEntries, s.LocalEntries)
 	}
+	if s.ExcludedDomains != nil {
+		out.ExcludedDomains = make([]string, len(s.ExcludedDomains))
+		copy(out.ExcludedDomains, s.ExcludedDomains)
+	}
 	if s.UpstreamDNS != nil {
 		out.UpstreamDNS = make([]Upstream, len(s.UpstreamDNS))
 		for i, upstream := range s.UpstreamDNS {
@@ -139,7 +147,7 @@ func (s Settings) Interval() time.Duration {
 // Settings contains a slice and is therefore not comparable with ==, which is
 // why this exists rather than a comparison at each call site.
 func (s Settings) IsZero() bool {
-	return s.Preset == "" && !s.Enabled && s.SyncInterval == 0 && len(s.CustomURLs) == 0 && len(s.LocalEntries) == 0 && len(s.UpstreamDNS) == 0
+	return s.Preset == "" && !s.Enabled && s.SyncInterval == 0 && len(s.CustomURLs) == 0 && len(s.LocalEntries) == 0 && len(s.ExcludedDomains) == 0 && len(s.UpstreamDNS) == 0
 }
 
 // Validate reports whether the configuration may be persisted. A nil result
@@ -161,6 +169,9 @@ func (s Settings) Validate() error {
 		return fmt.Errorf("unknown policy preset %q", s.Preset)
 	}
 	if err := s.validateSourceSelection(); err != nil {
+		return err
+	}
+	if err := s.validateExcludedDomains(); err != nil {
 		return err
 	}
 	if err := s.validateLocalEntries(); err != nil {
@@ -204,13 +215,32 @@ func (s Settings) validateSourceSelection() error {
 	return nil
 }
 
+func (s Settings) validateExcludedDomains() error {
+	if len(s.ExcludedDomains) > MaxExcludedDomains {
+		return fmt.Errorf("%d excluded domains exceed the maximum of %d", len(s.ExcludedDomains), MaxExcludedDomains)
+	}
+	if _, err := ParseExcludedDomains(s.ExcludedDomains); err != nil {
+		return fmt.Errorf("excluded domain rejected: %w", err)
+	}
+	return nil
+}
+
 func (s Settings) validateLocalEntries() error {
 	if len(s.LocalEntries) > 4096 {
 		return fmt.Errorf("%d local entries exceed the maximum of 4096", len(s.LocalEntries))
 	}
-	_, _, err := ParseLocalRules(s.LocalEntries)
+	local, _, err := ParseLocalRules(s.LocalEntries)
 	if err != nil {
 		return fmt.Errorf("local entry rejected: %w", err)
+	}
+	exclusions, err := ParseExcludedDomains(s.ExcludedDomains)
+	if err != nil {
+		return fmt.Errorf("excluded domain rejected: %w", err)
+	}
+	for base := range local.Domains {
+		if _, excluded := neverProxyReason(base, exclusions); excluded {
+			return fmt.Errorf("local entry rejected: %q is also listed in excluded_domains; a name cannot be both proxied and excluded", base)
+		}
 	}
 	return nil
 }
@@ -292,9 +322,14 @@ func (s Settings) SyncConfig() (SyncConfig, error) {
 	if err != nil {
 		return SyncConfig{}, err
 	}
+	excludedDomains, err := ParseExcludedDomains(s.ExcludedDomains)
+	if err != nil {
+		return SyncConfig{}, err
+	}
 	return SyncConfig{
 		Sources:         sources,
 		LocalRules:      localRules,
+		ExcludedDomains: excludedDomains,
 		RefreshInterval: s.Interval(),
 		FetchLimits:     DefaultFetchLimits(),
 		ParseLimits:     DefaultParseLimits(),
