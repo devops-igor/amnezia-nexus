@@ -10,9 +10,9 @@
         color: var(--text-secondary);
     }
 </style>
-<div class="card settings-section-card" id="policyUpstreamCard" style="margin-top: var(--space-lg);">
-    <div class="settings-card-header" style="display: flex; align-items: center; justify-content: space-between;">
-        <div style="display: flex; align-items: center; gap: var(--space-sm);">
+<div class="card settings-section-card settings-card-stacked" id="policyUpstreamCard">
+    <div class="settings-card-header settings-card-header-split">
+        <div class="settings-inline">
             <svg class="icon"><use href="#icon-globe"></use></svg>
             <h2 class="card-title">{{ _ "policy_upstream_title" }}</h2>
         </div>
@@ -20,16 +20,16 @@
 
     <p class="form-hint">{{ _ "policy_upstream_intro" }}</p>
 
-    <div id="policyUpstreamAlert" role="status" aria-live="polite" aria-atomic="true" style="display: none; padding: var(--space-sm) var(--space-md); border-radius: var(--radius-sm); margin-bottom: var(--space-md); font-size: 0.85rem;"></div>
+    <div id="policyUpstreamAlert" role="status" aria-live="polite" aria-atomic="true" class="settings-notice settings-notice-spaced" hidden></div>
 
     <form id="policyUpstreamForm" data-upstream-ready="false">
         <p class="form-hint" id="policyUpstreamLimitNote">{{ _ "policy_upstream_limit_note" }}</p>
 
         <div class="form-hint hidden" id="policyUpstreamDefaultsNotice">{{ _ "policy_upstream_defaults_notice" }}</div>
 
-        <div id="policyUpstreamRows" style="margin-top: var(--space-md);"></div>
+        <div id="policyUpstreamRows" class="settings-offset"></div>
 
-        <div style="display: flex; flex-wrap: wrap; gap: var(--space-sm); margin-top: var(--space-sm);">
+        <div class="settings-button-row settings-button-row-tight">
             <button type="button" class="btn btn-secondary btn-sm" id="policyUpstreamAddBtn" disabled>
                 {{ _ "policy_upstream_add_btn" }}
             </button>
@@ -44,8 +44,8 @@
 
         <p class="form-hint" id="policyUpstreamClientNotice">{{ _ "policy_upstream_client_config_notice" }}</p>
 
-        <div style="display: flex; flex-wrap: wrap; gap: var(--space-sm); margin-top: var(--space-md);">
-            <button type="submit" class="btn btn-primary" id="policyUpstreamSaveBtn" style="display: flex; align-items: center; gap: var(--space-sm);" disabled>
+        <div class="settings-button-row">
+            <button type="submit" class="btn btn-primary" id="policyUpstreamSaveBtn" disabled>
                 <svg class="icon"><use href="#icon-check"></use></svg>
                 <span id="policyUpstreamSaveBtnText">{{ _ "policy_upstream_save_btn" }}</span>
                 <span class="spinner hidden" id="policyUpstreamSaveSpinner" aria-hidden="true"></span>
@@ -59,7 +59,7 @@
         </div>
     </form>
 
-    <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_upstream_health_title" }}</div>
+    <div class="divider">{{ _ "policy_upstream_health_title" }}</div>
 
     <div class="form-group">
         <span class="form-hint" id="policyUpstreamHealthState">{{ _ "policy_upstream_health_none" }}</span>
@@ -69,27 +69,27 @@
     </div>
 
     <template id="policyUpstreamRowTemplate">
-        <div class="form-group" data-upstream-role="row" style="border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: var(--space-sm); margin-bottom: var(--space-sm);">
-            <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-sm);">
-                <span class="form-label" data-upstream-role="label" style="padding: 0;"></span>
-                <div style="display: flex; gap: var(--space-xs);">
+        <div class="form-group settings-row-card" data-upstream-role="row">
+            <div class="settings-bar">
+                <span class="form-label settings-flush" data-upstream-role="label"></span>
+                <div class="settings-cluster">
                     <button type="button" class="btn btn-secondary btn-sm" data-upstream-action="up">{{ _ "policy_upstream_up_btn" }}</button>
                     <button type="button" class="btn btn-secondary btn-sm" data-upstream-action="down">{{ _ "policy_upstream_down_btn" }}</button>
                     <button type="button" class="btn btn-secondary btn-sm" data-upstream-action="remove">{{ _ "policy_upstream_remove_btn" }}</button>
                 </div>
             </div>
 
-            <label class="form-label" style="display: block; margin-top: var(--space-xs);">
+            <label class="form-label settings-field-label">
                 <span>{{ _ "policy_upstream_col_address" }}</span>
                 <input class="form-input font-mono" type="text" data-upstream-field="address" spellcheck="false" autocapitalize="none" autocomplete="off">
             </label>
 
-            <label class="form-label" style="display: block; margin-top: var(--space-xs);">
+            <label class="form-label settings-field-label">
                 <span>{{ _ "policy_upstream_col_port" }}</span>
                 <input class="form-input" type="number" min="1" max="65535" inputmode="numeric" data-upstream-field="port" placeholder="{{ _ "policy_upstream_port_default_hint" }}" autocomplete="off">
             </label>
 
-            <label class="form-label" style="display: block; margin-top: var(--space-xs);">
+            <label class="form-label settings-field-label">
                 <span>{{ _ "policy_upstream_col_transport" }}</span>
                 <select class="form-input" data-upstream-field="transport">
                     <option value="plain">{{ _ "policy_upstream_transport_plain" }}</option>
@@ -98,7 +98,7 @@
                 </select>
             </label>
 
-            <label class="form-label" style="display: block; margin-top: var(--space-xs);">
+            <label class="form-label settings-field-label">
                 <span>{{ _ "policy_upstream_col_pin" }}</span>
                 <input class="form-input font-mono" type="text" data-upstream-field="pin" spellcheck="false" autocapitalize="none" autocomplete="off">
             </label>

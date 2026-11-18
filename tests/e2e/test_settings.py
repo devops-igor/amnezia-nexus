@@ -330,3 +330,44 @@ def test_upstream_status_ui(authenticated_page: Page, base_url: str) -> None:
     page.wait_for_load_state("networkidle")
     assert len(page_errors) == 0
     assert check_btn.is_visible()
+
+
+# Widths the settings layout is specified at: two stretched columns from 1024px,
+# one column below. 1440 and 1024 are the wide cases, 390 is the phone case.
+SETTINGS_LAYOUT_CASES = [(1440, 2), (1024, 2), (390, 1)]
+SETTINGS_PROBE = """() => {
+  const cards = [...document.querySelectorAll('.settings-section-card')].map(c => {
+    const r = c.getBoundingClientRect();
+    return {left: Math.round(r.left), top: Math.round(r.top + window.scrollY), h: Math.round(r.height)};
+  });
+  const rows = {};
+  cards.forEach(c => { (rows[c.top] = rows[c.top] || []).push(c.h); });
+  const de = document.documentElement;
+  return {
+    cards: cards.length,
+    columns: new Set(cards.map(c => c.left)).size,
+    maxRowDiff: Math.max(...Object.values(rows).map(r => Math.max(...r) - Math.min(...r))),
+    scrollWidth: de.scrollWidth,
+    clientWidth: de.clientWidth,
+  };
+}"""
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("width,columns", SETTINGS_LAYOUT_CASES)
+def test_settings_layout_columns_and_overflow(
+    authenticated_page: Page, base_url: str, width: int, columns: int
+) -> None:
+    """Cards form two equal-height columns from 1024px and one below, with no overflow."""
+    page = authenticated_page
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{base_url}/settings")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_function("document.querySelectorAll('.settings-section-card').length >= 9")
+
+    probe = page.evaluate(SETTINGS_PROBE)
+
+    assert probe["columns"] == columns, probe
+    # Two cards of one row never differ in height; a lone card is its own row.
+    assert probe["maxRowDiff"] == 0, probe
+    assert probe["scrollWidth"] == probe["clientWidth"], probe

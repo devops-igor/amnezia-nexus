@@ -6,8 +6,9 @@ package handlers
 // describe the document rather than the template source:
 //
 //   - one h1 for the page, and a heading outline that never skips a level;
-//   - the cards are direct children of one single-column grid, with no inline
-//     style attribute anywhere in the page shell or its section files;
+//   - the cards are children of one grid (or the full-width cards that follow
+//     it), the stylesheet makes that grid one column and two stretched columns
+//     from 1024px, and no settings template carries an inline style attribute;
 //   - every card category toggle carries an id and a name, and the icon-only
 //     catalog refresh button carries an accessible name in every locale;
 //   - the fields that start collapsed use the hidden attribute, which the page
@@ -118,7 +119,7 @@ func TestSettingsPageHeadingOutline(t *testing.T) {
 	}
 }
 
-func TestSettingsPageCardsShareOneColumnGrid(t *testing.T) {
+func TestSettingsPageCardsShareOneGrid(t *testing.T) {
 	doc := parseSettingsDocument(t, renderSettingsPage(t, models.RoleAdmin))
 
 	grids := 0
@@ -165,25 +166,30 @@ func containsClass(list, class string) bool {
 	return false
 }
 
-// settingsTemplateSource returns the page shell followed by every section file
-// under templates/settings/. The four standalone card partials are not part of
-// this contract: they keep their inline styles until their own cleanup.
+// settingsTemplateSource returns every template that renders on the settings
+// page: the shell, each section file under templates/settings/, and the four
+// standalone card partials.
 func settingsTemplateSource(t *testing.T) string {
 	t.Helper()
-	var b strings.Builder
-	shell, err := web.TemplatesFS.ReadFile("templates/settings.html")
-	if err != nil {
-		t.Fatalf("read settings shell: %v", err)
+	names := []string{
+		"templates/settings.html",
+		"templates/settings_notifications.html",
+		"templates/settings_policy.html",
+		"templates/settings_policy_upstream.html",
+		"templates/settings_policy_client.html",
 	}
-	b.Write(shell)
 	entries, err := web.TemplatesFS.ReadDir("templates/settings")
 	if err != nil || len(entries) == 0 {
 		t.Fatalf("list settings sections: %v (%d entries)", err, len(entries))
 	}
 	for _, e := range entries {
-		body, err := web.TemplatesFS.ReadFile("templates/settings/" + e.Name())
+		names = append(names, "templates/settings/"+e.Name())
+	}
+	var b strings.Builder
+	for _, name := range names {
+		body, err := web.TemplatesFS.ReadFile(name)
 		if err != nil {
-			t.Fatalf("read section %s: %v", e.Name(), err)
+			t.Fatalf("read %s: %v", name, err)
 		}
 		b.WriteString("\n")
 		b.Write(body)
@@ -192,18 +198,86 @@ func settingsTemplateSource(t *testing.T) string {
 }
 
 // TestSettingsPageLayoutIsNotInline fails when a layout rule returns to a style
-// attribute in the page shell or any of its section files.
+// attribute in any template that renders on the settings page.
 func TestSettingsPageLayoutIsNotInline(t *testing.T) {
 	source := settingsTemplateSource(t)
-	if strings.Contains(source, "style=") {
-		for _, line := range strings.Split(source, "\n") {
-			if strings.Contains(line, "style=") {
-				t.Errorf("inline style in the settings page source: %s", strings.TrimSpace(line))
-			}
+	for _, line := range strings.Split(source, "\n") {
+		if strings.Contains(line, "style=") {
+			t.Errorf("inline style in a settings template: %s", strings.TrimSpace(line))
 		}
 	}
 	if strings.Contains(source, "minmax(380px") {
 		t.Error("the settings grid must not carry a fixed 380px column minimum")
+	}
+}
+
+// cssRule returns the declaration block that follows the first occurrence of
+// selector at or after from, or "" when there is none.
+func cssRule(css, selector string, from int) (string, int) {
+	i := strings.Index(css[from:], selector+" {")
+	if i < 0 {
+		return "", -1
+	}
+	i += from
+	open := i + len(selector) + 2
+	end := strings.Index(css[open:], "}")
+	if end < 0 {
+		return "", -1
+	}
+	return css[open : open+end], open + end
+}
+
+// TestSettingsGridStylesheetRule pins the layout rule the browser measurement in
+// tests/e2e/test_settings.py exercises: one column by default, two columns that
+// stretch to the taller card from 1024px, and a track that can shrink below its
+// content so a long word cannot widen the page.
+func TestSettingsGridStylesheetRule(t *testing.T) {
+	raw, err := web.StaticFS.ReadFile("static/css/settings.css")
+	if err != nil {
+		t.Fatalf("read settings.css: %v", err)
+	}
+	css := string(raw)
+
+	base, after := cssRule(css, ".settings-grid", 0)
+	if after < 0 {
+		t.Fatal("settings.css has no .settings-grid rule")
+	}
+	if !strings.Contains(base, "grid-template-columns: minmax(0, 1fr)") {
+		t.Errorf("base .settings-grid is not a single shrinkable column:\n%s", base)
+	}
+
+	media := strings.Index(css[after:], "@media (min-width: 1024px)")
+	if media < 0 {
+		t.Fatal("settings.css has no @media (min-width: 1024px) block for the grid")
+	}
+	wide, _ := cssRule(css, "    .settings-grid", after+media)
+	if wide == "" {
+		t.Fatal("the 1024px block does not restyle .settings-grid")
+	}
+	if !strings.Contains(wide, "repeat(2, minmax(0, 1fr))") {
+		t.Errorf("wide .settings-grid is not two shrinkable columns:\n%s", wide)
+	}
+	if !strings.Contains(wide, "align-items: stretch") {
+		t.Errorf("wide .settings-grid does not stretch a row to its taller card:\n%s", wide)
+	}
+	if strings.Contains(base, "align-items: start") {
+		t.Error("base .settings-grid must not align cards to the start; paired cards would differ in height")
+	}
+}
+
+// TestSettingsStylesheetIsRegistered keeps the dedicated sheet in the shared
+// cascade list that every shell template links, in the same position.
+func TestSettingsStylesheetIsRegistered(t *testing.T) {
+	for _, shell := range []string{"base.html", "login.html", "setup.html", "change_password.html"} {
+		body, err := web.TemplatesFS.ReadFile("templates/" + shell)
+		if err != nil {
+			t.Fatalf("read %s: %v", shell, err)
+		}
+		vpn := strings.Index(string(body), "/static/css/vpn.css")
+		settings := strings.Index(string(body), "/static/css/settings.css")
+		if settings < 0 || vpn < 0 || settings < vpn {
+			t.Errorf("%s must link settings.css directly after vpn.css", shell)
+		}
 	}
 }
 
