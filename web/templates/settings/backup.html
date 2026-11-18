@@ -21,6 +21,7 @@
                             <svg class="icon"><use href="#icon-upload"></use></svg> <span id="restoreBtnText">{{ _ "restore_backup" }}</span>
                             <div class="spinner spinner-sm hidden" id="restoreSpinner"></div>
                         </button>
+                        {{ template "settings_immediate" "restore_backup" }}
                     </div>
                 </div>
                 {{ end }}

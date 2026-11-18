@@ -10,70 +10,6 @@
         });
     }
 
-    async function saveSettings() {
-        const btn = document.getElementById('saveBtn');
-        const text = document.getElementById('saveBtnText');
-        const spinner = document.getElementById('saveSpinner');
-        btn.disabled = true;
-        spinner.classList.remove('hidden');
-
-        const appForm = document.getElementById('appearanceForm');
-
-        const appearance = {
-            title: appForm.title.value,
-            logo: appForm.logo.value,
-            subtitle: appForm.subtitle.value,
-            language: document.getElementById('appearance_language').value
-        };
-
-        const captcha = {
-            enabled: document.getElementById('captcha_enabled').checked
-        };
-
-        const ssl = {
-            enabled: document.getElementById('ssl_enabled').checked,
-            domain: document.getElementById('ssl_domain').value.trim(),
-            cert_path: document.getElementById('ssl_cert_path').value.trim(),
-            key_path: document.getElementById('ssl_key_path').value.trim(),
-            cert_text: document.getElementById('ssl_cert_text').value.trim(),
-            key_text: document.getElementById('ssl_key_text').value.trim(),
-            panel_port: parseInt(document.getElementById('panel_port').value || '5000')
-        };
-
-        const limitsForm = document.getElementById('limitsForm');
-        const limits = {
-            max_connections_per_user: parseInt(limitsForm.max_connections_per_user.value) || 10,
-            connection_rate_limit_count: parseInt(limitsForm.connection_rate_limit_count.value) || 5,
-            connection_rate_limit_window: parseInt(limitsForm.connection_rate_limit_window.value) || 60
-        };
-
-        const telegramEnabledInput = document.getElementById('telegram_enabled');
-        const telegram = {
-            enabled: telegramEnabledInput ? telegramEnabledInput.checked : false,
-            bot_token: document.getElementById('telegram_bot_token') ? document.getElementById('telegram_bot_token').value.trim() : '',
-            chat_id: document.getElementById('telegram_chat_id') ? document.getElementById('telegram_chat_id').value.trim() : ''
-        };
-
-        const ghApiKeyInput = document.getElementById('gigahost_api_key');
-        let gigahost = undefined;
-        if (ghApiKeyInput) {
-            gigahost = {
-                api_key: ghApiKeyInput.value.trim()
-            };
-        }
-
-        try {
-            await API.post('/api/settings/save', { appearance, captcha, ssl, limits, telegram, gigahost });
-            UI.toast(_('settings_saved'), 'success');
-            setTimeout(() => window.location.reload(), 1000);
-        } catch (err) {
-            UI.toast(err.message || _('error'), 'error');
-        } finally {
-            btn.disabled = false;
-            spinner.classList.add('hidden');
-        }
-    }
-
     async function handleRestore(e) {
         const file = e.target.files[0];
         if (!file) return;
@@ -130,7 +66,7 @@
 
         try {
             const url = force ? '/api/system/upstream-status?refresh=true' : '/api/system/upstream-status';
-            const data = await API.get(url);
+            const data = await API.get(url, {silent: true});
 
             if (!data) return;
 
@@ -312,7 +248,7 @@
         const loading = document.getElementById('deployCatalogLoading');
         if (loading) loading.style.display = 'block';
         try {
-            const res = await API.get('/api/admin/hosting/gigahost/catalog');
+            const res = await API.get('/api/admin/hosting/gigahost/catalog', {silent: true});
             renderDeployCatalogStale(res);
             cachedPlans = (res && res.plans) ? res.plans : [];
             if (cachedPlans.length === 0) {

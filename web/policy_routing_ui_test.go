@@ -34,7 +34,7 @@ func policySectionHTMLForTest(t *testing.T) string {
 			return true
 		},
 	}
-	tmpl, err := template.New("settings_policy.html").Funcs(funcs).ParseFS(TemplatesFS, "templates/settings_policy.html")
+	tmpl, err := template.New("settings_policy.html").Funcs(funcs).ParseFS(TemplatesFS, "templates/settings_policy.html", "templates/settings_save_controls.html")
 	if err != nil {
 		t.Fatalf("parse settings_policy.html: %v", err)
 	}

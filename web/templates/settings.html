@@ -27,14 +27,9 @@
 {{ template "settings_policy" . }}
 {{ template "settings_policy_upstream" . }}
 {{ template "settings_policy_client" . }}
-<div class="settings-actions">
-    <button class="btn btn-primary" onclick="saveSettings()" id="saveBtn">
-        <svg class="icon"><use href="#icon-check"></use></svg>
-        <span id="saveBtnText">{{ _ "save_changes" }}</span>
-        <div class="spinner hidden" id="saveSpinner"></div>
-    </button>
-</div>
 
+<script src="/static/js/settings_cards.js?v={{ .app_version }}"></script>
+<script src="/static/js/settings_save.js?v={{ .app_version }}"></script>
 <script src="/static/js/notifications_settings.js?v={{ .app_version }}"></script>
 <script src="/static/js/gigahost_catalog_status.js"></script>
 <script src="/static/js/gigahost_setup.js"></script>

@@ -80,7 +80,7 @@ func upstreamSectionHTMLForTest(t *testing.T) string {
 		"is_admin": func(user any) bool { return true },
 	}
 	tmpl, err := template.New("settings_policy_upstream.html").Funcs(funcs).
-		ParseFS(TemplatesFS, "templates/settings_policy_upstream.html")
+		ParseFS(TemplatesFS, "templates/settings_policy_upstream.html", "templates/settings_save_controls.html")
 	if err != nil {
 		t.Fatalf("parse settings_policy_upstream.html: %v", err)
 	}
@@ -237,7 +237,9 @@ func TestPolicyUpstreamSectionUsesShippedDictionaryKeys(t *testing.T) {
 		if idx := strings.Index(key, `"`); idx >= 0 {
 			key = key[:idx]
 		}
-		if !strings.HasPrefix(key, "policy_upstream_") {
+		// save_changes is the one commit label shared by every settings card, so
+		// it is the single key allowed outside the section's own namespace.
+		if key != "save_changes" && !strings.HasPrefix(key, "policy_upstream_") {
 			t.Errorf("the section uses key %q outside its own namespace", key)
 			continue
 		}

@@ -1,0 +1,227 @@
+package handlers
+
+// Harness for the per-card save model tests (#888).
+//
+// The page is not reimplemented here. The test renders /settings through the
+// real handler, reads the script elements from that HTML in document order,
+// loads each one from the embedded static files, and runs them in JSDOM with a
+// fetch that answers like the panel. The real api.js and ui.js are loaded, so a
+// request that fails without opting out of the global toast raises exactly the
+// toast an operator would see.
+//
+// Because the script list comes from the rendered page, the same test also runs
+// against an older revision of the page and fails there for the behavioural
+// reason, not because a file is missing.
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+
+	"github.com/devops-igor/amnezia-nexus/internal/middleware"
+	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/web"
+)
+
+var settingsScriptSrc = regexp.MustCompile(`<script[^>]+src="([^"]+)"`)
+
+// settingsPageScripts returns the static scripts the rendered page loads, in
+// order, as {path, source} pairs. Scripts the harness does not need are skipped.
+func settingsPageScripts(t *testing.T, page string) [][2]string {
+	t.Helper()
+	skip := map[string]bool{"qrcode.min.js": true, "telemetry.js": true, "tables.js": true}
+	var out [][2]string
+	for _, m := range settingsScriptSrc.FindAllStringSubmatch(page, -1) {
+		path := strings.SplitN(m[1], "?", 2)[0]
+		if skip[path[strings.LastIndex(path, "/")+1:]] {
+			continue
+		}
+		body, err := web.StaticFS.ReadFile(strings.TrimPrefix(path, "/"))
+		if err != nil {
+			t.Fatalf("the rendered page loads %s, which is not embedded: %v", path, err)
+		}
+		out = append(out, [2]string{path, string(body)})
+	}
+	return out
+}
+
+// settingsStoredAnswer is what GET /api/settings returns for the handler's
+// current database, so the page's read-before-write sees real stored values.
+func settingsStoredAnswer(t *testing.T, h *Handlers) string {
+	t.Helper()
+	w := httptest.NewRecorder()
+	setupFullSettingsRouter(h).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/settings", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /api/settings = %d", w.Code)
+	}
+	return w.Body.String()
+}
+
+// settingsHarnessHead builds the JSDOM page from the rendered HTML and loads the
+// scripts in the order the page loads them. fetch is the real panel over HTTP.
+const settingsHarnessHead = `
+const {VirtualConsole} = require('jsdom');
+const vc = new VirtualConsole();
+vc.on('jsdomError', () => {});
+const dom = new JSDOM(CFG.page, {runScripts: 'outside-only', url: CFG.base + '/settings', virtualConsole: vc});
+const w = dom.window;
+const doc = w.document;
+w.I18N = CFG.dict;
+w._ = k => w.I18N[k] || k;
+const realFetch = fetch;
+let saveGate = null;
+let failSave = false;
+w.fetch = async (u, o) => {
+  const isSave = String(u).indexOf('/api/settings/save') === 0;
+  if (isSave && failSave) throw new TypeError('Failed to fetch');
+  if (isSave && saveGate) await saveGate;
+  return realFetch(CFG.base + u, o);
+};
+for (const s of CFG.scripts) { w.eval(s.source); }
+const toasts = [];
+const originalToast = w.UI.toast;
+w.UI.toast = (message, type, duration) => { toasts.push({message, type}); return originalToast(message, type, duration); };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function until(fn, label, ms) {
+  const end = Date.now() + (ms || 4000);
+  while (Date.now() < end) { if (fn()) return; await sleep(20); }
+  throw new Error('timed out waiting for ' + label);
+}
+const card = id => doc.getElementById(id);
+const commitOf = id => card(id).querySelector('[data-commit]');
+const badgeOf = id => card(id).querySelector('[data-dirty]');
+const statusOf = id => card(id).querySelector('[data-status]');
+const errorOf = id => card(id).querySelector('[data-error]');
+const shown = el => !!el && !el.hidden && !el.classList.contains('hidden') && el.textContent.trim() !== '';
+function type(id, value) {
+  const el = doc.getElementById(id);
+  el.value = value;
+  el.dispatchEvent(new w.Event('input', {bubbles: true}));
+}
+function toggle(id, on) {
+  const el = doc.getElementById(id);
+  el.checked = on;
+  el.dispatchEvent(new w.Event('change', {bubbles: true}));
+}
+async function stored() { return (await realFetch(CFG.base + '/api/settings')).json(); }
+const settled = () => sleep(250);
+// The page is ready once load has fired and the controllers have made their first reads.
+const ready = new Promise(r => {
+  if (doc.readyState === 'complete') r(); else w.addEventListener('load', r);
+}).then(() => sleep(500));
+`
+
+// seedSettingsForPage stores a known starting point, including write-only
+// secrets, so a test can tell a preserved value from a wiped one.
+func seedSettingsForPage(t *testing.T, h *Handlers) {
+	t.Helper()
+	ctx := context.Background()
+	seed := map[string]any{
+		"appearance": models.AppearanceSettings{Title: "Seed Title", Logo: "S", Subtitle: "Seed Sub", Language: "en"},
+		"captcha":    models.CaptchaSettings{Enabled: false},
+		"limits":     models.ConnectionLimits{MaxConnectionsPerUser: 10, ConnectionRateLimitCount: 5, ConnectionRateLimitWindow: 60},
+		"ssl": models.SSLSettings{
+			Enabled: false, Domain: "seed.example.test", PanelPort: 5000,
+			CertText: probeCertText, KeyText: probeKeyText,
+		},
+		"telegram": map[string]any{"enabled": true, "bot_token": probeBotToken, "chat_id": "-100seed"},
+	}
+	for key, value := range seed {
+		if err := h.db.SetSetting(ctx, key, value); err != nil {
+			t.Fatalf("seed %s: %v", key, err)
+		}
+	}
+}
+
+// settingsHarnessServer exposes the settings and hosting handlers over HTTP as an
+// administrator. The settings and catalog handlers are the real ones: with no
+// provider key configured the catalog handler answers 400, which is the hosting
+// error an appearance save used to surface.
+//
+// The notification read is the one injected failure. The handler fixture always
+// builds a notification service, so the real handler answers 200 here. The route
+// returns the 503 the handler itself sends when that service is absent, so the
+// page meets a second unrelated subsystem failure during load.
+func settingsHarnessServer(t *testing.T, h *Handlers) *httptest.Server {
+	t.Helper()
+	t.Setenv("GIGAHOST_API_KEY", "")
+	r := chi.NewRouter()
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			ctx := middleware.WithSession(req.Context(), &models.SessionData{
+				UserID: "admin-1", Username: "admin", Role: models.RoleAdmin,
+			})
+			next.ServeHTTP(w, req.WithContext(ctx))
+		})
+	})
+	r.Get("/api/settings", h.GetSettingsHandler)
+	r.Post("/api/settings/save", h.SaveSettingsHandler)
+	r.Get("/api/admin/hosting/gigahost/catalog", h.GigahostCatalogHandler)
+	r.Get("/api/notifications/settings", func(w http.ResponseWriter, _ *http.Request) {
+		h.JSONError(w, http.StatusServiceUnavailable, "notifications_unavailable", "Notification service is not configured")
+	})
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// runSettingsScenario renders the real /settings page, loads the scripts that
+// page names, and runs scenario against it. The scenario is the body of an
+// async function with the helpers from settingsHarnessHead in scope.
+func runSettingsScenario(t *testing.T, h *Handlers, scenario string) string {
+	t.Helper()
+	node := gigahostOrderStatusNode(t)
+	seedSettingsForPage(t, h)
+	page := renderSettingsPageFor(t, h, models.RoleAdmin)
+	srv := settingsHarnessServer(t, h)
+
+	enRaw, err := web.TranslationsFS.ReadFile("translations/en.json")
+	if err != nil {
+		t.Fatalf("read en dictionary: %v", err)
+	}
+	var dict map[string]string
+	if err := json.Unmarshal(enRaw, &dict); err != nil {
+		t.Fatalf("decode en dictionary: %v", err)
+	}
+	var scripts []map[string]string
+	for _, s := range settingsPageScripts(t, page) {
+		scripts = append(scripts, map[string]string{"path": s[0], "source": s[1]})
+	}
+	cfg, err := json.Marshal(map[string]any{"page": page, "base": srv.URL, "dict": dict, "scripts": scripts})
+	if err != nil {
+		t.Fatalf("encode harness config: %v", err)
+	}
+	// The configuration is large, so it travels by file: one environment string
+	// is capped well below the size of the page and its scripts.
+	cfgPath := filepath.Join(t.TempDir(), "harness.json")
+	if err := os.WriteFile(cfgPath, cfg, 0o600); err != nil {
+		t.Fatalf("write harness config: %v", err)
+	}
+
+	script := gigahostOrderStatusJSDOMBootstrap +
+		"\nconst CFG = JSON.parse(fs.readFileSync(process.env.SETTINGS_HARNESS_CFG, 'utf8'));\n" +
+		settingsHarnessHead +
+		"\n(async () => {\nawait ready;\n" + scenario +
+		"\nconsole.log('SETTINGS_SCENARIO_OK');\nw.close();\nprocess.exit(0);\n})().catch(err => { console.error(err && err.stack || err); process.exit(1); });\n"
+
+	cmd := exec.Command(node)
+	cmd.Stdin = strings.NewReader(script)
+	cmd.Env = append(os.Environ(), "SETTINGS_HARNESS_CFG="+cfgPath)
+	out, err := cmd.CombinedOutput()
+	if strings.Contains(string(out), "JSDOM_NOT_AVAILABLE") {
+		t.Skip("jsdom is not available in this Node environment")
+	}
+	if err != nil || !strings.Contains(string(out), "SETTINGS_SCENARIO_OK") {
+		t.Fatalf("settings scenario failed: %v\n%s", err, out)
+	}
+	return string(out)
+}

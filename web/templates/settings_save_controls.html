@@ -1,0 +1,20 @@
+{{ define "settings_dirty" }}<span class="badge badge-warn hidden" data-dirty role="status" aria-live="polite"></span>{{ end }}
+
+{{ define "settings_feedback" }}
+            <p class="settings-notice settings-notice-success" data-status role="status" aria-live="polite" hidden></p>
+            <p class="settings-notice settings-notice-danger" data-error role="alert" hidden></p>
+{{ end }}
+
+{{ define "settings_commit" }}
+            <div class="settings-button-row">
+                <button type="button" class="btn btn-primary" data-commit data-commit-when-dirty disabled>
+                    <svg class="icon"><use href="#icon-check"></use></svg>
+                    <span>{{ _ "save_changes" }}</span>
+                    <span class="spinner spinner-sm hidden" aria-hidden="true"></span>
+                </button>
+            </div>
+{{ template "settings_feedback" . }}
+{{ end }}
+
+{{/* The dot is the key of the button label the notice describes. */}}
+{{ define "settings_immediate" }}<span class="form-hint settings-immediate">{{ _ . }}: {{ _ "settings_applies_now" }}</span>{{ end }}

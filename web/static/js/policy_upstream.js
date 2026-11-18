@@ -333,7 +333,7 @@
         if (label) {
             label.textContent = busy
                 ? text('policy_upstream_saving')
-                : text('policy_upstream_save_btn');
+                : text('save_changes');
         }
     }
 
@@ -473,6 +473,9 @@
         paintDefaultsNotice(rows);
         paintGates(rows, errors);
         paintSaveEffects();
+        if (root.SettingsCards) {
+            root.SettingsCards.refresh('policyUpstreamCard');
+        }
     }
 
     function failureKindLabel(kind) {
@@ -614,6 +617,9 @@
             createRow(rowModel(entry));
         });
         refresh();
+        if (root.SettingsCards) {
+            root.SettingsCards.rebase('policyUpstreamCard');
+        }
     }
 
     function fetchRecord() {

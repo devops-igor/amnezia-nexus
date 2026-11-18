@@ -147,7 +147,7 @@ async function loadSetupIntents() {
         container.replaceChildren(emptySpan);
     };
     try {
-        const res = await API.get('/api/admin/hosting/gigahost/setup-intents');
+        const res = await API.get('/api/admin/hosting/gigahost/setup-intents', {silent: true});
         const intents = (res && res.setup_intents) ? res.setup_intents : [];
         if (intents.length === 0) {
             renderEmpty();

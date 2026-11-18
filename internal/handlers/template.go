@@ -120,6 +120,7 @@ func (te *TemplateEngine) ReloadTemplates() error {
 		"settings_policy_client.html",
 		"settings_policy_upstream.html",
 		"settings_notifications.html",
+		"settings_save_controls.html",
 		"settings/appearance.html",
 		"settings/captcha.html",
 		"settings/telegram.html",

@@ -30,6 +30,21 @@
         return fallback || key;
     }
 
+    var CARD = 'notificationsCard';
+
+    // cardReport writes a commit result into this card. The page toast is only a
+    // fallback for a page that did not load the card module.
+    function cardReport(kind, message) {
+        if (root.SettingsCards && root.SettingsCards.report(CARD, kind, message)) return;
+        if (root.UI && root.UI.toast) root.UI.toast(message, kind === 'success' ? 'success' : 'error');
+    }
+
+    // cardRebase makes what the card now shows its saved state, so the dirty
+    // badge clears once a stored record has been applied.
+    function cardRebase() {
+        if (root.SettingsCards) root.SettingsCards.rebase(CARD);
+    }
+
     function setBusy(buttonId, spinnerId, textId, busy, text) {
         var button = byId(buttonId);
         var spinner = byId(spinnerId);
@@ -67,6 +82,7 @@
             input.checked = categories[key] !== false;
         });
         toggleFields();
+        cardRebase();
     }
 
     function toggleFields() {
@@ -79,7 +95,7 @@
         if (state.loading) return;
         state.loading = true;
         try {
-            var settings = await root.API.get('/api/notifications/settings');
+            var settings = await root.API.get('/api/notifications/settings', { silent: true });
             renderSettings(settings || {});
             state.loaded = true;
             var saveBtn = byId('notificationSaveBtn');
@@ -123,14 +139,12 @@
         state.saving = true;
         setBusy('notificationSaveBtn', 'notificationSaveSpinner', 'notificationSaveBtnText', true, translate('loading', 'Loading'));
         try {
-            var saved = await root.API.post('/api/notifications/settings', collect());
+            var saved = await root.API.post('/api/notifications/settings', collect(), { silent: true });
             renderSettings(saved || {});
-            if (!silent) {
-                if (root.UI && root.UI.toast) root.UI.toast(translate('settings_saved', 'Settings saved'), 'success');
-            }
+            if (!silent) cardReport('success', translate('settings_saved', 'Settings saved'));
             return true;
         } catch (err) {
-            if (root.UI && root.UI.toast) root.UI.toast((err.message || err), 'error');
+            cardReport('error', err.message || String(err));
             return false;
         } finally {
             state.saving = false;
@@ -151,7 +165,7 @@
         setBusy('notificationTestBtn', 'notificationTestSpinner', 'notificationTestBtnText', true, translate('notifications_test_sending', 'Sending test…'));
         showTestResult(translate('notifications_test_sending', 'Sending test…'), false);
         try {
-            var result = await root.API.post('/api/notifications/test', {});
+            var result = await root.API.post('/api/notifications/test', {}, { silent: true });
             var status = result && result.status;
             if (status === 'sent') {
                 showTestResult(translate('notifications_test_sent', 'Test notification accepted by Gotify'), false);
@@ -179,7 +193,7 @@
         var container = byId('notificationHistory');
         if (!container) return;
         try {
-            var data = await root.API.get('/api/notifications/history?limit=25');
+            var data = await root.API.get('/api/notifications/history?limit=25', { silent: true });
             renderHistory(container, (data && data.events) || []);
         } catch (err) {
             container.textContent = translate('notifications_history_failed', 'Could not load notification history');

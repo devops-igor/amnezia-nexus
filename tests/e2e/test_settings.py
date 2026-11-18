@@ -573,10 +573,160 @@ def test_settings_button_height_scale_uses_the_spacing_tokens(
     small = _token_px("space-xl")
     # The recorded scale: 40 px and 32 px, built from the pinned tokens above.
     assert (large, small) == (40, 32)
-    expected = {"#saveBtn": large, "#policyClientRefreshBtn": large, "#upstreamCheckBtn": small}
+    expected = {
+        "#appearanceCard [data-commit]": large,
+        "#policyClientRefreshBtn": large,
+        "#upstreamCheckBtn": small,
+    }
     for selector, px in expected.items():
         page.locator(selector).wait_for(state="visible")
         height = page.evaluate(
             "sel => document.querySelector(sel).getBoundingClientRect().height", selector
         )
         assert abs(height - px) <= 0.5, (selector, height, px)
+
+
+def _restore_settings(page: Page, csrf_token: str, original: dict) -> None:
+    """Put the sections a test changed back, through the unchanged save endpoint."""
+    body = {key: original.get(key, {}) for key in ("appearance", "captcha", "ssl", "limits", "telegram")}
+    api_post(page, "/api/settings/save", body, csrf_token)
+
+
+def _commit(page: Page, card: str) -> None:
+    """Click one card's own commit control and wait for the save to be answered."""
+    with page.expect_response(
+        lambda r: r.url.endswith("/api/settings/save") and r.request.method == "POST"
+    ) as saved:
+        page.locator(f"#{card} [data-commit]").click()
+    assert saved.value.status == 200, saved.value.text()
+
+
+@pytest.mark.e2e
+def test_settings_every_staged_card_commits_from_inside_itself(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """One commit control per staged card, all with one label, and no page-level button."""
+    page = authenticated_page
+    page.goto(f"{base_url}/settings")
+    page.wait_for_load_state("networkidle")
+
+    assert page.locator("#saveBtn").count() == 0
+    assert page.locator(".settings-actions").count() == 0
+    cards = [
+        "appearanceCard", "sslCard", "captchaCard", "limitsCard", "telegramCard",
+        "notificationsCard", "policyRoutingCard", "policyUpstreamCard", "gigahostCard",
+    ]
+    labels = set()
+    for card in cards:
+        commit = page.locator(f"#{card} [data-commit]")
+        assert commit.count() == 1, card
+        labels.add(" ".join(commit.inner_text().split()))
+    assert len(labels) == 1, labels
+
+
+@pytest.mark.e2e
+def test_settings_card_dirty_state_and_scoped_save_feedback(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """An edit marks only its card; a successful appearance save reports in that card
+    and surfaces no hosting, routing or notification error anywhere on the page."""
+    page = authenticated_page
+    original = api_get(page, "/api/settings")
+    assert isinstance(original, dict)
+    page.goto(f"{base_url}/settings")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(700)
+    try:
+        title = page.locator("#app_title")
+        loaded = title.input_value()
+        assert not page.locator("#appearanceCard [data-dirty]").is_visible()
+        assert page.locator("#appearanceCard [data-commit]").is_disabled()
+
+        title.fill(loaded + " edited")
+        assert page.locator("#appearanceCard [data-dirty]").is_visible()
+        assert page.locator("#appearanceCard [data-commit]").is_enabled()
+        assert not page.locator("#sslCard [data-dirty]").is_visible()
+
+        title.fill(loaded)
+        assert not page.locator("#appearanceCard [data-dirty]").is_visible()
+
+        page.locator("label.switch-container:has(#captcha_enabled) .switch-slider").click()
+        title.fill("Card Scoped Title")
+        _commit(page, "appearanceCard")
+        page.wait_for_timeout(1500)
+
+        assert page.locator("#appearanceCard [data-status]").inner_text().strip()
+        assert not page.locator("#appearanceCard [data-dirty]").is_visible()
+        assert page.locator("#captchaCard [data-dirty]").is_visible()
+        assert page.locator("#captchaCard [data-commit]").is_enabled()
+        assert page.locator(".toast").count() == 0
+        assert page.locator("[data-error]:visible").count() == 0
+        body = page.inner_text("body").lower()
+        assert "api key not configured" not in body
+        assert "gigahost_api_key" not in body
+    finally:
+        _restore_settings(page, csrf_token, original)
+
+
+@pytest.mark.e2e
+def test_settings_security_commits_persist_across_a_reload(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """Application title, captcha, SSL and connection limits each commit from their own
+    card and are what a full reload renders and what the API stores."""
+    page = authenticated_page
+    original = api_get(page, "/api/settings")
+    assert isinstance(original, dict)
+    page.goto(f"{base_url}/settings")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(700)
+
+    def toggle(input_id: str) -> None:
+        page.locator(f"label.switch-container:has(#{input_id}) .switch-slider").click()
+
+    try:
+        page.locator("#app_title").fill("Persisted Title")
+        _commit(page, "appearanceCard")
+
+        toggle("captcha_enabled")
+        _commit(page, "captchaCard")
+
+        toggle("ssl_enabled")
+        page.locator("#panel_port").fill("5443")
+        page.locator("#ssl_domain").fill("panel.example.test")
+        page.locator("#ssl_cert_path").fill("/etc/example/cert.pem")
+        page.locator("#ssl_key_path").fill("/etc/example/key.pem")
+        _commit(page, "sslCard")
+
+        page.locator("#max_connections_per_user").fill("17")
+        page.locator("#connection_rate_limit_count").fill("9")
+        page.locator("#connection_rate_limit_window").fill("120")
+        _commit(page, "limitsCard")
+
+        page.goto(f"{base_url}/settings")
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(700)
+
+        assert page.locator("#app_title").input_value() == "Persisted Title"
+        assert page.locator("#captcha_enabled").is_checked()
+        assert page.locator("#ssl_enabled").is_checked()
+        assert page.locator("#panel_port").input_value() == "5443"
+        assert page.locator("#ssl_domain").input_value() == "panel.example.test"
+        assert page.locator("#ssl_cert_path").input_value() == "/etc/example/cert.pem"
+        assert page.locator("#ssl_key_path").input_value() == "/etc/example/key.pem"
+        assert page.locator("#max_connections_per_user").input_value() == "17"
+        assert page.locator("#connection_rate_limit_count").input_value() == "9"
+        assert page.locator("#connection_rate_limit_window").input_value() == "120"
+        assert page.locator("[data-dirty]:visible").count() == 0
+
+        stored = api_get(page, "/api/settings")
+        assert stored["appearance"]["title"] == "Persisted Title"
+        assert stored["captcha"]["enabled"] is True
+        assert stored["ssl"]["enabled"] is True and stored["ssl"]["panel_port"] == 5443
+        assert stored["limits"] == {
+            "max_connections_per_user": 17,
+            "connection_rate_limit_count": 9,
+            "connection_rate_limit_window": 120,
+        }
+    finally:
+        _restore_settings(page, csrf_token, original)

@@ -1149,5 +1149,9 @@
   "policy_excluded_domains_placeholder": "internal.api.example.com\n*.corp.example",
   "policy_excluded_domains_hint": "دامنه‌هایی که هرگز نباید وارد مجموعه PROXY شوند. در هر خط یک دامنه یا ورودی *.؛ خطوط خالی و توضیحات نادیده گرفته می‌شوند. حذف یک زیردامنه قاعده والد گسترده‌تر را نیز حذف می‌کند، بنابراین کل والد مستقیم می‌ماند. ورودی‌های IPv4/CIDR در اینجا پذیرفته نمی‌شوند.",
   "deploy_vps_refresh_catalog": "به‌روزرسانی فهرست و استقرارهای اخیر",
-  "upstream_releases_link": "برچسب‌های انتشار"
+  "upstream_releases_link": "برچسب‌های انتشار",
+  "settings_unsaved": "تغییرات ذخیره‌نشده",
+  "settings_applies_now": "بلافاصله اعمال می‌شود",
+  "settings_save_read_failed": "خواندن تنظیمات ذخیره‌شده ممکن نبود، بنابراین چیزی ذخیره نشد",
+  "settings_test_saves_first": "ابتدا تنظیمات بالا را ذخیره می‌کند، سپس بلافاصله ارسال می‌کند"
 }

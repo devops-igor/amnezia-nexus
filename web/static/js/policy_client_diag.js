@@ -100,7 +100,9 @@
             err.status = 0;
             return Promise.reject(err);
         }
-        return root.API.request(url, options);
+        // The section reports every failure in its own alert; a second page-wide
+        // toast for the same answer is two error surfaces for one fault.
+        return root.API.request(url, Object.assign({ silent: true }, options));
     }
 
     function clientErrorDetail(err) {

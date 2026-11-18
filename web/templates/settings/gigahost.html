@@ -1,27 +1,29 @@
 {{- define "settings_gigahost" -}}
 <!-- BLOCK 8: Gigahost Cloud Hosting & Deploy VPS -->
-        <div class="card settings-section-card" id="gigahostCard">
+        <div class="card settings-section-card" id="gigahostCard" data-settings-card="gigahost">
             <div class="settings-card-header settings-card-header-split">
                 <div class="settings-inline">
                     <svg class="icon"><use href="#icon-cloud"></use></svg>
                     <h2 class="card-title">{{ _ "gigahost_settings_title" }}</h2>
+                    {{ template "settings_dirty" . }}
                 </div>
             </div>
             <form id="gigahostForm">
                 {{ $ghSettings := get .settings "gigahost" }}
                 <div class="form-group">
                     <label class="form-label" for="gigahost_api_key">{{ _ "gigahost_api_key_label" }}</label>
-                    <input type="password" class="form-input" id="gigahost_api_key"
+                    <input type="password" class="form-input" id="gigahost_api_key" data-secret="masked"
                         value="{{ if get $ghSettings "api_key" }}********{{ end }}"
                         placeholder="flux_live_...">
                     <p class="form-hint">{{ _ "gigahost_api_key_hint" }}</p>
                 </div>
             </form>
+            {{ template "settings_commit" . }}
 
             <div class="divider settings-divider"></div>
 
             <!-- Deploy VPS Section -->
-            <div id="gigahostDeploySection">
+            <div id="gigahostDeploySection" data-dirty-ignore>
                 <div class="settings-subsection-header">
                     <div class="settings-inline">
                         <svg class="icon"><use href="#icon-server"></use></svg>
@@ -31,7 +33,7 @@
                         <svg class="icon"><use href="#icon-activity"></use></svg>
                     </button>
                 </div>
-                <p class="form-hint mb-md">{{ _ "deploy_vps_desc" }}</p>
+                <p class="form-hint mb-md">{{ _ "deploy_vps_desc" }} {{ template "settings_immediate" "deploy_vps_btn" }}</p>
 
                 <!-- Shown when the displayed catalog is a retained snapshot whose
                      refresh failed, so it never looks current when it is not. -->

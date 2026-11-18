@@ -353,6 +353,9 @@
 
         updatePolicyCustomGroup();
         updatePolicyPresetHighlight();
+        if (root.SettingsCards) {
+            root.SettingsCards.rebase('policyRoutingCard');
+        }
     }
 
     function renderPolicySourceStats(snapshot) {

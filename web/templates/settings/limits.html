@@ -1,9 +1,10 @@
 {{- define "settings_limits" -}}
 <!-- BLOCK 5: Connection Limits -->
-        <div class="card settings-section-card">
+        <div class="card settings-section-card" id="limitsCard" data-settings-card="limits">
             <div class="settings-card-header">
                 <svg class="icon"><use href="#icon-link"></use></svg>
                 <h2 class="card-title">{{ _ "connection_limits_title" }}</h2>
+                {{ template "settings_dirty" . }}
             </div>
             <form id="limitsForm">
                 {{ $limitsSettings := get .settings "limits" }}
@@ -29,5 +30,6 @@
                     <p class="form-hint">{{ _ "rate_limit_window_hint" }}</p>
                 </div>
             </form>
+            {{ template "settings_commit" . }}
         </div>
 {{- end }}

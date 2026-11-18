@@ -1149,5 +1149,9 @@
   "policy_excluded_domains_placeholder": "internal.api.example.com\n*.corp.example",
   "policy_excluded_domains_hint": "Домены, которые никогда не должны попадать в набор PROXY. Один домен или запись *. в строке; пустые строки и комментарии игнорируются. Исключение поддомена также удаляет более широкое родительское правило, поэтому весь родитель остаётся прямым. Записи IPv4/CIDR здесь не принимаются.",
   "deploy_vps_refresh_catalog": "Обновить каталог и недавние развёртывания",
-  "upstream_releases_link": "Теги релизов"
+  "upstream_releases_link": "Теги релизов",
+  "settings_unsaved": "Несохранённые изменения",
+  "settings_applies_now": "Применяется сразу",
+  "settings_save_read_failed": "Не удалось прочитать сохранённые настройки, поэтому ничего не сохранено",
+  "settings_test_saves_first": "Сначала сохраняет настройки выше, затем сразу отправляет"
 }

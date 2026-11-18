@@ -20,7 +20,7 @@ import re
 # disagree, so the exemption cannot grow or shrink without a visible edit.
 SETTINGS_SURFACE_CLASSES = frozenset({
     "mb-md", "mb-sm", "mt-sm", "spinner-sm",
-    "settings-actions", "settings-bar", "settings-bullets",
+    "settings-bar", "settings-bullets",
     "settings-button-row", "settings-button-row-tight",
     "settings-card-header-split", "settings-card-stacked",
     "settings-choice", "settings-choice-hint", "settings-choice-title",
@@ -28,7 +28,8 @@ SETTINGS_SURFACE_CLASSES = frozenset({
     "settings-field-pair", "settings-fieldset", "settings-flush",
     "settings-grid", "settings-inline", "settings-list",
     "settings-list-title", "settings-loading", "settings-notice",
-    "settings-notice-icon", "settings-notice-spaced",
+    "settings-immediate", "settings-notice-danger", "settings-notice-icon",
+    "settings-notice-spaced", "settings-notice-success",
     "settings-notice-warning", "settings-offset", "settings-row",
     "settings-row-card", "settings-source-stats", "settings-stack",
     "settings-stack-sm", "settings-subsection",
