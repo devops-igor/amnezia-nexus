@@ -33,8 +33,9 @@ DELIBERATE: dict[tuple[str, str], str] = {}
 
 
 def settings_scripts() -> list[str]:
-    """Scripts the Settings page loads, from the page shell and its section files."""
-    texts = [(WEB / "templates" / "settings.html").read_text(encoding="utf-8")]
+    """Scripts the Settings page loads: the layout, the page shell and its sections."""
+    texts = [(WEB / "templates" / "base.html").read_text(encoding="utf-8")]
+    texts += [(WEB / "templates" / "settings.html").read_text(encoding="utf-8")]
     texts += [
         p.read_text(encoding="utf-8")
         for p in sorted((WEB / "templates" / "settings").glob("*.html"))
