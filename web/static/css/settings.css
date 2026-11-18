@@ -195,7 +195,7 @@
 }
 
 .upstream-component-link {
-    color: var(--text-muted);
+    color: var(--text-secondary);
     display: inline-flex;
     align-items: center;
 }
@@ -207,7 +207,7 @@
 
 .upstream-component-meta {
     font-size: 0.78rem;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     margin-top: 3px;
 }
 
@@ -235,7 +235,7 @@
 
 .upstream-checked-at {
     font-size: 0.75rem;
-    color: var(--text-muted);
+    color: var(--text-secondary);
 }
 
 .upstream-footer .btn {
@@ -357,4 +357,22 @@
 .settings-source-stats {
     font-size: 0.82rem;
     margin-top: var(--space-xs);
+}
+
+/* ===== Informative secondary text =====
+   --text-muted measures 2.95:1 (dark) and 2.56:1 (light) against a card, below
+   the 4.5:1 AA minimum for text. It stays correct for decorative or disabled
+   text. Inside the Settings cards every muted element carries information an
+   operator reads (hints, value labels, column headers, status and loading
+   text, input examples), so those use --text-secondary (6.22:1 and 7.58:1).
+   The selectors are scoped to the cards so no other page changes. */
+.settings-section-card .form-hint,
+.settings-section-card .info-card-label,
+.settings-section-card .text-muted,
+.settings-section-card .data-table th {
+    color: var(--text-secondary);
+}
+
+.settings-section-card .form-input::placeholder {
+    color: var(--text-secondary);
 }

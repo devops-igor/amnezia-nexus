@@ -139,14 +139,17 @@ a:hover {
 }
 
 /* ===== Focus Visible (Accessibility) ===== */
-*:focus-visible {
-    outline: 2px solid var(--accent-color);
+/* :root lifts this above the component rules that load later and set
+   `outline: none` at single-class specificity (.form-input, .table-search-input),
+   which would otherwise win on source order and hide keyboard focus. */
+:root *:focus-visible {
+    outline: 2px solid var(--accent);
     outline-offset: 2px;
 }
 
 button:focus-visible,
 .btn:focus-visible {
-    outline: 2px solid var(--accent-color);
+    outline: 2px solid var(--accent);
     outline-offset: 2px;
 }
 

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page
 
+from tests.e2e import contrast
 from tests.e2e.conftest import api_get, api_post, assert_response_shape
 
 
@@ -580,3 +581,92 @@ def test_settings_button_height_scale_uses_the_spacing_tokens(
             "sel => document.querySelector(sel).getBoundingClientRect().height", selector
         )
         assert abs(height - px) <= 0.5, (selector, height, px)
+
+
+# --- Keyboard focus indicator, read from a real focused element -----------------
+# Asserting that a rule exists proved nothing for this defect: the rule existed and
+# still produced no outline, because it named a token that was never defined. These
+# tests focus real controls on the real page and read the computed outline.
+
+# (control, element that carries the outline). A switch hides its input, so the
+# visible track beside it is what shows focus.
+FOCUS_CONTROLS = [
+    ("#app_title", "#app_title"),
+    ("#appearance_language", "#appearance_language"),
+    ("#policy_local_entries", "#policy_local_entries"),
+    ("#notificationSaveBtn", "#notificationSaveBtn"),
+    ("#repoLink-amneziawg-go", "#repoLink-amneziawg-go"),
+    ("#captcha_enabled", "#captcha_enabled + .switch-slider"),
+]
+NO_TRANSITIONS = "*, *::before, *::after { transition: none !important; animation: none !important; }"
+FOCUS_PROBE = """([focusSel, outlineSel]) => {
+  const target = document.querySelector(focusSel);
+  target.focus();
+  const s = getComputedStyle(document.querySelector(outlineSel));
+  return {
+    focused: document.activeElement === target,
+    focusVisible: target.matches(':focus-visible'),
+    style: s.outlineStyle, width: s.outlineWidth, color: s.outlineColor, offset: s.outlineOffset,
+  };
+}"""
+
+
+def _rgb(hex_or_rgba: str) -> str:
+    r, g, b, _ = contrast.parse_color(hex_or_rgba)
+    return f"rgb({int(r)}, {int(g)}, {int(b)})"
+
+
+def _open_settings(page: Page, base_url: str, theme: str) -> None:
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/settings")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_function(
+        "document.querySelectorAll('.settings-grid > .settings-section-card').length >= 9"
+    )
+    page.add_style_tag(content=NO_TRANSITIONS)
+    page.evaluate("t => document.documentElement.setAttribute('data-theme', t)", theme)
+    # A key press first, so :focus-visible follows keyboard rules like a real user.
+    page.keyboard.press("Tab")
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("theme", ["dark", "light"])
+@pytest.mark.parametrize("focus_sel,outline_sel", FOCUS_CONTROLS)
+def test_focused_control_has_a_visible_outline(
+    authenticated_page: Page, base_url: str, theme: str, focus_sel: str, outline_sel: str
+) -> None:
+    """A focused control shows a solid 2 px outline in the accent colour, both themes.
+
+    The expected colour is read from tokens.css for the theme under test, so the
+    assertion follows the palette instead of pinning an rgb value.
+    """
+    page = authenticated_page
+    _open_settings(page, base_url, theme)
+    got = page.evaluate(FOCUS_PROBE, [focus_sel, outline_sel])
+    assert got["focused"] and got["focusVisible"], (focus_sel, got)
+    accent = contrast.resolve("accent", contrast.theme_tokens(theme))
+    assert got["style"] == "solid", (focus_sel, theme, got)
+    assert got["width"] == "2px", (focus_sel, theme, got)
+    assert got["color"] == _rgb(accent), (focus_sel, theme, got, accent)
+    assert got["offset"] == "2px", (focus_sel, theme, got)
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("theme", ["dark", "light"])
+def test_focus_outline_survives_the_component_rules_that_remove_it(
+    authenticated_page: Page, base_url: str, theme: str
+) -> None:
+    """Fields that set `outline: none` for their own focus style still show the outline.
+
+    .form-input and .table-search-input drop the browser outline at single-class
+    specificity and load after base.css, so a bare `*:focus-visible` loses to them.
+    """
+    page = authenticated_page
+    _open_settings(page, base_url, theme)
+    removed = page.evaluate(
+        "sel => { const e = document.querySelector(sel); return getComputedStyle(e).outlineStyle }",
+        "#app_title",
+    )
+    assert removed == "none", "unfocused field should not carry an outline"
+    got = page.evaluate(FOCUS_PROBE, ["#app_title", "#app_title"])
+    assert got["style"] == "solid" and got["width"] == "2px", got
