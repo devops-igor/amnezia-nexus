@@ -1,0 +1,20 @@
+{{- define "settings_captcha" -}}
+<!-- BLOCK 2: Captcha / Security -->
+        <div class="card settings-section-card">
+            <div class="settings-card-header">
+                <svg class="icon"><use href="#icon-shield"></use></svg>
+                <h3 class="card-title">{{ _ "captcha_title" }}</h3>
+            </div>
+            <form id="captchaForm">
+                <div class="form-group">
+                    <label class="switch-container">
+                        <span class="switch">
+                            <input type="checkbox" id="captcha_enabled" {{ if .captcha_settings.Enabled }}checked{{ end }}>
+                            <span class="switch-slider"></span>
+                        </span>
+                        <span class="switch-label-text">{{ _ "enable_captcha" }}</span>
+                    </label>
+                </div>
+            </form>
+        </div>
+{{- end }}

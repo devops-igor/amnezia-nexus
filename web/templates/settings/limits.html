@@ -1,0 +1,33 @@
+{{- define "settings_limits" -}}
+<!-- BLOCK 5: Connection Limits -->
+        <div class="card settings-section-card">
+            <div class="settings-card-header">
+                <svg class="icon"><use href="#icon-link"></use></svg>
+                <h3 class="card-title">{{ _ "connection_limits_title" }}</h3>
+            </div>
+            <form id="limitsForm">
+                {{ $limitsSettings := get .settings "limits" }}
+                <div class="form-group">
+                    <label class="form-label" for="max_connections_per_user">{{ _ "max_connections_per_user_label" }}</label>
+                    <input type="number" class="form-input" id="max_connections_per_user" name="max_connections_per_user" 
+                        value="{{ get $limitsSettings "max_connections_per_user" 10 }}" 
+                        min="1" max="1000" required>
+                    <p class="form-hint">{{ _ "max_connections_per_user_hint" }}</p>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="connection_rate_limit_count">{{ _ "rate_limit_count_label" }}</label>
+                    <input type="number" class="form-input" id="connection_rate_limit_count" name="connection_rate_limit_count" 
+                        value="{{ get $limitsSettings "connection_rate_limit_count" 5 }}" 
+                        min="1" max="100" required>
+                    <p class="form-hint">{{ _ "rate_limit_count_hint" }}</p>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="connection_rate_limit_window">{{ _ "rate_limit_window_label" }}</label>
+                    <input type="number" class="form-input" id="connection_rate_limit_window" name="connection_rate_limit_window" 
+                        value="{{ get $limitsSettings "connection_rate_limit_window" 60 }}" 
+                        min="10" max="3600" required>
+                    <p class="form-hint">{{ _ "rate_limit_window_hint" }}</p>
+                </div>
+            </form>
+        </div>
+{{- end }}

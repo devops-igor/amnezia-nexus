@@ -50,16 +50,13 @@ func TestGigahostSetupIntentsConsumerDOM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read setup intents module: %v", err)
 	}
-	templates, err := TemplatesFS.ReadFile("templates/settings.html")
-	if err != nil {
-		t.Fatalf("read settings template: %v", err)
-	}
+	templates := settingsTemplateText(t)
 	// The template must load the extracted module: an inline copy would silently
 	// diverge from the file this test exercises.
-	if !strings.Contains(string(templates), `src="/static/js/gigahost_setup_intents.js"`) {
+	if !strings.Contains(templates, `src="/static/js/gigahost_setup_intents.js"`) {
 		t.Fatal("settings.html does not load the extracted setup-intents module")
 	}
-	if !strings.Contains(string(templates), `id="setupIntentsContainer"`) {
+	if !strings.Contains(templates, `id="setupIntentsContainer"`) {
 		t.Fatal("settings.html has no container for saved setup approvals")
 	}
 
