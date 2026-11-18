@@ -518,6 +518,8 @@
         }
         return textarea.value.split('\n').map(function (line) {
             return line.trim();
+        }).filter(function (line) {
+            return line !== '';
         });
     }
 

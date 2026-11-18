@@ -370,7 +370,7 @@ assert.deepEqual(puts[0].body.custom_urls,
   ['https://lists.example.com/a.lst', 'https://lists.example.com/b.lst'],
   'the payload carries the operator URLs, trimmed, in order');
 assert.deepEqual(puts[0].body.local_entries,
-  ['local.example', '', '198.51.100.0/24'],
+  ['local.example', '198.51.100.0/24'],
   'the payload carries local entries in order; blank/comment handling stays server-side');
 assert.ok(alertText().text.indexOf('scheme must be https') !== -1,
   'the server validation detail is surfaced, got: ' + alertText().text);
