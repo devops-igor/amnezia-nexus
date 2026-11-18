@@ -39,7 +39,10 @@ func policySectionHTMLForTest(t *testing.T) string {
 		t.Fatalf("parse settings_policy.html: %v", err)
 	}
 	var buf bytes.Buffer
-	if err := tmpl.ExecuteTemplate(&buf, "settings_policy", map[string]any{"current_user": nil}); err != nil {
+	if err := tmpl.ExecuteTemplate(&buf, "settings_policy", map[string]any{
+		"current_user": nil,
+		"app_version":  "test",
+	}); err != nil {
 		t.Fatalf("render settings_policy: %v", err)
 	}
 	if !strings.Contains(buf.String(), `id="policyRoutingForm"`) {
