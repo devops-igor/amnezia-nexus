@@ -4,6 +4,7 @@ import (
 	"sort"
 	"time"
 
+	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
@@ -112,6 +113,88 @@ func correlateFlowDestination(flow forwarder.SessionFlow, records []dnsledger.Re
 		return FlowCorrelation{Match: FlowCorrelationUnique, Names: names, Considered: considered}
 	default:
 		return FlowCorrelation{Match: FlowCorrelationAmbiguous, Names: names, Considered: considered}
+	}
+}
+
+// flowNameAttemptLookback bounds how far before a flow decision an unresolved
+// query can be shown as an attempted name. It is a diagnostic hint, not proof
+// that the query caused the flow: a failed query has no answer to map to the IP.
+const flowNameAttemptLookback = 5 * time.Minute
+
+// maxFlowNameAttempts bounds the attempted names shown for one flow.
+const maxFlowNameAttempts = 3
+
+// flowNameAttempts returns the terminal queries that produced no usable answer
+// shortly before the flow was decided. They are reported as "tried" names, never
+// as the flow's name.
+func flowNameAttempts(flow forwarder.SessionFlow, events []dnsledger.Event) []dnsledger.Event {
+	if flow.DecidedAt.IsZero() || len(events) == 0 {
+		return nil
+	}
+	earliest := flow.DecidedAt.Add(-flowNameAttemptLookback)
+	out := make([]dnsledger.Event, 0, maxFlowNameAttempts)
+	for _, event := range events {
+		if usableNameAttempt(flow, event, earliest) {
+			out = append(out, event)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		left := nameAttemptTime(flow, out[i])
+		right := nameAttemptTime(flow, out[j])
+		if !left.Equal(right) {
+			return left.After(right)
+		}
+		return out[i].Seq > out[j].Seq
+	})
+	if len(out) > maxFlowNameAttempts {
+		out = out[:maxFlowNameAttempts]
+	}
+	return out
+}
+
+// nameAttemptTime is the instant at which the event's latest occurrence can be
+// attributed to the flow. The ledger collapses identical queries: ReceivedAt is
+// the first occurrence and LastSeen the latest, so a query first tried before the
+// lookback but retried inside it must still count. A repeat after the decision
+// cannot prove an earlier attempt, so that case falls back to the first
+// occurrence the ledger definitely recorded.
+func nameAttemptTime(flow forwarder.SessionFlow, event dnsledger.Event) time.Time {
+	latest := event.LastSeen
+	if latest.IsZero() {
+		latest = event.ReceivedAt
+	}
+	if latest.After(flow.DecidedAt) {
+		return event.ReceivedAt
+	}
+	return latest
+}
+
+// usableNameAttempt applies the temporal, incarnation and outcome rules to one
+// terminal query before it can be shown as an attempted name.
+func usableNameAttempt(flow forwarder.SessionFlow, event dnsledger.Event, earliest time.Time) bool {
+	attempted := nameAttemptTime(flow, event)
+	if attempted.IsZero() || attempted.After(flow.DecidedAt) || attempted.Before(earliest) {
+		return false
+	}
+	if event.RouteGenerationKnown && flow.Generation != 0 && event.RouteGeneration != flow.Generation {
+		return false
+	}
+	return unresolvedQueryKind(event.Kind)
+}
+
+// unresolvedQueryKind reports whether a terminal query kind means the client did
+// not get a usable answer. Answered and truncated queries are not attempts.
+func unresolvedQueryKind(kind string) bool {
+	switch kind {
+	case gatewaydns.QueryEventNXDomain,
+		gatewaydns.QueryEventNoAnswer,
+		gatewaydns.QueryEventUpstreamError,
+		gatewaydns.QueryEventAdmissionRefused,
+		gatewaydns.QueryEventInvalidQuery,
+		gatewaydns.QueryEventDeliveryFailed:
+		return true
+	default:
+		return false
 	}
 }
 

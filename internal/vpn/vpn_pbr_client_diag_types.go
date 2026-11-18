@@ -400,6 +400,16 @@ type ClientDiagnosisFlowNameCandidate struct {
 	ExpiresAt  string `json:"expires_at"`
 }
 
+// ClientDiagnosisFlowNameAttempt is one unresolved query the client tried shortly
+// before the flow was decided. It is not the flow's name: a failed query has no
+// answer to attribute to the destination IP.
+type ClientDiagnosisFlowNameAttempt struct {
+	Name       string `json:"name"`
+	QType      string `json:"qtype"`
+	Kind       string `json:"kind"`
+	ReceivedAt string `json:"received_at"`
+}
+
 // ClientDiagnosisFlow is one live flow record.
 type ClientDiagnosisFlow struct {
 	Protocol        string `json:"protocol"`
@@ -438,6 +448,9 @@ type ClientDiagnosisFlow struct {
 	NamesReason     string                             `json:"names_reason,omitempty"`
 	NamesConsidered int                                `json:"names_considered"`
 	NameCandidates  []ClientDiagnosisFlowNameCandidate `json:"name_candidates"`
+	// NameAttempts are the unresolved queries tried shortly before the decision.
+	// They are populated only when NamesMatch is none.
+	NameAttempts []ClientDiagnosisFlowNameAttempt `json:"name_attempts"`
 }
 
 // ClientDiagnosisFlows is the live-flow section.
