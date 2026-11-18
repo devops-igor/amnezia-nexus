@@ -289,6 +289,16 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.RequireAdmin)
 		r.Post("/{server_id}/clear", h.ClearServerHandler)
+
+		// Settings page and settings API (#909). Admin-only: Support neither
+		// opens the page nor reads or writes settings through the API. The
+		// ordinary backup download deliberately stays outside this group (see
+		// the Support-reachable group below).
+		r.Get("/settings", h.SettingsPageHandler)
+		r.Route("/api/settings", func(r chi.Router) {
+			r.Get("/", h.GetSettingsHandler)
+			r.Post("/save", h.SaveSettingsHandler)
+		})
 		r.Post("/api/settings/backup/restore", h.RestoreBackupHandler)
 		r.Route("/api/admin/hosting/gigahost", func(r chi.Router) {
 			r.Get("/catalog", h.GigahostCatalogHandler)
@@ -343,7 +353,6 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 
 		r.Get("/server/{server_id}", h.ServerPageHandler)
 		r.Get("/users", h.UsersPageHandler)
-		r.Get("/settings", h.SettingsPageHandler)
 		r.Get("/vpn", h.VPNPageHandler)
 
 		// Root server management aliases matching legacy routes
@@ -383,12 +392,10 @@ func NewRouterWithOptions(opts Options) *chi.Mux {
 			r.Post("/{user_id}/share/setup", h.SetupUserShareHandler)
 		})
 
-		// Settings API
-		r.Route("/api/settings", func(r chi.Router) {
-			r.Get("/", h.GetSettingsHandler)
-			r.Post("/save", h.SaveSettingsHandler)
-			r.Get("/backup/download", h.DownloadBackupHandler)
-		})
+		// Ordinary backup download stays available to Support (#893): the
+		// handler withholds the administrator-only policy record for that
+		// role. The rest of the settings API is Admin-only (#909).
+		r.Get("/api/settings/backup/download", h.DownloadBackupHandler)
 
 		// System API
 		r.Route("/api/system", func(r chi.Router) {

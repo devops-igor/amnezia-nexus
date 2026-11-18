@@ -147,21 +147,22 @@ func TestSupportBackupOmitsPolicyRuleContent(t *testing.T) {
 	assertNoRuleContent(t, "Support backup", body)
 }
 
-// The neighbouring non-admin read of the same settings table (the general
-// Settings API) must not expose the record either. This pins the boundary on the
+// The neighbouring read of the same settings table (the general Settings API) is
+// Admin-only since #909, so Support is refused outright. The refusal must carry
+// no policy record or rule content. This keeps the boundary pinned on the
 // adjacent path rather than only on the backup.
-func TestSupportSettingsReadOmitsPolicyRuleContent(t *testing.T) {
+func TestSupportSettingsReadIsDeniedWithoutRuleContent(t *testing.T) {
 	_, r := newPolicyBackupRouter(t)
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, roleRequest(t, models.RoleSupport, http.MethodGet, "/api/settings/", nil))
-	if w.Code != http.StatusOK {
-		t.Fatalf("Support settings read = %d, want 200; body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("Support settings read = %d, want 403; body=%s", w.Code, w.Body.String())
 	}
 	if bytes.Contains(w.Body.Bytes(), []byte(policy.SettingsKey)) {
-		t.Errorf("Support settings read exposes the %q record", policy.SettingsKey)
+		t.Errorf("Support settings refusal exposes the %q record", policy.SettingsKey)
 	}
-	assertNoRuleContent(t, "Support settings read", w.Body.Bytes())
+	assertNoRuleContent(t, "Support settings refusal", w.Body.Bytes())
 }
 
 // The administrator keeps both authorized reads: the export keeps its current
