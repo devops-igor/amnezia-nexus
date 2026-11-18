@@ -60,10 +60,6 @@ var policySectionIDs = []string{
 	"policyDirectBytes",
 	"policyProxyDrops",
 	"policyDirectDrops",
-	"policy_explain_value",
-	"policyExplainBtn",
-	"policyExplainResult",
-	"policyExplainDetail",
 }
 
 // renderSettingsPage renders /settings for the supplied role through the real
@@ -110,6 +106,20 @@ func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
 		} {
 			if !strings.Contains(adminBody, token) {
 				t.Errorf("admin settings page is missing %q", token)
+			}
+		}
+	})
+
+	t.Run("ExplainRemoved", func(t *testing.T) {
+		for _, removed := range []string{
+			`id="policy_explain_value"`,
+			`id="policyExplainBtn"`,
+			`id="policyExplainResult"`,
+			`id="policyExplainDetail"`,
+			"policy_explain_",
+		} {
+			if strings.Contains(adminBody, removed) {
+				t.Errorf("admin settings page still contains removed Explain surface %q", removed)
 			}
 		}
 	})
@@ -235,26 +245,6 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 		"policy_never", "policy_none", "policy_rule_count_value", "policy_status_unknown",
 		"policy_sync_state_disabled", "policy_sync_state_error",
 		"policy_sync_state_pending", "policy_sync_state_synced",
-		// The read-only decision dry run (#825): its result line, the labels it
-		// resolves at run time and every cause the server can return.
-		"policy_explain_running", "policy_explain_needs_value", "policy_explain_failed",
-		"policy_explain_result",
-		"policy_explain_prospective_rule", "policy_explain_current_prefix",
-		"policy_explain_decision_direct", "policy_explain_decision_proxy",
-		"policy_explain_decision_drop", "policy_explain_decision_unknown",
-		"policy_explain_reason_policy_disabled", "policy_explain_reason_no_policy_snapshot",
-		"policy_explain_reason_prohibited_destination", "policy_explain_reason_domain_rule",
-		"policy_explain_reason_cname_rule", "policy_explain_reason_cidr_rule",
-		"policy_explain_reason_cached_proxy_evidence", "policy_explain_reason_fresh_evidence_direct",
-		"policy_explain_reason_expired_evidence", "policy_explain_reason_evicted_evidence",
-		"policy_explain_reason_stale_evidence_generation", "policy_explain_reason_no_trusted_evidence",
-		"policy_explain_reason_no_usable_address", "policy_explain_reason_name_unresolved",
-		// The no-client-context result line, the label that separates policy
-		// evaluation from a measured route, and the cause variant selected when
-		// no session was read.
-		"policy_explain_result_no_context",
-		"policy_explain_policy_evaluation_label",
-		"policy_explain_reason_no_trusted_evidence_no_session",
 	} {
 		keys[key] = true
 	}
