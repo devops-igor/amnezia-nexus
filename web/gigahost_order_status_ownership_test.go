@@ -33,13 +33,9 @@ func gigahostOrderStatusOwnershipHarness(t *testing.T, scenario string) string {
 	if err != nil {
 		t.Fatalf("read the setup intents module: %v", err)
 	}
-	templateBytes, err := TemplatesFS.ReadFile("templates/settings.html")
-	if err != nil {
-		t.Fatalf("read the settings template: %v", err)
-	}
 	// The listener is taken from the template verbatim, so a change to the shipped wiring
 	// is exercised rather than described.
-	template := string(templateBytes)
+	template := settingsPageScript(t)
 	start := strings.Index(template, "    if (btnRefreshCatalog) {")
 	end := strings.Index(template, "    if (btnDeployVPS)")
 	if start < 0 || end <= start {

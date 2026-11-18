@@ -30,46 +30,6 @@ import (
 	"testing"
 )
 
-// lastInlineScript returns the body of the last <script> block without a src
-// attribute in an HTML template. It is used to run a page's own ordering logic in
-// JSDOM rather than a reimplementation of it.
-//
-// The scan is a simple forward search for "<script" and the matching "</script>",
-// which is sufficient here because the template contains no "<script" inside a
-// string literal. A missing or empty block is reported as an error, never as an
-// empty string that would let a test pass against nothing.
-func lastInlineScript(html string) (string, error) {
-	const open, closeTag = "<script", "</script>"
-	var last string
-	for offset := 0; ; {
-		start := strings.Index(html[offset:], open)
-		if start < 0 {
-			break
-		}
-		start += offset
-		tagEnd := strings.Index(html[start:], ">")
-		if tagEnd < 0 {
-			break
-		}
-		tagEnd += start
-		bodyStart := tagEnd + 1
-		end := strings.Index(html[bodyStart:], closeTag)
-		if end < 0 {
-			break
-		}
-		end += bodyStart
-		attributes := html[start:tagEnd]
-		if !strings.Contains(attributes, "src=") {
-			last = html[bodyStart:end]
-		}
-		offset = end + len(closeTag)
-	}
-	if strings.TrimSpace(last) == "" {
-		return "", fmt.Errorf("no inline script block with content found")
-	}
-	return last, nil
-}
-
 // pageElementIDs returns the element ids a page script binds with
 // getElementById('...'), deduplicated and in first-appearance order. It lets a DOM
 // harness create exactly the elements the shipped script expects, so the script can
@@ -101,11 +61,7 @@ func pageElementIDs(js string) []string {
 func TestGigahostPlacementPageWiringDOM(t *testing.T) {
 	node := requireJSDOM(t)
 
-	template, err := TemplatesFS.ReadFile("templates/settings.html")
-	if err != nil {
-		t.Fatalf("read settings template: %v", err)
-	}
-	templateText := string(template)
+	templateText := settingsTemplateText(t)
 
 	// The page must load the shipped module, not an inline copy.
 	if !strings.Contains(templateText, `src="/static/js/gigahost_placement.js"`) {
@@ -115,10 +71,7 @@ func TestGigahostPlacementPageWiringDOM(t *testing.T) {
 		t.Fatal("settings.html has no placement selector")
 	}
 
-	pageJS, err := lastInlineScript(templateText)
-	if err != nil {
-		t.Fatalf("extract the page script: %v", err)
-	}
+	pageJS := settingsPageScript(t)
 	// The block this test runs must be the ordering logic, not some other script.
 	for _, token := range []string{"function updateDeploySelections", "function handleDeployVPS", "deployPlacementSelect"} {
 		if !strings.Contains(pageJS, token) {

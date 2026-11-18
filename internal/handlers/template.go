@@ -120,6 +120,14 @@ func (te *TemplateEngine) ReloadTemplates() error {
 		"settings_policy_client.html",
 		"settings_policy_upstream.html",
 		"settings_notifications.html",
+		"settings/appearance.html",
+		"settings/captcha.html",
+		"settings/telegram.html",
+		"settings/ssl.html",
+		"settings/limits.html",
+		"settings/backup.html",
+		"settings/upstream_components.html",
+		"settings/gigahost.html",
 	}
 
 	fresh := make(map[string]*template.Template)

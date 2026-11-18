@@ -1,0 +1,37 @@
+{{- define "settings_appearance" -}}
+<!-- BLOCK 1: Appearance -->
+        <div class="card settings-section-card">
+            <div class="settings-card-header" style="display: flex; align-items: center; justify-content: space-between;">
+                <div style="display: flex; align-items: center; gap: var(--space-sm);">
+                    <svg class="icon"><use href="#icon-settings"></use></svg>
+                    <h3 class="card-title">{{ _ "appearance" }}</h3>
+                </div>
+                <span class="badge badge-info" style="font-size: 0.72rem;">v{{ .app_version }}{{ if .app_codename }} — {{ .app_codename }}{{ end }}</span>
+            </div>
+            <form id="appearanceForm">
+                <div class="form-group">
+                    <label class="form-label" for="app_title">{{ _ "title_label" }}</label>
+                    <input type="text" class="form-input" id="app_title" name="title" value="{{ get (get .settings "appearance") "title" "Amnezia" }}" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="app_logo">{{ _ "logo_label" }}</label>
+                    <input type="text" class="form-input" id="app_logo" name="logo" value="{{ get (get .settings "appearance") "logo" "🛡" }}" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="app_subtitle">{{ _ "subtitle_label" }}</label>
+                    <input type="text" class="form-input" id="app_subtitle" name="subtitle" value="{{ get (get .settings "appearance") "subtitle" "Web Panel" }}" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="appearance_language">{{ _ "language_label" }}</label>
+                    <select class="form-select" name="language" id="appearance_language">
+                        {{ $currentAppLang := get (get .settings "appearance") "language" "en" }}
+                        <option value="en" {{ if eq $currentAppLang "en" }}selected{{ end }}>{{ _ "lang_en" }}</option>
+                        <option value="ru" {{ if eq $currentAppLang "ru" }}selected{{ end }}>{{ _ "lang_ru" }}</option>
+                        <option value="fr" {{ if eq $currentAppLang "fr" }}selected{{ end }}>{{ _ "lang_fr" }}</option>
+                        <option value="zh" {{ if eq $currentAppLang "zh" }}selected{{ end }}>{{ _ "lang_zh" }}</option>
+                        <option value="fa" {{ if eq $currentAppLang "fa" }}selected{{ end }}>{{ _ "lang_fa" }}</option>
+                    </select>
+                </div>
+            </form>
+        </div>
+{{- end }}
