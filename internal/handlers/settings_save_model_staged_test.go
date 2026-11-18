@@ -140,3 +140,76 @@ assert.equal(n.getAttribute('aria-busy'), 'false');
 assert.equal(toasts.length, 0);
 `)
 }
+
+// TestSettingsStagedEdits_PolicySlowSaveKeepsNewerEdits: the policy card's form is
+// not locked during a save, so text typed after the request was built must survive
+// its answer, stay marked unsaved, and the stored record holds what was sent.
+func TestSettingsStagedEdits_PolicySlowSaveKeepsNewerEdits(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	runSettingsScenario(t, h, `
+const policy = card('policyRoutingCard');
+const save = policy.querySelector('[data-commit]');
+await sleep(300);
+
+let release;
+const gate = new Promise(r => { release = r; });
+holdWhen = (u, o) => (String(u) === '/api/vpn/policy' && String((o && o.method) || '').toUpperCase() === 'PUT') ? gate : null;
+
+type('policy_local_entries', 'sent.example');
+await until(() => !save.disabled, 'the edited card to be committable');
+save.click();
+await until(() => held > 0, 'the save request to reach the barrier');
+assert.equal(policy.getAttribute('aria-busy'), 'true');
+
+type('policy_local_entries', 'sent.example\nnewer.example');
+release();
+holdWhen = null;
+await until(() => policy.getAttribute('aria-busy') === 'false', 'the save to finish');
+await settled();
+
+assert.equal(doc.getElementById('policy_local_entries').value, 'sent.example\nnewer.example', 'the newer edit survived the answer');
+assert.equal(shown(badgeOf('policyRoutingCard')), true, 'the newer edit is still unsaved');
+assert.deepEqual(policyDouble.record.local_entries, ['sent.example'], 'the stored record holds what was sent');
+assert.equal(policyDouble.puts.length, 1);
+`)
+}
+
+// TestSettingsStagedEdits_UpstreamSlowSaveLocksTheRowsAndSettlesClean: the resolver
+// editor chose the other answer to a slow save. Its controls are disabled for the
+// whole request, so nothing can be typed that the answer could overwrite, and the
+// card is clean once the list it sent is stored.
+func TestSettingsStagedEdits_UpstreamSlowSaveLocksTheRowsAndSettlesClean(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	runSettingsScenario(t, h, `
+const up = card('policyUpstreamCard');
+const save = up.querySelector('[data-commit]');
+await until(() => up.querySelectorAll('[data-upstream-role="row"]').length > 0, 'upstream rows to load');
+await sleep(200);
+
+let release;
+const gate = new Promise(r => { release = r; });
+holdWhen = (u, o) => (String(u) === '/api/vpn/policy' && String((o && o.method) || '').toUpperCase() === 'PUT') ? gate : null;
+
+const port = () => up.querySelector('[data-upstream-field="port"]');
+port().value = '5353';
+port().dispatchEvent(new w.Event('input', {bubbles: true}));
+port().dispatchEvent(new w.Event('change', {bubbles: true}));
+await until(() => !save.disabled, 'the edited list to be committable');
+save.click();
+await until(() => held > 0, 'the save request to reach the barrier');
+
+assert.equal(up.getAttribute('aria-busy'), 'true');
+assert.equal(port().disabled, true, 'the row cannot be edited while the request runs');
+assert.equal(save.disabled, true);
+
+release();
+holdWhen = null;
+await until(() => up.getAttribute('aria-busy') === 'false', 'the save to finish');
+await settled();
+
+assert.equal(port().disabled, false, 'the row is editable again');
+assert.equal(shown(badgeOf('policyUpstreamCard')), false, 'the card is clean once the sent list is stored');
+assert.equal(policyDouble.record.upstream_dns[0].port, 5353, 'the stored list is the one that was sent');
+assert.ok(doc.getElementById('policyUpstreamAlert').textContent !== '', 'the result is reported in the card');
+`)
+}
