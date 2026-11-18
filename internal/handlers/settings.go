@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
+	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
 )
 
@@ -225,6 +226,24 @@ func (h *Handlers) SaveSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	h.JSON(w, http.StatusOK, map[string]any{"status": "success"})
 }
 
+// dropAdminOnlyBackupSettings removes from a backup export the settings records
+// the requesting session is not entitled to read.
+//
+// The policy routing record (#883) is administrator-only: its dedicated API
+// refuses every non-admin role, so the generic export must not become the
+// alternative read that hands operator-selected routing rules to Support. Restore
+// ignores the record (allowedSettingsKeys), so withholding it costs no restore
+// capability, and an Admin export keeps its current content.
+//
+// A session that is absent or not an administrator fails closed: the record is
+// withheld, exactly as for any other non-admin caller.
+func dropAdminOnlyBackupSettings(settings map[string]any, sess *models.SessionData) {
+	if settings == nil || sess.IsAdmin() {
+		return
+	}
+	delete(settings, policy.SettingsKey)
+}
+
 // DownloadBackupHandler exports panel metadata as a credential-free JSON backup.
 //
 // The payload contract is versioned by BackupData.FormatVersion: 0/absent is the
@@ -306,6 +325,10 @@ func (h *Handlers) DownloadBackupHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	settingsMap, _ := h.db.GetAllSettings(ctx)
+	// This export is a second read of the settings table under
+	// RequireAdminOrSupport, so the administrator-only records are withheld
+	// before anything reaches the payload.
+	dropAdminOnlyBackupSettings(settingsMap, h.GetSession(r))
 	if settingsMap != nil {
 		// GetAllSettings returns decrypted credentials (ssl.key_text, provider and
 		// bot tokens). The export is a credential-free metadata artifact (#343),
