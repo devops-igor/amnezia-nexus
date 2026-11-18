@@ -386,3 +386,23 @@ assert.equal(s.ssl.domain, 'seed.example.test', 'client A or B changed an ssl ro
 		}
 	}
 }
+
+// TestSettingsSaveModel_DoubleClickOnOneCardSendsOneRequest: a second click on a
+// card's commit, made before the first request has started, joins the commit that
+// is already queued. The control is not disabled until the request begins, so
+// without this the same section would be written twice.
+func TestSettingsSaveModel_DoubleClickOnOneCardSendsOneRequest(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	runSettingsScenario(t, h, `
+let sent = 0;
+holdWhen = (u, o) => { if (String(u).indexOf('/api/settings/save') === 0) sent++; return null; };
+type('max_connections_per_user', '27');
+const button = commitOf('limitsCard');
+button.click();
+button.click();
+await until(() => shown(statusOf('limitsCard')), 'the limits save to report success');
+await settled();
+assert.equal(sent, 1, 'two clicks on one card must be one request, got ' + sent);
+assert.equal((await stored()).limits.max_connections_per_user, 27);
+`)
+}
