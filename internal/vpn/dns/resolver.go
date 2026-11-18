@@ -74,21 +74,6 @@ type Resolver interface {
 	Exchange(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error)
 }
 
-// ReadOnlyResolver performs the same exchange without publishing its outcome to
-// the resolver's health status.
-//
-// It exists for a diagnostic that must not rewrite what the operator sees about
-// the live resolver (issue #825, review finding HIGH-01). Exchange records the
-// successful or failed attempt in ResolverStatus; a dry run that used it could
-// clear a real upstream failure, or invent one, just by being asked a question.
-// ReadOnlyResolver runs the identical path — same query deadline, same attempt
-// deadline, same primary/alternate failover, same TCP fallback — and only omits
-// the status write, so there is no second implementation and no budget
-// divergence.
-type ReadOnlyResolver interface {
-	ExchangeReadOnly(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error)
-}
-
 // ResolverConfig defines configuration for UpstreamResolver.
 type ResolverConfig struct {
 	// Upstreams is the ordered upstream list. The first entry is the primary and
@@ -253,21 +238,12 @@ func validateUpstreamEntry(upstream policy.Upstream, allowLoopback bool) error {
 // alternate upstream. A transport failure is returned as an error, never as a
 // valid empty answer. The attempt outcome is published to the resolver status.
 func (r *UpstreamResolver) Exchange(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error) {
-	return r.exchange(ctx, req, true)
+	return r.exchange(ctx, req)
 }
 
-// ExchangeReadOnly is Exchange without the resolver-status write. The exchange
-// itself — budgets, failover, TCP fallback, error classification — is the same
-// code path; only the health outcome is suppressed. It is what a read-only
-// diagnostic must use, so asking a question cannot change what the operator is
-// told about the live resolver.
-func (r *UpstreamResolver) ExchangeReadOnly(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error) {
-	return r.exchange(ctx, req, false)
-}
-
-// exchange runs one bounded query. record selects whether the attempt outcome
-// updates the resolver health status.
-func (r *UpstreamResolver) exchange(ctx context.Context, req *mdns.Msg, record bool) (*mdns.Msg, error) {
+// exchange runs one bounded query and publishes each attempt outcome to the
+// resolver health status.
+func (r *UpstreamResolver) exchange(ctx context.Context, req *mdns.Msg) (*mdns.Msg, error) {
 	if req == nil || len(req.Question) == 0 {
 		return nil, ErrInvalidRequest
 	}
@@ -285,7 +261,7 @@ func (r *UpstreamResolver) exchange(ctx context.Context, req *mdns.Msg, record b
 	if len(attempts) > 2 {
 		attempts = attempts[:2]
 	}
-	resp, err := r.runAttempts(queryCtx, ctx, req, attempts, record)
+	resp, err := r.runAttempts(queryCtx, ctx, req, attempts)
 	if err != nil {
 		return nil, err
 	}
@@ -299,7 +275,7 @@ func (r *UpstreamResolver) exchange(ctx context.Context, req *mdns.Msg, record b
 //
 // callerCtx is the caller's own context: a cancellation that came from the
 // client is not an upstream failure and must not be reported as one.
-func (r *UpstreamResolver) runAttempts(queryCtx, callerCtx context.Context, req *mdns.Msg, attempts []policy.Upstream, record bool) (*mdns.Msg, error) {
+func (r *UpstreamResolver) runAttempts(queryCtx, callerCtx context.Context, req *mdns.Msg, attempts []policy.Upstream) (*mdns.Msg, error) {
 	var lastErr error
 	for i, upstream := range attempts {
 		if queryCtx.Err() != nil {
@@ -309,13 +285,13 @@ func (r *UpstreamResolver) runAttempts(queryCtx, callerCtx context.Context, req 
 		resp, err := r.attemptExchange(queryCtx, req, upstream)
 		if err != nil {
 			lastErr = err
-			r.recordAttemptFailure(record, callerCtx, upstream, classifyAttemptError(err))
+			r.recordFailure(callerCtx, upstream, classifyAttemptError(err))
 			continue
 		}
 
 		if kind, reason := responseEnvelopeFailure(resp, req.Question[0]); kind != "" {
 			lastErr = fmt.Errorf("%w: %s from %v", ErrExchangeFailed, reason, upstream.String())
-			r.recordAttemptFailure(record, callerCtx, upstream, kind)
+			r.recordFailure(callerCtx, upstream, kind)
 			continue
 		}
 
@@ -324,7 +300,7 @@ func (r *UpstreamResolver) runAttempts(queryCtx, callerCtx context.Context, req 
 		// is returned to the client, but the status must not report a working
 		// provider for a query it could not answer.
 		if resp.Rcode == mdns.RcodeServerFailure {
-			r.recordAttemptFailure(record, callerCtx, upstream, FailureServfail)
+			r.recordFailure(callerCtx, upstream, FailureServfail)
 			if i < len(attempts)-1 {
 				lastErr = fmt.Errorf("%w: servfail from %v", ErrExchangeFailed, upstream.String())
 				continue
@@ -332,7 +308,7 @@ func (r *UpstreamResolver) runAttempts(queryCtx, callerCtx context.Context, req 
 			return resp, nil
 		}
 
-		r.recordAttemptSuccess(record, upstream)
+		r.recordSuccess(upstream)
 		return resp, nil
 	}
 
@@ -375,26 +351,6 @@ func (r *UpstreamResolver) recordFailure(ctx context.Context, upstream policy.Up
 	defer r.statusMu.Unlock()
 	r.status.LastFailure = upstream.String()
 	r.status.LastFailureKind = kind
-}
-
-// recordAttemptFailure writes a failed attempt only when the caller asked for
-// the status to be published. A read-only diagnostic passes record=false, so
-// asking a question cannot invent an upstream failure.
-func (r *UpstreamResolver) recordAttemptFailure(record bool, ctx context.Context, upstream policy.Upstream, kind FailureKind) {
-	if !record {
-		return
-	}
-	r.recordFailure(ctx, upstream, kind)
-}
-
-// recordAttemptSuccess writes a successful attempt only when the caller asked
-// for the status to be published, so a read-only diagnostic cannot clear a real
-// recorded failure.
-func (r *UpstreamResolver) recordAttemptSuccess(record bool, upstream policy.Upstream) {
-	if !record {
-		return
-	}
-	r.recordSuccess(upstream)
 }
 
 // classifyAttemptError maps one failed attempt to the operator-facing kind.
