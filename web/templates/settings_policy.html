@@ -22,7 +22,7 @@
         <span id="policyStatusBadge" class="badge badge-secondary">{{ _ "policy_status_disabled" }}</span>
     </div>
 
-    <div id="policyAlert" role="status" aria-live="polite" aria-atomic="true" class="settings-notice settings-notice-spaced" hidden></div>
+    <div id="policyAlert" role="status" aria-live="polite" aria-atomic="true" class="settings-notice settings-notice-spaced"></div>
 
     <form id="policyRoutingForm">
         <div class="form-group">
@@ -104,7 +104,7 @@
         <p class="form-hint">{{ _ "policy_limits_notice" }}</p>
 
         <div class="settings-button-row">
-            <button type="submit" class="btn btn-primary" id="policySaveBtn" data-commit disabled>
+            <button type="submit" class="btn btn-primary" id="policySaveBtn" data-commit data-commit-when-dirty data-commit-gated disabled>
                 <svg class="icon"><use href="#icon-check"></use></svg>
                 <span id="policySaveBtnText">{{ _ "save_changes" }}</span>
                 <span class="spinner hidden" id="policySaveSpinner" aria-hidden="true"></span>

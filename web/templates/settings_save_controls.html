@@ -1,8 +1,11 @@
-{{ define "settings_dirty" }}<span class="badge badge-warn hidden" data-dirty role="status" aria-live="polite"></span>{{ end }}
+{{/* The three result nodes are live regions. They are mounted empty and are never
+     hidden, so assistive technology has registered them before their text changes;
+     the stylesheet keeps an empty one out of the layout. */}}
+{{ define "settings_dirty" }}<span class="badge badge-warn" data-dirty role="status" aria-live="polite"></span>{{ end }}
 
 {{ define "settings_feedback" }}
-            <p class="settings-notice settings-notice-success" data-status role="status" aria-live="polite" hidden></p>
-            <p class="settings-notice settings-notice-danger" data-error role="alert" hidden></p>
+            <p class="settings-notice settings-notice-success" data-status role="status" aria-live="polite"></p>
+            <p class="settings-notice settings-notice-danger" data-error role="alert"></p>
 {{ end }}
 
 {{ define "settings_commit" }}

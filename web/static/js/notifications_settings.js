@@ -45,6 +45,32 @@
         if (root.SettingsCards) root.SettingsCards.rebase(CARD);
     }
 
+    // The card module owns the commit control while it is on the page: it
+    // blocks the control until the stored record has loaded, keeps a clean card
+    // from committing, marks the card busy and keeps keyboard focus. Without it
+    // the controller falls back to driving the button itself.
+    function cardGate(blocked) {
+        if (root.SettingsCards) {
+            root.SettingsCards.gate(CARD, blocked);
+            return;
+        }
+        var save = byId('notificationSaveBtn');
+        if (save) save.disabled = blocked;
+    }
+
+    function cardBusy(busy) {
+        if (root.SettingsCards) {
+            root.SettingsCards.busy(CARD, busy);
+            return;
+        }
+        setBusy('notificationSaveBtn', 'notificationSaveSpinner', 'notificationSaveBtnText', busy,
+            translate(busy ? 'loading' : 'save_changes', busy ? 'Loading' : 'Save changes'));
+    }
+
+    function cardIsClean() {
+        return !!root.SettingsCards && !root.SettingsCards.isDirty(CARD);
+    }
+
     function setBusy(buttonId, spinnerId, textId, busy, text) {
         var button = byId(buttonId);
         var spinner = byId(spinnerId);
@@ -98,17 +124,15 @@
             var settings = await root.API.get('/api/notifications/settings', { silent: true });
             renderSettings(settings || {});
             state.loaded = true;
-            var saveBtn = byId('notificationSaveBtn');
             var testBtn = byId('notificationTestBtn');
-            if (saveBtn) saveBtn.disabled = false;
+            cardGate(false);
             if (testBtn) testBtn.disabled = false;
             await loadHistory();
         } catch (err) {
             state.loaded = false;
             showTestResult(translate('notifications_load_failed', 'Could not load notification settings') + ': ' + (err.message || err), true);
-            var save = byId('notificationSaveBtn');
             var test = byId('notificationTestBtn');
-            if (save) save.disabled = true;
+            cardGate(true);
             if (test) test.disabled = true;
         } finally {
             state.loading = false;
@@ -134,13 +158,35 @@
         };
     }
 
+    // keepNewerEdits settles a save when the operator kept editing while the
+    // request was in flight. What was sent is stored; what is on screen now is
+    // not, so the form is left alone and only the saved baseline moves to the
+    // sent values. A token field that still holds what was sent is emptied, as
+    // after any save, because the secret is write-only.
+    function keepNewerEdits(saved, sent, body) {
+        state.tokenSet = !!saved.app_token_set;
+        state.maxAttempts = saved.max_attempts || state.maxAttempts;
+        var token = byId('notifications_token');
+        if (token) {
+            if (token.value.trim() === body.app_token) token.value = '';
+            token.placeholder = state.tokenSet ? '********' : '';
+        }
+        root.SettingsCards.rebase(CARD, sent);
+    }
+
     async function save(silent) {
         if (!state.loaded || state.saving) return false;
         state.saving = true;
-        setBusy('notificationSaveBtn', 'notificationSaveSpinner', 'notificationSaveBtnText', true, translate('loading', 'Loading'));
+        cardBusy(true);
         try {
-            var saved = await root.API.post('/api/notifications/settings', collect(), { silent: true });
-            renderSettings(saved || {});
+            var sent = root.SettingsCards ? root.SettingsCards.capture(CARD) : null;
+            var body = collect();
+            var saved = await root.API.post('/api/notifications/settings', body, { silent: true });
+            if (sent && root.SettingsCards.changedSince(CARD, sent)) {
+                keepNewerEdits(saved || {}, sent, body);
+            } else {
+                renderSettings(saved || {});
+            }
             if (!silent) cardReport('success', translate('settings_saved', 'Settings saved'));
             return true;
         } catch (err) {
@@ -148,7 +194,7 @@
             return false;
         } finally {
             state.saving = false;
-            setBusy('notificationSaveBtn', 'notificationSaveSpinner', 'notificationSaveBtnText', false, translate('save_changes', 'Save changes'));
+            cardBusy(false);
         }
     }
 
@@ -156,7 +202,9 @@
         if (!state.loaded || state.testing) return;
         // Test exactly the configuration the administrator sees. Persist it
         // first, so a passing test cannot belong to a different destination.
-        var saved = await save(true);
+        // A card with nothing staged already is what is stored, so there is
+        // nothing to save first.
+        var saved = cardIsClean() ? true : await save(true);
         if (!saved) {
             showTestResult(translate('notifications_test_save_failed', 'Save the notification settings before testing'), true);
             return;

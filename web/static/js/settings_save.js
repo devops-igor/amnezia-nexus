@@ -32,6 +32,10 @@
     };
 
     var chain = Promise.resolve();
+    // The commit already queued or running for each card. A second click, or an
+    // Enter that reaches the card before the first request has started, joins it
+    // instead of queueing a duplicate.
+    var pending = {};
     var loadedLanguage = null;
     var loadedTitle = '';
 
@@ -205,8 +209,12 @@
 
     // commit queues one card's save behind any save already running.
     function commit(key) {
+        if (pending[key]) return pending[key];
         var result = chain.then(function () { return run(key); });
+        pending[key] = result;
         chain = result["catch"](function () { return false; });
+        var release = function () { delete pending[key]; };
+        result.then(release, release);
         return result;
     }
 

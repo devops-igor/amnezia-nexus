@@ -1154,5 +1154,7 @@
   "settings_applies_now": "بلافاصله اعمال می‌شود",
   "settings_save_read_failed": "خواندن تنظیمات ذخیره‌شده ممکن نبود، بنابراین چیزی ذخیره نشد",
   "settings_test_saves_first": "ابتدا تنظیمات بالا را ذخیره می‌کند، سپس بلافاصله ارسال می‌کند",
-  "policy_client_tried_names_fmt": "تلاش‌شده: {names}"
+  "policy_client_tried_names_fmt": "تلاش‌شده: {names}",
+  "policy_save_kept": "سرور این تغییر را رد کرد. ویرایش‌های شما همچنان در فرم هستند و ذخیره نشده‌اند.",
+  "policy_upstream_save_kept": "ویرایش‌های شما همچنان در ویرایشگر هستند و ذخیره نشده‌اند."
 }

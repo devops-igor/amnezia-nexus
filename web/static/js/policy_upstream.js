@@ -283,57 +283,42 @@
         });
     }
 
+    // setAlert renders the inline banner. It is never hidden: a live region is
+    // announced reliably only when it was in the accessibility tree before its
+    // text changed. A failure is an alert (assertive) and anything else a status
+    // (polite), so the two differ by role as well as by wording.
     function setAlert(kind, message) {
         var banner = element('policyUpstreamAlert');
         if (!banner) {
             return;
         }
         if (!message) {
-            banner.style.display = 'none';
             banner.textContent = '';
             banner.setAttribute('data-state', '');
+            banner.style.background = '';
+            banner.style.border = '';
+            banner.style.color = '';
             return;
         }
+        var failure = kind !== 'success';
+        banner.setAttribute('role', failure ? 'alert' : 'status');
+        banner.setAttribute('aria-live', failure ? 'assertive' : 'polite');
         // Theme tokens, not literals: --success-bg/--danger-bg already carry the
         // light and dark variants. The text keeps the primary colour because the
         // state is also carried by the tint, the border and the wording.
-        if (kind === 'success') {
-            banner.style.background = 'var(--success-bg)';
-            banner.style.border = '1px solid var(--success-border)';
-        } else {
-            banner.style.background = 'var(--danger-bg)';
-            banner.style.border = '1px solid var(--danger-border)';
-        }
+        banner.style.background = failure ? 'var(--danger-bg)' : 'var(--success-bg)';
+        banner.style.border = failure ? '1px solid var(--danger-border)' : '1px solid var(--success-border)';
         banner.style.color = 'var(--text-primary)';
         banner.setAttribute('data-state', kind);
         banner.textContent = message;
-        banner.style.display = 'block';
     }
 
+    // setBusy hands the save control to the card module: aria-busy on the card,
+    // the disabled commit, the spinner and the focus that has to survive it. The
+    // button label does not change, so the layout does not shift.
     function setBusy(busy) {
-        var button = element('policyUpstreamSaveBtn');
-        var spinner = element('policyUpstreamSaveSpinner');
-        var label = element('policyUpstreamSaveBtnText');
-        if (button) {
-            if (busy && root.document && root.document.activeElement === button) {
-                busyFocus = button;
-            }
-            button.setAttribute('aria-busy', busy ? 'true' : 'false');
-            if (!busy) {
-                // Disabling a focused control drops focus to the body; give it back.
-                if (busyFocus === button && root.document && root.document.activeElement === root.document.body) {
-                    button.focus();
-                }
-                busyFocus = null;
-            }
-        }
-        if (spinner) {
-            spinner.classList.toggle('hidden', !busy);
-        }
-        if (label) {
-            label.textContent = busy
-                ? text('policy_upstream_saving')
-                : text('save_changes');
+        if (root.SettingsCards) {
+            root.SettingsCards.busy('policyUpstreamCard', busy);
         }
     }
 
@@ -408,9 +393,9 @@
         if (reloadBtn) {
             reloadBtn.disabled = blocked;
         }
-        var saveBtn = element('policyUpstreamSaveBtn');
-        if (saveBtn) {
-            saveBtn.disabled = blocked || invalid || !baseline || baseline.preset === '';
+        if (root.SettingsCards) {
+            root.SettingsCards.gate('policyUpstreamCard',
+                blocked || invalid || !baseline || baseline.preset === '');
         }
         paintRowControls();
     }
@@ -646,6 +631,22 @@
         return record;
     }
 
+    // refreshHealth reads the stored record only to update the runtime
+    // diagnostics. It never touches the rows or the baseline, so edits that were
+    // refused stay in the editor. A failed read leaves the last observation on
+    // screen, and a read that started before an accepted save is dropped.
+    async function refreshHealth() {
+        var seq = ++requestSeq;
+        try {
+            var record = await fetchRecord();
+            if (seq > lastAcceptedMutation) {
+                renderHealth(recordHealth(record));
+            }
+        } catch (err) {
+            // The refusal is already on screen; there is nothing newer to show.
+        }
+    }
+
     function setReady(value) {
         ready = !!value;
         refresh();
@@ -771,17 +772,12 @@
             var key = code === 'state_inconsistent'
                 ? 'policy_upstream_state_inconsistent'
                 : 'policy_upstream_save_failed';
-            setAlert('error', text(key) + ': ' + errorDetail(err) + ' ' + text('policy_upstream_save_refused'));
-            // Re-read the stored record so a rejected edit is not left on screen.
-            // When that read fails too, the last accepted record is restored and
-            // no success is claimed.
-            try {
-                await load(++requestSeq);
-            } catch (reloadErr) {
-                if (baseline) {
-                    applyRecord(baseline);
-                }
-            }
+            setAlert('error', text(key) + ': ' + errorDetail(err) + ' ' + text('policy_upstream_save_kept'));
+            // The refused rows were never stored, so they stay in the editor and
+            // the card stays marked unsaved: reloading the stored record here
+            // would discard them and then report the card as clean. The
+            // diagnostics are updated separately, from a read of their own.
+            await refreshHealth();
             return null;
         } finally {
             inFlight = false;

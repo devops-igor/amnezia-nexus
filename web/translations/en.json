@@ -1154,5 +1154,7 @@
   "settings_applies_now": "Applies immediately",
   "settings_save_read_failed": "Could not read the stored settings, so nothing was saved",
   "settings_test_saves_first": "Saves the settings above first, then sends now",
-  "policy_client_tried_names_fmt": "tried {names}"
+  "policy_client_tried_names_fmt": "tried {names}",
+  "policy_save_kept": "The server refused this change. Your edits are still in the form and are not saved.",
+  "policy_upstream_save_kept": "Your edits are still in the editor and are not saved."
 }

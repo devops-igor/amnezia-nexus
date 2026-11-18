@@ -730,3 +730,62 @@ def test_settings_security_commits_persist_across_a_reload(
         }
     finally:
         _restore_settings(page, csrf_token, original)
+
+
+@pytest.mark.e2e
+def test_settings_two_tabs_do_not_undo_each_others_security_saves(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """Two tabs of one session, a different card committed in each, real network.
+
+    Tab A starts an Appearance save and its request is held in the browser. Tab B
+    commits Captcha and then Limits and gets its success. A is released. A card
+    posts only its own section and the server writes only the sections it is sent,
+    so both of B's changes and A's title are what the server stores afterwards.
+    """
+    page_a = authenticated_page
+    original = api_get(page_a, "/api/settings")
+    assert isinstance(original, dict)
+    page_b = page_a.context.new_page()
+    try:
+        for tab in (page_a, page_b):
+            tab.goto(f"{base_url}/settings")
+            tab.wait_for_load_state("networkidle")
+            tab.wait_for_timeout(700)
+
+        held: list = []
+
+        def hold_appearance(route):
+            held.append(route)
+
+        page_a.route("**/api/settings/save", hold_appearance)
+        page_a.locator("#app_title").fill("Tab A Title")
+        page_a.locator("#appearanceCard [data-commit]").click()
+        for _ in range(100):
+            if held:
+                break
+            page_a.wait_for_timeout(50)
+        assert held, "tab A's save never reached the network"
+
+        page_b.locator("label.switch-container:has(#captcha_enabled) .switch-slider").click()
+        _commit(page_b, "captchaCard")
+        page_b.locator("#max_connections_per_user").fill("23")
+        _commit(page_b, "limitsCard")
+        mid = api_get(page_b, "/api/settings")
+        assert mid["captcha"]["enabled"] is True, "tab B's captcha save was acknowledged but is not stored"
+
+        held[0].continue_()
+        page_a.unroute("**/api/settings/save", hold_appearance)
+        for _ in range(100):
+            if page_a.locator("#appearanceCard [data-status]").inner_text().strip():
+                break
+            page_a.wait_for_timeout(50)
+        assert page_a.locator("#appearanceCard [data-status]").inner_text().strip()
+
+        stored = api_get(page_b, "/api/settings")
+        assert stored["appearance"]["title"] == "Tab A Title", "tab A's own change was lost"
+        assert stored["captcha"]["enabled"] is True, "tab A undid the captcha tab B saved"
+        assert stored["limits"]["max_connections_per_user"] == 23, "tab A undid the limits tab B saved"
+    finally:
+        page_b.close()
+        _restore_settings(page_a, csrf_token, original)

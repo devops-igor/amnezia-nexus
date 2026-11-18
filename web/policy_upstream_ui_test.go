@@ -118,6 +118,7 @@ func upstreamHarness(t *testing.T, prelude, scenario string) string {
 	if err != nil {
 		t.Fatalf("encode module: %v", err)
 	}
+	encodedCards := settingsCardsModuleForTest(t)
 	encodedSection, err := json.Marshal(upstreamSectionHTMLForTest(t))
 	if err != nil {
 		t.Fatalf("encode section: %v", err)
@@ -181,6 +182,8 @@ const alertState = () => {
   return {text: el.textContent, state: el.getAttribute('data-state'), display: el.style.display};
 };
 const saveBtn = () => w.document.getElementById('policyUpstreamSaveBtn');
+const cardNode = () => w.document.getElementById('policyUpstreamCard');
+const unsavedText = () => cardNode().querySelector('[data-dirty]').textContent;
 const formReady = () => w.document.getElementById('policyUpstreamForm').getAttribute('data-upstream-ready');
 const record = (list, extra) => Object.assign({
   enabled: false, preset: 'geoblock', custom_urls: [], sync_interval_seconds: 21600,
@@ -188,6 +191,7 @@ const record = (list, extra) => Object.assign({
 }, extra || {});
 
 (async () => {
+w.eval(%s);
 w.eval(%s);
 assert.equal(w.PolicyUpstreamEditor.init(), false, 'init must be inert without the section');
 
@@ -205,7 +209,7 @@ assert.deepEqual(missingKeys, [], 'the controller used a translation key outside
 console.log('UPSTREAM_SCENARIO_OK');
 dom.window.close();
 })().catch(err => { console.error(err); process.exit(1); });
-`, string(dict), string(encodedModule), string(encodedSection), prelude, scenario)
+`, string(dict), string(encodedCards), string(encodedModule), string(encodedSection), prelude, scenario)
 }
 
 // runUpstreamScenario executes one scenario and fails the test with the Node
@@ -323,7 +327,9 @@ assert.equal(notQueried.classList.contains('hidden'), false,
 assert.equal(rowNodes()[1].querySelector('[data-upstream-role="not-queried"]').classList.contains('hidden'), true);
 assert.equal(w.document.getElementById('policyUpstreamAddBtn').disabled, true,
   'three stored entries are the API maximum, so adding stops here');
-assert.equal(saveBtn().disabled, false, 'a read record with a preset opens the write gate');
+assert.equal(saveBtn().disabled, true, 'a loaded record is the saved state, so a clean card does not commit');
+setField(0, 'port', '54');
+assert.equal(saveBtn().disabled, false, 'a read record with a preset opens the write gate once something is staged');
 `)
 }
 
@@ -368,10 +374,13 @@ assert.equal(requestsTo('PUT').length, 0, 'the editor must not invent a preset')
 stored = record([], {preset: 'geoblock'});
 await w.PolicyUpstreamEditor.reload();
 await settle();
-assert.equal(saveBtn().disabled, false, 'a chosen list source opens the gate');
-assert.equal(visible('policyUpstreamSaveEffects'), false);
+assert.equal(visible('policyUpstreamSaveEffects'), false, 'a chosen list source clears the no-source notice');
+assert.equal(saveBtn().disabled, true, 'nothing is staged yet, so a clean card does not commit');
 assert.equal(await w.PolicyUpstreamEditor.addRow(), true);
 assert.equal(rowNodes().length, 1);
+setField(0, 'address', '9.9.9.9');
+setField(0, 'port', '53');
+assert.equal(saveBtn().disabled, false, 'a chosen list source opens the gate once a valid row is staged');
 assert.equal(visible('policyUpstreamDefaultsNotice'), false, 'a row replaces the defaults notice');
 `)
 }
@@ -489,12 +498,13 @@ assert.equal(rows()[0].pin, '', 'the stored record is adopted as the accepted on
 `)
 }
 
-// TestPolicyUpstreamEditorRefusalReloadsStoredRecord checks the failure path: the
-// server's own wording is shown and the form is reloaded from what is stored, so a
-// rejected edit cannot stay on screen as if it had been applied.
-func TestPolicyUpstreamEditorRefusalReloadsStoredRecord(t *testing.T) {
+// TestPolicyUpstreamEditorRefusalKeepsTheEditedRows checks the failure path: the
+// server's own wording is shown, the rows the operator typed stay in the editor,
+// and the card stays marked unsaved, because the refused list was never stored.
+func TestPolicyUpstreamEditorRefusalKeepsTheEditedRows(t *testing.T) {
 	runUpstreamScenario(t, `
 const detail = 'upstream DNS entry 1 rejected: upstream "127.0.0.1" is loopback';
+let reads = 0;
 responder = async (url, opts) => {
   if (opts.method === 'PUT') {
     const err = new Error(detail);
@@ -502,19 +512,25 @@ responder = async (url, opts) => {
     err.data = {error: 'validation_failed', detail: detail};
     throw err;
   }
+  reads++;
   return record([{address: '9.9.9.9', port: 53, transport: 'plain'}]);
 };
 `, `
 setField(0, 'address', '127.0.0.1');
+const readsBefore = reads;
 await w.PolicyUpstreamEditor.save();
 await settle();
 
 assert.equal(alertState().state, 'error');
 assert.ok(alertState().text.indexOf(detail) !== -1,
   'the server refusal must be shown verbatim, got: ' + alertState().text);
-assert.ok(alertState().text.indexOf(DICT.policy_upstream_save_refused) !== -1,
-  'the banner must say the form was reloaded, got: ' + alertState().text);
-assert.equal(rows()[0].address, '9.9.9.9', 'the rejected edit is replaced by the stored record');
+assert.ok(alertState().text.indexOf(DICT.policy_upstream_save_kept) !== -1,
+  'the banner must say the edit is still there and not saved, got: ' + alertState().text);
+assert.equal(rows()[0].address, '127.0.0.1', 'the refused edit stays in the editor');
+assert.equal(unsavedText(), DICT.settings_unsaved, 'the card is still marked unsaved after a refusal');
+assert.equal(cardNode().getAttribute('aria-busy'), 'false');
+assert.equal(saveBtn().disabled, false, 'the operator can correct the entry and try again');
+assert.ok(reads > readsBefore, 'the runtime diagnostics are still refreshed, by a read of their own');
 `)
 }
 
@@ -542,7 +558,8 @@ assert.equal(alertState().state, 'error');
 assert.ok(alertState().text.indexOf(DICT.policy_upstream_state_inconsistent) !== -1,
   'the inconsistent state needs its own message, got: ' + alertState().text);
 assert.ok(alertState().text.indexOf(detail) !== -1);
-assert.equal(rows()[0].port, '53', 'the stored record is restored after the reload');
+assert.equal(rows()[0].port, '8853', 'the refused edit stays in the editor');
+assert.equal(unsavedText(), DICT.settings_unsaved);
 `)
 }
 

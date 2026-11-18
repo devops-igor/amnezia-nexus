@@ -21,7 +21,7 @@
 
     <p class="form-hint">{{ _ "policy_upstream_intro" }}</p>
 
-    <div id="policyUpstreamAlert" role="status" aria-live="polite" aria-atomic="true" class="settings-notice settings-notice-spaced" hidden></div>
+    <div id="policyUpstreamAlert" role="status" aria-live="polite" aria-atomic="true" class="settings-notice settings-notice-spaced"></div>
 
     <form id="policyUpstreamForm" data-upstream-ready="false">
         <p class="form-hint" id="policyUpstreamLimitNote">{{ _ "policy_upstream_limit_note" }}</p>
@@ -46,7 +46,7 @@
         <p class="form-hint" id="policyUpstreamClientNotice">{{ _ "policy_upstream_client_config_notice" }}</p>
 
         <div class="settings-button-row">
-            <button type="submit" class="btn btn-primary" id="policyUpstreamSaveBtn" data-commit disabled>
+            <button type="submit" class="btn btn-primary" id="policyUpstreamSaveBtn" data-commit data-commit-when-dirty data-commit-gated disabled>
                 <svg class="icon"><use href="#icon-check"></use></svg>
                 <span id="policyUpstreamSaveBtnText">{{ _ "save_changes" }}</span>
                 <span class="spinner hidden" id="policyUpstreamSaveSpinner" aria-hidden="true"></span>

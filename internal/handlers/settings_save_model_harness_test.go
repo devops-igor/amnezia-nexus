@@ -69,10 +69,45 @@ const realFetch = fetch;
 let saveGate = null;
 let saveHeld = 0;
 let failSave = false;
+// holdWhen(url, opts) may return a promise a request waits on; failWhen(url, opts)
+// makes it fail like a dropped connection. Both see every request the page makes.
+let holdWhen = null;
+let failWhen = null;
+let held = 0;
+const isPost = o => String((o && o.method) || 'GET').toUpperCase() === 'POST';
+// The two policy cards talk to an endpoint the handler fixture does not mount, so
+// a small in-memory double answers it. policyRefuse makes the next PUT a 422.
+const policyDouble = {
+  refuse: false,
+  puts: [],
+  record: {enabled: false, preset: 'geoblock', custom_urls: [], local_entries: [], excluded_domains: [],
+    sync_interval_seconds: 21600,
+    upstream_dns: [{address: '9.9.9.9', port: 53, transport: 'plain'}],
+    status: {enabled: false, preset: 'geoblock', sync_state: 'disabled'}}
+};
+const jsonResponse = (body, status) => new Response(JSON.stringify(body), {status: status || 200, headers: {'content-type': 'application/json'}});
+function policyAnswer(u, o) {
+  const path = String(u).split('?')[0];
+  const method = String((o && o.method) || 'GET').toUpperCase();
+  if (path === '/api/vpn/policy/stats') return jsonResponse({proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0});
+  if (path !== '/api/vpn/policy') return null;
+  if (method === 'PUT') {
+    const body = JSON.parse(o.body);
+    policyDouble.puts.push(body);
+    if (policyDouble.refuse) return jsonResponse({error: 'activation_failed', detail: 'direct egress is unavailable'}, 422);
+    policyDouble.record = Object.assign({}, policyDouble.record, body, {status: {enabled: body.enabled, preset: body.preset, sync_state: 'disabled'}});
+    return jsonResponse(Object.assign({status: 'ok', policy_status: policyDouble.record.status}, policyDouble.record));
+  }
+  return jsonResponse(policyDouble.record);
+}
 w.fetch = async (u, o) => {
   const isSave = String(u).indexOf('/api/settings/save') === 0;
   if (isSave && failSave) throw new TypeError('Failed to fetch');
   if (isSave && saveGate) { saveHeld++; await saveGate; }
+  if (failWhen && failWhen(u, o)) throw new TypeError('Failed to fetch');
+  if (holdWhen) { const gate = holdWhen(u, o); if (gate) { held++; await gate; } }
+  const fake = policyAnswer(u, o);
+  if (fake) return fake;
   return realFetch(CFG.base + u, o);
 };
 for (const s of CFG.scripts) { w.eval(s.source); }
@@ -155,16 +190,22 @@ func seedSettingsForPage(t *testing.T, h *Handlers) {
 	}
 }
 
-// settingsHarnessServer exposes the settings and hosting handlers over HTTP as an
-// administrator. The settings and catalog handlers are the real ones: with no
+// settingsHarnessOptions selects what the harness server mounts beyond the
+// default. By default the notification read is the one injected failure: the
+// handler fixture always builds a notification service, so the real handler
+// answers 200, and the route returns the 503 the handler itself sends when that
+// service is absent, so the page meets a second unrelated subsystem failure
+// during load. liveNotifications routes the real notification handlers instead,
+// for tests that need that card to load and save.
+type settingsHarnessOptions struct {
+	liveNotifications bool
+}
+
+// settingsHarnessServerWith exposes the settings and hosting handlers over HTTP as
+// an administrator. The settings and catalog handlers are the real ones: with no
 // provider key configured the catalog handler answers 400, which is the hosting
 // error an appearance save used to surface.
-//
-// The notification read is the one injected failure. The handler fixture always
-// builds a notification service, so the real handler answers 200 here. The route
-// returns the 503 the handler itself sends when that service is absent, so the
-// page meets a second unrelated subsystem failure during load.
-func settingsHarnessServer(t *testing.T, h *Handlers) *httptest.Server {
+func settingsHarnessServerWith(t *testing.T, h *Handlers, opts settingsHarnessOptions) *httptest.Server {
 	t.Helper()
 	t.Setenv("GIGAHOST_API_KEY", "")
 	r := chi.NewRouter()
@@ -179,9 +220,15 @@ func settingsHarnessServer(t *testing.T, h *Handlers) *httptest.Server {
 	r.Get("/api/settings", h.GetSettingsHandler)
 	r.Post("/api/settings/save", h.SaveSettingsHandler)
 	r.Get("/api/admin/hosting/gigahost/catalog", h.GigahostCatalogHandler)
-	r.Get("/api/notifications/settings", func(w http.ResponseWriter, _ *http.Request) {
-		h.JSONError(w, http.StatusServiceUnavailable, "notifications_unavailable", "Notification service is not configured")
-	})
+	if opts.liveNotifications {
+		r.Get("/api/notifications/settings", h.GetNotificationSettingsHandler)
+		r.Post("/api/notifications/settings", h.SaveNotificationSettingsHandler)
+		r.Get("/api/notifications/history", h.GetNotificationHistoryHandler)
+	} else {
+		r.Get("/api/notifications/settings", func(w http.ResponseWriter, _ *http.Request) {
+			h.JSONError(w, http.StatusServiceUnavailable, "notifications_unavailable", "Notification service is not configured")
+		})
+	}
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	return srv
@@ -192,10 +239,16 @@ func settingsHarnessServer(t *testing.T, h *Handlers) *httptest.Server {
 // async function with the helpers from settingsHarnessHead in scope.
 func runSettingsScenario(t *testing.T, h *Handlers, scenario string) string {
 	t.Helper()
+	return runSettingsScenarioWith(t, h, settingsHarnessOptions{}, scenario)
+}
+
+// runSettingsScenarioWith is runSettingsScenario with the harness server options.
+func runSettingsScenarioWith(t *testing.T, h *Handlers, opts settingsHarnessOptions, scenario string) string {
+	t.Helper()
 	node := gigahostOrderStatusNode(t)
 	seedSettingsForPage(t, h)
 	page := renderSettingsPageFor(t, h, models.RoleAdmin)
-	srv := settingsHarnessServer(t, h)
+	srv := settingsHarnessServerWith(t, h, opts)
 
 	enRaw, err := web.TranslationsFS.ReadFile("translations/en.json")
 	if err != nil {

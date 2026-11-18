@@ -148,6 +148,22 @@
     margin: var(--space-sm) 0 0 0;
 }
 
+/* A live region is announced reliably only when it was already in the
+   accessibility tree before its text changed, so these nodes are never hidden
+   with display:none, [hidden] or visibility:hidden. While empty they take no
+   space instead: out of flow and zero size. The rule stops applying the moment
+   text arrives, so a region with a message has its normal box. */
+.settings-notice:empty,
+.settings-section-card [data-dirty]:empty {
+    position: absolute;
+    width: 0;
+    height: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+}
+
 .settings-immediate {
     font-weight: 600;
 }

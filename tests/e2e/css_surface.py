@@ -41,12 +41,15 @@ SETTINGS_SURFACE_CLASSES = frozenset({
     "upstream-component-sep", "upstream-component-title", "upstream-footer",
 })
 
-# Rules that pair two legacy classes but exist only to size controls inside the
-# Settings cards. Named exactly, so no other legacy rule is set aside by accident.
+# Rules that pair a legacy class with a Settings card and exist only to size or
+# place controls inside it. Named exactly, so no other legacy rule is set aside by
+# accident. The last one takes an empty unsaved badge out of the layout without
+# hiding it, which keeps its live region in the accessibility tree.
 SETTINGS_SCOPED_OVERRIDES = frozenset({
     ".settings-section-card .btn",
     ".settings-section-card .btn-sm",
     ".settings-card-header .badge",
+    ".settings-section-card [data-dirty]:empty",
 })
 
 # The three spacing utilities the Settings templates use. They live in vpn.css,

@@ -1154,5 +1154,7 @@
   "settings_applies_now": "Применяется сразу",
   "settings_save_read_failed": "Не удалось прочитать сохранённые настройки, поэтому ничего не сохранено",
   "settings_test_saves_first": "Сначала сохраняет настройки выше, затем сразу отправляет",
-  "policy_client_tried_names_fmt": "попытки: {names}"
+  "policy_client_tried_names_fmt": "попытки: {names}",
+  "policy_save_kept": "Сервер отклонил это изменение. Ваши правки остались в форме и не сохранены.",
+  "policy_upstream_save_kept": "Ваши правки остались в редакторе и не сохранены."
 }

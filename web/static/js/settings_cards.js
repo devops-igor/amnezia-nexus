@@ -18,6 +18,25 @@
  * Secrets. A control marked data-secret is write-only: the server keeps the
  * stored secret when the submitted value is empty. Emptying such a control is
  * therefore not a change, and only a non-empty different value is.
+ *
+ * Announcements. The unsaved badge, the success region and the error region are
+ * live regions that stay mounted and exposed while empty (the stylesheet keeps
+ * an empty one out of the layout), so assistive technology has registered them
+ * before their text changes. Text is written only when it changes: the unsaved
+ * announcement fires on the transition to dirty, not on every keystroke.
+ *
+ * Commit gate. A commit control marked data-commit-when-dirty is enabled only
+ * while its card is dirty and not blocked. A control that must wait for its
+ * controller to load a record also carries data-commit-gated, which starts it
+ * blocked;
+ * the controller calls gate() with the outcome of its own readiness and
+ * validation checks. This module is the only writer of the commit's disabled
+ * property.
+ *
+ * Busy. While a commit runs the card is aria-busy and its commit control is
+ * disabled. Disabling a focused control drops keyboard focus, so when the
+ * operation ends focus that was inside the card is put back on the control that
+ * held it, or on the card heading when that control is gone or still disabled.
  */
 (function (root) {
     'use strict';
@@ -105,17 +124,16 @@
         }
     }
 
+    function setText(node, value) {
+        if (node.textContent !== value) node.textContent = value;
+    }
+
     function paint(card, state) {
         var badge = part(card, '[data-dirty]');
-        if (badge) {
-            badge.textContent = state.dirty ? tr('settings_unsaved') : '';
-            badge.classList.toggle('hidden', !state.dirty);
-        }
-        // Only a commit that opts in is gated here. The notification and policy
-        // controllers keep their own readiness gates on their own buttons.
+        if (badge) setText(badge, state.dirty ? tr('settings_unsaved') : '');
         var commit = part(card, '[data-commit]');
         if (commit && commit.hasAttribute('data-commit-when-dirty')) {
-            commit.disabled = state.busy || !state.dirty;
+            commit.disabled = state.busy || state.blocked || !state.dirty;
         }
     }
 
@@ -128,13 +146,11 @@
         return dirty;
     }
 
+    // The regions stay mounted: clearing a report empties its text and nothing else.
     function hideReport(card) {
         ['[data-status]', '[data-error]'].forEach(function (selector) {
             var region = part(card, selector);
-            if (region) {
-                region.textContent = '';
-                region.hidden = true;
-            }
+            if (region) setText(region, '');
         });
     }
 
@@ -154,7 +170,18 @@
     function track(card) {
         var state = states.get(card);
         if (state) return state;
-        state = { baseline: snapshot(card, true), dirty: false, busy: false, timer: null, reporting: false };
+        state = {
+            baseline: snapshot(card, true),
+            dirty: false,
+            busy: false,
+            blocked: !!(part(card, '[data-commit]') && part(card, '[data-commit]').hasAttribute('data-commit-gated')),
+            held: null,
+            timer: null,
+            reporting: false
+        };
+        // The heading is where focus lands when the control that had it is gone.
+        var heading = part(card, '.card-title');
+        if (heading && !heading.hasAttribute('tabindex')) heading.setAttribute('tabindex', '-1');
         states.set(card, state);
         card.addEventListener('input', onEdit);
         card.addEventListener('change', onEdit);
@@ -205,13 +232,55 @@
         return found ? found.state.dirty : false;
     }
 
+    function inside(card, node) {
+        return !!node && node !== root.document.body && card.contains(node);
+    }
+
+    function focusable(node) {
+        return !!node && node.isConnected && !node.disabled;
+    }
+
+    // restoreFocus puts back focus the operation may have dropped: on the control
+    // that held it, or the card heading when that control is gone or disabled.
+    function restoreFocus(card, held) {
+        if (!held) return;
+        var active = root.document.activeElement;
+        if (active && active !== root.document.body && focusable(active) && card.contains(active)) return;
+        var target = focusable(held) ? held : part(card, '.card-title');
+        if (target && typeof target.focus === 'function') target.focus();
+    }
+
     function busy(card, flag) {
         var found = stateFor(card);
         if (!found) return;
-        found.state.busy = !!flag;
+        var state = found.state;
+        if (flag && !state.busy) {
+            var active = root.document.activeElement;
+            state.held = inside(found.card, active) ? active : null;
+        }
+        state.busy = !!flag;
         found.card.setAttribute('aria-busy', flag ? 'true' : 'false');
         var spinner = part(found.card, '[data-commit] .spinner');
         if (spinner) spinner.classList.toggle('hidden', !flag);
+        paint(found.card, state);
+        if (!flag) {
+            var held = state.held;
+            state.held = null;
+            restoreFocus(found.card, held);
+        }
+    }
+
+    function isBusy(card) {
+        var found = stateFor(card);
+        return found ? found.state.busy : false;
+    }
+
+    // gate blocks or opens the commit for reasons the controller owns: a record
+    // that is not loaded yet, or input that fails validation.
+    function gate(card, blocked) {
+        var found = stateFor(card);
+        if (!found) return;
+        found.state.blocked = !!blocked;
         paint(found.card, found.state);
     }
 
@@ -225,7 +294,6 @@
         hideReport(found.card);
         var region = part(found.card, kind === 'success' ? '[data-status]' : '[data-error]');
         if (!region) return false;
-        region.hidden = false;
         region.textContent = message;
         state.reporting = true;
         if (kind === 'success') {
@@ -258,6 +326,8 @@
         refresh: refresh,
         isDirty: isDirty,
         busy: busy,
+        isBusy: isBusy,
+        gate: gate,
         report: report,
         clearReport: clearReport
     };

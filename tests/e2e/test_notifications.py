@@ -23,8 +23,15 @@ def test_notification_card_loads_for_admin(
     card = page.locator("#notificationsCard")
     expect(card).to_be_visible()
     expect(page.locator("#notifications_enabled")).not_to_be_checked()
-    expect(page.locator("#notificationSaveBtn")).to_be_enabled()
+    # The stored record has loaded, so the test action is available. Save is not:
+    # a card with nothing staged has nothing to commit.
     expect(page.locator("#notificationTestBtn")).to_be_enabled()
+    expect(page.locator("#notificationSaveBtn")).to_be_disabled()
+    # The switch is the visible control while delivery is off; the destination
+    # fields appear once it is on.
+    page.locator("label.switch-container:has(#notifications_enabled)").click()
+    expect(page.locator("#notificationsCard [data-dirty]")).to_have_text("Unsaved changes")
+    expect(page.locator("#notificationSaveBtn")).to_be_enabled()
     # History is rendered by the shipped module after its read settles.
     expect(page.locator("#notificationHistory")).to_contain_text("No notifications yet")
 

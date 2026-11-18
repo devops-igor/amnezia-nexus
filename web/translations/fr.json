@@ -1154,5 +1154,7 @@
   "settings_applies_now": "S’applique immédiatement",
   "settings_save_read_failed": "Impossible de lire les paramètres enregistrés, rien n’a donc été enregistré",
   "settings_test_saves_first": "Enregistre d’abord les paramètres ci-dessus, puis envoie immédiatement",
-  "policy_client_tried_names_fmt": "essayé {names}"
+  "policy_client_tried_names_fmt": "essayé {names}",
+  "policy_save_kept": "Le serveur a refusé ce changement. Vos modifications restent dans le formulaire et ne sont pas enregistrées.",
+  "policy_upstream_save_kept": "Vos modifications restent dans l’éditeur et ne sont pas enregistrées."
 }
