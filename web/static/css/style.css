@@ -2569,6 +2569,18 @@ th.sortable[aria-sort="none"] .sort-icon-desc {
     margin-top: var(--space-md);
 }
 
+.mt-sm {
+    margin-top: var(--space-sm);
+}
+
+.mb-sm {
+    margin-bottom: var(--space-sm);
+}
+
+.mb-md {
+    margin-bottom: var(--space-md);
+}
+
 .text-muted {
     color: var(--text-muted);
 }
@@ -2672,6 +2684,257 @@ th.sortable[aria-sort="none"] .sort-icon-desc {
     width: 1.2rem;
     height: 1.2rem;
     color: var(--accent);
+}
+
+/* ===== Settings page layout ===== */
+/* One column of cards. Two independent stacks side by side differ in height
+   without bound (the Gigahost card alone is taller than most of the other
+   column), so cards are not paired. minmax(0, 1fr) lets a card shrink below its
+   content width instead of pushing the page wider than the viewport. */
+.settings-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-lg);
+    align-items: start;
+}
+
+.settings-actions {
+    margin-top: var(--space-xl);
+    display: flex;
+    justify-content: flex-end;
+}
+
+.settings-card-header-split {
+    justify-content: space-between;
+}
+
+.settings-inline {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.settings-card-header .badge {
+    font-size: 0.72rem;
+}
+
+.settings-stack {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+}
+
+.settings-stack-sm {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+}
+
+.settings-row {
+    display: flex;
+    gap: var(--space-sm);
+}
+
+.settings-row > .btn {
+    flex: 1;
+}
+
+.settings-offset {
+    margin-top: var(--space-md);
+}
+
+.settings-divider {
+    margin: var(--space-md) 0;
+}
+
+.settings-field-pair {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(160px, 100%), 1fr));
+    gap: var(--space-md);
+}
+
+.settings-subsection {
+    border-top: 1px solid var(--border-color);
+    padding-top: var(--space-md);
+}
+
+.settings-subsection-spaced {
+    margin-top: var(--space-lg);
+}
+
+.settings-subsection-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: var(--space-md);
+}
+
+.settings-subsection-title {
+    margin: 0;
+    font-size: 1rem;
+    font-weight: 600;
+}
+
+.settings-list-title {
+    margin: 0 0 var(--space-sm) 0;
+    font-size: 0.9rem;
+    font-weight: 600;
+}
+
+.settings-list {
+    font-size: 0.85rem;
+}
+
+.settings-notice {
+    padding: var(--space-sm) var(--space-md);
+    border-radius: var(--radius-sm);
+    font-size: 0.85rem;
+}
+
+.settings-notice-warning {
+    background: rgba(245, 158, 11, 0.12);
+    border: 1px solid var(--warning, #f59e0b);
+    color: var(--text-primary);
+}
+
+.settings-notice-spaced {
+    margin-bottom: var(--space-md);
+}
+
+.settings-notice-icon {
+    color: var(--warning, #f59e0b);
+    flex-shrink: 0;
+    width: 18px;
+    height: 18px;
+}
+
+.settings-loading {
+    text-align: center;
+    padding: var(--space-md);
+}
+
+.settings-loading .spinner {
+    width: 20px;
+    height: 20px;
+    margin: 0 auto;
+}
+
+.btn .spinner.spinner-sm {
+    width: 14px;
+    height: 14px;
+}
+
+/* Upstream component rows */
+.upstream-component {
+    padding: var(--space-sm) var(--space-md);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    background: var(--bg-secondary);
+}
+
+.upstream-component-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+/* The text column may shrink below its longest unbroken string (an image tag),
+   and the status badge keeps its size, so a narrow viewport wraps the text
+   instead of widening the page. */
+.upstream-component-row > div {
+    min-width: 0;
+}
+
+.upstream-component-row > .badge {
+    flex-shrink: 0;
+}
+
+.upstream-component-name {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.upstream-component-title {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.upstream-component-link {
+    color: var(--text-muted);
+    display: inline-flex;
+    align-items: center;
+}
+
+.upstream-component-link .icon {
+    width: 13px;
+    height: 13px;
+}
+
+.upstream-component-meta {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    margin-top: 3px;
+}
+
+.upstream-component-mono {
+    font-family: monospace;
+    overflow-wrap: anywhere;
+}
+
+.upstream-component-sep {
+    margin: 0 6px;
+}
+
+.upstream-component .badge {
+    font-size: 0.72rem;
+}
+
+.upstream-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: var(--space-xs);
+    border-top: 1px solid var(--border-color);
+    padding-top: var(--space-sm);
+}
+
+.upstream-checked-at {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+
+.upstream-footer .btn {
+    gap: var(--space-xs);
+}
+
+.upstream-footer .btn .icon {
+    width: 14px;
+    height: 14px;
+}
+
+.upstream-footer .btn .spinner {
+    width: 12px;
+    height: 12px;
+}
+
+/* One button size scale on the settings page: two heights built from the
+   existing spacing tokens (40px and 32px). The natural height differs with the
+   content (a 20px icon, a text-only label, a link versus a button), which is what
+   produced seven different heights. A floor with no vertical padding gives every
+   button the same height while still letting one grow when the text is enlarged
+   or a translation wraps. Buttons that script renders into the order and
+   approval lists carry compact inline padding, so they take the small height. */
+.settings-section-card .btn,
+.settings-actions .btn {
+    min-height: calc(var(--space-xl) + var(--space-sm));
+    padding-block: 0;
+}
+
+.settings-section-card .btn-sm,
+.settings-list .btn {
+    min-height: var(--space-xl);
 }
 
 /* Modern Connections List & Cards */
