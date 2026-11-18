@@ -351,12 +351,13 @@ TOKENS_CSS = REPO_ROOT / "web" / "static" / "css" / "tokens.css"
 
 # The approved spacing values these expectations are derived from. Pinned so a
 # retuned scale is a visible edit here rather than a silent change of meaning.
-APPROVED_SPACING = {"space-md": 16, "space-lg": 24, "space-xl": 32, "sidebar-width": 250}
-
-# The button size scale: 40 px is space-xl + space-sm, 32 px is space-xl. These
-# are the only settings-sheet rules that size a legacy class, so the computed
-# style differential cannot compare them with the pre-split reference.
-APPROVED_BUTTON_HEIGHT = {"#saveBtn": 40, "#upstreamCheckBtn": 32}
+APPROVED_SPACING = {
+    "space-sm": 8,
+    "space-md": 16,
+    "space-lg": 24,
+    "space-xl": 32,
+    "sidebar-width": 250,
+}
 
 
 def _token_px(name: str) -> float:
@@ -479,19 +480,24 @@ def test_settings_layout_matches_token_derived_geometry(
 def test_settings_button_height_scale_uses_the_spacing_tokens(
     authenticated_page: Page, base_url: str
 ) -> None:
-    """40 px for a card or action button, 32 px for a button inside a card."""
+    """40 px for a card or action button, 32 px for a button inside a card.
+
+    These are the rules in the Settings sheet that size a legacy class, which is
+    why the computed-style differential has no historical counterpart for them.
+    """
     page = authenticated_page
     page.set_viewport_size({"width": 1440, "height": 900})
     page.goto(f"{base_url}/settings")
     page.wait_for_load_state("networkidle")
     page.locator("#upstreamCheckBtn").wait_for(state="visible")
 
-    expected = {
-        "#saveBtn": _token_px("space-xl") + _token_px("space-sm"),
-        "#upstreamCheckBtn": _token_px("space-xl"),
-    }
-    assert expected == {selector: float(px) for selector, px in APPROVED_BUTTON_HEIGHT.items()}
+    large = _token_px("space-xl") + _token_px("space-sm")
+    small = _token_px("space-xl")
+    # The recorded scale: 40 px and 32 px, built from the pinned tokens above.
+    assert (large, small) == (40, 32)
+    expected = {"#saveBtn": large, "#policyClientRefreshBtn": large, "#upstreamCheckBtn": small}
     for selector, px in expected.items():
+        page.locator(selector).wait_for(state="visible")
         height = page.evaluate(
             "sel => document.querySelector(sel).getBoundingClientRect().height", selector
         )
