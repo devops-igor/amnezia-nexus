@@ -251,9 +251,10 @@ assert.equal(shown(badgeOf('telegramCard')), false);
 }
 
 // TestSettingsSaveModel_QuickCommitsDoNotOverwriteEachOther: two cards committed
-// back to back both end up stored. The endpoint rewrites four sections per call,
-// so an unserialised pair would let the second write restore the first card's
-// old value.
+// back to back, with the first request still held on the wire, both end up
+// stored and both report. Each request carries only its own section, so neither
+// can restore the other's old value; the queue keeps the two results in the order
+// the operator clicked.
 func TestSettingsSaveModel_QuickCommitsDoNotOverwriteEachOther(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)
 	runSettingsScenario(t, h, `
