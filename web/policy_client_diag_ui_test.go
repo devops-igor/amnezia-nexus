@@ -91,6 +91,7 @@ w._ = key => {
   if (key === 'policy_client_dns_coverage') return 'DNS-COVERAGE {stored}/{collapsed}/{evicted}/{aged}';
   if (key === 'policy_client_dns_truncated') return 'DNS-TRUNC {shown}/{total}';
   if (key === 'policy_client_outcome_fmt') return 'OUTCOME {ok}/{failed} · return {return} {packets}';
+  if (key === 'policy_client_tried_names_fmt') return 'TRIED {names}';
   if (key === 'policy_client_counters_live_note') return 'COUNTERS-LIVE';
   if (key === 'policy_client_drop_truncated') return 'DROP-TRUNC {shown}/{total}';
   if (key === 'policy_client_drop_coverage') return 'DROPCOV {stored}/{merged}/{evicted}/{pruned} session {session_keys} ledger {keys}/{key_limit} {age}';
@@ -564,7 +565,9 @@ responder = ((base) => async (url, opts) => {
               matched: 4, admitted: 3, delivered: 2, failed: 1,
               failure: 'client_queue_full'},
      names: [], names_match: 'none', names_reason: 'no_retained_answer', names_considered: 0,
-     name_candidates: []},
+     name_candidates: [],
+     name_attempts: [{name: 'missing.example', qtype: 'A', kind: 'nxdomain',
+                      received_at: '2026-11-17T09:09:50Z'}]},
     {protocol: 'tcp', destination_ip: '1.1.1.1', destination_port: 80, choice: 'DIRECT',
      route_generation: 3, last_seen_age_seconds: 12, expired: false, close_seen: false,
      decision_time: 'not_recorded', decision_reason: 'not_recorded',
@@ -592,8 +595,9 @@ assert.equal(ambiguous[5], 'OUTCOME 0/2 · return RETURN_EVIDENCE:not_measured 0
   'a refused dispatch and an unmeasured return are both visible');
 
 const none = rowCells('policyClientFlowRows', 1);
-assert.equal(none[4], 'NAME_MATCH:none: CORR:no_retained_answer',
-  'no candidate is stated with its reason');
+assert.equal(none[4],
+  'NAME_MATCH:none: TRIED missing.example (policy_client_dns_event_nxdomain, A)',
+  'an unresolved query near the decision states the name that was tried, not just the reason');
 assert.equal(none[5],
   'OUTCOME 3/0 · return RETURN_EVIDENCE:observed 0 · RET returned 4/3/2/1 (FAILURE:client_queue_full)'
     + ' · RETURN_AUTHORITY:current_tuple_association'

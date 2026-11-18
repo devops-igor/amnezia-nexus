@@ -171,7 +171,7 @@ func clientDiagnosisApplyRecords(out *ClientDiagnosisResponse, reads clientDiagn
 	if reads.dnsRecordsRead {
 		flowRecords = reads.dnsRecords.Records
 	}
-	out.Flows = clientDiagnosisFlowsFromSnapshot(reads.flows, flowRecords, reads.dnsRecordsRead, now)
+	out.Flows = clientDiagnosisFlowsFromSnapshot(reads.flows, flowRecords, reads.dnsRecordsRead, reads.dnsEvents.Events, now)
 	if !out.Flows.ScanComplete {
 		// The flow listing visits a bounded window of the table, so the record
 		// count is a lower bound. Saying so keeps "total" from being read as an
@@ -400,7 +400,7 @@ func clientDiagnosisEntryAge(entry policy.SessionEntry, now time.Time) (*int64, 
 
 // clientDiagnosisFlowsFromSnapshot renders the live-flow section, correlating each
 // destination with the session's retained DNS answers.
-func clientDiagnosisFlowsFromSnapshot(list forwarder.SessionFlowList, records []dnsledger.Record, recordsRead bool, now time.Time) ClientDiagnosisFlows {
+func clientDiagnosisFlowsFromSnapshot(list forwarder.SessionFlowList, records []dnsledger.Record, recordsRead bool, events []dnsledger.Event, now time.Time) ClientDiagnosisFlows {
 	out := ClientDiagnosisFlows{
 		Available:    true,
 		State:        clientDiagnosisTokenRecorded,
@@ -411,7 +411,7 @@ func clientDiagnosisFlowsFromSnapshot(list forwarder.SessionFlowList, records []
 		Entries:      make([]ClientDiagnosisFlow, 0, len(list.Flows)),
 	}
 	for _, flow := range list.Flows {
-		out.Entries = append(out.Entries, clientDiagnosisFlow(flow, records, recordsRead, now))
+		out.Entries = append(out.Entries, clientDiagnosisFlow(flow, records, recordsRead, events, now))
 	}
 	return out
 }
@@ -419,7 +419,7 @@ func clientDiagnosisFlowsFromSnapshot(list forwarder.SessionFlowList, records []
 // clientDiagnosisFlow renders one flow record. DecisionTime, DecisionReason and
 // the name match are stated as unknown rather than derived from lastSeen or
 // from the current policy.
-func clientDiagnosisFlow(flow forwarder.SessionFlow, records []dnsledger.Record, recordsRead bool, now time.Time) ClientDiagnosisFlow {
+func clientDiagnosisFlow(flow forwarder.SessionFlow, records []dnsledger.Record, recordsRead bool, events []dnsledger.Event, now time.Time) ClientDiagnosisFlow {
 	out := ClientDiagnosisFlow{
 		Protocol:        clientDiagnosisProtocol(flow.Protocol),
 		ClientSrcPort:   flow.SrcPort,
@@ -432,6 +432,7 @@ func clientDiagnosisFlow(flow forwarder.SessionFlow, records []dnsledger.Record,
 		CloseSeen:       flow.CloseSeen,
 		Names:           []string{},
 		NameCandidates:  []ClientDiagnosisFlowNameCandidate{},
+		NameAttempts:    []ClientDiagnosisFlowNameAttempt{},
 	}
 	if !flow.LastSeen.IsZero() {
 		out.LastSeenAgeSeconds = int64(max(now.Sub(flow.LastSeen), 0) / time.Second)
@@ -479,6 +480,24 @@ func clientDiagnosisFlow(flow forwarder.SessionFlow, records []dnsledger.Record,
 			Seq:        candidate.Seq,
 			ObservedAt: clientDiagnosisTime(candidate.ObservedAt),
 			ExpiresAt:  clientDiagnosisTime(candidate.ExpiresAt),
+		})
+	}
+	if correlation.Match == FlowCorrelationNone {
+		out.NameAttempts = clientDiagnosisFlowNameAttempts(flow, events)
+	}
+	return out
+}
+
+// clientDiagnosisFlowNameAttempts renders the unresolved queries tried near the
+// flow decision. flowNameAttempts owns the temporal, incarnation and outcome rules.
+func clientDiagnosisFlowNameAttempts(flow forwarder.SessionFlow, events []dnsledger.Event) []ClientDiagnosisFlowNameAttempt {
+	out := make([]ClientDiagnosisFlowNameAttempt, 0, maxFlowNameAttempts)
+	for _, event := range flowNameAttempts(flow, events) {
+		out = append(out, ClientDiagnosisFlowNameAttempt{
+			Name:       event.Name,
+			QType:      clientDiagnosisQType(event.QType),
+			Kind:       event.Kind,
+			ReceivedAt: clientDiagnosisTime(event.ReceivedAt),
 		})
 	}
 	return out
