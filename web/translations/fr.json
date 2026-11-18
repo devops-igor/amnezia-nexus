@@ -1148,10 +1148,7 @@
   "policy_excluded_domains_label": "Domaines jamais proxifiés",
   "policy_excluded_domains_placeholder": "internal.api.example.com\n*.corp.example",
   "policy_excluded_domains_hint": "Domaines qui ne doivent jamais entrer dans l'ensemble PROXY. Un domaine nu ou une entrée *. par ligne ; les lignes vides et les commentaires sont ignorés. Exclure un sous-domaine supprime aussi une règle parente plus large : tout le parent reste direct. Les entrées IPv4/CIDR ne sont pas acceptées ici.",
-<<<<<<< HEAD
-  "policy_client_tried_names_fmt": "essayé {names}"
-=======
   "deploy_vps_refresh_catalog": "Actualiser le catalogue et les déploiements récents",
-  "upstream_releases_link": "Tags de version"
->>>>>>> origin/main
+  "upstream_releases_link": "Tags de version",
+  "policy_client_tried_names_fmt": "essayé {names}"
 }
