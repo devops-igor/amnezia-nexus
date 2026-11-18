@@ -851,6 +851,20 @@ def test_focused_control_has_a_visible_outline(
     """
     page = authenticated_page
     _open_settings(page, base_url, theme)
+    if focus_sel == "#notificationSaveBtn":
+        # A card with nothing staged has nothing to commit, so its Save is disabled
+        # and a disabled control cannot take focus. Stage one change the way the
+        # change event reports it (no pointer, so :focus-visible keeps following
+        # keyboard rules), then press a key as _open_settings does.
+        page.evaluate(
+            """() => {
+                const box = document.getElementById('notifications_enabled');
+                box.checked = !box.checked;
+                box.dispatchEvent(new Event('change', {bubbles: true}));
+            }"""
+        )
+        page.wait_for_function("!document.getElementById('notificationSaveBtn').disabled")
+        page.keyboard.press("Tab")
     got = page.evaluate(FOCUS_PROBE, [focus_sel, outline_sel])
     assert got["focused"] and got["focusVisible"], (focus_sel, got)
     accent = contrast.resolve("accent", contrast.theme_tokens(theme))
