@@ -301,15 +301,7 @@ func TestIssue115_RemoveApiDocsAndImportUsers(t *testing.T) {
 	}
 
 	// 2. Assert settings.html does not contain removed elements or functions
-	templatesFS, err := GetTemplatesSubFS()
-	if err != nil {
-		t.Fatalf("GetTemplatesSubFS failed: %v", err)
-	}
-	settingsData, err := fs.ReadFile(templatesFS, "settings.html")
-	if err != nil {
-		t.Fatalf("failed to read settings.html: %v", err)
-	}
-	settingsStr := string(settingsData)
+	settingsStr := settingsTemplateText(t) + "\n" + settingsPageScript(t)
 
 	forbiddenTokens := []string{
 		"api_docs_title",

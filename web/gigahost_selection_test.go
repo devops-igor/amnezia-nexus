@@ -22,10 +22,7 @@ import (
 func TestGigahostDeploySelectionContract(t *testing.T) {
 	node := requireNode(t)
 	requireJSDOM(t)
-	source, err := TemplatesFS.ReadFile("templates/settings.html")
-	if err != nil {
-		t.Fatal(err)
-	}
+	source := settingsPageScript(t)
 	functions := []string{
 		"function appendDeployOption",
 		"function deployPlanAt",
@@ -43,7 +40,7 @@ func TestGigahostDeploySelectionContract(t *testing.T) {
 	}
 	var extracted strings.Builder
 	for _, fn := range functions {
-		code, extractErr := extractJSFunction(string(source), fn)
+		code, extractErr := extractJSFunction(source, fn)
 		if extractErr != nil {
 			t.Fatalf("extractJSFunction %s failed: %v", fn, extractErr)
 		}

@@ -420,11 +420,8 @@ func TestPhase6ClientExperienceAndPolish(t *testing.T) {
 	}
 
 	// 3. Assert System Settings (settings.html)
-	settingsData, err := fs.ReadFile(templatesFS, "settings.html")
-	if err != nil {
-		t.Fatalf("failed to read settings.html: %v", err)
-	}
-	settingsStr := string(settingsData)
+	// The page is split: shell, one file per section, and the page script.
+	settingsStr := settingsTemplateText(t) + "\n" + settingsPageScript(t)
 
 	requiredSettingsTokens := []string{
 		"href=\"#icon-settings\"",
