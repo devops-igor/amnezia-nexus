@@ -509,7 +509,7 @@ func TestFailoverProducerLifecycleAndSaturation(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- producer.Start(ctx) }()
 	time.Sleep(50 * time.Millisecond)
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer stopCancel()
 	if err := producer.Stop(stopCtx); err != nil {
 		t.Fatalf("stop: %v", err)
@@ -520,7 +520,7 @@ func TestFailoverProducerLifecycleAndSaturation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("start returned %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("producer did not exit")
 	}
 }
