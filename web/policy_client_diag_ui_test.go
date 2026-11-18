@@ -596,7 +596,7 @@ assert.equal(ambiguous[5], 'OUTCOME 0/2 · return RETURN_EVIDENCE:not_measured 0
 
 const none = rowCells('policyClientFlowRows', 1);
 assert.equal(none[4],
-  'NAME_MATCH:none: TRIED missing.example (policy_client_dns_event_nxdomain, A)',
+  'NAME_MATCH:none: TRIED missing.example (EVENT:nxdomain, A)',
   'an unresolved query near the decision states the name that was tried, not just the reason');
 assert.equal(none[5],
   'OUTCOME 3/0 · return RETURN_EVIDENCE:observed 0 · RET returned 4/3/2/1 (FAILURE:client_queue_full)'
