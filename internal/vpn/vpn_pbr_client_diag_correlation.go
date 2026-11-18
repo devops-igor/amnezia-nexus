@@ -139,8 +139,10 @@ func flowNameAttempts(flow forwarder.SessionFlow, events []dnsledger.Event) []dn
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if !out[i].ReceivedAt.Equal(out[j].ReceivedAt) {
-			return out[i].ReceivedAt.After(out[j].ReceivedAt)
+		left := nameAttemptTime(flow, out[i])
+		right := nameAttemptTime(flow, out[j])
+		if !left.Equal(right) {
+			return left.After(right)
 		}
 		return out[i].Seq > out[j].Seq
 	})
@@ -150,10 +152,28 @@ func flowNameAttempts(flow forwarder.SessionFlow, events []dnsledger.Event) []dn
 	return out
 }
 
+// nameAttemptTime is the instant at which the event's latest occurrence can be
+// attributed to the flow. The ledger collapses identical queries: ReceivedAt is
+// the first occurrence and LastSeen the latest, so a query first tried before the
+// lookback but retried inside it must still count. A repeat after the decision
+// cannot prove an earlier attempt, so that case falls back to the first
+// occurrence the ledger definitely recorded.
+func nameAttemptTime(flow forwarder.SessionFlow, event dnsledger.Event) time.Time {
+	latest := event.LastSeen
+	if latest.IsZero() {
+		latest = event.ReceivedAt
+	}
+	if latest.After(flow.DecidedAt) {
+		return event.ReceivedAt
+	}
+	return latest
+}
+
 // usableNameAttempt applies the temporal, incarnation and outcome rules to one
 // terminal query before it can be shown as an attempted name.
 func usableNameAttempt(flow forwarder.SessionFlow, event dnsledger.Event, earliest time.Time) bool {
-	if event.ReceivedAt.After(flow.DecidedAt) || event.ReceivedAt.Before(earliest) {
+	attempted := nameAttemptTime(flow, event)
+	if attempted.IsZero() || attempted.After(flow.DecidedAt) || attempted.Before(earliest) {
 		return false
 	}
 	if event.RouteGenerationKnown && flow.Generation != 0 && event.RouteGeneration != flow.Generation {

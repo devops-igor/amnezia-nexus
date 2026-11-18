@@ -419,3 +419,61 @@ func TestClientDiagnosisFlowExposesAttemptedNames(t *testing.T) {
 		t.Fatalf("attempt received_at = %q, want the query instant", attempt.ReceivedAt)
 	}
 }
+
+func TestFlowNameAttemptsUseCollapsedLastSeen(t *testing.T) {
+	const sessionID = "sess-collapsed"
+	first := time.Date(2026, 11, 17, 10, 0, 0, 0, time.UTC)
+	retry := first.Add(8 * time.Minute)
+	decided := first.Add(9 * time.Minute)
+	flow := forwarder.SessionFlow{Generation: 7, DecidedAt: decided}
+
+	record := func(ledger *dnsledger.Ledger, at time.Time) {
+		t.Helper()
+		if !ledger.RecordEvent(dnsledger.InputEvent{
+			SessionID:            sessionID,
+			Transport:            "udp",
+			Name:                 "retry.example",
+			QType:                1,
+			Kind:                 gatewaydns.QueryEventNXDomain,
+			ReceivedAt:           at,
+			AnsweredAt:           at,
+			RouteGeneration:      7,
+			RouteGenerationKnown: true,
+		}, at) {
+			t.Fatalf("record event at %s", at)
+		}
+	}
+
+	// First attempt outside the lookback, identical retry inside it. The ledger
+	// collapses them: ReceivedAt stays the first instant, LastSeen moves to the
+	// retry, and Count increments.
+	ledger := dnsledger.New()
+	record(ledger, first)
+	record(ledger, retry)
+	snapshot := ledger.SnapshotEvents(sessionID, 10)
+	if len(snapshot.Events) != 1 {
+		t.Fatalf("events = %d, want one collapsed event", len(snapshot.Events))
+	}
+	event := snapshot.Events[0]
+	if event.Count != 2 || !event.ReceivedAt.Equal(first) || !event.LastSeen.Equal(retry) {
+		t.Fatalf("collapsed event = count:%d received:%s last:%s, want first %s / last %s",
+			event.Count, event.ReceivedAt, event.LastSeen, first, retry)
+	}
+	if attempts := flowNameAttempts(flow, snapshot.Events); len(attempts) != 1 || attempts[0].Name != "retry.example" {
+		t.Fatalf("attempts = %+v, want the collapsed retry at %s included", attempts, retry)
+	}
+
+	// A repeat after the decision must not make the event look like a pre-decision
+	// attempt. The first occurrence is the only timestamp the ledger can prove was
+	// before the decision, and it is outside the five-minute lookback here.
+	lateLedger := dnsledger.New()
+	record(lateLedger, first)
+	record(lateLedger, decided.Add(time.Minute))
+	lateSnapshot := lateLedger.SnapshotEvents(sessionID, 10)
+	if len(lateSnapshot.Events) != 1 || lateSnapshot.Events[0].Count != 2 {
+		t.Fatalf("late fixture did not collapse: %+v", lateSnapshot.Events)
+	}
+	if attempts := flowNameAttempts(flow, lateSnapshot.Events); len(attempts) != 0 {
+		t.Fatalf("post-decision repeat produced attempts: %+v", attempts)
+	}
+}
