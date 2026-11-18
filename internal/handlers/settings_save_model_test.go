@@ -297,3 +297,31 @@ assert.deepEqual(moves, ['/settings']);
 assert.equal((await stored()).appearance.language, 'fr');
 `)
 }
+
+// TestSettingsSaveModel_ProviderCredentialCommitsFromItsOwnCard: the Gigahost key
+// is committed by the credentials card, stored, and shown masked afterwards. The
+// ordering workflow beside it is a set of immediate actions and never makes the
+// card look edited.
+func TestSettingsSaveModel_ProviderCredentialCommitsFromItsOwnCard(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	runSettingsScenario(t, h, `
+assert.ok(commitOf('gigahostCard'), 'the provider credentials card has no commit control of its own');
+assert.equal(shown(badgeOf('gigahostCard')), false, 'the order selectors are immediate actions, not staged settings');
+const plan = doc.getElementById('deployPlanSelect');
+plan.dispatchEvent(new w.Event('change', {bubbles: true}));
+assert.equal(shown(badgeOf('gigahostCard')), false, 'choosing an order option must not mark the credentials unsaved');
+
+type('gigahost_api_key', 'flux_live_probe_key_0123456789');
+assert.equal(shown(badgeOf('gigahostCard')), true);
+commitOf('gigahostCard').click();
+await until(() => shown(statusOf('gigahostCard')), 'the credentials card to report success');
+assert.equal(doc.getElementById('gigahost_api_key').value, '********', 'the saved key is shown masked, never echoed');
+assert.equal(shown(badgeOf('gigahostCard')), false);
+assert.equal(toasts.length, 0, 'no page toast: ' + JSON.stringify(toasts));
+`)
+	var gh map[string]any
+	_ = h.db.GetSetting(context.Background(), "gigahost", &gh)
+	if gh["api_key"] != "flux_live_probe_key_0123456789" {
+		t.Errorf("the provider key was not stored by its card: %v", gh["api_key"])
+	}
+}
