@@ -28,8 +28,13 @@ const (
 
 // SyncConfig defines parameters for scheduled and manual policy synchronization.
 type SyncConfig struct {
-	Sources         []Source      `json:"sources"`
-	LocalRules      ParsedRules   `json:"-"`
+	Sources    []Source    `json:"sources"`
+	LocalRules ParsedRules `json:"-"`
+	// ExcludedDomains is the parsed operator never-proxy list (built-in patterns
+	// are added separately). It is deliberately not part of the config hash: a
+	// no-op exclusion must not invalidate route evidence, and baseline adoption
+	// revalidates stored rules against the current list.
+	ExcludedDomains []string      `json:"-"`
 	RefreshInterval time.Duration `json:"refresh_interval"`
 	FetchLimits     FetchLimits   `json:"fetch_limits"`
 	ParseLimits     ParseLimits   `json:"parse_limits"`
@@ -104,6 +109,10 @@ type Syncer struct {
 	fetcher *Fetcher
 	store   Store
 	cfg     SyncConfig
+	// guardPatterns is the built-in never-proxy set plus the operator
+	// exclusions, fixed at construction so every source and the composed
+	// candidate are filtered by the same closed set.
+	guardPatterns []string
 
 	// owner/ticket bind this syncer to its service's write-ownership boundary
 	// (see sync_ownership.go). Both are set once, before the syncer runs, and
@@ -147,11 +156,18 @@ func NewSyncer(m *Matcher, fetcher *Fetcher, store Store, cfg SyncConfig) (*Sync
 		fetcher = NewFetcher(cfg.FetchLimits)
 	}
 
+	normalizedExclusions, err := ParseExcludedDomains(cfg.ExcludedDomains)
+	if err != nil {
+		return nil, fmt.Errorf("excluded domains: %w", err)
+	}
+	cfg.ExcludedDomains = normalizedExclusions
+
 	return &Syncer{
 		matcher:       m,
 		fetcher:       fetcher,
 		store:         store,
 		cfg:           cfg,
+		guardPatterns: mergeGuardPatterns(cfg.ExcludedDomains),
 		cachedSources: make(map[string]cachedSourceData),
 		syncReqCh:     make(chan syncRequest, 1),
 		stopCh:        make(chan struct{}),
@@ -311,7 +327,7 @@ func (s *Syncer) syncSingleSource(ctx context.Context, src Source, startTime tim
 				stat.Error = err.Error()
 				return cachedSourceData{}, stat, SourceParsedRules{}, fmt.Errorf("source %s parse failed: %w", src.ID, err)
 			}
-			rules, excluded = FilterNeverProxyDomains(rules)
+			rules, excluded = filterNeverProxyDomains(rules, s.guardPatterns)
 		} else {
 			rules = cached.rules
 			report = cached.report
@@ -323,7 +339,7 @@ func (s *Syncer) syncSingleSource(ctx context.Context, src Source, startTime tim
 			stat.Error = err.Error()
 			return cachedSourceData{}, stat, SourceParsedRules{}, fmt.Errorf("source %s parse failed: %w", src.ID, err)
 		}
-		rules, excluded = FilterNeverProxyDomains(rules)
+		rules, excluded = filterNeverProxyDomains(rules, s.guardPatterns)
 	}
 
 	stat.Accepted = report.Accepted
@@ -386,8 +402,8 @@ func aggregateCandidateRules(sourceParsedList []SourceParsedRules) (map[string]u
 	return candidateDomains, candidateCIDRs, len(candidateDomains) + len(candidateCIDRs)
 }
 
-func guardCandidateDomains(domains map[string]uint32, cidrs []string, total int) (map[string]uint32, int) {
-	guarded, excluded := filterNeverProxyFlags(domains)
+func (s *Syncer) guardCandidateDomains(domains map[string]uint32, cidrs []string, total int) (map[string]uint32, int) {
+	guarded, excluded := filterNeverProxyFlags(domains, s.guardPatterns)
 	if excluded == 0 {
 		return domains, total
 	}
@@ -442,7 +458,7 @@ func (s *Syncer) appendLocalRules(sourceParsedList []SourceParsedRules, statsMap
 	if len(s.cfg.LocalRules.Domains) == 0 && len(s.cfg.LocalRules.CIDRs) == 0 {
 		return sourceParsedList, nil
 	}
-	localRules, excluded := FilterNeverProxyDomains(s.cfg.LocalRules)
+	localRules, excluded := filterNeverProxyDomains(s.cfg.LocalRules, s.guardPatterns)
 	if excluded > 0 {
 		return sourceParsedList, fmt.Errorf("local rules contain %d never-proxy entries", excluded)
 	}
@@ -469,7 +485,7 @@ func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
 	}
 
 	candidateDomains, candidateCIDRs, totalRules := aggregateCandidateRules(sourceParsedList)
-	candidateDomains, totalRules = guardCandidateDomains(candidateDomains, candidateCIDRs, totalRules)
+	candidateDomains, totalRules = s.guardCandidateDomains(candidateDomains, candidateCIDRs, totalRules)
 	if err := s.validateCandidateRules(totalRules); err != nil {
 		s.recordFailure(err, statsMap, startTime)
 		return SyncResult{SourceStats: statsMap, Duration: time.Since(startTime)}, err

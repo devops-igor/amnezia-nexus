@@ -101,6 +101,20 @@ var neverProxyPatterns = []string{
 	"rzd.ru",
 	"showip.net",
 	"yandex.net",
+	// VK family. The owner requires every VK destination direct. The Ukraine
+	// list supplies vk.com/vk.ru and related infrastructure; these patterns
+	// remove those rules and all of their subdomains from every component.
+	"vk.com",
+	"vk.ru",
+	"vkontakte.ru",
+	"userapi.com",
+	"vk-apps.com",
+	"vkvideo.ru",
+	"vkforms.ru",
+	"vkplay.live",
+	"vkopt.net",
+	"vk.me",
+	"vk-cdn.net",
 	// Every name from Russia/outside-raw.lst, the list excluded from the
 	// aggregate. Some cross into other components; the guard keeps them direct.
 	"1018213540.rsc.cdn77.org",
@@ -133,18 +147,39 @@ var neverProxyPatterns = []string{
 }
 
 // NeverProxyReason reports whether a canonical domain rule would proxy a guarded
-// name. The returned reason names the guard for local-entry validation.
+// name under the built-in pattern set. The returned reason names the guard for
+// local-entry validation.
 func NeverProxyReason(domain string) (string, bool) {
+	return neverProxyReason(domain, neverProxyPatterns)
+}
+
+// neverProxyReason applies one closed pattern set. patterns is either the
+// built-in set or the built-in set plus operator exclusions. The ancestor check
+// is deliberate in both cases: a broad parent rule would otherwise proxy the
+// protected name even after the exact rule were removed.
+func neverProxyReason(domain string, patterns []string) (string, bool) {
 	domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
 	if domain == "" {
 		return "", false
 	}
-	for _, pattern := range neverProxyPatterns {
+	for _, pattern := range patterns {
 		if domain == pattern || strings.HasSuffix(domain, "."+pattern) || strings.HasSuffix(pattern, "."+domain) {
-			return fmt.Sprintf("never-proxy guard: %q is internal Russian infrastructure and must stay direct (pattern %q)", domain, pattern), true
+			return fmt.Sprintf("never-proxy guard: %q must stay direct (pattern %q)", domain, pattern), true
 		}
 	}
 	return "", false
+}
+
+// mergeGuardPatterns returns the built-in patterns plus operator exclusions. The
+// caller must not mutate the returned slice.
+func mergeGuardPatterns(exclusions []string) []string {
+	if len(exclusions) == 0 {
+		return neverProxyPatterns
+	}
+	out := make([]string, 0, len(neverProxyPatterns)+len(exclusions))
+	out = append(out, neverProxyPatterns...)
+	out = append(out, exclusions...)
+	return out
 }
 
 // FilterNeverProxyDomains removes guarded DOMAIN rules and returns the number
@@ -158,13 +193,17 @@ func NeverProxyReason(domain string) (string, bool) {
 // manifest contains only FormatDomains lists, so the shipped aggregate has no
 // CIDRs; an operator who adds one is choosing the address range to proxy.
 func FilterNeverProxyDomains(rules ParsedRules) (ParsedRules, int) {
+	return filterNeverProxyDomains(rules, neverProxyPatterns)
+}
+
+func filterNeverProxyDomains(rules ParsedRules, patterns []string) (ParsedRules, int) {
 	out := ParsedRules{
 		Domains: make(map[string]domainFlags, len(rules.Domains)),
 		CIDRs:   rules.CIDRs,
 	}
 	excluded := 0
 	for base, flags := range rules.Domains {
-		if _, guarded := NeverProxyReason(base); guarded {
+		if _, guarded := neverProxyReason(base, patterns); guarded {
 			excluded++
 			continue
 		}
@@ -174,20 +213,22 @@ func FilterNeverProxyDomains(rules ParsedRules) (ParsedRules, int) {
 }
 
 // GenerationNeverProxyViolations returns the stored domain rules that the
-// never-proxy guard forbids, sorted for stable reporting.
-//
-// A durable generation was filtered by the build that wrote it. After an upgrade
-// that adds a guard pattern, or after a hand-edited or pre-guard cache is loaded,
-// nothing in the generation itself proves it is clean. Baseline adoption must
-// check this before publishing those rules, because an upstream outage must not
-// turn a stale snapshot into a proxied government domain.
+// built-in never-proxy guard forbids, sorted for stable reporting.
 func GenerationNeverProxyViolations(gen *Generation) []string {
+	return generationNeverProxyViolations(gen, neverProxyPatterns)
+}
+
+// generationNeverProxyViolations checks a durable generation against one closed
+// pattern set. A generation was filtered by the build and settings that wrote it;
+// after an upgrade or an operator exclusion change nothing in the bytes proves it
+// is clean, so baseline adoption must check before publishing.
+func generationNeverProxyViolations(gen *Generation, patterns []string) []string {
 	if gen == nil || len(gen.Domains) == 0 {
 		return nil
 	}
 	violations := make([]string, 0)
 	for base := range gen.Domains {
-		if _, guarded := NeverProxyReason(base); guarded {
+		if _, guarded := neverProxyReason(base, patterns); guarded {
 			violations = append(violations, base)
 		}
 	}
@@ -196,17 +237,58 @@ func GenerationNeverProxyViolations(gen *Generation) []string {
 }
 
 // filterNeverProxyFlags applies the guard to the durable/aggregate flag map.
-func filterNeverProxyFlags(domains map[string]uint32) (map[string]uint32, int) {
+func filterNeverProxyFlags(domains map[string]uint32, patterns []string) (map[string]uint32, int) {
 	out := make(map[string]uint32, len(domains))
 	excluded := 0
 	for base, flags := range domains {
-		if _, guarded := NeverProxyReason(base); guarded {
+		if _, guarded := neverProxyReason(base, patterns); guarded {
 			excluded++
 			continue
 		}
 		out[base] = flags
 	}
 	return out, excluded
+}
+
+// MaxExcludedDomains bounds the operator exclusion list.
+const MaxExcludedDomains = 1024
+
+// ParseExcludedDomains validates operator-supplied never-proxy domains and
+// returns normalized, deduplicated bases in sorted order.
+//
+// Only names are accepted: a bare domain or a *. wildcard. IPv4/IPv6 literals
+// and CIDRs are refused because a name-based guard cannot override a proxy CIDR
+// at the packet path; that needs a separate decision-time DIRECT rule.
+func ParseExcludedDomains(lines []string) ([]string, error) {
+	dataLines := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if isIgnoredLine(trimmed) {
+			continue
+		}
+		dataLines = append(dataLines, trimmed)
+	}
+	if len(dataLines) > MaxExcludedDomains {
+		return nil, fmt.Errorf("%d excluded domains exceed the maximum of %d", len(dataLines), MaxExcludedDomains)
+	}
+	seen := make(map[string]struct{}, len(dataLines))
+	out := make([]string, 0, len(dataLines))
+	for _, line := range dataLines {
+		base, _, isIP, _, err := ParseDomainRule(line, DomainModeInclusiveSuffix)
+		if isIP {
+			return nil, fmt.Errorf("excluded entry %q is an address; only domains are supported", line)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("excluded entry %q: %w", line, err)
+		}
+		if _, duplicate := seen[base]; duplicate {
+			continue
+		}
+		seen[base] = struct{}{}
+		out = append(out, base)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // ParseLocalRules parses operator-supplied domain/CIDR entries with the same
