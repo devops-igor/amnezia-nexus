@@ -322,7 +322,7 @@ func TestStoredGenerationForDifferentSourcesIsNotTreatedAsBaseline(t *testing.T)
 		GenerationID:  "gen-other-source",
 		Version:       4,
 		ConfigHash:    "hash-of-some-other-source-config",
-		Domains:       map[string]uint8{"other.example.com": 1},
+		Domains:       map[string]uint32{"other.example.com": 1},
 		DomainCount:   1,
 	}
 	if err := store.Commit(context.Background(), other); err != nil {
@@ -351,5 +351,94 @@ func TestStoredGenerationForDifferentSourcesIsNotTreatedAsBaseline(t *testing.T)
 	}
 	if got := matcher.Current().DomainCount(); got != 20 {
 		t.Fatalf("changed source published %d rules, want the 20 served", got)
+	}
+}
+
+// TestRestartRefusesStoredGenerationWithGuardedDomainOnFetchFailure is the
+// HIGH-01 regression from #883 in the activation path: a last-known-good
+// generation written before the never-proxy guard matches the configured source,
+// so the config hash alone accepts it. With the upstream unavailable, activating
+// it would proxy a protected government name. Activation must refuse instead.
+func TestRestartRefusesStoredGenerationWithGuardedDomainOnFetchFailure(t *testing.T) {
+	server := newPolicyListServer(t)
+
+	cfg, err := policyListSettings(t).SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	fetch, store := fixtureFetcherAndStore(t, server, cfg)
+	ctx := context.Background()
+
+	matcher := policy.NewMatcher()
+	syncer, err := policy.NewSyncer(matcher, fetch, store, cfg)
+	if err != nil {
+		t.Fatalf("NewSyncer: %v", err)
+	}
+	gen := &policy.Generation{
+		SchemaVersion: policy.SchemaVersion,
+		GenerationID:  "gen-before-never-proxy-guard",
+		Version:       2,
+		ConfigHash:    syncer.ConfigHash(),
+		Domains: map[string]uint32{
+			"listed.example.com": 2,
+			"gov.ru":             2,
+		},
+	}
+	if err := store.Commit(ctx, gen); err != nil {
+		t.Fatalf("seed guarded generation: %v", err)
+	}
+
+	// The upstream is gone, so the stored generation is the only candidate.
+	server.Close()
+
+	activationErr := ensureInitialSnapshot(ctx, syncer, store, matcher)
+	if activationErr == nil {
+		t.Fatal("activation published a stored generation containing a guarded domain")
+	}
+	if !errors.Is(activationErr, ErrPolicyActivationNoRules) {
+		t.Fatalf("activation error = %v, want ErrPolicyActivationNoRules", activationErr)
+	}
+	if !strings.Contains(activationErr.Error(), "never-proxy") {
+		t.Fatalf("refusal does not name the never-proxy cause: %v", activationErr)
+	}
+	if matcher.Current() != nil {
+		t.Fatal("the guarded stored generation reached the live matcher")
+	}
+}
+
+// TestLoadLastKnownGoodRefusesGuardedGeneration covers the fallback publication
+// path independently: even when activation reaches it, it must not publish a
+// stored generation that the current never-proxy guard forbids.
+func TestLoadLastKnownGoodRefusesGuardedGeneration(t *testing.T) {
+	server := newPolicyListServer(t)
+	defer server.Close()
+
+	cfg, err := policyListSettings(t).SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	_, store := fixtureFetcherAndStore(t, server, cfg)
+	const configHash = "matching-config-hash"
+	gen := &policy.Generation{
+		SchemaVersion: policy.SchemaVersion,
+		GenerationID:  "gen-guarded-fallback",
+		Version:       1,
+		ConfigHash:    configHash,
+		Domains:       map[string]uint32{"gov.ru": 2},
+	}
+	if err := store.Commit(context.Background(), gen); err != nil {
+		t.Fatalf("seed guarded generation: %v", err)
+	}
+
+	matcher := policy.NewMatcher()
+	loadErr := loadLastKnownGood(context.Background(), store, matcher, configHash)
+	if loadErr == nil {
+		t.Fatal("loadLastKnownGood published a generation containing a guarded domain")
+	}
+	if !strings.Contains(loadErr.Error(), "never-proxy") {
+		t.Fatalf("fallback error does not name the guard: %v", loadErr)
+	}
+	if matcher.Current() != nil {
+		t.Fatal("the guarded fallback generation reached the live matcher")
 	}
 }

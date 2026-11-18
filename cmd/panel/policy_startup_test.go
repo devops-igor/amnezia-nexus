@@ -152,7 +152,7 @@ func TestPersistedPolicyActivationRecoversAfterRepair(t *testing.T) {
 		Version:       1,
 		ConfigHash:    probe.ConfigHash(),
 		SourcesMeta:   meta,
-		Domains:       map[string]uint8{"seed.example.com": 1},
+		Domains:       map[string]uint32{"seed.example.com": 1},
 		DomainCount:   1,
 	}
 	if err := store.Commit(context.Background(), gen); err != nil {

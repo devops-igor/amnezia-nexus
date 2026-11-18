@@ -28,6 +28,9 @@ const (
 	PresetAntifilterIPv4 PresetID = "antifilter_ipv4"
 	// PresetCustom selects operator-supplied HTTPS domain/CIDR list URLs.
 	PresetCustom PresetID = "custom"
+	// PresetAggregate selects the reviewed 24-list upstream aggregate with the
+	// never-proxy guard applied.
+	PresetAggregate PresetID = "aggregate"
 )
 
 // Documented preset source URLs (issue #678).
@@ -70,6 +73,7 @@ func (id PresetID) IsBuiltin() bool {
 // (it drives the order operators see and the stable sync source order), so
 // append new presets rather than reordering existing ones.
 var builtinPresets = []Preset{
+	{ID: PresetAggregate, Format: FormatDomains, BareDomainMode: DomainModeInclusiveSuffix},
 	{ID: PresetRussiaInside, URL: russiaInsideURL, Format: FormatDomains, BareDomainMode: DomainModeInclusiveSuffix},
 	{ID: PresetGeoblock, URL: geoblockURL, Format: FormatDomains, BareDomainMode: DomainModeInclusiveSuffix},
 	{ID: PresetAntifilterDomains, URL: antifilterDomainsURL, Format: FormatDomains, BareDomainMode: DomainModeInclusiveSuffix},
@@ -89,6 +93,9 @@ func Presets() []Preset {
 func LookupPreset(id PresetID) (Preset, bool) {
 	if id == PresetCustom {
 		return Preset{ID: PresetCustom}, true
+	}
+	if id == PresetAggregate {
+		return Preset{ID: PresetAggregate, Format: FormatDomains, BareDomainMode: DomainModeInclusiveSuffix}, true
 	}
 	for _, p := range builtinPresets {
 		if p.ID == id {

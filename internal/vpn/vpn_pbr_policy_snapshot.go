@@ -55,7 +55,7 @@ func ensureInitialSnapshot(ctx context.Context, syncer *policy.Syncer, store pol
 		return fmt.Errorf("%w: %v", ErrPolicyActivationNoRules, baselineErr)
 	}
 	if baseline == policy.BaselineForeign {
-		slog.Warn("Stored policy generation belongs to a different source configuration; " +
+		slog.Warn("Stored policy generation belongs to a different source configuration or contains never-proxy guarded rules; " +
 			"fetching a fresh snapshot without a last-known-good baseline")
 	}
 
@@ -103,12 +103,13 @@ func settleInitialSync(
 		slog.Warn("Policy sync failed at startup; activated last-known-good policy instead", "err", syncErr)
 		return nil
 	case syncErr != nil && baseline == policy.BaselineForeign:
-		// The only stored generation describes a different source configuration.
-		// Publishing it would authorize traffic with rules the operator did not
-		// select and that may protect different destinations entirely, so this
-		// refuses even though the old bytes stay on disk for recovery.
-		slog.Warn("Policy sync failed at startup and the stored generation belongs to a different source configuration; refusing activation", "err", syncErr)
-		return fmt.Errorf("%w: initial sync of the selected configuration failed (%v) and the stored last-known-good generation belongs to a different source configuration, so it is not valid rules for this one", ErrPolicyActivationNoRules, syncErr)
+		// The only stored generation describes a different source configuration or
+		// still contains names the never-proxy guard forbids. Publishing it would
+		// authorize traffic with rules the operator did not select, or proxy
+		// protected infrastructure, so this refuses even though the old bytes stay
+		// on disk for recovery.
+		slog.Warn("Policy sync failed at startup and the stored generation is not valid rules for this configuration; refusing activation", "err", syncErr)
+		return fmt.Errorf("%w: initial sync of the selected configuration failed (%v) and the stored last-known-good generation is not valid rules for it (different source configuration or never-proxy guarded domains)", ErrPolicyActivationNoRules, syncErr)
 	case syncErr != nil:
 		if loadErr := loadLastKnownGood(ctx, store, matcher, configHash); loadErr != nil {
 			return fmt.Errorf("%w: initial sync failed (%v) and no usable last-known-good policy was found: %w",
@@ -138,6 +139,12 @@ func loadLastKnownGood(ctx context.Context, store policy.Store, matcher *policy.
 	}
 	if wantConfigHash != "" && gen.ConfigHash != wantConfigHash {
 		return errors.New("stored last-known-good generation belongs to a different source configuration")
+	}
+	// Defense in depth: a generation is a record of what an older build
+	// published, and the never-proxy guard may have gained patterns since. Never
+	// publish rules the current guard forbids.
+	if violations := policy.GenerationNeverProxyViolations(gen); len(violations) > 0 {
+		return fmt.Errorf("stored last-known-good generation contains %d never-proxy guarded domain(s), including %q", len(violations), violations[0])
 	}
 	snap, err := policy.GenerationToSnapshot(gen)
 	if err != nil {

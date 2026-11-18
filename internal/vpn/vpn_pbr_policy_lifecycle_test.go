@@ -181,7 +181,7 @@ func TestLoadLastKnownGoodPublishesStoredGeneration(t *testing.T) {
 		Version:       7,
 		ConfigHash:    "seed",
 		SourcesMeta:   map[string]policy.SourceMeta{"geoblock": {ID: "geoblock"}},
-		Domains:       map[string]uint8{"example.com": 2},
+		Domains:       map[string]uint32{"example.com": 2},
 		CIDRs:         []string{"198.51.100.0/24"},
 	}
 	store := &memoryStore{committed: gen}
@@ -217,7 +217,7 @@ func TestLoadLastKnownGoodRejectsUnusableStores(t *testing.T) {
 				SchemaVersion: policy.SchemaVersion,
 				GenerationID:  "gen-empty",
 				Version:       1,
-				Domains:       map[string]uint8{},
+				Domains:       map[string]uint32{},
 				CIDRs:         nil,
 			}},
 		},
@@ -247,7 +247,7 @@ func TestPolicyStatusSnapshotReportsSyncerAndMatcherState(t *testing.T) {
 		SchemaVersion: policy.SchemaVersion,
 		GenerationID:  "gen-status-1",
 		Version:       3,
-		Domains:       map[string]uint8{"example.com": 2},
+		Domains:       map[string]uint32{"example.com": 2},
 		CIDRs:         []string{"198.51.100.0/24"},
 	}
 	if err := loadLastKnownGood(context.Background(), &memoryStore{committed: gen}, matcher, ""); err != nil {
@@ -524,7 +524,7 @@ func TestEnsureInitialSnapshotRequiresRules(t *testing.T) {
 		GenerationID:  "gen-ensure-1",
 		Version:       1,
 		ConfigHash:    policyConfigHashFor(t, settings),
-		Domains:       map[string]uint8{"example.com": 2},
+		Domains:       map[string]uint32{"example.com": 2},
 	}
 	if err := loadLastKnownGood(context.Background(), &memoryStore{committed: gen}, usable, gen.ConfigHash); err != nil {
 		t.Fatalf("seed: %v", err)

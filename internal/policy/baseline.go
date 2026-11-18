@@ -75,6 +75,14 @@ func (s *Syncer) AdoptBaseline(ctx context.Context) (BaselineStatus, error) {
 	if gen.ConfigHash != s.computeConfigHash() {
 		return BaselineForeign, nil
 	}
+	// A durable generation records what an older build published, not what the
+	// current guard permits. Adopting one that contains a guarded name would let
+	// the replacement syncer treat those rules as the live baseline; the guard
+	// version is part of neither the generative identity nor the config hash, so
+	// the content itself has to be checked.
+	if violations := GenerationNeverProxyViolations(gen); len(violations) > 0 {
+		return BaselineForeign, nil
+	}
 	s.cachedGen = gen
 	return BaselinePrimed, nil
 }
@@ -107,20 +115,14 @@ func (s *Syncer) PrimeBaseline(ctx context.Context) (BaselineStatus, error) {
 	if gen == nil {
 		return BaselineAbsent, nil
 	}
-	if gen.ConfigHash != s.computeConfigHash() {
-		return BaselineForeign, nil
+	snap, status, snapErr := s.prepareBaselineSnapshot(gen)
+	if snapErr != nil || status != BaselinePrimed {
+		return status, snapErr
 	}
-	snap, snapErr := GenerationToSnapshot(gen)
-	if snapErr != nil {
-		return BaselineAbsent, fmt.Errorf("stored policy generation cannot be compiled: %w", snapErr)
-	}
-	if snap.DomainCount() == 0 && snap.CIDRCount() == 0 {
-		return BaselineAbsent, fmt.Errorf("stored policy generation contains no rules")
-	}
-	// Everything above is read-only preparation (load, hash, compile) and may run
-	// outside the boundary. Publishing the baseline and advertising it in the status
-	// are a policy write, so they go through the same ownership decision as
-	// executeUpdate's commit and publication (#678 F678-06).
+	// Everything above is read-only preparation (load, hash, guard revalidation,
+	// compile) and may run outside the boundary. Publishing the baseline and
+	// advertising it in the status are a policy write, so they go through the same
+	// ownership decision as executeUpdate's commit and publication (#678 F678-06).
 	//
 	// Run primes the baseline asynchronously, after activation already published the
 	// same generation. A Run whose runtime has since been replaced must not republish
@@ -145,4 +147,30 @@ func (s *Syncer) PrimeBaseline(ctx context.Context) (BaselineStatus, error) {
 		return BaselineAbsent, fmt.Errorf("baseline publication refused: %w", writeErr)
 	}
 	return BaselinePrimed, nil
+}
+
+// prepareBaselineSnapshot validates a durable generation against this syncer's
+// configuration and the current never-proxy guard, then compiles it.
+//
+// BaselineForeign means the generation is not rules for this configuration; the
+// caller may fetch a fresh baseline. An error is reserved for a generation that
+// matches the configuration but cannot be used.
+func (s *Syncer) prepareBaselineSnapshot(gen *Generation) (*Snapshot, BaselineStatus, error) {
+	if gen.ConfigHash != s.computeConfigHash() {
+		return nil, BaselineForeign, nil
+	}
+	// A durable generation records what an older build published, not what the
+	// current guard permits. Publishing a snapshot with a guarded name would
+	// proxy protected infrastructure exactly when the upstream fetch also fails.
+	if violations := GenerationNeverProxyViolations(gen); len(violations) > 0 {
+		return nil, BaselineForeign, nil
+	}
+	snap, err := GenerationToSnapshot(gen)
+	if err != nil {
+		return nil, BaselineAbsent, fmt.Errorf("stored policy generation cannot be compiled: %w", err)
+	}
+	if snap.DomainCount() == 0 && snap.CIDRCount() == 0 {
+		return nil, BaselineAbsent, errors.New("stored policy generation contains no rules")
+	}
+	return snap, BaselinePrimed, nil
 }

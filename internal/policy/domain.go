@@ -9,7 +9,7 @@ import (
 	"golang.org/x/net/idna"
 )
 
-type domainFlags uint8
+type domainFlags uint32
 
 const (
 	domainExact           domainFlags = 1 << 0
@@ -23,15 +23,15 @@ const (
 	domainMatchMask domainFlags = domainExact | domainInclusiveSuffix | domainDescendants
 
 	// maxSnapshotSources bounds the compiled provenance encoding: one bit per
-	// source, packed above the matching bits. The Syncer accepts at most four
-	// sources (MaxCustomURLs), which is exactly what these bits hold. A snapshot
+	// source, packed above the matching bits. The aggregate manifest has 24
+	// external sources plus one local source, so 25 bits are reserved. A snapshot
 	// compiled from more sources records no provenance at all rather than a
 	// wrong one.
-	maxSnapshotSources = 4
+	maxSnapshotSources = 25
 	// domainSourceShift is the position of the first provenance bit.
-	domainSourceShift = 4
+	domainSourceShift = 3
 	// domainSourceMask covers every provenance bit.
-	domainSourceMask domainFlags = 0xf0
+	domainSourceMask domainFlags = 0xFFFFFFF8
 )
 
 // DomainMode defines how bare domain entries in a list are interpreted.

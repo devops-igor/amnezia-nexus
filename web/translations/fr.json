@@ -1136,5 +1136,13 @@
   "policy_client_filter_hint": "Restreint les lignes déjà lues pour cette session par adresse, port ou nom de destination. Il ne lit aucun état nouveau et n'envoie aucune requête.",
   "policy_client_filter_count": "{shown} lignes sur {total} correspondent à « {term} »",
   "policy_client_filter_none": "Aucune ligne enregistrée ne correspond à « {term} ».",
-  "policy_client_corr_dns_names_not_retained": "la preuve conservée par adresse ne porte pas de nom ; les noms viennent de l'historique des réponses"
+  "policy_client_corr_dns_names_not_retained": "la preuve conservée par adresse ne porte pas de nom ; les noms viennent de l'historique des réponses",
+  "policy_preset_aggregate": "Toutes les listes russes principales (agrégées)",
+  "policy_preset_aggregate_hint": "Réunit les 24 listes révisées, sans doublons. Russia outside est exclue et les noms d'État/internes russes restent toujours directs.",
+  "policy_local_entries_label": "Entrées locales",
+  "policy_local_entries_placeholder": "example.com\n*.example.org\n203.0.113.7\n198.51.100.0/24",
+  "policy_local_entries_hint": "Un domaine ou une IPv4/CIDR par ligne. Les lignes vides et les commentaires sont ignorés. Les entrées s'ajoutent à la source choisie ; les noms de domaine d'État/internes russes sont refusés. Les plages CIDR sont comparées par adresse et peuvent couvrir des destinations protégées : n'ajoutez que les plages que vous voulez proxifier.",
+  "policy_sources_title": "État des composants agrégés",
+  "policy_sources_empty": "Aucun état de composant agrégé",
+  "policy_source_excluded": "exclus"
 }

@@ -121,9 +121,9 @@ func TestSyncer_Status(t *testing.T) {
 		t.Error("expected error for empty sources")
 	}
 	if _, err := NewSyncer(matcher, nil, store, SyncConfig{
-		Sources: []Source{{ID: "1"}, {ID: "2"}, {ID: "3"}, {ID: "4"}, {ID: "5"}},
+		Sources: make([]Source, MaxSyncSources+1),
 	}); err == nil {
-		t.Error("expected error for > 4 sources")
+		t.Errorf("expected error for > %d sources", MaxSyncSources)
 	}
 	if _, err := NewSyncer(matcher, nil, store, SyncConfig{
 		Sources:         []Source{{ID: "1", URL: "https://example.com/r.lst"}},

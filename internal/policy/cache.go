@@ -45,7 +45,7 @@ type Generation struct {
 	// being treated as a change (equivalence.go).
 	AttributionHash string                `json:"attribution_hash,omitempty"`
 	SourcesMeta     map[string]SourceMeta `json:"sources_meta"`
-	Domains         map[string]uint8      `json:"domains"`
+	Domains         map[string]uint32     `json:"domains"`
 	CIDRs           []string              `json:"cidrs"`
 	DomainCount     int                   `json:"domain_count"`
 	CIDRCount       int                   `json:"cidr_count"`
@@ -53,7 +53,7 @@ type Generation struct {
 }
 
 // ComputeContentHash computes a deterministic SHA-256 digest over normalized rules.
-func ComputeContentHash(domains map[string]uint8, cidrs []string) string {
+func ComputeContentHash(domains map[string]uint32, cidrs []string) string {
 	h := sha256.New()
 
 	// Hash sorted domain entries

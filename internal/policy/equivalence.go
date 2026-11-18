@@ -42,7 +42,7 @@ import (
 // A content-equivalent refresh reuses the incumbent identity, so the generation
 // the forwarder's route cache keys client evidence on does not move; everything
 // else about the cycle (durable commit, atomic publication, status) is unchanged.
-func (s *Syncer) candidateIdentity(startTime time.Time, domains map[string]uint8, cidrs []string, perSource []SourceParsedRules) (uint64, string, time.Time) {
+func (s *Syncer) candidateIdentity(startTime time.Time, domains map[string]uint32, cidrs []string, perSource []SourceParsedRules) (uint64, string, time.Time) {
 	retain := s.retainableGeneration()
 	if s.equivalentTo(retain, domains, cidrs, perSource) {
 		return retain.Version, retain.GenerationID, retain.CreatedAt
@@ -72,7 +72,7 @@ func (s *Syncer) retainableGeneration() *Generation {
 // content of gen, attribution included. Attribution is compared through the
 // durable digest when the generation has one, and through the syncer's own
 // previous cycle otherwise; see sameSourceAttribution.
-func (s *Syncer) equivalentTo(gen *Generation, domains map[string]uint8, cidrs []string, perSource []SourceParsedRules) bool {
+func (s *Syncer) equivalentTo(gen *Generation, domains map[string]uint32, cidrs []string, perSource []SourceParsedRules) bool {
 	if gen == nil {
 		return false
 	}
@@ -103,7 +103,7 @@ func (s *Syncer) equivalentTo(gen *Generation, domains map[string]uint8, cidrs [
 // successful cycle records the digest, so that gap is one cycle and never
 // recurring: from then on attribution-only moves publish.
 func (s *Syncer) sameSourceAttribution(gen *Generation, perSource []SourceParsedRules) bool {
-	if len(perSource) != len(s.cfg.Sources) {
+	if len(perSource) != s.expectedSourceCount() {
 		return true
 	}
 	if len(s.cachedSources) == len(s.cfg.Sources) {
@@ -115,13 +115,35 @@ func (s *Syncer) sameSourceAttribution(gen *Generation, perSource []SourceParsed
 	return true
 }
 
+// expectedSourceCount is the number of per-source rule sets a cycle produces:
+// every configured external source, plus the local source when it has rules.
+// The stored digest and the candidate digest must cover the same set; stripping
+// one side made every restart look like an attribution change.
+func (s *Syncer) expectedSourceCount() int {
+	if len(s.cfg.LocalRules.Domains) == 0 && len(s.cfg.LocalRules.CIDRs) == 0 {
+		return len(s.cfg.Sources)
+	}
+	return len(s.cfg.Sources) + 1
+}
+
 // sameCachedSourceAttribution compares the candidate per-source rules with the
 // per-source rules of this syncer's own last cycle.
 func (s *Syncer) sameCachedSourceAttribution(perSource []SourceParsedRules) bool {
 	for _, item := range perSource {
 		previous, ok := s.cachedSources[item.SourceID]
 		if !ok {
-			return true
+			if item.SourceID != localSourceID {
+				return true
+			}
+			// Local rules come from the syncer configuration, not from a fetched
+			// cached source. appendLocalRules only lets a cycle reach this
+			// comparison when the guard removes nothing from them, so the
+			// configured rules are exactly the candidate's local rules.
+			if !equalFlagMap(s.cfg.LocalRules.Domains, item.Rules.Domains) ||
+				!equalPrefixSet(s.cfg.LocalRules.CIDRs, item.Rules.CIDRs) {
+				return false
+			}
+			continue
 		}
 		if !equalFlagMap(previous.rules.Domains, item.Rules.Domains) {
 			return false
@@ -136,7 +158,7 @@ func (s *Syncer) sameCachedSourceAttribution(perSource []SourceParsedRules) bool
 // equalFlagMap compares two rule flag maps. Parsing collapses duplicate
 // declarations into one entry per base domain, so equality here is equality of
 // the effective rule set however the list was written.
-func equalFlagMap[T ~uint8](a, b map[string]T) bool {
+func equalFlagMap[T ~uint32](a, b map[string]T) bool {
 	if len(a) != len(b) {
 		return false
 	}
