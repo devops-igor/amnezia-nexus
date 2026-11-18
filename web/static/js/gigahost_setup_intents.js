@@ -192,7 +192,7 @@ function setupIntentRow(i) {
         const stepSpan = document.createElement('span');
         stepSpan.style.fontSize = '0.75rem';
         stepSpan.style.marginLeft = '8px';
-        stepSpan.style.color = 'var(--text-muted)';
+        stepSpan.style.color = 'var(--text-secondary)';
         stepSpan.textContent = '[' + i.step + ']';
         left.appendChild(stepSpan);
     }
@@ -295,7 +295,7 @@ function setupIntentActions(i) {
     if (i.state === 'awaiting_credentials') {
         const hint = document.createElement('span');
         hint.style.fontSize = '0.75rem';
-        hint.style.color = 'var(--text-muted)';
+        hint.style.color = 'var(--text-secondary)';
         hint.textContent = _('setup_intents_credentials_hint');
         buttons.push(hint);
     }
