@@ -66,8 +66,8 @@ func (h *Handlers) SettingsPageHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	servers, _ := h.db.GetAllServers(ctx)
 	settings, _ := h.db.GetAllSettings(ctx)
-	// The page is readable by Admin and Support, so it obeys the same secret
-	// policy as GET /api/settings: no stored credential reaches the markup.
+	// The page obeys the same secret policy as GET /api/settings: no stored
+	// credential reaches the markup.
 	maskSettingsSecrets(settings)
 
 	_ = RenderTemplate(w, r, h.db, "settings.html", map[string]any{

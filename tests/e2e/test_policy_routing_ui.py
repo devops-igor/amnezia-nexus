@@ -224,7 +224,7 @@ def _login_as(page: Page, base_url: str, username: str, password: str) -> None:
 def test_policy_section_and_api_are_admin_only(
     authenticated_page: Page, base_url: str, csrf_token: str
 ) -> None:
-    """A support operator may open /settings but gets no section and a 403 API."""
+    """A support operator is refused /settings and the policy API with a 403."""
     admin_page = authenticated_page
     # Control: the administrator does get the section.
     _open_settings(admin_page, base_url)
@@ -246,9 +246,11 @@ def test_policy_section_and_api_are_admin_only(
     try:
         support_page = context.new_page()
         _login_as(support_page, base_url, username, password)
-        support_page.goto(f"{base_url}/settings")
-        support_page.wait_for_load_state("networkidle")
-        assert "/login" not in support_page.url, "a support operator must reach /settings"
+        response = support_page.goto(f"{base_url}/settings")
+        assert response is not None, "the settings request produced no response"
+        assert (
+            response.status == 403
+        ), f"a support operator must be refused /settings; got {response.status}"
         assert (
             support_page.locator(CARD).count() == 0
         ), "the admin-only policy section must not render for a support operator"
