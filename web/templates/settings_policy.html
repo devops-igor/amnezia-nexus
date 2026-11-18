@@ -37,6 +37,13 @@
 
         <fieldset class="form-group" style="border: 0; padding: 0; margin-inline: 0; min-width: 0;">
             <legend class="form-label" style="padding: 0;">{{ _ "policy_preset_label" }}</legend>
+            <label data-policy-preset="aggregate" style="display: flex; gap: var(--space-sm); align-items: flex-start; padding: var(--space-sm); border: 1px solid var(--border-color); border-radius: var(--radius-sm); margin-bottom: var(--space-xs);">
+                <input type="radio" name="policy_preset" value="aggregate" id="policy_preset_aggregate">
+                <span>
+                    <span style="font-weight: 600;">{{ _ "policy_preset_aggregate" }}</span>
+                    <span class="form-hint" style="display: block;">{{ _ "policy_preset_aggregate_hint" }}</span>
+                </span>
+            </label>
             <label data-policy-preset="russia_inside" style="display: flex; gap: var(--space-sm); align-items: flex-start; padding: var(--space-sm); border: 1px solid var(--border-color); border-radius: var(--radius-sm); margin-bottom: var(--space-xs);">
                 <input type="radio" name="policy_preset" value="russia_inside" id="policy_preset_russia_inside">
                 <span>
@@ -80,6 +87,12 @@
             <textarea class="form-input font-mono" id="policy_custom_urls" name="policy_custom_urls" rows="3" spellcheck="false" autocapitalize="none" placeholder="{{ _ "policy_custom_urls_placeholder" }}"></textarea>
         </div>
 
+        <div class="form-group">
+            <label class="form-label" for="policy_local_entries">{{ _ "policy_local_entries_label" }}</label>
+            <textarea class="form-input font-mono" id="policy_local_entries" name="policy_local_entries" rows="4" spellcheck="false" autocapitalize="none" placeholder="{{ _ "policy_local_entries_placeholder" }}"></textarea>
+            <p class="form-hint">{{ _ "policy_local_entries_hint" }}</p>
+        </div>
+
         <p class="form-hint">{{ _ "policy_semantics_notice" }}</p>
         <p class="form-hint">{{ _ "policy_limits_notice" }}</p>
 
@@ -116,6 +129,11 @@
             <span class="info-card-label">{{ _ "policy_status_rule_count" }}</span>
             <span class="info-card-value" id="policyRuleCount">-</span>
         </div>
+    </div>
+
+    <div class="form-group" style="margin-top: var(--space-md);">
+        <span class="form-label">{{ _ "policy_sources_title" }}</span>
+        <div id="policySourceStats" style="font-size:0.82rem; margin-top:var(--space-xs);"><span class="text-muted">{{ _ "loading" }}</span></div>
     </div>
 
     <div class="form-group" style="margin-top: var(--space-md);">

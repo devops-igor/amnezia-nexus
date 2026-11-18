@@ -29,6 +29,7 @@ const (
 // SyncConfig defines parameters for scheduled and manual policy synchronization.
 type SyncConfig struct {
 	Sources         []Source      `json:"sources"`
+	LocalRules      ParsedRules   `json:"-"`
 	RefreshInterval time.Duration `json:"refresh_interval"`
 	FetchLimits     FetchLimits   `json:"fetch_limits"`
 	ParseLimits     ParseLimits   `json:"parse_limits"`
@@ -42,7 +43,10 @@ type SourceSyncStats struct {
 	NotModified bool   `json:"not_modified"`
 	Accepted    int    `json:"accepted"`
 	Rejected    int    `json:"rejected"`
+	Excluded    int    `json:"excluded"`
 	Duplicates  int    `json:"duplicates"`
+	CheckedAt   string `json:"checked_at,omitempty"`
+	LastSuccess string `json:"last_success,omitempty"`
 	Error       string `json:"error,omitempty"`
 }
 
@@ -119,8 +123,8 @@ func NewSyncer(m *Matcher, fetcher *Fetcher, store Store, cfg SyncConfig) (*Sync
 	if len(cfg.Sources) == 0 {
 		return nil, errors.New("at least one source must be configured")
 	}
-	if len(cfg.Sources) > 4 {
-		return nil, errors.New("maximum 4 sources may be configured")
+	if len(cfg.Sources) > MaxSyncSources {
+		return nil, fmt.Errorf("maximum %d sources may be configured", MaxSyncSources)
 	}
 	if cfg.RefreshInterval <= 0 {
 		cfg.RefreshInterval = DefaultRefreshInterval
@@ -267,7 +271,7 @@ func (s *Syncer) getConditionalValidators(src Source) (string, string) {
 }
 
 func (s *Syncer) syncSingleSource(ctx context.Context, src Source, startTime time.Time) (cachedSourceData, SourceSyncStats, SourceParsedRules, error) {
-	stat := SourceSyncStats{ID: src.ID}
+	stat := SourceSyncStats{ID: src.ID, CheckedAt: startTime.UTC().Format(time.RFC3339)}
 	ifNoneMatch, ifModifiedSince := s.getConditionalValidators(src)
 
 	fetchRes, err := s.fetcher.Fetch(ctx, src.URL, ifNoneMatch, ifModifiedSince)
@@ -306,9 +310,12 @@ func (s *Syncer) syncSingleSource(ctx context.Context, src Source, startTime tim
 		}
 	}
 
+	rules, excluded := FilterNeverProxyDomains(rules)
 	stat.Accepted = report.Accepted
 	stat.Rejected = report.Rejected
+	stat.Excluded = excluded
 	stat.Duplicates = report.Duplicates
+	stat.LastSuccess = startTime.UTC().Format(time.RFC3339)
 
 	etag := fetchRes.ETag
 	lastMod := fetchRes.LastModified
@@ -335,14 +342,14 @@ func (s *Syncer) syncSingleSource(ctx context.Context, src Source, startTime tim
 	return cached, stat, parsed, nil
 }
 
-func aggregateCandidateRules(sourceParsedList []SourceParsedRules) (map[string]uint8, []string, int) {
-	candidateDomains := make(map[string]uint8)
+func aggregateCandidateRules(sourceParsedList []SourceParsedRules) (map[string]uint32, []string, int) {
+	candidateDomains := make(map[string]uint32)
 	var candidateCIDRs []string
 	seenCIDRs := make(map[netip.Prefix]struct{})
 
 	for _, item := range sourceParsedList {
 		for base, flags := range item.Rules.Domains {
-			candidateDomains[base] |= uint8(flags)
+			candidateDomains[base] |= uint32(flags)
 		}
 		for _, prefix := range item.Rules.CIDRs {
 			canon := prefix.Masked()
@@ -353,6 +360,21 @@ func aggregateCandidateRules(sourceParsedList []SourceParsedRules) (map[string]u
 		}
 	}
 	return candidateDomains, candidateCIDRs, len(candidateDomains) + len(candidateCIDRs)
+}
+
+func guardCandidateDomains(domains map[string]uint32, cidrs []string, total int) (map[string]uint32, int) {
+	guarded, excluded := filterNeverProxyFlags(domains)
+	if excluded == 0 {
+		return domains, total
+	}
+	return guarded, len(guarded) + len(cidrs)
+}
+
+func (s *Syncer) validateCandidateRules(totalCandidateRules int) error {
+	if totalCandidateRules == 0 {
+		return errors.New("cannot publish policy snapshot with zero rules")
+	}
+	return s.checkShrink(totalCandidateRules)
 }
 
 func (s *Syncer) checkShrink(totalCandidateRules int) error {
@@ -376,6 +398,34 @@ func (s *Syncer) nextVersion() uint64 {
 	return 1
 }
 
+func (s *Syncer) fetchSources(ctx context.Context, startTime time.Time) ([]SourceParsedRules, map[string]SourceSyncStats, map[string]cachedSourceData, error) {
+	statsMap := make(map[string]SourceSyncStats)
+	newCachedSources := make(map[string]cachedSourceData)
+	var sourceParsedList []SourceParsedRules
+	for _, src := range s.cfg.Sources {
+		cached, stat, parsed, err := s.syncSingleSource(ctx, src, startTime)
+		statsMap[src.ID] = stat
+		if err != nil {
+			return sourceParsedList, statsMap, newCachedSources, err
+		}
+		newCachedSources[src.ID] = cached
+		sourceParsedList = append(sourceParsedList, parsed)
+	}
+	return sourceParsedList, statsMap, newCachedSources, nil
+}
+
+func (s *Syncer) appendLocalRules(sourceParsedList []SourceParsedRules, statsMap map[string]SourceSyncStats) ([]SourceParsedRules, error) {
+	if len(s.cfg.LocalRules.Domains) == 0 && len(s.cfg.LocalRules.CIDRs) == 0 {
+		return sourceParsedList, nil
+	}
+	localRules, excluded := FilterNeverProxyDomains(s.cfg.LocalRules)
+	if excluded > 0 {
+		return sourceParsedList, fmt.Errorf("local rules contain %d never-proxy entries", excluded)
+	}
+	statsMap["local"] = SourceSyncStats{ID: "local", Accepted: len(localRules.Domains) + len(localRules.CIDRs)}
+	return append(sourceParsedList, SourceParsedRules{SourceID: "local", Rules: localRules}), nil
+}
+
 func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
 	if !s.active.CompareAndSwap(false, true) {
 		return SyncResult{}, ErrSyncInProgress
@@ -383,28 +433,20 @@ func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
 	defer s.active.Store(false)
 
 	startTime := time.Now().UTC()
-	statsMap := make(map[string]SourceSyncStats)
-	newCachedSources := make(map[string]cachedSourceData)
-	var sourceParsedList []SourceParsedRules
-
-	for _, src := range s.cfg.Sources {
-		cached, stat, parsed, err := s.syncSingleSource(ctx, src, startTime)
-		statsMap[src.ID] = stat
-		if err != nil {
-			s.recordFailure(err, statsMap, startTime)
-			return SyncResult{SourceStats: statsMap, Duration: time.Since(startTime)}, err
-		}
-		newCachedSources[src.ID] = cached
-		sourceParsedList = append(sourceParsedList, parsed)
-	}
-
-	candidateDomains, candidateCIDRs, totalRules := aggregateCandidateRules(sourceParsedList)
-	if totalRules == 0 {
-		err := errors.New("cannot publish policy snapshot with zero rules")
+	sourceParsedList, statsMap, newCachedSources, err := s.fetchSources(ctx, startTime)
+	if err != nil {
 		s.recordFailure(err, statsMap, startTime)
 		return SyncResult{SourceStats: statsMap, Duration: time.Since(startTime)}, err
 	}
-	if err := s.checkShrink(totalRules); err != nil {
+	sourceParsedList, err = s.appendLocalRules(sourceParsedList, statsMap)
+	if err != nil {
+		s.recordFailure(err, statsMap, startTime)
+		return SyncResult{SourceStats: statsMap, Duration: time.Since(startTime)}, err
+	}
+
+	candidateDomains, candidateCIDRs, totalRules := aggregateCandidateRules(sourceParsedList)
+	candidateDomains, totalRules = guardCandidateDomains(candidateDomains, candidateCIDRs, totalRules)
+	if err := s.validateCandidateRules(totalRules); err != nil {
 		s.recordFailure(err, statsMap, startTime)
 		return SyncResult{SourceStats: statsMap, Duration: time.Since(startTime)}, err
 	}

@@ -286,7 +286,7 @@ func TestSyncer_ConcurrentReadersRace(t *testing.T) {
 						SchemaVersion: SchemaVersion,
 						GenerationID:  fmt.Sprintf("gen-%d", v),
 						Version:       v,
-						Domains:       map[string]uint8{"example.com": uint8(domainInclusiveSuffix)},
+						Domains:       map[string]uint32{"example.com": uint32(domainInclusiveSuffix)},
 						CIDRs:         []string{"198.51.100.0/24"},
 					})
 				}
@@ -637,7 +637,7 @@ func TestSyncer_ConfigHashMismatchRejectsStaleCache(t *testing.T) {
 		Version:       1,
 		CreatedAt:     time.Now().UTC(),
 		ConfigHash:    configHashA,
-		Domains:       map[string]uint8{"old-domain.com": uint8(domainExact)},
+		Domains:       map[string]uint32{"old-domain.com": uint32(domainExact)},
 		DomainCount:   1,
 	}
 	if err := store.Commit(context.Background(), genA); err != nil {

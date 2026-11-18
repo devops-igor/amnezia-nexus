@@ -322,7 +322,7 @@ func TestStoredGenerationForDifferentSourcesIsNotTreatedAsBaseline(t *testing.T)
 		GenerationID:  "gen-other-source",
 		Version:       4,
 		ConfigHash:    "hash-of-some-other-source-config",
-		Domains:       map[string]uint8{"other.example.com": 1},
+		Domains:       map[string]uint32{"other.example.com": 1},
 		DomainCount:   1,
 	}
 	if err := store.Commit(context.Background(), other); err != nil {

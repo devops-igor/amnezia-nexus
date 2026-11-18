@@ -1136,5 +1136,13 @@
   "policy_client_filter_hint": "按目标地址、端口或名称缩小本会话已读取的行。不会读取新状态，也不会发送查询。",
   "policy_client_filter_count": "{shown}/{total} 行匹配“{term}”",
   "policy_client_filter_none": "没有已记录行匹配“{term}”。",
-  "policy_client_corr_dns_names_not_retained": "保留的地址证据不含名称；名称来自应答历史"
+  "policy_client_corr_dns_names_not_retained": "保留的地址证据不含名称；名称来自应答历史",
+  "policy_preset_aggregate": "所有主要俄罗斯列表（聚合）",
+  "policy_preset_aggregate_hint": "合并经审核的 24 个列表并去重。Russia outside 被排除，俄罗斯国家/内部域名始终直连。",
+  "policy_local_entries_label": "本地条目",
+  "policy_local_entries_placeholder": "example.com\n*.example.org\n203.0.113.7\n198.51.100.0/24",
+  "policy_local_entries_hint": "每行一个域名或 IPv4/CIDR。忽略空行和注释。这些条目会添加到所选来源；俄罗斯国家/内部域名会被拒绝。",
+  "policy_sources_title": "聚合组件状态",
+  "policy_sources_empty": "暂无聚合组件状态",
+  "policy_source_excluded": "已排除"
 }

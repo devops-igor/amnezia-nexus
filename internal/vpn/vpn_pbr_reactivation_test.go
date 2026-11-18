@@ -152,7 +152,7 @@ func seededStore(t *testing.T) policy.Store {
 		GenerationID:  "gen-seed",
 		Version:       1,
 		ConfigHash:    policyConfigHashFor(t, repeatedEnableSettings(t)),
-		Domains:       map[string]uint8{"example.com": 1},
+		Domains:       map[string]uint32{"example.com": 1},
 	}
 	gen.ContentHash = policy.ComputeContentHash(gen.Domains, gen.CIDRs)
 	m.committed = gen

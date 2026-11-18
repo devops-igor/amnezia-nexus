@@ -42,7 +42,7 @@ import (
 // A content-equivalent refresh reuses the incumbent identity, so the generation
 // the forwarder's route cache keys client evidence on does not move; everything
 // else about the cycle (durable commit, atomic publication, status) is unchanged.
-func (s *Syncer) candidateIdentity(startTime time.Time, domains map[string]uint8, cidrs []string, perSource []SourceParsedRules) (uint64, string, time.Time) {
+func (s *Syncer) candidateIdentity(startTime time.Time, domains map[string]uint32, cidrs []string, perSource []SourceParsedRules) (uint64, string, time.Time) {
 	retain := s.retainableGeneration()
 	if s.equivalentTo(retain, domains, cidrs, perSource) {
 		return retain.Version, retain.GenerationID, retain.CreatedAt
@@ -72,7 +72,7 @@ func (s *Syncer) retainableGeneration() *Generation {
 // content of gen, attribution included. Attribution is compared through the
 // durable digest when the generation has one, and through the syncer's own
 // previous cycle otherwise; see sameSourceAttribution.
-func (s *Syncer) equivalentTo(gen *Generation, domains map[string]uint8, cidrs []string, perSource []SourceParsedRules) bool {
+func (s *Syncer) equivalentTo(gen *Generation, domains map[string]uint32, cidrs []string, perSource []SourceParsedRules) bool {
 	if gen == nil {
 		return false
 	}
@@ -103,13 +103,17 @@ func (s *Syncer) equivalentTo(gen *Generation, domains map[string]uint8, cidrs [
 // successful cycle records the digest, so that gap is one cycle and never
 // recurring: from then on attribution-only moves publish.
 func (s *Syncer) sameSourceAttribution(gen *Generation, perSource []SourceParsedRules) bool {
-	if len(perSource) != len(s.cfg.Sources) {
+	external := perSource
+	if len(external) == len(s.cfg.Sources)+1 && external[len(external)-1].SourceID == "local" {
+		external = external[:len(external)-1]
+	}
+	if len(external) != len(s.cfg.Sources) {
 		return true
 	}
 	if len(s.cachedSources) == len(s.cfg.Sources) {
-		return s.sameCachedSourceAttribution(perSource)
+		return s.sameCachedSourceAttribution(external)
 	}
-	if candidate, ok := attributionDigest(perSource); ok && gen.AttributionHash != "" {
+	if candidate, ok := attributionDigest(external); ok && gen.AttributionHash != "" {
 		return gen.AttributionHash == candidate
 	}
 	return true
@@ -136,7 +140,7 @@ func (s *Syncer) sameCachedSourceAttribution(perSource []SourceParsedRules) bool
 // equalFlagMap compares two rule flag maps. Parsing collapses duplicate
 // declarations into one entry per base domain, so equality here is equality of
 // the effective rule set however the list was written.
-func equalFlagMap[T ~uint8](a, b map[string]T) bool {
+func equalFlagMap[T ~uint32](a, b map[string]T) bool {
 	if len(a) != len(b) {
 		return false
 	}

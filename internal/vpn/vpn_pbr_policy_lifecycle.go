@@ -87,6 +87,10 @@ type PolicyStatus struct {
 	LastSuccess  string `json:"last_success,omitempty"`
 	SyncState    string `json:"sync_state"`
 	LastError    string `json:"last_error,omitempty"`
+	// SourceStats carries the per-component aggregate-list outcome: accepted,
+	// excluded by the never-proxy guard, duplicates, conditional status and any
+	// failure. It is aggregate metadata, never a client observation.
+	SourceStats map[string]policy.SourceSyncStats `json:"source_stats,omitempty"`
 
 	// Upstream DNS health (issue #824). Without these an operator cannot tell a
 	// blocked upstream provider, which produces no evidence at all, from a policy
@@ -711,6 +715,7 @@ func applySyncerStatus(status *PolicyStatus, runtime *policyRuntime) {
 	status.DomainCount = live.DomainCount
 	status.CIDRCount = live.CIDRCount
 	status.LastError = live.LastError
+	status.SourceStats = live.SourceStats
 	status.Preset = runtime.presetID
 	if !live.LastSyncTime.IsZero() {
 		status.LastSyncTime = live.LastSyncTime.UTC().Format(time.RFC3339)

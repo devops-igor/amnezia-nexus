@@ -329,6 +329,11 @@
         if (textarea) {
             textarea.value = urls.join('\n');
         }
+        var local = Array.isArray(record.local_entries) ? record.local_entries : [];
+        var localTextarea = policyElement('policy_local_entries');
+        if (localTextarea) {
+            localTextarea.value = local.join('\n');
+        }
 
         var interval = policyElement('policy_sync_interval');
         if (interval && typeof record.sync_interval_seconds === 'number') {
@@ -343,6 +348,35 @@
 
         updatePolicyCustomGroup();
         updatePolicyPresetHighlight();
+    }
+
+    function renderPolicySourceStats(snapshot) {
+        var container = policyElement('policySourceStats');
+        if (!container) {
+            return;
+        }
+        while (container.firstChild) {
+            container.removeChild(container.firstChild);
+        }
+        var stats = snapshot && snapshot.source_stats ? snapshot.source_stats : null;
+        var keys = stats ? Object.keys(stats).sort() : [];
+        if (keys.length === 0) {
+            var empty = document.createElement('span');
+            empty.className = 'text-muted';
+            empty.textContent = policyText('policy_sources_empty');
+            container.appendChild(empty);
+            return;
+        }
+        keys.forEach(function (id) {
+            var item = stats[id] || {};
+            var row = document.createElement('div');
+            row.style.padding = '2px 0';
+            row.textContent = id + ': ' + (item.accepted || 0) + ' accepted, '
+                + (item.excluded || 0) + ' ' + policyText('policy_source_excluded')
+                + (item.last_success ? ' · ' + item.last_success : '')
+                + (item.error ? ' — ' + item.error : '');
+            container.appendChild(row);
+        });
     }
 
     function renderPolicyStatus(record, status) {
@@ -376,6 +410,8 @@
         if (presetEl) {
             presetEl.textContent = policyPresetLabel(preset);
         }
+
+        renderPolicySourceStats(snapshot);
 
         var lastSuccessEl = policyElement('policyLastSuccess');
         if (lastSuccessEl) {
@@ -475,6 +511,16 @@
         return policy;
     }
 
+    function policyLocalEntries() {
+        var textarea = policyElement('policy_local_entries');
+        if (!textarea || typeof textarea.value !== 'string') {
+            return [];
+        }
+        return textarea.value.split('\n').map(function (line) {
+            return line.trim();
+        });
+    }
+
     function policySavePayload() {
         var preset = policySelectedPreset();
         var enabledInput = policyElement('policy_enabled');
@@ -484,6 +530,7 @@
             enabled: !!(enabledInput && enabledInput.checked),
             preset: preset,
             custom_urls: preset === 'custom' ? policyCustomURLs() : [],
+            local_entries: policyLocalEntries(),
             sync_interval_seconds: isFinite(interval) && interval > 0 ? interval : 0
         };
     }

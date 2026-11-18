@@ -40,7 +40,7 @@ func TestCache_ErrorHandling(t *testing.T) {
 		GenerationID:  "gen-1",
 		Version:       1,
 		CreatedAt:     time.Now().UTC(),
-		Domains:       map[string]uint8{"example.com": uint8(domainExact)},
+		Domains:       map[string]uint32{"example.com": uint32(domainExact)},
 		CIDRs:         []string{"10.0.0.0/24"},
 	}
 	if err := store.Commit(ctx, goodGen); err != nil {
@@ -79,7 +79,7 @@ func TestCache_ErrorHandling(t *testing.T) {
 		t.Fatal("expected error on GenerationToSnapshot(nil)")
 	}
 	badCIDRGen := &Generation{
-		Domains: map[string]uint8{"example.com": 1},
+		Domains: map[string]uint32{"example.com": 1},
 		CIDRs:   []string{"not-a-valid-cidr"},
 	}
 	if _, err := GenerationToSnapshot(badCIDRGen); err == nil {

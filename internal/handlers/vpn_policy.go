@@ -126,6 +126,7 @@ func policySettingsEqual(a, b policy.Settings) bool {
 		a.Preset == b.Preset &&
 		a.SyncInterval == b.SyncInterval &&
 		slices.Equal(a.CustomURLs, b.CustomURLs) &&
+		slices.Equal(a.LocalEntries, b.LocalEntries) &&
 		slices.Equal(a.UpstreamDNS, b.UpstreamDNS)
 }
 
@@ -173,6 +174,7 @@ func (h *Handlers) GetPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		"enabled":               settings.Enabled,
 		"preset":                string(settings.Preset),
 		"custom_urls":           customURLsOrEmpty(settings.CustomURLs),
+		"local_entries":         localEntriesOrEmpty(settings.LocalEntries),
 		"sync_interval_seconds": settings.SyncInterval,
 		"upstream_dns":          upstreamDNSOrEmpty(settings.UpstreamDNS),
 	}
@@ -195,6 +197,13 @@ func customURLsOrEmpty(urls []string) []string {
 // upstreamDNSOrEmpty reports an empty JSON array rather than null for a record
 // that uses the effective default upstream list. An empty array therefore reads
 // as "no explicit list", which is exactly what the setting means.
+func localEntriesOrEmpty(entries []string) []string {
+	if entries == nil {
+		return []string{}
+	}
+	return entries
+}
+
 func upstreamDNSOrEmpty(list []policy.Upstream) []policy.Upstream {
 	if list == nil {
 		return []policy.Upstream{}
@@ -267,6 +276,9 @@ func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
 	// inside this mutation boundary so the record cannot change between the read
 	// and the write. The effective record is validated before it is persisted.
 	merged, mergeErr := mergeStoredUpstreams(incoming, previous)
+	if mergeErr == nil {
+		merged, mergeErr = mergeStoredLocalEntries(merged, previous)
+	}
 	if mergeErr != nil {
 		h.audit(r, "policy.settings_save", map[string]any{"result": "rejected", "reason": mergeErr.Error()})
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", mergeErr.Error())
@@ -293,8 +305,8 @@ func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
 
 	h.audit(r, "policy.settings_save", map[string]any{
 		"result": "ok", "enabled": incoming.Enabled, "preset": string(incoming.Preset),
-		"custom_url_count": len(incoming.CustomURLs), "sync_interval_seconds": incoming.SyncInterval,
-		"upstream_dns_count": len(incoming.UpstreamDNS),
+		"custom_url_count": len(incoming.CustomURLs), "local_entry_count": len(incoming.LocalEntries),
+		"sync_interval_seconds": incoming.SyncInterval, "upstream_dns_count": len(incoming.UpstreamDNS),
 	})
 	h.JSON(w, http.StatusOK, h.policyPutResponse(incoming))
 }
@@ -395,6 +407,22 @@ func mergeStoredUpstreams(incoming policy.Settings, previous previousPolicyRecor
 	return merged, nil
 }
 
+// mergeStoredLocalEntries preserves the stored local entries when a save omits
+// the field. An explicitly empty slice is a deliberate removal.
+func mergeStoredLocalEntries(incoming policy.Settings, previous previousPolicyRecord) (policy.Settings, error) {
+	if incoming.LocalEntries != nil {
+		return incoming, nil
+	}
+	merged := incoming
+	if previous.present {
+		merged.LocalEntries = previous.settings.LocalEntries
+	}
+	if err := merged.Validate(); err != nil {
+		return policy.Settings{}, err
+	}
+	return merged, nil
+}
+
 // policyPutResponse renders the saved record plus live status.
 func (h *Handlers) policyPutResponse(saved policy.Settings) map[string]any {
 	response := map[string]any{
@@ -402,6 +430,7 @@ func (h *Handlers) policyPutResponse(saved policy.Settings) map[string]any {
 		"enabled":               saved.Enabled,
 		"preset":                string(saved.Preset),
 		"custom_urls":           customURLsOrEmpty(saved.CustomURLs),
+		"local_entries":         localEntriesOrEmpty(saved.LocalEntries),
 		"sync_interval_seconds": saved.SyncInterval,
 		"upstream_dns":          upstreamDNSOrEmpty(saved.UpstreamDNS),
 	}

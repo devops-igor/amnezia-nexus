@@ -316,7 +316,33 @@ expires at the minimum answer TTL capped by the server's maximum TTL. Evidence
 is written into the authenticated session's cache scope, so it is bounded by
 the session lifetime and never visible to another session.
 
-## 5. Limitations
+## 5. Aggregate source, local entries and the never-proxy guard
+
+The `aggregate` preset unions the reviewed 24-list manifest in
+`internal/policy/aggregate.go`: six `Categories/` lists, sixteen `Services/`
+lists, `Russia/inside-raw.lst` and `Ukraine/inside-raw.lst`. The manifest is
+explicit and reviewable; converted transport variants, `src/` derivatives and
+`Russia/outside-raw.lst` are not fetched.
+
+Every component is fetched with the existing HTTPS/SSRF, conditional-request,
+size, timeout and rule-count protections. A component failure keeps the previous
+published policy and reports the failed component; a first activation with an
+incomplete aggregate is refused rather than publishing partial coverage.
+Duplicate rules collapse into one rule with every contributing source attributed
+within the snapshot provenance budget, and per-component status reports accepted,
+excluded, duplicate and failure counts.
+
+The never-proxy guard is applied to every external component and to local
+entries, and again to the composed rule set. It removes rules that are equal to,
+below, or broad ancestors of Russian state/government patterns and the explicit
+internal-service denylist. Excluded names keep the existing default path; the
+guard never turns another destination DIRECT. Local entries are persisted as an
+additive settings field, accept bare domains, `*.` subdomains, IPv4 literals and
+IPv4 CIDRs, and are refused with the named guard reason when they match the
+denylist. An empty local list does not change the generation; adding or removing
+a local entry does.
+
+## 6. Limitations
 
 - **Encrypted DNS is out of scope.** DNS over HTTPS (443) and DNS over TLS
   (853) are not detected, intercepted or decrypted. Those destinations produce
