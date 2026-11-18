@@ -54,18 +54,6 @@ func settingsPageScripts(t *testing.T, page string) [][2]string {
 	return out
 }
 
-// settingsStoredAnswer is what GET /api/settings returns for the handler's
-// current database, so the page's read-before-write sees real stored values.
-func settingsStoredAnswer(t *testing.T, h *Handlers) string {
-	t.Helper()
-	w := httptest.NewRecorder()
-	setupFullSettingsRouter(h).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/settings", nil))
-	if w.Code != http.StatusOK {
-		t.Fatalf("GET /api/settings = %d", w.Code)
-	}
-	return w.Body.String()
-}
-
 // settingsHarnessHead builds the JSDOM page from the rendered HTML and loads the
 // scripts in the order the page loads them. fetch is the real panel over HTTP.
 const settingsHarnessHead = `
