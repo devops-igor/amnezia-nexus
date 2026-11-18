@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import sync_playwright
 
+from tests.e2e import css_surface
+
 pytestmark = pytest.mark.e2e
 
 VIEWPORTS = [
@@ -212,9 +214,21 @@ def test_css_computed_style_differential(repo_root: Path):
 
     css_dir = repo_root / "web" / "static" / "css"
     modular_names = extract_base_template_stylesheets(repo_root)
-    modular_modules = [
-        (css_dir / name).read_text(encoding="utf-8")
+    # The frozen reference must stay byte-identical, so the Settings layout
+    # classes that did not exist when it was cut are set aside on the modular
+    # side by name (tests/e2e/css_surface.py) instead of being copied into it.
+    # Everything else is compared, including every legacy rule that applies to
+    # the elements the Settings templates render. The new classes are checked
+    # against token-derived expectations in tests/e2e/test_settings.py.
+    sheets = {
+        name[: -len(".css")]: (css_dir / name).read_text(encoding="utf-8")
         for name in modular_names
+    }
+    legacy = css_surface.legacy_view(sheets)
+    modular_modules = [
+        legacy[name[: -len(".css")]]
+        for name in modular_names
+        if name[: -len(".css")] in legacy
     ]
 
     pages = build_test_pages(repo_root)
