@@ -114,9 +114,23 @@ w.API = {
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 const settle = async (rounds) => { for (let i = 0; i < (rounds || 8); i++) await flush(); };
 const requestsTo = (suffix, method) => calls.filter(c => c.url.endsWith(suffix) && (!method || c.method === method));
+// alertText reads the card's two live regions the way a reader of the page does: the
+// text of whichever one has any, and its outcome. There is exactly one status and
+// one alert region, and at most one of them has text.
 const alertText = () => {
-  const el = w.document.getElementById('policyAlert');
-  return {text: el.textContent, state: el.getAttribute('data-state'), display: el.style.display};
+  const box = w.document.getElementById('policyAlert');
+  const status = box.querySelector('[data-status]');
+  const error = box.querySelector('[data-error]');
+  const words = el => el.textContent.replace(/\s+/g, ' ').trim();
+  const shown = [status, error].filter(el => words(el) !== '');
+  if (shown.length > 1) throw new Error('both result regions have text');
+  const el = shown[0] || null;
+  return {
+    text: el ? words(el) : '',
+    state: el ? (el === status ? 'success' : 'error') : '',
+    outcome: el ? el.getAttribute('data-outcome') : '',
+    regions: box.querySelectorAll('[data-status]').length + ':' + box.querySelectorAll('[data-error]').length
+  };
 };
 const toggle = () => w.document.getElementById('policy_enabled').checked;
 // editToggle changes the master switch the way a click does: the value moves and

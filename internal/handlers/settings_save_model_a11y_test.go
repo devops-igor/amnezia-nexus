@@ -11,7 +11,10 @@ package handlers
 // nodes a browser would put in the accessibility tree: not [hidden], not
 // display:none, not visibility:hidden, not aria-hidden. Geometry is not claimed.
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // settingsA11yHelpers is shared scenario code: the nine cards, a test of whether
 // a node is exposed, and an observer that records every text change of the three
@@ -28,13 +31,15 @@ function exposed(el) {
   }
   return true;
 }
-// The two policy cards report through one banner of their own whose role follows
-// the outcome; every other card has a status node and an alert node.
-const BANNERS = {policyRoutingCard: 'policyAlert', policyUpstreamCard: 'policyUpstreamAlert'};
-const liveNodes = id => BANNERS[id]
-  ? {dirty: card(id).querySelector('[data-dirty]'), banner: doc.getElementById(BANNERS[id])}
-  : {dirty: card(id).querySelector('[data-dirty]'), status: card(id).querySelector('[data-status]'), error: card(id).querySelector('[data-error]')};
-const resultText = id => Object.entries(liveNodes(id)).filter(([k]) => k !== 'dirty').map(([, el]) => el.textContent).join('');
+// Every card has the same three live nodes: the unsaved badge, one status region
+// and one alert region. The two policy cards carry theirs inside a wrapper above
+// the form, which is the only difference in where they sit.
+const liveNodes = id => ({
+  dirty: card(id).querySelector('[data-dirty]'),
+  status: card(id).querySelector('[data-status]'),
+  error: card(id).querySelector('[data-error]')
+});
+const resultText = id => [liveNodes(id).status, liveNodes(id).error].map(el => el.textContent.trim()).join('');
 // watch records every write to the live nodes of a card, one entry per mutation
 // record and not per callback: the callback batches synchronous writes, which would
 // hide a node that is rewritten on every keystroke. text is what was written.
@@ -69,12 +74,10 @@ for (const id of CARDS) {
     assert.equal(el.textContent, '', id + ' ' + name + ' must be empty until it has something to say');
   }
   assert.equal(nodes.dirty.getAttribute('role'), 'status', id + ' unsaved role');
-  if (nodes.banner) {
-    assert.equal(nodes.banner.getAttribute('role'), 'status', id + ' banner starts as a polite status');
-  } else {
-    assert.equal(nodes.status.getAttribute('role'), 'status', id + ' success role');
-    assert.equal(nodes.error.getAttribute('role'), 'alert', id + ' error role');
-  }
+  assert.equal(nodes.status.getAttribute('role'), 'status', id + ' success role');
+  assert.equal(nodes.error.getAttribute('role'), 'alert', id + ' error role');
+  assert.equal(card(id).querySelectorAll('[data-status]').length, 1, id + ' must have exactly one status region');
+  assert.equal(card(id).querySelectorAll('[data-error]').length, 1, id + ' must have exactly one alert region');
 }
 
 // One transition, many keystrokes: the unsaved text is written once.
@@ -114,36 +117,43 @@ assert.ok(log.some(e => e.node === 'error' && e.text !== ''), 'the failure text 
 `)
 }
 
-// TestSettingsA11y_PolicyBannersSwitchRoleWithTheOutcome: the two policy cards keep
-// their own banner. It is mounted and exposed while empty, polite for a success
-// and assertive for a failure.
-func TestSettingsA11y_PolicyBannersSwitchRoleWithTheOutcome(t *testing.T) {
+// TestSettingsA11y_PolicyCardsUseFixedStatusAndAlertRegions: the two policy cards
+// report into the same fixed pair of regions as every other card. A success lands
+// in the status region and a refusal in the alert region, and neither region ever
+// changes its role to suit the message. The review asked for this instead of one
+// banner that switches semantics in the same update as its text.
+func TestSettingsA11y_PolicyCardsUseFixedStatusAndAlertRegions(t *testing.T) {
 	h, _, _ := setupTestHandlers(t)
 	runSettingsScenario(t, h, settingsA11yHelpers+`
-await sleep(300);
-for (const [cardId, bannerId, fieldId] of [['policyRoutingCard', 'policyAlert', 'policy_local_entries'], ['policyUpstreamCard', 'policyUpstreamAlert', null]]) {
-  const banner = doc.getElementById(bannerId);
-  assert.equal(exposed(banner), true, bannerId + ' must be exposed before it has text');
-  assert.equal(banner.textContent, '', bannerId + ' must start empty');
-  assert.equal(banner.hasAttribute('hidden'), false);
-  assert.notEqual(banner.style.display, 'none');
+await sleep(400);
+for (const [cardId, wrapperId] of [['policyRoutingCard', 'policyAlert'], ['policyUpstreamCard', 'policyUpstreamAlert']]) {
+  const wrapper = doc.getElementById(wrapperId);
+  assert.ok(wrapper.contains(liveNodes(cardId).status) && wrapper.contains(liveNodes(cardId).error), cardId + ' regions sit in the result wrapper');
+  assert.equal(wrapper.getAttribute('role'), null, wrapperId + ' is a plain wrapper, not a live region of its own');
+  assert.equal(wrapper.hasAttribute('hidden'), false);
+  assert.equal(exposed(liveNodes(cardId).status), true, cardId + ' status region is exposed while empty');
+  assert.equal(exposed(liveNodes(cardId).error), true, cardId + ' alert region is exposed while empty');
 }
 
-const banner = doc.getElementById('policyAlert');
+const nodes = liveNodes('policyRoutingCard');
+const roles = () => [nodes.status.getAttribute('role'), nodes.error.getAttribute('role')];
+assert.deepEqual(roles(), ['status', 'alert']);
+
 type('policy_local_entries', 'corp.example');
 card('policyRoutingCard').querySelector('[data-commit]').click();
-await until(() => banner.textContent !== '', 'the policy success');
-assert.equal(banner.getAttribute('role'), 'status', 'a success is a status');
-assert.equal(banner.getAttribute('aria-live'), 'polite');
-assert.equal(exposed(banner), true);
+await until(() => nodes.status.textContent.trim() !== '', 'the policy success');
+assert.equal(nodes.error.textContent.trim(), '', 'a success must not write the alert region');
+assert.deepEqual(roles(), ['status', 'alert'], 'roles do not change with the outcome');
 
 policyDouble.refuse = true;
 type('policy_local_entries', 'other.example');
 card('policyRoutingCard').querySelector('[data-commit]').click();
-await until(() => banner.getAttribute('data-state') === 'error', 'the policy refusal');
-assert.equal(banner.getAttribute('role'), 'alert', 'a failure is an alert');
-assert.equal(banner.getAttribute('aria-live'), 'assertive');
-assert.equal(exposed(banner), true);
+await until(() => nodes.error.textContent.trim() !== '', 'the policy refusal');
+assert.equal(nodes.status.textContent.trim(), '', 'a refusal must clear the success region');
+assert.deepEqual(roles(), ['status', 'alert'], 'roles do not change with the outcome');
+assert.equal(nodes.error.getAttribute('data-outcome'), 'refused');
+assert.equal(wrapperState(), 'error');
+function wrapperState() { return doc.getElementById('policyAlert').getAttribute('data-state'); }
 `)
 }
 
@@ -217,4 +227,85 @@ for (const id of CARDS) {
   assert.ok(resultText(id) !== '', id + ' must report a completion or an error in its own card');
 }
 `)
+}
+
+// TestSettingsA11y_LateCompletionNeverTakesFocusFromAnotherCard is the regression the
+// review named. A save starts from its own control and is held on the wire. The
+// operator moves to an enabled input in a different card and types there. The save
+// then settles, once as a success and once as a failure, and focus and the typed
+// value must be exactly where the operator left them. The matrix repeats this for
+// every card; this test keeps the single case readable.
+func TestSettingsA11y_LateCompletionNeverTakesFocusFromAnotherCard(t *testing.T) {
+	for _, outcome := range []string{"success", "failure"} {
+		t.Run(outcome, func(t *testing.T) {
+			h, _, _ := setupTestHandlers(t)
+			runSettingsScenario(t, h, settingsA11yHelpers+`
+const failing = `+map[bool]string{true: "true", false: "false"}[outcome == "failure"]+`;
+let release;
+const gate = new Promise(r => { release = r; });
+holdWhen = (u, o) => (String(u).indexOf('/api/settings/save') === 0 && String((o && o.method) || '').toUpperCase() === 'POST') ? gate : null;
+if (failing) refuseWhen = u => String(u).indexOf('/api/settings/save') === 0;
+
+type('max_connections_per_user', '41');
+const commit = commitOf('limitsCard');
+commit.focus();
+commit.click();
+await until(() => held > 0, 'the save to reach the barrier');
+
+const elsewhere = doc.getElementById('app_title');
+elsewhere.focus();
+type('app_title', 'typed while the other card was saving');
+assert.equal(doc.activeElement, elsewhere, 'the operator is now in another card');
+
+release();
+holdWhen = null;
+await until(() => card('limitsCard').getAttribute('aria-busy') === 'false', 'the save to settle');
+await settled();
+
+assert.equal(doc.activeElement, elsewhere, 'a late ' + (failing ? 'failure' : 'success') + ' must leave focus where the operator put it');
+assert.equal(elsewhere.value, 'typed while the other card was saving', 'what was typed there is still there');
+assert.equal(shown(badgeOf('appearanceCard')), true, 'the other card is still marked unsaved');
+assert.equal(card('limitsCard').contains(doc.activeElement), false);
+`)
+		})
+	}
+}
+
+// focusDropScenario is the shared body of the "operation lost focus" cases: a save
+// is held, the focused control is disabled by the operation, drop() leaves focus
+// the way a browser would, and the save settles.
+const focusDropScenario = `
+let release;
+const gate = new Promise(r => { release = r; });
+holdWhen = (u, o) => (String(u).indexOf('/api/settings/save') === 0 && String((o && o.method) || '').toUpperCase() === 'POST') ? gate : null;
+type('max_connections_per_user', '43');
+const commit = commitOf('limitsCard');
+commit.focus();
+commit.click();
+await until(() => held > 0, 'the save to reach the barrier');
+assert.equal(commit.disabled, true, 'the commit is disabled while the request runs');
+DROP_FOCUS
+release();
+holdWhen = null;
+await until(() => card('limitsCard').getAttribute('aria-busy') === 'false', 'the save to settle');
+await settled();
+assert.ok(card('limitsCard').contains(doc.activeElement) && doc.activeElement !== doc.body,
+  'focus the operation lost comes back to the card, is on ' + doc.activeElement.tagName);
+assert.ok(!doc.activeElement.disabled, 'and to an element that can take it (the heading, since a clean card disables its commit)');
+assert.equal(doc.activeElement.classList.contains('card-title'), true, 'the card heading is the fallback');
+`
+
+// TestSettingsA11y_FocusIsRestoredWhenTheOperationLostIt is the other half of the
+// rule: when nothing else took focus and the operation dropped it, it comes back.
+//
+// Two ways to lose focus exist. A browser may move focus to the page body when the
+// focused control becomes disabled; JSDOM never does (it keeps the disabled control
+// as the active element, and blur() does not clear it), so that case cannot be
+// reached through the page here and is covered by the Chromium test instead.
+// What JSDOM does produce is the second: focus left on the disabled control. That
+// is the case below, and it must end on the card heading.
+func TestSettingsA11y_FocusIsRestoredWhenTheOperationLostIt(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	runSettingsScenario(t, h, settingsA11yHelpers+strings.Replace(focusDropScenario, "DROP_FOCUS",
+		"assert.equal(doc.activeElement, commit, 'focus is left on the disabled control');", 1))
 }

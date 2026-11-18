@@ -1042,3 +1042,69 @@ def test_no_populated_gigahost_text_is_painted_in_the_muted_colour(
     assert probe["everything"], "the populated state rendered no text"
     offenders = [node for node in probe["everything"] if node["color"] == muted]
     assert offenders == [], (name, theme, offenders)
+
+
+@pytest.mark.e2e
+def test_settings_late_save_does_not_take_focus_and_restores_lost_focus(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """Focus in a real browser, both halves of the rule.
+
+    A save is held on the wire. First the operator stays where they were: the
+    browser drops focus when the focused Save becomes disabled, and the operation
+    puts it back inside the card. Then, in a second pass, the operator moves to an
+    input in a different card while the save is held, and the late completion
+    leaves focus and the typed text alone.
+    """
+    page = authenticated_page
+    original = api_get(page, "/api/settings")
+    try:
+        for moves_away in (False, True):
+            page.goto(f"{base_url}/settings")
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(700)
+            held: list = []
+            page.route("**/api/settings/save", lambda route: held.append(route))
+            page.locator("#max_connections_per_user").fill("37" if moves_away else "36")
+            save = page.locator("#limitsCard [data-commit]")
+            save.focus()
+            save.click()
+            for _ in range(100):
+                if held:
+                    break
+                page.wait_for_timeout(50)
+            assert held, "the save never reached the network"
+            if moves_away:
+                page.locator("#app_title").focus()
+                page.keyboard.type("-typed-meanwhile")
+            else:
+                # Chromium keeps the disabled control as the active element for the
+                # rest of the task and moves focus to the body right after, so wait
+                # one tick before looking. Either state must end inside the card.
+                page.wait_for_timeout(100)
+                assert page.evaluate("document.activeElement === document.body"), (
+                    "the browser should have dropped focus when Save became disabled"
+                )
+            held[0].continue_()
+            page.unroute("**/api/settings/save")
+            page.wait_for_function(
+                "document.getElementById('limitsCard').getAttribute('aria-busy') === 'false'"
+            )
+            page.wait_for_timeout(200)
+            where = page.evaluate(
+                "({id: document.activeElement.id, inLimits: !!document.activeElement.closest('#limitsCard')})"
+            )
+            if moves_away:
+                assert where["id"] == "app_title", f"a late completion took focus from the operator: {where}"
+                assert "-typed-meanwhile" in page.locator("#app_title").input_value(), (
+                    "what the operator typed while the save was held must still be there"
+                )
+            else:
+                assert where["inLimits"], f"focus the operation lost was not restored to the card: {where}"
+    finally:
+        api_post(
+            page,
+            "/api/settings/save",
+            {k: original.get(k, {}) for k in ("appearance", "captcha", "ssl", "limits", "telegram")},
+            csrf_token,
+        )

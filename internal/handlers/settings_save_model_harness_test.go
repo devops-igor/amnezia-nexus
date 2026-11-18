@@ -73,6 +73,7 @@ let failSave = false;
 // makes it fail like a dropped connection. Both see every request the page makes.
 let holdWhen = null;
 let failWhen = null;
+let refuseWhen = null;
 let held = 0;
 const isPost = o => String((o && o.method) || 'GET').toUpperCase() === 'POST';
 // The two policy cards talk to an endpoint the handler fixture does not mount, so
@@ -106,6 +107,11 @@ w.fetch = async (u, o) => {
   if (isSave && saveGate) { saveHeld++; await saveGate; }
   if (failWhen && failWhen(u, o)) throw new TypeError('Failed to fetch');
   if (holdWhen) { const gate = holdWhen(u, o); if (gate) { held++; await gate; } }
+  // refuseWhen answers like a server that looked at the request and said no. It is
+  // applied after any hold, so a request can be slow and then refused. The real
+  // handler is not reached, which is the point: the page must treat any refusal the
+  // same way, whichever card sent it.
+  if (refuseWhen && refuseWhen(u, o)) return jsonResponse({error: 'validation_failed', detail: 'refused by the test'}, 422);
   const fake = policyAnswer(u, o);
   if (fake) return fake;
   return realFetch(CFG.base + u, o);

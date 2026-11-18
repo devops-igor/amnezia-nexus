@@ -177,9 +177,23 @@ const setField = (index, name, value) => {
   el.dispatchEvent(new w.Event('change', {bubbles: true}));
 };
 const clickRow = (index, action) => rowNodes()[index].querySelector('[data-upstream-action="' + action + '"]').click();
+// alertState reads the card's two live regions the way a reader of the page does: the
+// text of whichever one has any, and its outcome. There is exactly one status and
+// one alert region, and at most one of them has text.
 const alertState = () => {
-  const el = w.document.getElementById('policyUpstreamAlert');
-  return {text: el.textContent, state: el.getAttribute('data-state'), display: el.style.display};
+  const box = w.document.getElementById('policyUpstreamAlert');
+  const status = box.querySelector('[data-status]');
+  const error = box.querySelector('[data-error]');
+  const words = el => el.textContent.replace(/\s+/g, ' ').trim();
+  const shown = [status, error].filter(el => words(el) !== '');
+  if (shown.length > 1) throw new Error('both result regions have text');
+  const el = shown[0] || null;
+  return {
+    text: el ? words(el) : '',
+    state: el ? (el === status ? 'success' : 'error') : '',
+    outcome: el ? el.getAttribute('data-outcome') : '',
+    regions: box.querySelectorAll('[data-status]').length + ':' + box.querySelectorAll('[data-error]').length
+  };
 };
 const saveBtn = () => w.document.getElementById('policyUpstreamSaveBtn');
 const cardNode = () => w.document.getElementById('policyUpstreamCard');
@@ -440,32 +454,43 @@ assert.equal(savedRecord.enabled, true);
 `)
 }
 
-// TestPolicyUpstreamEditorConflictSendsNoWrite covers the read-to-write window:
-// the PUT replaces the whole record, so a list another writer changed since the
-// load is shown and the save is refused instead of silently overwriting it.
-func TestPolicyUpstreamEditorConflictSendsNoWrite(t *testing.T) {
+// TestPolicyUpstreamEditorConflictKeepsTheDraft covers the read-to-write window.
+// The PUT replaces the whole record, so a list another writer saved since the load
+// must not be overwritten. It must not be adopted into the editor either: the
+// operator's rows are work that exists nowhere else. The conflict is reported as a
+// conflict, nothing is written, and reloading is the operator's explicit choice.
+func TestPolicyUpstreamEditorConflictKeepsTheDraft(t *testing.T) {
 	runUpstreamScenario(t, `
 const stored = () => record([{address: '9.9.9.9', port: 53, transport: 'plain'}]);
 const changed = () => record([
   {address: '8.8.8.8', port: 53, transport: 'plain'},
   {address: 'dns.example.com', port: 853, transport: 'dot'}
 ]);
-let reads = 0;
+let remote = stored();
 responder = async (url, opts) => {
-  if (opts.method === 'PUT') return changed();
-  reads++;
-  return reads === 1 ? stored() : changed();
+  if (opts.method === 'PUT') throw new Error('no write may be sent on a conflict');
+  return remote;
 };
 `, `
 setField(0, 'address', '1.1.1.1');
+remote = changed(); // another tab saved a different list after this editor loaded
 assert.equal(await w.PolicyUpstreamEditor.save(), null);
 await settle();
 
 assert.equal(requestsTo('PUT').length, 0, 'a changed baseline must not be overwritten');
+assert.deepEqual(rows().map(r => r.address), ['1.1.1.1'], 'the operator rows stay in the editor, the newer list is not adopted');
+assert.equal(unsavedText(), DICT.settings_unsaved, 'the draft is still unsaved');
+assert.equal(saveBtn().disabled, false, 'the operator can still decide what to do with it');
 assert.equal(alertState().state, 'error');
+assert.equal(alertState().outcome, 'conflict', 'a conflict is reported as a conflict, not as a validation refusal or a failure');
 assert.equal(alertState().text, DICT.policy_upstream_conflict);
-assert.deepEqual(rows().map(r => r.address), ['8.8.8.8', 'dns.example.com'],
-  'the newer stored list is shown, not the refused edit');
+assert.equal(cardNode().getAttribute('aria-busy'), 'false');
+
+// Reload is the explicit way out, and it is the only thing that adopts the newer list.
+await w.PolicyUpstreamEditor.reload();
+await settle();
+assert.deepEqual(rows().map(r => r.address), ['8.8.8.8', 'dns.example.com'], 'an explicit reload shows the newer list');
+assert.equal(unsavedText(), '', 'and the card is clean because the editor now equals what is stored');
 `)
 }
 
@@ -485,6 +510,9 @@ responder = async (url, opts) => {
   return stored();
 };
 `, `
+const NEW_PIN = 'QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=';
+setField(0, 'pin', NEW_PIN);
+assert.equal(unsavedText(), DICT.settings_unsaved, 'the operator has a draft');
 assert.equal(await w.PolicyUpstreamEditor.save(), null);
 await settle();
 
@@ -494,7 +522,9 @@ assert.ok(alertState().text.indexOf(DICT.policy_upstream_echo_mismatch) !== -1,
   'the mismatch must be named, got: ' + alertState().text);
 assert.ok(alertState().text.indexOf('row 1 pin') !== -1,
   'the mismatch must name the field, got: ' + alertState().text);
-assert.equal(rows()[0].pin, '', 'the stored record is adopted as the accepted one');
+assert.equal(rows()[0].pin, NEW_PIN, 'the pin the operator entered stays in the editor: it is not stored, and it is not discarded');
+assert.equal(unsavedText(), DICT.settings_unsaved, 'a save that did not land is not clean');
+assert.equal(alertState().outcome, 'refused');
 `)
 }
 
