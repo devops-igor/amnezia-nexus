@@ -82,8 +82,18 @@ func TestValidateAcceptsEachBuiltinPreset(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Sources() for preset %q = %v", p.ID, err)
 			}
-			if len(sources) != 1 {
-				t.Fatalf("Sources() for preset %q returned %d sources, want 1", p.ID, len(sources))
+			wantSources := 1
+			if p.ID == PresetAggregate {
+				wantSources = len(AggregateSources())
+			}
+			if len(sources) != wantSources {
+				t.Fatalf("Sources() for preset %q returned %d sources, want %d", p.ID, len(sources), wantSources)
+			}
+			if p.ID == PresetAggregate {
+				if !sources[0].IsPreset || sources[0].ID != AggregateSources()[0].ID {
+					t.Errorf("aggregate first source = %+v", sources[0])
+				}
+				return
 			}
 			if sources[0].URL != p.URL {
 				t.Errorf("source URL = %q, want %q", sources[0].URL, p.URL)
@@ -434,5 +444,38 @@ func TestSettingsKeyValue(t *testing.T) {
 	// configuration, so pin it.
 	if SettingsKey != "pbr_policy" {
 		t.Fatalf("SettingsKey = %q, want %q", SettingsKey, "pbr_policy")
+	}
+}
+
+func TestSettingsAggregateAndLocalEntries(t *testing.T) {
+	settings := DefaultSettings()
+	settings.Preset = PresetAggregate
+	settings.LocalEntries = []string{"local.example", "198.51.100.0/24"}
+	if err := settings.Validate(); err != nil {
+		t.Fatalf("aggregate/local settings rejected: %v", err)
+	}
+	cfg, err := settings.SyncConfig()
+	if err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+	if len(cfg.Sources) != len(AggregateSources()) {
+		t.Fatalf("sources = %d, want %d", len(cfg.Sources), len(AggregateSources()))
+	}
+	if len(cfg.LocalRules.Domains) != 1 || len(cfg.LocalRules.CIDRs) != 1 {
+		t.Fatalf("local rules = %+v", cfg.LocalRules)
+	}
+
+	settings.LocalEntries = []string{"ozon.ru"}
+	if err := settings.Validate(); err == nil || !strings.Contains(err.Error(), "never-proxy guard") {
+		t.Fatalf("guarded local entry error = %v", err)
+	}
+}
+
+func TestSettingsAggregateCannotBeCombinedWithCustomURLs(t *testing.T) {
+	settings := DefaultSettings()
+	settings.Preset = PresetAggregate
+	settings.CustomURLs = []string{"https://lists.example/x.lst"}
+	if err := settings.Validate(); err == nil {
+		t.Fatal("aggregate + custom URLs was accepted")
 	}
 }

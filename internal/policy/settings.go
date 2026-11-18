@@ -41,9 +41,12 @@ const (
 	MaxSyncInterval = 24 * time.Hour
 	// DefaultSyncInterval is applied when the operator does not choose one.
 	DefaultSyncInterval = DefaultRefreshInterval
-	// MaxCustomURLs bounds custom sources. The Syncer accepts at most four
-	// sources in total, so a custom selection cannot exceed that budget.
+	// MaxCustomURLs bounds custom sources. The Syncer's total source budget is
+	// larger because the aggregate manifest contributes 24 reviewed sources.
 	MaxCustomURLs = 4
+	// MaxSyncSources bounds the total source list, including the aggregate
+	// manifest and the local source.
+	MaxSyncSources = 32
 )
 
 // Settings is the persisted policy-routing configuration.
@@ -61,6 +64,9 @@ type Settings struct {
 	// CustomURLs holds operator-supplied HTTPS list URLs. It is only meaningful
 	// when Preset is PresetCustom, and must be empty for a built-in preset.
 	CustomURLs []string `json:"custom_urls"`
+	// LocalEntries holds operator-supplied domain/CIDR rules merged on top of the
+	// selected external source. It is additive and works with every preset.
+	LocalEntries []string `json:"local_entries,omitempty"`
 	// SyncInterval is the refresh period in seconds.
 	SyncInterval int64 `json:"sync_interval_seconds"`
 	// UpstreamDNS is the operator-configured upstream resolver list. It is
@@ -103,6 +109,10 @@ func (s Settings) Normalize() Settings {
 		out.CustomURLs = make([]string, len(s.CustomURLs))
 		copy(out.CustomURLs, s.CustomURLs)
 	}
+	if s.LocalEntries != nil {
+		out.LocalEntries = make([]string, len(s.LocalEntries))
+		copy(out.LocalEntries, s.LocalEntries)
+	}
 	if s.UpstreamDNS != nil {
 		out.UpstreamDNS = make([]Upstream, len(s.UpstreamDNS))
 		for i, upstream := range s.UpstreamDNS {
@@ -129,7 +139,7 @@ func (s Settings) Interval() time.Duration {
 // Settings contains a slice and is therefore not comparable with ==, which is
 // why this exists rather than a comparison at each call site.
 func (s Settings) IsZero() bool {
-	return s.Preset == "" && !s.Enabled && s.SyncInterval == 0 && len(s.CustomURLs) == 0 && len(s.UpstreamDNS) == 0
+	return s.Preset == "" && !s.Enabled && s.SyncInterval == 0 && len(s.CustomURLs) == 0 && len(s.LocalEntries) == 0 && len(s.UpstreamDNS) == 0
 }
 
 // Validate reports whether the configuration may be persisted. A nil result
@@ -153,6 +163,9 @@ func (s Settings) Validate() error {
 	if err := s.validateSourceSelection(); err != nil {
 		return err
 	}
+	if err := s.validateLocalEntries(); err != nil {
+		return err
+	}
 	return s.validateUpstreams()
 }
 
@@ -174,11 +187,30 @@ func (s Settings) validateSourceSelection() error {
 	if len(s.CustomURLs) > 0 {
 		return fmt.Errorf("preset %q cannot be combined with custom URLs; select the %q preset to use them", s.Preset, PresetCustom)
 	}
+	if s.Preset == PresetAggregate {
+		for _, src := range AggregateSources() {
+			if _, err := ValidateFetchURL(src.URL); err != nil {
+				return fmt.Errorf("aggregate source %q has an unusable URL: %w", src.ID, err)
+			}
+		}
+		return nil
+	}
 	// Defense in depth: the built-in constants must still satisfy the same
 	// fetch rules the operator-supplied URLs are held to.
 	preset, _ := LookupPreset(s.Preset)
 	if _, err := ValidateFetchURL(preset.URL); err != nil {
 		return fmt.Errorf("built-in preset %q has an unusable source URL: %w", s.Preset, err)
+	}
+	return nil
+}
+
+func (s Settings) validateLocalEntries() error {
+	if len(s.LocalEntries) > 4096 {
+		return fmt.Errorf("%d local entries exceed the maximum of 4096", len(s.LocalEntries))
+	}
+	_, _, err := ParseLocalRules(s.LocalEntries)
+	if err != nil {
+		return fmt.Errorf("local entry rejected: %w", err)
 	}
 	return nil
 }
@@ -214,6 +246,9 @@ func (s Settings) validateCustomURLs() error {
 func (s Settings) Sources() ([]Source, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err
+	}
+	if s.Preset == PresetAggregate {
+		return AggregateSources(), nil
 	}
 	if s.Preset != PresetCustom {
 		preset, _ := LookupPreset(s.Preset)
@@ -253,8 +288,13 @@ func (s Settings) SyncConfig() (SyncConfig, error) {
 	if err != nil {
 		return SyncConfig{}, err
 	}
+	localRules, _, err := ParseLocalRules(s.LocalEntries)
+	if err != nil {
+		return SyncConfig{}, err
+	}
 	return SyncConfig{
 		Sources:         sources,
+		LocalRules:      localRules,
 		RefreshInterval: s.Interval(),
 		FetchLimits:     DefaultFetchLimits(),
 		ParseLimits:     DefaultParseLimits(),

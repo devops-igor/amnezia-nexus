@@ -42,6 +42,7 @@ var policySectionIDs = []string{
 	"policyAlert",
 	"policyStatusBadge",
 	"policy_enabled",
+	"policy_preset_aggregate",
 	"policy_preset_russia_inside",
 	"policy_preset_geoblock",
 	"policy_preset_antifilter_domains",
@@ -60,6 +61,8 @@ var policySectionIDs = []string{
 	"policyDirectBytes",
 	"policyProxyDrops",
 	"policyDirectDrops",
+	"policy_local_entries",
+	"policySourceStats",
 }
 
 // renderSettingsPage renders /settings for the supplied role through the real
@@ -95,6 +98,7 @@ func TestSettingsTemplatePolicyRoutingSection(t *testing.T) {
 		}
 		for _, token := range []string{
 			`name="policy_preset"`,
+			`value="aggregate"`,
 			`value="russia_inside"`,
 			`value="geoblock"`,
 			`value="antifilter_domains"`,

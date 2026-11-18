@@ -65,8 +65,8 @@ func TestSnapshotExplainDomainProvenance(t *testing.T) {
 }
 
 func TestSnapshotExplainWithoutAttribution(t *testing.T) {
-	sources := make([]SourceParsedRules, 0, 5)
-	for i := 0; i < 5; i++ {
+	sources := make([]SourceParsedRules, 0, maxSnapshotSources+1)
+	for i := 0; i <= maxSnapshotSources; i++ {
 		sources = append(sources, SourceParsedRules{
 			SourceID: string(rune('a' + i)),
 			Rules:    ParsedRules{Domains: map[string]domainFlags{"demo.example": domainInclusiveSuffix}},
@@ -86,7 +86,7 @@ func TestSnapshotExplainWithoutAttribution(t *testing.T) {
 		t.Fatalf("contributors = %v, want none beyond the provenance budget", match.Contributors)
 	}
 	if !snap.MatchDomain("demo.example") {
-		t.Error("a snapshot with more than four sources must still match")
+		t.Error("a snapshot with more than the provenance budget must still match")
 	}
 }
 
@@ -193,7 +193,7 @@ func TestGenerationSnapshotExplainsPrefixesWithoutSources(t *testing.T) {
 		SchemaVersion: SchemaVersion,
 		GenerationID:  "gen-lkg",
 		Version:       9,
-		Domains:       map[string]uint8{"blocked.example": uint8(domainInclusiveSuffix)},
+		Domains:       map[string]uint32{"blocked.example": uint32(domainInclusiveSuffix)},
 		CIDRs:         []string{"198.51.200.0/24"},
 		DomainCount:   1,
 		CIDRCount:     1,

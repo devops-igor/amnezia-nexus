@@ -82,7 +82,7 @@ func TestSyncer_AdoptBaseline(t *testing.T) {
 			Version:       3,
 			CreatedAt:     time.Now().UTC(),
 			ConfigHash:    seeder.ConfigHash(),
-			Domains:       map[string]uint8{"listed.example.com": uint8(domainExact)},
+			Domains:       map[string]uint32{"listed.example.com": uint32(domainExact)},
 		}); err != nil {
 			t.Fatalf("seed generation: %v", err)
 		}
@@ -113,7 +113,7 @@ func TestSyncer_AdoptBaseline(t *testing.T) {
 			Version:       4,
 			CreatedAt:     time.Now().UTC(),
 			ConfigHash:    seeder.ConfigHash(),
-			Domains:       map[string]uint8{"listed.example.com": uint8(domainExact)},
+			Domains:       map[string]uint32{"listed.example.com": uint32(domainExact)},
 			CIDRs:         []string{"198.51.100.0/24"},
 		}
 		if err := seeder.store.Commit(context.Background(), seeded); err != nil {

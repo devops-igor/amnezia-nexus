@@ -16,8 +16,8 @@ var documentedPresetURLs = map[PresetID]string{
 
 func TestPresetsResolveToDocumentedURLs(t *testing.T) {
 	got := Presets()
-	if len(got) != len(documentedPresetURLs) {
-		t.Fatalf("len(Presets()) = %d, want %d", len(got), len(documentedPresetURLs))
+	if len(got) != len(documentedPresetURLs)+1 {
+		t.Fatalf("len(Presets()) = %d, want %d", len(got), len(documentedPresetURLs)+1)
 	}
 
 	seen := make(map[PresetID]bool, len(got))
@@ -27,6 +27,12 @@ func TestPresetsResolveToDocumentedURLs(t *testing.T) {
 		}
 		seen[p.ID] = true
 
+		if p.ID == PresetAggregate {
+			if p.URL != "" || len(AggregateSources()) != 24 {
+				t.Errorf("aggregate preset URL=%q sources=%d, want empty URL and 24 manifest sources", p.URL, len(AggregateSources()))
+			}
+			continue
+		}
 		wantURL, ok := documentedPresetURLs[p.ID]
 		if !ok {
 			t.Errorf("undocumented preset %q exposed in catalog", p.ID)
@@ -49,6 +55,14 @@ func TestPresetsResolveToDocumentedURLs(t *testing.T) {
 func TestPresetsPassFetchURLValidation(t *testing.T) {
 	for _, p := range Presets() {
 		t.Run(string(p.ID), func(t *testing.T) {
+			if p.ID == PresetAggregate {
+				for _, src := range AggregateSources() {
+					if _, err := ValidateFetchURL(src.URL); err != nil {
+						t.Fatalf("aggregate source %q URL failed validation: %v", src.ID, err)
+					}
+				}
+				return
+			}
 			if _, err := ValidateFetchURL(p.URL); err != nil {
 				t.Fatalf("built-in preset %q URL failed validation: %v", p.ID, err)
 			}
@@ -60,6 +74,7 @@ func TestPresetsPassFetchURLValidation(t *testing.T) {
 // is fine; silent reordering is not.
 func TestPresetsOrderIsStable(t *testing.T) {
 	want := []PresetID{
+		PresetAggregate,
 		PresetRussiaInside,
 		PresetGeoblock,
 		PresetAntifilterDomains,

@@ -63,9 +63,9 @@ func attributionDigest(sources []SourceParsedRules) (string, bool) {
 	h := sha256.New()
 	for _, id := range ids {
 		rules := rulesBySource[id]
-		domains := make(map[string]uint8, len(rules.Domains))
+		domains := make(map[string]uint32, len(rules.Domains))
 		for base, flags := range rules.Domains {
-			domains[base] = uint8(flags)
+			domains[base] = uint32(flags)
 		}
 		_, _ = fmt.Fprintf(h, "S:%s:%s\n", id, ComputeContentHash(domains, canonicalPrefixStrings(rules.CIDRs)))
 	}

@@ -139,7 +139,7 @@ func TestSyncer_AttributionOnlyMoveAfterRestartOrAdoptionPublishesNewGeneration(
 			if !equalStringSet(before.CIDRs, durable.CIDRs) {
 				t.Fatalf("fixture changed the merged prefixes: %v -> %v", before.CIDRs, durable.CIDRs)
 			}
-			if !equalFlagMap(durable.Domains, map[string]uint8{
+			if !equalFlagMap(durable.Domains, map[string]uint32{
 				"shared.example.com": 1,
 				"alpha.example.com":  1,
 				"beta.example.com":   1,

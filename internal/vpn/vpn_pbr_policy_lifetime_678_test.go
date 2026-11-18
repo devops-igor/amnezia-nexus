@@ -39,7 +39,7 @@ func auditedLKGStore(t *testing.T, settings policy.Settings) *policy.FileStore {
 		t.Fatalf("SyncConfig: %v", err)
 	}
 	hash := sha256.New()
-	domains := make(map[string]uint8, 20)
+	domains := make(map[string]uint32, 20)
 	meta := make(map[string]policy.SourceMeta, len(cfg.Sources))
 	for i := 0; i < 20; i++ {
 		domains[fmt.Sprintf("seeded%d.example.com", i)] = 1
