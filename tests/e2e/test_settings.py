@@ -1,5 +1,8 @@
 """E2E tests for settings page and API."""
 
+import re
+from pathlib import Path
+
 import pytest
 from playwright.sync_api import Page
 
@@ -332,42 +335,164 @@ def test_upstream_status_ui(authenticated_page: Page, base_url: str) -> None:
     assert check_btn.is_visible()
 
 
-# Widths the settings layout is specified at: two stretched columns from 1024px,
-# one column below. 1440 and 1024 are the wide cases, 390 is the phone case.
-SETTINGS_LAYOUT_CASES = [(1440, 2), (1024, 2), (390, 1)]
+# --- Settings layout, checked against expectations derived from the design tokens
+# and the app shell, never from web/static/css/settings.css. A wrong value in that
+# sheet (a different gap, a different breakpoint, rows that stop stretching) has to
+# fail here without anyone editing an expectation.
+#
+# Measured on the pinned Chromium: two 551 px tracks at 1440 and two 343 px tracks
+# at 1024, a 24 px gap and paired cards of exactly equal height. A vertical
+# scrollbar shrinks clientWidth and the same rules then measure 548/340, so the
+# expectation is computed from clientWidth instead of being pinned to one
+# browser's viewport box.
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TOKENS_CSS = REPO_ROOT / "web" / "static" / "css" / "tokens.css"
+
+# The approved spacing values these expectations are derived from. Pinned so a
+# retuned scale is a visible edit here rather than a silent change of meaning.
+APPROVED_SPACING = {"space-md": 16, "space-lg": 24, "space-xl": 32, "sidebar-width": 250}
+
+# The button size scale: 40 px is space-xl + space-sm, 32 px is space-xl. These
+# are the only settings-sheet rules that size a legacy class, so the computed
+# style differential cannot compare them with the pre-split reference.
+APPROVED_BUTTON_HEIGHT = {"#saveBtn": 40, "#upstreamCheckBtn": 32}
+
+
+def _token_px(name: str) -> float:
+    match = re.search(rf"--{re.escape(name)}:\s*([\d.]+)px;", TOKENS_CSS.read_text(encoding="utf-8"))
+    assert match, f"token --{name} not found in tokens.css"
+    return float(match.group(1))
+
+
+# Viewport width, expected columns. 1023 and 1024 straddle the min-width
+# breakpoint, 390 and 320 are the phone cases the issue names.
+SETTINGS_LAYOUT_CASES = [(1440, 2), (1024, 2), (1023, 1), (390, 1), (320, 1)]
 SETTINGS_PROBE = """() => {
-  const cards = [...document.querySelectorAll('.settings-section-card')].map(c => {
+  const grid = document.querySelector('.settings-grid');
+  const gs = getComputedStyle(grid);
+  const main = document.querySelector('.app-main');
+  const ms = getComputedStyle(main);
+  const cards = [...grid.children].filter(c => c.classList.contains('settings-section-card')).map(c => {
     const r = c.getBoundingClientRect();
-    return {left: Math.round(r.left), top: Math.round(r.top + window.scrollY), h: Math.round(r.height)};
+    return {left: r.left, right: r.right, top: r.top + window.scrollY, bottom: r.bottom + window.scrollY, width: r.width, height: r.height};
   });
-  const rows = {};
-  cards.forEach(c => { (rows[c.top] = rows[c.top] || []).push(c.h); });
   const de = document.documentElement;
   return {
-    cards: cards.length,
-    columns: new Set(cards.map(c => c.left)).size,
-    maxRowDiff: Math.max(...Object.values(rows).map(r => Math.max(...r) - Math.min(...r))),
-    scrollWidth: de.scrollWidth,
-    clientWidth: de.clientWidth,
+    clientWidth: de.clientWidth, scrollWidth: de.scrollWidth,
+    columnGap: gs.columnGap, rowGap: gs.rowGap,
+    tracks: gs.gridTemplateColumns.split(' ').map(parseFloat),
+    gridWidth: grid.getBoundingClientRect().width,
+    mainWidth: main.getBoundingClientRect().width,
+    mainMaxWidth: parseFloat(ms.maxWidth),
+    mainPadding: [parseFloat(ms.paddingLeft), parseFloat(ms.paddingRight)],
+    cards,
   };
 }"""
 
 
+def _rows(cards: list[dict]) -> list[list[dict]]:
+    rows: dict[float, list[dict]] = {}
+    for card in cards:
+        rows.setdefault(round(card["top"], 1), []).append(card)
+    return [rows[top] for top in sorted(rows)]
+
+
+@pytest.mark.e2e
+def test_spacing_scale_is_the_approved_one() -> None:
+    """The token values the layout expectations are derived from."""
+    for name, px in APPROVED_SPACING.items():
+        assert _token_px(name) == px, f"--{name} is no longer {px}px: review the layout expectations"
+
+
 @pytest.mark.e2e
 @pytest.mark.parametrize("width,columns", SETTINGS_LAYOUT_CASES)
-def test_settings_layout_columns_and_overflow(
+def test_settings_layout_matches_token_derived_geometry(
     authenticated_page: Page, base_url: str, width: int, columns: int
 ) -> None:
-    """Cards form two equal-height columns from 1024px and one below, with no overflow."""
+    """Gap, track widths, breakpoint, row stretch and overflow from tokens and the shell."""
     page = authenticated_page
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(f"{base_url}/settings")
     page.wait_for_load_state("networkidle")
-    page.wait_for_function("document.querySelectorAll('.settings-section-card').length >= 9")
-
+    page.wait_for_function(
+        "document.querySelectorAll('.settings-grid > .settings-section-card').length >= 9"
+    )
     probe = page.evaluate(SETTINGS_PROBE)
 
-    assert probe["columns"] == columns, probe
-    # Two cards of one row never differ in height; a lone card is its own row.
-    assert probe["maxRowDiff"] == 0, probe
-    assert probe["scrollWidth"] == probe["clientWidth"], probe
+    gap = _token_px("space-lg")
+    client = probe["clientWidth"]
+    sidebar = _token_px("sidebar-width")
+    padding = _token_px("space-xl") if width >= 1024 else _token_px("space-md")
+
+    # The shell the grid sits in: the sidebar takes its own column from 1024 px
+    # and is off-canvas below it, so the main column keeps its width.
+    main_width = min(client - (sidebar if width >= 1024 else 0), probe["mainMaxWidth"])
+    content = main_width - 2 * padding
+    expected_track = (content - gap * (columns - 1)) / columns
+    assert abs(probe["mainWidth"] - main_width) <= 1, probe
+    assert [round(px) for px in probe["mainPadding"]] == [padding, padding], probe
+
+    # No document-level horizontal overflow.
+    assert probe["scrollWidth"] == client, probe
+
+    # The grid fills the main column's content box and its gap is the approved
+    # token, in both directions.
+    assert abs(probe["gridWidth"] - content) <= 1, probe
+    assert probe["columnGap"] == f"{gap:g}px", probe
+    assert probe["rowGap"] == f"{gap:g}px", probe
+
+    # One track per column, all of them equal and of the derived width.
+    assert len(probe["tracks"]) == columns, probe
+    assert len({round(track) for track in probe["tracks"]}) == 1, probe
+    for track in probe["tracks"]:
+        assert abs(track - expected_track) <= 1, (track, expected_track, probe)
+
+    rows = _rows(probe["cards"])
+    if columns == 2:
+        # The nine admin cards make four full pairs and one lone card, so an
+        # all-single layout cannot pass this case vacuously.
+        paired = [row for row in rows if len(row) == 2]
+        assert len(paired) >= 4, rows
+        for row in paired:
+            left, right = sorted(row, key=lambda card: card["left"])
+            assert abs(left["width"] - expected_track) <= 1, (row, expected_track)
+            assert abs(right["width"] - expected_track) <= 1, (row, expected_track)
+            assert abs((right["left"] - left["right"]) - gap) <= 0.5, (row, gap)
+    else:
+        assert all(len(row) == 1 for row in rows), rows
+        for row in rows:
+            assert abs(row[0]["width"] - expected_track) <= 1, (row, expected_track)
+
+    # Rows stretch: cards that share a row have the same height.
+    for row in rows:
+        heights = [card["height"] for card in row]
+        assert max(heights) - min(heights) < 0.5, heights
+
+    # Consecutive rows are one gap apart.
+    for upper, lower in zip(rows, rows[1:]):
+        distance = lower[0]["top"] - max(card["bottom"] for card in upper)
+        assert abs(distance - gap) <= 0.5, (distance, gap)
+
+
+@pytest.mark.e2e
+def test_settings_button_height_scale_uses_the_spacing_tokens(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """40 px for a card or action button, 32 px for a button inside a card."""
+    page = authenticated_page
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/settings")
+    page.wait_for_load_state("networkidle")
+    page.locator("#upstreamCheckBtn").wait_for(state="visible")
+
+    expected = {
+        "#saveBtn": _token_px("space-xl") + _token_px("space-sm"),
+        "#upstreamCheckBtn": _token_px("space-xl"),
+    }
+    assert expected == {selector: float(px) for selector, px in APPROVED_BUTTON_HEIGHT.items()}
+    for selector, px in expected.items():
+        height = page.evaluate(
+            "sel => document.querySelector(sel).getBoundingClientRect().height", selector
+        )
+        assert abs(height - px) <= 0.5, (selector, height, px)
