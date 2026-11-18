@@ -33,14 +33,16 @@ DELIBERATE: dict[tuple[str, str], str] = {}
 
 
 def settings_scripts() -> list[str]:
-    """Scripts the Settings page loads: the layout, the page shell and its sections."""
-    texts = [(WEB / "templates" / "base.html").read_text(encoding="utf-8")]
-    texts += [(WEB / "templates" / "settings.html").read_text(encoding="utf-8")]
-    texts += [
-        p.read_text(encoding="utf-8")
-        for p in sorted((WEB / "templates" / "settings").glob("*.html"))
-    ]
-    found = sorted({m for text in texts for m in _SCRIPT_SRC.findall(text)})
+    """Scripts the Settings page loads: the layout, the page shell and every partial.
+
+    Partials live in two places: templates/settings/ and the settings_*.html files
+    beside the page shell (the policy cards). Both load their own scripts.
+    """
+    templates = WEB / "templates"
+    files = [templates / "base.html", templates / "settings.html"]
+    files += sorted(templates.glob("settings_*.html"))
+    files += sorted((templates / "settings").glob("*.html"))
+    found = sorted({m for f in files for m in _SCRIPT_SRC.findall(f.read_text(encoding="utf-8"))})
     assert found, "no script found in the Settings templates"
     return found
 
@@ -54,10 +56,17 @@ def inline_muted_lines(script: str) -> list[tuple[int, str]]:
     ]
 
 
-def test_the_scan_sees_the_gigahost_renderers() -> None:
+def test_the_scan_sees_every_script_the_page_loads() -> None:
     scripts = settings_scripts()
-    assert "gigahost_order_status.js" in scripts
-    assert "gigahost_setup_intents.js" in scripts
+    for name in (
+        "gigahost_order_status.js",
+        "gigahost_setup_intents.js",  # templates/settings/ and the shell
+        "policy_routing.js",  # a settings_*.html partial
+        "policy_upstream.js",
+        "policy_client_diag.js",
+        "ui.js",  # the layout
+    ):
+        assert name in scripts, name
 
 
 def test_no_settings_script_paints_text_in_the_muted_colour_inline() -> None:
