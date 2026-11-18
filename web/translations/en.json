@@ -903,7 +903,7 @@
   "policy_upstream_save_refused": "The editor was reloaded from the stored configuration.",
   "policy_upstream_load_failed": "Could not read the stored resolver list",
   "policy_upstream_not_ready": "Saving waits for the stored resolver list to load.",
-  "policy_upstream_conflict": "Another change replaced the resolver list. The newer list is shown; save again to apply your edit.",
+  "policy_upstream_conflict": "Another change replaced the resolver list. Your edits are still in the editor and are not saved. Use Reload to see the newer list; that discards your edits.",
   "policy_upstream_echo_mismatch": "The server stored a different resolver list than the one sent",
   "policy_upstream_state_inconsistent": "Stored and running policy may disagree",
   "policy_upstream_port_required": "Plain DNS needs an explicit port.",

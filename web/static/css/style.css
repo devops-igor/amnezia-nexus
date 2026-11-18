@@ -3170,6 +3170,13 @@ th.sortable[aria-sort="none"] .sort-icon-desc {
     overflow: hidden;
 }
 
+/* The policy cards keep their result wrapper above the form. It takes no space
+   while both regions are empty, and the spacing the banner used to carry while one
+   has text. */
+.settings-result > .settings-notice:not(:empty) {
+    margin-bottom: var(--space-md);
+}
+
 .settings-immediate {
     font-weight: 600;
 }

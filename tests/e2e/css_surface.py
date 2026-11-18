@@ -31,7 +31,7 @@ SETTINGS_SURFACE_CLASSES = frozenset({
     "settings-immediate", "settings-notice-danger", "settings-notice-icon",
     "settings-notice-spaced", "settings-notice-success",
     "settings-notice-warning", "settings-offset", "settings-row",
-    "settings-row-card", "settings-source-stats", "settings-stack",
+    "settings-result", "settings-row-card", "settings-source-stats", "settings-stack",
     "settings-stack-sm", "settings-subsection",
     "settings-subsection-header", "settings-subsection-spaced",
     "settings-subsection-title", "settings-toolbar",

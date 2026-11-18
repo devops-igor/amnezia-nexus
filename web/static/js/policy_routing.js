@@ -212,39 +212,22 @@
             .filter(function (line) { return line.length > 0; });
     }
 
-    // setPolicyAlert renders one inline banner. An empty message empties it, so a
-    // recovered action clears a previous failure instead of leaving stale text.
-    // The banner is never hidden: a live region is announced reliably only when
-    // it was in the accessibility tree before its text changed. A failure is an
-    // alert (assertive) and anything else a status (polite), so the two are told
-    // apart by role as well as by wording.
+    // setPolicyAlert reports into the card's own two regions, the same ones every
+    // other card has: a success goes to the status region and anything else to the
+    // alert region, each with a role that never changes. An empty message clears
+    // both, so a recovered action does not leave a stale failure behind. The
+    // #policyAlert wrapper only carries the state for readers that look at it.
     function setPolicyAlert(kind, message) {
-        var banner = policyElement('policyAlert');
-        if (!banner) {
+        var cards = root.SettingsCards;
+        if (!cards) {
             return;
         }
         if (!message) {
-            banner.textContent = '';
-            banner.setAttribute('data-state', '');
-            banner.style.background = '';
-            banner.style.border = '';
-            banner.style.color = '';
+            cards.clearReport('policyRoutingCard');
             return;
         }
-        var failure = kind !== 'success';
-        banner.setAttribute('role', failure ? 'alert' : 'status');
-        banner.setAttribute('aria-live', failure ? 'assertive' : 'polite');
-        // Theme tokens, not literals: --success-bg/--danger-bg already carry the
-        // light and dark variants. The message keeps the primary text colour
-        // because --danger is tuned for dark surfaces and measures 3.2:1 on the
-        // light theme's card, under the 4.5:1 minimum for this text size. The
-        // state is still carried by the tint, the border and the wording rather
-        // than by colour alone.
-        banner.style.background = failure ? 'var(--danger-bg)' : 'var(--success-bg)';
-        banner.style.border = failure ? '1px solid var(--danger-border)' : '1px solid var(--success-border)';
-        banner.style.color = 'var(--text-primary)';
-        banner.setAttribute('data-state', kind);
-        banner.textContent = message;
+        cards.report('policyRoutingCard', kind === 'success' ? 'success' : 'error', message,
+            kind === 'success' ? 'saved' : 'refused');
     }
 
     function setPolicyBusy(role, busy) {
@@ -571,6 +554,23 @@
         };
     }
 
+    // classifyPolicy turns what a request threw into the outcome the card module
+    // understands: a refusal has a status from the server, a dropped request has none.
+    function classifyPolicy(err) {
+        var answered = err && typeof err.status === 'number' && err.status > 0;
+        var detail = policyErrorDetail(err);
+        var text = policyText('policy_save_failed') + ': ' + detail;
+        // Two sentences in one banner: the server's detail does not always end
+        // with a stop, and without one the refusal reads as a run-on sentence.
+        if (!/[.!?\u2026]$/.test(detail)) {
+            text += '.';
+        }
+        return {
+            outcome: answered ? 'refused' : 'failed',
+            message: text + ' ' + policyText('policy_save_kept')
+        };
+    }
+
     async function savePolicySettings() {
         if (!policyReady) {
             // Nothing may be persisted before the stored record has been read: the
@@ -585,23 +585,34 @@
         inFlight.save = true;
         var seq = ++requestSeq;
         var cards = root.SettingsCards;
-        var sent = cards ? cards.capture('policyRoutingCard') : null;
-        var payload = policySavePayload();
-        setPolicyBusy('save', true);
-        setPolicyAlert('', '');
+        var saved = null;
         try {
-            var saved = await policyRequest(POLICY_ENDPOINT, { method: 'PUT', body: payload });
-            // The accepted write owns the form from now on: a read issued before it
-            // must not replace it when it lands later.
-            lastAcceptedMutation = seq;
-            if (sent && cards.changedSince('policyRoutingCard', sent)) {
-                // The operator kept typing while the request was in flight. What
-                // was sent is stored and becomes the saved state; the newer input
-                // stays on screen and stays marked unsaved.
-                applyPolicyRecord(saved, true);
-                cards.rebase('policyRoutingCard', sent);
-            } else {
-                applyPolicyRecord(saved);
+            var settled = await cards.submit('policyRoutingCard', function () {
+                var payload = policySavePayload();
+                setPolicyAlert('', '');
+                return policyRequest(POLICY_ENDPOINT, { method: 'PUT', body: payload }).then(function (answer) {
+                    // The accepted write owns the form from now on: a read issued
+                    // before it must not replace it when it lands later.
+                    lastAcceptedMutation = seq;
+                    saved = answer;
+                    // Remembered either way; the fields are replaced only by the
+                    // card module, and only when nothing was typed meanwhile.
+                    applyPolicyRecord(answer, true);
+                    return {
+                        outcome: 'saved',
+                        message: policyText('policy_saved'),
+                        reconcile: function () { applyPolicyRecord(answer); }
+                    };
+                }, classifyPolicy);
+            });
+            if (settled.outcome !== 'saved') {
+                // The refused edits were never stored, so they stay in the form and
+                // the card stays marked unsaved. Only what the server is running is
+                // refreshed, by a read that never touches the form. If that read
+                // fails the last observation stays on screen, and it is never turned
+                // into stored intent shown as a runtime "enabled".
+                await refreshPolicyStatus();
+                return null;
             }
             renderPolicyStatus(saved, policyRuntimeSnapshot(saved));
             try {
@@ -610,28 +621,9 @@
             } catch (statsErr) {
                 // Leave the last known counters in place rather than showing zeroes.
             }
-            setPolicyAlert('success', policyText('policy_saved'));
             return saved;
-        } catch (err) {
-            var detail = policyErrorDetail(err);
-            var refusal = policyText('policy_save_failed') + ': ' + detail;
-            // Two sentences in one banner: the server's detail does not always end
-            // with a stop, and without one the refusal reads as a run-on sentence.
-            if (!/[.!?…]$/.test(detail)) {
-                refusal += '.';
-            }
-            setPolicyAlert('error', refusal + ' ' + policyText('policy_save_kept'));
-            // The refused edits were never stored, so they stay in the form and the
-            // card stays marked unsaved: reloading the last accepted record here
-            // would discard them and then report the card as clean. Only what the
-            // server is running is refreshed, from a separate read. If that read
-            // fails the last observation stays on screen, and it is never turned
-            // into stored intent shown as a runtime "enabled".
-            await refreshPolicyStatus();
-            return null;
         } finally {
             inFlight.save = false;
-            setPolicyBusy('save', false);
         }
     }
 

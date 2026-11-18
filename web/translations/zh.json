@@ -903,7 +903,7 @@
   "policy_upstream_save_refused": "编辑器已按已保存的配置重新加载。",
   "policy_upstream_load_failed": "无法读取已保存的解析器列表",
   "policy_upstream_not_ready": "保存将等待已保存的解析器列表加载完成。",
-  "policy_upstream_conflict": "另一处修改替换了解析器列表。已显示较新的列表；请再次保存以应用你的修改。",
+  "policy_upstream_conflict": "解析器列表已被其他更改替换。您的修改仍保留在编辑器中，尚未保存。使用“重新加载”可查看新列表，但这会丢弃您的修改。",
   "policy_upstream_echo_mismatch": "服务器保存的解析器列表与发送的不一致",
   "policy_upstream_state_inconsistent": "已保存的策略与正在运行的策略可能不一致",
   "policy_upstream_port_required": "明文 DNS 需要显式端口。",

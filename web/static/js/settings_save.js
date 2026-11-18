@@ -163,48 +163,45 @@
         });
     }
 
-    function succeed(key, body, sent) {
-        var card = cardNode(key);
+    // classify turns what a request threw into the outcome the card module
+    // understands. A refusal carries a status from the server; a request that
+    // never got an answer has none.
+    function classify(err) {
+        var answered = err && typeof err.status === 'number' && err.status > 0;
+        return { outcome: answered ? 'refused' : 'failed', message: failure(err) };
+    }
+
+    // afterStored is what only this module knows to do once a card's section is
+    // stored, whether or not the operator kept typing: the shell shows the new
+    // title, and a language change is the one save that leaves the page. The move
+    // is decided against the language that was loaded before this save.
+    function afterStored(key, body) {
         var move = languageChanged(key, body);
         if (key === 'appearance') {
             loadedLanguage = body.appearance.language;
             showAppearance(body.appearance);
         }
-        if (cards().changedSince(card, sent)) {
-            // The operator kept typing while the request was in flight. What was
-            // sent is saved; what is on screen now is not, and must stay marked.
-            cards().rebase(card, sent);
-        } else {
-            resetSecrets(card);
-            cards().rebase(card);
-        }
-        cards().report(card, 'success', tr('settings_saved'));
-        // Only a document load re-renders the dictionary, so a language change is
-        // the one save that leaves the page. Every other save stays where it is.
         if (move) {
             root.setTimeout(function () { api.navigate('/settings'); }, NAVIGATE_DELAY_MS);
         }
     }
 
-    async function run(key) {
+    function run(key) {
         var card = cardNode(key);
-        if (!card || !collectors[key]) return false;
-        cards().clearReport(card);
-        cards().busy(card, true);
-        try {
+        if (!card || !collectors[key]) return Promise.resolve(false);
+        return cards().submit(card, function () {
             var body = buildBody(key);
-            var sent = cards().capture(card);
-            try {
-                await root.API.post(SAVE_URL, body, { silent: true });
-            } catch (err) {
-                cards().report(card, 'error', failure(err));
-                return false;
-            }
-            succeed(key, body, sent);
-            return true;
-        } finally {
-            cards().busy(card, false);
-        }
+            return root.API.post(SAVE_URL, body, { silent: true }).then(function () {
+                afterStored(key, body);
+                return {
+                    outcome: 'saved',
+                    message: tr('settings_saved'),
+                    // Only when nothing was typed meanwhile: secrets go back to their
+                    // masks, which is what a fresh load shows.
+                    reconcile: function () { resetSecrets(card); }
+                };
+            }, classify);
+        }).then(function (settled) { return settled.outcome === 'saved'; });
     }
 
     // commit queues one card's save behind any save already running.

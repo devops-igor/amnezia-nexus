@@ -903,7 +903,7 @@
   "policy_upstream_save_refused": "L'éditeur a été rechargé depuis la configuration enregistrée.",
   "policy_upstream_load_failed": "Impossible de lire la liste des résolveurs enregistrée",
   "policy_upstream_not_ready": "L'enregistrement attend le chargement de la liste des résolveurs enregistrée.",
-  "policy_upstream_conflict": "Une autre modification a remplacé la liste des résolveurs. La liste la plus récente est affichée ; enregistrez à nouveau pour appliquer votre modification.",
+  "policy_upstream_conflict": "Une autre modification a remplacé la liste des résolveurs. Vos modifications restent dans l’éditeur et ne sont pas enregistrées. Utilisez Recharger pour voir la nouvelle liste ; cela supprime vos modifications.",
   "policy_upstream_echo_mismatch": "Le serveur a enregistré une liste de résolveurs différente de celle envoyée",
   "policy_upstream_state_inconsistent": "La politique enregistrée et la politique active peuvent diverger",
   "policy_upstream_port_required": "Le DNS en clair exige un port explicite.",

@@ -158,12 +158,25 @@
         };
     }
 
-    // keepNewerEdits settles a save when the operator kept editing while the
-    // request was in flight. What was sent is stored; what is on screen now is
-    // not, so the form is left alone and only the saved baseline moves to the
-    // sent values. A token field that still holds what was sent is emptied, as
-    // after any save, because the secret is write-only.
-    function keepNewerEdits(saved, sent, body) {
+    // classify turns what a request threw into the outcome the card module
+    // understands: a refusal has a status from the server, a dropped request has none.
+    function classify(err) {
+        var answered = err && typeof err.status === 'number' && err.status > 0;
+        return { outcome: answered ? 'refused' : 'failed', message: (err && err.message) || String(err) };
+    }
+
+    // storeAnswer is what is applied to the form after a save, and only when nothing
+    // was typed while the request ran: the stored record is the source of truth, so
+    // masked values and the attempts limit come back from it.
+    function storeAnswer(saved) {
+        renderSettings(saved || {});
+    }
+
+    // noteStored records the parts of the answer that are not on screen, whether or
+    // not the form is replaced: whether a token is stored, the attempts limit, and a
+    // token field that still holds what was sent is emptied, because the secret is
+    // write-only.
+    function noteStored(saved, body) {
         state.tokenSet = !!saved.app_token_set;
         state.maxAttempts = saved.max_attempts || state.maxAttempts;
         var token = byId('notifications_token');
@@ -171,29 +184,44 @@
             if (token.value.trim() === body.app_token) token.value = '';
             token.placeholder = state.tokenSet ? '********' : '';
         }
-        root.SettingsCards.rebase(CARD, sent);
     }
 
     async function save(silent) {
         if (!state.loaded || state.saving) return false;
         state.saving = true;
+        try {
+            if (!root.SettingsCards) return await saveWithoutCards(silent);
+            var settled = await root.SettingsCards.submit(CARD, function () {
+                var body = collect();
+                return root.API.post('/api/notifications/settings', body, { silent: true }).then(function (saved) {
+                    noteStored(saved || {}, body);
+                    return {
+                        outcome: 'saved',
+                        message: translate('settings_saved', 'Settings saved'),
+                        quiet: !!silent,
+                        reconcile: function () { storeAnswer(saved); }
+                    };
+                }, classify);
+            });
+            return settled.outcome === 'saved';
+        } finally {
+            state.saving = false;
+        }
+    }
+
+    // saveWithoutCards is the page that did not load the card module: the same
+    // request and the same toast fallback as before, with nothing staged to keep.
+    async function saveWithoutCards(silent) {
         cardBusy(true);
         try {
-            var sent = root.SettingsCards ? root.SettingsCards.capture(CARD) : null;
-            var body = collect();
-            var saved = await root.API.post('/api/notifications/settings', body, { silent: true });
-            if (sent && root.SettingsCards.changedSince(CARD, sent)) {
-                keepNewerEdits(saved || {}, sent, body);
-            } else {
-                renderSettings(saved || {});
-            }
+            var saved = await root.API.post('/api/notifications/settings', collect(), { silent: true });
+            renderSettings(saved || {});
             if (!silent) cardReport('success', translate('settings_saved', 'Settings saved'));
             return true;
         } catch (err) {
             cardReport('error', err.message || String(err));
             return false;
         } finally {
-            state.saving = false;
             cardBusy(false);
         }
     }

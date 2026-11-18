@@ -21,7 +21,7 @@
 
     <p class="form-hint">{{ _ "policy_upstream_intro" }}</p>
 
-    <div id="policyUpstreamAlert" role="status" aria-live="polite" aria-atomic="true" class="settings-notice settings-notice-spaced"></div>
+    <div id="policyUpstreamAlert" class="settings-result" data-result data-state="">{{ template "settings_feedback" . }}</div>
 
     <form id="policyUpstreamForm" data-upstream-ready="false">
         <p class="form-hint" id="policyUpstreamLimitNote">{{ _ "policy_upstream_limit_note" }}</p>

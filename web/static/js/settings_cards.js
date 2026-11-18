@@ -33,10 +33,29 @@
  * validation checks. This module is the only writer of the commit's disabled
  * property.
  *
- * Busy. While a commit runs the card is aria-busy and its commit control is
- * disabled. Disabling a focused control drops keyboard focus, so when the
- * operation ends focus that was inside the card is put back on the control that
- * held it, or on the card heading when that control is gone or still disabled.
+ * One lifecycle. Every card commits through submit(card, work). A controller
+ * supplies only the request and classifies what came back; this module owns what
+ * must be the same everywhere, so it cannot differ from card to card:
+ *
+ *   saved     the draft that was sent is the saved state. If the operator typed
+ *             more while the request ran, only the sent part is saved and the
+ *             rest stays on screen, marked unsaved.
+ *   refused   the server answered with a refusal      } the draft and its
+ *   failed    no answer arrived (transport)            } baseline are never
+ *   conflict  the stored state changed under the draft } touched, and the card
+ *                                                        stays marked unsaved.
+ *
+ * Busy is set before the request and cleared on every terminal outcome. A second
+ * submit while one runs is ignored. Exactly one status region and one alert
+ * region exist per card, at most one has text, and an outcome is written to the
+ * region that matches it.
+ *
+ * Focus. Disabling a focused control drops keyboard focus. When the operation
+ * ends, focus is put back only if the operation lost it: the active element is
+ * the body, or a disabled control inside the submitting card. It goes to the
+ * control that held it, or the card heading when that control is gone. Focus that
+ * the operator moved to any other control, in this card or another, is never
+ * touched.
  */
 (function (root) {
     'use strict';
@@ -150,8 +169,13 @@
     function hideReport(card) {
         ['[data-status]', '[data-error]'].forEach(function (selector) {
             var region = part(card, selector);
-            if (region) setText(region, '');
+            if (region) {
+                setText(region, '');
+                region.removeAttribute('data-outcome');
+            }
         });
+        var box = part(card, '[data-result]');
+        if (box) box.setAttribute('data-state', '');
     }
 
     function onEdit(event) {
@@ -240,12 +264,20 @@
         return !!node && node.isConnected && !node.disabled;
     }
 
-    // restoreFocus puts back focus the operation may have dropped: on the control
-    // that held it, or the card heading when that control is gone or disabled.
-    function restoreFocus(card, held) {
-        if (!held) return;
+    // lostFocus tells whether the operation itself took focus away: nothing has
+    // it, or it sits on a control of the submitting card that is now disabled.
+    // Focus on any enabled control, in this card or another, was put there by the
+    // operator and is theirs.
+    function lostFocus(card) {
         var active = root.document.activeElement;
-        if (active && active !== root.document.body && focusable(active) && card.contains(active)) return;
+        if (!active || active === root.document.body) return true;
+        return card.contains(active) && !!active.disabled;
+    }
+
+    // restoreFocus puts focus back only when the operation lost it, on the control
+    // that held it or, when that is gone or disabled, the card heading.
+    function restoreFocus(card, held) {
+        if (!held || !lostFocus(card)) return;
         var target = focusable(held) ? held : part(card, '.card-title');
         if (target && typeof target.focus === 'function') target.focus();
     }
@@ -286,7 +318,7 @@
 
     // report writes the outcome of a commit into the card that made it. Success
     // fades after a few seconds; a failure stays until the operator edits again.
-    function report(card, kind, message) {
+    function report(card, kind, message, outcome) {
         var found = stateFor(card);
         if (!found) return false;
         var state = found.state;
@@ -295,6 +327,9 @@
         var region = part(found.card, kind === 'success' ? '[data-status]' : '[data-error]');
         if (!region) return false;
         region.textContent = message;
+        region.setAttribute('data-outcome', outcome || (kind === 'success' ? 'saved' : 'failed'));
+        var box = part(found.card, '[data-result]');
+        if (box) box.setAttribute('data-state', kind === 'success' ? 'success' : 'error');
         state.reporting = true;
         if (kind === 'success') {
             state.timer = root.setTimeout(function () {
@@ -303,6 +338,72 @@
             }, STATUS_MS);
         }
         return true;
+    }
+
+    // OUTCOMES lists what a controller may return from its work. Anything else is
+    // treated as a failure, so a controller that forgets to classify cannot make a
+    // card look saved.
+    var OUTCOMES = { saved: 1, refused: 1, failed: 1, conflict: 1 };
+
+    // submit runs one commit for a card and settles it the same way for every
+    // controller. work() resolves to { outcome, message, reconcile }:
+    //   saved     reconcile() may apply the server's answer to the form when
+    //             nothing was typed meanwhile; the saved state moves to what was
+    //             sent either way. quiet: true suppresses the status text.
+    //   refused / failed / conflict   the draft and its baseline are untouched.
+    // work() builds its request from the form when it is called, which is the same
+    // step as the snapshot. A throw is a failure. It always clears busy and always reports, and never
+    // reports success unless work() said saved.
+    function submit(card, work) {
+        var found = stateFor(card);
+        if (!found) return Promise.resolve({ outcome: 'failed', ran: false });
+        var state = found.state;
+        if (state.busy) return Promise.resolve({ outcome: 'failed', ran: false });
+        clearReport(found.card);
+        busy(found.card, true);
+        // The snapshot is taken in the same synchronous step that calls work(), so
+        // what work() reads from the form to build its request and what counts as
+        // "sent" are the same instant. Nothing can be typed between the two.
+        var sent = snapshot(found.card, false);
+        var started;
+        try {
+            started = Promise.resolve(work());
+        } catch (err) {
+            started = Promise.reject(err);
+        }
+        return started.then(function (result) {
+            return result || { outcome: 'failed', message: tr('error') };
+        }, function (err) {
+            return { outcome: 'failed', message: (err && err.message) || tr('error') };
+        }).then(function (result) {
+            var outcome = OUTCOMES[result.outcome] ? result.outcome : 'failed';
+            try {
+                if (outcome === 'saved') {
+                    settleSaved(found.card, sent, result);
+                } else {
+                    report(found.card, 'error', result.message || tr('error'), outcome);
+                }
+            } finally {
+                busy(found.card, false);
+            }
+            return { outcome: outcome, ran: true, result: result };
+        });
+    }
+
+    // settleSaved moves the saved state to what was sent. If the operator kept
+    // typing, the form is left alone and what they typed stays marked unsaved;
+    // otherwise the controller may apply the server's answer to the form first.
+    function settleSaved(card, sent, result) {
+        if (differs(card, sent)) {
+            rebase(card, sent);
+        } else {
+            if (typeof result.reconcile === 'function') result.reconcile();
+            rebase(card);
+        }
+        // A controller that saves as a step of something else (a test that saves
+        // first) passes quiet and reports its own result, so the card does not
+        // announce a save the operator did not ask for.
+        if (!result.quiet) report(card, 'success', result.message || tr('settings_saved'), 'saved');
     }
 
     function clearReport(card) {
@@ -329,6 +430,7 @@
         isBusy: isBusy,
         gate: gate,
         report: report,
+        submit: submit,
         clearReport: clearReport
     };
 

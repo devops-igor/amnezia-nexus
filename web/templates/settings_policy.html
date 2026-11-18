@@ -22,7 +22,7 @@
         <span id="policyStatusBadge" class="badge badge-secondary">{{ _ "policy_status_disabled" }}</span>
     </div>
 
-    <div id="policyAlert" role="status" aria-live="polite" aria-atomic="true" class="settings-notice settings-notice-spaced"></div>
+    <div id="policyAlert" class="settings-result" data-result data-state="">{{ template "settings_feedback" . }}</div>
 
     <form id="policyRoutingForm">
         <div class="form-group">
