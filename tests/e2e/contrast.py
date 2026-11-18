@@ -4,6 +4,7 @@ Deliberately free of Playwright imports so the offline suite can import it.
 Everything here is derived from web/static/css/tokens.css; no colour is pinned
 in a test, so a palette change that breaks AA fails the assertion that uses it.
 """
+
 from __future__ import annotations
 
 import re
@@ -38,7 +39,12 @@ def parse_color(value: str) -> tuple[float, float, float, float]:
     hexed = _HEX_RE.match(value)
     if hexed:
         digits = hexed.group(1)
-        return float(int(digits[0:2], 16)), float(int(digits[2:4], 16)), float(int(digits[4:6], 16)), 1.0
+        return (
+            float(int(digits[0:2], 16)),
+            float(int(digits[2:4], 16)),
+            float(int(digits[4:6], 16)),
+            1.0,
+        )
     rgba = _RGBA_RE.match(value)
     if rgba:
         r, g, b, a = rgba.groups()

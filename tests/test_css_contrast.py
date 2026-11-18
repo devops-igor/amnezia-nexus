@@ -14,7 +14,6 @@ measuring by eye.
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 import pytest
 
@@ -47,7 +46,9 @@ _COLOR_RE = re.compile(r"(?<![-\w])color:\s*([^;]+);")
 
 
 def _css(name: str) -> str:
-    return re.sub(r"/\*.*?\*/", "", (CSS_DIR / f"{name}.css").read_text(encoding="utf-8"), flags=re.S)
+    return re.sub(
+        r"/\*.*?\*/", "", (CSS_DIR / f"{name}.css").read_text(encoding="utf-8"), flags=re.S
+    )
 
 
 def declared_color(css: str, selector: str) -> str:
@@ -93,7 +94,9 @@ def test_informative_text_meets_aa_on_every_surface(theme: str, selector: str) -
 
 
 @pytest.mark.parametrize("theme,expected", [("dark", 2.95), ("light", 2.56)])
-def test_muted_token_is_still_the_failing_one_the_fix_moves_away_from(theme: str, expected: float) -> None:
+def test_muted_token_is_still_the_failing_one_the_fix_moves_away_from(
+    theme: str, expected: float
+) -> None:
     """Calibrates the arithmetic against the ratios issue 902 measured for --text-muted.
 
     If this drifts the contrast helper is wrong, and every pass above is suspect.
