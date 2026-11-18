@@ -71,6 +71,7 @@ func TestEmbeddedStaticAndTemplates(t *testing.T) {
 		"css/tables.css",
 		"css/server.css",
 		"css/vpn.css",
+		"css/settings.css",
 		"js/qrcode.min.js",
 		"js/api.js",
 		"js/captcha.js",
@@ -622,6 +623,7 @@ var canonicalStylesheetOrder = []string{
 	"tables",
 	"server",
 	"vpn",
+	"settings",
 }
 
 var (
@@ -695,7 +697,7 @@ func TestStyleCSSConcatenationParity(t *testing.T) {
 	}
 
 	if concatenated.String() != string(styleData) {
-		t.Fatal("style.css does not match concatenation of the 7 modular stylesheets")
+		t.Fatal("style.css does not match concatenation of the 8 modular stylesheets")
 	}
 }
 
@@ -739,6 +741,7 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			<link rel="stylesheet" href="/static/css/tables.css">
 			<link rel="stylesheet" href="/static/css/server.css">
 			<link rel="stylesheet" href="/static/css/vpn.css">
+			<link rel="stylesheet" href="/static/css/settings.css">
 		`
 		extracted := extractActiveStylesheetOrder(sample)
 		if slices.Equal(canonicalStylesheetOrder, extracted) {
@@ -758,6 +761,7 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			<link rel="stylesheet" href="/static/css/tables.css">
 			<link rel="stylesheet" href="/static/css/server.css">
 			<link rel="stylesheet" href="/static/css/vpn.css">
+			<link rel="stylesheet" href="/static/css/settings.css">
 		`
 		extracted := extractActiveStylesheetOrder(sample)
 		if slices.Equal(canonicalStylesheetOrder, extracted) {
@@ -777,6 +781,7 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			<link rel="stylesheet" href="/static/css/tables.css">
 			<link rel="stylesheet" href="/static/css/server.css">
 			<link rel="stylesheet" href="/static/css/vpn.css">
+			<link rel="stylesheet" href="/static/css/settings.css">
 		`
 		extracted := extractActiveStylesheetOrder(sample)
 		if slices.Equal(canonicalStylesheetOrder, extracted) {
@@ -796,6 +801,7 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			<link rel="stylesheet" href="/static/css/tables.css">
 			<link rel="stylesheet" href="/static/css/server.css">
 			<link rel="stylesheet" href="/static/css/vpn.css">
+			<link rel="stylesheet" href="/static/css/settings.css">
 		`
 		extracted := extractActiveStylesheetOrder(sample)
 		if slices.Equal(canonicalStylesheetOrder, extracted) {
@@ -815,6 +821,7 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			<link rel="stylesheet" href="/static/css/tables.css">
 			<link rel="stylesheet" href="/static/css/server.css">
 			<link rel="stylesheet" href="/static/css/vpn.css">
+			<link rel="stylesheet" href="/static/css/settings.css">
 		`
 		extracted := extractActiveStylesheetOrder(sample)
 		if slices.Equal(canonicalStylesheetOrder, extracted) {
@@ -832,6 +839,7 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			<link rel="stylesheet" href="/static/css/tables.css">
 			<link rel="stylesheet" href="/static/css/server.css">
 			<link rel="stylesheet" href="/static/css/vpn.css">
+			<link rel="stylesheet" href="/static/css/settings.css">
 		`
 		extracted := extractActiveStylesheetOrder(sample)
 		if !slices.Equal(canonicalStylesheetOrder, extracted) {
@@ -848,6 +856,7 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			<link rel='stylesheet' href='/static/css/tables.css'>
 			<link rel="stylesheet" href="/static/css/server.css">
 			<link rel='stylesheet' href='/static/css/vpn.css'>
+			<link rel='stylesheet' href='/static/css/settings.css'>
 		`
 		extracted := extractActiveStylesheetOrder(sample)
 		if !slices.Equal(canonicalStylesheetOrder, extracted) {

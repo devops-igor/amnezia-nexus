@@ -1,5 +1,8 @@
 """E2E tests for settings page and API."""
 
+import re
+from pathlib import Path
+
 import pytest
 from playwright.sync_api import Page
 
@@ -330,3 +333,250 @@ def test_upstream_status_ui(authenticated_page: Page, base_url: str) -> None:
     page.wait_for_load_state("networkidle")
     assert len(page_errors) == 0
     assert check_btn.is_visible()
+
+
+# --- Settings layout, checked against expectations derived from the design tokens
+# and the app shell, never from web/static/css/settings.css. A wrong value in that
+# sheet (a different gap, a different breakpoint, rows that stop stretching) has to
+# fail here without anyone editing an expectation.
+#
+# Measured on the pinned Chromium: two 551 px tracks at 1440 and two 343 px tracks
+# at 1024, a 24 px gap and paired cards of exactly equal height. A vertical
+# scrollbar shrinks clientWidth and the same rules then measure 548/340, so the
+# expectation is computed from clientWidth instead of being pinned to one
+# browser's viewport box.
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TOKENS_CSS = REPO_ROOT / "web" / "static" / "css" / "tokens.css"
+
+# The approved spacing values these expectations are derived from. Pinned so a
+# retuned scale is a visible edit here rather than a silent change of meaning.
+APPROVED_SPACING = {
+    "space-sm": 8,
+    "space-md": 16,
+    "space-lg": 24,
+    "space-xl": 32,
+    "sidebar-width": 250,
+}
+
+
+def _token_px(name: str) -> float:
+    match = re.search(rf"--{re.escape(name)}:\s*([\d.]+)px;", TOKENS_CSS.read_text(encoding="utf-8"))
+    assert match, f"token --{name} not found in tokens.css"
+    return float(match.group(1))
+
+
+# Viewport width, expected columns. 1023 and 1024 straddle the min-width
+# breakpoint, 390 and 320 are the phone cases the issue names.
+SETTINGS_LAYOUT_CASES = [(1440, 2), (1024, 2), (1023, 1), (390, 1), (320, 1)]
+SETTINGS_PROBE = """() => {
+  const grid = document.querySelector('.settings-grid');
+  const gs = getComputedStyle(grid);
+  const main = document.querySelector('.app-main');
+  const ms = getComputedStyle(main);
+  const cards = [...grid.children].filter(c => c.classList.contains('settings-section-card')).map(c => {
+    const r = c.getBoundingClientRect();
+    return {left: r.left, right: r.right, top: r.top + window.scrollY, bottom: r.bottom + window.scrollY, width: r.width, height: r.height};
+  });
+  const de = document.documentElement;
+  return {
+    clientWidth: de.clientWidth, scrollWidth: de.scrollWidth,
+    columnGap: gs.columnGap, rowGap: gs.rowGap,
+    tracks: gs.gridTemplateColumns.split(' ').map(parseFloat),
+    gridWidth: grid.getBoundingClientRect().width,
+    mainWidth: main.getBoundingClientRect().width,
+    mainMaxWidth: parseFloat(ms.maxWidth),
+    mainPadding: [parseFloat(ms.paddingLeft), parseFloat(ms.paddingRight)],
+    cards,
+  };
+}"""
+
+
+def _rows(cards: list[dict]) -> list[list[dict]]:
+    rows: dict[float, list[dict]] = {}
+    for card in cards:
+        rows.setdefault(round(card["top"], 1), []).append(card)
+    return [rows[top] for top in sorted(rows)]
+
+
+def _geometry(client: float, columns: int, max_width: float) -> dict[str, float]:
+    """Content width and track width of a columns-wide grid inside the app shell.
+
+    Derived from the shell and the spacing scale, never from settings.css: from
+    1024 px the sidebar is in flow and the main column is padded by --space-xl,
+    below it the sidebar is off-canvas and the padding is --space-md.
+    """
+    gap = _token_px("space-lg")
+    sidebar = _token_px("sidebar-width") if columns == 2 else 0.0
+    padding = _token_px("space-xl") if columns == 2 else _token_px("space-md")
+    main = min(client - sidebar, max_width)
+    content = main - 2 * padding
+    return {
+        "gap": gap,
+        "main": main,
+        "padding": padding,
+        "content": content,
+        "track": (content - gap * (columns - 1)) / columns,
+    }
+
+
+@pytest.mark.e2e
+def test_spacing_scale_is_the_approved_one() -> None:
+    """The token values the layout expectations are derived from."""
+    for name, px in APPROVED_SPACING.items():
+        assert _token_px(name) == px, f"--{name} is no longer {px}px: review the layout expectations"
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("width,columns", SETTINGS_LAYOUT_CASES)
+def test_settings_layout_matches_token_derived_geometry(
+    authenticated_page: Page, base_url: str, width: int, columns: int
+) -> None:
+    """Gap, track widths, breakpoint, row stretch and overflow from tokens and the shell."""
+    page = authenticated_page
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{base_url}/settings")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_function(
+        "document.querySelectorAll('.settings-grid > .settings-section-card').length >= 9"
+    )
+    probe = page.evaluate(SETTINGS_PROBE)
+
+    client = probe["clientWidth"]
+    expected = _geometry(client, columns, probe["mainMaxWidth"])
+    gap = expected["gap"]
+    expected_track = expected["track"]
+
+    # The shell the grid sits in: the sidebar takes its own column from 1024 px
+    # and is off-canvas below it, so the main column keeps its width.
+    assert abs(probe["mainWidth"] - expected["main"]) <= 1, probe
+    assert [round(px) for px in probe["mainPadding"]] == [expected["padding"]] * 2, probe
+
+    # No document-level horizontal overflow.
+    assert probe["scrollWidth"] == client, probe
+
+    # The grid fills the main column's content box and its gap is the approved
+    # token, in both directions.
+    assert abs(probe["gridWidth"] - expected["content"]) <= 1, probe
+    assert probe["columnGap"] == f"{gap:g}px", probe
+    assert probe["rowGap"] == f"{gap:g}px", probe
+
+    # One track per column, all of them equal and of the derived width.
+    assert len(probe["tracks"]) == columns, probe
+    assert len({round(track) for track in probe["tracks"]}) == 1, probe
+    for track in probe["tracks"]:
+        assert abs(track - expected_track) <= 1, (track, expected_track, probe)
+
+    rows = _rows(probe["cards"])
+    if columns == 2:
+        # The nine admin cards make four full pairs and one lone card, so an
+        # all-single layout cannot pass this case vacuously.
+        paired = [row for row in rows if len(row) == 2]
+        assert len(paired) >= 4, rows
+        for row in paired:
+            left, right = sorted(row, key=lambda card: card["left"])
+            assert abs(left["width"] - expected_track) <= 1, (row, expected_track)
+            assert abs(right["width"] - expected_track) <= 1, (row, expected_track)
+            assert abs((right["left"] - left["right"]) - gap) <= 0.5, (row, gap)
+    else:
+        assert all(len(row) == 1 for row in rows), rows
+        for row in rows:
+            assert abs(row[0]["width"] - expected_track) <= 1, (row, expected_track)
+
+    # Rows stretch: cards that share a row have the same height.
+    for row in rows:
+        heights = [card["height"] for card in row]
+        assert max(heights) - min(heights) < 0.5, heights
+
+    # Consecutive rows are one gap apart.
+    for upper, lower in zip(rows, rows[1:]):
+        distance = lower[0]["top"] - max(card["bottom"] for card in upper)
+        assert abs(distance - gap) <= 0.5, (distance, gap)
+
+
+# Where an unused track showed up: nine admin cards leave one card alone in the
+# fifth row, and it sat beside half a grid of nothing. A Support session does not
+# get the admin-only Gigahost card, so its grid has eight children and ends on a
+# pair. Both shapes are checked at the two-column widths, plus the single-column
+# width where a stray span would create an implicit second track.
+UNPAIRED_ROW_CASES = [(1440, 2, 9), (1024, 2, 9), (1440, 2, 8), (1024, 2, 8), (1023, 1, 9)]
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("width,columns,cards", UNPAIRED_ROW_CASES)
+def test_settings_last_row_leaves_no_unused_track(
+    authenticated_page: Page, base_url: str, width: int, columns: int, cards: int
+) -> None:
+    """Every row fills the grid: a lone final card spans it, a pair does not."""
+    page = authenticated_page
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{base_url}/settings")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_function(
+        "document.querySelectorAll('.settings-grid > .settings-section-card').length >= 9"
+    )
+    if cards == 8:
+        # The Gigahost card is the only admin-only card, so a Support session's grid
+        # has eight children. Removing it here reproduces that shape in one page.
+        page.evaluate("() => document.getElementById('gigahostCard').remove()")
+        page.wait_for_function(
+            "document.querySelectorAll('.settings-grid > .settings-section-card').length === 8"
+        )
+    probe = page.evaluate(SETTINGS_PROBE)
+    expected = _geometry(probe["clientWidth"], columns, probe["mainMaxWidth"])
+
+    assert len(probe["cards"]) == cards, probe
+    assert len(probe["tracks"]) == columns, probe
+    rows = _rows(probe["cards"])
+
+    # No row may leave an unused track: its cards plus the gaps between them fill
+    # the grid's content box. A lone card that does not span leaves a whole track.
+    for index, row in enumerate(rows):
+        used = sum(card["width"] for card in row) + expected["gap"] * (len(row) - 1)
+        assert (
+            abs(used - expected["content"]) <= 1
+        ), f"row {index} has {len(row)} card(s) using {used}px of {expected['content']}px"
+
+    last = rows[-1]
+    if columns == 2 and cards % 2 == 1:
+        # The unpaired final card takes both tracks, so the row is a single
+        # full-width card and not a card plus an empty cell.
+        assert len(last) == 1, rows
+        assert abs(last[0]["width"] - expected["content"]) <= 1, (last, expected["content"])
+    elif columns == 2:
+        # An even count ends on a pair: the span rule must not misfire.
+        assert len(last) == 2, rows
+        for card in last:
+            assert abs(card["width"] - expected["track"]) <= 1, (last, expected["track"])
+    else:
+        # One column: no implicit second track from the span rule, one card per row.
+        assert len(probe["tracks"]) == 1, probe
+        assert all(len(row) == 1 for row in rows), rows
+
+
+@pytest.mark.e2e
+def test_settings_button_height_scale_uses_the_spacing_tokens(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """40 px for a card or action button, 32 px for a button inside a card.
+
+    These are the rules in the Settings sheet that size a legacy class, which is
+    why the computed-style differential has no historical counterpart for them.
+    """
+    page = authenticated_page
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/settings")
+    page.wait_for_load_state("networkidle")
+    page.locator("#upstreamCheckBtn").wait_for(state="visible")
+
+    large = _token_px("space-xl") + _token_px("space-sm")
+    small = _token_px("space-xl")
+    # The recorded scale: 40 px and 32 px, built from the pinned tokens above.
+    assert (large, small) == (40, 32)
+    expected = {"#saveBtn": large, "#policyClientRefreshBtn": large, "#upstreamCheckBtn": small}
+    for selector, px in expected.items():
+        page.locator(selector).wait_for(state="visible")
+        height = page.evaluate(
+            "sel => document.querySelector(sel).getBoundingClientRect().height", selector
+        )
+        assert abs(height - px) <= 0.5, (selector, height, px)

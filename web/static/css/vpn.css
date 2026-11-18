@@ -27,6 +27,18 @@
     margin-top: var(--space-md);
 }
 
+.mt-sm {
+    margin-top: var(--space-sm);
+}
+
+.mb-sm {
+    margin-bottom: var(--space-sm);
+}
+
+.mb-md {
+    margin-bottom: var(--space-md);
+}
+
 .text-muted {
     color: var(--text-muted);
 }

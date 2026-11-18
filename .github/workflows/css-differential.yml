@@ -33,6 +33,12 @@ jobs:
           pip install -r tests/e2e/requirements.txt
           playwright install --with-deps chromium
 
+      # The differential only means something while the reference is the original
+      # pre-split bytes and the Settings exemption is exactly the new surface, so
+      # that contract is checked first and fails fast.
+      - name: Run CSS Reference Integrity Guard
+        run: pytest tests/test_css_reference_frozen.py -v
+
       - name: Run CSS Computed Style Differential Oracle
         run: pytest tests/e2e/test_css_differential.py -v
 
