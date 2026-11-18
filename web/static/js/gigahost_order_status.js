@@ -87,7 +87,9 @@ function gigahostOrderStatusDetail(container, labelKey, valueNode) {
     row.style.padding = '2px 0';
 
     const label = document.createElement('span');
-    label.style.color = 'var(--text-muted)';
+    // Labels name the fact beside them, so they are informative text: --text-muted
+    // measures 2.95:1 (dark) and 2.56:1 (light) on a card, under the 4.5:1 minimum.
+    label.style.color = 'var(--text-secondary)';
     label.textContent = _(labelKey);
     row.appendChild(label);
 
@@ -111,7 +113,7 @@ function gigahostOrderStatusPanel(model) {
     panel.style.lineHeight = '1.45';
 
     const note = document.createElement('div');
-    note.style.color = 'var(--text-muted)';
+    note.style.color = 'var(--text-secondary)';
     note.style.marginBottom = '4px';
     note.textContent = _('gigahost_status_read_only');
     panel.appendChild(note);
@@ -168,7 +170,7 @@ function gigahostOrderStatusAddressDetail(panel, model) {
     // the explanation is due in that case too, not only while actively deploying.
     if (!model.addressWhileProvisioning && !model.providerUnknown) return;
     const hint = document.createElement('div');
-    hint.style.color = 'var(--text-muted)';
+    hint.style.color = 'var(--text-secondary)';
     hint.textContent = _('gigahost_status_ip_while_provisioning');
     panel.appendChild(hint);
 }

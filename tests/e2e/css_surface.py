@@ -46,6 +46,14 @@ SETTINGS_SCOPED_OVERRIDES = frozenset({
     ".settings-section-card .btn",
     ".settings-section-card .btn-sm",
     ".settings-card-header .badge",
+    # Informative text inside the cards uses --text-secondary instead of the
+    # reference's --text-muted, which fails the 4.5:1 minimum. A deliberate
+    # difference from the reference, so it is named here rather than compared.
+    ".settings-section-card .form-hint",
+    ".settings-section-card .info-card-label",
+    ".settings-section-card .text-muted",
+    ".settings-section-card .data-table th",
+    ".settings-section-card .form-input::placeholder",
 })
 
 # The three spacing utilities the Settings templates use. They live in vpn.css,

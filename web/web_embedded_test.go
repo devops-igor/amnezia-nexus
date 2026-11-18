@@ -701,6 +701,10 @@ func TestStyleCSSConcatenationParity(t *testing.T) {
 	}
 }
 
+// assetVersionAction is the only template action a stylesheet link may carry: the
+// release version used to bust a cached copy of the asset.
+const assetVersionAction = "{{ .app_version }}"
+
 func TestStylesheetTemplateLoadOrder(t *testing.T) {
 	templatesFS, err := GetTemplatesSubFS()
 	if err != nil {
@@ -719,7 +723,10 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			firstIdx := strings.Index(cleanHTML, "/static/css/")
 			lastIdx := strings.LastIndex(cleanHTML, "/static/css/")
 			if firstIdx != -1 && lastIdx != -1 && firstIdx < lastIdx {
-				linkSpan := cleanHTML[firstIdx:lastIdx]
+				// The one action allowed between the links is the release version in
+				// the cache-busting query. Any other action (a conditional include, a
+				// range) could change which stylesheets load or in what order.
+				linkSpan := strings.ReplaceAll(cleanHTML[firstIdx:lastIdx], assetVersionAction, "")
 				if strings.Contains(linkSpan, "{{") {
 					t.Fatalf("%s contains Go template actions between stylesheet links", tmpl)
 				}
@@ -731,6 +738,21 @@ func TestStylesheetTemplateLoadOrder(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("OnlyTheVersionActionIsAllowedBetweenLinks", func(t *testing.T) {
+		allowed := `<link href="/static/css/a.css?v={{ .app_version }}"><link href="/static/css/b.css?v={{ .app_version }}">`
+		if strings.Contains(strings.ReplaceAll(allowed, assetVersionAction, ""), "{{") {
+			t.Fatal("the version action should be the one permitted action")
+		}
+		for _, other := range []string{
+			`<link href="/static/css/a.css?v={{ .other }}"><link href="/static/css/b.css">`,
+			`<link href="/static/css/a.css">{{ if .x }}<link href="/static/css/m.css">{{ end }}<link href="/static/css/b.css">`,
+		} {
+			if !strings.Contains(strings.ReplaceAll(other, assetVersionAction, ""), "{{") {
+				t.Fatalf("a different action must still be rejected: %s", other)
+			}
+		}
+	})
 
 	t.Run("PreloadLinkFailsClosed", func(t *testing.T) {
 		sample := `
