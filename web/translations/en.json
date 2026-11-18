@@ -1141,7 +1141,7 @@
   "policy_preset_aggregate_hint": "Unions the reviewed 24-list manifest, deduplicated. Russia outside is excluded and Russian state/internal names are always kept direct.",
   "policy_local_entries_label": "Local entries",
   "policy_local_entries_placeholder": "example.com\n*.example.org\n203.0.113.7\n198.51.100.0/24",
-  "policy_local_entries_hint": "One domain or IPv4/CIDR per line. Blank lines and comments are ignored. These entries are added to the selected source; Russian state/internal names are refused.",
+  "policy_local_entries_hint": "One domain or IPv4/CIDR per line. Blank lines and comments are ignored. Entries are added to the selected source; Russian state/internal domain names are refused. CIDR ranges are matched by address and can cover protected destinations, so add only ranges you intend to proxy.",
   "policy_sources_title": "Aggregate component status",
   "policy_sources_empty": "No aggregate component status yet",
   "policy_source_excluded": "excluded"

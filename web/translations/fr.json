@@ -1141,7 +1141,7 @@
   "policy_preset_aggregate_hint": "Réunit les 24 listes révisées, sans doublons. Russia outside est exclue et les noms d'État/internes russes restent toujours directs.",
   "policy_local_entries_label": "Entrées locales",
   "policy_local_entries_placeholder": "example.com\n*.example.org\n203.0.113.7\n198.51.100.0/24",
-  "policy_local_entries_hint": "Un domaine ou une IPv4/CIDR par ligne. Les lignes vides et commentaires sont ignorés. Ces entrées s'ajoutent à la source choisie ; les noms d'État/internes russes sont refusés.",
+  "policy_local_entries_hint": "Un domaine ou une IPv4/CIDR par ligne. Les lignes vides et les commentaires sont ignorés. Les entrées s'ajoutent à la source choisie ; les noms de domaine d'État/internes russes sont refusés. Les plages CIDR sont comparées par adresse et peuvent couvrir des destinations protégées : n'ajoutez que les plages que vous voulez proxifier.",
   "policy_sources_title": "État des composants agrégés",
   "policy_sources_empty": "Aucun état de composant agrégé",
   "policy_source_excluded": "exclus"

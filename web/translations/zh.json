@@ -1141,7 +1141,7 @@
   "policy_preset_aggregate_hint": "合并经审核的 24 个列表并去重。Russia outside 被排除，俄罗斯国家/内部域名始终直连。",
   "policy_local_entries_label": "本地条目",
   "policy_local_entries_placeholder": "example.com\n*.example.org\n203.0.113.7\n198.51.100.0/24",
-  "policy_local_entries_hint": "每行一个域名或 IPv4/CIDR。忽略空行和注释。这些条目会添加到所选来源；俄罗斯国家/内部域名会被拒绝。",
+  "policy_local_entries_hint": "每行一个域名或 IPv4/CIDR。忽略空行和注释。条目会添加到所选来源；俄罗斯国家/内部域名会被拒绝。CIDR 范围按地址匹配，可能覆盖受保护的地址，因此只添加你打算代理的范围。",
   "policy_sources_title": "聚合组件状态",
   "policy_sources_empty": "暂无聚合组件状态",
   "policy_source_excluded": "已排除"

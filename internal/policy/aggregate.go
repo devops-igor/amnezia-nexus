@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -146,8 +147,16 @@ func NeverProxyReason(domain string) (string, bool) {
 	return "", false
 }
 
-// FilterNeverProxyDomains removes guarded domain rules and returns the number
-// removed. CIDR rules are untouched. The input map is not modified.
+// FilterNeverProxyDomains removes guarded DOMAIN rules and returns the number
+// removed. The input is not modified.
+//
+// CIDR rules pass through unchanged, and that is the documented boundary of the
+// guarantee: the guard works from names, while the forwarder matches a CIDR rule
+// against the packet's destination address before it consults DNS evidence
+// (forwarder.matchesProxyPolicy). A name-based guard therefore cannot promise
+// DIRECT for an address covered by an operator-supplied CIDR. The aggregate
+// manifest contains only FormatDomains lists, so the shipped aggregate has no
+// CIDRs; an operator who adds one is choosing the address range to proxy.
 func FilterNeverProxyDomains(rules ParsedRules) (ParsedRules, int) {
 	out := ParsedRules{
 		Domains: make(map[string]domainFlags, len(rules.Domains)),
@@ -162,6 +171,28 @@ func FilterNeverProxyDomains(rules ParsedRules) (ParsedRules, int) {
 		out.Domains[base] = flags
 	}
 	return out, excluded
+}
+
+// GenerationNeverProxyViolations returns the stored domain rules that the
+// never-proxy guard forbids, sorted for stable reporting.
+//
+// A durable generation was filtered by the build that wrote it. After an upgrade
+// that adds a guard pattern, or after a hand-edited or pre-guard cache is loaded,
+// nothing in the generation itself proves it is clean. Baseline adoption must
+// check this before publishing those rules, because an upstream outage must not
+// turn a stale snapshot into a proxied government domain.
+func GenerationNeverProxyViolations(gen *Generation) []string {
+	if gen == nil || len(gen.Domains) == 0 {
+		return nil
+	}
+	violations := make([]string, 0)
+	for base := range gen.Domains {
+		if _, guarded := NeverProxyReason(base); guarded {
+			violations = append(violations, base)
+		}
+	}
+	sort.Strings(violations)
+	return violations
 }
 
 // filterNeverProxyFlags applies the guard to the durable/aggregate flag map.

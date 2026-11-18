@@ -82,9 +82,20 @@ type syncResponse struct {
 	err error
 }
 
+// localSourceID is the per-source identifier for operator-supplied local rules.
+// It never reaches the fetcher; it exists so the local rules participate in the
+// composed snapshot, provenance and attribution digest like any other source.
+const localSourceID = "local"
+
 type cachedSourceData struct {
 	meta  SourceMeta
 	rules ParsedRules
+	// report and excluded are the parse outcome for rules. A conditional 304
+	// refresh reuses the filtered rules, so it must reuse their accounting too;
+	// otherwise a normal scheduled refresh reports zero accepted and zero
+	// excluded rules for a component that still contributes thousands.
+	report   ParseReport
+	excluded int
 }
 
 // Syncer orchestrates single-owner policy updates, LKG durability, and atomic publication.
@@ -285,6 +296,7 @@ func (s *Syncer) syncSingleSource(ctx context.Context, src Source, startTime tim
 
 	var rules ParsedRules
 	var report ParseReport
+	var excluded int
 
 	if fetchRes.NotModified {
 		cached, exists := s.cachedSources[src.ID]
@@ -299,8 +311,11 @@ func (s *Syncer) syncSingleSource(ctx context.Context, src Source, startTime tim
 				stat.Error = err.Error()
 				return cachedSourceData{}, stat, SourceParsedRules{}, fmt.Errorf("source %s parse failed: %w", src.ID, err)
 			}
+			rules, excluded = FilterNeverProxyDomains(rules)
 		} else {
 			rules = cached.rules
+			report = cached.report
+			excluded = cached.excluded
 		}
 	} else {
 		rules, report, err = Parse(ctx, bytes.NewReader(fetchRes.Body), src, s.cfg.ParseLimits)
@@ -308,25 +323,16 @@ func (s *Syncer) syncSingleSource(ctx context.Context, src Source, startTime tim
 			stat.Error = err.Error()
 			return cachedSourceData{}, stat, SourceParsedRules{}, fmt.Errorf("source %s parse failed: %w", src.ID, err)
 		}
+		rules, excluded = FilterNeverProxyDomains(rules)
 	}
 
-	rules, excluded := FilterNeverProxyDomains(rules)
 	stat.Accepted = report.Accepted
 	stat.Rejected = report.Rejected
 	stat.Excluded = excluded
 	stat.Duplicates = report.Duplicates
 	stat.LastSuccess = startTime.UTC().Format(time.RFC3339)
 
-	etag := fetchRes.ETag
-	lastMod := fetchRes.LastModified
-	if fetchRes.NotModified {
-		if etag == "" {
-			etag = ifNoneMatch
-		}
-		if lastMod == "" {
-			lastMod = ifModifiedSince
-		}
-	}
+	etag, lastMod := retainedValidators(fetchRes, ifNoneMatch, ifModifiedSince)
 
 	meta := SourceMeta{
 		ID:           src.ID,
@@ -337,9 +343,27 @@ func (s *Syncer) syncSingleSource(ctx context.Context, src Source, startTime tim
 		RuleCount:    len(rules.Domains) + len(rules.CIDRs),
 	}
 
-	cached := cachedSourceData{meta: meta, rules: rules}
+	cached := cachedSourceData{meta: meta, rules: rules, report: report, excluded: excluded}
 	parsed := SourceParsedRules{SourceID: src.ID, Rules: rules}
 	return cached, stat, parsed, nil
+}
+
+// retainedValidators returns the HTTP validators to persist for this fetch. A
+// 304 may omit them even though the cached copy is still current; dropping a
+// still-valid validator would force a full download on the next cycle.
+func retainedValidators(fetchRes *FetchResult, ifNoneMatch, ifModifiedSince string) (string, string) {
+	etag := fetchRes.ETag
+	lastMod := fetchRes.LastModified
+	if !fetchRes.NotModified {
+		return etag, lastMod
+	}
+	if etag == "" {
+		etag = ifNoneMatch
+	}
+	if lastMod == "" {
+		lastMod = ifModifiedSince
+	}
+	return etag, lastMod
 }
 
 func aggregateCandidateRules(sourceParsedList []SourceParsedRules) (map[string]uint32, []string, int) {
@@ -422,8 +446,8 @@ func (s *Syncer) appendLocalRules(sourceParsedList []SourceParsedRules, statsMap
 	if excluded > 0 {
 		return sourceParsedList, fmt.Errorf("local rules contain %d never-proxy entries", excluded)
 	}
-	statsMap["local"] = SourceSyncStats{ID: "local", Accepted: len(localRules.Domains) + len(localRules.CIDRs)}
-	return append(sourceParsedList, SourceParsedRules{SourceID: "local", Rules: localRules}), nil
+	statsMap[localSourceID] = SourceSyncStats{ID: localSourceID, Accepted: len(localRules.Domains) + len(localRules.CIDRs)}
+	return append(sourceParsedList, SourceParsedRules{SourceID: localSourceID, Rules: localRules}), nil
 }
 
 func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {

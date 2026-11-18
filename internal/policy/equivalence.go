@@ -103,20 +103,27 @@ func (s *Syncer) equivalentTo(gen *Generation, domains map[string]uint32, cidrs 
 // successful cycle records the digest, so that gap is one cycle and never
 // recurring: from then on attribution-only moves publish.
 func (s *Syncer) sameSourceAttribution(gen *Generation, perSource []SourceParsedRules) bool {
-	external := perSource
-	if len(external) == len(s.cfg.Sources)+1 && external[len(external)-1].SourceID == "local" {
-		external = external[:len(external)-1]
-	}
-	if len(external) != len(s.cfg.Sources) {
+	if len(perSource) != s.expectedSourceCount() {
 		return true
 	}
 	if len(s.cachedSources) == len(s.cfg.Sources) {
-		return s.sameCachedSourceAttribution(external)
+		return s.sameCachedSourceAttribution(perSource)
 	}
-	if candidate, ok := attributionDigest(external); ok && gen.AttributionHash != "" {
+	if candidate, ok := attributionDigest(perSource); ok && gen.AttributionHash != "" {
 		return gen.AttributionHash == candidate
 	}
 	return true
+}
+
+// expectedSourceCount is the number of per-source rule sets a cycle produces:
+// every configured external source, plus the local source when it has rules.
+// The stored digest and the candidate digest must cover the same set; stripping
+// one side made every restart look like an attribution change.
+func (s *Syncer) expectedSourceCount() int {
+	if len(s.cfg.LocalRules.Domains) == 0 && len(s.cfg.LocalRules.CIDRs) == 0 {
+		return len(s.cfg.Sources)
+	}
+	return len(s.cfg.Sources) + 1
 }
 
 // sameCachedSourceAttribution compares the candidate per-source rules with the
@@ -125,7 +132,18 @@ func (s *Syncer) sameCachedSourceAttribution(perSource []SourceParsedRules) bool
 	for _, item := range perSource {
 		previous, ok := s.cachedSources[item.SourceID]
 		if !ok {
-			return true
+			if item.SourceID != localSourceID {
+				return true
+			}
+			// Local rules come from the syncer configuration, not from a fetched
+			// cached source. appendLocalRules only lets a cycle reach this
+			// comparison when the guard removes nothing from them, so the
+			// configured rules are exactly the candidate's local rules.
+			if !equalFlagMap(s.cfg.LocalRules.Domains, item.Rules.Domains) ||
+				!equalPrefixSet(s.cfg.LocalRules.CIDRs, item.Rules.CIDRs) {
+				return false
+			}
+			continue
 		}
 		if !equalFlagMap(previous.rules.Domains, item.Rules.Domains) {
 			return false

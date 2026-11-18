@@ -333,14 +333,35 @@ within the snapshot provenance budget, and per-component status reports accepted
 excluded, duplicate and failure counts.
 
 The never-proxy guard is applied to every external component and to local
-entries, and again to the composed rule set. It removes rules that are equal to,
-below, or broad ancestors of Russian state/government patterns and the explicit
-internal-service denylist. Excluded names keep the existing default path; the
-guard never turns another destination DIRECT. Local entries are persisted as an
-additive settings field, accept bare domains, `*.` subdomains, IPv4 literals and
-IPv4 CIDRs, and are refused with the named guard reason when they match the
-denylist. An empty local list does not change the generation; adding or removing
-a local entry does.
+entries, and again to the composed rule set. It removes DOMAIN rules that are
+equal to, below, or broad ancestors of Russian state/government patterns and the
+explicit internal-service denylist. Excluded names keep the existing default
+path; the guard never turns another destination DIRECT. Local entries are
+persisted as an additive settings field, accept bare domains, `*.` subdomains,
+IPv4 literals and IPv4 CIDRs, and are refused with the named guard reason when a
+domain matches the denylist. An empty local list does not change the generation;
+adding or removing a local entry does.
+
+The guard is name-based, and that is the exact boundary of the guarantee:
+
+- **Domain rules are protected.** The aggregate manifest contains only
+  `FormatDomains` lists, and every guarded name is removed from every external
+  component, from local domain entries and from the composed candidate. Six
+  `Russia outside` names also arrive through other components; the guard removes
+  those too.
+- **CIDR rules are not rewritten.** The forwarder matches a CIDR against the
+  packet's destination address before it consults DNS evidence
+  (`forwarder.matchesProxyPolicy`), so a CIDR an operator supplies is routed by
+  address. A name-based guard cannot guarantee DIRECT for an address inside such
+  a range, because it has no address-to-name mapping to test. Adding a CIDR is
+  therefore an explicit choice to proxy that range; do not add one that covers a
+  destination that must stay direct. The shipped aggregate has no CIDRs.
+- **Stored snapshots are revalidated.** `PrimeBaseline`, `AdoptBaseline` and the
+  vpn last-known-good fallback check a durable generation's domain rules against
+  the current guard before publishing them. A snapshot written before a guard
+  pattern existed is reported as a foreign baseline and is never activated; if
+  the upstream fetch also fails, startup activation is refused rather than
+  proxying the stale protected name.
 
 ## 6. Limitations
 

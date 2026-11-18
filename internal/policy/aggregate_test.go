@@ -2,8 +2,10 @@ package policy
 
 import (
 	"context"
+	"net/netip"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAggregateManifestIsTheReviewedPrimaryRawSet(t *testing.T) {
@@ -241,5 +243,227 @@ func TestCompileSnapshotKeepsProvenanceForAggregateAndLocal(t *testing.T) {
 	}
 	if len(match.Contributors) != len(sources) {
 		t.Fatalf("contributors = %d, want %d", len(match.Contributors), len(sources))
+	}
+}
+
+// seedGeneration writes a durable generation whose ConfigHash matches cfg, so a
+// baseline decision reaches the content checks instead of the source check.
+func seedGeneration(t *testing.T, store Store, cfg SyncConfig, id string, domains map[string]uint32) {
+	t.Helper()
+	hash := (&Syncer{cfg: cfg}).computeConfigHash()
+	gen := &Generation{
+		SchemaVersion: SchemaVersion,
+		GenerationID:  id,
+		Version:       3,
+		CreatedAt:     time.Now().UTC().Add(-time.Hour),
+		ConfigHash:    hash,
+		Domains:       domains,
+	}
+	if err := store.Commit(context.Background(), gen); err != nil {
+		t.Fatalf("seed generation %q: %v", id, err)
+	}
+}
+
+// TestPrimeBaselineRefusesStoredGuardViolations is the HIGH-01 regression: an
+// upgrade must not activate a last-known-good snapshot written before the guard
+// existed. The config matches, so only revalidating the stored rules can stop
+// gov.ru from being published when the upstream fetch fails.
+func TestPrimeBaselineRefusesStoredGuardViolations(t *testing.T) {
+	store := NewFileStore(t.TempDir())
+	cfg := refreshConfig("/rules.lst")
+	seedGeneration(t, store, cfg, "gen-before-guard", map[string]uint32{
+		"allowed.example": uint32(domainInclusiveSuffix),
+		"gov.ru":          uint32(domainInclusiveSuffix),
+		"82.mvd.ru":       uint32(domainInclusiveSuffix),
+	})
+
+	// The upstream is unavailable, so the only candidate rules are the stored ones.
+	down := newRefreshFixture(t)
+	matcher := NewMatcher()
+	syncer := newRefreshSyncer(t, matcher, down.fetcher(), store, cfg)
+
+	status, err := syncer.PrimeBaseline(context.Background())
+	if err != nil {
+		t.Fatalf("PrimeBaseline: %v", err)
+	}
+	if status != BaselineForeign {
+		t.Fatalf("baseline status = %v, want BaselineForeign for a stored guard violation", status)
+	}
+	if matcher.Current() != nil {
+		t.Fatal("PrimeBaseline published a stored generation containing a never-proxy name")
+	}
+	// The save path adopts rather than publishes. It must refuse the same
+	// generation, or the replacement syncer would treat it as the baseline.
+	adopted, err := syncer.AdoptBaseline(context.Background())
+	if err != nil {
+		t.Fatalf("AdoptBaseline: %v", err)
+	}
+	if adopted != BaselineForeign {
+		t.Fatalf("adopt status = %v, want BaselineForeign for a stored guard violation", adopted)
+	}
+	if syncer.cachedGen != nil {
+		t.Fatal("AdoptBaseline cached a generation containing a never-proxy name")
+	}
+	if _, syncErr := syncer.SyncOnce(context.Background()); syncErr == nil {
+		t.Fatal("fixture upstream was expected to fail")
+	}
+	if matcher.Current() != nil {
+		t.Fatal("a failed fetch activated the stored guard-violating generation")
+	}
+}
+
+// TestPrimeBaselineStillAcceptsCleanStoredGeneration is the positive control for
+// the check above: an old but clean snapshot must remain a usable baseline, so
+// the fix does not turn every upgrade into a full outage dependency.
+func TestPrimeBaselineStillAcceptsCleanStoredGeneration(t *testing.T) {
+	store := NewFileStore(t.TempDir())
+	cfg := refreshConfig("/rules.lst")
+	seedGeneration(t, store, cfg, "gen-clean", map[string]uint32{
+		"allowed.example": uint32(domainInclusiveSuffix),
+	})
+
+	matcher := NewMatcher()
+	syncer := newRefreshSyncer(t, matcher, newRefreshFixture(t).fetcher(), store, cfg)
+	status, err := syncer.PrimeBaseline(context.Background())
+	if err != nil {
+		t.Fatalf("PrimeBaseline: %v", err)
+	}
+	if status != BaselinePrimed {
+		t.Fatalf("baseline status = %v, want BaselinePrimed for a clean stored generation", status)
+	}
+	if matcher.Current() == nil || !matcher.Current().MatchDomain("allowed.example") {
+		t.Fatal("clean stored generation was not published")
+	}
+}
+
+// TestSyncer_LocalRulesRestartRetainsGeneration is the MEDIUM-03 regression: the
+// durable attribution digest and the candidate digest must both include the local
+// source. Stripping it on one side made every restart with local rules publish a
+// new generation and discard trusted client DNS evidence.
+func TestSyncer_LocalRulesRestartRetainsGeneration(t *testing.T) {
+	fixture := newRefreshFixture(t, "/rules.lst")
+	fixture.serve("/rules.lst", "listed.example\n", `"v1"`)
+	cfg := refreshConfig("/rules.lst")
+	local, _, err := ParseLocalRules([]string{"local.example", "198.51.100.0/24"})
+	if err != nil {
+		t.Fatalf("parse local: %v", err)
+	}
+	cfg.LocalRules = local
+	store := NewFileStore(t.TempDir())
+	ctx := context.Background()
+
+	firstSyncer := newRefreshSyncer(t, NewMatcher(), fixture.fetcher(), store, cfg)
+	first, err := firstSyncer.SyncOnce(ctx)
+	if err != nil || !first.Published {
+		t.Fatalf("seed sync: published=%v err=%v", first.Published, err)
+	}
+
+	// Restart: a fresh syncer over the same store and an unchanged configuration.
+	// The live matcher is the one the runtime keeps serving across the restart.
+	liveMatcher := NewMatcher()
+	restarted := newRefreshSyncer(t, liveMatcher, fixture.fetcher(), store, cfg)
+	baseline, err := restarted.PrimeBaseline(ctx)
+	if err != nil || baseline != BaselinePrimed {
+		t.Fatalf("restart baseline = %v err=%v, want BaselinePrimed", baseline, err)
+	}
+	second, err := restarted.SyncOnce(ctx)
+	if err != nil {
+		t.Fatalf("post-restart refresh: %v", err)
+	}
+	if second.GenerationID != first.GenerationID {
+		t.Fatalf("unchanged local rules bumped the generation after restart: %s -> %s", first.GenerationID, second.GenerationID)
+	}
+
+	// An unrelated save builds a replacement syncer that adopts the durable
+	// generation over the same live matcher; the same unchanged local rules must
+	// still retain it.
+	replacement := newRefreshSyncer(t, liveMatcher, fixture.fetcher(), store, cfg)
+	adopted, err := replacement.AdoptBaseline(ctx)
+	if err != nil || adopted != BaselinePrimed {
+		t.Fatalf("replacement baseline = %v err=%v, want BaselinePrimed", adopted, err)
+	}
+	third, err := replacement.SyncOnce(ctx)
+	if err != nil {
+		t.Fatalf("replacement refresh: %v", err)
+	}
+	if third.GenerationID != first.GenerationID {
+		t.Fatalf("adopted unchanged local rules bumped the generation: %s -> %s", first.GenerationID, third.GenerationID)
+	}
+
+	// A genuine local change must still publish, against the same live matcher.
+	changedLocal, _, err := ParseLocalRules([]string{"other.example", "198.51.100.0/24"})
+	if err != nil {
+		t.Fatalf("parse changed local: %v", err)
+	}
+	changedCfg := cfg
+	changedCfg.LocalRules = changedLocal
+	changed := newRefreshSyncer(t, liveMatcher, fixture.fetcher(), store, changedCfg)
+	if _, err := changed.PrimeBaseline(ctx); err != nil {
+		t.Fatalf("changed baseline: %v", err)
+	}
+	fourth, err := changed.SyncOnce(ctx)
+	if err != nil {
+		t.Fatalf("changed refresh: %v", err)
+	}
+	if fourth.GenerationID == first.GenerationID {
+		t.Fatal("a changed local rule set retained the old generation")
+	}
+	if !liveMatcher.Current().MatchDomain("other.example") {
+		t.Fatal("changed local rule is missing from the published snapshot")
+	}
+}
+
+// TestSyncer_ConditionalRefreshPreservesComponentAccounting is the MEDIUM-04
+// regression: a 304 says the bytes did not change, so the accepted and excluded
+// counts of the reused filtered rules must survive the refresh.
+func TestSyncer_ConditionalRefreshPreservesComponentAccounting(t *testing.T) {
+	fixture := newRefreshFixture(t, "/rules.lst")
+	fixture.serve("/rules.lst", "allowed.example\nsecond.example\ngov.ru\n", `"v1"`)
+	cfg := refreshConfig("/rules.lst")
+	syncer := newRefreshSyncer(t, NewMatcher(), fixture.fetcher(), NewFileStore(t.TempDir()), cfg)
+
+	first, err := syncer.SyncOnce(context.Background())
+	if err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	firstStat := first.SourceStats["source-1"]
+	if firstStat.Accepted != 3 || firstStat.Excluded != 1 {
+		t.Fatalf("first sync accounting = accepted:%d excluded:%d, want 3/1", firstStat.Accepted, firstStat.Excluded)
+	}
+
+	second, err := syncer.SyncOnce(context.Background())
+	if err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	secondStat := second.SourceStats["source-1"]
+	if !secondStat.NotModified {
+		t.Fatalf("second sync did not receive a 304: %+v", secondStat)
+	}
+	if secondStat.Accepted != firstStat.Accepted || secondStat.Excluded != firstStat.Excluded {
+		t.Fatalf("304 refresh accounting = accepted:%d excluded:%d, want the retained %d/%d",
+			secondStat.Accepted, secondStat.Excluded, firstStat.Accepted, firstStat.Excluded)
+	}
+}
+
+// TestFilterNeverProxyDomainsLeavesCIDRRulesUnchanged pins the narrowed HIGH-02
+// contract: the guard is name-based, and a CIDR is matched by destination address
+// before DNS evidence, so it passes through and remains the operator's choice.
+func TestFilterNeverProxyDomainsLeavesCIDRRulesUnchanged(t *testing.T) {
+	prefix := netip.MustParsePrefix("203.0.113.0/24")
+	filtered, excluded := FilterNeverProxyDomains(ParsedRules{
+		Domains: map[string]domainFlags{
+			"gov.ru":          domainInclusiveSuffix,
+			"allowed.example": domainInclusiveSuffix,
+		},
+		CIDRs: []netip.Prefix{prefix},
+	})
+	if excluded != 1 {
+		t.Fatalf("excluded = %d, want the one guarded domain", excluded)
+	}
+	if len(filtered.CIDRs) != 1 || filtered.CIDRs[0] != prefix {
+		t.Fatalf("CIDR rules = %v, want the input prefix unchanged", filtered.CIDRs)
+	}
+	if len(filtered.Domains) != 1 {
+		t.Fatalf("domain rules = %v, want only the safe domain", filtered.Domains)
 	}
 }
