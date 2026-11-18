@@ -1153,5 +1153,6 @@
   "settings_unsaved": "有未保存的更改",
   "settings_applies_now": "立即生效",
   "settings_save_read_failed": "无法读取已保存的设置，因此未保存任何内容",
-  "settings_test_saves_first": "先保存上方的设置，然后立即发送"
+  "settings_test_saves_first": "先保存上方的设置，然后立即发送",
+  "policy_client_tried_names_fmt": "已尝试 {names}"
 }

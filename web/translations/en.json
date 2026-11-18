@@ -1153,5 +1153,6 @@
   "settings_unsaved": "Unsaved changes",
   "settings_applies_now": "Applies immediately",
   "settings_save_read_failed": "Could not read the stored settings, so nothing was saved",
-  "settings_test_saves_first": "Saves the settings above first, then sends now"
+  "settings_test_saves_first": "Saves the settings above first, then sends now",
+  "policy_client_tried_names_fmt": "tried {names}"
 }

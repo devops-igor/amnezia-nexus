@@ -1153,5 +1153,6 @@
   "settings_unsaved": "Несохранённые изменения",
   "settings_applies_now": "Применяется сразу",
   "settings_save_read_failed": "Не удалось прочитать сохранённые настройки, поэтому ничего не сохранено",
-  "settings_test_saves_first": "Сначала сохраняет настройки выше, затем сразу отправляет"
+  "settings_test_saves_first": "Сначала сохраняет настройки выше, затем сразу отправляет",
+  "policy_client_tried_names_fmt": "попытки: {names}"
 }

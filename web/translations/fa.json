@@ -1153,5 +1153,6 @@
   "settings_unsaved": "تغییرات ذخیره‌نشده",
   "settings_applies_now": "بلافاصله اعمال می‌شود",
   "settings_save_read_failed": "خواندن تنظیمات ذخیره‌شده ممکن نبود، بنابراین چیزی ذخیره نشد",
-  "settings_test_saves_first": "ابتدا تنظیمات بالا را ذخیره می‌کند، سپس بلافاصله ارسال می‌کند"
+  "settings_test_saves_first": "ابتدا تنظیمات بالا را ذخیره می‌کند، سپس بلافاصله ارسال می‌کند",
+  "policy_client_tried_names_fmt": "تلاش‌شده: {names}"
 }

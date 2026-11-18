@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
+	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
@@ -321,7 +323,7 @@ func TestClientDiagnosisFlowWireShapeIsExplicit(t *testing.T) {
 	for _, key := range []string{
 		`"decision_time"`, `"decision_reason"`, `"policy_generation"`,
 		`"dispatch"`, `"forward"`, `"return"`, `"names_match"`, `"names_reason"`,
-		`"names_considered"`, `"name_candidates"`,
+		`"names_considered"`, `"name_candidates"`, `"name_attempts"`,
 	} {
 		if !strings.Contains(string(raw), key) {
 			t.Errorf("wire answer is missing %s", key)
@@ -339,5 +341,139 @@ func TestClientDiagnosisFlowWireShapeIsExplicit(t *testing.T) {
 	}
 	if strings.Contains(string(raw), f.peerKey) {
 		t.Errorf("the answer carries the peer key: %s", raw)
+	}
+}
+
+func TestFlowNameAttemptsAreBoundedUnresolvedAndPreDecision(t *testing.T) {
+	decided := time.Date(2026, 11, 17, 9, 10, 0, 0, time.UTC)
+	flow := forwarder.SessionFlow{Generation: 7, DecidedAt: decided}
+	events := []dnsledger.Event{
+		{Name: "nx.example", Kind: gatewaydns.QueryEventNXDomain, ReceivedAt: decided.Add(-time.Minute), Seq: 5, RouteGeneration: 7, RouteGenerationKnown: true},
+		{Name: "noanswer.example", Kind: gatewaydns.QueryEventNoAnswer, ReceivedAt: decided.Add(-2 * time.Minute), Seq: 4, RouteGeneration: 7, RouteGenerationKnown: true},
+		{Name: "answered.example", Kind: gatewaydns.QueryEventAnswered, ReceivedAt: decided.Add(-time.Minute), Seq: 6},
+		{Name: "truncated.example", Kind: gatewaydns.QueryEventTruncated, ReceivedAt: decided.Add(-time.Minute), Seq: 7},
+		{Name: "after.example", Kind: gatewaydns.QueryEventUpstreamError, ReceivedAt: decided.Add(time.Second), Seq: 8},
+		{Name: "old.example", Kind: gatewaydns.QueryEventNXDomain, ReceivedAt: decided.Add(-6 * time.Minute), Seq: 9},
+		{Name: "othergen.example", Kind: gatewaydns.QueryEventNXDomain, ReceivedAt: decided.Add(-time.Minute), Seq: 10, RouteGeneration: 6, RouteGenerationKnown: true},
+		{Name: "unknowngen.example", Kind: gatewaydns.QueryEventUpstreamError, ReceivedAt: decided.Add(-90 * time.Second), Seq: 11},
+		{Name: "third.example", Kind: gatewaydns.QueryEventInvalidQuery, ReceivedAt: decided.Add(-30 * time.Second), Seq: 12},
+	}
+	got := flowNameAttempts(flow, events)
+	want := []struct {
+		name string
+		kind string
+	}{
+		{"third.example", gatewaydns.QueryEventInvalidQuery},
+		{"nx.example", gatewaydns.QueryEventNXDomain},
+		{"unknowngen.example", gatewaydns.QueryEventUpstreamError},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("attempts = %d, want %d (newest first, max 3): %+v", len(got), len(want), got)
+	}
+	for i, expected := range want {
+		if got[i].Name != expected.name || got[i].Kind != expected.kind {
+			t.Errorf("attempt %d = %s/%s, want %s/%s", i, got[i].Name, got[i].Kind, expected.name, expected.kind)
+		}
+	}
+
+	if attempts := flowNameAttempts(forwarder.SessionFlow{Generation: 7}, events); attempts != nil {
+		t.Errorf("a flow without a decision instant produced attempts: %+v", attempts)
+	}
+}
+
+func TestClientDiagnosisFlowExposesAttemptedNames(t *testing.T) {
+	f := newClientDiagFixture(t)
+	f.sendTCP(t, netip.MustParseAddr("1.1.1.1"), 41150, 443) // no evidence: PROXY default
+
+	sessionID := f.sessionID(t)
+	generation, known := f.routeCache.BindQueryIncarnation(sessionID)
+	received := time.Now().Add(-time.Minute).UTC()
+	f.routeCache.ObserveDNSQueryEvent(gatewaydns.QueryEvent{
+		SessionID:        sessionID,
+		Transport:        "udp",
+		Name:             "missing.example",
+		QType:            1,
+		Kind:             gatewaydns.QueryEventNXDomain,
+		ReceivedAt:       received,
+		AnsweredAt:       received,
+		RouteGeneration:  generation,
+		IncarnationKnown: known,
+	})
+
+	answer, err := f.svc.ClientDiagnosis(context.Background(), ClientDiagnosisRequest{SessionID: sessionID})
+	if err != nil {
+		t.Fatalf("ClientDiagnosis: %v", err)
+	}
+	flow := findFlowEvidence(t, answer.Flows.Entries, "1.1.1.1", 443)
+	if flow.NamesMatch != FlowCorrelationNone {
+		t.Fatalf("names match = %q, want none for a destination no answer named", flow.NamesMatch)
+	}
+	if len(flow.NameAttempts) != 1 {
+		t.Fatalf("attempts = %+v, want the unresolved query near the decision", flow.NameAttempts)
+	}
+	attempt := flow.NameAttempts[0]
+	if attempt.Name != "missing.example" || attempt.Kind != gatewaydns.QueryEventNXDomain || attempt.QType != "A" {
+		t.Fatalf("attempt = %+v, want missing.example/A/nxdomain", attempt)
+	}
+	if attempt.ReceivedAt == "" || attempt.ReceivedAt == ClientDiagnosisTokenNotRecorded {
+		t.Fatalf("attempt received_at = %q, want the query instant", attempt.ReceivedAt)
+	}
+}
+
+func TestFlowNameAttemptsUseCollapsedLastSeen(t *testing.T) {
+	const sessionID = "sess-collapsed"
+	first := time.Date(2026, 11, 17, 10, 0, 0, 0, time.UTC)
+	retry := first.Add(8 * time.Minute)
+	decided := first.Add(9 * time.Minute)
+	flow := forwarder.SessionFlow{Generation: 7, DecidedAt: decided}
+
+	record := func(ledger *dnsledger.Ledger, at time.Time) {
+		t.Helper()
+		if !ledger.RecordEvent(dnsledger.InputEvent{
+			SessionID:            sessionID,
+			Transport:            "udp",
+			Name:                 "retry.example",
+			QType:                1,
+			Kind:                 gatewaydns.QueryEventNXDomain,
+			ReceivedAt:           at,
+			AnsweredAt:           at,
+			RouteGeneration:      7,
+			RouteGenerationKnown: true,
+		}, at) {
+			t.Fatalf("record event at %s", at)
+		}
+	}
+
+	// First attempt outside the lookback, identical retry inside it. The ledger
+	// collapses them: ReceivedAt stays the first instant, LastSeen moves to the
+	// retry, and Count increments.
+	ledger := dnsledger.New()
+	record(ledger, first)
+	record(ledger, retry)
+	snapshot := ledger.SnapshotEvents(sessionID, 10)
+	if len(snapshot.Events) != 1 {
+		t.Fatalf("events = %d, want one collapsed event", len(snapshot.Events))
+	}
+	event := snapshot.Events[0]
+	if event.Count != 2 || !event.ReceivedAt.Equal(first) || !event.LastSeen.Equal(retry) {
+		t.Fatalf("collapsed event = count:%d received:%s last:%s, want first %s / last %s",
+			event.Count, event.ReceivedAt, event.LastSeen, first, retry)
+	}
+	if attempts := flowNameAttempts(flow, snapshot.Events); len(attempts) != 1 || attempts[0].Name != "retry.example" {
+		t.Fatalf("attempts = %+v, want the collapsed retry at %s included", attempts, retry)
+	}
+
+	// A repeat after the decision must not make the event look like a pre-decision
+	// attempt. The first occurrence is the only timestamp the ledger can prove was
+	// before the decision, and it is outside the five-minute lookback here.
+	lateLedger := dnsledger.New()
+	record(lateLedger, first)
+	record(lateLedger, decided.Add(time.Minute))
+	lateSnapshot := lateLedger.SnapshotEvents(sessionID, 10)
+	if len(lateSnapshot.Events) != 1 || lateSnapshot.Events[0].Count != 2 {
+		t.Fatalf("late fixture did not collapse: %+v", lateSnapshot.Events)
+	}
+	if attempts := flowNameAttempts(flow, lateSnapshot.Events); len(attempts) != 0 {
+		t.Fatalf("post-decision repeat produced attempts: %+v", attempts)
 	}
 }

@@ -1153,5 +1153,6 @@
   "settings_unsaved": "Modifications non enregistrées",
   "settings_applies_now": "S’applique immédiatement",
   "settings_save_read_failed": "Impossible de lire les paramètres enregistrés, rien n’a donc été enregistré",
-  "settings_test_saves_first": "Enregistre d’abord les paramètres ci-dessus, puis envoie immédiatement"
+  "settings_test_saves_first": "Enregistre d’abord les paramètres ci-dessus, puis envoie immédiatement",
+  "policy_client_tried_names_fmt": "essayé {names}"
 }
