@@ -8,17 +8,17 @@
     <meta name="csrf-token" content="{{ .csrf_token }}">
     <title>{{ if .site_settings.Title }}{{ .site_settings.Title }}{{ else }}Amnezia Nexus{{ end }} {{ block "title_extra" . }}{{ end }}</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
-    <link rel="stylesheet" href="/static/css/tokens.css?v=1.1.0">
-    <link rel="stylesheet" href="/static/css/base.css?v=1.1.0">
-    <link rel="stylesheet" href="/static/css/layout.css?v=1.1.0">
-    <link rel="stylesheet" href="/static/css/components.css?v=1.1.0">
-    <link rel="stylesheet" href="/static/css/tables.css?v=1.1.0">
-    <link rel="stylesheet" href="/static/css/server.css?v=1.1.0">
-    <link rel="stylesheet" href="/static/css/vpn.css?v=1.1.0">
-    <link rel="stylesheet" href="/static/css/settings.css?v=1.1.0">
+    <link rel="stylesheet" href="/static/css/tokens.css?v={{ .app_version }}">
+    <link rel="stylesheet" href="/static/css/base.css?v={{ .app_version }}">
+    <link rel="stylesheet" href="/static/css/layout.css?v={{ .app_version }}">
+    <link rel="stylesheet" href="/static/css/components.css?v={{ .app_version }}">
+    <link rel="stylesheet" href="/static/css/tables.css?v={{ .app_version }}">
+    <link rel="stylesheet" href="/static/css/server.css?v={{ .app_version }}">
+    <link rel="stylesheet" href="/static/css/vpn.css?v={{ .app_version }}">
+    <link rel="stylesheet" href="/static/css/settings.css?v={{ .app_version }}">
     <script>!function () { var t = localStorage.getItem('theme') || 'dark'; document.documentElement.setAttribute('data-theme', t) }()</script>
     <script src="/static/js/qrcode.min.js"></script>
-    <script src="/static/js/api.js?v=2.5.0"></script>
+    <script src="/static/js/api.js?v={{ .app_version }}"></script>
     <script src="/static/js/ui.js"></script>
     <script src="/static/js/tables.js"></script>
     <script src="/static/js/telemetry.js"></script>
