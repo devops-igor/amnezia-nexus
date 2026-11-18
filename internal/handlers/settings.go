@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/provider/gigahost"
@@ -53,7 +55,7 @@ func (h *Handlers) GetSettingsHandler(w http.ResponseWriter, r *http.Request) {
 
 // settingsSecretMask is the sentinel every read path renders in place of a
 // stored credential. The save path treats it, like an empty value, as "keep the
-// stored secret" (see preserveSecretsOnSave).
+// stored secret" (see persistSettings).
 const settingsSecretMask = "********"
 
 // maskTelegramSecrets replaces a stored Telegram bot token with the sentinel.
@@ -113,45 +115,40 @@ func stripObsoleteGigahostKeys(cfg map[string]any) {
 	}
 }
 
-func (h *Handlers) preserveSecretsOnSave(ctx context.Context, req *models.SaveSettingsRequest) {
-	h.preserveSSLOnSave(ctx, &req.SSL)
-	h.preserveTelegramOnSave(ctx, req.Telegram)
-	// Gigahost: Preserve existing api_key if incoming is empty or masked
-	if req.Gigahost != nil {
-		h.preserveGigahostOnSave(ctx, req.Gigahost)
-	}
-}
-
 // preserveSSLOnSave keeps the stored certificate material when the incoming
-// values are empty or the masked placeholder the settings page renders.
-func (h *Handlers) preserveSSLOnSave(ctx context.Context, incoming *models.SSLSettings) {
+// values are empty or the masked placeholder the settings page renders. The
+// stored row is read through tx, so it is the one the write replaces.
+func preserveSSLOnSave(tx *database.SettingsTx, incoming *models.SSLSettings) error {
 	var existing models.SSLSettings
-	_ = h.db.GetSetting(ctx, "ssl", &existing)
-	if incoming.KeyText == "" || incoming.KeyText == "********" {
+	if err := tx.Get("ssl", &existing); err != nil {
+		return fmt.Errorf("read stored ssl settings: %w", err)
+	}
+	if incoming.KeyText == "" || incoming.KeyText == settingsSecretMask {
 		incoming.KeyText = existing.KeyText
 	}
-	if incoming.CertText == "" || incoming.CertText == "********" {
+	if incoming.CertText == "" || incoming.CertText == settingsSecretMask {
 		incoming.CertText = existing.CertText
 	}
+	return nil
 }
 
 // preserveTelegramOnSave keeps the stored bot token when the incoming value is
-// absent, empty or masked. A nil section means "not edited", not "erase".
-func (h *Handlers) preserveTelegramOnSave(ctx context.Context, incoming map[string]any) {
-	if incoming == nil {
-		return
-	}
+// absent, empty or masked.
+func preserveTelegramOnSave(tx *database.SettingsTx, incoming map[string]any) error {
 	existing := make(map[string]any)
-	_ = h.db.GetSetting(ctx, "telegram", &existing)
+	if err := tx.Get("telegram", &existing); err != nil {
+		return fmt.Errorf("read stored telegram settings: %w", err)
+	}
 	for _, key := range []string{"bot_token", "token"} {
 		value, ok := incoming[key].(string)
-		if ok && value != "" && value != "********" {
+		if ok && value != "" && value != settingsSecretMask {
 			continue
 		}
 		if old, ok := existing[key].(string); ok && old != "" {
 			incoming[key] = old
 		}
 	}
+	return nil
 }
 
 // preserveGigahostOnSave keeps the stored Gigahost secrets and retired fields
@@ -161,17 +158,20 @@ func (h *Handlers) preserveTelegramOnSave(ctx context.Context, incoming map[stri
 // fields are stripped from what the panel ACCEPTS (see stripObsoleteGigahostKeys)
 // but carried through on write, so saving unrelated settings never destroys a
 // value an older panel stored. Nothing reads them.
-func (h *Handlers) preserveGigahostOnSave(ctx context.Context, incoming map[string]any) {
+func preserveGigahostOnSave(tx *database.SettingsTx, incoming map[string]any) error {
 	existing := make(map[string]any)
-	_ = h.db.GetSetting(ctx, "gigahost", &existing)
+	if err := tx.Get("gigahost", &existing); err != nil {
+		return fmt.Errorf("read stored gigahost settings: %w", err)
+	}
 
-	if key, ok := incoming["api_key"].(string); !ok || key == "" || key == "********" || strings.HasPrefix(key, "****") {
+	if key, ok := incoming["api_key"].(string); !ok || key == "" || strings.HasPrefix(key, "****") {
 		if oldKey, ok := existing["api_key"].(string); ok && oldKey != "" {
 			incoming["api_key"] = oldKey
 		}
 	}
 
 	carryObsoleteGigahostKeys(incoming, existing)
+	return nil
 }
 
 // carryObsoleteGigahostKeys copies retired setting fields from the stored row into
@@ -186,29 +186,6 @@ func carryObsoleteGigahostKeys(incoming, existing map[string]any) {
 			incoming[key] = old
 		}
 	}
-}
-
-func (h *Handlers) persistSettings(ctx context.Context, req *models.SaveSettingsRequest) error {
-	if err := h.db.SetSetting(ctx, "appearance", req.Appearance); err != nil {
-		return err
-	}
-	if err := h.db.SetSetting(ctx, "captcha", req.Captcha); err != nil {
-		return err
-	}
-	if req.Telegram != nil {
-		if err := h.db.SetSetting(ctx, "telegram", req.Telegram); err != nil {
-			return err
-		}
-	}
-	if err := h.db.SetSetting(ctx, "ssl", req.SSL); err != nil {
-		return err
-	}
-	if req.Gigahost != nil {
-		if err := h.db.SetSetting(ctx, "gigahost", req.Gigahost); err != nil {
-			return err
-		}
-	}
-	return h.db.SetSetting(ctx, "limits", req.Limits)
 }
 
 // providerCatalogClient forwards every Client method to the injected client
@@ -232,30 +209,41 @@ func (m *providerCatalogClient) GetCatalogEligibility() gigahost.CatalogEligibil
 	return gigahost.CatalogEligibility{}
 }
 
-// SaveSettingsHandler updates persistent settings sections in the database.
+// SaveSettingsHandler updates the settings sections the request carries.
+//
+// Each section belongs to the card that sends it. A section left out of the body
+// is left as stored, and a section sent as false, zero or empty is written. A
+// request that carries all four value sections, as the page-level form did,
+// writes all four. The sections are written in one transaction and the stored
+// credentials a masked or empty field stands for are read in that same
+// transaction.
 func (h *Handlers) SaveSettingsHandler(w http.ResponseWriter, r *http.Request) {
-	var req models.SaveSettingsRequest
-	if err := h.DecodeJSON(r, &req); err != nil {
+	var body settingsSaveBody
+	if err := h.DecodeJSON(r, &body); err != nil {
+		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
+		return
+	}
+	req, err := parseSettingsSave(&body)
+	if err != nil {
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", "Invalid request body")
 		return
 	}
 
 	sess := h.GetSession(r)
 	if sess == nil || !sess.IsAdmin() {
-		if req.Gigahost != nil && len(req.Gigahost) > 0 {
+		if len(req.gigahost) > 0 {
 			h.JSONError(w, http.StatusForbidden, "forbidden", "Admin privileges required to configure provider settings")
 			return
 		}
-		req.Gigahost = nil
+		req.gigahost = nil
 	}
 
 	ctx := r.Context()
-	if req.Gigahost != nil {
-		stripObsoleteGigahostKeys(req.Gigahost)
+	if req.gigahost != nil {
+		stripObsoleteGigahostKeys(req.gigahost)
 	}
-	h.preserveSecretsOnSave(ctx, &req)
 
-	if err := h.persistSettings(ctx, &req); err != nil {
+	if err := h.persistSettings(ctx, req); err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to save settings: "+err.Error())
 		return
 	}

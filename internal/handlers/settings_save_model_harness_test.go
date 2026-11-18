@@ -67,11 +67,12 @@ w.I18N = CFG.dict;
 w._ = k => w.I18N[k] || k;
 const realFetch = fetch;
 let saveGate = null;
+let saveHeld = 0;
 let failSave = false;
 w.fetch = async (u, o) => {
   const isSave = String(u).indexOf('/api/settings/save') === 0;
   if (isSave && failSave) throw new TypeError('Failed to fetch');
-  if (isSave && saveGate) await saveGate;
+  if (isSave && saveGate) { saveHeld++; await saveGate; }
   return realFetch(CFG.base + u, o);
 };
 for (const s of CFG.scripts) { w.eval(s.source); }
@@ -83,6 +84,30 @@ async function until(fn, label, ms) {
   const end = Date.now() + (ms || 4000);
   while (Date.now() < end) { if (fn()) return; await sleep(20); }
   throw new Error('timed out waiting for ' + label);
+}
+// openTab starts a second, independent page against the same server: its own
+// window, scripts and fetch, so it behaves like another browser tab. Its saves
+// are never held. The returned helpers mirror the ones above for that window.
+async function openTab() {
+  const vc2 = new VirtualConsole();
+  vc2.on('jsdomError', () => {});
+  const d2 = new JSDOM(CFG.page, {runScripts: 'outside-only', url: CFG.base + '/settings', virtualConsole: vc2});
+  const w2 = d2.window;
+  w2.I18N = CFG.dict;
+  w2._ = k => w2.I18N[k] || k;
+  w2.fetch = (u, o) => realFetch(CFG.base + u, o);
+  for (const s of CFG.scripts) { w2.eval(s.source); }
+  await new Promise(r => { if (w2.document.readyState === 'complete') r(); else w2.addEventListener('load', r); });
+  await sleep(500);
+  const d = w2.document;
+  return {
+    w: w2,
+    type(id, value) { const el = d.getElementById(id); el.value = value; el.dispatchEvent(new w2.Event('input', {bubbles: true})); },
+    toggle(id, on) { const el = d.getElementById(id); el.checked = on; el.dispatchEvent(new w2.Event('change', {bubbles: true})); },
+    commit(id) { d.getElementById(id).querySelector('[data-commit]').click(); },
+    status(id) { return d.getElementById(id).querySelector('[data-status]'); },
+    close() { w2.close(); }
+  };
 }
 const card = id => doc.getElementById(id);
 const commitOf = id => card(id).querySelector('[data-commit]');

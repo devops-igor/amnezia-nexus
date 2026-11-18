@@ -5,22 +5,20 @@
  * credentials are each committed by the control inside their own card. The
  * endpoint is unchanged: POST /api/settings/save.
  *
- * That endpoint writes appearance, captcha, ssl and limits from whatever the
- * request carries, so a request that leaves one out stores zero values for it.
- * A card therefore never sends a partial body. It reads the stored sections
- * immediately before the write, replaces only its own, and sends the whole
- * set, which keeps every other card's stored value as it was. Telegram and
- * Gigahost are already presence-aware on the server, so a card that does not
- * own them leaves them out.
+ * The server owns what a card may change: it writes only the sections a request
+ * carries and leaves the rest as stored, and it keeps a stored secret when the
+ * field arrives empty or masked. A card therefore posts exactly its own section
+ * and nothing else, so a save here cannot restore another card's older value,
+ * whatever another tab saved in the meantime.
  *
- * Commits are serialised: a second card's read never starts before the first
- * card's write has finished, so two quick commits cannot overwrite each other.
+ * Commits are still queued, one after another in this document, so a card never
+ * starts while another card's request is in flight and the status regions
+ * report in the order the operator clicked.
  */
 (function (root) {
     'use strict';
 
     var SAVE_URL = '/api/settings/save';
-    var READ_URL = '/api/settings';
     var NAVIGATE_DELAY_MS = 800;
     var SECRET_MASK = '********';
 
@@ -32,8 +30,6 @@
         telegram: 'telegramCard',
         gigahost: 'gigahostCard'
     };
-    // The value-struct sections the server rewrites on every save.
-    var ALWAYS_SENT = ['appearance', 'captcha', 'ssl', 'limits'];
 
     var chain = Promise.resolve();
     var loadedLanguage = null;
@@ -116,13 +112,10 @@
         return (err && err.message) || tr('error');
     }
 
-    // buildBody returns the request for one card: the stored values for the
-    // sections it does not own, and its own section from the screen.
-    function buildBody(key, stored) {
+    // buildBody returns the request for one card: its own section, read from the
+    // screen, and no other.
+    function buildBody(key) {
         var body = {};
-        ALWAYS_SENT.forEach(function (name) {
-            body[name] = (stored && stored[name]) || {};
-        });
         body[key] = collectors[key]();
         return body;
     }
@@ -195,14 +188,7 @@
         cards().clearReport(card);
         cards().busy(card, true);
         try {
-            var stored;
-            try {
-                stored = await root.API.get(READ_URL, { silent: true });
-            } catch (err) {
-                cards().report(card, 'error', tr('settings_save_read_failed') + ': ' + failure(err));
-                return false;
-            }
-            var body = buildBody(key, stored);
+            var body = buildBody(key);
             var sent = cards().capture(card);
             try {
                 await root.API.post(SAVE_URL, body, { silent: true });

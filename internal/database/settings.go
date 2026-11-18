@@ -30,9 +30,16 @@ func (d *DB) GetSetting(ctx context.Context, key string, target any) error {
 		return nil
 	}
 
+	return d.decodeStoredSetting(key, val.String, target)
+}
+
+// decodeStoredSetting deserializes one stored setting into target and decrypts
+// the credentials the row keeps encrypted. GetSetting and the settings
+// transaction reader share it, so both answer with the same plaintext.
+func (d *DB) decodeStoredSetting(key, raw string, target any) error {
 	if key == "ssl" {
 		var sslMap map[string]any
-		if err := json.Unmarshal([]byte(val.String), &sslMap); err == nil {
+		if err := json.Unmarshal([]byte(raw), &sslMap); err == nil {
 			if kt, ok := sslMap["key_text"].(string); ok && kt != "" {
 				sslMap["key_text"] = security.DecryptCredentialSafe(kt, d.secretKey)
 			}
@@ -47,7 +54,7 @@ func (d *DB) GetSetting(ctx context.Context, key string, target any) error {
 		}
 	} else if key == "gigahost" {
 		var ghMap map[string]any
-		if err := json.Unmarshal([]byte(val.String), &ghMap); err == nil {
+		if err := json.Unmarshal([]byte(raw), &ghMap); err == nil {
 			if apiKey, ok := ghMap["api_key"].(string); ok && apiKey != "" {
 				ghMap["api_key"] = security.DecryptCredentialSafe(apiKey, d.secretKey)
 			}
@@ -59,7 +66,7 @@ func (d *DB) GetSetting(ctx context.Context, key string, target any) error {
 		}
 	} else if key == "notifications" {
 		var ntMap map[string]any
-		if err := json.Unmarshal([]byte(val.String), &ntMap); err == nil {
+		if err := json.Unmarshal([]byte(raw), &ntMap); err == nil {
 			if token, ok := ntMap["app_token"].(string); ok && token != "" {
 				ntMap["app_token"] = security.DecryptCredentialSafe(token, d.secretKey)
 			}
@@ -71,7 +78,7 @@ func (d *DB) GetSetting(ctx context.Context, key string, target any) error {
 		}
 	}
 
-	return json.Unmarshal([]byte(val.String), target)
+	return json.Unmarshal([]byte(raw), target)
 }
 
 // GetSettingRaw retrieves the raw string value of a setting, distinguishing between
@@ -164,21 +171,9 @@ func (d *DB) SetSetting(ctx context.Context, key string, value any) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
-	valToStore := value
-	if key == "ssl" {
-		valToStore = d.prepareSSLSettingForStore(value)
-	} else if key == "gigahost" {
-		var prepErr error
-		valToStore, prepErr = d.prepareGigahostSettingForStore(value)
-		if prepErr != nil {
-			return prepErr
-		}
-	} else if key == "notifications" {
-		var prepErr error
-		valToStore, prepErr = d.prepareNotificationsSettingForStore(value)
-		if prepErr != nil {
-			return prepErr
-		}
+	valToStore, err := d.prepareSettingForStore(key, value)
+	if err != nil {
+		return err
 	}
 
 	b, err := json.Marshal(valToStore)
@@ -195,6 +190,21 @@ func (d *DB) SetSetting(ctx context.Context, key string, value any) error {
 	}
 
 	return nil
+}
+
+// prepareSettingForStore applies the at-rest encryption a setting key requires
+// before it is serialized. Keys without stored credentials pass through.
+func (d *DB) prepareSettingForStore(key string, value any) (any, error) {
+	switch key {
+	case "ssl":
+		return d.prepareSSLSettingForStore(value), nil
+	case "gigahost":
+		return d.prepareGigahostSettingForStore(value)
+	case "notifications":
+		return d.prepareNotificationsSettingForStore(value)
+	default:
+		return value, nil
+	}
 }
 
 // UpdateSetting is an alias for SetSetting.
@@ -216,21 +226,9 @@ func (d *DB) SetSettingsBulk(ctx context.Context, settings map[string]any) error
 	}()
 
 	for key, value := range settings {
-		valToStore := value
-		if key == "ssl" {
-			valToStore = d.prepareSSLSettingForStore(value)
-		} else if key == "gigahost" {
-			var prepErr error
-			valToStore, prepErr = d.prepareGigahostSettingForStore(value)
-			if prepErr != nil {
-				return prepErr
-			}
-		} else if key == "notifications" {
-			var prepErr error
-			valToStore, prepErr = d.prepareNotificationsSettingForStore(value)
-			if prepErr != nil {
-				return prepErr
-			}
+		valToStore, err := d.prepareSettingForStore(key, value)
+		if err != nil {
+			return err
 		}
 
 		b, err := json.Marshal(valToStore)

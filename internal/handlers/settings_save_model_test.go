@@ -325,3 +325,64 @@ assert.equal(toasts.length, 0, 'no page toast: ' + JSON.stringify(toasts));
 		t.Errorf("the provider key was not stored by its card: %v", gh["api_key"])
 	}
 }
+
+// TestSettingsSaveModel_TwoClientsInterleavedKeepBothSecurityChanges: the review
+// oracle for section ownership. Client A starts an Appearance save and its
+// request is held at a barrier on the wire. While it is held, client B, an
+// independent page on the same database, commits Captcha and Limits and gets its
+// success. Then A's request is released. Both changes must be what a reload
+// shows, and the rows and secrets neither client touched must be unchanged.
+//
+// A client that carried the whole settings document forward would send the
+// Captcha and Limits values it read before B's commits, and this fails.
+func TestSettingsSaveModel_TwoClientsInterleavedKeepBothSecurityChanges(t *testing.T) {
+	h, _, _ := setupTestHandlers(t)
+	runSettingsScenario(t, h, `
+const tabB = await openTab();
+
+let release;
+saveGate = new Promise(r => { release = r; });
+type('app_title', 'Client A Title');
+commitOf('appearanceCard').click();
+await until(() => saveHeld > 0, 'client A request to reach the barrier');
+
+tabB.toggle('captcha_enabled', true);
+tabB.commit('captchaCard');
+await until(() => shown(tabB.status('captchaCard')), 'client B captcha to save');
+tabB.type('max_connections_per_user', '23');
+tabB.commit('limitsCard');
+await until(() => shown(tabB.status('limitsCard')), 'client B limits to save');
+
+const mid = await stored();
+assert.equal(mid.captcha.enabled, true, 'client B captcha is stored before A is released');
+assert.equal(mid.appearance.title, 'Seed Title', 'client A has not written yet');
+
+release();
+await until(() => shown(statusOf('appearanceCard')), 'client A to report success');
+tabB.close();
+
+const s = await stored();
+assert.equal(s.appearance.title, 'Client A Title', 'client A change was lost');
+assert.equal(s.captcha.enabled, true, 'client A undid the captcha that client B saved');
+assert.equal(s.limits.max_connections_per_user, 23, 'client A undid the limits that client B saved');
+assert.equal(s.ssl.domain, 'seed.example.test', 'client A or B changed an ssl row nobody edited');
+`)
+
+	ctx := context.Background()
+	var ssl models.SSLSettings
+	_ = h.db.GetSetting(ctx, "ssl", &ssl)
+	if ssl.KeyText != probeKeyText || ssl.CertText != probeCertText {
+		t.Errorf("the interleaved saves changed the stored TLS material: key=%q cert=%q", ssl.KeyText, ssl.CertText)
+	}
+	var tg map[string]any
+	_ = h.db.GetSetting(ctx, "telegram", &tg)
+	if tg["bot_token"] != probeBotToken || tg["chat_id"] != "-100seed" {
+		t.Errorf("the interleaved saves changed the telegram row: %v", tg)
+	}
+	page := renderSettingsPageFor(t, h, models.RoleAdmin)
+	for _, want := range []string{`id="captcha_enabled" checked`, `value="Client A Title"`, `value="23"`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the reloaded settings page does not render %q", want)
+		}
+	}
+}
