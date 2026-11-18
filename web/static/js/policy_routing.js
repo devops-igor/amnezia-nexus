@@ -334,6 +334,11 @@
         if (localTextarea) {
             localTextarea.value = local.join('\n');
         }
+        var excluded = Array.isArray(record.excluded_domains) ? record.excluded_domains : [];
+        var excludedTextarea = policyElement('policy_excluded_domains');
+        if (excludedTextarea) {
+            excludedTextarea.value = excluded.join('\n');
+        }
 
         var interval = policyElement('policy_sync_interval');
         if (interval && typeof record.sync_interval_seconds === 'number') {
@@ -523,6 +528,18 @@
         });
     }
 
+    function policyExcludedDomains() {
+        var textarea = policyElement('policy_excluded_domains');
+        if (!textarea || typeof textarea.value !== 'string') {
+            return [];
+        }
+        return textarea.value.split('\n').map(function (line) {
+            return line.trim();
+        }).filter(function (line) {
+            return line !== '';
+        });
+    }
+
     function policySavePayload() {
         var preset = policySelectedPreset();
         var enabledInput = policyElement('policy_enabled');
@@ -533,6 +550,7 @@
             preset: preset,
             custom_urls: preset === 'custom' ? policyCustomURLs() : [],
             local_entries: policyLocalEntries(),
+            excluded_domains: policyExcludedDomains(),
             sync_interval_seconds: isFinite(interval) && interval > 0 ? interval : 0
         };
     }

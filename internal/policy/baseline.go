@@ -80,7 +80,7 @@ func (s *Syncer) AdoptBaseline(ctx context.Context) (BaselineStatus, error) {
 	// the replacement syncer treat those rules as the live baseline; the guard
 	// version is part of neither the generative identity nor the config hash, so
 	// the content itself has to be checked.
-	if violations := GenerationNeverProxyViolations(gen); len(violations) > 0 {
+	if violations := generationNeverProxyViolations(gen, s.guardPatterns); len(violations) > 0 {
 		return BaselineForeign, nil
 	}
 	s.cachedGen = gen
@@ -162,7 +162,7 @@ func (s *Syncer) prepareBaselineSnapshot(gen *Generation) (*Snapshot, BaselineSt
 	// A durable generation records what an older build published, not what the
 	// current guard permits. Publishing a snapshot with a guarded name would
 	// proxy protected infrastructure exactly when the upstream fetch also fails.
-	if violations := GenerationNeverProxyViolations(gen); len(violations) > 0 {
+	if violations := generationNeverProxyViolations(gen, s.guardPatterns); len(violations) > 0 {
 		return nil, BaselineForeign, nil
 	}
 	snap, err := GenerationToSnapshot(gen)
@@ -173,4 +173,15 @@ func (s *Syncer) prepareBaselineSnapshot(gen *Generation) (*Snapshot, BaselineSt
 		return nil, BaselineAbsent, errors.New("stored policy generation contains no rules")
 	}
 	return snap, BaselinePrimed, nil
+}
+
+// GenerationViolations returns the stored domain rules that this syncer's
+// current guard (built-in patterns plus operator exclusions) forbids. It is the
+// validator the vpn last-known-good fallback uses, so a generation written
+// before an operator exclusion is never published after a restart.
+func (s *Syncer) GenerationViolations(gen *Generation) []string {
+	if s == nil {
+		return GenerationNeverProxyViolations(gen)
+	}
+	return generationNeverProxyViolations(gen, s.guardPatterns)
 }

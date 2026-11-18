@@ -127,6 +127,7 @@ func policySettingsEqual(a, b policy.Settings) bool {
 		a.SyncInterval == b.SyncInterval &&
 		slices.Equal(a.CustomURLs, b.CustomURLs) &&
 		slices.Equal(a.LocalEntries, b.LocalEntries) &&
+		slices.Equal(a.ExcludedDomains, b.ExcludedDomains) &&
 		slices.Equal(a.UpstreamDNS, b.UpstreamDNS)
 }
 
@@ -175,6 +176,7 @@ func (h *Handlers) GetPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		"preset":                string(settings.Preset),
 		"custom_urls":           customURLsOrEmpty(settings.CustomURLs),
 		"local_entries":         localEntriesOrEmpty(settings.LocalEntries),
+		"excluded_domains":      excludedDomainsOrEmpty(settings.ExcludedDomains),
 		"sync_interval_seconds": settings.SyncInterval,
 		"upstream_dns":          upstreamDNSOrEmpty(settings.UpstreamDNS),
 	}
@@ -198,6 +200,13 @@ func customURLsOrEmpty(urls []string) []string {
 // that uses the effective default upstream list. An empty array therefore reads
 // as "no explicit list", which is exactly what the setting means.
 func localEntriesOrEmpty(entries []string) []string {
+	if entries == nil {
+		return []string{}
+	}
+	return entries
+}
+
+func excludedDomainsOrEmpty(entries []string) []string {
 	if entries == nil {
 		return []string{}
 	}
@@ -272,13 +281,10 @@ func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A save that omits the upstream list keeps the stored one; the merge happens
+	// A save that omits an additive field keeps the stored one; the merge happens
 	// inside this mutation boundary so the record cannot change between the read
 	// and the write. The effective record is validated before it is persisted.
-	merged, mergeErr := mergeStoredUpstreams(incoming, previous)
-	if mergeErr == nil {
-		merged, mergeErr = mergeStoredLocalEntries(merged, previous)
-	}
+	merged, mergeErr := mergeStoredPolicyFields(incoming, previous)
 	if mergeErr != nil {
 		h.audit(r, "policy.settings_save", map[string]any{"result": "rejected", "reason": mergeErr.Error()})
 		h.JSONError(w, http.StatusBadRequest, "validation_failed", mergeErr.Error())
@@ -306,6 +312,7 @@ func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
 	h.audit(r, "policy.settings_save", map[string]any{
 		"result": "ok", "enabled": incoming.Enabled, "preset": string(incoming.Preset),
 		"custom_url_count": len(incoming.CustomURLs), "local_entry_count": len(incoming.LocalEntries),
+		"excluded_domain_count": len(incoming.ExcludedDomains),
 		"sync_interval_seconds": incoming.SyncInterval, "upstream_dns_count": len(incoming.UpstreamDNS),
 	})
 	h.JSON(w, http.StatusOK, h.policyPutResponse(incoming))
@@ -407,6 +414,21 @@ func mergeStoredUpstreams(incoming policy.Settings, previous previousPolicyRecor
 	return merged, nil
 }
 
+// mergeStoredPolicyFields fills every additive field a save omits from the stored
+// record and validates the result. The merge is one step because the fields
+// interact: a local entry may not overlap an exclusion.
+func mergeStoredPolicyFields(incoming policy.Settings, previous previousPolicyRecord) (policy.Settings, error) {
+	merged, err := mergeStoredUpstreams(incoming, previous)
+	if err != nil {
+		return policy.Settings{}, err
+	}
+	merged, err = mergeStoredLocalEntries(merged, previous)
+	if err != nil {
+		return policy.Settings{}, err
+	}
+	return mergeStoredExcludedDomains(merged, previous)
+}
+
 // mergeStoredLocalEntries preserves the stored local entries when a save omits
 // the field. An explicitly empty slice is a deliberate removal.
 func mergeStoredLocalEntries(incoming policy.Settings, previous previousPolicyRecord) (policy.Settings, error) {
@@ -423,6 +445,22 @@ func mergeStoredLocalEntries(incoming policy.Settings, previous previousPolicyRe
 	return merged, nil
 }
 
+// mergeStoredExcludedDomains preserves the stored exclusion list when a save
+// omits the field. An explicitly empty slice is a deliberate removal.
+func mergeStoredExcludedDomains(incoming policy.Settings, previous previousPolicyRecord) (policy.Settings, error) {
+	if incoming.ExcludedDomains != nil {
+		return incoming, nil
+	}
+	merged := incoming
+	if previous.present {
+		merged.ExcludedDomains = previous.settings.ExcludedDomains
+	}
+	if err := merged.Validate(); err != nil {
+		return policy.Settings{}, err
+	}
+	return merged, nil
+}
+
 // policyPutResponse renders the saved record plus live status.
 func (h *Handlers) policyPutResponse(saved policy.Settings) map[string]any {
 	response := map[string]any{
@@ -431,6 +469,7 @@ func (h *Handlers) policyPutResponse(saved policy.Settings) map[string]any {
 		"preset":                string(saved.Preset),
 		"custom_urls":           customURLsOrEmpty(saved.CustomURLs),
 		"local_entries":         localEntriesOrEmpty(saved.LocalEntries),
+		"excluded_domains":      excludedDomainsOrEmpty(saved.ExcludedDomains),
 		"sync_interval_seconds": saved.SyncInterval,
 		"upstream_dns":          upstreamDNSOrEmpty(saved.UpstreamDNS),
 	}

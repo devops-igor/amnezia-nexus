@@ -334,13 +334,30 @@ excluded, duplicate and failure counts.
 
 The never-proxy guard is applied to every external component and to local
 entries, and again to the composed rule set. It removes DOMAIN rules that are
-equal to, below, or broad ancestors of Russian state/government patterns and the
-explicit internal-service denylist. Excluded names keep the existing default
-path; the guard never turns another destination DIRECT. Local entries are
+equal to, below, or broad ancestors of the built-in patterns and the
+operator-supplied `excluded_domains` list. Excluded names keep the existing
+default path; the guard never turns another destination DIRECT. Local entries are
 persisted as an additive settings field, accept bare domains, `*.` subdomains,
 IPv4 literals and IPv4 CIDRs, and are refused with the named guard reason when a
-domain matches the denylist. An empty local list does not change the generation;
-adding or removing a local entry does.
+domain matches the guard or the exclusion list. An empty local list does not
+change the generation; adding or removing a local entry does.
+
+The built-in guard includes the Russian state/government patterns, the
+internal-service denylist and the whole VK family (`vk.com`, `vk.ru`,
+`vkontakte.ru`, `userapi.com`, `vk-apps.com`, `vkvideo.ru`, `vkforms.ru`,
+`vkplay.live`, `vkopt.net`, `vk.me`, `vk-cdn.net`). `excluded_domains` is the
+operator-editable half of the same set: bare domains and `*.` entries, persisted
+with the policy settings and applied with the same ancestor semantics. IPv4,
+IPv6 and CIDR entries are refused there because a name-based list cannot override
+a proxy CIDR at the packet path.
+
+**Ancestor-removal consequence.** A rule is removed when it is equal to, a
+subdomain of, or an ancestor of a protected name. Excluding `api.example.com`
+therefore also removes a proxied `example.com` rule, so the whole parent becomes
+direct. That is the fail-safe direction: a broad parent rule would otherwise
+proxy the excluded name. If a single subdomain must stay direct while its parent
+remains proxied, that needs a decision-time DIRECT rule before the PROXY decision
+and is not provided by this guard.
 
 The guard is name-based, and that is the exact boundary of the guarantee:
 
@@ -358,10 +375,10 @@ The guard is name-based, and that is the exact boundary of the guarantee:
   destination that must stay direct. The shipped aggregate has no CIDRs.
 - **Stored snapshots are revalidated.** `PrimeBaseline`, `AdoptBaseline` and the
   vpn last-known-good fallback check a durable generation's domain rules against
-  the current guard before publishing them. A snapshot written before a guard
-  pattern existed is reported as a foreign baseline and is never activated; if
-  the upstream fetch also fails, startup activation is refused rather than
-  proxying the stale protected name.
+  the current guard and operator exclusions before publishing them. A snapshot
+  written before a guard pattern or exclusion existed is reported as a foreign
+  baseline and is never activated; if the upstream fetch also fails, startup
+  activation is refused rather than proxying the stale protected name.
 
 ## 6. Limitations
 

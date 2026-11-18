@@ -205,7 +205,8 @@ await settle();
 const puts = requestsTo('/api/vpn/policy', 'PUT');
 assert.equal(puts.length, 1, 'one save is exactly one PUT');
 assert.deepEqual(puts[0].body, {enabled: true, preset: 'russia_inside', custom_urls: [],
-                                local_entries: [], sync_interval_seconds: 21600},
+                                local_entries: [], excluded_domains: [],
+                                sync_interval_seconds: 21600},
   'the save payload carries the operator intent and the preserved interval');
 assert.equal(alertText().state, 'success', 'an accepted save is reported as success');
 assert.equal(alertText().text, 'policy_saved');
@@ -347,6 +348,7 @@ assert.equal(w.document.getElementById('policyCustomUrlsGroup').style.display, '
 w.document.getElementById('policy_custom_urls').value =
   '  https://lists.example.com/a.lst  \n\n https://lists.example.com/b.lst \n';
 w.document.getElementById('policy_local_entries').value = ' local.example \n\n 198.51.100.0/24 ';
+w.document.getElementById('policy_excluded_domains').value = ' internal.api.example.com \n\n *.corp.example ';
 responder = async (url, opts) => {
   if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
@@ -372,6 +374,9 @@ assert.deepEqual(puts[0].body.custom_urls,
 assert.deepEqual(puts[0].body.local_entries,
   ['local.example', '198.51.100.0/24'],
   'the payload carries local entries in order; blank/comment handling stays server-side');
+assert.deepEqual(puts[0].body.excluded_domains,
+  ['internal.api.example.com', '*.corp.example'],
+  'the payload carries excluded domains, trimmed and without blank lines');
 assert.ok(alertText().text.indexOf('scheme must be https') !== -1,
   'the server validation detail is surfaced, got: ' + alertText().text);
 // The reload returns the stored record, so a rejected entry is not shown as saved.
