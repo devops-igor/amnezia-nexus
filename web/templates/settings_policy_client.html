@@ -1,12 +1,12 @@
 {{ define "settings_policy_client" }}
 {{ if is_admin .current_user }}
-<div class="card settings-section-card" id="policyClientCard" style="margin-top: var(--space-lg);">
-    <div class="settings-card-header" style="display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm);">
-        <div style="display: flex; align-items: center; gap: var(--space-sm);">
+<div class="card settings-section-card settings-card-stacked" id="policyClientCard">
+    <div class="settings-card-header settings-card-header-split">
+        <div class="settings-inline">
             <svg class="icon"><use href="#icon-users"></use></svg>
-            <h3 class="card-title">{{ _ "policy_client_title" }}</h3>
+            <h2 class="card-title">{{ _ "policy_client_title" }}</h2>
         </div>
-        <button type="button" class="btn btn-secondary" id="policyClientRefreshBtn" style="display: flex; align-items: center; gap: var(--space-sm);">
+        <button type="button" class="btn btn-secondary" id="policyClientRefreshBtn">
             <svg class="icon"><use href="#icon-refresh"></use></svg>
             <span id="policyClientRefreshText">{{ _ "policy_client_refresh_btn" }}</span>
             <span class="spinner hidden" id="policyClientRefreshSpinner" aria-hidden="true"></span>
@@ -15,7 +15,7 @@
 
     <p class="form-hint">{{ _ "policy_client_hint" }}</p>
 
-    <div id="policyClientAlert" role="status" aria-live="polite" aria-atomic="true" style="display: none; padding: var(--space-sm) var(--space-md); border-radius: var(--radius-sm); margin-bottom: var(--space-md); font-size: 0.85rem;"></div>
+    <div id="policyClientAlert" role="status" aria-live="polite" aria-atomic="true" class="settings-notice settings-notice-spaced" hidden></div>
 
     <div class="form-group">
         <label class="form-label" for="policyClientSelect">{{ _ "policy_client_select_label" }}</label>
@@ -25,8 +25,8 @@
         <p class="form-hint" id="policyClientSelectHint">{{ _ "policy_client_select_hint" }}</p>
     </div>
 
-    <div style="display: flex; flex-wrap: wrap; gap: var(--space-sm); align-items: center;">
-        <button type="button" class="btn btn-primary" id="policyClientDiagnoseBtn" disabled style="display: flex; align-items: center; gap: var(--space-sm);">
+    <div class="settings-toolbar">
+        <button type="button" class="btn btn-primary" id="policyClientDiagnoseBtn" disabled>
             <svg class="icon"><use href="#icon-search"></use></svg>
             <span id="policyClientDiagnoseText">{{ _ "policy_client_diagnose_btn" }}</span>
             <span class="spinner hidden" id="policyClientDiagnoseSpinner" aria-hidden="true"></span>
@@ -35,7 +35,7 @@
     </div>
 
     <div id="policyClientResult" hidden>
-        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_selection_label" }}</div>
+        <div class="divider">{{ _ "policy_client_selection_label" }}</div>
         <div class="info-card-grid">
             <div class="info-card-item">
                 <span class="info-card-label">{{ _ "policy_client_field_session" }}</span>
@@ -62,7 +62,7 @@
         </div>
         <p class="form-hint" id="policyClientFilterFoot" hidden></p>
 
-        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_evidence_label" }}</div>
+        <div class="divider">{{ _ "policy_client_evidence_label" }}</div>
         <p class="form-hint">{{ _ "policy_client_evidence_hint" }}</p>
         <div class="table-container">
             <table class="data-table">
@@ -80,7 +80,7 @@
         </div>
         <p class="form-hint" id="policyClientEvidenceFoot" hidden></p>
 
-        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_flows_label" }}</div>
+        <div class="divider">{{ _ "policy_client_flows_label" }}</div>
         <p class="form-hint">{{ _ "policy_client_flows_hint" }}</p>
         <div class="table-container">
             <table class="data-table">
@@ -101,7 +101,7 @@
         </div>
         <p class="form-hint" id="policyClientFlowFoot" hidden></p>
 
-        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_dns_label" }}</div>
+        <div class="divider">{{ _ "policy_client_dns_label" }}</div>
         <p class="form-hint">{{ _ "policy_client_dns_hint" }}</p>
         <div class="table-container">
             <table class="data-table">
@@ -122,9 +122,9 @@
         </div>
         <p class="form-hint" id="policyClientDNSFoot" hidden></p>
         <p class="form-hint" id="policyClientDNSCoverage"></p>
-        <ul class="form-hint" id="policyClientDNSGaps" style="margin: 0; padding-inline-start: var(--space-lg);"></ul>
+        <ul class="form-hint settings-bullets" id="policyClientDNSGaps"></ul>
 
-        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_dns_events_label" }}</div>
+        <div class="divider">{{ _ "policy_client_dns_events_label" }}</div>
         <p class="form-hint">{{ _ "policy_client_dns_events_hint" }}</p>
         <div class="table-container">
             <table class="data-table">
@@ -145,13 +145,13 @@
         <p class="form-hint" id="policyClientEventFoot" hidden></p>
         <p class="form-hint" id="policyClientEventCoverage"></p>
 
-        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_limits_label" }}</div>
+        <div class="divider">{{ _ "policy_client_limits_label" }}</div>
         <p class="form-hint">{{ _ "policy_client_not_covered_label" }}</p>
-        <ul class="form-hint" id="policyClientNotCovered" style="margin: 0; padding-inline-start: var(--space-lg);"></ul>
+        <ul class="form-hint settings-bullets" id="policyClientNotCovered"></ul>
         <p class="form-hint">{{ _ "policy_client_limitations_label" }}</p>
-        <ul class="form-hint" id="policyClientLimitations" style="margin: 0; padding-inline-start: var(--space-lg);"></ul>
+        <ul class="form-hint settings-bullets" id="policyClientLimitations"></ul>
 
-        <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_client_drops_label" }}</div>
+        <div class="divider">{{ _ "policy_client_drops_label" }}</div>
         <p class="form-hint">{{ _ "policy_client_drops_hint" }}</p>
         <div class="table-container">
             <table>

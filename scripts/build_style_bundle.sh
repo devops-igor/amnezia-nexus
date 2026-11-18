@@ -2,7 +2,7 @@
 # ==============================================================================
 # build_style_bundle.sh — Concatenates modular stylesheets into style.css
 #
-# Generates web/static/css/style.css by concatenating the 7 canonical CSS modules
+# Generates web/static/css/style.css by concatenating the 8 canonical CSS modules
 # in deterministic order, preserving parity with TestStyleCSSConcatenationParity.
 # ==============================================================================
 
@@ -21,6 +21,7 @@ MODULES=(
     "tables.css"
     "server.css"
     "vpn.css"
+    "settings.css"
 )
 
 TEMP_FILE="$(mktemp "${OUTPUT_FILE}.tmp.XXXXXX")"

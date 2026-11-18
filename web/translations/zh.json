@@ -1148,5 +1148,10 @@
   "policy_excluded_domains_label": "永不代理的域名",
   "policy_excluded_domains_placeholder": "internal.api.example.com\n*.corp.example",
   "policy_excluded_domains_hint": "绝不能进入 PROXY 集合的域名。每行一个裸域名或 *. 条目；忽略空行和注释。排除子域名也会移除更宽泛的父规则，因此整个父域保持直连。此处不接受 IPv4/CIDR 条目。",
+<<<<<<< HEAD
   "policy_client_tried_names_fmt": "已尝试 {names}"
+=======
+  "deploy_vps_refresh_catalog": "刷新目录和最近的部署",
+  "upstream_releases_link": "发布标签"
+>>>>>>> origin/main
 }

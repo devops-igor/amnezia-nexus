@@ -12,16 +12,16 @@
         color: var(--text-secondary);
     }
 </style>
-<div class="card settings-section-card" id="policyRoutingCard" style="margin-top: var(--space-lg);">
-    <div class="settings-card-header" style="display: flex; align-items: center; justify-content: space-between;">
-        <div style="display: flex; align-items: center; gap: var(--space-sm);">
+<div class="card settings-section-card settings-card-stacked" id="policyRoutingCard">
+    <div class="settings-card-header settings-card-header-split">
+        <div class="settings-inline">
             <svg class="icon"><use href="#icon-globe"></use></svg>
-            <h3 class="card-title">{{ _ "policy_title" }}</h3>
+            <h2 class="card-title">{{ _ "policy_title" }}</h2>
         </div>
-        <span id="policyStatusBadge" class="badge badge-secondary" style="font-size: 0.72rem;">{{ _ "policy_status_disabled" }}</span>
+        <span id="policyStatusBadge" class="badge badge-secondary">{{ _ "policy_status_disabled" }}</span>
     </div>
 
-    <div id="policyAlert" role="status" aria-live="polite" aria-atomic="true" style="display: none; padding: var(--space-sm) var(--space-md); border-radius: var(--radius-sm); margin-bottom: var(--space-md); font-size: 0.85rem;"></div>
+    <div id="policyAlert" role="status" aria-live="polite" aria-atomic="true" class="settings-notice settings-notice-spaced" hidden></div>
 
     <form id="policyRoutingForm">
         <div class="form-group">
@@ -35,54 +35,54 @@
             <p class="form-hint" id="policyDirectEgressNotice">{{ _ "policy_direct_egress_notice" }}</p>
         </div>
 
-        <fieldset class="form-group" style="border: 0; padding: 0; margin-inline: 0; min-width: 0;">
-            <legend class="form-label" style="padding: 0;">{{ _ "policy_preset_label" }}</legend>
-            <label data-policy-preset="aggregate" style="display: flex; gap: var(--space-sm); align-items: flex-start; padding: var(--space-sm); border: 1px solid var(--border-color); border-radius: var(--radius-sm); margin-bottom: var(--space-xs);">
+        <fieldset class="form-group settings-fieldset">
+            <legend class="form-label settings-flush">{{ _ "policy_preset_label" }}</legend>
+            <label data-policy-preset="aggregate" class="settings-choice">
                 <input type="radio" name="policy_preset" value="aggregate" id="policy_preset_aggregate">
                 <span>
-                    <span style="font-weight: 600;">{{ _ "policy_preset_aggregate" }}</span>
-                    <span class="form-hint" style="display: block;">{{ _ "policy_preset_aggregate_hint" }}</span>
+                    <span class="settings-choice-title">{{ _ "policy_preset_aggregate" }}</span>
+                    <span class="form-hint settings-choice-hint">{{ _ "policy_preset_aggregate_hint" }}</span>
                 </span>
             </label>
-            <label data-policy-preset="russia_inside" style="display: flex; gap: var(--space-sm); align-items: flex-start; padding: var(--space-sm); border: 1px solid var(--border-color); border-radius: var(--radius-sm); margin-bottom: var(--space-xs);">
+            <label data-policy-preset="russia_inside" class="settings-choice">
                 <input type="radio" name="policy_preset" value="russia_inside" id="policy_preset_russia_inside">
                 <span>
-                    <span style="font-weight: 600;">{{ _ "policy_preset_russia_inside" }}</span>
-                    <span class="form-hint" style="display: block;">{{ _ "policy_preset_russia_inside_hint" }}</span>
+                    <span class="settings-choice-title">{{ _ "policy_preset_russia_inside" }}</span>
+                    <span class="form-hint settings-choice-hint">{{ _ "policy_preset_russia_inside_hint" }}</span>
                 </span>
             </label>
-            <label data-policy-preset="geoblock" style="display: flex; gap: var(--space-sm); align-items: flex-start; padding: var(--space-sm); border: 1px solid var(--border-color); border-radius: var(--radius-sm); margin-bottom: var(--space-xs);">
+            <label data-policy-preset="geoblock" class="settings-choice">
                 <input type="radio" name="policy_preset" value="geoblock" id="policy_preset_geoblock">
                 <span>
-                    <span style="font-weight: 600;">{{ _ "policy_preset_geoblock" }}</span>
-                    <span class="form-hint" style="display: block;">{{ _ "policy_preset_geoblock_hint" }}</span>
+                    <span class="settings-choice-title">{{ _ "policy_preset_geoblock" }}</span>
+                    <span class="form-hint settings-choice-hint">{{ _ "policy_preset_geoblock_hint" }}</span>
                 </span>
             </label>
-            <label data-policy-preset="antifilter_domains" style="display: flex; gap: var(--space-sm); align-items: flex-start; padding: var(--space-sm); border: 1px solid var(--border-color); border-radius: var(--radius-sm); margin-bottom: var(--space-xs);">
+            <label data-policy-preset="antifilter_domains" class="settings-choice">
                 <input type="radio" name="policy_preset" value="antifilter_domains" id="policy_preset_antifilter_domains">
                 <span>
-                    <span style="font-weight: 600;">{{ _ "policy_preset_antifilter_domains" }}</span>
-                    <span class="form-hint" style="display: block;">{{ _ "policy_preset_antifilter_domains_hint" }}</span>
+                    <span class="settings-choice-title">{{ _ "policy_preset_antifilter_domains" }}</span>
+                    <span class="form-hint settings-choice-hint">{{ _ "policy_preset_antifilter_domains_hint" }}</span>
                 </span>
             </label>
-            <label data-policy-preset="antifilter_ipv4" style="display: flex; gap: var(--space-sm); align-items: flex-start; padding: var(--space-sm); border: 1px solid var(--border-color); border-radius: var(--radius-sm); margin-bottom: var(--space-xs);">
+            <label data-policy-preset="antifilter_ipv4" class="settings-choice">
                 <input type="radio" name="policy_preset" value="antifilter_ipv4" id="policy_preset_antifilter_ipv4">
                 <span>
-                    <span style="font-weight: 600;">{{ _ "policy_preset_antifilter_ipv4" }}</span>
-                    <span class="form-hint" style="display: block;">{{ _ "policy_preset_antifilter_ipv4_hint" }}</span>
+                    <span class="settings-choice-title">{{ _ "policy_preset_antifilter_ipv4" }}</span>
+                    <span class="form-hint settings-choice-hint">{{ _ "policy_preset_antifilter_ipv4_hint" }}</span>
                 </span>
             </label>
-            <label data-policy-preset="custom" style="display: flex; gap: var(--space-sm); align-items: flex-start; padding: var(--space-sm); border: 1px solid var(--border-color); border-radius: var(--radius-sm); margin-bottom: var(--space-xs);">
+            <label data-policy-preset="custom" class="settings-choice">
                 <input type="radio" name="policy_preset" value="custom" id="policy_preset_custom">
                 <span>
-                    <span style="font-weight: 600;">{{ _ "policy_preset_custom" }}</span>
-                    <span class="form-hint" style="display: block;">{{ _ "policy_preset_custom_hint" }}</span>
+                    <span class="settings-choice-title">{{ _ "policy_preset_custom" }}</span>
+                    <span class="form-hint settings-choice-hint">{{ _ "policy_preset_custom_hint" }}</span>
                 </span>
             </label>
             <p class="form-hint">{{ _ "policy_preset_unavailable_note" }}</p>
         </fieldset>
 
-        <div class="form-group" id="policyCustomUrlsGroup" style="display: none;">
+        <div class="form-group" id="policyCustomUrlsGroup" hidden>
             <label class="form-label" for="policy_custom_urls">{{ _ "policy_custom_urls_label" }}</label>
             <textarea class="form-input font-mono" id="policy_custom_urls" name="policy_custom_urls" rows="3" spellcheck="false" autocapitalize="none" placeholder="{{ _ "policy_custom_urls_placeholder" }}"></textarea>
         </div>
@@ -102,13 +102,13 @@
         <p class="form-hint">{{ _ "policy_semantics_notice" }}</p>
         <p class="form-hint">{{ _ "policy_limits_notice" }}</p>
 
-        <div style="display: flex; flex-wrap: wrap; gap: var(--space-sm); margin-top: var(--space-md);">
-            <button type="submit" class="btn btn-primary" id="policySaveBtn" style="display: flex; align-items: center; gap: var(--space-sm);" disabled>
+        <div class="settings-button-row">
+            <button type="submit" class="btn btn-primary" id="policySaveBtn" disabled>
                 <svg class="icon"><use href="#icon-check"></use></svg>
                 <span id="policySaveBtnText">{{ _ "policy_save_btn" }}</span>
                 <span class="spinner hidden" id="policySaveSpinner" aria-hidden="true"></span>
             </button>
-            <button type="button" class="btn btn-secondary" id="policySyncBtn" style="display: flex; align-items: center; gap: var(--space-sm);">
+            <button type="button" class="btn btn-secondary" id="policySyncBtn">
                 <svg class="icon"><use href="#icon-refresh"></use></svg>
                 <span id="policySyncBtnText">{{ _ "policy_sync_btn" }}</span>
                 <span class="spinner hidden" id="policySyncSpinner" aria-hidden="true"></span>
@@ -116,7 +116,7 @@
         </div>
     </form>
 
-    <div class="divider" style="margin: var(--space-lg) 0;">{{ _ "policy_status_title" }}</div>
+    <div class="divider">{{ _ "policy_status_title" }}</div>
 
     <div class="info-card-grid">
         <div class="info-card-item">
@@ -137,17 +137,17 @@
         </div>
     </div>
 
-    <div class="form-group" style="margin-top: var(--space-md);">
+    <div class="form-group mt-md">
         <span class="form-label">{{ _ "policy_sources_title" }}</span>
-        <div id="policySourceStats" style="font-size:0.82rem; margin-top:var(--space-xs);"><span class="text-muted">{{ _ "loading" }}</span></div>
+        <div id="policySourceStats" class="settings-source-stats"><span class="text-muted">{{ _ "loading" }}</span></div>
     </div>
 
-    <div class="form-group" style="margin-top: var(--space-md);">
+    <div class="form-group mt-md">
         <span class="form-label">{{ _ "policy_status_last_error" }}</span>
         <span class="form-hint" id="policyLastError">-</span>
     </div>
 
-    <div class="divider" style="margin: var(--space-md) 0;">{{ _ "policy_counters_title" }}</div>
+    <div class="divider settings-divider">{{ _ "policy_counters_title" }}</div>
 
     <div class="info-card-grid">
         <div class="info-card-item">

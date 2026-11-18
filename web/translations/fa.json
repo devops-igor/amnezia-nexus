@@ -1148,5 +1148,10 @@
   "policy_excluded_domains_label": "دامنه‌هایی که هرگز پروکسی نمی‌شوند",
   "policy_excluded_domains_placeholder": "internal.api.example.com\n*.corp.example",
   "policy_excluded_domains_hint": "دامنه‌هایی که هرگز نباید وارد مجموعه PROXY شوند. در هر خط یک دامنه یا ورودی *.؛ خطوط خالی و توضیحات نادیده گرفته می‌شوند. حذف یک زیردامنه قاعده والد گسترده‌تر را نیز حذف می‌کند، بنابراین کل والد مستقیم می‌ماند. ورودی‌های IPv4/CIDR در اینجا پذیرفته نمی‌شوند.",
+<<<<<<< HEAD
   "policy_client_tried_names_fmt": "تلاش‌شده: {names}"
+=======
+  "deploy_vps_refresh_catalog": "به‌روزرسانی فهرست و استقرارهای اخیر",
+  "upstream_releases_link": "برچسب‌های انتشار"
+>>>>>>> origin/main
 }
