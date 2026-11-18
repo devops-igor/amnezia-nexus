@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -115,18 +116,41 @@ func stripObsoleteGigahostKeys(cfg map[string]any) {
 	}
 }
 
+// carriesStored reports whether an incoming credential value stands for "keep
+// the stored one": empty, or the placeholder the settings page renders.
+func carriesStored(value string) bool {
+	return value == "" || value == settingsSecretMask
+}
+
 // preserveSSLOnSave keeps the stored certificate material when the incoming
 // values are empty or the masked placeholder the settings page renders. The
 // stored row is read through tx, so it is the one the write replaces.
+//
+// Only the fields the request leaves blank have to be preserved, so only those
+// are read strictly. A stored value that is present but cannot be decrypted is
+// not an empty one: carrying it forward would write an empty value over
+// ciphertext that a corrected key could still recover, so the read fails with a
+// CredentialUnreadableError and nothing is written. A request that supplies both
+// fields replaces them and never reads either, which is the way out.
 func preserveSSLOnSave(tx *database.SettingsTx, incoming *models.SSLSettings) error {
+	var carry []string
+	if carriesStored(incoming.KeyText) {
+		carry = append(carry, "key_text")
+	}
+	if carriesStored(incoming.CertText) {
+		carry = append(carry, "cert_text")
+	}
+	if len(carry) == 0 {
+		return nil
+	}
 	var existing models.SSLSettings
-	if err := tx.Get("ssl", &existing); err != nil {
+	if err := tx.GetStrict("ssl", &existing, carry...); err != nil {
 		return fmt.Errorf("read stored ssl settings: %w", err)
 	}
-	if incoming.KeyText == "" || incoming.KeyText == settingsSecretMask {
+	if carriesStored(incoming.KeyText) {
 		incoming.KeyText = existing.KeyText
 	}
-	if incoming.CertText == "" || incoming.CertText == settingsSecretMask {
+	if carriesStored(incoming.CertText) {
 		incoming.CertText = existing.CertText
 	}
 	return nil
@@ -159,12 +183,23 @@ func preserveTelegramOnSave(tx *database.SettingsTx, incoming map[string]any) er
 // but carried through on write, so saving unrelated settings never destroys a
 // value an older panel stored. Nothing reads them.
 func preserveGigahostOnSave(tx *database.SettingsTx, incoming map[string]any) error {
+	key, supplied := incoming["api_key"].(string)
+	keepKey := !supplied || key == "" || strings.HasPrefix(key, "****")
+
+	// The key is read strictly only when it has to be carried forward. The retired
+	// fields are plain and are carried either way.
 	existing := make(map[string]any)
-	if err := tx.Get("gigahost", &existing); err != nil {
+	var err error
+	if keepKey {
+		err = tx.GetStrict("gigahost", &existing, "api_key")
+	} else {
+		err = tx.Get("gigahost", &existing)
+	}
+	if err != nil {
 		return fmt.Errorf("read stored gigahost settings: %w", err)
 	}
 
-	if key, ok := incoming["api_key"].(string); !ok || key == "" || strings.HasPrefix(key, "****") {
+	if keepKey {
 		if oldKey, ok := existing["api_key"].(string); ok && oldKey != "" {
 			incoming["api_key"] = oldKey
 		}
@@ -244,12 +279,40 @@ func (h *Handlers) SaveSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.persistSettings(ctx, req); err != nil {
+		var unreadable *database.CredentialUnreadableError
+		if errors.As(err, &unreadable) {
+			h.JSONError(w, http.StatusConflict, "credential_unreadable", unreadableCredentialDetail(unreadable))
+			return
+		}
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to save settings: "+err.Error())
 		return
 	}
 
 	h.audit(r, "settings.save", nil)
 	h.JSON(w, http.StatusOK, map[string]any{"status": "success"})
+}
+
+// unreadableCredentialDetail tells the operator what happened and what to do. It
+// names the field, never a value: the stored ciphertext stays where it is.
+func unreadableCredentialDetail(e *database.CredentialUnreadableError) string {
+	return "Nothing was saved. The stored " + credentialLabel(e.Key, e.Field) +
+		" cannot be decrypted with the active secret key. Restore the key it was " +
+		"encrypted with, or enter the value again to replace it."
+}
+
+func credentialLabel(key, field string) string {
+	switch key + "." + field {
+	case "ssl.key_text":
+		return "TLS private key"
+	case "ssl.cert_text":
+		return "TLS certificate"
+	case "gigahost.api_key":
+		return "Gigahost API key"
+	case "notifications.app_token":
+		return "notification application token"
+	default:
+		return key + " " + field
+	}
 }
 
 // dropAdminOnlyBackupSettings removes from a backup export the settings records

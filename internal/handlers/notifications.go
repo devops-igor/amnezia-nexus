@@ -2,11 +2,13 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/notifications"
 )
@@ -54,6 +56,21 @@ func (h *Handlers) SaveNotificationSettingsHandler(w http.ResponseWriter, r *htt
 		return
 	}
 	ctx := r.Context()
+	// A blank or masked token means "keep the stored one". The stored one is read
+	// through the lossy decoder below, which turns a token it cannot decrypt into an
+	// empty string, so unreadable is checked first and refused: saving would
+	// replace recoverable ciphertext with nothing. Supplying a token replaces it
+	// and needs no read, which is the way out.
+	if tokenCarriesStored(req.AppToken) {
+		var unreadable *database.CredentialUnreadableError
+		if err := h.db.CheckCredentialsReadable(ctx, "notifications", "app_token"); errors.As(err, &unreadable) {
+			h.JSONError(w, http.StatusConflict, "credential_unreadable", unreadableCredentialDetail(unreadable))
+			return
+		} else if err != nil {
+			h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to load notification settings")
+			return
+		}
+	}
 	current, err := svc.LoadSettings(ctx)
 	if err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to load notification settings")
@@ -238,6 +255,13 @@ func validateNotificationLimits(settings *models.NotificationSettings) error {
 		return errNotification("max attempts must be between 1 and 20")
 	}
 	return nil
+}
+
+// tokenCarriesStored reports whether a submitted application token stands for
+// "keep the stored one".
+func tokenCarriesStored(token string) bool {
+	token = strings.TrimSpace(token)
+	return token == "" || token == notificationTokenMask || strings.HasPrefix(token, "****")
 }
 
 func notificationSettingsFromRequest(req models.SaveNotificationSettingsRequest, current models.NotificationSettings) models.NotificationSettings {

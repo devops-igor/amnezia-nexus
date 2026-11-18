@@ -6,7 +6,70 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/devops-igor/amnezia-nexus/internal/security"
 )
+
+// credentialFields names, per settings key, the fields the database stores
+// encrypted. A caller that has to carry one of them forward must be able to tell
+// three states apart: absent (no row, or an empty field), readable, and present
+// but unreadable under the active key. The lossy readers fold the third into the
+// first, which is correct for display and wrong for a write.
+var credentialFields = map[string][]string{
+	"ssl":           {"key_text", "cert_text"},
+	"gigahost":      {"api_key"},
+	"notifications": {"app_token"},
+}
+
+// CredentialUnreadableError reports a stored credential that is present but
+// cannot be decrypted with the active key. Writing the setting anyway would
+// replace it with an empty value that no later key correction can recover.
+type CredentialUnreadableError struct {
+	Key   string
+	Field string
+}
+
+func (e *CredentialUnreadableError) Error() string {
+	return fmt.Sprintf("stored %s.%s cannot be decrypted with the active key", e.Key, e.Field)
+}
+
+// unreadableCredential returns the first of the named fields (all credential
+// fields of key when none are named) that holds ciphertext this database cannot
+// decrypt. An empty or absent field is not unreadable. A value that is not a JSON
+// object is left to the ordinary decoder, which reports it.
+func (d *DB) unreadableCredential(key, raw string, fields []string) error {
+	if len(fields) == 0 {
+		fields = credentialFields[key]
+	}
+	var stored map[string]any
+	if json.Unmarshal([]byte(raw), &stored) != nil {
+		return nil
+	}
+	for _, field := range fields {
+		value, ok := stored[field].(string)
+		if !ok || value == "" {
+			continue
+		}
+		if _, err := security.DecryptCredential(value, d.secretKey); err != nil {
+			return &CredentialUnreadableError{Key: key, Field: field}
+		}
+	}
+	return nil
+}
+
+// CheckCredentialsReadable reports a CredentialUnreadableError when the stored
+// row for key holds one of the named credential fields (all of them when none are
+// named) that cannot be decrypted. A missing row or an empty field is readable.
+func (d *DB) CheckCredentialsReadable(ctx context.Context, key string, fields ...string) error {
+	val, found, err := d.GetSettingRaw(ctx, key)
+	if err != nil {
+		return err
+	}
+	if !found || !val.Valid || val.String == "" {
+		return nil
+	}
+	return d.unreadableCredential(key, val.String, fields)
+}
 
 // SettingsTx reads and writes settings rows inside one transaction. It exists
 // so a caller can decide what to write from the rows as they are at write time,
@@ -41,6 +104,30 @@ func (t *SettingsTx) Get(key string, target any) error {
 	}
 	if !val.Valid || val.String == "" {
 		return nil
+	}
+	return t.d.decodeStoredSetting(key, val.String, target)
+}
+
+// GetStrict is Get for a caller that is about to carry credentials forward. It
+// fails with a CredentialUnreadableError, before decoding anything, when one of
+// the named credential fields (all of them when none are named) is present but
+// cannot be decrypted. Name only the fields that really have to be preserved: a
+// field the request replaces does not need to be readable, which is what keeps
+// supplying replacement material a way out of an unreadable credential.
+func (t *SettingsTx) GetStrict(key string, target any, fields ...string) error {
+	var val sql.NullString
+	err := t.tx.QueryRowContext(t.ctx, "SELECT value FROM settings WHERE key = ?", key).Scan(&val)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get setting %s: %w", key, err)
+	}
+	if !val.Valid || val.String == "" {
+		return nil
+	}
+	if err := t.d.unreadableCredential(key, val.String, fields); err != nil {
+		return err
 	}
 	return t.d.decodeStoredSetting(key, val.String, target)
 }
