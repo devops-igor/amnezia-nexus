@@ -16,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/geodb"
 )
 
 // generateTestCertificate generates an in-memory CA and server certificate valid for domain and 127.0.0.1.
@@ -226,7 +228,7 @@ func TestProbeTLSH2_InvalidCert(t *testing.T) {
 
 func TestScanSNI_WorkerPool(t *testing.T) {
 	// Create mock GeoDB with test ranges
-	ranges := []IPRange{
+	ranges := []geodb.IPRange{
 		{
 			StartIP: 0x7F000001, // 127.0.0.1
 			EndIP:   0x7F000001,
@@ -234,7 +236,7 @@ func TestScanSNI_WorkerPool(t *testing.T) {
 			Country: [2]byte{'U', 'S'},
 		},
 	}
-	geoDB := NewGeoDBFromRanges(ranges)
+	geoDB := geodb.NewGeoDBFromRanges(ranges)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

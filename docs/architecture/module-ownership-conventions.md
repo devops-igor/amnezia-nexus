@@ -57,6 +57,7 @@ Find your task, open the package, read the contract, and run the validation befo
 | `internal/config/` | Configuration structs, environment parsing, validation defaults, translation loading (embedded from `web/`), platform-specific file helpers. |
 | `internal/security/` | Password hashing, credential encryption, session encoding, and integrity helpers. Stdlib and crypto only. |
 | `internal/captcha/` | Captcha generation and verification, embedded captcha assets. Self-contained. |
+| `internal/geodb/` | Offline IPv4 ASN and country lookup table (`geodb.go`) over the embedded `ip2asn.bin.gz` asset, plus the multi-region CDN ASN table. Embedded asset and in-memory lookup only; no operational imports. |
 
 ### 2.3 Persistence
 

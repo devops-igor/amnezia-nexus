@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/geodb"
 )
 
 func TestProbeTLSH2_P256OnlyRejection(t *testing.T) {
@@ -105,7 +107,7 @@ func TestScanSNI_PrioritizedRankingGeoAlignedOverAnycastCDN(t *testing.T) {
 	// Server IP: 192.0.2.10 (SE, AS42708)
 	// Local domain IP: 192.0.2.20 (SE, AS42708) -> proximity score 100
 	// Anycast CDN IP: 104.16.1.1 (US, AS13335 Cloudflare) -> proximity score 40
-	ranges := []IPRange{
+	ranges := []geodb.IPRange{
 		{
 			StartIP: 0x68100101, // 104.16.1.1
 			EndIP:   0x68100101,
@@ -125,7 +127,7 @@ func TestScanSNI_PrioritizedRankingGeoAlignedOverAnycastCDN(t *testing.T) {
 			Country: [2]byte{'S', 'E'},
 		},
 	}
-	geoDB := NewGeoDBFromRanges(ranges)
+	geoDB := geodb.NewGeoDBFromRanges(ranges)
 
 	localDomain := "local-aligned.se"
 	cdnDomain := "cdn-anycast.com"
