@@ -1069,6 +1069,8 @@
   "policy_client_reason_proxy_cidr_rule": "依据地址规则走代理",
   "policy_client_reason_proxy_cached_evidence": "依据已观测证据走代理",
   "policy_client_reason_no_trusted_evidence": "默认走代理（无可信证据）",
+  "policy_client_reason_allocation_direct": "依据地址分配直连",
+  "policy_client_reason_allocation_cdn_excluded": "走代理：属俄罗斯分配但为共享 CDN 网段",
   "policy_client_reason_not_recorded": "决策原因未记录",
   "policy_client_corr_answer_after_decision": "应答在该决策之后到达",
   "policy_client_corr_expired_before_decision": "证据在该决策前已过期",

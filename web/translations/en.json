@@ -1069,6 +1069,8 @@
   "policy_client_reason_proxy_cidr_rule": "proxy by address rule",
   "policy_client_reason_proxy_cached_evidence": "proxy by observed evidence",
   "policy_client_reason_no_trusted_evidence": "proxy by default (no usable evidence)",
+  "policy_client_reason_allocation_direct": "direct by allocation match",
+  "policy_client_reason_allocation_cdn_excluded": "proxy: allocation matched, but the range is a shared CDN",
   "policy_client_reason_not_recorded": "decision reason not recorded",
   "policy_client_corr_answer_after_decision": "the answer arrived after this decision",
   "policy_client_corr_expired_before_decision": "the evidence had expired before this decision",

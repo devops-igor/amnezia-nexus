@@ -188,7 +188,7 @@ func mergeGuardPatterns(exclusions []string) []string {
 // CIDR rules pass through unchanged, and that is the documented boundary of the
 // guarantee: the guard works from names, while the forwarder matches a CIDR rule
 // against the packet's destination address before it consults DNS evidence
-// (forwarder.matchesProxyPolicy). A name-based guard therefore cannot promise
+// (forwarder.decideEgress, row 2). A name-based guard therefore cannot promise
 // DIRECT for an address covered by an operator-supplied CIDR. The aggregate
 // manifest contains only FormatDomains lists, so the shipped aggregate has no
 // CIDRs; an operator who adds one is choosing the address range to proxy.
