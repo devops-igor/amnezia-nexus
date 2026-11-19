@@ -96,6 +96,7 @@ func run(stdin io.Reader, stdout io.Writer, args []string) error {
 	if err != nil {
 		return describeRejection(err)
 	}
+	recorded := policy.RecordedInventoryCount(opts.dir)
 	body, err := readZone(stdin)
 	if err != nil {
 		return err
@@ -109,7 +110,7 @@ func run(stdin io.Reader, stdout io.Writer, args []string) error {
 			return err
 		}
 	}
-	return report(stdout, opts, update.PreviousPrefixCount, record)
+	return report(stdout, opts, update.PreviousPrefixCount, recorded, record)
 }
 
 func parseOptions(stdout io.Writer, args []string) (options, error) {
@@ -160,13 +161,19 @@ func describeRejection(err error) error {
 	}
 }
 
-func report(stdout io.Writer, opts options, previous int, record policy.InventoryProvenance) error {
+// report prints the outcome. The measured count decides; a record that disagrees
+// with it is reported so an operator can see the interrupted-update state that
+// this run is repairing, but it never changes the decision.
+func report(stdout io.Writer, opts options, previous, recorded int, record policy.InventoryProvenance) error {
 	fmt.Fprintf(stdout, "source: %s\n", record.Source)
 	fmt.Fprintf(stdout, "source_url: %s\n", record.SourceURL)
 	fmt.Fprintf(stdout, "retrieved_at: %s\n", record.RetrievedAt)
 	fmt.Fprintf(stdout, "prefix_count: %d\n", record.PrefixCount)
 	if previous > 0 {
 		fmt.Fprintf(stdout, "previous_prefix_count: %d\n", previous)
+	}
+	if recorded > 0 && recorded != previous {
+		fmt.Fprintf(stdout, "recorded_prefix_count: %d (the record disagrees with the measured committed data; the measured count decides)\n", recorded)
 	}
 	fmt.Fprintf(stdout, "sha256: %s\n", record.SHA256)
 	fmt.Fprintf(stdout, "notice: %s %s\n", record.NoticeFile, record.NoticeSHA256)

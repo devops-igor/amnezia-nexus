@@ -21,7 +21,9 @@ import (
 //     compared against the artifact it would replace BEFORE any file is touched,
 //     so a rejected update — a captive portal response, a truncated download, a
 //     body with one bad line — leaves the previously committed artifact exactly
-//     as it was.
+//     as it was. That comparison measures the committed data file; the count in
+//     the provenance record is never trusted for it, because an interrupted
+//     update can leave the record describing the other generation.
 //   - Each file is then replaced atomically on its own. The two renames are
 //     separate, so a run that dies between them leaves a mixed pair, which the
 //     loader refuses rather than serving; WriteInventoryArtifact states that
@@ -146,22 +148,21 @@ func checkInventoryReduction(count int, opts InventoryUpdateOptions) error {
 		ErrInventoryLargeReduction, count, opts.PreviousPrefixCount, MaxInventoryReductionPercent, InventoryLargeReductionFlag)
 }
 
-// PreviousInventoryCount returns the prefix count an update would be reducing
-// from.
+// PreviousInventoryCount returns the authoritative prefix count an update would
+// be reducing from.
 //
-// Order: the record in dir, then — when dir holds no record at all — the
-// committed artifact this build ships. A record that exists but cannot be read is
-// NOT treated as "no previous artifact": the count is then measured from the data
-// file in dir, which is the file the update would replace. That independence is
-// the point. The embedded artifact is whatever was checked out when the binary
-// was built, so a damaged record in the tree is also a damaged record inside the
-// binary: the two provenance reads fail together, and falling back from one to
-// the other would report zero exactly when the guard is needed. Reading the data
-// file does not depend on either record.
+// The committed data file is measured whenever it exists, and that measurement is
+// the baseline. It is the payload the update would replace; the recorded count is
+// metadata that an interrupted update can leave describing the other generation,
+// because the two files are renamed separately. A record claiming a smaller count
+// than the data actually holds would otherwise let a feed truncated to exactly
+// that number look like no reduction at all, so the record is never consulted
+// here — see RecordedInventoryCount for the reporting use of it.
 //
-// When no count can be established at all — unusable record, unreadable or
-// unmeasurable data file, and no usable shipped set — the result is an error and
-// the caller must leave the artifact untouched.
+// Only when the directory holds no data file at all does the count come from the
+// committed set this build ships. A data file that exists but cannot be measured,
+// or an absent data file with an unusable shipped set, is an error: the caller
+// must leave the artifact untouched, and zero is never a substitute for a count.
 func PreviousInventoryCount(dir string) (int, error) {
 	return previousInventoryCount(dir, shippedInventoryCount)
 }
@@ -169,24 +170,39 @@ func PreviousInventoryCount(dir string) (int, error) {
 // previousInventoryCount is PreviousInventoryCount with the shipped-set reader
 // injected, so a test can reproduce a build whose embedded artifact is unusable.
 func previousInventoryCount(dir string, shipped func() (int, error)) (int, error) {
-	meta, err := os.ReadFile(InventoryMetaPath(dir))
+	measured, err := countCommittedDataFile(dir)
 	switch {
 	case err == nil:
-		var prov InventoryProvenance
-		if json.Unmarshal(meta, &prov) == nil && prov.PrefixCount > 0 {
-			return prov.PrefixCount, nil
-		}
-		return countCommittedDataFile(dir)
+		return measured, nil
 	case errors.Is(err, fs.ErrNotExist):
 		count, shippedErr := shipped()
 		if shippedErr != nil {
-			return 0, fmt.Errorf("%w: %s holds no record and the shipped inventory is unusable: %v",
+			return 0, fmt.Errorf("%w: %s holds no data file and the shipped inventory is unusable: %v",
 				ErrInventoryBaselineUnavailable, dir, shippedErr)
 		}
 		return count, nil
 	default:
-		return 0, fmt.Errorf("read committed inventory provenance: %w", err)
+		return 0, err
 	}
+}
+
+// RecordedInventoryCount returns the prefix count the provenance record in dir
+// claims, or 0 when there is no readable record.
+//
+// It exists so the command can tell an operator that a record disagrees with the
+// data beside it, which is the state an interrupted update leaves behind. It never
+// influences the baseline: a disagreement is reported, not acted on, because
+// repairing that pair is exactly what the update is for.
+func RecordedInventoryCount(dir string) int {
+	meta, err := os.ReadFile(InventoryMetaPath(dir))
+	if err != nil {
+		return 0
+	}
+	var prov InventoryProvenance
+	if err := json.Unmarshal(meta, &prov); err != nil || prov.PrefixCount <= 0 {
+		return 0
+	}
+	return prov.PrefixCount
 }
 
 // shippedInventoryCount returns the prefix count of the committed artifact this
@@ -199,18 +215,25 @@ func shippedInventoryCount() (int, error) {
 	return shipped.PrefixCount(), nil
 }
 
-// countCommittedDataFile measures the data file in dir. It is the count used when
-// the provenance record is unusable: the data file is the thing the update would
-// replace, and reading it does not depend on the record that failed.
+// countCommittedDataFile measures the data file in dir.
+//
+// It returns fs.ErrNotExist when the directory holds no data file, so the caller
+// can tell "there is nothing here" from "there is something here I cannot read".
+// A file that exists but cannot be read or measured is a wrapped
+// ErrInventoryBaselineUnavailable: that is the fail-closed case, because the
+// payload the update would replace is unknown.
 func countCommittedDataFile(dir string) (int, error) {
 	body, err := os.ReadFile(InventoryDataPath(dir))
 	if err != nil {
-		return 0, fmt.Errorf("%w: the record in %s is unusable and the committed data file cannot be read: %v",
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, fs.ErrNotExist
+		}
+		return 0, fmt.Errorf("%w: the committed data file in %s cannot be read: %v",
 			ErrInventoryBaselineUnavailable, dir, err)
 	}
 	count, err := countInventoryPrefixes(body)
 	if err != nil {
-		return 0, fmt.Errorf("%w: the record in %s is unusable and the committed data file cannot be measured: %v",
+		return 0, fmt.Errorf("%w: the committed data file in %s cannot be measured: %v",
 			ErrInventoryBaselineUnavailable, dir, err)
 	}
 	return count, nil

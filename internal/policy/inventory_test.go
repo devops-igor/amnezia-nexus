@@ -373,22 +373,61 @@ func damageRecord(t *testing.T, dir string) {
 	}
 }
 
-// The truncation guard compares against the artifact an update would replace. A
-// record that cannot be read must not degrade to "no previous artifact": the
-// count comes from the data file, which does not depend on that record, and when
-// nothing can be measured the update is refused.
+// rewriteRecordCount makes the record in dir claim a different prefix count while
+// staying valid JSON — the state an interrupted update leaves when it renamed only
+// one of the two files.
+func rewriteRecordCount(t *testing.T, dir string, count int) {
+	t.Helper()
+	meta, err := os.ReadFile(InventoryMetaPath(dir))
+	if err != nil {
+		t.Fatalf("read the record: %v", err)
+	}
+	var prov InventoryProvenance
+	if err := json.Unmarshal(meta, &prov); err != nil {
+		t.Fatalf("unmarshal the record: %v", err)
+	}
+	prov.PrefixCount = count
+	rewritten, err := json.MarshalIndent(prov, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal the record: %v", err)
+	}
+	if err := os.WriteFile(InventoryMetaPath(dir), append(rewritten, '\n'), 0o600); err != nil {
+		t.Fatalf("write the record: %v", err)
+	}
+}
+
+// The truncation guard compares against the artifact an update would replace, and
+// that comparison measures the data file. The record is never the baseline: an
+// interrupted update can leave it describing the other generation. When nothing
+// can be measured the update is refused.
 func TestPreviousInventoryCount(t *testing.T) {
 	shipped := mustShippedInventory(t)
 
-	t.Run("readable record wins", func(t *testing.T) {
+	t.Run("data file is measured", func(t *testing.T) {
 		dir := t.TempDir()
-		writeSyntheticArtifact(t, dir, 1200)
+		writeSyntheticArtifact(t, dir, 3000)
 		got, err := PreviousInventoryCount(dir)
 		if err != nil {
 			t.Fatalf("PreviousInventoryCount: %v", err)
 		}
-		if got != 1200 {
-			t.Fatalf("PreviousInventoryCount = %d, want the recorded 1200", got)
+		if got != 3000 {
+			t.Fatalf("PreviousInventoryCount = %d, want the measured 3000", got)
+		}
+	})
+
+	t.Run("record cannot override the measured data file", func(t *testing.T) {
+		dir := t.TempDir()
+		writeSyntheticArtifact(t, dir, 8664)
+		rewriteRecordCount(t, dir, 1200)
+		got, err := PreviousInventoryCount(dir)
+		if err != nil {
+			t.Fatalf("PreviousInventoryCount: %v", err)
+		}
+		if got != 8664 {
+			t.Fatalf("PreviousInventoryCount = %d, want the measured 8664, not the recorded 1200", got)
+		}
+		if recorded := RecordedInventoryCount(dir); recorded != 1200 {
+			t.Fatalf("RecordedInventoryCount = %d, want the recorded 1200 for reporting", recorded)
 		}
 	})
 
@@ -402,7 +441,7 @@ func TestPreviousInventoryCount(t *testing.T) {
 		}
 	})
 
-	t.Run("damaged record is measured from the data file", func(t *testing.T) {
+	t.Run("damaged record does not disturb the measurement", func(t *testing.T) {
 		dir := t.TempDir()
 		writeSyntheticArtifact(t, dir, 3000)
 		damageRecord(t, dir)
@@ -411,25 +450,24 @@ func TestPreviousInventoryCount(t *testing.T) {
 			t.Fatalf("PreviousInventoryCount: %v", err)
 		}
 		if got != 3000 {
-			t.Fatalf("PreviousInventoryCount = %d, want the 3000 measured from the data file", got)
+			t.Fatalf("PreviousInventoryCount = %d, want the measured 3000", got)
+		}
+		if recorded := RecordedInventoryCount(dir); recorded != 0 {
+			t.Fatalf("RecordedInventoryCount = %d, want 0 for an unreadable record", recorded)
 		}
 	})
 
-	t.Run("damaged record and unmeasurable data file refuse", func(t *testing.T) {
+	t.Run("unmeasurable data file refuses even with a readable record", func(t *testing.T) {
 		dir := t.TempDir()
 		writeSyntheticArtifact(t, dir, 3000)
-		damageRecord(t, dir)
 		if err := os.WriteFile(InventoryDataPath(dir), []byte("not a prefix list\n"), 0o600); err != nil {
 			t.Fatalf("damage the data file: %v", err)
 		}
-		got, err := PreviousInventoryCount(dir)
-		if !errors.Is(err, ErrInventoryBaselineUnavailable) {
-			t.Fatalf("PreviousInventoryCount error = %v, want %v", err, ErrInventoryBaselineUnavailable)
-		}
-		if got != 0 {
-			t.Fatalf("PreviousInventoryCount returned %d with an error, want 0", got)
+		if _, err := PreviousInventoryCount(dir); !errors.Is(err, ErrInventoryBaselineUnavailable) {
+			t.Fatalf("error = %v, want %v", err, ErrInventoryBaselineUnavailable)
 		}
 	})
+
 	t.Run("no record and unusable shipped set refuse", func(t *testing.T) {
 		brokenShipped := func() (int, error) { return 0, errors.New("the embedded provenance record is damaged") }
 		got, err := previousInventoryCount(t.TempDir(), brokenShipped)
@@ -440,6 +478,66 @@ func TestPreviousInventoryCount(t *testing.T) {
 			t.Fatalf("previousInventoryCount returned %d with an error, want 0", got)
 		}
 	})
+}
+
+// A record that understates the committed data must not let a truncated feed look
+// like no reduction: 8,664 prefixes on disk, a record claiming 1,200, and a
+// 1,200-prefix replacement. Refused without the maintenance flag, accepted with
+// it, and the repair leaves a coherent pair.
+func TestRecordedCountCannotMaskATruncatedReplacement(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticArtifact(t, dir, 8664)
+	rewriteRecordCount(t, dir, 1200)
+
+	previous, err := PreviousInventoryCount(dir)
+	if err != nil {
+		t.Fatalf("PreviousInventoryCount: %v", err)
+	}
+	if previous != 8664 {
+		t.Fatalf("baseline = %d, want the measured 8664 rather than the recorded 1200", previous)
+	}
+
+	body := syntheticZone(1200)
+	prov := InventoryProvenance{
+		Source:      "ipdeny",
+		SourceURL:   "https://example.invalid/ru-aggregated.zone",
+		RetrievedAt: "2026-11-19",
+	}
+	opts := InventoryUpdateOptions{PreviousPrefixCount: previous}
+	_, _, err = ValidateInventoryUpdate(body, prov, opts)
+	if !errors.Is(err, ErrInventoryLargeReduction) {
+		t.Fatalf("error = %v, want %v", err, ErrInventoryLargeReduction)
+	}
+	for _, want := range []string{"1200", "8664", "-" + InventoryLargeReductionFlag} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("rejection message %q does not name %q", err, want)
+		}
+	}
+
+	// The explicit decision accepts it, and writing it repairs the pair the
+	// interrupted update left behind.
+	opts.AllowLargeReduction = true
+	record, meta, err := ValidateInventoryUpdate(body, prov, opts)
+	if err != nil {
+		t.Fatalf("large reduction with the flag: %v", err)
+	}
+	if record.PrefixCount != 1200 {
+		t.Fatalf("accepted record holds %d prefixes, want 1200", record.PrefixCount)
+	}
+	if err := WriteInventoryArtifact(dir, body, meta); err != nil {
+		t.Fatalf("WriteInventoryArtifact: %v", err)
+	}
+	data, err := os.ReadFile(InventoryDataPath(dir))
+	if err != nil {
+		t.Fatalf("read repaired data: %v", err)
+	}
+	repairedMeta, err := os.ReadFile(InventoryMetaPath(dir))
+	if err != nil {
+		t.Fatalf("read repaired record: %v", err)
+	}
+	if _, err := LoadInventory(data, repairedMeta); err != nil {
+		t.Fatalf("the repair did not leave a loadable artifact: %v", err)
+	}
 }
 
 // A tool run from a working tree embeds whatever was checked out, so a damaged

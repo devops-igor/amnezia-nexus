@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -270,5 +271,77 @@ func TestRunRefusesWhenNoBaselineCanBeEstablished(t *testing.T) {
 	}
 	if string(record) != "{not json" {
 		t.Fatalf("a refused run replaced the damaged record: %q", record)
+	}
+}
+
+// rewriteRecordCount makes the committed record claim a different prefix count
+// while staying valid JSON: the state an interrupted update leaves when it renamed
+// only one of the two files.
+func rewriteRecordCount(t *testing.T, dir string, count int) {
+	t.Helper()
+	meta, err := os.ReadFile(policy.InventoryMetaPath(dir))
+	if err != nil {
+		t.Fatalf("read the record: %v", err)
+	}
+	var prov policy.InventoryProvenance
+	if err := json.Unmarshal(meta, &prov); err != nil {
+		t.Fatalf("unmarshal the record: %v", err)
+	}
+	prov.PrefixCount = count
+	rewritten, err := json.MarshalIndent(prov, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal the record: %v", err)
+	}
+	if err := os.WriteFile(policy.InventoryMetaPath(dir), append(rewritten, '\n'), 0o600); err != nil {
+		t.Fatalf("write the record: %v", err)
+	}
+}
+
+// The recorded count must never set the baseline: a record understating the data
+// would otherwise let a feed truncated to exactly that number look like no
+// reduction. The measured data decides, and a disagreement is reported.
+func TestRunIgnoresARecordThatUnderstatesTheData(t *testing.T) {
+	dir := t.TempDir()
+	base := "-dir " + dir + " -url https://example.invalid/ru.zone -retrieved 2026-11-19"
+
+	// Seed 8,664 prefixes. The fresh directory has no data file, so the baseline
+	// is the shipped set and an equal count needs no flag.
+	if _, err := runTool(t, zone(8664), base); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	seeded, err := os.ReadFile(policy.InventoryDataPath(dir))
+	if err != nil {
+		t.Fatalf("read seeded data: %v", err)
+	}
+	rewriteRecordCount(t, dir, 1200)
+
+	// A 1,200-prefix replacement, which the record alone would call no reduction.
+	_, err = runTool(t, zone(1200), base)
+	if !errors.Is(err, policy.ErrInventoryLargeReduction) {
+		t.Fatalf("error = %v, want %v", err, policy.ErrInventoryLargeReduction)
+	}
+	for _, want := range []string{"1200", "8664", "-" + policy.InventoryLargeReductionFlag} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("message %q does not name %q", err, want)
+		}
+	}
+	after, err := os.ReadFile(policy.InventoryDataPath(dir))
+	if err != nil {
+		t.Fatalf("read data after the refused run: %v", err)
+	}
+	if !bytes.Equal(seeded, after) {
+		t.Fatal("a refused run modified the committed data")
+	}
+
+	// The explicit decision applies it, and the run reports the disagreement it
+	// is repairing.
+	out, err := runTool(t, zone(1200), base+" -allow-large-reduction")
+	if err != nil {
+		t.Fatalf("large reduction with the flag: %v", err)
+	}
+	for _, want := range []string{"previous_prefix_count: 8664", "recorded_prefix_count: 1200", "the measured count decides"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output does not contain %q:\n%s", want, out)
+		}
 	}
 }
