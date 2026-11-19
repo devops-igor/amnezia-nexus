@@ -2,41 +2,42 @@
 #
 # The gate deploys the panel on the runner itself, so it must not depend on a
 # compose file already existing on the host: on a GitHub-hosted runner nothing
-# survives between runs. This file is the canonical shape for that purpose, and
-# it maps the panel to 8443 because the workflow probes
-# http://127.0.0.1:8443/api/health.
+# survives between runs. This file is the canonical shape for that purpose.
 #
-# It mirrors the deployment documented in README.md, with the port that the gate
-# addresses. Values the gate overrides at runtime (the image tag and the two E2E
-# environment variables) stay at their defaults here.
+# It mirrors the configuration the lab host used, which matters for two details
+# established by trial on a hosted runner:
+#
+#   * the panel's own VPN endpoint listens on 51822, leaving 51820 free for the
+#     AWG backend the onboarding test installs. With 51820 here, that install
+#     fails with "UDP port 51820 is already in use on the server".
+#   * the panel runs as root with NET_ADMIN and the host TUN device, the
+#     privileges its VPN endpoint needs.
+#
+# The web panel is mapped to 8443 because the workflow probes
+# http://127.0.0.1:8443/api/health.
 services:
   amnezia-panel:
     image: ghcr.io/devops-igor/amnezia-nexus:latest
     container_name: amnezia-panel
     restart: unless-stopped
-    ports:
-      - "8443:5000"
-      - "51820:51820/udp"
-    volumes:
-      - panel-data:/app/data
-    # The panel runs as a non-root user and carries file capabilities, so these
-    # must also be in the container's bounding set or the binary cannot start.
+    user: root
     cap_add:
       - NET_ADMIN
-      - NET_RAW
     devices:
       - /dev/net/tun:/dev/net/tun
-    sysctls:
-      net.ipv4.ip_forward: 1
-      net.ipv4.conf.all.rp_filter: 2
-      net.ipv4.conf.all.accept_local: 1
+    ports:
+      - "8443:5000"          # Web panel
+      - "51822:51822/udp"    # Panel VPN endpoint, mapped 1:1 to VPN_LISTEN_PORT
+    volumes:
+      - panel-data:/app/data
     environment:
       - PORT=5000
       - DATA_DIR=/app/data
       - LOG_LEVEL=INFO
       - VPN_ENABLED=true
-      - VPN_LISTEN_PORT=51820
+      - VPN_LISTEN_PORT=51822
       - VPN_SUBNET=10.100.0.0/16
+      - VPN_CLIENT_AWG_ENGINE=upstream
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:5000/api/health"]
       interval: 15s
