@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/containerlog"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	gossh "golang.org/x/crypto/ssh"
@@ -631,8 +632,8 @@ func TestNaiveManager_PinnedImagePullAndDirectoryMount(t *testing.T) {
 	if !strings.Contains(runCmd, "'"+NaiveImageRef+"'") {
 		t.Errorf("docker run must use the pinned image %q, got:\n%s", NaiveImageRef, runCmd)
 	}
-	if !strings.Contains(runCmd, "--log-driver none") {
-		t.Errorf("docker run missing --log-driver none flag:\n%s", runCmd)
+	if !strings.Contains(runCmd, containerlog.RunArgs(false)) {
+		t.Errorf("docker run missing the shared readable container log flags:\n%s", runCmd)
 	}
 	if !strings.Contains(runCmd, "--tmpfs /tmp:rw,noexec,nosuid,size=16m") {
 		t.Errorf("docker run missing tmpfs /tmp flag:\n%s", runCmd)
@@ -659,6 +660,71 @@ func TestNaiveManager_PinnedImagePullAndDirectoryMount(t *testing.T) {
 	}
 	if !psFound {
 		t.Errorf("docker ps was not executed in GetServerStatus")
+	}
+}
+
+// naiveContainerRunCommand installs naive with the given params and returns the
+// recorded docker run command.
+func naiveContainerRunCommand(t *testing.T, params map[string]any) string {
+	t.Helper()
+	mockSSH := newMockNaiveSSHClient()
+	pool := &mockNaivePool{client: mockSSH}
+	mgr := NewNaiveManagerWithServerLocks(pool, awg.NewServerLockRegistry())
+	server := &models.Server{ID: 90, Host: "198.51.100.3", SSHPort: 22}
+
+	if err := mgr.Install(context.Background(), server, params); err != nil {
+		t.Fatalf("Install failed: %v", err)
+	}
+
+	var runCmd string
+	for _, cmd := range mockSSH.commands {
+		if strings.Contains(cmd, "docker run") {
+			runCmd = cmd
+		}
+	}
+	if runCmd == "" {
+		t.Fatalf("docker run command was not recorded")
+	}
+	return runCmd
+}
+
+func naiveInstallParams() map[string]any {
+	return map[string]any{
+		"port": 443,
+		"naive_options": models.NaiveInstallOptions{
+			Port:   "443",
+			Domain: "naive.example.com",
+		},
+	}
+}
+
+// The container log must stay readable by default, so a failed install can
+// still say what caddy was doing instead of a daemon refusal to read the log.
+// The assertion derives from the shared definition, so a hardcoded driver here
+// fails as soon as the definition changes.
+func TestNaiveManager_DefaultContainerLogIsReadableAndCapped(t *testing.T) {
+	runCmd := naiveContainerRunCommand(t, naiveInstallParams())
+
+	if want := containerlog.RunArgs(false); !strings.Contains(runCmd, want) {
+		t.Fatalf("docker run does not use the shared readable log configuration %q:\n%s", want, runCmd)
+	}
+	if strings.Contains(runCmd, "--log-driver none") {
+		t.Fatalf("docker run must not request the unreadable driver by default:\n%s", runCmd)
+	}
+}
+
+// An operator who explicitly wants no container log keeps the previous
+// behaviour, without size caps the none driver cannot honour.
+func TestNaiveManager_ExplicitOptOutDisablesContainerLog(t *testing.T) {
+	params := naiveInstallParams()
+	params[containerlog.DisableParam] = true
+	runCmd := naiveContainerRunCommand(t, params)
+
+	if want := containerlog.RunArgs(true); !strings.Contains(runCmd, want) {
+		t.Fatalf("docker run does not honour the explicit opt-out %q:\n%s", want, runCmd)
+	}
+	if strings.Contains(runCmd, "--log-opt") {
+		t.Fatalf("disabled container log must not carry size caps:\n%s", runCmd)
 	}
 }
 

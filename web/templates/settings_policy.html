@@ -100,6 +100,12 @@
             <p class="form-hint">{{ _ "policy_excluded_domains_hint" }}</p>
         </div>
 
+        <div class="form-group">
+            <label class="form-label" for="policy_inventory_override">{{ _ "policy_inventory_override_label" }}</label>
+            <textarea class="form-input font-mono" id="policy_inventory_override" name="policy_inventory_override" rows="4" spellcheck="false" autocapitalize="none" placeholder="{{ _ "policy_inventory_override_placeholder" }}"></textarea>
+            <p class="form-hint">{{ _ "policy_inventory_override_hint" }}</p>
+        </div>
+
         <p class="form-hint">{{ _ "policy_semantics_notice" }}</p>
         <p class="form-hint">{{ _ "policy_limits_notice" }}</p>
 
@@ -138,6 +144,32 @@
             <span class="info-card-value" id="policyRuleCount">-</span>
         </div>
     </div>
+
+    <div class="divider settings-divider">{{ _ "policy_inventory_title" }}</div>
+
+    <div class="info-card-grid">
+        <div class="info-card-item">
+            <span class="info-card-label">{{ _ "policy_inventory_source_label" }}</span>
+            <span class="info-card-value" id="policyInventorySource">-</span>
+        </div>
+        <div class="info-card-item">
+            <span class="info-card-label">{{ _ "policy_inventory_prefixes_label" }}</span>
+            <span class="info-card-value" id="policyInventoryPrefixes">-</span>
+        </div>
+        <div class="info-card-item">
+            <span class="info-card-label">{{ _ "policy_inventory_retrieved_label" }}</span>
+            <span class="info-card-value" id="policyInventoryRetrieved">-</span>
+        </div>
+        <div class="info-card-item">
+            <span class="info-card-label">{{ _ "policy_inventory_age_label" }}</span>
+            <span class="info-card-value" id="policyInventoryAge">-</span>
+        </div>
+        <div class="info-card-item">
+            <span class="info-card-label">{{ _ "policy_inventory_override_status_label" }}</span>
+            <span class="info-card-value" id="policyInventoryOverrideStatus">-</span>
+        </div>
+    </div>
+    <p class="form-hint" id="policyInventoryNotice"></p>
 
     <div class="form-group mt-md">
         <span class="form-label">{{ _ "policy_sources_title" }}</span>

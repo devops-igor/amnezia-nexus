@@ -64,6 +64,13 @@ var policySectionIDs = []string{
 	"policyDirectDrops",
 	"policy_local_entries",
 	"policy_excluded_domains",
+	"policy_inventory_override",
+	"policyInventorySource",
+	"policyInventoryPrefixes",
+	"policyInventoryRetrieved",
+	"policyInventoryAge",
+	"policyInventoryOverrideStatus",
+	"policyInventoryNotice",
 	"policySourceStats",
 }
 
@@ -265,6 +272,12 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 		"policy_never", "policy_none", "policy_rule_count_value", "policy_status_unknown",
 		"policy_sync_state_disabled", "policy_sync_state_error",
 		"policy_sync_state_pending", "policy_sync_state_synced",
+		// Keys the inventory block formats at run time (issue #920). Their values
+		// carry the placeholders the controller substitutes, so a missing
+		// dictionary entry would leave a raw key on the page.
+		"policy_inventory_age_value", "policy_inventory_stale",
+		"policy_inventory_override_active", "policy_inventory_override_none",
+		"policy_inventory_unusable",
 	} {
 		keys[key] = true
 	}

@@ -52,6 +52,16 @@ const (
 	EgressReasonNoTrustedEvidence EgressReason = "no_trusted_evidence"
 	// EgressReasonNonTCPOrUDP means the protocol cannot be NATed directly.
 	EgressReasonNonTCPOrUDP EgressReason = "non_tcp_udp_fallback"
+	// EgressReasonAllocationDirect means the destination is inside the Russian
+	// allocation and no CDN exclusion applied, so the address alone routed it
+	// DIRECT with no DNS evidence (issue #918). The token names allocation
+	// membership, never hosting location: the classifier cannot prove where a
+	// service runs, only how its address is allocated.
+	EgressReasonAllocationDirect EgressReason = "allocation_direct"
+	// EgressReasonAllocationCDNExcluded means the destination is inside the
+	// Russian allocation but its range belongs to a known multi-region CDN, so
+	// it stayed proxied (issue #918).
+	EgressReasonAllocationCDNExcluded EgressReason = "allocation_cdn_excluded"
 )
 
 // Dispatch outcome and failure tokens. A flow states what happened to the

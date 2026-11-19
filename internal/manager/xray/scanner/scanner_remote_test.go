@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/geodb"
 )
 
 func startScannerTLSServer(t *testing.T, domain string) (*httptest.Server, *x509.CertPool) {
@@ -66,7 +68,7 @@ func TestProbeTLSH2UsesDialContext(t *testing.T) {
 
 func TestScanSNIRemoteDialContextScope(t *testing.T) {
 	server, rootCAs := startScannerTLSServer(t, "127.0.0.1")
-	geoDB := NewGeoDBFromRanges([]IPRange{{
+	geoDB := geodb.NewGeoDBFromRanges([]geodb.IPRange{{
 		StartIP: 0x7F000001,
 		EndIP:   0x7F000001,
 		ASN:     13335,

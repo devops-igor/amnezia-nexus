@@ -186,6 +186,17 @@ func startPersistedPolicyRouting(ctx context.Context, db *database.DB, vpnSvc *v
 				slog.Warn("Could not apply the persisted upstream DNS list; the continuity responder keeps its previous list", "err", applyErr)
 			}
 		}
+		// The stored inventory override is reported even while policy routing is
+		// off: the status describes what the record configures, and an operator
+		// reading it must not see the shipped set alone when an override is stored.
+		// An unparsable record keeps the shipped set, which is the fail-safe answer.
+		override, overrideErr := policySettings.ParsedInventoryOverride()
+		if overrideErr != nil {
+			slog.Warn("Persisted inventory override is unusable; the shipped allocation set stays authoritative",
+				"err", overrideErr)
+			override = nil
+		}
+		vpnSvc.SetInventoryOverride(override)
 		return nil
 	}
 

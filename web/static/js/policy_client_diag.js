@@ -488,7 +488,15 @@
             }
             appendCell(row, names);
 
-            var outcome = clientText('policy_client_outcome_fmt')
+            // The route and the dispatch outcome are stated together, on the
+            // server's own tokens: a flow routed DIRECT whose packets never reached
+            // the WAN must read as direct-and-failed rather than as an unexplained
+            // failure, because the cause is the egress path, not the classifier.
+            var dispatchState = (flow.dispatch && flow.dispatch.state) || 'not_recorded';
+            var routeOutcome = clientText('policy_client_route_outcome_fmt')
+                .replace('{route}', clientTokenLabel('decision', flow.choice))
+                .replace('{dispatch}', clientTokenLabel('dispatch', dispatchState));
+            var outcome = routeOutcome + ' · ' + clientText('policy_client_outcome_fmt')
                 .replace('{ok}', String((flow.forward && flow.forward.packets) || 0))
                 .replace('{failed}', String((flow.forward && flow.forward.failed) || 0))
                 .replace('{return}', clientTokenLabel('return_evidence', (flow.return && flow.return.evidence) || 'not_recorded'))

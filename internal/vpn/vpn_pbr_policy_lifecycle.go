@@ -129,6 +129,15 @@ type PolicyStatus struct {
 	DNSQueriesRetired          uint64 `json:"dns_queries_retired"`
 	DNSRefusalsPerSession      uint64 `json:"dns_refusals_per_session"`
 	DNSRefusalsGlobal          uint64 `json:"dns_refusals_global"`
+
+	// Inventory is the committed Russian address inventory (issue #919): the
+	// source and retrieval date recorded beside the data, its age against the
+	// staleness threshold, and whether an operator override is in force.
+	//
+	// It is reported whether or not policy routing is currently enabled,
+	// because the artifact ships with the build and its age is a fact about
+	// the binary rather than about the sync. It carries no client addresses.
+	Inventory *policy.InventoryStatus `json:"inventory,omitempty"`
 }
 
 // policyRuntime holds the live policy objects for a started service.
@@ -138,6 +147,28 @@ type policyRuntime struct {
 	settings policy.Settings
 	presetID string
 	cancel   context.CancelFunc
+}
+
+// policyActivationInput compiles the two things activation needs from an operator
+// record: the syncer configuration, and the parsed inventory override the address
+// classifier is built from.
+//
+// Both belong to one derivation because they share the same contract. SyncConfig
+// validates the whole record — the address override included — so an override that
+// reaches the classifier is one the same validation accepted. Parsing it here
+// keeps that pairing in one place instead of leaving activation to remember it,
+// and the error is returned rather than swallowed so an unusable body can never
+// activate as a shipped-set-only classifier that looks applied.
+func policyActivationInput(settings policy.Settings) (policy.SyncConfig, *policy.InventoryOverride, error) {
+	cfg, err := settings.SyncConfig()
+	if err != nil {
+		return policy.SyncConfig{}, nil, fmt.Errorf("policy settings: %w", err)
+	}
+	override, err := settings.ParsedInventoryOverride()
+	if err != nil {
+		return policy.SyncConfig{}, nil, fmt.Errorf("policy settings: inventory override: %w", err)
+	}
+	return cfg, override, nil
 }
 
 // StartPolicyRouting starts policy synchronization and activates the PBR data
@@ -159,9 +190,9 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 	if s == nil {
 		return errors.New("vpn: policy activation requires a service")
 	}
-	cfg, err := settings.SyncConfig()
+	cfg, override, err := policyActivationInput(settings)
 	if err != nil {
-		return fmt.Errorf("policy settings: %w", err)
+		return err
 	}
 	if store == nil {
 		return errors.New("vpn: policy activation requires a durable policy store")
@@ -217,10 +248,11 @@ func (s *Service) StartPolicyRouting(ctx context.Context, settings policy.Settin
 		return fmt.Errorf("activate policy routing: %w", err)
 	}
 	s.SetPBRConfig(PBRConfig{
-		Enabled:       true,
-		HostWANIP:     hostWAN,
-		PolicyMatcher: matcher,
-		UpstreamDNS:   settings.EffectiveUpstreams(),
+		Enabled:           true,
+		HostWANIP:         hostWAN,
+		PolicyMatcher:     matcher,
+		UpstreamDNS:       settings.EffectiveUpstreams(),
+		InventoryOverride: override,
 	})
 
 	if err := s.initPBR(ctx); err != nil {
@@ -296,6 +328,16 @@ func (s *Service) updateLivePolicyRouting(ctx context.Context, matcher *policy.M
 	if err := s.applyLiveUpstreams(settings); err != nil {
 		return err
 	}
+	// The inventory override is not part of the compiled snapshot either: it is
+	// applied to the installed classifier, which is replaced rather than rebuilt.
+	// It is applied only after the sync succeeded, for the same reason as the
+	// upstream list: a refused update must leave the previous configuration,
+	// override included, in effect.
+	override, err := settings.ParsedInventoryOverride()
+	if err != nil {
+		return fmt.Errorf("inventory override: %w", err)
+	}
+	s.SetInventoryOverride(override)
 	// Only after the content is published does the schedule change, so a refused
 	// update leaves the previous loop running on the previous rules.
 	s.startPolicyLoop(ctx, syncer, matcher, settings, presetID)
@@ -650,7 +692,37 @@ func (s *Service) PolicyStatusSnapshot() PolicyStatus {
 
 	applyUpstreamStatus(&status, s.getPBRConfig())
 	applyDNSPanelStatus(&status, s)
+	applyInventoryStatus(&status, s.effectiveInventoryOverride())
 	return status
+}
+
+// applyInventoryStatus reports the Russian inventory's provenance and age, with
+// any operator override distinguished from the committed set (issues #919, #920).
+//
+// The override is applied to the shipped set here exactly as the classifier
+// applies it, so the counts an operator reads describe the set the packet path is
+// consulting: the shipped prefix count and digest stay the shipped set's, and the
+// override's own count and digest are reported beside them rather than folded in.
+//
+// An unusable artifact is reported as an error on the field rather than omitted:
+// an operator who sees no inventory at all cannot tell "this build has no
+// artifact" from "the artifact is broken and every address is being proxied",
+// and only the first is harmless. A configured override is still reported then,
+// because "an override is stored and currently useless" is a different fact from
+// "nothing is configured".
+func applyInventoryStatus(status *PolicyStatus, override *policy.InventoryOverride) {
+	inventory, err := policy.ShippedInventory()
+	if err != nil {
+		status.Inventory = &policy.InventoryStatus{
+			Error:               err.Error(),
+			MaxAgeDays:          int(policy.DefaultInventoryMaxAge / (24 * time.Hour)),
+			OverridePrefixCount: override.PrefixCount(),
+			OverrideSHA256:      override.Digest(),
+		}
+		return
+	}
+	live := inventory.WithOverride(override).Status(time.Now().UTC(), policy.DefaultInventoryMaxAge)
+	status.Inventory = &live
 }
 
 // applyDNSPanelStatus copies the panel-side intercepted-DNS accounting of the

@@ -257,9 +257,18 @@ var clientDiagTokenValues = map[string][]string{
 	"reason": {
 		"sticky_flow", "evidence_direct", "proxy_cidr_rule", "proxy_cached_evidence",
 		"no_trusted_evidence", "not_recorded",
+		// Address classification of issue #918. The first token names allocation
+		// membership, not hosting location; the second names a range that is
+		// inside the allocation but belongs to a multi-region CDN.
+		"allocation_direct", "allocation_cdn_excluded",
 	},
 	"name_match":      {"unique", "ambiguous", "none", "not_recorded"},
 	"return_evidence": {"observed", "not_observed", "not_measured", "not_recorded"},
+	// What the dispatch path did with the flow's packets. The state is a token
+	// family of its own because it is rendered beside the route: a DIRECT flow
+	// whose writes failed reads as direct-and-failed, not as an unexplained
+	// failure (issue #920).
+	"dispatch": {"written_to_wan", "queued_to_backend", "failed", "not_recorded"},
 	"corr": {
 		"answer_after_decision", "expired_before_decision", "no_retained_answer",
 		"decision_time_not_recorded", "dns_records_not_recorded", "dns_names_not_retained",
