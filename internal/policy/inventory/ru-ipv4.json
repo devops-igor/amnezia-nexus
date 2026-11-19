@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "kind": "russian_ipv4_allocations",
+  "source": "ipdeny",
+  "source_url": "https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone",
+  "retrieved_at": "2026-11-19",
+  "prefix_count": 8664,
+  "sha256": "a115697bb8cacf10c211c59848448862c05411a62b21e343e8fb3fab0cb0a645",
+  "license": "RIR delegation data; freely redistributable, no account and no key",
+  "notes": "Committed verbatim: ru-ipv4.txt is byte-identical to the published feed, so `curl <source_url> | sha256sum` reproduces sha256 above. Prefix count and digest are re-derived from the committed bytes at load time and a mismatch is refused. Regenerate only with ./cmd/ru-inventory, which validates before writing."
+}

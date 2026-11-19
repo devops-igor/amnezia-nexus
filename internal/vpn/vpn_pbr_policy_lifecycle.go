@@ -129,6 +129,15 @@ type PolicyStatus struct {
 	DNSQueriesRetired          uint64 `json:"dns_queries_retired"`
 	DNSRefusalsPerSession      uint64 `json:"dns_refusals_per_session"`
 	DNSRefusalsGlobal          uint64 `json:"dns_refusals_global"`
+
+	// Inventory is the committed Russian address inventory (issue #919): the
+	// source and retrieval date recorded beside the data, its age against the
+	// staleness threshold, and whether an operator override is in force.
+	//
+	// It is reported whether or not policy routing is currently enabled,
+	// because the artifact ships with the build and its age is a fact about
+	// the binary rather than about the sync. It carries no client addresses.
+	Inventory *policy.InventoryStatus `json:"inventory,omitempty"`
 }
 
 // policyRuntime holds the live policy objects for a started service.
@@ -650,7 +659,28 @@ func (s *Service) PolicyStatusSnapshot() PolicyStatus {
 
 	applyUpstreamStatus(&status, s.getPBRConfig())
 	applyDNSPanelStatus(&status, s)
+	applyInventoryStatus(&status)
 	return status
+}
+
+// applyInventoryStatus reports the committed Russian inventory's provenance and
+// age (issue #919).
+//
+// An unusable artifact is reported as an error on the field rather than omitted:
+// an operator who sees no inventory at all cannot tell "this build has no
+// artifact" from "the artifact is broken and every address is being proxied",
+// and only the first is harmless.
+func applyInventoryStatus(status *PolicyStatus) {
+	inventory, err := policy.ShippedInventory()
+	if err != nil {
+		status.Inventory = &policy.InventoryStatus{
+			Error:      err.Error(),
+			MaxAgeDays: int(policy.DefaultInventoryMaxAge / (24 * time.Hour)),
+		}
+		return
+	}
+	live := inventory.Status(time.Now().UTC(), policy.DefaultInventoryMaxAge)
+	status.Inventory = &live
 }
 
 // applyDNSPanelStatus copies the panel-side intercepted-DNS accounting of the
