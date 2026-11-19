@@ -22,7 +22,11 @@ concurrency:
 jobs:
   e2e-dev:
     name: DEV Server E2E Verification
-    runs-on: [ self-hosted, linux, arm64, dev ]
+    # GitHub-hosted runner: the gate deploys the panel and its data plane on the
+    # runner itself, so it needs no reachability to a lab host. The four-core ARM
+    # SBC that used to host it stalled under load and produced false failures
+    # (issue 928), and hosted minutes are free for a public repository.
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       # internal/vpn does not compile without this tag (tags_guard.go enforces
@@ -245,9 +249,16 @@ jobs:
           # Ensure functional awg CLI tool is available
           if ! awg --version >/dev/null 2>&1; then
             echo "Installing functional awg CLI tool and musl runtime..."
-            if [ ! -f /lib/ld-musl-aarch64.so.1 ]; then
-              sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20261116-1 /lib/ld-musl-aarch64.so.1 | sudo tee /lib/ld-musl-aarch64.so.1 >/dev/null
-              sudo chmod 755 /lib/ld-musl-aarch64.so.1
+            # The image is musl-built, so the CLI needs the loader for the
+            # runner's architecture. Resolve it rather than assuming aarch64.
+            case "$(uname -m)" in
+              aarch64|arm64) MUSL_LOADER=/lib/ld-musl-aarch64.so.1 ;;
+              x86_64|amd64)  MUSL_LOADER=/lib/ld-musl-x86_64.so.1 ;;
+              *) echo "Unsupported architecture for the awg CLI tool: $(uname -m)" >&2; exit 1 ;;
+            esac
+            if [ ! -f "$MUSL_LOADER" ]; then
+              sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20261116-1 "$MUSL_LOADER" | sudo tee "$MUSL_LOADER" >/dev/null
+              sudo chmod 755 "$MUSL_LOADER"
             fi
             sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20261116-1 /usr/local/bin/awg | sudo tee /usr/local/bin/awg >/dev/null
             sudo chmod 755 /usr/local/bin/awg
