@@ -241,6 +241,27 @@ jobs:
           E2E_PANEL_LOG_CONTAINER="amnezia-panel" \
           ./scripts/run_e2e_lifecycle.sh
 
+      - name: Collect Panel and Install Logs on Failure
+        if: failure()
+        run: |
+          mkdir -p test-artifacts/e2e-diagnostics
+          OUT=test-artifacts/e2e-diagnostics/failure-context.txt
+          {
+            echo "==> Containers"
+            docker ps -a 2>&1 || true
+            echo
+            echo "==> Panel log, install-related lines"
+            docker logs amnezia-panel --tail 600 2>&1 | grep -aiE "install|awg|protocol|readiness|error|fail" || true
+            echo
+            echo "==> Panel log, last 200 lines"
+            docker logs amnezia-panel --tail 200 2>&1 || true
+            echo
+            echo "==> AWG backend container"
+            docker logs amnezia-awg2 --tail 200 2>&1 || true
+            docker inspect amnezia-awg2 --format '{{.State.Status}} {{.State.Error}} exit={{.State.ExitCode}}' 2>&1 || true
+          } > "$OUT" 2>&1
+          echo "Collected failure context for the panel and the AWG backend."
+
       - name: Upload Lifecycle Diagnostics
         uses: actions/upload-artifact@v7
         if: always()
