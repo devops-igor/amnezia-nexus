@@ -128,7 +128,8 @@ func policySettingsEqual(a, b policy.Settings) bool {
 		slices.Equal(a.CustomURLs, b.CustomURLs) &&
 		slices.Equal(a.LocalEntries, b.LocalEntries) &&
 		slices.Equal(a.ExcludedDomains, b.ExcludedDomains) &&
-		slices.Equal(a.UpstreamDNS, b.UpstreamDNS)
+		slices.Equal(a.UpstreamDNS, b.UpstreamDNS) &&
+		slices.Equal(a.InventoryOverride, b.InventoryOverride)
 }
 
 // restorePolicySettings compensates a committed settings write whose activation
@@ -177,6 +178,7 @@ func (h *Handlers) GetPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		"custom_urls":           customURLsOrEmpty(settings.CustomURLs),
 		"local_entries":         localEntriesOrEmpty(settings.LocalEntries),
 		"excluded_domains":      excludedDomainsOrEmpty(settings.ExcludedDomains),
+		"inventory_override":    stringsOrEmpty(settings.InventoryOverride),
 		"sync_interval_seconds": settings.SyncInterval,
 		"upstream_dns":          upstreamDNSOrEmpty(settings.UpstreamDNS),
 	}
@@ -196,23 +198,32 @@ func customURLsOrEmpty(urls []string) []string {
 	return urls
 }
 
+// stringsOrEmpty reports an empty JSON array rather than null for a list the
+// record leaves unset, so the settings form receives a value it can join. Every
+// additive list in the API answers through it, so one field cannot report null
+// while its neighbors report [].
+func stringsOrEmpty(entries []string) []string {
+	if entries == nil {
+		return []string{}
+	}
+	return entries
+}
+
+// localEntriesOrEmpty reports an empty JSON array rather than null for a record
+// whose local entry list is unset.
+func localEntriesOrEmpty(entries []string) []string {
+	return stringsOrEmpty(entries)
+}
+
+// excludedDomainsOrEmpty reports an empty JSON array rather than null for a
+// record whose exclusion list is unset.
+func excludedDomainsOrEmpty(entries []string) []string {
+	return stringsOrEmpty(entries)
+}
+
 // upstreamDNSOrEmpty reports an empty JSON array rather than null for a record
 // that uses the effective default upstream list. An empty array therefore reads
 // as "no explicit list", which is exactly what the setting means.
-func localEntriesOrEmpty(entries []string) []string {
-	if entries == nil {
-		return []string{}
-	}
-	return entries
-}
-
-func excludedDomainsOrEmpty(entries []string) []string {
-	if entries == nil {
-		return []string{}
-	}
-	return entries
-}
-
 func upstreamDNSOrEmpty(list []policy.Upstream) []policy.Upstream {
 	if list == nil {
 		return []policy.Upstream{}
@@ -312,8 +323,9 @@ func (h *Handlers) PutPolicyHandler(w http.ResponseWriter, r *http.Request) {
 	h.audit(r, "policy.settings_save", map[string]any{
 		"result": "ok", "enabled": incoming.Enabled, "preset": string(incoming.Preset),
 		"custom_url_count": len(incoming.CustomURLs), "local_entry_count": len(incoming.LocalEntries),
-		"excluded_domain_count": len(incoming.ExcludedDomains),
-		"sync_interval_seconds": incoming.SyncInterval, "upstream_dns_count": len(incoming.UpstreamDNS),
+		"excluded_domain_count":    len(incoming.ExcludedDomains),
+		"inventory_override_count": len(incoming.InventoryOverride),
+		"sync_interval_seconds":    incoming.SyncInterval, "upstream_dns_count": len(incoming.UpstreamDNS),
 	})
 	h.JSON(w, http.StatusOK, h.policyPutResponse(incoming))
 }
@@ -426,7 +438,11 @@ func mergeStoredPolicyFields(incoming policy.Settings, previous previousPolicyRe
 	if err != nil {
 		return policy.Settings{}, err
 	}
-	return mergeStoredExcludedDomains(merged, previous)
+	merged, err = mergeStoredExcludedDomains(merged, previous)
+	if err != nil {
+		return policy.Settings{}, err
+	}
+	return mergeStoredInventoryOverride(merged, previous)
 }
 
 // mergeStoredLocalEntries preserves the stored local entries when a save omits
@@ -461,6 +477,24 @@ func mergeStoredExcludedDomains(incoming policy.Settings, previous previousPolic
 	return merged, nil
 }
 
+// mergeStoredInventoryOverride preserves the stored inventory override when a
+// save omits the field. An explicitly empty slice is a deliberate removal, so a
+// client that cannot render the textarea yet cannot erase an operator's override
+// on an ordinary save, while clearing it stays possible.
+func mergeStoredInventoryOverride(incoming policy.Settings, previous previousPolicyRecord) (policy.Settings, error) {
+	if incoming.InventoryOverride != nil {
+		return incoming, nil
+	}
+	merged := incoming
+	if previous.present {
+		merged.InventoryOverride = previous.settings.InventoryOverride
+	}
+	if err := merged.Validate(); err != nil {
+		return policy.Settings{}, err
+	}
+	return merged, nil
+}
+
 // policyPutResponse renders the saved record plus live status.
 func (h *Handlers) policyPutResponse(saved policy.Settings) map[string]any {
 	response := map[string]any{
@@ -470,6 +504,7 @@ func (h *Handlers) policyPutResponse(saved policy.Settings) map[string]any {
 		"custom_urls":           customURLsOrEmpty(saved.CustomURLs),
 		"local_entries":         localEntriesOrEmpty(saved.LocalEntries),
 		"excluded_domains":      excludedDomainsOrEmpty(saved.ExcludedDomains),
+		"inventory_override":    stringsOrEmpty(saved.InventoryOverride),
 		"sync_interval_seconds": saved.SyncInterval,
 		"upstream_dns":          upstreamDNSOrEmpty(saved.UpstreamDNS),
 	}
@@ -496,6 +531,12 @@ func (h *Handlers) applyPolicySettings(ctx context.Context, settings policy.Sett
 	}
 
 	if !settings.Enabled {
+		// The override is parsed before anything is torn down: a rejected body must
+		// not leave the data path stopped while the record is rolled back.
+		override, err := settings.ParsedInventoryOverride()
+		if err != nil {
+			return fmt.Errorf("inventory override: %w", err)
+		}
 		// An accepted disable still owns the resolver that issued gateway-DNS
 		// profiles use, so its list is published before the data path is torn
 		// down; teardown then builds the continuity responder from that list.
@@ -503,6 +544,12 @@ func (h *Handlers) applyPolicySettings(ctx context.Context, settings policy.Sett
 			return fmt.Errorf("apply upstream dns configuration: %w", err)
 		}
 		h.vpnSvc.StopPolicyRouting()
+		// The override is part of the stored record, not of the data path: with
+		// policy routing off nothing consults the classifier, but the status still
+		// has to describe the override the operator has configured. StartPolicyRouting
+		// records the same value on the enabling path, so both branches leave the
+		// service describing the accepted record.
+		h.vpnSvc.SetInventoryOverride(override)
 		return nil
 	}
 

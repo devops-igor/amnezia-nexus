@@ -259,6 +259,16 @@ func SetWANDeviceFactoryForTest(fn func(name string) (forwarder.PacketDevice, er
 	return func() { newProductionWANDevice = previous }
 }
 
+// DestinationClassifierForTest exposes the address classifier installed on the
+// packet path, so a test in another package can assert what an activated data
+// path actually consults. Test-only.
+func (s *Service) DestinationClassifierForTest() forwarder.DestinationClassifier {
+	if s == nil || s.forwarder == nil {
+		return nil
+	}
+	return s.forwarder.DestinationClassifier()
+}
+
 // policyFetcherForTest lets tests drive the real fetch pipeline against a local
 // TLS fixture instead of a public CA. Production leaves it nil, so
 // newPolicySyncer passes a nil fetcher and policy.NewSyncer builds the hardened

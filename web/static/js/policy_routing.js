@@ -335,6 +335,13 @@
         if (excludedTextarea) {
             excludedTextarea.value = excluded.join('\n');
         }
+        // The inventory override is a stored record field like the lists above: the
+        // textarea always shows what the server accepted, never a local guess.
+        var override = Array.isArray(record.inventory_override) ? record.inventory_override : [];
+        var overrideTextarea = policyElement('policy_inventory_override');
+        if (overrideTextarea) {
+            overrideTextarea.value = override.join('\n');
+        }
 
         var interval = policyElement('policy_sync_interval');
         if (interval && typeof record.sync_interval_seconds === 'number') {
@@ -383,6 +390,74 @@
         });
     }
 
+    // renderPolicyInventory states which allocation inventory the classifier is
+    // using. The shipped set's provenance is reported as its own facts, and an
+    // operator override is reported beside it rather than as part of it: an
+    // operator who cannot tell the two apart cannot tell whether a routing
+    // decision came from the committed artifact or from their own correction.
+    //
+    // Every value comes from the server's snapshot. When the artifact is unusable
+    // the notice carries the reported error, because an empty grid would read as
+    // "no data" instead of "the set is broken and everything is proxied".
+    function renderPolicyInventory(snapshot) {
+        var inventory = snapshot && snapshot.inventory ? snapshot.inventory : null;
+        var source = policyElement('policyInventorySource');
+        var prefixes = policyElement('policyInventoryPrefixes');
+        var retrieved = policyElement('policyInventoryRetrieved');
+        var age = policyElement('policyInventoryAge');
+        var override = policyElement('policyInventoryOverrideStatus');
+        var notice = policyElement('policyInventoryNotice');
+
+        if (!inventory) {
+            [source, prefixes, retrieved, age, override].forEach(function (el) {
+                if (el) {
+                    el.textContent = '-';
+                }
+            });
+            if (notice) {
+                notice.textContent = '';
+            }
+            return;
+        }
+
+        if (source) {
+            source.textContent = inventory.source || policyText('policy_none');
+        }
+        if (prefixes) {
+            prefixes.textContent = policyFormatCount(inventory.prefix_count);
+        }
+        if (retrieved) {
+            retrieved.textContent = inventory.retrieved_at || policyText('policy_none');
+        }
+        if (age) {
+            var ageText = policyText('policy_inventory_age_value')
+                .replace('{days}', policyFormatCount(inventory.age_days))
+                .replace('{max}', policyFormatCount(inventory.max_age_days));
+            if (inventory.stale) {
+                ageText = ageText + ' · ' + policyText('policy_inventory_stale');
+            }
+            age.textContent = ageText;
+        }
+        if (override) {
+            var overrideCount = Number(inventory.override_prefix_count) || 0;
+            if (overrideCount > 0) {
+                // The digest is what distinguishes two overrides with the same
+                // number of prefixes; it is truncated for reading, never invented.
+                var digest = inventory.override_sha256 ? String(inventory.override_sha256).slice(0, 12) : '';
+                override.textContent = policyText('policy_inventory_override_active')
+                    .replace('{count}', policyFormatCount(overrideCount))
+                    .replace('{digest}', digest);
+            } else {
+                override.textContent = policyText('policy_inventory_override_none');
+            }
+        }
+        if (notice) {
+            notice.textContent = inventory.error
+                ? policyText('policy_inventory_unusable') + ' ' + inventory.error
+                : '';
+        }
+    }
+
     function renderPolicyStatus(record, status) {
         var snapshot = policyRuntimeSnapshot({ status: status });
         if (snapshot) {
@@ -416,6 +491,7 @@
         }
 
         renderPolicySourceStats(snapshot);
+        renderPolicyInventory(snapshot);
 
         var lastSuccessEl = policyElement('policyLastSuccess');
         if (lastSuccessEl) {
@@ -539,6 +615,21 @@
         });
     }
 
+    // policyInventoryOverride reads the operator's override field. An empty field
+    // is sent as an explicit empty list, which the server treats as a deliberate
+    // removal of a stored override.
+    function policyInventoryOverride() {
+        var textarea = policyElement('policy_inventory_override');
+        if (!textarea || typeof textarea.value !== 'string') {
+            return [];
+        }
+        return textarea.value.split('\n').map(function (line) {
+            return line.trim();
+        }).filter(function (line) {
+            return line !== '';
+        });
+    }
+
     function policySavePayload() {
         var preset = policySelectedPreset();
         var enabledInput = policyElement('policy_enabled');
@@ -550,6 +641,7 @@
             custom_urls: preset === 'custom' ? policyCustomURLs() : [],
             local_entries: policyLocalEntries(),
             excluded_domains: policyExcludedDomains(),
+            inventory_override: policyInventoryOverride(),
             sync_interval_seconds: isFinite(interval) && interval > 0 ? interval : 0
         };
     }
