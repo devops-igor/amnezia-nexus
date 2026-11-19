@@ -301,6 +301,71 @@ func TestRejectedUpdateLeavesCommittedArtifactIntact(t *testing.T) {
 	}
 }
 
+// The two committed files are replaced by separate renames, so an interrupted
+// update can leave new data beside the previous provenance record. This is the
+// failure the atomicity comments describe: the loader refuses that pair rather
+// than serving it, and one re-run of the tool writes both files from one
+// matching generation.
+func TestMixedInventoryPairIsRefusedAndRerunRestoresCoherence(t *testing.T) {
+	dir := t.TempDir()
+	prov := InventoryProvenance{
+		Source:      "ipdeny",
+		SourceURL:   "https://example.invalid/ru-aggregated.zone",
+		RetrievedAt: "2026-11-19",
+	}
+	first := syntheticZone(1200)
+	_, firstMeta, err := ValidateInventoryUpdate(first, prov)
+	if err != nil {
+		t.Fatalf("ValidateInventoryUpdate: %v", err)
+	}
+	if err := WriteInventoryArtifact(dir, first, firstMeta); err != nil {
+		t.Fatalf("WriteInventoryArtifact: %v", err)
+	}
+
+	// Only the data file is replaced, as if the first rename succeeded and the
+	// process died before the second.
+	second := syntheticZone(1201)
+	if err := os.WriteFile(InventoryDataPath(dir), second, 0o600); err != nil {
+		t.Fatalf("simulate the interrupted update: %v", err)
+	}
+	mixedData, err := os.ReadFile(InventoryDataPath(dir))
+	if err != nil {
+		t.Fatalf("read mixed data: %v", err)
+	}
+	mixedMeta, err := os.ReadFile(InventoryMetaPath(dir))
+	if err != nil {
+		t.Fatalf("read mixed provenance: %v", err)
+	}
+	if _, err := LoadInventory(mixedData, mixedMeta); !errors.Is(err, ErrInventoryProvenanceMismatch) {
+		t.Fatalf("mixed pair error = %v, want %v", err, ErrInventoryProvenanceMismatch)
+	}
+
+	// Re-running the tool is the documented recovery: both files come from one
+	// generation, so the pair is coherent again.
+	record, rerunMeta, err := ValidateInventoryUpdate(second, prov)
+	if err != nil {
+		t.Fatalf("ValidateInventoryUpdate on re-run: %v", err)
+	}
+	if err := WriteInventoryArtifact(dir, second, rerunMeta); err != nil {
+		t.Fatalf("WriteInventoryArtifact on re-run: %v", err)
+	}
+	recoveredData, err := os.ReadFile(InventoryDataPath(dir))
+	if err != nil {
+		t.Fatalf("read recovered data: %v", err)
+	}
+	recoveredMeta, err := os.ReadFile(InventoryMetaPath(dir))
+	if err != nil {
+		t.Fatalf("read recovered provenance: %v", err)
+	}
+	recovered, err := LoadInventory(recoveredData, recoveredMeta)
+	if err != nil {
+		t.Fatalf("re-running the tool did not restore a coherent pair: %v", err)
+	}
+	if recovered.PrefixCount() != record.PrefixCount || recovered.PrefixCount() != 1201 {
+		t.Fatalf("recovered inventory holds %d prefixes, want 1201", recovered.PrefixCount())
+	}
+}
+
 func TestWriteInventoryArtifactRequiresWritableDirectory(t *testing.T) {
 	err := WriteInventoryArtifact(os.TempDir()+"/does-not-exist-919/inventory", []byte("10.0.0.0/8\n"), []byte("{}"))
 	if err == nil {

@@ -13,7 +13,10 @@
 //	  | go run ./cmd/ru-inventory -url https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone -retrieved 2026-11-19
 //
 // A rejected body leaves the committed artifact untouched and exits non-zero.
-// Use -dry-run to validate and report without writing.
+// The data file and its provenance record are then replaced by two separate
+// renames, so a run that fails between them leaves a mixed pair that the loader
+// refuses; re-running this command rewrites both from one matching zone. Use
+// -dry-run to validate and report without writing.
 package main
 
 import (

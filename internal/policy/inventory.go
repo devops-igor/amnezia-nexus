@@ -36,8 +36,9 @@ import (
 //   - the loader re-derives the prefix count and digest from the bytes it
 //     actually parsed and refuses the artifact when they disagree with the
 //     provenance file. A hand-edited zone, a truncated copy or a mismatched
-//     provenance update is therefore a startup-visible error, never a silently
-//     smaller routing set.
+//     provenance update is therefore an error at load time — including the
+//     mixed pair a regeneration interrupted between its two renames leaves
+//     behind — never a silently smaller routing set.
 //
 // Uncovered addresses are out of scope here: the consumer treats "not a member"
 // as the fail-safe proxy default.

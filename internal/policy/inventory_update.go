@@ -11,17 +11,18 @@ import (
 // This file owns the maintenance entry point for the committed Russian
 // inventory (issue #919). It is not used at runtime.
 //
-// The ordering is the guarantee: a body is fully validated and its provenance
-// record rendered BEFORE any file is touched, so a rejected update — a captive
-// portal response, a truncated download, a body with one bad line — leaves the
-// previously committed artifact exactly as it was. Writes then go through a
-// temporary file in the destination directory and a rename, so an interrupted
-// update cannot leave a half-written zone that the loader would parse as a
-// smaller set.
+// The ordering is the guarantee that matters most: a body is fully validated and
+// its provenance record rendered BEFORE any file is touched, so a rejected
+// update — a captive portal response, a truncated download, a body with one bad
+// line — leaves the previously committed artifact exactly as it was. Each file
+// is then replaced atomically on its own. The two renames are separate, so a run
+// that dies between them leaves a mixed pair, which the loader refuses rather
+// than serving; WriteInventoryArtifact states that contract and the recovery.
 //
 // A written artifact is re-verified by the loader (count and digest are derived
 // from the bytes), which is why this file does not need its own verification
-// pass: a mismatch is refused at startup rather than trusted here.
+// pass: a mismatch is refused when the artifact is loaded rather than trusted
+// here.
 
 // ValidateInventoryUpdate validates body as the committed zone and returns the
 // complete provenance record with its committed JSON rendering. It writes
@@ -60,8 +61,19 @@ func ValidateInventoryUpdate(body []byte, prov InventoryProvenance) (InventoryPr
 }
 
 // WriteInventoryArtifact replaces the committed data and provenance files in dir
-// with body and meta. Both files are written to temporaries in dir first and then
-// renamed, so a reader never observes a partially written artifact.
+// with body and meta.
+//
+// Each file is individually atomic: it is written to a temporary in dir and
+// renamed into place, so no reader ever sees a half-written file. The two
+// renames are separate, so a reader that runs between them observes a mixed
+// pair — new data with the previous provenance record, or the reverse. That pair
+// is not served: LoadInventory re-derives the prefix count and digest from the
+// data and refuses the artifact when the record disagrees, so an interrupted
+// update cannot present a smaller or inconsistent set as the current one.
+// Recovery is to re-run the tool: one invocation rewrites both files from one
+// matching generation, after which the pair is coherent again. No journal, lock
+// or two-phase commit is involved, and none is needed — the inconsistent pair
+// fails loudly and re-running is idempotent.
 //
 // It does not validate body: callers use ValidateInventoryUpdate first, which is
 // the single place the acceptance rule lives.
