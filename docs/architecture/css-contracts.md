@@ -27,7 +27,7 @@ An automated comment-stripped brace parsing inspection of `web/static/css/style.
    - `.switch-slider` (line 2530) references `var(--bg-surface-hover, #232738)`. Because an explicit fallback is supplied, it safely evaluates to `#232738` at runtime.
    - `.login-card-elevated` (line 2596) references `box-shadow: var(--shadow-xl), 0 0 30px rgba(99, 102, 241, 0.06);`. Because `--shadow-xl` has no fallback, the entire `box-shadow` declaration becomes invalid at computed-value time and evaluates to `none` (the secondary glow shadow is not retained).
 3. **Redundant Copy-Paste Rules**: Multiple utility classes (`.hidden`, `.gap-xs`, `.gap-sm`, `.gap-md`) are duplicated verbatim at lines 1641–1671 and lines 1941–1956.
-4. **Tight Go Unit Test Coupling**: Multiple Go tests in `web/` assert literal string tokens, multi-line blocks, and regexes directly against `fs.ReadFile(staticFS, "css/style.css")`. Any naive file split without coordination breaks the Go test suite. Production templates pin the stylesheet href to `?v=1.1.0` (asserted in `web/web_vpn_test.go:760`).
+4. **Tight Go Unit Test Coupling**: Multiple Go tests in `web/` assert literal string tokens, multi-line blocks, and regexes directly against `fs.ReadFile(staticFS, "css/style.css")`. Any naive file split without coordination breaks the Go test suite. Production templates pin the stylesheet href to `?v={{ .app_version }}`, which resolves to the build's `AppVersion`; `internal/handlers/asset_version_test.go` fails if any template hardcodes a literal version instead.
 
 ---
 
@@ -389,26 +389,26 @@ Total Lines Accounted: 3,008 lines (Every proposed file strictly < 1,000 lines)
 
 #### Template Context Invariant
 In Amnezia Nexus, HTTP request context injected by Go (`internal/handlers/template.go:713–724`) provides `current_user, site_settings, captcha_settings, lang, translations_json, csrf_token, app_version, app_codename` plus the handler map. **It does NOT inject `.active_page` or `.version`.**
-Furthermore, production templates pin the stylesheet href to `?v=1.1.0` (asserted in `web/web_vpn_test.go:760`). Standalone templates (`login.html`, `setup.html`, `change_password.html`) do not extend `base.html` and link stylesheets directly.
+Furthermore, production templates pin the stylesheet href to `?v={{ .app_version }}` (asserted in `web/web_vpn_test.go:760`). Standalone templates (`login.html`, `setup.html`, `change_password.html`) do not extend `base.html` and link stylesheets directly.
 
 #### Production Load Order Contract
 All stylesheets must be loaded unconditionally in `base.html` and standalone templates in this strict order:
 
 ```html
 <!-- 1. Design Tokens & Theme Variables -->
-<link rel="stylesheet" href="/static/css/tokens.css?v=1.1.0">
+<link rel="stylesheet" href="/static/css/tokens.css?v={{ .app_version }}">
 <!-- 2. Base Element Resets & Primitives -->
-<link rel="stylesheet" href="/static/css/base.css?v=1.1.0">
+<link rel="stylesheet" href="/static/css/base.css?v={{ .app_version }}">
 <!-- 3. Shell Layout & Structural Drawers -->
-<link rel="stylesheet" href="/static/css/layout.css?v=1.1.0">
+<link rel="stylesheet" href="/static/css/layout.css?v={{ .app_version }}">
 <!-- 4. Atomic Components & Form Dialogs -->
-<link rel="stylesheet" href="/static/css/components.css?v=1.1.0">
+<link rel="stylesheet" href="/static/css/components.css?v={{ .app_version }}">
 <!-- 5. Interactive Data Table Engine (Loads AFTER components so .table-search-input overrides .form-input) -->
-<link rel="stylesheet" href="/static/css/tables.css?v=1.1.0">
+<link rel="stylesheet" href="/static/css/tables.css?v={{ .app_version }}">
 <!-- 6. Server Management Domain -->
-<link rel="stylesheet" href="/static/css/server.css?v=1.1.0">
+<link rel="stylesheet" href="/static/css/server.css?v={{ .app_version }}">
 <!-- 7. VPN Telemetry, Dashboard, Utilities & Users (Loads utilities AFTER components so .font-mono overrides .form-input) -->
-<link rel="stylesheet" href="/static/css/vpn.css?v=1.1.0">
+<link rel="stylesheet" href="/static/css/vpn.css?v={{ .app_version }}">
 ```
 
 ### 8.3 Go Asset Embedding & Unit Test Lockstep Contract
@@ -451,7 +451,7 @@ The following real tests read `css/style.css` directly and assert literal string
 8. `TestLoadBalancerHighlightAndAwgPreselection` (`web/web_vpn_test.go:156`, assert at line 200): Asserts `".lb-selection-callout"` and `"[dir="rtl"] .lb-selection-callout"`.
 9. `TestIssue101VPNModernization` (`web/web_vpn_test.go:298`, assert at line 453): Asserts 17 classes: `".stat-card"`, `".stat-card-header"`, `".stat-card-title"`, `".stat-card-value"`, `".stat-card-sub"`, `".latency-pill"`, `".latency-good"`, `".latency-fair"`, `".latency-poor"`, `".latency-dot"`, `".info-card"`, `".info-card-grid"`, `".info-card-item"`, `".info-card-label"`, `".info-card-value"`, `".interactive-table th"`, `".interactive-table td"`, as well as `".interactive-table"` and `"width: 100%"`.
 10. `TestIssue101VPNPolishRework` (`web/web_vpn_test.go:630`, assert at line 654): Asserts `".gap-xs {"` and `"gap: var(--space-xs);"`.
-11. `TestIssue109VPNTableFullWidth` (`web/web_vpn_test.go:716`, assert at line 727): Asserts multi-line `.interactive-table` and `.table-container table` full-width blocks, and verifies cache-busting href `href="/static/css/style.css?v=1.1.0"` across all templates at line 760.
+11. `TestIssue109VPNTableFullWidth` (`web/web_vpn_test.go:716`, assert at line 727): Asserts multi-line `.interactive-table` and `.table-container table` full-width blocks, and verifies cache-busting href `href="/static/css/base.css?v={{ .app_version }}"` across all templates.
 12. Test fixtures & computed-style JSDOM tests:
     - `web/vpn_fixture_test.go:211`: reads `static/css/style.css` via `readFixtureStaticAsset` and injects it into Node.js / JSDOM `<style>` element.
     - `web/vpn_fixture_selftest_test.go:653, 728`: asserts virtual static FS mapping.
@@ -882,7 +882,7 @@ Any PR implementing Issue #505 MUST satisfy the following checklist before merge
   - Both `.traffic-badge` definitions and modifiers reside in `components.css` in source order.
   - Responsive `@media` overrides remain in the same file as, or downstream of, their base rules (e.g. L1673–1719 in `server.css` loading after `components.css`).
   - Multi-selector theme transition hook is placed after component transitions.
-- [ ] **Unconditional Link Contract**: Stylesheets are loaded unconditionally in `base.html` and standalone templates with cache-busting query `?v=1.1.0`.
+- [ ] **Unconditional Link Contract**: Stylesheets are loaded unconditionally in `base.html` and standalone templates with cache-busting query `?v={{ .app_version }}`.
 - [ ] **Badge Integrity**: Winning `.badge` definition (L1900, `border-radius: var(--radius-sm)`) and `.badge-secondary` (line 1935) are preserved during badge consolidation.
 - [ ] **Dedup Boundaries**: Only byte-identical utilities (lines 1941–1956: `.hidden`, `.gap-*`) and dead companion `.skeleton-icon` (line 1428) are pruned mechanically; visual design changes are separated.
 - [ ] **Stacking Context Hierarchy**: Stacking order is strictly maintained: desktop base sidebar (`z-index: 90`), mobile bottom bar (`z-index: 70`), drawer backdrop (`z-index: 95`), drawer active sidebar (`z-index: 100`).
