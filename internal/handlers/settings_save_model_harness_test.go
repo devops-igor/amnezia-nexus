@@ -203,8 +203,15 @@ func seedSettingsForPage(t *testing.T, h *Handlers) {
 // service is absent, so the page meets a second unrelated subsystem failure
 // during load. liveNotifications routes the real notification handlers instead,
 // for tests that need that card to load and save.
+//
+// storeBeforeRender replaces stored sections after the standard seed and before
+// the page is rendered, so a card can be loaded with a value its markup would
+// reject as an entry. That is a state this build defines: an empty appearance
+// field means "use the built-in one" and a zero connection limit means "use the
+// default", and the rendered inputs show exactly what storage holds.
 type settingsHarnessOptions struct {
 	liveNotifications bool
+	storeBeforeRender map[string]any
 }
 
 // settingsHarnessServerWith exposes the settings and hosting handlers over HTTP as
@@ -253,6 +260,11 @@ func runSettingsScenarioWith(t *testing.T, h *Handlers, opts settingsHarnessOpti
 	t.Helper()
 	node := gigahostOrderStatusNode(t)
 	seedSettingsForPage(t, h)
+	for key, value := range opts.storeBeforeRender {
+		if err := h.db.SetSetting(context.Background(), key, value); err != nil {
+			t.Fatalf("store %s before render: %v", key, err)
+		}
+	}
 	page := renderSettingsPageFor(t, h, models.RoleAdmin)
 	srv := settingsHarnessServerWith(t, h, opts)
 

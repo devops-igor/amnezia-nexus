@@ -670,6 +670,46 @@ def test_settings_card_dirty_state_and_scoped_save_feedback(
 
 
 @pytest.mark.e2e
+def test_settings_empty_stored_appearance_fields_do_not_block_the_card(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """A stored empty logo and subtitle is a state this panel defines: the shell
+    renders its built-in icon and label for them. The appearance card must still
+    commit a change to another of its fields, and must send the empty values back as
+    they were stored.
+
+    Regression: the card enforced its own required attributes against the values it
+    had loaded, so a card in that state produced no request at all and the operator
+    could not save the change they did make.
+    """
+    page = authenticated_page
+    original = api_get(page, "/api/settings")
+    assert isinstance(original, dict)
+    appearance = dict(original.get("appearance") or {})
+    try:
+        appearance.update({"title": "Empty Stored Fields", "logo": "", "subtitle": ""})
+        api_post(page, "/api/settings/save", {"appearance": appearance}, csrf_token)
+
+        page.goto(f"{base_url}/settings")
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(700)
+        assert page.locator("#app_logo").input_value() == ""
+        assert page.locator("#app_subtitle").input_value() == ""
+
+        page.locator("#app_title").fill("Empty Stored Fields Edited")
+        _commit(page, "appearanceCard")
+        page.wait_for_timeout(1000)
+
+        assert page.locator("#appearanceCard [data-error]").inner_text().strip() == ""
+        stored = api_get(page, "/api/settings")
+        assert stored["appearance"]["title"] == "Empty Stored Fields Edited"
+        assert stored["appearance"]["logo"] == "", "the untouched stored logo was rewritten"
+        assert stored["appearance"]["subtitle"] == "", "the untouched stored subtitle was rewritten"
+    finally:
+        _restore_settings(page, csrf_token, original)
+
+
+@pytest.mark.e2e
 def test_settings_security_commits_persist_across_a_reload(
     authenticated_page: Page, base_url: str, csrf_token: str
 ) -> None:
