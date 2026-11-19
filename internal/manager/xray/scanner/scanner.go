@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/devops-igor/amnezia-nexus/internal/geodb"
 )
 
 // DefaultCandidateDomains contains well-known high-reputation TLS 1.3 / H2 endpoints.
@@ -66,14 +68,14 @@ type ScannerOptions struct {
 	Concurrency int
 	Timeout     time.Duration
 	Domains     []string
-	GeoDB       *GeoDB
+	GeoDB       *geodb.GeoDB
 	RootCAs     *x509.CertPool
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // calculateProximityScore ranks candidate domains by locality, treating Anycast CDNs as graceful fallback.
 func calculateProximityScore(serverCountry string, serverASN uint32, candCountry string, candASN uint32) int {
-	isCDN := IsMultiRegionCDNASN(candASN)
+	isCDN := geodb.IsMultiRegionCDNASN(candASN)
 	sameASN := serverASN > 0 && candASN > 0 && serverASN == candASN
 	sameCountry := serverCountry != "" && candCountry != "" && serverCountry == candCountry
 
@@ -112,7 +114,7 @@ func ScanSNI(ctx context.Context, serverHost string, opts ScannerOptions) (*Scan
 	geoDB := opts.GeoDB
 	if geoDB == nil {
 		var err error
-		geoDB, err = DefaultGeoDB()
+		geoDB, err = geodb.DefaultGeoDB()
 		if err != nil {
 			return nil, fmt.Errorf("load default geodb: %w", err)
 		}
@@ -220,7 +222,7 @@ func scanCandidateDomain(
 	serverIP net.IP,
 	serverCountry string,
 	serverASN uint32,
-	geoDB *GeoDB,
+	geoDB *geodb.GeoDB,
 	timeout time.Duration,
 	rootCAs *x509.CertPool,
 	dialContext func(ctx context.Context, network, addr string) (net.Conn, error),
