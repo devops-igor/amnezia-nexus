@@ -14,18 +14,16 @@ A release centred on the Settings experience, together with policy routing gains
 ### Added
 - Multi-protocol backends: Xray and NaiveProxy remote protocol managers with a REALITY SNI scanner and portal UI, a generalized backend tunnel schema, Naive installation from a pinned prebuilt Caddy image, and a pure-Go NaiveProxy HTTP/2 and HTTP/3 client dialer with a CONNECT prober.
 - Gigahost hosting inside the panel: datacenter placement chosen on the Settings page, durable VPS setup with an automatic policy that is off by default and enforced at every effect boundary, host identity pinned on first contact, hourly orders pinned to a documented datacenter, and interactive order status refreshing every 30 seconds.
-- Client routing diagnostics: recorded terminal DNS query events, retained per-client route state, correlated flow decisions, attempted DNS names on uncorrelated flows, and a per-client diagnosis answer that states its own evidence gap.
+- Client routing diagnostics: recorded terminal DNS query events, retained per-client route state, correlated flow decisions, attempted DNS names on uncorrelated flows, and a per-client diagnosis answer that states its own evidence gap (#862).
 - Forwarder visibility: PROXY return-direction observation, per-flow decision and dispatch evidence, oversized-return attribution to the direct or backend producer, and bounded per-client pre-flow refusals.
-- Encrypted upstream resolver editor in Settings, with DNS-over-HTTPS and DNS-over-TLS upstreams carried through policy.
+- Encrypted upstream resolver editor in Settings, with DNS-over-HTTPS and DNS-over-TLS upstreams carried through policy (#862).
 - Ingress dispatch to proxy or direct WAN, with admission onto canary-proven backends.
 - Per-card Settings saving: every card commits its own fields from a control inside it, shows an unsaved-changes badge and reports success or failure within that card, replacing the single page-level button (#884, #888).
 - Rebuilt Settings layout: two equal columns above 1024 px and one below, one heading outline, one two-step button scale, and no inline layout styles left in any settings template (#884, #887).
 - Upstream policy aggregation with a never-proxy guard and operator-managed local entries, VK domains treated as direct, and editable exclusion lists (#883, #892, #894).
-- Per-client routing diagnosis and an upstream DNS editor (#862).
 - Durable Gotify delivery with authoritative notification producers (#785).
 
 ### Changed
-- The Policy Explain dry run was removed; the policy API no longer offers a dry-run explanation mode (#882).
 - DNS and forwarding behaviour was tightened across the range: replies for expired direct-flow incarnations are refused, oversized direct TCP returns are normalized to the client MTU, mixed DNS admission is repaired with panel overload reported, and policy attribution identity survives a restart.
 - The Settings page and the settings API are now Admin-only. The Support role keeps ordinary backup downloads and still receives no administrator-only policy records (#893, #909).
 - Settings saves write only the sections a request carries. An omitted section is left as stored instead of being reset, and credential material that cannot be decrypted refuses the save with a recoverable error instead of being overwritten (#888).
