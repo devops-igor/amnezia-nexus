@@ -20,8 +20,10 @@
  * substituted default is what let a card report success for a setting it never
  * stored. The card module rejects an entry the card's markup rejects before any
  * collector runs; the check here is what keeps a card that never reaches it
- * honest. After a save the numeric fields are filled in from the accepted values,
- * so the card shows the setting that was stored.
+ * honest. A field the operator left alone holds the stored value, which is sent
+ * back as it is: only an entry has to satisfy the range its markup declares.
+ * After a save the numeric fields are filled in from the accepted values, so the
+ * card shows the setting that was stored.
  */
 (function (root) {
     'use strict';
@@ -87,9 +89,20 @@
     }
 
     // parses asks the control itself whether the value it holds satisfies the
-    // constraints its markup declares.
+    // constraints its markup declares. A value the card loaded is exempt: it is
+    // already what the server stores, the operator did not type it, and refusing
+    // it would leave a card that cannot be saved for a reason nobody caused. The
+    // number itself still has to be readable, which numberOf checks before this.
     function parses(node) {
+        if (unchanged(node)) return true;
         return typeof node.checkValidity !== 'function' || node.checkValidity();
+    }
+
+    // unchanged reports whether a field still holds the value its card loaded, as
+    // the card module records it.
+    function unchanged(node) {
+        var module = cards();
+        return !!(module && typeof module.unchanged === 'function' && module.unchanged(node));
     }
 
     // collectors read one card's fields exactly as the page-level save used to.

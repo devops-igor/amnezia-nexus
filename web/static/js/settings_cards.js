@@ -56,6 +56,13 @@
  * still not a place to guess, so submit() also refuses an entry that is not a
  * number rather than let a collector replace it with a default.
  *
+ * The constraints bind entries, not stored values. A control that still holds the
+ * value its card loaded is showing data the server already keeps, and the
+ * operator did not type it: refusing it would make a card unsaveable over a
+ * value nobody entered, which is the state a stored empty field produced. Such a
+ * control is therefore left out of the check and sent back unchanged, while the
+ * same value typed by the operator is an entry and must satisfy the markup.
+ *
  * Busy is set before the request and cleared on every terminal outcome. A second
  * submit while one runs is ignored. Exactly one status region and one alert
  * region exist per card, at most one has text, and an outcome is written to the
@@ -376,16 +383,34 @@
         return name ? name + ': ' + reason : reason;
     }
 
+    // unchanged reports whether a control still holds the value its card was
+    // loaded with, or last stored. That value is data, not an entry: it is what
+    // the server already keeps for the field, so sending it back cannot change
+    // anything. The card's own baseline is the only record of it, which is why
+    // this lives here and not in each controller.
+    function unchanged(control) {
+        var card = control && control.closest ? control.closest('[data-settings-card]') : null;
+        var state = card ? states.get(card) : null;
+        if (!state) return false;
+        var list = controls(card);
+        var index = list.indexOf(control);
+        var was = index < 0 ? null : state.baseline[index];
+        if (!was || was[0] !== keyOf(control, index)) return false;
+        return valueOf(control, false) === was[1];
+    }
+
     // invalidControl returns the first control of the card the commit may not send,
     // or null. The constraints are the ones the markup declares: checkValidity
     // covers required, min, max, step, pattern and the input's type, so a constraint
     // added to a template is enforced here without a matching rule in this file. A
     // number the markup does not require still has to be a number: an entry that is
     // not one is refused rather than replaced by a default somewhere further down.
+    // A control the operator has not touched is not an entry and is not checked.
     function invalidControl(card) {
         var list = controls(card);
         for (var i = 0; i < list.length; i++) {
             var control = list[i];
+            if (unchanged(control)) continue;
             if (control.willValidate === false) continue;
             if (typeof control.checkValidity === 'function' && !control.checkValidity()) return control;
             var numeric = (control.type || '').toLowerCase() === 'number';
@@ -489,6 +514,10 @@
         report: report,
         submit: submit,
         clearReport: clearReport,
+        // unchanged tells whether a control still holds the value its card loaded,
+        // which a controller that reads a typed number itself needs to know: a
+        // stored value is sent back as it is, an entry must satisfy the markup.
+        unchanged: unchanged,
         // A controller that reads a typed number itself refuses an entry it cannot
         // read through this, so the card names the field the same way it would if
         // submit() had rejected it.
