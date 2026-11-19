@@ -231,6 +231,12 @@ type Forwarder struct {
 	policyMatcher *policy.Matcher
 	gatewayDNSIP  netip.Addr
 	dnsHandler    DNSHandler
+	// destinationClassifier answers "inside the Russian allocation, and is it a
+	// multi-region CDN" for the routing contract (issue #918). It is immutable
+	// once installed. A nil value is the documented fail-closed state: the
+	// contract keeps its proxy default, which is the behavior before this
+	// input existed. Guarded by mu.
+	destinationClassifier DestinationClassifier
 
 	// Policy routing accounting metrics:
 	proxiedBytes atomic.Int64
@@ -602,6 +608,25 @@ func (f *Forwarder) SetPolicyMatcher(m *policy.Matcher) {
 	f.mu.Lock()
 	f.policyMatcher = m
 	f.mu.Unlock()
+}
+
+// SetDestinationClassifier installs the address classifier the routing contract
+// consults (issue #918). A nil value removes it, which restores the documented
+// fail-closed state: no classification input, so the contract keeps its proxy
+// default. The classifier is immutable, so installing one is a pointer swap and
+// the packet path needs no lock beyond the read that snapshots it.
+func (f *Forwarder) SetDestinationClassifier(c DestinationClassifier) {
+	f.mu.Lock()
+	f.destinationClassifier = c
+	f.mu.Unlock()
+}
+
+// DestinationClassifier returns the installed address classifier, or nil when
+// none is configured.
+func (f *Forwarder) DestinationClassifier() DestinationClassifier {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.destinationClassifier
 }
 
 // PolicyMatcher returns the configured policy matcher.

@@ -97,6 +97,10 @@ const w = dom.window;
 w._ = key => {
   if (key === 'policy_rule_count_value') return '{domains} domains / {cidrs} prefixes';
   if (key.indexOf('policy_sync_state_') === 0) return 'sync:' + key.slice('policy_sync_state_'.length);
+  // The two inventory templates whose substitution is under test: everything else
+  // resolves to its own key, so an assertion can name the exact key a branch chose.
+  if (key === 'policy_inventory_age_value') return '{days} d / max {max}';
+  if (key === 'policy_inventory_override_active') return 'OVERRIDE {count} · {digest}';
   return key;
 };
 
@@ -201,8 +205,12 @@ func runPolicyControllerScenario(t *testing.T, prelude, scenario string) {
 func policyRecordScript(enabled bool, preset string) string {
 	return fmt.Sprintf(`
 const record = () => ({enabled: %t, preset: '%s', custom_urls: [], sync_interval_seconds: 21600,
+  inventory_override: [],
   status: {enabled: %t, preset: '%s', domain_count: 1234, cidr_count: 56, sync_state: 'synced',
-           last_success: '2026-11-14T10:00:00Z', last_error: ''}});
+           last_success: '2026-11-14T10:00:00Z', last_error: '',
+           inventory: {source: 'ipdeny', source_url: 'https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone',
+                       retrieved_at: '2026-11-19', prefix_count: 8664, override_prefix_count: 0,
+                       age_days: 1, max_age_days: 180, stale: false}}});
 const stats = () => ({proxy_bytes: 2048, direct_bytes: 1048576, proxy_drops: 3, direct_drops: 0});
 responder = async (url, opts) => {
   if (url.endsWith('/stats')) return stats();
@@ -229,6 +237,16 @@ assert.equal(text('policyProxyDrops'), '3');
 assert.equal(text('policyDirectDrops'), '0');
 assert.equal(w.document.getElementById('policyCustomUrlsGroup').style.display, 'none',
   'the custom URL box must stay hidden for a preset that carries no URLs');
+// The inventory block reports the shipped set's own provenance and says plainly
+// that no operator override is in force.
+assert.equal(text('policyInventorySource'), 'ipdeny');
+assert.equal(text('policyInventoryPrefixes'), '8664');
+assert.equal(text('policyInventoryRetrieved'), '2026-11-19');
+assert.equal(text('policyInventoryAge'), '1 d / max 180',
+  'a fresh artifact reports its age against the configured bound, without the stale marker');
+assert.equal(text('policyInventoryOverrideStatus'), 'policy_inventory_override_none',
+  'an absent override must read as "shipped set only", not as an empty override');
+assert.equal(text('policyInventoryNotice'), '', 'a usable artifact needs no warning');
 assert.equal(requestsTo('/api/vpn/policy/stats', 'GET').length, 1, 'counters come from the server exactly once');
 `)
 }
@@ -258,7 +276,7 @@ await settle();
 const puts = requestsTo('/api/vpn/policy', 'PUT');
 assert.equal(puts.length, 1, 'one save is exactly one PUT');
 assert.deepEqual(puts[0].body, {enabled: true, preset: 'russia_inside', custom_urls: [],
-                                local_entries: [], excluded_domains: [],
+                                local_entries: [], excluded_domains: [], inventory_override: [],
                                 sync_interval_seconds: 21600},
   'the save payload carries the operator intent and the preserved interval');
 assert.equal(alertText().state, 'success', 'an accepted save is reported as success');
@@ -649,6 +667,82 @@ assert.equal(alertText().state, 'success');
 assert.equal(toggle(), true, 'the accepted record is applied to the form');
 assert.equal(badge().enabled, 'unknown',
   'the PUT result code "ok" must not be promoted to a runtime snapshot');
+`)
+}
+
+// TestPolicyRoutingControllerInventoryOverride covers the operator override
+// surface (issue #920): the textarea is populated from the stored record, the
+// save carries the edited list, and the status distinguishes an operator override
+// from the shipped set, including a stale artifact and an unusable one.
+func TestPolicyRoutingControllerInventoryOverride(t *testing.T) {
+	runPolicyControllerScenario(t, `
+const recordWith = (inventory) => ({
+  enabled: false, preset: 'aggregate', custom_urls: [], sync_interval_seconds: 21600,
+  inventory_override: ['203.0.113.0/24'],
+  status: {enabled: false, preset: 'aggregate', domain_count: 0, cidr_count: 0,
+           sync_state: 'disabled', last_success: '', last_error: '', inventory: inventory}
+});
+const shipped = {source: 'ipdeny', retrieved_at: '2026-11-19', prefix_count: 8664,
+                 sha256: 'a115697bb8ca', override_prefix_count: 0, age_days: 2,
+                 max_age_days: 180, stale: false};
+responder = async (url, opts) => {
+  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
+  if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
+    return {status: 'ok', enabled: false, preset: 'aggregate', custom_urls: [],
+            inventory_override: ['198.51.100.0/24', '203.0.113.0/24'],
+            sync_interval_seconds: 21600,
+            policy_status: recordWith(Object.assign({}, shipped, {
+              override_prefix_count: 2, override_sha256: 'deadbeefcafe1234', age_days: 200, stale: true
+            })).status};
+  }
+  return recordWith(shipped);
+};
+`, `
+// The stored override is shown as stored, never as an empty box.
+assert.equal(w.document.getElementById('policy_inventory_override').value, '203.0.113.0/24',
+  'the override textarea is populated from the record');
+assert.equal(text('policyInventoryOverrideStatus'), 'policy_inventory_override_none');
+assert.equal(text('policyInventoryAge'), '2 d / max 180');
+assert.equal(text('policyInventoryNotice'), '');
+
+// The operator replaces it; the payload carries the edited list, and the answer
+// renders the accepted override beside the shipped set, with the stale marker the
+// server reported and the digest that distinguishes two overrides of equal size.
+editField('policy_inventory_override', ' 198.51.100.0/24 \n\n 203.0.113.0/24 ');
+await w.savePolicySettings();
+await settle();
+
+const puts = requestsTo('/api/vpn/policy', 'PUT');
+assert.equal(puts.length, 1, 'one save is exactly one PUT');
+assert.deepEqual(puts[0].body.inventory_override, ['198.51.100.0/24', '203.0.113.0/24'],
+  'the payload carries the override prefixes, trimmed and without blank lines');
+assert.equal(text('policyInventoryPrefixes'), '8664',
+  'the shipped prefix count stays the shipped count while an override is in force');
+assert.equal(text('policyInventoryOverrideStatus'), 'OVERRIDE 2 · deadbeefcafe',
+  'the override is reported beside the shipped set, identified by its digest');
+assert.equal(text('policyInventoryAge'), '200 d / max 180 · policy_inventory_stale',
+  'a stale artifact is marked stale, not presented as current');
+`)
+}
+
+// TestPolicyRoutingControllerInventoryUnusable keeps the broken-artifact case
+// visible: an operator who sees an empty grid cannot tell "no data" from "the set
+// is broken and every destination is proxied".
+func TestPolicyRoutingControllerInventoryUnusable(t *testing.T) {
+	runPolicyControllerScenario(t, `
+responder = async (url) => {
+  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
+  return {enabled: false, preset: 'geoblock', custom_urls: [], sync_interval_seconds: 21600,
+          status: {enabled: false, preset: 'geoblock', domain_count: 0, cidr_count: 0,
+                   sync_state: 'disabled', last_error: '',
+                   inventory: {error: 'inventory provenance does not match the committed data',
+                               prefix_count: 0, max_age_days: 180}}};
+};
+`, `
+assert.equal(text('policyInventoryPrefixes'), '0',
+  'an unusable artifact reports no usable prefix count');
+assert.equal(text('policyInventoryNotice'), 'policy_inventory_unusable inventory provenance does not match the committed data',
+  'the reported error is shown, so a broken set does not read as an empty one');
 `)
 }
 

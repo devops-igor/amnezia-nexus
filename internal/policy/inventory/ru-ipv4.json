@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "kind": "russian_ipv4_allocations",
+  "source": "ipdeny",
+  "source_url": "https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone",
+  "retrieved_at": "2026-11-19",
+  "prefix_count": 8664,
+  "sha256": "a115697bb8cacf10c211c59848448862c05411a62b21e343e8fb3fab0cb0a645",
+  "notice_file": "Copyrights.txt",
+  "notice_sha256": "d15546e0bb48ed5f410db0122e3f205120d09f0cbe4d43c84b3a0437709a5ef2",
+  "license": "Redistribution is permitted only on the IPDeny.com terms: Copyrights.txt must be kept intact and distributed with the zone files, and the data must not be used for spam, bulk advertising or illegal activity. The zone is derived from APNIC, ARIN, RIPE NCC, LACNIC and AFRINIC registry data under those registries' own conditions; allocation data describes registration, not the location where an address is currently in use.",
+  "notes": "Committed verbatim: ru-ipv4.txt is byte-identical to the published feed, so `curl <source_url> | sha256sum` reproduces sha256 above. Copyrights.txt is the upstream notice, committed verbatim and embedded with the binary; the loader refuses a record whose notice_sha256 does not match the notice it ships. Prefix count and digest are re-derived from the committed bytes at load time and a mismatch is refused. Regenerate only with ./cmd/ru-inventory, which validates before writing; that command replaces this record and the data file by two separate renames, so an interrupted run leaves a mismatched pair that the loader refuses rather than serving — re-run the command to write both from one matching zone."
+}
