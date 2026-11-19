@@ -6,6 +6,11 @@ container replacement. Making the rest of CI parallel must not put a second job
 on that host, and it must not let a failed shared prerequisite produce a cascade
 of duplicate failures that hides the cause.
 
+The runner that executes that lifecycle is now a GitHub-hosted one (the
+self-hosted ARM board it replaced stalled under load, issue 928). The
+exclusivity boundary is unchanged, so the runner guard asserts an explicit
+GitHub-hosted specification rather than the retired self-hosted label set.
+
 These are static and stub-driven checks; they need no host, container or
 network. The fail-fast behaviour itself is proven by running the real lifecycle
 script in ``tests/test_e2e_install_failure_finalizer.py``.
@@ -48,14 +53,76 @@ def _on_block(text: str) -> str:
 
 # ── One host, one run at a time ─────────────────────────────────────
 
+# The lifecycle gate used to pin a self-hosted `[self-hosted, linux, arm64, dev]`
+# board. That four-core ARM SBC stalled under load and produced false failures
+# (issue 928), while the same suite finished in 7m47s on a GitHub-hosted runner,
+# so the owner moved the gate there. The guard keeps its original strength: an
+# absent, empty, expression-based or self-hosted runner still fails, so the
+# workflow cannot silently drift onto a runner nobody chose. Only a Linux hosted
+# image is valid: the lifecycle uses sudo, ip, apt and docker throughout.
+HOSTED_LABEL = re.compile(r"^ubuntu-[0-9a-z.]+$")
 
-def test_dev_workflow_stays_pinned_to_the_dev_runner() -> None:
-    match = re.search(r"^\s+runs-on:\s*\[(.+)\]\s*$", _dev_text(), re.MULTILINE)
-    assert match, "e2e-dev.yml has no explicit runs-on label list"
-    labels = {label.strip() for label in match.group(1).split(",")}
-    assert {"self-hosted", "linux", "arm64", "dev"} <= labels, (
-        f"the live workflow must stay on the DEV runner, got {sorted(labels)}"
-    )
+# A declaration, not a mention: `^[ \t]*runs-on:` cannot match a line whose
+# first non-space character is `#`, so a commented-out runner requests nothing.
+# The character class, not `\s*`, keeps the value on one line: with `\s*` an
+# empty `runs-on:` swallows the following line and reads its key as the runner.
+RUNS_ON = re.compile(r"^[ \t]*runs-on:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
+
+
+def _declared_runner_labels(text: str) -> list[list[str]]:
+    """Return the label list of every ``runs-on:`` declaration in the workflow."""
+    declarations: list[list[str]] = []
+    for raw in RUNS_ON.findall(text):
+        value = raw.split("#", 1)[0].strip()
+        if value.startswith("[") and value.endswith("]"):
+            labels = [label.strip().strip("'\"") for label in value[1:-1].split(",")]
+            declarations.append([label for label in labels if label])
+        else:
+            declarations.append([value] if value else [])
+    return declarations
+
+
+def _hosted_runner_problem(labels: list[str]) -> str | None:
+    """Return why these labels are not an explicit GitHub-hosted runner, or None."""
+    if not labels:
+        return "declares no runner: the specification is absent or empty"
+    if any("${{" in label for label in labels):
+        return f"uses an expression instead of an explicit label: {labels}"
+    if "self-hosted" in labels:
+        return f"requests a self-hosted runner: {labels}"
+    if len(labels) != 1 or not HOSTED_LABEL.match(labels[0]):
+        return f"expected one GitHub-hosted ubuntu-* label (e.g. ubuntu-latest), got {labels}"
+    return None
+
+
+def test_dev_workflow_declares_an_explicit_hosted_runner() -> None:
+    declarations = _declared_runner_labels(_dev_text())
+    assert declarations, "e2e-dev.yml declares no runs-on at all"
+    for labels in declarations:
+        problem = _hosted_runner_problem(labels)
+        assert problem is None, f"e2e-dev.yml {problem}"
+
+
+def test_the_hosted_runner_guard_still_rejects_drift() -> None:
+    """The guard above must keep failing on every drift it exists to catch."""
+    assert _hosted_runner_problem(["ubuntu-latest"]) is None
+    assert _hosted_runner_problem(["ubuntu-24.04"]) is None
+    for drifted in (
+        [],
+        ["${{ matrix.os }}"],
+        ["self-hosted", "linux", "arm64", "dev"],
+        ["linux", "arm64"],
+        ["ubuntu-latest", "self-hosted"],
+        ["ubuntu-latest", "large"],
+        ["windows-latest"],
+        ["macos-14"],
+    ):
+        assert _hosted_runner_problem(drifted) is not None, drifted
+    assert _declared_runner_labels("jobs:\n  a:\n    steps: []\n") == []
+    # An empty declaration must not borrow the next line's key as its runner,
+    # and a commented-out line is not a declaration at all.
+    assert _declared_runner_labels("    runs-on:\n    timeout-minutes: 90\n") == [[]]
+    assert _declared_runner_labels("    # runs-on: ubuntu-latest\n") == []
 
 
 def test_dev_workflow_serialises_runs_without_cancelling() -> None:
