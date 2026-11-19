@@ -705,6 +705,13 @@ func TestStyleCSSConcatenationParity(t *testing.T) {
 // release version used to bust a cached copy of the asset.
 const assetVersionAction = "{{ .app_version }}"
 
+// versionedTemplateAsset is the src attribute a settings template must carry for
+// path. Every settings controller is served from /static, whose cached copy
+// outlives a release, so the attribute must name the release version.
+func versionedTemplateAsset(path string) string {
+	return `src="` + path + "?v=" + assetVersionAction + `"`
+}
+
 func TestStylesheetTemplateLoadOrder(t *testing.T) {
 	templatesFS, err := GetTemplatesSubFS()
 	if err != nil {

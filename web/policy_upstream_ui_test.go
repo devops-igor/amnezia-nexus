@@ -85,7 +85,14 @@ func upstreamSectionHTMLForTest(t *testing.T) string {
 		t.Fatalf("parse settings_policy_upstream.html: %v", err)
 	}
 	var buf bytes.Buffer
-	if err := tmpl.ExecuteTemplate(&buf, "settings_policy_upstream", map[string]any{"current_user": nil}); err != nil {
+	// The page supplies the release version. This package cannot reach the
+	// release constant without an import cycle, so the fixture supplies a
+	// placeholder, as the routing fixture does: the URL must have the production
+	// shape even where its exact value is not asserted.
+	if err := tmpl.ExecuteTemplate(&buf, "settings_policy_upstream", map[string]any{
+		"current_user": nil,
+		"app_version":  "test",
+	}); err != nil {
 		t.Fatalf("render settings_policy_upstream: %v", err)
 	}
 	rendered := buf.String()

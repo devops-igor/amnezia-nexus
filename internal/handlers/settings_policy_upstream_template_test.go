@@ -30,6 +30,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/devops-igor/amnezia-nexus/internal/config"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/web"
 )
@@ -49,7 +50,13 @@ func renderUpstreamCardForTest(t *testing.T, role models.UserRole) (string, *tem
 		t.Fatal("the partial must define the section name settings_policy_upstream")
 	}
 	var buf bytes.Buffer
-	data := map[string]any{"current_user": &models.SessionData{UserID: "user-1", Role: role}}
+	// app_version is what the page supplies to the partial, and the controller's
+	// cache identity comes from it. A fixture without it would render an empty
+	// query and could never assert the URL a browser actually requests.
+	data := map[string]any{
+		"current_user": &models.SessionData{UserID: "user-1", Role: role},
+		"app_version":  config.AppVersion,
+	}
 	if err := tmpl.ExecuteTemplate(&buf, "settings_policy_upstream", data); err != nil {
 		t.Fatalf("render settings_policy_upstream as %s: %v", role, err)
 	}
@@ -114,7 +121,7 @@ func TestSettingsPolicyUpstreamTemplate(t *testing.T) {
 	})
 
 	t.Run("ControllerAssetLoadedForAdminsOnly", func(t *testing.T) {
-		if got := strings.Count(adminBody, `src="/static/js/policy_upstream.js"`); got != 1 {
+		if got := strings.Count(adminBody, versionedSrcAttr("/static/js/policy_upstream.js")); got != 1 {
 			t.Errorf("admin render loads the upstream controller %d times, want exactly 1", got)
 		}
 	})
@@ -207,13 +214,13 @@ func TestSettingsPageRendersUpstreamEditor(t *testing.T) {
 		`data-upstream-ready="false"`,
 		`id="policyUpstreamRowTemplate"`,
 		`id="policyUpstreamSaveBtn"`,
-		`src="/static/js/policy_upstream.js"`,
+		versionedSrcAttr("/static/js/policy_upstream.js"),
 	} {
 		if !strings.Contains(adminBody, token) {
 			t.Errorf("admin settings page is missing %q", token)
 		}
 	}
-	if got := strings.Count(adminBody, `src="/static/js/policy_upstream.js"`); got != 1 {
+	if got := strings.Count(adminBody, versionedSrcAttr("/static/js/policy_upstream.js")); got != 1 {
 		t.Errorf("admin settings page loads the upstream controller %d times, want exactly 1", got)
 	}
 

@@ -39,7 +39,14 @@ func clientDiagSectionHTMLForTest(t *testing.T) string {
 		t.Fatalf("parse settings_policy_client.html: %v", err)
 	}
 	var buf bytes.Buffer
-	if err := tmpl.ExecuteTemplate(&buf, "settings_policy_client", map[string]any{"current_user": nil}); err != nil {
+	// The page supplies the release version. This package cannot reach the
+	// release constant without an import cycle, so the fixture supplies a
+	// placeholder: the URL must have the production shape even where its exact
+	// value is not asserted.
+	if err := tmpl.ExecuteTemplate(&buf, "settings_policy_client", map[string]any{
+		"current_user": nil,
+		"app_version":  "test",
+	}); err != nil {
 		t.Fatalf("render settings_policy_client: %v", err)
 	}
 	if !strings.Contains(buf.String(), `id="policyClientCard"`) {

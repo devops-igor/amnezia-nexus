@@ -53,7 +53,7 @@ func TestGigahostSetupIntentsConsumerDOM(t *testing.T) {
 	templates := settingsTemplateText(t)
 	// The template must load the extracted module: an inline copy would silently
 	// diverge from the file this test exercises.
-	if !strings.Contains(templates, `src="/static/js/gigahost_setup_intents.js"`) {
+	if !strings.Contains(templates, versionedTemplateAsset("/static/js/gigahost_setup_intents.js")) {
 		t.Fatal("settings.html does not load the extracted setup-intents module")
 	}
 	if !strings.Contains(templates, `id="setupIntentsContainer"`) {
