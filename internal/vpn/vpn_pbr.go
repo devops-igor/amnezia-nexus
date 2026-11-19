@@ -50,6 +50,10 @@ type PBRConfig struct {
 	// settings change can swap the upstream list without rebuilding the data
 	// path.
 	DNSResolver *gatewaydns.UpstreamResolver
+	// InventoryOverride is the accepted operator override the classifier applies
+	// on top of the committed allocation inventory. Nil keeps the shipped set as
+	// the only authority, which is the behavior when no override is configured.
+	InventoryOverride *policy.InventoryOverride
 }
 
 // ValidatePBRPrerequisites checks that all required direct egress components are present
@@ -182,7 +186,11 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 	s.forwarder.SetDirectEgress(dem)
 	s.forwarder.SetRouteCache(cfg.RouteCache)
 	s.forwarder.SetPolicyMatcher(cfg.PolicyMatcher)
-	s.forwarder.SetDestinationClassifier(newDestinationClassifier())
+	s.forwarder.SetDestinationClassifier(newDestinationClassifier(cfg.InventoryOverride))
+	// The recorded override and the installed classifier are written together:
+	// the status then describes the set the packet path is actually consulting,
+	// including while a later save is still being applied.
+	s.inventoryOverride = cfg.InventoryOverride
 	if cfg.GatewayDNSIP.IsValid() {
 		s.forwarder.SetGatewayDNSIP(cfg.GatewayDNSIP)
 	}
@@ -1092,14 +1100,19 @@ func (s *Service) TeardownPBR() error {
 // answers "inside the Russian allocation" and the embedded ASN table answers
 // "known multi-region CDN".
 //
+// The override is the operator's accepted correction of the allocation set
+// (issue #920). It is applied as a layer over the shipped inventory rather than
+// replacing it, so an address it does not name keeps the committed answer.
+//
 // Both are compiled into the binary, so building this costs no I/O and no
-// network. A failure leaves the classifier uninstalled, which keeps the
-// documented fail-safe: every destination is proxied, exactly as before this
-// input existed. The refusal is logged rather than swallowed, and the
+// network. A failure leaves the classifier uninstalled, which keeps the previous
+// decision path rather than a new one: the retained-DNS-evidence row still
+// decides, and a destination with no usable evidence keeps the fail-safe proxy
+// default. The refusal is logged rather than swallowed, and the
 // inventory's own status field already reports a broken artifact to the
 // operator — "the artifact is broken" and "no address is Russian" must never
 // look the same.
-func newDestinationClassifier() forwarder.DestinationClassifier {
+func newDestinationClassifier(override *policy.InventoryOverride) forwarder.DestinationClassifier {
 	inventory, err := policy.ShippedInventory()
 	if err != nil {
 		slog.Warn("Address classifier unavailable: committed allocation inventory is unusable", "err", err)
@@ -1110,7 +1123,7 @@ func newDestinationClassifier() forwarder.DestinationClassifier {
 		slog.Warn("Address classifier unavailable: embedded ASN table is unusable", "err", err)
 		return nil
 	}
-	classifier, err := policy.NewAddressClassifier(inventory, geo)
+	classifier, err := policy.NewAddressClassifier(inventory.WithOverride(override), geo)
 	if err != nil {
 		slog.Warn("Address classifier unavailable", "err", err)
 		return nil

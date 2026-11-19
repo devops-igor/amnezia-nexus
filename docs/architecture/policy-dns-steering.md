@@ -422,8 +422,43 @@ and two decide identically with or without evidence.
 
 `policy.AddressClassifier` joins both and answers only those two questions. It is
 installed by `ConfigurePBR` and removed when policy routing is disabled or torn
-down. With no classifier installed the contract keeps its fail-safe number: every
-destination is proxied, which is the behaviour before this input existed.
+down.
+
+**With no classifier installed, the contract keeps its previous decision path,
+not a new one.** The migration row still routes on fresh client DNS evidence
+(`evidence_direct` for a retained `Direct`, `proxy_cached_evidence` for a retained
+`Proxy`), and a destination with no usable evidence keeps the fail-safe `PROXY`
+default. An absent classifier therefore does not mean "every destination is
+proxied": a destination the client's own retained DNS evidence resolved direct is
+still routed direct, exactly as it was before this input existed, and only the
+address-only decisions disappear. That distinction matters when reading the
+diagnosis, because the reason token on a direct flow names which of the two paths
+decided it.
+
+### The operator inventory override
+
+The committed allocation set is the baseline, and an operator can correct or
+extend it without waiting for a release. The override is stored in the same
+policy settings record as the other policy fields:
+
+- it is the `inventory_override` list on `PUT /api/vpn/policy` and on the policy
+  settings section, one IPv4 prefix per line (the same line shape as a custom
+  source, so an operator does not learn a second syntax);
+- it is validated where it is written. A body that is not a prefix list, a
+  mistyped address such as `203.0.113.999`, an IPv6-only body, or a body with no
+  prefix at all is refused with `400` and the stored record is left exactly as it
+  was, so a typo can never be persisted as an override that applies nothing;
+- it takes precedence over the shipped set for every address it contains, and an
+  address it does not name keeps the committed answer. It answers set membership
+  only: an explicit PROXY rule and the prohibited/internal guard still outrank it,
+  so an override naming a private range cannot route such a destination;
+- it is applied on activation and on an accepted save while policy routing is
+  live. The classifier is replaced rather than the data path rebuilt, so a save
+  that only changes the override does not interrupt live flows;
+- the policy status reports it beside the shipped set — the shipped prefix count,
+  source, retrieval date and digest stay the shipped set's own facts, and the
+  override's count and digest are reported as the override. An override is
+  therefore never presented as part of the committed artifact.
 
 ### What classification does not mean
 
@@ -434,6 +469,12 @@ destination is proxied, which is the behaviour before this input existed.
   addresses still fails. That is why the per-flow record separates *routed direct
   and written to WAN* from *routed direct and failed*: the second is the signal
   that the egress location, not the classifier, is the problem.
+- **A successful WAN write is not proof that the application worked.** The write
+  records that the packet left through this host's WAN interface; it says nothing
+  about what the remote service did with it, and nothing about whether a reply
+  came back. The return direction is a separate observation, `not_observed` when
+  no reply was seen, so a direct flow can read as written and still have served
+  nothing.
 - **The CDN list is conservative.** `KnownCDNASNs` covers Cloudflare, Fastly,
   Akamai, Amazon, Google and Microsoft. It is an exclusion list, not
   comprehensive CDN detection; a Russian service behind an unlisted CDN is routed
@@ -453,7 +494,9 @@ destination is proxied, which is the behaviour before this input existed.
   client configured for encrypted DNS, while everything else keeps the proxy
   default.
 - **IPv4 only.** Interception and policy matching are IPv4. IPv6 DNS is not
-  observed.
+  observed, and an operator inventory override is validated as an IPv4 prefix
+  list, so an IPv6-only body is refused rather than stored as an override that
+  would apply nothing.
 - **TTL-zero answers produce no evidence** for unmatched destinations, the
   existing conservative rule; matched destinations still record `Proxy`.
 - **Continuity answers are not evidence.** While policy routing is inactive the

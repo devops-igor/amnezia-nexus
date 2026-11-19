@@ -3,6 +3,7 @@ package policy
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -47,6 +48,10 @@ const (
 	// MaxSyncSources bounds the total source list, including the aggregate
 	// manifest and the local source.
 	MaxSyncSources = 32
+	// MaxInventoryOverrideEntries bounds the operator inventory override. It
+	// matches the local-rule cap because the override is pasted into a form field
+	// like a local list: a body past that size is a mistake, not a routing set.
+	MaxInventoryOverrideEntries = 4096
 )
 
 // Settings is the persisted policy-routing configuration.
@@ -82,6 +87,14 @@ type Settings struct {
 	// upstream.go), and the policy resolver and the DNS servers a generated
 	// client configuration pushes both derive from it.
 	UpstreamDNS []Upstream `json:"upstream_dns,omitempty"`
+	// InventoryOverride holds operator-supplied IPv4 prefixes that take
+	// precedence over the committed Russian allocation inventory for every
+	// address they contain, so a deployment can correct the shipped set without
+	// waiting for a release. Empty is the default and means "the shipped set
+	// alone". The body uses the same line format as LocalEntries, but only prefix
+	// lines participate in the address question and a body with no prefix is
+	// refused rather than stored as an override that would apply nothing.
+	InventoryOverride []string `json:"inventory_override,omitempty"`
 }
 
 // DefaultSettings returns the fresh-install configuration: policy routing
@@ -127,6 +140,10 @@ func (s Settings) Normalize() Settings {
 			out.UpstreamDNS[i] = upstream.WithDefaultPort()
 		}
 	}
+	if s.InventoryOverride != nil {
+		out.InventoryOverride = make([]string, len(s.InventoryOverride))
+		copy(out.InventoryOverride, s.InventoryOverride)
+	}
 	return out
 }
 
@@ -147,7 +164,7 @@ func (s Settings) Interval() time.Duration {
 // Settings contains a slice and is therefore not comparable with ==, which is
 // why this exists rather than a comparison at each call site.
 func (s Settings) IsZero() bool {
-	return s.Preset == "" && !s.Enabled && s.SyncInterval == 0 && len(s.CustomURLs) == 0 && len(s.LocalEntries) == 0 && len(s.ExcludedDomains) == 0 && len(s.UpstreamDNS) == 0
+	return s.Preset == "" && !s.Enabled && s.SyncInterval == 0 && len(s.CustomURLs) == 0 && len(s.LocalEntries) == 0 && len(s.ExcludedDomains) == 0 && len(s.UpstreamDNS) == 0 && len(s.InventoryOverride) == 0
 }
 
 // Validate reports whether the configuration may be persisted. A nil result
@@ -175,6 +192,9 @@ func (s Settings) Validate() error {
 		return err
 	}
 	if err := s.validateLocalEntries(); err != nil {
+		return err
+	}
+	if err := s.validateInventoryOverride(); err != nil {
 		return err
 	}
 	return s.validateUpstreams()
@@ -243,6 +263,36 @@ func (s Settings) validateLocalEntries() error {
 		}
 	}
 	return nil
+}
+
+// validateInventoryOverride refuses an override body the classifier could not
+// apply. It uses the same parser the activation path uses, so a body that saves
+// is a body that classifies: an invalid override is rejected at the settings
+// boundary instead of being persisted and then silently ignored.
+func (s Settings) validateInventoryOverride() error {
+	if len(s.InventoryOverride) == 0 {
+		return nil
+	}
+	if len(s.InventoryOverride) > MaxInventoryOverrideEntries {
+		return fmt.Errorf("%d inventory override entries exceed the maximum of %d", len(s.InventoryOverride), MaxInventoryOverrideEntries)
+	}
+	if _, err := s.ParsedInventoryOverride(); err != nil {
+		return fmt.Errorf("inventory override rejected: %w", err)
+	}
+	return nil
+}
+
+// ParsedInventoryOverride parses the stored override body. A nil result with a
+// nil error means no override is configured, which is the shipped-set-only
+// state; the caller does not have to distinguish it from an empty body.
+//
+// Validation and activation both go through this method, so a record that
+// validated is exactly the record the classifier receives.
+func (s Settings) ParsedInventoryOverride() (*InventoryOverride, error) {
+	if len(s.InventoryOverride) == 0 {
+		return nil, nil
+	}
+	return ParseInventoryOverride([]byte(strings.Join(s.InventoryOverride, "\n")))
 }
 
 func (s Settings) validateCustomURLs() error {

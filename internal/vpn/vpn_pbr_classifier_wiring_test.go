@@ -70,7 +70,7 @@ func TestServicePBRInstallsAndRemovesTheAddressClassifier(t *testing.T) {
 // path: an unusable input means no classifier, which keeps the proxy default
 // rather than routing on partial data.
 func TestNewDestinationClassifierJoinsBothCommittedInputs(t *testing.T) {
-	classifier := newDestinationClassifier()
+	classifier := newDestinationClassifier(nil)
 	if classifier == nil {
 		t.Fatal("the committed inventory and embedded ASN table must produce a classifier")
 	}
