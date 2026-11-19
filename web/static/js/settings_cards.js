@@ -37,6 +37,8 @@
  * supplies only the request and classifies what came back; this module owns what
  * must be the same everywhere, so it cannot differ from card to card:
  *
+ *   invalid   an entry the card's own markup rejects. Nothing is sent, the field
+ *             is named in the card's error region, and the card stays unsaved.
  *   saved     the draft that was sent is the saved state. If the operator typed
  *             more while the request ran, only the sent part is saved and the
  *             rest stays on screen, marked unsaved.
@@ -44,6 +46,15 @@
  *   failed    no answer arrived (transport)            } baseline are never
  *   conflict  the stored state changed under the draft } touched, and the card
  *                                                        stays marked unsaved.
+ *
+ * Validation. The commit control is a button, so the browser never applies a
+ * field's own required, min, max and step to it. submit() asks the platform
+ * instead: every control the card would send must satisfy the constraints its
+ * markup declares, and the report names the field. The constraints are therefore
+ * the markup's, not a copy kept here, and a card that adds one gets it enforced
+ * without a change to this module. A number field the markup does not require is
+ * still not a place to guess, so submit() also refuses an entry that is not a
+ * number rather than let a collector replace it with a default.
  *
  * Busy is set before the request and cleared on every terminal outcome. A second
  * submit while one runs is ignored. Exactly one status region and one alert
@@ -345,6 +356,44 @@
     // card look saved.
     var OUTCOMES = { saved: 1, refused: 1, failed: 1, conflict: 1 };
 
+    // labelOf names a control the way its markup already does: the label it points
+    // at, the label that wraps it, or the name it is addressed by.
+    function labelOf(control) {
+        var label = null;
+        if (control.id) label = root.document.querySelector('label[for="' + control.id + '"]');
+        if (!label && control.closest) label = control.closest('label');
+        var text = label ? (label.textContent || '').replace(/\s+/g, ' ').trim() : '';
+        if (text) return text;
+        return control.getAttribute('aria-label') || control.name || control.id || '';
+    }
+
+    // fieldMessage says why one entry cannot be sent, naming the field.
+    function fieldMessage(control) {
+        var name = labelOf(control) || '';
+        var reason = control.validity && control.validity.valueMissing
+            ? tr('settings_field_required')
+            : tr('settings_field_invalid');
+        return name ? name + ': ' + reason : reason;
+    }
+
+    // invalidControl returns the first control of the card the commit may not send,
+    // or null. The constraints are the ones the markup declares: checkValidity
+    // covers required, min, max, step, pattern and the input's type, so a constraint
+    // added to a template is enforced here without a matching rule in this file. A
+    // number the markup does not require still has to be a number: an entry that is
+    // not one is refused rather than replaced by a default somewhere further down.
+    function invalidControl(card) {
+        var list = controls(card);
+        for (var i = 0; i < list.length; i++) {
+            var control = list[i];
+            if (control.willValidate === false) continue;
+            if (typeof control.checkValidity === 'function' && !control.checkValidity()) return control;
+            var numeric = (control.type || '').toLowerCase() === 'number';
+            if (numeric && control.value !== '' && !isFinite(Number(control.value))) return control;
+        }
+        return null;
+    }
+
     // submit runs one commit for a card and settles it the same way for every
     // controller. work() resolves to { outcome, message, reconcile }:
     //   saved     reconcile() may apply the server's answer to the form when
@@ -360,6 +409,14 @@
         var state = found.state;
         if (state.busy) return Promise.resolve({ outcome: 'failed', ran: false });
         clearReport(found.card);
+        // An entry the card's own markup rejects is not sent. The report names the
+        // field, and nothing else changes: the draft is what the operator typed and
+        // the card stays marked unsaved, because nothing was stored.
+        var rejected = invalidControl(found.card);
+        if (rejected) {
+            report(found.card, 'error', fieldMessage(rejected), 'invalid');
+            return Promise.resolve({ outcome: 'invalid', ran: false });
+        }
         busy(found.card, true);
         // The snapshot is taken in the same synchronous step that calls work(), so
         // what work() reads from the form to build its request and what counts as
@@ -431,7 +488,11 @@
         gate: gate,
         report: report,
         submit: submit,
-        clearReport: clearReport
+        clearReport: clearReport,
+        // A controller that reads a typed number itself refuses an entry it cannot
+        // read through this, so the card names the field the same way it would if
+        // submit() had rejected it.
+        fieldMessage: fieldMessage
     };
 
     if (root.document) {

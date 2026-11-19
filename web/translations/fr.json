@@ -315,6 +315,8 @@
   "services": "Services",
   "setting_up": "Setting up...",
   "settings_saved": "Paramètres enregistrés",
+  "settings_field_required": "ce champ ne peut pas être vide",
+  "settings_field_invalid": "saisissez un nombre dans la plage autorisée",
   "settings_title": "Paramètres du Panneau",
   "setup_already_done": "Setup already completed",
   "setup_btn": "Create Account",

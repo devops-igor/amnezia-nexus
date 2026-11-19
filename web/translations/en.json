@@ -315,6 +315,8 @@
   "services": "Services",
   "setting_up": "Setting up...",
   "settings_saved": "Settings saved successfully",
+  "settings_field_required": "this field cannot be empty",
+  "settings_field_invalid": "enter a number within the allowed range",
   "settings_title": "Panel Settings",
   "setup_already_done": "Setup already completed",
   "setup_btn": "Create Account",

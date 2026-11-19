@@ -315,6 +315,8 @@
   "services": "服务",
   "setting_up": "Setting up...",
   "settings_saved": "设置已保存",
+  "settings_field_required": "此字段不能为空",
+  "settings_field_invalid": "请输入允许范围内的数字",
   "settings_title": "面板设置",
   "setup_already_done": "Setup already completed",
   "setup_btn": "Create Account",

@@ -144,8 +144,18 @@
         categoryInputs().forEach(function (input) {
             categories[input.getAttribute('data-category')] = !!input.checked;
         });
-        var cooldown = parseInt((byId('notifications_cooldown') || {}).value || '60', 10);
-        if (!isFinite(cooldown)) cooldown = 60;
+        // The number the operator entered, or nothing to send. A field that does not
+        // hold a number stops the commit through the card's own validation; it is
+        // never replaced by the default, which is how an emptied field used to save a
+        // cooldown nobody entered.
+        var cooldownField = byId('notifications_cooldown');
+        var cooldownRaw = cooldownField ? String(cooldownField.value).trim() : '';
+        var cooldown = Number(cooldownRaw);
+        if (cooldownRaw === '' || !isFinite(cooldown)) {
+            throw new Error(root.SettingsCards && root.SettingsCards.fieldMessage
+                ? root.SettingsCards.fieldMessage(cooldownField)
+                : translate('settings_field_invalid', 'Enter a number within the allowed range'));
+        }
         var tokenInput = byId('notifications_token');
         return {
             enabled: !!(byId('notifications_enabled') || {}).checked,

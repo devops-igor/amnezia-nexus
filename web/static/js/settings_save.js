@@ -14,6 +14,14 @@
  * Commits are still queued, one after another in this document, so a card never
  * starts while another card's request is in flight and the status regions
  * report in the order the operator clicked.
+ *
+ * Collectors read what the operator entered. They do not fill in a value: a field
+ * that cannot be read as the number it declares stops the commit, because a
+ * substituted default is what let a card report success for a setting it never
+ * stored. The card module rejects an entry the card's markup rejects before any
+ * collector runs; the check here is what keeps a card that never reaches it
+ * honest. After a save the numeric fields are filled in from the accepted values,
+ * so the card shows the setting that was stored.
  */
 (function (root) {
     'use strict';
@@ -61,6 +69,29 @@
         return node ? node.checked : false;
     }
 
+    // numberOf reads a field this card sends as a number. What the operator
+    // entered is what is sent, or nothing is: a field that cannot be read as the
+    // number it declares stops the commit instead of falling back to a default. A
+    // default is how a card came to report success for a value it never stored -
+    // an entered 0 was read as absent and sent as 10, and the card went on showing
+    // the 0 it had.
+    function numberOf(id) {
+        var node = field(id);
+        if (!node) throw new Error(tr('settings_field_invalid'));
+        var raw = trimmed(id);
+        var value = Number(raw);
+        if (raw === '' || !isFinite(value) || !parses(node)) {
+            throw new Error(cards() && cards().fieldMessage ? cards().fieldMessage(node) : tr('settings_field_invalid'));
+        }
+        return value;
+    }
+
+    // parses asks the control itself whether the value it holds satisfies the
+    // constraints its markup declares.
+    function parses(node) {
+        return typeof node.checkValidity !== 'function' || node.checkValidity();
+    }
+
     // collectors read one card's fields exactly as the page-level save used to.
     var collectors = {
         appearance: function () {
@@ -82,14 +113,14 @@
                 key_path: trimmed('ssl_key_path'),
                 cert_text: trimmed('ssl_cert_text'),
                 key_text: trimmed('ssl_key_text'),
-                panel_port: parseInt(text('panel_port') || '5000')
+                panel_port: numberOf('panel_port')
             };
         },
         limits: function () {
             return {
-                max_connections_per_user: parseInt(text('max_connections_per_user')) || 10,
-                connection_rate_limit_count: parseInt(text('connection_rate_limit_count')) || 5,
-                connection_rate_limit_window: parseInt(text('connection_rate_limit_window')) || 60
+                max_connections_per_user: numberOf('max_connections_per_user'),
+                connection_rate_limit_count: numberOf('connection_rate_limit_count'),
+                connection_rate_limit_window: numberOf('connection_rate_limit_window')
             };
         },
         telegram: function () {
@@ -133,6 +164,27 @@
             } else if (control.value !== '') {
                 control.value = SECRET_MASK;
             }
+        });
+    }
+
+    // STORED_FIELDS names, per card, the fields whose stored value is the number
+    // the request carried. They are filled in from the accepted values after a
+    // save, so the field shows the setting that was stored rather than the text
+    // that produced it: an entry of 007 is stored as 7 and is shown as 7.
+    var STORED_FIELDS = {
+        limits: ['max_connections_per_user', 'connection_rate_limit_count', 'connection_rate_limit_window'],
+        ssl: ['panel_port']
+    };
+
+    // showStored writes the accepted values back into the fields the card sent. The
+    // server stores the number it decoded from the request unchanged, so the value
+    // the card sent is the value it now shows.
+    function showStored(key, body) {
+        var ids = STORED_FIELDS[key];
+        if (!ids) return;
+        ids.forEach(function (id) {
+            var node = field(id);
+            if (node) node.value = String(body[key][id]);
         });
     }
 
@@ -197,8 +249,9 @@
                     outcome: 'saved',
                     message: tr('settings_saved'),
                     // Only when nothing was typed meanwhile: secrets go back to their
-                    // masks, which is what a fresh load shows.
-                    reconcile: function () { resetSecrets(card); }
+                    // masks, which is what a fresh load shows, and the numeric fields
+                    // show the value the save stored.
+                    reconcile: function () { resetSecrets(card); showStored(key, body); }
                 };
             }, classify);
         }).then(function (settled) { return settled.outcome === 'saved'; });

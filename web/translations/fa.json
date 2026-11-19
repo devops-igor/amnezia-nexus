@@ -315,6 +315,8 @@
   "services": "سرویس‌ها",
   "setting_up": "Setting up...",
   "settings_saved": "تنظیمات با موفقیت ذخیره شد",
+  "settings_field_required": "این فیلد نمی‌تواند خالی باشد",
+  "settings_field_invalid": "عددی در محدوده مجاز وارد کنید",
   "settings_title": "تنظیمات پنل",
   "setup_already_done": "Setup already completed",
   "setup_btn": "Create Account",

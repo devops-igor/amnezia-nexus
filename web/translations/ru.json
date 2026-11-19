@@ -315,6 +315,8 @@
   "services": "Сервисы",
   "setting_up": "Настройка...",
   "settings_saved": "Настройки успешно сохранены",
+  "settings_field_required": "это поле не может быть пустым",
+  "settings_field_invalid": "введите число в допустимом диапазоне",
   "settings_title": "Настройки панели",
   "setup_already_done": "Настройка уже завершена",
   "setup_btn": "Создать аккаунт",
