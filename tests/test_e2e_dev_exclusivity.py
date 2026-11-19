@@ -58,9 +58,17 @@ def _on_block(text: str) -> str:
 # (issue 928), while the same suite finished in 7m47s on a GitHub-hosted runner,
 # so the owner moved the gate there. The guard keeps its original strength: an
 # absent, empty, expression-based or self-hosted runner still fails, so the
-# workflow cannot silently drift onto a runner nobody chose. Only a Linux hosted
-# image is valid: the lifecycle uses sudo, ip, apt and docker throughout.
-HOSTED_LABEL = re.compile(r"^ubuntu-[0-9a-z.]+$")
+# workflow cannot silently drift onto a runner nobody chose.
+#
+# The approved image is enumerated, not pattern-matched. A prefix rule accepted
+# `ubuntu-anything` and `ubuntu-999.99`, which is exactly the drift this test
+# exists to catch: a label nobody chose would have passed. Add an image here
+# deliberately when it is the one the gate should run on.
+APPROVED_HOSTED_LABELS = frozenset({
+    "ubuntu-latest",
+    "ubuntu-24.04",
+    "ubuntu-22.04",
+})
 
 # A declaration, not a mention: `^[ \t]*runs-on:` cannot match a line whose
 # first non-space character is `#`, so a commented-out runner requests nothing.
@@ -90,8 +98,11 @@ def _hosted_runner_problem(labels: list[str]) -> str | None:
         return f"uses an expression instead of an explicit label: {labels}"
     if "self-hosted" in labels:
         return f"requests a self-hosted runner: {labels}"
-    if len(labels) != 1 or not HOSTED_LABEL.match(labels[0]):
-        return f"expected one GitHub-hosted ubuntu-* label (e.g. ubuntu-latest), got {labels}"
+    if len(labels) != 1 or labels[0] not in APPROVED_HOSTED_LABELS:
+        return (
+            "expected one approved GitHub-hosted label "
+            f"({', '.join(sorted(APPROVED_HOSTED_LABELS))}), got {labels}"
+        )
     return None
 
 
@@ -116,6 +127,12 @@ def test_the_hosted_runner_guard_still_rejects_drift() -> None:
         ["ubuntu-latest", "large"],
         ["windows-latest"],
         ["macos-14"],
+        # Ubuntu-shaped but not approved: a prefix rule used to accept these,
+        # which would have let an image nobody chose run a privileged,
+        # destructive lifecycle against a real host.
+        ["ubuntu-anything"],
+        ["ubuntu-999.99"],
+        ["ubuntu-dev"],
     ):
         assert _hosted_runner_problem(drifted) is not None, drifted
     assert _declared_runner_labels("jobs:\n  a:\n    steps: []\n") == []

@@ -241,33 +241,6 @@ jobs:
           E2E_PANEL_LOG_CONTAINER="amnezia-panel" \
           ./scripts/run_e2e_lifecycle.sh
 
-      - name: Collect Panel and Install Logs on Failure
-        if: failure()
-        run: |
-          mkdir -p test-artifacts/e2e-diagnostics
-          OUT=test-artifacts/e2e-diagnostics/failure-context.txt
-          # This repository is public, so artifacts are public. Capture the
-          # failure's shape, never a raw log dump: container state plus only the
-          # lines that name an install, readiness or protocol failure. Those name
-          # a cause; a full tail can carry credentials, session identifiers and
-          # fixture data that do not belong in a downloadable artifact.
-          {
-            echo "==> Containers"
-            docker ps -a 2>&1 || true
-            echo
-            echo "==> Panel log, install and readiness lines only"
-            docker logs amnezia-panel --tail 600 2>&1 \
-              | grep -aiE "install|readiness|probe|protocol .*(fail|error)|port .* in use" \
-              | cut -c1-400 || true
-            echo
-            echo "==> AWG backend container state"
-            docker inspect amnezia-awg2 --format '{{.State.Status}} exit={{.State.ExitCode}}' 2>&1 || true
-            docker logs amnezia-awg2 --tail 40 2>&1 \
-              | grep -aiE "error|fail|fatal|panic|refus|permission|no such" \
-              | cut -c1-400 || true
-          } > "$OUT" 2>&1
-          echo "Collected failure context: container state and failure-naming lines only."
-
       - name: Upload Lifecycle Diagnostics
         uses: actions/upload-artifact@v7
         if: always()
