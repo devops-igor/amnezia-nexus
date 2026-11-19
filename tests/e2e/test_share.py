@@ -1,10 +1,13 @@
 """E2E tests for share link functionality."""
 
+import uuid
+
 import pytest
 from playwright.sync_api import Page
 
 from tests.e2e.conftest import api_get, api_post, assert_response_shape
 from tests.e2e.prerequisites import require
+from tests.e2e.share_page import SERVED_SHARE_SURFACE, assert_share_page_served
 
 
 def _find_or_create_user(page: Page, csrf_token: str, username: str = "e2e_share_user") -> dict:
@@ -98,14 +101,12 @@ def test_access_share_link(authenticated_page: Page, base_url: str, csrf_token: 
     share_token = share_result["body"].get("share_token")
     require(bool(share_token), "No share token returned")
 
-    # Navigate to the share link
-    page.goto(f"{base_url}/share/{share_token}")
+    # Navigate to the share link. The share page is judged from the navigation's
+    # own status, never from the token text: the token is random hex and may
+    # contain "404" inside a perfectly valid link.
+    response = page.goto(f"{base_url}/share/{share_token}")
     page.wait_for_load_state("networkidle")
-
-    # Should see the share page (not 404)
-    content = page.content()
-    assert "404" not in page.url
-    assert len(content) > 0
+    assert_share_page_served(response, page)
 
     # Clean up
     api_post(
@@ -115,6 +116,59 @@ def test_access_share_link(authenticated_page: Page, base_url: str, csrf_token: 
         csrf_token,
     )
     api_post(page, f"/api/users/{user_id}/delete", {}, csrf_token)
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "marker",
+    [
+        pytest.param("dead404", id="bogus-token-contains-404"),
+        pytest.param("deadbee", id="bogus-token-without-404"),
+    ],
+)
+def test_missing_share_link_is_not_served(
+    authenticated_page: Page, base_url: str, marker: str
+) -> None:
+    """Failure control: a genuinely missing share page must fail the served check.
+
+    Both tokens are random hex that does not exist. One contains "404" and one
+    does not, which are the two ways the old URL-substring assertion was wrong:
+
+    * token with "404" on a *served* page -> false failure (the #915 report),
+    * token without "404" on a *missing* page -> false pass.
+
+    The corrected check must reject the page in both cases, because it reads the
+    navigation's status instead of the token text.
+    """
+    page = authenticated_page
+    suffix = uuid.uuid4().hex[7:]
+    # The tail is random, so make each case hold by construction rather than by
+    # chance: one token must contain "404", the other must not.
+    if marker == "deadbee":
+        while "404" in suffix:
+            suffix = uuid.uuid4().hex[7:]
+    bogus_token = f"{marker}{suffix}"
+    assert ("404" in bogus_token) is (
+        marker == "dead404"
+    ), f"this case needs a token whose 404 content matches its id: {bogus_token}"
+
+    response = page.goto(f"{base_url}/share/{bogus_token}")
+    page.wait_for_load_state("networkidle")
+
+    assert response is not None, "the share link navigation produced no response"
+    assert response.status == 404, (
+        "a share link that does not exist must answer 404; "
+        f"got {response.status} for a bogus token"
+    )
+    assert (
+        page.locator(SERVED_SHARE_SURFACE).count() == 0
+    ), "a missing share page must not render the served share surface"
+
+    # The control that matters: the assertion the real test relies on rejects
+    # this page. If it ever starts passing here, the test has stopped proving
+    # anything about the share page.
+    with pytest.raises(AssertionError):
+        assert_share_page_served(response, page)
 
 
 @pytest.mark.e2e
