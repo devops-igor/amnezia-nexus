@@ -210,6 +210,24 @@ jobs:
           chmod 600 ~/.ssh/authorized_keys ~/.ssh/id_ed25519
           chmod 644 ~/.ssh/id_ed25519.pub
           chmod 700 ~/.ssh
+          # The onboarding tests add a server over SSH at the bridge gateway
+          # (172.17.0.1:22). A prepared lab machine already runs sshd; a hosted
+          # runner does not, so provision it rather than assuming it.
+          if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openssh-server
+          fi
+          sudo mkdir -p /run/sshd
+          sudo systemctl start ssh 2>/dev/null || sudo service ssh start 2>/dev/null || sudo /usr/sbin/sshd
+          for i in $(seq 1 15); do
+            (echo > /dev/tcp/172.17.0.1/22) >/dev/null 2>&1 && break
+            sleep 1
+          done
+          if ! (echo > /dev/tcp/172.17.0.1/22) >/dev/null 2>&1; then
+            echo "Error: no SSH daemon reachable at 172.17.0.1:22; the onboarding tests cannot run." >&2
+            exit 1
+          fi
+          echo "SSH daemon reachable at 172.17.0.1:22"
           E2E_BASE_URL="http://127.0.0.1:8443" \
           E2E_ADMIN_USER="admin" \
           E2E_ADMIN_PASS="AdminE2EPass123!" \
