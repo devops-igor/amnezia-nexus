@@ -78,7 +78,14 @@ jobs:
         run: |
           docker rm -f amnezia-awg2 2>/dev/null || true
           sudo ip link del awg0 2>/dev/null || true
-          cd ~ && docker compose down -v
+          cd ~ && docker compose down -v 2>/dev/null || true
+          # A hosted runner begins with no compose file, so seed the canonical
+          # deployment rather than assuming one exists. On a host that already
+          # has one, this leaves it alone.
+          if [ ! -f ~/docker-compose.yaml ]; then
+            cp "${GITHUB_WORKSPACE}/.github/e2e/docker-compose.yaml" ~/docker-compose.yaml
+            echo "Seeded ~/docker-compose.yaml from .github/e2e/docker-compose.yaml"
+          fi
           PR_TAG="pr-${{ github.event.pull_request.number || 'manual' }}"
           sed -i "s|image: ghcr.io/devops-igor/amnezia-nexus:.*|image: ghcr.io/devops-igor/amnezia-nexus:${PR_TAG}|" ~/docker-compose.yaml
           cat << EOF > ~/docker-compose.override.yaml
@@ -376,12 +383,14 @@ jobs:
           docker rm -f amnezia-awg2 2>/dev/null || true
           sudo ip link del awg0 2>/dev/null || true
           echo "==> Stopping PR container and wiping volume..."
-          cd ~ && docker compose down -v
+          cd ~ && docker compose down -v 2>/dev/null || true
           echo "==> Removing override file..."
           rm -f ~/docker-compose.override.yaml
-          echo "==> Resetting ~/docker-compose.yaml to default production image and cleaning legacy lines..."
-          sed -i 's|image: ghcr.io/devops-igor/amnezia-nexus:.*|image: ghcr.io/devops-igor/amnezia-nexus:latest|' ~/docker-compose.yaml
-          sed -i '/E2E_TESTING/d' ~/docker-compose.yaml
+          if [ -f ~/docker-compose.yaml ]; then
+            echo "==> Resetting ~/docker-compose.yaml to default production image and cleaning legacy lines..."
+            sed -i 's|image: ghcr.io/devops-igor/amnezia-nexus:.*|image: ghcr.io/devops-igor/amnezia-nexus:latest|' ~/docker-compose.yaml
+            sed -i '/E2E_TESTING/d' ~/docker-compose.yaml
+          fi
           echo "==> Pruning Docker system (containers, images, build cache, volumes)..."
           docker system prune -af --volumes
           echo "==> Cleaning up Python E2E virtual environment..."
