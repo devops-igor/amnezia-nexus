@@ -232,6 +232,7 @@ jobs:
           E2E_ADMIN_USER="admin" \
           E2E_ADMIN_PASS="AdminE2EPass123!" \
           E2E_SERVER_HOST="172.17.0.1" \
+          E2E_SERVER_SSH_USER="${USER}" \
           E2E_SERVER_SSH_KEY="${HOME}/.ssh/id_ed25519" \
           E2E_TESTING="true" \
           E2E_REQUIRE_DATAPLANE="true" \
