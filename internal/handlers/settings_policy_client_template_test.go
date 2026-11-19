@@ -80,7 +80,7 @@ func TestSettingsTemplatePolicyClientSection(t *testing.T) {
 			}
 		}
 		for _, token := range []string{
-			`src="/static/js/policy_client_diag.js"`,
+			versionedSrcAttr("/static/js/policy_client_diag.js"),
 			`id="policyClientSelect"`,
 			`<table class="data-table">`,
 			`scope="col"`,
@@ -96,7 +96,7 @@ func TestSettingsTemplatePolicyClientSection(t *testing.T) {
 		if strings.Contains(supportBody, `id="policyClientCard"`) {
 			t.Error("support operator received the admin-only per-client section")
 		}
-		if strings.Contains(supportBody, `src="/static/js/policy_client_diag.js"`) {
+		if strings.Contains(supportBody, "/static/js/policy_client_diag.js") {
 			t.Error("support operator's page loads the per-client controller")
 		}
 	})

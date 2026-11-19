@@ -315,6 +315,8 @@
   "services": "سرویس‌ها",
   "setting_up": "Setting up...",
   "settings_saved": "تنظیمات با موفقیت ذخیره شد",
+  "settings_field_required": "این فیلد نمی‌تواند خالی باشد",
+  "settings_field_invalid": "عددی در محدوده مجاز وارد کنید",
   "settings_title": "تنظیمات پنل",
   "setup_already_done": "Setup already completed",
   "setup_btn": "Create Account",
@@ -903,7 +905,7 @@
   "policy_upstream_save_refused": "ویرایشگر از پیکربندی ذخیره‌شده دوباره بارگیری شد.",
   "policy_upstream_load_failed": "خواندن فهرست ذخیره‌شدهٔ resolverها ممکن نشد",
   "policy_upstream_not_ready": "ذخیره‌سازی منتظر بارگیری فهرست ذخیره‌شدهٔ resolverها است.",
-  "policy_upstream_conflict": "تغییری دیگر فهرست resolverها را جایگزین کرد. فهرست تازه‌تر نمایش داده می‌شود؛ برای اعمال ویرایش دوباره ذخیره کنید.",
+  "policy_upstream_conflict": "فهرست حل‌کننده‌ها با تغییر دیگری جایگزین شد. ویرایش‌های شما همچنان در ویرایشگر هستند و ذخیره نشده‌اند. برای دیدن فهرست جدید «بارگیری مجدد» را بزنید؛ این کار ویرایش‌های شما را کنار می‌گذارد.",
   "policy_upstream_echo_mismatch": "سرور فهرست resolver متفاوتی از آنچه فرستاده شد ذخیره کرد",
   "policy_upstream_state_inconsistent": "سیاست ذخیره‌شده و سیاست در حال اجرا ممکن است هم‌خوان نباشند",
   "policy_upstream_port_required": "DNS ساده به درگاه صریح نیاز دارد.",
@@ -1150,5 +1152,11 @@
   "policy_excluded_domains_hint": "دامنه‌هایی که هرگز نباید وارد مجموعه PROXY شوند. در هر خط یک دامنه یا ورودی *.؛ خطوط خالی و توضیحات نادیده گرفته می‌شوند. حذف یک زیردامنه قاعده والد گسترده‌تر را نیز حذف می‌کند، بنابراین کل والد مستقیم می‌ماند. ورودی‌های IPv4/CIDR در اینجا پذیرفته نمی‌شوند.",
   "deploy_vps_refresh_catalog": "به‌روزرسانی فهرست و استقرارهای اخیر",
   "upstream_releases_link": "برچسب‌های انتشار",
-  "policy_client_tried_names_fmt": "تلاش‌شده: {names}"
+  "settings_unsaved": "تغییرات ذخیره‌نشده",
+  "settings_applies_now": "بلافاصله اعمال می‌شود",
+  "settings_save_read_failed": "خواندن تنظیمات ذخیره‌شده ممکن نبود، بنابراین چیزی ذخیره نشد",
+  "settings_test_saves_first": "ابتدا تنظیمات بالا را ذخیره می‌کند، سپس بلافاصله ارسال می‌کند",
+  "policy_client_tried_names_fmt": "تلاش‌شده: {names}",
+  "policy_save_kept": "سرور این تغییر را رد کرد. ویرایش‌های شما همچنان در فرم هستند و ذخیره نشده‌اند.",
+  "policy_upstream_save_kept": "ویرایش‌های شما همچنان در ویرایشگر هستند و ذخیره نشده‌اند."
 }

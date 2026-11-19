@@ -1,9 +1,10 @@
 {{- define "settings_telegram" -}}
 <!-- BLOCK 3: Telegram Bot Notifications -->
-        <div class="card settings-section-card">
+        <div class="card settings-section-card" id="telegramCard" data-settings-card="telegram">
             <div class="settings-card-header">
                 <svg class="icon"><use href="#icon-send"></use></svg>
                 <h2 class="card-title">{{ _ "telegram_bot_title" }}</h2>
+                {{ template "settings_dirty" . }}
             </div>
             <form id="telegramForm">
                 {{ $tgSettings := get .settings "telegram" }}
@@ -19,7 +20,7 @@
                 <div id="telegramFields" class="settings-offset"{{ if not (get $tgSettings "enabled") }} hidden{{ end }}>
                     <div class="form-group">
                         <label class="form-label" for="telegram_bot_token">{{ _ "telegram_bot_token_label" }}</label>
-                        <input type="password" class="form-input" id="telegram_bot_token" value="{{ get $tgSettings "bot_token" "" }}" placeholder="123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ">
+                        <input type="password" class="form-input" id="telegram_bot_token" data-secret="masked" value="{{ get $tgSettings "bot_token" "" }}" placeholder="123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ">
                     </div>
                     <div class="form-group">
                         <label class="form-label" for="telegram_chat_id">{{ _ "telegram_chat_id_label" }}</label>
@@ -28,5 +29,6 @@
                     <p class="form-hint">{{ _ "telegram_bot_hint" }}</p>
                 </div>
             </form>
+            {{ template "settings_commit" . }}
         </div>
 {{- end }}

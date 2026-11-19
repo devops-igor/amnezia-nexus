@@ -283,57 +283,29 @@
         });
     }
 
+    // setAlert reports into the card's own two regions, the same ones every other
+    // card has: a success goes to the status region and anything else to the alert
+    // region, each with a role that never changes. An empty message clears both.
+    // kind may also name the outcome ('conflict'), which is recorded on the region.
     function setAlert(kind, message) {
-        var banner = element('policyUpstreamAlert');
-        if (!banner) {
+        var cards = root.SettingsCards;
+        if (!cards) {
             return;
         }
         if (!message) {
-            banner.style.display = 'none';
-            banner.textContent = '';
-            banner.setAttribute('data-state', '');
+            cards.clearReport('policyUpstreamCard');
             return;
         }
-        // Theme tokens, not literals: --success-bg/--danger-bg already carry the
-        // light and dark variants. The text keeps the primary colour because the
-        // state is also carried by the tint, the border and the wording.
-        if (kind === 'success') {
-            banner.style.background = 'var(--success-bg)';
-            banner.style.border = '1px solid var(--success-border)';
-        } else {
-            banner.style.background = 'var(--danger-bg)';
-            banner.style.border = '1px solid var(--danger-border)';
-        }
-        banner.style.color = 'var(--text-primary)';
-        banner.setAttribute('data-state', kind);
-        banner.textContent = message;
-        banner.style.display = 'block';
+        cards.report('policyUpstreamCard', kind === 'success' ? 'success' : 'error', message,
+            kind === 'success' ? 'saved' : (kind === 'conflict' ? 'conflict' : 'refused'));
     }
 
+    // setBusy hands the save control to the card module: aria-busy on the card,
+    // the disabled commit, the spinner and the focus that has to survive it. The
+    // button label does not change, so the layout does not shift.
     function setBusy(busy) {
-        var button = element('policyUpstreamSaveBtn');
-        var spinner = element('policyUpstreamSaveSpinner');
-        var label = element('policyUpstreamSaveBtnText');
-        if (button) {
-            if (busy && root.document && root.document.activeElement === button) {
-                busyFocus = button;
-            }
-            button.setAttribute('aria-busy', busy ? 'true' : 'false');
-            if (!busy) {
-                // Disabling a focused control drops focus to the body; give it back.
-                if (busyFocus === button && root.document && root.document.activeElement === root.document.body) {
-                    button.focus();
-                }
-                busyFocus = null;
-            }
-        }
-        if (spinner) {
-            spinner.classList.toggle('hidden', !busy);
-        }
-        if (label) {
-            label.textContent = busy
-                ? text('policy_upstream_saving')
-                : text('policy_upstream_save_btn');
+        if (root.SettingsCards) {
+            root.SettingsCards.busy('policyUpstreamCard', busy);
         }
     }
 
@@ -408,9 +380,9 @@
         if (reloadBtn) {
             reloadBtn.disabled = blocked;
         }
-        var saveBtn = element('policyUpstreamSaveBtn');
-        if (saveBtn) {
-            saveBtn.disabled = blocked || invalid || !baseline || baseline.preset === '';
+        if (root.SettingsCards) {
+            root.SettingsCards.gate('policyUpstreamCard',
+                blocked || invalid || !baseline || baseline.preset === '');
         }
         paintRowControls();
     }
@@ -473,6 +445,9 @@
         paintDefaultsNotice(rows);
         paintGates(rows, errors);
         paintSaveEffects();
+        if (root.SettingsCards) {
+            root.SettingsCards.refresh('policyUpstreamCard');
+        }
     }
 
     function failureKindLabel(kind) {
@@ -599,12 +574,9 @@
         refresh();
     }
 
-    // applyRecord replaces the rows and the baseline with an accepted record.
-    function applyRecord(record) {
-        if (!record) {
-            return;
-        }
-        baseline = record;
+    // rebuildRows replaces the rows with a record's list and repaints. It does not
+    // decide anything: callers call it only when replacing the editor is right.
+    function rebuildRows(record) {
         var container = element('policyUpstreamRows');
         if (!container) {
             return;
@@ -614,6 +586,20 @@
             createRow(rowModel(entry));
         });
         refresh();
+        if (root.SettingsCards) {
+            root.SettingsCards.rebase('policyUpstreamCard');
+        }
+    }
+
+    // applyRecord replaces the rows and the baseline with a record the operator is
+    // meant to see: the first load, an explicit Reload, or a reset to the defaults.
+    // It is never reached from a save outcome.
+    function applyRecord(record) {
+        if (!record) {
+            return;
+        }
+        baseline = record;
+        rebuildRows(record);
     }
 
     function fetchRecord() {
@@ -638,6 +624,22 @@
         applyRecord(record);
         renderHealth(recordHealth(record));
         return record;
+    }
+
+    // refreshHealth reads the stored record only to update the runtime
+    // diagnostics. It never touches the rows or the baseline, so edits that were
+    // refused stay in the editor. A failed read leaves the last observation on
+    // screen, and a read that started before an accepted save is dropped.
+    async function refreshHealth() {
+        var seq = ++requestSeq;
+        try {
+            var record = await fetchRecord();
+            if (seq > lastAcceptedMutation) {
+                renderHealth(recordHealth(record));
+            }
+        } catch (err) {
+            // The refusal is already on screen; there is nothing newer to show.
+        }
     }
 
     function setReady(value) {
@@ -697,6 +699,20 @@
         return '';
     }
 
+    // classifySave turns what a request threw into the outcome the card module
+    // understands: a refusal has a status from the server, a dropped request has none.
+    function classifySave(err) {
+        var code = err && err.data && typeof err.data === 'object' ? err.data.error : '';
+        var key = code === 'state_inconsistent'
+            ? 'policy_upstream_state_inconsistent'
+            : 'policy_upstream_save_failed';
+        var answered = err && typeof err.status === 'number' && err.status > 0;
+        return {
+            outcome: answered ? 'refused' : 'failed',
+            message: text(key) + ': ' + errorDetail(err) + ' ' + text('policy_upstream_save_kept')
+        };
+    }
+
     async function save() {
         if (!ready) {
             setAlert('error', text('policy_upstream_not_ready'));
@@ -727,60 +743,79 @@
         }
         inFlight = true;
         var seq = ++requestSeq;
-        setBusy(true);
-        setAlert('', '');
-        refresh();
+        var saved = null;
         try {
-            // A fresh read first: the whole record is replaced, so the four
-            // fields the operator did not edit are echoed from here, never from
-            // the other card's DOM or from markup defaults.
+            refresh();
+            var settled = await root.SettingsCards.submit('policyUpstreamCard', function () {
+                return writeList(rows, seq).then(function (result) {
+                    saved = result.saved || null;
+                    // The request is over before the card module settles and puts
+                    // focus back. inFlight gates the commit, so clearing it here
+                    // makes the commit enabled again by the time focus is restored;
+                    // clearing it afterwards would restore focus to a control that
+                    // is still disabled and send it to the heading instead.
+                    inFlight = false;
+                    refresh();
+                    return result;
+                });
+            });
+            if (settled.outcome !== 'saved') {
+                // Whatever went wrong, the rows and the unsaved mark stay. Only the
+                // runtime diagnostics are refreshed, by a read that never touches
+                // the editor. A conflict is the exception: the diagnostics belong to
+                // the record somebody else saved, so they are not repainted either.
+                if (settled.outcome !== 'conflict') await refreshHealth();
+                return null;
+            }
+            return saved;
+        } finally {
+            inFlight = false;
+            refresh();
+        }
+    }
+
+    // writeList reads the stored record, refuses to overwrite one that changed since
+    // the editor loaded it, and otherwise writes the edited list. It never changes
+    // the editor: on a conflict it reports and returns, and the operator decides
+    // whether to reload.
+    async function writeList(rows, seq) {
+        try {
+            // A fresh read first: the whole record is replaced, so the four fields
+            // the operator did not edit are echoed from here, never from the other
+            // card's DOM or from markup defaults.
             var fresh = await fetchRecord();
             if (!sameList(fresh.upstream_dns, baseline.upstream_dns)) {
-                applyRecord(fresh);
-                renderHealth(recordHealth(fresh));
-                setAlert('error', text('policy_upstream_conflict'));
-                return null;
+                return { outcome: 'conflict', message: text('policy_upstream_conflict') };
             }
             var payload = buildPayload(fresh, rows);
             var answer = await request(ENDPOINT, { method: 'PUT', body: payload });
             lastAcceptedMutation = seq;
             var saved = parseRecord(answer);
             if (!saved) {
-                setAlert('error', text('policy_upstream_echo_mismatch'));
-                return null;
+                return { outcome: 'refused', message: text('policy_upstream_echo_mismatch') };
             }
-            applyRecord(saved);
-            renderHealth(saved.policyStatus || saved.status);
+            // The server accepted and stored the sent list. The baseline the next
+            // save compares against moves to it now, and the rows are replaced only
+            // by the card module, and only when nothing was typed meanwhile.
+            baseline = saved;
             var mismatch = echoMismatch(payload, saved);
             if (mismatch) {
-                // Unknown fields are ignored silently by the server, so a
-                // difference here means the stored list is not the edited one.
-                setAlert('error', text('policy_upstream_echo_mismatch') + ': ' + mismatch);
-                return null;
+                // Unknown fields are ignored silently by the server, so a difference
+                // here means the stored list is not the edited one: not a success.
+                return {
+                    outcome: 'refused',
+                    message: text('policy_upstream_echo_mismatch') + ': ' + mismatch + ' ' + text('policy_upstream_save_kept')
+                };
             }
-            setAlert('success', text('policy_upstream_saved'));
-            return saved;
+            renderHealth(saved.policyStatus || saved.status);
+            return {
+                outcome: 'saved',
+                message: text('policy_upstream_saved'),
+                saved: saved,
+                reconcile: function () { rebuildRows(saved); }
+            };
         } catch (err) {
-            var code = err && err.data && typeof err.data === 'object' ? err.data.error : '';
-            var key = code === 'state_inconsistent'
-                ? 'policy_upstream_state_inconsistent'
-                : 'policy_upstream_save_failed';
-            setAlert('error', text(key) + ': ' + errorDetail(err) + ' ' + text('policy_upstream_save_refused'));
-            // Re-read the stored record so a rejected edit is not left on screen.
-            // When that read fails too, the last accepted record is restored and
-            // no success is claimed.
-            try {
-                await load(++requestSeq);
-            } catch (reloadErr) {
-                if (baseline) {
-                    applyRecord(baseline);
-                }
-            }
-            return null;
-        } finally {
-            inFlight = false;
-            setBusy(false);
-            refresh();
+            return classifySave(err);
         }
     }
 

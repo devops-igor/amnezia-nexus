@@ -41,16 +41,16 @@ func TestGigahostSetupApprovalInitiationConsumerDOM(t *testing.T) {
 	// itself must be the shipped module: an inline copy could diverge from it. The
 	// offer is not conditioned on the provider having assigned an address, because
 	// the provisioning interval before an address exists is what a saved job covers.
-	if !strings.Contains(templateStr, `src="/static/js/gigahost_setup_intents.js"`) {
+	if !strings.Contains(templateStr, versionedTemplateAsset("/static/js/gigahost_setup_intents.js")) {
 		t.Fatal("settings.html does not load the module that defines the action")
 	}
-	if !strings.Contains(templateStr, `src="/static/js/gigahost_order_status.js"`) {
+	if !strings.Contains(templateStr, versionedTemplateAsset("/static/js/gigahost_order_status.js")) {
 		t.Fatal("settings.html does not load the module that renders the recent orders")
 	}
 	// The classification is a separate shipped module, and it must be loaded before the
 	// renderer that consumes it.
-	modelAt := strings.Index(templateStr, `src="/static/js/gigahost_order_status_model.js"`)
-	rendererAt := strings.Index(templateStr, `src="/static/js/gigahost_order_status.js"`)
+	modelAt := strings.Index(templateStr, versionedTemplateAsset("/static/js/gigahost_order_status_model.js"))
+	rendererAt := strings.Index(templateStr, versionedTemplateAsset("/static/js/gigahost_order_status.js"))
 	if modelAt < 0 {
 		t.Fatal("settings.html does not load the order-status classification module")
 	}

@@ -574,13 +574,262 @@ def test_settings_button_height_scale_uses_the_spacing_tokens(
     small = _token_px("space-xl")
     # The recorded scale: 40 px and 32 px, built from the pinned tokens above.
     assert (large, small) == (40, 32)
-    expected = {"#saveBtn": large, "#policyClientRefreshBtn": large, "#upstreamCheckBtn": small}
+    expected = {
+        "#appearanceCard [data-commit]": large,
+        "#policyClientRefreshBtn": large,
+        "#upstreamCheckBtn": small,
+    }
     for selector, px in expected.items():
         page.locator(selector).wait_for(state="visible")
         height = page.evaluate(
             "sel => document.querySelector(sel).getBoundingClientRect().height", selector
         )
         assert abs(height - px) <= 0.5, (selector, height, px)
+
+
+def _restore_settings(page: Page, csrf_token: str, original: dict) -> None:
+    """Put the sections a test changed back, through the unchanged save endpoint."""
+    body = {key: original.get(key, {}) for key in ("appearance", "captcha", "ssl", "limits", "telegram")}
+    api_post(page, "/api/settings/save", body, csrf_token)
+
+
+def _commit(page: Page, card: str) -> None:
+    """Click one card's own commit control and wait for the save to be answered."""
+    with page.expect_response(
+        lambda r: r.url.endswith("/api/settings/save") and r.request.method == "POST"
+    ) as saved:
+        page.locator(f"#{card} [data-commit]").click()
+    assert saved.value.status == 200, saved.value.text()
+
+
+@pytest.mark.e2e
+def test_settings_every_staged_card_commits_from_inside_itself(
+    authenticated_page: Page, base_url: str
+) -> None:
+    """One commit control per staged card, all with one label, and no page-level button."""
+    page = authenticated_page
+    page.goto(f"{base_url}/settings")
+    page.wait_for_load_state("networkidle")
+
+    assert page.locator("#saveBtn").count() == 0
+    assert page.locator(".settings-actions").count() == 0
+    cards = [
+        "appearanceCard", "sslCard", "captchaCard", "limitsCard", "telegramCard",
+        "notificationsCard", "policyRoutingCard", "policyUpstreamCard", "gigahostCard",
+    ]
+    labels = set()
+    for card in cards:
+        commit = page.locator(f"#{card} [data-commit]")
+        assert commit.count() == 1, card
+        labels.add(" ".join(commit.inner_text().split()))
+    assert len(labels) == 1, labels
+
+
+@pytest.mark.e2e
+def test_settings_card_dirty_state_and_scoped_save_feedback(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """An edit marks only its card; a successful appearance save reports in that card
+    and surfaces no hosting, routing or notification error anywhere on the page."""
+    page = authenticated_page
+    original = api_get(page, "/api/settings")
+    assert isinstance(original, dict)
+    page.goto(f"{base_url}/settings")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(700)
+    try:
+        title = page.locator("#app_title")
+        loaded = title.input_value()
+        assert not page.locator("#appearanceCard [data-dirty]").is_visible()
+        assert page.locator("#appearanceCard [data-commit]").is_disabled()
+
+        title.fill(loaded + " edited")
+        assert page.locator("#appearanceCard [data-dirty]").is_visible()
+        assert page.locator("#appearanceCard [data-commit]").is_enabled()
+        assert not page.locator("#sslCard [data-dirty]").is_visible()
+
+        title.fill(loaded)
+        assert not page.locator("#appearanceCard [data-dirty]").is_visible()
+
+        page.locator("label.switch-container:has(#captcha_enabled) .switch-slider").click()
+        title.fill("Card Scoped Title")
+        _commit(page, "appearanceCard")
+        page.wait_for_timeout(1500)
+
+        assert page.locator("#appearanceCard [data-status]").inner_text().strip()
+        assert not page.locator("#appearanceCard [data-dirty]").is_visible()
+        assert page.locator("#captchaCard [data-dirty]").is_visible()
+        assert page.locator("#captchaCard [data-commit]").is_enabled()
+        assert page.locator(".toast").count() == 0
+        assert page.locator("[data-error]:visible").count() == 0
+        body = page.inner_text("body").lower()
+        assert "api key not configured" not in body
+        assert "gigahost_api_key" not in body
+    finally:
+        _restore_settings(page, csrf_token, original)
+
+
+@pytest.mark.e2e
+def test_settings_empty_stored_appearance_fields_do_not_block_the_card(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """A stored empty logo and subtitle is a state this panel defines: the shell
+    renders its built-in icon and label for them. The appearance card must still
+    commit a change to another of its fields, and must send the empty values back as
+    they were stored.
+
+    Regression: the card enforced its own required attributes against the values it
+    had loaded, so a card in that state produced no request at all and the operator
+    could not save the change they did make.
+    """
+    page = authenticated_page
+    original = api_get(page, "/api/settings")
+    assert isinstance(original, dict)
+    appearance = dict(original.get("appearance") or {})
+    try:
+        appearance.update({"title": "Empty Stored Fields", "logo": "", "subtitle": ""})
+        api_post(page, "/api/settings/save", {"appearance": appearance}, csrf_token)
+
+        page.goto(f"{base_url}/settings")
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(700)
+        assert page.locator("#app_logo").input_value() == ""
+        assert page.locator("#app_subtitle").input_value() == ""
+
+        page.locator("#app_title").fill("Empty Stored Fields Edited")
+        _commit(page, "appearanceCard")
+        page.wait_for_timeout(1000)
+
+        assert page.locator("#appearanceCard [data-error]").inner_text().strip() == ""
+        stored = api_get(page, "/api/settings")
+        assert stored["appearance"]["title"] == "Empty Stored Fields Edited"
+        assert stored["appearance"]["logo"] == "", "the untouched stored logo was rewritten"
+        assert stored["appearance"]["subtitle"] == "", "the untouched stored subtitle was rewritten"
+    finally:
+        _restore_settings(page, csrf_token, original)
+
+
+@pytest.mark.e2e
+def test_settings_security_commits_persist_across_a_reload(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """Application title, captcha, SSL and connection limits each commit from their own
+    card and are what a full reload renders and what the API stores."""
+    page = authenticated_page
+    original = api_get(page, "/api/settings")
+    assert isinstance(original, dict)
+    page.goto(f"{base_url}/settings")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(700)
+
+    def toggle(input_id: str) -> None:
+        page.locator(f"label.switch-container:has(#{input_id}) .switch-slider").click()
+
+    try:
+        page.locator("#app_title").fill("Persisted Title")
+        _commit(page, "appearanceCard")
+
+        toggle("captcha_enabled")
+        _commit(page, "captchaCard")
+
+        toggle("ssl_enabled")
+        page.locator("#panel_port").fill("5443")
+        page.locator("#ssl_domain").fill("panel.example.test")
+        page.locator("#ssl_cert_path").fill("/etc/example/cert.pem")
+        page.locator("#ssl_key_path").fill("/etc/example/key.pem")
+        _commit(page, "sslCard")
+
+        page.locator("#max_connections_per_user").fill("17")
+        page.locator("#connection_rate_limit_count").fill("9")
+        page.locator("#connection_rate_limit_window").fill("120")
+        _commit(page, "limitsCard")
+
+        page.goto(f"{base_url}/settings")
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(700)
+
+        assert page.locator("#app_title").input_value() == "Persisted Title"
+        assert page.locator("#captcha_enabled").is_checked()
+        assert page.locator("#ssl_enabled").is_checked()
+        assert page.locator("#panel_port").input_value() == "5443"
+        assert page.locator("#ssl_domain").input_value() == "panel.example.test"
+        assert page.locator("#ssl_cert_path").input_value() == "/etc/example/cert.pem"
+        assert page.locator("#ssl_key_path").input_value() == "/etc/example/key.pem"
+        assert page.locator("#max_connections_per_user").input_value() == "17"
+        assert page.locator("#connection_rate_limit_count").input_value() == "9"
+        assert page.locator("#connection_rate_limit_window").input_value() == "120"
+        assert page.locator("[data-dirty]:visible").count() == 0
+
+        stored = api_get(page, "/api/settings")
+        assert stored["appearance"]["title"] == "Persisted Title"
+        assert stored["captcha"]["enabled"] is True
+        assert stored["ssl"]["enabled"] is True and stored["ssl"]["panel_port"] == 5443
+        assert stored["limits"] == {
+            "max_connections_per_user": 17,
+            "connection_rate_limit_count": 9,
+            "connection_rate_limit_window": 120,
+        }
+    finally:
+        _restore_settings(page, csrf_token, original)
+
+
+@pytest.mark.e2e
+def test_settings_two_tabs_do_not_undo_each_others_security_saves(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """Two tabs of one session, a different card committed in each, real network.
+
+    Tab A starts an Appearance save and its request is held in the browser. Tab B
+    commits Captcha and then Limits and gets its success. A is released. A card
+    posts only its own section and the server writes only the sections it is sent,
+    so both of B's changes and A's title are what the server stores afterwards.
+    """
+    page_a = authenticated_page
+    original = api_get(page_a, "/api/settings")
+    assert isinstance(original, dict)
+    page_b = page_a.context.new_page()
+    try:
+        for tab in (page_a, page_b):
+            tab.goto(f"{base_url}/settings")
+            tab.wait_for_load_state("networkidle")
+            tab.wait_for_timeout(700)
+
+        held: list = []
+
+        def hold_appearance(route):
+            held.append(route)
+
+        page_a.route("**/api/settings/save", hold_appearance)
+        page_a.locator("#app_title").fill("Tab A Title")
+        page_a.locator("#appearanceCard [data-commit]").click()
+        for _ in range(100):
+            if held:
+                break
+            page_a.wait_for_timeout(50)
+        assert held, "tab A's save never reached the network"
+
+        page_b.locator("label.switch-container:has(#captcha_enabled) .switch-slider").click()
+        _commit(page_b, "captchaCard")
+        page_b.locator("#max_connections_per_user").fill("23")
+        _commit(page_b, "limitsCard")
+        mid = api_get(page_b, "/api/settings")
+        assert mid["captcha"]["enabled"] is True, "tab B's captcha save was acknowledged but is not stored"
+
+        held[0].continue_()
+        page_a.unroute("**/api/settings/save", hold_appearance)
+        for _ in range(100):
+            if page_a.locator("#appearanceCard [data-status]").inner_text().strip():
+                break
+            page_a.wait_for_timeout(50)
+        assert page_a.locator("#appearanceCard [data-status]").inner_text().strip()
+
+        stored = api_get(page_b, "/api/settings")
+        assert stored["appearance"]["title"] == "Tab A Title", "tab A's own change was lost"
+        assert stored["captcha"]["enabled"] is True, "tab A undid the captcha tab B saved"
+        assert stored["limits"]["max_connections_per_user"] == 23, "tab A undid the limits tab B saved"
+    finally:
+        page_b.close()
+        _restore_settings(page_a, csrf_token, original)
 
 
 # --- Keyboard focus indicator, read from a real focused element -----------------
@@ -642,6 +891,20 @@ def test_focused_control_has_a_visible_outline(
     """
     page = authenticated_page
     _open_settings(page, base_url, theme)
+    if focus_sel == "#notificationSaveBtn":
+        # A card with nothing staged has nothing to commit, so its Save is disabled
+        # and a disabled control cannot take focus. Stage one change the way the
+        # change event reports it (no pointer, so :focus-visible keeps following
+        # keyboard rules), then press a key as _open_settings does.
+        page.evaluate(
+            """() => {
+                const box = document.getElementById('notifications_enabled');
+                box.checked = !box.checked;
+                box.dispatchEvent(new Event('change', {bubbles: true}));
+            }"""
+        )
+        page.wait_for_function("!document.getElementById('notificationSaveBtn').disabled")
+        page.keyboard.press("Tab")
     got = page.evaluate(FOCUS_PROBE, [focus_sel, outline_sel])
     assert got["focused"] and got["focusVisible"], (focus_sel, got)
     accent = contrast.resolve("accent", contrast.theme_tokens(theme))
@@ -819,3 +1082,69 @@ def test_no_populated_gigahost_text_is_painted_in_the_muted_colour(
     assert probe["everything"], "the populated state rendered no text"
     offenders = [node for node in probe["everything"] if node["color"] == muted]
     assert offenders == [], (name, theme, offenders)
+
+
+@pytest.mark.e2e
+def test_settings_late_save_does_not_take_focus_and_restores_lost_focus(
+    authenticated_page: Page, base_url: str, csrf_token: str
+) -> None:
+    """Focus in a real browser, both halves of the rule.
+
+    A save is held on the wire. First the operator stays where they were: the
+    browser drops focus when the focused Save becomes disabled, and the operation
+    puts it back inside the card. Then, in a second pass, the operator moves to an
+    input in a different card while the save is held, and the late completion
+    leaves focus and the typed text alone.
+    """
+    page = authenticated_page
+    original = api_get(page, "/api/settings")
+    try:
+        for moves_away in (False, True):
+            page.goto(f"{base_url}/settings")
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(700)
+            held: list = []
+            page.route("**/api/settings/save", lambda route: held.append(route))
+            page.locator("#max_connections_per_user").fill("37" if moves_away else "36")
+            save = page.locator("#limitsCard [data-commit]")
+            save.focus()
+            save.click()
+            for _ in range(100):
+                if held:
+                    break
+                page.wait_for_timeout(50)
+            assert held, "the save never reached the network"
+            if moves_away:
+                page.locator("#app_title").focus()
+                page.keyboard.type("-typed-meanwhile")
+            else:
+                # Chromium keeps the disabled control as the active element for the
+                # rest of the task and moves focus to the body right after, so wait
+                # one tick before looking. Either state must end inside the card.
+                page.wait_for_timeout(100)
+                assert page.evaluate("document.activeElement === document.body"), (
+                    "the browser should have dropped focus when Save became disabled"
+                )
+            held[0].continue_()
+            page.unroute("**/api/settings/save")
+            page.wait_for_function(
+                "document.getElementById('limitsCard').getAttribute('aria-busy') === 'false'"
+            )
+            page.wait_for_timeout(200)
+            where = page.evaluate(
+                "({id: document.activeElement.id, inLimits: !!document.activeElement.closest('#limitsCard')})"
+            )
+            if moves_away:
+                assert where["id"] == "app_title", f"a late completion took focus from the operator: {where}"
+                assert "-typed-meanwhile" in page.locator("#app_title").input_value(), (
+                    "what the operator typed while the save was held must still be there"
+                )
+            else:
+                assert where["inLimits"], f"focus the operation lost was not restored to the card: {where}"
+    finally:
+        api_post(
+            page,
+            "/api/settings/save",
+            {k: original.get(k, {}) for k in ("appearance", "captcha", "ssl", "limits", "telegram")},
+            csrf_token,
+        )

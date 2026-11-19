@@ -207,7 +207,11 @@ func TestShellsRenderTheCurrentAppVersionOnVersionedAssets(t *testing.T) {
 		versionedScripts []string
 	}{
 		{"base.html (layout, via /settings)", func(t *testing.T) string { return renderSettingsPage(t, models.RoleAdmin) },
-			[]string{"/static/js/api.js", "/static/js/notifications_settings.js", "/static/js/settings.js", "/static/js/policy_routing.js"}},
+			// The layout's own versioned script, then every settings controller. The
+			// page must emit the current version for all of them; the source scan in
+			// TestSettingsTemplatesVersionEveryAsset keeps this list in step with the
+			// templates, so the two checks cannot drift.
+			append([]string{"/static/js/api.js"}, settingsSurfaceControllers...)},
 		{"login.html", renderLoginPage, []string{"/static/js/api.js"}},
 		{"setup.html", renderSetupPage, nil},
 		{"change_password.html", renderChangePasswordPage, nil},

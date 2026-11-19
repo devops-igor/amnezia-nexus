@@ -261,7 +261,7 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 	// here with the template's own keys.
 	for _, key := range []string{
 		"policy_load_failed", "policy_not_ready", "policy_saved", "policy_save_failed",
-		"policy_save_refused", "policy_sync_ok", "policy_sync_failed", "policy_sync_running",
+		"policy_save_kept", "policy_sync_ok", "policy_sync_failed", "policy_sync_running",
 		"policy_never", "policy_none", "policy_rule_count_value", "policy_status_unknown",
 		"policy_sync_state_disabled", "policy_sync_state_error",
 		"policy_sync_state_pending", "policy_sync_state_synced",

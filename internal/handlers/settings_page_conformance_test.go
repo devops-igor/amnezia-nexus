@@ -174,6 +174,7 @@ func settingsTemplateSource(t *testing.T) string {
 	names := []string{
 		"templates/settings.html",
 		"templates/settings_notifications.html",
+		"templates/settings_save_controls.html",
 		"templates/settings_policy.html",
 		"templates/settings_policy_upstream.html",
 		"templates/settings_policy_client.html",
@@ -376,7 +377,11 @@ func TestSettingsPageCollapsedFieldsUseHiddenAttribute(t *testing.T) {
 }
 
 func TestSettingsPageNewKeysExistInEveryLocale(t *testing.T) {
-	keys := []string{"deploy_vps_refresh_catalog", "upstream_releases_link"}
+	keys := []string{
+		"deploy_vps_refresh_catalog", "upstream_releases_link",
+		// The per-card save model (#888).
+		"settings_unsaved", "settings_applies_now", "settings_save_read_failed", "settings_test_saves_first",
+	}
 	for _, locale := range []string{"en", "ru", "fr", "zh", "fa"} {
 		raw, err := web.TranslationsFS.ReadFile("translations/" + locale + ".json")
 		if err != nil {

@@ -45,8 +45,21 @@ def _open_settings(page: Page, base_url: str) -> None:
     expect(page.locator("#policyStatusBadge")).to_have_attribute("data-enabled", "false")
 
 
+def _stage_change(page: Page) -> None:
+    """Make sure the card has something staged: it commits only what changed.
+
+    A card whose fields match the stored record is clean and its Save is
+    disabled, so a test that re-selects what is already stored has to stage one
+    real edit first. The entry is unique, so it is always a change.
+    """
+    if page.locator(SAVE_BTN).is_disabled():
+        page.fill("#policy_local_entries", f"e2e-{uuid.uuid4().hex[:8]}.example")
+    expect(page.locator(SAVE_BTN)).to_be_enabled()
+
+
 def _save(page: Page):
     """Click Save and return the policy PUT response that the click caused."""
+    _stage_change(page)
     with page.expect_response(
         lambda r: r.url.endswith(POLICY_ENDPOINT) and r.request.method == "PUT"
     ) as info:
@@ -147,7 +160,7 @@ def test_policy_sync_failure_is_reported_with_the_server_reason(
 def test_policy_rejected_enablement_is_not_shown_as_enabled(
     authenticated_page: Page, base_url: str
 ) -> None:
-    """An enablement the server refuses falls back to the saved, disabled state."""
+    """An enablement the server refuses is not shown as running, and is not lost."""
     page = authenticated_page
     _open_settings(page, base_url)
     page.check("#policy_preset_geoblock")
@@ -166,12 +179,16 @@ def test_policy_rejected_enablement_is_not_shown_as_enabled(
     assert detail in text, f"the refusal must be shown verbatim; banner={text!r}"
     expect(page.locator(ALERT)).to_have_attribute("data-state", "error")
 
-    # The decisive assertion: the screenshot-free equivalent of "the toggle is off
-    # and the badge does not claim enabled" after a refusal.
-    expect(page.locator(ENABLE_TOGGLE)).not_to_be_checked()
+    # The decisive assertions. A refused enablement is never shown as running: the
+    # status badge follows what the server runs, and the stored record is
+    # unchanged. The switch itself keeps the operator's edit, and the card stays
+    # marked unsaved, because the refused change was neither stored nor discarded.
     expect(page.locator("#policyStatusBadge")).to_have_attribute("data-enabled", "false")
     stored = api_get(page, POLICY_ENDPOINT)
     assert stored.get("enabled") is False
+    expect(page.locator(ENABLE_TOGGLE)).to_be_checked()
+    expect(page.locator(f"{CARD} [data-dirty]")).to_have_text("Unsaved changes")
+    expect(page.locator(SAVE_BTN)).to_be_enabled()
 
 
 @pytest.mark.e2e
@@ -196,10 +213,15 @@ def test_policy_custom_url_validation_error_is_inline(
     text = _alert_text(page)
     assert detail in text, f"the validation detail must be shown verbatim; banner={text!r}"
     expect(page.locator(ALERT)).to_have_attribute("data-state", "error")
-    # The form was reloaded from the accepted record, so the rejected entry is gone.
+    # A refusal never stored the entry and never discards it either: the operator's
+    # text stays in the box, the card stays marked unsaved, and the stored record
+    # does not contain it.
     assert (
-        page.locator("#policy_custom_urls").input_value() != "http://insecure.example/domains.lst"
+        page.locator("#policy_custom_urls").input_value() == "http://insecure.example/domains.lst"
     )
+    expect(page.locator(f"{CARD} [data-dirty]")).to_have_text("Unsaved changes")
+    stored = api_get(page, POLICY_ENDPOINT)
+    assert "http://insecure.example/domains.lst" not in stored.get("custom_urls", [])
 
 
 def _login_as(page: Page, base_url: str, username: str, password: str) -> None:

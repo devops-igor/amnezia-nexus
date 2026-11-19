@@ -527,7 +527,7 @@ function gigahostOrderStatusRefreshState() {
  * not be read, so the setup axis is reported as unknown rather than as "none". */
 async function readGigahostSetupIntents(signal) {
     try {
-        const res = await API.get('/api/admin/hosting/gigahost/setup-intents', {signal: signal});
+        const res = await API.get('/api/admin/hosting/gigahost/setup-intents', {signal: signal, silent: true});
         const intents = (res && res.setup_intents) ? res.setup_intents : [];
         const index = {};
         intents.forEach((intent) => {
@@ -551,7 +551,7 @@ async function readGigahostSetupIntents(signal) {
  * index is applied by the caller that still owns the view. */
 async function readGigahostBackendIndex(signal) {
     try {
-        const res = await API.get('/api/vpn/backends', {signal: signal});
+        const res = await API.get('/api/vpn/backends', {signal: signal, silent: true});
         const backends = (res && res.backends) ? res.backends : [];
         const index = {};
         backends.forEach((backend) => {
@@ -580,7 +580,7 @@ function gigahostOrderStatusHealthFor(order) {
 async function readGigahostOrderDeploy(orderId, signal) {
     if (!orderId) return {deploy: null, detailOK: false};
     try {
-        const res = await API.get('/api/admin/hosting/gigahost/orders/' + encodeURIComponent(orderId) + '/status', {signal: signal});
+        const res = await API.get('/api/admin/hosting/gigahost/orders/' + encodeURIComponent(orderId) + '/status', {signal: signal, silent: true});
         const deploy = res && (res.deploy || res);
         return {deploy: deploy || null, detailOK: !!deploy};
     } catch (_) {
@@ -774,7 +774,7 @@ async function gigahostOrderStatusReadOnce(signal) {
     let orders;
     let observations;
     try {
-        const res = await API.get('/api/admin/hosting/gigahost/orders', {signal: signal});
+        const res = await API.get('/api/admin/hosting/gigahost/orders', {signal: signal, silent: true});
         orders = (res && res.orders) ? res.orders : [];
         observations = (res && res.provider_observations) ? res.provider_observations : {};
     } catch (_) {

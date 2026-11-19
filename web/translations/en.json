@@ -315,6 +315,8 @@
   "services": "Services",
   "setting_up": "Setting up...",
   "settings_saved": "Settings saved successfully",
+  "settings_field_required": "this field cannot be empty",
+  "settings_field_invalid": "enter a number within the allowed range",
   "settings_title": "Panel Settings",
   "setup_already_done": "Setup already completed",
   "setup_btn": "Create Account",
@@ -903,7 +905,7 @@
   "policy_upstream_save_refused": "The editor was reloaded from the stored configuration.",
   "policy_upstream_load_failed": "Could not read the stored resolver list",
   "policy_upstream_not_ready": "Saving waits for the stored resolver list to load.",
-  "policy_upstream_conflict": "Another change replaced the resolver list. The newer list is shown; save again to apply your edit.",
+  "policy_upstream_conflict": "Another change replaced the resolver list. Your edits are still in the editor and are not saved. Use Reload to see the newer list; that discards your edits.",
   "policy_upstream_echo_mismatch": "The server stored a different resolver list than the one sent",
   "policy_upstream_state_inconsistent": "Stored and running policy may disagree",
   "policy_upstream_port_required": "Plain DNS needs an explicit port.",
@@ -1150,5 +1152,11 @@
   "policy_excluded_domains_hint": "Domains that must never enter the PROXY set. One bare domain or *. entry per line; blank lines and comments are ignored. Excluding a subdomain also removes a broader parent rule, so the whole parent stays direct. IPv4/CIDR entries are not accepted here.",
   "deploy_vps_refresh_catalog": "Refresh catalog and recent deployments",
   "upstream_releases_link": "Release tags",
-  "policy_client_tried_names_fmt": "tried {names}"
+  "settings_unsaved": "Unsaved changes",
+  "settings_applies_now": "Applies immediately",
+  "settings_save_read_failed": "Could not read the stored settings, so nothing was saved",
+  "settings_test_saves_first": "Saves the settings above first, then sends now",
+  "policy_client_tried_names_fmt": "tried {names}",
+  "policy_save_kept": "The server refused this change. Your edits are still in the form and are not saved.",
+  "policy_upstream_save_kept": "Your edits are still in the editor and are not saved."
 }

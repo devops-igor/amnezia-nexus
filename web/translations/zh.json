@@ -315,6 +315,8 @@
   "services": "服务",
   "setting_up": "Setting up...",
   "settings_saved": "设置已保存",
+  "settings_field_required": "此字段不能为空",
+  "settings_field_invalid": "请输入允许范围内的数字",
   "settings_title": "面板设置",
   "setup_already_done": "Setup already completed",
   "setup_btn": "Create Account",
@@ -903,7 +905,7 @@
   "policy_upstream_save_refused": "编辑器已按已保存的配置重新加载。",
   "policy_upstream_load_failed": "无法读取已保存的解析器列表",
   "policy_upstream_not_ready": "保存将等待已保存的解析器列表加载完成。",
-  "policy_upstream_conflict": "另一处修改替换了解析器列表。已显示较新的列表；请再次保存以应用你的修改。",
+  "policy_upstream_conflict": "解析器列表已被其他更改替换。您的修改仍保留在编辑器中，尚未保存。使用“重新加载”可查看新列表，但这会丢弃您的修改。",
   "policy_upstream_echo_mismatch": "服务器保存的解析器列表与发送的不一致",
   "policy_upstream_state_inconsistent": "已保存的策略与正在运行的策略可能不一致",
   "policy_upstream_port_required": "明文 DNS 需要显式端口。",
@@ -1150,5 +1152,11 @@
   "policy_excluded_domains_hint": "绝不能进入 PROXY 集合的域名。每行一个裸域名或 *. 条目；忽略空行和注释。排除子域名也会移除更宽泛的父规则，因此整个父域保持直连。此处不接受 IPv4/CIDR 条目。",
   "deploy_vps_refresh_catalog": "刷新目录和最近的部署",
   "upstream_releases_link": "发布标签",
-  "policy_client_tried_names_fmt": "已尝试 {names}"
+  "settings_unsaved": "有未保存的更改",
+  "settings_applies_now": "立即生效",
+  "settings_save_read_failed": "无法读取已保存的设置，因此未保存任何内容",
+  "settings_test_saves_first": "先保存上方的设置，然后立即发送",
+  "policy_client_tried_names_fmt": "已尝试 {names}",
+  "policy_save_kept": "服务器拒绝了此更改。您的修改仍保留在表单中，尚未保存。",
+  "policy_upstream_save_kept": "您的修改仍保留在编辑器中，尚未保存。"
 }

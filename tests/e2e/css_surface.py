@@ -20,7 +20,7 @@ import re
 # disagree, so the exemption cannot grow or shrink without a visible edit.
 SETTINGS_SURFACE_CLASSES = frozenset({
     "mb-md", "mb-sm", "mt-sm", "spinner-sm",
-    "settings-actions", "settings-bar", "settings-bullets",
+    "settings-bar", "settings-bullets",
     "settings-button-row", "settings-button-row-tight",
     "settings-card-header-split", "settings-card-stacked",
     "settings-choice", "settings-choice-hint", "settings-choice-title",
@@ -28,9 +28,10 @@ SETTINGS_SURFACE_CLASSES = frozenset({
     "settings-field-pair", "settings-fieldset", "settings-flush",
     "settings-grid", "settings-inline", "settings-list",
     "settings-list-title", "settings-loading", "settings-notice",
-    "settings-notice-icon", "settings-notice-spaced",
+    "settings-immediate", "settings-notice-danger", "settings-notice-icon",
+    "settings-notice-spaced", "settings-notice-success",
     "settings-notice-warning", "settings-offset", "settings-row",
-    "settings-row-card", "settings-source-stats", "settings-stack",
+    "settings-result", "settings-row-card", "settings-source-stats", "settings-stack",
     "settings-stack-sm", "settings-subsection",
     "settings-subsection-header", "settings-subsection-spaced",
     "settings-subsection-title", "settings-toolbar",
@@ -40,12 +41,15 @@ SETTINGS_SURFACE_CLASSES = frozenset({
     "upstream-component-sep", "upstream-component-title", "upstream-footer",
 })
 
-# Rules that pair two legacy classes but exist only to size controls inside the
-# Settings cards. Named exactly, so no other legacy rule is set aside by accident.
+# Rules that pair a legacy class with a Settings card and exist only to size or
+# place controls inside it. Named exactly, so no other legacy rule is set aside by
+# accident. The last one takes an empty unsaved badge out of the layout without
+# hiding it, which keeps its live region in the accessibility tree.
 SETTINGS_SCOPED_OVERRIDES = frozenset({
     ".settings-section-card .btn",
     ".settings-section-card .btn-sm",
     ".settings-card-header .badge",
+    ".settings-section-card [data-dirty]:empty",
     # Informative text inside the cards uses --text-secondary instead of the
     # reference's --text-muted, which fails the 4.5:1 minimum. A deliberate
     # difference from the reference, so it is named here rather than compared.

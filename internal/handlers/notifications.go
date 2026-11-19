@@ -2,11 +2,13 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/database"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/notifications"
 )
@@ -54,6 +56,9 @@ func (h *Handlers) SaveNotificationSettingsHandler(w http.ResponseWriter, r *htt
 		return
 	}
 	ctx := r.Context()
+	if !h.tokenCanBeCarried(w, ctx, req.AppToken) {
+		return
+	}
 	current, err := svc.LoadSettings(ctx)
 	if err != nil {
 		h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to load notification settings")
@@ -238,6 +243,36 @@ func validateNotificationLimits(settings *models.NotificationSettings) error {
 		return errNotification("max attempts must be between 1 and 20")
 	}
 	return nil
+}
+
+// tokenCanBeCarried answers whether the save may go on. A blank or masked token
+// means "keep the stored one", and the stored one is read afterwards through the
+// lossy decoder, which turns a token it cannot decrypt into an empty string. So an
+// unreadable one is refused here, with the response already written: saving would
+// replace recoverable ciphertext with nothing. A token that is supplied replaces
+// the stored one and needs no read, which is the way out.
+func (h *Handlers) tokenCanBeCarried(w http.ResponseWriter, ctx context.Context, submitted string) bool {
+	if !tokenCarriesStored(submitted) {
+		return true
+	}
+	err := h.db.CheckCredentialsReadable(ctx, "notifications", "app_token")
+	if err == nil {
+		return true
+	}
+	var unreadable *database.CredentialUnreadableError
+	if errors.As(err, &unreadable) {
+		h.JSONError(w, http.StatusConflict, "credential_unreadable", unreadableCredentialDetail(unreadable))
+		return false
+	}
+	h.JSONError(w, http.StatusInternalServerError, "database_error", "Failed to load notification settings")
+	return false
+}
+
+// tokenCarriesStored reports whether a submitted application token stands for
+// "keep the stored one".
+func tokenCarriesStored(token string) bool {
+	token = strings.TrimSpace(token)
+	return token == "" || token == notificationTokenMask || strings.HasPrefix(token, "****")
 }
 
 func notificationSettingsFromRequest(req models.SaveNotificationSettingsRequest, current models.NotificationSettings) models.NotificationSettings {

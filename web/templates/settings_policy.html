@@ -12,16 +12,17 @@
         color: var(--text-secondary);
     }
 </style>
-<div class="card settings-section-card settings-card-stacked" id="policyRoutingCard">
+<div class="card settings-section-card settings-card-stacked" id="policyRoutingCard" data-settings-card="policyRouting">
     <div class="settings-card-header settings-card-header-split">
         <div class="settings-inline">
             <svg class="icon"><use href="#icon-globe"></use></svg>
             <h2 class="card-title">{{ _ "policy_title" }}</h2>
+            {{ template "settings_dirty" . }}
         </div>
         <span id="policyStatusBadge" class="badge badge-secondary">{{ _ "policy_status_disabled" }}</span>
     </div>
 
-    <div id="policyAlert" role="status" aria-live="polite" aria-atomic="true" class="settings-notice settings-notice-spaced" hidden></div>
+    <div id="policyAlert" class="settings-result" data-result data-state="">{{ template "settings_feedback" . }}</div>
 
     <form id="policyRoutingForm">
         <div class="form-group">
@@ -103,9 +104,9 @@
         <p class="form-hint">{{ _ "policy_limits_notice" }}</p>
 
         <div class="settings-button-row">
-            <button type="submit" class="btn btn-primary" id="policySaveBtn" disabled>
+            <button type="submit" class="btn btn-primary" id="policySaveBtn" data-commit data-commit-when-dirty data-commit-gated disabled>
                 <svg class="icon"><use href="#icon-check"></use></svg>
-                <span id="policySaveBtnText">{{ _ "policy_save_btn" }}</span>
+                <span id="policySaveBtnText">{{ _ "save_changes" }}</span>
                 <span class="spinner hidden" id="policySaveSpinner" aria-hidden="true"></span>
             </button>
             <button type="button" class="btn btn-secondary" id="policySyncBtn">
@@ -113,6 +114,7 @@
                 <span id="policySyncBtnText">{{ _ "policy_sync_btn" }}</span>
                 <span class="spinner hidden" id="policySyncSpinner" aria-hidden="true"></span>
             </button>
+            {{ template "settings_immediate" "policy_sync_btn" }}
         </div>
     </form>
 

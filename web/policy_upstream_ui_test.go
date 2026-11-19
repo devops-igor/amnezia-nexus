@@ -80,12 +80,19 @@ func upstreamSectionHTMLForTest(t *testing.T) string {
 		"is_admin": func(user any) bool { return true },
 	}
 	tmpl, err := template.New("settings_policy_upstream.html").Funcs(funcs).
-		ParseFS(TemplatesFS, "templates/settings_policy_upstream.html")
+		ParseFS(TemplatesFS, "templates/settings_policy_upstream.html", "templates/settings_save_controls.html")
 	if err != nil {
 		t.Fatalf("parse settings_policy_upstream.html: %v", err)
 	}
 	var buf bytes.Buffer
-	if err := tmpl.ExecuteTemplate(&buf, "settings_policy_upstream", map[string]any{"current_user": nil}); err != nil {
+	// The page supplies the release version. This package cannot reach the
+	// release constant without an import cycle, so the fixture supplies a
+	// placeholder, as the routing fixture does: the URL must have the production
+	// shape even where its exact value is not asserted.
+	if err := tmpl.ExecuteTemplate(&buf, "settings_policy_upstream", map[string]any{
+		"current_user": nil,
+		"app_version":  "test",
+	}); err != nil {
 		t.Fatalf("render settings_policy_upstream: %v", err)
 	}
 	rendered := buf.String()
@@ -118,6 +125,7 @@ func upstreamHarness(t *testing.T, prelude, scenario string) string {
 	if err != nil {
 		t.Fatalf("encode module: %v", err)
 	}
+	encodedCards := settingsCardsModuleForTest(t)
 	encodedSection, err := json.Marshal(upstreamSectionHTMLForTest(t))
 	if err != nil {
 		t.Fatalf("encode section: %v", err)
@@ -176,11 +184,27 @@ const setField = (index, name, value) => {
   el.dispatchEvent(new w.Event('change', {bubbles: true}));
 };
 const clickRow = (index, action) => rowNodes()[index].querySelector('[data-upstream-action="' + action + '"]').click();
+// alertState reads the card's two live regions the way a reader of the page does: the
+// text of whichever one has any, and its outcome. There is exactly one status and
+// one alert region, and at most one of them has text.
 const alertState = () => {
-  const el = w.document.getElementById('policyUpstreamAlert');
-  return {text: el.textContent, state: el.getAttribute('data-state'), display: el.style.display};
+  const box = w.document.getElementById('policyUpstreamAlert');
+  const status = box.querySelector('[data-status]');
+  const error = box.querySelector('[data-error]');
+  const words = el => el.textContent.replace(/\s+/g, ' ').trim();
+  const shown = [status, error].filter(el => words(el) !== '');
+  if (shown.length > 1) throw new Error('both result regions have text');
+  const el = shown[0] || null;
+  return {
+    text: el ? words(el) : '',
+    state: el ? (el === status ? 'success' : 'error') : '',
+    outcome: el ? el.getAttribute('data-outcome') : '',
+    regions: box.querySelectorAll('[data-status]').length + ':' + box.querySelectorAll('[data-error]').length
+  };
 };
 const saveBtn = () => w.document.getElementById('policyUpstreamSaveBtn');
+const cardNode = () => w.document.getElementById('policyUpstreamCard');
+const unsavedText = () => cardNode().querySelector('[data-dirty]').textContent;
 const formReady = () => w.document.getElementById('policyUpstreamForm').getAttribute('data-upstream-ready');
 const record = (list, extra) => Object.assign({
   enabled: false, preset: 'geoblock', custom_urls: [], sync_interval_seconds: 21600,
@@ -188,6 +212,7 @@ const record = (list, extra) => Object.assign({
 }, extra || {});
 
 (async () => {
+w.eval(%s);
 w.eval(%s);
 assert.equal(w.PolicyUpstreamEditor.init(), false, 'init must be inert without the section');
 
@@ -205,7 +230,7 @@ assert.deepEqual(missingKeys, [], 'the controller used a translation key outside
 console.log('UPSTREAM_SCENARIO_OK');
 dom.window.close();
 })().catch(err => { console.error(err); process.exit(1); });
-`, string(dict), string(encodedModule), string(encodedSection), prelude, scenario)
+`, string(dict), string(encodedCards), string(encodedModule), string(encodedSection), prelude, scenario)
 }
 
 // runUpstreamScenario executes one scenario and fails the test with the Node
@@ -237,7 +262,9 @@ func TestPolicyUpstreamSectionUsesShippedDictionaryKeys(t *testing.T) {
 		if idx := strings.Index(key, `"`); idx >= 0 {
 			key = key[:idx]
 		}
-		if !strings.HasPrefix(key, "policy_upstream_") {
+		// save_changes is the one commit label shared by every settings card, so
+		// it is the single key allowed outside the section's own namespace.
+		if key != "save_changes" && !strings.HasPrefix(key, "policy_upstream_") {
 			t.Errorf("the section uses key %q outside its own namespace", key)
 			continue
 		}
@@ -321,7 +348,9 @@ assert.equal(notQueried.classList.contains('hidden'), false,
 assert.equal(rowNodes()[1].querySelector('[data-upstream-role="not-queried"]').classList.contains('hidden'), true);
 assert.equal(w.document.getElementById('policyUpstreamAddBtn').disabled, true,
   'three stored entries are the API maximum, so adding stops here');
-assert.equal(saveBtn().disabled, false, 'a read record with a preset opens the write gate');
+assert.equal(saveBtn().disabled, true, 'a loaded record is the saved state, so a clean card does not commit');
+setField(0, 'port', '54');
+assert.equal(saveBtn().disabled, false, 'a read record with a preset opens the write gate once something is staged');
 `)
 }
 
@@ -366,10 +395,13 @@ assert.equal(requestsTo('PUT').length, 0, 'the editor must not invent a preset')
 stored = record([], {preset: 'geoblock'});
 await w.PolicyUpstreamEditor.reload();
 await settle();
-assert.equal(saveBtn().disabled, false, 'a chosen list source opens the gate');
-assert.equal(visible('policyUpstreamSaveEffects'), false);
+assert.equal(visible('policyUpstreamSaveEffects'), false, 'a chosen list source clears the no-source notice');
+assert.equal(saveBtn().disabled, true, 'nothing is staged yet, so a clean card does not commit');
 assert.equal(await w.PolicyUpstreamEditor.addRow(), true);
 assert.equal(rowNodes().length, 1);
+setField(0, 'address', '9.9.9.9');
+setField(0, 'port', '53');
+assert.equal(saveBtn().disabled, false, 'a chosen list source opens the gate once a valid row is staged');
 assert.equal(visible('policyUpstreamDefaultsNotice'), false, 'a row replaces the defaults notice');
 `)
 }
@@ -429,32 +461,43 @@ assert.equal(savedRecord.enabled, true);
 `)
 }
 
-// TestPolicyUpstreamEditorConflictSendsNoWrite covers the read-to-write window:
-// the PUT replaces the whole record, so a list another writer changed since the
-// load is shown and the save is refused instead of silently overwriting it.
-func TestPolicyUpstreamEditorConflictSendsNoWrite(t *testing.T) {
+// TestPolicyUpstreamEditorConflictKeepsTheDraft covers the read-to-write window.
+// The PUT replaces the whole record, so a list another writer saved since the load
+// must not be overwritten. It must not be adopted into the editor either: the
+// operator's rows are work that exists nowhere else. The conflict is reported as a
+// conflict, nothing is written, and reloading is the operator's explicit choice.
+func TestPolicyUpstreamEditorConflictKeepsTheDraft(t *testing.T) {
 	runUpstreamScenario(t, `
 const stored = () => record([{address: '9.9.9.9', port: 53, transport: 'plain'}]);
 const changed = () => record([
   {address: '8.8.8.8', port: 53, transport: 'plain'},
   {address: 'dns.example.com', port: 853, transport: 'dot'}
 ]);
-let reads = 0;
+let remote = stored();
 responder = async (url, opts) => {
-  if (opts.method === 'PUT') return changed();
-  reads++;
-  return reads === 1 ? stored() : changed();
+  if (opts.method === 'PUT') throw new Error('no write may be sent on a conflict');
+  return remote;
 };
 `, `
 setField(0, 'address', '1.1.1.1');
+remote = changed(); // another tab saved a different list after this editor loaded
 assert.equal(await w.PolicyUpstreamEditor.save(), null);
 await settle();
 
 assert.equal(requestsTo('PUT').length, 0, 'a changed baseline must not be overwritten');
+assert.deepEqual(rows().map(r => r.address), ['1.1.1.1'], 'the operator rows stay in the editor, the newer list is not adopted');
+assert.equal(unsavedText(), DICT.settings_unsaved, 'the draft is still unsaved');
+assert.equal(saveBtn().disabled, false, 'the operator can still decide what to do with it');
 assert.equal(alertState().state, 'error');
+assert.equal(alertState().outcome, 'conflict', 'a conflict is reported as a conflict, not as a validation refusal or a failure');
 assert.equal(alertState().text, DICT.policy_upstream_conflict);
-assert.deepEqual(rows().map(r => r.address), ['8.8.8.8', 'dns.example.com'],
-  'the newer stored list is shown, not the refused edit');
+assert.equal(cardNode().getAttribute('aria-busy'), 'false');
+
+// Reload is the explicit way out, and it is the only thing that adopts the newer list.
+await w.PolicyUpstreamEditor.reload();
+await settle();
+assert.deepEqual(rows().map(r => r.address), ['8.8.8.8', 'dns.example.com'], 'an explicit reload shows the newer list');
+assert.equal(unsavedText(), '', 'and the card is clean because the editor now equals what is stored');
 `)
 }
 
@@ -474,6 +517,9 @@ responder = async (url, opts) => {
   return stored();
 };
 `, `
+const NEW_PIN = 'QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=';
+setField(0, 'pin', NEW_PIN);
+assert.equal(unsavedText(), DICT.settings_unsaved, 'the operator has a draft');
 assert.equal(await w.PolicyUpstreamEditor.save(), null);
 await settle();
 
@@ -483,16 +529,19 @@ assert.ok(alertState().text.indexOf(DICT.policy_upstream_echo_mismatch) !== -1,
   'the mismatch must be named, got: ' + alertState().text);
 assert.ok(alertState().text.indexOf('row 1 pin') !== -1,
   'the mismatch must name the field, got: ' + alertState().text);
-assert.equal(rows()[0].pin, '', 'the stored record is adopted as the accepted one');
+assert.equal(rows()[0].pin, NEW_PIN, 'the pin the operator entered stays in the editor: it is not stored, and it is not discarded');
+assert.equal(unsavedText(), DICT.settings_unsaved, 'a save that did not land is not clean');
+assert.equal(alertState().outcome, 'refused');
 `)
 }
 
-// TestPolicyUpstreamEditorRefusalReloadsStoredRecord checks the failure path: the
-// server's own wording is shown and the form is reloaded from what is stored, so a
-// rejected edit cannot stay on screen as if it had been applied.
-func TestPolicyUpstreamEditorRefusalReloadsStoredRecord(t *testing.T) {
+// TestPolicyUpstreamEditorRefusalKeepsTheEditedRows checks the failure path: the
+// server's own wording is shown, the rows the operator typed stay in the editor,
+// and the card stays marked unsaved, because the refused list was never stored.
+func TestPolicyUpstreamEditorRefusalKeepsTheEditedRows(t *testing.T) {
 	runUpstreamScenario(t, `
 const detail = 'upstream DNS entry 1 rejected: upstream "127.0.0.1" is loopback';
+let reads = 0;
 responder = async (url, opts) => {
   if (opts.method === 'PUT') {
     const err = new Error(detail);
@@ -500,19 +549,25 @@ responder = async (url, opts) => {
     err.data = {error: 'validation_failed', detail: detail};
     throw err;
   }
+  reads++;
   return record([{address: '9.9.9.9', port: 53, transport: 'plain'}]);
 };
 `, `
 setField(0, 'address', '127.0.0.1');
+const readsBefore = reads;
 await w.PolicyUpstreamEditor.save();
 await settle();
 
 assert.equal(alertState().state, 'error');
 assert.ok(alertState().text.indexOf(detail) !== -1,
   'the server refusal must be shown verbatim, got: ' + alertState().text);
-assert.ok(alertState().text.indexOf(DICT.policy_upstream_save_refused) !== -1,
-  'the banner must say the form was reloaded, got: ' + alertState().text);
-assert.equal(rows()[0].address, '9.9.9.9', 'the rejected edit is replaced by the stored record');
+assert.ok(alertState().text.indexOf(DICT.policy_upstream_save_kept) !== -1,
+  'the banner must say the edit is still there and not saved, got: ' + alertState().text);
+assert.equal(rows()[0].address, '127.0.0.1', 'the refused edit stays in the editor');
+assert.equal(unsavedText(), DICT.settings_unsaved, 'the card is still marked unsaved after a refusal');
+assert.equal(cardNode().getAttribute('aria-busy'), 'false');
+assert.equal(saveBtn().disabled, false, 'the operator can correct the entry and try again');
+assert.ok(reads > readsBefore, 'the runtime diagnostics are still refreshed, by a read of their own');
 `)
 }
 
@@ -540,7 +595,8 @@ assert.equal(alertState().state, 'error');
 assert.ok(alertState().text.indexOf(DICT.policy_upstream_state_inconsistent) !== -1,
   'the inconsistent state needs its own message, got: ' + alertState().text);
 assert.ok(alertState().text.indexOf(detail) !== -1);
-assert.equal(rows()[0].port, '53', 'the stored record is restored after the reload');
+assert.equal(rows()[0].port, '8853', 'the refused edit stays in the editor');
+assert.equal(unsavedText(), DICT.settings_unsaved);
 `)
 }
 

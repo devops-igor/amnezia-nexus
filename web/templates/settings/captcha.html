@@ -1,9 +1,10 @@
 {{- define "settings_captcha" -}}
 <!-- BLOCK 2: Captcha / Security -->
-        <div class="card settings-section-card">
+        <div class="card settings-section-card" id="captchaCard" data-settings-card="captcha">
             <div class="settings-card-header">
                 <svg class="icon"><use href="#icon-shield"></use></svg>
                 <h2 class="card-title">{{ _ "captcha_title" }}</h2>
+                {{ template "settings_dirty" . }}
             </div>
             <form id="captchaForm">
                 <div class="form-group">
@@ -16,5 +17,6 @@
                     </label>
                 </div>
             </form>
+            {{ template "settings_commit" . }}
         </div>
 {{- end }}

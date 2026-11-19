@@ -34,7 +34,7 @@ func policySectionHTMLForTest(t *testing.T) string {
 			return true
 		},
 	}
-	tmpl, err := template.New("settings_policy.html").Funcs(funcs).ParseFS(TemplatesFS, "templates/settings_policy.html")
+	tmpl, err := template.New("settings_policy.html").Funcs(funcs).ParseFS(TemplatesFS, "templates/settings_policy.html", "templates/settings_save_controls.html")
 	if err != nil {
 		t.Fatalf("parse settings_policy.html: %v", err)
 	}
@@ -51,6 +51,21 @@ func policySectionHTMLForTest(t *testing.T) string {
 	return buf.String()
 }
 
+// settingsCardsModuleForTest returns the shared card module as a JSON string, so a
+// controller fixture can load it the way the Settings page does.
+func settingsCardsModuleForTest(t *testing.T) string {
+	t.Helper()
+	module, err := StaticFS.ReadFile("static/js/settings_cards.js")
+	if err != nil {
+		t.Fatalf("read card module: %v", err)
+	}
+	encoded, err := json.Marshal(string(module))
+	if err != nil {
+		t.Fatalf("encode card module: %v", err)
+	}
+	return string(encoded)
+}
+
 // policyControllerHarness builds a JSDOM window with the shipped module and the
 // rendered section. `prelude` installs the API double before the initial load;
 // `scenario` runs after that load has settled.
@@ -65,6 +80,7 @@ func policyControllerHarness(t *testing.T, prelude, scenario string) string {
 	if err != nil {
 		t.Fatalf("encode module: %v", err)
 	}
+	encodedCards := settingsCardsModuleForTest(t)
 	encodedSection, err := json.Marshal(policySectionHTMLForTest(t))
 	if err != nil {
 		t.Fatalf("encode section: %v", err)
@@ -98,11 +114,42 @@ w.API = {
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 const settle = async (rounds) => { for (let i = 0; i < (rounds || 8); i++) await flush(); };
 const requestsTo = (suffix, method) => calls.filter(c => c.url.endsWith(suffix) && (!method || c.method === method));
+// alertText reads the card's two live regions the way a reader of the page does: the
+// text of whichever one has any, and its outcome. There is exactly one status and
+// one alert region, and at most one of them has text.
 const alertText = () => {
-  const el = w.document.getElementById('policyAlert');
-  return {text: el.textContent, state: el.getAttribute('data-state'), display: el.style.display};
+  const box = w.document.getElementById('policyAlert');
+  const status = box.querySelector('[data-status]');
+  const error = box.querySelector('[data-error]');
+  const words = el => el.textContent.replace(/\s+/g, ' ').trim();
+  const shown = [status, error].filter(el => words(el) !== '');
+  if (shown.length > 1) throw new Error('both result regions have text');
+  const el = shown[0] || null;
+  return {
+    text: el ? words(el) : '',
+    state: el ? (el === status ? 'success' : 'error') : '',
+    outcome: el ? el.getAttribute('data-outcome') : '',
+    regions: box.querySelectorAll('[data-status]').length + ':' + box.querySelectorAll('[data-error]').length
+  };
 };
 const toggle = () => w.document.getElementById('policy_enabled').checked;
+// editToggle changes the master switch the way a click does: the value moves and
+// the change event follows, which is what the card's dirty tracking listens to.
+const editToggle = (on) => {
+  const el = w.document.getElementById('policy_enabled');
+  el.checked = on;
+  el.dispatchEvent(new w.Event('change', {bubbles: true}));
+};
+const editField = (id, value) => {
+  const el = w.document.getElementById(id);
+  el.value = value;
+  el.dispatchEvent(new w.Event('input', {bubbles: true}));
+};
+const card = () => w.document.getElementById('policyRoutingCard');
+const unsavedBadge = () => {
+  const el = card().querySelector('[data-dirty]');
+  return {text: el.textContent};
+};
 const badge = () => {
   const el = w.document.getElementById('policyStatusBadge');
   return {text: el.textContent, enabled: el.getAttribute('data-enabled')};
@@ -116,6 +163,9 @@ const selectedPreset = () => {
 // Evaluate the module before the section exists: the auto-init entry point must
 // be inert without a form, and the test then installs the real markup.
 (async () => {
+// The page loads the card module before the controller, and the controller hands
+// the commit control, the busy state and the focus to it.
+w.eval(%s);
 w.eval(%s);
 assert.equal(w.initPolicyRouting(), false, 'init must be inert without the section');
 
@@ -132,7 +182,7 @@ await settle();
 console.log('POLICY_SCENARIO_OK');
 dom.window.close();
 })().catch(err => { console.error(err); process.exit(1); });
-`, string(encodedModule), string(encodedSection), prelude, scenario)
+`, string(encodedCards), string(encodedModule), string(encodedSection), prelude, scenario)
 }
 
 // runPolicyControllerScenario executes one scenario and fails the test with the
@@ -223,7 +273,8 @@ assert.equal(text('policyDirectDrops'), '1', 'counters are refreshed from the st
 func TestPolicyRoutingControllerRefusedEnableIsNotShownEnabled(t *testing.T) {
 	runPolicyControllerScenario(t, policyRecordScript(false, "geoblock"), `
 // The operator asks for enablement; activation is refused (missing direct
-// egress). The reload afterwards returns the record the server kept.
+// egress). What the server is running is refreshed by a separate read; the
+// operator's edit stays in the form, marked unsaved.
 let putCalls = 0;
 responder = async (url, opts) => {
   if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
@@ -241,7 +292,7 @@ responder = async (url, opts) => {
   }
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
 };
-w.document.getElementById('policy_enabled').checked = true;
+editToggle(true);
 await w.savePolicySettings();
 await settle();
 
@@ -250,12 +301,15 @@ const alert = alertText();
 assert.equal(alert.state, 'error', 'a refusal must be an error, never a success');
 assert.ok(alert.text.indexOf('direct egress is unavailable') !== -1,
   'the backend refusal must be surfaced verbatim, got: ' + alert.text);
-assert.ok(alert.text.indexOf('policy_save_refused') !== -1,
-  'the banner must state that the form was reloaded from the saved configuration');
-assert.ok(alert.text.indexOf('unavailable. policy_save_refused') !== -1,
+assert.ok(alert.text.indexOf('policy_save_kept') !== -1,
+  'the banner must say the edit is still in the form and not saved');
+assert.ok(alert.text.indexOf('unavailable. policy_save_kept') !== -1,
   'the server detail and the refusal must read as separate sentences, got: ' + alert.text);
-assert.equal(toggle(), false, 'a refused enablement must not remain visible as enabled');
-assert.equal(badge().enabled, 'false', 'the badge must follow the server, not the refused intent');
+assert.equal(toggle(), true, 'the refused edit stays in the form so the operator can correct it');
+assert.equal(unsavedBadge().text, 'settings_unsaved', 'the card is still marked unsaved after a refusal');
+assert.equal(card().getAttribute('aria-busy'), 'false');
+assert.equal(w.document.getElementById('policySaveBtn').disabled, false, 'the operator can try again');
+assert.equal(badge().enabled, 'false', 'the badge follows what the server runs, not the refused intent');
 assert.equal(text('policyLastError'), 'direct egress is unavailable',
   'the status block must show the server-reported error');
 `)
@@ -263,8 +317,8 @@ assert.equal(text('policyLastError'), 'direct egress is unavailable',
 
 func TestPolicyRoutingControllerRefusedSaveRestoresLastKnownRecord(t *testing.T) {
 	runPolicyControllerScenario(t, policyRecordScript(false, "antifilter_domains"), `
-// The refusal happens and the follow-up read fails too. The form must fall back
-// to the last record the server returned instead of keeping the refused intent.
+// The refusal happens and the follow-up status read fails too. The edit stays in
+// the form, marked unsaved, and the last runtime observation stays on screen.
 responder = async (url, opts) => {
   if (opts.method === 'PUT' || opts.method === 'POST') {
     const err = new Error('policy preset must be selected');
@@ -274,14 +328,16 @@ responder = async (url, opts) => {
   }
   throw new Error('backend unavailable');
 };
-w.document.getElementById('policy_enabled').checked = true;
+editToggle(true);
 await w.savePolicySettings();
 await settle();
 
 assert.ok(alertText().text.indexOf('policy preset must be selected') !== -1,
   'the validation detail must be surfaced, got: ' + alertText().text);
-assert.equal(toggle(), false, 'the toggled intent must be rolled back to the last server record');
-assert.equal(selectedPreset(), 'antifilter_domains', 'the last server preset must be restored');
+assert.equal(toggle(), true, 'the refused edit must stay in the form');
+assert.equal(selectedPreset(), 'antifilter_domains', 'a field the operator did not touch is unchanged');
+assert.equal(unsavedBadge().text, 'settings_unsaved', 'a failed status read must not clear the unsaved mark');
+assert.equal(badge().enabled, 'false', 'a failed status read keeps the last runtime observation');
 `)
 }
 
@@ -348,10 +404,10 @@ func TestPolicyRoutingControllerCustomURLPayload(t *testing.T) {
 // blank lines are dropped. Validation itself stays server-side.
 assert.equal(w.document.getElementById('policyCustomUrlsGroup').style.display, 'block',
   'the custom URL box is shown for the custom preset');
-w.document.getElementById('policy_custom_urls').value =
-  '  https://lists.example.com/a.lst  \n\n https://lists.example.com/b.lst \n';
-w.document.getElementById('policy_local_entries').value = ' local.example \n\n 198.51.100.0/24 ';
-w.document.getElementById('policy_excluded_domains').value = ' internal.api.example.com \n\n *.corp.example ';
+editField('policy_custom_urls',
+  '  https://lists.example.com/a.lst  \n\n https://lists.example.com/b.lst \n');
+editField('policy_local_entries', ' local.example \n\n 198.51.100.0/24 ');
+editField('policy_excluded_domains', ' internal.api.example.com \n\n *.corp.example ');
 responder = async (url, opts) => {
   if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
   if (url.endsWith('/api/vpn/policy') && opts.method === 'PUT') {
@@ -382,9 +438,12 @@ assert.deepEqual(puts[0].body.excluded_domains,
   'the payload carries excluded domains, trimmed and without blank lines');
 assert.ok(alertText().text.indexOf('scheme must be https') !== -1,
   'the server validation detail is surfaced, got: ' + alertText().text);
-// The reload returns the stored record, so a rejected entry is not shown as saved.
+// A rejected entry is not stored, and it is not discarded either: the operator's
+// text is still in the box so the URL can be corrected.
 assert.equal(w.document.getElementById('policy_custom_urls').value,
-  'https://lists.example.com/a.lst', 'the textarea is reloaded from the saved record');
+  '  https://lists.example.com/a.lst  \n\n https://lists.example.com/b.lst \n',
+  'the refused input stays in the editor');
+assert.equal(unsavedBadge().text, 'settings_unsaved');
 `)
 }
 
@@ -420,7 +479,8 @@ assert.equal(await w.savePolicySettings(), null, 'a save while one is in flight 
 await firstSave;
 await settle();
 assert.equal(putCalls, 1, 'two submits must not become two PUTs');
-assert.equal(w.document.getElementById('policySaveBtn').getAttribute('aria-busy'), 'false',
+// Busy is a property of the card, not of one button (SET2-15).
+assert.equal(w.document.getElementById('policyRoutingCard').getAttribute('aria-busy'), 'false',
   'the busy announcement must be cleared when the request ends');
 
 const firstSync = w.syncPolicy();
@@ -487,8 +547,12 @@ await settle();
 assert.equal(toggle(), true, 'the loaded record is the stored enabled one');
 assert.equal(selectedPreset(), 'geoblock');
 assert.equal(badge().enabled, 'true', 'the runtime snapshot arrived with the record');
-assert.equal(w.document.getElementById('policySaveBtn').disabled, false);
 assert.equal(w.document.getElementById('policyRoutingForm').getAttribute('data-policy-ready'), 'true');
+// A loaded record is the saved state, so nothing is staged and Save stays
+// disabled until the operator changes something (SET2-12).
+assert.equal(w.document.getElementById('policySaveBtn').disabled, true, 'a clean card does not commit');
+editField('policy_local_entries', 'local.example');
+assert.equal(w.document.getElementById('policySaveBtn').disabled, false, 'an edited, loaded card can commit');
 
 // Ordinary post-load control: the accepted save still works, and it carries the
 // loaded non-default interval instead of resetting it.

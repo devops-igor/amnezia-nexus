@@ -1,9 +1,10 @@
 {{- define "settings_ssl" -}}
 <!-- BLOCK 4: SSL / HTTPS -->
-        <div class="card settings-section-card">
+        <div class="card settings-section-card" id="sslCard" data-settings-card="ssl">
             <div class="settings-card-header">
                 <svg class="icon"><use href="#icon-lock"></use></svg>
                 <h2 class="card-title">{{ _ "ssl_title" }}</h2>
+                {{ template "settings_dirty" . }}
             </div>
             <form id="sslForm">
                 {{ $sslSettings := get .settings "ssl" }}
@@ -18,7 +19,7 @@
                 </div>
                 <div class="form-group settings-offset">
                     <label class="form-label" for="panel_port">{{ _ "panel_port_label" }}</label>
-                    <input type="number" class="form-input" id="panel_port" value="{{ get $sslSettings "panel_port" 5000 }}" placeholder="5000">
+                    <input type="number" class="form-input" id="panel_port" value="{{ get $sslSettings "panel_port" 5000 }}" placeholder="5000" min="1" max="65535" step="1" required>
                 </div>
                 <div id="sslFields" class="settings-offset"{{ if not (get $sslSettings "enabled") }} hidden{{ end }}>
                     <div class="form-group">
@@ -41,15 +42,16 @@
 
                     <div class="form-group">
                         <label class="form-label" for="ssl_cert_text">{{ _ "cert_text_label" }}</label>
-                        <textarea class="form-input" id="ssl_cert_text" rows="4" placeholder="-----BEGIN CERTIFICATE----- ...">{{ get $sslSettings "cert_text" "" }}</textarea>
+                        <textarea class="form-input" id="ssl_cert_text" data-secret="clear" rows="4" placeholder="-----BEGIN CERTIFICATE----- ...">{{ get $sslSettings "cert_text" "" }}</textarea>
                     </div>
                     <div class="form-group">
                         <label class="form-label" for="ssl_key_text">{{ _ "key_text_label" }}</label>
-                        <textarea class="form-input" id="ssl_key_text" rows="4" placeholder="-----BEGIN PRIVATE KEY----- ...">{{ get $sslSettings "key_text" "" }}</textarea>
+                        <textarea class="form-input" id="ssl_key_text" data-secret="clear" rows="4" placeholder="-----BEGIN PRIVATE KEY----- ...">{{ get $sslSettings "key_text" "" }}</textarea>
                     </div>
 
                     <p class="form-hint">{{ _ "ssl_hint" }}</p>
                 </div>
             </form>
+            {{ template "settings_commit" . }}
         </div>
 {{- end }}

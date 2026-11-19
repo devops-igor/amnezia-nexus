@@ -212,48 +212,41 @@
             .filter(function (line) { return line.length > 0; });
     }
 
-    // setPolicyAlert renders one inline banner. An empty message hides it, so a
-    // recovered action clears a previous failure instead of leaving stale text.
+    // setPolicyAlert reports into the card's own two regions, the same ones every
+    // other card has: a success goes to the status region and anything else to the
+    // alert region, each with a role that never changes. An empty message clears
+    // both, so a recovered action does not leave a stale failure behind. The
+    // #policyAlert wrapper only carries the state for readers that look at it.
     function setPolicyAlert(kind, message) {
-        var banner = policyElement('policyAlert');
-        if (!banner) {
+        var cards = root.SettingsCards;
+        if (!cards) {
             return;
         }
         if (!message) {
-            banner.style.display = 'none';
-            banner.textContent = '';
-            banner.setAttribute('data-state', '');
+            cards.clearReport('policyRoutingCard');
             return;
         }
-        // Theme tokens, not literals: --success-bg/--danger-bg already carry the
-        // light and dark variants. The message keeps the primary text colour
-        // because --danger is tuned for dark surfaces and measures 3.2:1 on the
-        // light theme's card, under the 4.5:1 minimum for this text size. The
-        // state is still carried by the tint, the border and the wording rather
-        // than by colour alone.
-        if (kind === 'success') {
-            banner.style.background = 'var(--success-bg)';
-            banner.style.border = '1px solid var(--success-border)';
-        } else {
-            banner.style.background = 'var(--danger-bg)';
-            banner.style.border = '1px solid var(--danger-border)';
-        }
-        banner.style.color = 'var(--text-primary)';
-        banner.setAttribute('data-state', kind);
-        banner.textContent = message;
-        banner.style.display = 'block';
+        cards.report('policyRoutingCard', kind === 'success' ? 'success' : 'error', message,
+            kind === 'success' ? 'saved' : 'refused');
     }
 
     function setPolicyBusy(role, busy) {
-        var button = policyElement(role === 'sync' ? 'policySyncBtn' : 'policySaveBtn');
-        var spinner = policyElement(role === 'sync' ? 'policySyncSpinner' : 'policySaveSpinner');
-        var label = policyElement(role === 'sync' ? 'policySyncBtnText' : 'policySaveBtnText');
+        if (role === 'save') {
+            // The card module owns the save control: aria-busy on the card, the
+            // disabled commit, the spinner and the focus that has to survive it.
+            if (root.SettingsCards) {
+                root.SettingsCards.busy('policyRoutingCard', busy);
+            }
+            return;
+        }
+        var button = policyElement('policySyncBtn');
+        var spinner = policyElement('policySyncSpinner');
+        var label = policyElement('policySyncBtnText');
         if (button) {
             if (busy && root.document && root.document.activeElement === button) {
                 busyFocus = button;
             }
-            // A save also stays disabled until the stored record has been read.
-            button.disabled = !!busy || (role === 'save' && !policyReady);
+            button.disabled = !!busy;
             button.setAttribute('aria-busy', busy ? 'true' : 'false');
             // Disabling a focused control moves focus to the document body, so a
             // keyboard operator would lose their place for the whole request.
@@ -265,13 +258,9 @@
             }
         }
         if (spinner) {
-            if (busy) {
-                spinner.classList.remove('hidden');
-            } else {
-                spinner.classList.add('hidden');
-            }
+            spinner.classList.toggle('hidden', !busy);
         }
-        if (label && role === 'sync') {
+        if (label) {
             label.textContent = busy ? policyText('policy_sync_running') : policyText('policy_sync_btn');
         }
     }
@@ -280,9 +269,8 @@
     // in step with it. Only a successful read of the stored record opens it.
     function setPolicyReady(ready) {
         policyReady = !!ready;
-        var saveBtn = policyElement('policySaveBtn');
-        if (saveBtn) {
-            saveBtn.disabled = !policyReady || inFlight.save;
+        if (root.SettingsCards) {
+            root.SettingsCards.gate('policyRoutingCard', !policyReady);
         }
         var form = policyElement('policyRoutingForm');
         if (form) {
@@ -313,11 +301,19 @@
     // applyPolicyRecord populates the form from a server record. It is the only
     // writer of the toggle and preset controls, so the displayed intent is always
     // a record the server accepted.
-    function applyPolicyRecord(record) {
+    //
+    // With keepForm the record is remembered as the last accepted one and the
+    // fields are left as the operator has them. That is for a save whose answer
+    // arrives after the operator kept typing: what was sent is stored, what is on
+    // screen now is not.
+    function applyPolicyRecord(record, keepForm) {
         if (!record) {
             return;
         }
         lastServerRecord = record;
+        if (keepForm) {
+            return;
+        }
 
         var enabled = policyElement('policy_enabled');
         if (enabled) {
@@ -353,6 +349,9 @@
 
         updatePolicyCustomGroup();
         updatePolicyPresetHighlight();
+        if (root.SettingsCards) {
+            root.SettingsCards.rebase('policyRoutingCard');
+        }
     }
 
     function renderPolicySourceStats(snapshot) {
@@ -555,6 +554,23 @@
         };
     }
 
+    // classifyPolicy turns what a request threw into the outcome the card module
+    // understands: a refusal has a status from the server, a dropped request has none.
+    function classifyPolicy(err) {
+        var answered = err && typeof err.status === 'number' && err.status > 0;
+        var detail = policyErrorDetail(err);
+        var text = policyText('policy_save_failed') + ': ' + detail;
+        // Two sentences in one banner: the server's detail does not always end
+        // with a stop, and without one the refusal reads as a run-on sentence.
+        if (!/[.!?\u2026]$/.test(detail)) {
+            text += '.';
+        }
+        return {
+            outcome: answered ? 'refused' : 'failed',
+            message: text + ' ' + policyText('policy_save_kept')
+        };
+    }
+
     async function savePolicySettings() {
         if (!policyReady) {
             // Nothing may be persisted before the stored record has been read: the
@@ -568,15 +584,36 @@
         }
         inFlight.save = true;
         var seq = ++requestSeq;
-        var payload = policySavePayload();
-        setPolicyBusy('save', true);
-        setPolicyAlert('', '');
+        var cards = root.SettingsCards;
+        var saved = null;
         try {
-            var saved = await policyRequest(POLICY_ENDPOINT, { method: 'PUT', body: payload });
-            // The accepted write owns the form from now on: a read issued before it
-            // must not replace it when it lands later.
-            lastAcceptedMutation = seq;
-            applyPolicyRecord(saved);
+            var settled = await cards.submit('policyRoutingCard', function () {
+                var payload = policySavePayload();
+                setPolicyAlert('', '');
+                return policyRequest(POLICY_ENDPOINT, { method: 'PUT', body: payload }).then(function (answer) {
+                    // The accepted write owns the form from now on: a read issued
+                    // before it must not replace it when it lands later.
+                    lastAcceptedMutation = seq;
+                    saved = answer;
+                    // Remembered either way; the fields are replaced only by the
+                    // card module, and only when nothing was typed meanwhile.
+                    applyPolicyRecord(answer, true);
+                    return {
+                        outcome: 'saved',
+                        message: policyText('policy_saved'),
+                        reconcile: function () { applyPolicyRecord(answer); }
+                    };
+                }, classifyPolicy);
+            });
+            if (settled.outcome !== 'saved') {
+                // The refused edits were never stored, so they stay in the form and
+                // the card stays marked unsaved. Only what the server is running is
+                // refreshed, by a read that never touches the form. If that read
+                // fails the last observation stays on screen, and it is never turned
+                // into stored intent shown as a runtime "enabled".
+                await refreshPolicyStatus();
+                return null;
+            }
             renderPolicyStatus(saved, policyRuntimeSnapshot(saved));
             try {
                 var stats = await policyRequest(STATS_ENDPOINT, { method: 'GET' });
@@ -584,33 +621,9 @@
             } catch (statsErr) {
                 // Leave the last known counters in place rather than showing zeroes.
             }
-            setPolicyAlert('success', policyText('policy_saved'));
             return saved;
-        } catch (err) {
-            var detail = policyErrorDetail(err);
-            var refusal = policyText('policy_save_failed') + ': ' + detail;
-            // Two sentences in one banner: the server's detail does not always end
-            // with a stop, and without one the refusal reads as a run-on sentence.
-            if (!/[.!?…]$/.test(detail)) {
-                refusal += '.';
-            }
-            setPolicyAlert('error', refusal + ' ' + policyText('policy_save_refused'));
-            // Re-read the accepted record. If that fails too, the last accepted
-            // record and the last runtime observation are restored: a failed read
-            // must not clear the badge, the counts or the activation diagnostic, and
-            // it must never turn stored intent into a runtime "enabled".
-            try {
-                await loadPolicySettings();
-            } catch (reloadErr) {
-                if (lastServerRecord) {
-                    applyPolicyRecord(lastServerRecord);
-                    renderPolicyStatus(lastServerRecord, lastRuntimeSnapshot);
-                }
-            }
-            return null;
         } finally {
             inFlight.save = false;
-            setPolicyBusy('save', false);
         }
     }
 

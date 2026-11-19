@@ -3037,12 +3037,6 @@ th.sortable[aria-sort="none"] .sort-icon-desc {
     }
 }
 
-.settings-actions {
-    margin-top: var(--space-xl);
-    display: flex;
-    justify-content: flex-end;
-}
-
 .settings-card-header-split {
     justify-content: space-between;
 }
@@ -3138,6 +3132,53 @@ th.sortable[aria-sort="none"] .sort-icon-desc {
 
 .settings-notice-spaced {
     margin-bottom: var(--space-md);
+}
+
+/* The result of a commit, shown inside the card that made it. The state is
+   carried by the tint, the border and the wording, and the text keeps the
+   primary colour so it stays readable in both themes. */
+.settings-notice-success {
+    background: var(--success-bg);
+    border: 1px solid var(--success-border);
+    color: var(--text-primary);
+}
+
+.settings-notice-danger {
+    background: var(--danger-bg);
+    border: 1px solid var(--danger-border);
+    color: var(--text-primary);
+}
+
+.settings-section-card > .settings-notice-success,
+.settings-section-card > .settings-notice-danger {
+    margin: var(--space-sm) 0 0 0;
+}
+
+/* A live region is announced reliably only when it was already in the
+   accessibility tree before its text changed, so these nodes are never hidden
+   with display:none, [hidden] or visibility:hidden. While empty they take no
+   space instead: out of flow and zero size. The rule stops applying the moment
+   text arrives, so a region with a message has its normal box. */
+.settings-notice:empty,
+.settings-section-card [data-dirty]:empty {
+    position: absolute;
+    width: 0;
+    height: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+}
+
+/* The policy cards keep their result wrapper above the form. It takes no space
+   while both regions are empty, and the spacing the banner used to carry while one
+   has text. */
+.settings-result > .settings-notice:not(:empty) {
+    margin-bottom: var(--space-md);
+}
+
+.settings-immediate {
+    font-weight: 600;
 }
 
 .settings-notice-icon {
@@ -3265,8 +3306,7 @@ th.sortable[aria-sort="none"] .sort-icon-desc {
    button the same height while still letting one grow when the text is enlarged
    or a translation wraps. Buttons that script renders into the order and
    approval lists carry compact inline padding, so they take the small height. */
-.settings-section-card .btn,
-.settings-actions .btn {
+.settings-section-card .btn {
     min-height: calc(var(--space-xl) + var(--space-sm));
     padding-block: 0;
 }

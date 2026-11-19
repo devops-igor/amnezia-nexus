@@ -30,6 +30,47 @@
         return fallback || key;
     }
 
+    var CARD = 'notificationsCard';
+
+    // cardReport writes a commit result into this card. The page toast is only a
+    // fallback for a page that did not load the card module.
+    function cardReport(kind, message) {
+        if (root.SettingsCards && root.SettingsCards.report(CARD, kind, message)) return;
+        if (root.UI && root.UI.toast) root.UI.toast(message, kind === 'success' ? 'success' : 'error');
+    }
+
+    // cardRebase makes what the card now shows its saved state, so the dirty
+    // badge clears once a stored record has been applied.
+    function cardRebase() {
+        if (root.SettingsCards) root.SettingsCards.rebase(CARD);
+    }
+
+    // The card module owns the commit control while it is on the page: it
+    // blocks the control until the stored record has loaded, keeps a clean card
+    // from committing, marks the card busy and keeps keyboard focus. Without it
+    // the controller falls back to driving the button itself.
+    function cardGate(blocked) {
+        if (root.SettingsCards) {
+            root.SettingsCards.gate(CARD, blocked);
+            return;
+        }
+        var save = byId('notificationSaveBtn');
+        if (save) save.disabled = blocked;
+    }
+
+    function cardBusy(busy) {
+        if (root.SettingsCards) {
+            root.SettingsCards.busy(CARD, busy);
+            return;
+        }
+        setBusy('notificationSaveBtn', 'notificationSaveSpinner', 'notificationSaveBtnText', busy,
+            translate(busy ? 'loading' : 'save_changes', busy ? 'Loading' : 'Save changes'));
+    }
+
+    function cardIsClean() {
+        return !!root.SettingsCards && !root.SettingsCards.isDirty(CARD);
+    }
+
     function setBusy(buttonId, spinnerId, textId, busy, text) {
         var button = byId(buttonId);
         var spinner = byId(spinnerId);
@@ -67,6 +108,7 @@
             input.checked = categories[key] !== false;
         });
         toggleFields();
+        cardRebase();
     }
 
     function toggleFields() {
@@ -79,20 +121,18 @@
         if (state.loading) return;
         state.loading = true;
         try {
-            var settings = await root.API.get('/api/notifications/settings');
+            var settings = await root.API.get('/api/notifications/settings', { silent: true });
             renderSettings(settings || {});
             state.loaded = true;
-            var saveBtn = byId('notificationSaveBtn');
             var testBtn = byId('notificationTestBtn');
-            if (saveBtn) saveBtn.disabled = false;
+            cardGate(false);
             if (testBtn) testBtn.disabled = false;
             await loadHistory();
         } catch (err) {
             state.loaded = false;
             showTestResult(translate('notifications_load_failed', 'Could not load notification settings') + ': ' + (err.message || err), true);
-            var save = byId('notificationSaveBtn');
             var test = byId('notificationTestBtn');
-            if (save) save.disabled = true;
+            cardGate(true);
             if (test) test.disabled = true;
         } finally {
             state.loading = false;
@@ -104,8 +144,18 @@
         categoryInputs().forEach(function (input) {
             categories[input.getAttribute('data-category')] = !!input.checked;
         });
-        var cooldown = parseInt((byId('notifications_cooldown') || {}).value || '60', 10);
-        if (!isFinite(cooldown)) cooldown = 60;
+        // The number the operator entered, or nothing to send. A field that does not
+        // hold a number stops the commit through the card's own validation; it is
+        // never replaced by the default, which is how an emptied field used to save a
+        // cooldown nobody entered.
+        var cooldownField = byId('notifications_cooldown');
+        var cooldownRaw = cooldownField ? String(cooldownField.value).trim() : '';
+        var cooldown = Number(cooldownRaw);
+        if (cooldownRaw === '' || !isFinite(cooldown)) {
+            throw new Error(root.SettingsCards && root.SettingsCards.fieldMessage
+                ? root.SettingsCards.fieldMessage(cooldownField)
+                : translate('settings_field_invalid', 'Enter a number within the allowed range'));
+        }
         var tokenInput = byId('notifications_token');
         return {
             enabled: !!(byId('notifications_enabled') || {}).checked,
@@ -118,23 +168,71 @@
         };
     }
 
+    // classify turns what a request threw into the outcome the card module
+    // understands: a refusal has a status from the server, a dropped request has none.
+    function classify(err) {
+        var answered = err && typeof err.status === 'number' && err.status > 0;
+        return { outcome: answered ? 'refused' : 'failed', message: (err && err.message) || String(err) };
+    }
+
+    // storeAnswer is what is applied to the form after a save, and only when nothing
+    // was typed while the request ran: the stored record is the source of truth, so
+    // masked values and the attempts limit come back from it.
+    function storeAnswer(saved) {
+        renderSettings(saved || {});
+    }
+
+    // noteStored records the parts of the answer that are not on screen, whether or
+    // not the form is replaced: whether a token is stored, the attempts limit, and a
+    // token field that still holds what was sent is emptied, because the secret is
+    // write-only.
+    function noteStored(saved, body) {
+        state.tokenSet = !!saved.app_token_set;
+        state.maxAttempts = saved.max_attempts || state.maxAttempts;
+        var token = byId('notifications_token');
+        if (token) {
+            if (token.value.trim() === body.app_token) token.value = '';
+            token.placeholder = state.tokenSet ? '********' : '';
+        }
+    }
+
     async function save(silent) {
         if (!state.loaded || state.saving) return false;
         state.saving = true;
-        setBusy('notificationSaveBtn', 'notificationSaveSpinner', 'notificationSaveBtnText', true, translate('loading', 'Loading'));
         try {
-            var saved = await root.API.post('/api/notifications/settings', collect());
-            renderSettings(saved || {});
-            if (!silent) {
-                if (root.UI && root.UI.toast) root.UI.toast(translate('settings_saved', 'Settings saved'), 'success');
-            }
-            return true;
-        } catch (err) {
-            if (root.UI && root.UI.toast) root.UI.toast((err.message || err), 'error');
-            return false;
+            if (!root.SettingsCards) return await saveWithoutCards(silent);
+            var settled = await root.SettingsCards.submit(CARD, function () {
+                var body = collect();
+                return root.API.post('/api/notifications/settings', body, { silent: true }).then(function (saved) {
+                    noteStored(saved || {}, body);
+                    return {
+                        outcome: 'saved',
+                        message: translate('settings_saved', 'Settings saved'),
+                        quiet: !!silent,
+                        reconcile: function () { storeAnswer(saved); }
+                    };
+                }, classify);
+            });
+            return settled.outcome === 'saved';
         } finally {
             state.saving = false;
-            setBusy('notificationSaveBtn', 'notificationSaveSpinner', 'notificationSaveBtnText', false, translate('save_changes', 'Save changes'));
+        }
+    }
+
+    // saveWithoutCards is the page that did not load the card module: the same
+    // request and the same toast fallback as before, with nothing staged to keep.
+    async function saveWithoutCards(silent) {
+        cardBusy(true);
+        try {
+            var saved = await root.API.post('/api/notifications/settings', collect(), { silent: true });
+            renderSettings(saved || {});
+            if (!silent) cardReport('success', translate('settings_saved', 'Settings saved'));
+            return true;
+        } catch (err) {
+            cardReport('error', err.message || String(err));
+            return false;
+        } finally {
+            cardBusy(false);
         }
     }
 
@@ -142,7 +240,9 @@
         if (!state.loaded || state.testing) return;
         // Test exactly the configuration the administrator sees. Persist it
         // first, so a passing test cannot belong to a different destination.
-        var saved = await save(true);
+        // A card with nothing staged already is what is stored, so there is
+        // nothing to save first.
+        var saved = cardIsClean() ? true : await save(true);
         if (!saved) {
             showTestResult(translate('notifications_test_save_failed', 'Save the notification settings before testing'), true);
             return;
@@ -151,7 +251,7 @@
         setBusy('notificationTestBtn', 'notificationTestSpinner', 'notificationTestBtnText', true, translate('notifications_test_sending', 'Sending test…'));
         showTestResult(translate('notifications_test_sending', 'Sending test…'), false);
         try {
-            var result = await root.API.post('/api/notifications/test', {});
+            var result = await root.API.post('/api/notifications/test', {}, { silent: true });
             var status = result && result.status;
             if (status === 'sent') {
                 showTestResult(translate('notifications_test_sent', 'Test notification accepted by Gotify'), false);
@@ -179,7 +279,7 @@
         var container = byId('notificationHistory');
         if (!container) return;
         try {
-            var data = await root.API.get('/api/notifications/history?limit=25');
+            var data = await root.API.get('/api/notifications/history?limit=25', { silent: true });
             renderHistory(container, (data && data.events) || []);
         } catch (err) {
             container.textContent = translate('notifications_history_failed', 'Could not load notification history');

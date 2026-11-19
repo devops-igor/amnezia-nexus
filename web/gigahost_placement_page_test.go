@@ -64,7 +64,7 @@ func TestGigahostPlacementPageWiringDOM(t *testing.T) {
 	templateText := settingsTemplateText(t)
 
 	// The page must load the shipped module, not an inline copy.
-	if !strings.Contains(templateText, `src="/static/js/gigahost_placement.js"`) {
+	if !strings.Contains(templateText, versionedTemplateAsset("/static/js/gigahost_placement.js")) {
 		t.Fatal("settings.html does not load the placement module")
 	}
 	if !strings.Contains(templateText, `id="deployPlacementSelect"`) {

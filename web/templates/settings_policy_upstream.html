@@ -10,17 +10,18 @@
         color: var(--text-secondary);
     }
 </style>
-<div class="card settings-section-card settings-card-stacked" id="policyUpstreamCard">
+<div class="card settings-section-card settings-card-stacked" id="policyUpstreamCard" data-settings-card="policyUpstream">
     <div class="settings-card-header settings-card-header-split">
         <div class="settings-inline">
             <svg class="icon"><use href="#icon-globe"></use></svg>
             <h2 class="card-title">{{ _ "policy_upstream_title" }}</h2>
+            {{ template "settings_dirty" . }}
         </div>
     </div>
 
     <p class="form-hint">{{ _ "policy_upstream_intro" }}</p>
 
-    <div id="policyUpstreamAlert" role="status" aria-live="polite" aria-atomic="true" class="settings-notice settings-notice-spaced" hidden></div>
+    <div id="policyUpstreamAlert" class="settings-result" data-result data-state="">{{ template "settings_feedback" . }}</div>
 
     <form id="policyUpstreamForm" data-upstream-ready="false">
         <p class="form-hint" id="policyUpstreamLimitNote">{{ _ "policy_upstream_limit_note" }}</p>
@@ -45,14 +46,15 @@
         <p class="form-hint" id="policyUpstreamClientNotice">{{ _ "policy_upstream_client_config_notice" }}</p>
 
         <div class="settings-button-row">
-            <button type="submit" class="btn btn-primary" id="policyUpstreamSaveBtn" disabled>
+            <button type="submit" class="btn btn-primary" id="policyUpstreamSaveBtn" data-commit data-commit-when-dirty data-commit-gated disabled>
                 <svg class="icon"><use href="#icon-check"></use></svg>
-                <span id="policyUpstreamSaveBtnText">{{ _ "policy_upstream_save_btn" }}</span>
+                <span id="policyUpstreamSaveBtnText">{{ _ "save_changes" }}</span>
                 <span class="spinner hidden" id="policyUpstreamSaveSpinner" aria-hidden="true"></span>
             </button>
             <button type="button" class="btn btn-secondary" id="policyUpstreamDefaultsBtn" disabled>
                 {{ _ "policy_upstream_defaults_btn" }}
             </button>
+            {{ template "settings_immediate" "policy_upstream_defaults_btn" }}
             <button type="button" class="btn btn-secondary" id="policyUpstreamReloadBtn" disabled>
                 {{ _ "policy_upstream_reload_btn" }}
             </button>
@@ -109,6 +111,6 @@
         </div>
     </template>
 </div>
-<script src="/static/js/policy_upstream.js"></script>
+<script src="/static/js/policy_upstream.js?v={{ .app_version }}"></script>
 {{ end }}
 {{ end }}

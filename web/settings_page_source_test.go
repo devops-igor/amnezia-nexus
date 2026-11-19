@@ -34,6 +34,13 @@ func settingsTemplateText(t *testing.T) string {
 	sort.Strings(names)
 	var text strings.Builder
 	text.Write(shell)
+	// The commit control, dirty badge and feedback regions every card shares.
+	shared, err := TemplatesFS.ReadFile("templates/settings_save_controls.html")
+	if err != nil {
+		t.Fatalf("read shared save controls: %v", err)
+	}
+	text.WriteString("\n")
+	text.Write(shared)
 	for _, name := range names {
 		section, err := TemplatesFS.ReadFile("templates/settings/" + name)
 		if err != nil {
@@ -129,9 +136,22 @@ func TestSettingsPageSplitContract(t *testing.T) {
 		}
 	}
 
+	// The save model's two scripts load before anything that reports through them.
+	for _, module := range []string{"settings_cards.js", "settings_save.js"} {
+		at := strings.Index(shell, `src="/static/js/`+module)
+		first := strings.Index(shell, `src="/static/js/notifications_settings.js`)
+		if at < 0 || at > first {
+			t.Errorf("module %s must load before the notification controller", module)
+		}
+	}
+
 	// The handlers the markup names must exist as globals in the page script.
+	// saveSettings is gone on purpose: every card commits through its own control.
 	pageScript := settingsPageScript(t)
-	for _, handler := range []string{"saveSettings", "handleRestore", "checkUpstreamStatus"} {
+	if strings.Contains(pageScript, "function saveSettings(") {
+		t.Error("the page-level saveSettings handler must not return")
+	}
+	for _, handler := range []string{"handleRestore", "checkUpstreamStatus"} {
 		if !strings.Contains(pageScript, "function "+handler+"(") {
 			t.Errorf("page script does not define %s", handler)
 		}
