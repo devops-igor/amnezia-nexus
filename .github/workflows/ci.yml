@@ -452,6 +452,7 @@ jobs:
             tests/test_e2e_skip_policy.py \
             tests/test_e2e_dev_exclusivity.py \
             tests/test_e2e_preflight.py \
+            tests/test_e2e_dev_host.py \
             tests/test_e2e_call_timing_privacy.py \
             tests/test_e2e_timing_wiring.py \
             tests/test_ci_offline_discovery.py \
