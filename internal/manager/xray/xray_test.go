@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/manager/awg"
+	"github.com/devops-igor/amnezia-nexus/internal/manager/containerlog"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	gossh "golang.org/x/crypto/ssh"
@@ -626,7 +627,7 @@ func TestXrayManager_ContainerFlagsAndSudo(t *testing.T) {
 		"--cap-drop ALL",
 		"--cap-add NET_BIND_SERVICE",
 		"--security-opt no-new-privileges:true",
-		"--log-driver none",
+		containerlog.RunArgs(false),
 		"--tmpfs /tmp:rw,noexec,nosuid,size=16m",
 		"--tmpfs /run:rw,noexec,nosuid,size=16m",
 		"-v '/opt/amnezia/xray':/etc/xray:ro",
@@ -663,6 +664,62 @@ func TestXrayManager_ContainerFlagsAndSudo(t *testing.T) {
 	}
 	if !psFound {
 		t.Errorf("docker ps was not executed in GetServerStatus")
+	}
+}
+
+// xrayContainerRunCommand installs xray with the given params and returns the
+// recorded docker run command.
+func xrayContainerRunCommand(t *testing.T, params map[string]any) string {
+	t.Helper()
+	mockSSH := newMockXraySSHClient()
+	pool := &mockXrayPool{client: mockSSH}
+	mgr := NewXrayManagerWithServerLocks(pool, awg.NewServerLockRegistry())
+	server := &models.Server{ID: 45, Host: "192.0.2.4", SSHPort: 22}
+
+	if err := mgr.Install(context.Background(), server, params); err != nil {
+		t.Fatalf("Install failed: %v", err)
+	}
+
+	var runCmd string
+	for _, cmd := range mockSSH.commands {
+		if strings.Contains(cmd, "docker run") {
+			runCmd = cmd
+		}
+	}
+	if runCmd == "" {
+		t.Fatalf("docker run command was not recorded")
+	}
+	return runCmd
+}
+
+// The container log must stay readable by default, so a failed readiness probe
+// carries the engine's own output instead of a daemon refusal to read it. The
+// assertion derives from the shared definition, so a hardcoded driver here
+// fails as soon as the definition changes.
+func TestXrayManager_DefaultContainerLogIsReadableAndCapped(t *testing.T) {
+	runCmd := xrayContainerRunCommand(t, map[string]any{"port": 443})
+
+	if want := containerlog.RunArgs(false); !strings.Contains(runCmd, want) {
+		t.Fatalf("docker run does not use the shared readable log configuration %q:\n%s", want, runCmd)
+	}
+	if strings.Contains(runCmd, "--log-driver none") {
+		t.Fatalf("docker run must not request the unreadable driver by default:\n%s", runCmd)
+	}
+}
+
+// An operator who explicitly wants no container log keeps the previous
+// behaviour, without size caps the none driver cannot honour.
+func TestXrayManager_ExplicitOptOutDisablesContainerLog(t *testing.T) {
+	runCmd := xrayContainerRunCommand(t, map[string]any{
+		"port":                    443,
+		containerlog.DisableParam: true,
+	})
+
+	if want := containerlog.RunArgs(true); !strings.Contains(runCmd, want) {
+		t.Fatalf("docker run does not honour the explicit opt-out %q:\n%s", want, runCmd)
+	}
+	if strings.Contains(runCmd, "--log-opt") {
+		t.Fatalf("disabled container log must not carry size caps:\n%s", runCmd)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/containerlog"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/google/uuid"
@@ -271,6 +272,10 @@ type containerLaunchOptions struct {
 	flow             string
 	clients          []XrayClient
 	skipProbe        bool
+	// disableContainerLog is the operator's explicit opt-out from keeping the
+	// container's own log. Left false, the log stays readable so a readiness
+	// failure can report what the engine did.
+	disableContainerLog bool
 }
 
 func (m *XrayManager) pullImage(ctx context.Context, client ssh.SSHClient, image string) error {
@@ -662,13 +667,14 @@ func (m *XrayManager) launchContainer(ctx context.Context, client ssh.SSHClient,
 --cap-drop ALL \
 --cap-add NET_BIND_SERVICE \
 --security-opt no-new-privileges:true \
---log-driver none \
+%s \
 --tmpfs /tmp:rw,noexec,nosuid,size=16m \
 --tmpfs /run:rw,noexec,nosuid,size=16m \
 -v %s:/etc/xray:ro \
 -v %s:/usr/local/etc/xray:ro \
 %s`,
 		ssh.EscapeShellArg(XrayContainerName),
+		containerlog.RunArgs(opts.disableContainerLog),
 		ssh.EscapeShellArg(XrayConfigDir),
 		ssh.EscapeShellArg(XrayConfigDir),
 		ssh.EscapeShellArg(opts.image),
@@ -922,18 +928,20 @@ func (m *XrayManager) Install(ctx context.Context, server *models.Server, params
 
 	// 7. Launch amnezia-xray container with resolved profile image and verify readiness before deleting backup
 	skipProbe, _ := params["skip_probe"].(bool)
+	disableContainerLog, _ := params[containerlog.DisableParam].(bool)
 	launchOpts := containerLaunchOptions{
-		image:            profile.Image,
-		engineProfile:    string(profile.Name),
-		existingCfgBytes: existingCfgBytes,
-		server:           server,
-		portPrimary:      portPrimary,
-		serverName:       serverName,
-		pubB64:           pubB64,
-		shortID:          shortID,
-		flow:             flow,
-		clients:          clients,
-		skipProbe:        skipProbe,
+		image:               profile.Image,
+		engineProfile:       string(profile.Name),
+		existingCfgBytes:    existingCfgBytes,
+		server:              server,
+		portPrimary:         portPrimary,
+		serverName:          serverName,
+		pubB64:              pubB64,
+		shortID:             shortID,
+		flow:                flow,
+		clients:             clients,
+		skipProbe:           skipProbe,
+		disableContainerLog: disableContainerLog,
 	}
 	if err := m.launchContainer(ctx, client, launchOpts); err != nil {
 		return err
