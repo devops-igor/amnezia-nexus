@@ -24,13 +24,11 @@ from typing import Any, Dict, Optional, Tuple
 import pytest
 from playwright.sync_api import Page
 
+from tests.e2e import dev_host
 from tests.e2e.conftest import api_get, api_post
 
 logger = logging.getLogger(__name__)
 
-# Pinned multiarch AmneziaWG client container image matching internal/manager/awg/awg.go
-PRIMARY_CLIENT_IMAGE = "devopsigor/amneziawg:v3.1.20261116-1"
-FALLBACK_CLIENT_IMAGE = "devopsigor/amneziawg:ci-test"
 GATEWAY_IP = "10.8.1.1"
 
 
@@ -52,63 +50,6 @@ def _assert_zero_packet_loss(ping_stdout: str, label: str = "ping") -> None:
     assert match, f"Could not determine packet loss for {label}: {ping_stdout}"
     loss = float(match.group(1))
     assert loss == 0.0, f"Expected 0% packet loss for {label}, got {loss}%: {ping_stdout}"
-
-
-def _check_docker_available() -> bool:
-    """Check whether local Docker daemon is reachable."""
-    try:
-        res = subprocess.run(
-            ["docker", "info"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return res.returncode == 0
-    except Exception as exc:
-        logger.warning("Docker daemon reachability check failed: %s", exc)
-        return False
-
-
-def _verify_client_image_architecture(image: str) -> bool:
-    """Verify that the AmneziaWG client image executes on the host architecture."""
-    try:
-        res = subprocess.run(
-            ["docker", "run", "--rm", "--entrypoint", "awg", image, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        return res.returncode == 0 and "amneziawg-tools" in res.stdout
-    except Exception as exc:
-        logger.warning("Architecture execution check failed for %s: %s", image, exc)
-        return False
-
-
-def _resolve_client_image() -> Optional[str]:
-    """Resolve available AmneziaWG client image or attempt pull.
-
-    Returns the image tag if available, or None if unavailable.
-    """
-    for img in (PRIMARY_CLIENT_IMAGE, FALLBACK_CLIENT_IMAGE):
-        inspect_res = subprocess.run(
-            ["docker", "image", "inspect", img],
-            capture_output=True,
-            text=True,
-        )
-        if inspect_res.returncode == 0:
-            return img
-
-        logger.info("Attempting to pull AmneziaWG client image: %s", img)
-        pull_res = subprocess.run(
-            ["docker", "pull", img],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if pull_res.returncode == 0:
-            return img
-
-    return None
 
 
 def _docker_exec(
@@ -247,20 +188,8 @@ def _verify_egress_nat(container_name: str) -> bool:
 
 @pytest.mark.e2e
 def test_docker_preflight() -> None:
-    """Pre-flight check: Docker daemon reachability, AmneziaWG client image presence and architecture."""
-    if not _check_docker_available():
-        _handle_skip_or_fail("Docker daemon is unreachable; skipping data plane traffic test")
-
-    client_image = _resolve_client_image()
-    if not client_image:
-        _handle_skip_or_fail(
-            f"Neither {PRIMARY_CLIENT_IMAGE} nor {FALLBACK_CLIENT_IMAGE} available; skipping"
-        )
-
-    assert client_image is not None
-    if not _verify_client_image_architecture(client_image):
-        _handle_skip_or_fail(f"Client image {client_image} cannot execute on host architecture")
-
+    """Pre-flight check: Docker daemon reachability, AmneziaWG client image presence and execution."""
+    client_image = dev_host.require_client_image(_handle_skip_or_fail)
     logger.info("Docker pre-flight passed using client image: %s", client_image)
 
 
@@ -272,16 +201,7 @@ def test_dataplane_traffic_verification(
     page = authenticated_page
 
     # 1. Pre-flight checks
-    if not _check_docker_available():
-        _handle_skip_or_fail("Docker daemon is unreachable; skipping data plane traffic test")
-
-    client_image = _resolve_client_image()
-    if not client_image:
-        _handle_skip_or_fail("AmneziaWG client container image is unavailable; skipping")
-
-    assert client_image is not None
-    if not _verify_client_image_architecture(client_image):
-        _handle_skip_or_fail(f"Client image {client_image} cannot execute on host architecture")
+    client_image = dev_host.require_client_image(_handle_skip_or_fail)
 
     # 2. Server discovery (strictly requiring live running AWG container)
     server_id, server_data = _discover_awg_server(page, csrf_token)
