@@ -103,6 +103,10 @@ var (
 	// that would keep far fewer prefixes than the artifact it replaces, which is
 	// what a feed truncated mid-download looks like.
 	ErrInventoryLargeReduction = errors.New("inventory body would greatly reduce the committed set")
+	// ErrInventoryBaselineUnavailable means the prefix count of the committed
+	// artifact could not be established, so the truncation guard cannot compare
+	// against it. It is a refusal, never a reason to compare against zero.
+	ErrInventoryBaselineUnavailable = errors.New("committed inventory baseline is unavailable")
 )
 
 // InventorySource names the set that answered a membership question, so a

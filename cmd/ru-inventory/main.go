@@ -20,7 +20,9 @@
 //
 // A body that keeps fewer than policy.MaxInventoryReductionPercent of the
 // committed prefixes is refused as a truncated feed; pass
-// -allow-large-reduction for a deliberate large change.
+// -allow-large-reduction for a deliberate large change. The comparison needs a
+// count of the committed artifact; when that count cannot be established the run
+// is refused rather than applied without a guard.
 //
 // The upstream copyright notice (Copyrights.txt) ships with the artifact and is
 // embedded in the binary; this command never writes or replaces it, because the
@@ -71,12 +73,18 @@ func (o options) provenance() policy.InventoryProvenance {
 }
 
 // updateOptions returns the maintenance decisions for this invocation, including
-// the count the body is compared against.
-func (o options) updateOptions() policy.InventoryUpdateOptions {
-	return policy.InventoryUpdateOptions{
-		PreviousPrefixCount: policy.PreviousInventoryCount(o.dir),
-		AllowLargeReduction: o.allowLargeReduction,
+// the count the body is compared against. A baseline that cannot be established
+// is an error: the caller must refuse the update rather than compare against
+// nothing.
+func (o options) updateOptions() (policy.InventoryUpdateOptions, error) {
+	previous, err := policy.PreviousInventoryCount(o.dir)
+	if err != nil {
+		return policy.InventoryUpdateOptions{}, err
 	}
+	return policy.InventoryUpdateOptions{
+		PreviousPrefixCount: previous,
+		AllowLargeReduction: o.allowLargeReduction,
+	}, nil
 }
 
 func run(stdin io.Reader, stdout io.Writer, args []string) error {
@@ -84,11 +92,14 @@ func run(stdin io.Reader, stdout io.Writer, args []string) error {
 	if err != nil {
 		return err
 	}
+	update, err := opts.updateOptions()
+	if err != nil {
+		return describeRejection(err)
+	}
 	body, err := readZone(stdin)
 	if err != nil {
 		return err
 	}
-	update := opts.updateOptions()
 	record, meta, err := policy.ValidateInventoryUpdate(body, opts.provenance(), update)
 	if err != nil {
 		return describeRejection(err)
@@ -142,6 +153,8 @@ func describeRejection(err error) error {
 		return fmt.Errorf("zone rejected, committed inventory left unchanged: %w", err)
 	case errors.Is(err, policy.ErrInventoryLargeReduction):
 		return fmt.Errorf("zone rejected, committed inventory left unchanged: %w", err)
+	case errors.Is(err, policy.ErrInventoryBaselineUnavailable):
+		return fmt.Errorf("zone not applied, committed inventory left unchanged: %w", err)
 	default:
 		return err
 	}

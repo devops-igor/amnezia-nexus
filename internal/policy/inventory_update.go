@@ -1,9 +1,12 @@
 package policy
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -52,8 +55,10 @@ const (
 // InventoryUpdateOptions carries the maintenance decisions for one regeneration.
 type InventoryUpdateOptions struct {
 	// PreviousPrefixCount is the prefix count of the committed artifact this
-	// update replaces, from PreviousInventoryCount. Zero means there is no
-	// previous artifact, so only the absolute floor applies.
+	// update replaces, from PreviousInventoryCount. Zero means the caller
+	// established that there is no committed artifact to compare against — not
+	// that the baseline could not be read, which PreviousInventoryCount reports
+	// as an error. A negative value is refused.
 	PreviousPrefixCount int
 	// AllowLargeReduction accepts a body that would keep fewer than
 	// MaxInventoryReductionPercent of those prefixes. It is the explicit
@@ -118,8 +123,20 @@ func (p InventoryProvenance) validateForWrite() error {
 // committed set unless the operator asked for that. The message names both
 // counts and the flag, because an operator who sees only one number cannot tell
 // which side is wrong.
+//
+// A zero baseline means the caller established that there is no committed
+// artifact to compare against. It is not a way to skip the comparison when the
+// baseline read failed: PreviousInventoryCount returns an error in that case
+// rather than zero, so a failed read cannot arrive here as "no previous
+// artifact". A negative baseline is a caller error and is refused.
 func checkInventoryReduction(count int, opts InventoryUpdateOptions) error {
-	if opts.AllowLargeReduction || opts.PreviousPrefixCount <= 0 {
+	if opts.AllowLargeReduction {
+		return nil
+	}
+	if opts.PreviousPrefixCount < 0 {
+		return fmt.Errorf("inventory update received a negative previous prefix count (%d)", opts.PreviousPrefixCount)
+	}
+	if opts.PreviousPrefixCount == 0 {
 		return nil
 	}
 	if count*100 >= opts.PreviousPrefixCount*MaxInventoryReductionPercent {
@@ -130,24 +147,86 @@ func checkInventoryReduction(count int, opts InventoryUpdateOptions) error {
 }
 
 // PreviousInventoryCount returns the prefix count an update would be reducing
-// from: the count recorded by the artifact in dir, or — when dir holds no
-// readable record — the count of the committed artifact this build ships.
+// from.
 //
-// The artifact on disk is preferred because it is the file the update would
-// replace. The embedded count is the fallback for a first run or a damaged
-// record, so the comparison is against the committed set rather than silently
-// becoming "no baseline" exactly when the tree is in an unusual state.
-func PreviousInventoryCount(dir string) int {
-	if meta, err := os.ReadFile(InventoryMetaPath(dir)); err == nil {
+// Order: the record in dir, then — when dir holds no record at all — the
+// committed artifact this build ships. A record that exists but cannot be read is
+// NOT treated as "no previous artifact": the count is then measured from the data
+// file in dir, which is the file the update would replace. That independence is
+// the point. The embedded artifact is whatever was checked out when the binary
+// was built, so a damaged record in the tree is also a damaged record inside the
+// binary: the two provenance reads fail together, and falling back from one to
+// the other would report zero exactly when the guard is needed. Reading the data
+// file does not depend on either record.
+//
+// When no count can be established at all — unusable record, unreadable or
+// unmeasurable data file, and no usable shipped set — the result is an error and
+// the caller must leave the artifact untouched.
+func PreviousInventoryCount(dir string) (int, error) {
+	return previousInventoryCount(dir, shippedInventoryCount)
+}
+
+// previousInventoryCount is PreviousInventoryCount with the shipped-set reader
+// injected, so a test can reproduce a build whose embedded artifact is unusable.
+func previousInventoryCount(dir string, shipped func() (int, error)) (int, error) {
+	meta, err := os.ReadFile(InventoryMetaPath(dir))
+	switch {
+	case err == nil:
 		var prov InventoryProvenance
-		if err := json.Unmarshal(meta, &prov); err == nil && prov.PrefixCount > 0 {
-			return prov.PrefixCount
+		if json.Unmarshal(meta, &prov) == nil && prov.PrefixCount > 0 {
+			return prov.PrefixCount, nil
 		}
+		return countCommittedDataFile(dir)
+	case errors.Is(err, fs.ErrNotExist):
+		count, shippedErr := shipped()
+		if shippedErr != nil {
+			return 0, fmt.Errorf("%w: %s holds no record and the shipped inventory is unusable: %v",
+				ErrInventoryBaselineUnavailable, dir, shippedErr)
+		}
+		return count, nil
+	default:
+		return 0, fmt.Errorf("read committed inventory provenance: %w", err)
 	}
-	if shipped, err := ShippedInventory(); err == nil {
-		return shipped.PrefixCount()
+}
+
+// shippedInventoryCount returns the prefix count of the committed artifact this
+// build ships.
+func shippedInventoryCount() (int, error) {
+	shipped, err := ShippedInventory()
+	if err != nil {
+		return 0, err
 	}
-	return 0
+	return shipped.PrefixCount(), nil
+}
+
+// countCommittedDataFile measures the data file in dir. It is the count used when
+// the provenance record is unusable: the data file is the thing the update would
+// replace, and reading it does not depend on the record that failed.
+func countCommittedDataFile(dir string) (int, error) {
+	body, err := os.ReadFile(InventoryDataPath(dir))
+	if err != nil {
+		return 0, fmt.Errorf("%w: the record in %s is unusable and the committed data file cannot be read: %v",
+			ErrInventoryBaselineUnavailable, dir, err)
+	}
+	count, err := countInventoryPrefixes(body)
+	if err != nil {
+		return 0, fmt.Errorf("%w: the record in %s is unusable and the committed data file cannot be measured: %v",
+			ErrInventoryBaselineUnavailable, dir, err)
+	}
+	return count, nil
+}
+
+// countInventoryPrefixes counts the distinct prefixes of a data body without
+// applying the update-path acceptance rules. A baseline measures the committed
+// file as it stands; it is not a candidate for acceptance, so the absolute floor
+// and the canonical-form and markup rules do not apply to it.
+func countInventoryPrefixes(body []byte) (int, error) {
+	src := Source{ID: "ru-inventory-baseline", Format: FormatIPv4, BareDomainMode: DomainModeExact}
+	parsed, _, err := Parse(context.Background(), bytes.NewReader(body), src, DefaultParseLimits())
+	if err != nil {
+		return 0, err
+	}
+	return len(distinctMaskedPrefixes(parsed.CIDRs)), nil
 }
 
 // WriteInventoryArtifact replaces the committed data and provenance files in dir

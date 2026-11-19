@@ -197,3 +197,78 @@ func TestRunUsesDirectoryArtifactAsBaseline(t *testing.T) {
 		t.Fatalf("a growing feed was refused: %v", err)
 	}
 }
+
+// A damaged provenance record must not disable the truncation guard: the count
+// can be measured from the committed data file, which is the file the update
+// would replace.
+func TestRunUsesDataFileWhenRecordIsDamaged(t *testing.T) {
+	dir := t.TempDir()
+	base := "-dir " + dir + " -url https://example.invalid/ru.zone -retrieved 2026-11-19"
+	if _, err := runTool(t, zone(3000), base+" -allow-large-reduction"); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	seeded, err := os.ReadFile(policy.InventoryDataPath(dir))
+	if err != nil {
+		t.Fatalf("read seeded data: %v", err)
+	}
+	if err := os.WriteFile(policy.InventoryMetaPath(dir), []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("damage the record: %v", err)
+	}
+
+	_, err = runTool(t, zone(1200), base)
+	if !errors.Is(err, policy.ErrInventoryLargeReduction) {
+		t.Fatalf("error = %v, want %v", err, policy.ErrInventoryLargeReduction)
+	}
+	for _, want := range []string{"1200", "3000", "-" + policy.InventoryLargeReductionFlag} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("message %q does not name %q", err, want)
+		}
+	}
+	after, err := os.ReadFile(policy.InventoryDataPath(dir))
+	if err != nil {
+		t.Fatalf("read data after the refused run: %v", err)
+	}
+	if !bytes.Equal(seeded, after) {
+		t.Fatal("a refused run modified the committed data")
+	}
+}
+
+// When neither the record nor the data file yields a count, the run is refused
+// with the artifact left exactly as it was: the guard is never skipped for want
+// of a baseline.
+func TestRunRefusesWhenNoBaselineCanBeEstablished(t *testing.T) {
+	dir := t.TempDir()
+	base := "-dir " + dir + " -url https://example.invalid/ru.zone -retrieved 2026-11-19"
+	if _, err := runTool(t, zone(3000), base+" -allow-large-reduction"); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	if err := os.WriteFile(policy.InventoryMetaPath(dir), []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("damage the record: %v", err)
+	}
+	broken := []byte("not a prefix list\n")
+	if err := os.WriteFile(policy.InventoryDataPath(dir), broken, 0o600); err != nil {
+		t.Fatalf("damage the data file: %v", err)
+	}
+
+	_, err := runTool(t, zone(1200), base)
+	if !errors.Is(err, policy.ErrInventoryBaselineUnavailable) {
+		t.Fatalf("error = %v, want %v", err, policy.ErrInventoryBaselineUnavailable)
+	}
+	if !strings.Contains(err.Error(), "committed inventory left unchanged") {
+		t.Fatalf("message %q does not tell the operator the artifact was kept", err)
+	}
+	after, err := os.ReadFile(policy.InventoryDataPath(dir))
+	if err != nil {
+		t.Fatalf("read data after the refused run: %v", err)
+	}
+	if !bytes.Equal(broken, after) {
+		t.Fatal("a refused run replaced the damaged data file")
+	}
+	record, err := os.ReadFile(policy.InventoryMetaPath(dir))
+	if err != nil {
+		t.Fatalf("read record after the refused run: %v", err)
+	}
+	if string(record) != "{not json" {
+		t.Fatalf("a refused run replaced the damaged record: %q", record)
+	}
+}
