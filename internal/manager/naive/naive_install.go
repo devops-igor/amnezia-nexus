@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/devops-igor/amnezia-nexus/internal/manager/containerlog"
 	"github.com/devops-igor/amnezia-nexus/internal/manager/ssh"
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 )
@@ -315,7 +316,10 @@ func pullCaddyImage(ctx context.Context, client ssh.SSHClient) error {
 // The image is pulled by digest, so a compromised or mis-tagged registry entry
 // cannot substitute different content: the pull fails instead. One retry covers
 // a transient registry blip without turning a real failure into a slow one.
-func (m *NaiveManager) pullAndLaunchContainer(ctx context.Context, client ssh.SSHClient) error {
+//
+// disableContainerLog is the operator's explicit opt-out from keeping the
+// container's own log; left false the log stays readable and size-capped.
+func (m *NaiveManager) pullAndLaunchContainer(ctx context.Context, client ssh.SSHClient, disableContainerLog bool) error {
 	if err := pullCaddyImage(ctx, client); err != nil {
 		return err
 	}
@@ -330,7 +334,7 @@ func (m *NaiveManager) pullAndLaunchContainer(ctx context.Context, client ssh.SS
 --name %s \
 --restart unless-stopped \
 --network host \
---log-driver none \
+%s \
 --tmpfs /tmp:rw,noexec,nosuid,size=16m \
 --tmpfs /run:rw,noexec,nosuid,size=16m \
 -v %s:/etc/caddy:ro \
@@ -338,6 +342,7 @@ func (m *NaiveManager) pullAndLaunchContainer(ctx context.Context, client ssh.SS
 -v %s:/data \
 %s`,
 		ssh.EscapeShellArg(NaiveContainerName),
+		containerlog.RunArgs(disableContainerLog),
 		ssh.EscapeShellArg(NaiveConfigDir),
 		ssh.EscapeShellArg(NaiveWWWDir),
 		ssh.EscapeShellArg(NaiveDataVolume),
@@ -430,7 +435,8 @@ func (m *NaiveManager) Install(ctx context.Context, server *models.Server, param
 	}
 
 	// 6. Build and launch amnezia-caddy container
-	if err := m.pullAndLaunchContainer(ctx, client); err != nil {
+	disableContainerLog, _ := params[containerlog.DisableParam].(bool)
+	if err := m.pullAndLaunchContainer(ctx, client, disableContainerLog); err != nil {
 		return err
 	}
 
