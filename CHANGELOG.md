@@ -7,13 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-- Backup export no longer carries panel or authentication credentials: the JSON download previously set `X-Backup-Credentials-Excluded: true` while including the decrypted TLS private key, the portal VPN private key (`server_private_key`, encrypted at rest but still a credential), the AWG header-protection key, Telegram bot tokens, the Gigahost API key, every user's share bearer token, AWG 3.1 backend header-protection keys stored in server protocol metadata (under `HeaderProtectionKey`, `header_protection_key` and `hpkey`), and — for administrators — VLESS authentication UUIDs and names derived from them. Secrets are now omitted recursively from both settings and server protocol metadata, including future `*_private_key` / `*_api_key` / `*_secret` / `*_token` / `*_password` fields (#343).
+## [2.6.0] - Meridian - 2026-11-19
+
+A release centred on the Settings experience, together with policy routing gains, a credential-free backup export, and lower-level VPN and test-infrastructure fixes.
+
+### Added
+- Multi-protocol backends: Xray and NaiveProxy remote protocol managers with a REALITY SNI scanner and portal UI, a generalized backend tunnel schema, Naive installation from a pinned prebuilt Caddy image, and a pure-Go NaiveProxy HTTP/2 and HTTP/3 client dialer with a CONNECT prober.
+- Gigahost hosting inside the panel: datacenter placement chosen on the Settings page, durable VPS setup with an automatic policy that is off by default and enforced at every effect boundary, host identity pinned on first contact, hourly orders pinned to a documented datacenter, and interactive order status refreshing every 30 seconds.
+- Client routing diagnostics: recorded terminal DNS query events, retained per-client route state, correlated flow decisions, attempted DNS names on uncorrelated flows, and a per-client diagnosis answer that states its own evidence gap (#862).
+- Forwarder visibility: PROXY return-direction observation, per-flow decision and dispatch evidence, oversized-return attribution to the direct or backend producer, and bounded per-client pre-flow refusals.
+- Encrypted upstream resolver editor in Settings, with DNS-over-HTTPS and DNS-over-TLS upstreams carried through policy (#862).
+- Ingress dispatch to proxy or direct WAN, with admission onto canary-proven backends.
+- Per-card Settings saving: every card commits its own fields from a control inside it, shows an unsaved-changes badge and reports success or failure within that card, replacing the single page-level button (#884, #888).
+- Rebuilt Settings layout: two equal columns above 1024 px and one below, one heading outline, one two-step button scale, and no inline layout styles left in any settings template (#884, #887).
+- Upstream policy aggregation with a never-proxy guard and operator-managed local entries, VK domains treated as direct, and editable exclusion lists (#883, #892, #894).
+- Durable Gotify delivery with authoritative notification producers (#785).
 
 ### Changed
+- DNS and forwarding behaviour was tightened across the range: replies for expired direct-flow incarnations are refused, oversized direct TCP returns are normalized to the client MTU, mixed DNS admission is repaired with panel overload reported, and policy attribution identity survives a restart.
+- The Settings page and the settings API are now Admin-only. The Support role keeps ordinary backup downloads and still receives no administrator-only policy records (#893, #909).
+- Settings saves write only the sections a request carries. An omitted section is left as stored instead of being reset, and credential material that cannot be decrypted refuses the save with a recoverable error instead of being overwritten (#888).
+- Static asset URLs now carry the build version automatically, so a browser holding an older controller cannot run it against newer markup (#896, #902).
 - Backup payload gains `format_version` (`0`/absent = legacy export that may contain decrypted secrets, `2` = credential-free). Restore rejects a newer format with `400 unsupported_backup_format`, overlays settings on the live values so a redacted backup cannot blank the TLS key or bot token, and writes a tokenless share disabled instead of half-enabled.
-- Restore keeps the TLS identity coherent: a backup that does not supply **both** the certificate and its private key leaves the live pair untouched, because a certificate from the backup over the live key is a mismatched pair that `tls.X509KeyPair` rejects at the next listener start.
-- Migration: a legacy backup restores unchanged on a version-2 panel. A version-2 backup must not be restored on a pre-#343 panel — that panel ignores `format_version` and would write the settings map without its secrets. Regenerate the export before downgrading. AWG and other connection identifiers remain in the payload: they are connection identity. VLESS UUIDs are authentication credentials and are redacted for every role, so restored VLESS connections have no usable client identity until they are re-provisioned; the secret-bearing recovery format that would carry them is tracked by epic #341 (#343).
+- Restore keeps the TLS identity coherent: a backup that does not supply both the certificate and its private key leaves the live pair untouched, because a certificate from the backup over the live key is a mismatched pair that `tls.X509KeyPair` rejects at the next listener start.
+- Migration: a legacy backup restores unchanged on a version-2 panel. A version-2 backup must not be restored on a pre-#343 panel, which ignores `format_version` and would write the settings map without its secrets. Regenerate the export before downgrading. VLESS UUIDs are authentication credentials and are redacted for every role, so restored VLESS connections have no usable client identity until they are re-provisioned (#343).
+
+### Fixed
+- The Settings page no longer renders stored credentials into its HTML. Telegram bot tokens, the alternate token, and TLS key and certificate text are withheld for every role, matching the API (#897).
+- Keyboard focus is visible again. An undefined colour token had invalidated the outline rule, so the indicator had been silently absent on every page loading the shared stylesheet (#902).
+- Hint text and script-rendered status text in Settings now meet 4.5:1 contrast in both themes, where they previously measured 2.95:1 and 2.56:1 (#902).
+- A settings card can commit the values it loaded even when a stored value would not satisfy its own markup, while a value the operator types is still validated (#888).
+- DEV end-to-end verification now names the step that actually failed, distinguishes a stalled container start from an architecture problem, and tolerates the runner's demonstrated stalls without weakening the fail-closed data-plane requirement (#911).
+- Failover retries when self-healing is disabled, and pending failovers are retried instead of waiting for the next self-heal pass (#903).
+
+### Security
+- Backup export no longer carries panel or authentication credentials: the JSON download previously set `X-Backup-Credentials-Excluded: true` while including the decrypted TLS private key, the portal VPN private key (`server_private_key`, encrypted at rest but still a credential), the AWG header-protection key, Telegram bot tokens, the Gigahost API key, every user's share bearer token, AWG 3.1 backend header-protection keys stored in server protocol metadata (under `HeaderProtectionKey`, `header_protection_key` and `hpkey`), and, for administrators, VLESS authentication UUIDs and names derived from them. Secrets are now omitted recursively from both settings and server protocol metadata, including future `*_private_key` / `*_api_key` / `*_secret` / `*_token` / `*_password` fields (#343).
+- The Settings page no longer discloses stored credentials to a lower-privileged role, and the settings API accepts only the Admin role (#897, #909).
 
 ## [2.5.0] - Eclipse - 2026-10-24
 
