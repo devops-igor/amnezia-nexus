@@ -11,29 +11,69 @@ import (
 // This file owns the maintenance entry point for the committed Russian
 // inventory (issue #919). It is not used at runtime.
 //
-// The ordering is the guarantee that matters most: a body is fully validated and
-// its provenance record rendered BEFORE any file is touched, so a rejected
-// update — a captive portal response, a truncated download, a body with one bad
-// line — leaves the previously committed artifact exactly as it was. Each file
-// is then replaced atomically on its own. The two renames are separate, so a run
-// that dies between them leaves a mixed pair, which the loader refuses rather
-// than serving; WriteInventoryArtifact states that contract and the recovery.
+// Two rules live here, and both answer the same class of failure — a feed that
+// is well formed but wrong:
 //
-// A written artifact is re-verified by the loader (count and digest are derived
-// from the bytes), which is why this file does not need its own verification
-// pass: a mismatch is refused when the artifact is loaded rather than trusted
-// here.
+//   - Ordering: a body is fully validated, its provenance rendered and its size
+//     compared against the artifact it would replace BEFORE any file is touched,
+//     so a rejected update — a captive portal response, a truncated download, a
+//     body with one bad line — leaves the previously committed artifact exactly
+//     as it was.
+//   - Each file is then replaced atomically on its own. The two renames are
+//     separate, so a run that dies between them leaves a mixed pair, which the
+//     loader refuses rather than serving; WriteInventoryArtifact states that
+//     contract and the recovery.
+//
+// A written artifact is re-verified by the loader (count, digest and notice are
+// all derived from the bytes that ship), which is why this file does not need its
+// own verification pass: a mismatch is refused when the artifact is loaded rather
+// than trusted here.
+
+// Bounds and names for the size comparison.
+const (
+	// MaxInventoryReductionPercent is the largest drop in prefix count an update
+	// may make without an explicit maintenance decision.
+	//
+	// The absolute floor in inventory.go cannot catch this failure: a feed that
+	// is truncated mid-download but still well formed can hold a few thousand
+	// well-formed prefixes and pass a 1,024-prefix floor while removing most of
+	// the Russian allocation from classification. Comparing against the count of
+	// the artifact being replaced is what catches it. Fifty percent matches the
+	// shrink guard the policy syncer already applies to downloaded rule sets, so
+	// the repository has one reduction rule rather than two.
+	MaxInventoryReductionPercent = 50
+
+	// InventoryLargeReductionFlag is the maintenance flag that accepts a
+	// deliberate large reduction. It is named here so that the rejection message
+	// and the flag the command registers cannot drift apart.
+	InventoryLargeReductionFlag = "allow-large-reduction"
+)
+
+// InventoryUpdateOptions carries the maintenance decisions for one regeneration.
+type InventoryUpdateOptions struct {
+	// PreviousPrefixCount is the prefix count of the committed artifact this
+	// update replaces, from PreviousInventoryCount. Zero means there is no
+	// previous artifact, so only the absolute floor applies.
+	PreviousPrefixCount int
+	// AllowLargeReduction accepts a body that would keep fewer than
+	// MaxInventoryReductionPercent of those prefixes. It is the explicit
+	// maintenance decision for a genuine change, not a way to skip validation.
+	AllowLargeReduction bool
+}
 
 // ValidateInventoryUpdate validates body as the committed zone and returns the
 // complete provenance record with its committed JSON rendering. It writes
 // nothing, which is what a dry run reports.
 //
 // prov supplies the descriptive fields (source, source URL, retrieval date,
-// license, notes); the prefix count and digest are always derived from body, so
-// a caller cannot record metadata that disagrees with the data it commits.
-func ValidateInventoryUpdate(body []byte, prov InventoryProvenance) (InventoryProvenance, []byte, error) {
+// license, notes); the prefix count, data digest and notice digest are always
+// derived, so a caller cannot record metadata that disagrees with what ships.
+func ValidateInventoryUpdate(body []byte, prov InventoryProvenance, opts InventoryUpdateOptions) (InventoryProvenance, []byte, error) {
 	inv, err := InventoryFromBody(body)
 	if err != nil {
+		return InventoryProvenance{}, nil, err
+	}
+	if err := checkInventoryReduction(inv.PrefixCount(), opts); err != nil {
 		return InventoryProvenance{}, nil, err
 	}
 
@@ -43,13 +83,11 @@ func ValidateInventoryUpdate(body []byte, prov InventoryProvenance) (InventoryPr
 	record.Source = prov.Source
 	record.SourceURL = prov.SourceURL
 	record.RetrievedAt = prov.RetrievedAt
+	record.NoticeFile = ShippedInventoryNoticeFile
+	record.NoticeSHA256 = NoticeDigest()
 	record.License = prov.License
 	record.Notes = prov.Notes
-
-	if record.Source == "" || record.SourceURL == "" {
-		return InventoryProvenance{}, nil, errors.New("inventory provenance requires a source name and source URL")
-	}
-	if _, err := record.retrievedTime(); err != nil {
+	if err := record.validateForWrite(); err != nil {
 		return InventoryProvenance{}, nil, err
 	}
 
@@ -58,6 +96,58 @@ func ValidateInventoryUpdate(body []byte, prov InventoryProvenance) (InventoryPr
 		return InventoryProvenance{}, nil, fmt.Errorf("render inventory provenance: %w", err)
 	}
 	return record, append(meta, '\n'), nil
+}
+
+// validateForWrite checks that a record describes an artifact that can be
+// committed: a named source, a real retrieval date, and the copyright notice
+// this build actually ships.
+func (p InventoryProvenance) validateForWrite() error {
+	if p.Source == "" || p.SourceURL == "" {
+		return errors.New("inventory provenance requires a source name and source URL")
+	}
+	if _, err := p.retrievedTime(); err != nil {
+		return err
+	}
+	if p.NoticeSHA256 == "" || p.NoticeSHA256 != NoticeDigest() {
+		return errors.New("inventory provenance must record the shipped copyright notice")
+	}
+	return nil
+}
+
+// checkInventoryReduction refuses a body that would drop too much of the
+// committed set unless the operator asked for that. The message names both
+// counts and the flag, because an operator who sees only one number cannot tell
+// which side is wrong.
+func checkInventoryReduction(count int, opts InventoryUpdateOptions) error {
+	if opts.AllowLargeReduction || opts.PreviousPrefixCount <= 0 {
+		return nil
+	}
+	if count*100 >= opts.PreviousPrefixCount*MaxInventoryReductionPercent {
+		return nil
+	}
+	return fmt.Errorf("%w: body holds %d prefixes, the committed artifact holds %d; keeping fewer than %d%% is refused as a truncated feed unless -%s is passed",
+		ErrInventoryLargeReduction, count, opts.PreviousPrefixCount, MaxInventoryReductionPercent, InventoryLargeReductionFlag)
+}
+
+// PreviousInventoryCount returns the prefix count an update would be reducing
+// from: the count recorded by the artifact in dir, or — when dir holds no
+// readable record — the count of the committed artifact this build ships.
+//
+// The artifact on disk is preferred because it is the file the update would
+// replace. The embedded count is the fallback for a first run or a damaged
+// record, so the comparison is against the committed set rather than silently
+// becoming "no baseline" exactly when the tree is in an unusual state.
+func PreviousInventoryCount(dir string) int {
+	if meta, err := os.ReadFile(InventoryMetaPath(dir)); err == nil {
+		var prov InventoryProvenance
+		if err := json.Unmarshal(meta, &prov); err == nil && prov.PrefixCount > 0 {
+			return prov.PrefixCount
+		}
+	}
+	if shipped, err := ShippedInventory(); err == nil {
+		return shipped.PrefixCount()
+	}
+	return 0
 }
 
 // WriteInventoryArtifact replaces the committed data and provenance files in dir

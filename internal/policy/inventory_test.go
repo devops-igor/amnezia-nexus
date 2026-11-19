@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -213,12 +214,14 @@ func TestCommittedInventoryProvenanceIsVerified(t *testing.T) {
 	}
 
 	mutations := map[string]func(*InventoryProvenance){
-		"prefix_count": func(p *InventoryProvenance) { p.PrefixCount++ },
-		"digest":       func(p *InventoryProvenance) { p.SHA256 = strings.Repeat("0", 64) },
-		"schema":       func(p *InventoryProvenance) { p.SchemaVersion = 99 },
-		"kind":         func(p *InventoryProvenance) { p.Kind = "some_other_list" },
-		"date":         func(p *InventoryProvenance) { p.RetrievedAt = "19.11.2026" },
-		"no_date":      func(p *InventoryProvenance) { p.RetrievedAt = "" },
+		"prefix_count":   func(p *InventoryProvenance) { p.PrefixCount++ },
+		"digest":         func(p *InventoryProvenance) { p.SHA256 = strings.Repeat("0", 64) },
+		"schema":         func(p *InventoryProvenance) { p.SchemaVersion = 99 },
+		"kind":           func(p *InventoryProvenance) { p.Kind = "some_other_list" },
+		"date":           func(p *InventoryProvenance) { p.RetrievedAt = "19.11.2026" },
+		"no_date":        func(p *InventoryProvenance) { p.RetrievedAt = "" },
+		"notice_digest":  func(p *InventoryProvenance) { p.NoticeSHA256 = strings.Repeat("0", 64) },
+		"notice_missing": func(p *InventoryProvenance) { p.NoticeSHA256 = "" },
 	}
 	for name, mutate := range mutations {
 		t.Run(name, func(t *testing.T) {
@@ -248,6 +251,138 @@ func TestCommittedInventoryProvenanceIsVerified(t *testing.T) {
 	}
 }
 
+// The redistribution terms require the upstream notice to be kept intact and
+// distributed with the zone files. This proves it is committed, embedded, and
+// named by the record the loader enforces.
+func TestCommittedInventoryShipsTheUpstreamNotice(t *testing.T) {
+	notice := InventoryNotice()
+	if len(notice) == 0 {
+		t.Fatal("no copyright notice ships with the inventory")
+	}
+	for _, want := range []string{
+		"IPDENY.COM COPYRIGHT NOTICE",
+		"THIS COPYRIGHT.TXT FILE INTACT AND DISTRIBUTE IT WITH OUR",
+		"APNIC, LACNIC, ARIN, AFRINIC and RIPE IP databases",
+	} {
+		if !bytes.Contains(notice, []byte(want)) {
+			t.Fatalf("shipped notice does not contain %q", want)
+		}
+	}
+
+	onDisk, err := os.ReadFile(filepath.Join("inventory", ShippedInventoryNoticeFile))
+	if err != nil {
+		t.Fatalf("committed notice is missing: %v", err)
+	}
+	if !bytes.Equal(onDisk, notice) {
+		t.Fatal("the committed notice differs from the one the binary ships")
+	}
+	if got := NoticeDigest(); got != digestHex(notice) {
+		t.Fatalf("NoticeDigest = %q, want the notice's own digest", got)
+	}
+
+	prov := mustShippedInventory(t).Provenance()
+	if prov.NoticeFile != ShippedInventoryNoticeFile || prov.NoticeSHA256 != NoticeDigest() {
+		t.Fatalf("provenance does not name the shipped notice: file %q digest %q", prov.NoticeFile, prov.NoticeSHA256)
+	}
+	license := strings.ToLower(prov.License)
+	if strings.Contains(license, "freely redistributable") {
+		t.Fatalf("license metadata still calls the data freely redistributable: %q", prov.License)
+	}
+	if !strings.Contains(license, "kept intact") || !strings.Contains(license, "distributed") {
+		t.Fatalf("license metadata does not state the redistribution condition: %q", prov.License)
+	}
+}
+
+// A feed truncated mid-download is well formed and can clear the absolute floor,
+// so the update path also compares against the artifact it would replace.
+func TestInventoryUpdateRefusesLargeReduction(t *testing.T) {
+	shipped := mustShippedInventory(t)
+	committed := dataLines(committedInventoryData(t))
+	prov := InventoryProvenance{
+		Source:      "ipdeny",
+		SourceURL:   "https://example.invalid/ru-aggregated.zone",
+		RetrievedAt: "2026-11-19",
+	}
+	baseline := InventoryUpdateOptions{PreviousPrefixCount: shipped.PrefixCount()}
+	subset := []byte(strings.Join(committed[:1200], "\n") + "\n")
+
+	_, _, err := ValidateInventoryUpdate(subset, prov, baseline)
+	if !errors.Is(err, ErrInventoryLargeReduction) {
+		t.Fatalf("error = %v, want %v", err, ErrInventoryLargeReduction)
+	}
+	for _, want := range []string{"1200", fmt.Sprintf("%d", shipped.PrefixCount()), "-" + InventoryLargeReductionFlag} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("rejection message %q does not name %q", err, want)
+		}
+	}
+
+	// The explicit maintenance decision accepts the same body.
+	allowed := baseline
+	allowed.AllowLargeReduction = true
+	record, _, err := ValidateInventoryUpdate(subset, prov, allowed)
+	if err != nil {
+		t.Fatalf("large reduction with the flag: %v", err)
+	}
+	if record.PrefixCount != 1200 {
+		t.Fatalf("accepted record holds %d prefixes, want 1200", record.PrefixCount)
+	}
+
+	// Exactly half is not fewer than half: the boundary is inclusive.
+	half := syntheticZone(shipped.PrefixCount() / 2)
+	if _, _, err := ValidateInventoryUpdate(half, prov, baseline); err != nil {
+		t.Fatalf("a body holding exactly half the committed prefixes was refused: %v", err)
+	}
+
+	// A genuine growth passes without a flag.
+	grown := append(append([]byte{}, committedInventoryData(t)...), syntheticZone(50)...)
+	if _, _, err := ValidateInventoryUpdate(grown, prov, baseline); err != nil {
+		t.Fatalf("a growing feed was refused: %v", err)
+	}
+
+	// The absolute floor still reports on its own when the body is tiny.
+	if _, _, err := ValidateInventoryUpdate(syntheticZone(100), prov, baseline); !errors.Is(err, ErrInventoryNotPrefixList) {
+		t.Fatalf("error = %v, want %v for a body below the floor", err, ErrInventoryNotPrefixList)
+	}
+}
+
+// The truncation guard compares against the artifact an update would replace.
+// When that record is unavailable it must not silently become "no baseline".
+func TestPreviousInventoryCount(t *testing.T) {
+	dir := t.TempDir()
+	shipped := mustShippedInventory(t)
+
+	// An empty directory falls back to the committed set this build ships.
+	if got := PreviousInventoryCount(dir); got != shipped.PrefixCount() {
+		t.Fatalf("PreviousInventoryCount(empty dir) = %d, want the shipped %d", got, shipped.PrefixCount())
+	}
+
+	// A record in the directory wins over the embedded count.
+	prov := InventoryProvenance{
+		Source:      "ipdeny",
+		SourceURL:   "https://example.invalid/ru-aggregated.zone",
+		RetrievedAt: "2026-11-19",
+	}
+	body := syntheticZone(1200)
+	_, meta, err := ValidateInventoryUpdate(body, prov, InventoryUpdateOptions{AllowLargeReduction: true})
+	if err != nil {
+		t.Fatalf("ValidateInventoryUpdate: %v", err)
+	}
+	if err := WriteInventoryArtifact(dir, body, meta); err != nil {
+		t.Fatalf("WriteInventoryArtifact: %v", err)
+	}
+	if got := PreviousInventoryCount(dir); got != 1200 {
+		t.Fatalf("PreviousInventoryCount(dir with artifact) = %d, want 1200", got)
+	}
+
+	// A damaged record falls back to the shipped count rather than to zero.
+	if err := os.WriteFile(InventoryMetaPath(dir), []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("damage the record: %v", err)
+	}
+	if got := PreviousInventoryCount(dir); got != shipped.PrefixCount() {
+		t.Fatalf("PreviousInventoryCount(damaged record) = %d, want the shipped %d", got, shipped.PrefixCount())
+	}
+}
+
 func TestRejectedUpdateLeavesCommittedArtifactIntact(t *testing.T) {
 	dir := t.TempDir()
 	prov := InventoryProvenance{
@@ -256,7 +391,7 @@ func TestRejectedUpdateLeavesCommittedArtifactIntact(t *testing.T) {
 		RetrievedAt: "2026-11-19",
 	}
 	good := syntheticZone(1200)
-	record, meta, err := ValidateInventoryUpdate(good, prov)
+	record, meta, err := ValidateInventoryUpdate(good, prov, InventoryUpdateOptions{})
 	if err != nil {
 		t.Fatalf("ValidateInventoryUpdate: %v", err)
 	}
@@ -277,7 +412,7 @@ func TestRejectedUpdateLeavesCommittedArtifactIntact(t *testing.T) {
 
 	// The tool validates before it writes, so a rejected body never reaches
 	// WriteInventoryArtifact. This is that sequence with a captive-portal body.
-	if _, _, err := ValidateInventoryUpdate([]byte("<!DOCTYPE html><html>Login</html>"), prov); !errors.Is(err, ErrInventoryNotPrefixList) {
+	if _, _, err := ValidateInventoryUpdate([]byte("<!DOCTYPE html><html>Login</html>"), prov, InventoryUpdateOptions{}); !errors.Is(err, ErrInventoryNotPrefixList) {
 		t.Fatalf("ValidateInventoryUpdate error = %v, want %v", err, ErrInventoryNotPrefixList)
 	}
 	afterData, err := os.ReadFile(InventoryDataPath(dir))
@@ -314,7 +449,7 @@ func TestMixedInventoryPairIsRefusedAndRerunRestoresCoherence(t *testing.T) {
 		RetrievedAt: "2026-11-19",
 	}
 	first := syntheticZone(1200)
-	_, firstMeta, err := ValidateInventoryUpdate(first, prov)
+	_, firstMeta, err := ValidateInventoryUpdate(first, prov, InventoryUpdateOptions{})
 	if err != nil {
 		t.Fatalf("ValidateInventoryUpdate: %v", err)
 	}
@@ -342,7 +477,7 @@ func TestMixedInventoryPairIsRefusedAndRerunRestoresCoherence(t *testing.T) {
 
 	// Re-running the tool is the documented recovery: both files come from one
 	// generation, so the pair is coherent again.
-	record, rerunMeta, err := ValidateInventoryUpdate(second, prov)
+	record, rerunMeta, err := ValidateInventoryUpdate(second, prov, InventoryUpdateOptions{})
 	if err != nil {
 		t.Fatalf("ValidateInventoryUpdate on re-run: %v", err)
 	}
@@ -377,10 +512,10 @@ func TestWriteInventoryArtifactRequiresWritableDirectory(t *testing.T) {
 }
 
 func TestValidateInventoryUpdateRequiresProvenanceSource(t *testing.T) {
-	if _, _, err := ValidateInventoryUpdate(syntheticZone(1200), InventoryProvenance{RetrievedAt: "2026-11-19"}); err == nil {
+	if _, _, err := ValidateInventoryUpdate(syntheticZone(1200), InventoryProvenance{RetrievedAt: "2026-11-19"}, InventoryUpdateOptions{}); err == nil {
 		t.Fatal("ValidateInventoryUpdate accepted a provenance record with no source or URL")
 	}
-	if _, _, err := ValidateInventoryUpdate(syntheticZone(1200), InventoryProvenance{Source: "ipdeny", SourceURL: "https://example.invalid/x"}); err == nil {
+	if _, _, err := ValidateInventoryUpdate(syntheticZone(1200), InventoryProvenance{Source: "ipdeny", SourceURL: "https://example.invalid/x"}, InventoryUpdateOptions{}); err == nil {
 		t.Fatal("ValidateInventoryUpdate accepted a provenance record with no retrieval date")
 	}
 }
@@ -501,6 +636,52 @@ func TestParseInventoryOverrideControls(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if _, err := ParseInventoryOverride(body); err == nil {
 				t.Fatalf("ParseInventoryOverride accepted %q", string(body))
+			}
+		})
+	}
+}
+
+// A mistyped address is a syntactically valid domain, so the mixed parser would
+// otherwise file it as an inert domain rule and the operator would see their
+// prefix silently missing. The rule is narrow: digits and dots, with an optional
+// /digits mask, must parse as IPv4 or be refused. Genuine names keep working.
+func TestParseInventoryOverrideRejectsDottedNumericTokens(t *testing.T) {
+	for _, token := range []string{"203.0.113.999", "999.0.0.1", "1.2.3.4/33", "1.2.3", "300.1.1.1"} {
+		t.Run("reject_"+strings.ReplaceAll(token, ".", "_"), func(t *testing.T) {
+			// One valid prefix ahead of the bad token: the body is refused whole.
+			_, err := ParseInventoryOverride([]byte("198.51.100.0/24\n" + token + "\n"))
+			if err == nil {
+				t.Fatalf("%q was accepted as an override entry", token)
+			}
+			if !strings.Contains(err.Error(), "looks like an IPv4 address") {
+				t.Fatalf("error %v does not explain that %q is a bad address", err, token)
+			}
+		})
+	}
+
+	accepted := []struct {
+		token      string
+		addsPrefix bool
+	}{
+		{"example.com", false},
+		{"*.example.com", false},
+		{".example.com", false},
+		{"123.example.com", false},
+		{"10.0.0.1", true},
+		{"10.0.0.0/8", true},
+	}
+	for _, c := range accepted {
+		t.Run("accept_"+strings.ReplaceAll(c.token, ".", "_"), func(t *testing.T) {
+			override, err := ParseInventoryOverride([]byte("198.51.100.0/24\n" + c.token + "\n"))
+			if err != nil {
+				t.Fatalf("%q was rejected: %v", c.token, err)
+			}
+			want := 1
+			if c.addsPrefix {
+				want = 2
+			}
+			if override.PrefixCount() != want {
+				t.Fatalf("%q gave %d prefixes, want %d", c.token, override.PrefixCount(), want)
 			}
 		})
 	}

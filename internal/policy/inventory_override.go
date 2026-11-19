@@ -88,6 +88,13 @@ func ParseInventoryOverride(body []byte) (*InventoryOverride, error) {
 // "not-a-prefix" as a domain rule and silently drop it from the address set,
 // which is exactly the typo an operator needs to hear about. Explicit suffix and
 // wildcard forms have no dot in their base either, so they are exempt.
+//
+// A dotted-numeric token gets its own rejection: "203.0.113.999" is a mistyped
+// address, but a dotted token is a syntactically valid domain, so without this
+// rule the parser would file it as an inert domain rule and the operator would
+// see the prefix silently missing from their override. Only the shape is judged
+// here — digits and dots, with an optional /digits mask — never general domain
+// syntax.
 func validateOverrideLines(body []byte) error {
 	for i, raw := range strings.Split(string(body), "\n") {
 		line := strings.TrimSpace(raw)
@@ -97,12 +104,57 @@ func validateOverrideLines(body []byte) error {
 		if _, err := ParseIPv4Rule(line); err == nil {
 			continue
 		}
+		if isDottedNumeric(line) {
+			return fmt.Errorf("inventory override line %d: %q looks like an IPv4 address or prefix but is not a valid one", i+1, line)
+		}
 		if strings.HasPrefix(line, "*.") || strings.HasPrefix(line, ".") || strings.Contains(line, ".") {
 			continue
 		}
 		return fmt.Errorf("inventory override line %d: %q is neither an IPv4 prefix nor a domain name", i+1, line)
 	}
 	return nil
+}
+
+// isDottedNumeric reports whether a token has the shape of an IPv4 address or
+// prefix: digits and dots only, optionally followed by / and digits. A token with
+// any other character — a letter, a wildcard, a leading dot — is not this shape
+// and is left to the domain parser.
+func isDottedNumeric(line string) bool {
+	addr := line
+	if slash := strings.IndexByte(addr, '/'); slash >= 0 {
+		mask := addr[slash+1:]
+		addr = addr[:slash]
+		if mask == "" || !allDigits(mask) {
+			return false
+		}
+	}
+	if addr == "" || !allDigitsAndDots(addr) {
+		return false
+	}
+	return strings.Contains(addr, ".")
+}
+
+// allDigits reports whether s is non-empty and holds only ASCII digits.
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// allDigitsAndDots reports whether s holds only ASCII digits and dots.
+func allDigitsAndDots(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if (s[i] < '0' || s[i] > '9') && s[i] != '.' {
+			return false
+		}
+	}
+	return true
 }
 
 // PrefixCount returns the number of distinct prefixes in the override.

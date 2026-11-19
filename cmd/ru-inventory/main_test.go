@@ -31,7 +31,7 @@ func runTool(t *testing.T, body, args string) (string, error) {
 
 func TestRunWritesValidatedArtifact(t *testing.T) {
 	dir := t.TempDir()
-	out, err := runTool(t, zone(1200), "-dir "+dir+" -url https://example.invalid/ru.zone -retrieved 2026-11-19")
+	out, err := runTool(t, zone(1200), "-dir "+dir+" -url https://example.invalid/ru.zone -retrieved 2026-11-19 -allow-large-reduction")
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -56,14 +56,23 @@ func TestRunWritesValidatedArtifact(t *testing.T) {
 	if inv.PrefixCount() != 1200 {
 		t.Fatalf("loaded %d prefixes, want 1200", inv.PrefixCount())
 	}
-	if got := inv.Provenance(); got.SourceURL != "https://example.invalid/ru.zone" || got.Source != "ipdeny" {
+	got := inv.Provenance()
+	if got.SourceURL != "https://example.invalid/ru.zone" || got.Source != "ipdeny" {
 		t.Fatalf("provenance = %+v, want the invocation's source and URL", got)
+	}
+	if got.NoticeFile != policy.ShippedInventoryNoticeFile || got.NoticeSHA256 != policy.NoticeDigest() {
+		t.Fatalf("provenance does not record the shipped notice: file %q digest %q", got.NoticeFile, got.NoticeSHA256)
+	}
+	for _, want := range []string{"notice: Copyrights.txt ", "previous_prefix_count: "} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output does not contain %q:\n%s", want, out)
+		}
 	}
 }
 
 func TestRunRejectsNonPrefixBodyAndKeepsArtifact(t *testing.T) {
 	dir := t.TempDir()
-	args := "-dir " + dir + " -url https://example.invalid/ru.zone -retrieved 2026-11-19"
+	args := "-dir " + dir + " -url https://example.invalid/ru.zone -retrieved 2026-11-19 -allow-large-reduction"
 	if _, err := runTool(t, zone(1200), args); err != nil {
 		t.Fatalf("seed run: %v", err)
 	}
@@ -94,7 +103,7 @@ func TestRunRejectsNonPrefixBodyAndKeepsArtifact(t *testing.T) {
 
 func TestRunDryRunWritesNothing(t *testing.T) {
 	dir := t.TempDir()
-	out, err := runTool(t, zone(1200), "-dir "+dir+" -url https://example.invalid/ru.zone -retrieved 2026-11-19 -dry-run")
+	out, err := runTool(t, zone(1200), "-dir "+dir+" -url https://example.invalid/ru.zone -retrieved 2026-11-19 -dry-run -allow-large-reduction")
 	if err != nil {
 		t.Fatalf("dry run: %v", err)
 	}
@@ -111,10 +120,10 @@ func TestRunDryRunWritesNothing(t *testing.T) {
 
 func TestRunRequiresProvenance(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := runTool(t, zone(1200), "-dir "+dir+" -retrieved 2026-11-19"); err == nil {
+	if _, err := runTool(t, zone(1200), "-dir "+dir+" -retrieved 2026-11-19 -allow-large-reduction"); err == nil {
 		t.Fatal("run accepted an invocation with no source URL")
 	}
-	if _, err := runTool(t, zone(1200), "-dir "+dir+" -url https://example.invalid/ru.zone"); err == nil {
+	if _, err := runTool(t, zone(1200), "-dir "+dir+" -url https://example.invalid/ru.zone -allow-large-reduction"); err == nil {
 		t.Fatal("run accepted an invocation with no retrieval date")
 	}
 }
@@ -122,5 +131,69 @@ func TestRunRequiresProvenance(t *testing.T) {
 func TestRunRejectsPositionalArguments(t *testing.T) {
 	if _, err := runTool(t, zone(1200), "-url https://example.invalid/ru.zone -retrieved 2026-11-19 ru.zone"); err == nil {
 		t.Fatal("run accepted a file argument instead of reading stdin")
+	}
+}
+
+// A well formed but truncated feed clears the absolute floor, so the command
+// compares against the artifact it is about to replace and refuses a large
+// reduction unless the operator asked for one.
+func TestRunRefusesTruncatedFeedWithoutFlag(t *testing.T) {
+	dir := t.TempDir()
+	base := "-dir " + dir + " -url https://example.invalid/ru.zone -retrieved 2026-11-19"
+
+	// The fresh directory holds no record, so this seed is compared against the
+	// committed set this build ships and needs the explicit decision.
+	if _, err := runTool(t, zone(3000), base+" -allow-large-reduction"); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	seeded, err := os.ReadFile(policy.InventoryDataPath(dir))
+	if err != nil {
+		t.Fatalf("read seeded data: %v", err)
+	}
+
+	// 1,200 clears the 1,024 floor but is below half of 3,000: refused, and the
+	// message carries both counts and the flag that overrides it.
+	_, err = runTool(t, zone(1200), base)
+	if !errors.Is(err, policy.ErrInventoryLargeReduction) {
+		t.Fatalf("error = %v, want %v", err, policy.ErrInventoryLargeReduction)
+	}
+	for _, want := range []string{"1200", "3000", "-" + policy.InventoryLargeReductionFlag} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("message %q does not name %q", err, want)
+		}
+	}
+	if !strings.Contains(err.Error(), "committed inventory left unchanged") {
+		t.Fatalf("message %q does not tell the operator the artifact was kept", err)
+	}
+	after, err := os.ReadFile(policy.InventoryDataPath(dir))
+	if err != nil {
+		t.Fatalf("read data after refused run: %v", err)
+	}
+	if !bytes.Equal(seeded, after) {
+		t.Fatal("a refused run modified the committed data")
+	}
+
+	// The same body is accepted as an explicit maintenance decision.
+	if _, err := runTool(t, zone(1200), base+" -allow-large-reduction"); err != nil {
+		t.Fatalf("large reduction with the flag: %v", err)
+	}
+}
+
+// The count compared against is the artifact in the target directory, not the
+// set compiled into this build: 1,800 is below half of the shipped 8,664 but
+// above half of the 3,000 in this directory.
+func TestRunUsesDirectoryArtifactAsBaseline(t *testing.T) {
+	dir := t.TempDir()
+	base := "-dir " + dir + " -url https://example.invalid/ru.zone -retrieved 2026-11-19"
+	if _, err := runTool(t, zone(3000), base+" -allow-large-reduction"); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+
+	if _, err := runTool(t, zone(1800), base); err != nil {
+		t.Fatalf("1800 prefixes over a 3000-prefix artifact should be accepted: %v", err)
+	}
+	// A genuine growth needs no flag.
+	if _, err := runTool(t, zone(2000), base); err != nil {
+		t.Fatalf("a growing feed was refused: %v", err)
 	}
 }

@@ -43,8 +43,15 @@ import (
 // Uncovered addresses are out of scope here: the consumer treats "not a member"
 // as the fail-safe proxy default.
 
-//go:embed inventory/ru-ipv4.txt inventory/ru-ipv4.json
+//go:embed inventory/ru-ipv4.txt inventory/ru-ipv4.json inventory/Copyrights.txt
 var inventoryArtifacts embed.FS
+
+// inventoryNotice is the upstream copyright notice, compiled in so it travels
+// with the data it covers. The redistribution terms require the notice to be
+// kept intact and distributed with the zone files; embedding it is what makes
+// that true for a binary as well as for the repository, and LoadInventory
+// refuses a provenance record that does not name the notice it ships.
+var inventoryNotice, _ = inventoryArtifacts.ReadFile("inventory/" + ShippedInventoryNoticeFile)
 
 const (
 	// InventoryArtifactDir is where the committed artifact lives, relative to
@@ -56,6 +63,10 @@ const (
 	// ShippedInventoryMetaFile records the source, retrieval date and digest of
 	// the data file beside it.
 	ShippedInventoryMetaFile = "ru-ipv4.json"
+	// ShippedInventoryNoticeFile is the upstream copyright notice, committed
+	// verbatim beside the data because the redistribution terms require it to
+	// travel with the zone.
+	ShippedInventoryNoticeFile = "Copyrights.txt"
 
 	// InventorySchemaVersion identifies the provenance record layout. An
 	// unrecognized version is refused rather than half-read.
@@ -88,6 +99,10 @@ var (
 	// describe the committed data: a different prefix count, a different
 	// digest, or an unsupported schema.
 	ErrInventoryProvenanceMismatch = errors.New("inventory provenance does not match the committed data")
+	// ErrInventoryLargeReduction means the body is a well formed prefix list
+	// that would keep far fewer prefixes than the artifact it replaces, which is
+	// what a feed truncated mid-download looks like.
+	ErrInventoryLargeReduction = errors.New("inventory body would greatly reduce the committed set")
 )
 
 // InventorySource names the set that answered a membership question, so a
@@ -121,10 +136,27 @@ type InventoryProvenance struct {
 	PrefixCount int `json:"prefix_count"`
 	// SHA256 is the digest of the data file exactly as committed.
 	SHA256 string `json:"sha256"`
-	// License records the redistribution terms of the feed.
+	// NoticeFile names the upstream copyright notice committed beside the data.
+	// The redistribution terms require it to be kept intact and distributed
+	// with the zone files, so the record names it rather than repeating it.
+	NoticeFile string `json:"notice_file,omitempty"`
+	// NoticeSHA256 is the digest of that notice, so the copy that travels with
+	// the data is the copy this record describes. LoadInventory refuses a
+	// record whose digest does not match the notice it ships.
+	NoticeSHA256 string `json:"notice_sha256,omitempty"`
+	// License states the redistribution terms that actually apply.
 	License string `json:"license,omitempty"`
 	// Notes carries the update procedure for a human reviewer.
 	Notes string `json:"notes,omitempty"`
+}
+
+// InventoryNotice returns a copy of the upstream copyright notice shipped with
+// the inventory. It is committed beside the data and embedded in the binary, so
+// a deployment carries the notice the redistribution terms require.
+func InventoryNotice() []byte {
+	out := make([]byte, len(inventoryNotice))
+	copy(out, inventoryNotice)
+	return out
 }
 
 // retrievedTime parses the recorded retrieval date.
@@ -277,7 +309,8 @@ func digestHex(data []byte) string {
 }
 
 // LoadInventory builds a shipped inventory from a data body and its provenance
-// record, refusing either when the record does not describe the data.
+// record, refusing either when the record does not describe the data or does not
+// name the copyright notice that ships with it.
 func LoadInventory(body, meta []byte) (*Inventory, error) {
 	inv, err := InventoryFromBody(body)
 	if err != nil {
@@ -288,26 +321,48 @@ func LoadInventory(body, meta []byte) (*Inventory, error) {
 	if err := json.Unmarshal(meta, &prov); err != nil {
 		return nil, fmt.Errorf("inventory provenance: %w", err)
 	}
+	if err := inv.adoptProvenance(prov); err != nil {
+		return nil, err
+	}
+	return inv, nil
+}
+
+// adoptProvenance verifies a provenance record against the bytes that were
+// actually parsed and, when it agrees, adopts it.
+//
+// The notice digest is checked here rather than left to a test: the
+// redistribution terms require the notice to travel with the zone, and a record
+// that does not describe the notice this build ships would let a future update
+// replace or drop it unnoticed.
+func (inv *Inventory) adoptProvenance(prov InventoryProvenance) error {
 	if prov.SchemaVersion != InventorySchemaVersion || prov.Kind != InventoryKind {
-		return nil, fmt.Errorf("%w: schema %d kind %q is not the supported %d/%q",
+		return fmt.Errorf("%w: schema %d kind %q is not the supported %d/%q",
 			ErrInventoryProvenanceMismatch, prov.SchemaVersion, prov.Kind, InventorySchemaVersion, InventoryKind)
 	}
 	retrieved, err := prov.retrievedTime()
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInventoryProvenanceMismatch, err)
+		return fmt.Errorf("%w: %w", ErrInventoryProvenanceMismatch, err)
 	}
 	if prov.PrefixCount != inv.shippedCount {
-		return nil, fmt.Errorf("%w: provenance records %d prefixes, committed data holds %d",
+		return fmt.Errorf("%w: provenance records %d prefixes, committed data holds %d",
 			ErrInventoryProvenanceMismatch, prov.PrefixCount, inv.shippedCount)
 	}
 	if prov.SHA256 != inv.prov.SHA256 {
-		return nil, fmt.Errorf("%w: provenance records digest %s, committed data hashes to %s",
+		return fmt.Errorf("%w: provenance records digest %s, committed data hashes to %s",
 			ErrInventoryProvenanceMismatch, prov.SHA256, inv.prov.SHA256)
 	}
-
+	if want := NoticeDigest(); prov.NoticeSHA256 != want {
+		return fmt.Errorf("%w: provenance records notice digest %q, the shipped %s hashes to %s",
+			ErrInventoryProvenanceMismatch, prov.NoticeSHA256, ShippedInventoryNoticeFile, want)
+	}
 	inv.prov = prov
 	inv.retrieved = retrieved
-	return inv, nil
+	return nil
+}
+
+// NoticeDigest returns the SHA-256 of the shipped copyright notice.
+func NoticeDigest() string {
+	return digestHex(inventoryNotice)
 }
 
 var (

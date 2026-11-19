@@ -13,10 +13,18 @@
 //	  | go run ./cmd/ru-inventory -url https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone -retrieved 2026-11-19
 //
 // A rejected body leaves the committed artifact untouched and exits non-zero.
-// The data file and its provenance record are then replaced by two separate
-// renames, so a run that fails between them leaves a mixed pair that the loader
-// refuses; re-running this command rewrites both from one matching zone. Use
-// -dry-run to validate and report without writing.
+// The two committed files are then replaced by separate renames, so a run that
+// fails between them leaves a mixed pair that the loader refuses; re-running the
+// command rewrites both from one matching zone. Use -dry-run to validate and
+// report without writing.
+//
+// A body that keeps fewer than policy.MaxInventoryReductionPercent of the
+// committed prefixes is refused as a truncated feed; pass
+// -allow-large-reduction for a deliberate large change.
+//
+// The upstream copyright notice (Copyrights.txt) ships with the artifact and is
+// embedded in the binary; this command never writes or replaces it, because the
+// redistribution terms require it to stay intact.
 package main
 
 import (
@@ -43,21 +51,31 @@ func main() {
 
 // options holds the invocation's flags.
 type options struct {
-	dir       string
-	source    string
-	sourceURL string
-	retrieved string
-	dryRun    bool
+	dir                 string
+	source              string
+	sourceURL           string
+	retrieved           string
+	dryRun              bool
+	allowLargeReduction bool
 }
 
 // provenance returns the descriptive provenance fields for this invocation.
-// The prefix count and digest are not taken from the operator: they are derived
-// from the zone body by the validator.
+// The prefix count, data digest and notice digest are not taken from the
+// operator: they are derived from what ships by the validator.
 func (o options) provenance() policy.InventoryProvenance {
 	return policy.InventoryProvenance{
 		Source:      o.source,
 		SourceURL:   o.sourceURL,
 		RetrievedAt: o.retrieved,
+	}
+}
+
+// updateOptions returns the maintenance decisions for this invocation, including
+// the count the body is compared against.
+func (o options) updateOptions() policy.InventoryUpdateOptions {
+	return policy.InventoryUpdateOptions{
+		PreviousPrefixCount: policy.PreviousInventoryCount(o.dir),
+		AllowLargeReduction: o.allowLargeReduction,
 	}
 }
 
@@ -70,7 +88,8 @@ func run(stdin io.Reader, stdout io.Writer, args []string) error {
 	if err != nil {
 		return err
 	}
-	record, meta, err := policy.ValidateInventoryUpdate(body, opts.provenance())
+	update := opts.updateOptions()
+	record, meta, err := policy.ValidateInventoryUpdate(body, opts.provenance(), update)
 	if err != nil {
 		return describeRejection(err)
 	}
@@ -79,7 +98,7 @@ func run(stdin io.Reader, stdout io.Writer, args []string) error {
 			return err
 		}
 	}
-	return report(stdout, opts, record)
+	return report(stdout, opts, update.PreviousPrefixCount, record)
 }
 
 func parseOptions(stdout io.Writer, args []string) (options, error) {
@@ -91,6 +110,8 @@ func parseOptions(stdout io.Writer, args []string) (options, error) {
 	fs.StringVar(&opts.sourceURL, "url", "", "exact URL the zone was downloaded from (required)")
 	fs.StringVar(&opts.retrieved, "retrieved", "", "retrieval date in UTC, YYYY-MM-DD (required)")
 	fs.BoolVar(&opts.dryRun, "dry-run", false, "validate and report without writing the artifact")
+	fs.BoolVar(&opts.allowLargeReduction, policy.InventoryLargeReductionFlag, false,
+		fmt.Sprintf("accept a body that keeps fewer than %d%% of the committed prefixes", policy.MaxInventoryReductionPercent))
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
 	}
@@ -116,18 +137,26 @@ func readZone(stdin io.Reader) ([]byte, error) {
 // describeRejection keeps the wrapped validation error, adding what the operator
 // most needs to know: the committed artifact was not touched.
 func describeRejection(err error) error {
-	if errors.Is(err, policy.ErrInventoryNotPrefixList) {
+	switch {
+	case errors.Is(err, policy.ErrInventoryNotPrefixList):
 		return fmt.Errorf("zone rejected, committed inventory left unchanged: %w", err)
+	case errors.Is(err, policy.ErrInventoryLargeReduction):
+		return fmt.Errorf("zone rejected, committed inventory left unchanged: %w", err)
+	default:
+		return err
 	}
-	return err
 }
 
-func report(stdout io.Writer, opts options, record policy.InventoryProvenance) error {
+func report(stdout io.Writer, opts options, previous int, record policy.InventoryProvenance) error {
 	fmt.Fprintf(stdout, "source: %s\n", record.Source)
 	fmt.Fprintf(stdout, "source_url: %s\n", record.SourceURL)
 	fmt.Fprintf(stdout, "retrieved_at: %s\n", record.RetrievedAt)
 	fmt.Fprintf(stdout, "prefix_count: %d\n", record.PrefixCount)
+	if previous > 0 {
+		fmt.Fprintf(stdout, "previous_prefix_count: %d\n", previous)
+	}
 	fmt.Fprintf(stdout, "sha256: %s\n", record.SHA256)
+	fmt.Fprintf(stdout, "notice: %s %s\n", record.NoticeFile, record.NoticeSHA256)
 	if opts.dryRun {
 		fmt.Fprintln(stdout, "dry_run: true (nothing written)")
 		return nil
