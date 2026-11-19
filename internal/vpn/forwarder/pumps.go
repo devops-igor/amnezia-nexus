@@ -127,6 +127,7 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	directEgress := f.directEgress
 	routeCache := f.routeCache
 	policyMatcher := f.policyMatcher
+	classifier := f.destinationClassifier
 	gwDNS := f.gatewayDNSIP
 	dnsHandler := f.dnsHandler
 	f.mu.RUnlock()
@@ -146,19 +147,42 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 		return err
 	}
 
+	// The decision's inputs are read ONCE, and the same immutable snapshot supplies
+	// both the operator-override match and the generation recorded on the flow. A
+	// publish between two separate reads would let the record claim a generation
+	// that did not make the decision. The classifier is immutable and answers from
+	// committed data, so it is read outside the lock.
+	policySnapshot := currentPolicySnapshot(policyMatcher)
+	policyGeneration := policyGenerationOf(policySnapshot)
+	backendTunnel := backend.tunnelID
+
+	classification := classifyDestination(classifier, dstIP)
+
 	// Step 1 — DROP: Prohibited destinations (loopback, link-local, RFC1918, CGNAT, multicast, metadata).
 	// Explicit exception: traffic to designated gateway DNS on port 53 strictly.
-	if err := ValidateDirectDestination(dstIP, parsed.DstPort, gwDNS); err != nil {
+	//
+	// The verdict is the contract's first row, applied by decideEgress above every
+	// input that could ask for DIRECT, so an operator DIRECT override can never
+	// route a prohibited or internal destination.
+	decision := decideEgress(egressInput{
+		prohibitedErr:     ValidateDirectDestination(dstIP, parsed.DstPort, gwDNS),
+		proxyOverride:     policySnapshot != nil && policySnapshot.MatchIPv4(dstIP),
+		migrationEvidence: sessionDNSDecision(routeCache, sID, dstIP),
+		classification:    classification,
+	})
+	if decision.dropped() {
 		f.directDrops.Add(1)
 		// The destination is prohibited, so no flow is created. The packet IS a well-formed
 		// client packet, so its protocol and destination are recorded as observed facts.
-		f.recordClientDrop(peerKey, route, DropReasonProhibitedDestination,
+		f.recordClientDrop(peerKey, route, decision.dropReason,
 			parsed.Protocol, dstIP, parsed.DstPort, true, pktLen)
-		return err
+		return decision.dropErr
 	}
 
 	// Step 1b — PROXY FALLBACK: Non-TCP/UDP protocols (such as ICMP ping) cannot be NAT'd via direct egress.
-	// Route them safely through the proxy backend, preserving connectivity.
+	// Route them safely through the proxy backend, preserving connectivity. This
+	// refusal is about the transport, not the destination, so it is applied before
+	// the routing decision is acted on.
 	if parsed.Protocol != 6 && parsed.Protocol != 17 {
 		return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
 	}
@@ -176,46 +200,50 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 		}
 	}
 
-	// The decision's policy snapshot is read ONCE, and the same immutable snapshot
-	// supplies both the rule match and the generation recorded on the flow. A
-	// publish between two separate reads would let the record claim a generation
-	// that did not make the decision.
-	policySnapshot := currentPolicySnapshot(policyMatcher)
-	policyGeneration := policyGenerationOf(policySnapshot)
-	backendTunnel := backend.tunnelID
-
-	// Step 2 — PROXY: Policy snapshot CIDR or route cache Proxy match (including shared-IP conflict).
-	if matched, reason := f.matchesProxyPolicy(dstIP, sID, policySnapshot, routeCache); matched {
-		if directEgress != nil {
-			_ = directEgress.RecordFlowDecision(peerKey, sID, route.generation, packet, EgressChoiceProxy, FlowDecision{
-				Reason:           reason,
-				PolicyGeneration: policyGeneration,
-				DecidedAt:        time.Now(),
-				BackendTunnelID:  backendTunnel,
-			})
-		}
-		return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
-	}
-
-	// Step 3 — DIRECT: Client-scoped DNS evidence observed public destination without proxy match.
-	if routeCache != nil && routeCache.Lookup(sID, dstIP) == policy.Direct {
+	// Step 2 — DIRECT: the decided route, with the branch that decided it
+	// recorded on the flow. A dispatch refusal here is the contract's
+	// "required egress unavailable" row: it is reported as a DROP with the
+	// producer's reason and never re-decided as PROXY.
+	if decision.choice == EgressChoiceDirect {
 		return f.routeDirectDecision(directEgress, route, peerKey, packet, pktLen, backend, backendTraffic, sID, cID, FlowDecision{
-			Reason:           EgressReasonEvidenceDirect,
+			Reason:           decision.reason,
 			PolicyGeneration: policyGeneration,
 			DecidedAt:        time.Now(),
 		})
 	}
 
-	// Step 4 — PROXY (Safe Default): Missing, expired, or evicted DNS evidence (policy.Unknown).
+	// Step 3 — PROXY: the decided route, with the branch that decided it.
 	if directEgress != nil {
 		_ = directEgress.RecordFlowDecision(peerKey, sID, route.generation, packet, EgressChoiceProxy, FlowDecision{
-			Reason:           EgressReasonNoTrustedEvidence,
+			Reason:           decision.reason,
 			PolicyGeneration: policyGeneration,
 			DecidedAt:        time.Now(),
 			BackendTunnelID:  backendTunnel,
 		})
 	}
 	return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
+}
+
+// sessionDNSDecision returns the session's retained DNS evidence for one
+// destination, or policy.Unknown when no evidence source is configured. It is
+// the read the migration row of the routing contract consumes; it is kept
+// separate so the contract itself stays a pure function of its inputs.
+func sessionDNSDecision(routeCache RouteCache, sessionID string, dstIP netip.Addr) policy.Decision {
+	if routeCache == nil {
+		return policy.Unknown
+	}
+	return routeCache.Lookup(sessionID, dstIP)
+}
+
+// classifyDestination asks the installed address classifier about one
+// destination. A nil classifier is the documented fail-closed state and answers
+// the zero classification, which the contract reads as uncovered, so the packet
+// path needs no separate "is a classifier installed" branch of its own.
+func classifyDestination(classifier DestinationClassifier, dstIP netip.Addr) policy.DestinationClassification {
+	if classifier == nil {
+		return policy.DestinationClassification{}
+	}
+	return classifier.Classify(dstIP)
 }
 
 // currentPolicySnapshot reads the published snapshot once. Everything a decision
@@ -276,24 +304,6 @@ func (f *Forwarder) routeDirectDecision(directEgress *DirectEgressManager, route
 	// is exactly the case a global counter cannot attribute to this client.
 	f.recordDirectRefusal(peerKey, route, packet, pktLen, ErrDirectEgressUnavailable, refusalBeforeDispatch)
 	return ErrDirectEgressUnavailable
-}
-
-// matchesProxyPolicy reports whether the policy puts this destination on the
-// proxy, and WHICH branch matched. The caller records the branch as the flow's
-// decision reason (issue #861), so the reason is the branch that actually ran
-// rather than a second evaluation of the same rules.
-//
-// It takes the published snapshot rather than the matcher on purpose: the caller
-// takes one snapshot at the decision and uses it for both this match and the
-// generation it records, so the two can never disagree.
-func (f *Forwarder) matchesProxyPolicy(dstIP netip.Addr, sID string, snapshot *policy.Snapshot, routeCache RouteCache) (bool, EgressReason) {
-	if snapshot != nil && snapshot.MatchIPv4(dstIP) {
-		return true, EgressReasonProxyCIDRRule
-	}
-	if routeCache != nil && routeCache.Lookup(sID, dstIP) == policy.Proxy {
-		return true, EgressReasonProxyCachedEvidence
-	}
-	return false, ""
 }
 
 func (f *Forwarder) sendToDirectEgress(directEgress *DirectEgressManager, route *sessionRoute, peerKey string, packet []byte, pktLen int64, sID, cID string) error {

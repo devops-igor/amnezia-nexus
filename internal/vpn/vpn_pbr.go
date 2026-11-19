@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"sync"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/geodb"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
@@ -141,6 +143,10 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 	if !cfg.Enabled {
 		s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(cfg.GatewayDNSIP), s.continuityUpstreamsLocked(cfg))
 		s.forwarder.SetPBREnabled(false)
+		// The classifier belongs to the data path that routes on it: with policy
+		// routing off, no packet consults it and no stale classification survives
+		// into the next activation.
+		s.forwarder.SetDestinationClassifier(nil)
 		if dem := s.forwarder.DirectEgress(); dem != nil {
 			_ = dem.Close()
 			s.forwarder.SetDirectEgress(nil)
@@ -176,6 +182,7 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 	s.forwarder.SetDirectEgress(dem)
 	s.forwarder.SetRouteCache(cfg.RouteCache)
 	s.forwarder.SetPolicyMatcher(cfg.PolicyMatcher)
+	s.forwarder.SetDestinationClassifier(newDestinationClassifier())
 	if cfg.GatewayDNSIP.IsValid() {
 		s.forwarder.SetGatewayDNSIP(cfg.GatewayDNSIP)
 	}
@@ -1070,11 +1077,45 @@ func (s *Service) TeardownPBR() error {
 	// change must reach the responder that keeps issued profiles answering.
 	s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(addr), s.dnsUpstreams)
 	s.forwarder.SetPBREnabled(false)
+	// The classifier belongs to the data path that consults it; a teardown leaves
+	// no stale classification installed behind a disabled router.
+	s.forwarder.SetDestinationClassifier(nil)
 	if dem := s.forwarder.DirectEgress(); dem != nil {
 		_ = dem.Close()
 		s.forwarder.SetDirectEgress(nil)
 	}
 	return nil
+}
+
+// newDestinationClassifier joins the two committed inputs the routing contract
+// needs for a destination address (issue #918): the allocation inventory
+// answers "inside the Russian allocation" and the embedded ASN table answers
+// "known multi-region CDN".
+//
+// Both are compiled into the binary, so building this costs no I/O and no
+// network. A failure leaves the classifier uninstalled, which keeps the
+// documented fail-safe: every destination is proxied, exactly as before this
+// input existed. The refusal is logged rather than swallowed, and the
+// inventory's own status field already reports a broken artifact to the
+// operator — "the artifact is broken" and "no address is Russian" must never
+// look the same.
+func newDestinationClassifier() forwarder.DestinationClassifier {
+	inventory, err := policy.ShippedInventory()
+	if err != nil {
+		slog.Warn("Address classifier unavailable: committed allocation inventory is unusable", "err", err)
+		return nil
+	}
+	geo, err := geodb.DefaultGeoDB()
+	if err != nil {
+		slog.Warn("Address classifier unavailable: embedded ASN table is unusable", "err", err)
+		return nil
+	}
+	classifier, err := policy.NewAddressClassifier(inventory, geo)
+	if err != nil {
+		slog.Warn("Address classifier unavailable", "err", err)
+		return nil
+	}
+	return classifier
 }
 
 // UpdatePolicySnapshot compiles and atomically publishes new policy sources.

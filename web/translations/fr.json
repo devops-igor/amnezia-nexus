@@ -1069,6 +1069,8 @@
   "policy_client_reason_proxy_cidr_rule": "proxy par règle d'adresse",
   "policy_client_reason_proxy_cached_evidence": "proxy d'après les preuves observées",
   "policy_client_reason_no_trusted_evidence": "proxy par défaut (aucune preuve utilisable)",
+  "policy_client_reason_allocation_direct": "direct d'après l'allocation d'adresse",
+  "policy_client_reason_allocation_cdn_excluded": "proxy : allocation russe mais plage d'un CDN partagé",
   "policy_client_reason_not_recorded": "motif de décision non enregistré",
   "policy_client_corr_answer_after_decision": "la réponse est arrivée après cette décision",
   "policy_client_corr_expired_before_decision": "la preuve avait expiré avant cette décision",

@@ -1,18 +1,21 @@
 # Policy DNS Steering & Plain-DNS Interception
 
-Policy routing grants a direct egress path only when a client's own DNS answer
-proves that a destination is not on the active policy list. This document
-describes the two mechanisms that produce that evidence: steering generated
-client configurations to the policy resolver, and intercepting plain DNS so
-answers become routing observations.
+Policy routing grants a direct egress path from client DNS evidence, or from the
+destination address itself when the client's DNS is invisible to the panel. This
+document describes the mechanisms that produce that evidence — steering generated
+client configurations to the policy resolver and intercepting plain DNS so
+answers become routing observations — and, in section 6, the routing contract
+that also classifies a destination by its address.
 
 ## 1. Why both mechanisms exist
 
 The policy resolver is a userspace DNS service (`internal/vpn/dns`) that answers
 A queries, evaluates the answer against the active policy snapshot, and writes
-client-scoped observations into the route cache. A destination is `Direct` only
-when fresh, session-scoped evidence says so; missing, expired or foreign
-evidence is `Unknown` and is proxied (fail-closed).
+client-scoped observations into the route cache. A destination observed by that
+resolver is `Direct` only when fresh, session-scoped evidence says so; missing,
+expired or foreign evidence is `Unknown` and, until section 6 was implemented,
+was proxied (fail-closed). A destination the panel never observed can now be
+routed direct by address classification alone (section 6).
 
 Evidence can only come from a query the resolver actually sees. Two independent
 gaps make that impossible without this feature:
@@ -367,12 +370,13 @@ The guard is name-based, and that is the exact boundary of the guarantee:
   `Russia outside` names also arrive through other components; the guard removes
   those too.
 - **CIDR rules are not rewritten.** The forwarder matches a CIDR against the
-  packet's destination address before it consults DNS evidence
-  (`forwarder.matchesProxyPolicy`), so a CIDR an operator supplies is routed by
-  address. A name-based guard cannot guarantee DIRECT for an address inside such
-  a range, because it has no address-to-name mapping to test. Adding a CIDR is
-  therefore an explicit choice to proxy that range; do not add one that covers a
-  destination that must stay direct. The shipped aggregate has no CIDRs.
+  packet's destination address before it consults DNS evidence or the address
+  classifier (`forwarder.decideEgress`, row 2), so a CIDR an operator supplies is
+  routed by address. A name-based guard cannot guarantee DIRECT for an address
+  inside such a range, because it has no address-to-name mapping to test. Adding
+  a CIDR is therefore an explicit choice to proxy that range; do not add one that
+  covers a destination that must stay direct. The shipped aggregate has no
+  CIDRs.
 - **Stored snapshots are revalidated.** `PrimeBaseline`, `AdoptBaseline` and the
   vpn last-known-good fallback check a durable generation's domain rules against
   the current guard and operator exclusions before publishing them. A snapshot
@@ -380,12 +384,74 @@ The guard is name-based, and that is the exact boundary of the guarantee:
   baseline and is never activated; if the upstream fetch also fails, startup
   activation is refused rather than proxying the stale protected name.
 
-## 6. Limitations
+## 6. Routing contract: DNS evidence and address classification
 
-- **Encrypted DNS is out of scope.** DNS over HTTPS (443) and DNS over TLS
-  (853) are not detected, intercepted or decrypted. Those destinations produce
-  no evidence, remain `Unknown`, and are proxied. A client configured for
-  encrypted DNS therefore gets no direct-path benefit from policy routing.
+Both evidence sources feed one contract, implemented in one place:
+`forwarder.decideEgress` (`internal/vpn/forwarder/routing_decision.go`). The rows
+are applied in this order, and the branch that decided is recorded on the flow so
+the diagnosis can name it.
+
+| Condition | Result | Recorded reason |
+| :--- | :--- | :--- |
+| Invalid, prohibited or internal destination | DROP | `prohibited_destination` / `invalid_client_packet` in the DROP ledger |
+| Explicit operator PROXY override (a published address rule) | PROXY | `proxy_cidr_rule` |
+| *Migration row:* client DNS evidence for this destination | DIRECT / PROXY | `evidence_direct` / `proxy_cached_evidence` |
+| Inside the Russian allocation **and** a known multi-region CDN | PROXY | `allocation_cdn_excluded` |
+| Inside the Russian allocation, no CDN exclusion | DIRECT | `allocation_direct` |
+| Unknown or uncovered destination | PROXY | `no_trusted_evidence` |
+| Required egress unavailable for a DIRECT decision | DROP, no switch | `direct_egress_unavailable` in the DROP ledger |
+
+The two DROP rows never leave through the other path: a prohibited destination is
+refused before any routing input is consulted, and a DIRECT decision whose egress
+is unavailable is recorded as a DROP with the producer's reason rather than being
+re-decided as PROXY.
+
+**The evidence row is temporary.** While the DNS evidence subsystem exists, its
+verdict sits between the explicit override and the address classifier, in exactly
+one block marked `MIGRATION ROW — TEMPORARY` in `decideEgress` and one field
+(`migrationEvidence`) on its input. Removing that block yields the table above
+without the evidence row and changes no other row; a test asserts that rows one
+and two decide identically with or without evidence.
+
+### Why two inputs
+
+| Question | Answered by | Why the other input cannot answer it |
+| :--- | :--- | :--- |
+| Is the address inside the Russian allocation? | The committed inventory (`internal/policy/inventory`), RIR delegation | The embedded ASN table reports the origin network's registration: Yandex prefixes are originated by AS208398, a Serbian-registered network, so every Yandex address reads `RS` while RIPE records the space as RU |
+| Does the range belong to a multi-region CDN? | The embedded ASN table (`internal/geodb`), `KnownCDNASNs` | An allocation zone carries no ASN, so an Amazon or Cloudflare range inside the Russian allocation would be routed direct |
+
+`policy.AddressClassifier` joins both and answers only those two questions. It is
+installed by `ConfigurePBR` and removed when policy routing is disabled or torn
+down. With no classifier installed the contract keeps its fail-safe number: every
+destination is proxied, which is the behaviour before this input existed.
+
+### What classification does not mean
+
+- **Allocation is not hosting location.** Membership is an approximation from RIR
+  delegation. The reason token says `allocation_direct`, never "hosted in Russia".
+- **A direct path still egresses through this host's WAN address.** If that
+  ingress sits outside Russia, a Russian service that refuses foreign source
+  addresses still fails. That is why the per-flow record separates *routed direct
+  and written to WAN* from *routed direct and failed*: the second is the signal
+  that the egress location, not the classifier, is the problem.
+- **The CDN list is conservative.** `KnownCDNASNs` covers Cloudflare, Fastly,
+  Akamai, Amazon, Google and Microsoft. It is an exclusion list, not
+  comprehensive CDN detection; a Russian service behind an unlisted CDN is routed
+  direct, and a listed CDN range inside the allocation stays proxied.
+- **Prohibited destinations are refused first.** The prohibited check is
+  address-side (`ValidateDirectDestination`) and is the contract's first row, so
+  an operator DIRECT input — including an operator inventory override that names
+  a private or internal range — cannot route such a destination.
+
+## 7. Limitations
+
+- **Encrypted DNS is not observed.** DNS over HTTPS (443) and DNS over TLS
+  (853) are not detected, intercepted or decrypted, so those queries produce no
+  evidence. Their destinations are routed by the address classifier of section 6
+  when it can classify them, and proxied otherwise. A downstream destination
+  inside the Russian allocation therefore reaches a direct path even for a
+  client configured for encrypted DNS, while everything else keeps the proxy
+  default.
 - **IPv4 only.** Interception and policy matching are IPv4. IPv6 DNS is not
   observed.
 - **TTL-zero answers produce no evidence** for unmatched destinations, the

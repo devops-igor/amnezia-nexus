@@ -257,6 +257,10 @@ var clientDiagTokenValues = map[string][]string{
 	"reason": {
 		"sticky_flow", "evidence_direct", "proxy_cidr_rule", "proxy_cached_evidence",
 		"no_trusted_evidence", "not_recorded",
+		// Address classification of issue #918. The first token names allocation
+		// membership, not hosting location; the second names a range that is
+		// inside the allocation but belongs to a multi-region CDN.
+		"allocation_direct", "allocation_cdn_excluded",
 	},
 	"name_match":      {"unique", "ambiguous", "none", "not_recorded"},
 	"return_evidence": {"observed", "not_observed", "not_measured", "not_recorded"},
