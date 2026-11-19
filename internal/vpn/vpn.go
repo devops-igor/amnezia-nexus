@@ -204,6 +204,13 @@ type Service struct {
 	// a list the operator replaced cannot come back. Guarded by mu; always a
 	// private copy.
 	dnsUpstreams []policy.Upstream
+	// inventoryOverride is the accepted operator override for the committed
+	// Russian allocation inventory, or nil when the shipped set alone answers.
+	// It is the record's own value, not a classification result: activation and
+	// an accepted settings change set it, an accepted disable keeps it because the
+	// override stays stored, and the status reports it. Guarded by mu; the value
+	// itself is immutable.
+	inventoryOverride *policy.InventoryOverride
 	// backendDevices holds the per-backend UDP devices created by EnableBackend.
 	backendDevices         map[int64]BackendDevice
 	backendDeviceEndpoints map[int64]string

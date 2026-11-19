@@ -98,6 +98,7 @@ w._ = key => {
   if (key === 'policy_client_dns_coverage') return 'DNS-COVERAGE {stored}/{collapsed}/{evicted}/{aged}';
   if (key === 'policy_client_dns_truncated') return 'DNS-TRUNC {shown}/{total}';
   if (key === 'policy_client_outcome_fmt') return 'OUTCOME {ok}/{failed} · return {return} {packets}';
+  if (key === 'policy_client_route_outcome_fmt') return 'ROUTE {route} · {dispatch}';
   if (key === 'policy_client_tried_names_fmt') return 'TRIED {names}';
   if (key === 'policy_client_counters_live_note') return 'COUNTERS-LIVE';
   if (key === 'policy_client_drop_truncated') return 'DROP-TRUNC {shown}/{total}';
@@ -136,6 +137,7 @@ w._ = key => {
   if (key.indexOf('policy_client_return_evidence_') === 0) return 'RETURN_EVIDENCE:' + key.slice('policy_client_return_evidence_'.length);
   if (key.indexOf('policy_client_corr_') === 0) return 'CORR:' + key.slice('policy_client_corr_'.length);
   if (key.indexOf('policy_client_failure_') === 0) return 'FAILURE:' + key.slice('policy_client_failure_'.length);
+  if (key.indexOf('policy_client_dispatch_') === 0) return 'DISPATCH:' + key.slice('policy_client_dispatch_'.length);
   return key;
 };
 
@@ -302,7 +304,7 @@ assert.deepEqual(rowCells('policyClientFlowRows', 0),
   ['PROTO:tcp', '93.184.216.34:443', 'DECISION:direct',
    '2026-11-17T09:09:58Z · REASON:evidence_direct · gen-1',
    'NAME_MATCH:unique: plain.example',
-   'OUTCOME 1/0 · return RETURN_EVIDENCE:not_observed 0',
+   'ROUTE DECISION:direct · DISPATCH:written_to_wan · OUTCOME 1/0 · return RETURN_EVIDENCE:not_observed 0',
    '42s', 'active']);
 
 const limits = Array.from(w.document.getElementById('policyClientLimitations').children).map(li => li.textContent);
@@ -598,7 +600,7 @@ assert.equal(ambiguous[3], '2026-11-17T09:09:58Z · REASON:proxy_cidr_rule · ge
   'the decision instant, reason, generation and selected backend are rendered together');
 assert.equal(ambiguous[4], 'NAME_MATCH:ambiguous: plain.example, shared.example',
   'several candidate names are shown as several, never collapsed to one');
-assert.equal(ambiguous[5], 'OUTCOME 0/2 · return RETURN_EVIDENCE:not_measured 0 · FAILURE:backend_queue_full',
+assert.equal(ambiguous[5], 'ROUTE DECISION:proxy · DISPATCH:failed · OUTCOME 0/2 · return RETURN_EVIDENCE:not_measured 0 · FAILURE:backend_queue_full',
   'a refused dispatch and an unmeasured return are both visible');
 
 const none = rowCells('policyClientFlowRows', 1);
@@ -606,7 +608,7 @@ assert.equal(none[4],
   'NAME_MATCH:none: TRIED missing.example (EVENT:nxdomain, A)',
   'an unresolved query near the decision states the name that was tried, not just the reason');
 assert.equal(none[5],
-  'OUTCOME 3/0 · return RETURN_EVIDENCE:observed 0 · RET returned 4/3/2/1 (FAILURE:client_queue_full)'
+  'ROUTE DECISION:proxy · DISPATCH:queued_to_backend · OUTCOME 3/0 · return RETURN_EVIDENCE:observed 0 · RET returned 4/3/2/1 (FAILURE:client_queue_full)'
     + ' · RETURN_AUTHORITY:current_tuple_association'
     + ' · DEVICE 2/1 (FAILURE:backend_write_failed)',
   'a proxy flow states queue admission, the device write and the return chain separately');
@@ -614,8 +616,64 @@ assert.equal(none[5],
 const unrecorded = rowCells('policyClientFlowRows', 2);
 assert.equal(unrecorded[3], 'not_recorded · REASON:not_recorded',
   'a flow without decision metadata says so instead of showing an empty instants cell');
-assert.equal(unrecorded[5], 'OUTCOME 4/0 · return RETURN_EVIDENCE:observed 2',
+assert.equal(unrecorded[5], 'ROUTE DECISION:direct · DISPATCH:written_to_wan · OUTCOME 4/0 · return RETURN_EVIDENCE:observed 2',
   'an observed return is distinguished from an unmeasured one');
+`)
+}
+
+// TestPolicyClientDiagDistinguishesDirectFailedFromDirectWorked covers the
+// distinction the epic review asked for (issue #920): two flows with the same
+// deciding reason differ in outcome, and the difference is a direct-and-failed
+// reading rather than an unexplained failure. The route and the dispatch outcome
+// are asserted together, because that conjunction is what tells an operator the
+// egress path failed rather than the classifier.
+func TestPolicyClientDiagDistinguishesDirectFailedFromDirectWorked(t *testing.T) {
+	runClientDiagScenario(t, clientTargetsScript+`
+responder = ((base) => async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
+  const answer = await base(url, opts);
+  answer.flows.entries = [
+    {protocol: 'tcp', destination_ip: '213.180.204.186', destination_port: 443, choice: 'DIRECT',
+     route_generation: 3, last_seen_age_seconds: 3, expired: false, close_seen: false,
+     decision_time: '2026-11-17T09:09:58Z', decision_reason: 'allocation_direct',
+     policy_generation: 'gen-1',
+     dispatch: {state: 'written_to_wan'}, forward: {packets: 2, bytes: 120, failed: 0},
+     return: {evidence: 'not_observed', packets: 0, bytes: 0},
+     names: [], names_match: 'none', names_considered: 0, name_candidates: []},
+    {protocol: 'tcp', destination_ip: '185.73.194.82', destination_port: 443, choice: 'DIRECT',
+     route_generation: 3, last_seen_age_seconds: 4, expired: false, close_seen: false,
+     decision_time: '2026-11-17T09:09:59Z', decision_reason: 'allocation_direct',
+     policy_generation: 'gen-1',
+     dispatch: {state: 'failed', reason: 'direct_egress_unavailable'},
+     forward: {packets: 0, bytes: 0, failed: 1, failure: 'direct_egress_unavailable'},
+     return: {evidence: 'not_observed', packets: 0, bytes: 0},
+     names: [], names_match: 'none', names_considered: 0, name_candidates: []}
+  ];
+  return answer;
+})(responder);
+`, `
+selectClient('sess-a');
+await w.diagnoseSelectedClient();
+await settle();
+assert.equal(rowCount('policyClientFlowRows'), 2, 'both direct flows are rendered');
+
+const worked = rowCells('policyClientFlowRows', 0);
+const failed = rowCells('policyClientFlowRows', 1);
+
+// Same route, same deciding reason: the classifier is not what differs.
+assert.equal(worked[2], 'DECISION:direct');
+assert.equal(failed[2], 'DECISION:direct');
+assert.equal(rowCells('policyClientFlowRows', 0)[3], '2026-11-17T09:09:58Z · REASON:allocation_direct · gen-1');
+assert.equal(rowCells('policyClientFlowRows', 1)[3], '2026-11-17T09:09:59Z · REASON:allocation_direct · gen-1');
+
+// The outcome cell names the route and what happened to the packets, so a failed
+// direct flow reads as direct-and-failed instead of as a bare "failed".
+assert.equal(worked[5], 'ROUTE DECISION:direct · DISPATCH:written_to_wan · OUTCOME 2/0 · return RETURN_EVIDENCE:not_observed 0',
+  'a direct flow whose WAN writes succeeded is not reported as failed');
+assert.equal(failed[5], 'ROUTE DECISION:direct · DISPATCH:failed · OUTCOME 0/1 · return RETURN_EVIDENCE:not_observed 0 · FAILURE:direct_egress_unavailable',
+  'a direct flow whose egress failed is direct-and-failed, with the producer failure named');
+assert.notEqual(worked[5], failed[5],
+  'the two outcomes must be distinguishable without inspecting logs');
 `)
 }
 
