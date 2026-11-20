@@ -1122,6 +1122,8 @@
   "policy_client_failure_short_write": "دستگاه قاب ناقص نوشت",
   "policy_client_return_chain_fmt": "بازگشت: منطبق {matched} · در صف {admitted} · تحویل {delivered} · ناموفق {failed}",
   "policy_client_route_outcome_fmt": "{route} · ارسال {dispatch}",
+  "policy_client_route_failed_backend_write": "خطای نوشتن روی بک‌اند",
+  "policy_client_route_failed_return": "خطای تحویل پاسخ",
   "policy_client_dispatch_written_to_wan": "نوشته‌شده در WAN",
   "policy_client_dispatch_queued_to_backend": "در صف به بک‌اند",
   "policy_client_dispatch_failed": "ناموفق",

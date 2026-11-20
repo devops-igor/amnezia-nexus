@@ -1122,6 +1122,8 @@
   "policy_client_failure_short_write": "device wrote a short frame",
   "policy_client_return_chain_fmt": "return matched {matched} · queued {admitted} · delivered {delivered} · failed {failed}",
   "policy_client_route_outcome_fmt": "{route} · dispatch {dispatch}",
+  "policy_client_route_failed_backend_write": "backend write failed",
+  "policy_client_route_failed_return": "return delivery failed",
   "policy_client_dispatch_written_to_wan": "written to WAN",
   "policy_client_dispatch_queued_to_backend": "queued to backend",
   "policy_client_dispatch_failed": "failed",

@@ -515,40 +515,105 @@
         appendCell(row, address);
     }
 
-    // appendFlowRoute states the route the flow was given, and marks a delivery
-    // the dispatch path recorded as failed: a direct route whose packets were
-    // refused must not read like a direct route that reached the WAN. Only the
-    // recorded dispatch state marks the cell — a success is never inferred from an
-    // absent failure, and a state this build does not know leaves the route plain.
-    // The dispatch outcome and the failure the packet met are the cell's tooltip,
-    // where a queue hand-off stays distinguishable from a completed write.
+    // appendFlowRoute states the route the flow was given and marks every producer
+    // that recorded a failed delivery: the dispatch path, the backend device writes
+    // and the return delivery. Each failing producer is named on its own, so a flow
+    // whose backend accepted some writes and refused one is never reported as a
+    // failed flow, and a direct route whose packets were refused cannot read like a
+    // direct route that reached the WAN. Only recorded states and counters mark the
+    // cell: a success is never inferred from an absent failure.
     function appendFlowRoute(row, flow) {
+        var state = dispatchState(flow);
+        var markers = routeFailureMarkers(flow, state);
         var route = clientTokenLabel('decision', flow.choice);
-        var dispatch = flow.dispatch || {};
-        var state = dispatch.state == null ? '' : String(dispatch.state);
-        if (state === 'failed') {
-            var failed = clientText('policy_client_dispatch_failed');
-            route = route ? route + ' (' + failed + ')' : failed;
+        if (markers.length) {
+            route = route ? route + ' (' + markers.join(', ') + ')' : markers.join(', ');
         }
-        appendCell(row, route, flowDispatchDetail(flow, state));
+        appendCell(row, route, routeFailureDetail(flow, state));
     }
 
-    // flowDispatchDetail is the dispatch evidence behind the route cell: the
-    // outcome the dispatch path recorded and, when it recorded one, the failure the
-    // packet met. The reason on the dispatch state is the measured outcome; the
-    // forward counters' failure stands in when a producer recorded only that. A
-    // state of not_recorded, or no state at all, offers no tooltip.
-    function flowDispatchDetail(flow, state) {
-        if (!state || state === 'not_recorded') {
-            return '';
+    // dispatchState is the outcome the dispatch path recorded, or '' when the
+    // answer carried none.
+    function dispatchState(flow) {
+        var dispatch = flow.dispatch || {};
+        return dispatch.state == null ? '' : String(dispatch.state);
+    }
+
+    // routeFailureMarkers names every producer that recorded a failed delivery, in
+    // the order the wire states them: the dispatch outcome, the backend device
+    // writes, then the return delivery. A producer with nothing refused contributes
+    // nothing, so the marker count is what the record says, not a guess.
+    function routeFailureMarkers(flow, state) {
+        var markers = [];
+        if (state === 'failed') {
+            markers.push(clientText('policy_client_dispatch_failed'));
         }
-        var parts = [clientTokenLabel('dispatch', state)];
+        if (recordedCount(flow.forward, 'backend_write_failed') > 0) {
+            markers.push(clientText('policy_client_route_failed_backend_write'));
+        }
+        if (recordedCount(flow.return, 'failed') > 0) {
+            markers.push(clientText('policy_client_route_failed_return'));
+        }
+        return markers;
+    }
+
+    // routeFailureDetail is the evidence behind the route cell: the dispatch
+    // outcome, and for every producer that failed its recorded reason and the
+    // counts it recorded, so a backend write refusal is not read as a client-side
+    // queue failure. A flow that recorded nothing offers no tooltip.
+    function routeFailureDetail(flow, state) {
+        var parts = [];
         var forward = flow.forward || {};
-        var failure = (flow.dispatch && flow.dispatch.reason) || forward.failure || '';
-        if (failure) {
-            parts.push(clientTokenLabel('failure', failure));
+        var back = flow.return || {};
+        if (state && state !== 'not_recorded') {
+            parts.push(clientTokenLabel('dispatch', state));
+            appendFailureLabel(parts, (flow.dispatch && flow.dispatch.reason) || forward.failure);
+        }
+        if (recordedCount(forward, 'backend_write_failed') > 0) {
+            parts.push(clientText('policy_client_route_failed_backend_write'));
+            appendFailureLabel(parts, forward.backend_write_failure);
+            parts.push(filledText('policy_client_backend_write_fmt', {
+                ok: recordedCount(forward, 'backend_writes'),
+                failed: recordedCount(forward, 'backend_write_failed')
+            }));
+        }
+        if (recordedCount(back, 'failed') > 0) {
+            parts.push(clientText('policy_client_route_failed_return'));
+            appendFailureLabel(parts, back.failure);
+            parts.push(filledText('policy_client_return_chain_fmt', {
+                matched: recordedCount(back, 'matched'),
+                admitted: recordedCount(back, 'admitted'),
+                delivered: recordedCount(back, 'delivered'),
+                failed: recordedCount(back, 'failed')
+            }));
         }
         return parts.join(' · ');
+    }
+
+    // appendFailureLabel adds the dictionary label of a recorded failure token, and
+    // nothing when that producer recorded none.
+    function appendFailureLabel(parts, token) {
+        if (token) {
+            parts.push(clientTokenLabel('failure', token));
+        }
+    }
+
+    // filledText translates one format string and fills its placeholders here, so a
+    // count is inserted into the shipped sentence instead of a sentence assembled
+    // from fragments.
+    function filledText(key, values) {
+        var text = clientText(key);
+        Object.keys(values).forEach(function (name) {
+            text = text.replace('{' + name + '}', String(values[name]));
+        });
+        return text;
+    }
+
+    // recordedCount reads one recorded counter. An absent or non-numeric value is
+    // the zero it is: it neither invents a failure nor hides one.
+    function recordedCount(owner, field) {
+        var value = Number(owner && owner[field]);
+        return isFinite(value) && value > 0 ? value : 0;
     }
 
     // appendFlowDecision states the recorded reason as one short label. The instant,

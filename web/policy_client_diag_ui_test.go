@@ -101,6 +101,8 @@ w._ = key => {
   if (key === 'policy_client_dns_truncated') return 'DNS-TRUNC {shown}/{total}';
   if (key === 'policy_client_outcome_fmt') return 'OUTCOME {ok}/{failed} · return {return} {packets}';
   if (key === 'policy_client_route_outcome_fmt') return 'ROUTE {route} · {dispatch}';
+  if (key === 'policy_client_route_failed_backend_write') return 'FAILED:backend-write';
+  if (key === 'policy_client_route_failed_return') return 'FAILED:return';
   if (key === 'policy_client_tried_names_fmt') return 'TRIED {names}';
   if (key === 'policy_client_flow_names_multiple') return 'FIRST {name} PLUS {count}';
   if (key === 'policy_client_drop_truncated') return 'DROP-TRUNC {shown}/{total}';
@@ -546,8 +548,10 @@ assert.equal(text('policyClientDropCoverage'), 'DROPCOV 3/5/0/1 session 4 ledger
 
 // TestPolicyClientDiagFlowStateVariety pins the visible rendering of the states a
 // recorded flow can be in: several candidate names, no candidate with a stated
-// reason, a refused dispatch, an unmeasured return and a flow recorded without
-// decision metadata. Each cell is asserted, so a wrong or invented value fails.
+// reason, a refused dispatch, a dispatch that succeeded into the queue while the
+// backend and the return delivery failed, and a flow recorded without decision
+// metadata. Each cell and each route tooltip is asserted, so a wrong or invented
+// value fails.
 func TestPolicyClientDiagFlowStateVariety(t *testing.T) {
 	runClientDiagScenario(t, clientTargetsScript+`
 responder = ((base) => async (url, opts) => {
@@ -600,6 +604,15 @@ responder = ((base) => async (url, opts) => {
      dispatch: {state: 'written_to_wan'}, forward: {packets: 4, bytes: 400, failed: 0},
      return: {evidence: 'observed', packets: 2, bytes: 200,
               first_at: '2026-11-17T09:10:00Z', last_at: '2026-11-17T09:10:01Z'},
+     names: [], names_match: 'not_recorded', names_considered: 0, name_candidates: []},
+    {protocol: 'udp', destination_ip: '9.9.9.9', destination_port: 443, choice: 'PROXY',
+     route_generation: 3, last_seen_age_seconds: 14, expired: false, close_seen: false,
+     decision_time: '2026-11-17T09:09:55Z', decision_reason: 'sticky_flow',
+     policy_generation: 'gen-1', backend_tunnel_id: 77,
+     dispatch: {state: 'queued_to_backend'},
+     forward: {packets: 5, bytes: 300, failed: 0, backend_writes: 5, backend_write_failed: 0},
+     return: {evidence: 'observed', authority: 'current_tuple_association',
+              matched: 5, admitted: 5, delivered: 5, failed: 0},
      names: [], names_match: 'not_recorded', names_considered: 0, name_candidates: []}
   ];
   return answer;
@@ -608,13 +621,15 @@ responder = ((base) => async (url, opts) => {
 selectClient('sess-a');
 await w.diagnoseSelectedClient();
 await settle();
-assert.equal(rowCount('policyClientFlowRows'), 3, 'all three states are rendered');
+assert.equal(rowCount('policyClientFlowRows'), 4, 'all four states are rendered');
 
 const ambiguous = rowCells('policyClientFlowRows', 0);
 assert.equal(ambiguous[1], '93.184.216.34:443 (FIRST plain.example PLUS 1)',
   'the first of several candidate names is shown with a count of the others, never collapsed to that one alone');
 assert.equal(ambiguous[2], 'DECISION:proxy (DISPATCH:failed)',
-  'the recorded route is rendered, and a refused delivery is marked on it');
+  'the recorded route is rendered, and a failed dispatch is marked on it');
+assert.equal(rowCellTitles('policyClientFlowRows', 0)[2], 'DISPATCH:failed · FAILURE:backend_queue_full',
+  'a failed dispatch keeps the outcome and the reason it recorded');
 assert.equal(ambiguous[3], 'DECISION_REASON:proxy_cidr_rule',
   'the deciding reason is one label, not a sentence of metadata');
 assert.equal(rowCellTitles('policyClientFlowRows', 0)[3],
@@ -626,6 +641,14 @@ assert.equal(none[1], '8.8.8.8:53',
   'a name the client tried without an answer is not this flow destination name');
 assert.equal(none[3], 'DECISION_REASON:no_trusted_evidence',
   'the fail-closed default has its own label');
+// The dispatch succeeded into the queue, but the backend refused one of three
+// writes and the return delivery failed: each producer is named on its own, so a
+// partly successful flow is not reported as a failed flow.
+assert.equal(none[2], 'DECISION:proxy (FAILED:backend-write, FAILED:return)',
+  'every producer that recorded a failure is marked by name');
+assert.equal(rowCellTitles('policyClientFlowRows', 1)[2],
+  'DISPATCH:queued_to_backend · FAILED:backend-write · FAILURE:backend_write_failed · DEVICE 2/1 · FAILED:return · FAILURE:client_queue_full · RET returned 4/3/2/1',
+  'the tooltip names each failing producer with its reason and its counts');
 
 const unrecorded = rowCells('policyClientFlowRows', 2);
 assert.equal(unrecorded[1], '1.1.1.1:80');
@@ -633,6 +656,13 @@ assert.equal(unrecorded[3], 'DECISION_REASON:not_recorded',
   'a flow without decision metadata says so instead of showing an empty instants cell');
 assert.equal(rowCellTitles('policyClientFlowRows', 2)[3], '',
   'a decision that recorded nothing offers no tooltip');
+
+// The same proxy dispatch outcome with nothing refused: no failure indicator.
+const clean = rowCells('policyClientFlowRows', 3);
+assert.equal(clean[2], 'DECISION:proxy',
+  'a proxy flow whose writes and return delivery recorded no failure keeps the plain route');
+assert.equal(rowCellTitles('policyClientFlowRows', 3)[2], 'DISPATCH:queued_to_backend',
+  'its tooltip states the dispatch outcome and no failure');
 `)
 }
 

@@ -1122,6 +1122,8 @@
   "policy_client_failure_short_write": "устройство записало неполный пакет",
   "policy_client_return_chain_fmt": "ответ: совпало {matched} · в очереди {admitted} · доставлено {delivered} · с ошибкой {failed}",
   "policy_client_route_outcome_fmt": "{route} · отправка {dispatch}",
+  "policy_client_route_failed_backend_write": "ошибка записи на бэкенд",
+  "policy_client_route_failed_return": "ошибка доставки ответа",
   "policy_client_dispatch_written_to_wan": "записано в WAN",
   "policy_client_dispatch_queued_to_backend": "в очереди к бэкенду",
   "policy_client_dispatch_failed": "ошибка",

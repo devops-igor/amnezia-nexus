@@ -1122,6 +1122,8 @@
   "policy_client_failure_short_write": "设备写入不完整帧",
   "policy_client_return_chain_fmt": "返回：匹配 {matched} · 已入队 {admitted} · 已交付 {delivered} · 失败 {failed}",
   "policy_client_route_outcome_fmt": "{route} · 发送 {dispatch}",
+  "policy_client_route_failed_backend_write": "后端写入失败",
+  "policy_client_route_failed_return": "返回投递失败",
   "policy_client_dispatch_written_to_wan": "已写入 WAN",
   "policy_client_dispatch_queued_to_backend": "已入队至后端",
   "policy_client_dispatch_failed": "失败",
