@@ -1,4 +1,4 @@
-name: DEV Server E2E Verification
+name: Lifecycle E2E Verification
 
 'on':
   push:
@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   e2e-dev:
-    name: DEV Server E2E Verification
+    name: Lifecycle E2E Verification
     # GitHub-hosted runner: the gate deploys the panel and its data plane on the
     # runner itself, so it needs no reachability to a lab host. The four-core ARM
     # SBC that used to host it stalled under load and produced false failures

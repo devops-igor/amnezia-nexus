@@ -48,7 +48,7 @@ or dataplane involvement.
 
 [[runner]]
 name = "dev-lifecycle"
-label = "DEV Server E2E Verification"
+label = "Lifecycle E2E Verification"
 workflow = ".github/workflows/e2e-dev.yml"
 script = "scripts/run_e2e_lifecycle.sh"
 paths = [
@@ -65,8 +65,14 @@ paths = [
   "tests/e2e/test_multiprotocol_server.py",
 ]
 rationale = """
-These need the real deployment on the self-hosted ARM64 DEV runner: clean-slate
-provisioning, server onboarding, SSH, protocol installation, client creation,
-packet traversal or failover. A local fixture cannot prove any of it, so they
-stay live and fail closed when a prerequisite is missing.
+These need a real deployment: clean-slate provisioning, server onboarding, SSH,
+protocol installation, client creation, packet traversal or failover. A local
+fixture cannot prove any of it, so they stay live and fail closed when a
+prerequisite is missing.
+
+Since the gate moved off the self-hosted ARM board, the deployment it exercises
+is the job's own ephemeral GitHub-hosted runner: the panel is deployed on it and
+the onboarding target is that runner's docker bridge. The suites are unchanged,
+but the machine under them is x86_64 and disposable, so no ARM64 runtime is
+exercised here any more.
 """
