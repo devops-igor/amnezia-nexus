@@ -440,17 +440,113 @@
         return clientText('policy_client_failed');
     }
 
+    // detailSeq numbers the revealed detail regions so each opener can name the
+    // element it controls. Ids only have to be unique in the document, so the
+    // counter is never reset.
+    var detailSeq = 0;
+
+    // openDetail is the one revealed detail, as {toggle, region}. A table of many
+    // rows must not accumulate open panels, so opening one closes the previous, and
+    // a re-render drops the reference with the rows it belonged to.
+    var openDetail = null;
+
     // appendCell writes one table cell. A cell whose full fact is longer than the
-    // column carries the detail it cannot show as its title, so the row stays
-    // readable without the detail being invented or silently dropped.
+    // column carries that fact as its title, which native tooltips show on hover
+    // only, and as a disclosure inside the same cell: a focusable opener that says
+    // whether it is expanded and names the region it reveals. The row keeps its
+    // cells; the detail is revealed in place, so a pointer or a keyboard can reach
+    // what hover cannot.
     function appendCell(row, text, title) {
         var cell = root.document.createElement('td');
-        cell.textContent = text == null || text === '' ? '-' : String(text);
-        if (title) {
-            cell.title = String(title);
+        var label = text == null || text === '' ? '-' : String(text);
+        if (!title) {
+            cell.textContent = label;
+            row.appendChild(cell);
+            return cell;
         }
+        var detail = String(title);
+        cell.title = detail;
+        var regionId = 'policyClientCellDetail' + (++detailSeq);
+        var toggle = root.document.createElement('span');
+        toggle.className = 'cell-detail-toggle';
+        toggle.setAttribute('role', 'button');
+        toggle.setAttribute('tabindex', '0');
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.setAttribute('aria-controls', regionId);
+        toggle.setAttribute('data-detail', detail);
+        toggle.textContent = label;
+        var region = root.document.createElement('span');
+        region.className = 'cell-detail';
+        region.id = regionId;
+        region.hidden = true;
+        toggle.addEventListener('click', function (event) {
+            if (event && typeof event.stopPropagation === 'function') {
+                event.stopPropagation();
+            }
+            toggleCellDetail(toggle, region);
+        });
+        toggle.addEventListener('keydown', function (event) {
+            handleDetailKey(event, toggle, region);
+        });
+        cell.addEventListener('click', function () {
+            openCellDetail(toggle, region);
+        });
+        cell.appendChild(toggle);
+        cell.appendChild(region);
         row.appendChild(cell);
         return cell;
+    }
+
+    // toggleCellDetail opens or closes one cell's detail, so a pointer or the
+    // keyboard can put back what it revealed.
+    function toggleCellDetail(toggle, region) {
+        if (openDetail && openDetail.region === region) {
+            closeDetail();
+            return;
+        }
+        openCellDetail(toggle, region);
+    }
+
+    // openCellDetail reveals one cell's detail and closes whatever was open, so only
+    // one panel is ever expanded.
+    function openCellDetail(toggle, region) {
+        if (openDetail && openDetail.region === region) {
+            return;
+        }
+        closeDetail();
+        region.textContent = toggle.getAttribute('data-detail') || '';
+        region.hidden = false;
+        toggle.setAttribute('aria-expanded', 'true');
+        openDetail = {toggle: toggle, region: region};
+    }
+
+    // closeDetail hides the revealed detail and clears its text, so a closed cell
+    // carries no hidden copy of the fact.
+    function closeDetail() {
+        if (!openDetail) {
+            return;
+        }
+        openDetail.region.hidden = true;
+        openDetail.region.textContent = '';
+        openDetail.toggle.setAttribute('aria-expanded', 'false');
+        openDetail = null;
+    }
+
+    // handleDetailKey gives the disclosure the keyboard it needs: Enter and Space
+    // open or close it, Escape closes it and leaves focus on the opener so the
+    // operator does not lose their place in the table.
+    function handleDetailKey(event, toggle, region) {
+        var key = event && event.key;
+        if (key === 'Enter' || key === ' ' || key === 'Spacebar') {
+            event.preventDefault();
+            toggleCellDetail(toggle, region);
+            return;
+        }
+        if (key === 'Escape' || key === 'Esc') {
+            event.preventDefault();
+            closeDetail();
+            toggle.focus();
+        }
     }
 
     function renderEvidence(entries) {
@@ -480,6 +576,9 @@
         if (!body) {
             return;
         }
+        // A detail revealed on the previous render belongs to a row that is being
+        // replaced, so the panel is closed before the table is rebuilt.
+        closeDetail();
         entries.forEach(function (flow) {
             var row = root.document.createElement('tr');
             appendCell(row, clientTokenLabel('protocol', flow.protocol));

@@ -874,6 +874,167 @@ assert.ok(rowCells('policyClientFlowRows', 0).indexOf('active') === -1,
 `)
 }
 
+// TestPolicyClientDiagCellDetailIsReachableByPointerAndKeyboard pins how the cell
+// detail is exposed, not only what it says. A native title is a hover-only
+// affordance: a touch device and a keyboard user never see it. Every cell that
+// carries detail therefore holds a disclosure inside itself - focusable, reporting
+// its expanded state and naming the region it reveals - which a click or tap, Enter
+// or Space opens and Escape closes, with one panel open at a time.
+func TestPolicyClientDiagCellDetailIsReachableByPointerAndKeyboard(t *testing.T) {
+	runClientDiagScenario(t, clientTargetsScript+`
+responder = ((base) => async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
+  const answer = await base(url, opts);
+  answer.flows.entries = [
+    {protocol: 'tcp', destination_ip: '93.184.216.34', destination_port: 443, choice: 'PROXY',
+     route_generation: 3, last_seen_age_seconds: 5, expired: false, close_seen: false,
+     decision_time: '2026-11-17T09:09:58Z', decision_reason: 'proxy_cidr_rule',
+     policy_generation: 'gen-1', backend_tunnel_id: 77,
+     dispatch: {state: 'queued_to_backend'},
+     forward: {packets: 3, bytes: 180, failed: 0, backend_writes: 2, backend_write_failed: 1,
+               backend_write_failure: 'backend_write_failed'},
+     return: {evidence: 'observed', authority: 'current_tuple_association', matched: 4,
+              admitted: 3, delivered: 2, failed: 1, dropped: 1, failure: 'client_queue_full'},
+     names: ['alpha.example', 'beta.example'], names_match: 'ambiguous', names_considered: 2,
+     name_candidates: []},
+    {protocol: 'udp', destination_ip: '8.8.8.8', destination_port: 53, choice: 'PROXY',
+     route_generation: 3, last_seen_age_seconds: 9, expired: false, close_seen: false,
+     decision_time: '2026-11-17T09:09:57Z', decision_reason: 'no_trusted_evidence',
+     policy_generation: 'gen-1',
+     dispatch: {state: 'queued_to_backend'}, forward: {packets: 3, bytes: 0, failed: 0},
+     return: {evidence: 'not_measured', packets: 0, bytes: 0},
+     names: ['plain.example'], names_match: 'unique', names_considered: 1,
+     name_candidates: []}
+  ];
+  return answer;
+})(responder);
+`, `
+const flowRows = () => Array.from(w.document.getElementById('policyClientFlowRows').children);
+const cellsOf = (row) => Array.from(row.children);
+const detailCells = () => flowRows().map(row => cellsOf(row).map(cell => ({
+  title: cell.getAttribute('title') || '',
+  toggle: cell.querySelector('[role="button"]'),
+  region: cell.querySelector('.cell-detail')
+})));
+const press = (el, key) => el.dispatchEvent(new w.KeyboardEvent('keydown',
+  {key: key, bubbles: true, cancelable: true}));
+const expandedToggles = () => Array.from(
+  w.document.querySelectorAll('#policyClientFlowRows [aria-expanded="true"]'));
+const visibleRegions = () => Array.from(
+  w.document.querySelectorAll('#policyClientFlowRows .cell-detail'))
+  .filter(region => region.hidden === false);
+
+selectClient('sess-a');
+await w.diagnoseSelectedClient();
+await settle();
+
+// Every row is still four cells, and each cell with detail keeps the disclosure
+// inside the cell it belongs to.
+assert.equal(rowCount('policyClientFlowRows'), 2, 'both flows are rendered');
+flowRows().forEach((row, index) => {
+  assert.equal(row.children.length, 4, 'row ' + index + ' still carries exactly four cells');
+});
+const cells = detailCells();
+assert.equal(cells[0][1].title, 'alpha.example, beta.example',
+  'the several-names list is the destination cell detail');
+assert.equal(cells[0][2].title.indexOf('FAILURE:backend_write_failed') >= 0, true,
+  'the failure detail is the route cell detail');
+assert.equal(cells[1][1].toggle, null,
+  'a cell with nothing more to say carries no disclosure');
+
+// 1. Closed by default, and the opener reports that state to assistive technology.
+Array.from(w.document.querySelectorAll('#policyClientFlowRows .cell-detail-toggle')).forEach(toggle => {
+  assert.equal(toggle.getAttribute('role'), 'button', 'the opener is a button for a screen reader');
+  assert.equal(toggle.getAttribute('tabindex'), '0', 'the opener is focusable');
+  assert.equal(toggle.getAttribute('aria-expanded'), 'false', 'the opener reports collapsed');
+});
+assert.equal(visibleRegions().length, 0, 'no detail is revealed before it is asked for');
+Array.from(w.document.querySelectorAll('#policyClientFlowRows .cell-detail')).forEach(region => {
+  assert.equal(region.textContent, '', 'a closed detail holds no hidden copy of the fact');
+});
+
+// The opener names the element it reveals, and that element is the one inside it.
+const namesToggle = cells[0][1].toggle;
+assert.equal(namesToggle.getAttribute('aria-controls'), cells[0][1].region.id,
+  'the opener controls the region beside it');
+assert.equal(cells[0][1].region.parentNode, cellsOf(flowRows()[0])[1],
+  'the revealed detail lives inside its own cell, not in a new column');
+
+// 2. A pointer opens it: a click on the opener and a tap on the cell both work.
+const TapEvent = w.PointerEvent || w.MouseEvent;
+const tap = (el) => el.dispatchEvent(new TapEvent('click',
+  {bubbles: true, cancelable: true, pointerType: 'touch'}));
+namesToggle.click();
+assert.equal(namesToggle.getAttribute('aria-expanded'), 'true', 'a click expands the detail');
+assert.equal(cells[0][1].region.hidden, false, 'a click reveals the region');
+assert.equal(cells[0][1].region.textContent, 'alpha.example, beta.example',
+  'the revealed text is the title text, with every matched name');
+namesToggle.click();
+assert.equal(namesToggle.getAttribute('aria-expanded'), 'false', 'a second click collapses it');
+
+// A tap is delivered as a click, which is the shape a touch device produces: jsdom
+// has no touch input, so the pointer event is what can be exercised here.
+tap(cells[0][3].region.parentNode);
+assert.equal(cells[0][3].toggle.getAttribute('aria-expanded'), 'true',
+  'a tap on the cell, delivered as a click, opens its detail');
+cells[0][3].toggle.click();
+
+cells[1][2].region.parentNode.click();
+assert.equal(cells[1][2].toggle.getAttribute('aria-expanded'), 'true',
+  'a tap anywhere in the cell opens its detail');
+cells[1][2].toggle.click();
+
+// 3. The keyboard opens it: Enter and Space.
+cells[0][2].toggle.focus();
+press(cells[0][2].toggle, 'Enter');
+assert.equal(cells[0][2].toggle.getAttribute('aria-expanded'), 'true', 'Enter expands the detail');
+assert.equal(cells[0][2].region.textContent, cells[0][2].title,
+  'the revealed failure detail is the whole title: producers, reasons and counts');
+assert.equal(cells[0][2].region.textContent.indexOf('DEVICE 2/1') >= 0, true,
+  'the backend write counts are in the revealed text');
+assert.equal(cells[0][2].region.textContent.indexOf('RET returned 4/3/2/1/1') >= 0, true,
+  'the return counts, including dropped, are in the revealed text');
+assert.equal(cells[0][3].region.textContent, '', 'the other cells stay closed');
+
+press(cells[1][3].toggle, ' ');
+assert.equal(cells[1][3].toggle.getAttribute('aria-expanded'), 'true', 'Space expands the detail');
+assert.equal(expandedToggles().length, 1, 'only one detail is open at a time');
+assert.equal(cells[0][2].region.hidden, true, 'opening another cell closes the previous one');
+assert.equal(cells[0][2].region.textContent, '', 'the closed detail keeps no text');
+
+// 4. Escape closes it and leaves focus on the opener, so the row is not lost.
+press(cells[1][3].toggle, 'Escape');
+assert.equal(cells[1][3].toggle.getAttribute('aria-expanded'), 'false', 'Escape collapses the detail');
+assert.equal(visibleRegions().length, 0, 'Escape leaves no region revealed');
+assert.equal(w.document.activeElement, cells[1][3].toggle, 'Escape keeps focus on the opener');
+
+// 5. Nothing is lost: every title a cell carries is reachable as revealed text.
+let checked = 0;
+detailCells().forEach((row, rowIndex) => {
+  row.forEach((cell, cellIndex) => {
+    if (!cell.toggle) {
+      return;
+    }
+    cell.toggle.click();
+    assert.equal(cell.region.textContent, cell.title,
+      'row ' + rowIndex + ' cell ' + cellIndex + ' reveals exactly its title text');
+    checked += 1;
+    cell.toggle.click();
+  });
+});
+assert.equal(checked, 5, 'every detail-bearing cell was opened and compared');
+
+// 6. A re-render closes what the replaced rows held.
+cells[0][2].toggle.click();
+assert.equal(visibleRegions().length, 1, 'a detail is open before the re-render');
+await w.diagnoseSelectedClient();
+await settle();
+assert.equal(visibleRegions().length, 0, 'a re-render leaves no panel open');
+assert.equal(expandedToggles().length, 0, 'a re-render resets every opener');
+assert.equal(rowCount('policyClientFlowRows'), 2, 'the table is rebuilt, not doubled');
+`)
+}
+
 // TestPolicyClientDiagFlowDestinationNamesOnlyWhenKnown pins the Destination cell:
 // the address the tuple carried, and a name only when a stored answer genuinely
 // names it. A name the client tried without an answer is not a name; when several
