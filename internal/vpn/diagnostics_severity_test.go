@@ -587,11 +587,7 @@ func TestB3ClientBackendQueueLossRefusalDegradesHealth(t *testing.T) {
 		f := forwarder.NewForwarder(nil, "192.0.2.0/24", 1)
 		path := forwarder.NewReturnPath(func(_, _ string, p []byte) (int, error) { return len(p), nil })
 		f.RegisterSessionWithReturnPath("s", "c", "peer", "192.0.2.1", 1, path)
-		// The destination is outside the pool on purpose: the pool's base+1 is the
-		// address the panel used to serve DNS on, and the legacy path refuses that one
-		// destination. This test is about queue loss, not addressing, so it sends to an
-		// ordinary external destination from the pool's first client address.
-		packet := returnPacket("8.8.8.8")
+		packet := returnPacket("192.0.2.1")
 		packet[12], packet[13], packet[14], packet[15] = 192, 0, 2, 1
 		for range forwarder.DefaultBackendQueueSize {
 			if err := f.RouteClientToBackend("peer", packet); err != nil {

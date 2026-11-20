@@ -62,27 +62,23 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 // routeClientLegacy enqueues one client packet toward the proxy backend, which is
 // the unchanged legacy route.
 //
-// One destination is refused first: the panel address issued client profiles used
-// to name as their resolver. Nothing answers it any more, and the policy path
-// refuses it as a prohibited destination, so leaving the legacy path to tunnel it
-// would report two different outcomes for one destination depending on a switch.
-// The refusal is accounted for the way every other legacy client refusal is — the
-// aggregate client drop counter plus a drop-ledger record under the same
-// prohibited-destination token — rather than discarded.
+// One service is refused first: the panel's former resolver on the DNS port. Nothing
+// answers that address and port any more, and the policy path refuses the address as
+// an internal destination, so leaving the legacy path to tunnel a query to it would
+// report two different outcomes for the same query depending on a switch. The refusal
+// is accounted for the way every other legacy client refusal is — the aggregate client
+// drop counter plus a drop-ledger record under the same prohibited-destination token —
+// rather than discarded.
 //
-// This is one destination, not a general validation pass: every other packet,
-// external resolvers included, is enqueued exactly as before, and a malformed
-// packet is neither parsed nor rejected here.
+// It is a service, not an address: the same address on any other port is ordinary
+// legacy traffic (the tunnel gateway's own services live there) and is enqueued
+// exactly as before. Nothing else on this path is inspected, accepted or rejected, so
+// this is not a validation pass.
 func (f *Forwarder) routeClientLegacy(route *sessionRoute, peerKey string, packet []byte, pktLen int64) error {
-	if dst, ok := clientPacketIPv4Destination(packet); ok && dst == f.formerResolverAddr {
-		// The tuple is recorded only when the packet can be read as one: a refused
-		// packet must never appear in the ledger with a destination it did not carry.
-		protocol, dstPort, hasTuple := uint8(0), uint16(0), false
-		if parsed, err := ParseAndValidateClientIPv4(packet, ""); err == nil {
-			protocol, dstPort, hasTuple = parsed.Protocol, parsed.DstPort, true
-		}
+	if parsed, refused := f.removedResolverService(packet); refused {
 		f.clientDropsTotal.Add(1)
-		f.recordClientDrop(peerKey, route, DropReasonProhibitedDestination, protocol, dst, dstPort, hasTuple, pktLen)
+		f.recordClientDrop(peerKey, route, DropReasonProhibitedDestination,
+			parsed.Protocol, parsed.DstIP, parsed.DstPort, true, pktLen)
 		return ErrProhibitedDestination
 	}
 
@@ -190,18 +186,37 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
 }
 
-// clientPacketIPv4Destination reads the destination address of an IPv4 client
-// packet without validating it.
+// resolverServicePort is the only port the removed panel resolver listened on. It is
+// the whole extent of the legacy path's refusal: the service, not the address.
+const resolverServicePort = 53
+
+// removedResolverService reports whether packet is addressed to the service the
+// DNS-producer deletion removed — the panel's former resolver address on the DNS port,
+// over either transport that resolver answered (UDP and TCP) — and returns the tuple to
+// record when it is.
 //
-// It exists so the legacy path can recognize ONE destination without gaining a
-// validation pass: the fixed header offset is read only for a packet whose version
-// nibble is 4 and whose header is present, and nothing else about the packet is
-// inspected, accepted or rejected here.
-func clientPacketIPv4Destination(packet []byte) (netip.Addr, bool) {
-	if len(packet) < 20 || packet[0]>>4 != 4 {
-		return netip.Addr{}, false
+// The destination is read from its fixed offset first, so the packet path pays one
+// compare per packet and parses only a packet actually addressed there. The address on
+// any other port is ordinary traffic (the tunnel gateway serves other things there),
+// and a packet that does not parse as IPv4 UDP/TCP never matches, so it keeps the
+// unchanged legacy route.
+func (f *Forwarder) removedResolverService(packet []byte) (*ParsedClientPacket, bool) {
+	if f == nil || len(packet) < 20 || packet[0]>>4 != 4 {
+		return nil, false
 	}
-	return netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]}), true
+	dst := netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]})
+	if dst != f.formerResolverAddr {
+		return nil, false
+	}
+	parsed, err := ParseAndValidateClientIPv4(packet, "")
+	if err != nil || parsed.DstPort != resolverServicePort {
+		return nil, false
+	}
+	// 6 = TCP, 17 = UDP, the two transports the removed resolver answered on.
+	if parsed.Protocol != 6 && parsed.Protocol != 17 {
+		return nil, false
+	}
+	return parsed, true
 }
 
 // classifyDestination asks the installed address classifier about one
