@@ -176,10 +176,12 @@
                         <svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy_config" }}
                     </button>
                     <button class="btn btn-primary btn-sm"
-                        onclick="UI.downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1">
+                        onclick="UI.downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1"
+                        aria-describedby="profileRegenerateNotice">
                         <svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download_conf" }}
                     </button>
                 </div>
+                <p class="form-hint" id="profileRegenerateNotice" style="color: var(--text-secondary);">{{ _ "profile_regenerate_notice" }}</p>
             </div>
         </div>
 
