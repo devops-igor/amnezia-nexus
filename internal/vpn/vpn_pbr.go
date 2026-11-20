@@ -141,11 +141,12 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 		return errors.New("vpn: forwarder unavailable")
 	}
 
-	// Default to disabled. Configurations already issued while policy routing
-	// was active keep naming the gateway, so the gateway-address-only
-	// continuity responder is installed before the classifier is turned off.
+	// Default to disabled. A configuration issued while policy routing was
+	// active keeps naming the gateway, so the resolver that answered it is
+	// removed with the data path: no profile is served by the panel once the
+	// classifier is off.
 	if !cfg.Enabled {
-		s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(cfg.GatewayDNSIP), s.continuityUpstreamsLocked(cfg))
+		s.clearDNSHandlerLocked()
 		s.forwarder.SetPBREnabled(false)
 		// The classifier belongs to the data path that routes on it: with policy
 		// routing off, no packet consults it and no stale classification survives
@@ -160,9 +161,9 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 
 	// Validate prerequisites before enabling PBR
 	if err := ValidatePBRPrerequisites(cfg); err != nil {
-		// A refused activation is a transition to disabled: keep issued
-		// gateway profiles served rather than stranding them.
-		s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(cfg.GatewayDNSIP), s.continuityUpstreamsLocked(cfg))
+		// A refused activation is a transition to disabled: remove the resolver
+		// with the data path it belongs to.
+		s.clearDNSHandlerLocked()
 		s.forwarder.SetPBREnabled(false)
 		return fmt.Errorf("pbr prerequisites: %w", err)
 	}
@@ -203,7 +204,7 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 
 	// The resolver installed above is the authority for what is dialed, so the
 	// owned list is taken from it rather than from the activation input: every
-	// later consumer (live change, teardown, continuity) reads this one field.
+	// later consumer (live change, a later activation) reads this one field.
 	if cfg.DNSResolver != nil {
 		s.dnsUpstreams = cfg.DNSResolver.Upstreams()
 	}
@@ -212,15 +213,26 @@ func (s *Service) ConfigurePBR(cfg PBRConfig) error {
 	return nil
 }
 
-// continuityUpstreamsLocked picks the upstream list for a continuity install
-// driven by a configuration: the configuration's own list when it carries one,
-// otherwise the list the service already owns. A disable that carries no list
-// therefore cannot reset an accepted one to the defaults. The caller holds s.mu.
-func (s *Service) continuityUpstreamsLocked(cfg PBRConfig) []policy.Upstream {
-	if len(cfg.UpstreamDNS) > 0 {
-		return cfg.UpstreamDNS
+// clearDNSHandlerLocked closes and removes the forwarder's ingress DNS handler.
+// The caller holds s.mu.
+//
+// It is the disable transition. With policy routing inactive no resolver answers
+// gateway-addressed DNS, so a client profile that still names the gateway address
+// receives no answer from the panel and must be replaced. The handler is removed
+// before it is closed, so no packet is admitted into a closing responder, and a
+// repeated call is a no-op.
+func (s *Service) clearDNSHandlerLocked() {
+	if s == nil || s.forwarder == nil {
+		return
 	}
-	return s.dnsUpstreams
+	handler := s.forwarder.DNSHandler()
+	if handler == nil {
+		return
+	}
+	s.forwarder.SetDNSHandler(nil)
+	if closer, ok := handler.(io.Closer); ok {
+		_ = closer.Close()
+	}
 }
 
 // installPBRDNSHandlerLocked makes the policy resolver the forwarder's DNS
@@ -260,9 +272,8 @@ func (s *Service) publishPBRUpstreamsLocked(upstreams []policy.Upstream) {
 }
 
 // EffectiveDNSUpstreams returns the effective upstream list this service has
-// accepted for its DNS consumers (the policy resolver while policy routing is
-// active, the continuity responder otherwise). An empty result means nothing has
-// been accepted yet, which the consumers treat as the effective defaults. The
+// accepted for its policy resolver. An empty result means nothing has been
+// accepted yet, which the consumers treat as the effective defaults. The
 // slice is a copy.
 func (s *Service) EffectiveDNSUpstreams() []policy.Upstream {
 	if s == nil {
@@ -845,16 +856,6 @@ func (s *Service) deriveDefaultGatewayDNSIP() netip.Addr {
 	return s.deriveGatewayDNSIPLocked()
 }
 
-// pbrGatewayDNSAddrLocked returns the gateway DNS address issued configurations
-// name: the configured address when valid, otherwise the subnet gateway. The
-// caller holds s.mu.
-func (s *Service) pbrGatewayDNSAddrLocked(configured netip.Addr) netip.Addr {
-	if validGatewayDNSAddr(configured) {
-		return configured
-	}
-	return s.deriveGatewayDNSIPLocked()
-}
-
 // deriveGatewayDNSIPLocked derives the gateway DNS address from the service
 // subnet. The caller holds s.mu for reading or writing.
 func (s *Service) deriveGatewayDNSIPLocked() netip.Addr {
@@ -1073,17 +1074,12 @@ func (s *Service) TeardownPBR() error {
 	if s.forwarder == nil {
 		return nil
 	}
-	// Configurations issued while policy routing was active keep the gateway as
-	// their only resolver. Teardown of the classifier and direct egress is
-	// unchanged; only the gateway-address-only DNS responder persists, and
-	// installing it replaces and closes the active policy resolver.
-	addr := netip.Addr{}
-	if pbrCfg != nil {
-		addr = pbrCfg.GatewayDNSIP
-	}
-	// Read the owned current list, never the activation input: an accepted live
-	// change must reach the responder that keeps issued profiles answering.
-	s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(addr), s.dnsUpstreams)
+	// A configuration issued while policy routing was active names the gateway as
+	// its only resolver. The resolver that answered it belongs to the policy data
+	// path, so it is removed here with the classifier and direct egress: the panel
+	// stops answering that address and an issued profile loses DNS until it is
+	// replaced.
+	s.clearDNSHandlerLocked()
 	s.forwarder.SetPBREnabled(false)
 	// The classifier belongs to the data path that consults it; a teardown leaves
 	// no stale classification installed behind a disabled router.

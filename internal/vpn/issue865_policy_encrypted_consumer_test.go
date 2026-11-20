@@ -3,17 +3,16 @@ package vpn
 // Issue #865: the policy-on (intercepting) Service-configured encrypted resolver
 // proof — the last open consumer of the editor's configuration.
 //
-// Why this file exists. The continuity consumer (issue865_service_encrypted_
-// consumer_test.go) proves a Service-configured encrypted list reaches a real
-// client reply, but that responder deliberately produces no routing evidence.
-// The policy resolver is the consumer that turns answers into DIRECT/PROXY
-// evidence, and it is the reason the operator configures an upstream list at all.
+// Why this file exists. The policy resolver turns answers into DIRECT/PROXY
+// evidence, and it is the reason the operator configures an upstream list at
+// all. The configured list has no other resolver consumer in this build, so this
+// is the proof that an operator-supplied encrypted entry is honoured end to end.
 // Until now it could not be reached by a fixture: the production constructor
 // passes gatewaydns.ResolverConfig{Upstreams: ...} only, so loopback upstreams are
 // refused and the trust/dial seams are unexported.
 //
-// What changed, and what did not. newPolicyUpstreamResolver is now a package-level
-// variable with an unchanged body, exactly like newDNSContinuityResolver, so a test
+// What changed, and what did not. newPolicyUpstreamResolver is a package-level
+// variable with an unchanged body, so a test
 // can wrap it. The wrapper in this file calls the real
 // gatewaydns.NewUpstreamResolver on the configuration the Service actually passes
 // and adds only AllowLoopbackUpstream; every other production behaviour — the
@@ -26,7 +25,7 @@ package vpn
 // them through initPBR (the production startup path) from SetPBRConfig input, and
 // a real client stack exchanges real DNS packets through the real forwarder.
 //
-// Trust isolation is the same child-process pattern as the continuity proof: the
+// Trust isolation is the same child-process pattern as the other encrypted fixture proof: the
 // parent mints a private CA, the child inherits it only through SSL_CERT_FILE, and
 // the host's trust store and every other process are untouched.
 
@@ -121,7 +120,7 @@ func TestIssue865PolicyEncryptedConsumer(t *testing.T) {
 type issue865PolicyPhase struct {
 	svc    *Service
 	cache  *MemoryRouteCache
-	client *continuityClient
+	client *dnsTestClient
 }
 
 // issue865StartPolicyPhase activates policy routing through Service.SetPBRConfig
@@ -151,7 +150,7 @@ func issue865StartPolicyPhase(t *testing.T, entry policy.Upstream) *issue865Poli
 
 	fwd := forwarder.NewForwarder(nil, "10.100.0.0/16", 64)
 	fwd.AttachBackendDevice(issue865PolicyBackend, &mockPBRDevice{})
-	client, path := newContinuityClient(t, fwd, issue865PolicyPeer, issue865ClientIP)
+	client, path := newDNSTestClient(t, fwd, issue865PolicyPeer, issue865ClientIP)
 	t.Cleanup(client.close)
 	fwd.RegisterSessionWithReturnPath(issue865PolicySession, "issue865-policy-connection",
 		issue865PolicyPeer, issue865ClientIP.String(), issue865PolicyBackend, path)
@@ -177,7 +176,7 @@ func issue865StartPolicyPhase(t *testing.T, entry policy.Upstream) *issue865Poli
 // the active policy gateway intercepts.
 func (p *issue865PolicyPhase) query(t *testing.T, name string, id uint16) *mdns.Msg {
 	t.Helper()
-	return continuityUDPQuery(t, p.client.stack, netip.MustParseAddrPort(issue865ForeignResolver), name, id)
+	return dnsUDPQuery(t, p.client.stack, netip.MustParseAddrPort(issue865ForeignResolver), name, id)
 }
 
 // waitDecision waits for the answer to be observed as routing evidence.
