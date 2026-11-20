@@ -166,14 +166,19 @@ func main() {
 		hostPort = "127.0.0.1:" + hostPort
 	}
 
+	// Register the handler before the listener exists. Opening the socket is what makes this
+	// process observable to the parent, and until the handler is registered a SIGTERM from
+	// the harness hits the default disposition and exits with "signal: terminated" instead of
+	// the clean exit the tests assert on. The channel is buffered so a signal that arrives
+	// before main blocks on it is retained rather than dropped.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+
 	ln, err := net.Listen("tcp", hostPort)
 	if err != nil {
 		os.Exit(5)
 	}
 	defer ln.Close()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
 	go func() {
 		for {
