@@ -91,9 +91,10 @@ type Settings struct {
 	// precedence over the committed Russian allocation inventory for every
 	// address they contain, so a deployment can correct the shipped set without
 	// waiting for a release. Empty is the default and means "the shipped set
-	// alone". The body uses the same line format as LocalEntries, but only prefix
-	// lines participate in the address question and a body with no prefix is
-	// refused rather than stored as an override that would apply nothing.
+	// alone". The body uses the same line shape as LocalEntries (blank lines and
+	// comments are ignored), but this field is an IPv4 prefix list: a body with
+	// no prefix, or one that also carries a domain rule, is refused rather than
+	// stored as an override that would apply only part of what was submitted.
 	InventoryOverride []string `json:"inventory_override,omitempty"`
 }
 
@@ -265,10 +266,21 @@ func (s Settings) validateLocalEntries() error {
 	return nil
 }
 
+// ErrInventoryOverrideNotPrefixOnly means the stored override carried a rule
+// that is not an IPv4 prefix. ParseInventoryOverride deliberately accepts mixed
+// input for other consumers, but the persisted field is an address set: a domain
+// line there would be saved and never applied, so the settings boundary refuses
+// it with this reason instead of storing an override that partly does nothing.
+var ErrInventoryOverrideNotPrefixOnly = errors.New("inventory override must contain only IPv4 prefixes")
+
 // validateInventoryOverride refuses an override body the classifier could not
 // apply. It uses the same parser the activation path uses, so a body that saves
 // is a body that classifies: an invalid override is rejected at the settings
 // boundary instead of being persisted and then silently ignored.
+//
+// The field is documented as an IPv4 prefix list, so a mixed body is refused
+// even when it also carries a usable prefix. Accepting it would store rules the
+// parser reports as ignored and no surface ever shows, which reads as applied.
 func (s Settings) validateInventoryOverride() error {
 	if len(s.InventoryOverride) == 0 {
 		return nil
@@ -276,10 +288,24 @@ func (s Settings) validateInventoryOverride() error {
 	if len(s.InventoryOverride) > MaxInventoryOverrideEntries {
 		return fmt.Errorf("%d inventory override entries exceed the maximum of %d", len(s.InventoryOverride), MaxInventoryOverrideEntries)
 	}
-	if _, err := s.ParsedInventoryOverride(); err != nil {
+	override, err := s.ParsedInventoryOverride()
+	if err != nil {
 		return fmt.Errorf("inventory override rejected: %w", err)
 	}
+	if ignored := override.DomainRuleCount(); ignored > 0 {
+		return fmt.Errorf("inventory override rejected: %w: the body also carries %d domain %s beside %d prefix %s; only prefixes are applied here",
+			ErrInventoryOverrideNotPrefixOnly, ignored, pluralWord(ignored, "rule", "rules"),
+			override.PrefixCount(), pluralWord(override.PrefixCount(), "prefix", "prefixes"))
+	}
 	return nil
+}
+
+// pluralWord returns singular for exactly one, otherwise plural.
+func pluralWord(n int, singular, plural string) string {
+	if n == 1 {
+		return singular
+	}
+	return plural
 }
 
 // ParsedInventoryOverride parses the stored override body. A nil result with a
