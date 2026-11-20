@@ -585,8 +585,8 @@ func TestDaemon_CrashRecovery(t *testing.T) {
 }
 
 // daemonSnapshot is the supervisor state a recovery assertion needs in order to describe a
-// failure without a second investigation: the generation counter, the supervised child's pid
-// and — once it has been reaped — its exit status, which lastErr does not always carry.
+// failure without a second investigation: health and generation, plus the supervised child's
+// pid and — once it has been reaped — its exit status, which lastErr does not always carry.
 type daemonSnapshot struct {
 	healthy bool
 	gen     uint64
@@ -595,14 +595,22 @@ type daemonSnapshot struct {
 }
 
 func snapshotDaemon(d *Daemon) daemonSnapshot {
-	// Read health before the generation counter: a healthy reading implies the publish already
-	// happened, which implies d.cmdGen advanced before it, so this order cannot report a
-	// healthy daemon under a stale generation.
-	s := daemonSnapshot{healthy: d.IsHealthy()}
-
+	// Every field the assertion reads comes from this one critical section, because health and
+	// generation must describe the same instant. Two acquisitions can pair a health reading
+	// taken while the crashed child is still unreaped and reported healthy with the
+	// *replacement's* generation, so "new generation AND healthy" could hold before the
+	// replacement is ready — exactly the condition the assertion exists to rule out.
+	//
+	// Health is recomputed here from the fields IsHealthy() reads instead of calling it,
+	// because IsHealthy() takes d.mu itself and a second acquisition is the inconsistency this
+	// helper is meant to avoid. The duplicate predicate is pinned against IsHealthy() by
+	// TestDaemonSnapshotMatchesIsHealthy so the two cannot drift apart silently.
 	d.mu.Lock()
-	s.gen = d.cmdGen
-	s.lastErr = d.lastErr
+	s := daemonSnapshot{
+		healthy: !d.stopped && d.cmd != nil && d.socksDialer != nil && d.lastErr == nil,
+		gen:     d.cmdGen,
+		lastErr: d.lastErr,
+	}
 	cmd := d.cmd
 	exitCh := d.exitCh
 	d.mu.Unlock()
@@ -634,6 +642,58 @@ func (s daemonSnapshot) describe(crashGen uint64) string {
 	}
 	return fmt.Sprintf("healthy=%v generation=%d (crashed generation %d) child=%s lastErr=%s",
 		s.healthy, s.gen, crashGen, s.child, lastErr)
+}
+
+// TestDaemonSnapshotMatchesIsHealthy pins the one place the test tree reproduces a product
+// predicate: snapshotDaemon recomputes IsHealthy()'s fields so health and generation come from
+// a single critical section. The table covers each field that can make the two disagree, so a
+// field added to IsHealthy() — or dropped from the snapshot — fails here instead of silently
+// weakening the recovery assertion. No process is started: this pins the predicate only.
+func TestDaemonSnapshotMatchesIsHealthy(t *testing.T) {
+	cases := []struct {
+		name      string
+		stopped   bool
+		hasCmd    bool
+		hasDialer bool
+		failed    bool
+	}{
+		// Healthy: running, dialer installed, no supervisor failure.
+		{name: "running", hasCmd: true, hasDialer: true},
+		// Restarted but not published yet: a generation exists, no dialer, crash still recorded.
+		{name: "recovering", hasCmd: true, failed: true},
+		// Child started, dialer not installed yet, no failure recorded: only the dialer can
+		// make this unhealthy.
+		{name: "child without dialer", hasCmd: true},
+		// Crash observed and reaped, restart not started.
+		{name: "crashed", failed: true},
+		// Published fields without a supervised child: only the child can make this unhealthy.
+		{name: "no child with published fields", hasDialer: true},
+		// Dialer installed but the supervisor still reports a failure.
+		{name: "failure recorded", hasCmd: true, hasDialer: true, failed: true},
+		// Stopped with leftover fields: only the stopped flag can make this unhealthy.
+		{name: "stopped with leftovers", stopped: true, hasCmd: true, hasDialer: true},
+		{name: "stopped", stopped: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Daemon{stopped: tc.stopped}
+			if tc.hasCmd {
+				d.cmd = &exec.Cmd{}
+			}
+			if tc.hasDialer {
+				d.socksDialer = &Socks5Dialer{}
+			}
+			if tc.failed {
+				d.lastErr = fmt.Errorf("naive: daemon process exited unexpectedly")
+			}
+
+			got, want := snapshotDaemon(d).healthy, d.IsHealthy()
+			if got != want {
+				t.Fatalf("snapshot healthy=%v, IsHealthy()=%v for the same state", got, want)
+			}
+		})
+	}
 }
 
 // TestDaemon_ExitReasonIsReported pins the supervisor's record of *why* a child went away.
