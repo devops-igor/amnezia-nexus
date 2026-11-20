@@ -29,6 +29,27 @@
     // wording.
     var TEXT_PREFIX = 'policy_client_';
 
+    // DECISION_REASON_LABELS maps a recorded decision reason to the one short
+    // label the flows table shows. The mapping is data, not a branch: a token this
+    // build does not know falls back to one generic label, so a raw token never
+    // reaches a cell. The two refusal conditions are listed as well - this build
+    // records them as a refused packet or a failed dispatch rather than as a
+    // flow's reason, so should a diagnosis ever carry either as one, it still
+    // renders a label instead of the token.
+    var DECISION_REASON_LABELS = {
+        allocation_direct: 'policy_client_decision_reason_allocation_direct',
+        allocation_cdn_excluded: 'policy_client_decision_reason_allocation_cdn_excluded',
+        no_trusted_evidence: 'policy_client_decision_reason_no_trusted_evidence',
+        prohibited_destination: 'policy_client_decision_reason_prohibited_destination',
+        direct_egress_unavailable: 'policy_client_decision_reason_direct_egress_unavailable',
+        proxy_cidr_rule: 'policy_client_decision_reason_proxy_cidr_rule',
+        evidence_direct: 'policy_client_decision_reason_evidence_direct',
+        proxy_cached_evidence: 'policy_client_decision_reason_proxy_cached_evidence',
+        sticky_flow: 'policy_client_decision_reason_sticky_flow',
+        non_tcp_udp_fallback: 'policy_client_decision_reason_non_tcp_udp_fallback',
+        not_recorded: 'policy_client_decision_reason_not_recorded'
+    };
+
     var initialized = false;
     // The newest request issued. A response whose sequence is not this one is
     // stale and is dropped, which is what keeps two deferred answers from
@@ -419,9 +440,15 @@
         return clientText('policy_client_failed');
     }
 
-    function appendCell(row, text) {
+    // appendCell writes one table cell. A cell whose full fact is longer than the
+    // column carries the detail it cannot show as its title, so the row stays
+    // readable without the detail being invented or silently dropped.
+    function appendCell(row, text, title) {
         var cell = root.document.createElement('td');
         cell.textContent = text == null || text === '' ? '-' : String(text);
+        if (title) {
+            cell.title = String(title);
+        }
         row.appendChild(cell);
         return cell;
     }
@@ -442,10 +469,10 @@
         });
     }
 
-    // renderFlows renders the recorded decisions and outcomes. Every cell states
-    // what the server sent: a branch token, a correlation class, or an explicit
-    // "not recorded"/"not measured". Nothing here derives a cause, a name or a
-    // success.
+    // renderFlows renders the recorded decisions for one incarnation, as four
+    // columns: the protocol, the destination, the route the flow was given and the
+    // reason for that route. Every cell states what the server sent; nothing here
+    // derives a cause, a name or a success.
     function renderFlows(entries) {
         var body = clientElement('policyClientFlowRows');
         if (!body) {
@@ -454,106 +481,76 @@
         entries.forEach(function (flow) {
             var row = root.document.createElement('tr');
             appendCell(row, clientTokenLabel('protocol', flow.protocol));
-            appendCell(row, flow.destination_ip + ':' + String(flow.destination_port));
+            appendFlowDestination(row, flow);
             appendCell(row, clientTokenLabel('decision', flow.choice));
-
-            var decision = flow.decision_time + ' · ' + clientTokenLabel('reason', flow.decision_reason);
-            if (flow.policy_generation && flow.policy_generation !== 'not_recorded') {
-                decision = decision + ' · ' + flow.policy_generation;
-            }
-            // The backend the branch selected, when the recorded decision carries one.
-            // It is the producer's own value, not a lookup of the current configuration.
-            if (flow.backend_tunnel_id != null) {
-                decision = decision + ' · ' + clientText('policy_client_backend_fmt')
-                    .replace('{backend}', String(flow.backend_tunnel_id));
-            }
-            appendCell(row, decision);
-
-            var names = clientTokenLabel('name_match', flow.names_match);
-            if (flow.names && flow.names.length) {
-                names = names + ': ' + flow.names.join(', ');
-            } else if (flow.name_attempts && flow.name_attempts.length) {
-                // A failed query has no answer to attribute to this IP. These are
-                // names the client tried near the decision, never "the flow's name".
-                var tried = flow.name_attempts.map(function (attempt) {
-                    var label = attempt.name + ' (' + clientTokenLabel('dns_event', attempt.kind);
-                    if (attempt.qtype) {
-                        label = label + ', ' + attempt.qtype;
-                    }
-                    return label + ')';
-                }).join(', ');
-                names = names + ': ' + clientText('policy_client_tried_names_fmt').replace('{names}', tried);
-            } else if (flow.names_reason) {
-                names = names + ': ' + clientTokenLabel('corr', flow.names_reason);
-            }
-            appendCell(row, names);
-
-            // The route and the dispatch outcome are stated together, on the
-            // server's own tokens: a flow routed DIRECT whose packets never reached
-            // the WAN must read as direct-and-failed rather than as an unexplained
-            // failure, because the cause is the egress path, not the classifier.
-            var dispatchState = (flow.dispatch && flow.dispatch.state) || 'not_recorded';
-            var routeOutcome = clientText('policy_client_route_outcome_fmt')
-                .replace('{route}', clientTokenLabel('decision', flow.choice))
-                .replace('{dispatch}', clientTokenLabel('dispatch', dispatchState));
-            var outcome = routeOutcome + ' · ' + clientText('policy_client_outcome_fmt')
-                .replace('{ok}', String((flow.forward && flow.forward.packets) || 0))
-                .replace('{failed}', String((flow.forward && flow.forward.failed) || 0))
-                .replace('{return}', clientTokenLabel('return_evidence', (flow.return && flow.return.evidence) || 'not_recorded'))
-                .replace('{packets}', String((flow.return && flow.return.packets) || 0));
-            if (flow.forward && flow.forward.failure) {
-                outcome = outcome + ' · ' + clientTokenLabel('failure', flow.forward.failure);
-            }
-            // PROXY return: arrival, queue admission and the client handoff are three
-            // different observations. They are rendered as a chain so "admitted" is never
-            // read as "delivered", and a refusal states where the reply stopped.
-            if (flow.choice === 'PROXY' && flow.return && flow.return.evidence === 'observed') {
-                var chain = clientText('policy_client_return_chain_fmt')
-                    .replace('{matched}', String(flow.return.matched || 0))
-                    .replace('{admitted}', String(flow.return.admitted || 0))
-                    .replace('{delivered}', String(flow.return.delivered || 0))
-                    .replace('{failed}', String(flow.return.failed || 0));
-                if (flow.return.failure) {
-                    chain = chain + ' (' + clientTokenLabel('failure', flow.return.failure) + ')';
-                }
-                // The claim beside the numbers: this is the flow that owns the tuple now,
-                // which is not proof of which remote incarnation answered.
-                if (flow.return.authority) {
-                    chain = chain + ' · ' + clientTokenLabel('return_authority', flow.return.authority);
-                }
-                outcome = outcome + ' · ' + chain;
-            }
-            // Admission and the backend device write are different facts: a proxy
-            // flow states both, so "queued" is never read as "delivered".
-            // Only stated when a device outcome exists: "0 written / 0 failed" on a
-            // packet that has not reached the writer yet would read as a measurement.
-            if (flow.choice === 'PROXY' && flow.forward &&
-                ((flow.forward.backend_writes || 0) + (flow.forward.backend_write_failed || 0)) > 0) {
-                var written = clientText('policy_client_backend_write_fmt')
-                    .replace('{ok}', String(flow.forward.backend_writes || 0))
-                    .replace('{failed}', String(flow.forward.backend_write_failed || 0));
-                if (flow.forward.backend_write_failure) {
-                    written = written + ' (' + clientTokenLabel('failure', flow.forward.backend_write_failure) + ')';
-                }
-                outcome = outcome + ' · ' + written;
-            }
-            appendCell(row, outcome);
-
-            appendCell(row, formatSeconds(flow.last_seen_age_seconds));
-            var state = flow.expired ? 'expired' : 'active';
-            if (flow.close_seen) {
-                state = state + '/closed';
-            }
-            appendCell(row, state);
+            appendFlowDecision(row, flow);
             body.appendChild(row);
         });
     }
 
-    function formatSeconds(seconds) {
-        if (typeof seconds !== 'number' || !isFinite(seconds)) {
-            return '-';
+    // appendFlowDestination states the recorded tuple, followed by the matched DNS
+    // name only when exactly one stored answer names this address. Several matched
+    // names are stated as several instead of choosing one silently, and the names a
+    // client tried without an answer are never shown: an unanswered query says
+    // nothing about where this flow went.
+    function appendFlowDestination(row, flow) {
+        var address = flow.destination_ip + ':' + String(flow.destination_port);
+        var names = flow.names || [];
+        if (names.length === 1) {
+            appendCell(row, address + ' (' + names[0] + ')');
+            return;
         }
-        return clientText('policy_client_seconds').replace('{seconds}', String(Math.max(0, Math.floor(seconds))));
+        if (names.length > 1) {
+            var several = clientText('policy_client_flow_names_multiple')
+                .replace('{count}', String(names.length));
+            appendCell(row, address + ' (' + several + ')', names.join(', '));
+            return;
+        }
+        appendCell(row, address);
+    }
+
+    // appendFlowDecision states the recorded reason as one short label. The instant,
+    // the policy generation, the selected backend and the raw token stay out of the
+    // cell: they are the background of the label, so they are offered as the cell's
+    // title instead of crowding the row.
+    function appendFlowDecision(row, flow) {
+        var token = flow.decision_reason == null ? '' : String(flow.decision_reason);
+        appendCell(row, clientText(decisionReasonLabelKey(token)), flowDecisionDetail(flow, token));
+    }
+
+    // decisionReasonLabelKey resolves a recorded reason to its label key. A flow
+    // recorded without one is not a different condition, so it takes the
+    // "not recorded" label; a token this build does not know takes the generic
+    // one, which is also what keeps the token out of the cell text.
+    function decisionReasonLabelKey(token) {
+        if (!token) {
+            return 'policy_client_decision_reason_not_recorded';
+        }
+        if (Object.prototype.hasOwnProperty.call(DECISION_REASON_LABELS, token)) {
+            return DECISION_REASON_LABELS[token];
+        }
+        return 'policy_client_decision_reason_unknown';
+    }
+
+    // flowDecisionDetail is what the cell cannot show: when the decision was taken,
+    // against which policy generation, for which backend, and the token the label
+    // was derived from.
+    function flowDecisionDetail(flow, token) {
+        var parts = [];
+        if (flow.decision_time && flow.decision_time !== 'not_recorded') {
+            parts.push(String(flow.decision_time));
+        }
+        if (flow.policy_generation && flow.policy_generation !== 'not_recorded') {
+            parts.push(String(flow.policy_generation));
+        }
+        if (flow.backend_tunnel_id != null) {
+            parts.push(clientText('policy_client_backend_fmt')
+                .replace('{backend}', String(flow.backend_tunnel_id)));
+        }
+        if (token && token !== 'not_recorded') {
+            parts.push(token);
+        }
+        return parts.join(' · ');
     }
 
     // renderDNSRecords renders the observed answers. The name, its validated
@@ -870,9 +867,6 @@
             if (!flows.scan_complete) {
                 flowFoot = flowFoot + ' ' + clientText('policy_client_partial_scan').replace('{scanned}', String(flows.scanned || 0));
             }
-        }
-        if ((flows.entries || []).length) {
-            flowFoot = flowFoot + ' ' + clientText('policy_client_counters_live_note');
         }
         renderFoot('policyClientFlowFoot', flowFoot);
 

@@ -100,7 +100,7 @@ w._ = key => {
   if (key === 'policy_client_outcome_fmt') return 'OUTCOME {ok}/{failed} · return {return} {packets}';
   if (key === 'policy_client_route_outcome_fmt') return 'ROUTE {route} · {dispatch}';
   if (key === 'policy_client_tried_names_fmt') return 'TRIED {names}';
-  if (key === 'policy_client_counters_live_note') return 'COUNTERS-LIVE';
+  if (key === 'policy_client_flow_names_multiple') return 'SEVERAL {count}';
   if (key === 'policy_client_drop_truncated') return 'DROP-TRUNC {shown}/{total}';
   if (key === 'policy_client_drop_coverage') return 'DROPCOV {stored}/{merged}/{evicted}/{pruned} session {session_keys} ledger {keys}/{key_limit} {age}';
   if (key === 'policy_client_drop_no_tuple') return 'NO-TUPLE';
@@ -129,6 +129,8 @@ w._ = key => {
   // Token families resolve to a sentinel, so an assertion can prove the token
   // was looked up in the dictionary instead of being printed raw.
   if (key.indexOf('policy_client_state_') === 0) return 'STATE:' + key.slice('policy_client_state_'.length);
+  if (key.indexOf('policy_client_decision_reason_') === 0)
+    return 'DECISION_REASON:' + key.slice('policy_client_decision_reason_'.length);
   if (key.indexOf('policy_client_decision_') === 0) return 'DECISION:' + key.slice('policy_client_decision_'.length);
   if (key.indexOf('policy_client_protocol_') === 0) return 'PROTO:' + key.slice('policy_client_protocol_'.length);
   if (key.indexOf('policy_client_limit_') === 0) return 'LIMIT:' + key.slice('policy_client_limit_'.length);
@@ -165,6 +167,12 @@ const options = () => Array.from(w.document.getElementById('policyClientSelect')
     generation: o.getAttribute('data-route-generation')}));
 const rowCount = id => w.document.getElementById(id).children.length;
 const rowCells = (id, index) => Array.from(w.document.getElementById(id).children[index].children).map(c => c.textContent);
+// rowHeaders reads the headers of the table that owns a body id, and rowCellTitles
+// the tooltips of one row: the cells' detail lives there, not in their text.
+const rowHeaders = id => Array.from(
+  w.document.getElementById(id).closest('table').querySelectorAll('thead th')).map(th => th.textContent);
+const rowCellTitles = (id, index) => Array.from(w.document.getElementById(id).children[index].children)
+  .map(c => c.getAttribute('title') || '');
 const selectClient = (id) => {
   const select = w.document.getElementById('policyClientSelect');
   select.value = id;
@@ -300,12 +308,16 @@ assert.deepEqual(rowCells('policyClientEvidenceRows', 0),
    '2026-11-17T09:14:30Z', 'fresh']);
 
 assert.equal(rowCount('policyClientFlowRows'), 1, 'one live flow is rendered');
+assert.deepEqual(rowHeaders('policyClientFlowRows'),
+  ['policy_client_column_protocol', 'policy_client_column_destination',
+   'policy_client_column_choice', 'policy_client_column_decision'],
+  'the flows table renders the four columns an operator reads');
 assert.deepEqual(rowCells('policyClientFlowRows', 0),
-  ['PROTO:tcp', '93.184.216.34:443', 'DECISION:direct',
-   '2026-11-17T09:09:58Z · REASON:evidence_direct · gen-1',
-   'NAME_MATCH:unique: plain.example',
-   'ROUTE DECISION:direct · DISPATCH:written_to_wan · OUTCOME 1/0 · return RETURN_EVIDENCE:not_observed 0',
-   '42s', 'active']);
+  ['PROTO:tcp', '93.184.216.34:443 (plain.example)', 'DECISION:direct',
+   'DECISION_REASON:evidence_direct']);
+assert.equal(rowCellTitles('policyClientFlowRows', 0)[3],
+  '2026-11-17T09:09:58Z · gen-1 · evidence_direct',
+  'the instant, the generation and the token the label came from are the cell tooltip');
 
 const limits = Array.from(w.document.getElementById('policyClientLimitations').children).map(li => li.textContent);
 assert.deepEqual(limits, ['LIMIT:dns_names_not_retained',
@@ -502,9 +514,11 @@ assert.equal(w.document.getElementById('policyClientEvidenceFoot').hidden, false
   'a truncated evidence page must say so');
 assert.equal(text('policyClientEvidenceFoot'), 'TRUNC 1/9');
 assert.equal(w.document.getElementById('policyClientFlowFoot').hidden, false);
-assert.equal(text('policyClientFlowFoot'), 'FLOWS 1/600 PARTIAL 16384 COUNTERS-LIVE',
-  'the flow count must be presented as a windowed count, with the live-sample caveat');
-assert.equal(rowCells('policyClientFlowRows', 0)[0], 'PROTO:udp');
+assert.equal(text('policyClientFlowFoot'), 'FLOWS 1/600 PARTIAL 16384',
+  'the flow count must be presented as a windowed count, with the partial scan stated');
+assert.deepEqual(rowCells('policyClientFlowRows', 0),
+  ['PROTO:udp', '1.1.1.1:53', 'DECISION:proxy', 'DECISION_REASON:not_recorded'],
+  'a flow recorded without decision metadata says so instead of showing an empty cell');
 // Pre-flow refusals: a real row per reason, an explicit "no tuple" instead of an
 // invented destination, the truncation note and the retention coverage.
 assert.equal(rowCells('policyClientDropRows', 0)[0], 'REASON:prohibited',
@@ -595,39 +609,36 @@ await settle();
 assert.equal(rowCount('policyClientFlowRows'), 3, 'all three states are rendered');
 
 const ambiguous = rowCells('policyClientFlowRows', 0);
+assert.equal(ambiguous[1], '93.184.216.34:443 (SEVERAL 2)',
+  'several candidate names are stated as several, never collapsed to one');
 assert.equal(ambiguous[2], 'DECISION:proxy', 'the recorded route is rendered');
-assert.equal(ambiguous[3], '2026-11-17T09:09:58Z · REASON:proxy_cidr_rule · gen-1 · BACKEND 77',
-  'the decision instant, reason, generation and selected backend are rendered together');
-assert.equal(ambiguous[4], 'NAME_MATCH:ambiguous: plain.example, shared.example',
-  'several candidate names are shown as several, never collapsed to one');
-assert.equal(ambiguous[5], 'ROUTE DECISION:proxy · DISPATCH:failed · OUTCOME 0/2 · return RETURN_EVIDENCE:not_measured 0 · FAILURE:backend_queue_full',
-  'a refused dispatch and an unmeasured return are both visible');
+assert.equal(ambiguous[3], 'DECISION_REASON:proxy_cidr_rule',
+  'the deciding reason is one label, not a sentence of metadata');
+assert.equal(rowCellTitles('policyClientFlowRows', 0)[3],
+  '2026-11-17T09:09:58Z · gen-1 · BACKEND 77 · proxy_cidr_rule',
+  'the instant, the generation, the selected backend and the token are the cell tooltip');
 
 const none = rowCells('policyClientFlowRows', 1);
-assert.equal(none[4],
-  'NAME_MATCH:none: TRIED missing.example (EVENT:nxdomain, A)',
-  'an unresolved query near the decision states the name that was tried, not just the reason');
-assert.equal(none[5],
-  'ROUTE DECISION:proxy · DISPATCH:queued_to_backend · OUTCOME 3/0 · return RETURN_EVIDENCE:observed 0 · RET returned 4/3/2/1 (FAILURE:client_queue_full)'
-    + ' · RETURN_AUTHORITY:current_tuple_association'
-    + ' · DEVICE 2/1 (FAILURE:backend_write_failed)',
-  'a proxy flow states queue admission, the device write and the return chain separately');
+assert.equal(none[1], '8.8.8.8:53',
+  'a name the client tried without an answer is not this flow destination name');
+assert.equal(none[3], 'DECISION_REASON:no_trusted_evidence',
+  'the fail-closed default has its own label');
 
 const unrecorded = rowCells('policyClientFlowRows', 2);
-assert.equal(unrecorded[3], 'not_recorded · REASON:not_recorded',
+assert.equal(unrecorded[1], '1.1.1.1:80');
+assert.equal(unrecorded[3], 'DECISION_REASON:not_recorded',
   'a flow without decision metadata says so instead of showing an empty instants cell');
-assert.equal(unrecorded[5], 'ROUTE DECISION:direct · DISPATCH:written_to_wan · OUTCOME 4/0 · return RETURN_EVIDENCE:observed 2',
-  'an observed return is distinguished from an unmeasured one');
+assert.equal(rowCellTitles('policyClientFlowRows', 2)[3], '',
+  'a decision that recorded nothing offers no tooltip');
 `)
 }
 
-// TestPolicyClientDiagDistinguishesDirectFailedFromDirectWorked covers the
-// distinction the epic review asked for (issue #920): two flows with the same
-// deciding reason differ in outcome, and the difference is a direct-and-failed
-// reading rather than an unexplained failure. The route and the dispatch outcome
-// are asserted together, because that conjunction is what tells an operator the
-// egress path failed rather than the classifier.
-func TestPolicyClientDiagDistinguishesDirectFailedFromDirectWorked(t *testing.T) {
+// TestPolicyClientDiagFlowsTableKeepsFourColumnsAndDropsTheRest pins the flows
+// table to the four columns an operator reads (issue #940). Both flows below carry
+// the dispatch and return evidence the table used to spell out, and none of it may
+// be rendered: not in a column, not under another name, and not hidden by a style.
+// The test fails if a removed column comes back.
+func TestPolicyClientDiagFlowsTableKeepsFourColumnsAndDropsTheRest(t *testing.T) {
 	runClientDiagScenario(t, clientTargetsScript+`
 responder = ((base) => async (url, opts) => {
   if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
@@ -657,23 +668,181 @@ await w.diagnoseSelectedClient();
 await settle();
 assert.equal(rowCount('policyClientFlowRows'), 2, 'both direct flows are rendered');
 
-const worked = rowCells('policyClientFlowRows', 0);
-const failed = rowCells('policyClientFlowRows', 1);
+const headers = rowHeaders('policyClientFlowRows');
+assert.deepEqual(headers, ['policy_client_column_protocol', 'policy_client_column_destination',
+  'policy_client_column_choice', 'policy_client_column_decision'],
+  'the header row is the four columns, not eight');
+['policy_client_column_names', 'policy_client_column_outcome',
+ 'policy_client_column_last_seen', 'policy_client_column_state'].forEach(removed => {
+  assert.ok(headers.indexOf(removed) === -1,
+    'the removed header ' + removed + ' must not return');
+});
 
-// Same route, same deciding reason: the classifier is not what differs.
-assert.equal(worked[2], 'DECISION:direct');
-assert.equal(failed[2], 'DECISION:direct');
-assert.equal(rowCells('policyClientFlowRows', 0)[3], '2026-11-17T09:09:58Z · REASON:allocation_direct · gen-1');
-assert.equal(rowCells('policyClientFlowRows', 1)[3], '2026-11-17T09:09:59Z · REASON:allocation_direct · gen-1');
+Array.from(w.document.getElementById('policyClientFlowRows').children).forEach((row, index) => {
+  assert.equal(row.children.length, 4, 'row ' + index + ' carries exactly four cells');
+});
 
-// The outcome cell names the route and what happened to the packets, so a failed
-// direct flow reads as direct-and-failed instead of as a bare "failed".
-assert.equal(worked[5], 'ROUTE DECISION:direct · DISPATCH:written_to_wan · OUTCOME 2/0 · return RETURN_EVIDENCE:not_observed 0',
-  'a direct flow whose WAN writes succeeded is not reported as failed');
-assert.equal(failed[5], 'ROUTE DECISION:direct · DISPATCH:failed · OUTCOME 0/1 · return RETURN_EVIDENCE:not_observed 0 · FAILURE:direct_egress_unavailable',
-  'a direct flow whose egress failed is direct-and-failed, with the producer failure named');
-assert.notEqual(worked[5], failed[5],
-  'the two outcomes must be distinguishable without inspecting logs');
+// Same route and same deciding reason: the two rows are indistinguishable here
+// because the dispatch difference the removed column used to carry is gone from
+// the DOM, not merely hidden.
+assert.deepEqual(rowCells('policyClientFlowRows', 0),
+  ['PROTO:tcp', '213.180.204.186:443', 'DECISION:direct', 'DECISION_REASON:allocation_direct']);
+assert.deepEqual(rowCells('policyClientFlowRows', 1),
+  ['PROTO:tcp', '185.73.194.82:443', 'DECISION:direct', 'DECISION_REASON:allocation_direct']);
+
+const removedEvidence = ['ROUTE ', 'DISPATCH', 'OUTCOME', 'RETURN', 'DEVICE ', 'FAILURE',
+  'direct_egress_unavailable', 'written_to_wan'];
+rowCells('policyClientFlowRows', 1).forEach(cell => {
+  removedEvidence.forEach(marker => {
+    assert.equal(cell.indexOf(marker), -1,
+      'the removed dispatch/return evidence must not be rendered as ' + marker);
+  });
+});
+assert.ok(rowCells('policyClientFlowRows', 0).indexOf('active') === -1,
+  'the removed state column is not rendered under another name');
+`)
+}
+
+// TestPolicyClientDiagFlowDestinationNamesOnlyWhenKnown pins the Destination cell:
+// the address the tuple carried, and a name only when a stored answer genuinely
+// names it. A name the client tried without an answer is not a name, and several
+// matching names are stated as several rather than one of them being chosen.
+func TestPolicyClientDiagFlowDestinationNamesOnlyWhenKnown(t *testing.T) {
+	runClientDiagScenario(t, clientTargetsScript+`
+responder = ((base) => async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
+  const answer = await base(url, opts);
+  answer.flows.entries = [
+    {protocol: 'tcp', destination_ip: '93.184.216.34', destination_port: 443, choice: 'DIRECT',
+     last_seen_age_seconds: 3, expired: false, close_seen: false,
+     decision_reason: 'evidence_direct', names: [], names_match: 'not_recorded',
+     names_reason: 'no_retained_answer',
+     name_attempts: [{name: 'missing.example', qtype: 'A', kind: 'nxdomain',
+                      received_at: '2026-11-17T09:09:50Z'}]},
+    {protocol: 'udp', destination_ip: '8.8.8.8', destination_port: 53, choice: 'PROXY',
+     last_seen_age_seconds: 4, expired: false, close_seen: false,
+     decision_reason: 'no_trusted_evidence',
+     names: ['plain.example'], names_match: 'unique', names_considered: 1},
+    {protocol: 'tcp', destination_ip: '1.1.1.1', destination_port: 443, choice: 'PROXY',
+     last_seen_age_seconds: 5, expired: false, close_seen: false,
+     decision_reason: 'proxy_cached_evidence',
+     names: ['plain.example', 'shared.example', 'other.example'],
+     names_match: 'ambiguous', names_considered: 3}
+  ];
+  return answer;
+})(responder);
+`, `
+selectClient('sess-a');
+await w.diagnoseSelectedClient();
+await settle();
+assert.equal(rowCount('policyClientFlowRows'), 3, 'all three destinations are rendered');
+
+// 1. Only unanswered attempts: no name, because no answer named this address.
+const attemptedOnly = rowCells('policyClientFlowRows', 0);
+assert.equal(attemptedOnly[1], '93.184.216.34:443',
+  'an unanswered attempt must not be presented as the flow destination name');
+assert.ok(attemptedOnly[1].indexOf('missing.example') === -1,
+  'the attempted name stays out of the destination cell entirely');
+
+// 2. One stored answer names the address: it is shown with the address.
+const single = rowCells('policyClientFlowRows', 1);
+assert.equal(single[1], '8.8.8.8:53 (plain.example)',
+  'the one answer that names the address is shown beside it');
+
+// 3. Several stored answers name it: stated as several, and none is chosen.
+const several = rowCells('policyClientFlowRows', 2);
+assert.equal(several[1], '1.1.1.1:443 (SEVERAL 3)',
+  'several matching names are stated as several instead of choosing one');
+assert.equal(rowCellTitles('policyClientFlowRows', 2)[1],
+  'plain.example, shared.example, other.example',
+  'every matching name is available in the cell tooltip');
+assert.equal(rowCellTitles('policyClientFlowRows', 0)[1], '',
+  'an address with no known name carries no tooltip');
+`)
+}
+
+// TestPolicyClientDiagFlowDecisionLabels pins the Decision cell: one short label per
+// recorded condition, with no instant, generation, backend id or raw token in the
+// cell text. The detail the cell cannot show is its tooltip, which is where the
+// token stays quotable.
+func TestPolicyClientDiagFlowDecisionLabels(t *testing.T) {
+	runClientDiagScenario(t, clientTargetsScript+`
+const reasons = ['allocation_direct', 'allocation_cdn_excluded', 'no_trusted_evidence',
+  'prohibited_destination', 'direct_egress_unavailable', 'proxy_cidr_rule',
+  'evidence_direct', 'proxy_cached_evidence', 'sticky_flow', 'non_tcp_udp_fallback',
+  'not_recorded', 'brand_new_reason'];
+responder = ((base) => async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
+  const answer = await base(url, opts);
+  answer.flows.entries = reasons.map((reason, index) => ({
+    protocol: 'tcp', destination_ip: '93.184.216.' + (10 + index), destination_port: 443,
+    choice: 'DIRECT', last_seen_age_seconds: 3, expired: false, close_seen: false,
+    decision_time: reason === 'not_recorded' ? 'not_recorded'
+      : '2026-11-17T09:09:5' + (index % 10) + 'Z', decision_reason: reason,
+    policy_generation: 'gen-9', backend_tunnel_id: index === 5 ? 77 : undefined,
+    names: [], names_match: 'not_recorded', name_attempts: []}));
+  return answer;
+})(responder);
+`, `
+// The labels this test asserts are the shipped English wording for each token.
+const LABELS = {
+  policy_client_decision_reason_allocation_direct: 'Direct by list',
+  policy_client_decision_reason_allocation_cdn_excluded: 'Proxy: shared CDN',
+  policy_client_decision_reason_no_trusted_evidence: 'Default proxy failover',
+  policy_client_decision_reason_prohibited_destination: 'Blocked destination',
+  policy_client_decision_reason_direct_egress_unavailable: 'Direct unavailable',
+  policy_client_decision_reason_proxy_cidr_rule: 'Operator rule',
+  policy_client_decision_reason_evidence_direct: 'DNS evidence',
+  policy_client_decision_reason_proxy_cached_evidence: 'DNS evidence: proxy',
+  policy_client_decision_reason_sticky_flow: 'Kept earlier choice',
+  policy_client_decision_reason_non_tcp_udp_fallback: 'Proxy: protocol fallback',
+  policy_client_decision_reason_not_recorded: 'Not recorded',
+  policy_client_decision_reason_unknown: 'Other reason'
+};
+const fallback = w._;
+w._ = key => LABELS[key] || fallback(key);
+
+selectClient('sess-a');
+await w.diagnoseSelectedClient();
+await settle();
+assert.equal(rowCount('policyClientFlowRows'), 12, 'every recorded reason is one row');
+
+const rows = Array.from(w.document.getElementById('policyClientFlowRows').children);
+assert.deepEqual(rows.map(row => row.children[3].textContent), [
+  'Direct by list',
+  'Proxy: shared CDN',
+  'Default proxy failover',
+  'Blocked destination',
+  'Direct unavailable',
+  'Operator rule',
+  'DNS evidence',
+  'DNS evidence: proxy',
+  'Kept earlier choice',
+  'Proxy: protocol fallback',
+  'Not recorded',
+  'Other reason'
+], 'each recorded reason renders its own short label');
+
+// The cell carries the label and nothing else.
+rows.forEach((row, index) => {
+  const cell = row.children[3].textContent;
+  assert.ok(cell.indexOf('2026-') === -1, 'the decision instant stays out of the cell');
+  assert.ok(cell.indexOf('gen-9') === -1, 'the policy generation stays out of the cell');
+  assert.ok(cell.indexOf('BACKEND') === -1, 'the backend stays out of the cell');
+  assert.equal(cell.indexOf(reasons[index]), -1,
+    'the raw reason token stays out of the cell');
+});
+
+// The tooltip is where the detail lives.
+const titles = rows.map(row => row.children[3].getAttribute('title') || '');
+assert.equal(titles[0], '2026-11-17T09:09:50Z · gen-9 · allocation_direct',
+  'the instant, generation and token are the cell tooltip');
+assert.equal(titles[5], '2026-11-17T09:09:55Z · gen-9 · BACKEND 77 · proxy_cidr_rule',
+  'a proxy decision keeps its selected backend in the tooltip');
+assert.equal(titles[10], 'gen-9',
+  'a flow recorded without a reason has no instant or token to describe');
+assert.ok(titles[11].indexOf('brand_new_reason') !== -1,
+  'a token this build does not know stays quotable in the tooltip');
 `)
 }
 
