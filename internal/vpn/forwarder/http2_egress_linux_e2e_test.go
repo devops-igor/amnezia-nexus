@@ -58,10 +58,13 @@ import (
 // direct origin, one netstack proxy backend with the proxied origin, and one
 // forwarder with policy routing enabled.
 type h2Fixture struct {
-	t        *testing.T
-	fwd      *Forwarder
-	dem      *DirectEgressManager
-	rc       *testRouteCache
+	t   *testing.T
+	fwd *Forwarder
+	dem *DirectEgressManager
+	// direct holds the destinations classified as allocation members, which is the
+	// address input that makes a flow take the DIRECT path. Retained DNS evidence
+	// no longer routes, so a DIRECT session states its destination here.
+	direct   map[netip.Addr]struct{}
 	wan      *mssClampDevice
 	cert     tls.Certificate
 	pool     *x509.CertPool
@@ -73,7 +76,7 @@ type h2Fixture struct {
 
 func newH2EgressFixture(t *testing.T) *h2Fixture {
 	t.Helper()
-	fx := &h2Fixture{t: t, rc: newTestRouteCache(), body: h2OriginBody(), proxyID: 401}
+	fx := &h2Fixture{t: t, direct: make(map[netip.Addr]struct{}), body: h2OriginBody(), proxyID: 401}
 
 	cert, pool, certPEM, keyPEM := newH2OriginCertificate(t)
 	fx.cert, fx.pool = cert, pool
@@ -98,7 +101,9 @@ func newH2EgressFixture(t *testing.T) *h2Fixture {
 	}, fx.fwd)
 	t.Cleanup(func() { _ = fx.dem.Close() })
 	fx.fwd.SetDirectEgress(fx.dem)
-	fx.fwd.SetRouteCache(fx.rc)
+	// Configured as production does; it holds the answers this fixture no longer
+	// consults for a route.
+	fx.fwd.SetRouteCache(newTestRouteCache())
 	fx.fwd.StartPumps(t.Context())
 
 	// The proxied origin needs the forwarder, and its teardown must close its
@@ -221,19 +226,38 @@ type h2Session struct {
 }
 
 // startSession registers a peer whose packets enter the production dispatcher
-// and whose returns are bounded by the client tunnel MTU.
+// and whose returns are bounded by the client tunnel MTU. decision states the
+// address input for the session's destination: DIRECT classifies it as an
+// allocation member, PROXY leaves it uncovered.
 func (fx *h2Fixture) startSession(t *testing.T, peerKey, sessionID, clientIP string, clientMTU uint32, dst netip.Addr, decision policy.Decision) *h2Session {
 	t.Helper()
 	client := newH2ClientStack(t, netip.MustParseAddr(clientIP), clientMTU)
 	returns := newH2MTUReturnPath(h2PathMTU, client.inject)
 	path := NewReturnPath(returns.write)
 	fx.fwd.RegisterSessionWithReturnPath(sessionID, "conn-"+peerKey, peerKey, clientIP, fx.proxyID, path)
-	fx.rc.Set(sessionID, dst, decision)
+	fx.routeDestination(dst, decision)
 	client.setSubmit(func(packet []byte) error { return fx.fwd.RouteClientToBackend(peerKey, packet) })
 
 	s := &h2Session{fx: fx, client: client, returns: returns, peerKey: peerKey, sessionID: sessionID, clientIP: clientIP, path: path}
 	t.Cleanup(s.end)
 	return s
+}
+
+// routeDestination states the address input for one destination. A DIRECT
+// decision is expressed the way the shipped classifier expresses it, by
+// classifying the destination as an allocation member; a PROXY decision is the
+// uncovered default. The set accumulates, so classifying a later session's
+// destination cannot unclassify a session that is still live.
+func (fx *h2Fixture) routeDestination(dst netip.Addr, decision policy.Decision) {
+	if decision != policy.Direct {
+		return
+	}
+	fx.direct[dst] = struct{}{}
+	addrs := make([]netip.Addr, 0, len(fx.direct))
+	for addr := range fx.direct {
+		addrs = append(addrs, addr)
+	}
+	fx.fwd.SetDestinationClassifier(newTestDirectClassifier(addrs...))
 }
 
 func (s *h2Session) end() {

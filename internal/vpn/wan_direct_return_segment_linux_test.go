@@ -393,7 +393,6 @@ func buildReturnSegRig(t *testing.T, wan forwarder.PacketDevice, server netip.Ad
 	for _, c := range clients {
 		path := forwarder.NewReturnPath(c.returnSink)
 		fwd.RegisterSessionWithReturnPath("sess-"+c.peerKey, "conn-"+c.peerKey, c.peerKey, c.clientIP, 301, path)
-		cache.Set("sess-"+c.peerKey, server, policy.Direct)
 	}
 	svc := &Service{forwarder: fwd}
 	if err := svc.ConfigurePBR(PBRConfig{
@@ -406,6 +405,10 @@ func buildReturnSegRig(t *testing.T, wan forwarder.PacketDevice, server netip.Ad
 	}); err != nil {
 		t.Fatalf("ConfigurePBR: %v", err)
 	}
+	// The remote endpoint is classified as an allocation member, so every flow to
+	// it takes the DIRECT path by address. Retained DNS evidence no longer routes.
+	installDirectDestinations(fwd, server)
+
 	dem := fwd.DirectEgress()
 	if dem == nil {
 		t.Fatal("ConfigurePBR installed no DirectEgressManager")

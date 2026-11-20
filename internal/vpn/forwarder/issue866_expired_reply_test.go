@@ -8,8 +8,6 @@ import (
 	"net/netip"
 	"testing"
 	"time"
-
-	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
 // The tests in this file cover the flow-lifetime rule for the INCOMING
@@ -293,12 +291,12 @@ func TestIssue866ReverseTrafficExtendsLiveFlow(t *testing.T) {
 	h.requireDelivered(sink, natPort, issue866RemotePort, "reply-after-push", "reply after the client resumed")
 }
 
-// TestIssue866ActiveTrafficStableAfterDNSEvidenceExpiry is the control for the
-// expiry rule: an established flow keeps its decision and tuple while the DNS
-// evidence that created it lapses, so the correction cannot turn evidence aging
-// into a path change for live traffic. A new tuple with no evidence still fails
-// closed to PROXY.
-func TestIssue866ActiveTrafficStableAfterDNSEvidenceExpiry(t *testing.T) {
+// TestIssue866ActiveTrafficStableAfterReclassification is the control for the
+// expiry rule: an established flow keeps its decision and tuple when the address
+// classification that chose DIRECT is withdrawn, so a changed decision input
+// cannot move live traffic. A tuple decided after the withdrawal has no
+// classification and fails closed to PROXY.
+func TestIssue866ActiveTrafficStableAfterReclassification(t *testing.T) {
 	base := freeNATRange(t, 2)
 	const flowTimeout = 200 * time.Millisecond
 	h := newDirectEgressHarness(t, DirectEgressConfig{
@@ -311,14 +309,14 @@ func TestIssue866ActiveTrafficStableAfterDNSEvidenceExpiry(t *testing.T) {
 	h.dem.SetQuarantineDurations(quarantine, quarantine)
 	sink := h.register("session-one")
 
-	if err := h.dispatchUDP(issue866ClientPort, issue866RemotePort, "evidence-query"); err != nil {
-		t.Fatalf("DIRECT admission on fresh evidence failed: %v", err)
+	if err := h.dispatchUDP(issue866ClientPort, issue866RemotePort, "classified-query"); err != nil {
+		t.Fatalf("DIRECT admission of the classified destination failed: %v", err)
 	}
 	natPort := h.lastNATPort()
-	h.requireDelivered(sink, natPort, issue866RemotePort, "evidence-reply", "reply on fresh evidence")
+	h.requireDelivered(sink, natPort, issue866RemotePort, "classified-reply", "reply on the classified destination")
 
-	// The DNS answer that justified DIRECT lapses; the flow must not care.
-	h.cache.Set("session-one", h.remote, policy.Unknown)
+	// The classification that justified DIRECT is withdrawn; the live flow must not care.
+	h.fwd.SetDestinationClassifier(nil)
 
 	// Failure-only diagnostics: the state this case depends on is recorded around each real
 	// dispatch and reply, and printed only if the case fails. Nothing here changes a flow, a
@@ -343,28 +341,28 @@ func TestIssue866ActiveTrafficStableAfterDNSEvidenceExpiry(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		time.Sleep(flowTimeout / 4)
 		recordIssue866(fmt.Sprintf("before_dispatch_%d", i))
-		if err := h.dispatchUDP(issue866ClientPort, issue866RemotePort, "no-evidence-query"); err != nil {
+		if err := h.dispatchUDP(issue866ClientPort, issue866RemotePort, "reclassified-query"); err != nil {
 			t.Fatalf("client packet on the established flow failed: %v", err)
 		}
 		recordIssue866(fmt.Sprintf("after_dispatch_%d", i))
 		if got := h.lastNATPort(); got != natPort {
-			t.Fatalf("live flow changed NAT port after evidence expiry: %d, want %d", got, natPort)
+			t.Fatalf("live flow changed NAT port after reclassification: %d, want %d", got, natPort)
 		}
 		recordIssue866(fmt.Sprintf("before_reply_%d", i))
-		h.requireDelivered(sink, natPort, issue866RemotePort, "no-evidence-reply", "reply on the established flow")
+		h.requireDelivered(sink, natPort, issue866RemotePort, "reclassified-reply", "reply on the established flow")
 	}
 
-	// Fail-closed selection is preserved for a tuple that has no evidence.
+	// Fail-closed selection is preserved for a tuple decided with no classification.
 	wanBefore := len(h.wanDev.getPackets())
-	if err := h.dispatchUDP(issue866ClientPort+1, issue866RemotePort, "no-evidence-new-tuple"); err != nil {
-		t.Fatalf("dispatch of an evidence-less tuple failed: %v", err)
+	if err := h.dispatchUDP(issue866ClientPort+1, issue866RemotePort, "uncovered-new-tuple"); err != nil {
+		t.Fatalf("dispatch of an uncovered tuple failed: %v", err)
 	}
 	if got := len(h.wanDev.getPackets()); got != wanBefore {
-		t.Fatalf("an evidence-less tuple egressed directly: %d new WAN packet(s)", got-wanBefore)
+		t.Fatalf("an uncovered tuple egressed directly: %d new WAN packet(s)", got-wanBefore)
 	}
-	fresh := buildTestIPv4UDPPacket(h.client, h.remote, issue866ClientPort+1, issue866RemotePort, []byte("no-evidence-new-tuple"))
+	fresh := buildTestIPv4UDPPacket(h.client, h.remote, issue866ClientPort+1, issue866RemotePort, []byte("uncovered-new-tuple"))
 	if choice, found := h.dem.LookupFlow(h.peerKey, fresh); !found || choice != EgressChoiceProxy {
-		t.Fatalf("evidence-less tuple decision: got %v (found=%v), want PROXY", choice, found)
+		t.Fatalf("uncovered tuple decision: got %v (found=%v), want PROXY", choice, found)
 	}
 }
 

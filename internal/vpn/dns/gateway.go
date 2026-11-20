@@ -97,9 +97,8 @@ type GatewayConfig struct {
 	// policy-routing session: UDP replies are built from the queried address,
 	// and every TCP connection is translated onto its own internal connection
 	// so replies are rewritten back to the exact client/resolver tuple that
-	// queried. While the gateway-address-only continuity service serves issued
-	// configurations after policy routing is disabled, this flag stays false
-	// and only queries addressed to Gateway are answered.
+	// queried. With the flag false only queries addressed to Gateway are
+	// answered.
 	InterceptAllDestinations bool
 }
 

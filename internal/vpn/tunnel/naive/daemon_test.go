@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -165,14 +166,19 @@ func main() {
 		hostPort = "127.0.0.1:" + hostPort
 	}
 
+	// Register the handler before the listener exists. Opening the socket is what makes this
+	// process observable to the parent, and until the handler is registered a SIGTERM from
+	// the harness hits the default disposition and exits with "signal: terminated" instead of
+	// the clean exit the tests assert on. The channel is buffered so a signal that arrives
+	// before main blocks on it is retained rather than dropped.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+
 	ln, err := net.Listen("tcp", hostPort)
 	if err != nil {
 		os.Exit(5)
 	}
 	defer ln.Close()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
 	go func() {
 		for {
@@ -531,35 +537,237 @@ func TestDaemon_CrashRecovery(t *testing.T) {
 	}()
 
 	port := d.Port()
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	// Simulate unexpected crash by killing the process directly
 	d.mu.Lock()
 	proc := d.cmd.Process
+	crashGen := d.cmdGen
 	d.mu.Unlock()
-
-	if proc != nil {
-		_ = proc.Kill()
+	if proc == nil {
+		t.Fatal("expected a running child process before the crash")
 	}
 
-	// Wait for supervisor to restart the process and become ready on the same port
-	restarted := false
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	deadline := time.Now().Add(4 * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(100 * time.Millisecond)
-		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			restarted = true
+	crashAt := time.Now()
+	_ = proc.Kill()
+
+	// Recovery means the supervisor reaps the crashed child and publishes a ready replacement
+	// generation on the same port. Both cheaper signals are wrong on their own:
+	//   - a TCP accept on the port is not readiness: the replacement listener starts accepting
+	//     one readiness-probe interval before the supervisor clears lastErr and installs the
+	//     SOCKS5 dialer (measured 22-25ms idle, up to 81ms on a loaded host), so asserting
+	//     health the instant the port accepts reports a recovering daemon as broken;
+	//   - IsHealthy() alone is not evidence of recovery either: it stays true for the 1-60ms
+	//     between the kill and the supervisor reaping the child, so waiting only on it can
+	//     succeed before any restart happened.
+	// Waiting for a new generation that is healthy covers both. The window allows the
+	// supervisor's own single-attempt budget (200ms restart delay + 3s readiness probe) plus
+	// scheduling headroom; measured end-to-end recovery was 228ms idle and 356ms at worst
+	// under 2x CPU oversubscription, so the window keeps an 11x margin over the worst
+	// observation instead of being the binding constraint.
+	const recoveryWindow = 4 * time.Second
+	deadline := crashAt.Add(recoveryWindow)
+	var state daemonSnapshot
+	for {
+		state = snapshotDaemon(d)
+		if state.gen > crashGen && state.healthy {
 			break
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected the supervisor to publish a recovered generation within %v of the crash, took %v: %s",
+				recoveryWindow, time.Since(crashAt).Round(time.Millisecond), state.describe(crashGen))
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	if !restarted {
-		t.Fatal("expected daemon to recover and restart after crash")
+	// The replacement must serve on the same loopback port the crashed generation used.
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatalf("expected recovered generation to accept on the same port %s after %v: %v: %s",
+			addr, time.Since(crashAt).Round(time.Millisecond), err, state.describe(crashGen))
 	}
-	if !d.IsHealthy() {
-		t.Errorf("expected daemon to be healthy after recovery, got last error: %v", d.LastError())
+	_ = conn.Close()
+}
+
+// daemonSnapshot is the supervisor state a recovery assertion needs in order to describe a
+// failure without a second investigation: health and generation, plus the supervised child's
+// pid and — once it has been reaped — its exit status, which lastErr does not always carry.
+type daemonSnapshot struct {
+	healthy bool
+	gen     uint64
+	child   string
+	lastErr error
+}
+
+func snapshotDaemon(d *Daemon) daemonSnapshot {
+	// Every field the assertion reads comes from this one critical section, because health and
+	// generation must describe the same instant. Two acquisitions can pair a health reading
+	// taken while the crashed child is still unreaped and reported healthy with the
+	// *replacement's* generation, so "new generation AND healthy" could hold before the
+	// replacement is ready — exactly the condition the assertion exists to rule out.
+	//
+	// Health is recomputed here from the fields IsHealthy() reads instead of calling it,
+	// because IsHealthy() takes d.mu itself and a second acquisition is the inconsistency this
+	// helper is meant to avoid. The duplicate predicate is pinned against IsHealthy() by
+	// TestDaemonSnapshotMatchesIsHealthy so the two cannot drift apart silently.
+	d.mu.Lock()
+	s := daemonSnapshot{
+		healthy: !d.stopped && d.cmd != nil && d.socksDialer != nil && d.lastErr == nil,
+		gen:     d.cmdGen,
+		lastErr: d.lastErr,
+	}
+	cmd := d.cmd
+	exitCh := d.exitCh
+	d.mu.Unlock()
+
+	if cmd == nil || cmd.Process == nil {
+		s.child = "no supervised child"
+		return s
+	}
+	pid := cmd.Process.Pid
+	s.child = fmt.Sprintf("pid %d running", pid)
+	if exitCh != nil {
+		select {
+		case <-exitCh:
+			// exitCh is closed by the Wait goroutine after it reaped the process, so
+			// ProcessState is complete and safe to read here.
+			if cmd.ProcessState != nil {
+				s.child = fmt.Sprintf("pid %d exited (%s)", pid, cmd.ProcessState)
+			}
+		default:
+		}
+	}
+	return s
+}
+
+func (s daemonSnapshot) describe(crashGen uint64) string {
+	lastErr := "none"
+	if s.lastErr != nil {
+		lastErr = s.lastErr.Error()
+	}
+	return fmt.Sprintf("healthy=%v generation=%d (crashed generation %d) child=%s lastErr=%s",
+		s.healthy, s.gen, crashGen, s.child, lastErr)
+}
+
+// TestDaemonSnapshotMatchesIsHealthy pins the one place the test tree reproduces a product
+// predicate: snapshotDaemon recomputes IsHealthy()'s fields so health and generation come from
+// a single critical section. The table covers each field that can make the two disagree, so a
+// field added to IsHealthy() — or dropped from the snapshot — fails here instead of silently
+// weakening the recovery assertion. No process is started: this pins the predicate only.
+func TestDaemonSnapshotMatchesIsHealthy(t *testing.T) {
+	cases := []struct {
+		name      string
+		stopped   bool
+		hasCmd    bool
+		hasDialer bool
+		failed    bool
+	}{
+		// Healthy: running, dialer installed, no supervisor failure.
+		{name: "running", hasCmd: true, hasDialer: true},
+		// Restarted but not published yet: a generation exists, no dialer, crash still recorded.
+		{name: "recovering", hasCmd: true, failed: true},
+		// Child started, dialer not installed yet, no failure recorded: only the dialer can
+		// make this unhealthy.
+		{name: "child without dialer", hasCmd: true},
+		// Crash observed and reaped, restart not started.
+		{name: "crashed", failed: true},
+		// Published fields without a supervised child: only the child can make this unhealthy.
+		{name: "no child with published fields", hasDialer: true},
+		// Dialer installed but the supervisor still reports a failure.
+		{name: "failure recorded", hasCmd: true, hasDialer: true, failed: true},
+		// Stopped with leftover fields: only the stopped flag can make this unhealthy.
+		{name: "stopped with leftovers", stopped: true, hasCmd: true, hasDialer: true},
+		{name: "stopped", stopped: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Daemon{stopped: tc.stopped}
+			if tc.hasCmd {
+				d.cmd = &exec.Cmd{}
+			}
+			if tc.hasDialer {
+				d.socksDialer = &Socks5Dialer{}
+			}
+			if tc.failed {
+				d.lastErr = fmt.Errorf("naive: daemon process exited unexpectedly")
+			}
+
+			got, want := snapshotDaemon(d).healthy, d.IsHealthy()
+			if got != want {
+				t.Fatalf("snapshot healthy=%v, IsHealthy()=%v for the same state", got, want)
+			}
+		})
+	}
+}
+
+// TestDaemon_ExitReasonIsReported pins the supervisor's record of *why* a child went away.
+// Without it the crash-recovery assertion can only report that the process exited, which is
+// exactly the message that made an earlier failure look like a product race.
+func TestDaemon_ExitReasonIsReported(t *testing.T) {
+	mockBin := buildMockNaiveBinary(t)
+
+	p := models.NaiveProxyParams{
+		Username: "alice",
+		Password: "secret-password",
+		Domain:   "camouflage.example.com",
+		EnableH3: false,
+	}
+
+	cases := []struct {
+		name   string
+		signal os.Signal
+		want   string
+	}{
+		// A signal death must carry the kernel's reason, not just "exited unexpectedly".
+		{name: "killed", signal: syscall.SIGKILL, want: "naive: daemon process exited unexpectedly: signal: killed"},
+		// A clean exit has no status to report, and no reason may be invented for it.
+		{name: "clean_exit", signal: syscall.SIGTERM, want: "naive: daemon process exited unexpectedly"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, err := NewDaemon(mockBin, "198.51.100.1:443", p)
+			if err != nil {
+				t.Fatalf("NewDaemon: %v", err)
+			}
+			d.SetReadinessTimeout(1 * time.Second)
+			// Keep the error observable: a pending restart delay means the successful recovery
+			// cannot clear lastErr while this test is asserting on it.
+			d.SetRestartDelay(5 * time.Second)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			if err := d.Start(ctx); err != nil {
+				t.Fatalf("Start daemon: %v", err)
+			}
+			defer func() {
+				_ = d.Stop()
+			}()
+
+			d.mu.Lock()
+			proc := d.cmd.Process
+			d.mu.Unlock()
+			if proc == nil {
+				t.Fatal("expected a running child process")
+			}
+			if err := proc.Signal(tc.signal); err != nil {
+				t.Fatalf("signal child: %v", err)
+			}
+
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				if err := d.LastError(); err != nil {
+					if got := err.Error(); got != tc.want {
+						t.Fatalf("expected supervisor error %q, got %q", tc.want, got)
+					}
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			t.Fatal("expected the supervisor to record the child's exit")
+		})
 	}
 }
 

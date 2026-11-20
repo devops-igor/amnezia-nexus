@@ -56,6 +56,8 @@ type clientDiagFixture struct {
 	example  netip.Addr
 	proxyIP  netip.Addr
 	peerKey  string
+	// directAddrs are the destinations this fixture's classifier routes DIRECT.
+	directAddrs map[netip.Addr]struct{}
 }
 
 // newClientDiagFixture builds the production chain: a forwarder with a backend
@@ -317,8 +319,9 @@ func TestClientDiagnosisReportsTheProducersOwnRecords(t *testing.T) {
 	f.queryIP(t, "plain.example", 50001)
 	f.queryIP(t, "proxy.example", 50002)
 
-	// One unlisted destination (no evidence -> PROXY default), one DIRECT
-	// destination (fresh DIRECT evidence), one PROXY destination (evidence).
+	// One uncovered destination (PROXY default), one destination inside the
+	// allocation (DIRECT by address), one PROXY destination (operator rule).
+	f.direct(t, f.example)
 	f.sendTCP(t, netip.MustParseAddr("8.8.4.4"), 40001, 80)
 	f.sendTCP(t, f.example, 40002, 443)
 	f.sendTCP(t, f.proxyIP, 40003, 443)

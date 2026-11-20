@@ -727,13 +727,6 @@ func s4BuildDispatcherService(wanDev forwarder.PacketDevice, fixture *s4Fixture)
 	for _, peer := range s4PeerRegistrations {
 		path := forwarder.NewReturnPath(s4ReplySink(replies))
 		fwd.RegisterSessionWithReturnPath("sess-"+peer.peerKey, "conn-"+peer.peerKey, peer.peerKey, peer.clientIP, s4ProxyBackendID, path)
-		// Direct decisions come from observed client DNS evidence, exactly as in
-		// production; seeding the cache for the fixture peer keeps the flow honest
-		// without inventing a second decision path. The proxied peer deliberately
-		// gets NO direct decision, so its packet must take the proxy path.
-		if peer.clientIP != s4ProxyBackendClientIP {
-			rc.Set("sess-"+peer.peerKey, fixture.peerIP, policy.Direct)
-		}
 	}
 
 	svc := &Service{forwarder: fwd}
@@ -749,6 +742,11 @@ func s4BuildDispatcherService(wanDev forwarder.PacketDevice, fixture *s4Fixture)
 		stopBackend()
 		return nil, nil, nil, nil, fmt.Errorf("ConfigurePBR: %w", err)
 	}
+	// The remote endpoint is classified as an allocation member, so the direct
+	// peers' flows to it take the DIRECT path by address. The proxied peer targets
+	// an uncovered destination, so its packet must take the proxy path.
+	installDirectDestinations(fwd, fixture.peerIP)
+
 	dem := svc.forwarder.DirectEgress()
 	if dem == nil {
 		stopBackend()

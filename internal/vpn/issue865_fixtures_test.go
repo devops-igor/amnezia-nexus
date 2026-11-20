@@ -1,43 +1,15 @@
 package vpn
 
-// Issue #865: the VPN Service-configured encrypted resolver consumer proof.
+// Shared fixtures for the issue #865 encrypted-consumer proofs: a private
+// certificate authority, encrypted DNS responders and a real client network
+// stack wired into the production forwarder.
 //
-// The gap this file closes, precisely: the existing module and gateway tests
-// prove that a client DNS packet intercepted by a gateway reaches an
-// authenticated encrypted fixture. They do not prove that a resolver built by
-// the VPN Service from the operator's configured upstream list does the same,
-// because the Service passes gatewaydns.ResolverConfig{Upstreams: ...} only.
-//
-// Both Service resolver-construction paths consume the same operator list, so the
-// distinction below is the whole point of the file:
-//
-//   - Exercised: the continuity responder. installDNSContinuity() is the
-//     production startup entry point (service_lifecycle.go); it builds the
-//     resolver from the Service's own configured upstream list and serves
-//     already-issued client profiles through the real forwarder return path.
-//     Its resolver factory, newDNSContinuityResolver, is an existing documented
-//     test substitution point; the substitution below calls the real
-//     gatewaydns.NewUpstreamResolver with the real config and adds only
-//     AllowLoopbackUpstream (an exported field documented as needed by resolver
-//     fixtures). Nothing is mocked, replaced or prebuilt, and no validation is
-//     skipped other than admitting the loopback fixture address.
-//   - NOT exercised, deliberately: the policy/intercepting resolver. It has no
-//     factory substitution point, its only hooks are pre-set resolver/gateway
-//     fields (i.e. injecting a prebuilt resolver, which is not factory proof),
-//     and its configured list admits no loopback endpoint. Routing evidence for a
-//     Service-configured encrypted list therefore remains unproved and is
-//     reported as the remaining gap rather than approximated here. The continuity
-//     responder writes no routing evidence by design.
-//
-// Trust isolation: the resolver in this path uses the process system store
-// (tlsRootCAs nil). The parent test mints a private CA and re-executes this test
-// binary as a child with SSL_CERT_FILE pointing at that CA only, so the child's
-// first system-pool load trusts it while the host, other processes and all
-// production configuration are untouched. Chain, hostname/IP verification and
-// pins remain the real ones.
+// The fixtures live in their own file because two proofs use them: the policy
+// resolver proof (issue865_policy_encrypted_consumer_test.go) and, before this
+// file existed, a proof for the resolver that served already-issued gateway
+// profiles. That resolver is gone; the fixtures it shared remain.
 
 import (
-	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -47,7 +19,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
-	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -55,27 +26,16 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/devops-igor/amnezia-nexus/internal/policy"
-	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	mdns "github.com/miekg/dns"
-)
-
-const (
-	// issue865ChildEnv marks the isolated child process, whose system trust store
-	// is the private fixture CA supplied through SSL_CERT_FILE.
-	issue865ChildEnv = "ISSUE865_SERVICE_CHILD"
-	// issue865FixtureDirEnv points the child at the key material the parent minted.
-	issue865FixtureDirEnv = "ISSUE865_SERVICE_FIXTURE_DIR"
-	// issue865ChildMarker is printed only after every controlled result passed.
-	issue865ChildMarker = "ISSUE865_SERVICE_PROOF_OK"
 )
 
 // issue865FixtureAnswers is the name→address table the encrypted fixtures serve.
@@ -90,6 +50,92 @@ var (
 	issue865Gateway   = netip.MustParseAddr("10.100.0.1")
 	issue865ClientIP  = netip.MustParseAddr("10.100.0.2")
 )
+
+// dnsTestClient is a real client network stack. Its outbound packets enter the
+// production forwarder entry point and performed DNS replies arrive through the
+// session's return path, so an unmodified client accepts every answer.
+type dnsTestClient struct {
+	dev   tun.Device
+	stack *netstack.Net
+	stop  chan struct{}
+	done  chan struct{}
+}
+
+func newDNSTestClient(t *testing.T, fwd *forwarder.Forwarder, peerKey string, clientIP netip.Addr) (*dnsTestClient, *forwarder.ReturnPath) {
+	t.Helper()
+	dev, stack, err := netstack.CreateNetTUN([]netip.Addr{clientIP}, nil, 1500)
+	if err != nil {
+		t.Fatalf("failed to create client netstack: %v", err)
+	}
+	path := forwarder.NewReturnPath(func(_, _ string, packet []byte) (int, error) {
+		return dev.Write([][]byte{packet}, 0)
+	})
+	c := &dnsTestClient{dev: dev, stack: stack, stop: make(chan struct{}), done: make(chan struct{})}
+	go func() {
+		defer close(c.done)
+		buf := make([][]byte, 1)
+		buf[0] = make([]byte, 1500)
+		sizes := make([]int, 1)
+		for {
+			select {
+			case <-c.stop:
+				return
+			default:
+			}
+			n, err := dev.Read(buf, sizes, 0)
+			if err != nil {
+				return
+			}
+			if n > 0 && sizes[0] > 0 {
+				pkt := make([]byte, sizes[0])
+				copy(pkt, buf[0][:sizes[0]])
+				_ = fwd.RouteClientToBackend(peerKey, pkt)
+			}
+		}
+	}()
+	return c, path
+}
+
+func (c *dnsTestClient) close() {
+	close(c.stop)
+	_ = c.dev.Close()
+	select {
+	case <-c.done:
+	case <-time.After(2 * time.Second):
+	}
+}
+
+// dnsUDPQuery performs one DNS A query from a real client stack and returns the
+// answer the client received.
+func dnsUDPQuery(t *testing.T, stack *netstack.Net, dst netip.AddrPort, name string, id uint16) *mdns.Msg {
+	t.Helper()
+	conn, err := stack.DialUDPAddrPort(netip.AddrPort{}, dst)
+	if err != nil {
+		t.Fatalf("client failed to dial %s over UDP: %v", dst, err)
+	}
+	defer conn.Close()
+	req := new(mdns.Msg)
+	req.SetQuestion(name, mdns.TypeA)
+	req.Id = id
+	payload, err := req.Pack()
+	if err != nil {
+		t.Fatalf("failed to pack DNS query: %v", err)
+	}
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("failed to write DNS query to %s: %v", dst, err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("no UDP reply from %s: %v", dst, err)
+	}
+	resp := new(mdns.Msg)
+	if err := resp.Unpack(buf[:n]); err != nil {
+		t.Fatalf("failed to unpack UDP reply from %s: %v", dst, err)
+	}
+	return resp
+}
 
 // issue865CA is a private certificate authority for one test process tree.
 type issue865CA struct {
@@ -348,150 +394,4 @@ func issue865AssertRefused(t *testing.T, label string, resp *mdns.Msg) {
 	if len(resp.Answer) != 0 {
 		t.Fatalf("%s: a refused exchange still answered %d records", label, len(resp.Answer))
 	}
-}
-
-// TestIssue865ServiceEncryptedConsumer is the parent half: it mints the private
-// fixture material and runs the isolated child that owns the system-trust
-// override. A skipped, empty or failed child is a failure here.
-func TestIssue865ServiceEncryptedConsumer(t *testing.T) {
-	if os.Getenv(issue865ChildEnv) == "1" {
-		t.Skip("this is the isolated child process; the parent test is the entry point")
-	}
-	dir := t.TempDir()
-	trusted := issue865MintCA(t)
-	trusted.issue865WriteCA(t, filepath.Join(dir, "ca.pem"))
-	issue865WriteLeaf(t, dir, "leaf", trusted)
-	untrusted := issue865MintCA(t)
-	issue865WriteLeaf(t, dir, "other", untrusted)
-
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatalf("locate this test binary: %v", err)
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, executable,
-		"-test.run=^TestIssue865ServiceEncryptedConsumerChild$",
-		"-test.v", "-test.count=1", "-test.timeout=90s")
-	cmd.Env = append(os.Environ(),
-		issue865ChildEnv+"=1",
-		"SSL_CERT_FILE="+filepath.Join(dir, "ca.pem"),
-		issue865FixtureDirEnv+"="+dir,
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("isolated child failed: %v\n%s", err, out)
-	}
-	text := string(out)
-	for _, want := range []string{
-		"--- PASS: TestIssue865ServiceEncryptedConsumerChild",
-		issue865ChildMarker,
-		"dot=1",
-		"doh=1",
-		"cert_refused=1",
-		"pin_refused=1",
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("isolated child output is missing %q:\n%s", want, text)
-		}
-	}
-	if strings.Contains(text, "--- SKIP") {
-		t.Fatalf("the isolated child skipped instead of proving the consumer:\n%s", text)
-	}
-	// Keep the child's own report in the test log: it is the evidence that the
-	// four controlled results actually executed in the isolated process.
-	t.Logf("isolated child output:\n%s", text)
-}
-
-// TestIssue865ServiceEncryptedConsumerChild drives a real Service-configured
-// encrypted resolver through a real client. It runs only in the child process the
-// parent starts, because the system trust store must be loaded for the first time
-// with the private fixture CA in SSL_CERT_FILE.
-func TestIssue865ServiceEncryptedConsumerChild(t *testing.T) {
-	if os.Getenv(issue865ChildEnv) != "1" {
-		t.Skip("runs only inside the isolated child process started by the parent test")
-	}
-	dir := os.Getenv(issue865FixtureDirEnv)
-	if dir == "" {
-		t.Fatal("fixture directory is missing from the child environment")
-	}
-	trusted := issue865LoadKeyPair(t, dir, "leaf")
-	untrusted := issue865LoadKeyPair(t, dir, "other")
-
-	// The Service's own resolver factory, substituted at its documented test seam.
-	// The real constructor still builds the resolver from the config the Service
-	// passes; only the test-only loopback admission is enabled.
-	previousFactory := newDNSContinuityResolver
-	newDNSContinuityResolver = func(cfg gatewaydns.ResolverConfig) (gatewaydns.Resolver, error) {
-		cfg.AllowLoopbackUpstream = true
-		return gatewaydns.NewUpstreamResolver(cfg)
-	}
-	t.Cleanup(func() { newDNSContinuityResolver = previousFactory })
-
-	// Real forwarder, real returned packets, real client stack.
-	fwd := forwarder.NewForwarder(nil, "10.100.0.0/16", 64)
-	fwd.AttachBackendDevice(9, &mockPBRDevice{})
-	client, path := newContinuityClient(t, fwd, "issue865-service-peer", issue865ClientIP)
-	t.Cleanup(client.close)
-	fwd.RegisterSessionWithReturnPath("issue865-service-session", "issue865-service-connection",
-		"issue865-service-peer", issue865ClientIP.String(), 9, path)
-
-	svc := &Service{forwarder: fwd}
-	t.Cleanup(svc.closeDNSContinuity)
-	dst := netip.AddrPortFrom(issue865Gateway, 53)
-
-	// 1. DoT positive: the Service builds the resolver from the configured list
-	// and the client receives the fixture's answer through the encrypted exchange.
-	dot := issue865StartDoT(t, trusted)
-	svc.dnsUpstreams = []policy.Upstream{{
-		Address: "127.0.0.1", Port: dot.port, Transport: policy.TransportDoT,
-	}}
-	svc.installDNSContinuity()
-	issue865AssertAnswer(t, "DoT configured upstream", continuityUDPQuery(t, client.stack, dst, "matched.example.", 8651), issue865MatchedIP)
-	if got := dot.handshakes.Load(); got == 0 {
-		t.Fatal("DoT fixture saw no TLS handshake: the configured entry was not dialed")
-	}
-
-	// 2. DoH positive: same wiring, DoH transport, and the fixture rejects anything
-	// that is not a DoH POST.
-	doh := issue865StartDoH(t, trusted)
-	svc.dnsUpstreams = []policy.Upstream{{
-		Address: "127.0.0.1", Port: doh.port, Transport: policy.TransportDoH,
-	}}
-	svc.installDNSContinuity()
-	issue865AssertAnswer(t, "DoH configured upstream", continuityUDPQuery(t, client.stack, dst, "direct.example.", 8652), issue865DirectIP)
-	if got := doh.requests.Load(); got == 0 {
-		t.Fatal("DoH fixture served no DoH request: the configured entry was not dialed")
-	}
-	if got := doh.rejected.Load(); got != 0 {
-		t.Fatalf("DoH fixture rejected %d requests: the exchange was not a DoH POST on the RFC 8484 path", got)
-	}
-
-	// 3. Certificate refusal: the fixture presents a leaf from a CA the child does
-	// not trust, so the encrypted exchange must fail even though the resolver
-	// reached the listener.
-	certRefused := issue865StartDoT(t, untrusted)
-	svc.dnsUpstreams = []policy.Upstream{{
-		Address: "127.0.0.1", Port: certRefused.port, Transport: policy.TransportDoT,
-	}}
-	svc.installDNSContinuity()
-	issue865AssertRefused(t, "untrusted certificate", continuityUDPQuery(t, client.stack, dst, "matched.example.", 8653))
-	if got := certRefused.handshakes.Load(); got == 0 {
-		t.Fatal("the untrusted-certificate control never reached the encrypted listener")
-	}
-
-	// 4. Pin refusal: the chain verifies, the configured pin does not match the
-	// serving leaf, and the answer must be refused on the pin alone.
-	pinRefused := issue865StartDoT(t, trusted)
-	svc.dnsUpstreams = []policy.Upstream{{
-		Address: "127.0.0.1", Port: pinRefused.port, Transport: policy.TransportDoT,
-		SPKIPin: issue865SPKIPin(t, untrusted),
-	}}
-	svc.installDNSContinuity()
-	issue865AssertRefused(t, "pin mismatch", continuityUDPQuery(t, client.stack, dst, "matched.example.", 8654))
-	if got := pinRefused.handshakes.Load(); got == 0 {
-		t.Fatal("the pin-mismatch control never reached the encrypted listener")
-	}
-
-	fmt.Printf("%s dot=1 doh=1 cert_refused=1 pin_refused=1\n", issue865ChildMarker)
 }

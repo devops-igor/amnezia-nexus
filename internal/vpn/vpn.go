@@ -193,16 +193,12 @@ type Service struct {
 	portalPrivKey    string
 	awgProvider      AWGStatusProvider
 	ingressEngine    *IngressEngine
-	// dnsContinuity is the gateway-address-only DNS responder that serves
-	// configurations issued while policy routing was active and survives its
-	// disablement. Guarded by mu.
-	dnsContinuity *dnsContinuityService
 	// dnsUpstreams is THE current effective upstream list every DNS consumer
 	// reads: the live policy resolver sets it on activation and on an accepted
-	// live change, and teardown, continuity installs and disabled-startup
-	// recovery rebuild from it. It is never derived from activation metadata, so
-	// a list the operator replaced cannot come back. Guarded by mu; always a
-	// private copy.
+	// live change, and a disabled or refused activation records the operator's
+	// accepted list here for the next activation. It is never derived from
+	// activation metadata, so a list the operator replaced cannot come back.
+	// Guarded by mu; always a private copy.
 	dnsUpstreams []policy.Upstream
 	// inventoryOverride is the accepted operator override for the committed
 	// Russian allocation inventory, or nil when the shipped set alone answers.
