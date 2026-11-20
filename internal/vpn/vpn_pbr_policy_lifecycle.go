@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/netip"
 	"sync"
 	"time"
 
@@ -384,14 +383,16 @@ func (s *Service) applyLiveUpstreams(settings policy.Settings) error {
 	return s.ApplyEffectiveUpstreams(settings.EffectiveUpstreams())
 }
 
-// ApplyEffectiveUpstreams publishes an accepted upstream list to whichever DNS
-// consumer owns answers right now and records it as the service's current
+// ApplyEffectiveUpstreams publishes an accepted upstream list to the DNS
+// consumer that owns answers right now and records it as the service's current
 // effective list.
 //
 // The list is validated before anything is published, and the owned field is
-// written in the same critical section as the consumer update, so teardown, a
-// later continuity install and a disabled restart all read the list the operator
-// most recently had accepted - never the value captured at activation.
+// written in the same critical section as the consumer update, so a later
+// activation reads the list the operator most recently had accepted - never the
+// value captured at activation. With policy routing inactive there is no
+// resolver in this build, so recording the list is the whole effect: it is the
+// list the next activation dials and the one the operator surface reports.
 func (s *Service) ApplyEffectiveUpstreams(upstreams []policy.Upstream) error {
 	if s == nil {
 		return nil
@@ -413,22 +414,8 @@ func (s *Service) ApplyEffectiveUpstreams(upstreams []policy.Upstream) error {
 	// next rebuild.
 	s.dnsUpstreams = effective
 
-	pbrCfg, err := s.applyToLiveResolverLocked(effective)
-	if err != nil {
-		return err
-	}
-	if s.forwarder == nil || s.forwarder.PBREnabled() {
-		// Either there is no data path to serve, or the policy resolver is the
-		// answer path. The continuity responder is rebuilt from the owned list
-		// when the data path is torn down.
-		return nil
-	}
-	addr := netip.Addr{}
-	if pbrCfg != nil {
-		addr = pbrCfg.GatewayDNSIP
-	}
-	s.installDNSContinuityLocked(s.pbrGatewayDNSAddrLocked(addr), effective)
-	return nil
+	_, err := s.applyToLiveResolverLocked(effective)
+	return err
 }
 
 // applyToLiveResolverLocked publishes upstreams to the resolver registered with

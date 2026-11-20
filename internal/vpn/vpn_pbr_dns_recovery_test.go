@@ -244,27 +244,25 @@ func dnsRecoveryReplyProtocol(pkt []byte) byte {
 // dnsOwnedGoroutinePrefixes lists the code our DNS runtime runs its goroutines
 // under: the gateway server's listeners, accept loops and connection handlers,
 // the per-transport netstack readers and per-scope limiter watchers, and the
-// queued workers of the intercepted and continuity handlers.
+// queued workers of the intercepted-path handler.
 //
-// The handler constructors are listed too, because a queued worker that has been
+// The handler constructor is listed too, because a queued worker that has been
 // created but not yet scheduled prints no frame of its own to attribute; its
 // creation site is then the only ownership evidence, and taking it keeps the
 // count independent of when the runtime first runs the goroutine.
 var dnsOwnedGoroutinePrefixes = []string{
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/dns.",
 	"github.com/devops-igor/amnezia-nexus/internal/vpn.(*pbrDNSHandler).",
-	"github.com/devops-igor/amnezia-nexus/internal/vpn.(*dnsContinuityHandler).",
 	"github.com/devops-igor/amnezia-nexus/internal/vpn.newPBRDNSHandler",
-	"github.com/devops-igor/amnezia-nexus/internal/vpn.newDNSContinuityHandler",
 }
 
 // dnsOwnsStack reports whether one goroutine dump block belongs to the DNS
 // runtime.
 //
 // A frame line is matched with its symbol intact, including the receiver and
-// the argument list: the handler prefixes above contain "(*pbrDNSHandler)." and
-// "(*dnsContinuityHandler).", so truncating a symbol at its first parenthesis
-// would remove exactly the receiver the match depends on. The runtime's
+// the argument list: the handler prefix above contains "(*pbrDNSHandler).", so
+// truncating a symbol at its first parenthesis would remove exactly the receiver
+// the match depends on. The runtime's
 // "created by " marker is removed before matching, so a goroutine that is only
 // attributable through its creator (its own frames belonging to a dependency)
 // is counted as owned as well.

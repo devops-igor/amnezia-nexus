@@ -8,10 +8,9 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/vpn"
 )
 
-// Regression for F824-01 at the panel entrypoint: a saved upstream list must
-// reach the continuity responder even when the persisted record has policy
-// routing disabled, which is the state every issued gateway-DNS profile is in
-// after the feature was turned off.
+// Regression for F824-01 at the panel entrypoint: a saved upstream list must be
+// recorded on the service even when the persisted record has policy routing
+// disabled, so the next activation dials it instead of the built-in defaults.
 func TestDisabledStartupInstallsPersistedUpstreams(t *testing.T) {
 	db, cfg, settings := newPolicyStartupFixture(t)
 	settings.Enabled = false
@@ -36,7 +35,7 @@ func TestDisabledStartupInstallsPersistedUpstreams(t *testing.T) {
 
 	got := vpnSvc.EffectiveDNSUpstreams()
 	if len(got) != 1 || got[0].Address != "9.9.9.9" || got[0].Port != 53 {
-		t.Fatalf("disabled startup left the responder on %v, want the persisted list [9.9.9.9:53]", got)
+		t.Fatalf("disabled startup recorded %v, want the persisted list [9.9.9.9:53]", got)
 	}
 }
 
@@ -71,10 +70,9 @@ func TestDisabledStartupWithoutListKeepsDefaults(t *testing.T) {
 }
 
 // TestRefusedActivationStartupAppliesPersistedUpstreams is HIGH-02: when the
-// persisted activation is refused, no resolver is installed, but issued
-// gateway-DNS profiles still need the operator's saved list rather than the
-// defaults. Policy routing must stay disabled and the failure must still be
-// reported.
+// persisted activation is refused, no resolver is installed, but the operator's
+// saved list is still recorded rather than the defaults. Policy routing must stay
+// disabled and the failure must still be reported.
 func TestRefusedActivationStartupAppliesPersistedUpstreams(t *testing.T) {
 	db, cfg, settings := newPolicyStartupFixture(t)
 	settings.UpstreamDNS = []policy.Upstream{{Address: "9.9.9.9", Port: 53}}
@@ -98,7 +96,7 @@ func TestRefusedActivationStartupAppliesPersistedUpstreams(t *testing.T) {
 		t.Fatal("policy routing reports enabled although activation was refused")
 	}
 	if got := vpnSvc.EffectiveDNSUpstreams(); len(got) != 1 || got[0].Address != "9.9.9.9" {
-		t.Fatalf("refused activation left the responder on %v, want the persisted list [9.9.9.9:53]", got)
+		t.Fatalf("refused activation recorded %v, want the persisted list [9.9.9.9:53]", got)
 	}
 	status := vpnSvc.PolicyStatusSnapshot()
 	if status.Enabled {

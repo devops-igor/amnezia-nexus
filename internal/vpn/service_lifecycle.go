@@ -21,10 +21,6 @@ func (s *Service) Start(ctx context.Context) error {
 	s.retiredBackendDeviceDrops = backendDeviceDropStats{}
 	s.mu.Unlock()
 
-	// Serve configurations issued while policy routing was active even when the
-	// process starts with policy routing disabled.
-	s.installDNSContinuity()
-
 	// No client transport keys, endpoints, or forwarder routes survive a process
 	// restart. Atomically discard persisted sessions and their pool gauges
 	// before any backend device or packet pump can receive traffic. If cleanup
@@ -467,7 +463,6 @@ func (s *Service) Stop() error {
 		_ = s.TeardownPBR()
 		recordErr(s.forwarder.Stop())
 	}
-	s.closeDNSContinuity()
 	s.stopRollingHistory()
 	if s.pool != nil {
 		_ = s.pool.Close()

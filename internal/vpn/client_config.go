@@ -301,46 +301,18 @@ func (s *Service) GenerateClientConfig(ctx context.Context, userID string) (stri
 	return s.renderClientConfigForConnection(ctx, db, cfg, portalPub, user, awgConn, false)
 }
 
-// clientConfigDNSServers returns the DNS resolvers a generated client
-// configuration must push.
-//
-// While policy routing is active the policy resolver is the only resolver that
-// can turn a client's own answers into routing evidence, so clients are steered
-// to the tunnel gateway address. The gateway resolver is pushed only when the
-// policy routing runtime and its gateway both exist: a configuration must never
-// point a client at a resolver that is not running. With policy routing
-// inactive the external resolvers are kept unchanged.
-//
-// A configuration downloaded while policy routing was active keeps the gateway
-// address after deactivation. A gateway-address-only continuity responder keeps
-// answering that address over UDP and TCP, so the issued profile stays usable;
-// the continuity responder records no routing evidence, so its answers can never
-// grant a direct path.
-func (s *Service) clientConfigDNSServers() (string, string) {
-	dns1, dns2 := defaultClientDNSServers()
-
-	if s == nil || !s.PBREnabled() {
-		return dns1, dns2
-	}
-	pbrCfg := s.getPBRConfig()
-	if pbrCfg == nil || pbrCfg.DNSGateway == nil {
-		return dns1, dns2
-	}
-	gw := pbrCfg.GatewayDNSIP
-	if !gw.IsValid() || !gw.Is4() || gw.IsUnspecified() || gw.IsLoopback() {
-		return dns1, dns2
-	}
-	return gw.String(), gw.String()
-}
-
-// defaultClientDNSServers renders the external resolver pair a configuration
-// pushes when the policy gateway is not the answer path.
+// defaultClientDNSServers renders the external resolver pair every generated
+// client configuration pushes.
 //
 // It derives from policy.DefaultUpstreams(), the same definition the policy
 // resolver falls back to, so the rendered pair and the resolver cannot drift
 // apart. Only plain-transport entries are rendered: a future DoT or DoH default
 // must never appear as a plain DNS directive, which would be a silent
 // downgrade for the client.
+//
+// The panel's own gateway address is never rendered. A profile that named it
+// would depend on a resolver the panel no longer runs: policy routing no longer
+// steers clients, so a profile carrying its gateway would lose DNS.
 func defaultClientDNSServers() (string, string) {
 	first, second := "", ""
 	for _, upstream := range policy.DefaultUpstreams() {
@@ -443,7 +415,7 @@ func (s *Service) renderClientConfigForConnection(
 
 	clientMTU := resolveClientMTU(awgConn, awgParams)
 
-	dns1, dns2 := s.clientConfigDNSServers()
+	dns1, dns2 := defaultClientDNSServers()
 	configStr := awg.RenderClientConfig(
 		p.clientPriv,
 		assignedIP,
