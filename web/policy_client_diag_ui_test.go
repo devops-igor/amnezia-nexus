@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io/fs"
 	"regexp"
 	"strings"
 	"testing"
@@ -1035,12 +1036,19 @@ assert.equal(rowCount('policyClientFlowRows'), 2, 'the table is rebuilt, not dou
 `)
 }
 
-// TestPolicyClientDiagCellDetailAuthorCascade evaluates the shipped stylesheet the
-// way a browser does for the collapsed state. The controller collapses a region
-// with the hidden attribute, and the browser's own [hidden] rule is user-agent
-// origin: any author declaration on the element beats it. So an author rule that
-// sets display:block on .cell-detail keeps a collapsed region in the layout, and
-// the sheet has to win that cascade back with display:none for [hidden].
+// TestPolicyClientDiagCellDetailAuthorCascade evaluates every stylesheet bundle
+// that defines .cell-detail the way a browser does for the collapsed state. The
+// controller collapses a region with the hidden attribute, and the browser's own
+// [hidden] rule is user-agent origin: any author declaration on the element beats
+// it. So an author rule that sets display:block on .cell-detail keeps a collapsed
+// region in the layout, and each bundle has to win that cascade back with
+// display:none for [hidden].
+//
+// The bundles are derived from the files, not listed here: the page may load the
+// module (settings.css) or the concatenated bundle (style.css), and a third bundle
+// added later is covered without editing this test. Each one is asserted in its own
+// run, which rebuilds the JS context: two bundles loaded side by side would compete
+// in one cascade, and the whole point is what a page loading only that bundle gets.
 //
 // jsdom cannot answer "did it win?" through computed style - it applies the hidden
 // attribute itself and reports display:none even when the author sheet says block,
@@ -1048,13 +1056,92 @@ assert.equal(rowCount('policyClientFlowRows'), 2, 'the table is rebuilt, not dou
 // author rules themselves, matches them with the DOM's own selector engine, and
 // asserts which declaration would win by specificity and source order.
 func TestPolicyClientDiagCellDetailAuthorCascade(t *testing.T) {
-	sheet, err := StaticFS.ReadFile("static/css/style.css")
+	bundles := cellDetailBundles(t)
+	if len(bundles) < 2 {
+		t.Fatalf("found %d stylesheet bundle(s) defining .cell-detail (%v); the page loads at least "+
+			"the module and the concatenation, so the detection is wrong", len(bundles), bundles)
+	}
+	for _, bundle := range bundles {
+		bundle := bundle
+		t.Run(bundle, func(t *testing.T) {
+			assertCellDetailCascade(t, bundle)
+		})
+	}
+}
+
+// cellDetailBundles returns every stylesheet under static/css that defines the
+// .cell-detail class, in file-name order.
+func cellDetailBundles(t *testing.T) []string {
+	t.Helper()
+	entries, err := fs.ReadDir(StaticFS, "static/css")
 	if err != nil {
-		t.Fatalf("read style.css: %v", err)
+		t.Fatalf("list static/css: %v", err)
+	}
+	var bundles []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".css") {
+			continue
+		}
+		name := "static/css/" + entry.Name()
+		raw, err := StaticFS.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if definesClass(string(raw), "cell-detail") {
+			bundles = append(bundles, name)
+		}
+	}
+	return bundles
+}
+
+// definesClass reports whether a stylesheet defines a class, ignoring comments and
+// not counting a longer class that starts with the same letters.
+func definesClass(css, class string) bool {
+	code := stripCSSComments(css)
+	needle := "." + class
+	for i := 0; i+len(needle) <= len(code); i++ {
+		if code[i:i+len(needle)] != needle {
+			continue
+		}
+		if i+len(needle) == len(code) {
+			return true
+		}
+		switch next := code[i+len(needle)]; {
+		case next >= 'a' && next <= 'z', next >= 'A' && next <= 'Z',
+			next >= '0' && next <= '9', next == '-', next == '_':
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// stripCSSComments removes /* */ comments, which name the classes they describe and
+// must not count as a definition.
+func stripCSSComments(css string) string {
+	for {
+		start := strings.Index(css, "/*")
+		if start < 0 {
+			return css
+		}
+		end := strings.Index(css[start:], "*/")
+		if end < 0 {
+			return css[:start]
+		}
+		css = css[:start] + css[start+end+2:]
+	}
+}
+
+// assertCellDetailCascade runs the cascade check against one bundle.
+func assertCellDetailCascade(t *testing.T, bundle string) {
+	t.Helper()
+	sheet, err := StaticFS.ReadFile(bundle)
+	if err != nil {
+		t.Fatalf("read %s: %v", bundle, err)
 	}
 	encoded, err := json.Marshal(string(sheet))
 	if err != nil {
-		t.Fatalf("encode stylesheet: %v", err)
+		t.Fatalf("encode %s: %v", bundle, err)
 	}
 	runClientDiagScenario(t, clientTargetsScript+`
 responder = ((base) => async (url, opts) => {
@@ -1062,6 +1149,7 @@ responder = ((base) => async (url, opts) => {
   return base(url, opts);
 })(responder);
 `, fmt.Sprintf(`
+const bundle = %q;
 const style = w.document.createElement('style');
 style.textContent = %s;
 w.document.head.appendChild(style);
@@ -1084,7 +1172,7 @@ Array.from(w.document.styleSheets).forEach(sheet => {
     displayRules.push({selector: rule.selectorText, display: rule.style.display});
   });
 });
-assert.ok(displayRules.length > 0, 'the shipped stylesheet exposes its display rules');
+assert.ok(displayRules.length > 0, bundle + ' exposes its display rules');
 
 // Specificity as the cascade counts it: ids, then classes plus attributes, then
 // element names. The two rules under test differ only by the attribute.
@@ -1113,19 +1201,21 @@ const winner = (element) => {
 
 const collapsedWinner = winner(collapsed);
 const revealedWinner = winner(revealed);
-assert.ok(collapsedWinner, 'an author rule decides display for a collapsed cell detail');
+assert.ok(collapsedWinner, bundle + ': an author rule decides display for a collapsed cell detail');
 assert.equal(collapsedWinner.display, 'none',
-  'the author rule that wins display for a collapsed cell detail is ' + collapsedWinner.selector
-  + ' (' + collapsedWinner.display + '); the block rule would keep it in the layout');
+  bundle + ': the rule that wins display for a collapsed cell detail is '
+  + collapsedWinner.selector + ' (' + collapsedWinner.display
+  + '); without a [hidden] declaration the block rule keeps it in the layout');
 assert.ok(collapsedWinner.selector.indexOf('[hidden]') >= 0,
-  'the winning rule is the [hidden] companion, not the block rule');
-assert.equal(revealedWinner.display, 'block',
-  'a revealed cell detail still resolves to the block rule (' + revealedWinner.selector + ')');
+  bundle + ': the winning rule is the [hidden] companion, not the block rule');
+assert.notEqual(revealedWinner.display, 'none',
+  bundle + ': a revealed cell detail still resolves to a display (' + revealedWinner.selector
+  + ' -> ' + revealedWinner.display + ')');
 // jsdom applies the hidden attribute itself, so its computed style cannot
 // distinguish the two states; it is asserted only to document that difference.
 assert.equal(w.getComputedStyle(collapsed).display, 'none',
-  'jsdom reports none for both states, which is why the cascade above is the oracle');
-`, string(encoded)))
+  bundle + ': jsdom reports none for both states, which is why the cascade above is the oracle');
+`, bundle, string(encoded)))
 }
 
 // TestPolicyClientDiagFlowDestinationNamesOnlyWhenKnown pins the Destination cell:
