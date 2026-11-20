@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/devops-igor/amnezia-nexus/internal/geodb"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
 )
@@ -138,6 +139,35 @@ type PolicyStatus struct {
 	// because the artifact ships with the build and its age is a fact about
 	// the binary rather than about the sync. It carries no client addresses.
 	Inventory *policy.InventoryStatus `json:"inventory,omitempty"`
+
+	// CDN is the CDN exclusion set the classifier consults (issue #934): the
+	// networks whose addresses are proxied even when they fall inside the Russian
+	// allocation. It is reported whether or not policy routing is enabled,
+	// because the set ships with the build and decides every direct decision
+	// that is made.
+	//
+	// Without it the second classifier input was only visible one flow at a time,
+	// so an operator could not answer why a Russian-allocation destination was
+	// proxied without reading code.
+	CDN *CDNExclusionStatus `json:"cdn,omitempty"`
+}
+
+// CDNExclusionStatus is the operator-facing view of the CDN exclusion set: the
+// entries in force, where they come from, and — when they cannot be described —
+// the reason instead of an empty list.
+//
+// Entries carries no client addresses and no destinations: it is the static set,
+// not a record of what was classified.
+type CDNExclusionStatus struct {
+	// Source names where the set comes from. It is a built-in table, so this is
+	// the identity of that table rather than a feed location.
+	Source string `json:"source"`
+	// Entries is the exclusion set in ASN order. It is empty when the classifier
+	// excludes nothing, which is a fact the surface reports as such.
+	Entries []geodb.CDNExclusion `json:"entries"`
+	// Error reports entries that could not be described. The set is then not
+	// empty — it is unknown — and must not be read as "nothing is excluded".
+	Error string `json:"error,omitempty"`
 }
 
 // policyRuntime holds the live policy objects for a started service.
@@ -693,6 +723,7 @@ func (s *Service) PolicyStatusSnapshot() PolicyStatus {
 	applyUpstreamStatus(&status, s.getPBRConfig())
 	applyDNSPanelStatus(&status, s)
 	applyInventoryStatus(&status, s.effectiveInventoryOverride())
+	applyCDNExclusionStatus(&status)
 	return status
 }
 
@@ -723,6 +754,29 @@ func applyInventoryStatus(status *PolicyStatus, override *policy.InventoryOverri
 	}
 	live := inventory.WithOverride(override).Status(time.Now().UTC(), policy.DefaultInventoryMaxAge)
 	status.Inventory = &live
+}
+
+// applyCDNExclusionStatus reports the CDN exclusion set the classifier consults
+// (issue #934), so an operator can answer why a destination inside the Russian
+// allocation was proxied anyway.
+//
+// The entries come from geodb.CDNExclusions, which reads the table
+// IsMultiRegionCDNASN matches against. Nothing is copied or restated here: a
+// second list would drift from the classifier's and the surface would then
+// describe a set that is not the one deciding packets.
+//
+// An unreadable set is reported as an error rather than omitted. An absent block
+// or an empty list reads as "no CDN network is excluded" — every CDN destination
+// proxied — which is the opposite of what an unusable set means.
+func applyCDNExclusionStatus(status *PolicyStatus) {
+	live := CDNExclusionStatus{Source: geodb.CDNExclusionSource}
+	entries, err := geodb.CDNExclusions()
+	if err != nil {
+		live.Error = err.Error()
+	} else {
+		live.Entries = entries
+	}
+	status.CDN = &live
 }
 
 // applyDNSPanelStatus copies the panel-side intercepted-DNS accounting of the
