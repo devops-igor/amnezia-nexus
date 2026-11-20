@@ -79,8 +79,14 @@ func TestSettingsTemplatePolicyClientSection(t *testing.T) {
 				t.Errorf("admin settings page is missing #%s", id)
 			}
 		}
+		// The controller is referenced through the URL derived from the bytes this
+		// build ships, so the markup cannot be satisfied by a cached predecessor.
+		controllerSrc, err := web.AssetURL("/static/js/policy_client_diag.js")
+		if err != nil {
+			t.Fatalf("AssetURL(policy_client_diag.js): %v", err)
+		}
 		for _, token := range []string{
-			versionedSrcAttr("/static/js/policy_client_diag.js"),
+			`src="` + controllerSrc + `"`,
 			`id="policyClientSelect"`,
 			`<table class="data-table">`,
 			`scope="col"`,
@@ -124,10 +130,11 @@ func TestSettingsTemplatePolicyClientSection(t *testing.T) {
 				t.Errorf("per-client section must not contain %q", forbidden)
 			}
 		}
-		// Every script tag is an external asset carrying its own source; the section ships
-		// the controller and the destination filter it delegates to, and no inline body.
+		// Every script tag is an external asset carrying its own source — either a
+		// versioned /static reference or one this build derives from the asset's
+		// bytes — and the section ships no inline body.
 		got := strings.Count(source, "<script")
-		if want := strings.Count(source, "<script src=\"/static/js/"); got != want || want == 0 {
+		if want := strings.Count(source, "<script src=\""); got != want || want == 0 {
 			t.Errorf("per-client section has %d script tags but %d external assets; every tag must load a shipped asset", got, want)
 		}
 	})

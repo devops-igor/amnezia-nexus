@@ -1081,7 +1081,7 @@
   "policy_client_decision_reason_non_tcp_udp_fallback": "پروکسی: جایگزین پروتکل",
   "policy_client_decision_reason_not_recorded": "ثبت نشده",
   "policy_client_decision_reason_unknown": "دلیل دیگر",
-  "policy_client_flow_names_multiple": "{count} نام منطبق",
+  "policy_client_flow_names_multiple": "{name} و {count} مورد دیگر",
   "policy_client_corr_answer_after_decision": "پاسخ پس از این تصمیم رسید",
   "policy_client_corr_expired_before_decision": "شاهد پیش از این تصمیم منقضی شده بود",
   "policy_client_corr_no_retained_answer": "هیچ پاسخ نگه‌داری‌شده‌ای این آدرس را نام نبرده است",

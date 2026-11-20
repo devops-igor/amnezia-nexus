@@ -489,10 +489,13 @@
     }
 
     // appendFlowDestination states the recorded tuple, followed by the matched DNS
-    // name only when exactly one stored answer names this address. Several matched
-    // names are stated as several instead of choosing one silently, and the names a
-    // client tried without an answer are never shown: an unanswered query says
-    // nothing about where this flow went.
+    // names only when stored answers name this address: the one name when there is
+    // one, and the first name plus how many others also match when there are
+    // several. The first name is shown because the row must stay readable, and the
+    // count is shown with it so the address never looks like it has that one name.
+    // The complete list stays in the cell tooltip, and the names a client tried
+    // without an answer are never shown: an unanswered query says nothing about
+    // where this flow went.
     function appendFlowDestination(row, flow) {
         var address = flow.destination_ip + ':' + String(flow.destination_port);
         var names = flow.names || [];
@@ -502,7 +505,8 @@
         }
         if (names.length > 1) {
             var several = clientText('policy_client_flow_names_multiple')
-                .replace('{count}', String(names.length));
+                .replace('{name}', String(names[0]))
+                .replace('{count}', String(names.length - 1));
             appendCell(row, address + ' (' + several + ')', names.join(', '));
             return;
         }

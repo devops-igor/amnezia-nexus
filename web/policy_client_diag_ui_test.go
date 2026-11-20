@@ -33,16 +33,18 @@ func clientDiagSectionHTMLForTest(t *testing.T) string {
 		"is_admin": func(any) bool {
 			return true
 		},
+		"asset_url": AssetURL,
 	}
 	tmpl, err := template.New("settings_policy_client.html").Funcs(funcs).ParseFS(TemplatesFS, "templates/settings_policy_client.html")
 	if err != nil {
 		t.Fatalf("parse settings_policy_client.html: %v", err)
 	}
 	var buf bytes.Buffer
-	// The page supplies the release version. This package cannot reach the
-	// release constant without an import cycle, so the fixture supplies a
-	// placeholder: the URL must have the production shape even where its exact
-	// value is not asserted.
+	// The page supplies the release version, and the controller is referenced
+	// through its content-derived URL by the shipped template itself. This package
+	// cannot reach the release constant without an import cycle, so the fixture
+	// supplies a placeholder for it: the URL must have the production shape even
+	// where its exact value is not asserted.
 	if err := tmpl.ExecuteTemplate(&buf, "settings_policy_client", map[string]any{
 		"current_user": nil,
 		"app_version":  "test",
@@ -100,7 +102,7 @@ w._ = key => {
   if (key === 'policy_client_outcome_fmt') return 'OUTCOME {ok}/{failed} · return {return} {packets}';
   if (key === 'policy_client_route_outcome_fmt') return 'ROUTE {route} · {dispatch}';
   if (key === 'policy_client_tried_names_fmt') return 'TRIED {names}';
-  if (key === 'policy_client_flow_names_multiple') return 'SEVERAL {count}';
+  if (key === 'policy_client_flow_names_multiple') return 'FIRST {name} PLUS {count}';
   if (key === 'policy_client_drop_truncated') return 'DROP-TRUNC {shown}/{total}';
   if (key === 'policy_client_drop_coverage') return 'DROPCOV {stored}/{merged}/{evicted}/{pruned} session {session_keys} ledger {keys}/{key_limit} {age}';
   if (key === 'policy_client_drop_no_tuple') return 'NO-TUPLE';
@@ -609,8 +611,8 @@ await settle();
 assert.equal(rowCount('policyClientFlowRows'), 3, 'all three states are rendered');
 
 const ambiguous = rowCells('policyClientFlowRows', 0);
-assert.equal(ambiguous[1], '93.184.216.34:443 (SEVERAL 2)',
-  'several candidate names are stated as several, never collapsed to one');
+assert.equal(ambiguous[1], '93.184.216.34:443 (FIRST plain.example PLUS 1)',
+  'the first of several candidate names is shown with a count of the others, never collapsed to that one alone');
 assert.equal(ambiguous[2], 'DECISION:proxy', 'the recorded route is rendered');
 assert.equal(ambiguous[3], 'DECISION_REASON:proxy_cidr_rule',
   'the deciding reason is one label, not a sentence of metadata');
@@ -705,8 +707,9 @@ assert.ok(rowCells('policyClientFlowRows', 0).indexOf('active') === -1,
 
 // TestPolicyClientDiagFlowDestinationNamesOnlyWhenKnown pins the Destination cell:
 // the address the tuple carried, and a name only when a stored answer genuinely
-// names it. A name the client tried without an answer is not a name, and several
-// matching names are stated as several rather than one of them being chosen.
+// names it. A name the client tried without an answer is not a name; when several
+// names match, the first is shown with a count of the others instead of the row
+// pretending the address has that one name.
 func TestPolicyClientDiagFlowDestinationNamesOnlyWhenKnown(t *testing.T) {
 	runClientDiagScenario(t, clientTargetsScript+`
 responder = ((base) => async (url, opts) => {
@@ -749,10 +752,11 @@ const single = rowCells('policyClientFlowRows', 1);
 assert.equal(single[1], '8.8.8.8:53 (plain.example)',
   'the one answer that names the address is shown beside it');
 
-// 3. Several stored answers name it: stated as several, and none is chosen.
+// 3. Several stored answers name it: the first name is shown with a count of the
+//    others, so the address never looks like it has that one name.
 const several = rowCells('policyClientFlowRows', 2);
-assert.equal(several[1], '1.1.1.1:443 (SEVERAL 3)',
-  'several matching names are stated as several instead of choosing one');
+assert.equal(several[1], '1.1.1.1:443 (FIRST plain.example PLUS 2)',
+  'the first of several matching names is shown with a count of the others');
 assert.equal(rowCellTitles('policyClientFlowRows', 2)[1],
   'plain.example, shared.example, other.example',
   'every matching name is available in the cell tooltip');

@@ -1081,7 +1081,7 @@
   "policy_client_decision_reason_non_tcp_udp_fallback": "Прокси: протокол без NAT",
   "policy_client_decision_reason_not_recorded": "Не записано",
   "policy_client_decision_reason_unknown": "Другая причина",
-  "policy_client_flow_names_multiple": "{count} совпавших имён",
+  "policy_client_flow_names_multiple": "{name} и ещё {count}",
   "policy_client_corr_answer_after_decision": "ответ пришёл после этого решения",
   "policy_client_corr_expired_before_decision": "данные истекли до этого решения",
   "policy_client_corr_no_retained_answer": "ни один сохранённый ответ не называл этот адрес",

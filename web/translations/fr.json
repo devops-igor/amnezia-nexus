@@ -1081,7 +1081,7 @@
   "policy_client_decision_reason_non_tcp_udp_fallback": "Proxy : repli de protocole",
   "policy_client_decision_reason_not_recorded": "Non enregistré",
   "policy_client_decision_reason_unknown": "Autre motif",
-  "policy_client_flow_names_multiple": "{count} noms correspondants",
+  "policy_client_flow_names_multiple": "{name} et {count} autres",
   "policy_client_corr_answer_after_decision": "la réponse est arrivée après cette décision",
   "policy_client_corr_expired_before_decision": "la preuve avait expiré avant cette décision",
   "policy_client_corr_no_retained_answer": "aucune réponse conservée ne nommait cette adresse",

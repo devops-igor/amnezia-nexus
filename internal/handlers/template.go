@@ -524,6 +524,15 @@ func mathLogicFuncMap() template.FuncMap {
 	}
 }
 
+// assetFuncMap exposes the cache identity of a delivered asset to templates.
+// A template names the asset by its /static path; the URL it receives carries a
+// query derived from that asset's bytes (web.AssetURL).
+func assetFuncMap() template.FuncMap {
+	return template.FuncMap{
+		"asset_url": web.AssetURL,
+	}
+}
+
 // baseFuncMap merges all grouped FuncMap helpers.
 func baseFuncMap() template.FuncMap {
 	fm := make(template.FuncMap)
@@ -535,6 +544,7 @@ func baseFuncMap() template.FuncMap {
 		dataAccessFuncMap(),
 		stringFuncMap(),
 		mathLogicFuncMap(),
+		assetFuncMap(),
 	}
 	for _, g := range groups {
 		for k, v := range g {

@@ -1081,7 +1081,7 @@
   "policy_client_decision_reason_non_tcp_udp_fallback": "代理：协议回退",
   "policy_client_decision_reason_not_recorded": "未记录",
   "policy_client_decision_reason_unknown": "其他原因",
-  "policy_client_flow_names_multiple": "{count} 个匹配名称",
+  "policy_client_flow_names_multiple": "{name} 另 {count} 个",
   "policy_client_corr_answer_after_decision": "应答在该决策之后到达",
   "policy_client_corr_expired_before_decision": "证据在该决策前已过期",
   "policy_client_corr_no_retained_answer": "没有保留的应答提到该地址",

@@ -1081,7 +1081,7 @@
   "policy_client_decision_reason_non_tcp_udp_fallback": "Proxy: protocol fallback",
   "policy_client_decision_reason_not_recorded": "Not recorded",
   "policy_client_decision_reason_unknown": "Other reason",
-  "policy_client_flow_names_multiple": "{count} matching names",
+  "policy_client_flow_names_multiple": "{name} +{count} more",
   "policy_client_corr_answer_after_decision": "the answer arrived after this decision",
   "policy_client_corr_expired_before_decision": "the evidence had expired before this decision",
   "policy_client_corr_no_retained_answer": "no retained answer named this address",
