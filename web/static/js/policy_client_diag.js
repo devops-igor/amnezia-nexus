@@ -539,6 +539,14 @@
         return dispatch.state == null ? '' : String(dispatch.state);
     }
 
+    // dispatchFailed reports whether the dispatch path refused the flow's packets.
+    // The recorded state is the producer's summary; the refused-packet counter is
+    // checked as well, so an answer that carries the count without a state this
+    // build knows is still marked instead of reading as a delivery that worked.
+    function dispatchFailed(flow, state) {
+        return state === 'failed' || recordedCount(flow.forward, 'failed') > 0;
+    }
+
     // routeFailureMarkers names every producer that recorded a failed delivery, in
     // the order the wire states them: the dispatch outcome, the backend device
     // writes, then the return path. A producer with nothing refused contributes
@@ -548,7 +556,7 @@
     // (failed) - and either one is a delivery the panel did not make.
     function routeFailureMarkers(flow, state) {
         var markers = [];
-        if (state === 'failed') {
+        if (dispatchFailed(flow, state)) {
             markers.push(clientText('policy_client_dispatch_failed'));
         }
         if (recordedCount(flow.forward, 'backend_write_failed') > 0) {
@@ -578,6 +586,11 @@
         if (state && state !== 'not_recorded') {
             parts.push(clientTokenLabel('dispatch', state));
             appendFailureLabel(parts, (flow.dispatch && flow.dispatch.reason) || forward.failure);
+        } else if (dispatchFailed(flow, state)) {
+            // The count says packets were refused, but no state this build knows
+            // was recorded: state the outcome from the counter, not from a guess.
+            parts.push(clientText('policy_client_dispatch_failed'));
+            appendFailureLabel(parts, forward.failure);
         }
         if (recordedCount(forward, 'backend_write_failed') > 0) {
             parts.push(clientText('policy_client_route_failed_backend_write'));
