@@ -122,8 +122,9 @@ func TestPolicyOverrideRefusedAtTheBoundaryLeavesTheRecordUnchanged(t *testing.T
 	before := storedPolicyForTest(t, h)
 
 	for name, override := range map[string][]string{
-		"mistyped_prefix": {"203.0.113.999"},
-		"domains_only":    {"example.com"},
+		"mistyped_prefix":   {"203.0.113.999"},
+		"domains_only":      {"example.com"},
+		"prefix_and_domain": {"203.0.113.0/24", "example.com"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			w := putPolicyForTest(t, h, map[string]any{
