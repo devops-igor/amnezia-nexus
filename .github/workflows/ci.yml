@@ -373,7 +373,7 @@ jobs:
             tests/test_ci_coverprofile_merge.py
 
       - name: Download Shard Coverage
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: coverage-shard-*
           path: coverage-shards
