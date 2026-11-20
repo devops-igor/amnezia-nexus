@@ -22,7 +22,6 @@ func refuseFixture(t *testing.T, cfg DirectEgressConfig) (*Forwarder, string, st
 	fwd := NewForwarder(nil, "10.100.0.0/16", 8)
 	fwd.SetPBREnabled(true)
 	cfg.HostWANIP = netip.MustParseAddr("203.0.113.1")
-	cfg.GatewayDNSIP = netip.MustParseAddr("10.100.0.1")
 	fwd.SetDirectEgress(NewDirectEgressManager(cfg, fwd))
 	dem := fwd.DirectEgress()
 	// The manager owns a WAN reader; retire it with the test that created it.

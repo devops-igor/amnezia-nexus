@@ -63,11 +63,6 @@ type SessionScopeRetirer interface {
 	RetireSessionScope(sessionID string)
 }
 
-// DNSHandler processes DNS packets addressed to the designated gateway DNS IPv4 address.
-type DNSHandler interface {
-	HandleDNSPacket(sessionID, peerKey, assignedIP string, path *ReturnPath, packet []byte) (bool, error)
-}
-
 type sessionRoute struct {
 	sessionID       string
 	connectionID    string
@@ -129,7 +124,14 @@ type Forwarder struct {
 	// trigger a rebind, and only while unassigned. A claimed srcIP outside
 	// the subnet (or unparseable) is always treated as spoofed and dropped —
 	// an inner packet source outside the portal pool can only be a spoof.
-	portalSubnet        *net.IPNet
+	portalSubnet *net.IPNet
+	// formerResolverAddr is the panel's own address that issued client profiles
+	// used to name as their resolver: the gateway address, derived from the same
+	// client pool. It is stored because the legacy (policy-off) packet path needs
+	// it while no policy configuration exists to consult — that path runs after a
+	// teardown has discarded the activation input. Nothing serves DNS there any
+	// more, so a packet to it is refused on both paths.
+	formerResolverAddr  netip.Addr
 	totalRxBytes        atomic.Int64
 	totalTxBytes        atomic.Int64
 	totalRxPackets      atomic.Uint64
@@ -229,8 +231,6 @@ type Forwarder struct {
 	directEgress  *DirectEgressManager
 	routeCache    RouteCache
 	policyMatcher *policy.Matcher
-	gatewayDNSIP  netip.Addr
-	dnsHandler    DNSHandler
 	// destinationClassifier answers "inside the Russian allocation, and is it a
 	// multi-region CDN" for the routing contract (issue #918). It is immutable
 	// once installed. A nil value is the documented fail-closed state: the
@@ -343,6 +343,7 @@ func NewForwarderWithLimits(accountant *TrafficAccountant, portalSubnetCIDR stri
 		accountant:         accountant,
 		clientDrops:        newDropLedger(nil),
 		portalSubnet:       portalSubnet,
+		formerResolverAddr: derivedResolverAddr(portalSubnetCIDR),
 		routesByPeer:       make(map[string]*sessionRoute),
 		routesByIP:         make(map[string]*sessionRoute),
 		backendQueues:      make(map[int64]chan BackendPacket),
@@ -404,6 +405,27 @@ func (f *Forwarder) InPortalSubnet(ip string) bool {
 		return false
 	}
 	return f.portalSubnet.Contains(parsed)
+}
+
+// defaultFormerResolverAddr is the gateway address of the shipped client pool,
+// which is also the address a build with no configured pool uses.
+const defaultFormerResolverAddr = "10.100.0.1"
+
+// derivedResolverAddr computes the panel address issued client profiles used to
+// name as their resolver: the client pool's own base address with the last octet
+// set to one. It is the derivation the service made before the resolver was
+// removed, kept in one place so the packet path cannot disagree with the address
+// the forwarder stores.
+//
+// An absent or unparseable pool falls back to the shipped default, so the rule is
+// deterministic in every configuration rather than silently checking nothing.
+func derivedResolverAddr(portalSubnetCIDR string) netip.Addr {
+	if prefix, err := netip.ParsePrefix(portalSubnetCIDR); err == nil && prefix.Addr().Is4() {
+		b := prefix.Addr().As4()
+		b[3] = 1
+		return netip.AddrFrom4(b)
+	}
+	return netip.MustParseAddr(defaultFormerResolverAddr)
 }
 
 // PumpsRunning reports whether forwarder pumps are active.
@@ -634,38 +656,6 @@ func (f *Forwarder) PolicyMatcher() *policy.Matcher {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.policyMatcher
-}
-
-// SetGatewayDNSIP configures the designated gateway DNS IPv4 address.
-func (f *Forwarder) SetGatewayDNSIP(ip netip.Addr) {
-	f.mu.Lock()
-	f.gatewayDNSIP = ip
-	dem := f.directEgress
-	f.mu.Unlock()
-	if dem != nil {
-		dem.SetGatewayDNSIP(ip)
-	}
-}
-
-// GatewayDNSIP returns the designated gateway DNS IPv4 address.
-func (f *Forwarder) GatewayDNSIP() netip.Addr {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.gatewayDNSIP
-}
-
-// SetDNSHandler installs an ingress DNS handler for packets addressed to GatewayDNSIP:53.
-func (f *Forwarder) SetDNSHandler(h DNSHandler) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.dnsHandler = h
-}
-
-// DNSHandler returns the installed ingress DNS handler.
-func (f *Forwarder) DNSHandler() DNSHandler {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.dnsHandler
 }
 
 // ProxiedBytes returns the total bytes forwarded to proxy backends under PBR.

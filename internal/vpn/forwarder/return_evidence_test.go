@@ -19,9 +19,8 @@ func proxyReturnFixture(t *testing.T, bufSize int) (*Forwarder, *testCaptureRetu
 	fwd := NewForwarder(nil, "10.100.0.0/16", bufSize)
 	fwd.SetPBREnabled(true)
 	dem := NewDirectEgressManager(DirectEgressConfig{
-		HostWANIP:    netip.MustParseAddr("203.0.113.1"),
-		GatewayDNSIP: netip.MustParseAddr("10.100.0.1"),
-		WANDevice:    newMockPacketDev(),
+		HostWANIP: netip.MustParseAddr("203.0.113.1"),
+		WANDevice: newMockPacketDev(),
 	}, fwd)
 	fwd.SetDirectEgress(dem)
 	// The manager owns a WAN reader; retire it with the test that created it.

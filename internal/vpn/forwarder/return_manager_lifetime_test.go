@@ -45,9 +45,8 @@ func newManagerLifetimeFixture(t *testing.T, queueSize int) *managerLifetimeFixt
 	fwd := NewForwarder(nil, "10.100.0.0/16", queueSize)
 	fwd.SetPBREnabled(true)
 	dem := NewDirectEgressManager(DirectEgressConfig{
-		HostWANIP:    netip.MustParseAddr("203.0.113.1"),
-		GatewayDNSIP: netip.MustParseAddr("10.100.0.1"),
-		WANDevice:    newMockPacketDev(),
+		HostWANIP: netip.MustParseAddr("203.0.113.1"),
+		WANDevice: newMockPacketDev(),
 	}, fwd)
 	fwd.SetDirectEgress(dem)
 	t.Cleanup(func() { _ = dem.Close() })

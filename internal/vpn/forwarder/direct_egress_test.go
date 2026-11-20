@@ -104,10 +104,8 @@ func (c *testCaptureReturnPath) getPackets() [][]byte {
 }
 
 func TestDirectEgress_IsProhibitedDestination(t *testing.T) {
-	gwDNS := netip.MustParseAddr("10.100.0.1")
 	cfg := DirectEgressConfig{
-		HostWANIP:    netip.MustParseAddr("203.0.113.1"),
-		GatewayDNSIP: gwDNS,
+		HostWANIP: netip.MustParseAddr("203.0.113.1"),
 	}
 	dem := NewDirectEgressManager(cfg, nil)
 	defer func() { _ = dem.Close() }()
@@ -127,7 +125,7 @@ func TestDirectEgress_IsProhibitedDestination(t *testing.T) {
 		{"multicast 224/4", "224.0.0.1", true},
 		{"unspecified 0.0.0.0", "0.0.0.0", true},
 		{"broadcast 255.255.255.255", "255.255.255.255", true},
-		{"designated gateway DNS", "10.100.0.1", false}, // EXPLICIT EXCEPTION
+		{"former gateway DNS address", "10.100.0.1", true},
 		{"public Cloudflare DNS", "1.1.1.1", false},
 		{"public Google DNS", "8.8.8.8", false},
 		{"public example.com", "93.184.216.34", false},
@@ -408,9 +406,7 @@ func TestDirectEgress_ClientIsolation(t *testing.T) {
 }
 
 func TestDirectEgress_ProhibitedDrops(t *testing.T) {
-	dem := NewDirectEgressManager(DirectEgressConfig{
-		GatewayDNSIP: netip.MustParseAddr("10.100.0.1"),
-	}, nil)
+	dem := NewDirectEgressManager(DirectEgressConfig{}, nil)
 	defer func() { _ = dem.Close() }()
 
 	capPath := newTestCaptureReturnPath()

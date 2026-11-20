@@ -49,17 +49,14 @@ func setupForwarderWithPBR(t *testing.T) (*Forwarder, *DirectEgressManager, *moc
 
 	wanDev := newMockPacketDev()
 	hostWAN := netip.MustParseAddr("203.0.113.1")
-	gwDNS := netip.MustParseAddr("10.100.0.1")
 
 	dem := NewDirectEgressManager(DirectEgressConfig{
-		HostWANIP:    hostWAN,
-		GatewayDNSIP: gwDNS,
-		WANDevice:    wanDev,
+		HostWANIP: hostWAN,
+		WANDevice: wanDev,
 	}, fwd)
 	fwd.SetDirectEgress(dem)
 	// The manager owns a WAN reader; retire it with the test that created it.
 	t.Cleanup(func() { _ = dem.Close() })
-	fwd.SetGatewayDNSIP(gwDNS)
 
 	rc := newTestRouteCache()
 	fwd.SetRouteCache(rc)
@@ -130,32 +127,119 @@ func TestPolicyDispatch_ProhibitedDestinations(t *testing.T) {
 	}
 }
 
-func TestPolicyDispatch_GatewayDNSException(t *testing.T) {
+// TestPolicyDispatch_GatewayDNSIsProhibitedDestination pins the outcome of
+// removing the gateway-DNS exception: the panel serves no resolver at that
+// address, so a client packet to it is an internal destination like any other. It
+// is refused before any flow exists, counted as a direct drop, and recorded in the
+// drop ledger under the existing prohibited-destination token rather than being
+// proxied to a backend that could not answer it.
+func TestPolicyDispatch_GatewayDNSIsProhibitedDestination(t *testing.T) {
 	fwd, _, _, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-gwdns"
 	backendID := int64(202)
 	clientIP := "10.100.0.15"
+	sessionID := "s-gw"
 	capPath := newTestCaptureReturnPath()
 
-	fwd.RegisterSessionWithReturnPath("s-gw", "c-gw", peerKey, clientIP, backendID, capPath.path)
+	fwd.RegisterSessionWithReturnPath(sessionID, "c-gw", peerKey, clientIP, backendID, capPath.path)
 
-	// Traffic to GatewayDNSIP (10.100.0.1:53) must NOT be dropped by Step 1
 	gwDNS := netip.MustParseAddr("10.100.0.1")
 	dnsPkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), gwDNS, 54321, 53, []byte("dns-query"))
 
 	err := fwd.RouteClientToBackend(peerKey, dnsPkt)
-	// Safe default routes to proxy backend queue
-	if err != nil {
-		t.Fatalf("expected gateway DNS query to be accepted, got: %v", err)
+	if !errors.Is(err, ErrProhibitedDestination) {
+		t.Fatalf("gateway-addressed DNS = %v, want ErrProhibitedDestination", err)
 	}
 
-	beQueue := fwd.backendQueues[backendID]
-	if len(beQueue) != 1 {
-		t.Fatalf("expected packet in backend queue, got %d", len(beQueue))
+	if got := len(fwd.backendQueues[backendID]); got != 0 {
+		t.Fatalf("a prohibited destination reached the proxy queue: %d packets", got)
 	}
-	if fwd.DirectDrops() != 0 {
-		t.Errorf("gateway DNS must not cause directDrops, got %d", fwd.DirectDrops())
+	if fwd.DirectDrops() != 1 {
+		t.Errorf("gateway DNS must count as one direct drop, got %d", fwd.DirectDrops())
+	}
+
+	snapshot := fwd.ClientDropSnapshot(sessionID, 0, 10)
+	if len(snapshot.Entries) != 1 {
+		t.Fatalf("drop records = %d, want 1: %+v", len(snapshot.Entries), snapshot.Entries)
+	}
+	if got := snapshot.Entries[0].Key.Reason; got != DropReasonProhibitedDestination {
+		t.Errorf("drop reason = %q, want %q", got, DropReasonProhibitedDestination)
+	}
+	if got := snapshot.Entries[0].Key.DstPort; got != 53 {
+		t.Errorf("drop record port = %d, want 53", got)
+	}
+	if !snapshot.Entries[0].Key.HasTuple {
+		t.Error("a well-formed packet's drop record claims it carried no tuple")
+	}
+}
+
+// TestPolicyDispatch_LegacyRefusesFormerResolverAddress is the policy-off half of the
+// same outcome: the destination that is refused while policy routing is active must
+// not be tunnelled while it is disabled. Nothing serves DNS at that address any more,
+// so the legacy path refuses it with the same token, counts the drop and records it,
+// and the control in the same test proves ordinary legacy routing still enqueues.
+func TestPolicyDispatch_LegacyRefusesFormerResolverAddress(t *testing.T) {
+	fwd := NewForwarder(nil, "10.100.0.0/16", 100) // policy routing stays disabled
+	peerKey := "peer-legacy-gw"
+	backendID := int64(303)
+	clientIP := "10.100.0.20"
+	sessionID := "s-legacy-gw"
+	capPath := newTestCaptureReturnPath()
+	fwd.RegisterSessionWithReturnPath(sessionID, "c-legacy-gw", peerKey, clientIP, backendID, capPath.path)
+
+	if fwd.PBREnabled() {
+		t.Fatal("the fixture must exercise the legacy path")
+	}
+
+	// The address is the client pool's gateway, which is what issued profiles named.
+	formerResolver := netip.MustParseAddr("10.100.0.1")
+	dnsPkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), formerResolver, 54321, 53, []byte("dns-query"))
+
+	if err := fwd.RouteClientToBackend(peerKey, dnsPkt); !errors.Is(err, ErrProhibitedDestination) {
+		t.Fatalf("legacy gateway-addressed DNS = %v, want ErrProhibitedDestination", err)
+	}
+	if got := len(fwd.backendQueues[backendID]); got != 0 {
+		t.Fatalf("a refused packet reached the proxy queue: %d packets", got)
+	}
+
+	// The refusal is accounted for, not discarded: the existing aggregate client drop
+	// counter plus a ledger record under the same token the policy path writes.
+	queueFull, rateLimited, noBackend, total := fwd.ClientDropStats()
+	if total != 1 || queueFull != 0 || rateLimited != 0 || noBackend != 0 {
+		t.Errorf("client drop stats = queueFull:%d rateLimited:%d noBackend:%d total:%d, want 0/0/0/1",
+			queueFull, rateLimited, noBackend, total)
+	}
+	snapshot := fwd.ClientDropSnapshot(sessionID, 0, 10)
+	if len(snapshot.Entries) != 1 {
+		t.Fatalf("drop records = %d, want 1: %+v", len(snapshot.Entries), snapshot.Entries)
+	}
+	entry := snapshot.Entries[0]
+	if entry.Key.Reason != DropReasonProhibitedDestination {
+		t.Errorf("drop reason = %q, want %q", entry.Key.Reason, DropReasonProhibitedDestination)
+	}
+	if entry.Key.SessionID != sessionID || entry.Key.Generation != fwd.SessionRouteStates()[0].Generation {
+		t.Errorf("drop record identity = %q/%d, want the refusing incarnation", entry.Key.SessionID, entry.Key.Generation)
+	}
+	if !entry.Key.HasTuple || entry.Key.Protocol != 17 || entry.Key.DstPort != 53 || entry.Key.DstIP != formerResolver.As4() {
+		t.Errorf("drop tuple = proto:%d dst:%v:%d hasTuple:%v, want udp/10.100.0.1/53",
+			entry.Key.Protocol, netip.AddrFrom4(entry.Key.DstIP), entry.Key.DstPort, entry.Key.HasTuple)
+	}
+
+	// Control: this is not a validation pass. An ordinary external destination,
+	// including another resolver, still takes the unchanged legacy route.
+	controlPkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), netip.MustParseAddr("8.8.8.8"), 54322, 53, []byte("dns-query"))
+	if err := fwd.RouteClientToBackend(peerKey, controlPkt); err != nil {
+		t.Fatalf("legacy routing refused an external resolver: %v", err)
+	}
+	if got := len(fwd.backendQueues[backendID]); got != 1 {
+		t.Fatalf("control packet enqueued = %d, want 1", got)
+	}
+	if _, _, _, total = fwd.ClientDropStats(); total != 1 {
+		t.Errorf("a routed packet moved the client drop counter: total = %d, want 1", total)
+	}
+	if got := len(fwd.ClientDropSnapshot(sessionID, 0, 10).Entries); got != 1 {
+		t.Errorf("the control packet added a drop record: %d records", got)
 	}
 }
 
@@ -518,12 +602,10 @@ func TestPolicyDispatch_WANReplyDownstreamAdmission(t *testing.T) {
 
 	wanDev := newMockPacketDev()
 	hostWAN := netip.MustParseAddr("203.0.113.1")
-	gwDNS := netip.MustParseAddr("10.100.0.1")
 
 	dem := NewDirectEgressManager(DirectEgressConfig{
-		HostWANIP:    hostWAN,
-		GatewayDNSIP: gwDNS,
-		WANDevice:    wanDev,
+		HostWANIP: hostWAN,
+		WANDevice: wanDev,
 	}, fwd)
 	fwd.SetDirectEgress(dem)
 	t.Cleanup(func() { _ = dem.Close() })
@@ -660,12 +742,10 @@ func TestPolicyDispatch_DirectTransmissionErrorAccounting(t *testing.T) {
 
 	wanDev := newFailingMockPacketDev(errors.New("wan cable disconnected"))
 	hostWAN := netip.MustParseAddr("203.0.113.1")
-	gwDNS := netip.MustParseAddr("10.100.0.1")
 
 	dem := NewDirectEgressManager(DirectEgressConfig{
-		HostWANIP:    hostWAN,
-		GatewayDNSIP: gwDNS,
-		WANDevice:    wanDev,
+		HostWANIP: hostWAN,
+		WANDevice: wanDev,
 	}, fwd)
 	fwd.SetDirectEgress(dem)
 	t.Cleanup(func() { _ = dem.Close() })

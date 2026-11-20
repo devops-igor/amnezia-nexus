@@ -8,19 +8,20 @@ import (
 	"testing"
 	"time"
 
-	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
-// Coupled producer→Service→wire coverage for the flow evidence and the DNS↔flow
-// correlation (issue #861, slice 3b).
+// Coupled producer→Service→wire coverage for the flow evidence (issue #861,
+// slice 3b).
 //
-// The chain is the real one: a client DNS query produces a retained answer, a
-// client packet produces a flow whose branch records the decision, the packet is
-// dispatched to the WAN device or the backend queue, and the reply path admits the
-// return. Those records are then read through Service.ClientDiagnosis and the JSON
-// the handler returns.
+// The chain is the real one: a client packet produces a flow whose branch records
+// the decision, the packet is dispatched to the WAN device or the backend queue, and
+// the reply path admits the return. Those records are then read through
+// Service.ClientDiagnosis and the JSON the handler returns.
+//
+// This build records no DNS answers, so the flow's name correlation is asserted in
+// the not-recorded state it must report rather than against retained names.
 
 func findFlowEvidence(t *testing.T, flows []ClientDiagnosisFlow, destination string, port uint16) ClientDiagnosisFlow {
 	t.Helper()
@@ -39,8 +40,6 @@ func findFlowEvidence(t *testing.T, flows []ClientDiagnosisFlow, destination str
 func TestClientDiagnosisReportsRecordedFlowEvidence(t *testing.T) {
 	f := newClientDiagFixture(t)
 	f.direct(t, f.example)
-	f.queryIP(t, "plain.example", 55001)
-	f.queryIP(t, "proxy.example", 55002)
 	f.sendTCP(t, f.example, 41100, 443) // DIRECT: the address is inside the allocation
 	f.sendTCP(t, f.proxyIP, 41101, 443) // PROXY: the address is uncovered
 
@@ -73,8 +72,13 @@ func TestClientDiagnosisReportsRecordedFlowEvidence(t *testing.T) {
 	if direct.Return.Evidence != "not_observed" {
 		t.Errorf("return = %+v, want not_observed before any reply", direct.Return)
 	}
-	if direct.NamesMatch != FlowCorrelationUnique || len(direct.Names) != 1 || direct.Names[0] != "plain.example" {
-		t.Errorf("names = %q %v, want the single retained name that preceded the decision", direct.NamesMatch, direct.Names)
+	// This build keeps no answers, so the flow must state that its names were not
+	// recorded instead of implying that no name matched.
+	if direct.NamesMatch != FlowCorrelationNotRecorded {
+		t.Errorf("names match = %q, want not_recorded: this build retains no answers", direct.NamesMatch)
+	}
+	if len(direct.Names) != 0 {
+		t.Errorf("names = %v, want none without a collector", direct.Names)
 	}
 	if direct.BackendTunnelID != nil {
 		t.Errorf("direct flow backend = %v, want none", *direct.BackendTunnelID)
@@ -93,105 +97,9 @@ func TestClientDiagnosisReportsRecordedFlowEvidence(t *testing.T) {
 	if proxied.Return.Evidence != "not_measured" {
 		t.Errorf("proxy return = %+v, want explicitly not_measured", proxied.Return)
 	}
-	if proxied.NamesMatch != FlowCorrelationUnique || len(proxied.Names) != 1 || proxied.Names[0] != "proxy.example" {
-		t.Errorf("proxy names = %q %v, want its own retained name", proxied.NamesMatch, proxied.Names)
+	if proxied.NamesMatch != FlowCorrelationNotRecorded {
+		t.Errorf("proxy names match = %q, want not_recorded: this build retains no answers", proxied.NamesMatch)
 	}
-}
-
-// TestClientDiagnosisCorrelationPreservesAmbiguityAndTime covers the correlation
-// rules that a matching address alone cannot answer: several names on one address,
-// an answer that arrived after the decision, and an answer that had expired before
-// it.
-func TestClientDiagnosisCorrelationPreservesAmbiguityAndTime(t *testing.T) {
-	t.Run("SharedAddressIsAmbiguous", func(t *testing.T) {
-		f := newClientDiagFixture(t)
-		f.queryIP(t, "plain.example", 55101)
-		f.queryIP(t, "shared.example", 55102)
-		f.sendTCP(t, f.example, 41110, 443)
-
-		answer, err := f.svc.ClientDiagnosis(context.Background(), ClientDiagnosisRequest{SessionID: f.sessionID(t)})
-		if err != nil {
-			t.Fatalf("ClientDiagnosis: %v", err)
-		}
-		flow := findFlowEvidence(t, answer.Flows.Entries, f.example.String(), 443)
-		if flow.NamesMatch != FlowCorrelationAmbiguous {
-			t.Fatalf("names match = %q, want ambiguous for two names on one address", flow.NamesMatch)
-		}
-		if len(flow.Names) != 2 {
-			t.Errorf("names = %v, want both candidates", flow.Names)
-		}
-		for _, want := range []string{"plain.example", "shared.example"} {
-			if !clientDiagHas(flow.Names, want) {
-				t.Errorf("candidate %q missing from %v", want, flow.Names)
-			}
-		}
-		if len(flow.NameCandidates) != 2 {
-			t.Errorf("candidates = %d, want one entry per name", len(flow.NameCandidates))
-		}
-		for _, candidate := range flow.NameCandidates {
-			if candidate.Seq == 0 || candidate.ObservedAt == "" || candidate.ExpiresAt == "" {
-				t.Errorf("candidate %+v must carry its own record identity and instants", candidate)
-			}
-		}
-	})
-
-	t.Run("AnswerAfterTheDecisionDoesNotExplainIt", func(t *testing.T) {
-		f := newClientDiagFixture(t)
-		// The flow is decided with no evidence for the address (PROXY default), and
-		// the answer that names that address arrives AFTERWARDS. That answer cannot
-		// explain the earlier choice.
-		f.sendTCP(t, f.example, 41111, 443)
-		f.queryIP(t, "plain.example", 55103)
-
-		answer, err := f.svc.ClientDiagnosis(context.Background(), ClientDiagnosisRequest{SessionID: f.sessionID(t)})
-		if err != nil {
-			t.Fatalf("ClientDiagnosis: %v", err)
-		}
-		flow := findFlowEvidence(t, answer.Flows.Entries, f.example.String(), 443)
-		if flow.NamesMatch != FlowCorrelationNone {
-			t.Fatalf("names match = %q, want none: the answer came after the decision", flow.NamesMatch)
-		}
-		if flow.NamesReason != CorrelationReasonAnswerAfterDecision {
-			t.Errorf("names reason = %q, want answer_after_decision", flow.NamesReason)
-		}
-		if flow.NamesConsidered != 1 {
-			t.Errorf("considered = %d, want the late record counted even though it cannot explain the flow", flow.NamesConsidered)
-		}
-		// The record itself is retained and correlates to nothing for this flow:
-		// the history is not rewritten by the rejection.
-		if len(answer.DNS.Records) != 1 {
-			t.Errorf("dns records = %d, want the retained answer", len(answer.DNS.Records))
-		}
-	})
-
-	t.Run("ExpiredBeforeTheDecisionIsNotACause", func(t *testing.T) {
-		f := newClientDiagFixture(t)
-		f.queryIP(t, "short.example", 55104)
-		// The one-second answer expires before the flow is decided.
-		time.Sleep(1100 * time.Millisecond)
-		f.sendTCP(t, netip.MustParseAddr("93.184.216.77"), 41112, 443)
-
-		answer, err := f.svc.ClientDiagnosis(context.Background(), ClientDiagnosisRequest{SessionID: f.sessionID(t)})
-		if err != nil {
-			t.Fatalf("ClientDiagnosis: %v", err)
-		}
-		flow := findFlowEvidence(t, answer.Flows.Entries, "93.184.216.77", 443)
-		if flow.NamesMatch != FlowCorrelationNone {
-			t.Fatalf("names match = %q, want none: the evidence had expired", flow.NamesMatch)
-		}
-		if flow.NamesReason != CorrelationReasonExpiredBeforeDecision {
-			t.Errorf("names reason = %q, want expired_before_decision", flow.NamesReason)
-		}
-		if flow.NamesConsidered != 1 {
-			t.Errorf("considered = %d, want the matching record counted even though it cannot explain the flow", flow.NamesConsidered)
-		}
-		// The retained record is still in the history, labelled expired: the
-		// correlation refuses the claim, the record itself is not deleted.
-		record := findDNSRecord(t, answer.DNS.Records, "short.example")
-		if record.State != "expired" {
-			t.Errorf("record state = %q, want expired", record.State)
-		}
-	})
 }
 
 // TestClientDiagnosisFlowEvidenceIsPerIncarnation proves a retained flow keeps the
@@ -199,7 +107,6 @@ func TestClientDiagnosisCorrelationPreservesAmbiguityAndTime(t *testing.T) {
 // history survives but the old flow's recorded facts do not move.
 func TestClientDiagnosisFlowEvidenceIsPerIncarnation(t *testing.T) {
 	f := newClientDiagFixture(t)
-	f.queryIP(t, "plain.example", 55201)
 	f.sendTCP(t, f.example, 41120, 443)
 	sessionID := f.sessionID(t)
 	firstGeneration := f.generation(t)
@@ -222,11 +129,7 @@ func TestClientDiagnosisFlowEvidenceIsPerIncarnation(t *testing.T) {
 	if len(second.Flows.Entries) != 0 {
 		t.Fatalf("flows = %d after a rekey, want none", len(second.Flows.Entries))
 	}
-	// The retained DNS answer survives the rekey and still correlates to the
-	// destination, but the flow record itself is gone rather than rewritten.
-	if len(second.DNS.Records) != 1 {
-		t.Errorf("dns records = %d after a rekey, want the retained answer", len(second.DNS.Records))
-	}
+	// The flow record itself is gone rather than rewritten.
 	if original.RouteGeneration != firstGeneration {
 		t.Errorf("original flow generation = %d, want %d", original.RouteGeneration, firstGeneration)
 	}
@@ -236,7 +139,6 @@ func TestClientDiagnosisFlowEvidenceIsPerIncarnation(t *testing.T) {
 // refreshes the flow's activity nor moves any evidence or counter.
 func TestClientDiagnosisFlowEvidenceIsNotWrittenByReads(t *testing.T) {
 	f := newClientDiagFixture(t)
-	f.queryIP(t, "plain.example", 55301)
 	f.sendTCP(t, f.example, 41130, 443)
 	sessionID := f.sessionID(t)
 
@@ -302,10 +204,12 @@ func TestClientDiagnosisFlowWithoutDispatchSaysSo(t *testing.T) {
 		t.Errorf("legacy flow decision = %q/%q, want explicit not_recorded", flow.DecisionTime, flow.DecisionReason)
 	}
 	if flow.NamesMatch != FlowCorrelationNotRecorded {
-		t.Errorf("names match = %q, want not_recorded: the decision instant is unknown", flow.NamesMatch)
+		t.Errorf("names match = %q, want not_recorded", flow.NamesMatch)
 	}
-	if flow.NamesReason != CorrelationReasonDecisionTimeUnknown {
-		t.Errorf("names reason = %q, want decision_time_not_recorded", flow.NamesReason)
+	// No answer was recorded at all in this build, so the not-recorded reason names
+	// the missing collector rather than one of the per-record rules.
+	if flow.NamesReason != CorrelationReasonNoCollector {
+		t.Errorf("names reason = %q, want dns_records_not_recorded", flow.NamesReason)
 	}
 }
 
@@ -334,8 +238,8 @@ func TestClientDiagnosisFlowWireShapeIsExplicit(t *testing.T) {
 	if flow.DecisionReason != string(forwarder.EgressReasonNoTrustedEvidence) {
 		t.Errorf("decision reason = %q, want the fail-closed default", flow.DecisionReason)
 	}
-	if flow.NamesMatch != FlowCorrelationNone {
-		t.Errorf("names match = %q, want none for a destination no answer named", flow.NamesMatch)
+	if flow.NamesMatch != FlowCorrelationNotRecorded {
+		t.Errorf("names match = %q, want not_recorded: no answer history exists", flow.NamesMatch)
 	}
 	if flow.Return.Evidence != "not_measured" {
 		t.Errorf("return = %q, want not_measured for PROXY", flow.Return.Evidence)
@@ -349,24 +253,24 @@ func TestFlowNameAttemptsAreBoundedUnresolvedAndPreDecision(t *testing.T) {
 	decided := time.Date(2026, 11, 17, 9, 10, 0, 0, time.UTC)
 	flow := forwarder.SessionFlow{Generation: 7, DecidedAt: decided}
 	events := []dnsledger.Event{
-		{Name: "nx.example", Kind: gatewaydns.QueryEventNXDomain, ReceivedAt: decided.Add(-time.Minute), Seq: 5, RouteGeneration: 7, RouteGenerationKnown: true},
-		{Name: "noanswer.example", Kind: gatewaydns.QueryEventNoAnswer, ReceivedAt: decided.Add(-2 * time.Minute), Seq: 4, RouteGeneration: 7, RouteGenerationKnown: true},
-		{Name: "answered.example", Kind: gatewaydns.QueryEventAnswered, ReceivedAt: decided.Add(-time.Minute), Seq: 6},
-		{Name: "truncated.example", Kind: gatewaydns.QueryEventTruncated, ReceivedAt: decided.Add(-time.Minute), Seq: 7},
-		{Name: "after.example", Kind: gatewaydns.QueryEventUpstreamError, ReceivedAt: decided.Add(time.Second), Seq: 8},
-		{Name: "old.example", Kind: gatewaydns.QueryEventNXDomain, ReceivedAt: decided.Add(-6 * time.Minute), Seq: 9},
-		{Name: "othergen.example", Kind: gatewaydns.QueryEventNXDomain, ReceivedAt: decided.Add(-time.Minute), Seq: 10, RouteGeneration: 6, RouteGenerationKnown: true},
-		{Name: "unknowngen.example", Kind: gatewaydns.QueryEventUpstreamError, ReceivedAt: decided.Add(-90 * time.Second), Seq: 11},
-		{Name: "third.example", Kind: gatewaydns.QueryEventInvalidQuery, ReceivedAt: decided.Add(-30 * time.Second), Seq: 12},
+		{Name: "nx.example", Kind: queryKindNXDomain, ReceivedAt: decided.Add(-time.Minute), Seq: 5, RouteGeneration: 7, RouteGenerationKnown: true},
+		{Name: "noanswer.example", Kind: queryKindNoAnswer, ReceivedAt: decided.Add(-2 * time.Minute), Seq: 4, RouteGeneration: 7, RouteGenerationKnown: true},
+		{Name: "answered.example", Kind: queryKindAnswered, ReceivedAt: decided.Add(-time.Minute), Seq: 6},
+		{Name: "truncated.example", Kind: queryKindTruncated, ReceivedAt: decided.Add(-time.Minute), Seq: 7},
+		{Name: "after.example", Kind: queryKindUpstreamError, ReceivedAt: decided.Add(time.Second), Seq: 8},
+		{Name: "old.example", Kind: queryKindNXDomain, ReceivedAt: decided.Add(-6 * time.Minute), Seq: 9},
+		{Name: "othergen.example", Kind: queryKindNXDomain, ReceivedAt: decided.Add(-time.Minute), Seq: 10, RouteGeneration: 6, RouteGenerationKnown: true},
+		{Name: "unknowngen.example", Kind: queryKindUpstreamError, ReceivedAt: decided.Add(-90 * time.Second), Seq: 11},
+		{Name: "third.example", Kind: queryKindInvalidQuery, ReceivedAt: decided.Add(-30 * time.Second), Seq: 12},
 	}
 	got := flowNameAttempts(flow, events)
 	want := []struct {
 		name string
 		kind string
 	}{
-		{"third.example", gatewaydns.QueryEventInvalidQuery},
-		{"nx.example", gatewaydns.QueryEventNXDomain},
-		{"unknowngen.example", gatewaydns.QueryEventUpstreamError},
+		{"third.example", queryKindInvalidQuery},
+		{"nx.example", queryKindNXDomain},
+		{"unknowngen.example", queryKindUpstreamError},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("attempts = %d, want %d (newest first, max 3): %+v", len(got), len(want), got)
@@ -379,45 +283,6 @@ func TestFlowNameAttemptsAreBoundedUnresolvedAndPreDecision(t *testing.T) {
 
 	if attempts := flowNameAttempts(forwarder.SessionFlow{Generation: 7}, events); attempts != nil {
 		t.Errorf("a flow without a decision instant produced attempts: %+v", attempts)
-	}
-}
-
-func TestClientDiagnosisFlowExposesAttemptedNames(t *testing.T) {
-	f := newClientDiagFixture(t)
-	f.sendTCP(t, netip.MustParseAddr("1.1.1.1"), 41150, 443) // no evidence: PROXY default
-
-	sessionID := f.sessionID(t)
-	generation, known := f.routeCache.BindQueryIncarnation(sessionID)
-	received := time.Now().Add(-time.Minute).UTC()
-	f.routeCache.ObserveDNSQueryEvent(gatewaydns.QueryEvent{
-		SessionID:        sessionID,
-		Transport:        "udp",
-		Name:             "missing.example",
-		QType:            1,
-		Kind:             gatewaydns.QueryEventNXDomain,
-		ReceivedAt:       received,
-		AnsweredAt:       received,
-		RouteGeneration:  generation,
-		IncarnationKnown: known,
-	})
-
-	answer, err := f.svc.ClientDiagnosis(context.Background(), ClientDiagnosisRequest{SessionID: sessionID})
-	if err != nil {
-		t.Fatalf("ClientDiagnosis: %v", err)
-	}
-	flow := findFlowEvidence(t, answer.Flows.Entries, "1.1.1.1", 443)
-	if flow.NamesMatch != FlowCorrelationNone {
-		t.Fatalf("names match = %q, want none for a destination no answer named", flow.NamesMatch)
-	}
-	if len(flow.NameAttempts) != 1 {
-		t.Fatalf("attempts = %+v, want the unresolved query near the decision", flow.NameAttempts)
-	}
-	attempt := flow.NameAttempts[0]
-	if attempt.Name != "missing.example" || attempt.Kind != gatewaydns.QueryEventNXDomain || attempt.QType != "A" {
-		t.Fatalf("attempt = %+v, want missing.example/A/nxdomain", attempt)
-	}
-	if attempt.ReceivedAt == "" || attempt.ReceivedAt == ClientDiagnosisTokenNotRecorded {
-		t.Fatalf("attempt received_at = %q, want the query instant", attempt.ReceivedAt)
 	}
 }
 
@@ -435,7 +300,7 @@ func TestFlowNameAttemptsUseCollapsedLastSeen(t *testing.T) {
 			Transport:            "udp",
 			Name:                 "retry.example",
 			QType:                1,
-			Kind:                 gatewaydns.QueryEventNXDomain,
+			Kind:                 queryKindNXDomain,
 			ReceivedAt:           at,
 			AnsweredAt:           at,
 			RouteGeneration:      7,

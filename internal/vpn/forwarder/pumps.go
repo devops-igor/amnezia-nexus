@@ -2,7 +2,6 @@ package forwarder
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
@@ -54,54 +53,39 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 	}
 
 	if !f.pbrEnabled.Load() {
-		// Configurations issued while policy routing was active name the
-		// gateway address as their only resolver. A gateway-address-only
-		// responder keeps serving them after disablement, while external
-		// port 53 keeps its previous routing.
-		if handled, err := f.handleLegacyGatewayDNS(route, peerKey, packet); handled {
-			return err
-		}
-		return f.routeClientLegacy(route, packet, pktLen)
+		return f.routeClientLegacy(route, peerKey, packet, pktLen)
 	}
 
 	return f.routeClientPBR(route, peerKey, packet, pktLen)
 }
 
-// handleLegacyGatewayDNS submits a gateway-addressed port-53 packet to the
-// installed DNS handler while policy routing is inactive. Only the designated
-// gateway address is matched, so external port-53 traffic keeps its previous
-// routing; anything else falls through to the legacy path unchanged. The check
-// is deliberately cheap because this is the default path for every client
-// packet when policy routing is off; the handler and the gateway perform the
-// full validation of an admitted packet.
-func (f *Forwarder) handleLegacyGatewayDNS(route *sessionRoute, peerKey string, packet []byte) (bool, error) {
-	f.mu.RLock()
-	handler := f.dnsHandler
-	gwDNS := f.gatewayDNSIP
-	f.mu.RUnlock()
-	if handler == nil || !gwDNS.IsValid() {
-		return false, nil
+// routeClientLegacy enqueues one client packet toward the proxy backend, which is
+// the unchanged legacy route.
+//
+// One destination is refused first: the panel address issued client profiles used
+// to name as their resolver. Nothing answers it any more, and the policy path
+// refuses it as a prohibited destination, so leaving the legacy path to tunnel it
+// would report two different outcomes for one destination depending on a switch.
+// The refusal is accounted for the way every other legacy client refusal is — the
+// aggregate client drop counter plus a drop-ledger record under the same
+// prohibited-destination token — rather than discarded.
+//
+// This is one destination, not a general validation pass: every other packet,
+// external resolvers included, is enqueued exactly as before, and a malformed
+// packet is neither parsed nor rejected here.
+func (f *Forwarder) routeClientLegacy(route *sessionRoute, peerKey string, packet []byte, pktLen int64) error {
+	if dst, ok := clientPacketIPv4Destination(packet); ok && dst == f.formerResolverAddr {
+		// The tuple is recorded only when the packet can be read as one: a refused
+		// packet must never appear in the ledger with a destination it did not carry.
+		protocol, dstPort, hasTuple := uint8(0), uint16(0), false
+		if parsed, err := ParseAndValidateClientIPv4(packet, ""); err == nil {
+			protocol, dstPort, hasTuple = parsed.Protocol, parsed.DstPort, true
+		}
+		f.clientDropsTotal.Add(1)
+		f.recordClientDrop(peerKey, route, DropReasonProhibitedDestination, protocol, dst, dstPort, hasTuple, pktLen)
+		return ErrProhibitedDestination
 	}
-	if len(packet) < 20 || (packet[0]>>4) != 4 {
-		return false, nil
-	}
-	ihl := int(packet[0]&0x0f) * 4
-	if len(packet) < ihl+4 {
-		return false, nil
-	}
-	if proto := packet[9]; proto != 6 && proto != 17 {
-		return false, nil
-	}
-	if binary.BigEndian.Uint16(packet[ihl+2:ihl+4]) != 53 {
-		return false, nil
-	}
-	if netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]}) != gwDNS {
-		return false, nil
-	}
-	return handler.HandleDNSPacket(route.sessionID, peerKey, route.assignedIP, route.returnPath, packet)
-}
 
-func (f *Forwarder) routeClientLegacy(route *sessionRoute, packet []byte, pktLen int64) error {
 	f.mu.RLock()
 	beQueue, ok := f.backendQueues[route.backendTunnelID]
 	if !ok {
@@ -127,8 +111,6 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	directEgress := f.directEgress
 	policyMatcher := f.policyMatcher
 	classifier := f.destinationClassifier
-	gwDNS := f.gatewayDNSIP
-	dnsHandler := f.dnsHandler
 	f.mu.RUnlock()
 
 	parsed, err := ParseAndValidateClientIPv4(packet, route.assignedIP)
@@ -158,13 +140,12 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	classification := classifyDestination(classifier, dstIP)
 
 	// Step 1 — DROP: Prohibited destinations (loopback, link-local, RFC1918, CGNAT, multicast, metadata).
-	// Explicit exception: traffic to designated gateway DNS on port 53 strictly.
 	//
 	// The verdict is the contract's first row, applied by decideEgress above every
 	// input that could ask for DIRECT, so an operator DIRECT override can never
 	// route a prohibited or internal destination.
 	decision := decideEgress(egressInput{
-		prohibitedErr:  ValidateDirectDestination(dstIP, parsed.DstPort, gwDNS),
+		prohibitedErr:  ValidateDirectDestination(dstIP),
 		proxyOverride:  policySnapshot != nil && policySnapshot.MatchIPv4(dstIP),
 		classification: classification,
 	})
@@ -183,19 +164,6 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	// the routing decision is acted on.
 	if parsed.Protocol != 6 && parsed.Protocol != 17 {
 		return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
-	}
-
-	// Ingress DNS interception: while policy routing is active every plain
-	// DNS packet on UDP or TCP port 53 is submitted to the policy resolver,
-	// whatever its destination, so the client's own answers become routing
-	// evidence. The gateway rewrites the reply to appear from the queried
-	// address, so an unmodified client accepts it. Prohibited destinations
-	// keep the drop decided above; this never becomes an egress path.
-	if dnsHandler != nil && parsed.DstPort == 53 {
-		handled, err := dnsHandler.HandleDNSPacket(sID, peerKey, route.assignedIP, route.returnPath, packet)
-		if handled {
-			return err
-		}
 	}
 
 	// Step 2 — DIRECT: the decided route, with the branch that decided it
@@ -220,6 +188,20 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 		})
 	}
 	return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
+}
+
+// clientPacketIPv4Destination reads the destination address of an IPv4 client
+// packet without validating it.
+//
+// It exists so the legacy path can recognize ONE destination without gaining a
+// validation pass: the fixed header offset is read only for a packet whose version
+// nibble is 4 and whose header is present, and nothing else about the packet is
+// inspected, accepted or rejected here.
+func clientPacketIPv4Destination(packet []byte) (netip.Addr, bool) {
+	if len(packet) < 20 || packet[0]>>4 != 4 {
+		return netip.Addr{}, false
+	}
+	return netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]}), true
 }
 
 // classifyDestination asks the installed address classifier about one

@@ -51,14 +51,12 @@ func newFlowEvidenceFixture(t *testing.T, queueSize int) *flowEvidenceFixture {
 	fix.fwd.SetPBREnabled(true)
 	fix.fwd.AttachBackendDevice(fix.backendID, fix.backendDev)
 	fix.dem = NewDirectEgressManager(DirectEgressConfig{
-		HostWANIP:    netip.MustParseAddr("203.0.113.1"),
-		GatewayDNSIP: netip.MustParseAddr("10.100.0.1"),
-		WANDevice:    fix.wan,
+		HostWANIP: netip.MustParseAddr("203.0.113.1"),
+		WANDevice: fix.wan,
 	}, fix.fwd)
 	fix.fwd.SetDirectEgress(fix.dem)
 	// The manager owns a WAN reader; retire it with the test that created it.
 	t.Cleanup(func() { _ = fix.dem.Close() })
-	fix.fwd.SetGatewayDNSIP(netip.MustParseAddr("10.100.0.1"))
 	fix.fwd.SetRouteCache(fix.rc)
 	fix.publishSnapshot(t, nil)
 	fix.returnPath = newTestCaptureReturnPath()
@@ -569,10 +567,9 @@ func TestFlowEvidenceBoundsAreTheFlowTable(t *testing.T) {
 	fwd := NewForwarder(nil, "10.100.0.0/16", 8)
 	fix := newFlowEvidenceFixture(t, 8)
 	dem := NewDirectEgressManager(DirectEgressConfig{
-		HostWANIP:    netip.MustParseAddr("203.0.113.1"),
-		GatewayDNSIP: netip.MustParseAddr("10.100.0.1"),
-		WANDevice:    newMockPacketDev(),
-		MaxFlows:     2,
+		HostWANIP: netip.MustParseAddr("203.0.113.1"),
+		WANDevice: newMockPacketDev(),
+		MaxFlows:  2,
 	}, fwd)
 	fwd.SetDirectEgress(dem)
 	t.Cleanup(func() { _ = dem.Close() })

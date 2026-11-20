@@ -4,7 +4,6 @@ import (
 	"sort"
 	"time"
 
-	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
@@ -182,16 +181,31 @@ func usableNameAttempt(flow forwarder.SessionFlow, event dnsledger.Event, earlie
 	return unresolvedQueryKind(event.Kind)
 }
 
+// Terminal query kinds a retained event can carry. They are the tokens the removed
+// evidence producer stamped on a query event and are what dnsledger.Event.Kind
+// holds, so they are named here rather than imported from a package that no longer
+// produces them. The unresolved subset is what the flow correlation reads.
+const (
+	queryKindAnswered         = "answered"
+	queryKindNXDomain         = "nxdomain"
+	queryKindNoAnswer         = "no_answer"
+	queryKindAdmissionRefused = "admission_refused"
+	queryKindUpstreamError    = "upstream_error"
+	queryKindInvalidQuery     = "invalid_query"
+	queryKindTruncated        = "truncated"
+	queryKindDeliveryFailed   = "delivery_failed"
+)
+
 // unresolvedQueryKind reports whether a terminal query kind means the client did
 // not get a usable answer. Answered and truncated queries are not attempts.
 func unresolvedQueryKind(kind string) bool {
 	switch kind {
-	case gatewaydns.QueryEventNXDomain,
-		gatewaydns.QueryEventNoAnswer,
-		gatewaydns.QueryEventUpstreamError,
-		gatewaydns.QueryEventAdmissionRefused,
-		gatewaydns.QueryEventInvalidQuery,
-		gatewaydns.QueryEventDeliveryFailed:
+	case queryKindNXDomain,
+		queryKindNoAnswer,
+		queryKindUpstreamError,
+		queryKindAdmissionRefused,
+		queryKindInvalidQuery,
+		queryKindDeliveryFailed:
 		return true
 	default:
 		return false

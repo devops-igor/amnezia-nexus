@@ -10,10 +10,8 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
-	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/session"
-	mdns "github.com/miekg/dns"
 )
 
 // Producer-to-service coverage for the per-client diagnosis (issue #861,
@@ -22,9 +20,6 @@ import (
 // Every record asserted below is produced by the real data path, not by a test
 // seam:
 //
-//   - the cache entries come from a client DNS query that travelled
-//     RouteClientToBackend -> intercepted DNS -> Gateway -> Server ->
-//     ObserveResponse -> MemoryRouteCache, the same chain production runs;
 //   - the flows come from crafted client packets through RouteClientToBackend,
 //     which is where the packet path records its choice.
 //
@@ -42,17 +37,10 @@ type clientDiagFixture struct {
 	// returnPath is the client return path the route was registered with, kept so
 	// a rekey case can register the same incarnation again.
 	returnPath *forwarder.ReturnPath
-	// slowEntered / slowRelease drive the blocking query used to interleave a
-	// session replacement with an in-flight lookup. slowOnce makes the release
-	// idempotent so every exit path can unblock it.
-	slowEntered chan struct{}
-	slowRelease chan struct{}
-	slowOnce    sync.Once
 
 	mu       sync.Mutex
 	replies  [][]byte
 	clientIP netip.Addr
-	gwDNS    netip.Addr
 	example  netip.Addr
 	proxyIP  netip.Addr
 	peerKey  string
@@ -60,17 +48,14 @@ type clientDiagFixture struct {
 	directAddrs map[netip.Addr]struct{}
 }
 
-// newClientDiagFixture builds the production chain: a forwarder with a backend
-// device and a client return path, the intercepted DNS gateway with a loopback
-// style mock upstream, and a real session registry.
+// newClientDiagFixture builds the production chain the diagnosis reads: a
+// forwarder with a backend device, a client return path, the installed
+// classifier, the route cache and a real session registry.
+//
+// It installs no DNS resolver and no evidence producer: this build records
+// nothing for a client's lookups, which is a state the diagnosis has to report
+// rather than hide.
 func newClientDiagFixture(t *testing.T) *clientDiagFixture {
-	t.Helper()
-	return newClientDiagFixtureWithInflight(t, 0)
-}
-
-// newClientDiagFixtureWithInflight builds the same real chain with an explicit
-// per-session admission budget, which is how a genuine refusal is induced.
-func newClientDiagFixtureWithInflight(t *testing.T, maxInflightPerSession int) *clientDiagFixture {
 	t.Helper()
 	ctx := context.Background()
 
@@ -78,7 +63,6 @@ func newClientDiagFixtureWithInflight(t *testing.T, maxInflightPerSession int) *
 		wan:      &mockPBRDevice{},
 		backend:  &mockPBRDevice{},
 		clientIP: netip.MustParseAddr("10.100.0.10"),
-		gwDNS:    netip.MustParseAddr("10.100.0.1"),
 		example:  netip.MustParseAddr("93.184.216.34"),
 		proxyIP:  netip.MustParseAddr("93.184.216.99"),
 		peerKey:  "peer-client-diag",
@@ -101,122 +85,6 @@ func newClientDiagFixtureWithInflight(t *testing.T, maxInflightPerSession int) *
 	matcher.Publish(snap)
 	routeCache.AttachMatcher(matcher)
 
-	// The upstream answer is the policy evaluation's input: an unlisted name is
-	// DIRECT evidence, a listed name is PROXY evidence.
-	resolver := &mockPBRResolver{exchange: func(_ context.Context, req *mdns.Msg) (*mdns.Msg, error) {
-		resp := new(mdns.Msg)
-		resp.SetReply(req)
-		if len(req.Question) == 0 {
-			return resp, nil
-		}
-		q := req.Question[0]
-		if q.Qtype == mdns.TypeHTTPS && q.Name == "https.example." {
-			// An HTTPS (SVCB) answer: records of the QUERIED type, no A record.
-			resp.Answer = append(resp.Answer, &mdns.SVCB{
-				Hdr:      mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeHTTPS, Class: mdns.ClassINET, Ttl: 300},
-				Priority: 1,
-				Target:   ".",
-			})
-			return resp, nil
-		}
-		if q.Qtype != mdns.TypeA {
-			// A real authority does not answer a non-A question with A records. The
-			// fixture must not either, or a no-answer response would look like an
-			// answered one.
-			return resp, nil
-		}
-		switch q.Name {
-		case "plain.example.":
-			resp.Answer = append(resp.Answer, &mdns.A{
-				Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
-				A:   f.example.AsSlice(),
-			})
-		case "proxy.example.":
-			resp.Answer = append(resp.Answer, &mdns.A{
-				Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
-				A:   f.proxyIP.AsSlice(),
-			})
-		case "shared.example.":
-			// A second name for the same address: the cache merges by address, so
-			// one flow can have several candidate names.
-			resp.Answer = append(resp.Answer, &mdns.A{
-				Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
-				A:   f.example.AsSlice(),
-			})
-		case "nx.example.":
-			// A terminal NXDOMAIN: an error response, distinct from a no-answer one.
-			resp.Rcode = mdns.RcodeNameError
-		case "https.example.":
-			// An HTTPS (SVCB) answer: the reply carries records, but of the queried
-			// type, not an A record. It must never become A route evidence.
-			resp.Answer = append(resp.Answer, &mdns.SVCB{
-				Hdr:      mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeHTTPS, Class: mdns.ClassINET, Ttl: 300},
-				Priority: 1,
-				Target:   ".",
-			})
-		case "slow.example.":
-			// Blocks until the test releases it, so a rekey can land between the
-			// query's receipt and the terminal event.
-			if f.slowEntered != nil {
-				f.slowEntered <- struct{}{}
-			}
-			if f.slowRelease != nil {
-				<-f.slowRelease
-			}
-			resp.Answer = append(resp.Answer, &mdns.A{
-				Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
-				A:   f.example.AsSlice(),
-			})
-		case "fail.example.":
-			// A failed upstream exchange, which the server turns into SERVFAIL.
-			return nil, context.DeadlineExceeded
-		case "big.example.":
-			// Enough records to exceed the client's UDP size, so the server shapes a
-			// truncated reply.
-			for i := 0; i < 40; i++ {
-				ip := netip.AddrFrom4([4]byte{93, 184, 217, byte(i + 1)})
-				resp.Answer = append(resp.Answer, &mdns.A{
-					Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
-					A:   ip.AsSlice(),
-				})
-			}
-		case "short.example.":
-			// A one-second answer, for the "evidence expired before the decision"
-			// control.
-			resp.Answer = append(resp.Answer, &mdns.A{
-				Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 1},
-				A:   netip.MustParseAddr("93.184.216.77").AsSlice(),
-			})
-		case "alias.example.":
-			// A validated alias chain: the queried name is a CNAME to the name
-			// that carries the address.
-			resp.Answer = append(resp.Answer,
-				&mdns.CNAME{
-					Hdr:    mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeCNAME, Class: mdns.ClassINET, Ttl: 300},
-					Target: "plain.example.",
-				},
-				&mdns.A{
-					Hdr: mdns.RR_Header{Name: "plain.example.", Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 300},
-					A:   f.example.AsSlice(),
-				})
-		}
-		return resp, nil
-	}}
-	server, err := gatewaydns.NewServer(gatewaydns.ServerConfig{
-		Gateway:               netip.AddrPortFrom(f.gwDNS, 53),
-		MaxInflightPerSession: maxInflightPerSession,
-	}, resolver, matcher)
-	if err != nil {
-		t.Fatalf("dns NewServer: %v", err)
-	}
-	gateway, err := gatewaydns.NewGateway(gatewaydns.GatewayConfig{
-		Gateway:       netip.AddrPortFrom(f.gwDNS, 53),
-		RouteObserver: routeCache,
-	}, server)
-	if err != nil {
-		t.Fatalf("dns NewGateway: %v", err)
-	}
-
 	fwd := forwarder.NewForwarder(nil, "10.100.0.0/16", 64)
 	fwd.AttachBackendDevice(11, f.backend)
 	returnPath := forwarder.NewReturnPath(func(_, _ string, packet []byte) (int, error) {
@@ -235,8 +103,6 @@ func newClientDiagFixtureWithInflight(t *testing.T, maxInflightPerSession int) *
 	}
 	fwd.RegisterSessionWithReturnPath(sess.ID, "conn-1", f.peerKey, f.clientIP.String(), 11, returnPath)
 	f.returnPath = returnPath
-	f.slowEntered = make(chan struct{}, 1)
-	f.slowRelease = make(chan struct{})
 
 	f.fwd = fwd
 	f.routeCache = routeCache
@@ -244,19 +110,13 @@ func newClientDiagFixtureWithInflight(t *testing.T, maxInflightPerSession int) *
 	if err := f.svc.ConfigurePBR(PBRConfig{
 		Enabled:       true,
 		HostWANIP:     netip.MustParseAddr("203.0.113.1"),
-		GatewayDNSIP:  f.gwDNS,
 		WANDevice:     f.wan,
 		RouteCache:    routeCache,
 		PolicyMatcher: matcher,
-		DNSGateway:    gateway,
 	}); err != nil {
 		t.Fatalf("ConfigurePBR: %v", err)
 	}
 	t.Cleanup(func() { _ = f.svc.TeardownPBR() })
-	// Registered after the teardown cleanup, so it runs first: an early assertion
-	// failure must release the slow upstream exchange before the fixture tears the
-	// resolver and the direct egress down.
-	t.Cleanup(f.releaseSlow)
 	f.dem = fwd.DirectEgress()
 	return f
 }
@@ -288,17 +148,6 @@ func (f *clientDiagFixture) generation(t *testing.T) uint64 {
 	return states[0].Generation
 }
 
-func findEntry(t *testing.T, entries []ClientDiagnosisEntry, address string) ClientDiagnosisEntry {
-	t.Helper()
-	for _, entry := range entries {
-		if entry.Address == address {
-			return entry
-		}
-	}
-	t.Fatalf("no retained evidence for %s; entries=%+v", address, entries)
-	return ClientDiagnosisEntry{}
-}
-
 func findFlow(t *testing.T, flows []ClientDiagnosisFlow, dst string, dstPort uint16) ClientDiagnosisFlow {
 	t.Helper()
 	for _, flow := range flows {
@@ -311,13 +160,11 @@ func findFlow(t *testing.T, flows []ClientDiagnosisFlow, dst string, dstPort uin
 }
 
 // TestClientDiagnosisReportsTheProducersOwnRecords is the primary positive
-// control: DIRECT and PROXY flows recorded by the packet path, and the address
-// evidence recorded by the intercepted DNS answer, are all reported for the
-// session that produced them.
+// control: DIRECT and PROXY flows recorded by the packet path are reported for the
+// session that produced them, and the evidence section states that no answer was
+// recorded rather than presenting an empty history.
 func TestClientDiagnosisReportsTheProducersOwnRecords(t *testing.T) {
 	f := newClientDiagFixture(t)
-	f.queryIP(t, "plain.example", 50001)
-	f.queryIP(t, "proxy.example", 50002)
 
 	// One uncovered destination (PROXY default), one destination inside the
 	// allocation (DIRECT by address), one PROXY destination (operator rule).
@@ -350,30 +197,19 @@ func TestClientDiagnosisReportsTheProducersOwnRecords(t *testing.T) {
 		t.Error("the answer must declare that it is read-only")
 	}
 
-	if !answer.DNS.Available || answer.DNS.State != string(policy.EvidenceFresh) {
-		t.Fatalf("dns = %+v, want a fresh retained set", answer.DNS)
+	// No producer observes DNS in this build, so the retained set is absent. The
+	// section must still be present and state that, not claim an empty history.
+	if !answer.DNS.Available {
+		t.Fatalf("dns = %+v, want the section present", answer.DNS)
 	}
-	direct := findEntry(t, answer.DNS.Entries, f.example.String())
-	if direct.Decision != policy.Direct.String() {
-		t.Errorf("plain.example evidence decision = %q, want DIRECT", direct.Decision)
+	if answer.DNS.State != string(policy.EvidenceAbsent) {
+		t.Errorf("dns state = %q, want absent: no DNS answer was recorded", answer.DNS.State)
 	}
-	if direct.ObservedAt == "" || direct.ExpiresAt == "" {
-		t.Errorf("evidence instants = %q/%q, want both recorded", direct.ObservedAt, direct.ExpiresAt)
-	}
-	if direct.AgeSeconds == nil {
-		t.Errorf("fresh evidence age = %q, want a measured age", direct.AgeUnavailableReason)
-	}
-	proxyEvidence := findEntry(t, answer.DNS.Entries, f.proxyIP.String())
-	if proxyEvidence.Decision != policy.Proxy.String() {
-		t.Errorf("proxy.example evidence decision = %q, want PROXY", proxyEvidence.Decision)
+	if len(answer.DNS.Entries) != 0 {
+		t.Errorf("evidence entries = %d, want none", len(answer.DNS.Entries))
 	}
 	if answer.DNS.Names.Match != ClientDiagnosisNamesNotRecorded {
 		t.Errorf("names match = %q, want not_recorded: the cache keeps no names", answer.DNS.Names.Match)
-	}
-	for _, entry := range answer.DNS.Entries {
-		if len(entry.Names) != 0 {
-			t.Errorf("entry %s carries names %v from an address-keyed cache", entry.Address, entry.Names)
-		}
 	}
 
 	if !answer.Flows.Available {
@@ -484,7 +320,6 @@ func TestClientDiagnosisReportsTheProducersOwnRecords(t *testing.T) {
 // in another client's answer, in either section.
 func TestClientDiagnosisIsolatesClients(t *testing.T) {
 	f := newClientDiagFixture(t)
-	f.queryIP(t, "plain.example", 51001)
 	f.sendTCP(t, f.example, 41001, 443)
 	firstSession := f.sessionID(t)
 
@@ -533,8 +368,10 @@ func TestClientDiagnosisIsolatesClients(t *testing.T) {
 			if !target.RouteLive || target.RouteGeneration == 0 {
 				t.Errorf("first client target = %+v, want a live route generation", target)
 			}
-			if target.EvidenceEntries == 0 {
-				t.Error("the first client holds retained evidence, but the picker reports none")
+			// Nothing records DNS answers in this build, so the picker counts the
+			// session's flows and must not imply retained evidence it does not hold.
+			if target.EvidenceEntries != 0 {
+				t.Errorf("first client target = %+v, want no retained evidence", target)
 			}
 		}
 	}
@@ -544,7 +381,6 @@ func TestClientDiagnosisIsolatesClients(t *testing.T) {
 // absent selections: none of them may return another incarnation's records.
 func TestClientDiagnosisRefusesAnotherIncarnation(t *testing.T) {
 	f := newClientDiagFixture(t)
-	f.queryIP(t, "plain.example", 52001)
 	f.sendTCP(t, f.example, 42001, 443)
 	sessionID := f.sessionID(t)
 	oldGeneration := f.generation(t)
@@ -588,10 +424,7 @@ func TestClientDiagnosisRefusesAnotherIncarnation(t *testing.T) {
 		if answer.Selection.State != ClientDiagnosisStateLive {
 			t.Fatalf("state = %q, want live for the current generation", answer.Selection.State)
 		}
-		// The DNS ledger survives a rekey; the flow table does not.
-		if len(answer.DNS.Entries) == 0 {
-			t.Error("retained address evidence must survive a same-session rekey")
-		}
+		// The flow table does not survive a rekey.
 		if len(answer.Flows.Entries) != 0 {
 			t.Errorf("flows = %d after a rekey, want 0", len(answer.Flows.Entries))
 		}
@@ -711,7 +544,6 @@ func TestClientDiagnosisBusyAndCancelled(t *testing.T) {
 // and after a diagnosis request.
 func TestClientDiagnosisLeavesEveryStoreUntouched(t *testing.T) {
 	f := newClientDiagFixture(t)
-	f.queryIP(t, "plain.example", 53001)
 	f.sendTCP(t, f.example, 43001, 443)
 	sessionID := f.sessionID(t)
 	generation := f.generation(t)

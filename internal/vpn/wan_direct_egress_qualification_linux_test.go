@@ -733,7 +733,6 @@ func s4BuildDispatcherService(wanDev forwarder.PacketDevice, fixture *s4Fixture)
 	cfg := PBRConfig{
 		Enabled:       true,
 		HostWANIP:     netip.MustParseAddr(s4HostWAN),
-		GatewayDNSIP:  netip.MustParseAddr("10.100.0.1"),
 		WANDevice:     wanDev,
 		RouteCache:    rc,
 		PolicyMatcher: matcher,
