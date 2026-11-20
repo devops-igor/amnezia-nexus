@@ -20,6 +20,9 @@ import re
 # disagree, so the exemption cannot grow or shrink without a visible edit.
 SETTINGS_SURFACE_CLASSES = frozenset({
     "mb-md", "mb-sm", "mt-sm", "spinner-sm",
+    # The per-client flows table's cell disclosure: the row keeps four cells and
+    # reveals the rest of a fact in place, which the reference never had.
+    "cell-detail", "cell-detail-toggle",
     "settings-bar", "settings-bullets",
     "settings-button-row", "settings-button-row-tight",
     "settings-card-header-split", "settings-card-stacked",

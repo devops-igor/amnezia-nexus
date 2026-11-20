@@ -29,6 +29,27 @@
     // wording.
     var TEXT_PREFIX = 'policy_client_';
 
+    // DECISION_REASON_LABELS maps a recorded decision reason to the one short
+    // label the flows table shows. The mapping is data, not a branch: a token this
+    // build does not know falls back to one generic label, so a raw token never
+    // reaches a cell. The two refusal conditions are listed as well - this build
+    // records them as a refused packet or a failed dispatch rather than as a
+    // flow's reason, so should a diagnosis ever carry either as one, it still
+    // renders a label instead of the token.
+    var DECISION_REASON_LABELS = {
+        allocation_direct: 'policy_client_decision_reason_allocation_direct',
+        allocation_cdn_excluded: 'policy_client_decision_reason_allocation_cdn_excluded',
+        no_trusted_evidence: 'policy_client_decision_reason_no_trusted_evidence',
+        prohibited_destination: 'policy_client_decision_reason_prohibited_destination',
+        direct_egress_unavailable: 'policy_client_decision_reason_direct_egress_unavailable',
+        proxy_cidr_rule: 'policy_client_decision_reason_proxy_cidr_rule',
+        evidence_direct: 'policy_client_decision_reason_evidence_direct',
+        proxy_cached_evidence: 'policy_client_decision_reason_proxy_cached_evidence',
+        sticky_flow: 'policy_client_decision_reason_sticky_flow',
+        non_tcp_udp_fallback: 'policy_client_decision_reason_non_tcp_udp_fallback',
+        not_recorded: 'policy_client_decision_reason_not_recorded'
+    };
+
     var initialized = false;
     // The newest request issued. A response whose sequence is not this one is
     // stale and is dropped, which is what keeps two deferred answers from
@@ -419,11 +440,113 @@
         return clientText('policy_client_failed');
     }
 
-    function appendCell(row, text) {
+    // detailSeq numbers the revealed detail regions so each opener can name the
+    // element it controls. Ids only have to be unique in the document, so the
+    // counter is never reset.
+    var detailSeq = 0;
+
+    // openDetail is the one revealed detail, as {toggle, region}. A table of many
+    // rows must not accumulate open panels, so opening one closes the previous, and
+    // a re-render drops the reference with the rows it belonged to.
+    var openDetail = null;
+
+    // appendCell writes one table cell. A cell whose full fact is longer than the
+    // column carries that fact as its title, which native tooltips show on hover
+    // only, and as a disclosure inside the same cell: a focusable opener that says
+    // whether it is expanded and names the region it reveals. The row keeps its
+    // cells; the detail is revealed in place, so a pointer or a keyboard can reach
+    // what hover cannot.
+    function appendCell(row, text, title) {
         var cell = root.document.createElement('td');
-        cell.textContent = text == null || text === '' ? '-' : String(text);
+        var label = text == null || text === '' ? '-' : String(text);
+        if (!title) {
+            cell.textContent = label;
+            row.appendChild(cell);
+            return cell;
+        }
+        var detail = String(title);
+        cell.title = detail;
+        var regionId = 'policyClientCellDetail' + (++detailSeq);
+        var toggle = root.document.createElement('span');
+        toggle.className = 'cell-detail-toggle';
+        toggle.setAttribute('role', 'button');
+        toggle.setAttribute('tabindex', '0');
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.setAttribute('aria-controls', regionId);
+        toggle.setAttribute('data-detail', detail);
+        toggle.textContent = label;
+        var region = root.document.createElement('span');
+        region.className = 'cell-detail';
+        region.id = regionId;
+        region.hidden = true;
+        toggle.addEventListener('click', function (event) {
+            if (event && typeof event.stopPropagation === 'function') {
+                event.stopPropagation();
+            }
+            toggleCellDetail(toggle, region);
+        });
+        toggle.addEventListener('keydown', function (event) {
+            handleDetailKey(event, toggle, region);
+        });
+        cell.addEventListener('click', function () {
+            openCellDetail(toggle, region);
+        });
+        cell.appendChild(toggle);
+        cell.appendChild(region);
         row.appendChild(cell);
         return cell;
+    }
+
+    // toggleCellDetail opens or closes one cell's detail, so a pointer or the
+    // keyboard can put back what it revealed.
+    function toggleCellDetail(toggle, region) {
+        if (openDetail && openDetail.region === region) {
+            closeDetail();
+            return;
+        }
+        openCellDetail(toggle, region);
+    }
+
+    // openCellDetail reveals one cell's detail and closes whatever was open, so only
+    // one panel is ever expanded.
+    function openCellDetail(toggle, region) {
+        if (openDetail && openDetail.region === region) {
+            return;
+        }
+        closeDetail();
+        region.textContent = toggle.getAttribute('data-detail') || '';
+        region.hidden = false;
+        toggle.setAttribute('aria-expanded', 'true');
+        openDetail = {toggle: toggle, region: region};
+    }
+
+    // closeDetail hides the revealed detail and clears its text, so a closed cell
+    // carries no hidden copy of the fact.
+    function closeDetail() {
+        if (!openDetail) {
+            return;
+        }
+        openDetail.region.hidden = true;
+        openDetail.region.textContent = '';
+        openDetail.toggle.setAttribute('aria-expanded', 'false');
+        openDetail = null;
+    }
+
+    // handleDetailKey gives the disclosure the keyboard it needs: Enter and Space
+    // open or close it, Escape closes it and leaves focus on the opener so the
+    // operator does not lose their place in the table.
+    function handleDetailKey(event, toggle, region) {
+        var key = event && event.key;
+        if (key === 'Enter' || key === ' ' || key === 'Spacebar') {
+            event.preventDefault();
+            toggleCellDetail(toggle, region);
+            return;
+        }
+        if (key === 'Escape' || key === 'Esc') {
+            event.preventDefault();
+            closeDetail();
+            toggle.focus();
+        }
     }
 
     function renderEvidence(entries) {
@@ -442,118 +565,224 @@
         });
     }
 
-    // renderFlows renders the recorded decisions and outcomes. Every cell states
-    // what the server sent: a branch token, a correlation class, or an explicit
-    // "not recorded"/"not measured". Nothing here derives a cause, a name or a
-    // success.
+    // renderFlows renders the recorded decisions for one incarnation, as four
+    // columns: the protocol, the destination, the route the flow was given and the
+    // reason for that route. Every cell states what the server sent; nothing here
+    // derives a cause, a name or a success. The route cell marks a delivery the
+    // dispatch path refused, so a direct route that failed cannot read as one that
+    // reached the WAN.
     function renderFlows(entries) {
         var body = clientElement('policyClientFlowRows');
         if (!body) {
             return;
         }
+        // A detail revealed on the previous render belongs to a row that is being
+        // replaced, so the panel is closed before the table is rebuilt.
+        closeDetail();
         entries.forEach(function (flow) {
             var row = root.document.createElement('tr');
             appendCell(row, clientTokenLabel('protocol', flow.protocol));
-            appendCell(row, flow.destination_ip + ':' + String(flow.destination_port));
-            appendCell(row, clientTokenLabel('decision', flow.choice));
-
-            var decision = flow.decision_time + ' · ' + clientTokenLabel('reason', flow.decision_reason);
-            if (flow.policy_generation && flow.policy_generation !== 'not_recorded') {
-                decision = decision + ' · ' + flow.policy_generation;
-            }
-            // The backend the branch selected, when the recorded decision carries one.
-            // It is the producer's own value, not a lookup of the current configuration.
-            if (flow.backend_tunnel_id != null) {
-                decision = decision + ' · ' + clientText('policy_client_backend_fmt')
-                    .replace('{backend}', String(flow.backend_tunnel_id));
-            }
-            appendCell(row, decision);
-
-            var names = clientTokenLabel('name_match', flow.names_match);
-            if (flow.names && flow.names.length) {
-                names = names + ': ' + flow.names.join(', ');
-            } else if (flow.name_attempts && flow.name_attempts.length) {
-                // A failed query has no answer to attribute to this IP. These are
-                // names the client tried near the decision, never "the flow's name".
-                var tried = flow.name_attempts.map(function (attempt) {
-                    var label = attempt.name + ' (' + clientTokenLabel('dns_event', attempt.kind);
-                    if (attempt.qtype) {
-                        label = label + ', ' + attempt.qtype;
-                    }
-                    return label + ')';
-                }).join(', ');
-                names = names + ': ' + clientText('policy_client_tried_names_fmt').replace('{names}', tried);
-            } else if (flow.names_reason) {
-                names = names + ': ' + clientTokenLabel('corr', flow.names_reason);
-            }
-            appendCell(row, names);
-
-            // The route and the dispatch outcome are stated together, on the
-            // server's own tokens: a flow routed DIRECT whose packets never reached
-            // the WAN must read as direct-and-failed rather than as an unexplained
-            // failure, because the cause is the egress path, not the classifier.
-            var dispatchState = (flow.dispatch && flow.dispatch.state) || 'not_recorded';
-            var routeOutcome = clientText('policy_client_route_outcome_fmt')
-                .replace('{route}', clientTokenLabel('decision', flow.choice))
-                .replace('{dispatch}', clientTokenLabel('dispatch', dispatchState));
-            var outcome = routeOutcome + ' · ' + clientText('policy_client_outcome_fmt')
-                .replace('{ok}', String((flow.forward && flow.forward.packets) || 0))
-                .replace('{failed}', String((flow.forward && flow.forward.failed) || 0))
-                .replace('{return}', clientTokenLabel('return_evidence', (flow.return && flow.return.evidence) || 'not_recorded'))
-                .replace('{packets}', String((flow.return && flow.return.packets) || 0));
-            if (flow.forward && flow.forward.failure) {
-                outcome = outcome + ' · ' + clientTokenLabel('failure', flow.forward.failure);
-            }
-            // PROXY return: arrival, queue admission and the client handoff are three
-            // different observations. They are rendered as a chain so "admitted" is never
-            // read as "delivered", and a refusal states where the reply stopped.
-            if (flow.choice === 'PROXY' && flow.return && flow.return.evidence === 'observed') {
-                var chain = clientText('policy_client_return_chain_fmt')
-                    .replace('{matched}', String(flow.return.matched || 0))
-                    .replace('{admitted}', String(flow.return.admitted || 0))
-                    .replace('{delivered}', String(flow.return.delivered || 0))
-                    .replace('{failed}', String(flow.return.failed || 0));
-                if (flow.return.failure) {
-                    chain = chain + ' (' + clientTokenLabel('failure', flow.return.failure) + ')';
-                }
-                // The claim beside the numbers: this is the flow that owns the tuple now,
-                // which is not proof of which remote incarnation answered.
-                if (flow.return.authority) {
-                    chain = chain + ' · ' + clientTokenLabel('return_authority', flow.return.authority);
-                }
-                outcome = outcome + ' · ' + chain;
-            }
-            // Admission and the backend device write are different facts: a proxy
-            // flow states both, so "queued" is never read as "delivered".
-            // Only stated when a device outcome exists: "0 written / 0 failed" on a
-            // packet that has not reached the writer yet would read as a measurement.
-            if (flow.choice === 'PROXY' && flow.forward &&
-                ((flow.forward.backend_writes || 0) + (flow.forward.backend_write_failed || 0)) > 0) {
-                var written = clientText('policy_client_backend_write_fmt')
-                    .replace('{ok}', String(flow.forward.backend_writes || 0))
-                    .replace('{failed}', String(flow.forward.backend_write_failed || 0));
-                if (flow.forward.backend_write_failure) {
-                    written = written + ' (' + clientTokenLabel('failure', flow.forward.backend_write_failure) + ')';
-                }
-                outcome = outcome + ' · ' + written;
-            }
-            appendCell(row, outcome);
-
-            appendCell(row, formatSeconds(flow.last_seen_age_seconds));
-            var state = flow.expired ? 'expired' : 'active';
-            if (flow.close_seen) {
-                state = state + '/closed';
-            }
-            appendCell(row, state);
+            appendFlowDestination(row, flow);
+            appendFlowRoute(row, flow);
+            appendFlowDecision(row, flow);
             body.appendChild(row);
         });
     }
 
-    function formatSeconds(seconds) {
-        if (typeof seconds !== 'number' || !isFinite(seconds)) {
-            return '-';
+    // appendFlowDestination states the recorded tuple, followed by the matched DNS
+    // names only when stored answers name this address: the one name when there is
+    // one, and the first name plus how many others also match when there are
+    // several. The first name is shown because the row must stay readable, and the
+    // count is shown with it so the address never looks like it has that one name.
+    // The complete list stays in the cell tooltip, and the names a client tried
+    // without an answer are never shown: an unanswered query says nothing about
+    // where this flow went.
+    function appendFlowDestination(row, flow) {
+        var address = flow.destination_ip + ':' + String(flow.destination_port);
+        var names = flow.names || [];
+        if (names.length === 1) {
+            appendCell(row, address + ' (' + names[0] + ')');
+            return;
         }
-        return clientText('policy_client_seconds').replace('{seconds}', String(Math.max(0, Math.floor(seconds))));
+        if (names.length > 1) {
+            var several = clientText('policy_client_flow_names_multiple')
+                .replace('{name}', String(names[0]))
+                .replace('{count}', String(names.length - 1));
+            appendCell(row, address + ' (' + several + ')', names.join(', '));
+            return;
+        }
+        appendCell(row, address);
+    }
+
+    // appendFlowRoute states the route the flow was given and marks every producer
+    // that recorded a failed delivery: the dispatch path, the backend device writes
+    // and the return delivery. Each failing producer is named on its own, so a flow
+    // whose backend accepted some writes and refused one is never reported as a
+    // failed flow, and a direct route whose packets were refused cannot read like a
+    // direct route that reached the WAN. Only recorded states and counters mark the
+    // cell: a success is never inferred from an absent failure.
+    function appendFlowRoute(row, flow) {
+        var state = dispatchState(flow);
+        var markers = routeFailureMarkers(flow, state);
+        var route = clientTokenLabel('decision', flow.choice);
+        if (markers.length) {
+            route = route ? route + ' (' + markers.join(', ') + ')' : markers.join(', ');
+        }
+        appendCell(row, route, routeFailureDetail(flow, state));
+    }
+
+    // dispatchState is the outcome the dispatch path recorded, or '' when the
+    // answer carried none.
+    function dispatchState(flow) {
+        var dispatch = flow.dispatch || {};
+        return dispatch.state == null ? '' : String(dispatch.state);
+    }
+
+    // dispatchFailed reports whether the dispatch path refused the flow's packets.
+    // The recorded state is the producer's summary; the refused-packet counter is
+    // checked as well, so an answer that carries the count without a state this
+    // build knows is still marked instead of reading as a delivery that worked.
+    function dispatchFailed(flow, state) {
+        return state === 'failed' || recordedCount(flow.forward, 'failed') > 0;
+    }
+
+    // routeFailureMarkers names every producer that recorded a failed delivery, in
+    // the order the wire states them: the dispatch outcome, the backend device
+    // writes, then the return path. A producer with nothing refused contributes
+    // nothing, so the marker count is what the record says, not a guess. The return
+    // path refuses a reply in two different places - before the client writer
+    // (dropped: queue full, rate limited, size cap, closed path) and inside it
+    // (failed) - and either one is a delivery the panel did not make.
+    function routeFailureMarkers(flow, state) {
+        var markers = [];
+        if (dispatchFailed(flow, state)) {
+            markers.push(clientText('policy_client_dispatch_failed'));
+        }
+        if (recordedCount(flow.forward, 'backend_write_failed') > 0) {
+            markers.push(clientText('policy_client_route_failed_backend_write'));
+        }
+        if (returnRefused(flow.return)) {
+            markers.push(clientText('policy_client_route_failed_return'));
+        }
+        return markers;
+    }
+
+    // returnRefused reports whether the return path recorded a refusal: a reply
+    // dropped before the client writer, or a writer failure. The two counters are
+    // separate observations and neither is inferred from the other.
+    function returnRefused(back) {
+        return recordedCount(back, 'failed') > 0 || recordedCount(back, 'dropped') > 0;
+    }
+
+    // routeFailureDetail is the evidence behind the route cell: the dispatch
+    // outcome, and for every producer that failed its recorded reason and the
+    // counts it recorded, so a backend write refusal is not read as a client-side
+    // queue failure. A flow that recorded nothing offers no tooltip.
+    function routeFailureDetail(flow, state) {
+        var parts = [];
+        var forward = flow.forward || {};
+        var back = flow.return || {};
+        if (state && state !== 'not_recorded') {
+            parts.push(clientTokenLabel('dispatch', state));
+            appendFailureLabel(parts, (flow.dispatch && flow.dispatch.reason) || forward.failure);
+        } else if (dispatchFailed(flow, state)) {
+            // The count says packets were refused, but no state this build knows
+            // was recorded: state the outcome from the counter, not from a guess.
+            parts.push(clientText('policy_client_dispatch_failed'));
+            appendFailureLabel(parts, forward.failure);
+        }
+        if (recordedCount(forward, 'backend_write_failed') > 0) {
+            parts.push(clientText('policy_client_route_failed_backend_write'));
+            appendFailureLabel(parts, forward.backend_write_failure);
+            parts.push(filledText('policy_client_backend_write_fmt', {
+                ok: recordedCount(forward, 'backend_writes'),
+                failed: recordedCount(forward, 'backend_write_failed')
+            }));
+        }
+        if (returnRefused(back)) {
+            parts.push(clientText('policy_client_route_failed_return'));
+            appendFailureLabel(parts, back.failure);
+            // The chain keeps every return observation in its own slot: a dropped
+            // reply and a failed write are different facts and are never summed.
+            parts.push(filledText('policy_client_return_chain_fmt', {
+                matched: recordedCount(back, 'matched'),
+                admitted: recordedCount(back, 'admitted'),
+                delivered: recordedCount(back, 'delivered'),
+                failed: recordedCount(back, 'failed'),
+                dropped: recordedCount(back, 'dropped')
+            }));
+        }
+        return parts.join(' · ');
+    }
+
+    // appendFailureLabel adds the dictionary label of a recorded failure token, and
+    // nothing when that producer recorded none.
+    function appendFailureLabel(parts, token) {
+        if (token) {
+            parts.push(clientTokenLabel('failure', token));
+        }
+    }
+
+    // filledText translates one format string and fills its placeholders here, so a
+    // count is inserted into the shipped sentence instead of a sentence assembled
+    // from fragments.
+    function filledText(key, values) {
+        var text = clientText(key);
+        Object.keys(values).forEach(function (name) {
+            text = text.replace('{' + name + '}', String(values[name]));
+        });
+        return text;
+    }
+
+    // recordedCount reads one recorded counter. An absent or non-numeric value is
+    // the zero it is: it neither invents a failure nor hides one.
+    function recordedCount(owner, field) {
+        var value = Number(owner && owner[field]);
+        return isFinite(value) && value > 0 ? value : 0;
+    }
+
+    // appendFlowDecision states the recorded reason as one short label. The instant,
+    // the policy generation, the selected backend and the raw token stay out of the
+    // cell: they are the background of the label, so they are offered as the cell's
+    // title instead of crowding the row.
+    function appendFlowDecision(row, flow) {
+        var token = flow.decision_reason == null ? '' : String(flow.decision_reason);
+        appendCell(row, clientText(decisionReasonLabelKey(token)), flowDecisionDetail(flow, token));
+    }
+
+    // decisionReasonLabelKey resolves a recorded reason to its label key. A flow
+    // recorded without one is not a different condition, so it takes the
+    // "not recorded" label; a token this build does not know takes the generic
+    // one, which is also what keeps the token out of the cell text.
+    function decisionReasonLabelKey(token) {
+        if (!token) {
+            return 'policy_client_decision_reason_not_recorded';
+        }
+        if (Object.prototype.hasOwnProperty.call(DECISION_REASON_LABELS, token)) {
+            return DECISION_REASON_LABELS[token];
+        }
+        return 'policy_client_decision_reason_unknown';
+    }
+
+    // flowDecisionDetail is what the cell cannot show: when the decision was taken,
+    // against which policy generation, for which backend, and the token the label
+    // was derived from.
+    function flowDecisionDetail(flow, token) {
+        var parts = [];
+        if (flow.decision_time && flow.decision_time !== 'not_recorded') {
+            parts.push(String(flow.decision_time));
+        }
+        if (flow.policy_generation && flow.policy_generation !== 'not_recorded') {
+            parts.push(String(flow.policy_generation));
+        }
+        if (flow.backend_tunnel_id != null) {
+            parts.push(clientText('policy_client_backend_fmt')
+                .replace('{backend}', String(flow.backend_tunnel_id)));
+        }
+        if (token && token !== 'not_recorded') {
+            parts.push(token);
+        }
+        return parts.join(' · ');
     }
 
     // renderDNSRecords renders the observed answers. The name, its validated
@@ -870,9 +1099,6 @@
             if (!flows.scan_complete) {
                 flowFoot = flowFoot + ' ' + clientText('policy_client_partial_scan').replace('{scanned}', String(flows.scanned || 0));
             }
-        }
-        if ((flows.entries || []).length) {
-            flowFoot = flowFoot + ' ' + clientText('policy_client_counters_live_note');
         }
         renderFoot('policyClientFlowFoot', flowFoot);
 

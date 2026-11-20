@@ -140,11 +140,16 @@ await w.diagnoseSelectedClient();
 await settle();
 
 const proxyFlow = rowCells('policyClientFlowRows', 0);
-assert.equal(proxyFlow[3],
-  '2026-11-17T09:09:58Z · REASON:proxy_cidr_rule · gen-flow-9 · BACKEND 77',
-  'the recorded decision states its instant, reason, policy generation and selected backend');
+assert.equal(proxyFlow[1], '93.184.216.34:443 (plain.example)',
+  'the destination carries the one stored answer that names it');
+assert.equal(proxyFlow[3], 'DECISION_REASON:proxy_cidr_rule',
+  'the recorded reason is one label, not a sentence of metadata');
+assert.equal(rowCellTitles('policyClientFlowRows', 0)[3],
+  '2026-11-17T09:09:58Z · gen-flow-9 · BACKEND 77 · proxy_cidr_rule',
+  'the recorded decision states its instant, generation and selected backend as the cell tooltip');
 const directFlow = rowCells('policyClientFlowRows', 1);
-assert.equal(directFlow[3], '2026-11-17T09:09:50Z · REASON:evidence_direct · gen-flow-8',
+assert.equal(directFlow[3], 'DECISION_REASON:evidence_direct');
+assert.equal(rowCellTitles('policyClientFlowRows', 1)[3], '2026-11-17T09:09:50Z · gen-flow-8 · evidence_direct',
   'a DIRECT decision shows no backend it never selected');
 
 const answer = rowCells('policyClientDNSRows', 0);
@@ -186,13 +191,13 @@ assert.equal(text('policyClientFilterFoot'), '', 'no filter, no filter line');
 // named the address.
 await setFilter('plain.example');
 assert.equal(rowCount('policyClientFlowRows'), 1, 'the flow whose name matches stays');
-assert.equal(rowCells('policyClientFlowRows', 0)[1], '93.184.216.34:443');
+assert.equal(rowCells('policyClientFlowRows', 0)[1], '93.184.216.34:443 (plain.example)');
 assert.equal(rowCount('policyClientDNSRows'), 1, 'the answer record that matches stays');
 assert.equal(rowCount('policyClientEventRows'), 1, 'the query that matches stays');
 assert.equal(rowCount('policyClientDropRows'), 0, 'no refusal carries that destination');
 assert.equal(text('policyClientFilterFoot'), 'FILTER 3/10 "plain.example"',
   'the filter line states what it left out of the recorded rows');
-assert.equal(text('policyClientFlowFoot'), 'FLOWS 2/2 COUNTERS-LIVE',
+assert.equal(text('policyClientFlowFoot'), 'FLOWS 2/2',
   'the section foot still describes the recorded page, not the filtered one');
 
 // An address narrows by the address the router wrote, and the refusal that carried no

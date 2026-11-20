@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io/fs"
 	"regexp"
 	"strings"
 	"testing"
@@ -33,16 +34,18 @@ func clientDiagSectionHTMLForTest(t *testing.T) string {
 		"is_admin": func(any) bool {
 			return true
 		},
+		"asset_url": AssetURL,
 	}
 	tmpl, err := template.New("settings_policy_client.html").Funcs(funcs).ParseFS(TemplatesFS, "templates/settings_policy_client.html")
 	if err != nil {
 		t.Fatalf("parse settings_policy_client.html: %v", err)
 	}
 	var buf bytes.Buffer
-	// The page supplies the release version. This package cannot reach the
-	// release constant without an import cycle, so the fixture supplies a
-	// placeholder: the URL must have the production shape even where its exact
-	// value is not asserted.
+	// The page supplies the release version, and the controller is referenced
+	// through its content-derived URL by the shipped template itself. This package
+	// cannot reach the release constant without an import cycle, so the fixture
+	// supplies a placeholder for it: the URL must have the production shape even
+	// where its exact value is not asserted.
 	if err := tmpl.ExecuteTemplate(&buf, "settings_policy_client", map[string]any{
 		"current_user": nil,
 		"app_version":  "test",
@@ -99,8 +102,10 @@ w._ = key => {
   if (key === 'policy_client_dns_truncated') return 'DNS-TRUNC {shown}/{total}';
   if (key === 'policy_client_outcome_fmt') return 'OUTCOME {ok}/{failed} · return {return} {packets}';
   if (key === 'policy_client_route_outcome_fmt') return 'ROUTE {route} · {dispatch}';
+  if (key === 'policy_client_route_failed_backend_write') return 'FAILED:backend-write';
+  if (key === 'policy_client_route_failed_return') return 'FAILED:return';
   if (key === 'policy_client_tried_names_fmt') return 'TRIED {names}';
-  if (key === 'policy_client_counters_live_note') return 'COUNTERS-LIVE';
+  if (key === 'policy_client_flow_names_multiple') return 'FIRST {name} PLUS {count}';
   if (key === 'policy_client_drop_truncated') return 'DROP-TRUNC {shown}/{total}';
   if (key === 'policy_client_drop_coverage') return 'DROPCOV {stored}/{merged}/{evicted}/{pruned} session {session_keys} ledger {keys}/{key_limit} {age}';
   if (key === 'policy_client_drop_no_tuple') return 'NO-TUPLE';
@@ -119,7 +124,7 @@ w._ = key => {
   if (key === 'policy_client_filter_none') return 'NO MATCH "{term}"';
   if (key === 'policy_client_return_authority_current_tuple_association') return 'RETURN_AUTHORITY:current_tuple_association';
   if (key === 'policy_client_return_chain_fmt')
-    return 'RET returned {matched}/{admitted}/{delivered}/{failed}';
+    return 'RET returned {matched}/{admitted}/{delivered}/{failed}/{dropped}';
   if (key === 'policy_client_dns_events_coverage') return 'EVENTS-COVERAGE {stored}/{collapsed}/{evicted}/{aged}';
   if (key === 'policy_client_dns_events_truncated') return 'EVENTS-TRUNC {shown}/{total}';
   if (key === 'policy_client_delivered_yes') return 'DELIVERED';
@@ -129,6 +134,8 @@ w._ = key => {
   // Token families resolve to a sentinel, so an assertion can prove the token
   // was looked up in the dictionary instead of being printed raw.
   if (key.indexOf('policy_client_state_') === 0) return 'STATE:' + key.slice('policy_client_state_'.length);
+  if (key.indexOf('policy_client_decision_reason_') === 0)
+    return 'DECISION_REASON:' + key.slice('policy_client_decision_reason_'.length);
   if (key.indexOf('policy_client_decision_') === 0) return 'DECISION:' + key.slice('policy_client_decision_'.length);
   if (key.indexOf('policy_client_protocol_') === 0) return 'PROTO:' + key.slice('policy_client_protocol_'.length);
   if (key.indexOf('policy_client_limit_') === 0) return 'LIMIT:' + key.slice('policy_client_limit_'.length);
@@ -165,6 +172,12 @@ const options = () => Array.from(w.document.getElementById('policyClientSelect')
     generation: o.getAttribute('data-route-generation')}));
 const rowCount = id => w.document.getElementById(id).children.length;
 const rowCells = (id, index) => Array.from(w.document.getElementById(id).children[index].children).map(c => c.textContent);
+// rowHeaders reads the headers of the table that owns a body id, and rowCellTitles
+// the tooltips of one row: the cells' detail lives there, not in their text.
+const rowHeaders = id => Array.from(
+  w.document.getElementById(id).closest('table').querySelectorAll('thead th')).map(th => th.textContent);
+const rowCellTitles = (id, index) => Array.from(w.document.getElementById(id).children[index].children)
+  .map(c => c.getAttribute('title') || '');
 const selectClient = (id) => {
   const select = w.document.getElementById('policyClientSelect');
   select.value = id;
@@ -300,12 +313,16 @@ assert.deepEqual(rowCells('policyClientEvidenceRows', 0),
    '2026-11-17T09:14:30Z', 'fresh']);
 
 assert.equal(rowCount('policyClientFlowRows'), 1, 'one live flow is rendered');
+assert.deepEqual(rowHeaders('policyClientFlowRows'),
+  ['policy_client_column_protocol', 'policy_client_column_destination',
+   'policy_client_column_choice', 'policy_client_column_decision'],
+  'the flows table renders the four columns an operator reads');
 assert.deepEqual(rowCells('policyClientFlowRows', 0),
-  ['PROTO:tcp', '93.184.216.34:443', 'DECISION:direct',
-   '2026-11-17T09:09:58Z · REASON:evidence_direct · gen-1',
-   'NAME_MATCH:unique: plain.example',
-   'ROUTE DECISION:direct · DISPATCH:written_to_wan · OUTCOME 1/0 · return RETURN_EVIDENCE:not_observed 0',
-   '42s', 'active']);
+  ['PROTO:tcp', '93.184.216.34:443 (plain.example)', 'DECISION:direct',
+   'DECISION_REASON:evidence_direct']);
+assert.equal(rowCellTitles('policyClientFlowRows', 0)[3],
+  '2026-11-17T09:09:58Z · gen-1 · evidence_direct',
+  'the instant, the generation and the token the label came from are the cell tooltip');
 
 const limits = Array.from(w.document.getElementById('policyClientLimitations').children).map(li => li.textContent);
 assert.deepEqual(limits, ['LIMIT:dns_names_not_retained',
@@ -502,9 +519,11 @@ assert.equal(w.document.getElementById('policyClientEvidenceFoot').hidden, false
   'a truncated evidence page must say so');
 assert.equal(text('policyClientEvidenceFoot'), 'TRUNC 1/9');
 assert.equal(w.document.getElementById('policyClientFlowFoot').hidden, false);
-assert.equal(text('policyClientFlowFoot'), 'FLOWS 1/600 PARTIAL 16384 COUNTERS-LIVE',
-  'the flow count must be presented as a windowed count, with the live-sample caveat');
-assert.equal(rowCells('policyClientFlowRows', 0)[0], 'PROTO:udp');
+assert.equal(text('policyClientFlowFoot'), 'FLOWS 1/600 PARTIAL 16384',
+  'the flow count must be presented as a windowed count, with the partial scan stated');
+assert.deepEqual(rowCells('policyClientFlowRows', 0),
+  ['PROTO:udp', '1.1.1.1:53', 'DECISION:proxy', 'DECISION_REASON:not_recorded'],
+  'a flow recorded without decision metadata says so instead of showing an empty cell');
 // Pre-flow refusals: a real row per reason, an explicit "no tuple" instead of an
 // invented destination, the truncation note and the retention coverage.
 assert.equal(rowCells('policyClientDropRows', 0)[0], 'REASON:prohibited',
@@ -530,8 +549,10 @@ assert.equal(text('policyClientDropCoverage'), 'DROPCOV 3/5/0/1 session 4 ledger
 
 // TestPolicyClientDiagFlowStateVariety pins the visible rendering of the states a
 // recorded flow can be in: several candidate names, no candidate with a stated
-// reason, a refused dispatch, an unmeasured return and a flow recorded without
-// decision metadata. Each cell is asserted, so a wrong or invented value fails.
+// reason, a refused dispatch, a dispatch that succeeded into the queue while the
+// backend and the return delivery failed, and a flow recorded without decision
+// metadata. Each cell and each route tooltip is asserted, so a wrong or invented
+// value fails.
 func TestPolicyClientDiagFlowStateVariety(t *testing.T) {
 	runClientDiagScenario(t, clientTargetsScript+`
 responder = ((base) => async (url, opts) => {
@@ -584,6 +605,15 @@ responder = ((base) => async (url, opts) => {
      dispatch: {state: 'written_to_wan'}, forward: {packets: 4, bytes: 400, failed: 0},
      return: {evidence: 'observed', packets: 2, bytes: 200,
               first_at: '2026-11-17T09:10:00Z', last_at: '2026-11-17T09:10:01Z'},
+     names: [], names_match: 'not_recorded', names_considered: 0, name_candidates: []},
+    {protocol: 'udp', destination_ip: '9.9.9.9', destination_port: 443, choice: 'PROXY',
+     route_generation: 3, last_seen_age_seconds: 14, expired: false, close_seen: false,
+     decision_time: '2026-11-17T09:09:55Z', decision_reason: 'sticky_flow',
+     policy_generation: 'gen-1', backend_tunnel_id: 77,
+     dispatch: {state: 'queued_to_backend'},
+     forward: {packets: 5, bytes: 300, failed: 0, backend_writes: 5, backend_write_failed: 0},
+     return: {evidence: 'observed', authority: 'current_tuple_association',
+              matched: 5, admitted: 5, delivered: 5, failed: 0},
      names: [], names_match: 'not_recorded', names_considered: 0, name_candidates: []}
   ];
   return answer;
@@ -592,42 +622,150 @@ responder = ((base) => async (url, opts) => {
 selectClient('sess-a');
 await w.diagnoseSelectedClient();
 await settle();
-assert.equal(rowCount('policyClientFlowRows'), 3, 'all three states are rendered');
+assert.equal(rowCount('policyClientFlowRows'), 4, 'all four states are rendered');
 
 const ambiguous = rowCells('policyClientFlowRows', 0);
-assert.equal(ambiguous[2], 'DECISION:proxy', 'the recorded route is rendered');
-assert.equal(ambiguous[3], '2026-11-17T09:09:58Z · REASON:proxy_cidr_rule · gen-1 · BACKEND 77',
-  'the decision instant, reason, generation and selected backend are rendered together');
-assert.equal(ambiguous[4], 'NAME_MATCH:ambiguous: plain.example, shared.example',
-  'several candidate names are shown as several, never collapsed to one');
-assert.equal(ambiguous[5], 'ROUTE DECISION:proxy · DISPATCH:failed · OUTCOME 0/2 · return RETURN_EVIDENCE:not_measured 0 · FAILURE:backend_queue_full',
-  'a refused dispatch and an unmeasured return are both visible');
+assert.equal(ambiguous[1], '93.184.216.34:443 (FIRST plain.example PLUS 1)',
+  'the first of several candidate names is shown with a count of the others, never collapsed to that one alone');
+assert.equal(ambiguous[2], 'DECISION:proxy (DISPATCH:failed)',
+  'the recorded route is rendered, and a failed dispatch is marked on it');
+assert.equal(rowCellTitles('policyClientFlowRows', 0)[2], 'DISPATCH:failed · FAILURE:backend_queue_full',
+  'a failed dispatch keeps the outcome and the reason it recorded');
+assert.equal(ambiguous[3], 'DECISION_REASON:proxy_cidr_rule',
+  'the deciding reason is one label, not a sentence of metadata');
+assert.equal(rowCellTitles('policyClientFlowRows', 0)[3],
+  '2026-11-17T09:09:58Z · gen-1 · BACKEND 77 · proxy_cidr_rule',
+  'the instant, the generation, the selected backend and the token are the cell tooltip');
 
 const none = rowCells('policyClientFlowRows', 1);
-assert.equal(none[4],
-  'NAME_MATCH:none: TRIED missing.example (EVENT:nxdomain, A)',
-  'an unresolved query near the decision states the name that was tried, not just the reason');
-assert.equal(none[5],
-  'ROUTE DECISION:proxy · DISPATCH:queued_to_backend · OUTCOME 3/0 · return RETURN_EVIDENCE:observed 0 · RET returned 4/3/2/1 (FAILURE:client_queue_full)'
-    + ' · RETURN_AUTHORITY:current_tuple_association'
-    + ' · DEVICE 2/1 (FAILURE:backend_write_failed)',
-  'a proxy flow states queue admission, the device write and the return chain separately');
+assert.equal(none[1], '8.8.8.8:53',
+  'a name the client tried without an answer is not this flow destination name');
+assert.equal(none[3], 'DECISION_REASON:no_trusted_evidence',
+  'the fail-closed default has its own label');
+// The dispatch succeeded into the queue, but the backend refused one of three
+// writes and the return delivery failed: each producer is named on its own, so a
+// partly successful flow is not reported as a failed flow.
+assert.equal(none[2], 'DECISION:proxy (FAILED:backend-write, FAILED:return)',
+  'every producer that recorded a failure is marked by name');
+assert.equal(rowCellTitles('policyClientFlowRows', 1)[2],
+  'DISPATCH:queued_to_backend · FAILED:backend-write · FAILURE:backend_write_failed · DEVICE 2/1 · FAILED:return · FAILURE:client_queue_full · RET returned 4/3/2/1/0',
+  'the tooltip names each failing producer with its reason and its counts');
 
 const unrecorded = rowCells('policyClientFlowRows', 2);
-assert.equal(unrecorded[3], 'not_recorded · REASON:not_recorded',
+assert.equal(unrecorded[1], '1.1.1.1:80');
+assert.equal(unrecorded[3], 'DECISION_REASON:not_recorded',
   'a flow without decision metadata says so instead of showing an empty instants cell');
-assert.equal(unrecorded[5], 'ROUTE DECISION:direct · DISPATCH:written_to_wan · OUTCOME 4/0 · return RETURN_EVIDENCE:observed 2',
-  'an observed return is distinguished from an unmeasured one');
+assert.equal(rowCellTitles('policyClientFlowRows', 2)[3], '',
+  'a decision that recorded nothing offers no tooltip');
+
+// The same proxy dispatch outcome with nothing refused: no failure indicator.
+const clean = rowCells('policyClientFlowRows', 3);
+assert.equal(clean[2], 'DECISION:proxy',
+  'a proxy flow whose writes and return delivery recorded no failure keeps the plain route');
+assert.equal(rowCellTitles('policyClientFlowRows', 3)[2], 'DISPATCH:queued_to_backend',
+  'its tooltip states the dispatch outcome and no failure');
 `)
 }
 
-// TestPolicyClientDiagDistinguishesDirectFailedFromDirectWorked covers the
-// distinction the epic review asked for (issue #920): two flows with the same
-// deciding reason differ in outcome, and the difference is a direct-and-failed
-// reading rather than an unexplained failure. The route and the dispatch outcome
-// are asserted together, because that conjunction is what tells an operator the
-// egress path failed rather than the classifier.
-func TestPolicyClientDiagDistinguishesDirectFailedFromDirectWorked(t *testing.T) {
+// TestPolicyClientDiagRouteCellShowsReturnRefusals pins the return path as its own
+// producer. A reply the panel refused before the client writer is recorded as
+// dropped (queue full, rate limited, size cap, closed path) and one its writer
+// could not deliver as failed; these are different observations, so each marks the
+// route cell and each keeps its own number in the tooltip. The reason the answer
+// recorded is stated once - it is the flow's first refusal - and is never
+// attributed to both counters at once.
+func TestPolicyClientDiagRouteCellShowsReturnRefusals(t *testing.T) {
+	runClientDiagScenario(t, clientTargetsScript+`
+responder = ((base) => async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
+  const answer = await base(url, opts);
+  const flow = (ip, dispatch, forward, back) => ({protocol: 'udp', destination_ip: ip,
+    destination_port: 443, choice: 'PROXY', route_generation: 3,
+    last_seen_age_seconds: 3, expired: false, close_seen: false,
+    decision_time: '2026-11-17T09:09:58Z', decision_reason: 'proxy_cidr_rule',
+    policy_generation: 'gen-1', backend_tunnel_id: 77, dispatch: dispatch,
+    forward: forward, return: back,
+    names: [], names_match: 'none', names_considered: 0, name_candidates: []});
+  const queued = {state: 'queued_to_backend'};
+  const backendOk = {packets: 3, bytes: 180, failed: 0, backend_writes: 3, backend_write_failed: 0};
+  answer.flows.entries = [
+    // A queue refusal: packets dropped before the client writer, none failed.
+    flow('77.88.55.77', queued, backendOk,
+      {evidence: 'observed', authority: 'current_tuple_association',
+       matched: 3, admitted: 0, delivered: 0, failed: 0, dropped: 3,
+       failure: 'client_queue_full'}),
+    // A client-writer failure: nothing dropped, one reply failed in the writer.
+    flow('77.88.55.78', queued, backendOk,
+      {evidence: 'observed', authority: 'current_tuple_association',
+       matched: 2, admitted: 2, delivered: 1, failed: 1, dropped: 0,
+       failure: 'client_write_failed'}),
+    // Both observations in the same flow: two dropped, one failed.
+    flow('77.88.55.79', queued, backendOk,
+      {evidence: 'observed', authority: 'current_tuple_association',
+       matched: 5, admitted: 3, delivered: 2, failed: 1, dropped: 2,
+       failure: 'client_rate_limited'}),
+    // A backend refusal and a return refusal together: both producers are named.
+    flow('77.88.55.80', queued,
+      {packets: 3, bytes: 180, failed: 0, backend_writes: 2, backend_write_failed: 1,
+       backend_write_failure: 'backend_write_failed'},
+      {evidence: 'observed', authority: 'current_tuple_association',
+       matched: 2, admitted: 0, delivered: 0, failed: 0, dropped: 2,
+       failure: 'client_rate_limited'})
+  ];
+  return answer;
+})(responder);
+`, `
+selectClient('sess-a');
+await w.diagnoseSelectedClient();
+await settle();
+assert.equal(rowCount('policyClientFlowRows'), 4, 'every recorded refusal is rendered');
+
+// Dropped only: marked, and the drop reason is stated.
+const dropped = rowCells('policyClientFlowRows', 0);
+assert.equal(dropped[2], 'DECISION:proxy (FAILED:return)',
+  'a return queue refusal marks the route cell as the return producer, not as a backend one');
+assert.equal(dropped[2].indexOf('FAILED:backend-write'), -1,
+  'the return producer never borrows the backend wording');
+assert.equal(rowCellTitles('policyClientFlowRows', 0)[2],
+  'DISPATCH:queued_to_backend · FAILED:return · FAILURE:client_queue_full · RET returned 3/0/0/0/3',
+  'a dropped reply states how many were dropped and why, with the writer failures still zero');
+
+// Failed only: marked, and the writer reason is stated.
+const failedWrite = rowCells('policyClientFlowRows', 1);
+assert.equal(failedWrite[2], 'DECISION:proxy (FAILED:return)',
+  'a client-writer failure marks the route cell as the return producer');
+assert.equal(rowCellTitles('policyClientFlowRows', 1)[2],
+  'DISPATCH:queued_to_backend · FAILED:return · FAILURE:client_write_failed · RET returned 2/2/1/1/0',
+  'a failed write states how many failed and why, with drops still zero');
+
+// Both observations at once: one marker, two numbers, never summed.
+const both = rowCells('policyClientFlowRows', 2);
+assert.equal(both[2], 'DECISION:proxy (FAILED:return)',
+  'both return observations describe one producer, so the cell names it once');
+assert.equal(rowCellTitles('policyClientFlowRows', 2)[2],
+  'DISPATCH:queued_to_backend · FAILED:return · FAILURE:client_rate_limited · RET returned 5/3/2/1/2',
+  'two dropped and one failed stay two numbers in the return chain');
+
+// A backend refusal and a return refusal together: both producers, each by name.
+const twoProducers = rowCells('policyClientFlowRows', 3);
+assert.equal(twoProducers[2], 'DECISION:proxy (FAILED:backend-write, FAILED:return)',
+  'a backend refusal and a return refusal are both marked, in producer order');
+assert.equal(rowCellTitles('policyClientFlowRows', 3)[2],
+  'DISPATCH:queued_to_backend · FAILED:backend-write · FAILURE:backend_write_failed · DEVICE 2/1 · FAILED:return · FAILURE:client_rate_limited · RET returned 2/0/0/0/2',
+  'both producers keep their own reason and counts in one tooltip');
+`)
+}
+
+// TestPolicyClientDiagFlowsTableKeepsFourColumnsAndDropsTheRest pins the flows
+// table to the four columns an operator reads (issue #940), and to the one thing
+// the removed columns carried that the row cannot lose: whether the route that was
+// chosen actually delivered. Both direct flows below share a route and a deciding
+// reason, and only the recorded dispatch separates them, so the table must show
+// that difference in the Recorded route cell rather than let the two rows read the
+// same. The remaining states the wire can send are covered too: a queue hand-off
+// and an unrecorded dispatch stay plain in the cell and differ in the tooltip.
+// Nothing from the removed columns may come back as a column, a cell or a style.
+func TestPolicyClientDiagFlowsTableKeepsFourColumnsAndDropsTheRest(t *testing.T) {
 	runClientDiagScenario(t, clientTargetsScript+`
 responder = ((base) => async (url, opts) => {
   if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
@@ -647,6 +785,20 @@ responder = ((base) => async (url, opts) => {
      dispatch: {state: 'failed', reason: 'direct_egress_unavailable'},
      forward: {packets: 0, bytes: 0, failed: 1, failure: 'direct_egress_unavailable'},
      return: {evidence: 'not_observed', packets: 0, bytes: 0},
+     names: [], names_match: 'none', names_considered: 0, name_candidates: []},
+    {protocol: 'tcp', destination_ip: '77.88.55.66', destination_port: 443, choice: 'PROXY',
+     route_generation: 3, last_seen_age_seconds: 5, expired: false, close_seen: false,
+     decision_time: '2026-11-17T09:10:00Z', decision_reason: 'no_trusted_evidence',
+     policy_generation: 'gen-1', backend_tunnel_id: 77,
+     dispatch: {state: 'queued_to_backend'}, forward: {packets: 3, bytes: 180, failed: 0},
+     return: {evidence: 'not_measured', packets: 0, bytes: 0},
+     names: [], names_match: 'none', names_considered: 0, name_candidates: []},
+    {protocol: 'udp', destination_ip: '1.1.1.1', destination_port: 53, choice: 'DIRECT',
+     route_generation: 3, last_seen_age_seconds: 6, expired: false, close_seen: false,
+     decision_time: 'not_recorded', decision_reason: 'not_recorded',
+     policy_generation: 'not_recorded',
+     dispatch: {state: 'not_recorded'}, forward: {packets: 0, bytes: 0, failed: 0},
+     return: {evidence: 'not_measured', packets: 0, bytes: 0},
      names: [], names_match: 'none', names_considered: 0, name_candidates: []}
   ];
   return answer;
@@ -655,25 +807,559 @@ responder = ((base) => async (url, opts) => {
 selectClient('sess-a');
 await w.diagnoseSelectedClient();
 await settle();
-assert.equal(rowCount('policyClientFlowRows'), 2, 'both direct flows are rendered');
+assert.equal(rowCount('policyClientFlowRows'), 4, 'every flow is rendered');
 
-const worked = rowCells('policyClientFlowRows', 0);
-const failed = rowCells('policyClientFlowRows', 1);
+const headers = rowHeaders('policyClientFlowRows');
+assert.deepEqual(headers, ['policy_client_column_protocol', 'policy_client_column_destination',
+  'policy_client_column_choice', 'policy_client_column_decision'],
+  'the header row is the four columns, not eight');
+['policy_client_column_names', 'policy_client_column_outcome',
+ 'policy_client_column_last_seen', 'policy_client_column_state'].forEach(removed => {
+  assert.ok(headers.indexOf(removed) === -1,
+    'the removed header ' + removed + ' must not return');
+});
 
-// Same route, same deciding reason: the classifier is not what differs.
-assert.equal(worked[2], 'DECISION:direct');
-assert.equal(failed[2], 'DECISION:direct');
-assert.equal(rowCells('policyClientFlowRows', 0)[3], '2026-11-17T09:09:58Z · REASON:allocation_direct · gen-1');
-assert.equal(rowCells('policyClientFlowRows', 1)[3], '2026-11-17T09:09:59Z · REASON:allocation_direct · gen-1');
+Array.from(w.document.getElementById('policyClientFlowRows').children).forEach((row, index) => {
+  assert.equal(row.children.length, 4, 'row ' + index + ' carries exactly four cells');
+});
 
-// The outcome cell names the route and what happened to the packets, so a failed
-// direct flow reads as direct-and-failed instead of as a bare "failed".
-assert.equal(worked[5], 'ROUTE DECISION:direct · DISPATCH:written_to_wan · OUTCOME 2/0 · return RETURN_EVIDENCE:not_observed 0',
-  'a direct flow whose WAN writes succeeded is not reported as failed');
-assert.equal(failed[5], 'ROUTE DECISION:direct · DISPATCH:failed · OUTCOME 0/1 · return RETURN_EVIDENCE:not_observed 0 · FAILURE:direct_egress_unavailable',
-  'a direct flow whose egress failed is direct-and-failed, with the producer failure named');
-assert.notEqual(worked[5], failed[5],
-  'the two outcomes must be distinguishable without inspecting logs');
+// The pair that used to read identically: same route, same deciding reason, one
+// delivered and one refused by the dispatch path.
+assert.deepEqual(rowCells('policyClientFlowRows', 0),
+  ['PROTO:tcp', '213.180.204.186:443', 'DECISION:direct', 'DECISION_REASON:allocation_direct']);
+assert.deepEqual(rowCells('policyClientFlowRows', 1),
+  ['PROTO:tcp', '185.73.194.82:443', 'DECISION:direct (DISPATCH:failed)',
+   'DECISION_REASON:allocation_direct']);
+assert.notDeepEqual(rowCells('policyClientFlowRows', 0)[2], rowCells('policyClientFlowRows', 1)[2],
+  'a direct route that failed must not render like a direct route that was delivered');
+assert.equal(rowCells('policyClientFlowRows', 0)[3], rowCells('policyClientFlowRows', 1)[3],
+  'the Decision cell stays the recorded reason label: the dispatch difference is the route cell');
+assert.equal(rowCells('policyClientFlowRows', 0)[0], rowCells('policyClientFlowRows', 1)[0],
+  'the protocol cell is not what separates the delivered flow from the failed one');
+assert.equal(rowCells('policyClientFlowRows', 1)[2].indexOf('DISPATCH:failed') >= 0, true,
+  'the failure marker comes from the dispatch label dictionary, not from a literal');
+
+// The delivery evidence is the route cell tooltip, where a queue hand-off and a
+// completed write are different statements.
+assert.equal(rowCellTitles('policyClientFlowRows', 0)[2], 'DISPATCH:written_to_wan',
+  'a delivered direct flow states the completed write in its tooltip');
+assert.equal(rowCellTitles('policyClientFlowRows', 1)[2],
+  'DISPATCH:failed · FAILURE:direct_egress_unavailable',
+  'a failed direct flow states the dispatch outcome and the failure it met');
+assert.equal(rowCellTitles('policyClientFlowRows', 2)[2], 'DISPATCH:queued_to_backend',
+  'a queue hand-off is not a completed write and says so');
+assert.equal(rowCellTitles('policyClientFlowRows', 3)[2], '',
+  'a flow whose dispatch recorded nothing offers no tooltip');
+
+// A queue hand-off and an unrecorded dispatch are not failures: only the failed
+// state marks the route text.
+assert.equal(rowCells('policyClientFlowRows', 2)[2], 'DECISION:proxy',
+  'a queued delivery keeps the plain route text');
+assert.equal(rowCells('policyClientFlowRows', 3)[2], 'DECISION:direct',
+  'an unrecorded dispatch keeps the plain route text');
+
+// Nothing from the removed columns may be rendered as cell text: the dispatch and
+// return evidence lives in the route cell tooltip only.
+const removedText = ['ROUTE ', 'OUTCOME', 'RETURN', 'DEVICE ', 'written_to_wan',
+  'direct_egress_unavailable', 'backend_queue_full'];
+Array.from(w.document.getElementById('policyClientFlowRows').children).forEach((row, index) => {
+  Array.from(row.children).forEach(cell => {
+    removedText.forEach(marker => {
+      assert.equal(cell.textContent.indexOf(marker), -1,
+        'row ' + index + ' must not render the removed evidence as ' + marker);
+    });
+  });
+});
+assert.ok(rowCells('policyClientFlowRows', 0).indexOf('active') === -1,
+  'the removed state column is not rendered under another name');
+`)
+}
+
+// TestPolicyClientDiagCellDetailIsReachableByPointerAndKeyboard pins how the cell
+// detail is exposed, not only what it says. A native title is a hover-only
+// affordance: a touch device and a keyboard user never see it. Every cell that
+// carries detail therefore holds a disclosure inside itself - focusable, reporting
+// its expanded state and naming the region it reveals - which a click or tap, Enter
+// or Space opens and Escape closes, with one panel open at a time.
+func TestPolicyClientDiagCellDetailIsReachableByPointerAndKeyboard(t *testing.T) {
+	runClientDiagScenario(t, clientTargetsScript+`
+responder = ((base) => async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
+  const answer = await base(url, opts);
+  answer.flows.entries = [
+    {protocol: 'tcp', destination_ip: '93.184.216.34', destination_port: 443, choice: 'PROXY',
+     route_generation: 3, last_seen_age_seconds: 5, expired: false, close_seen: false,
+     decision_time: '2026-11-17T09:09:58Z', decision_reason: 'proxy_cidr_rule',
+     policy_generation: 'gen-1', backend_tunnel_id: 77,
+     dispatch: {state: 'queued_to_backend'},
+     forward: {packets: 3, bytes: 180, failed: 0, backend_writes: 2, backend_write_failed: 1,
+               backend_write_failure: 'backend_write_failed'},
+     return: {evidence: 'observed', authority: 'current_tuple_association', matched: 4,
+              admitted: 3, delivered: 2, failed: 1, dropped: 1, failure: 'client_queue_full'},
+     names: ['alpha.example', 'beta.example'], names_match: 'ambiguous', names_considered: 2,
+     name_candidates: []},
+    {protocol: 'udp', destination_ip: '8.8.8.8', destination_port: 53, choice: 'PROXY',
+     route_generation: 3, last_seen_age_seconds: 9, expired: false, close_seen: false,
+     decision_time: '2026-11-17T09:09:57Z', decision_reason: 'no_trusted_evidence',
+     policy_generation: 'gen-1',
+     dispatch: {state: 'queued_to_backend'}, forward: {packets: 3, bytes: 0, failed: 0},
+     return: {evidence: 'not_measured', packets: 0, bytes: 0},
+     names: ['plain.example'], names_match: 'unique', names_considered: 1,
+     name_candidates: []}
+  ];
+  return answer;
+})(responder);
+`, `
+const flowRows = () => Array.from(w.document.getElementById('policyClientFlowRows').children);
+const cellsOf = (row) => Array.from(row.children);
+const detailCells = () => flowRows().map(row => cellsOf(row).map(cell => ({
+  title: cell.getAttribute('title') || '',
+  toggle: cell.querySelector('[role="button"]'),
+  region: cell.querySelector('.cell-detail')
+})));
+const press = (el, key) => el.dispatchEvent(new w.KeyboardEvent('keydown',
+  {key: key, bubbles: true, cancelable: true}));
+const expandedToggles = () => Array.from(
+  w.document.querySelectorAll('#policyClientFlowRows [aria-expanded="true"]'));
+const visibleRegions = () => Array.from(
+  w.document.querySelectorAll('#policyClientFlowRows .cell-detail'))
+  .filter(region => region.hidden === false);
+
+selectClient('sess-a');
+await w.diagnoseSelectedClient();
+await settle();
+
+// Every row is still four cells, and each cell with detail keeps the disclosure
+// inside the cell it belongs to.
+assert.equal(rowCount('policyClientFlowRows'), 2, 'both flows are rendered');
+flowRows().forEach((row, index) => {
+  assert.equal(row.children.length, 4, 'row ' + index + ' still carries exactly four cells');
+});
+const cells = detailCells();
+assert.equal(cells[0][1].title, 'alpha.example, beta.example',
+  'the several-names list is the destination cell detail');
+assert.equal(cells[0][2].title.indexOf('FAILURE:backend_write_failed') >= 0, true,
+  'the failure detail is the route cell detail');
+assert.equal(cells[1][1].toggle, null,
+  'a cell with nothing more to say carries no disclosure');
+
+// 1. Closed by default, and the opener reports that state to assistive technology.
+Array.from(w.document.querySelectorAll('#policyClientFlowRows .cell-detail-toggle')).forEach(toggle => {
+  assert.equal(toggle.getAttribute('role'), 'button', 'the opener is a button for a screen reader');
+  assert.equal(toggle.getAttribute('tabindex'), '0', 'the opener is focusable');
+  assert.equal(toggle.getAttribute('aria-expanded'), 'false', 'the opener reports collapsed');
+});
+assert.equal(visibleRegions().length, 0, 'no detail is revealed before it is asked for');
+Array.from(w.document.querySelectorAll('#policyClientFlowRows .cell-detail')).forEach(region => {
+  assert.equal(region.textContent, '', 'a closed detail holds no hidden copy of the fact');
+});
+
+// The opener names the element it reveals, and that element is the one inside it.
+const namesToggle = cells[0][1].toggle;
+assert.equal(namesToggle.getAttribute('aria-controls'), cells[0][1].region.id,
+  'the opener controls the region beside it');
+assert.equal(cells[0][1].region.parentNode, cellsOf(flowRows()[0])[1],
+  'the revealed detail lives inside its own cell, not in a new column');
+
+// 2. A pointer opens it: a click on the opener and a tap on the cell both work.
+const TapEvent = w.PointerEvent || w.MouseEvent;
+const tap = (el) => el.dispatchEvent(new TapEvent('click',
+  {bubbles: true, cancelable: true, pointerType: 'touch'}));
+namesToggle.click();
+assert.equal(namesToggle.getAttribute('aria-expanded'), 'true', 'a click expands the detail');
+assert.equal(cells[0][1].region.hidden, false, 'a click reveals the region');
+assert.equal(cells[0][1].region.textContent, 'alpha.example, beta.example',
+  'the revealed text is the title text, with every matched name');
+namesToggle.click();
+assert.equal(namesToggle.getAttribute('aria-expanded'), 'false', 'a second click collapses it');
+
+// A tap is delivered as a click, which is the shape a touch device produces: jsdom
+// has no touch input, so the pointer event is what can be exercised here.
+tap(cells[0][3].region.parentNode);
+assert.equal(cells[0][3].toggle.getAttribute('aria-expanded'), 'true',
+  'a tap on the cell, delivered as a click, opens its detail');
+cells[0][3].toggle.click();
+
+cells[1][2].region.parentNode.click();
+assert.equal(cells[1][2].toggle.getAttribute('aria-expanded'), 'true',
+  'a tap anywhere in the cell opens its detail');
+cells[1][2].toggle.click();
+
+// 3. The keyboard opens it: Enter and Space.
+cells[0][2].toggle.focus();
+press(cells[0][2].toggle, 'Enter');
+assert.equal(cells[0][2].toggle.getAttribute('aria-expanded'), 'true', 'Enter expands the detail');
+assert.equal(cells[0][2].region.textContent, cells[0][2].title,
+  'the revealed failure detail is the whole title: producers, reasons and counts');
+assert.equal(cells[0][2].region.textContent.indexOf('DEVICE 2/1') >= 0, true,
+  'the backend write counts are in the revealed text');
+assert.equal(cells[0][2].region.textContent.indexOf('RET returned 4/3/2/1/1') >= 0, true,
+  'the return counts, including dropped, are in the revealed text');
+assert.equal(cells[0][3].region.textContent, '', 'the other cells stay closed');
+
+press(cells[1][3].toggle, ' ');
+assert.equal(cells[1][3].toggle.getAttribute('aria-expanded'), 'true', 'Space expands the detail');
+assert.equal(expandedToggles().length, 1, 'only one detail is open at a time');
+assert.equal(cells[0][2].region.hidden, true, 'opening another cell closes the previous one');
+assert.equal(cells[0][2].region.textContent, '', 'the closed detail keeps no text');
+
+// 4. Escape closes it and leaves focus on the opener, so the row is not lost.
+press(cells[1][3].toggle, 'Escape');
+assert.equal(cells[1][3].toggle.getAttribute('aria-expanded'), 'false', 'Escape collapses the detail');
+assert.equal(visibleRegions().length, 0, 'Escape leaves no region revealed');
+assert.equal(w.document.activeElement, cells[1][3].toggle, 'Escape keeps focus on the opener');
+
+// 5. Nothing is lost: every title a cell carries is reachable as revealed text.
+let checked = 0;
+detailCells().forEach((row, rowIndex) => {
+  row.forEach((cell, cellIndex) => {
+    if (!cell.toggle) {
+      return;
+    }
+    cell.toggle.click();
+    assert.equal(cell.region.textContent, cell.title,
+      'row ' + rowIndex + ' cell ' + cellIndex + ' reveals exactly its title text');
+    checked += 1;
+    cell.toggle.click();
+  });
+});
+assert.equal(checked, 5, 'every detail-bearing cell was opened and compared');
+
+// 6. A re-render closes what the replaced rows held.
+cells[0][2].toggle.click();
+assert.equal(visibleRegions().length, 1, 'a detail is open before the re-render');
+await w.diagnoseSelectedClient();
+await settle();
+assert.equal(visibleRegions().length, 0, 'a re-render leaves no panel open');
+assert.equal(expandedToggles().length, 0, 'a re-render resets every opener');
+assert.equal(rowCount('policyClientFlowRows'), 2, 'the table is rebuilt, not doubled');
+`)
+}
+
+// TestPolicyClientDiagCellDetailAuthorCascade evaluates every stylesheet bundle
+// that defines .cell-detail the way a browser does for the collapsed state. The
+// controller collapses a region with the hidden attribute, and the browser's own
+// [hidden] rule is user-agent origin: any author declaration on the element beats
+// it. So an author rule that sets display:block on .cell-detail keeps a collapsed
+// region in the layout, and each bundle has to win that cascade back with
+// display:none for [hidden].
+//
+// The bundles are derived from the files, not listed here: the page may load the
+// module (settings.css) or the concatenated bundle (style.css), and a third bundle
+// added later is covered without editing this test. Each one is asserted in its own
+// run, which rebuilds the JS context: two bundles loaded side by side would compete
+// in one cascade, and the whole point is what a page loading only that bundle gets.
+//
+// jsdom cannot answer "did it win?" through computed style - it applies the hidden
+// attribute itself and reports display:none even when the author sheet says block,
+// so that check would pass with the defect present. This test therefore reads the
+// author rules themselves, matches them with the DOM's own selector engine, and
+// asserts which declaration would win by specificity and source order.
+func TestPolicyClientDiagCellDetailAuthorCascade(t *testing.T) {
+	bundles := cellDetailBundles(t)
+	if len(bundles) < 2 {
+		t.Fatalf("found %d stylesheet bundle(s) defining .cell-detail (%v); the page loads at least "+
+			"the module and the concatenation, so the detection is wrong", len(bundles), bundles)
+	}
+	for _, bundle := range bundles {
+		bundle := bundle
+		t.Run(bundle, func(t *testing.T) {
+			assertCellDetailCascade(t, bundle)
+		})
+	}
+}
+
+// cellDetailBundles returns every stylesheet under static/css that defines the
+// .cell-detail class, in file-name order.
+func cellDetailBundles(t *testing.T) []string {
+	t.Helper()
+	entries, err := fs.ReadDir(StaticFS, "static/css")
+	if err != nil {
+		t.Fatalf("list static/css: %v", err)
+	}
+	var bundles []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".css") {
+			continue
+		}
+		name := "static/css/" + entry.Name()
+		raw, err := StaticFS.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if definesClass(string(raw), "cell-detail") {
+			bundles = append(bundles, name)
+		}
+	}
+	return bundles
+}
+
+// definesClass reports whether a stylesheet defines a class, ignoring comments and
+// not counting a longer class that starts with the same letters.
+func definesClass(css, class string) bool {
+	code := stripCSSComments(css)
+	needle := "." + class
+	for i := 0; i+len(needle) <= len(code); i++ {
+		if code[i:i+len(needle)] != needle {
+			continue
+		}
+		if i+len(needle) == len(code) {
+			return true
+		}
+		switch next := code[i+len(needle)]; {
+		case next >= 'a' && next <= 'z', next >= 'A' && next <= 'Z',
+			next >= '0' && next <= '9', next == '-', next == '_':
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// stripCSSComments removes /* */ comments, which name the classes they describe and
+// must not count as a definition.
+func stripCSSComments(css string) string {
+	for {
+		start := strings.Index(css, "/*")
+		if start < 0 {
+			return css
+		}
+		end := strings.Index(css[start:], "*/")
+		if end < 0 {
+			return css[:start]
+		}
+		css = css[:start] + css[start+end+2:]
+	}
+}
+
+// assertCellDetailCascade runs the cascade check against one bundle.
+func assertCellDetailCascade(t *testing.T, bundle string) {
+	t.Helper()
+	sheet, err := StaticFS.ReadFile(bundle)
+	if err != nil {
+		t.Fatalf("read %s: %v", bundle, err)
+	}
+	encoded, err := json.Marshal(string(sheet))
+	if err != nil {
+		t.Fatalf("encode %s: %v", bundle, err)
+	}
+	runClientDiagScenario(t, clientTargetsScript+`
+responder = ((base) => async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
+  return base(url, opts);
+})(responder);
+`, fmt.Sprintf(`
+const bundle = %q;
+const style = w.document.createElement('style');
+style.textContent = %s;
+w.document.head.appendChild(style);
+
+const detailHost = w.document.createElement('div');
+detailHost.className = 'card settings-section-card';
+detailHost.innerHTML = '<span class="cell-detail" hidden>collapsed detail</span>'
+  + '<span class="cell-detail">revealed detail</span>';
+w.document.body.appendChild(detailHost);
+const collapsed = detailHost.children[0];
+const revealed = detailHost.children[1];
+
+// Every unconditional author rule that sets display, in source order.
+const displayRules = [];
+Array.from(w.document.styleSheets).forEach(sheet => {
+  Array.from(sheet.cssRules).forEach(rule => {
+    if (!rule.selectorText || !rule.style || !rule.style.display) {
+      return;
+    }
+    displayRules.push({selector: rule.selectorText, display: rule.style.display});
+  });
+});
+assert.ok(displayRules.length > 0, bundle + ' exposes its display rules');
+
+// Specificity as the cascade counts it: ids, then classes plus attributes, then
+// element names. The two rules under test differ only by the attribute.
+const specificity = (selector) => {
+  const ids = (selector.match(/#[\w-]+/g) || []).length;
+  const classish = (selector.match(/\.[\w-]+|\[[^\]]+\]|:[a-z-]+/g) || []).length;
+  const elements = (selector.replace(/[#.][\w-]+|\[[^\]]+\]|::?[a-z-]+(\([^)]*\))?/g, ' ')
+    .match(/[a-z][\w-]*/g) || []).length;
+  return [ids, classish, elements];
+};
+const beats = (left, right) => left[0] !== right[0] ? left[0] > right[0]
+  : left[1] !== right[1] ? left[1] > right[1] : left[2] >= right[2];
+const winner = (element) => {
+  let best = null;
+  displayRules.forEach(rule => {
+    if (!element.matches(rule.selector)) {
+      return;
+    }
+    const spec = specificity(rule.selector);
+    if (!best || beats(spec, best.spec)) {
+      best = {spec: spec, selector: rule.selector, display: rule.display};
+    }
+  });
+  return best;
+};
+
+const collapsedWinner = winner(collapsed);
+const revealedWinner = winner(revealed);
+assert.ok(collapsedWinner, bundle + ': an author rule decides display for a collapsed cell detail');
+assert.equal(collapsedWinner.display, 'none',
+  bundle + ': the rule that wins display for a collapsed cell detail is '
+  + collapsedWinner.selector + ' (' + collapsedWinner.display
+  + '); without a [hidden] declaration the block rule keeps it in the layout');
+assert.ok(collapsedWinner.selector.indexOf('[hidden]') >= 0,
+  bundle + ': the winning rule is the [hidden] companion, not the block rule');
+assert.notEqual(revealedWinner.display, 'none',
+  bundle + ': a revealed cell detail still resolves to a display (' + revealedWinner.selector
+  + ' -> ' + revealedWinner.display + ')');
+// jsdom applies the hidden attribute itself, so its computed style cannot
+// distinguish the two states; it is asserted only to document that difference.
+assert.equal(w.getComputedStyle(collapsed).display, 'none',
+  bundle + ': jsdom reports none for both states, which is why the cascade above is the oracle');
+`, bundle, string(encoded)))
+}
+
+// TestPolicyClientDiagFlowDestinationNamesOnlyWhenKnown pins the Destination cell:
+// the address the tuple carried, and a name only when a stored answer genuinely
+// names it. A name the client tried without an answer is not a name; when several
+// names match, the first is shown with a count of the others instead of the row
+// pretending the address has that one name.
+func TestPolicyClientDiagFlowDestinationNamesOnlyWhenKnown(t *testing.T) {
+	runClientDiagScenario(t, clientTargetsScript+`
+responder = ((base) => async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
+  const answer = await base(url, opts);
+  answer.flows.entries = [
+    {protocol: 'tcp', destination_ip: '93.184.216.34', destination_port: 443, choice: 'DIRECT',
+     last_seen_age_seconds: 3, expired: false, close_seen: false,
+     decision_reason: 'evidence_direct', names: [], names_match: 'not_recorded',
+     names_reason: 'no_retained_answer',
+     name_attempts: [{name: 'missing.example', qtype: 'A', kind: 'nxdomain',
+                      received_at: '2026-11-17T09:09:50Z'}]},
+    {protocol: 'udp', destination_ip: '8.8.8.8', destination_port: 53, choice: 'PROXY',
+     last_seen_age_seconds: 4, expired: false, close_seen: false,
+     decision_reason: 'no_trusted_evidence',
+     names: ['plain.example'], names_match: 'unique', names_considered: 1},
+    {protocol: 'tcp', destination_ip: '1.1.1.1', destination_port: 443, choice: 'PROXY',
+     last_seen_age_seconds: 5, expired: false, close_seen: false,
+     decision_reason: 'proxy_cached_evidence',
+     names: ['plain.example', 'shared.example', 'other.example'],
+     names_match: 'ambiguous', names_considered: 3}
+  ];
+  return answer;
+})(responder);
+`, `
+selectClient('sess-a');
+await w.diagnoseSelectedClient();
+await settle();
+assert.equal(rowCount('policyClientFlowRows'), 3, 'all three destinations are rendered');
+
+// 1. Only unanswered attempts: no name, because no answer named this address.
+const attemptedOnly = rowCells('policyClientFlowRows', 0);
+assert.equal(attemptedOnly[1], '93.184.216.34:443',
+  'an unanswered attempt must not be presented as the flow destination name');
+assert.ok(attemptedOnly[1].indexOf('missing.example') === -1,
+  'the attempted name stays out of the destination cell entirely');
+
+// 2. One stored answer names the address: it is shown with the address.
+const single = rowCells('policyClientFlowRows', 1);
+assert.equal(single[1], '8.8.8.8:53 (plain.example)',
+  'the one answer that names the address is shown beside it');
+
+// 3. Several stored answers name it: the first name is shown with a count of the
+//    others, so the address never looks like it has that one name.
+const several = rowCells('policyClientFlowRows', 2);
+assert.equal(several[1], '1.1.1.1:443 (FIRST plain.example PLUS 2)',
+  'the first of several matching names is shown with a count of the others');
+assert.equal(rowCellTitles('policyClientFlowRows', 2)[1],
+  'plain.example, shared.example, other.example',
+  'every matching name is available in the cell tooltip');
+assert.equal(rowCellTitles('policyClientFlowRows', 0)[1], '',
+  'an address with no known name carries no tooltip');
+`)
+}
+
+// TestPolicyClientDiagFlowDecisionLabels pins the Decision cell: one short label per
+// recorded condition, with no instant, generation, backend id or raw token in the
+// cell text. The detail the cell cannot show is its tooltip, which is where the
+// token stays quotable.
+func TestPolicyClientDiagFlowDecisionLabels(t *testing.T) {
+	runClientDiagScenario(t, clientTargetsScript+`
+const reasons = ['allocation_direct', 'allocation_cdn_excluded', 'no_trusted_evidence',
+  'prohibited_destination', 'direct_egress_unavailable', 'proxy_cidr_rule',
+  'evidence_direct', 'proxy_cached_evidence', 'sticky_flow', 'non_tcp_udp_fallback',
+  'not_recorded', 'brand_new_reason'];
+responder = ((base) => async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
+  const answer = await base(url, opts);
+  answer.flows.entries = reasons.map((reason, index) => ({
+    protocol: 'tcp', destination_ip: '93.184.216.' + (10 + index), destination_port: 443,
+    choice: 'DIRECT', last_seen_age_seconds: 3, expired: false, close_seen: false,
+    decision_time: reason === 'not_recorded' ? 'not_recorded'
+      : '2026-11-17T09:09:5' + (index % 10) + 'Z', decision_reason: reason,
+    policy_generation: 'gen-9', backend_tunnel_id: index === 5 ? 77 : undefined,
+    names: [], names_match: 'not_recorded', name_attempts: []}));
+  return answer;
+})(responder);
+`, `
+// The labels this test asserts are the shipped English wording for each token.
+const LABELS = {
+  policy_client_decision_reason_allocation_direct: 'Direct by list',
+  policy_client_decision_reason_allocation_cdn_excluded: 'Proxy: shared CDN',
+  policy_client_decision_reason_no_trusted_evidence: 'Default proxy failover',
+  policy_client_decision_reason_prohibited_destination: 'Blocked destination',
+  policy_client_decision_reason_direct_egress_unavailable: 'Direct unavailable',
+  policy_client_decision_reason_proxy_cidr_rule: 'Operator rule',
+  policy_client_decision_reason_evidence_direct: 'DNS evidence',
+  policy_client_decision_reason_proxy_cached_evidence: 'DNS evidence: proxy',
+  policy_client_decision_reason_sticky_flow: 'Kept earlier choice',
+  policy_client_decision_reason_non_tcp_udp_fallback: 'Proxy: protocol fallback',
+  policy_client_decision_reason_not_recorded: 'Not recorded',
+  policy_client_decision_reason_unknown: 'Other reason'
+};
+const fallback = w._;
+w._ = key => LABELS[key] || fallback(key);
+
+selectClient('sess-a');
+await w.diagnoseSelectedClient();
+await settle();
+assert.equal(rowCount('policyClientFlowRows'), 12, 'every recorded reason is one row');
+
+const rows = Array.from(w.document.getElementById('policyClientFlowRows').children);
+assert.deepEqual(rows.map(row => row.children[3].textContent), [
+  'Direct by list',
+  'Proxy: shared CDN',
+  'Default proxy failover',
+  'Blocked destination',
+  'Direct unavailable',
+  'Operator rule',
+  'DNS evidence',
+  'DNS evidence: proxy',
+  'Kept earlier choice',
+  'Proxy: protocol fallback',
+  'Not recorded',
+  'Other reason'
+], 'each recorded reason renders its own short label');
+
+// The cell carries the label and nothing else.
+rows.forEach((row, index) => {
+  const cell = row.children[3].textContent;
+  assert.ok(cell.indexOf('2026-') === -1, 'the decision instant stays out of the cell');
+  assert.ok(cell.indexOf('gen-9') === -1, 'the policy generation stays out of the cell');
+  assert.ok(cell.indexOf('BACKEND') === -1, 'the backend stays out of the cell');
+  assert.equal(cell.indexOf(reasons[index]), -1,
+    'the raw reason token stays out of the cell');
+});
+
+// The tooltip is where the detail lives.
+const titles = rows.map(row => row.children[3].getAttribute('title') || '');
+assert.equal(titles[0], '2026-11-17T09:09:50Z · gen-9 · allocation_direct',
+  'the instant, generation and token are the cell tooltip');
+assert.equal(titles[5], '2026-11-17T09:09:55Z · gen-9 · BACKEND 77 · proxy_cidr_rule',
+  'a proxy decision keeps its selected backend in the tooltip');
+assert.equal(titles[10], 'gen-9',
+  'a flow recorded without a reason has no instant or token to describe');
+assert.ok(titles[11].indexOf('brand_new_reason') !== -1,
+  'a token this build does not know stays quotable in the tooltip');
 `)
 }
 

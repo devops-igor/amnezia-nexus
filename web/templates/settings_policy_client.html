@@ -90,10 +90,6 @@
                         <th scope="col">{{ _ "policy_client_column_destination" }}</th>
                         <th scope="col">{{ _ "policy_client_column_choice" }}</th>
                         <th scope="col">{{ _ "policy_client_column_decision" }}</th>
-                        <th scope="col">{{ _ "policy_client_column_names" }}</th>
-                        <th scope="col">{{ _ "policy_client_column_outcome" }}</th>
-                        <th scope="col">{{ _ "policy_client_column_last_seen" }}</th>
-                        <th scope="col">{{ _ "policy_client_column_state" }}</th>
                     </tr>
                 </thead>
                 <tbody id="policyClientFlowRows"></tbody>
@@ -173,6 +169,6 @@
     </div>
 </div>
 <script src="/static/js/policy_client_diag_filter.js?v={{ .app_version }}"></script>
-<script src="/static/js/policy_client_diag.js?v={{ .app_version }}"></script>
+<script src="{{ asset_url "/static/js/policy_client_diag.js" }}"></script>
 {{ end }}
 {{ end }}
