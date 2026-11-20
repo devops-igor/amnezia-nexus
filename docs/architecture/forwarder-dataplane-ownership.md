@@ -141,28 +141,37 @@ The forwarder does not intercept DNS. No ingress listener, route, packet device
 or pump in this package inspects, answers, rewrites or re-routes port 53, and the
 forwarder holds no DNS handler, no resolver it would answer from and no
 per-session DNS authority. It remembers only which address the panel used to serve
-on (`formerResolverAddr`), so that one destination can be refused in both modes.
-A client DNS packet is otherwise an ordinary client-to-backend packet: it takes
-the same path as any other transport on that port.
+on (`formerResolverAddr`), so the resolver service that disappeared can be
+recognized. A client DNS packet is otherwise an ordinary client-to-backend packet:
+it takes the same path as any other transport on that port.
 
-- **One address is refused in both modes.** The panel address issued client
-  profiles used to name as their resolver — the client pool's gateway, derived by
-  `derivedResolverAddr` — is refused under the existing `prohibited_destination`
-  token whether or not policy routing is active: the policy path refuses it with
-  every other internal destination, and the legacy path refuses that one
-  destination before enqueuing. Nothing serves DNS there any more, so tunnelling
-  the packet would be the only way it could reach a listener that no longer
-  exists. The refusal is counted (the aggregate client drop counter) and recorded
-  in the drop ledger, never discarded.
+- **The removed resolver service is refused, not the whole address.** The panel
+  address issued client profiles used to name as their resolver is the client
+  pool's gateway, derived by `derivedResolverAddr`. Nothing answers UDP or TCP
+  port 53 on it any more. With policy routing disabled, `routeClientLegacy`
+  refuses exactly that service — that address, that port, either transport — under
+  the existing `prohibited_destination` token, counting the drop in the aggregate
+  client drop counter and recording it in the drop ledger rather than discarding
+  it. The same address on any other port is ordinary legacy traffic: the tunnel
+  gateway serves its own services there, and those packets are enqueued exactly as
+  before. Refusing the address rather than the service would silently black-hole
+  them.
+- **The policy path is unchanged and still refuses the address.** While policy
+  routing is active, the same address is refused on every port, because it is an
+  internal destination like every other private address; that general check
+  (`ValidateDirectDestination`) predates this removal and is not specific to DNS.
+  The two paths therefore agree on the resolver service and differ elsewhere,
+  which is the pre-existing difference between a validated policy path and an
+  unvalidated legacy route.
 - **The legacy path is otherwise unchanged, and is not a validation pass.** With
-  policy routing disabled, `routeClientLegacy` enqueues every other destination
-  exactly as it always did — external resolvers on port 53 included — and does not
-  parse, accept or reject a packet for any other reason. The full
-  prohibited-destination check (`ValidateDirectDestination`) belongs to the policy
-  path alone, so an internal destination other than the former resolver address
-  still takes the legacy route.
-- **No DNS branch.** Neither path consults a DNS handler or a gateway address, and
-  enabling or disabling policy routing installs and removes nothing DNS-shaped.
+  policy routing disabled, `routeClientLegacy` enqueues every destination other
+  than the removed resolver service exactly as it always did — external resolvers
+  on port 53 included — and does not reject a packet for any other reason. A
+  packet that does not parse as IPv4 UDP or TCP never matches the refused service,
+  so it keeps the unchanged legacy route.
+- **No DNS branch.** Neither path consults a DNS handler or a resolver it would
+  answer from, and enabling or disabling policy routing installs and removes
+  nothing DNS-shaped.
 - **No replies or translations.** Reply construction, client-facing
   substitution, UDP reply rewriting and the per-connection TCP translation are
   not forwarder behaviour and no longer exist anywhere in the data path.
