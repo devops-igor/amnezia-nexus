@@ -209,9 +209,8 @@ func proxyReturnFixtureWithPath(t *testing.T, path *ReturnPath) (*Forwarder, *te
 	fwd := NewForwarder(nil, "10.100.0.0/16", 8)
 	fwd.SetPBREnabled(true)
 	dem := NewDirectEgressManager(DirectEgressConfig{
-		HostWANIP:    netip.MustParseAddr("203.0.113.1"),
-		GatewayDNSIP: netip.MustParseAddr("10.100.0.1"),
-		WANDevice:    newMockPacketDev(),
+		HostWANIP: netip.MustParseAddr("203.0.113.1"),
+		WANDevice: newMockPacketDev(),
 	}, fwd)
 	fwd.SetDirectEgress(dem)
 	// The manager owns a WAN reader; retire it with the test that created it.
@@ -287,9 +286,8 @@ func proxyReturnRateLimitedFixture(t *testing.T, limitDownBps int64) (*Forwarder
 	fwd := NewForwarder(nil, "10.100.0.0/16", 8)
 	fwd.SetPBREnabled(true)
 	dem := NewDirectEgressManager(DirectEgressConfig{
-		HostWANIP:    netip.MustParseAddr("203.0.113.1"),
-		GatewayDNSIP: netip.MustParseAddr("10.100.0.1"),
-		WANDevice:    newMockPacketDev(),
+		HostWANIP: netip.MustParseAddr("203.0.113.1"),
+		WANDevice: newMockPacketDev(),
 	}, fwd)
 	fwd.SetDirectEgress(dem)
 	// The manager owns a WAN reader; retire it with the test that created it.

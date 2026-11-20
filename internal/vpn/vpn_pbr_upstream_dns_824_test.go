@@ -241,18 +241,13 @@ func TestInitPBRWithoutConfiguredUpstreamsUsesDefaultPair(t *testing.T) {
 			t.Fatalf("live resolver upstream %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
-	// The client configuration names the external resolvers, never the gateway:
-	// the profile must not depend on a resolver that only exists while policy
-	// routing is active. The upstream list therefore drives the resolver alone.
-	gw := svc.deriveDefaultGatewayDNSIP().String()
+	// The client configuration names the external resolvers the profile pair is
+	// derived from, so the profile never depends on a resolver the panel runs. The
+	// upstream list therefore drives the resolver alone.
 	dns1, dns2 := defaultClientDNSServers()
-	if dns1 == "" || dns2 == "" {
-		t.Fatalf("active client configuration DNS = (%q, %q), want the external resolvers", dns1, dns2)
-	}
-	for _, entry := range []string{dns1, dns2} {
-		if entry == gw {
-			t.Fatalf("active client configuration DNS names the panel resolver %q", entry)
-		}
+	wantPair := renderedProfileDNS()
+	if got := dns1 + ", " + dns2; got != wantPair {
+		t.Fatalf("active client configuration DNS = %q, want the external pair %q", got, wantPair)
 	}
 }
 

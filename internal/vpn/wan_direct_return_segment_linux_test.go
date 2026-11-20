@@ -398,7 +398,6 @@ func buildReturnSegRig(t *testing.T, wan forwarder.PacketDevice, server netip.Ad
 	if err := svc.ConfigurePBR(PBRConfig{
 		Enabled:       true,
 		HostWANIP:     netip.MustParseAddr(s4HostWAN),
-		GatewayDNSIP:  netip.MustParseAddr("10.100.0.1"),
 		WANDevice:     wan,
 		RouteCache:    cache,
 		PolicyMatcher: matcher,

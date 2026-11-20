@@ -84,9 +84,8 @@ func proxyQueueFixture(t *testing.T, dev PacketDevice) (*Forwarder, *testRouteCa
 	fwd.SetPBREnabled(true)
 	fwd.AttachBackendDevice(31, dev)
 	dem := NewDirectEgressManager(DirectEgressConfig{
-		HostWANIP:    netip.MustParseAddr("203.0.113.1"),
-		GatewayDNSIP: netip.MustParseAddr("10.100.0.1"),
-		WANDevice:    newMockPacketDev(),
+		HostWANIP: netip.MustParseAddr("203.0.113.1"),
+		WANDevice: newMockPacketDev(),
 	}, fwd)
 	fwd.SetDirectEgress(dem)
 	// The manager owns a WAN reader; the test that created it retires it, including

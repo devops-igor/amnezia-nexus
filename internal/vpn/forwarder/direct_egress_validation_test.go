@@ -52,21 +52,18 @@ func TestValidation_ProhibitedDestinations(t *testing.T) {
 	}
 }
 
-func TestValidation_GatewayDNSNarrowScoping(t *testing.T) {
-	gwDNS := netip.MustParseAddr("10.100.0.1")
+// TestValidation_FormerGatewayDNSIsProhibited pins the outcome of the removed
+// gateway-DNS exception: the panel runs no resolver at its own subnet address, so
+// a packet to it is refused with the existing prohibited-destination token, port
+// included in whatever the packet carried.
+func TestValidation_FormerGatewayDNSIsProhibited(t *testing.T) {
+	formerGatewayDNS := netip.MustParseAddr("10.100.0.1")
 
-	// Port 53 must be allowed (DNS exception)
-	if err := ValidateDirectDestination(gwDNS, 53, gwDNS); err != nil {
-		t.Fatalf("expected port 53 to gateway DNS to be allowed, got: %v", err)
+	if err := ValidateDirectDestination(formerGatewayDNS); !errors.Is(err, ErrProhibitedDestination) {
+		t.Fatalf("former gateway DNS address = %v, want ErrProhibitedDestination", err)
 	}
-
-	// Any non-53 port to gateway DNS must be dropped
-	nonDNSPorts := []uint16{80, 443, 22, 5353, 8080}
-	for _, port := range nonDNSPorts {
-		err := ValidateDirectDestination(gwDNS, port, gwDNS)
-		if !errors.Is(err, ErrProhibitedDestination) {
-			t.Errorf("expected ErrProhibitedDestination for gateway DNS port %d, got: %v", port, err)
-		}
+	if !IsProhibitedIPv4Destination(formerGatewayDNS) {
+		t.Fatal("the former gateway DNS address is still treated as permitted")
 	}
 }
 

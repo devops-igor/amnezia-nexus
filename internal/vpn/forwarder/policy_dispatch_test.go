@@ -49,17 +49,14 @@ func setupForwarderWithPBR(t *testing.T) (*Forwarder, *DirectEgressManager, *moc
 
 	wanDev := newMockPacketDev()
 	hostWAN := netip.MustParseAddr("203.0.113.1")
-	gwDNS := netip.MustParseAddr("10.100.0.1")
 
 	dem := NewDirectEgressManager(DirectEgressConfig{
-		HostWANIP:    hostWAN,
-		GatewayDNSIP: gwDNS,
-		WANDevice:    wanDev,
+		HostWANIP: hostWAN,
+		WANDevice: wanDev,
 	}, fwd)
 	fwd.SetDirectEgress(dem)
 	// The manager owns a WAN reader; retire it with the test that created it.
 	t.Cleanup(func() { _ = dem.Close() })
-	fwd.SetGatewayDNSIP(gwDNS)
 
 	rc := newTestRouteCache()
 	fwd.SetRouteCache(rc)
@@ -130,32 +127,50 @@ func TestPolicyDispatch_ProhibitedDestinations(t *testing.T) {
 	}
 }
 
-func TestPolicyDispatch_GatewayDNSException(t *testing.T) {
+// TestPolicyDispatch_GatewayDNSIsProhibitedDestination pins the outcome of
+// removing the gateway-DNS exception: the panel serves no resolver at that
+// address, so a client packet to it is an internal destination like any other. It
+// is refused before any flow exists, counted as a direct drop, and recorded in the
+// drop ledger under the existing prohibited-destination token rather than being
+// proxied to a backend that could not answer it.
+func TestPolicyDispatch_GatewayDNSIsProhibitedDestination(t *testing.T) {
 	fwd, _, _, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-gwdns"
 	backendID := int64(202)
 	clientIP := "10.100.0.15"
+	sessionID := "s-gw"
 	capPath := newTestCaptureReturnPath()
 
-	fwd.RegisterSessionWithReturnPath("s-gw", "c-gw", peerKey, clientIP, backendID, capPath.path)
+	fwd.RegisterSessionWithReturnPath(sessionID, "c-gw", peerKey, clientIP, backendID, capPath.path)
 
-	// Traffic to GatewayDNSIP (10.100.0.1:53) must NOT be dropped by Step 1
 	gwDNS := netip.MustParseAddr("10.100.0.1")
 	dnsPkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), gwDNS, 54321, 53, []byte("dns-query"))
 
 	err := fwd.RouteClientToBackend(peerKey, dnsPkt)
-	// Safe default routes to proxy backend queue
-	if err != nil {
-		t.Fatalf("expected gateway DNS query to be accepted, got: %v", err)
+	if !errors.Is(err, ErrProhibitedDestination) {
+		t.Fatalf("gateway-addressed DNS = %v, want ErrProhibitedDestination", err)
 	}
 
-	beQueue := fwd.backendQueues[backendID]
-	if len(beQueue) != 1 {
-		t.Fatalf("expected packet in backend queue, got %d", len(beQueue))
+	if got := len(fwd.backendQueues[backendID]); got != 0 {
+		t.Fatalf("a prohibited destination reached the proxy queue: %d packets", got)
 	}
-	if fwd.DirectDrops() != 0 {
-		t.Errorf("gateway DNS must not cause directDrops, got %d", fwd.DirectDrops())
+	if fwd.DirectDrops() != 1 {
+		t.Errorf("gateway DNS must count as one direct drop, got %d", fwd.DirectDrops())
+	}
+
+	snapshot := fwd.ClientDropSnapshot(sessionID, 0, 10)
+	if len(snapshot.Entries) != 1 {
+		t.Fatalf("drop records = %d, want 1: %+v", len(snapshot.Entries), snapshot.Entries)
+	}
+	if got := snapshot.Entries[0].Key.Reason; got != DropReasonProhibitedDestination {
+		t.Errorf("drop reason = %q, want %q", got, DropReasonProhibitedDestination)
+	}
+	if got := snapshot.Entries[0].Key.DstPort; got != 53 {
+		t.Errorf("drop record port = %d, want 53", got)
+	}
+	if !snapshot.Entries[0].Key.HasTuple {
+		t.Error("a well-formed packet's drop record claims it carried no tuple")
 	}
 }
 
@@ -518,12 +533,10 @@ func TestPolicyDispatch_WANReplyDownstreamAdmission(t *testing.T) {
 
 	wanDev := newMockPacketDev()
 	hostWAN := netip.MustParseAddr("203.0.113.1")
-	gwDNS := netip.MustParseAddr("10.100.0.1")
 
 	dem := NewDirectEgressManager(DirectEgressConfig{
-		HostWANIP:    hostWAN,
-		GatewayDNSIP: gwDNS,
-		WANDevice:    wanDev,
+		HostWANIP: hostWAN,
+		WANDevice: wanDev,
 	}, fwd)
 	fwd.SetDirectEgress(dem)
 	t.Cleanup(func() { _ = dem.Close() })
@@ -660,12 +673,10 @@ func TestPolicyDispatch_DirectTransmissionErrorAccounting(t *testing.T) {
 
 	wanDev := newFailingMockPacketDev(errors.New("wan cable disconnected"))
 	hostWAN := netip.MustParseAddr("203.0.113.1")
-	gwDNS := netip.MustParseAddr("10.100.0.1")
 
 	dem := NewDirectEgressManager(DirectEgressConfig{
-		HostWANIP:    hostWAN,
-		GatewayDNSIP: gwDNS,
-		WANDevice:    wanDev,
+		HostWANIP: hostWAN,
+		WANDevice: wanDev,
 	}, fwd)
 	fwd.SetDirectEgress(dem)
 	t.Cleanup(func() { _ = dem.Close() })

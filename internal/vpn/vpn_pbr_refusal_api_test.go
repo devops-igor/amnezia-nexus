@@ -18,7 +18,6 @@ import (
 func tightDirectEgress(t *testing.T, f *clientDiagFixture, cfg forwarder.DirectEgressConfig) {
 	t.Helper()
 	cfg.HostWANIP = netip.MustParseAddr("203.0.113.1")
-	cfg.GatewayDNSIP = netip.MustParseAddr("10.100.0.1")
 	f.fwd.SetDirectEgress(forwarder.NewDirectEgressManager(cfg, f.fwd))
 }
 

@@ -2,7 +2,6 @@ package forwarder
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
@@ -54,51 +53,10 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 	}
 
 	if !f.pbrEnabled.Load() {
-		// Configurations issued while policy routing was active name the
-		// gateway address as their only resolver. A gateway-address-only
-		// responder keeps serving them after disablement, while external
-		// port 53 keeps its previous routing.
-		if handled, err := f.handleLegacyGatewayDNS(route, peerKey, packet); handled {
-			return err
-		}
 		return f.routeClientLegacy(route, packet, pktLen)
 	}
 
 	return f.routeClientPBR(route, peerKey, packet, pktLen)
-}
-
-// handleLegacyGatewayDNS submits a gateway-addressed port-53 packet to the
-// installed DNS handler while policy routing is inactive. Only the designated
-// gateway address is matched, so external port-53 traffic keeps its previous
-// routing; anything else falls through to the legacy path unchanged. The check
-// is deliberately cheap because this is the default path for every client
-// packet when policy routing is off; the handler and the gateway perform the
-// full validation of an admitted packet.
-func (f *Forwarder) handleLegacyGatewayDNS(route *sessionRoute, peerKey string, packet []byte) (bool, error) {
-	f.mu.RLock()
-	handler := f.dnsHandler
-	gwDNS := f.gatewayDNSIP
-	f.mu.RUnlock()
-	if handler == nil || !gwDNS.IsValid() {
-		return false, nil
-	}
-	if len(packet) < 20 || (packet[0]>>4) != 4 {
-		return false, nil
-	}
-	ihl := int(packet[0]&0x0f) * 4
-	if len(packet) < ihl+4 {
-		return false, nil
-	}
-	if proto := packet[9]; proto != 6 && proto != 17 {
-		return false, nil
-	}
-	if binary.BigEndian.Uint16(packet[ihl+2:ihl+4]) != 53 {
-		return false, nil
-	}
-	if netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]}) != gwDNS {
-		return false, nil
-	}
-	return handler.HandleDNSPacket(route.sessionID, peerKey, route.assignedIP, route.returnPath, packet)
 }
 
 func (f *Forwarder) routeClientLegacy(route *sessionRoute, packet []byte, pktLen int64) error {
@@ -127,8 +85,6 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	directEgress := f.directEgress
 	policyMatcher := f.policyMatcher
 	classifier := f.destinationClassifier
-	gwDNS := f.gatewayDNSIP
-	dnsHandler := f.dnsHandler
 	f.mu.RUnlock()
 
 	parsed, err := ParseAndValidateClientIPv4(packet, route.assignedIP)
@@ -158,13 +114,12 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	classification := classifyDestination(classifier, dstIP)
 
 	// Step 1 — DROP: Prohibited destinations (loopback, link-local, RFC1918, CGNAT, multicast, metadata).
-	// Explicit exception: traffic to designated gateway DNS on port 53 strictly.
 	//
 	// The verdict is the contract's first row, applied by decideEgress above every
 	// input that could ask for DIRECT, so an operator DIRECT override can never
 	// route a prohibited or internal destination.
 	decision := decideEgress(egressInput{
-		prohibitedErr:  ValidateDirectDestination(dstIP, parsed.DstPort, gwDNS),
+		prohibitedErr:  ValidateDirectDestination(dstIP),
 		proxyOverride:  policySnapshot != nil && policySnapshot.MatchIPv4(dstIP),
 		classification: classification,
 	})
@@ -183,19 +138,6 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	// the routing decision is acted on.
 	if parsed.Protocol != 6 && parsed.Protocol != 17 {
 		return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
-	}
-
-	// Ingress DNS interception: while policy routing is active every plain
-	// DNS packet on UDP or TCP port 53 is submitted to the policy resolver,
-	// whatever its destination, so the client's own answers become routing
-	// evidence. The gateway rewrites the reply to appear from the queried
-	// address, so an unmodified client accepts it. Prohibited destinations
-	// keep the drop decided above; this never becomes an egress path.
-	if dnsHandler != nil && parsed.DstPort == 53 {
-		handled, err := dnsHandler.HandleDNSPacket(sID, peerKey, route.assignedIP, route.returnPath, packet)
-		if handled {
-			return err
-		}
 	}
 
 	// Step 2 — DIRECT: the decided route, with the branch that decided it

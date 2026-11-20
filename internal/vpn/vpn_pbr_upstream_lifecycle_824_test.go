@@ -73,8 +73,7 @@ func TestAcceptedLiveChangeReachesTheLiveResolver(t *testing.T) {
 
 // TestApplyEffectiveUpstreamsRecordsAcceptedListWhenDisabled keeps the disabled
 // path inert and honest: the accepted list is recorded for the next activation,
-// and no resolver is installed, so the panel answers no DNS for an issued
-// profile.
+// and no resolver is installed for it.
 func TestApplyEffectiveUpstreamsRecordsAcceptedListWhenDisabled(t *testing.T) {
 	svc := serviceForActivation(t)
 
@@ -88,7 +87,7 @@ func TestApplyEffectiveUpstreamsRecordsAcceptedListWhenDisabled(t *testing.T) {
 	if svc.PBREnabled() {
 		t.Fatal("the test fixture unexpectedly enabled policy routing")
 	}
-	if handler := svc.forwarder.DNSHandler(); handler != nil {
-		t.Fatalf("a disabled service installed %T: the panel would answer issued profiles", handler)
+	if cfg := svc.getPBRConfig(); cfg != nil && cfg.DNSResolver != nil {
+		t.Fatalf("a disabled service installed a resolver for %v", cfg.DNSResolver.Upstreams())
 	}
 }

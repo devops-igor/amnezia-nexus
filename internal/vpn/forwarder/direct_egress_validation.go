@@ -59,14 +59,11 @@ func IsProhibitedIPv4Destination(dst netip.Addr) bool {
 }
 
 // ValidateDirectDestination checks whether dst is permitted for direct egress.
-// If dst matches the designated gateway DNS address, it is permitted ONLY on port 53.
-func ValidateDirectDestination(dst netip.Addr, dstPort uint16, gwDNS netip.Addr) error {
-	if gwDNS.IsValid() && dst == gwDNS {
-		if dstPort == 53 {
-			return nil
-		}
-		return ErrProhibitedDestination
-	}
+//
+// The panel serves no DNS of its own, so the gateway address a client profile
+// used to name is an ordinary private destination: a packet to it is refused
+// here like any other internal destination.
+func ValidateDirectDestination(dst netip.Addr) error {
 	if IsProhibitedIPv4Destination(dst) {
 		return ErrProhibitedDestination
 	}
@@ -332,15 +329,7 @@ func computeL4Checksum(srcIP, dstIP [4]byte, protocol uint8, l4Data []byte) uint
 }
 
 // IsProhibitedDestination checks whether dst is permitted for direct egress.
-// Traffic to the designated gateway DNS address is permitted without port qualification here
-// (strict port 53 scoping is enforced on full packets in RouteDirect/pumps).
 func (m *DirectEgressManager) IsProhibitedDestination(dst netip.Addr) bool {
-	if m != nil {
-		gw := m.GatewayDNSIP()
-		if gw.IsValid() && dst == gw {
-			return false
-		}
-	}
 	return IsProhibitedIPv4Destination(dst)
 }
 

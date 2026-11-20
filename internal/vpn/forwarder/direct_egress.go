@@ -98,7 +98,6 @@ type natEntry struct {
 // DirectEgressConfig configures DirectEgressManager.
 type DirectEgressConfig struct {
 	HostWANIP         netip.Addr
-	GatewayDNSIP      netip.Addr
 	WANDevice         PacketDevice
 	TCPTimeout        time.Duration
 	UDPTimeout        time.Duration
@@ -147,8 +146,6 @@ type DirectEgressManager struct {
 	readerRunning    bool
 	directDrops      atomic.Uint64
 	directBytes      atomic.Int64
-	gwDNSMu          sync.RWMutex
-	gwDNSIP          netip.Addr
 	portEpoch        map[uint16]uint64
 	quarantinedPorts map[uint16]time.Time
 	portCooldown     time.Duration
@@ -217,7 +214,6 @@ func NewDirectEgressManager(cfg DirectEgressConfig, fwd *Forwarder) *DirectEgres
 		maxBindings:      maxBindings,
 		remoteBindings:   make(map[remoteBindingKey]*remoteBindingEntry),
 		portOwners:       make(map[uint16]string),
-		gwDNSIP:          cfg.GatewayDNSIP,
 		reservations:     make(map[uint16]io.Closer),
 		maxReservations: clampMaxReservations(
 			cfg.MaxHostReservations,
@@ -233,30 +229,6 @@ func NewDirectEgressManager(cfg DirectEgressConfig, fwd *Forwarder) *DirectEgres
 	}
 
 	return dem
-}
-
-// SetGatewayDNSIP updates the designated gateway DNS IPv4 address safely under a lock.
-func (m *DirectEgressManager) SetGatewayDNSIP(ip netip.Addr) {
-	if m == nil {
-		return
-	}
-	m.gwDNSMu.Lock()
-	m.gwDNSIP = ip
-	m.cfg.GatewayDNSIP = ip
-	m.gwDNSMu.Unlock()
-}
-
-// GatewayDNSIP returns the configured gateway DNS address safely.
-func (m *DirectEgressManager) GatewayDNSIP() netip.Addr {
-	if m == nil {
-		return netip.Addr{}
-	}
-	m.gwDNSMu.RLock()
-	defer m.gwDNSMu.RUnlock()
-	if m.gwDNSIP.IsValid() {
-		return m.gwDNSIP
-	}
-	return m.cfg.GatewayDNSIP
 }
 
 // SetPortCooldown configures the quarantine cooldown for recycled NAT ports.
@@ -578,11 +550,7 @@ func (m *DirectEgressManager) RouteDirect(peerKey, assignedIP string, args ...an
 	proto := parsed.Protocol
 	ihl := parsed.IHL
 
-	var gw netip.Addr
-	if m != nil {
-		gw = m.GatewayDNSIP()
-	}
-	if err := ValidateDirectDestination(parsed.DstIP, parsed.DstPort, gw); err != nil {
+	if err := ValidateDirectDestination(parsed.DstIP); err != nil {
 		m.directDrops.Add(1)
 		return err
 	}

@@ -129,7 +129,6 @@ func TestConfigurePBRInstallsTheOverrideClassifier(t *testing.T) {
 	cfg := PBRConfig{
 		Enabled:           true,
 		HostWANIP:         netip.MustParseAddr("198.51.200.1"),
-		GatewayDNSIP:      netip.MustParseAddr("10.100.0.1"),
 		WANDevice:         &mockPBRDevice{},
 		RouteCache:        &mockRouteCache{},
 		PolicyMatcher:     matcher,
@@ -179,7 +178,6 @@ func TestSetInventoryOverrideReplacesTheLiveClassifier(t *testing.T) {
 	if err := svc.ConfigurePBR(PBRConfig{
 		Enabled:       true,
 		HostWANIP:     netip.MustParseAddr("198.51.200.1"),
-		GatewayDNSIP:  netip.MustParseAddr("10.100.0.1"),
 		WANDevice:     &mockPBRDevice{},
 		RouteCache:    &mockRouteCache{},
 		PolicyMatcher: matcher,
