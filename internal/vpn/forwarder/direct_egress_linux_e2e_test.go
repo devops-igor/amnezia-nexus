@@ -16,7 +16,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"golang.org/x/sys/unix"
 )
 
@@ -293,8 +292,13 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 	defer func() { _ = dem.Close() }()
 	fwd.SetDirectEgress(dem)
 
-	rc := newTestRouteCache()
-	fwd.SetRouteCache(rc)
+	// The packet path decides by destination address. The echo target is
+	// classified as an allocation member, so its flows take the DIRECT path; the
+	// proxy and unknown destinations in the subtests below stay uncovered and
+	// therefore proxy. The route cache is still configured as production does and
+	// holds no decision for any of them: retained evidence no longer routes.
+	fwd.SetDestinationClassifier(newTestDirectClassifier(targetIP))
+	fwd.SetRouteCache(newTestRouteCache())
 
 	fwd.StartPumps(t.Context())
 	defer fwd.StopPumps()
@@ -309,7 +313,6 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 		capPath := newTestCaptureReturnPath()
 
 		fwd.RegisterSessionWithReturnPath(sessionID, "conn-1", peerKey, clientIP, 101, capPath.path)
-		rc.Set(sessionID, targetIP, policy.Direct)
 
 		pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), targetIP, clientPort, targetPort, []byte("ping-udp"))
 		if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
@@ -355,7 +358,6 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 		capPath := newTestCaptureReturnPath()
 
 		fwd.RegisterSessionWithReturnPath(sessionID, "conn-2", peerKey, clientIP, 101, capPath.path)
-		rc.Set(sessionID, targetIP, policy.Direct)
 
 		// Send SYN (0x02)
 		synPkt := buildTestIPv4TCPPacketWithSeqAck(netip.MustParseAddr(clientIP), targetIP, clientPort, targetPort, 1000, 0, 0x02, nil)
@@ -439,9 +441,6 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 
 		proxyDst := netip.MustParseAddr("198.51.200.50")
 		directDst := targetIP // 198.51.200.2
-
-		rc.Set(sessionID, proxyDst, policy.Proxy)
-		rc.Set(sessionID, directDst, policy.Direct)
 
 		pktProxy := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), proxyDst, 1111, 80, []byte("to-proxy"))
 		pktDirect := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), directDst, 2222, 8080, []byte("to-direct"))
@@ -550,7 +549,6 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 		fwd.mu.Unlock()
 
 		proxyDst := netip.MustParseAddr("198.51.200.88")
-		rc.Set(sessionID, proxyDst, policy.Proxy)
 
 		pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), proxyDst, 4444, 80, []byte("outage-proxy"))
 		err := fwd.RouteClientToBackend(peerKey, pkt)
@@ -578,8 +576,6 @@ func TestLinuxE2E_DirectEgress(t *testing.T) {
 		fwd.RegisterSessionWithReturnPath(sessB, "c-b", peerB, ipB, 101, capB.path)
 
 		dst := targetIP // 198.51.200.2
-		rc.Set(sessA, dst, policy.Direct)
-		rc.Set(sessB, dst, policy.Direct)
 
 		pktA := buildTestIPv4UDPPacket(netip.MustParseAddr(ipA), dst, 5001, 8080, []byte("data-a"))
 		pktB := buildTestIPv4UDPPacket(netip.MustParseAddr(ipB), dst, 5002, 8080, []byte("data-b"))

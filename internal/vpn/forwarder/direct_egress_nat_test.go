@@ -7,8 +7,6 @@ import (
 	"net/netip"
 	"testing"
 	"time"
-
-	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
 // TestNAT_PeerChurnAndSafePortReuse verifies that remote bindings are bounded,
@@ -250,10 +248,11 @@ func TestNAT_LookupExpiryRetiresRemoteBindingAndReclaimsPort(t *testing.T) {
 	}
 }
 
-// TestNAT_ProductionDispatchAfterDNSEvidenceExpiry verifies HIGH R18-B2 across full dispatch:
-// After DNS evidence expires and flow moves to PROXY, NAT port and remote binding are retired.
-func TestNAT_ProductionDispatchAfterDNSEvidenceExpiry(t *testing.T) {
-	f, m, dev, rc := setupForwarderWithPBR(t)
+// TestNAT_ProductionDispatchAfterReclassification verifies HIGH R18-B2 across full dispatch:
+// after the address classification behind an established flow is withdrawn and the flow is
+// re-decided as PROXY, NAT port and remote binding are retired.
+func TestNAT_ProductionDispatchAfterReclassification(t *testing.T) {
+	f, m, dev, _ := setupForwarderWithPBR(t)
 	defer func() { _ = m.Close() }()
 	m.mu.Lock()
 	m.cfg.MinPort = 45000
@@ -264,8 +263,8 @@ func TestNAT_ProductionDispatchAfterDNSEvidenceExpiry(t *testing.T) {
 	target := netip.MustParseAddr("1.1.1.1")
 	a := netip.MustParseAddr("10.100.0.10")
 	b := netip.MustParseAddr("10.100.0.11")
+	f.SetDestinationClassifier(newTestDirectClassifier(target))
 	f.RegisterSessionWithReturnPath("session-a", "connection-a", "peer-a", a.String(), 101, newTestCaptureReturnPath().path)
-	rc.Set("session-a", target, policy.Direct)
 	packet := buildTestIPv4UDPPacket(a, target, 12345, 53, []byte("initial-direct"))
 	if err := f.RouteClientToBackend("peer-a", packet); err != nil {
 		t.Fatal(err)
@@ -276,16 +275,17 @@ func TestNAT_ProductionDispatchAfterDNSEvidenceExpiry(t *testing.T) {
 	}
 	m.mu.Unlock()
 
-	// Simulate the ordinary expiry of client DNS evidence before the next packet
-	rc.Set("session-a", target, policy.Unknown)
+	// The classification is withdrawn before the next packet, so the flow is
+	// re-decided as PROXY and its direct-NAT state must be retired.
+	f.SetDestinationClassifier(nil)
 	if err := f.RouteClientToBackend("peer-a", packet); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(f.backendQueues[101]); got != 1 {
-		t.Fatalf("expected expired evidence to use PROXY, queued=%d", got)
+		t.Fatalf("expected the re-decided flow to use PROXY, queued=%d", got)
 	}
 	if got := len(dev.getPackets()); got != 1 {
-		t.Fatalf("expired evidence unexpectedly emitted another WAN packet, total=%d", got)
+		t.Fatalf("a re-decided PROXY flow emitted another WAN packet, total=%d", got)
 	}
 	m.Sweep(time.Now().Add(time.Hour))
 	m.mu.RLock()
@@ -300,8 +300,8 @@ func TestNAT_ProductionDispatchAfterDNSEvidenceExpiry(t *testing.T) {
 	}
 	m.mu.RUnlock()
 
+	f.SetDestinationClassifier(newTestDirectClassifier(target))
 	f.RegisterSessionWithReturnPath("session-b", "connection-b", "peer-b", b.String(), 101, newTestCaptureReturnPath().path)
-	rc.Set("session-b", target, policy.Direct)
 	other := buildTestIPv4UDPPacket(b, target, 23456, 53, []byte("other-peer-direct"))
 	err := f.RouteClientToBackend("peer-b", other)
 	if errors.Is(err, ErrNATPortExhaustion) {

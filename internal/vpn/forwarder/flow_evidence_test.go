@@ -96,6 +96,23 @@ func (f *flowEvidenceFixture) send(t *testing.T, dst string, dstPort uint16) {
 	}
 }
 
+// direct installs an address classifier that puts the supplied destinations inside
+// the Russian allocation, which is how the final contract decides a flow DIRECT.
+// A test states the address input the production classifier would supply; retained
+// DNS evidence no longer decides a route.
+func (f *flowEvidenceFixture) direct(t *testing.T, dsts ...string) {
+	t.Helper()
+	addrs := make([]netip.Addr, 0, len(dsts))
+	for _, dst := range dsts {
+		addr, err := netip.ParseAddr(dst)
+		if err != nil {
+			t.Fatalf("fixture destination %q: %v", dst, err)
+		}
+		addrs = append(addrs, addr)
+	}
+	f.fwd.SetDestinationClassifier(newTestDirectClassifier(addrs...))
+}
+
 func (f *flowEvidenceFixture) snapshot(t *testing.T) SessionFlowList {
 	t.Helper()
 	return f.snapshotFor(t, f.session)
@@ -123,7 +140,7 @@ func (f *flowEvidenceFixture) onlyFlow(t *testing.T) SessionFlow {
 func TestFlowEvidenceRecordsTheDirectDecision(t *testing.T) {
 	fix := newFlowEvidenceFixture(t, 8)
 	dst := "93.184.216.34"
-	fix.rc.Set(fix.session, netip.MustParseAddr(dst), policy.Direct)
+	fix.direct(t, dst)
 
 	before := time.Now()
 	fix.send(t, dst, 443)
@@ -132,8 +149,8 @@ func TestFlowEvidenceRecordsTheDirectDecision(t *testing.T) {
 	if flow.Choice != EgressChoiceDirect {
 		t.Fatalf("choice = %v, want DIRECT", flow.Choice)
 	}
-	if flow.DecisionReason != EgressReasonEvidenceDirect {
-		t.Errorf("reason = %q, want %q: the decision branch must be recorded, not inferred", flow.DecisionReason, EgressReasonEvidenceDirect)
+	if flow.DecisionReason != EgressReasonAllocationDirect {
+		t.Errorf("reason = %q, want %q: the decision branch must be recorded, not inferred", flow.DecisionReason, EgressReasonAllocationDirect)
 	}
 	if flow.DecidedAt.IsZero() || flow.DecidedAt.Before(before.Add(-time.Second)) {
 		t.Errorf("decided_at = %v, want the instant of the decision", flow.DecidedAt)
@@ -184,14 +201,21 @@ func TestFlowEvidenceRecordsProxyDecisionsAndDispatch(t *testing.T) {
 		}
 	})
 
-	t.Run("CachedEvidence", func(t *testing.T) {
+	t.Run("RetainedEvidenceDoesNotDecide", func(t *testing.T) {
 		fix := newFlowEvidenceFixture(t, 8)
 		dst := "93.184.216.35"
+		// A retained PROXY decision is present for the destination; the address is
+		// classified as an allocation member, so the address decides and the flow
+		// records the branch that actually ran.
 		fix.rc.Set(fix.session, netip.MustParseAddr(dst), policy.Proxy)
+		fix.direct(t, dst)
 		fix.send(t, dst, 443)
 		flow := fix.onlyFlow(t)
-		if flow.DecisionReason != EgressReasonProxyCachedEvidence {
-			t.Errorf("reason = %q, want %q", flow.DecisionReason, EgressReasonProxyCachedEvidence)
+		if flow.Choice != EgressChoiceDirect {
+			t.Fatalf("choice = %v, want DIRECT: the address decided, not the evidence", flow.Choice)
+		}
+		if flow.DecisionReason != EgressReasonAllocationDirect {
+			t.Errorf("reason = %q, want %q", flow.DecisionReason, EgressReasonAllocationDirect)
 		}
 	})
 
@@ -254,7 +278,7 @@ func TestFlowEvidenceRecordsRefusedDispatch(t *testing.T) {
 	t.Run("DirectWriteFailed", func(t *testing.T) {
 		fix := newFlowEvidenceFixture(t, 8)
 		dst := "93.184.216.36"
-		fix.rc.Set(fix.session, netip.MustParseAddr(dst), policy.Direct)
+		fix.direct(t, dst)
 		fix.dem.AttachWANDevice(newFailingFlowDev())
 		if err := fix.fwd.RouteClientToBackend(fix.peerKey,
 			buildTestIPv4TCPPacket(netip.MustParseAddr(fix.client), netip.MustParseAddr(dst), 41000, 443, 0x02, nil)); err == nil {
@@ -277,7 +301,7 @@ func TestFlowEvidenceRecordsRefusedDispatch(t *testing.T) {
 func TestFlowEvidenceRecordsDirectReturn(t *testing.T) {
 	fix := newFlowEvidenceFixture(t, 8)
 	dst := "93.184.216.37"
-	fix.rc.Set(fix.session, netip.MustParseAddr(dst), policy.Direct)
+	fix.direct(t, dst)
 	fix.send(t, dst, 443)
 
 	flow := fix.onlyFlow(t)
@@ -332,7 +356,7 @@ func TestFlowEvidenceRecordsDirectReturn(t *testing.T) {
 func TestFlowEvidenceKeepsTheOriginalDecisionAcrossPolicyChanges(t *testing.T) {
 	fix := newFlowEvidenceFixture(t, 8)
 	dst := "93.184.216.38"
-	fix.rc.Set(fix.session, netip.MustParseAddr(dst), policy.Direct)
+	fix.direct(t, dst)
 	fix.send(t, dst, 443)
 	original := fix.onlyFlow(t)
 
@@ -346,7 +370,7 @@ func TestFlowEvidenceKeepsTheOriginalDecisionAcrossPolicyChanges(t *testing.T) {
 	if sticky.Choice != EgressChoiceDirect {
 		t.Errorf("choice = %v, want the original DIRECT: a sticky flow is not re-decided", sticky.Choice)
 	}
-	if sticky.DecisionReason != EgressReasonEvidenceDirect {
+	if sticky.DecisionReason != EgressReasonAllocationDirect {
 		t.Errorf("reason = %q, want the original branch, not the current policy", sticky.DecisionReason)
 	}
 	if !sticky.DecidedAt.Equal(original.DecidedAt) {
@@ -369,7 +393,7 @@ func TestFlowEvidenceKeepsTheOriginalDecisionAcrossPolicyChanges(t *testing.T) {
 func TestFlowEvidenceTupleReuseIsANewIncarnation(t *testing.T) {
 	fix := newFlowEvidenceFixture(t, 8)
 	dst := "93.184.216.39"
-	fix.rc.Set(fix.session, netip.MustParseAddr(dst), policy.Direct)
+	fix.direct(t, dst)
 	fix.send(t, dst, 443)
 	first := fix.onlyFlow(t)
 
@@ -399,7 +423,6 @@ func TestFlowEvidenceTupleReuseIsANewIncarnation(t *testing.T) {
 func TestFlowEvidenceRefusesAttributionForASupersededRoute(t *testing.T) {
 	fix := newFlowEvidenceFixture(t, 8)
 	dst := netip.MustParseAddr("93.184.216.60")
-	fix.rc.Set(fix.session, dst, policy.Direct)
 
 	// Capture the current route, then re-register the peer so that route's
 	// generation is no longer the registered one.
@@ -509,7 +532,7 @@ func (f *flowEvidenceFixture) generationOf(t *testing.T) uint64 {
 func TestFlowEvidenceSnapshotIsPure(t *testing.T) {
 	fix := newFlowEvidenceFixture(t, 8)
 	dst := "93.184.216.40"
-	fix.rc.Set(fix.session, netip.MustParseAddr(dst), policy.Direct)
+	fix.direct(t, dst)
 	fix.send(t, dst, 443)
 
 	first := fix.onlyFlow(t)

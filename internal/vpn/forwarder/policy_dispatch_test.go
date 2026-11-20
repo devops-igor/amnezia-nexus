@@ -206,8 +206,12 @@ func TestPolicyDispatch_PolicySnapshotCIDRMatch(t *testing.T) {
 	}
 }
 
-func TestPolicyDispatch_RouteCacheProxyMatch(t *testing.T) {
-	fwd, _, _, rc := setupForwarderWithPBR(t)
+// TestPolicyDispatch_RetainedProxyEvidenceDoesNotDecide pins that a retained
+// PROXY decision is not an input: an uncovered destination proxies because the
+// address is uncovered, and the flow states that branch rather than the evidence
+// token a removed migration row used to produce.
+func TestPolicyDispatch_RetainedProxyEvidenceDoesNotDecide(t *testing.T) {
+	fwd, dem, _, rc := setupForwarderWithPBR(t)
 
 	peerKey := "peer-rc-proxy"
 	backendID := int64(204)
@@ -218,6 +222,8 @@ func TestPolicyDispatch_RouteCacheProxyMatch(t *testing.T) {
 	fwd.RegisterSessionWithReturnPath(sessionID, "c-rc-proxy", peerKey, clientIP, backendID, capPath.path)
 
 	targetIP := netip.MustParseAddr("93.184.216.34")
+	// The session holds a retained PROXY decision for this destination. It must not
+	// decide: the address is uncovered, so the uncovered row proxies and says so.
 	rc.Set(sessionID, targetIP, policy.Proxy)
 
 	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), targetIP, 34567, 80, 0x02, nil)
@@ -233,10 +239,18 @@ func TestPolicyDispatch_RouteCacheProxyMatch(t *testing.T) {
 	if fwd.ProxiedBytes() != int64(len(pkt)) {
 		t.Errorf("expected %d proxiedBytes, got %d", len(pkt), fwd.ProxiedBytes())
 	}
+	flow := recordedFlow(t, dem, sessionID, targetIP)
+	if flow.DecisionReason != EgressReasonNoTrustedEvidence {
+		t.Errorf("decision reason = %q, want %q: the uncovered address decided", flow.DecisionReason, EgressReasonNoTrustedEvidence)
+	}
 }
 
-func TestPolicyDispatch_RouteCacheDirectMatch(t *testing.T) {
-	fwd, _, wanDev, rc := setupForwarderWithPBR(t)
+// TestPolicyDispatch_AddressClassificationDecidesDirect is the other direction:
+// the installed classifier marks the destination an allocation member, so it
+// routes DIRECT and records the allocation branch. What the route cache holds for
+// the same destination is irrelevant here.
+func TestPolicyDispatch_AddressClassificationDecidesDirect(t *testing.T) {
+	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-rc-direct"
 	backendID := int64(205)
@@ -247,7 +261,7 @@ func TestPolicyDispatch_RouteCacheDirectMatch(t *testing.T) {
 	fwd.RegisterSessionWithReturnPath(sessionID, "c-rc-direct", peerKey, clientIP, backendID, capPath.path)
 
 	targetIP := netip.MustParseAddr("1.1.1.1")
-	rc.Set(sessionID, targetIP, policy.Direct)
+	fwd.SetDestinationClassifier(newTestDirectClassifier(targetIP))
 
 	pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), targetIP, 45678, 53, []byte("dns-req"))
 	err := fwd.RouteClientToBackend(peerKey, pkt)
@@ -264,6 +278,10 @@ func TestPolicyDispatch_RouteCacheDirectMatch(t *testing.T) {
 	}
 	if fwd.ProxiedBytes() != 0 {
 		t.Errorf("expected 0 proxiedBytes, got %d", fwd.ProxiedBytes())
+	}
+	flow := recordedFlow(t, dem, sessionID, targetIP)
+	if flow.DecisionReason != EgressReasonAllocationDirect {
+		t.Errorf("decision reason = %q, want %q", flow.DecisionReason, EgressReasonAllocationDirect)
 	}
 }
 
@@ -296,7 +314,7 @@ func TestPolicyDispatch_UnknownRoute_SafeDefault(t *testing.T) {
 }
 
 func TestPolicyDispatch_ProxyBackendUnavailable_FailClosed(t *testing.T) {
-	fwd, _, wanDev, rc := setupForwarderWithPBR(t)
+	fwd, _, wanDev, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-failclosed"
 	backendID := int64(999) // Will delete queue to simulate backend outage
@@ -312,7 +330,6 @@ func TestPolicyDispatch_ProxyBackendUnavailable_FailClosed(t *testing.T) {
 	fwd.mu.Unlock()
 
 	targetIP := netip.MustParseAddr("93.184.216.34")
-	rc.Set(sessionID, targetIP, policy.Proxy)
 
 	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), targetIP, 11223, 80, 0x02, nil)
 	err := fwd.RouteClientToBackend(peerKey, pkt)
@@ -329,8 +346,12 @@ func TestPolicyDispatch_ProxyBackendUnavailable_FailClosed(t *testing.T) {
 	}
 }
 
-func TestPolicyDispatch_FlowStickinessAcrossTTL(t *testing.T) {
-	fwd, _, wanDev, rc := setupForwarderWithPBR(t)
+// TestPolicyDispatch_FlowStickinessAcrossReclassification proves an active
+// 5-tuple keeps the choice it was given even when the address classification
+// behind it changes: stickiness is a property of the flow, not of the inputs that
+// created it.
+func TestPolicyDispatch_FlowStickinessAcrossReclassification(t *testing.T) {
+	fwd, _, wanDev, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-stickiness"
 	backendID := int64(207)
@@ -341,12 +362,12 @@ func TestPolicyDispatch_FlowStickinessAcrossTTL(t *testing.T) {
 	fwd.RegisterSessionWithReturnPath(sessionID, "c-stickiness", peerKey, clientIP, backendID, capPath.path)
 
 	targetIP := netip.MustParseAddr("1.1.1.1")
-	rc.Set(sessionID, targetIP, policy.Direct)
+	fwd.SetDestinationClassifier(newTestDirectClassifier(targetIP))
 
 	clientPort := uint16(22334)
 	targetPort := uint16(443)
 
-	// 1. Initial packet: routes DIRECT according to RouteCache
+	// 1. Initial packet: the classifier routes the destination DIRECT.
 	pkt1 := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), targetIP, clientPort, targetPort, 0x02, nil)
 	err := fwd.RouteClientToBackend(peerKey, pkt1)
 	if err != nil {
@@ -356,10 +377,10 @@ func TestPolicyDispatch_FlowStickinessAcrossTTL(t *testing.T) {
 		t.Fatalf("expected 1 WAN packet, got %d", len(wanDev.getPackets()))
 	}
 
-	// 2. RouteCache TTL expires: now returns Unknown or Proxy
-	rc.Set(sessionID, targetIP, policy.Unknown)
+	// 2. The classification is withdrawn, so a new flow would proxy.
+	fwd.SetDestinationClassifier(nil)
 
-	// 3. Subsequent packet in active flow: must stick to DIRECT despite RouteCache change!
+	// 3. Subsequent packet in the active flow must stay DIRECT.
 	pkt2 := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), targetIP, clientPort, targetPort, 0x10, []byte("data"))
 	err = fwd.RouteClientToBackend(peerKey, pkt2)
 	if err != nil {
@@ -376,7 +397,7 @@ func TestPolicyDispatch_FlowStickinessAcrossTTL(t *testing.T) {
 }
 
 func TestPolicyDispatch_TwoClientIsolation(t *testing.T) {
-	fwd, dem, wanDev, rc := setupForwarderWithPBR(t)
+	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
 
 	peerA := "peer-iso-A"
 	peerB := "peer-iso-B"
@@ -392,8 +413,7 @@ func TestPolicyDispatch_TwoClientIsolation(t *testing.T) {
 	fwd.RegisterSessionWithReturnPath(sessionB, "conn-B", peerB, clientB, 302, capB.path)
 
 	targetIP := netip.MustParseAddr("93.184.216.34")
-	rc.Set(sessionA, targetIP, policy.Direct)
-	rc.Set(sessionB, targetIP, policy.Direct)
+	fwd.SetDestinationClassifier(newTestDirectClassifier(targetIP))
 
 	// Both clients use same source port to same destination
 	pktA := buildTestIPv4TCPPacket(netip.MustParseAddr(clientA), targetIP, 5000, 80, 0x02, nil)
@@ -433,7 +453,7 @@ func TestPolicyDispatch_TwoClientIsolation(t *testing.T) {
 }
 
 func TestPolicyDispatch_AccountingMetrics(t *testing.T) {
-	fwd, _, _, rc := setupForwarderWithPBR(t)
+	fwd, _, _, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-metrics"
 	backendID := int64(208)
@@ -444,10 +464,9 @@ func TestPolicyDispatch_AccountingMetrics(t *testing.T) {
 	fwd.RegisterSessionWithReturnPath(sessionID, "c-metrics", peerKey, clientIP, backendID, capPath.path)
 
 	directIP := netip.MustParseAddr("1.1.1.1")
-	rc.Set(sessionID, directIP, policy.Direct)
+	fwd.SetDestinationClassifier(newTestDirectClassifier(directIP))
 
 	proxyIP := netip.MustParseAddr("8.8.8.8")
-	rc.Set(sessionID, proxyIP, policy.Proxy)
 
 	prohibitedIP := netip.MustParseAddr("127.0.0.1")
 
@@ -509,9 +528,6 @@ func TestPolicyDispatch_WANReplyDownstreamAdmission(t *testing.T) {
 	fwd.SetDirectEgress(dem)
 	t.Cleanup(func() { _ = dem.Close() })
 
-	rc := newTestRouteCache()
-	fwd.SetRouteCache(rc)
-
 	peerKey := "peer-admission"
 	clientIP := "10.100.0.80"
 	sessionID := "s-adm"
@@ -524,7 +540,7 @@ func TestPolicyDispatch_WANReplyDownstreamAdmission(t *testing.T) {
 	}
 
 	targetIP := netip.MustParseAddr("93.184.216.34")
-	rc.Set(sessionID, targetIP, policy.Direct)
+	fwd.SetDestinationClassifier(newTestDirectClassifier(targetIP))
 
 	// Send outbound packet to create NAT entry
 	outPkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), targetIP, 12345, 80, 0x02, nil)
@@ -588,7 +604,7 @@ func TestPolicyDispatch_WANReplyDownstreamAdmission(t *testing.T) {
 }
 
 func TestPolicyDispatch_RouteRetirementFlowInvalidation(t *testing.T) {
-	fwd, dem, _, rc := setupForwarderWithPBR(t)
+	fwd, dem, _, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-invalidation"
 	clientIP := "10.100.0.81"
@@ -597,7 +613,7 @@ func TestPolicyDispatch_RouteRetirementFlowInvalidation(t *testing.T) {
 
 	fwd.RegisterSessionWithReturnPath(sessionID1, "c-inv-1", peerKey, clientIP, 202, capPath1.path)
 	targetIP := netip.MustParseAddr("1.1.1.1")
-	rc.Set(sessionID1, targetIP, policy.Direct)
+	fwd.SetDestinationClassifier(newTestDirectClassifier(targetIP))
 
 	pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), targetIP, 10001, 53, []byte("inv"))
 	if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
@@ -654,9 +670,6 @@ func TestPolicyDispatch_DirectTransmissionErrorAccounting(t *testing.T) {
 	fwd.SetDirectEgress(dem)
 	t.Cleanup(func() { _ = dem.Close() })
 
-	rc := newTestRouteCache()
-	fwd.SetRouteCache(rc)
-
 	peerKey := "peer-f5-fail"
 	clientIP := "10.100.0.82"
 	sessionID := "s-fail-f5"
@@ -664,7 +677,7 @@ func TestPolicyDispatch_DirectTransmissionErrorAccounting(t *testing.T) {
 
 	fwd.RegisterSessionWithReturnPath(sessionID, "c-fail-f5", peerKey, clientIP, 203, capPath.path)
 	targetIP := netip.MustParseAddr("1.1.1.1")
-	rc.Set(sessionID, targetIP, policy.Direct)
+	fwd.SetDestinationClassifier(newTestDirectClassifier(targetIP))
 
 	pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), targetIP, 10001, 53, []byte("f5-data"))
 	err := fwd.RouteClientToBackend(peerKey, pkt)
@@ -690,7 +703,7 @@ func TestPolicyDispatch_DirectTransmissionErrorAccounting(t *testing.T) {
 }
 
 func TestPolicyDispatch_R2B1_AuthorizingGenerationMismatchRejected(t *testing.T) {
-	fwd, dem, wanDev, rc := setupForwarderWithPBR(t)
+	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-r2b1"
 	clientIP := "10.100.0.83"
@@ -699,7 +712,6 @@ func TestPolicyDispatch_R2B1_AuthorizingGenerationMismatchRejected(t *testing.T)
 
 	fwd.RegisterSessionWithReturnPath(sessionID, "c-r2b1", peerKey, clientIP, 204, capPath.path)
 	targetIP := netip.MustParseAddr("1.1.1.1")
-	rc.Set(sessionID, targetIP, policy.Direct)
 
 	pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), targetIP, 10002, 53, []byte("r2b1-data"))
 
@@ -720,7 +732,7 @@ func TestPolicyDispatch_R2B1_AuthorizingGenerationMismatchRejected(t *testing.T)
 }
 
 func TestPolicyDispatch_R2H1_DirectWANReplyWriteFenceAndQueueBounding(t *testing.T) {
-	fwd, dem, wanDev, rc := setupForwarderWithPBR(t)
+	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-r2h1"
 	clientIP := "10.100.0.84"
@@ -729,7 +741,7 @@ func TestPolicyDispatch_R2H1_DirectWANReplyWriteFenceAndQueueBounding(t *testing
 
 	fwd.RegisterSessionWithReturnPath(sessionID, "c-r2h1", peerKey, clientIP, 205, capPath.path)
 	targetIP := netip.MustParseAddr("1.1.1.1")
-	rc.Set(sessionID, targetIP, policy.Direct)
+	fwd.SetDestinationClassifier(newTestDirectClassifier(targetIP))
 
 	pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), targetIP, 10003, 53, []byte("r2h1-data"))
 	if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
@@ -772,7 +784,7 @@ func TestPolicyDispatch_R2H1_DirectWANReplyWriteFenceAndQueueBounding(t *testing
 }
 
 func TestPolicyDispatch_R3B1_RecordFlowAuthorizingIdentityValidation(t *testing.T) {
-	fwd, dem, wanDev, rc := setupForwarderWithPBR(t)
+	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-r3b1"
 	clientIP := "10.100.0.85"
@@ -780,7 +792,6 @@ func TestPolicyDispatch_R3B1_RecordFlowAuthorizingIdentityValidation(t *testing.
 
 	fwd.RegisterSessionWithReturnPath("s-old", "c-old", peerKey, clientIP, 206, capPath.path)
 	targetIP := netip.MustParseAddr("1.1.1.1")
-	rc.Set("s-old", targetIP, policy.Direct)
 
 	pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), targetIP, 10004, 53, []byte("r3b1-data"))
 
@@ -801,7 +812,6 @@ func TestPolicyDispatch_R3B1_RecordFlowAuthorizingIdentityValidation(t *testing.
 		t.Fatal(err)
 	}
 	ret.Wait()
-	rc.Set("s-new", targetIP, policy.Proxy)
 
 	// Old caller tries to record with old identity
 	dem.RecordFlow(peerKey, "s-old", 1, pkt, EgressChoiceDirect)
@@ -822,7 +832,7 @@ func TestPolicyDispatch_R3B1_RecordFlowAuthorizingIdentityValidation(t *testing.
 }
 
 func TestPolicyDispatch_R3H1_DirectWANReplyRetirementWriteFenceContinuous(t *testing.T) {
-	fwd, dem, wanDev, rc := setupForwarderWithPBR(t)
+	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
 
 	peerKey := "peer-r3h1"
 	clientIP := "10.100.0.86"
@@ -839,7 +849,7 @@ func TestPolicyDispatch_R3H1_DirectWANReplyRetirementWriteFenceContinuous(t *tes
 
 	fwd.RegisterSessionWithReturnPath("s-r3h1", "c-r3h1", peerKey, clientIP, 207, blockingPath)
 	targetIP := netip.MustParseAddr("1.1.1.1")
-	rc.Set("s-r3h1", targetIP, policy.Direct)
+	fwd.SetDestinationClassifier(newTestDirectClassifier(targetIP))
 
 	pkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), targetIP, 10005, 53, []byte("r3h1-data"))
 	if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
