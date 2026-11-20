@@ -6,7 +6,6 @@ import (
 
 	mdns "github.com/miekg/dns"
 
-	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
@@ -71,15 +70,15 @@ func clientDiagnosisCoverage(fwd *forwarder.Forwarder, now time.Time) ClientDiag
 	}
 }
 
-// clientDiagnosisEmptyDNS is the section a non-live selection returns: the shape
-// is present so a client never has to distinguish "absent key" from "no
-// evidence".
+// clientDiagnosisEmptyDNS is the DNS section this build always returns: no
+// address evidence is retained and no answer or query collector exists, so every
+// member states not_recorded while keeping its shape. The shape stays present so a
+// client never has to distinguish "absent key" from "nothing retained".
 func clientDiagnosisEmptyDNS() ClientDiagnosisDNS {
 	return ClientDiagnosisDNS{
 		Available:        false,
 		State:            ClientDiagnosisTokenNotRecorded,
 		Names:            ClientDiagnosisNamesMatch{Match: ClientDiagnosisNamesNotRecorded, Reason: ClientDiagnosisNamesReasonNotRetained},
-		Entries:          []ClientDiagnosisEntry{},
 		Records:          []ClientDiagnosisDNSRecord{},
 		RecordsAvailable: false,
 		RecordCoverage:   clientDiagnosisEmptyRecordCoverage(false),
@@ -146,8 +145,6 @@ func clientDiagnosisEmptyFlows() ClientDiagnosisFlows {
 
 // clientDiagnosisReads is everything the read path copied for one answer.
 type clientDiagnosisReads struct {
-	entries        policy.SessionEntryList
-	generation     string
 	flows          forwarder.SessionFlowList
 	flowsAvailable bool
 	dnsRecords     dnsledger.SessionSnapshot
@@ -159,7 +156,6 @@ type clientDiagnosisReads struct {
 // path took. A store that was not consulted keeps its not_recorded default:
 // claiming one this answer never read would be a false statement.
 func clientDiagnosisApplyRecords(out *ClientDiagnosisResponse, reads clientDiagnosisReads, now time.Time) {
-	out.DNS = clientDiagnosisDNSFromEntries(reads.entries, reads.generation, now)
 	if reads.dnsRecordsRead {
 		clientDiagnosisApplyDNSRecords(&out.DNS, reads.dnsRecords, now)
 		clientDiagnosisApplyDNSEvents(&out.DNS, reads.dnsEvents, now)
@@ -337,65 +333,6 @@ func clientDiagnosisRCode(rcode int) string {
 		return name
 	}
 	return "RCODE" + strconv.Itoa(rcode)
-}
-
-// clientDiagnosisDNSFromEntries renders the retained address evidence.
-func clientDiagnosisDNSFromEntries(list policy.SessionEntryList, generation string, now time.Time) ClientDiagnosisDNS {
-	out := ClientDiagnosisDNS{
-		Available:      true,
-		State:          string(list.State),
-		Generation:     list.Generation,
-		Names:          ClientDiagnosisNamesMatch{Match: ClientDiagnosisNamesNotRecorded, Reason: ClientDiagnosisNamesReasonNotRetained},
-		Entries:        make([]ClientDiagnosisEntry, 0, len(list.Entries)),
-		Total:          list.Total,
-		Truncated:      list.Truncated,
-		Records:        []ClientDiagnosisDNSRecord{},
-		RecordCoverage: clientDiagnosisEmptyRecordCoverage(false),
-	}
-	if generation != "" && out.Generation == "" {
-		out.Generation = generation
-	}
-	if list.State == policy.EvidenceQuarantined {
-		out.QuarantinedUntil = clientDiagnosisTime(list.QuarantinedUntil)
-	}
-	for _, entry := range list.Entries {
-		out.Entries = append(out.Entries, clientDiagnosisEntry(entry, now))
-	}
-	return out
-}
-
-// clientDiagnosisEntry renders one retained decision.
-func clientDiagnosisEntry(entry policy.SessionEntry, now time.Time) ClientDiagnosisEntry {
-	out := ClientDiagnosisEntry{
-		Address:    entry.Address.String(),
-		Decision:   entry.Decision.String(),
-		ObservedAt: clientDiagnosisTime(entry.ObservedAt),
-		ExpiresAt:  clientDiagnosisTime(entry.ExpiresAt),
-		State:      string(entry.State),
-		Names:      []string{},
-		NamesMatch: ClientDiagnosisNamesNotRecorded,
-	}
-	if !entry.ExpiresAt.IsZero() {
-		out.ExpiresInSeconds = int64(entry.ExpiresAt.Sub(now) / time.Second)
-	}
-	age, reason := clientDiagnosisEntryAge(entry, now)
-	out.AgeSeconds = age
-	out.AgeUnavailableReason = reason
-	return out
-}
-
-// clientDiagnosisEntryAge states the elapsed age of fresh evidence from its
-// recorded instant, never from its deadline. A non-fresh entry has no usable
-// age: reporting one would describe evidence the packet path ignores.
-func clientDiagnosisEntryAge(entry policy.SessionEntry, now time.Time) (*int64, string) {
-	if entry.State != policy.EvidenceFresh {
-		return nil, string(policy.AgeNotFresh)
-	}
-	if entry.ObservedAt.IsZero() {
-		return nil, string(policy.AgeInstantNotRecorded)
-	}
-	seconds := int64(max(now.Sub(entry.ObservedAt), 0) / time.Second)
-	return &seconds, ""
 }
 
 // clientDiagnosisFlowsFromSnapshot renders the live-flow section, correlating each

@@ -709,9 +709,6 @@ func s4BuildDispatcherService(wanDev forwarder.PacketDevice, fixture *s4Fixture)
 	}
 	matcher.Publish(snapshot)
 
-	rc := NewMemoryRouteCache()
-	rc.AttachMatcher(matcher)
-
 	fwd := forwarder.NewForwarder(nil, "10.100.0.0/16", 100)
 
 	// The proxy backend is a real packet device, not a bare channel: attach it so
@@ -734,7 +731,6 @@ func s4BuildDispatcherService(wanDev forwarder.PacketDevice, fixture *s4Fixture)
 		Enabled:       true,
 		HostWANIP:     netip.MustParseAddr(s4HostWAN),
 		WANDevice:     wanDev,
-		RouteCache:    rc,
 		PolicyMatcher: matcher,
 	}
 	if err := svc.ConfigurePBR(cfg); err != nil {

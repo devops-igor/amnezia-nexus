@@ -32,8 +32,8 @@ type SyncConfig struct {
 	LocalRules ParsedRules `json:"-"`
 	// ExcludedDomains is the parsed operator never-proxy list (built-in patterns
 	// are added separately). It is deliberately not part of the config hash: a
-	// no-op exclusion must not invalidate route evidence, and baseline adoption
-	// revalidates stored rules against the current list.
+	// no-op exclusion must not mint a new generation (equivalence.go), and
+	// baseline adoption revalidates stored rules against the current list.
 	ExcludedDomains []string      `json:"-"`
 	RefreshInterval time.Duration `json:"refresh_interval"`
 	FetchLimits     FetchLimits   `json:"fetch_limits"`
@@ -492,11 +492,10 @@ func (s *Syncer) executeUpdate(ctx context.Context) (SyncResult, error) {
 	}
 
 	// A content-equivalent refresh keeps the published generation (equivalence.go):
-	// route evidence is keyed on the generation identifier, so advancing it for
-	// rules the client already had would discard evidence the client cannot
-	// restore without resolving again. The retained generation still goes through
-	// the same durable commit and atomic publication below, which is what refreshes
-	// its source fetch/health metadata.
+	// advancing it for rules the client already had would stamp a new attribution
+	// on the flows that run the same policy. The retained generation still goes
+	// through the same durable commit and atomic publication below, which is what
+	// refreshes its source fetch/health metadata.
 	newVersion, genID, createdAt := s.candidateIdentity(startTime, candidateDomains, candidateCIDRs, sourceParsedList)
 	sourcesMeta := make(map[string]SourceMeta, len(newCachedSources))
 	for id, item := range newCachedSources {

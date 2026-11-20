@@ -9,7 +9,6 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // These tests prove the real production policy-source path introduced for #678:
@@ -268,40 +267,5 @@ func TestSyncOnceRefusesClosedSyncer(t *testing.T) {
 
 	if _, err := syncer.SyncOnce(context.Background()); err == nil {
 		t.Fatal("SyncOnce ran on a closed syncer")
-	}
-}
-
-// Route-cache size accessors must report the real entry count, since the stats
-// endpoint publishes it.
-func TestRouteCacheEntryCountTracksObservations(t *testing.T) {
-	rc, err := NewRouteCache(CacheConfig{})
-	if err != nil {
-		t.Fatalf("NewRouteCache: %v", err)
-	}
-	if rc.EntryCount() != 0 || rc.SessionCount() != 0 {
-		t.Fatalf("fresh cache reports (%d, %d), want (0, 0)", rc.EntryCount(), rc.SessionCount())
-	}
-
-	scope := Scope{SessionID: "session-1", OwnershipEpoch: 1}
-	sc, err := rc.Open(scope)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	if rc.SessionCount() != 1 {
-		t.Errorf("session count = %d, want 1", rc.SessionCount())
-	}
-
-	gen := "gen-1"
-	rc.SetPolicyGeneration(gen)
-	now := time.Now()
-	// 93.184.216.34 is a public address; the route cache rejects SSRF-reserved
-	// ranges like 203.0.113.0/24 when recording observations.
-	if err := sc.Observe(gen, []Observation{
-		{IP: netip.MustParseAddr("93.184.216.34"), Decision: Direct, ExpiresAt: now.Add(time.Hour)},
-	}, now); err != nil {
-		t.Fatalf("Observe: %v", err)
-	}
-	if got := rc.EntryCount(); got != 1 {
-		t.Errorf("entry count after one observation = %d, want 1", got)
 	}
 }

@@ -215,7 +215,6 @@ func proxyReturnFixtureWithPath(t *testing.T, path *ReturnPath) (*Forwarder, *te
 	fwd.SetDirectEgress(dem)
 	// The manager owns a WAN reader; retire it with the test that created it.
 	t.Cleanup(func() { _ = dem.Close() })
-	fwd.SetRouteCache(newTestRouteCache())
 	capPath := newTestCaptureReturnPath()
 	fwd.RegisterSessionWithReturnPath("sess-return", "conn-1", "peer-return", "10.100.0.7", 31, path)
 	fwd.StartPumps(t.Context())
@@ -292,7 +291,6 @@ func proxyReturnRateLimitedFixture(t *testing.T, limitDownBps int64) (*Forwarder
 	fwd.SetDirectEgress(dem)
 	// The manager owns a WAN reader; retire it with the test that created it.
 	t.Cleanup(func() { _ = dem.Close() })
-	fwd.SetRouteCache(newTestRouteCache())
 	fwd.BeginRegisterSessionWithLimit("sess-rate", "conn-1", "peer-rate", "10.100.0.7", 31, limitDownBps, 0).Wait()
 	return fwd, "peer-rate", "sess-rate"
 }

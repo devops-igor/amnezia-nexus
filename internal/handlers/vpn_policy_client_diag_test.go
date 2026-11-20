@@ -74,8 +74,10 @@ func TestClientDiagnosisHandlerPolicyDisabledOnADataPathlessService(t *testing.T
 			t.Errorf("section %q is missing from the answer", section)
 		}
 	}
-	// Every list is an array, never null: the UI iterates unconditionally.
-	for _, section := range []string{"dns", "flows", "drops"} {
+	// Every list is an array, never null: the UI iterates unconditionally. The DNS
+	// section no longer carries an entries list: the retained-evidence table was
+	// deleted with the route cache it read.
+	for _, section := range []string{"flows", "drops"} {
 		block := out[section].(map[string]any)
 		if _, ok := block["entries"].([]any); !ok {
 			t.Errorf("%s.entries is %T, want an array", section, block["entries"])
@@ -84,16 +86,18 @@ func TestClientDiagnosisHandlerPolicyDisabledOnADataPathlessService(t *testing.T
 	if limitations, ok := out["limitations"].([]any); !ok || len(limitations) == 0 {
 		t.Errorf("limitations = %v, want a non-empty list", out["limitations"])
 	}
-	// The DNS section carries both halves of the answer with final shapes: the
-	// retained evidence and the observed-answer history.
+	// The DNS section carries the answer and query history with final shapes.
 	dns, ok := out["dns"].(map[string]any)
 	if !ok {
 		t.Fatalf("dns section missing: %s", w.Body.String())
 	}
-	for _, key := range []string{"entries", "records"} {
+	for _, key := range []string{"records", "events"} {
 		if _, ok := dns[key].([]any); !ok {
 			t.Errorf("dns.%s is %T, want an array", key, dns[key])
 		}
+	}
+	if _, ok := dns["entries"]; ok {
+		t.Error("dns.entries is present: the retained-evidence table has no producer and no reader")
 	}
 	if available, _ := dns["records_available"].(bool); available {
 		t.Error("a service without a policy runtime cannot report an available DNS collector")

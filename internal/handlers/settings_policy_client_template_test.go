@@ -55,8 +55,6 @@ var clientDiagSectionIDs = []string{
 	"policyClientStateValue",
 	"policyClientGenerationValue",
 	"policyClientEvaluatedValue",
-	"policyClientEvidenceRows",
-	"policyClientEvidenceFoot",
 	"policyClientFlowRows",
 	"policyClientFlowFoot",
 	"policyClientDNSRows",

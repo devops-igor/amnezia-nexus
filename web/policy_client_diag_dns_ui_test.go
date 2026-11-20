@@ -17,7 +17,7 @@ import (
 const clientDNSDiagnosisScript = `
 const targets = () => ({clients: [
   {session_id: 'sess-a', connection_name: 'phone', assigned_ip: '10.100.0.5',
-   route_live: true, route_generation: 4, evidence_entries: 1}
+   route_live: true, route_generation: 4}
 ], sampled_at: '2026-11-17T09:10:00Z', policy_routing_enabled: true, read_only: true,
  not_covered: []});
 responder = async (url, opts) => {
@@ -25,7 +25,7 @@ responder = async (url, opts) => {
   return {
     selection: {session_id: 'sess-a', state: 'live', route_generation: 4},
     dns: {
-      available: true, state: 'fresh', names: {match: 'not_recorded'}, entries: [],
+      available: true, state: 'fresh', names: {match: 'not_recorded'},
       records_available: true, records_total: 2, records_truncated: false,
       records: [
         {seq: 7, name: 'alias.example', qtype: 'A', rcode: 'NOERROR',

@@ -605,20 +605,17 @@ func (h *Handlers) SyncPolicyHandler(w http.ResponseWriter, r *http.Request) {
 
 // GetPolicyStatsHandler serves GET /api/vpn/policy/stats.
 //
-// Only aggregate counters are published: proxy/direct byte totals, drop counts,
-// the DNS route-cache size, and the active rule count. Deliberately excluded are
-// client DNS history, full queried domains, credentials and any client or
-// private address.
+// Only aggregate counters are published: proxy/direct byte totals, drop counts
+// and the active rule count. Deliberately excluded are client DNS history, full
+// queried domains, credentials and any client or private address.
 func (h *Handlers) GetPolicyStatsHandler(w http.ResponseWriter, r *http.Request) {
 	stats := map[string]any{
-		"proxy_bytes":    int64(0),
-		"direct_bytes":   int64(0),
-		"proxy_drops":    uint64(0),
-		"direct_drops":   uint64(0),
-		"route_cache":    0,
-		"route_sessions": 0,
-		"active_rules":   0,
-		"enabled":        false,
+		"proxy_bytes":  int64(0),
+		"direct_bytes": int64(0),
+		"proxy_drops":  uint64(0),
+		"direct_drops": uint64(0),
+		"active_rules": 0,
+		"enabled":      false,
 	}
 
 	if h.vpnSvc != nil {
@@ -627,10 +624,6 @@ func (h *Handlers) GetPolicyStatsHandler(w http.ResponseWriter, r *http.Request)
 		stats["direct_bytes"] = directBytes
 		stats["proxy_drops"] = proxyDrops
 		stats["direct_drops"] = h.vpnSvc.PolicyDirectDrops()
-
-		entries, sessions := h.vpnSvc.PolicyRouteCacheSize()
-		stats["route_cache"] = entries
-		stats["route_sessions"] = sessions
 
 		status := h.vpnSvc.PolicyStatusSnapshot()
 		stats["enabled"] = status.Enabled

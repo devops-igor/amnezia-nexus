@@ -89,7 +89,7 @@ func recordedFlow(t *testing.T, dem *DirectEgressManager, sessionID string, dstI
 // acceptance case: a client that resolves through DoH or DoT leaves no DNS
 // evidence at all, and the destination address alone must route it direct.
 func TestAllocationClassifiedFlowRoutesDirectWithNoDNSEvidence(t *testing.T) {
-	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, dem, wanDev := setupForwarderWithPBR(t)
 	fwd.SetDestinationClassifier(installedClassifier(t))
 
 	const (
@@ -139,7 +139,7 @@ func TestAllocationClassifiedFlowRoutesDirectWithNoDNSEvidence(t *testing.T) {
 // an address that the embedded table also reports as `RS` but which is outside
 // the Russian allocation must not be routed direct.
 func TestGenuineSerbianDestinationStaysProxied(t *testing.T) {
-	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, dem, wanDev := setupForwarderWithPBR(t)
 	fwd.SetDestinationClassifier(installedClassifier(t))
 
 	const (
@@ -174,7 +174,7 @@ func TestGenuineSerbianDestinationStaysProxied(t *testing.T) {
 // data: 193.176.179.0/24 is inside the committed Russian allocation and is
 // covered by AS16509 (Amazon), so it must stay proxied.
 func TestCDNRangeInsideAllocationStaysProxied(t *testing.T) {
-	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, dem, wanDev := setupForwarderWithPBR(t)
 	fwd.SetDestinationClassifier(installedClassifier(t))
 
 	const (
@@ -209,7 +209,7 @@ func TestCDNRangeInsideAllocationStaysProxied(t *testing.T) {
 // the other way: a published address rule keeps an allocation member on the
 // proxy.
 func TestExplicitProxyRuleWinsOverAllocationMatch(t *testing.T) {
-	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, dem, wanDev := setupForwarderWithPBR(t)
 	fwd.SetDestinationClassifier(installedClassifier(t))
 
 	snapshot, err := policy.CompileSnapshot(1, "gen-override", []policy.SourceParsedRules{{
@@ -261,7 +261,7 @@ func TestOperatorDirectInputCannotBypassProhibitedGuard(t *testing.T) {
 		}
 	}
 
-	fwd, _, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, _, wanDev := setupForwarderWithPBR(t)
 	fwd.SetDestinationClassifier(classifier)
 
 	const (
@@ -307,7 +307,7 @@ func TestOperatorDirectInputCannotBypassProhibitedGuard(t *testing.T) {
 // control: with no classifier configured, decisions are exactly today's, so an
 // allocation member still takes the proxy path and says why.
 func TestWithoutClassifierAllocationDestinationsStayProxied(t *testing.T) {
-	fwd, dem, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, dem, wanDev := setupForwarderWithPBR(t)
 	if got := fwd.DestinationClassifier(); got != nil {
 		t.Fatalf("a classifier is installed without being configured: %T", got)
 	}
@@ -344,13 +344,12 @@ func TestWithoutClassifierAllocationDestinationsStayProxied(t *testing.T) {
 }
 
 // TestRetainedProxyEvidenceCannotProxyAllocationDestination is one half of the
-// stale-evidence control: the session still holds a retained PROXY decision for
-// an address inside the Russian allocation, and the address must route DIRECT
-// anyway. The retained evidence is present in the same route cache the packet
-// path is configured with, so the only way this passes is that the decision no
-// longer reads it.
+// stale-evidence control: a session's retained PROXY decision used to be able to
+// outvote the address. That input is gone — the route cache and its evidence were
+// deleted — so the address decides by construction, and this test pins the
+// outcome: an address inside the Russian allocation routes DIRECT.
 func TestRetainedProxyEvidenceCannotProxyAllocationDestination(t *testing.T) {
-	fwd, dem, wanDev, rc := setupForwarderWithPBR(t)
+	fwd, dem, wanDev := setupForwarderWithPBR(t)
 	fwd.SetDestinationClassifier(installedClassifier(t))
 
 	const (
@@ -363,10 +362,6 @@ func TestRetainedProxyEvidenceCannotProxyAllocationDestination(t *testing.T) {
 	fwd.RegisterSessionWithReturnPath(sessionID, "c-stale-proxy", peerKey, clientIP, backendID, capPath.path)
 
 	target := netip.MustParseAddr("213.180.204.186") // inside 213.180.192.0/19
-	rc.Set(sessionID, target, policy.Proxy)
-	if got := rc.Lookup(sessionID, target); got != policy.Proxy {
-		t.Fatalf("fixture evidence = %v, want the retained PROXY decision under test", got)
-	}
 
 	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), target, 41030, 443, 0x02, nil)
 	if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
@@ -392,10 +387,10 @@ func TestRetainedProxyEvidenceCannotProxyAllocationDestination(t *testing.T) {
 }
 
 // TestRetainedDirectEvidenceCannotRouteUncoveredDestinationDirect is the other
-// half: the session holds a retained DIRECT decision for an address the
-// classifier does not cover, and the address must still proxy.
+// half of that control: with retained evidence gone as a routing input, an
+// address the classifier does not cover still proxies.
 func TestRetainedDirectEvidenceCannotRouteUncoveredDestinationDirect(t *testing.T) {
-	fwd, dem, wanDev, rc := setupForwarderWithPBR(t)
+	fwd, dem, wanDev := setupForwarderWithPBR(t)
 	fwd.SetDestinationClassifier(installedClassifier(t))
 
 	const (
@@ -408,10 +403,6 @@ func TestRetainedDirectEvidenceCannotRouteUncoveredDestinationDirect(t *testing.
 	fwd.RegisterSessionWithReturnPath(sessionID, "c-stale-direct", peerKey, clientIP, backendID, capPath.path)
 
 	target := netip.MustParseAddr("147.91.1.1") // Serbia, outside the allocation
-	rc.Set(sessionID, target, policy.Direct)
-	if got := rc.Lookup(sessionID, target); got != policy.Direct {
-		t.Fatalf("fixture evidence = %v, want the retained DIRECT decision under test", got)
-	}
 
 	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), target, 41031, 443, 0x02, nil)
 	if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
@@ -437,7 +428,7 @@ func TestRetainedDirectEvidenceCannotRouteUncoveredDestinationDirect(t *testing.
 // DIRECT decision whose required egress is unavailable is a DROP with the
 // producer's reason, never a silent switch to the proxy.
 func TestAllocationClassifiedFlowWithoutEgressDrops(t *testing.T) {
-	fwd, _, wanDev, _ := setupForwarderWithPBR(t)
+	fwd, _, wanDev := setupForwarderWithPBR(t)
 	fwd.SetDestinationClassifier(installedClassifier(t))
 	// No direct-egress manager: the proxied path is healthy, the direct one is not.
 	fwd.SetDirectEgress(nil)

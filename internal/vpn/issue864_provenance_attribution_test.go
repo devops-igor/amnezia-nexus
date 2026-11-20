@@ -13,20 +13,19 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
-// TestIssue864AttributionOnlyMoveAfterRestartInvalidatesEvidence is the consumer
-// oracle for the durable attribution criterion.
+// TestIssue864AttributionOnlyMoveAfterRestartPublishesNewGeneration is the
+// consumer oracle for the durable attribution criterion.
 //
 // Two lists supply the same merged rules; one domain and one prefix move from
 // the first list to the second. Routing cannot change, because every rule is
-// still supplied by someone. What does change is which list an explanation names,
-// and the generation the session's route evidence is keyed on — so a restart that
-// followed by such a move must publish a new generation and the evidence recorded
-// under the old one must be invalidated, exactly as for any other genuine change.
+// still supplied by someone. What does change is which list an explanation
+// names — and the generation the forwarder stamps on the flows it records — so a
+// restart followed by such a move must publish a new generation, exactly as for
+// any other genuine change.
 //
-// The subjects are real: MemoryRouteCache, the policy.RouteCache behind it, a real
-// policy.Syncer over a real FileStore and Matcher, and the production settings
-// path that turns two custom URLs into two sources.
-func TestIssue864AttributionOnlyMoveAfterRestartInvalidatesEvidence(t *testing.T) {
+// The subjects are real: a real policy.Syncer over a real FileStore and Matcher,
+// and the production settings path that turns two custom URLs into two sources.
+func TestIssue864AttributionOnlyMoveAfterRestartPublishesNewGeneration(t *testing.T) {
 	var mu sync.Mutex
 	bodies := map[string]string{
 		"/a.lst": "shared.example.com\nalpha.example.com\n198.51.100.0/24\n",
@@ -78,27 +77,17 @@ func TestIssue864AttributionOnlyMoveAfterRestartInvalidatesEvidence(t *testing.T
 	if err != nil {
 		t.Fatalf("NewSyncer: %v", err)
 	}
-	cache := NewMemoryRouteCache()
 
 	first, err := syncer.SyncOnce(ctx)
 	if err != nil || !first.Published {
 		t.Fatalf("initial sync: published=%v err=%v", first.Published, err)
 	}
-	// Attach after the first publication, so the adapter starts on the published
-	// generation instead of clearing evidence it never stored.
-	cache.AttachMatcher(matcher)
 	seedSnap := matcher.Current()
 	seedMatch, ok := seedSnap.ExplainDomain("shared.example.com")
 	if !ok || !reflect.DeepEqual(seedMatch.Contributors, []string{"custom-1"}) {
 		t.Fatalf("seed attribution = %+v, want custom-1", seedMatch)
 	}
 
-	const session = "session-attribution-move"
-	evidence := netip.MustParseAddr("93.184.216.34")
-	cache.Observe(session, evidence, policy.Direct)
-	if got := cache.Lookup(session, evidence); got != policy.Direct {
-		t.Fatalf("precondition: recorded evidence answered %v, want DIRECT", got)
-	}
 	beforeStats := [2]int{seedSnap.DomainCount(), seedSnap.CIDRCount()}
 
 	// The same merged rules, with the domain and the prefix supplied by the
@@ -120,13 +109,6 @@ func TestIssue864AttributionOnlyMoveAfterRestartInvalidatesEvidence(t *testing.T
 	}
 	if baseline, err := restartedSyncer.PrimeBaseline(ctx); err != nil || baseline != policy.BaselinePrimed {
 		t.Fatalf("PrimeBaseline: status=%v err=%v", baseline, err)
-	}
-	cache.AttachMatcher(restarted)
-
-	// Priming the baseline replays the same generation, so the evidence must
-	// still be there: only a real change may discard it.
-	if got := cache.Lookup(session, evidence); got != policy.Direct {
-		t.Fatalf("priming the durable baseline discarded the session's evidence (lookup answered %v)", got)
 	}
 
 	second, err := restartedSyncer.SyncOnce(ctx)
@@ -155,14 +137,11 @@ func TestIssue864AttributionOnlyMoveAfterRestartInvalidatesEvidence(t *testing.T
 		t.Fatal("a prefix the lists still contain no longer matches after the move")
 	}
 
-	// The contract: a moved attribution is a new generation, so the session's
-	// evidence recorded under the old one is invalidated rather than reused.
+	// The contract: a moved attribution is a new generation, so the flows recorded
+	// after it report the attribution that is actually live.
 	if second.GenerationID == first.GenerationID {
-		t.Fatalf("an attribution-only move after a restart retained generation %q; the explanation would name the previous list and the route evidence would outlive the attribution it was recorded under",
+		t.Fatalf("an attribution-only move after a restart retained generation %q; the explanation would name the previous list",
 			first.GenerationID)
-	}
-	if got := cache.Lookup(session, evidence); got != policy.Unknown {
-		t.Fatalf("attribution-only move kept the session's evidence (lookup answered %v), want UNKNOWN", got)
 	}
 
 	// The current attribution is the one the live snapshot reports.

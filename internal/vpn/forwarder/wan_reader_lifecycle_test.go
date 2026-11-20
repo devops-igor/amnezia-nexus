@@ -186,7 +186,7 @@ func TestWANFixtureCleanupRetiresReaderAfterEarlyExit(t *testing.T) {
 	var dev *mockPacketDev
 
 	t.Run("early exit", func(t *testing.T) {
-		_, dem, dev, _ = setupForwarderWithPBR(t)
+		_, dem, dev = setupForwarderWithPBR(t)
 		requireParkedWANReader(t, dev)
 		t.Skip("leave before the case reaches any teardown of its own")
 	})

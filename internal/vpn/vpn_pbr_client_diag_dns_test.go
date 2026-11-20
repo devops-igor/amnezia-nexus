@@ -7,17 +7,14 @@ import (
 	"testing"
 )
 
-// TestClientDiagnosisWithoutACollectorSaysNotRecorded pins the intermediate state
-// this build ships in: the panel records no DNS evidence, so a live selection must
-// report the record history as unavailable rather than as an empty history. A
-// client that has observed nothing and a build that records nothing are different
-// statements, and the section may only make the second one.
+// TestClientDiagnosisWithoutACollectorSaysNotRecorded pins the state this build
+// ships in: the panel records no DNS evidence — no store retains it and no
+// producer exists — so a live selection must report the record history as
+// unavailable rather than as an empty history. A client that has observed nothing
+// and a build that records nothing are different statements, and the section may
+// only make the second one.
 func TestClientDiagnosisWithoutACollectorSaysNotRecorded(t *testing.T) {
 	f := newClientDiagFixture(t)
-
-	if rc := f.svc.clientDiagnosisRouteCache(); rc != nil && rc.DNSLedger() != nil {
-		t.Fatal("fixture still carries a DNS ledger: this build installs no collector")
-	}
 
 	answer, err := f.svc.ClientDiagnosis(context.Background(), ClientDiagnosisRequest{SessionID: f.sessionID(t)})
 	if err != nil {
@@ -49,7 +46,7 @@ func TestClientDiagnosisWithoutACollectorSaysNotRecorded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	for _, key := range []string{`"entries"`, `"records"`, `"events"`, `"records_available"`, `"events_available"`} {
+	for _, key := range []string{`"records"`, `"events"`, `"records_available"`, `"events_available"`} {
 		if !strings.Contains(string(raw), key) {
 			t.Errorf("wire answer is missing %s", key)
 		}

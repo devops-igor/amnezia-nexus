@@ -3,7 +3,6 @@ package vpn
 import (
 	"context"
 	"errors"
-	"net/netip"
 	"testing"
 	"time"
 
@@ -397,16 +396,6 @@ func TestPolicyStatusSnapshotWithoutRuntime(t *testing.T) {
 	}
 }
 
-// The route-cache size accessors must report zeros rather than panicking when PBR
-// is not configured.
-func TestPolicyRouteCacheSizeWithoutPBR(t *testing.T) {
-	svc := serviceForActivation(t)
-	entries, sessions := svc.PolicyRouteCacheSize()
-	if entries != 0 || sessions != 0 {
-		t.Fatalf("PolicyRouteCacheSize = (%d, %d), want (0, 0)", entries, sessions)
-	}
-}
-
 // Dispatch counters must be zero-valued on a forwarder with no PBR traffic.
 func TestPolicyDispatchCountersWithoutTraffic(t *testing.T) {
 	svc := serviceForActivation(t)
@@ -449,59 +438,6 @@ func TestPolicyActivationErrorIsDescriptive(t *testing.T) {
 	err := ErrPolicyActivationNoRules
 	if err == nil || len(err.Error()) < 20 {
 		t.Fatalf("activation error %v is not descriptive enough for an operator", err)
-	}
-}
-
-// nonMemoryRouteCache satisfies forwarder.RouteCache but is not the in-memory
-// implementation, so PolicyRouteCacheSize must reject it.
-type nonMemoryRouteCache struct{}
-
-func (nonMemoryRouteCache) Lookup(string, netip.Addr) policy.Decision { return policy.Unknown }
-
-// PolicyRouteCacheSize must report the real route-cache size once PBR is
-// configured, since the stats endpoint publishes it. Each type-assertion branch is
-// asserted so a regression to a silent zero is caught.
-func TestPolicyRouteCacheSizeReportsConfiguredCache(t *testing.T) {
-	svc := serviceForActivation(t)
-
-	// 1. Runtime present but no PBR config: (0, 0), not a panic.
-	policyRuntimeMu.Lock()
-	policyRuntimes[svc] = &policyRuntime{matcher: policy.NewMatcher()}
-	policyRuntimeMu.Unlock()
-	t.Cleanup(func() {
-		policyRuntimeMu.Lock()
-		delete(policyRuntimes, svc)
-		policyRuntimeMu.Unlock()
-	})
-	if entries, sessions := svc.PolicyRouteCacheSize(); entries != 0 || sessions != 0 {
-		t.Fatalf("without PBR config = (%d, %d), want (0, 0)", entries, sessions)
-	}
-
-	// 2. A PBR config whose route cache is not a MemoryRouteCache: (0, 0).
-	svc.SetPBRConfig(PBRConfig{Enabled: true, RouteCache: nonMemoryRouteCache{}})
-	if entries, sessions := svc.PolicyRouteCacheSize(); entries != 0 || sessions != 0 {
-		t.Fatalf("with foreign route cache = (%d, %d), want (0, 0)", entries, sessions)
-	}
-
-	// 3. A real MemoryRouteCache with one observed entry: (1, 1).
-	mem := NewMemoryRouteCache()
-	sc, err := mem.Open(policy.Scope{SessionID: "s1", OwnershipEpoch: 1})
-	if err != nil {
-		t.Fatalf("open session cache: %v", err)
-	}
-	gen := "gen-size-1"
-	mem.SetPolicyGeneration(gen)
-	now := time.Now()
-	if err := sc.Observe(gen, []policy.Observation{
-		{IP: netip.MustParseAddr("93.184.216.34"), Decision: policy.Direct, ExpiresAt: now.Add(time.Hour)},
-	}, now); err != nil {
-		t.Fatalf("observe: %v", err)
-	}
-
-	svc.SetPBRConfig(PBRConfig{Enabled: true, RouteCache: mem})
-	entries, sessions := svc.PolicyRouteCacheSize()
-	if entries != 1 || sessions != 1 {
-		t.Fatalf("configured cache = (%d, %d), want (1, 1)", entries, sessions)
 	}
 }
 

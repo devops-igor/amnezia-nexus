@@ -50,7 +50,6 @@ import (
 	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
-	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"golang.org/x/net/http2"
 )
 
@@ -101,9 +100,6 @@ func newH2EgressFixture(t *testing.T) *h2Fixture {
 	}, fx.fwd)
 	t.Cleanup(func() { _ = fx.dem.Close() })
 	fx.fwd.SetDirectEgress(fx.dem)
-	// Configured as production does; it holds the answers this fixture no longer
-	// consults for a route.
-	fx.fwd.SetRouteCache(newTestRouteCache())
 	fx.fwd.StartPumps(t.Context())
 
 	// The proxied origin needs the forwarder, and its teardown must close its
@@ -226,16 +222,16 @@ type h2Session struct {
 }
 
 // startSession registers a peer whose packets enter the production dispatcher
-// and whose returns are bounded by the client tunnel MTU. decision states the
-// address input for the session's destination: DIRECT classifies it as an
-// allocation member, PROXY leaves it uncovered.
-func (fx *h2Fixture) startSession(t *testing.T, peerKey, sessionID, clientIP string, clientMTU uint32, dst netip.Addr, decision policy.Decision) *h2Session {
+// and whose returns are bounded by the client tunnel MTU. direct states the
+// address input for the session's destination: true classifies it as an
+// allocation member, false leaves it uncovered.
+func (fx *h2Fixture) startSession(t *testing.T, peerKey, sessionID, clientIP string, clientMTU uint32, dst netip.Addr, direct bool) *h2Session {
 	t.Helper()
 	client := newH2ClientStack(t, netip.MustParseAddr(clientIP), clientMTU)
 	returns := newH2MTUReturnPath(h2PathMTU, client.inject)
 	path := NewReturnPath(returns.write)
 	fx.fwd.RegisterSessionWithReturnPath(sessionID, "conn-"+peerKey, peerKey, clientIP, fx.proxyID, path)
-	fx.routeDestination(dst, decision)
+	fx.routeDestination(dst, direct)
 	client.setSubmit(func(packet []byte) error { return fx.fwd.RouteClientToBackend(peerKey, packet) })
 
 	s := &h2Session{fx: fx, client: client, returns: returns, peerKey: peerKey, sessionID: sessionID, clientIP: clientIP, path: path}
@@ -243,13 +239,13 @@ func (fx *h2Fixture) startSession(t *testing.T, peerKey, sessionID, clientIP str
 	return s
 }
 
-// routeDestination states the address input for one destination. A DIRECT
-// decision is expressed the way the shipped classifier expresses it, by
-// classifying the destination as an allocation member; a PROXY decision is the
-// uncovered default. The set accumulates, so classifying a later session's
+// routeDestination states the address input for one destination. A direct
+// destination is expressed the way the shipped classifier expresses it, by
+// classifying it as an allocation member; an uncovered destination is the
+// fail-closed default. The set accumulates, so classifying a later session's
 // destination cannot unclassify a session that is still live.
-func (fx *h2Fixture) routeDestination(dst netip.Addr, decision policy.Decision) {
-	if decision != policy.Direct {
+func (fx *h2Fixture) routeDestination(dst netip.Addr, direct bool) {
+	if !direct {
 		return
 	}
 	fx.direct[dst] = struct{}{}
@@ -384,7 +380,7 @@ func (fx *h2Fixture) caseDirect(t *testing.T, dst netip.AddrPort) {
 	fx.wan.setClamp(0)
 	directBefore := fx.dem.DirectBytes()
 	proxyBefore := fx.proxyDev.packets.Load()
-	s := fx.startSession(t, "peer-h2-direct", "sess-h2-direct", "10.100.0.30", h2CorrectClientMTU, dst.Addr(), policy.Direct)
+	s := fx.startSession(t, "peer-h2-direct", "sess-h2-direct", "10.100.0.30", h2CorrectClientMTU, dst.Addr(), true)
 
 	res := s.exchange(t.Context(), dst, h2PositiveTimeout)
 	assertBodyEquality(t, res, fx.body, "DIRECT")
@@ -412,7 +408,7 @@ func (fx *h2Fixture) caseDirect(t *testing.T, dst netip.AddrPort) {
 func (fx *h2Fixture) caseProxied(t *testing.T, dst netip.AddrPort) {
 	fx.wan.setClamp(0)
 	proxyBefore := fx.proxyDev.packets.Load()
-	s := fx.startSession(t, "peer-h2-proxy", "sess-h2-proxy", "10.100.0.31", h2CorrectClientMTU, dst.Addr(), policy.Proxy)
+	s := fx.startSession(t, "peer-h2-proxy", "sess-h2-proxy", "10.100.0.31", h2CorrectClientMTU, dst.Addr(), false)
 
 	res := s.exchange(t.Context(), dst, h2PositiveTimeout)
 	assertBodyEquality(t, res, fx.body, "PROXY")
@@ -436,7 +432,7 @@ func (fx *h2Fixture) caseProxied(t *testing.T, dst netip.AddrPort) {
 // the refusal is observed at the HTTP layer when the handshake completes.
 func (fx *h2Fixture) caseHTTP11Refused(t *testing.T, dst netip.AddrPort) {
 	fx.wan.setClamp(0)
-	s := fx.startSession(t, "peer-h2-h1", "sess-h2-h1", "10.100.0.32", h2CorrectClientMTU, dst.Addr(), policy.Direct)
+	s := fx.startSession(t, "peer-h2-h1", "sess-h2-h1", "10.100.0.32", h2CorrectClientMTU, dst.Addr(), true)
 
 	ctx, cancel := context.WithTimeout(t.Context(), h2NegativeTimeout)
 	defer cancel()
@@ -485,7 +481,7 @@ func (fx *h2Fixture) caseHTTP11Refused(t *testing.T, dst netip.AddrPort) {
 // the 1280 path and the full body arrives.
 func (fx *h2Fixture) caseConstrainedClamped(t *testing.T, dst netip.AddrPort) {
 	fx.wan.setClamp(h2ClampedMSS)
-	s := fx.startSession(t, "peer-h2-clamped", "sess-h2-clamped", "10.100.0.33", h2LegacyClientMTU, dst.Addr(), policy.Direct)
+	s := fx.startSession(t, "peer-h2-clamped", "sess-h2-clamped", "10.100.0.33", h2LegacyClientMTU, dst.Addr(), true)
 
 	res := s.exchange(t.Context(), dst, h2PositiveTimeout)
 	assertBodyEquality(t, res, fx.body, "DIRECT+MSS clamp")
@@ -511,7 +507,7 @@ func (fx *h2Fixture) caseConstrainedClamped(t *testing.T, dst netip.AddrPort) {
 // the path cannot carry. This is the regression the clamp prevents.
 func (fx *h2Fixture) caseConstrainedUnclamped(t *testing.T, dst netip.AddrPort) {
 	fx.wan.setClamp(0)
-	s := fx.startSession(t, "peer-h2-unclamped", "sess-h2-unclamped", "10.100.0.34", h2LegacyClientMTU, dst.Addr(), policy.Direct)
+	s := fx.startSession(t, "peer-h2-unclamped", "sess-h2-unclamped", "10.100.0.34", h2LegacyClientMTU, dst.Addr(), true)
 
 	res := s.exchange(t.Context(), dst, h2NegativeTimeout)
 	if res.err == nil && bytes.Equal(res.body, fx.body) {

@@ -44,25 +44,6 @@ type PacketDevice interface {
 	Close() error
 }
 
-// RouteCache queries routing decisions for client sessions.
-type RouteCache interface {
-	Lookup(sessionID string, ip netip.Addr) policy.Decision
-}
-
-// SessionScopeRetirer is an optional RouteCache capability. A cache that
-// implements it keeps per-session scope state which MUST be released when the
-// authenticated session's route retires; otherwise the scope outlives its
-// session and permanently consumes the cache's bounded session capacity.
-//
-// The forwarder invokes it from the write section that removes the route, so a
-// consumer that fences its allocation on route liveness can never re-admit a
-// released scope. Implementations must stay memory-only and must not call back
-// into the forwarder: the forwarder lock sits above the cache lock in the lock
-// order.
-type SessionScopeRetirer interface {
-	RetireSessionScope(sessionID string)
-}
-
 type sessionRoute struct {
 	sessionID       string
 	connectionID    string
@@ -229,7 +210,6 @@ type Forwarder struct {
 	// Policy-based routing and direct egress:
 	pbrEnabled    atomic.Bool
 	directEgress  *DirectEgressManager
-	routeCache    RouteCache
 	policyMatcher *policy.Matcher
 	// destinationClassifier answers "inside the Russian allocation, and is it a
 	// multi-region CDN" for the routing contract (issue #918). It is immutable
@@ -609,20 +589,6 @@ func (f *Forwarder) DirectEgress() *DirectEgressManager {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.directEgress
-}
-
-// SetRouteCache configures the client route evidence lookup source.
-func (f *Forwarder) SetRouteCache(rc RouteCache) {
-	f.mu.Lock()
-	f.routeCache = rc
-	f.mu.Unlock()
-}
-
-// RouteCache returns the configured route decision source.
-func (f *Forwarder) RouteCache() RouteCache {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.routeCache
 }
 
 // SetPolicyMatcher configures the policy snapshot matcher.

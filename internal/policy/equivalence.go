@@ -9,14 +9,15 @@ import (
 // This file owns the question a refresh cycle has to answer before it publishes:
 // "does this candidate change the effective policy?".
 //
-// The answer matters because route evidence is keyed on the policy generation.
-// The forwarder's cache adapter (MemoryRouteCache) compares the matcher's
-// generation with the one its evidence was recorded under and clears every
-// session view when they differ, which turns each client's unresolved flows into
-// the fail-closed PROXY path until it resolves again. Scheduled refreshes run
-// every SyncConfig.RefreshInterval and an upstream answering 304 — or an
-// unchanged 200 — is the ordinary case, so publishing a new generation for
-// identical rules would discard usable evidence on a timer.
+// The answer matters because the published generation is stamped on what the
+// forwarder records. Every routed flow carries the generation of the snapshot its
+// decision was taken against, so a refresh that republishes an identical rule set
+// under a new generation changes what those flows report — a new attribution for
+// traffic that runs exactly the same policy — and it replaces the live snapshot
+// under a policy the operator did not change. Scheduled refreshes run every
+// SyncConfig.RefreshInterval and an upstream answering 304 — or an unchanged 200 —
+// is the ordinary case, so publishing a new generation for identical rules would
+// rewrite that attribution on a timer.
 //
 // Equivalence is about effective content, never about a rule count or a single
 // source digest:
@@ -40,8 +41,8 @@ import (
 // instant the current cycle must publish under.
 //
 // A content-equivalent refresh reuses the incumbent identity, so the generation
-// the forwarder's route cache keys client evidence on does not move; everything
-// else about the cycle (durable commit, atomic publication, status) is unchanged.
+// the forwarder stamps on the flows it records does not move; everything else
+// about the cycle (durable commit, atomic publication, status) is unchanged.
 func (s *Syncer) candidateIdentity(startTime time.Time, domains map[string]uint32, cidrs []string, perSource []SourceParsedRules) (uint64, string, time.Time) {
 	retain := s.retainableGeneration()
 	if s.equivalentTo(retain, domains, cidrs, perSource) {

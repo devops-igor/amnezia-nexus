@@ -5,28 +5,23 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"net/netip"
 	"sync/atomic"
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
-// TestIssue864UnchangedRefreshPreservesRoutingEvidence is the consumer oracle for
-// the policy refresh contract.
+// TestIssue864UnchangedRefreshPreservesGeneration is the consumer oracle for the
+// policy refresh contract.
 //
-// The forwarder decides a new flow from the client's DNS evidence: an address the
-// session legitimately resolved as DIRECT is routed direct, and a missing entry
-// takes the fail-closed PROXY path. That evidence is keyed on the policy
-// generation, and the cache adapter below is the only writer of the generation the
-// evidence is compared against. So a scheduled refresh that re-publishes identical
-// rules silently discards it.
-//
-// The oracle drives the real adapter (MemoryRouteCache), the real policy.RouteCache
-// behind it, a real policy.Syncer over a real FileStore and Matcher, and the
-// fixture TLS listener. Only TLS trust and the approved-IP/dial pair are
-// substituted, exactly as the existing policy fixtures do.
-func TestIssue864UnchangedRefreshPreservesRoutingEvidence(t *testing.T) {
+// A published generation is what the forwarder stamps on the flows it records, so
+// a scheduled refresh that republishes identical rules under a new generation
+// changes what those flows report without changing what they route. The
+// equivalence gate internal/policy/equivalence.go owns that decision; this test
+// pins its two outcomes against a real policy.Syncer over a real FileStore and
+// Matcher, and the fixture TLS listener. Only TLS trust and the approved-IP/dial
+// pair are substituted, exactly as the existing policy fixtures do.
+func TestIssue864UnchangedRefreshPreservesGeneration(t *testing.T) {
 	var body atomic.Pointer[[]string]
 	var etag atomic.Pointer[string]
 	initial := domainList("policy", 20)
@@ -59,9 +54,6 @@ func TestIssue864UnchangedRefreshPreservesRoutingEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSyncer: %v", err)
 	}
-
-	cache := NewMemoryRouteCache()
-	cache.AttachMatcher(matcher)
 	ctx := context.Background()
 
 	first, err := syncer.SyncOnce(ctx)
@@ -72,20 +64,8 @@ func TestIssue864UnchangedRefreshPreservesRoutingEvidence(t *testing.T) {
 		t.Fatal("initial sync did not publish")
 	}
 
-	// The evidence a DNS observation records for a name the list does not cover:
-	// the address was resolved directly, so new flows to it must stay direct.
-	const session = "session-refresh-evidence"
-	evidence := netip.MustParseAddr("93.184.216.34")
-	if got := cache.Lookup(session, evidence); got != policy.Unknown {
-		t.Fatalf("precondition: a fresh session answered %v for the evidence address, want UNKNOWN", got)
-	}
-	cache.Observe(session, evidence, policy.Direct)
-	if got := cache.Lookup(session, evidence); got != policy.Direct {
-		t.Fatalf("precondition: recorded evidence answered %v, want DIRECT", got)
-	}
-
 	// A refresh whose rules are unchanged (the upstream answers 304) must keep the
-	// generation, and therefore the session's evidence.
+	// generation the flows are stamped with.
 	second, err := syncer.SyncOnce(ctx)
 	if err != nil {
 		t.Fatalf("unchanged refresh: %v", err)
@@ -94,18 +74,15 @@ func TestIssue864UnchangedRefreshPreservesRoutingEvidence(t *testing.T) {
 	if !second.SourceStats[sourceID].NotModified {
 		t.Fatalf("fixture did not answer 304 for the unchanged refresh: %+v", second.SourceStats)
 	}
-	// Assert the harm before the mechanism, so a failing run shows what the client
-	// loses rather than only that an identifier changed.
-	if got := cache.Lookup(session, evidence); got != policy.Direct {
-		t.Fatalf("unchanged refresh discarded the session's DIRECT evidence (lookup answered %v): new flows fall back to the fail-closed PROXY path (generation %q -> %q)",
-			got, first.GenerationID, second.GenerationID)
-	}
 	if second.GenerationID != first.GenerationID {
 		t.Fatalf("unchanged refresh published generation %q over %q", second.GenerationID, first.GenerationID)
 	}
+	if live := matcher.Current(); live == nil || live.Generation() != first.GenerationID {
+		t.Fatalf("live snapshot generation = %v, want the retained %q", live, first.GenerationID)
+	}
 
-	// The control: a genuine rule change publishes a new generation, and the same
-	// evidence is then correctly invalidated instead of being reused.
+	// The control: a genuine rule change publishes a new generation, so the
+	// retention cannot freeze the policy.
 	grown := append(domainList("policy", 20), "added-after-refresh.example.com")
 	body.Store(&grown)
 	v2 := `"list-v2"`
@@ -118,7 +95,14 @@ func TestIssue864UnchangedRefreshPreservesRoutingEvidence(t *testing.T) {
 	if third.GenerationID == second.GenerationID {
 		t.Fatalf("a genuine rule change retained generation %q", second.GenerationID)
 	}
-	if got := cache.Lookup(session, evidence); got != policy.Unknown {
-		t.Fatalf("changed rules kept the session's evidence (lookup answered %v), want UNKNOWN", got)
+	live := matcher.Current()
+	if live == nil {
+		t.Fatal("no live snapshot after the changed refresh")
+	}
+	if live.Generation() != third.GenerationID {
+		t.Errorf("live snapshot generation = %q, want the published %q", live.Generation(), third.GenerationID)
+	}
+	if !live.MatchDomain("added-after-refresh.example.com") {
+		t.Error("live snapshot does not carry the added rule")
 	}
 }

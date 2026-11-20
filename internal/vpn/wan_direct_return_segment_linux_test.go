@@ -386,9 +386,6 @@ func buildReturnSegRig(t *testing.T, wan forwarder.PacketDevice, server netip.Ad
 		t.Fatalf("policy snapshot: %v", err)
 	}
 	matcher.Publish(snap)
-	cache := NewMemoryRouteCache()
-	cache.AttachMatcher(matcher)
-
 	fwd := forwarder.NewForwarder(nil, "10.100.0.0/16", 100)
 	for _, c := range clients {
 		path := forwarder.NewReturnPath(c.returnSink)
@@ -399,13 +396,12 @@ func buildReturnSegRig(t *testing.T, wan forwarder.PacketDevice, server netip.Ad
 		Enabled:       true,
 		HostWANIP:     netip.MustParseAddr(s4HostWAN),
 		WANDevice:     wan,
-		RouteCache:    cache,
 		PolicyMatcher: matcher,
 	}); err != nil {
 		t.Fatalf("ConfigurePBR: %v", err)
 	}
 	// The remote endpoint is classified as an allocation member, so every flow to
-	// it takes the DIRECT path by address. Retained DNS evidence no longer routes.
+	// it takes the DIRECT path by address.
 	installDirectDestinations(fwd, server)
 
 	dem := fwd.DirectEgress()

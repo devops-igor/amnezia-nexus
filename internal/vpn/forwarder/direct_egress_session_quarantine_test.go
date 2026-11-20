@@ -28,7 +28,6 @@ type sessionQuarantineHarness struct {
 	fwd     *Forwarder
 	dem     *DirectEgressManager
 	wanDev  *mockPacketDev
-	cache   *testRouteCache
 	hostWAN netip.Addr
 	client  netip.Addr
 	remote  netip.Addr
@@ -63,8 +62,6 @@ func newDirectEgressHarness(t *testing.T, cfg DirectEgressConfig) *sessionQuaran
 	// The harness's single remote is an allocation member, so its flows take the
 	// DIRECT path this fixture exercises.
 	h.fwd.SetDestinationClassifier(newTestDirectClassifier(h.remote))
-	h.cache = newTestRouteCache()
-	h.fwd.SetRouteCache(h.cache)
 	t.Cleanup(func() {
 		h.fwd.UnregisterSession(h.peerKey)
 		_ = h.dem.Close()

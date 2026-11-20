@@ -20,13 +20,12 @@ import (
 // than a DTO check.
 
 // flowEvidenceFixture builds a policy-active forwarder whose WAN device and
-// backend queue are test devices, plus a route cache the test can steer.
+// backend queue are test devices.
 type flowEvidenceFixture struct {
 	fwd        *Forwarder
 	dem        *DirectEgressManager
 	wan        *mockPacketDev
 	backendDev *mockPacketDev
-	rc         *testRouteCache
 	matcher    *policy.Matcher
 	peerKey    string
 	session    string
@@ -41,7 +40,6 @@ func newFlowEvidenceFixture(t *testing.T, queueSize int) *flowEvidenceFixture {
 		fwd:        NewForwarder(nil, "10.100.0.0/16", queueSize),
 		wan:        newMockPacketDev(),
 		backendDev: newMockPacketDev(),
-		rc:         newTestRouteCache(),
 		matcher:    policy.NewMatcher(),
 		peerKey:    "peer-flow-evidence",
 		session:    "sess-flow-evidence",
@@ -57,7 +55,6 @@ func newFlowEvidenceFixture(t *testing.T, queueSize int) *flowEvidenceFixture {
 	fix.fwd.SetDirectEgress(fix.dem)
 	// The manager owns a WAN reader; retire it with the test that created it.
 	t.Cleanup(func() { _ = fix.dem.Close() })
-	fix.fwd.SetRouteCache(fix.rc)
 	fix.publishSnapshot(t, nil)
 	fix.returnPath = newTestCaptureReturnPath()
 	fix.fwd.RegisterSessionWithReturnPath(fix.session, "conn-1", fix.peerKey, fix.client, fix.backendID, fix.returnPath.path)
@@ -202,10 +199,10 @@ func TestFlowEvidenceRecordsProxyDecisionsAndDispatch(t *testing.T) {
 	t.Run("RetainedEvidenceDoesNotDecide", func(t *testing.T) {
 		fix := newFlowEvidenceFixture(t, 8)
 		dst := "93.184.216.35"
-		// A retained PROXY decision is present for the destination; the address is
-		// classified as an allocation member, so the address decides and the flow
-		// records the branch that actually ran.
-		fix.rc.Set(fix.session, netip.MustParseAddr(dst), policy.Proxy)
+		// The destination is classified as an allocation member, so the address
+		// decides and the flow records the branch that actually ran. There is no
+		// retained decision to weigh against it: the route cache that held one was
+		// deleted, so this pins the address-based outcome.
 		fix.direct(t, dst)
 		fix.send(t, dst, 443)
 		flow := fix.onlyFlow(t)

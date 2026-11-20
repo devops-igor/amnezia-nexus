@@ -72,14 +72,10 @@ func newActivePBRConfig(t *testing.T) PBRConfig {
 	}
 	matcher.Publish(snap)
 
-	routeCache := NewMemoryRouteCache()
-	routeCache.AttachMatcher(matcher)
-
 	return PBRConfig{
 		Enabled:       true,
 		HostWANIP:     netip.MustParseAddr("203.0.113.10"),
 		WANDevice:     &mockPBRDevice{},
-		RouteCache:    routeCache,
 		PolicyMatcher: matcher,
 	}
 }

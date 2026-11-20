@@ -606,28 +606,6 @@ func (s *Service) PolicyDirectDrops() uint64 {
 	return directDrops
 }
 
-// PolicyRouteCacheSize reports the current DNS route-cache size as
-// (entries, live sessions). It returns zeros when PBR is not configured.
-func (s *Service) PolicyRouteCacheSize() (entries, sessions int) {
-	runtime := s.policyRuntime()
-	if runtime == nil {
-		return 0, 0
-	}
-	cfg := s.getPBRConfig()
-	if cfg == nil {
-		return 0, 0
-	}
-	mem, ok := cfg.RouteCache.(*MemoryRouteCache)
-	if !ok || mem == nil {
-		return 0, 0
-	}
-	rc := mem.RouteCache()
-	if rc == nil {
-		return 0, 0
-	}
-	return rc.EntryCount(), rc.SessionCount()
-}
-
 // ReportPolicyActivationFailure records why policy routing could not be activated
 // so the status surface can explain it. It is used when activation was refused
 // before a runtime existed, where the syncer's own status cannot carry the reason.
