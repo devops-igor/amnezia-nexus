@@ -139,17 +139,29 @@ by editing a call site.
 
 The forwarder does not intercept DNS. No ingress listener, route, packet device
 or pump in this package inspects, answers, rewrites or re-routes port 53, and the
-forwarder holds no DNS handler, no gateway address and no per-session DNS
-authority. A client DNS packet is an ordinary client-to-backend packet: it takes
+forwarder holds no DNS handler, no resolver it would answer from and no
+per-session DNS authority. It remembers only which address the panel used to serve
+on (`formerResolverAddr`), so that one destination can be refused in both modes.
+A client DNS packet is otherwise an ordinary client-to-backend packet: it takes
 the same path as any other transport on that port.
 
-- **No exception.** Port 53 to any destination — including an address inside the
-  access server's own subnet — is refused by the prohibited-destination check
-  (`ValidateDirectDestination`) like every other internal destination, under the
-  existing `prohibited_destination` token. Nothing serves such an address, so a
-  packet to it is a drop, not a proxied flow.
-- **No active/inactive difference.** `SetPBREnabled` selects the policy path over
-  the legacy route for every packet equally; neither path has a DNS branch, and
+- **One address is refused in both modes.** The panel address issued client
+  profiles used to name as their resolver — the client pool's gateway, derived by
+  `derivedResolverAddr` — is refused under the existing `prohibited_destination`
+  token whether or not policy routing is active: the policy path refuses it with
+  every other internal destination, and the legacy path refuses that one
+  destination before enqueuing. Nothing serves DNS there any more, so tunnelling
+  the packet would be the only way it could reach a listener that no longer
+  exists. The refusal is counted (the aggregate client drop counter) and recorded
+  in the drop ledger, never discarded.
+- **The legacy path is otherwise unchanged, and is not a validation pass.** With
+  policy routing disabled, `routeClientLegacy` enqueues every other destination
+  exactly as it always did — external resolvers on port 53 included — and does not
+  parse, accept or reject a packet for any other reason. The full
+  prohibited-destination check (`ValidateDirectDestination`) belongs to the policy
+  path alone, so an internal destination other than the former resolver address
+  still takes the legacy route.
+- **No DNS branch.** Neither path consults a DNS handler or a gateway address, and
   enabling or disabling policy routing installs and removes nothing DNS-shaped.
 - **No replies or translations.** Reply construction, client-facing
   substitution, UDP reply rewriting and the per-connection TCP translation are

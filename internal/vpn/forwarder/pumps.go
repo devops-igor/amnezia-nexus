@@ -53,13 +53,39 @@ func (f *Forwarder) routeClientToBackend(peerKey string, packet []byte, path *Re
 	}
 
 	if !f.pbrEnabled.Load() {
-		return f.routeClientLegacy(route, packet, pktLen)
+		return f.routeClientLegacy(route, peerKey, packet, pktLen)
 	}
 
 	return f.routeClientPBR(route, peerKey, packet, pktLen)
 }
 
-func (f *Forwarder) routeClientLegacy(route *sessionRoute, packet []byte, pktLen int64) error {
+// routeClientLegacy enqueues one client packet toward the proxy backend, which is
+// the unchanged legacy route.
+//
+// One destination is refused first: the panel address issued client profiles used
+// to name as their resolver. Nothing answers it any more, and the policy path
+// refuses it as a prohibited destination, so leaving the legacy path to tunnel it
+// would report two different outcomes for one destination depending on a switch.
+// The refusal is accounted for the way every other legacy client refusal is — the
+// aggregate client drop counter plus a drop-ledger record under the same
+// prohibited-destination token — rather than discarded.
+//
+// This is one destination, not a general validation pass: every other packet,
+// external resolvers included, is enqueued exactly as before, and a malformed
+// packet is neither parsed nor rejected here.
+func (f *Forwarder) routeClientLegacy(route *sessionRoute, peerKey string, packet []byte, pktLen int64) error {
+	if dst, ok := clientPacketIPv4Destination(packet); ok && dst == f.formerResolverAddr {
+		// The tuple is recorded only when the packet can be read as one: a refused
+		// packet must never appear in the ledger with a destination it did not carry.
+		protocol, dstPort, hasTuple := uint8(0), uint16(0), false
+		if parsed, err := ParseAndValidateClientIPv4(packet, ""); err == nil {
+			protocol, dstPort, hasTuple = parsed.Protocol, parsed.DstPort, true
+		}
+		f.clientDropsTotal.Add(1)
+		f.recordClientDrop(peerKey, route, DropReasonProhibitedDestination, protocol, dst, dstPort, hasTuple, pktLen)
+		return ErrProhibitedDestination
+	}
+
 	f.mu.RLock()
 	beQueue, ok := f.backendQueues[route.backendTunnelID]
 	if !ok {
@@ -162,6 +188,20 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 		})
 	}
 	return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
+}
+
+// clientPacketIPv4Destination reads the destination address of an IPv4 client
+// packet without validating it.
+//
+// It exists so the legacy path can recognize ONE destination without gaining a
+// validation pass: the fixed header offset is read only for a packet whose version
+// nibble is 4 and whose header is present, and nothing else about the packet is
+// inspected, accepted or rejected here.
+func clientPacketIPv4Destination(packet []byte) (netip.Addr, bool) {
+	if len(packet) < 20 || packet[0]>>4 != 4 {
+		return netip.Addr{}, false
+	}
+	return netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]}), true
 }
 
 // classifyDestination asks the installed address classifier about one

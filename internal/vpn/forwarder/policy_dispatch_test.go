@@ -174,6 +174,75 @@ func TestPolicyDispatch_GatewayDNSIsProhibitedDestination(t *testing.T) {
 	}
 }
 
+// TestPolicyDispatch_LegacyRefusesFormerResolverAddress is the policy-off half of the
+// same outcome: the destination that is refused while policy routing is active must
+// not be tunnelled while it is disabled. Nothing serves DNS at that address any more,
+// so the legacy path refuses it with the same token, counts the drop and records it,
+// and the control in the same test proves ordinary legacy routing still enqueues.
+func TestPolicyDispatch_LegacyRefusesFormerResolverAddress(t *testing.T) {
+	fwd := NewForwarder(nil, "10.100.0.0/16", 100) // policy routing stays disabled
+	peerKey := "peer-legacy-gw"
+	backendID := int64(303)
+	clientIP := "10.100.0.20"
+	sessionID := "s-legacy-gw"
+	capPath := newTestCaptureReturnPath()
+	fwd.RegisterSessionWithReturnPath(sessionID, "c-legacy-gw", peerKey, clientIP, backendID, capPath.path)
+
+	if fwd.PBREnabled() {
+		t.Fatal("the fixture must exercise the legacy path")
+	}
+
+	// The address is the client pool's gateway, which is what issued profiles named.
+	formerResolver := netip.MustParseAddr("10.100.0.1")
+	dnsPkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), formerResolver, 54321, 53, []byte("dns-query"))
+
+	if err := fwd.RouteClientToBackend(peerKey, dnsPkt); !errors.Is(err, ErrProhibitedDestination) {
+		t.Fatalf("legacy gateway-addressed DNS = %v, want ErrProhibitedDestination", err)
+	}
+	if got := len(fwd.backendQueues[backendID]); got != 0 {
+		t.Fatalf("a refused packet reached the proxy queue: %d packets", got)
+	}
+
+	// The refusal is accounted for, not discarded: the existing aggregate client drop
+	// counter plus a ledger record under the same token the policy path writes.
+	queueFull, rateLimited, noBackend, total := fwd.ClientDropStats()
+	if total != 1 || queueFull != 0 || rateLimited != 0 || noBackend != 0 {
+		t.Errorf("client drop stats = queueFull:%d rateLimited:%d noBackend:%d total:%d, want 0/0/0/1",
+			queueFull, rateLimited, noBackend, total)
+	}
+	snapshot := fwd.ClientDropSnapshot(sessionID, 0, 10)
+	if len(snapshot.Entries) != 1 {
+		t.Fatalf("drop records = %d, want 1: %+v", len(snapshot.Entries), snapshot.Entries)
+	}
+	entry := snapshot.Entries[0]
+	if entry.Key.Reason != DropReasonProhibitedDestination {
+		t.Errorf("drop reason = %q, want %q", entry.Key.Reason, DropReasonProhibitedDestination)
+	}
+	if entry.Key.SessionID != sessionID || entry.Key.Generation != fwd.SessionRouteStates()[0].Generation {
+		t.Errorf("drop record identity = %q/%d, want the refusing incarnation", entry.Key.SessionID, entry.Key.Generation)
+	}
+	if !entry.Key.HasTuple || entry.Key.Protocol != 17 || entry.Key.DstPort != 53 || entry.Key.DstIP != formerResolver.As4() {
+		t.Errorf("drop tuple = proto:%d dst:%v:%d hasTuple:%v, want udp/10.100.0.1/53",
+			entry.Key.Protocol, netip.AddrFrom4(entry.Key.DstIP), entry.Key.DstPort, entry.Key.HasTuple)
+	}
+
+	// Control: this is not a validation pass. An ordinary external destination,
+	// including another resolver, still takes the unchanged legacy route.
+	controlPkt := buildTestIPv4UDPPacket(netip.MustParseAddr(clientIP), netip.MustParseAddr("8.8.8.8"), 54322, 53, []byte("dns-query"))
+	if err := fwd.RouteClientToBackend(peerKey, controlPkt); err != nil {
+		t.Fatalf("legacy routing refused an external resolver: %v", err)
+	}
+	if got := len(fwd.backendQueues[backendID]); got != 1 {
+		t.Fatalf("control packet enqueued = %d, want 1", got)
+	}
+	if _, _, _, total = fwd.ClientDropStats(); total != 1 {
+		t.Errorf("a routed packet moved the client drop counter: total = %d, want 1", total)
+	}
+	if got := len(fwd.ClientDropSnapshot(sessionID, 0, 10).Entries); got != 1 {
+		t.Errorf("the control packet added a drop record: %d records", got)
+	}
+}
+
 func TestPolicyDispatch_PolicySnapshotCIDRMatch(t *testing.T) {
 	fwd, _, _, _ := setupForwarderWithPBR(t)
 
