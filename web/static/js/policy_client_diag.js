@@ -472,7 +472,9 @@
     // renderFlows renders the recorded decisions for one incarnation, as four
     // columns: the protocol, the destination, the route the flow was given and the
     // reason for that route. Every cell states what the server sent; nothing here
-    // derives a cause, a name or a success.
+    // derives a cause, a name or a success. The route cell marks a delivery the
+    // dispatch path refused, so a direct route that failed cannot read as one that
+    // reached the WAN.
     function renderFlows(entries) {
         var body = clientElement('policyClientFlowRows');
         if (!body) {
@@ -482,7 +484,7 @@
             var row = root.document.createElement('tr');
             appendCell(row, clientTokenLabel('protocol', flow.protocol));
             appendFlowDestination(row, flow);
-            appendCell(row, clientTokenLabel('decision', flow.choice));
+            appendFlowRoute(row, flow);
             appendFlowDecision(row, flow);
             body.appendChild(row);
         });
@@ -511,6 +513,42 @@
             return;
         }
         appendCell(row, address);
+    }
+
+    // appendFlowRoute states the route the flow was given, and marks a delivery
+    // the dispatch path recorded as failed: a direct route whose packets were
+    // refused must not read like a direct route that reached the WAN. Only the
+    // recorded dispatch state marks the cell — a success is never inferred from an
+    // absent failure, and a state this build does not know leaves the route plain.
+    // The dispatch outcome and the failure the packet met are the cell's tooltip,
+    // where a queue hand-off stays distinguishable from a completed write.
+    function appendFlowRoute(row, flow) {
+        var route = clientTokenLabel('decision', flow.choice);
+        var dispatch = flow.dispatch || {};
+        var state = dispatch.state == null ? '' : String(dispatch.state);
+        if (state === 'failed') {
+            var failed = clientText('policy_client_dispatch_failed');
+            route = route ? route + ' (' + failed + ')' : failed;
+        }
+        appendCell(row, route, flowDispatchDetail(flow, state));
+    }
+
+    // flowDispatchDetail is the dispatch evidence behind the route cell: the
+    // outcome the dispatch path recorded and, when it recorded one, the failure the
+    // packet met. The reason on the dispatch state is the measured outcome; the
+    // forward counters' failure stands in when a producer recorded only that. A
+    // state of not_recorded, or no state at all, offers no tooltip.
+    function flowDispatchDetail(flow, state) {
+        if (!state || state === 'not_recorded') {
+            return '';
+        }
+        var parts = [clientTokenLabel('dispatch', state)];
+        var forward = flow.forward || {};
+        var failure = (flow.dispatch && flow.dispatch.reason) || forward.failure || '';
+        if (failure) {
+            parts.push(clientTokenLabel('failure', failure));
+        }
+        return parts.join(' · ');
     }
 
     // appendFlowDecision states the recorded reason as one short label. The instant,

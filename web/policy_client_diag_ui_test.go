@@ -613,7 +613,8 @@ assert.equal(rowCount('policyClientFlowRows'), 3, 'all three states are rendered
 const ambiguous = rowCells('policyClientFlowRows', 0);
 assert.equal(ambiguous[1], '93.184.216.34:443 (FIRST plain.example PLUS 1)',
   'the first of several candidate names is shown with a count of the others, never collapsed to that one alone');
-assert.equal(ambiguous[2], 'DECISION:proxy', 'the recorded route is rendered');
+assert.equal(ambiguous[2], 'DECISION:proxy (DISPATCH:failed)',
+  'the recorded route is rendered, and a refused delivery is marked on it');
 assert.equal(ambiguous[3], 'DECISION_REASON:proxy_cidr_rule',
   'the deciding reason is one label, not a sentence of metadata');
 assert.equal(rowCellTitles('policyClientFlowRows', 0)[3],
@@ -636,10 +637,14 @@ assert.equal(rowCellTitles('policyClientFlowRows', 2)[3], '',
 }
 
 // TestPolicyClientDiagFlowsTableKeepsFourColumnsAndDropsTheRest pins the flows
-// table to the four columns an operator reads (issue #940). Both flows below carry
-// the dispatch and return evidence the table used to spell out, and none of it may
-// be rendered: not in a column, not under another name, and not hidden by a style.
-// The test fails if a removed column comes back.
+// table to the four columns an operator reads (issue #940), and to the one thing
+// the removed columns carried that the row cannot lose: whether the route that was
+// chosen actually delivered. Both direct flows below share a route and a deciding
+// reason, and only the recorded dispatch separates them, so the table must show
+// that difference in the Recorded route cell rather than let the two rows read the
+// same. The remaining states the wire can send are covered too: a queue hand-off
+// and an unrecorded dispatch stay plain in the cell and differ in the tooltip.
+// Nothing from the removed columns may come back as a column, a cell or a style.
 func TestPolicyClientDiagFlowsTableKeepsFourColumnsAndDropsTheRest(t *testing.T) {
 	runClientDiagScenario(t, clientTargetsScript+`
 responder = ((base) => async (url, opts) => {
@@ -660,6 +665,20 @@ responder = ((base) => async (url, opts) => {
      dispatch: {state: 'failed', reason: 'direct_egress_unavailable'},
      forward: {packets: 0, bytes: 0, failed: 1, failure: 'direct_egress_unavailable'},
      return: {evidence: 'not_observed', packets: 0, bytes: 0},
+     names: [], names_match: 'none', names_considered: 0, name_candidates: []},
+    {protocol: 'tcp', destination_ip: '77.88.55.66', destination_port: 443, choice: 'PROXY',
+     route_generation: 3, last_seen_age_seconds: 5, expired: false, close_seen: false,
+     decision_time: '2026-11-17T09:10:00Z', decision_reason: 'no_trusted_evidence',
+     policy_generation: 'gen-1', backend_tunnel_id: 77,
+     dispatch: {state: 'queued_to_backend'}, forward: {packets: 3, bytes: 180, failed: 0},
+     return: {evidence: 'not_measured', packets: 0, bytes: 0},
+     names: [], names_match: 'none', names_considered: 0, name_candidates: []},
+    {protocol: 'udp', destination_ip: '1.1.1.1', destination_port: 53, choice: 'DIRECT',
+     route_generation: 3, last_seen_age_seconds: 6, expired: false, close_seen: false,
+     decision_time: 'not_recorded', decision_reason: 'not_recorded',
+     policy_generation: 'not_recorded',
+     dispatch: {state: 'not_recorded'}, forward: {packets: 0, bytes: 0, failed: 0},
+     return: {evidence: 'not_measured', packets: 0, bytes: 0},
      names: [], names_match: 'none', names_considered: 0, name_candidates: []}
   ];
   return answer;
@@ -668,7 +687,7 @@ responder = ((base) => async (url, opts) => {
 selectClient('sess-a');
 await w.diagnoseSelectedClient();
 await settle();
-assert.equal(rowCount('policyClientFlowRows'), 2, 'both direct flows are rendered');
+assert.equal(rowCount('policyClientFlowRows'), 4, 'every flow is rendered');
 
 const headers = rowHeaders('policyClientFlowRows');
 assert.deepEqual(headers, ['policy_client_column_protocol', 'policy_client_column_destination',
@@ -684,20 +703,51 @@ Array.from(w.document.getElementById('policyClientFlowRows').children).forEach((
   assert.equal(row.children.length, 4, 'row ' + index + ' carries exactly four cells');
 });
 
-// Same route and same deciding reason: the two rows are indistinguishable here
-// because the dispatch difference the removed column used to carry is gone from
-// the DOM, not merely hidden.
+// The pair that used to read identically: same route, same deciding reason, one
+// delivered and one refused by the dispatch path.
 assert.deepEqual(rowCells('policyClientFlowRows', 0),
   ['PROTO:tcp', '213.180.204.186:443', 'DECISION:direct', 'DECISION_REASON:allocation_direct']);
 assert.deepEqual(rowCells('policyClientFlowRows', 1),
-  ['PROTO:tcp', '185.73.194.82:443', 'DECISION:direct', 'DECISION_REASON:allocation_direct']);
+  ['PROTO:tcp', '185.73.194.82:443', 'DECISION:direct (DISPATCH:failed)',
+   'DECISION_REASON:allocation_direct']);
+assert.notDeepEqual(rowCells('policyClientFlowRows', 0)[2], rowCells('policyClientFlowRows', 1)[2],
+  'a direct route that failed must not render like a direct route that was delivered');
+assert.equal(rowCells('policyClientFlowRows', 0)[3], rowCells('policyClientFlowRows', 1)[3],
+  'the Decision cell stays the recorded reason label: the dispatch difference is the route cell');
+assert.equal(rowCells('policyClientFlowRows', 0)[0], rowCells('policyClientFlowRows', 1)[0],
+  'the protocol cell is not what separates the delivered flow from the failed one');
+assert.equal(rowCells('policyClientFlowRows', 1)[2].indexOf('DISPATCH:failed') >= 0, true,
+  'the failure marker comes from the dispatch label dictionary, not from a literal');
 
-const removedEvidence = ['ROUTE ', 'DISPATCH', 'OUTCOME', 'RETURN', 'DEVICE ', 'FAILURE',
-  'direct_egress_unavailable', 'written_to_wan'];
-rowCells('policyClientFlowRows', 1).forEach(cell => {
-  removedEvidence.forEach(marker => {
-    assert.equal(cell.indexOf(marker), -1,
-      'the removed dispatch/return evidence must not be rendered as ' + marker);
+// The delivery evidence is the route cell tooltip, where a queue hand-off and a
+// completed write are different statements.
+assert.equal(rowCellTitles('policyClientFlowRows', 0)[2], 'DISPATCH:written_to_wan',
+  'a delivered direct flow states the completed write in its tooltip');
+assert.equal(rowCellTitles('policyClientFlowRows', 1)[2],
+  'DISPATCH:failed · FAILURE:direct_egress_unavailable',
+  'a failed direct flow states the dispatch outcome and the failure it met');
+assert.equal(rowCellTitles('policyClientFlowRows', 2)[2], 'DISPATCH:queued_to_backend',
+  'a queue hand-off is not a completed write and says so');
+assert.equal(rowCellTitles('policyClientFlowRows', 3)[2], '',
+  'a flow whose dispatch recorded nothing offers no tooltip');
+
+// A queue hand-off and an unrecorded dispatch are not failures: only the failed
+// state marks the route text.
+assert.equal(rowCells('policyClientFlowRows', 2)[2], 'DECISION:proxy',
+  'a queued delivery keeps the plain route text');
+assert.equal(rowCells('policyClientFlowRows', 3)[2], 'DECISION:direct',
+  'an unrecorded dispatch keeps the plain route text');
+
+// Nothing from the removed columns may be rendered as cell text: the dispatch and
+// return evidence lives in the route cell tooltip only.
+const removedText = ['ROUTE ', 'OUTCOME', 'RETURN', 'DEVICE ', 'written_to_wan',
+  'direct_egress_unavailable', 'backend_queue_full'];
+Array.from(w.document.getElementById('policyClientFlowRows').children).forEach((row, index) => {
+  Array.from(row.children).forEach(cell => {
+    removedText.forEach(marker => {
+      assert.equal(cell.textContent.indexOf(marker), -1,
+        'row ' + index + ' must not render the removed evidence as ' + marker);
+    });
   });
 });
 assert.ok(rowCells('policyClientFlowRows', 0).indexOf('active') === -1,
