@@ -1,4 +1,4 @@
-name: DEV Server E2E Verification
+name: Lifecycle E2E Verification
 
 'on':
   push:
@@ -21,8 +21,12 @@ concurrency:
 
 jobs:
   e2e-dev:
-    name: DEV Server E2E Verification
-    runs-on: [ self-hosted, linux, arm64, dev ]
+    name: Lifecycle E2E Verification
+    # GitHub-hosted runner: the gate deploys the panel and its data plane on the
+    # runner itself, so it needs no reachability to a lab host. The four-core ARM
+    # SBC that used to host it stalled under load and produced false failures
+    # (issue 928), and hosted minutes are free for a public repository.
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       # internal/vpn does not compile without this tag (tags_guard.go enforces
@@ -74,7 +78,14 @@ jobs:
         run: |
           docker rm -f amnezia-awg2 2>/dev/null || true
           sudo ip link del awg0 2>/dev/null || true
-          cd ~ && docker compose down -v
+          cd ~ && docker compose down -v 2>/dev/null || true
+          # A hosted runner begins with no compose file, so seed the canonical
+          # deployment rather than assuming one exists. On a host that already
+          # has one, this leaves it alone.
+          if [ ! -f ~/docker-compose.yaml ]; then
+            cp "${GITHUB_WORKSPACE}/.github/e2e/docker-compose.yaml" ~/docker-compose.yaml
+            echo "Seeded ~/docker-compose.yaml from .github/e2e/docker-compose.yaml"
+          fi
           PR_TAG="pr-${{ github.event.pull_request.number || 'manual' }}"
           sed -i "s|image: ghcr.io/devops-igor/amnezia-nexus:.*|image: ghcr.io/devops-igor/amnezia-nexus:${PR_TAG}|" ~/docker-compose.yaml
           cat << EOF > ~/docker-compose.override.yaml
@@ -199,10 +210,29 @@ jobs:
           chmod 600 ~/.ssh/authorized_keys ~/.ssh/id_ed25519
           chmod 644 ~/.ssh/id_ed25519.pub
           chmod 700 ~/.ssh
+          # The onboarding tests add a server over SSH at the bridge gateway
+          # (172.17.0.1:22). A prepared lab machine already runs sshd; a hosted
+          # runner does not, so provision it rather than assuming it.
+          if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openssh-server
+          fi
+          sudo mkdir -p /run/sshd
+          sudo systemctl start ssh 2>/dev/null || sudo service ssh start 2>/dev/null || sudo /usr/sbin/sshd
+          for i in $(seq 1 15); do
+            (echo > /dev/tcp/172.17.0.1/22) >/dev/null 2>&1 && break
+            sleep 1
+          done
+          if ! (echo > /dev/tcp/172.17.0.1/22) >/dev/null 2>&1; then
+            echo "Error: no SSH daemon reachable at 172.17.0.1:22; the onboarding tests cannot run." >&2
+            exit 1
+          fi
+          echo "SSH daemon reachable at 172.17.0.1:22"
           E2E_BASE_URL="http://127.0.0.1:8443" \
           E2E_ADMIN_USER="admin" \
           E2E_ADMIN_PASS="AdminE2EPass123!" \
           E2E_SERVER_HOST="172.17.0.1" \
+          E2E_SERVER_SSH_USER="${USER}" \
           E2E_SERVER_SSH_KEY="${HOME}/.ssh/id_ed25519" \
           E2E_TESTING="true" \
           E2E_REQUIRE_DATAPLANE="true" \
@@ -245,9 +275,16 @@ jobs:
           # Ensure functional awg CLI tool is available
           if ! awg --version >/dev/null 2>&1; then
             echo "Installing functional awg CLI tool and musl runtime..."
-            if [ ! -f /lib/ld-musl-aarch64.so.1 ]; then
-              sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20261116-1 /lib/ld-musl-aarch64.so.1 | sudo tee /lib/ld-musl-aarch64.so.1 >/dev/null
-              sudo chmod 755 /lib/ld-musl-aarch64.so.1
+            # The image is musl-built, so the CLI needs the loader for the
+            # runner's architecture. Resolve it rather than assuming aarch64.
+            case "$(uname -m)" in
+              aarch64|arm64) MUSL_LOADER=/lib/ld-musl-aarch64.so.1 ;;
+              x86_64|amd64)  MUSL_LOADER=/lib/ld-musl-x86_64.so.1 ;;
+              *) echo "Unsupported architecture for the awg CLI tool: $(uname -m)" >&2; exit 1 ;;
+            esac
+            if [ ! -f "$MUSL_LOADER" ]; then
+              sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20261116-1 "$MUSL_LOADER" | sudo tee "$MUSL_LOADER" >/dev/null
+              sudo chmod 755 "$MUSL_LOADER"
             fi
             sudo docker run --rm --entrypoint cat devopsigor/amneziawg:v3.1.20261116-1 /usr/local/bin/awg | sudo tee /usr/local/bin/awg >/dev/null
             sudo chmod 755 /usr/local/bin/awg
@@ -365,12 +402,14 @@ jobs:
           docker rm -f amnezia-awg2 2>/dev/null || true
           sudo ip link del awg0 2>/dev/null || true
           echo "==> Stopping PR container and wiping volume..."
-          cd ~ && docker compose down -v
+          cd ~ && docker compose down -v 2>/dev/null || true
           echo "==> Removing override file..."
           rm -f ~/docker-compose.override.yaml
-          echo "==> Resetting ~/docker-compose.yaml to default production image and cleaning legacy lines..."
-          sed -i 's|image: ghcr.io/devops-igor/amnezia-nexus:.*|image: ghcr.io/devops-igor/amnezia-nexus:latest|' ~/docker-compose.yaml
-          sed -i '/E2E_TESTING/d' ~/docker-compose.yaml
+          if [ -f ~/docker-compose.yaml ]; then
+            echo "==> Resetting ~/docker-compose.yaml to default production image and cleaning legacy lines..."
+            sed -i 's|image: ghcr.io/devops-igor/amnezia-nexus:.*|image: ghcr.io/devops-igor/amnezia-nexus:latest|' ~/docker-compose.yaml
+            sed -i '/E2E_TESTING/d' ~/docker-compose.yaml
+          fi
           echo "==> Pruning Docker system (containers, images, build cache, volumes)..."
           docker system prune -af --volumes
           echo "==> Cleaning up Python E2E virtual environment..."

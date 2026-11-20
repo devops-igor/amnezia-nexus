@@ -727,7 +727,7 @@ assert.equal(text('policyInventoryAge'), '200 d / max 180 · policy_inventory_st
 
 // TestPolicyRoutingControllerInventoryUnusable keeps the broken-artifact case
 // visible: an operator who sees an empty grid cannot tell "no data" from "the set
-// is broken and every destination is proxied".
+// is broken and address-based direct routing is unavailable".
 func TestPolicyRoutingControllerInventoryUnusable(t *testing.T) {
 	runPolicyControllerScenario(t, `
 responder = async (url) => {

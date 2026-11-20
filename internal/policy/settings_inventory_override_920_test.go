@@ -2,6 +2,7 @@ package policy
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -65,6 +66,7 @@ func TestSettingsAcceptsAValidInventoryOverride(t *testing.T) {
 func TestSettingsRejectsAnUnusableInventoryOverride(t *testing.T) {
 	cases := map[string][]string{
 		"no_prefix_only_domains": {"example.com", "example.org"},
+		"prefix_and_domain":      {"203.0.113.0/24", "example.com"},
 		"mistyped_address":       {"203.0.113.0/24", "203.0.113.999"},
 		"bare_token":             {"not-a-prefix"},
 		"ipv6_only":              {"2001:db8::/32"},
@@ -89,6 +91,35 @@ func TestSettingsRejectsAnUnusableInventoryOverride(t *testing.T) {
 	}
 	if err := settingsWithOverride(t, tooMany...).Validate(); err == nil {
 		t.Fatal("Settings.Validate accepted an override past the entry cap")
+	}
+}
+
+// A mixed body that also carries a usable prefix is the case an accepted override
+// could not express: the prefix classified, the domain was counted as ignored and
+// no surface ever reported it, so the saved field read as fully applied. The
+// settings boundary refuses it with a named reason, while the library parser keeps
+// accepting mixed input for any other consumer.
+func TestSettingsRejectsPrefixAndDomainWithANamedReason(t *testing.T) {
+	entries := []string{"203.0.113.0/24", "example.com"}
+
+	err := settingsWithOverride(t, entries...).Validate()
+	if err == nil {
+		t.Fatalf("Settings.Validate accepted %v", entries)
+	}
+	if !errors.Is(err, ErrInventoryOverrideNotPrefixOnly) {
+		t.Fatalf("refusal = %v, want ErrInventoryOverrideNotPrefixOnly", err)
+	}
+	if !strings.Contains(err.Error(), "1 domain rule") {
+		t.Fatalf("refusal does not name the domain rule it would never apply: %v", err)
+	}
+
+	override, parseErr := ParseInventoryOverride([]byte(strings.Join(entries, "\n")))
+	if parseErr != nil {
+		t.Fatalf("ParseInventoryOverride rejected the mixed body it still supports: %v", parseErr)
+	}
+	if override.PrefixCount() != 1 || override.DomainRuleCount() != 1 {
+		t.Fatalf("library parse = %d prefixes / %d domain rules, want 1 / 1",
+			override.PrefixCount(), override.DomainRuleCount())
 	}
 }
 
