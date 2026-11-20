@@ -132,7 +132,7 @@ The DEV runner is a single self-hosted machine. A suite belongs on it only when 
 | --- | --- | --- |
 | Hosted, panel-only | `Hosted Browser E2E (panel-only, no DEV)` in `ci.yml` | `test_auth.py`, `test_settings.py` |
 | Hosted, static fixture | `CSS Differential` in `css-differential.yml` | `test_css_differential.py` |
-| Live DEV, ARM64 | `DEV Server E2E Verification` in `e2e-dev.yml` | `test_setup.py`, `test_onboard.py`, `test_users.py`, `test_connections.py`, `test_my_connections.py`, `test_multiprotocol_clients.py`, `test_share.py`, `test_servers.py`, `test_vpn_diagnostics.py`, `test_traffic.py`, `test_multiprotocol_server.py` |
+| Hosted lifecycle (ephemeral) | `Lifecycle E2E Verification` in `e2e-dev.yml` | `test_setup.py`, `test_onboard.py`, `test_users.py`, `test_connections.py`, `test_my_connections.py`, `test_multiprotocol_clients.py`, `test_share.py`, `test_servers.py`, `test_vpn_diagnostics.py`, `test_traffic.py`, `test_multiprotocol_server.py` |
 
 The machine-readable version is [`runner_map.toml`](runner_map.toml), and [`tests/test_e2e_runner_map.py`](../../tests/test_e2e_runner_map.py) enforces it: every suite must be assigned exactly once, each runner must actually select the paths it claims, the DEV script may not also run a hosted suite, and a hosted suite may not acquire a live-only dependency (`E2E_SERVER_HOST`, `E2E_REQUIRE_DATAPLANE`, the provisioning or install-failure helpers).
 
