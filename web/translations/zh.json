@@ -244,7 +244,7 @@
   "prepare_host": "准备环境...",
   "prev_page": "← 上一页",
   "profile_locked": "已锁定配置: {}",
-  "profile_regenerate_notice": "在面板停止为客户端提供 DNS 之前生成的配置可能仍指向旧的解析器。一旦该解析器停止响应，设备会失去 DNS 且没有任何提示。重新下载配置即可替换为可用的配置。",
+  "profile_regenerate_notice": "在面板停止为客户端提供 DNS 之前生成的配置可能仍指向旧的解析器，一旦该解析器停止响应，设备就会失去 DNS。请下载更新后的配置，导入到 VPN 客户端，替换旧配置后重新连接。",
   "protocol_label": "协议",
   "protocols": "协议",
   "public_link_label": "公开链接",

@@ -244,7 +244,7 @@
   "prepare_host": "Préparation de l'hôte...",
   "prev_page": "← Retour",
   "profile_locked": "Profil verrouillé: {}",
-  "profile_regenerate_notice": "Un profil généré avant que le panneau ne cesse de fournir le DNS aux clients peut encore désigner l'ancien résolveur. Dès que ce résolveur cesse de répondre, l'appareil perd le DNS sans avertissement. Télécharger à nouveau le profil le remplace par un profil fonctionnel.",
+  "profile_regenerate_notice": "Un profil généré avant que le panneau ne cesse de fournir le DNS aux clients peut encore désigner l'ancien résolveur : l'appareil perd le DNS dès qu'il cesse de répondre. Téléchargez la configuration à jour, importez-la dans le client VPN, remplacez l'ancien profil, puis reconnectez-vous.",
   "protocol_label": "Protocole",
   "protocols": "Protocoles",
   "public_link_label": "Lien public",

@@ -244,7 +244,7 @@
   "prepare_host": "Preparing host...",
   "prev_page": "← Back",
   "profile_locked": "Profile locked: {}",
-  "profile_regenerate_notice": "A profile generated before the panel stopped providing client DNS may still name the old resolver. Once that resolver stops answering, the device loses DNS with no warning. Downloading the profile again replaces it with a working one.",
+  "profile_regenerate_notice": "A profile generated before the panel stopped providing client DNS may still name the old resolver, so the device loses DNS once it stops answering. Download the updated configuration, import it into the VPN client, replace the old profile, then reconnect.",
   "protocol_label": "Protocol",
   "protocols": "Protocols",
   "public_link_label": "Public link",

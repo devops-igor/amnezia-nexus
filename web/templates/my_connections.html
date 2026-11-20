@@ -175,13 +175,12 @@
                     <button class="btn btn-secondary btn-sm" onclick="UI.copy(currentConfig, this)" style="flex:1">
                         <svg class="icon"><use href="#icon-copy"></use></svg> {{ _ "copy_config" }}
                     </button>
-                    <button class="btn btn-primary btn-sm"
-                        onclick="UI.downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1"
-                        aria-describedby="profileRegenerateNotice">
+                    <button class="btn btn-primary btn-sm" id="profileDownloadBtn"
+                        onclick="UI.downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1">
                         <svg class="icon"><use href="#icon-download"></use></svg> {{ _ "download_conf" }}
                     </button>
                 </div>
-                <p class="form-hint" id="profileRegenerateNotice" style="color: var(--text-secondary);">{{ _ "profile_regenerate_notice" }}</p>
+                <p class="form-hint" id="profileRegenerateNotice" hidden style="color: var(--text-secondary);">{{ _ "profile_regenerate_notice" }}</p>
             </div>
         </div>
 
@@ -302,6 +301,22 @@
     const availableServers = {{ .servers | json }};
     const initialConnections = {{ .connections | json }};
 
+    // The statement about the panel's old resolver concerns AmneziaWG profiles
+    // only: the other protocols never carried the gateway resolver, so the
+    // notice would be false for them. The protocol argument is the one the
+    // server renders on the row and the create response returns, so this is the
+    // single place the decision is made. Visibility and the description link
+    // are set together, so aria-describedby never points at a hidden paragraph.
+    function syncProfileNotice(proto) {
+        const notice = document.getElementById('profileRegenerateNotice');
+        const downloadBtn = document.getElementById('profileDownloadBtn');
+        const show = (proto || '').toLowerCase() === 'awg';
+        if (notice) notice.hidden = !show;
+        if (!downloadBtn) return;
+        if (show) downloadBtn.setAttribute('aria-describedby', 'profileRegenerateNotice');
+        else downloadBtn.removeAttribute('aria-describedby');
+    }
+
     async function showMyConfig(connectionId, name, proto) {
         try {
             UI.toast(_('loading_connections'), 'info');
@@ -316,6 +331,7 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
 
                 currentProto = proto || '';
+                syncProfileNotice(currentProto);
                 const isNoVpnKey = (currentProto === 'telemt' || currentProto === 'naive');
                 const vpnTab = document.getElementById('configTabVpn') || document.querySelectorAll('.config-tab')[1];
                 const panelVpn = document.getElementById('panel-vpn');
@@ -671,6 +687,7 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
 
                 currentProto = proto || '';
+                syncProfileNotice(currentProto);
                 const isNoVpnKey = (currentProto === 'telemt' || currentProto === 'naive');
                 const vpnTab = document.getElementById('configTabVpn') || document.querySelectorAll('.config-tab')[1];
                 const panelVpn = document.getElementById('panel-vpn');
