@@ -1120,7 +1120,7 @@
   "policy_client_backend_write_fmt": "périphérique : {ok} écrits / {failed} en échec",
   "policy_client_failure_backend_write_failed": "échec d’écriture sur le périphérique",
   "policy_client_failure_short_write": "le périphérique a écrit une trame partielle",
-  "policy_client_return_chain_fmt": "retour : apparié {matched} · en file {admitted} · remis {delivered} · en échec {failed}",
+  "policy_client_return_chain_fmt": "retour : apparié {matched} · en file {admitted} · remis {delivered} · en échec {failed} · abandonnés {dropped}",
   "policy_client_route_outcome_fmt": "{route} · envoi {dispatch}",
   "policy_client_route_failed_backend_write": "échec d’écriture vers le backend",
   "policy_client_route_failed_return": "échec de livraison du retour",

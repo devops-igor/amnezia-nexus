@@ -1120,7 +1120,7 @@
   "policy_client_backend_write_fmt": "устройство: {ok} записано / {failed} с ошибкой",
   "policy_client_failure_backend_write_failed": "ошибка записи на устройство",
   "policy_client_failure_short_write": "устройство записало неполный пакет",
-  "policy_client_return_chain_fmt": "ответ: совпало {matched} · в очереди {admitted} · доставлено {delivered} · с ошибкой {failed}",
+  "policy_client_return_chain_fmt": "ответ: совпало {matched} · в очереди {admitted} · доставлено {delivered} · с ошибкой {failed} · отброшено {dropped}",
   "policy_client_route_outcome_fmt": "{route} · отправка {dispatch}",
   "policy_client_route_failed_backend_write": "ошибка записи на бэкенд",
   "policy_client_route_failed_return": "ошибка доставки ответа",

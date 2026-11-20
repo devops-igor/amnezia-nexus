@@ -123,7 +123,7 @@ w._ = key => {
   if (key === 'policy_client_filter_none') return 'NO MATCH "{term}"';
   if (key === 'policy_client_return_authority_current_tuple_association') return 'RETURN_AUTHORITY:current_tuple_association';
   if (key === 'policy_client_return_chain_fmt')
-    return 'RET returned {matched}/{admitted}/{delivered}/{failed}';
+    return 'RET returned {matched}/{admitted}/{delivered}/{failed}/{dropped}';
   if (key === 'policy_client_dns_events_coverage') return 'EVENTS-COVERAGE {stored}/{collapsed}/{evicted}/{aged}';
   if (key === 'policy_client_dns_events_truncated') return 'EVENTS-TRUNC {shown}/{total}';
   if (key === 'policy_client_delivered_yes') return 'DELIVERED';
@@ -647,7 +647,7 @@ assert.equal(none[3], 'DECISION_REASON:no_trusted_evidence',
 assert.equal(none[2], 'DECISION:proxy (FAILED:backend-write, FAILED:return)',
   'every producer that recorded a failure is marked by name');
 assert.equal(rowCellTitles('policyClientFlowRows', 1)[2],
-  'DISPATCH:queued_to_backend · FAILED:backend-write · FAILURE:backend_write_failed · DEVICE 2/1 · FAILED:return · FAILURE:client_queue_full · RET returned 4/3/2/1',
+  'DISPATCH:queued_to_backend · FAILED:backend-write · FAILURE:backend_write_failed · DEVICE 2/1 · FAILED:return · FAILURE:client_queue_full · RET returned 4/3/2/1/0',
   'the tooltip names each failing producer with its reason and its counts');
 
 const unrecorded = rowCells('policyClientFlowRows', 2);
@@ -663,6 +663,95 @@ assert.equal(clean[2], 'DECISION:proxy',
   'a proxy flow whose writes and return delivery recorded no failure keeps the plain route');
 assert.equal(rowCellTitles('policyClientFlowRows', 3)[2], 'DISPATCH:queued_to_backend',
   'its tooltip states the dispatch outcome and no failure');
+`)
+}
+
+// TestPolicyClientDiagRouteCellShowsReturnRefusals pins the return path as its own
+// producer. A reply the panel refused before the client writer is recorded as
+// dropped (queue full, rate limited, size cap, closed path) and one its writer
+// could not deliver as failed; these are different observations, so each marks the
+// route cell and each keeps its own number in the tooltip. The reason the answer
+// recorded is stated once - it is the flow's first refusal - and is never
+// attributed to both counters at once.
+func TestPolicyClientDiagRouteCellShowsReturnRefusals(t *testing.T) {
+	runClientDiagScenario(t, clientTargetsScript+`
+responder = ((base) => async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
+  const answer = await base(url, opts);
+  const flow = (ip, dispatch, forward, back) => ({protocol: 'udp', destination_ip: ip,
+    destination_port: 443, choice: 'PROXY', route_generation: 3,
+    last_seen_age_seconds: 3, expired: false, close_seen: false,
+    decision_time: '2026-11-17T09:09:58Z', decision_reason: 'proxy_cidr_rule',
+    policy_generation: 'gen-1', backend_tunnel_id: 77, dispatch: dispatch,
+    forward: forward, return: back,
+    names: [], names_match: 'none', names_considered: 0, name_candidates: []});
+  const queued = {state: 'queued_to_backend'};
+  const backendOk = {packets: 3, bytes: 180, failed: 0, backend_writes: 3, backend_write_failed: 0};
+  answer.flows.entries = [
+    // A queue refusal: packets dropped before the client writer, none failed.
+    flow('77.88.55.77', queued, backendOk,
+      {evidence: 'observed', authority: 'current_tuple_association',
+       matched: 3, admitted: 0, delivered: 0, failed: 0, dropped: 3,
+       failure: 'client_queue_full'}),
+    // A client-writer failure: nothing dropped, one reply failed in the writer.
+    flow('77.88.55.78', queued, backendOk,
+      {evidence: 'observed', authority: 'current_tuple_association',
+       matched: 2, admitted: 2, delivered: 1, failed: 1, dropped: 0,
+       failure: 'client_write_failed'}),
+    // Both observations in the same flow: two dropped, one failed.
+    flow('77.88.55.79', queued, backendOk,
+      {evidence: 'observed', authority: 'current_tuple_association',
+       matched: 5, admitted: 3, delivered: 2, failed: 1, dropped: 2,
+       failure: 'client_rate_limited'}),
+    // A backend refusal and a return refusal together: both producers are named.
+    flow('77.88.55.80', queued,
+      {packets: 3, bytes: 180, failed: 0, backend_writes: 2, backend_write_failed: 1,
+       backend_write_failure: 'backend_write_failed'},
+      {evidence: 'observed', authority: 'current_tuple_association',
+       matched: 2, admitted: 0, delivered: 0, failed: 0, dropped: 2,
+       failure: 'client_rate_limited'})
+  ];
+  return answer;
+})(responder);
+`, `
+selectClient('sess-a');
+await w.diagnoseSelectedClient();
+await settle();
+assert.equal(rowCount('policyClientFlowRows'), 4, 'every recorded refusal is rendered');
+
+// Dropped only: marked, and the drop reason is stated.
+const dropped = rowCells('policyClientFlowRows', 0);
+assert.equal(dropped[2], 'DECISION:proxy (FAILED:return)',
+  'a return queue refusal marks the route cell as the return producer, not as a backend one');
+assert.equal(dropped[2].indexOf('FAILED:backend-write'), -1,
+  'the return producer never borrows the backend wording');
+assert.equal(rowCellTitles('policyClientFlowRows', 0)[2],
+  'DISPATCH:queued_to_backend · FAILED:return · FAILURE:client_queue_full · RET returned 3/0/0/0/3',
+  'a dropped reply states how many were dropped and why, with the writer failures still zero');
+
+// Failed only: marked, and the writer reason is stated.
+const failedWrite = rowCells('policyClientFlowRows', 1);
+assert.equal(failedWrite[2], 'DECISION:proxy (FAILED:return)',
+  'a client-writer failure marks the route cell as the return producer');
+assert.equal(rowCellTitles('policyClientFlowRows', 1)[2],
+  'DISPATCH:queued_to_backend · FAILED:return · FAILURE:client_write_failed · RET returned 2/2/1/1/0',
+  'a failed write states how many failed and why, with drops still zero');
+
+// Both observations at once: one marker, two numbers, never summed.
+const both = rowCells('policyClientFlowRows', 2);
+assert.equal(both[2], 'DECISION:proxy (FAILED:return)',
+  'both return observations describe one producer, so the cell names it once');
+assert.equal(rowCellTitles('policyClientFlowRows', 2)[2],
+  'DISPATCH:queued_to_backend · FAILED:return · FAILURE:client_rate_limited · RET returned 5/3/2/1/2',
+  'two dropped and one failed stay two numbers in the return chain');
+
+// A backend refusal and a return refusal together: both producers, each by name.
+const twoProducers = rowCells('policyClientFlowRows', 3);
+assert.equal(twoProducers[2], 'DECISION:proxy (FAILED:backend-write, FAILED:return)',
+  'a backend refusal and a return refusal are both marked, in producer order');
+assert.equal(rowCellTitles('policyClientFlowRows', 3)[2],
+  'DISPATCH:queued_to_backend · FAILED:backend-write · FAILURE:backend_write_failed · DEVICE 2/1 · FAILED:return · FAILURE:client_rate_limited · RET returned 2/0/0/0/2',
+  'both producers keep their own reason and counts in one tooltip');
 `)
 }
 

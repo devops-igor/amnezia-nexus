@@ -541,8 +541,11 @@
 
     // routeFailureMarkers names every producer that recorded a failed delivery, in
     // the order the wire states them: the dispatch outcome, the backend device
-    // writes, then the return delivery. A producer with nothing refused contributes
-    // nothing, so the marker count is what the record says, not a guess.
+    // writes, then the return path. A producer with nothing refused contributes
+    // nothing, so the marker count is what the record says, not a guess. The return
+    // path refuses a reply in two different places - before the client writer
+    // (dropped: queue full, rate limited, size cap, closed path) and inside it
+    // (failed) - and either one is a delivery the panel did not make.
     function routeFailureMarkers(flow, state) {
         var markers = [];
         if (state === 'failed') {
@@ -551,10 +554,17 @@
         if (recordedCount(flow.forward, 'backend_write_failed') > 0) {
             markers.push(clientText('policy_client_route_failed_backend_write'));
         }
-        if (recordedCount(flow.return, 'failed') > 0) {
+        if (returnRefused(flow.return)) {
             markers.push(clientText('policy_client_route_failed_return'));
         }
         return markers;
+    }
+
+    // returnRefused reports whether the return path recorded a refusal: a reply
+    // dropped before the client writer, or a writer failure. The two counters are
+    // separate observations and neither is inferred from the other.
+    function returnRefused(back) {
+        return recordedCount(back, 'failed') > 0 || recordedCount(back, 'dropped') > 0;
     }
 
     // routeFailureDetail is the evidence behind the route cell: the dispatch
@@ -577,14 +587,17 @@
                 failed: recordedCount(forward, 'backend_write_failed')
             }));
         }
-        if (recordedCount(back, 'failed') > 0) {
+        if (returnRefused(back)) {
             parts.push(clientText('policy_client_route_failed_return'));
             appendFailureLabel(parts, back.failure);
+            // The chain keeps every return observation in its own slot: a dropped
+            // reply and a failed write are different facts and are never summed.
             parts.push(filledText('policy_client_return_chain_fmt', {
                 matched: recordedCount(back, 'matched'),
                 admitted: recordedCount(back, 'admitted'),
                 delivered: recordedCount(back, 'delivered'),
-                failed: recordedCount(back, 'failed')
+                failed: recordedCount(back, 'failed'),
+                dropped: recordedCount(back, 'dropped')
             }));
         }
         return parts.join(' · ');

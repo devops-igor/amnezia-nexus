@@ -1120,7 +1120,7 @@
   "policy_client_backend_write_fmt": "دستگاه: {ok} نوشته‌شده / {failed} ناموفق",
   "policy_client_failure_backend_write_failed": "خطای نوشتن روی دستگاه",
   "policy_client_failure_short_write": "دستگاه قاب ناقص نوشت",
-  "policy_client_return_chain_fmt": "بازگشت: منطبق {matched} · در صف {admitted} · تحویل {delivered} · ناموفق {failed}",
+  "policy_client_return_chain_fmt": "بازگشت: منطبق {matched} · در صف {admitted} · تحویل {delivered} · ناموفق {failed} · کنارگذاشته {dropped}",
   "policy_client_route_outcome_fmt": "{route} · ارسال {dispatch}",
   "policy_client_route_failed_backend_write": "خطای نوشتن روی بک‌اند",
   "policy_client_route_failed_return": "خطای تحویل پاسخ",
