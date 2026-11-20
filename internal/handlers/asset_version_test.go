@@ -203,14 +203,15 @@ func TestShellsRenderTheCurrentAppVersionOnVersionedAssets(t *testing.T) {
 	shells := []struct {
 		name   string
 		render func(t *testing.T) string
-		// versionedScripts are the script paths that carry a version query today.
+		// versionedScripts are the script paths that carry the release version as
+		// their query today.
 		versionedScripts []string
 	}{
 		{"base.html (layout, via /settings)", func(t *testing.T) string { return renderSettingsPage(t, models.RoleAdmin) },
-			// The layout's own versioned script, then every settings controller. The
-			// page must emit the current version for all of them; the source scan in
-			// TestSettingsTemplatesVersionEveryAsset keeps this list in step with the
-			// templates, so the two checks cannot drift.
+			// The layout's own versioned script, then every settings controller. Each
+			// one's query is the identity the template that loads it declares — the
+			// release version, or the digest of the asset's bytes — so the two checks
+			// read the same templates and cannot drift.
 			append([]string{"/static/js/api.js"}, settingsSurfaceControllers...)},
 		{"login.html", renderLoginPage, []string{"/static/js/api.js"}},
 		{"setup.html", renderSetupPage, nil},
@@ -244,13 +245,22 @@ func TestShellsRenderTheCurrentAppVersionOnVersionedAssets(t *testing.T) {
 					continue
 				}
 				seen[path] = "?" + query
-				if "?"+query != want {
-					t.Errorf("script %s carries %q, want %q", path, "?"+query, want)
+			}
+			// A settings controller is compared with the identity its own template
+			// declares; any other script on the shell must carry the release version.
+			declared := declaredAssetQueries(t)
+			for path, query := range seen {
+				wantQuery, ok := declared[path]
+				if !ok {
+					wantQuery = want
+				}
+				if query != wantQuery {
+					t.Errorf("script %s carries %q, want %q", path, query, wantQuery)
 				}
 			}
 			for _, path := range shell.versionedScripts {
 				if _, ok := seen[path]; !ok {
-					t.Errorf("script %s lost its version query (versioned scripts seen: %v)", path, seen)
+					t.Errorf("script %s lost its cache-identity query (versioned scripts seen: %v)", path, seen)
 				}
 			}
 		})

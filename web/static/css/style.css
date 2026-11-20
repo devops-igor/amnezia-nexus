@@ -3422,3 +3422,33 @@ th.sortable[aria-sort="none"] .sort-icon-desc {
 .settings-section-card .form-input::placeholder {
     color: var(--text-secondary);
 }
+
+/* ===== Per-client flows table: cell disclosure =====
+   The Live flows table holds more fact in a cell than its column can show, and the
+   rest is revealed in place. The cue is a dotted underline plus the pointer cursor,
+   so an operator can tell the text is actionable without colour being the only
+   signal; neither property changes the glyph widths or the row height. */
+.settings-section-card .cell-detail-toggle {
+    cursor: pointer;
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+}
+
+/* The revealed detail reads as a block of its own inside the same cell: smaller
+   secondary text that wraps instead of truncating. --text-secondary is an existing
+   token and clears 4.5:1 on the card and on the row hover in both themes. */
+.settings-section-card .cell-detail {
+    display: block;
+    margin-top: var(--space-xs);
+    font-size: 0.8rem;
+    line-height: 1.4;
+    color: var(--text-secondary);
+    white-space: normal;
+    overflow-wrap: break-word;
+}
+
+/* A collapsed detail must not take space: the block rule above outranks the
+   browser's own [hidden] styling, so the hidden state is stated here as well. */
+.settings-section-card .cell-detail[hidden] {
+    display: none;
+}
