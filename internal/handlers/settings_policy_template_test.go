@@ -71,6 +71,10 @@ var policySectionIDs = []string{
 	"policyInventoryAge",
 	"policyInventoryOverrideStatus",
 	"policyInventoryNotice",
+	"policyCdnSource",
+	"policyCdnCount",
+	"policyCdnEntries",
+	"policyCdnNotice",
 	"policySourceStats",
 }
 
@@ -278,6 +282,10 @@ func TestPolicySectionTranslationKeysInEveryLocale(t *testing.T) {
 		"policy_inventory_age_value", "policy_inventory_stale",
 		"policy_inventory_override_active", "policy_inventory_override_none",
 		"policy_inventory_unusable",
+		// Keys the CDN exclusion block renders at run time (issue #934). They are
+		// chosen by the controller, not written in markup, so a missing dictionary
+		// entry would leave a raw key on the page.
+		"policy_cdn_empty", "policy_cdn_unavailable", "policy_cdn_unusable",
 	} {
 		keys[key] = true
 	}

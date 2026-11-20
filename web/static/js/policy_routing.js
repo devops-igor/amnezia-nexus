@@ -72,6 +72,15 @@
         return root.document.getElementById(id);
     }
 
+    // setPolicyElementText writes one status value and tolerates an absent element,
+    // so a section rendered without a block never throws in the controller.
+    function setPolicyElementText(id, text) {
+        var el = policyElement(id);
+        if (el) {
+            el.textContent = text;
+        }
+    }
+
     function policyRequest(url, options) {
         if (!root.API || typeof root.API.request !== 'function') {
             var err = new Error(policyText('policy_load_failed'));
@@ -458,6 +467,78 @@
         }
     }
 
+    // policyCDNEntryText renders one exclusion the way the list reads: the
+    // provider name, then the autonomous system the classifier matches against.
+    // A missing half is left out rather than filled with a placeholder, so the
+    // line never claims something the server did not send.
+    function policyCDNEntryText(entry) {
+        var provider = entry && entry.provider ? String(entry.provider) : '';
+        var asn = entry && entry.asn ? 'AS' + String(entry.asn) : '';
+        if (provider === '') {
+            return asn;
+        }
+        if (asn === '') {
+            return provider;
+        }
+        return provider + ' · ' + asn;
+    }
+
+    // renderPolicyCDNEntryList fills the exclusion list, distinguishing the three
+    // states a reader must not confuse: a reported empty set (the classifier
+    // excludes nothing), an unreported set (this deployment told us nothing), and
+    // an unusable one (the set exists but cannot be described).
+    function renderPolicyCDNEntryList(entries) {
+        var list = policyElement('policyCdnEntries');
+        if (!list) {
+            return;
+        }
+        while (list.firstChild) {
+            list.removeChild(list.firstChild);
+        }
+        var state = 'policy_cdn_unavailable';
+        if (entries && entries.length === 0) {
+            state = 'policy_cdn_empty';
+        }
+        if (!entries || entries.length === 0) {
+            var placeholder = document.createElement('li');
+            placeholder.className = 'text-muted';
+            placeholder.textContent = policyText(state);
+            list.appendChild(placeholder);
+            return;
+        }
+        entries.forEach(function (entry) {
+            var row = document.createElement('li');
+            row.textContent = policyCDNEntryText(entry);
+            list.appendChild(row);
+        });
+    }
+
+    // renderPolicyCDNNotice states why the set could not be described. It is empty
+    // when there is nothing to report, so a usable set carries no warning.
+    function renderPolicyCDNNotice(cdn) {
+        if (!cdn || !cdn.error) {
+            return '';
+        }
+        return policyText('policy_cdn_unusable') + ' ' + cdn.error;
+    }
+
+    // renderPolicyCDNExclusions states the CDN exclusion set the classifier
+    // consults (issue #934). The allocation block answers "is this address in the
+    // Russian set"; this block answers the rest of the decision — a destination
+    // inside that set is still proxied when its network belongs to a multi-region
+    // CDN. Before it, that half was visible only one flow at a time.
+    //
+    // Every value comes from the server's snapshot, which reads the table the
+    // classifier itself matches against; nothing is restated here.
+    function renderPolicyCDNExclusions(snapshot) {
+        var cdn = snapshot && snapshot.cdn ? snapshot.cdn : null;
+        var entries = cdn && Array.isArray(cdn.entries) ? cdn.entries : null;
+        setPolicyElementText('policyCdnSource', cdn && cdn.source ? cdn.source : '-');
+        setPolicyElementText('policyCdnCount', entries ? policyFormatCount(entries.length) : '-');
+        renderPolicyCDNEntryList(entries);
+        setPolicyElementText('policyCdnNotice', renderPolicyCDNNotice(cdn));
+    }
+
     function renderPolicyStatus(record, status) {
         var snapshot = policyRuntimeSnapshot({ status: status });
         if (snapshot) {
@@ -492,6 +573,7 @@
 
         renderPolicySourceStats(snapshot);
         renderPolicyInventory(snapshot);
+        renderPolicyCDNExclusions(snapshot);
 
         var lastSuccessEl = policyElement('policyLastSuccess');
         if (lastSuccessEl) {

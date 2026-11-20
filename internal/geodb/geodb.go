@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -53,6 +54,51 @@ var KnownCDNASNs = map[uint32]string{
 func IsMultiRegionCDNASN(asn uint32) bool {
 	_, ok := KnownCDNASNs[asn]
 	return ok
+}
+
+// CDNExclusion is one entry of the exclusion set: an autonomous system that
+// belongs to a multi-region anycast provider, so a destination address in that
+// network is proxied even when its allocation would otherwise be routed direct.
+type CDNExclusion struct {
+	ASN      uint32 `json:"asn"`
+	Provider string `json:"provider"`
+}
+
+// CDNExclusionSource names where the exclusion set comes from, so an operator
+// reading a rendered list can tell it apart from a downloaded or operator-edited
+// set. It is the table this package matches against, compiled into the build.
+const CDNExclusionSource = "geodb.KnownCDNASNs"
+
+// ErrCDNExclusionEntryUnusable means an entry of the exclusion table cannot be
+// described to an operator: ASN 0 is not an autonomous system, and a blank
+// provider name does not say which network is excluded.
+var ErrCDNExclusionEntryUnusable = errors.New("CDN exclusion entry is unusable")
+
+// CDNExclusions returns the exclusion set the classifier consults, ordered by
+// ASN, so a surface can report what is in force instead of a copy of it.
+//
+// The entries are read from KnownCDNASNs — the table IsMultiRegionCDNASN matches
+// an ASN against — rather than duplicated here. A second list would drift from
+// the classifier's, and the list an operator read would then be the wrong one.
+// An empty result is not an error: it means the classifier excludes nothing,
+// which the caller must report as such rather than as an absent set.
+func CDNExclusions() ([]CDNExclusion, error) {
+	return cdnExclusions(KnownCDNASNs)
+}
+
+// cdnExclusions projects table into the reportable form. It takes the table as an
+// argument so the unusable-entry rule can be exercised without mutating the
+// package table.
+func cdnExclusions(table map[uint32]string) ([]CDNExclusion, error) {
+	out := make([]CDNExclusion, 0, len(table))
+	for asn, provider := range table {
+		if asn == 0 || strings.TrimSpace(provider) == "" {
+			return nil, fmt.Errorf("%w: AS%d %q", ErrCDNExclusionEntryUnusable, asn, provider)
+		}
+		out = append(out, CDNExclusion{ASN: asn, Provider: provider})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ASN < out[j].ASN })
+	return out, nil
 }
 
 // DefaultGeoDB returns the singleton embedded GeoDB instance.

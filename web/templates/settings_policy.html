@@ -172,6 +172,22 @@
     </div>
     <p class="form-hint" id="policyInventoryNotice"></p>
 
+    <div class="divider settings-divider">{{ _ "policy_cdn_title" }}</div>
+
+    <div class="info-card-grid">
+        <div class="info-card-item">
+            <span class="info-card-label">{{ _ "policy_cdn_source_label" }}</span>
+            <span class="info-card-value font-mono" id="policyCdnSource">-</span>
+        </div>
+        <div class="info-card-item">
+            <span class="info-card-label">{{ _ "policy_cdn_count_label" }}</span>
+            <span class="info-card-value" id="policyCdnCount">-</span>
+        </div>
+    </div>
+    <ul class="form-hint settings-bullets" id="policyCdnEntries"><li class="text-muted">{{ _ "loading" }}</li></ul>
+    <p class="form-hint">{{ _ "policy_cdn_hint" }}</p>
+    <p class="form-hint" id="policyCdnNotice"></p>
+
     <div class="form-group mt-md">
         <span class="form-label">{{ _ "policy_sources_title" }}</span>
         <div id="policySourceStats" class="settings-source-stats"><span class="text-muted">{{ _ "loading" }}</span></div>

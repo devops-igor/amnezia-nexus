@@ -22,6 +22,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/devops-igor/amnezia-nexus/internal/geodb"
 )
 
 // policySectionHTMLForTest renders the shipped partial with the template helpers
@@ -200,14 +202,40 @@ func runPolicyControllerScenario(t *testing.T, prelude, scenario string) {
 	}
 }
 
+// policyCDNPayloadForTest is the CDN exclusion block exactly as the API carries
+// it, built from the table the classifier consults. Feeding the fixture from the
+// real table is what makes the rendering assertions about the shipped set rather
+// than about a copy invented here.
+func policyCDNPayloadForTest(t *testing.T) string {
+	t.Helper()
+	entries, err := geodb.CDNExclusions()
+	if err != nil {
+		t.Fatalf("read the classifier's CDN exclusion set: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("the classifier excludes no CDN network; the rendering fixture would be vacuous")
+	}
+	encoded, err := json.Marshal(map[string]any{
+		"source":  geodb.CDNExclusionSource,
+		"entries": entries,
+	})
+	if err != nil {
+		t.Fatalf("encode the CDN exclusion payload: %v", err)
+	}
+	return string(encoded)
+}
+
 // policyRecordScript is the API double's default answer: a disabled record with
 // a chosen preset, plus the runtime snapshot and counters the status block reads.
-func policyRecordScript(enabled bool, preset string) string {
+func policyRecordScript(t *testing.T, enabled bool, preset string) string {
+	t.Helper()
 	return fmt.Sprintf(`
+const cdn = %s;
 const record = () => ({enabled: %t, preset: '%s', custom_urls: [], sync_interval_seconds: 21600,
   inventory_override: [],
   status: {enabled: %t, preset: '%s', domain_count: 1234, cidr_count: 56, sync_state: 'synced',
            last_success: '2026-11-14T10:00:00Z', last_error: '',
+           cdn: cdn,
            inventory: {source: 'ipdeny', source_url: 'https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone',
                        retrieved_at: '2026-11-19', prefix_count: 8664, override_prefix_count: 0,
                        age_days: 1, max_age_days: 180, stale: false}}});
@@ -216,11 +244,11 @@ responder = async (url, opts) => {
   if (url.endsWith('/stats')) return stats();
   if (url.endsWith('/api/vpn/policy')) return record();
   throw new Error('unexpected ' + (opts.method || 'GET') + ' ' + url);
-};`, enabled, preset, enabled, preset)
+};`, policyCDNPayloadForTest(t), enabled, preset, enabled, preset)
 }
 
 func TestPolicyRoutingControllerInitialRender(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(false, "geoblock"), `
+	runPolicyControllerScenario(t, policyRecordScript(t, false, "geoblock"), `
 assert.equal(toggle(), false, 'the saved record is disabled, so the toggle must be off');
 assert.equal(selectedPreset(), 'geoblock', 'the saved preset must be selected');
 assert.equal(badge().enabled, 'false', 'a disabled record must not render an enabled badge');
@@ -252,7 +280,7 @@ assert.equal(requestsTo('/api/vpn/policy/stats', 'GET').length, 1, 'counters com
 }
 
 func TestPolicyRoutingControllerSaveAccepted(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(false, ""), `
+	runPolicyControllerScenario(t, policyRecordScript(t, false, ""), `
 // The operator picks a preset and toggles the master switch on; the server
 // accepts both.
 responder = async (url, opts) => {
@@ -289,7 +317,7 @@ assert.equal(text('policyDirectDrops'), '1', 'counters are refreshed from the st
 }
 
 func TestPolicyRoutingControllerRefusedEnableIsNotShownEnabled(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(false, "geoblock"), `
+	runPolicyControllerScenario(t, policyRecordScript(t, false, "geoblock"), `
 // The operator asks for enablement; activation is refused (missing direct
 // egress). What the server is running is refreshed by a separate read; the
 // operator's edit stays in the form, marked unsaved.
@@ -334,7 +362,7 @@ assert.equal(text('policyLastError'), 'direct egress is unavailable',
 }
 
 func TestPolicyRoutingControllerRefusedSaveRestoresLastKnownRecord(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(false, "antifilter_domains"), `
+	runPolicyControllerScenario(t, policyRecordScript(t, false, "antifilter_domains"), `
 // The refusal happens and the follow-up status read fails too. The edit stays in
 // the form, marked unsaved, and the last runtime observation stays on screen.
 responder = async (url, opts) => {
@@ -360,7 +388,7 @@ assert.equal(badge().enabled, 'false', 'a failed status read keeps the last runt
 }
 
 func TestPolicyRoutingControllerSyncFailureAndSuccess(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(true, "russia_inside"), `
+	runPolicyControllerScenario(t, policyRecordScript(t, true, "russia_inside"), `
 // 1. The sync fails: the server says why, and the button becomes usable again.
 responder = async (url, opts) => {
   if (url.endsWith('/api/vpn/policy/sync')) {
@@ -417,7 +445,7 @@ assert.equal(text('policyProxyBytes'), '4.00 KiB', 'counters are re-read after a
 }
 
 func TestPolicyRoutingControllerCustomURLPayload(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(false, "custom"), `
+	runPolicyControllerScenario(t, policyRecordScript(t, false, "custom"), `
 // The custom preset is the only one that sends URLs; the list is trimmed and
 // blank lines are dropped. Validation itself stays server-side.
 assert.equal(w.document.getElementById('policyCustomUrlsGroup').style.display, 'block',
@@ -469,7 +497,7 @@ assert.equal(unsavedBadge().text, 'settings_unsaved');
 // and one sync in flight. Disabling the button is not enough on its own: pressing
 // Enter in the form reaches the submit handler while the button is already done.
 func TestPolicyRoutingControllerSingleFlight(t *testing.T) {
-	runPolicyControllerScenario(t, policyRecordScript(false, "geoblock"), `
+	runPolicyControllerScenario(t, policyRecordScript(t, false, "geoblock"), `
 let putCalls = 0;
 let syncCalls = 0;
 const accepted = () => ({status: 'ok', enabled: true, preset: 'geoblock', custom_urls: [],
@@ -746,6 +774,69 @@ assert.equal(text('policyInventoryNotice'), 'policy_inventory_unusable inventory
 `)
 }
 
+// TestPolicyRoutingControllerCDNExclusions covers the CDN exclusion block (issue
+// #934): the section must list the set the classifier actually consults, entry by
+// entry, with the source it was read from. The fixture payload is the real table,
+// so an entry the surface drops is an entry an operator would not see.
+func TestPolicyRoutingControllerCDNExclusions(t *testing.T) {
+	runPolicyControllerScenario(t, policyRecordScript(t, false, "russia_inside"), fmt.Sprintf(`
+const expected = %s;
+const rows = w.document.querySelectorAll('#policyCdnEntries li');
+assert.equal(text('policyCdnSource'), expected.source,
+  'the block must name where the set comes from');
+assert.equal(text('policyCdnCount'), String(expected.entries.length),
+  'the count must be the number of networks the classifier excludes');
+assert.equal(rows.length, expected.entries.length,
+  'every excluded network the server reported must be listed');
+for (let i = 0; i < expected.entries.length; i++) {
+  const entry = expected.entries[i];
+  assert.ok(rows[i].textContent.indexOf(entry.provider) !== -1,
+    'entry ' + i + ' must name its provider, got: ' + rows[i].textContent);
+  assert.ok(rows[i].textContent.indexOf('AS' + entry.asn) !== -1,
+    'entry ' + i + ' must name its ASN, got: ' + rows[i].textContent);
+}
+assert.equal(text('policyCdnNotice'), '', 'a usable set carries no warning');
+`, policyCDNPayloadForTest(t)))
+}
+
+// TestPolicyRoutingControllerCDNExclusionsEmptyAndUnusable keeps the two honest
+// failure shapes apart: a set that is genuinely empty (every CDN destination is
+// proxied) must not read as a set that could not be reported, and the other way
+// round. Neither may be rendered as an invented count.
+func TestPolicyRoutingControllerCDNExclusionsEmptyAndUnusable(t *testing.T) {
+	runPolicyControllerScenario(t, `
+const recordWith = (cdn) => ({enabled: false, preset: 'geoblock', custom_urls: [],
+  sync_interval_seconds: 21600,
+  status: {enabled: false, preset: 'geoblock', domain_count: 0, cidr_count: 0,
+           sync_state: 'disabled', cdn: cdn}});
+let answer = () => recordWith({source: 'geodb.KnownCDNASNs', entries: []});
+responder = async (url) => {
+  if (url.endsWith('/stats')) return {proxy_bytes: 0, direct_bytes: 0, proxy_drops: 0, direct_drops: 0};
+  return answer();
+};
+`, `
+// 1. The set is reported and empty.
+assert.equal(text('policyCdnCount'), '0',
+  'an empty exclusion set has a count of zero, not a blank');
+assert.equal(text('policyCdnEntries'), 'policy_cdn_empty',
+  'an empty set must say that the classifier excludes nothing');
+assert.equal(text('policyCdnNotice'), '', 'an empty set is not an error');
+
+// 2. The set cannot be described: the count is unknown, not zero, and the server
+// reason is shown so the block does not read as "nothing is excluded".
+answer = () => recordWith({source: 'geodb.KnownCDNASNs',
+  error: 'CDN exclusion entry is unusable: AS0 ""'});
+await w.loadPolicySettings();
+await settle();
+assert.equal(text('policyCdnCount'), '-',
+  'an unusable set has no count to report; zero would be a claim the server did not make');
+assert.equal(text('policyCdnEntries'), 'policy_cdn_unavailable',
+  'an unusable set must not render as an empty list');
+assert.equal(text('policyCdnNotice'), 'policy_cdn_unusable CDN exclusion entry is unusable: AS0 ""',
+  'the server reason must be shown, so the failure is diagnosable');
+`)
+}
+
 // TestPolicyRoutingModuleElementIDs guards the wiring between the module and the
 // template: every id the controller looks up must exist in the rendered section.
 func TestPolicyRoutingModuleElementIDs(t *testing.T) {
@@ -755,7 +846,7 @@ func TestPolicyRoutingModuleElementIDs(t *testing.T) {
 	}
 	section := policySectionHTMLForTest(t)
 
-	lookup := regexp.MustCompile(`policyElement\('([A-Za-z0-9_]+)'\)`)
+	lookup := regexp.MustCompile(`(?:policyElement|setPolicyElementText)\('([A-Za-z0-9_]+)'`)
 	matches := lookup.FindAllStringSubmatch(string(module), -1)
 	if len(matches) < 10 {
 		t.Fatalf("found only %d element lookups in the controller; the extraction is wrong", len(matches))
