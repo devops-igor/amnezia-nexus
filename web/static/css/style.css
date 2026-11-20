@@ -3446,3 +3446,9 @@ th.sortable[aria-sort="none"] .sort-icon-desc {
     white-space: normal;
     overflow-wrap: break-word;
 }
+
+/* A collapsed detail must not take space: the block rule above outranks the
+   browser's own [hidden] styling, so the hidden state is stated here as well. */
+.settings-section-card .cell-detail[hidden] {
+    display: none;
+}

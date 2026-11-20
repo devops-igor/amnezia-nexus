@@ -1035,6 +1035,99 @@ assert.equal(rowCount('policyClientFlowRows'), 2, 'the table is rebuilt, not dou
 `)
 }
 
+// TestPolicyClientDiagCellDetailAuthorCascade evaluates the shipped stylesheet the
+// way a browser does for the collapsed state. The controller collapses a region
+// with the hidden attribute, and the browser's own [hidden] rule is user-agent
+// origin: any author declaration on the element beats it. So an author rule that
+// sets display:block on .cell-detail keeps a collapsed region in the layout, and
+// the sheet has to win that cascade back with display:none for [hidden].
+//
+// jsdom cannot answer "did it win?" through computed style - it applies the hidden
+// attribute itself and reports display:none even when the author sheet says block,
+// so that check would pass with the defect present. This test therefore reads the
+// author rules themselves, matches them with the DOM's own selector engine, and
+// asserts which declaration would win by specificity and source order.
+func TestPolicyClientDiagCellDetailAuthorCascade(t *testing.T) {
+	sheet, err := StaticFS.ReadFile("static/css/style.css")
+	if err != nil {
+		t.Fatalf("read style.css: %v", err)
+	}
+	encoded, err := json.Marshal(string(sheet))
+	if err != nil {
+		t.Fatalf("encode stylesheet: %v", err)
+	}
+	runClientDiagScenario(t, clientTargetsScript+`
+responder = ((base) => async (url, opts) => {
+  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
+  return base(url, opts);
+})(responder);
+`, fmt.Sprintf(`
+const style = w.document.createElement('style');
+style.textContent = %s;
+w.document.head.appendChild(style);
+
+const detailHost = w.document.createElement('div');
+detailHost.className = 'card settings-section-card';
+detailHost.innerHTML = '<span class="cell-detail" hidden>collapsed detail</span>'
+  + '<span class="cell-detail">revealed detail</span>';
+w.document.body.appendChild(detailHost);
+const collapsed = detailHost.children[0];
+const revealed = detailHost.children[1];
+
+// Every unconditional author rule that sets display, in source order.
+const displayRules = [];
+Array.from(w.document.styleSheets).forEach(sheet => {
+  Array.from(sheet.cssRules).forEach(rule => {
+    if (!rule.selectorText || !rule.style || !rule.style.display) {
+      return;
+    }
+    displayRules.push({selector: rule.selectorText, display: rule.style.display});
+  });
+});
+assert.ok(displayRules.length > 0, 'the shipped stylesheet exposes its display rules');
+
+// Specificity as the cascade counts it: ids, then classes plus attributes, then
+// element names. The two rules under test differ only by the attribute.
+const specificity = (selector) => {
+  const ids = (selector.match(/#[\w-]+/g) || []).length;
+  const classish = (selector.match(/\.[\w-]+|\[[^\]]+\]|:[a-z-]+/g) || []).length;
+  const elements = (selector.replace(/[#.][\w-]+|\[[^\]]+\]|::?[a-z-]+(\([^)]*\))?/g, ' ')
+    .match(/[a-z][\w-]*/g) || []).length;
+  return [ids, classish, elements];
+};
+const beats = (left, right) => left[0] !== right[0] ? left[0] > right[0]
+  : left[1] !== right[1] ? left[1] > right[1] : left[2] >= right[2];
+const winner = (element) => {
+  let best = null;
+  displayRules.forEach(rule => {
+    if (!element.matches(rule.selector)) {
+      return;
+    }
+    const spec = specificity(rule.selector);
+    if (!best || beats(spec, best.spec)) {
+      best = {spec: spec, selector: rule.selector, display: rule.display};
+    }
+  });
+  return best;
+};
+
+const collapsedWinner = winner(collapsed);
+const revealedWinner = winner(revealed);
+assert.ok(collapsedWinner, 'an author rule decides display for a collapsed cell detail');
+assert.equal(collapsedWinner.display, 'none',
+  'the author rule that wins display for a collapsed cell detail is ' + collapsedWinner.selector
+  + ' (' + collapsedWinner.display + '); the block rule would keep it in the layout');
+assert.ok(collapsedWinner.selector.indexOf('[hidden]') >= 0,
+  'the winning rule is the [hidden] companion, not the block rule');
+assert.equal(revealedWinner.display, 'block',
+  'a revealed cell detail still resolves to the block rule (' + revealedWinner.selector + ')');
+// jsdom applies the hidden attribute itself, so its computed style cannot
+// distinguish the two states; it is asserted only to document that difference.
+assert.equal(w.getComputedStyle(collapsed).display, 'none',
+  'jsdom reports none for both states, which is why the cascade above is the oracle');
+`, string(encoded)))
+}
+
 // TestPolicyClientDiagFlowDestinationNamesOnlyWhenKnown pins the Destination cell:
 // the address the tuple carried, and a name only when a stored answer genuinely
 // names it. A name the client tried without an answer is not a name; when several

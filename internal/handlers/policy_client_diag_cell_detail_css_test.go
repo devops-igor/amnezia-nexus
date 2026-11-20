@@ -72,6 +72,28 @@ func TestPolicyClientDiagCellDetailStyles(t *testing.T) {
 		t.Errorf(".cell-detail uses --text-muted, which does not reach 4.5:1 on the table surfaces "+
 			"(2.95:1 dark, 2.56:1 light):\n%s", detail)
 	}
+
+	// The collapsed state has to be stated by the author sheet too: the block rule
+	// above beats the browser's own [hidden] styling, because an author declaration
+	// wins over the user-agent rule. Without this companion a collapsed region keeps
+	// display:block and can take space in the table.
+	//
+	// This names the missing rule; which author declaration actually wins is checked
+	// in TestPolicyClientDiagCellDetailAuthorCascade, because a cascade is not a
+	// string match. jsdom applies the hidden attribute itself, so a computed-style
+	// check here would pass either way - that is why the cascade lives in the web
+	// package, where the sheet can be evaluated as a browser evaluates it.
+	for _, file := range []string{"static/css/settings.css", "static/css/style.css"} {
+		raw, err := web.StaticFS.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		hiddenRule, _ := cssRule(string(raw), ".settings-section-card .cell-detail[hidden]", 0)
+		if hiddenRule == "" || !strings.Contains(hiddenRule, "display: none") {
+			t.Errorf("%s does not state display: none for .settings-section-card .cell-detail[hidden], "+
+				"so a collapsed detail keeps the block layout:\n%q", file, hiddenRule)
+		}
+	}
 }
 
 // declaresProperty reports whether a declaration block declares exactly this
