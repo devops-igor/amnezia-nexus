@@ -193,7 +193,6 @@ func TestHandleWANReplyRefusesUnsafeOptions(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHostIsolationHarness(t, DirectEgressConfig{})
-			h.allowDirect(remote)
 			dispatchSegmentTestSYN(h, remote)
 			natPort := h.natPort()
 
@@ -226,7 +225,6 @@ func TestHandleWANReplyCWRPlacementDelivered(t *testing.T) {
 	remote := netip.MustParseAddr("93.184.216.34")
 
 	h := newHostIsolationHarness(t, DirectEgressConfig{})
-	h.allowDirect(remote)
 	dispatchSegmentTestSYN(h, remote)
 	natPort := h.natPort()
 

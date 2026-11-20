@@ -10,8 +10,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
 // hostIsolationWANIP is a real local address, so a host socket genuinely competes
@@ -55,6 +53,9 @@ func newHostIsolationHarness(t *testing.T, cfg DirectEgressConfig) *hostIsolatio
 	h.dem = NewDirectEgressManager(cfg, h.fwd)
 	h.fwd.SetDirectEgress(h.dem)
 	h.fwd.SetPBREnabled(true)
+	// Every remote this harness dispatches is treated as an allocation member, so
+	// each flow takes the DIRECT path this fixture exercises.
+	h.fwd.SetDestinationClassifier(newAllDirectTestClassifier())
 	h.cache = newTestRouteCache()
 	h.fwd.SetRouteCache(h.cache)
 	h.capture = newTestCaptureReturnPath()
@@ -66,21 +67,14 @@ func newHostIsolationHarness(t *testing.T, cfg DirectEgressConfig) *hostIsolatio
 	return h
 }
 
-// allowDirect records DIRECT evidence for a remote on the harness session.
-func (h *hostIsolationHarness) allowDirect(remote netip.Addr) {
-	h.cache.Set(h.session, remote, policy.Direct)
-}
-
 // dispatchUDP sends one client UDP packet through the authentic forwarder.
 func (h *hostIsolationHarness) dispatchUDP(remote netip.Addr, dstPort uint16, payload string) error {
-	h.allowDirect(remote)
 	pkt := buildTestIPv4UDPPacket(h.client, remote, 12345, dstPort, []byte(payload))
 	return h.fwd.RouteClientToBackend(h.peerKey, pkt)
 }
 
 // dispatchTCP sends one client TCP packet through the authentic forwarder.
 func (h *hostIsolationHarness) dispatchTCP(remote netip.Addr, dstPort uint16, flags uint8) error {
-	h.allowDirect(remote)
 	pkt := buildTestIPv4TCPPacket(h.client, remote, 12345, dstPort, flags, nil)
 	return h.fwd.RouteClientToBackend(h.peerKey, pkt)
 }

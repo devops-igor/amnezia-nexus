@@ -39,16 +39,19 @@ const (
 	// had; no new decision was taken for that packet.
 	EgressReasonStickyFlow EgressReason = "sticky_flow"
 	// EgressReasonEvidenceDirect means fresh client-scoped DNS evidence made the
-	// destination DIRECT.
+	// destination DIRECT. The decision path no longer produces it: the address
+	// alone decides. It stays defined because a flow recorded before that
+	// change still carries the token.
 	EgressReasonEvidenceDirect EgressReason = "evidence_direct"
 	// EgressReasonProxyCIDRRule means the published policy snapshot's address
 	// rule put the destination on the proxy.
 	EgressReasonProxyCIDRRule EgressReason = "proxy_cidr_rule"
 	// EgressReasonProxyCachedEvidence means the session's own retained PROXY
-	// decision put the destination on the proxy.
+	// decision put the destination on the proxy. Like the evidence_direct token
+	// it is historical only: the decision path no longer produces it.
 	EgressReasonProxyCachedEvidence EgressReason = "proxy_cached_evidence"
-	// EgressReasonNoTrustedEvidence means there was no usable evidence, so the
-	// fail-closed default applied.
+	// EgressReasonNoTrustedEvidence means the destination was uncovered by the
+	// classifier, so the fail-closed default applied.
 	EgressReasonNoTrustedEvidence EgressReason = "no_trusted_evidence"
 	// EgressReasonNonTCPOrUDP means the protocol cannot be NATed directly.
 	EgressReasonNonTCPOrUDP EgressReason = "non_tcp_udp_fallback"

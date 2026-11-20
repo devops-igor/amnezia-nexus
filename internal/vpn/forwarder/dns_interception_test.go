@@ -81,10 +81,10 @@ func TestDNSInterception_ProhibitedDestinationIsNotIntercepted(t *testing.T) {
 	}
 }
 
-// TestDNSInterception_LegacyServesGatewayDNSOnly proves the continuity contract
-// at the forwarder boundary: while policy routing is inactive the installed
-// responder is consulted only for the designated gateway address on port 53.
-// External port 53 keeps its legacy path and never reaches the responder.
+// TestDNSInterception_LegacyServesGatewayDNSOnly proves the dispatch contract at
+// the forwarder boundary: while policy routing is inactive an installed responder
+// is consulted only for the designated gateway address on port 53. External port
+// 53 keeps its legacy path and never reaches the responder.
 func TestDNSInterception_LegacyServesGatewayDNSOnly(t *testing.T) {
 	fwd := NewForwarder(nil, "10.100.0.0/16", 100)
 	fwd.SetPBREnabled(false)

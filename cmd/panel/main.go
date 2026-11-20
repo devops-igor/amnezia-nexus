@@ -177,13 +177,12 @@ func startPersistedPolicyRouting(ctx context.Context, db *database.DB, vpnSvc *v
 		return nil
 	}
 	if !policySettings.Enabled || !cfg.VPNEnabled {
-		// Policy routing stays off, but a client configuration issued while it was
-		// active still names the gateway, so its responder must dial the list the
-		// operator saved instead of the built-in defaults. Without a data plane
-		// there is no responder to configure.
+		// Policy routing stays off. The operator's saved upstream list is still
+		// recorded so a later activation dials it rather than the built-in
+		// defaults. Without a data plane there is nothing to record it on.
 		if cfg.VPNEnabled {
 			if applyErr := vpnSvc.ApplyEffectiveUpstreams(policySettings.EffectiveUpstreams()); applyErr != nil {
-				slog.Warn("Could not apply the persisted upstream DNS list; the continuity responder keeps its previous list", "err", applyErr)
+				slog.Warn("Could not apply the persisted upstream DNS list; the policy resolver keeps its previous list", "err", applyErr)
 			}
 		}
 		// The stored inventory override is reported even while policy routing is
@@ -207,13 +206,11 @@ func startPersistedPolicyRouting(ctx context.Context, db *database.DB, vpnSvc *v
 		// panel reachable. Nothing here rewrites the stored record; the operator's
 		// intent stays available to repair through the API.
 		//
-		// The refused activation did not install a resolver, but configurations
-		// issued while policy routing was active still name the gateway, so the
-		// responder that answers them must dial the saved list rather than the
-		// defaults. It is applied here, before the data plane start installs that
-		// responder.
+		// The refused activation installed no resolver, so the saved list is
+		// recorded for a later activation rather than for a responder that would
+		// answer issued profiles.
 		if applyErr := vpnSvc.ApplyEffectiveUpstreams(policySettings.EffectiveUpstreams()); applyErr != nil {
-			slog.Warn("Could not apply the persisted upstream DNS list after a refused activation; the continuity responder keeps its previous list",
+			slog.Warn("Could not apply the persisted upstream DNS list after a refused activation; the policy resolver keeps its previous list",
 				"err", applyErr)
 		}
 		vpnSvc.ReportPolicyActivationFailure(fmt.Errorf("persisted policy routing could not be activated: %w", startErr))

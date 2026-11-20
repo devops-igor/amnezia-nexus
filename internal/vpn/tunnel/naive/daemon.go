@@ -302,27 +302,44 @@ func (d *Daemon) supervisorLoop() {
 		case <-d.stopSupervisor:
 			return
 		case ev := <-d.procExitCh:
-			d.mu.Lock()
-			if d.stopped || d.cmd == nil || ev.gen != d.cmdGen {
-				d.mu.Unlock()
+			initialDelay, ok := d.observeExit(ev)
+			if !ok {
 				continue
 			}
-			d.cmd = nil
-			if d.cmdCancel != nil {
-				d.cmdCancel()
-				d.cmdCancel = nil
-			}
-			d.socksDialer = nil
-			d.lastErr = errors.New("naive: daemon process exited unexpectedly")
-			initialDelay := d.restartDelay
-			if initialDelay <= 0 {
-				initialDelay = 200 * time.Millisecond
-			}
-			d.mu.Unlock()
-
 			d.runRecovery(initialDelay)
 		}
 	}
+}
+
+// observeExit records a supervised child's exit and reports the delay before the first restart
+// attempt. ok is false for a stale notification: the daemon is already stopped, or the event
+// belongs to a superseded process generation.
+func (d *Daemon) observeExit(ev procExitEvent) (initialDelay time.Duration, ok bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.stopped || d.cmd == nil || ev.gen != d.cmdGen {
+		return 0, false
+	}
+	d.cmd = nil
+	if d.cmdCancel != nil {
+		d.cmdCancel()
+		d.cmdCancel = nil
+	}
+	d.socksDialer = nil
+	// Carry the child's own exit status. A bare "exited unexpectedly" tells an operator
+	// nothing about why the process went away, and it is the only reason the supervisor can
+	// report, because startProcessLocked discards the child's stderr.
+	if ev.err != nil {
+		d.lastErr = fmt.Errorf("naive: daemon process exited unexpectedly: %w", ev.err)
+	} else {
+		d.lastErr = errors.New("naive: daemon process exited unexpectedly")
+	}
+	initialDelay = d.restartDelay
+	if initialDelay <= 0 {
+		initialDelay = 200 * time.Millisecond
+	}
+	return initialDelay, true
 }
 
 func (d *Daemon) runRecovery(initialDelay time.Duration) {

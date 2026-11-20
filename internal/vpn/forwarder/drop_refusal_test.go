@@ -14,9 +14,10 @@ import (
 // drives the real dispatch path and reads the bounded ledger through the same publication
 // fence the other producers use.
 
-// refuseFixture builds a policy-active forwarder whose direct egress has the given limits and
-// a route cache that puts the test destinations on the DIRECT path.
-func refuseFixture(t *testing.T, cfg DirectEgressConfig) (*Forwarder, *testRouteCache, string, string) {
+// refuseFixture builds a policy-active forwarder whose direct egress has the given limits.
+// Its classifier treats every destination as an allocation member, so each flow in these
+// controls takes the DIRECT path where the refusal happens.
+func refuseFixture(t *testing.T, cfg DirectEgressConfig) (*Forwarder, string, string) {
 	t.Helper()
 	fwd := NewForwarder(nil, "10.100.0.0/16", 8)
 	fwd.SetPBREnabled(true)
@@ -26,28 +27,19 @@ func refuseFixture(t *testing.T, cfg DirectEgressConfig) (*Forwarder, *testRoute
 	dem := fwd.DirectEgress()
 	// The manager owns a WAN reader; retire it with the test that created it.
 	t.Cleanup(func() { _ = dem.Close() })
-	cache := newTestRouteCache()
-	fwd.SetRouteCache(cache)
+	fwd.SetDestinationClassifier(newAllDirectTestClassifier())
 	fwd.RegisterSessionWithReturnPath("sess-refuse", "conn-1", "peer-refuse", "10.100.0.7", 31, newTestCaptureReturnPath().path)
 	t.Cleanup(fwd.StopPumps)
-	return fwd, cache, "peer-refuse", "sess-refuse"
-}
-
-// directDecision marks a destination DIRECT in the route cache, which is the client-scoped
-// DNS evidence branch of the real decision.
-func directDecision(cache *testRouteCache, sessionID, dst string) {
-	cache.Set(sessionID, netip.MustParseAddr(dst), 1) // policy.Direct
+	return fwd, "peer-refuse", "sess-refuse"
 }
 
 // TestRefusalSinkFlowTableFull proves a full flow table is recorded per client with the
 // destination that could not be installed.
 func TestRefusalSinkFlowTableFull(t *testing.T) {
-	fwd, cache, peer, sessionID := refuseFixture(t, DirectEgressConfig{
+	fwd, peer, sessionID := refuseFixture(t, DirectEgressConfig{
 		WANDevice: newMockPacketDev(),
 		MaxFlows:  1,
 	})
-	directDecision(cache, sessionID, "93.184.216.20")
-	directDecision(cache, sessionID, "93.184.216.21")
 
 	if err := fwd.RouteClientToBackend(peer, flowClientPacket("10.100.0.7", "93.184.216.20", 50000, 443)); err != nil {
 		t.Fatalf("first direct packet: %v", err)
@@ -76,13 +68,11 @@ func TestRefusalSinkFlowTableFull(t *testing.T) {
 // TestRefusalSinkNATPortExhaustion proves a port-allocation refusal is recorded even though
 // the entry created for it is removed again.
 func TestRefusalSinkNATPortExhaustion(t *testing.T) {
-	fwd, cache, peer, sessionID := refuseFixture(t, DirectEgressConfig{
+	fwd, peer, sessionID := refuseFixture(t, DirectEgressConfig{
 		WANDevice: newMockPacketDev(),
 		MinPort:   50100,
 		MaxPort:   50100,
 	})
-	directDecision(cache, sessionID, "93.184.216.30")
-	directDecision(cache, sessionID, "93.184.216.31")
 
 	if err := fwd.RouteClientToBackend(peer, flowClientPacket("10.100.0.7", "93.184.216.30", 50002, 443)); err != nil {
 		t.Fatalf("first direct packet: %v", err)
@@ -107,9 +97,8 @@ func TestRefusalSinkNATPortExhaustion(t *testing.T) {
 
 // TestRefusalSinkEgressUnavailable proves the pre-entry direct-egress refusal is attributed.
 func TestRefusalSinkEgressUnavailable(t *testing.T) {
-	fwd, cache, peer, sessionID := refuseFixture(t, DirectEgressConfig{WANDevice: newMockPacketDev()})
+	fwd, peer, sessionID := refuseFixture(t, DirectEgressConfig{WANDevice: newMockPacketDev()})
 	fwd.SetDirectEgress(nil) // the decision path has no manager to dispatch through
-	directDecision(cache, sessionID, "93.184.216.40")
 
 	if err := fwd.RouteClientToBackend(peer, flowClientPacket("10.100.0.7", "93.184.216.40", 50004, 443)); err == nil {
 		t.Fatal("a packet was dispatched without a direct-egress manager")
@@ -128,10 +117,9 @@ func TestRefusalSinkEgressUnavailable(t *testing.T) {
 // new producers: the resumed call is made directly, so this does NOT stand in for the
 // real-hook pause control, which is run as an overlay against the dispatch path.
 func TestRefusalSinkIsFencedAfterRetirement(t *testing.T) {
-	fwd, cache, peer, sessionID := refuseFixture(t, DirectEgressConfig{WANDevice: newMockPacketDev()})
+	fwd, peer, sessionID := refuseFixture(t, DirectEgressConfig{WANDevice: newMockPacketDev()})
 	route := fwd.routesByPeer[peer]
 	fwd.SetDirectEgress(nil)
-	directDecision(cache, sessionID, "93.184.216.50")
 
 	if err := fwd.RouteClientToBackend(peer, flowClientPacket("10.100.0.7", "93.184.216.50", 50005, 443)); err == nil {
 		t.Fatal("a packet was dispatched without a direct-egress manager")
@@ -153,8 +141,7 @@ func TestRefusalSinkIsFencedAfterRetirement(t *testing.T) {
 // ledger must not report the same refusal a second time.
 func TestPostEntryWANFailureIsNotDuplicatedInTheLedger(t *testing.T) {
 	// No WAN device: the entry is installed, then the write step refuses.
-	fwd, cache, peer, sessionID := refuseFixture(t, DirectEgressConfig{WANDevice: nil})
-	directDecision(cache, sessionID, "93.184.216.60")
+	fwd, peer, sessionID := refuseFixture(t, DirectEgressConfig{WANDevice: nil})
 
 	err := fwd.RouteClientToBackend(peer, flowClientPacket("10.100.0.7", "93.184.216.60", 50010, 443))
 	if !errors.Is(err, ErrDirectEgressUnavailable) {
@@ -183,12 +170,10 @@ func TestPostEntryWANFailureIsNotDuplicatedInTheLedger(t *testing.T) {
 // capacity is free the same client's next packet installs a flow, while the earlier refusal
 // remains recorded history.
 func TestRefusalSinkRecoversAfterCapacityIsReleased(t *testing.T) {
-	fwd, cache, peer, sessionID := refuseFixture(t, DirectEgressConfig{
+	fwd, peer, sessionID := refuseFixture(t, DirectEgressConfig{
 		WANDevice: newMockPacketDev(),
 		MaxFlows:  1,
 	})
-	directDecision(cache, sessionID, "93.184.216.70")
-	directDecision(cache, sessionID, "93.184.216.71")
 
 	if err := fwd.RouteClientToBackend(peer, flowClientPacket("10.100.0.7", "93.184.216.70", 50011, 443)); err != nil {
 		t.Fatalf("first direct packet: %v", err)

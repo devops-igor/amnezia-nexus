@@ -28,10 +28,9 @@ import (
 // and the packet path records it in the DROP ledger with the producer's reason
 // instead of re-deciding the packet as PROXY. Every other row is decided here.
 //
-// While the DNS evidence subsystem exists, one MIGRATION row is inserted between
-// rows 2 and 3. It is the block marked TEMPORARY below, it is the only place
-// that reads evidence, and deleting it yields the final contract without
-// touching another row.
+// The destination address is the only routing input. Retained DNS evidence is
+// not consulted: the recorded evidence of a flow describes the decision, it
+// does not decide one.
 
 // DestinationClassifier answers what is known about one destination address.
 // policy.AddressClassifier is the production implementation; a nil classifier
@@ -53,12 +52,6 @@ type egressInput struct {
 	// proxyOverride reports an explicit PROXY match from the published policy
 	// snapshot, which today means an operator-supplied address range.
 	proxyOverride bool
-	// migrationEvidence is the client-scoped DNS evidence of the migration
-	// contract. policy.Unknown means "no usable evidence" and leaves the
-	// address classifier to decide.
-	//
-	// TEMPORARY: this field and the block that reads it are the migration row.
-	migrationEvidence policy.Decision
 	// classification is the address classifier's answer for this destination.
 	// The zero value means uncovered, which proxies.
 	classification policy.DestinationClassification
@@ -104,19 +97,6 @@ func decideEgress(in egressInput) egressDecision {
 	// always take a destination off the direct path.
 	if in.proxyOverride {
 		return egressDecision{choice: EgressChoiceProxy, reason: EgressReasonProxyCIDRRule}
-	}
-
-	// MIGRATION ROW — TEMPORARY. While the DNS evidence subsystem exists, the
-	// session's retained evidence sits between the explicit override and the
-	// address classifier: observed PROXY keeps a shared address proxied, and
-	// observed DIRECT still routes direct. Removing this block (and the
-	// migrationEvidence field above) yields the final contract and changes no
-	// other row.
-	switch in.migrationEvidence {
-	case policy.Direct:
-		return egressDecision{choice: EgressChoiceDirect, reason: EgressReasonEvidenceDirect}
-	case policy.Proxy:
-		return egressDecision{choice: EgressChoiceProxy, reason: EgressReasonProxyCachedEvidence}
 	}
 
 	// Row 3 — PROXY: inside the Russian allocation, but the range belongs to a

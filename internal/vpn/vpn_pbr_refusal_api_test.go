@@ -22,10 +22,11 @@ func tightDirectEgress(t *testing.T, f *clientDiagFixture, cfg forwarder.DirectE
 	f.fwd.SetDirectEgress(forwarder.NewDirectEgressManager(cfg, f.fwd))
 }
 
-// directRouteFor marks the destination DIRECT in the fixture's route cache.
+// directRouteFor makes the destination an allocation member of the fixture's
+// address classifier, which is how the packet path decides it DIRECT.
 func directRouteFor(t *testing.T, f *clientDiagFixture, dst string) {
 	t.Helper()
-	f.routeCache.Set(f.sessionID(t), netip.MustParseAddr(dst), 1) // policy.Direct
+	f.direct(t, netip.MustParseAddr(dst))
 }
 
 func diagnosisFor(t *testing.T, f *clientDiagFixture) ClientDiagnosisResponse {

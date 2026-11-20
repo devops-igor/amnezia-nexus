@@ -12,7 +12,6 @@ import (
 	"github.com/devops-igor/amnezia-nexus/internal/models"
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	gatewaydns "github.com/devops-igor/amnezia-nexus/internal/vpn/dns"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
 // These tests cover the #824 slice-1 wiring in this package: the resolver dials
@@ -242,12 +241,18 @@ func TestInitPBRWithoutConfiguredUpstreamsUsesDefaultPair(t *testing.T) {
 			t.Fatalf("live resolver upstream %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
-	// While policy routing is active the client configuration names the gateway
-	// resolver, not the upstream: only the gateway's answers can become routing
-	// evidence. The upstream list therefore drives the resolver alone here.
+	// The client configuration names the external resolvers, never the gateway:
+	// the profile must not depend on a resolver that only exists while policy
+	// routing is active. The upstream list therefore drives the resolver alone.
 	gw := svc.deriveDefaultGatewayDNSIP().String()
-	if dns1, dns2 := svc.clientConfigDNSServers(); dns1 != gw || dns2 != gw {
-		t.Fatalf("active client configuration DNS = (%q, %q), want the gateway %q", dns1, dns2, gw)
+	dns1, dns2 := defaultClientDNSServers()
+	if dns1 == "" || dns2 == "" {
+		t.Fatalf("active client configuration DNS = (%q, %q), want the external resolvers", dns1, dns2)
+	}
+	for _, entry := range []string{dns1, dns2} {
+		if entry == gw {
+			t.Fatalf("active client configuration DNS names the panel resolver %q", entry)
+		}
 	}
 }
 
@@ -335,52 +340,5 @@ func TestApplyLiveUpstreamsWithoutRuntimeIsNoOp(t *testing.T) {
 
 	if err := svc.applyLiveUpstreams(policy.DefaultSettings()); err != nil {
 		t.Fatalf("applyLiveUpstreams with no runtime = %v, want nil", err)
-	}
-}
-
-// TestContinuityResponderUsesConfiguredUpstreams keeps the issued-profile
-// responder on the operator's list instead of a hardcoded provider, so a
-// disabled deployment does not silently fall back to a blocked one. An empty
-// list still yields the effective default pair.
-func TestContinuityResponderUsesConfiguredUpstreams(t *testing.T) {
-	var captured []gatewaydns.ResolverConfig
-	original := newDNSContinuityResolver
-	newDNSContinuityResolver = func(cfg gatewaydns.ResolverConfig) (gatewaydns.Resolver, error) {
-		captured = append(captured, cfg)
-		return &mockPBRResolver{exchange: func(_ context.Context, req *mdns.Msg) (*mdns.Msg, error) {
-			resp := new(mdns.Msg)
-			resp.SetReply(req)
-			return resp, nil
-		}}, nil
-	}
-	t.Cleanup(func() { newDNSContinuityResolver = original })
-
-	svc := &Service{forwarder: forwarder.NewForwarder(nil, "10.100.0.0/16", 8)}
-	t.Cleanup(svc.closeDNSContinuity)
-	gateway := netip.MustParseAddr("10.100.0.1")
-
-	configured := []policy.Upstream{{Address: "9.9.9.9", Port: 53}, {Address: "149.112.112.112", Port: 53}}
-	svc.installDNSContinuityLocked(gateway, configured)
-	if len(captured) != 1 {
-		t.Fatalf("continuity resolver builds = %d, want 1", len(captured))
-	}
-	if len(captured[0].Upstreams) != len(configured) || captured[0].Upstreams[0] != configured[0] {
-		t.Fatalf("continuity resolver upstreams = %v, want %v", captured[0].Upstreams, configured)
-	}
-
-	// Repeating the same install must not rebuild the responder.
-	svc.installDNSContinuityLocked(gateway, configured)
-	if len(captured) != 1 {
-		t.Fatalf("repeated identical install rebuilt the responder: %d builds", len(captured))
-	}
-
-	// An empty list resolves through the effective default pair.
-	svc.installDNSContinuityLocked(gateway, nil)
-	if len(captured) != 2 {
-		t.Fatalf("continuity resolver builds = %d, want 2", len(captured))
-	}
-	defaults := policy.DefaultUpstreams()
-	if len(captured[1].Upstreams) != len(defaults) || captured[1].Upstreams[0] != defaults[0] {
-		t.Fatalf("continuity resolver upstreams = %v, want the default pair %v", captured[1].Upstreams, defaults)
 	}
 }

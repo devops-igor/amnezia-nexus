@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/devops-igor/amnezia-nexus/internal/policy"
@@ -12,6 +13,12 @@ import (
 // switch") is decided where availability is known, so its test drives the packet
 // path instead: TestAllocationClassifiedFlowWithoutEgressDrops in
 // allocation_routing_test.go.
+//
+// The destination address is the whole input. The packet-path tests in
+// allocation_routing_test.go prove that retained DNS evidence cannot change a
+// decision either way; testEgressInputHasNoEvidenceField below keeps that property
+// structural, so a later change cannot quietly reintroduce an evidence input
+// without failing here.
 
 // allocationDirect is the classifier's answer for a member with no CDN exclusion.
 var allocationDirect = policy.DestinationClassification{
@@ -46,29 +53,10 @@ func TestRoutingContractRows(t *testing.T) {
 			wantDrop:   DropReasonProhibitedDestination,
 		},
 		{
-			name: "row 1: a prohibited destination is dropped even when DNS evidence says DIRECT",
-			in: egressInput{
-				prohibitedErr:     ErrProhibitedDestination,
-				migrationEvidence: policy.Direct,
-			},
-			wantChoice: EgressChoiceNone,
-			wantDrop:   DropReasonProhibitedDestination,
-		},
-		{
 			name: "row 2: an explicit operator PROXY override wins over a matching allocation",
 			in: egressInput{
 				proxyOverride:  true,
 				classification: allocationDirect,
-			},
-			wantChoice: EgressChoiceProxy,
-			wantReason: EgressReasonProxyCIDRRule,
-		},
-		{
-			name: "row 2: an explicit operator PROXY override wins over DNS evidence",
-			in: egressInput{
-				proxyOverride:     true,
-				migrationEvidence: policy.Direct,
-				classification:    allocationDirect,
 			},
 			wantChoice: EgressChoiceProxy,
 			wantReason: EgressReasonProxyCIDRRule,
@@ -123,82 +111,19 @@ func TestRoutingContractRows(t *testing.T) {
 	}
 }
 
-// TestMigrationRowIsConfined proves the migration row is one removable block
-// rather than a scattering of evidence handling:
-//
-//   - rows 1 and 2 decide identically whatever the DNS evidence says, so removing
-//     the migration row cannot change them;
-//   - the migration row can only replace the classifier rows (3, 4 and 5);
-//   - with no evidence present the contract is exactly the final one, row by row.
-//
-// The literal removal was exercised separately with `go test -overlay` against a
-// variant without the block: every case below that has no evidence still passes,
-// which is the definition of "the final contract remains".
-func TestMigrationRowIsConfined(t *testing.T) {
-	classifications := []struct {
-		name  string
-		value policy.DestinationClassification
-	}{
-		{"cdn", allocationCDN},
-		{"direct", allocationDirect},
-		{"uncovered", policy.DestinationClassification{}},
+// testEgressInputHasNoEvidenceField makes the removal of the DNS-evidence input
+// structural rather than textual: the contract's inputs are the prohibited
+// verdict, the operator override and the address classification, and nothing
+// else. A reintroduced evidence field fails this control before it can decide a
+// single packet.
+func TestEgressInputHasNoEvidenceField(t *testing.T) {
+	wantFields := []string{"prohibitedErr", "proxyOverride", "classification"}
+	typ := reflect.TypeOf(egressInput{})
+	var got []string
+	for i := 0; i < typ.NumField(); i++ {
+		got = append(got, typ.Field(i).Name)
 	}
-	evidences := []policy.Decision{policy.Unknown, policy.Direct, policy.Proxy}
-
-	for _, classification := range classifications {
-		for _, evidence := range evidences {
-			in := egressInput{classification: classification.value, migrationEvidence: evidence}
-			got := decideEgress(in)
-
-			// Without evidence the classifier's own row must decide.
-			if evidence == policy.Unknown {
-				wantChoice := EgressChoiceProxy
-				wantReason := EgressReasonNoTrustedEvidence
-				if classification.name == "cdn" {
-					wantReason = EgressReasonAllocationCDNExcluded
-				}
-				if classification.name == "direct" {
-					wantChoice = EgressChoiceDirect
-					wantReason = EgressReasonAllocationDirect
-				}
-				if got.choice != wantChoice || got.reason != wantReason || got.dropped() {
-					t.Fatalf("no evidence, %s classification: got %v/%q (dropped=%v), want %v/%q",
-						classification.name, got.choice, got.reason, got.dropped(), wantChoice, wantReason)
-				}
-				continue
-			}
-
-			// With evidence present the evidence row decides, and says so.
-			wantReason := EgressReasonEvidenceDirect
-			wantChoice := EgressChoiceDirect
-			if evidence == policy.Proxy {
-				wantReason = EgressReasonProxyCachedEvidence
-				wantChoice = EgressChoiceProxy
-			}
-			if got.choice != wantChoice || got.reason != wantReason {
-				t.Fatalf("evidence %v, %s classification: got %v/%q, want %v/%q",
-					evidence, classification.name, got.choice, got.reason, wantChoice, wantReason)
-			}
-		}
-	}
-
-	// Rows 1 and 2 are decided above the migration row and must ignore it.
-	for _, evidence := range evidences {
-		if got := decideEgress(egressInput{prohibitedErr: ErrProhibitedDestination, migrationEvidence: evidence}); !got.dropped() {
-			t.Errorf("evidence %v overrode the prohibited-destination DROP: %+v", evidence, got)
-		}
-		if got := decideEgress(egressInput{proxyOverride: true, migrationEvidence: evidence}); got.reason != EgressReasonProxyCIDRRule {
-			t.Errorf("evidence %v overrode the explicit PROXY override: %+v", evidence, got)
-		}
-	}
-}
-
-// TestProxyEvidenceAloneDecidesProxy keeps the retained-PROXY-evidence row
-// meaningful on its own: a destination with no classification at all is still
-// proxied by evidence, with the evidence token rather than the default one.
-func TestProxyEvidenceAloneDecidesProxy(t *testing.T) {
-	got := decideEgress(egressInput{migrationEvidence: policy.Proxy})
-	if got.choice != EgressChoiceProxy || got.reason != EgressReasonProxyCachedEvidence {
-		t.Fatalf("got %v/%q, want PROXY/%q", got.choice, got.reason, EgressReasonProxyCachedEvidence)
+	if !reflect.DeepEqual(got, wantFields) {
+		t.Fatalf("egressInput fields = %v, want %v: the routing decision must take no DNS-evidence input", got, wantFields)
 	}
 }

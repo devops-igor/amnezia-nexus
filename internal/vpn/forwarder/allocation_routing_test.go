@@ -343,6 +343,96 @@ func TestWithoutClassifierAllocationDestinationsStayProxied(t *testing.T) {
 	}
 }
 
+// TestRetainedProxyEvidenceCannotProxyAllocationDestination is one half of the
+// stale-evidence control: the session still holds a retained PROXY decision for
+// an address inside the Russian allocation, and the address must route DIRECT
+// anyway. The retained evidence is present in the same route cache the packet
+// path is configured with, so the only way this passes is that the decision no
+// longer reads it.
+func TestRetainedProxyEvidenceCannotProxyAllocationDestination(t *testing.T) {
+	fwd, dem, wanDev, rc := setupForwarderWithPBR(t)
+	fwd.SetDestinationClassifier(installedClassifier(t))
+
+	const (
+		peerKey   = "peer-stale-proxy"
+		sessionID = "s-stale-proxy"
+		clientIP  = "10.100.0.97"
+		backendID = int64(308)
+	)
+	capPath := newTestCaptureReturnPath()
+	fwd.RegisterSessionWithReturnPath(sessionID, "c-stale-proxy", peerKey, clientIP, backendID, capPath.path)
+
+	target := netip.MustParseAddr("213.180.204.186") // inside 213.180.192.0/19
+	rc.Set(sessionID, target, policy.Proxy)
+	if got := rc.Lookup(sessionID, target); got != policy.Proxy {
+		t.Fatalf("fixture evidence = %v, want the retained PROXY decision under test", got)
+	}
+
+	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), target, 41030, 443, 0x02, nil)
+	if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
+		t.Fatalf("RouteClientToBackend: %v", err)
+	}
+
+	if got := len(wanDev.getPackets()); got != 1 {
+		t.Fatalf("packets written to the direct WAN device = %d, want 1: retained PROXY evidence proxied an allocation address", got)
+	}
+	if got := len(fwd.backendQueues[backendID]); got != 0 {
+		t.Fatalf("packets queued to the proxy backend = %d, want 0: retained PROXY evidence proxied an allocation address", got)
+	}
+	flow := recordedFlow(t, dem, sessionID, target)
+	if flow.Choice != EgressChoiceDirect {
+		t.Fatalf("flow choice = %v, want DIRECT", flow.Choice)
+	}
+	if flow.DecisionReason != EgressReasonAllocationDirect {
+		t.Errorf("decision reason = %q, want %q: the address decided, not the evidence", flow.DecisionReason, EgressReasonAllocationDirect)
+	}
+	if flow.DecisionReason == EgressReasonProxyCachedEvidence || flow.DecisionReason == EgressReasonEvidenceDirect {
+		t.Errorf("decision reason = %q, want an address-based reason", flow.DecisionReason)
+	}
+}
+
+// TestRetainedDirectEvidenceCannotRouteUncoveredDestinationDirect is the other
+// half: the session holds a retained DIRECT decision for an address the
+// classifier does not cover, and the address must still proxy.
+func TestRetainedDirectEvidenceCannotRouteUncoveredDestinationDirect(t *testing.T) {
+	fwd, dem, wanDev, rc := setupForwarderWithPBR(t)
+	fwd.SetDestinationClassifier(installedClassifier(t))
+
+	const (
+		peerKey   = "peer-stale-direct"
+		sessionID = "s-stale-direct"
+		clientIP  = "10.100.0.98"
+		backendID = int64(309)
+	)
+	capPath := newTestCaptureReturnPath()
+	fwd.RegisterSessionWithReturnPath(sessionID, "c-stale-direct", peerKey, clientIP, backendID, capPath.path)
+
+	target := netip.MustParseAddr("147.91.1.1") // Serbia, outside the allocation
+	rc.Set(sessionID, target, policy.Direct)
+	if got := rc.Lookup(sessionID, target); got != policy.Direct {
+		t.Fatalf("fixture evidence = %v, want the retained DIRECT decision under test", got)
+	}
+
+	pkt := buildTestIPv4TCPPacket(netip.MustParseAddr(clientIP), target, 41031, 443, 0x02, nil)
+	if err := fwd.RouteClientToBackend(peerKey, pkt); err != nil {
+		t.Fatalf("RouteClientToBackend: %v", err)
+	}
+
+	if got := len(wanDev.getPackets()); got != 0 {
+		t.Fatalf("packets written direct = %d, want 0: retained DIRECT evidence routed an uncovered address direct", got)
+	}
+	if got := len(fwd.backendQueues[backendID]); got != 1 {
+		t.Fatalf("packets queued to the proxy backend = %d, want 1", got)
+	}
+	flow := recordedFlow(t, dem, sessionID, target)
+	if flow.Choice != EgressChoiceProxy {
+		t.Fatalf("flow choice = %v, want PROXY", flow.Choice)
+	}
+	if flow.DecisionReason != EgressReasonNoTrustedEvidence {
+		t.Errorf("decision reason = %q, want %q: the address decided, not the evidence", flow.DecisionReason, EgressReasonNoTrustedEvidence)
+	}
+}
+
 // TestAllocationClassifiedFlowWithoutEgressDrops is the contract's last row: a
 // DIRECT decision whose required egress is unavailable is a DROP with the
 // producer's reason, never a silent switch to the proxy.

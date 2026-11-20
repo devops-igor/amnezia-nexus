@@ -196,6 +196,11 @@ func TestDNSRuntimeCacheRecovery_OverlappingRetirementKeepsLiveScope(t *testing.
 			f.fwd.SetPolicyMatcher(f.cache.PolicyMatcher())
 			f.fwd.SetGatewayDNSIP(netip.MustParseAddr("10.100.0.1"))
 			f.fwd.AttachBackendDevice(1, &mockPBRDevice{})
+			// The answered address is classified as an allocation member, so the
+			// fresh flow below takes the DIRECT path by address. The DNS answers
+			// are still recorded as evidence (asserted above), they no longer
+			// choose a route.
+			installDirectDestinations(f.fwd, netip.MustParseAddr("93.184.216.34"))
 
 			client := f.start(t)
 			defer client.Close()
