@@ -555,6 +555,10 @@ func TestPBR_DNSGatewayPopulatesRouteCache_DirectEgress(t *testing.T) {
 		t.Fatalf("ConfigurePBR: %v", err)
 	}
 	defer func() { _ = svc.TeardownPBR() }()
+	// The packet path decides by destination address, so the fixture states the
+	// address input. The intercepted answers below are still recorded in the route
+	// cache (assertions 3 and 5), they simply do not route a packet.
+	installDirectDestinations(fwd, exampleIP)
 
 	// 1. Verify UNKNOWN destinations go to proxy backend, never DIRECT
 	unqueriedIP := netip.MustParseAddr("8.8.4.4")
@@ -614,7 +618,8 @@ func TestPBR_DNSGatewayPopulatesRouteCache_DirectEgress(t *testing.T) {
 		t.Fatalf("expected route cache to have Direct for example.com, got %v", got)
 	}
 
-	// 4. Subsequent packets to 93.184.216.34:80 must be dispatched DIRECT to WAN device!
+	// 4. Subsequent packets to 93.184.216.34:80 must be dispatched DIRECT to WAN
+	// device, because that address is inside the allocation.
 	tcpPkt := buildTestPBRTCPPacket(clientIP, exampleIP, 12345, 80, []byte("get-example"))
 	if err := fwd.RouteClientToBackend(peerKey, tcpPkt); err != nil {
 		t.Fatalf("RouteClientToBackend for direct IP failed: %v", err)

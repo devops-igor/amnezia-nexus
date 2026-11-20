@@ -38,10 +38,11 @@ func findFlowEvidence(t *testing.T, flows []ClientDiagnosisFlow, destination str
 // produced, and the return evidence the reply path admitted all reach the wire.
 func TestClientDiagnosisReportsRecordedFlowEvidence(t *testing.T) {
 	f := newClientDiagFixture(t)
+	f.direct(t, f.example)
 	f.queryIP(t, "plain.example", 55001)
 	f.queryIP(t, "proxy.example", 55002)
-	f.sendTCP(t, f.example, 41100, 443) // DIRECT: evidence chose it
-	f.sendTCP(t, f.proxyIP, 41101, 443) // PROXY: cached PROXY evidence chose it
+	f.sendTCP(t, f.example, 41100, 443) // DIRECT: the address is inside the allocation
+	f.sendTCP(t, f.proxyIP, 41101, 443) // PROXY: the address is uncovered
 
 	answer, err := f.svc.ClientDiagnosis(context.Background(), ClientDiagnosisRequest{SessionID: f.sessionID(t)})
 	if err != nil {
@@ -52,8 +53,8 @@ func TestClientDiagnosisReportsRecordedFlowEvidence(t *testing.T) {
 	if direct.Choice != forwarder.EgressChoiceDirect.String() {
 		t.Fatalf("direct flow choice = %q, want DIRECT", direct.Choice)
 	}
-	if direct.DecisionReason != string(forwarder.EgressReasonEvidenceDirect) {
-		t.Errorf("decision reason = %q, want the branch that ran (%q)", direct.DecisionReason, forwarder.EgressReasonEvidenceDirect)
+	if direct.DecisionReason != string(forwarder.EgressReasonAllocationDirect) {
+		t.Errorf("decision reason = %q, want the branch that ran (%q)", direct.DecisionReason, forwarder.EgressReasonAllocationDirect)
 	}
 	if direct.DecisionTime == ClientDiagnosisTokenNotRecorded || direct.DecisionTime == "" {
 		t.Error("decision time must be the recorded instant, not the not_recorded token")
@@ -80,8 +81,8 @@ func TestClientDiagnosisReportsRecordedFlowEvidence(t *testing.T) {
 	}
 
 	proxied := findFlowEvidence(t, answer.Flows.Entries, f.proxyIP.String(), 443)
-	if proxied.DecisionReason != string(forwarder.EgressReasonProxyCachedEvidence) {
-		t.Errorf("proxy decision reason = %q, want the cached-evidence branch", proxied.DecisionReason)
+	if proxied.DecisionReason != string(forwarder.EgressReasonNoTrustedEvidence) {
+		t.Errorf("proxy decision reason = %q, want the uncovered-address branch", proxied.DecisionReason)
 	}
 	if proxied.Dispatch.State != "queued_to_backend" {
 		t.Errorf("proxy dispatch = %+v, want queue acceptance, not a device write", proxied.Dispatch)

@@ -10,7 +10,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/devops-igor/amnezia-nexus/internal/policy"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/virtualtun"
 )
 
@@ -195,7 +194,6 @@ func TestDirectEgress_OversizedTCPReplyReachesTheClientInMTUSizedPieces(t *testi
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHostIsolationHarness(t, DirectEgressConfig{})
-			h.allowDirect(remote)
 			if err := h.fwd.RouteClientToBackend(h.peerKey, buildTestIPv4TCPPacket(h.client, remote, clientPort, remotePort, 0x02, nil)); err != nil {
 				t.Fatalf("client SYN dispatch: %v", err)
 			}
@@ -302,7 +300,6 @@ func TestDirectEgress_UnsupportedOversizedReplyStillRefusedOnce(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHostIsolationHarness(t, DirectEgressConfig{})
-			h.allowDirect(remote)
 			tc.dispatch(h)
 			natPort := h.natPort()
 
@@ -333,7 +330,6 @@ func TestDirectEgress_OversizedReplyKeepsSessionOwnershipChecks(t *testing.T) {
 
 	t.Run("remote_endpoint_mismatch", func(t *testing.T) {
 		h := newHostIsolationHarness(t, DirectEgressConfig{})
-		h.allowDirect(remote)
 		if err := h.fwd.RouteClientToBackend(h.peerKey, buildTestIPv4TCPPacket(h.client, remote, 12345, 80, 0x02, nil)); err != nil {
 			t.Fatalf("client SYN dispatch: %v", err)
 		}
@@ -354,7 +350,6 @@ func TestDirectEgress_OversizedReplyKeepsSessionOwnershipChecks(t *testing.T) {
 
 	t.Run("closed_return_path", func(t *testing.T) {
 		h := newHostIsolationHarness(t, DirectEgressConfig{})
-		h.allowDirect(remote)
 		if err := h.fwd.RouteClientToBackend(h.peerKey, buildTestIPv4TCPPacket(h.client, remote, 12345, 80, 0x02, nil)); err != nil {
 			t.Fatalf("client SYN dispatch: %v", err)
 		}
@@ -427,10 +422,8 @@ func TestDirectEgress_SegmentedReplyPartialFailureIsCountedPerPiece(t *testing.T
 	})
 	fwd.SetDirectEgress(dem)
 	fwd.SetPBREnabled(true)
-	cache := newTestRouteCache()
-	fwd.SetRouteCache(cache)
+	fwd.SetDestinationClassifier(newTestDirectClassifier(remote))
 	fwd.RegisterSessionWithReturnPath("sess", "conn", "peer", client.String(), 1, path)
-	cache.Set("sess", remote, policy.Direct)
 
 	if err := fwd.RouteClientToBackend("peer", buildTestIPv4TCPPacket(client, remote, clientPort, remotePort, 0x02, nil)); err != nil {
 		t.Fatalf("client SYN dispatch: %v", err)

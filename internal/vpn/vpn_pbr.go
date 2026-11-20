@@ -1105,13 +1105,12 @@ func (s *Service) TeardownPBR() error {
 // replacing it, so an address it does not name keeps the committed answer.
 //
 // Both are compiled into the binary, so building this costs no I/O and no
-// network. A failure leaves the classifier uninstalled, which keeps the previous
-// decision path rather than a new one: the retained-DNS-evidence row still
-// decides, and a destination with no usable evidence keeps the fail-safe proxy
-// default. The refusal is logged rather than swallowed, and the
-// inventory's own status field already reports a broken artifact to the
-// operator — "the artifact is broken" and "no address is Russian" must never
-// look the same.
+// network. A failure leaves the classifier uninstalled, and the contract then
+// answers uncovered for every destination: nothing routes DIRECT and every
+// packet keeps the fail-safe proxy default. The refusal is logged rather than
+// swallowed, and the inventory's own status field already reports a broken
+// artifact to the operator — "the artifact is broken" and "no address is
+// Russian" must never look the same.
 func newDestinationClassifier(override *policy.InventoryOverride) forwarder.DestinationClassifier {
 	inventory, err := policy.ShippedInventory()
 	if err != nil {

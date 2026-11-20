@@ -8,8 +8,6 @@ import (
 	"net/netip"
 	"testing"
 	"time"
-
-	"github.com/devops-igor/amnezia-nexus/internal/policy"
 )
 
 // The tests in this file cover the session-isolation rule for a direct-NAT
@@ -62,6 +60,9 @@ func newDirectEgressHarness(t *testing.T, cfg DirectEgressConfig) *sessionQuaran
 	h.dem = NewDirectEgressManager(cfg, h.fwd)
 	h.fwd.SetDirectEgress(h.dem)
 	h.fwd.SetPBREnabled(true)
+	// The harness's single remote is an allocation member, so its flows take the
+	// DIRECT path this fixture exercises.
+	h.fwd.SetDestinationClassifier(newTestDirectClassifier(h.remote))
 	h.cache = newTestRouteCache()
 	h.fwd.SetRouteCache(h.cache)
 	t.Cleanup(func() {
@@ -80,9 +81,6 @@ func (h *sessionQuarantineHarness) register(sessionID string) *testCaptureReturn
 	sink := newTestCaptureReturnPath()
 	h.sinks[sessionID] = sink
 	h.fwd.RegisterSessionWithReturnPath(sessionID, "connection-"+sessionID, h.peerKey, h.client.String(), 1, sink.path)
-	// The retired route's cache scope is released with it; the replacement
-	// session observes fresh DIRECT evidence for the same remote.
-	h.cache.Set(sessionID, h.remote, policy.Direct)
 	return sink
 }
 

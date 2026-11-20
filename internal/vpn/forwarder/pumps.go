@@ -125,7 +125,6 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	cID := route.connectionID
 	backendTraffic := f.backendTraffic[route.backendTunnelID]
 	directEgress := f.directEgress
-	routeCache := f.routeCache
 	policyMatcher := f.policyMatcher
 	classifier := f.destinationClassifier
 	gwDNS := f.gatewayDNSIP
@@ -165,10 +164,9 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 	// input that could ask for DIRECT, so an operator DIRECT override can never
 	// route a prohibited or internal destination.
 	decision := decideEgress(egressInput{
-		prohibitedErr:     ValidateDirectDestination(dstIP, parsed.DstPort, gwDNS),
-		proxyOverride:     policySnapshot != nil && policySnapshot.MatchIPv4(dstIP),
-		migrationEvidence: sessionDNSDecision(routeCache, sID, dstIP),
-		classification:    classification,
+		prohibitedErr:  ValidateDirectDestination(dstIP, parsed.DstPort, gwDNS),
+		proxyOverride:  policySnapshot != nil && policySnapshot.MatchIPv4(dstIP),
+		classification: classification,
 	})
 	if decision.dropped() {
 		f.directDrops.Add(1)
@@ -222,17 +220,6 @@ func (f *Forwarder) routeClientPBR(route *sessionRoute, peerKey string, packet [
 		})
 	}
 	return f.sendToProxyBackend(backend, route, backendTraffic, sID, cID, packet, pktLen)
-}
-
-// sessionDNSDecision returns the session's retained DNS evidence for one
-// destination, or policy.Unknown when no evidence source is configured. It is
-// the read the migration row of the routing contract consumes; it is kept
-// separate so the contract itself stays a pure function of its inputs.
-func sessionDNSDecision(routeCache RouteCache, sessionID string, dstIP netip.Addr) policy.Decision {
-	if routeCache == nil {
-		return policy.Unknown
-	}
-	return routeCache.Lookup(sessionID, dstIP)
 }
 
 // classifyDestination asks the installed address classifier about one
