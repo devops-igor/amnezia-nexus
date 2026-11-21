@@ -4,9 +4,6 @@ import (
 	"strconv"
 	"time"
 
-	mdns "github.com/miekg/dns"
-
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 )
 
@@ -14,9 +11,10 @@ import (
 // store is touched, so every helper can be read as "given these copies and this
 // instant, what does the operator see?".
 //
-// The age vocabulary is the one the dry run already publishes
-// (policy.AgeNotFresh and friends), so an evidence age means the same thing on
-// both endpoints instead of being re-invented here.
+// Only the two surviving sections are rendered here: the live flows the packet
+// path recorded, and the drop ledger. The DNS section this file used to build is
+// gone with its producer and its stores, so no helper below can emit a record,
+// a query event or a correlated name.
 
 // clientDiagnosisTokenRecorded marks a section that was actually read.
 const clientDiagnosisTokenRecorded = "recorded"
@@ -38,16 +36,14 @@ func clientDiagnosisNotCovered() []string {
 		ClientDiagnosisLimitApplication,
 		ClientDiagnosisLimitReturnTupleAssociation,
 		ClientDiagnosisLimitIPv6,
-		ClientDiagnosisLimitEncryptedDNS,
 	}
 }
 
 // clientDiagnosisLimitations lists what this build's own stores still cannot state.
 //
 // It is deliberately short. A fact the panel now records — a flow's decision time and
-// reason, its forwarding and backend-write outcomes, a per-client drop, a name or a
-// query's transport — is not a limitation, and a token claiming otherwise would
-// contradict the row beside it.
+// reason, its forwarding and backend-write outcomes, a per-client drop — is not a
+// limitation, and a token claiming otherwise would contradict the row beside it.
 func clientDiagnosisLimitations() []string {
 	return []string{
 		ClientDiagnosisLimitFlowEvidenceInstall,
@@ -70,70 +66,6 @@ func clientDiagnosisCoverage(fwd *forwarder.Forwarder, now time.Time) ClientDiag
 	}
 }
 
-// clientDiagnosisEmptyDNS is the DNS section this build always returns: no
-// address evidence is retained and no answer or query collector exists, so every
-// member states not_recorded while keeping its shape. The shape stays present so a
-// client never has to distinguish "absent key" from "nothing retained".
-func clientDiagnosisEmptyDNS() ClientDiagnosisDNS {
-	return ClientDiagnosisDNS{
-		Available:        false,
-		State:            ClientDiagnosisTokenNotRecorded,
-		Names:            ClientDiagnosisNamesMatch{Match: ClientDiagnosisNamesNotRecorded, Reason: ClientDiagnosisNamesReasonNotRetained},
-		Records:          []ClientDiagnosisDNSRecord{},
-		RecordsAvailable: false,
-		RecordCoverage:   clientDiagnosisEmptyRecordCoverage(false),
-		EventsAvailable:  false,
-		Events:           []ClientDiagnosisDNSQueryEvent{},
-		EventCoverage: ClientDiagnosisDNSQueryEventCoverage{
-			StartedAt:   "",
-			Limits:      ClientDiagnosisEventLimits{EventsPerSession: dnsledger.MaxEventsPerSession, EventsTotal: dnsledger.MaxEventsTotal, MaxAgeSeconds: int64(dnsledger.MaxRecordAge / time.Second)},
-			NotRecorded: clientDiagnosisDNSRecordGaps(),
-		},
-	}
-}
-
-// clientDiagnosisEmptyRecordCoverage is the coverage block of a section that was
-// not read. Every list stays present so the panel never has to guess a shape.
-func clientDiagnosisEmptyRecordCoverage(available bool) ClientDiagnosisDNSRecordCoverage {
-	coverage := ClientDiagnosisDNSRecordCoverage{
-		Limits: clientDiagnosisRecordLimits(dnsledger.Limits{
-			RecordsPerSession:  dnsledger.MaxRecordsPerSession,
-			RecordsTotal:       dnsledger.MaxRecordsTotal,
-			MaxAgeSeconds:      int64(dnsledger.MaxRecordAge / time.Second),
-			BytesTotal:         dnsledger.MaxBytesTotal,
-			NamesPerRecord:     dnsledger.MaxNamesPerRecord,
-			AddressesPerRecord: dnsledger.MaxAddressesPerRecord,
-		}),
-		NotRecorded: clientDiagnosisDNSRecordGaps(),
-	}
-	if !available {
-		coverage.StartedAt = ""
-	}
-	return coverage
-}
-
-// clientDiagnosisDNSRecordGaps lists what the answer store itself cannot see.
-//
-// It is empty: the facts that used to be listed here — a failed answer, a non-answer
-// query, the transport and the query's receipt instant — are recorded by the terminal
-// query store and shown in the queries table of the same panel. Keeping them here would
-// claim, next to rows that state them, that this build does not record them.
-func clientDiagnosisDNSRecordGaps() []string {
-	return []string{}
-}
-
-// clientDiagnosisRecordLimits renders the collector's bounds.
-func clientDiagnosisRecordLimits(limits dnsledger.Limits) ClientDiagnosisRecordLimits {
-	return ClientDiagnosisRecordLimits{
-		RecordsPerSession:  limits.RecordsPerSession,
-		RecordsTotal:       limits.RecordsTotal,
-		MaxAgeSeconds:      limits.MaxAgeSeconds,
-		BytesTotal:         limits.BytesTotal,
-		NamesPerRecord:     limits.NamesPerRecord,
-		AddressesPerRecord: limits.AddressesPerRecord,
-	}
-}
-
 // clientDiagnosisEmptyFlows is the flow section for a non-live selection.
 func clientDiagnosisEmptyFlows() ClientDiagnosisFlows {
 	return ClientDiagnosisFlows{
@@ -147,27 +79,16 @@ func clientDiagnosisEmptyFlows() ClientDiagnosisFlows {
 type clientDiagnosisReads struct {
 	flows          forwarder.SessionFlowList
 	flowsAvailable bool
-	dnsRecords     dnsledger.SessionSnapshot
-	dnsRecordsRead bool
-	dnsEvents      dnsledger.EventSnapshot
 }
 
 // clientDiagnosisApplyRecords fills the record sections from the copies the read
 // path took. A store that was not consulted keeps its not_recorded default:
 // claiming one this answer never read would be a false statement.
 func clientDiagnosisApplyRecords(out *ClientDiagnosisResponse, reads clientDiagnosisReads, now time.Time) {
-	if reads.dnsRecordsRead {
-		clientDiagnosisApplyDNSRecords(&out.DNS, reads.dnsRecords, now)
-		clientDiagnosisApplyDNSEvents(&out.DNS, reads.dnsEvents, now)
-	}
 	if !reads.flowsAvailable {
 		return
 	}
-	var flowRecords []dnsledger.Record
-	if reads.dnsRecordsRead {
-		flowRecords = reads.dnsRecords.Records
-	}
-	out.Flows = clientDiagnosisFlowsFromSnapshot(reads.flows, flowRecords, reads.dnsRecordsRead, reads.dnsEvents.Events, now)
+	out.Flows = clientDiagnosisFlowsFromSnapshot(reads.flows, now)
 	if !out.Flows.ScanComplete {
 		// The flow listing visits a bounded window of the table, so the record
 		// count is a lower bound. Saying so keeps "total" from being read as an
@@ -176,168 +97,8 @@ func clientDiagnosisApplyRecords(out *ClientDiagnosisResponse, reads clientDiagn
 	}
 }
 
-// clientDiagnosisApplyDNSEvents fills the terminal-query history.
-func clientDiagnosisApplyDNSEvents(section *ClientDiagnosisDNS, snapshot dnsledger.EventSnapshot, now time.Time) {
-	section.EventsAvailable = true
-	section.EventsTotal = snapshot.Total
-	section.EventsTruncated = snapshot.Truncated
-	section.Events = make([]ClientDiagnosisDNSQueryEvent, 0, len(snapshot.Events))
-	for _, event := range snapshot.Events {
-		section.Events = append(section.Events, clientDiagnosisDNSEvent(event))
-	}
-	section.EventCoverage = ClientDiagnosisDNSQueryEventCoverage{
-		StartedAt:         clientDiagnosisTime(snapshot.Stats.StartedAt),
-		EventsStored:      snapshot.Stats.Events,
-		EstimatedBytes:    snapshot.Stats.Bytes,
-		Written:           snapshot.Stats.Written,
-		Collapsed:         snapshot.Stats.Collapsed,
-		EvictedPerSession: snapshot.Stats.EvictedSession,
-		EvictedGlobal:     snapshot.Stats.EvictedGlobal,
-		AgedOut:           snapshot.Stats.AgedOut,
-		RejectedNoRoom:    snapshot.Stats.RejectedNoRoom,
-		Limits: ClientDiagnosisEventLimits{
-			EventsPerSession: snapshot.Limits.EventsPerSession,
-			EventsTotal:      snapshot.Limits.EventsTotal,
-			MaxAgeSeconds:    snapshot.Limits.MaxAgeSeconds,
-		},
-		NotRecorded: clientDiagnosisDNSRecordGaps(),
-	}
-	_ = now
-}
-
-// clientDiagnosisDNSEvent renders one stored terminal query.
-func clientDiagnosisDNSEvent(event dnsledger.Event) ClientDiagnosisDNSQueryEvent {
-	out := ClientDiagnosisDNSQueryEvent{
-		Seq:              event.Seq,
-		Name:             event.Name,
-		QType:            clientDiagnosisQType(event.QType),
-		RCode:            clientDiagnosisRCode(event.RCode),
-		Kind:             event.Kind,
-		Transport:        event.Transport,
-		Delivered:        event.Delivered,
-		Truncated:        event.Truncated,
-		UpstreamError:    event.UpstreamError,
-		ReceivedAt:       clientDiagnosisTime(event.ReceivedAt),
-		AnsweredAt:       clientDiagnosisTime(event.AnsweredAt),
-		IncarnationKnown: event.RouteGenerationKnown,
-		PolicyGeneration: event.PolicyGeneration,
-		Count:            event.Count,
-		FirstSeen:        clientDiagnosisTime(event.FirstSeen),
-		LastSeen:         clientDiagnosisTime(event.LastSeen),
-	}
-	if event.RouteGenerationKnown {
-		generation := event.RouteGeneration
-		out.RouteGeneration = &generation
-	}
-	return out
-}
-
-// clientDiagnosisApplyDNSRecords fills the observed-answer history.
-func clientDiagnosisApplyDNSRecords(section *ClientDiagnosisDNS, snapshot dnsledger.SessionSnapshot, now time.Time) {
-	section.RecordsAvailable = true
-	section.RecordsTotal = snapshot.Total
-	section.RecordsTruncated = snapshot.Truncated
-	section.Records = make([]ClientDiagnosisDNSRecord, 0, len(snapshot.Records))
-	for _, record := range snapshot.Records {
-		section.Records = append(section.Records, clientDiagnosisDNSRecord(record, now))
-	}
-	section.RecordCoverage = ClientDiagnosisDNSRecordCoverage{
-		StartedAt:          clientDiagnosisTime(snapshot.Stats.StartedAt),
-		RecordsStored:      snapshot.Stats.Records,
-		EstimatedBytes:     snapshot.Stats.Bytes,
-		Sessions:           snapshot.Stats.Sessions,
-		Written:            snapshot.Stats.Written,
-		Collapsed:          snapshot.Stats.Collapsed,
-		EvictedPerSession:  snapshot.Stats.EvictedSession,
-		EvictedGlobal:      snapshot.Stats.EvictedGlobal,
-		AgedOut:            snapshot.Stats.AgedOut,
-		RejectedNoRoom:     snapshot.Stats.RejectedNoRoom,
-		WithoutIncarnation: snapshot.Stats.WithoutIncarnate,
-		Limits:             clientDiagnosisRecordLimits(snapshot.Limits),
-		NotRecorded:        clientDiagnosisDNSRecordGaps(),
-	}
-}
-
-// clientDiagnosisDNSRecord renders one stored observation. The state is computed
-// at the sampled instant and the stored record is not touched: an expired record
-// stays in the history and is labeled expired.
-func clientDiagnosisDNSRecord(record dnsledger.Record, now time.Time) ClientDiagnosisDNSRecord {
-	out := ClientDiagnosisDNSRecord{
-		Seq:                  record.Seq,
-		Name:                 record.Name,
-		QType:                clientDiagnosisQType(record.QType),
-		RCode:                clientDiagnosisRCode(record.RCode),
-		Aliases:              []string{},
-		Addresses:            make([]ClientDiagnosisDNSAddress, 0, len(record.Addresses)),
-		ResolvedAddresses:    record.ResolvedAddressCount,
-		ObservedAt:           clientDiagnosisTime(record.ObservedAt),
-		ReceivedAt:           ClientDiagnosisTokenNotRecorded,
-		Transport:            ClientDiagnosisTokenNotRecorded,
-		ExpiresAt:            clientDiagnosisTime(record.ExpiresAt),
-		State:                clientDiagnosisRecordState(record.ExpiresAt, now),
-		PolicyGeneration:     record.PolicyGeneration,
-		IncarnationKnown:     record.RouteGenerationKnown,
-		Classification:       "invalid",
-		ClassificationReason: record.ClassificationReason,
-		CacheWrite:           record.CacheVerdict,
-		Count:                record.Count,
-		FirstSeen:            clientDiagnosisTime(record.FirstSeen),
-		LastSeen:             clientDiagnosisTime(record.LastSeen),
-	}
-	if record.ClassificationValid {
-		out.Classification = "valid"
-		out.ClassificationReason = ""
-	}
-	if record.RouteGenerationKnown {
-		generation := record.RouteGeneration
-		out.RouteGeneration = &generation
-	}
-	if len(record.Aliases) > 0 {
-		out.Aliases = append(out.Aliases, record.Aliases...)
-	}
-	for _, address := range record.Addresses {
-		out.Addresses = append(out.Addresses, ClientDiagnosisDNSAddress{
-			Address:  address.Address.String(),
-			Decision: address.Decision,
-		})
-	}
-	if !record.ExpiresAt.IsZero() {
-		out.ExpiresInSeconds = int64(record.ExpiresAt.Sub(now) / time.Second)
-	}
-	return out
-}
-
-// clientDiagnosisRecordState labels a stored record at the sampled instant.
-func clientDiagnosisRecordState(expiresAt, now time.Time) string {
-	if expiresAt.IsZero() {
-		return ClientDiagnosisTokenNotRecorded
-	}
-	if expiresAt.After(now) {
-		return "active"
-	}
-	return "expired"
-}
-
-// clientDiagnosisQType renders a query type. Only A reaches this boundary today,
-// and an unknown value is reported numerically rather than guessed.
-func clientDiagnosisQType(qtype uint16) string {
-	if name, ok := mdns.TypeToString[qtype]; ok {
-		return name
-	}
-	return "TYPE" + strconv.Itoa(int(qtype))
-}
-
-// clientDiagnosisRCode renders a response code.
-func clientDiagnosisRCode(rcode int) string {
-	if name, ok := mdns.RcodeToString[rcode]; ok {
-		return name
-	}
-	return "RCODE" + strconv.Itoa(rcode)
-}
-
-// clientDiagnosisFlowsFromSnapshot renders the live-flow section, correlating each
-// destination with the session's retained DNS answers.
-func clientDiagnosisFlowsFromSnapshot(list forwarder.SessionFlowList, records []dnsledger.Record, recordsRead bool, events []dnsledger.Event, now time.Time) ClientDiagnosisFlows {
+// clientDiagnosisFlowsFromSnapshot renders the live-flow section.
+func clientDiagnosisFlowsFromSnapshot(list forwarder.SessionFlowList, now time.Time) ClientDiagnosisFlows {
 	out := ClientDiagnosisFlows{
 		Available:    true,
 		State:        clientDiagnosisTokenRecorded,
@@ -348,15 +109,15 @@ func clientDiagnosisFlowsFromSnapshot(list forwarder.SessionFlowList, records []
 		Entries:      make([]ClientDiagnosisFlow, 0, len(list.Flows)),
 	}
 	for _, flow := range list.Flows {
-		out.Entries = append(out.Entries, clientDiagnosisFlow(flow, records, recordsRead, events, now))
+		out.Entries = append(out.Entries, clientDiagnosisFlow(flow, now))
 	}
 	return out
 }
 
 // clientDiagnosisFlow renders one flow record. DecisionTime, DecisionReason and
-// the name match are stated as unknown rather than derived from lastSeen or
-// from the current policy.
-func clientDiagnosisFlow(flow forwarder.SessionFlow, records []dnsledger.Record, recordsRead bool, events []dnsledger.Event, now time.Time) ClientDiagnosisFlow {
+// the policy generation are stated as unknown rather than derived from lastSeen
+// or from the current policy.
+func clientDiagnosisFlow(flow forwarder.SessionFlow, now time.Time) ClientDiagnosisFlow {
 	out := ClientDiagnosisFlow{
 		Protocol:        clientDiagnosisProtocol(flow.Protocol),
 		ClientSrcPort:   flow.SrcPort,
@@ -367,9 +128,6 @@ func clientDiagnosisFlow(flow forwarder.SessionFlow, records []dnsledger.Record,
 		LastSeen:        clientDiagnosisTime(flow.LastSeen),
 		Expired:         flow.Expired,
 		CloseSeen:       flow.CloseSeen,
-		Names:           []string{},
-		NameCandidates:  []ClientDiagnosisFlowNameCandidate{},
-		NameAttempts:    []ClientDiagnosisFlowNameAttempt{},
 	}
 	if !flow.LastSeen.IsZero() {
 		out.LastSeenAgeSeconds = int64(max(now.Sub(flow.LastSeen), 0) / time.Second)
@@ -405,38 +163,6 @@ func clientDiagnosisFlow(flow forwarder.SessionFlow, records []dnsledger.Record,
 		BackendWriteFailure: flow.BackendWriteFailure,
 	}
 	out.Return = clientDiagnosisFlowReturn(flow)
-
-	correlation := correlateFlowDestination(flow, records, recordsRead)
-	out.NamesMatch = correlation.Match
-	out.NamesReason = correlation.Reason
-	out.NamesConsidered = correlation.Considered
-	for _, candidate := range correlation.Names {
-		out.Names = append(out.Names, candidate.Name)
-		out.NameCandidates = append(out.NameCandidates, ClientDiagnosisFlowNameCandidate{
-			Name:       candidate.Name,
-			Seq:        candidate.Seq,
-			ObservedAt: clientDiagnosisTime(candidate.ObservedAt),
-			ExpiresAt:  clientDiagnosisTime(candidate.ExpiresAt),
-		})
-	}
-	if correlation.Match == FlowCorrelationNone {
-		out.NameAttempts = clientDiagnosisFlowNameAttempts(flow, events)
-	}
-	return out
-}
-
-// clientDiagnosisFlowNameAttempts renders the unresolved queries tried near the
-// flow decision. flowNameAttempts owns the temporal, incarnation and outcome rules.
-func clientDiagnosisFlowNameAttempts(flow forwarder.SessionFlow, events []dnsledger.Event) []ClientDiagnosisFlowNameAttempt {
-	out := make([]ClientDiagnosisFlowNameAttempt, 0, maxFlowNameAttempts)
-	for _, event := range flowNameAttempts(flow, events) {
-		out = append(out, ClientDiagnosisFlowNameAttempt{
-			Name:       event.Name,
-			QType:      clientDiagnosisQType(event.QType),
-			Kind:       event.Kind,
-			ReceivedAt: clientDiagnosisTime(event.ReceivedAt),
-		})
-	}
 	return out
 }
 

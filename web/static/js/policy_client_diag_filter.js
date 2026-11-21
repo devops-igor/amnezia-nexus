@@ -1,9 +1,9 @@
 // Destination filter for the per-client diagnosis panel (issue #861).
 //
 // The filter narrows rows the panel already holds for ONE selected session: flow
-// destinations, answer names and addresses, query names and refusal tuples. It reads no
-// state and sends no request, and it keeps each row's own facts — a row is shown or hidden
-// by what it already says, never by anything inferred for the filter.
+// destinations and refusal tuples. It reads no state and sends no request, and it keeps
+// each row's own facts — a row is shown or hidden by what it already says, never by
+// anything inferred for the filter.
 //
 // The controller owns the rendering; this module owns the term and the predicates, so the
 // filtering rule lives in one place instead of being spread through the table renderers.
@@ -52,25 +52,9 @@
         });
     }
 
-    function records(list) {
-        return rows(list || [], function (record) {
-            var addresses = (record.addresses || []).map(function (entry) {
-                return entry.address;
-            });
-            return [record.name, (record.aliases || []).join(' '), addresses.join(' ')];
-        });
-    }
-
-    function events(list) {
-        return rows(list || [], function (event) {
-            return [event.name];
-        });
-    }
-
     function flows(entries) {
         return rows(entries || [], function (flow) {
-            return [flow.destination_ip, String(flow.destination_port == null ? '' : flow.destination_port),
-                (flow.names || []).join(' ')];
+            return [flow.destination_ip, String(flow.destination_port == null ? '' : flow.destination_port)];
         });
     }
 
@@ -110,8 +94,6 @@
     root.clientDiagDestinationFilter = {
         set: set,
         active: active,
-        records: records,
-        events: events,
         flows: flows,
         drops: drops,
         foot: foot

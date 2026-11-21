@@ -7,12 +7,11 @@ import (
 	"time"
 
 	"github.com/devops-igor/amnezia-nexus/internal/models"
-	"github.com/devops-igor/amnezia-nexus/internal/vpn/dnsledger"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/forwarder"
 	"github.com/devops-igor/amnezia-nexus/internal/vpn/session"
 )
 
-// This file is the read-only per-client diagnosis of issue #861, slice 1: an
+// This file is the read-only per-client diagnosis of issue #861: an
 // administrator selects one exact session incarnation and receives the evidence
 // the data plane already retains for it.
 //
@@ -28,11 +27,12 @@ import (
 //   - No resolver is reachable from here. This file has no DNS dependency, so a
 //     panel lookup can never become a client observation.
 //
-// What it does not have is as important as what it has: no query name, no
-// CNAME chain, no decision time, no decision reason and no outcome is retained
-// anywhere in the current data plane. Each of those is returned as an explicit
-// unknown token rather than inferred from a route, a lastSeen or a current
-// policy rule.
+// What it does not have is as important as what it has: no client DNS answer, no
+// query name and no name correlation is retained anywhere in this build, because
+// the producer, the route cache and the history store that carried them are
+// deleted. A flow carries the decision its branch recorded, the dispatch and
+// return outcomes it measured, and an explicit unknown token wherever a fact was
+// never recorded.
 //
 // Cross-subsystem atomicity is not promised. The stores are read one after
 // another under their own locks, so a rekey, a retirement or a policy refresh can
@@ -114,7 +114,6 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 	out := ClientDiagnosisResponse{
 		Selection:   ClientDiagnosisSelection{SessionID: sessionID},
 		Coverage:    clientDiagnosisCoverage(fwd, now),
-		DNS:         clientDiagnosisEmptyDNS(),
 		Flows:       clientDiagnosisEmptyFlows(),
 		Drops:       ClientDiagnosisDrops{Available: false, State: ClientDiagnosisTokenNotRecorded, Entries: []ClientDiagnosisDrop{}},
 		Limitations: clientDiagnosisLimitations(),
@@ -130,7 +129,9 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 	// resolved, so their state never depends on a partially read store.
 	if state, limitation := clientDiagnosisUnavailableState(fwd, mgr); state != "" {
 		out.Selection.State = state
-		out.Limitations = append(out.Limitations, limitation)
+		if limitation != "" {
+			out.Limitations = append(out.Limitations, limitation)
+		}
 		return out, nil
 	}
 
@@ -151,8 +152,6 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 	if fwd != nil {
 		dropSnapshot = fwd.ClientDropSnapshot(sessionID, selection.RouteGeneration, 0)
 	}
-	dnsRecords, dnsRecordsRead := s.clientDiagnosisDNSRecords()
-	dnsEvents := s.clientDiagnosisDNSEvents()
 	if err := ctx.Err(); err != nil {
 		return ClientDiagnosisResponse{}, err
 	}
@@ -172,9 +171,6 @@ func (s *Service) ClientDiagnosis(ctx context.Context, req ClientDiagnosisReques
 	clientDiagnosisApplyRecords(&out, clientDiagnosisReads{
 		flows:          flows,
 		flowsAvailable: flowsAvailable,
-		dnsRecords:     dnsRecords,
-		dnsRecordsRead: dnsRecordsRead,
-		dnsEvents:      dnsEvents,
 	}, now)
 	return out, nil
 }
@@ -202,11 +198,13 @@ func (s *Service) clientDiagnosisBegin(ctx context.Context, req ClientDiagnosisR
 }
 
 // clientDiagnosisUnavailableState reports the state of a service whose sources
-// cannot answer, with the limitation that explains it. An empty state means the
-// selection can be resolved normally.
+// cannot answer, with the limitation that explains it when the state token alone
+// does not. An empty state means the selection can be resolved normally.
 func clientDiagnosisUnavailableState(fwd *forwarder.Forwarder, mgr *session.SessionManager) (string, string) {
 	if fwd == nil || !fwd.PBREnabled() {
-		return ClientDiagnosisStatePolicyDisabled, ClientDiagnosisLimitEvidenceScope
+		// "policy routing is off" is the whole story, and a limitation beside it
+		// would have to name a store this build no longer has.
+		return ClientDiagnosisStatePolicyDisabled, ""
 	}
 	if mgr == nil {
 		// A route alone is not a verified identity: refuse the selection instead
@@ -217,15 +215,13 @@ func clientDiagnosisUnavailableState(fwd *forwarder.Forwarder, mgr *session.Sess
 }
 
 // clientDiagnosisRefusalLimitations lists what a refused verdict cannot state.
+// The verdict token carries the explanation, so only the case whose cause is not
+// in the token itself adds a limitation.
 func clientDiagnosisRefusalLimitations(verdict string) []string {
-	switch verdict {
-	case ClientDiagnosisStateUnknownSession:
+	if verdict == ClientDiagnosisStateUnknownSession {
 		return []string{ClientDiagnosisLimitSessionEnd}
-	case ClientDiagnosisStateRouteAbsent, ClientDiagnosisStateRouteGenerationReplaced:
-		return []string{ClientDiagnosisLimitEvidenceScope}
-	default:
-		return nil
 	}
+	return nil
 }
 
 // clientDiagnosisSources snapshots the two live objects under the service lock
@@ -333,26 +329,6 @@ func clientDiagnosisStillSelected(fwd *forwarder.Forwarder, sessionID string, ge
 		}
 	}
 	return false
-}
-
-// clientDiagnosisDNSRecords reports the session's observed-answer history. This
-// build retains none: the collector lived on the deleted route cache, and the
-// producer that wrote it was deleted with the DNS gateway. The answer is
-// therefore always the empty snapshot with "no collector consulted", which the
-// panel renders as "not recorded" — the same answer a nil collector gave before
-// the store was removed.
-//
-// The reader and its wire mapping are removed together with the history store,
-// so this endpoint keeps one honest answer instead of a half-deleted section.
-func (s *Service) clientDiagnosisDNSRecords() (dnsledger.SessionSnapshot, bool) {
-	return dnsledger.SessionSnapshot{Records: []dnsledger.Record{}}, false
-}
-
-// clientDiagnosisDNSEvents reports the session's terminal-query history. Like
-// the answer history, no collector exists in this build, so it answers the empty
-// snapshot and the response says events_available=false.
-func (s *Service) clientDiagnosisDNSEvents() dnsledger.EventSnapshot {
-	return dnsledger.EventSnapshot{Events: []dnsledger.Event{}}
 }
 
 // clientDiagnosisSnapshotFlows reads the selected incarnation's flow records and

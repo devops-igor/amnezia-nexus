@@ -52,8 +52,8 @@ type clientDiagFixture struct {
 // classifier, the policy matcher and a real session registry.
 //
 // It installs no DNS resolver, no evidence producer and no route cache: this
-// build records nothing for a client's lookups, which is a state the diagnosis
-// has to report rather than hide.
+// build records nothing for a client's lookups, and the answer carries no member
+// for them.
 func newClientDiagFixture(t *testing.T) *clientDiagFixture {
 	t.Helper()
 	ctx := context.Background()
@@ -156,8 +156,7 @@ func findFlow(t *testing.T, flows []ClientDiagnosisFlow, dst string, dstPort uin
 
 // TestClientDiagnosisReportsTheProducersOwnRecords is the primary positive
 // control: DIRECT and PROXY flows recorded by the packet path are reported for the
-// session that produced them, and the evidence section states that no answer was
-// recorded rather than presenting an empty history.
+// session that produced them.
 func TestClientDiagnosisReportsTheProducersOwnRecords(t *testing.T) {
 	f := newClientDiagFixture(t)
 
@@ -192,18 +191,6 @@ func TestClientDiagnosisReportsTheProducersOwnRecords(t *testing.T) {
 		t.Error("the answer must declare that it is read-only")
 	}
 
-	// No producer observes DNS in this build and no store retains it, so the
-	// section is present and states that rather than claiming an empty history.
-	if answer.DNS.Available || answer.DNS.State != ClientDiagnosisTokenNotRecorded {
-		t.Errorf("dns = %+v, want an unavailable section stating not_recorded", answer.DNS)
-	}
-	if answer.DNS.RecordsAvailable || answer.DNS.EventsAvailable {
-		t.Errorf("dns = %+v, want no retained answers and no query history", answer.DNS)
-	}
-	if answer.DNS.Names.Match != ClientDiagnosisNamesNotRecorded {
-		t.Errorf("names match = %q, want not_recorded: the cache keeps no names", answer.DNS.Names.Match)
-	}
-
 	if !answer.Flows.Available {
 		t.Fatalf("flows = %+v, want an available section", answer.Flows)
 	}
@@ -235,11 +222,6 @@ func TestClientDiagnosisReportsTheProducersOwnRecords(t *testing.T) {
 		if flow.PolicyGeneration == "" {
 			t.Errorf("flow policy generation is empty; it must be a generation or the not_recorded token")
 		}
-		switch flow.NamesMatch {
-		case FlowCorrelationUnique, FlowCorrelationAmbiguous, FlowCorrelationNone, FlowCorrelationNotRecorded:
-		default:
-			t.Errorf("flow names match = %q, want one of the documented correlation classes", flow.NamesMatch)
-		}
 	}
 
 	// Every stated unknown is stated, and nothing the tables now record is claimed as
@@ -255,7 +237,11 @@ func TestClientDiagnosisReportsTheProducersOwnRecords(t *testing.T) {
 	}
 	for _, stale := range []string{
 		"dns_names_not_retained",
+		"dns_records_not_recorded",
 		"dns_questions_not_retained",
+		"route_cache_evidence_only",
+		"encrypted_dns_not_observed",
+		"records_without_route_generation",
 		"flow_decision_time_not_recorded",
 		"flow_decision_reason_not_recorded",
 		"flow_outcomes_not_recorded",
@@ -298,7 +284,7 @@ func TestClientDiagnosisReportsTheProducersOwnRecords(t *testing.T) {
 	if err := json.Unmarshal(raw, &roundTrip); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	for _, key := range []string{"selection", "coverage", "dns", "flows", "drops", "limitations", "evaluated_at", "read_only"} {
+	for _, key := range []string{"selection", "coverage", "flows", "drops", "limitations", "evaluated_at", "read_only"} {
 		if _, ok := roundTrip[key]; !ok {
 			t.Errorf("wire answer is missing section %q", key)
 		}
@@ -463,8 +449,8 @@ func TestClientDiagnosisPolicyDisabledAndMissingService(t *testing.T) {
 		if answer.Coverage.PolicyRoutingEnabled {
 			t.Error("coverage claims policy routing is enabled")
 		}
-		if answer.DNS.Available || answer.Flows.Available {
-			t.Error("a disabled policy path must not report available sections")
+		if answer.Flows.Available {
+			t.Error("a disabled policy path must not report an available flow section")
 		}
 		if len(answer.Flows.Entries) != 0 {
 			t.Error("a disabled policy path returned records")
@@ -621,8 +607,8 @@ func TestClientDiagnosisHelperContracts(t *testing.T) {
 	})
 
 	t.Run("UnavailableStates", func(t *testing.T) {
-		if state, limitation := clientDiagnosisUnavailableState(nil, nil); state != ClientDiagnosisStatePolicyDisabled || limitation != ClientDiagnosisLimitEvidenceScope {
-			t.Errorf("nil forwarder = %q/%q, want policy_disabled with the evidence-scope limitation", state, limitation)
+		if state, limitation := clientDiagnosisUnavailableState(nil, nil); state != ClientDiagnosisStatePolicyDisabled || limitation != "" {
+			t.Errorf("nil forwarder = %q/%q, want policy_disabled with no limitation", state, limitation)
 		}
 		fwd := forwarder.NewForwarder(nil, "10.100.0.0/16", 8)
 		fwd.SetPBREnabled(true)
@@ -632,15 +618,14 @@ func TestClientDiagnosisHelperContracts(t *testing.T) {
 	})
 
 	t.Run("RefusalLimitations", func(t *testing.T) {
-		cases := map[string]string{
-			ClientDiagnosisStateUnknownSession:          ClientDiagnosisLimitSessionEnd,
-			ClientDiagnosisStateRouteAbsent:             ClientDiagnosisLimitEvidenceScope,
-			ClientDiagnosisStateRouteGenerationReplaced: ClientDiagnosisLimitEvidenceScope,
+		if got := clientDiagnosisRefusalLimitations(ClientDiagnosisStateUnknownSession); len(got) != 1 || got[0] != ClientDiagnosisLimitSessionEnd {
+			t.Errorf("unknown_session limitations = %v, want [%s]", got, ClientDiagnosisLimitSessionEnd)
 		}
-		for verdict, want := range cases {
-			got := clientDiagnosisRefusalLimitations(verdict)
-			if len(got) != 1 || got[0] != want {
-				t.Errorf("%s limitations = %v, want [%s]", verdict, got, want)
+		// The verdict token explains these on its own: no limitation names a store
+		// this build no longer has.
+		for _, verdict := range []string{ClientDiagnosisStateRouteAbsent, ClientDiagnosisStateRouteGenerationReplaced} {
+			if got := clientDiagnosisRefusalLimitations(verdict); got != nil {
+				t.Errorf("%s limitations = %v, want none", verdict, got)
 			}
 		}
 		if got := clientDiagnosisRefusalLimitations(ClientDiagnosisStateLive); got != nil {

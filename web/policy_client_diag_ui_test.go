@@ -94,18 +94,13 @@ const w = dom.window;
 // chose instead of depending on English wording. The keys whose substitution is
 // under test are the ones with placeholders.
 w._ = key => {
-  if (key === 'policy_client_truncated') return 'TRUNC {shown}/{total}';
   if (key === 'policy_client_flow_count') return 'FLOWS {shown}/{total}';
   if (key === 'policy_client_partial_scan') return 'PARTIAL {scanned}';
   if (key === 'policy_client_seconds') return '{seconds}s';
-  if (key === 'policy_client_dns_coverage') return 'DNS-COVERAGE {stored}/{collapsed}/{evicted}/{aged}';
-  if (key === 'policy_client_dns_truncated') return 'DNS-TRUNC {shown}/{total}';
   if (key === 'policy_client_outcome_fmt') return 'OUTCOME {ok}/{failed} · return {return} {packets}';
   if (key === 'policy_client_route_outcome_fmt') return 'ROUTE {route} · {dispatch}';
   if (key === 'policy_client_route_failed_backend_write') return 'FAILED:backend-write';
   if (key === 'policy_client_route_failed_return') return 'FAILED:return';
-  if (key === 'policy_client_tried_names_fmt') return 'TRIED {names}';
-  if (key === 'policy_client_flow_names_multiple') return 'FIRST {name} PLUS {count}';
   if (key === 'policy_client_drop_truncated') return 'DROP-TRUNC {shown}/{total}';
   if (key === 'policy_client_drop_coverage') return 'DROPCOV {stored}/{merged}/{evicted}/{pruned} session {session_keys} ledger {keys}/{key_limit} {age}';
   if (key === 'policy_client_drop_no_tuple') return 'NO-TUPLE';
@@ -125,12 +120,6 @@ w._ = key => {
   if (key === 'policy_client_return_authority_current_tuple_association') return 'RETURN_AUTHORITY:current_tuple_association';
   if (key === 'policy_client_return_chain_fmt')
     return 'RET returned {matched}/{admitted}/{delivered}/{failed}/{dropped}';
-  if (key === 'policy_client_dns_events_coverage') return 'EVENTS-COVERAGE {stored}/{collapsed}/{evicted}/{aged}';
-  if (key === 'policy_client_dns_events_truncated') return 'EVENTS-TRUNC {shown}/{total}';
-  if (key === 'policy_client_delivered_yes') return 'DELIVERED';
-  if (key === 'policy_client_delivered_no') return 'NOT-DELIVERED';
-  if (key.indexOf('policy_client_dns_event_') === 0) return 'EVENT:' + key.slice('policy_client_dns_event_'.length);
-  if (key.indexOf('policy_client_upstream_') === 0) return 'UPSTREAM:' + key.slice('policy_client_upstream_'.length);
   // Token families resolve to a sentinel, so an assertion can prove the token
   // was looked up in the dictionary instead of being printed raw.
   if (key.indexOf('policy_client_state_') === 0) return 'STATE:' + key.slice('policy_client_state_'.length);
@@ -140,9 +129,7 @@ w._ = key => {
   if (key.indexOf('policy_client_protocol_') === 0) return 'PROTO:' + key.slice('policy_client_protocol_'.length);
   if (key.indexOf('policy_client_limit_') === 0) return 'LIMIT:' + key.slice('policy_client_limit_'.length);
   if (key.indexOf('policy_client_reason_') === 0) return 'REASON:' + key.slice('policy_client_reason_'.length);
-  if (key.indexOf('policy_client_name_match_') === 0) return 'NAME_MATCH:' + key.slice('policy_client_name_match_'.length);
   if (key.indexOf('policy_client_return_evidence_') === 0) return 'RETURN_EVIDENCE:' + key.slice('policy_client_return_evidence_'.length);
-  if (key.indexOf('policy_client_corr_') === 0) return 'CORR:' + key.slice('policy_client_corr_'.length);
   if (key.indexOf('policy_client_failure_') === 0) return 'FAILURE:' + key.slice('policy_client_failure_'.length);
   if (key.indexOf('policy_client_dispatch_') === 0) return 'DISPATCH:' + key.slice('policy_client_dispatch_'.length);
   return key;
@@ -234,9 +221,7 @@ const diagnosis = (session, generation) => ({
   coverage: {policy_routing_enabled: true, sampled_at: '2026-11-17T09:10:00Z',
              evidence_source: 'live_flows',
              not_covered: ['application_success_not_observable'],
-             not_recorded: ['dns_names_not_retained']},
-  dns: {available: true, state: 'fresh',
-        names: {match: 'not_recorded', reason: 'dns_names_not_retained'}},
+             not_recorded: ['flow_evidence_install_failure_not_recorded']},
   flows: {available: true, state: 'recorded', scanned: 2, scan_complete: true, total: 1,
           truncated: false,
           entries: [{protocol: 'tcp', client_src_port: 40002, destination_ip: '93.184.216.34',
@@ -246,13 +231,9 @@ const diagnosis = (session, generation) => ({
                      decision_time: '2026-11-17T09:09:58Z', decision_reason: 'evidence_direct',
                      policy_generation: 'gen-1',
                      dispatch: {state: 'written_to_wan'}, forward: {packets: 1, bytes: 60, failed: 0},
-                     return: {evidence: 'not_observed', packets: 0, bytes: 0},
-                     names: ['plain.example'], names_match: 'unique', names_considered: 1,
-                     name_candidates: [{name: 'plain.example', dns_seq: 1,
-                                        observed_at: '2026-11-17T09:09:30Z',
-                                        expires_at: '2026-11-17T09:14:30Z'}]}]},
+                     return: {evidence: 'not_observed', packets: 0, bytes: 0}}]},
   drops: {available: false, state: 'not_recorded', total: 0, truncated: false, entries: []},
-  limitations: ['dns_names_not_retained', 'flow_decision_reason_not_recorded'],
+  limitations: ['not_an_atomic_cross_subsystem_snapshot'],
   evaluated_at: '2026-11-17T09:10:00Z', read_only: true
 });
 responder = async (url, opts) => {
@@ -304,6 +285,10 @@ assert.equal(text('policyClientEvaluatedValue'), '2026-11-17T09:10:00Z');
 
 assert.equal(w.document.getElementById('policyClientEvidenceRows'), null,
   'the retained-address table is gone with the route cache it read');
+assert.equal(w.document.getElementById('policyClientDNSRows'), null,
+  'the DNS answer table is gone with the history store that fed it');
+assert.equal(w.document.getElementById('policyClientEventRows'), null,
+  'the terminal-query table is gone too');
 
 assert.equal(rowCount('policyClientFlowRows'), 1, 'one live flow is rendered');
 assert.deepEqual(rowHeaders('policyClientFlowRows'),
@@ -311,15 +296,16 @@ assert.deepEqual(rowHeaders('policyClientFlowRows'),
    'policy_client_column_choice', 'policy_client_column_decision'],
   'the flows table renders the four columns an operator reads');
 assert.deepEqual(rowCells('policyClientFlowRows', 0),
-  ['PROTO:tcp', '93.184.216.34:443 (plain.example)', 'DECISION:direct',
+  ['PROTO:tcp', '93.184.216.34:443', 'DECISION:direct',
    'DECISION_REASON:evidence_direct']);
 assert.equal(rowCellTitles('policyClientFlowRows', 0)[3],
   '2026-11-17T09:09:58Z · gen-1 · evidence_direct',
   'the instant, the generation and the token the label came from are the cell tooltip');
+assert.equal(rowCellTitles('policyClientFlowRows', 0)[1], '',
+  'the destination cell states the recorded tuple and no name');
 
 const limits = Array.from(w.document.getElementById('policyClientLimitations').children).map(li => li.textContent);
-assert.deepEqual(limits, ['LIMIT:dns_names_not_retained',
-                          'LIMIT:flow_decision_reason_not_recorded'],
+assert.deepEqual(limits, ['LIMIT:not_an_atomic_cross_subsystem_snapshot'],
   'every stated limitation is rendered from the answer, not invented here');
 `)
 }
@@ -478,8 +464,6 @@ responder = async (url, opts) => {
             not_covered: []};
   }
   return {selection: {session_id: 'sess-a', state: 'live', route_generation: 2},
-    dns: {available: false, state: 'not_recorded',
-      names: {match: 'not_recorded'}},
     flows: {available: true, state: 'recorded', scanned: 16384, scan_complete: false,
             total: 600, truncated: true, entries: [
       {protocol: 'udp', destination_ip: '1.1.1.1', destination_port: 53, choice: 'PROXY',
@@ -537,11 +521,10 @@ assert.equal(text('policyClientDropCoverage'), 'DROPCOV 3/5/0/1 session 4 ledger
 }
 
 // TestPolicyClientDiagFlowStateVariety pins the visible rendering of the states a
-// recorded flow can be in: several candidate names, no candidate with a stated
-// reason, a refused dispatch, a dispatch that succeeded into the queue while the
-// backend and the return delivery failed, and a flow recorded without decision
-// metadata. Each cell and each route tooltip is asserted, so a wrong or invented
-// value fails.
+// recorded flow can be in: a refused dispatch, a dispatch that succeeded into the
+// queue while the backend and the return delivery failed, a flow recorded without
+// decision metadata and a clean proxy hand-off. Each cell and each route tooltip is
+// asserted, so a wrong or invented value fails.
 func TestPolicyClientDiagFlowStateVariety(t *testing.T) {
 	runClientDiagScenario(t, clientTargetsScript+`
 responder = ((base) => async (url, opts) => {
@@ -570,9 +553,7 @@ responder = ((base) => async (url, opts) => {
      dispatch: {state: 'failed', reason: 'backend_queue_full'},
      forward: {packets: 0, bytes: 0, failed: 2, failure: 'backend_queue_full',
                backend_writes: 0, backend_write_failed: 0},
-     return: {evidence: 'not_measured', packets: 0, bytes: 0},
-     names: ['plain.example', 'shared.example'], names_match: 'ambiguous', names_considered: 2,
-     name_candidates: []},
+     return: {evidence: 'not_measured', packets: 0, bytes: 0}},
     {protocol: 'udp', destination_ip: '8.8.8.8', destination_port: 53, choice: 'PROXY',
      route_generation: 3, last_seen_age_seconds: 9, expired: false, close_seen: false,
      decision_time: '2026-11-17T09:09:57Z', decision_reason: 'no_trusted_evidence',
@@ -582,19 +563,14 @@ responder = ((base) => async (url, opts) => {
                backend_write_failure: 'backend_write_failed'},
      return: {evidence: 'observed', authority: 'current_tuple_association',
               matched: 4, admitted: 3, delivered: 2, failed: 1,
-              failure: 'client_queue_full'},
-     names: [], names_match: 'none', names_reason: 'no_retained_answer', names_considered: 0,
-     name_candidates: [],
-     name_attempts: [{name: 'missing.example', qtype: 'A', kind: 'nxdomain',
-                      received_at: '2026-11-17T09:09:50Z'}]},
+              failure: 'client_queue_full'}},
     {protocol: 'tcp', destination_ip: '1.1.1.1', destination_port: 80, choice: 'DIRECT',
      route_generation: 3, last_seen_age_seconds: 12, expired: false, close_seen: false,
      decision_time: 'not_recorded', decision_reason: 'not_recorded',
      policy_generation: 'not_recorded',
      dispatch: {state: 'written_to_wan'}, forward: {packets: 4, bytes: 400, failed: 0},
      return: {evidence: 'observed', packets: 2, bytes: 200,
-              first_at: '2026-11-17T09:10:00Z', last_at: '2026-11-17T09:10:01Z'},
-     names: [], names_match: 'not_recorded', names_considered: 0, name_candidates: []},
+              first_at: '2026-11-17T09:10:00Z', last_at: '2026-11-17T09:10:01Z'}},
     {protocol: 'udp', destination_ip: '9.9.9.9', destination_port: 443, choice: 'PROXY',
      route_generation: 3, last_seen_age_seconds: 14, expired: false, close_seen: false,
      decision_time: '2026-11-17T09:09:55Z', decision_reason: 'sticky_flow',
@@ -602,8 +578,7 @@ responder = ((base) => async (url, opts) => {
      dispatch: {state: 'queued_to_backend'},
      forward: {packets: 5, bytes: 300, failed: 0, backend_writes: 5, backend_write_failed: 0},
      return: {evidence: 'observed', authority: 'current_tuple_association',
-              matched: 5, admitted: 5, delivered: 5, failed: 0},
-     names: [], names_match: 'not_recorded', names_considered: 0, name_candidates: []}
+              matched: 5, admitted: 5, delivered: 5, failed: 0}}
   ];
   return answer;
 })(responder);
@@ -614,8 +589,8 @@ await settle();
 assert.equal(rowCount('policyClientFlowRows'), 4, 'all four states are rendered');
 
 const ambiguous = rowCells('policyClientFlowRows', 0);
-assert.equal(ambiguous[1], '93.184.216.34:443 (FIRST plain.example PLUS 1)',
-  'the first of several candidate names is shown with a count of the others, never collapsed to that one alone');
+assert.equal(ambiguous[1], '93.184.216.34:443',
+  'the destination cell states the recorded tuple, with no name to correlate');
 assert.equal(ambiguous[2], 'DECISION:proxy (DISPATCH:failed)',
   'the recorded route is rendered, and a failed dispatch is marked on it');
 assert.equal(rowCellTitles('policyClientFlowRows', 0)[2], 'DISPATCH:failed · FAILURE:backend_queue_full',
@@ -628,7 +603,7 @@ assert.equal(rowCellTitles('policyClientFlowRows', 0)[3],
 
 const none = rowCells('policyClientFlowRows', 1);
 assert.equal(none[1], '8.8.8.8:53',
-  'a name the client tried without an answer is not this flow destination name');
+  'the destination cell carries what the flow record holds and nothing more');
 assert.equal(none[3], 'DECISION_REASON:no_trusted_evidence',
   'the fail-closed default has its own label');
 // The dispatch succeeded into the queue, but the backend refused one of three
@@ -673,8 +648,7 @@ responder = ((base) => async (url, opts) => {
     last_seen_age_seconds: 3, expired: false, close_seen: false,
     decision_time: '2026-11-17T09:09:58Z', decision_reason: 'proxy_cidr_rule',
     policy_generation: 'gen-1', backend_tunnel_id: 77, dispatch: dispatch,
-    forward: forward, return: back,
-    names: [], names_match: 'none', names_considered: 0, name_candidates: []});
+    forward: forward, return: back});
   const queued = {state: 'queued_to_backend'};
   const backendOk = {packets: 3, bytes: 180, failed: 0, backend_writes: 3, backend_write_failed: 0};
   answer.flows.entries = [
@@ -766,7 +740,7 @@ responder = ((base) => async (url, opts) => {
      policy_generation: 'gen-1',
      dispatch: {state: 'written_to_wan'}, forward: {packets: 2, bytes: 120, failed: 0},
      return: {evidence: 'not_observed', packets: 0, bytes: 0},
-     names: [], names_match: 'none', names_considered: 0, name_candidates: []},
+     },
     {protocol: 'tcp', destination_ip: '185.73.194.82', destination_port: 443, choice: 'DIRECT',
      route_generation: 3, last_seen_age_seconds: 4, expired: false, close_seen: false,
      decision_time: '2026-11-17T09:09:59Z', decision_reason: 'allocation_direct',
@@ -774,21 +748,21 @@ responder = ((base) => async (url, opts) => {
      dispatch: {state: 'failed', reason: 'direct_egress_unavailable'},
      forward: {packets: 0, bytes: 0, failed: 1, failure: 'direct_egress_unavailable'},
      return: {evidence: 'not_observed', packets: 0, bytes: 0},
-     names: [], names_match: 'none', names_considered: 0, name_candidates: []},
+     },
     {protocol: 'tcp', destination_ip: '77.88.55.66', destination_port: 443, choice: 'PROXY',
      route_generation: 3, last_seen_age_seconds: 5, expired: false, close_seen: false,
      decision_time: '2026-11-17T09:10:00Z', decision_reason: 'no_trusted_evidence',
      policy_generation: 'gen-1', backend_tunnel_id: 77,
      dispatch: {state: 'queued_to_backend'}, forward: {packets: 3, bytes: 180, failed: 0},
      return: {evidence: 'not_measured', packets: 0, bytes: 0},
-     names: [], names_match: 'none', names_considered: 0, name_candidates: []},
+     },
     {protocol: 'udp', destination_ip: '1.1.1.1', destination_port: 53, choice: 'DIRECT',
      route_generation: 3, last_seen_age_seconds: 6, expired: false, close_seen: false,
      decision_time: 'not_recorded', decision_reason: 'not_recorded',
      policy_generation: 'not_recorded',
      dispatch: {state: 'not_recorded'}, forward: {packets: 0, bytes: 0, failed: 0},
      return: {evidence: 'not_measured', packets: 0, bytes: 0},
-     names: [], names_match: 'none', names_considered: 0, name_candidates: []}
+     }
   ];
   return answer;
 })(responder);
@@ -884,17 +858,13 @@ responder = ((base) => async (url, opts) => {
      forward: {packets: 3, bytes: 180, failed: 0, backend_writes: 2, backend_write_failed: 1,
                backend_write_failure: 'backend_write_failed'},
      return: {evidence: 'observed', authority: 'current_tuple_association', matched: 4,
-              admitted: 3, delivered: 2, failed: 1, dropped: 1, failure: 'client_queue_full'},
-     names: ['alpha.example', 'beta.example'], names_match: 'ambiguous', names_considered: 2,
-     name_candidates: []},
+              admitted: 3, delivered: 2, failed: 1, dropped: 1, failure: 'client_queue_full'}},
     {protocol: 'udp', destination_ip: '8.8.8.8', destination_port: 53, choice: 'PROXY',
      route_generation: 3, last_seen_age_seconds: 9, expired: false, close_seen: false,
      decision_time: '2026-11-17T09:09:57Z', decision_reason: 'no_trusted_evidence',
      policy_generation: 'gen-1',
      dispatch: {state: 'queued_to_backend'}, forward: {packets: 3, bytes: 0, failed: 0},
-     return: {evidence: 'not_measured', packets: 0, bytes: 0},
-     names: ['plain.example'], names_match: 'unique', names_considered: 1,
-     name_candidates: []}
+     return: {evidence: 'not_measured', packets: 0, bytes: 0}}
   ];
   return answer;
 })(responder);
@@ -925,12 +895,12 @@ flowRows().forEach((row, index) => {
   assert.equal(row.children.length, 4, 'row ' + index + ' still carries exactly four cells');
 });
 const cells = detailCells();
-assert.equal(cells[0][1].title, 'alpha.example, beta.example',
-  'the several-names list is the destination cell detail');
+assert.equal(cells[0][1].title, '',
+  'the destination cell carries no detail: the row states the recorded tuple only');
+assert.equal(cells[0][1].toggle, null,
+  'a cell with nothing more to say carries no disclosure');
 assert.equal(cells[0][2].title.indexOf('FAILURE:backend_write_failed') >= 0, true,
   'the failure detail is the route cell detail');
-assert.equal(cells[1][1].toggle, null,
-  'a cell with nothing more to say carries no disclosure');
 
 // 1. Closed by default, and the opener reports that state to assistive technology.
 Array.from(w.document.querySelectorAll('#policyClientFlowRows .cell-detail-toggle')).forEach(toggle => {
@@ -944,23 +914,23 @@ Array.from(w.document.querySelectorAll('#policyClientFlowRows .cell-detail')).fo
 });
 
 // The opener names the element it reveals, and that element is the one inside it.
-const namesToggle = cells[0][1].toggle;
-assert.equal(namesToggle.getAttribute('aria-controls'), cells[0][1].region.id,
+const routeToggle = cells[0][2].toggle;
+assert.equal(routeToggle.getAttribute('aria-controls'), cells[0][2].region.id,
   'the opener controls the region beside it');
-assert.equal(cells[0][1].region.parentNode, cellsOf(flowRows()[0])[1],
+assert.equal(cells[0][2].region.parentNode, cellsOf(flowRows()[0])[2],
   'the revealed detail lives inside its own cell, not in a new column');
 
 // 2. A pointer opens it: a click on the opener and a tap on the cell both work.
 const TapEvent = w.PointerEvent || w.MouseEvent;
 const tap = (el) => el.dispatchEvent(new TapEvent('click',
   {bubbles: true, cancelable: true, pointerType: 'touch'}));
-namesToggle.click();
-assert.equal(namesToggle.getAttribute('aria-expanded'), 'true', 'a click expands the detail');
-assert.equal(cells[0][1].region.hidden, false, 'a click reveals the region');
-assert.equal(cells[0][1].region.textContent, 'alpha.example, beta.example',
-  'the revealed text is the title text, with every matched name');
-namesToggle.click();
-assert.equal(namesToggle.getAttribute('aria-expanded'), 'false', 'a second click collapses it');
+routeToggle.click();
+assert.equal(routeToggle.getAttribute('aria-expanded'), 'true', 'a click expands the detail');
+assert.equal(cells[0][2].region.hidden, false, 'a click reveals the region');
+assert.equal(cells[0][2].region.textContent, cells[0][2].title,
+  'the revealed text is the title text, with every producer it names');
+routeToggle.click();
+assert.equal(routeToggle.getAttribute('aria-expanded'), 'false', 'a second click collapses it');
 
 // A tap is delivered as a click, which is the shape a touch device produces: jsdom
 // has no touch input, so the pointer event is what can be exercised here.
@@ -1012,7 +982,7 @@ detailCells().forEach((row, rowIndex) => {
     cell.toggle.click();
   });
 });
-assert.equal(checked, 5, 'every detail-bearing cell was opened and compared');
+assert.equal(checked, 4, 'every detail-bearing cell was opened and compared');
 
 // 6. A re-render closes what the replaced rows held.
 cells[0][2].toggle.click();
@@ -1207,66 +1177,6 @@ assert.equal(w.getComputedStyle(collapsed).display, 'none',
 `, bundle, string(encoded)))
 }
 
-// TestPolicyClientDiagFlowDestinationNamesOnlyWhenKnown pins the Destination cell:
-// the address the tuple carried, and a name only when a stored answer genuinely
-// names it. A name the client tried without an answer is not a name; when several
-// names match, the first is shown with a count of the others instead of the row
-// pretending the address has that one name.
-func TestPolicyClientDiagFlowDestinationNamesOnlyWhenKnown(t *testing.T) {
-	runClientDiagScenario(t, clientTargetsScript+`
-responder = ((base) => async (url, opts) => {
-  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
-  const answer = await base(url, opts);
-  answer.flows.entries = [
-    {protocol: 'tcp', destination_ip: '93.184.216.34', destination_port: 443, choice: 'DIRECT',
-     last_seen_age_seconds: 3, expired: false, close_seen: false,
-     decision_reason: 'evidence_direct', names: [], names_match: 'not_recorded',
-     names_reason: 'no_retained_answer',
-     name_attempts: [{name: 'missing.example', qtype: 'A', kind: 'nxdomain',
-                      received_at: '2026-11-17T09:09:50Z'}]},
-    {protocol: 'udp', destination_ip: '8.8.8.8', destination_port: 53, choice: 'PROXY',
-     last_seen_age_seconds: 4, expired: false, close_seen: false,
-     decision_reason: 'no_trusted_evidence',
-     names: ['plain.example'], names_match: 'unique', names_considered: 1},
-    {protocol: 'tcp', destination_ip: '1.1.1.1', destination_port: 443, choice: 'PROXY',
-     last_seen_age_seconds: 5, expired: false, close_seen: false,
-     decision_reason: 'proxy_cached_evidence',
-     names: ['plain.example', 'shared.example', 'other.example'],
-     names_match: 'ambiguous', names_considered: 3}
-  ];
-  return answer;
-})(responder);
-`, `
-selectClient('sess-a');
-await w.diagnoseSelectedClient();
-await settle();
-assert.equal(rowCount('policyClientFlowRows'), 3, 'all three destinations are rendered');
-
-// 1. Only unanswered attempts: no name, because no answer named this address.
-const attemptedOnly = rowCells('policyClientFlowRows', 0);
-assert.equal(attemptedOnly[1], '93.184.216.34:443',
-  'an unanswered attempt must not be presented as the flow destination name');
-assert.ok(attemptedOnly[1].indexOf('missing.example') === -1,
-  'the attempted name stays out of the destination cell entirely');
-
-// 2. One stored answer names the address: it is shown with the address.
-const single = rowCells('policyClientFlowRows', 1);
-assert.equal(single[1], '8.8.8.8:53 (plain.example)',
-  'the one answer that names the address is shown beside it');
-
-// 3. Several stored answers name it: the first name is shown with a count of the
-//    others, so the address never looks like it has that one name.
-const several = rowCells('policyClientFlowRows', 2);
-assert.equal(several[1], '1.1.1.1:443 (FIRST plain.example PLUS 2)',
-  'the first of several matching names is shown with a count of the others');
-assert.equal(rowCellTitles('policyClientFlowRows', 2)[1],
-  'plain.example, shared.example, other.example',
-  'every matching name is available in the cell tooltip');
-assert.equal(rowCellTitles('policyClientFlowRows', 0)[1], '',
-  'an address with no known name carries no tooltip');
-`)
-}
-
 // TestPolicyClientDiagFlowDecisionLabels pins the Decision cell: one short label per
 // recorded condition, with no instant, generation, backend id or raw token in the
 // cell text. The detail the cell cannot show is its tooltip, which is where the
@@ -1286,7 +1196,7 @@ responder = ((base) => async (url, opts) => {
     decision_time: reason === 'not_recorded' ? 'not_recorded'
       : '2026-11-17T09:09:5' + (index % 10) + 'Z', decision_reason: reason,
     policy_generation: 'gen-9', backend_tunnel_id: index === 5 ? 77 : undefined,
-    names: [], names_match: 'not_recorded', name_attempts: []}));
+    }));
   return answer;
 })(responder);
 `, `
@@ -1349,79 +1259,6 @@ assert.equal(titles[10], 'gen-9',
   'a flow recorded without a reason has no instant or token to describe');
 assert.ok(titles[11].indexOf('brand_new_reason') !== -1,
   'a token this build does not know stays quotable in the tooltip');
-`)
-}
-
-// TestPolicyClientDiagRendersTerminalQueryEvents covers the terminal-query table:
-// an answered query, a no-answer query, an NXDOMAIN, an upstream timeout and a
-// truncated reply are each rendered with their own result, transport, instants and
-// delivery, and the section states that a recorded query is not route evidence.
-func TestPolicyClientDiagRendersTerminalQueryEvents(t *testing.T) {
-	runClientDiagScenario(t, clientTargetsScript+`
-responder = ((base) => async (url, opts) => {
-  if (url.endsWith('/api/vpn/policy/clients')) return base(url, opts);
-  const answer = await base(url, opts);
-  answer.dns.events_available = true;
-  answer.dns.events_total = 5;
-  answer.dns.events_truncated = false;
-  answer.dns.events = [
-    {seq: 5, name: 'big.example', qtype: 'A', rcode: 'NOERROR', kind: 'truncated',
-     transport: 'udp', delivered: true, truncated: true,
-     received_at: '2026-11-17T09:10:05Z', answered_at: '2026-11-17T09:10:05Z', count: 1,
-     first_seen: '2026-11-17T09:10:05Z', last_seen: '2026-11-17T09:10:05Z'},
-    {seq: 4, name: 'fail.example', qtype: 'A', rcode: 'SERVFAIL', kind: 'upstream_error',
-     upstream_error: 'timeout', transport: 'udp', delivered: true, truncated: false,
-     received_at: '2026-11-17T09:10:04Z', answered_at: '2026-11-17T09:10:04Z', count: 1,
-     first_seen: '2026-11-17T09:10:04Z', last_seen: '2026-11-17T09:10:04Z'},
-    {seq: 3, name: 'nx.example', qtype: 'A', rcode: 'NXDOMAIN', kind: 'nxdomain',
-     transport: 'udp', delivered: true, truncated: false,
-     received_at: '2026-11-17T09:10:03Z', answered_at: '2026-11-17T09:10:03Z', count: 1,
-     first_seen: '2026-11-17T09:10:03Z', last_seen: '2026-11-17T09:10:03Z'},
-    {seq: 2, name: 'plain.example', qtype: 'AAAA', rcode: 'NOERROR', kind: 'no_answer',
-     transport: 'udp', delivered: true, truncated: false,
-     received_at: '2026-11-17T09:10:02Z', answered_at: '2026-11-17T09:10:02Z', count: 1,
-     first_seen: '2026-11-17T09:10:02Z', last_seen: '2026-11-17T09:10:02Z'},
-    {seq: 1, name: 'plain.example', qtype: 'A', rcode: 'NOERROR', kind: 'answered',
-     transport: 'udp', delivered: false, truncated: false,
-     received_at: '2026-11-17T09:10:01Z', answered_at: '2026-11-17T09:10:01Z', count: 1,
-     first_seen: '2026-11-17T09:10:01Z', last_seen: '2026-11-17T09:10:01Z'}
-  ];
-  answer.dns.event_coverage = {started_at: '2026-11-17T09:00:00Z', events_stored: 5,
-    estimated_bytes: 640, written: 7, collapsed: 1, evicted_per_session: 0, evicted_global: 1,
-    aged_out: 0, rejected_no_room: 0,
-    limits: {events_per_session: 128, events_total: 4096, max_age_seconds: 1800},
-    not_recorded: ['dns_transport_not_recorded']};
-  return answer;
-})(responder);
-`, `
-selectClient('sess-a');
-await w.diagnoseSelectedClient();
-await settle();
-
-assert.equal(rowCount('policyClientEventRows'), 5, 'every terminal query is rendered');
-
-const truncated = rowCells('policyClientEventRows', 0);
-assert.equal(truncated[0], 'big.example');
-assert.equal(truncated[2], 'EVENT:truncated', 'a truncated reply says so');
-assert.equal(truncated[3], 'UDP', 'the client transport is shown');
-assert.equal(truncated[6], 'DELIVERED', 'the reply reached the client');
-
-const failed = rowCells('policyClientEventRows', 1);
-assert.equal(failed[2], 'EVENT:upstream_error (UPSTREAM:timeout)',
-  'the failed exchange states its class, not a guess');
-
-const nxdomain = rowCells('policyClientEventRows', 2);
-assert.equal(nxdomain[2], 'EVENT:nxdomain', 'an NXDOMAIN is a distinct terminal result');
-
-const noAnswer = rowCells('policyClientEventRows', 3);
-assert.equal(noAnswer[2], 'EVENT:no_answer', 'a no-answer response is not an error');
-
-const undelivered = rowCells('policyClientEventRows', 4);
-assert.equal(undelivered[6], 'NOT-DELIVERED',
-  'a response the consumer never received is not reported as delivered');
-
-assert.equal(text('policyClientEventCoverage'), 'EVENTS-COVERAGE 5/1/1/0',
-  'the event store coverage is stated');
 `)
 }
 

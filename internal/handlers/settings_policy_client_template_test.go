@@ -57,13 +57,6 @@ var clientDiagSectionIDs = []string{
 	"policyClientEvaluatedValue",
 	"policyClientFlowRows",
 	"policyClientFlowFoot",
-	"policyClientDNSRows",
-	"policyClientDNSFoot",
-	"policyClientDNSCoverage",
-	"policyClientDNSGaps",
-	"policyClientEventRows",
-	"policyClientEventFoot",
-	"policyClientEventCoverage",
 	"policyClientNotCovered",
 	"policyClientLimitations",
 }
@@ -249,13 +242,14 @@ func TestPolicyClientSectionTranslationKeysInEveryLocale(t *testing.T) {
 
 // clientDiagTokenValues are the documented token families the controller
 // translates. Each family is listed separately: a state token has no decision
-// label, and asserting the cross product would demand keys nobody renders.
+// label, and asserting the cross product would demand keys nobody renders. The
+// families are the ones the shipped controller addresses through
+// clientTokenLabel; a family whose producer is deleted is removed here, so this
+// list cannot keep a key alive that nothing renders.
 var clientDiagTokenValues = map[string][]string{
 	"state": {
 		"live", "route_generation_replaced", "route_absent", "unknown_session",
 		"policy_disabled", "identity_unavailable", "inconsistent",
-		// Record states of one stored DNS answer.
-		"active", "expired",
 	},
 	"decision": {"direct", "proxy", "unknown"},
 	"protocol": {"tcp", "udp"},
@@ -267,17 +261,12 @@ var clientDiagTokenValues = map[string][]string{
 		// inside the allocation but belongs to a multi-region CDN.
 		"allocation_direct", "allocation_cdn_excluded",
 	},
-	"name_match":      {"unique", "ambiguous", "none", "not_recorded"},
 	"return_evidence": {"observed", "not_observed", "not_measured", "not_recorded"},
 	// What the dispatch path did with the flow's packets. The state is a token
 	// family of its own because it is rendered beside the route: a DIRECT flow
 	// whose writes failed reads as direct-and-failed, not as an unexplained
 	// failure (issue #920).
 	"dispatch": {"written_to_wan", "queued_to_backend", "failed", "not_recorded"},
-	"corr": {
-		"answer_after_decision", "expired_before_decision", "no_retained_answer",
-		"decision_time_not_recorded", "dns_records_not_recorded", "dns_names_not_retained",
-	},
 	"failure": {
 		"wan_write_failed", "backend_queue_full", "backend_detached",
 		"backend_unavailable", "direct_egress_unavailable", "return_path_closed",
@@ -285,19 +274,13 @@ var clientDiagTokenValues = map[string][]string{
 		"client_queue_full", "client_rate_limited", "packet_too_large",
 		"return_path_closed", "client_write_failed", "client_short_write",
 	},
-	"dns_event": {
-		"answered", "no_answer", "nxdomain", "admission_refused", "upstream_error",
-		"invalid_query", "truncated", "delivery_failed",
-	},
-	"upstream": {"timeout", "refused", "error"},
 	"limit": {
 		"flow_evidence_install_failure_not_recorded",
 		"application_success_not_observable",
-		"proxy_return_not_measured", "route_cache_evidence_only",
+		"proxy_return_not_measured",
 		"session_end_not_distinguishable",
-		"ipv6_not_supported", "encrypted_dns_not_observed",
+		"ipv6_not_supported",
 		"not_an_atomic_cross_subsystem_snapshot", "selection_changed_during_read",
 		"session_registry_unavailable", "flow_scan_window_partial",
-		"records_without_route_generation",
 	},
 }
