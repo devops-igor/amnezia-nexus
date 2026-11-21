@@ -4,6 +4,13 @@ on:
   pull_request:
     branches:
       - main
+    # A gate verdict belongs to a state of the pull request, so every action that
+    # can grant or withdraw the exception below has to re-run it. Without `types`,
+    # GitHub runs only opened, synchronize and reopened, so applying or removing a
+    # label, or editing the description, would leave an older verdict in place.
+    # Both halves can be withdrawn independently, so this is not narrowed to one
+    # label name: every label change and every description edit re-assesses.
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
   push:
     branches:
       - main
